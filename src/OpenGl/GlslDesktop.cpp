@@ -181,7 +181,8 @@ void drop_texcoord_redeclarations(StringView text, String* out) {
   out->append(text.substr(copied, text.size() - copied));
 }
 
-bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_t* uses) {
+bool translate_desktop_glsl(StringView source, DesktopStage stage, String* out, uint32_t* uses) {
+  const bool vertex = stage == DesktopStage::Vertex;
   *uses = 0;
   uint64_t body = 0;
   uint32_t version_line = 0;
@@ -235,7 +236,7 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
       else if (name.equals("gl_FrontColor") || name.equals("gl_BackColor") || name.equals("gl_FrontSecondaryColor") || name.equals("gl_BackSecondaryColor")) decl(varying_out, "vec4", kRenames[r].vertex_to, "");
       else if (name.equals("gl_TexCoord")) decl(varying_out, "vec4", "tcos_TexCoord", "[8]");
       else if (name.equals("gl_FogFragCoord")) decl(varying_out, "float", "tcos_FogFragCoord", "");
-    } else {
+    } else if (stage == DesktopStage::Fragment) {
       if (name.equals("gl_Color")) decl(varying_in, "vec4", "tcos_FrontColor", "");
       else if (name.equals("gl_SecondaryColor")) decl(varying_in, "vec4", "tcos_FrontSecondaryColor", "");
       else if (name.equals("gl_TexCoord")) decl(varying_in, "vec4", "tcos_TexCoord", "[8]");
@@ -304,7 +305,8 @@ bool translate_desktop_glsl(StringView source, bool vertex, String* out, uint32_
     }
     if (!replacement) for (const Rename& r : kRenames) {
       if (!word.equals(r.from)) continue;
-      replacement = vertex ? r.vertex_to : r.fragment_to;
+      // (the geometry and tessellation stages: only the uniform state; the per-vertex compatibility values are not passed through them)
+      replacement = vertex ? r.vertex_to : (stage == DesktopStage::Fragment || r.use ? r.fragment_to : nullptr);
       break;
     }
     out->append(replacement ? StringView(replacement) : word);

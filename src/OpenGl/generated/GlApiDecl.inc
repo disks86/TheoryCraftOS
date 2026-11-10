@@ -413,6 +413,8 @@ void glNormalPointer(GLenum type, GLsizei stride, UserPtr pointer);
 void glNormalPointerEXT(GLenum type, GLsizei stride, GLsizei count, UserPtr pointer);
 void glOrtho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear, GLdouble zFar);
 void glPassThrough(GLfloat token);
+void glPatchParameterfv(GLenum pname, UserPtr values);
+void glPatchParameteri(GLenum pname, GLint value);
 void glPixelMapfv(GLenum map, GLsizei mapsize, UserPtr values);
 void glPixelMapuiv(GLenum map, GLsizei mapsize, UserPtr values);
 void glPixelMapusv(GLenum map, GLsizei mapsize, UserPtr values);

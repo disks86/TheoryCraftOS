@@ -413,373 +413,375 @@ case 411: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = 
 case 412: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glNormalPointerEXT(a0, a1, a2, a3); break; }
 case 413: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); const GLdouble a4 = rd.f64(); const GLdouble a5 = rd.f64(); api.glOrtho(a0, a1, a2, a3, a4, a5); break; }
 case 414: { const GLfloat a0 = rd.f32(); api.glPassThrough(a0); break; }
-case 415: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapfv(a0, a1, a2); break; }
-case 416: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapuiv(a0, a1, a2); break; }
-case 417: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapusv(a0, a1, a2); break; }
-case 418: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPixelStoref(a0, a1); break; }
-case 419: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPixelStorei(a0, a1); break; }
-case 420: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPixelTransferf(a0, a1); break; }
-case 421: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPixelTransferi(a0, a1); break; }
-case 422: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glPixelZoom(a0, a1); break; }
-case 423: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPointParameterf(a0, a1); break; }
-case 424: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glPointParameterfv(a0, a1); break; }
-case 425: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPointParameteri(a0, a1); break; }
-case 426: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glPointParameteriv(a0, a1); break; }
-case 427: { const GLfloat a0 = rd.f32(); api.glPointSize(a0); break; }
-case 428: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); api.glPolygonMode(a0, a1); break; }
-case 429: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glPolygonOffset(a0, a1); break; }
-case 430: { const UserPtr a0 = UserPtr{rd.u64()}; api.glPolygonStipple(a0); break; }
-case 431: { api.glPopAttrib(); break; }
-case 432: { api.glPopClientAttrib(); break; }
-case 433: { api.glPopMatrix(); break; }
-case 434: { api.glPopName(); break; }
-case 435: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glPrimitiveRestartIndex(a0); break; }
-case 436: { const GLsizei a0 = static_cast<GLsizei>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; const UserPtr a2 = UserPtr{rd.u64()}; api.glPrioritizeTextures(a0, a1, a2); break; }
-case 437: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1dv(a0, a1, a2, a3); break; }
-case 438: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); api.glProgramUniform1f(a0, a1, a2); break; }
-case 439: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1fv(a0, a1, a2, a3); break; }
-case 440: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glProgramUniform1i(a0, a1, a2); break; }
-case 441: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1iv(a0, a1, a2, a3); break; }
-case 442: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glProgramUniform1ui(a0, a1, a2); break; }
-case 443: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1uiv(a0, a1, a2, a3); break; }
-case 444: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2dv(a0, a1, a2, a3); break; }
-case 445: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glProgramUniform2f(a0, a1, a2, a3); break; }
-case 446: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2fv(a0, a1, a2, a3); break; }
-case 447: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glProgramUniform2i(a0, a1, a2, a3); break; }
-case 448: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2iv(a0, a1, a2, a3); break; }
-case 449: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glProgramUniform2ui(a0, a1, a2, a3); break; }
-case 450: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2uiv(a0, a1, a2, a3); break; }
-case 451: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3dv(a0, a1, a2, a3); break; }
-case 452: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glProgramUniform3f(a0, a1, a2, a3, a4); break; }
-case 453: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3fv(a0, a1, a2, a3); break; }
-case 454: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glProgramUniform3i(a0, a1, a2, a3, a4); break; }
-case 455: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3iv(a0, a1, a2, a3); break; }
-case 456: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glProgramUniform3ui(a0, a1, a2, a3, a4); break; }
-case 457: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3uiv(a0, a1, a2, a3); break; }
-case 458: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4dv(a0, a1, a2, a3); break; }
-case 459: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); const GLfloat a5 = rd.f32(); api.glProgramUniform4f(a0, a1, a2, a3, a4, a5); break; }
-case 460: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4fv(a0, a1, a2, a3); break; }
-case 461: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLint a5 = static_cast<GLint>(rd.u32()); api.glProgramUniform4i(a0, a1, a2, a3, a4, a5); break; }
-case 462: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4iv(a0, a1, a2, a3); break; }
-case 463: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); const GLuint a5 = static_cast<GLuint>(rd.u32()); api.glProgramUniform4ui(a0, a1, a2, a3, a4, a5); break; }
-case 464: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4uiv(a0, a1, a2, a3); break; }
-case 465: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2dv(a0, a1, a2, a3, a4); break; }
-case 466: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2fv(a0, a1, a2, a3, a4); break; }
-case 467: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x3dv(a0, a1, a2, a3, a4); break; }
-case 468: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x3fv(a0, a1, a2, a3, a4); break; }
-case 469: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x4dv(a0, a1, a2, a3, a4); break; }
-case 470: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x4fv(a0, a1, a2, a3, a4); break; }
-case 471: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3dv(a0, a1, a2, a3, a4); break; }
-case 472: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3fv(a0, a1, a2, a3, a4); break; }
-case 473: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x2dv(a0, a1, a2, a3, a4); break; }
-case 474: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x2fv(a0, a1, a2, a3, a4); break; }
-case 475: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x4dv(a0, a1, a2, a3, a4); break; }
-case 476: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x4fv(a0, a1, a2, a3, a4); break; }
-case 477: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4dv(a0, a1, a2, a3, a4); break; }
-case 478: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4fv(a0, a1, a2, a3, a4); break; }
-case 479: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x2dv(a0, a1, a2, a3, a4); break; }
-case 480: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x2fv(a0, a1, a2, a3, a4); break; }
-case 481: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x3dv(a0, a1, a2, a3, a4); break; }
-case 482: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x3fv(a0, a1, a2, a3, a4); break; }
-case 483: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glProvokingVertex(a0); break; }
-case 484: { const GLbitfield a0 = static_cast<GLbitfield>(rd.u32()); api.glPushAttrib(a0); break; }
-case 485: { const GLbitfield a0 = static_cast<GLbitfield>(rd.u32()); api.glPushClientAttrib(a0); break; }
-case 486: { api.glPushMatrix(); break; }
-case 487: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glPushName(a0); break; }
-case 488: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glRasterPos2d(a0, a1); break; }
-case 489: { GLdouble a0[2]; rd.array(a0); api.glRasterPos2dv(ArrayView<const GLdouble>(a0, 2)); break; }
-case 490: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glRasterPos2f(a0, a1); break; }
-case 491: { GLfloat a0[2]; rd.array(a0); api.glRasterPos2fv(ArrayView<const GLfloat>(a0, 2)); break; }
-case 492: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glRasterPos2i(a0, a1); break; }
-case 493: { GLint a0[2]; rd.array(a0); api.glRasterPos2iv(ArrayView<const GLint>(a0, 2)); break; }
-case 494: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glRasterPos2s(a0, a1); break; }
-case 495: { GLshort a0[2]; rd.array(a0); api.glRasterPos2sv(ArrayView<const GLshort>(a0, 2)); break; }
-case 496: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glRasterPos3d(a0, a1, a2); break; }
-case 497: { GLdouble a0[3]; rd.array(a0); api.glRasterPos3dv(ArrayView<const GLdouble>(a0, 3)); break; }
-case 498: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glRasterPos3f(a0, a1, a2); break; }
-case 499: { GLfloat a0[3]; rd.array(a0); api.glRasterPos3fv(ArrayView<const GLfloat>(a0, 3)); break; }
-case 500: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glRasterPos3i(a0, a1, a2); break; }
-case 501: { GLint a0[3]; rd.array(a0); api.glRasterPos3iv(ArrayView<const GLint>(a0, 3)); break; }
-case 502: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glRasterPos3s(a0, a1, a2); break; }
-case 503: { GLshort a0[3]; rd.array(a0); api.glRasterPos3sv(ArrayView<const GLshort>(a0, 3)); break; }
-case 504: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRasterPos4d(a0, a1, a2, a3); break; }
-case 505: { GLdouble a0[4]; rd.array(a0); api.glRasterPos4dv(ArrayView<const GLdouble>(a0, 4)); break; }
-case 506: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRasterPos4f(a0, a1, a2, a3); break; }
-case 507: { GLfloat a0[4]; rd.array(a0); api.glRasterPos4fv(ArrayView<const GLfloat>(a0, 4)); break; }
-case 508: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glRasterPos4i(a0, a1, a2, a3); break; }
-case 509: { GLint a0[4]; rd.array(a0); api.glRasterPos4iv(ArrayView<const GLint>(a0, 4)); break; }
-case 510: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glRasterPos4s(a0, a1, a2, a3); break; }
-case 511: { GLshort a0[4]; rd.array(a0); api.glRasterPos4sv(ArrayView<const GLshort>(a0, 4)); break; }
-case 512: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glReadBuffer(a0); break; }
-case 513: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLenum a4 = static_cast<GLenum>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const UserPtr a6 = UserPtr{rd.u64()}; api.glReadPixels(a0, a1, a2, a3, a4, a5, a6); break; }
-case 514: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRectd(a0, a1, a2, a3); break; }
-case 515: { GLdouble a0[2]; rd.array(a0); GLdouble a1[2]; rd.array(a1); api.glRectdv(ArrayView<const GLdouble>(a0, 2), ArrayView<const GLdouble>(a1, 2)); break; }
-case 516: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRectf(a0, a1, a2, a3); break; }
-case 517: { GLfloat a0[2]; rd.array(a0); GLfloat a1[2]; rd.array(a1); api.glRectfv(ArrayView<const GLfloat>(a0, 2), ArrayView<const GLfloat>(a1, 2)); break; }
-case 518: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glRecti(a0, a1, a2, a3); break; }
-case 519: { GLint a0[2]; rd.array(a0); GLint a1[2]; rd.array(a1); api.glRectiv(ArrayView<const GLint>(a0, 2), ArrayView<const GLint>(a1, 2)); break; }
-case 520: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glRects(a0, a1, a2, a3); break; }
-case 521: { GLshort a0[2]; rd.array(a0); GLshort a1[2]; rd.array(a1); api.glRectsv(ArrayView<const GLshort>(a0, 2), ArrayView<const GLshort>(a1, 2)); break; }
-case 522: { const GLenum a0 = static_cast<GLenum>(rd.u32()); result = api.glRenderMode(a0); break; }
-case 523: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glRenderbufferStorage(a0, a1, a2, a3); break; }
-case 524: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); api.glRenderbufferStorageMultisample(a0, a1, a2, a3, a4); break; }
-case 525: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRotated(a0, a1, a2, a3); break; }
-case 526: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRotatef(a0, a1, a2, a3); break; }
-case 527: { const GLfloat a0 = rd.f32(); const GLboolean a1 = static_cast<GLboolean>(rd.u32()); api.glSampleCoverage(a0, a1); break; }
-case 528: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterIiv(a0, a1, a2); break; }
-case 529: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterIuiv(a0, a1, a2); break; }
-case 530: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glSamplerParameterf(a0, a1, a2); break; }
-case 531: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterfv(a0, a1, a2); break; }
-case 532: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glSamplerParameteri(a0, a1, a2); break; }
-case 533: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameteriv(a0, a1, a2); break; }
-case 534: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glScaled(a0, a1, a2); break; }
-case 535: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glScalef(a0, a1, a2); break; }
-case 536: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glScissor(a0, a1, a2, a3); break; }
-case 537: { const GLbyte a0 = static_cast<GLbyte>(rd.u32()); const GLbyte a1 = static_cast<GLbyte>(rd.u32()); const GLbyte a2 = static_cast<GLbyte>(rd.u32()); api.glSecondaryColor3b(a0, a1, a2); break; }
-case 538: { GLbyte a0[3]; rd.array(a0); api.glSecondaryColor3bv(ArrayView<const GLbyte>(a0, 3)); break; }
-case 539: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glSecondaryColor3d(a0, a1, a2); break; }
-case 540: { GLdouble a0[3]; rd.array(a0); api.glSecondaryColor3dv(ArrayView<const GLdouble>(a0, 3)); break; }
-case 541: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glSecondaryColor3f(a0, a1, a2); break; }
-case 542: { GLfloat a0[3]; rd.array(a0); api.glSecondaryColor3fv(ArrayView<const GLfloat>(a0, 3)); break; }
-case 543: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glSecondaryColor3i(a0, a1, a2); break; }
-case 544: { GLint a0[3]; rd.array(a0); api.glSecondaryColor3iv(ArrayView<const GLint>(a0, 3)); break; }
-case 545: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glSecondaryColor3s(a0, a1, a2); break; }
-case 546: { GLshort a0[3]; rd.array(a0); api.glSecondaryColor3sv(ArrayView<const GLshort>(a0, 3)); break; }
-case 547: { const GLubyte a0 = static_cast<GLubyte>(rd.u32()); const GLubyte a1 = static_cast<GLubyte>(rd.u32()); const GLubyte a2 = static_cast<GLubyte>(rd.u32()); api.glSecondaryColor3ub(a0, a1, a2); break; }
-case 548: { GLubyte a0[3]; rd.array(a0); api.glSecondaryColor3ubv(ArrayView<const GLubyte>(a0, 3)); break; }
-case 549: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glSecondaryColor3ui(a0, a1, a2); break; }
-case 550: { GLuint a0[3]; rd.array(a0); api.glSecondaryColor3uiv(ArrayView<const GLuint>(a0, 3)); break; }
-case 551: { const GLushort a0 = static_cast<GLushort>(rd.u32()); const GLushort a1 = static_cast<GLushort>(rd.u32()); const GLushort a2 = static_cast<GLushort>(rd.u32()); api.glSecondaryColor3us(a0, a1, a2); break; }
-case 552: { GLushort a0[3]; rd.array(a0); api.glSecondaryColor3usv(ArrayView<const GLushort>(a0, 3)); break; }
-case 553: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glSecondaryColorPointer(a0, a1, a2, a3); break; }
-case 554: { const GLsizei a0 = static_cast<GLsizei>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glSelectBuffer(a0, a1); break; }
-case 555: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glShadeModel(a0); break; }
-case 556: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; const UserPtr a3 = UserPtr{rd.u64()}; api.glShaderSource(a0, a1, a2, a3); break; }
-case 557: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glStencilFunc(a0, a1, a2); break; }
-case 558: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glStencilFuncSeparate(a0, a1, a2, a3); break; }
-case 559: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glStencilMask(a0); break; }
-case 560: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glStencilMaskSeparate(a0, a1); break; }
-case 561: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); api.glStencilOp(a0, a1, a2); break; }
-case 562: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLenum a3 = static_cast<GLenum>(rd.u32()); api.glStencilOpSeparate(a0, a1, a2, a3); break; }
-case 563: { const GLdouble a0 = rd.f64(); api.glTexCoord1d(a0); break; }
-case 564: { GLdouble a0[1]; rd.array(a0); api.glTexCoord1dv(ArrayView<const GLdouble>(a0, 1)); break; }
-case 565: { const GLfloat a0 = rd.f32(); api.glTexCoord1f(a0); break; }
-case 566: { GLfloat a0[1]; rd.array(a0); api.glTexCoord1fv(ArrayView<const GLfloat>(a0, 1)); break; }
-case 567: { const GLint a0 = static_cast<GLint>(rd.u32()); api.glTexCoord1i(a0); break; }
-case 568: { GLint a0[1]; rd.array(a0); api.glTexCoord1iv(ArrayView<const GLint>(a0, 1)); break; }
-case 569: { const GLshort a0 = static_cast<GLshort>(rd.u32()); api.glTexCoord1s(a0); break; }
-case 570: { GLshort a0[1]; rd.array(a0); api.glTexCoord1sv(ArrayView<const GLshort>(a0, 1)); break; }
-case 571: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glTexCoord2d(a0, a1); break; }
-case 572: { GLdouble a0[2]; rd.array(a0); api.glTexCoord2dv(ArrayView<const GLdouble>(a0, 2)); break; }
-case 573: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glTexCoord2f(a0, a1); break; }
-case 574: { GLfloat a0[2]; rd.array(a0); api.glTexCoord2fv(ArrayView<const GLfloat>(a0, 2)); break; }
-case 575: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glTexCoord2i(a0, a1); break; }
-case 576: { GLint a0[2]; rd.array(a0); api.glTexCoord2iv(ArrayView<const GLint>(a0, 2)); break; }
-case 577: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glTexCoord2s(a0, a1); break; }
-case 578: { GLshort a0[2]; rd.array(a0); api.glTexCoord2sv(ArrayView<const GLshort>(a0, 2)); break; }
-case 579: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glTexCoord3d(a0, a1, a2); break; }
-case 580: { GLdouble a0[3]; rd.array(a0); api.glTexCoord3dv(ArrayView<const GLdouble>(a0, 3)); break; }
-case 581: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glTexCoord3f(a0, a1, a2); break; }
-case 582: { GLfloat a0[3]; rd.array(a0); api.glTexCoord3fv(ArrayView<const GLfloat>(a0, 3)); break; }
-case 583: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexCoord3i(a0, a1, a2); break; }
-case 584: { GLint a0[3]; rd.array(a0); api.glTexCoord3iv(ArrayView<const GLint>(a0, 3)); break; }
-case 585: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glTexCoord3s(a0, a1, a2); break; }
-case 586: { GLshort a0[3]; rd.array(a0); api.glTexCoord3sv(ArrayView<const GLshort>(a0, 3)); break; }
-case 587: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glTexCoord4d(a0, a1, a2, a3); break; }
-case 588: { GLdouble a0[4]; rd.array(a0); api.glTexCoord4dv(ArrayView<const GLdouble>(a0, 4)); break; }
-case 589: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glTexCoord4f(a0, a1, a2, a3); break; }
-case 590: { GLfloat a0[4]; rd.array(a0); api.glTexCoord4fv(ArrayView<const GLfloat>(a0, 4)); break; }
-case 591: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glTexCoord4i(a0, a1, a2, a3); break; }
-case 592: { GLint a0[4]; rd.array(a0); api.glTexCoord4iv(ArrayView<const GLint>(a0, 4)); break; }
-case 593: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glTexCoord4s(a0, a1, a2, a3); break; }
-case 594: { GLshort a0[4]; rd.array(a0); api.glTexCoord4sv(ArrayView<const GLshort>(a0, 4)); break; }
-case 595: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glTexCoordPointer(a0, a1, a2, a3); break; }
-case 596: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glTexCoordPointerEXT(a0, a1, a2, a3, a4); break; }
-case 597: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexEnvf(a0, a1, a2); break; }
-case 598: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexEnvfv(a0, a1, a2); break; }
-case 599: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexEnvi(a0, a1, a2); break; }
-case 600: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexEnviv(a0, a1, a2); break; }
-case 601: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLdouble a2 = rd.f64(); api.glTexGend(a0, a1, a2); break; }
-case 602: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGendv(a0, a1, a2); break; }
-case 603: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexGenf(a0, a1, a2); break; }
-case 604: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGenfv(a0, a1, a2); break; }
-case 605: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexGeni(a0, a1, a2); break; }
-case 606: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGeniv(a0, a1, a2); break; }
-case 607: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const UserPtr a7 = UserPtr{rd.u64()}; api.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, a7); break; }
-case 608: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLint a5 = static_cast<GLint>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const UserPtr a8 = UserPtr{rd.u64()}; api.glTexImage2D(a0, a1, a2, a3, a4, a5, a6, a7, a8); break; }
-case 609: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLint a6 = static_cast<GLint>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const GLenum a8 = static_cast<GLenum>(rd.u32()); const UserPtr a9 = UserPtr{rd.u64()}; api.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); break; }
-case 610: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexParameterf(a0, a1, a2); break; }
-case 611: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexParameterfv(a0, a1, a2); break; }
-case 612: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexParameteri(a0, a1, a2); break; }
-case 613: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexParameteriv(a0, a1, a2); break; }
-case 614: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glTexStorage1D(a0, a1, a2, a3); break; }
-case 615: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); api.glTexStorage2D(a0, a1, a2, a3, a4); break; }
-case 616: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); api.glTexStorage3D(a0, a1, a2, a3, a4, a5); break; }
-case 617: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLenum a4 = static_cast<GLenum>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const UserPtr a6 = UserPtr{rd.u64()}; api.glTexSubImage1D(a0, a1, a2, a3, a4, a5, a6); break; }
-case 618: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const UserPtr a8 = UserPtr{rd.u64()}; api.glTexSubImage2D(a0, a1, a2, a3, a4, a5, a6, a7, a8); break; }
-case 619: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLsizei a6 = static_cast<GLsizei>(rd.u32()); const GLsizei a7 = static_cast<GLsizei>(rd.u32()); const GLenum a8 = static_cast<GLenum>(rd.u32()); const GLenum a9 = static_cast<GLenum>(rd.u32()); const UserPtr a10 = UserPtr{rd.u64()}; api.glTexSubImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10); break; }
-case 620: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; const GLenum a3 = static_cast<GLenum>(rd.u32()); api.glTransformFeedbackVaryings(a0, a1, a2, a3); break; }
-case 621: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glTranslated(a0, a1, a2); break; }
-case 622: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glTranslatef(a0, a1, a2); break; }
-case 623: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1dv(a0, a1, a2); break; }
-case 624: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); api.glUniform1f(a0, a1); break; }
-case 625: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1fv(a0, a1, a2); break; }
-case 626: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glUniform1i(a0, a1); break; }
-case 627: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1iv(a0, a1, a2); break; }
-case 628: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glUniform1ui(a0, a1); break; }
-case 629: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1uiv(a0, a1, a2); break; }
-case 630: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2dv(a0, a1, a2); break; }
-case 631: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glUniform2f(a0, a1, a2); break; }
-case 632: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2fv(a0, a1, a2); break; }
-case 633: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glUniform2i(a0, a1, a2); break; }
-case 634: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2iv(a0, a1, a2); break; }
-case 635: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glUniform2ui(a0, a1, a2); break; }
-case 636: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2uiv(a0, a1, a2); break; }
-case 637: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3dv(a0, a1, a2); break; }
-case 638: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glUniform3f(a0, a1, a2, a3); break; }
-case 639: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3fv(a0, a1, a2); break; }
-case 640: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glUniform3i(a0, a1, a2, a3); break; }
-case 641: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3iv(a0, a1, a2); break; }
-case 642: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glUniform3ui(a0, a1, a2, a3); break; }
-case 643: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3uiv(a0, a1, a2); break; }
-case 644: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4dv(a0, a1, a2); break; }
-case 645: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glUniform4f(a0, a1, a2, a3, a4); break; }
-case 646: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4fv(a0, a1, a2); break; }
-case 647: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glUniform4i(a0, a1, a2, a3, a4); break; }
-case 648: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4iv(a0, a1, a2); break; }
-case 649: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glUniform4ui(a0, a1, a2, a3, a4); break; }
-case 650: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4uiv(a0, a1, a2); break; }
-case 651: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glUniformBlockBinding(a0, a1, a2); break; }
-case 652: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2dv(a0, a1, a2, a3); break; }
-case 653: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2fv(a0, a1, a2, a3); break; }
-case 654: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x3dv(a0, a1, a2, a3); break; }
-case 655: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x3fv(a0, a1, a2, a3); break; }
-case 656: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x4dv(a0, a1, a2, a3); break; }
-case 657: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x4fv(a0, a1, a2, a3); break; }
-case 658: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3dv(a0, a1, a2, a3); break; }
-case 659: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3fv(a0, a1, a2, a3); break; }
-case 660: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x2dv(a0, a1, a2, a3); break; }
-case 661: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x2fv(a0, a1, a2, a3); break; }
-case 662: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x4dv(a0, a1, a2, a3); break; }
-case 663: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x4fv(a0, a1, a2, a3); break; }
-case 664: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4dv(a0, a1, a2, a3); break; }
-case 665: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4fv(a0, a1, a2, a3); break; }
-case 666: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x2dv(a0, a1, a2, a3); break; }
-case 667: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x2fv(a0, a1, a2, a3); break; }
-case 668: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x3dv(a0, a1, a2, a3); break; }
-case 669: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x3fv(a0, a1, a2, a3); break; }
-case 670: { const GLenum a0 = static_cast<GLenum>(rd.u32()); result = api.glUnmapBuffer(a0); break; }
-case 671: { const GLuint a0 = static_cast<GLuint>(rd.u32()); result = api.glUnmapNamedBuffer(a0); break; }
-case 672: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glUseProgram(a0); break; }
-case 673: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glValidateProgram(a0); break; }
-case 674: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glVertex2d(a0, a1); break; }
-case 675: { GLdouble a0[2]; rd.array(a0); api.glVertex2dv(ArrayView<const GLdouble>(a0, 2)); break; }
-case 676: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glVertex2f(a0, a1); break; }
-case 677: { GLfloat a0[2]; rd.array(a0); api.glVertex2fv(ArrayView<const GLfloat>(a0, 2)); break; }
-case 678: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glVertex2i(a0, a1); break; }
-case 679: { GLint a0[2]; rd.array(a0); api.glVertex2iv(ArrayView<const GLint>(a0, 2)); break; }
-case 680: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glVertex2s(a0, a1); break; }
-case 681: { GLshort a0[2]; rd.array(a0); api.glVertex2sv(ArrayView<const GLshort>(a0, 2)); break; }
-case 682: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertex3d(a0, a1, a2); break; }
-case 683: { GLdouble a0[3]; rd.array(a0); api.glVertex3dv(ArrayView<const GLdouble>(a0, 3)); break; }
-case 684: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glVertex3f(a0, a1, a2); break; }
-case 685: { GLfloat a0[3]; rd.array(a0); api.glVertex3fv(ArrayView<const GLfloat>(a0, 3)); break; }
-case 686: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glVertex3i(a0, a1, a2); break; }
-case 687: { GLint a0[3]; rd.array(a0); api.glVertex3iv(ArrayView<const GLint>(a0, 3)); break; }
-case 688: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glVertex3s(a0, a1, a2); break; }
-case 689: { GLshort a0[3]; rd.array(a0); api.glVertex3sv(ArrayView<const GLshort>(a0, 3)); break; }
-case 690: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertex4d(a0, a1, a2, a3); break; }
-case 691: { GLdouble a0[4]; rd.array(a0); api.glVertex4dv(ArrayView<const GLdouble>(a0, 4)); break; }
-case 692: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glVertex4f(a0, a1, a2, a3); break; }
-case 693: { GLfloat a0[4]; rd.array(a0); api.glVertex4fv(ArrayView<const GLfloat>(a0, 4)); break; }
-case 694: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glVertex4i(a0, a1, a2, a3); break; }
-case 695: { GLint a0[4]; rd.array(a0); api.glVertex4iv(ArrayView<const GLint>(a0, 4)); break; }
-case 696: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glVertex4s(a0, a1, a2, a3); break; }
-case 697: { GLshort a0[4]; rd.array(a0); api.glVertex4sv(ArrayView<const GLshort>(a0, 4)); break; }
-case 698: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); api.glVertexAttrib1d(a0, a1); break; }
-case 699: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[1]; rd.array(a1); api.glVertexAttrib1dv(a0, ArrayView<const GLdouble>(a1, 1)); break; }
-case 700: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); api.glVertexAttrib1f(a0, a1); break; }
-case 701: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[1]; rd.array(a1); api.glVertexAttrib1fv(a0, ArrayView<const GLfloat>(a1, 1)); break; }
-case 702: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib1s(a0, a1); break; }
-case 703: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[1]; rd.array(a1); api.glVertexAttrib1sv(a0, ArrayView<const GLshort>(a1, 1)); break; }
-case 704: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertexAttrib2d(a0, a1, a2); break; }
-case 705: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[2]; rd.array(a1); api.glVertexAttrib2dv(a0, ArrayView<const GLdouble>(a1, 2)); break; }
-case 706: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glVertexAttrib2f(a0, a1, a2); break; }
-case 707: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[2]; rd.array(a1); api.glVertexAttrib2fv(a0, ArrayView<const GLfloat>(a1, 2)); break; }
-case 708: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib2s(a0, a1, a2); break; }
-case 709: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[2]; rd.array(a1); api.glVertexAttrib2sv(a0, ArrayView<const GLshort>(a1, 2)); break; }
-case 710: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertexAttrib3d(a0, a1, a2, a3); break; }
-case 711: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[3]; rd.array(a1); api.glVertexAttrib3dv(a0, ArrayView<const GLdouble>(a1, 3)); break; }
-case 712: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glVertexAttrib3f(a0, a1, a2, a3); break; }
-case 713: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[3]; rd.array(a1); api.glVertexAttrib3fv(a0, ArrayView<const GLfloat>(a1, 3)); break; }
-case 714: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib3s(a0, a1, a2, a3); break; }
-case 715: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[3]; rd.array(a1); api.glVertexAttrib3sv(a0, ArrayView<const GLshort>(a1, 3)); break; }
-case 716: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttrib4Nbv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
-case 717: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttrib4Niv(a0, ArrayView<const GLint>(a1, 4)); break; }
-case 718: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttrib4Nsv(a0, ArrayView<const GLshort>(a1, 4)); break; }
-case 719: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLubyte a1 = static_cast<GLubyte>(rd.u32()); const GLubyte a2 = static_cast<GLubyte>(rd.u32()); const GLubyte a3 = static_cast<GLubyte>(rd.u32()); const GLubyte a4 = static_cast<GLubyte>(rd.u32()); api.glVertexAttrib4Nub(a0, a1, a2, a3, a4); break; }
-case 720: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttrib4Nubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
-case 721: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttrib4Nuiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
-case 722: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttrib4Nusv(a0, ArrayView<const GLushort>(a1, 4)); break; }
-case 723: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttrib4bv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
-case 724: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); const GLdouble a4 = rd.f64(); api.glVertexAttrib4d(a0, a1, a2, a3, a4); break; }
-case 725: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[4]; rd.array(a1); api.glVertexAttrib4dv(a0, ArrayView<const GLdouble>(a1, 4)); break; }
-case 726: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glVertexAttrib4f(a0, a1, a2, a3, a4); break; }
-case 727: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[4]; rd.array(a1); api.glVertexAttrib4fv(a0, ArrayView<const GLfloat>(a1, 4)); break; }
-case 728: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttrib4iv(a0, ArrayView<const GLint>(a1, 4)); break; }
-case 729: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); const GLshort a4 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib4s(a0, a1, a2, a3, a4); break; }
-case 730: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttrib4sv(a0, ArrayView<const GLshort>(a1, 4)); break; }
-case 731: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttrib4ubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
-case 732: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttrib4uiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
-case 733: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttrib4usv(a0, ArrayView<const GLushort>(a1, 4)); break; }
-case 734: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glVertexAttribDivisor(a0, a1); break; }
-case 735: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glVertexAttribI1i(a0, a1); break; }
-case 736: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[1]; rd.array(a1); api.glVertexAttribI1iv(a0, ArrayView<const GLint>(a1, 1)); break; }
-case 737: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI1ui(a0, a1); break; }
-case 738: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[1]; rd.array(a1); api.glVertexAttribI1uiv(a0, ArrayView<const GLuint>(a1, 1)); break; }
-case 739: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glVertexAttribI2i(a0, a1, a2); break; }
-case 740: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[2]; rd.array(a1); api.glVertexAttribI2iv(a0, ArrayView<const GLint>(a1, 2)); break; }
-case 741: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI2ui(a0, a1, a2); break; }
-case 742: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[2]; rd.array(a1); api.glVertexAttribI2uiv(a0, ArrayView<const GLuint>(a1, 2)); break; }
-case 743: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glVertexAttribI3i(a0, a1, a2, a3); break; }
-case 744: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[3]; rd.array(a1); api.glVertexAttribI3iv(a0, ArrayView<const GLint>(a1, 3)); break; }
-case 745: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI3ui(a0, a1, a2, a3); break; }
-case 746: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[3]; rd.array(a1); api.glVertexAttribI3uiv(a0, ArrayView<const GLuint>(a1, 3)); break; }
-case 747: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttribI4bv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
-case 748: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glVertexAttribI4i(a0, a1, a2, a3, a4); break; }
-case 749: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttribI4iv(a0, ArrayView<const GLint>(a1, 4)); break; }
-case 750: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttribI4sv(a0, ArrayView<const GLshort>(a1, 4)); break; }
-case 751: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttribI4ubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
-case 752: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI4ui(a0, a1, a2, a3, a4); break; }
-case 753: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttribI4uiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
-case 754: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttribI4usv(a0, ArrayView<const GLushort>(a1, 4)); break; }
-case 755: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glVertexAttribIPointer(a0, a1, a2, a3, a4); break; }
-case 756: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); api.glVertexAttribL1d(a0, a1); break; }
-case 757: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[1]; rd.array(a1); api.glVertexAttribL1dv(a0, ArrayView<const GLdouble>(a1, 1)); break; }
-case 758: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertexAttribL2d(a0, a1, a2); break; }
-case 759: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[2]; rd.array(a1); api.glVertexAttribL2dv(a0, ArrayView<const GLdouble>(a1, 2)); break; }
-case 760: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertexAttribL3d(a0, a1, a2, a3); break; }
-case 761: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[3]; rd.array(a1); api.glVertexAttribL3dv(a0, ArrayView<const GLdouble>(a1, 3)); break; }
-case 762: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); const GLdouble a4 = rd.f64(); api.glVertexAttribL4d(a0, a1, a2, a3, a4); break; }
-case 763: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[4]; rd.array(a1); api.glVertexAttribL4dv(a0, ArrayView<const GLdouble>(a1, 4)); break; }
-case 764: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const UserPtr a5 = UserPtr{rd.u64()}; api.glVertexAttribPointer(a0, a1, a2, a3, a4, a5); break; }
-case 765: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glVertexPointer(a0, a1, a2, a3); break; }
-case 766: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glVertexPointerEXT(a0, a1, a2, a3, a4); break; }
-case 767: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glViewport(a0, a1, a2, a3); break; }
-case 768: { const GLsync a0 = static_cast<GLsync>(rd.u64()); const GLbitfield a1 = static_cast<GLbitfield>(rd.u32()); const GLuint64 a2 = static_cast<GLuint64>(rd.u64()); api.glWaitSync(a0, a1, a2); break; }
-case 769: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glWindowPos2d(a0, a1); break; }
-case 770: { GLdouble a0[2]; rd.array(a0); api.glWindowPos2dv(ArrayView<const GLdouble>(a0, 2)); break; }
-case 771: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glWindowPos2f(a0, a1); break; }
-case 772: { GLfloat a0[2]; rd.array(a0); api.glWindowPos2fv(ArrayView<const GLfloat>(a0, 2)); break; }
-case 773: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glWindowPos2i(a0, a1); break; }
-case 774: { GLint a0[2]; rd.array(a0); api.glWindowPos2iv(ArrayView<const GLint>(a0, 2)); break; }
-case 775: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glWindowPos2s(a0, a1); break; }
-case 776: { GLshort a0[2]; rd.array(a0); api.glWindowPos2sv(ArrayView<const GLshort>(a0, 2)); break; }
-case 777: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glWindowPos3d(a0, a1, a2); break; }
-case 778: { GLdouble a0[3]; rd.array(a0); api.glWindowPos3dv(ArrayView<const GLdouble>(a0, 3)); break; }
-case 779: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glWindowPos3f(a0, a1, a2); break; }
-case 780: { GLfloat a0[3]; rd.array(a0); api.glWindowPos3fv(ArrayView<const GLfloat>(a0, 3)); break; }
-case 781: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glWindowPos3i(a0, a1, a2); break; }
-case 782: { GLint a0[3]; rd.array(a0); api.glWindowPos3iv(ArrayView<const GLint>(a0, 3)); break; }
-case 783: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glWindowPos3s(a0, a1, a2); break; }
-case 784: { GLshort a0[3]; rd.array(a0); api.glWindowPos3sv(ArrayView<const GLshort>(a0, 3)); break; }
+case 415: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glPatchParameterfv(a0, a1); break; }
+case 416: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPatchParameteri(a0, a1); break; }
+case 417: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapfv(a0, a1, a2); break; }
+case 418: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapuiv(a0, a1, a2); break; }
+case 419: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glPixelMapusv(a0, a1, a2); break; }
+case 420: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPixelStoref(a0, a1); break; }
+case 421: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPixelStorei(a0, a1); break; }
+case 422: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPixelTransferf(a0, a1); break; }
+case 423: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPixelTransferi(a0, a1); break; }
+case 424: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glPixelZoom(a0, a1); break; }
+case 425: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLfloat a1 = rd.f32(); api.glPointParameterf(a0, a1); break; }
+case 426: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glPointParameterfv(a0, a1); break; }
+case 427: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glPointParameteri(a0, a1); break; }
+case 428: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glPointParameteriv(a0, a1); break; }
+case 429: { const GLfloat a0 = rd.f32(); api.glPointSize(a0); break; }
+case 430: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); api.glPolygonMode(a0, a1); break; }
+case 431: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glPolygonOffset(a0, a1); break; }
+case 432: { const UserPtr a0 = UserPtr{rd.u64()}; api.glPolygonStipple(a0); break; }
+case 433: { api.glPopAttrib(); break; }
+case 434: { api.glPopClientAttrib(); break; }
+case 435: { api.glPopMatrix(); break; }
+case 436: { api.glPopName(); break; }
+case 437: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glPrimitiveRestartIndex(a0); break; }
+case 438: { const GLsizei a0 = static_cast<GLsizei>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; const UserPtr a2 = UserPtr{rd.u64()}; api.glPrioritizeTextures(a0, a1, a2); break; }
+case 439: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1dv(a0, a1, a2, a3); break; }
+case 440: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); api.glProgramUniform1f(a0, a1, a2); break; }
+case 441: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1fv(a0, a1, a2, a3); break; }
+case 442: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glProgramUniform1i(a0, a1, a2); break; }
+case 443: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1iv(a0, a1, a2, a3); break; }
+case 444: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glProgramUniform1ui(a0, a1, a2); break; }
+case 445: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform1uiv(a0, a1, a2, a3); break; }
+case 446: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2dv(a0, a1, a2, a3); break; }
+case 447: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glProgramUniform2f(a0, a1, a2, a3); break; }
+case 448: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2fv(a0, a1, a2, a3); break; }
+case 449: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glProgramUniform2i(a0, a1, a2, a3); break; }
+case 450: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2iv(a0, a1, a2, a3); break; }
+case 451: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glProgramUniform2ui(a0, a1, a2, a3); break; }
+case 452: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform2uiv(a0, a1, a2, a3); break; }
+case 453: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3dv(a0, a1, a2, a3); break; }
+case 454: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glProgramUniform3f(a0, a1, a2, a3, a4); break; }
+case 455: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3fv(a0, a1, a2, a3); break; }
+case 456: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glProgramUniform3i(a0, a1, a2, a3, a4); break; }
+case 457: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3iv(a0, a1, a2, a3); break; }
+case 458: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glProgramUniform3ui(a0, a1, a2, a3, a4); break; }
+case 459: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform3uiv(a0, a1, a2, a3); break; }
+case 460: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4dv(a0, a1, a2, a3); break; }
+case 461: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); const GLfloat a5 = rd.f32(); api.glProgramUniform4f(a0, a1, a2, a3, a4, a5); break; }
+case 462: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4fv(a0, a1, a2, a3); break; }
+case 463: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLint a5 = static_cast<GLint>(rd.u32()); api.glProgramUniform4i(a0, a1, a2, a3, a4, a5); break; }
+case 464: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4iv(a0, a1, a2, a3); break; }
+case 465: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); const GLuint a5 = static_cast<GLuint>(rd.u32()); api.glProgramUniform4ui(a0, a1, a2, a3, a4, a5); break; }
+case 466: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glProgramUniform4uiv(a0, a1, a2, a3); break; }
+case 467: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2dv(a0, a1, a2, a3, a4); break; }
+case 468: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2fv(a0, a1, a2, a3, a4); break; }
+case 469: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x3dv(a0, a1, a2, a3, a4); break; }
+case 470: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x3fv(a0, a1, a2, a3, a4); break; }
+case 471: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x4dv(a0, a1, a2, a3, a4); break; }
+case 472: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix2x4fv(a0, a1, a2, a3, a4); break; }
+case 473: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3dv(a0, a1, a2, a3, a4); break; }
+case 474: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3fv(a0, a1, a2, a3, a4); break; }
+case 475: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x2dv(a0, a1, a2, a3, a4); break; }
+case 476: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x2fv(a0, a1, a2, a3, a4); break; }
+case 477: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x4dv(a0, a1, a2, a3, a4); break; }
+case 478: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix3x4fv(a0, a1, a2, a3, a4); break; }
+case 479: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4dv(a0, a1, a2, a3, a4); break; }
+case 480: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4fv(a0, a1, a2, a3, a4); break; }
+case 481: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x2dv(a0, a1, a2, a3, a4); break; }
+case 482: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x2fv(a0, a1, a2, a3, a4); break; }
+case 483: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x3dv(a0, a1, a2, a3, a4); break; }
+case 484: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glProgramUniformMatrix4x3fv(a0, a1, a2, a3, a4); break; }
+case 485: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glProvokingVertex(a0); break; }
+case 486: { const GLbitfield a0 = static_cast<GLbitfield>(rd.u32()); api.glPushAttrib(a0); break; }
+case 487: { const GLbitfield a0 = static_cast<GLbitfield>(rd.u32()); api.glPushClientAttrib(a0); break; }
+case 488: { api.glPushMatrix(); break; }
+case 489: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glPushName(a0); break; }
+case 490: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glRasterPos2d(a0, a1); break; }
+case 491: { GLdouble a0[2]; rd.array(a0); api.glRasterPos2dv(ArrayView<const GLdouble>(a0, 2)); break; }
+case 492: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glRasterPos2f(a0, a1); break; }
+case 493: { GLfloat a0[2]; rd.array(a0); api.glRasterPos2fv(ArrayView<const GLfloat>(a0, 2)); break; }
+case 494: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glRasterPos2i(a0, a1); break; }
+case 495: { GLint a0[2]; rd.array(a0); api.glRasterPos2iv(ArrayView<const GLint>(a0, 2)); break; }
+case 496: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glRasterPos2s(a0, a1); break; }
+case 497: { GLshort a0[2]; rd.array(a0); api.glRasterPos2sv(ArrayView<const GLshort>(a0, 2)); break; }
+case 498: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glRasterPos3d(a0, a1, a2); break; }
+case 499: { GLdouble a0[3]; rd.array(a0); api.glRasterPos3dv(ArrayView<const GLdouble>(a0, 3)); break; }
+case 500: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glRasterPos3f(a0, a1, a2); break; }
+case 501: { GLfloat a0[3]; rd.array(a0); api.glRasterPos3fv(ArrayView<const GLfloat>(a0, 3)); break; }
+case 502: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glRasterPos3i(a0, a1, a2); break; }
+case 503: { GLint a0[3]; rd.array(a0); api.glRasterPos3iv(ArrayView<const GLint>(a0, 3)); break; }
+case 504: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glRasterPos3s(a0, a1, a2); break; }
+case 505: { GLshort a0[3]; rd.array(a0); api.glRasterPos3sv(ArrayView<const GLshort>(a0, 3)); break; }
+case 506: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRasterPos4d(a0, a1, a2, a3); break; }
+case 507: { GLdouble a0[4]; rd.array(a0); api.glRasterPos4dv(ArrayView<const GLdouble>(a0, 4)); break; }
+case 508: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRasterPos4f(a0, a1, a2, a3); break; }
+case 509: { GLfloat a0[4]; rd.array(a0); api.glRasterPos4fv(ArrayView<const GLfloat>(a0, 4)); break; }
+case 510: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glRasterPos4i(a0, a1, a2, a3); break; }
+case 511: { GLint a0[4]; rd.array(a0); api.glRasterPos4iv(ArrayView<const GLint>(a0, 4)); break; }
+case 512: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glRasterPos4s(a0, a1, a2, a3); break; }
+case 513: { GLshort a0[4]; rd.array(a0); api.glRasterPos4sv(ArrayView<const GLshort>(a0, 4)); break; }
+case 514: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glReadBuffer(a0); break; }
+case 515: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLenum a4 = static_cast<GLenum>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const UserPtr a6 = UserPtr{rd.u64()}; api.glReadPixels(a0, a1, a2, a3, a4, a5, a6); break; }
+case 516: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRectd(a0, a1, a2, a3); break; }
+case 517: { GLdouble a0[2]; rd.array(a0); GLdouble a1[2]; rd.array(a1); api.glRectdv(ArrayView<const GLdouble>(a0, 2), ArrayView<const GLdouble>(a1, 2)); break; }
+case 518: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRectf(a0, a1, a2, a3); break; }
+case 519: { GLfloat a0[2]; rd.array(a0); GLfloat a1[2]; rd.array(a1); api.glRectfv(ArrayView<const GLfloat>(a0, 2), ArrayView<const GLfloat>(a1, 2)); break; }
+case 520: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glRecti(a0, a1, a2, a3); break; }
+case 521: { GLint a0[2]; rd.array(a0); GLint a1[2]; rd.array(a1); api.glRectiv(ArrayView<const GLint>(a0, 2), ArrayView<const GLint>(a1, 2)); break; }
+case 522: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glRects(a0, a1, a2, a3); break; }
+case 523: { GLshort a0[2]; rd.array(a0); GLshort a1[2]; rd.array(a1); api.glRectsv(ArrayView<const GLshort>(a0, 2), ArrayView<const GLshort>(a1, 2)); break; }
+case 524: { const GLenum a0 = static_cast<GLenum>(rd.u32()); result = api.glRenderMode(a0); break; }
+case 525: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glRenderbufferStorage(a0, a1, a2, a3); break; }
+case 526: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); api.glRenderbufferStorageMultisample(a0, a1, a2, a3, a4); break; }
+case 527: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glRotated(a0, a1, a2, a3); break; }
+case 528: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glRotatef(a0, a1, a2, a3); break; }
+case 529: { const GLfloat a0 = rd.f32(); const GLboolean a1 = static_cast<GLboolean>(rd.u32()); api.glSampleCoverage(a0, a1); break; }
+case 530: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterIiv(a0, a1, a2); break; }
+case 531: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterIuiv(a0, a1, a2); break; }
+case 532: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glSamplerParameterf(a0, a1, a2); break; }
+case 533: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameterfv(a0, a1, a2); break; }
+case 534: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glSamplerParameteri(a0, a1, a2); break; }
+case 535: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glSamplerParameteriv(a0, a1, a2); break; }
+case 536: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glScaled(a0, a1, a2); break; }
+case 537: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glScalef(a0, a1, a2); break; }
+case 538: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glScissor(a0, a1, a2, a3); break; }
+case 539: { const GLbyte a0 = static_cast<GLbyte>(rd.u32()); const GLbyte a1 = static_cast<GLbyte>(rd.u32()); const GLbyte a2 = static_cast<GLbyte>(rd.u32()); api.glSecondaryColor3b(a0, a1, a2); break; }
+case 540: { GLbyte a0[3]; rd.array(a0); api.glSecondaryColor3bv(ArrayView<const GLbyte>(a0, 3)); break; }
+case 541: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glSecondaryColor3d(a0, a1, a2); break; }
+case 542: { GLdouble a0[3]; rd.array(a0); api.glSecondaryColor3dv(ArrayView<const GLdouble>(a0, 3)); break; }
+case 543: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glSecondaryColor3f(a0, a1, a2); break; }
+case 544: { GLfloat a0[3]; rd.array(a0); api.glSecondaryColor3fv(ArrayView<const GLfloat>(a0, 3)); break; }
+case 545: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glSecondaryColor3i(a0, a1, a2); break; }
+case 546: { GLint a0[3]; rd.array(a0); api.glSecondaryColor3iv(ArrayView<const GLint>(a0, 3)); break; }
+case 547: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glSecondaryColor3s(a0, a1, a2); break; }
+case 548: { GLshort a0[3]; rd.array(a0); api.glSecondaryColor3sv(ArrayView<const GLshort>(a0, 3)); break; }
+case 549: { const GLubyte a0 = static_cast<GLubyte>(rd.u32()); const GLubyte a1 = static_cast<GLubyte>(rd.u32()); const GLubyte a2 = static_cast<GLubyte>(rd.u32()); api.glSecondaryColor3ub(a0, a1, a2); break; }
+case 550: { GLubyte a0[3]; rd.array(a0); api.glSecondaryColor3ubv(ArrayView<const GLubyte>(a0, 3)); break; }
+case 551: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glSecondaryColor3ui(a0, a1, a2); break; }
+case 552: { GLuint a0[3]; rd.array(a0); api.glSecondaryColor3uiv(ArrayView<const GLuint>(a0, 3)); break; }
+case 553: { const GLushort a0 = static_cast<GLushort>(rd.u32()); const GLushort a1 = static_cast<GLushort>(rd.u32()); const GLushort a2 = static_cast<GLushort>(rd.u32()); api.glSecondaryColor3us(a0, a1, a2); break; }
+case 554: { GLushort a0[3]; rd.array(a0); api.glSecondaryColor3usv(ArrayView<const GLushort>(a0, 3)); break; }
+case 555: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glSecondaryColorPointer(a0, a1, a2, a3); break; }
+case 556: { const GLsizei a0 = static_cast<GLsizei>(rd.u32()); const UserPtr a1 = UserPtr{rd.u64()}; api.glSelectBuffer(a0, a1); break; }
+case 557: { const GLenum a0 = static_cast<GLenum>(rd.u32()); api.glShadeModel(a0); break; }
+case 558: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; const UserPtr a3 = UserPtr{rd.u64()}; api.glShaderSource(a0, a1, a2, a3); break; }
+case 559: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glStencilFunc(a0, a1, a2); break; }
+case 560: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glStencilFuncSeparate(a0, a1, a2, a3); break; }
+case 561: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glStencilMask(a0); break; }
+case 562: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glStencilMaskSeparate(a0, a1); break; }
+case 563: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); api.glStencilOp(a0, a1, a2); break; }
+case 564: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLenum a3 = static_cast<GLenum>(rd.u32()); api.glStencilOpSeparate(a0, a1, a2, a3); break; }
+case 565: { const GLdouble a0 = rd.f64(); api.glTexCoord1d(a0); break; }
+case 566: { GLdouble a0[1]; rd.array(a0); api.glTexCoord1dv(ArrayView<const GLdouble>(a0, 1)); break; }
+case 567: { const GLfloat a0 = rd.f32(); api.glTexCoord1f(a0); break; }
+case 568: { GLfloat a0[1]; rd.array(a0); api.glTexCoord1fv(ArrayView<const GLfloat>(a0, 1)); break; }
+case 569: { const GLint a0 = static_cast<GLint>(rd.u32()); api.glTexCoord1i(a0); break; }
+case 570: { GLint a0[1]; rd.array(a0); api.glTexCoord1iv(ArrayView<const GLint>(a0, 1)); break; }
+case 571: { const GLshort a0 = static_cast<GLshort>(rd.u32()); api.glTexCoord1s(a0); break; }
+case 572: { GLshort a0[1]; rd.array(a0); api.glTexCoord1sv(ArrayView<const GLshort>(a0, 1)); break; }
+case 573: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glTexCoord2d(a0, a1); break; }
+case 574: { GLdouble a0[2]; rd.array(a0); api.glTexCoord2dv(ArrayView<const GLdouble>(a0, 2)); break; }
+case 575: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glTexCoord2f(a0, a1); break; }
+case 576: { GLfloat a0[2]; rd.array(a0); api.glTexCoord2fv(ArrayView<const GLfloat>(a0, 2)); break; }
+case 577: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glTexCoord2i(a0, a1); break; }
+case 578: { GLint a0[2]; rd.array(a0); api.glTexCoord2iv(ArrayView<const GLint>(a0, 2)); break; }
+case 579: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glTexCoord2s(a0, a1); break; }
+case 580: { GLshort a0[2]; rd.array(a0); api.glTexCoord2sv(ArrayView<const GLshort>(a0, 2)); break; }
+case 581: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glTexCoord3d(a0, a1, a2); break; }
+case 582: { GLdouble a0[3]; rd.array(a0); api.glTexCoord3dv(ArrayView<const GLdouble>(a0, 3)); break; }
+case 583: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glTexCoord3f(a0, a1, a2); break; }
+case 584: { GLfloat a0[3]; rd.array(a0); api.glTexCoord3fv(ArrayView<const GLfloat>(a0, 3)); break; }
+case 585: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexCoord3i(a0, a1, a2); break; }
+case 586: { GLint a0[3]; rd.array(a0); api.glTexCoord3iv(ArrayView<const GLint>(a0, 3)); break; }
+case 587: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glTexCoord3s(a0, a1, a2); break; }
+case 588: { GLshort a0[3]; rd.array(a0); api.glTexCoord3sv(ArrayView<const GLshort>(a0, 3)); break; }
+case 589: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glTexCoord4d(a0, a1, a2, a3); break; }
+case 590: { GLdouble a0[4]; rd.array(a0); api.glTexCoord4dv(ArrayView<const GLdouble>(a0, 4)); break; }
+case 591: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glTexCoord4f(a0, a1, a2, a3); break; }
+case 592: { GLfloat a0[4]; rd.array(a0); api.glTexCoord4fv(ArrayView<const GLfloat>(a0, 4)); break; }
+case 593: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glTexCoord4i(a0, a1, a2, a3); break; }
+case 594: { GLint a0[4]; rd.array(a0); api.glTexCoord4iv(ArrayView<const GLint>(a0, 4)); break; }
+case 595: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glTexCoord4s(a0, a1, a2, a3); break; }
+case 596: { GLshort a0[4]; rd.array(a0); api.glTexCoord4sv(ArrayView<const GLshort>(a0, 4)); break; }
+case 597: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glTexCoordPointer(a0, a1, a2, a3); break; }
+case 598: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glTexCoordPointerEXT(a0, a1, a2, a3, a4); break; }
+case 599: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexEnvf(a0, a1, a2); break; }
+case 600: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexEnvfv(a0, a1, a2); break; }
+case 601: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexEnvi(a0, a1, a2); break; }
+case 602: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexEnviv(a0, a1, a2); break; }
+case 603: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLdouble a2 = rd.f64(); api.glTexGend(a0, a1, a2); break; }
+case 604: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGendv(a0, a1, a2); break; }
+case 605: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexGenf(a0, a1, a2); break; }
+case 606: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGenfv(a0, a1, a2); break; }
+case 607: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexGeni(a0, a1, a2); break; }
+case 608: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexGeniv(a0, a1, a2); break; }
+case 609: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const UserPtr a7 = UserPtr{rd.u64()}; api.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, a7); break; }
+case 610: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLint a5 = static_cast<GLint>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const UserPtr a8 = UserPtr{rd.u64()}; api.glTexImage2D(a0, a1, a2, a3, a4, a5, a6, a7, a8); break; }
+case 611: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLint a6 = static_cast<GLint>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const GLenum a8 = static_cast<GLenum>(rd.u32()); const UserPtr a9 = UserPtr{rd.u64()}; api.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); break; }
+case 612: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLfloat a2 = rd.f32(); api.glTexParameterf(a0, a1, a2); break; }
+case 613: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexParameterfv(a0, a1, a2); break; }
+case 614: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glTexParameteri(a0, a1, a2); break; }
+case 615: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glTexParameteriv(a0, a1, a2); break; }
+case 616: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glTexStorage1D(a0, a1, a2, a3); break; }
+case 617: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); api.glTexStorage2D(a0, a1, a2, a3, a4); break; }
+case 618: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); api.glTexStorage3D(a0, a1, a2, a3, a4, a5); break; }
+case 619: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const GLenum a4 = static_cast<GLenum>(rd.u32()); const GLenum a5 = static_cast<GLenum>(rd.u32()); const UserPtr a6 = UserPtr{rd.u64()}; api.glTexSubImage1D(a0, a1, a2, a3, a4, a5, a6); break; }
+case 620: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLenum a6 = static_cast<GLenum>(rd.u32()); const GLenum a7 = static_cast<GLenum>(rd.u32()); const UserPtr a8 = UserPtr{rd.u64()}; api.glTexSubImage2D(a0, a1, a2, a3, a4, a5, a6, a7, a8); break; }
+case 621: { const GLenum a0 = static_cast<GLenum>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); const GLsizei a5 = static_cast<GLsizei>(rd.u32()); const GLsizei a6 = static_cast<GLsizei>(rd.u32()); const GLsizei a7 = static_cast<GLsizei>(rd.u32()); const GLenum a8 = static_cast<GLenum>(rd.u32()); const GLenum a9 = static_cast<GLenum>(rd.u32()); const UserPtr a10 = UserPtr{rd.u64()}; api.glTexSubImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10); break; }
+case 622: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; const GLenum a3 = static_cast<GLenum>(rd.u32()); api.glTransformFeedbackVaryings(a0, a1, a2, a3); break; }
+case 623: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glTranslated(a0, a1, a2); break; }
+case 624: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glTranslatef(a0, a1, a2); break; }
+case 625: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1dv(a0, a1, a2); break; }
+case 626: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); api.glUniform1f(a0, a1); break; }
+case 627: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1fv(a0, a1, a2); break; }
+case 628: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glUniform1i(a0, a1); break; }
+case 629: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1iv(a0, a1, a2); break; }
+case 630: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glUniform1ui(a0, a1); break; }
+case 631: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform1uiv(a0, a1, a2); break; }
+case 632: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2dv(a0, a1, a2); break; }
+case 633: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glUniform2f(a0, a1, a2); break; }
+case 634: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2fv(a0, a1, a2); break; }
+case 635: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glUniform2i(a0, a1, a2); break; }
+case 636: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2iv(a0, a1, a2); break; }
+case 637: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glUniform2ui(a0, a1, a2); break; }
+case 638: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform2uiv(a0, a1, a2); break; }
+case 639: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3dv(a0, a1, a2); break; }
+case 640: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glUniform3f(a0, a1, a2, a3); break; }
+case 641: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3fv(a0, a1, a2); break; }
+case 642: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glUniform3i(a0, a1, a2, a3); break; }
+case 643: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3iv(a0, a1, a2); break; }
+case 644: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glUniform3ui(a0, a1, a2, a3); break; }
+case 645: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform3uiv(a0, a1, a2); break; }
+case 646: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4dv(a0, a1, a2); break; }
+case 647: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glUniform4f(a0, a1, a2, a3, a4); break; }
+case 648: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4fv(a0, a1, a2); break; }
+case 649: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glUniform4i(a0, a1, a2, a3, a4); break; }
+case 650: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4iv(a0, a1, a2); break; }
+case 651: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glUniform4ui(a0, a1, a2, a3, a4); break; }
+case 652: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const UserPtr a2 = UserPtr{rd.u64()}; api.glUniform4uiv(a0, a1, a2); break; }
+case 653: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glUniformBlockBinding(a0, a1, a2); break; }
+case 654: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2dv(a0, a1, a2, a3); break; }
+case 655: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2fv(a0, a1, a2, a3); break; }
+case 656: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x3dv(a0, a1, a2, a3); break; }
+case 657: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x3fv(a0, a1, a2, a3); break; }
+case 658: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x4dv(a0, a1, a2, a3); break; }
+case 659: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix2x4fv(a0, a1, a2, a3); break; }
+case 660: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3dv(a0, a1, a2, a3); break; }
+case 661: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3fv(a0, a1, a2, a3); break; }
+case 662: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x2dv(a0, a1, a2, a3); break; }
+case 663: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x2fv(a0, a1, a2, a3); break; }
+case 664: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x4dv(a0, a1, a2, a3); break; }
+case 665: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix3x4fv(a0, a1, a2, a3); break; }
+case 666: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4dv(a0, a1, a2, a3); break; }
+case 667: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4fv(a0, a1, a2, a3); break; }
+case 668: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x2dv(a0, a1, a2, a3); break; }
+case 669: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x2fv(a0, a1, a2, a3); break; }
+case 670: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x3dv(a0, a1, a2, a3); break; }
+case 671: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLsizei a1 = static_cast<GLsizei>(rd.u32()); const GLboolean a2 = static_cast<GLboolean>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glUniformMatrix4x3fv(a0, a1, a2, a3); break; }
+case 672: { const GLenum a0 = static_cast<GLenum>(rd.u32()); result = api.glUnmapBuffer(a0); break; }
+case 673: { const GLuint a0 = static_cast<GLuint>(rd.u32()); result = api.glUnmapNamedBuffer(a0); break; }
+case 674: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glUseProgram(a0); break; }
+case 675: { const GLuint a0 = static_cast<GLuint>(rd.u32()); api.glValidateProgram(a0); break; }
+case 676: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glVertex2d(a0, a1); break; }
+case 677: { GLdouble a0[2]; rd.array(a0); api.glVertex2dv(ArrayView<const GLdouble>(a0, 2)); break; }
+case 678: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glVertex2f(a0, a1); break; }
+case 679: { GLfloat a0[2]; rd.array(a0); api.glVertex2fv(ArrayView<const GLfloat>(a0, 2)); break; }
+case 680: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glVertex2i(a0, a1); break; }
+case 681: { GLint a0[2]; rd.array(a0); api.glVertex2iv(ArrayView<const GLint>(a0, 2)); break; }
+case 682: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glVertex2s(a0, a1); break; }
+case 683: { GLshort a0[2]; rd.array(a0); api.glVertex2sv(ArrayView<const GLshort>(a0, 2)); break; }
+case 684: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertex3d(a0, a1, a2); break; }
+case 685: { GLdouble a0[3]; rd.array(a0); api.glVertex3dv(ArrayView<const GLdouble>(a0, 3)); break; }
+case 686: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glVertex3f(a0, a1, a2); break; }
+case 687: { GLfloat a0[3]; rd.array(a0); api.glVertex3fv(ArrayView<const GLfloat>(a0, 3)); break; }
+case 688: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glVertex3i(a0, a1, a2); break; }
+case 689: { GLint a0[3]; rd.array(a0); api.glVertex3iv(ArrayView<const GLint>(a0, 3)); break; }
+case 690: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glVertex3s(a0, a1, a2); break; }
+case 691: { GLshort a0[3]; rd.array(a0); api.glVertex3sv(ArrayView<const GLshort>(a0, 3)); break; }
+case 692: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertex4d(a0, a1, a2, a3); break; }
+case 693: { GLdouble a0[4]; rd.array(a0); api.glVertex4dv(ArrayView<const GLdouble>(a0, 4)); break; }
+case 694: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glVertex4f(a0, a1, a2, a3); break; }
+case 695: { GLfloat a0[4]; rd.array(a0); api.glVertex4fv(ArrayView<const GLfloat>(a0, 4)); break; }
+case 696: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glVertex4i(a0, a1, a2, a3); break; }
+case 697: { GLint a0[4]; rd.array(a0); api.glVertex4iv(ArrayView<const GLint>(a0, 4)); break; }
+case 698: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glVertex4s(a0, a1, a2, a3); break; }
+case 699: { GLshort a0[4]; rd.array(a0); api.glVertex4sv(ArrayView<const GLshort>(a0, 4)); break; }
+case 700: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); api.glVertexAttrib1d(a0, a1); break; }
+case 701: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[1]; rd.array(a1); api.glVertexAttrib1dv(a0, ArrayView<const GLdouble>(a1, 1)); break; }
+case 702: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); api.glVertexAttrib1f(a0, a1); break; }
+case 703: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[1]; rd.array(a1); api.glVertexAttrib1fv(a0, ArrayView<const GLfloat>(a1, 1)); break; }
+case 704: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib1s(a0, a1); break; }
+case 705: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[1]; rd.array(a1); api.glVertexAttrib1sv(a0, ArrayView<const GLshort>(a1, 1)); break; }
+case 706: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertexAttrib2d(a0, a1, a2); break; }
+case 707: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[2]; rd.array(a1); api.glVertexAttrib2dv(a0, ArrayView<const GLdouble>(a1, 2)); break; }
+case 708: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glVertexAttrib2f(a0, a1, a2); break; }
+case 709: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[2]; rd.array(a1); api.glVertexAttrib2fv(a0, ArrayView<const GLfloat>(a1, 2)); break; }
+case 710: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib2s(a0, a1, a2); break; }
+case 711: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[2]; rd.array(a1); api.glVertexAttrib2sv(a0, ArrayView<const GLshort>(a1, 2)); break; }
+case 712: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertexAttrib3d(a0, a1, a2, a3); break; }
+case 713: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[3]; rd.array(a1); api.glVertexAttrib3dv(a0, ArrayView<const GLdouble>(a1, 3)); break; }
+case 714: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); api.glVertexAttrib3f(a0, a1, a2, a3); break; }
+case 715: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[3]; rd.array(a1); api.glVertexAttrib3fv(a0, ArrayView<const GLfloat>(a1, 3)); break; }
+case 716: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib3s(a0, a1, a2, a3); break; }
+case 717: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[3]; rd.array(a1); api.glVertexAttrib3sv(a0, ArrayView<const GLshort>(a1, 3)); break; }
+case 718: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttrib4Nbv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
+case 719: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttrib4Niv(a0, ArrayView<const GLint>(a1, 4)); break; }
+case 720: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttrib4Nsv(a0, ArrayView<const GLshort>(a1, 4)); break; }
+case 721: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLubyte a1 = static_cast<GLubyte>(rd.u32()); const GLubyte a2 = static_cast<GLubyte>(rd.u32()); const GLubyte a3 = static_cast<GLubyte>(rd.u32()); const GLubyte a4 = static_cast<GLubyte>(rd.u32()); api.glVertexAttrib4Nub(a0, a1, a2, a3, a4); break; }
+case 722: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttrib4Nubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
+case 723: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttrib4Nuiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
+case 724: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttrib4Nusv(a0, ArrayView<const GLushort>(a1, 4)); break; }
+case 725: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttrib4bv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
+case 726: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); const GLdouble a4 = rd.f64(); api.glVertexAttrib4d(a0, a1, a2, a3, a4); break; }
+case 727: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[4]; rd.array(a1); api.glVertexAttrib4dv(a0, ArrayView<const GLdouble>(a1, 4)); break; }
+case 728: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); const GLfloat a3 = rd.f32(); const GLfloat a4 = rd.f32(); api.glVertexAttrib4f(a0, a1, a2, a3, a4); break; }
+case 729: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLfloat a1[4]; rd.array(a1); api.glVertexAttrib4fv(a0, ArrayView<const GLfloat>(a1, 4)); break; }
+case 730: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttrib4iv(a0, ArrayView<const GLint>(a1, 4)); break; }
+case 731: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); const GLshort a3 = static_cast<GLshort>(rd.u32()); const GLshort a4 = static_cast<GLshort>(rd.u32()); api.glVertexAttrib4s(a0, a1, a2, a3, a4); break; }
+case 732: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttrib4sv(a0, ArrayView<const GLshort>(a1, 4)); break; }
+case 733: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttrib4ubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
+case 734: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttrib4uiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
+case 735: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttrib4usv(a0, ArrayView<const GLushort>(a1, 4)); break; }
+case 736: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glVertexAttribDivisor(a0, a1); break; }
+case 737: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glVertexAttribI1i(a0, a1); break; }
+case 738: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[1]; rd.array(a1); api.glVertexAttribI1iv(a0, ArrayView<const GLint>(a1, 1)); break; }
+case 739: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI1ui(a0, a1); break; }
+case 740: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[1]; rd.array(a1); api.glVertexAttribI1uiv(a0, ArrayView<const GLuint>(a1, 1)); break; }
+case 741: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glVertexAttribI2i(a0, a1, a2); break; }
+case 742: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[2]; rd.array(a1); api.glVertexAttribI2iv(a0, ArrayView<const GLint>(a1, 2)); break; }
+case 743: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI2ui(a0, a1, a2); break; }
+case 744: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[2]; rd.array(a1); api.glVertexAttribI2uiv(a0, ArrayView<const GLuint>(a1, 2)); break; }
+case 745: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); api.glVertexAttribI3i(a0, a1, a2, a3); break; }
+case 746: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[3]; rd.array(a1); api.glVertexAttribI3iv(a0, ArrayView<const GLint>(a1, 3)); break; }
+case 747: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI3ui(a0, a1, a2, a3); break; }
+case 748: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[3]; rd.array(a1); api.glVertexAttribI3uiv(a0, ArrayView<const GLuint>(a1, 3)); break; }
+case 749: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLbyte a1[4]; rd.array(a1); api.glVertexAttribI4bv(a0, ArrayView<const GLbyte>(a1, 4)); break; }
+case 750: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); const GLint a3 = static_cast<GLint>(rd.u32()); const GLint a4 = static_cast<GLint>(rd.u32()); api.glVertexAttribI4i(a0, a1, a2, a3, a4); break; }
+case 751: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLint a1[4]; rd.array(a1); api.glVertexAttribI4iv(a0, ArrayView<const GLint>(a1, 4)); break; }
+case 752: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLshort a1[4]; rd.array(a1); api.glVertexAttribI4sv(a0, ArrayView<const GLshort>(a1, 4)); break; }
+case 753: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLubyte a1[4]; rd.array(a1); api.glVertexAttribI4ubv(a0, ArrayView<const GLubyte>(a1, 4)); break; }
+case 754: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLuint a1 = static_cast<GLuint>(rd.u32()); const GLuint a2 = static_cast<GLuint>(rd.u32()); const GLuint a3 = static_cast<GLuint>(rd.u32()); const GLuint a4 = static_cast<GLuint>(rd.u32()); api.glVertexAttribI4ui(a0, a1, a2, a3, a4); break; }
+case 755: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLuint a1[4]; rd.array(a1); api.glVertexAttribI4uiv(a0, ArrayView<const GLuint>(a1, 4)); break; }
+case 756: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLushort a1[4]; rd.array(a1); api.glVertexAttribI4usv(a0, ArrayView<const GLushort>(a1, 4)); break; }
+case 757: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glVertexAttribIPointer(a0, a1, a2, a3, a4); break; }
+case 758: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); api.glVertexAttribL1d(a0, a1); break; }
+case 759: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[1]; rd.array(a1); api.glVertexAttribL1dv(a0, ArrayView<const GLdouble>(a1, 1)); break; }
+case 760: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glVertexAttribL2d(a0, a1, a2); break; }
+case 761: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[2]; rd.array(a1); api.glVertexAttribL2dv(a0, ArrayView<const GLdouble>(a1, 2)); break; }
+case 762: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); api.glVertexAttribL3d(a0, a1, a2, a3); break; }
+case 763: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[3]; rd.array(a1); api.glVertexAttribL3dv(a0, ArrayView<const GLdouble>(a1, 3)); break; }
+case 764: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); const GLdouble a3 = rd.f64(); const GLdouble a4 = rd.f64(); api.glVertexAttribL4d(a0, a1, a2, a3, a4); break; }
+case 765: { const GLuint a0 = static_cast<GLuint>(rd.u32()); GLdouble a1[4]; rd.array(a1); api.glVertexAttribL4dv(a0, ArrayView<const GLdouble>(a1, 4)); break; }
+case 766: { const GLuint a0 = static_cast<GLuint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLenum a2 = static_cast<GLenum>(rd.u32()); const GLboolean a3 = static_cast<GLboolean>(rd.u32()); const GLsizei a4 = static_cast<GLsizei>(rd.u32()); const UserPtr a5 = UserPtr{rd.u64()}; api.glVertexAttribPointer(a0, a1, a2, a3, a4, a5); break; }
+case 767: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const UserPtr a3 = UserPtr{rd.u64()}; api.glVertexPointer(a0, a1, a2, a3); break; }
+case 768: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLenum a1 = static_cast<GLenum>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); const UserPtr a4 = UserPtr{rd.u64()}; api.glVertexPointerEXT(a0, a1, a2, a3, a4); break; }
+case 769: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLsizei a2 = static_cast<GLsizei>(rd.u32()); const GLsizei a3 = static_cast<GLsizei>(rd.u32()); api.glViewport(a0, a1, a2, a3); break; }
+case 770: { const GLsync a0 = static_cast<GLsync>(rd.u64()); const GLbitfield a1 = static_cast<GLbitfield>(rd.u32()); const GLuint64 a2 = static_cast<GLuint64>(rd.u64()); api.glWaitSync(a0, a1, a2); break; }
+case 771: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); api.glWindowPos2d(a0, a1); break; }
+case 772: { GLdouble a0[2]; rd.array(a0); api.glWindowPos2dv(ArrayView<const GLdouble>(a0, 2)); break; }
+case 773: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); api.glWindowPos2f(a0, a1); break; }
+case 774: { GLfloat a0[2]; rd.array(a0); api.glWindowPos2fv(ArrayView<const GLfloat>(a0, 2)); break; }
+case 775: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); api.glWindowPos2i(a0, a1); break; }
+case 776: { GLint a0[2]; rd.array(a0); api.glWindowPos2iv(ArrayView<const GLint>(a0, 2)); break; }
+case 777: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); api.glWindowPos2s(a0, a1); break; }
+case 778: { GLshort a0[2]; rd.array(a0); api.glWindowPos2sv(ArrayView<const GLshort>(a0, 2)); break; }
+case 779: { const GLdouble a0 = rd.f64(); const GLdouble a1 = rd.f64(); const GLdouble a2 = rd.f64(); api.glWindowPos3d(a0, a1, a2); break; }
+case 780: { GLdouble a0[3]; rd.array(a0); api.glWindowPos3dv(ArrayView<const GLdouble>(a0, 3)); break; }
+case 781: { const GLfloat a0 = rd.f32(); const GLfloat a1 = rd.f32(); const GLfloat a2 = rd.f32(); api.glWindowPos3f(a0, a1, a2); break; }
+case 782: { GLfloat a0[3]; rd.array(a0); api.glWindowPos3fv(ArrayView<const GLfloat>(a0, 3)); break; }
+case 783: { const GLint a0 = static_cast<GLint>(rd.u32()); const GLint a1 = static_cast<GLint>(rd.u32()); const GLint a2 = static_cast<GLint>(rd.u32()); api.glWindowPos3i(a0, a1, a2); break; }
+case 784: { GLint a0[3]; rd.array(a0); api.glWindowPos3iv(ArrayView<const GLint>(a0, 3)); break; }
+case 785: { const GLshort a0 = static_cast<GLshort>(rd.u32()); const GLshort a1 = static_cast<GLshort>(rd.u32()); const GLshort a2 = static_cast<GLshort>(rd.u32()); api.glWindowPos3s(a0, a1, a2); break; }
+case 786: { GLshort a0[3]; rd.array(a0); api.glWindowPos3sv(ArrayView<const GLshort>(a0, 3)); break; }

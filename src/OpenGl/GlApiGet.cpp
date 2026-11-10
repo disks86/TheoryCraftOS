@@ -30,7 +30,7 @@ const char* const kExtensions[] = {
     "GL_ARB_shading_language_100", "GL_ARB_texture_env_add", "GL_ARB_texture_env_combine", "GL_ARB_texture_env_crossbar", "GL_ARB_texture_env_dot3", "GL_ARB_texture_cube_map", "GL_ARB_depth_texture",
     "GL_ARB_shadow", "GL_ARB_point_parameters", "GL_ARB_point_sprite", "GL_ARB_occlusion_query", "GL_ARB_occlusion_query2", "GL_ARB_vertex_array_object", "GL_ARB_framebuffer_object", "GL_ARB_map_buffer_range",
     "GL_ARB_copy_buffer", "GL_ARB_draw_elements_base_vertex", "GL_ARB_draw_instanced", "GL_ARB_instanced_arrays", "GL_ARB_base_instance", "GL_ARB_sampler_objects", "GL_ARB_buffer_storage", "GL_ARB_texture_storage",
-    "GL_ARB_uniform_buffer_object", "GL_ARB_texture_non_power_of_two", "GL_ARB_texture_rectangle", "GL_ARB_texture_compression", "GL_ARB_texture_float", "GL_ARB_texture_rg", "GL_ARB_half_float_pixel", "GL_ARB_half_float_vertex",
+    "GL_ARB_uniform_buffer_object", "GL_ARB_tessellation_shader", "GL_ARB_texture_non_power_of_two", "GL_ARB_texture_rectangle", "GL_ARB_texture_compression", "GL_ARB_texture_float", "GL_ARB_texture_rg", "GL_ARB_half_float_pixel", "GL_ARB_half_float_vertex",
     "GL_ARB_seamless_cube_map", "GL_ARB_explicit_attrib_location", "GL_ARB_provoking_vertex", "GL_ARB_draw_buffers", "GL_ARB_draw_buffers_blend", "GL_ARB_blend_func_extended_unavailable_placeholder",
     "GL_EXT_abgr", "GL_EXT_bgra", "GL_EXT_blend_color", "GL_EXT_blend_minmax", "GL_EXT_blend_subtract", "GL_EXT_blend_func_separate", "GL_EXT_draw_range_elements", "GL_EXT_multi_draw_arrays", "GL_EXT_packed_pixels",
     "GL_EXT_packed_depth_stencil", "GL_EXT_rescale_normal", "GL_EXT_secondary_color", "GL_EXT_separate_specular_color", "GL_EXT_stencil_wrap", "GL_EXT_texture_edge_clamp", "GL_EXT_texture3D", "GL_EXT_texture_env_add", "GL_EXT_texture_env_combine",
@@ -151,6 +151,25 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_MAX_COLOR_ATTACHMENTS: case GL_MAX_DRAW_BUFFERS: return one(webgl::kMaxDrawBuffers);
     case GL_MAX_VARYING_COMPONENTS: return one(gpu::kMaxVarying);
     case GL_MAX_VERTEX_UNIFORM_COMPONENTS: case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS: return one(16384);
+    // geometry and tessellation (the same values the GLSL front end gives the gl_Max* constants)
+    case GL_MAX_GEOMETRY_INPUT_COMPONENTS: return one(64);
+    case GL_MAX_GEOMETRY_OUTPUT_COMPONENTS: return one(128);
+    case GL_MAX_GEOMETRY_TEXTURE_IMAGE_UNITS: return one(16);
+    case GL_MAX_GEOMETRY_OUTPUT_VERTICES: return one(256);
+    case GL_MAX_GEOMETRY_TOTAL_OUTPUT_COMPONENTS: return one(1024);
+    case GL_MAX_GEOMETRY_UNIFORM_COMPONENTS: return one(1024);
+    case GL_MAX_GEOMETRY_SHADER_INVOCATIONS: return one(32);
+    case GL_MAX_PATCH_VERTICES: return one(32);
+    case GL_MAX_TESS_GEN_LEVEL: return one(64);
+    case GL_MAX_TESS_CONTROL_INPUT_COMPONENTS: case GL_MAX_TESS_CONTROL_OUTPUT_COMPONENTS: case GL_MAX_TESS_EVALUATION_INPUT_COMPONENTS:
+    case GL_MAX_TESS_EVALUATION_OUTPUT_COMPONENTS: return one(128);
+    case GL_MAX_TESS_CONTROL_TEXTURE_IMAGE_UNITS: case GL_MAX_TESS_EVALUATION_TEXTURE_IMAGE_UNITS: return one(16);
+    case GL_MAX_TESS_CONTROL_UNIFORM_COMPONENTS: case GL_MAX_TESS_EVALUATION_UNIFORM_COMPONENTS: return one(1024);
+    case GL_MAX_TESS_CONTROL_TOTAL_OUTPUT_COMPONENTS: return one(4096);
+    case GL_MAX_TESS_PATCH_COMPONENTS: return one(120);
+    case GL_PATCH_VERTICES: return one(gl_.desktop.patch_vertices);
+    case GL_PATCH_DEFAULT_OUTER_LEVEL: for (int i = 0; i < 4; ++i) out[i] = gl_.desktop.patch_outer[i]; *count = 4; *kind = 1; return true;
+    case GL_PATCH_DEFAULT_INNER_LEVEL: for (int i = 0; i < 2; ++i) out[i] = gl_.desktop.patch_inner[i]; *count = 2; *kind = 1; return true;
     case GL_MAX_VERTEX_ATTRIBS: return one(webgl::kMaxAttribs);
     case GL_MAX_UNIFORM_BUFFER_BINDINGS: return one(webgl::kMaxUniformBindings);
     case GL_MAX_UNIFORM_BLOCK_SIZE: return one(1 << 24);

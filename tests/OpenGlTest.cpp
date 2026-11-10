@@ -793,6 +793,144 @@ static void test_several_shaders_per_stage() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+// Geometry and tessellation stages.
+static GLuint build_stages(const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs) {
+  const GLuint p = glCreateProgram();
+  const char* const sources[5] = {vs, tcs, tes, gs, fs};
+  const GLenum types[5] = {GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER};
+  for (int i = 0; i < 5; ++i) {
+    if (!sources[i]) continue;
+    const GLuint s = glCreateShader(types[i]);
+    glShaderSource(s, 1, &sources[i], nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[512] = {}; glGetShaderInfoLog(s, sizeof(log), nullptr, log); printf("shader %d: %s\n", i, log); }
+    glAttachShader(p, s);
+    glDeleteShader(s);
+  }
+  glLinkProgram(p);
+  GLint ok = 0;
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  if (!ok) { char log[512] = {}; glGetProgramInfoLog(p, sizeof(log), nullptr, log); printf("link: %s\n", log); glDeleteProgram(p); return 0; }
+  return p;
+}
+
+static void test_geometry_and_tessellation() {
+  Fixture f;
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  const char* vs = "#version 150\nin vec4 pos;\nout vec4 tint;\nvoid main(){ gl_Position = pos; tint = vec4(pos.xy * 0.5 + 0.5, 0.0, 1.0); }\n";
+  const char* fs = "#version 150\nin vec4 color;\nout vec4 frag;\nvoid main(){ frag = color; }\n";
+  // A point becomes a quad (a strip of 4), coloured by the invocation's primitive.
+  const char* gs = "#version 150\nlayout(points) in;\nlayout(triangle_strip, max_vertices = 4) out;\nin vec4 tint[];\nout vec4 color;\n"
+                   "void main(){ for (int i = 0; i < 4; ++i) { gl_Position = gl_in[0].gl_Position + vec4(float(i & 1) * 0.5 - 0.25, float(i >> 1) * 0.5 - 0.25, 0.0, 0.0);\n"
+                   " color = gl_PrimitiveIDIn == 0 ? vec4(1.0, 0.0, 0.0, 1.0) : vec4(0.0, 0.0, 1.0, 1.0); EmitVertex(); } EndPrimitive(); }\n";
+  const GLuint g = build_stages(vs, nullptr, nullptr, gs, fs);
+  CHECK(g != 0);
+  GLint value = 0;
+  glGetProgramiv(g, GL_GEOMETRY_VERTICES_OUT, &value);
+  CHECK(value == 4);
+  glGetProgramiv(g, GL_GEOMETRY_INPUT_TYPE, &value);
+  CHECK(value == GL_POINTS);
+  glGetProgramiv(g, GL_GEOMETRY_OUTPUT_TYPE, &value);
+  CHECK(value == GL_TRIANGLE_STRIP);
+  GLuint vao = 0, vbo = 0;
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  const float points[8] = {-0.5f, -0.5f, 0, 1, 0.5f, 0.5f, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(points), points, GL_STATIC_DRAW);
+  const GLint at = glGetAttribLocation(g, "pos");
+  glEnableVertexAttribArray(static_cast<GLuint>(at));
+  glVertexAttribPointer(static_cast<GLuint>(at), 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(g);
+  glDrawArrays(GL_POINTS, 0, 2);
+  CHECK(glGetError() == GL_NO_ERROR);
+  CHECK(near(pixel(16, 16), 255, 0, 0));      // around (-0.5, -0.5): the first point's quad
+  CHECK(near(pixel(48, 48), 0, 0, 255));      // the second's
+  CHECK(near(pixel(32, 32), 0, 0, 0));        // between them
+  glDrawArrays(GL_TRIANGLES, 0, 3);           // (not the geometry stage's input primitive)
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glUseProgram(0);
+  glDeleteProgram(g);
+
+  // Triangles through a geometry stage that passes them on with a varying of its own.
+  const char* gs_tri = "#version 150\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\nin vec4 tint[3];\nout vec4 color;\n"
+                       "void main(){ for (int i = 0; i < gl_in.length(); ++i) { gl_Position = gl_in[i].gl_Position; color = vec4(0.0, 1.0, 0.0, 1.0) + tint[i] * 0.0; EmitVertex(); } }\n";
+  const GLuint t = build_stages(vs, nullptr, nullptr, gs_tri, fs);
+  CHECK(t != 0);
+  const float tri[12] = {-1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(tri), tri, GL_STATIC_DRAW);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(t);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  CHECK(glGetError() == GL_NO_ERROR);
+  CHECK(near(pixel(10, 10), 0, 255, 0));
+  CHECK(near(pixel(60, 60), 0, 0, 0));
+  glUseProgram(0);
+  glDeleteProgram(t);
+
+  // Tessellation: a quad patch of four corners, the control stage passing them on (with a barrier between writing and reading the outputs), cut in 4 x 4.
+  const char* tcs = "#version 150\n#extension GL_ARB_tessellation_shader : require\nlayout(vertices = 4) out;\nin vec4 tint[];\nout vec4 c_tint[];\n"
+                    "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; c_tint[gl_InvocationID] = tint[gl_InvocationID]; barrier();\n"
+                    " if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 4.0; gl_TessLevelOuter[1] = 4.0; gl_TessLevelOuter[2] = 4.0; gl_TessLevelOuter[3] = 4.0;\n"
+                    " gl_TessLevelInner[0] = 4.0; gl_TessLevelInner[1] = c_tint[3].w * 4.0; } }\n";
+  const char* tes = "#version 150\n#extension GL_ARB_tessellation_shader : require\nlayout(quads, equal_spacing, ccw) in;\nin vec4 c_tint[];\nout vec4 color;\n"
+                    "void main(){ vec4 a = mix(gl_in[0].gl_Position, gl_in[1].gl_Position, gl_TessCoord.x), b = mix(gl_in[3].gl_Position, gl_in[2].gl_Position, gl_TessCoord.x);\n"
+                    " gl_Position = mix(a, b, gl_TessCoord.y); color = vec4(1.0, 1.0, 0.0, 1.0) * c_tint[0].w; }\n";
+  const GLuint q = build_stages(vs, tcs, tes, nullptr, fs);
+  CHECK(q != 0);
+  glGetProgramiv(q, GL_TESS_CONTROL_OUTPUT_VERTICES, &value);
+  CHECK(value == 4);
+  glGetProgramiv(q, GL_TESS_GEN_MODE, &value);
+  CHECK(value == GL_QUADS);
+  const float quad[16] = {-1, -1, 0, 1, 0, -1, 0, 1, 0, 0, 0, 1, -1, 0, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(q);
+  glPatchParameteri(GL_PATCH_VERTICES, 4);
+  glDrawArrays(GL_PATCHES, 0, 4);
+  CHECK(glGetError() == GL_NO_ERROR);
+  CHECK(near(pixel(8, 8), 255, 255, 0) && near(pixel(24, 24), 255, 255, 0) && near(pixel(30, 2), 255, 255, 0));      // the lower left quarter, all of it
+  CHECK(near(pixel(40, 40), 0, 0, 0) && near(pixel(40, 10), 0, 0, 0));
+  glDrawArrays(GL_TRIANGLES, 0, 3);      // (a tessellation program draws patches only)
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glUseProgram(0);
+  glDeleteProgram(q);
+
+  // An evaluation stage alone: the levels from glPatchParameterfv; triangles.
+  const char* tes_tri = "#version 150\n#extension GL_ARB_tessellation_shader : require\nlayout(triangles) in;\nout vec4 color;\n"
+                        "void main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+                        " color = vec4(gl_TessLevelOuter[0] / 8.0, 0.0, 1.0, 1.0); }\n";
+  const GLuint e = build_stages(vs, nullptr, tes_tri, nullptr, fs);
+  CHECK(e != 0);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(tri), tri, GL_STATIC_DRAW);
+  const float outer[4] = {4, 4, 4, 4}, inner[2] = {3, 3};
+  glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, outer);
+  glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, inner);
+  glPatchParameteri(GL_PATCH_VERTICES, 3);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(e);
+  glDrawArrays(GL_PATCHES, 0, 3);
+  CHECK(glGetError() == GL_NO_ERROR);
+  CHECK(near(pixel(10, 10), 128, 0, 255, 2));
+  CHECK(near(pixel(60, 60), 0, 0, 0));
+  glUseProgram(0);
+  glDeleteProgram(e);
+  // link errors: a control stage without an evaluation stage; a geometry stage without its layouts
+  CHECK(build_stages(vs, tcs, nullptr, nullptr, fs) == 0);
+  CHECK(build_stages(vs, nullptr, nullptr, "#version 150\nvoid main(){ EmitVertex(); }\n", fs) == 0);
+  glDeleteBuffers(1, &vbo);
+  glDeleteVertexArrays(1, &vao);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -965,6 +1103,7 @@ int main() {
   test_glsl_program();
   test_desktop_glsl();
   test_several_shaders_per_stage();
+  test_geometry_and_tessellation();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

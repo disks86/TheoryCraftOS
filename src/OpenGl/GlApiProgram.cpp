@@ -26,7 +26,7 @@ namespace opengl {
 
 namespace {
 bool is_shader_type(uint32_t type) {
-  return type == GL_VERTEX_SHADER || type == GL_FRAGMENT_SHADER;
+  return type == GL_VERTEX_SHADER || type == GL_FRAGMENT_SHADER || type == GL_GEOMETRY_SHADER || type == GL_TESS_CONTROL_SHADER || type == GL_TESS_EVALUATION_SHADER;
 }
 }  // namespace
 
@@ -89,7 +89,8 @@ void GlApi::glShaderSource(GLuint shader, GLsizei count, UserPtr string, UserPtr
   const webgl::ShaderObj* so = gl_.shader_at(object);
   String translated(a_);
   uint32_t uses = 0;
-  if (so && translate_desktop_glsl(whole.view(), so->type == GL_VERTEX_SHADER, &translated, &uses)) gl_.shader_source(object, translated.view());
+  const DesktopStage stage = !so ? DesktopStage::Other : (so->type == GL_VERTEX_SHADER ? DesktopStage::Vertex : (so->type == GL_FRAGMENT_SHADER ? DesktopStage::Fragment : DesktopStage::Other));
+  if (so && translate_desktop_glsl(whole.view(), stage, &translated, &uses)) gl_.shader_source(object, translated.view());
   else gl_.shader_source(object, whole.view());
 }
 void GlApi::glCompileShader(GLuint shader) {
@@ -119,7 +120,9 @@ void GlApi::glLinkProgram(GLuint program) {
   // A compatibility program may leave out a stage: the fixed-function one stands in, written at the version of the stage that is there so that the varyings match.
   const webgl::ProgramObj* po = gl_.program(p);
   uint32_t stand_in = 0;
-  if (po && compat() && po->has_stage(GL_VERTEX_SHADER) != po->has_stage(GL_FRAGMENT_SHADER)) {
+  // (not with geometry or tessellation stages: those need a vertex shader of the program's own)
+  const bool extra_stages = po && (po->has_stage(GL_GEOMETRY_SHADER) || po->has_stage(GL_TESS_CONTROL_SHADER) || po->has_stage(GL_TESS_EVALUATION_SHADER));
+  if (po && compat() && !extra_stages && po->has_stage(GL_VERTEX_SHADER) != po->has_stage(GL_FRAGMENT_SHADER)) {
     const bool need_vertex = !po->has_stage(GL_VERTEX_SHADER);
     const uint32_t present = po->first_of(need_vertex ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
     const bool modern = gl_.shader_src(present).starts_with("#version 300");
@@ -140,7 +143,7 @@ void GlApi::glLinkProgram(GLuint program) {
     }
     String translated(a_);
     uint32_t uses = 0;
-    translate_desktop_glsl(text.view(), need_vertex, &translated, &uses);
+    translate_desktop_glsl(text.view(), need_vertex ? DesktopStage::Vertex : DesktopStage::Fragment, &translated, &uses);
     stand_in = gl_.create_shader(need_vertex ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
     gl_.shader_source(stand_in, translated.view());
     gl_.compile_shader(stand_in);
@@ -456,15 +459,8 @@ bool GlApi::block_member(uint32_t object, uint32_t index, BlockMember* out) {
   const webgl::ProgramObj* po = gl_.program(object);
   if (!po || !po->linked || index < po->uniforms.count()) return false;
   uint32_t n = static_cast<uint32_t>(po->uniforms.count());
-  const shader::Module* mods[2] = {po->vsm.get(), po->fsm.get()};
-  for (int s = 0; s < 2; ++s) {
-    const shader::Module& m = *mods[s];
-    for (uint64_t b = 0; b < m.blocks.count(); ++b) {
-      if (s == 1) {      // (a block both stages have counts once)
-        bool seen = false;
-        for (uint64_t k = 0; k < mods[0]->blocks.count(); ++k) seen = seen || mods[0]->blocks[k]->name.view().equals(m.blocks[b]->name.view());
-        if (seen) continue;
-      }
+  bool found = false;
+  po->for_each_block([&](uint32_t, const shader::Module& m, uint64_t b) {
       uint32_t off = 0;
       for (uint64_t g = 0; g < m.globals.count(); ++g) {
         const shader::Global& gv = *m.globals[g];
@@ -481,14 +477,15 @@ bool GlApi::block_member(uint32_t object, uint32_t index, BlockMember* out) {
           shader::layout_of(m, gv.type.element(), shader::Layout::Std140, &eal, &esz);
           out->array_stride = gv.type.array ? (esz + 15) / 16 * 16 : 0;
           out->matrix_stride = gv.type.cols > 1 ? 16 : 0;
-          return true;
+          found = true;
+          return false;
         }
         off += sz;
         ++n;
       }
-    }
-  }
-  return false;
+      return true;
+  });
+  return found;
 }
 
 void GlApi::glGetUniformIndices(GLuint program, GLsizei uniformCount, UserPtr uniformNames, UserPtr uniformIndices) {

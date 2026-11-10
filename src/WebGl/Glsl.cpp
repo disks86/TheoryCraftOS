@@ -221,6 +221,8 @@ const BuiltinName kBuiltins[] = {
     {"unpackUnorm4x8", BuiltinFn::UnpackUnorm4x8}, {"unpackSnorm4x8", BuiltinFn::UnpackSnorm4x8}, {"bitCount", BuiltinFn::BitCount}, {"findLSB", BuiltinFn::FindLsb},
     {"findMSB", BuiltinFn::FindMsb}, {"bitfieldExtract", BuiltinFn::BitfieldExtract}, {"bitfieldInsert", BuiltinFn::BitfieldInsert},
     {"bitfieldReverse", BuiltinFn::BitfieldReverse}, {"uaddCarry", BuiltinFn::UaddCarry}, {"usubBorrow", BuiltinFn::UsubBorrow},
+    {"EmitVertex", BuiltinFn::EmitVertex}, {"EndPrimitive", BuiltinFn::EndPrimitive}, {"EmitStreamVertex", BuiltinFn::EmitStreamVertex},
+    {"EndStreamPrimitive", BuiltinFn::EndStreamPrimitive}, {"barrier", BuiltinFn::Barrier},
     {"dFdx", BuiltinFn::Dfdx}, {"dFdy", BuiltinFn::Dfdy}, {"fwidth", BuiltinFn::Fwidth}, {"dFdxCoarse", BuiltinFn::Dfdx}, {"dFdyCoarse", BuiltinFn::Dfdy},
     {"dFdxFine", BuiltinFn::Dfdx}, {"dFdyFine", BuiltinFn::Dfdy}, {"fwidthCoarse", BuiltinFn::Fwidth}, {"fwidthFine", BuiltinFn::Fwidth},
 };
@@ -265,6 +267,7 @@ class Parser {
       : m_(m), a_(m.allocator), toks_(toks), stage_(stage), syms_(m.allocator), scopes_(m.allocator), merge_units_(merge_units), compile_only_(compile_only) {}
 
   bool run() {
+    prescan_layouts();
     declare_builtin_vars();
     push_scope();
     while (cur().kind != Tok::End && !failed_) top_level();
@@ -348,7 +351,28 @@ class Parser {
   struct Unsized { int32_t global; uint32_t length; };
   List<Unsized> unsized_{a_};
   int32_t interfaces_ = 0;      // in/out interface blocks seen (they are not Module::blocks)
+  // Arrayed interface instances (gl_in[], `in Blk {...} v[];`): their number and length.
+  struct Arrayed { int32_t iface; uint32_t length; };
+  List<Arrayed> arrayed_{a_};
+  // The length of a per-vertex array: the input primitive's vertices (geometry), the patch's output vertices (control outputs) or gl_MaxPatchVertices.
+  uint32_t per_vertex_length(bool output) const {
+    if (stage_ == Stage::Geometry) return m_.input_vertices ? m_.input_vertices : 6;
+    if (stage_ == Stage::TessControl && output) return m_.tcs_vertices > 0 ? static_cast<uint32_t>(m_.tcs_vertices) : 32;
+    return 32;
+  }
+  bool is_per_vertex(GlobalKind kind, bool patch) const {
+    if (patch) return false;
+    if (stage_ == Stage::Geometry) return kind == GlobalKind::In;
+    if (stage_ == Stage::TessControl) return kind == GlobalKind::In || kind == GlobalKind::Out;
+    if (stage_ == Stage::TessEval) return kind == GlobalKind::In;
+    return false;
+  }
+  uint32_t arrayed_length(int32_t iface) const {
+    for (const Arrayed& x : arrayed_) if (x.iface == iface) return x.length;
+    return 0;
+  }
   bool merge_units_ = false;    // several shaders of the stage in one token stream (parse_glsl_units)
+  uint32_t pending_inner_ = 0;  // the inner size of the per-vertex array of arrays being declared
   bool compile_only_ = false;   // GlslOptions::compile_only
   // The nodes each function body added (they are added in order, bodies do not nest): which functions a function calls.
   struct BodyNodes { int32_t function; uint64_t begin, end; };
@@ -562,11 +586,13 @@ class Parser {
     return false;
   }
 
-  bool parse_array_suffix(Type* t) {
+  // `[n]`, `[]` (and with `one`, only the first of several).
+  bool parse_array_suffix(Type* t, bool one = false) {
     while (accept("[")) {
       if (is("]")) {
         ++pos_;
         t->array = kUnsizedArray;   // unsized: the initializer, a redeclaration or the indices used say
+        if (one) break;
         continue;
       }
       const int32_t e = expression();
@@ -575,6 +601,7 @@ class Parser {
       if (v > static_cast<int64_t>(kMaxArrayLength)) return err("array too large");
       if (!expect("]")) return false;
       t->array = static_cast<uint32_t>(v);
+      if (one) break;
     }
     return true;
   }
@@ -592,7 +619,9 @@ class Parser {
     const Type f1 = make_type(Base::Float), f4 = make_type(Base::Float, 4), f2 = make_type(Base::Float, 2), i1 = make_type(Base::Int), b1 = make_type(Base::Bool);
     Type frag_data = f4;
     frag_data.array = 4;
-    if (stage_ == Stage::Vertex) {
+    if (stage_ == Stage::Geometry || stage_ == Stage::TessControl || stage_ == Stage::TessEval) {
+      declare_primitive_stage_builtins();
+    } else if (stage_ == Stage::Vertex) {
       add_builtin("gl_Position", f4, GlobalKind::Out, kBvPosition);
       add_builtin("gl_PointSize", f1, GlobalKind::Out, kBvPointSize);
       add_builtin("gl_VertexID", i1, GlobalKind::In, kBvVertexIndex);
@@ -627,6 +656,21 @@ class Parser {
                                                                   {"gl_MaxVertexUniformComponents", 16384}, {"gl_MaxFragmentUniformComponents", 16384}, {"gl_MaxVaryingFloats", 64},
                                                                   {"gl_MaxVaryingComponents", 64}, {"gl_MaxVertexTextureImageUnits", 14}, {"gl_MaxCombinedTextureImageUnits", 14},
                                                                   {"gl_MaxVertexOutputComponents", 64}, {"gl_MaxFragmentInputComponents", 64}};
+    // geometry and tessellation limits (the values glGet reports)
+    const struct { const char* name; int v; } stage_consts[] = {{"gl_MaxGeometryInputComponents", 64}, {"gl_MaxGeometryOutputComponents", 128}, {"gl_MaxGeometryTextureImageUnits", 16},
+                                                                {"gl_MaxGeometryOutputVertices", 256}, {"gl_MaxGeometryTotalOutputComponents", 1024}, {"gl_MaxGeometryUniformComponents", 1024},
+                                                                {"gl_MaxGeometryVaryingComponents", 64}, {"gl_MaxPatchVertices", 32}, {"gl_MaxTessGenLevel", 64},
+                                                                {"gl_MaxTessControlInputComponents", 128}, {"gl_MaxTessControlOutputComponents", 128},
+                                                                {"gl_MaxTessControlTextureImageUnits", 16}, {"gl_MaxTessControlUniformComponents", 1024},
+                                                                {"gl_MaxTessControlTotalOutputComponents", 4096}, {"gl_MaxTessEvaluationInputComponents", 128},
+                                                                {"gl_MaxTessEvaluationOutputComponents", 128}, {"gl_MaxTessEvaluationTextureImageUnits", 16},
+                                                                {"gl_MaxTessEvaluationUniformComponents", 1024}, {"gl_MaxTessPatchComponents", 120}};
+    if (m_.desktop && m_.desktop_version >= 150)
+      for (const auto& c : stage_consts) {
+        const int32_t n = int_node(c.v);
+        const int32_t g = new_global(c.name, i1, GlobalKind::Const, false);
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->init = n;
+      }
     if (m_.desktop)
       for (const auto& c : desktop_consts) {
         const int32_t n = int_node(c.v);
@@ -639,6 +683,88 @@ class Parser {
       if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->init = n;
     }
   }
+  // A value the host sets before each invocation (gl_InvocationID, gl_PrimitiveIDIn, gl_TessCoord ...): private, read-only.
+  int32_t system_value(const char* name, const Type& t) {
+    const int32_t g = new_global(name, t, GlobalKind::Private, false);
+    if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->is_read_only = true;
+    return g;
+  }
+  // The members of gl_in[] / gl_out[]: per-vertex arrays named gl_in.gl_Position ..., reached as gl_in[i].gl_Position (a symbol of kind 4).
+  void per_vertex_block(const char* instance, GlobalKind kind, uint32_t count, bool shared) {
+    const int32_t iface = interfaces_++;
+    const char* const members[] = {"gl_Position", "gl_PointSize", "gl_ClipDistance"};
+    const Type types[] = {make_type(Base::Float, 4), make_type(Base::Float), make_type(Base::Float)};
+    const uint32_t inners[] = {0, 0, 8};      // (gl_ClipDistance: 8 per vertex)
+    for (int i = 0; i < 3; ++i) {
+      String name(a_);
+      name.assign(instance);
+      name.push_back('.');
+      name.append(members[i]);
+      Type t = types[i];
+      t.array = count * (inners[i] ? inners[i] : 1);
+      const int32_t g = new_global(name.view(), t, kind, shared);
+      if (g < 0) return;
+      Global& gv = *m_.globals[static_cast<uint64_t>(g)];
+      gv.iface = iface;
+      gv.inner = inners[i];
+      gv.per_vertex = true;
+      gv.is_read_only = kind == GlobalKind::In;
+    }
+    add_sym(instance, make_type(Base::Void), 4, iface);
+    if (!arrayed_.push_back(Arrayed{iface, count})) err("out of memory");
+  }
+  void declare_primitive_stage_builtins() {
+    const Type f1 = make_type(Base::Float), f4 = make_type(Base::Float, 4), i1 = make_type(Base::Int), f3 = make_type(Base::Float, 3);
+    Type clip = f1;
+    clip.array = 8;
+    if (stage_ == Stage::Geometry) {
+      per_vertex_block("gl_in", GlobalKind::In, m_.input_vertices ? m_.input_vertices : 6, false);
+      system_value("gl_PrimitiveIDIn", i1);
+      system_value("gl_InvocationID", i1);
+    } else {
+      per_vertex_block("gl_in", GlobalKind::In, 32, false);
+      system_value("gl_PatchVerticesIn", i1);
+      system_value("gl_PrimitiveID", i1);
+    }
+    if (stage_ == Stage::TessControl) {
+      system_value("gl_InvocationID", i1);
+      // The outputs are shared by the patch's invocations (they read each other's after barrier()): in the shared region, which the host gives each patch.
+      per_vertex_block("gl_out", GlobalKind::Out, m_.tcs_vertices > 0 ? static_cast<uint32_t>(m_.tcs_vertices) : 32, true);
+      Type outer = f1, inner = f1;
+      outer.array = 4;
+      inner.array = 2;
+      const struct { const char* name; Type type; } levels[] = {{"gl_TessLevelOuter", outer}, {"gl_TessLevelInner", inner}};
+      for (const auto& lv : levels) {
+        const int32_t g = new_global(lv.name, lv.type, GlobalKind::Out, true);
+        if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->patch = true;
+      }
+      return;
+    }
+    if (stage_ == Stage::TessEval) {
+      system_value("gl_TessCoord", f3);
+      Type outer = f1, inner = f1;
+      outer.array = 4;
+      inner.array = 2;
+      const struct { const char* name; Type type; } levels[] = {{"gl_TessLevelOuter", outer}, {"gl_TessLevelInner", inner}};
+      for (const auto& lv : levels) {
+        const int32_t g = new_global(lv.name, lv.type, GlobalKind::In, false);
+        if (g >= 0) {
+          m_.globals[static_cast<uint64_t>(g)]->patch = true;
+          m_.globals[static_cast<uint64_t>(g)]->is_read_only = true;
+        }
+      }
+    }
+    // The vertex the stage puts out (the geometry stage, per EmitVertex(); the evaluation stage, per tessellated vertex).
+    add_builtin("gl_Position", f4, GlobalKind::Out, kBvPosition);
+    add_builtin("gl_PointSize", f1, GlobalKind::Out, kBvPointSize);
+    add_builtin("gl_ClipDistance", clip, GlobalKind::Out, kBvClipDistance);
+    if (stage_ == Stage::Geometry) {
+      new_global("gl_PrimitiveID", i1, GlobalKind::Out, false);
+      new_global("gl_Layer", i1, GlobalKind::Out, false);
+      new_global("gl_ViewportIndex", i1, GlobalKind::Out, false);
+    }
+  }
+
   void add_builtin(const char* name, const Type& t, GlobalKind kind, int32_t id) {
     const int32_t g = new_global(name, t, kind, false);
     if (g >= 0) {
@@ -675,6 +801,21 @@ class Parser {
     for (int32_t k = 0; k < a.count; ++k) {
       const uint64_t ka = static_cast<uint64_t>(a.first) + static_cast<uint64_t>(k), kb = static_cast<uint64_t>(b.first) + static_cast<uint64_t>(k);
       if (ka >= m_.kids.count() || kb >= m_.kids.count() || !same_expression(m_.kids[ka], m_.kids[kb], depth + 1)) return false;
+    }
+    return true;
+  }
+
+  // Whether an expression uses only constants (literals, const globals, constructors, operators and built-in functions of them).
+  bool constant_expression(int32_t x, uint32_t depth) const {
+    if (x < 0) return true;
+    if (depth > 64) return false;
+    const Node& n = m_.nodes[static_cast<uint64_t>(x)];
+    if (n.kind == NodeKind::Local || n.kind == NodeKind::Call || n.kind == NodeKind::TexCall) return false;
+    if (n.kind == NodeKind::Global) return n.ival >= 0 && static_cast<uint64_t>(n.ival) < m_.globals.count() && m_.globals[static_cast<uint64_t>(n.ival)]->kind == GlobalKind::Const;
+    if (!constant_expression(n.a, depth + 1) || !constant_expression(n.b, depth + 1) || !constant_expression(n.c, depth + 1) || !constant_expression(n.d, depth + 1)) return false;
+    for (int32_t k = 0; k < n.count; ++k) {
+      const uint64_t kk = static_cast<uint64_t>(n.first) + static_cast<uint64_t>(k);
+      if (kk >= m_.kids.count() || !constant_expression(m_.kids[kk], depth + 1)) return false;
     }
     return true;
   }
@@ -728,7 +869,116 @@ class Parser {
     bool is_const = false, uniform = false, attribute = false, varying = false, in = false, out = false, inout = false, flat = false, layout_std140 = false;
     uint8_t frag_coord = 0;      // layout(origin_upper_left) 1, layout(pixel_center_integer) 2
     int32_t location = -1, binding = -1;
+    bool patch = false;          // tessellation: per patch
+    // layout declarations of the geometry and tessellation stages (`layout(triangles) in;` ...)
+    uint32_t prim = 0xFFFFFFFFu;
+    int32_t max_vertices = -1, invocations = -1, vertices = -1, stream = -1;
+    uint32_t spacing = 0, order = 0;
+    bool point_mode = false;
   };
+
+  // The keys of the geometry and tessellation layouts (others are accepted and ignored, as before).
+  bool layout_stage_key(StringView key, int32_t value, Quals* q) {
+    struct K { const char* name; uint32_t prim; };
+    static const K kPrims[] = {{"points", 0}, {"lines", 1}, {"lines_adjacency", 0xA}, {"triangles", 4}, {"triangles_adjacency", 0xC}, {"line_strip", 3}, {"triangle_strip", 5},
+                               {"quads", 7}, {"isolines", 0x8E7A}};
+    for (const K& k : kPrims) if (key.equals(k.name)) { q->prim = k.prim; return true; }
+    if (key.equals("max_vertices")) q->max_vertices = value;
+    else if (key.equals("invocations")) { if (value < 1 || value > 32) return err("bad number of geometry shader invocations"); q->invocations = value; }
+    else if (key.equals("vertices")) { if (value < 1 || value > 32) return err("bad number of patch vertices"); q->vertices = value; }
+    else if (key.equals("stream")) q->stream = value;
+    else if (key.equals("equal_spacing")) q->spacing = 0x0202;
+    else if (key.equals("fractional_even_spacing")) q->spacing = 0x8E7C;
+    else if (key.equals("fractional_odd_spacing")) q->spacing = 0x8E7B;
+    else if (key.equals("cw")) q->order = 0x0900;
+    else if (key.equals("ccw")) q->order = 0x0901;
+    else if (key.equals("point_mode")) q->point_mode = true;
+    return true;
+  }
+
+  // Vertices of a geometry shader's input primitive.
+  static uint32_t primitive_vertices(uint32_t prim) {
+    switch (prim) {
+      case 0: return 1;
+      case 1: return 2;
+      case 0xA: return 4;
+      case 4: return 3;
+      case 0xC: return 6;
+      default: return 0;
+    }
+  }
+
+  // `layout(...) in;` / `layout(...) out;` with nothing declared: the stage's layout.
+  void apply_layout(const Quals& q) {
+    const auto conflict = [&](const char* what) { err(what); };
+    if (stage_ == Stage::Geometry && q.in) {
+      if (q.prim != 0xFFFFFFFFu) {
+        if (!primitive_vertices(q.prim)) return conflict("bad geometry shader input primitive");
+        if (m_.gs_input != 0xFFFFFFFFu && m_.gs_input != q.prim) return conflict("geometry shader input primitives conflict");
+        m_.gs_input = q.prim;
+      }
+      if (q.invocations > 0) {
+        if (m_.gs_invocations != 1 && m_.gs_invocations != static_cast<uint32_t>(q.invocations)) return conflict("geometry shader invocation counts conflict");
+        m_.gs_invocations = static_cast<uint32_t>(q.invocations);
+      }
+    } else if (stage_ == Stage::Geometry && q.out) {
+      if (q.prim != 0xFFFFFFFFu) {
+        if (q.prim != 0 && q.prim != 3 && q.prim != 5) return conflict("bad geometry shader output primitive");
+        if (m_.gs_output != 0xFFFFFFFFu && m_.gs_output != q.prim) return conflict("geometry shader output primitives conflict");
+        m_.gs_output = q.prim;
+      }
+      if (q.max_vertices >= 0) {
+        if (q.max_vertices > 256) return conflict("max_vertices is more than gl_MaxGeometryOutputVertices");
+        if (m_.gs_max_vertices >= 0 && m_.gs_max_vertices != q.max_vertices) return conflict("max_vertices values conflict");
+        m_.gs_max_vertices = q.max_vertices;
+      }
+    } else if (stage_ == Stage::TessControl && q.out) {
+      if (q.vertices > 0) {
+        if (m_.tcs_vertices >= 0 && m_.tcs_vertices != q.vertices) return conflict("patch vertex counts conflict");
+        m_.tcs_vertices = q.vertices;
+      }
+    } else if (stage_ == Stage::TessEval && q.in) {
+      if (q.prim != 0xFFFFFFFFu) {
+        if (q.prim != 4 && q.prim != 7 && q.prim != 0x8E7A) return conflict("bad tessellation primitive mode");
+        if (m_.tes_mode && m_.tes_mode != q.prim) return conflict("tessellation primitive modes conflict");
+        m_.tes_mode = q.prim;
+      }
+      if (q.spacing) {
+        if (m_.tes_spacing && m_.tes_spacing != q.spacing) return conflict("tessellation spacings conflict");
+        m_.tes_spacing = q.spacing;
+      }
+      if (q.order) {
+        if (m_.tes_order && m_.tes_order != q.order) return conflict("tessellation vertex orders conflict");
+        m_.tes_order = q.order;
+      }
+      if (q.point_mode) m_.tes_point_mode = true;
+    }
+  }
+
+  // Before the built-ins are declared: the sizes of the per-vertex arrays (gl_in[], gl_out[]) from the layouts, wherever they are in the shaders.
+  void prescan_layouts() {
+    if (stage_ == Stage::TessControl || stage_ == Stage::TessEval) m_.input_vertices = 32;
+    uint32_t depth = 0;
+    for (uint64_t i = 0; i + 3 < toks_.count(); ++i) {
+      const Token& t = toks_[i];
+      if (t.kind == Tok::Punct && t.text.equals("{")) ++depth;
+      else if (t.kind == Tok::Punct && t.text.equals("}") && depth) --depth;
+      if (depth || t.kind != Tok::Ident || !t.text.equals("layout") || !toks_[i + 1].text.equals("(")) continue;
+      uint64_t k = i + 2;
+      uint32_t prim = 0xFFFFFFFFu;
+      int32_t vertices = -1;
+      for (; k < toks_.count() && !toks_[k].text.equals(")"); ++k) {
+        if (toks_[k].kind != Tok::Ident) continue;
+        Quals q;
+        if (toks_[k].text.equals("vertices") && k + 2 < toks_.count() && toks_[k + 2].kind == Tok::Int) vertices = static_cast<int32_t>(toks_[k + 2].ival);
+        else if (layout_stage_key(toks_[k].text, 0, &q) && q.prim != 0xFFFFFFFFu) prim = q.prim;
+      }
+      if (k + 2 >= toks_.count() || toks_[k + 2].kind != Tok::Punct || !toks_[k + 2].text.equals(";")) continue;
+      const StringView dir = toks_[k + 1].text;
+      if (stage_ == Stage::Geometry && dir.equals("in") && primitive_vertices(prim)) m_.input_vertices = primitive_vertices(prim);
+      if (stage_ == Stage::TessControl && dir.equals("out") && vertices > 0 && vertices <= 32) m_.tcs_vertices = vertices;
+    }
+  }
 
   bool parse_layout(Quals* q) {
     if (!expect("(")) return false;
@@ -738,15 +988,22 @@ class Parser {
       ++pos_;
       int32_t value = 0;
       if (accept("=")) {
-        if (cur().kind != Tok::Int) return err("bad layout value");
-        value = static_cast<int32_t>(cur().ival);
-        ++pos_;
+        if (cur().kind == Tok::Int && peek().kind == Tok::Punct && (peek().text.equals(",") || peek().text.equals(")"))) {
+          value = static_cast<int32_t>(cur().ival);
+          ++pos_;
+        } else {      // (a constant expression: `max_vertices = N * 3`)
+          const int32_t e = assignment();
+          int64_t v;
+          if (e < 0 || !fold_int(e, &v) || v < 0 || v > 0x7FFFFFFF) return err("bad layout value");
+          value = static_cast<int32_t>(v);
+        }
       }
       if (key.equals("location")) q->location = value;
       else if (key.equals("binding")) q->binding = value;
       else if (key.equals("std140")) q->layout_std140 = true;
       else if (key.equals("origin_upper_left")) q->frag_coord |= 1;
       else if (key.equals("pixel_center_integer")) q->frag_coord |= 2;
+      else if (!layout_stage_key(key, value, q)) return false;
       if (!accept(",")) break;
     }
     return expect(")");
@@ -764,6 +1021,7 @@ class Parser {
       else if (w.equals("out")) q->out = true;
       else if (w.equals("inout")) q->inout = true;
       else if (w.equals("flat")) q->flat = true;
+      else if (w.equals("patch")) q->patch = true;
       else if (w.equals("layout")) { if (!parse_layout(q)) return false; }
     }
     return !failed_;
@@ -804,6 +1062,11 @@ class Parser {
     }
     Quals q;
     if (!parse_quals(&q)) return;
+    if (is(";") && (q.in || q.out || q.uniform)) {      // `layout(triangles) in;`
+      ++pos_;
+      apply_layout(q);
+      return;
+    }
     // uniform block
     if ((q.uniform || q.in || q.out) && cur().kind == Tok::Ident && !at_type() && peek().kind == Tok::Punct && peek().text.equals("{")) {
       uniform_block(q);
@@ -832,7 +1095,18 @@ class Parser {
       const StringView name = cur().text;
       ++pos_;
       Type vt = t;
-      if (is("[") && !parse_array_suffix(&vt)) return;
+      // (`in vec4 v[][2]`: per vertex, an array of two; the first size, then the second)
+      pending_inner_ = 0;
+      if (is("[")) {
+        if (!parse_array_suffix(&vt, true)) return;
+        if (is("[")) {
+          const uint32_t outer = vt.array;
+          Type in = t;
+          if (!parse_array_suffix(&in) || in.array == kUnsizedArray) { err("the inner array needs a size"); return; }
+          pending_inner_ = in.array;
+          vt.array = outer;
+        }
+      }
       int32_t init = -1;
       if (accept("=")) {
         init = assignment();
@@ -877,6 +1151,23 @@ class Parser {
     else if (q.varying) kind = stage_ == Stage::Vertex ? GlobalKind::Out : GlobalKind::In;
     else if (q.in) kind = GlobalKind::In;
     else if (q.out) kind = GlobalKind::Out;
+    // Geometry and tessellation stages: per-vertex inputs (and control outputs) are arrays, one element per vertex; control outputs are shared by the patch's invocations.
+    const bool per_vertex = !name.starts_with("gl_") && is_per_vertex(kind, q.patch);
+    const uint32_t inner = pending_inner_;
+    pending_inner_ = 0;
+    if (inner && !per_vertex) { err("arrays of arrays are only supported as per-vertex varyings"); return; }
+    if (per_vertex) {
+      const uint32_t len = per_vertex_length(kind == GlobalKind::Out);
+      if (!t.array) { err(stage_ == Stage::Geometry ? "geometry shader inputs must be arrays" : "tessellation shader per-vertex varyings must be arrays"); return; }
+      if (t.array == kUnsizedArray) t.array = len;
+      else if (stage_ == Stage::Geometry && m_.input_vertices && t.array != len) { err("the array size of a geometry shader input does not match the input primitive"); return; }
+      else if (stage_ == Stage::TessControl && kind == GlobalKind::Out && m_.tcs_vertices > 0 && t.array != len) { err("the array size of a tessellation control output does not match the patch's vertices"); return; }
+      if (inner) {
+        if (t.array > kMaxArrayLength / inner) { err("array too large"); return; }
+        t.array *= inner;
+      }
+    }
+    if (stage_ == Stage::TessControl && kind == GlobalKind::Out) shared = true;
     // A redeclared built-in (`layout(origin_upper_left) in vec4 gl_FragCoord;`, `out vec4 gl_Position;`): the built-in it is.
     if (name.starts_with("gl_")) {
       const int32_t old = m_.find_global(name);
@@ -903,7 +1194,8 @@ class Parser {
         if (og.kind != kind || !(og.type == t)) { err("a global is declared with different types or qualifiers in two shaders"); return; }
         if (init >= 0) {
           // (two shaders may initialize it alike: GLSL 1.20 4.3 "... must have the same initializer")
-          if (og.init >= 0 && !same_expression(og.init, init, 0)) { err("a global is initialized differently in two shaders"); return; }
+          // (only a constant one: an initializer that reads uniforms or variables is per shader, so two of them are an error even if written alike)
+          if (og.init >= 0 && (!same_expression(og.init, init, 0) || !constant_expression(init, 0))) { err("a global is initialized in two shaders"); return; }
           if (og.init < 0) og.init = init;
         }
         if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) return;
@@ -918,6 +1210,9 @@ class Parser {
     gv.location = q.location;
     gv.binding = q.binding;
     gv.flat = q.flat;
+    gv.per_vertex = per_vertex;
+    gv.inner = inner;
+    gv.patch = q.patch;
     if (kind == GlobalKind::Uniform) gv.uniform_index = 0;
   }
 
@@ -1021,10 +1316,22 @@ class Parser {
     // An interface block with an instance name: its members are only reached as inst.member, and are named Block.member (as GL names them), so they cannot collide
     // with the stage's other varyings and match the other stage's block by block and member name.
     bool named_interface = false;
+    // An arrayed instance (`in Blk {...} v[];` of the geometry and tessellation stages): every member is an array with one element per vertex.
+    uint32_t arrayed = 0;
+    const bool builtin_block = !is_uniform && (block_name.equals("gl_PerVertex") || block_name.equals("gl_PerFragment"));
     if (!is_uniform) {
       uint64_t k = pos_;
       while (k < toks_.count() && toks_[k].kind != Tok::End && !(toks_[k].text.equals("}"))) ++k;
       named_interface = k + 1 < toks_.count() && toks_[k + 1].kind == Tok::Ident;
+      if (named_interface && k + 2 < toks_.count() && toks_[k + 2].text.equals("[")) {
+        arrayed = per_vertex_length(q.out);
+        if (k + 4 < toks_.count() && toks_[k + 3].kind == Tok::Int && toks_[k + 4].text.equals("]")) {
+          const uint32_t n = toks_[k + 3].ival;
+          if (n == 0 || n > 32) { err("bad interface block array size"); return; }
+          if (stage_ == Stage::Geometry && q.in && m_.input_vertices && n != m_.input_vertices) { err("the array size of a geometry shader input does not match the input primitive"); return; }
+          arrayed = n;
+        }
+      }
     }
     String qualified(a_);
     uint32_t offset = 0;
@@ -1041,25 +1348,33 @@ class Parser {
         Type t = mt;
         if (is("[") && !parse_array_suffix(&t)) return;
         // out gl_PerVertex { vec4 gl_Position; ... }: the members are the built-ins (only which ones are used is said)
-        if (!is_uniform && (block_name.equals("gl_PerVertex") || block_name.equals("gl_PerFragment"))) {
-          const int32_t old = m_.find_global(name);
-          if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone) {
-            if (!accept(",")) break;
-            continue;
-          }
+        if (builtin_block) {
+          if (!accept(",")) break;
+          continue;
+        }
+        uint32_t member_inner = 0;
+        if (arrayed) {
+          if (t.array == kUnsizedArray) { err("a member of an arrayed interface block must have a size"); return; }
+          member_inner = t.array;
+          t.array = member_inner ? arrayed * member_inner : arrayed;
         }
         StringView global_name = name;
-        if (named_interface) {
+        if (!is_uniform) {      // (every member of an interface block is Block.member, which is how the stages match them; an unnamed block's members keep their own names as symbols)
           qualified.assign(block_name);
           qualified.push_back('.');
           qualified.append(name);
           global_name = qualified.view();
         }
-        const int32_t g = new_global(global_name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform);
+        const bool tcs_out = stage_ == Stage::TessControl && q.out;
+        const int32_t g = new_global(global_name, t, is_uniform ? GlobalKind::Uniform : (q.in ? GlobalKind::In : GlobalKind::Out), is_uniform || tcs_out);
         if (g < 0) return;
         Global& gv = *m_.globals[static_cast<uint64_t>(g)];
         gv.block = bi;
         gv.iface = iface;
+        if (!is_uniform && !named_interface) add_sym(name, gv.type, 1, g);
+        gv.per_vertex = arrayed != 0;
+        gv.inner = member_inner;
+        gv.patch = q.patch;
         if (!is_uniform) {      // (a member's own interpolation qualifier)
           gv.flat = gv.flat || mq.flat || q.flat;
         }
@@ -1071,13 +1386,22 @@ class Parser {
     }
     if (!expect("}")) return;
     if (cur().kind == Tok::Ident) {   // instance name
-      if (is_uniform) {
-        m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(cur().text);
-        add_sym(cur().text, make_type(Base::Void), 2, bi);
-      } else {
-        add_sym(cur().text, make_type(Base::Void), 3, iface);
-      }
+      const StringView instance = cur().text;
       ++pos_;
+      if (builtin_block) {      // (gl_in[], gl_out[]: the built-in instance stays)
+        Type ignored = make_type(Base::Void);
+        if (is("[") && !parse_array_suffix(&ignored)) return;
+      } else if (is_uniform) {
+        m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(instance);
+        add_sym(instance, make_type(Base::Void), 2, bi);
+      } else if (arrayed) {
+        Type ignored = make_type(Base::Void);
+        if (is("[") && !parse_array_suffix(&ignored)) return;
+        add_sym(instance, make_type(Base::Void), 4, iface);
+        if (!arrayed_.push_back(Arrayed{iface, arrayed})) { err("out of memory"); return; }
+      } else {
+        add_sym(instance, make_type(Base::Void), 3, iface);
+      }
     }
     expect(";");
   }
@@ -1526,11 +1850,60 @@ class Parser {
     return postfix_expr();
   }
 
+  // Index `index` of a per-vertex array: of an array of arrays (inner > 0), the start of vertex `index`'s array, completed by the next index (kPartialIndex).
+  static constexpr uint8_t kPartialIndex = 0x80;
+  int32_t vertex_index(int32_t base, int32_t index, uint32_t inner) {
+    Node ix;
+    ix.kind = NodeKind::Index;
+    ix.line = cur().line;
+    ix.a = base;
+    ix.b = index;
+    if (inner) {
+      Node mul;
+      mul.kind = NodeKind::Binary;
+      mul.op = Op::Mul;
+      mul.line = ix.line;
+      mul.a = index;
+      mul.b = int_node(static_cast<int32_t>(inner));
+      ix.b = add(mul);
+      ix.flags = kPartialIndex;
+      // (read alone, the vertex's whole array: the interpreter takes `inner` from the type)
+      const Node& bn = m_.nodes[static_cast<uint64_t>(base)];
+      if (bn.kind == NodeKind::Global) {
+        ix.type = m_.globals[static_cast<uint64_t>(bn.ival)]->type.element();
+        ix.type.array = inner;
+      }
+    }
+    return add(ix);
+  }
+
   int32_t postfix_expr() {
     int32_t e = primary();
     while (e >= 0 && !failed_) {
       if (is("[")) {
         ++pos_;
+        // the second index of a per-vertex array of arrays: added to the first
+        if (m_.nodes[static_cast<uint64_t>(e)].kind == NodeKind::Index && (m_.nodes[static_cast<uint64_t>(e)].flags & kPartialIndex)) {
+          const int32_t j = expression();
+          if (j < 0 || !expect("]")) return -1;
+          Node sum;
+          sum.kind = NodeKind::Binary;
+          sum.op = Op::Add;
+          sum.line = cur().line;
+          sum.a = m_.nodes[static_cast<uint64_t>(e)].b;
+          sum.b = j;
+          const int32_t b = add(sum);
+          m_.nodes[static_cast<uint64_t>(e)].b = b;
+          m_.nodes[static_cast<uint64_t>(e)].flags &= static_cast<uint8_t>(~kPartialIndex);
+          continue;
+        }
+        const uint32_t base_inner = m_.nodes[static_cast<uint64_t>(e)].kind == NodeKind::Global ? m_.globals[static_cast<uint64_t>(m_.nodes[static_cast<uint64_t>(e)].ival)]->inner : 0;
+        if (base_inner) {
+          const int32_t i = expression();
+          if (i < 0 || !expect("]")) return -1;
+          e = vertex_index(e, i, base_inner);
+          continue;
+        }
         Node n;
         n.kind = NodeKind::Index;
         n.a = e;
@@ -1667,6 +2040,32 @@ class Parser {
       err(msg.c_str());
       ++pos_;
       return -1;
+    }
+    if (s->kind == 4) {      // an arrayed interface instance: inst[i].member, or inst.length()
+      const uint32_t len = arrayed_length(s->index);
+      if (accept(".")) {
+        if (!is_id("length")) return err("expected length()"), -1;
+        ++pos_;
+        if (!expect("(") || !expect(")")) return -1;
+        return int_node(static_cast<int32_t>(len));
+      }
+      if (!expect("[")) return -1;
+      const int32_t index = expression();
+      if (index < 0 || !expect("]")) return -1;
+      if (!accept(".") || cur().kind != Tok::Ident) return err("expected a member of the block"), -1;
+      const StringView member = cur().text;
+      ++pos_;
+      for (uint64_t i = m_.globals.count(); i > 0; --i) {
+        const Global& g = *m_.globals[i - 1];
+        const StringView gn = g.name.view();
+        if (g.iface != s->index || gn.size() <= member.size() || gn[gn.size() - member.size() - 1] != '.' || !gn.substr(gn.size() - member.size(), member.size()).equals(member)) continue;
+        n.kind = NodeKind::Global;
+        n.ival = static_cast<int32_t>(i - 1);
+        m_.globals[i - 1]->referenced = true;
+        const int32_t base = add(n);
+        return vertex_index(base, index, g.inner);
+      }
+      return err("no such member in the block"), -1;
     }
     if (s->kind == 2 || s->kind == 3) {   // block instance (uniform 2, interface 3): inst.member
       if (!accept(".") || cur().kind != Tok::Ident) return err("expected a member of the block"), -1;

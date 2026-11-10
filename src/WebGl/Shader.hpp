@@ -43,7 +43,7 @@ constexpr uint32_t kMaxArrayLength = 1u << 16;     // the longest array a shader
 constexpr uint32_t kMaxValueSlots = 1u << 24;      // what Module::slots_of answers at most (a module that needs more fails to compile)
 
 enum class Language : uint8_t { Glsl100, Glsl300, Wgsl };
-enum class Stage : uint8_t { Vertex, Fragment, Compute };
+enum class Stage : uint8_t { Vertex, Fragment, Compute, Geometry, TessControl, TessEval };
 
 enum class Base : uint8_t { Void, Bool, Int, Uint, Float, Sampler, Texture, SamplerState, Struct };
 enum : uint8_t { kDim2D = 0, kDimCube = 1, kDim3D = 2, kDim2DArray = 3, kDimCubeArray = 4, kDim1D = 5, kDimMultisampled = 6, kDimDepth2D = 7,
@@ -121,6 +121,10 @@ struct Global {
   int32_t init = -1;        // node of the initializer
   int32_t block = -1;       // uniform block index (GLSL) or -1
   int32_t iface = -1;       // an in/out interface block's number (members are ordinary varyings; this only resolves instance.member) or -1
+  bool per_vertex = false;  // geometry and tessellation stages: an array with one element per vertex of the primitive or patch (`in vec4 v[]`, gl_in[].gl_Position)
+  bool patch = false;       // tessellation: a per-patch varying (`patch out`, gl_TessLevelOuter/Inner)
+  uint32_t inner = 0;       // a per-vertex array of arrays (`in vec4 v[][2]`, a member array of an arrayed block): each vertex's array has this many elements, the global's type is
+                            // the flat array of all of them (v[i][j] is element i * inner + j)
   uint32_t block_offset = 0;   // byte offset inside the block (std140)
   uint32_t uniform_index = 0;
 };
@@ -193,7 +197,8 @@ enum class BuiltinFn : uint16_t {
   BitCount, FindLsb, FindMsb, BitfieldExtract, BitfieldInsert, BitfieldReverse, UaddCarry, UsubBorrow, FirstLeadingBit, FirstTrailingBit,
   Dfdx, Dfdy, Fwidth,
   Barrier, AtomicLoad, AtomicStore, AtomicAdd, AtomicSub, AtomicMax, AtomicMin, AtomicAnd, AtomicOr, AtomicXor, AtomicExchange, AtomicCompareExchange,
-  ArrayLength, Dot4U8Packed, CountLeadingZeros, CountTrailingZeros, ReverseBits, ExtractBits, InsertBits, Step1, TextureBarrier, Transform2
+  ArrayLength, Dot4U8Packed, CountLeadingZeros, CountTrailingZeros, ReverseBits, ExtractBits, InsertBits, Step1, TextureBarrier, Transform2,
+  EmitVertex, EndPrimitive, EmitStreamVertex, EndStreamPrimitive
 };
 
 struct Module {
@@ -225,6 +230,17 @@ struct Module {
   bool desktop = false;            // desktop GLSL (GlslOptions::desktop)
   uint32_t desktop_version = 0;    // its #version (110 when none): 110 ... 460
   bool compatibility = false;      // desktop GLSL with the compatibility built-ins (1.40 and before, or `compatibility`)
+  // Geometry and tessellation stages, from their layout declarations (GL enum values; 0 = not declared).
+  uint32_t gs_input = 0xFFFFFFFFu;  // GL_POINTS 0, GL_LINES 1, GL_LINES_ADJACENCY 0xA, GL_TRIANGLES 4, GL_TRIANGLES_ADJACENCY 0xC (0xFFFFFFFF: not declared)
+  uint32_t gs_output = 0xFFFFFFFFu; // GL_POINTS 0, GL_LINE_STRIP 3, GL_TRIANGLE_STRIP 5
+  int32_t gs_max_vertices = -1;
+  uint32_t gs_invocations = 1;
+  uint32_t input_vertices = 0;      // the length of per-vertex input arrays (gl_in): the input primitive's vertex count, or gl_MaxPatchVertices
+  int32_t tcs_vertices = -1;        // layout(vertices = n) out
+  uint32_t tes_mode = 0;            // GL_TRIANGLES 4, GL_QUADS 7, GL_ISOLINES 0x8E7A
+  uint32_t tes_spacing = 0;         // GL_EQUAL 0x0202, GL_FRACTIONAL_EVEN 0x8E7C, GL_FRACTIONAL_ODD 0x8E7B
+  uint32_t tes_order = 0;           // GL_CW 0x0900, GL_CCW 0x0901
+  bool tes_point_mode = false;
 
   uint32_t slots_of(const Type& t) const;
   const StructDef* struct_of(const Type& t) const { return t.base == Base::Struct && t.sid < structs.count() ? structs[t.sid].get() : nullptr; }
@@ -284,6 +300,16 @@ class ITextureHost {
   ~ITextureHost() = default;
 };
 
+// Where a geometry shader's EmitVertex()/EndPrimitive() go: the host reads the outputs from the machine's private region when called.
+class IStreamHost {
+ public:
+  virtual bool emit_vertex(uint32_t stream) = 0;
+  virtual bool end_primitive(uint32_t stream) = 0;
+
+ protected:
+  ~IStreamHost() = default;
+};
+
 // Which derivative-site values a neighbouring pixel recorded (see Machine::set_derivative_source).
 struct DerivativeLog {
   explicit DerivativeLog(allocators::IAllocator& a) : values(a) {}
@@ -307,6 +333,7 @@ class Machine {
   uint32_t* shared_region() const { return shared_; }
   void set_shared(uint32_t* region) { shared_ = region; }
   void set_texture_host(ITextureHost* host) { host_ = host; }
+  void set_stream_host(IStreamHost* host) { stream_host_ = host; }
   // Zeroes the private region and runs the initializers of the private globals (call before the first run, and to reset between invocations when wanted).
   bool reset_privates();
   // Runs the initializers of the shared globals of a region of module.shared_slots slots; once per region.
@@ -337,6 +364,7 @@ class Machine {
   uint32_t* shared_ = nullptr;
   bool valid_ = false;
   ITextureHost* host_ = nullptr;
+  IStreamHost* stream_host_ = nullptr;
   static constexpr uint32_t kMaxVars = 4096, kMaxFrames = 2048;
   Var* vars_ = nullptr;
   Frame* frames_ = nullptr;

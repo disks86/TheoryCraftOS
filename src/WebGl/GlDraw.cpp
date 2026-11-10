@@ -20,6 +20,7 @@
 // and presenting the drawing buffer.
 #include "WebGl/GlContext.hpp"
 #include "WebGl/GlPixels.hpp"
+#include "WebGl/GlStages.hpp"
 
 namespace webgl {
 
@@ -438,10 +439,164 @@ uint32_t GlContext::fetch_index(const uint8_t* idx, uint32_t type, uint32_t i) c
   return read_index(idx + uint64_t{i} * sz, type);
 }
 
+// Calls `primitive(positions, n)` for every primitive of a draw in `mode`, with the positions in the draw's vertex list of its vertices (in the order the next stage takes them:
+// adjacency primitives as the geometry stage's input arrays have them). A restart index (`vertex(i)` below 0) begins a new strip or list.
+template <class Vertex, class Primitive>
+static void assemble(uint32_t mode, int32_t count, uint32_t patch_vertices, Vertex& vertex, Primitive& primitive) {
+  int32_t pos[32];
+  int32_t start = 0;
+  for (int32_t i = 0; i <= count; ++i) {
+    if (i < count && vertex(i) >= 0) continue;
+    const int32_t n = i - start;      // a run between restarts: [start, i)
+    const auto emit = [&](uint32_t k) { primitive(pos, k); };
+    switch (mode) {
+      case 0: for (int32_t k = 0; k < n; ++k) { pos[0] = start + k; emit(1); } break;
+      case 1: for (int32_t k = 0; k + 1 < n; k += 2) { pos[0] = start + k; pos[1] = start + k + 1; emit(2); } break;
+      case 2: case 3:
+        for (int32_t k = 0; k + 1 < n; ++k) { pos[0] = start + k; pos[1] = start + k + 1; emit(2); }
+        if (mode == 2 && n > 2) { pos[0] = start + n - 1; pos[1] = start; emit(2); }
+        break;
+      case 4: for (int32_t k = 0; k + 2 < n; k += 3) { pos[0] = start + k; pos[1] = start + k + 1; pos[2] = start + k + 2; emit(3); } break;
+      case 5:
+        for (int32_t k = 0; k + 2 < n; ++k) {
+          pos[0] = start + k + (k & 1);
+          pos[1] = start + k + 1 - (k & 1);
+          pos[2] = start + k + 2;
+          emit(3);
+        }
+        break;
+      case 6: for (int32_t k = 1; k + 1 < n; ++k) { pos[0] = start; pos[1] = start + k; pos[2] = start + k + 1; emit(3); } break;
+      case 0xA: for (int32_t k = 0; k + 3 < n; k += 4) { for (int32_t j = 0; j < 4; ++j) pos[j] = start + k + j; emit(4); } break;
+      case 0xB: for (int32_t k = 0; k + 3 < n; ++k) { for (int32_t j = 0; j < 4; ++j) pos[j] = start + k + j; emit(4); } break;
+      case 0xC: for (int32_t k = 0; k + 5 < n; k += 6) { for (int32_t j = 0; j < 6; ++j) pos[j] = start + k + j; emit(6); } break;
+      case 0xD: {
+        // A triangle strip with adjacency (GL 4.6, table 10.1, 1-based there): which vertices make triangle t of the strip, as (first, its adjacent, second, ..., third, ...).
+        const int32_t tris = n >= 6 ? (n - 4) / 2 : 0;
+        for (int32_t t = 0; t < tris; ++t) {
+          int32_t v[6];      // 1-based as in the table: 1st, adj 1-2, 2nd, adj 2-3, 3rd, adj 3-1
+          const int32_t i2 = 2 * t;
+          if (tris == 1) { const int32_t a[6] = {1, 2, 3, 6, 5, 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
+          else if (t == 0) { const int32_t a[6] = {1, 2, 3, 7, 5, 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
+          else if (t == tris - 1) {
+            if (t & 1) { const int32_t a[6] = {i2 + 3, i2 - 1, i2 + 1, i2 + 4, i2 + 5, i2 + 6}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
+            else { const int32_t a[6] = {i2 + 1, i2 - 1, i2 + 3, i2 + 6, i2 + 5, i2 + 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
+          } else if (t & 1) {
+            const int32_t a[6] = {i2 + 3, i2 - 1, i2 + 1, i2 + 4, i2 + 5, i2 + 7};
+            for (int j = 0; j < 6; ++j) v[j] = a[j];
+          } else {
+            const int32_t a[6] = {i2 + 1, i2 - 1, i2 + 3, i2 + 7, i2 + 5, i2 + 4};
+            for (int j = 0; j < 6; ++j) v[j] = a[j];
+          }
+          bool inside = true;
+          for (int j = 0; j < 6; ++j) { pos[j] = start + v[j] - 1; inside = inside && v[j] >= 1 && v[j] <= n; }
+          if (inside) emit(6);
+        }
+        break;
+      }
+      case 0xE:
+        if (patch_vertices >= 1 && patch_vertices <= 32)
+          for (int32_t k = 0; k + static_cast<int32_t>(patch_vertices) <= n; k += static_cast<int32_t>(patch_vertices)) {
+            for (uint32_t j = 0; j < patch_vertices; ++j) pos[j] = start + k + static_cast<int32_t>(j);
+            emit(patch_vertices);
+          }
+        break;
+      default: break;
+    }
+    start = i + 1;
+  }
+}
+
+template <class RunVertex, class ShadeVertex, class EmitTriangle, class EmitLine, class Pipe>
+bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count, int32_t instances, int32_t first, const uint8_t* idx, uint32_t index_type, bool indexed,
+                                    bool restart_ok, uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line,
+                                    gpu::RasterState& rs, Pipe& pipe) {
+  gpu::IPrimitiveSink* const sink = desktop.primitive_sink;
+  // Which input primitives the program takes: patches for tessellation; the geometry stage's input primitive; the evaluation stage's output must be that too.
+  const ExtraStage* gs = p.extra[kStageGeometry].get();
+  const ExtraStage* tes = p.extra[kStageTessEval].get();
+  if (tes ? mode != 0xE : mode == 0xE) { set_error(INVALID_OPERATION); return false; }
+  if (gs) {
+    const uint32_t in = gs->module->gs_input;
+    uint32_t feeds;
+    if (tes) feeds = tes->module->tes_point_mode ? 0 : (tes->module->tes_mode == 0x8E7A ? 1 : 4);
+    else feeds = mode == 0 ? 0 : (mode <= 3 ? 1 : (mode <= 6 ? 4 : (mode <= 0xB ? 0xA : 0xC)));
+    if (feeds != in) { set_error(INVALID_OPERATION); return false; }
+  }
+  struct Out final : IPrimitiveOut {
+    gpu::IPrimitiveSink* sink;
+    gpu::RasterState& rs;
+    Pipe& pipe;
+    EmitTriangle& tri;
+    EmitLine& ln;
+    Out(gpu::IPrimitiveSink* s, gpu::RasterState& r, Pipe& pp, EmitTriangle& t, EmitLine& l) : sink(s), rs(r), pipe(pp), tri(t), ln(l) {}
+    void point(const gpu::RVertex& a) override {
+      if (sink) sink->point(a);
+      else gpu::draw_point(rs, a, pipe);
+    }
+    void line(const gpu::RVertex& a, const gpu::RVertex& b, bool first_of_strip) override { ln(a, b, first_of_strip); }
+    void triangle(const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) override { tri(a, b, c); }
+  } out(sink, rs, pipe, emit_triangle, emit_line);
+  StagePipeline stages(a_, p, desktop, this, out);
+  if (p.has_extra() && !stages.begin()) { set_error(0x505); return false; }
+  const uint32_t slots = p.vs_record_slots;
+  List<uint32_t> records(a_);
+  if (!records.reserve(uint64_t{slots ? slots : 1} * 32)) { set_error(0x505); return false; }
+  for (uint32_t i = 0; i < (slots ? slots : 1) * 32; ++i) records.push_back(0);
+  bool ok = true;
+  for (int32_t inst = 0; inst < instances && ok; ++inst) {
+    auto vertex = [&](int32_t i) -> int64_t {
+      if (!indexed) return first + i;
+      const uint32_t v = fetch_index(idx, index_type, static_cast<uint32_t>(i));
+      if (restart_ok && v == restart_val) return -1;
+      const int64_t rebased = static_cast<int64_t>(v) + desktop.base_vertex;
+      return rebased < 0 ? 0 : rebased;
+    };
+    uint32_t primitive_id = 0;
+    auto primitive = [&](const int32_t* pos, uint32_t n) {
+      if (!ok) return;
+      if (!p.has_extra()) {      // adjacency without a geometry stage: the primitive inside
+        gpu::RVertex a, b, c;
+        const bool lines = mode == 0xA || mode == 0xB;
+        const int32_t i0 = pos[1], i1 = lines ? pos[2] : pos[2], i2 = pos[4];
+        const int32_t first_pos = lines ? pos[1] : pos[0];
+        if (lines) {
+          ok = shade_vertex(static_cast<uint32_t>(vertex(i0)), static_cast<uint32_t>(vertex(i0)), static_cast<uint32_t>(inst), &a) &&
+               shade_vertex(static_cast<uint32_t>(vertex(i1)), static_cast<uint32_t>(vertex(i1)), static_cast<uint32_t>(inst), &b);
+          if (ok) emit_line(a, b, true);
+        } else {
+          ok = shade_vertex(static_cast<uint32_t>(vertex(first_pos)), static_cast<uint32_t>(vertex(first_pos)), static_cast<uint32_t>(inst), &a) &&
+               shade_vertex(static_cast<uint32_t>(vertex(pos[2])), static_cast<uint32_t>(vertex(pos[2])), static_cast<uint32_t>(inst), &b) &&
+               shade_vertex(static_cast<uint32_t>(vertex(i2)), static_cast<uint32_t>(vertex(i2)), static_cast<uint32_t>(inst), &c);
+          if (ok) emit_triangle(a, b, c);
+        }
+        return;
+      }
+      // the vertex stage's records of the primitive's vertices
+      const uint32_t* recs[32];
+      for (uint32_t k = 0; k < n && k < 32; ++k) {
+        const uint32_t ix = static_cast<uint32_t>(vertex(pos[k]));
+        bool edge;
+        if (!run_vertex(ix, ix, static_cast<uint32_t>(inst), &edge)) { ok = false; return; }
+        uint32_t* rec = records.view().data() + uint64_t{k} * slots;
+        const ArrayView<const uint32_t> src(p.vsm ? p.vmach->private_region() : nullptr, p.vsm->private_slots);
+        for (const StageCopy& r : p.vs_record)
+          for (uint32_t s = 0; s < r.count; ++s)
+            if (r.src + s < src.size() && r.dst + s < slots) rec[r.dst + s] = src[r.src + s];
+        recs[k] = rec;
+      }
+      if (!stages.primitive(ArrayView<const uint32_t* const>(recs, n < 32 ? n : 32), primitive_id++)) ok = false;
+    };
+    assemble(mode, count, desktop.patch_vertices, vertex, primitive);
+  }
+  if (!ok) set_error(INVALID_OPERATION);
+  return ok;
+}
+
 bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t index_type, uint64_t index_offset, int32_t instances, bool indexed) {
   using shader::Machine;
   if (lost_) return false;
-  if (mode > 6) { set_error(INVALID_ENUM); return false; }
+  // (adjacency and patches: desktop GL)
+  if (mode > 6 && !(desktop.active && mode >= 0xA && mode <= 0xE)) { set_error(INVALID_ENUM); return false; }
   if (count < 0 || instances < 0 || first < 0) { set_error(INVALID_VALUE); return false; }
   ProgramObj* p = program_at(program_);
   if (!p || !p->linked) { set_error(INVALID_OPERATION); return false; }
@@ -512,7 +667,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default && !desktop.primitive_sink) {
+  if (target.is_default && !desktop.primitive_sink && !p->has_extra() && mode <= 6) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
   }
@@ -579,17 +734,8 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   for (uint32_t i = 0; i < kCache; ++i) { Cached e; e.key = -1; cache.push_back(e); }
   uint32_t cur_instance = 0xFFFFFFFFu;
 
-  auto shade_vertex = [&](uint32_t index, uint32_t vertex_id, uint32_t instance, gpu::RVertex* out) -> bool {
-    const int64_t key = static_cast<int64_t>(index);
-    Cached& slot = cache[index % kCache];
-    if (cur_instance != instance) {
-      for (uint32_t i = 0; i < kCache; ++i) cache[i].key = -1;
-      cur_instance = instance;
-    }
-    if (indexed && !tf_active_ && !desktop.primitive_sink && slot.key == key) {
-      *out = slot.v;
-      return true;
-    }
+  // Runs the vertex stage for a vertex; the results are in vm's private region.
+  auto run_vertex = [&](uint32_t index, uint32_t vertex_id, uint32_t instance, bool* edge) -> bool {
     uint32_t* pr = vm.private_region();
     for (uint32_t i = 0; i < vmod.private_slots; ++i) pr[i] = vinitial[i];
     for (const auto& ai : p->attribs) {
@@ -615,13 +761,27 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     }
     if (desktop.active && desktop.edge_flag_attrib >= 0) {
       const VertexAttrib& ef = vao->attribs[desktop.edge_flag_attrib];
-      out->edge = ef.enabled && buffer_at(ef.buffer) ? buffer_at(ef.buffer)->data.view()[ef.offset + uint64_t{index} * (ef.stride ? ef.stride : 1)] != 0 : ef.cur_f[0] != 0;
+      *edge = ef.enabled && buffer_at(ef.buffer) ? buffer_at(ef.buffer)->data.view()[ef.offset + uint64_t{index} * (ef.stride ? ef.stride : 1)] != 0 : ef.cur_f[0] != 0;
     } else {
-      out->edge = true;
+      *edge = true;
     }
     if (vid_g >= 0) pr[vmod.globals[static_cast<uint64_t>(vid_g)]->slot] = vertex_id;
     if (iid_g >= 0) pr[vmod.globals[static_cast<uint64_t>(iid_g)]->slot] = instance;
-    if (vm.start(vmod.main_function, ArrayView<const uint32_t* const>()) != Machine::Status::Done) return false;
+    return vm.start(vmod.main_function, ArrayView<const uint32_t* const>()) == Machine::Status::Done;
+  };
+  auto shade_vertex = [&](uint32_t index, uint32_t vertex_id, uint32_t instance, gpu::RVertex* out) -> bool {
+    const int64_t key = static_cast<int64_t>(index);
+    Cached& slot = cache[index % kCache];
+    if (cur_instance != instance) {
+      for (uint32_t i = 0; i < kCache; ++i) cache[i].key = -1;
+      cur_instance = instance;
+    }
+    if (indexed && !tf_active_ && !desktop.primitive_sink && slot.key == key) {
+      *out = slot.v;
+      return true;
+    }
+    if (!run_vertex(index, vertex_id, instance, &out->edge)) return false;
+    uint32_t* pr = vm.private_region();
     for (int i = 0; i < 4; ++i) out->pos[i] = u2f(pr[pos_slot + i]);
     out->point_size = vps_g >= 0 ? u2f(pr[ps_slot]) : 1.0f;
     for (const VaryingLink& l : p->links)
@@ -673,6 +833,13 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     stipple_at += gpu::draw_line(rs, a, b, pipe);
   };
   bool ok = true;
+  // Geometry and tessellation stages, adjacency and patches: GlStages.cpp.
+  if (p->has_extra() || mode >= 0xA) {
+    ok = draw_through_stages(*p, mode, count, instances, first, idx, index_type, indexed, restart_ok, restart_val, run_vertex, shade_vertex, emit_triangle, emit_line, rs, pipe);
+    if (pipe.occlusion) pipe.occlusion->result = pipe.samples ? 1 : pipe.occlusion->result;
+    ++version_;
+    return ok;
+  }
   for (int32_t inst = 0; inst < instances && ok; ++inst) {
     // the list of vertex indices of this draw (with restart markers)
     auto index_at = [&](int32_t i) -> int64_t {
@@ -776,9 +943,10 @@ void GlContext::draw_range_elements(uint32_t mode, uint32_t, uint32_t, int32_t c
 // --- Uniform blocks -----------------------------------------------------------------------------------------------------------------------------------
 
 void GlContext::load_uniform_blocks(ProgramObj* p) {
-  for (int s = 0; s < 2; ++s) {
-    const shader::Module& m = s == 0 ? *p->vsm : *p->fsm;
-    uint32_t* shared = s == 0 ? p->vs_shared.view().data() : p->fs_shared.view().data();
+  for (int s = 0; s < 5; ++s) {
+    if (!p->stage_module(s)) continue;
+    const shader::Module& m = *p->stage_module(s);
+    uint32_t* shared = p->stage_shared(s);
     for (uint64_t b = 0; b < m.blocks.count(); ++b) {
       const int32_t merged = static_cast<int32_t>(get_uniform_block_index(static_cast<uint32_t>(program_), m.blocks[b]->name.view()));
       if (merged < 0 || static_cast<uint64_t>(merged) >= p->block_bindings.count()) continue;

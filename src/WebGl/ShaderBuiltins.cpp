@@ -764,6 +764,15 @@ bool Interp::builtin(BuiltinFn fn, const Ref* a, uint32_t n, Ref* out, const Nod
 
     // --- compute
     case BuiltinFn::Barrier: case BuiltinFn::TextureBarrier: return true;
+    // --- geometry shaders
+    case BuiltinFn::EmitVertex: case BuiltinFn::EndPrimitive: case BuiltinFn::EmitStreamVertex: case BuiltinFn::EndStreamPrimitive: {
+      if (!m.stream_host_) return fail("EmitVertex() outside a geometry shader");
+      const bool stream_form = fn == BuiltinFn::EmitStreamVertex || fn == BuiltinFn::EndStreamPrimitive;
+      if (stream_form && !need(1)) return false;
+      const uint32_t stream = stream_form ? a[0].p[0] : 0;
+      const bool ok = fn == BuiltinFn::EmitVertex || fn == BuiltinFn::EmitStreamVertex ? m.stream_host_->emit_vertex(stream) : m.stream_host_->end_primitive(stream);
+      return ok || fail("the geometry shader's output failed");
+    }
     case BuiltinFn::ArrayLength: return need(1) && scalar_result(*this, Base::Uint, a[0].t.array, out);
     case BuiltinFn::AtomicLoad: {
       if (!need(1)) return false;

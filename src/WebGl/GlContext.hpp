@@ -176,6 +176,7 @@ struct UniformLeaf {
   uint32_t size = 1;         // array length
   shader::Type type;         // the element type
   int32_t vs_slot = -1, fs_slot = -1;   // shared slots in each stage's storage
+  int32_t extra_slot[3] = {-1, -1, -1};  // ... and in the geometry, tessellation control and evaluation stages' (ProgramObj::extra)
   uint32_t elem_slots = 1;
   uint32_t location = 0;     // of the first element
   bool in_block = false;
@@ -197,8 +198,35 @@ struct AttribInfo {
   shader::Type type;
 };
 
+// How one stage's outputs become the next one's inputs, between the vertex, tessellation and geometry stages (GlStages.cpp). Per vertex, an output of a stage that runs once per
+// vertex (vertex, evaluation) goes to element i of the next stage's input array for the primitive's vertex i; the control stage's per-vertex arrays go element by element; per-patch
+// values once.
+struct StageCopy {
+  uint32_t src = 0, dst = 0;            // slots of the first element (src: in the producer's record, or its shared region for the control stage)
+  uint32_t count = 0;                   // slots per element
+  uint32_t src_stride = 0, dst_stride = 0;
+  uint32_t elements = 1;                // control -> evaluation, per vertex: how many elements
+  bool per_vertex = false;              // dst is a per-vertex array (index by the vertex)
+};
+
+// A geometry or tessellation stage of a program: its module, the shared storage (uniforms; for the control stage the patch's outputs too), the machines, and what feeds it.
+struct ExtraStage {
+  explicit ExtraStage(allocators::IAllocator& a) : shared(a), machines(a), inputs(a), record(a), initial(a), output_slots(a) {}
+  UniquePointer<shader::Module> module;
+  List<uint32_t> shared;
+  List<UniquePointer<shader::Machine>> machines;   // one; the control stage one per output vertex (they run side by side to each barrier())
+  List<StageCopy> inputs;                          // from the stage before
+  List<StageCopy> record;                          // a stage that runs per vertex (evaluation): its outputs the next stage reads, gathered (src: its private slot, dst: record slot)
+  uint32_t record_slots = 0;
+  List<uint32_t> initial;                          // the private region as its initializers leave it
+  struct Range { uint32_t slot, count; };
+  List<Range> output_slots;                        // control stage: its outputs in the shared region, cleared for each patch
+};
+enum : uint32_t { kStageGeometry = 0, kStageTessControl = 1, kStageTessEval = 2 };
+
 struct ProgramObj {
-  explicit ProgramObj(allocators::IAllocator& a) : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), outputs(a), locs(a) {}
+  explicit ProgramObj(allocators::IAllocator& a)
+      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), outputs(a), locs(a), vs_record(a) {}
   String log;
   // The attached shaders, in the order attached. WebGL allows one per stage; desktop GL any number, linked together (shader::parse_glsl_units).
   struct Attached { uint32_t id; uint32_t type; };
@@ -226,6 +254,35 @@ struct ProgramObj {
   struct Loc { uint32_t leaf, element; };
   List<Loc> locs;
   UniquePointer<shader::Machine> vmach, fmach;   // made when first drawn with
+  // The geometry, tessellation control and evaluation stages (kStage*), when the program has them; and the vertex stage's outputs the first of them reads, gathered per vertex.
+  UniquePointer<ExtraStage> extra[3];
+  List<StageCopy> vs_record;
+  uint32_t vs_record_slots = 0;
+  bool has_extra() const { return extra[0] || extra[1] || extra[2]; }
+  // The stages by number: 0 vertex, 1 fragment, 2 + kStage* the others (null when absent).
+  const shader::Module* stage_module(int s) const { return s == 0 ? vsm.get() : (s == 1 ? fsm.get() : (extra[s - 2] ? extra[s - 2]->module.get() : nullptr)); }
+  uint32_t* stage_shared(int s) { return s == 0 ? vs_shared.view().data() : (s == 1 ? fs_shared.view().data() : (extra[s - 2] ? extra[s - 2]->shared.view().data() : nullptr)); }
+  // The uniform blocks, one per name across the stages, numbered in stage order: f(index, stage module, block) for each, until it returns false.
+  template <class F>
+  void for_each_block(F&& f) const {
+    uint32_t idx = 0;
+    for (int s = 0; s < 5; ++s) {
+      const shader::Module* m = stage_module(s);
+      if (!m) continue;
+      for (uint64_t b = 0; b < m->blocks.count(); ++b) {
+        bool seen = false;
+        for (int t = 0; t < s && !seen; ++t) {
+          const shader::Module* o = stage_module(t);
+          if (o) for (uint64_t k = 0; k < o->blocks.count(); ++k) seen = seen || o->blocks[k]->name.view().equals(m->blocks[b]->name.view());
+        }
+        if (seen) continue;
+        if (!f(idx, *m, b)) return;
+        ++idx;
+      }
+    }
+  }
+  // The stage whose vertices are rasterized: geometry, else evaluation, else vertex.
+  const shader::Module& last_module() const { return extra[kStageGeometry] ? *extra[kStageGeometry]->module : (extra[kStageTessEval] ? *extra[kStageTessEval]->module : *vsm); }
   // Hardware acceleration (GlAccel.cpp): the TGSI translation and the accelerator's compiled program, made when the program is first drawn with.
   UniquePointer<TgsiProgram> tgsi;
   IAccelerator* accel = nullptr;
@@ -306,6 +363,9 @@ struct DesktopState {
   uint32_t restart_index = 0;
   int32_t base_vertex = 0;
   uint32_t base_instance = 0;
+  // glPatchParameteri / glPatchParameterfv: the vertices of a patch, and the levels the evaluation stage uses without a control stage.
+  uint32_t patch_vertices = 3;
+  float patch_outer[4] = {1, 1, 1, 1}, patch_inner[2] = {1, 1};
   uint32_t polygon_mode_front = 0x1B02, polygon_mode_back = 0x1B02;   // GL_FILL
   int32_t edge_flag_attrib = -1;       // the attribute holding the edge flag (only read when a polygon mode is not GL_FILL)
   bool offset_line = false, offset_point = false;
@@ -610,13 +670,19 @@ class GlContext final : public shader::ITextureHost {
 
   void link_failed(ProgramObj* p, StringView why);
   bool link_collect_uniforms(ProgramObj* p);
-  void flatten_uniform(ProgramObj* p, const shader::Module& m, bool is_vs, const shader::Global& g, const shader::Type& t, StringView name, uint32_t slot);
+  void flatten_uniform(ProgramObj* p, const shader::Module& m, int stage, const shader::Global& g, const shader::Type& t, StringView name, uint32_t slot);
+  bool link_extra_stages(ProgramObj* p);
+  bool link_stage_inputs(ProgramObj* p, const shader::Module& producer, bool producer_is_control, ExtraStage& consumer, List<StageCopy>* record, uint32_t* record_slots, const char* name);
   void setup_program_storage(ProgramObj* p);
   void load_uniform_blocks(ProgramObj* p);
   uint32_t uniform_gl_type(const shader::Type& t) const;
 
   struct VertexOut;
   bool run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t index_type, uint64_t index_offset, int32_t instances, bool indexed);
+  // run_draw's way through the geometry and tessellation stages (and adjacency primitives without them); the lambdas are run_draw's (GlDraw.cpp).
+  template <class RunVertex, class ShadeVertex, class EmitTriangle, class EmitLine, class Pipe>
+  bool draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count, int32_t instances, int32_t first, const uint8_t* idx, uint32_t index_type, bool indexed, bool restart_ok,
+                           uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line, gpu::RasterState& rs, Pipe& pipe);
   uint32_t fetch_index(const uint8_t* idx, uint32_t type, uint32_t i) const;
   void mark_dirty(int32_t x, int32_t y);
   Image* default_color() { return dcolor_; }
