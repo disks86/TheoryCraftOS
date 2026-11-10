@@ -84,6 +84,7 @@ constexpr uint32_t GL_CLIENT_ACTIVE_TEXTURE = 0x84E1;
 constexpr uint32_t GL_CLIENT_ATTRIB_STACK_DEPTH = 0x0BB1;
 constexpr uint32_t GL_CLIENT_PIXEL_STORE_BIT = 0x00000001;
 constexpr uint32_t GL_CLIENT_VERTEX_ARRAY_BIT = 0x00000002;
+constexpr uint32_t GL_CLIP_DISTANCE0 = 0x3000;
 constexpr uint32_t GL_CLIP_PLANE0 = 0x3000;
 constexpr uint32_t GL_COEFF = 0x0A00;
 constexpr uint32_t GL_COLOR = 0x1800;

@@ -116,6 +116,7 @@ void StagePipeline::to_vertex(const uint32_t* privates, gpu::RVertex* out) const
   for (const VaryingLink& l : p_.links)
     for (uint32_t k = 0; k < l.count; ++k)
       if (l.vs_slot + k < n && l.var_offset + k < gpu::kMaxVarying) out->var[l.var_offset + k] = u2f(privates[l.vs_slot + k]);
+  p_.fill_clip_distances(privates, n, desktop_.clip_planes, out->var);
 }
 
 bool StagePipeline::gather(const ExtraStage& stage, const uint32_t* privates, uint32_t* record) const {

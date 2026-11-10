@@ -253,8 +253,13 @@ struct FragmentPipeline final : gpu::IFragmentSink {
       if (ds.polygon_stipple && !f.is_point && !f.is_line && !((ds.polygon_pattern[(y / t.ss) & 31] >> ((x / t.ss) & 31)) & 1)) return;
       if (ds.line_stipple && f.is_line && !((ds.stipple_pattern >> ((static_cast<uint32_t>(f.line_pos) / (ds.stipple_factor ? ds.stipple_factor : 1)) & 15)) & 1)) return;
       if (ds.clip_mask && ds.clip_varying >= 0) {
-        int32_t at = ds.clip_varying;
-        for (uint32_t m = ds.clip_mask; m; m &= m - 1, ++at) if (f.varyings[at] < 0) return;
+        if (ds.clip_indexed) {      // (a program: plane i's distance is varying clip_varying + i)
+          for (uint32_t i = 0; i < 8; ++i)
+            if ((ds.clip_mask >> i) & 1 && static_cast<uint32_t>(ds.clip_varying) + i < gpu::kMaxVarying && f.varyings[ds.clip_varying + static_cast<int32_t>(i)] < 0) return;
+        } else {
+          int32_t at = ds.clip_varying;
+          for (uint32_t m = ds.clip_mask; m; m &= m - 1, ++at) if (f.varyings[at] < 0) return;
+        }
       }
     }
     const bool has_depth = t.depth && c.depth_test_ && (t.depth->info->store == Store::Depth || t.depth->info->store == Store::DepthStencil);
@@ -667,7 +672,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default && !desktop.primitive_sink && !p->has_extra() && mode <= 6) {
+  if (target.is_default && !desktop.primitive_sink && !p->has_extra() && mode <= 6 && !(desktop.active && desktop.clip_mask)) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
   }
@@ -786,6 +791,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     out->point_size = vps_g >= 0 ? u2f(pr[ps_slot]) : 1.0f;
     for (const VaryingLink& l : p->links)
       for (uint32_t k = 0; k < l.count; ++k) out->var[l.var_offset + k] = u2f(pr[l.vs_slot + k]);
+    p->fill_clip_distances(pr, vmod.private_slots, desktop.clip_planes, out->var);
     if (tf_active_) tf_capture(*p, pr);
     slot.key = key;
     slot.v = *out;

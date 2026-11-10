@@ -67,8 +67,10 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
 ## Not done
 
 - GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; geometry streams other than 0, transform feedback of the geometry and
-  tessellation stages, layered rendering (`gl_Layer`), the compatibility varyings (`gl_FrontColor`, `gl_TexCoord`, `gl_ClipVertex`) in those stages, `gl_PrimitiveID` without a
-  geometry stage; clip distances are written but not applied.
+  tessellation stages, layered rendering (`gl_Layer`), the compatibility varyings (`gl_FrontColor`, `gl_TexCoord`) in those stages, `gl_PrimitiveID` without a geometry stage,
+  a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after `float gl_ClipDistance[2]`).
+- Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
+  tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).
