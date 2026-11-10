@@ -413,6 +413,8 @@
 "glNormalPointerEXT",
 "glOrtho",
 "glPassThrough",
+"glPatchParameterfv",
+"glPatchParameteri",
 "glPixelMapfv",
 "glPixelMapuiv",
 "glPixelMapusv",

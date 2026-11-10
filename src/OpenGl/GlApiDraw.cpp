@@ -403,6 +403,20 @@ void GlApi::draw_any(uint32_t mode, int32_t first, int32_t count, uint32_t type,
   finish_draw();
 }
 
+// Tessellation: the vertices of a patch, and the levels used when a program has no control stage.
+void GlApi::glPatchParameteri(GLenum pname, GLint value) {
+  if (pname != GL_PATCH_VERTICES) { error(GL_INVALID_ENUM); return; }
+  if (value <= 0 || value > 32) { error(GL_INVALID_VALUE); return; }
+  gl_.desktop.patch_vertices = static_cast<uint32_t>(value);
+}
+void GlApi::glPatchParameterfv(GLenum pname, UserPtr values) {
+  float v[4] = {};
+  const uint32_t n = pname == GL_PATCH_DEFAULT_OUTER_LEVEL ? 4 : (pname == GL_PATCH_DEFAULT_INNER_LEVEL ? 2 : 0);
+  if (!n) { error(GL_INVALID_ENUM); return; }
+  if (!read_values(values, v, n)) { error(GL_INVALID_VALUE); return; }
+  for (uint32_t i = 0; i < n; ++i) (n == 4 ? gl_.desktop.patch_outer[i] : gl_.desktop.patch_inner[i]) = v[i];
+}
+
 void GlApi::glDrawArrays(GLenum mode, GLint first, GLsizei count) { draw_any(mode, first, count, 0, UserPtr{}, false, 1, 0, 0); }
 void GlApi::glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) { draw_any(mode, first, count, 0, UserPtr{}, false, instancecount, 0, 0); }
 void GlApi::glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount, GLuint baseinstance) { draw_any(mode, first, count, 0, UserPtr{}, false, instancecount, 0, baseinstance); }

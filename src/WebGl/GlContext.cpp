@@ -124,7 +124,9 @@ uint32_t GlContext::create_renderbuffer() {
   return static_cast<uint32_t>(objects_->rbos.count());
 }
 uint32_t GlContext::create_shader(uint32_t type) {
-  if (type != 0x8B31 && type != 0x8B30) { set_error(INVALID_ENUM); return 0; }
+  // vertex, fragment; desktop GL also geometry and tessellation control and evaluation
+  const bool extra = type == 0x8DD9 || type == 0x8E88 || type == 0x8E87;
+  if (type != 0x8B31 && type != 0x8B30 && !(extra && desktop.active)) { set_error(INVALID_ENUM); return 0; }
   UniquePointer<ShaderObj> b = UniquePointer<ShaderObj>::make(a_, a_);
   if (!b) { set_error(OUT_OF_MEMORY); return 0; }
   b->type = type;

@@ -369,6 +369,7 @@ add_executable(BOOTX64
   src/WebGl/GlCompressed.cpp
   src/WebGl/GlSampler.cpp
   src/WebGl/GlDraw.cpp
+  src/WebGl/GlStages.cpp
   src/OpenGl/FixedFunction.cpp
   src/OpenGl/GlApiBuffer.cpp
   src/OpenGl/GlApiCore.cpp

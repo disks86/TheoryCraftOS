@@ -573,6 +573,13 @@ bool Interp::lvalue(int32_t id, LRef* out) {
       }
       if (i < 0) i = 0;
       if (i >= count) i = count ? count - 1 : 0;
+      // (the first index of a per-vertex array of arrays: that vertex's whole array, kept inside the global)
+      if ((node.flags & 0x80) && node.type.array && base.t.array) {
+        const uint32_t inner = node.type.array;
+        if (inner > count) return fail("bad array of arrays");
+        if (i > count - inner) i = count - inner;
+        et.array = inner;
+      }
       out->p = base.p + static_cast<uint64_t>(i) * es;
       out->t = et;
       out->n = 0;
@@ -729,6 +736,12 @@ bool Interp::eval(int32_t id, Ref* out) {
       }
       if (i < 0) i = 0;
       if (i >= count) i = count ? count - 1 : 0;
+      if ((node.flags & 0x80) && node.type.array && base.t.array) {      // (see lvalue)
+        const uint32_t inner = node.type.array;
+        if (inner > count) return fail("bad array of arrays");
+        if (i > count - inner) i = count - inner;
+        et.array = inner;
+      }
       out->p = base.p + static_cast<uint64_t>(i) * es;
       out->t = et;
       return true;

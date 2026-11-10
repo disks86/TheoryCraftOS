@@ -51,10 +51,24 @@ What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAG
 
 The desktop's 3D Test can draw its cube through the kernel GL path (the command stream opengl32.dll writes, run by `GlService`), next to Direct3D; see [Direct3DKernelMode.md](Direct3DKernelMode.md#the-3d-test-window).
 
+## Shader stages
+
+- The GLSL front end (`src/WebGl/Glsl.cpp`) has a desktop mode (`GlslOptions::desktop`): GLSL 1.10-1.20 by the ES 1.00 rules, 1.30 and later by the 3.00 ones, plus what desktop
+  GLSL adds. `GlslDesktop.cpp` only declares the compatibility built-ins (`tcos_*`), including the structure-valued uniform state that `GlApi` fills before each draw.
+- Several shaders per stage link as one translation unit (`parse_glsl_units`), each preprocessed on its own; a function is visible only in the shaders declaring it.
+- Geometry and tessellation (`GL_ARB_tessellation_shader`) stages: the front end has their layouts, built-ins (`gl_in[]`, `gl_out[]`, `gl_InvocationID`, `gl_TessCoord`, the levels),
+  per-vertex arrays (and arrays of arrays inside them, flattened), `patch` varyings and `EmitVertex`/`EndPrimitive`/`barrier`. `GlStages.cpp` runs them between the vertex stage and
+  the rasterizer: the control stage's invocations side by side to each `barrier()` with the patch's outputs in its shared region, the primitive generator of
+  `Graphics/Graphics3D/Software/Tessellator.hpp` (the Direct3D 11 reference tessellator, also OpenGL's), then the evaluation and geometry stages. Adjacency primitives draw their
+  inner primitive without a geometry stage.
+- piglit's `.shader_test` files: `tests/run_host_tests.sh PiglitShaderTest` (pinned piglit, fetched by `tests/fetch_piglit.sh`; tens of minutes), expected failures in
+  `tests/data/piglit/shader_test.xfail`.
+
 ## Not done
 
-- The shader front end is still GLSL ES: desktop GLSL goes through a source translation that handles versions, the compatibility built-ins and common keywords but not implicit
-  int-to-float conversions, `gl_LightSource`/`gl_FrontMaterial` and other structure-valued state, doubles, geometry/tessellation/compute shaders, subroutines or SSBOs/images.
+- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; geometry streams other than 0, transform feedback of the geometry and
+  tessellation stages, layered rendering (`gl_Layer`), the compatibility varyings (`gl_FrontColor`, `gl_TexCoord`, `gl_ClipVertex`) in those stages, `gl_PrimitiveID` without a
+  geometry stage; clip distances are written but not applied.
 - Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).

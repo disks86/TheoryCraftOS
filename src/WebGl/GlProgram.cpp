@@ -72,6 +72,16 @@ void GlContext::shader_source(uint32_t id, StringView src) {
   s->source.assign(src);
 }
 
+static shader::Stage stage_of_shader(uint32_t type) {
+  switch (type) {
+    case 0x8B31: return shader::Stage::Vertex;
+    case 0x8DD9: return shader::Stage::Geometry;
+    case 0x8E88: return shader::Stage::TessControl;
+    case 0x8E87: return shader::Stage::TessEval;
+    default: return shader::Stage::Fragment;
+  }
+}
+
 void GlContext::compile_shader(uint32_t id) {
   ShaderObj* s = shader_at(id);
   if (!s) { set_error(INVALID_VALUE); return; }
@@ -82,7 +92,7 @@ void GlContext::compile_shader(uint32_t id) {
   shader::GlslOptions glsl;
   glsl.desktop = desktop.active;
   glsl.compile_only = desktop.active;      // (desktop GL: a shader may leave main or its functions' bodies to another shader of the program)
-  const bool ok = shader::parse_glsl(*m, s->source.view(), s->type == 0x8B31 ? shader::Stage::Vertex : shader::Stage::Fragment, glsl);
+  const bool ok = shader::parse_glsl(*m, s->source.view(), stage_of_shader(s->type), glsl);
   if (ok && !es3_ && m->glsl_version >= 300) {
     s->log.assign("ERROR: 0:1: '#version 300 es' needs a WebGL 2 context");
   } else if (!ok) {
@@ -159,7 +169,8 @@ void GlContext::link_failed(ProgramObj* p, StringView why) {
   p->log.append(why);
 }
 
-void GlContext::flatten_uniform(ProgramObj* p, const shader::Module& m, bool is_vs, const shader::Global& g, const Type& t, StringView name, uint32_t slot) {
+// `stage`: 0 vertex, 1 fragment, 2 + kStage* the others.
+void GlContext::flatten_uniform(ProgramObj* p, const shader::Module& m, int stage, const shader::Global& g, const Type& t, StringView name, uint32_t slot) {
   if (t.array && t.base == Base::Struct) {
     const uint32_t es = m.slots_of(t.element());
     for (uint32_t i = 0; i < t.array; ++i) {
@@ -168,7 +179,7 @@ void GlContext::flatten_uniform(ProgramObj* p, const shader::Module& m, bool is_
       n.push_back('[');
       n.append_uint(i);
       n.push_back(']');
-      flatten_uniform(p, m, is_vs, g, t.element(), n.view(), slot + i * es);
+      flatten_uniform(p, m, stage, g, t.element(), n.view(), slot + i * es);
     }
     return;
   }
@@ -180,7 +191,7 @@ void GlContext::flatten_uniform(ProgramObj* p, const shader::Module& m, bool is_
       n.assign(name);
       n.push_back('.');
       n.append(sd->fields[i].name.view());
-      flatten_uniform(p, m, is_vs, g, sd->fields[i].type, n.view(), slot + sd->fields[i].offset);
+      flatten_uniform(p, m, stage, g, sd->fields[i].type, n.view(), slot + sd->fields[i].offset);
     }
     return;
   }
@@ -201,17 +212,21 @@ void GlContext::flatten_uniform(ProgramObj* p, const shader::Module& m, bool is_
     leaf = l.get();
     p->uniforms.push_back(static_cast<UniquePointer<UniformLeaf>&&>(l));
   }
-  (is_vs ? leaf->vs_slot : leaf->fs_slot) = static_cast<int32_t>(slot);
+  if (stage == 0) leaf->vs_slot = static_cast<int32_t>(slot);
+  else if (stage == 1) leaf->fs_slot = static_cast<int32_t>(slot);
+  else leaf->extra_slot[stage - 2] = static_cast<int32_t>(slot);
 }
 
 bool GlContext::link_collect_uniforms(ProgramObj* p) {
-  const shader::Module* mods[2] = {p->vsm.get(), p->fsm.get()};
-  for (int s = 0; s < 2; ++s) {
+  const shader::Module* mods[5] = {p->vsm.get(), p->fsm.get(), nullptr, nullptr, nullptr};
+  for (uint32_t k = 0; k < 3; ++k) mods[2 + k] = p->extra[k] ? p->extra[k]->module.get() : nullptr;
+  for (int s = 0; s < 5; ++s) {
+    if (!mods[s]) continue;
     const shader::Module& m = *mods[s];
     for (uint64_t i = 0; i < m.globals.count(); ++i) {
       const shader::Global& g = *m.globals[i];
       if (g.kind != GlobalKind::Uniform || g.block >= 0) continue;
-      flatten_uniform(p, m, s == 0, g, g.type, g.name.view(), g.slot);
+      flatten_uniform(p, m, s, g, g.type, g.name.view(), g.slot);
     }
   }
   // a uniform declared in both stages must have the same type
@@ -222,6 +237,158 @@ bool GlContext::link_collect_uniforms(ProgramObj* p) {
     }
     l.location = static_cast<uint32_t>(p->locs.count());
     for (uint32_t e = 0; e < l.size; ++e) p->locs.push_back(ProgramObj::Loc{static_cast<uint32_t>(i), e});
+  }
+  return true;
+}
+
+// The geometry and tessellation stages of a program (desktop GL): parsed from the attached shaders of each, checked for the layouts they must declare, and joined to the stages
+// around them (StageCopy). Fails the link (and says why) or returns true.
+bool GlContext::link_extra_stages(ProgramObj* p) {
+  static constexpr uint32_t kTypes[3] = {0x8DD9, 0x8E88, 0x8E87};
+  static constexpr shader::Stage kStages[3] = {shader::Stage::Geometry, shader::Stage::TessControl, shader::Stage::TessEval};
+  static const char* const kNames[3] = {"geometry shader: ", "tessellation control shader: ", "tessellation evaluation shader: "};
+  for (UniquePointer<ExtraStage>& st : p->extra) st.reset();
+  p->vs_record.clear();
+  p->vs_record_slots = 0;
+  shader::GlslOptions glsl;
+  glsl.desktop = desktop.active;
+  for (uint32_t k = 0; k < 3; ++k) {
+    List<StringView> sources(a_);
+    for (const ProgramObj::Attached& at : p->shaders) {
+      if (at.type != kTypes[k]) continue;
+      ShaderObj* s = shader_at(at.id);
+      if (!s || !sources.push_back(s->source.view())) { link_failed(p, "out of memory"); return false; }
+    }
+    if (sources.empty()) continue;
+    UniquePointer<ExtraStage> st = UniquePointer<ExtraStage>::make(a_, a_);
+    if (!st) { link_failed(p, "out of memory"); return false; }
+    st->module = UniquePointer<shader::Module>::make(a_, a_);
+    if (!st->module) { link_failed(p, "out of memory"); return false; }
+    if (!shader::parse_glsl_units(*st->module, static_cast<const List<StringView>&>(sources).view(), kStages[k], glsl)) {
+      String why(a_);
+      why.assign(kNames[k]);
+      why.append(st->module->error.view());
+      link_failed(p, why.view());
+      return false;
+    }
+    p->extra[k] = static_cast<UniquePointer<ExtraStage>&&>(st);
+  }
+  ExtraStage* gs = p->extra[kStageGeometry].get();
+  ExtraStage* tcs = p->extra[kStageTessControl].get();
+  ExtraStage* tes = p->extra[kStageTessEval].get();
+  if (!gs && !tcs && !tes) return true;
+  if (tcs && !tes) { link_failed(p, "a tessellation control shader needs a tessellation evaluation shader"); return false; }
+  if (gs) {
+    const shader::Module& m = *gs->module;
+    if (m.gs_input == 0xFFFFFFFFu) { link_failed(p, "the geometry shader declares no input primitive"); return false; }
+    if (m.gs_output == 0xFFFFFFFFu) { link_failed(p, "the geometry shader declares no output primitive"); return false; }
+    if (m.gs_max_vertices < 0) { link_failed(p, "the geometry shader declares no max_vertices"); return false; }
+  }
+  if (tcs && tcs->module->tcs_vertices <= 0) { link_failed(p, "the tessellation control shader declares no output patch size"); return false; }
+  if (tes && !tes->module->tes_mode) { link_failed(p, "the tessellation evaluation shader declares no primitive mode"); return false; }
+  // vertex -> control -> evaluation -> geometry: what each reads of the stage before
+  const shader::Module* before = p->vsm.get();
+  bool before_is_control = false;
+  List<StageCopy>* before_record = &p->vs_record;
+  uint32_t* before_slots = &p->vs_record_slots;
+  ExtraStage* chain[3] = {tcs, tes, gs};
+  for (uint32_t k = 0; k < 3; ++k) {
+    ExtraStage* st = chain[k];
+    if (!st) continue;
+    if (!link_stage_inputs(p, *before, before_is_control, *st, before_record, before_slots, k == 0 ? kNames[1] : (k == 1 ? kNames[2] : kNames[0]))) return false;
+    before = st->module.get();
+    before_is_control = st == tcs;
+    before_record = &st->record;
+    before_slots = &st->record_slots;
+  }
+  if (tcs) {
+    // (the control stage's outputs, cleared for each patch)
+    const shader::Module& m = *tcs->module;
+    for (uint64_t i = 0; i < m.globals.count(); ++i) {
+      const shader::Global& g = *m.globals[i];
+      if (g.kind == GlobalKind::Out && g.shared && !tcs->output_slots.push_back(ExtraStage::Range{g.slot, m.slots_of(g.type)})) { link_failed(p, "out of memory"); return false; }
+    }
+  }
+  return true;
+}
+
+// Which of `producer`'s outputs feed each input of `consumer`, by name (gl_in[].gl_Position from gl_Position, or from the control stage's gl_out[]), and the record of the producer's
+// outputs that a per-vertex producer keeps for each vertex.
+bool GlContext::link_stage_inputs(ProgramObj* p, const shader::Module& producer, bool producer_is_control, ExtraStage& consumer, List<StageCopy>* record, uint32_t* record_slots,
+                                  const char* name) {
+  const shader::Module& cm = *consumer.module;
+  String want(a_);
+  for (uint64_t i = 0; i < cm.globals.count(); ++i) {
+    const shader::Global& cg = *cm.globals[i];
+    if (cg.kind != GlobalKind::In) continue;
+    const StringView cn = cg.name.view();
+    if (cn.starts_with("gl_in.")) {
+      want.assign(producer_is_control ? "gl_out." : "");
+      want.append(cn.substr(6, cn.size() - 6));
+    } else {
+      want.assign(cn);
+    }
+    const shader::Global* pg = nullptr;
+    for (uint64_t k = 0; k < producer.globals.count(); ++k) {
+      const shader::Global& g = *producer.globals[k];
+      const bool output = g.kind == GlobalKind::Out || (g.kind == GlobalKind::Builtin && (g.builtin == shader::kBvPosition || g.builtin == shader::kBvPointSize || g.builtin == shader::kBvClipDistance));
+      if (output && g.name.view().equals(want.view())) { pg = &g; break; }
+    }
+    if (!pg) {
+      if (cg.referenced && !cn.starts_with("gl_")) {
+        String why(a_);
+        why.assign(name);
+        why.append("the input ");
+        why.append(cn);
+        why.append(" is not written by the stage before");
+        link_failed(p, why.view());
+        return false;
+      }
+      continue;      // (zero)
+    }
+    // (per vertex: the element, or of an array of arrays the vertex's array)
+    Type ct = cg.per_vertex ? cg.type.element() : cg.type;
+    if (cg.per_vertex && cg.inner) ct.array = cg.inner;
+    Type pt = producer_is_control && pg->per_vertex ? pg->type.element() : pg->type;
+    if (producer_is_control && pg->per_vertex && pg->inner) pt.array = pg->inner;
+    if (!(ct == pt) && !(ct.base == Base::Struct && pt.base == Base::Struct)) {
+      String why(a_);
+      why.assign(name);
+      why.append("the type of ");
+      why.append(cn);
+      why.append(" does not match the stage before");
+      link_failed(p, why.view());
+      return false;
+    }
+    StageCopy c;
+    c.dst = cg.slot;
+    c.count = cm.slots_of(ct);
+    if (producer_is_control) {      // from the patch's outputs, element by element (or once, per patch)
+      c.src = pg->slot;
+      c.per_vertex = false;
+      if (cg.per_vertex && pg->per_vertex) {
+        c.src_stride = c.dst_stride = c.count;
+        const uint32_t pv = pg->type.array / (pg->inner ? pg->inner : 1), cv = cg.type.array / (cg.inner ? cg.inner : 1);
+        c.elements = pv < cv ? pv : cv;
+      }
+    } else {      // from each vertex's record
+      if (!cg.per_vertex) continue;      // (a per-patch input needs a control stage: zero)
+      uint32_t at = 0xFFFFFFFFu;
+      for (const StageCopy& r : *record) if (r.src == pg->slot && r.count == c.count) at = r.dst;
+      if (at == 0xFFFFFFFFu) {
+        StageCopy r;
+        r.src = pg->slot;
+        r.dst = *record_slots;
+        r.count = c.count;
+        if (!record->push_back(r)) { link_failed(p, "out of memory"); return false; }
+        at = *record_slots;
+        *record_slots += c.count;
+      }
+      c.src = at;
+      c.per_vertex = true;
+      c.dst_stride = c.count;
+    }
+    if (!consumer.inputs.push_back(c)) { link_failed(p, "out of memory"); return false; }
   }
   return true;
 }
@@ -245,8 +412,12 @@ void GlContext::link_program(uint32_t id) {
   for (const ProgramObj::Attached& at : p->shaders) {
     ShaderObj* s = shader_at(at.id);
     if (!s || !s->compiled || !s->module) { link_failed(p, "attached shaders did not compile"); return; }
+    if (at.type != 0x8B31 && at.type != 0x8B30) continue;      // (the geometry and tessellation stages: link_extra_stages)
     if (!(at.type == 0x8B31 ? vs_sources : fs_sources).push_back(s->source.view())) { link_failed(p, "out of memory"); return; }
   }
+  // (desktop GL: a program with geometry or tessellation stages may leave out the fragment stage; its fragments' colours are undefined, here unwritten)
+  const bool extra_stages = p->has_stage(0x8DD9) || p->has_stage(0x8E88) || p->has_stage(0x8E87);
+  if (fs_sources.empty() && desktop.active && extra_stages && !fs_sources.push_back(StringView("#version 150\nvoid main() {}\n"))) { link_failed(p, "out of memory"); return; }
   if (vs_sources.empty() || fs_sources.empty()) { link_failed(p, "a program needs a vertex and a fragment shader"); return; }
   shader::GlslOptions link_glsl;
   link_glsl.desktop = desktop.active;
@@ -268,12 +439,14 @@ void GlContext::link_program(uint32_t id) {
     link_failed(p, why.view());
     return;
   }
+  if (!link_extra_stages(p)) return;
   const shader::Module& vm = *p->vsm;
   const shader::Module& fm = *p->fsm;
+  const shader::Module& lm = p->last_module();      // (whose outputs the fragment stage reads)
   if (desktop.active && vm.desktop) {
     // A vertex shader must write gl_Position (GLSL 1.10 to 1.30: the linker says so).
     const int32_t pos = vm.find_builtin_global(shader::kBvPosition);
-    if (vm.desktop_version < 140 && (pos < 0 || !vm.globals[static_cast<uint64_t>(pos)]->referenced)) { link_failed(p, "the vertex shader does not write gl_Position"); return; }
+    if (!p->has_extra() && vm.desktop_version < 140 && (pos < 0 || !vm.globals[static_cast<uint64_t>(pos)]->referenced)) { link_failed(p, "the vertex shader does not write gl_Position"); return; }
     // A uniform both stages declare must have one type.
     for (uint64_t i = 0; i < vm.globals.count(); ++i) {
       const shader::Global& vg = *vm.globals[i];
@@ -334,8 +507,8 @@ void GlContext::link_program(uint32_t id) {
     const shader::Global& fg = *fm.globals[i];
     if (fg.kind != GlobalKind::In || fg.builtin != shader::kBvNone) continue;
     const shader::Global* match = nullptr;
-    for (uint64_t k = 0; k < vm.globals.count(); ++k) {
-      const shader::Global& vg = *vm.globals[k];
+    for (uint64_t k = 0; k < lm.globals.count(); ++k) {
+      const shader::Global& vg = *lm.globals[k];
       if (vg.kind == GlobalKind::Out && vg.builtin == shader::kBvNone && vg.name.view().equals(fg.name.view())) { match = &vg; break; }
     }
     if (!match || (desktop.active && !match->referenced)) {
@@ -365,6 +538,19 @@ void GlContext::link_program(uint32_t id) {
     if (offset > gpu::kMaxVarying) { link_failed(p, "too many varyings"); return; }
     p->links.push_back(l);
   }
+  // gl_PrimitiveID: what the geometry stage writes, to the fragment stage (flat).
+  if (p->extra[kStageGeometry]) {
+    const int32_t fgi = fm.find_global("gl_PrimitiveID"), lgi = lm.find_global("gl_PrimitiveID");
+    if (fgi >= 0 && lgi >= 0 && fm.globals[static_cast<uint64_t>(fgi)]->referenced && offset < gpu::kMaxVarying) {
+      VaryingLink l;
+      l.vs_slot = lm.globals[static_cast<uint64_t>(lgi)]->slot;
+      l.fs_slot = fm.globals[static_cast<uint64_t>(fgi)]->slot;
+      l.count = 1;
+      l.flat = true;
+      l.var_offset = offset++;
+      p->links.push_back(l);
+    }
+  }
   p->nvar = offset;
 
   // fragment outputs
@@ -385,19 +571,21 @@ void GlContext::link_program(uint32_t id) {
   link_collect_uniforms(p);
   // uniform blocks: one binding per distinct name
   p->block_bindings.clear();
-  for (int s = 0; s < 2; ++s) {
-    const shader::Module& m = s == 0 ? vm : fm;
-    for (uint64_t b = 0; b < m.blocks.count(); ++b) {
-      bool seen = false;
-      if (s == 1)
-        for (uint64_t k = 0; k < vm.blocks.count(); ++k) seen = seen || vm.blocks[k]->name.view().equals(m.blocks[b]->name.view());
-      if (!seen) p->block_bindings.push_back(m.blocks[b]->binding >= 0 ? m.blocks[b]->binding : 0);
-    }
-  }
+  p->for_each_block([&](uint32_t, const shader::Module& m, uint64_t b) {
+    p->block_bindings.push_back(m.blocks[b]->binding >= 0 ? m.blocks[b]->binding : 0);
+    return true;
+  });
   p->vs_shared.clear();
   p->fs_shared.clear();
   for (uint32_t i = 0; i < (vm.shared_slots ? vm.shared_slots : 1); ++i) p->vs_shared.push_back(0);
   for (uint32_t i = 0; i < (fm.shared_slots ? fm.shared_slots : 1); ++i) p->fs_shared.push_back(0);
+  for (const UniquePointer<ExtraStage>& st : p->extra) {
+    if (!st) continue;
+    st->shared.clear();
+    const uint32_t n = st->module->shared_slots ? st->module->shared_slots : 1;
+    if (!st->shared.reserve(n)) { link_failed(p, "out of memory"); return; }
+    for (uint32_t i = 0; i < n; ++i) st->shared.push_back(0);
+  }
   p->linked = true;
   p->log.assign("");
 }
@@ -416,6 +604,24 @@ bool GlContext::program_status(uint32_t id, uint32_t pname, double* out) {
     case 0x8B82: *out = p->linked; return true;
     case 0x8B83: *out = p->validate_ok; return true;
     case 0x8B85: *out = static_cast<double>(p->shaders.count()); return true;
+    // geometry and tessellation (the linked program's)
+    case 0x8916: case 0x8917: case 0x8918: case 0x887F: {      // GEOMETRY_VERTICES_OUT, _INPUT_TYPE, _OUTPUT_TYPE, _SHADER_INVOCATIONS
+      if (!p->linked || !p->extra[kStageGeometry]) { set_error(INVALID_OPERATION); return false; }
+      const shader::Module& m = *p->extra[kStageGeometry]->module;
+      *out = pname == 0x8916 ? m.gs_max_vertices : (pname == 0x8917 ? m.gs_input : (pname == 0x8918 ? m.gs_output : m.gs_invocations));
+      return true;
+    }
+    case 0x8E75: {      // TESS_CONTROL_OUTPUT_VERTICES
+      if (!p->linked || !p->extra[kStageTessControl]) { set_error(INVALID_OPERATION); return false; }
+      *out = p->extra[kStageTessControl]->module->tcs_vertices;
+      return true;
+    }
+    case 0x8E76: case 0x8E77: case 0x8E78: case 0x8E79: {      // TESS_GEN_MODE, _SPACING, _VERTEX_ORDER, _POINT_MODE
+      if (!p->linked || !p->extra[kStageTessEval]) { set_error(INVALID_OPERATION); return false; }
+      const shader::Module& m = *p->extra[kStageTessEval]->module;
+      *out = pname == 0x8E76 ? m.tes_mode : (pname == 0x8E77 ? (m.tes_spacing ? m.tes_spacing : 0x0202) : (pname == 0x8E78 ? (m.tes_order ? m.tes_order : 0x0901) : m.tes_point_mode));
+      return true;
+    }
     case 0x8B86: *out = p->uniforms.count(); return true;
     case 0x8B89: *out = p->attribs.count(); return true;
     case 0x8B87: { uint64_t m = 0; for (auto& u : p->uniforms) if (u->name.size() + 1 > m) m = u->name.size() + 1; *out = static_cast<double>(m); return true; }
@@ -544,10 +750,11 @@ void GlContext::uniform(int32_t location, uint32_t base_kind, uint32_t cols, uin
   const uint32_t per = l.elem_slots;
   const uint32_t n = count < l.size - loc.element ? count : l.size - loc.element;
   for (uint32_t e = 0; e < n; ++e) {
-    for (int stage = 0; stage < 2; ++stage) {
-      const int32_t slot = stage == 0 ? l.vs_slot : l.fs_slot;
+    for (int stage = 0; stage < 5; ++stage) {
+      const int32_t slot = stage == 0 ? l.vs_slot : (stage == 1 ? l.fs_slot : l.extra_slot[stage - 2]);
       if (slot < 0) continue;
-      List<uint32_t>& store = stage == 0 ? p->vs_shared : p->fs_shared;
+      if (stage >= 2 && !p->extra[stage - 2]) continue;
+      List<uint32_t>& store = stage == 0 ? p->vs_shared : (stage == 1 ? p->fs_shared : p->extra[stage - 2]->shared);
       for (uint32_t k = 0; k < per; ++k) {
         uint32_t v = lanes[e * per + k];
         if (t.base == Base::Bool) v = base_kind == 'f' ? (__builtin_bit_cast(float, v) != 0.0f) : (v != 0);
@@ -563,8 +770,12 @@ bool GlContext::get_uniform(uint32_t program, int32_t location, double* out, uin
   if (location < 0 || static_cast<uint64_t>(location) >= p->locs.count()) { set_error(INVALID_OPERATION); return false; }
   const ProgramObj::Loc loc = p->locs[static_cast<uint64_t>(location)];
   const UniformLeaf& l = *p->uniforms[loc.leaf];
-  const int32_t slot = l.vs_slot >= 0 ? l.vs_slot : l.fs_slot;
-  const List<uint32_t>& store = l.vs_slot >= 0 ? p->vs_shared : p->fs_shared;
+  int32_t slot = l.vs_slot >= 0 ? l.vs_slot : l.fs_slot;
+  const List<uint32_t>* store_ptr = l.vs_slot >= 0 ? &p->vs_shared : &p->fs_shared;
+  for (uint32_t k = 0; slot < 0 && k < 3; ++k)
+    if (p->extra[k] && l.extra_slot[k] >= 0) { slot = l.extra_slot[k]; store_ptr = &p->extra[k]->shared; }
+  if (slot < 0) { set_error(INVALID_OPERATION); return false; }
+  const List<uint32_t>& store = *store_ptr;
   *count = l.elem_slots;
   for (uint32_t k = 0; k < l.elem_slots && k < 16; ++k) {
     const uint32_t v = store[static_cast<uint64_t>(slot) + loc.element * l.elem_slots + k];
@@ -585,33 +796,23 @@ uint32_t GlContext::uniform_block_count(uint32_t program) const {
 uint32_t GlContext::get_uniform_block_index(uint32_t program, StringView name) {
   ProgramObj* p = program_at(program);
   if (!p || !p->linked) { set_error(INVALID_OPERATION); return 0xFFFFFFFFu; }
-  uint32_t idx = 0;
-  for (uint64_t b = 0; b < p->vsm->blocks.count(); ++b, ++idx)
-    if (p->vsm->blocks[b]->name.view().equals(name)) return idx;
-  for (uint64_t b = 0; b < p->fsm->blocks.count(); ++b) {
-    bool seen = false;
-    for (uint64_t k = 0; k < p->vsm->blocks.count(); ++k) seen = seen || p->vsm->blocks[k]->name.view().equals(p->fsm->blocks[b]->name.view());
-    if (seen) continue;
-    if (p->fsm->blocks[b]->name.view().equals(name)) return idx;
-    ++idx;
-  }
-  return 0xFFFFFFFFu;
+  uint32_t found = 0xFFFFFFFFu;
+  p->for_each_block([&](uint32_t idx, const shader::Module& m, uint64_t b) {
+    if (m.blocks[b]->name.view().equals(name)) found = idx;
+    return found == 0xFFFFFFFFu;
+  });
+  return found;
 }
 
 StringView GlContext::uniform_block_name(uint32_t program, uint32_t block) {
   ProgramObj* p = program_at(program);
   if (!p || !p->linked) return StringView();
-  uint32_t idx = 0;
-  for (uint64_t b = 0; b < p->vsm->blocks.count(); ++b, ++idx)
-    if (idx == block) return p->vsm->blocks[b]->name.view();
-  for (uint64_t b = 0; b < p->fsm->blocks.count(); ++b) {
-    bool seen = false;
-    for (uint64_t k = 0; k < p->vsm->blocks.count(); ++k) seen = seen || p->vsm->blocks[k]->name.view().equals(p->fsm->blocks[b]->name.view());
-    if (seen) continue;
-    if (idx == block) return p->fsm->blocks[b]->name.view();
-    ++idx;
-  }
-  return StringView();
+  StringView found;
+  p->for_each_block([&](uint32_t idx, const shader::Module& m, uint64_t b) {
+    if (idx == block) found = m.blocks[b]->name.view();
+    return idx != block;
+  });
+  return found;
 }
 
 void GlContext::uniform_block_binding(uint32_t program, uint32_t block, uint32_t binding) {
@@ -624,14 +825,14 @@ bool GlContext::uniform_block_info(uint32_t program, uint32_t block, uint32_t pn
   ProgramObj* p = program_at(program);
   if (!p || !p->linked || block >= p->block_bindings.count()) { set_error(INVALID_VALUE); return false; }
   const StringView name = uniform_block_name(program, block);
-  const shader::Module* mods[2] = {p->vsm.get(), p->fsm.get()};
   uint32_t size = 0, members = 0;
-  bool in_vs = false, in_fs = false;
-  for (int s = 0; s < 2; ++s) {
-    const shader::Module& m = *mods[s];
+  bool in_stage[5] = {};
+  for (int s = 0; s < 5; ++s) {
+    if (!p->stage_module(s)) continue;
+    const shader::Module& m = *p->stage_module(s);
     for (uint64_t b = 0; b < m.blocks.count(); ++b) {
       if (!m.blocks[b]->name.view().equals(name)) continue;
-      (s == 0 ? in_vs : in_fs) = true;
+      in_stage[s] = true;
       uint32_t off = 0, cnt = 0;
       for (uint64_t g = 0; g < m.globals.count(); ++g) {
         if (m.globals[g]->block != static_cast<int32_t>(b)) continue;
@@ -645,11 +846,15 @@ bool GlContext::uniform_block_info(uint32_t program, uint32_t block, uint32_t pn
     }
   }
   switch (pname) {
-    case 0x8A44: *out = p->block_bindings[block]; return true;
-    case 0x8A40: *out = size; return true;
-    case 0x8A42: *out = members; return true;
-    case 0x8A46: *out = in_vs; return true;
-    case 0x8A47: *out = in_fs; return true;
+    case 0x8A3F: *out = p->block_bindings[block]; return true;      // UNIFORM_BLOCK_BINDING
+    case 0x8A40: *out = size; return true;                          // _DATA_SIZE
+    case 0x8A41: *out = static_cast<double>(name.size() + 1); return true;      // _NAME_LENGTH
+    case 0x8A42: *out = members; return true;                       // _ACTIVE_UNIFORMS
+    case 0x8A44: *out = in_stage[0]; return true;                   // _REFERENCED_BY_VERTEX_SHADER
+    case 0x8A45: *out = in_stage[2 + kStageGeometry]; return true;  // _REFERENCED_BY_GEOMETRY_SHADER
+    case 0x8A46: *out = in_stage[1]; return true;                   // _REFERENCED_BY_FRAGMENT_SHADER
+    case 0x84F0: *out = in_stage[2 + kStageTessControl]; return true;
+    case 0x84F1: *out = in_stage[2 + kStageTessEval]; return true;
     default: set_error(INVALID_ENUM); return false;
   }
 }

@@ -140,7 +140,8 @@ struct Outcome {
 
 struct Test {
   std::vector<std::string> vs, fs;      // one per [vertex shader] / [fragment shader] section: several are linked into one stage
-  std::string gs, vertex_data;
+  std::vector<std::string> gs, tcs, tes;
+  std::string vertex_data;
   bool passthrough = false;
   std::vector<std::string> commands;
   std::vector<std::string> needs;
@@ -170,7 +171,10 @@ bool load(const std::string& path, Test* t) {
       else if (section == "[fragment shader]") { t->fs.emplace_back(); body = &t->fs.back(); }
       else if (section == "[vertex shader passthrough]") t->passthrough = true;
       else if (section == "[vertex data]") body = &t->vertex_data;
-      else if (section.find("geometry") != std::string::npos) { t->has_gs = true; body = &t->gs; }
+      else if (section == "[geometry shader]") { t->gs.emplace_back(); body = &t->gs.back(); }
+      else if (section == "[tessellation control shader]") { t->tcs.emplace_back(); body = &t->tcs.back(); }
+      else if (section == "[tessellation evaluation shader]") { t->tes.emplace_back(); body = &t->tes.back(); }
+      else if (section.find("geometry") != std::string::npos) t->has_gs = true;      // (SPIR-V, passthrough ...)
       else if (section.find("tessellation") != std::string::npos) t->has_tess = true;
       else if (section.find("compute") != std::string::npos) t->has_compute = true;
       continue;
@@ -260,7 +264,8 @@ struct Runner {
     if (!ok) {
       char buf[1024] = {};
       glGetShaderInfoLog(s, sizeof(buf), nullptr, buf);
-      *why = std::string(type == GL_VERTEX_SHADER ? "vs compile: " : "fs compile: ") + buf;
+      const char* stage = type == GL_VERTEX_SHADER ? "vs" : type == GL_FRAGMENT_SHADER ? "fs" : type == GL_GEOMETRY_SHADER ? "gs" : type == GL_TESS_CONTROL_SHADER ? "tcs" : "tes";
+      *why = std::string(stage) + " compile: " + buf;
       return false;
     }
     *out = s;
@@ -277,10 +282,13 @@ struct Runner {
       if (!compile(GL_VERTEX_SHADER, src, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
       glAttachShader(program, s);
     }
-    for (const std::string& src : t.fs) {
-      if (!compile(GL_FRAGMENT_SHADER, src, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
-      glAttachShader(program, s);
-    }
+    const struct { const std::vector<std::string>* list; GLenum type; } stages[] = {
+        {&t.tcs, GL_TESS_CONTROL_SHADER}, {&t.tes, GL_TESS_EVALUATION_SHADER}, {&t.gs, GL_GEOMETRY_SHADER}, {&t.fs, GL_FRAGMENT_SHADER}};
+    for (const auto& st : stages)
+      for (const std::string& src : *st.list) {
+        if (!compile(st.type, src, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
+        glAttachShader(program, s);
+      }
     glBindAttribLocation(program, 0, "piglit_vertex");
     glLinkProgram(program);
     GLint ok = 0;
@@ -314,7 +322,7 @@ struct Runner {
   }
 
   // piglit_draw_rect: through the program's piglit_vertex / piglit_texcoord when it has them, else the fixed-function arrays.
-  void draw_rect(float x, float y, float w, float h, bool tex, float tx = 0, float ty = 0, float tw = 1, float th = 1) {
+  void draw_rect(float x, float y, float w, float h, bool tex, float tx = 0, float ty = 0, float tw = 1, float th = 1, bool patch = false) {
     const float verts[16] = {x, y, 0, 1, x + w, y, 0, 1, x, y + h, 0, 1, x + w, y + h, 0, 1};
     const float tc[8] = {tx, ty, tx + tw, ty, tx, ty + th, tx + tw, ty + th};
     const GLint vloc = program ? glGetAttribLocation(program, "piglit_vertex") : -1;
@@ -325,7 +333,12 @@ struct Runner {
       if (tloc >= 0) { glVertexAttribPointer(tloc, 2, GL_FLOAT, GL_FALSE, 0, tc); glEnableVertexAttribArray(tloc); }
       else { glTexCoordPointer(2, GL_FLOAT, 0, tc); glEnableClientState(GL_TEXTURE_COORD_ARRAY); }
     }
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (patch) {      // (piglit_draw_rect_custom with patches: the four corners as one patch)
+      glPatchParameteri(GL_PATCH_VERTICES, 4);
+      glDrawArrays(GL_PATCHES, 0, 4);
+    } else {
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
     if (vloc >= 0) glDisableVertexAttribArray(vloc); else glDisableClientState(GL_VERTEX_ARRAY);
     if (tloc >= 0) glDisableVertexAttribArray(tloc); else glDisableClientState(GL_TEXTURE_COORD_ARRAY);
   }
@@ -418,7 +431,15 @@ struct Runner {
       at = e + 1;
       if (!l.empty() && l[0] != '#') lines.push_back(l);
     }
-    if (lines.empty()) { *why = "no vertex data"; return false; }
+    if (lines.empty()) {      // (no vertex data: the shaders make their vertices from gl_VertexID; an empty vertex array object, as shader_runner binds)
+      GLuint vao = 0;
+      glGenVertexArrays(1, &vao);
+      glBindVertexArray(vao);
+      glDrawArrays(mode, first, count);
+      glBindVertexArray(0);
+      glDeleteVertexArrays(1, &vao);
+      return true;
+    }
     struct Column { std::string name; int comps; };
     std::vector<Column> cols;
     for (const std::string& c : words(lines[0])) {
@@ -487,12 +508,17 @@ struct Runner {
       }
       if (w[0] == "draw" && w.size() >= 2 && w[1] == "rect") {
         size_t i = 2;
-        bool ortho = false, tex = false;
-        while (i < w.size() && (w[i] == "ortho" || w[i] == "tex")) { if (w[i] == "ortho") ortho = true; else tex = true; ++i; }
+        bool ortho = false, tex = false, patch = false;
+        while (i < w.size() && (w[i] == "ortho" || w[i] == "tex" || w[i] == "patch")) {
+          if (w[i] == "ortho") ortho = true;
+          else if (w[i] == "patch") patch = true;
+          else tex = true;
+          ++i;
+        }
         float x = f(i), y = f(i + 1), ww = f(i + 2), hh = f(i + 3);
         if (ortho) { x = x * 2 / kWidth - 1; y = y * 2 / kHeight - 1; ww = ww * 2 / kWidth; hh = hh * 2 / kHeight; }
         if (tex) draw_rect(x, y, ww, hh, true, f(i + 4), f(i + 5), f(i + 6), f(i + 7));
-        else draw_rect(x, y, ww, hh, false);
+        else draw_rect(x, y, ww, hh, false, 0, 0, 1, 1, patch);
         continue;
       }
       if (w[0] == "draw" && w.size() >= 5 && w[1] == "arrays") {
@@ -645,6 +671,14 @@ struct Runner {
       }
       if (w[0] == "shade" && w.size() >= 3) { glShadeModel(w[2] == "flat" ? GL_FLAT : GL_SMOOTH); continue; }
       if (w[0] == "hint") continue;
+      if (w[0] == "patch" && w.size() >= 4 && w[1] == "parameter" && w[2] == "vertices") { glPatchParameteri(GL_PATCH_VERTICES, atoi(w[3].c_str())); continue; }
+      if (w[0] == "patch" && w.size() >= 6 && w[1] == "parameter" && w[2] == "default" && w[3] == "level") {
+        float v[4] = {};
+        const bool outer = w[4] == "outer";
+        for (size_t k = 0; k < (outer ? 4u : 2u) && 5 + k < w.size(); ++k) v[k] = static_cast<float>(atof(w[5 + k].c_str()));
+        glPatchParameterfv(outer ? GL_PATCH_DEFAULT_OUTER_LEVEL : GL_PATCH_DEFAULT_INNER_LEVEL, v);
+        continue;
+      }
       o.kind = Outcome::Skip;
       o.why = "skip: command " + w[0] + (w.size() > 1 ? " " + w[1] : "");
       return o;
@@ -719,7 +753,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--filter") && i + 1 < argc) filter = argv[++i];
   }
   // The suites of the GLSL versions the context has.
-  const char* const kDirs[] = {"tests/spec/glsl-1.10", "tests/spec/glsl-1.20", "tests/spec/glsl-1.30", "tests/spec/glsl-1.40", "tests/spec/glsl-1.50", "tests/spec/glsl-3.30", "tests/shaders"};
+  const char* const kDirs[] = {"tests/spec/glsl-1.10", "tests/spec/glsl-1.20", "tests/spec/glsl-1.30", "tests/spec/glsl-1.40", "tests/spec/glsl-1.50", "tests/spec/glsl-3.30", "tests/spec/arb_tessellation_shader", "tests/shaders"};
   std::vector<std::string> files;
   for (const char* d : kDirs) collect(root + "/" + d, &files);
   std::sort(files.begin(), files.end());
