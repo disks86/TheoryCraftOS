@@ -198,9 +198,14 @@ struct AttribInfo {
 };
 
 struct ProgramObj {
-  explicit ProgramObj(allocators::IAllocator& a) : log(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), outputs(a), locs(a) {}
+  explicit ProgramObj(allocators::IAllocator& a) : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), outputs(a), locs(a) {}
   String log;
-  uint32_t vs = 0, fs = 0;
+  // The attached shaders, in the order attached. WebGL allows one per stage; desktop GL any number, linked together (shader::parse_glsl_units).
+  struct Attached { uint32_t id; uint32_t type; };
+  List<Attached> shaders;
+  bool has_stage(uint32_t type) const { for (const Attached& s : shaders) if (s.type == type) return true; return false; }
+  uint32_t first_of(uint32_t type) const { for (const Attached& s : shaders) if (s.type == type) return s.id; return 0; }
+  bool has_shader(uint32_t id) const { for (const Attached& s : shaders) if (s.id == id) return true; return false; }
   bool linked = false, deleted = false;
   UniquePointer<shader::Module> vsm, fsm;
   List<UniquePointer<UniformLeaf>> uniforms;
@@ -502,6 +507,8 @@ class GlContext final : public shader::ITextureHost {
   void bind_attrib_location(uint32_t program, uint32_t index, StringView name);
   int32_t get_attrib_location(uint32_t program, StringView name);
   uint32_t attached_shaders(uint32_t program, uint32_t* out, uint32_t max);
+  void release_if_unattached(uint32_t shader);
+  void free_program(uint32_t id);
   const ProgramObj* program(uint32_t id) const;
   const UniformLeaf* active_uniform(uint32_t program, uint32_t index);
   const AttribInfo* active_attrib(uint32_t program, uint32_t index);

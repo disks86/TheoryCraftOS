@@ -119,10 +119,10 @@ void GlApi::glLinkProgram(GLuint program) {
   // A compatibility program may leave out a stage: the fixed-function one stands in, written at the version of the stage that is there so that the varyings match.
   const webgl::ProgramObj* po = gl_.program(p);
   uint32_t stand_in = 0;
-  if (po && compat() && (po->vs == 0) != (po->fs == 0)) {
-    const uint32_t present = po->vs ? po->vs : po->fs;
+  if (po && compat() && po->has_stage(GL_VERTEX_SHADER) != po->has_stage(GL_FRAGMENT_SHADER)) {
+    const bool need_vertex = !po->has_stage(GL_VERTEX_SHADER);
+    const uint32_t present = po->first_of(need_vertex ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
     const bool modern = gl_.shader_src(present).starts_with("#version 300");
-    const bool need_vertex = po->vs == 0;
     String text(a_);
     text.append(modern ? "#version 130\n" : "#version 110\n");
     if (need_vertex) {

@@ -237,8 +237,14 @@ struct Module {
 // `extensions` (GLSL): the extension names the context offers, as a bit set the front end understands is not needed: #extension is accepted for any name.
 struct GlslOptions {
   bool desktop = false;      // desktop GLSL (OpenGL): #version 110 when none is given, glcpp's desktop rules, the desktop built-ins; else GLSL ES (WebGL)
+  bool compile_only = false; // one shader of several to be linked: it need not define main (Module::main_function stays -1), and functions it only declares are not
+                             // checked; without it, a called function must have a body (the link of desktop GL)
 };
 bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& options = GlslOptions());
+// Several shaders of one stage linked together (desktop GL lets a program have more than one): each is preprocessed on its own (macros do not cross), then they
+// are parsed as one translation unit in which a file-scope variable or structure declared again with the same type is the same one, a prototype in one
+// shader finds its body in another, and exactly one main is defined. The version is the highest the units declare.
+bool parse_glsl_units(Module& module, ArrayView<const StringView> sources, Stage stage, const GlslOptions& options = GlslOptions());
 bool parse_wgsl(Module& module, StringView source);
 // Gives the runtime-sized array of a storage buffer global (or the last field of its struct) a length and updates the layout.
 void set_runtime_length(Module& module, uint32_t global, uint32_t count);

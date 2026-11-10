@@ -714,6 +714,85 @@ static void test_desktop_glsl() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+// Several shaders in one stage, linked together: each compiles on its own (no main needed), globals of one name are one variable, a prototype finds its body in
+// another shader, and a function is visible only where it is declared.
+static GLuint build_units(const char* const* vs, int nvs, const char* const* fs, int nfs, bool expect_link) {
+  const GLuint p = glCreateProgram();
+  for (int stage = 0; stage < 2; ++stage) {
+    const char* const* list = stage == 0 ? vs : fs;
+    for (int i = 0; i < (stage == 0 ? nvs : nfs); ++i) {
+      const GLuint s = glCreateShader(stage == 0 ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER);
+      glShaderSource(s, 1, &list[i], nullptr);
+      glCompileShader(s);
+      GLint ok = 0;
+      glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+      CHECK(ok);
+      glAttachShader(p, s);
+      glDeleteShader(s);      // (stays while attached)
+    }
+  }
+  glLinkProgram(p);
+  GLint ok = 0;
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  CHECK((ok != 0) == expect_link);
+  if (expect_link && !ok) {
+    char log[512] = {};
+    glGetProgramInfoLog(p, sizeof(log), nullptr, log);
+    printf("link: %s\n", log);
+  }
+  return p;
+}
+
+static void test_several_shaders_per_stage() {
+  Fixture f;
+  const char* vs[] = {"#version 120\nvec4 place(vec4 v);\nvoid main(){ gl_Position = place(gl_Vertex); }\n",
+                      "#version 120\nuniform float scale;\nvec4 place(vec4 v) { return gl_ModelViewProjectionMatrix * vec4(v.xyz * scale, 1.0); }\n"};
+  const char* fs[] = {"#version 120\nuniform float scale;\nvec4 shade();\nvoid main(){ gl_FragColor = shade(); }\n",
+                      "#version 120\nuniform float scale;\nfloat abs(float x) { return 1.0; }\nvec4 shade() { return vec4(scale * 0.5, abs(-0.25), 0.0, 1.0); }\n"};
+  const GLuint p = build_units(vs, 2, fs, 2, true);
+  GLint n = 0;
+  glGetProgramiv(p, GL_ATTACHED_SHADERS, &n);
+  CHECK(n == 4);
+  GLint uniforms = 0;
+  glGetProgramiv(p, GL_ACTIVE_UNIFORMS, &uniforms);
+  int scales = 0;      // (scale, once: one variable in every shader)
+  for (GLint i = 0; i < uniforms; ++i) {
+    char name[64] = {};
+    GLint size = 0;
+    GLenum type = 0;
+    glGetActiveUniform(p, static_cast<GLuint>(i), sizeof(name), nullptr, &size, &type, name);
+    if (!strcmp(name, "scale")) ++scales;
+  }
+  CHECK(scales == 1);
+  glUseProgram(p);
+  glUniform1f(glGetUniformLocation(p, "scale"), 1.0f);
+  glRectf(0, 0, 64, 64);
+  CHECK(near(pixel(30, 30), 128, 255, 0, 2));      // the user abs() defined in that shader
+  GLuint shaders[4] = {};
+  glGetAttachedShaders(p, 4, nullptr, shaders);
+  glUseProgram(0);
+  glDeleteProgram(p);
+  CHECK(!glIsShader(shaders[0]) && !glIsShader(shaders[3]));      // (deleted while attached: gone with the program)
+  // the built-in abs() where the user one is not declared
+  const char* fs2[] = {"#version 120\nfloat half_abs(float);\nfloat abs(float x) { return 1.0; }\nvoid main(){ gl_FragColor = vec4(half_abs(-1.0), 0.0, 0.0, 1.0); }\n",
+                       "#version 120\nfloat half_abs(float x) { return abs(x) * 0.25; }\n"};
+  const char* vs1[] = {"#version 120\nvoid main(){ gl_Position = ftransform(); }\n"};
+  const GLuint q = build_units(vs1, 1, fs2, 2, true);
+  glUseProgram(q);
+  glRectf(0, 0, 64, 64);
+  CHECK(near(pixel(30, 30), 64, 0, 0, 2));
+  glUseProgram(0);
+  glDeleteProgram(q);
+  // link errors: two mains, one global with two types, a function called but defined nowhere
+  const char* two_mains[] = {"void main(){ gl_Position = ftransform(); }\n", "void main(){ gl_Position = vec4(0.0); }\n"};
+  glDeleteProgram(build_units(two_mains, 2, fs, 2, false));
+  const char* types[] = {"#version 120\nuniform float scale;\nvec4 place(vec4 v) { return v * scale; }\n", "#version 120\nuniform vec2 scale;\nvec4 place(vec4 v);\nvoid main(){ gl_Position = place(gl_Vertex); }\n"};
+  glDeleteProgram(build_units(types, 2, fs, 2, false));
+  const char* undefined[] = {"#version 120\nvec4 place(vec4 v);\nvoid main(){ gl_Position = place(gl_Vertex); }\n"};
+  glDeleteProgram(build_units(undefined, 1, fs, 2, false));
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -885,6 +964,7 @@ int main() {
   test_selection_and_feedback();
   test_glsl_program();
   test_desktop_glsl();
+  test_several_shaders_per_stage();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

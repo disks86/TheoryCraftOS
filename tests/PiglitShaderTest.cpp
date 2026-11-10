@@ -139,12 +139,12 @@ struct Outcome {
 };
 
 struct Test {
-  std::string vs, fs, gs, vertex_data;
+  std::vector<std::string> vs, fs;      // one per [vertex shader] / [fragment shader] section: several are linked into one stage
+  std::string gs, vertex_data;
   bool passthrough = false;
   std::vector<std::string> commands;
   std::vector<std::string> needs;
   bool has_gs = false, has_tess = false, has_compute = false;
-  bool several_per_stage = false;      // two [vertex shader] sections: several shaders linked into one stage
 };
 
 bool load(const std::string& path, Test* t) {
@@ -166,8 +166,8 @@ bool load(const std::string& path, Test* t) {
     if (!tl.empty() && tl[0] == '[' && tl.back() == ']') {
       section = tl;
       body = nullptr;
-      if (section == "[vertex shader]") { if (!t->vs.empty()) t->several_per_stage = true; body = &t->vs; }
-      else if (section == "[fragment shader]") { if (!t->fs.empty()) t->several_per_stage = true; body = &t->fs; }
+      if (section == "[vertex shader]") { t->vs.emplace_back(); body = &t->vs.back(); }
+      else if (section == "[fragment shader]") { t->fs.emplace_back(); body = &t->fs.back(); }
       else if (section == "[vertex shader passthrough]") t->passthrough = true;
       else if (section == "[vertex data]") body = &t->vertex_data;
       else if (section.find("geometry") != std::string::npos) { t->has_gs = true; body = &t->gs; }
@@ -271,14 +271,14 @@ struct Runner {
     Outcome o;
     program = glCreateProgram();
     GLuint s = 0;
-    std::string vs = t.vs;
-    if (t.passthrough) vs = "#version 110\nattribute vec4 piglit_vertex;\nvoid main() { gl_Position = piglit_vertex; }\n";
-    if (!vs.empty()) {
-      if (!compile(GL_VERTEX_SHADER, vs, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
+    std::vector<std::string> vs = t.vs;
+    if (t.passthrough) vs.assign(1, "#version 110\nattribute vec4 piglit_vertex;\nvoid main() { gl_Position = piglit_vertex; }\n");
+    for (const std::string& src : vs) {
+      if (!compile(GL_VERTEX_SHADER, src, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
       glAttachShader(program, s);
     }
-    if (!t.fs.empty()) {
-      if (!compile(GL_FRAGMENT_SHADER, t.fs, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
+    for (const std::string& src : t.fs) {
+      if (!compile(GL_FRAGMENT_SHADER, src, &s, &o.why)) { if (expect_link_failure) return o; o.kind = Outcome::Fail; return o; }
       glAttachShader(program, s);
     }
     glBindAttribLocation(program, 0, "piglit_vertex");
@@ -663,7 +663,6 @@ struct Runner {
 // What the test asks of the context: Skip with the reason when the context does not have it.
 bool supported(const Test& t, const char* extensions, std::string* why) {
   if (t.has_gs) { *why = "skip: geometry shader"; return false; }
-  if (t.several_per_stage) { *why = "skip: several shaders in one stage"; return false; }
   if (t.has_tess) { *why = "skip: tessellation"; return false; }
   if (t.has_compute) { *why = "skip: compute"; return false; }
   for (const std::string& r : t.needs) {

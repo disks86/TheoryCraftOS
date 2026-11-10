@@ -33,7 +33,7 @@ bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\f' |
 
 // --- Lexer -----------------------------------------------------------------------------------------------------------------------------------------------
 
-enum class Tok : uint8_t { End, Ident, Int, Uint, Float, Punct };
+enum class Tok : uint8_t { End, Ident, Int, Uint, Float, Punct, UnitBreak };   // UnitBreak: where one linked shader ends and the next begins (parse_glsl_units)
 
 struct Token {
   Tok kind = Tok::End;
@@ -261,17 +261,72 @@ struct Sym {
 
 class Parser {
  public:
-  Parser(Module& m, List<Token>& toks, Stage stage) : m_(m), a_(m.allocator), toks_(toks), stage_(stage), syms_(m.allocator), scopes_(m.allocator) {}
+  Parser(Module& m, List<Token>& toks, Stage stage, bool merge_units = false, bool compile_only = false)
+      : m_(m), a_(m.allocator), toks_(toks), stage_(stage), syms_(m.allocator), scopes_(m.allocator), merge_units_(merge_units), compile_only_(compile_only) {}
 
   bool run() {
     declare_builtin_vars();
     push_scope();
     while (cur().kind != Tok::End && !failed_) top_level();
+    end_unit();
+    if (!failed_ && merge_units_ && (frag_coord_conflict_ || (any_redeclared_ && any_used_bare_)))
+      return err("gl_FragCoord is not redeclared with the same layout in every fragment shader that uses it");
     if (!failed_) finish_unsized();
     pop_scope();
     if (failed_) return false;
     m_.main_function = m_.find_function("main");
+    if (compile_only_ && (m_.main_function < 0 || m_.functions[static_cast<uint64_t>(m_.main_function)]->body < 0)) {
+      m_.main_function = -1;
+      return true;
+    }
     if (m_.main_function < 0 || m_.functions[static_cast<uint64_t>(m_.main_function)]->body < 0) return err("no main function");
+    if (!compile_only_) {
+      // (linking: every function main can reach must be defined in one of the shaders)
+      List<bool> reached(a_);
+      List<int32_t> work(a_);
+      for (uint64_t i = 0; i < m_.functions.count(); ++i) if (!reached.push_back(false)) return err("out of memory");
+      reached[static_cast<uint64_t>(m_.main_function)] = true;
+      if (!work.push_back(m_.main_function)) return err("out of memory");
+      while (!work.empty()) {
+        const int32_t fn = work[work.count() - 1];
+        work.remove_at(work.count() - 1);
+        for (const BodyNodes& b : body_nodes_) {
+          if (b.function != fn) continue;
+          for (uint64_t k = b.begin; k < b.end && k < m_.nodes.count(); ++k) {
+            Node& n = m_.nodes[k];
+            if (n.kind != NodeKind::Call || n.ival < 0 || static_cast<uint64_t>(n.ival) >= m_.functions.count()) continue;
+            // A prototype only: a definition in another shader that the arguments convert to (int to float, GLSL 1.20 4.1.10) is the one called.
+            if (m_.functions[static_cast<uint64_t>(n.ival)]->body < 0 && m_.desktop && m_.desktop_version >= 120) {
+              const Function& proto = *m_.functions[static_cast<uint64_t>(n.ival)];
+              for (uint64_t c = 0; c < m_.functions.count(); ++c) {
+                const Function& def = *m_.functions[c];
+                if (def.body < 0 || !def.name.view().equals(proto.name.view()) || def.params.count() != proto.params.count() || !(def.ret == proto.ret)) continue;
+                bool converts = true;
+                for (uint64_t a = 0; a < def.params.count() && converts; ++a) {
+                  const Type& from = proto.params[a].type;
+                  const Type& to = def.params[a].type;
+                  converts = from == to || (to.base == Base::Float && (from.base == Base::Int || from.base == Base::Uint) && from.rows == to.rows && from.cols == to.cols && from.array == to.array);
+                }
+                if (converts) { n.ival = static_cast<int32_t>(c); break; }
+              }
+            }
+            const uint64_t callee = static_cast<uint64_t>(n.ival);
+            if (m_.functions[callee]->body < 0) {
+              String msg(a_);
+              msg.assign("function ");
+              msg.append(m_.functions[callee]->name.view());
+              msg.append(" is called but not defined");
+              m_.error.assign(msg.view());
+              return false;
+            }
+            if (!reached[callee]) {
+              reached[callee] = true;
+              if (!work.push_back(n.ival)) return err("out of memory");
+            }
+          }
+        }
+      }
+    }
     m_.functions[static_cast<uint64_t>(m_.main_function)]->is_entry = true;
     m_.functions[static_cast<uint64_t>(m_.main_function)]->stage = stage_;
     return true;
@@ -293,6 +348,34 @@ class Parser {
   struct Unsized { int32_t global; uint32_t length; };
   List<Unsized> unsized_{a_};
   int32_t interfaces_ = 0;      // in/out interface blocks seen (they are not Module::blocks)
+  bool merge_units_ = false;    // several shaders of the stage in one token stream (parse_glsl_units)
+  bool compile_only_ = false;   // GlslOptions::compile_only
+  // The nodes each function body added (they are added in order, bodies do not nest): which functions a function calls.
+  struct BodyNodes { int32_t function; uint64_t begin, end; };
+  // gl_FragCoord in linked fragment shaders (GLSL 1.50, 4.3.8.1): if one redeclares it, every one that uses it must, all with the same layout qualifiers.
+  // Which linked shaders declare each function (bit per unit; from the 64th on, they share a bit): a function is visible only where it is declared, so one shader's
+  // abs() does not hide the built-in in another.
+  uint32_t unit_ = 0;
+  List<uint64_t> fn_units_{a_};
+  uint64_t unit_bit() const { return uint64_t{1} << (unit_ < 63 ? unit_ : 63); }
+  bool visible_here(uint64_t fn) const { return !merge_units_ || (fn < fn_units_.count() && (fn_units_[fn] & unit_bit()) != 0); }
+  bool unit_uses_frag_coord_ = false, unit_redeclares_frag_coord_ = false;
+  uint8_t unit_frag_coord_ = 0;
+  bool any_redeclared_ = false, any_used_bare_ = false;
+  int16_t frag_coord_layout_ = -1;      // the qualifiers of the redeclarations so far, -1 none yet
+  bool frag_coord_conflict_ = false;
+  void end_unit() {
+    if (unit_redeclares_frag_coord_) {
+      any_redeclared_ = true;
+      if (frag_coord_layout_ >= 0 && frag_coord_layout_ != unit_frag_coord_) frag_coord_conflict_ = true;
+      frag_coord_layout_ = unit_frag_coord_;
+    } else if (unit_uses_frag_coord_) {
+      any_used_bare_ = true;
+    }
+    unit_uses_frag_coord_ = unit_redeclares_frag_coord_ = false;
+    unit_frag_coord_ = 0;
+  }
+  List<BodyNodes> body_nodes_{a_};
 
   // --- tokens
   const Token& cur() const { return toks_[pos_]; }
@@ -622,6 +705,7 @@ class Parser {
 
   struct Quals {
     bool is_const = false, uniform = false, attribute = false, varying = false, in = false, out = false, inout = false, flat = false, layout_std140 = false;
+    uint8_t frag_coord = 0;      // layout(origin_upper_left) 1, layout(pixel_center_integer) 2
     int32_t location = -1, binding = -1;
   };
 
@@ -640,6 +724,8 @@ class Parser {
       if (key.equals("location")) q->location = value;
       else if (key.equals("binding")) q->binding = value;
       else if (key.equals("std140")) q->layout_std140 = true;
+      else if (key.equals("origin_upper_left")) q->frag_coord |= 1;
+      else if (key.equals("pixel_center_integer")) q->frag_coord |= 2;
       if (!accept(",")) break;
     }
     return expect(")");
@@ -663,6 +749,12 @@ class Parser {
   }
 
   void top_level() {
+    if (cur().kind == Tok::UnitBreak) {
+      end_unit();
+      ++unit_;
+      ++pos_;
+      return;
+    }
     if (accept(";")) return;
     if (is_id("invariant") && peek().kind == Tok::Ident && !at_type_at(1) && !is_qualifier_word(peek().text)) {
       // `invariant gl_Position, v;`: every value is computed the same way here already
@@ -681,10 +773,11 @@ class Parser {
       return;
     }
     if (is_id("struct")) {
-      struct_decl(nullptr);
+      Type st;
+      struct_decl(&st);
       if (!failed_) {
         // a declaration like `struct S {...} s;` or just `struct S {...};`
-        global_declarators_after_struct();
+        global_declarators_after_struct(st);
       }
       return;
     }
@@ -763,6 +856,38 @@ class Parser {
     else if (q.varying) kind = stage_ == Stage::Vertex ? GlobalKind::Out : GlobalKind::In;
     else if (q.in) kind = GlobalKind::In;
     else if (q.out) kind = GlobalKind::Out;
+    // A redeclared built-in (`layout(origin_upper_left) in vec4 gl_FragCoord;`, `out vec4 gl_Position;`): the built-in it is.
+    if (name.starts_with("gl_")) {
+      const int32_t old = m_.find_global(name);
+      if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone) {
+        if (m_.globals[static_cast<uint64_t>(old)]->builtin == kBvFragCoord) {
+          unit_redeclares_frag_coord_ = true;
+          unit_frag_coord_ = q.frag_coord;
+        }
+        return;
+      }
+    }
+    // Linked shaders that declare the same variable: one variable (GLSL 1.10, 4.1.9 ... "global variables ... must have the same type in every shader").
+    if (merge_units_) {
+      const int32_t old = m_.find_global(name);
+      if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin == kBvNone) {
+        Global& og = *m_.globals[static_cast<uint64_t>(old)];
+        // (`vec4 v[2];` in one shader and `vec4 v[];` in another: one array of 2)
+        if (og.kind == kind && og.type.array && t.array == kUnsizedArray && og.type.element() == t.element()) {
+          if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) return;
+          add_sym(name, og.type, 1, old);
+          return;
+        }
+        if (og.kind != kind || !(og.type == t)) { err("a global is declared with different types or qualifiers in two shaders"); return; }
+        if (init >= 0) {
+          if (og.init >= 0 && kind != GlobalKind::Const) { err("a global is initialized in two shaders"); return; }
+          if (og.init < 0) og.init = init;
+        }
+        if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) return;
+        add_sym(name, og.type, 1, old);
+        return;
+      }
+    }
     const int32_t g = new_global(name, t, kind, shared);
     if (g < 0) return;
     Global& gv = *m_.globals[static_cast<uint64_t>(g)];
@@ -773,12 +898,10 @@ class Parser {
     if (kind == GlobalKind::Uniform) gv.uniform_index = 0;
   }
 
-  void global_declarators_after_struct() {
+  void global_declarators_after_struct(const Type& t) {
     // `struct S {...};` was parsed by struct_decl up to the closing brace
     if (is(";")) { ++pos_; return; }
     if (cur().kind == Tok::Ident) {
-      Type t = make_type(Base::Struct);
-      t.sid = static_cast<uint16_t>(m_.structs.count() - 1);
       Quals q;
       for (;;) {
         if (cur().kind != Tok::Ident) { err("expected a name"); return; }
@@ -833,6 +956,21 @@ class Parser {
     }
     if (!expect("}")) return false;
     sd->slots = offset;
+    // Linked shaders that each define the structure (at file scope, the same members): one type.
+    if (merge_units_ && cur_fn_ < 0) {
+      for (uint64_t i = 0; i < m_.structs.count(); ++i) {
+        const StructDef& old = *m_.structs[i];
+        if (!old.name.view().equals(sd->name.view())) continue;
+        bool same = old.fields.count() == sd->fields.count();
+        for (uint64_t k = 0; same && k < old.fields.count(); ++k) same = old.fields[k].name.view().equals(sd->fields[k].name.view()) && old.fields[k].type == sd->fields[k].type;
+        if (!same) return err("a structure is defined differently in two shaders");
+        if (out) {
+          *out = make_type(Base::Struct);
+          out->sid = static_cast<uint16_t>(i);
+        }
+        return true;
+      }
+    }
     m_.structs.push_back(static_cast<UniquePointer<StructDef>&&>(sd));
     if (out) {
       *out = make_type(Base::Struct);
@@ -879,6 +1017,14 @@ class Parser {
         ++pos_;
         Type t = mt;
         if (is("[") && !parse_array_suffix(&t)) return;
+        // out gl_PerVertex { vec4 gl_Position; ... }: the members are the built-ins (only which ones are used is said)
+        if (!is_uniform && (block_name.equals("gl_PerVertex") || block_name.equals("gl_PerFragment"))) {
+          const int32_t old = m_.find_global(name);
+          if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone) {
+            if (!accept(",")) break;
+            continue;
+          }
+        }
         StringView global_name = name;
         if (named_interface) {
           qualified.assign(block_name);
@@ -961,15 +1107,33 @@ class Parser {
       m_.functions.push_back(static_cast<UniquePointer<Function>&&>(fn));
       index = static_cast<int32_t>(m_.functions.count() - 1);
     }
+    while (fn_units_.count() < m_.functions.count()) if (!fn_units_.push_back(0)) { err("out of memory"); return; }
+    fn_units_[static_cast<uint64_t>(index)] |= unit_bit();
     if (accept(";")) return;   // a prototype
     if (!is("{")) { err("expected a function body"); return; }
     Function& F = *m_.functions[static_cast<uint64_t>(index)];
+    if (F.body >= 0) {
+      // (the helpers the desktop translation adds to each shader, tcos_*, are the same in each: the first is kept)
+      if (merge_units_ && F.name.view().starts_with("tcos_")) {
+        uint32_t depth = 0;
+        do {
+          if (is("{")) ++depth;
+          else if (is("}")) --depth;
+          ++pos_;
+        } while (depth && cur().kind != Tok::End);
+        return;
+      }
+      err(merge_units_ ? "a function is defined in two shaders" : "a function is defined twice");
+      return;
+    }
     cur_fn_ = index;
     nlocals_ = static_cast<uint32_t>(F.params.count());
     push_scope();
     for (uint64_t i = 0; i < pnames.count(); ++i)
       if (!pnames[i]->empty()) add_sym(pnames[i]->view(), F.params[i].type, 0, static_cast<int32_t>(i));
+    const uint64_t first_node = m_.nodes.count();
     const int32_t body = block_stmt(false);
+    if (!body_nodes_.push_back(BodyNodes{index, first_node, m_.nodes.count()})) { err("out of memory"); return; }
     finish_unsized_locals();
     pop_scope();
     m_.functions[static_cast<uint64_t>(index)]->body = body;
@@ -1501,7 +1665,10 @@ class Parser {
     }
     n.kind = s->kind == 0 ? NodeKind::Local : NodeKind::Global;
     n.ival = s->index;
-    if (s->kind == 1) m_.globals[static_cast<uint64_t>(s->index)]->referenced = true;
+    if (s->kind == 1) {
+      m_.globals[static_cast<uint64_t>(s->index)]->referenced = true;
+      if (m_.globals[static_cast<uint64_t>(s->index)]->builtin == kBvFragCoord) unit_uses_frag_coord_ = true;
+    }
     if (s->kind == 1 && m_.globals[static_cast<uint64_t>(s->index)]->builtin == kBvFragDepth) m_.writes_frag_depth = true;
     return add(n);
   }
@@ -1515,7 +1682,7 @@ class Parser {
     int32_t best = -1;
     for (uint64_t i = 0; i < m_.functions.count(); ++i) {
       const Function& f = *m_.functions[i];
-      if (!f.name.view().equals(name) || f.params.count() != args.count()) continue;
+      if (!f.name.view().equals(name) || f.params.count() != args.count() || !visible_here(i)) continue;
       bool ok = true;
       for (uint64_t k = 0; k < args.count(); ++k) {
         Type st;
@@ -1589,50 +1756,106 @@ class Parser {
 
 }  // namespace
 
-bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& glsl) {
-  module.stage = stage;
-  module.language = Language::Glsl100;
-  // The preprocessor is glcpp's (GlslPreprocessor.cpp). Its output keeps #version, #extension, #pragma and #line as lines: they are blanked here, keeping the line count.
+namespace {
+
+// One shader's preprocessed text with the directive lines (#version, #extension, #pragma, #line, which glcpp keeps) blanked, keeping the line count.
+bool preprocess_unit(Module& module, StringView source, const GlslOptions& glsl, String* pp, PreprocessResult* pre) {
   PreprocessOptions options;
   options.default_version = glsl.desktop ? 110 : 100;
   options.default_es = !glsl.desktop;
-  PreprocessResult pre(module.allocator);
-  if (!preprocess_glsl(module.allocator, source, options, &pre)) {
-    module.error.assign(pre.log.empty() ? StringView("preprocessor error") : pre.log.view());
+  if (!preprocess_glsl(module.allocator, source, options, pre)) {
+    module.error.assign(pre->log.empty() ? StringView("preprocessor error") : pre->log.view());
     return false;
   }
-  const uint32_t version = pre.version;
-  String pp(module.allocator);
-  {
-    const StringView text = pre.output.view();
-    uint64_t i = 0;
-    while (i < text.size()) {
-      uint64_t end = i;
-      while (end < text.size() && text[end] != '\n') ++end;
-      uint64_t k = i;
-      while (k < end && (text[k] == ' ' || text[k] == '\t' || text[k] == '\r')) ++k;
-      if (k >= end || text[k] != '#') pp.append(text.substr(i, end - i));
-      if (end < text.size()) pp.append("\n");
-      i = end + 1;
+  const StringView text = pre->output.view();
+  uint64_t i = 0;
+  while (i < text.size()) {
+    uint64_t end = i;
+    while (end < text.size() && text[end] != '\n') ++end;
+    uint64_t k = i;
+    while (k < end && (text[k] == ' ' || text[k] == '\t' || text[k] == '\r')) ++k;
+    if (k >= end || text[k] != '#') pp->append(text.substr(i, end - i));
+    if (end < text.size()) pp->append("\n");
+    i = end + 1;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool parse_glsl_units(Module& module, ArrayView<const StringView> sources, Stage stage, const GlslOptions& glsl) {
+  module.stage = stage;
+  module.language = Language::Glsl100;
+  if (sources.size() == 0) {
+    module.error.assign("no shader");
+    return false;
+  }
+  // The texts stay alive while the tokens (views into them) are parsed.
+  List<UniquePointer<String>> texts(module.allocator);
+  List<Token> toks(module.allocator);
+  uint32_t version = 0;
+  bool es = false, compatibility_profile = false;
+  for (const StringView source : sources) {
+    UniquePointer<String> pp = UniquePointer<String>::make(module.allocator, module.allocator);
+    PreprocessResult pre(module.allocator);
+    if (!pp || !texts.push_back(static_cast<UniquePointer<String>&&>(pp))) {
+      module.error.assign("out of memory");
+      return false;
+    }
+    String& text = *texts[texts.count() - 1];
+    if (!preprocess_unit(module, source, glsl, &text, &pre)) return false;
+    if (texts.count() > 1 && pre.es != es) {
+      module.error.assign("linked shaders mix GLSL ES and desktop GLSL");
+      return false;
+    }
+    es = pre.es;
+    if (pre.version > version) version = pre.version;
+    compatibility_profile = compatibility_profile || pre.profile == 2;
+    List<Token> unit(module.allocator);
+    if (!lex(text.view(), &unit)) {
+      module.error.assign("out of memory");
+      return false;
+    }
+    // (each unit's End token is dropped but the last: one stream, with a break between units)
+    if (texts.count() > 1) {
+      Token brk;
+      brk.kind = Tok::UnitBreak;
+      if (!toks.push_back(brk)) {
+        module.error.assign("out of memory");
+        return false;
+      }
+    }
+    for (const Token& t : unit) {
+      if (t.kind == Tok::End) continue;
+      if (!toks.push_back(t)) {
+        module.error.assign("out of memory");
+        return false;
+      }
     }
   }
-  if (glsl.desktop && !pre.es) {
+  Token end;
+  end.kind = Tok::End;
+  if (!toks.push_back(end)) {
+    module.error.assign("out of memory");
+    return false;
+  }
+  if (glsl.desktop && !es) {
     // Desktop GLSL: 1.10 and 1.20 by the 1.00 rules, 1.30 and later by the 3.00 ones, with what desktop GLSL adds (Module::desktop).
     module.desktop = true;
     module.desktop_version = version;
-    module.compatibility = version <= 140 || pre.profile == 2;
+    module.compatibility = version <= 140 || compatibility_profile;
     module.glsl_version = version >= 130 ? 300 : 100;
   } else {
     module.glsl_version = version;
   }
   if (module.glsl_version >= 300) module.language = Language::Glsl300;
-  List<Token> toks(module.allocator);
-  if (!lex(pp.view(), &toks)) {
-    module.error.assign("out of memory");
-    return false;
-  }
-  Parser parser(module, toks, stage);
+  Parser parser(module, toks, stage, sources.size() > 1, glsl.compile_only);
   return parser.run();
+}
+
+bool parse_glsl(Module& module, StringView source, Stage stage, const GlslOptions& glsl) {
+  const StringView one[1] = {source};
+  return parse_glsl_units(module, ArrayView<const StringView>(one, 1), stage, glsl);
 }
 
 }  // namespace shader

@@ -221,14 +221,14 @@ void GlContext::delete_object(uint32_t kind, uint32_t id) {
       if (id <= objects_->shaders.count() && objects_->shaders[id - 1]) {
         objects_->shaders[id - 1]->deleted = true;
         bool attached = false;
-        for (auto& p : objects_->programs) if (p && (p->vs == id || p->fs == id)) attached = true;
+        for (auto& p : objects_->programs) if (p && p->has_shader(id)) attached = true;
         if (!attached) objects_->shaders[id - 1].reset();
       }
       break;
     case 'p':
       if (id <= objects_->programs.count() && objects_->programs[id - 1]) {
         if (program_ == id) objects_->programs[id - 1]->deleted = true;
-        else objects_->programs[id - 1].reset();
+        else free_program(id);
       }
       break;
     case 'v':
@@ -1061,7 +1061,7 @@ void GlContext::use_program(uint32_t id) {
   program_ = id;
   if (old && old != id) {
     ProgramObj* o = program_at(old);
-    if (o && o->deleted) objects_->programs[old - 1].reset();
+    if (o && o->deleted) free_program(old);
   }
 }
 
