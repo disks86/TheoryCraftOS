@@ -658,6 +658,27 @@ class Parser {
     return true;
   }
 
+  // Whether two expressions are written the same (operators, constants, variables, calls): initializers of one global in linked shaders.
+  bool same_expression(int32_t x, int32_t y, uint32_t depth) const {
+    if (x == y) return true;
+    if (x < 0 || y < 0 || depth > 64) return false;
+    const Node& a = m_.nodes[static_cast<uint64_t>(x)];
+    const Node& b = m_.nodes[static_cast<uint64_t>(y)];
+    if (a.kind != b.kind || a.op != b.op || a.ival != b.ival || a.count != b.count || a.flags != b.flags || !(a.type == b.type)) return false;
+    if (a.kind == NodeKind::Const) {
+      const uint32_t n = m_.slots_of(a.type);
+      if (a.a < 0 || b.a < 0 || n > m_.consts.count() || static_cast<uint64_t>(a.a) > m_.consts.count() - n || static_cast<uint64_t>(b.a) > m_.consts.count() - n) return false;
+      for (uint32_t k = 0; k < n; ++k) if (m_.consts[static_cast<uint64_t>(a.a) + k] != m_.consts[static_cast<uint64_t>(b.a) + k]) return false;
+      return true;
+    }
+    if (!same_expression(a.a, b.a, depth + 1) || !same_expression(a.b, b.b, depth + 1) || !same_expression(a.c, b.c, depth + 1) || !same_expression(a.d, b.d, depth + 1)) return false;
+    for (int32_t k = 0; k < a.count; ++k) {
+      const uint64_t ka = static_cast<uint64_t>(a.first) + static_cast<uint64_t>(k), kb = static_cast<uint64_t>(b.first) + static_cast<uint64_t>(k);
+      if (ka >= m_.kids.count() || kb >= m_.kids.count() || !same_expression(m_.kids[ka], m_.kids[kb], depth + 1)) return false;
+    }
+    return true;
+  }
+
   int32_t new_global(StringView name, const Type& t, GlobalKind kind, bool shared) {
     UniquePointer<Global> g = UniquePointer<Global>::make(a_, a_);
     if (!g) { err("out of memory"); return -1; }
@@ -859,7 +880,8 @@ class Parser {
     // A redeclared built-in (`layout(origin_upper_left) in vec4 gl_FragCoord;`, `out vec4 gl_Position;`): the built-in it is.
     if (name.starts_with("gl_")) {
       const int32_t old = m_.find_global(name);
-      if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone) {
+      // (arrays such as gl_ClipDistance[3] and gl_TexCoord[] are redeclared with a size, which the declaration below gives them)
+      if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone && !t.array) {
         if (m_.globals[static_cast<uint64_t>(old)]->builtin == kBvFragCoord) {
           unit_redeclares_frag_coord_ = true;
           unit_frag_coord_ = q.frag_coord;
@@ -880,7 +902,8 @@ class Parser {
         }
         if (og.kind != kind || !(og.type == t)) { err("a global is declared with different types or qualifiers in two shaders"); return; }
         if (init >= 0) {
-          if (og.init >= 0 && kind != GlobalKind::Const) { err("a global is initialized in two shaders"); return; }
+          // (two shaders may initialize it alike: GLSL 1.20 4.3 "... must have the same initializer")
+          if (og.init >= 0 && !same_expression(og.init, init, 0)) { err("a global is initialized differently in two shaders"); return; }
           if (og.init < 0) og.init = init;
         }
         if (Sym* s = find_sym(name)) if (s->kind == 1 && s->index == old) return;
