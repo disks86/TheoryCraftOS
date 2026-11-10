@@ -617,7 +617,7 @@ void GlApi::glDeleteTransformFeedbacks(GLsizei n, UserPtr ids) {
     const uint32_t object = tf_names_.object(name);
     if (object) {
       uint64_t unused = 0;
-      if (!gl_.transform_feedback_vertices(object, &unused)) continue;      // (an active one may not be deleted: INVALID_OPERATION)
+      if (!gl_.transform_feedback_vertices(object, 0, &unused)) continue;      // (an active one may not be deleted: INVALID_OPERATION)
       if (gl_.tf_bound_ == object) gl_.bind_transform_feedback(0);      // (the default object's bindings come back)
       gl_.delete_object('x', object);
     }
@@ -641,8 +641,7 @@ void GlApi::draw_transform_feedback(GLenum mode, GLuint id, uint32_t stream, GLs
   const uint32_t object = id ? tf_names_.object(id) : 0;
   if (id && !object) { error(GL_INVALID_VALUE); return; }
   uint64_t vertices = 0;
-  if (!gl_.transform_feedback_vertices(object, &vertices)) return;
-  if (stream != 0) vertices = 0;      // (only stream 0 is captured)
+  if (!gl_.transform_feedback_vertices(object, stream, &vertices)) return;
   draw_any(mode, 0, static_cast<GLsizei>(vertices > 0x7FFFFFFF ? 0x7FFFFFFF : vertices), 0, UserPtr{}, false, instances, 0, 0);
 }
 void GlApi::glDrawTransformFeedback(GLenum mode, GLuint id) { draw_transform_feedback(mode, id, 0, 1); }

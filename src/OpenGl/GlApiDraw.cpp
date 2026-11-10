@@ -255,6 +255,7 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
     ds.clip_varying = po ? po->clip_varying : -1;
     ds.clip_mask = ds.clip_varying >= 0 ? fx_.clip_enabled : 0;
     ds.clip_indexed = true;
+    ds.two_side_color = fx_.vertex_program_two_side;      // GL_VERTEX_PROGRAM_TWO_SIDE: back-facing triangles show gl_BackColor
     for (uint32_t i = 0; i < 8 && i < kMaxClipPlanes; ++i)
       for (int k = 0; k < 4; ++k) ds.clip_planes[i][k] = static_cast<float>(fx_.clip_plane[i][k]);
     load_compat_uniforms(user_program_);
@@ -272,6 +273,7 @@ bool GlApi::prepare_draw(uint32_t, int64_t lowest, int64_t highest, uint32_t ins
     ds.clip_mask = fx_.clip_enabled;
     ds.clip_varying = p->clip_first;
     ds.clip_indexed = false;
+    ds.two_side_color = false;      // (the fixed-function shaders choose the side themselves)
     ds.ff_1d_mask = 0;
     ds.ff_rect_mask = 0;
     for (uint32_t i = 0; i < kMaxTexUnits; ++i) {

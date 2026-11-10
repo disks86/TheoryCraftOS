@@ -1139,6 +1139,82 @@ static void test_transform_feedback_stages() {
   glDeleteProgram(d);
   glDeleteTransformFeedbacks(1, &object);
   CHECK(!glIsTransformFeedback(object));
+
+  // The shader's own layout (GLSL 4.40): offsets with gaps, a buffer's stride, a block's members one after another; glTransformFeedbackVaryings not called.
+  const GLuint x = build_stages("#version 440\nin vec4 pos;\nlayout(xfb_offset = 4) out float a;\nlayout(xfb_offset = 12) out float b;\n"
+                                "layout(xfb_buffer = 1, xfb_stride = 12) out;\nlayout(xfb_buffer = 1, xfb_offset = 0) out Blk { float p; float q; } blk;\n"
+                                "void main(){ gl_Position = vec4(0.0); a = pos.x; b = pos.x + 100.0; blk.p = -pos.x; blk.q = pos.x * 2.0; }\n",
+                                nullptr, nullptr, nullptr, fs);
+  CHECK(x != 0);
+  attrib(x);
+  glUseProgram(x);
+  reset_floats(tfb[0], 16);
+  reset_floats(tfb[1], 16);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 1, tfb[1]);
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_POINTS, 2, 2);
+  glEndTransformFeedback();
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 9);
+  CHECK(got[0] == -1 && got[1] == 2 && got[2] == -1 && got[3] == 102 && got[5] == 3 && got[7] == 103 && got[8] == -1);
+  read_floats(tfb[1], got, 7);
+  CHECK(got[0] == -2 && got[1] == 4 && got[2] == -1 && got[3] == -3 && got[4] == 6 && got[5] == -1 && got[6] == -1);
+  glUseProgram(0);
+  glDeleteProgram(x);
+  // overlapping offsets, and a stride too small, fail the link
+  CHECK(build_stages("#version 440\nlayout(xfb_offset = 0) out vec2 a;\nlayout(xfb_offset = 4) out float b;\nvoid main(){ gl_Position = vec4(0.0); a = vec2(0.0); b = 0.0; }\n",
+                     nullptr, nullptr, nullptr, fs) == 0);
+  CHECK(build_stages("#version 440\nlayout(xfb_stride = 4) out;\nlayout(xfb_offset = 0) out vec2 a;\nvoid main(){ gl_Position = vec4(0.0); a = vec2(0.0); }\n",
+                     nullptr, nullptr, nullptr, fs) == 0);
+
+  // Vertex streams: stream 0 to buffer 0, stream 1 (twice per point) to buffer 1; the indexed queries count each stream, and glDrawTransformFeedbackStream draws one.
+  const char* stream_names[] = {"s0", "gl_NextBuffer", "s1"};
+  const GLuint m = build_stages("#version 400\nin vec4 pos;\nout float vid;\nvoid main(){ gl_Position = vec4(0.0); vid = pos.x; }\n", nullptr, nullptr,
+                                "#version 400\nlayout(points) in;\nlayout(points, max_vertices = 2) out;\nin float vid[];\n"
+                                "layout(stream = 0) out float s0;\nlayout(stream = 1) out float s1;\n"
+                                "void main(){ s0 = 1.0 + vid[0]; EmitStreamVertex(0); s1 = 10.0 + vid[0]; EmitStreamVertex(1); s1 = 20.0 + vid[0]; EmitStreamVertex(1); }\n",
+                                fs, stream_names, 3);
+  CHECK(m != 0);
+  attrib(m);
+  glUseProgram(m);
+  reset_floats(tfb[0], 8);
+  reset_floats(tfb[1], 8);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 1, tfb[1]);
+  glBeginQueryIndexed(GL_PRIMITIVES_GENERATED, 1, queries[0]);
+  glBeginQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, 0, queries[1]);
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_POINTS, 1, 2);
+  glEndTransformFeedback();
+  glEndQueryIndexed(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, 0);
+  glEndQueryIndexed(GL_PRIMITIVES_GENERATED, 1);
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 3);
+  CHECK(got[0] == 2 && got[1] == 3 && got[2] == -1);
+  read_floats(tfb[1], got, 5);
+  CHECK(got[0] == 11 && got[1] == 21 && got[2] == 12 && got[3] == 22 && got[4] == -1);
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 4);
+  glGetQueryObjectuiv(queries[1], GL_QUERY_RESULT, &count);
+  CHECK(count == 2);
+  glUseProgram(0);
+  glDeleteProgram(m);
+  const GLuint d1 = build_stages(vs, nullptr, nullptr, nullptr, fs);
+  attrib(d1);
+  glUseProgram(d1);
+  glBeginQuery(GL_PRIMITIVES_GENERATED, queries[0]);
+  glDrawTransformFeedbackStream(GL_POINTS, 0, 1);
+  glEndQuery(GL_PRIMITIVES_GENERATED);
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 4);
+  glUseProgram(0);
+  glDeleteProgram(d1);
+  // several streams need points out; an output's stream outside a geometry shader is an error
+  CHECK(build_stages("#version 400\nvoid main(){ gl_Position = vec4(0.0); }\n", nullptr, nullptr,
+                     "#version 400\nlayout(points) in;\nlayout(line_strip, max_vertices = 2) out;\nlayout(stream = 1) out float s1;\nvoid main(){ s1 = 1.0; EmitStreamVertex(1); }\n",
+                     fs) == 0);
+  CHECK(glGetError() == GL_NO_ERROR);
   glDisable(GL_RASTERIZER_DISCARD);
   glDeleteQueries(2, queries);
   glDeleteBuffers(2, tfb);
@@ -1216,6 +1292,34 @@ static void test_compat_stage_varyings() {
   glClampColor(GL_CLAMP_VERTEX_COLOR, GL_TRUE);
   glUseProgram(0);
   glDeleteProgram(c);
+  // two-sided colour: a back-facing rectangle shows gl_BackColor only with GL_VERTEX_PROGRAM_TWO_SIDE; through the vertex stage, then a geometry stage
+  const char* two_fs = "#version 110\nvoid main(){ gl_FragColor = gl_Color + gl_SecondaryColor; }\n";
+  const GLuint two_vs = build("#version 110\nvoid main(){ gl_Position = gl_Vertex; gl_FrontColor = vec4(1.0, 0.0, 0.0, 1.0); gl_BackColor = vec4(0.0, 0.0, 1.0, 1.0);\n"
+                              " gl_FrontSecondaryColor = vec4(0.0); gl_BackSecondaryColor = vec4(0.0, 0.5, 0.0, 0.0); }\n", two_fs);
+  const GLuint two_gs = build_stages("#version 150 compatibility\nvoid main(){ gl_Position = gl_Vertex; }\n", nullptr, nullptr,
+                                     "#version 150 compatibility\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\n"
+                                     "void main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; gl_FrontColor = vec4(1.0, 0.0, 0.0, 1.0);\n"
+                                     " gl_BackColor = vec4(0.0, 0.0, 1.0, 1.0); gl_FrontSecondaryColor = vec4(0.0); gl_BackSecondaryColor = vec4(0.0, 0.5, 0.0, 0.0); EmitVertex(); } }\n",
+                                     two_fs);
+  CHECK(two_vs != 0 && two_gs != 0);
+  const GLuint twos[2] = {two_vs, two_gs};
+  for (const GLuint two : twos) {
+    glUseProgram(two);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glRectf(1, -1, -1, 1);      // (clockwise: the back faces the viewer)
+    CHECK(near(pixel(32, 32), 255, 0, 0));
+    glEnable(GL_VERTEX_PROGRAM_TWO_SIDE);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glRectf(1, -1, -1, 1);
+    CHECK(near(pixel(32, 32), 0, 128, 255, 2));
+    glClear(GL_COLOR_BUFFER_BIT);
+    glRectf(-1, -1, 1, 1);      // (counter-clockwise: the front)
+    CHECK(near(pixel(32, 32), 255, 0, 0));
+    glDisable(GL_VERTEX_PROGRAM_TWO_SIDE);
+  }
+  glUseProgram(0);
+  glDeleteProgram(two_vs);
+  glDeleteProgram(two_gs);
   CHECK(glGetError() == GL_NO_ERROR);
 }
 

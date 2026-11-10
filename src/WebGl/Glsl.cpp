@@ -339,6 +339,7 @@ class Parser {
   Module& m_;
   allocators::IAllocator& a_;
   List<Token>& toks_;
+  uint8_t default_stream_ = 0, default_xfb_buffer_ = 0;      // `layout(stream = n) out;`, `layout(xfb_buffer = n) out;`
   Stage stage_;
   List<UniquePointer<Sym>> syms_;
   List<uint64_t> scopes_;
@@ -885,6 +886,7 @@ class Parser {
     // layout declarations of the geometry and tessellation stages (`layout(triangles) in;` ...)
     uint32_t prim = 0xFFFFFFFFu;
     int32_t max_vertices = -1, invocations = -1, vertices = -1, stream = -1;
+    int32_t xfb_buffer = -1, xfb_offset = -1, xfb_stride = -1;      // (GLSL 4.40, ARB_enhanced_layouts)
     uint32_t spacing = 0, order = 0;
     bool point_mode = false;
   };
@@ -898,7 +900,10 @@ class Parser {
     if (key.equals("max_vertices")) q->max_vertices = value;
     else if (key.equals("invocations")) { if (value < 1 || value > 32) return err("bad number of geometry shader invocations"); q->invocations = value; }
     else if (key.equals("vertices")) { if (value < 1 || value > 32) return err("bad number of patch vertices"); q->vertices = value; }
-    else if (key.equals("stream")) q->stream = value;
+    else if (key.equals("stream")) { if (value < 0 || value > 3) return err("bad vertex stream"); q->stream = value; }
+    else if (key.equals("xfb_buffer")) { if (value < 0 || value > 3) return err("bad transform feedback buffer"); q->xfb_buffer = value; }
+    else if (key.equals("xfb_offset")) { if (value % 4) return err("a transform feedback offset must be a multiple of 4"); q->xfb_offset = value; }
+    else if (key.equals("xfb_stride")) { if (value % 4 || value > 4096) return err("bad transform feedback stride"); q->xfb_stride = value; }
     else if (key.equals("equal_spacing")) q->spacing = 0x0202;
     else if (key.equals("fractional_even_spacing")) q->spacing = 0x8E7C;
     else if (key.equals("fractional_odd_spacing")) q->spacing = 0x8E7B;
@@ -920,9 +925,40 @@ class Parser {
     }
   }
 
+  bool set_stride(int32_t buffer, int32_t stride) {
+    if (m_.xfb_stride[buffer & 3] >= 0 && m_.xfb_stride[buffer & 3] != stride) return err("transform feedback strides conflict");
+    m_.xfb_stride[buffer & 3] = stride;
+    return true;
+  }
+  // An output's stream and transform feedback capture, from its own qualifiers, its block's, or the defaults; `next`: the offset a block's next member takes (-1 none).
+  bool set_capture(Global& gv, const Quals& q, const Quals* block, int32_t* next) {
+    const int32_t stream = q.stream >= 0 ? q.stream : (block && block->stream >= 0 ? block->stream : default_stream_);
+    if (stream && stage_ != Stage::Geometry) return err("only geometry shader outputs have streams");
+    gv.stream = static_cast<uint8_t>(stream);
+    if (stream) m_.gs_streams = true;
+    const int32_t buffer = q.xfb_buffer >= 0 ? q.xfb_buffer : (block && block->xfb_buffer >= 0 ? block->xfb_buffer : default_xfb_buffer_);
+    if (q.xfb_stride >= 0 && !set_stride(buffer, q.xfb_stride)) return false;
+    int32_t offset = q.xfb_offset;
+    if (offset < 0 && next && *next >= 0) offset = *next;
+    if (offset < 0) return true;
+    const uint32_t bytes = m_.slots_of(gv.type) * 4;
+    if (bytes > 0x10000 || static_cast<uint32_t>(offset) > 0x10000) return err("transform feedback offset too large");
+    gv.xfb_buffer = static_cast<int8_t>(buffer);
+    gv.xfb_offset = offset;
+    m_.has_xfb = true;
+    if (next) *next = offset + static_cast<int32_t>(bytes);
+    return true;
+  }
+
   // `layout(...) in;` / `layout(...) out;` with nothing declared: the stage's layout.
   void apply_layout(const Quals& q) {
     const auto conflict = [&](const char* what) { err(what); };
+    // `layout(stream = 1) out;`, `layout(xfb_buffer = 1, xfb_stride = 32) out;`: the defaults of the declarations after it, and a buffer's stride
+    if (q.out) {
+      if (q.stream >= 0) default_stream_ = static_cast<uint8_t>(q.stream);
+      if (q.xfb_buffer >= 0) default_xfb_buffer_ = static_cast<uint8_t>(q.xfb_buffer);
+      if (q.xfb_stride >= 0 && !set_stride(q.xfb_buffer >= 0 ? q.xfb_buffer : default_xfb_buffer_, q.xfb_stride)) return;
+    }
     if (stage_ == Stage::Geometry && q.in) {
       if (q.prim != 0xFFFFFFFFu) {
         if (!primitive_vertices(q.prim)) return conflict("bad geometry shader input primitive");
@@ -1186,6 +1222,7 @@ class Parser {
       const int32_t old = m_.find_global(name);
       // (arrays such as gl_ClipDistance[3] and gl_TexCoord[] are redeclared with a size, which the declaration below gives them)
       if (old >= 0 && m_.globals[static_cast<uint64_t>(old)]->builtin != kBvNone && !t.array) {
+        if (q.out) set_capture(*m_.globals[static_cast<uint64_t>(old)], q, nullptr, nullptr);      // (`layout(xfb_offset = 0) out vec4 gl_Position;`)
         if (m_.globals[static_cast<uint64_t>(old)]->builtin == kBvFragCoord) {
           unit_redeclares_frag_coord_ = true;
           unit_frag_coord_ = q.frag_coord;
@@ -1227,6 +1264,7 @@ class Parser {
     gv.inner = inner;
     gv.patch = q.patch;
     if (kind == GlobalKind::Uniform) gv.uniform_index = 0;
+    if (kind == GlobalKind::Out) set_capture(gv, q, nullptr, nullptr);
   }
 
   void global_declarators_after_struct(const Type& t) {
@@ -1348,6 +1386,7 @@ class Parser {
     }
     String qualified(a_);
     uint32_t offset = 0;
+    int32_t xfb_next = q.xfb_offset;      // (a block with an xfb_offset: its members one after another from there)
     List<int32_t> members(a_);
     while (!is("}") && !failed_ && cur().kind != Tok::End) {
       Quals mq;
@@ -1362,6 +1401,10 @@ class Parser {
         if (is("[") && !parse_array_suffix(&t)) return;
         // out gl_PerVertex { vec4 gl_Position; ... }: the members are the built-ins (only which ones are used is said)
         if (builtin_block) {
+          if (q.out && (mq.xfb_offset >= 0 || xfb_next >= 0)) {
+            const int32_t bg = m_.find_global(name);
+            if (bg >= 0 && !set_capture(*m_.globals[static_cast<uint64_t>(bg)], mq, &q, &xfb_next)) return;
+          }
           if (!accept(",")) break;
           continue;
         }
@@ -1388,6 +1431,7 @@ class Parser {
         gv.per_vertex = arrayed != 0;
         gv.inner = member_inner;
         gv.patch = q.patch;
+        if (q.out && !set_capture(gv, mq, &q, &xfb_next)) return;
         if (!is_uniform) {      // (a member's own interpolation qualifier)
           gv.flat = gv.flat || mq.flat || q.flat;
         }

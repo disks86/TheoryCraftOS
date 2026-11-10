@@ -1148,27 +1148,31 @@ bool GlContext::get_vertex_attrib(uint32_t index, uint32_t pname, double* out, u
 
 // --- Queries -----------------------------------------------------------------------------------------------------------------------------------------------
 
-// The query of each kind that may be active: 0 any samples passed, 1 conservative, 2 transform feedback primitives written (and the others), 3 primitives generated.
-static uint32_t query_slot(uint32_t target) { return target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : (target == 0x8C87 ? 3 : 2)); }
+// The query of each kind that may be active: 0 any samples passed, 1 conservative, 2 the others (time elapsed ...); the primitive queries per stream in prim_queries_.
+static uint32_t query_slot(uint32_t target) { return target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : 2); }
+static bool primitive_query(uint32_t target) { return target == 0x8C87 || target == 0x8C88; }
 
-void GlContext::begin_query(uint32_t target, uint32_t id) {
+void GlContext::begin_query(uint32_t target, uint32_t id, uint32_t index) {
   QueryObj* q = query_at(id);
   if (!q) { set_error(INVALID_OPERATION); return; }
+  if (index >= 4 || (index && !primitive_query(target))) { set_error(INVALID_VALUE); return; }
+  uint32_t& active = primitive_query(target) ? prim_queries_[target == 0x8C88][index] : query_active_[query_slot(target)];
+  if (active) { set_error(INVALID_OPERATION); return; }
   q->target = target;
   q->active = true;
   q->ended = false;
   q->result = 0;
-  const uint32_t slot = query_slot(target);
-  query_active_[slot] = id;
+  active = id;
 }
 
-void GlContext::end_query(uint32_t target) {
-  const uint32_t slot = query_slot(target);
-  QueryObj* q = query_at(query_active_[slot]);
+void GlContext::end_query(uint32_t target, uint32_t index) {
+  if (index >= 4) { set_error(INVALID_VALUE); return; }
+  uint32_t& active = primitive_query(target) ? prim_queries_[target == 0x8C88][index] : query_active_[query_slot(target)];
+  QueryObj* q = query_at(active);
   if (!q) { set_error(INVALID_OPERATION); return; }
   q->active = false;
   q->ended = true;
-  query_active_[slot] = 0;
+  active = 0;
 }
 
 bool GlContext::query_result(uint32_t id, uint32_t pname, double* out) {
@@ -1179,9 +1183,9 @@ bool GlContext::query_result(uint32_t id, uint32_t pname, double* out) {
   return true;
 }
 
-uint32_t GlContext::current_query(uint32_t target) const {
-  const uint32_t slot = query_slot(target);
-  return query_active_[slot];
+uint32_t GlContext::current_query(uint32_t target, uint32_t index) const {
+  if (index >= 4) return 0;
+  return primitive_query(target) ? prim_queries_[target == 0x8C88][index] : query_active_[query_slot(target)];
 }
 
 // --- Parameters ---------------------------------------------------------------------------------------------------------------------------------------------

@@ -284,6 +284,7 @@ bool GlContext::link_extra_stages(ProgramObj* p) {
     if (m.gs_input == 0xFFFFFFFFu) { link_failed(p, "the geometry shader declares no input primitive"); return false; }
     if (m.gs_output == 0xFFFFFFFFu) { link_failed(p, "the geometry shader declares no output primitive"); return false; }
     if (m.gs_max_vertices < 0) { link_failed(p, "the geometry shader declares no max_vertices"); return false; }
+    if (m.gs_streams && m.gs_output != 0) { link_failed(p, "a geometry shader with outputs on several streams must put out points"); return false; }
   }
   if (tcs && tcs->module->tcs_vertices <= 0) { link_failed(p, "the tessellation control shader declares no output patch size"); return false; }
   if (tes && !tes->module->tes_mode) { link_failed(p, "the tessellation evaluation shader declares no primitive mode"); return false; }
@@ -602,6 +603,24 @@ void GlContext::link_program(uint32_t id) {
     }
   }
   p->nvar = offset;
+  // Two-sided colour: the back colour of each front one the fragment stage reads, if the last stage writes it (after the interpolated varyings).
+  p->back_count = 0;
+  if (desktop.active) {
+    static const char* const kPairs[2][2] = {{"tcos_FrontColor", "tcos_BackColor"}, {"tcos_FrontSecondaryColor", "tcos_BackSecondaryColor"}};
+    uint32_t at = offset;
+    for (const auto& pair : kPairs) {
+      const int32_t fg = fm.find_global(pair[0]), bg = lm.find_global(pair[1]);
+      if (fg < 0 || bg < 0) continue;
+      const shader::Global& back = *lm.globals[static_cast<uint64_t>(bg)];
+      if (back.kind != GlobalKind::Out || !back.referenced || at + 4 > gpu::kMaxVarying) continue;
+      for (const VaryingLink& l : p->links) {
+        if (l.fs_slot != fm.globals[static_cast<uint64_t>(fg)]->slot || l.count != 4) continue;
+        p->back_colors[p->back_count++] = ProgramObj::BackColor{back.slot, l.var_offset, at, l.clamp};
+        at += 4;
+        break;
+      }
+    }
+  }
   if (!link_transform_feedback(p, lm)) return;
 
   // fragment outputs
@@ -936,7 +955,7 @@ void GlContext::begin_transform_feedback(uint32_t mode) {
   tf->active = true;
   tf->paused = false;
   tf->primitive = tf_family(mode);
-  tf->vertices = 0;
+  for (uint64_t& v : tf->vertices) v = 0;
   tf_active_ = true;
   for (auto& v : tf_pos_) v = 0;
 }
@@ -978,11 +997,11 @@ void GlContext::bind_transform_feedback(uint32_t id) {
   tf_active_ = now->active && !now->paused;
 }
 
-bool GlContext::transform_feedback_vertices(uint32_t id, uint64_t* vertices) {
+bool GlContext::transform_feedback_vertices(uint32_t id, uint32_t stream, uint64_t* vertices) {
   const TransformFeedbackObj* tf = !id ? &default_tf_ : (id <= tfs_.count() ? tfs_[id - 1].get() : nullptr);
   if (!tf) { set_error(INVALID_VALUE); return false; }
   if (tf->active) { set_error(INVALID_OPERATION); return false; }
-  *vertices = tf->vertices;
+  *vertices = tf->vertices[stream & 3];
   return true;
 }
 
@@ -996,11 +1015,13 @@ bool GlContext::transform_feedback_varying(uint32_t program, uint32_t index, Str
   return true;
 }
 
-// The capture of a program: each name of glTransformFeedbackVaryings found among the outputs of the last pre-raster stage (`name`, `name[i]`, a member `Block.member`
-// or, of an unnamed block, `member`; the compatibility ones by their tcos_ names), and the special gl_NextBuffer / gl_SkipComponents1..4 of interleaved capture.
+// The capture of a program. When the last pre-raster stage gives its outputs xfb_offsets, those (with their buffers and strides); otherwise each name of
+// glTransformFeedbackVaryings found among its outputs (`name`, `name[i]`, a member `Block.member` or, of an unnamed block, `member`; the compatibility ones by their
+// tcos_ names), and the special gl_NextBuffer / gl_SkipComponents1..4 of interleaved capture. A buffer takes the vertices of one stream.
 bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& last) {
   p->tf_plan.clear();
   p->tf_record_slots = 0;
+  for (uint32_t& s : p->tf_stride) s = 0;
   if (p->extra[kStageGeometry]) {
     const uint32_t out = p->extra[kStageGeometry]->module->gs_output;
     p->tf_primitive = out == 0 ? 0 : (out == 3 ? 1 : 4);
@@ -1009,6 +1030,42 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
     p->tf_primitive = m.tes_point_mode ? 0 : (m.tes_mode == 0x8E7A ? 1 : 4);
   } else {
     p->tf_primitive = 0xFFFFFFFFu;      // (the draw's mode)
+  }
+  int32_t buffer_stream[4] = {-1, -1, -1, -1};
+  const auto add = [&](const TfPiece& piece) {
+    if (buffer_stream[piece.binding] >= 0 && buffer_stream[piece.binding] != static_cast<int32_t>(piece.stream)) return link_failed(p, "a transform feedback buffer takes outputs of two streams"), false;
+    buffer_stream[piece.binding] = static_cast<int32_t>(piece.stream);
+    if (p->tf_record_slots + piece.count > kMaxTfComponents) return link_failed(p, "too many transform feedback components"), false;
+    p->tf_record_slots += piece.count;
+    if (!p->tf_plan.push_back(piece)) return link_failed(p, "out of memory"), false;
+    return true;
+  };
+  if (last.has_xfb) {      // (the shader's own layout: glTransformFeedbackVaryings does not count)
+    uint32_t extent[4] = {0, 0, 0, 0};
+    for (const UniquePointer<shader::Global>& gp : last.globals) {
+      const shader::Global& g = *gp;
+      if (g.xfb_offset < 0 || g.xfb_buffer < 0) continue;
+      TfPiece piece;
+      piece.src = g.slot;
+      piece.count = last.slots_of(g.type);
+      piece.binding = static_cast<uint32_t>(g.xfb_buffer) & 3;
+      piece.offset = static_cast<uint32_t>(g.xfb_offset);
+      piece.stream = g.stream;
+      if (piece.count > last.private_slots || piece.src > last.private_slots - piece.count) { link_failed(p, "a transform feedback output outside its stage's variables"); return false; }
+      for (const TfPiece& other : p->tf_plan)
+        if (other.binding == piece.binding && piece.offset < other.offset + other.count * 4 && other.offset < piece.offset + piece.count * 4) {
+          link_failed(p, "transform feedback outputs overlap in their buffer");
+          return false;
+        }
+      if (!add(piece)) return false;
+      if (piece.offset + piece.count * 4 > extent[piece.binding]) extent[piece.binding] = piece.offset + piece.count * 4;
+    }
+    for (uint32_t b = 0; b < 4; ++b) {
+      const int32_t stride = last.xfb_stride[b];
+      if (stride >= 0 && static_cast<uint32_t>(stride) < extent[b]) { link_failed(p, "a transform feedback output reaches past its buffer's xfb_stride"); return false; }
+      p->tf_stride[b] = stride >= 0 ? static_cast<uint32_t>(stride) : extent[b];
+    }
+    return true;
   }
   const bool separate = p->tf_mode == 0x8C8D;
   if (p->tf_varyings.count() > 32 || (separate && p->tf_varyings.count() > 4)) { link_failed(p, "too many transform feedback varyings"); return false; }
@@ -1025,12 +1082,17 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
     }
     TfPiece piece;
     piece.binding = binding;
+    piece.offset = p->tf_stride[binding];
     const StringView skip("gl_SkipComponents");
     if (name.starts_with(skip) && name.size() == skip.size() + 1 && name[skip.size()] >= '1' && name[skip.size()] <= '4') {
       if (separate) { link_failed(p, "gl_SkipComponents in separate transform feedback"); return false; }
-      piece.skip = true;
-      piece.count = static_cast<uint32_t>(name[skip.size()] - '0');
-      p->tf_info[i] = ProgramObj::TfVaryingInfo{0, piece.count};      // (GL_NONE, the components skipped)
+      const uint32_t n = static_cast<uint32_t>(name[skip.size()] - '0');
+      p->tf_info[i] = ProgramObj::TfVaryingInfo{0, n};      // (GL_NONE, the components skipped)
+      p->tf_stride[binding] += n * 4;      // (a gap the vertex's bytes leave as they are)
+      total += n;
+      in_binding += n;
+      if (total > kMaxTfComponents) { link_failed(p, "too many transform feedback components"); return false; }
+      continue;
     } else {
       // name[index]
       StringView base = name;
@@ -1087,12 +1149,13 @@ bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& las
         p->tf_info[i] = ProgramObj::TfVaryingInfo{gl_type_of(et), g->type.array ? g->type.array : 1};
       }
       if (piece.count > last.private_slots || piece.src > last.private_slots - piece.count) { link_failed(p, "a transform feedback varying outside its stage's variables"); return false; }
+      piece.stream = g->stream;
     }
     total += piece.count;
     in_binding += piece.count;
     if (total > kMaxTfComponents || (separate && in_binding > kMaxTfSeparateComponents)) { link_failed(p, "too many transform feedback components"); return false; }
-    if (!piece.skip) p->tf_record_slots += piece.count;
-    if (!p->tf_plan.push_back(piece)) { link_failed(p, "out of memory"); return false; }
+    p->tf_stride[binding] += piece.count * 4;
+    if (!add(piece)) return false;
   }
   return true;
 }
@@ -1108,7 +1171,6 @@ GlContext::TfRecorder::TfRecorder(GlContext& gl, const ProgramObj& p) : gl_(gl),
 void GlContext::TfRecorder::gather(ArrayView<const uint32_t> privates, ArrayView<uint32_t> record) const {
   uint64_t at = 0;
   for (const TfPiece& piece : p_.tf_plan) {
-    if (piece.skip) continue;
     ArrayView<uint32_t> dst;
     ArrayView<const uint32_t> src;
     if (record.try_subview(at, piece.count, &dst) && privates.try_subview(piece.src, piece.count, &src)) dst.copy_from(src);
@@ -1132,41 +1194,44 @@ void GlContext::TfRecorder::record(ArrayView<const uint32_t> rec) {
   ++pending_;
 }
 
-void GlContext::TfRecorder::primitive() {
-  if (QueryObj* q = gl_.query_at(gl_.query_active_[3])) ++q->result;      // GL_PRIMITIVES_GENERATED
+void GlContext::TfRecorder::primitive(uint32_t stream) {
+  stream &= 3;
+  if (QueryObj* q = gl_.query_at(gl_.prim_queries_[0][stream])) ++q->result;      // GL_PRIMITIVES_GENERATED
   const uint32_t n = pending_;
   pending_ = 0;
   if (!capturing_ || n == 0) return;
-  // the bytes of a vertex in each binding, and room for the whole primitive in all of them
-  uint64_t per_vertex[4] = {0, 0, 0, 0};
-  for (const TfPiece& piece : p_.tf_plan) per_vertex[piece.binding & 3] += uint64_t{piece.count} * 4;
-  ByteWriter writers[4];
+  // the bindings this stream's vertices go to, and room for the whole primitive in all of them
+  bool used[4] = {false, false, false, false};
+  for (const TfPiece& piece : p_.tf_plan) if (piece.stream == stream) used[piece.binding & 3] = true;
+  ByteView out[4];
   for (uint32_t b = 0; b < 4; ++b) {
-    if (!per_vertex[b]) continue;
+    if (!used[b]) continue;
     const BufferBinding& bb = gl_.tf_bindings_[b];
     Buffer* buf = gl_.buffer_at(bb.buffer);
     if (!buf) return;
     const ByteView all = buf->data.writable_view();
     uint64_t end = all.size();
     if (bb.size && bb.offset <= end && bb.size < end - bb.offset) end = bb.offset + bb.size;
-    const uint64_t need = per_vertex[b] * n;
+    const uint64_t need = uint64_t{p_.tf_stride[b]} * n;
     if (bb.offset > end || gl_.tf_pos_[b] > end - bb.offset || need > end - bb.offset - gl_.tf_pos_[b]) return;      // (overflow: nothing of it is written)
-    writers[b] = ByteWriter(all.subview(bb.offset + gl_.tf_pos_[b], need));
+    out[b] = all.subview(bb.offset + gl_.tf_pos_[b], need);
   }
   const uint32_t rs = p_.tf_record_slots;
   for (uint32_t v = 0; v < n; ++v) {
     const ArrayView<const uint32_t> rec = static_cast<const List<uint32_t>&>(records_).view().subview(uint64_t{v} * rs, rs);
     uint64_t k = 0;
     for (const TfPiece& piece : p_.tf_plan) {
-      ByteWriter& w = writers[piece.binding & 3];
-      if (piece.skip) { w.reserve(uint64_t{piece.count} * 4); continue; }      // (left as it is)
-      for (uint32_t c = 0; c < piece.count; ++c) w.le32(rec[k++]);
+      const uint64_t at = k;
+      k += piece.count;
+      if (piece.stream != stream) continue;
+      // (the piece's bytes in this vertex: the plan keeps them inside the stride)
+      ByteWriter w(out[piece.binding & 3].subview(uint64_t{v} * p_.tf_stride[piece.binding & 3] + piece.offset, uint64_t{piece.count} * 4));
+      for (uint32_t c = 0; c < piece.count; ++c) w.le32(rec[at + c]);
     }
   }
-  for (uint32_t b = 0; b < 4; ++b) gl_.tf_pos_[b] += per_vertex[b] * n;
-  QueryObj* written = gl_.query_at(gl_.query_active_[2]);
-  if (written && written->target == 0x8C88) ++written->result;      // GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN
-  gl_.current_tf()->vertices += n;
+  for (uint32_t b = 0; b < 4; ++b) if (used[b]) gl_.tf_pos_[b] += uint64_t{p_.tf_stride[b]} * n;
+  if (QueryObj* q = gl_.query_at(gl_.prim_queries_[1][stream])) ++q->result;      // GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN
+  gl_.current_tf()->vertices[stream] += n;
 }
 
 }  // namespace webgl

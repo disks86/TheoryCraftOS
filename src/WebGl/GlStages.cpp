@@ -123,6 +123,7 @@ void StagePipeline::to_vertex(const uint32_t* privates, gpu::RVertex* out) const
     for (uint32_t k = 0; k < l.count; ++k)
       if (l.vs_slot + k < n && l.var_offset + k < gpu::kMaxVarying) out->var[l.var_offset + k] = clamp_varying(l, desktop_.clamp_vertex_color, u2f(privates[l.vs_slot + k]));
   p_.fill_clip_distances(privates, n, desktop_.clip_planes, out->var);
+  p_.fill_back_colors(privates, n, desktop_.clamp_vertex_color, out->var);
 }
 
 bool StagePipeline::gather(const ExtraStage& stage, const uint32_t* privates, uint32_t* record) const {
@@ -158,16 +159,29 @@ bool StagePipeline::geometry(ArrayView<const uint32_t* const> records, uint32_t 
   for (uint32_t inv = 0; inv < m.gs_invocations; ++inv) {
     strip_count_ = 0;
     emitted_ = 0;
+    for (uint32_t& e : stream_emitted_) e = 0;
     if (!run_one(*st.machines[0], gs_.snapshot, gs_.invocation_slot, inv)) return false;
   }
   return true;
 }
 
 bool StagePipeline::emit_vertex(uint32_t stream) {
-  if (stream != 0 || emitted_ >= max_vertices_) return true;      // (only stream 0 is rasterized; vertices past max_vertices are dropped)
+  const uint32_t* privates = gs_.stage->machines[0]->private_region();
+  if (stream != 0) {      // (another stream: not rasterized; a point for transform feedback and the stream's queries)
+    if (stream >= 4 || stream_emitted_[stream] >= max_vertices_) return true;
+    ++stream_emitted_[stream];
+    const uint32_t rs = tf_.record_slots();
+    if (tf_.capturing() && !strip_tf_.empty()) {
+      const ArrayView<uint32_t> scratch = strip_tf_.view().subview(uint64_t{2} * rs, rs);
+      tf_.gather(ArrayView<const uint32_t>(privates, last_.private_slots), scratch);
+      tf_.record(scratch);
+    }
+    tf_.primitive(stream);
+    return true;
+  }
+  if (emitted_ >= max_vertices_) return true;      // (vertices past max_vertices are dropped)
   ++emitted_;
   gpu::RVertex v;
-  const uint32_t* privates = gs_.stage->machines[0]->private_region();
   to_vertex(privates, &v);
   // (transform feedback: the vertices of each primitive, in the order they are rasterized)
   // (transform feedback: the vertices of each primitive, in the order they are rasterized; records 0 and 1 the strip's, 2 the new vertex's)

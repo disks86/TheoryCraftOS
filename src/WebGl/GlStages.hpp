@@ -88,6 +88,7 @@ class StagePipeline final : public shader::IStreamHost {
   gpu::RVertex strip_[2];
   List<uint32_t> strip_tf_;      // the two strip vertices' records, then the new vertex's (TfRecorder::record_slots() slots each)
   uint32_t strip_count_ = 0, emitted_ = 0, max_vertices_ = 0, output_ = 0, gs_primitives_ = 0;
+  uint32_t stream_emitted_[4] = {0, 0, 0, 0};      // (vertices of the other streams; max_vertices holds for each)
   // the evaluation stage's vertices of a patch (records, when a geometry stage follows; else vertices)
   List<uint32_t> tes_records_;
   List<gpu::RVertex> tes_vertices_;

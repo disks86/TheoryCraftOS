@@ -64,19 +64,23 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
 - Compatibility varyings in those stages: the desktop translation renames `gl_FrontColor`, `gl_TexCoord[]`, ... to the `tcos_*` names the vertex and fragment stages use, and
   the front end gives `gl_in[]`/`gl_out[]` the matching members (only those a shader names). A compatibility program with such a stage and no fragment shader gets the
   fixed-function one. The colours the last stage writes are clamped to [0, 1] while `GL_CLAMP_VERTEX_COLOR` is on (`VaryingLink::clamp`; on the 3D device, a saturating move).
-- Transform feedback captures from the last vertex-processing stage. At link time the varyings become a plan of slot ranges per buffer (`name`, `name[i]`, `Block.member`,
-  `gl_SkipComponents1..4`, `gl_NextBuffer`). Each draw has a `GlContext::TfRecorder`: the stage that ends vertex processing hands it each vertex of a primitive, and the
+  Two-sided colour (`GL_VERTEX_PROGRAM_TWO_SIDE`): the back colours travel as extra vertex values past the interpolated ones (`ProgramObj::back_colors`), and a
+  back-facing triangle's vertices take them in place of the front ones before it is rasterized. Fragment shaders are unchanged (such draws stay on the CPU).
+- Transform feedback captures from the last vertex-processing stage. At link time the outputs become a plan: slot ranges, each at a byte offset of its buffer's per-vertex
+  stride, with its vertex stream. The plan comes from the shader's own `xfb_buffer`/`xfb_offset`/`xfb_stride` layouts when it has them, else from the
+  glTransformFeedbackVaryings names (`name`, `name[i]`, `Block.member`, `gl_SkipComponents1..4` leaving a gap, `gl_NextBuffer`). Each draw has a `GlContext::TfRecorder`: the stage that ends vertex processing hands it each vertex of a primitive, and the
   primitive is written whole or, when a buffer has no room, not at all. Strips go out as separate primitives, wound as they are drawn. The recorder also counts
-  `GL_PRIMITIVES_GENERATED` and `GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN`. Transform feedback objects keep their bindings, and they can be paused and drawn from
-  (`glDrawTransformFeedback`, stream 0).
+  `GL_PRIMITIVES_GENERATED` and `GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN`, per stream (`glBeginQueryIndexed`). A geometry shader's `EmitStreamVertex(n)` on streams 1..3
+  makes a point for those buffers and queries only (several streams need `points` output; only stream 0 is rasterized). Transform feedback objects keep their
+  bindings, and they can be paused and drawn from (`glDrawTransformFeedbackStream`). WebGL 2 has the same objects, pause/resume and `getTransformFeedbackVarying`.
 - piglit's `.shader_test` files: `tests/run_host_tests.sh PiglitShaderTest` (pinned piglit, fetched by `tests/fetch_piglit.sh`; tens of minutes), expected failures in
   `tests/data/piglit/shader_test.xfail`.
 
 ## Not done
 
-- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; geometry streams other than 0 (and so their transform feedback and
-  indexed queries), layered rendering (`gl_Layer`), `gl_PrimitiveID` without a geometry stage, a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after
-  `float gl_ClipDistance[2]`), two-sided colour (`gl_BackColor` is passed on but the fragment stage always reads the front one), `xfb_buffer`/`xfb_offset` layouts.
+- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; layered rendering (`gl_Layer`), `gl_PrimitiveID` without a
+  geometry stage, a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after `float gl_ClipDistance[2]`), doubles in transform feedback (8-byte
+  alignment), the program interface queries of `GL_TRANSFORM_FEEDBACK_VARYING`/`_BUFFER`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).

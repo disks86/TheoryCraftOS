@@ -230,11 +230,11 @@ struct ExtraStage {
 };
 enum : uint32_t { kStageGeometry = 0, kStageTessControl = 1, kStageTessEval = 2 };
 
-// What transform feedback captures of each vertex (ProgramObj::tf_plan), piece by piece in the order of glTransformFeedbackVaryings: `count` slots from `src` of the
-// last pre-raster stage's private region, appended to binding `binding`; or (skip, gl_SkipComponentsN) `count` components of the binding passed over, left as they are.
+// What transform feedback captures of each vertex (ProgramObj::tf_plan): `count` slots from `src` of the last pre-raster stage's private region, written at byte `offset`
+// of the vertex's ProgramObj::tf_stride[binding] bytes in binding `binding`, for the vertices of stream `stream`. (The bytes no piece covers, gl_SkipComponentsN or the
+// gaps between xfb_offsets, are left as they are.)
 struct TfPiece {
-  uint32_t src = 0, count = 0, binding = 0;
-  bool skip = false;
+  uint32_t src = 0, count = 0, binding = 0, offset = 0, stream = 0;
 };
 constexpr uint32_t kMaxTfComponents = 128;      // per vertex, every binding together (GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS)
 constexpr uint32_t kMaxTfSeparateComponents = 64;
@@ -260,10 +260,11 @@ struct ProgramObj {
   List<int32_t> block_bindings;        // per block of vs/fs (by index in the merged list)
   List<UniquePointer<String>> tf_varyings;
   uint32_t tf_mode = 0x8C8C;
-  // The linked capture (link_transform_feedback): the pieces, the slots of a vertex's record (the pieces that are not skips, one after another), the primitive the last
-  // stage puts out (0 points, 1 lines, 4 triangles), and of each varying its type and number of elements (glGetTransformFeedbackVarying).
+  // The linked capture (link_transform_feedback): the pieces, the slots of a vertex's record (the pieces one after another), each binding's bytes per vertex, the
+  // primitive the last stage puts out (0 points, 1 lines, 4 triangles), and of each varying its type and number of elements (glGetTransformFeedbackVarying).
   List<TfPiece> tf_plan;
   uint32_t tf_record_slots = 0;
+  uint32_t tf_stride[4] = {0, 0, 0, 0};
   uint32_t tf_primitive = 4;
   struct TfVaryingInfo { uint32_t gl_type, size; };
   TfVaryingInfo tf_info[32] = {};
@@ -296,6 +297,25 @@ struct ProgramObj {
       }
       varyings[static_cast<uint32_t>(clip_varying) + i] = d;
     }
+  }
+  // Two-sided colour (compatibility): the back colours the last stage writes (tcos_BackColor, tcos_BackSecondaryColor), carried as varyings `back` ... past nvar (not
+  // interpolated), and the front ones' varyings `front` the fragment stage reads, which they replace in a back-facing triangle's vertices.
+  struct BackColor { uint32_t src, front, back; bool clamp; };
+  BackColor back_colors[2] = {};
+  uint32_t back_count = 0;
+  void fill_back_colors(const uint32_t* privates, uint32_t private_slots, bool clamping, float* varyings) const {
+    for (uint32_t i = 0; i < back_count && i < 2; ++i)
+      for (uint32_t k = 0; k < 4; ++k) {
+        const uint32_t s = back_colors[i].src + k;
+        float v = s < private_slots ? __builtin_bit_cast(float, privates[s]) : 0.0f;
+        if (clamping && back_colors[i].clamp) v = v >= 1.0f ? 1.0f : (v > 0.0f ? v : 0.0f);
+        varyings[back_colors[i].back + k] = v;
+      }
+  }
+  // A vertex of a back-facing triangle: its back colours in place of the front ones.
+  void use_back_colors(float* varyings) const {
+    for (uint32_t i = 0; i < back_count && i < 2; ++i)
+      for (uint32_t k = 0; k < 4; ++k) varyings[back_colors[i].front + k] = varyings[back_colors[i].back + k];
   }
   bool has_extra() const { return extra[0] || extra[1] || extra[2]; }
   // The stages by number: 0 vertex, 1 fragment, 2 + kStage* the others (null when absent).
@@ -371,7 +391,7 @@ struct TransformFeedbackObj {
   uint64_t positions[4] = {0, 0, 0, 0};   // (while not bound: the bytes captured into each binding so far)
   bool active = false, paused = false;
   uint32_t primitive = 4;                  // glBeginTransformFeedback's mode
-  uint64_t vertices = 0;                   // captured since the last begin (glDrawTransformFeedback draws them)
+  uint64_t vertices[4] = {0, 0, 0, 0};     // captured on each stream since the last begin (glDrawTransformFeedbackStream draws them)
 };
 
 struct TextureUnit {
@@ -437,6 +457,7 @@ struct DesktopState {
   int32_t clip_varying = -1;           // the first of the program's clip distances among the varyings (one scalar per set bit, lowest first)
   bool clip_indexed = false;           // a program's: the distance of plane i is varying clip_varying + i (not packed by set bit)
   float clip_planes[8][4] = {};        // the planes in eye space (glClipPlane), for a program's gl_ClipVertex
+  bool two_side_color = false;         // a program's back colours (ProgramObj::back_colors) replace the front ones of back-facing triangles
   bool clamp_vertex_color = true;      // glClampColor(GL_CLAMP_VERTEX_COLOR): the colours a program's last pre-raster stage writes are clamped (VaryingLink::clamp)
   uint8_t color_mask[kMaxDrawBuffers] = {15, 15, 15, 15, 15, 15, 15, 15};
   bool per_buffer_masks = false;
@@ -637,7 +658,7 @@ class GlContext final : public shader::ITextureHost {
   // glGetTransformFeedbackVarying of a linked program; false (and the error set) if there is no such one.
   bool transform_feedback_varying(uint32_t program, uint32_t index, String* name, uint32_t* size, uint32_t* gl_type);
   // glDrawTransformFeedback: the vertices object `id` (0 the default one) captured between its last begin and end; false (and the error set) if it has none to give.
-  bool transform_feedback_vertices(uint32_t id, uint64_t* vertices);
+  bool transform_feedback_vertices(uint32_t id, uint32_t stream, uint64_t* vertices);
 
   // The transform feedback and primitive queries of one draw (GlProgram.cpp). The stage that ends vertex processing hands over each vertex of a primitive (vertex(), or
   // record() with what gather() made of it earlier), then calls primitive(): the primitive is counted (GL_PRIMITIVES_GENERATED) and, while feedback is on, written
@@ -652,7 +673,8 @@ class GlContext final : public shader::ITextureHost {
     void gather(ArrayView<const uint32_t> privates, ArrayView<uint32_t> record) const;
     void vertex(ArrayView<const uint32_t> privates);
     void record(ArrayView<const uint32_t> record);
-    void primitive();
+    // A primitive of stream `stream` (only stream 0 is rasterized; the others are points of the geometry stage).
+    void primitive(uint32_t stream = 0);
 
    private:
     GlContext& gl_;
@@ -681,10 +703,11 @@ class GlContext final : public shader::ITextureHost {
   void finish() {}
 
   // --- queries and sync
-  void begin_query(uint32_t target, uint32_t id);
-  void end_query(uint32_t target);
+  // `index`: the vertex stream of a primitive query (glBeginQueryIndexed); 0 for the others.
+  void begin_query(uint32_t target, uint32_t id, uint32_t index = 0);
+  void end_query(uint32_t target, uint32_t index = 0);
   bool query_result(uint32_t id, uint32_t pname, double* out);
-  uint32_t current_query(uint32_t target) const;
+  uint32_t current_query(uint32_t target, uint32_t index = 0) const;
 
   // --- misc queries
   bool get_integer(uint32_t pname, double* out, uint32_t* count);   // numeric parameters (arrays up to 4)
@@ -805,6 +828,7 @@ class GlContext final : public shader::ITextureHost {
   uint32_t rb_bound_ = 0, read_fb_ = 0, draw_fb_ = 0;
   uint32_t program_ = 0, vao_id_ = 0, tf_bound_ = 0;
   uint32_t query_active_[4] = {0, 0, 0, 0};
+  uint32_t prim_queries_[2][4] = {};      // the GL_PRIMITIVES_GENERATED [0] and GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN [1] query of each vertex stream
 
   // state
   bool blend_ = false, cull_ = false, depth_test_ = false, stencil_test_ = false, scissor_test_ = false, offset_fill_ = false, dither_ = true, rasterizer_discard_ = false;
