@@ -690,12 +690,22 @@ class Parser {
     return g;
   }
   // The members of gl_in[] / gl_out[]: per-vertex arrays named gl_in.gl_Position ..., reached as gl_in[i].gl_Position (a symbol of kind 4).
+  // Whether the shaders name an identifier anywhere.
+  bool mentions(StringView name) const {
+    for (const Token& t : toks_) if (t.kind == Tok::Ident && t.text.equals(name)) return true;
+    return false;
+  }
   void per_vertex_block(const char* instance, GlobalKind kind, uint32_t count, bool shared) {
     const int32_t iface = interfaces_++;
-    const char* const members[] = {"gl_Position", "gl_PointSize", "gl_ClipDistance", "gl_ClipVertex"};
-    const Type types[] = {make_type(Base::Float, 4), make_type(Base::Float), make_type(Base::Float), make_type(Base::Float, 4)};
-    const uint32_t inners[] = {0, 0, 8, 0};      // (gl_ClipDistance: 8 per vertex)
-    for (int i = 0; i < (m_.compatibility ? 4 : 3); ++i) {      // (gl_ClipVertex: the compatibility profile's)
+    // (the compatibility profile adds gl_ClipVertex and the colours, texture coordinates and fog coordinate; the desktop translation names those tcos_*, and only the
+    // ones the shaders name are made, as each is an array of every vertex)
+    const char* const members[] = {"gl_Position", "gl_PointSize", "gl_ClipDistance", "gl_ClipVertex", "tcos_FrontColor", "tcos_BackColor", "tcos_FrontSecondaryColor",
+                                   "tcos_BackSecondaryColor", "tcos_TexCoord", "tcos_FogFragCoord"};
+    const Type f1 = make_type(Base::Float), f4 = make_type(Base::Float, 4);
+    const Type types[] = {f4, f1, f1, f4, f4, f4, f4, f4, f4, f1};
+    const uint32_t inners[] = {0, 0, 8, 0, 0, 0, 0, 0, 8, 0};      // (gl_ClipDistance, gl_TexCoord: 8 per vertex)
+    for (int i = 0; i < (m_.compatibility ? 10 : 3); ++i) {
+      if (i >= 4 && !mentions(StringView(members[i]))) continue;
       String name(a_);
       name.assign(instance);
       name.push_back('.');
@@ -1150,7 +1160,8 @@ class Parser {
     if (q.is_const && !q.uniform) kind = GlobalKind::Const;
     else if (q.uniform) { kind = GlobalKind::Uniform; shared = true; }
     else if (q.attribute) kind = GlobalKind::In;
-    else if (q.varying) kind = stage_ == Stage::Vertex ? GlobalKind::Out : GlobalKind::In;
+    // (`varying` in a geometry or evaluation shader of the compatibility profile: an output, as the stage's vertex goes on to the fragment stage)
+    else if (q.varying) kind = stage_ == Stage::Vertex || stage_ == Stage::Geometry || stage_ == Stage::TessEval ? GlobalKind::Out : GlobalKind::In;
     else if (q.in) kind = GlobalKind::In;
     else if (q.out) kind = GlobalKind::Out;
     // Geometry and tessellation stages: per-vertex inputs (and control outputs) are arrays, one element per vertex; control outputs are shared by the patch's invocations.

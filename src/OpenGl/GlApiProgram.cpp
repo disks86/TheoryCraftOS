@@ -89,7 +89,10 @@ void GlApi::glShaderSource(GLuint shader, GLsizei count, UserPtr string, UserPtr
   const webgl::ShaderObj* so = gl_.shader_at(object);
   String translated(a_);
   uint32_t uses = 0;
-  const DesktopStage stage = !so ? DesktopStage::Other : (so->type == GL_VERTEX_SHADER ? DesktopStage::Vertex : (so->type == GL_FRAGMENT_SHADER ? DesktopStage::Fragment : DesktopStage::Other));
+  DesktopStage stage = DesktopStage::Other;
+  if (so && so->type == GL_VERTEX_SHADER) stage = DesktopStage::Vertex;
+  else if (so && so->type == GL_FRAGMENT_SHADER) stage = DesktopStage::Fragment;
+  else if (so && so->type == GL_TESS_CONTROL_SHADER) stage = DesktopStage::Control;
   if (so && translate_desktop_glsl(whole.view(), stage, &translated, &uses)) gl_.shader_source(object, translated.view());
   else gl_.shader_source(object, whole.view());
 }
@@ -120,9 +123,10 @@ void GlApi::glLinkProgram(GLuint program) {
   // A compatibility program may leave out a stage: the fixed-function one stands in, written at the version of the stage that is there so that the varyings match.
   const webgl::ProgramObj* po = gl_.program(p);
   uint32_t stand_in = 0;
-  // (not with geometry or tessellation stages: those need a vertex shader of the program's own)
+  // (with geometry or tessellation stages only the fragment stage stands in: those stages need a vertex shader of the program's own)
   const bool extra_stages = po && (po->has_stage(GL_GEOMETRY_SHADER) || po->has_stage(GL_TESS_CONTROL_SHADER) || po->has_stage(GL_TESS_EVALUATION_SHADER));
-  if (po && compat() && !extra_stages && po->has_stage(GL_VERTEX_SHADER) != po->has_stage(GL_FRAGMENT_SHADER)) {
+  const bool missing_one = po && po->has_stage(GL_VERTEX_SHADER) != po->has_stage(GL_FRAGMENT_SHADER);
+  if (po && compat() && missing_one && (!extra_stages || !po->has_stage(GL_FRAGMENT_SHADER))) {
     const bool need_vertex = !po->has_stage(GL_VERTEX_SHADER);
     const uint32_t present = po->first_of(need_vertex ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
     const bool modern = gl_.shader_src(present).starts_with("#version 300");
@@ -567,8 +571,84 @@ void GlApi::glTransformFeedbackVaryings(GLuint program, GLsizei count, UserPtr v
   for (uint64_t i = 0; i < names.count(); ++i) views.push_back(names[i].view());
   gl_.transform_feedback_varyings(object, views.view(), bufferMode);
 }
-void GlApi::glBeginTransformFeedback(GLenum primitiveMode) { gl_.program_ = user_program_; gl_.begin_transform_feedback(primitiveMode); }
+void GlApi::glBeginTransformFeedback(GLenum primitiveMode) {
+  if (primitiveMode != GL_POINTS && primitiveMode != GL_LINES && primitiveMode != GL_TRIANGLES) { error(GL_INVALID_ENUM); return; }
+  gl_.program_ = user_program_;
+  gl_.begin_transform_feedback(primitiveMode);
+}
 void GlApi::glEndTransformFeedback() { gl_.end_transform_feedback(); }
+void GlApi::glPauseTransformFeedback() { gl_.pause_transform_feedback(); }
+void GlApi::glResumeTransformFeedback() { gl_.resume_transform_feedback(); }
+void GlApi::glGetTransformFeedbackVarying(GLuint program, GLuint index, GLsizei bufSize, UserPtr length, UserPtr size, UserPtr type, UserPtr name) {
+  const uint32_t object = program_object(program);
+  if (!object) { error(GL_INVALID_VALUE); return; }
+  String text(a_);
+  uint32_t n = 0, t = 0;
+  if (!gl_.transform_feedback_varying(object, index, &text, &n, &t)) return;
+  const int32_t s = static_cast<int32_t>(n);
+  write_values(size, &s, 1);
+  write_values(type, &t, 1);
+  write_string(name, bufSize, length, text.view());
+}
+
+// --- Transform feedback objects (GL 4.0): names here, the objects (their bindings and what they captured) in the context. ------------------------------------------
+
+void GlApi::glGenTransformFeedbacks(GLsizei n, UserPtr ids) {
+  if (n < 0) { error(GL_INVALID_VALUE); return; }
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t name = tf_names_.generate();
+    if (!write_values(ids.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
+  }
+}
+void GlApi::glCreateTransformFeedbacks(GLsizei n, UserPtr ids) {
+  if (n < 0) { error(GL_INVALID_VALUE); return; }
+  for (int32_t i = 0; i < n; ++i) {
+    const uint32_t name = tf_names_.generate();
+    tf_names_.set(name, gl_.create_transform_feedback());
+    if (!write_values(ids.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
+  }
+}
+void GlApi::glDeleteTransformFeedbacks(GLsizei n, UserPtr ids) {
+  if (n < 0) { error(GL_INVALID_VALUE); return; }
+  for (int32_t i = 0; i < n; ++i) {
+    uint32_t name = 0;
+    if (!read_values(ids.plus(uint64_t{static_cast<uint32_t>(i)} * 4), &name, 1)) { error(GL_INVALID_VALUE); return; }
+    if (!name) continue;
+    const uint32_t object = tf_names_.object(name);
+    if (object) {
+      uint64_t unused = 0;
+      if (!gl_.transform_feedback_vertices(object, &unused)) continue;      // (an active one may not be deleted: INVALID_OPERATION)
+      if (gl_.tf_bound_ == object) gl_.bind_transform_feedback(0);      // (the default object's bindings come back)
+      gl_.delete_object('x', object);
+    }
+    tf_names_.erase(name);
+  }
+}
+uint64_t GlApi::glIsTransformFeedback(GLuint id) { return id && tf_names_.object(id) != 0; }
+void GlApi::glBindTransformFeedback(GLenum target, GLuint id) {
+  if (target != GL_TRANSFORM_FEEDBACK) { error(GL_INVALID_ENUM); return; }
+  if (id && !tf_names_.known(id)) { error(GL_INVALID_OPERATION); return; }
+  uint32_t object = id ? tf_names_.object(id) : 0;
+  if (id && !object) {
+    object = gl_.create_transform_feedback();
+    if (!object) return;
+    tf_names_.set(id, object);
+  }
+  gl_.bind_transform_feedback(object);
+}
+void GlApi::draw_transform_feedback(GLenum mode, GLuint id, uint32_t stream, GLsizei instances) {
+  if (stream >= 4) { error(GL_INVALID_VALUE); return; }
+  const uint32_t object = id ? tf_names_.object(id) : 0;
+  if (id && !object) { error(GL_INVALID_VALUE); return; }
+  uint64_t vertices = 0;
+  if (!gl_.transform_feedback_vertices(object, &vertices)) return;
+  if (stream != 0) vertices = 0;      // (only stream 0 is captured)
+  draw_any(mode, 0, static_cast<GLsizei>(vertices > 0x7FFFFFFF ? 0x7FFFFFFF : vertices), 0, UserPtr{}, false, instances, 0, 0);
+}
+void GlApi::glDrawTransformFeedback(GLenum mode, GLuint id) { draw_transform_feedback(mode, id, 0, 1); }
+void GlApi::glDrawTransformFeedbackInstanced(GLenum mode, GLuint id, GLsizei instancecount) { draw_transform_feedback(mode, id, 0, instancecount); }
+void GlApi::glDrawTransformFeedbackStream(GLenum mode, GLuint id, GLuint stream) { draw_transform_feedback(mode, id, stream, 1); }
+void GlApi::glDrawTransformFeedbackStreamInstanced(GLenum mode, GLuint id, GLuint stream, GLsizei instancecount) { draw_transform_feedback(mode, id, stream, instancecount); }
 
 }  // namespace opengl
 

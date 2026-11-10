@@ -61,14 +61,22 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   the rasterizer: the control stage's invocations side by side to each `barrier()` with the patch's outputs in its shared region, the primitive generator of
   `Graphics/Graphics3D/Software/Tessellator.hpp` (the Direct3D 11 reference tessellator, also OpenGL's), then the evaluation and geometry stages. Adjacency primitives draw their
   inner primitive without a geometry stage.
+- Compatibility varyings in those stages: the desktop translation renames `gl_FrontColor`, `gl_TexCoord[]`, ... to the `tcos_*` names the vertex and fragment stages use, and
+  the front end gives `gl_in[]`/`gl_out[]` the matching members (only those a shader names). A compatibility program with such a stage and no fragment shader gets the
+  fixed-function one. The colours the last stage writes are clamped to [0, 1] while `GL_CLAMP_VERTEX_COLOR` is on (`VaryingLink::clamp`; on the 3D device, a saturating move).
+- Transform feedback captures from the last vertex-processing stage. At link time the varyings become a plan of slot ranges per buffer (`name`, `name[i]`, `Block.member`,
+  `gl_SkipComponents1..4`, `gl_NextBuffer`). Each draw has a `GlContext::TfRecorder`: the stage that ends vertex processing hands it each vertex of a primitive, and the
+  primitive is written whole or, when a buffer has no room, not at all. Strips go out as separate primitives, wound as they are drawn. The recorder also counts
+  `GL_PRIMITIVES_GENERATED` and `GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN`. Transform feedback objects keep their bindings, and they can be paused and drawn from
+  (`glDrawTransformFeedback`, stream 0).
 - piglit's `.shader_test` files: `tests/run_host_tests.sh PiglitShaderTest` (pinned piglit, fetched by `tests/fetch_piglit.sh`; tens of minutes), expected failures in
   `tests/data/piglit/shader_test.xfail`.
 
 ## Not done
 
-- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; geometry streams other than 0, transform feedback of the geometry and
-  tessellation stages, layered rendering (`gl_Layer`), the compatibility varyings (`gl_FrontColor`, `gl_TexCoord`) in those stages, `gl_PrimitiveID` without a geometry stage,
-  a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after `float gl_ClipDistance[2]`).
+- GLSL: doubles, compute shaders, subroutines, SSBOs/images, implicit conversions beyond prototypes; geometry streams other than 0 (and so their transform feedback and
+  indexed queries), layered rendering (`gl_Layer`), `gl_PrimitiveID` without a geometry stage, a redeclared built-in array's size (`gl_in[0].gl_ClipDistance.length()` after
+  `float gl_ClipDistance[2]`), two-sided colour (`gl_BackColor` is passed on but the fragment stage always reads the front one), `xfb_buffer`/`xfb_offset` layouts.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
 - Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).

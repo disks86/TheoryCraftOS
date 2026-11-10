@@ -794,7 +794,8 @@ static void test_several_shaders_per_stage() {
 }
 
 // Geometry and tessellation stages.
-static GLuint build_stages(const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs) {
+static GLuint build_stages(const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs, const char* const* captured = nullptr, int ncaptured = 0,
+                           GLenum capture_mode = GL_INTERLEAVED_ATTRIBS) {
   const GLuint p = glCreateProgram();
   const char* const sources[5] = {vs, tcs, tes, gs, fs};
   const GLenum types[5] = {GL_VERTEX_SHADER, GL_TESS_CONTROL_SHADER, GL_TESS_EVALUATION_SHADER, GL_GEOMETRY_SHADER, GL_FRAGMENT_SHADER};
@@ -809,6 +810,7 @@ static GLuint build_stages(const char* vs, const char* tcs, const char* tes, con
     glAttachShader(p, s);
     glDeleteShader(s);
   }
+  if (captured) glTransformFeedbackVaryings(p, ncaptured, captured, capture_mode);
   glLinkProgram(p);
   GLint ok = 0;
   glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -928,6 +930,292 @@ static void test_geometry_and_tessellation() {
   CHECK(build_stages(vs, nullptr, nullptr, "#version 150\nvoid main(){ EmitVertex(); }\n", fs) == 0);
   glDeleteBuffers(1, &vbo);
   glDeleteVertexArrays(1, &vao);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+// The floats a transform feedback buffer holds (and how many of `n` were written: the rest stay at -1).
+static void read_floats(GLuint buffer, float* out, int n) {
+  glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, buffer);
+  glGetBufferSubData(GL_TRANSFORM_FEEDBACK_BUFFER, 0, n * 4, out);
+}
+static void reset_floats(GLuint buffer, int n) {
+  float fill[64];
+  for (int i = 0; i < 64; ++i) fill[i] = -1;
+  glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER, buffer);
+  glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER, n * 4, fill, GL_DYNAMIC_COPY);
+}
+
+// Transform feedback from each stage that may end vertex processing: strips as separate primitives, the geometry and evaluation stages' vertices, the primitive
+// queries, overflow, interleaved specials (gl_SkipComponents, gl_NextBuffer), pause/resume, objects and glDrawTransformFeedback.
+static void test_transform_feedback_stages() {
+  Fixture f;
+  GLuint vao = 0, vbo = 0, tfb[2] = {0, 0}, queries[2] = {0, 0};
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glGenBuffers(1, &vbo);
+  glGenBuffers(2, tfb);
+  glGenQueries(2, queries);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  const float verts[16] = {0, 0, 0, 1, 1, 0, 0, 1, 2, 0, 0, 1, 3, 0, 0, 1};      // x = the vertex's number
+  glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+  const char* fs = "#version 150\nout vec4 frag;\nvoid main(){ frag = vec4(1.0); }\n";
+  const auto attrib = [&](GLuint p) {
+    const GLint at = glGetAttribLocation(p, "pos");
+    glEnableVertexAttribArray(static_cast<GLuint>(at));
+    glVertexAttribPointer(static_cast<GLuint>(at), 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+  };
+  float got[64];
+
+  // The vertex stage, a strip of 4: two triangles (0 1 2) (2 1 3); the queries count both.
+  const char* vs = "#version 150\nin vec4 pos;\nout float id;\nvoid main(){ gl_Position = vec4(0.0); id = pos.x; }\n";
+  const char* id_name[] = {"id"};
+  const GLuint v = build_stages(vs, nullptr, nullptr, nullptr, fs, id_name, 1);
+  CHECK(v != 0);
+  attrib(v);
+  glUseProgram(v);
+  reset_floats(tfb[0], 8);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glEnable(GL_RASTERIZER_DISCARD);
+  glBeginQuery(GL_PRIMITIVES_GENERATED, queries[0]);
+  glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, queries[1]);
+  glBeginTransformFeedback(GL_TRIANGLES);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glEndTransformFeedback();
+  glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+  glEndQuery(GL_PRIMITIVES_GENERATED);
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 7);
+  CHECK(got[0] == 0 && got[1] == 1 && got[2] == 2 && got[3] == 2 && got[4] == 1 && got[5] == 3 && got[6] == -1);
+  GLuint count = 0;
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 2);
+  glGetQueryObjectuiv(queries[1], GL_QUERY_RESULT, &count);
+  CHECK(count == 2);
+  // a mode other than glBeginTransformFeedback's
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_TRIANGLES, 0, 3);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glEndTransformFeedback();
+  // overflow: room for one triangle; the second is generated but neither written nor counted as written
+  reset_floats(tfb[0], 4);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBeginQuery(GL_PRIMITIVES_GENERATED, queries[0]);
+  glBeginQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, queries[1]);
+  glBeginTransformFeedback(GL_TRIANGLES);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glEndTransformFeedback();
+  glEndQuery(GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+  glEndQuery(GL_PRIMITIVES_GENERATED);
+  read_floats(tfb[0], got, 4);
+  CHECK(got[0] == 0 && got[1] == 1 && got[2] == 2 && got[3] == -1);
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 2);
+  glGetQueryObjectuiv(queries[1], GL_QUERY_RESULT, &count);
+  CHECK(count == 1);
+  // paused: nothing captured until resumed
+  reset_floats(tfb[0], 8);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_POINTS, 0, 1);
+  glPauseTransformFeedback();
+  GLint flag = 0;
+  glGetIntegerv(GL_TRANSFORM_FEEDBACK_PAUSED, &flag);
+  CHECK(flag == 1);
+  glDrawArrays(GL_POINTS, 1, 1);
+  glResumeTransformFeedback();
+  glDrawArrays(GL_POINTS, 2, 2);
+  glEndTransformFeedback();
+  read_floats(tfb[0], got, 4);
+  CHECK(got[0] == 0 && got[1] == 2 && got[2] == 3 && got[3] == -1);
+  glResumeTransformFeedback();      // (not active)
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glUseProgram(0);
+  glDeleteProgram(v);
+
+  // The geometry stage: each point becomes a strip of 4 (ids 10p + 0..3); the captured triangles are the strip's, wound as drawn.
+  const char* gs = "#version 150\nlayout(points) in;\nlayout(triangle_strip, max_vertices = 4) out;\nin float vid[];\nout float id;\nout vec2 pair;\n"
+                   "void main(){ for (int i = 0; i < 4; ++i) { gl_Position = vec4(0.0); id = vid[0] * 10.0 + float(i); pair = vec2(float(i), -float(i)); EmitVertex(); } }\n";
+  const char* g_names[] = {"id"};
+  const GLuint g = build_stages("#version 150\nin vec4 pos;\nout float vid;\nvoid main(){ gl_Position = vec4(0.0); vid = pos.x; }\n", nullptr, nullptr, gs, fs, g_names, 1);
+  CHECK(g != 0);
+  attrib(g);
+  glUseProgram(g);
+  reset_floats(tfb[0], 16);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBeginQuery(GL_PRIMITIVES_GENERATED, queries[0]);
+  glBeginTransformFeedback(GL_TRIANGLES);
+  glDrawArrays(GL_POINTS, 1, 2);
+  glEndTransformFeedback();
+  glEndQuery(GL_PRIMITIVES_GENERATED);
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 13);
+  CHECK(got[0] == 10 && got[1] == 11 && got[2] == 12 && got[3] == 12 && got[4] == 11 && got[5] == 13);
+  CHECK(got[6] == 20 && got[11] == 23 && got[12] == -1);
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 4);
+  glBeginTransformFeedback(GL_POINTS);      // (the geometry stage puts out triangles)
+  glDrawArrays(GL_POINTS, 0, 1);
+  CHECK(glGetError() == GL_INVALID_OPERATION);
+  glEndTransformFeedback();
+  glUseProgram(0);
+  glDeleteProgram(g);
+
+  // Interleaved specials from the geometry stage: buffer 0 takes id and a skipped component, gl_NextBuffer moves on, buffer 1 takes pair.
+  const char* specials[] = {"id", "gl_SkipComponents1", "gl_NextBuffer", "pair"};
+  const GLuint s = build_stages("#version 150\nin vec4 pos;\nout float vid;\nvoid main(){ gl_Position = vec4(0.0); vid = pos.x; }\n", nullptr, nullptr,
+                                "#version 150\nlayout(points) in;\nlayout(points, max_vertices = 2) out;\nin float vid[];\nout float id;\nout vec2 pair;\n"
+                                "void main(){ for (int i = 0; i < 2; ++i) { id = vid[0] + float(i); pair = vec2(id, -id); EmitVertex(); } }\n",
+                                fs, specials, 4);
+  CHECK(s != 0);
+  GLsizei len = 0, size = 0;
+  GLenum type = 0;
+  char name[32] = {};
+  glGetTransformFeedbackVarying(s, 3, sizeof(name), &len, &size, &type, name);
+  CHECK(type == GL_FLOAT_VEC2 && size == 1 && len == 4 && name[0] == 'p');
+  attrib(s);
+  glUseProgram(s);
+  reset_floats(tfb[0], 8);
+  reset_floats(tfb[1], 8);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 1, tfb[1]);
+  glBeginTransformFeedback(GL_POINTS);
+  glDrawArrays(GL_POINTS, 2, 1);
+  glEndTransformFeedback();
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 5);
+  CHECK(got[0] == 2 && got[1] == -1 && got[2] == 3 && got[3] == -1 && got[4] == -1);      // id, a skipped component, id, skipped
+  read_floats(tfb[1], got, 5);
+  CHECK(got[0] == 2 && got[1] == -2 && got[2] == 3 && got[3] == -3 && got[4] == -1);
+  glUseProgram(0);
+  glDeleteProgram(s);
+  // a name that is not an output fails the link; an array element past the end too
+  const char* bad[] = {"nothing"};
+  CHECK(build_stages(vs, nullptr, nullptr, nullptr, fs, bad, 1) == 0);
+  const char* past[] = {"gl_ClipDistance[9]"};
+  CHECK(build_stages(vs, nullptr, nullptr, nullptr, fs, past, 1) == 0);
+
+  // The evaluation stage: one triangle (levels 1), its points' gl_TessCoord.x; then glDrawTransformFeedback draws what an object captured.
+  const char* tes = "#version 150\n#extension GL_ARB_tessellation_shader : require\nlayout(triangles) in;\nout float u;\nvoid main(){ gl_Position = vec4(0.0); u = gl_TessCoord.x; }\n";
+  const char* u_name[] = {"u"};
+  const GLuint e = build_stages("#version 150\nin vec4 pos;\nvoid main(){ gl_Position = pos; }\n", nullptr, tes, nullptr, fs, u_name, 1);
+  CHECK(e != 0);
+  attrib(e);
+  glUseProgram(e);
+  const float ones[4] = {1, 1, 1, 1};
+  glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, ones);
+  glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, ones);
+  glPatchParameteri(GL_PATCH_VERTICES, 3);
+  GLuint object = 0;
+  glGenTransformFeedbacks(1, &object);
+  glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, object);
+  GLint bound = 0;
+  glGetIntegerv(GL_TRANSFORM_FEEDBACK_BINDING, &bound);
+  CHECK(bound == static_cast<GLint>(object) && glIsTransformFeedback(object));
+  reset_floats(tfb[0], 8);
+  glBindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, tfb[0]);
+  glBeginTransformFeedback(GL_TRIANGLES);
+  glDrawArrays(GL_PATCHES, 0, 3);
+  glEndTransformFeedback();
+  CHECK(glGetError() == GL_NO_ERROR);
+  read_floats(tfb[0], got, 4);
+  float sum = 0;
+  for (int i = 0; i < 3; ++i) sum += got[i];
+  CHECK(sum == 1 && got[3] == -1);      // (the corners: u = 1 at one, 0 at the others)
+  glBindTransformFeedback(GL_TRANSFORM_FEEDBACK, 0);
+  glUseProgram(0);
+  glDeleteProgram(e);
+  // the vertex stage again, drawing the object's 3 captured vertices as points: three primitives generated
+  const GLuint d = build_stages(vs, nullptr, nullptr, nullptr, fs);
+  CHECK(d != 0);
+  attrib(d);
+  glUseProgram(d);
+  glBeginQuery(GL_PRIMITIVES_GENERATED, queries[0]);
+  glDrawTransformFeedback(GL_POINTS, object);
+  glEndQuery(GL_PRIMITIVES_GENERATED);
+  glGetQueryObjectuiv(queries[0], GL_QUERY_RESULT, &count);
+  CHECK(count == 3);
+  CHECK(glGetError() == GL_NO_ERROR);
+  glUseProgram(0);
+  glDeleteProgram(d);
+  glDeleteTransformFeedbacks(1, &object);
+  CHECK(!glIsTransformFeedback(object));
+  glDisable(GL_RASTERIZER_DISCARD);
+  glDeleteQueries(2, queries);
+  glDeleteBuffers(2, tfb);
+  glDeleteBuffers(1, &vbo);
+  glDeleteVertexArrays(1, &vao);
+  CHECK(glGetError() == GL_NO_ERROR);
+}
+
+// The compatibility varyings through the geometry and tessellation stages (gl_in[].gl_FrontColor in, gl_FrontColor and gl_TexCoord[] out), the fixed-function
+// fragment stage standing in after them, and vertex colour clamping (GL_CLAMP_VERTEX_COLOR).
+static void test_compat_stage_varyings() {
+  Fixture f;
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+  glClearColor(0, 0, 0, 1);
+  // vertex colour in, the geometry stage passes it on and adds a texture coordinate the fragment shader reads
+  const char* vs = "#version 150 compatibility\nvoid main(){ gl_Position = gl_Vertex; gl_FrontColor = vec4(0.0, 1.0, 0.0, 1.0); }\n";
+  const char* gs = "#version 150 compatibility\nlayout(triangles) in;\nlayout(triangle_strip, max_vertices = 3) out;\n"
+                   "void main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; gl_FrontColor = gl_in[i].gl_FrontColor; gl_TexCoord[2] = vec4(0.5); EmitVertex(); } }\n";
+  const char* fs = "#version 110\nvoid main(){ gl_FragColor = vec4(gl_TexCoord[2].x, gl_Color.g, 0.0, 1.0); }\n";
+  const GLuint p = build_stages(vs, nullptr, nullptr, gs, fs);
+  CHECK(p != 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(p);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 32), 128, 255, 0));
+  glUseProgram(0);
+  glDeleteProgram(p);
+  // no fragment shader: the fixed-function one shows the evaluation stage's gl_FrontColor
+  const char* tes = "#version 150 compatibility\n#extension GL_ARB_tessellation_shader : require\nlayout(triangles) in;\n"
+                    "void main(){ gl_Position = gl_TessCoord.x * gl_in[0].gl_Position + gl_TessCoord.y * gl_in[1].gl_Position + gl_TessCoord.z * gl_in[2].gl_Position;\n"
+                    " gl_FrontColor = gl_in[0].gl_FrontColor * 0.0 + vec4(0.0, 0.0, 1.0, 1.0); }\n";
+  const GLuint t = build_stages(vs, nullptr, tes, nullptr, nullptr);
+  CHECK(t != 0);
+  const float ones[4] = {1, 1, 1, 1};
+  glPatchParameterfv(GL_PATCH_DEFAULT_OUTER_LEVEL, ones);
+  glPatchParameterfv(GL_PATCH_DEFAULT_INNER_LEVEL, ones);
+  glPatchParameteri(GL_PATCH_VERTICES, 3);
+  GLuint vao = 0, vbo = 0;
+  glGenVertexArrays(1, &vao);
+  glBindVertexArray(vao);
+  glGenBuffers(1, &vbo);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  const float tri[12] = {-1, -1, 0, 1, 1, -1, 0, 1, -1, 1, 0, 1};
+  glBufferData(GL_ARRAY_BUFFER, sizeof(tri), tri, GL_STATIC_DRAW);
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glVertexPointer(4, GL_FLOAT, 0, nullptr);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(t);
+  glDrawArrays(GL_PATCHES, 0, 3);
+  CHECK(glGetError() == GL_NO_ERROR);
+  CHECK(near(pixel(10, 10), 0, 0, 255) && near(pixel(60, 60), 0, 0, 0));
+  glUseProgram(0);
+  glDeleteProgram(t);
+  glDisableClientState(GL_VERTEX_ARRAY);
+  glDeleteBuffers(1, &vbo);
+  glDeleteVertexArrays(1, &vao);
+  // clamping: a colour of 2 is 1 when it reaches the fragment stage, unless turned off
+  const GLuint c = build("#version 110\nvoid main(){ gl_Position = gl_Vertex; gl_FrontColor = vec4(2.0, -1.0, 0.5, 1.0); }\n",
+                         "#version 110\nvoid main(){ gl_FragColor = gl_Color * 0.5 + vec4(0.0, 0.5, 0.0, 0.5); }\n");
+  CHECK(c != 0);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glUseProgram(c);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 32), 128, 128, 64, 2));
+  glClampColor(GL_CLAMP_VERTEX_COLOR, GL_FALSE);
+  GLint clamping = 1;
+  glGetIntegerv(GL_CLAMP_VERTEX_COLOR, &clamping);
+  CHECK(clamping == GL_FALSE);
+  glClear(GL_COLOR_BUFFER_BIT);
+  glRectf(-1, -1, 1, 1);
+  CHECK(near(pixel(32, 32), 255, 0, 64, 2));
+  glClampColor(GL_CLAMP_VERTEX_COLOR, GL_TRUE);
+  glUseProgram(0);
+  glDeleteProgram(c);
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
@@ -1171,6 +1459,8 @@ int main() {
   test_several_shaders_per_stage();
   test_geometry_and_tessellation();
   test_clip_distances();
+  test_transform_feedback_stages();
+  test_compat_stage_varyings();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

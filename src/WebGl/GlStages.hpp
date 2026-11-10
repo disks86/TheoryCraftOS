@@ -41,7 +41,9 @@ class IPrimitiveOut {
 
 class StagePipeline final : public shader::IStreamHost {
  public:
-  StagePipeline(allocators::IAllocator& allocator, ProgramObj& program, const DesktopState& desktop, shader::ITextureHost* textures, IPrimitiveOut& out);
+  // `tf`: the draw's transform feedback, given each vertex of a primitive of the last stage before the primitive goes to `out`.
+  StagePipeline(allocators::IAllocator& allocator, ProgramObj& program, const DesktopState& desktop, shader::ITextureHost* textures, IPrimitiveOut& out,
+                GlContext::TfRecorder& tf);
   StagePipeline(const StagePipeline&) = delete;
   StagePipeline& operator=(const StagePipeline&) = delete;
 
@@ -77,16 +79,19 @@ class StagePipeline final : public shader::IStreamHost {
   const DesktopState& desktop_;
   shader::ITextureHost* textures_;
   IPrimitiveOut& out_;
+  GlContext::TfRecorder& tf_;
   StageRun gs_, tcs_, tes_;
   const shader::Module& last_;
   uint32_t pos_slot_ = 0, size_slot_ = 0;
   bool has_pos_ = false, has_size_ = false;
-  // the geometry stage's output strip
+  // the geometry stage's output strip (and, with transform feedback, what it captures of those vertices)
   gpu::RVertex strip_[2];
+  List<uint32_t> strip_tf_;      // the two strip vertices' records, then the new vertex's (TfRecorder::record_slots() slots each)
   uint32_t strip_count_ = 0, emitted_ = 0, max_vertices_ = 0, output_ = 0, gs_primitives_ = 0;
   // the evaluation stage's vertices of a patch (records, when a geometry stage follows; else vertices)
   List<uint32_t> tes_records_;
   List<gpu::RVertex> tes_vertices_;
+  List<uint32_t> tes_tf_;      // (transform feedback: each vertex's record, TfRecorder::record_slots() slots)
   UniquePointer<graphics::Tessellator> tessellator_;
 };
 

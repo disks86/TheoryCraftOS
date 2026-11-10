@@ -288,6 +288,9 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_SAMPLER_BINDING: return one(group_->samplers.name_of(eu.sampler));
     case GL_CURRENT_PROGRAM: return one(user_program_ ? group_->shaders_and_programs.name_of(user_program_ | kProgramObjectBit) : 0);
     case GL_VERTEX_ARRAY_BINDING: return one(vao_names_.name_of(gl_.vao_id_));
+    case GL_TRANSFORM_FEEDBACK_BINDING: return one(tf_names_.name_of(gl_.tf_bound_));
+    case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.tf_buffer_));
+    case GL_CLAMP_VERTEX_COLOR: return one(gl_.desktop.clamp_vertex_color ? GL_TRUE : GL_FALSE);
     case GL_ARRAY_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.array_buffer_));
     case GL_ELEMENT_ARRAY_BUFFER_BINDING: return one(group_->buffers.name_of(vao->element_buffer));
     case GL_PIXEL_PACK_BUFFER_BINDING: return one(group_->buffers.name_of(gl_.pixel_pack_));

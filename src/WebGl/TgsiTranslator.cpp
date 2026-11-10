@@ -186,8 +186,8 @@ class Gen {
     end_inst();
   }
   void inst_rows(const char* op, uint16_t dst, uint32_t rows, const Oper* s0, const Oper* s1 = nullptr, const Oper* s2 = nullptr) { inst(op, dst, mask_of(rows), s0, s1, s2); }
-  void out_mov(uint32_t out, const char* mask, const Oper& src) {
-    begin_inst("MOV");
+  void out_mov(uint32_t out, const char* mask, const Oper& src, bool saturate = false) {
+    begin_inst(saturate ? "MOV_SAT" : "MOV");
     body.append(" OUT[");
     body.append_uint(out);
     body.append("].");
@@ -1515,7 +1515,7 @@ bool Gen::run() {
         if (g.type.base != Base::Float || g.type.array || g.type.cols != 1 || g.type.rows != link.count || g.flat) return fail("a varying the device cannot take");
         Var v;
         if (!global_var(gi, &v)) return false;
-        out_mov(static_cast<uint32_t>(1 + k), mask_of(link.count), filled('T', v.temp[0], link.count));
+        out_mov(static_cast<uint32_t>(1 + k), mask_of(link.count), filled('T', v.temp[0], link.count), link.saturate);
         found = true;
       }
       if (!found) return fail("a varying the vertex shader does not declare");

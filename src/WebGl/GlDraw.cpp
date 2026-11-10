@@ -514,7 +514,7 @@ static void assemble(uint32_t mode, int32_t count, uint32_t patch_vertices, Vert
 template <class RunVertex, class ShadeVertex, class EmitTriangle, class EmitLine, class Pipe>
 bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count, int32_t instances, int32_t first, const uint8_t* idx, uint32_t index_type, bool indexed,
                                     bool restart_ok, uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line,
-                                    gpu::RasterState& rs, Pipe& pipe) {
+                                    gpu::RasterState& rs, Pipe& pipe, TfRecorder& tf) {
   gpu::IPrimitiveSink* const sink = desktop.primitive_sink;
   // Which input primitives the program takes: patches for tessellation; the geometry stage's input primitive; the evaluation stage's output must be that too.
   const ExtraStage* gs = p.extra[kStageGeometry].get();
@@ -533,15 +533,17 @@ bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count,
     Pipe& pipe;
     EmitTriangle& tri;
     EmitLine& ln;
-    Out(gpu::IPrimitiveSink* s, gpu::RasterState& r, Pipe& pp, EmitTriangle& t, EmitLine& l) : sink(s), rs(r), pipe(pp), tri(t), ln(l) {}
+    TfRecorder& tf;
+    Out(gpu::IPrimitiveSink* s, gpu::RasterState& r, Pipe& pp, EmitTriangle& t, EmitLine& l, TfRecorder& f) : sink(s), rs(r), pipe(pp), tri(t), ln(l), tf(f) {}
     void point(const gpu::RVertex& a) override {
+      tf.primitive();
       if (sink) sink->point(a);
       else gpu::draw_point(rs, a, pipe);
     }
     void line(const gpu::RVertex& a, const gpu::RVertex& b, bool first_of_strip) override { ln(a, b, first_of_strip); }
     void triangle(const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) override { tri(a, b, c); }
-  } out(sink, rs, pipe, emit_triangle, emit_line);
-  StagePipeline stages(a_, p, desktop, this, out);
+  } out(sink, rs, pipe, emit_triangle, emit_line, tf);
+  StagePipeline stages(a_, p, desktop, this, out, tf);
   if (p.has_extra() && !stages.begin()) { set_error(0x505); return false; }
   const uint32_t slots = p.vs_record_slots;
   List<uint32_t> records(a_);
@@ -726,6 +728,13 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   if (!vinitial.reserve(vmod.private_slots)) { set_error(0x505); return false; }
   for (uint32_t i = 0; i < vmod.private_slots; ++i) vinitial.push_back(vm.private_region()[i]);
 
+  // Transform feedback and the primitive queries; with feedback on, the draw's primitives must be what glBeginTransformFeedback said (desktop GL: of the last stage).
+  TfRecorder tf(*this, *p);
+  if (!tf.ok()) { set_error(0x505); return false; }
+  if (tf_active_ && desktop.active) {
+    const uint32_t made = p->tf_primitive != 0xFFFFFFFFu ? p->tf_primitive : (mode == 0 ? 0u : (mode <= 3 || mode == 0xA || mode == 0xB ? 1u : 4u));
+    if (made != current_tf()->primitive) { set_error(INVALID_OPERATION); return false; }
+  }
   // vertex shading
   const int32_t vpos_g = vmod.find_builtin_global(shader::kBvPosition), vps_g = vmod.find_builtin_global(shader::kBvPointSize);
   const int32_t vid_g = vmod.find_builtin_global(shader::kBvVertexIndex), iid_g = vmod.find_builtin_global(shader::kBvInstanceIndex);
@@ -790,9 +799,9 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     for (int i = 0; i < 4; ++i) out->pos[i] = u2f(pr[pos_slot + i]);
     out->point_size = vps_g >= 0 ? u2f(pr[ps_slot]) : 1.0f;
     for (const VaryingLink& l : p->links)
-      for (uint32_t k = 0; k < l.count; ++k) out->var[l.var_offset + k] = u2f(pr[l.vs_slot + k]);
+      for (uint32_t k = 0; k < l.count; ++k) out->var[l.var_offset + k] = clamp_varying(l, desktop.clamp_vertex_color, u2f(pr[l.vs_slot + k]));
     p->fill_clip_distances(pr, vmod.private_slots, desktop.clip_planes, out->var);
-    if (tf_active_) tf_capture(*p, pr);
+    tf.vertex(ArrayView<const uint32_t>(pr, vmod.private_slots));
     slot.key = key;
     slot.v = *out;
     return true;
@@ -806,6 +815,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   uint8_t tri_mask = 7;
   // A triangle by the polygon mode of the side it shows.
   auto emit_triangle = [&](const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) {
+    tf.primitive();
     if (sink) { sink->triangle(a, b, c); return; }
     if (!polygon_modes) { gpu::draw_triangle(rs, a, b, c, pipe); return; }
     const float iwa = a.pos[3] != 0 ? 1 / a.pos[3] : 0, iwb = b.pos[3] != 0 ? 1 / b.pos[3] : 0, iwc = c.pos[3] != 0 ? 1 / c.pos[3] : 0;
@@ -833,6 +843,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     }
   };
   auto emit_line = [&](const gpu::RVertex& a, const gpu::RVertex& b, bool first) {
+    tf.primitive();
     if (sink) { sink->line(a, b, first); return; }
     if (first) stipple_at = 0;
     rs.line_start = stipple_at;
@@ -841,7 +852,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   bool ok = true;
   // Geometry and tessellation stages, adjacency and patches: GlStages.cpp.
   if (p->has_extra() || mode >= 0xA) {
-    ok = draw_through_stages(*p, mode, count, instances, first, idx, index_type, indexed, restart_ok, restart_val, run_vertex, shade_vertex, emit_triangle, emit_line, rs, pipe);
+    ok = draw_through_stages(*p, mode, count, instances, first, idx, index_type, indexed, restart_ok, restart_val, run_vertex, shade_vertex, emit_triangle, emit_line, rs, pipe, tf);
     if (pipe.occlusion) pipe.occlusion->result = pipe.samples ? 1 : pipe.occlusion->result;
     ++version_;
     return ok;
@@ -875,6 +886,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
         for (int32_t i = 0; i < count && ok; ++i) {
           if (index_at(i) < 0) continue;
           if (!get(i, &va)) { ok = false; break; }
+          tf.primitive();
           if (sink) sink->point(va);
           else gpu::draw_point(rs, va, pipe);
         }

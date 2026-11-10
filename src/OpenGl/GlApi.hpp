@@ -256,6 +256,7 @@ class GlApi {
   void finish_draw();
   bool upload_client_arrays(int64_t lowest, int64_t highest, uint32_t instances);
   void draw_any(uint32_t mode, int32_t first, int32_t count, uint32_t type, UserPtr indices, bool indexed, int32_t instances, int32_t base_vertex, uint32_t base_instance);
+  void draw_transform_feedback(uint32_t mode, uint32_t id, uint32_t stream, int32_t instances);
   void client_pointer(uint32_t attr, int32_t size, uint32_t type, bool normalized, int32_t stride, UserPtr pointer, bool integer);
   uint32_t engine_buffer(uint32_t name);      // creates the object of a name the first time
   void client_state(uint32_t array, bool on);

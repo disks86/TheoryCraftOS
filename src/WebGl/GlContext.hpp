@@ -186,7 +186,13 @@ struct VaryingLink {
   uint32_t vs_slot, fs_slot, count;   // private slots
   bool flat;
   uint32_t var_offset;                // position in the interpolated varyings array
+  bool clamp = false;                 // a compatibility colour (gl_FrontColor ...): clamped to [0, 1] per vertex while GL_CLAMP_VERTEX_COLOR is on
 };
+// A vertex's value of a varying as the rasterizer takes it (NaN clamps to 0).
+inline float clamp_varying(const VaryingLink& l, bool clamping, float v) {
+  if (!l.clamp || !clamping) return v;
+  return v >= 1.0f ? 1.0f : (v > 0.0f ? v : 0.0f);
+}
 
 struct AttribInfo {
   explicit AttribInfo(allocators::IAllocator& a) : name(a) {}
@@ -224,9 +230,18 @@ struct ExtraStage {
 };
 enum : uint32_t { kStageGeometry = 0, kStageTessControl = 1, kStageTessEval = 2 };
 
+// What transform feedback captures of each vertex (ProgramObj::tf_plan), piece by piece in the order of glTransformFeedbackVaryings: `count` slots from `src` of the
+// last pre-raster stage's private region, appended to binding `binding`; or (skip, gl_SkipComponentsN) `count` components of the binding passed over, left as they are.
+struct TfPiece {
+  uint32_t src = 0, count = 0, binding = 0;
+  bool skip = false;
+};
+constexpr uint32_t kMaxTfComponents = 128;      // per vertex, every binding together (GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS)
+constexpr uint32_t kMaxTfSeparateComponents = 64;
+
 struct ProgramObj {
   explicit ProgramObj(allocators::IAllocator& a)
-      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), outputs(a), locs(a), vs_record(a) {}
+      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), tf_plan(a), outputs(a), locs(a), vs_record(a) {}
   String log;
   // The attached shaders, in the order attached. WebGL allows one per stage; desktop GL any number, linked together (shader::parse_glsl_units).
   struct Attached { uint32_t id; uint32_t type; };
@@ -245,6 +260,13 @@ struct ProgramObj {
   List<int32_t> block_bindings;        // per block of vs/fs (by index in the merged list)
   List<UniquePointer<String>> tf_varyings;
   uint32_t tf_mode = 0x8C8C;
+  // The linked capture (link_transform_feedback): the pieces, the slots of a vertex's record (the pieces that are not skips, one after another), the primitive the last
+  // stage puts out (0 points, 1 lines, 4 triangles), and of each varying its type and number of elements (glGetTransformFeedbackVarying).
+  List<TfPiece> tf_plan;
+  uint32_t tf_record_slots = 0;
+  uint32_t tf_primitive = 4;
+  struct TfVaryingInfo { uint32_t gl_type, size; };
+  TfVaryingInfo tf_info[32] = {};
   uint32_t nvar = 0;
   struct Output { int32_t location; uint32_t slot; shader::Type type; };
   List<Output> outputs;                // fragment outputs
@@ -346,7 +368,10 @@ struct TransformFeedbackObj {
   uint32_t buffers[4] = {0, 0, 0, 0};
   uint64_t offsets[4] = {0, 0, 0, 0};
   uint64_t sizes[4] = {0, 0, 0, 0};
+  uint64_t positions[4] = {0, 0, 0, 0};   // (while not bound: the bytes captured into each binding so far)
   bool active = false, paused = false;
+  uint32_t primitive = 4;                  // glBeginTransformFeedback's mode
+  uint64_t vertices = 0;                   // captured since the last begin (glDrawTransformFeedback draws them)
 };
 
 struct TextureUnit {
@@ -412,6 +437,7 @@ struct DesktopState {
   int32_t clip_varying = -1;           // the first of the program's clip distances among the varyings (one scalar per set bit, lowest first)
   bool clip_indexed = false;           // a program's: the distance of plane i is varying clip_varying + i (not packed by set bit)
   float clip_planes[8][4] = {};        // the planes in eye space (glClipPlane), for a program's gl_ClipVertex
+  bool clamp_vertex_color = true;      // glClampColor(GL_CLAMP_VERTEX_COLOR): the colours a program's last pre-raster stage writes are clamped (VaryingLink::clamp)
   uint8_t color_mask[kMaxDrawBuffers] = {15, 15, 15, 15, 15, 15, 15, 15};
   bool per_buffer_masks = false;
   // one blend state per draw buffer (glBlendFunci, glEnablei(GL_BLEND, i)) when per_buffer_blend is set
@@ -604,6 +630,37 @@ class GlContext final : public shader::ITextureHost {
   void transform_feedback_varyings(uint32_t program, ArrayView<const StringView> names, uint32_t mode);
   void begin_transform_feedback(uint32_t mode);
   void end_transform_feedback();
+  void pause_transform_feedback();
+  void resume_transform_feedback();
+  // glBindTransformFeedback: the bindings and positions of the object bound before are kept in it, the new one's become the context's.
+  void bind_transform_feedback(uint32_t id);
+  // glGetTransformFeedbackVarying of a linked program; false (and the error set) if there is no such one.
+  bool transform_feedback_varying(uint32_t program, uint32_t index, String* name, uint32_t* size, uint32_t* gl_type);
+  // glDrawTransformFeedback: the vertices object `id` (0 the default one) captured between its last begin and end; false (and the error set) if it has none to give.
+  bool transform_feedback_vertices(uint32_t id, uint64_t* vertices);
+
+  // The transform feedback and primitive queries of one draw (GlProgram.cpp). The stage that ends vertex processing hands over each vertex of a primitive (vertex(), or
+  // record() with what gather() made of it earlier), then calls primitive(): the primitive is counted (GL_PRIMITIVES_GENERATED) and, while feedback is on, written
+  // whole, or not at all when a buffer has no room left for it (and then not counted as written).
+  class TfRecorder {
+   public:
+    TfRecorder(GlContext& gl, const ProgramObj& p);
+    // False if out of memory.
+    bool ok() const { return ok_; }
+    bool capturing() const { return capturing_; }
+    uint32_t record_slots() const { return p_.tf_record_slots; }
+    void gather(ArrayView<const uint32_t> privates, ArrayView<uint32_t> record) const;
+    void vertex(ArrayView<const uint32_t> privates);
+    void record(ArrayView<const uint32_t> record);
+    void primitive();
+
+   private:
+    GlContext& gl_;
+    const ProgramObj& p_;
+    bool capturing_ = false, ok_ = true;
+    uint32_t pending_ = 0;      // vertices of the primitive so far
+    List<uint32_t> records_;    // their records (3 * record_slots())
+  };
 
   // --- vertex arrays
   void enable_vertex_attrib(uint32_t index, bool on);
@@ -701,7 +758,10 @@ class GlContext final : public shader::ITextureHost {
   // run_draw's way through the geometry and tessellation stages (and adjacency primitives without them); the lambdas are run_draw's (GlDraw.cpp).
   template <class RunVertex, class ShadeVertex, class EmitTriangle, class EmitLine, class Pipe>
   bool draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count, int32_t instances, int32_t first, const uint8_t* idx, uint32_t index_type, bool indexed, bool restart_ok,
-                           uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line, gpu::RasterState& rs, Pipe& pipe);
+                           uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line, gpu::RasterState& rs, Pipe& pipe,
+                           TfRecorder& tf);
+  bool link_transform_feedback(ProgramObj* p, const shader::Module& last);
+  TransformFeedbackObj* current_tf() { return tf_bound_ ? tfs_[tf_bound_ - 1].get() : &default_tf_; }
   uint32_t fetch_index(const uint8_t* idx, uint32_t type, uint32_t i) const;
   void mark_dirty(int32_t x, int32_t y);
   Image* default_color() { return dcolor_; }
@@ -775,7 +835,6 @@ class GlContext final : public shader::ITextureHost {
   uint64_t tf_pos_[4] = {0, 0, 0, 0};   // bytes captured so far into each transform feedback binding
   bool tf_capturing() const { return tf_active_; }
   bool tf_active_ = false;
-  void tf_capture(const ProgramObj& p, const uint32_t* priv);
 
   // --- 3D hardware (GlAccel.cpp). Only the default framebuffer is drawn by the accelerator; hw_target_ holds its picture on the device.
   // hw_valid_: the device picture is right, so the next accelerated draw may build on it. hw_ahead_: it is also newer than def_color_, which hw_sync() then updates.
