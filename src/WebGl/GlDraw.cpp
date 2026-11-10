@@ -158,6 +158,11 @@ struct FragmentPipeline final : gpu::IFragmentSink {
   QueryObj* occlusion = nullptr;
   uint64_t samples = 0;
   int32_t alpha_slot = -1;
+  // gl_PrimitiveID without a geometry stage: the number of primitives drawn so far in this instance (divided by DesktopState::primitive_id_divisor, for
+  // quads drawn as two triangles), or the patch number when a tessellation stage made the primitive. Written into the initial private region.
+  int32_t prim_slot = -1;
+  uint32_t prim_count = 0;
+  bool prim_fixed = false;
 
   FragmentPipeline(GlContext& ctx, ProgramObj& prog, GlContext::Target& target, shader::Machine& m, bool derivs)
       : c(ctx), p(prog), t(target), fm(m), mod(m.module()), late(false), deriv(derivs), logx(ctx.a_), logy(ctx.a_), initial(ctx.a_) {
@@ -170,7 +175,28 @@ struct FragmentPipeline final : gpu::IFragmentSink {
     ff_slot = b >= 0 ? static_cast<int32_t>(mod.globals[static_cast<uint64_t>(b)]->slot) : -1;
     pc_slot = d >= 0 ? static_cast<int32_t>(mod.globals[static_cast<uint64_t>(d)]->slot) : -1;
     fd_slot = e >= 0 ? static_cast<int32_t>(mod.globals[static_cast<uint64_t>(e)]->slot) : -1;
+    const int32_t pid = c.desktop.active && !p.extra[kStageGeometry] ? mod.find_global("gl_PrimitiveID") : -1;
+    if (pid >= 0 && mod.globals[static_cast<uint64_t>(pid)]->referenced) prim_slot = static_cast<int32_t>(mod.globals[static_cast<uint64_t>(pid)]->slot);
   }
+
+  void set_primitive_id(uint32_t id) {
+    if (prim_slot >= 0 && static_cast<uint64_t>(prim_slot) < initial.count()) initial[static_cast<uint64_t>(prim_slot)] = id;
+  }
+  // Each primitive the rasterizer gets (or a feedback sink) calls this once, before its fragments.
+  void next_primitive() {
+    if (prim_slot < 0 || prim_fixed) return;
+    const uint32_t d = c.desktop.primitive_id_divisor;
+    set_primitive_id(d ? prim_count / d : 0);
+    ++prim_count;
+  }
+  void reset_primitives() { prim_count = 0; prim_fixed = false; }
+  // A layered framebuffer: the images of the layer the primitive goes to (the geometry stage's gl_Layer; past the last layer, the last).
+  void set_layer(int32_t layer) {
+    if (!t.layered) return;
+    const uint32_t l = layer < 0 ? 0 : (static_cast<uint32_t>(layer) >= t.layers ? t.layers - 1 : static_cast<uint32_t>(layer));
+    if (l != t.current_layer) c.resolve_target(t.fb, true, &t, l);
+  }
+  void patch_primitive(uint32_t id) { prim_fixed = true; set_primitive_id(id); }
 
   // The private region as the initializers of the shader's globals leave it (const globals, `float x = 2.0;` at file scope), restored before each fragment.
   List<uint32_t> initial;
@@ -545,6 +571,8 @@ bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count,
     Out(gpu::IPrimitiveSink* s, gpu::RasterState& r, Pipe& pp, EmitTriangle& t, EmitLine& l, TfRecorder& f) : sink(s), rs(r), pipe(pp), tri(t), ln(l), tf(f) {}
     void point(const gpu::RVertex& a) override {
       tf.primitive();
+      pipe.next_primitive();
+      pipe.set_layer(a.layer);
       if (sink) sink->point(a);
       else gpu::draw_point(rs, a, pipe);
     }
@@ -567,6 +595,7 @@ bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count,
       return rebased < 0 ? 0 : rebased;
     };
     uint32_t primitive_id = 0;
+    pipe.reset_primitives();
     auto primitive = [&](const int32_t* pos, uint32_t n) {
       if (!ok) return;
       if (!p.has_extra()) {      // adjacency without a geometry stage: the primitive inside
@@ -599,6 +628,7 @@ bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count,
             if (r.src + s < src.size() && r.dst + s < slots) rec[r.dst + s] = src[r.src + s];
         recs[k] = rec;
       }
+      if (tes) pipe.patch_primitive(primitive_id);      // (a tessellation stage's primitives: the patch's number)
       if (!stages.primitive(ArrayView<const uint32_t* const>(recs, n < 32 ? n : 32), primitive_id++)) ok = false;
     };
     assemble(mode, count, desktop.patch_vertices, vertex, primitive);
@@ -825,6 +855,8 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   // A triangle by the polygon mode of the side it shows.
   auto emit_triangle = [&](const gpu::RVertex& a0, const gpu::RVertex& b0, const gpu::RVertex& c0) {
     tf.primitive();
+    pipe.next_primitive();
+    pipe.set_layer(a0.layer);
     // two-sided colour: a back-facing triangle's vertices with their back colours
     const bool two_side = desktop.active && desktop.two_side_color && p->back_count;
     const bool swapped = two_side && !triangle_front(rs, a0, b0, c0);
@@ -863,6 +895,8 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   };
   auto emit_line = [&](const gpu::RVertex& a, const gpu::RVertex& b, bool first) {
     tf.primitive();
+    pipe.next_primitive();
+    pipe.set_layer(a.layer);
     if (sink) { sink->line(a, b, first); return; }
     if (first) stipple_at = 0;
     rs.line_start = stipple_at;
@@ -877,6 +911,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     return ok;
   }
   for (int32_t inst = 0; inst < instances && ok; ++inst) {
+    pipe.reset_primitives();
     // the list of vertex indices of this draw (with restart markers)
     auto index_at = [&](int32_t i) -> int64_t {
       if (!indexed) return first + i;
@@ -906,6 +941,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
           if (index_at(i) < 0) continue;
           if (!get(i, &va)) { ok = false; break; }
           tf.primitive();
+          pipe.next_primitive();
           if (sink) sink->point(va);
           else gpu::draw_point(rs, va, pipe);
         }
@@ -1032,6 +1068,10 @@ void GlContext::clear(uint32_t mask) {
     if ((mask & 0x4000) && whole && cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3]) hw_ahead_ = false;
     else hw_sync();
   }
+  // (a layered framebuffer: every layer)
+  const uint32_t layers = t.layered ? t.layers : 1;
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+  if (layer) resolve_target(draw_fb_, true, &t, layer);
   if (mask & 0x4000) {
     for (uint32_t bi = 0; bi < kMaxDrawBuffers; ++bi) {
       Image* im = t.color[bi];
@@ -1080,6 +1120,7 @@ void GlContext::clear(uint32_t mask) {
         write_texel(*t.stencil, static_cast<uint32_t>(x), static_cast<uint32_t>(y), t.depth_layer, raw);
       }
   }
+  }
   if (t.is_default) hw_after_clear(mask, whole);
   ++version_;
 }
@@ -1099,6 +1140,9 @@ void GlContext::clear_buffer(uint32_t buffer, int32_t drawbuffer, const uint32_t
     x1 = (sc_[0] + sc_[2]) * k < x1 ? (sc_[0] + sc_[2]) * k : x1;
     y1 = (sc_[1] + sc_[3]) * k < y1 ? (sc_[1] + sc_[3]) * k : y1;
   }
+  const uint32_t layers = t.layered ? t.layers : 1;
+  for (uint32_t layer = 0; layer < layers; ++layer) {      // (a layered framebuffer: every layer)
+  if (layer) resolve_target(draw_fb_, true, &t, layer);
   if (buffer == 0x1800) {
     if (drawbuffer < 0 || drawbuffer >= static_cast<int32_t>(kMaxDrawBuffers)) { set_error(INVALID_VALUE); return; }
     Image* im = t.color[drawbuffer];
@@ -1136,6 +1180,8 @@ void GlContext::clear_buffer(uint32_t buffer, int32_t drawbuffer, const uint32_t
       }
   } else if (buffer != 0x1800 && buffer != 0x1801 && buffer != 0x1802) {
     set_error(INVALID_ENUM);
+    return;
+  }
   }
   ++version_;
 }

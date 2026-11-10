@@ -151,6 +151,7 @@ struct Attachment {
   uint32_t id = 0;
   uint32_t face_target = 0x0DE1;
   int32_t level = 0, layer = 0;
+  bool layered = false;   // glFramebufferTexture of a 3D, array or cube texture: every layer, the geometry stage's gl_Layer picks one per primitive
 };
 
 struct Framebuffer {
@@ -241,7 +242,7 @@ constexpr uint32_t kMaxTfSeparateComponents = 64;
 
 struct ProgramObj {
   explicit ProgramObj(allocators::IAllocator& a)
-      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), tf_plan(a), outputs(a), locs(a), vs_record(a) {}
+      : log(a), shaders(a), uniforms(a), attribs(a), links(a), vs_shared(a), fs_shared(a), bound_attribs(a), block_bindings(a), tf_varyings(a), tf_plan(a), tf_resources(a), outputs(a), locs(a), vs_record(a) {}
   String log;
   // The attached shaders, in the order attached. WebGL allows one per stage; desktop GL any number, linked together (shader::parse_glsl_units).
   struct Attached { uint32_t id; uint32_t type; };
@@ -266,8 +267,15 @@ struct ProgramObj {
   uint32_t tf_record_slots = 0;
   uint32_t tf_stride[4] = {0, 0, 0, 0};
   uint32_t tf_primitive = 4;
-  struct TfVaryingInfo { uint32_t gl_type, size; };
-  TfVaryingInfo tf_info[32] = {};
+  // The GL_TRANSFORM_FEEDBACK_VARYING resources: the glTransformFeedbackVaryings names (gl_NextBuffer and gl_SkipComponentsN too, with type GL_NONE) or, when the shader
+  // has xfb layouts, the outputs they capture. binding is the buffer binding (-1 for gl_NextBuffer), offset the byte offset in its vertex (-1 for gl_NextBuffer).
+  struct TfResource {
+    explicit TfResource(allocators::IAllocator& a) : name(a) {}
+    String name;
+    uint32_t gl_type = 0, size = 0;
+    int32_t offset = -1, binding = -1;
+  };
+  List<UniquePointer<TfResource>> tf_resources;
   uint32_t nvar = 0;
   struct Output { int32_t location; uint32_t slot; shader::Type type; };
   List<Output> outputs;                // fragment outputs
@@ -466,6 +474,7 @@ struct DesktopState {
   struct BufferBlend { bool enabled = false; uint32_t eq_rgb = 0x8006, eq_a = 0x8006, sr = 1, dr = 0, sa = 1, da = 0; } blend[kMaxDrawBuffers];
   // Where the vertices go instead of the rasterizer: feedback and selection modes (glRenderMode).
   gpu::IPrimitiveSink* primitive_sink = nullptr;
+  uint32_t primitive_id_divisor = 1;   // gl_PrimitiveID without a geometry stage counts this many of the engine's primitives as one (quads: 2; polygons: 0, all one)
   ConstByteView triangle_edges;        // polygons cut into triangles: one byte per triangle, bits 0..2 say which edges are real ones
   uint32_t ff_1d_mask = 0, ff_rect_mask = 0;   // texture units whose sampler2D reaches the unit's 1D (rectangle) texture: fixed-function programs
 };
@@ -645,6 +654,7 @@ class GlContext final : public shader::ITextureHost {
   uint32_t get_uniform_block_index(uint32_t program, StringView name);
   void uniform_block_binding(uint32_t program, uint32_t block, uint32_t binding);
   int32_t get_frag_data_location(uint32_t program, StringView name);
+  void framebuffer_texture_layered(uint32_t target, uint32_t attachment, uint32_t tex, int32_t level);
   uint32_t uniform_block_count(uint32_t program) const;
   bool uniform_block_info(uint32_t program, uint32_t block, uint32_t pname, double* out);
   StringView uniform_block_name(uint32_t program, uint32_t block);
@@ -762,9 +772,13 @@ class GlContext final : public shader::ITextureHost {
     uint32_t depth_layer = 0;
     bool is_default = false;
     bool ok = false;
+    // layered attachments: the framebuffer's fewest layers, and the one the images above are of
+    bool layered = false;
+    uint32_t layers = 1, current_layer = 0, fb = 0;
   };
-  bool resolve_image(const Attachment& at, Image** img, uint32_t* layer);
-  void resolve_target(uint32_t fb, bool draw, Target* t);
+  bool resolve_image(const Attachment& at, Image** img, uint32_t* layer, uint32_t select = 0);
+  static uint32_t attachment_layers(const Attachment& at, const Image& im);
+  void resolve_target(uint32_t fb, bool draw, Target* t, uint32_t select_layer = 0);
   bool framebuffer_complete(uint32_t fb, uint32_t* status);
 
   void link_failed(ProgramObj* p, StringView why);

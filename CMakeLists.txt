@@ -380,6 +380,7 @@ add_executable(BOOTX64
   src/OpenGl/GlApiMisc.cpp
   src/OpenGl/GlApiPixels.cpp
   src/OpenGl/GlApiProgram.cpp
+  src/OpenGl/GlApiResource.cpp
   src/OpenGl/GlApiTexture.cpp
   src/OpenGl/GlService.cpp
   src/OpenGl/GlSurface.cpp

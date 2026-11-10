@@ -82,8 +82,8 @@ class StagePipeline final : public shader::IStreamHost {
   GlContext::TfRecorder& tf_;
   StageRun gs_, tcs_, tes_;
   const shader::Module& last_;
-  uint32_t pos_slot_ = 0, size_slot_ = 0;
-  bool has_pos_ = false, has_size_ = false;
+  uint32_t pos_slot_ = 0, size_slot_ = 0, layer_slot_ = 0;
+  bool has_pos_ = false, has_size_ = false, has_layer_ = false;
   // the geometry stage's output strip (and, with transform feedback, what it captures of those vertices)
   gpu::RVertex strip_[2];
   List<uint32_t> strip_tf_;      // the two strip vertices' records, then the new vertex's (TfRecorder::record_slots() slots each)

@@ -458,9 +458,15 @@ void GlApi::glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint t
   const webgl::Texture* t = texture ? gl_.texture_at(group_->textures.object(texture)) : nullptr;
   attach_texture(target, attachment, t ? t->target : GL_TEXTURE_2D_ARRAY, texture, level, layer);
 }
+// A 3D, array or cube texture is attached whole (layered): the geometry stage's gl_Layer says which layer each primitive draws to.
 void GlApi::glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
   const webgl::Texture* t = texture ? gl_.texture_at(group_->textures.object(texture)) : nullptr;
-  attach_texture(target, attachment, t ? (t->target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X : t->target) : GL_TEXTURE_2D, texture, level, 0);
+  if (t && (t->target == GL_TEXTURE_3D || t->target == GL_TEXTURE_2D_ARRAY || t->target == GL_TEXTURE_CUBE_MAP ||
+            t->target == GL_TEXTURE_CUBE_MAP_ARRAY || t->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)) {
+    gl_.framebuffer_texture_layered(target, attachment, group_->textures.object(texture), level);
+    return;
+  }
+  attach_texture(target, attachment, t ? t->target : GL_TEXTURE_2D, texture, level, 0);
 }
 void GlApi::glGetFramebufferAttachmentParameteriv(GLenum target, GLenum attachment, GLenum pname, UserPtr params) {
   double v = 0;

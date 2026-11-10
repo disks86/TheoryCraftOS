@@ -643,7 +643,7 @@ class Parser {
       add_builtin("gl_FragDepth", f1, GlobalKind::Out, kBvFragDepth);
       add_builtin("gl_FragDepthEXT", f1, GlobalKind::Out, kBvFragDepth);
       if (m_.desktop) {
-        const int32_t g = new_global("gl_PrimitiveID", i1, GlobalKind::Private, false);      // (always 0: primitives are not counted for the fragment stage)
+        const int32_t g = new_global("gl_PrimitiveID", i1, GlobalKind::Private, false);      // (from the geometry stage, else the draw counts primitives: FragmentPipeline)
         if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->is_read_only = true;
         Type clip = f1;
         clip.array = 8;
@@ -1388,6 +1388,8 @@ class Parser {
     uint32_t offset = 0;
     int32_t xfb_next = q.xfb_offset;      // (a block with an xfb_offset: its members one after another from there)
     List<int32_t> members(a_);
+    struct Sized { StringView name; uint32_t length; };
+    List<Sized> sized(a_);                // (a gl_PerVertex redeclaration's array members with their sizes: applied once the instance name is known)
     while (!is("}") && !failed_ && cur().kind != Tok::End) {
       Quals mq;
       parse_quals(&mq);
@@ -1404,6 +1406,10 @@ class Parser {
           if (q.out && (mq.xfb_offset >= 0 || xfb_next >= 0)) {
             const int32_t bg = m_.find_global(name);
             if (bg >= 0 && !set_capture(*m_.globals[static_cast<uint64_t>(bg)], mq, &q, &xfb_next)) return;
+          }
+          if (t.array && t.array != kUnsizedArray) {
+            if (t.array > 8) { err("a built-in array redeclared larger than it is"); return; }
+            if (!sized.push_back(Sized{name, t.array})) { err("out of memory"); return; }
           }
           if (!accept(",")) break;
           continue;
@@ -1448,6 +1454,8 @@ class Parser {
       if (builtin_block) {      // (gl_in[], gl_out[]: the built-in instance stays)
         Type ignored = make_type(Base::Void);
         if (is("[") && !parse_array_suffix(&ignored)) return;
+        if (!apply_declared_lengths(instance, sized.view())) return;
+        sized.clear();
       } else if (is_uniform) {
         m_.blocks[static_cast<uint64_t>(bi)]->instance.assign(instance);
         add_sym(instance, make_type(Base::Void), 2, bi);
@@ -1460,7 +1468,25 @@ class Parser {
         add_sym(instance, make_type(Base::Void), 3, iface);
       }
     }
+    if (builtin_block && !apply_declared_lengths(StringView(), sized.view())) return;
     expect(";");
+  }
+
+  // The sizes a gl_PerVertex redeclaration gives built-in arrays: on the built-in (`gl_ClipDistance`) or the instance's member (`gl_in.gl_ClipDistance`).
+  template <class SizedView>
+  bool apply_declared_lengths(StringView instance, SizedView sized) {
+    String full(a_);
+    for (const auto& sz : sized) {
+      full.clear();
+      if (!instance.empty()) {
+        full.append(instance);
+        full.push_back('.');
+      }
+      full.append(sz.name);
+      const int32_t g = m_.find_global(full.view());
+      if (g >= 0) m_.globals[static_cast<uint64_t>(g)]->declared_length = sz.length;
+    }
+    return true;
   }
 
   // --- functions
@@ -1992,6 +2018,13 @@ class Parser {
         if (name.equals("length") && is("(")) {
           ++pos_;
           if (!expect(")")) return -1;
+          // a redeclared built-in array (alone, or one vertex's of gl_in[]): the size the redeclaration gave
+          const Node& bn = m_.nodes[static_cast<uint64_t>(e)];
+          const Node* gn = bn.kind == NodeKind::Global ? &bn : (bn.kind == NodeKind::Index && (bn.flags & kPartialIndex) ? &m_.nodes[static_cast<uint64_t>(bn.a)] : nullptr);
+          if (gn && gn->kind == NodeKind::Global && m_.globals[static_cast<uint64_t>(gn->ival)]->declared_length) {
+            e = int_node(static_cast<int32_t>(m_.globals[static_cast<uint64_t>(gn->ival)]->declared_length));
+            continue;
+          }
           Node n;
           n.kind = NodeKind::Length;
           n.a = e;

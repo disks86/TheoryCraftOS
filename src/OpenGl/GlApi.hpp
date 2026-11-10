@@ -363,6 +363,17 @@ class GlApi {
     uint32_t block = 0, offset = 0, array_stride = 0, matrix_stride = 0;
   };
   bool block_member(uint32_t object, uint32_t index, BlockMember* out);
+  // GlApiResource.cpp: program interface queries
+  struct Resource {
+    explicit Resource(allocators::IAllocator& a) : name(a) {}
+    String name;
+    uint32_t type = 0, array_size = 0, stages = 0;
+    int32_t location = -1, location_index = -1, offset = -1, block = -1, array_stride = -1, matrix_stride = -1, binding = -1, data_size = 0, buffer_index = -1, stride = 0;
+  };
+  uint32_t resource_count(uint32_t object, uint32_t iface);
+  bool resource_at(uint32_t object, uint32_t iface, uint32_t index, Resource* out);
+  uint32_t block_stages(uint32_t object, uint32_t block);
+  template <class F> void active_variables(uint32_t object, uint32_t iface, uint32_t index, F&& f);
   bool sampler_get(uint32_t sampler, uint32_t pname, double* out, uint32_t* n);
   // A client memory with one word in it, for answering a query through another query's code.
   class ProbeMemory final : public IClientMemory {

@@ -51,6 +51,9 @@ StagePipeline::StagePipeline(allocators::IAllocator& allocator, ProgramObj& prog
   const int32_t pos = last_.find_builtin_global(shader::kBvPosition), size = last_.find_builtin_global(shader::kBvPointSize);
   if (pos >= 0) { has_pos_ = true; pos_slot_ = last_.globals[static_cast<uint64_t>(pos)]->slot; }
   if (size >= 0) { has_size_ = true; size_slot_ = last_.globals[static_cast<uint64_t>(size)]->slot; }
+  // (layered rendering: what the geometry stage writes to gl_Layer)
+  const int32_t layer = gs_.stage ? last_.find_global("gl_Layer") : -1;
+  if (layer >= 0 && last_.globals[static_cast<uint64_t>(layer)]->referenced) { has_layer_ = true; layer_slot_ = last_.globals[static_cast<uint64_t>(layer)]->slot; }
 }
 
 bool StagePipeline::prepare(StageRun& run) {
@@ -119,6 +122,7 @@ void StagePipeline::to_vertex(const uint32_t* privates, gpu::RVertex* out) const
   for (int i = 0; i < 4; ++i) out->pos[i] = has_pos_ && pos_slot_ + i < n ? u2f(privates[pos_slot_ + i]) : (i == 3 ? 1.0f : 0.0f);
   out->point_size = has_size_ && size_slot_ < n ? u2f(privates[size_slot_]) : 1.0f;
   out->edge = true;
+  out->layer = has_layer_ && layer_slot_ < n ? static_cast<int32_t>(privates[layer_slot_]) : 0;
   for (const VaryingLink& l : p_.links)
     for (uint32_t k = 0; k < l.count; ++k)
       if (l.vs_slot + k < n && l.var_offset + k < gpu::kMaxVarying) out->var[l.var_offset + k] = clamp_varying(l, desktop_.clamp_vertex_color, u2f(privates[l.vs_slot + k]));

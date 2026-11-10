@@ -157,6 +157,10 @@ bool GlContext::hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int3
   // (the device's shaders saturate the compatibility colours: with clamping turned off, the CPU draws)
   if (!desktop.clamp_vertex_color) for (const VaryingLink& l : p.links) if (l.clamp) return false;
   if (desktop.two_side_color && p.back_count) return false;      // (two-sided colour: the CPU picks each triangle's side)
+  if (desktop.active) {                                           // (gl_PrimitiveID: counted by the CPU rasterizer)
+    const int32_t pid = p.fsm->find_global("gl_PrimitiveID");
+    if (pid >= 0 && p.fsm->globals[static_cast<uint64_t>(pid)]->referenced) return false;
+  }
   if (stencil_test_ || offset_fill_ || alpha_to_coverage_ || sample_coverage_en_) return false;
   if (!(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return false;
   const bool depth = ddepth_->defined();
