@@ -37,11 +37,27 @@ void append_ms(FixedString<96>& line, uint64_t us) {
 }
 }  // namespace
 
-void CubeView::set_graphics(dxgk::Kernel* kernel, SystemGraphics* graphics) {
+void CubeView::set_graphics(dxgk::Kernel* kernel, SystemGraphics* graphics, opengl::GlService* gl) {
   gui::UiGuard lock(this);
+  active_ = nullptr;
   renderer_.reset();
+  gl_renderer_.reset();
   kernel_ = kernel;
   graphics_ = graphics;
+  gl_ = gl;
+  invalidate();
+}
+
+void CubeView::set_api(CubeApi api) {
+  gui::UiGuard lock(this);
+  if (api == api_) return;
+  api_ = api;
+  // (the other API's renderer lets go of what it holds in the kernel; the next frame opens the new one)
+  active_ = nullptr;
+  renderer_.reset();
+  gl_renderer_.reset();
+  restart_benchmark();
+  second_start_us_ = 0;
   invalidate();
 }
 
@@ -63,17 +79,49 @@ void CubeView::restart_benchmark() {
   bench_frames_ = bench_total_us_ = bench_best_us_ = bench_worst_us_ = 0;
 }
 
-// The renderer for this size on the adapter the check box chooses (the GPU's when there is one and it is asked for, the CPU renderer's otherwise).
+// The OpenGL renderer for this size.
+bool CubeView::ensure_gl_renderer(uint32_t width, uint32_t height) {
+  if (!gl_) return false;
+  if (gl_renderer_ && gl_renderer_->is_open() && gl_renderer_->width() == width && gl_renderer_->height() == height) {
+    active_ = gl_renderer_.get();
+    return true;
+  }
+  if (!gl_renderer_) {
+    gl_renderer_ = UniquePointer<GlCubeRenderer>::make(allocator(), allocator(), *gl_, kGlProcessId);
+    if (!gl_renderer_) return false;
+  }
+  const bool fresh = !gl_renderer_->is_open();
+  if (!gl_renderer_->open(width, height)) {
+    if (gl_renderer_->build_log().size() && !gl_log_shown_) {   // (once: the view tries again every frame)
+      gl_log_shown_ = true;
+      console::debug_puts("3D Test: OpenGL refused the cube's shaders: ");
+      console::debug_puts(gl_renderer_->build_log());
+      console::debug_puts("\n");
+    }
+    return false;
+  }
+  texture_available_ = gl_renderer_->texture_available();
+  share_refused_ = false;
+  active_ = gl_renderer_.get();
+  if (fresh) restart_benchmark();
+  return true;
+}
+
+// The renderer for this size on the adapter the check box chooses (the GPU's when there is one and it is asked for, the CPU renderer's otherwise), for the API chosen.
 bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
+  if (api_ == CubeApi::OpenGL) return ensure_gl_renderer(width, height);
   if (!kernel_) return false;
   // (the display GPU's adapter first: the desktop draws on that device, so the frame can be shown from where it is)
   const graphics::IGraphicsDevice* desktop_device = graphics_ ? &graphics_->device() : nullptr;
   uint32_t adapter = CubeRenderer::find_adapter(*kernel_, use_gpu_, desktop_device);
   if (adapter == dxgk::kInvalidIndex) adapter = CubeRenderer::find_adapter(*kernel_, !use_gpu_, desktop_device);   // (the machine has only the other kind)
   if (adapter == dxgk::kInvalidIndex) return false;
-  if (renderer_ && renderer_->is_open() && renderer_->adapter_index() == adapter && renderer_->width() == width && renderer_->height() == height) return true;
+  if (renderer_ && renderer_->is_open() && renderer_->adapter_index() == adapter && renderer_->width() == width && renderer_->height() == height) {
+    active_ = renderer_.get();
+    return true;
+  }
   if (!renderer_) {
-    renderer_ = UniquePointer<CubeRenderer>::make(allocator(), allocator(), *kernel_, kProcessId);
+    renderer_ = UniquePointer<CubeRenderer>::make(allocator(), allocator(), *kernel_, kProcessId, api_);
     if (!renderer_) return false;
   }
   const bool switched = renderer_->adapter_index() != adapter;
@@ -82,6 +130,7 @@ bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
   if (!renderer_->open(adapter, width, height, chosen && chosen->caps().accelerated)) return false;
   texture_available_ = renderer_->texture_available();
   share_refused_ = false;
+  active_ = renderer_.get();
   if (switched) restart_benchmark();   // (a new size alone keeps the average going: the frames are not the same work, but the check boxes are what the numbers compare)
   return true;
 }
@@ -89,8 +138,8 @@ bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
 void CubeView::paint(gui::Painter& painter) {
   const gui::Rect2D area{0, 0, bounds().width, bounds().height};
   painter.fill(area, kBackground);
-  if (!kernel_) {
-    painter.text_centered(area, "No Direct3D driver.", kRed);
+  if (!api_available(api_)) {
+    painter.text_centered(area, api_ == CubeApi::OpenGL ? "No OpenGL in the kernel." : "No Direct3D driver.", kRed);
     return;
   }
 
@@ -105,31 +154,33 @@ void CubeView::paint(gui::Painter& painter) {
     const float angle = static_cast<float>((frame_start - start_us_) % 6000000) * (kTwoPi / 6000000.0f);   // one turn in 6 seconds
     CubeFrameTimes times;
     // A frame that stays on the GPU is composed from there; if the renderer cannot take it (another device, a CPU renderer) it is read back and drawn from memory as before.
-    const bool shared = renderer_->shareable() && !share_refused_;
-    drawn = renderer_->render(angle, use_texture_, &times, !shared);
+    ICubeRenderer& renderer = *active_;
+    const bool shared = renderer.shareable() && !share_refused_;
+    drawn = renderer.render(angle, use_texture_, &times, !shared);
     if (drawn) {
       const int32_t px = (area.width - static_cast<int32_t>(width)) / 2, py = (area.height - static_cast<int32_t>(height)) / 2;
       bool shown = false;
       if (shared) {
         graphics::IGraphicsDevice* device = nullptr;
         graphics::IImage* image = nullptr;
-        if (renderer_->acquire_target(&device, &image)) {
+        if (renderer.acquire_target(&device, &image)) {
           shown = painter.device_image(*device, *image, {0, 0, width, height}, px, py);
-          renderer_->release_target();
+          renderer.release_target();
         }
         if (!shown) {
           share_refused_ = true;   // (until the renderer is made again)
           const uint64_t start = hardware::uptime_us();
-          drawn = renderer_->fetch_picture();
+          drawn = renderer.fetch_picture();
           times.readback_us = hardware::uptime_us() - start;
         }
       }
-      if (drawn && !shown) painter.image(renderer_->picture(), {0, 0, width, height}, px, py);
+      if (drawn && !shown) painter.image(renderer.picture(), {0, 0, width, height}, px, py);
     }
     if (drawn) {
-      active_accelerated_ = renderer_->caps().accelerated;
-      active_textured_ = renderer_->last_textured();
-      device_name_.assign(renderer_->caps().name);
+      active_accelerated_ = renderer.accelerated();
+      active_textured_ = renderer.last_textured();
+      active_api_ = renderer.api();
+      device_name_.assign(renderer.device_name());
       submit_us_ = times.submit_us;
       readback_us_ = times.readback_us;
       const uint64_t total = times.total_us();
@@ -156,10 +207,12 @@ void CubeView::paint(gui::Painter& painter) {
       report.append(" FPS, avg ");
       report.append_uint(bench_average_us());
       report.append(" us/frame, ");
-      report.append(active_accelerated_ && !failed_ ? "GPU accelerated" : "software");
+      report.append(failed_ ? "FAILED" : active_accelerated_ ? "GPU accelerated" : "software");
       report.append(" (");
       report.append(device_name_.view());
-      report.append(", Direct3D kernel mode)\n");
+      report.append(", ");
+      report.append(cube_api_name(failed_ ? api_ : active_api_));
+      report.append((failed_ ? api_ : active_api_) == CubeApi::OpenGL ? " kernel GL)\n" : " over the kernel-mode driver)\n");
       console::debug_puts(report.view());
     }
   }
@@ -206,14 +259,19 @@ void CubeView::paint(gui::Painter& painter) {
   painter.fill({8, 28, 12, 12}, indicator);
   painter.outline({8, 28, 12, 12}, kWhite);
   FixedString<96> mode;
-  mode.assign(failed_ ? "3D drawing failed" : gpu ? "GPU accelerated" : "Software (CPU)");
+  mode.assign(cube_api_name(api_));
+  mode.append(": ");
+  mode.append(failed_ ? "3D drawing failed" : gpu ? "GPU accelerated" : "Software (CPU)");
   if (!failed_ && device_name_.view().size()) {
     mode.append(" - ");
     mode.append(device_name_.view());
   }
   painter.text(27, 27, mode.view(), kShadow);
   painter.text(26, 26, mode.view(), indicator);
-  if (!gpu_available() && !failed_) {   // say why, so the machine's setup can be fixed
+  if (api_ == CubeApi::OpenGL && !failed_) {
+    painter.text(9, 45, "The kernel's GL draws on the CPU", kShadow);
+    painter.text(8, 44, "The kernel's GL draws on the CPU", kAmber);
+  } else if (!gpu_available() && !failed_) {   // say why, so the machine's setup can be fixed
     FixedString<128> why;
     why.assign("No GPU: ");
     why.append(software_reason());
@@ -226,9 +284,11 @@ void CubeView::paint(gui::Painter& painter) {
 
 // --- The window ------------------------------------------------------------------------------------
 
-Graphics3DTest::Graphics3DTest(allocators::IAllocator& allocator) : Frame(allocator), view_(allocator), bar_(allocator), gpu_box_(allocator), texture_box_(allocator) {
+Graphics3DTest::Graphics3DTest(allocators::IAllocator& allocator)
+    : Frame(allocator), view_(allocator), bar_(allocator), gpu_box_(allocator), texture_box_(allocator), api_bar_(allocator), direct3d_button_(allocator), vulkan_button_(allocator),
+      opengl_button_(allocator) {
   set_title("3D Test");
-  set_bounds({100, 60, 440, 380});
+  set_bounds({100, 60, 440, 406});
   set_padding(gui::Insets::all(4));
   set_minimize_enabled(true);
 
@@ -247,15 +307,44 @@ Graphics3DTest::Graphics3DTest(allocators::IAllocator& allocator) : Frame(alloca
   texture_box_.on_changed({&Graphics3DTest::on_texture_changed, this});
   bar_.add(&texture_box_);
   bar_.add(&gpu_box_);
+  // The API: one row of radio buttons under the check boxes.
+  api_bar_.set_style(gui::PanelStyle::Sunken);
+  api_bar_.set_dock(gui::DockStyle::Bottom);
+  api_bar_.set_size(0, 26);
+  for (uint32_t i = 0; i < kCubeApiCount; ++i) {
+    gui::RadioButton& b = api_button(static_cast<CubeApi>(i));
+    b.set_text(cube_api_name(static_cast<CubeApi>(i)));
+    b.set_group(&api_group_);
+    b.set_dock(gui::DockStyle::Left);
+    b.set_size(110, 0);
+    b.on_changed({&Graphics3DTest::on_api_changed, this});
+    api_bar_.add(&b);
+  }
+  direct3d_button_.set_checked(true);
   view_.set_dock(gui::DockStyle::Fill);
+  add(&api_bar_);
   add(&bar_);
   add(&view_);
 }
 
-void Graphics3DTest::set_graphics(dxgk::Kernel* kernel, SystemGraphics* graphics) {
-  view_.set_graphics(kernel, graphics);
+void Graphics3DTest::set_graphics(dxgk::Kernel* kernel, SystemGraphics* graphics, opengl::GlService* gl) {
+  view_.set_graphics(kernel, graphics, gl);
+  for (uint32_t i = 0; i < kCubeApiCount; ++i) api_button(static_cast<CubeApi>(i)).set_enabled(view_.api_available(static_cast<CubeApi>(i)));
+  update_gpu_box();
+}
+
+void Graphics3DTest::update_gpu_box() {
   gpu_box_.set_enabled(view_.gpu_available());
-  gpu_box_.set_text(view_.gpu_available() ? "Use GPU acceleration" : "Use GPU acceleration (none here)");
+  gpu_box_.set_text(view_.gpu_available() ? "Use GPU acceleration" : view_.api() == CubeApi::OpenGL ? "Use GPU acceleration (not for GL)" : "Use GPU acceleration (none here)");
+}
+
+void Graphics3DTest::on_api_changed(void* self, gui::Control& control) {
+  auto* t = static_cast<Graphics3DTest*>(self);
+  auto& button = static_cast<gui::RadioButton&>(control);
+  if (!button.checked()) return;   // (the button that was unchecked fires too)
+  for (uint32_t i = 0; i < kCubeApiCount; ++i)
+    if (&t->api_button(static_cast<CubeApi>(i)) == &button) t->view_.set_api(static_cast<CubeApi>(i));
+  t->update_gpu_box();
 }
 
 void Graphics3DTest::on_texture_changed(void* self, gui::Control&) {

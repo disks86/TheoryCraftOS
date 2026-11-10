@@ -270,6 +270,20 @@ The vertex shader's positions come with Y down and the hull and domain shaders w
 constant indices; the factors in the `TESSOUTER` / `TESSINNER` outputs), `TESS_EVAL` TGSI (`TES_PRIM_MODE 4`, `TES_SPACING 2`, the values of these properties are numbers), shader types 3 and 4,
 a `BIND_SHADER` of both on every pipeline bind, and `DRAW_VBO` of `PIPE_PRIM_PATCHES` with the two extra words (control points per patch, draw id); the feature is claimed when the host reports GLSL 4.00.
 
+## The 3D Test window
+
+The desktop's 3D Test (Start menu, `src/Desktop/Graphics3DTest.cpp`) draws its spinning cube through any of three APIs, chosen with the radio buttons at the bottom, so
+the kernel side of each can be tried and timed on the machine at hand:
+
+- **Direct3D**: the kernel-mode Direct3D driver with its built-in shaders and the typed calls (`desktop::CubeRenderer`).
+- **Vulkan**: the same driver the way vulkan-1.dll drives it: SPIR-V (`src/Desktop/CubeShaders`, compiled by `scripts/gen-cube-spirv.py`) translated to DXBC by the DLL's
+  own translator (built into the kernel as `src/Desktop/CubeSpirvTranslator.c`), shaders and pipelines made through `Kernel::escape`.
+- **OpenGL**: the kernel's GL (`desktop::GlCubeRenderer`): the GL command stream opengl32.dll writes, run by `opengl::GlService` in a context and window surface of the
+  window's own process, the frame shown with a swap and read with `read_front`. It always draws on the CPU.
+
+`tests/run_host_tests.sh CubeRendererTest` checks that the three give the same picture on the software device. Every few seconds the window writes a `3D Test:` line
+(frames per second, average frame time, the device and the API) to the debug console.
+
 ## Not done
 
 - **The user-mode half and the system-call glue**: no `NtGdiDdDDI*` services in `src/Process/Windows*.cpp` / `win32u`, no d3d9 / dxgi / d3d11 DLLs. `lock()` returns a view of

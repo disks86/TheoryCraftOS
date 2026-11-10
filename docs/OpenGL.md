@@ -47,6 +47,10 @@ What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAG
   Build the program into `build/winetests/opengl32_own.exe` (`x86_64-w64-mingw32-gcc -O1 -o build/winetests/opengl32_own.exe tests/windows/opengltest.c -lopengl32 -lgdi32 -luser32`)
   and run `scripts/winetest.sh opengl32 own opengl` from a short path (a symlink to the checkout, with `build` a symlink to a build directory configured from it).
 
+## The 3D Test window
+
+The desktop's 3D Test can draw its cube through the kernel GL path (the command stream opengl32.dll writes, run by `GlService`), next to Direct3D; see [Direct3DKernelMode.md](Direct3DKernelMode.md#the-3d-test-window).
+
 ## Not done
 
 - The shader front end is still GLSL ES: desktop GLSL goes through a source translation that handles versions, the compatibility built-ins and common keywords but not implicit

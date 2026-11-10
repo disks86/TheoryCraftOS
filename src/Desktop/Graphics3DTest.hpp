@@ -33,10 +33,12 @@
 #include "Allocators/IAllocator.hpp"
 #include "Graphics/GraphicsTypes.hpp"
 #include "Desktop/CubeRenderer.hpp"
+#include "Desktop/GlCubeRenderer.hpp"
 #include "Graphics/SystemGraphics.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/Panel.hpp"
+#include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Utility/FixedString.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -50,16 +52,21 @@ class CubeView : public gui::Control {
 
   explicit CubeView(allocators::IAllocator& allocator) : Control(allocator) {}
 
-  // The kernel-mode Direct3D driver to draw with (nullptr: the view says there is none) and the machine's graphics, which only say why there is no GPU. Both must
-  // outlive the view.
-  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics);
+  // The kernel-mode Direct3D driver to draw with (nullptr: the view says there is none), the machine's graphics, which only say why there is no GPU, and the kernel's
+  // OpenGL (nullptr: none). All must outlive the view.
+  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics, opengl::GlService* gl = nullptr);
+  // The API the cube is drawn through. One that is not there (no Direct3D driver for Direct3D and Vulkan, no GL for OpenGL) makes the view say so.
+  void set_api(CubeApi api);
+  CubeApi api() const { return api_; }
+  bool api_available(CubeApi api) const { return api == CubeApi::OpenGL ? gl_ != nullptr : kernel_ != nullptr; }
   // Whether the cube is drawn on the GPU device (when there is one) or on the CPU one.
   void set_use_gpu(bool use_gpu);
   bool use_gpu() const { return use_gpu_; }
   // Whether the faces show the logo (when the device can sample it) or flat colors.
   void set_use_texture(bool use_texture);
   bool use_texture() const { return use_texture_; }
-  bool gpu_available() const { return kernel_ && CubeRenderer::find_adapter(*kernel_, true) != dxgk::kInvalidIndex; }
+  // (the kernel's GL has no GPU adapter: OpenGL is always drawn on the CPU)
+  bool gpu_available() const { return api_ != CubeApi::OpenGL && kernel_ && CubeRenderer::find_adapter(*kernel_, true) != dxgk::kInvalidIndex; }
 
   // The measurements, for the status line and for tests.
   uint32_t fps() const { return fps_; }
@@ -73,6 +80,8 @@ class CubeView : public gui::Control {
   uint64_t submit_microseconds() const { return submit_us_; }
   uint64_t readback_microseconds() const { return readback_us_; }
   bool accelerated() const { return active_accelerated_; }
+  // The API of the last frame drawn.
+  CubeApi active_api() const { return active_api_; }
   // Whether the last frame was drawn with the logo on the faces.
   bool textured() const { return active_textured_; }
   // Whether the device in use could be given the logo (known once a frame has been drawn).
@@ -87,13 +96,21 @@ class CubeView : public gui::Control {
 
  private:
   bool ensure_renderer(uint32_t width, uint32_t height);
+  bool ensure_gl_renderer(uint32_t width, uint32_t height);
   void restart_benchmark();
 
   static constexpr dxgk::ProcessId kProcessId = 0x3D3D3D3D;   // (the process the 3D test is to the kernel-mode driver)
+  static constexpr uint64_t kGlProcessId = 0x3D3D3D3D;        // (and to the kernel's GL)
 
   graphics::SystemGraphics* graphics_ = nullptr;
   dxgk::Kernel* kernel_ = nullptr;
-  UniquePointer<CubeRenderer> renderer_;
+  opengl::GlService* gl_ = nullptr;
+  CubeApi api_ = CubeApi::Direct3D;
+  CubeApi active_api_ = CubeApi::Direct3D;
+  UniquePointer<CubeRenderer> renderer_;          // Direct3D and Vulkan (on the kernel-mode driver)
+  UniquePointer<GlCubeRenderer> gl_renderer_;     // OpenGL
+  ICubeRenderer* active_ = nullptr;               // the one of the two that draws
+  bool gl_log_shown_ = false;
   bool renderer_accelerated_ = false;
   bool use_gpu_ = true;
   bool use_texture_ = true;
@@ -113,19 +130,25 @@ class Graphics3DTest : public gui::Frame {
  public:
   explicit Graphics3DTest(allocators::IAllocator& allocator);
 
-  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics);
+  void set_graphics(dxgk::Kernel* kernel, graphics::SystemGraphics* graphics, opengl::GlService* gl = nullptr);
   CubeView& view() { return view_; }
   gui::CheckBox& gpu_box() { return gpu_box_; }
   gui::CheckBox& texture_box() { return texture_box_; }
+  gui::RadioButton& api_button(CubeApi api) { return api == CubeApi::Vulkan ? vulkan_button_ : api == CubeApi::OpenGL ? opengl_button_ : direct3d_button_; }
 
  private:
   static void on_gpu_changed(void* self, gui::Control&);
   static void on_texture_changed(void* self, gui::Control&);
+  static void on_api_changed(void* self, gui::Control&);
+  void update_gpu_box();
 
   CubeView view_;
   gui::Panel bar_;
   gui::CheckBox gpu_box_;
   gui::CheckBox texture_box_;
+  gui::RadioGroup api_group_;   // (before its buttons: it must outlive them)
+  gui::Panel api_bar_;
+  gui::RadioButton direct3d_button_, vulkan_button_, opengl_button_;
 };
 
 }  // namespace desktop

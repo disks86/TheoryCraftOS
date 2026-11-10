@@ -16,16 +16,24 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The spinning cube of the 3D test, drawn the way a Direct3D program is: through the kernel-mode Direct3D driver (Kernel/Dxgkrnl) with the same calls a user-mode
+// The spinning cube of the 3D test, drawn the way a Direct3D or a Vulkan program is: through the kernel-mode Direct3D driver (Kernel/Dxgkrnl) with the same calls a user-mode
 // driver makes - open an adapter, create a device and a context, allocations (render target, depth buffer, vertex and index buffers, the logo texture), shaders and
 // pipelines, then a command stream per frame handed to Kernel::render() and the picture read back with Kernel::lock(). So the 3D test exercises (and times) the whole
 // kernel path - validation, residency, scheduling, the device behind the adapter - not just the device.
+//
+// The two APIs differ in how the shaders and pipelines reach the kernel (CubeApi):
+//  - Direct3D: the kernel's built-in shaders, through the typed calls (create_shader / create_pipeline).
+//  - Vulkan: what vulkan-1.dll does - SPIR-V shaders (CubeShaders/*.vert, *.frag) translated to DXBC by the same translator the DLL carries (src/Windows/vulkan-1/spirv.inc),
+//    sent with the private-data escape (Kernel::escape: CreateShader with ShaderKind::Dxbc, CreatePipeline), so the DXBC front end and the escape ABI are exercised too.
+// OpenGL goes to the kernel's GL instead (GlCubeRenderer.hpp); all three draw the same picture.
 //
 // A frame's time is split in two: "submit" is Kernel::render() (the stream is checked, queued and run on the adapter's device, which is done when the call returns) and
 // "readback" is the lock that brings the picture to the CPU plus the copy out of it. Their sum is what CubeView shows as "render".
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Graphics/GraphicsTypes.hpp"
+#include "Graphics/Graphics3D/BuiltinShaders.hpp"
+#include "Graphics/Graphics3D/CubeMesh.hpp"
 #include "Graphics/Graphics3D/IGraphicsDevice.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -38,12 +46,52 @@ struct CubeFrameTimes {
   uint64_t total_us() const { return submit_us + readback_us; }
 };
 
-class CubeRenderer {
- public:
-  static constexpr uint32_t kLogoSize = 256;   // the texture is the logo at this size (its own)
+// The graphics API the cube is drawn through: which part of the kernel is exercised.
+enum class CubeApi : uint32_t { Direct3D, Vulkan, OpenGL };
+constexpr uint32_t kCubeApiCount = 3;
+const char* cube_api_name(CubeApi api);
 
-  // `pid` is the process the kernel knows this renderer as (opened here, closed with the renderer).
-  CubeRenderer(allocators::IAllocator& allocator, dxgk::Kernel& kernel, dxgk::ProcessId pid);
+constexpr uint32_t kCubeLogoSize = 256;   // the texture is the logo at this size (its own)
+constexpr uint32_t kCubeBackground = 0xFF10101A;   // the clear color (B8G8R8A8 word)
+
+// What every renderer of the cube does, whatever API it draws through.
+class ICubeRenderer {
+ public:
+  virtual CubeApi api() const = 0;
+  virtual bool is_open() const = 0;
+  virtual uint32_t width() const = 0;
+  virtual uint32_t height() const = 0;
+  // Whether a GPU draws the picture, and the name of what draws it.
+  virtual bool accelerated() const = 0;
+  virtual const char* device_name() const = 0;
+  // Whether the faces can show the logo (known once open).
+  virtual bool texture_available() const = 0;
+  virtual bool last_textured() const = 0;
+  // Draws one frame at `angle` (radians around the cube's turn) and copies it into picture(). `textured` is honoured when texture_available(). Without `read_back` the frame stays
+  // on the GPU when the renderer can lend it (shareable(); picture() is then the frame before): show it with acquire_target(), or fetch_picture() to have it on the CPU after all.
+  virtual bool render(float angle, bool textured, CubeFrameTimes* times, bool read_back) = 0;
+  virtual bool shareable() const = 0;
+  virtual bool acquire_target(graphics::IGraphicsDevice** device, graphics::IImage** image) = 0;
+  virtual void release_target() = 0;
+  virtual bool fetch_picture() = 0;
+  // The last frame, B8G8R8A8.
+  virtual const graphics::Surface& picture() const = 0;
+
+ protected:
+  ~ICubeRenderer() = default;
+};
+
+// The cube's geometry for both looks (the colored vertices have each face's own color) and the indices both share.
+void build_cube_geometry(ArrayView<graphics::ColoredVertex> colored, ArrayView<graphics::TexturedVertex> textured, ArrayView<uint16_t> indices);
+// The logo at kCubeLogoSize on the clear color, rows top first, 0xAARRGGBB. False if it cannot be decoded.
+bool render_cube_logo(allocators::IAllocator& allocator, ArrayView<uint32_t> texels);
+
+class CubeRenderer final : public ICubeRenderer {
+ public:
+  static constexpr uint32_t kLogoSize = kCubeLogoSize;
+
+  // `pid` is the process the kernel knows this renderer as (opened here, closed with the renderer). `api` is Direct3D or Vulkan (OpenGL has its own renderer).
+  CubeRenderer(allocators::IAllocator& allocator, dxgk::Kernel& kernel, dxgk::ProcessId pid, CubeApi api = CubeApi::Direct3D);
   ~CubeRenderer();
   CubeRenderer(const CubeRenderer&) = delete;
   CubeRenderer& operator=(const CubeRenderer&) = delete;
@@ -60,31 +108,33 @@ class CubeRenderer {
   // `shareable`: the color target can also be sampled, so that a renderer on the same device can show it in place (acquire_target) and the frame need not be read back.
   bool open(uint32_t adapter_index, uint32_t width, uint32_t height, bool shareable = false);
   void close();
-  bool is_open() const { return static_cast<bool>(state_); }
+  CubeApi api() const override { return api_; }
+  bool is_open() const override { return static_cast<bool>(state_); }
   uint32_t adapter_index() const { return adapter_index_; }
-  uint32_t width() const { return width_; }
-  uint32_t height() const { return height_; }
+  uint32_t width() const override { return width_; }
+  uint32_t height() const override { return height_; }
   const dxgk::AdapterCaps& caps() const { return caps_; }
-  // Whether the faces can show the logo (known once open).
-  bool texture_available() const { return texture_available_; }
+  bool accelerated() const override { return caps_.accelerated; }
+  const char* device_name() const override { return caps_.name; }
+  bool texture_available() const override { return texture_available_; }
 
-  // Draws one frame at `angle` (radians around the cube's turn) and copies it into picture(). `textured` is honoured when texture_available(). Without `read_back` the frame stays on
-  // the GPU (picture() is then the frame before): show it with acquire_target(), or fetch_picture() to have it on the CPU after all.
-  bool render(float angle, bool textured, CubeFrameTimes* times, bool read_back = true);
+  bool render(float angle, bool textured, CubeFrameTimes* times, bool read_back) override;
+  bool render(float angle, bool textured, CubeFrameTimes* times) { return render(angle, textured, times, true); }
   // Whether the color target can be lent to a renderer on the adapter's device.
-  bool shareable() const { return shareable_; }
+  bool shareable() const override { return shareable_; }
   // Lends the device and its image of the last frame's color target; release_target() when done with it (the next render() needs it back).
-  bool acquire_target(graphics::IGraphicsDevice** device, graphics::IImage** image);
-  void release_target();
+  bool acquire_target(graphics::IGraphicsDevice** device, graphics::IImage** image) override;
+  void release_target() override;
   // The last frame, read back into picture() now (what render() does unless told not to).
-  bool fetch_picture() { return state_ && read_back(); }
-  // The last frame, B8G8R8A8.
-  const graphics::Surface& picture() const { return picture_; }
-  bool last_textured() const { return last_textured_; }
+  bool fetch_picture() override { return state_ && read_back(); }
+  const graphics::Surface& picture() const override { return picture_; }
+  bool last_textured() const override { return last_textured_; }
 
  private:
   struct State;
   bool create_pipeline(bool textured, dxgk::Handle* pipeline);
+  bool create_spirv_pipeline(bool textured, dxgk::Handle* pipeline);
+  bool escape_create_shader(ConstByteView dxbc, dxgk::Handle* shader);
   bool create_buffer(uint32_t flags, uint64_t size, dxgk::Handle* out);
   bool write(dxgk::Handle allocation, ConstByteView bytes);
   bool create_geometry();
@@ -94,6 +144,7 @@ class CubeRenderer {
   allocators::IAllocator& allocator_;
   dxgk::Kernel& kernel_;
   dxgk::ProcessId pid_;
+  CubeApi api_;
   bool process_open_ = false;
   UniquePointer<State> state_;
   uint32_t adapter_index_ = dxgk::kInvalidIndex;
