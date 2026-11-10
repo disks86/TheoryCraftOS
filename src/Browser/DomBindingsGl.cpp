@@ -139,7 +139,8 @@ Value make_number_array(Vm& vm, const double* values, uint32_t n) {
   X(getActiveUniformBlockName) X(getActiveUniformBlockParameter) X(uniformBlockBinding) X(getFragDataLocation) X(getAttachedShaders)                         \
   X(transformFeedbackVaryings) X(enableVertexAttribArray) X(disableVertexAttribArray) X(vertexAttribPointer) X(vertexAttribDivisor) X(vertexAttrib)        \
   X(getVertexAttrib) X(bindVertexArray) X(clear) X(clearBuffer) X(clearBufferfi) X(drawArrays) X(drawElements) X(drawRangeElements) X(readPixels)          \
-  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes) X(beginTransformFeedback) X(endTransformFeedback) X(compressedTexImage) X(compressedTexSubImage)
+  X(beginQuery) X(endQuery) X(getQueryParameter) X(getQuery) X(currentProgram) X(boundObject) X(lose) X(restore) X(attributes) X(beginTransformFeedback) X(endTransformFeedback) X(compressedTexImage) X(compressedTexSubImage) \
+  X(bindTransformFeedback) X(pauseTransformFeedback) X(resumeTransformFeedback) X(getTransformFeedbackVarying)
 
 enum Op : uint32_t {
 #define X(name) op_##name,
@@ -666,6 +667,20 @@ NATIVE(gl_call) {
     }
     case op_beginTransformFeedback: gl.begin_transform_feedback(a.u32(0)); break;
     case op_endTransformFeedback: gl.end_transform_feedback(); break;
+    case op_bindTransformFeedback: gl.bind_transform_feedback(a.u32(0)); break;
+    case op_pauseTransformFeedback: gl.pause_transform_feedback(); break;
+    case op_resumeTransformFeedback: gl.resume_transform_feedback(); break;
+    case op_getTransformFeedbackVarying: {      // (program, index): [name, size, type], as getActiveAttrib
+      String name(vm.allocator());
+      uint32_t size = 0, type = 0;
+      if (!gl.transform_feedback_varying(a.u32(0), a.u32(1), &name, &size, &type)) break;
+      JsObject* arr = vm.new_array(3);
+      vm.array_push(arr, str_value(vm, name.view()));
+      vm.array_push(arr, num_value(size));
+      vm.array_push(arr, num_value(type));
+      *result = Value::make_object(arr);
+      break;
+    }
     case op_lose: gl.lose(); break;
     case op_restore: gl.restore(); break;
     case op_attributes: {

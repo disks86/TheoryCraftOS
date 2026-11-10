@@ -511,6 +511,14 @@ static void assemble(uint32_t mode, int32_t count, uint32_t patch_vertices, Vert
   }
 }
 
+// Whether a triangle faces the viewer, as the polygon modes and two-sided colour decide it (window-space winding against glFrontFace).
+static bool triangle_front(const gpu::RasterState& rs, const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) {
+  const float iwa = a.pos[3] != 0 ? 1 / a.pos[3] : 0, iwb = b.pos[3] != 0 ? 1 / b.pos[3] : 0, iwc = c.pos[3] != 0 ? 1 / c.pos[3] : 0;
+  const float ax = a.pos[0] * iwa * rs.vp_w, ay = a.pos[1] * iwa * rs.vp_h, bx = b.pos[0] * iwb * rs.vp_w, by = b.pos[1] * iwb * rs.vp_h, cx = c.pos[0] * iwc * rs.vp_w, cy = c.pos[1] * iwc * rs.vp_h;
+  const float area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+  return rs.front_ccw ? area > 0 : area < 0;
+}
+
 template <class RunVertex, class ShadeVertex, class EmitTriangle, class EmitLine, class Pipe>
 bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count, int32_t instances, int32_t first, const uint8_t* idx, uint32_t index_type, bool indexed,
                                     bool restart_ok, uint32_t restart_val, RunVertex& run_vertex, ShadeVertex& shade_vertex, EmitTriangle& emit_triangle, EmitLine& emit_line,
@@ -801,6 +809,7 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
     for (const VaryingLink& l : p->links)
       for (uint32_t k = 0; k < l.count; ++k) out->var[l.var_offset + k] = clamp_varying(l, desktop.clamp_vertex_color, u2f(pr[l.vs_slot + k]));
     p->fill_clip_distances(pr, vmod.private_slots, desktop.clip_planes, out->var);
+    p->fill_back_colors(pr, vmod.private_slots, desktop.clamp_vertex_color, out->var);
     tf.vertex(ArrayView<const uint32_t>(pr, vmod.private_slots));
     slot.key = key;
     slot.v = *out;
@@ -814,14 +823,24 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   float stipple_at = 0;
   uint8_t tri_mask = 7;
   // A triangle by the polygon mode of the side it shows.
-  auto emit_triangle = [&](const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) {
+  auto emit_triangle = [&](const gpu::RVertex& a0, const gpu::RVertex& b0, const gpu::RVertex& c0) {
     tf.primitive();
+    // two-sided colour: a back-facing triangle's vertices with their back colours
+    const bool two_side = desktop.active && desktop.two_side_color && p->back_count;
+    const bool swapped = two_side && !triangle_front(rs, a0, b0, c0);
+    gpu::RVertex sides[3];
+    if (swapped) {
+      sides[0] = a0;
+      sides[1] = b0;
+      sides[2] = c0;
+      for (gpu::RVertex& v : sides) p->use_back_colors(v.var);
+    }
+    const gpu::RVertex& a = swapped ? sides[0] : a0;
+    const gpu::RVertex& b = swapped ? sides[1] : b0;
+    const gpu::RVertex& c = swapped ? sides[2] : c0;
     if (sink) { sink->triangle(a, b, c); return; }
     if (!polygon_modes) { gpu::draw_triangle(rs, a, b, c, pipe); return; }
-    const float iwa = a.pos[3] != 0 ? 1 / a.pos[3] : 0, iwb = b.pos[3] != 0 ? 1 / b.pos[3] : 0, iwc = c.pos[3] != 0 ? 1 / c.pos[3] : 0;
-    const float ax = a.pos[0] * iwa * rs.vp_w, ay = a.pos[1] * iwa * rs.vp_h, bx = b.pos[0] * iwb * rs.vp_w, by = b.pos[1] * iwb * rs.vp_h, cx = c.pos[0] * iwc * rs.vp_w, cy = c.pos[1] * iwc * rs.vp_h;
-    const float area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
-    const bool front = rs.front_ccw ? area > 0 : area < 0;
+    const bool front = triangle_front(rs, a, b, c);
     if ((rs.cull & 1) && front) return;
     if ((rs.cull & 2) && !front) return;
     const uint32_t pm = front ? desktop.polygon_mode_front : desktop.polygon_mode_back;

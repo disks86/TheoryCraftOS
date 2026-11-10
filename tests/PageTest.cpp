@@ -1513,6 +1513,17 @@ static void test_webgl() {
                   "var ub = gl.createBuffer(); gl.bindBuffer(gl.UNIFORM_BUFFER, ub); gl.bufferData(gl.UNIFORM_BUFFER, new Float32Array([0.25, 0.5, 0.125, 1, 0.4, 0, 0, 0]), gl.STATIC_DRAW); var bi = gl.getUniformBlockIndex(p, 'Block'); gl.uniformBlockBinding(p, bi, 2); gl.bindBufferBase(gl.UNIFORM_BUFFER, 2, ub); "
                   "gl.drawArraysInstanced(gl.TRIANGLES, 0, 3, 2); var px = new Uint8Array(4); gl.readPixels(16, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); var qx = new Uint8Array(4); gl.readPixels(48, 32, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, qx); console.log(bi, px.join(','), qx.join(','), gl.getError());") ==
         "true  | 0 64,128,32,255 128,255,64,255 0");
+  // WebGL 2 transform feedback: a varying's info, an object bound with its buffer, pause/resume (the paused point is not captured)
+  CHECK(gl_script("var gl = c.getContext('webgl2'); function sh(t, s) { var o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); return o; } "
+                  "var p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, '#version 300 es\\nlayout(location=0) in float x; out vec2 v; void main() { v = vec2(x, x * 10.0); gl_Position = vec4(0.0); }')); "
+                  "gl.attachShader(p, sh(gl.FRAGMENT_SHADER, '#version 300 es\\nprecision highp float; out vec4 o; void main() { o = vec4(1.0); }')); gl.transformFeedbackVaryings(p, ['v'], gl.INTERLEAVED_ATTRIBS); gl.linkProgram(p); "
+                  "var info = gl.getTransformFeedbackVarying(p, 0); gl.useProgram(p); var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([1, 2, 3]), gl.STATIC_DRAW); "
+                  "gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 1, gl.FLOAT, false, 0, 0); var tf = gl.createTransformFeedback(); gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, tf); "
+                  "var out = gl.createBuffer(); gl.bindBuffer(gl.TRANSFORM_FEEDBACK_BUFFER, out); gl.bufferData(gl.TRANSFORM_FEEDBACK_BUFFER, 32, gl.DYNAMIC_COPY); gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, out); "
+                  "gl.enable(gl.RASTERIZER_DISCARD); gl.beginTransformFeedback(gl.POINTS); gl.drawArrays(gl.POINTS, 0, 1); gl.pauseTransformFeedback(); gl.drawArrays(gl.POINTS, 1, 1); gl.resumeTransformFeedback(); gl.drawArrays(gl.POINTS, 2, 1); gl.endTransformFeedback(); "
+                  "gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null); var r = new Float32Array(6); gl.getBufferSubData(gl.TRANSFORM_FEEDBACK_BUFFER, 0, r); "
+                  "console.log(info.name, info.size, info.type === gl.FLOAT_VEC2, Array.prototype.join.call(r, ','), gl.getError());") ==
+        "v 1 true 1,10,3,30,0,0 0");
   // lost contexts
   CHECK(gl_script((head + "var e = gl.getExtension('WEBGL_lose_context'); var lostEvents = 0; c.addEventListener('webglcontextlost', function (ev) { lostEvents++; ev.preventDefault(); }); e.loseContext(); console.log(gl.isContextLost(), gl.getError(), gl.createBuffer(), lostEvents, gl.getExtension('OES_vertex_array_object') === null);").c_str()) ==
         "true 0 null 1 true");

@@ -649,13 +649,13 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
   m2('createTransformFeedback', function () { var h = call(this.__id, OP.create, 120); return h ? newObj(Classes.TransformFeedback, this, h, 'TransformFeedback') : null; });
   m2('deleteTransformFeedback', function (o) { if (o && !o.__deleted) { call(this.__id, OP.destroy, 120, o.__h); o.__deleted = true; } });
   m2('isTransformFeedback', function (o) { return !!o && o instanceof Classes.TransformFeedback && !o.__deleted; });
-  m2('bindTransformFeedback', function () {});
+  m2('bindTransformFeedback', function (t, o) { CALL(this, 'bindTransformFeedback', handleOf(o)); });
   m2('beginTransformFeedback', function (mode) { CALL(this, 'beginTransformFeedback', mode); });
   m2('endTransformFeedback', function () { CALL(this, 'endTransformFeedback'); });
-  m2('pauseTransformFeedback', function () {});
-  m2('resumeTransformFeedback', function () {});
+  m2('pauseTransformFeedback', function () { CALL(this, 'pauseTransformFeedback'); });
+  m2('resumeTransformFeedback', function () { CALL(this, 'resumeTransformFeedback'); });
   m2('transformFeedbackVaryings', function (p, names, mode) { CALL(this, 'transformFeedbackVaryings', handleOf(p), Array.prototype.slice.call(names), mode); });
-  m2('getTransformFeedbackVarying', function () { return null; });
+  m2('getTransformFeedbackVarying', function (p, i) { return activeInfo(CALL(this, 'getTransformFeedbackVarying', handleOf(p), i)); });
 
   // uniform blocks
   m2('getUniformBlockIndex', function (p, n) { return CALL(this, 'getUniformBlockIndex', handleOf(p), String(n)); });

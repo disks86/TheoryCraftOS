@@ -152,9 +152,11 @@ bool GlContext::hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int3
   IAccelerator* acc = accelerator();
   if (!acc || !target.is_default || draw_fb_ != 0 || !default_draw_back_ || instances != 1 || mode < 4 || mode > 6) return false;
   if (target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || tf_active_ || rasterizer_discard_) return false;
-  if (query_active_[0] || query_active_[1] || query_active_[3]) return false;      // (primitives generated: counted on the CPU)
+  if (query_active_[0] || query_active_[1]) return false;
+  for (uint32_t q : prim_queries_[0]) if (q) return false;      // (primitives generated: counted on the CPU)
   // (the device's shaders saturate the compatibility colours: with clamping turned off, the CPU draws)
   if (!desktop.clamp_vertex_color) for (const VaryingLink& l : p.links) if (l.clamp) return false;
+  if (desktop.two_side_color && p.back_count) return false;      // (two-sided colour: the CPU picks each triangle's side)
   if (stencil_test_ || offset_fill_ || alpha_to_coverage_ || sample_coverage_en_) return false;
   if (!(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return false;
   const bool depth = ddepth_->defined();

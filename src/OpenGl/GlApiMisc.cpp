@@ -749,19 +749,24 @@ void GlApi::glDeleteQueries(GLsizei n, UserPtr ids) {
   }
 }
 uint64_t GlApi::glIsQuery(GLuint id) { return id && query_names_.object(id) != 0; }
-void GlApi::glBeginQuery(GLenum target, GLuint id) {
+void GlApi::glBeginQuery(GLenum target, GLuint id) { glBeginQueryIndexed(target, 0, id); }
+void GlApi::glEndQuery(GLenum target) { gl_.end_query(target); }
+void GlApi::glGetQueryiv(GLenum target, GLenum pname, UserPtr params) { glGetQueryIndexediv(target, 0, pname, params); }
+// (the index: the vertex stream of GL_PRIMITIVES_GENERATED and GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN; 0 for the others)
+void GlApi::glBeginQueryIndexed(GLenum target, GLuint index, GLuint id) {
   if (!id || !query_names_.known(id)) { error(GL_INVALID_OPERATION); return; }
   uint32_t object = query_names_.object(id);
   if (!object) {
     object = gl_.create_query();
     query_names_.set(id, object);
   }
-  gl_.begin_query(target, object);
+  gl_.begin_query(target, object, index);
 }
-void GlApi::glEndQuery(GLenum target) { gl_.end_query(target); }
-void GlApi::glGetQueryiv(GLenum target, GLenum pname, UserPtr params) {
+void GlApi::glEndQueryIndexed(GLenum target, GLuint index) { gl_.end_query(target, index); }
+void GlApi::glGetQueryIndexediv(GLenum target, GLuint index, GLenum pname, UserPtr params) {
+  if (index >= 4) { error(GL_INVALID_VALUE); return; }
   int32_t out = 0;
-  if (pname == GL_CURRENT_QUERY) out = static_cast<int32_t>(query_names_.name_of(gl_.current_query(target)));
+  if (pname == GL_CURRENT_QUERY) out = static_cast<int32_t>(query_names_.name_of(gl_.current_query(target, index)));
   else if (pname == GL_QUERY_COUNTER_BITS) out = 64;
   else { error(GL_INVALID_ENUM); return; }
   write_values(params, &out, 1);

@@ -127,6 +127,9 @@ struct Global {
                             // the flat array of all of them (v[i][j] is element i * inner + j)
   uint32_t block_offset = 0;   // byte offset inside the block (std140)
   uint32_t uniform_index = 0;
+  uint8_t stream = 0;          // geometry stage: the vertex stream an output belongs to (layout(stream = n))
+  int8_t xfb_buffer = -1;      // captured by transform feedback into this buffer at byte xfb_offset of each vertex (layout xfb_*), or -1
+  int32_t xfb_offset = -1;
 };
 
 struct UniformBlock {
@@ -241,6 +244,11 @@ struct Module {
   uint32_t tes_spacing = 0;         // GL_EQUAL 0x0202, GL_FRACTIONAL_EVEN 0x8E7C, GL_FRACTIONAL_ODD 0x8E7B
   uint32_t tes_order = 0;           // GL_CW 0x0900, GL_CCW 0x0901
   bool tes_point_mode = false;
+  // Transform feedback the shader describes itself (layout xfb_buffer / xfb_offset / xfb_stride, GLSL 4.40): whether any output has an offset, and each buffer's stride
+  // in bytes (-1: not given); and whether a geometry shader puts out vertices on streams other than 0 (layout(stream = n)).
+  bool has_xfb = false;
+  int32_t xfb_stride[4] = {-1, -1, -1, -1};
+  bool gs_streams = false;
 
   uint32_t slots_of(const Type& t) const;
   const StructDef* struct_of(const Type& t) const { return t.base == Base::Struct && t.sid < structs.count() ? structs[t.sid].get() : nullptr; }
