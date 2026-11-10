@@ -114,29 +114,19 @@ class VirglBuffer final : public IBuffer {
     memory_ = allocate_dma_view<uint8_t>(gpu.allocator(), size, 4096);
     if (memory_.empty()) return;
     memory_.fill(0);
+    bind_ = extra_bind;
+    if (usage & kBufferVertex) bind_ |= virgl::kBindVertexBuffer;
+    if (usage & kBufferIndex) bind_ |= virgl::kBindIndexBuffer;
+    if (usage & kBufferStorage) bind_ |= virgl::kBindShaderBuffer;
+    if (usage & kBufferStreamOutput) bind_ |= virgl::kBindStreamOutput;
     id_ = gpu.allocate_resource_id();
-    uint32_t bind = extra_bind;
-    if (usage & kBufferVertex) bind |= virgl::kBindVertexBuffer;
-    if (usage & kBufferIndex) bind |= virgl::kBindIndexBuffer;
-    if (usage & kBufferStorage) bind |= virgl::kBindShaderBuffer;
-    if (usage & kBufferStreamOutput) bind |= virgl::kBindStreamOutput;
-    ResourceCreate3d create{header(kCmdResourceCreate3d), id_, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind,
-                            static_cast<uint32_t>(size), 1, 1, 1, 0, 0, 0, 0};
-    ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id_, 1,
-                                 {reinterpret_cast<uint64_t>(memory_.data()), static_cast<uint32_t>(size), 0}};
-    CtxResource ctx{header(kCmdCtxAttachResource), id_, 0};
-    ok_ = gpu.command(as_bytes(create)) && gpu.command(as_bytes(attach)) && gpu.command(as_bytes(ctx));
+    ok_ = make_resource(id_, /*fence=*/true);
     gpu.add_resource_bytes(size);
     accounted_ = size;
   }
   ~VirglBuffer() {
     hardware::VirtioGpu& gpu = device_.gpu();
-    if (id_) {
-      CtxResource detach{header(kCmdCtxDetachResource), id_, 0};
-      ResourceUnref unref{header(kCmdResourceUnref), id_, 0};
-      gpu.command(as_bytes(detach));
-      gpu.command(as_bytes(unref));
-    }
+    if (id_) drop_resource(id_, /*fence=*/true);
     gpu.remove_resource_bytes(accounted_);
     release_view(gpu.allocator(), memory_);
   }
@@ -144,7 +134,13 @@ class VirglBuffer final : public IBuffer {
   uint32_t id() const { return id_; }
   uint64_t size() const override { return memory_.size(); }
   ByteView map() override { return memory_; }
+  // The host writes an upload into the buffer straight away, without waiting for the GPU (virglrenderer maps it unsynchronized: keeping work that still reads
+  // the old contents apart is the guest's job). So a buffer that a submit the GPU may not have finished draws from is not written over: its contents go to a
+  // new host resource, which the next submits use, and the old one is let go - the host keeps it until the work that reads it is done. Without that a renderer
+  // that fills a buffer, submits, fills it again and submits again (the desktop's, around a picture it shows from the GPU) has its first draws read the
+  // second contents whenever the GPU is behind.
   void unmap() override {
+    if (ok_ && device_.in_flight(last_use())) replace_busy_resource();
     TransferHost3d transfer{header(kCmdTransferToHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0,
                             id_, 0, 0, 0};
     device_.gpu().command(as_bytes(transfer), /*fence=*/false);
@@ -154,11 +150,49 @@ class VirglBuffer final : public IBuffer {
     TransferHost3d transfer{header(kCmdTransferFromHost3d), {0, 0, 0, static_cast<uint32_t>(memory_.size()), 1, 1}, 0, id_, 0, 0, 0};
     return device_.gpu().command(as_bytes(transfer));
   }
+  // A submit was given to the host with commands that use this buffer: its number (VirtioGpu::work_sent). Called by the submit, from any thread.
+  void note_use(uint64_t work) {
+    uint64_t seen = __atomic_load_n(&last_use_, __ATOMIC_RELAXED);
+    while (work > seen && !__atomic_compare_exchange_n(&last_use_, &seen, work, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+  }
+  uint64_t last_use() const { return __atomic_load_n(&last_use_, __ATOMIC_ACQUIRE); }
 
  private:
+  // A host resource for the buffer (`id`), backed by our memory and known to the context.
+  bool make_resource(uint32_t id, bool fence) {
+    hardware::VirtioGpu& gpu = device_.gpu();
+    const uint32_t size = static_cast<uint32_t>(memory_.size());
+    ResourceCreate3d create{header(kCmdResourceCreate3d), id, virgl::kTargetBuffer, virgl::kFormatR8Unorm, bind_, size, 1, 1, 1, 0, 0, 0, 0};
+    ResourceAttachBacking attach{header(kCmdResourceAttachBacking), id, 1, {reinterpret_cast<uint64_t>(memory_.data()), size, 0}};
+    CtxResource ctx{header(kCmdCtxAttachResource), id, 0};
+    return gpu.command(as_bytes(create), fence) && gpu.command(as_bytes(attach), fence) && gpu.command(as_bytes(ctx), fence);
+  }
+  void drop_resource(uint32_t id, bool fence) {
+    hardware::VirtioGpu& gpu = device_.gpu();
+    CtxResource detach{header(kCmdCtxDetachResource), id, 0};
+    ResourceUnref unref{header(kCmdResourceUnref), id, 0};
+    gpu.command(as_bytes(detach), fence);
+    gpu.command(as_bytes(unref), fence);
+  }
+  // The buffer moves to a new host resource (no fences: nothing here waits for the GPU). If the host will not make one, waiting for the GPU instead keeps the
+  // old resource safe to write.
+  void replace_busy_resource() {
+    const uint32_t fresh = device_.gpu().allocate_resource_id();
+    if (!make_resource(fresh, /*fence=*/false)) {
+      drop_resource(fresh, /*fence=*/false);
+      device_.wait_for_gpu();
+      return;
+    }
+    drop_resource(id_, /*fence=*/false);
+    id_ = fresh;
+    __atomic_store_n(&last_use_, uint64_t{0}, __ATOMIC_RELEASE);   // (no work has the new one yet)
+  }
+
   VirglDevice& device_;
   ByteView memory_;
   uint32_t id_ = 0;
+  uint32_t bind_ = 0;
+  uint64_t last_use_ = 0;    // the work number of the last submit that used the buffer (0: none)
   uint64_t accounted_ = 0;   // what the GPU's video memory figure counts for this buffer
   bool ok_ = false;
 };
@@ -694,6 +728,11 @@ bool VirglDevice::send_commands(const uint32_t* dwords, uint32_t count, bool fen
   return ok;
 }
 
+bool VirglDevice::wait_for_gpu() {
+  const uint32_t nop = 0;
+  return send_commands(&nop, 1, /*fence=*/true);
+}
+
 VirglDevice::~VirglDevice() {
   for (uint32_t handle : sampler_states_) destroy_object(handle);
 }
@@ -882,8 +921,30 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
     if (c.type == RecordedCommand::Type::BeginQuery && (c.count & 0xFF) == static_cast<uint32_t>(QueryKind::SoPrimitivesWritten)) user_so_query[c.count >> 8 & 3] = true;
   const ConstByteView pool = recorder.constants();
 
+  // The buffers the commands bind (vertex, index, storage and stream output): each part of the stream that goes out tells them its work number, so that a
+  // later upload into one of them knows whether the GPU may still be reading it (VirglBuffer::unmap). A submit that binds more than this has all buffers count as used.
+  constexpr uint32_t kTrackedBuffers = 32;
+  VirglBuffer* used[kTrackedBuffers] = {};
+  uint32_t used_count = 0;
+  bool used_untracked = false;
+  auto use = [&](VirglBuffer* buffer) {
+    if (!buffer) return;
+    for (uint32_t k = 0; k < used_count; ++k)
+      if (used[k] == buffer) return;
+    if (used_count < kTrackedBuffers) used[used_count++] = buffer;
+    else used_untracked = true;
+  };
+
   auto flush = [&]() {
     if (stream.count() && !send_commands(stream.data(), stream.count())) return false;
+    if (stream.count()) {
+      const uint64_t work = gpu_.work_sent();   // (this part's number, or a later one if another thread sent meanwhile: later is safe)
+      for (uint32_t k = 0; k < used_count; ++k) used[k]->note_use(work);
+      if (used_untracked) {
+        uint64_t seen = __atomic_load_n(&all_used_until_, __ATOMIC_RELAXED);
+        while (work > seen && !__atomic_compare_exchange_n(&all_used_until_, &seen, work, true, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {}
+      }
+    }
     stream.reset();
     return true;
   };
@@ -1102,11 +1163,13 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (target && start > target->size()) return false;
         end_stream_output();   // (the draws that follow start at this binding's beginning)
         so_slot[cmd.unit] = {target, start};
+        use(target);
         break;
       }
       case RecordedCommand::Type::BindStorageBuffer:
         if (cmd.unit >= kMaxStorageBuffers || !cmd.buffer) return false;   // (the bindings may change between draws)
         storage[cmd.unit] = {static_cast<VirglBuffer*>(cmd.buffer), cmd.offset, cmd.count};
+        use(storage[cmd.unit].buffer);
         storage_dirty = true;
         draw_storage_dirty = true;
         break;
@@ -1246,10 +1309,12 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       case RecordedCommand::Type::BindVertexBuffer:
         vertex_buffer = static_cast<VirglBuffer*>(cmd.buffer);
         vertex_offset = cmd.offset;
+        use(vertex_buffer);
         break;
       case RecordedCommand::Type::BindIndexBuffer:
         index_buffer = static_cast<VirglBuffer*>(cmd.buffer);
         index_offset = cmd.offset;
+        use(index_buffer);
         index_type = cmd.index_type;
         break;
       case RecordedCommand::Type::BindTexture: {

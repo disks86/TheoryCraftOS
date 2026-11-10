@@ -53,6 +53,7 @@ enum CommandType : uint32_t {
   kRespOkCapsetInfo,
   kRespOkCapset,
   kRespOkEdid,
+  kRespErrUnspec = 0x1200,   // (the errors start here)
 };
 
 constexpr uint32_t kFlagFence = 1u << 0;
