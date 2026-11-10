@@ -18,6 +18,7 @@
 
 // Shaders and programs of the GL context: compiling, linking (attributes, varyings, uniforms, blocks), setting and querying uniforms.
 #include "WebGl/GlContext.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace webgl {
 
@@ -539,6 +540,11 @@ void GlContext::link_program(uint32_t id) {
     l.count = fm.slots_of(fg.type);
     l.flat = fg.flat || match->flat || fg.type.base == Base::Int || fg.type.base == Base::Uint;
     l.var_offset = offset;
+    // (the compatibility colours a stage writes are clamped, ARB_color_buffer_float)
+    if (desktop.active) {
+      const StringView n = fg.name.view();
+      l.clamp = n.equals("tcos_FrontColor") || n.equals("tcos_BackColor") || n.equals("tcos_FrontSecondaryColor") || n.equals("tcos_BackSecondaryColor");
+    }
     offset += l.count;
     if (offset > gpu::kMaxVarying) { link_failed(p, "too many varyings"); return; }
     p->links.push_back(l);
@@ -596,6 +602,7 @@ void GlContext::link_program(uint32_t id) {
     }
   }
   p->nvar = offset;
+  if (!link_transform_feedback(p, lm)) return;
 
   // fragment outputs
   p->frag_writes_all = false;
@@ -916,46 +923,250 @@ void GlContext::transform_feedback_varyings(uint32_t program, ArrayView<const St
   p->tf_mode = mode;
 }
 
-void GlContext::begin_transform_feedback(uint32_t) {
-  TransformFeedbackObj* tf = tf_bound_ ? tfs_[tf_bound_ - 1].get() : &default_tf_;
+// The family of a draw mode or of what a stage puts out, as transform feedback names them: 0 points, 1 lines, 4 triangles.
+static uint32_t tf_family(uint32_t mode) {
+  if (mode == 0) return 0;
+  if (mode <= 3 || mode == 0xA || mode == 0xB) return 1;
+  return 4;
+}
+
+void GlContext::begin_transform_feedback(uint32_t mode) {
+  TransformFeedbackObj* tf = current_tf();
+  if (tf->active) { set_error(INVALID_OPERATION); return; }
   tf->active = true;
+  tf->paused = false;
+  tf->primitive = tf_family(mode);
+  tf->vertices = 0;
   tf_active_ = true;
   for (auto& v : tf_pos_) v = 0;
 }
 void GlContext::end_transform_feedback() {
-  TransformFeedbackObj* tf = tf_bound_ ? tfs_[tf_bound_ - 1].get() : &default_tf_;
+  TransformFeedbackObj* tf = current_tf();
   tf->active = false;
+  tf->paused = false;
   tf_active_ = false;
 }
+void GlContext::pause_transform_feedback() {
+  TransformFeedbackObj* tf = current_tf();
+  if (!tf->active || tf->paused) { set_error(INVALID_OPERATION); return; }
+  tf->paused = true;
+  tf_active_ = false;
+}
+void GlContext::resume_transform_feedback() {
+  TransformFeedbackObj* tf = current_tf();
+  if (!tf->active || !tf->paused) { set_error(INVALID_OPERATION); return; }
+  tf->paused = false;
+  tf_active_ = true;
+}
 
-// Appends the captured varyings of one vertex (the vertex shader's private slots) to the bound feedback buffers.
-void GlContext::tf_capture(const ProgramObj& p, const uint32_t* priv) {
-  const bool separate = p.tf_mode == 0x8C8D;
-  for (uint64_t i = 0; i < p.tf_varyings.count(); ++i) {
-    const StringView name = p.tf_varyings[i]->view();
-    const shader::Global* g = nullptr;
-    for (uint64_t k = 0; k < p.vsm->globals.count() && !g; ++k) {
-      const shader::Global& c = *p.vsm->globals[k];
-      if (c.kind != shader::GlobalKind::Out && !(c.kind == shader::GlobalKind::Builtin && c.builtin == shader::kBvPosition)) continue;
-      if (c.name.view().equals(name)) g = &c;
+void GlContext::bind_transform_feedback(uint32_t id) {
+  TransformFeedbackObj* old = current_tf();
+  if (old->active && !old->paused) { set_error(INVALID_OPERATION); return; }
+  if (id && (id > tfs_.count() || !tfs_[id - 1])) { set_error(INVALID_OPERATION); return; }
+  for (uint32_t i = 0; i < 4; ++i) {
+    old->buffers[i] = tf_bindings_[i].buffer;
+    old->offsets[i] = tf_bindings_[i].offset;
+    old->sizes[i] = tf_bindings_[i].size;
+    old->positions[i] = tf_pos_[i];
+  }
+  tf_bound_ = id;
+  const TransformFeedbackObj* now = current_tf();
+  for (uint32_t i = 0; i < 4; ++i) {
+    tf_bindings_[i] = BufferBinding{now->buffers[i], now->offsets[i], now->sizes[i]};
+    tf_pos_[i] = now->positions[i];
+  }
+  tf_active_ = now->active && !now->paused;
+}
+
+bool GlContext::transform_feedback_vertices(uint32_t id, uint64_t* vertices) {
+  const TransformFeedbackObj* tf = !id ? &default_tf_ : (id <= tfs_.count() ? tfs_[id - 1].get() : nullptr);
+  if (!tf) { set_error(INVALID_VALUE); return false; }
+  if (tf->active) { set_error(INVALID_OPERATION); return false; }
+  *vertices = tf->vertices;
+  return true;
+}
+
+bool GlContext::transform_feedback_varying(uint32_t program, uint32_t index, String* name, uint32_t* size, uint32_t* gl_type) {
+  ProgramObj* p = program_at(program);
+  if (!p) { set_error(INVALID_VALUE); return false; }
+  if (!p->linked || index >= p->tf_varyings.count() || index >= 32) { set_error(INVALID_VALUE); return false; }
+  name->assign(p->tf_varyings[index]->view());
+  *size = p->tf_info[index].size;
+  *gl_type = p->tf_info[index].gl_type;
+  return true;
+}
+
+// The capture of a program: each name of glTransformFeedbackVaryings found among the outputs of the last pre-raster stage (`name`, `name[i]`, a member `Block.member`
+// or, of an unnamed block, `member`; the compatibility ones by their tcos_ names), and the special gl_NextBuffer / gl_SkipComponents1..4 of interleaved capture.
+bool GlContext::link_transform_feedback(ProgramObj* p, const shader::Module& last) {
+  p->tf_plan.clear();
+  p->tf_record_slots = 0;
+  if (p->extra[kStageGeometry]) {
+    const uint32_t out = p->extra[kStageGeometry]->module->gs_output;
+    p->tf_primitive = out == 0 ? 0 : (out == 3 ? 1 : 4);
+  } else if (p->extra[kStageTessEval]) {
+    const shader::Module& m = *p->extra[kStageTessEval]->module;
+    p->tf_primitive = m.tes_point_mode ? 0 : (m.tes_mode == 0x8E7A ? 1 : 4);
+  } else {
+    p->tf_primitive = 0xFFFFFFFFu;      // (the draw's mode)
+  }
+  const bool separate = p->tf_mode == 0x8C8D;
+  if (p->tf_varyings.count() > 32 || (separate && p->tf_varyings.count() > 4)) { link_failed(p, "too many transform feedback varyings"); return false; }
+  uint32_t binding = 0, total = 0, in_binding = 0;
+  String want(a_);
+  for (uint64_t i = 0; i < p->tf_varyings.count(); ++i) {
+    const StringView name = p->tf_varyings[i]->view();
+    p->tf_info[i] = ProgramObj::TfVaryingInfo{0, 0};
+    if (separate) { binding = static_cast<uint32_t>(i); in_binding = 0; }
+    if (name.equals("gl_NextBuffer")) {
+      if (separate || ++binding >= 4) { link_failed(p, "gl_NextBuffer past the last transform feedback buffer"); return false; }
+      in_binding = 0;
+      continue;
     }
-    if (!g) continue;
-    const uint32_t binding = separate ? static_cast<uint32_t>(i) : 0;
-    if (binding >= 4) continue;
-    const BufferBinding& bb = tf_bindings_[binding];
-    Buffer* b = buffer_at(bb.buffer);
-    if (!b) continue;
-    const uint32_t n = p.vsm->slots_of(g->type);
-    const uint64_t limit = bb.size ? bb.offset + bb.size : b->data.size();
-    ByteView bytes = b->data.writable_view();
-    for (uint32_t k = 0; k < n; ++k) {
-      const uint64_t at = bb.offset + tf_pos_[binding];
-      if (at + 4 > limit || at + 4 > bytes.size()) return;
-      const uint32_t v = priv[g->slot + k];
-      __builtin_memcpy(bytes.data() + at, &v, 4);
-      tf_pos_[binding] += 4;
+    TfPiece piece;
+    piece.binding = binding;
+    const StringView skip("gl_SkipComponents");
+    if (name.starts_with(skip) && name.size() == skip.size() + 1 && name[skip.size()] >= '1' && name[skip.size()] <= '4') {
+      if (separate) { link_failed(p, "gl_SkipComponents in separate transform feedback"); return false; }
+      piece.skip = true;
+      piece.count = static_cast<uint32_t>(name[skip.size()] - '0');
+      p->tf_info[i] = ProgramObj::TfVaryingInfo{0, piece.count};      // (GL_NONE, the components skipped)
+    } else {
+      // name[index]
+      StringView base = name;
+      int64_t element = -1;
+      if (name.size() > 3 && name[name.size() - 1] == ']') {
+        uint64_t open = name.size() - 1;
+        while (open > 0 && name[open] != '[') --open;
+        if (name[open] != '[' || open + 2 > name.size() - 1) { link_failed(p, "a bad transform feedback varying name"); return false; }
+        int64_t v = 0;
+        for (uint64_t k = open + 1; k + 1 < name.size(); ++k) {
+          if (name[k] < '0' || name[k] > '9' || v > 100000) { link_failed(p, "a bad transform feedback varying name"); return false; }
+          v = v * 10 + (name[k] - '0');
+        }
+        element = v;
+        base = name.substr(0, open);
+      }
+      const shader::Global* g = nullptr;
+      const auto output = [](const shader::Global& c) {
+        return c.kind == GlobalKind::Out ||
+               (c.kind == GlobalKind::Builtin && (c.builtin == shader::kBvPosition || c.builtin == shader::kBvPointSize || c.builtin == shader::kBvClipDistance)) ||
+               (c.kind == GlobalKind::Private && c.name.view().equals("gl_ClipVertex"));
+      };
+      for (int attempt = 0; attempt < 3 && !g; ++attempt) {
+        want.assign(base);
+        if (attempt == 1) {      // (the compatibility varyings: gl_FrontColor is tcos_FrontColor)
+          if (!base.starts_with("gl_")) continue;
+          want.assign("tcos_");
+          want.append(base.substr(3, base.size() - 3));
+        }
+        for (uint64_t k = last.globals.count(); k > 0 && !g; --k) {      // (the last declaration: a redeclared gl_ClipDistance[n])
+          const shader::Global& c = *last.globals[k - 1];
+          if (!output(c)) continue;
+          const StringView cn = c.name.view();
+          if (attempt < 2 ? cn.equals(want.view()) : (c.iface >= 0 && cn.size() > base.size() && cn.ends_with(base) && cn[cn.size() - base.size() - 1] == '.')) g = &c;
+        }
+      }
+      if (!g) {
+        String why(a_);
+        why.assign("the transform feedback varying ");
+        why.append(name);
+        why.append(" is not an output of the last vertex processing stage");
+        link_failed(p, why.view());
+        return false;
+      }
+      const Type et = g->type.array ? g->type.element() : g->type;
+      if (element >= 0) {
+        if (!g->type.array || static_cast<uint64_t>(element) >= g->type.array) { link_failed(p, "a transform feedback varying's index is past the end of its array"); return false; }
+        piece.src = g->slot + static_cast<uint32_t>(element) * last.slots_of(et);
+        piece.count = last.slots_of(et);
+        p->tf_info[i] = ProgramObj::TfVaryingInfo{gl_type_of(et), 1};
+      } else {
+        piece.src = g->slot;
+        piece.count = last.slots_of(g->type);
+        p->tf_info[i] = ProgramObj::TfVaryingInfo{gl_type_of(et), g->type.array ? g->type.array : 1};
+      }
+      if (piece.count > last.private_slots || piece.src > last.private_slots - piece.count) { link_failed(p, "a transform feedback varying outside its stage's variables"); return false; }
+    }
+    total += piece.count;
+    in_binding += piece.count;
+    if (total > kMaxTfComponents || (separate && in_binding > kMaxTfSeparateComponents)) { link_failed(p, "too many transform feedback components"); return false; }
+    if (!piece.skip) p->tf_record_slots += piece.count;
+    if (!p->tf_plan.push_back(piece)) { link_failed(p, "out of memory"); return false; }
+  }
+  return true;
+}
+
+GlContext::TfRecorder::TfRecorder(GlContext& gl, const ProgramObj& p) : gl_(gl), p_(p), capturing_(gl.tf_active_ && !p.tf_plan.empty()), records_(gl.a_) {
+  if (!capturing_) return;
+  const uint64_t n = uint64_t{3} * p.tf_record_slots;
+  ok_ = records_.reserve(n);
+  for (uint64_t i = 0; ok_ && i < n; ++i) records_.push_back(0);
+  if (!ok_) capturing_ = false;
+}
+
+void GlContext::TfRecorder::gather(ArrayView<const uint32_t> privates, ArrayView<uint32_t> record) const {
+  uint64_t at = 0;
+  for (const TfPiece& piece : p_.tf_plan) {
+    if (piece.skip) continue;
+    ArrayView<uint32_t> dst;
+    ArrayView<const uint32_t> src;
+    if (record.try_subview(at, piece.count, &dst) && privates.try_subview(piece.src, piece.count, &src)) dst.copy_from(src);
+    at += piece.count;
+  }
+}
+
+void GlContext::TfRecorder::vertex(ArrayView<const uint32_t> privates) {
+  if (!capturing_ || pending_ >= 3) return;
+  const uint32_t rs = p_.tf_record_slots;
+  gather(privates, records_.view().subview(uint64_t{pending_} * rs, rs));
+  ++pending_;
+}
+
+void GlContext::TfRecorder::record(ArrayView<const uint32_t> rec) {
+  if (!capturing_ || pending_ >= 3) return;
+  const uint32_t rs = p_.tf_record_slots;
+  ArrayView<uint32_t> dst = records_.view().subview(uint64_t{pending_} * rs, rs);
+  ArrayView<const uint32_t> src;
+  if (rec.try_subview(0, rs, &src)) dst.copy_from(src);
+  ++pending_;
+}
+
+void GlContext::TfRecorder::primitive() {
+  if (QueryObj* q = gl_.query_at(gl_.query_active_[3])) ++q->result;      // GL_PRIMITIVES_GENERATED
+  const uint32_t n = pending_;
+  pending_ = 0;
+  if (!capturing_ || n == 0) return;
+  // the bytes of a vertex in each binding, and room for the whole primitive in all of them
+  uint64_t per_vertex[4] = {0, 0, 0, 0};
+  for (const TfPiece& piece : p_.tf_plan) per_vertex[piece.binding & 3] += uint64_t{piece.count} * 4;
+  ByteWriter writers[4];
+  for (uint32_t b = 0; b < 4; ++b) {
+    if (!per_vertex[b]) continue;
+    const BufferBinding& bb = gl_.tf_bindings_[b];
+    Buffer* buf = gl_.buffer_at(bb.buffer);
+    if (!buf) return;
+    const ByteView all = buf->data.writable_view();
+    uint64_t end = all.size();
+    if (bb.size && bb.offset <= end && bb.size < end - bb.offset) end = bb.offset + bb.size;
+    const uint64_t need = per_vertex[b] * n;
+    if (bb.offset > end || gl_.tf_pos_[b] > end - bb.offset || need > end - bb.offset - gl_.tf_pos_[b]) return;      // (overflow: nothing of it is written)
+    writers[b] = ByteWriter(all.subview(bb.offset + gl_.tf_pos_[b], need));
+  }
+  const uint32_t rs = p_.tf_record_slots;
+  for (uint32_t v = 0; v < n; ++v) {
+    const ArrayView<const uint32_t> rec = static_cast<const List<uint32_t>&>(records_).view().subview(uint64_t{v} * rs, rs);
+    uint64_t k = 0;
+    for (const TfPiece& piece : p_.tf_plan) {
+      ByteWriter& w = writers[piece.binding & 3];
+      if (piece.skip) { w.reserve(uint64_t{piece.count} * 4); continue; }      // (left as it is)
+      for (uint32_t c = 0; c < piece.count; ++c) w.le32(rec[k++]);
     }
   }
+  for (uint32_t b = 0; b < 4; ++b) gl_.tf_pos_[b] += per_vertex[b] * n;
+  QueryObj* written = gl_.query_at(gl_.query_active_[2]);
+  if (written && written->target == 0x8C88) ++written->result;      // GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN
+  gl_.current_tf()->vertices += n;
 }
 
 }  // namespace webgl

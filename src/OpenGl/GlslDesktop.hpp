@@ -37,7 +37,10 @@ enum CompatUse : uint32_t {
 };
 
 // `vertex`: the vertex stage (gl_Color is an attribute there and a varying in the fragment stage). False if the text is not something to translate (an ES shader: kept as it is).
-enum class DesktopStage : uint8_t { Vertex, Fragment, Other };   // Other: geometry, tessellation
+// Other: the geometry and tessellation evaluation stages; Control: the tessellation control stage. Their compatibility varyings (gl_FrontColor, gl_TexCoord[] ...) are
+// renamed as the vertex stage's are: the outputs are declared (not in the control stage, whose outputs are gl_out[].tcos_*), and gl_in[i].gl_FrontColor becomes
+// gl_in[i].tcos_FrontColor, a member the front end gives gl_in[] and gl_out[] in the compatibility profile.
+enum class DesktopStage : uint8_t { Vertex, Fragment, Other, Control };
 bool translate_desktop_glsl(StringView source, DesktopStage stage, String* out, uint32_t* uses);
 
 }  // namespace opengl

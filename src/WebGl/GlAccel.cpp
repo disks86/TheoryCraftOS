@@ -136,7 +136,8 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   if (!p.vsm || !p.fsm) return false;
   List<TgsiLink> links(a_);
   for (const VaryingLink& l : p.links) {
-    if (l.flat || !links.push_back(TgsiLink{l.vs_slot, l.fs_slot, l.count})) return false;
+    // (a clamped colour is saturated in the shader: built with clamping on, see hw_draw)
+    if (l.flat || !links.push_back(TgsiLink{l.vs_slot, l.fs_slot, l.count, l.clamp})) return false;
   }
   UniquePointer<TgsiProgram> t = UniquePointer<TgsiProgram>::make(a_, a_);
   if (!t || !translate_to_tgsi(a_, *p.vsm, *p.fsm, links.view(), t.get())) return false;
@@ -151,7 +152,9 @@ bool GlContext::hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int3
   IAccelerator* acc = accelerator();
   if (!acc || !target.is_default || draw_fb_ != 0 || !default_draw_back_ || instances != 1 || mode < 4 || mode > 6) return false;
   if (target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || tf_active_ || rasterizer_discard_) return false;
-  if (query_active_[0] || query_active_[1]) return false;
+  if (query_active_[0] || query_active_[1] || query_active_[3]) return false;      // (primitives generated: counted on the CPU)
+  // (the device's shaders saturate the compatibility colours: with clamping turned off, the CPU draws)
+  if (!desktop.clamp_vertex_color) for (const VaryingLink& l : p.links) if (l.clamp) return false;
   if (stencil_test_ || offset_fill_ || alpha_to_coverage_ || sample_coverage_en_) return false;
   if (!(cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3])) return false;
   const bool depth = ddepth_->defined();

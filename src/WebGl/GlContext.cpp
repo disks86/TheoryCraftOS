@@ -1148,6 +1148,9 @@ bool GlContext::get_vertex_attrib(uint32_t index, uint32_t pname, double* out, u
 
 // --- Queries -----------------------------------------------------------------------------------------------------------------------------------------------
 
+// The query of each kind that may be active: 0 any samples passed, 1 conservative, 2 transform feedback primitives written (and the others), 3 primitives generated.
+static uint32_t query_slot(uint32_t target) { return target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : (target == 0x8C87 ? 3 : 2)); }
+
 void GlContext::begin_query(uint32_t target, uint32_t id) {
   QueryObj* q = query_at(id);
   if (!q) { set_error(INVALID_OPERATION); return; }
@@ -1155,12 +1158,12 @@ void GlContext::begin_query(uint32_t target, uint32_t id) {
   q->active = true;
   q->ended = false;
   q->result = 0;
-  const uint32_t slot = target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : 2);
+  const uint32_t slot = query_slot(target);
   query_active_[slot] = id;
 }
 
 void GlContext::end_query(uint32_t target) {
-  const uint32_t slot = target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : 2);
+  const uint32_t slot = query_slot(target);
   QueryObj* q = query_at(query_active_[slot]);
   if (!q) { set_error(INVALID_OPERATION); return; }
   q->active = false;
@@ -1177,7 +1180,7 @@ bool GlContext::query_result(uint32_t id, uint32_t pname, double* out) {
 }
 
 uint32_t GlContext::current_query(uint32_t target) const {
-  const uint32_t slot = target == 0x8C2F ? 0 : (target == 0x8D6A ? 1 : 2);
+  const uint32_t slot = query_slot(target);
   return query_active_[slot];
 }
 
@@ -1211,7 +1214,12 @@ bool GlContext::get_integer(uint32_t pname, double* o, uint32_t* count) {
     case 0x84FD: *o = 16; return true;
     case 0x8904: *o = -8; return true;
     case 0x8905: *o = 7; return true;
-    case 0x8C8A: case 0x8C8B: case 0x8C80: *o = 4; return true;
+    // transform feedback: interleaved components, separate attributes, components of each separate one
+    case 0x8C8A: *o = kMaxTfComponents; return true;
+    case 0x8C8B: *o = 4; return true;
+    case 0x8C80: *o = kMaxTfSeparateComponents; return true;
+    case 0x8E23: *o = current_tf()->paused; return true;
+    case 0x8E24: *o = current_tf()->active; return true;
     case 0x0D3A: *count = 2; o[0] = 8192; o[1] = 8192; return true;
     case 0x0BA2: *count = 4; for (int i = 0; i < 4; ++i) o[i] = vp_[i]; return true;
     case 0x0C10: *count = 4; for (int i = 0; i < 4; ++i) o[i] = sc_[i]; return true;

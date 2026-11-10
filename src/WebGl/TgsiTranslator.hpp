@@ -43,6 +43,7 @@ constexpr uint32_t kTgsiMaxSamplers = 2;
 // A varying the vertex shader writes and the fragment shader reads: their private slots and the number of floats.
 struct TgsiLink {
   uint32_t vs_slot, fs_slot, count;
+  bool saturate = false;   // written clamped to [0, 1] (a clamped vertex colour)
 };
 
 // Where a CONST row gets its values: `comps` floats from `slot` of the shared (uniform) region of a stage.

@@ -132,6 +132,12 @@ int32_t parse_version(StringView text, uint64_t* line_end, uint32_t* line, bool*
   return v;
 }
 
+// The varyings of the compatibility profile that pass from stage to stage (the vertex stage's outputs, the fragment stage's inputs).
+bool compat_varying(StringView name) {
+  return name.equals("gl_FrontColor") || name.equals("gl_BackColor") || name.equals("gl_FrontSecondaryColor") || name.equals("gl_BackSecondaryColor") || name.equals("gl_TexCoord") ||
+         name.equals("gl_FogFragCoord");
+}
+
 }  // namespace
 
 // A shader's own declaration of gl_TexCoord (`varying vec4 gl_TexCoord[4];`, GLSL 1.10 lets it give a size): the translation declares the 8 of them itself, so the
@@ -241,6 +247,8 @@ bool translate_desktop_glsl(StringView source, DesktopStage stage, String* out, 
       else if (name.equals("gl_SecondaryColor")) decl(varying_in, "vec4", "tcos_FrontSecondaryColor", "");
       else if (name.equals("gl_TexCoord")) decl(varying_in, "vec4", "tcos_TexCoord", "[8]");
       else if (name.equals("gl_FogFragCoord")) decl(varying_in, "float", "tcos_FogFragCoord", "");
+    } else if (stage == DesktopStage::Other) {      // (the vertex these stages put out; what they read is gl_in[].tcos_*)
+      if (compat_varying(name)) decl(varying_out, name.equals("gl_FogFragCoord") ? "float" : "vec4", kRenames[r].vertex_to, name.equals("gl_TexCoord") ? "[8]" : "");
     }
     if (name.equals("gl_ModelViewMatrix")) decl("uniform", "mat4", "tcos_ModelViewMatrix", "");
     else if (name.equals("gl_ProjectionMatrix")) decl("uniform", "mat4", "tcos_ProjectionMatrix", "");
@@ -305,8 +313,9 @@ bool translate_desktop_glsl(StringView source, DesktopStage stage, String* out, 
     }
     if (!replacement) for (const Rename& r : kRenames) {
       if (!word.equals(r.from)) continue;
-      // (the geometry and tessellation stages: only the uniform state; the per-vertex compatibility values are not passed through them)
-      replacement = vertex ? r.vertex_to : (stage == DesktopStage::Fragment || r.use ? r.fragment_to : nullptr);
+      // (the geometry and tessellation stages: the uniform state, and the compatibility varyings by their vertex-stage names)
+      if (vertex || ((stage == DesktopStage::Other || stage == DesktopStage::Control) && compat_varying(StringView(r.from)))) replacement = r.vertex_to;
+      else replacement = stage == DesktopStage::Fragment || r.use ? r.fragment_to : nullptr;
       break;
     }
     out->append(replacement ? StringView(replacement) : word);

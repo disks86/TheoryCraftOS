@@ -632,6 +632,8 @@ void GlApi::glProvokingVertex(GLenum mode) {
 void GlApi::glClampColor(GLenum target, GLenum clamp) {
   if (target != GL_CLAMP_READ_COLOR && target != GL_CLAMP_VERTEX_COLOR && target != GL_CLAMP_FRAGMENT_COLOR) { error(GL_INVALID_ENUM); return; }
   if (target == GL_CLAMP_READ_COLOR) fx_.clamp_read_color = clamp != GL_FALSE;
+  // (GL_FIXED_ONLY: clamped, as the default framebuffer is fixed-point)
+  if (target == GL_CLAMP_VERTEX_COLOR) gl_.desktop.clamp_vertex_color = clamp != GL_FALSE;
 }
 void GlApi::glFlush() { flush_to_surface(); }
 void GlApi::glFinish() { gl_.finish(); flush_to_surface(); }

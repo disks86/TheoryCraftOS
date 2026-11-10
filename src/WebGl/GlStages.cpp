@@ -41,9 +41,10 @@ bool copy_slots(ArrayView<uint32_t> dst, uint64_t to, ArrayView<const uint32_t> 
 
 }  // namespace
 
-StagePipeline::StagePipeline(allocators::IAllocator& allocator, ProgramObj& program, const DesktopState& desktop, shader::ITextureHost* textures, IPrimitiveOut& out)
-    : a_(allocator), p_(program), desktop_(desktop), textures_(textures), out_(out), gs_(allocator), tcs_(allocator), tes_(allocator), last_(program.last_module()),
-      tes_records_(allocator), tes_vertices_(allocator) {
+StagePipeline::StagePipeline(allocators::IAllocator& allocator, ProgramObj& program, const DesktopState& desktop, shader::ITextureHost* textures, IPrimitiveOut& out,
+                             GlContext::TfRecorder& tf)
+    : a_(allocator), p_(program), desktop_(desktop), textures_(textures), out_(out), tf_(tf), gs_(allocator), tcs_(allocator), tes_(allocator), last_(program.last_module()),
+      strip_tf_(allocator), tes_records_(allocator), tes_vertices_(allocator), tes_tf_(allocator) {
   gs_.stage = p_.extra[kStageGeometry].get();
   tcs_.stage = p_.extra[kStageTessControl].get();
   tes_.stage = p_.extra[kStageTessEval].get();
@@ -85,6 +86,11 @@ bool StagePipeline::prepare(StageRun& run) {
 
 bool StagePipeline::begin() {
   if (!prepare(gs_) || !prepare(tcs_) || !prepare(tes_)) return false;
+  if (gs_.stage && tf_.capturing()) {
+    const uint64_t n = uint64_t{3} * tf_.record_slots();
+    if (!strip_tf_.reserve(n)) return false;
+    for (uint64_t i = 0; i < n; ++i) strip_tf_.push_back(0);
+  }
   if (tes_.stage) {
     tessellator_ = UniquePointer<graphics::Tessellator>::make(a_, a_);
     if (!tessellator_ || !tessellator_->valid()) return false;
@@ -115,7 +121,7 @@ void StagePipeline::to_vertex(const uint32_t* privates, gpu::RVertex* out) const
   out->edge = true;
   for (const VaryingLink& l : p_.links)
     for (uint32_t k = 0; k < l.count; ++k)
-      if (l.vs_slot + k < n && l.var_offset + k < gpu::kMaxVarying) out->var[l.var_offset + k] = u2f(privates[l.vs_slot + k]);
+      if (l.vs_slot + k < n && l.var_offset + k < gpu::kMaxVarying) out->var[l.var_offset + k] = clamp_varying(l, desktop_.clamp_vertex_color, u2f(privates[l.vs_slot + k]));
   p_.fill_clip_distances(privates, n, desktop_.clip_planes, out->var);
 }
 
@@ -161,20 +167,43 @@ bool StagePipeline::emit_vertex(uint32_t stream) {
   if (stream != 0 || emitted_ >= max_vertices_) return true;      // (only stream 0 is rasterized; vertices past max_vertices are dropped)
   ++emitted_;
   gpu::RVertex v;
-  to_vertex(gs_.stage->machines[0]->private_region(), &v);
+  const uint32_t* privates = gs_.stage->machines[0]->private_region();
+  to_vertex(privates, &v);
+  // (transform feedback: the vertices of each primitive, in the order they are rasterized)
+  // (transform feedback: the vertices of each primitive, in the order they are rasterized; records 0 and 1 the strip's, 2 the new vertex's)
+  const bool tf = tf_.capturing() && !strip_tf_.empty();
+  const uint32_t rs = tf_.record_slots();
+  const ArrayView<uint32_t> recs = strip_tf_.view();
+  if (tf) tf_.gather(ArrayView<const uint32_t>(privates, last_.private_slots), recs.subview(uint64_t{2} * rs, rs));
+  const auto rec = [&](uint32_t k) { if (tf) tf_.record(recs.subview(uint64_t{k} * rs, rs)); };
+  const auto keep = [&](uint32_t to, uint32_t from) { if (tf) recs.subview(uint64_t{to} * rs, rs).copy_from(recs.subview(uint64_t{from} * rs, rs)); };
   switch (output_) {
-    case 0: out_.point(v); break;
+    case 0:
+      rec(2);
+      out_.point(v);
+      break;
     case 3:
-      if (strip_count_ >= 1) out_.line(strip_[1], v, strip_count_ == 1);
+      if (strip_count_ >= 1) {
+        rec(1);
+        rec(2);
+        out_.line(strip_[1], v, strip_count_ == 1);
+      }
       strip_[1] = v;
+      keep(1, 2);
       break;
     default:      // a triangle strip: every vertex after the second makes a triangle, every other one wound the other way, the new vertex last (it is the provoking one)
       if (strip_count_ >= 2) {
-        if (strip_count_ % 2 == 0) out_.triangle(strip_[0], strip_[1], v);
+        const bool even = strip_count_ % 2 == 0;
+        rec(even ? 0 : 1);
+        rec(even ? 1 : 0);
+        rec(2);
+        if (even) out_.triangle(strip_[0], strip_[1], v);
         else out_.triangle(strip_[1], strip_[0], v);
       }
       strip_[0] = strip_[1];
       strip_[1] = v;
+      keep(0, 1);
+      keep(1, 2);
       break;
   }
   ++strip_count_;
@@ -270,7 +299,11 @@ bool StagePipeline::tessellate(ArrayView<const uint32_t* const> records, uint32_
   const uint32_t rs = te.record_slots;
   tes_records_.clear();
   tes_vertices_.clear();
+  tes_tf_.clear();
   if (to_geometry ? !tes_records_.reserve(uint64_t{rs} * points.size()) : !tes_vertices_.reserve(points.size())) return false;
+  const bool tf = !to_geometry && tf_.capturing();
+  const uint32_t tfs = tf_.record_slots();
+  if (tf && !tes_tf_.reserve(uint64_t{tfs} * points.size())) return false;
   Machine& tm = *te.machines[0];
   for (const graphics::Tessellator::Point& pt : points) {
     if (tes_.coord_slot >= 0 && static_cast<uint64_t>(tes_.coord_slot) + 2 < tsnap.size()) {
@@ -288,6 +321,11 @@ bool StagePipeline::tessellate(ArrayView<const uint32_t* const> records, uint32_
       gpu::RVertex v;
       to_vertex(tm.private_region(), &v);
       tes_vertices_.push_back(v);
+      if (tf) {
+        const uint64_t at = tes_tf_.count();
+        for (uint32_t k = 0; k < tfs; ++k) tes_tf_.push_back(0);
+        tf_.gather(ArrayView<const uint32_t>(tm.private_region(), tem.private_slots), tes_tf_.view().subview(at, tfs));
+      }
     }
   }
   const uint32_t per = output == graphics::TessOutput::Point ? 1 : (output == graphics::TessOutput::Line ? 2 : 3);
@@ -299,12 +337,12 @@ bool StagePipeline::tessellate(ArrayView<const uint32_t* const> records, uint32_
       const uint32_t* recs[3];
       for (uint32_t k = 0; k < per; ++k) recs[k] = tes_records_.view().data() + uint64_t{indices[i + k]} * rs;
       if (!geometry(ArrayView<const uint32_t* const>(recs, per), gs_primitives_++)) return false;      // (the geometry stage counts the draw's tessellated primitives)
-    } else if (per == 1) {
-      out_.point(tes_vertices_[indices[i]]);
-    } else if (per == 2) {
-      out_.line(tes_vertices_[indices[i]], tes_vertices_[indices[i + 1]], true);
     } else {
-      out_.triangle(tes_vertices_[indices[i]], tes_vertices_[indices[i + 1]], tes_vertices_[indices[i + 2]]);
+      if (tf)
+        for (uint32_t k = 0; k < per; ++k) tf_.record(ArrayView<const uint32_t>(tes_tf_.view()).subview(uint64_t{indices[i + k]} * tfs, tfs));
+      if (per == 1) out_.point(tes_vertices_[indices[i]]);
+      else if (per == 2) out_.line(tes_vertices_[indices[i]], tes_vertices_[indices[i + 1]], true);
+      else out_.triangle(tes_vertices_[indices[i]], tes_vertices_[indices[i + 1]], tes_vertices_[indices[i + 2]]);
     }
   }
   return true;
