@@ -26,6 +26,8 @@
 #include <time.h>
 #include <vector>
 #include "Desktop/CubeRenderer.hpp"
+#include "Desktop/CubeSpirv.hpp"
+#include "Desktop/GlCubeRenderer.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
@@ -73,11 +75,11 @@ static std::vector<uint8_t> read_file(const char* path) {
 
 static int channel(uint32_t p, int shift) { return static_cast<int>((p >> shift) & 0xFF); }
 
-static uint32_t pixel(const CubeRenderer& r, uint32_t x, uint32_t y) { return r.picture().pixels[uint64_t{y} * r.picture().pitch + x]; }
+static uint32_t pixel(const ICubeRenderer& r, uint32_t x, uint32_t y) { return r.picture().pixels[uint64_t{y} * r.picture().pitch + x]; }
 
 // The mean difference between the middle of the cube's front face and the logo, with the logo optionally mirrored. The camera looks at the face straight on
 // (angle 0) from 4.5 units, with a 0.9 radian field of view, so the face is a square of 2 / (2 tan(0.45) 3.5) of the picture's height.
-static double face_error(const CubeRenderer& r, const ArrayView<uint32_t>& logo, bool mirror_x, bool mirror_y) {
+static double face_error(const ICubeRenderer& r, const ArrayView<uint32_t>& logo, bool mirror_x, bool mirror_y) {
   const double height = r.height(), half = height * 0.5 / (0.4831 * 3.5);   // (half the face, in pixels)
   const double cx = r.width() * 0.5, cy = height * 0.5;
   double sum = 0;
@@ -311,6 +313,166 @@ static void test_shared(TestAllocator& a) {
   CHECK(r.render(1.0f, true, &times, false));   // back in the renderer's hands
 }
 
+// Pixels where a channel of the two pictures differs by more than `tolerance`.
+static uint64_t differing_pixels(const graphics::Surface& a, const graphics::Surface& b, int tolerance) {
+  if (a.width != b.width || a.height != b.height) return ~uint64_t{0};
+  uint64_t n = 0;
+  for (uint32_t y = 0; y < a.height; ++y)
+    for (uint32_t x = 0; x < a.width; ++x) {
+      const uint32_t p = a.pixels[uint64_t{y} * a.pitch + x], q = b.pixels[uint64_t{y} * b.pitch + x];
+      for (int shift : {0, 8, 16})
+        if (abs(channel(p, shift) - channel(q, shift)) > tolerance) {
+          ++n;
+          break;
+        }
+    }
+  return n;
+}
+
+// With CUBE_DUMP=<folder> set, the pictures are written there as PPM files, to look at.
+static void dump(const char* name, const graphics::Surface& s) {
+  const char* folder = getenv("CUBE_DUMP");
+  if (!folder) return;
+  char path[512];
+  snprintf(path, sizeof path, "%s/%s.ppm", folder, name);
+  FILE* f = fopen(path, "wb");
+  if (!f) return;
+  fprintf(f, "P6\n%u %u\n255\n", s.width, s.height);
+  for (uint32_t y = 0; y < s.height; ++y)
+    for (uint32_t x = 0; x < s.width; ++x) {
+      const uint32_t p = s.pixels[uint64_t{y} * s.pitch + x];
+      const uint8_t rgb[3] = {static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 8), static_cast<uint8_t>(p)};
+      fwrite(rgb, 1, 3, f);
+    }
+  fclose(f);
+}
+
+// The three APIs draw the same cube: the Vulkan path (SPIR-V -> DXBC -> escape) and the kernel's OpenGL against the Direct3D path, flat and with the logo, at several angles.
+static void test_apis(TestAllocator& a) {
+  CHECK(cube_api_name(CubeApi::Direct3D)[0] == 'D' && cube_api_name(CubeApi::Vulkan)[0] == 'V' && cube_api_name(CubeApi::OpenGL)[0] == 'O');
+  graphics::SoftwareDevice device{a, nullptr};
+  dxgk::Kernel kernel(a);
+  kernel.add_adapter(device, dxgk::AdapterConfig());
+  opengl::GlService gl_service(a);
+  const uint32_t W = 200, H = 160;
+  CubeRenderer d3d(a, kernel, 0x50, CubeApi::Direct3D), vk(a, kernel, 0x51, CubeApi::Vulkan);
+  GlCubeRenderer gl(a, gl_service, 0x52);
+  CHECK(d3d.api() == CubeApi::Direct3D && vk.api() == CubeApi::Vulkan && gl.api() == CubeApi::OpenGL);
+  CHECK(d3d.open(0, W, H) && vk.open(0, W, H));
+  const bool gl_open = gl.open(W, H);
+  if (!gl_open) printf("   OpenGL: %.*s\n", static_cast<int>(gl.build_log().size()), gl.build_log().data());
+  CHECK(gl_open);
+  CHECK(vk.texture_available() && gl.texture_available() && !gl.accelerated() && !gl.shareable());
+  CHECK(gl_service.context_count(0x52) == 1);
+  if (!d3d.is_open() || !vk.is_open() || !gl.is_open()) return;
+  CubeFrameTimes times;
+  for (bool textured : {false, true}) {
+    for (float angle : {0.0f, 0.7f, 1.3f, 3.14159265f}) {
+      CHECK(d3d.render(angle, textured, &times) && vk.render(angle, textured, &times) && gl.render(angle, textured, &times));
+      CHECK(vk.last_textured() == textured && gl.last_textured() == textured);
+      const uint64_t vk_diff = differing_pixels(d3d.picture(), vk.picture(), 40), gl_diff = differing_pixels(d3d.picture(), gl.picture(), 40);
+      printf("   %s angle %.2f: Vulkan differs from Direct3D in %llu, OpenGL in %llu of %u pixels\n", textured ? "logo" : "flat", angle, static_cast<unsigned long long>(vk_diff),
+             static_cast<unsigned long long>(gl_diff), W * H);
+      CHECK(vk_diff < W * H / 100 && gl_diff < W * H / 100);   // (edges and filtering may differ a little; a wrong winding, flip or color would differ in thousands)
+      if (angle == 1.3f) {
+        dump(textured ? "d3d_logo" : "d3d_flat", d3d.picture());
+        dump(textured ? "vulkan_logo" : "vulkan_flat", vk.picture());
+        dump(textured ? "opengl_logo" : "opengl_flat", gl.picture());
+      }
+    }
+  }
+  // The front face: red when flat, and the logo upright and not mirrored, on every API.
+  for (ICubeRenderer* r : {static_cast<ICubeRenderer*>(&vk), static_cast<ICubeRenderer*>(&gl)}) {
+    CHECK(r->render(0, false, &times, true));
+    const uint32_t middle = pixel(*r, W / 2, H / 2);
+    CHECK(channel(middle, 16) > 200 && channel(middle, 8) < 110 && channel(middle, 0) < 110);
+    CHECK(pixel(*r, 0, 0) == kCubeBackground && pixel(*r, W - 1, H - 1) == kCubeBackground);
+  }
+  ArrayView<uint32_t> reference = allocate_view<uint32_t>(a, 256 * 256);
+  CHECK(render_cube_logo(a, reference));
+  CubeRenderer vk_square(a, kernel, 0x53, CubeApi::Vulkan);
+  GlCubeRenderer gl_square(a, gl_service, 0x54);
+  CHECK(vk_square.open(0, 200, 200) && gl_square.open(200, 200));
+  for (ICubeRenderer* r : {static_cast<ICubeRenderer*>(&vk_square), static_cast<ICubeRenderer*>(&gl_square)}) {
+    if (!r->is_open()) continue;
+    CHECK(r->render(0, true, &times, true) && r->last_textured());
+    const double right = face_error(*r, reference, false, false), mirrored_x = face_error(*r, reference, true, false), mirrored_y = face_error(*r, reference, false, true);
+    printf("   %s front face: error %.1f, mirrored across %.1f, upside down %.1f\n", cube_api_name(r->api()), right, mirrored_x, mirrored_y);
+    CHECK(right < 40 && right * 1.5 < mirrored_x && right * 1.5 < mirrored_y);
+  }
+  release_view(a, reference);
+
+  // Reopened at another size; closing gives the GL process back.
+  CHECK(gl.open(96, 64) && gl.width() == 96 && gl.picture().width == 96 && gl.render(0.5f, true, &times, true) && pixel(gl, 0, 0) == kCubeBackground);
+  CHECK(vk.open(0, 96, 64) && vk.render(0.5f, true, &times));
+  CHECK(differing_pixels(gl.picture(), vk.picture(), 40) < 96 * 64 / 50);
+  CHECK(!gl.open(0, 64) && !gl.is_open() && !gl.render(0, false, &times, true));
+  CHECK(gl_service.context_count(0x52) == 0);
+  gl_square.close();
+  CHECK(gl_service.context_count(0x54) == 0);
+
+  // A small benchmark of the two new paths at the 3D test's size.
+  CHECK(vk.open(0, 400, 300) && gl.open(400, 300));
+  for (ICubeRenderer* r : {static_cast<ICubeRenderer*>(&vk), static_cast<ICubeRenderer*>(&gl)}) {
+    uint64_t submit = 0, readback = 0;
+    constexpr uint32_t kFrames = 8;
+    for (uint32_t i = 0; i < kFrames; ++i) {
+      CubeFrameTimes t;
+      CHECK(r->render(i * 0.5f, true, &t, true));
+      submit += t.submit_us;
+      readback += t.readback_us;
+    }
+    printf("   %s logo 400x300: %.2f ms a frame (submit %.2f, readback %.2f)\n", cube_api_name(r->api()), (submit + readback) / 1000.0 / kFrames, submit / 1000.0 / kFrames,
+           readback / 1000.0 / kFrames);
+  }
+}
+
+// The GL stream's view of the renderer's memory: only the registered views, each only as far as it goes, and only the writable ones written.
+static void test_client_memory() {
+  GlCubeRenderer::ClientMemory m;
+  uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  uint8_t out[8] = {};
+  uint8_t sink[4] = {};
+  const uint64_t ro = m.add(ConstByteView(data)), rw = m.add_writable(ByteView(sink));
+  CHECK(ro && rw && ro != rw);
+  CHECK(m.read(ro, ByteView(out)) && out[7] == 8);
+  CHECK(m.read(ro + 6, ByteView(out).first(2)) && out[0] == 7);
+  CHECK(!m.read(ro + 6, ByteView(out).first(3)));        // past the end
+  CHECK(!m.read(ro + 9, ByteView(out).first(1)));
+  CHECK(!m.read(0, ByteView(out).first(1)));             // null
+  CHECK(!m.read(rw + (uint64_t{1} << 32), ByteView(out).first(1)));   // no such region
+  CHECK(!m.read(~uint64_t{0}, ByteView(out).first(1)));
+  CHECK(!m.write(ro, ConstByteView(data).first(1)));     // read only
+  CHECK(m.write(rw + 1, ConstByteView(data).first(3)) && sink[1] == 1 && sink[3] == 3);
+  CHECK(!m.write(rw + 2, ConstByteView(data).first(3)));
+  for (uint32_t i = 2; i < GlCubeRenderer::ClientMemory::kMaxRegions; ++i) CHECK(m.add(ConstByteView(data)) != 0);
+  CHECK(m.add(ConstByteView(data)) == 0);                // full
+  m.clear();
+  CHECK(!m.read(ro, ByteView(out).first(1)));            // gone with clear()
+}
+
+// The translator refuses what is not SPIR-V, cut short or with flipped bits, without reading out of bounds (ASan watches).
+static void test_spirv_refusals(TestAllocator& a) {
+  ByteBuffer dxbc(a);
+  SpirvTranslation info;
+  const ArrayView<const uint32_t> vs = cube_spirv(true, SpirvStage::Vertex), fs = cube_spirv(true, SpirvStage::Fragment);
+  CHECK(translate_spirv(a, vs, SpirvStage::Vertex, 64, dxbc, &info) && dxbc.size() > 0 && info.inputs == 3 && info.outputs == 1);
+  CHECK(translate_spirv(a, fs, SpirvStage::Fragment, 64, dxbc, &info) && info.texture_units == 1);
+  const char* why = nullptr;
+  CHECK(!translate_spirv(a, vs, SpirvStage::Vertex, 16, dxbc, &info, &why) && why && why[0]);   // a push block bigger than what is sent
+  CHECK(!translate_spirv(a, vs, SpirvStage::Fragment, 64, dxbc, &info));                         // the wrong stage: no entry point of it
+  CHECK(!translate_spirv(a, ArrayView<const uint32_t>(), SpirvStage::Vertex, 64, dxbc, &info));
+  std::vector<uint32_t> words(vs.data(), vs.data() + vs.size());
+  for (uint64_t n = 0; n < words.size(); n += 7) translate_spirv(a, ArrayView<const uint32_t>(words.data(), n), SpirvStage::Vertex, 64, dxbc, &info);
+  uint32_t seed = 12345;
+  for (int round = 0; round < 300; ++round) {
+    std::vector<uint32_t> flipped = words;
+    seed = seed * 1103515245u + 12345u;
+    flipped[(seed >> 8) % flipped.size()] ^= 1u << ((seed >> 3) % 32);
+    translate_spirv(a, ArrayView<const uint32_t>(flipped.data(), flipped.size()), SpirvStage::Vertex, 64, dxbc, &info);
+  }
+}
+
 int main(int argc, char** argv) {
   g_logo = read_file(argc > 1 ? argv[1] : "assets/logo.png");
   if (g_logo.empty()) {
@@ -322,6 +484,9 @@ int main(int argc, char** argv) {
   test_logo(a);
   test_benchmark(a);
   test_shared(a);
+  test_client_memory();
+  test_spirv_refusals(a);
+  test_apis(a);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);
     return 1;

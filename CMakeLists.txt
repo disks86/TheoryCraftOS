@@ -605,6 +605,9 @@ add_executable(BOOTX64
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp
   src/Desktop/CubeRenderer.cpp
+  src/Desktop/CubeSpirv.cpp
+  src/Desktop/CubeSpirvTranslator.c
+  src/Desktop/GlCubeRenderer.cpp
   src/SystemMonitor.cpp
   src/SystemInventory.cpp
   src/SystemDeviceDetails.cpp
@@ -1081,10 +1084,12 @@ set_source_files_properties(src/Graphics/Logo/Logo.S PROPERTIES COMPILE_OPTIONS 
 set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE
-  -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector
-  -fno-threadsafe-statics -mno-red-zone -fshort-wchar
+  -ffreestanding -fno-stack-protector -mno-red-zone -fshort-wchar
   -Wall -Wextra -g -O1
+  $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
 )
+# (the one C source: vulkan-1.dll's SPIR-V translator, which the 3D test's Vulkan path carries; it is the DLL's code as it is)
+set_source_files_properties(src/Desktop/CubeSpirvTranslator.c PROPERTIES COMPILE_OPTIONS "-std=gnu11;-Wno-unused-parameter;-Wno-unused-function;-Wno-sign-compare")
 # Keep frame pointers so gdb backtraces work.
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 

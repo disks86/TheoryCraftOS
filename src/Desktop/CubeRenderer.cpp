@@ -17,12 +17,12 @@
  */
 
 #include "Desktop/CubeRenderer.hpp"
-#include "Graphics/Graphics3D/BuiltinShaders.hpp"
-#include "Graphics/Graphics3D/CubeMesh.hpp"
+#include "Desktop/CubeSpirv.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Dxgkrnl/CommandStream.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace desktop {
 
@@ -31,7 +31,7 @@ using graphics::ColoredVertex;
 using graphics::TexturedVertex;
 
 namespace {
-constexpr uint32_t kBackground = 0xFF10101A;
+constexpr uint32_t kBackground = kCubeBackground;
 
 // The color of each face of the flat cube (the order of build_textured_cube's faces).
 constexpr float kFaceColors[6][4] = {
@@ -44,6 +44,28 @@ enum : uint32_t { kListColor, kListDepth, kListVertices, kListIndices, kListLogo
 uint64_t now_us() { return hardware::uptime_us(); }
 }  // namespace
 
+const char* cube_api_name(CubeApi api) {
+  switch (api) {
+    case CubeApi::Direct3D: return "Direct3D";
+    case CubeApi::Vulkan: return "Vulkan";
+    case CubeApi::OpenGL: return "OpenGL";
+  }
+  return "?";
+}
+
+void build_cube_geometry(ArrayView<ColoredVertex> colored, ArrayView<TexturedVertex> textured, ArrayView<uint16_t> indices) {
+  graphics::build_textured_cube(textured, indices);
+  for (uint32_t i = 0; i < graphics::kCubeVertices; ++i) {
+    for (uint32_t k = 0; k < 3; ++k) colored[i].position[k] = textured[i].position[k];
+    for (uint32_t k = 0; k < 4; ++k) colored[i].color[k] = kFaceColors[i / 4][k];
+  }
+}
+
+bool render_cube_logo(allocators::IAllocator& allocator, ArrayView<uint32_t> texels) {
+  graphics::Logo logo(allocator);
+  return texels.size() == uint64_t{kCubeLogoSize} * kCubeLogoSize && logo.load(graphics::embedded_logo_png()) && logo.render(kCubeLogoSize, kBackground & 0xFFFFFF, texels);
+}
+
 struct CubeRenderer::State {
   Handle adapter = kNullHandle, device = kNullHandle, context = kNullHandle;
   Handle colored_pipeline = kNullHandle, textured_pipeline = kNullHandle;
@@ -51,7 +73,8 @@ struct CubeRenderer::State {
   Handle colored_vertices = kNullHandle, textured_vertices = kNullHandle, indices = kNullHandle, logo = kNullHandle;
 };
 
-CubeRenderer::CubeRenderer(allocators::IAllocator& allocator, Kernel& kernel, ProcessId pid) : allocator_(allocator), kernel_(kernel), pid_(pid) {
+CubeRenderer::CubeRenderer(allocators::IAllocator& allocator, Kernel& kernel, ProcessId pid, CubeApi api)
+    : allocator_(allocator), kernel_(kernel), pid_(pid), api_(api == CubeApi::Vulkan ? CubeApi::Vulkan : CubeApi::Direct3D) {
   process_open_ = status::ok(kernel_.open_process(pid_));
 }
 
@@ -110,8 +133,10 @@ bool CubeRenderer::write(Handle allocation, ConstByteView bytes) {
   return ok;
 }
 
-// The pipeline of the built-in colored or textured shaders: what a user-mode driver does with the private-data escape, here through the typed calls.
+// The pipeline of the built-in colored or textured shaders: what a user-mode driver does with the private-data escape, here through the typed calls. On the Vulkan path
+// the shaders are SPIR-V and go through the escape (create_spirv_pipeline).
 bool CubeRenderer::create_pipeline(bool textured, Handle* pipeline) {
+  if (api_ == CubeApi::Vulkan) return create_spirv_pipeline(textured, pipeline);
   Handle vs = kNullHandle, fs = kNullHandle;
   if (!status::ok(kernel_.create_shader(pid_, state_->device, {textured ? ShaderKind::TexturedVertex : ShaderKind::ColoredVertex, graphics::ShaderStage::Vertex, {}}, &vs)) ||
       !status::ok(kernel_.create_shader(pid_, state_->device, {textured ? ShaderKind::TexturedFragment : ShaderKind::ColoredFragment, graphics::ShaderStage::Fragment, {}}, &fs)))
@@ -132,16 +157,66 @@ bool CubeRenderer::create_pipeline(bool textured, Handle* pipeline) {
   return status::ok(kernel_.create_pipeline(pid_, state_->device, pd, pipeline));
 }
 
+// A shader made through the private-data escape, as vulkan-1.dll makes it: CreateShader, the kind (DXBC), the stage (the bytecode says it), the size, the bytecode.
+bool CubeRenderer::escape_create_shader(ConstByteView dxbc, Handle* shader) {
+  ByteBuffer request(allocator_);
+  if (dxbc.size() > 0xFFFFFFFFu || !request.put32(static_cast<uint32_t>(EscapeOp::CreateShader)) || !request.put32(static_cast<uint32_t>(ShaderKind::Dxbc)) || !request.put32(0) ||
+      !request.put32(static_cast<uint32_t>(dxbc.size())) || !request.append(dxbc))
+    return false;
+  uint8_t reply[4] = {};
+  uint32_t reply_bytes = 0;
+  if (!status::ok(kernel_.escape(pid_, state_->device, request.view(), ByteView(reply), &reply_bytes)) || reply_bytes != 4) return false;
+  ByteReader r{ConstByteView(reply)};
+  *shader = r.le32();
+  return r.ok() && *shader != kNullHandle;
+}
+
+// The Vulkan path: the cube's SPIR-V translated to DXBC (as vkCreateGraphicsPipelines does), the shaders and the pipeline made with the escape's words - the layout
+// vulkan-1.dll writes (vk_pipeline.inc) and the kernel's EscapeOp::CreatePipeline reads.
+bool CubeRenderer::create_spirv_pipeline(bool textured, Handle* pipeline) {
+  constexpr uint32_t kPushBytes = sizeof(graphics::ColoredConstants);
+  ByteBuffer vs_dxbc(allocator_), fs_dxbc(allocator_);
+  SpirvTranslation vs_info, fs_info;
+  if (!translate_spirv(allocator_, cube_spirv(textured, SpirvStage::Vertex), SpirvStage::Vertex, kPushBytes, vs_dxbc, &vs_info) ||
+      !translate_spirv(allocator_, cube_spirv(textured, SpirvStage::Fragment), SpirvStage::Fragment, kPushBytes, fs_dxbc, &fs_info))
+    return false;
+  Handle vs = kNullHandle, fs = kNullHandle;
+  if (!escape_create_shader(vs_dxbc.view(), &vs) || !escape_create_shader(fs_dxbc.view(), &fs)) return false;
+  // (the layout of the vertices is the built-in pipelines' own: position at location 0, the color or the coordinates at 1)
+  graphics::GraphicsPipelineDesc d;
+  if (textured) graphics::describe_textured_pipeline(&d);
+  else graphics::describe_colored_pipeline(&d);
+  uint32_t varyings = 0;
+  for (uint32_t l = 0; l < 32; ++l)
+    if ((vs_info.outputs >> l) & 1) varyings = l + 1;
+  ByteBuffer request(allocator_);
+  bool ok = request.put32(static_cast<uint32_t>(EscapeOp::CreatePipeline)) && request.put32(vs) && request.put32(fs) && request.put32(d.vertex_stride) &&
+            request.put32(d.attribute_count) && request.put32(varyings) && request.put32(fs_info.texture_units) &&
+            request.put32(static_cast<uint32_t>(graphics::CullMode::Back)) && request.put32(static_cast<uint32_t>(graphics::FrontFace::CounterClockwise)) &&
+            request.put32(1 | 2);   // (depth test and depth write, no blending)
+  for (uint32_t a = 0; a < 4; ++a) {
+    const bool used = a < d.attribute_count;
+    ok = ok && request.put32(used ? d.attributes[a].location : 0) && request.put32(used ? static_cast<uint32_t>(d.attributes[a].format) : 0) &&
+         request.put32(used ? d.attributes[a].offset : 0);
+  }
+  // (no stencil: enable, compare Always, the three ops Keep, the masks, the reference)
+  ok = ok && request.put32(0) && request.put32(static_cast<uint32_t>(graphics::CompareOp::Always)) && request.put32(0) && request.put32(0) && request.put32(0) && request.put32(0xFF) &&
+       request.put32(0xFF) && request.put32(0);
+  if (!ok) return false;
+  uint8_t reply[4] = {};
+  uint32_t reply_bytes = 0;
+  if (!status::ok(kernel_.escape(pid_, state_->device, request.view(), ByteView(reply), &reply_bytes)) || reply_bytes != 4) return false;
+  ByteReader r{ConstByteView(reply)};
+  *pipeline = r.le32();
+  return r.ok() && *pipeline != kNullHandle;
+}
+
 // The cube's vertices for both looks, and the indices both share.
 bool CubeRenderer::create_geometry() {
   TexturedVertex textured[graphics::kCubeVertices];
   ColoredVertex colored[graphics::kCubeVertices];
   uint16_t indices[graphics::kCubeIndices];
-  graphics::build_textured_cube(ArrayView<TexturedVertex>(textured, graphics::kCubeVertices), ArrayView<uint16_t>(indices, graphics::kCubeIndices));
-  for (uint32_t i = 0; i < graphics::kCubeVertices; ++i) {
-    for (uint32_t k = 0; k < 3; ++k) colored[i].position[k] = textured[i].position[k];
-    for (uint32_t k = 0; k < 4; ++k) colored[i].color[k] = kFaceColors[i / 4][k];
-  }
+  build_cube_geometry(ArrayView<ColoredVertex>(colored), ArrayView<TexturedVertex>(textured), ArrayView<uint16_t>(indices));
   State& s = *state_;
   return create_buffer(kAllocVertexBuffer, sizeof colored, &s.colored_vertices) && create_buffer(kAllocVertexBuffer, sizeof textured, &s.textured_vertices) &&
          create_buffer(kAllocIndexBuffer, sizeof indices, &s.indices) && write(s.colored_vertices, bytes_of(colored)) && write(s.textured_vertices, bytes_of(textured)) &&
@@ -150,9 +225,8 @@ bool CubeRenderer::create_geometry() {
 
 // The logo texture: best effort, an adapter that cannot do it just keeps the colors.
 bool CubeRenderer::create_logo() {
-  graphics::Logo logo(allocator_);
   ArrayView<uint32_t> texels = allocate_view<uint32_t>(allocator_, uint64_t{kLogoSize} * kLogoSize);
-  bool ok = !texels.empty() && logo.load(graphics::embedded_logo_png()) && logo.render(kLogoSize, kBackground & 0xFFFFFF, texels);
+  bool ok = !texels.empty() && render_cube_logo(allocator_, texels);
   State& s = *state_;
   if (ok) {
     AllocationDesc d;

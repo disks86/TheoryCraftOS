@@ -77,6 +77,10 @@ sent without a fence (the host answers when it has the commands, not when its GP
 a time (ntdll / msvcrt `libc_string.inc`, the kernel's `runtime.cpp`). Left: a written buffer is still sent whole (no range), and a present into a window reads the picture back
 from the host and the desktop composites it on the CPU.
 
+## The 3D Test window
+
+The desktop's 3D Test can draw its cube through the Vulkan path (SPIR-V translated by this DLL's translator, built into the kernel, then the escape), next to Direct3D; see [Direct3DKernelMode.md](Direct3DKernelMode.md#the-3d-test-window).
+
 ## Not done
 
 Geometry and tessellation shaders, storage images, texel buffers, occlusion and pipeline statistics queries (timestamps are done: the CPU's clock when the commands before them
