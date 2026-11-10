@@ -81,6 +81,7 @@ void GlContext::compile_shader(uint32_t id) {
   if (!m) { s->log.assign("out of memory"); return; }
   shader::GlslOptions glsl;
   glsl.desktop = desktop.active;
+  glsl.compile_only = desktop.active;      // (desktop GL: a shader may leave main or its functions' bodies to another shader of the program)
   const bool ok = shader::parse_glsl(*m, s->source.view(), s->type == 0x8B31 ? shader::Stage::Vertex : shader::Stage::Fragment, glsl);
   if (ok && !es3_ && m->glsl_version >= 300) {
     s->log.assign("ERROR: 0:1: '#version 300 es' needs a WebGL 2 context");
@@ -111,25 +112,44 @@ void GlContext::attach_shader(uint32_t program, uint32_t shader) {
   ProgramObj* p = program_at(program);
   ShaderObj* s = shader_at(shader);
   if (!p || !s) { set_error(INVALID_VALUE); return; }
-  uint32_t& slot = s->type == 0x8B31 ? p->vs : p->fs;
-  if (slot) { set_error(INVALID_OPERATION); return; }
-  slot = shader;
+  // The same shader twice is an error; so is a second shader of a stage, except in desktop GL.
+  if (p->has_shader(shader) || (!desktop.active && p->has_stage(s->type))) { set_error(INVALID_OPERATION); return; }
+  if (!p->shaders.push_back(ProgramObj::Attached{shader, s->type})) set_error(0x505);
 }
 
 void GlContext::detach_shader(uint32_t program, uint32_t shader) {
   ProgramObj* p = program_at(program);
   if (!p) { set_error(INVALID_VALUE); return; }
-  if (p->vs == shader) p->vs = 0;
-  else if (p->fs == shader) p->fs = 0;
-  else set_error(INVALID_OPERATION);
+  for (uint64_t i = 0; i < p->shaders.count(); ++i) {
+    if (p->shaders[i].id != shader) continue;
+    p->shaders.remove_at(i);
+    release_if_unattached(shader);
+    return;
+  }
+  set_error(INVALID_OPERATION);
+}
+
+// A shader deleted while attached goes once the last program lets it go.
+void GlContext::release_if_unattached(uint32_t shader) {
+  ShaderObj* s = shader_at(shader);
+  if (!s || !s->deleted) return;
+  for (auto& other : objects_->programs) if (other && other->has_shader(shader)) return;
+  objects_->shaders[shader - 1].reset();
+}
+
+void GlContext::free_program(uint32_t id) {
+  if (!id || id > objects_->programs.count() || !objects_->programs[id - 1]) return;
+  List<uint32_t> attached(a_);
+  for (const ProgramObj::Attached& s : objects_->programs[id - 1]->shaders) attached.push_back(s.id);
+  objects_->programs[id - 1].reset();
+  for (const uint32_t s : attached) release_if_unattached(s);
 }
 
 uint32_t GlContext::attached_shaders(uint32_t program, uint32_t* out, uint32_t max) {
   ProgramObj* p = program_at(program);
   uint32_t n = 0;
   if (!p) return 0;
-  if (p->vs && n < max) out[n++] = p->vs;
-  if (p->fs && n < max) out[n++] = p->fs;
+  for (const ProgramObj::Attached& s : p->shaders) if (n < max) out[n++] = s.id;
   return n;
 }
 
@@ -220,17 +240,32 @@ void GlContext::link_program(uint32_t id) {
   p->vmach.reset();
   p->release_accel();
   p->fmach.reset();
-  ShaderObj* vs = shader_at(p->vs);
-  ShaderObj* fs = shader_at(p->fs);
-  if (!vs || !fs) { link_failed(p, "a program needs a vertex and a fragment shader"); return; }
-  if (!vs->compiled || !fs->compiled || !vs->module || !fs->module) { link_failed(p, "attached shaders did not compile"); return; }
+  // Every attached shader of a stage, in the order attached (each must have compiled).
+  List<StringView> vs_sources(a_), fs_sources(a_);
+  for (const ProgramObj::Attached& at : p->shaders) {
+    ShaderObj* s = shader_at(at.id);
+    if (!s || !s->compiled || !s->module) { link_failed(p, "attached shaders did not compile"); return; }
+    if (!(at.type == 0x8B31 ? vs_sources : fs_sources).push_back(s->source.view())) { link_failed(p, "out of memory"); return; }
+  }
+  if (vs_sources.empty() || fs_sources.empty()) { link_failed(p, "a program needs a vertex and a fragment shader"); return; }
   shader::GlslOptions link_glsl;
   link_glsl.desktop = desktop.active;
   // Each program owns its own parse of the shaders, so recompiling a shader later does not change it.
   p->vsm = UniquePointer<shader::Module>::make(a_, a_);
   p->fsm = UniquePointer<shader::Module>::make(a_, a_);
-  if (!p->vsm || !p->fsm || !shader::parse_glsl(*p->vsm, vs->source.view(), shader::Stage::Vertex, link_glsl) || !shader::parse_glsl(*p->fsm, fs->source.view(), shader::Stage::Fragment, link_glsl)) {
-    link_failed(p, "could not prepare the shaders");
+  if (!p->vsm || !p->fsm) { link_failed(p, "out of memory"); return; }
+  if (!shader::parse_glsl_units(*p->vsm, static_cast<const List<StringView>&>(vs_sources).view(), shader::Stage::Vertex, link_glsl)) {
+    String why(a_);
+    why.assign("vertex shader: ");
+    why.append(p->vsm->error.view());
+    link_failed(p, why.view());
+    return;
+  }
+  if (!shader::parse_glsl_units(*p->fsm, static_cast<const List<StringView>&>(fs_sources).view(), shader::Stage::Fragment, link_glsl)) {
+    String why(a_);
+    why.assign("fragment shader: ");
+    why.append(p->fsm->error.view());
+    link_failed(p, why.view());
     return;
   }
   const shader::Module& vm = *p->vsm;
@@ -380,7 +415,7 @@ bool GlContext::program_status(uint32_t id, uint32_t pname, double* out) {
     case 0x8B80: *out = p->deleted; return true;
     case 0x8B82: *out = p->linked; return true;
     case 0x8B83: *out = p->validate_ok; return true;
-    case 0x8B85: *out = (p->vs ? 1 : 0) + (p->fs ? 1 : 0); return true;
+    case 0x8B85: *out = static_cast<double>(p->shaders.count()); return true;
     case 0x8B86: *out = p->uniforms.count(); return true;
     case 0x8B89: *out = p->attribs.count(); return true;
     case 0x8B87: { uint64_t m = 0; for (auto& u : p->uniforms) if (u->name.size() + 1 > m) m = u->name.size() + 1; *out = static_cast<double>(m); return true; }
