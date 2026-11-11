@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// Host-side tests for the SPIR-V to DXBC translator of vulkan-1.dll (src/Windows/vulkan-1/spirv.inc): shaders compiled by glslc (tests/data/spirv, the GLSL next to the SPIR-V) are
+// Host-side tests for the SPIR-V to DXBC translator of vulkan-1.dll (src/Vulkan/spirv.inc): shaders compiled by glslc (tests/data/spirv, the GLSL next to the SPIR-V) are
 // translated, taken by the kernel's DXBC front end, run by its shader interpreter and compared with a C++ model of the same GLSL. Truncated and bit-flipped modules must be refused
 // or translated, never crash (this runs under ASan and UBSan).
 #include <math.h>

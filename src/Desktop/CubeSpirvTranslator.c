@@ -16,6 +16,6 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* The SPIR-V to DXBC translator of vulkan-1.dll (freestanding C), built into the kernel for the 3D test's Vulkan path (Desktop/CubeSpirv.hpp), so the kernel side gets
+/* The SPIR-V to DXBC translator of the Vulkan driver (src/Vulkan, freestanding C), built into the kernel for the 3D test's Vulkan path (Desktop/CubeSpirv.hpp), so the kernel side gets
  * exactly the DXBC the DLL would send it. */
-#include "../Windows/vulkan-1/spirv.inc"
+#include "../Vulkan/spirv.inc"

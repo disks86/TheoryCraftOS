@@ -260,9 +260,14 @@ uint64_t thunk(Call& call) {
   if (!s.ok()) return s.failure();
   return F(s, call, call.arg(0));
 }
+// Registers a service of this layer (unlocked: the Direct3D kernel has its own locks) and notes it as one of the D3DKMT services, which a Linux process may call through
+// /dev/dxg (src/Process/DxgDevice.h).
+void register_service(WindowsSyscallNumber number, Handler handler);
+// True if `service` is a service registered with register_service.
+bool is_service(uint32_t service);
 template <ThunkFn F>
 inline void add(WindowsSyscallNumber number) {
-  register_handler(number, &thunk<F>, false);
+  register_service(number, &thunk<F>);
 }
 
 // A user pointer that is null is STATUS_INVALID_PARAMETER, one that cannot be read STATUS_ACCESS_VIOLATION.

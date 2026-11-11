@@ -19,36 +19,137 @@
 /* vulkan-1.dll for TheoryCraftOS: the Vulkan loader and the one driver behind it. A real vulkan-1.dll finds the drivers of the installed GPUs and forwards the calls to them; this OS has
  * one graphics architecture for every GPU it drives (docs/Direct3DKernelMode.md): the kernel-mode Direct3D layer (dxgkrnl, reached with the D3DKMT* services of gdi32.dll) owns the
  * adapters, video memory and command queues, and replays a device-independent command stream on whatever the adapter is - the CPU renderer, virgl, SVGA3D, Intel Gen9, V3D, Radeon Vega.
- * So the driver here is written once, over that layer, and works for all of them:
+ * So the driver is written once, over that layer, and works for all of them - and for Linux programs too: the driver is src/Vulkan (docs/Vulkan.md), shared with the Linux
+ * libvulkan (src/Linux/libvulkan), which reaches the same services through /dev/dxg.
  *
- *   - the adapters are the kernel's (vkEnumeratePhysicalDevices); the limits, features and formats are what the adapter reports (QueryAdapterInfo: texture units, push constant bytes,
- *     the DeviceFeature bits), not what a desktop GPU has - a draw that needs more than the adapter has is refused when the pipeline is made;
- *   - shaders are SPIR-V, translated to DXBC (spirv.inc) and handed to the kernel as DXBC through its private escape;
- *   - a command buffer is recorded and run at vkQueueSubmit: draws become the kernel's command stream (one stream per render pass), copies and clears that the CPU can do are done in
- *     order with it; every submission has run when vkQueueSubmit returns, so fences, semaphores and events only keep a state;
- *   - memory is host memory; a buffer or image that the GPU uses is copied to its kernel allocation when the program has written the memory since it was last copied;
- *   - presentation flips a swapchain image onto the display.
- * Not here: compute, geometry and tessellation shaders, storage buffers and images, texel buffers, queries, indirect draws, sparse resources, a second queue, Vulkan 1.1 and later (the
- * driver is a 1.0 driver). vkGetInstanceProcAddr answers NULL for what is not here and the exports that exist for the sake of linking answer VK_ERROR_FEATURE_NOT_PRESENT
- * (src/Windows/stubs/vulkan-1.inc). Built freestanding over kernel32.dll, gdi32.dll and user32.dll with the OS's mingw compiler. */
+ * This file is the Windows layer of it (vk_os.h): memory from the process heap, diagnostics to the debugger, the clock of QueryPerformanceCounter, the D3DKMT functions of
+ * gdi32.dll, and VK_KHR_win32_surface (a window's client size from user32.dll). vkGetInstanceProcAddr answers NULL for what is not implemented and the exports that exist for the
+ * sake of linking answer VK_ERROR_FEATURE_NOT_PRESENT (src/Windows/stubs/vulkan-1.inc). Built freestanding over kernel32.dll, gdi32.dll and user32.dll with the OS's mingw compiler. */
 #define WIN32_LEAN_AND_MEAN
 #define VK_USE_PLATFORM_WIN32_KHR
-#define VK_NO_PROTOTYPES_DISABLED 0
 #include <windows.h>
-#include "khronos/vulkan/vulkan_core.h"
-#include "khronos/vulkan/vulkan_win32.h"
-#include "spirv.h"
-#include "spirv.inc"
+#include "../../Vulkan/khronos/vulkan/vulkan_core.h"
+#include "../../Vulkan/khronos/vulkan/vulkan_win32.h"
+
+#define VK_OS_NAME "vulkan-1"
+#define VK_OS_EXPORT __declspec(dllexport)
+#define VK_OS_INSTANCE_EXTENSIONS {VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
+#define VK_OS_PROCS(X) X(vkCreateWin32SurfaceKHR) X(vkGetPhysicalDeviceWin32PresentationSupportKHR)
+#include "../../Vulkan/vk_driver.inc"
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
-#include "vk_base.inc"
-#include "vk_instance.inc"
-#include "vk_resources.inc"
-#include "vk_pipeline.inc"
-#include "vk_commands.inc"
-#include "vk_wsi.inc"
-#include "vk_entry.inc"
+/* ---- memory (the DLL is freestanding: these are the C library's for the compiler and the driver) ---------------------------------------------------------------------- */
+void *memcpy(void *d, const void *s, size_t n) {
+  uint8_t *p = d;
+  const uint8_t *q = s;
+  while (n--) *p++ = *q++;
+  return d;
+}
+void *memmove(void *d, const void *s, size_t n) {
+  uint8_t *p = d;
+  const uint8_t *q = s;
+  if (p < q) {
+    while (n--) *p++ = *q++;
+  } else {
+    p += n;
+    q += n;
+    while (n--) *--p = *--q;
+  }
+  return d;
+}
+void *memset(void *d, int c, size_t n) {
+  uint8_t *p = d;
+  while (n--) *p++ = (uint8_t)c;
+  return d;
+}
+
+static void *vk_alloc(size_t bytes) { return bytes ? HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes) : NULL; }
+static void vk_free(void *p) {
+  if (p) HeapFree(GetProcessHeap(), 0, p);
+}
+
+/* ---- diagnostics and the clock ------------------------------------------------------------------------------------------------------------------------------------------ */
+static void vk_os_trace(const char *text) {
+  char name[8];
+  OutputDebugStringA(text);
+  if (GetEnvironmentVariableA("VULKAN_1_DEBUG", name, sizeof name)) {
+    DWORD written;
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    if (h && h != INVALID_HANDLE_VALUE) WriteFile(h, text, (DWORD)cstrlen(text), &written, NULL);
+  }
+}
+
+static uint64_t vk_os_now_ns(void) {
+  static LARGE_INTEGER frequency;
+  LARGE_INTEGER t;
+  if (!frequency.QuadPart && !QueryPerformanceFrequency(&frequency)) return 0;
+  QueryPerformanceCounter(&t);
+  return (uint64_t)(t.QuadPart / frequency.QuadPart) * 1000000000ull + (uint64_t)(t.QuadPart % frequency.QuadPart) * 1000000000ull / (uint64_t)frequency.QuadPart;
+}
+
+/* ---- the D3DKMT services of gdi32.dll ----------------------------------------------------------------------------------------------------------------------------------- */
+#define KMT_DECL(name) __declspec(dllimport) LONG WINAPI name(void *params)
+KMT_DECL(D3DKMTEnumAdapters2);
+KMT_DECL(D3DKMTOpenAdapterFromLuid);
+KMT_DECL(D3DKMTCloseAdapter);
+KMT_DECL(D3DKMTQueryAdapterInfo);
+KMT_DECL(D3DKMTCreateDevice);
+KMT_DECL(D3DKMTDestroyDevice);
+KMT_DECL(D3DKMTCreateContext);
+KMT_DECL(D3DKMTDestroyContext);
+KMT_DECL(D3DKMTCreateAllocation);
+KMT_DECL(D3DKMTDestroyAllocation);
+KMT_DECL(D3DKMTLock);
+KMT_DECL(D3DKMTUnlock);
+KMT_DECL(D3DKMTRender);
+KMT_DECL(D3DKMTPresent);
+KMT_DECL(D3DKMTEscape);
+KMT_DECL(D3DKMTGetDisplayModeList);
+KMT_DECL(D3DKMTGetDeviceState);
+
+#define STATUS_NOT_IMPLEMENTED_KMT ((KmtStatus)0xC0000002u)
+static KmtStatus kmt(uint32_t service, void *params) {
+  switch (service) {
+    case TCOS_DXG_ENUM_ADAPTERS2: return D3DKMTEnumAdapters2(params);
+    case TCOS_DXG_OPEN_ADAPTER_FROM_LUID: return D3DKMTOpenAdapterFromLuid(params);
+    case TCOS_DXG_CLOSE_ADAPTER: return D3DKMTCloseAdapter(params);
+    case TCOS_DXG_QUERY_ADAPTER_INFO: return D3DKMTQueryAdapterInfo(params);
+    case TCOS_DXG_CREATE_DEVICE: return D3DKMTCreateDevice(params);
+    case TCOS_DXG_DESTROY_DEVICE: return D3DKMTDestroyDevice(params);
+    case TCOS_DXG_CREATE_CONTEXT: return D3DKMTCreateContext(params);
+    case TCOS_DXG_DESTROY_CONTEXT: return D3DKMTDestroyContext(params);
+    case TCOS_DXG_CREATE_ALLOCATION: return D3DKMTCreateAllocation(params);
+    case TCOS_DXG_DESTROY_ALLOCATION: return D3DKMTDestroyAllocation(params);
+    case TCOS_DXG_LOCK: return D3DKMTLock(params);
+    case TCOS_DXG_UNLOCK: return D3DKMTUnlock(params);
+    case TCOS_DXG_RENDER: return D3DKMTRender(params);
+    case TCOS_DXG_PRESENT: return D3DKMTPresent(params);
+    case TCOS_DXG_ESCAPE: return D3DKMTEscape(params);
+    case TCOS_DXG_GET_DISPLAY_MODE_LIST: return D3DKMTGetDisplayModeList(params);
+    case TCOS_DXG_GET_DEVICE_STATE: return D3DKMTGetDeviceState(params);
+    default: return STATUS_NOT_IMPLEMENTED_KMT;
+  }
+}
+
+/* ---- VK_KHR_win32_surface ----------------------------------------------------------------------------------------------------------------------------------------------- */
+enum { SURFACE_WIN32 = 1 };
+
+VKAPI VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *ci, const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
+  (void)instance, (void)alloc;
+  return make_surface((uint64_t)(ULONG_PTR)ci->hwnd, SURFACE_WIN32, out);
+}
+VKAPI VkBool32 VKAPI_CALL vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice pd, uint32_t family) {
+  (void)pd;
+  return family == 0;
+}
+
+static bool vk_os_surface_extent(const Surface *s, uint32_t *w, uint32_t *h) {
+  RECT r;
+  if (!s->window || !GetClientRect((HWND)(ULONG_PTR)s->window, &r)) return false;
+  *w = (uint32_t)(r.right - r.left), *h = (uint32_t)(r.bottom - r.top);
+  return true;
+}
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module, (void)reason, (void)reserved;

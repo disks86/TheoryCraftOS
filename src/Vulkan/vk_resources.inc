@@ -1,4 +1,4 @@
-/* vulkan-1.c, part 3: memory, buffers, images, samplers, shaders, descriptors, render passes. */
+/* The Vulkan driver, part 3: memory, buffers, images, samplers, shaders, descriptors, render passes. */
 
 /* ---- memory ------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 VKAPI VkResult VKAPI_CALL vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *alloc, VkDeviceMemory *out) {
@@ -28,7 +28,7 @@ VKAPI VkResult VKAPI_CALL vkMapMemory(VkDevice device, VkDeviceMemory memory, Vk
   (void)device, (void)flags;
   if (m->type == 0 || m->mapped || offset >= m->size) return VK_ERROR_MEMORY_MAP_FAILED;
   if (size != VK_WHOLE_SIZE && size > m->size - offset) return VK_ERROR_MEMORY_MAP_FAILED;
-  m->mapped = TRUE;
+  m->mapped = true;
   ++m->version;
   *data = m->data + offset;
   return VK_SUCCESS;
@@ -36,12 +36,12 @@ VKAPI VkResult VKAPI_CALL vkMapMemory(VkDevice device, VkDeviceMemory memory, Vk
 VKAPI void VKAPI_CALL vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
   Mem *m = (Mem *)memory;
   (void)device;
-  m->mapped = FALSE;
+  m->mapped = false;
   ++m->version;
 }
 VKAPI VkResult VKAPI_CALL vkFlushMappedMemoryRanges(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges) {
   (void)device;
-  for (UINT i = 0; i < count; ++i) ++((Mem *)ranges[i].memory)->version;
+  for (uint32_t i = 0; i < count; ++i) ++((Mem *)ranges[i].memory)->version;
   return VK_SUCCESS;
 }
 VKAPI VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges) {
@@ -54,11 +54,11 @@ VKAPI void VKAPI_CALL vkGetDeviceMemoryCommitment(VkDevice device, VkDeviceMemor
 }
 
 /* The submissions so far (vkQueueSubmit counts them). */
-static UINT g_submission;
+static uint32_t g_submission;
 
 /* The version of a memory object, counting a mapped one as written once in each submission (a mapping is how the program writes without telling us; Vulkan makes what the host
  * wrote visible to the commands of a submission when it is submitted, not while it runs, so a buffer used by many draws of one submission is brought up once). */
-static UINT mem_version(Mem *m) {
+static uint32_t mem_version(Mem *m) {
   if (m->mapped && m->seen_submission != g_submission) {
     ++m->version;
     m->seen_submission = g_submission;
@@ -100,29 +100,29 @@ VKAPI VkResult VKAPI_CALL vkBindBufferMemory(VkDevice device, VkBuffer buffer, V
 }
 
 /* The buffer's contents on the GPU side (made when the buffer is first used by a draw; brought up to date when the program has written the memory since). */
-static BOOL buf_sync(Buf *b, UINT *alloc_out) {
-  if (!b->mem) return FALSE;
+static bool buf_sync(Buf *b, uint32_t *alloc_out) {
+  if (!b->mem) return false;
   if (!b->alloc) {
-    UINT flags = 0;
+    uint32_t flags = 0;
     if (b->usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) flags |= A_VERTEX;
     if (b->usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) flags |= A_INDEX;
     if (b->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) flags |= A_UAV;
     if (!flags) flags = A_VERTEX;
-    ULONGLONG size = (b->size + 15) & ~15ull;
+    uint64_t size = (b->size + 15) & ~15ull;
     if (size < 16) size = 16;
-    if (!kmt_make_buffer(b->dev, size, flags, &b->alloc)) return FALSE;
+    if (!kmt_make_buffer(b->dev, size, flags, &b->alloc)) return false;
     b->synced = 0;
   }
-  UINT version = mem_version(b->mem);
+  uint32_t version = mem_version(b->mem);
   if (b->synced != version) {
-    const BYTE *now = b->mem->data + b->off;
+    const uint8_t *now = b->mem->data + b->off;
     /* Mapped memory counts as written in every submission whether the program wrote it or not: what is the same as last time (static geometry an engine keeps mapped) is not
      * copied up again. A buffer the CPU writes through the driver (copies, updates) or that the GPU wrote (sent is dropped) is copied as before. */
     if (b->sent && b->synced != 0 && memcmp(b->sent, now, (size_t)b->size) == 0) {
       b->synced = version;
     } else {
-      BYTE *p = kmt_lock(b->dev, b->alloc, 0, LOCK_DISCARD);
-      if (!p) return FALSE;
+      uint8_t *p = kmt_lock(b->dev, b->alloc, 0, LOCK_DISCARD);
+      if (!p) return false;
       memcpy(p, now, (size_t)b->size);
       kmt_unlock(b->dev, b->alloc);
       b->synced = version;
@@ -131,15 +131,15 @@ static BOOL buf_sync(Buf *b, UINT *alloc_out) {
     }
   }
   *alloc_out = b->alloc;
-  return TRUE;
+  return true;
 }
 
 /* What the GPU wrote into bytes off .. off + size of a buffer (a storage buffer of a dispatch or a draw) back into its memory, so that the program, the copies the CPU does and the
  * uniform data read from the memory see it. The buffer stays in step: nothing is copied up again for it. */
-static void buf_readback(Buf *b, ULONGLONG off, ULONGLONG size) {
+static void buf_readback(Buf *b, uint64_t off, uint64_t size) {
   if (!b->mem || !b->alloc || off >= b->size) return;
   if (size > b->size - off) size = b->size - off;
-  BYTE *p = kmt_lock(b->dev, b->alloc, 0, LOCK_READ_ONLY);
+  uint8_t *p = kmt_lock(b->dev, b->alloc, 0, LOCK_READ_ONLY);
   if (!p) return;
   memcpy(b->mem->data + b->off + off, p + off, (size_t)size);
   kmt_unlock(b->dev, b->alloc);
@@ -148,20 +148,20 @@ static void buf_readback(Buf *b, ULONGLONG off, ULONGLONG size) {
 }
 
 /* ---- images ---------------------------------------------------------------------------------------------------------------------------------------------------------------- */
-static UINT level_extent(UINT v, UINT level) {
+static uint32_t level_extent(uint32_t v, uint32_t level) {
   v >>= level;
   return v ? v : 1;
 }
 
-static ULONGLONG image_total_bytes(const Img *img) {
-  ULONGLONG total = 0;
-  for (UINT l = 0; l < img->mips; ++l) total += (ULONGLONG)level_extent(img->w, l) * level_extent(img->h, l) * img->bpp * (img->layers > 1 ? img->layers : 1) * (img->kind == 1 ? 1 : 1);
+static uint64_t image_total_bytes(const Img *img) {
+  uint64_t total = 0;
+  for (uint32_t l = 0; l < img->mips; ++l) total += (uint64_t)level_extent(img->w, l) * level_extent(img->h, l) * img->bpp * (img->layers > 1 ? img->layers : 1) * (img->kind == 1 ? 1 : 1);
   return total * (img->kind == 1 ? img->depth : 1);
 }
 
 static VkResult image_create_allocation(Img *img) {
   Device *d = img->dev;
-  UINT flags = 0;
+  uint32_t flags = 0;
   if (img->is_depth) {
     flags = A_DEPTH;
   } else {
@@ -177,7 +177,7 @@ static VkResult image_create_allocation(Img *img) {
      * refuses to make one, and the present that needs it resident would lose the context). Copies and clears need no texture: the CPU does them on the image's memory. */
     if (img->swapchain) flags = A_TARGET | A_PRESENT | ((img->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ? A_TEXTURE : 0);
   }
-  UINT w[AW_WORDS];
+  uint32_t w[AW_WORDS];
   memset(w, 0, sizeof w);
   w[AW_VERSION] = 1;
   w[AW_FLAGS] = flags;
@@ -188,7 +188,7 @@ static VkResult image_create_allocation(Img *img) {
   w[AW_KIND] = img->kind;
   w[AW_SAMPLES] = img->samples;
   w[AW_LAYERS] = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
-  UINT pitch = 0;
+  uint32_t pitch = 0;
   if (!kmt_create_allocation(d, w, &pitch, &img->alloc)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   img->pitch = pitch ? pitch : img->w * img->bpp;
   return VK_SUCCESS;
@@ -202,8 +202,8 @@ VKAPI VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo
   if (!fi) return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if (ci->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) return VK_ERROR_FEATURE_NOT_PRESENT;
   if (ci->usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-  UINT kind = 0;
-  UINT layers = ci->arrayLayers;
+  uint32_t kind = 0;
+  uint32_t layers = ci->arrayLayers;
   if (ci->imageType == VK_IMAGE_TYPE_3D) {
     if (!(pd->caps.features & FEAT_TEXTURE_KINDS) || ci->mipLevels != 1) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     kind = 1;
@@ -219,7 +219,7 @@ VKAPI VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo
     kind = 2;
   }
   if (ci->extent.width > pd->caps.max_texture_dimension || ci->extent.height > pd->caps.max_texture_dimension) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-  UINT samples = ci->samples;
+  uint32_t samples = ci->samples;
   if (samples != 1 && (!(pd->caps.features & FEAT_MULTISAMPLE) || !((pd->caps.sample_counts >> samples) & 1))) return VK_ERROR_FORMAT_NOT_SUPPORTED;
   Img *img = vk_alloc(sizeof(Img));
   if (!img) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -265,25 +265,25 @@ VKAPI void VKAPI_CALL vkGetImageSparseMemoryRequirements(VkDevice device, VkImag
 VKAPI void VKAPI_CALL vkGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource *sub, VkSubresourceLayout *layout) {
   (void)device;
   Img *img = (Img *)image;
-  ULONGLONG off = 0;
-  for (UINT l = 0; l < sub->mipLevel && l < img->mips; ++l) off += (ULONGLONG)level_extent(img->w, l) * level_extent(img->h, l) * img->bpp;
+  uint64_t off = 0;
+  for (uint32_t l = 0; l < sub->mipLevel && l < img->mips; ++l) off += (uint64_t)level_extent(img->w, l) * level_extent(img->h, l) * img->bpp;
   layout->offset = off;
-  layout->rowPitch = (ULONGLONG)level_extent(img->w, sub->mipLevel) * img->bpp;
+  layout->rowPitch = (uint64_t)level_extent(img->w, sub->mipLevel) * img->bpp;
   layout->size = layout->rowPitch * level_extent(img->h, sub->mipLevel);
   layout->arrayPitch = layout->size;
   layout->depthPitch = layout->size;
 }
 
 /* The memory of a linear image to the allocation, and back: a program that maps an image sees the rows of each level one after the other. */
-static void image_levels_copy(Img *img, BOOL to_gpu) {
+static void image_levels_copy(Img *img, bool to_gpu) {
   if (!img->mem) return;
-  ULONGLONG off = img->off;
-  UINT layers = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
-  for (UINT l = 0; l < img->mips; ++l) {
-    UINT w = level_extent(img->w, l), h = level_extent(img->h, l);
-    ULONGLONG bytes = (ULONGLONG)w * h * img->bpp * layers;
+  uint64_t off = img->off;
+  uint32_t layers = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
+  for (uint32_t l = 0; l < img->mips; ++l) {
+    uint32_t w = level_extent(img->w, l), h = level_extent(img->h, l);
+    uint64_t bytes = (uint64_t)w * h * img->bpp * layers;
     if (off + bytes > img->mem->size) return;
-    BYTE *p = kmt_lock(img->dev, img->alloc, l, to_gpu ? LOCK_DISCARD : LOCK_READ_ONLY);
+    uint8_t *p = kmt_lock(img->dev, img->alloc, l, to_gpu ? LOCK_DISCARD : LOCK_READ_ONLY);
     if (!p) return;
     if (to_gpu) {
       memcpy(p, img->mem->data + off, (size_t)bytes);
@@ -298,14 +298,14 @@ static void image_levels_copy(Img *img, BOOL to_gpu) {
 }
 static void image_sync_up(Img *img) {
   if (img->tiling != VK_IMAGE_TILING_LINEAR || !img->mem) return;
-  UINT v = mem_version(img->mem);
+  uint32_t v = mem_version(img->mem);
   if (img->synced == v) return;
-  image_levels_copy(img, TRUE);
+  image_levels_copy(img, true);
   img->synced = v;
 }
 static void image_sync_down(Img *img) {
   if (img->tiling != VK_IMAGE_TILING_LINEAR || !img->mem) return;
-  image_levels_copy(img, FALSE);
+  image_levels_copy(img, false);
   img->synced = mem_version(img->mem);
 }
 
@@ -335,7 +335,7 @@ VKAPI void VKAPI_CALL vkDestroyBufferView(VkDevice device, VkBufferView view, co
   (void)device, (void)view, (void)alloc;
 }
 
-static UINT address_mode(VkSamplerAddressMode m) { return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ? 0 : 1; }
+static uint32_t address_mode(VkSamplerAddressMode m) { return m == VK_SAMPLER_ADDRESS_MODE_REPEAT || m == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT ? 0 : 1; }
 
 VKAPI VkResult VKAPI_CALL vkCreateSampler(VkDevice device, const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *alloc, VkSampler *out) {
   (void)device, (void)alloc;
@@ -364,7 +364,7 @@ VKAPI VkResult VKAPI_CALL vkCreateShaderModule(VkDevice device, const VkShaderMo
     return VK_ERROR_OUT_OF_HOST_MEMORY;
   }
   memcpy(s->words, ci->pCode, ci->codeSize);
-  s->nwords = (UINT)(ci->codeSize / 4);
+  s->nwords = (uint32_t)(ci->codeSize / 4);
   *out = (VkShaderModule)s;
   return VK_SUCCESS;
 }
@@ -397,7 +397,7 @@ VKAPI VkResult VKAPI_CALL vkMergePipelineCaches(VkDevice device, VkPipelineCache
 
 /* ---- synchronisation objects: every submission has run when vkQueueSubmit returns, so these only keep a state ------------------------------------------------------ */
 typedef struct Fence {
-  BOOL signaled;
+  bool signaled;
 } Fence;
 VKAPI VkResult VKAPI_CALL vkCreateFence(VkDevice device, const VkFenceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkFence *out) {
   (void)device, (void)alloc;
@@ -413,7 +413,7 @@ VKAPI void VKAPI_CALL vkDestroyFence(VkDevice device, VkFence fence, const VkAll
 }
 VKAPI VkResult VKAPI_CALL vkResetFences(VkDevice device, uint32_t count, const VkFence *fences) {
   (void)device;
-  for (UINT i = 0; i < count; ++i) ((Fence *)fences[i])->signaled = FALSE;
+  for (uint32_t i = 0; i < count; ++i) ((Fence *)fences[i])->signaled = false;
   return VK_SUCCESS;
 }
 VKAPI VkResult VKAPI_CALL vkGetFenceStatus(VkDevice device, VkFence fence) {
@@ -422,8 +422,8 @@ VKAPI VkResult VKAPI_CALL vkGetFenceStatus(VkDevice device, VkFence fence) {
 }
 VKAPI VkResult VKAPI_CALL vkWaitForFences(VkDevice device, uint32_t count, const VkFence *fences, VkBool32 wait_all, uint64_t timeout) {
   (void)device, (void)timeout;
-  UINT signaled = 0;
-  for (UINT i = 0; i < count; ++i) signaled += ((Fence *)fences[i])->signaled;
+  uint32_t signaled = 0;
+  for (uint32_t i = 0; i < count; ++i) signaled += ((Fence *)fences[i])->signaled;
   return (wait_all ? signaled == count : signaled > 0) ? VK_SUCCESS : VK_TIMEOUT;
 }
 VKAPI VkResult VKAPI_CALL vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo *ci, const VkAllocationCallbacks *alloc, VkSemaphore *out) {
@@ -446,33 +446,27 @@ VKAPI void VKAPI_CALL vkDestroyEvent(VkDevice device, VkEvent e, const VkAllocat
 }
 VKAPI VkResult VKAPI_CALL vkGetEventStatus(VkDevice device, VkEvent e) {
   (void)device;
-  return *(UINT *)e ? VK_EVENT_SET : VK_EVENT_RESET;
+  return *(uint32_t *)e ? VK_EVENT_SET : VK_EVENT_RESET;
 }
 VKAPI VkResult VKAPI_CALL vkSetEvent(VkDevice device, VkEvent e) {
   (void)device;
-  *(UINT *)e = 1;
+  *(uint32_t *)e = 1;
   return VK_SUCCESS;
 }
 VKAPI VkResult VKAPI_CALL vkResetEvent(VkDevice device, VkEvent e) {
   (void)device;
-  *(UINT *)e = 0;
+  *(uint32_t *)e = 0;
   return VK_SUCCESS;
 }
 /* Queries: timestamps. Every submission has run when vkQueueSubmit returns, so a timestamp is the time when the commands before it have run (the CPU's clock, in
  * nanoseconds: timestampPeriod 1); the pool keeps the values and whether each is there. Occlusion and pipeline statistics queries are not done. */
 typedef struct QueryPool {
-  ULONGLONG *value;
-  BYTE *available;
-  UINT count;
+  uint64_t *value;
+  uint8_t *available;
+  uint32_t count;
 } QueryPool;
 
-static ULONGLONG now_ns(void) {
-  static LARGE_INTEGER frequency;
-  LARGE_INTEGER t;
-  if (!frequency.QuadPart && !QueryPerformanceFrequency(&frequency)) return 0;
-  QueryPerformanceCounter(&t);
-  return (ULONGLONG)(t.QuadPart / frequency.QuadPart) * 1000000000ull + (ULONGLONG)(t.QuadPart % frequency.QuadPart) * 1000000000ull / (ULONGLONG)frequency.QuadPart;
-}
+static uint64_t now_ns(void) { return vk_os_now_ns(); }
 
 VKAPI VkResult VKAPI_CALL vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *alloc, VkQueryPool *out) {
   (void)device, (void)alloc;
@@ -480,7 +474,7 @@ VKAPI VkResult VKAPI_CALL vkCreateQueryPool(VkDevice device, const VkQueryPoolCr
   QueryPool *p = vk_alloc(sizeof(QueryPool));
   if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
   p->count = ci->queryCount;
-  p->value = vk_alloc(sizeof(ULONGLONG) * p->count);
+  p->value = vk_alloc(sizeof(uint64_t) * p->count);
   p->available = vk_alloc(p->count);
   if (!p->value || !p->available) {
     vk_free(p->value), vk_free(p->available), vk_free(p);
@@ -496,20 +490,20 @@ VKAPI void VKAPI_CALL vkDestroyQueryPool(VkDevice device, VkQueryPool pool, cons
   vk_free(p->value), vk_free(p->available), vk_free(p);
 }
 
-/* The results of queries first .. first + count - 1 into `data` (`stride` bytes apart) as vkGetQueryPoolResults and vkCmdCopyQueryPoolResults write them. FALSE: one is not there. */
-static BOOL query_results(const QueryPool *p, UINT first, UINT count, BYTE *data, ULONGLONG size, ULONGLONG stride, VkQueryResultFlags flags) {
-  BOOL all = TRUE;
-  const UINT word = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
-  const UINT need = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2 * word : word;
-  for (UINT q = 0; q < count && first + q < p->count; ++q) {
-    if ((ULONGLONG)q * stride + need > size) break;
-    BYTE *at = data + (ULONGLONG)q * stride;
-    const BOOL there = p->available[first + q] != 0;
+/* The results of queries first .. first + count - 1 into `data` (`stride` bytes apart) as vkGetQueryPoolResults and vkCmdCopyQueryPoolResults write them. false: one is not there. */
+static bool query_results(const QueryPool *p, uint32_t first, uint32_t count, uint8_t *data, uint64_t size, uint64_t stride, VkQueryResultFlags flags) {
+  bool all = true;
+  const uint32_t word = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+  const uint32_t need = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2 * word : word;
+  for (uint32_t q = 0; q < count && first + q < p->count; ++q) {
+    if ((uint64_t)q * stride + need > size) break;
+    uint8_t *at = data + (uint64_t)q * stride;
+    const bool there = p->available[first + q] != 0;
     all &= there;
     if (there || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-      const ULONGLONG v = there ? p->value[first + q] : 0;
+      const uint64_t v = there ? p->value[first + q] : 0;
       if (word == 8) memcpy(at, &v, 8);
-      else put32(at, 0, (UINT)v);
+      else put32(at, 0, (uint32_t)v);
     }
     if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
       if (word == 8) put64(at, 8, there ? 1 : 0);
@@ -534,23 +528,23 @@ VKAPI VkResult VKAPI_CALL vkCreateRenderPass(VkDevice device, const VkRenderPass
   if (!rp) return VK_ERROR_OUT_OF_HOST_MEMORY;
   rp->dev = (Device *)device;
   rp->natt = ci->attachmentCount;
-  for (UINT i = 0; i < rp->natt; ++i) {
+  for (uint32_t i = 0; i < rp->natt; ++i) {
     const VkAttachmentDescription *a = &ci->pAttachments[i];
     rp->att[i].format = a->format, rp->att[i].samples = a->samples, rp->att[i].load = a->loadOp, rp->att[i].stencil_load = a->stencilLoadOp, rp->att[i].store = a->storeOp;
   }
   rp->nsub = ci->subpassCount;
-  for (UINT s = 0; s < rp->nsub; ++s) {
+  for (uint32_t s = 0; s < rp->nsub; ++s) {
     const VkSubpassDescription *sd = &ci->pSubpasses[s];
     if (sd->colorAttachmentCount > 4 || sd->inputAttachmentCount) {
       vk_free(rp);
       return VK_ERROR_FEATURE_NOT_PRESENT;
     }
     rp->sub[s].ncolor = sd->colorAttachmentCount;
-    for (UINT c = 0; c < sd->colorAttachmentCount; ++c) rp->sub[s].color[c] = sd->pColorAttachments[c].attachment;
+    for (uint32_t c = 0; c < sd->colorAttachmentCount; ++c) rp->sub[s].color[c] = sd->pColorAttachments[c].attachment;
     rp->sub[s].depth = sd->pDepthStencilAttachment ? sd->pDepthStencilAttachment->attachment : 0xFFFFFFFFu;
     if (sd->pResolveAttachments) {
       rp->sub[s].nresolve = sd->colorAttachmentCount;
-      for (UINT c = 0; c < sd->colorAttachmentCount; ++c) rp->sub[s].resolve[c] = sd->pResolveAttachments[c].attachment;
+      for (uint32_t c = 0; c < sd->colorAttachmentCount; ++c) rp->sub[s].resolve[c] = sd->pResolveAttachments[c].attachment;
     }
   }
   *out = (VkRenderPass)rp;
@@ -571,7 +565,7 @@ VKAPI VkResult VKAPI_CALL vkCreateFramebuffer(VkDevice device, const VkFramebuff
   if (!fb) return VK_ERROR_OUT_OF_HOST_MEMORY;
   fb->dev = (Device *)device, fb->pass = (RenderPass *)ci->renderPass, fb->nview = ci->attachmentCount;
   fb->w = ci->width, fb->h = ci->height, fb->layers = ci->layers;
-  for (UINT i = 0; i < fb->nview; ++i) fb->view[i] = (View *)ci->pAttachments[i];
+  for (uint32_t i = 0; i < fb->nview; ++i) fb->view[i] = (View *)ci->pAttachments[i];
   *out = (VkFramebuffer)fb;
   return VK_SUCCESS;
 }
@@ -592,7 +586,7 @@ VKAPI VkResult VKAPI_CALL vkCreateDescriptorSetLayout(VkDevice device, const VkD
     vk_free(l);
     return VK_ERROR_OUT_OF_HOST_MEMORY;
   }
-  for (UINT i = 0; i < l->nb; ++i) {
+  for (uint32_t i = 0; i < l->nb; ++i) {
     const VkDescriptorSetLayoutBinding *b = &ci->pBindings[i];
     if (b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || b->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || b->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
       vk_free(l->b);
@@ -612,25 +606,25 @@ VKAPI void VKAPI_CALL vkDestroyDescriptorSetLayout(VkDevice device, VkDescriptor
   vk_free(l);
 }
 
-static int layout_binding_index(const DSetLayout *l, UINT binding) {
-  for (UINT i = 0; i < l->nb; ++i)
+static int layout_binding_index(const DSetLayout *l, uint32_t binding) {
+  for (uint32_t i = 0; i < l->nb; ++i)
     if (l->b[i].binding == binding) return (int)i;
   return -1;
 }
 
 /* The binding with the next higher number after `binding` (-1: none). */
-static int next_binding_index(const DSetLayout *l, UINT binding) {
+static int next_binding_index(const DSetLayout *l, uint32_t binding) {
   int best = -1;
-  for (UINT i = 0; i < l->nb; ++i)
+  for (uint32_t i = 0; i < l->nb; ++i)
     if (l->b[i].binding > binding && (best < 0 || l->b[i].binding < l->b[best].binding)) best = (int)i;
   return best;
 }
 
-static BOOL is_dynamic(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
+static bool is_dynamic(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
 /* The number of a dynamic descriptor among those of its set: the dynamic offsets come in the order of the bindings, then of the array elements. */
-static UINT dynamic_index(const DSetLayout *l, UINT binding, UINT element) {
-  UINT n = element;
-  for (UINT k = 0; k < l->nb; ++k)
+static uint32_t dynamic_index(const DSetLayout *l, uint32_t binding, uint32_t element) {
+  uint32_t n = element;
+  for (uint32_t k = 0; k < l->nb; ++k)
     if (is_dynamic(l->b[k].type) && l->b[k].binding < binding) n += l->b[k].count;
   return n;
 }
@@ -641,8 +635,8 @@ VKAPI VkResult VKAPI_CALL vkCreatePipelineLayout(VkDevice device, const VkPipeli
   PipeLayout *l = vk_alloc(sizeof(PipeLayout));
   if (!l) return VK_ERROR_OUT_OF_HOST_MEMORY;
   l->dev = (Device *)device, l->nsets = ci->setLayoutCount;
-  for (UINT i = 0; i < l->nsets; ++i) l->sets[i] = (DSetLayout *)ci->pSetLayouts[i];
-  for (UINT i = 0; i < ci->pushConstantRangeCount; ++i) l->push_bytes = MAX(l->push_bytes, ci->pPushConstantRanges[i].offset + ci->pPushConstantRanges[i].size);
+  for (uint32_t i = 0; i < l->nsets; ++i) l->sets[i] = (DSetLayout *)ci->pSetLayouts[i];
+  for (uint32_t i = 0; i < ci->pushConstantRangeCount; ++i) l->push_bytes = MAX(l->push_bytes, ci->pPushConstantRanges[i].offset + ci->pPushConstantRanges[i].size);
   *out = (VkPipelineLayout)l;
   return VK_SUCCESS;
 }
@@ -653,7 +647,7 @@ VKAPI void VKAPI_CALL vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout 
 
 typedef struct DescPool {
   DescSet **sets;
-  UINT n, cap;
+  uint32_t n, cap;
 } DescPool;
 
 VKAPI VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *alloc, VkDescriptorPool *out) {
@@ -672,7 +666,7 @@ static void free_set(DescSet *s) {
 VKAPI VkResult VKAPI_CALL vkResetDescriptorPool(VkDevice device, VkDescriptorPool pool, VkDescriptorPoolResetFlags flags) {
   DescPool *p = (DescPool *)pool;
   (void)device, (void)flags;
-  for (UINT i = 0; i < p->n; ++i) free_set(p->sets[i]);
+  for (uint32_t i = 0; i < p->n; ++i) free_set(p->sets[i]);
   p->n = 0;
   return VK_SUCCESS;
 }
@@ -686,14 +680,14 @@ VKAPI void VKAPI_CALL vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool 
 }
 VKAPI VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice device, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) {
   DescPool *p = (DescPool *)ai->descriptorPool;
-  for (UINT i = 0; i < ai->descriptorSetCount; ++i) {
+  for (uint32_t i = 0; i < ai->descriptorSetCount; ++i) {
     DSetLayout *l = (DSetLayout *)ai->pSetLayouts[i];
     DescSet *s = vk_alloc(sizeof(DescSet));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->dev = (Device *)device, s->layout = l;
-    s->first = vk_alloc((l->nb ? l->nb : 1) * sizeof(UINT));
-    UINT total = 0;
-    for (UINT b = 0; b < l->nb; ++b) {
+    s->first = vk_alloc((l->nb ? l->nb : 1) * sizeof(uint32_t));
+    uint32_t total = 0;
+    for (uint32_t b = 0; b < l->nb; ++b) {
       if (s->first) s->first[b] = total;
       total += l->b[b].count;
     }
@@ -701,7 +695,7 @@ VKAPI VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice device, const VkDesc
     s->d = vk_alloc((total ? total : 1) * sizeof(Descr));
     if (!s->first || !s->d || !LIST_PUSH(p->sets, p->n, p->cap, s)) {
       free_set(s);
-      for (UINT k = 0; k < i; ++k) out[k] = VK_NULL_HANDLE;
+      for (uint32_t k = 0; k < i; ++k) out[k] = VK_NULL_HANDLE;
       return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     out[i] = (VkDescriptorSet)s;
@@ -711,8 +705,8 @@ VKAPI VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice device, const VkDesc
 VKAPI VkResult VKAPI_CALL vkFreeDescriptorSets(VkDevice device, VkDescriptorPool pool, uint32_t count, const VkDescriptorSet *sets) {
   DescPool *p = (DescPool *)pool;
   (void)device;
-  for (UINT i = 0; i < count; ++i)
-    for (UINT k = 0; k < p->n; ++k)
+  for (uint32_t i = 0; i < count; ++i)
+    for (uint32_t k = 0; k < p->n; ++k)
       if (p->sets[k] == (DescSet *)sets[i]) {
         free_set(p->sets[k]);
         p->sets[k] = p->sets[--p->n];
@@ -723,20 +717,20 @@ VKAPI VkResult VKAPI_CALL vkFreeDescriptorSets(VkDevice device, VkDescriptorPool
 
 VKAPI void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t nwrites, const VkWriteDescriptorSet *writes, uint32_t ncopies, const VkCopyDescriptorSet *copies) {
   (void)device;
-  for (UINT i = 0; i < nwrites; ++i) {
+  for (uint32_t i = 0; i < nwrites; ++i) {
     const VkWriteDescriptorSet *w = &writes[i];
     DescSet *s = (DescSet *)w->dstSet;
     int bi = layout_binding_index(s->layout, w->dstBinding);
     if (bi < 0) continue;
-    UINT element = w->dstArrayElement;
-    for (UINT k = 0; k < w->descriptorCount; ++k, ++element) {
+    uint32_t element = w->dstArrayElement;
+    for (uint32_t k = 0; k < w->descriptorCount; ++k, ++element) {
       /* (descriptors past the end of a binding go on into the next binding: Vulkan's consecutive binding updates) */
       while (bi >= 0 && element >= s->layout->b[bi].count) {
         element -= s->layout->b[bi].count;
         bi = next_binding_index(s->layout, s->layout->b[bi].binding);
       }
       if (bi < 0) break;
-      UINT index = s->first[bi] + element;
+      uint32_t index = s->first[bi] + element;
       if (index >= s->nd) break;
       Descr *d = &s->d[index];
       if (w->pBufferInfo && (w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
@@ -751,13 +745,13 @@ VKAPI void VKAPI_CALL vkUpdateDescriptorSets(VkDevice device, uint32_t nwrites, 
       }
     }
   }
-  for (UINT i = 0; i < ncopies; ++i) {
+  for (uint32_t i = 0; i < ncopies; ++i) {
     const VkCopyDescriptorSet *c = &copies[i];
     DescSet *src = (DescSet *)c->srcSet, *dst = (DescSet *)c->dstSet;
     int sb = layout_binding_index(src->layout, c->srcBinding), db = layout_binding_index(dst->layout, c->dstBinding);
     if (sb < 0 || db < 0) continue;
-    for (UINT k = 0; k < c->descriptorCount; ++k) {
-      UINT si = src->first[sb] + c->srcArrayElement + k, di = dst->first[db] + c->dstArrayElement + k;
+    for (uint32_t k = 0; k < c->descriptorCount; ++k) {
+      uint32_t si = src->first[sb] + c->srcArrayElement + k, di = dst->first[db] + c->dstArrayElement + k;
       if (si < src->nd && di < dst->nd) dst->d[di] = src->d[si];
     }
   }

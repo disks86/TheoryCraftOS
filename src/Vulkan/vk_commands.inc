@@ -1,4 +1,4 @@
-/* vulkan-1.c, part 5: command buffers. vkCmd* record into a list; vkQueueSubmit runs the list: the draws and dispatches become the kernel's command stream (CommandStream.hpp), the
+/* The Vulkan driver, part 5: command buffers. vkCmd* record into a list; vkQueueSubmit runs the list: the draws and dispatches become the kernel's command stream (CommandStream.hpp), the
  * copies and clears that the CPU can do are done in order with it. What the GPU writes into storage buffers is copied back into their memory when the stream has run (buf_readback), so
  * the memory always holds what the commands before have left there: a dispatch is run on its own for that. */
 
@@ -11,8 +11,8 @@ enum {
 enum { BP_GRAPHICS = 0, BP_COMPUTE = 1 };
 
 typedef struct Cmd {
-  UINT op, n;
-  ULONGLONG a, b, c, d, e;
+  uint32_t op, n;
+  uint64_t a, b, c, d, e;
   void *p;
 } Cmd;
 
@@ -20,30 +20,30 @@ typedef struct CmdBuf {
   Hdr h;
   Device *dev;
   Cmd *cmds;
-  UINT n, cap;
-  BOOL failed;
+  uint32_t n, cap;
+  bool failed;
   struct CmdPool *pool;
 } CmdBuf;
 
 typedef struct CmdPool {
   Device *dev;
   CmdBuf **bufs;
-  UINT n, cap;
+  uint32_t n, cap;
 } CmdPool;
 
 static void cmdbuf_reset(CmdBuf *cb) {
-  for (UINT i = 0; i < cb->n; ++i) vk_free(cb->cmds[i].p);
+  for (uint32_t i = 0; i < cb->n; ++i) vk_free(cb->cmds[i].p);
   cb->n = 0;
-  cb->failed = FALSE;
+  cb->failed = false;
 }
 
-static Cmd *record(VkCommandBuffer buffer, UINT op) {
+static Cmd *record(VkCommandBuffer buffer, uint32_t op) {
   CmdBuf *cb = (CmdBuf *)buffer;
   Cmd c;
   memset(&c, 0, sizeof c);
   c.op = op;
   if (!LIST_PUSH(cb->cmds, cb->n, cb->cap, c)) {
-    cb->failed = TRUE;
+    cb->failed = true;
     static Cmd dummy;
     return &dummy;
   }
@@ -53,7 +53,7 @@ static Cmd *record(VkCommandBuffer buffer, UINT op) {
 static void *keep(VkCommandBuffer buffer, const void *src, size_t bytes) {
   void *p = vk_alloc(bytes ? bytes : 1);
   if (!p) {
-    ((CmdBuf *)buffer)->failed = TRUE;
+    ((CmdBuf *)buffer)->failed = true;
     return NULL;
   }
   if (src) memcpy(p, src, bytes);
@@ -77,14 +77,14 @@ VKAPI void VKAPI_CALL vkDestroyCommandPool(VkDevice device, VkCommandPool pool, 
   CmdPool *p = (CmdPool *)pool;
   (void)device, (void)alloc;
   if (!p) return;
-  for (UINT i = 0; i < p->n; ++i) free_cmdbuf(p->bufs[i]);
+  for (uint32_t i = 0; i < p->n; ++i) free_cmdbuf(p->bufs[i]);
   vk_free(p->bufs);
   vk_free(p);
 }
 VKAPI VkResult VKAPI_CALL vkResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags) {
   CmdPool *p = (CmdPool *)pool;
   (void)device, (void)flags;
-  for (UINT i = 0; i < p->n; ++i) cmdbuf_reset(p->bufs[i]);
+  for (uint32_t i = 0; i < p->n; ++i) cmdbuf_reset(p->bufs[i]);
   return VK_SUCCESS;
 }
 VKAPI void VKAPI_CALL vkTrimCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolTrimFlags flags) {
@@ -92,11 +92,11 @@ VKAPI void VKAPI_CALL vkTrimCommandPool(VkDevice device, VkCommandPool pool, VkC
 }
 VKAPI VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *out) {
   CmdPool *p = (CmdPool *)ai->commandPool;
-  for (UINT i = 0; i < ai->commandBufferCount; ++i) {
+  for (uint32_t i = 0; i < ai->commandBufferCount; ++i) {
     CmdBuf *cb = vk_alloc(sizeof(CmdBuf));
     if (!cb || !LIST_PUSH(p->bufs, p->n, p->cap, cb)) {
       vk_free(cb);
-      for (UINT k = 0; k < i; ++k) out[k] = NULL;
+      for (uint32_t k = 0; k < i; ++k) out[k] = NULL;
       return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     cb->h.magic = MAGIC_CMD;
@@ -109,8 +109,8 @@ VKAPI VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice device, const VkComm
 VKAPI void VKAPI_CALL vkFreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count, const VkCommandBuffer *bufs) {
   CmdPool *p = (CmdPool *)pool;
   (void)device;
-  for (UINT i = 0; i < count; ++i)
-    for (UINT k = 0; k < p->n; ++k)
+  for (uint32_t i = 0; i < count; ++i)
+    for (uint32_t k = 0; k < p->n; ++k)
       if (p->bufs[k] == (CmdBuf *)bufs[i]) {
         free_cmdbuf(p->bufs[k]);
         p->bufs[k] = p->bufs[--p->n];
@@ -133,9 +133,9 @@ VKAPI VkResult VKAPI_CALL vkResetCommandBuffer(VkCommandBuffer buffer, VkCommand
 VKAPI void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer b, const VkRenderPassBeginInfo *bi, VkSubpassContents contents) {
   (void)contents;
   Cmd *c = record(b, C_BEGIN_PASS);
-  c->a = (ULONGLONG)(ULONG_PTR)bi->renderPass, c->b = (ULONGLONG)(ULONG_PTR)bi->framebuffer;
-  c->c = ((ULONGLONG)(UINT)bi->renderArea.offset.x & 0xFFFFFFFFull) | ((ULONGLONG)(UINT)bi->renderArea.offset.y << 32);
-  c->d = (ULONGLONG)bi->renderArea.extent.width | ((ULONGLONG)bi->renderArea.extent.height << 32);
+  c->a = (uint64_t)(uintptr_t)bi->renderPass, c->b = (uint64_t)(uintptr_t)bi->framebuffer;
+  c->c = ((uint64_t)(uint32_t)bi->renderArea.offset.x & 0xFFFFFFFFull) | ((uint64_t)(uint32_t)bi->renderArea.offset.y << 32);
+  c->d = (uint64_t)bi->renderArea.extent.width | ((uint64_t)bi->renderArea.extent.height << 32);
   c->n = bi->clearValueCount;
   c->p = keep(b, bi->pClearValues, sizeof(VkClearValue) * bi->clearValueCount);
 }
@@ -147,17 +147,17 @@ VKAPI void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer b) { record(b, C_END_PA
 VKAPI void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer b, VkPipelineBindPoint point, VkPipeline pipeline) {
   if (point != VK_PIPELINE_BIND_POINT_GRAPHICS && point != VK_PIPELINE_BIND_POINT_COMPUTE) return;
   Cmd *c = record(b, C_BIND_PIPE);
-  c->a = (ULONGLONG)(ULONG_PTR)pipeline, c->d = point == VK_PIPELINE_BIND_POINT_COMPUTE ? BP_COMPUTE : BP_GRAPHICS;
+  c->a = (uint64_t)(uintptr_t)pipeline, c->d = point == VK_PIPELINE_BIND_POINT_COMPUTE ? BP_COMPUTE : BP_GRAPHICS;
 }
 VKAPI void VKAPI_CALL vkCmdBindVertexBuffers(VkCommandBuffer b, uint32_t first, uint32_t count, const VkBuffer *bufs, const VkDeviceSize *offsets) {
-  for (UINT i = 0; i < count; ++i) {
+  for (uint32_t i = 0; i < count; ++i) {
     Cmd *c = record(b, C_BIND_VB);
-    c->a = first + i, c->b = (ULONGLONG)(ULONG_PTR)bufs[i], c->c = offsets[i];
+    c->a = first + i, c->b = (uint64_t)(uintptr_t)bufs[i], c->c = offsets[i];
   }
 }
 VKAPI void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
   Cmd *c = record(b, C_BIND_IB);
-  c->a = (ULONGLONG)(ULONG_PTR)buffer, c->b = offset, c->c = type;
+  c->a = (uint64_t)(uintptr_t)buffer, c->b = offset, c->c = type;
 }
 VKAPI void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer b, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet *sets, uint32_t ndyn,
                                               const uint32_t *dyn) {
@@ -165,10 +165,10 @@ VKAPI void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer b, VkPipelineBindP
   if (point != VK_PIPELINE_BIND_POINT_GRAPHICS && point != VK_PIPELINE_BIND_POINT_COMPUTE) return;
   Cmd *c = record(b, C_BIND_SETS);
   c->a = first, c->n = count, c->b = ndyn, c->d = point == VK_PIPELINE_BIND_POINT_COMPUTE ? BP_COMPUTE : BP_GRAPHICS;
-  c->p = keep(b, NULL, sizeof(void *) * count + sizeof(UINT) * ndyn);
+  c->p = keep(b, NULL, sizeof(void *) * count + sizeof(uint32_t) * ndyn);
   if (!c->p) return;
   memcpy(c->p, sets, sizeof(void *) * count);
-  memcpy((BYTE *)c->p + sizeof(void *) * count, dyn, sizeof(UINT) * ndyn);
+  memcpy((uint8_t *)c->p + sizeof(void *) * count, dyn, sizeof(uint32_t) * ndyn);
 }
 VKAPI void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer b, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void *values) {
   (void)layout, (void)stages;
@@ -199,15 +199,15 @@ VKAPI void VKAPI_CALL vkCmdDraw(VkCommandBuffer b, uint32_t vertices, uint32_t i
 }
 VKAPI void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer b, uint32_t indices, uint32_t instances, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance) {
   Cmd *c = record(b, C_DRAW_INDEXED);
-  c->a = indices, c->b = instances, c->c = first_index, c->d = (ULONGLONG)(UINT)vertex_offset, c->e = first_instance;
+  c->a = indices, c->b = instances, c->c = first_index, c->d = (uint64_t)(uint32_t)vertex_offset, c->e = first_instance;
 }
 VKAPI void VKAPI_CALL vkCmdDrawIndirect(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset, uint32_t count, uint32_t stride) {
   (void)buffer, (void)offset, (void)count, (void)stride;
-  ((CmdBuf *)b)->failed = TRUE;
+  ((CmdBuf *)b)->failed = true;
 }
 VKAPI void VKAPI_CALL vkCmdDrawIndexedIndirect(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset, uint32_t count, uint32_t stride) {
   (void)buffer, (void)offset, (void)count, (void)stride;
-  ((CmdBuf *)b)->failed = TRUE;
+  ((CmdBuf *)b)->failed = true;
 }
 VKAPI void VKAPI_CALL vkCmdDispatch(VkCommandBuffer b, uint32_t x, uint32_t y, uint32_t z) {
   Cmd *c = record(b, C_DISPATCH);
@@ -215,56 +215,56 @@ VKAPI void VKAPI_CALL vkCmdDispatch(VkCommandBuffer b, uint32_t x, uint32_t y, u
 }
 VKAPI void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer b, VkBuffer buffer, VkDeviceSize offset) {
   Cmd *c = record(b, C_DISPATCH_INDIRECT);
-  c->a = (ULONGLONG)(ULONG_PTR)buffer, c->b = offset;
+  c->a = (uint64_t)(uintptr_t)buffer, c->b = offset;
 }
 
 VKAPI void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer b, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions) {
   Cmd *c = record(b, C_COPY_BUF);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst, c->n = count;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst, c->n = count;
   c->p = keep(b, regions, sizeof(VkBufferCopy) * count);
 }
 VKAPI void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer b, VkBuffer src, VkImage dst, VkImageLayout layout, uint32_t count, const VkBufferImageCopy *regions) {
   (void)layout;
   Cmd *c = record(b, C_COPY_BUF2IMG);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst, c->n = count;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst, c->n = count;
   c->p = keep(b, regions, sizeof(VkBufferImageCopy) * count);
 }
 VKAPI void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer b, VkImage src, VkImageLayout layout, VkBuffer dst, uint32_t count, const VkBufferImageCopy *regions) {
   (void)layout;
   Cmd *c = record(b, C_COPY_IMG2BUF);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst, c->n = count;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst, c->n = count;
   c->p = keep(b, regions, sizeof(VkBufferImageCopy) * count);
 }
 VKAPI void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer b, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t count, const VkImageCopy *regions) {
   (void)sl, (void)dl;
   Cmd *c = record(b, C_COPY_IMG);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst, c->n = count;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst, c->n = count;
   c->p = keep(b, regions, sizeof(VkImageCopy) * count);
 }
 VKAPI void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer b, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t count, const VkImageBlit *regions, VkFilter filter) {
   (void)sl, (void)dl, (void)filter;
   Cmd *c = record(b, C_BLIT);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst, c->n = count;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst, c->n = count;
   c->p = keep(b, regions, sizeof(VkImageBlit) * count);
 }
 VKAPI void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer b, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, uint32_t count, const VkImageResolve *regions) {
   (void)sl, (void)dl, (void)count, (void)regions;
   Cmd *c = record(b, C_RESOLVE);
-  c->a = (ULONGLONG)(ULONG_PTR)src, c->b = (ULONGLONG)(ULONG_PTR)dst;
+  c->a = (uint64_t)(uintptr_t)src, c->b = (uint64_t)(uintptr_t)dst;
 }
 VKAPI void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer b, VkImage image, VkImageLayout layout, const VkClearColorValue *color, uint32_t count, const VkImageSubresourceRange *ranges) {
   (void)layout;
   Cmd *c = record(b, C_CLEAR_COLOR);
-  c->a = (ULONGLONG)(ULONG_PTR)image, c->n = count;
+  c->a = (uint64_t)(uintptr_t)image, c->n = count;
   c->p = keep(b, NULL, sizeof(VkClearColorValue) + sizeof(VkImageSubresourceRange) * count);
   if (!c->p) return;
   memcpy(c->p, color, sizeof(VkClearColorValue));
-  memcpy((BYTE *)c->p + sizeof(VkClearColorValue), ranges, sizeof(VkImageSubresourceRange) * count);
+  memcpy((uint8_t *)c->p + sizeof(VkClearColorValue), ranges, sizeof(VkImageSubresourceRange) * count);
 }
 VKAPI void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer b, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue *value, uint32_t count, const VkImageSubresourceRange *ranges) {
   (void)layout, (void)count, (void)ranges;
   Cmd *c = record(b, C_CLEAR_DS);
-  c->a = (ULONGLONG)(ULONG_PTR)image;
+  c->a = (uint64_t)(uintptr_t)image;
   c->p = keep(b, value, sizeof *value);
 }
 VKAPI void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer b, uint32_t count, const VkClearAttachment *atts, uint32_t nrects, const VkClearRect *rects) {
@@ -275,15 +275,15 @@ VKAPI void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer b, uint32_t count, c
 }
 VKAPI void VKAPI_CALL vkCmdFillBuffer(VkCommandBuffer b, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
   Cmd *c = record(b, C_FILL);
-  c->a = (ULONGLONG)(ULONG_PTR)dst, c->b = offset, c->c = size, c->d = data;
+  c->a = (uint64_t)(uintptr_t)dst, c->b = offset, c->c = size, c->d = data;
 }
 VKAPI void VKAPI_CALL vkCmdUpdateBuffer(VkCommandBuffer b, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, const void *data) {
   Cmd *c = record(b, C_UPDATE);
-  c->a = (ULONGLONG)(ULONG_PTR)dst, c->b = offset, c->c = size;
+  c->a = (uint64_t)(uintptr_t)dst, c->b = offset, c->c = size;
   c->p = keep(b, data, (size_t)size);
 }
 VKAPI void VKAPI_CALL vkCmdExecuteCommands(VkCommandBuffer b, uint32_t count, const VkCommandBuffer *bufs) {
-  for (UINT i = 0; i < count; ++i) record(b, C_EXEC)->a = (ULONGLONG)(ULONG_PTR)bufs[i];
+  for (uint32_t i = 0; i < count; ++i) record(b, C_EXEC)->a = (uint64_t)(uintptr_t)bufs[i];
 }
 VKAPI void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer b, VkPipelineStageFlags s, VkPipelineStageFlags d, VkDependencyFlags f, uint32_t nm, const VkMemoryBarrier *m, uint32_t nb,
                                            const VkBufferMemoryBarrier *bb, uint32_t ni, const VkImageMemoryBarrier *ib) {
@@ -299,16 +299,16 @@ VKAPI void VKAPI_CALL vkCmdBeginQuery(VkCommandBuffer b, VkQueryPool p, uint32_t
 VKAPI void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer b, VkQueryPool p, uint32_t q) { (void)b, (void)p, (void)q; }
 VKAPI void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer b, VkQueryPool p, uint32_t f, uint32_t c) {
   Cmd *cmd = record(b, C_RESET_QUERIES);
-  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = f, cmd->c = c;
+  cmd->a = (uint64_t)(uintptr_t)p, cmd->b = f, cmd->c = c;
 }
 VKAPI void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer b, VkPipelineStageFlagBits s, VkQueryPool p, uint32_t q) {
   (void)s;
   Cmd *cmd = record(b, C_TIMESTAMP);
-  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = q;
+  cmd->a = (uint64_t)(uintptr_t)p, cmd->b = q;
 }
 VKAPI void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer b, VkQueryPool p, uint32_t f, uint32_t c, VkBuffer d, VkDeviceSize o, VkDeviceSize s, VkQueryResultFlags fl) {
   Cmd *cmd = record(b, C_COPY_QUERIES);
-  cmd->a = (ULONGLONG)(ULONG_PTR)p, cmd->b = f, cmd->c = c, cmd->d = o, cmd->e = s, cmd->n = fl;
+  cmd->a = (uint64_t)(uintptr_t)p, cmd->b = f, cmd->c = c, cmd->d = o, cmd->e = s, cmd->n = fl;
   cmd->p = keep(b, &d, sizeof d);
 }
 
@@ -316,60 +316,60 @@ VKAPI void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer b, VkQueryPool p
 typedef struct Exec {
   Device *d;
   const Caps *caps;
-  UINT bytes;                  /* of the stream so far */
-  UINT nalloc;
+  uint32_t bytes;                  /* of the stream so far */
+  uint32_t nalloc;
   KMT_HANDLE temps[256];
-  UINT ntemps;
-  BOOL stream_open;            /* a pass is open in the stream */
+  uint32_t ntemps;
+  bool stream_open;            /* a pass is open in the stream */
   RenderPass *rp;
   Framebuffer *fb;
-  UINT subpass;
+  uint32_t subpass;
   const VkClearValue *clears;
-  UINT nclears;
-  BOOL attachment_used[9];
+  uint32_t nclears;
+  bool attachment_used[9];
   Pipe *pipe;
   DescSet *sets[8];
-  UINT dyn[8][8];
-  BYTE push[256];
+  uint32_t dyn[8][8];
+  uint8_t push[256];
   Pipe *cpipe;                 /* the compute pipeline (the graphics one is `pipe`) */
   DescSet *csets[8];
-  UINT cdyn[8][8];
+  uint32_t cdyn[8][8];
   struct {                     /* storage buffers the stream writes: copied back into their memory once it has run */
     Buf *b;
-    ULONGLONG off, size;
+    uint64_t off, size;
   } written[UAV_SLOTS * 4];
-  UINT nwritten;
+  uint32_t nwritten;
   struct {
     Buf *b;
-    ULONGLONG off;
+    uint64_t off;
   } vb[8];
   Buf *ib;
-  ULONGLONG ib_off;
-  UINT ib_type;
+  uint64_t ib_off;
+  uint32_t ib_type;
   VkViewport vp;
   VkRect2D sc;
-  BOOL vp_set, sc_set;
-  BOOL dirty_pipe, dirty_state, dirty_vb, dirty_ib;
-  UINT topology_sent;
-  BOOL failed;
+  bool vp_set, sc_set;
+  bool dirty_pipe, dirty_state, dirty_vb, dirty_ib;
+  uint32_t topology_sent;
+  bool failed;
 } Exec;
 
-static UINT *stream_words(Exec *x, UINT n) {
+static uint32_t *stream_words(Exec *x, uint32_t n) {
   if (x->bytes + n * 4 > x->d->dma_bytes) return NULL;
-  UINT *w = (UINT *)(x->d->dma + x->bytes);
+  uint32_t *w = (uint32_t *)(x->d->dma + x->bytes);
   x->bytes += n * 4;
   return w;
 }
 /* One packet: the op and the payload words. */
-static BOOL packet(Exec *x, UINT op, const UINT *payload, UINT n) {
-  UINT *w = stream_words(x, n + 1);
-  if (!w) return FALSE;
+static bool packet(Exec *x, uint32_t op, const uint32_t *payload, uint32_t n) {
+  uint32_t *w = stream_words(x, n + 1);
+  if (!w) return false;
   w[0] = op | ((n + 1) << 16);
-  for (UINT i = 0; i < n; ++i) w[i + 1] = payload[i];
-  return TRUE;
+  for (uint32_t i = 0; i < n; ++i) w[i + 1] = payload[i];
+  return true;
 }
-static UINT fbits(float f) {
-  union { float f; UINT u; } v;
+static uint32_t fbits(float f) {
+  union { float f; uint32_t u; } v;
   v.f = f;
   return v.u;
 }
@@ -379,7 +379,7 @@ enum { OP_BEGIN_PASS = 1, OP_END_PASS, OP_BIND_PIPELINE, OP_BIND_VB, OP_BIND_IB,
 
 /* The index of an allocation in the stream's allocation list. */
 static int alloc_index(Exec *x, KMT_HANDLE a) {
-  for (UINT i = 0; i < x->nalloc; ++i)
+  for (uint32_t i = 0; i < x->nalloc; ++i)
     if (get32(x->d->alloc_list, i * 8) == a) return (int)i;
   if (x->nalloc >= x->d->alloc_entries) return -1;
   put32(x->d->alloc_list, x->nalloc * 8, a);
@@ -390,141 +390,141 @@ static int alloc_index(Exec *x, KMT_HANDLE a) {
 /* Runs the stream written so far. */
 static void flush(Exec *x) {
   if (x->bytes == 0) return;
-  BYTE args[128];
+  uint8_t args[128];
   memset(args, 0, sizeof args);
   put32(args, 0, x->d->ctx);
   put32(args, 4, 0);
   put32(args, 8, x->bytes);
   put32(args, 12, x->nalloc);
-  NTSTATUS st = D3DKMTRender(args);
+  KmtStatus st = kmt(TCOS_DXG_RENDER, args);
   if (!STATUS_OK(st)) {
-    x->failed = TRUE;
-    trace_status("D3DKMTRender", (UINT)st);
+    x->failed = true;
+    trace_status("D3DKMTRender", (uint32_t)st);
   } else {
-    for (UINT i = 0; i < x->nwritten; ++i) buf_readback(x->written[i].b, x->written[i].off, x->written[i].size);
+    for (uint32_t i = 0; i < x->nwritten; ++i) buf_readback(x->written[i].b, x->written[i].off, x->written[i].size);
     /* The stream has run (or been refused) when Render returns; a context that lost a submission says so in the device state (a lost device). */
-    BYTE state[16];
+    uint8_t state[16];
     memset(state, 0, sizeof state);
     put32(state, 0, x->d->dev);
     put32(state, 4, 3);   /* TdrReset */
-    if (STATUS_OK(D3DKMTGetDeviceState(state)) && get32(state, 8)) {
-      x->failed = TRUE;
+    if (STATUS_OK(kmt(TCOS_DXG_GET_DEVICE_STATE, state)) && get32(state, 8)) {
+      x->failed = true;
       trace("the adapter refused a command stream: the device is lost");
     }
   }
   x->bytes = 0;
   x->nalloc = 0;
   x->nwritten = 0;
-  x->stream_open = FALSE;
-  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
+  x->stream_open = false;
+  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = true;
   x->topology_sent = 0xFFFFFFFFu;
 }
 
-static BOOL ensure_room(Exec *x, UINT words) {
-  if (x->bytes + words * 4 + 256 <= x->d->dma_bytes && x->nalloc + 8 <= x->d->alloc_entries) return TRUE;
+static bool ensure_room(Exec *x, uint32_t words) {
+  if (x->bytes + words * 4 + 256 <= x->d->dma_bytes && x->nalloc + 8 <= x->d->alloc_entries) return true;
   if (!x->stream_open) {
     flush(x);
-    return TRUE;
+    return true;
   }
-  return FALSE;
+  return false;
 }
 
 /* Starts the pass of the current subpass in the stream. */
 static void begin_stream_pass(Exec *x) {
   const Subpass *sp = &x->rp->sub[x->subpass];
-  UINT color[4] = {NO_ALLOC, NO_ALLOC, NO_ALLOC, NO_ALLOC};
-  UINT flags = 0;
+  uint32_t color[4] = {NO_ALLOC, NO_ALLOC, NO_ALLOC, NO_ALLOC};
+  uint32_t flags = 0;
   float clear_color[4] = {0, 0, 0, 0}, clear_depth = 1.0f;
-  UINT clear_stencil = 0;
-  UINT depth = NO_ALLOC;
-  for (UINT c = 0; c < sp->ncolor; ++c) {
-    UINT att = sp->color[c];
+  uint32_t clear_stencil = 0;
+  uint32_t depth = NO_ALLOC;
+  for (uint32_t c = 0; c < sp->ncolor; ++c) {
+    uint32_t att = sp->color[c];
     if (att >= x->fb->nview) continue;
     Img *img = x->fb->view[att]->img;
     int idx = alloc_index(x, img->alloc);
-    color[c] = idx < 0 ? NO_ALLOC : (UINT)idx;
-    img->gpu_written = TRUE;
+    color[c] = idx < 0 ? NO_ALLOC : (uint32_t)idx;
+    img->gpu_written = true;
     if (x->rp->att[att].load == VK_ATTACHMENT_LOAD_OP_CLEAR && !x->attachment_used[att] && att < x->nclears) {
       flags |= 1;
       for (int k = 0; k < 4; ++k) clear_color[k] = x->clears[att].color.float32[k];
     }
-    x->attachment_used[att] = TRUE;
+    x->attachment_used[att] = true;
   }
   if (sp->depth != 0xFFFFFFFFu && sp->depth < x->fb->nview) {
-    UINT att = sp->depth;
+    uint32_t att = sp->depth;
     Img *img = x->fb->view[att]->img;
     int idx = alloc_index(x, img->alloc);
-    depth = idx < 0 ? NO_ALLOC : (UINT)idx;
-    img->gpu_written = TRUE;
+    depth = idx < 0 ? NO_ALLOC : (uint32_t)idx;
+    img->gpu_written = true;
     if (!x->attachment_used[att] && att < x->nclears) {
       if (x->rp->att[att].load == VK_ATTACHMENT_LOAD_OP_CLEAR) flags |= 2, clear_depth = x->clears[att].depthStencil.depth;
       if (x->rp->att[att].stencil_load == VK_ATTACHMENT_LOAD_OP_CLEAR) flags |= 4, clear_stencil = x->clears[att].depthStencil.stencil;
     }
-    x->attachment_used[att] = TRUE;
+    x->attachment_used[att] = true;
   }
-  UINT nextra = 0;
-  for (UINT c = 1; c < 4; ++c)
+  uint32_t nextra = 0;
+  for (uint32_t c = 1; c < 4; ++c)
     if (color[c] != NO_ALLOC) nextra = c;
-  UINT payload[12];
+  uint32_t payload[12];
   payload[0] = color[0], payload[1] = depth, payload[2] = flags;
   for (int k = 0; k < 4; ++k) payload[3 + k] = fbits(clear_color[k]);
   payload[7] = fbits(clear_depth), payload[8] = clear_stencil;
-  for (UINT c = 1; c <= nextra; ++c) payload[8 + c] = color[c];
-  if (!packet(x, OP_BEGIN_PASS, payload, 9 + nextra)) x->failed = TRUE;
-  x->stream_open = TRUE;
-  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
+  for (uint32_t c = 1; c <= nextra; ++c) payload[8 + c] = color[c];
+  if (!packet(x, OP_BEGIN_PASS, payload, 9 + nextra)) x->failed = true;
+  x->stream_open = true;
+  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = true;
   x->topology_sent = 0xFFFFFFFFu;
 }
 
 static void end_stream_pass(Exec *x) {
   if (!x->stream_open) return;
   packet(x, OP_END_PASS, NULL, 0);
-  x->stream_open = FALSE;
+  x->stream_open = false;
 }
 
 /* After a subpass: the multisample resolve attachments. */
 static void resolve_subpass(Exec *x) {
   const Subpass *sp = &x->rp->sub[x->subpass];
   if (!sp->nresolve) return;
-  for (UINT c = 0; c < sp->ncolor && c < sp->nresolve; ++c) {
-    UINT from = sp->color[c], to = sp->resolve[c];
+  for (uint32_t c = 0; c < sp->ncolor && c < sp->nresolve; ++c) {
+    uint32_t from = sp->color[c], to = sp->resolve[c];
     if (from >= x->fb->nview || to >= x->fb->nview) continue;
     int di = alloc_index(x, x->fb->view[to]->img->alloc), si = alloc_index(x, x->fb->view[from]->img->alloc);
     if (di < 0 || si < 0) continue;
-    UINT payload[2] = {(UINT)di, (UINT)si};
+    uint32_t payload[2] = {(uint32_t)di, (uint32_t)si};
     packet(x, OP_RESOLVE, payload, 2);
-    x->fb->view[to]->img->gpu_written = TRUE;
+    x->fb->view[to]->img->gpu_written = true;
   }
 }
 
 /* The descriptor sets and dynamic offsets of the bind point a pipeline is used at. */
 static DescSet **bound_sets(Exec *x, const Pipe *p) { return p->compute ? x->csets : x->sets; }
-static UINT dynamic_offset(Exec *x, const Pipe *p, UINT set, const DescSet *s, UINT binding, UINT element) {
-  UINT di = dynamic_index(s->layout, binding, element);
+static uint32_t dynamic_offset(Exec *x, const Pipe *p, uint32_t set, const DescSet *s, uint32_t binding, uint32_t element) {
+  uint32_t di = dynamic_index(s->layout, binding, element);
   return di < 8 ? (p->compute ? x->cdyn : x->dyn)[set][di] : 0;
 }
 
 /* The constant data of the pipeline's constant buffer slots, in the order the shaders declared them. Returns the number of bytes. */
-static UINT gather_constants(Exec *x, Pipe *p, BYTE *out, UINT cap) {
+static uint32_t gather_constants(Exec *x, Pipe *p, uint8_t *out, uint32_t cap) {
   DescSet **sets = bound_sets(x, p);
-  UINT total = 0;
-  for (UINT i = 0; i < p->ncb; ++i) {
-    UINT bytes = p->cb[i].vec4 * 16;
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < p->ncb; ++i) {
+    uint32_t bytes = p->cb[i].vec4 * 16;
     if (total + bytes > cap) break;
-    BYTE *dst = out + total;
+    uint8_t *dst = out + total;
     memset(dst, 0, bytes);
     if (p->cb[i].kind == SPV_RES_PUSH) {
-      memcpy(dst, x->push, MIN(bytes, (UINT)sizeof x->push));
+      memcpy(dst, x->push, MIN(bytes, (uint32_t)sizeof x->push));
     } else if (p->cb[i].set < 8 && sets[p->cb[i].set]) {
       DescSet *s = sets[p->cb[i].set];
       int bi = layout_binding_index(s->layout, p->cb[i].binding);
       if (bi >= 0 && s->layout->b[bi].count > 0 && s->d[s->first[bi]].buf) {
         Descr *d = &s->d[s->first[bi]];
-        ULONGLONG off = d->off;
+        uint64_t off = d->off;
         if (is_dynamic(s->layout->b[bi].type)) off += dynamic_offset(x, p, p->cb[i].set, s, p->cb[i].binding, 0);
         Buf *buf = d->buf;
         if (buf->mem && off < buf->size) {
-          ULONGLONG n = MIN((ULONGLONG)bytes, MIN(d->range, buf->size - off));
+          uint64_t n = MIN((uint64_t)bytes, MIN(d->range, buf->size - off));
           memcpy(dst, buf->mem->data + buf->off + off, (size_t)n);
         }
       }
@@ -536,13 +536,13 @@ static UINT gather_constants(Exec *x, Pipe *p, BYTE *out, UINT cap) {
 
 static void bind_textures(Exec *x, Pipe *p) {
   DescSet **sets = bound_sets(x, p);
-  for (UINT u = 0; u < p->nunit; ++u) {
+  for (uint32_t u = 0; u < p->nunit; ++u) {
     TexUnit *tu = &p->unit[u];
     if (tu->set >= 8 || !sets[tu->set]) continue;
     DescSet *s = sets[tu->set];
     int bi = layout_binding_index(s->layout, tu->binding);
     if (bi < 0) continue;
-    UINT index = s->first[bi] + tu->element;
+    uint32_t index = s->first[bi] + tu->element;
     if (index >= s->nd) continue;
     Descr *d = &s->d[index];
     Sampler *smp = d->sampler;
@@ -556,61 +556,61 @@ static void bind_textures(Exec *x, Pipe *p) {
     image_sync_up(img);
     int idx = alloc_index(x, img->alloc);
     if (idx < 0) continue;
-    UINT payload[9] = {u, (UINT)idx, smp->filter, smp->addr_u, smp->addr_v, smp->mip_filter, fbits(smp->lod_bias), fbits(smp->min_lod), fbits(smp->max_lod)};
+    uint32_t payload[9] = {u, (uint32_t)idx, smp->filter, smp->addr_u, smp->addr_v, smp->mip_filter, fbits(smp->lod_bias), fbits(smp->min_lod), fbits(smp->max_lod)};
     packet(x, OP_BIND_TEXTURE, payload, 9);
   }
 }
 
-/* The pipeline's storage buffers into the kernel's slots (BindUav). The written ones are noted for the copy back. FALSE when one is not there: the kernel refuses a dispatch or a
+/* The pipeline's storage buffers into the kernel's slots (BindUav). The written ones are noted for the copy back. false when one is not there: the kernel refuses a dispatch or a
  * draw without every slot its shader uses. */
-static BOOL bind_storage(Exec *x, Pipe *p) {
+static bool bind_storage(Exec *x, Pipe *p) {
   DescSet **sets = bound_sets(x, p);
-  for (UINT k = 0; k < p->nstorage; ++k) {
+  for (uint32_t k = 0; k < p->nstorage; ++k) {
     const StorageSlot *ss = &p->storage[k];
     DescSet *s = ss->set < 8 ? sets[ss->set] : NULL;
     int bi = s ? layout_binding_index(s->layout, ss->binding) : -1;
-    if (bi < 0 || ss->element >= s->layout->b[bi].count) return FALSE;
+    if (bi < 0 || ss->element >= s->layout->b[bi].count) return false;
     Descr *d = &s->d[s->first[bi] + ss->element];
     Buf *buf = d->buf;
-    UINT alloc;
-    if (!buf || !buf_sync(buf, &alloc)) return FALSE;
-    ULONGLONG off = d->off;
+    uint32_t alloc;
+    if (!buf || !buf_sync(buf, &alloc)) return false;
+    uint64_t off = d->off;
     if (is_dynamic(s->layout->b[bi].type)) off += dynamic_offset(x, p, ss->set, s, ss->binding, ss->element);
-    if (off >= buf->size) return FALSE;
-    ULONGLONG range = MIN(d->range, buf->size - off);
+    if (off >= buf->size) return false;
+    uint64_t range = MIN(d->range, buf->size - off);
     range = (range + 3) & ~3ull;   /* (the kernel binds whole words; the allocation is rounded up to 16 bytes) */
     int idx = alloc_index(x, alloc);
-    if (idx < 0 || off % 4 || range == 0 || range > 0xFFFFFFFFull) return FALSE;
-    UINT payload[4] = {ss->slot, (UINT)idx, (UINT)off, (UINT)range};
-    if (!packet(x, OP_BIND_UAV, payload, 4)) return FALSE;
+    if (idx < 0 || off % 4 || range == 0 || range > 0xFFFFFFFFull) return false;
+    uint32_t payload[4] = {ss->slot, (uint32_t)idx, (uint32_t)off, (uint32_t)range};
+    if (!packet(x, OP_BIND_UAV, payload, 4)) return false;
     if (ss->slot < UAV_SLOTS) {
-      BOOL noted = FALSE;
-      for (UINT i = 0; i < x->nwritten; ++i) noted |= x->written[i].b == buf && x->written[i].off == off && x->written[i].size == range;
+      bool noted = false;
+      for (uint32_t i = 0; i < x->nwritten; ++i) noted |= x->written[i].b == buf && x->written[i].off == off && x->written[i].size == range;
       if (noted) continue;
-      if (x->nwritten == sizeof x->written / sizeof x->written[0]) return FALSE;
+      if (x->nwritten == sizeof x->written / sizeof x->written[0]) return false;
       x->written[x->nwritten].b = buf, x->written[x->nwritten].off = off, x->written[x->nwritten].size = range;
       ++x->nwritten;
     }
   }
-  return TRUE;
+  return true;
 }
 
 /* A dispatch: the compute pipeline, its constants, textures and storage buffers, run on its own so that what it writes is back in memory for the commands after it. */
-static void do_dispatch(Exec *x, UINT gx, UINT gy, UINT gz) {
+static void do_dispatch(Exec *x, uint32_t gx, uint32_t gy, uint32_t gz) {
   Pipe *p = x->cpipe;
   if (!p || x->stream_open || gx == 0 || gy == 0 || gz == 0) return;
   if (gx > 65535 || gy > 65535 || gz > 65535) {
     trace("a dispatch of more work groups than maxComputeWorkGroupCount");
-    x->failed = TRUE;
+    x->failed = true;
     return;
   }
   flush(x);
   packet(x, OP_BIND_PIPELINE, &p->pipe, 1);
-  BYTE constants[4096];
-  UINT bytes = gather_constants(x, p, constants, MIN((UINT)sizeof constants, x->caps->max_push_constant_bytes));
+  uint8_t constants[4096];
+  uint32_t bytes = gather_constants(x, p, constants, MIN((uint32_t)sizeof constants, x->caps->max_push_constant_bytes));
   if (bytes) {
-    UINT words = bytes / 4;
-    UINT *w = stream_words(x, 2 + words);
+    uint32_t words = bytes / 4;
+    uint32_t *w = stream_words(x, 2 + words);
     if (w) {
       w[0] = OP_PUSH | ((2 + words) << 16);
       w[1] = bytes;
@@ -623,60 +623,60 @@ static void do_dispatch(Exec *x, UINT gx, UINT gy, UINT gz) {
     x->bytes = 0, x->nalloc = 0, x->nwritten = 0;
     return;
   }
-  UINT payload[3] = {gx, gy, gz};
+  uint32_t payload[3] = {gx, gy, gz};
   packet(x, OP_DISPATCH, payload, 3);
   flush(x);
   /* (the graphics state is sent again for the next draw) */
-  x->dirty_pipe = x->dirty_state = TRUE;
+  x->dirty_pipe = x->dirty_state = true;
 }
 
-static BOOL vertex_direct(Pipe *p) {
-  if (p->nattrs == 0) return TRUE;
-  UINT binding = p->attrs[0].binding;
-  for (UINT i = 0; i < p->nattrs; ++i) {
+static bool vertex_direct(Pipe *p) {
+  if (p->nattrs == 0) return true;
+  uint32_t binding = p->attrs[0].binding;
+  for (uint32_t i = 0; i < p->nattrs; ++i) {
     const VtxFormat *vf = vertex_format(p->attrs[i].format);
-    if (!vf || vf->kind != 0 || p->attrs[i].binding != binding || p->attrs[i].offset != p->out_offset[i]) return FALSE;
+    if (!vf || vf->kind != 0 || p->attrs[i].binding != binding || p->attrs[i].offset != p->out_offset[i]) return false;
   }
-  for (UINT b = 0; b < p->nbindings; ++b)
+  for (uint32_t b = 0; b < p->nbindings; ++b)
     if (p->bindings[b].binding == binding) return !p->bindings[b].per_instance && p->bindings[b].stride == p->out_stride;
-  return FALSE;
+  return false;
 }
 
-static const VtxBinding *find_vtx_binding(Pipe *p, UINT binding) {
-  for (UINT b = 0; b < p->nbindings; ++b)
+static const VtxBinding *find_vtx_binding(Pipe *p, uint32_t binding) {
+  for (uint32_t b = 0; b < p->nbindings; ++b)
     if (p->bindings[b].binding == binding) return &p->bindings[b];
   return NULL;
 }
 
 /* Vertices lo .. lo + count - 1 of the bound buffers as one buffer of the layout the pipeline was made with. Returns the allocation (temporary) or 0. */
-static KMT_HANDLE gather_vertices(Exec *x, UINT lo, UINT count, UINT first_instance, UINT instances) {
+static KMT_HANDLE gather_vertices(Exec *x, uint32_t lo, uint32_t count, uint32_t first_instance, uint32_t instances) {
   Pipe *p = x->pipe;
-  UINT elements = MAX(count, first_instance + instances);
+  uint32_t elements = MAX(count, first_instance + instances);
   if (elements == 0 || p->out_stride == 0) return 0;
-  ULONGLONG bytes = (ULONGLONG)elements * p->out_stride;
+  uint64_t bytes = (uint64_t)elements * p->out_stride;
   if (bytes > (64u << 20)) return 0;
-  BYTE *tmp = vk_alloc((size_t)bytes);
+  uint8_t *tmp = vk_alloc((size_t)bytes);
   if (!tmp) return 0;
-  for (UINT e = 0; e < elements; ++e) {
-    for (UINT a = 0; a < p->nattrs; ++a) {
+  for (uint32_t e = 0; e < elements; ++e) {
+    for (uint32_t a = 0; a < p->nattrs; ++a) {
       const VtxBinding *vb = find_vtx_binding(p, p->attrs[a].binding);
       const VtxFormat *vf = vertex_format(p->attrs[a].format);
       if (!vb || !vf) continue;
-      UINT src_element = vb->per_instance ? e : lo + e;
+      uint32_t src_element = vb->per_instance ? e : lo + e;
       if (vb->per_instance ? e >= first_instance + instances : e >= count) continue;
       Buf *buf = p->attrs[a].binding < 8 ? x->vb[p->attrs[a].binding].b : NULL;
       if (!buf || !buf->mem) continue;
-      ULONGLONG at = x->vb[p->attrs[a].binding].off + (ULONGLONG)src_element * vb->stride + p->attrs[a].offset;
+      uint64_t at = x->vb[p->attrs[a].binding].off + (uint64_t)src_element * vb->stride + p->attrs[a].offset;
       if (at + vf->bytes > buf->size) continue;
-      const BYTE *src = buf->mem->data + buf->off + at;
-      float *dst = (float *)(tmp + (ULONGLONG)e * p->out_stride + p->out_offset[a]);
-      for (UINT c = 0; c < vf->comps; ++c) dst[c] = read_component(vf, src, c);
+      const uint8_t *src = buf->mem->data + buf->off + at;
+      float *dst = (float *)(tmp + (uint64_t)e * p->out_stride + p->out_offset[a]);
+      for (uint32_t c = 0; c < vf->comps; ++c) dst[c] = read_component(vf, src, c);
     }
   }
   KMT_HANDLE a = 0;
-  ULONGLONG alloc_bytes = (bytes + 15) & ~15ull;
+  uint64_t alloc_bytes = (bytes + 15) & ~15ull;
   if (kmt_make_buffer(x->d, alloc_bytes, A_VERTEX, &a)) {
-    BYTE *dst = kmt_lock(x->d, a, 0, LOCK_DISCARD);
+    uint8_t *dst = kmt_lock(x->d, a, 0, LOCK_DISCARD);
     if (dst) {
       memcpy(dst, tmp, (size_t)bytes);
       kmt_unlock(x->d, a);
@@ -691,7 +691,7 @@ static KMT_HANDLE gather_vertices(Exec *x, UINT lo, UINT count, UINT first_insta
   return a;
 }
 
-static UINT map_topology(UINT t) {
+static uint32_t map_topology(uint32_t t) {
   switch (t) {
     case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 5;
     case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return 3;
@@ -702,7 +702,7 @@ static UINT map_topology(UINT t) {
   }
 }
 
-static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_offset, UINT first_instance, BOOL indexed) {
+static void do_draw(Exec *x, uint32_t count, uint32_t instances, uint32_t first, int vertex_offset, uint32_t first_instance, bool indexed) {
   Pipe *p = x->pipe;
   if (!p || !x->rp || count == 0 || instances == 0) return;
   if (!ensure_room(x, 64 + p->nunit * 10)) {
@@ -711,29 +711,29 @@ static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_
     flush(x);
     begin_stream_pass(x);
   }
-  BOOL direct = vertex_direct(p) && p->nattrs > 0 && p->attrs[0].binding < 8 && x->vb[p->attrs[0].binding].b && instances == 1 && first_instance == 0;
+  bool direct = vertex_direct(p) && p->nattrs > 0 && p->attrs[0].binding < 8 && x->vb[p->attrs[0].binding].b && instances == 1 && first_instance == 0;
   KMT_HANDLE gathered = 0;
-  UINT draw_first = first;
+  uint32_t draw_first = first;
   int draw_offset = vertex_offset;
   if (!direct && p->nattrs > 0) {
-    UINT lo = 0, hi = 0;
+    uint32_t lo = 0, hi = 0;
     if (indexed) {
       Buf *ib = x->ib;
       if (!ib || !ib->mem) return;
-      UINT isz = x->ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
-      ULONGLONG at = x->ib_off + (ULONGLONG)first * isz;
-      if (at + (ULONGLONG)count * isz > ib->size) return;
-      const BYTE *src = ib->mem->data + ib->off + at;
-      UINT mn = 0xFFFFFFFFu, mx = 0;
-      for (UINT i = 0; i < count; ++i) {
-        UINT v = isz == 4 ? ((const UINT *)src)[i] : ((const USHORT *)src)[i];
+      uint32_t isz = x->ib_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+      uint64_t at = x->ib_off + (uint64_t)first * isz;
+      if (at + (uint64_t)count * isz > ib->size) return;
+      const uint8_t *src = ib->mem->data + ib->off + at;
+      uint32_t mn = 0xFFFFFFFFu, mx = 0;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint32_t v = isz == 4 ? ((const uint32_t *)src)[i] : ((const uint16_t *)src)[i];
         if (v == (isz == 4 ? 0xFFFFFFFFu : 0xFFFFu)) continue;
         mn = MIN(mn, v), mx = MAX(mx, v);
       }
       if (mn > mx) return;
       int base = vertex_offset;
-      lo = (UINT)((int)mn + base);
-      hi = (UINT)((int)mx + base);
+      lo = (uint32_t)((int)mn + base);
+      hi = (uint32_t)((int)mx + base);
       draw_offset = base - (int)lo;
     } else {
       lo = first;
@@ -745,17 +745,17 @@ static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_
   }
   /* state */
   if (x->dirty_pipe) {
-    UINT h = p->pipe;
+    uint32_t h = p->pipe;
     packet(x, OP_BIND_PIPELINE, &h, 1);
-    x->dirty_pipe = FALSE;
-    x->dirty_state = TRUE;
+    x->dirty_pipe = false;
+    x->dirty_state = true;
   }
   if (x->dirty_state) {
-    BYTE constants[4096];
-    UINT bytes = gather_constants(x, p, constants, MIN((UINT)sizeof constants, x->caps->max_push_constant_bytes));
+    uint8_t constants[4096];
+    uint32_t bytes = gather_constants(x, p, constants, MIN((uint32_t)sizeof constants, x->caps->max_push_constant_bytes));
     if (bytes) {
-      UINT words = bytes / 4;
-      UINT *w = stream_words(x, 2 + words);
+      uint32_t words = bytes / 4;
+      uint32_t *w = stream_words(x, 2 + words);
       if (w) {
         w[0] = OP_PUSH | ((2 + words) << 16);
         w[1] = bytes;
@@ -767,91 +767,91 @@ static void do_draw(Exec *x, UINT count, UINT instances, UINT first, int vertex_
       trace("a draw without a storage buffer its pipeline uses");
       return;
     }
-    x->dirty_state = FALSE;
+    x->dirty_state = false;
   }
   {
     VkViewport vp = p->dyn_viewport || x->vp_set ? x->vp : p->viewport;
     if (!x->vp_set && !p->dyn_viewport) vp = p->viewport;
     if (vp.width == 0 && vp.height == 0 && x->fb) vp.x = 0, vp.y = 0, vp.width = (float)x->fb->w, vp.height = (float)x->fb->h, vp.minDepth = 0, vp.maxDepth = 1;
-    UINT payload[6] = {fbits(vp.x), fbits(vp.y), fbits(vp.width), fbits(vp.height), fbits(vp.minDepth), fbits(vp.maxDepth)};
+    uint32_t payload[6] = {fbits(vp.x), fbits(vp.y), fbits(vp.width), fbits(vp.height), fbits(vp.minDepth), fbits(vp.maxDepth)};
     packet(x, OP_VIEWPORT, payload, 6);
     VkRect2D sc = (p->dyn_scissor || x->sc_set) ? x->sc : p->scissor;
     if (!x->sc_set && !p->dyn_scissor) sc = p->scissor;
     if (sc.extent.width == 0 && sc.extent.height == 0 && x->fb) sc.offset.x = sc.offset.y = 0, sc.extent.width = x->fb->w, sc.extent.height = x->fb->h;
-    UINT sp[4] = {(UINT)sc.offset.x, (UINT)sc.offset.y, sc.extent.width, sc.extent.height};
+    uint32_t sp[4] = {(uint32_t)sc.offset.x, (uint32_t)sc.offset.y, sc.extent.width, sc.extent.height};
     packet(x, OP_SCISSOR, sp, 4);
   }
-  UINT topo = map_topology(p->topology);
+  uint32_t topo = map_topology(p->topology);
   if (topo != x->topology_sent) {
     packet(x, OP_TOPOLOGY, &topo, 1);
     x->topology_sent = topo;
   }
   if (p->nattrs > 0) {
-    UINT alloc, off = 0;
+    uint32_t alloc, off = 0;
     int idx;
     if (direct) {
       if (!buf_sync(x->vb[p->attrs[0].binding].b, &alloc)) return;
       idx = alloc_index(x, alloc);
-      off = (UINT)x->vb[p->attrs[0].binding].off;
+      off = (uint32_t)x->vb[p->attrs[0].binding].off;
     } else {
       idx = alloc_index(x, gathered);
     }
     if (idx < 0) return;
-    UINT payload[2] = {(UINT)idx, off};
+    uint32_t payload[2] = {(uint32_t)idx, off};
     packet(x, OP_BIND_VB, payload, 2);
   }
   if (indexed) {
     Buf *ib = x->ib;
-    UINT alloc;
+    uint32_t alloc;
     if (!ib || !buf_sync(ib, &alloc)) return;
     int idx = alloc_index(x, alloc);
     if (idx < 0) return;
-    UINT payload[3] = {(UINT)idx, x->ib_type == VK_INDEX_TYPE_UINT32 ? 1u : 0u, (UINT)x->ib_off};
+    uint32_t payload[3] = {(uint32_t)idx, x->ib_type == VK_INDEX_TYPE_UINT32 ? 1u : 0u, (uint32_t)x->ib_off};
     packet(x, OP_BIND_IB, payload, 3);
   }
   if (indexed) {
     if (instances == 1 && first_instance == 0) {
-      UINT payload[3] = {count, first, (UINT)draw_offset};
+      uint32_t payload[3] = {count, first, (uint32_t)draw_offset};
       packet(x, OP_DRAW_INDEXED, payload, 3);
     } else {
-      UINT payload[5] = {count, first, (UINT)draw_offset, instances, first_instance};
+      uint32_t payload[5] = {count, first, (uint32_t)draw_offset, instances, first_instance};
       packet(x, OP_DRAW_INDEXED_INSTANCED, payload, 5);
     }
   } else if (instances == 1 && first_instance == 0) {
-    UINT payload[2] = {count, direct ? first : draw_first};
+    uint32_t payload[2] = {count, direct ? first : draw_first};
     packet(x, OP_DRAW, payload, 2);
   } else {
-    UINT payload[4] = {count, direct ? first : draw_first, instances, first_instance};
+    uint32_t payload[4] = {count, direct ? first : draw_first, instances, first_instance};
     packet(x, OP_DRAW_INSTANCED, payload, 4);
   }
 }
 
 /* ---- the copies and clears the CPU does ---------------------------------------------------------------------------------------------------------------------------- */
-static BYTE *level_pointer(Img *img, UINT level, BOOL write, UINT *pitch_out) {
-  BYTE *p = kmt_lock(img->dev, img->alloc, level, write ? 0 : LOCK_READ_ONLY);
+static uint8_t *level_pointer(Img *img, uint32_t level, bool write, uint32_t *pitch_out) {
+  uint8_t *p = kmt_lock(img->dev, img->alloc, level, write ? 0 : LOCK_READ_ONLY);
   *pitch_out = level_extent(img->w, level) * img->bpp;
   return p;
 }
 
-static void copy_buffer_image(Exec *x, const VkBufferImageCopy *r, Buf *buf, Img *img, BOOL to_image) {
+static void copy_buffer_image(Exec *x, const VkBufferImageCopy *r, Buf *buf, Img *img, bool to_image) {
   if (!buf->mem || img->is_depth) return;
-  UINT layers_in_alloc = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
-  UINT pitch;
-  BYTE *level = level_pointer(img, r->imageSubresource.mipLevel, to_image, &pitch);
+  uint32_t layers_in_alloc = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
+  uint32_t pitch;
+  uint8_t *level = level_pointer(img, r->imageSubresource.mipLevel, to_image, &pitch);
   if (!level) return;
-  UINT lw = level_extent(img->w, r->imageSubresource.mipLevel), lh = level_extent(img->h, r->imageSubresource.mipLevel);
-  UINT row_len = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
-  UINT img_h = r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
-  UINT slices = MAX(r->imageExtent.depth, r->imageSubresource.layerCount);
-  for (UINT z = 0; z < slices; ++z) {
-    UINT slice = (img->kind == 1 ? (UINT)r->imageOffset.z : r->imageSubresource.baseArrayLayer) + z;
+  uint32_t lw = level_extent(img->w, r->imageSubresource.mipLevel), lh = level_extent(img->h, r->imageSubresource.mipLevel);
+  uint32_t row_len = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
+  uint32_t img_h = r->bufferImageHeight ? r->bufferImageHeight : r->imageExtent.height;
+  uint32_t slices = MAX(r->imageExtent.depth, r->imageSubresource.layerCount);
+  for (uint32_t z = 0; z < slices; ++z) {
+    uint32_t slice = (img->kind == 1 ? (uint32_t)r->imageOffset.z : r->imageSubresource.baseArrayLayer) + z;
     if (slice >= layers_in_alloc) break;
-    for (UINT y = 0; y < r->imageExtent.height; ++y) {
+    for (uint32_t y = 0; y < r->imageExtent.height; ++y) {
       int iy = r->imageOffset.y + (int)y, ix = r->imageOffset.x;
-      if (iy < 0 || (UINT)iy >= lh || ix < 0 || (UINT)ix + r->imageExtent.width > lw) continue;
-      ULONGLONG boff = buf->off + r->bufferOffset + ((ULONGLONG)z * img_h + y) * row_len * img->bpp;
-      ULONGLONG ioff = (ULONGLONG)slice * lh * pitch + (ULONGLONG)iy * pitch + (ULONGLONG)ix * img->bpp;
-      ULONGLONG n = (ULONGLONG)r->imageExtent.width * img->bpp;
+      if (iy < 0 || (uint32_t)iy >= lh || ix < 0 || (uint32_t)ix + r->imageExtent.width > lw) continue;
+      uint64_t boff = buf->off + r->bufferOffset + ((uint64_t)z * img_h + y) * row_len * img->bpp;
+      uint64_t ioff = (uint64_t)slice * lh * pitch + (uint64_t)iy * pitch + (uint64_t)ix * img->bpp;
+      uint64_t n = (uint64_t)r->imageExtent.width * img->bpp;
       if (boff + n > buf->mem->size) continue;
       if (to_image) {
         memcpy(level + ioff, buf->mem->data + boff, (size_t)n);
@@ -868,21 +868,21 @@ static void copy_buffer_image(Exec *x, const VkBufferImageCopy *r, Buf *buf, Img
 
 static void exec_copy_image(const VkImageCopy *r, Img *src, Img *dst) {
   if (src->is_depth || dst->is_depth || src->bpp != dst->bpp) return;
-  UINT sp, dp;
-  BYTE *s = level_pointer(src, r->srcSubresource.mipLevel, FALSE, &sp);
+  uint32_t sp, dp;
+  uint8_t *s = level_pointer(src, r->srcSubresource.mipLevel, false, &sp);
   if (!s) return;
-  BYTE *d = src == dst && r->srcSubresource.mipLevel == r->dstSubresource.mipLevel ? s : level_pointer(dst, r->dstSubresource.mipLevel, TRUE, &dp);
+  uint8_t *d = src == dst && r->srcSubresource.mipLevel == r->dstSubresource.mipLevel ? s : level_pointer(dst, r->dstSubresource.mipLevel, true, &dp);
   if (!d) {
     kmt_unlock(src->dev, src->alloc);
     return;
   }
   dp = level_extent(dst->w, r->dstSubresource.mipLevel) * dst->bpp;
-  UINT sh = level_extent(src->h, r->srcSubresource.mipLevel), dh = level_extent(dst->h, r->dstSubresource.mipLevel);
-  for (UINT y = 0; y < r->extent.height; ++y) {
+  uint32_t sh = level_extent(src->h, r->srcSubresource.mipLevel), dh = level_extent(dst->h, r->dstSubresource.mipLevel);
+  for (uint32_t y = 0; y < r->extent.height; ++y) {
     int sy = r->srcOffset.y + (int)y, dy = r->dstOffset.y + (int)y;
-    if (sy < 0 || dy < 0 || (UINT)sy >= sh || (UINT)dy >= dh) continue;
-    BYTE *row = d + (ULONGLONG)dy * dp + (ULONGLONG)r->dstOffset.x * dst->bpp;
-    memmove(row, s + (ULONGLONG)sy * sp + (ULONGLONG)r->srcOffset.x * src->bpp, (size_t)r->extent.width * src->bpp);
+    if (sy < 0 || dy < 0 || (uint32_t)sy >= sh || (uint32_t)dy >= dh) continue;
+    uint8_t *row = d + (uint64_t)dy * dp + (uint64_t)r->dstOffset.x * dst->bpp;
+    memmove(row, s + (uint64_t)sy * sp + (uint64_t)r->srcOffset.x * src->bpp, (size_t)r->extent.width * src->bpp);
     if (src->swap_rb != dst->swap_rb && src->bpp == 4) swap_rb_pixels(row, r->extent.width);
   }
   if (d != s) kmt_unlock(dst->dev, dst->alloc);
@@ -891,10 +891,10 @@ static void exec_copy_image(const VkImageCopy *r, Img *src, Img *dst) {
 
 static void exec_blit(const VkImageBlit *r, Img *src, Img *dst) {
   if (src->is_depth || dst->is_depth || src->bpp != dst->bpp || src == dst) return;
-  UINT sp, dp;
-  BYTE *s = level_pointer(src, r->srcSubresource.mipLevel, FALSE, &sp);
+  uint32_t sp, dp;
+  uint8_t *s = level_pointer(src, r->srcSubresource.mipLevel, false, &sp);
   if (!s) return;
-  BYTE *d = level_pointer(dst, r->dstSubresource.mipLevel, TRUE, &dp);
+  uint8_t *d = level_pointer(dst, r->dstSubresource.mipLevel, true, &dp);
   if (!d) {
     kmt_unlock(src->dev, src->alloc);
     return;
@@ -902,82 +902,82 @@ static void exec_blit(const VkImageBlit *r, Img *src, Img *dst) {
   int sx0 = r->srcOffsets[0].x, sy0 = r->srcOffsets[0].y, sx1 = r->srcOffsets[1].x, sy1 = r->srcOffsets[1].y;
   int dx0 = r->dstOffsets[0].x, dy0 = r->dstOffsets[0].y, dx1 = r->dstOffsets[1].x, dy1 = r->dstOffsets[1].y;
   int dw = dx1 - dx0, dh = dy1 - dy0, sw = sx1 - sx0, sh = sy1 - sy0;
-  UINT lw = level_extent(dst->w, r->dstSubresource.mipLevel), lh = level_extent(dst->h, r->dstSubresource.mipLevel);
-  UINT slw = level_extent(src->w, r->srcSubresource.mipLevel), slh = level_extent(src->h, r->srcSubresource.mipLevel);
+  uint32_t lw = level_extent(dst->w, r->dstSubresource.mipLevel), lh = level_extent(dst->h, r->dstSubresource.mipLevel);
+  uint32_t slw = level_extent(src->w, r->srcSubresource.mipLevel), slh = level_extent(src->h, r->srcSubresource.mipLevel);
   for (int y = 0; y < (dh < 0 ? -dh : dh); ++y)
     for (int xx = 0; xx < (dw < 0 ? -dw : dw); ++xx) {
       int dxp = dw < 0 ? dx0 - 1 - xx : dx0 + xx, dyp = dh < 0 ? dy0 - 1 - y : dy0 + y;
       int fx = (int)(((long long)(2 * xx + 1) * (sw < 0 ? -sw : sw)) / (2 * (dw < 0 ? -dw : dw))), fy = (int)(((long long)(2 * y + 1) * (sh < 0 ? -sh : sh)) / (2 * (dh < 0 ? -dh : dh)));
       int sxp = sw < 0 ? sx0 - 1 - fx : sx0 + fx, syp = sh < 0 ? sy0 - 1 - fy : sy0 + fy;
-      if (dxp < 0 || dyp < 0 || (UINT)dxp >= lw || (UINT)dyp >= lh || sxp < 0 || syp < 0 || (UINT)sxp >= slw || (UINT)syp >= slh) continue;
-      BYTE *px = d + (ULONGLONG)dyp * dp + (ULONGLONG)dxp * dst->bpp;
-      memcpy(px, s + (ULONGLONG)syp * sp + (ULONGLONG)sxp * src->bpp, src->bpp);
+      if (dxp < 0 || dyp < 0 || (uint32_t)dxp >= lw || (uint32_t)dyp >= lh || sxp < 0 || syp < 0 || (uint32_t)sxp >= slw || (uint32_t)syp >= slh) continue;
+      uint8_t *px = d + (uint64_t)dyp * dp + (uint64_t)dxp * dst->bpp;
+      memcpy(px, s + (uint64_t)syp * sp + (uint64_t)sxp * src->bpp, src->bpp);
       if (src->swap_rb != dst->swap_rb && src->bpp == 4) swap_rb_pixels(px, 1);
     }
   kmt_unlock(dst->dev, dst->alloc);
   kmt_unlock(src->dev, src->alloc);
 }
 
-static UINT float_to_half(float f) {
-  union { float f; UINT u; } v;
+static uint32_t float_to_half(float f) {
+  union { float f; uint32_t u; } v;
   v.f = f;
-  UINT sign = (v.u >> 16) & 0x8000, exp = (v.u >> 23) & 0xFF, man = v.u & 0x7FFFFF;
+  uint32_t sign = (v.u >> 16) & 0x8000, exp = (v.u >> 23) & 0xFF, man = v.u & 0x7FFFFF;
   if (exp == 0xFF) return sign | 0x7C00 | (man ? 0x200 : 0);
   int e = (int)exp - 127 + 15;
   if (e >= 31) return sign | 0x7C00;
   if (e <= 0) return e < -10 ? sign : sign | ((man | 0x800000) >> (14 - e));
-  return sign | ((UINT)e << 10) | (man >> 13);
+  return sign | ((uint32_t)e << 10) | (man >> 13);
 }
-static BYTE unorm8(float f) { return (BYTE)(f <= 0 ? 0 : f >= 1 ? 255 : (int)(f * 255.0f + 0.5f)); }
+static uint8_t unorm8(float f) { return (uint8_t)(f <= 0 ? 0 : f >= 1 ? 255 : (int)(f * 255.0f + 0.5f)); }
 
 /* The bytes of a pixel of a format with a clear colour. */
-static void clear_pixel(const Img *img, const VkClearColorValue *c, BYTE *out) {
+static void clear_pixel(const Img *img, const VkClearColorValue *c, uint8_t *out) {
   switch (img->dfmt) {
     case DF_A8R8G8B8: case DF_A8R8G8B8_SRGB: out[0] = unorm8(c->float32[2]), out[1] = unorm8(c->float32[1]), out[2] = unorm8(c->float32[0]), out[3] = unorm8(c->float32[3]); break;
     case DF_A8B8G8R8: case DF_A8B8G8R8_SRGB: out[0] = unorm8(c->float32[0]), out[1] = unorm8(c->float32[1]), out[2] = unorm8(c->float32[2]), out[3] = unorm8(c->float32[3]); break;
-    case DF_RGBA8UI: for (int i = 0; i < 4; ++i) out[i] = (BYTE)c->uint32[i]; break;
-    case DF_RGBA16F: for (int i = 0; i < 4; ++i) { USHORT h = (USHORT)float_to_half(c->float32[i]); memcpy(out + 2 * i, &h, 2); } break;
+    case DF_RGBA8UI: for (int i = 0; i < 4; ++i) out[i] = (uint8_t)c->uint32[i]; break;
+    case DF_RGBA16F: for (int i = 0; i < 4; ++i) { uint16_t h = (uint16_t)float_to_half(c->float32[i]); memcpy(out + 2 * i, &h, 2); } break;
     case DF_RGBA32F: case DF_RGBA32UI: case DF_RGBA32SI: memcpy(out, c, 16); break;
-    case DF_RGBA16: for (int i = 0; i < 4; ++i) { USHORT h = (USHORT)(c->float32[i] <= 0 ? 0 : c->float32[i] >= 1 ? 65535 : (int)(c->float32[i] * 65535.0f + 0.5f)); memcpy(out + 2 * i, &h, 2); } break;
-    case DF_RGBA16UI: case DF_RGBA16SI: for (int i = 0; i < 4; ++i) { USHORT h = (USHORT)c->uint32[i]; memcpy(out + 2 * i, &h, 2); } break;
+    case DF_RGBA16: for (int i = 0; i < 4; ++i) { uint16_t h = (uint16_t)(c->float32[i] <= 0 ? 0 : c->float32[i] >= 1 ? 65535 : (int)(c->float32[i] * 65535.0f + 0.5f)); memcpy(out + 2 * i, &h, 2); } break;
+    case DF_RGBA16UI: case DF_RGBA16SI: for (int i = 0; i < 4; ++i) { uint16_t h = (uint16_t)c->uint32[i]; memcpy(out + 2 * i, &h, 2); } break;
     default: memset(out, 0, img->bpp); break;
   }
 }
 
-static void exec_clear_color(const Img *img_c, const void *payload, UINT nranges) {
+static void exec_clear_color(const Img *img_c, const void *payload, uint32_t nranges) {
   Img *img = (Img *)img_c;
   const VkClearColorValue *color = payload;
-  const VkImageSubresourceRange *ranges = (const VkImageSubresourceRange *)((const BYTE *)payload + sizeof(VkClearColorValue));
-  BYTE pixel[16];
+  const VkImageSubresourceRange *ranges = (const VkImageSubresourceRange *)((const uint8_t *)payload + sizeof(VkClearColorValue));
+  uint8_t pixel[16];
   clear_pixel(img, color, pixel);
-  for (UINT r = 0; r < nranges; ++r) {
-    UINT levels = ranges[r].levelCount == VK_REMAINING_MIP_LEVELS ? img->mips - ranges[r].baseMipLevel : ranges[r].levelCount;
-    for (UINT l = ranges[r].baseMipLevel; l < ranges[r].baseMipLevel + levels && l < img->mips; ++l) {
-      BYTE *p = kmt_lock(img->dev, img->alloc, l, LOCK_DISCARD);
+  for (uint32_t r = 0; r < nranges; ++r) {
+    uint32_t levels = ranges[r].levelCount == VK_REMAINING_MIP_LEVELS ? img->mips - ranges[r].baseMipLevel : ranges[r].levelCount;
+    for (uint32_t l = ranges[r].baseMipLevel; l < ranges[r].baseMipLevel + levels && l < img->mips; ++l) {
+      uint8_t *p = kmt_lock(img->dev, img->alloc, l, LOCK_DISCARD);
       if (!p) continue;
-      UINT layers = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
-      ULONGLONG n = (ULONGLONG)level_extent(img->w, l) * level_extent(img->h, l) * layers;
-      for (ULONGLONG i = 0; i < n; ++i) memcpy(p + i * img->bpp, pixel, img->bpp);
+      uint32_t layers = img->kind == 1 ? img->depth : img->kind == 3 ? 6 : img->kind == 2 ? img->layers : 1;
+      uint64_t n = (uint64_t)level_extent(img->w, l) * level_extent(img->h, l) * layers;
+      for (uint64_t i = 0; i < n; ++i) memcpy(p + i * img->bpp, pixel, img->bpp);
       kmt_unlock(img->dev, img->alloc);
     }
   }
 }
 
 /* A clear of a whole image that can be drawn into (one level, one layer, one sample) done by the GPU: a pass that only clears it, in the stream with the other commands, instead of
- * the CPU filling the image's memory (which waits for the GPU first and then has the whole image uploaded again). FALSE: not such an image or range, the CPU does it. */
-static BOOL gpu_clear_color(Exec *x, Img *img, const VkClearColorValue *color, const VkImageSubresourceRange *ranges, UINT nranges) {
-  if (img->is_depth || !(img->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || img->mips != 1 || img->samples != 1 || img->kind != 0 || img->layers > 1) return FALSE;
-  if (img->tiling == VK_IMAGE_TILING_LINEAR && img->mem) return FALSE;   /* (a linear image's memory is what the program sees: the CPU keeps it) */
-  BOOL covered = FALSE;
-  for (UINT r = 0; r < nranges; ++r) covered |= ranges[r].baseMipLevel == 0 && ranges[r].levelCount != 0 && ranges[r].baseArrayLayer == 0 && ranges[r].layerCount != 0;
-  if (!covered) return TRUE;   /* (nothing of the one level and layer: nothing to do) */
+ * the CPU filling the image's memory (which waits for the GPU first and then has the whole image uploaded again). false: not such an image or range, the CPU does it. */
+static bool gpu_clear_color(Exec *x, Img *img, const VkClearColorValue *color, const VkImageSubresourceRange *ranges, uint32_t nranges) {
+  if (img->is_depth || !(img->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || img->mips != 1 || img->samples != 1 || img->kind != 0 || img->layers > 1) return false;
+  if (img->tiling == VK_IMAGE_TILING_LINEAR && img->mem) return false;   /* (a linear image's memory is what the program sees: the CPU keeps it) */
+  bool covered = false;
+  for (uint32_t r = 0; r < nranges; ++r) covered |= ranges[r].baseMipLevel == 0 && ranges[r].levelCount != 0 && ranges[r].baseArrayLayer == 0 && ranges[r].layerCount != 0;
+  if (!covered) return true;   /* (nothing of the one level and layer: nothing to do) */
   int idx = alloc_index(x, img->alloc);
-  if (idx < 0) return FALSE;
-  UINT payload[9] = {(UINT)idx, NO_ALLOC, 1, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3], fbits(1.0f), 0};   /* (the colour's words as they are: floats, or the integers of an integer image) */
-  if (!packet(x, OP_BEGIN_PASS, payload, 9) || !packet(x, OP_END_PASS, NULL, 0)) return FALSE;
-  img->gpu_written = TRUE;
-  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
-  return TRUE;
+  if (idx < 0) return false;
+  uint32_t payload[9] = {(uint32_t)idx, NO_ALLOC, 1, color->uint32[0], color->uint32[1], color->uint32[2], color->uint32[3], fbits(1.0f), 0};   /* (the colour's words as they are: floats, or the integers of an integer image) */
+  if (!packet(x, OP_BEGIN_PASS, payload, 9) || !packet(x, OP_END_PASS, NULL, 0)) return false;
+  img->gpu_written = true;
+  x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = true;
+  return true;
 }
 
 static void run_cmds(Exec *x, CmdBuf *cb);
@@ -986,15 +986,15 @@ static void exec_one(Exec *x, const Cmd *c) {
   Device *d = x->d;
   switch (c->op) {
     case C_BEGIN_PASS: {
-      x->rp = (RenderPass *)(ULONG_PTR)c->a;
-      x->fb = (Framebuffer *)(ULONG_PTR)c->b;
+      x->rp = (RenderPass *)(uintptr_t)c->a;
+      x->fb = (Framebuffer *)(uintptr_t)c->b;
       x->clears = c->p;
       x->nclears = c->n;
       x->subpass = 0;
       memset(x->attachment_used, 0, sizeof x->attachment_used);
-      x->vp_set = x->sc_set = FALSE;
+      x->vp_set = x->sc_set = false;
       if (!x->rp || !x->fb || x->rp->nsub == 0) break;
-      for (UINT i = 0; i < x->fb->nview; ++i) image_sync_up(x->fb->view[i]->img);
+      for (uint32_t i = 0; i < x->fb->nview; ++i) image_sync_up(x->fb->view[i]->img);
       begin_stream_pass(x);
       break;
     }
@@ -1015,108 +1015,108 @@ static void exec_one(Exec *x, const Cmd *c) {
       break;
     case C_BIND_PIPE:
       if (c->d == BP_COMPUTE) {
-        x->cpipe = (Pipe *)(ULONG_PTR)c->a;
+        x->cpipe = (Pipe *)(uintptr_t)c->a;
         break;
       }
-      x->pipe = (Pipe *)(ULONG_PTR)c->a;
-      x->dirty_pipe = TRUE;
+      x->pipe = (Pipe *)(uintptr_t)c->a;
+      x->dirty_pipe = true;
       break;
     case C_BIND_VB:
-      if (c->a < 8) x->vb[c->a].b = (Buf *)(ULONG_PTR)c->b, x->vb[c->a].off = c->c;
-      x->dirty_vb = TRUE;
+      if (c->a < 8) x->vb[c->a].b = (Buf *)(uintptr_t)c->b, x->vb[c->a].off = c->c;
+      x->dirty_vb = true;
       break;
     case C_BIND_IB:
-      x->ib = (Buf *)(ULONG_PTR)c->a, x->ib_off = c->b, x->ib_type = (UINT)c->c;
-      x->dirty_ib = TRUE;
+      x->ib = (Buf *)(uintptr_t)c->a, x->ib_off = c->b, x->ib_type = (uint32_t)c->c;
+      x->dirty_ib = true;
       break;
     case C_BIND_SETS: {
       DescSet **sets = c->p;
-      const UINT *dyn = (const UINT *)((BYTE *)c->p + sizeof(void *) * c->n);
-      UINT used = 0;
+      const uint32_t *dyn = (const uint32_t *)((uint8_t *)c->p + sizeof(void *) * c->n);
+      uint32_t used = 0;
       DescSet **bound = c->d == BP_COMPUTE ? x->csets : x->sets;
-      UINT (*offsets)[8] = c->d == BP_COMPUTE ? x->cdyn : x->dyn;
-      for (UINT i = 0; i < c->n && c->a + i < 8; ++i) {
+      uint32_t (*offsets)[8] = c->d == BP_COMPUTE ? x->cdyn : x->dyn;
+      for (uint32_t i = 0; i < c->n && c->a + i < 8; ++i) {
         bound[c->a + i] = sets[i];
-        UINT count = 0;
-        for (UINT k = 0; sets[i] && k < sets[i]->layout->nb; ++k)
+        uint32_t count = 0;
+        for (uint32_t k = 0; sets[i] && k < sets[i]->layout->nb; ++k)
           if (is_dynamic(sets[i]->layout->b[k].type)) count += sets[i]->layout->b[k].count;
-        for (UINT k = 0; k < count && used < c->b; ++k, ++used)
+        for (uint32_t k = 0; k < count && used < c->b; ++k, ++used)
           if (k < 8) offsets[c->a + i][k] = dyn[used];
       }
-      if (c->d == BP_GRAPHICS) x->dirty_state = TRUE;
+      if (c->d == BP_GRAPHICS) x->dirty_state = true;
       break;
     }
     case C_DISPATCH:
-      do_dispatch(x, (UINT)c->a, (UINT)c->b, (UINT)c->c);
+      do_dispatch(x, (uint32_t)c->a, (uint32_t)c->b, (uint32_t)c->c);
       break;
     case C_DISPATCH_INDIRECT: {
       /* (the group counts are read from the buffer's memory: what the commands before have left there) */
-      Buf *b = (Buf *)(ULONG_PTR)c->a;
+      Buf *b = (Buf *)(uintptr_t)c->a;
       if (!b || !b->mem || c->b > b->size || b->size - c->b < 12) break;
       flush(x);
-      UINT g[3];
+      uint32_t g[3];
       memcpy(g, b->mem->data + b->off + c->b, 12);
       do_dispatch(x, g[0], g[1], g[2]);
       break;
     }
     case C_PUSH:
       if (c->a + c->n <= sizeof x->push) memcpy(x->push + c->a, c->p, c->n);
-      x->dirty_state = TRUE;
+      x->dirty_state = true;
       break;
     case C_VIEWPORT:
-      x->vp = *(const VkViewport *)c->p, x->vp_set = TRUE;
+      x->vp = *(const VkViewport *)c->p, x->vp_set = true;
       break;
     case C_SCISSOR:
-      x->sc = *(const VkRect2D *)c->p, x->sc_set = TRUE;
+      x->sc = *(const VkRect2D *)c->p, x->sc_set = true;
       break;
     case C_DRAW:
-      do_draw(x, (UINT)c->a, (UINT)c->b, (UINT)c->c, 0, (UINT)c->d, FALSE);
+      do_draw(x, (uint32_t)c->a, (uint32_t)c->b, (uint32_t)c->c, 0, (uint32_t)c->d, false);
       break;
     case C_DRAW_INDEXED:
-      do_draw(x, (UINT)c->a, (UINT)c->b, (UINT)c->c, (int)(UINT)c->d, (UINT)c->e, TRUE);
+      do_draw(x, (uint32_t)c->a, (uint32_t)c->b, (uint32_t)c->c, (int)(uint32_t)c->d, (uint32_t)c->e, true);
       break;
     case C_COPY_BUF: {
       flush(x);
-      Buf *src = (Buf *)(ULONG_PTR)c->a, *dst = (Buf *)(ULONG_PTR)c->b;
+      Buf *src = (Buf *)(uintptr_t)c->a, *dst = (Buf *)(uintptr_t)c->b;
       const VkBufferCopy *r = c->p;
       if (!src->mem || !dst->mem) break;
-      for (UINT i = 0; i < c->n; ++i)
+      for (uint32_t i = 0; i < c->n; ++i)
         if (r[i].srcOffset + r[i].size <= src->size && r[i].dstOffset + r[i].size <= dst->size) memmove(dst->mem->data + dst->off + r[i].dstOffset, src->mem->data + src->off + r[i].srcOffset, (size_t)r[i].size);
       ++dst->mem->version;
       break;
     }
     case C_COPY_BUF2IMG: case C_COPY_IMG2BUF: {
       flush(x);
-      BOOL to_image = c->op == C_COPY_BUF2IMG;
-      Buf *buf = (Buf *)(ULONG_PTR)(to_image ? c->a : c->b);
-      Img *img = (Img *)(ULONG_PTR)(to_image ? c->b : c->a);
-      for (UINT i = 0; i < c->n; ++i) copy_buffer_image(x, &((const VkBufferImageCopy *)c->p)[i], buf, img, to_image);
+      bool to_image = c->op == C_COPY_BUF2IMG;
+      Buf *buf = (Buf *)(uintptr_t)(to_image ? c->a : c->b);
+      Img *img = (Img *)(uintptr_t)(to_image ? c->b : c->a);
+      for (uint32_t i = 0; i < c->n; ++i) copy_buffer_image(x, &((const VkBufferImageCopy *)c->p)[i], buf, img, to_image);
       if (to_image) image_sync_down(img);
       break;
     }
     case C_COPY_IMG: {
       flush(x);
-      for (UINT i = 0; i < c->n; ++i) exec_copy_image(&((const VkImageCopy *)c->p)[i], (Img *)(ULONG_PTR)c->a, (Img *)(ULONG_PTR)c->b);
+      for (uint32_t i = 0; i < c->n; ++i) exec_copy_image(&((const VkImageCopy *)c->p)[i], (Img *)(uintptr_t)c->a, (Img *)(uintptr_t)c->b);
       break;
     }
     case C_BLIT: {
       flush(x);
-      for (UINT i = 0; i < c->n; ++i) exec_blit(&((const VkImageBlit *)c->p)[i], (Img *)(ULONG_PTR)c->a, (Img *)(ULONG_PTR)c->b);
+      for (uint32_t i = 0; i < c->n; ++i) exec_blit(&((const VkImageBlit *)c->p)[i], (Img *)(uintptr_t)c->a, (Img *)(uintptr_t)c->b);
       break;
     }
     case C_RESOLVE: {
-      Img *src = (Img *)(ULONG_PTR)c->a, *dst = (Img *)(ULONG_PTR)c->b;
+      Img *src = (Img *)(uintptr_t)c->a, *dst = (Img *)(uintptr_t)c->b;
       int di = alloc_index(x, dst->alloc), si = alloc_index(x, src->alloc);
       if (di >= 0 && si >= 0) {
-        UINT payload[2] = {(UINT)di, (UINT)si};
+        uint32_t payload[2] = {(uint32_t)di, (uint32_t)si};
         packet(x, OP_RESOLVE, payload, 2);
         flush(x);
       }
       break;
     }
     case C_CLEAR_COLOR: {
-      Img *img = (Img *)(ULONG_PTR)c->a;
-      const VkImageSubresourceRange *ranges = (const VkImageSubresourceRange *)((const BYTE *)c->p + sizeof(VkClearColorValue));
+      Img *img = (Img *)(uintptr_t)c->a;
+      const VkImageSubresourceRange *ranges = (const VkImageSubresourceRange *)((const uint8_t *)c->p + sizeof(VkClearColorValue));
       if (gpu_clear_color(x, img, c->p, ranges, c->n)) break;
       flush(x);
       exec_clear_color(img, c->p, c->n);
@@ -1124,14 +1124,14 @@ static void exec_one(Exec *x, const Cmd *c) {
     }
     case C_CLEAR_DS: {
       /* A depth image has no CPU view: a pass that only clears it. */
-      Img *img = (Img *)(ULONG_PTR)c->a;
+      Img *img = (Img *)(uintptr_t)c->a;
       const VkClearDepthStencilValue *v = c->p;
       int idx = alloc_index(x, img->alloc);
       if (idx < 0) break;
-      UINT payload[9] = {NO_ALLOC, (UINT)idx, 6, 0, 0, 0, 0, fbits(v->depth), v->stencil};
+      uint32_t payload[9] = {NO_ALLOC, (uint32_t)idx, 6, 0, 0, 0, 0, fbits(v->depth), v->stencil};
       packet(x, OP_BEGIN_PASS, payload, 9);
       packet(x, OP_END_PASS, NULL, 0);
-      img->gpu_written = TRUE;
+      img->gpu_written = true;
       flush(x);
       break;
     }
@@ -1139,10 +1139,10 @@ static void exec_one(Exec *x, const Cmd *c) {
       if (!x->rp || !x->fb) break;
       const VkClearAttachment *a = c->p;
       const Subpass *sp = &x->rp->sub[x->subpass];
-      UINT flags = 0;
+      uint32_t flags = 0;
       float color[4] = {0, 0, 0, 0}, depth = 1.0f;
-      UINT stencil = 0;
-      for (UINT i = 0; i < c->n; ++i) {
+      uint32_t stencil = 0;
+      for (uint32_t i = 0; i < c->n; ++i) {
         if (a[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
           flags |= 1;
           for (int k = 0; k < 4; ++k) color[k] = a[i].clearValue.color.float32[k];
@@ -1152,60 +1152,60 @@ static void exec_one(Exec *x, const Cmd *c) {
       }
       /* The whole render area: the pass begins again, clearing, over what is in the images. */
       end_stream_pass(x);
-      UINT colors[4] = {NO_ALLOC, NO_ALLOC, NO_ALLOC, NO_ALLOC}, depth_idx = NO_ALLOC, nextra = 0;
-      for (UINT k = 0; k < sp->ncolor; ++k) {
+      uint32_t colors[4] = {NO_ALLOC, NO_ALLOC, NO_ALLOC, NO_ALLOC}, depth_idx = NO_ALLOC, nextra = 0;
+      for (uint32_t k = 0; k < sp->ncolor; ++k) {
         int idx = sp->color[k] < x->fb->nview ? alloc_index(x, x->fb->view[sp->color[k]]->img->alloc) : -1;
-        colors[k] = idx < 0 ? NO_ALLOC : (UINT)idx;
+        colors[k] = idx < 0 ? NO_ALLOC : (uint32_t)idx;
         if (colors[k] != NO_ALLOC && k > 0) nextra = k;
       }
       if (sp->depth != 0xFFFFFFFFu && sp->depth < x->fb->nview) {
         int idx = alloc_index(x, x->fb->view[sp->depth]->img->alloc);
-        depth_idx = idx < 0 ? NO_ALLOC : (UINT)idx;
+        depth_idx = idx < 0 ? NO_ALLOC : (uint32_t)idx;
       }
-      UINT payload[12] = {colors[0], depth_idx, flags, fbits(color[0]), fbits(color[1]), fbits(color[2]), fbits(color[3]), fbits(depth), stencil, colors[1], colors[2], colors[3]};
+      uint32_t payload[12] = {colors[0], depth_idx, flags, fbits(color[0]), fbits(color[1]), fbits(color[2]), fbits(color[3]), fbits(depth), stencil, colors[1], colors[2], colors[3]};
       packet(x, OP_BEGIN_PASS, payload, 9 + nextra);
-      x->stream_open = TRUE;
-      x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = TRUE;
+      x->stream_open = true;
+      x->dirty_pipe = x->dirty_state = x->dirty_vb = x->dirty_ib = true;
       x->topology_sent = 0xFFFFFFFFu;
       break;
     }
     case C_FILL: {
-      Buf *b = (Buf *)(ULONG_PTR)c->a;
+      Buf *b = (Buf *)(uintptr_t)c->a;
       if (!b->mem || c->b >= b->size) break;
-      ULONGLONG n = c->c == VK_WHOLE_SIZE ? b->size - c->b : MIN(c->c, b->size - c->b);
-      UINT v = (UINT)c->d;
-      for (ULONGLONG i = 0; i + 4 <= n; i += 4) memcpy(b->mem->data + b->off + c->b + i, &v, 4);
+      uint64_t n = c->c == VK_WHOLE_SIZE ? b->size - c->b : MIN(c->c, b->size - c->b);
+      uint32_t v = (uint32_t)c->d;
+      for (uint64_t i = 0; i + 4 <= n; i += 4) memcpy(b->mem->data + b->off + c->b + i, &v, 4);
       ++b->mem->version;
       break;
     }
     case C_UPDATE: {
-      Buf *b = (Buf *)(ULONG_PTR)c->a;
+      Buf *b = (Buf *)(uintptr_t)c->a;
       if (!b->mem || c->b + c->c > b->size) break;
       memcpy(b->mem->data + b->off + c->b, c->p, (size_t)c->c);
       ++b->mem->version;
       break;
     }
     case C_EXEC:
-      run_cmds(x, (CmdBuf *)(ULONG_PTR)c->a);
+      run_cmds(x, (CmdBuf *)(uintptr_t)c->a);
       break;
     case C_RESET_QUERIES: {
-      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
-      for (ULONGLONG q = c->b; p && q < c->b + c->c && q < p->count; ++q) p->available[q] = 0;
+      QueryPool *p = (QueryPool *)(uintptr_t)c->a;
+      for (uint64_t q = c->b; p && q < c->b + c->c && q < p->count; ++q) p->available[q] = 0;
       break;
     }
     case C_TIMESTAMP: {
       /* (inside a pass the stream is still being written: the time is when the draws before it have been sent, not run) */
-      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
+      QueryPool *p = (QueryPool *)(uintptr_t)c->a;
       if (!x->stream_open) flush(x);
       if (p && c->b < p->count) p->value[c->b] = now_ns(), p->available[c->b] = 1;
       break;
     }
     case C_COPY_QUERIES: {
-      QueryPool *p = (QueryPool *)(ULONG_PTR)c->a;
+      QueryPool *p = (QueryPool *)(uintptr_t)c->a;
       Buf *b = c->p ? *(Buf **)c->p : NULL;
       flush(x);
       if (!p || !b || !b->mem || c->d >= b->size || c->b > p->count || c->c > p->count - c->b) break;
-      query_results(p, (UINT)c->b, (UINT)c->c, b->mem->data + b->off + c->d, b->size - c->d, c->e, (VkQueryResultFlags)c->n);
+      query_results(p, (uint32_t)c->b, (uint32_t)c->c, b->mem->data + b->off + c->d, b->size - c->d, c->e, (VkQueryResultFlags)c->n);
       ++b->mem->version;
       break;
     }
@@ -1215,20 +1215,20 @@ static void exec_one(Exec *x, const Cmd *c) {
 }
 
 static void run_cmds(Exec *x, CmdBuf *cb) {
-  for (UINT i = 0; i < cb->n; ++i) exec_one(x, &cb->cmds[i]);
+  for (uint32_t i = 0; i < cb->n; ++i) exec_one(x, &cb->cmds[i]);
 }
 
 static VkResult submit_cmdbuf(Device *d, CmdBuf *cb) {
   Exec *x = vk_alloc(sizeof(Exec));
   if (!x) return VK_ERROR_OUT_OF_HOST_MEMORY;
   x->d = d, x->caps = &d->pd->caps;
-  x->dirty_pipe = x->dirty_state = TRUE;
+  x->dirty_pipe = x->dirty_state = true;
   x->topology_sent = 0xFFFFFFFFu;
   run_cmds(x, cb);
   end_stream_pass(x);
   flush(x);
-  for (UINT i = 0; i < x->ntemps; ++i) kmt_free(d, x->temps[i]);
-  BOOL failed = x->failed || cb->failed;
+  for (uint32_t i = 0; i < x->ntemps; ++i) kmt_free(d, x->temps[i]);
+  bool failed = x->failed || cb->failed;
   vk_free(x);
   return failed ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
@@ -1237,8 +1237,8 @@ VKAPI VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t count, const VkS
   Queue *q = (Queue *)queue;
   VkResult result = VK_SUCCESS;
   ++g_submission;   /* (what the program wrote into mapped memory up to now is seen by these commands) */
-  for (UINT i = 0; i < count && result == VK_SUCCESS; ++i)
-    for (UINT k = 0; k < submits[i].commandBufferCount && result == VK_SUCCESS; ++k) result = submit_cmdbuf(q->dev, (CmdBuf *)submits[i].pCommandBuffers[k]);
-  if (fence) ((Fence *)fence)->signaled = TRUE;
+  for (uint32_t i = 0; i < count && result == VK_SUCCESS; ++i)
+    for (uint32_t k = 0; k < submits[i].commandBufferCount && result == VK_SUCCESS; ++k) result = submit_cmdbuf(q->dev, (CmdBuf *)submits[i].pCommandBuffers[k]);
+  if (fence) ((Fence *)fence)->signaled = true;
   return result;
 }

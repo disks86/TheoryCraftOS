@@ -18,7 +18,7 @@
 
 #include "Desktop/CubeSpirv.hpp"
 #include "Desktop/CubeShaders/CubeSpirv.inc"
-#include "Windows/vulkan-1/spirv.h"
+#include "Vulkan/spirv.h"
 
 namespace desktop {
 

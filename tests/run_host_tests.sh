@@ -16,16 +16,16 @@ jit_rt="src/Jit/CodeCache.cpp src/Jit/CodeMemory.cpp src/Jit/JitCompiler.cpp src
 media="src/Crypto/*.cpp src/Media/*.cpp src/Media/Audio/*.cpp src/Media/Image/*.cpp src/Midi/MidiFile.cpp src/Midi/MidiStream.cpp src/Midi/SoftwareSynth.cpp"
 gui_audio="src/Hardware/Monitor/*.cpp src/Hardware/Printer/PrinterTypes.cpp src/Hardware/Printer/TextLayout.cpp src/Hardware/Printer/Halftone.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioCaptureHub.cpp src/Audio/CaptureStream.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Audio/AudioPlayer.cpp src/Video/*.cpp src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/AMD/*.cpp src/Hardware/Platform/AMD/*.cpp src/Hardware/VideoCodec/NVIDIA/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/Gcn/*.cpp src/Emulation/SoftFloat.cpp src/Hardware/GraphicsProcessingUnit/NVIDIA/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp $media"
 
-# The desktop's 3D test draws through the kernel-mode Direct3D driver (Direct3D, and Vulkan with vulkan-1.dll's SPIR-V translator, which is C) or the kernel's OpenGL,
+# The desktop's 3D test draws through the kernel-mode Direct3D driver (Direct3D, and Vulkan with the SPIR-V translator of src/Vulkan, which is C) or the kernel's OpenGL,
 # with the logo on the cube. The translator is built as an object once (spirv_host).
 # (spirv_host thread: a ThreadSanitizer build for GuiThreadTest instead)
 spirv_object="$out/spirv_host.o"
 spirv_host() {
   local object=$spirv_object sanitize="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
   if [ "${1:-}" = thread ]; then object="$out/spirv_host_tsan.o"; sanitize="-fsanitize=thread"; fi
-  if [ ! -f "$object" ] || [ -n "$(find src/Windows/vulkan-1 -name 'spirv*' -newer "$object")" ]; then
+  if [ ! -f "$object" ] || [ -n "$(find src/Vulkan -name 'spirv*' -newer "$object")" ]; then
     echo '#include "spirv.inc"' > "$out/spirv_host.c"
-    gcc -std=gnu11 -O1 -g $sanitize -I src/Windows/vulkan-1 -w -c "$out/spirv_host.c" -o "$object"
+    gcc -std=gnu11 -O1 -g $sanitize -I src/Vulkan -w -c "$out/spirv_host.c" -o "$object"
   fi
 }
 gl_kernel="$(ls src/OpenGl/*.cpp | grep -v WindowsGl) src/OpenGl/generated/GlApiVariants.cpp"
@@ -337,10 +337,10 @@ for t in "${WANTED[@]}"; do
     DxgkrnlTest) build_and_run DxgkrnlTest tests/DxgkrnlTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp \
                    src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
     VulkanShaderTest) mkdir -p "$out/vk"
-                # the translator is C (src/Windows/vulkan-1/spirv.inc, freestanding); the test links it as an object
+                # the translator is C (src/Vulkan/spirv.inc, freestanding); the test links it as an object
                 echo '#include "spirv.inc"' > "$out/vk/spirv_host.c"
-                gcc -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I src/Windows/vulkan-1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -c "$out/vk/spirv_host.c" -o "$out/vk/spirv_host.o"
-                build_and_run VulkanShaderTest tests/VulkanShaderTest.cpp "$out/vk/spirv_host.o" -I src/Windows/vulkan-1 tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp \
+                gcc -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I src/Vulkan -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -c "$out/vk/spirv_host.c" -o "$out/vk/spirv_host.o"
+                build_and_run VulkanShaderTest tests/VulkanShaderTest.cpp "$out/vk/spirv_host.o" -I src/Vulkan tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp \
                    src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
     GraphicsPoolTest) build_and_run GraphicsPoolTest tests/GraphicsPoolTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
                         src/Hardware/GraphicsProcessingUnit/Multi/GpuTopology.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuPowerPolicy.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuManager.cpp src/Hardware/GraphicsProcessingUnit/Multi/GpuPool.cpp \

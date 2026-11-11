@@ -26,8 +26,8 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
-#include "../../src/Windows/vulkan-1/khronos/vulkan/vulkan_core.h"
-#include "../../src/Windows/vulkan-1/khronos/vulkan/vulkan_win32.h"
+#include "../../src/Vulkan/khronos/vulkan/vulkan_core.h"
+#include "../../src/Vulkan/khronos/vulkan/vulkan_win32.h"
 #include "vulkantest_shaders.h"
 
 static int g_checks, g_failed;

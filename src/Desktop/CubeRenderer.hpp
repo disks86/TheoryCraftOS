@@ -23,7 +23,7 @@
 //
 // The two APIs differ in how the shaders and pipelines reach the kernel (CubeApi):
 //  - Direct3D: the kernel's built-in shaders, through the typed calls (create_shader / create_pipeline).
-//  - Vulkan: what vulkan-1.dll does - SPIR-V shaders (CubeShaders/*.vert, *.frag) translated to DXBC by the same translator the DLL carries (src/Windows/vulkan-1/spirv.inc),
+//  - Vulkan: what vulkan-1.dll does - SPIR-V shaders (CubeShaders/*.vert, *.frag) translated to DXBC by the same translator the DLL carries (src/Vulkan/spirv.inc),
 //    sent with the private-data escape (Kernel::escape: CreateShader with ShaderKind::Dxbc, CreatePipeline), so the DXBC front end and the escape ABI are exercised too.
 // OpenGL goes to the kernel's GL instead (GlCubeRenderer.hpp); all three draw the same picture.
 //

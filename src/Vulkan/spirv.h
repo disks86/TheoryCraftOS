@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* The SPIR-V to DXBC translator of vulkan-1.dll (spirv.inc is the code). A Vulkan shader module arrives as SPIR-V; the kernel's Direct3D layer (src/Kernel/Dxgkrnl) takes Shader
+/* The SPIR-V to DXBC translator of the Vulkan driver (spirv.inc is the code; vulkan-1.dll and the Linux libvulkan carry it). A Vulkan shader module arrives as SPIR-V; the kernel's Direct3D layer (src/Kernel/Dxgkrnl) takes Shader
  * Model 4.0 DXBC for every GPU it drives, so the driver translates once and the same shader runs on the CPU renderer, virgl, SVGA3D, Intel Gen9, V3D and Vega.
  *
  * Two passes, because the numbers a shader's resources get (constant buffer slots, texture units) are those of the whole pipeline, not of one shader:

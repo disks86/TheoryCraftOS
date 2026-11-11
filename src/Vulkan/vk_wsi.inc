@@ -1,36 +1,33 @@
-/* vulkan-1.c, part 6: VK_KHR_surface, VK_KHR_win32_surface and VK_KHR_swapchain. A swapchain image is an allocation the kernel can show (flip): into its window's client
- * area when the window is one of the desktop's (the kernel copies it into the window's surface), else on the display. */
+/* The Vulkan driver, part 6: VK_KHR_surface and VK_KHR_swapchain. A swapchain image is an allocation the kernel can show (flip): into its window's client area when the surface
+ * names a window of the desktop (the kernel copies it into the window's surface), else on the display. Making a surface is the platform's (VK_KHR_win32_surface on Windows,
+ * VK_EXT_headless_surface on Linux): it fills in a Surface, and says how big its window is (vk_os_surface_extent). */
 
-typedef struct Surface {
-  HINSTANCE instance;
-  HWND window;
-} Surface;
+struct Surface {
+  uint64_t window;    /* what D3DKMTPresent takes as hWindow: a desktop window, or 0 for the display */
+  uint32_t kind;      /* the platform's own (which extension made it) */
+};
 
 typedef struct Swapchain {
   Device *dev;
   Img **img;
-  UINT n;
-  UINT next;
-  UINT w, h;
+  uint32_t n;
+  uint32_t next;
+  uint32_t w, h;
   VkFormat format;
-  HWND window;
+  uint64_t window;
 } Swapchain;
 
-VKAPI VkResult VKAPI_CALL vkCreateWin32SurfaceKHR(VkInstance instance, const VkWin32SurfaceCreateInfoKHR *ci, const VkAllocationCallbacks *alloc, VkSurfaceKHR *out) {
-  (void)instance, (void)alloc;
+/* A surface of the platform's: `window` is the present target (0: the display). */
+static VkResult make_surface(uint64_t window, uint32_t kind, VkSurfaceKHR *out) {
   Surface *s = vk_alloc(sizeof(Surface));
   if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
-  s->instance = ci->hinstance, s->window = ci->hwnd;
+  s->window = window, s->kind = kind;
   *out = (VkSurfaceKHR)s;
   return VK_SUCCESS;
 }
 VKAPI void VKAPI_CALL vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *alloc) {
   (void)instance, (void)alloc;
   vk_free(surface);
-}
-VKAPI VkBool32 VKAPI_CALL vkGetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice pd, uint32_t family) {
-  (void)pd;
-  return family == 0;
 }
 VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice pd, uint32_t family, VkSurfaceKHR surface, VkBool32 *supported) {
   (void)pd, (void)surface;
@@ -41,11 +38,9 @@ VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDe
   const PhysDev *pd = (const PhysDev *)physical;
   Surface *s = (Surface *)surface;
   memset(c, 0, sizeof *c);
-  RECT r;
-  UINT w = 0, h = 0;
-  if (s->window && GetClientRect(s->window, &r)) w = (UINT)(r.right - r.left), h = (UINT)(r.bottom - r.top);
-  if (w == 0 || h == 0) w = 640, h = 480;
-  UINT dim = pd->caps.max_texture_dimension ? pd->caps.max_texture_dimension : 4096;
+  uint32_t w = 0, h = 0;
+  if (!vk_os_surface_extent(s, &w, &h) || w == 0 || h == 0) w = 640, h = 480;
+  uint32_t dim = pd->caps.max_texture_dimension ? pd->caps.max_texture_dimension : 4096;
   c->minImageCount = 2, c->maxImageCount = 8;
   c->currentExtent.width = w, c->currentExtent.height = h;
   c->minImageExtent.width = c->minImageExtent.height = 1;
@@ -63,8 +58,8 @@ VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice 
     *count = 2;
     return VK_SUCCESS;
   }
-  UINT n = MIN(*count, 2u);
-  for (UINT i = 0; i < n; ++i) out[i] = formats[i];
+  uint32_t n = MIN(*count, 2u);
+  for (uint32_t i = 0; i < n; ++i) out[i] = formats[i];
   *count = n;
   return n < 2 ? VK_INCOMPLETE : VK_SUCCESS;
 }
@@ -75,8 +70,8 @@ VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDe
     *count = 3;
     return VK_SUCCESS;
   }
-  UINT n = MIN(*count, 3u);
-  for (UINT i = 0; i < n; ++i) out[i] = modes[i];
+  uint32_t n = MIN(*count, 3u);
+  for (uint32_t i = 0; i < n; ++i) out[i] = modes[i];
   *count = n;
   return n < 3 ? VK_INCOMPLETE : VK_SUCCESS;
 }
@@ -89,28 +84,28 @@ VKAPI VkResult VKAPI_CALL vkCreateSwapchainKHR(VkDevice device, const VkSwapchai
   if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
   sc->dev = d, sc->n = MAX(ci->minImageCount, 2u), sc->w = ci->imageExtent.width, sc->h = ci->imageExtent.height, sc->format = ci->imageFormat;
   sc->next = 0;
-  sc->window = ci->surface ? ((Surface *)ci->surface)->window : NULL;
+  sc->window = ci->surface ? ((Surface *)ci->surface)->window : 0;
   sc->img = vk_alloc(sizeof(Img *) * sc->n);
   if (!sc->img) {
     vk_free(sc);
     return VK_ERROR_OUT_OF_HOST_MEMORY;
   }
   const FormatInfo *fi = format_info(d->pd, ci->imageFormat);
-  for (UINT i = 0; i < sc->n; ++i) {
+  for (uint32_t i = 0; i < sc->n; ++i) {
     Img *img = vk_alloc(sizeof(Img));
     if (!img) break;
     img->dev = d, img->type = VK_IMAGE_TYPE_2D, img->format = ci->imageFormat, img->dfmt = fi->dfmt, img->bpp = fi->bpp, img->swap_rb = fi->swap_rb != 0;
     img->w = sc->w, img->h = sc->h, img->depth = 1, img->mips = 1, img->layers = 1, img->samples = 1;
-    img->tiling = VK_IMAGE_TILING_OPTIMAL, img->usage = ci->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, img->swapchain = TRUE;
+    img->tiling = VK_IMAGE_TILING_OPTIMAL, img->usage = ci->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, img->swapchain = true;
     if (image_create_allocation(img) != VK_SUCCESS) {
       vk_free(img);
       break;
     }
     sc->img[i] = img;
   }
-  for (UINT i = 0; i < sc->n; ++i)
+  for (uint32_t i = 0; i < sc->n; ++i)
     if (!sc->img[i]) {
-      for (UINT k = 0; k < sc->n; ++k) {
+      for (uint32_t k = 0; k < sc->n; ++k) {
         if (sc->img[k]) kmt_free(d, sc->img[k]->alloc);
         vk_free(sc->img[k]);
       }
@@ -125,7 +120,7 @@ VKAPI void VKAPI_CALL vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swap
   Swapchain *sc = (Swapchain *)swapchain;
   (void)alloc;
   if (!sc) return;
-  for (UINT i = 0; i < sc->n; ++i) {
+  for (uint32_t i = 0; i < sc->n; ++i) {
     kmt_free((Device *)device, sc->img[i]->alloc);
     vk_free(sc->img[i]);
   }
@@ -139,8 +134,8 @@ VKAPI VkResult VKAPI_CALL vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKH
     *count = sc->n;
     return VK_SUCCESS;
   }
-  UINT n = MIN(*count, sc->n);
-  for (UINT i = 0; i < n; ++i) out[i] = (VkImage)sc->img[i];
+  uint32_t n = MIN(*count, sc->n);
+  for (uint32_t i = 0; i < n; ++i) out[i] = (VkImage)sc->img[i];
   *count = n;
   return n < sc->n ? VK_INCOMPLETE : VK_SUCCESS;
 }
@@ -149,22 +144,22 @@ VKAPI VkResult VKAPI_CALL vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR 
   (void)device, (void)timeout, (void)semaphore;
   *index = sc->next;
   sc->next = (sc->next + 1) % sc->n;
-  if (fence) ((Fence *)fence)->signaled = TRUE;
+  if (fence) ((Fence *)fence)->signaled = true;
   return VK_SUCCESS;
 }
 VKAPI VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pi) {
   Queue *q = (Queue *)queue;
   VkResult result = VK_SUCCESS;
-  for (UINT i = 0; i < pi->swapchainCount; ++i) {
+  for (uint32_t i = 0; i < pi->swapchainCount; ++i) {
     Swapchain *sc = (Swapchain *)pi->pSwapchains[i];
     Img *img = sc->img[pi->pImageIndices[i]];
-    BYTE args[128];
+    uint8_t args[128];
     memset(args, 0, sizeof args);
     put32(args, 0, q->dev->ctx);
-    put64(args, 8, (ULONGLONG)(ULONG_PTR)sc->window);
+    put64(args, 8, sc->window);
     put32(args, 20, img->alloc);
     put32(args, 88, 4);   /* flip */
-    NTSTATUS st = D3DKMTPresent(args);
+    KmtStatus st = kmt(TCOS_DXG_PRESENT, args);
     VkResult r = STATUS_OK(st) ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
     if (pi->pResults) pi->pResults[i] = r;
     if (r != VK_SUCCESS) result = r;
