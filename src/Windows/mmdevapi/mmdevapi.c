@@ -20,21 +20,24 @@
  * tcos_audio.h). In Windows the audio client lives in audioses.dll; programs only reach it through IMMDevice::Activate, so it is here.
  *
  *  - CLSID_MMDeviceEnumerator (DllGetClassObject; ole32 finds this library for it) enumerates one render endpoint, the graph's sink, while the kernel
- *    has an audio device, and no capture endpoints (the graph has no capture). Its property store has the names, form factor, speakers and the
- *    engine's format (32-bit float stereo at 48 kHz).
+ *    has an audio device, and one capture endpoint, the graph's source, while there is a microphone. Their property stores have the names, form
+ *    factor, speakers and the engine's format (32-bit float stereo at 48 kHz).
  *  - IAudioClient/2/3 in shared mode: every initialized client is a stream of the graph in the client's own format (PCM 8/16/24/32-bit or float, any
  *    rate the graph takes: the kernel converts, as AUTOCONVERTPCM would), mixed there with the native, Linux and other Windows programs' sound. The
  *    client's buffer is a ring in this process; what the program releases goes to the kernel as fast as its stream takes it, the padding is what the
  *    graph's mixer has not read yet (as in Windows: not what the device has still to play), the clock is what the device has played, and a thread
- *    signals the event every period (10 ms) while the stream runs. Exclusive mode and
- *    loopback are refused (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED, E_NOTIMPL).
+ *    signals the event every period (10 ms) while the stream runs. A client of the capture endpoint is a record stream of the graph: the thread reads
+ *    what the kernel recorded into the ring, IAudioCaptureClient hands it out a packet (10 ms) at a time with its device position, the padding is what
+ *    waits to be read, and audio lost because the program read too slowly flags the next packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY. Exclusive mode
+ *    and loopback are refused (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED, E_NOTIMPL).
  *  - IAudioRenderClient, IAudioClock (bytes per second), IAudioStreamVolume and IChannelAudioVolume (the first two channels set the stream's volume
  *    and balance), and the process's one audio session (ISimpleAudioVolume, IAudioSessionControl2, IAudioSessionManager2): the session's volume and
  *    mute apply to every stream of the process.
- *  - IAudioEndpointVolume is the graph's master volume (what pactl and wpctl show as the sink's: scalar = cube root of the amplitude, so 50% here is
- *    50% there), with change notifications for changes made in this process; IAudioMeterInformation reads silence.
- *  - ActivateAudioInterfaceAsync activates on the default render endpoint (DEVINTERFACE_AUDIO_RENDER or the endpoint's id) and calls the handler on a
- *    thread of its own.
+ *  - IAudioEndpointVolume is the graph's master volume on the render endpoint and the microphone's master gain on the capture endpoint (what pactl and
+ *    wpctl show as the sink's and the source's: scalar = cube root of the amplitude, so 50% here is 50% there), with change notifications for changes
+ *    made in this process; IAudioMeterInformation reads silence. The session's volume applies to the process's render streams.
+ *  - ActivateAudioInterfaceAsync activates on the default endpoints (DEVINTERFACE_AUDIO_RENDER, DEVINTERFACE_AUDIO_CAPTURE or an endpoint's id) and
+ *    calls the handler on a thread of its own.
  * Built freestanding over kernel32.dll, ntdll.dll and ole32.dll (CoTaskMemAlloc). */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
@@ -74,6 +77,16 @@ static const WCHAR kRenderInterface[] = L"{E6327CAD-DCEC-4949-AE8A-991E976A79D2}
 static const WCHAR kFriendlyName[] = L"Speakers (TheoryCraftOS)";
 static const WCHAR kDeviceDescription[] = L"Speakers";
 static const WCHAR kInterfaceName[] = L"TheoryCraftOS Audio";
+/* the capture endpoint: the graph's source (dsound.dll's capture device GUID too) */
+static const GUID kCaptureEndpointGuid = {0x5AF3A3C3, 0x6E1B, 0x4B4E, {0x8D, 0x2F, 0x1C, 0x0A, 0x7E, 0x5D, 0x9B, 0x31}};
+static const GUID kIidDirectSoundCapture = {0xB0210781, 0x89CD, 0x11D0, {0xAF, 0x08, 0x00, 0xA0, 0xC9, 0x25, 0xCD, 0x16}};
+static const WCHAR kCaptureEndpointId[] = L"{0.0.1.00000000}.{5af3a3c3-6e1b-4b4e-8d2f-1c0a7e5d9b31}";
+static const WCHAR kCaptureGuidString[] = L"{5af3a3c3-6e1b-4b4e-8d2f-1c0a7e5d9b31}";
+static const WCHAR kCaptureInterface[] = L"{2EEF81BE-33FA-4800-9670-1CD474972C3F}";      /* DEVINTERFACE_AUDIO_CAPTURE */
+static const WCHAR kCaptureFriendlyName[] = L"Microphone (TheoryCraftOS)";
+static const WCHAR kCaptureDescription[] = L"Microphone";
+#define RENDER 0
+#define CAPTURE 1
 
 static BOOL same_guid(const GUID *a, const GUID *b) {
   const BYTE *x = (const BYTE *)a, *y = (const BYTE *)b;
@@ -113,6 +126,7 @@ static WCHAR *task_string(const WCHAR *s) {
   return r;
 }
 static BOOL has_device(void) { return tcos_audio_devices() != 0; }
+static BOOL has_endpoint(int which) { return which == CAPTURE ? tcos_audio_input_devices() != 0 : has_device(); }
 
 /* The engine's format: 32-bit float stereo at 48 kHz. */
 static void mix_format(WAVEFORMATEXTENSIBLE *f) {
@@ -377,8 +391,10 @@ struct Client {
   IAudioClock clock;
   IAudioStreamVolume stream_volume;
   IChannelAudioVolume channel_volume;
+  IAudioCaptureClient capture_client;
   LONG refs;
   CRITICAL_SECTION lock;
+  BOOL capture;             /* a client of the capture endpoint */
   BOOL initialized, started, in_get;
   DWORD flags;
   WAVEFORMATEX format;      /* (the plain part; the graph needs no more) */
@@ -386,9 +402,13 @@ struct Client {
   REFERENCE_TIME period;
   ULONG64 stream;
   BYTE *staging;            /* what GetBuffer hands out */
-  BYTE *ring;               /* released, not yet taken by the kernel: buffer_frames frames */
+  BYTE *ring;               /* released, not yet taken by the kernel (capture: recorded, not yet handed out): buffer_frames frames */
   UINT32 ring_head, ring_count;
   ULONG64 written;          /* frames the program released since the last Reset */
+  UINT32 packet;            /* capture: the frames of a packet (a period) */
+  ULONG64 captured;         /* capture: frames read from the kernel since the last Reset (the device position after the ring) */
+  ULONG64 lost_seen;        /* capture: the kernel's lost bytes when last looked at */
+  BOOL discontinuity;       /* capture: audio was lost before the next packet */
   ULONG64 base;             /* the kernel's written bytes at the last Reset */
   HANDLE event, thread, wake;
   volatile LONG stop;
@@ -400,6 +420,7 @@ static Client *from_render(IAudioRenderClient *i) { return CONTAINING_RECORD(i, 
 static Client *from_clock(IAudioClock *i) { return CONTAINING_RECORD(i, Client, clock); }
 static Client *from_stream_volume(IAudioStreamVolume *i) { return CONTAINING_RECORD(i, Client, stream_volume); }
 static Client *from_channel_volume(IChannelAudioVolume *i) { return CONTAINING_RECORD(i, Client, channel_volume); }
+static Client *from_capture_client(IAudioCaptureClient *i) { return CONTAINING_RECORD(i, Client, capture_client); }
 
 static BOOL any_started(void) {
   BOOL any = FALSE;
@@ -412,6 +433,10 @@ static BOOL any_started(void) {
 /* The stream's volume in the graph: the session's times the first two channels' (left, right). */
 static void apply_volume_with(Client *c, float session, BOOL mute) {
   EnterCriticalSection(&c->lock);
+  if (c->capture) {      /* (the session is the process's playback; a microphone stream has its own channels' volume only) */
+    session = 1.0f;
+    mute = FALSE;
+  }
   if (c->stream) {
     const float l = c->channels[0] * session, r = (c->format.nChannels > 1 ? c->channels[1] : c->channels[0]) * session;
     audio_call(TCOS_AUDIO_SET_VOLUME, c->stream, (ULONG64)(l * 65535.0f + 0.5f), (ULONG64)(r * 65535.0f + 0.5f), 0, 0, 0, NULL, NULL, NULL);
@@ -436,13 +461,14 @@ static void apply_session_to_all(void) {
  * and the device still has to play does not count). */
 static UINT32 padding_locked(Client *c) {
   if (!c->stream) return 0;
-  ULONG64 waiting = 0;
+  ULONG64 waiting = 0;      /* (capture: what the kernel recorded that is not in the ring yet; with the ring, everything waiting to be read) */
   tcos_audio_status(c->stream, &waiting, NULL, NULL, NULL);
   const ULONG64 pad = c->ring_count + waiting / c->frame;
   return pad > c->buffer_frames ? c->buffer_frames : (UINT32)pad;
 }
 static ULONG64 played_bytes_locked(Client *c) {
   if (!c->stream) return 0;
+  if (c->capture) return c->captured * c->frame;      /* (the device position: what was recorded) */
   ULONG64 played = 0;
   tcos_audio_status(c->stream, NULL, NULL, NULL, &played);
   ULONG64 bytes = played > c->base ? played - c->base : 0;
@@ -466,6 +492,34 @@ static void push_locked(Client *c) {
   }
 }
 
+/* Capture: reads what the kernel recorded into the ring after what is there, and notes audio the kernel lost meanwhile. */
+static void pull_locked(Client *c) {
+  if (!c->started || !c->stream) return;
+  while (c->ring_count < c->buffer_frames) {
+    const UINT32 tail = (c->ring_head + c->ring_count) % c->buffer_frames;
+    UINT32 n = c->buffer_frames - c->ring_count;
+    if (n > c->buffer_frames - tail) n = c->buffer_frames - tail;
+    ULONG64 got = 0;
+    if (audio_call(TCOS_AUDIO_READ, c->stream, (ULONG64)(ULONG_PTR)(c->ring + (SIZE_T)tail * c->frame), (ULONG64)n * c->frame, 0, 0, 0, NULL, NULL, &got) != 0)
+      return;
+    const UINT32 frames = (UINT32)(got / c->frame);
+    c->ring_count += frames;
+    c->captured += frames;
+    if (frames < n) break;
+  }
+  ULONG64 lost = 0;
+  tcos_audio_status(c->stream, NULL, &lost, NULL, NULL);
+  if (lost > c->lost_seen) {
+    c->discontinuity = TRUE;
+    c->lost_seen = lost;
+  }
+}
+/* Capture: the frames of the next packet (a whole period while recording; what is left once stopped), 0 when there is none. */
+static UINT32 next_packet_locked(Client *c) {
+  if (c->ring_count >= c->packet) return c->packet;
+  return c->started ? 0 : c->ring_count;
+}
+
 static DWORD WINAPI client_thread(LPVOID param) {
   Client *c = (Client *)param;
   DWORD period_ms = (DWORD)(c->period / 10000);
@@ -473,7 +527,8 @@ static DWORD WINAPI client_thread(LPVOID param) {
   while (!c->stop) {
     WaitForSingleObject(c->wake, period_ms);
     EnterCriticalSection(&c->lock);
-    push_locked(c);
+    if (c->capture) pull_locked(c);
+    else push_locked(c);
     if (c->started && c->event) SetEvent(c->event);
     LeaveCriticalSection(&c->lock);
   }
@@ -535,7 +590,7 @@ static HRESULT WINAPI ac_initialize(IAudioClient3 *i, AUDCLNT_SHAREMODE mode, DW
   HRESULT hr = S_OK;
   if (c->initialized) hr = AUDCLNT_E_ALREADY_INITIALIZED;
   else if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE) hr = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
-  else if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) hr = E_NOTIMPL;      /* (the graph has no capture) */
+  else if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) hr = E_NOTIMPL;      /* (the graph's sink has no monitor) */
   else if (!wave_format_code(format)) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
   if (FAILED(hr)) {
     LeaveCriticalSection(&c->lock);
@@ -553,7 +608,10 @@ static HRESULT WINAPI ac_initialize(IAudioClient3 *i, AUDCLNT_SHAREMODE mode, DW
   c->ring = (BYTE *)alloc((SIZE_T)c->buffer_frames * c->frame);
   LONG st = 0;
   const BOOL have_memory = c->staging && c->ring;
-  if (have_memory) c->stream = tcos_audio_open(format, &st);
+  if (have_memory) c->stream = tcos_audio_open_kind(format, c->capture, &st);
+  c->packet = format->nSamplesPerSec / 100;
+  if (c->packet < 1) c->packet = 1;
+  if (c->packet > c->buffer_frames) c->packet = c->buffer_frames;
   if (!c->stream) {
     release_memory(c->staging);
     release_memory(c->ring);
@@ -627,8 +685,8 @@ static HRESULT WINAPI ac_start(IAudioClient3 *i) {
   else if ((c->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !c->event) hr = AUDCLNT_E_EVENTHANDLE_NOT_SET;
   else {
     c->started = TRUE;
-    push_locked(c);
-    audio_call(TCOS_AUDIO_PAUSE, c->stream, 0, 0, 0, 0, 0, NULL, NULL, NULL);
+    if (!c->capture) push_locked(c);
+    audio_call(TCOS_AUDIO_PAUSE, c->stream, 0, 0, 0, 0, 0, NULL, NULL, NULL);      /* (capture: the kernel records from now) */
   }
   LeaveCriticalSection(&c->lock);
   if (SUCCEEDED(hr)) SetEvent(c->wake);
@@ -639,6 +697,7 @@ static HRESULT WINAPI ac_stop(IAudioClient3 *i) {
   if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
   EnterCriticalSection(&c->lock);
   const BOOL was = c->started;
+  if (was && c->capture) pull_locked(c);      /* (what was recorded up to now can still be read) */
   if (was) audio_call(TCOS_AUDIO_PAUSE, c->stream, 1, 0, 0, 0, 0, NULL, NULL, NULL);
   c->started = FALSE;
   LeaveCriticalSection(&c->lock);
@@ -653,11 +712,14 @@ static HRESULT WINAPI ac_reset(IAudioClient3 *i) {
   else if (c->in_get) hr = AUDCLNT_E_BUFFER_OPERATION_PENDING;
   else {
     audio_call(TCOS_AUDIO_FLUSH, c->stream, 0, 0, 0, 0, 0, NULL, NULL, NULL);
-    ULONG64 written = 0;
-    tcos_audio_status(c->stream, NULL, NULL, &written, NULL);
+    ULONG64 lost = 0, written = 0;
+    tcos_audio_status(c->stream, NULL, &lost, &written, NULL);
     c->base = written;
     c->written = 0;
     c->ring_head = c->ring_count = 0;
+    c->captured = 0;
+    if (c->capture) c->lost_seen = lost;
+    c->discontinuity = FALSE;
   }
   LeaveCriticalSection(&c->lock);
   return hr;
@@ -677,7 +739,13 @@ static HRESULT WINAPI ac_get_service(IAudioClient3 *i, REFIID riid, void **out) 
   if (!out) return E_POINTER;
   *out = NULL;
   if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
-  if (same_guid(riid, &IID_IAudioRenderClient)) *out = &c->render;
+  if (same_guid(riid, &IID_IAudioRenderClient)) {
+    if (c->capture) return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    *out = &c->render;
+  } else if (same_guid(riid, &IID_IAudioCaptureClient)) {
+    if (!c->capture) return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
+    *out = &c->capture_client;
+  }
   else if (same_guid(riid, &IID_IAudioClock)) *out = &c->clock;
   else if (same_guid(riid, &IID_IAudioStreamVolume)) *out = &c->stream_volume;
   else if (same_guid(riid, &IID_IChannelAudioVolume)) *out = &c->channel_volume;
@@ -687,8 +755,7 @@ static HRESULT WINAPI ac_get_service(IAudioClient3 *i, REFIID riid, void **out) 
   } else if (same_guid(riid, &IID_IAudioSessionControl) || same_guid(riid, &IID_IAudioSessionControl2)) {
     *out = &g_session_control;
     return S_OK;
-  } else if (same_guid(riid, &IID_IAudioCaptureClient)) return AUDCLNT_E_WRONG_ENDPOINT_TYPE;
-  else return E_NOINTERFACE;
+  } else return E_NOINTERFACE;
   InterlockedIncrement(&c->refs);
   return S_OK;
 }
@@ -790,6 +857,85 @@ static HRESULT WINAPI rc_release_buffer(IAudioRenderClient *i, UINT32 frames, DW
   return hr;
 }
 static const IAudioRenderClientVtbl kRenderVtbl = {rc_query, rc_add_ref, rc_release, rc_get_buffer, rc_release_buffer};
+
+/* the capture client */
+static HRESULT WINAPI cc_query(IAudioCaptureClient *i, REFIID riid, void **out) {
+  if (!out) return E_POINTER;
+  *out = NULL;
+  if (!same_guid(riid, &kIidUnknown) && !same_guid(riid, &IID_IAudioCaptureClient)) return E_NOINTERFACE;
+  *out = i;
+  client_add_ref(from_capture_client(i));
+  return S_OK;
+}
+static ULONG WINAPI cc_add_ref(IAudioCaptureClient *i) { return client_add_ref(from_capture_client(i)); }
+static ULONG WINAPI cc_release(IAudioCaptureClient *i) { return client_release(from_capture_client(i)); }
+static UINT64 qpc_100ns(void) {
+  LARGE_INTEGER now, frequency;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&frequency);
+  return frequency.QuadPart ? (UINT64)((double)now.QuadPart * 10000000.0 / (double)frequency.QuadPart) : 0;
+}
+static HRESULT WINAPI cc_get_buffer(IAudioCaptureClient *i, BYTE **data, UINT32 *frames, DWORD *flags, UINT64 *device_position, UINT64 *qpc_position) {
+  Client *c = from_capture_client(i);
+  if (!data || !frames || !flags) return E_POINTER;
+  *data = NULL;
+  *frames = 0;
+  *flags = 0;
+  EnterCriticalSection(&c->lock);
+  HRESULT hr = S_OK;
+  if (c->in_get) {
+    hr = AUDCLNT_E_OUT_OF_ORDER;
+  } else {
+    pull_locked(c);
+    const UINT32 n = next_packet_locked(c);
+    if (!n) {
+      hr = AUDCLNT_S_BUFFER_EMPTY;
+    } else {
+      if (c->ring_head + n <= c->buffer_frames) {
+        *data = c->ring + (SIZE_T)c->ring_head * c->frame;
+      } else {      /* (around the end of the ring: one piece in the staging buffer) */
+        const UINT32 first = c->buffer_frames - c->ring_head;
+        copy(c->staging, c->ring + (SIZE_T)c->ring_head * c->frame, (SIZE_T)first * c->frame);
+        copy(c->staging + (SIZE_T)first * c->frame, c->ring, (SIZE_T)(n - first) * c->frame);
+        *data = c->staging;
+      }
+      *frames = n;
+      *flags = c->discontinuity ? AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY : 0;
+      c->discontinuity = FALSE;
+      if (device_position) *device_position = c->captured - c->ring_count;
+      if (qpc_position) *qpc_position = qpc_100ns();
+      c->in_get = TRUE;
+      c->got = n;
+    }
+  }
+  LeaveCriticalSection(&c->lock);
+  return hr;
+}
+static HRESULT WINAPI cc_release_buffer(IAudioCaptureClient *i, UINT32 frames) {
+  Client *c = from_capture_client(i);
+  EnterCriticalSection(&c->lock);
+  HRESULT hr = S_OK;
+  if (!c->in_get) hr = frames ? AUDCLNT_E_OUT_OF_ORDER : S_OK;
+  else if (frames != 0 && frames != c->got) hr = AUDCLNT_E_INVALID_SIZE;      /* (a packet is read whole or not at all) */
+  else {
+    c->ring_head = (c->ring_head + frames) % c->buffer_frames;
+    c->ring_count -= frames;
+    c->in_get = FALSE;
+    c->got = 0;
+  }
+  LeaveCriticalSection(&c->lock);
+  return hr;
+}
+static HRESULT WINAPI cc_get_next_packet_size(IAudioCaptureClient *i, UINT32 *frames) {
+  Client *c = from_capture_client(i);
+  if (!frames) return E_POINTER;
+  EnterCriticalSection(&c->lock);
+  pull_locked(c);
+  *frames = c->in_get ? 0 : next_packet_locked(c);
+  LeaveCriticalSection(&c->lock);
+  return S_OK;
+}
+static const IAudioCaptureClientVtbl kCaptureClientVtbl = {cc_query, cc_add_ref, cc_release, cc_get_buffer, cc_release_buffer, cc_get_next_packet_size};
 
 /* the clock: bytes of the client's format */
 static HRESULT WINAPI ck_query(IAudioClock *i, REFIID riid, void **out) {
@@ -909,9 +1055,11 @@ static HRESULT WINAPI cav_set_all(IChannelAudioVolume *i, UINT32 count, const fl
 static HRESULT WINAPI cav_get_all(IChannelAudioVolume *i, UINT32 count, float *levels) { return get_all_channels(from_channel_volume(i), count, levels); }
 static const IChannelAudioVolumeVtbl kChannelVolumeVtbl = {cav_query, cav_add_ref, cav_release, cav_get_count, cav_set, cav_get, cav_set_all, cav_get_all};
 
-static HRESULT new_client(void **out) {
+static HRESULT new_client(void **out, int which) {
   Client *c = (Client *)alloc(sizeof *c);
   if (!c) return E_OUTOFMEMORY;
+  c->capture = which == CAPTURE;
+  c->capture_client.lpVtbl = (IAudioCaptureClientVtbl *)&kCaptureClientVtbl;
   c->client.lpVtbl = (IAudioClient3Vtbl *)&kClientVtbl;
   c->render.lpVtbl = (IAudioRenderClientVtbl *)&kRenderVtbl;
   c->clock.lpVtbl = (IAudioClockVtbl *)&kClockVtbl;
@@ -928,11 +1076,15 @@ static HRESULT new_client(void **out) {
   return S_OK;
 }
 
-/* ---- the endpoint's volume (the graph's master volume) and meter -------------------------------------------------------------------------------- */
+/* ---- the endpoints' volume (the graph's master volume, the microphone's master gain) and meter ------------------------------------------------- */
 
 #define MAX_VOLUME_CALLBACKS 16
-static IAudioEndpointVolumeCallback *g_volume_callbacks[MAX_VOLUME_CALLBACKS];
+static IAudioEndpointVolumeCallback *g_volume_callbacks[2][MAX_VOLUME_CALLBACKS];
 static SRWLOCK g_callback_lock = SRWLOCK_INIT;
+static IAudioEndpointVolume g_endpoint_volume[2];
+static int volume_endpoint(IAudioEndpointVolume *i) { return i == &g_endpoint_volume[CAPTURE] ? CAPTURE : RENDER; }
+/* The stream number NtTcosAudio's volume calls take for an endpoint's master volume. */
+static ULONG64 master_stream(int which) { return which == CAPTURE ? TCOS_AUDIO_SOURCE_STREAM : 0; }
 
 /* The master volume as the scalar programs and the volume sliders use: the cube root of the amplitude (as PulseAudio and PipeWire show it). */
 static float cube_root(float x) {
@@ -941,18 +1093,18 @@ static float cube_root(float x) {
   for (int k = 0; k < 40; ++k) r = (2 * r + x / (r * r)) / 3;
   return (float)r;
 }
-static BOOL read_master(float *scalar, BOOL *mute) {
+static BOOL read_master(int which, float *scalar, BOOL *mute) {
   ULONG64 v = 0, muted = 0;
-  if (audio_call(TCOS_AUDIO_GET_VOLUME, 0, 0, 0, 0, 0, 0, NULL, &muted, &v) != 0) return FALSE;
+  if (audio_call(TCOS_AUDIO_GET_VOLUME, master_stream(which), 0, 0, 0, 0, 0, NULL, &muted, &v) != 0) return FALSE;
   const DWORD left = (DWORD)(v & 0xFFFF), right = (DWORD)(v >> 16 & 0xFFFF);
   if (scalar) *scalar = cube_root((float)(left > right ? left : right) / 65535.0f);
   if (mute) *mute = muted != 0;
   return TRUE;
 }
-static void notify_volume(LPCGUID context) {
+static void notify_volume(int which, LPCGUID context) {
   float scalar = 0;
   BOOL mute = FALSE;
-  if (!read_master(&scalar, &mute)) return;
+  if (!read_master(which, &scalar, &mute)) return;
   BYTE raw[sizeof(AUDIO_VOLUME_NOTIFICATION_DATA) + sizeof(float)];
   AUDIO_VOLUME_NOTIFICATION_DATA *data = (AUDIO_VOLUME_NOTIFICATION_DATA *)raw;
   zero(raw, sizeof raw);
@@ -964,15 +1116,15 @@ static void notify_volume(LPCGUID context) {
   ((float *)(data->afChannelVolumes))[1] = scalar;
   AcquireSRWLockShared(&g_callback_lock);
   for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (g_volume_callbacks[k]) IAudioEndpointVolumeCallback_OnNotify(g_volume_callbacks[k], data);
+    if (g_volume_callbacks[which][k]) IAudioEndpointVolumeCallback_OnNotify(g_volume_callbacks[which][k], data);
   ReleaseSRWLockShared(&g_callback_lock);
 }
-static HRESULT set_master(float scalar, LPCGUID context) {
+static HRESULT set_master(int which, float scalar, LPCGUID context) {
   if (!(scalar >= 0.0f && scalar <= 1.0f)) return E_INVALIDARG;
   const float amplitude = scalar * scalar * scalar;
   const ULONG64 v = (ULONG64)(amplitude * 65535.0f + 0.5f);
-  if (audio_call(TCOS_AUDIO_SET_VOLUME, 0, v, v, 0, 0, 0, NULL, NULL, NULL) != 0) return AUDCLNT_E_DEVICE_INVALIDATED;
-  notify_volume(context);
+  if (audio_call(TCOS_AUDIO_SET_VOLUME, master_stream(which), v, v, 0, 0, 0, NULL, NULL, NULL) != 0) return AUDCLNT_E_DEVICE_INVALIDATED;
+  notify_volume(which, context);
   return S_OK;
 }
 static float db_to_scalar(float db) { return cube_root((float)tcos_db_to_gain(db)); }
@@ -992,13 +1144,13 @@ static HRESULT WINAPI ev_query(IAudioEndpointVolume *i, REFIID riid, void **out)
 static ULONG WINAPI ev_add_ref(IAudioEndpointVolume *i) { (void)i; return 2; }
 static ULONG WINAPI ev_release(IAudioEndpointVolume *i) { (void)i; return 1; }
 static HRESULT WINAPI ev_register(IAudioEndpointVolume *i, IAudioEndpointVolumeCallback *callback) {
-  (void)i;
   if (!callback) return E_POINTER;
+  const int which = volume_endpoint(i);
   HRESULT hr = E_OUTOFMEMORY;
   AcquireSRWLockExclusive(&g_callback_lock);
   for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (!g_volume_callbacks[k]) {
-      g_volume_callbacks[k] = callback;
+    if (!g_volume_callbacks[which][k]) {
+      g_volume_callbacks[which][k] = callback;
       IAudioEndpointVolumeCallback_AddRef(callback);
       hr = S_OK;
       break;
@@ -1007,14 +1159,14 @@ static HRESULT WINAPI ev_register(IAudioEndpointVolume *i, IAudioEndpointVolumeC
   return hr;
 }
 static HRESULT WINAPI ev_unregister(IAudioEndpointVolume *i, IAudioEndpointVolumeCallback *callback) {
-  (void)i;
   if (!callback) return E_POINTER;
+  const int which = volume_endpoint(i);
   IAudioEndpointVolumeCallback *found = NULL;
   AcquireSRWLockExclusive(&g_callback_lock);
   for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (g_volume_callbacks[k] == callback) {
+    if (g_volume_callbacks[which][k] == callback) {
       found = callback;
-      g_volume_callbacks[k] = NULL;
+      g_volume_callbacks[which][k] = NULL;
       break;
     }
   ReleaseSRWLockExclusive(&g_callback_lock);
@@ -1029,33 +1181,29 @@ static HRESULT WINAPI ev_get_channel_count(IAudioEndpointVolume *i, UINT *count)
   return S_OK;
 }
 static HRESULT WINAPI ev_set_level(IAudioEndpointVolume *i, float db, LPCGUID context) {
-  (void)i;
   if (!(db >= MIN_DB && db <= 0.0f)) return E_INVALIDARG;
-  return set_master(db_to_scalar(db), context);
+  return set_master(volume_endpoint(i), db_to_scalar(db), context);
 }
-static HRESULT WINAPI ev_set_scalar(IAudioEndpointVolume *i, float level, LPCGUID context) { (void)i; return set_master(level, context); }
+static HRESULT WINAPI ev_set_scalar(IAudioEndpointVolume *i, float level, LPCGUID context) { return set_master(volume_endpoint(i), level, context); }
 static HRESULT WINAPI ev_get_level(IAudioEndpointVolume *i, float *db) {
-  (void)i;
   if (!db) return E_POINTER;
   float s = 0;
-  if (!read_master(&s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (!read_master(volume_endpoint(i), &s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
   *db = scalar_to_db(s);
   return S_OK;
 }
 static HRESULT WINAPI ev_get_scalar(IAudioEndpointVolume *i, float *level) {
-  (void)i;
   if (!level) return E_POINTER;
-  return read_master(level, NULL) ? S_OK : AUDCLNT_E_DEVICE_INVALIDATED;
+  return read_master(volume_endpoint(i), level, NULL) ? S_OK : AUDCLNT_E_DEVICE_INVALIDATED;
 }
-/* (the master volume has no balance: a channel's level is the whole volume) */
+/* (the master volumes have no balance: a channel's level is the whole volume) */
 static HRESULT WINAPI ev_set_channel_level(IAudioEndpointVolume *i, UINT channel, float db, LPCGUID context) {
   if (channel >= 2) return E_INVALIDARG;
   return ev_set_level(i, db, context);
 }
 static HRESULT WINAPI ev_set_channel_scalar(IAudioEndpointVolume *i, UINT channel, float level, LPCGUID context) {
-  (void)i;
   if (channel >= 2) return E_INVALIDARG;
-  return set_master(level, context);
+  return set_master(volume_endpoint(i), level, context);
 }
 static HRESULT WINAPI ev_get_channel_level(IAudioEndpointVolume *i, UINT channel, float *db) {
   if (channel >= 2) return E_INVALIDARG;
@@ -1066,42 +1214,40 @@ static HRESULT WINAPI ev_get_channel_scalar(IAudioEndpointVolume *i, UINT channe
   return ev_get_scalar(i, level);
 }
 static HRESULT WINAPI ev_set_mute(IAudioEndpointVolume *i, WINBOOL mute, LPCGUID context) {
-  (void)i;
+  const int which = volume_endpoint(i);
   BOOL was = FALSE;
-  if (!read_master(NULL, &was)) return AUDCLNT_E_DEVICE_INVALIDATED;
-  if (audio_call(TCOS_AUDIO_SET_MUTE, 0, mute ? 1 : 0, 0, 0, 0, 0, NULL, NULL, NULL) != 0) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (!read_master(which, NULL, &was)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (audio_call(TCOS_AUDIO_SET_MUTE, master_stream(which), mute ? 1 : 0, 0, 0, 0, 0, NULL, NULL, NULL) != 0) return AUDCLNT_E_DEVICE_INVALIDATED;
   if ((was != 0) == (mute != 0)) return S_FALSE;
-  notify_volume(context);
+  notify_volume(which, context);
   return S_OK;
 }
 static HRESULT WINAPI ev_get_mute(IAudioEndpointVolume *i, WINBOOL *mute) {
-  (void)i;
   if (!mute) return E_POINTER;
   BOOL m = FALSE;
-  if (!read_master(NULL, &m)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (!read_master(volume_endpoint(i), NULL, &m)) return AUDCLNT_E_DEVICE_INVALIDATED;
   *mute = m;
   return S_OK;
 }
 #define VOLUME_STEPS 101
 static HRESULT WINAPI ev_get_step_info(IAudioEndpointVolume *i, UINT *step, UINT *count) {
-  (void)i;
   if (!step && !count) return E_POINTER;
   float s = 0;
-  if (!read_master(&s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (!read_master(volume_endpoint(i), &s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
   if (step) *step = (UINT)(s * (VOLUME_STEPS - 1) + 0.5f);
   if (count) *count = VOLUME_STEPS;
   return S_OK;
 }
-static HRESULT step_by(int delta, LPCGUID context) {
+static HRESULT step_by(int which, int delta, LPCGUID context) {
   float s = 0;
-  if (!read_master(&s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (!read_master(which, &s, NULL)) return AUDCLNT_E_DEVICE_INVALIDATED;
   int step = (int)(s * (VOLUME_STEPS - 1) + 0.5f) + delta;
   if (step < 0) step = 0;
   if (step > VOLUME_STEPS - 1) step = VOLUME_STEPS - 1;
-  return set_master((float)step / (VOLUME_STEPS - 1), context);
+  return set_master(which, (float)step / (VOLUME_STEPS - 1), context);
 }
-static HRESULT WINAPI ev_step_up(IAudioEndpointVolume *i, LPCGUID context) { (void)i; return step_by(1, context); }
-static HRESULT WINAPI ev_step_down(IAudioEndpointVolume *i, LPCGUID context) { (void)i; return step_by(-1, context); }
+static HRESULT WINAPI ev_step_up(IAudioEndpointVolume *i, LPCGUID context) { return step_by(volume_endpoint(i), 1, context); }
+static HRESULT WINAPI ev_step_down(IAudioEndpointVolume *i, LPCGUID context) { return step_by(volume_endpoint(i), -1, context); }
 static HRESULT WINAPI ev_query_hardware(IAudioEndpointVolume *i, DWORD *mask) {
   (void)i;
   if (!mask) return E_POINTER;
@@ -1120,7 +1266,7 @@ static const IAudioEndpointVolumeVtbl kEndpointVolumeVtbl = {
   ev_query, ev_add_ref, ev_release, ev_register, ev_unregister, ev_get_channel_count, ev_set_level, ev_set_scalar, ev_get_level, ev_get_scalar,
   ev_set_channel_level, ev_set_channel_scalar, ev_get_channel_level, ev_get_channel_scalar, ev_set_mute, ev_get_mute, ev_get_step_info, ev_step_up,
   ev_step_down, ev_query_hardware, ev_get_range};
-static IAudioEndpointVolume g_endpoint_volume = {(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl};
+static IAudioEndpointVolume g_endpoint_volume[2] = {{(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl}, {(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl}};
 
 /* (IAudioMeterInformation: mingw's endpointvolume.h only declares it) */
 static const GUID kIidMeter = {0xC02216F6, 0x8C67, 0x4B5B, {0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64}};
@@ -1174,28 +1320,35 @@ static HRESULT WINAPI mi_query_hardware(Meter *i, DWORD *mask) {
 static const MeterVtbl kMeterVtbl = {mi_query, mi_add_ref, mi_release, mi_get_peak, mi_get_count, mi_get_peaks, mi_query_hardware};
 static Meter g_meter = {&kMeterVtbl};
 
-/* ---- the endpoint and its properties ------------------------------------------------------------------------------------------------------------ */
+/* ---- the endpoints and their properties --------------------------------------------------------------------------------------------------------- */
 
-static HRESULT activate(REFIID riid, DWORD context, PROPVARIANT *params, void **out) {
+static HRESULT activate(int which, REFIID riid, DWORD context, PROPVARIANT *params, void **out) {
   (void)context; (void)params;
   if (!out) return E_POINTER;
   *out = NULL;
   if (!riid) return E_POINTER;
-  if (!has_device()) return AUDCLNT_E_DEVICE_INVALIDATED;
-  if (same_guid(riid, &IID_IAudioClient) || same_guid(riid, &IID_IAudioClient2) || same_guid(riid, &IID_IAudioClient3)) return new_client(out);
-  if (same_guid(riid, &IID_IAudioEndpointVolume)) { *out = &g_endpoint_volume; return S_OK; }
+  if (!has_endpoint(which)) return AUDCLNT_E_DEVICE_INVALIDATED;
+  if (same_guid(riid, &IID_IAudioClient) || same_guid(riid, &IID_IAudioClient2) || same_guid(riid, &IID_IAudioClient3)) return new_client(out, which);
+  if (same_guid(riid, &IID_IAudioEndpointVolume)) { *out = &g_endpoint_volume[which]; return S_OK; }
   if (same_guid(riid, &IID_IAudioSessionManager) || same_guid(riid, &IID_IAudioSessionManager2)) { *out = &g_session_manager; return S_OK; }
   if (same_guid(riid, &kIidMeter)) { *out = &g_meter; return S_OK; }
-  if (same_guid(riid, &kIidDirectSound) || same_guid(riid, &kIidDirectSound8)) {
+  typedef HRESULT (WINAPI *CreateFn)(LPCGUID, void **, IUnknown *);
+  if (which == RENDER && (same_guid(riid, &kIidDirectSound) || same_guid(riid, &kIidDirectSound8))) {
     /* (dsound.dll's object on this endpoint) */
     HMODULE dsound = LoadLibraryA("dsound.dll");
-    typedef HRESULT (WINAPI *CreateFn)(LPCGUID, void **, IUnknown *);
     CreateFn create = dsound ? (CreateFn)(void *)GetProcAddress(dsound, "DirectSoundCreate8") : NULL;
     return create ? create(&kEndpointGuid, out, NULL) : E_NOINTERFACE;
+  }
+  if (which == CAPTURE && same_guid(riid, &kIidDirectSoundCapture)) {      /* (IID_IDirectSoundCapture8 is the same) */
+    HMODULE dsound = LoadLibraryA("dsound.dll");
+    CreateFn create = dsound ? (CreateFn)(void *)GetProcAddress(dsound, "DirectSoundCaptureCreate8") : NULL;
+    return create ? create(&kCaptureEndpointGuid, out, NULL) : E_NOINTERFACE;
   }
   return E_NOINTERFACE;
 }
 
+static IPropertyStore g_properties[2];
+static int property_endpoint(IPropertyStore *i) { return i == &g_properties[CAPTURE] ? CAPTURE : RENDER; }
 static HRESULT WINAPI ps_query(IPropertyStore *i, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
@@ -1223,14 +1376,14 @@ static HRESULT WINAPI ps_get_at(IPropertyStore *i, DWORD index, PROPERTYKEY *key
   return S_OK;
 }
 static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVARIANT *value) {
-  (void)i;
   if (!key || !value) return E_POINTER;
+  const BOOL capture = property_endpoint(i) == CAPTURE;
   zero(value, sizeof *value);
   const WCHAR *text = NULL;
-  if (same_key(key, &PKEY_Device_FriendlyName)) text = kFriendlyName;
-  else if (same_key(key, &PKEY_Device_DeviceDesc)) text = kDeviceDescription;
+  if (same_key(key, &PKEY_Device_FriendlyName)) text = capture ? kCaptureFriendlyName : kFriendlyName;
+  else if (same_key(key, &PKEY_Device_DeviceDesc)) text = capture ? kCaptureDescription : kDeviceDescription;
   else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = kInterfaceName;
-  else if (same_key(key, &PKEY_AudioEndpoint_GUID)) text = kEndpointGuidString;
+  else if (same_key(key, &PKEY_AudioEndpoint_GUID)) text = capture ? kCaptureGuidString : kEndpointGuidString;
   if (text) {
     value->pwszVal = task_string(text);
     if (!value->pwszVal) return E_OUTOFMEMORY;
@@ -1239,7 +1392,7 @@ static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVA
   }
   if (same_key(key, &PKEY_AudioEndpoint_FormFactor)) {
     value->vt = VT_UI4;
-    value->ulVal = Speakers;
+    value->ulVal = capture ? Microphone : Speakers;
   } else if (same_key(key, &PKEY_AudioEndpoint_PhysicalSpeakers)) {
     value->vt = VT_UI4;
     value->ulVal = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
@@ -1256,59 +1409,61 @@ static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVA
 static HRESULT WINAPI ps_set_value(IPropertyStore *i, REFPROPERTYKEY key, REFPROPVARIANT value) { (void)i; (void)key; (void)value; return STG_E_ACCESSDENIED; }
 static HRESULT WINAPI ps_commit(IPropertyStore *i) { (void)i; return S_OK; }
 static const IPropertyStoreVtbl kPropertyStoreVtbl = {ps_query, ps_add_ref, ps_release, ps_get_count, ps_get_at, ps_get_value, ps_set_value, ps_commit};
-static IPropertyStore g_properties = {(IPropertyStoreVtbl *)&kPropertyStoreVtbl};
+static IPropertyStore g_properties[2] = {{(IPropertyStoreVtbl *)&kPropertyStoreVtbl}, {(IPropertyStoreVtbl *)&kPropertyStoreVtbl}};
 
 typedef struct {
   IMMDevice device;
   IMMEndpoint endpoint;
 } Endpoint;
-static Endpoint g_endpoint;
+static Endpoint g_endpoints[2];
+static int device_endpoint(IMMDevice *i) { return i == &g_endpoints[CAPTURE].device ? CAPTURE : RENDER; }
+static const WCHAR *endpoint_id(int which) { return which == CAPTURE ? kCaptureEndpointId : kEndpointId; }
 
 static HRESULT WINAPI dv_query(IMMDevice *i, REFIID riid, void **out) {
-  (void)i;
   if (!out) return E_POINTER;
   *out = NULL;
-  if (same_guid(riid, &kIidUnknown) || same_guid(riid, &IID_IMMDevice)) *out = &g_endpoint.device;
-  else if (same_guid(riid, &IID_IMMEndpoint)) *out = &g_endpoint.endpoint;
+  Endpoint *e = &g_endpoints[device_endpoint(i)];
+  if (same_guid(riid, &kIidUnknown) || same_guid(riid, &IID_IMMDevice)) *out = &e->device;
+  else if (same_guid(riid, &IID_IMMEndpoint)) *out = &e->endpoint;
   else return E_NOINTERFACE;
   return S_OK;
 }
 static ULONG WINAPI dv_add_ref(IMMDevice *i) { (void)i; return 2; }
 static ULONG WINAPI dv_release(IMMDevice *i) { (void)i; return 1; }
-static HRESULT WINAPI dv_activate(IMMDevice *i, REFIID riid, DWORD context, PROPVARIANT *params, void **out) { (void)i; return activate(riid, context, params, out); }
+static HRESULT WINAPI dv_activate(IMMDevice *i, REFIID riid, DWORD context, PROPVARIANT *params, void **out) {
+  return activate(device_endpoint(i), riid, context, params, out);
+}
 static HRESULT WINAPI dv_open_property_store(IMMDevice *i, DWORD access, IPropertyStore **out) {
-  (void)i;
   if (!out) return E_POINTER;
   *out = NULL;
   if (access != STGM_READ && access != STGM_WRITE && access != STGM_READWRITE) return E_INVALIDARG;
-  *out = &g_properties;
+  *out = &g_properties[device_endpoint(i)];
   return S_OK;
 }
 static HRESULT WINAPI dv_get_id(IMMDevice *i, LPWSTR *id) {
-  (void)i;
   if (!id) return E_POINTER;
-  *id = task_string(kEndpointId);
+  *id = task_string(endpoint_id(device_endpoint(i)));
   return *id ? S_OK : E_OUTOFMEMORY;
 }
 static HRESULT WINAPI dv_get_state(IMMDevice *i, DWORD *state) {
-  (void)i;
   if (!state) return E_POINTER;
-  *state = has_device() ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
+  *state = has_endpoint(device_endpoint(i)) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
   return S_OK;
 }
 static const IMMDeviceVtbl kDeviceVtbl = {dv_query, dv_add_ref, dv_release, dv_activate, dv_open_property_store, dv_get_id, dv_get_state};
 
-static HRESULT WINAPI ep_query(IMMEndpoint *i, REFIID riid, void **out) { (void)i; return dv_query(&g_endpoint.device, riid, out); }
+static int endpoint_of(IMMEndpoint *i) { return i == &g_endpoints[CAPTURE].endpoint ? CAPTURE : RENDER; }
+static HRESULT WINAPI ep_query(IMMEndpoint *i, REFIID riid, void **out) { return dv_query(&g_endpoints[endpoint_of(i)].device, riid, out); }
 static ULONG WINAPI ep_add_ref(IMMEndpoint *i) { (void)i; return 2; }
 static ULONG WINAPI ep_release(IMMEndpoint *i) { (void)i; return 1; }
 static HRESULT WINAPI ep_get_data_flow(IMMEndpoint *i, EDataFlow *flow) {
-  (void)i;
   if (!flow) return E_POINTER;
-  *flow = eRender;
+  *flow = endpoint_of(i) == CAPTURE ? eCapture : eRender;
   return S_OK;
 }
 static const IMMEndpointVtbl kEndpointVtbl = {ep_query, ep_add_ref, ep_release, ep_get_data_flow};
-static Endpoint g_endpoint = {{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}};
+static Endpoint g_endpoints[2] = {{{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}},
+                                  {{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}}};
 
 /* ---- the enumerator ----------------------------------------------------------------------------------------------------------------------------- */
 
@@ -1316,6 +1471,7 @@ typedef struct {
   IMMDeviceCollection iface;
   LONG refs;
   UINT count;
+  int items[2];
 } Collection;
 
 static HRESULT WINAPI co_query(IMMDeviceCollection *i, REFIID riid, void **out) {
@@ -1340,8 +1496,9 @@ static HRESULT WINAPI co_get_count(IMMDeviceCollection *i, UINT *count) {
 static HRESULT WINAPI co_item(IMMDeviceCollection *i, UINT index, IMMDevice **out) {
   if (!out) return E_POINTER;
   *out = NULL;
-  if (index >= ((Collection *)i)->count) return E_INVALIDARG;
-  *out = &g_endpoint.device;
+  Collection *c = (Collection *)i;
+  if (index >= c->count) return E_INVALIDARG;
+  *out = &g_endpoints[c->items[index]].device;
   return S_OK;
 }
 static const IMMDeviceCollectionVtbl kCollectionVtbl = {co_query, co_add_ref, co_release, co_get_count, co_item};
@@ -1365,9 +1522,11 @@ static HRESULT WINAPI en_enum(IMMDeviceEnumerator *i, EDataFlow flow, DWORD mask
   if (!c) return E_OUTOFMEMORY;
   c->iface.lpVtbl = (IMMDeviceCollectionVtbl *)&kCollectionVtbl;
   c->refs = 1;
-  const BOOL present = has_device();
-  const DWORD state = present ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
-  c->count = flow != eCapture && (mask & state) ? 1 : 0;
+  for (int which = RENDER; which <= CAPTURE; ++which) {
+    if (flow != eAll && flow != (which == CAPTURE ? eCapture : eRender)) continue;
+    const DWORD state = has_endpoint(which) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
+    if (mask & state) c->items[c->count++] = which;
+  }
   *out = &c->iface;
   return S_OK;
 }
@@ -1376,17 +1535,21 @@ static HRESULT WINAPI en_get_default(IMMDeviceEnumerator *i, EDataFlow flow, ERo
   if (!out) return E_POINTER;
   *out = NULL;
   if ((flow != eRender && flow != eCapture) || role < eConsole || role >= ERole_enum_count) return E_INVALIDARG;
-  if (flow == eCapture || !has_device()) return E_NOTFOUND_;
-  *out = &g_endpoint.device;
+  const int which = flow == eCapture ? CAPTURE : RENDER;
+  if (!has_endpoint(which)) return E_NOTFOUND_;
+  *out = &g_endpoints[which].device;
   return S_OK;
 }
 static HRESULT WINAPI en_get_device(IMMDeviceEnumerator *i, LPCWSTR id, IMMDevice **out) {
   (void)i;
   if (!out || !id) return E_POINTER;
   *out = NULL;
-  if (!wide_equal_nocase(id, kEndpointId)) return E_NOTFOUND_;
-  *out = &g_endpoint.device;
-  return S_OK;
+  for (int which = RENDER; which <= CAPTURE; ++which)
+    if (wide_equal_nocase(id, endpoint_id(which))) {
+      *out = &g_endpoints[which].device;
+      return S_OK;
+    }
+  return E_NOTFOUND_;
 }
 /* (endpoints never come and go while a program runs here, so the callbacks are never called) */
 static HRESULT WINAPI en_register(IMMDeviceEnumerator *i, IMMNotificationClient *client) { (void)i; return client ? S_OK : E_POINTER; }
@@ -1448,12 +1611,14 @@ EXPORT HRESULT WINAPI ActivateAudioInterfaceAsync(LPCWSTR device, REFIID iid, PR
   if (!o) return E_OUTOFMEMORY;
   o->iface.lpVtbl = (IActivateAudioInterfaceAsyncOperationVtbl *)&kOperationVtbl;
   o->refs = 2;      /* the caller's and the completion's */
-  if (wide_equal_nocase(device, kRenderInterface) || wide_equal_nocase(device, kEndpointId)) {
+  const int which = wide_equal_nocase(device, kRenderInterface) || wide_equal_nocase(device, kEndpointId) ? RENDER
+                    : wide_equal_nocase(device, kCaptureInterface) || wide_equal_nocase(device, kCaptureEndpointId) ? CAPTURE : -1;
+  if (which >= 0) {
     void *object = NULL;
-    o->result = activate(iid, CLSCTX_ALL, parameters, &object);
+    o->result = activate(which, iid, CLSCTX_ALL, parameters, &object);
     o->object = (IUnknown *)object;
   } else {
-    o->result = E_NOTFOUND_;      /* (capture, process loopback, an endpoint that is not here) */
+    o->result = E_NOTFOUND_;      /* (process loopback, an endpoint that is not here) */
   }
   o->handler = handler;
   IActivateAudioInterfaceCompletionHandler_AddRef(handler);

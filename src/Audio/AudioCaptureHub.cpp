@@ -38,6 +38,16 @@ IAudioCapture* AudioCaptureHub::source() {
   return device_;
 }
 
+FixedString<64> AudioCaptureHub::source_name() {
+  kernel::ScopedMutex guard(mutex_);
+  FixedString<64> name;
+  if (device_) {
+    StringView text(device_->name());
+    name.assign(text.size() > 60 ? text.first(60) : text);      // (a long name is cut, not dropped)
+  }
+  return name;
+}
+
 IAudioDevice* AudioCaptureHub::source_device() {
   kernel::ScopedMutex guard(mutex_);
   return owner_.get();

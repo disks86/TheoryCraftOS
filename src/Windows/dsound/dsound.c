@@ -26,9 +26,10 @@
  * DSSCL_WRITEPRIMARY the program writes the primary buffer itself, in its own format.
  *
  * The play cursor is where the device is (what the kernel says it has played), the write cursor where the mixer has read up to; position
- * notifications fire as the play cursor passes them. Buffers made with DuplicateSoundBuffer share their memory. Not done: capture
- * (DirectSoundCapture*, full duplex: DSERR_NODRIVER, there is no capture in the graph), effects (SetFX: DSERR_FXUNAVAILABLE), Doppler, property sets.
- * The classes have a factory (DllGetClassObject; ole32 finds this library for CLSID_DirectSound and CLSID_DirectSound8). Built freestanding over
+ * notifications fire as the play cursor passes them. Buffers made with DuplicateSoundBuffer share their memory. Capture (DirectSoundCapture8, its
+ * buffers, full duplex) records from the graph's source: capture.inc. Not done: effects (SetFX: DSERR_FXUNAVAILABLE, no capture effects), Doppler,
+ * property sets. The classes have a factory (DllGetClassObject; ole32 finds this library for CLSID_DirectSound(8), CLSID_DirectSoundCapture(8) and
+ * CLSID_DirectSoundFullDuplex). Built freestanding over
  * kernel32.dll and ntdll.dll. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1404,33 +1405,7 @@ EXPORT HRESULT WINAPI DirectSoundEnumerateW(LPDSENUMCALLBACKW callback, LPVOID c
   return DS_OK;
 }
 
-/* Capture: the graph has none. */
-EXPORT HRESULT WINAPI DirectSoundCaptureCreate(LPCGUID guid, LPDIRECTSOUNDCAPTURE *out, LPUNKNOWN outer) {
-  (void)guid;
-  if (!out) return DSERR_INVALIDPARAM;
-  *out = NULL;
-  return outer ? DSERR_NOAGGREGATION : DSERR_NODRIVER;
-}
-EXPORT HRESULT WINAPI DirectSoundCaptureCreate8(LPCGUID guid, LPDIRECTSOUNDCAPTURE8 *out, LPUNKNOWN outer) {
-  return DirectSoundCaptureCreate(guid, (LPDIRECTSOUNDCAPTURE *)out, outer);
-}
-EXPORT HRESULT WINAPI DirectSoundCaptureEnumerateA(LPDSENUMCALLBACKA callback, LPVOID context) {
-  (void)context;
-  return callback ? DS_OK : DSERR_INVALIDPARAM;
-}
-EXPORT HRESULT WINAPI DirectSoundCaptureEnumerateW(LPDSENUMCALLBACKW callback, LPVOID context) {
-  (void)context;
-  return callback ? DS_OK : DSERR_INVALIDPARAM;
-}
-EXPORT HRESULT WINAPI DirectSoundFullDuplexCreate(LPCGUID capture, LPCGUID render, LPCDSCBUFFERDESC cdesc, LPCDSBUFFERDESC rdesc, HWND window, DWORD level,
-                                                  LPDIRECTSOUNDFULLDUPLEX *out, LPDIRECTSOUNDCAPTUREBUFFER8 *cbuf, LPDIRECTSOUNDBUFFER8 *rbuf, LPUNKNOWN outer) {
-  (void)capture; (void)render; (void)cdesc; (void)rdesc; (void)window; (void)level;
-  if (out) *out = NULL;
-  if (cbuf) *cbuf = NULL;
-  if (rbuf) *rbuf = NULL;
-  if (!out) return DSERR_INVALIDPARAM;
-  return outer ? DSERR_NOAGGREGATION : DSERR_NODRIVER;
-}
+#include "capture.inc"
 
 EXPORT HRESULT WINAPI GetDeviceID(LPCGUID source, LPGUID dest) {
   if (!source || !dest) return DSERR_INVALIDPARAM;
@@ -1439,13 +1414,19 @@ EXPORT HRESULT WINAPI GetDeviceID(LPCGUID source, LPGUID dest) {
     *dest = kDeviceGuid;
     return DS_OK;
   }
-  return same_guid(source, &DSDEVID_DefaultCapture) || same_guid(source, &DSDEVID_DefaultVoiceCapture) ? DSERR_NODRIVER : DSERR_INVALIDPARAM;
+  if (capture_guid(source) && !same_guid(source, &kGuidNull)) {
+    if (!tcos_audio_input_devices()) return DSERR_NODRIVER;
+    *dest = kCaptureGuid;
+    return DS_OK;
+  }
+  return DSERR_INVALIDPARAM;
 }
 
 /* ---- the class factory -------------------------------------------------------------------------------------------------------------------------- */
 
 typedef struct {
   IClassFactory iface;
+  int kind;      /* 0 DirectSound, 1 DirectSoundCapture, 2 DirectSoundFullDuplex */
 } Factory;
 
 static HRESULT WINAPI f_query(IClassFactory *i, REFIID riid, void **out) {
@@ -1460,11 +1441,26 @@ static HRESULT WINAPI f_query(IClassFactory *i, REFIID riid, void **out) {
 static ULONG WINAPI f_add_ref(IClassFactory *i) { (void)i; return 2; }
 static ULONG WINAPI f_release(IClassFactory *i) { (void)i; return 1; }
 static HRESULT WINAPI f_create_instance(IClassFactory *i, IUnknown *outer, REFIID riid, void **out) {
-  (void)i;
   if (!out) return E_POINTER;
   *out = NULL;
   if (outer) return CLASS_E_NOAGGREGATION;
-  Device *d = new_device();      /* (not initialized: the program calls Initialize) */
+  /* (not initialized: the program calls Initialize) */
+  const int kind = ((Factory *)i)->kind;
+  if (kind == 1) {
+    CaptureDevice *c = new_capture_device();
+    if (!c) return E_OUTOFMEMORY;
+    const HRESULT hr = c_query(&c->iface, riid, out);
+    c_release(&c->iface);
+    return hr;
+  }
+  if (kind == 2) {
+    FullDuplex *x = new_duplex();
+    if (!x) return E_OUTOFMEMORY;
+    const HRESULT hr = x_query(&x->iface, riid, out);
+    x_release(&x->iface);
+    return hr;
+  }
+  Device *d = new_device();
   if (!d) return E_OUTOFMEMORY;
   const HRESULT hr = d_query(&d->iface, riid, out);
   d_release(&d->iface);
@@ -1472,12 +1468,16 @@ static HRESULT WINAPI f_create_instance(IClassFactory *i, IUnknown *outer, REFII
 }
 static HRESULT WINAPI f_lock_server(IClassFactory *i, BOOL lock) { (void)i; (void)lock; return S_OK; }
 static const IClassFactoryVtbl kFactoryVtbl = {f_query, f_add_ref, f_release, f_create_instance, f_lock_server};
-static Factory g_factory = {{(IClassFactoryVtbl *)&kFactoryVtbl}};
+static Factory g_factory = {{(IClassFactoryVtbl *)&kFactoryVtbl}, 0};
+static Factory g_capture_factory = {{(IClassFactoryVtbl *)&kFactoryVtbl}, 1};
+static Factory g_duplex_factory = {{(IClassFactoryVtbl *)&kFactoryVtbl}, 2};
 
 EXPORT HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID riid, LPVOID *out) {
   if (!out) return E_POINTER;
   *out = NULL;
   if (same_guid(clsid, &CLSID_DirectSound) || same_guid(clsid, &CLSID_DirectSound8)) return f_query(&g_factory.iface, riid, out);
+  if (same_guid(clsid, &CLSID_DirectSoundCapture) || same_guid(clsid, &CLSID_DirectSoundCapture8)) return f_query(&g_capture_factory.iface, riid, out);
+  if (same_guid(clsid, &CLSID_DirectSoundFullDuplex)) return f_query(&g_duplex_factory.iface, riid, out);
   return CLASS_E_CLASSNOTAVAILABLE;
 }
 EXPORT HRESULT WINAPI DllCanUnloadNow(void) { return S_FALSE; }

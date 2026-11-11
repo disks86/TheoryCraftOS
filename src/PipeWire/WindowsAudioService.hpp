@@ -16,9 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The Windows programs' way into the PipeWire graph: NtTcosAudio (layout in src/Process/WindowsAudio.hpp), which winmm.dll's waveOut functions call.
-// Every process that plays is a client of the graph ("tcos-winmm"); every stream it opens a playback node, mixed with what the native and Linux
-// programs play. A process's streams stop when it ends (process_exited, from win32k's exit hooks).
+// The Windows programs' way into the PipeWire graph: NtTcosAudio (layout in src/Process/WindowsAudio.hpp), which winmm.dll (waveOut, waveIn),
+// dsound.dll and mmdevapi.dll (WASAPI) call. Every process that plays or records is a client of the graph ("tcos-winmm"); every stream it opens a
+// playback node, mixed with what the native and Linux programs play, or a capture node that hears the microphone along with every other program that
+// records. A process's streams stop when it ends (process_exited, from win32k's exit hooks).
 #pragma once
 #include <stdint.h>
 #include "Kernel/Sync.hpp"
@@ -34,6 +35,8 @@ class WindowsAudioService {
  public:
   static constexpr uint32_t kMaxStreamsPerProcess = 64;
   static constexpr uint64_t kMaxWrite = 1u << 20;
+  // The stream number that stands for the source (the microphone's master gain) in the volume calls; 0 is the sink.
+  static constexpr uint32_t kSourceStream = 0xFFFFFFFFu;
 
   WindowsAudioService(Graph& graph, allocators::IAllocator& allocator) : graph_(graph), allocator_(allocator), owners_(allocator) {}
   ~WindowsAudioService();
@@ -50,8 +53,11 @@ class WindowsAudioService {
   // The operations on a process's streams without a Process (what call() does once it has read the arguments); the tests drive these.
   uint32_t open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream);
   uint32_t write(uint64_t pid, uint32_t stream, ConstByteView pcm, uint32_t* taken);
+  // A record stream: what the microphone hears from now, in `format`.
+  uint32_t open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream);
+  uint32_t read(uint64_t pid, uint32_t stream, ByteView out, uint32_t* got);
   uint32_t close(uint64_t pid, uint32_t stream, bool drain);
-  // Stream 0 is the master volume (the sink). Left and right are 0 .. 0xFFFF; a stream's louder side is its volume, the balance its pan.
+  // Stream 0 is the master volume (the sink), kSourceStream the microphone's master gain (the source). Left and right are 0 .. 0xFFFF; a stream's louder side is its volume, the balance its pan.
   uint32_t set_volume(uint64_t pid, uint32_t stream, uint32_t left, uint32_t right);
   uint32_t get_volume(uint64_t pid, uint32_t stream, uint32_t* left, uint32_t* right, bool* mute);
   uint32_t set_mute(uint64_t pid, uint32_t stream, bool mute);
@@ -67,6 +73,7 @@ class WindowsAudioService {
   bool owns_locked(uint64_t pid, uint32_t node);
   // The graph node `stream` stands for (0: the sink), if the process may change its volume.
   uint32_t volume_node(uint64_t pid, uint32_t stream, uint32_t* node);
+  uint32_t open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, uint32_t* stream);
 
   Graph& graph_;
   allocators::IAllocator& allocator_;

@@ -25,7 +25,9 @@ namespace {
 // SPA channel positions (spa/param/audio/raw.h)
 constexpr uint32_t kMono = 2, kFL = 3, kFR = 4, kFC = 5, kLFE = 6, kSL = 7, kSR = 8, kFLC = 9, kFRC = 10, kRC = 11, kRL = 12, kRR = 13;
 
-void default_positions(uint32_t channels, uint32_t* out) {
+}  // namespace
+
+void default_channel_positions(uint32_t channels, uint32_t* out) {
   static constexpr uint32_t k3[] = {kFL, kFR, kFC}, k4[] = {kFL, kFR, kRL, kRR}, k5[] = {kFL, kFR, kFC, kRL, kRR}, k6[] = {kFL, kFR, kFC, kLFE, kRL, kRR},
                             k7[] = {kFL, kFR, kFC, kLFE, kRC, kSL, kSR}, k8[] = {kFL, kFR, kFC, kLFE, kRL, kRR, kSL, kSR};
   const uint32_t* table = nullptr;
@@ -43,8 +45,7 @@ void default_positions(uint32_t channels, uint32_t* out) {
   for (uint32_t i = 0; i < channels; ++i) out[i] = table ? table[i] : (i % 2 ? kFR : kFL);
 }
 
-// How much of a channel goes to the left and the right (per mille).
-void side_weights(uint32_t position, int32_t* left, int32_t* right) {
+void channel_side_weights(uint32_t position, int32_t* left, int32_t* right) {
   switch (position) {
     case kFL: case kSL: case kRL: case kFLC: *left = 1000; *right = 0; return;
     case kFR: case kSR: case kRR: case kFRC: *left = 0; *right = 1000; return;
@@ -53,6 +54,8 @@ void side_weights(uint32_t position, int32_t* left, int32_t* right) {
     default: *left = 707; *right = 707; return;      // mono and the positions without a side
   }
 }
+
+namespace {
 
 int32_t alaw_decode(uint8_t a) {
   a ^= 0x55;
@@ -159,11 +162,11 @@ uint32_t convert_to_s16(const PcmFormat& in, const uint32_t* positions, ConstByt
   if (frames > out.size() / (2 * out_channels)) frames = out.size() / (2 * out_channels);
   uint32_t order[PcmFormat::kMaxChannels];
   if (positions) for (uint32_t c = 0; c < in.channels; ++c) order[c] = positions[c];
-  else default_positions(in.channels, order);
+  else default_channel_positions(in.channels, order);
   int32_t left_w[PcmFormat::kMaxChannels], right_w[PcmFormat::kMaxChannels];
   int64_t left_total = 0, right_total = 0;
   for (uint32_t c = 0; c < in.channels; ++c) {
-    side_weights(in.channels == 1 ? kMono : order[c], &left_w[c], &right_w[c]);
+    channel_side_weights(in.channels == 1 ? kMono : order[c], &left_w[c], &right_w[c]);
     left_total += left_w[c];
     right_total += right_w[c];
   }

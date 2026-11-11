@@ -23,6 +23,7 @@ namespace pipewire {
 namespace {
 
 constexpr const char* kSinkName = "tcos_output.stereo";
+constexpr const char* kSourceName = "tcos_input.stereo";
 constexpr uint32_t kFL = 3, kFR = 4, kMono = 2;
 
 const char* channel_name(uint32_t position) {
@@ -37,6 +38,20 @@ uint8_t to_device_volume(float volume) {
   if (!(volume > 0.0f)) return 0;
   if (volume >= 1.0f) return hardware::kAudioMaxVolume;
   return static_cast<uint8_t>(volume * hardware::kAudioMaxVolume + 0.5f);
+}
+
+void set_port_props(GraphObject& port, uint32_t node, uint32_t index, uint32_t direction, const char* prefix, allocators::IAllocator& allocator) {
+  String name(allocator);
+  name.append(prefix);
+  name.append(channel_name(port.channel));
+  port.node = node;
+  port.direction = direction;
+  port.props.set("port.name", name.view());
+  port.props.set("port.direction", direction == kDirectionInput ? "in" : "out");
+  port.props.set_uint("port.id", index);
+  port.props.set_uint("node.id", node);
+  port.props.set("audio.channel", channel_name(port.channel));
+  port.props.set("format.dsp", "32 bit float mono audio");
 }
 
 }  // namespace
@@ -82,17 +97,21 @@ bool interface_from_name(StringView name, ObjectType* out) {
   return false;
 }
 
-Graph::Graph(allocators::IAllocator& allocator, audio::AudioMixer* mixer)
-    : allocator_(allocator), mixer_(mixer), objects_(allocator), retired_(allocator) {}
+Graph::Graph(allocators::IAllocator& allocator, audio::AudioMixer* mixer, audio::AudioCaptureHub* capture)
+    : allocator_(allocator), mixer_(mixer), capture_(capture), objects_(allocator), retired_(allocator) {}
 
 Graph::~Graph() {
   // the streams that are still playing stop with the graph
-  for (UniquePointer<GraphObject>& o : objects_.view())
+  for (UniquePointer<GraphObject>& o : objects_.view()) {
     if (o->playback) {
       o->playback->flush();
       o->playback->close();
     }
+    if (o->record) o->record->close();
+  }
 }
+
+bool Graph::has_input() { return capture_ && capture_->source() != nullptr; }
 
 GraphObject* Graph::find_locked(uint32_t id) {
   // objects_ is in id order
@@ -136,6 +155,9 @@ void Graph::remove_locked(uint32_t id) {
 }
 
 bool Graph::initialize() {
+  // (the hub's lock is not taken under the graph's)
+  const uint8_t gain = capture_ ? capture_->master_gain() : 0;
+  const bool gain_muted = capture_ ? capture_->master_muted() : false;
   kernel::ScopedMutex guard(mutex_);
   if (objects_.count()) return true;
   GraphObject* core = add_locked(ObjectType::Core, 0);
@@ -193,19 +215,18 @@ bool Graph::initialize() {
   for (uint32_t i = 0; i < 2; ++i) {
     GraphObject* port = add_locked(ObjectType::Port, 0);
     if (!port) return false;
-    port->node = sink_;
-    port->direction = kDirectionInput;
     port->channel = kPositions[i];
+    set_port_props(*port, sink_, i, kDirectionInput, "playback_", allocator_);
     sink_ports_[i] = port->id;
-    String name(allocator_);
-    name.append("playback_");
-    name.append(channel_name(kPositions[i]));
-    port->props.set("port.name", name.view());
-    port->props.set("port.direction", "in");
-    port->props.set_uint("port.id", i);
-    port->props.set_uint("node.id", sink_);
-    port->props.set("audio.channel", channel_name(kPositions[i]));
-    port->props.set("format.dsp", "32 bit float mono audio");
+  }
+  if (capture_) {
+    if (!add_source_locked()) return false;
+    source_gain_ = gain;
+    source_muted_ = gain_muted;
+    if (GraphObject* source = find_locked(source_)) {
+      source->volume = gain / float(hardware::kAudioMaxVolume);
+      source->mute = gain_muted;
+    }
   }
   set_default_metadata_locked();
   if (mixer_) {
@@ -217,10 +238,53 @@ bool Graph::initialize() {
   return true;
 }
 
+bool Graph::add_source_locked() {
+  GraphObject* device = add_locked(ObjectType::Device, 0);
+  if (!device) return false;
+  source_device_ = device->id;
+  device->props.set("device.api", "tcos");
+  device->props.set("device.name", "tcos_card.input");
+  device->props.set("device.description", "Audio input");
+  device->props.set("media.class", "Audio/Device");
+  device->props.set("device.bus", "pci");
+
+  GraphObject* source = add_locked(ObjectType::Node, 0);
+  if (!source) return false;
+  source_ = source->id;
+  source->role = NodeRole::Source;
+  source->format = PcmFormat{SampleFormat::S16Le, hardware::kAudioSampleRate, 2};
+  source->output_ports = 2;
+  source->state = kNodeStateSuspended;      // (refresh() tells it idle once there is a microphone)
+  source->props.set("node.name", kSourceName);
+  source->props.set("node.description", "Audio input");
+  source->props.set("node.nick", "Audio input");
+  source->props.set("media.class", "Audio/Source");
+  source->props.set_uint("device.id", source_device_);
+  source->props.set("audio.channels", "2");
+  source->props.set("audio.rate", "48000");
+  source->props.set("audio.format", "S16LE");
+  source->props.set("audio.position", "FL,FR");
+  source->props.set("priority.session", "2000");
+  source->props.set("factory.name", "api.tcos.capture");
+  static constexpr uint32_t kPositions[2] = {kFL, kFR};
+  for (uint32_t i = 0; i < 2; ++i) {
+    GraphObject* port = add_locked(ObjectType::Port, 0);
+    if (!port) return false;
+    port->channel = kPositions[i];
+    set_port_props(*port, source_, i, kDirectionOutput, "capture_", allocator_);
+    source_ports_[i] = port->id;
+  }
+  return true;
+}
+
 void Graph::set_default_metadata_locked() {
   if (GraphObject* m = find_locked(metadata_)) {
     m->props.set("default.audio.sink", "{\"name\":\"tcos_output.stereo\"}");
     m->props.set("default.configured.audio.sink", "{\"name\":\"tcos_output.stereo\"}");
+    if (source_) {
+      m->props.set("default.audio.source", "{\"name\":\"tcos_input.stereo\"}");
+      m->props.set("default.configured.audio.source", "{\"name\":\"tcos_input.stereo\"}");
+    }
     touch_locked(*m);
   }
 }
@@ -235,8 +299,16 @@ bool Graph::snapshot(List<GraphEntry>* out) {
   kernel::ScopedMutex guard(mutex_);
   if (!out->reserve(objects_.count())) return false;
   for (const UniquePointer<GraphObject>& o : objects_.view())
-    if (!out->push_back(GraphEntry{o->id, o->type, o->changed})) return false;
+    if (!out->push_back(GraphEntry{o->id, o->type, o->changed, o->role})) return false;
   return true;
+}
+
+uint32_t Graph::record_count() {
+  kernel::ScopedMutex guard(mutex_);
+  uint32_t n = 0;
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node && o->role == NodeRole::Capture) ++n;
+  return n;
 }
 
 uint32_t Graph::playback_count() {
@@ -295,6 +367,30 @@ void Graph::remove_client(uint32_t client) {
 
 // ---- streams ---------------------------------------------------------------------------------------------------------------------------------------
 
+void Graph::name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format) {
+  // what the graph owns
+  node.props.set_uint("object.id", node.id);
+  node.props.set_uint("object.serial", node.object_serial);
+  node.props.set_uint("client.id", client);
+  if (!node.props.has("node.name") || node.props.get("node.name").empty()) {
+    String name(allocator_);
+    name.append(node.props.has("application.name") ? node.props.get("application.name") : StringView("stream"));
+    name.push_back('.');
+    name.append_uint(node.id);
+    node.props.set("node.name", name.view());
+  }
+  if (!node.props.has("media.name")) node.props.set("media.name", node.props.get("node.name"));
+  if (!node.props.has("media.type")) node.props.set("media.type", "Audio");
+  node.props.set_uint("audio.channels", format.channels);
+  node.props.set_uint("audio.rate", format.rate);
+  node.props.set("audio.format", format.name());
+  node.props.set("node.autoconnect", "true");
+  if (GraphObject* c = find_locked(client)) {
+    if (!node.props.has("application.name") && c->props.has("application.name")) node.props.set("application.name", c->props.get("application.name"));
+    node.props.set_uint("application.process.id", c->pid);
+  }
+}
+
 uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props) {
   GraphObject* node = add_locked(ObjectType::Node, client);
   if (!node) return 0;
@@ -303,29 +399,9 @@ uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const Pcm
   node->format = format;
   node->state = kNodeStateIdle;      // (refresh() tells it running once something is queued)
   node->props.update(props, Properties::Mode::kReplace);
-  // what the graph owns
-  node->props.set_uint("object.id", node->id);
-  node->props.set_uint("object.serial", node->object_serial);
-  node->props.set_uint("client.id", client);
   node->props.set("media.class", "Stream/Output/Audio");
-  if (!node->props.has("node.name") || node->props.get("node.name").empty()) {
-    String name(allocator_);
-    name.append(node->props.has("application.name") ? node->props.get("application.name") : StringView("stream"));
-    name.push_back('.');
-    name.append_uint(node->id);
-    node->props.set("node.name", name.view());
-  }
-  if (!node->props.has("media.name")) node->props.set("media.name", node->props.get("node.name"));
-  if (!node->props.has("media.type")) node->props.set("media.type", "Audio");
-  node->props.set_uint("audio.channels", format.channels);
-  node->props.set_uint("audio.rate", format.rate);
-  node->props.set("audio.format", format.name());
   node->props.set("target.object", kSinkName);
-  node->props.set("node.autoconnect", "true");
-  if (GraphObject* c = find_locked(client)) {
-    if (!node->props.has("application.name") && c->props.has("application.name")) node->props.set("application.name", c->props.get("application.name"));
-    node->props.set_uint("application.process.id", c->pid);
-  }
+  name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
   // ports: mono, or front left and right (more channels are folded into two)
   const uint32_t ports = format.channels == 1 ? 1 : 2;
@@ -334,18 +410,8 @@ uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const Pcm
     const uint32_t position = ports == 1 ? kMono : (i == 0 ? kFL : kFR);
     GraphObject* port = add_locked(ObjectType::Port, client);
     if (!port) return node_id;
-    port->node = node_id;
-    port->direction = kDirectionOutput;
     port->channel = position;
-    String name(allocator_);
-    name.append("output_");
-    name.append(channel_name(position));
-    port->props.set("port.name", name.view());
-    port->props.set("port.direction", "out");
-    port->props.set_uint("port.id", i);
-    port->props.set_uint("node.id", node_id);
-    port->props.set("audio.channel", channel_name(position));
-    port->props.set("format.dsp", "32 bit float mono audio");
+    set_port_props(*port, node_id, i, kDirectionOutput, "output_", allocator_);
     const uint32_t port_id = port->id;
     // links to the sink: mono to both sides
     for (uint32_t s = 0; s < 2; ++s) {
@@ -404,9 +470,88 @@ uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const 
   return id;
 }
 
+uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props) {
+  GraphObject* node = add_locked(ObjectType::Node, client);
+  if (!node) return 0;
+  node->role = NodeRole::Capture;
+  node->origin = origin;
+  node->format = format;
+  node->state = kNodeStateRunning;
+  node->props.update(props, Properties::Mode::kReplace);
+  node->props.set("media.class", "Stream/Input/Audio");
+  node->props.set("target.object", kSourceName);
+  name_stream_node_locked(*node, client, format);
+  const uint32_t node_id = node->id;
+  // ports: mono, or front left and right (more channels are made from those two)
+  const uint32_t ports = format.channels == 1 ? 1 : 2;
+  node->input_ports = ports;
+  for (uint32_t i = 0; i < ports; ++i) {
+    GraphObject* port = add_locked(ObjectType::Port, client);
+    if (!port) return node_id;
+    port->channel = ports == 1 ? kMono : (i == 0 ? kFL : kFR);
+    set_port_props(*port, node_id, i, kDirectionInput, "input_", allocator_);
+    const uint32_t port_id = port->id;
+    // links from the source: both sides into a mono port
+    for (uint32_t s = 0; s < 2; ++s) {
+      if (ports == 2 && s != i) continue;
+      GraphObject* link = add_locked(ObjectType::Link, client);
+      if (!link) return node_id;
+      link->output_node = source_;
+      link->output_port = source_ports_[s];
+      link->input_node = node_id;
+      link->input_port = port_id;
+      link->props.set_uint("link.output.node", source_);
+      link->props.set_uint("link.output.port", source_ports_[s]);
+      link->props.set_uint("link.input.node", node_id);
+      link->props.set_uint("link.input.port", port_id);
+      link->props.set("factory.name", "link-factory");
+    }
+  }
+  return node_id;
+}
+
+uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out) {
+  *out = SharedPointer<RecordStream>();
+  if (!capture_ || !source_ || !format.valid()) return 0;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* c = find_locked(client);
+    if (!c || c->type != ObjectType::Client) return 0;
+  }
+  audio::StreamFormat sf;
+  sf.sample_rate = format.rate;
+  sf.channels = format.channels == 1 ? 1 : 2;
+  sf.type = audio::SampleType::S16;
+  // half a second at the program's rate (a program that reads less often than that loses audio)
+  uint32_t ring = sf.frame_size() * (format.rate / 2);
+  if (ring < 16384) ring = 16384;
+  SharedPointer<audio::CaptureStream> capture = capture_->open_stream(sf, ring);
+  if (!capture) return 0;
+  SharedPointer<RecordStream> record = SharedPointer<RecordStream>::make(allocator_, allocator_, format, capture);
+  if (!record) {
+    capture->close();
+    return 0;
+  }
+  uint32_t id = 0;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    Origin origin = Origin::Kernel;
+    if (GraphObject* c = find_locked(client)) origin = c->origin;
+    id = add_record_node_locked(client, origin, format, props);
+    if (GraphObject* node = id ? find_locked(id) : nullptr) node->record = record;
+  }
+  if (!id) {
+    capture->close();
+    return 0;
+  }
+  *out = record;
+  return id;
+}
+
 void Graph::remove_node_locked(uint32_t node_id, List<SharedPointer<PlaybackStream>>* stopped, bool drain) {
   GraphObject* node = find_locked(node_id);
-  if (!node || node->type != ObjectType::Node || node->role != NodeRole::Playback) return;
+  if (!node || node->type != ObjectType::Node || (node->role != NodeRole::Playback && node->role != NodeRole::Capture)) return;
+  if (node->record) node->record->close();
   if (node->playback) {
     retired_.push_back(node->playback->shared_stream());
     if (drain) node->playback->close();
@@ -451,6 +596,12 @@ bool Graph::update_node(uint32_t node_id, const Properties& props, Properties::M
   return true;
 }
 
+SharedPointer<RecordStream> Graph::record_of(uint32_t node_id) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(node_id);
+  return node && node->type == ObjectType::Node ? node->record : SharedPointer<RecordStream>();
+}
+
 SharedPointer<PlaybackStream> Graph::playback_of(uint32_t node_id) {
   kernel::ScopedMutex guard(mutex_);
   GraphObject* node = find_locked(node_id);
@@ -462,11 +613,12 @@ SharedPointer<PlaybackStream> Graph::playback_of(uint32_t node_id) {
 bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
   if (!(volume >= 0.0f)) volume = 0.0f;
   if (volume > 1.5f) volume = 1.5f;
-  bool sink = false;
+  bool sink = false, source = false;
   {
     kernel::ScopedMutex guard(mutex_);
     GraphObject* node = find_locked(node_id);
     if (!node || node->type != ObjectType::Node) return false;
+    if ((node->role == NodeRole::Source || node->role == NodeRole::Capture) && volume > 1.0f) volume = 1.0f;      // (the hub only attenuates)
     node->volume = volume;
     node->mute = mute;
     touch_locked(*node);
@@ -474,6 +626,13 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
       sink = true;
       master_ = to_device_volume(volume);
       master_muted_ = mute;
+    } else if (node->role == NodeRole::Source) {
+      source = true;
+      source_gain_ = to_device_volume(volume);
+      source_muted_ = mute;
+    } else if (node->record) {
+      node->record->capture().set_gain(to_device_volume(volume));
+      node->record->capture().set_muted(mute);
     } else if (node->playback) {
       node->playback->stream().set_volume(to_device_volume(volume));
       node->playback->stream().set_muted(mute);
@@ -486,6 +645,10 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
     // (outside the graph's lock: the mixer takes its own)
     mixer_->set_master_volume(to_device_volume(volume));
     mixer_->set_master_muted(mute);
+  }
+  if (source && capture_) {
+    capture_->set_master_gain(to_device_volume(volume));
+    capture_->set_master_muted(mute);
   }
   return true;
 }
@@ -502,8 +665,9 @@ bool Graph::get_volume(uint32_t node_id, float* volume, bool* mute) {
 bool Graph::set_paused(uint32_t node_id, bool paused) {
   kernel::ScopedMutex guard(mutex_);
   GraphObject* node = find_locked(node_id);
-  if (!node || node->type != ObjectType::Node || !node->playback) return false;
-  node->playback->set_paused(paused);
+  if (!node || node->type != ObjectType::Node || (!node->playback && !node->record)) return false;
+  if (node->playback) node->playback->set_paused(paused);
+  else node->record->set_paused(paused);
   const uint32_t state = paused ? kNodeStateIdle : kNodeStateRunning;
   if (node->state != state) {
     node->state = state;
@@ -535,7 +699,53 @@ void Graph::sync_sink_locked(const char* device_name, uint8_t master, bool muted
   }
 }
 
+void Graph::sync_source_locked(StringView device_name, uint8_t gain, bool muted) {
+  GraphObject* source = find_locked(source_);
+  if (!source) return;
+  const StringView description = device_name.empty() ? StringView("Audio input") : device_name;
+  if (source->props.get("node.description") != description) {
+    source->props.set("node.description", description);
+    source->props.set("node.nick", description);
+    touch_locked(*source);
+    if (GraphObject* device = find_locked(source_device_)) {
+      device->props.set("device.description", description);
+      touch_locked(*device);
+    }
+  }
+  if (gain != source_gain_ || muted != source_muted_) {
+    source_gain_ = gain;
+    source_muted_ = muted;
+    source->volume = gain / float(hardware::kAudioMaxVolume);
+    source->mute = muted;
+    touch_locked(*source);
+  }
+  // the record streams' state; the source runs while one of them listens, and is suspended with no microphone
+  bool listening = false;
+  for (UniquePointer<GraphObject>& p : objects_.view()) {
+    GraphObject& o = *p;
+    if (o.type != ObjectType::Node || o.role != NodeRole::Capture || !o.record) continue;
+    const uint32_t state = o.record->paused() ? kNodeStateIdle : kNodeStateRunning;
+    if (state == kNodeStateRunning) listening = true;
+    if (state != o.state) {
+      o.state = state;
+      touch_locked(o);
+    }
+  }
+  const uint32_t state = device_name.empty() ? kNodeStateSuspended : listening ? kNodeStateRunning : kNodeStateIdle;
+  if (state != source->state) {
+    source->state = state;
+    touch_locked(*source);
+  }
+}
+
 void Graph::refresh() {
+  if (capture_ && source_) {
+    const FixedString<64> name = capture_->source_name();
+    const uint8_t gain = capture_->master_gain();
+    const bool muted = capture_->master_muted();
+    kernel::ScopedMutex guard(mutex_);
+    sync_source_locked(name.view(), gain, muted);
+  }
   if (!mixer_) return;
   List<SharedPointer<audio::AudioStream>> live(allocator_);
   if (!mixer_->snapshot_streams(&live)) return;

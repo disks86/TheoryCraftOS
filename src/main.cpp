@@ -2126,8 +2126,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     }
     // The kernel's PipeWire (src/PipeWire): one media graph over the mixer for every kind of program, so that their sound is mixed. The native programs'
     // streams show up in it by themselves; Linux programs reach it at $XDG_RUNTIME_DIR/pipewire-0 (PipeWire's protocol) and $XDG_RUNTIME_DIR/pulse/native
-    // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll and NtTcosAudio. (Gone before the mixer is.)
-    pipewire::Graph media_graph(shared_allocator, mixer.get());
+    // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll, dsound.dll, WASAPI and NtTcosAudio. Recording goes the same ways
+    // through the capture hub: the graph's source is the microphone it shares. (Gone before the mixer and the hub are.)
+    pipewire::Graph media_graph(shared_allocator, mixer.get(), capture_hub.get());
     pipewire::NativeServer pipewire_native(media_graph, shared_allocator);
     pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
     pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);

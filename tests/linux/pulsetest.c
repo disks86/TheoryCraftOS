@@ -18,7 +18,9 @@
 
 /* A Linux program (no C library; x86-64, AArch64 and RISC-V from the same source) that plays through the kernel's PipeWire the way libpulse does: it
  * connects to $XDG_RUNTIME_DIR/pulse/native (/run/user/0/pulse/native) with socket(2)/connect(2), authenticates, names itself, creates a playback
- * stream (16-bit mono, 32 kHz), sends 4 s of a 500 Hz tone as the server's REQUESTs allow, drains it and lists the sink inputs.
+ * stream (16-bit mono, 32 kHz), sends 4 s of a 500 Hz tone as the server's REQUESTs allow, drains it and lists the sink inputs. Then it records: a
+ * record stream (16-bit stereo, 16 kHz) on the default source, half a second of what the emulator's microphone hears (880 Hz on the left at 8000, 1320 Hz on
+ * the right at 4000), checked on each side.
  * Prints "pulsetest: N checks, M failed". Run by tests/pipewire_emulated.sh on the CPU emulator next to a Windows program and a native stream. */
 
 #if defined(__x86_64__)
@@ -147,6 +149,20 @@ static long wait_reply(u32 tag) {
 static const short kSine[64] = {0, 588, 1171, 1742, 2296, 2828, 3333, 3806, 4243, 4638, 4989, 5292, 5543, 5742, 5885, 5971, 6000, 5971, 5885, 5742, 5543, 5292, 4989, 4638, 4243, 3806, 3333, 2828, 2296, 1742, 1171, 588, 0, -588, -1171, -1742, -2296, -2828, -3333, -3806, -4243, -4638, -4989, -5292, -5543, -5742, -5885, -5971, -6000, -5971, -5885, -5742, -5543, -5292, -4989, -4638, -4243, -3806, -3333, -2828, -2296, -1742, -1171, -588};
 static u8 audio[8192];
 
+/* The amplitude of one frequency in `n` samples (every `step`-th short of `p`), by Goertzel: `coefficient` is 2 cos(2 pi f / rate). */
+static float tone_amplitude(const short* p, u32 n, u32 step, float coefficient) {
+  float s1 = 0, s2 = 0;
+  for (u32 i = 0; i < n; ++i) {
+    const float s0 = (float)p[i * step] + coefficient * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  const float power = s1 * s1 + s2 * s2 - coefficient * s1 * s2;
+  /* amplitude = 2 sqrt(power) / n: compared squared, so no square root is needed */
+  return 4.0f * power / ((float)n * (float)n);
+}
+static short recorded[16000];      /* 0.5 s of 16 kHz stereo */
+
 void start_c(long* stack) {
   (void)stack;
   fd = sys3(NR_SOCKET, 1 /* AF_UNIX */, 1 /* SOCK_STREAM */, 0);
@@ -228,6 +244,51 @@ void start_c(long* stack) {
   tag = begin(4);          /* DELETE_PLAYBACK_STREAM */
   t_u32(stream_channel);
   check(send_command() && wait_reply(tag) == 2, "DELETE_PLAYBACK_STREAM");
+
+  /* ---- recording */
+  tag = begin(11);         /* LOOKUP_SOURCE */
+  t_str("@DEFAULT_SOURCE@");
+  check(send_command() && wait_reply(tag) == 2 && rx_len >= 15 && rx[10] == 'L', "LOOKUP_SOURCE @DEFAULT_SOURCE@");
+  const u32 source = rx_len >= 15 ? get_be32(rx + 11) : 0;
+  tag = begin(5);          /* CREATE_RECORD_STREAM: s16le, 2 channels, 16 kHz, 20 ms fragments */
+  tx[tn++] = 'a'; tx[tn++] = 3; tx[tn++] = 2; put_be32(tx + tn, 16000); tn += 4;
+  tx[tn++] = 'm'; tx[tn++] = 2; tx[tn++] = 1; tx[tn++] = 2;
+  t_u32(source); t_str(0); t_u32(0xFFFFFFFFu); t_bool(0); t_u32(1280);
+  for (int i = 0; i < 7; ++i) t_bool(0);
+  t_bool(0); t_bool(0);      /* peak detect, adjust latency */
+  tx[tn++] = 'P'; t_prop("media.name", "microphone"); tx[tn++] = 'N';
+  t_u32(0xFFFFFFFFu);        /* direct on input */
+  t_bool(0);                 /* early requests */
+  t_bool(0); t_bool(0);      /* don't inhibit auto suspend, fail on suspend */
+  t_u8(0);                   /* formats */
+  tx[tn++] = 'v'; tx[tn++] = 2; put_be32(tx + tn, 0x10000); tn += 4; put_be32(tx + tn, 0x10000); tn += 4;
+  t_bool(0); t_bool(0); t_bool(0); t_bool(0); t_bool(0);      /* muted, volume set, muted set, relative volume, passthrough */
+  check(send_command() && wait_reply(tag) == 2, "CREATE_RECORD_STREAM");
+  check(rx_len >= 30 && rx[10] == 'L' && rx[20] == 'L' && rx[25] == 'L', "the record stream's channel, source output and fragment size");
+  const u32 record_channel = get_be32(rx + 11), fragment = get_be32(rx + 26);
+  check(fragment == 1280, "the fragment size asked for");
+  /* half a second, as the server sends it */
+  u32 got = 0, packets = 0;
+  while (got < sizeof recorded && packets < 10000) {
+    if (!read_packet()) break;
+    if (rx_channel != record_channel) continue;
+    ++packets;
+    u32 n = rx_len;
+    if (n > sizeof recorded - got) n = sizeof recorded - got;
+    for (u32 i = 0; i + 1 < n; i += 2) recorded[(got + i) / 2] = (short)(rx[i] | rx[i + 1] << 8);
+    got += n;
+  }
+  check(got == sizeof recorded, "half a second recorded");
+  /* (the second half: the first may hold the resampler's start) */
+  const u32 frames = sizeof recorded / 4 / 2;
+  const float left880 = tone_amplitude(recorded + frames * 2, frames, 2, 1.88176f), left1320 = tone_amplitude(recorded + frames * 2, frames, 2, 1.73726f);
+  const float right1320 = tone_amplitude(recorded + frames * 2 + 1, frames, 2, 1.73726f), right880 = tone_amplitude(recorded + frames * 2 + 1, frames, 2, 1.88176f);
+  check(left880 > 7000.0f * 7000.0f && left880 < 9000.0f * 9000.0f, "the left side heard 880 Hz at 8000");
+  check(right1320 > 3400.0f * 3400.0f && right1320 < 4600.0f * 4600.0f, "the right side heard 1320 Hz at 4000");
+  check(left1320 < 500.0f * 500.0f && right880 < 500.0f * 500.0f, "each side only its own tone");
+  tag = begin(6);          /* DELETE_RECORD_STREAM */
+  t_u32(record_channel);
+  check(send_command() && wait_reply(tag) == 2, "DELETE_RECORD_STREAM");
   sys3(NR_CLOSE, fd, 0, 0);
   out("pulsetest: ");
   out_u((ulong)checks);

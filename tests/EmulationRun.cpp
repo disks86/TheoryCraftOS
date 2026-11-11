@@ -106,6 +106,46 @@ struct RealtimeDevice final : hardware::IAudioDevice {
   bool muted() const override { return mute; }
   hardware::AudioStatistics statistics() override { return {}; }
 };
+
+// A microphone that hears, in real time, 880 Hz on the left at 8000 and 1320 Hz on the right at 4000 (what the recording tests check for).
+struct RealtimeMicrophone final : hardware::IAudioCapture {
+  std::mutex m;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  double owed = 0;        // frames heard and not yet read
+  uint64_t phase = 0;     // frames made so far
+  uint8_t level = hardware::kAudioMaxVolume;
+  bool mute = false;
+  void advance() {
+    const auto t = std::chrono::steady_clock::now();
+    owed += std::chrono::duration<double>(t - last).count() * 48000.0;
+    if (owed > 16384) owed = 16384;      // (the hardware's ring: older audio is gone)
+    last = t;
+  }
+  const char* name() const override { return "Emulated microphone"; }
+  uint32_t read(ByteView out) override {
+    std::lock_guard<std::mutex> g(m);
+    advance();
+    uint32_t frames = uint32_t(out.size() / 4);
+    if (frames > uint32_t(owed)) frames = uint32_t(owed);
+    for (uint32_t i = 0; i < frames; ++i, ++phase) {
+      const double t = double(phase) / 48000.0;
+      const int16_t l = mute ? 0 : int16_t(8000.0 * sin(2 * M_PI * 880.0 * t) * level / hardware::kAudioMaxVolume);
+      const int16_t r = mute ? 0 : int16_t(4000.0 * sin(2 * M_PI * 1320.0 * t) * level / hardware::kAudioMaxVolume);
+      out[4 * i] = uint8_t(l); out[4 * i + 1] = uint8_t(uint16_t(l) >> 8);
+      out[4 * i + 2] = uint8_t(r); out[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    owed -= frames;
+    return frames * 4;
+  }
+  uint32_t available_bytes() override { std::lock_guard<std::mutex> g(m); advance(); return uint32_t(owed) * 4; }
+  void flush() override { std::lock_guard<std::mutex> g(m); advance(); phase += uint64_t(owed); owed = 0; }
+  void set_gain(uint8_t x) override { level = x; }
+  uint8_t gain() const override { return level; }
+  void set_muted(bool x) override { mute = x; }
+  bool muted() const override { return mute; }
+  hardware::AudioCaptureStatistics statistics() override { return {}; }
+};
+
 // The strength of `freq` in samples [from, from + n) of the left channel.
 double tone(const std::vector<int16_t>& s, size_t from, size_t n, double freq) {
   double re = 0, im = 0;
@@ -327,7 +367,10 @@ int main(int argc, char** argv) {
   RealtimeDevice speakers;
   audio::AudioMixer mixer(speakers, a);
   mixer.initialize();
-  pipewire::Graph graph(a, &mixer);
+  RealtimeMicrophone microphone;
+  audio::AudioCaptureHub capture_hub(microphone, a);
+  capture_hub.initialize();
+  pipewire::Graph graph(a, &mixer, &capture_hub);
   graph.initialize();
   pipewire::NativeServer pw_native(graph, a);
   pipewire::PulseServer pw_pulse(graph, a);
@@ -340,6 +383,7 @@ int main(int argc, char** argv) {
   std::thread audio_thread([&] {
     while (!audio_stop) {
       mixer.pump();
+      capture_hub.pump();
       for (int i = 0; i < 4 && pw_sockets.pump(); ++i) {}
       const uint32_t n = graph.playback_count();
       if (n > most_streams) most_streams = n;

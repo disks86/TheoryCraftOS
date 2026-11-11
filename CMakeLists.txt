@@ -220,6 +220,7 @@ add_executable(BOOTX64
   src/PipeWire/Graph.cpp
   src/PipeWire/NativeServer.cpp
   src/PipeWire/PlaybackStream.cpp
+  src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp
   src/PipeWire/PulseServer.cpp
   src/PipeWire/SocketServer.cpp

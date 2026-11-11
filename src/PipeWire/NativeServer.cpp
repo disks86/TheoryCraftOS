@@ -362,8 +362,11 @@ void NativeServer::send_info(Client& c, Resource& r) {
         m = begin(c, r.id, kEvInfo);
         f = b.begin_struct();
         b.int32(static_cast<int32_t>(o.id));
-        b.int32(static_cast<int32_t>(o.role == NodeRole::Sink ? 64 : 0));      // max input ports
-        b.int32(static_cast<int32_t>(o.role == NodeRole::Sink ? 0 : 64));      // max output ports
+        {
+          const bool takes = o.role == NodeRole::Sink || o.role == NodeRole::Capture;      // (input ports; the others have output ports)
+          b.int32(takes ? 64 : 0);      // max input ports
+          b.int32(takes ? 0 : 64);      // max output ports
+        }
         b.int64(0x1f);      // input ports, output ports, state, props, params
         b.int32(static_cast<int32_t>(o.input_ports));
         b.int32(static_cast<int32_t>(o.output_ports));
@@ -505,7 +508,7 @@ void NativeServer::core_method(Client& c, uint32_t opcode, pod::Parser& args) {
         protocol_error(c, 0, kEINVAL, "invalid create_object");
         return;
       }
-      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP, "no such factory (play through the PulseAudio socket)");
+      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP, "no such factory (play and record through the PulseAudio socket)");
       send_remove_id(c, static_cast<uint32_t>(new_id));
       break;
     }

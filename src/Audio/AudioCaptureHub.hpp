@@ -23,6 +23,7 @@
 #include "Hardware/AudioDevice/IAudioDevice.hpp"
 #include "Kernel/Thread.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Utility/FixedString.hpp"
 #include "Utility/SharedPointer.hpp"
 
 namespace audio {
@@ -83,6 +84,8 @@ class AudioCaptureHub {
   void set_source(hardware::IAudioCapture* source, SharedPointer<hardware::IAudioDevice> owner);
   // The source in use (may be null; only good until the next set_source()).
   hardware::IAudioCapture* source();
+  // The source's name, copied (empty when there is none).
+  FixedString<64> source_name();
   // The audio device the source belongs to (null when it was bound by reference or there is none).
   hardware::IAudioDevice* source_device();
 

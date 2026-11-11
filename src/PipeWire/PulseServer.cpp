@@ -45,7 +45,8 @@ enum : uint32_t {
   kSetRecordStreamBufferAttr = 73, kUpdatePlaybackStreamSampleRate = 74, kUpdateRecordStreamSampleRate = 75, kUpdateRecordStreamProplist = 80,
   kUpdatePlaybackStreamProplist = 81, kUpdateClientProplist = 82, kRemoveRecordStreamProplist = 83, kRemovePlaybackStreamProplist = 84,
   kRemoveClientProplist = 85, kStarted = 86, kExtension = 87, kGetCardInfo = 88, kGetCardInfoList = 89, kSetCardProfile = 90, kSetSinkPort = 96,
-  kSetSourcePort = 97, kSetPortLatencyOffset = 98, kEnableSrbchannel = 99, kDisableSrbchannel = 100, kRegisterMemfdShmid = 101, kSendObjectMessage = 102,
+  kSetSourcePort = 97, kSetSourceOutputVolume = 98, kSetSourceOutputMute = 99, kSetPortLatencyOffset = 100, kEnableSrbchannel = 101,
+  kDisableSrbchannel = 102, kRegisterMemfdShmid = 103, kSendObjectMessage = 104,
 };
 
 // pulse/def.h errors
@@ -57,10 +58,13 @@ enum : uint32_t {
 constexpr uint32_t kTagNone = 0xFFFFFFFFu;
 constexpr uint32_t kVersionMask = 0x0000FFFFu;
 constexpr const char* kSinkName = "tcos_output.stereo";
+constexpr const char* kSourceName = "tcos_input.stereo";
 constexpr uint8_t kPositionMono = 0, kPositionLeft = 1, kPositionRight = 2;
 constexpr uint32_t kSinkFlags = 0x1 | 0x2 | 0x4;      // hardware volume, latency, hardware
-constexpr uint32_t kSinkStateRunning = 0, kSinkStateIdle = 1;
+constexpr uint32_t kSinkStateRunning = 0, kSinkStateIdle = 1, kSinkStateSuspended = 2;
 constexpr uint64_t kSinkLatencyUs = 50000;
+constexpr uint64_t kSourceLatencyUs = 10000;
+constexpr uint32_t kMaxFragmentsPerTick = 8;
 
 uint32_t ms_bytes(const SampleSpec& spec, uint32_t ms) {
   const uint64_t frames = uint64_t{spec.rate} * ms / 1000;
@@ -179,9 +183,9 @@ PulseServer::Client* PulseServer::find(uint32_t handle) {
   return nullptr;
 }
 
-PulseServer::Stream* PulseServer::stream(Client& c, uint32_t channel) {
+PulseServer::Stream* PulseServer::stream(Client& c, uint32_t channel, bool record) {
   for (UniquePointer<Stream>& s : c.streams.view())
-    if (s->channel == channel) return s.get();
+    if (s->channel == channel && (s->record.get() != nullptr) == record) return s.get();
   return nullptr;
 }
 
@@ -281,6 +285,9 @@ void PulseServer::send_simple_reply(Client& c, uint32_t tag) { end_command(c, be
 // ---- commands --------------------------------------------------------------------------------------------------------------------------------------
 
 bool PulseServer::is_sink_name(StringView name) const { return name == StringView(kSinkName) || name == StringView("@DEFAULT_SINK@"); }
+bool PulseServer::is_source_name(StringView name) const {
+  return graph_.source_id() && (name == StringView(kSourceName) || name == StringView("@DEFAULT_SOURCE@"));
+}
 
 void PulseServer::command(Client& c, ConstByteView payload) {
   TagReader t(payload);
@@ -293,7 +300,7 @@ void PulseServer::command(Client& c, ConstByteView payload) {
     send_error(c, tag, kErrAccess);
     return;
   }
-  const uint32_t sink = graph_.sink_id();
+  const uint32_t sink = graph_.sink_id(), source = graph_.source_id();
   auto invalid = [&] { send_error(c, tag, kErrProtocol); };
   switch (cmd) {
     case kAuth: {
@@ -465,7 +472,8 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       w.string("theorycraft");
       w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
       w.string(kSinkName);
-      w.string_null();      // (no source)
+      if (source) w.string(kSourceName);
+      else w.string_null();      // (no capture: no source)
       w.u32(0x7c05ae11);
       if (c.version >= 15) w.channel_map(default_map(2));
       end_command(c, m);
@@ -531,11 +539,198 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       end_command(c, m);
       return;
     }
-    case kGetSourceInfoList: case kGetModuleInfoList: case kGetSourceOutputInfoList: case kGetSampleInfoList: case kGetCardInfoList:
+    case kGetSourceInfoList: {
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      if (source) fill_source(c, w);
+      end_command(c, m);
+      return;
+    }
+    case kGetSourceInfo: {
+      uint32_t index = 0;
+      StringView name;
+      bool null_name = true;
+      if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
+      if (!source || !(index == source || (!null_name && is_source_name(name)))) return send_error(c, tag, kErrNoEntity);
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      fill_source(c, w);
+      end_command(c, m);
+      return;
+    }
+    case kLookupSource: {
+      StringView name;
+      if (!t.string(&name)) return invalid();
+      if (!is_source_name(name)) return send_error(c, tag, kErrNoEntity);
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter(c.outbox).u32(source);
+      end_command(c, m);
+      return;
+    }
+    case kGetSourceOutputInfo: {
+      uint32_t index = 0;
+      if (!t.u32(&index)) return invalid();
+      bool found = false;
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      graph_.visit(index, [&](const GraphObject& o) {
+        if (o.type == ObjectType::Node && o.role == NodeRole::Capture) {
+          fill_source_output(c, w, o);
+          found = true;
+        }
+      });
+      if (!found) {
+        c.outbox.truncate(m);
+        return send_error(c, tag, kErrNoEntity);
+      }
+      end_command(c, m);
+      return;
+    }
+    case kGetSourceOutputInfoList: {
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      graph_.for_each([&](const GraphObject& o) {
+        if (o.type == ObjectType::Node && o.role == NodeRole::Capture) fill_source_output(c, w, o);
+      });
+      end_command(c, m);
+      return;
+    }
+    case kGetModuleInfoList: case kGetSampleInfoList: case kGetCardInfoList:
       return send_simple_reply(c, tag);
-    case kGetSourceInfo: case kGetModuleInfo: case kGetSourceOutputInfo: case kGetSampleInfo: case kGetCardInfo: case kLookupSource: case kPlaySample:
-    case kRemoveSample:
+    case kGetModuleInfo: case kGetSampleInfo: case kGetCardInfo: case kPlaySample: case kRemoveSample:
       return send_error(c, tag, kErrNoEntity);
+    case kCreateRecordStream: create_record(c, tag, t); return;
+    case kDeleteRecordStream: {
+      uint32_t channel = 0;
+      if (!t.u32(&channel)) return invalid();
+      if (!stream(c, channel, true)) return send_error(c, tag, kErrNoEntity);
+      delete_stream(c, channel, false);
+      return send_simple_reply(c, tag);
+    }
+    case kCorkRecordStream: {
+      uint32_t channel = 0;
+      bool cork = false;
+      if (!t.u32(&channel) || !t.boolean(&cork)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      s->corked = cork;
+      graph_.set_paused(s->node, cork);
+      return send_simple_reply(c, tag);
+    }
+    case kFlushRecordStream: {
+      uint32_t channel = 0;
+      if (!t.u32(&channel)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      s->record->flush();
+      return send_simple_reply(c, tag);
+    }
+    case kGetRecordLatency: {
+      uint32_t channel = 0, sec = 0, usec = 0;
+      if (!t.u32(&channel) || !t.timeval(&sec, &usec)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      const uint64_t waiting = s->record->available_bytes();
+      const uint64_t frame = s->spec.frame_size();
+      const uint64_t waiting_us = frame && s->spec.rate ? waiting / frame * 1000000 / s->spec.rate : 0;
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      w.usec(0);                                   // monitor latency
+      w.usec(kSourceLatencyUs + waiting_us);       // source latency and what waits to be sent
+      w.boolean(!s->corked && graph_.has_input());
+      w.timeval(sec, usec);
+      w.timeval(sec, usec);
+      w.s64(static_cast<int64_t>(s->write_index + waiting));      // write index: recorded
+      w.s64(static_cast<int64_t>(s->write_index));                // read index: sent
+      end_command(c, m);
+      return;
+    }
+    case kSetRecordStreamBufferAttr: {
+      uint32_t channel = 0, maxlength = 0, fragsize = 0;
+      bool adjust = false, early = false;
+      if (!t.u32(&channel) || !t.u32(&maxlength) || !t.u32(&fragsize)) return invalid();
+      if (c.version >= 13 && !t.boolean(&adjust)) return invalid();
+      if (c.version >= 14 && !t.boolean(&early)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      const uint32_t frame = s->spec.frame_size();
+      if (fragsize != 0xFFFFFFFFu && fragsize) {
+        const uint32_t lo = ms_bytes(s->spec, 5), hi = ms_bytes(s->spec, 250);
+        s->fragsize = round_frames(fragsize < lo ? lo : fragsize > hi ? hi : fragsize, frame);
+      }
+      if (maxlength != 0xFFFFFFFFu && maxlength) s->maxlength = round_frames(maxlength < s->fragsize ? s->fragsize : maxlength, frame);
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      w.u32(s->maxlength);
+      w.u32(s->fragsize);
+      if (c.version >= 13) w.usec(frame && s->spec.rate ? uint64_t{s->fragsize} / frame * 1000000 / s->spec.rate : 0);
+      end_command(c, m);
+      return;
+    }
+    case kUpdateRecordStreamProplist: {
+      uint32_t channel = 0, mode = 0;
+      Properties props(allocator_);
+      if (!t.u32(&channel) || !t.u32(&mode) || !t.proplist(&props)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      if (mode > 2) return send_error(c, tag, kErrInvalid);
+      graph_.update_node(s->node, props, mode == 0 ? Properties::Mode::kReplace : static_cast<Properties::Mode>(mode));
+      return send_simple_reply(c, tag);
+    }
+    case kRemoveRecordStreamProplist: return send_simple_reply(c, tag);
+    case kSetRecordStreamName: {
+      uint32_t channel = 0;
+      StringView name;
+      if (!t.u32(&channel) || !t.string(&name)) return invalid();
+      Stream* s = stream(c, channel, true);
+      if (!s) return send_error(c, tag, kErrNoEntity);
+      Properties props(allocator_);
+      props.set("media.name", name);
+      graph_.update_node(s->node, props, Properties::Mode::kReplace);
+      return send_simple_reply(c, tag);
+    }
+    case kSetSourceVolume: case kSetSourceMute: {
+      uint32_t index = 0;
+      StringView name;
+      bool null_name = true;
+      if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
+      if (!source || !(index == source || (!null_name && is_source_name(name)))) return send_error(c, tag, kErrNoEntity);
+      float volume = 1.0f;
+      bool mute = false;
+      graph_.get_volume(source, &volume, &mute);
+      if (cmd == kSetSourceVolume) {
+        Cvolume v;
+        if (!t.cvolume(&v) || v.channels == 0) return invalid();
+        volume = pulse_volume_to_linear(v.max());
+      } else if (!t.boolean(&mute)) {
+        return invalid();
+      }
+      graph_.set_volume(source, volume, mute);
+      return send_simple_reply(c, tag);
+    }
+    case kSetSourceOutputVolume: case kSetSourceOutputMute: {
+      uint32_t index = 0;
+      if (!t.u32(&index)) return invalid();
+      float volume = 1.0f;
+      bool mute = false;
+      if (!graph_.record_of(index) || !graph_.get_volume(index, &volume, &mute)) return send_error(c, tag, kErrNoEntity);
+      if (cmd == kSetSourceOutputVolume) {
+        Cvolume v;
+        if (!t.cvolume(&v) || v.channels == 0) return invalid();
+        volume = pulse_volume_to_linear(v.max());
+      } else if (!t.boolean(&mute)) {
+        return invalid();
+      }
+      graph_.set_volume(index, volume, mute);
+      return send_simple_reply(c, tag);
+    }
+    case kKillSourceOutput: {
+      uint32_t index = 0;
+      if (!t.u32(&index)) return invalid();
+      if (!graph_.record_of(index)) return send_error(c, tag, kErrNoEntity);
+      graph_.destroy_node(index, false);
+      return send_simple_reply(c, tag);
+    }
     case kSubscribe: {
       uint32_t mask = 0;
       if (!t.u32(&mask)) return invalid();
@@ -567,7 +762,9 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       if (!t.u32(&index)) return invalid();
       float volume = 1.0f;
       bool mute = false;
-      if (index == sink || !graph_.get_volume(index, &volume, &mute)) return send_error(c, tag, kErrNoEntity);
+      bool sink_input = false;      // (a playing stream of any kind; not the sink, the source or a record stream)
+      graph_.visit(index, [&](const GraphObject& o) { sink_input = o.type == ObjectType::Node && o.role == NodeRole::Playback; });
+      if (!sink_input || !graph_.get_volume(index, &volume, &mute)) return send_error(c, tag, kErrNoEntity);
       if (cmd == kSetSinkInputVolume) {
         Cvolume v;
         if (!t.cvolume(&v) || v.channels == 0) return invalid();
@@ -594,8 +791,8 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       return;
     }
     case kExtension: return send_error(c, tag, kErrNoExtension);
-    case kCreateRecordStream: case kCreateUploadStream: case kLoadModule: case kUpdatePlaybackStreamSampleRate: case kMoveSinkInput:
-    case kSetSinkPort: case kSetCardProfile: case kSendObjectMessage:
+    case kCreateUploadStream: case kLoadModule: case kUpdatePlaybackStreamSampleRate: case kUpdateRecordStreamSampleRate: case kMoveSinkInput:
+    case kMoveSourceOutput: case kSetSinkPort: case kSetSourcePort: case kSetCardProfile: case kSendObjectMessage:
       return send_error(c, tag, kErrNotSupported);
     case kExit: case kKillClient: case kUnloadModule: return send_error(c, tag, kErrAccess);
     default: return send_error(c, tag, kErrCommand);
@@ -703,12 +900,133 @@ void PulseServer::create_playback(Client& c, uint32_t tag, TagReader& t) {
   if (!c.streams.push_back(util::move(s))) graph_.destroy_node(node);
 }
 
+void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
+  SampleSpec spec;
+  ChannelMap map;
+  Cvolume volume;
+  uint32_t source_index = 0, maxlength = 0, fragsize = 0, direct_on_input = 0;
+  StringView source_name, legacy_name;
+  bool corked = false, b = false, muted = false, volume_set = false, muted_set = false;
+  Properties props(allocator_);
+  auto invalid = [&] { send_error(c, tag, kErrProtocol); };
+  if (c.version < 13 && !t.string(&legacy_name)) return invalid();
+  if (!t.sample_spec(&spec) || !t.channel_map(&map) || !t.u32(&source_index) || !t.string(&source_name) || !t.u32(&maxlength) || !t.boolean(&corked) ||
+      !t.u32(&fragsize))
+    return invalid();
+  if (c.version >= 12)
+    for (int i = 0; i < 7; ++i)      // no_remap, no_remix, fix_format, fix_rate, fix_channels, no_move, variable_rate
+      if (!t.boolean(&b)) return invalid();
+  if (c.version >= 13 && (!t.boolean(&b) || !t.boolean(&b) || !t.proplist(&props) || !t.u32(&direct_on_input)))
+    return invalid();      // peak_detect, adjust_latency, proplist, direct_on_input
+  if (c.version >= 14 && !t.boolean(&b)) return invalid();      // early_requests
+  if (c.version >= 15 && (!t.boolean(&b) || !t.boolean(&b))) return invalid();      // dont_inhibit_auto_suspend, fail_on_suspend
+  if (c.version >= 22) {
+    uint8_t formats = 0;
+    if (!t.u8(&formats)) return invalid();
+    for (uint8_t i = 0; i < formats; ++i) {
+      uint8_t encoding = 0;
+      Properties fp(allocator_);
+      if (!t.format_info(&encoding, &fp)) return invalid();
+    }
+    if (!t.cvolume(&volume) || !t.boolean(&muted) || !t.boolean(&volume_set) || !t.boolean(&muted_set) || !t.boolean(&b) || !t.boolean(&b))
+      return invalid();      // volume, muted, volume_set, muted_set, relative_volume, passthrough
+  }
+  if (c.version < 13 && !legacy_name.empty()) props.set("media.name", legacy_name);
+  if (!spec.valid()) return send_error(c, tag, kErrInvalid);
+  if (map.channels == 0) map = default_map(spec.channels);
+  if (map.channels != spec.channels) return send_error(c, tag, kErrInvalid);
+  const uint32_t source = graph_.source_id();
+  if (!source) return send_error(c, tag, kErrNoEntity);
+  if (source_index != pulse::kInvalidIndex && source_index != source) return send_error(c, tag, kErrNoEntity);
+  if (!source_name.empty() && !is_source_name(source_name)) return send_error(c, tag, kErrNoEntity);
+  if (direct_on_input != pulse::kInvalidIndex && direct_on_input != 0) return send_error(c, tag, kErrNotSupported);      // (recording one stream's output)
+  PcmFormat format;
+  if (!to_pcm_format(spec, &format)) return send_error(c, tag, kErrNotSupported);
+  if (c.streams.count() >= kMaxStreamsPerClient) return send_error(c, tag, kErrTooLarge);
+
+  props.update(c.props, Properties::Mode::kMerge);
+  props.set("client.api", "pipewire-pulse");
+  SharedPointer<RecordStream> record;
+  const uint32_t node = graph_.create_record(c.graph_client, format, props, &record);
+  if (!node) return send_error(c, tag, kErrTooLarge);
+  UniquePointer<Stream> s = UniquePointer<Stream>::make(allocator_, allocator_);
+  if (!s) {
+    graph_.destroy_node(node);
+    return send_error(c, tag, kErrTooLarge);
+  }
+  const uint32_t frame = spec.frame_size();
+  s->channel = c.next_channel++;
+  s->node = node;
+  s->record = record;
+  s->spec = spec;
+  s->map = map;
+  const uint32_t lo = ms_bytes(spec, 5), hi = ms_bytes(spec, 250);
+  s->fragsize = round_frames(fragsize == 0xFFFFFFFFu || fragsize == 0 ? ms_bytes(spec, 50) : (fragsize < lo ? lo : fragsize > hi ? hi : fragsize), frame);
+  const uint32_t ring = ms_bytes(spec, 500);
+  s->maxlength = round_frames(maxlength == 0xFFFFFFFFu || maxlength < s->fragsize ? (ring > s->fragsize ? ring : s->fragsize) : maxlength, frame);
+  s->corked = corked;
+  if (corked) graph_.set_paused(node, true);
+  float linear = 1.0f;
+  bool mute_now = false;
+  graph_.get_volume(node, &linear, &mute_now);
+  if (c.version >= 22 && volume_set && volume.channels > 0) linear = pulse_volume_to_linear(volume.max());
+  if (c.version >= 22 && muted_set) mute_now = muted;
+  graph_.set_volume(node, linear, mute_now);
+
+  const uint64_t m = begin_command(c, kReply, tag);
+  TagWriter w(c.outbox);
+  w.u32(s->channel);
+  w.u32(node);
+  if (c.version >= 9) {
+    w.u32(s->maxlength);
+    w.u32(s->fragsize);
+  }
+  if (c.version >= 12) {
+    w.sample_spec(spec);
+    w.channel_map(map);
+    w.u32(source);
+    w.string(kSourceName);
+    w.boolean(false);
+  }
+  if (c.version >= 13) w.usec(kSourceLatencyUs);
+  if (c.version >= 22) {
+    Properties none(allocator_);
+    w.format_info(1, none);      // PCM
+  }
+  end_command(c, m);
+  if (!c.streams.push_back(util::move(s))) graph_.destroy_node(node);
+}
+
+void PulseServer::send_recorded(Client& c, Stream& s) {
+  if (s.corked || !s.record) return;
+  const uint64_t frame = s.spec.frame_size();
+  for (uint32_t n = 0; n < kMaxFragmentsPerTick; ++n) {
+    // a client that does not read gets no more: the microphone's ring drops the oldest audio instead of the outbox growing
+    if (c.outbox.size() > kMaxOutbox / 2) return;
+    if (s.record->available_bytes() < s.fragsize) return;
+    const uint64_t start = c.outbox.size();
+    if (!c.outbox.put_zeros(kDescriptorSize + uint64_t{s.fragsize})) return;
+    ByteView all = c.outbox.writable_view();
+    const uint32_t got = s.record->read(all.subview(start + kDescriptorSize, s.fragsize));
+    const uint32_t whole = frame ? static_cast<uint32_t>(got - got % frame) : got;
+    if (whole == 0) {
+      c.outbox.truncate(start);
+      return;
+    }
+    c.outbox.truncate(start + kDescriptorSize + whole);
+    ByteView d = c.outbox.writable_view();
+    put_be32(d, start, whole);
+    put_be32(d, start + 4, s.channel);      // (offset 0, flags 0: PA_SEEK_RELATIVE)
+    s.write_index += whole;
+  }
+}
+
 void PulseServer::delete_stream(Client& c, uint32_t channel, bool killed) {
   for (uint64_t i = 0; i < c.streams.count(); ++i) {
     Stream& s = *c.streams[i];
     if (s.channel != channel) continue;
     if (killed) {
-      const uint64_t m = begin_command(c, kPlaybackStreamKilled, kTagNone);
+      const uint64_t m = begin_command(c, s.record ? kRecordStreamKilled : kPlaybackStreamKilled, kTagNone);
       TagWriter(c.outbox).u32(channel);
       end_command(c, m);
     } else {
@@ -851,6 +1169,68 @@ void PulseServer::fill_sink_input(Client& c, TagWriter& w, const GraphObject& o)
   }
 }
 
+void PulseServer::fill_source(Client& c, TagWriter& w) {
+  graph_.visit(graph_.source_id(), [&](const GraphObject& o) {
+    w.u32(o.id);
+    w.string(kSourceName);
+    w.string(o.props.get("node.description"));
+    w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
+    w.channel_map(default_map(2));
+    w.u32(pulse::kInvalidIndex);      // module
+    w.cvolume(flat_volume(2, linear_to_pulse_volume(o.volume)));
+    w.boolean(o.mute);
+    w.u32(pulse::kInvalidIndex);      // monitor of sink: none, it is a microphone
+    w.string_null();
+    w.usec(kSourceLatencyUs);
+    w.string("tcos-capture");
+    w.u32(kSinkFlags);                // (the same flags: hardware volume, latency, hardware)
+    if (c.version >= 13) {
+      w.proplist(o.props);
+      w.usec(kSourceLatencyUs);
+    }
+    if (c.version >= 15) {
+      w.volume(pulse::kVolumeNorm);
+      w.u32(o.state == kNodeStateRunning ? kSinkStateRunning : o.state == kNodeStateSuspended ? kSinkStateSuspended : kSinkStateIdle);
+      w.u32(pulse::kVolumeNorm + 1);
+      w.u32(pulse::kInvalidIndex);
+    }
+    if (c.version >= 16) {
+      w.u32(0);
+      w.string_null();
+    }
+    if (c.version >= 22) {
+      w.u8(1);
+      Properties none(allocator_);
+      w.format_info(1, none);
+    }
+  });
+}
+
+void PulseServer::fill_source_output(Client& c, TagWriter& w, const GraphObject& o) {
+  const SampleSpec spec = to_spec(o.format);
+  w.u32(o.id);
+  w.string(o.props.get("media.name"));
+  w.u32(pulse::kInvalidIndex);      // module
+  w.u32(o.client ? o.client : pulse::kInvalidIndex);
+  w.u32(graph_.source_id());
+  w.sample_spec(spec);
+  w.channel_map(default_map(spec.channels));
+  w.usec(kSourceLatencyUs);
+  w.usec(kSourceLatencyUs);
+  w.string("speex-float-1");
+  w.string(o.origin == Origin::Windows ? "tcos-winmm" : o.origin == Origin::Native ? "tcos-native" : "protocol-pulse");
+  if (c.version >= 13) w.proplist(o.props);
+  if (c.version >= 19) w.boolean(o.state != kNodeStateRunning);
+  if (c.version >= 22) {
+    w.cvolume(flat_volume(spec.channels, linear_to_pulse_volume(o.volume)));
+    w.boolean(o.mute);
+    w.boolean(true);      // has volume
+    w.boolean(true);      // volume writable
+    Properties none(allocator_);
+    w.format_info(1, none);
+  }
+}
+
 void PulseServer::fill_client(Client& c, TagWriter& w, const GraphObject& o) {
   w.u32(o.id);
   w.string(o.props.get("application.name"));
@@ -861,11 +1241,14 @@ void PulseServer::fill_client(Client& c, TagWriter& w, const GraphObject& o) {
 
 void PulseServer::send_subscription_events(Client& c) {
   // facility (pulse/def.h: sink 0, sink input 2, client 5) and the masks that enable them
-  constexpr uint32_t kSink = 0, kSinkInput = 2, kClientFacility = 5, kNew = 0x00, kChange = 0x10, kRemove = 0x20;
-  const uint32_t sink = graph_.sink_id();
+  constexpr uint32_t kSink = 0, kSource = 1, kSinkInput = 2, kSourceOutput = 3, kClientFacility = 5, kNew = 0x00, kChange = 0x10, kRemove = 0x20;
   auto facility_of = [&](const GraphEntry& e, uint32_t* out) {
     if (e.type == ObjectType::Client) *out = kClientFacility;
-    else if (e.type == ObjectType::Node) *out = e.id == sink ? kSink : kSinkInput;
+    else if (e.type != ObjectType::Node) return false;
+    else if (e.role == NodeRole::Sink) *out = kSink;
+    else if (e.role == NodeRole::Source) *out = kSource;
+    else if (e.role == NodeRole::Playback) *out = kSinkInput;
+    else if (e.role == NodeRole::Capture) *out = kSourceOutput;
     else return false;
     return (c.subscriptions & (1u << *out)) != 0;
   };
@@ -909,9 +1292,12 @@ void PulseServer::tick() {
     // streams whose node is gone (killed from another client, pactl kill-sink-input)
     for (uint64_t i = c.streams.count(); i > 0; --i) {
       Stream& s = *c.streams[i - 1];
-      if (!graph_.playback_of(s.node)) delete_stream(c, s.channel, true);
+      if (s.record ? !graph_.record_of(s.node) : !graph_.playback_of(s.node)) delete_stream(c, s.channel, true);
     }
-    for (UniquePointer<Stream>& s : c.streams.view()) flow(c, *s);
+    for (UniquePointer<Stream>& s : c.streams.view()) {
+      if (s->record) send_recorded(c, *s);
+      else flow(c, *s);
+    }
     if (changed && c.subscriptions) send_subscription_events(c);
     if (c.outbox.size() > kMaxOutbox) c.closing = true;
   }

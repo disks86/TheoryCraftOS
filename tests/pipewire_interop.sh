@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # The kernel's PipeWire (src/PipeWire) against the real PipeWire and PulseAudio client libraries: tests/pipewire/PipeWireHostServer.cpp serves the graph,
 # the native protocol and the PulseAudio protocol on the host's AF_UNIX sockets, then the host's own pw-dump, pw-cli, wpctl, pactl and paplay are pointed
-# at them (PIPEWIRE_REMOTE, PULSE_SERVER). Two paplay runs play at once; the server's mixed output must hold both tones at the right levels.
+# at them (PIPEWIRE_REMOTE, PULSE_SERVER). Two paplay runs play at once; the server's mixed output must hold both tones at the right levels. The server's
+# microphone hears 880 Hz on the left and 1320 Hz on the right: parecord (and pw-dump, pactl's source commands) must find the source and record both.
 # Usage: tests/pipewire_interop.sh     (needs pipewire's and pulseaudio's client tools and python3; skipped without them)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for tool in pw-dump pw-cli pactl paplay python3; do
+for tool in pw-dump pw-cli pactl paplay parecord python3; do
   command -v "$tool" >/dev/null || { echo "skipped (no $tool)"; exit 0; }
 done
 work=${TMPDIR:-/tmp}/tcos-pwinterop
@@ -13,8 +14,8 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/Pod.cpp
-         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Kernel/Sync.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
 g++ -fsanitize=address,undefined -pthread "$work"/obj/*.o -o "$work/pwhost"
@@ -41,8 +42,15 @@ sink = [o for o in d if o['type'] == 'PipeWire:Interface:Node' and o['info']['pr
 ports = [o for o in d if o['type'] == 'PipeWire:Interface:Port']
 assert sink['info']['params']['Props'][0]['channelVolumes'] == [1.0, 1.0]
 assert sink['info']['params']['EnumFormat'][0]['format'] == 'S16LE'
-assert len(ports) == 2 and all(p['info']['params']['Format'] for p in ports)
+sink_ports = [p for p in ports if p['info']['props'].get('node.id') == sink['id']]
+assert len(sink_ports) == 2 and len(ports) == 4 and all(p['info']['params']['Format'] for p in ports)      # (and the source's two)
 assert any(o['type'] == 'PipeWire:Interface:Metadata' and o['metadata'][0]['key'] == 'default.audio.sink' for o in d)
+\""
+check "pw-dump shows the source" "python3 -c \"
+import json; d = json.load(open('$work/dump.json'))
+src = [o for o in d if o['type'] == 'PipeWire:Interface:Node' and o['info']['props'].get('media.class') == 'Audio/Source'][0]
+assert src['info']['props']['node.name'] == 'tcos_input.stereo' and src['info']['n-output-ports'] == 2
+assert any(o['type'] == 'PipeWire:Interface:Metadata' and any(m['key'] == 'default.audio.source' for m in o['metadata']) for o in d)
 \""
 check "pw-dump reports no protocol error" "! grep -q 'invalid message' '$work/dump.err'"
 check "pw-cli lists the sink" "timeout 5 pw-cli ls Node | grep -q 'node.name = \"tcos_output.stereo\"'"
@@ -52,6 +60,32 @@ check "pactl list sinks" "timeout 5 pactl list sinks | grep -q 'Name: tcos_outpu
 check "pactl set-sink-volume" "timeout 5 pactl set-sink-volume @DEFAULT_SINK@ 50% && timeout 5 pactl get-sink-volume @DEFAULT_SINK@ | grep -q ' 50%'"
 check "pactl set-sink-mute" "timeout 5 pactl set-sink-mute @DEFAULT_SINK@ 1 && timeout 5 pactl get-sink-mute @DEFAULT_SINK@ | grep -q yes && timeout 5 pactl set-sink-mute @DEFAULT_SINK@ 0"
 timeout 5 pactl set-sink-volume @DEFAULT_SINK@ 100%
+check "pactl info names the default source" "timeout 5 pactl info | grep -q 'Default Source: tcos_input.stereo'"
+check "pactl list sources" "timeout 5 pactl list sources | grep -q 'Description: Host test microphone'"
+check "pactl set-source-volume and mute" "timeout 5 pactl set-source-volume @DEFAULT_SOURCE@ 50% && timeout 5 pactl get-source-volume @DEFAULT_SOURCE@ | grep -q ' 50%' && timeout 5 pactl set-source-mute @DEFAULT_SOURCE@ 1 && timeout 5 pactl get-source-mute @DEFAULT_SOURCE@ | grep -q yes && timeout 5 pactl set-source-mute @DEFAULT_SOURCE@ 0 && timeout 5 pactl set-source-volume @DEFAULT_SOURCE@ 100%"
+# recording: parecord for about a second (raw 16-bit stereo at 44.1 kHz), and the source outputs while it records
+(sleep 0.5; timeout 5 pactl list source-outputs > "$work/outputs.txt" 2>&1 || true) & lister=$!
+timeout 1.2 parecord --raw --format=s16le --rate=44100 --channels=2 "$work/recorded.raw" || true
+wait $lister || true      # (not a bare wait: the server is a background job too)
+# a second recording whose volume another client changes (SET_SOURCE_OUTPUT_VOLUME)
+(sleep 0.5; index=$(timeout 5 pactl list short source-outputs | cut -f1 | head -1)
+ timeout 5 pactl set-source-output-volume "$index" 50% && timeout 5 pactl list source-outputs > "$work/outputs-volume.txt" 2>&1 || true) & lister=$!
+timeout 1.5 parecord --raw "$work/recorded-2.raw" || true
+wait $lister || true
+check "pactl list source-outputs saw parecord" "grep -q 'application.name = \"parecord\"' '$work/outputs.txt'"
+check "pactl set-source-output-volume" "grep -q 'Volume:.* 50%' '$work/outputs-volume.txt'"
+check "parecord recorded both sides of the microphone" "python3 - '$work/recorded.raw' <<'PY'
+import cmath, math, struct, sys
+data = open(sys.argv[1], 'rb').read(); n = len(data) // 4
+assert n > 22050, n
+s = struct.unpack('<%dh' % (2 * n), data[:4 * n])
+seg = 11025      # 0.25 s: 220 and 330 whole periods
+left, right = s[2 * (n - seg)::2], s[2 * (n - seg) + 1::2]
+mag = lambda x, f: 2 * abs(sum(v * cmath.exp(-2j * math.pi * f * k / 44100) for k, v in enumerate(x))) / len(x)
+l880, l1320, r880, r1320 = mag(left, 880), mag(left, 1320), mag(right, 880), mag(right, 1320)
+print('   left 880 Hz %.0f, 1320 Hz %.0f; right 880 Hz %.0f, 1320 Hz %.0f' % (l880, l1320, r880, r1320))
+assert 7200 < l880 < 8800 and 3600 < r1320 < 4400 and l1320 < 300 and r880 < 300
+PY"
 (timeout 4 pactl subscribe > "$work/subscribe.txt" 2>&1 || true) &
 (sleep 0.7; timeout 5 pactl list sink-inputs > "$work/inputs.txt" 2>&1 || true) &
 sleep 0.3

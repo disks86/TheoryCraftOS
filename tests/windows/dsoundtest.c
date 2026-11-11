@@ -71,9 +71,10 @@ static void directsound_start(void) {
   CHECK(DirectSoundEnumerateA(on_device, NULL) == DS_OK && enumerated == 2);
   GUID id;
   CHECK(GetDeviceID(&DSDEVID_DefaultPlayback, &id) == DS_OK && !IsEqualGUID(&id, &GUID_NULL));
-  CHECK(GetDeviceID(&DSDEVID_DefaultCapture, &id) == DSERR_NODRIVER);
-  IDirectSoundCapture *capture = (IDirectSoundCapture *)1;
-  CHECK(DirectSoundCaptureCreate(NULL, &capture, NULL) == DSERR_NODRIVER && capture == NULL);
+  /* (the emulator has a microphone: capture is recordtest.c's) */
+  CHECK(GetDeviceID(&DSDEVID_DefaultCapture, &id) == DS_OK && !IsEqualGUID(&id, &GUID_NULL));
+  GUID render_id;
+  CHECK(GetDeviceID(&DSDEVID_DefaultPlayback, &render_id) == DS_OK && !IsEqualGUID(&id, &render_id));
 
   CHECK(DirectSoundCreate8(NULL, &g_ds, NULL) == DS_OK && g_ds);
   if (!g_ds) return;
@@ -284,10 +285,11 @@ static void wasapi(void) {
   UINT count = 9;
   CHECK(IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &col) == S_OK && IMMDeviceCollection_GetCount(col, &count) == S_OK && count == 1);
   if (col) IMMDeviceCollection_Release(col);
-  CHECK(IMMDeviceEnumerator_EnumAudioEndpoints(en, eCapture, DEVICE_STATE_ACTIVE, &col) == S_OK && IMMDeviceCollection_GetCount(col, &count) == S_OK && count == 0);
+  CHECK(IMMDeviceEnumerator_EnumAudioEndpoints(en, eCapture, DEVICE_STATE_ACTIVE, &col) == S_OK && IMMDeviceCollection_GetCount(col, &count) == S_OK && count == 1);
+  if (col) IMMDeviceCollection_Release(col);
+  CHECK(IMMDeviceEnumerator_EnumAudioEndpoints(en, eAll, DEVICE_STATE_ACTIVE, &col) == S_OK && IMMDeviceCollection_GetCount(col, &count) == S_OK && count == 2);
   if (col) IMMDeviceCollection_Release(col);
   IMMDevice *dev = NULL;
-  CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eCapture, eConsole, &dev) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && dev == NULL);
   CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev) == S_OK && dev);
   if (!dev) return;
   LPWSTR id = NULL;

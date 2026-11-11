@@ -17,13 +17,14 @@
  */
 
 // Host tests for the kernel's PipeWire (src/PipeWire): the SPA POD and PulseAudio tagstruct codecs (round trips, every truncation, bit flips), the PCM
-// conversion, the graph over a real AudioMixer and a fake device (native, Linux and Windows streams mixed into one output), the native protocol and the
+// conversion both ways, recording (a fake microphone through the capture hub to record streams, PulseAudio and Windows), the graph over a real AudioMixer and a fake device (native, Linux and Windows streams mixed into one output), the native protocol and the
 // PulseAudio protocol driven as their clients drive them (and fed garbage), the Windows service, the AF_UNIX transport, and several threads at once.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <mutex>
 #include <random>
@@ -35,6 +36,7 @@
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
+#include "PipeWire/RecordStream.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "PipeWire/Tagstruct.hpp"
 #include "Audio/Pan.hpp"
@@ -996,6 +998,508 @@ static void test_pulse_protocol() {
   CHECK(server.client_count() == 0 && g.playback_count() == 0);
 }
 
+// ---- recording -----------------------------------------------------------------------------------------------------------------------------------
+
+// A microphone that hands out what the test puts in (48 kHz 16-bit stereo, like the hardware).
+struct FakeMicrophone final : hardware::IAudioCapture {
+  std::mutex m;
+  std::vector<uint8_t> pending;
+  uint8_t level = hardware::kAudioMaxVolume;
+  bool mute = false;
+  const char* name() const override { return "Fake microphone"; }
+  void add(uint32_t frames, int16_t left, int16_t right) {
+    std::lock_guard<std::mutex> g(m);
+    for (uint32_t i = 0; i < frames; ++i) {
+      const int16_t v[2] = {left, right};
+      for (int16_t x : v) { pending.push_back(uint8_t(x)); pending.push_back(uint8_t(uint16_t(x) >> 8)); }
+    }
+  }
+  uint32_t read(ByteView out) override {
+    std::lock_guard<std::mutex> g(m);
+    uint32_t n = out.size() < pending.size() ? uint32_t(out.size()) : uint32_t(pending.size());
+    n -= n % kAudioFrameSize;
+    if (n) memcpy(out.data(), pending.data(), n);
+    pending.erase(pending.begin(), pending.begin() + n);
+    return n;
+  }
+  uint32_t available_bytes() override { std::lock_guard<std::mutex> g(m); return uint32_t(pending.size()); }
+  void flush() override { std::lock_guard<std::mutex> g(m); pending.clear(); }
+  void set_gain(uint8_t g) override { level = g; }
+  uint8_t gain() const override { return level; }
+  void set_muted(bool v) override { mute = v; }
+  bool muted() const override { return mute; }
+  hardware::AudioCaptureStatistics statistics() override { return {}; }
+};
+
+static int16_t s16_at(const std::vector<uint8_t>& b, size_t sample) { return int16_t(b[2 * sample] | b[2 * sample + 1] << 8); }
+
+static void test_record_convert() {
+  // 16-bit stereo into every format, and back through the playback side's decoder: the same values (G.711 within its step)
+  static constexpr SampleFormat kAll[] = {SampleFormat::U8, SampleFormat::S16Le, SampleFormat::S16Be, SampleFormat::S24Le, SampleFormat::S24Be,
+                                          SampleFormat::S24_32Le, SampleFormat::S32Le, SampleFormat::S32Be, SampleFormat::F32Le, SampleFormat::F32Be,
+                                          SampleFormat::F64Le, SampleFormat::Alaw, SampleFormat::Ulaw};
+  static constexpr int16_t kValues[] = {0, 1, -1, 100, -100, 1000, -1000, 12345, -12345, 32767, -32768, 255, -256};
+  for (SampleFormat f : kAll) {
+    const PcmFormat format{f, 48000, 2};
+    std::vector<uint8_t> in;
+    for (int16_t v : kValues) for (int16_t x : {v, int16_t(-v / 2)}) { in.push_back(uint8_t(x)); in.push_back(uint8_t(uint16_t(x) >> 8)); }
+    const uint32_t frames = uint32_t(in.size() / 4);
+    std::vector<uint8_t> mid(frames * format.frame_size()), back(frames * 4);
+    uint32_t used = 0;
+    CHECK(convert_from_s16(ConstByteView(in.data(), in.size()), 2, format, nullptr, ByteView(mid.data(), mid.size()), &used) == mid.size() && used == in.size());
+    CHECK(convert_to_s16(format, nullptr, ConstByteView(mid.data(), mid.size()), ByteView(back.data(), back.size()), 2, &used) == back.size());
+    int worst = 0;
+    for (size_t i = 0; i < in.size() / 2; ++i) {
+      const int a = s16_at(in, i), b = s16_at(back, i);
+      const int tolerance = f == SampleFormat::U8 ? 256 : (f == SampleFormat::Alaw || f == SampleFormat::Ulaw) ? (abs(a) / 16 + 16) : 1;
+      if (abs(a - b) > tolerance) worst = abs(a - b) > worst ? abs(a - b) : worst;
+    }
+    if (worst) printf("  format %s: off by %d\n", format.name(), worst);
+    CHECK(worst == 0);
+  }
+  // six channels from stereo: each takes its side, the centre both, LFE nothing; mono gets the average
+  std::vector<uint8_t> lr = {0xE8, 0x03, 0x18, 0xFC};      // left 1000, right -1000... and a second frame below
+  lr.insert(lr.end(), {0xD0, 0x07, 0x00, 0x00});          // left 2000, right 0
+  std::vector<uint8_t> six(2 * 6 * 2);
+  uint32_t used = 0;
+  CHECK(convert_from_s16(ConstByteView(lr.data(), lr.size()), 2, PcmFormat{SampleFormat::S16Le, 48000, 6}, nullptr, ByteView(six.data(), six.size()), &used) == six.size());
+  // FL FR FC LFE RL RR
+  CHECK(s16_at(six, 0) == 1000 && s16_at(six, 1) == -1000 && s16_at(six, 2) == 0 && s16_at(six, 3) == 0 && s16_at(six, 4) == 1000 && s16_at(six, 5) == -1000);
+  CHECK(s16_at(six, 6) == 2000 && s16_at(six, 7) == 0 && s16_at(six, 8) == 1000 && s16_at(six, 9) == 0 && s16_at(six, 10) == 2000);
+  std::vector<uint8_t> mono(4);
+  CHECK(convert_from_s16(ConstByteView(lr.data(), lr.size()), 2, PcmFormat{SampleFormat::S16Le, 48000, 1}, nullptr, ByteView(mono.data(), mono.size()), &used) == 4);
+  CHECK(s16_at(mono, 0) == 0 && s16_at(mono, 1) == 1000);
+  // mono input into stereo: both sides
+  std::vector<uint8_t> st(8);
+  CHECK(convert_from_s16(ConstByteView(lr.data(), 4), 1, PcmFormat{SampleFormat::S16Le, 48000, 2}, nullptr, ByteView(st.data(), st.size()), &used) == 8 && used == 4);
+  CHECK(s16_at(st, 0) == 1000 && s16_at(st, 1) == 1000 && s16_at(st, 2) == -1000 && s16_at(st, 3) == -1000);
+  // truncation: partial frames are left, a target too small takes what fits, bad arguments do nothing
+  for (size_t cut = 0; cut <= lr.size(); ++cut) {
+    std::vector<uint8_t> out(24, 0xAA);
+    const uint32_t made = convert_from_s16(ConstByteView(lr.data(), cut), 2, PcmFormat{SampleFormat::F32Le, 48000, 3}, nullptr, ByteView(out.data(), out.size()), &used);
+    CHECK(used == cut / 4 * 4 && made == cut / 4 * 12);
+    for (size_t room = 0; room < 24; ++room) {
+      std::vector<uint8_t> small(room ? room : 1, 0xAA);
+      const uint32_t m2 = convert_from_s16(ConstByteView(lr.data(), cut), 2, PcmFormat{SampleFormat::F32Le, 48000, 3}, nullptr, ByteView(small.data(), room), &used);
+      CHECK(m2 <= room && m2 % 12 == 0 && used == m2 / 12 * 4);
+    }
+  }
+  CHECK(convert_from_s16(ConstByteView(lr.data(), lr.size()), 3, PcmFormat{}, nullptr, ByteView(six.data(), six.size()), &used) == 0 && used == 0);
+  CHECK(convert_from_s16(ConstByteView(lr.data(), lr.size()), 2, PcmFormat{SampleFormat::S16Le, 10, 2}, nullptr, ByteView(six.data(), six.size()), &used) == 0);
+}
+
+static void put_create_record(pulse::TagWriter& w, const pulse::SampleSpec& spec, uint32_t fragsize, const char* name, bool corked = false) {
+  pulse::ChannelMap map; map.channels = spec.channels;
+  for (uint8_t i = 0; i < spec.channels; ++i) map.positions[i] = uint8_t(spec.channels == 1 ? 0 : 1 + i);
+  pulse::Cvolume vol; vol.channels = spec.channels;
+  for (uint8_t i = 0; i < spec.channels; ++i) vol.values[i] = pulse::kVolumeNorm;
+  w.sample_spec(spec); w.channel_map(map); w.u32(0xFFFFFFFFu); w.string(static_cast<const char*>(nullptr)); w.u32(0xFFFFFFFFu); w.boolean(corked);
+  w.u32(fragsize);
+  for (int i = 0; i < 7; ++i) w.boolean(false);
+  Properties props(A);
+  props.set("media.name", name);
+  w.boolean(false); w.boolean(false); w.proplist(props); w.u32(0xFFFFFFFFu);      // peak detect, adjust latency, proplist, direct on input
+  w.boolean(false);                                                             // early requests
+  w.boolean(false); w.boolean(false);                                           // don't inhibit, fail on suspend
+  w.u8(0);                                                                      // formats
+  w.cvolume(vol); w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false);      // volume, muted, volume set, muted set, relative, passthrough
+}
+
+static void test_record() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  CHECK(g.source_id() != 0 && g.has_input());
+  // the source: an Audio/Source node with two output ports, the default source
+  bool source_ok = false, metadata_ok = false;
+  g.visit(g.source_id(), [&](const GraphObject& o) {
+    source_ok = o.role == NodeRole::Source && o.output_ports == 2 && o.props.get("media.class") == StringView("Audio/Source") && o.props.get("node.name") == StringView("tcos_input.stereo");
+  });
+  g.visit(g.metadata_id(), [&](const GraphObject& o) { metadata_ok = o.props.get("default.audio.source").find("tcos_input.stereo") != StringView::npos; });
+  CHECK(source_ok && metadata_ok);
+  g.refresh();
+  g.visit(g.source_id(), [&](const GraphObject& o) { source_ok = o.props.get("node.description") == StringView("Fake microphone") && o.state == kNodeStateIdle; });
+  CHECK(source_ok);
+  // without a hub there is no source, and no record stream can be made
+  {
+    Graph none(A, &mixer);
+    CHECK(none.initialize() && none.source_id() == 0 && !none.has_input());
+    const uint32_t client = none.add_client(Origin::Linux, 1, "protocol-pulse", "");
+    SharedPointer<RecordStream> r;
+    CHECK(none.create_record(client, PcmFormat{}, Properties(A), &r) == 0 && !r);
+  }
+
+  // a record stream: F32 mono at 16 kHz, linked from both sides of the source
+  const uint32_t client = g.add_client(Origin::Linux, 77, "protocol-pulse", "pipewire-pulse");
+  SharedPointer<RecordStream> rec;
+  Properties props(A);
+  props.set("application.name", "parecord");
+  const uint32_t node = g.create_record(client, PcmFormat{SampleFormat::F32Le, 16000, 1}, props, &rec);
+  CHECK(node && rec && g.record_of(node) == rec && !g.playback_of(node) && g.record_count() == 1 && g.playback_count() == 0);
+  uint32_t links = 0, ports = 0;
+  g.for_each([&](const GraphObject& o) {
+    if (o.type == ObjectType::Link && o.input_node == node && o.output_node == g.source_id()) ++links;
+    if (o.type == ObjectType::Port && o.node == node && o.direction == kDirectionInput) ++ports;
+  });
+  bool node_ok = false;
+  g.visit(node, [&](const GraphObject& o) { node_ok = o.role == NodeRole::Capture && o.props.get("media.class") == StringView("Stream/Input/Audio") && o.input_ports == 1; });
+  CHECK(links == 2 && ports == 1 && node_ok);
+  // 100 ms at 48 kHz, left 8000 and right 4000: mono at 16 kHz is 1600 frames of their average (6000)
+  mic.add(4800, 8000, 4000);
+  hub.pump();
+  CHECK(rec->available_bytes() >= 1500 * 4 && rec->available_bytes() <= 1700 * 4);
+  std::vector<uint8_t> got(16000 * 4);
+  uint32_t n = rec->read(ByteView(got.data(), got.size()));
+  CHECK(n % 4 == 0 && n >= 1500 * 4 && rec->read_bytes() == n && rec->available_bytes() == 0);
+  float mid = 0;
+  memcpy(&mid, got.data() + 800 * 4, 4);
+  CHECK(fabsf(mid * 32768.0f - 6000.0f) < 20.0f);
+  // a stream's volume and mute are its gain; the source's are the hub's master gain, which the microphone gets
+  CHECK(g.set_volume(node, 0.5f, false));
+  mic.add(4800, 8000, 4000);
+  hub.pump();
+  n = rec->read(ByteView(got.data(), got.size()));
+  memcpy(&mid, got.data() + 800 * 4, 4);
+  CHECK(n > 0 && fabsf(mid * 32768.0f - 3000.0f) < 60.0f);
+  float volume = 0; bool muted = true;
+  CHECK(g.set_volume(node, 1.4f, false) && g.get_volume(node, &volume, &muted) && volume == 1.0f && !muted);      // (no gain above 1)
+  CHECK(g.set_volume(g.source_id(), 0.25f, true) && mic.level == uint8_t(0.25f * hardware::kAudioMaxVolume + 0.5f) && mic.mute && hub.master_muted());
+  CHECK(g.set_volume(g.source_id(), 1.0f, false) && mic.level == hardware::kAudioMaxVolume && !mic.mute);
+  // paused: hears nothing, and what came meanwhile is not handed out after
+  CHECK(g.set_paused(node, true) && rec->paused());
+  mic.add(4800, 1000, 1000);
+  hub.pump();
+  CHECK(rec->available_bytes() == 0 && rec->read(ByteView(got.data(), got.size())) == 0);
+  g.refresh();
+  bool idle = false;
+  g.visit(node, [&](const GraphObject& o) { idle = o.state == kNodeStateIdle; });
+  CHECK(idle);
+  CHECK(g.set_paused(node, false) && !rec->paused() && rec->available_bytes() == 0);
+  mic.add(480, 1000, 1000);
+  hub.pump();
+  CHECK(rec->available_bytes() > 0);
+  rec->flush();
+  CHECK(rec->available_bytes() == 0);
+  // the client goes: its record node and the hub's stream go too
+  g.remove_client(client);
+  hub.pump();
+  CHECK(g.record_count() == 0 && rec->closed() && hub.stream_count() == 0);
+  // the microphone is unplugged: the source is suspended, a stream still opens (and hears nothing)
+  hub.set_source(nullptr, SharedPointer<hardware::IAudioDevice>());
+  g.refresh();
+  bool suspended = false;
+  g.visit(g.source_id(), [&](const GraphObject& o) { suspended = o.state == kNodeStateSuspended && o.props.get("node.description") == StringView("Audio input"); });
+  CHECK(suspended && !g.has_input());
+  hub.set_source(&mic, SharedPointer<hardware::IAudioDevice>());
+  g.refresh();      // (the protocols' tick does this)
+
+  // ---- PulseAudio: parecord's commands
+  PulseServer server(g, A);
+  PulseClient c(server);
+  uint8_t cookie[256] = {};
+  std::vector<uint8_t> body;
+  uint32_t cmd = 0;
+  uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(9, [](pulse::TagWriter& w) { Properties p(A); p.set("application.name", "parecord"); w.proplist(p); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(35, [](pulse::TagWriter& w) { w.u32(0x2 | 0x8); });      // subscribe: sources, source outputs
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  // server info names the default source
+  t = c.command(20, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    StringView name, version, user, host, sink, source;
+    pulse::SampleSpec ss;
+    CHECK(r.string(&name) && r.string(&version) && r.string(&user) && r.string(&host) && r.sample_spec(&ss) && r.string(&sink) && r.string(&source) &&
+          source == StringView("tcos_input.stereo"));
+  }
+  // the source list and lookups
+  t = c.command(24, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t index = 0, module = 0, monitor = 0, flags = 0, base = 0, state = 0, steps = 0, card = 0, nports = 0; StringView name, desc, mname, driver, port;
+    pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute; uint64_t lat = 0, conf = 0; Properties pl(A); uint8_t formats = 0, enc = 0;
+    CHECK(r.u32(&index) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module) && r.cvolume(&vol) && r.boolean(&mute) &&
+          r.u32(&monitor) && r.string(&mname) && r.usec(&lat) && r.string(&driver) && r.u32(&flags) && r.proplist(&pl) && r.usec(&conf) && r.volume(&base) &&
+          r.u32(&state) && r.u32(&steps) && r.u32(&card) && r.u32(&nports) && r.string(&port) && r.u8(&formats) && r.format_info(&enc, &pl) && r.at_end());
+    CHECK(index == g.source_id() && name == StringView("tcos_input.stereo") && desc == StringView("Fake microphone") && monitor == pulse::kInvalidIndex);
+  }
+  t = c.command(11, [](pulse::TagWriter& w) { w.string("@DEFAULT_SOURCE@"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t index = 0;
+    CHECK(r.u32(&index) && index == g.source_id());
+  }
+  t = c.command(11, [](pulse::TagWriter& w) { w.string("tcos_output.stereo.monitor"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+  t = c.command(23, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("tcos_input.stereo"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  // a record stream: S16 stereo at 44.1 kHz, 20 ms fragments
+  const pulse::SampleSpec spec{pulse::kS16Le, 2, 44100};
+  t = c.command(5, [&](pulse::TagWriter& w) { put_create_record(w, spec, 3528, "voice"); });
+  std::vector<PulsePacket> packets = c.take();
+  CHECK(find_reply(packets, t, &body, &cmd) && cmd == 2);
+  uint32_t channel = 0, index = 0, maxlength = 0, fragsize = 0;
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    pulse::SampleSpec ss; pulse::ChannelMap map; uint32_t source = 0; StringView source_name; bool susp = true; uint64_t latency = 0; uint8_t enc = 0; Properties fp(A);
+    CHECK(r.u32(&channel) && r.u32(&index) && r.u32(&maxlength) && r.u32(&fragsize) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&source) &&
+          r.string(&source_name) && r.boolean(&susp) && r.usec(&latency) && r.format_info(&enc, &fp) && r.at_end());
+    CHECK(fragsize == 3528 && maxlength >= fragsize && source == g.source_id() && !susp && enc == 1 && g.record_of(index));
+  }
+  server.tick();
+  packets = c.take();
+  CHECK(count_command(packets, 66) >= 1);      // subscription event: a new source output
+  // 200 ms of microphone: the client gets about 8820 frames in fragments on its channel, the values the microphone heard
+  mic.add(9600, 3000, -3000);
+  size_t audio_bytes = 0, fragments = 0;
+  bool values_ok = true;
+  for (int i = 0; i < 20; ++i) {
+    hub.pump();
+    server.tick();
+    for (const PulsePacket& p : c.take()) {
+      if (p.channel != channel) continue;
+      ++fragments;
+      audio_bytes += p.payload.size();
+      if (p.payload.size() != 3528) values_ok = false;
+      for (size_t k = 4 * 100; k + 3 < p.payload.size() && k < 4 * 200; k += 4)
+        if (abs(s16_at(p.payload, k / 2) - 3000) > 40 || abs(s16_at(p.payload, k / 2 + 1) + 3000) > 40) values_ok = false;
+    }
+  }
+  CHECK(fragments >= 4 && audio_bytes >= 8000 * 4 && audio_bytes <= 8900 * 4 && values_ok);
+  // latency: the indices count what was sent
+  t = c.command(57, [&](pulse::TagWriter& w) { w.u32(channel); w.timeval(1, 2); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint64_t monitor = 0, source = 0; bool running = false; uint32_t s1, u1, s2, u2; int64_t wi = 0, ri = 0;
+    CHECK(r.usec(&monitor) && r.usec(&source) && r.boolean(&running) && r.timeval(&s1, &u1) && r.timeval(&s2, &u2) && r.s64(&wi) && r.s64(&ri) && r.at_end());
+    CHECK(running && ri == int64_t(audio_bytes) && wi >= ri);
+  }
+  // buffer attributes
+  t = c.command(73, [&](pulse::TagWriter& w) { w.u32(channel); w.u32(0xFFFFFFFFu); w.u32(10); w.boolean(false); w.boolean(false); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t ml = 0, fs = 0; uint64_t lat = 0;
+    CHECK(r.u32(&ml) && r.u32(&fs) && r.usec(&lat) && r.at_end() && fs == 220 * 4);      // (at least 5 ms)
+  }
+  // source outputs: the stream, with the client's name; its volume and mute (commands 98, 99)
+  t = c.command(32, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0, owner = 0, source = 0; StringView name, method, driver; pulse::SampleSpec ss; pulse::ChannelMap map; uint64_t l1, l2;
+    Properties pl(A); bool corked = true, mute = true, has = false, writable = false; pulse::Cvolume vol; uint8_t enc = 0;
+    CHECK(r.u32(&idx) && r.string(&name) && r.u32(&module) && r.u32(&owner) && r.u32(&source) && r.sample_spec(&ss) && r.channel_map(&map) && r.usec(&l1) &&
+          r.usec(&l2) && r.string(&method) && r.string(&driver) && r.proplist(&pl) && r.boolean(&corked) && r.cvolume(&vol) && r.boolean(&mute) &&
+          r.boolean(&has) && r.boolean(&writable) && r.format_info(&enc, &pl) && r.at_end());
+    CHECK(idx == index && name == StringView("voice") && source == g.source_id() && !corked && !mute && has && writable && ss.rate == 44100);
+  }
+  pulse::Cvolume half; half.channels = 2; half.values[0] = half.values[1] = pulse::kVolumeNorm / 2;
+  t = c.command(98, [&](pulse::TagWriter& w) { w.u32(index); w.cvolume(half); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && g.get_volume(index, &volume, &muted) && fabsf(volume - 0.125f) < 0.01f);
+  t = c.command(99, [&](pulse::TagWriter& w) { w.u32(index); w.boolean(true); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && g.get_volume(index, &volume, &muted) && muted);
+  t = c.command(98, [&](pulse::TagWriter& w) { w.u32(g.sink_id()); w.cvolume(half); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);      // (the sink is no source output)
+  t = c.command(37, [&](pulse::TagWriter& w) { w.u32(index); w.cvolume(half); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);      // (nor is a source output a sink input)
+  // the source's volume and mute: the hub's master gain
+  t = c.command(38, [&](pulse::TagWriter& w) { w.u32(g.source_id()); w.string(static_cast<const char*>(nullptr)); w.cvolume(half); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && hub.master_gain() < hardware::kAudioMaxVolume / 4);
+  t = c.command(40, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("@DEFAULT_SOURCE@"); w.boolean(true); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && hub.master_muted());
+  t = c.command(40, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("tcos_input.stereo"); w.boolean(false); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && !hub.master_muted());
+  // cork: nothing is sent while corked, and nothing old after
+  t = c.command(58, [&](pulse::TagWriter& w) { w.u32(channel); w.boolean(true); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  mic.add(4800, 100, 100);
+  hub.pump();
+  server.tick();
+  size_t while_corked = 0;
+  for (const PulsePacket& p : c.take()) if (p.channel == channel) while_corked += p.payload.size();
+  CHECK(while_corked == 0);
+  t = c.command(58, [&](pulse::TagWriter& w) { w.u32(channel); w.boolean(false); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  hub.pump();
+  server.tick();
+  for (const PulsePacket& p : c.take()) if (p.channel == channel) while_corked += p.payload.size();
+  CHECK(while_corked == 0);
+  t = c.command(59, [&](pulse::TagWriter& w) { w.u32(channel); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(47, [&](pulse::TagWriter& w) { w.u32(channel); w.string("call"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  bool renamed = false;
+  g.visit(index, [&](const GraphObject& o) { renamed = o.props.get("media.name") == StringView("call"); });
+  CHECK(renamed);
+  // playback commands do not reach a record stream, and the other way round
+  t = c.command(4, [&](pulse::TagWriter& w) { w.u32(channel); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0 && g.record_of(index));
+  // killed from elsewhere (pactl kill-source-output): RECORD_STREAM_KILLED
+  PulseClient other(server);
+  t = other.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+  other.take();
+  t = other.command(50, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(other.take(), t, &body, &cmd) && cmd == 2 && !g.record_of(index));
+  server.tick();
+  CHECK(count_command(c.take(), 65) == 1);
+  // a second stream, then deleted by its client; a mono one too
+  t = c.command(5, [&](pulse::TagWriter& w) { put_create_record(w, pulse::SampleSpec{pulse::kFloat32Le, 1, 8000}, 0xFFFFFFFFu, "mono", true); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    CHECK(r.u32(&channel) && r.u32(&index) && r.u32(&maxlength) && r.u32(&fragsize) && fragsize == 400 * 4);      // 50 ms by default
+  }
+  bool corked_node = false;
+  g.visit(index, [&](const GraphObject& o) { corked_node = o.record && o.record->paused(); });
+  CHECK(corked_node);
+  t = c.command(6, [&](pulse::TagWriter& w) { w.u32(channel); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && g.record_count() == 0);
+  // bad requests: an unknown source, a channel map that does not fit, direct-on-input
+  t = c.command(5, [&](pulse::TagWriter& w) {
+    pulse::ChannelMap map; map.channels = 2; map.positions[0] = 1; map.positions[1] = 2;
+    w.sample_spec(spec); w.channel_map(map); w.u32(12345); w.string(static_cast<const char*>(nullptr)); w.u32(0xFFFFFFFFu); w.boolean(false); w.u32(0xFFFFFFFFu);
+  });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+  // garbage: every truncation of a CREATE_RECORD_STREAM and bit flips in it
+  ByteBuffer good(A);
+  {
+    pulse::TagWriter w(good);
+    w.u32(5); w.u32(1);
+    put_create_record(w, spec, 3528, "fuzz");
+  }
+  std::mt19937 rng(17);
+  for (size_t round = 0; round < good.size() + 600; ++round) {
+    PulseClient bad(server);
+    if (!bad.handle) break;
+    bad.command(8, [&](pulse::TagWriter& x) { x.u32(35); x.arbitrary(ConstByteView(cookie, 16)); });
+    std::vector<uint8_t> m(good.view().data(), good.view().data() + good.size());
+    if (round < good.size()) m.resize(round);
+    else for (int k = 0; k < 3; ++k) m[rng() % m.size()] ^= uint8_t(1u << (rng() % 8));
+    bad.packet(0xFFFFFFFFu, ConstByteView(m.data(), m.size()));
+    mic.add(480, 1, 1);
+    hub.pump();
+    server.tick();
+    bad.take();
+    server.close_client(bad.handle);
+  }
+  server.close_client(c.handle);
+  server.close_client(other.handle);
+  hub.pump();
+  CHECK(server.client_count() == 0 && g.record_count() == 0 && hub.stream_count() == 0);
+
+  // ---- Windows: the service's capture side
+  WindowsAudioService service(g, A);
+  uint32_t stream = 0, read = 0;
+  CHECK(service.open_capture(20, PcmFormat{SampleFormat::S16Le, 48000, 2}, "recorder.exe", &stream) == 0 && stream && g.record_of(stream));
+  bool windows = false;
+  g.visit(stream, [&](const GraphObject& o) { windows = o.origin == Origin::Windows && o.role == NodeRole::Capture; });
+  CHECK(windows && service.stream_count() == 1);
+  mic.add(960, 1234, -1234);
+  hub.pump();
+  std::vector<uint8_t> buffer(10000);
+  CHECK(service.read(21, stream, ByteView(buffer.data(), buffer.size()), &read) != 0);      // not its stream
+  CHECK(service.read(20, stream, ByteView(buffer.data(), buffer.size()), &read) == 0 && read == 960 * 4 && s16_at(buffer, 100) == 1234 && s16_at(buffer, 101) == -1234);
+  uint32_t taken = 0;
+  CHECK(service.write(20, stream, ConstByteView(buffer.data(), 64), &taken) != 0);      // (a capture stream takes no writes)
+  // its volume: no pan, the louder side
+  uint32_t left = 0, right = 0;
+  CHECK(service.set_volume(20, stream, 0x8000, 0x2000) == 0 && service.get_volume(20, stream, &left, &right, &muted) == 0 && left == right && left > 0x7E00 && left < 0x8200);
+  // the microphone's master gain (stream 0xFFFFFFFF)
+  CHECK(service.set_volume(20, WindowsAudioService::kSourceStream, 0x8000, 0x8000) == 0 && hub.master_gain() > hardware::kAudioMaxVolume / 3 && hub.master_gain() < hardware::kAudioMaxVolume * 2 / 3);
+  CHECK(service.set_mute(20, WindowsAudioService::kSourceStream, true) == 0 && hub.master_muted() && service.get_volume(20, WindowsAudioService::kSourceStream, &left, &right, &muted) == 0 && muted);
+  CHECK(service.set_mute(20, WindowsAudioService::kSourceStream, false) == 0 && service.set_volume(20, WindowsAudioService::kSourceStream, 0xFFFF, 0xFFFF) == 0);
+  CHECK(service.close(20, stream, false) == 0 && service.stream_count() == 0 && g.record_count() == 0);
+  CHECK(service.open_capture(20, PcmFormat{SampleFormat::S16Le, 1, 2}, "", &stream) != 0);
+  CHECK(service.open_capture(20, PcmFormat{SampleFormat::F32Le, 44100, 2}, "", &stream) == 0);
+  service.process_exited(20);
+  hub.pump();
+  CHECK(service.stream_count() == 0 && g.record_count() == 0 && hub.stream_count() == 0);
+  // without a capture hub, no capture stream opens
+  {
+    Graph none(A, &mixer);
+    CHECK(none.initialize());
+    WindowsAudioService plain(none, A);
+    CHECK(plain.open_capture(20, PcmFormat{}, "", &stream) != 0 && plain.set_volume(20, WindowsAudioService::kSourceStream, 1, 1) != 0);
+  }
+}
+
+// Recording from several threads at once: the hub pumps a microphone that keeps talking while threads open, read, pause and close record streams (through
+// the graph and through the Windows service) and another changes the source's gain. Nothing may race (ASan, UBSan) and every reader hears audio.
+static void test_record_threads() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  WindowsAudioService service(g, A);
+  std::atomic<bool> stop{false};
+  std::atomic<int> heard{0}, opened{0};
+  std::thread pump([&] {
+    while (!stop) {
+      mic.add(480, 3000, -3000);
+      hub.pump();
+      g.refresh();
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+  });
+  std::thread knob([&] {
+    for (int i = 0; !stop; ++i) {
+      g.set_volume(g.source_id(), (i % 10) / 10.0f, i % 7 == 0);
+      std::this_thread::sleep_for(std::chrono::microseconds(300));
+    }
+  });
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; ++t)
+    readers.emplace_back([&, t] {
+      std::vector<uint8_t> buffer(8192);
+      const uint32_t client = g.add_client(Origin::Linux, 100 + t, "protocol-pulse", "");
+      for (int round = 0; round < 25; ++round) {
+        uint32_t node = 0, stream = 0, got = 0;
+        SharedPointer<RecordStream> r;
+        if (t % 2 == 0) {
+          node = g.create_record(client, PcmFormat{t == 0 ? SampleFormat::S16Le : SampleFormat::F32Le, 16000u + 8000u * uint32_t(t), uint32_t(1 + t % 3)}, Properties(A), &r);
+          if (node) ++opened;
+        } else if (service.open_capture(200 + t, PcmFormat{SampleFormat::S24Le, 44100, 2}, "thread.exe", &stream) == 0) {
+          ++opened;
+        }
+        for (int k = 0; k < 20; ++k) {
+          uint32_t n = 0;
+          if (r) n = r->read(ByteView(buffer.data(), buffer.size()));
+          else if (stream && service.read(200 + t, stream, ByteView(buffer.data(), buffer.size()), &got) == 0) n = got;
+          if (n) ++heard;
+          if (k == 10 && node) g.set_paused(node, true);
+          if (k == 12 && node) g.set_paused(node, false);
+          std::this_thread::sleep_for(std::chrono::microseconds(400));
+        }
+        if (node) g.destroy_node(node);
+        if (stream) service.close(200 + t, stream, false);
+      }
+      g.remove_client(client);
+      service.process_exited(200 + t);
+    });
+  for (std::thread& r : readers) r.join();
+  stop = true;
+  pump.join();
+  knob.join();
+  hub.pump();
+  CHECK(opened == 100 && heard > 100 && g.record_count() == 0 && service.stream_count() == 0 && hub.stream_count() == 0);
+}
+
 // ---- the Windows service -------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows_service() {
@@ -1218,6 +1722,9 @@ int main() {
   test_native_protocol();
   test_pulse_protocol();
   test_windows_service();
+  test_record_convert();
+  test_record();
+  test_record_threads();
   test_sockets();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());

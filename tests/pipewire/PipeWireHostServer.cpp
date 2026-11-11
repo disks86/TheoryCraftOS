@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -94,6 +95,45 @@ struct RealtimeDevice final : hardware::IAudioDevice {
   hardware::AudioStatistics statistics() override { return {}; }
 };
 
+// A microphone that hears, in real time, 880 Hz on the left at 8000 and 1320 Hz on the right at 4000 (what parecord must record).
+struct RealtimeMicrophone final : hardware::IAudioCapture {
+  std::mutex m;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  double owed = 0;
+  uint64_t phase = 0;
+  uint8_t level = hardware::kAudioMaxVolume;
+  bool mute = false;
+  void advance() {
+    const auto now = std::chrono::steady_clock::now();
+    owed += std::chrono::duration<double>(now - last).count() * 48000.0;
+    if (owed > 16384) owed = 16384;
+    last = now;
+  }
+  const char* name() const override { return "Host test microphone"; }
+  uint32_t read(ByteView out) override {
+    std::lock_guard<std::mutex> g(m);
+    advance();
+    uint32_t frames = uint32_t(out.size() / 4);
+    if (frames > uint32_t(owed)) frames = uint32_t(owed);
+    for (uint32_t i = 0; i < frames; ++i, ++phase) {
+      const double t = double(phase) / 48000.0;
+      const int16_t l = mute ? 0 : int16_t(8000.0 * sin(2 * M_PI * 880.0 * t) * level / hardware::kAudioMaxVolume);
+      const int16_t r = mute ? 0 : int16_t(4000.0 * sin(2 * M_PI * 1320.0 * t) * level / hardware::kAudioMaxVolume);
+      out[4 * i] = uint8_t(l); out[4 * i + 1] = uint8_t(uint16_t(l) >> 8);
+      out[4 * i + 2] = uint8_t(r); out[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    owed -= frames;
+    return frames * 4;
+  }
+  uint32_t available_bytes() override { std::lock_guard<std::mutex> g(m); advance(); return uint32_t(owed) * 4; }
+  void flush() override { std::lock_guard<std::mutex> g(m); advance(); phase += uint64_t(owed); owed = 0; }
+  void set_gain(uint8_t x) override { level = x; }
+  uint8_t gain() const override { return level; }
+  void set_muted(bool x) override { mute = x; }
+  bool muted() const override { return mute; }
+  hardware::AudioCaptureStatistics statistics() override { return {}; }
+};
+
 void write_wav(const char* path, const std::vector<int16_t>& samples) {
   FILE* f = fopen(path, "wb");
   if (!f) return;
@@ -141,7 +181,10 @@ int main(int argc, char** argv) {
   RealtimeDevice device;
   audio::AudioMixer mixer(device, A);
   if (!mixer.initialize()) return 1;
-  Graph graph(A, &mixer);
+  RealtimeMicrophone microphone;
+  audio::AudioCaptureHub capture(microphone, A);
+  if (!capture.initialize()) return 1;
+  Graph graph(A, &mixer, &capture);
   if (!graph.initialize()) return 1;
   NativeServer native(graph, A);
   PulseServer pulse(graph, A);
@@ -150,6 +193,7 @@ int main(int argc, char** argv) {
   std::thread mix([&] {
     while (!g_stop) {
       mixer.pump();
+      capture.pump();
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   });

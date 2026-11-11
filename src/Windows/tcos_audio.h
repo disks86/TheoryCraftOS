@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* What the Windows audio libraries share (winmm.dll's waveOut, dsound.dll, mmdevapi.dll's WASAPI): the call into NtTcosAudio, the kernel's way into
+/* What the Windows audio libraries share (winmm.dll's waveOut and waveIn, dsound.dll, mmdevapi.dll's WASAPI): the call into NtTcosAudio, the kernel's way into
  * its PipeWire graph (src/Process/WindowsAudio.hpp has the operations), the wave formats the graph takes, and the bit of maths the libraries need
  * without a C runtime (decibels, square roots, sines). Include it after <windows.h>; the libraries are linked against ntdll.dll. */
 #pragma once
@@ -24,7 +24,8 @@
 __declspec(dllimport) LONG NTAPI NtTcosAudio(ULONG64 *arguments);
 
 enum { TCOS_AUDIO_OPEN = 1, TCOS_AUDIO_CLOSE, TCOS_AUDIO_WRITE, TCOS_AUDIO_STATUS, TCOS_AUDIO_FLUSH, TCOS_AUDIO_PAUSE, TCOS_AUDIO_SET_VOLUME,
-       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE };
+       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE, TCOS_AUDIO_OPEN_CAPTURE, TCOS_AUDIO_READ };
+#define TCOS_AUDIO_SOURCE_STREAM 0xFFFFFFFFull      /* (the volume calls' stream number for the microphone's master gain; 0 is the master volume) */
 #define TCOS_STATUS_INVALID_PARAMETER ((LONG)0xC000000D)
 
 /* One call: [0] operation, [1] stream, [2..6] parameters; *out5, *out6, *out7 (each may be NULL) get what the kernel wrote back. */
@@ -54,6 +55,12 @@ static inline LONG tcos_audio_status(ULONG64 stream, ULONG64 *waiting, ULONG64 *
 static inline ULONG64 tcos_audio_devices(void) {
   ULONG64 n = 0;
   return audio_call(TCOS_AUDIO_DEVICES, 0, 0, 0, 0, 0, 0, NULL, NULL, &n) == 0 ? n : 0;
+}
+
+/* The number of input devices (0 or 1: a microphone is there). */
+static inline ULONG64 tcos_audio_input_devices(void) {
+  ULONG64 n = 0;
+  return audio_call(TCOS_AUDIO_DEVICES, 0, 0, 0, 0, 0, 0, NULL, &n, NULL) == 0 ? n : 0;
 }
 
 /* (mmreg.h's WAVEFORMATEXTENSIBLE, without pulling in ksmedia.h) */
@@ -103,17 +110,18 @@ static inline void program_name(char *out, int size) {
   out[k] = 0;
 }
 
-/* Opens a stream of the graph for `format` (see wave_format_code); 0 when it cannot be opened. */
-static inline ULONG64 tcos_audio_open(const WAVEFORMATEX *format, LONG *status) {
+/* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream; 0 when it cannot be opened. */
+static inline ULONG64 tcos_audio_open_kind(const WAVEFORMATEX *format, BOOL capture, LONG *status) {
   char name[128];
   program_name(name, sizeof name);
   ULONG64 stream = 0;
   const ULONG64 code = wave_format_code(format);
-  LONG st = code ? audio_call(TCOS_AUDIO_OPEN, 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
+  LONG st = code ? audio_call(capture ? TCOS_AUDIO_OPEN_CAPTURE : TCOS_AUDIO_OPEN, 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
                  : TCOS_STATUS_INVALID_PARAMETER;
   if (status) *status = st;
   return st == 0 ? stream : 0;
 }
+static inline ULONG64 tcos_audio_open(const WAVEFORMATEX *format, LONG *status) { return tcos_audio_open_kind(format, FALSE, status); }
 
 /* ---- maths without a C runtime ------------------------------------------------------------------------------------------------------------------ */
 

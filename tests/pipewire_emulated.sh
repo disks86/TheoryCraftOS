@@ -4,18 +4,20 @@
 # plays, and a native 300 Hz stream) tests/windows/winmmtest.c (winmm.dll's waveOut and PlaySound, 400 Hz) and tests/linux/pulsetest.c (the
 # PulseAudio protocol over socket(2), 500 Hz; no C library) run at the same time. Both must pass their checks, and the mixed output must hold all three
 # tones at once. A second run does the same with tests/windows/dsoundtest.c (dsound.dll at 600 Hz and WASAPI at 700 Hz, both from one program): all of
-# 300, 500, 600 and 700 Hz must be in the mix at once.
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound]   (the Linux program's CPU, default x86_64; which runs, default all).
+# 300, 500, 600 and 700 Hz must be in the mix at once. A third run records: the emulator's microphone (880 Hz left, 1320 Hz right) is heard by
+# tests/windows/recordtest.c (waveIn, DirectSound capture, WASAPI capture) and by pulsetest's record stream at the same time.
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 arch=${1:-x86_64}
 which=${2:-all}
-work=${TMPDIR:-/tmp}/tcos-pwemu
+# (one work folder per checkout: the objects and the DLL build of another worktree must not be taken for this one's)
+work=${TMPDIR:-/tmp}/tcos-pwemu-$(printf %s "$PWD" | cksum | cut -d" " -f1)
 mkdir -p "$work/obj" "$work/sys32"
 for tool in x86_64-w64-mingw32-gcc clang; do command -v "$tool" >/dev/null || { echo "skipped (no $tool)"; exit 0; }; done
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp)
+         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_AUDIO"
 objs=()
 jobs=()
@@ -37,6 +39,7 @@ ninja -C "$work/build" windows_dlls > /dev/null
 cp "$work"/build/windows/*.dll "$work/sys32/"
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/winmmtest.exe" tests/windows/winmmtest.c -lwinmm
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/dsoundtest.exe" tests/windows/dsoundtest.c -ldsound -lole32 -luuid
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/recordtest.exe" tests/windows/recordtest.c -lwinmm -ldsound -lole32 -luuid
 # the Linux program
 lld=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/gcc-ld/ld.lld 2>/dev/null | head -1 || true)
 case $arch in
@@ -50,7 +53,7 @@ clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestand
   -Wall -Wextra -o "$work/pulsetest-$arch" tests/linux/pulsetest.c
 
 fail=0
-if [ "$which" != dsound ]; then
+if [ "$which" = all ] || [ "$which" = winmm ]; then
   "$work/emurun" "$work/winmmtest.exe" "$work/sys32" "$work/pulsetest-$arch" | tee "$work/run.out"
   grep -q "winmmtest: [0-9]* checks, 0 failed" "$work/run.out" || { echo "FAIL winmmtest"; fail=1; }
   grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run.out" || { echo "FAIL pulsetest"; fail=1; }
@@ -67,7 +70,7 @@ print("ok   the mix holds all three programs' tones" if ok else "FAIL the mix: %
 sys.exit(0 if ok else 1)
 PY
 fi
-if [ "$which" != winmm ]; then
+if [ "$which" = all ] || [ "$which" = dsound ]; then
   TCOS_EMU_TONES=300,500,600,700 "$work/emurun" "$work/dsoundtest.exe" "$work/sys32" "$work/pulsetest-$arch" | tee "$work/run-dsound.out"
   grep -q "dsoundtest: [0-9]* checks, 0 failed" "$work/run-dsound.out" || { echo "FAIL dsoundtest"; fail=1; }
   grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run-dsound.out" || { echo "FAIL pulsetest (with dsoundtest)"; fail=1; }
@@ -83,6 +86,12 @@ ok = 2200 < t300 < 2800 and 1800 < t500 < 2400 and 3600 < t600 < 4400 and 3600 <
 print("ok   the mix holds DirectSound's and WASAPI's tones with the others" if ok else "FAIL the mix: %s" % m.group(0))
 sys.exit(0 if ok else 1)
 PY
+fi
+if [ "$which" = all ] || [ "$which" = record ]; then
+  TCOS_EMU_TONES=300,500 "$work/emurun" "$work/recordtest.exe" "$work/sys32" "$work/pulsetest-$arch" | tee "$work/run-record.out"
+  grep -q "recordtest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL recordtest"; fail=1; }
+  grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL pulsetest (with recordtest)"; fail=1; }
+  grep -q "faulted=0" "$work/run-record.out" && grep -q "second program: exit=0" "$work/run-record.out" || { echo "FAIL a program faulted or failed (record run)"; fail=1; }
 fi
 [ $fail -eq 0 ] && echo "pipewire emulated: all passed" || echo "pipewire emulated: FAILED"
 exit $fail

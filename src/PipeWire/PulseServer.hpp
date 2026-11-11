@@ -26,7 +26,13 @@
 // Served: AUTH, SET_CLIENT_NAME, playback streams (create, delete, drain, cork, flush, trigger, prebuf, latency, buffer attributes, name and property
 // updates) with PulseAudio's flow control (REQUEST, STARTED, PLAYBACK_STREAM_KILLED), the server/sink/sink-input/client queries and lists, sink and
 // sink-input volume and mute, SUBSCRIBE with its events, STAT, LOOKUP_SINK. Every stream is a node of the graph, so "pactl list sink-inputs" also shows
-// the native and Windows programs that play. Not served (an error answer): record and upload streams, samples, modules, cards, extensions.
+// the native and Windows programs that play.
+//
+// Recording (parecord, browsers' getUserMedia through libpulse, voice chat): record streams (create, delete, cork, flush, latency, buffer attributes,
+// name and property updates) read the graph's source - the capture hub's microphone - and the server sends what they record in packets on the stream's
+// channel, a fragment (fragsize) at a time; source and source-output queries, lists, volume and mute, LOOKUP_SOURCE, and their subscription events.
+// "pactl list source-outputs" shows the Windows programs that record as well. Not served (an error answer): upload streams, samples, modules, cards,
+// extensions, monitor sources.
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
@@ -64,15 +70,16 @@ class PulseServer final : public IProtocolServer {
     explicit Stream(allocators::IAllocator& a) : pending(a), drains(a) {}
     uint32_t channel = 0;
     uint32_t node = 0;
-    SharedPointer<PlaybackStream> playback;
+    SharedPointer<PlaybackStream> playback;      // a playback stream; else
+    SharedPointer<RecordStream> record;          // a record stream
     pulse::SampleSpec spec;
     pulse::ChannelMap map;
-    uint32_t maxlength = 0, tlength = 0, prebuf = 0, minreq = 0;
+    uint32_t maxlength = 0, tlength = 0, prebuf = 0, minreq = 0, fragsize = 0;
     uint64_t requested = 0;      // bytes the client may still send without being asked
     ByteBuffer pending;          // came, not yet taken by the playback stream
     uint64_t pending_offset = 0;
     List<uint32_t> drains;       // tags of DRAIN requests to answer once it has played out
-    uint64_t write_index = 0;
+    uint64_t write_index = 0;    // playback: bytes the client sent; record: bytes sent to the client
     bool corked = false;
     bool started = false;
   };
@@ -94,7 +101,8 @@ class PulseServer final : public IProtocolServer {
   };
 
   Client* find(uint32_t handle);
-  Stream* stream(Client& c, uint32_t channel);
+  // The playback (or with `record`, the record) stream on `channel`.
+  Stream* stream(Client& c, uint32_t channel, bool record = false);
   void packet(Client& c, uint32_t channel, ConstByteView payload, int64_t offset, uint32_t flags);
   void command(Client& c, ConstByteView payload);
   void audio(Client& c, uint32_t channel, ConstByteView data);
@@ -106,14 +114,20 @@ class PulseServer final : public IProtocolServer {
   void send_simple_reply(Client& c, uint32_t tag);
 
   void create_playback(Client& c, uint32_t tag, pulse::TagReader& t);
+  void create_record(Client& c, uint32_t tag, pulse::TagReader& t);
+  // Sends what a record stream has recorded, whole fragments.
+  void send_recorded(Client& c, Stream& s);
   void delete_stream(Client& c, uint32_t channel, bool killed);
   void feed(Stream& s);
   void flow(Client& c, Stream& s);
 
   void fill_sink(Client& c, pulse::TagWriter& w);
+  void fill_source(Client& c, pulse::TagWriter& w);
+  void fill_source_output(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_sink_input(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_client(Client& c, pulse::TagWriter& w, const GraphObject& o);
   bool is_sink_name(StringView name) const;
+  bool is_source_name(StringView name) const;
   void send_subscription_events(Client& c);
 
   Graph& graph_;

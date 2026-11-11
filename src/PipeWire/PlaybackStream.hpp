@@ -46,6 +46,11 @@ struct PcmFormat {
   const char* name() const;
 };
 
+// The usual SPA channel positions for `channels` channels (out has room for that many).
+void default_channel_positions(uint32_t channels, uint32_t* out);
+// How much of a channel at SPA `position` belongs to the left and the right side (per mille: 1000 one side only, 707 both, 0 neither as for LFE).
+void channel_side_weights(uint32_t position, int32_t* left, int32_t* right);
+
 // Converts whole frames of `in` into interleaved 16-bit little-endian samples, `out_channels` (1 or 2) per frame. Returns the bytes written; *consumed is
 // the input bytes used (both whole frames). `positions` are the input's channels as SPA channel numbers (null: the usual order for that count).
 uint32_t convert_to_s16(const PcmFormat& in, const uint32_t* positions, ConstByteView source, ByteView out, uint32_t out_channels, uint32_t* consumed);
