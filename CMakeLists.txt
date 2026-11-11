@@ -755,6 +755,12 @@ add_executable(BOOTX64
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp
   src/Process/UnixSockets.cpp
+  src/X11/X11Drawing.cpp
+  src/X11/X11Input.cpp
+  src/X11/X11Requests.cpp
+  src/X11/X11SocketServer.cpp
+  src/X11/X11Tables.cpp
+  src/X11/X11Windows.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsMisc.cpp

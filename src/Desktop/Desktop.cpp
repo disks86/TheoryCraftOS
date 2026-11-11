@@ -49,6 +49,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       explorer_(allocator),
       computer_manager_(allocator),
       win32_windows_(allocator),
+      x11_windows_(allocator),
       notepad_(allocator),
       paint_(allocator),
       spreadsheet_(allocator),
@@ -682,8 +683,17 @@ uint32_t Desktop::calculator_count() const {
 void Desktop::on_calculator(void* self, Control&) { static_cast<Desktop*>(self)->open_calculator(); }
 
 // The raw device events go to the Windows programs first (they are handed over when they are theirs), then on as usual. (The input pump's thread.)
-void Desktop::tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers) { static_cast<Desktop*>(self)->win32_windows_.tap_key(event, modifiers); }
-void Desktop::tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y) { static_cast<Desktop*>(self)->win32_windows_.tap_mouse(event, x, y); }
+// (each kind of foreign window takes the keys while one of its windows is the active one, the mouse while the pointer is over one of them)
+void Desktop::tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers) {
+  Desktop& d = *static_cast<Desktop*>(self);
+  d.win32_windows_.tap_key(event, modifiers);
+  d.x11_windows_.tap_key(event, modifiers);
+}
+void Desktop::tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y) {
+  Desktop& d = *static_cast<Desktop*>(self);
+  d.win32_windows_.tap_mouse(event, x, y);
+  d.x11_windows_.tap_mouse(event, x, y);
+}
 
 Calendar* Desktop::open_calendar(TabFrame* into) {
   Calendar* calendar = open_instance(calendar_, extra_calendars_, &Desktop::setup_calendar, into);
@@ -1009,6 +1019,7 @@ void Desktop::monitors_changed() {
     }
     if (!several) {
       win32_windows_.set_monitors({}, {});
+      x11_windows_.set_monitors({}, {});
       toasts_.clear_area();
       display_settings_.refresh();
       return;
@@ -1040,6 +1051,7 @@ void Desktop::monitors_changed() {
     surface_.set_regions(regions, count);
     windows_.set_areas(areas, count);
     win32_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
+    x11_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
     if (count) toasts_.set_area(areas[0]);   // the primary monitor above its taskbar
     display_settings_.refresh();
   });
@@ -1214,6 +1226,7 @@ void Desktop::pump(uint64_t uptime_us) {
   window_.tick(uptime_us);
   input_.pump();
   win32_windows_.pump(windows_);
+  x11_windows_.pump(windows_);
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
   if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });

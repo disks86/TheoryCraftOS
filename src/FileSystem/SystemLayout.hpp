@@ -94,6 +94,9 @@ inline constexpr const char* kLinuxUsrBin = "/Linux/usr/bin";
 // Where a Linux process sees the Windows tree (/Windows, the C: drive), as under WSL: a path in the Linux process's own view, not one of the OS's file
 // system. Files (and unix sockets, see Process/UnixSockets.hpp) made there by one kind of program are the other's.
 inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
+// The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
+inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
+inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
 // Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
 inline constexpr const char* kLinuxFirmware = "/Linux/lib/firmware";
 inline constexpr const char* kLinuxFirmwareIntelVpu = "/Linux/lib/firmware/intel/vpu";

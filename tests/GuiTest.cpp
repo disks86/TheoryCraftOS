@@ -46,6 +46,7 @@
 #include "Gui/Windows/WindowSwitcher.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "X11/X11Server.hpp"
 
 using namespace gui;
 namespace key = hardware::key;
@@ -1794,6 +1795,127 @@ static void test_font_unicode() {
   CHECK(Painter::text_width("\xC3\xA9t\xC3\xA9") == 3 * Painter::kGlyphWidth);
 }
 
+// An X client's window and a Windows program's window on the same desktop: both are frames of the window manager made by the same code (Win32Windows over
+// desktop::IWindowsSession), with the same decorations, and the desktop's actions reach the X client as X events.
+static void put16(std::vector<uint8_t>& b, uint32_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); }
+static void put32(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); }
+static void x11_request(x11::Server& s, uint32_t client, std::vector<uint8_t> b) {      // (b: opcode, data, then the body; the length is filled in)
+  while (b.size() % 4) b.push_back(0);
+  b[2] = uint8_t(b.size() / 4);
+  b[3] = uint8_t(b.size() / 4 >> 8);
+  s.receive(client, ConstByteView(b.data(), b.size()));
+}
+
+static void test_x11_frames() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeWindowsSession win32(a);
+    x11::Server xs(a);
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_windows_session(&win32);
+    d.set_x11_session(&xs);
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    const Point mo = wm.window_origin();
+    // a Windows program's window
+    win32.add(7, true, {40, 40, 200, 150}, "Notepad", false);
+    // an X client: setup, a 240x120 window (frame at 300,60) with a title and WM_DELETE_WINDOW, filled red, mapped
+    const uint32_t c = xs.open_client(0);
+    const uint8_t setup[12] = {'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    xs.receive(c, ConstByteView(setup, 12));
+    ByteBuffer out(a);
+    xs.take_output(c, &out);
+    CHECK(out.size() > 8 && out.view()[0] == 1);
+    const uint32_t base = uint32_t(c) << 21, w = base | 1, gc = base | 2, protocols = 69, del = 70;      // (WM_PROTOCOLS, WM_DELETE_WINDOW are the server's first atoms)
+    std::vector<uint8_t> b = {1, 0, 0, 0};
+    put32(b, w); put32(b, x11::Server::kRootWindow); put16(b, 300); put16(b, 60); put16(b, 240); put16(b, 120); put16(b, 0); put16(b, 1); put32(b, 0);
+    put32(b, 0x2 | 0x800); put32(b, 0xFFFFFF); put32(b, (1u << 17) | (1u << 15) | 1u | 4u);
+    x11_request(xs, c, b);
+    b = {18, 0, 0, 0}; put32(b, w); put32(b, 39); put32(b, 31); b.push_back(8); b.push_back(0); b.push_back(0); b.push_back(0); put32(b, 5);
+    for (char ch : std::string("xterm")) b.push_back(uint8_t(ch));
+    x11_request(xs, c, b);
+    b = {18, 0, 0, 0}; put32(b, w); put32(b, protocols); put32(b, 4); b.push_back(32); b.push_back(0); b.push_back(0); b.push_back(0); put32(b, 1); put32(b, del);
+    x11_request(xs, c, b);
+    // (WM_NORMAL_HINTS with PPosition: the frame goes where it was asked)
+    b = {18, 0, 0, 0}; put32(b, w); put32(b, 40); put32(b, 41); b.push_back(32); b.push_back(0); b.push_back(0); b.push_back(0); put32(b, 18);
+    put32(b, 4); for (int i = 0; i < 17; ++i) put32(b, 0);
+    x11_request(xs, c, b);
+    b = {8, 0, 0, 0}; put32(b, w);
+    x11_request(xs, c, b);
+    b = {55, 0, 0, 0}; put32(b, gc); put32(b, w); put32(b, 0x4); put32(b, 0xFF0000);
+    x11_request(xs, c, b);
+    b = {70, 0, 0, 0}; put32(b, w); put32(b, gc); put16(b, 0); put16(b, 0); put16(b, 240); put16(b, 120);
+    x11_request(xs, c, b);
+    d.step(1000);
+    desktop::Win32Window* wh = d.win32_windows().host(7);
+    desktop::Win32Window* xh = d.x11_windows().host(w);
+    CHECK(wh && xh && xh->manager() == &wm && wh->manager() == &wm);
+    CHECK(xh && xh->title() == StringView("xterm") && xh->decorated() && xh->in_taskbar() && wm.active() == xh);
+    gui::Rect2D pic;
+    CHECK(xh && xh->bounds().x == 300 && xh->bounds().y == 60 && xh->picture_area(&pic) && pic.x == 306 && pic.y == 85 && pic.width == 240 && pic.height == 120);
+    CHECK(screen.px(mo.x + 400, mo.y + 140) == 0xFFFF0000u);      // the X client's picture, drawn by the desktop
+    // the same decorations: the title bar of an inactive frame looks the same for both kinds (the X one is active now; activate the Windows one and compare)
+    {
+      gui::UiGuard lock(&wm);
+      wm.activate(wh);
+    }
+    d.step(2000);
+    CHECK(wm.active() == wh);
+    // (both frames are inactive vs. active here: compare the X frame now inactive with the Windows frame inactive before)
+    const uint32_t x_title = screen.px(mo.x + 300 + 8, mo.y + 60 + 8);
+    {
+      gui::UiGuard lock(&wm);
+      wm.activate(xh);
+    }
+    d.step(3000);
+    const uint32_t w_title = screen.px(mo.x + 40 + 8, mo.y + 40 + 8);
+    CHECK(x_title == w_title);
+    // the desktop activated the X window: the client has the focus
+    // the user moves and sizes the frame: the client hears ConfigureNotify with its new inside
+    out.clear();
+    xs.take_output(c, &out);
+    {
+      gui::UiGuard lock(&wm);
+      xh->set_bounds({320, 70, 300, 200});
+    }
+    d.step(4000);
+    out.clear();
+    xs.take_output(c, &out);
+    bool configured = false;
+    for (uint64_t at = 0; at + 32 <= out.size(); at += 32) {
+      ConstByteView e = out.view().subview(at, 32);
+      if (e[0] == 1) break;      // (no replies were asked for)
+      if (e[0] == 22) configured = (e[16] | e[17] << 8) == 326 && (e[18] | e[19] << 8) == 95 && (e[20] | e[21] << 8) == 288 && (e[22] | e[23] << 8) == 169;
+    }
+    CHECK(configured);
+    d.step(5000);
+    CHECK(xh->bounds().x == 320 && xh->bounds().width == 300);
+    // closing the frame asks the client (WM_DELETE_WINDOW), which destroys the window: the frame goes
+    xh->close();      // (the close button)
+    d.step(6000);
+    out.clear();
+    xs.take_output(c, &out);
+    bool asked = false;
+    for (uint64_t at = 0; at + 32 <= out.size(); at += 32) {
+      ConstByteView e = out.view().subview(at, 32);
+      if (e[0] == 33 && (e[12] | e[13] << 8 | e[14] << 16 | uint32_t(e[15]) << 24) == del) asked = true;
+    }
+    CHECK(asked);
+    CHECK(d.x11_windows().host(w) != nullptr);      // (still there until the client agrees)
+    b = {4, 0, 0, 0}; put32(b, w);
+    x11_request(xs, c, b);
+    d.step(7000);
+    CHECK(d.x11_windows().host(w) == nullptr && d.x11_windows().count() == 0);
+    xs.close_client(c);
+    d.set_x11_session(nullptr);
+    d.set_windows_session(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_dock_layout();
   test_uniform_panel();
@@ -1813,6 +1935,7 @@ int main() {
   test_switcher();
   test_desktop_toasts();
   test_windows_screen();
+  test_x11_frames();
   test_windows_more();
   test_font_unicode();
   if (g_failed) { printf("%d checks failed\n", g_failed); return 1; }

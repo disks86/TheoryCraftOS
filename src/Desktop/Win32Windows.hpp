@@ -18,6 +18,8 @@
 
 // The windows of the Windows programs as windows of the desktop: each visible top-level window of win32k is a gui::Frame in the desktop's window manager, stacked,
 // activated, moved, sized, minimized, maximized and closed like any other, with its taskbar button and Alt+Tab place.
+// The X server's windows go through the same code (a second instance over x11::Server, which implements IWindowsSession too: docs/X11.md), so the two kinds
+// of foreign window look and behave alike.
 //
 // One coordinate space: win32k's screen is the window manager's area, so a window's rectangle is its frame's bounds. The desktop draws the title bar and frame of a
 // window with a caption (win32k's non-client sizes are the frame's); the program's picture of the inside (its window surface) is drawn by the view straight from the

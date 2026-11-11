@@ -20,6 +20,7 @@
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
+#include "X11/X11SocketServer.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
 #include "OpenGl/WindowsGl.hpp"
@@ -139,6 +140,7 @@
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
+#include "Program/EmulatedTask.hpp"
 #include "Program/ProgramRunner.hpp"
 #include "SystemFileSystem.hpp"
 #include "Browser/HttpPageLoader.hpp"
@@ -2063,6 +2065,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     process::win32k::DesktopBridge windows_bridge;
     desktop.set_windows_session(&windows_bridge);
     struct WindowsBridgeGuard { desktop::Desktop& d; ~WindowsBridgeGuard() { d.set_windows_session(nullptr); } } windows_bridge_guard{desktop};      // (the desktop lets go first)
+    // The X programs' windows: the kernel's X server (src/X11), the desktop its window manager, so an X window gets the same frame as a Windows one. Linux
+    // and Windows programs reach it at DISPLAY=:0 over the system's AF_UNIX sockets (the abstract name /tmp/.X11-unix/X0, and that path in the Linux tree).
+    x11::Server x11_server(shared_allocator, [] { return hardware::uptime_us() / 1000; });
+    desktop.set_x11_session(&x11_server);
+    struct X11Guard { desktop::Desktop& d; ~X11Guard() { d.set_x11_session(nullptr); } } x11_guard{desktop};      // (the desktop lets go first)
+    UniquePointer<x11::SocketServer> x11_sockets;
+    if (desktop::ensure_system_objects(shared_allocator)) {      // (the sockets live with the system's objects, made here if no program made them yet)
+      if (process::UnixSocketManager* sockets = process::system_unix_sockets()) {
+        x11_sockets = UniquePointer<x11::SocketServer>::make(shared_allocator, x11_server, *sockets, shared_allocator);
+        if (x11_sockets && x11_sockets->listen(0, &explorer_files.file_system()) && x11_sockets->start()) console::puts("x11: listening on DISPLAY=:0\n");
+        else console::puts("x11: the X server could not listen\n");
+      }
+    }
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
 #ifdef TCOS_AUTORUN
@@ -2088,7 +2103,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         const uint64_t slash = run.path.rfind('/');
         run.working_directory = slash == StringView::npos ? StringView("/") : run.path.first(slash);
         run.arguments = ArrayView<const StringView>(arguments, count);
-        run.kind = exe::ExecutableKind::Pe;
+        const StringView name(TCOS_AUTORUN);      // (a Windows program by its .exe; anything else is taken for a Linux one)
+        run.kind = name.ends_with(".exe") || name.ends_with(".EXE") ? exe::ExecutableKind::Pe : exe::ExecutableKind::Elf;
         run.output = [](void*, StringView text) { console::puts(text); };
         console::puts("autorun: starting " TCOS_AUTORUN "\n");
         uint32_t code = 0;
