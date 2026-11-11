@@ -30,6 +30,9 @@
 #include <stdint.h>
 
 #define TCOS_DXG_DEVICE_PATH "/dev/dxg"
+/* Its device number (st_rdev, as glibc's makedev(10, 243): a misc character device, as WSL's /dev/dxg is). The Wayland compositor names it as the main device
+ * of its dmabuf feedback (zwp_linux_dmabuf_feedback_v1.main_device), so a client knows which device to make its buffers on. */
+#define TCOS_DXG_DEVICE_NUMBER ((10ull << 8) | 243ull)
 
 typedef struct TcosDxgCall {
   uint32_t service;   /* a TCOS_DXG_* number (the NtGdiDdDDI* system call number of the service) */

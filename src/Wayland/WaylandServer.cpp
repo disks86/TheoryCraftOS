@@ -33,7 +33,7 @@ constexpr uint32_t kGlobalCount = 9;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 5}, {"zxdg_decoration_manager_v1", 1},
-    {"zwp_linux_dmabuf_v1", 3},      // (only offered with set_dmabuf)
+    {"zwp_linux_dmabuf_v1", 4},      // (only offered with set_dmabuf; 3 without an fd maker: version 4's feedback needs its format table)
 };
 constexpr uint32_t kDmabufGlobal = 9;
 
@@ -59,6 +59,7 @@ void Server::set_fd_maker(MakeFd make, void* context) {
   make_fd_ = make;
   make_fd_context_ = context;
   keymap_ = Fd();
+  format_table_ = Fd();
 }
 
 void Server::wake() {
@@ -294,8 +295,8 @@ void Server::destroy_object(Client& c, uint32_t id) {
 // ------------------------------------------------------------------ the registry
 
 void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t version, uint32_t id) {
-  if (name == 0 || name > kGlobalCount || (name == kDmabufGlobal && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 ||
-      version > kGlobals[name - 1].version) {
+  const uint32_t most = name == kDmabufGlobal && !make_fd_ ? 3 : name >= 1 && name <= kGlobalCount ? kGlobals[name - 1].version : 0;
+  if (name == 0 || name > kGlobalCount || (name == kDmabufGlobal && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 || version > most) {
     post_error(c, kDisplayId, kErrorInvalidObject, "invalid global");
     return;
   }
@@ -355,7 +356,8 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       return;
     }
     case Iface::LinuxDmabuf: {
-      // the formats, all linear: format events before version 3, modifier events from it on
+      // the formats, all linear: format events before version 3, modifier events in 3; from 4 on the client asks for feedback instead
+      if (version >= 4) return;
       const uint32_t formats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
       for (uint32_t f : formats) {
         Event e(object, version >= 3 ? 1 : 0);
@@ -388,7 +390,7 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         for (uint32_t g = 0; g < kGlobalCount; ++g) {
           if (g + 1 == kDmabufGlobal && !dmabuf_) continue;
           Event e(registry, 0);
-          e.u(g + 1).string(kGlobals[g].name).u(kGlobals[g].version);
+          e.u(g + 1).string(kGlobals[g].name).u(g + 1 == kDmabufGlobal && !make_fd_ ? 3 : kGlobals[g].version);
           send(c, e);
         }
       } else {
@@ -473,7 +475,8 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::DecorationManager:
     case Iface::Decoration: decoration_request(c, id, r, opcode, in); return;
     case Iface::LinuxDmabuf:
-    case Iface::BufferParams: dmabuf_request(c, id, r, opcode, in); return;
+    case Iface::BufferParams:
+    case Iface::DmabufFeedback: dmabuf_request(c, id, r, opcode, in); return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");
       return;

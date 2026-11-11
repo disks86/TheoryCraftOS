@@ -26,7 +26,8 @@
 //
 // Globals: wl_compositor 6, wl_subcompositor 1, wl_shm 2 (ARGB8888, XRGB8888, ABGR8888, XBGR8888), wl_seat 8 (pointer and keyboard; the keymap is a US
 // xkb_v1 keymap in a sealed file in memory), wl_output 4 (the primary monitor), wl_data_device_manager 3 (no transfers yet), xdg_wm_base 5,
-// zxdg_decoration_manager_v1 1, and zwp_linux_dmabuf_v1 3 when the transport can take GPU images (set_dmabuf; the same four formats, linear).
+// zxdg_decoration_manager_v1 1, and zwp_linux_dmabuf_v1 4 when the transport can take GPU images (set_dmabuf; the same four formats, linear; feedback
+// names /dev/dxg as the device).
 //
 // GPU pictures. A zwp_linux_dmabuf_v1 buffer is a GPU image a client passed as a descriptor (on this system an export of the kernel's Direct3D layer, made with
 // /dev/dxg: Process/DxgBufferFile.hpp). The desktop draws it where it is: on the GPU, with no copy at all, when the desktop's renderer draws on the device the
@@ -171,7 +172,7 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback,
   };
   struct Surface;
   struct Client;
@@ -312,6 +313,8 @@ class Server final : public desktop::IWindowsSession {
   void decoration_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   // --- zwp_linux_dmabuf_v1 (WaylandDmabuf.cpp)
   void dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void send_dmabuf_feedback(Client& c, uint32_t feedback);
+  Fd format_table_fd();
   bool make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, int32_t width, int32_t height, uint32_t format, uint32_t flags, bool immediate, BufferInfo* out);
   void commit(Client& c, Surface& s);
   void apply(Client& c, Surface& s, State& state);
@@ -372,6 +375,7 @@ class Server final : public desktop::IWindowsSession {
   void* make_fd_context_ = nullptr;
   bool dmabuf_ = false;
   Fd keymap_;
+  Fd format_table_;      // zwp_linux_dmabuf_feedback_v1's format table (made once, sealed)
   UniquePointer<Client> clients_[kMaxClients];
   Hive<Surface> surfaces_;
   List<Surface*> stack_;                    // the mapped windows (toplevels and popups), bottom first

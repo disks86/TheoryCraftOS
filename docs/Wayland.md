@@ -28,7 +28,7 @@ through the same input taps. `IWindowsSession::mouse_left` (new; a no-op for the
 not one of its own, so the compositor can send `wl_pointer.leave`.
 
 - **Globals.** `wl_compositor` 6, `wl_subcompositor` 1, `wl_shm` 2, `wl_seat` 8, `wl_output` 4 (the primary monitor), `wl_data_device_manager`
-  3 (objects only, nothing is transferred), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1 and `zwp_linux_dmabuf_v1` 3 (while the transport can make GPU
+  3 (objects only, nothing is transferred), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1 and `zwp_linux_dmabuf_v1` 4 (while the transport can make GPU
   images: the kernel sets that up when it has the Direct3D layer).
 - **One coordinate space.** The compositor's screen is the desktop's window manager area; its monitors and work areas come from `set_display`.
   The desktop's "surface" rectangle of a window is the client's window geometry (`xdg_surface.set_window_geometry`, else its buffer), so a
@@ -72,6 +72,10 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
   never shows. `create` answers `created` with a `wl_buffer` of the server's ids (from 0xFF000000; no `delete_id` when it goes), or `failed`; `create_immed`
   answers a buffer that cannot be made with `invalid_wl_buffer`. Every other error of the protocol is checked (`already_used`, `plane_idx`, `plane_set`,
   `incomplete`, `invalid_format`, `invalid_dimensions`, `out_of_bounds`).
+- **Feedback (version 4).** `get_default_feedback` and `get_surface_feedback` answer one tranche with the four formats, linear, on the main device
+  `/dev/dxg` (`TCOS_DXG_DEVICE_NUMBER`, the `st_rdev` an `fstat` of `/dev/dxg` gives), and a format table in a sealed file in memory (16-byte entries:
+  format, padding, modifier). Version 4 sends no format or modifier events, as the protocol says. Without a maker of descriptors (the host harness) the
+  global is offered as version 3.
 - **Drawing, with no copy.** When the desktop draws the window (`draw_window`), the device's own image is lent (`dxgk::Kernel::acquire_export_image`: queued
   work on it done first, made resident and pinned while it is drawn) and drawn in place (`IRenderer2D::draw_device_image`) when the desktop's renderer draws on
   that device: the frame never passes through the CPU. On another device or the CPU renderer the picture is drawn from the CPU's view of it (`read_export`: one
@@ -134,8 +138,7 @@ picture it drew last.
 
 ## Not done
 
-- **GPU buffers.** `zwp_linux_dmabuf_v1` is version 3: no feedback objects (version 4: `get_default_feedback`, the format table, the main device),
-  which newer Mesa and wlroots-based clients prefer but do not need. No `wl_drm`. Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
+- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
   pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). No explicit synchronization (`linux-drm-syncobj`, implicit fences): the
   desktop draws what the image holds when it draws. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):

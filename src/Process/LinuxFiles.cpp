@@ -150,6 +150,7 @@ constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000, kSIfSo
 struct Meta {
   uint32_t mode = 0;
   uint64_t size = 0, ino = 0, modified = 0, created = 0;
+  uint64_t rdev = 0;      // a device node's number (st_rdev)
 };
 
 Meta meta_of(const DirectoryEntry& e, StringView path) {
@@ -177,6 +178,7 @@ uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) 
   put(out, 8, m.ino, 8);
   put(out, x86 ? 16 : 20, 1, x86 ? 8 : 4);                  // st_nlink
   put(out, x86 ? 24 : 16, m.mode, 4);
+  put(out, x86 ? 40 : 32, m.rdev, 8);                      // st_rdev
   put(out, 48, m.size, 8);
   put(out, 56, 4096, x86 ? 8 : 4);                          // st_blksize
   put(out, 64, (m.size + 511) / 512, 8);                    // st_blocks
@@ -203,7 +205,10 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Null: *m = device_meta(kSIfChr | 0666, 3); return 0;
     case DescriptorKind::Zero: *m = device_meta(kSIfChr | 0666, 5); return 0;
     case DescriptorKind::Random: *m = device_meta(kSIfChr | 0666, 9); return 0;
-    case DescriptorKind::Dxg: *m = device_meta(kSIfChr | 0666, 10); return 0;      // (a character device without a file object, like the others)
+    case DescriptorKind::Dxg:      // (a character device without a file object, like the others; its number is the one Wayland's dmabuf feedback names)
+      *m = device_meta(kSIfChr | 0666, 10);
+      m->rdev = TCOS_DXG_DEVICE_NUMBER;
+      return 0;
     case DescriptorKind::UnixSocket: *m = device_meta(kSIfSock | 0777, p.files().token(fd)); return 0;
     default: break;
   }

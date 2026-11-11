@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// zwp_linux_dmabuf_v1 (version 3): wl_buffers whose picture is a GPU image a client passed as a descriptor (on this system an export of the kernel's Direct3D
+// zwp_linux_dmabuf_v1 (version 4): wl_buffers whose picture is a GPU image a client passed as a descriptor (on this system an export of the kernel's Direct3D
 // layer made with /dev/dxg, Process/DxgBufferFile.hpp). The desktop draws one in place (draw_tree), so a client that renders on the GPU shows its frames with
 // no copy through the CPU.
 //
@@ -24,6 +24,11 @@
 // DRM_FORMAT_MOD_INVALID: "the driver's choice", which here is linear), no flags (y-inverted and interlaced pictures are refused), and a size no larger than the
 // image. The four formats are ARGB8888, XRGB8888, ABGR8888 and XBGR8888: the format says whether the alpha counts; the order of the channels is the image's own
 // (the Direct3D layer knows it), so a client's swizzle never shows.
+//
+// Feedback (version 4): one tranche, the four formats, linear, on the main device: /dev/dxg's number (Process/DxgDevice.h), the one device a client makes its
+// buffers on here. The format table is a sealed file in memory of 16-byte entries (format, padding, modifier), the same for every client. Surface feedback is
+// the default feedback (one GPU: nothing differs per surface), and it never changes, so each feedback object gets it once.
+#include "Process/DxgDevice.h"
 #include "Wayland/WaylandInternal.hpp"
 
 namespace wayland {
@@ -42,8 +47,49 @@ bool shm_format_of(uint32_t drm, uint32_t* shm) {
 }
 
 constexpr uint32_t kMaxPlanes = 4;      // (what the protocol allows)
+constexpr uint32_t kTableFormats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
 
 }  // namespace
+
+Fd Server::format_table_fd() {
+  if (format_table_ || !make_fd_) return format_table_;
+  uint8_t table[sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 16] = {};
+  ByteWriter out{ByteView(table, sizeof(table))};
+  for (uint32_t f : kTableFormats) out.le32(f), out.le32(0), out.le64(kDrmModLinear);
+  format_table_ = make_fd_(make_fd_context_, ConstByteView(table, sizeof(table)));
+  return format_table_;
+}
+
+void Server::send_dmabuf_feedback(Client& c, uint32_t feedback) {
+  const Fd table = format_table_fd();
+  if (!table) {
+    post_error(c, kDisplayId, kErrorNoMemory, "no format table");
+    return;
+  }
+  uint8_t device[8];
+  ByteWriter dev{ByteView(device, sizeof(device))};
+  dev.le64(TCOS_DXG_DEVICE_NUMBER);      // (dev_t in the host's byte order: little-endian on every CPU here)
+  uint8_t indices[sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 2];
+  ByteWriter idx{ByteView(indices, sizeof(indices))};
+  for (uint16_t i = 0; i < sizeof(kTableFormats) / sizeof(kTableFormats[0]); ++i) idx.le16(i);
+  Event t(feedback, 1);      // format_table(fd, size)
+  t.fd(table).u(uint32_t(sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 16));
+  send(c, t);
+  Event main(feedback, 2);      // main_device
+  main.array(ConstByteView(device, sizeof(device)));
+  send(c, main);
+  Event target(feedback, 4);      // tranche_target_device
+  target.array(ConstByteView(device, sizeof(device)));
+  send(c, target);
+  Event formats(feedback, 5);      // tranche_formats
+  formats.array(ConstByteView(indices, sizeof(indices)));
+  send(c, formats);
+  Event flags(feedback, 6);      // tranche_flags: none (not scanout)
+  flags.u(0);
+  send(c, flags);
+  send(c, Event(feedback, 3));      // tranche_done
+  send(c, Event(feedback, 0));      // done
+}
 
 // The checks of create and create_immed. A wrong request is a protocol error (false, the client is gone); a buffer that cannot be made from what was given is
 // `failed` for create, and invalid_wl_buffer for create_immed (false too), as the protocol has it. True with *out filled: the buffer is made.
@@ -110,8 +156,27 @@ void Server::dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode
         if (nr) nr->params = util::move(params);
         return;
       }
+      case 2:        // get_default_feedback(new id) (4)
+      case 3: {      // get_surface_feedback(new id, surface) (4)
+        const uint32_t object = in.u();
+        const uint32_t surface = opcode == 3 ? in.object() : 0;
+        if (!in.ok()) return;
+        if (r.version < 4) {
+          post_error(c, id, kErrorInvalidMethod, "zwp_linux_dmabuf_v1 has no such request");
+          return;
+        }
+        if (opcode == 3 && !object_of(c, surface, Iface::Surface, id)) return;
+        if (!new_object(c, object, Iface::DmabufFeedback, r.version, id)) return;
+        send_dmabuf_feedback(c, object);
+        return;
+      }
       default: post_error(c, id, kErrorInvalidMethod, "zwp_linux_dmabuf_v1 has no such request"); return;
     }
+  }
+  if (r.iface == Iface::DmabufFeedback) {
+    if (opcode == 0) destroy_object(c, id);      // destroy
+    else post_error(c, id, kErrorInvalidMethod, "zwp_linux_dmabuf_feedback_v1 has no such request");
+    return;
   }
   // zwp_linux_buffer_params_v1
   if (!r.params) return;

@@ -34,7 +34,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return r;
 }
 enum { NR_READ = 0, NR_WRITE = 1, NR_CLOSE = 3, NR_LSEEK = 8, NR_IOCTL = 16, NR_DUP = 32, NR_SOCKET = 41, NR_CONNECT = 42, NR_SENDMSG = 46, NR_RECVMSG = 47,
-       NR_OPENAT = 257, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_NANOSLEEP = 35, NR_MMAP = 9, NR_MUNMAP = 11 };
+       NR_OPENAT = 257, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_NANOSLEEP = 35, NR_MMAP = 9, NR_MUNMAP = 11, NR_FSTAT = 5 };
 __asm__(".globl _start\n_start:\n  xor %ebp, %ebp\n  mov %rsp, %rdi\n  and $-16, %rsp\n  call start_c\n");
 #elif defined(__aarch64__)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -44,7 +44,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return x0;
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_LSEEK = 62, NR_IOCTL = 29, NR_DUP = 23, NR_SOCKET = 198, NR_CONNECT = 203, NR_SENDMSG = 211,
-       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215 };
+       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215, NR_FSTAT = 80 };
 __asm__(".globl _start\n_start:\n  mov x29, #0\n  mov x0, sp\n  mov x9, sp\n  and x9, x9, #-16\n  mov sp, x9\n  bl start_c\n");
 #elif defined(__riscv)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -54,7 +54,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return a0;
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_LSEEK = 62, NR_IOCTL = 29, NR_DUP = 23, NR_SOCKET = 198, NR_CONNECT = 203, NR_SENDMSG = 211,
-       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215 };
+       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215, NR_FSTAT = 80 };
 __asm__(".globl _start\n_start:\n  li s0, 0\n  mv a0, sp\n  andi sp, sp, -16\n  call start_c\n");
 #else
 #error "no runtime for this CPU"
@@ -126,6 +126,7 @@ static void end(void) {
   if (sys3(NR_SENDMSG, sock, hdr, 0) != (long)msg_len) { ++failed; out("FAIL: sendmsg\n"); }
   pending_fd = -1;
 }
+static int table_fd = -1;
 static u8 in[65536];
 static u32 in_len;
 static int fill(void) {
@@ -135,10 +136,11 @@ static int fill(void) {
   const long got = sys3(NR_RECVMSG, sock, hdr, 0);
   if (got <= 0) return 0;
   in_len += (u32)got;
-  if ((u64)control[0] > 16 && (control[1] & 0xFFFFFFFF) == 1 && (control[1] >> 32) == 1) {      /* (the keymap is not asked for: close what comes) */
+  if ((u64)control[0] > 16 && (control[1] & 0xFFFFFFFF) == 1 && (control[1] >> 32) == 1) {      /* (the feedback's format table; anything else is closed) */
     int fd;
     copy(&fd, &control[2], 4);
-    sys3(NR_CLOSE, fd, 0, 0);
+    if (table_fd < 0) table_fd = fd;
+    else sys3(NR_CLOSE, fd, 0, 0);
   }
   return 1;
 }
@@ -488,14 +490,39 @@ __attribute__((used)) void start_c(long *stack) {
     else if (same(name, "zxdg_decoration_manager_v1")) g_deco = global;
     else if (same(name, "zwp_linux_dmabuf_v1")) g_dmabuf = global, dmabuf_version = arg(1 + (arg(1) + 3) / 4 + 1);
   }
-  CHECK(g_compositor && g_wm && g_deco && g_dmabuf && dmabuf_version == 3);
+  CHECK(g_compositor && g_wm && g_deco && g_dmabuf && dmabuf_version == 4);
   begin(2, 0); put(g_compositor); put_s("wl_compositor"); put(5); put(10); end();
   begin(2, 0); put(g_wm); put_s("xdg_wm_base"); put(5); put(12); end();
   begin(2, 0); put(g_deco); put_s("zxdg_decoration_manager_v1"); put(1); put(14); end();
-  begin(2, 0); put(g_dmabuf); put_s("zwp_linux_dmabuf_v1"); put(3); put(16); end();
-  begin(1, 0); put(17); end();
-  CHECK(wait_event(17, 0));
-  CHECK(modifiers_seen == 4 && linear_seen == 4);
+  begin(2, 0); put(g_dmabuf); put_s("zwp_linux_dmabuf_v1"); put(4); put(16); end();
+  /* version 4: the default feedback - the format table (a sealed file mapped privately, as Mesa does) and the device, which is /dev/dxg */
+  begin(16, 2); put(18); end();
+  CHECK(wait_event(18, 1));
+  const u32 table_size = arg(0);
+  CHECK(table_size == 64 && table_fd >= 0);
+  if (table_fd >= 0) {
+    const long t = sys6(NR_MMAP, 0, 4096, 1, 2, table_fd, 0);      /* PROT_READ, MAP_PRIVATE */
+    CHECK(t > 0 || t < -4096);
+    if (t > 0 || t < -4096) {
+      const u32 *entry = (const u32 *)t;
+      CHECK(entry[0] == 0x34325241 && entry[2] == 0 && entry[3] == 0 && entry[12] == 0x34324258);
+      sys3(NR_MUNMAP, t, 4096, 0);
+    }
+    sys3(NR_CLOSE, table_fd, 0, 0);
+  }
+  CHECK(wait_event(18, 2));
+  u64 main_device = 0;
+  copy(&main_device, ev.args + 4, 8);
+  u8 st[144];
+  const long dxg_dev = sys6(NR_OPENAT, -100, (long)TCOS_DXG_DEVICE_PATH, 2 | 0x80000, 0, 0, 0);
+  CHECK(dxg_dev >= 0 && sys3(NR_FSTAT, dxg_dev, st, 0) == 0);
+  u64 rdev = 0;
+  copy(&rdev, st + (sizeof(long) == 8 && NR_FSTAT == 5 ? 40 : 32), 8);      /* (st_rdev: 40 in x86-64's layout, 32 in the generic one) */
+  CHECK(main_device == rdev && rdev == TCOS_DXG_DEVICE_NUMBER);
+  sys3(NR_CLOSE, dxg_dev, 0, 0);
+  CHECK(wait_event(18, 0));      /* done */
+  begin(18, 0); end();
+  CHECK(modifiers_seen == 0);      /* (version 4 sends no modifier events) */
   /* the buffer: plane 0 is the dmabuf (offset 0, its rows W * 4 bytes apart), linear */
   begin(16, 1); put(39); end();
   begin(39, 1); put(0); put(0); put(W * 4); put(0); put(0); pending_fd = dmabuf; end();

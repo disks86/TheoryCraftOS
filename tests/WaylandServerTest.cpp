@@ -1496,6 +1496,13 @@ static void test_dmabuf() {
   server.set_fd_maker(&make_test_fd, nullptr);
   server.attach(4, 24);
   server.set_display(1024, 768, {});
+  {      // without a maker of descriptors (no format table to send) version 4 is not offered
+    Server bare(A);
+    bare.set_dmabuf(true);
+    WClient c(bare);
+    c.registry();
+    CHECK(c.globals["zwp_linux_dmabuf_v1"].second == 3);
+  }
   {      // not offered until the transport can make GPU images
     WClient c(server);
     c.registry();
@@ -1509,7 +1516,7 @@ static void test_dmabuf() {
   {      // the formats: modifier events (all linear) from version 3, format events before
     WClient c(server);
     const uint32_t r = c.registry();
-    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 1 && c.globals["zwp_linux_dmabuf_v1"].second == 3);
+    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 1 && c.globals["zwp_linux_dmabuf_v1"].second == 4);
     c.drop_events();
     const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
     std::vector<uint32_t> formats;
@@ -1519,6 +1526,53 @@ static void test_dmabuf() {
     c.drop_events();
     const uint32_t d2 = c.bind(r, "zwp_linux_dmabuf_v1", 2);
     CHECK(c.count(d2, 0) == 4 && c.count(d2, 1) == 0);
+    // version 4: no format events; feedback objects say it all (the format table as a sealed file, /dev/dxg as the device, one tranche)
+    c.drop_events();
+    const uint32_t d4 = c.bind(r, "zwp_linux_dmabuf_v1", 4);
+    CHECK(c.count(d4, 0) == 0 && c.count(d4, 1) == 0);
+    const size_t fds_before = c.fds.size();
+    const uint32_t fb = c.new_id();
+    c.send(Msg(d4, 2).u(fb));
+    std::vector<uint16_t> order;
+    for (const Ev& e : c.events) if (e.object == fb) order.push_back(e.opcode);
+    CHECK((order == std::vector<uint16_t>{1, 2, 4, 5, 6, 3, 0}));
+    Ev table = c.take(fb, 1);
+    CHECK(table.u(0) == 64 && c.fds.size() == fds_before + 1);
+    if (c.fds.size() == fds_before + 1) {
+      ByteView t = c.fds.back()->map(64);
+      CHECK(t.size() >= 64);
+      if (t.size() >= 64) {
+        uint32_t f0 = 0, f3 = 0;
+        uint64_t m0 = 1;
+        memcpy(&f0, t.data(), 4);
+        memcpy(&m0, t.data() + 8, 8);
+        memcpy(&f3, t.data() + 48, 4);
+        CHECK(f0 == kAR24 && m0 == 0 && f3 == kXB24);
+      }
+    }
+    Ev main_device = c.take(fb, 2);
+    CHECK(main_device.u(0) == 8 && main_device.u(1) == ((10u << 8) | 243u) && main_device.u(2) == 0);
+    Ev tranche = c.take(fb, 5);
+    CHECK(tranche.u(0) == 8 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
+    c.send(Msg(fb, 0));      // destroy
+    CHECK(c.take(1, 1).u(0) == fb);
+    // per-surface feedback: the same
+    const uint32_t comp = c.bind(r, "wl_compositor");
+    const uint32_t surf = c.new_id();
+    c.send(Msg(comp, 0).u(surf));
+    const uint32_t sfb = c.new_id();
+    c.send(Msg(d4, 3).u(sfb).u(surf));
+    CHECK(c.has(sfb, 0) && c.has(sfb, 2) && !c.closing);
+    c.send(Msg(d4, 3).u(c.new_id()).u(comp));      // (not a surface)
+    CHECK(c.error() && c.closing);
+  }
+  {      // feedback is not a version 3 request
+    WClient c(server);
+    const uint32_t r = c.registry();
+    const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
+    c.send(Msg(d3, 2).u(c.new_id()));
+    uint32_t code = 9;
+    CHECK(c.error(nullptr, &code) && code == 1);
   }
   {      // a toplevel showing a GPU buffer; drawn by the image itself; released when replaced
     DmabufApp app(server);
