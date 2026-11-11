@@ -2578,6 +2578,169 @@ static void test_drag_and_drop() {
   free_made();
 }
 
+// ------------------------------------------------------------------ buffer scale and transform, wp_viewporter, wp_fractional_scale_v1
+
+static uint32_t pattern_px(uint32_t x, uint32_t y) { return 0xFF000000u | x << 8 | y; }
+
+static void test_mapping() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_dmabuf(true);
+  constexpr int32_t BW = 40, BH = 20;
+  struct Case {
+    const char* what;
+    std::function<void(App&, App::Window&, uint32_t viewport)> set;
+    int32_t sw, sh;                       // the surface's size
+    int32_t sx, sy, bx, by;               // a surface pixel and the buffer pixel it shows
+  };
+  const Case cases[] = {
+      {"scale 2", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 8).i(2)); }, 20, 10, 5, 3, 11, 7},
+      {"90", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(1)); }, 20, 40, 2, 30, 30, 17},
+      {"180", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(2)); }, 40, 20, 3, 5, 36, 14},
+      {"270", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(3)); }, 20, 40, 2, 30, 9, 2},
+      {"flipped", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(4)); }, 40, 20, 3, 5, 36, 5},
+      {"flipped 90", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(5)); }, 20, 40, 2, 30, 30, 2},
+      {"90 and scale 2", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(1)); a.send(Msg(w.surface, 8).i(2)); }, 10, 20, 1, 15, 31, 17},
+      {"viewport crop and stretch", [](App& a, App::Window&, uint32_t v) {
+         a.send(Msg(v, 1).i(10 * 256).i(5 * 256).i(20 * 256).i(10 * 256));
+         a.send(Msg(v, 2).i(40).i(20));
+       }, 40, 20, 39, 19, 29, 14},
+      {"viewport crop only", [](App& a, App::Window&, uint32_t v) { a.send(Msg(v, 1).i(10 * 256).i(5 * 256).i(20 * 256).i(10 * 256)); }, 20, 10, 0, 0, 10, 5},
+      {"viewport size only", [](App& a, App::Window&, uint32_t v) { a.send(Msg(v, 2).i(80).i(40)); }, 80, 40, 79, 39, 39, 19},
+  };
+  for (const Case& k : cases) {
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, k.what);
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    k.set(app, w, viewport);
+    App::Pool p = app.pool(size_t(BW) * BH * 4);
+    for (int32_t y = 0; y < BH; ++y)
+      for (int32_t x = 0; x < BW; ++x) {
+        const uint32_t v = pattern_px(uint32_t(x), uint32_t(y));
+        memcpy(p.memory->data() + (y * BW + x) * 4, &v, 4);
+      }
+    const uint32_t b = app.buffer(p, 0, BW, BH, BW * 4);
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 6));
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1 && !app.closing);
+    if (list.size() != 1) continue;
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(list[0], &info, &title));
+    const bool size_ok = int32_t(info.surface.width) == k.sw && int32_t(info.surface.height) == k.sh;
+    const uint32_t got = server.window_pixel(list[0], k.sx, k.sy);
+    // drawn: the same pixel lands where the surface's is (the renderer samples the buffer through the map; a stretch filters, so only the size is checked there)
+    std::vector<uint32_t> target(100 * 100, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 100;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && int32_t(dw) == k.sw && int32_t(dh) == k.sh);
+    }
+    const bool plain = std::string(k.what).find("scale") == std::string::npos && std::string(k.what).find("stretch") == std::string::npos &&
+                       std::string(k.what).find("size only") == std::string::npos;
+    const uint32_t drawn = target[size_t(k.sy) * 100 + size_t(k.sx)];
+    if (!size_ok || got != pattern_px(uint32_t(k.bx), uint32_t(k.by)) || (plain && drawn != got))
+      printf("   mapping '%s': surface %ux%u, pixel %08x (want %08x), drawn %08x\n", k.what, info.surface.width, info.surface.height, got,
+             pattern_px(uint32_t(k.bx), uint32_t(k.by)), drawn);
+    CHECK(size_ok && got == pattern_px(uint32_t(k.bx), uint32_t(k.by)));
+    if (plain) CHECK(drawn == got);
+    CHECK(target[100 * 100 - 1] == 0);      // (nothing outside the surface)
+  }
+  {      // a GPU buffer turned: read through its image
+    DmabufApp app(server);
+    App::Window w = app.toplevel(true, "gpu turned");
+    Fd g = Fd::make_as<FakeGpu>(A, 40u, 20u, 0u);
+    FakeGpu& image = static_cast<FakeGpu&>(*g);
+    for (uint32_t y = 0; y < 20; ++y)
+      for (uint32_t x = 0; x < 40; ++x) image.pixels[y * 40 + x] = pattern_px(x, y);
+    const uint32_t b = app.immed(app.params(g, 0, 160), 40, 20);
+    app.send(Msg(w.surface, 7).i(2));
+    app.commit(w, b, 40, 20);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      CHECK(server.window_pixel(list[0], 3, 5) == pattern_px(36, 14));
+      std::vector<uint32_t> target(100 * 100, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+      ts.width = ts.height = ts.pitch = 100;
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && target[5 * 100 + 3] == pattern_px(36, 14) && image.draws == 0);      // (read, not drawn in place)
+    }
+  }
+  {      // fractional scale: the preferred scale is 1 (120); version 6 surfaces are told the preferred buffer scale and transform
+    App app(server);
+    const uint32_t fsm = app.bind(app.reg, "wp_fractional_scale_manager_v1");
+    const uint32_t s = app.surface();
+    CHECK(app.take(s, 2).i(0) == 1 && app.has(s, 3));
+    const uint32_t f = app.new_id();
+    app.send(Msg(fsm, 1).u(f).u(s));
+    CHECK(app.take(f, 0).u(0) == 120);
+    app.send(Msg(fsm, 1).u(app.new_id()).u(s));
+    uint32_t code = 9;
+    CHECK(app.error(nullptr, &code) && code == 0);
+  }
+  // the rules
+  struct Rule {
+    const char* what;
+    uint32_t code;
+    std::function<void(App&, App::Window&, uint32_t viewporter, uint32_t viewport)> run;
+  };
+  const Rule rules[] = {
+      {"size not a multiple of the scale", 2, [](App& a, App::Window& w, uint32_t, uint32_t) {
+         a.send(Msg(w.surface, 8).i(3));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"source outside the buffer", 2, [](App& a, App::Window& w, uint32_t, uint32_t v) {
+         a.send(Msg(v, 1).i(30 * 256).i(0).i(20 * 256).i(10 * 256));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"fractional source without a destination", 1, [](App& a, App::Window& w, uint32_t, uint32_t v) {
+         a.send(Msg(v, 1).i(0).i(0).i(10 * 256 + 128).i(10 * 256));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"negative source", 0, [](App& a, App::Window&, uint32_t, uint32_t v) { a.send(Msg(v, 1).i(-256).i(0).i(256).i(256)); }},
+      {"zero destination", 0, [](App& a, App::Window&, uint32_t, uint32_t v) { a.send(Msg(v, 2).i(0).i(10)); }},
+      {"second viewport", 0, [](App& a, App::Window& w, uint32_t vp, uint32_t) { a.send(Msg(vp, 1).u(a.new_id()).u(w.surface)); }},
+      {"bad scale", 0, [](App& a, App::Window& w, uint32_t, uint32_t) { a.send(Msg(w.surface, 8).i(0)); }},
+      {"bad transform", 1, [](App& a, App::Window& w, uint32_t, uint32_t) { a.send(Msg(w.surface, 7).i(8)); }},
+  };
+  for (const Rule& k : rules) {
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, "rule");
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    k.run(app, w, viewporter, viewport);
+    uint32_t code = 99;
+    const bool err = app.error(nullptr, &code);
+    if (!err || code != k.code) printf("   mapping rule '%s': error %d code %u\n", k.what, err, code);
+    CHECK(err && code == k.code && app.closing);
+  }
+  {      // the viewport of a surface that went
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    const uint32_t s = app.surface();
+    const uint32_t v = app.new_id();
+    app.send(Msg(viewporter, 1).u(v).u(s));
+    app.send(Msg(s, 0));
+    app.send(Msg(v, 2).i(10).i(10));
+    uint32_t code = 9;
+    CHECK(app.error(nullptr, &code) && code == 3);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2596,6 +2759,7 @@ int main() {
   test_dxg_cpu_mapping();
   test_syncobj();
   test_clipboard();
+  test_mapping();
   test_drag_and_drop();
   test_dxg_fences();
   test_dxg_threads();

@@ -205,7 +205,7 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
   };
   struct Surface;
   struct Client;
@@ -289,6 +289,18 @@ class Server final : public desktop::IWindowsSession {
     bool geometry_set = false;
     Rect geometry;
     SyncPoint acquire, release;  // explicit sync (wp_linux_drm_syncobj_surface_v1)
+    // how the buffer maps onto the surface (0 / -1: not set in this commit)
+    int32_t scale = 0, transform = -1;
+    bool source_set = false, destination_set = false;      // wp_viewport (set_source / set_destination, -1 = unset)
+    int32_t source[4] = {-1, -1, -1, -1};                   // x, y, w, h in 24.8 fixed point
+    int32_t destination[2] = {-1, -1};
+  };
+  // How a surface's buffer maps onto it: buffer_transform, buffer_scale, then the viewport's crop and size.
+  struct BufferMapping {
+    int32_t scale = 1, transform = 0;
+    int32_t source[4] = {-1, -1, -1, -1};      // (24.8; -1: the whole of it)
+    int32_t destination[2] = {-1, -1};
+    bool identity() const { return scale == 1 && transform == 0 && source[0] == -1 && destination[0] == -1; }
   };
   struct Surface {
     explicit Surface(allocators::IAllocator& allocator) : pending_callbacks(allocator), callbacks(allocator), stack(allocator), title(allocator) {}
@@ -297,6 +309,8 @@ class Server final : public desktop::IWindowsSession {
     Role role = Role::None;
     uint32_t xdg_id = 0, role_id = 0, decoration_id = 0;      // xdg_surface; toplevel / popup / subsurface; zxdg_toplevel_decoration_v1
     uint32_t syncobj_id = 0;                    // wp_linux_drm_syncobj_surface_v1 (0: implicit sync)
+    uint32_t viewport_id = 0, fractional_id = 0;      // wp_viewport, wp_fractional_scale_v1
+    BufferMapping mapping;
     bool waiting = false;                       // a commit waits for its acquire point (explicit sync): `waiting_state`
     State waiting_state;
     State pending, cached;                      // (cached: a synchronized subsurface's commit, applied with its parent's)
@@ -416,6 +430,13 @@ class Server final : public desktop::IWindowsSession {
   void dismiss_popups(Surface* keep_root);
   void dismiss_children(Surface& s);
   void shown_size(const Surface& s, int32_t* w, int32_t* h) const;
+  // The surface's size from its buffer and mapping (0 x 0: no buffer), and where a surface point is in the buffer (false: outside it).
+  static void surface_size(const BufferInfo& b, const BufferMapping& m, int32_t* w, int32_t* h);
+  static void unviewported(const BufferInfo& b, const BufferMapping& m, float* w, float* h);
+  static bool surface_to_buffer(const BufferInfo& b, const BufferMapping& m, float sx, float sy, float* bx, float* by);
+  bool check_mapping(Client& c, Surface& s, const State& state);      // (commit: the scale and viewport rules; false: an error was posted)
+  void draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y);
+  void viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void actual_size(const Surface& s, int32_t* w, int32_t* h) const;
   static ArrayView<uint32_t> buffer_pixels(const BufferInfo& b);
   void copy_region(Client& c, uint32_t region, SharedPointer<RegionRects>* out, uint32_t from);

@@ -770,6 +770,7 @@ add_executable(BOOTX64
   src/Wayland/WaylandDmabuf.cpp
   src/Wayland/WaylandInput.cpp
   src/Wayland/WaylandKeymap.cpp
+  src/Wayland/WaylandScale.cpp
   src/Wayland/WaylandServer.cpp
   src/Wayland/WaylandSocketServer.cpp
   src/Wayland/WaylandSurfaces.cpp

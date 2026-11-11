@@ -107,8 +107,7 @@ void Server::actual_size(const Surface& s, int32_t* w, int32_t* h) const {
     *w = s.geometry.w;
     *h = s.geometry.h;
   } else {
-    *w = s.current.valid() ? s.current.width : 0;
-    *h = s.current.valid() ? s.current.height : 0;
+    surface_size(s.current, s.mapping, w, h);
   }
 }
 
@@ -260,12 +259,16 @@ void Server::surface_request(Client& c, uint32_t id, Resource& r, uint16_t opcod
     case 6: commit(c, *s); return;
     case 7: {      // set_buffer_transform
       const int32_t t = in.i();
-      if (in.ok() && (t < 0 || t > 7)) post_error(c, id, kSurfaceInvalidTransform, "invalid transform");
+      if (!in.ok()) return;
+      if (t < 0 || t > 7) post_error(c, id, kSurfaceInvalidTransform, "invalid transform");
+      else s->pending.transform = t;
       return;
     }
-    case 8: {      // set_buffer_scale (pictures are shown 1:1: the output's scale is 1)
+    case 8: {      // set_buffer_scale
       const int32_t scale = in.i();
-      if (in.ok() && scale < 1) post_error(c, id, kSurfaceInvalidScale, "invalid scale");
+      if (!in.ok()) return;
+      if (scale < 1 || scale > 16) post_error(c, id, kSurfaceInvalidScale, "invalid scale");
+      else s->pending.scale = scale;
       return;
     }
     case 10:       // offset(x, y)
@@ -286,7 +289,7 @@ bool Server::synchronized(const Surface& s) const {
 }
 
 void Server::commit(Client& c, Surface& s) {
-  if (!check_sync_points(c, s)) return;
+  if (!check_sync_points(c, s) || !check_mapping(c, s, s.pending)) return;
   if (s.pending.release.set()) {      // (the buffer's use from this commit ends at that point)
     s.pending.buffer.release_timeline = s.pending.release.timeline;
     s.pending.buffer.release_point = s.pending.release.point;
@@ -298,6 +301,10 @@ void Server::commit(Client& c, Surface& s) {
     if (p.damaged) { k.damage = k.damaged ? unite(k.damage, p.damage) : p.damage; k.damaged = true; }
     if (p.opaque_set) { k.opaque_set = true; k.opaque = p.opaque; }
     if (p.input_set) { k.input_set = true; k.input = p.input; }
+    if (p.scale > 0) k.scale = p.scale;
+    if (p.transform >= 0) k.transform = p.transform;
+    if (p.source_set) { k.source_set = true; for (int i = 0; i < 4; ++i) k.source[i] = p.source[i]; }
+    if (p.destination_set) { k.destination_set = true; k.destination[0] = p.destination[0]; k.destination[1] = p.destination[1]; }
     s.has_cached = true;
     s.pending = State();
     for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
@@ -338,6 +345,13 @@ void Server::apply(Client& c, Surface& s, State& state) {
     s.current = state.buffer;
     if (!state.damaged) full = true;      // (a new picture with no damage said: all of it)
   }
+  // how the buffer maps onto the surface (a change of it repaints all of it)
+  const BufferMapping before_mapping = s.mapping;
+  if (state.scale > 0) s.mapping.scale = state.scale;
+  if (state.transform >= 0) s.mapping.transform = state.transform;
+  if (state.source_set) for (int i = 0; i < 4; ++i) s.mapping.source[i] = state.source[i];
+  if (state.destination_set) s.mapping.destination[0] = state.destination[0], s.mapping.destination[1] = state.destination[1];
+  if (!s.mapping.identity() || !before_mapping.identity()) full = true;
   // a GPU picture the client may have written through a CPU mapping: those writes reach the image now (GpuImage::committed)
   if ((state.attached || state.damaged) && s.current.image()) s.current.image()->committed();
   if (state.input_set) s.input = state.input;
@@ -461,7 +475,7 @@ void Server::destroy_surface(Client& c, Surface& s) {
     s.waiting = false;
     --waiting_count_;
   }
-  const uint32_t role_objects[4] = {s.xdg_id, s.role_id, s.decoration_id, s.syncobj_id};
+  const uint32_t role_objects[6] = {s.xdg_id, s.role_id, s.decoration_id, s.syncobj_id, s.viewport_id, s.fractional_id};
   for (uint32_t o : role_objects)
     if (o != 0)
       if (Resource* r = c.objects.find(o)) r->surface = nullptr;
@@ -1339,6 +1353,11 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, i
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
+    if (!s.mapping.identity()) {      // turned, scaled or cropped: one affine map from the buffer to the screen (WaylandScale.cpp)
+      renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
+      draw_mapped(s, renderer, x, y);
+      continue;
+    }
     if (GpuImage* image = s.current.image()) {      // a dmabuf: drawn where it is (see GpuImage::draw)
       renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
       if (!image->draw(renderer, {0, 0, static_cast<uint32_t>(s.current.width), static_cast<uint32_t>(s.current.height)}, x, y)) draw_missed_ = true;

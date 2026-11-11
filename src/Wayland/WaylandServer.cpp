@@ -29,12 +29,13 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 10;
+constexpr uint32_t kGlobalCount = 12;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 5}, {"zxdg_decoration_manager_v1", 1},
     {"zwp_linux_dmabuf_v1", 4},      // (only offered with set_dmabuf; 3 without an fd maker: version 4's feedback needs its format table)
     {"wp_linux_drm_syncobj_manager_v1", 1},      // (with set_dmabuf too: the transport makes the timelines)
+    {"wp_viewporter", 1}, {"wp_fractional_scale_manager_v1", 1},
 };
 constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 
@@ -313,7 +314,8 @@ void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t versi
     return;
   }
   constexpr Iface kIfaces[kGlobalCount] = {Iface::Compositor, Iface::Subcompositor, Iface::Shm, Iface::Seat,
-                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager};
+                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager,
+                                           Iface::Viewporter, Iface::FractionalScaleManager};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -435,6 +437,14 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         s->client = c.number;
         s->id = object;
         nr->surface = s;
+        if (r.version >= 6) {      // (version 6: the scale and transform the client should draw with: the output's)
+          Event scale(object, 2);
+          scale.i(1);
+          send(c, scale);
+          Event transform(object, 3);
+          transform.u(0);
+          send(c, transform);
+        }
       } else if (opcode == 1) {      // create_region
         Resource* nr = new_object(c, object, Iface::Region, 1, id);
         if (!nr) return;
@@ -477,6 +487,10 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::SyncobjManager:
     case Iface::SyncobjTimeline:
     case Iface::SyncobjSurface: syncobj_request(c, id, r, opcode, in); return;
+    case Iface::Viewporter:
+    case Iface::Viewport:
+    case Iface::FractionalScaleManager:
+    case Iface::FractionalScale: viewport_request(c, id, r, opcode, in); return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");
       return;

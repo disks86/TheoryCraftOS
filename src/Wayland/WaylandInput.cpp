@@ -42,7 +42,9 @@ Server::Surface* Server::hit(Surface& s, int32_t x, int32_t y, int32_t* local_x,
       if (Surface* found = hit(*entry, x - entry->sub_x, y - entry->sub_y, local_x, local_y)) return found;
       continue;
     }
-    if (!s.current.valid() || x < 0 || y < 0 || x >= s.current.width || y >= s.current.height) continue;
+    int32_t sw = 0, sh = 0;
+    surface_size(s.current, s.mapping, &sw, &sh);
+    if (!s.current.valid() || x < 0 || y < 0 || x >= sw || y >= sh) continue;
     if (s.input && !s.input->contains(x, y)) continue;
     *local_x = x;
     *local_y = y;

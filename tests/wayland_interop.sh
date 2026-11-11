@@ -15,7 +15,7 @@ for p in stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unsta
   wayland-scanner client-header "$protocols/$p.xml" "$out/$(basename $p)-client-protocol.h"
   wayland-scanner private-code "$protocols/$p.xml" "$out/$(basename $p)-protocol.c"
 done
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Wayland/WaylandScale.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp \
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp -o "$out/WaylandHostServer"
 gcc -O1 -g -Wall -I "$out" tests/wayland/wl_client.c "$out/xdg-shell-protocol.c" "$out/xdg-decoration-unstable-v1-protocol.c" -lwayland-client -lxkbcommon \
   -o "$out/wl_client"

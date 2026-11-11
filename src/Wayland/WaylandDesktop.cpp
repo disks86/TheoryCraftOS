@@ -261,7 +261,13 @@ uint32_t Server::window_pixel(uint32_t window, int32_t x, int32_t y) {
   kernel::ScopedMutex lock(mutex_);
   Surface* s = window_surface(window);
   if (!s || !s->current.valid()) return 0;
-  const int32_t bx = x + (s->geometry_set ? s->geometry.x : 0), by = y + (s->geometry_set ? s->geometry.y : 0);
+  int32_t bx = x + (s->geometry_set ? s->geometry.x : 0), by = y + (s->geometry_set ? s->geometry.y : 0);
+  if (!s->mapping.identity()) {      // (the surface point's pixel in the buffer)
+    float fx = 0, fy = 0;
+    if (!surface_to_buffer(s->current, s->mapping, float(bx) + 0.5f, float(by) + 0.5f, &fx, &fy)) return 0;
+    bx = int32_t(fx);
+    by = int32_t(fy);
+  }
   if (bx < 0 || by < 0 || bx >= s->current.width || by >= s->current.height) return 0;
   if (GpuImage* image = s->current.image()) {      // (0xAARRGGBB whatever the image's order)
     uint32_t pixel = 0;
