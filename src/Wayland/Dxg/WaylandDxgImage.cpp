@@ -25,6 +25,7 @@ namespace wayland {
 namespace {
 
 namespace status = dxgk::status;
+uint64_t g_in_place = 0, g_from_cpu = 0;      // (atomic: the desktop and tests draw from several threads)
 
 // The words of a locked image, for graphics::Surface. Safe: the view is the allocation's own backing (page-aligned memory of the video memory manager, checked
 // below), its rows are whole pixels (the pitch is width * 4 for the formats exported), and it stays valid until end_read_export, which the caller does after
@@ -51,7 +52,10 @@ class DxgImage final : public GpuImage {
       if (kernel_.acquire_export_image(*exported_, &lent) == status::kSuccess) {
         const bool shown = renderer.draw_device_image(*lent.device, *lent.image, source, x, y);
         kernel_.release_export_image(*exported_);
-        if (shown) return true;
+        if (shown) {
+          __atomic_add_fetch(&g_in_place, 1, __ATOMIC_RELAXED);
+          return true;
+        }
         refused_ = &renderer;      // (another device, or a CPU renderer: it will not take it next time either)
       }
     }
@@ -64,7 +68,7 @@ class DxgImage final : public GpuImage {
     picture.pitch = info_.pitch / 4;
     picture.format = dxgk::is_rgba_order(info_.desc.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
     const bool ok = picture.pixels.size() >= uint64_t{picture.pitch} * picture.height;
-    if (ok) renderer.draw_image(picture, source, x, y);
+    if (ok) renderer.draw_image(picture, source, x, y), __atomic_add_fetch(&g_from_cpu, 1, __ATOMIC_RELAXED);
     kernel_.end_read_export(*exported_);
     return ok;
   }
@@ -109,6 +113,13 @@ class DxgTimeline final : public GpuTimeline {
 };
 
 }  // namespace
+
+DxgImageDraws dxg_image_draws() {
+  DxgImageDraws d;
+  d.in_place = __atomic_load_n(&g_in_place, __ATOMIC_RELAXED);
+  d.from_cpu = __atomic_load_n(&g_from_cpu, __ATOMIC_RELAXED);
+  return d;
+}
 
 SharedPointer<GpuTimeline> make_dxg_timeline(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
   if (!kernel || !object || !object->gpu_sync || !object->gpu_sync->exported()) return SharedPointer<GpuTimeline>();

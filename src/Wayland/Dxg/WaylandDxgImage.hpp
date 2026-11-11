@@ -38,6 +38,11 @@ namespace wayland {
 
 // A GpuImage for `object` when it is a GPU image of `kernel` (a dxgk::Kernel); null otherwise. (A SocketServer::MakeGpuImage.)
 SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
+// How the desktop drew GPU buffers so far: in place on their device (no copy) and from the CPU's view (diagnostics: the kernel prints them after an autorun).
+struct DxgImageDraws {
+  uint64_t in_place = 0, from_cpu = 0;
+};
+DxgImageDraws dxg_image_draws();
 // A GpuTimeline for `object` when it is a fence of the Direct3D layer (a sync object's timeline); null otherwise. (A SocketServer::MakeGpuTimeline.)
 SharedPointer<GpuTimeline> make_dxg_timeline(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
 

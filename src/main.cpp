@@ -2161,6 +2161,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         console::puts(" ");
         console::puts(message.view());
         console::puts("\n");
+        const wayland::DxgImageDraws draws = wayland::dxg_image_draws();      // (how the desktop showed Wayland GPU buffers meanwhile)
+        console::puts("autorun: wayland GPU buffer draws in place ");
+        console::put_dec(static_cast<int64_t>(draws.in_place));
+        console::puts(", from the CPU ");
+        console::put_dec(static_cast<int64_t>(draws.from_cpu));
+        console::puts("\n");
       }
     };
     static AutoRun autorun{&shared_allocator, &explorer_files.file_system()};

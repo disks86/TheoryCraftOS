@@ -136,6 +136,12 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
 
+`tests/linux/waylandvktest.c` has also been run in QEMU on the real kernel (`TCOS_AUTORUN=/Linux/usr/bin/waylandvktest`, argument `stay`), on the
+software renderer (standard VGA) and on virgl (`-device virtio-gpu-gl-pci -display egl-headless`; the screen grabbed over `-vnc unix:...`, since QMP's
+`screendump` has no surface in that mode): 117 checks passed on both, the frame showed in a framed desktop window, and on virgl the kernel's count after
+the run (`autorun: wayland GPU buffer draws in place 33, from the CPU 0`, `wayland::dxg_image_draws`) shows every frame drawn in place by the desktop's GPU
+renderer.
+
 It has also been run in QEMU: the kernel started `tests/linux/waylandtest.c` (`TCOS_AUTORUN=/Linux/usr/bin/waylandtest`, argument `stay`), which
 passed its 30 checks with real page tables behind its memfd mappings; its window showed as an ordinary desktop frame with a taskbar button and the
 picture it drew last.
@@ -143,15 +149,33 @@ picture it drew last.
 `tests/wayland_interop.sh` runs the compositor code on the development machine (`tests/wayland/WaylandHostServer.cpp`), with host descriptors.
 `foot` and GTK 4 (`zenity --info`, with `GSK_RENDERER=cairo`) showed their windows correctly there.
 
+## Plan: what GPU clients still need
+
+Real toolkits reach the GPU through Mesa (EGL, GBM) or the Vulkan loader, and both speak to the compositor through libwayland-client. In the order the work
+depends on itself:
+
+1. **A dynamic loader for Linux programs.** libwayland-client, libvulkan.so.1 and Mesa are shared libraries; the Linux layer runs static ELF only. The
+   loader is the gate for everything below (and for running distribution binaries such as foot or GTK applications inside the OS at all).
+2. **`VK_KHR_wayland_surface` in the shared Vulkan driver** (as `libvulkan.so.1`, or as an ICD of the system's loader). The pieces exist: a swapchain image
+   is an exportable image (`vk_external.inc`), a present is `zwp_linux_buffer_params_v1.create_immed` once per image, then attach / damage / commit, with
+   explicit sync's acquire point after the frame's work and the release point waited for in `vkAcquireNextImageKHR`. What is missing is the call path into
+   libwayland-client (`wl_proxy_marshal_flags`, a private event queue for the swapchain), which needs step 1.
+3. **GBM and EGL.** Mesa needs a GBM backend and an EGL platform over `/dev/dxg` instead of a DRM render node: buffers are `/dev/dxg` exports (made by
+   the Direct3D layer with the formats the feedback lists), and GL rendering would go to the kernel's OpenGL (`src/OpenGl`) or to a Zink-like layer on
+   the shared Vulkan driver. The second reuses more: GL over the Vulkan driver, buffers from step 2's code.
+4. **YUV and several planes** (video players' direct output): the Direct3D layer needs NV12 / P010 formats (with planes at offsets of one allocation), the
+   protocol handling more than plane 0, and the desktop's renderers a YUV-to-RGB draw (a shader on the device renderer, the existing conversion code of
+   `src/Hardware/VideoCodec` on the CPU).
+
 ## Not done
 
 - **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
   pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
   once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
-  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):
+  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (see the plan above):
   a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
-  Not run in QEMU yet (only on the CPU emulator and in the host tests, on the software renderer); not tried on virgl or a real GPU.
+  Not tried on a real GPU (only the software renderer and virgl).
 - **Protocols.** No primary selection, `xdg_activation_v1`, `wp_viewporter`, `wp_fractional_scale_v1`, `wp_cursor_shape_v1`, text input,
   pointer constraints, relative pointer, presentation time, idle inhibit, xdg-foreign, layer shell or tablets. `wl_touch` sends nothing.
 - **Clipboard and drag and drop.** `wl_data_device_manager` makes its objects but transfers nothing, and nothing is bridged to the desktop's
