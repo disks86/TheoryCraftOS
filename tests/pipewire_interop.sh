@@ -43,7 +43,8 @@ ports = [o for o in d if o['type'] == 'PipeWire:Interface:Port']
 assert sink['info']['params']['Props'][0]['channelVolumes'] == [1.0, 1.0]
 assert sink['info']['params']['EnumFormat'][0]['format'] == 'S16LE'
 sink_ports = [p for p in ports if p['info']['props'].get('node.id') == sink['id']]
-assert len(sink_ports) == 2 and len(ports) == 4 and all(p['info']['params']['Format'] for p in ports)      # (and the source's two)
+assert len(sink_ports) == 4 and len(ports) == 6 and all(p['info']['params']['Format'] for p in ports)      # (playback and monitor ports, the source's two)
+assert sum(1 for p in sink_ports if p['info']['props'].get('port.monitor') in (True, 'true')) == 2
 assert any(o['type'] == 'PipeWire:Interface:Metadata' and o['metadata'][0]['key'] == 'default.audio.sink' for o in d)
 \""
 check "pw-dump shows the source" "python3 -c \"
@@ -60,6 +61,7 @@ check "pactl list sinks" "timeout 5 pactl list sinks | grep -q 'Name: tcos_outpu
 check "pactl set-sink-volume" "timeout 5 pactl set-sink-volume @DEFAULT_SINK@ 50% && timeout 5 pactl get-sink-volume @DEFAULT_SINK@ | grep -q ' 50%'"
 check "pactl set-sink-mute" "timeout 5 pactl set-sink-mute @DEFAULT_SINK@ 1 && timeout 5 pactl get-sink-mute @DEFAULT_SINK@ | grep -q yes && timeout 5 pactl set-sink-mute @DEFAULT_SINK@ 0"
 timeout 5 pactl set-sink-volume @DEFAULT_SINK@ 100%
+check "pactl list sources shows the monitor" "timeout 5 pactl list short sources | grep -q 'tcos_output.stereo.monitor'"
 check "pactl info names the default source" "timeout 5 pactl info | grep -q 'Default Source: tcos_input.stereo'"
 check "pactl list sources" "timeout 5 pactl list sources | grep -q 'Description: Host test microphone'"
 check "pactl set-source-volume and mute" "timeout 5 pactl set-source-volume @DEFAULT_SOURCE@ 50% && timeout 5 pactl get-source-volume @DEFAULT_SOURCE@ | grep -q ' 50%' && timeout 5 pactl set-source-mute @DEFAULT_SOURCE@ 1 && timeout 5 pactl get-source-mute @DEFAULT_SOURCE@ | grep -q yes && timeout 5 pactl set-source-mute @DEFAULT_SOURCE@ 0 && timeout 5 pactl set-source-volume @DEFAULT_SOURCE@ 100%"
@@ -92,11 +94,23 @@ sleep 0.3
 start=$(date +%s%N)
 timeout 15 paplay "$work/a.wav" & a=$!
 timeout 15 paplay "$work/b.wav" & b=$!
+(sleep 0.4; timeout 0.8 parecord -d @DEFAULT_MONITOR@ --raw --format=s16le --rate=48000 --channels=2 "$work/monitor.raw" || true) & monitor=$!
 check "paplay (44.1 kHz stereo)" "wait $a"
 check "paplay (22.05 kHz mono) at the same time" "wait $b"
 elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
 check "played in real time (${elapsed} ms for 1.5 s)" "[ $elapsed -ge 1300 ] && [ $elapsed -le 4000 ]"
 wait
+wait $monitor || true
+check "parecord of the monitor heard both paplay tones" "python3 - '$work/monitor.raw' <<'PY'
+import cmath, math, struct, sys
+data = open(sys.argv[1], 'rb').read(); n = len(data) // 4
+assert n > 9600, n
+s = struct.unpack('<%dh' % (2 * n), data[:4 * n]); left = s[2 * (n - 9600)::2]
+mag = lambda f: 2 * abs(sum(v * cmath.exp(-2j * math.pi * f * k / 48000) for k, v in enumerate(left))) / len(left)
+a, b = mag(440), mag(660)
+print('   monitor: 440 Hz %.0f, 660 Hz %.0f' % (a, b))
+assert 7000 < a < 9000 and 3700 < b < 4700      # (before the master volume: 8000, and 6000 * 0.707)
+PY"
 check "pactl list sink-inputs saw both" "[ \$(grep -c 'application.name = \"paplay\"' '$work/inputs.txt') -eq 2 ]"
 check "pactl subscribe saw the streams come and go" "grep -q \"'new' on sink-input\" '$work/subscribe.txt' && grep -q \"'remove' on sink-input\" '$work/subscribe.txt'"
 pkill -TERM -f "$work/pwhost $sock" || true

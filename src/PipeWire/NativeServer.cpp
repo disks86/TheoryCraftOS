@@ -363,9 +363,9 @@ void NativeServer::send_info(Client& c, Resource& r) {
         f = b.begin_struct();
         b.int32(static_cast<int32_t>(o.id));
         {
-          const bool takes = o.role == NodeRole::Sink || o.role == NodeRole::Capture;      // (input ports; the others have output ports)
-          b.int32(takes ? 64 : 0);      // max input ports
-          b.int32(takes ? 0 : 64);      // max output ports
+          // (the sink has input ports and its monitor's output ports; a record node input ports; the others output ports)
+          b.int32(o.role == NodeRole::Sink || o.role == NodeRole::Capture ? 64 : 0);      // max input ports
+          b.int32(o.role == NodeRole::Capture ? 0 : 64);                                 // max output ports
         }
         b.int64(0x1f);      // input ports, output ports, state, props, params
         b.int32(static_cast<int32_t>(o.input_ports));

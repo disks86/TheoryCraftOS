@@ -29,7 +29,8 @@
  *    signals the event every period (10 ms) while the stream runs. A client of the capture endpoint is a record stream of the graph: the thread reads
  *    what the kernel recorded into the ring, IAudioCaptureClient hands it out a packet (10 ms) at a time with its device position, the padding is what
  *    waits to be read, and audio lost because the program read too slowly flags the next packet AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY. Exclusive mode
- *    and loopback are refused (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED, E_NOTIMPL).
+ *    is refused (AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED). A render endpoint's client made with AUDCLNT_STREAMFLAGS_LOOPBACK records what the mixer
+ *    plays (the graph's monitor) as a capture client does, except that it hears nothing while nothing plays, as in Windows.
  *  - IAudioRenderClient, IAudioClock (bytes per second), IAudioStreamVolume and IChannelAudioVolume (the first two channels set the stream's volume
  *    and balance), and the process's one audio session (ISimpleAudioVolume, IAudioSessionControl2, IAudioSessionManager2): the session's volume and
  *    mute apply to every stream of the process.
@@ -394,7 +395,8 @@ struct Client {
   IAudioCaptureClient capture_client;
   LONG refs;
   CRITICAL_SECTION lock;
-  BOOL capture;             /* a client of the capture endpoint */
+  BOOL capture;             /* a client of the capture endpoint, or a loopback client of the render endpoint: it records */
+  BOOL loopback;            /* recording what plays (AUDCLNT_STREAMFLAGS_LOOPBACK on the render endpoint) */
   BOOL initialized, started, in_get;
   DWORD flags;
   WAVEFORMATEX format;      /* (the plain part; the graph needs no more) */
@@ -590,7 +592,7 @@ static HRESULT WINAPI ac_initialize(IAudioClient3 *i, AUDCLNT_SHAREMODE mode, DW
   HRESULT hr = S_OK;
   if (c->initialized) hr = AUDCLNT_E_ALREADY_INITIALIZED;
   else if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE) hr = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
-  else if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) hr = E_NOTIMPL;      /* (the graph's sink has no monitor) */
+  else if ((flags & AUDCLNT_STREAMFLAGS_LOOPBACK) && c->capture) hr = AUDCLNT_E_WRONG_ENDPOINT_TYPE;      /* (loopback is the render endpoint's) */
   else if (!wave_format_code(format)) hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
   if (FAILED(hr)) {
     LeaveCriticalSection(&c->lock);
@@ -608,7 +610,8 @@ static HRESULT WINAPI ac_initialize(IAudioClient3 *i, AUDCLNT_SHAREMODE mode, DW
   c->ring = (BYTE *)alloc((SIZE_T)c->buffer_frames * c->frame);
   LONG st = 0;
   const BOOL have_memory = c->staging && c->ring;
-  if (have_memory) c->stream = tcos_audio_open_kind(format, c->capture, &st);
+  if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) c->capture = c->loopback = TRUE;      /* (a render endpoint's loopback client records what plays: the monitor) */
+  if (have_memory) c->stream = tcos_audio_open_from(format, c->capture, c->loopback, &st);
   c->packet = format->nSamplesPerSec / 100;
   if (c->packet < 1) c->packet = 1;
   if (c->packet > c->buffer_frames) c->packet = c->buffer_frames;

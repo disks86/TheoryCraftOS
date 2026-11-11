@@ -121,16 +121,16 @@ void WindowsAudioService::process_exited(uint64_t pid) {
 }
 
 uint32_t WindowsAudioService::open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream) {
-  return open_node(pid, format, name, false, stream);
+  return open_node(pid, format, name, false, false, stream);
 }
 
-uint32_t WindowsAudioService::open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream) {
-  return open_node(pid, format, name, true, stream);
+uint32_t WindowsAudioService::open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, bool monitor) {
+  return open_node(pid, format, name, true, monitor, stream);
 }
 
-uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, uint32_t* stream) {
+uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, bool monitor, uint32_t* stream) {
   *stream = 0;
-  if (capture ? !graph_.source_id() : !graph_.mixer()) return kDeviceNotConnected;
+  if (capture && !monitor ? !graph_.source_id() : !graph_.mixer()) return kDeviceNotConnected;
   if (!format.valid()) return kInvalidParameter;
   kernel::ScopedMutex guard(mutex_);
   Owner* o = owner_locked(pid, true);
@@ -149,7 +149,7 @@ uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, S
   uint32_t node = 0;
   if (capture) {
     SharedPointer<RecordStream> record;
-    node = graph_.create_record(o->client, format, props, &record);
+    node = graph_.create_record(o->client, format, props, &record, monitor);
   } else {
     SharedPointer<PlaybackStream> playback;
     node = graph_.create_playback(o->client, format, props, &playback);
@@ -293,7 +293,8 @@ uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRe
       if (a[5] == 0) name_length = 0;
       if (name_length && !p.read_user(a[5], ByteView(name, name_length))) return kAccessViolation;
       uint32_t node = 0;
-      const uint32_t st = open_node(pid, format, StringView(ConstByteView(name, name_length)), a[0] == kOpenCapture, &node);
+      // (OPEN_CAPTURE with [1] = 1: the monitor, what the mixer plays)
+      const uint32_t st = open_node(pid, format, StringView(ConstByteView(name, name_length)), a[0] == kOpenCapture, a[0] == kOpenCapture && a[1] == 1, &node);
       if (st != kSuccess) return st;
       if (!put(7, node)) {
         close(pid, node, false);

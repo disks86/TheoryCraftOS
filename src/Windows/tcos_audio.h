@@ -110,18 +110,20 @@ static inline void program_name(char *out, int size) {
   out[k] = 0;
 }
 
-/* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream; 0 when it cannot be opened. */
-static inline ULONG64 tcos_audio_open_kind(const WAVEFORMATEX *format, BOOL capture, LONG *status) {
+/* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream of the microphone or (`monitor`)
+ * of what the mixer plays; 0 when it cannot be opened. */
+static inline ULONG64 tcos_audio_open_from(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, LONG *status) {
   char name[128];
   program_name(name, sizeof name);
   ULONG64 stream = 0;
   const ULONG64 code = wave_format_code(format);
-  LONG st = code ? audio_call(capture ? TCOS_AUDIO_OPEN_CAPTURE : TCOS_AUDIO_OPEN, 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
+  LONG st = code ? audio_call(capture ? TCOS_AUDIO_OPEN_CAPTURE : TCOS_AUDIO_OPEN, capture && monitor ? 1 : 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
                  : TCOS_STATUS_INVALID_PARAMETER;
   if (status) *status = st;
   return st == 0 ? stream : 0;
 }
-static inline ULONG64 tcos_audio_open(const WAVEFORMATEX *format, LONG *status) { return tcos_audio_open_kind(format, FALSE, status); }
+static inline ULONG64 tcos_audio_open_kind(const WAVEFORMATEX *format, BOOL capture, LONG *status) { return tcos_audio_open_from(format, capture, FALSE, status); }
+static inline ULONG64 tcos_audio_open(const WAVEFORMATEX *format, LONG *status) { return tcos_audio_open_from(format, FALSE, FALSE, status); }
 
 /* ---- maths without a C runtime ------------------------------------------------------------------------------------------------------------------ */
 

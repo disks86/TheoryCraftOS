@@ -80,6 +80,7 @@ struct GraphObject {
   SharedPointer<RecordStream> record;                // a record stream a protocol opened
   SharedPointer<audio::AudioStream> native;          // a stream a native program opened on the mixer
   uint32_t input_ports = 0, output_ports = 0;
+  bool monitor = false;                              // a record node of the sink's monitor (what plays), not of the source
   // a port
   uint32_t node = 0, direction = 0, channel = 0;     // channel: an SPA position
   // a link
@@ -128,9 +129,10 @@ class Graph {
   // A playback stream of `client` in `format`, its node and ports linked to the sink. 0 when there is no mixer, the format is not valid or the mixer is
   // full. *out is the stream the client writes to.
   uint32_t create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out);
-  // A record stream of `client` in `format`, its node and ports linked from the source. 0 when there is no capture hub, the format is not valid or the
-  // hub is full. *out is the stream the client reads from.
-  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out);
+  // A record stream of `client` in `format`, its node and ports linked from the source (or, with `monitor`, from the sink's monitor ports: what the
+  // mixer plays, before the master volume). 0 when there is no capture hub (no mixer for a monitor), the format is not valid or the hub (the mixer's
+  // taps) is full. *out is the stream the client reads from.
+  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false);
   // `drain`: what is queued still plays; else it stops now. (A record node just stops.)
   void destroy_node(uint32_t node, bool drain = false);
   bool update_node(uint32_t node, const Properties& props, Properties::Mode mode);
@@ -185,7 +187,7 @@ class Graph {
   void remove_locked(uint32_t id);
   void remove_node_locked(uint32_t node, List<SharedPointer<PlaybackStream>>* stopped, bool drain);
   bool add_source_locked();
-  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props);
+  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
   uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props);
@@ -203,6 +205,7 @@ class Graph {
   uint64_t serial_ = 1;
   uint32_t native_client_ = 0, device_ = 0, sink_ = 0, metadata_ = 0;
   uint32_t sink_ports_[2] = {};
+  uint32_t monitor_ports_[2] = {};      // the sink's monitor_FL / monitor_FR
   uint32_t source_device_ = 0, source_ = 0;
   uint32_t source_ports_[2] = {};
   uint8_t source_gain_ = 0;

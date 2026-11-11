@@ -32,7 +32,8 @@
 // name and property updates) read the graph's source - the capture hub's microphone - and the server sends what they record in packets on the stream's
 // channel, a fragment (fragsize) at a time; source and source-output queries, lists, volume and mute, LOOKUP_SOURCE, and their subscription events.
 // "pactl list source-outputs" shows the Windows programs that record as well. Not served (an error answer): upload streams, samples, modules, cards,
-// extensions, monitor sources.
+// extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
+// records what the mixer plays (OBS, "record what you hear").
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
@@ -122,12 +123,15 @@ class PulseServer final : public IProtocolServer {
   void flow(Client& c, Stream& s);
 
   void fill_sink(Client& c, pulse::TagWriter& w);
-  void fill_source(Client& c, pulse::TagWriter& w);
+  // The microphone's source, or (`monitor`) the sink's monitor source.
+  void fill_source(Client& c, pulse::TagWriter& w, bool monitor);
   void fill_source_output(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_sink_input(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_client(Client& c, pulse::TagWriter& w, const GraphObject& o);
   bool is_sink_name(StringView name) const;
   bool is_source_name(StringView name) const;
+  // The source a request names (by name unless `null_name`, else by index): true if there is one, *monitor for the sink's monitor.
+  bool find_source(uint32_t index, StringView name, bool null_name, bool* monitor) const;
   void send_subscription_events(Client& c);
 
   Graph& graph_;

@@ -370,7 +370,7 @@ static void test_graph() {
   CHECK(mixer.initialize());
   Graph g(A, &mixer);
   CHECK(g.initialize());
-  CHECK(count_type(g, ObjectType::Node) == 1 && count_type(g, ObjectType::Port) == 2 && count_type(g, ObjectType::Device) == 1 && count_type(g, ObjectType::Metadata) == 1);
+  CHECK(count_type(g, ObjectType::Node) == 1 && count_type(g, ObjectType::Port) == 4 && count_type(g, ObjectType::Device) == 1 && count_type(g, ObjectType::Metadata) == 1);      // (the sink: two playback ports, two monitor ports)
   bool sink_ok = false;
   g.visit(g.sink_id(), [&](const GraphObject& o) { sink_ok = o.props.get("media.class") == StringView("Audio/Sink") && o.role == NodeRole::Sink; });
   CHECK(sink_ok);
@@ -398,7 +398,7 @@ static void test_graph() {
   g.refresh();
   CHECK(g.serial() > before);
   CHECK(g.playback_count() == 3);
-  CHECK(count_type(g, ObjectType::Link) == 6 && count_type(g, ObjectType::Port) == 2 + 6);
+  CHECK(count_type(g, ObjectType::Link) == 6 && count_type(g, ObjectType::Port) == 4 + 6);
   bool native_seen = false;
   g.for_each([&](const GraphObject& o) {
     if (o.native.get() == native.get()) native_seen = o.client == g.native_client_id() && o.props.get("application.name") == StringView("Media Player");
@@ -1229,7 +1229,9 @@ static void test_record() {
     pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute; uint64_t lat = 0, conf = 0; Properties pl(A); uint8_t formats = 0, enc = 0;
     CHECK(r.u32(&index) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module) && r.cvolume(&vol) && r.boolean(&mute) &&
           r.u32(&monitor) && r.string(&mname) && r.usec(&lat) && r.string(&driver) && r.u32(&flags) && r.proplist(&pl) && r.usec(&conf) && r.volume(&base) &&
-          r.u32(&state) && r.u32(&steps) && r.u32(&card) && r.u32(&nports) && r.string(&port) && r.u8(&formats) && r.format_info(&enc, &pl) && r.at_end());
+          r.u32(&state) && r.u32(&steps) && r.u32(&card) && r.u32(&nports) && r.string(&port) && r.u8(&formats) && r.format_info(&enc, &pl));
+    uint32_t second = 0;      // (and the sink's monitor after it)
+    CHECK(r.u32(&second) && second == (g.sink_id() | (1u << 24)));
     CHECK(index == g.source_id() && name == StringView("tcos_input.stereo") && desc == StringView("Fake microphone") && monitor == pulse::kInvalidIndex);
   }
   t = c.command(11, [](pulse::TagWriter& w) { w.string("@DEFAULT_SOURCE@"); });
@@ -1240,6 +1242,8 @@ static void test_record() {
     CHECK(r.u32(&index) && index == g.source_id());
   }
   t = c.command(11, [](pulse::TagWriter& w) { w.string("tcos_output.stereo.monitor"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);      // (the sink's monitor)
+  t = c.command(11, [](pulse::TagWriter& w) { w.string("no.such.source"); });
   CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
   t = c.command(23, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("tcos_input.stereo"); });
   CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
@@ -1500,6 +1504,163 @@ static void test_record_threads() {
   CHECK(opened == 100 && heard > 100 && g.record_count() == 0 && service.stream_count() == 0 && hub.stream_count() == 0);
 }
 
+// The sink's monitor: what the mixer plays, recorded through the graph, PulseAudio (tcos_output.stereo.monitor, sink | 1 << 24) and the Windows service
+// (WASAPI loopback), with and without a microphone.
+static void test_monitor() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);      // (no capture hub: the monitor is the only source)
+  CHECK(g.initialize() && g.source_id() == 0);
+  uint32_t monitor_ports = 0;
+  g.for_each([&](const GraphObject& o) {
+    if (o.type == ObjectType::Port && o.node == g.sink_id() && o.direction == kDirectionOutput && o.props.get("port.monitor") == StringView("true")) ++monitor_ports;
+  });
+  CHECK(monitor_ports == 2);
+  const uint32_t client = g.add_client(Origin::Linux, 5, "protocol-pulse", "");
+  SharedPointer<RecordStream> rec;
+  const uint32_t node = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true);
+  CHECK(node && rec && mixer.tap_count() == 1);
+  CHECK(!g.create_record(client, PcmFormat{}, Properties(A), &rec, false));      // (no microphone)
+  rec = g.record_of(node);
+  bool linked = false;
+  g.for_each([&](const GraphObject& o) { if (o.type == ObjectType::Link && o.input_node == node && o.output_node == g.sink_id()) linked = true; });
+  CHECK(linked);
+  // something plays: the monitor hears it as mixed
+  SharedPointer<PlaybackStream> play;
+  const uint32_t player = g.create_playback(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &play);
+  std::vector<uint8_t> tone = s16_constant(2400, 2, 1234);
+  CHECK(player && play->write(ConstByteView(tone.data(), tone.size())) == tone.size());
+  mixer.pump();
+  std::vector<uint8_t> got(48000);
+  uint32_t n = rec->read(ByteView(got.data(), got.size()));
+  CHECK(n == audio::AudioMixer::kChunkFrames * 4 && s16_at(got, 200) == 1234 && s16_at(got, 201) == 1234);      // (one chunk a pump)
+  // nothing plays: nothing is heard (as WASAPI loopback)
+  drain_mixer(mixer, dev);
+  rec->flush();
+  mixer.pump();
+  CHECK(rec->available_bytes() == 0);
+  // closing lets the mixer's tap go
+  g.destroy_node(node);
+  dev.play_all();
+  CHECK(play->write(ConstByteView(tone.data(), tone.size())) > 0);
+  mixer.pump();
+  CHECK(mixer.tap_count() == 0);
+
+  // PulseAudio: the monitor is a source; with no microphone it is the default one
+  PulseServer server(g, A);
+  PulseClient c(server);
+  uint8_t cookie[256] = {};
+  std::vector<uint8_t> body;
+  uint32_t cmd = 0;
+  uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(20, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    StringView name, version, user, host, sink, source;
+    pulse::SampleSpec ss;
+    CHECK(r.string(&name) && r.string(&version) && r.string(&user) && r.string(&host) && r.sample_spec(&ss) && r.string(&sink) && r.string(&source) &&
+          source == StringView("tcos_output.stereo.monitor"));
+  }
+  const uint32_t monitor_index = g.sink_id() | (1u << 24);
+  t = c.command(22, [](pulse::TagWriter&) {});      // the sink names its monitor
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t index = 0, module = 0, monitor = 0; StringView name, desc, mname; pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute;
+    CHECK(r.u32(&index) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module) && r.cvolume(&vol) && r.boolean(&mute) &&
+          r.u32(&monitor) && r.string(&mname) && monitor == monitor_index && mname == StringView("tcos_output.stereo.monitor"));
+  }
+  t = c.command(24, [](pulse::TagWriter&) {});      // the source list: only the monitor
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t index = 0, module = 0, of = 0, flags = 0; StringView name, desc, ofname, driver; pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute; uint64_t lat;
+    CHECK(r.u32(&index) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module) && r.cvolume(&vol) && r.boolean(&mute) &&
+          r.u32(&of) && r.string(&ofname) && r.usec(&lat) && r.string(&driver) && r.u32(&flags));
+    CHECK(index == monitor_index && name == StringView("tcos_output.stereo.monitor") && of == g.sink_id() && desc.starts_with("Monitor of "));
+  }
+  for (const char* name : {"@DEFAULT_MONITOR@", "tcos_output.stereo.monitor", "@DEFAULT_SOURCE@"}) {
+    t = c.command(11, [&](pulse::TagWriter& w) { w.string(name); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t index = 0;
+    CHECK(r.u32(&index) && index == monitor_index);
+  }
+  t = c.command(11, [&](pulse::TagWriter& w) { w.string("tcos_input.stereo"); });      // (there is no microphone)
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+  t = c.command(23, [&](pulse::TagWriter& w) { w.u32(monitor_index); w.string(static_cast<const char*>(nullptr)); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  // record the monitor (parec -d @DEFAULT_MONITOR@) while something plays
+  const pulse::SampleSpec spec{pulse::kS16Le, 2, 48000};
+  t = c.command(5, [&](pulse::TagWriter& w) {
+    pulse::TagWriter& x = w;
+    pulse::ChannelMap map; map.channels = 2; map.positions[0] = 1; map.positions[1] = 2;
+    pulse::Cvolume vol; vol.channels = 2; vol.values[0] = vol.values[1] = pulse::kVolumeNorm;
+    x.sample_spec(spec); x.channel_map(map); x.u32(0xFFFFFFFFu); x.string("@DEFAULT_MONITOR@"); x.u32(0xFFFFFFFFu); x.boolean(false); x.u32(960 * 4);
+    for (int i = 0; i < 7; ++i) x.boolean(false);
+    Properties props(A);
+    x.boolean(false); x.boolean(false); x.proplist(props); x.u32(0xFFFFFFFFu); x.boolean(false); x.boolean(false); x.boolean(false);
+    x.u8(0); x.cvolume(vol); x.boolean(false); x.boolean(false); x.boolean(false); x.boolean(false); x.boolean(false);
+  });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  uint32_t channel = 0, output = 0, maxlength = 0, fragsize = 0, source = 0;
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    pulse::SampleSpec ss; pulse::ChannelMap map; StringView sname;
+    CHECK(r.u32(&channel) && r.u32(&output) && r.u32(&maxlength) && r.u32(&fragsize) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&source) && r.string(&sname) &&
+          source == monitor_index && sname == StringView("tcos_output.stereo.monitor"));
+  }
+  size_t heard = 0;
+  bool value_ok = true;
+  for (int i = 0; i < 6; ++i) {
+    dev.play_all();
+    std::vector<uint8_t> more = s16_constant(960, 2, -777);
+    play->write(ConstByteView(more.data(), more.size()));
+    mixer.pump();
+    server.tick();
+    for (const PulsePacket& p : c.take())
+      if (p.channel == channel) {
+        heard += p.payload.size();
+        if (p.payload.size() >= 4 && s16_at(p.payload, 0) != -777 && s16_at(p.payload, 0) != 1234) value_ok = false;
+      }
+  }
+  CHECK(heard >= 960 * 4 * 3 && value_ok);
+  t = c.command(32, [](pulse::TagWriter&) {});      // the source output says it records the monitor
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0, owner = 0, from = 0; StringView name;
+    CHECK(r.u32(&idx) && r.string(&name) && r.u32(&module) && r.u32(&owner) && r.u32(&from) && idx == output && from == monitor_index);
+  }
+  t = c.command(38, [&](pulse::TagWriter& w) { pulse::Cvolume v; v.channels = 2; v.values[0] = v.values[1] = 100; w.u32(monitor_index); w.string(static_cast<const char*>(nullptr)); w.cvolume(v); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);      // (accepted; the monitor has no volume of its own)
+  server.close_client(c.handle);
+  CHECK(g.record_count() == 0);
+
+  // Windows: OPEN_CAPTURE of the monitor (WASAPI loopback) works without a microphone
+  WindowsAudioService service(g, A);
+  uint32_t stream = 0, read = 0;
+  CHECK(service.open_capture(30, PcmFormat{SampleFormat::F32Le, 48000, 2}, "obs.exe", &stream, true) == 0 && stream);
+  CHECK(service.open_capture(30, PcmFormat{SampleFormat::F32Le, 48000, 2}, "obs.exe", &read, false) != 0);      // (no microphone)
+  dev.play_all();
+  play->flush();      // (what the PulseAudio part left queued)
+  play->write(ConstByteView(tone.data(), tone.size()));
+  mixer.pump();
+  std::vector<uint8_t> floats(48000);
+  CHECK(service.read(30, stream, ByteView(floats.data(), floats.size()), &read) == 0 && read >= 1000 * 8);
+  float v = 0;
+  memcpy(&v, floats.data() + 800, 4);
+  CHECK(fabsf(v * 32768.0f - 1234.0f) < 2.0f);
+  service.process_exited(30);
+  g.remove_client(client);
+  dev.play_all();
+  mixer.pump();
+  CHECK(g.record_count() == 0 && mixer.tap_count() == 0);
+}
+
 // ---- the Windows service -------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows_service() {
@@ -1725,6 +1886,7 @@ int main() {
   test_record_convert();
   test_record();
   test_record_threads();
+  test_monitor();
   test_sockets();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());

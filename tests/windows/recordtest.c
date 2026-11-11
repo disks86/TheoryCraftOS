@@ -20,7 +20,8 @@
  * client, one after the other, each checking what it heard. The CPU emulator's microphone (tests/EmulationRun.cpp, TCOS_EMU_AUDIO) hears 880 Hz on the
  * left at 8000 and 1320 Hz on the right at 4000; every API converts it to the format asked for (22.05 kHz stereo 16-bit, 16 kHz mono float, 48 kHz
  * stereo 16-bit). Also: device counts and caps, bad formats and handles, waveInStop/Reset returning headers, position notifications and cursors, packet
- * sizes and device positions, the capture endpoint's properties and volume (the microphone's master gain, apart from the speakers'). Run by
+ * sizes and device positions, the capture endpoint's properties and volume (the microphone's master gain, apart from the speakers'), and WASAPI
+ * loopback capture on the render endpoint (what plays: the emulator's native 300 Hz stream). Run by
  * tests/pipewire_emulated.sh next to tests/linux/pulsetest.c, which records the same microphone at the same time. Prints "recordtest: N checks, M failed". */
 #define COBJMACROS
 #include <windows.h>
@@ -391,11 +392,61 @@ static void wasapi_capture(IMMDeviceEnumerator *en) {
   CloseHandle(event);
 }
 
+/* ---- WASAPI loopback: what plays (the emulator's native 300 Hz stream, 5000 on both sides, and pulsetest's 500 Hz) --------------------------------- */
+
+static void wasapi_loopback(IMMDeviceEnumerator *en) {
+  IMMDevice *speakers = NULL, *mic = NULL;
+  CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &speakers) == S_OK && speakers);
+  CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eCapture, eConsole, &mic) == S_OK && mic);
+  if (!speakers || !mic) return;
+  IAudioClient *client = NULL, *wrong = NULL;
+  WAVEFORMATEX *mix = NULL;
+  CHECK(IMMDevice_Activate(mic, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&wrong) == S_OK && wrong);
+  CHECK(IMMDevice_Activate(speakers, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&client) == S_OK && client);
+  if (!client || !wrong) return;
+  CHECK(IAudioClient_GetMixFormat(client, &mix) == S_OK && mix && mix->nChannels == 2 && mix->nSamplesPerSec == 48000 && mix->wBitsPerSample == 32);
+  if (!mix) return;
+  CHECK(IAudioClient_Initialize(wrong, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, mix, NULL) == AUDCLNT_E_WRONG_ENDPOINT_TYPE);
+  IAudioClient_Release(wrong);
+  CHECK(IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, mix, NULL) == S_OK);
+  IAudioCaptureClient *cap = NULL;
+  IAudioRenderClient *render = NULL;
+  CHECK(IAudioClient_GetService(client, &IID_IAudioRenderClient, (void **)&render) == AUDCLNT_E_WRONG_ENDPOINT_TYPE);      /* (a loopback client records) */
+  CHECK(IAudioClient_GetService(client, &IID_IAudioCaptureClient, (void **)&cap) == S_OK && cap);
+  if (!cap) return;
+  CHECK(IAudioClient_Start(client) == S_OK);
+  int got = 0, rounds = 0;
+  while (got < 9600 && rounds < 1000) {      /* 0.2 s: 60 whole periods of 300 Hz */
+    Sleep(10);
+    ++rounds;
+    UINT32 packet = 0;
+    while (got < 9600 && IAudioCaptureClient_GetNextPacketSize(cap, &packet) == S_OK && packet > 0) {
+      BYTE *data = NULL;
+      UINT32 frames = 0;
+      DWORD flags = 0;
+      if (IAudioCaptureClient_GetBuffer(cap, &data, &frames, &flags, NULL, NULL) != S_OK) break;
+      const float *f = (const float *)data;
+      for (UINT32 i = 0; i < frames * 2 && got * 2 + (int)i < 9600 * 2; ++i) g_samples[got * 2 + i] = f[i] * 32768.0f;
+      got += (int)frames;
+      IAudioCaptureClient_ReleaseBuffer(cap, frames);
+    }
+  }
+  CHECK(got >= 9600);
+  const double l300 = amplitude(g_samples, 9600, 2, 300, 48000), r300 = amplitude(g_samples + 1, 9600, 2, 300, 48000);
+  printf("WASAPI loopback: 300 Hz left %.0f, right %.0f\n", l300, r300);
+  CHECK(about(l300, 5000, 600) && about(r300, 5000, 600));
+  CHECK(IAudioClient_Stop(client) == S_OK);
+  IAudioCaptureClient_Release(cap);
+  IAudioClient_Release(client);
+  CoTaskMemFree(mix);
+}
+
 int main(void) {
   CHECK(SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED)));
   IMMDeviceEnumerator *en = NULL;
   CHECK(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en) == S_OK && en);
   if (en) endpoint_volume(en);
+  if (en) wasapi_loopback(en);      /* (early: the native stream plays for the emulator's first 6 s) */
   wave_in();
   directsound_capture();
   if (en) wasapi_capture(en);

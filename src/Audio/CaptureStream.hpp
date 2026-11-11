@@ -18,6 +18,7 @@
 
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Audio/AudioTap.hpp"
 #include "Audio/Resampler.hpp"
 #include "Audio/StreamFormat.hpp"
 #include "Hardware/AudioDevice/CaptureRing.hpp"
@@ -34,7 +35,7 @@ namespace audio {
 // stream has its own gain and mute. Thread safe.
 //
 // Obtain one from AudioCaptureHub::open_stream(); close() it when done.
-class CaptureStream {
+class CaptureStream final : public IAudioTap {
  public:
   static constexpr uint32_t kDefaultRingBytes = 64 * 1024;  // about 340 ms
 
@@ -61,12 +62,12 @@ class CaptureStream {
 
   // No more audio is delivered; the hub lets the stream go.
   void close() { __atomic_store_n(&closed_, true, __ATOMIC_RELEASE); }
-  bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }
+  bool closed() const override { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }
 
   hardware::AudioCaptureStatistics statistics();
 
   // Hub side: appends recorded frames (in the device's format; they are converted here).
-  void deliver(ConstByteView pcm);
+  void deliver(ConstByteView pcm) override;
 
  private:
   allocators::IAllocator& allocator_;

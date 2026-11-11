@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Audio/AudioTap.hpp"
 #include "Allocators/IAllocator.hpp"
 #include "Audio/AudioStream.hpp"
 #include "Hardware/AudioDevice/IAudioDevice.hpp"
@@ -52,16 +53,17 @@ struct MixerStatistics {
 class AudioMixer {
  public:
   static constexpr uint32_t kMaxStreams = 32;
+  static constexpr uint32_t kMaxTaps = 16;
   static constexpr uint32_t kTargetDelayFrames = hardware::kAudioSampleRate / 20;  // 50 ms
   static constexpr uint32_t kChunkFrames = 1024;
   static constexpr uint32_t kPumpIntervalUs = 5000;
 
   // The mixer plays into `device`, which must outlive it (and must not be one that is removed while the mixer runs: use the next constructor).
   AudioMixer(hardware::IAudioDevice& device, allocators::IAllocator& allocator)
-      : device_(&device), allocator_(allocator), streams_(allocator), volume_(device.volume()), muted_(device.muted()) {}
+      : device_(&device), allocator_(allocator), streams_(allocator), taps_(allocator), volume_(device.volume()), muted_(device.muted()) {}
   // The mixer shares the device, so it stays valid for as long as the mixer uses it.
   AudioMixer(SharedPointer<hardware::IAudioDevice> device, allocators::IAllocator& allocator)
-      : device_(device.get()), owner_(device), allocator_(allocator), streams_(allocator), volume_(device->volume()), muted_(device->muted()) {}
+      : device_(device.get()), owner_(device), allocator_(allocator), streams_(allocator), taps_(allocator), volume_(device->volume()), muted_(device->muted()) {}
   ~AudioMixer() {
     stop_service();
     release_view(allocator_, accumulator_);
@@ -106,6 +108,10 @@ class AudioMixer {
   uint64_t played_frames();
   // The streams now in the mix (copies of the pointers, taken under the mixer's lock), for the sound server's graph. False if out of memory.
   bool snapshot_streams(List<SharedPointer<AudioStream>>* out);
+  // `tap` hears every chunk the mixer mixes from now on (before the master volume: that is the device's), until it is closed. False at kMaxTaps or
+  // out of memory. While nothing plays nothing is mixed, so a tap hears nothing (as WASAPI loopback capture does).
+  bool add_tap(SharedPointer<IAudioTap> tap);
+  uint32_t tap_count();
   MixerStatistics statistics();
   // (the device in use; see current_device() when it can change)
   hardware::IAudioDevice& device() { return *device_; }
@@ -119,6 +125,7 @@ class AudioMixer {
   allocators::IAllocator& allocator_;
   mutable kernel::Mutex mutex_;  // guards the device in use, the stream list, the buffers and the statistics
   List<SharedPointer<AudioStream>> streams_;
+  List<SharedPointer<IAudioTap>> taps_;
   ArrayView<int32_t> accumulator_;  // kChunkFrames stereo frames
   ByteView output_;                 // the same, as 16-bit samples
   uint32_t pending_offset_ = 0;     // part of output_ the device has not taken yet

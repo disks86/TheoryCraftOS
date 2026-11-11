@@ -53,8 +53,8 @@ class WindowsAudioService {
   // The operations on a process's streams without a Process (what call() does once it has read the arguments); the tests drive these.
   uint32_t open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream);
   uint32_t write(uint64_t pid, uint32_t stream, ConstByteView pcm, uint32_t* taken);
-  // A record stream: what the microphone hears from now, in `format`.
-  uint32_t open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream);
+  // A record stream: what the microphone hears from now, in `format` (with `monitor`: what the mixer plays, WASAPI's loopback capture).
+  uint32_t open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, bool monitor = false);
   uint32_t read(uint64_t pid, uint32_t stream, ByteView out, uint32_t* got);
   uint32_t close(uint64_t pid, uint32_t stream, bool drain);
   // Stream 0 is the master volume (the sink), kSourceStream the microphone's master gain (the source). Left and right are 0 .. 0xFFFF; a stream's louder side is its volume, the balance its pan.
@@ -73,7 +73,7 @@ class WindowsAudioService {
   bool owns_locked(uint64_t pid, uint32_t node);
   // The graph node `stream` stands for (0: the sink), if the process may change its volume.
   uint32_t volume_node(uint64_t pid, uint32_t stream, uint32_t* node);
-  uint32_t open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, uint32_t* stream);
+  uint32_t open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, bool monitor, uint32_t* stream);
 
   Graph& graph_;
   allocators::IAllocator& allocator_;

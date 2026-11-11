@@ -219,6 +219,16 @@ bool Graph::initialize() {
     set_port_props(*port, sink_, i, kDirectionInput, "playback_", allocator_);
     sink_ports_[i] = port->id;
   }
+  // the monitor: what the mixer plays, for record streams of the monitor (PulseAudio's tcos_output.stereo.monitor, WASAPI loopback)
+  sink->output_ports = 2;
+  for (uint32_t i = 0; i < 2; ++i) {
+    GraphObject* port = add_locked(ObjectType::Port, 0);
+    if (!port) return false;
+    port->channel = kPositions[i];
+    set_port_props(*port, sink_, i, kDirectionOutput, "monitor_", allocator_);
+    port->props.set("port.monitor", "true");
+    monitor_ports_[i] = port->id;
+  }
   if (capture_) {
     if (!add_source_locked()) return false;
     source_gain_ = gain;
@@ -470,18 +480,22 @@ uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const 
   return id;
 }
 
-uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props) {
+uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor) {
   GraphObject* node = add_locked(ObjectType::Node, client);
   if (!node) return 0;
   node->role = NodeRole::Capture;
+  node->monitor = monitor;
   node->origin = origin;
   node->format = format;
   node->state = kNodeStateRunning;
   node->props.update(props, Properties::Mode::kReplace);
   node->props.set("media.class", "Stream/Input/Audio");
-  node->props.set("target.object", kSourceName);
+  node->props.set("target.object", monitor ? kSinkName : kSourceName);
+  if (monitor) node->props.set("stream.capture.sink", "true");
   name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
+  const uint32_t from_node = monitor ? sink_ : source_;
+  const uint32_t* from_ports = monitor ? monitor_ports_ : source_ports_;
   // ports: mono, or front left and right (more channels are made from those two)
   const uint32_t ports = format.channels == 1 ? 1 : 2;
   node->input_ports = ports;
@@ -496,12 +510,12 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
       if (ports == 2 && s != i) continue;
       GraphObject* link = add_locked(ObjectType::Link, client);
       if (!link) return node_id;
-      link->output_node = source_;
-      link->output_port = source_ports_[s];
+      link->output_node = from_node;
+      link->output_port = from_ports[s];
       link->input_node = node_id;
       link->input_port = port_id;
-      link->props.set_uint("link.output.node", source_);
-      link->props.set_uint("link.output.port", source_ports_[s]);
+      link->props.set_uint("link.output.node", from_node);
+      link->props.set_uint("link.output.port", from_ports[s]);
       link->props.set_uint("link.input.node", node_id);
       link->props.set_uint("link.input.port", port_id);
       link->props.set("factory.name", "link-factory");
@@ -510,9 +524,10 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
   return node_id;
 }
 
-uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out) {
+uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor) {
   *out = SharedPointer<RecordStream>();
-  if (!capture_ || !source_ || !format.valid()) return 0;
+  if (monitor ? !mixer_ : (!capture_ || !source_)) return 0;
+  if (!format.valid()) return 0;
   {
     kernel::ScopedMutex guard(mutex_);
     GraphObject* c = find_locked(client);
@@ -525,7 +540,14 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
   // half a second at the program's rate (a program that reads less often than that loses audio)
   uint32_t ring = sf.frame_size() * (format.rate / 2);
   if (ring < 16384) ring = 16384;
-  SharedPointer<audio::CaptureStream> capture = capture_->open_stream(sf, ring);
+  SharedPointer<audio::CaptureStream> capture;
+  if (monitor) {
+    // (a stream of its own that the mixer feeds what it mixes)
+    capture = SharedPointer<audio::CaptureStream>::make(allocator_, allocator_, sf);
+    if (capture && (!capture->allocate(ring) || !mixer_->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
+  } else {
+    capture = capture_->open_stream(sf, ring);
+  }
   if (!capture) return 0;
   SharedPointer<RecordStream> record = SharedPointer<RecordStream>::make(allocator_, allocator_, format, capture);
   if (!record) {
@@ -537,7 +559,7 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     kernel::ScopedMutex guard(mutex_);
     Origin origin = Origin::Kernel;
     if (GraphObject* c = find_locked(client)) origin = c->origin;
-    id = add_record_node_locked(client, origin, format, props);
+    id = add_record_node_locked(client, origin, format, props, monitor);
     if (GraphObject* node = id ? find_locked(id) : nullptr) node->record = record;
   }
   if (!id) {
@@ -725,7 +747,7 @@ void Graph::sync_source_locked(StringView device_name, uint8_t gain, bool muted)
     GraphObject& o = *p;
     if (o.type != ObjectType::Node || o.role != NodeRole::Capture || !o.record) continue;
     const uint32_t state = o.record->paused() ? kNodeStateIdle : kNodeStateRunning;
-    if (state == kNodeStateRunning) listening = true;
+    if (state == kNodeStateRunning && !o.monitor) listening = true;
     if (state != o.state) {
       o.state = state;
       touch_locked(o);
@@ -768,6 +790,14 @@ void Graph::refresh() {
   List<uint32_t> ended(allocator_);
   for (UniquePointer<GraphObject>& p : objects_.view()) {
     GraphObject& o = *p;
+    if (o.type == ObjectType::Node && o.role == NodeRole::Capture && o.monitor && o.record && !capture_) {
+      // (the monitor's record nodes, when there is no capture hub to look after them)
+      const uint32_t state = o.record->paused() ? kNodeStateIdle : kNodeStateRunning;
+      if (state != o.state) {
+        o.state = state;
+        touch_locked(o);
+      }
+    }
     if (o.type != ObjectType::Node || o.role != NodeRole::Playback) continue;
     if (o.native && !is_live(o.native.get())) {
       ended.push_back(o.id);

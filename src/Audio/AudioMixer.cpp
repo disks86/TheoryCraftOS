@@ -134,6 +134,8 @@ void AudioMixer::pump() {
   // Streams that are over go first, so a closed stream does not hold a slot.
   for (uint64_t i = streams_.count(); i > 0; --i)
     if (streams_[i - 1]->finished()) streams_.remove_at(i - 1);
+  for (uint64_t i = taps_.count(); i > 0; --i)
+    if (taps_[i - 1]->closed()) taps_.remove_at(i - 1);
 
   flush_pending();
   if (pending_bytes_ > 0) return;  // the device is still behind
@@ -170,7 +172,23 @@ void AudioMixer::pump() {
   pending_offset_ = 0;
   pending_bytes_ = mixed * kAudioFrameSize;
   stats_.frames_mixed += mixed;
+  // what the device will play, for the taps
+  for (SharedPointer<IAudioTap>& tap : taps_) tap->deliver(ConstByteView(output_).first(pending_bytes_));
   flush_pending();
+}
+
+bool AudioMixer::add_tap(SharedPointer<IAudioTap> tap) {
+  if (!tap) return false;
+  kernel::ScopedMutex guard(mutex_);
+  for (uint64_t i = taps_.count(); i > 0; --i)
+    if (taps_[i - 1]->closed()) taps_.remove_at(i - 1);
+  if (taps_.count() >= kMaxTaps) return false;
+  return taps_.push_back(util::move(tap));
+}
+
+uint32_t AudioMixer::tap_count() {
+  kernel::ScopedMutex guard(mutex_);
+  return static_cast<uint32_t>(taps_.count());
 }
 
 bool AudioMixer::start_service() {

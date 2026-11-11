@@ -52,6 +52,11 @@ program that records, of any kind, gets a record stream of it.
   side; centre and mono the average, LFE silence). The source's volume and mute are the hub's master gain and mute (the microphone's), a record
   stream's its `CaptureStream`'s gain (neither goes above 1). A paused (corked, stopped) record stream drops what the microphone hears meanwhile, so it
   starts again with sound from the moment it resumes. Native capture streams (WebRTC's through the desktop) are not shown as nodes.
+- **The monitor.** The sink has output ports `monitor_FL`/`monitor_FR` (`port.monitor`). `create_record(..., monitor = true)` makes a record stream
+  that the mixer feeds what it mixes (`AudioMixer::add_tap`, an `IAudioTap` such as a `CaptureStream`), before the master volume (the device's). While
+  nothing plays nothing is mixed, so a monitor stream hears nothing (as WASAPI loopback does) rather than silence. PulseAudio shows it as the source
+  `tcos_output.stereo.monitor` (index sink | 1 << 24, `@DEFAULT_MONITOR@`, the default source when there is no microphone); `NtTcosAudio`'s
+  OPEN_CAPTURE takes it with `[1] = 1`, which WASAPI's `AUDCLNT_STREAMFLAGS_LOOPBACK` on the render endpoint uses.
 
 ## What the protocols serve
 
@@ -90,7 +95,7 @@ while it captures (`Start` with or without `DSCBSTART_LOOPING`, `Stop`), `Lock` 
 position notifications and `DSBPN_OFFSETSTOP`; `IDirectSoundFullDuplex` and `DirectSoundFullDuplexCreate` (a capture and a playback buffer);
 `CLSID_DirectSoundCapture(8)` and `CLSID_DirectSoundFullDuplex` in the class factory. No capture effects (`DSCBCAPS_CTRLFX` is refused).
 
-**WASAPI**: `CLSID_MMDeviceEnumerator` (ole32 finds `mmdevapi.dll` for it) with one render endpoint and one capture endpoint (while there is a
+**WASAPI** (loopback: a render endpoint's client with `AUDCLNT_STREAMFLAGS_LOOPBACK` is a capture client of the monitor): `CLSID_MMDeviceEnumerator` (ole32 finds `mmdevapi.dll` for it) with one render endpoint and one capture endpoint (while there is a
 microphone: form factor `Microphone`, its own id and GUID, `DEVINTERFACE_AUDIO_CAPTURE` for `ActivateAudioInterfaceAsync`), `IMMDevice`
 (`Activate`, the property store: names, form factor, speakers, the engine format), `IMMEndpoint`; `IAudioClient`/`2`/`3` in shared mode, each client a
 stream of the graph in its own format (any format the graph converts, as `AUTOCONVERTPCM` would), event-driven or polled, with `IAudioRenderClient`,
@@ -130,13 +135,12 @@ comes out once stopped), the padding is everything waiting to be read, and audio
   shared-memory buffers (memfd + `mmap(MAP_SHARED)` of a descriptor) and eventfds; the Linux layer has neither yet, so the server answers `-ENOTSUP`.
   Those programs fail; libpulse programs work.
 - **libpipewire recording** has the playback side's gap (`pw_stream` needs `client-node`); `pw-record` fails, `parecord` works.
-- **Monitors and loopback.** The sink has no monitor source (`tcos_output.stereo.monitor`), so recording what plays (OBS, WASAPI loopback,
-  `AUDCLNT_STREAMFLAGS_LOOPBACK`) is refused; PulseAudio's `direct_on_input` (recording one stream) too.
+- **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **Native recorders in the graph.** The hub's own streams (WebRTC's `getUserMedia` through the desktop) are not shown as nodes, so `pactl list
   source-outputs` does not list them.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).
-- **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused) and no loopback capture;
+- **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused);
   endpoint and session notifications are accepted but never sent (nothing changes from outside the process); the master volume has no balance.
   DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`, no capture effects such as AEC or noise suppression), no Doppler shift, no
   property sets (`IKsPropertySet`, EAX); after `Stop` what it had mixed ahead (30 ms or more) still plays. WASAPI capture packets are always 10 ms

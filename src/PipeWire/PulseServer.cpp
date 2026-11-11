@@ -59,6 +59,8 @@ constexpr uint32_t kTagNone = 0xFFFFFFFFu;
 constexpr uint32_t kVersionMask = 0x0000FFFFu;
 constexpr const char* kSinkName = "tcos_output.stereo";
 constexpr const char* kSourceName = "tcos_input.stereo";
+constexpr const char* kMonitorName = "tcos_output.stereo.monitor";
+constexpr uint32_t kMonitorFlag = 1u << 24;      // (a monitor source's index is its sink's with this bit, as pipewire-pulse numbers them)
 constexpr uint8_t kPositionMono = 0, kPositionLeft = 1, kPositionRight = 2;
 constexpr uint32_t kSinkFlags = 0x1 | 0x2 | 0x4;      // hardware volume, latency, hardware
 constexpr uint32_t kSinkStateRunning = 0, kSinkStateIdle = 1, kSinkStateSuspended = 2;
@@ -286,7 +288,27 @@ void PulseServer::send_simple_reply(Client& c, uint32_t tag) { end_command(c, be
 
 bool PulseServer::is_sink_name(StringView name) const { return name == StringView(kSinkName) || name == StringView("@DEFAULT_SINK@"); }
 bool PulseServer::is_source_name(StringView name) const {
-  return graph_.source_id() && (name == StringView(kSourceName) || name == StringView("@DEFAULT_SOURCE@"));
+  if (name == StringView("@DEFAULT_SOURCE@")) return graph_.source_id() || graph_.mixer();      // (the monitor when there is no microphone)
+  return graph_.source_id() && name == StringView(kSourceName);
+}
+
+bool PulseServer::find_source(uint32_t index, StringView name, bool null_name, bool* monitor) const {
+  const uint32_t source = graph_.source_id(), monitor_index = graph_.sink_id() | kMonitorFlag;
+  const bool have_monitor = graph_.mixer() != nullptr;
+  if (!null_name && !name.empty()) {
+    if (name == StringView(kMonitorName) || name == StringView("@DEFAULT_MONITOR@")) {
+      *monitor = true;
+      return have_monitor;
+    }
+    if (name == StringView("@DEFAULT_SOURCE@")) {
+      *monitor = !source;
+      return source || have_monitor;
+    }
+    *monitor = false;
+    return source && name == StringView(kSourceName);
+  }
+  *monitor = index == monitor_index;
+  return (*monitor && have_monitor) || (source && index == source);
 }
 
 void PulseServer::command(Client& c, ConstByteView payload) {
@@ -473,7 +495,8 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
       w.string(kSinkName);
       if (source) w.string(kSourceName);
-      else w.string_null();      // (no capture: no source)
+      else if (graph_.mixer()) w.string(kMonitorName);      // (no microphone: the monitor, as pipewire-pulse does)
+      else w.string_null();
       w.u32(0x7c05ae11);
       if (c.version >= 15) w.channel_map(default_map(2));
       end_command(c, m);
@@ -542,28 +565,30 @@ void PulseServer::command(Client& c, ConstByteView payload) {
     case kGetSourceInfoList: {
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
-      if (source) fill_source(c, w);
+      if (source) fill_source(c, w, false);
+      if (graph_.mixer()) fill_source(c, w, true);
       end_command(c, m);
       return;
     }
     case kGetSourceInfo: {
       uint32_t index = 0;
       StringView name;
-      bool null_name = true;
+      bool null_name = true, monitor = false;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!source || !(index == source || (!null_name && is_source_name(name)))) return send_error(c, tag, kErrNoEntity);
+      if (!find_source(index, name, null_name, &monitor)) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
-      fill_source(c, w);
+      fill_source(c, w, monitor);
       end_command(c, m);
       return;
     }
     case kLookupSource: {
       StringView name;
+      bool monitor = false;
       if (!t.string(&name)) return invalid();
-      if (!is_source_name(name)) return send_error(c, tag, kErrNoEntity);
+      if (name.empty() || !find_source(pulse::kInvalidIndex, name, false, &monitor)) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
-      TagWriter(c.outbox).u32(source);
+      TagWriter(c.outbox).u32(monitor ? sink | kMonitorFlag : source);
       end_command(c, m);
       return;
     }
@@ -692,9 +717,10 @@ void PulseServer::command(Client& c, ConstByteView payload) {
     case kSetSourceVolume: case kSetSourceMute: {
       uint32_t index = 0;
       StringView name;
-      bool null_name = true;
+      bool null_name = true, monitor = false;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!source || !(index == source || (!null_name && is_source_name(name)))) return send_error(c, tag, kErrNoEntity);
+      if (!find_source(index, name, null_name, &monitor)) return send_error(c, tag, kErrNoEntity);
+      if (monitor) return send_simple_reply(c, tag);      /* (the monitor has no volume of its own: it is what the sink plays) */
       float volume = 1.0f;
       bool mute = false;
       graph_.get_volume(source, &volume, &mute);
@@ -935,10 +961,13 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
   if (!spec.valid()) return send_error(c, tag, kErrInvalid);
   if (map.channels == 0) map = default_map(spec.channels);
   if (map.channels != spec.channels) return send_error(c, tag, kErrInvalid);
-  const uint32_t source = graph_.source_id();
-  if (!source) return send_error(c, tag, kErrNoEntity);
-  if (source_index != pulse::kInvalidIndex && source_index != source) return send_error(c, tag, kErrNoEntity);
-  if (!source_name.empty() && !is_source_name(source_name)) return send_error(c, tag, kErrNoEntity);
+  bool monitor = false;
+  if (!find_source(source_index == pulse::kInvalidIndex && source_name.empty() ? graph_.source_id() : source_index, source_name, source_name.empty(), &monitor)) {
+    // (no source given and no microphone: the monitor)
+    if (!(source_index == pulse::kInvalidIndex && source_name.empty() && graph_.mixer())) return send_error(c, tag, kErrNoEntity);
+    monitor = true;
+  }
+  const uint32_t source = monitor ? graph_.sink_id() | kMonitorFlag : graph_.source_id();
   if (direct_on_input != pulse::kInvalidIndex && direct_on_input != 0) return send_error(c, tag, kErrNotSupported);      // (recording one stream's output)
   PcmFormat format;
   if (!to_pcm_format(spec, &format)) return send_error(c, tag, kErrNotSupported);
@@ -947,7 +976,7 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
   props.update(c.props, Properties::Mode::kMerge);
   props.set("client.api", "pipewire-pulse");
   SharedPointer<RecordStream> record;
-  const uint32_t node = graph_.create_record(c.graph_client, format, props, &record);
+  const uint32_t node = graph_.create_record(c.graph_client, format, props, &record, monitor);
   if (!node) return send_error(c, tag, kErrTooLarge);
   UniquePointer<Stream> s = UniquePointer<Stream>::make(allocator_, allocator_);
   if (!s) {
@@ -985,7 +1014,7 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
     w.sample_spec(spec);
     w.channel_map(map);
     w.u32(source);
-    w.string(kSourceName);
+    w.string(monitor ? kMonitorName : kSourceName);
     w.boolean(false);
   }
   if (c.version >= 13) w.usec(kSourceLatencyUs);
@@ -1115,8 +1144,8 @@ void PulseServer::fill_sink(Client& c, TagWriter& w) {
     w.u32(pulse::kInvalidIndex);      // module
     w.cvolume(flat_volume(2, linear_to_pulse_volume(o.volume)));
     w.boolean(o.mute);
-    w.u32(pulse::kInvalidIndex);      // monitor source
-    w.string_null();
+    w.u32(o.id | kMonitorFlag);       // monitor source
+    w.string(kMonitorName);
     w.usec(kSinkLatencyUs);
     w.string("tcos-mixer");
     w.u32(kSinkFlags);
@@ -1169,28 +1198,51 @@ void PulseServer::fill_sink_input(Client& c, TagWriter& w, const GraphObject& o)
   }
 }
 
-void PulseServer::fill_source(Client& c, TagWriter& w) {
-  graph_.visit(graph_.source_id(), [&](const GraphObject& o) {
-    w.u32(o.id);
-    w.string(kSourceName);
-    w.string(o.props.get("node.description"));
+void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor) {
+  graph_.visit(monitor ? graph_.sink_id() : graph_.source_id(), [&](const GraphObject& o) {
+    String description(allocator_);
+    if (monitor) {
+      description.append("Monitor of ");
+      description.append(o.props.get("node.description"));
+    } else {
+      description.append(o.props.get("node.description"));
+    }
+    w.u32(monitor ? o.id | kMonitorFlag : o.id);
+    w.string(monitor ? kMonitorName : kSourceName);
+    w.string(description.view());
     w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
     w.channel_map(default_map(2));
     w.u32(pulse::kInvalidIndex);      // module
-    w.cvolume(flat_volume(2, linear_to_pulse_volume(o.volume)));
-    w.boolean(o.mute);
-    w.u32(pulse::kInvalidIndex);      // monitor of sink: none, it is a microphone
-    w.string_null();
+    w.cvolume(flat_volume(2, monitor ? pulse::kVolumeNorm : linear_to_pulse_volume(o.volume)));
+    w.boolean(monitor ? false : o.mute);
+    if (monitor) {
+      w.u32(o.id);                    // monitor of sink
+      w.string(kSinkName);
+    } else {
+      w.u32(pulse::kInvalidIndex);    // a microphone: monitor of nothing
+      w.string_null();
+    }
     w.usec(kSourceLatencyUs);
-    w.string("tcos-capture");
-    w.u32(kSinkFlags);                // (the same flags: hardware volume, latency, hardware)
+    w.string(monitor ? "tcos-mixer" : "tcos-capture");
+    w.u32(monitor ? 0x2u : kSinkFlags);      // (the monitor: latency only, no volume or hardware of its own)
     if (c.version >= 13) {
-      w.proplist(o.props);
+      if (monitor) {
+        Properties props(allocator_);
+        props.set("device.class", "monitor");
+        props.set("device.description", description.view());
+        props.set("node.name", kMonitorName);
+        props.set("media.class", "Audio/Source");
+        w.proplist(props);
+      } else {
+        w.proplist(o.props);
+      }
       w.usec(kSourceLatencyUs);
     }
     if (c.version >= 15) {
       w.volume(pulse::kVolumeNorm);
-      w.u32(o.state == kNodeStateRunning ? kSinkStateRunning : o.state == kNodeStateSuspended ? kSinkStateSuspended : kSinkStateIdle);
+      const uint32_t state = monitor ? (o.state == kNodeStateRunning ? kSinkStateRunning : kSinkStateIdle)
+                                     : (o.state == kNodeStateRunning ? kSinkStateRunning : o.state == kNodeStateSuspended ? kSinkStateSuspended : kSinkStateIdle);
+      w.u32(state);
       w.u32(pulse::kVolumeNorm + 1);
       w.u32(pulse::kInvalidIndex);
     }
@@ -1212,7 +1264,7 @@ void PulseServer::fill_source_output(Client& c, TagWriter& w, const GraphObject&
   w.string(o.props.get("media.name"));
   w.u32(pulse::kInvalidIndex);      // module
   w.u32(o.client ? o.client : pulse::kInvalidIndex);
-  w.u32(graph_.source_id());
+  w.u32(o.monitor ? graph_.sink_id() | kMonitorFlag : graph_.source_id());
   w.sample_spec(spec);
   w.channel_map(default_map(spec.channels));
   w.usec(kSourceLatencyUs);

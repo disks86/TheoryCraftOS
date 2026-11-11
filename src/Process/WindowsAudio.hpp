@@ -38,7 +38,8 @@
 //   8 GET_VOLUME  [1] (0: master, 0xFFFFFFFF: microphone); [6] = 1 when muted, [7] = left | right << 16.
 //   9 DEVICES     [6] = the number of input devices (0 or 1: a microphone is there), [7] = the number of output devices (0 or 1: the mixer's).
 //  10 SET_MUTE    [1] (0: master, 0xFFFFFFFF: microphone), [2] 1 muted, 0 not. The volume is kept.
-//  11 OPEN_CAPTURE  as OPEN; [7] = a capture stream that records from now.
+//  11 OPEN_CAPTURE  as OPEN, [1] 0: the microphone, 1: the monitor (what the mixer plays, for WASAPI loopback); [7] = a capture stream that
+//                 records from now.
 //  12 READ        [1], [2] buffer, [3] bytes (at most 1 MiB); [7] = the bytes read (whole frames; 0 when nothing is waiting). Never blocks.
 // STATUS_INVALID_HANDLE for a stream the process does not have, STATUS_INVALID_PARAMETER for a format the graph cannot take, STATUS_DEVICE_NOT_CONNECTED
 // when there is no audio device (or, for OPEN_CAPTURE, no capture hub), STATUS_NOT_SUPPORTED without the graph.
