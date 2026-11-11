@@ -217,6 +217,14 @@ add_executable(BOOTX64
   src/Audio/Resampler.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/PipeWire/Graph.cpp
+  src/PipeWire/NativeServer.cpp
+  src/PipeWire/PlaybackStream.cpp
+  src/PipeWire/Pod.cpp
+  src/PipeWire/PulseServer.cpp
+  src/PipeWire/SocketServer.cpp
+  src/PipeWire/Tagstruct.cpp
+  src/PipeWire/WindowsAudioService.cpp
   src/Audio/AudioRouter.cpp
   src/Audio/WavFile.cpp
   src/Audio/AudioPlayer.cpp
@@ -752,6 +760,7 @@ add_executable(BOOTX64
   src/Process/WindowsDialogs.cpp
   src/Process/WindowsFonts.cpp
   src/Process/WindowsOpenGl.cpp
+  src/Process/WindowsAudio.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp

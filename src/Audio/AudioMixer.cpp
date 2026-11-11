@@ -91,6 +91,27 @@ uint32_t AudioMixer::stream_count() {
   return static_cast<uint32_t>(streams_.count());
 }
 
+uint64_t AudioMixer::mixed_frames() {
+  kernel::ScopedMutex guard(mutex_);
+  return stats_.frames_mixed;
+}
+
+uint64_t AudioMixer::played_frames() {
+  kernel::ScopedMutex guard(mutex_);
+  // (what was cut for the device and not taken yet counts as not played as well)
+  const uint64_t waiting = uint64_t{device_->queued_bytes() / kAudioFrameSize} + pending_bytes_ / kAudioFrameSize;
+  return stats_.frames_mixed > waiting ? stats_.frames_mixed - waiting : 0;
+}
+
+bool AudioMixer::snapshot_streams(List<SharedPointer<AudioStream>>* out) {
+  out->clear();
+  kernel::ScopedMutex guard(mutex_);
+  if (!out->reserve(streams_.count())) return false;
+  for (SharedPointer<AudioStream>& stream : streams_)
+    if (!out->push_back(stream)) return false;
+  return true;
+}
+
 MixerStatistics AudioMixer::statistics() {
   kernel::ScopedMutex guard(mutex_);
   MixerStatistics copy = stats_;

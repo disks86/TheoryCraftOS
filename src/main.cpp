@@ -21,6 +21,11 @@
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "X11/X11SocketServer.hpp"
+#include "PipeWire/Graph.hpp"
+#include "PipeWire/NativeServer.hpp"
+#include "PipeWire/PulseServer.hpp"
+#include "PipeWire/SocketServer.hpp"
+#include "PipeWire/WindowsAudioService.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
 #include "OpenGl/WindowsGl.hpp"
@@ -2102,6 +2107,25 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (x11_sockets && x11_sockets->listen(0, &explorer_files.file_system()) && x11_sockets->start()) console::puts("x11: listening on DISPLAY=:0\n");
         else console::puts("x11: the X server could not listen\n");
       }
+    }
+    // The kernel's PipeWire (src/PipeWire): one media graph over the mixer for every kind of program, so that their sound is mixed. The native programs'
+    // streams show up in it by themselves; Linux programs reach it at $XDG_RUNTIME_DIR/pipewire-0 (PipeWire's protocol) and $XDG_RUNTIME_DIR/pulse/native
+    // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll and NtTcosAudio. (Gone before the mixer is.)
+    pipewire::Graph media_graph(shared_allocator, mixer.get());
+    pipewire::NativeServer pipewire_native(media_graph, shared_allocator);
+    pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
+    pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);
+    UniquePointer<pipewire::SocketServer> pipewire_sockets;
+    if (media_graph.initialize()) {
+      pipewire::install_windows_audio(windows_audio);
+      process::win32k::register_process_exit_hook([](uint64_t pid) { pipewire::windows_audio_process_exited(pid); });
+      if (process::UnixSocketManager* sockets = process::system_unix_sockets())
+        pipewire_sockets = UniquePointer<pipewire::SocketServer>::make(shared_allocator, *sockets, shared_allocator);
+      if (pipewire_sockets && pipewire::listen_standard_sockets(*pipewire_sockets, pipewire_native, pipewire_pulse, &explorer_files.file_system(), shared_allocator) &&
+          pipewire_sockets->start())
+        Entry(Level::Ok, "PipeWire").text("graph running; listening at ").text(filesystem::layout::kLinuxRuntimeFolder).text("/pipewire-0 and /pulse/native");
+      else
+        Entry(Level::Warning, "PipeWire").text("the PipeWire sockets could not listen");
     }
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);

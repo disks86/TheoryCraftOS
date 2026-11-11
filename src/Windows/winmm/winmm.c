@@ -19,9 +19,11 @@
 /* winmm.dll for TheoryCraftOS: the multimedia timer and the answers of a machine with no wave, MIDI, mixer or joystick device behind winmm.
  *   time*      timeGetTime (milliseconds since boot), timeGetDevCaps (1 .. 65535 ms), timeBegin/EndPeriod (accepted: the scheduler's sleeps are not tick-bound), and
  *              timeSetEvent / timeKillEvent over kernel32's timer queues: at most 16 events at once, ids that are not reused right away, a one-shot event is gone once it fired.
- *   devices    the open functions of wave, MIDI and mixer devices answer that there is none (a stub answered MMSYSERR_NOERROR and left the handle unset); the joystick functions
+ *   wave out   one device: the kernel's PipeWire graph (waveout.inc, over NtTcosAudio), so a Windows program's sound is mixed with the native and Linux
+ *              programs'; PlaySound / sndPlaySound play WAVE files and images through it.
+ *   devices    the open functions of wave in, MIDI and mixer devices answer that there is none (a stub answered MMSYSERR_NOERROR and left the handle unset); the joystick functions
  *              answer for 16 empty slots (JOYERR_PARMS / JOYERR_UNPLUGGED).
- * Not here (still stubs): PlaySound and the MCI, mmio, ACM and driver functions. Built freestanding over kernel32.dll and ntdll.dll. */
+ * Not here (still stubs): the MCI, mmio, ACM and driver functions. Built freestanding over kernel32.dll and ntdll.dll. */
 #define WIN32_LEAN_AND_MEAN
 #define _WINMM_      /* (the definitions: mmsystem.h declares the functions without dllimport) */
 #include <windows.h>
@@ -200,12 +202,6 @@ EXPORT MMRESULT WINAPI joyReleaseCapture(UINT id) { return joystick_slot(id); }
  * The counts are 0 (the stubs' answer); the open functions clear the handle and answer that the device does not exist (the mapper, that there is no driver). */
 #define MAPPER_ID ((UINT)-1)
 static MMRESULT no_device(UINT id) { return id == MAPPER_ID ? MMSYSERR_NODRIVER : MMSYSERR_BADDEVICEID; }
-EXPORT MMRESULT WINAPI waveOutOpen(LPHWAVEOUT out, UINT id, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
-  (void)callback; (void)instance; (void)flags;
-  if (out) *out = NULL;
-  if (!format) return MMSYSERR_INVALPARAM;
-  return no_device(id);
-}
 EXPORT MMRESULT WINAPI waveInOpen(LPHWAVEIN out, UINT id, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
   (void)callback; (void)instance; (void)flags;
   if (out) *out = NULL;
@@ -236,8 +232,6 @@ EXPORT MMRESULT WINAPI mixerOpen(LPHMIXER out, UINT id, DWORD_PTR callback, DWOR
   if (out) *out = NULL;
   return MMSYSERR_BADDEVICEID;
 }
-EXPORT MMRESULT WINAPI waveOutGetDevCapsA(UINT_PTR id, LPWAVEOUTCAPSA caps, UINT size) { (void)size; return caps ? no_device((UINT)id) : MMSYSERR_INVALPARAM; }
-EXPORT MMRESULT WINAPI waveOutGetDevCapsW(UINT_PTR id, LPWAVEOUTCAPSW caps, UINT size) { (void)size; return caps ? no_device((UINT)id) : MMSYSERR_INVALPARAM; }
 EXPORT MMRESULT WINAPI waveInGetDevCapsA(UINT_PTR id, LPWAVEINCAPSA caps, UINT size) { (void)size; return caps ? no_device((UINT)id) : MMSYSERR_INVALPARAM; }
 EXPORT MMRESULT WINAPI waveInGetDevCapsW(UINT_PTR id, LPWAVEINCAPSW caps, UINT size) { (void)size; return caps ? no_device((UINT)id) : MMSYSERR_INVALPARAM; }
 EXPORT MMRESULT WINAPI midiOutGetDevCapsA(UINT_PTR id, LPMIDIOUTCAPSA caps, UINT size) { (void)size; return caps ? no_device((UINT)id) : MMSYSERR_INVALPARAM; }
@@ -249,21 +243,11 @@ EXPORT MMRESULT WINAPI mixerGetDevCapsW(UINT_PTR id, LPMIXERCAPSW caps, UINT siz
 
 /* The counts: no devices. The functions on an open device get a handle that no open function ever gave out: MMSYSERR_INVALHANDLE (a stub answered MMSYSERR_NOERROR, so
  * a program that wrote a buffer waited for a WOM_DONE that never came). */
-EXPORT UINT WINAPI waveOutGetNumDevs(void) { return 0; }
 EXPORT UINT WINAPI waveInGetNumDevs(void) { return 0; }
 EXPORT UINT WINAPI midiOutGetNumDevs(void) { return 0; }
 EXPORT UINT WINAPI midiInGetNumDevs(void) { return 0; }
 EXPORT UINT WINAPI mixerGetNumDevs(void) { return 0; }
 EXPORT UINT WINAPI auxGetNumDevs(void) { return 0; }
-EXPORT MMRESULT WINAPI waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutPrepareHeader(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutUnprepareHeader(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutWrite(HWAVEOUT h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutPause(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutRestart(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutBreakLoop(HWAVEOUT h) { (void)h; return MMSYSERR_INVALHANDLE; }
-EXPORT MMRESULT WINAPI waveOutGetPosition(HWAVEOUT h, LPMMTIME time, UINT size) { (void)h; (void)time; (void)size; return MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI waveInClose(HWAVEIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI waveInPrepareHeader(HWAVEIN h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI waveInUnprepareHeader(HWAVEIN h, LPWAVEHDR header, UINT size) { (void)h; (void)header; (void)size; return MMSYSERR_INVALHANDLE; }
@@ -285,6 +269,8 @@ EXPORT MMRESULT WINAPI midiInStart(HMIDIIN h) { (void)h; return MMSYSERR_INVALHA
 EXPORT MMRESULT WINAPI midiInStop(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI midiInReset(HMIDIIN h) { (void)h; return MMSYSERR_INVALHANDLE; }
 EXPORT MMRESULT WINAPI mixerClose(HMIXER h) { (void)h; return MMSYSERR_INVALHANDLE; }
+
+#include "waveout.inc"
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module;

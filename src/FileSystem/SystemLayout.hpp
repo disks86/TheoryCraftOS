@@ -97,6 +97,12 @@ inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
 // The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
 inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
 inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
+// The runtime folder of the Linux programs' user ($XDG_RUNTIME_DIR, root's: uid 0) as they see it and where it is on the system's file system. The
+// kernel's PipeWire listens there (src/PipeWire/SocketServer.hpp): pipewire-0 (PipeWire's protocol) and pulse/native (PulseAudio's).
+inline constexpr const char* kLinuxRuntimeFolder = "/run/user/0";
+inline constexpr const char* kRuntimeFolder = "/Linux/run/user/0";
+inline constexpr const char* kPipeWireSocket = "pipewire-0";
+inline constexpr const char* kPulseSocket = "pulse/native";
 // Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
 inline constexpr const char* kLinuxFirmware = "/Linux/lib/firmware";
 inline constexpr const char* kLinuxFirmwareIntelVpu = "/Linux/lib/firmware/intel/vpu";
@@ -132,7 +138,7 @@ inline constexpr const char* kWindowsFolders[] = {
 // presents devices and process information; here they start out empty.
 inline constexpr const char* kLinuxFolders[] = {
     kLinuxBin, "/Linux/boot", "/Linux/dev", kLinuxEtc, "/Linux/etc/opt", kLinuxHome, "/Linux/lib", kLinuxFirmware, "/Linux/lib/firmware/intel", kLinuxFirmwareIntelVpu, "/Linux/lib64", "/Linux/media",
-    "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
+    "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", "/Linux/run/user", kRuntimeFolder, "/Linux/run/user/0/pulse", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
     "/Linux/usr", kLinuxUsrBin, "/Linux/usr/include", "/Linux/usr/lib", "/Linux/usr/lib64", "/Linux/usr/local", "/Linux/usr/local/bin",
     "/Linux/usr/local/lib", "/Linux/usr/sbin", "/Linux/usr/share", "/Linux/var", "/Linux/var/cache", "/Linux/var/lib", "/Linux/var/log",
     "/Linux/var/tmp",

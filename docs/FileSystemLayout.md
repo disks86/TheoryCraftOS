@@ -33,7 +33,9 @@ Linux processes see `/Linux` as `/`, with the Filesystem Hierarchy Standard fold
 `media`, `mnt`, `opt`, `proc`, `root`, `run`, `sbin`, `srv`, `sys`, `tmp`, `usr` (`bin`, `include`, `lib`, `lib64`, `local`, `sbin`, `share`)
 and `var` (`cache`, `lib`, `log`, `tmp`). `dev`, `proc` and `sys` are plain empty folders for now; the kernel answers a few names under `/dev` itself (`null`, `zero`, `random`, `urandom`, `tty`, and `dxg`: the
 kernel-mode Direct3D layer, see [Vulkan.md](Vulkan.md)) without files behind them. The kernel's X server listens at `/tmp/.X11-unix/X0`
-(`/Linux/tmp/.X11-unix/X0`, `kX11SocketFolder`; see [X11.md](X11.md)), which it makes at start. Use the `kWindows*` and `kLinux*`
+(`/Linux/tmp/.X11-unix/X0`, `kX11SocketFolder`; see [X11.md](X11.md)), which it makes at start. Linux programs get `XDG_RUNTIME_DIR=/run/user/0`
+(`kLinuxRuntimeFolder`, on disk `/Linux/run/user/0`, `kRuntimeFolder`), where the kernel's PipeWire listens at `pipewire-0` and `pulse/native` (see
+[PipeWire.md](PipeWire.md)). Use the `kWindows*` and `kLinux*`
 constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
 
 Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads

@@ -65,7 +65,8 @@ bool world_directory(SyscallAbi abi, StringView shell_cwd, String* out) {
 
 ArrayView<const StringView> default_environment(SyscallAbi abi) {
   static const StringView kLinux[] = {"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=dumb", "LANG=C.UTF-8", "SHELL=/bin/sh",
-                                       "DISPLAY=:0"};      // (the kernel's X server, src/X11)
+                                       "DISPLAY=:0",      // (the kernel's X server, src/X11)
+                                       "XDG_RUNTIME_DIR=/run/user/0"};      // (the kernel's PipeWire listens there: src/PipeWire)
   static const StringView kWindows[] = {"SystemDrive=C:", "SystemRoot=C:\\Windows", "windir=C:\\Windows", "PATH=C:\\Windows\\System32;C:\\Windows", "TEMP=C:\\Temp",
                                          "TMP=C:\\Temp", "OS=Windows_NT", "PROCESSOR_ARCHITECTURE=AMD64", "NUMBER_OF_PROCESSORS=1", "COMSPEC=C:\\Windows\\System32\\cmd.exe",
                                          "USERPROFILE=C:\\Users\\Default", "USERNAME=Default", "HOMEDRIVE=C:", "HOMEPATH=\\Users\\Default",
