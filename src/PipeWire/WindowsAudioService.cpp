@@ -17,6 +17,7 @@
  */
 
 #include "PipeWire/WindowsAudioService.hpp"
+#include "Audio/Pan.hpp"
 #include "Process/WindowsAudio.hpp"
 
 namespace pipewire {
@@ -25,7 +26,7 @@ namespace {
 
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kNoMemory = 0xC0000017u,
                    kDeviceNotConnected = 0xC000009Du, kTooManyOpened = 0xC000011Fu;
-enum : uint64_t { kOpen = 1, kClose, kWrite, kStatus, kFlush, kPause, kSetVolume, kGetVolume, kDevices };
+enum : uint64_t { kOpen = 1, kClose, kWrite, kStatus, kFlush, kPause, kSetVolume, kGetVolume, kDevices, kSetMute };
 constexpr uint32_t kWaveFormatPcm = 1, kWaveFormatFloat = 3;
 
 WindowsAudioService* g_service = nullptr;
@@ -178,6 +179,66 @@ uint32_t WindowsAudioService::close(uint64_t pid, uint32_t stream, bool drain) {
   return kSuccess;
 }
 
+uint32_t WindowsAudioService::volume_node(uint64_t pid, uint32_t stream, uint32_t* node) {
+  *node = stream ? stream : graph_.sink_id();
+  if (!stream) return kSuccess;
+  kernel::ScopedMutex guard(mutex_);
+  return owns_locked(pid, stream) ? kSuccess : kInvalidHandle;
+}
+
+uint32_t WindowsAudioService::set_volume(uint64_t pid, uint32_t stream, uint32_t left, uint32_t right) {
+  uint32_t node = 0;
+  const uint32_t st = volume_node(pid, stream, &node);
+  if (st != kSuccess) return st;
+  if (left > 0xFFFF) left = 0xFFFF;
+  if (right > 0xFFFF) right = 0xFFFF;
+  float volume = 1.0f;
+  bool mute = false;
+  if (!graph_.get_volume(node, &volume, &mute)) return kInvalidHandle;
+  // the louder side is the stream's volume, the other one a pan (the sink has no balance: its volume is the louder side)
+  if (stream) {
+    SharedPointer<PlaybackStream> s = graph_.playback_of(stream);
+    if (!s) return kInvalidHandle;
+    s->stream().set_pan(audio::pan_for_gains(left, right, s->stream().format().channels == 1));
+  }
+  return graph_.set_volume(node, static_cast<float>(left > right ? left : right) / 65535.0f, mute) ? kSuccess : kInvalidHandle;
+}
+
+uint32_t WindowsAudioService::get_volume(uint64_t pid, uint32_t stream, uint32_t* left, uint32_t* right, bool* mute) {
+  *left = *right = 0;
+  *mute = false;
+  uint32_t node = 0;
+  const uint32_t st = volume_node(pid, stream, &node);
+  if (st != kSuccess) return st;
+  float volume = 1.0f;
+  if (!graph_.get_volume(node, &volume, mute)) return kInvalidHandle;
+  if (volume > 1.0f) volume = 1.0f;
+  const uint32_t loudest = static_cast<uint32_t>(volume * 65535.0f + 0.5f);
+  *left = *right = loudest;
+  if (stream) {
+    SharedPointer<PlaybackStream> s = graph_.playback_of(stream);
+    if (!s) return kInvalidHandle;
+    int32_t l = 0, r = 0;
+    audio::pan_gains(s->stream().pan(), s->stream().format().channels == 1, &l, &r);
+    const int32_t most = l > r ? l : r;
+    if (most > 0) {
+      *left = static_cast<uint32_t>((uint64_t{loudest} * static_cast<uint32_t>(l) + static_cast<uint32_t>(most) / 2) / static_cast<uint32_t>(most));
+      *right = static_cast<uint32_t>((uint64_t{loudest} * static_cast<uint32_t>(r) + static_cast<uint32_t>(most) / 2) / static_cast<uint32_t>(most));
+    }
+  }
+  return kSuccess;
+}
+
+uint32_t WindowsAudioService::set_mute(uint64_t pid, uint32_t stream, bool mute) {
+  uint32_t node = 0;
+  const uint32_t st = volume_node(pid, stream, &node);
+  if (st != kSuccess) return st;
+  float volume = 1.0f;
+  bool was = false;
+  if (!graph_.get_volume(node, &volume, &was)) return kInvalidHandle;
+  return graph_.set_volume(node, volume, mute) ? kSuccess : kInvalidHandle;
+}
+
 uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRequest& r) {
   const uint64_t at = r.args[0];
   uint64_t a[8] = {};
@@ -243,7 +304,9 @@ uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRe
       // (once it has played out, all of it counts as played: the mixer counts device frames, which do not convert back to the program's exactly)
       const bool drained = s->drained();
       const uint64_t written = s->written_bytes(), played = drained ? written : s->played_bytes();
-      return put(5, drained ? 0 : s->buffered_bytes()) && put(6, written) && put(7, played < written ? played : written) ? kSuccess : kAccessViolation;
+      return put(4, drained ? 0 : s->waiting_bytes()) && put(5, drained ? 0 : s->buffered_bytes()) && put(6, written) && put(7, played < written ? played : written)
+                 ? kSuccess
+                 : kAccessViolation;
     }
     case kFlush: case kPause: {
       {
@@ -256,31 +319,15 @@ uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRe
       s->flush();
       return kSuccess;
     }
-    case kSetVolume: {
-      const uint32_t node = stream ? stream : graph_.sink_id();
-      if (stream) {
-        kernel::ScopedMutex guard(mutex_);
-        if (!owns_locked(pid, stream)) return kInvalidHandle;
-      }
-      const uint64_t loudest = (a[2] > a[3] ? a[2] : a[3]) & 0xFFFF;
-      float volume = 1.0f;
-      bool mute = false;
-      graph_.get_volume(node, &volume, &mute);
-      return graph_.set_volume(node, static_cast<float>(loudest) / 65535.0f, mute) ? kSuccess : kInvalidHandle;
-    }
+    case kSetVolume: return set_volume(pid, stream, static_cast<uint32_t>(a[2] & 0xFFFF), static_cast<uint32_t>(a[3] & 0xFFFF));
     case kGetVolume: {
-      const uint32_t node = stream ? stream : graph_.sink_id();
-      if (stream) {
-        kernel::ScopedMutex guard(mutex_);
-        if (!owns_locked(pid, stream)) return kInvalidHandle;
-      }
-      float volume = 1.0f;
+      uint32_t left = 0, right = 0;
       bool mute = false;
-      if (!graph_.get_volume(node, &volume, &mute)) return kInvalidHandle;
-      if (volume > 1.0f) volume = 1.0f;
-      const uint64_t v = static_cast<uint64_t>(volume * 65535.0f + 0.5f);
-      return put(7, v | v << 16) ? kSuccess : kAccessViolation;
+      const uint32_t st = get_volume(pid, stream, &left, &right, &mute);
+      if (st != kSuccess) return st;
+      return put(6, mute ? 1 : 0) && put(7, left | uint64_t{right} << 16) ? kSuccess : kAccessViolation;
     }
+    case kSetMute: return set_mute(pid, stream, a[2] != 0);
     case kDevices: return put(7, graph_.mixer() ? 1 : 0) ? kSuccess : kAccessViolation;
     default: return kInvalidParameter;
   }

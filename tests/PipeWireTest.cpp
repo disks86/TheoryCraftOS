@@ -37,6 +37,7 @@
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "PipeWire/Tagstruct.hpp"
+#include "Audio/Pan.hpp"
 #include "PipeWire/WindowsAudioService.hpp"
 #include "Process/UnixSockets.hpp"
 #include "Utility/ByteStream.hpp"
@@ -1015,10 +1016,38 @@ static void test_windows_service() {
   bool owned = false;
   g.visit(stream, [&](const GraphObject& o) { owned = o.origin == Origin::Windows && o.props.get("application.name") == StringView("game.exe"); });
   CHECK(owned && service.stream_count() == 1);
+  // what the mixer has not taken yet (WASAPI's padding): all of it, then less once the mixer has run
+  SharedPointer<PlaybackStream> playback = g.playback_of(stream);
+  const uint64_t waiting = playback ? playback->waiting_bytes() : 0;
+  CHECK(playback && waiting > 4000 && waiting <= 8820 && waiting <= playback->buffered_bytes());
   dev.take();
   mixer.pump();
+  CHECK(playback && playback->waiting_bytes() < waiting);
   std::vector<int16_t> out = dev.take();
   CHECK(out.size() > 202 && abs(out[200] - 2828) <= 6 && abs(out[201] - 2828) <= 6);      // mono to both sides, at the pan's equal-power centre (0.707)
+  // a left/right volume pair is the stream's volume and a pan (DirectSound/WASAPI balance), and reads back the same
+  uint32_t left = 0, right = 0;
+  bool mute = true;
+  CHECK(service.set_volume(10, stream, 0xFFFF, 0x8000) == 0);
+  CHECK(service.get_volume(10, stream, &left, &right, &mute) == 0 && !mute && left == 0xFFFF && right > 0x7400 && right < 0x8C00);
+  CHECK(audio::pan_for_gains(1000, 1000, true) == 0 && audio::pan_for_gains(0, 5, false) == audio::kPanRight && audio::pan_for_gains(5, 0, true) == audio::kPanLeft);
+  CHECK(audio::pan_for_gains(32768, 16384, false) < -20 && audio::pan_for_gains(16384, 32768, false) > 20);
+  dev.take();
+  CHECK(service.write(10, stream, ConstByteView(mono.data(), mono.size()), &taken) == 0);
+  mixer.pump();
+  out = dev.take();
+  CHECK(out.size() > 202 && out[200] > out[201] * 3 / 2 && out[201] > out[200] / 3);      // louder on the left, still heard on the right
+  CHECK(service.set_mute(10, stream, true) == 0 && service.get_volume(10, stream, &left, &right, &mute) == 0 && mute && left == 0xFFFF);
+  dev.take();
+  CHECK(service.write(10, stream, ConstByteView(mono.data(), mono.size()), &taken) == 0);
+  mixer.pump();
+  out = dev.take();
+  CHECK(out.size() > 202 && out[200] == 0 && out[201] == 0);
+  CHECK(service.set_mute(11, stream, false) != 0 && service.set_volume(11, stream, 1, 1) != 0 && service.get_volume(11, stream, &left, &right, &mute) != 0);
+  // the master volume (stream 0): no balance, the louder side
+  CHECK(service.set_volume(10, 0, 0x4000, 0x8000) == 0 && service.get_volume(10, 0, &left, &right, &mute) == 0 && left == right && right > 0x7E00 && right < 0x8200);
+  CHECK(service.set_mute(10, 0, true) == 0 && service.get_volume(10, 0, &left, &right, &mute) == 0 && mute);
+  CHECK(service.set_mute(10, 0, false) == 0 && service.set_volume(10, 0, 0xFFFF, 0xFFFF) == 0);
   CHECK(service.close(10, stream, true) == 0 && service.stream_count() == 0);
   uint32_t s2 = 0;
   CHECK(service.open(10, PcmFormat{SampleFormat::F32Le, 48000, 2}, "", &s2) == 0);

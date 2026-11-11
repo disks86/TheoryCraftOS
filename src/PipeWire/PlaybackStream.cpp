@@ -274,6 +274,13 @@ uint64_t PlaybackStream::written_bytes() {
   return written_;
 }
 
+uint64_t PlaybackStream::waiting_bytes() {
+  kernel::ScopedMutex guard(mutex_);
+  // (the stream and the carry hold 16-bit frames of out_channels_ at the program's rate: as many of the program's frames)
+  const uint64_t converted = uint64_t{stream_->queued_bytes()} + (carry_.size() - carry_offset_);
+  return converted / (2 * out_channels_) * format_.frame_size();
+}
+
 uint64_t PlaybackStream::buffered_bytes() {
   uint64_t written;
   {

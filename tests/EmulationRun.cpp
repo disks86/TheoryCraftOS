@@ -42,6 +42,8 @@
 #endif
 #ifdef TCOS_EMU_AUDIO
 #include <cmath>
+#include <dirent.h>
+#include "FileSystem/SystemLayout.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
@@ -181,6 +183,24 @@ int main(int argc, char** argv) {
   A a; H h; Libs libs; if (argc > 2) libs.dir = argv[2];
   filesystem::RamFileSystem fs(a);
   process::prepare_program_folders(fs);
+#ifdef TCOS_EMU_AUDIO
+  // the libraries in System32 as well, for what a program loads while it runs (ole32 loading dsound.dll or mmdevapi.dll for CoCreateInstance)
+  if (argc > 2)
+    if (DIR* d = opendir(argv[2])) {
+      while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 5 || n.substr(n.size() - 4) != ".dll") continue;
+        bool read_ok = false;
+        const std::vector<uint8_t> image = slurp(std::string(argv[2]) + "/" + n, &read_ok);
+        const std::string path = std::string(filesystem::layout::kWindowsSystem32) + "/" + n;
+        UniquePointer<filesystem::IFile> file;
+        uint64_t written = 0;
+        if (read_ok && fs.open_file(StringView(path.c_str()), filesystem::OpenMode::CreateOrOpen, &file) == filesystem::Status::Ok)
+          file->write(0, ConstByteView(image.data(), image.size()), &written);
+      }
+      closedir(d);
+    }
+#endif
   Sync osync; process::ObjectManager objects(osync); process::set_system_objects(&objects);      // (before the program: its sections go back to the manager when it is destroyed)
   objects.set_allocator(&a);
   process::UserProgram p(a, 100, h);
@@ -331,6 +351,25 @@ int main(int argc, char** argv) {
     }
     printf("audio: %zu frames mixed, most streams at once %u\n", frames, most_streams.load());
     printf("audio: native 300 Hz %.0f, windows 400 Hz %.0f, linux 500 Hz %.0f; all three at once %.0f\n", best[0], best[1], best[2], best_all);
+    // every program's tone on its own, and the ones in TCOS_EMU_TONES (default 300,400,500) at the same moment
+    std::vector<double> together;
+    {
+      const char* list = getenv("TCOS_EMU_TONES");
+      std::string text = list ? list : "300,400,500";
+      for (size_t at = 0; at < text.size();) {
+        const size_t comma = text.find(',', at);
+        together.push_back(atof(text.substr(at, comma == std::string::npos ? std::string::npos : comma - at).c_str()));
+        at = comma == std::string::npos ? text.size() : comma + 1;
+      }
+    }
+    double best_tone[5] = {0, 0, 0, 0, 0}, best_together = 0;
+    for (size_t at = 0; at + window <= frames; at += window / 2) {
+      for (int k = 0; k < 5; ++k) best_tone[k] = std::max(best_tone[k], tone(rec, at, window, 300.0 + 100.0 * k));
+      double all = 1e18;
+      for (double f : together) all = std::min(all, tone(rec, at, window, f));
+      best_together = std::max(best_together, all);
+    }
+    printf("audio: tones 300:%.0f 400:%.0f 500:%.0f 600:%.0f 700:%.0f; together %.0f\n", best_tone[0], best_tone[1], best_tone[2], best_tone[3], best_tone[4], best_together);
   }
   delete second_program;
 #endif

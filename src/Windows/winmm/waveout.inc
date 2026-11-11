@@ -25,31 +25,10 @@
  * Loops (WHDR_BEGINLOOP/ENDLOOP) play once. PlaySound / sndPlaySound play a RIFF WAVE file or image (SND_FILENAME, SND_MEMORY) this way; aliases and
  * resources are not found (FALSE, or silence with SND_NODEFAULT). */
 
-__declspec(dllimport) LONG NTAPI NtTcosAudio(ULONG64 *arguments);
+#include "../tcos_audio.h"
 
-/* (mmreg.h's TCOS_WAVE_FORMAT_EXTENSIBLE, without pulling in ksmedia) */
-#define TCOS_WAVE_FORMAT_EXTENSIBLE 0xFFFE
-#define TCOS_WAVE_FORMAT_IEEE_FLOAT 3
-typedef struct {
-  WAVEFORMATEX Format;
-  WORD wValidBitsPerSample;
-  DWORD dwChannelMask;
-  GUID SubFormat;
-} TcosWaveFormatExtensible;
 #define TCOS_PID_MAPPER 2
 #define TCOS_PID_WAVEOUT 100
-
-enum { TCOS_AUDIO_OPEN = 1, TCOS_AUDIO_CLOSE, TCOS_AUDIO_WRITE, TCOS_AUDIO_STATUS, TCOS_AUDIO_FLUSH, TCOS_AUDIO_PAUSE, TCOS_AUDIO_SET_VOLUME,
-       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES };
-
-static LONG audio_call(ULONG64 op, ULONG64 stream, ULONG64 a, ULONG64 b, ULONG64 c, ULONG64 d, ULONG64 e, ULONG64 *out5, ULONG64 *out6, ULONG64 *out7) {
-  ULONG64 w[8] = {op, stream, a, b, c, d, e, 0};
-  LONG st = NtTcosAudio(w);
-  if (out5) *out5 = w[5];
-  if (out6) *out6 = w[6];
-  if (out7) *out7 = w[7];
-  return st;
-}
 
 #define WAVE_DEVICES 1
 #define MAX_WAVEOUTS 32
@@ -185,33 +164,6 @@ static ULONG64 wave_position_locked(WaveOut *w) {
 }
 
 /* The kernel's format code for a WAVEFORMATEX (0 if it is not one the graph plays). */
-static ULONG64 wave_format_code(const WAVEFORMATEX *f) {
-  WORD tag = f->wFormatTag;
-  if (tag == TCOS_WAVE_FORMAT_EXTENSIBLE) {
-    if (f->cbSize < 22) return 0;
-    const TcosWaveFormatExtensible *x = (const TcosWaveFormatExtensible *)f;
-    tag = (WORD)x->SubFormat.Data1;      /* KSDATAFORMAT_SUBTYPE_PCM / _IEEE_FLOAT are {00000001/3-0000-0010-8000-00aa00389b71} */
-    if (x->SubFormat.Data2 != 0 || x->SubFormat.Data3 != 0x10) return 0;
-  }
-  if (tag != WAVE_FORMAT_PCM && tag != TCOS_WAVE_FORMAT_IEEE_FLOAT) return 0;
-  const WORD bits = f->wBitsPerSample;
-  if (tag == WAVE_FORMAT_PCM && bits != 8 && bits != 16 && bits != 24 && bits != 32) return 0;
-  if (tag == TCOS_WAVE_FORMAT_IEEE_FLOAT && bits != 32 && bits != 64) return 0;
-  if (f->nChannels < 1 || f->nChannels > 32 || f->nSamplesPerSec < 4000 || f->nSamplesPerSec > 192000) return 0;
-  if (f->nBlockAlign != f->nChannels * (bits / 8)) return 0;
-  return (ULONG64)tag | (ULONG64)bits << 16;
-}
-
-static void program_name(char *out, int size) {
-  char path[MAX_PATH];
-  const DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
-  int start = 0;
-  for (DWORD i = 0; i < n; ++i) if (path[i] == '\\' || path[i] == '/') start = (int)i + 1;
-  int k = 0;
-  for (DWORD i = (DWORD)start; i < n && k + 1 < size; ++i) out[k++] = path[i];
-  out[k] = 0;
-}
-
 EXPORT MMRESULT WINAPI waveOutOpen(LPHWAVEOUT out, UINT id, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
   if (out) *out = NULL;
   if (!format) return MMSYSERR_INVALPARAM;

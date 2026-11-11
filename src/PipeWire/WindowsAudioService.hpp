@@ -32,7 +32,7 @@ namespace pipewire {
 
 class WindowsAudioService {
  public:
-  static constexpr uint32_t kMaxStreamsPerProcess = 32;
+  static constexpr uint32_t kMaxStreamsPerProcess = 64;
   static constexpr uint64_t kMaxWrite = 1u << 20;
 
   WindowsAudioService(Graph& graph, allocators::IAllocator& allocator) : graph_(graph), allocator_(allocator), owners_(allocator) {}
@@ -51,6 +51,10 @@ class WindowsAudioService {
   uint32_t open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream);
   uint32_t write(uint64_t pid, uint32_t stream, ConstByteView pcm, uint32_t* taken);
   uint32_t close(uint64_t pid, uint32_t stream, bool drain);
+  // Stream 0 is the master volume (the sink). Left and right are 0 .. 0xFFFF; a stream's louder side is its volume, the balance its pan.
+  uint32_t set_volume(uint64_t pid, uint32_t stream, uint32_t left, uint32_t right);
+  uint32_t get_volume(uint64_t pid, uint32_t stream, uint32_t* left, uint32_t* right, bool* mute);
+  uint32_t set_mute(uint64_t pid, uint32_t stream, bool mute);
 
  private:
   struct Owner {
@@ -61,6 +65,8 @@ class WindowsAudioService {
   };
   Owner* owner_locked(uint64_t pid, bool create);
   bool owns_locked(uint64_t pid, uint32_t node);
+  // The graph node `stream` stands for (0: the sink), if the process may change its volume.
+  uint32_t volume_node(uint64_t pid, uint32_t stream, uint32_t* node);
 
   Graph& graph_;
   allocators::IAllocator& allocator_;

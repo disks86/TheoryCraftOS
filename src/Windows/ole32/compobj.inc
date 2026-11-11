@@ -694,8 +694,21 @@ static HRESULT get_registered_class(REFCLSID clsid, DWORD context, REFIID riid, 
 
 typedef HRESULT (WINAPI *DllGetClassObjectFn)(REFCLSID, REFIID, void **);
 
+/* The system's classes that a fresh registry does not list, and the library each lives in. */
+static const struct { GUID clsid; const char *dll; } kSystemClasses[] = {
+  {{0x25E609E4, 0xB259, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}}, "dinput8.dll"},      /* CLSID_DirectInput8 */
+  {{0x47D4D946, 0x62E8, 0x11CF, {0x93, 0xBC, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}}, "dsound.dll"},       /* CLSID_DirectSound */
+  {{0x3901CC3F, 0x84B5, 0x4FA4, {0xBA, 0x35, 0xAA, 0x81, 0x72, 0xB8, 0xA0, 0x9B}}, "dsound.dll"},       /* CLSID_DirectSound8 */
+  {{0xB0210780, 0x89CD, 0x11D0, {0xAF, 0x08, 0x00, 0xA0, 0xC9, 0x25, 0xCD, 0x16}}, "dsound.dll"},       /* CLSID_DirectSoundCapture */
+  {{0xE4BCAC13, 0x7F99, 0x4908, {0x9A, 0x8E, 0x74, 0xE3, 0xBF, 0x24, 0xB6, 0xE1}}, "dsound.dll"},       /* CLSID_DirectSoundCapture8 */
+  {{0xFEA4300C, 0x7959, 0x4147, {0xB2, 0x6A, 0x23, 0x77, 0xB9, 0xE7, 0xA9, 0x1D}}, "dsound.dll"},       /* CLSID_DirectSoundFullDuplex */
+  {{0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}}, "mmdevapi.dll"},     /* CLSID_MMDeviceEnumerator */
+};
+static const char *system_class_library(REFCLSID clsid) {
+  for (size_t i = 0; i < sizeof(kSystemClasses) / sizeof(kSystemClasses[0]); i++) if (IsEqualGUID(&kSystemClasses[i].clsid, clsid)) return kSystemClasses[i].dll;
+  return NULL;
+}
 /* The classes shell32.dll serves (its DllGetClassObject): shortcuts, shell items, the desktop and file system folders, My Computer, the known-folder manager. */
-static const GUID kClsidDirectInput8 = {0x25E609E4, 0xB259, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};      /* (dinput8.dll's) */
 static BOOL is_shell32_class(REFCLSID clsid) {
   static const GUID classes[] = {
     {0x00021401, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, {0x9AC9FBE1, 0xE0A2, 0x4AD6, {0xB4, 0xEE, 0xE2, 0x12, 0x01, 0x3E, 0xA9, 0x17}},
@@ -740,7 +753,14 @@ EXPORT HRESULT WINAPI CoGetClassObject(REFCLSID rclsid, DWORD context, LPVOID se
       clsid_key_path(&clsid, W('I', 'n', 'p', 'r', 'o', 'c', 'S', 'e', 'r', 'v', 'e', 'r', '3', '2'), path);
       if (reg_class_string(path, NULL, dll, MAX_PATH * 2) == ERROR_SUCCESS && dll[0]) return load_class_from_dll(dll, &clsid, riid, out);
       if (is_shell32_class(&clsid)) return load_class_from_dll(W('s', 'h', 'e', 'l', 'l', '3', '2', '.', 'd', 'l', 'l'), &clsid, riid, out);      /* (a fresh system registers none of these) */
-      if (IsEqualGUID(&clsid, &kClsidDirectInput8)) return load_class_from_dll(W('d', 'i', 'n', 'p', 'u', 't', '8', '.', 'd', 'l', 'l'), &clsid, riid, out);      /* (nor this) */
+      const char *library = system_class_library(&clsid);      /* (nor these) */
+      if (library) {
+        WCHAR wide[32];
+        int k = 0;
+        for (; library[k] && k < 31; k++) wide[k] = (WCHAR)library[k];
+        wide[k] = 0;
+        return load_class_from_dll(wide, &clsid, riid, out);
+      }
     }
     if (context & CLSCTX_INPROC_HANDLER) {
       clsid_key_path(&clsid, W('I', 'n', 'p', 'r', 'o', 'c', 'H', 'a', 'n', 'd', 'l', 'e', 'r', '3', '2'), path);

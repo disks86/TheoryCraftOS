@@ -70,6 +70,9 @@ class PlaybackStream {
   // Program bytes played so far: taken by the mixer, less what is still in the device's queue (exact once drained()).
   uint64_t played_bytes();
   uint64_t written_bytes();
+  // Program bytes written that the mixer has not taken yet (still in this stream; approximate across rates). What WASAPI calls the padding, and what a
+  // program's own mixer keeps topped up; unlike buffered_bytes() it leaves out the device's queue.
+  uint64_t waiting_bytes();
   // Everything written has been played: taken by the mixer, and the device has played it out too.
   bool drained();
   // Drops everything not yet played.

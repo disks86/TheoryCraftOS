@@ -9,7 +9,7 @@ Linux and Windows programs therefore play at the same time, each stream with its
 | Native programs (media player, web audio, MIDI synth, ...) | `AudioMixer::open_stream` as before. `Graph::refresh` finds the streams and shows each as a node of the "TheoryCraftOS" client (`AudioStream::set_label` names it). |
 | Linux programs using libpulse (most desktop programs: browsers, SDL, games, `paplay`, `pactl`) | PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`, served by `PulseServer`, as pipewire-pulse does. |
 | Linux programs using libpipewire (`pw-dump`, `pw-cli`, `wpctl`, session tools) | PipeWire's native protocol (version 3) at `$XDG_RUNTIME_DIR/pipewire-0`, served by `NativeServer`. |
-| Windows programs | `winmm.dll`: `waveOut*`, `PlaySound`, `sndPlaySound` (`src/Windows/winmm/waveout.inc`) over the `NtTcosAudio` service (510), served by `WindowsAudioService`. |
+| Windows programs | `winmm.dll` (`waveOut*`, `PlaySound`, `sndPlaySound`: `src/Windows/winmm/waveout.inc`), `dsound.dll` (DirectSound 8: `src/Windows/dsound/dsound.c`) and WASAPI (`mmdevapi.dll`: `IMMDeviceEnumerator`, `IAudioClient3` and the rest, `src/Windows/mmdevapi/mmdevapi.c`), all over the `NtTcosAudio` service (510, `src/Windows/tcos_audio.h`), served by `WindowsAudioService`. |
 
 `XDG_RUNTIME_DIR` is `/run/user/0` in the Linux programs' default environment (`/Linux/run/user/0` on the system's disk; see
 [FileSystemLayout.md](FileSystemLayout.md)). Both sockets are also bound as abstract names, so Windows programs can reach them through ws2_32's
@@ -26,7 +26,7 @@ Linux and Windows programs therefore play at the same time, each stream with its
 | PipeWire's native protocol | `NativeServer.{hpp,cpp}` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
-| NtTcosAudio | `src/Process/WindowsAudio.{hpp,cpp}` (layout, handler pointer), `WindowsAudioService.{hpp,cpp}` (the work) |
+| NtTcosAudio | `src/Process/WindowsAudio.{hpp,cpp}` (layout, handler pointer), `WindowsAudioService.{hpp,cpp}` (the work), `src/Windows/tcos_audio.h` (the DLLs' side) |
 | Start-up | `src/main.cpp` (after the X server) |
 
 ## How it fits together
@@ -58,23 +58,48 @@ Format), Node set_param(Props) for volume and mute, the metadata's `default.audi
 prepare/unprepare/write, pause/restart/reset/break loop, position (bytes, samples, ms; frozen while paused), per-stream and master volume, device caps,
 error texts, `PlaySound`/`sndPlaySound` of a WAVE file or image (sync, async, loop, stop).
 
+**DirectSound** mixes in the program, as Windows does: each `IDirectSound8` has one 16-bit stereo 48 kHz stream of the graph and a thread that mixes
+its playing secondary buffers into it every 5 ms (fixed point; linear interpolation at each buffer's own frequency), keeping the kernel's stream about
+30 ms full (more when the thread is woken late). Buffers: PCM 8/16/24/32-bit and float, 1 to 8 channels, `Lock`/`Unlock` across the end,
+`Play`/`Stop` (looping, one-shot), cursors (play = what the device has played, write = where the mixer has read to), `SetCurrentPosition`,
+volume (hundredths of a dB), pan, frequency (100 Hz to 200 kHz, at once), position notifications and `DSBPN_OFFSETSTOP`, `DuplicateSoundBuffer`
+(shared samples), 3D buffers and the listener (distance with min/max and rolloff, the cone, an equal-power pan from the direction, head-relative and
+disabled modes, deferred settings and `CommitDeferredSettings`). The primary buffer's volume and pan are the whole mix's; with `DSSCL_WRITEPRIMARY`
+the program writes it itself. Enumeration (the primary driver and one device), `GetDeviceID`, caps, cooperative levels, speaker configuration and
+the class factory (`CLSID_DirectSound`, `CLSID_DirectSound8`; ole32 finds `dsound.dll` for them).
+
+**WASAPI**: `CLSID_MMDeviceEnumerator` (ole32 finds `mmdevapi.dll` for it) with one render endpoint and no capture endpoints, `IMMDevice`
+(`Activate`, the property store: names, form factor, speakers, the engine format), `IMMEndpoint`; `IAudioClient`/`2`/`3` in shared mode, each client a
+stream of the graph in its own format (any format the graph converts, as `AUTOCONVERTPCM` would), event-driven or polled, with `IAudioRenderClient`,
+`IAudioClock`, `IAudioStreamVolume`, `IChannelAudioVolume`; the process's audio session (`ISimpleAudioVolume`, `IAudioSessionControl2`,
+`IAudioSessionManager2`); `IAudioEndpointVolume` as the master volume (scalar = cube root of the amplitude, as `pactl`/`wpctl` show it) with change
+callbacks; `IAudioMeterInformation` (silence); `ActivateAudioInterfaceAsync`. The padding is what the graph's mixer has not taken yet
+(NtTcosAudio STATUS `[4]`), as in Windows, so the device's own queue never stops a client from writing; the clock is what the device has played.
+A stream's left/right volume pair becomes its volume and pan in the graph (`audio::pan_for_gains`), and `SET_MUTE` mutes without losing the volume.
+
 ## Tests
 
 - `tests/run_host_tests.sh PipeWireTest`: codecs (round trips, every truncation, bit flips), conversion, the graph mixing native, Linux and Windows
   streams on a real mixer, both protocols as clients drive them and fed garbage, the Windows service, the AF_UNIX transport, several threads at once.
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl` and `paplay` against `tests/pipewire/PipeWireHostServer.cpp`
   (the same graph and protocols on host sockets). Two `paplay` at once; the mixed output must hold both tones at the right levels.
-- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the OS's own DLLs) and
-  `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
+- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
+  OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
+  The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
+  Linux program and the native stream, and all four tones must be in the mix at once (the DLLs are also put in the RAM disk's System32, since ole32
+  loads `dsound.dll` and `mmdevapi.dll` while the program runs).
 
 ## Not done
 
 - **libpipewire playback.** `pw_stream` programs (`pw-cat`, `pw-play`) ask Core::create_object for the `client-node`/`adapter` factories, which need
   shared-memory buffers (memfd + `mmap(MAP_SHARED)` of a descriptor) and eventfds; the Linux layer has neither yet, so the server answers `-ENOTSUP`.
   Those programs fail; libpulse programs work.
-- **Recording.** No capture nodes, no PulseAudio record streams, no `waveIn` (the `AudioCaptureHub` is not in the graph yet).
-- **More of Windows audio.** DirectSound (`dsound.dll`), WASAPI (`mmdevapi.dll`, `IAudioClient`) and XAudio2 are still stubs; they would go over the
-  same NtTcosAudio service.
+- **Recording.** No capture nodes, no PulseAudio record streams, no `waveIn`, no DirectSound capture, no WASAPI capture endpoints (the
+  `AudioCaptureHub` is not in the graph yet).
+- **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused) and no loopback capture;
+  endpoint and session notifications are accepted but never sent (nothing changes from outside the process); the master volume has no balance.
+  DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`), no Doppler shift, no property sets (`IKsPropertySet`, EAX); after `Stop` what
+  it had mixed ahead (30 ms or more) still plays.
 - **More than one sink.** The graph follows the mixer's one output device; switching devices is the `AudioRouter`'s, not PipeWire's
   (`move-sink-input`, `set-default-sink` to another device do nothing).
 - **Formats, controls.** PulseAudio sample-rate updates, passthrough formats, per-channel volumes (the loudest channel is taken), PipeWire

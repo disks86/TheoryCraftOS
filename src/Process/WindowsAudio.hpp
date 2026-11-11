@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// NtTcosAudio(PULONG64 arguments): this OS's own service (510), behind winmm.dll's wave output. The work is the kernel's PipeWire graph
+// NtTcosAudio(PULONG64 arguments): this OS's own service (510), behind winmm.dll's wave output, dsound.dll and WASAPI (mmdevapi.dll). The work is the kernel's PipeWire graph
 // (src/PipeWire/WindowsAudioService.hpp), installed at start-up with set_audio_handler so that the process layer does not depend on it. Each stream a
 // Windows program opens is a node of the graph, mixed with the native and Linux programs' sound. The arguments are 8 ULONG64 in the program's memory:
 //
@@ -26,12 +26,15 @@
 //                 0), [6] its length (at most 255); [7] = the stream.
 //   2 CLOSE       [1], [2] 1: let what is queued play out first.
 //   3 WRITE       [1], [2] data, [3] bytes (at most 1 MiB); [7] = the bytes taken (whole frames; 0 when the stream is full). Never blocks.
-//   4 STATUS      [1]; [5] = bytes queued, [6] = bytes written, [7] = bytes played (in the stream's format).
+//   4 STATUS      [1]; [4] = bytes the mixer has not taken yet, [5] = bytes not played yet (those and the device's queue), [6] = bytes written,
+//                 [7] = bytes played (all in the stream's format).
 //   5 FLUSH       [1]: drops what is queued.
 //   6 PAUSE       [1], [2] 1 paused, 0 playing.
-//   7 SET_VOLUME  [1] (0: the master volume), [2] left, [3] right (0 .. 0xFFFF each).
-//   8 GET_VOLUME  [1] (0: master); [7] = left | right << 16.
+//   7 SET_VOLUME  [1] (0: the master volume), [2] left, [3] right (0 .. 0xFFFF each). A stream's louder side is its volume and the balance
+//                 becomes its pan; the master volume has no balance (the louder side).
+//   8 GET_VOLUME  [1] (0: master); [6] = 1 when muted, [7] = left | right << 16.
 //   9 DEVICES     [7] = the number of output devices (0 or 1: the mixer's).
+//  10 SET_MUTE    [1] (0: master), [2] 1 muted, 0 not. The volume is kept.
 // STATUS_INVALID_HANDLE for a stream the process does not have, STATUS_INVALID_PARAMETER for a format the graph cannot take, STATUS_DEVICE_NOT_CONNECTED
 // when there is no audio device, STATUS_NOT_SUPPORTED without the graph.
 #pragma once
