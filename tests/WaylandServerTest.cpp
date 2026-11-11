@@ -1,0 +1,1445 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// The kernel's Wayland compositor (src/Wayland) and the files in memory it reads its clients' pictures from (src/Process/MemoryFile): the registry and
+// its globals, shm pools and buffers, toplevels framed by the desktop (configure, ack, map, move, resize, maximize, minimize, close, decorations),
+// popups and their positioners, subsurfaces (sync and desync), drawing straight from the client's memory, frame callbacks, the seat (pointer focus and
+// the implicit grab, buttons, the wheel, the cursor a client sets, keyboard focus, keys, modifiers, the keymap), protocol errors, truncated and bit-flipped
+// streams, and the AF_UNIX transport with descriptors passed as SCM_RIGHTS, with several client threads and a desktop thread at once.
+// Run: tests/run_host_tests.sh WaylandServerTest
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Process/MemoryFile.hpp"
+#include "Process/ProcessFiles.hpp"
+#include "Process/UnixSockets.hpp"
+#include "Wayland/WaylandServer.hpp"
+#include "Wayland/WaylandSocketServer.hpp"
+
+using wayland::Fd;
+using wayland::Server;
+
+struct TestAllocator final : allocators::IAllocator {
+  std::atomic<int> live{0};
+  void* allocate(uint64_t size) override { ++live; return malloc(size ? size : 1); }
+  void* allocate_aligned(uint64_t size, uint64_t alignment) override {
+    ++live;
+    void* p = nullptr;
+    if (posix_memalign(&p, alignment < sizeof(void*) ? sizeof(void*) : alignment, size ? size : 1) != 0) { --live; return nullptr; }
+    return p;
+  }
+  void deallocate(void* p) override { if (p) { --live; free(p); } }
+};
+static TestAllocator A;
+
+static std::atomic<int> g_failed{0};
+#define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
+
+// ------------------------------------------------------------------ memory a test client shares with the server
+
+struct TestMemory final : wayland::Memory {
+  std::vector<uint8_t>* bytes;
+  bool not_memory = false;
+  explicit TestMemory(std::vector<uint8_t>* b) : bytes(b) {}
+  ByteView map(uint64_t size) override {
+    if (not_memory || !bytes || bytes->size() < size) return ByteView();
+    return ByteView(bytes->data(), bytes->size());
+  }
+};
+
+// What the server sent with the keymap (the test's fd maker keeps the contents).
+static std::vector<std::vector<uint8_t>*> g_made;
+static Fd make_test_fd(void*, ConstByteView contents) {
+  auto* v = new std::vector<uint8_t>(contents.data(), contents.data() + contents.size());
+  g_made.push_back(v);
+  return Fd::make_as<TestMemory>(A, v);
+}
+static void free_made() {
+  for (auto* v : g_made) delete v;
+  g_made.clear();
+}
+
+// ------------------------------------------------------------------ a raw Wayland client
+
+struct Msg {
+  std::vector<uint8_t> b;
+  Msg(uint32_t object, uint16_t opcode) { u(object); u(opcode); }
+  Msg& u(uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); return *this; }
+  Msg& i(int32_t v) { return u(uint32_t(v)); }
+  Msg& s(const std::string& text) {
+    u(uint32_t(text.size() + 1));
+    for (char c : text) b.push_back(uint8_t(c));
+    b.push_back(0);
+    while (b.size() % 4) b.push_back(0);
+    return *this;
+  }
+  std::vector<uint8_t> done() {
+    std::vector<uint8_t> out = b;
+    const uint32_t word = uint32_t(out.size()) << 16 | uint32_t(out[4] | out[5] << 8);
+    for (int k = 0; k < 4; ++k) out[4 + k] = uint8_t(word >> (8 * k));
+    return out;
+  }
+};
+
+struct Ev {
+  uint32_t object = 0;
+  uint16_t opcode = 0;
+  std::vector<uint8_t> a;
+  bool fd = false;
+  uint32_t u(size_t word) const { size_t at = word * 4; return at + 4 <= a.size() ? uint32_t(a[at] | a[at + 1] << 8 | a[at + 2] << 16 | uint32_t(a[at + 3]) << 24) : 0; }
+  int32_t i(size_t word) const { return int32_t(u(word)); }
+  std::string s(size_t word) const {      // the string at that word
+    const uint32_t n = u(word);
+    if (n == 0) return std::string();
+    return std::string(a.begin() + long(word * 4 + 4), a.begin() + long(word * 4 + 4 + n - 1));
+  }
+};
+
+struct WClient {
+  Server& s;
+  uint32_t number = 0;
+  uint32_t next = 2;
+  std::vector<uint8_t> in;
+  std::deque<Ev> events;
+  std::vector<Fd> fds;
+  bool closing = false;
+  std::map<std::string, std::pair<uint32_t, uint32_t>> globals;      // interface -> name, version
+  explicit WClient(Server& server) : s(server) { number = s.open_client(7); }
+  ~WClient() { if (number) s.close_client(number); }
+  uint32_t new_id() { return next++; }
+  void send(const std::vector<uint8_t>& bytes, std::vector<Fd> with = {}) {
+    s.receive(number, ConstByteView(bytes.data(), bytes.size()), ArrayView<Fd>(with.data(), with.size()));
+    pull();
+  }
+  void send(Msg m, std::vector<Fd> with = {}) { send(m.done(), std::move(with)); }
+  void pull() {
+    ByteBuffer buf(A);
+    List<Fd> got(A);
+    closing = s.take_output(number, &buf, &got) || closing;
+    for (Fd& f : got.view()) fds.push_back(f);
+    in.insert(in.end(), buf.view().data(), buf.view().data() + buf.size());
+    while (in.size() >= 8) {
+      const uint32_t object = uint32_t(in[0] | in[1] << 8 | in[2] << 16 | uint32_t(in[3]) << 24);
+      const uint32_t word = uint32_t(in[4] | in[5] << 8 | in[6] << 16 | uint32_t(in[7]) << 24);
+      const uint32_t size = word >> 16;
+      if (size < 8 || in.size() < size) break;
+      Ev e;
+      e.object = object;
+      e.opcode = uint16_t(word & 0xFFFF);
+      e.a.assign(in.begin() + 8, in.begin() + size);
+      events.push_back(e);
+      in.erase(in.begin(), in.begin() + size);
+    }
+  }
+  // The first event of that object and opcode (it and those before it of the same object are dropped); nullopt-ish: object 0.
+  Ev take(uint32_t object, uint16_t opcode) {
+    pull();
+    for (auto it = events.begin(); it != events.end(); ++it) {
+      if (it->object == object && it->opcode == opcode) {
+        Ev e = *it;
+        events.erase(it);
+        return e;
+      }
+    }
+    return Ev();
+  }
+  bool has(uint32_t object, uint16_t opcode) {
+    pull();
+    for (const Ev& e : events) if (e.object == object && e.opcode == opcode) return true;
+    return false;
+  }
+  int count(uint32_t object, uint16_t opcode) {
+    pull();
+    int n = 0;
+    for (const Ev& e : events) if (e.object == object && e.opcode == opcode) ++n;
+    return n;
+  }
+  void drop_events() { pull(); events.clear(); }
+  // wl_display.get_registry, then the globals
+  uint32_t registry() {
+    const uint32_t r = new_id();
+    send(Msg(1, 1).u(r));
+    for (Ev& e : events) if (e.object == r && e.opcode == 0) globals[e.s(1)] = {e.u(0), e.u(1 + (e.u(1) + 3) / 4 + 1)};
+    return r;
+  }
+  uint32_t bind(uint32_t registry_id, const std::string& interface, uint32_t version = 0) {
+    const auto g = globals[interface];
+    const uint32_t id = new_id();
+    send(Msg(registry_id, 0).u(g.first).s(interface).u(version ? version : g.second).u(id));
+    return id;
+  }
+  // wl_display.sync: true when its callback came back (everything before it was carried out)
+  bool roundtrip() {
+    const uint32_t cb = new_id();
+    send(Msg(1, 0).u(cb));
+    return take(cb, 0).object == cb;
+  }
+  bool error(uint32_t* object = nullptr, uint32_t* code = nullptr) {
+    Ev e = take(1, 0);
+    if (e.object != 1) return false;
+    if (object) *object = e.u(0);
+    if (code) *code = e.u(1);
+    return true;
+  }
+};
+
+// A client with the usual globals bound.
+struct App : WClient {
+  uint32_t reg = 0, compositor = 0, subcompositor = 0, shm = 0, seat = 0, output = 0, wm = 0, deco = 0, ddm = 0;
+  explicit App(Server& server, bool all = true) : WClient(server) {
+    reg = registry();
+    compositor = bind(reg, "wl_compositor");
+    subcompositor = bind(reg, "wl_subcompositor");
+    shm = bind(reg, "wl_shm");
+    wm = bind(reg, "xdg_wm_base");
+    if (all) {
+      seat = bind(reg, "wl_seat");
+      output = bind(reg, "wl_output");
+      deco = bind(reg, "zxdg_decoration_manager_v1");
+      ddm = bind(reg, "wl_data_device_manager");
+    }
+    drop_events();
+  }
+  // A pool of `bytes` bytes (the client's memory), shared with the server.
+  struct Pool {
+    uint32_t id = 0;
+    std::vector<uint8_t>* memory = nullptr;
+  };
+  std::vector<std::vector<uint8_t>*> memories;
+  ~App() { for (auto* m : memories) delete m; }
+  Pool pool(size_t bytes) {
+    Pool p;
+    p.memory = new std::vector<uint8_t>(bytes);
+    memories.push_back(p.memory);
+    p.id = new_id();
+    send(Msg(shm, 0).u(p.id).i(int32_t(bytes)), {Fd::make_as<TestMemory>(A, p.memory)});
+    return p;
+  }
+  uint32_t buffer(const Pool& p, int32_t offset, int32_t w, int32_t h, int32_t stride, uint32_t format = 1) {
+    const uint32_t id = new_id();
+    send(Msg(p.id, 0).u(id).i(offset).i(w).i(h).i(stride).u(format));
+    return id;
+  }
+  static void fill(const Pool& p, int32_t offset, int32_t w, int32_t h, int32_t stride, uint32_t color) {
+    for (int32_t y = 0; y < h; ++y)
+      for (int32_t x = 0; x < w; ++x) memcpy(p.memory->data() + offset + y * stride + x * 4, &color, 4);
+  }
+  uint32_t surface() {
+    const uint32_t id = new_id();
+    send(Msg(compositor, 0).u(id));
+    return id;
+  }
+  struct Window {
+    uint32_t surface = 0, xdg = 0, toplevel = 0, decoration = 0, serial = 0;
+    int32_t cw = 0, ch = 0;      // what the last configure asked for
+  };
+  // A toplevel up to its first configure (acknowledged).
+  Window toplevel(bool decorate = true, const std::string& title = "test") {
+    Window w;
+    w.surface = surface();
+    w.xdg = new_id();
+    send(Msg(wm, 2).u(w.xdg).u(w.surface));
+    w.toplevel = new_id();
+    send(Msg(w.xdg, 1).u(w.toplevel));
+    if (decorate) {
+      w.decoration = new_id();
+      send(Msg(deco, 1).u(w.decoration).u(w.toplevel));
+    }
+    send(Msg(w.toplevel, 2).s(title));
+    send(Msg(w.surface, 6));      // the initial commit
+    configured(w);
+    return w;
+  }
+  // Takes the configure that came (toplevel + xdg_surface) and acknowledges it.
+  bool configured(Window& w) {
+    Ev c = take(w.toplevel, 0);
+    Ev x = take(w.xdg, 0);
+    if (c.object == 0 || x.object == 0) return false;
+    w.cw = c.i(0);
+    w.ch = c.i(1);
+    w.serial = x.u(0);
+    send(Msg(w.xdg, 4).u(w.serial));
+    return true;
+  }
+  // Attaches a fresh buffer of w x h filled with `color` and commits it.
+  uint32_t show(Window& w, int32_t width, int32_t height, uint32_t color, Pool* keep = nullptr) {
+    Pool p = pool(size_t(width) * height * 4);
+    fill(p, 0, width, height, width * 4, color);
+    const uint32_t b = buffer(p, 0, width, height, width * 4);
+    send(Msg(w.surface, 1).u(b).i(0).i(0));
+    send(Msg(w.surface, 2).i(0).i(0).i(width).i(height));
+    send(Msg(w.surface, 6));
+    if (keep) *keep = p;
+    return b;
+  }
+};
+
+static desktop::IWindowsSession::Monitor monitor(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32_t taskbar) {
+  desktop::IWindowsSession::Monitor m;
+  m.rect = {x, y, w, h};
+  m.work = {x, y, w, h - taskbar};
+  return m;
+}
+
+static std::vector<uint32_t> listed(Server& s) {
+  List<uint32_t> list(A);
+  s.windows(&list);
+  return std::vector<uint32_t>(list.view().data(), list.view().data() + list.count());
+}
+
+// ------------------------------------------------------------------ MemoryFile
+
+static void test_memory_file() {
+  using process::MemoryFile;
+  using process::BlockRef;
+  using filesystem::Status;
+  {
+    MemoryFile f(A, true);
+    uint64_t size = 99;
+    CHECK(!f.block(&size) && size == 0);      // (empty: no block yet)
+    uint64_t done = 0;
+    const uint8_t hello[5] = {'h', 'e', 'l', 'l', 'o'};
+    CHECK(f.write(10, ConstByteView(hello, 5), &done) == Status::Ok && done == 5 && f.size() == 15);
+    uint8_t back[20] = {};
+    uint64_t got = 0;
+    CHECK(f.read(0, ByteView(back, 20), &got) == Status::Ok && got == 15 && back[0] == 0 && back[10] == 'h' && back[14] == 'o');
+    CHECK(f.read(15, ByteView(back, 20), &got) == Status::Ok && got == 0);
+    BlockRef b = f.block(&size);
+    CHECK(b && size == 15 && b.get()->capacity() == 4096 && b.get()->bytes()[11] == 'e');
+    // writes through the block are the file's
+    b.get()->bytes()[0] = 'X';
+    CHECK(f.read(0, ByteView(back, 1), &got) == Status::Ok && back[0] == 'X');
+    // growing within the block keeps it; past it moves the contents, the old block stays valid for whoever holds it
+    CHECK(f.resize(4000) == Status::Ok);
+    uint64_t s2 = 0;
+    BlockRef same = f.block(&s2);
+    CHECK(same.get() == b.get() && s2 == 4000);
+    CHECK(f.resize(10000) == Status::Ok && f.size() == 10000);
+    BlockRef bigger = f.block(&s2);
+    CHECK(bigger.get() != b.get() && bigger.get()->capacity() >= 10000 && bigger.get()->bytes()[0] == 'X' && bigger.get()->bytes()[14] == 'o');
+    CHECK(b.get()->bytes()[14] == 'o');      // (still readable: this reference keeps it)
+    // shrinking clears what is cut off
+    CHECK(f.resize(12) == Status::Ok && f.resize(20) == Status::Ok);
+    CHECK(f.read(0, ByteView(back, 20), &got) == Status::Ok && got == 20 && back[11] == 'e' && back[12] == 0 && back[14] == 0);
+    // fallocate
+    CHECK(f.allocate(0, 50) == Status::Ok && f.size() == 50);
+    CHECK(f.allocate(100, 0) == Status::InvalidArgument);
+    // seals
+    CHECK(f.add_seals(MemoryFile::kSealShrink));
+    CHECK(f.resize(10) == Status::AccessDenied && f.resize(60) == Status::Ok);
+    CHECK(f.add_seals(MemoryFile::kSealGrow | MemoryFile::kSealSeal));
+    CHECK(f.resize(61) == Status::AccessDenied && f.write(60, ConstByteView(hello, 1), &done) == Status::AccessDenied);
+    CHECK(!f.add_seals(MemoryFile::kSealWrite));      // (sealed against more seals)
+    CHECK(f.seals() == (MemoryFile::kSealShrink | MemoryFile::kSealGrow | MemoryFile::kSealSeal));
+    // limits: sizes that would wrap or exceed the maximum
+    MemoryFile g(A, false);
+    CHECK(!g.add_seals(MemoryFile::kSealGrow));      // (no MFD_ALLOW_SEALING)
+    CHECK(g.resize(MemoryFile::kMaxSize + 1) == Status::NoSpace);
+    CHECK(g.write(~uint64_t{0} - 2, ConstByteView(hello, 5), &done) == Status::NoSpace);
+    CHECK(g.allocate(~uint64_t{0} - 10, 20) == Status::NoSpace);
+  }
+  CHECK(A.live == 0);
+  // several threads reading the block while another grows and shrinks the file (the holders' memory stays valid)
+  {
+    MemoryFile f(A, false);
+    CHECK(f.resize(4096) == filesystem::Status::Ok);
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int k = 0; k < 4; ++k)
+      readers.emplace_back([&] {
+        while (!stop) {
+          uint64_t size = 0;
+          BlockRef b = f.block(&size);
+          if (b) {
+            volatile uint8_t sum = 0;
+            for (uint64_t i = 0; i < size && i < b.get()->capacity(); i += 512) sum = uint8_t(sum + b.get()->bytes()[i]);
+          }
+          uint8_t buf[64];
+          uint64_t got = 0;
+          f.read(100, ByteView(buf, sizeof buf), &got);
+        }
+      });
+    for (int round = 0; round < 300; ++round) {
+      f.resize(uint64_t(4096 + (round % 7) * 8192));
+      uint64_t done = 0;
+      const uint8_t v = uint8_t(round);
+      f.write(uint64_t(round * 13 % 4000), ConstByteView(&v, 1), &done);
+    }
+    stop = true;
+    for (std::thread& t : readers) t.join();
+  }
+  CHECK(A.live == 0);
+}
+
+// ------------------------------------------------------------------ the registry
+
+static void test_registry() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1280, 800, {});
+  {
+    WClient c(server);
+    CHECK(c.number != 0);
+    const uint32_t r = c.registry();
+    const char* names[] = {"wl_compositor", "wl_subcompositor", "wl_shm", "wl_seat", "wl_output", "wl_data_device_manager", "xdg_wm_base", "zxdg_decoration_manager_v1"};
+    for (const char* n : names) CHECK(c.globals.count(n) == 1);
+    CHECK(c.globals["xdg_wm_base"].second == 5 && c.globals["wl_seat"].second == 8);
+    c.drop_events();
+    const uint32_t shm = c.bind(r, "wl_shm");
+    int formats = 0;
+    for (const Ev& e : c.events) if (e.object == shm && e.opcode == 0) ++formats;
+    CHECK(formats == 4);
+    const uint32_t seat = c.bind(r, "wl_seat");
+    Ev caps = c.take(seat, 0);
+    CHECK(caps.object == seat && caps.u(0) == 3);
+    CHECK(c.take(seat, 1).s(0) == "seat0");
+    const uint32_t output = c.bind(r, "wl_output");
+    Ev mode = c.take(output, 1);
+    CHECK(mode.object == output && mode.i(1) == 1280 && mode.i(2) == 800);
+    CHECK(c.has(output, 2));      // done
+    // sync: the callback's done, then its id is given back
+    const uint32_t cb = c.new_id();
+    c.send(Msg(1, 0).u(cb));
+    CHECK(c.take(cb, 0).object == cb);
+    Ev del = c.take(1, 1);
+    CHECK(del.object == 1 && del.u(0) == cb);
+    CHECK(!c.closing);
+    // a bind of a version the global does not have is an error
+    const uint32_t bad = c.new_id();
+    c.send(Msg(r, 0).u(c.globals["wl_compositor"].first).s("wl_compositor").u(99).u(bad));
+    CHECK(c.error() && c.closing);
+  }
+  {      // a bind under the wrong interface name
+    WClient c(server);
+    const uint32_t r = c.registry();
+    c.send(Msg(r, 0).u(c.globals["wl_shm"].first).s("wl_compositor").u(1).u(c.new_id()));
+    CHECK(c.error());
+  }
+  CHECK(server.client_count() == 0);
+}
+
+// ------------------------------------------------------------------ toplevels and the desktop
+
+static void test_toplevel() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  const desktop::IWindowsSession::Monitor m = monitor(0, 0, 1280, 800, 40);
+  server.set_display(1280, 800, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+  App app(server);
+  App::Window w = app.toplevel(true, "Hello Wayland");
+  CHECK(w.cw == 0 && w.ch == 0);      // (the client chooses the first size)
+  CHECK(listed(server).empty());      // (not shown before it has a picture)
+  App::Pool pool;
+  const uint32_t buffer = app.show(w, 300, 200, 0xFF336699u, &pool);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 1);
+  if (list.empty()) return;
+  const uint32_t win = list[0];
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(server.window_info(win, &info, &title));
+  CHECK(info.visible && info.caption && info.sizable && info.minimize_box && info.maximize_box && !info.popup);
+  CHECK(title.view() == StringView("Hello Wayland"));
+  CHECK(info.surface.width == 300 && info.surface.height == 200);
+  CHECK(info.window.width == 300 + 8 && info.window.height == 200 + 4 + 24 + 4);
+  CHECK(info.surface.x == info.window.x + 4 && info.surface.y == info.window.y + 28);
+  CHECK(info.window.x >= 0 && info.window.y >= 0 && info.window.y + int32_t(info.window.height) <= 760);
+  CHECK(server.window_pixel(win, 10, 10) == 0xFF336699u);
+  // the surface entered the output
+  CHECK(app.take(w.surface, 0).u(0) == app.output);
+  // what the desktop is told
+  List<uint32_t> changed(A);
+  List<desktop::IWindowsSession::Repaint> repainted(A);
+  server.take_changes(&changed, &repainted);
+  bool saw = false;
+  for (uint32_t c : changed.view()) saw |= c == win;
+  CHECK(saw && repainted.count() >= 1);
+  // drawing: straight from the client's memory, then the frame callback is answered
+  const uint32_t frame = app.new_id();
+  app.send(Msg(w.surface, 3).u(frame));
+  App::fill(pool, 0, 300, 200, 1200, 0xFF00FF00u);
+  app.send(Msg(w.surface, 2).i(5).i(6).i(10).i(10));
+  app.send(Msg(w.surface, 6));
+  server.take_changes(&changed, &repainted);
+  CHECK(repainted.count() == 1 && repainted[0].window == win && repainted[0].dirty.x == 5 && repainted[0].dirty.y == 6 && repainted[0].dirty.width == 10);
+  CHECK(!app.has(frame, 0));
+  std::vector<uint32_t> target(400 * 300, 0);
+  graphics::Surface ts;
+  ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+  ts.width = 400;
+  ts.height = 300;
+  ts.pitch = 400;
+  {
+    graphics::SoftwareRenderer2D renderer(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(server.draw_window(win, renderer, 50, 40, &dw, &dh));
+    CHECK(dw == 300 && dh == 200);
+  }
+  CHECK(target[40 * 400 + 50] == 0xFF00FF00u && target[239 * 400 + 349] == 0xFF00FF00u && target[39 * 400 + 50] == 0);
+  CHECK(app.take(frame, 0).object == frame);
+  // the same buffer again is not released; a new one releases the old
+  CHECK(!app.has(buffer, 0));
+  app.show(w, 300, 200, 0xFF112233u);
+  CHECK(app.has(buffer, 0));
+  // the user moves the frame: no configure (the size is the same), the window is where the frame is
+  app.drop_events();
+  server.move_window(win, {100, 120, info.window.width, info.window.height});
+  CHECK(server.window_info(win, &info, &title) && info.window.x == 100 && info.window.y == 120 && info.surface.x == 104 && info.surface.y == 148);
+  CHECK(!app.has(w.toplevel, 0));
+  // ... and sizes it: the client is asked, the frame shows the new size until the client answers with a picture of it
+  server.move_window(win, {100, 120, 508, 432});
+  CHECK(app.configured(w) && w.cw == 500 && w.ch == 400);
+  CHECK(server.window_info(win, &info, &title) && info.surface.width == 500 && info.surface.height == 400);
+  app.show(w, 500, 400, 0xFF445566u);
+  CHECK(server.window_info(win, &info, &title) && info.surface.width == 500);
+  // a client that answers a different size (its minimum): that is what is shown
+  app.send(Msg(w.toplevel, 8).i(450).i(350));
+  server.move_window(win, {100, 120, 208, 132});
+  CHECK(app.configured(w) && w.cw == 450 && w.ch == 350);
+  // activation: keyboard focus and the activated state
+  app.drop_events();
+  server.activate_window(win);
+  Ev c = app.take(w.toplevel, 0);
+  CHECK(c.object == w.toplevel);
+  bool activated = false;
+  for (size_t k = 0; k < c.u(2) / 4; ++k) activated |= c.u(3 + k) == 4;
+  CHECK(activated);
+  CHECK(server.window_info(win, &info, &title) && info.active);
+  // maximize (the desktop's button): the work area inside the frame
+  app.drop_events();
+  server.window_command(win, desktop::IWindowsSession::Command::Maximize);
+  CHECK(app.configured(w) && w.cw == 1280 - 8 && w.ch == 760 - 32);
+  app.show(w, w.cw, w.ch, 0xFF000000u);
+  CHECK(server.window_info(win, &info, &title) && info.maximized && info.window.x == 0 && info.window.y == 0 && int32_t(info.window.height) == 760);
+  server.window_command(win, desktop::IWindowsSession::Command::Restore);
+  CHECK(app.configured(w) && w.cw == 450 && w.ch == 350);
+  // minimize and back
+  server.window_command(win, desktop::IWindowsSession::Command::Minimize);
+  CHECK(server.window_info(win, &info, &title) && info.minimized);
+  server.window_command(win, desktop::IWindowsSession::Command::Restore);
+  CHECK(server.window_info(win, &info, &title) && !info.minimized);
+  // the client minimizes itself, maximizes itself
+  app.send(Msg(w.toplevel, 13));
+  CHECK(server.window_info(win, &info, &title) && info.minimized);
+  server.window_command(win, desktop::IWindowsSession::Command::Restore);
+  app.drop_events();
+  app.send(Msg(w.toplevel, 9));
+  CHECK(app.configured(w) && w.cw == 1272);
+  app.send(Msg(w.toplevel, 10));
+  CHECK(app.configured(w) && w.cw == 450);
+  // fullscreen: the monitor, no frame
+  app.send(Msg(w.toplevel, 11).u(0));
+  CHECK(app.configured(w) && w.cw == 1280 && w.ch == 800);
+  app.show(w, 1280, 800, 0xFF000000u);
+  CHECK(server.window_info(win, &info, &title) && !info.caption && info.window.width == 1280 && info.window.x == 0);
+  app.send(Msg(w.toplevel, 12));
+  CHECK(app.configured(w) && w.cw == 450);
+  app.show(w, 450, 350, 0xFF000000u);
+  // a move started by the client (its own title bar): the desktop drags the frame
+  app.send(Msg(w.toplevel, 5).u(app.seat).u(1));
+  uint32_t edge = 0;
+  CHECK(server.take_drag(&edge) == win && edge == 9);
+  app.send(Msg(w.toplevel, 6).u(app.seat).u(1).u(10));      // bottom right
+  CHECK(server.take_drag(&edge) == win && edge == 8);
+  CHECK(server.take_drag(&edge) == 0);
+  // the close button: the client is asked
+  server.window_command(win, desktop::IWindowsSession::Command::Close);
+  CHECK(app.has(w.toplevel, 1));
+  // fixed size: not sizable
+  app.send(Msg(w.toplevel, 7).i(450).i(350));
+  app.send(Msg(w.toplevel, 8).i(450).i(350));
+  CHECK(server.window_info(win, &info, &title) && !info.sizable && !info.maximize_box);
+  // the decoration object goes: the client draws its own frame from now on
+  app.send(Msg(w.decoration, 0));
+  CHECK(server.window_info(win, &info, &title) && !info.caption && info.window.width == info.surface.width);
+  // a null buffer unmaps it; then it starts over with an initial commit
+  app.send(Msg(w.surface, 1).u(0).i(0).i(0));
+  app.send(Msg(w.surface, 6));
+  CHECK(listed(server).empty());
+  CHECK(server.window_info(win, &info, &title) && !info.visible);
+  app.drop_events();
+  app.send(Msg(w.surface, 6));
+  CHECK(app.configured(w));
+  app.show(w, 100, 100, 0xFFFFFFFFu);
+  CHECK(listed(server).size() == 1);
+  // the toplevel goes: so does the window
+  app.send(Msg(w.toplevel, 0));
+  CHECK(listed(server).empty() && !server.window_info(win, &info, &title));
+  CHECK(app.roundtrip() && !app.closing);
+}
+
+// A window with window geometry (a client-side shadow around it): the desktop sees the geometry; drawing leaves the shadow out.
+static void test_geometry_and_csd() {
+  Server server(A);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  App app(server, false);
+  App::Window w = app.toplevel(false, "csd");
+  App::Pool p = app.pool(220 * 170 * 4);
+  App::fill(p, 0, 220, 170, 880, 0x40000000u);              // shadow
+  for (int y = 10; y < 160; ++y)
+    for (int x = 10; x < 210; ++x) {
+      const uint32_t v = 0xFFAA0000u;
+      memcpy(p.memory->data() + y * 880 + x * 4, &v, 4);
+    }
+  const uint32_t b = app.buffer(p, 0, 220, 170, 880, 0);      // ARGB
+  app.send(Msg(w.xdg, 3).i(10).i(10).i(200).i(150));
+  app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+  app.send(Msg(w.surface, 6));
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 1);
+  if (list.empty()) return;
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(server.window_info(list[0], &info, &title) && !info.caption && info.surface.width == 200 && info.surface.height == 150);
+  CHECK(info.window.width == 200 && info.window.x == info.surface.x);
+  CHECK(server.window_pixel(list[0], 0, 0) == 0xFFAA0000u);
+  std::vector<uint32_t> target(300 * 300, 0xFF0000FFu);
+  graphics::Surface ts;
+  ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+  ts.width = ts.height = ts.pitch = 300;
+  {
+    graphics::SoftwareRenderer2D renderer(ts);
+    renderer.set_clip({20, 20, 200, 150});      // (the desktop's view clips to the frame's inside)
+    uint32_t dw = 0, dh = 0;
+    CHECK(server.draw_window(list[0], renderer, 20, 20, &dw, &dh) && dw == 200 && dh == 150);
+  }
+  CHECK(target[20 * 300 + 20] == 0xFFAA0000u && target[19 * 300 + 20] == 0xFF0000FFu && target[169 * 300 + 219] == 0xFFAA0000u);
+  // the pointer at the shadow's place is not over it; at the geometry it is
+  const uint32_t pointer = app.new_id();
+  app.seat = app.bind(app.reg, "wl_seat");
+  app.send(Msg(app.seat, 0).u(pointer));
+  app.drop_events();
+  server.mouse_position(info.surface.x + 5, info.surface.y + 5);
+  Ev enter = app.take(pointer, 0);
+  CHECK(enter.object == pointer && enter.u(1) == w.surface && enter.i(2) == 15 * 256 && enter.i(3) == 15 * 256);
+}
+
+// ------------------------------------------------------------------ popups
+
+static void test_popups() {
+  Server server(A);
+  server.attach(4, 24);
+  const desktop::IWindowsSession::Monitor m = monitor(0, 0, 800, 600, 0);
+  server.set_display(800, 600, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+  App app(server);
+  App::Window w = app.toplevel(true, "menu owner");
+  app.show(w, 400, 300, 0xFFFFFFFFu);
+  const uint32_t win = listed(server)[0];
+  server.move_window(win, {100, 100, 408, 332});      // inside at (104, 128)
+  server.activate_window(win);
+  // a menu below a button at (20, 30, 60, 20) of the window
+  const uint32_t pos = app.new_id();
+  app.send(Msg(app.wm, 1).u(pos));
+  app.send(Msg(pos, 1).i(150).i(100));
+  app.send(Msg(pos, 2).i(20).i(30).i(60).i(20));
+  app.send(Msg(pos, 3).u(6));      // anchor bottom_left
+  app.send(Msg(pos, 4).u(8));      // gravity bottom_right
+  app.send(Msg(pos, 5).u(1 | 2 | 4 | 8));
+  const uint32_t ps = app.surface(), pxdg = app.new_id(), popup = app.new_id();
+  app.send(Msg(app.wm, 2).u(pxdg).u(ps));
+  app.send(Msg(pxdg, 2).u(popup).u(w.xdg).u(pos));
+  app.send(Msg(popup, 1).u(app.seat).u(1));      // grab
+  app.send(Msg(ps, 6));
+  Ev pc = app.take(popup, 0);
+  CHECK(pc.object == popup && pc.i(0) == 20 && pc.i(1) == 50 && pc.i(2) == 150 && pc.i(3) == 100);
+  Ev px = app.take(pxdg, 0);
+  app.send(Msg(pxdg, 4).u(px.u(0)));
+  const uint32_t keyboard = app.new_id();
+  app.send(Msg(app.seat, 1).u(keyboard));
+  app.drop_events();
+  App::Window pw;
+  pw.surface = ps;
+  app.show(pw, 150, 100, 0xFF00FF00u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  const uint32_t pwin = list[1];
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(server.window_info(pwin, &info, &title) && info.popup && info.owned && !info.caption && info.surface.x == 104 + 20 && info.surface.y == 128 + 50);
+  // the grab took the keyboard
+  Ev enter = app.take(keyboard, 1);
+  CHECK(enter.object == keyboard && enter.u(1) == ps);
+  // it moves with its window
+  server.move_window(win, {200, 100, 408, 332});
+  CHECK(server.window_info(pwin, &info, &title) && info.surface.x == 204 + 20);
+  // near the right edge: flipped to the left of the anchor
+  server.move_window(win, {400, 100, 408, 332});
+  const uint32_t pos2 = app.new_id();
+  app.send(Msg(app.wm, 1).u(pos2));
+  app.send(Msg(pos2, 1).i(150).i(100));
+  app.send(Msg(pos2, 2).i(380).i(30).i(10).i(10));
+  app.send(Msg(pos2, 3).u(8));
+  app.send(Msg(pos2, 4).u(8));
+  app.send(Msg(pos2, 5).u(4));
+  app.send(Msg(popup, 2).u(pos2).u(77));
+  Ev rep = app.take(popup, 2);
+  CHECK(rep.object == popup && rep.u(0) == 77);
+  pc = app.take(popup, 0);
+  CHECK(pc.object == popup && pc.i(0) == 380 - 150);      // (404 + 390 + 150 would pass 800)
+  // a press outside the popup closes it
+  server.mouse_position(250, 300);
+  server.mouse_button(1, true);
+  server.mouse_button(1, false);
+  CHECK(app.has(popup, 1));      // popup_done
+  CHECK(listed(server).size() == 1);
+  // the keyboard is back with the window
+  CHECK(app.take(keyboard, 1).u(1) == w.surface);
+  // a popup without a parent is an error
+  const uint32_t s3 = app.surface(), x3 = app.new_id();
+  app.send(Msg(app.wm, 2).u(x3).u(s3));
+  app.send(Msg(x3, 2).u(app.new_id()).u(0).u(pos));
+  CHECK(app.error() && app.closing);
+}
+
+// ------------------------------------------------------------------ subsurfaces
+
+static void test_subsurfaces() {
+  Server server(A);
+  server.set_display(800, 600, {});
+  App app(server);
+  App::Window w = app.toplevel(false, "sub");
+  App::Pool main_pool;
+  app.show(w, 200, 200, 0xFF000000u, &main_pool);
+  const uint32_t win = listed(server)[0];
+  // a child at (50, 60), synchronized: shown with the parent's next commit
+  const uint32_t child = app.surface(), sub = app.new_id();
+  app.send(Msg(app.subcompositor, 1).u(sub).u(child).u(w.surface));
+  app.send(Msg(sub, 1).i(50).i(60));
+  App::Pool cp = app.pool(40 * 30 * 4);
+  App::fill(cp, 0, 40, 30, 160, 0xFFFF0000u);
+  const uint32_t cb = app.buffer(cp, 0, 40, 30, 160);
+  app.send(Msg(child, 1).u(cb).i(0).i(0));
+  app.send(Msg(child, 6));
+  auto draw = [&](int32_t x, int32_t y) {
+    std::vector<uint32_t> target(200 * 200, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 200;
+    graphics::SoftwareRenderer2D renderer(ts);
+    uint32_t dw = 0, dh = 0;
+    server.draw_window(win, renderer, 0, 0, &dw, &dh);
+    return target[size_t(y) * 200 + size_t(x)];
+  };
+  CHECK(draw(55, 65) == 0xFF000000u);      // (not yet: synchronized)
+  app.send(Msg(w.surface, 6));
+  CHECK(draw(55, 65) == 0xFFFF0000u && draw(49, 65) == 0xFF000000u && draw(89, 89) == 0xFFFF0000u && draw(90, 90) == 0xFF000000u);
+  // the pointer over the child goes to the child, in its coordinates
+  const uint32_t pointer = app.new_id();
+  app.send(Msg(app.seat, 0).u(pointer));
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  server.window_info(win, &info, &title);
+  app.drop_events();
+  server.mouse_position(info.surface.x + 52, info.surface.y + 61);
+  Ev e = app.take(pointer, 0);
+  CHECK(e.u(1) == child && e.i(2) == 2 * 256 && e.i(3) == 256);
+  // desync: a commit shows at once; below the parent: hidden behind it
+  app.send(Msg(sub, 5));
+  App::fill(cp, 0, 40, 30, 160, 0xFF0000FFu);
+  app.send(Msg(child, 2).i(0).i(0).i(40).i(30));
+  app.send(Msg(child, 6));
+  CHECK(draw(55, 65) == 0xFF0000FFu);
+  app.send(Msg(sub, 3).u(w.surface));
+  CHECK(draw(55, 65) == 0xFF000000u);
+  // a surface cannot be its own parent's parent
+  const uint32_t sub2 = app.new_id();
+  app.send(Msg(app.subcompositor, 1).u(sub2).u(w.surface).u(child));
+  CHECK(app.error());
+}
+
+// ------------------------------------------------------------------ the seat
+
+static void test_seat() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1000, 800, {});
+  App a(server), b(server);
+  App::Window wa = a.toplevel(false, "a"), wb = b.toplevel(false, "b");
+  a.show(wa, 300, 300, 0xFF111111u);
+  b.show(wb, 300, 300, 0xFF222222u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  server.move_window(list[0], {0, 0, 300, 300});
+  server.move_window(list[1], {400, 0, 300, 300});
+  const uint32_t pa = a.new_id(), ka = a.new_id(), pb = b.new_id(), kb = b.new_id();
+  a.send(Msg(a.seat, 0).u(pa));
+  a.send(Msg(a.seat, 1).u(ka));
+  b.send(Msg(b.seat, 0).u(pb));
+  b.send(Msg(b.seat, 1).u(kb));
+  // the keymap: an xkb_v1 text with its NUL, in a descriptor that came with it; then the repeat rate
+  Ev km = a.take(ka, 0);
+  CHECK(km.object == ka && km.u(0) == 1 && !a.fds.empty());
+  if (!a.fds.empty()) {
+    ByteView text = a.fds[0]->map(km.u(1));
+    CHECK(text.size() >= km.u(1) && text[km.u(1) - 1] == 0 && std::string(reinterpret_cast<const char*>(text.data())).find("xkb_symbols") != std::string::npos);
+  }
+  Ev rep = a.take(ka, 5);
+  CHECK(rep.i(0) == 25 && rep.i(1) == 600);
+  CHECK(Server::evdev_code(0x04) == 30 && Server::evdev_code(0x28) == 28 && Server::evdev_code(0xE1) == 42 && Server::evdev_code(0x00) == 0);
+  a.drop_events();
+  b.drop_events();
+  // the pointer over a's window: enter, motion, frame
+  server.mouse_position(10, 20);
+  Ev enter = a.take(pa, 0);
+  CHECK(enter.object == pa && enter.u(1) == wa.surface && enter.i(2) == 10 * 256 && enter.i(3) == 20 * 256);
+  CHECK(a.has(pa, 5));
+  server.mouse_position(12, 20);
+  Ev motion = a.take(pa, 2);
+  CHECK(motion.object == pa && motion.i(1) == 12 * 256);
+  // over to b: a's leave, b's enter
+  server.mouse_position(410, 30);
+  CHECK(a.take(pa, 1).u(1) == wa.surface);
+  CHECK(b.take(pb, 0).u(1) == wb.surface);
+  // a press and a drag out of b's window: the implicit grab keeps b's focus, with coordinates outside its surface
+  server.mouse_button(1, true);
+  Ev press = b.take(pb, 3);
+  CHECK(press.object == pb && press.u(2) == 0x110 && press.u(3) == 1);
+  CHECK(server.capture_window() == list[1]);
+  server.mouse_position(100, 30);
+  Ev drag = b.take(pb, 2);
+  CHECK(drag.object == pb && drag.i(1) == -300 * 256);
+  CHECK(!a.has(pa, 0));
+  server.mouse_button(1, false);
+  CHECK(b.take(pb, 3).u(3) == 0);
+  CHECK(b.has(pb, 1) && a.has(pa, 0));      // (the release ends the grab: the focus moves to what is under the pointer)
+  CHECK(server.capture_window() == 0);
+  // the right and middle buttons, the wheel
+  a.drop_events();
+  server.mouse_button(2, true);
+  CHECK(a.take(pa, 3).u(2) == 0x111);
+  server.mouse_button(2, false);
+  a.drop_events();
+  server.mouse_button(3, true);
+  CHECK(a.take(pa, 3).u(2) == 0x112);
+  server.mouse_button(3, false);
+  server.mouse_wheel(1);
+  CHECK(a.take(pa, 6).u(0) == 0);
+  CHECK(a.take(pa, 9).i(1) == -120);
+  CHECK(a.take(pa, 4).i(2) == -15 * 256);
+  // the cursor a client sets
+  desktop::IWindowsSession::Pointer ptr;
+  server.pointer(&ptr);
+  CHECK(!ptr.hidden && ptr.cursor == 0 && ptr.system_id == 32512);
+  const uint32_t cs = a.surface();
+  App::Pool cp = a.pool(16 * 16 * 4);
+  App::fill(cp, 0, 16, 16, 64, 0x80402010u);      // premultiplied, half transparent
+  const uint32_t cbuf = a.buffer(cp, 0, 16, 16, 64, 0);
+  a.send(Msg(cs, 1).u(cbuf).i(0).i(0));
+  a.send(Msg(cs, 6));
+  a.send(Msg(pa, 0).u(enter.u(0)).u(cs).i(3).i(4));
+  server.pointer(&ptr);
+  CHECK(!ptr.hidden && ptr.cursor != 0);
+  uint32_t sys = 0, cw = 0, ch = 0;
+  int32_t hx = 0, hy = 0;
+  List<uint32_t> argb(A);
+  CHECK(server.cursor_picture(ptr.cursor, &sys, &argb, &cw, &ch, &hx, &hy) && cw == 16 && ch == 16 && hx == 3 && hy == 4);
+  CHECK(argb.count() == 256 && argb[0] == 0x80804020u);      // (straight alpha)
+  a.send(Msg(pa, 0).u(enter.u(0)).u(0).i(0).i(0));
+  server.pointer(&ptr);
+  CHECK(ptr.hidden);
+  // b cannot set a's cursor (the pointer is not over b)
+  b.send(Msg(pb, 0).u(1).u(0).i(0).i(0));
+  server.pointer(&ptr);
+  CHECK(ptr.hidden);
+  // the pointer leaves for a desktop window
+  a.drop_events();
+  server.mouse_left();
+  CHECK(a.has(pa, 1));
+  // the keyboard: the active window's client
+  server.activate_window(list[0]);
+  Ev kenter = a.take(ka, 1);
+  CHECK(kenter.object == ka && kenter.u(1) == wa.surface);
+  Ev mods = a.take(ka, 4);
+  CHECK(mods.object == ka && mods.u(1) == 0);
+  server.key(0xE1, true, hardware::modifier::kLeftShift);      // shift down
+  Ev k1 = a.take(ka, 3);
+  CHECK(k1.u(2) == 42 && k1.u(3) == 1);
+  CHECK(a.take(ka, 4).u(1) == 1);      // Shift
+  server.key(0x04, true, hardware::modifier::kLeftShift);
+  CHECK(a.take(ka, 3).u(2) == 30);
+  server.key(0x04, true, hardware::modifier::kLeftShift);      // (the desktop's repeat: dropped, the client repeats itself)
+  CHECK(!a.has(ka, 3));
+  server.key(0x04, false, hardware::modifier::kLeftShift);
+  CHECK(a.take(ka, 3).u(3) == 0);
+  server.key(0xE1, false, 0);
+  a.take(ka, 3);
+  CHECK(a.take(ka, 4).u(1) == 0);
+  server.key(0x39, true, 0);      // caps lock: locked Lock
+  CHECK(a.take(ka, 4).u(3) == 2);
+  server.key(0x39, false, 0);
+  CHECK(!b.has(kb, 3));
+  // a key held while the focus moves comes with the enter
+  server.key(0x05, true, 0);
+  server.activate_window(list[1]);
+  CHECK(a.take(ka, 2).u(1) == wa.surface);
+  Ev be = b.take(kb, 1);
+  CHECK(be.object == kb && be.u(2) == 4 && be.u(3) == 48);
+  CHECK(b.take(kb, 4).u(3) == 2);      // (caps lock is still on)
+  server.key(0x05, false, 0);
+  CHECK(b.take(kb, 3).u(2) == 48);
+  // no window active: nobody has the keyboard
+  server.activate_window(0);
+  CHECK(b.take(kb, 2).u(1) == wb.surface);
+  free_made();
+}
+
+// ------------------------------------------------------------------ protocol errors
+
+static void test_errors() {
+  Server server(A);
+  server.set_display(800, 600, {});
+  auto expect_error = [&](const std::function<void(App&)>& f, uint32_t want_code, int line) {
+    App app(server);
+    f(app);
+    uint32_t object = 0, code = 0;
+    const bool got = app.error(&object, &code);
+    if (!got || code != want_code || !app.closing) {
+      printf("FAILED line %d: expected error %u, got %d (%u)\n", line, want_code, got, code);
+      ++g_failed;
+    }
+  };
+  // an unknown object, an unknown request
+  expect_error([](App& a) { a.send(Msg(999, 0)); }, 0, __LINE__);
+  expect_error([](App& a) { a.send(Msg(a.compositor, 7).u(a.new_id())); }, 1, __LINE__);
+  // a new id that is in use
+  expect_error([](App& a) { a.send(Msg(a.compositor, 0).u(a.shm)); }, 0, __LINE__);
+  // shm: a descriptor that is not memory, a pool too big for it, a missing descriptor, bad buffers
+  expect_error([](App& a) {
+    auto* v = new std::vector<uint8_t>(100);
+    a.memories.push_back(v);
+    Fd fd = Fd::make_as<TestMemory>(A, v);
+    a.send(Msg(a.shm, 0).u(a.new_id()).i(4096), {fd});
+  }, 2, __LINE__);
+  expect_error([](App& a) { a.send(Msg(a.shm, 0).u(a.new_id()).i(4096)); }, 1, __LINE__);      // (no descriptor came: malformed)
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 0, 16, 16, 64, 12345); }, 0, __LINE__);
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 0, 33, 16, 128); }, 1, __LINE__);      // (33 * 16 rows of 128 > 4096)
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 2, 16, 16, 64); }, 1, __LINE__);
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 0, 16, 16, 60); }, 1, __LINE__);
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 0, -1, 16, 64); }, 1, __LINE__);
+  expect_error([](App& a) { App::Pool p = a.pool(4096); a.buffer(p, 0x7FFFFFFC, 1, 1, 4); }, 1, __LINE__);
+  expect_error([](App& a) { App::Pool p = a.pool(8192); a.send(Msg(p.id, 2).i(4096)); }, 1, __LINE__);      // (a pool cannot shrink)
+  // xdg: a second role, a buffer before the first configure, a bad geometry, an incomplete positioner
+  expect_error([](App& a) {
+    const uint32_t s = a.surface(), x = a.new_id();
+    a.send(Msg(a.subcompositor, 1).u(a.new_id()).u(s).u(a.surface()));
+    a.send(Msg(a.wm, 2).u(x).u(s));
+  }, 0, __LINE__);
+  expect_error([](App& a) {
+    const uint32_t s = a.surface(), x = a.new_id(), t = a.new_id();
+    a.send(Msg(a.wm, 2).u(x).u(s));
+    a.send(Msg(x, 1).u(t));
+    App::Pool p = a.pool(4096);
+    a.send(Msg(s, 1).u(a.buffer(p, 0, 16, 16, 64)).i(0).i(0));
+    a.send(Msg(s, 6));
+  }, 3, __LINE__);
+  expect_error([](App& a) { App::Window w = a.toplevel(); a.send(Msg(w.xdg, 3).i(0).i(0).i(0).i(10)); }, 5, __LINE__);
+  expect_error([](App& a) {
+    App::Window w = a.toplevel();
+    const uint32_t pos = a.new_id(), s = a.surface(), x = a.new_id();
+    a.send(Msg(a.wm, 1).u(pos));
+    a.send(Msg(a.wm, 2).u(x).u(s));
+    a.send(Msg(x, 2).u(a.new_id()).u(w.xdg).u(pos));
+  }, 5, __LINE__);
+  expect_error([](App& a) { const uint32_t pos = a.new_id(); a.send(Msg(a.wm, 1).u(pos)); a.send(Msg(pos, 1).i(0).i(5)); }, 0, __LINE__);
+  expect_error([](App& a) { App::Window w = a.toplevel(); a.send(Msg(a.deco, 1).u(a.new_id()).u(w.toplevel)); a.send(Msg(a.deco, 1).u(a.new_id()).u(w.toplevel)); }, 1, __LINE__);
+  expect_error([](App& a) { a.send(Msg(a.surface(), 8).i(0)); }, 0, __LINE__);
+  // a malformed string, a bad message size
+  expect_error([](App& a) {
+    Msg m(a.reg, 0);
+    m.u(1).u(8);
+    for (int k = 0; k < 8; ++k) m.b.push_back('x');      // (no NUL)
+    m.u(1).u(a.new_id());
+    a.send(m);
+  }, 1, __LINE__);
+  expect_error([](App& a) {
+    std::vector<uint8_t> raw = {1, 0, 0, 0, 0, 0, 6, 0};      // size 6
+    a.send(raw);
+  }, 1, __LINE__);
+  CHECK(server.client_count() == 0);
+}
+
+// ------------------------------------------------------------------ truncated and bit-flipped streams
+
+static void test_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  // a valid session's bytes (recorded from what a client sends)
+  std::vector<std::vector<uint8_t>> messages;
+  std::vector<int> fd_at;      // which messages carry a descriptor
+  {
+    auto add = [&](Msg m, bool fd = false) { messages.push_back(m.done()); if (fd) fd_at.push_back(int(messages.size()) - 1); };
+    add(Msg(1, 1).u(2));
+    add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+    add(Msg(2, 0).u(3).s("wl_shm").u(2).u(4));
+    add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(5));
+    add(Msg(2, 0).u(4).s("wl_seat").u(8).u(6));
+    add(Msg(2, 0).u(8).s("zxdg_decoration_manager_v1").u(1).u(7));
+    add(Msg(2, 0).u(2).s("wl_subcompositor").u(1).u(8));
+    add(Msg(3, 0).u(10));
+    add(Msg(5, 2).u(11).u(10));
+    add(Msg(11, 1).u(12));
+    add(Msg(7, 1).u(13).u(12));
+    add(Msg(12, 2).s("fuzz"));
+    add(Msg(10, 6));
+    add(Msg(11, 4).u(1));
+    add(Msg(4, 0).u(14).i(65536), true);
+    add(Msg(14, 0).u(15).i(0).i(64).i(64).i(256).u(0));
+    add(Msg(10, 1).u(15).i(0).i(0));
+    add(Msg(10, 2).i(0).i(0).i(64).i(64));
+    add(Msg(10, 3).u(16));
+    add(Msg(10, 6));
+    add(Msg(6, 0).u(17));
+    add(Msg(6, 1).u(18));
+    add(Msg(3, 0).u(19));
+    add(Msg(8, 1).u(20).u(19).u(10));
+    add(Msg(20, 1).i(5).i(5));
+    add(Msg(3, 1).u(21));
+    add(Msg(21, 1).i(0).i(0).i(10).i(10));
+    add(Msg(19, 5).u(21));
+    add(Msg(19, 6));
+    add(Msg(5, 1).u(22));
+    add(Msg(22, 1).i(10).i(10));
+    add(Msg(22, 2).i(0).i(0).i(5).i(5));
+    add(Msg(3, 0).u(23));
+    add(Msg(5, 2).u(24).u(23));
+    add(Msg(24, 2).u(25).u(11).u(22));
+    add(Msg(23, 6));
+    add(Msg(12, 9));
+    add(Msg(10, 6));
+    add(Msg(1, 0).u(26));
+  }
+  std::vector<uint8_t> all;
+  std::vector<size_t> fd_offsets;
+  for (size_t k = 0; k < messages.size(); ++k) {
+    for (int f : fd_at) if (size_t(f) == k) fd_offsets.push_back(all.size());
+    all.insert(all.end(), messages[k].begin(), messages[k].end());
+  }
+  std::vector<uint8_t> memory(65536, 0x55);
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk, bool with_fd) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    size_t at = 0;
+    bool fd_sent = !with_fd;
+    while (at < bytes.size()) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      std::vector<Fd> fds;
+      if (!fd_sent) { fds.push_back(Fd::make_as<TestMemory>(A, &memory)); fd_sent = true; }
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>(fds.data(), fds.size()));
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    // the desktop looks at whatever came of it
+    List<uint32_t> list(A), changed(A);
+    List<desktop::IWindowsSession::Repaint> rep(A);
+    server.windows(&list);
+    server.take_changes(&changed, &rep);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      desktop::WindowsWindowInfo info;
+      String title(A);
+      server.window_info(w, &info, &title);
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      server.move_window(w, {0, 0, 100, 100});
+      server.activate_window(w);
+    }
+    server.mouse_position(30, 40);
+    server.mouse_button(1, true);
+    server.key(0x04, true, 0);
+    server.mouse_button(1, false);
+    server.key(0x04, false, 0);
+    server.close_client(c);
+  };
+  // whole, and in pieces of every size up to 64 bytes
+  run(all, all.size(), true);
+  for (size_t chunk = 1; chunk <= 64; ++chunk) run(all, chunk, true);
+  // every prefix
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096, true);
+  // bit flips, with and without the descriptor
+  std::mt19937 rng(1234);
+  for (int round = 0; round < 3000; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 200, rng() % 4 != 0);
+  }
+  // random words
+  for (int round = 0; round < 500; ++round) {
+    std::vector<uint8_t> v = all;
+    for (int f = 0; f < 6; ++f) {
+      const size_t at = (rng() % (v.size() / 4)) * 4;
+      const uint32_t word = rng() % 3 == 0 ? rng() : rng() % 40;
+      memcpy(&v[at], &word, 4);
+    }
+    run(v, 4096, true);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ the AF_UNIX transport, descriptors as SCM_RIGHTS
+
+struct SystemSync final : process::ISystemSync {
+  std::mutex m;
+  std::condition_variable cv;
+  static thread_local std::unique_lock<std::mutex>* mine;
+  void lock() override { mine = new std::unique_lock<std::mutex>(m); }
+  void unlock() override { delete mine; mine = nullptr; }
+  bool wait(uint64_t ns) override {
+    if (ns == ~uint64_t{0}) { cv.wait(*mine); return true; }
+    return cv.wait_for(*mine, std::chrono::nanoseconds(ns)) == std::cv_status::no_timeout;
+  }
+  void notify_all() override { cv.notify_all(); }
+};
+thread_local std::unique_lock<std::mutex>* SystemSync::mine = nullptr;
+
+// A Linux program's end of a connection: bytes and, with them, descriptors (open objects of the process's table, as sendmsg puts them in flight).
+struct SocketClient {
+  process::UnixSocketManager& m;
+  uint32_t id = 0;
+  std::vector<uint8_t> in;
+  std::vector<SharedPointer<process::OpenObject>> received;
+  explicit SocketClient(process::UnixSocketManager& manager) : m(manager) {}
+  ~SocketClient() { if (id) m.release(id); }
+  bool connect() {
+    if (m.create(process::UnixType::Stream, 42, &id) != process::UnixStatus::Ok) return false;
+    const std::string name = "/run/user/0/wayland-0";
+    const process::UnixName un = process::UnixName::from(process::UnixName::Kind::Path, ConstByteView(reinterpret_cast<const uint8_t*>(name.data()), name.size()));
+    m.sync().lock();
+    const process::UnixStatus st = m.connect_locked(id, un, "/Linux/run/user/0/wayland-0", 42);
+    m.sync().unlock();
+    return st == process::UnixStatus::Ok;
+  }
+  bool write(const std::vector<uint8_t>& bytes, SharedPointer<process::OpenObject> fd = SharedPointer<process::OpenObject>()) {
+    Queue<process::UnixInFlight> rights(A);
+    if (fd) {
+      process::UnixInFlight e;
+      e.kind = process::DescriptorKind::File;
+      e.object = fd;
+      rights.enqueue(e);
+    }
+    size_t at = 0;
+    while (at < bytes.size()) {
+      m.sync().lock();
+      uint32_t sent = 0;
+      const process::UnixStatus st = m.send_locked(id, ConstByteView(bytes.data() + at, bytes.size() - at), nullptr, 42, rights.count() ? &rights : nullptr, &sent);
+      if (st == process::UnixStatus::WouldBlock) m.sync().wait(10'000'000);
+      m.sync().unlock();
+      if (st != process::UnixStatus::Ok && st != process::UnixStatus::WouldBlock) return false;
+      at += st == process::UnixStatus::Ok ? sent : 0;
+    }
+    return true;
+  }
+  bool read(size_t n, int ms = 5000) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    uint8_t buf[4096];
+    while (in.size() < n) {
+      if (std::chrono::steady_clock::now() > until) return false;
+      Queue<process::UnixInFlight> rights(A);
+      m.sync().lock();
+      process::UnixSocketManager::Received got;
+      const process::UnixStatus st = m.receive_locked(id, ByteView(buf, sizeof buf), false, &got, &rights);
+      if (st == process::UnixStatus::WouldBlock) m.sync().wait(10'000'000);
+      m.sync().unlock();
+      process::UnixInFlight e;
+      while (rights.dequeue(&e)) received.push_back(e.object);
+      if (st == process::UnixStatus::Ok) {
+        if (got.end_of_file) return false;
+        in.insert(in.end(), buf, buf + got.got);
+      } else if (st != process::UnixStatus::WouldBlock) {
+        return false;
+      }
+    }
+    return true;
+  }
+  // The next event of that object and opcode (the others before it are dropped).
+  Ev next(uint32_t object, uint16_t opcode) {
+    for (;;) {
+      if (!read(8)) return Ev();
+      const uint32_t size = uint32_t(in[6] | in[7] << 8);
+      if (size < 8 || !read(size)) return Ev();
+      Ev e;
+      e.object = uint32_t(in[0] | in[1] << 8 | in[2] << 16 | uint32_t(in[3]) << 24);
+      e.opcode = uint16_t(in[4] | in[5] << 8);
+      e.a.assign(in.begin() + 8, in.begin() + size);
+      in.erase(in.begin(), in.begin() + size);
+      if (e.object == object && e.opcode == opcode) return e;
+    }
+  }
+};
+
+// A file in memory, as memfd_create makes it, as an open object.
+static SharedPointer<process::OpenObject> memfd(uint64_t size) {
+  SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
+  UniquePointer<process::MemoryFile> f = UniquePointer<process::MemoryFile>::make(A, A, true);
+  f->resize(size);
+  o->memory = f.get();
+  o->file = util::move(f);
+  o->readable = o->writable = true;
+  return o;
+}
+
+static void test_socket_transport() {
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  Server server(A);
+  server.set_display(800, 600, {});
+  filesystem::RamFileSystem files(A);
+  {
+    wayland::SocketServer transport(server, sockets, A);
+    CHECK(transport.listen(files));
+    filesystem::DirectoryEntry entry;
+    CHECK(files.stat("/Linux/run/user/0/wayland-0", &entry) == filesystem::Status::Ok);
+    std::atomic<bool> stop{false};
+    std::thread pump([&] {
+      while (!stop) {
+        while (transport.pump()) {}
+        transport.wait(5'000'000);
+      }
+    });
+    SocketClient c(sockets);
+    CHECK(c.connect());
+    std::vector<uint8_t> batch;
+    auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); batch.insert(batch.end(), v.begin(), v.end()); };
+    add(Msg(1, 1).u(2));
+    add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+    add(Msg(2, 0).u(3).s("wl_shm").u(1).u(4));
+    add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(5));
+    add(Msg(2, 0).u(4).s("wl_seat").u(8).u(6));
+    add(Msg(6, 1).u(7));      // a keyboard: its keymap comes as a descriptor
+    add(Msg(3, 0).u(10));
+    add(Msg(5, 2).u(11).u(10));
+    add(Msg(11, 1).u(12));
+    add(Msg(10, 6));
+    CHECK(c.write(batch));
+    Ev km = c.next(7, 0);
+    CHECK(km.object == 7 && km.u(0) == 1);
+    CHECK(c.received.size() == 1 && c.received[0] && c.received[0]->memory);
+    if (!c.received.empty() && c.received[0] && c.received[0]->memory) {      // the keymap file: sealed, readable as the program would map it
+      uint64_t size = 0;
+      process::BlockRef b = c.received[0]->memory->block(&size);
+      CHECK(b && size == km.u(1) && std::string(reinterpret_cast<const char*>(b.get()->bytes().data())).find("xkb_keycodes") != std::string::npos);
+      CHECK((c.received[0]->memory->seals() & process::MemoryFile::kSealWrite) != 0);
+    }
+    Ev conf = c.next(11, 0);
+    CHECK(conf.object == 11);
+    // a pool in a file in memory, passed with SCM_RIGHTS; the picture is the client's memory
+    SharedPointer<process::OpenObject> shm = memfd(64 * 64 * 4);
+    batch.clear();
+    add(Msg(11, 4).u(conf.u(0)));
+    CHECK(c.write(batch));
+    CHECK(c.write(Msg(4, 0).u(13).i(64 * 64 * 4).done(), shm));
+    {
+      uint64_t size = 0;
+      process::BlockRef b = shm->memory->block(&size);
+      for (uint64_t k = 0; k < size; k += 4) { const uint32_t v = 0xFF123456u; memcpy(b.get()->bytes().data() + k, &v, 4); }
+    }
+    batch.clear();
+    add(Msg(13, 0).u(14).i(0).i(64).i(64).i(256).u(1));
+    add(Msg(10, 1).u(14).i(0).i(0));
+    add(Msg(10, 6));
+    add(Msg(1, 0).u(15));
+    CHECK(c.write(batch));
+    CHECK(c.next(15, 0).object == 15);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      CHECK(server.window_pixel(list[0], 3, 3) == 0xFF123456u);
+      // the client writes into its memory: the server sees it in place (no copy)
+      uint64_t size = 0;
+      process::BlockRef b = shm->memory->block(&size);
+      const uint32_t v = 0xFFABCDEFu;
+      memcpy(b.get()->bytes().data() + (3 * 64 + 3) * 4, &v, 4);
+      CHECK(server.window_pixel(list[0], 3, 3) == 0xFFABCDEFu);
+    }
+    // a descriptor that is not a file in memory: invalid_fd
+    SocketClient d(sockets);
+    CHECK(d.connect());
+    batch.clear();
+    add(Msg(1, 1).u(2));
+    add(Msg(2, 0).u(3).s("wl_shm").u(1).u(3));
+    CHECK(d.write(batch));
+    SharedPointer<process::OpenObject> plain = SharedPointer<process::OpenObject>::make(A, A);
+    CHECK(d.write(Msg(3, 0).u(4).i(4096).done(), plain));
+    Ev err = d.next(1, 0);
+    CHECK(err.object == 1 && err.u(1) == 2);
+    stop = true;
+    pump.join();
+  }
+  CHECK(server.client_count() == 0);
+}
+
+// Several clients at once on their own threads, the transport on its thread and the desktop on another: windows made, configured, drawn into, shown,
+// moved, activated, input delivered, frame callbacks answered by the desktop's drawing, everything torn down.
+static void test_threads() {
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  Server server(A);
+  server.attach(4, 24);
+  server.set_display(1280, 800, {});
+  filesystem::RamFileSystem files(A);
+  wayland::SocketServer transport(server, sockets, A);
+  CHECK(transport.listen(files));
+  std::atomic<bool> stop{false};
+  std::thread pump([&] {
+    while (!stop) {
+      while (transport.pump()) {}
+      transport.wait(2'000'000);
+    }
+  });
+  std::thread desktop_thread([&] {
+    List<uint32_t> changed(A), list(A);
+    List<desktop::IWindowsSession::Repaint> repainted(A);
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    std::vector<uint32_t> target(256 * 256);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 256;
+    uint32_t n = 0;
+    while (!stop) {
+      server.take_changes(&changed, &repainted);
+      server.windows(&list);
+      for (uint32_t w : list.view()) {
+        if (server.window_info(w, &info, &title) && (n % 7) == 0) server.move_window(w, {info.window.x + 1, info.window.y, info.window.width, info.window.height});
+        if ((n % 5) == 0) server.activate_window(w);
+        graphics::SoftwareRenderer2D renderer(ts);
+        uint32_t dw = 0, dh = 0;
+        server.draw_window(w, renderer, 0, 0, &dw, &dh);      // (answers the frame callbacks)
+      }
+      server.mouse_position(int32_t(n % 600), int32_t(n % 400));
+      server.mouse_button(1, (n & 1) != 0);
+      server.key(uint8_t(0x04 + n % 26), (n & 2) != 0, 0);
+      desktop::IWindowsSession::Pointer ptr;
+      server.pointer(&ptr);
+      ++n;
+      std::this_thread::yield();
+    }
+  });
+  constexpr int kClients = 8;
+  std::atomic<int> good{0};
+  std::vector<std::thread> clients;
+  for (int k = 0; k < kClients; ++k) {
+    clients.emplace_back([&, k] {
+      SocketClient c(sockets);
+      if (!c.connect()) return;
+      std::vector<uint8_t> batch;
+      auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); batch.insert(batch.end(), v.begin(), v.end()); };
+      add(Msg(1, 1).u(2));
+      add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+      add(Msg(2, 0).u(3).s("wl_shm").u(1).u(4));
+      add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(5));
+      add(Msg(2, 0).u(4).s("wl_seat").u(8).u(6));
+      add(Msg(6, 0).u(7));
+      add(Msg(6, 1).u(8));
+      if (!c.write(batch)) return;
+      SharedPointer<process::OpenObject> shm = memfd(128 * 128 * 4);
+      if (!c.write(Msg(4, 0).u(9).i(128 * 128 * 4).done(), shm)) return;
+      bool ok = true;
+      uint32_t next = 100;
+      for (int round = 0; round < 12 && ok; ++round) {
+        const uint32_t s = next++, x = next++, t = next++, b = next++, cb = next++, sync_cb = next++;
+        batch.clear();
+        add(Msg(3, 0).u(s));
+        add(Msg(5, 2).u(x).u(s));
+        add(Msg(x, 1).u(t));
+        add(Msg(t, 2).s("thread " + std::to_string(k)));
+        add(Msg(s, 6));
+        if (!c.write(batch)) { ok = false; break; }
+        Ev conf = c.next(x, 0);
+        if (conf.object != x) { ok = false; break; }
+        batch.clear();
+        add(Msg(x, 4).u(conf.u(0)));
+        add(Msg(9, 0).u(b).i(0).i(128).i(128).i(512).u(1));
+        add(Msg(s, 1).u(b).i(0).i(0));
+        add(Msg(s, 2).i(0).i(0).i(128).i(128));
+        add(Msg(s, 3).u(cb));
+        add(Msg(s, 6));
+        if (!c.write(batch)) { ok = false; break; }
+        // the desktop draws it and answers (unless it went away first; then the round trip says it was carried out)
+        Ev done = c.next(cb, 0);
+        ok = done.object == cb;
+        batch.clear();
+        add(Msg(t, 0));
+        add(Msg(x, 0));
+        add(Msg(s, 0));
+        add(Msg(b, 0));
+        add(Msg(1, 0).u(sync_cb));
+        if (!c.write(batch)) { ok = false; break; }
+        if (c.next(sync_cb, 0).object != sync_cb) ok = false;
+      }
+      if (ok) ++good;
+    });
+  }
+  for (std::thread& t : clients) t.join();
+  for (int i = 0; i < 500 && server.client_count() != 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  stop = true;
+  pump.join();
+  desktop_thread.join();
+  CHECK(good == kClients);
+  CHECK(server.client_count() == 0);
+  CHECK(listed(server).empty());
+}
+
+int main() {
+  test_memory_file();
+  test_registry();
+  test_toplevel();
+  test_geometry_and_csd();
+  test_popups();
+  test_subsurfaces();
+  test_seat();
+  test_errors();
+  test_fuzz();
+  test_socket_transport();
+  test_threads();
+  free_made();
+  if (g_failed) {
+    printf("WaylandServerTest: %d FAILED\n", g_failed.load());
+    return 1;
+  }
+  printf("WaylandServerTest: all passed\n");
+  return 0;
+}

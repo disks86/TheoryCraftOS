@@ -97,6 +97,13 @@ inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
 // The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
 inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
 inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
+// The Wayland compositor's socket (src/Wayland/WaylandSocketServer.hpp): XDG_RUNTIME_DIR (/run/user/0, root's: there are no other users yet) and
+// WAYLAND_DISPLAY (wayland-0) as Linux programs see them, and where the folder is on the system's file system.
+inline constexpr const char* kLinuxRuntimeFolder = "/run/user/0";
+inline constexpr const char* kLinuxRun = "/Linux/run";
+inline constexpr const char* kLinuxRunUser = "/Linux/run/user";
+inline constexpr const char* kRuntimeFolder = "/Linux/run/user/0";
+inline constexpr const char* kWaylandDisplay = "wayland-0";
 // Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
 inline constexpr const char* kLinuxFirmware = "/Linux/lib/firmware";
 inline constexpr const char* kLinuxFirmwareIntelVpu = "/Linux/lib/firmware/intel/vpu";

@@ -23,6 +23,8 @@
 // The Linux file system calls (LinuxSyscalls.cpp maps numbers to these). Each returns the value for the result register: the result, or -errno.
 namespace process::linuxabi {
 
+uint64_t sys_memfd_create(Process& p, uint64_t name, uint64_t flags);
+uint64_t sys_fallocate(Process& p, uint64_t fd, uint64_t mode, uint64_t offset, uint64_t length);
 uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t flags);
 uint64_t sys_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);
 uint64_t sys_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);

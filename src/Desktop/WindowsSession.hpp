@@ -98,6 +98,7 @@ class IWindowsSession {
   virtual void mouse_position(int32_t x, int32_t y) = 0;
   virtual void mouse_button(uint32_t button, bool down) = 0;                  // 1 left, 2 right, 3 middle
   virtual void mouse_wheel(int32_t notches) = 0;                              // + away from the user
+  virtual void mouse_left() {}                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
   virtual uint32_t capture_window() = 0;                                      // the window that captured the mouse (SetCapture), 0: none

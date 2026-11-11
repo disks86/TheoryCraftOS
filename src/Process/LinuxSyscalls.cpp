@@ -19,6 +19,7 @@
 #include "Process/LinuxFiles.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
+#include "Process/MemoryFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -30,7 +31,7 @@ namespace process {
 
 namespace {
 
-constexpr int64_t kEnoent = 2, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
@@ -39,7 +40,7 @@ enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Ge
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
-  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6 };
+  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -78,6 +79,8 @@ constexpr NumberEntry kNumbers[] = {
     {299, 243, Call::Recvmmsg},    {48, 210, Call::Shutdown},   {51, 204, Call::Getsockname}, {52, 205, Call::Getpeername},
     {54, 208, Call::Setsockopt},   {55, 209, Call::Getsockopt}, {7, kAbsent, Call::Poll},    {271, 73, Call::Ppoll},
     {23, kAbsent, Call::Select},   {270, 72, Call::Pselect6},
+    // files in memory (MemoryFile.hpp): what Wayland clients share their pictures through
+    {319, 279, Call::MemfdCreate}, {285, 47, Call::Fallocate},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -123,15 +126,45 @@ uint64_t do_brk(Process& process, uint64_t request) {
   return request;
 }
 
-uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd) {
+// mmap() of a file in memory (memfd_create): its block is mapped as it is (MAP_SHARED), or as a copy-on-write view (MAP_PRIVATE). The pages past the
+// block's end cannot be mapped (ENXIO; Linux would map them and fault on use).
+uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
+  OpenObject* object = process.files().object(fd);
+  if (!object) return error(kEbadf);
+  if (!object->memory) return error(kEnodev);      // (other files cannot be mapped yet)
+  if (offset % AddressSpace::kPageSize != 0) return error(kEinval);
+  if (!object->readable || ((flags & kMapShared) && (prot & kProtWrite) && !object->writable)) return error(kEacces);
+  if ((flags & kMapShared) && (prot & kProtWrite) && (object->memory->seals() & (MemoryFile::kSealWrite | MemoryFile::kSealFutureWrite))) return error(kEperm);
+  uint64_t file_size = 0;
+  BlockRef block = object->memory->block(&file_size);
+  if (!block || offset >= block.get()->capacity() || size > block.get()->capacity() - offset) return error(kEnxio);
+  uint64_t where = 0;
+  if (flags & kMapFixed) {
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    if (!space.unmap(address, size)) return error(kEnomem);
+    where = address;
+  } else if (!space.find_free(size, address ? address : process.mmap_cursor(), &where)) {
+    return error(kEnomem);
+  }
+  if (!space.map_shared(where, size, uint8_t(prot), block.get()->storage() + offset, block.get())) return error(kEnomem);
+  if (flags & kMapPrivate) {      // (written pages get copies of their own: AddressSpace::keeps_private_copies)
+    PageAttributes attributes;
+    attributes.type = PageAttributes::Mapped;
+    attributes.protect = attributes.allocation_protect = 0x08;      // PAGE_WRITECOPY
+    space.set_attributes(where, size, attributes);
+  }
+  if (!(flags & kMapFixed) && !address) process.set_mmap_cursor(where + size);
+  return where;
+}
+
+uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   AddressSpace* space = process.address_space();
   if (!space) return error(kEnomem);
-  (void)fd;
   uint64_t size = 0;
   if (length == 0 || !AddressSpace::round_up(length, &size) || !valid_protection(prot)) return error(kEinval);
   if (flags & ~(kMapShared | kMapPrivate | kMapFixed | kMapAnonymous | kMapOtherAccepted)) return error(kEinval);
   if (((flags & kMapShared) != 0) == ((flags & kMapPrivate) != 0)) return error(kEinval);      // exactly one of the two
-  if (!(flags & kMapAnonymous)) return error(kEnodev);      // files cannot be mapped yet
+  if (!(flags & kMapAnonymous)) return map_memory_file(process, *space, address, size, prot, flags, fd, offset);
   uint64_t where = 0;
   if (flags & kMapFixed) {
     if (address % AddressSpace::kPageSize != 0) return error(kEinval);
@@ -244,7 +277,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);
       case Call::Nanosleep: return nanosleep(process, a[0], a[1]);
       case Call::Brk: return do_brk(process, a[0]);
-      case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
       case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
@@ -295,6 +328,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Getrandom: return do_getrandom(process, a[0], a[1]);
       case Call::Gettimeofday: return do_gettimeofday(process, a[0]);
       case Call::Getppid: return 0;
+      case Call::MemfdCreate: return linuxabi::sys_memfd_create(process, a[0], a[1]);
+      case Call::Fallocate: return linuxabi::sys_fallocate(process, a[0], a[1], a[2], a[3]);
       case Call::Socket: return linuxabi::sys_socket(process, a[0], a[1], a[2]);
       case Call::Socketpair: return linuxabi::sys_socketpair(process, a[0], a[1], a[2], a[3]);
       case Call::Bind: return linuxabi::sys_bind(process, a[0], a[1], a[2]);

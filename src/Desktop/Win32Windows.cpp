@@ -472,6 +472,7 @@ void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int3
     if (grabbed_) {
       release_buttons();
       grabbed_ = false;      // the pointer left the programs' windows with nothing keeping it: it is the desktop's again
+      session_->mouse_left();
     }
     return;
   }

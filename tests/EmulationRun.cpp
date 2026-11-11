@@ -40,6 +40,12 @@
 #include "Process/UnixSockets.hpp"
 #include "X11/X11SocketServer.hpp"
 #endif
+#ifdef TCOS_EMU_WAYLAND
+#include <map>
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Process/UnixSockets.hpp"
+#include "Wayland/WaylandSocketServer.hpp"
+#endif
 using namespace emulation;
 
 // With -DTCOS_EMU_DXG the program also has the kernel's Direct3D: win32k with the NtGdiDdDDI* services over a dxgk::Kernel that has one adapter, the software renderer (the
@@ -168,6 +174,38 @@ int main(int argc, char** argv) {
     }
   });
 #endif
+#ifdef TCOS_EMU_WAYLAND
+  // With -DTCOS_EMU_WAYLAND the kernel's Wayland compositor listens for the program at /run/user/0/wayland-0 of the Linux tree, on a thread of its own
+  // as in the kernel; a stand-in desktop draws the windows (which answers their frame callbacks) and notes the framed ones' titles and a pixel of each.
+  wayland::Server wl_server(a);
+  wl_server.attach(4, 24);
+  wayland::SocketServer wl_sockets(wl_server, *process::system_unix_sockets(), a);
+  if (!wl_sockets.listen(fs)) printf("wayland: could not listen\n");
+  std::atomic<bool> wl_stop{false};
+  std::map<std::string, uint32_t> wl_titles;
+  std::thread wl_thread([&] {
+    std::vector<uint32_t> canvas(512 * 512);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(canvas.data(), canvas.size());
+    target.width = target.height = target.pitch = 512;
+    while (!wl_stop) {
+      while (wl_sockets.pump()) {}
+      wl_sockets.wait(2'000'000);
+      List<uint32_t> windows(a), changed(a);
+      List<desktop::IWindowsSession::Repaint> repainted(a);
+      wl_server.take_changes(&changed, &repainted);
+      wl_server.windows(&windows);
+      for (uint32_t w : windows.view()) {
+        desktop::WindowsWindowInfo info;
+        String title(a);
+        if (wl_server.window_info(w, &info, &title) && info.visible && info.caption) wl_titles[std::string(title.c_str())] = wl_server.window_pixel(w, 2, 2);
+        graphics::SoftwareRenderer2D renderer(target);
+        uint32_t dw = 0, dh = 0;
+        wl_server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      }
+    }
+  });
+#endif
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
@@ -179,6 +217,11 @@ int main(int argc, char** argv) {
   x11_stop = true;
   x11_thread.join();
   for (const std::string& t : x11_titles) printf("x11-desktop: framed window \"%s\"\n", t.c_str());
+#endif
+#ifdef TCOS_EMU_WAYLAND
+  wl_stop = true;
+  wl_thread.join();
+  for (const auto& t : wl_titles) printf("wayland-desktop: framed window \"%s\" pixel %08x\n", t.first.c_str(), t.second);
 #endif
   printf("[exit=%u faulted=%d killed=%d vector=%d addr=%llx pc=%llx]\n", o.exit_code, o.faulted, o.killed, o.fault.vector, (unsigned long long)o.fault.address, (unsigned long long)o.fault.pc);
 }

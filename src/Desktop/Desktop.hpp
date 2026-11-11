@@ -248,6 +248,9 @@ class Desktop {
   // windows (Win32Windows speaks desktop::IWindowsSession, which the X server implements too), so both look and behave alike. Null: none.
   void set_x11_session(IWindowsSession* session) { x11_windows_.set_session(session, &windows_); }
   Win32Windows& x11_windows() { return x11_windows_; }
+  // The Wayland programs' windows and input (the kernel's compositor, src/Wayland/WaylandServer.hpp): the same frames and handling again. Null: none.
+  void set_wayland_session(IWindowsSession* session) { wayland_windows_.set_session(session, &windows_); }
+  Win32Windows& wayland_windows() { return wayland_windows_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
   // Opens the computer manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
@@ -428,6 +431,7 @@ class Desktop {
   ComputerManager computer_manager_;
   Win32Windows win32_windows_;
   Win32Windows x11_windows_;      // (the X server's windows: see set_x11_session)
+  Win32Windows wayland_windows_;  // (the Wayland compositor's windows: see set_wayland_session)
   Notepad notepad_;
   FileProperties file_properties_;
   Paint paint_;
