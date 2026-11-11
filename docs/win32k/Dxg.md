@@ -10,6 +10,13 @@ process-exit hook. Every structure is read once into a `UserBlock` (Windows x64 
 structure pointer is STATUS_INVALID_PARAMETER, an unreadable one STATUS_ACCESS_VIOLATION, a zero handle STATUS_INVALID_PARAMETER. dxgk statuses pass through.
 Blocking waits use neither the system lock nor a dxgk wait hook: they poll `wait_sync_cpu(timeout 0)` and sleep in the host, and end when the process exits.
 
+## Linux processes: /dev/dxg
+
+A Linux process makes the same calls with `ioctl(fd, TCOS_DXG_IOCTL_CALL, &call)` on `/dev/dxg` (`src/Process/DxgDevice.h`): `call` names the service by its `NtGdiDdDDI*` number and
+points at the parameter block, which has the same Windows x64 layout. The handler (`linux_service` in `Win32kDxg.cpp`) runs it through the same table as the system call, so
+the services, records and limits below are the same for both kinds of process; only services this layer registered (`dxg::register_service`) are taken, anything else is
+`EINVAL`. The Linux Vulkan driver (`src/Linux/libvulkan`, [../Vulkan.md](../Vulkan.md)) is the user.
+
 ## Implemented (50)
 
 Adapters and devices: OpenAdapterFromLuid, OpenAdapterFromDeviceName (name of adapter n: `\\?\DISPLAY#TCOSDXG#<n>#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}`),
@@ -34,7 +41,7 @@ WaitForSynchronizationObject, Signal/WaitForSynchronizationObjectFromGpu.
 112 bytes: 8 words (max texture dimension, vertex attributes, varyings, texture units, push constant bytes, vertex stride, flags, `DeviceFeature` bits), the adapter's
 name (64 bytes), then 2 words (colour targets, vertex buffers), then 4 words added for the Vulkan driver (words 26..29): multisample counts (`DeviceInfo::sample_counts`), kind of device (0 CPU renderer, 1 virtual GPU, 2 GPU), PCI vendor
 and a device number (`Adapter::Adapter` finds the vendor from the device's name: Intel 8086, AMD 1002, VMware 15AD, virtio 1AF4, Broadcom 14E4, the CPU renderer 10005). A caller
-that asks for 96 bytes gets the first 96. [WindowsVulkan.md](../WindowsVulkan.md) is the user of all of it.
+that asks for 96 bytes gets the first 96. [Vulkan.md](../Vulkan.md) is the user of all of it.
 
 gdi32.dll has a `D3DKMT*` thunk for every `NtGdiDdDDI*` service (before the Vulkan driver only 47 existed and `D3DKMTCreateContext`, `Render`, `Lock`, `Present` ... were stubs that
 answered success without doing anything).

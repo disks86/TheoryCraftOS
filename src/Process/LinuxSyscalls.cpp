@@ -237,7 +237,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
       case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
-      case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0]);
+      case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0], a[1], a[2]);
       case Call::Fstat: return linuxabi::sys_fstat(process, arch_, a[0], a[1]);
       case Call::Newfstatat: return linuxabi::sys_statat(process, arch_, a[0], a[1], a[2], a[3]);
       case Call::Stat:

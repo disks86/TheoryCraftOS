@@ -49,6 +49,11 @@ uint64_t sys_dup(Process& p, uint64_t fd);
 uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument);
 uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path);
-uint64_t sys_ioctl(Process& p, uint64_t fd);
+uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument);
+
+// The D3DKMT services behind /dev/dxg (src/Process/DxgDevice.h): runs service `service` (an NtGdiDdDDI* number) for the process with its parameter block at `params` and
+// stores its NTSTATUS. False if `service` is not a D3DKMT service. win32k's Direct3D layer installs it (install_dxg); without one, ioctl on /dev/dxg answers ENODEV.
+using DxgServiceHandler = bool (*)(Process& process, uint32_t service, uint64_t params, uint32_t* status);
+void set_dxg_service_handler(DxgServiceHandler handler);
 
 }  // namespace process::linuxabi

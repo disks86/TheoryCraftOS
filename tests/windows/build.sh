@@ -114,4 +114,4 @@ if command -v clang >/dev/null; then
 fi
 ${CXX:-x86_64-w64-mingw32-g++} -std=c++17 -O1 -Wall -static -static-libgcc -static-libstdc++ -Wno-unused-result -o "$out/cxxtest.exe" tests/windows/cxxtest.cpp 2>/dev/null && echo "built $out/cxxtest.exe (C++ exceptions, libstdc++ and libgcc linked statically)" || echo "(no C++ build: $(basename "${CXX:-x86_64-w64-mingw32-g++}") failed)"
 $cc -O1 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -o "$out/vulkantest.exe" tests/windows/vulkantest.c
-echo "built $out/vulkantest.exe (vulkan-1.dll: the physical devices and a render on each; scripts/winetest.sh does not run it, see docs/WindowsVulkan.md)"
+echo "built $out/vulkantest.exe (vulkan-1.dll: the physical devices and a render on each; scripts/winetest.sh does not run it, see docs/Vulkan.md)"

@@ -370,6 +370,7 @@ DescriptorKind ProcessFiles::device_at(StringView virtual_path) const {
   if (virtual_path == StringView("/dev/zero")) return DescriptorKind::Zero;
   if (virtual_path == StringView("/dev/urandom") || virtual_path == StringView("/dev/random")) return DescriptorKind::Random;
   if (virtual_path == StringView("/dev/tty")) return DescriptorKind::ConsoleOutput;
+  if (virtual_path == StringView("/dev/dxg")) return DescriptorKind::Dxg;
   return DescriptorKind::Closed;
 }
 

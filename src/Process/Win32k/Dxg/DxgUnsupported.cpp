@@ -64,7 +64,7 @@ void register_unsupported() {
       N::NtDxgkDisplayMuxSwitchFinish, N::NtDxgkDisplayPortOperation, N::NtDxgkVailConnect, N::NtDxgkVailDisconnect, N::NtDxgkVailPromoteCompositionSurface,
       N::NtDxgkRegisterVailProcess,
   };
-  for (N n : kNumbers) register_handler(n, &not_supported, false);
+  for (N n : kNumbers) register_service(n, &not_supported);
 }
 
 }  // namespace process::win32k::dxg

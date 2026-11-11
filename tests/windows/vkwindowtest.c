@@ -7,8 +7,8 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VK_NO_PROTOTYPES
 #include <windows.h>
-#include "../../src/Windows/vulkan-1/khronos/vulkan/vulkan_core.h"
-#include "../../src/Windows/vulkan-1/khronos/vulkan/vulkan_win32.h"
+#include "../../src/Vulkan/khronos/vulkan/vulkan_core.h"
+#include "../../src/Vulkan/khronos/vulkan/vulkan_win32.h"
 
 static int g_quit;
 

@@ -1225,6 +1225,11 @@ if(TCOS_ARCH STREQUAL "x86_64")
     set(_own_depends "")
     if(EXISTS ${_own})
       file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.h)
+      if(_library STREQUAL "vulkan-1")
+        # (the driver is shared with the Linux libvulkan: src/Vulkan, and the /dev/dxg header for its service numbers)
+        file(GLOB _shared_incs ${CMAKE_SOURCE_DIR}/src/Vulkan/*.inc ${CMAKE_SOURCE_DIR}/src/Vulkan/*.h)
+        list(APPEND _own_incs ${_shared_incs} ${CMAKE_SOURCE_DIR}/src/Process/DxgDevice.h)
+      endif()
       set(_own_sources ${_own} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll)
       set(_own_depends ${_own} ${_own_incs} ${WINDOWS_DIR}/libntdll.a ${WINDOWS_DIR}/kernel32.dll ${WINDOWS_HEADERS})
       if(_library STREQUAL "ole32")
@@ -1272,6 +1277,24 @@ if(TCOS_ARCH STREQUAL "x86_64")
     target_sources(BOOTX64 PRIVATE ${WINDOWS_DIR}/demo_libraries.S)
     set_source_files_properties(${WINDOWS_DIR}/demo_libraries.S PROPERTIES OBJECT_DEPENDS "${WINDOWS_DLL_FILES}")
   endif()
+endif()
+
+# libvulkan.a for Linux programs: the Vulkan driver vulkan-1.dll shares (src/Vulkan) over /dev/dxg (src/Linux/libvulkan, docs/Vulkan.md), one archive per CPU in
+# linux/<cpu>/. Built with clang when there is one (`ninja linux_vulkan`); not part of the default build.
+find_program(TCOS_LINUX_CC clang)
+find_program(TCOS_LINUX_AR llvm-ar)
+if(TCOS_LINUX_CC AND TCOS_LINUX_AR)
+  file(GLOB _linux_vulkan_sources ${CMAKE_SOURCE_DIR}/src/Vulkan/*.inc ${CMAKE_SOURCE_DIR}/src/Vulkan/*.h)
+  set(_linux_vulkan_cpus x86_64 aarch64 riscv64)
+  set(_linux_vulkan_outputs "")
+  foreach(_cpu ${_linux_vulkan_cpus})
+    list(APPEND _linux_vulkan_outputs ${CMAKE_BINARY_DIR}/linux/${_cpu}/libvulkan.a)
+  endforeach()
+  add_custom_command(OUTPUT ${_linux_vulkan_outputs}
+    COMMAND ${CMAKE_COMMAND} -E env CC=${TCOS_LINUX_CC} AR=${TCOS_LINUX_AR} ${CMAKE_SOURCE_DIR}/src/Linux/libvulkan/build.sh ${CMAKE_BINARY_DIR}/linux ${_linux_vulkan_cpus}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/Linux/libvulkan/libvulkan.c ${CMAKE_SOURCE_DIR}/src/Linux/libvulkan/build.sh ${CMAKE_SOURCE_DIR}/src/Process/DxgDevice.h ${_linux_vulkan_sources}
+    COMMENT "Building libvulkan.a for Linux programs")
+  add_custom_target(linux_vulkan DEPENDS ${_linux_vulkan_outputs})
 endif()
 
 # An extra program for the demo to run (a static Linux x86-64 ELF, say a C program built with `gcc -static -no-pie`); its output and exit code are logged.

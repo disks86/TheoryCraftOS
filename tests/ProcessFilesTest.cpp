@@ -21,6 +21,8 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/DxgDevice.h"
+#include "Process/LinuxFiles.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/ProcessFiles.hpp"
@@ -292,6 +294,54 @@ static void test_linux_files() {
   const char path[] = "/etc/motd";
   space2.write_privileged(0x10000, ConstByteView(reinterpret_cast<const uint8_t*>(path), sizeof(path)));
   CHECK(sres(bare.syscall(lin(2, 0x10000, 0))) == -2 && sres(bare.syscall(lin(4, 0x10000, 0x10100))) == -2 && sres(bare.syscall(lin(83, 0x10000, 0))) == -2);
+}
+
+// /dev/dxg (DxgDevice.h): a character device that only takes ioctl TCOS_DXG_IOCTL_CALL, which hands the service and its parameter block to the installed handler (win32k's
+// Direct3D layer; a stand-in here) and writes its status back into the TcosDxgCall.
+static uint32_t g_dxg_service = 0;
+static uint64_t g_dxg_params = 0;
+static bool fake_dxg(Process&, uint32_t service, uint64_t params, uint32_t* status) {
+  if (service != TCOS_DXG_ENUM_ADAPTERS2) return false;      // (only "one service" exists here)
+  g_dxg_service = service, g_dxg_params = params;
+  *status = 0xC0000123u;
+  return true;
+}
+static void test_dxg_device() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  Rig rig(SyscallAbi::Linux, fs);
+  Process& p = *rig.process;
+  const int64_t fd = sres(p.syscall(lin(257, kAtFdCwd, rig.str("/dev/dxg"), 2 | 0x80000)));      // O_RDWR | O_CLOEXEC
+  CHECK(fd >= 3);
+  const uint64_t buf = rig.alloc(256);
+  CHECK(sres(p.syscall(lin(0, fd, buf, 16))) == -22 && sres(p.syscall(lin(1, fd, buf, 16))) == -22);      // no read, no write
+  CHECK(p.syscall(lin(5, fd, buf)) == 0 && (rig.u64(buf + 24) & 0xFFFFFFFFu & 0170000u) == 020000u);      // fstat: a character device (st_mode at 24)
+  CHECK(sres(p.syscall(lin(8, fd, 0, 0))) == -29);      // lseek: ESPIPE
+
+  // The call block: service, status, params.
+  const uint64_t call = rig.alloc(16);
+  auto put_call = [&](uint32_t service, uint64_t params) {
+    uint8_t raw[16] = {};
+    for (int i = 0; i < 4; ++i) raw[i] = uint8_t(service >> (8 * i));
+    for (int i = 0; i < 8; ++i) raw[8 + i] = uint8_t(params >> (8 * i));
+    CHECK(rig.space.write_privileged(call, ConstByteView(raw, 16)));
+  };
+  put_call(TCOS_DXG_ENUM_ADAPTERS2, 0x12345678);
+  linuxabi::set_dxg_service_handler(nullptr);
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_CALL, call))) == -19);      // no Direct3D layer: ENODEV
+  linuxabi::set_dxg_service_handler(&fake_dxg);
+  CHECK(sres(p.syscall(lin(16, fd, 0x5401, call))) == -25);                      // another request (TCGETS): ENOTTY
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_CALL, 0))) == -14);            // no call block: EFAULT
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_CALL, 0x7FFF0000))) == -14);   // an unmapped one
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_CALL, 0x2FFF8))) == -14);      // one that runs off the end of the mapping
+  CHECK(sres(p.syscall(lin(16, fd, uint64_t{0xFFFFFFFF00000000ull} | TCOS_DXG_IOCTL_CALL, call))) == 0);      // (the request is 32 bits: the rest is ignored)
+  CHECK(g_dxg_service == TCOS_DXG_ENUM_ADAPTERS2 && g_dxg_params == 0x12345678 && rig.bytes(call + 4, 4) == std::string("\x23\x01\x00\xC0", 4));      // status written back
+  put_call(42, 0);
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_CALL, call))) == -22);      // not a D3DKMT service: EINVAL
+  const int64_t null_fd = sres(p.syscall(lin(2, rig.str("/dev/null"), 2)));
+  CHECK(sres(p.syscall(lin(16, null_fd, TCOS_DXG_IOCTL_CALL, call))) == -25);      // only /dev/dxg takes it
+  CHECK(sres(p.syscall(lin(16, 900, TCOS_DXG_IOCTL_CALL, call))) == -9);
+  linuxabi::set_dxg_service_handler(nullptr);
 }
 
 // --- Windows --------------------------------------------------------------------------------------------------------------------------------------
@@ -808,6 +858,7 @@ int main() {
   test_paths();
   test_prepare();
   test_linux_files();
+  test_dxg_device();
   test_windows_files();
   test_change_notifications();
   test_read_directory_changes();

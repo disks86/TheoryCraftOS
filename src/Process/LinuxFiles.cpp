@@ -17,6 +17,8 @@
  */
 #include "Process/LinuxFiles.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/DxgDevice.h"
+#include "Utility/ByteStream.hpp"
 
 namespace process::linuxabi {
 
@@ -185,6 +187,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Null: *m = device_meta(kSIfChr | 0666, 3); return 0;
     case DescriptorKind::Zero: *m = device_meta(kSIfChr | 0666, 5); return 0;
     case DescriptorKind::Random: *m = device_meta(kSIfChr | 0666, 9); return 0;
+    case DescriptorKind::Dxg: *m = device_meta(kSIfChr | 0666, 10); return 0;      // (a character device without a file object, like the others)
     default: break;
   }
   OpenObject* object = p.files().object(fd);
@@ -245,6 +248,7 @@ uint64_t read_from(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, boo
     case DescriptorKind::ConsoleOutput:
     case DescriptorKind::ConsoleError: return error(kEbadf);
     case DescriptorKind::Directory: return error(kEisdir);
+    case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
     case DescriptorKind::Null: return 0;
     case DescriptorKind::Zero:
     case DescriptorKind::Random: {
@@ -296,6 +300,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
       return faulted && done == 0 ? error(kEfault) : done;
     }
     case DescriptorKind::Directory: return error(kEisdir);
+    case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
     case DescriptorKind::Null:
     case DescriptorKind::Zero:
     case DescriptorKind::Random: return count;
@@ -648,6 +653,29 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path) {
   return status == Status::Ok ? error(kEinval) : errno_of(status);      // there are no symbolic links: what exists is not one
 }
 
-uint64_t sys_ioctl(Process& p, uint64_t fd) { return p.descriptor(fd) == DescriptorKind::Closed ? error(kEbadf) : error(kEnotty); }
+namespace {
+DxgServiceHandler g_dxg_handler = nullptr;      // set once at boot, before any process runs (install_dxg)
+}  // namespace
+
+void set_dxg_service_handler(DxgServiceHandler handler) { g_dxg_handler = handler; }
+
+// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h). Everything else, and ioctl on other descriptors, is ENOTTY.
+uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
+  const DescriptorKind kind = p.descriptor(fd);
+  if (kind == DescriptorKind::Closed) return error(kEbadf);
+  if (kind != DescriptorKind::Dxg || uint32_t(request) != TCOS_DXG_IOCTL_CALL) return error(kEnotty);      // (the request is an unsigned int: the upper half is not part of it)
+  // TcosDxgCall: service (4), status (4), params (8)
+  uint8_t raw[16];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t service = reader.le32();
+  reader.skip(4);      // (status: written below)
+  const uint64_t params = reader.le64();
+  if (!g_dxg_handler) return error(kEnodev);
+  uint32_t status = 0;
+  if (!g_dxg_handler(p, service, params, &status)) return error(kEinval);
+  uint8_t out[4] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
+  return p.write_user(argument + 4, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+}
 
 }  // namespace process::linuxabi
