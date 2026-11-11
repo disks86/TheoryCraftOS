@@ -70,6 +70,12 @@ class GlService {
   bool take_flushed(uint64_t pid, uint64_t window);
   void process_exited(uint64_t pid);
   uint32_t context_count(uint64_t pid);
+  // How a context's draws have gone so far (on the 3D hardware or on the CPU); false if there is no such context. `accelerator` (optional): the name of the 3D hardware
+  // its draws go to, null when there is none.
+  bool hardware_stats(uint64_t pid, uint32_t context, webgl::GlContext::HardwareStats* out, const char** accelerator = nullptr);
+  // Told, for each context that goes (deleted, or its process exited) and drew something, how many of its draws the 3D hardware took (the kernel logs it).
+  using ReportFunction = void (*)(uint64_t pid, const webgl::GlContext::HardwareStats& stats);
+  void set_report(ReportFunction report) { report_ = report; }
   allocators::IAllocator& allocator() { return a_; }
 
  private:
@@ -99,8 +105,11 @@ class GlService {
   };
   SharedPointer<Process> process(uint64_t pid, bool create);
   Surface* surface_for(Process& p, const SurfaceRequest& request);
+  static void sync_hardware(Process& p, GlSurface* surface);
 
+  void report(uint64_t pid, const Context& c) const;
   allocators::IAllocator& a_;
+  ReportFunction report_ = nullptr;
   kernel::Mutex lock_;      // the list of processes only
   List<SharedPointer<Process>> processes_;
 };

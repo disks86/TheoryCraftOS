@@ -810,6 +810,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The system's OpenGL, for every program (opengl32.dll reaches it with NtTcosOpenGl); a process's contexts and surfaces go when it ends.
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
+  system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
+    Entry e(Level::Info, "OpenGL");
+    e.text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");
+    for (const auto& r : stats.reasons)
+      if (r.why) e.text("; ").dec(r.count).text(" because of ").text(r.why);
+  });
   process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
   if (dxg_adapters > 1)

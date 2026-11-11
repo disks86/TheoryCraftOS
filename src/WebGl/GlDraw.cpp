@@ -715,6 +715,9 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   if (target.is_default && !desktop.primitive_sink && !p->has_extra() && mode <= 6 && !(desktop.active && desktop.clip_mask)) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
+  } else if (target.is_default) {
+    hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
+    hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : (p->has_extra() ? "geometry or tessellation shaders" : (mode > 6 ? "adjacency or patches" : "clip planes")));
   }
 
   // varying flags for the rasterizer
@@ -1064,9 +1067,19 @@ void GlContext::clear(uint32_t mask) {
   if (x0 >= x1 || y0 >= y1) return;
   const bool whole = x0 == 0 && y0 == 0 && x1 == static_cast<int32_t>(t.w) && y1 == static_cast<int32_t>(t.h);
   if (t.is_default) {
+    // A clear of the whole drawing buffer that the 3D hardware can do is done there only: the picture is then the device's, the CPU's colour comes back with
+    // hw_sync() when something needs it, and its depth and stencil are cleared then (hw_apply_pending_clears) - a frame drawn on the device never touches them.
+    if (whole && hw_fast_clear(mask)) {
+      ++version_;
+      return;
+    }
     // The CPU clear below builds on the picture that is there - unless it replaces all of it.
-    if ((mask & 0x4000) && whole && cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3]) hw_ahead_ = false;
-    else hw_sync();
+    if ((mask & 0x4000) && whole && cmask_[0] && cmask_[1] && cmask_[2] && cmask_[3]) {
+      hw_ahead_ = false;
+      hw_apply_pending_clears();
+    } else {
+      hw_sync();
+    }
   }
   // (a layered framebuffer: every layer)
   const uint32_t layers = t.layered ? t.layers : 1;
@@ -1121,7 +1134,7 @@ void GlContext::clear(uint32_t mask) {
       }
   }
   }
-  if (t.is_default) hw_after_clear(mask, whole);
+  if (t.is_default && !hw_clearing_cpu_) hw_after_clear(mask, whole);
   ++version_;
 }
 

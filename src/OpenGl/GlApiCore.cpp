@@ -58,7 +58,7 @@ uint64_t decode_command(GlApi& api, uint32_t op, StreamReader& rd) {
 }  // namespace
 
 GlApi::GlApi(allocators::IAllocator& allocator, ShareGroup& group, const ContextConfig& config)
-    : a_(allocator), group_(&group), config_(config), gl_(allocator, true, 1, 1, engine_attributes(config), &group.objects), client_strings_(allocator), attrib_stack_(allocator), client_stack_(allocator),
+    : a_(allocator), group_(&group), config_(config), gl_(allocator, true, 1, 1, engine_attributes(config), &group.objects), client_strings_(allocator), renderer_(allocator), attrib_stack_(allocator), client_stack_(allocator),
       fixed_programs_(allocator), imm_(allocator), tri_edges_(allocator), vao_names_(allocator), fbo_names_(allocator), query_names_(allocator), tf_names_(allocator), mappings_(allocator), live_syncs_(allocator) {
   gl_.desktop.active = true;
   for (uint32_t& hint : fx_.hints) hint = GL_DONT_CARE;

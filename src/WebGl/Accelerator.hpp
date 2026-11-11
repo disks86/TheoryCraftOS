@@ -39,7 +39,14 @@ struct AccelSampler {
   bool linear = false;
   bool repeat_s = true, repeat_t = true;
 };
-constexpr uint32_t kAccelMaxTextures = 2;
+constexpr uint32_t kAccelMaxTextures = 16;
+
+// What an accelerator's programs may have (IAccelerator::limits): CONST rows, vertex attributes, varyings and textures. The defaults are what every device has.
+struct AccelLimits {
+  uint32_t const_rows = 8, attributes = 4, varyings = 4, textures = 2;
+  bool blend_state = false;   // AccelState's custom blending, colour mask and depth functions
+  bool lines = false;         // AccelState::topology lines and points
+};
 
 struct AccelState {
   // Window coordinates as in GL: origin at the bottom left, rows counted from there (the device image is stored the same way, see GlAccel.cpp).
@@ -52,7 +59,17 @@ struct AccelState {
   bool front_ccw = true;     // counter-clockwise in GL window coordinates
   bool depth_test = false;   // passes if closer or equal
   bool depth_write = false;
-  bool blend = false;        // source alpha over one minus source alpha
+  bool blend = false;        // source alpha over one minus source alpha (custom_blend false)
+  // AccelLimits::blend_state: blending by these factors and equations (enabled by `blend`), the channels written (bit 0 red .. bit 3 alpha) and what the depth test
+  // compares with. The numbers are the device's (graphics::BlendFactor, BlendOp, CompareOp in IGraphicsDevice.hpp); custom_blend false is source over destination,
+  // every channel written and a depth test that passes when closer or equal.
+  bool custom_blend = false;
+  uint8_t src_rgb = 1, dst_rgb = 0, src_alpha = 1, dst_alpha = 0;   // graphics::BlendFactor
+  uint8_t op_rgb = 0, op_alpha = 0;                                 // graphics::BlendOp
+  uint8_t color_mask = 0xF;
+  uint8_t depth_compare = 3;                                        // graphics::CompareOp (LessEqual)
+  // AccelLimits::lines: what the vertices make, 0 a list of triangles, 1 of lines, 2 of points (one pixel wide)
+  uint8_t topology = 0;
   // The textures the program samples, by sampler index (SAMP[i] of its TGSI): texture handles from create_texture() and how each is read. texture_count is what the
   // program was created with.
   uint32_t texture_count = 0;
@@ -63,9 +80,10 @@ struct AccelState {
 class IAccelerator {
  public:
   virtual const char* name() const = 0;
+  virtual AccelLimits limits() const { return AccelLimits(); }
 
   // Compiles a TGSI vertex/fragment pair: `attributes` float4 inputs (IN[0..]), `varyings` float4 outputs, and `textures` 2D samplers (SAMP[0..] of the fragment
-  // shader, at most kAccelMaxTextures). 0: the device cannot run it.
+  // shader, at most limits().textures). 0: the device cannot run it.
   virtual uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) = 0;
   virtual void destroy_program(uint32_t program) = 0;
 
@@ -88,7 +106,7 @@ class IAccelerator {
   virtual void destroy_target(uint32_t target) = 0;
   // Clears color (to rgba) and/or depth (to `depth`).
   virtual bool clear(uint32_t target, bool color, const float rgba[4], bool depth, float depth_value) = 0;
-  // Draws `vertex_count` vertices (a triangle list) of `attributes` float4 each from `vertices`, with `constants` (a multiple of 16 bytes: the CONST rows).
+  // Draws `vertex_count` vertices (a list of AccelState::topology: triangles by default) of `attributes` float4 each from `vertices`, with `constants` (a multiple of 16 bytes: the CONST rows).
   virtual bool draw(uint32_t target, uint32_t program, const AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) = 0;
   // Copies the color image to `rgba` (width * height * 4 bytes: R, G, B, A of each pixel), the rows in the order the GL window has them - the bottom row first.
   virtual bool read_color(uint32_t target, ByteView rgba) = 0;

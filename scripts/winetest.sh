@@ -19,6 +19,7 @@
 #   scripts/winetest.sh <dll> [test ...]     e.g. scripts/winetest.sh ntdll large_int rtl
 # Builds the tests into build/winetests, boots the OS headless with tests/windows/winerun.exe as the program (TCOS_WINE_TEST_PROGRAM) and the tests next to it, and writes
 # the output to build/winetests/<dll>.log and a summary (checks failed per test) to the terminal. Do not run two at once: they share the build directory.
+# WINETEST_GPU=virgl boots with QEMU's virtio-gpu-gl (virgl 3D, headless) instead of the standard VGA card.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 dll=$1; shift
@@ -66,7 +67,8 @@ mon=/tmp/tcos-qemu-mon-$$.sock
 rm -f "$mon"
 # (the QMP socket of the run target is left out: its path is too long for QEMU when the checkout is deep, and nothing here uses it)
 args=(); skip=0
-for a in "$@"; do if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else args+=("$a"); fi; done
+# (with WINETEST_GPU=virgl the run-gl target's window becomes egl-headless: virgl 3D with no display)
+for a in "$@"; do if [ $skip = 1 ]; then skip=0; elif [ "$a" = -qmp ]; then skip=1; else case "$a" in gtk,gl=on*) a=egl-headless;; esac; args+=("$a"); fi; done
 /usr/bin/qemu-system-x86_64 -display none -enable-kvm -monitor unix:"$mon",server,nowait "${args[@]}" >/dev/null 2>"$(dirname "$0")/qemu-err.txt" &
 pid=$!
 n=0; quiet=0; last=0
@@ -94,7 +96,7 @@ QEMU
   : > build/debugcon.log
   cmake -S . -B build -DTCOS_USERMODE_DEMO=OFF -DTCOS_WINE_TEST_PROGRAM="$PWD/$out/winerun.exe" "-DTCOS_WINE_TEST_FILES=$(IFS=';'; echo "${files[*]}")" -DQEMU="$PWD/$out/qemu.sh" >/dev/null
   ninja -C build esp primary vars >"$out/build.log" 2>&1 || { tail -20 "$out/build.log"; exit 1; }
-  ninja -C build run-std >/dev/null 2>&1 || true
+  if [ "${WINETEST_GPU:-}" = virgl ]; then ninja -C build run-gl >/dev/null 2>&1 || true; else ninja -C build run-std >/dev/null 2>&1 || true; fi
   [ -s "$out/hang-dump.txt" ] && { cat "$out/hang-dump.txt" >> "$out/$dll.hang"; rm -f "$out/hang-dump.txt"; }
   sed -n '/Windows test program/,$p' build/debugcon.log | { grep -av "^\[" || true; } | { grep -av "^  \(test program\|Windows test program\)" || true; } >> "$out/$dll.log"      # (-a: a console test writes control characters)
   # the tests that did not start in this round are the next round's; the one that started and never ended is recorded as hung

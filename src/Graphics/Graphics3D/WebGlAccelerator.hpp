@@ -38,6 +38,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   ~WebGlAccelerator();
 
   const char* name() const override { return device_.info().name; }
+  webgl::AccelLimits limits() const override;
   uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) override;
   void destroy_program(uint32_t program) override;
   uint32_t create_texture(uint32_t w, uint32_t h) override;
@@ -50,12 +51,16 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool read_color(uint32_t target, ByteView rgba) override;
 
  private:
-  static constexpr uint32_t kVariants = 64;   // cull (3) x front face (2) x depth test x depth write x blend, as bits
-
+  // A pipeline of a program for one state: the pipeline state of an AccelState packed into a key.
+  struct Variant {
+    uint64_t key = 0;
+    IPipeline* pipeline = nullptr;
+  };
   struct Program {
+    explicit Program(allocators::IAllocator& a) : variants(a) {}
     IShaderModule* vs = nullptr;
     IShaderModule* fs = nullptr;
-    IPipeline* pipelines[kVariants] = {};
+    List<Variant> variants;
     uint32_t attributes = 0, varyings = 0, textures = 0;
   };
   struct Texture {

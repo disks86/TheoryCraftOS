@@ -75,9 +75,15 @@ struct UniformBase {
 
 // What both stages share while they are translated.
 struct Shared {
-  explicit Shared(TgsiProgram* p, ArrayView<const TgsiLink> l) : out(p), links(l) {}
+  Shared(TgsiProgram* p, ArrayView<const TgsiLink> l, const TgsiLimits& lim) : out(p), links(l), limits(lim) {
+    if (limits.const_rows > kTgsiMaxConstRows) limits.const_rows = kTgsiMaxConstRows;
+    if (limits.attributes > kTgsiMaxAttributes) limits.attributes = kTgsiMaxAttributes;
+    if (limits.varyings > kTgsiMaxVaryings) limits.varyings = kTgsiMaxVaryings;
+    if (limits.samplers > kTgsiMaxSamplers) limits.samplers = kTgsiMaxSamplers;
+  }
   TgsiProgram* out;
   ArrayView<const TgsiLink> links;
+  TgsiLimits limits;
   const char* why = nullptr;
   // WGSL: the locations of the varyings the vertex shader wrote, in the order of the device's GENERIC registers
   uint32_t var_loc[kTgsiMaxVaryings] = {};
@@ -350,16 +356,16 @@ bool Gen::global_var(uint64_t gi, Var* out) {
 
 // `elems` x `cols` consecutive CONST rows of `rows` floats each, read from the shared region of this stage from `slot` on.
 bool Gen::alloc_const(uint32_t slot, uint32_t rows, uint32_t cols, uint32_t elems, uint32_t* row) {
-  if (elems > kTgsiMaxConstRows) return fail("too many uniforms");
+  if (elems > sh_.limits.const_rows) return fail("too many uniforms");
   const uint32_t total = elems * cols;
   TgsiProgram& p = *sh_.out;
-  if (p.const_rows + total > kTgsiMaxConstRows) return fail("too many uniforms");
+  if (p.const_rows + total > sh_.limits.const_rows) return fail("too many uniforms");
   const uint32_t first = p.const_rows;
   for (uint32_t e = 0; e < elems; ++e)
     for (uint32_t c = 0; c < cols; ++c) {
       TgsiConstant k;
       k.stage = fs_ ? 1 : 0;
-      k.row = static_cast<uint8_t>(first + e * cols + c);
+      k.row = static_cast<uint16_t>(first + e * cols + c);
       k.comps = static_cast<uint8_t>(rows);
       k.slot = slot + (e * cols + c) * rows;
       if (!p.constants.push_back(k)) return fail("out of memory");
@@ -493,7 +499,7 @@ bool Gen::attribute_index(const Global& g, uint32_t* index) {
       *index = static_cast<uint32_t>(i);
       return true;
     }
-  if (p.attributes.count() >= kTgsiMaxAttributes) return fail("too many attributes");
+  if (p.attributes.count() >= sh_.limits.attributes) return fail("too many attributes");
   if (!p.attributes.push_back(TgsiAttribute{g.slot, g.type.rows})) return fail("out of memory");
   *index = static_cast<uint32_t>(p.attributes.count() - 1);
   return true;
@@ -506,7 +512,7 @@ bool Gen::attribute_at(uint32_t key, uint32_t comps, uint32_t* index) {
       *index = static_cast<uint32_t>(i);
       return true;
     }
-  if (p.attributes.count() >= kTgsiMaxAttributes) return fail("too many attributes");
+  if (p.attributes.count() >= sh_.limits.attributes) return fail("too many attributes");
   if (!p.attributes.push_back(TgsiAttribute{key, static_cast<uint8_t>(comps)})) return fail("out of memory");
   *index = static_cast<uint32_t>(p.attributes.count() - 1);
   return true;
@@ -561,7 +567,7 @@ bool Gen::global_val(uint64_t gi, Val* out) {
       if (g.flat) return fail("a flat varying");
       for (uint64_t i = 0; i < sh_.links.size(); ++i)
         if (sh_.links[i].fs_slot == g.slot) {
-          if (i >= kTgsiMaxVaryings || sh_.links[i].count != g.type.rows) return fail("a varying the device cannot take");
+          if (i >= sh_.limits.varyings || sh_.links[i].count != g.type.rows) return fail("a varying the device cannot take");
           out->c[0] = filled('I', static_cast<uint16_t>(i), g.type.rows);
           return true;
         }
@@ -1267,7 +1273,7 @@ bool Gen::tex_call(const Node& n, Val* out) {
   uint32_t index = 0;
   while (index < p.samplers.count() && !(p.samplers[index].slot == g->slot && p.samplers[index].sampler_slot == sampler_slot && p.samplers[index].wgsl == wgsl)) ++index;
   if (index == p.samplers.count()) {
-    if (index >= kTgsiMaxSamplers) return fail("too many samplers");
+    if (index >= sh_.limits.samplers) return fail("too many samplers");
     if (!p.samplers.push_back(TgsiSampler{g->slot, sampler_slot, wgsl})) return fail("out of memory");
   }
   Val coord;
@@ -1454,7 +1460,7 @@ bool Gen::run_entry() {
         out_mov(0, "y", ny);
         have_color = true;
       } else if (o.builtin == kBvNone && o.location >= 0) {
-        if (o.flat || sh_.var_count >= kTgsiMaxVaryings) return fail("a varying the device cannot take");
+        if (o.flat || sh_.var_count >= sh_.limits.varyings) return fail("a varying the device cannot take");
         const uint32_t idx = sh_.var_count++;
         sh_.var_loc[idx] = static_cast<uint32_t>(o.location);
         sh_.var_rows[idx] = o.v.rows;
@@ -1507,7 +1513,7 @@ bool Gen::run() {
     end_inst();
     for (uint64_t k = 0; k < sh_.links.size(); ++k) {
       const TgsiLink& link = sh_.links[k];
-      if (k >= kTgsiMaxVaryings || link.count < 1 || link.count > 4) return fail("a varying the device cannot take");
+      if (k >= sh_.limits.varyings || link.count < 1 || link.count > 4) return fail("a varying the device cannot take");
       bool found = false;
       for (uint64_t gi = 0; gi < m_.globals.count() && !found; ++gi) {
         const Global& g = *m_.globals[gi];
@@ -1605,7 +1611,8 @@ bool assemble(String& out, const Gen& g, bool fragment, uint32_t attributes, uin
 
 }  // namespace
 
-bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t vs_fn, const Module& fs, int32_t fs_fn, TgsiProgram* out, const char** why) {
+bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t vs_fn, const Module& fs, int32_t fs_fn, TgsiProgram* out, const char** why,
+                            const TgsiLimits& limits) {
   (void)a;
   out->vs.clear();
   out->fs.clear();
@@ -1614,7 +1621,7 @@ bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t
   out->samplers.clear();
   out->const_rows = 0;
   out->varyings = 0;
-  Shared sh(out, ArrayView<const TgsiLink>());
+  Shared sh(out, ArrayView<const TgsiLink>(), limits);
   bool ok = vs.language == Language::Wgsl && fs.language == Language::Wgsl && vs_fn >= 0 && fs_fn >= 0;
   if (!ok) sh.why = "not a WGSL pipeline";
   Gen vg(sh, vs, false, vs_fn);
@@ -1634,7 +1641,8 @@ bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t
   return ok;
 }
 
-bool translate_to_tgsi(allocators::IAllocator& a, const Module& vs, const Module& fs, ArrayView<const TgsiLink> links, TgsiProgram* out, const char** why) {
+bool translate_to_tgsi(allocators::IAllocator& a, const Module& vs, const Module& fs, ArrayView<const TgsiLink> links, TgsiProgram* out, const char** why,
+                       const TgsiLimits& limits) {
   (void)a;
   out->vs.clear();
   out->fs.clear();
@@ -1643,8 +1651,8 @@ bool translate_to_tgsi(allocators::IAllocator& a, const Module& vs, const Module
   out->samplers.clear();
   out->const_rows = 0;
   out->varyings = 0;
-  Shared sh(out, links);
-  bool ok = vs.stage == Stage::Vertex && fs.stage == Stage::Fragment && links.size() <= kTgsiMaxVaryings;
+  Shared sh(out, links, limits);
+  bool ok = vs.stage == Stage::Vertex && fs.stage == Stage::Fragment && links.size() <= sh.limits.varyings;
   if (!ok) sh.why = "unsupported stage or too many varyings";
   Gen vg(sh, vs, false);
   Gen fg(sh, fs, true);

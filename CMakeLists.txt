@@ -1237,6 +1237,11 @@ if(TCOS_ARCH STREQUAL "x86_64")
         list(APPEND _own_sources ${WINDOWS_DIR}/${_import}.dll)
         list(APPEND _own_depends ${WINDOWS_DIR}/${_import}.dll)
       endforeach()
+      if(_library STREQUAL "opengl32")
+        # opengl32.dll's entry points are generated with the kernel's opcodes (scripts/gen-opengl.py): a stale DLL would send the old numbers.
+        file(GLOB _gl_generated ${CMAKE_SOURCE_DIR}/src/OpenGl/generated/*.inc)
+        list(APPEND _own_depends ${_gl_generated} ${CMAKE_SOURCE_DIR}/src/OpenGl/GlClient.h ${CMAKE_SOURCE_DIR}/src/OpenGl/GlStream.hpp)
+      endif()
     endif()
     # <dll>.def: forwarders to other libraries, exports that the C code cannot spell, and the ordinals Windows gives the exports (scripts/sync-ordinals.py: a program may
     # import by number). A library that is only stubs may have one too.

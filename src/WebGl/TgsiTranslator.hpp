@@ -23,7 +23,7 @@
 // uniform blocks, flat varyings, gl_FragCoord, discard in a loop ...) makes the translation fail and the draw then runs on the CPU rasterizer.
 //
 // The output follows the conventions of graphics::ShaderModuleDesc::tgsi: attributes are IN[0..], varyings GENERIC[0..], and the uniforms of both stages share one
-// block of CONST rows (at most kTgsiMaxConstRows, the device's push constants). Clip space is converted from GL's (-w <= z <= w) to the device's (0 <= z <= w) at
+// block of CONST rows (at most TgsiLimits::const_rows, the device's push constants). Clip space is converted from GL's (-w <= z <= w) to the device's (0 <= z <= w) at
 // the end of the vertex shader; x and y are left alone because the device renders GL's bottom-up window rows as its own rows.
 #pragma once
 #include <stdint.h>
@@ -35,10 +35,16 @@
 
 namespace webgl {
 
-constexpr uint32_t kTgsiMaxConstRows = 8;
-constexpr uint32_t kTgsiMaxAttributes = 4;
-constexpr uint32_t kTgsiMaxVaryings = 4;
-constexpr uint32_t kTgsiMaxSamplers = 2;
+// The most any device takes (array sizes); what one device takes is a TgsiLimits.
+constexpr uint32_t kTgsiMaxConstRows = 256;
+constexpr uint32_t kTgsiMaxAttributes = 16;
+constexpr uint32_t kTgsiMaxVaryings = 16;
+constexpr uint32_t kTgsiMaxSamplers = 16;
+
+// What the device the shaders are for takes: CONST rows (its push constants), vertex inputs, varyings and fragment samplers. The defaults are what every device has.
+struct TgsiLimits {
+  uint32_t const_rows = 8, attributes = 4, varyings = 4, samplers = 2;
+};
 
 // A varying the vertex shader writes and the fragment shader reads: their private slots and the number of floats.
 struct TgsiLink {
@@ -49,7 +55,7 @@ struct TgsiLink {
 // Where a CONST row gets its values: `comps` floats from `slot` of the shared (uniform) region of a stage.
 struct TgsiConstant {
   uint8_t stage;   // 0 vertex, 1 fragment
-  uint8_t row;
+  uint16_t row;
   uint8_t comps;
   uint32_t slot;
 };
@@ -81,12 +87,12 @@ struct TgsiProgram {
 
 // False when the pair cannot run on the device (see the file comment); `why` (optional) then says what stopped it.
 bool translate_to_tgsi(allocators::IAllocator& a, const shader::Module& vs, const shader::Module& fs, ArrayView<const TgsiLink> links, TgsiProgram* out,
-                       const char** why = nullptr);
+                       const char** why = nullptr, const TgsiLimits& limits = TgsiLimits());
 
 // The same for a WGSL render pipeline: the vertex and fragment entry points (function indexes in their modules). Attributes are keyed by @location; the vertex
 // outputs with a @location become the varyings, the fragment shader's inputs are matched to them by location, and the vertex shader's @builtin(position) and the
 // fragment shader's @location(0) vec4 are the only built-in output and color. textureSample of a texture_2d<f32> with a (non-comparison) sampler is translated like texture2D. Clip space is WebGPU's (0 <= z <= w) with y negated for the device.
 bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const shader::Module& vs, int32_t vs_fn, const shader::Module& fs, int32_t fs_fn, TgsiProgram* out,
-                            const char** why = nullptr);
+                            const char** why = nullptr, const TgsiLimits& limits = TgsiLimits());
 
 }  // namespace webgl

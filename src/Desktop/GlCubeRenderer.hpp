@@ -48,8 +48,9 @@ class GlCubeRenderer final : public ICubeRenderer {
   bool is_open() const override { return open_; }
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
-  bool accelerated() const override { return false; }
-  const char* device_name() const override { return "kernel GL rasterizer"; }
+  // Whether the last frame's draws ran on the 3D hardware (the kernel GL's accelerator), and its name then.
+  bool accelerated() const override { return accelerated_; }
+  const char* device_name() const override { return accelerated_ && accelerator_ ? accelerator_ : "kernel GL rasterizer"; }
   bool texture_available() const override { return texture_available_; }
   bool last_textured() const override { return last_textured_; }
   bool render(float angle, bool textured, CubeFrameTimes* times, bool read_back) override;
@@ -107,6 +108,9 @@ class GlCubeRenderer final : public ICubeRenderer {
   int32_t colored_mvp_ = -1, textured_mvp_ = -1;
   uint32_t colored_vertices_ = 0, textured_vertices_ = 0, indices_ = 0, logo_ = 0;
   bool texture_available_ = false, last_textured_ = false;
+  bool accelerated_ = false;
+  const char* accelerator_ = nullptr;
+  uint64_t gpu_draws_ = 0;
   ClientMemory memory_;
   ByteBuffer log_;
   graphics::Surface picture_;

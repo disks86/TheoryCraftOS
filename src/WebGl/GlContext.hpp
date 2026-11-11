@@ -355,6 +355,7 @@ struct ProgramObj {
   IAccelerator* accel = nullptr;
   uint32_t accel_program = 0;
   bool accel_tried = false;
+  const char* accel_why = nullptr;   // why the shaders cannot run on the accelerator (a static string), when they cannot
   ~ProgramObj() { release_accel(); }
   void release_accel() {
     if (accel && accel_program) accel->destroy_program(accel_program);
@@ -493,6 +494,26 @@ class GlContext final : public shader::ITextureHost {
   GlContext(const GlContext&) = delete;
   // True while the default framebuffer is drawn by the 3D hardware (for tests and the browser's status).
   bool hardware_drawing() const { return hw_valid_ && hw_target_ != 0; }
+  // How the draws of the default framebuffer went: on the 3D hardware or on the CPU, and why the last one the hardware did not take was refused (a static string).
+  struct HardwareStats {
+    uint64_t gpu_draws = 0, cpu_draws = 0;
+    const char* last_refusal = nullptr;
+    // the reasons draws went to the CPU, and how many each (the first kReasons distinct ones)
+    static constexpr uint32_t kReasons = 8;
+    struct Reason { const char* why = nullptr; uint64_t count = 0; } reasons[kReasons];
+    void refused(const char* why) {
+      ++cpu_draws;
+      last_refusal = why;
+      for (Reason& r : reasons) {
+        if (r.why == why || !r.why) {
+          r.why = why;
+          ++r.count;
+          return;
+        }
+      }
+    }
+  };
+  const HardwareStats& hardware_stats() const { return hw_stats_; }
   GlContext& operator=(const GlContext&) = delete;
 
   bool valid() const { return valid_; }
@@ -881,16 +902,28 @@ class GlContext final : public shader::ITextureHost {
   uint32_t hw_target_ = 0;
   bool hw_valid_ = false;
   bool hw_ahead_ = false;
+  uint32_t hw_w_ = 0, hw_h_ = 0;    // the size of hw_target_
+  HardwareStats hw_stats_;
   AccelTextureCache hw_textures_;   // the device copies of the textures the accelerated draws sampled, by GL name
   bool hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sampler);
   void hw_forget_texture(uint32_t name);
   void hw_drop();
+  void hw_retarget(uint32_t w, uint32_t h);
   void hw_sync();
   void hw_cpu_write() { hw_sync(); hw_valid_ = false; }
+  // A whole-buffer clear done on the device alone (see clear()); the CPU's depth and stencil clears it leaves for later.
+  bool hw_fast_clear(uint32_t mask);
+  void hw_apply_pending_clears();
+  bool hw_pending_depth_ = false, hw_pending_stencil_ = false, hw_clearing_cpu_ = false;
+  float hw_pending_depth_value_ = 1;
+  int32_t hw_pending_stencil_value_ = 0;
+  uint32_t hw_pending_stencil_mask_ = 0xFF;
   void hw_after_clear(uint32_t mask, bool whole);
   bool hw_target(IAccelerator* acc);
   bool hw_program(ProgramObj& p, IAccelerator& acc);
   bool hw_draw(ProgramObj& p, const Target& target, uint32_t mode, int32_t first, int32_t count, uint32_t index_type, const uint8_t* idx, bool indexed, int32_t instances);
+  bool hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode, int32_t first, int32_t count, uint32_t index_type, const uint8_t* idx, bool indexed, int32_t instances,
+                     const char** why);
 };
 
 // Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at

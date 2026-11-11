@@ -177,6 +177,8 @@ void GlCubeRenderer::close() {
   if (context_ || open_) service_.process_exited(pid_);
   context_ = 0;
   open_ = false;
+  accelerated_ = false;
+  gpu_draws_ = 0;
   release_view(allocator_, picture_.pixels);
   picture_ = graphics::Surface();
   width_ = height_ = 0;
@@ -385,6 +387,12 @@ bool GlCubeRenderer::render(float angle, bool textured, CubeFrameTimes* times, b
   if (times) {
     times->submit_us = submitted_at - start;
     times->readback_us = now_us() - submitted_at;
+  }
+  // (the cube's one draw went to the 3D hardware if the context's count of hardware draws went up)
+  webgl::GlContext::HardwareStats stats;
+  if (service_.hardware_stats(pid_, context_, &stats, &accelerator_)) {
+    accelerated_ = stats.gpu_draws > gpu_draws_;
+    gpu_draws_ = stats.gpu_draws;
   }
   return ok;
 }

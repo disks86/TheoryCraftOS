@@ -47,6 +47,27 @@ What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAG
   Build the program into `build/winetests/opengl32_own.exe` (`x86_64-w64-mingw32-gcc -O1 -o build/winetests/opengl32_own.exe tests/windows/opengltest.c -lopengl32 -lgdi32 -luser32`)
   and run `scripts/winetest.sh opengl32 own opengl` from a short path (a symlink to the checkout, with `build` a symlink to a build directory configured from it).
 
+## The 3D hardware
+
+When the machine has a GPU whose 3D engine takes TGSI (virgl in QEMU; `webgl::IAccelerator`, installed by `main.cpp` as `graphics::WebGlAccelerator` over the
+system's graphics device), a context draws its window's default framebuffer there, the same way WebGL canvases do (`src/WebGl/GlAccel.cpp`, `TgsiTranslator.cpp`). Each
+draw is offered to the device and runs on the CPU rasterizer when the device cannot do it; the choice is per draw and never changes the result, only where the work runs.
+
+- The program's shaders become TGSI once (`translate_to_tgsi`, with the device's `AccelLimits`: virgl takes 256 constant rows, 16 attributes, 14 varyings and 16
+  textures), including the generated fixed-function ones. The vertices are assembled on the CPU (the draw's modes, restart index and base vertex) and sent as one list.
+- State the device has goes with the draw: blend factors and equations, the colour mask and the depth function (`AccelState::custom_blend`), culling, scissor and
+  viewport, lines and points one pixel wide. What it has not (the stencil test, polygon offset, polygon modes and stipples, flat shading, alpha test, logic ops,
+  wide lines, point sizes, two-sided colour, gl_PrimitiveID, clip planes, geometry and tessellation stages, queries, transform feedback, framebuffer objects,
+  instancing, mipmapped or non-RGBA8 textures, constant blend colours ...) keeps the draw on the CPU.
+- The picture stays on the device between draws. A clear of the whole window is done there only, and the CPU's depth and stencil clears wait until the CPU needs
+  them (`hw_fast_clear`, `hw_apply_pending_clears`). The picture comes back to the window's image when something reads it: a swap or a front-buffer read
+  (`GlService::sync_hardware`), `glReadPixels`, a draw the device cannot take. A swap keeps the device target for the next frame, which starts again at its clear.
+- `GL_RENDERER` names the device. Each context counts its draws on the GPU and on the CPU, with why each refused one was refused (`GlContext::HardwareStats`); when
+  a context goes, the kernel logs it ("OpenGL: process N: 1 draws on the GPU, 9 on the CPU; 5 because of ...").
+
+Measured on virgl (QEMU, egl-headless): the 3D Test's GL cube went from 4.7 ms a frame on the CPU to 2.8 ms, of which 0.2 ms submitting and 2.6 ms bringing the
+picture back. `tests/windows/opengltest.c` passes on virgl as on the CPU (`WINETEST_GPU=virgl scripts/winetest.sh opengl32 own`).
+
 ## The 3D Test window
 
 The desktop's 3D Test can draw its cube through the kernel GL path (the command stream opengl32.dll writes, run by `GlService`), next to Direct3D; see [Direct3DKernelMode.md](Direct3DKernelMode.md#the-3d-test-window).
@@ -92,7 +113,9 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   layouts are reported as `Block.member`; `glBindFragDataLocation`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
-- Drawing is on the CPU (the WebGL accelerator path only takes WebGL's default framebuffer, not window surfaces).
+- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no loops, integers, user functions, uniform blocks, `discard` in a loop,
+  flat varyings, `gl_FragCoord`, derivatives or texture kinds other than 2D; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is
+  read back at each swap (no zero-copy present into the window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).
 - Wine's test still fails on rendering into DIBs (bitmap formats' read-back of GDI contents), some pixel-format choice details, and object-name expectations after sharing.

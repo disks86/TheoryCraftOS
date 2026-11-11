@@ -61,6 +61,7 @@ static void read_at(int x, int y, unsigned char out[4]) {
 }
 
 int main(void) {
+  setvbuf(stdout, NULL, _IONBF, 0);      /* (a crash must not lose what was printed) */
   WNDCLASSA cls;
   memset(&cls, 0, sizeof(cls));
   cls.style = CS_OWNDC;
@@ -99,6 +100,7 @@ int main(void) {
 
   const char *version = (const char *)glGetString(GL_VERSION);
   const char *vendor = (const char *)glGetString(GL_VENDOR);
+  printf("opengltest: GL_RENDERER %s\n", (const char *)glGetString(GL_RENDERER));
   printf("opengltest: GL_VERSION %s, GL_VENDOR %s\n", version ? version : "(null)", vendor ? vendor : "(null)");
   CHECK(version && version[0] >= '1');
   GLint viewport[4] = {0};

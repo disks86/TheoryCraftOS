@@ -335,7 +335,7 @@ void Graphics3DTest::set_graphics(dxgk::Kernel* kernel, SystemGraphics* graphics
 
 void Graphics3DTest::update_gpu_box() {
   gpu_box_.set_enabled(view_.gpu_available());
-  gpu_box_.set_text(view_.gpu_available() ? "Use GPU acceleration" : view_.api() == CubeApi::OpenGL ? "Use GPU acceleration (not for GL)" : "Use GPU acceleration (none here)");
+  gpu_box_.set_text(view_.gpu_available() ? "Use GPU acceleration" : view_.api() == CubeApi::OpenGL ? "Use GPU acceleration (GL chooses for itself)" : "Use GPU acceleration (none here)");
 }
 
 void Graphics3DTest::on_api_changed(void* self, gui::Control& control) {

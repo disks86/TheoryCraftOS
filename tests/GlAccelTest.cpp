@@ -192,6 +192,11 @@ static void test_translate_refusals() {
 // An accelerator that records what it was asked and "renders" a recognisable picture: every pixel is 0x80 0x40 0x20 0xFF after a draw.
 struct FakeAccel final : IAccelerator {
   const char* name() const override { return "fake"; }
+  AccelLimits limits() const override { return wide ? wide_limits : AccelLimits(); }
+  bool wide = false;      // limits of a device like virgl's: blend state, lines, more constants
+  AccelLimits wide_limits{256, 16, 14, 16, true, true};
+  uint32_t vertex_floats(uint32_t v, uint32_t attr) const { return v * last_attributes * 4 + attr * 4; }
+  float all_vertices[64 * 4 * 4] = {};
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     ++programs;
     last_program_textures = textures;
@@ -217,12 +222,13 @@ struct FakeAccel final : IAccelerator {
   }
   bool draw(uint32_t, uint32_t, const AccelState& s, ConstByteView v, uint32_t count, ConstByteView c) override {
     ++draws;
-    drawn = true;
+    if (!fail_draw) drawn = true;      // (a failed draw changed nothing)
     last_state = s;
     last_count = count;
     vertex_bytes = v.size();
     if (v.size() >= 16) memcpy(first_vertex, v.data(), 16);
     if (v.size() >= 32) memcpy(second_attr, v.data() + 16, 16);
+    memcpy(all_vertices, v.data(), v.size() < sizeof all_vertices ? v.size() : sizeof all_vertices);
     constant_bytes = c.size();
     if (c.size() >= 16) memcpy(first_const, c.data(), 16);
     return !fail_draw;
@@ -1024,6 +1030,104 @@ static void test_webgpu_refusals() {
   CHECK(a.live == 0);
 }
 
+// A device with blend state and lines (virgl): GL's factors, equations, colour mask and depth function go to it as its own, lines and points are drawn as lists, and the
+// desktop's primitive restart and base vertex shape the vertices sent.
+static void test_wide_device_state() {
+  TestAllocator a;
+  FakeAccel fake;
+  fake.wide = true;
+  set_accelerator(&fake);
+  {
+    GlContext gl(a, false, 64, 64, noaa());
+    Scene sc(gl);
+    sc.setup(kVs, kFs);
+    gl.clear(0x4000 | 0x100);
+    gl.enable(0x0BE2, true);   // BLEND
+    gl.blend_func_separate(0x0306, 0x0300, 1, 0);   // DST_COLOR, SRC_COLOR / ONE, ZERO
+    gl.blend_equation_separate(0x800B, 0x8008);      // REVERSE_SUBTRACT, MAX
+    gl.color_mask(true, false, true, false);
+    gl.enable(0x0B71, true);   // DEPTH_TEST
+    gl.depth_func(0x0204);     // GREATER
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 1 && gl.get_error() == 0);
+    const AccelState& st = fake.last_state;
+    CHECK(st.custom_blend && st.blend && st.src_rgb == 6 && st.dst_rgb == 2 && st.src_alpha == 1 && st.dst_alpha == 0);
+    CHECK(st.op_rgb == 2 && st.op_alpha == 4 && st.color_mask == 5 && st.depth_compare == 4 && st.depth_test && st.topology == 0);
+    // a constant colour factor stays on the CPU
+    gl.blend_func_separate(0x8001, 0, 1, 0);   // CONSTANT_COLOR
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 1 && strcmp(gl.hardware_stats().last_refusal, "a blend factor") == 0);
+    CHECK(gl.hardware_stats().gpu_draws == 1 && gl.hardware_stats().cpu_draws == 1);
+    gl.enable(0x0BE2, false);
+    gl.color_mask(true, true, true, true);
+    gl.enable(0x0B71, false);
+    gl.clear(0x4000 | 0x100);
+    // a line loop of three vertices: three segments; points: one vertex each; the CPU's culling does not apply to them
+    gl.enable(0x0B44, true);   // CULL_FACE
+    gl.draw_arrays(2, 0, 3, 1);
+    CHECK(fake.draws == 2 && fake.last_state.topology == 1 && fake.last_count == 6 && fake.last_state.cull == 0);
+    CHECK(fake.all_vertices[fake.vertex_floats(5, 1)] == -1 && fake.all_vertices[fake.vertex_floats(4, 1)] == -1);   // (the last segment: vertex 2 back to vertex 0)
+    gl.draw_arrays(0, 0, 3, 1);
+    CHECK(fake.draws == 3 && fake.last_state.topology == 2 && fake.last_count == 3);
+    gl.enable(0x0B44, false);
+    // wide lines are the CPU's
+    gl.line_width(2);
+    gl.draw_arrays(1, 0, 2, 1);
+    CHECK(fake.draws == 3 && strcmp(gl.hardware_stats().last_refusal, "wide or stippled lines") == 0);
+    gl.line_width(1);
+    gl.clear(0x4000 | 0x100);      // (the CPU drew the wide line: the device starts over at a clear)
+    // desktop: an index the program restarts at only with restart on, and the base vertex added to the others
+    gl.desktop.active = true;
+    gl.desktop.base_vertex = 1;
+    const uint16_t indices[4] = {0, 0xFFFF, 1, 0};
+    const uint32_t eb = gl.create_buffer();
+    gl.bind_buffer(0x8893, eb);
+    gl.buffer_data(0x8893, ConstByteView(reinterpret_cast<const uint8_t*>(indices), sizeof indices), 0, 0x88E4);
+    const float verts[] = {-1, -1, 1, 0, 0, 1, -1, 0, 1, 0, -1, 1, 0, 0, 1, 1, 1, 1, 1, 1};
+    gl.bind_buffer(0x8892, 0);
+    (void)verts;
+    gl.draw_elements(0, 4, 0x1403, 0, 1);      // points; restart off: 0xFFFF is an index past the vertices, so the draw is refused for its attribute
+    CHECK(fake.draws == 3);
+    gl.desktop.primitive_restart = true;
+    gl.desktop.restart_index = 0xFFFF;
+    gl.draw_elements(0, 4, 0x1403, 0, 1);      // points 1, 2, 1 (each index plus one)
+    if (fake.draws != 4) printf("refused: %s\n", gl.hardware_stats().last_refusal);
+    CHECK(fake.draws == 4 && fake.last_count == 3);
+    CHECK(fake.all_vertices[fake.vertex_floats(0, 1)] == 1 && fake.all_vertices[fake.vertex_floats(1, 1)] == -1 && fake.all_vertices[fake.vertex_floats(2, 1)] == 1);
+    gl.desktop.active = false;
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// A whole-buffer clear runs on the device alone; the depth clear the CPU owes is done before the CPU next draws (here a draw the device cannot take).
+static void test_device_only_clear() {
+  TestAllocator a;
+  FakeAccel fake;
+  set_accelerator(&fake);
+  {
+    GlContext gl(a, false, 64, 64, noaa());
+    Scene sc(gl);
+    sc.setup(kVs, kFs);
+    gl.enable(0x0B71, true);   // DEPTH_TEST (LESS)
+    gl.enable(0x0B90, true);   // STENCIL_TEST: the CPU draws
+    gl.clear(0x4000 | 0x100);
+    gl.draw_arrays(4, 0, 3, 1);   // CPU depth 0.5 where the triangle is
+    CHECK(fake.draws == 0 && pixel(gl, 10, 10) == 0xFFFF0000u);
+    gl.enable(0x0B90, false);
+    const int reads = fake.reads;
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000 | 0x100);     // on the device only
+    CHECK(fake.clears >= 1 && fake.reads == reads && gl.hardware_drawing());
+    gl.enable(0x0B90, true);
+    gl.draw_arrays(4, 0, 3, 1);   // the CPU again: its depth was cleared to 1 first, so the triangle passes LESS
+    CHECK(fake.reads == reads + 1);   // (the device's cleared picture came back first)
+    CHECK(pixel(gl, 10, 10) == 0xFFFF0000u && pixel(gl, 55, 55) == 0xFF000000u);
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_translate_basic();
   test_translate_matrix_and_functions();
@@ -1033,6 +1137,8 @@ int main() {
   test_device_textures();
   test_hardware_draw_and_readback();
   test_fallbacks();
+  test_wide_device_state();
+  test_device_only_clear();
   test_refused_program_and_failed_draw();
   test_uniforms_and_depth();
   test_no_accelerator();
