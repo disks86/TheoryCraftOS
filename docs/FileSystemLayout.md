@@ -34,7 +34,8 @@ Linux processes see `/Linux` as `/`, with the Filesystem Hierarchy Standard fold
 and `var` (`cache`, `lib`, `log`, `tmp`). `dev`, `proc` and `sys` are plain empty folders for now; the kernel answers a few names under `/dev` itself (`null`, `zero`, `random`, `urandom`, `tty`, and `dxg`: the
 kernel-mode Direct3D layer, see [Vulkan.md](Vulkan.md)) without files behind them. The kernel's X server listens at `/tmp/.X11-unix/X0`
 (`/Linux/tmp/.X11-unix/X0`, `kX11SocketFolder`; see [X11.md](X11.md)), which it makes at start. The kernel's Wayland compositor listens at `/run/user/0/wayland-0` (`XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` of every
-Linux program; `/Linux/run/user/0/wayland-0`, `kRuntimeFolder`; see [Wayland.md](Wayland.md)), also made at start. Use the `kWindows*` and `kLinux*`
+Linux program; `/Linux/run/user/0/wayland-0`, `kRuntimeFolder`; see [Wayland.md](Wayland.md)), also made at start, and the kernel's PipeWire listens there too, at `pipewire-0` and `pulse/native` (see
+[PipeWire.md](PipeWire.md)). Use the `kWindows*` and `kLinux*`
 constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
 
 Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads

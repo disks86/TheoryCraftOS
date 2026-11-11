@@ -95,6 +95,7 @@ bool AudioStream::drained() {
 }
 
 uint32_t AudioStream::mix_into(int32_t* accumulator, uint32_t max_frames) {
+  if (paused()) return 0;
   const bool silent = muted() || volume() == 0;
   int32_t left_gain, right_gain;  // Q15: the volume and the pan together
   pan_gains(pan(), format_.channels == 1, &left_gain, &right_gain);

@@ -54,7 +54,68 @@
 #include "Graphics/Graphics3D/LockedDevice.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
 #endif
+#ifdef TCOS_EMU_AUDIO
+#include <cmath>
+#include <dirent.h>
+#include "FileSystem/SystemLayout.hpp"
+#include "PipeWire/Graph.hpp"
+#include "PipeWire/NativeServer.hpp"
+#include "PipeWire/PulseServer.hpp"
+#include "PipeWire/SocketServer.hpp"
+#include "PipeWire/WindowsAudioService.hpp"
+#include "Process/UnixSockets.hpp"
+#endif
 using namespace emulation;
+
+// With -DTCOS_EMU_AUDIO the kernel's PipeWire is there: the graph over a mixer whose device drains in real time and keeps what it got, its sockets at
+// /run/user/0/pipewire-0 and /run/user/0/pulse/native, NtTcosAudio for winmm.dll, and a native stream (300 Hz) that plays meanwhile. A second program
+// may be given (argv[3]) to run at the same time. At the end the mixed output is checked for each program's tone (tests/pipewire_emulated.sh).
+#ifdef TCOS_EMU_AUDIO
+namespace {
+struct RealtimeDevice final : hardware::IAudioDevice {
+  std::mutex m;
+  std::vector<int16_t> recorded;
+  double queued = 0;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  void advance() {
+    const auto t = std::chrono::steady_clock::now();
+    queued -= std::chrono::duration<double>(t - last).count() * 48000.0;
+    if (queued < 0) queued = 0;
+    last = t;
+  }
+  const char* name() const override { return "Emulated speakers"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t write(ConstByteView pcm) override {
+    std::lock_guard<std::mutex> g(m);
+    advance();
+    uint32_t frames = uint32_t(pcm.size() / 4), room = 4800 - uint32_t(queued);
+    if (frames > room) frames = room;
+    for (uint32_t i = 0; i < frames * 2; ++i) recorded.push_back(int16_t(pcm[2 * i] | pcm[2 * i + 1] << 8));
+    queued += frames;
+    return frames * 4;
+  }
+  uint32_t queued_bytes() override { std::lock_guard<std::mutex> g(m); advance(); return uint32_t(queued) * 4; }
+  uint32_t free_bytes() override { std::lock_guard<std::mutex> g(m); advance(); return (4800 - uint32_t(queued)) * 4; }
+  uint8_t v = 100; bool mute = false;
+  void set_volume(uint8_t x) override { v = x; }
+  uint8_t volume() const override { return v; }
+  void set_muted(bool x) override { mute = x; }
+  bool muted() const override { return mute; }
+  hardware::AudioStatistics statistics() override { return {}; }
+};
+// The strength of `freq` in samples [from, from + n) of the left channel.
+double tone(const std::vector<int16_t>& s, size_t from, size_t n, double freq) {
+  double re = 0, im = 0;
+  for (size_t k = 0; k < n; ++k) {
+    const double v = s[2 * (from + k)], w = 2 * M_PI * freq * double(k) / 48000.0;
+    re += v * cos(w);
+    im -= v * sin(w);
+  }
+  return sqrt(re * re + im * im) / double(n);
+}
+}  // namespace
+#endif
 
 // With -DTCOS_EMU_DXG the program also has the kernel's Direct3D: win32k with the NtGdiDdDDI* services over a dxgk::Kernel that has one adapter, the software renderer (the
 // way tests/Win32kDxgTest.cpp builds it). tests/emulated_dx.sh builds it that way for dxgi.dll and d3d12.dll.
@@ -136,6 +197,24 @@ int main(int argc, char** argv) {
   A a; H h; Libs libs; if (argc > 2) libs.dir = argv[2];
   filesystem::RamFileSystem fs(a);
   process::prepare_program_folders(fs);
+#ifdef TCOS_EMU_AUDIO
+  // the libraries in System32 as well, for what a program loads while it runs (ole32 loading dsound.dll or mmdevapi.dll for CoCreateInstance)
+  if (argc > 2)
+    if (DIR* d = opendir(argv[2])) {
+      while (dirent* e = readdir(d)) {
+        const std::string n = e->d_name;
+        if (n.size() < 5 || n.substr(n.size() - 4) != ".dll") continue;
+        bool read_ok = false;
+        const std::vector<uint8_t> image = slurp(std::string(argv[2]) + "/" + n, &read_ok);
+        const std::string path = std::string(filesystem::layout::kWindowsSystem32) + "/" + n;
+        UniquePointer<filesystem::IFile> file;
+        uint64_t written = 0;
+        if (read_ok && fs.open_file(StringView(path.c_str()), filesystem::OpenMode::CreateOrOpen, &file) == filesystem::Status::Ok)
+          file->write(0, ConstByteView(image.data(), image.size()), &written);
+      }
+      closedir(d);
+    }
+#endif
   Sync osync; process::ObjectManager objects(osync); process::set_system_objects(&objects);      // (before the program: its sections go back to the manager when it is destroyed)
   objects.set_allocator(&a);
   process::UserProgram p(a, 100, h);
@@ -237,12 +316,131 @@ int main(int argc, char** argv) {
     }
   });
 #endif
+#ifdef TCOS_EMU_AUDIO
+  RealtimeDevice speakers;
+  audio::AudioMixer mixer(speakers, a);
+  mixer.initialize();
+  pipewire::Graph graph(a, &mixer);
+  graph.initialize();
+  pipewire::NativeServer pw_native(graph, a);
+  pipewire::PulseServer pw_pulse(graph, a);
+  pipewire::WindowsAudioService windows_audio(graph, a);
+  pipewire::install_windows_audio(windows_audio);
+  pipewire::SocketServer pw_sockets(*process::system_unix_sockets(), a);
+  if (!pipewire::listen_standard_sockets(pw_sockets, pw_native, pw_pulse, &fs, a)) printf("pipewire: could not listen\n");
+  std::atomic<bool> audio_stop{false};
+  std::atomic<uint32_t> most_streams{0};
+  std::thread audio_thread([&] {
+    while (!audio_stop) {
+      mixer.pump();
+      for (int i = 0; i < 4 && pw_sockets.pump(); ++i) {}
+      const uint32_t n = graph.playback_count();
+      if (n > most_streams) most_streams = n;
+      pw_sockets.wait(2'000'000);
+    }
+  });
+  // a native program's sound: 300 Hz, stereo, for 6 s (what the media player would play)
+  std::thread native_thread([&] {
+    SharedPointer<audio::AudioStream> s = mixer.open_stream(audio::StreamFormat(), 16384);
+    if (!s) return;
+    s->set_label("Media Player");
+    std::vector<uint8_t> pcm(4800 * 4);
+    for (uint32_t frame = 0; frame < 48000 * 6 && !audio_stop;) {
+      for (uint32_t i = 0; i < 4800; ++i) {
+        const int16_t v = int16_t(5000.0 * sin(2 * M_PI * 300.0 * double(frame + i) / 48000.0));
+        pcm[4 * i] = pcm[4 * i + 2] = uint8_t(v);
+        pcm[4 * i + 1] = pcm[4 * i + 3] = uint8_t(uint16_t(v) >> 8);
+      }
+      size_t done = 0;
+      while (done < pcm.size() && !audio_stop) {
+        done += s->write(ConstByteView(pcm.data() + done, pcm.size() - done));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      frame += 4800;
+    }
+    s->close();
+  });
+  // the second program, at the same time as the first
+  process::UserProgram* second_program = nullptr;
+  std::thread second_thread;
+  std::atomic<int> second_exit{-1};
+  std::vector<uint8_t> second_image;
+  if (argc > 3) {
+    bool read_ok = false;
+    second_image = slurp(argv[3], &read_ok);
+    if (read_ok) {
+      second_program = new process::UserProgram(a, 101, h);
+      second_program->set_file_system(&fs);
+      second_program->set_library_provider(&libs);
+      second_program->set_processor_count(1);
+      const ConstByteView image(second_image.data(), second_image.size());
+      StringView av2[] = {"C:\\second.exe"};
+      if (second_program->load(image, ArrayView<const StringView>(av2, 1), process::default_environment(process::abi_for_executable(exe::identify_executable(image.at_most(exe::kIdentifyBytes)))), ConstByteView(rnd, 16)) == process::LoadStatus::Ok) {
+        second_thread = std::thread([&] {
+          auto cpu2 = create_guest_cpu(second_program->start().arch, a);
+          Sync sync2; Threads th2; Ctl ctl2;
+          std::thread dog([&] { for (int i = 0; i < 600 && !ctl2.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl2.stop = true; });
+          auto o2 = run_emulated_threads(*second_program, *cpu2.get(), ctl2, sync2, th2, a, 20000);
+          ctl2.stop = true;
+          dog.join();
+          second_exit = o2.faulted ? -2 : int(o2.exit_code);
+        });
+      } else {
+        printf("second program: load failed\n");
+      }
+    }
+  }
+#endif
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
 #ifdef TCOS_EMU_DXG
   process::win32k::dxg::shutdown_for_tests();      // (the layer's records point into the kernel and the allocator, which are going away)
   dxgk::set_system_kernel(nullptr);
+#endif
+#ifdef TCOS_EMU_AUDIO
+  if (second_thread.joinable()) second_thread.join();
+  printf("second program: exit=%d\n", second_exit.load());
+  native_thread.join();
+  // let the mixer play out what is queued
+  for (int i = 0; i < 100 && graph.playback_count() > 0; ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); graph.refresh(); }
+  audio_stop = true;
+  audio_thread.join();
+  {
+    std::lock_guard<std::mutex> g(speakers.m);
+    const std::vector<int16_t>& rec = speakers.recorded;
+    const size_t frames = rec.size() / 2, window = 4800;
+    double best_all = 0, best[3] = {0, 0, 0};
+    const double freqs[3] = {300, 400, 500};
+    for (size_t at = 0; at + window <= frames; at += window / 2) {
+      double m[3];
+      for (int k = 0; k < 3; ++k) { m[k] = tone(rec, at, window, freqs[k]); if (m[k] > best[k]) best[k] = m[k]; }
+      const double all = std::min(m[0], std::min(m[1], m[2]));
+      if (all > best_all) best_all = all;
+    }
+    printf("audio: %zu frames mixed, most streams at once %u\n", frames, most_streams.load());
+    printf("audio: native 300 Hz %.0f, windows 400 Hz %.0f, linux 500 Hz %.0f; all three at once %.0f\n", best[0], best[1], best[2], best_all);
+    // every program's tone on its own, and the ones in TCOS_EMU_TONES (default 300,400,500) at the same moment
+    std::vector<double> together;
+    {
+      const char* list = getenv("TCOS_EMU_TONES");
+      std::string text = list ? list : "300,400,500";
+      for (size_t at = 0; at < text.size();) {
+        const size_t comma = text.find(',', at);
+        together.push_back(atof(text.substr(at, comma == std::string::npos ? std::string::npos : comma - at).c_str()));
+        at = comma == std::string::npos ? text.size() : comma + 1;
+      }
+    }
+    double best_tone[5] = {0, 0, 0, 0, 0}, best_together = 0;
+    for (size_t at = 0; at + window <= frames; at += window / 2) {
+      for (int k = 0; k < 5; ++k) best_tone[k] = std::max(best_tone[k], tone(rec, at, window, 300.0 + 100.0 * k));
+      double all = 1e18;
+      for (double f : together) all = std::min(all, tone(rec, at, window, f));
+      best_together = std::max(best_together, all);
+    }
+    printf("audio: tones 300:%.0f 400:%.0f 500:%.0f 600:%.0f 700:%.0f; together %.0f\n", best_tone[0], best_tone[1], best_tone[2], best_tone[3], best_tone[4], best_together);
+  }
+  delete second_program;
 #endif
 #ifdef TCOS_EMU_X11
   x11_stop = true;

@@ -217,6 +217,14 @@ add_executable(BOOTX64
   src/Audio/Resampler.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/PipeWire/Graph.cpp
+  src/PipeWire/NativeServer.cpp
+  src/PipeWire/PlaybackStream.cpp
+  src/PipeWire/Pod.cpp
+  src/PipeWire/PulseServer.cpp
+  src/PipeWire/SocketServer.cpp
+  src/PipeWire/Tagstruct.cpp
+  src/PipeWire/WindowsAudioService.cpp
   src/Audio/AudioRouter.cpp
   src/Audio/WavFile.cpp
   src/Audio/AudioPlayer.cpp
@@ -752,6 +760,7 @@ add_executable(BOOTX64
   src/Process/WindowsDialogs.cpp
   src/Process/WindowsFonts.cpp
   src/Process/WindowsOpenGl.cpp
+  src/Process/WindowsAudio.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp
@@ -1231,6 +1240,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_vulkan-1 gdi32 user32)      # (the D3DKMT services of the kernel-mode Direct3D layer, the window size)
   set(WINDOWS_IMPORTS_crypt32 advapi32 bcrypt)      # (DPAPI: the per-user key in the registry, AES and HMAC of bcrypt)
   set(WINDOWS_IMPORTS_secur32 advapi32)      # (GetUserNameExW: the user name of the token)
+  set(WINDOWS_IMPORTS_mmdevapi ole32)      # (CoTaskMemAlloc for the strings, formats and property values it hands out)
   set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     if(DEFINED WINDOWS_STUB_RESULT_${_library})

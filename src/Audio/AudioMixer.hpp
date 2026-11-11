@@ -100,6 +100,12 @@ class AudioMixer {
   bool master_muted() const;
 
   uint32_t stream_count();
+  // Frames the mixer has handed to the device so far, and of those the ones the device has played (the rest are in its queue). A stream's last frame,
+  // mixed when mixed_frames() was M, has been heard once played_frames() >= M.
+  uint64_t mixed_frames();
+  uint64_t played_frames();
+  // The streams now in the mix (copies of the pointers, taken under the mixer's lock), for the sound server's graph. False if out of memory.
+  bool snapshot_streams(List<SharedPointer<AudioStream>>* out);
   MixerStatistics statistics();
   // (the device in use; see current_device() when it can change)
   hardware::IAudioDevice& device() { return *device_; }

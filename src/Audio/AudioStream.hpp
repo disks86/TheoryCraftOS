@@ -24,6 +24,8 @@
 #include "Hardware/AudioDevice/AudioTypes.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/FixedString.hpp"
+#include "Utility/StringView.hpp"
 
 namespace audio {
 
@@ -73,6 +75,20 @@ class AudioStream {
   int pan() const { return __atomic_load_n(&pan_, __ATOMIC_RELAXED); }
   void set_muted(bool muted) { __atomic_store_n(&muted_, muted, __ATOMIC_RELAXED); }
   bool muted() const { return __atomic_load_n(&muted_, __ATOMIC_RELAXED); }
+  // A paused stream keeps what is queued and gives the mixer nothing until it is resumed (a corked PipeWire/PulseAudio stream, waveOutPause).
+  void set_paused(bool paused) { __atomic_store_n(&paused_, paused, __ATOMIC_RELAXED); }
+  bool paused() const { return __atomic_load_n(&paused_, __ATOMIC_RELAXED); }
+
+  // Who plays this stream ("Media Player", "Web Audio", ...), shown by the sound server's graph (src/PipeWire). Set it before the stream is shared;
+  // longer names are cut.
+  void set_label(StringView label) {
+    kernel::ScopedMutex guard(mutex_);
+    label_ = FixedString<48>(label.size() > 47 ? label.first(47) : label);
+  }
+  FixedString<48> label() {
+    kernel::ScopedMutex guard(mutex_);
+    return label_;
+  }
 
   // No more writes. What is queued still plays.
   void close() { __atomic_store_n(&closed_, true, __ATOMIC_RELEASE); }
@@ -105,7 +121,9 @@ class AudioStream {
   uint8_t volume_ = hardware::kAudioMaxVolume;
   int8_t pan_ = 0;
   bool muted_ = false;
+  bool paused_ = false;
   bool closed_ = false;
+  FixedString<48> label_;
   uint32_t peak_ = 0;
   uint64_t frames_written_ = 0;
   uint64_t frames_mixed_ = 0;

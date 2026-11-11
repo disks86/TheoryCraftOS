@@ -73,4 +73,27 @@ inline void pan_gains(int pan, bool mono_source, int32_t* left, int32_t* right) 
   *right = r;
 }
 
+// The position whose gains (as pan_gains gives them for this kind of source) are nearest in ratio to `left` : `right` (any common scale): a
+// left/right volume pair (waveOutSetVolume, IAudioStreamVolume) as a pan. Equal gains are the centre, a silent side the far end.
+inline int pan_for_gains(uint32_t left, uint32_t right, bool mono_source) {
+  if (left == right) return kPanCenter;
+  if (left == 0) return kPanRight;
+  if (right == 0) return kPanLeft;
+  int best = kPanCenter;
+  uint64_t best_error = ~uint64_t{0};
+  for (int pan = kPanLeft; pan <= kPanRight; ++pan) {
+    int32_t l = 0, r = 0;
+    pan_gains(pan, mono_source, &l, &r);
+    // how far r:l is from right:left, scaled by both sums so that it does not depend on either scale
+    const uint64_t a = uint64_t(uint32_t(r)) * left, b = uint64_t(uint32_t(l)) * right;
+    const uint64_t cross = a > b ? a - b : b - a;
+    const uint64_t error = (cross << 16) / ((uint64_t(uint32_t(l + r)) * (uint64_t{left} + right) >> 16) + 1);
+    if (error < best_error) {
+      best_error = error;
+      best = pan;
+    }
+  }
+  return best;
+}
+
 }  // namespace audio
