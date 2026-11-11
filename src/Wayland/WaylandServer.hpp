@@ -195,6 +195,8 @@ class Server final : public desktop::IWindowsSession {
   bool cursor_confined() override;
   uint32_t capture_window() override;
 
+  // Whether a client keeps the screen from going idle (zwp_idle_inhibit_manager_v1: a visible surface with an inhibitor).
+  bool idle_inhibited();
   // Tests: the pixel (0xAARRGGBB as the client stored it; a GPU buffer's as GpuImage::read gives it) of a window's committed buffer at (x, y) of the window's
   // surface; 0 when outside or none.
   uint32_t window_pixel(uint32_t window, int32_t x, int32_t y);
@@ -206,6 +208,9 @@ class Server final : public desktop::IWindowsSession {
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
     DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
+    Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
+    RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
+    Importer, Imported,
   };
   struct Surface;
   struct Client;
@@ -270,8 +275,9 @@ class Server final : public desktop::IWindowsSession {
     Positioner positioner;                      // xdg_positioner
     SharedPointer<DmabufParams> params;         // zwp_linux_buffer_params_v1
     Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
-    SharedPointer<DataSourceInfo> source;       // wl_data_source
-    SharedPointer<OfferInfo> offer;             // wl_data_offer
+    SharedPointer<DataSourceInfo> source;       // wl_data_source, zwp_primary_selection_source_v1
+    SharedPointer<OfferInfo> offer;             // wl_data_offer, zwp_primary_selection_offer_v1
+    SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
   struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
@@ -303,7 +309,8 @@ class Server final : public desktop::IWindowsSession {
     bool identity() const { return scale == 1 && transform == 0 && source[0] == -1 && destination[0] == -1; }
   };
   struct Surface {
-    explicit Surface(allocators::IAllocator& allocator) : pending_callbacks(allocator), callbacks(allocator), stack(allocator), title(allocator) {}
+    explicit Surface(allocators::IAllocator& allocator)
+        : pending_callbacks(allocator), callbacks(allocator), pending_feedback(allocator), feedback(allocator), stack(allocator), title(allocator) {}
     uint8_t client = 0;
     uint32_t id = 0;                            // the wl_surface
     Role role = Role::None;
@@ -318,6 +325,7 @@ class Server final : public desktop::IWindowsSession {
     BufferInfo current;
     SharedPointer<RegionRects> input;           // null: everywhere
     List<uint32_t> pending_callbacks, callbacks;
+    List<uint32_t> pending_feedback, feedback;  // wp_presentation_feedback: of the next commit, of the picture shown
     // subsurfaces: the children with the surface itself (nullptr) among them, bottom first
     Surface* parent = nullptr;
     List<Surface*> stack;
@@ -437,6 +445,20 @@ class Server final : public desktop::IWindowsSession {
   bool check_mapping(Client& c, Surface& s, const State& state);      // (commit: the scale and viewport rules; false: an error was posted)
   void draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y);
   void viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- the other protocols (WaylandExtras.cpp): activation, cursor shapes, the primary selection, relative pointer and constraints, presentation time,
+  // idle inhibitors, xdg-foreign; and the window manager's pings
+  void extras_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void activate_locked(Surface* s);
+  void send_primary_selection(Client& c);
+  void update_constraints();
+  void constraint_gone(Surface& s);
+  struct Constraint;
+  Constraint* active_constraint();
+  void relative_motion(int32_t dx, int32_t dy);
+  void ping(Client& c);
+  void check_pings();
+  void presented(Surface& s, bool shown);
+  void forget_exports(Surface& s);
   void actual_size(const Surface& s, int32_t* w, int32_t* h) const;
   static ArrayView<uint32_t> buffer_pixels(const BufferInfo& b);
   void copy_region(Client& c, uint32_t region, SharedPointer<RegionRects>* out, uint32_t from);
@@ -502,6 +524,34 @@ class Server final : public desktop::IWindowsSession {
   int32_t frame_border_ = 0, frame_title_ = 0;
   uint32_t place_counter_ = 0;
   bool draw_missed_ = false;
+  // the other protocols (WaylandExtras.cpp)
+  uint32_t cursor_shape_ = 0;               // wp_cursor_shape_v1: the system cursor (OCR_*) the client under the pointer chose; 0: none
+  uint8_t psel_client_ = 0;                 // the primary selection's source
+  uint32_t psel_source_ = 0;
+  uint8_t psel_sent_client_ = 0;
+  struct Constraint {
+    uint8_t client = 0;
+    uint32_t id = 0;
+    Surface* surface = nullptr;
+    bool lock = false, persistent = false, active = false, defunct = false;
+    SharedPointer<RegionRects> region;      // (null: the whole surface)
+    bool hint_set = false;
+    int32_t hint_x = 0, hint_y = 0;         // a lock's cursor position hint (surface pixels)
+  };
+  List<Constraint> constraints_;
+  uint64_t present_seq_ = 0;
+  List<String> tokens_;                     // xdg_activation_v1 tokens handed out and not used yet
+  uint32_t next_token_ = 1;
+  struct Exported {
+    uint8_t client = 0;
+    uint32_t id = 0;
+    Surface* surface = nullptr;
+    String handle;
+    explicit Exported(allocators::IAllocator& allocator) : handle(allocator) {}
+  };
+  List<UniquePointer<Exported>> exports_;
+  uint32_t next_export_ = 1;
+  uint32_t idle_inhibitors_ = 0;
   // the selection: a client's wl_data_source, or the desktop's clipboard (sel_client_ 0, sel_desktop_)
   kernel::Clipboard* clipboard_ = nullptr;
   uint64_t clipboard_seen_ = 0;             // the clipboard's sequence the server last took in or set itself

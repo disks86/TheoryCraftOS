@@ -362,6 +362,10 @@ void Server::apply(Client& c, Surface& s, State& state) {
   }
   for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
   s.pending_callbacks.clear();
+  // presentation feedback: a new picture discards what the old one's was waiting for
+  if (state.attached && s.feedback.count()) presented(s, false);
+  for (uint32_t f : s.pending_feedback.view()) s.feedback.push_back(f);
+  s.pending_feedback.clear();
   // the children's positions and synchronized commits come with this one
   for (Surface* child : s.stack.view()) {
     if (!child) continue;
@@ -443,6 +447,8 @@ void Server::release_buffer(Client& c, const BufferInfo& b) {
 }
 
 void Server::forget_surface(Surface& s) {
+  constraint_gone(s);
+  forget_exports(s);
   if (drag_.icon == &s) drag_.icon = nullptr;
   if (drag_.focus == &s) drag_.focus = nullptr, drag_.offer = 0;
   if (drag_.origin == &s) end_drag(false);      // (its origin went: the drag is cancelled)
@@ -480,6 +486,8 @@ void Server::destroy_surface(Client& c, Surface& s) {
     if (o != 0)
       if (Resource* r = c.objects.find(o)) r->surface = nullptr;
   if (s.current.valid()) release_buffer(c, s.current);
+  for (uint32_t f : s.pending_feedback.view()) s.feedback.push_back(f);      // (pictures that will never be shown)
+  presented(s, false);
   surfaces_.erase(&s);
 }
 
@@ -740,7 +748,16 @@ void Server::wm_base_request(Client& c, uint32_t id, Resource& r, uint16_t opcod
       s.xdg_id = object;
       return;
     }
-    case 3: in.u(); return;      // pong
+    case 3: {      // pong(serial): it answers
+      const uint32_t serial = in.u();
+      if (!in.ok() || serial != c.ping_serial) return;
+      c.ping_serial = 0;
+      if (c.not_responding) {
+        c.not_responding = false;
+        for (Surface& s : surfaces_) if (s.client == c.number && s.role == Role::Toplevel && s.window) note_changed(s);
+      }
+      return;
+    }
     default: post_error(c, id, kErrorInvalidMethod, "xdg_wm_base has no such request"); return;
   }
 }
@@ -914,6 +931,7 @@ void Server::configure_toplevel(Surface& s) {
   if (s.maximized) add(kStateMaximized);
   if (s.fullscreen) add(kStateFullscreen);
   if (s.activated) add(kStateActivated);
+  if (s.iconic && tr->version >= 6) add(9);      // suspended: minimized, nothing of it is seen
   Event e(s.role_id, 0);
   e.i(w).i(h).array(ConstByteView(states, n * 4));
   send(*c, e);
@@ -1353,6 +1371,7 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, i
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
+    if (s.feedback.count() && s.current.valid()) presented(s, true);      // (shown now: wp_presentation_feedback.presented)
     if (!s.mapping.identity()) {      // turned, scaled or cropped: one affine map from the buffer to the screen (WaylandScale.cpp)
       renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
       draw_mapped(s, renderer, x, y);

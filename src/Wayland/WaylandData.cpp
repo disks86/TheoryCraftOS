@@ -78,6 +78,7 @@ void Server::tick() {
   {
     kernel::ScopedMutex lock(mutex_);
     poll_waiting();
+    check_pings();
     clipboard = clipboard_;
     seen = clipboard_seen_;
   }

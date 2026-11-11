@@ -768,6 +768,7 @@ add_executable(BOOTX64
   src/Wayland/WaylandData.cpp
   src/Wayland/WaylandDesktop.cpp
   src/Wayland/WaylandDmabuf.cpp
+  src/Wayland/WaylandExtras.cpp
   src/Wayland/WaylandInput.cpp
   src/Wayland/WaylandKeymap.cpp
   src/Wayland/WaylandScale.cpp

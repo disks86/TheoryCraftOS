@@ -29,20 +29,22 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 12;
+constexpr uint32_t kGlobalCount = 21;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
-    {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 5}, {"zxdg_decoration_manager_v1", 1},
+    {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 6}, {"zxdg_decoration_manager_v1", 1},
     {"zwp_linux_dmabuf_v1", 4},      // (only offered with set_dmabuf; 3 without an fd maker: version 4's feedback needs its format table)
     {"wp_linux_drm_syncobj_manager_v1", 1},      // (with set_dmabuf too: the transport makes the timelines)
     {"wp_viewporter", 1}, {"wp_fractional_scale_manager_v1", 1},
+    {"xdg_activation_v1", 1}, {"wp_cursor_shape_manager_v1", 1}, {"zwp_primary_selection_device_manager_v1", 1}, {"zwp_relative_pointer_manager_v1", 1},
+    {"zwp_pointer_constraints_v1", 1}, {"wp_presentation", 1}, {"zwp_idle_inhibit_manager_v1", 1}, {"zxdg_exporter_v2", 1}, {"zxdg_importer_v2", 1},
 };
 constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 
 }  // namespace
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
-    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator) {
+    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator) {
   monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
 }
 
@@ -166,6 +168,9 @@ void Server::close_client(uint32_t client) {
     for (Surface* s : mine.view()) destroy_surface(*c, *s);
     const uint8_t number = c->number;
     if (drag_.client == number) drag_.source = 0, end_drag(false);
+    for (uint64_t i = constraints_.count(); i-- > 0;) if (constraints_[i].client == number) constraints_.remove_at(i);
+    if (psel_client_ == number) psel_client_ = 0, psel_source_ = 0;
+    if (psel_sent_client_ == number) psel_sent_client_ = 0;
     if (sel_sent_client_ == number) sel_sent_client_ = 0;
     clients_[client].reset();
     if (sel_client_ == number) {      // (its selection goes with it)
@@ -315,7 +320,9 @@ void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t versi
   }
   constexpr Iface kIfaces[kGlobalCount] = {Iface::Compositor, Iface::Subcompositor, Iface::Shm, Iface::Seat,
                                            Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager,
-                                           Iface::Viewporter, Iface::FractionalScaleManager};
+                                           Iface::Viewporter, Iface::FractionalScaleManager, Iface::Activation, Iface::CursorShapeManager,
+                                           Iface::PrimaryManager, Iface::RelativePointerManager, Iface::PointerConstraints, Iface::Presentation,
+                                           Iface::IdleInhibitManager, Iface::Exporter, Iface::Importer};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -367,6 +374,12 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
         send(c, d);
       }
       if (version >= 2) send(c, Event(object, 2));      // done
+      return;
+    }
+    case Iface::Presentation: {      // clock_id: CLOCK_MONOTONIC (the clock of the times presented gives)
+      Event e(object, 0);
+      e.u(1);
+      send(c, e);
       return;
     }
     case Iface::LinuxDmabuf: {
@@ -491,6 +504,12 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::Viewport:
     case Iface::FractionalScaleManager:
     case Iface::FractionalScale: viewport_request(c, id, r, opcode, in); return;
+    case Iface::Activation: case Iface::ActivationToken: case Iface::CursorShapeManager: case Iface::CursorShapeDevice: case Iface::PrimaryManager:
+    case Iface::PrimarySource: case Iface::PrimaryDevice: case Iface::PrimaryOffer: case Iface::RelativePointerManager: case Iface::RelativePointer:
+    case Iface::PointerConstraints: case Iface::LockedPointer: case Iface::ConfinedPointer: case Iface::Presentation: case Iface::PresentationFeedback:
+    case Iface::IdleInhibitManager: case Iface::IdleInhibitor: case Iface::Exporter: case Iface::Exported: case Iface::Importer: case Iface::Imported:
+      extras_request(c, id, r, opcode, in);
+      return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");
       return;

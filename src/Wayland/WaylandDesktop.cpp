@@ -133,6 +133,7 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
   out->surface = {c.x, c.y, static_cast<uint32_t>(max32(c.w, 0)), static_cast<uint32_t>(max32(c.h, 0))};
   out->window = {c.x - l, c.y - t, static_cast<uint32_t>(max32(c.w, 0) + l + r), static_cast<uint32_t>(max32(c.h, 0) + t + b)};
   if (toplevel) title->append(s->title.view());
+  if (Client* c = client_of(s->client); toplevel && c && c->not_responding) title->append(" (Not Responding)");      // (it does not answer pings: WaylandExtras.cpp)
   return true;
 }
 
@@ -203,26 +204,7 @@ void Server::activate_window(uint32_t window) {
     Surface* s = window_surface(window);
     if (s && s->role != Role::Toplevel) s = nullptr;      // (popups are not activated: their toplevel stays active)
     if (window != 0 && (!s || !s->mapped)) return;
-    Surface* old = window_surface(active_window_);
-    if (s) raise(*s);
-    if (old != s) {
-      if (old && old->role == Role::Toplevel) {
-        old->activated = false;
-        if (old->initial_configure) configure_toplevel(*old);
-        note_changed(*old);
-      }
-      dismiss_popups(s);
-      active_window_ = s ? s->window : 0;
-      if (s) {
-        s->activated = true;
-        if (s->initial_configure) configure_toplevel(*s);
-        note_changed(*s);
-      }
-    }
-    // the keyboard: the topmost popup that grabbed it, else the window
-    Surface* focus = s;
-    for (Surface* w : stack_.view()) if (s && w->role == Role::Popup && w->grab && root_toplevel(w) == s) focus = w;
-    set_keyboard_focus(focus);
+    activate_locked(s);      // (WaylandExtras.cpp)
   }
   wake();
 }
@@ -234,11 +216,12 @@ void Server::window_command(uint32_t window, Command command) {
     if (!s || s->role != Role::Toplevel) return;
     switch (command) {
       case Command::Close:
-        if (Client* c = client_of(s->client)) send(*c, Event(s->role_id, 1));
+        if (Client* c = client_of(s->client)) send(*c, Event(s->role_id, 1)), ping(*c);      // (a client that does not close may be hung: it is pinged)
         break;
       case Command::Minimize:
         s->iconic = true;
         dismiss_children(*s);
+        if (s->initial_configure) configure_toplevel(*s);      // (version 6: suspended)
         note_changed(*s);
         break;
       case Command::Maximize:
@@ -247,7 +230,10 @@ void Server::window_command(uint32_t window, Command command) {
         note_changed(*s);
         break;
       case Command::Restore:
-        if (s->iconic) s->iconic = false;
+        if (s->iconic) {
+          s->iconic = false;
+          if (s->initial_configure) configure_toplevel(*s);
+        }
         else if (s->fullscreen) set_fullscreen(*s, false);
         else set_maximized(*s, false);
         note_changed(*s);

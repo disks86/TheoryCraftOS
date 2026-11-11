@@ -422,7 +422,7 @@ static void test_registry() {
     const uint32_t r = c.registry();
     const char* names[] = {"wl_compositor", "wl_subcompositor", "wl_shm", "wl_seat", "wl_output", "wl_data_device_manager", "xdg_wm_base", "zxdg_decoration_manager_v1"};
     for (const char* n : names) CHECK(c.globals.count(n) == 1);
-    CHECK(c.globals["xdg_wm_base"].second == 5 && c.globals["wl_seat"].second == 8);
+    CHECK(c.globals["xdg_wm_base"].second == 6 && c.globals["wl_seat"].second == 8);
     c.drop_events();
     const uint32_t shm = c.bind(r, "wl_shm");
     int formats = 0;
@@ -2741,6 +2741,223 @@ static void test_mapping() {
   free_made();
 }
 
+// ------------------------------------------------------------------ the other protocols, pings, the minimized state
+
+static uint64_t g_fake_ms = 1000;
+static uint64_t fake_clock() { return g_fake_ms; }
+
+static void test_extras() {
+  Server server(A, &fake_clock);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(true, "A"), wb = b.toplevel(true, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    server.move_window(win_a, {10, 10, 120, 120});
+    server.move_window(win_b, {400, 10, 120, 120});
+    desktop::WindowsWindowInfo ia, ib;
+    String title(A);
+    auto info = [&](uint32_t w, desktop::WindowsWindowInfo* out) { CHECK(server.window_info(w, out, &title)); };
+    // --- xdg_activation_v1: a token from A lets it take the focus from B, once
+    server.activate_window(win_b);
+    const uint32_t act_a = a.bind(a.reg, "xdg_activation_v1");
+    const uint32_t token = a.new_id();
+    a.send(Msg(act_a, 1).u(token));
+    a.send(Msg(token, 3));
+    const std::string text = a.take(token, 0).s(0);
+    CHECK(!text.empty());
+    a.send(Msg(act_a, 2).s(text).u(wa.surface));
+    info(win_a, &ia);
+    info(win_b, &ib);
+    CHECK(ia.active && !ib.active);
+    server.activate_window(win_b);
+    a.send(Msg(act_a, 2).s(text).u(wa.surface));      // (spent)
+    a.send(Msg(act_a, 2).s("made-up").u(wa.surface));
+    info(win_a, &ia);
+    CHECK(!ia.active);
+    // --- wp_cursor_shape_v1: the text cursor over A
+    server.activate_window(win_a);
+    info(win_a, &ia);
+    server.mouse_position(ia.surface.x + 20, ia.surface.y + 20);
+    const uint32_t csm = a.bind(a.reg, "wp_cursor_shape_manager_v1");
+    const uint32_t shape = a.new_id();
+    a.send(Msg(csm, 1).u(shape).u(a.pointer));
+    a.send(Msg(shape, 1).u(0).u(9));      // text
+    desktop::IWindowsSession::Pointer p;
+    server.pointer(&p);
+    CHECK(!p.hidden && p.cursor == 0 && p.system_id == 32513);
+    a.send(Msg(shape, 1).u(0).u(29));      // nwse-resize
+    server.pointer(&p);
+    CHECK(p.system_id == 32642);
+    // --- zwp_relative_pointer_v1 and a persistent lock while A is active and has the pointer
+    const uint32_t rpm = a.bind(a.reg, "zwp_relative_pointer_manager_v1"), pc = a.bind(a.reg, "zwp_pointer_constraints_v1");
+    const uint32_t rel = a.new_id();
+    a.send(Msg(rpm, 1).u(rel).u(a.pointer));
+    const uint32_t lock = a.new_id();
+    a.send(Msg(pc, 1).u(lock).u(wa.surface).u(a.pointer).u(0).u(2));
+    CHECK(a.has(lock, 0) && server.cursor_confined());      // locked
+    int32_t cx0 = 0, cy0 = 0, cx = 0, cy = 0;
+    server.cursor(&cx0, &cy0);
+    a.drop_events();
+    server.mouse_motion(7, -3);
+    Ev rm = a.take(rel, 0);
+    CHECK(rm.object == rel && rm.i(2) == 7 * 256 && rm.i(3) == -3 * 256);
+    server.cursor(&cx, &cy);
+    CHECK(cx == cx0 && cy == cy0);      // (locked: the pointer stays)
+    server.activate_window(win_b);
+    CHECK(a.has(lock, 1) && !server.cursor_confined());      // unlocked: A is not active
+    server.activate_window(win_a);
+    CHECK(a.has(lock, 0) && server.cursor_confined());      // (persistent: back)
+    a.send(Msg(pc, 2).u(a.new_id()).u(wa.surface).u(a.pointer).u(0).u(1));
+    uint32_t object = 0, code = 0;
+    CHECK(a.error(&object, &code) && code == 1);      // already_constrained
+  }
+  {      // a one-shot confinement: the pointer stays in the surface; it ends with the focus and does not come back
+    App app(server);
+    const uint32_t pointer = app.new_id();
+    app.send(Msg(app.seat, 0).u(pointer));
+    App::Window w = app.toplevel(true, "confined");
+    const uint32_t win = shown_window(server, app, w, 0xFF101010u);
+    server.move_window(win, {50, 50, 120, 120});
+    server.activate_window(win);
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win, &info, &title));
+    server.mouse_position(info.surface.x + 10, info.surface.y + 10);
+    const uint32_t pc = app.bind(app.reg, "zwp_pointer_constraints_v1");
+    const uint32_t conf = app.new_id();
+    app.send(Msg(pc, 2).u(conf).u(w.surface).u(pointer).u(0).u(1));
+    CHECK(app.has(conf, 0) && server.cursor_confined());
+    server.mouse_motion(-500, -500);
+    int32_t x = 0, y = 0;
+    server.cursor(&x, &y);
+    CHECK(x == info.surface.x && y == info.surface.y);      // (at the surface's corner, not past it)
+    server.activate_window(0);
+    CHECK(app.has(conf, 1) && !server.cursor_confined());
+    server.activate_window(win);
+    app.drop_events();
+    server.mouse_motion(1, 1);
+    CHECK(!app.has(conf, 0) && !server.cursor_confined());      // (one-shot: over)
+  }
+  {      // --- zwp_primary_selection_v1 between two clients
+    App a(server), b(server);
+    App::Window wa = a.toplevel(true, "PA"), wb = b.toplevel(true, "PB");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    const uint32_t ma = a.bind(a.reg, "zwp_primary_selection_device_manager_v1"), mb = b.bind(b.reg, "zwp_primary_selection_device_manager_v1");
+    const uint32_t da = a.new_id(), db = b.new_id();
+    a.send(Msg(ma, 1).u(da).u(a.seat));
+    b.send(Msg(mb, 1).u(db).u(b.seat));
+    server.activate_window(win_a);
+    const uint32_t src = a.new_id();
+    a.send(Msg(ma, 0).u(src));
+    a.send(Msg(src, 0).s("text/plain;charset=utf-8"));
+    a.send(Msg(da, 0).u(src).u(0));
+    b.drop_events();
+    server.activate_window(win_b);
+    Ev sel = b.take(db, 1);
+    CHECK(sel.object == db && sel.u(0) >= 0xFF000000u);
+    const uint32_t offer = sel.u(0);
+    CHECK(b.take(offer, 0).s(0) == "text/plain;charset=utf-8");
+    std::vector<uint8_t> pipe;
+    Fd fd = Fd::make_as<TestMemory>(A, &pipe);
+    b.send(Msg(offer, 0).s("text/plain;charset=utf-8"), {fd});
+    Ev sent = a.take(src, 0);
+    CHECK(sent.object == src && sent.s(0) == "text/plain;charset=utf-8" && a.fds.back().get() == fd.get());
+    // B takes the primary selection: A's source is cancelled
+    const uint32_t src_b = b.new_id();
+    b.send(Msg(mb, 0).u(src_b));
+    b.send(Msg(db, 0).u(src_b).u(0));
+    CHECK(a.has(src, 1));
+  }
+  {      // --- wp_presentation: presented when drawn, discarded when replaced first
+    App app(server);
+    const uint32_t pres = app.bind(app.reg, "wp_presentation");
+    CHECK(app.take(pres, 0).u(0) == 1);      // clock_id: CLOCK_MONOTONIC
+    App::Window w = app.toplevel(true, "presented");
+    const uint32_t win = shown_window(server, app, w, 0xFF202020u);
+    const uint32_t f1 = app.new_id();
+    app.send(Msg(pres, 1).u(w.surface).u(f1));
+    app.show(w, 100, 80, 0xFF303030u);
+    const uint32_t f2 = app.new_id();
+    app.send(Msg(pres, 1).u(w.surface).u(f2));
+    app.show(w, 100, 80, 0xFF404040u);
+    CHECK(app.has(f1, 2));      // discarded: never shown
+    std::vector<uint32_t> target(200 * 200);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 200;
+    graphics::SoftwareRenderer2D r(ts);
+    uint32_t dw, dh;
+    g_fake_ms = 123456;
+    CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    Ev pr = app.take(f2, 1);
+    CHECK(pr.object == f2 && pr.u(1) == 123 && pr.u(2) == 456000000u && pr.u(3) == 16666667u);
+    CHECK(app.take(1, 1).u(0) == f1);      // (delete_id: the feedback objects go)
+  }
+  {      // --- idle inhibitors are counted; xdg-foreign makes another client's window the parent
+    App a(server), b(server);
+    const uint32_t idle = a.bind(a.reg, "zwp_idle_inhibit_manager_v1");
+    const uint32_t s = a.surface();
+    const uint32_t inh = a.new_id();
+    a.send(Msg(idle, 1).u(inh).u(s));
+    CHECK(server.idle_inhibited());
+    a.send(Msg(inh, 0));
+    CHECK(!server.idle_inhibited());
+    App::Window wa = a.toplevel(true, "parent"), wb = b.toplevel(true, "dialog");
+    shown_window(server, a, wa, 0xFF0000FFu);
+    const uint32_t win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    const uint32_t exporter = a.bind(a.reg, "zxdg_exporter_v2"), importer = b.bind(b.reg, "zxdg_importer_v2");
+    const uint32_t exported = a.new_id();
+    a.send(Msg(exporter, 1).u(exported).u(wa.surface));
+    const std::string handle = a.take(exported, 0).s(0);
+    CHECK(!handle.empty());
+    const uint32_t imported = b.new_id();
+    b.send(Msg(importer, 1).u(imported).s(handle));
+    b.send(Msg(imported, 1).u(wb.surface));
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win_b, &info, &title) && info.owned);
+    a.send(Msg(wa.toplevel, 0));      // the parent goes: the import hears it, the dialog has no parent
+    a.send(Msg(wa.xdg, 0));
+    a.send(Msg(wa.surface, 0));
+    CHECK(b.has(imported, 0));
+    CHECK(server.window_info(win_b, &info, &title) && !info.owned);
+    const uint32_t unknown = b.new_id();
+    b.send(Msg(importer, 1).u(unknown).s("no-such-handle"));
+    CHECK(b.has(unknown, 0));
+    const uint32_t late = b.new_id();
+    b.send(Msg(importer, 1).u(late).s(handle));      // (the export is gone: destroyed at once)
+    CHECK(b.has(late, 0));
+  }
+  {      // --- pings: a client that does not answer is shown as not responding until it does; the minimized state
+    App app(server);
+    App::Window w = app.toplevel(true, "Editor");
+    const uint32_t win = shown_window(server, app, w, 0xFF505050u);
+    g_fake_ms = 200000;
+    app.drop_events();
+    server.window_command(win, desktop::IWindowsSession::Command::Close);
+    Ev ping = app.take(app.wm, 0);
+    CHECK(ping.object == app.wm && app.has(w.toplevel, 1));      // ping, and the close
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    g_fake_ms += 6000;
+    server.tick();
+    CHECK(server.window_info(win, &info, &title) && title.view() == StringView("Editor (Not Responding)"));
+    app.send(Msg(app.wm, 3).u(ping.u(0)));      // pong
+    CHECK(server.window_info(win, &info, &title) && title.view() == StringView("Editor"));
+    app.drop_events();
+    server.window_command(win, desktop::IWindowsSession::Command::Minimize);
+    Ev conf = app.take(w.toplevel, 0);
+    bool suspended = false;
+    for (size_t i = 0; i + 3 < conf.a.size() - 12; i += 4) suspended |= conf.u(3 + i / 4) == 9;
+    CHECK(conf.object == w.toplevel && suspended);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2760,6 +2977,7 @@ int main() {
   test_syncobj();
   test_clipboard();
   test_mapping();
+  test_extras();
   test_drag_and_drop();
   test_dxg_fences();
   test_dxg_threads();

@@ -81,7 +81,10 @@ struct Server::Client {
   Queue<Fd> fds_in;           // descriptors no request took yet
   List<Fd> fds_out;           // descriptors that go with `out`
   Dictionary<uint32_t, Resource> objects;
-  uint32_t next_server_id = kFirstServerId;      // the next id of an object the server makes (zwp_linux_buffer_params_v1.created)
+  uint32_t next_server_id = kFirstServerId;
+  uint32_t ping_serial = 0;            // xdg_wm_base.ping not answered yet (0: none)
+  uint64_t ping_sent = 0;              // when it went (the clock's milliseconds)
+  bool not_responding = false;         // it did not answer for kPingPatience: its windows' titles say so      // the next id of an object the server makes (zwp_linux_buffer_params_v1.created)
 };
 
 // The arguments of one request. A malformed argument makes it fail (ok() false): the request is then a protocol error.

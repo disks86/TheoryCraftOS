@@ -16,6 +16,7 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
 | The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
 | Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
+| Activation, cursor shapes, primary selection, relative pointer and constraints, presentation time, idle inhibit, xdg-foreign, pings | `src/Wayland/WaylandExtras.cpp` |
 | `pipe` / `pipe2` for Linux programs (what clipboard transfers go through) | `src/Process/LinuxSockets.cpp` |
 | GPU images over the kernel's Direct3D layer (kept apart: the rest builds without it) | `src/Wayland/Dxg/WaylandDxgImage.{hpp,cpp}` |
 | dmabufs: `/dev/dxg`'s export and import, the descriptor, the kernel's export object | `src/Process/DxgBufferFile.hpp`, `LinuxFiles.cpp`, `Win32kDxg.cpp`, `Kernel/Dxgkrnl/DxgKernel.{hpp,cpp}` |
@@ -31,7 +32,9 @@ through the same input taps. `IWindowsSession::mouse_left` (new; a no-op for the
 not one of its own, so the compositor can send `wl_pointer.leave`.
 
 - **Globals.** `wl_compositor` 6, `wl_subcompositor` 1, `wl_shm` 2, `wl_seat` 8, `wl_output` 4 (the primary monitor), `wl_data_device_manager`
-  3 (copy and paste, drag and drop), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1, `wp_viewporter` 1, `wp_fractional_scale_manager_v1` 1, `zwp_linux_dmabuf_v1` 4 and `wp_linux_drm_syncobj_manager_v1` 1 (the last two while
+  3 (copy and paste, drag and drop), `xdg_wm_base` 6, `zxdg_decoration_manager_v1` 1, `wp_viewporter` 1, `wp_fractional_scale_manager_v1` 1, `xdg_activation_v1` 1, `wp_cursor_shape_manager_v1` 1,
+  `zwp_primary_selection_device_manager_v1` 1, `zwp_relative_pointer_manager_v1` 1, `zwp_pointer_constraints_v1` 1, `wp_presentation` 1,
+  `zwp_idle_inhibit_manager_v1` 1, `zxdg_exporter_v2` 1, `zxdg_importer_v2` 1, `zwp_linux_dmabuf_v1` 4 and `wp_linux_drm_syncobj_manager_v1` 1 (the last two while
   the transport can make GPU images and timelines: the kernel sets that up when it has the Direct3D layer).
 - **One coordinate space.** The compositor's screen is the desktop's window manager area; its monitors and work areas come from `set_display`.
   The desktop's "surface" rectangle of a window is the client's window geometry (`xdg_surface.set_window_geometry`, else its buffer), so a
@@ -61,6 +64,24 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   The keymap is a complete US xkb_v1 text, with no includes, in a sealed file in memory that every client maps read-only. Modifier masks are the
   real modifiers: Shift 1, Lock 2, Control 4, Mod1/Alt 8, Mod2/NumLock 16, Mod4/Super 64. Keys repeat on the client side (`repeat_info` 25/s after
   600 ms), so the desktop's repeated presses of a held key are dropped.
+
+## The other protocols, and pings
+
+- **Activation** (`xdg_activation_v1`): tokens are made by the compositor and spent once; `activate` activates the surface's window as a click would.
+- **Cursor shapes** (`wp_cursor_shape_v1`): the 34 named shapes become the desktop's own cursors (the `OCR_*` shapes it has for Windows programs).
+- **Primary selection** (`zwp_primary_selection_v1`): the middle-button selection between Wayland clients, offered with the keyboard as the
+  clipboard's selection is; pastes go to the source with the client's descriptor. The desktop has no primary selection to bridge it to.
+- **Relative pointer and constraints** (`zwp_relative_pointer_v1`, `zwp_pointer_constraints_v1`): every motion is also sent as it came. A lock keeps the
+  pointer where it is (its hint is where it is put back), a confinement keeps it in the surface (or its region), while the surface has the pointer and
+  its window is active; the desktop then holds the pointer for the program as for a Windows program's `ClipCursor`, and Ctrl+Alt takes it back.
+  One-shot constraints end at their first release; persistent ones come back.
+- **Presentation time** (`wp_presentation`, clock `CLOCK_MONOTONIC`): a commit's feedback is `presented` when the desktop draws the picture (time,
+  60 Hz refresh, a sequence count) or `discarded` when a newer picture replaced it first.
+- **xdg-foreign** (`zxdg_exporter_v2`, `zxdg_importer_v2`): one client's toplevel exported as a handle becomes the parent of another client's
+  toplevel (the desktop shows it as owned); when the exported window goes, the imports hear `destroyed` and the dialogs lose their parent.
+- **Pings and the minimized state.** `xdg_wm_base.ping` goes when the user activates or closes a window; a client that has not answered after five
+  seconds is shown as not responding (its windows' titles end in "(Not Responding)", as on Windows) until it does. `xdg_wm_base` is version 6, so
+  a minimized toplevel is configured `suspended`.
 
 ## Scale, transforms, viewports
 
@@ -166,6 +187,7 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
 | Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard) | `tests/wayland_interop.sh` |
+| Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
@@ -212,16 +234,18 @@ depends on itself:
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (see the plan above):
   a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
   Not tried on a real GPU (only the software renderer and virgl).
-- **Protocols.** No primary selection, `xdg_activation_v1`, `wp_cursor_shape_v1`, text input,
-  pointer constraints, relative pointer, presentation time, idle inhibit, xdg-foreign, layer shell or tablets. `wl_touch` sends nothing.
+- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
+  panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
+  sessions no tablet or touch input). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
+  desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
 - **Clipboard and drag and drop.** Only text reaches the desktop's clipboard (pictures and other types stay between Wayland clients); the
   desktop's pictures are not offered. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
   and Windows or X programs are not bridged. Selection and drag serials are not checked.
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.
-- **Window manager.** Minimizing sends no state. `show_window_menu` does nothing. A popup's `reactive` flag and parent size are ignored, and
-  `xdg_wm_base.ping` is never sent.
+- **Window manager.** `show_window_menu` does nothing (the desktop has no window menu to open). A popup's `reactive` flag and parent size are
+  ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.
 - **Windows programs.** Wayland needs descriptor passing, which Windows' `AF_UNIX` lacks, so only Linux programs are clients.
