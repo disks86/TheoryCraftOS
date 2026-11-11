@@ -753,6 +753,8 @@ add_executable(BOOTX64
   src/Process/WindowsOpenGl.cpp
   src/Process/WindowsMemory.cpp
   src/Process/WindowsSockets.cpp
+  src/Process/WindowsUnixSockets.cpp
+  src/Process/UnixSockets.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
   src/Process/WindowsMisc.cpp
@@ -765,6 +767,7 @@ add_executable(BOOTX64
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
+  src/Process/LinuxSockets.cpp
   src/Process/LinuxThreads.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp

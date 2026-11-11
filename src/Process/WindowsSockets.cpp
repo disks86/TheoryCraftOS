@@ -19,6 +19,7 @@
 #include "Process/WindowsSockets.hpp"
 #include "Process/SocketAddress.hpp"
 #include "Process/Sockets.hpp"
+#include "Process/WindowsUnixSockets.hpp"
 #include "Process/WindowsFiles.hpp"
 #include "Utility/ByteText.hpp"
 
@@ -45,6 +46,14 @@ SocketManager* require(Process& p, uint64_t handle, uint64_t* id) {
   if (!slot_of(handle, &slot) || p.files().kind(slot) != DescriptorKind::Socket) return nullptr;
   *id = p.files().token(slot);
   return sockets;
+}
+
+// A handle of an AF_UNIX socket (WindowsUnixSockets.cpp takes those): its socket id.
+bool unix_handle(Process& p, uint64_t handle, uint32_t* id) {
+  uint64_t slot = 0;
+  if (!slot_of(handle, &slot) || p.files().kind(slot) != DescriptorKind::UnixSocket) return false;
+  *id = uint32_t(p.files().token(slot));
+  return true;
 }
 
 uint32_t give_socket_handle(Process& p, uint32_t id, uint64_t* handle) {
@@ -128,6 +137,7 @@ void socket_token_add(uint64_t token) { if (SocketManager* sockets = system_sock
 void socket_token_release(uint64_t token) { if (SocketManager* sockets = system_sockets()) sockets->release(uint32_t(token)); }
 
 uint32_t nt_create_socket(Process& p, const SyscallRequest& r) {
+  if (uint32_t(r.args[0]) == kAfUnix) return unix_create_socket(p, uint32_t(r.args[1]), r.args[3]);      // (no network needed)
   SocketManager* sockets = system_sockets();
   if (!sockets) return kNotImplemented;
   const uint32_t family = uint32_t(r.args[0]);
@@ -145,6 +155,7 @@ uint32_t nt_create_socket(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_bind_socket(Process& p, const SyscallRequest& r) {
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id)) return unix_bind_socket(p, unix_id, r.args[1], r.args[2]);
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -155,6 +166,7 @@ uint32_t nt_bind_socket(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_connect_socket(Process& p, const SyscallRequest& r) {
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id)) return unix_connect_socket(p, unix_id, r.args[1], r.args[2]);
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -165,6 +177,7 @@ uint32_t nt_connect_socket(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_listen_socket(Process& p, const SyscallRequest& r) {
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id)) return unix_listen_socket(p, unix_id, uint32_t(r.args[1]));
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -172,6 +185,7 @@ uint32_t nt_listen_socket(Process& p, const SyscallRequest& r) {
 }
 
 uint32_t nt_accept_socket(Process& p, const SyscallRequest& r) {
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id)) return unix_accept_socket(p, unix_id, r.args[1], r.args[2], r.args[3]);
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -199,6 +213,7 @@ uint32_t nt_accept_socket(Process& p, const SyscallRequest& r) {
 uint32_t nt_send_socket(Process& p, const SyscallRequest& r) {
   uint64_t to_at = 0, to_length = 0;
   if (!argument(p, r, 4, &to_at) || !argument(p, r, 5, &to_length)) return kAccessViolation;
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id)) return unix_send_socket(p, unix_id, r.args[1], uint32_t(r.args[2]), r.args[3], to_at, to_length);
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -223,6 +238,8 @@ uint32_t nt_send_socket(Process& p, const SyscallRequest& r) {
 uint32_t nt_receive_socket(Process& p, const SyscallRequest& r) {
   uint64_t from_at = 0, from_length_at = 0, peer_closed_at = 0;
   if (!argument(p, r, 4, &from_at) || !argument(p, r, 5, &from_length_at) || !argument(p, r, 6, &peer_closed_at)) return kAccessViolation;
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id))
+    return unix_receive_socket(p, unix_id, r.args[1], uint32_t(r.args[2]), r.args[3], from_at, from_length_at, peer_closed_at);
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -255,6 +272,8 @@ uint32_t nt_receive_socket(Process& p, const SyscallRequest& r) {
 uint32_t nt_socket_control(Process& p, const SyscallRequest& r) {
   uint64_t out_at = 0, out_length_arg = 0;
   if (!argument(p, r, 4, &out_at) || !argument(p, r, 5, &out_length_arg)) return kAccessViolation;
+  if (uint32_t unix_id = 0; unix_handle(p, r.args[0], &unix_id))
+    return unix_socket_control(p, unix_id, uint32_t(r.args[1]), r.args[2], uint32_t(r.args[3]), out_at, uint32_t(out_length_arg));
   uint64_t id = 0;
   SocketManager* sockets = require(p, r.args[0], &id);
   if (!sockets) return kInvalidHandle;
@@ -370,7 +389,8 @@ uint32_t nt_select_sockets(Process& p, const SyscallRequest& r) {
   if (!argument(p, r, 4, &except_count_at) || !argument(p, r, 5, &except_at) || !argument(p, r, 6, &timeout_at) || !argument(p, r, 7, &ready_count_at))
     return kAccessViolation;
   SocketManager* sockets = system_sockets();
-  if (!sockets) return kNotImplemented;
+  UnixSocketManager* unix_sockets = system_unix_sockets();
+  if (!sockets && !unix_sockets) return kNotImplemented;
   constexpr uint32_t kMaxEach = 64;
   // Each count is read/write (like a real fd_set's own fd_count field): the caller's in-value is how many handles it put in, and on return it holds how many of
   // that same array are now ready - the only way the caller learns each array's own post-compaction size, since *ReadyCount is just the grand total of all three.
@@ -390,37 +410,85 @@ uint32_t nt_select_sockets(Process& p, const SyscallRequest& r) {
     if (!p.read_user_u64(timeout_at, &raw)) return kAccessViolation;
     timeout_100ns = int64_t(raw);
   }
-  auto id_of = [&](uint32_t handle, uint64_t* id) -> bool {
+  // Each handle is a network socket or an AF_UNIX one; the unix ones are looked at with their lock held (one lock for a whole pass).
+  enum : uint8_t { kNone, kNetwork, kUnix };
+  auto kind_of = [&](uint32_t handle, uint64_t* id) -> uint8_t {
     uint64_t slot = 0;
-    if (!slot_of(handle, &slot) || p.files().kind(slot) != DescriptorKind::Socket) return false;
-    *id = p.files().token(slot);
-    return true;
+    if (!slot_of(handle, &slot)) return kNone;
+    const DescriptorKind kind = p.files().kind(slot);
+    if (kind == DescriptorKind::Socket && sockets) { *id = p.files().token(slot); return kNetwork; }
+    if (kind == DescriptorKind::UnixSocket && unix_sockets) { *id = p.files().token(slot); return kUnix; }
+    return kNone;
+  };
+  bool any_network = false, any_unix = false;
+  {
+    const uint32_t* lists[3] = {read_handles, write_handles, except_handles};
+    const uint32_t counts[3] = {read_count, write_count, except_count};
+    for (uint32_t k = 0; k < 3; ++k)
+      for (uint32_t i = 0; i < counts[k]; ++i) {
+        uint64_t sid = 0;
+        const uint8_t kind = kind_of(lists[k][i], &sid);
+        any_network = any_network || kind == kNetwork;
+        any_unix = any_unix || kind == kUnix;
+      }
+  }
+  // which: 0 readable, 1 writable, 2 an error. (Unix sockets: the caller holds their lock.)
+  auto ready_of = [&](uint32_t handle, uint32_t which) -> bool {
+    uint64_t sid = 0;
+    switch (kind_of(handle, &sid)) {
+      case kNetwork: return which == 0 ? sockets->ready_to_read(uint32_t(sid)) : which == 1 ? sockets->ready_to_write(uint32_t(sid)) : sockets->has_error(uint32_t(sid));
+      case kUnix: return unix_select_ready_locked(*unix_sockets, uint32_t(sid), which);
+      default: return false;
+    }
+  };
+  uint32_t kept_read = 0, kept_write = 0, kept_except = 0;
+  uint32_t ready_read[kMaxEach], ready_write[kMaxEach], ready_except[kMaxEach];
+  auto evaluate = [&]() -> uint32_t {      // (the unix lock held if there are unix handles)
+    kept_read = kept_write = kept_except = 0;
+    for (uint32_t i = 0; i < read_count; ++i) if (ready_of(read_handles[i], 0)) ready_read[kept_read++] = read_handles[i];
+    for (uint32_t i = 0; i < write_count; ++i) if (ready_of(write_handles[i], 1)) ready_write[kept_write++] = write_handles[i];
+    for (uint32_t i = 0; i < except_count; ++i) if (ready_of(except_handles[i], 2)) ready_except[kept_except++] = except_handles[i];
+    return kept_read + kept_write + kept_except;
   };
   const uint64_t started = p.host().monotonic_ns();
   IProcessRuntime* runtime = p.runtime();
   for (;;) {
-    const uint64_t seen = sockets->progress();
-    uint32_t ready = 0, kept_read = 0, kept_write = 0, kept_except = 0;
-    for (uint32_t i = 0; i < read_count; ++i) { uint64_t sid; if (id_of(read_handles[i], &sid) && sockets->ready_to_read(uint32_t(sid))) { read_handles[kept_read++] = read_handles[i]; ++ready; } }
-    for (uint32_t i = 0; i < write_count; ++i) { uint64_t sid; if (id_of(write_handles[i], &sid) && sockets->ready_to_write(uint32_t(sid))) { write_handles[kept_write++] = write_handles[i]; ++ready; } }
-    for (uint32_t i = 0; i < except_count; ++i) { uint64_t sid; if (id_of(except_handles[i], &sid) && sockets->has_error(uint32_t(sid))) { except_handles[kept_except++] = except_handles[i]; ++ready; } }
+    const uint64_t seen = sockets ? sockets->progress() : 0;
+    uint32_t ready = 0;
+    if (any_unix) {
+      unix_sockets->sync().lock();
+      ready = evaluate();
+      unix_sockets->sync().unlock();
+    } else {
+      ready = evaluate();
+    }
     if (ready > 0 || timeout_100ns == 0) {
-      if (read_count && !p.write_user(r.args[1], ConstByteView(reinterpret_cast<uint8_t*>(read_handles), kept_read * 4))) return kAccessViolation;
-      if (write_count && !p.write_user(r.args[3], ConstByteView(reinterpret_cast<uint8_t*>(write_handles), kept_write * 4))) return kAccessViolation;
-      if (except_count && !p.write_user(except_at, ConstByteView(reinterpret_cast<uint8_t*>(except_handles), kept_except * 4))) return kAccessViolation;
+      if (read_count && kept_read && !p.write_user(r.args[1], ConstByteView(reinterpret_cast<uint8_t*>(ready_read), kept_read * 4))) return kAccessViolation;
+      if (write_count && kept_write && !p.write_user(r.args[3], ConstByteView(reinterpret_cast<uint8_t*>(ready_write), kept_write * 4))) return kAccessViolation;
+      if (except_count && kept_except && !p.write_user(except_at, ConstByteView(reinterpret_cast<uint8_t*>(ready_except), kept_except * 4))) return kAccessViolation;
       if (read_count_at != 0 && !p.write_user_u32(read_count_at, kept_read)) return kAccessViolation;
       if (write_count_at != 0 && !p.write_user_u32(write_count_at, kept_write)) return kAccessViolation;
       if (except_count_at != 0 && !p.write_user_u32(except_count_at, kept_except)) return kAccessViolation;
       return p.write_user_u32(ready_count_at, ready) ? kSuccess : kAccessViolation;
     }
     if (p.exited() || (runtime && runtime->interrupted())) return 0xC0000120u;
-    if (timeout_100ns > 0 && uint64_t(timeout_100ns) * 100 <= p.host().monotonic_ns() - started) {
+    const uint64_t used = p.host().monotonic_ns() - started;
+    if (timeout_100ns > 0 && uint64_t(timeout_100ns) * 100 <= used) {
       if (read_count_at != 0 && !p.write_user_u32(read_count_at, 0)) return kAccessViolation;
       if (write_count_at != 0 && !p.write_user_u32(write_count_at, 0)) return kAccessViolation;
       if (except_count_at != 0 && !p.write_user_u32(except_count_at, 0)) return kAccessViolation;
       return p.write_user_u32(ready_count_at, 0) ? kSuccess : kAccessViolation;
     }
-    wait_for_network(p, *sockets, seen);
+    if (any_network) {
+      wait_for_network(p, *sockets, seen);      // (a unix socket that becomes ready meanwhile is seen within the slice)
+    } else if (any_unix) {      // only unix sockets: sleep until one of them changes (looked at again under their lock, so no wake-up is lost)
+      const uint64_t left = timeout_100ns > 0 ? uint64_t(timeout_100ns) * 100 - used : ~uint64_t{0};
+      unix_wait(p, *unix_sockets, left, [&] { return evaluate() != 0; });
+    } else {
+      if (runtime) runtime->unlock();
+      p.host().sleep_ns(kSliceUs * 1000);      // (no socket among them at all: nothing will ever be ready but the timeout)
+      if (runtime) runtime->lock();
+    }
   }
 }
 

@@ -424,6 +424,11 @@ class Process {
 
 // Moves bytes between the program and the console in small pieces, so a huge or half-mapped buffer cannot make the kernel allocate or fault. Return
 // the number of bytes moved; `*faulted` says the program's memory ended the transfer early.
+// The use a descriptor's token keeps of the system object it names (a pipe, a socket, a synchronization object, ...): one more when a descriptor is copied
+// (duplicated, inherited, carried by a unix socket message), one less when a copy goes. Kinds without a shared object do nothing.
+void descriptor_token_add(DescriptorKind kind, uint64_t token);
+void descriptor_token_release(DescriptorKind kind, uint64_t token);
+
 uint64_t copy_user_to_console(Process& process, uint32_t stream, uint64_t address, uint64_t count, bool* faulted);
 uint64_t copy_console_to_user(Process& process, uint64_t address, uint64_t count, bool* faulted);
 

@@ -56,4 +56,7 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
 using DxgServiceHandler = bool (*)(Process& process, uint32_t service, uint64_t params, uint32_t* status);
 void set_dxg_service_handler(DxgServiceHandler handler);
 
+// The errno (as a result register value, -errno) for a file system status.
+uint64_t errno_of_status(filesystem::Status status);
+
 }  // namespace process::linuxabi

@@ -17,6 +17,7 @@
  */
 #include "Process/ProcessFiles.hpp"
 #include "Process/Objects.hpp"
+#include "FileSystem/SystemLayout.hpp"
 
 namespace process {
 
@@ -196,9 +197,27 @@ bool ProcessFiles::fold_case(String* path, uint64_t prefix_size) const {
   return path->assign(result.view());
 }
 
+namespace {
+// The rest of `virtual_path` after /mnt/c ("" for /mnt/c itself, "/x" below it), or false if it is not in there.
+bool under_windows_mount(StringView virtual_path, StringView* rest) {
+  const StringView kWindowsDriveMount(filesystem::layout::kLinuxWindowsDrive);
+  if (virtual_path.size() < kWindowsDriveMount.size() || virtual_path.first(kWindowsDriveMount.size()) != kWindowsDriveMount) return false;
+  const StringView after = virtual_path.without_prefix(kWindowsDriveMount.size());
+  if (!after.empty() && after[0] != '/') return false;      // ("/mnt/cdrom" is not)
+  *rest = after;
+  return true;
+}
+}  // namespace
+
 bool ProcessFiles::host_path(StringView virtual_path, String* out) const {
   if (!fs_ || !allocator_) return false;
   out->clear();
+  StringView windows_rest;
+  if (style_ == PathStyle::Posix && under_windows_mount(virtual_path, &windows_rest)) {
+    const StringView windows_root(filesystem::layout::kWindows);
+    if (!out->assign(windows_root) || !out->append(windows_rest)) return false;
+    return fold_case(out, windows_root.size());
+  }
   if (!out->assign(root_prefix_)) return false;
   if (virtual_path == StringView("/")) return true;
   if (!out->append(virtual_path)) return false;
@@ -351,6 +370,19 @@ int64_t ProcessFiles::open_token(DescriptorKind kind, uint64_t token) {
   slots_[target].kind = kind;
   slots_[target].token = token;
   slots_[target].close_on_exec = false;
+  slots_[target].inherit = slots_[target].protect = false;
+  return target;
+}
+
+int64_t ProcessFiles::install(DescriptorKind kind, const SharedPointer<OpenObject>& object, uint64_t token, uint64_t minimum) {
+  if (kind == DescriptorKind::Closed) return -1;
+  const int64_t target = free_slot(minimum);
+  if (target < 0) return -1;
+  slots_[target].kind = kind;
+  slots_[target].object = object;
+  slots_[target].token = token;
+  slots_[target].close_on_exec = false;
+  slots_[target].denied = 0;
   slots_[target].inherit = slots_[target].protect = false;
   return target;
 }

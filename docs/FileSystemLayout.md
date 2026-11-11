@@ -38,6 +38,11 @@ constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`
 Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads
 `/Linux/lib/firmware/intel/vpu/vpu_<generation>_v1.bin` (`kLinuxFirmwareIntelVpu`; the file comes from the linux-firmware package, the OS does not carry it).
 
+A Linux process also sees the Windows tree at `/mnt/c` (`kLinuxWindowsDrive`), as under WSL: `/mnt/c/Users/Public` is the Windows process's
+`C:\Users\Public`, with names compared without regard to case as Windows does. It is the one place the two views overlap, so that files and unix
+sockets (`src/Process/UnixSockets.hpp`) one kind of program makes are there for the other. `/mnt` itself stays a plain folder of `/Linux`;
+`c` is not listed in it.
+
 Other volumes (USB sticks, network shares) are folders of `/` named by their label.
 
 ## Rules for new code
@@ -49,7 +54,7 @@ Other volumes (USB sticks, network shares) are folders of `/` named by their lab
 - Do not create new top-level folders in `/`. If something does not fit the table, extend the table (this file and `SystemLayout.hpp`)
   in the same change.
 - Windows and Linux processes get a view of their own root (`/Windows` as `C:\`, `/Linux` as `/`). Translate paths at the system-call
-  boundary; a process must not be able to name a path outside its root.
+  boundary; a process must not be able to name a path outside its root (a Linux process's `/mnt/c` is the only way into the other one).
 - `/EFI` is a mount, not a folder of the primary partition. Do not create an `EFI` folder on the primary partition (it would be hidden by
   the mount).
 
