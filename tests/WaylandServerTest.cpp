@@ -1758,7 +1758,7 @@ static uint32_t pattern_a(uint32_t x, uint32_t y) { return 0xFF000000u | (x * 4)
 static SharedPointer<process::OpenObject> dmabuf_object(SharedPointer<dxgk::ExportedAllocation> exported) {
   SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
   const uint64_t bytes = dxgk::export_info(*exported).bytes;
-  UniquePointer<process::DxgBufferFile> f = UniquePointer<process::DxgBufferFile>::make(A, util::move(exported), bytes);
+  UniquePointer<process::DxgBufferFile> f = UniquePointer<process::DxgBufferFile>::make(A, A, util::move(exported), bytes);
   o->gpu_buffer = f.get();
   o->file = util::move(f);
   o->readable = true;
@@ -2011,7 +2011,7 @@ static void test_dxg_threads() {
           SharedPointer<dxgk::ExportedAllocation> e;
           if (!next || !dst::ok(k.export_allocation(p.pid, next, &e))) { ++bad; break; }
           SharedPointer<process::OpenObject> object = dmabuf_object(util::move(e));
-          Fd fd = Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, *object));
+          Fd fd = Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, object));
           if (a) k.destroy_allocation(p.pid, a);
           a = next;
           if (buffer) app.send(Msg(buffer, 0));
@@ -2036,6 +2036,94 @@ static void test_dxg_threads() {
   free_made();
 }
 
+// The CPU's view of a dmabuf (mmap's copy): filled from the image at the first map, DMA_BUF_IOCTL_SYNC both ways, writes through a writable shared mapping
+// reaching the window at each commit without the ioctl.
+static void test_dxg_cpu_mapping() {
+  graphics::SoftwareDevice device{A, nullptr};
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  server.set_dmabuf(true);
+  constexpr uint32_t W = 32, H = 20;
+  {
+    DxgProcess p(k, 70);
+    const dxgk::Handle a = p.image(W, H);
+    CHECK(p.paint(a, W, H, pattern_a));
+    SharedPointer<dxgk::ExportedAllocation> e;
+    CHECK(dst::ok(k.export_allocation(p.pid, a, &e)));
+    SharedPointer<process::OpenObject> object = dmabuf_object(e);
+    process::DxgBufferFile& file = *object->gpu_buffer;
+    using R = process::DxgBufferFile::SyncResult;
+    // without the Direct3D layer's copier there is nothing to map
+    process::set_dxg_buffer_copier(nullptr);
+    CHECK(!file.map_block(false) && file.sync(1) == R::NoCopier);
+    process::set_dxg_buffer_copier(&dxgk::copy_export);
+    CHECK(file.sync(1) == R::Ok);      // (nothing mapped yet: nothing to move)
+    CHECK(file.sync(0) == R::Invalid && file.sync(8 | 1) == R::Invalid);
+    process::BlockRef block = file.map_block(false);
+    CHECK(block && block.get()->capacity() % 4096 == 0 && block.get()->capacity() >= W * H * 4);
+    if (!block) return;
+    auto word = [&](uint32_t x, uint32_t y) { uint32_t v = 0; memcpy(&v, block.get()->bytes().data() + (y * W + x) * 4, 4); return v; };
+    auto put = [&](uint32_t x, uint32_t y, uint32_t v) { memcpy(block.get()->bytes().data() + (y * W + x) * 4, &v, 4); };
+    CHECK(word(5, 7) == pattern_a(5, 7) && word(W - 1, H - 1) == pattern_a(W - 1, H - 1));
+    // the GPU side changes: START|READ brings it in
+    CHECK(p.paint(a, W, H, [](uint32_t x, uint32_t) { return 0xFF000000u | x; }));
+    CHECK(word(9, 3) == pattern_a(9, 3));
+    CHECK(file.sync(process::DxgBufferFile::kSyncRead) == R::Ok && word(9, 3) == 0xFF000009u);
+    // the CPU writes: END|WRITE sends it to the image (which the process sees through its own handle)
+    put(4, 4, 0xFF123456u);
+    CHECK(file.sync(process::DxgBufferFile::kSyncEnd | process::DxgBufferFile::kSyncWrite) == R::Ok);
+    dxgk::LockResult v;
+    uint32_t px = 0;
+    CHECK(dst::ok(k.lock(p.pid, a, dxgk::kLockReadOnly, 0, &v)));
+    memcpy(&px, v.data.data() + 4 * v.pitch + 16, 4);
+    CHECK(px == 0xFF123456u);
+    CHECK(dst::ok(k.unlock(p.pid, a)));
+    // a second descriptor of the same export shares the copy
+    process::BlockRef again = file.map_block(true);
+    CHECK(again && again.get() == block.get());
+    // shown by the compositor; a CPU write through the writable mapping reaches the window at the next commit, without the ioctl
+    struct ImageFd final : wayland::Memory {
+      SharedPointer<wayland::GpuImage> image;
+      explicit ImageFd(SharedPointer<wayland::GpuImage> i) : image(util::move(i)) {}
+      ByteView map(uint64_t) override { return ByteView(); }
+      wayland::GpuImage* gpu() override { return image.get(); }
+    };
+    DmabufApp app(server);
+    App::Window w = app.toplevel(true, "mapped");
+    const uint32_t b = app.immed(app.params(Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, object)), 0, W * 4), W, H);
+    app.commit(w, b, W, H);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      CHECK(server.window_pixel(list[0], 4, 4) == 0xFF123456u);
+      put(6, 2, 0xFF00AA00u);
+      CHECK(server.window_pixel(list[0], 6, 2) != 0xFF00AA00u);      // (not before the commit)
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF00AA00u);
+      // the GPU draws a new frame while the mapping is still there but the CPU wrote nothing since: the commit keeps the GPU's frame
+      CHECK(p.paint(a, W, H, [](uint32_t, uint32_t) { return 0xFF445566u; }));
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF445566u);
+      // the mappings go: later commits never send the old copy
+      block.reset();
+      again.reset();
+      CHECK(p.paint(a, W, H, [](uint32_t, uint32_t) { return 0xFF778899u; }));
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF778899u);
+    }
+    CHECK(!app.closing);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2051,6 +2139,7 @@ int main() {
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();
+  test_dxg_cpu_mapping();
   test_dxg_threads();
   test_threads();
   free_made();

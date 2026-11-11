@@ -71,6 +71,9 @@ class GpuImage {
   virtual bool draw(graphics::IRenderer2D& renderer, const graphics::Rect2D& source, int32_t x, int32_t y) = 0;
   // Its pixels in `source` (inside the image), row after row, into `out` (source.width * source.height words). False when it cannot be read now.
   virtual bool read(const graphics::Rect2D& source, ArrayView<uint32_t> out) = 0;
+  // A buffer of it was committed: what the client wrote through a CPU mapping of the descriptor goes to the image (a dmabuf mapped with mmap,
+  // Process/DxgBufferFile.hpp). False when that could not be done now.
+  virtual bool committed() { return true; }
 
  protected:
   GpuImage() = default;

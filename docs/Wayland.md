@@ -79,6 +79,9 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
   time: the window is marked for a repaint and the desktop comes back for it.
 - **Lifetime.** The descriptor holds a `dxgk::ExportedAllocation`, which holds the allocation: a buffer keeps showing after the client destroyed its image or
   exited, until the buffer is replaced or destroyed. Dropping the last use takes the Direct3D layer's lock, never held by anyone who drops one.
+- **CPU writes.** A client may `mmap` its dmabuf and write it with the CPU (GBM-style clients): the mapping is a copy of the image
+  ([win32k/Dxg.md](win32k/Dxg.md)); at each commit of a buffer made from it the compositor sends the copy to the image, when a writable mapping is still
+  there and a checksum says the copy changed since it was last moved, so a client that renders on the GPU is never overwritten by an old copy.
 - **Release.** As for `wl_shm`: when another buffer replaces it. The desktop reads the image while it draws (under the compositor's lock), so a client that
   re-renders a released image never races the desktop; a client that re-renders the attached image (as `tests/linux/waylandvktest.c` does) may be drawn
   half-way through a frame, as on any compositor that samples a buffer it did not release.
@@ -134,8 +137,8 @@ picture it drew last.
 - **GPU buffers.** `zwp_linux_dmabuf_v1` is version 3: no feedback objects (version 4: `get_default_feedback`, the format table, the main device),
   which newer Mesa and wlroots-based clients prefer but do not need. No `wl_drm`. Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
   pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). No explicit synchronization (`linux-drm-syncobj`, implicit fences): the
-  desktop draws what the image holds when it draws. A dmabuf cannot be mapped or read by the CPU (`mmap`, `DMA_BUF_IOCTL_SYNC`), so GBM-style clients that
-  write their buffers with the CPU cannot use one. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):
+  desktop draws what the image holds when it draws. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
+  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):
   a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
   Not run in QEMU yet (only on the CPU emulator and in the host tests, on the software renderer); not tried on virgl or a real GPU.
 - **Protocols.** No primary selection, `xdg_activation_v1`, `wp_viewporter`, `wp_fractional_scale_v1`, `wp_cursor_shape_v1`, text input,

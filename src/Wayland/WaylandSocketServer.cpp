@@ -201,7 +201,7 @@ bool SocketServer::pump() {
       SharedPointer<process::OpenObject> object;
       SharedPointer<GpuImage> image;
       const bool file = entry.kind == process::DescriptorKind::File && entry.object;
-      if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, *entry.object);
+      if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, entry.object);
       if (file && (entry.object->memory || image)) object = entry.object;
       else unsent.enqueue(util::move(entry));
       Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object), util::move(image));

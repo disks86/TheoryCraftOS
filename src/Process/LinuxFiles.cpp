@@ -771,7 +771,7 @@ uint64_t dxg_export(Process& p, uint64_t argument) {
     ObjectManager* objects = system_objects();
     allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
     SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
-    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, util::move(exported), bytes);
+    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, allocator, util::move(exported), bytes);
     if (!object || !file || !object->path.append("/dmabuf:dxg")) return error(kEnomem);
     object->gpu_buffer = file.get();
     object->file = util::move(file);
@@ -810,6 +810,23 @@ uint64_t dxg_import(Process& p, uint64_t argument) {
   put_le32(out + 20, imported.pitch);
   return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
 }
+// DMA_BUF_IOCTL_SYNC (_IOW('b', 0, struct dma_buf_sync { u64 flags })) on a GPU image's descriptor: moves the picture between the image and the CPU's copy that
+// mmap maps (DxgBufferFile.hpp). EAGAIN while the GPU still works on the image. Anything else on a file is ENOTTY.
+uint64_t dmabuf_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
+  constexpr uint32_t kDmaBufIoctlSync = 0x40086200u;
+  constexpr int64_t kEagain = 11;
+  SharedPointer<OpenObject> object = p.files().shared_object(fd);
+  if (!object || !object->gpu_buffer || uint32_t(request) != kDmaBufIoctlSync) return error(kEnotty);
+  uint8_t raw[8];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  switch (object->gpu_buffer->sync(reader.le64())) {
+    case DxgBufferFile::SyncResult::Ok: return 0;
+    case DxgBufferFile::SyncResult::Busy: return error(kEagain);
+    case DxgBufferFile::SyncResult::NoCopier: return error(kEnodev);
+    default: return error(kEinval);
+  }
+}
 }  // namespace
 
 void set_dxg_service_handler(DxgServiceHandler handler) { g_dxg_handler = handler; }
@@ -824,6 +841,7 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
+  if (kind == DescriptorKind::File) return dmabuf_ioctl(p, fd, request, argument);
   if (kind != DescriptorKind::Dxg) return error(kEnotty);
   const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)
   if (code == TCOS_DXG_IOCTL_EXPORT) return dxg_export(p, argument);

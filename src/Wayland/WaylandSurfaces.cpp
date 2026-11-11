@@ -315,6 +315,8 @@ void Server::apply(Client& c, Surface& s, State& state) {
     s.current = state.buffer;
     if (!state.damaged) full = true;      // (a new picture with no damage said: all of it)
   }
+  // a GPU picture the client may have written through a CPU mapping: those writes reach the image now (GpuImage::committed)
+  if ((state.attached || state.damaged) && s.current.image()) s.current.image()->committed();
   if (state.input_set) s.input = state.input;
   if (state.geometry_set) {
     if (!s.geometry_set || s.geometry.x != state.geometry.x || s.geometry.y != state.geometry.y) full = true;

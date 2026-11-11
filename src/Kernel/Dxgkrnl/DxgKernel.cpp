@@ -556,6 +556,7 @@ class ExportedAllocation {
  private:
   friend class Kernel;
   friend const ExportInfo& export_info(const ExportedAllocation& exported);
+  friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
   Kernel& kernel_;
   SharedPointer<Allocation> allocation_;
   Adapter& adapter_;
@@ -564,6 +565,30 @@ class ExportedAllocation {
 };
 
 const ExportInfo& export_info(const ExportedAllocation& exported) { return exported.info_; }
+
+bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image) {
+  kernel::ScopedMutex g(exported.kernel_.lock_);
+  Allocation& a = *exported.allocation_;
+  exported.adapter_.pump();
+  if (exported.adapter_.allocation_in_use(a)) return false;
+  uint64_t offset = 0, level = 0;
+  ByteView image;
+  if (!a.level_range(0, &offset, &level) || !a.writable_backing().try_subview(offset, level, &image)) return false;
+  const uint64_t n = image.size() < bytes.size() ? image.size() : bytes.size();
+  if (to_image) {
+    if (n < image.size()) {
+      if (!a.manager().read_back(a)) return false;      // (the part not given stays what the GPU has)
+    } else {
+      a.manager().discard_gpu_contents(a);
+    }
+    image.first(n).copy_from(ConstByteView(bytes.first(n)));
+    a.manager().note_cpu_write(a);
+    return true;
+  }
+  if (!a.manager().read_back(a)) return false;
+  bytes.first(n).copy_from(ConstByteView(image.first(n)));
+  return true;
+}
 
 Adapter* Kernel::adapter_of_locked(const Allocation& a) {
   for (UniquePointer<Adapter>& ad : adapters_.view())

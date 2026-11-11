@@ -36,7 +36,10 @@ ArrayView<uint32_t> pixel_words(ByteView bytes) {
 
 class DxgImage final : public GpuImage {
  public:
-  DxgImage(dxgk::Kernel& kernel, SharedPointer<dxgk::ExportedAllocation> exported) : kernel_(kernel), exported_(util::move(exported)), info_(dxgk::export_info(*exported_)) {}
+  DxgImage(dxgk::Kernel& kernel, SharedPointer<process::OpenObject> object)
+      : kernel_(kernel), object_(util::move(object)), exported_(object_->gpu_buffer->exported()), info_(dxgk::export_info(*exported_)) {}
+
+  bool committed() override { return object_->gpu_buffer->flush_cpu_writes(); }
 
   uint32_t width() const override { return info_.desc.width; }
   uint32_t height() const override { return info_.desc.height; }
@@ -89,6 +92,7 @@ class DxgImage final : public GpuImage {
 
  private:
   dxgk::Kernel& kernel_;
+  SharedPointer<process::OpenObject> object_;      // the descriptor (its DxgBufferFile has the CPU's copy, if it was mapped)
   SharedPointer<dxgk::ExportedAllocation> exported_;
   const dxgk::ExportInfo info_;
   const graphics::IRenderer2D* refused_ = nullptr;
@@ -96,9 +100,9 @@ class DxgImage final : public GpuImage {
 
 }  // namespace
 
-SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, process::OpenObject& object) {
-  if (!kernel || !object.gpu_buffer || !object.gpu_buffer->exported()) return SharedPointer<GpuImage>();
-  return SharedPointer<GpuImage>::make_as<DxgImage>(allocator, *static_cast<dxgk::Kernel*>(kernel), object.gpu_buffer->exported());
+SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
+  if (!kernel || !object || !object->gpu_buffer || !object->gpu_buffer->exported()) return SharedPointer<GpuImage>();
+  return SharedPointer<GpuImage>::make_as<DxgImage>(allocator, *static_cast<dxgk::Kernel*>(kernel), object);
 }
 
 }  // namespace wayland

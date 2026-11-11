@@ -136,6 +136,7 @@ void install_dxg() {
   register_process_exit_hook(dxg::process_exited);
   linuxabi::set_dxg_service_handler(&dxg::linux_service);
   linuxabi::set_dxg_buffer_handlers(&dxg::linux_export, &dxg::linux_import);
+  set_dxg_buffer_copier(&dxgk::copy_export);      // (mmap of a dmabuf: the CPU's copy, DxgBufferFile.hpp)
 }
 
 }  // namespace process::win32k

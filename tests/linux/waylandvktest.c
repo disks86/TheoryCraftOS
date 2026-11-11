@@ -34,7 +34,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return r;
 }
 enum { NR_READ = 0, NR_WRITE = 1, NR_CLOSE = 3, NR_LSEEK = 8, NR_IOCTL = 16, NR_DUP = 32, NR_SOCKET = 41, NR_CONNECT = 42, NR_SENDMSG = 46, NR_RECVMSG = 47,
-       NR_OPENAT = 257, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_NANOSLEEP = 35 };
+       NR_OPENAT = 257, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_NANOSLEEP = 35, NR_MMAP = 9, NR_MUNMAP = 11 };
 __asm__(".globl _start\n_start:\n  xor %ebp, %ebp\n  mov %rsp, %rdi\n  and $-16, %rsp\n  call start_c\n");
 #elif defined(__aarch64__)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -44,7 +44,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return x0;
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_LSEEK = 62, NR_IOCTL = 29, NR_DUP = 23, NR_SOCKET = 198, NR_CONNECT = 203, NR_SENDMSG = 211,
-       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101 };
+       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215 };
 __asm__(".globl _start\n_start:\n  mov x29, #0\n  mov x0, sp\n  mov x9, sp\n  and x9, x9, #-16\n  mov sp, x9\n  bl start_c\n");
 #elif defined(__riscv)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -54,7 +54,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return a0;
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_LSEEK = 62, NR_IOCTL = 29, NR_DUP = 23, NR_SOCKET = 198, NR_CONNECT = 203, NR_SENDMSG = 211,
-       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101 };
+       NR_RECVMSG = 212, NR_OPENAT = 56, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279, NR_NANOSLEEP = 101, NR_MMAP = 222, NR_MUNMAP = 215 };
 __asm__(".globl _start\n_start:\n  li s0, 0\n  mv a0, sp\n  andi sp, sp, -16\n  call start_c\n");
 #else
 #error "no runtime for this CPU"
@@ -419,6 +419,25 @@ __attribute__((used)) void start_c(long *stack) {
   CHECK(sys3(NR_LSEEK, dmabuf, 0, 2) >= (long)(W * H * 4));      /* SEEK_END: its size, as a dmabuf's */
   u8 byte;
   CHECK(sys3(NR_READ, dmabuf, &byte, 1) < 0);                     /* (the pixels are not read through the descriptor) */
+  /* the CPU's view: mmap maps a copy of the image; DMA_BUF_IOCTL_SYNC brings the GPU's pixels in (START|READ) and sends the CPU's out (END|WRITE) */
+  {
+    const unsigned long bytes = (W * H * 4 + 4095) / 4096 * 4096;
+    const long m = sys6(NR_MMAP, 0, (long)bytes, 3, 1, dmabuf, 0);      /* PROT_READ | PROT_WRITE, MAP_SHARED */
+    CHECK(m > 0 || m < -4096);
+    if (m > 0 || m < -4096) {
+      u32 *px = (u32 *)m;
+      unsigned long flags = 1;      /* DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ */
+      CHECK(sys3(NR_IOCTL, dmabuf, 0x40086200, &flags) == 0);
+      CHECK(near(px[2 * W + 2], 0xFFFF8000u));
+      px[1 * W + 1] = 0xFF0000FFu;
+      flags = 4 | 2;                /* DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE */
+      CHECK(sys3(NR_IOCTL, dmabuf, 0x40086200, &flags) == 0);
+      CHECK(pixel_of(image, 1, 1) == 0xFF0000FFu);      /* (the GPU's image has the CPU's write) */
+      flags = 0x10;
+      CHECK(sys3(NR_IOCTL, dmabuf, 0x40086200, &flags) == -22);      /* EINVAL */
+      CHECK(sys3(NR_MUNMAP, m, bytes, 0) == 0);
+    }
+  }
   /* an image that is not exportable is refused */
   VkDeviceMemory plain_memory;
   VkImage plain = make_image(0, -1, &plain_memory);

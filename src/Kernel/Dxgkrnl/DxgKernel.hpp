@@ -103,6 +103,10 @@ struct ExportInfo {
   uint32_t adapter = 0;    // the adapter's number
 };
 const ExportInfo& export_info(const ExportedAllocation& exported);
+// Copies the image of an export to `bytes`, or `bytes` to it (`to_image`): the first bytes of its memory (rows `pitch` apart), as many as both have. The work
+// queued on it is done first; false while some waits for a fence, or when the image cannot be read. (The CPU's copy of a mapped dmabuf, Process/DxgBufferFile.hpp:
+// what process::set_dxg_buffer_copier is given.)
+bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
 
 class Kernel {
  public:
@@ -219,6 +223,7 @@ class Kernel {
 
  private:
   friend class ExportedAllocation;
+  friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
   struct Process;
   struct ShareToken;
   Adapter* adapter_of_locked(const Allocation& a);

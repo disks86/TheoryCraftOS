@@ -37,6 +37,6 @@ class Kernel;
 namespace wayland {
 
 // A GpuImage for `object` when it is a GPU image of `kernel` (a dxgk::Kernel); null otherwise. (A SocketServer::MakeGpuImage.)
-SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, process::OpenObject& object);
+SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
 
 }  // namespace wayland

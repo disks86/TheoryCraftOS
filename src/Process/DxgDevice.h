@@ -43,7 +43,8 @@ typedef struct TcosDxgCall {
 /* A GPU image as a file descriptor (the counterpart of a Linux dmabuf: what a Wayland client passes in zwp_linux_buffer_params_v1.add). TCOS_DXG_IOCTL_EXPORT
  * makes one for an allocation of the process: a 2D image of one level and one sample in an 8-bit four-channel colour format, made shareable (the allocation flag
  * 1 << 7, kAllocShared). The descriptor holds the image on its own: it stays valid after the allocation is destroyed or the process exits. It can be closed,
- * duplicated, passed with SCM_RIGHTS and measured with lseek(SEEK_END), not read, written or mapped. TCOS_DXG_IOCTL_IMPORT gives the process an allocation
+ * duplicated, passed with SCM_RIGHTS, measured with lseek(SEEK_END) and mapped (a CPU copy of the image, moved with DMA_BUF_IOCTL_SYNC as on Linux), not read or
+ * written. TCOS_DXG_IOCTL_IMPORT gives the process an allocation
  * handle for the image of such a descriptor, on one of its devices (of the same adapter).
  * Both answer 0 when the service ran (its NTSTATUS in `status`; fd / allocation only on success), -EFAULT for an unreadable structure, -EBADF for a descriptor
  * that is not such an image (import), -EMFILE when the table is full (export), -ENODEV without a Direct3D layer. */

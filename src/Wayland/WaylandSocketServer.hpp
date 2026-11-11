@@ -50,7 +50,7 @@ class SocketServer {
   SocketServer& operator=(const SocketServer&) = delete;
 
   // Makes GPU images of the dmabufs clients pass (null: none; zwp_linux_dmabuf_v1 is offered while there is a maker). Set before start().
-  using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, process::OpenObject& object);
+  using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
   void set_gpu_images(MakeGpuImage make, void* context);
   // Binds the socket file (made afresh in `files`, the system's file system, where /Linux/run is). False when it could not be bound.
   bool listen(filesystem::IFileSystem& files);

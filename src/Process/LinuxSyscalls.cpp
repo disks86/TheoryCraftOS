@@ -127,16 +127,23 @@ uint64_t do_brk(Process& process, uint64_t request) {
 }
 
 // mmap() of a file in memory (memfd_create): its block is mapped as it is (MAP_SHARED), or as a copy-on-write view (MAP_PRIVATE). The pages past the
-// block's end cannot be mapped (ENXIO; Linux would map them and fault on use).
+// block's end cannot be mapped (ENXIO; Linux would map them and fault on use). A GPU image (a dmabuf of /dev/dxg) maps the CPU's copy of it the same way.
 uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   OpenObject* object = process.files().object(fd);
   if (!object) return error(kEbadf);
-  if (!object->memory) return error(kEnodev);      // (other files cannot be mapped yet)
+  if (!object->memory && !object->gpu_buffer) return error(kEnodev);      // (other files cannot be mapped yet)
   if (offset % AddressSpace::kPageSize != 0) return error(kEinval);
-  if (!object->readable || ((flags & kMapShared) && (prot & kProtWrite) && !object->writable)) return error(kEacces);
-  if ((flags & kMapShared) && (prot & kProtWrite) && (object->memory->seals() & (MemoryFile::kSealWrite | MemoryFile::kSealFutureWrite))) return error(kEperm);
-  uint64_t file_size = 0;
-  BlockRef block = object->memory->block(&file_size);
+  const bool shared_write = (flags & kMapShared) && (prot & kProtWrite);
+  BlockRef block;
+  if (object->gpu_buffer) {      // a GPU image: the CPU's copy of it (DxgBufferFile.hpp); a dmabuf is mapped for writing whatever its descriptor allows, as on Linux
+    block = object->gpu_buffer->map_block(shared_write);
+    if (!block) return error(kEnodev);
+  } else {
+    if (!object->readable || (shared_write && !object->writable)) return error(kEacces);
+    if (shared_write && (object->memory->seals() & (MemoryFile::kSealWrite | MemoryFile::kSealFutureWrite))) return error(kEperm);
+    uint64_t file_size = 0;
+    block = object->memory->block(&file_size);
+  }
   if (!block || offset >= block.get()->capacity() || size > block.get()->capacity() - offset) return error(kEnxio);
   uint64_t where = 0;
   if (flags & kMapFixed) {
