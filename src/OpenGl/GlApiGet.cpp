@@ -48,7 +48,17 @@ uint64_t GlApi::glGetError() {
 uint64_t GlApi::glGetString(GLenum name) {
   switch (name) {
     case GL_VENDOR: return client_string("TheoryCraftOS");
-    case GL_RENDERER: return client_string("TheoryCraftOS kernel GL (software)");
+    case GL_RENDERER: {
+      // (with a 3D accelerator, the draws it can take run on it: GlAccel.cpp)
+      const webgl::IAccelerator* acc = webgl::accelerator();
+      if (!acc) return client_string("TheoryCraftOS kernel GL (software)");
+      if (renderer_.empty()) {
+        renderer_.assign("TheoryCraftOS kernel GL (");
+        renderer_.append(acc->name());
+        renderer_.append(", the CPU for what it cannot draw)");
+      }
+      return client_string(renderer_.c_str());
+    }
     case GL_VERSION: return client_string(kVersionString);
     case GL_SHADING_LANGUAGE_VERSION: return client_string(kGlslVersionString);
     case GL_EXTENSIONS: {

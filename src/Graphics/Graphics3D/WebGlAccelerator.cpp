@@ -40,17 +40,35 @@ WebGlAccelerator::~WebGlAccelerator() {
 }
 
 void WebGlAccelerator::destroy_program_locked(Program& p) {
-  for (IPipeline*& pl : p.pipelines)
-    if (pl) device_.destroy_pipeline(pl);
+  for (Variant& v : p.variants)
+    if (v.pipeline) device_.destroy_pipeline(v.pipeline);
+  p.variants.clear();
   if (p.vs) device_.destroy_shader_module(p.vs);
   if (p.fs) device_.destroy_shader_module(p.fs);
-  p = Program();
+  p.vs = p.fs = nullptr;
+  p.attributes = p.varyings = p.textures = 0;
+}
+
+// What the device takes: its push constants as CONST rows, its vertex attributes, varyings and texture units.
+webgl::AccelLimits WebGlAccelerator::limits() const {
+  const DeviceInfo info = device_.info();
+  webgl::AccelLimits l;
+  const uint32_t rows = (info.max_push_constant_bytes < kMaxPushConstantBytes ? info.max_push_constant_bytes : kMaxPushConstantBytes) / 16;
+  l.const_rows = rows < 8 ? 8 : rows;
+  l.attributes = info.limits.vertex_attributes < kMaxVertexAttributes ? info.limits.vertex_attributes : kMaxVertexAttributes;
+  l.varyings = info.limits.varyings < kMaxVaryings ? info.limits.varyings : kMaxVaryings;
+  const uint32_t units = info.limits.texture_units < kMaxTextureUnits ? info.limits.texture_units : kMaxTextureUnits;
+  l.textures = units < webgl::kAccelMaxTextures ? units : webgl::kAccelMaxTextures;
+  l.blend_state = (info.features & kFeatureBlendState) != 0;
+  l.lines = (info.features & kFeatureLines) != 0;
+  return l;
 }
 
 uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
-  if (attributes == 0 || attributes > kBaseVertexAttributes || varyings > kBaseVaryings || textures > webgl::kAccelMaxTextures) return 0;
+  const webgl::AccelLimits l = limits();
+  if (attributes == 0 || attributes > l.attributes || varyings > l.varyings || textures > l.textures) return 0;
   kernel::ScopedMutex guard(lock_);
-  UniquePointer<Program> p = UniquePointer<Program>::make(allocator_);
+  UniquePointer<Program> p = UniquePointer<Program>::make(allocator_, allocator_);
   if (!p) return 0;
   ShaderModuleDesc vd;
   vd.stage = ShaderStage::Vertex;
@@ -164,9 +182,14 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   // GL's window rows are the device's rows in the same order (row 0 is the bottom of the GL window, which the device draws as its first row), so the picture is the
   // device's upside down and a counter-clockwise triangle in GL is a clockwise one for the device.
   const uint32_t cull = s.cull > 2 ? 0 : s.cull;
-  const uint32_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u);
-  IPipeline*& slot = p.pipelines[key];
-  if (slot) return slot;
+  uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u);
+  if (s.custom_blend) {
+    key |= uint64_t{1} << 6;
+    key |= uint64_t{s.src_rgb & 15} << 8 | uint64_t{s.dst_rgb & 15} << 12 | uint64_t{s.src_alpha & 15} << 16 | uint64_t{s.dst_alpha & 15} << 20;
+    key |= uint64_t{s.op_rgb & 7} << 24 | uint64_t{s.op_alpha & 7} << 27 | uint64_t{s.color_mask & 15} << 30 | uint64_t{s.depth_compare & 7} << 34;
+  }
+  for (const Variant& v : p.variants)
+    if (v.key == key) return v.pipeline;
   GraphicsPipelineDesc d;
   d.vertex_shader = p.vs;
   d.fragment_shader = p.fs;
@@ -179,9 +202,28 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   d.front_face = s.front_ccw ? FrontFace::Clockwise : FrontFace::CounterClockwise;
   d.depth_test = s.depth_test;
   d.depth_write = s.depth_write;
-  d.alpha_blend = s.blend;
-  slot = device_.create_graphics_pipeline(d);
-  return slot;
+  if (s.custom_blend) {      // (the numbers are the device's: Accelerator.hpp)
+    if (s.src_rgb > 10 || s.dst_rgb > 10 || s.src_alpha > 10 || s.dst_alpha > 10 || s.op_rgb > 4 || s.op_alpha > 4 || s.depth_compare > 7) return nullptr;
+    d.blend.custom = true;
+    d.blend.enable = s.blend;
+    d.blend.src_color = static_cast<BlendFactor>(s.src_rgb);
+    d.blend.dst_color = static_cast<BlendFactor>(s.dst_rgb);
+    d.blend.src_alpha = static_cast<BlendFactor>(s.src_alpha);
+    d.blend.dst_alpha = static_cast<BlendFactor>(s.dst_alpha);
+    d.blend.color_op = static_cast<BlendOp>(s.op_rgb);
+    d.blend.alpha_op = static_cast<BlendOp>(s.op_alpha);
+    d.blend.write_mask = s.color_mask & 15;
+    d.depth_compare = static_cast<CompareOp>(s.depth_compare);
+  } else {
+    d.alpha_blend = s.blend;
+  }
+  IPipeline* made = device_.create_graphics_pipeline(d);
+  if (!made) return nullptr;
+  if (!p.variants.push_back(Variant{key, made})) {
+    device_.destroy_pipeline(made);
+    return nullptr;
+  }
+  return made;
 }
 
 // One render pass on a target that loads what is there: a clear, or a draw.
@@ -246,6 +288,7 @@ bool WebGlAccelerator::run_pass(Target& t, bool clear_color, const Vec4& color, 
     Rect2D sc{0, 0, t.width, t.height};
     if (state->scissor) sc = Rect2D{state->sc_x, state->sc_y, state->sc_w, state->sc_h};
     commands_->set_scissor(sc);
+    if (state->topology) commands_->set_primitive_topology(state->topology == 1 ? PrimitiveTopology::LineList : PrimitiveTopology::PointList);
     commands_->draw(vertex_count);
   }
   commands_->end_render_pass();
@@ -270,6 +313,10 @@ bool WebGlAccelerator::draw(uint32_t handle, uint32_t program, const webgl::Acce
   Target* t = target_at(handle);
   Program* p = program_at(program);
   if (!t || !p || vertex_count == 0 || vertices.size() != uint64_t{vertex_count} * p->attributes * 16 || constants.size() > kMaxPushConstantBytes || constants.size() % 16) return false;
+  const DeviceInfo info = device_.info();
+  if (constants.size() > info.max_push_constant_bytes) return false;
+  if (state.topology > 2 || (state.topology && !(info.features & kFeatureLines))) return false;
+  if (state.custom_blend && !(info.features & kFeatureBlendState)) return false;
   return run_pass(*t, false, Vec4(), false, 1.0f, p, &state, vertices, vertex_count, constants);
 }
 

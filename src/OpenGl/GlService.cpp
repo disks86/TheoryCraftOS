@@ -88,6 +88,7 @@ GlStatus GlService::delete_context(uint64_t pid, uint32_t handle) {
   kernel::ScopedMutex g(p->lock);
   for (uint64_t i = 0; i < p->contexts.count(); ++i) {
     if (p->contexts[i] && p->contexts[i]->handle == handle) {
+      report(pid, *p->contexts[i]);
       p->contexts.remove_at(i);      // (the API goes before its share group: members in that order)
       return GlStatus::Ok;
     }
@@ -171,6 +172,18 @@ GlStatus GlService::execute(uint64_t pid, uint64_t thread, ConstByteView stream,
   return GlStatus::Ok;
 }
 
+void GlService::report(uint64_t pid, const Context& c) const {
+  if (!report_ || !c.api) return;
+  const webgl::GlContext::HardwareStats& stats = c.api->hardware_stats();
+  if (stats.gpu_draws || stats.cpu_draws) report_(pid, stats);
+}
+
+// The pictures the 3D hardware drew for the contexts drawing to `surface` are brought into its images (before they are shown or swapped).
+void GlService::sync_hardware(Process& p, GlSurface* surface) {
+  for (const UniquePointer<Context>& c : p.contexts)
+    if (c && c->api && c->api->surface() == surface) c->api->sync_hardware();
+}
+
 GlStatus GlService::swap(uint64_t pid, uint64_t window, uint32_t width, uint32_t height, bool do_swap, PresentFunction present, void* present_context) {
   SharedPointer<Process> p = process(pid, false);
   if (!p) return GlStatus::InvalidHandle;
@@ -180,6 +193,7 @@ GlStatus GlService::swap(uint64_t pid, uint64_t window, uint32_t width, uint32_t
     kernel::ScopedMutex g(p->lock);
     Surface* s = p->surface(window);
     if (!s) return GlStatus::InvalidHandle;
+    sync_hardware(*p, s->surface.get());
     if (do_swap) s->surface->swap();
     const webgl::Image& front = s->surface->front();
     if (present && front.defined()) {
@@ -213,6 +227,7 @@ GlStatus GlService::read_front(uint64_t pid, uint64_t window, ByteView out, uint
   kernel::ScopedMutex g(p->lock);
   Surface* s = p->surface(window);
   if (!s) return GlStatus::InvalidHandle;
+  sync_hardware(*p, s->surface.get());
   const webgl::Image& front = s->surface->front();
   *width = front.w;
   *height = front.h;
@@ -247,8 +262,24 @@ void GlService::process_exited(uint64_t pid) {
   }
   if (!gone) return;
   kernel::ScopedMutex g(gone->lock);      // (a thread still inside a call finishes first)
+  for (const UniquePointer<Context>& c : gone->contexts)
+    if (c) report(pid, *c);
   gone->contexts.clear();
   gone->surfaces.clear();
+}
+
+bool GlService::hardware_stats(uint64_t pid, uint32_t context, webgl::GlContext::HardwareStats* out, const char** accelerator) {
+  if (accelerator) {
+    const webgl::IAccelerator* acc = webgl::accelerator();
+    *accelerator = acc ? acc->name() : nullptr;
+  }
+  SharedPointer<Process> p = process(pid, false);
+  if (!p) return false;
+  kernel::ScopedMutex g(p->lock);
+  Context* c = p->find(context);
+  if (!c || !c->api) return false;
+  *out = c->api->hardware_stats();
+  return true;
 }
 
 uint32_t GlService::context_count(uint64_t pid) {

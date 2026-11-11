@@ -116,6 +116,9 @@ class GlApi {
   // The window surface drawn to (null: none, draws go nowhere and reads give nothing). The first surface a context gets sets its viewport and scissor, as GL says.
   void bind_surface(GlSurface* surface);
   GlSurface* surface() const { return surface_; }
+  // What the 3D hardware drew is brought into the surface's images (GlService, before a swap or a read of the front buffer).
+  void sync_hardware() { gl_.hw_sync(); }
+  const webgl::GlContext::HardwareStats& hardware_stats() const { return gl_.hardware_stats(); }
   // The surface changed its size or swapped: the engine's images are where the surface now has them.
   void surface_changed();
 
@@ -142,6 +145,7 @@ class GlApi {
   float depth_range_values_[2];
   struct ClientString { const char* text; uint64_t address; };
   List<ClientString> client_strings_;
+  String renderer_;      // GL_RENDERER with the 3D hardware's name in it (made at the first glGetString)
   bool compat() const { return !config_.core_profile; }
   void error(uint32_t e) { gl_.set_error(e); }
   // Reads a value array of the program (or of the display list being replayed).

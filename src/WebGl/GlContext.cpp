@@ -51,8 +51,9 @@ GlContext::~GlContext() { hw_drop(); }
 void GlContext::restore() { lost_ = false; }
 
 void GlContext::set_default_images(Image* color, Image* read, Image* depth, uint32_t width, uint32_t height) {
-  hw_drop();
-  dcolor_ = color ? color : &own_color_;
+  Image* const next = color ? color : &own_color_;
+  hw_retarget(next->w, next->h);
+  dcolor_ = next;
   dread_ = read ? read : dcolor_;
   ddepth_ = depth ? depth : &own_depth_;
   width_ = width;

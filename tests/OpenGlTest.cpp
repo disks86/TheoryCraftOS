@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <sanitizer/asan_interface.h>
 #include "OpenGl/GlApi.hpp"
 #include "OpenGl/GlService.hpp"
@@ -1636,6 +1637,125 @@ static void test_layered_rendering() {
   CHECK(glGetError() == GL_NO_ERROR);
 }
 
+// The 3D hardware path for window surfaces, with an accelerator that takes everything and "draws" a recognisable colour: fixed-function and GLSL draws go to it, the
+// picture comes back at a read of the pixels and at a swap (through GlService), and each context tells why a draw stayed on the CPU.
+struct AcceptingAccel final : webgl::IAccelerator {
+  const char* name() const override { return "test gpu"; }
+  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true}; }
+  uint32_t create_program(const char* vs, const char* fs, uint32_t, uint32_t, uint32_t) override {
+    last_vs = vs;
+    last_fs = fs;
+    return ++programs;
+  }
+  void destroy_program(uint32_t) override {}
+  uint32_t create_texture(uint32_t, uint32_t) override { return ++textures; }
+  bool write_texture(uint32_t, ConstByteView) override { return true; }
+  uint32_t create_target(uint32_t, uint32_t) override { return ++targets; }
+  void destroy_target(uint32_t) override {}
+  bool clear(uint32_t, bool, const float*, bool, float) override { drawn = false; return true; }
+  bool draw(uint32_t, uint32_t, const webgl::AccelState&, ConstByteView, uint32_t, ConstByteView) override { ++draws; drawn = true; return true; }
+  bool read_color(uint32_t, ByteView rgba) override {
+    ++reads;
+    for (uint64_t i = 0; i + 3 < rgba.size(); i += 4) { rgba[i] = drawn ? 10 : 0; rgba[i + 1] = drawn ? 200 : 0; rgba[i + 2] = drawn ? 30 : 0; rgba[i + 3] = 255; }
+    return true;
+  }
+  uint32_t programs = 0, textures = 0, targets = 0, draws = 0, reads = 0;
+  bool drawn = false;
+  std::string last_vs, last_fs;
+};
+
+static void test_hardware_path() {
+  AcceptingAccel acc;
+  webgl::set_accelerator(&acc);
+  {
+    Fixture f;
+    const char* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    CHECK(renderer && strstr(renderer, "test gpu"));
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glColor3f(1, 0, 0);
+    glBegin(GL_TRIANGLES);
+    glVertex2f(0, 0);
+    glVertex2f(64, 0);
+    glVertex2f(0, 64);
+    glEnd();
+    gl_stream_flush();
+    const webgl::GlContext::HardwareStats& st = f.api.hardware_stats();
+    if (st.cpu_draws) for (const auto& r : st.reasons) if (r.why) printf("  CPU: %s x%llu\n", r.why, static_cast<unsigned long long>(r.count));
+    CHECK(acc.draws == 1 && st.gpu_draws == 1 && st.cpu_draws == 0);
+    CHECK(near(pixel(5, 5), 10, 200, 30) && acc.reads == 1);      // (the device's picture)
+    // a draw the device cannot take: the CPU draws over the device's picture, which it read back first
+    glEnable(GL_POLYGON_STIPPLE);
+    glBegin(GL_TRIANGLES);
+    glVertex2f(0, 0);
+    glVertex2f(64, 0);
+    glVertex2f(0, 64);
+    glEnd();
+    glDisable(GL_POLYGON_STIPPLE);
+    gl_stream_flush();
+    CHECK(st.cpu_draws == 1 && strcmp(st.last_refusal, "polygon stipple") == 0);
+    // a GLSL program
+    glClear(GL_COLOR_BUFFER_BIT);
+    const GLuint p = build("#version 130\nin vec2 pos;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); }\n", "#version 130\nuniform vec4 c;\nvoid main(){ gl_FragColor = c; }\n");
+    CHECK(p != 0);
+    glUseProgram(p);
+    const float tri[6] = {-1, -1, 1, -1, -1, 1};
+    const GLint at = glGetAttribLocation(p, "pos");
+    glEnableVertexAttribArray(static_cast<GLuint>(at));
+    glVertexAttribPointer(static_cast<GLuint>(at), 2, GL_FLOAT, GL_FALSE, 0, tri);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    gl_stream_flush();
+    if (st.gpu_draws != 2) for (const auto& r : st.reasons) if (r.why) printf("  CPU: %s x%llu\n", r.why, static_cast<unsigned long long>(r.count));
+    CHECK(st.gpu_draws == 2);
+    glUseProgram(0);
+    glDeleteProgram(p);
+    glDisableVertexAttribArray(static_cast<GLuint>(at));
+  }
+  // through the service: the swap brings the device picture into the window before it shows it, and a context going away reports what it drew where
+  {
+    GlService service(g_alloc);
+    static uint64_t reported_gpu = 0;
+    reported_gpu = 0;
+    service.set_report([](uint64_t, const webgl::GlContext::HardwareStats& st) { reported_gpu += st.gpu_draws; });
+    ContextRequest r;
+    uint32_t a = 0;
+    CHECK(service.create_context(2, r, &a) == GlStatus::Ok);
+    SurfaceRequest s;
+    s.window = 0x200;
+    s.width = 8;
+    s.height = 8;
+    CHECK(service.make_current(2, 10, a, s) == GlStatus::Ok);
+    g_api = nullptr;
+    g_stream.used = 0;
+    glViewport(0, 0, 8, 8);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_TRIANGLES);
+    glVertex2f(-1, -1);
+    glVertex2f(1, -1);
+    glVertex2f(-1, 1);
+    glEnd();
+    List<uint32_t> words(g_alloc);
+    for (uint32_t i = 0; i < g_stream.used; ++i) words.push_back(g_stream.words[i]);
+    g_stream.used = 0;
+    uint64_t result = 0;
+    CHECK(service.execute(2, 10, ConstByteView(reinterpret_cast<const uint8_t*>(words.view().data()), words.count() * 4), g_memory, &result) == GlStatus::Ok);
+    struct Seen { uint8_t first[4] = {}; } seen;
+    CHECK(service.swap(2, 0x200, 8, 8, true, [](void* c, uint64_t, ConstByteView rgba, uint32_t, uint32_t) {
+      for (int i = 0; i < 4; ++i) static_cast<Seen*>(c)->first[i] = rgba[static_cast<uint64_t>(i)];
+    }, &seen) == GlStatus::Ok);
+    CHECK(seen.first[0] == 10 && seen.first[1] == 200 && seen.first[2] == 30);
+    // the next frame draws on the device again after its clear (the device target is kept across the swap)
+    const uint32_t targets = acc.targets;
+    CHECK(service.execute(2, 10, ConstByteView(reinterpret_cast<const uint8_t*>(words.view().data()), words.count() * 4), g_memory, &result) == GlStatus::Ok);
+    CHECK(acc.targets == targets);
+    CHECK(service.delete_context(2, a) == GlStatus::Ok);
+    CHECK(reported_gpu == 2);
+    service.process_exited(2);
+  }
+  webgl::set_accelerator(nullptr);
+}
+
 static void test_framebuffer_object() {
   Fixture f;
   GLuint fbo = 0, tex = 0;
@@ -1815,6 +1935,7 @@ int main() {
   test_primitive_id_and_lengths();
   test_program_resources();
   test_layered_rendering();
+  test_hardware_path();
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();

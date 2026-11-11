@@ -52,6 +52,7 @@
 #include "SystemWirelessDetails.hpp"
 #include "SystemBluetoothDetails.hpp"
 #include "BootLog.hpp"
+#include "WebGl/AccelConformance.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Desktop/Desktop.hpp"
@@ -812,6 +813,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The system's OpenGL, for every program (opengl32.dll reaches it with NtTcosOpenGl); a process's contexts and surfaces go when it ends.
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
+  system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
+    Entry e(Level::Info, "OpenGL");
+    e.text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");
+    for (const auto& r : stats.reasons)
+      if (r.why) e.text("; ").dec(r.count).text(" because of ").text(r.why);
+  });
   process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
   if (dxg_adapters > 1)
@@ -839,6 +846,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // WebGL and WebGPU draw on the 3D hardware when there is some (and on the CPU rasterizer in src/WebGl when there is not, or for a draw the hardware cannot do).
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
+  // What the GL contexts' hardware path (GLSL -> TGSI) draws on this GPU, against their CPU rasterizer (webgl::run_accel_conformance): the verdicts are in the log.
+  if (system_graphics.accelerated()) {
+    const uint32_t wrong = webgl::run_accel_conformance(shared_allocator, web_accelerator, [](void*, const webgl::AccelSceneResult& r) {
+      const bool bad = r.verdict == webgl::AccelVerdict::Differs || r.verdict == webgl::AccelVerdict::Broken;
+      Entry e(bad ? Level::Warning : r.verdict == webgl::AccelVerdict::NotTaken ? Level::Info : Level::Ok, "OpenGL");
+      e.text(r.name).text(": ");
+      switch (r.verdict) {
+        case webgl::AccelVerdict::Same: e.text("as the CPU renderer"); break;
+        case webgl::AccelVerdict::Differs:
+          e.text("differs in ").dec(r.bad_channels).text(" channels, first at ").dec(r.first_x).text(",").dec(r.first_y).text(" channel ").dec(r.first_channel).text(": ").dec(r.device_value)
+              .text(" instead of ").dec(r.cpu_value);
+          break;
+        case webgl::AccelVerdict::NotTaken: e.text("drawn on the CPU (").text(r.why ? r.why : "?").text(")"); break;
+        case webgl::AccelVerdict::Broken: e.text("failed"); break;
+      }
+    }, nullptr);
+    Entry(wrong ? Level::Warning : Level::Ok, "OpenGL").dec(wrong).text(" of ").dec(webgl::accel_scene_count()).text(" GPU conformance scene(s) wrong");
+  }
   if (gpu) {
     graphics::IRenderer2D* renderer = system_graphics.renderer_2d();
     if (!renderer) {

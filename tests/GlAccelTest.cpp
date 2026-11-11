@@ -26,6 +26,11 @@
 #include "WebGl/GlContext.hpp"
 #include "WebGl/GpuDevice.hpp"
 #include "WebGl/TgsiTranslator.hpp"
+#include "WebGl/Raster.hpp"
+#include "WebGl/AccelConformance.hpp"
+#include "TgsiMachine.hpp"
+#include <math.h>
+#include <string>
 
 using namespace webgl;
 
@@ -168,9 +173,9 @@ static void test_translate_refusals() {
     // (kFs reads a varying that this vertex shader does not write)
     CHECK(!translate(gl, a, prog, &t, &why));
     CHECK(why != nullptr);
-    // a texture lookup with an explicit level, or of a cube map
+    // a texture lookup with an explicit level is a plain one (the device's textures have one level); one with an offset, or of a cube map, is refused
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform sampler2D tex; void main() { gl_FragColor = texture2DLod(tex, vcol.xy, 1.0); }");
-    CHECK(!translate(gl, a, prog, &t, &why));
+    CHECK(translate(gl, a, prog, &t, &why));
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform samplerCube tex; void main() { gl_FragColor = textureCube(tex, vcol); }");
     CHECK(!translate(gl, a, prog, &t, &why));
     // a third sampler
@@ -192,6 +197,11 @@ static void test_translate_refusals() {
 // An accelerator that records what it was asked and "renders" a recognisable picture: every pixel is 0x80 0x40 0x20 0xFF after a draw.
 struct FakeAccel final : IAccelerator {
   const char* name() const override { return "fake"; }
+  AccelLimits limits() const override { return wide ? wide_limits : AccelLimits(); }
+  bool wide = false;      // limits of a device like virgl's: blend state, lines, more constants
+  AccelLimits wide_limits{256, 16, 14, 16, true, true};
+  uint32_t vertex_floats(uint32_t v, uint32_t attr) const { return v * last_attributes * 4 + attr * 4; }
+  float all_vertices[64 * 4 * 4] = {};
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     ++programs;
     last_program_textures = textures;
@@ -217,12 +227,13 @@ struct FakeAccel final : IAccelerator {
   }
   bool draw(uint32_t, uint32_t, const AccelState& s, ConstByteView v, uint32_t count, ConstByteView c) override {
     ++draws;
-    drawn = true;
+    if (!fail_draw) drawn = true;      // (a failed draw changed nothing)
     last_state = s;
     last_count = count;
     vertex_bytes = v.size();
     if (v.size() >= 16) memcpy(first_vertex, v.data(), 16);
     if (v.size() >= 32) memcpy(second_attr, v.data() + 16, 16);
+    memcpy(all_vertices, v.data(), v.size() < sizeof all_vertices ? v.size() : sizeof all_vertices);
     constant_bytes = c.size();
     if (c.size() >= 16) memcpy(first_const, c.data(), 16);
     return !fail_draw;
@@ -1008,10 +1019,10 @@ static void test_webgpu_refusals() {
   FakeAccel fake;
   set_accelerator(&fake);
   {
-    // a loop in the vertex shader, and reading a built-in input: both stay on the CPU
+    // a bitwise integer operator in the vertex shader: it stays on the CPU
     const char* looped =
         "struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32>, }\n"
-        "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VsOut { var o: VsOut; var s = 0.0; for (var i = 0; i < 3; i = i + 1) { s = s + 1.0; } o.pos = vec4<f32>(p, 0.0, 1.0); o.color = c; return o; }\n"
+        "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VsOut { var o: VsOut; var s = 1u; s = s ^ 3u; o.pos = vec4<f32>(p, 0.0, 1.0); o.color = c; return o; }\n"
         "@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color, 1.0); }\n";
     GpuScene sc(a, looped);
     CHECK(sc.pass(false));
@@ -1024,6 +1035,332 @@ static void test_webgpu_refusals() {
   CHECK(a.live == 0);
 }
 
+// A device with blend state and lines (virgl): GL's factors, equations, colour mask and depth function go to it as its own, lines and points are drawn as lists, and the
+// desktop's primitive restart and base vertex shape the vertices sent.
+static void test_wide_device_state() {
+  TestAllocator a;
+  FakeAccel fake;
+  fake.wide = true;
+  set_accelerator(&fake);
+  {
+    GlContext gl(a, false, 64, 64, noaa());
+    Scene sc(gl);
+    sc.setup(kVs, kFs);
+    gl.clear(0x4000 | 0x100);
+    gl.enable(0x0BE2, true);   // BLEND
+    gl.blend_func_separate(0x0306, 0x0300, 1, 0);   // DST_COLOR, SRC_COLOR / ONE, ZERO
+    gl.blend_equation_separate(0x800B, 0x8008);      // REVERSE_SUBTRACT, MAX
+    gl.color_mask(true, false, true, false);
+    gl.enable(0x0B71, true);   // DEPTH_TEST
+    gl.depth_func(0x0204);     // GREATER
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 1 && gl.get_error() == 0);
+    const AccelState& st = fake.last_state;
+    CHECK(st.custom_blend && st.blend && st.src_rgb == 6 && st.dst_rgb == 2 && st.src_alpha == 1 && st.dst_alpha == 0);
+    CHECK(st.op_rgb == 2 && st.op_alpha == 4 && st.color_mask == 5 && st.depth_compare == 4 && st.depth_test && st.topology == 0);
+    // a constant colour factor stays on the CPU
+    gl.blend_func_separate(0x8001, 0, 1, 0);   // CONSTANT_COLOR
+    gl.draw_arrays(4, 0, 3, 1);
+    CHECK(fake.draws == 1 && strcmp(gl.hardware_stats().last_refusal, "a blend factor") == 0);
+    CHECK(gl.hardware_stats().gpu_draws == 1 && gl.hardware_stats().cpu_draws == 1);
+    gl.enable(0x0BE2, false);
+    gl.color_mask(true, true, true, true);
+    gl.enable(0x0B71, false);
+    gl.clear(0x4000 | 0x100);
+    // a line loop of three vertices: three segments; points: one vertex each; the CPU's culling does not apply to them
+    gl.enable(0x0B44, true);   // CULL_FACE
+    gl.draw_arrays(2, 0, 3, 1);
+    CHECK(fake.draws == 2 && fake.last_state.topology == 1 && fake.last_count == 6 && fake.last_state.cull == 0);
+    CHECK(fake.all_vertices[fake.vertex_floats(5, 1)] == -1 && fake.all_vertices[fake.vertex_floats(4, 1)] == -1);   // (the last segment: vertex 2 back to vertex 0)
+    gl.draw_arrays(0, 0, 3, 1);
+    CHECK(fake.draws == 3 && fake.last_state.topology == 2 && fake.last_count == 3);
+    gl.enable(0x0B44, false);
+    // wide lines are the CPU's
+    gl.line_width(2);
+    gl.draw_arrays(1, 0, 2, 1);
+    CHECK(fake.draws == 3 && strcmp(gl.hardware_stats().last_refusal, "wide or stippled lines") == 0);
+    gl.line_width(1);
+    gl.clear(0x4000 | 0x100);      // (the CPU drew the wide line: the device starts over at a clear)
+    // desktop: an index the program restarts at only with restart on, and the base vertex added to the others
+    gl.desktop.active = true;
+    gl.desktop.base_vertex = 1;
+    const uint16_t indices[4] = {0, 0xFFFF, 1, 0};
+    const uint32_t eb = gl.create_buffer();
+    gl.bind_buffer(0x8893, eb);
+    gl.buffer_data(0x8893, ConstByteView(reinterpret_cast<const uint8_t*>(indices), sizeof indices), 0, 0x88E4);
+    const float verts[] = {-1, -1, 1, 0, 0, 1, -1, 0, 1, 0, -1, 1, 0, 0, 1, 1, 1, 1, 1, 1};
+    gl.bind_buffer(0x8892, 0);
+    (void)verts;
+    gl.draw_elements(0, 4, 0x1403, 0, 1);      // points; restart off: 0xFFFF is an index past the vertices, so the draw is refused for its attribute
+    CHECK(fake.draws == 3);
+    gl.desktop.primitive_restart = true;
+    gl.desktop.restart_index = 0xFFFF;
+    gl.draw_elements(0, 4, 0x1403, 0, 1);      // points 1, 2, 1 (each index plus one)
+    if (fake.draws != 4) printf("refused: %s\n", gl.hardware_stats().last_refusal);
+    CHECK(fake.draws == 4 && fake.last_count == 3);
+    CHECK(fake.all_vertices[fake.vertex_floats(0, 1)] == 1 && fake.all_vertices[fake.vertex_floats(1, 1)] == -1 && fake.all_vertices[fake.vertex_floats(2, 1)] == 1);
+    gl.desktop.active = false;
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// A whole-buffer clear runs on the device alone; the depth clear the CPU owes is done before the CPU next draws (here a draw the device cannot take).
+static void test_device_only_clear() {
+  TestAllocator a;
+  FakeAccel fake;
+  set_accelerator(&fake);
+  {
+    GlContext gl(a, false, 64, 64, noaa());
+    Scene sc(gl);
+    sc.setup(kVs, kFs);
+    gl.enable(0x0B71, true);   // DEPTH_TEST (LESS)
+    gl.enable(0x0B90, true);   // STENCIL_TEST: the CPU draws
+    gl.clear(0x4000 | 0x100);
+    gl.draw_arrays(4, 0, 3, 1);   // CPU depth 0.5 where the triangle is
+    CHECK(fake.draws == 0 && pixel(gl, 10, 10) == 0xFFFF0000u);
+    gl.enable(0x0B90, false);
+    const int reads = fake.reads;
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000 | 0x100);     // on the device only
+    CHECK(fake.clears >= 1 && fake.reads == reads && gl.hardware_drawing());
+    gl.enable(0x0B90, true);
+    gl.draw_arrays(4, 0, 3, 1);   // the CPU again: its depth was cleared to 1 first, so the triangle passes LESS
+    CHECK(fake.reads == reads + 1);   // (the device's cleared picture came back first)
+    CHECK(pixel(gl, 10, 10) == 0xFFFF0000u && pixel(gl, 55, 55) == 0xFF000000u);
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
+// --- The translated shaders run as the CPU runs the GLSL --------------------------------------------------------------------------------------------------
+// A reference "device": the TGSI the translator wrote is run by the test interpreter (tests/TgsiMachine.hpp), on the CPU rasterizer of src/WebGl, with the state
+// of AccelState. A scene drawn by it and by the CPU path must give the same picture, which checks the translation (and GlAccel's packing of the inputs).
+struct TgsiAccel final : IAccelerator {
+  struct Prog { std::string vs, fs; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; };
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; };
+  struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
+  std::vector<Prog> progs;
+  std::vector<Tex> texs;
+  std::vector<Tgt> tgts;
+  int draws = 0, refused = 0;
+  const char* name() const override { return "tgsi reference"; }
+  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true}; }
+  uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
+    Prog p;
+    p.vs = vs;
+    p.fs = fs;
+    p.attributes = attributes;
+    p.varyings = varyings;
+    p.textures = textures;
+    size_t at = 0;
+    while ((at = p.fs.find("DCL IN[", at)) != std::string::npos) {
+      const int i = atoi(p.fs.c_str() + at + 7);
+      const size_t eol = p.fs.find('\n', at);
+      const std::string line = p.fs.substr(at, eol - at);
+      if (line.find("CONSTANT") != std::string::npos && line.find("GENERIC") != std::string::npos && i < 16) p.flat[i] = true;
+      if (line.find("POSITION") != std::string::npos) p.position = i;
+      if (line.find("FACE") != std::string::npos) p.face = i;
+      at = eol;
+    }
+    progs.push_back(p);
+    return static_cast<uint32_t>(progs.size());
+  }
+  void destroy_program(uint32_t) override {}
+  uint32_t create_texture(uint32_t w, uint32_t h) override {
+    texs.push_back(Tex{w, h, std::vector<uint8_t>(uint64_t{w} * h * 4)});
+    return static_cast<uint32_t>(texs.size());
+  }
+  bool write_texture(uint32_t t, ConstByteView rgba) override {
+    Tex& x = texs.at(t - 1);
+    if (rgba.size() != x.rgba.size()) return false;
+    memcpy(x.rgba.data(), rgba.data(), rgba.size());
+    return true;
+  }
+  uint32_t create_target(uint32_t w, uint32_t h) override {
+    tgts.push_back(Tgt{w, h, std::vector<uint8_t>(uint64_t{w} * h * 4), std::vector<float>(uint64_t{w} * h, 1.0f)});
+    return static_cast<uint32_t>(tgts.size());
+  }
+  void destroy_target(uint32_t) override {}
+  bool clear(uint32_t t, bool color, const float rgba[4], bool depth, float d) override {
+    Tgt& g = tgts.at(t - 1);
+    for (uint64_t i = 0; i < uint64_t{g.w} * g.h; ++i) {
+      if (color)
+        for (int k = 0; k < 4; ++k) g.rgba[i * 4 + k] = to8(rgba[k]);
+      if (depth) g.depth[i] = d;
+    }
+    return true;
+  }
+  static uint8_t to8(float v) { return !(v > 0) ? 0 : (v >= 1 ? 255 : static_cast<uint8_t>(v * 255.0f + 0.5f)); }
+  struct Sampling final : graphics::ITextureSet {
+    const TgsiAccel* acc = nullptr;
+    const AccelState* st = nullptr;
+    graphics::Vec4 sample(uint32_t unit, float u, float v) const override {
+      const Tex& t = acc->texs.at(st->textures[unit] - 1);
+      const AccelSampler& sm = st->samplers[unit];
+      auto texel = [&](int x, int y, int k) {
+        const auto wrap = [](int i, int n, bool repeat) { return repeat ? ((i % n) + n) % n : (i < 0 ? 0 : (i >= n ? n - 1 : i)); };
+        x = wrap(x, static_cast<int>(t.w), sm.repeat_s);
+        y = wrap(y, static_cast<int>(t.h), sm.repeat_t);
+        return t.rgba[(uint64_t(y) * t.w + uint64_t(x)) * 4 + k] / 255.0f;
+      };
+      float r[4];
+      const float fx = u * static_cast<float>(t.w), fy = v * static_cast<float>(t.h);
+      for (int k = 0; k < 4; ++k) {
+        if (!sm.linear) {
+          r[k] = texel(static_cast<int>(floorf(fx)), static_cast<int>(floorf(fy)), k);
+        } else {
+          const float x = fx - 0.5f, y = fy - 0.5f, x0 = floorf(x), y0 = floorf(y), ax = x - x0, ay = y - y0;
+          const int ix = static_cast<int>(x0), iy = static_cast<int>(y0);
+          r[k] = (texel(ix, iy, k) * (1 - ax) + texel(ix + 1, iy, k) * ax) * (1 - ay) + (texel(ix, iy + 1, k) * (1 - ax) + texel(ix + 1, iy + 1, k) * ax) * ay;
+        }
+      }
+      return {r[0], r[1], r[2], r[3]};
+    }
+  };
+  struct Pixels final : gpu::IFragmentSink {
+    TgsiAccel* acc;
+    Tgt* t;
+    const Prog* p;
+    const AccelState* st;
+    const float* constants;
+    uint32_t const_rows;
+    Sampling sampling;
+    bool ok = true;
+    void fragment(const gpu::Fragment& f) override {
+      if (f.x < 0 || f.y < 0 || static_cast<uint32_t>(f.x) >= t->w || static_cast<uint32_t>(f.y) >= t->h) return;
+      static tgsi_test::TgsiMachine m;
+      m = tgsi_test::TgsiMachine();
+      for (uint32_t r = 0; r < const_rows; ++r)
+        for (int k = 0; k < 4; ++k) m.cst[r][k] = constants[r * 4 + k];
+      for (uint32_t i = 0; i < p->varyings; ++i)
+        for (int k = 0; k < 4; ++k) m.in[i][k] = f.varyings[i * 4 + k];
+      if (p->position >= 0)
+        for (int k = 0; k < 4; ++k) m.in[p->position][k] = f.coord[k];
+      if (p->face >= 0) m.in[p->face][0] = m.in[p->face][1] = m.in[p->face][2] = m.in[p->face][3] = f.front ? 1.0f : -1.0f;
+      m.textures = &sampling;
+      if (!m.run(p->fs)) { ok = false; return; }
+      if (m.killed) return;
+      const uint64_t at = uint64_t(f.y) * t->w + uint64_t(f.x);
+      if (st->depth_test) {
+        const float d = t->depth[at];
+        const uint8_t op = st->custom_blend ? st->depth_compare : 3;
+        const bool pass = op == 0 ? false : op == 1 ? f.z < d : op == 2 ? f.z == d : op == 3 ? f.z <= d : op == 4 ? f.z > d : op == 5 ? f.z != d : op == 6 ? f.z >= d : true;
+        if (!pass) return;
+      }
+      if (st->depth_write) t->depth[at] = f.z;
+      float src[4], dst[4];
+      for (int k = 0; k < 4; ++k) {
+        src[k] = m.out[0][k] < 0 ? 0 : (m.out[0][k] > 1 ? 1 : m.out[0][k]);
+        dst[k] = t->rgba[at * 4 + k] / 255.0f;
+      }
+      float res[4] = {src[0], src[1], src[2], src[3]};
+      if (st->blend) {
+        const auto factor = [&](uint8_t fct, int k) {
+          switch (fct) {
+            case 0: return 0.0f;
+            case 1: return 1.0f;
+            case 2: return src[k];
+            case 3: return 1 - src[k];
+            case 4: return src[3];
+            case 5: return 1 - src[3];
+            case 6: return dst[k];
+            case 7: return 1 - dst[k];
+            case 8: return dst[3];
+            case 9: return 1 - dst[3];
+            default: return k == 3 ? 1.0f : (src[3] < 1 - dst[3] ? src[3] : 1 - dst[3]);
+          }
+        };
+        for (int k = 0; k < 4; ++k) {
+          const bool alpha = k == 3;
+          const uint8_t sf = st->custom_blend ? (alpha ? st->src_alpha : st->src_rgb) : 4, df = st->custom_blend ? (alpha ? st->dst_alpha : st->dst_rgb) : 5;
+          const uint8_t op = st->custom_blend ? (alpha ? st->op_alpha : st->op_rgb) : 0;
+          const float s = src[k] * factor(sf, k), d = dst[k] * factor(df, k);
+          res[k] = op == 0 ? s + d : op == 1 ? s - d : op == 2 ? d - s : op == 3 ? (src[k] < dst[k] ? src[k] : dst[k]) : (src[k] > dst[k] ? src[k] : dst[k]);
+        }
+      }
+      const uint8_t mask = st->custom_blend ? st->color_mask : 15;
+      for (int k = 0; k < 4; ++k)
+        if (mask & (1 << k)) t->rgba[at * 4 + k] = to8(res[k]);
+    }
+  };
+  bool draw(uint32_t target, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) override {
+    ++draws;
+    Tgt& t = tgts.at(target - 1);
+    const Prog& p = progs.at(program - 1);
+    const float* vf = reinterpret_cast<const float*>(vertices.data());
+    const float* cf = reinterpret_cast<const float*>(constants.data());
+    const uint32_t rows = static_cast<uint32_t>(constants.size() / 16);
+    std::vector<gpu::RVertex> vs(count);
+    for (uint32_t v = 0; v < count; ++v) {
+      tgsi_test::TgsiMachine m;
+      for (uint32_t r = 0; r < rows; ++r)
+        for (int k = 0; k < 4; ++k) m.cst[r][k] = cf[r * 4 + k];
+      for (uint32_t a = 0; a < p.attributes; ++a)
+        for (int k = 0; k < 4; ++k) m.in[a][k] = vf[(v * p.attributes + a) * 4 + k];
+      if (!m.run(p.vs)) { if (getenv("TGSI_TRACE")) printf("%s\n", p.vs.c_str()); ++refused; return false; }
+      for (int k = 0; k < 4; ++k) vs[v].pos[k] = m.out[0][k];
+      for (uint32_t i = 0; i < p.varyings; ++i)
+        for (int k = 0; k < 4; ++k) vs[v].var[i * 4 + k] = m.out[1 + i][k];
+    }
+    gpu::RasterState rs;
+    rs.vp_x = static_cast<int32_t>(st.vp_x);
+    rs.vp_y = static_cast<int32_t>(st.vp_y);
+    rs.vp_w = static_cast<int32_t>(st.vp_w);
+    rs.vp_h = static_cast<int32_t>(st.vp_h);
+    rs.depth_near = st.depth_near;
+    rs.depth_far = st.depth_far;
+    rs.target_w = static_cast<int32_t>(t.w);
+    rs.target_h = static_cast<int32_t>(t.h);
+    if (st.scissor) { rs.sc_x = st.sc_x; rs.sc_y = st.sc_y; rs.sc_w = static_cast<int32_t>(st.sc_w); rs.sc_h = static_cast<int32_t>(st.sc_h); }
+    else { rs.sc_x = rs.sc_y = 0; rs.sc_w = static_cast<int32_t>(t.w); rs.sc_h = static_cast<int32_t>(t.h); }
+    rs.cull = st.cull;
+    rs.front_ccw = st.front_ccw;
+    rs.nvar = p.varyings * 4;
+    rs.clip_z_zero_to_one = true;
+    for (uint32_t i = 0; i < p.varyings && i < 16; ++i)
+      for (int k = 0; k < 4; ++k) rs.flat[i * 4 + k] = p.flat[i];
+    Pixels px;
+    px.acc = this;
+    px.t = &t;
+    px.p = &p;
+    px.st = &st;
+    px.constants = cf;
+    px.const_rows = rows;
+    px.sampling.acc = this;
+    px.sampling.st = &st;
+    if (st.topology == 0) for (uint32_t v = 0; v + 2 < count; v += 3) gpu::draw_triangle(rs, vs[v], vs[v + 1], vs[v + 2], px);
+    else if (st.topology == 1) for (uint32_t v = 0; v + 1 < count; v += 2) gpu::draw_line(rs, vs[v], vs[v + 1], px);
+    else for (uint32_t v = 0; v < count; ++v) gpu::draw_point(rs, vs[v], px);
+    if (!px.ok) { if (getenv("TGSI_TRACE")) printf("%s\n", p.fs.c_str()); ++refused; }
+    return px.ok;
+  }
+  bool read_color(uint32_t target, ByteView rgba) override {
+    Tgt& t = tgts.at(target - 1);
+    if (rgba.size() != t.rgba.size()) return false;
+    memcpy(rgba.data(), t.rgba.data(), t.rgba.size());
+    return true;
+  }
+};
+
+// The conformance scenes of src/WebGl/AccelConformance.cpp on the reference device: each must draw on it, and as the CPU does.
+static void test_translated_shaders_match_the_cpu() {
+  TestAllocator a;
+  TgsiAccel ref;
+  struct Seen { int scenes = 0; } seen;
+  const uint32_t wrong = run_accel_conformance(a, ref, [](void* c, const AccelSceneResult& r) {
+    ++static_cast<Seen*>(c)->scenes;
+    if (r.verdict == AccelVerdict::Same && r.drawn_pixels >= 100) return;
+    printf("FAILED scene \"%s\": verdict %d (%s), %u channels differ, first at (%u, %u) channel %u: cpu %d, device %d; %u pixels drawn\n", r.name, static_cast<int>(r.verdict),
+           r.why ? r.why : "-", r.bad_channels, r.first_x, r.first_y, r.first_channel, r.cpu_value, r.device_value, r.drawn_pixels);
+    ++g_failed;
+  }, &seen);
+  CHECK(wrong == 0 && seen.scenes == static_cast<int>(accel_scene_count()) && seen.scenes >= 23);
+  CHECK(ref.refused == 0);
+  CHECK(accelerator() == nullptr);      // (put back as it was)
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_translate_basic();
   test_translate_matrix_and_functions();
@@ -1033,6 +1370,9 @@ int main() {
   test_device_textures();
   test_hardware_draw_and_readback();
   test_fallbacks();
+  test_wide_device_state();
+  test_device_only_clear();
+  test_translated_shaders_match_the_cpu();
   test_refused_program_and_failed_draw();
   test_uniforms_and_depth();
   test_no_accelerator();
