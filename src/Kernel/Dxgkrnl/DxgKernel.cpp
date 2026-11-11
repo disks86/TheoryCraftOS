@@ -537,6 +537,143 @@ NtStatus Kernel::close_share(ProcessId pid, uint32_t token) {
   return status::kNotFound;
 }
 
+// --- Exports (Linux dmabufs) -----------------------------------------------------------------------------------------------------------------------------------
+
+class ExportedAllocation {
+ public:
+  ExportedAllocation(Kernel& kernel, SharedPointer<Allocation> allocation, Adapter& adapter, const ExportInfo& info)
+      : kernel_(kernel), allocation_(util::move(allocation)), adapter_(adapter), info_(info) {}
+  // What the kernel's readers still hold is given back, and the allocation let go, under the kernel's lock (the video memory manager is not safe without it).
+  ~ExportedAllocation() {
+    kernel::ScopedMutex g(kernel_.lock_);
+    for (; reads_; --reads_) allocation_->manager().lock_released(*allocation_);
+    for (; acquires_; --acquires_) allocation_->manager().unpin(*allocation_);
+    allocation_.reset();
+  }
+  ExportedAllocation(const ExportedAllocation&) = delete;
+  ExportedAllocation& operator=(const ExportedAllocation&) = delete;
+
+ private:
+  friend class Kernel;
+  friend const ExportInfo& export_info(const ExportedAllocation& exported);
+  Kernel& kernel_;
+  SharedPointer<Allocation> allocation_;
+  Adapter& adapter_;
+  const ExportInfo info_;
+  uint32_t reads_ = 0, acquires_ = 0;      // (under the kernel's lock)
+};
+
+const ExportInfo& export_info(const ExportedAllocation& exported) { return exported.info_; }
+
+Adapter* Kernel::adapter_of_locked(const Allocation& a) {
+  for (UniquePointer<Adapter>& ad : adapters_.view())
+    if (&ad->vidmm() == &a.manager()) return ad.get();
+  return nullptr;
+}
+
+namespace {
+// The formats a compositor takes: 8 bits a channel, four channels.
+bool exportable_format(Format f) {
+  return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || f == Format::A8R8G8B8Srgb || f == Format::A8B8G8R8Srgb;
+}
+}  // namespace
+
+NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out) {
+  SharedPointer<ExportedAllocation> made;
+  {
+    kernel::ScopedMutex g(lock_);
+    Process* p = find_process(pid);
+    AllocRec* rec = p ? p->allocations.raw(allocation) : nullptr;
+    if (!rec) return status::kInvalidHandle;
+    const Allocation& a = *rec->allocation;
+    const AllocationDesc& d = a.desc();
+    if (!(d.flags & kAllocShared)) return status::kAccessDenied;
+    if (!a.is_image() || a.is_depth() || a.is_staging() || d.samples != 1 || d.mip_levels != 1 || d.kind != graphics::TextureKind::Texture2D || d.layers > 1 || d.heap != 0 ||
+        !exportable_format(d.format))
+      return status::kNotSupported;
+    Adapter* adapter = adapter_of_locked(a);
+    if (!adapter) return status::kInvalidDeviceState;
+    ExportInfo info;
+    info.desc = d;
+    info.pitch = a.pitch();
+    info.bytes = a.backing().size();
+    info.adapter = adapter->index();
+    made = SharedPointer<ExportedAllocation>::make(allocator_, *this, rec->allocation, *adapter, info);
+    if (!made) return status::kNoMemory;
+  }
+  *out = util::move(made);      // (with the lock let go: what *out held before may have been the last use of another export)
+  return status::kSuccess;
+}
+
+NtStatus Kernel::import_allocation(ProcessId pid, Handle device, const ExportedAllocation& exported, Handle* allocation, AllocationDesc* desc) {
+  if (&exported.kernel_ != this) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  DeviceObject* d = p ? p->devices.raw(device) : nullptr;
+  if (!d) return status::kInvalidHandle;
+  if (&exported.allocation_->manager() != &d->adapter().vidmm()) return status::kInvalidParameter;   // (another adapter's memory)
+  SharedPointer<AllocRec> rec = SharedPointer<AllocRec>::make(allocator_);
+  if (!rec) return status::kNoMemory;
+  rec->allocation = exported.allocation_;
+  rec->device = device;
+  *allocation = p->allocations.insert(rec);
+  if (desc) *desc = exported.info_.desc;
+  return *allocation ? status::kSuccess : status::kInsufficientResources;
+}
+
+NtStatus Kernel::read_export(ExportedAllocation& exported, LockResult* out) {
+  if (&exported.kernel_ != this) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  Allocation& a = *exported.allocation_;
+  exported.adapter_.pump();
+  if (exported.adapter_.allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+  if (!a.manager().read_back(a)) return status::kInvalidDeviceState;
+  uint64_t offset = 0, bytes = 0;
+  ByteView data;
+  if (!a.level_range(0, &offset, &bytes) || !a.writable_backing().try_subview(offset, bytes, &data)) return status::kInvalidDeviceState;
+  a.manager().lock_taken(a);
+  ++exported.reads_;
+  out->data = data;
+  out->pitch = exported.info_.pitch;
+  return status::kSuccess;
+}
+
+NtStatus Kernel::end_read_export(ExportedAllocation& exported) {
+  if (&exported.kernel_ != this) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  if (!exported.reads_) return status::kInvalidDeviceState;
+  exported.allocation_->manager().lock_released(*exported.allocation_);
+  --exported.reads_;
+  return status::kSuccess;
+}
+
+NtStatus Kernel::acquire_export_image(ExportedAllocation& exported, AcquiredImage* out) {
+  if (&exported.kernel_ != this || !out) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  Allocation& a = *exported.allocation_;
+  if (!(a.desc().flags & kAllocTexture) || !(a.desc().flags & kAllocRenderTarget)) return status::kNotSupported;
+  if (a.lock_count() != exported.reads_) return status::kInvalidDeviceState;      // (the CPU of a process has it locked: its picture may be half written)
+  exported.adapter_.pump();
+  if (exported.adapter_.allocation_in_use(a)) return status::kGraphicsAllocationBusy;
+  const NtStatus s = a.manager().make_resident(a);
+  if (s != status::kSuccess) return s;
+  if (!a.image()) return status::kInvalidDeviceState;
+  a.manager().pin(a);
+  ++exported.acquires_;
+  out->device = &exported.adapter_.device();
+  out->image = a.image();
+  return status::kSuccess;
+}
+
+NtStatus Kernel::release_export_image(ExportedAllocation& exported) {
+  if (&exported.kernel_ != this) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  if (!exported.acquires_) return status::kInvalidDeviceState;
+  exported.allocation_->manager().unpin(*exported.allocation_);
+  --exported.acquires_;
+  return status::kSuccess;
+}
+
 NtStatus Kernel::lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t subresource, LockResult* out) {
   kernel::ScopedMutex g(lock_);
   Process* p = find_process(pid);

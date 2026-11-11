@@ -19,6 +19,8 @@
 #include "Process/LinuxFiles.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/DxgDevice.h"
+#include "Process/MemoryFile.hpp"
+#include "Process/Objects.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace process::linuxabi {
@@ -207,6 +209,11 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
   }
   OpenObject* object = p.files().object(fd);
   DirectoryEntry entry;
+  if (object->memory || object->gpu_buffer) {      // (a file in memory or a GPU image has no path to look at: a regular file of its size)
+    entry.size = object->file->size();
+    *m = meta_of(entry, object->path.view());
+    return 0;
+  }
   const Status status = p.files().stat_object(*object, &entry);
   if (status != Status::Ok) return static_cast<int64_t>(errno_of(status));
   *m = meta_of(entry, object->path.view());
@@ -609,7 +616,53 @@ uint64_t sys_ftruncate(Process& p, uint64_t fd, uint64_t length) {
   if (files.kind(fd) != DescriptorKind::File) return error(kEinval);
   OpenObject& object = *files.object(fd);
   if (!object.writable) return error(kEinval);
-  return errno_of_or_zero(files.resize(object, length));
+  const Status status = files.resize(object, length);
+  if (object.memory && status == Status::AccessDenied) return error(kEperm);      // (a seal forbids it)
+  return errno_of_or_zero(status);
+}
+
+// memfd_create(name, flags): a file in memory (MemoryFile.hpp), named "memfd:<name>" in /proc's style; MFD_CLOEXEC 1, MFD_ALLOW_SEALING 2 (hugetlb and the
+// exec flags are refused).
+uint64_t sys_memfd_create(Process& p, uint64_t name, uint64_t flags) {
+  constexpr uint64_t kCloexec = 1, kAllowSealing = 2, kNoexecSeal = 8, kExec = 0x10;
+  if (flags & ~(kCloexec | kAllowSealing | kNoexecSeal | kExec)) return error(kEinval);
+  char text[250] = {};
+  uint64_t length = 0;
+  for (; length < sizeof(text) - 1; ++length) {      // (the name is up to 249 bytes, as on Linux)
+    uint8_t c = 0;
+    if (!p.read_user(name + length, ByteView(&c, 1))) return error(kEfault);
+    if (c == 0) break;
+    text[length] = static_cast<char>(c);
+  }
+  if (length == sizeof(text) - 1) return error(kEinval);
+  ProcessFiles& files = p.files();
+  // the bytes outlive the process when they are passed on (SCM_RIGHTS): they come from the system's allocator when there is one
+  ObjectManager* objects = system_objects();
+  allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
+  SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
+  if (!object) return error(kEnomem);
+  UniquePointer<MemoryFile> file = UniquePointer<MemoryFile>::make(allocator, allocator, (flags & kAllowSealing) != 0);
+  if (!file || !object->path.append("/memfd:") || !object->path.append(StringView(text, length))) return error(kEnomem);
+  object->memory = file.get();
+  object->file = util::move(file);
+  object->readable = object->writable = true;
+  const int64_t fd = files.install(DescriptorKind::File, object, 0);
+  if (fd < 0) return error(kEmfile);
+  files.set_close_on_exec(uint64_t(fd), (flags & kCloexec) != 0);
+  return uint64_t(fd);
+}
+
+// fallocate(fd, mode, offset, length): makes room in a file in memory (mode 0); other files and modes are not supported (glibc's posix_fallocate then
+// writes the zeros itself).
+uint64_t sys_fallocate(Process& p, uint64_t fd, uint64_t mode, uint64_t offset, uint64_t length) {
+  ProcessFiles& files = p.files();
+  if (files.kind(fd) == DescriptorKind::Closed) return error(kEbadf);
+  OpenObject* object = files.object(fd);
+  if (int64_t(offset) < 0 || int64_t(length) <= 0) return error(kEinval);
+  if (!object || !object->memory || mode != 0) return error(kEopnotsupp);
+  if (!object->writable) return error(kEbadf);
+  const Status status = object->memory->allocate(offset, length);
+  return status == Status::AccessDenied ? error(kEperm) : errno_of_or_zero(status);      // (a seal forbids growing)
 }
 
 uint64_t sys_fsync(Process& p, uint64_t fd) {
@@ -667,6 +720,14 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
     case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
       if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
       return 0;
+    case 1033:     // F_ADD_SEALS / F_GET_SEALS: files in memory (memfd_create) only
+    case 1034: {
+      OpenObject* object = files.object(fd);
+      if (!object || !object->memory) return error(kEinval);
+      if (command == 1034) return object->memory->seals();
+      if (!object->writable) return error(kEperm);
+      return object->memory->add_seals(uint32_t(argument)) ? 0 : error(kEperm);
+    }
     default: return error(kEinval);
   }
 }
@@ -684,16 +745,90 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path) {
 
 namespace {
 DxgServiceHandler g_dxg_handler = nullptr;      // set once at boot, before any process runs (install_dxg)
+DxgExportHandler g_dxg_export = nullptr;
+DxgImportHandler g_dxg_import = nullptr;
+
+void put_le32(uint8_t* at, uint32_t v) {
+  for (int i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
+}
+
+// TCOS_DXG_IOCTL_EXPORT: a descriptor (a File-kind object whose file is a DxgBufferFile) for an allocation's export.
+uint64_t dxg_export(Process& p, uint64_t argument) {
+  uint8_t raw[16];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t allocation = reader.le32(), flags = reader.le32();
+  if (flags & ~uint32_t(TCOS_DXG_EXPORT_CLOEXEC)) return error(kEinval);
+  if (!g_dxg_export) return error(kEnodev);
+  SharedPointer<dxgk::ExportedAllocation> exported;
+  uint64_t bytes = 0;
+  uint32_t status = 0;
+  if (!g_dxg_export(p, allocation, &exported, &bytes, &status)) return error(kEnodev);
+  int64_t fd = -1;
+  if (exported) {
+    // (the object outlives the process when it is passed on: it comes from the system's allocator when there is one, as a memfd's does)
+    ProcessFiles& files = p.files();
+    ObjectManager* objects = system_objects();
+    allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
+    SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
+    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, util::move(exported), bytes);
+    if (!object || !file || !object->path.append("/dmabuf:dxg")) return error(kEnomem);
+    object->gpu_buffer = file.get();
+    object->file = util::move(file);
+    object->readable = true;
+    fd = files.install(DescriptorKind::File, object, 0);
+    if (fd < 0) return error(kEmfile);
+    files.set_close_on_exec(uint64_t(fd), (flags & TCOS_DXG_EXPORT_CLOEXEC) != 0);
+  }
+  uint8_t out[8];
+  put_le32(out, uint32_t(int32_t(fd)));
+  put_le32(out + 4, status);
+  if (p.write_user(argument + 8, ConstByteView(out, sizeof(out)))) return 0;
+  if (fd >= 0) p.files().close(uint64_t(fd));
+  return error(kEfault);
+}
+
+// TCOS_DXG_IOCTL_IMPORT: an allocation handle of the process for the image of a descriptor.
+uint64_t dxg_import(Process& p, uint64_t argument) {
+  uint8_t raw[32];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t fd = reader.le32(), device = reader.le32();
+  if (p.descriptor(fd) != DescriptorKind::File) return error(kEbadf);
+  SharedPointer<OpenObject> object = p.files().shared_object(fd);      // (held: another thread may close the descriptor meanwhile)
+  if (!object || !object->gpu_buffer || !object->gpu_buffer->exported()) return error(kEbadf);
+  if (!g_dxg_import) return error(kEnodev);
+  DxgImported imported;
+  uint32_t status = 0;
+  if (!g_dxg_import(p, device, *object->gpu_buffer->exported(), &imported, &status)) return error(kEnodev);
+  uint8_t out[24];
+  put_le32(out, imported.allocation);
+  put_le32(out + 4, status);
+  put_le32(out + 8, imported.width);
+  put_le32(out + 12, imported.height);
+  put_le32(out + 16, imported.format);
+  put_le32(out + 20, imported.pitch);
+  return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+}
 }  // namespace
 
 void set_dxg_service_handler(DxgServiceHandler handler) { g_dxg_handler = handler; }
+void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler) {
+  g_dxg_export = export_handler;
+  g_dxg_import = import_handler;
+}
 
-// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h). Everything else, and ioctl on other descriptors, is ENOTTY.
+// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h); TCOS_DXG_IOCTL_EXPORT / IMPORT make and open GPU images as descriptors. Everything else,
+// and ioctl on other descriptors, is ENOTTY.
 uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
-  if (kind != DescriptorKind::Dxg || uint32_t(request) != TCOS_DXG_IOCTL_CALL) return error(kEnotty);      // (the request is an unsigned int: the upper half is not part of it)
+  if (kind != DescriptorKind::Dxg) return error(kEnotty);
+  const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)
+  if (code == TCOS_DXG_IOCTL_EXPORT) return dxg_export(p, argument);
+  if (code == TCOS_DXG_IOCTL_IMPORT) return dxg_import(p, argument);
+  if (code != TCOS_DXG_IOCTL_CALL) return error(kEnotty);
   // TcosDxgCall: service (4), status (4), params (8)
   uint8_t raw[16];
   if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);

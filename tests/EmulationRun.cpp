@@ -40,6 +40,20 @@
 #include "Process/UnixSockets.hpp"
 #include "X11/X11SocketServer.hpp"
 #endif
+#ifdef TCOS_EMU_WAYLAND
+#include <map>
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Process/UnixSockets.hpp"
+#include "Wayland/WaylandSocketServer.hpp"
+#endif
+// With both -DTCOS_EMU_WAYLAND and -DTCOS_EMU_DXG the compositor also takes GPU buffers (zwp_linux_dmabuf_v1: dmabufs of /dev/dxg), and the stand-in desktop
+// draws every other round with a 2D renderer on the adapter's device (the image sampled in place), the others on the CPU. tests/wayland_dmabuf_emulated.sh.
+#if defined(TCOS_EMU_WAYLAND) && defined(TCOS_EMU_DXG)
+#define TCOS_EMU_DMABUF 1
+#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
+#include "Graphics/Graphics3D/LockedDevice.hpp"
+#include "Wayland/Dxg/WaylandDxgImage.hpp"
+#endif
 using namespace emulation;
 
 // With -DTCOS_EMU_DXG the program also has the kernel's Direct3D: win32k with the NtGdiDdDDI* services over a dxgk::Kernel that has one adapter, the software renderer (the
@@ -136,11 +150,17 @@ int main(int argc, char** argv) {
 #ifdef TCOS_EMU_DXG
   FakeScreen screen(640, 480);
   graphics::SoftwareDevice device(a, &screen);
+#ifdef TCOS_EMU_DMABUF
+  graphics::LockedDevice shared_device(device);      // (the program's thread and the desktop's both draw on it)
+  graphics::IGraphicsDevice& adapter_device = shared_device;
+#else
+  graphics::IGraphicsDevice& adapter_device = device;
+#endif
   dxgk::Kernel dxkernel(a);
   dxgk::AdapterConfig adapter_config;
   adapter_config.display = &screen;
   adapter_config.local_memory_budget = 256ull << 20;
-  dxkernel.add_adapter(device, adapter_config);
+  dxkernel.add_adapter(adapter_device, adapter_config);
   dxgk::set_system_kernel(&dxkernel);
   process::win32k::install();
   process::win32k::install_dxg();
@@ -168,6 +188,55 @@ int main(int argc, char** argv) {
     }
   });
 #endif
+#ifdef TCOS_EMU_WAYLAND
+  // With -DTCOS_EMU_WAYLAND the kernel's Wayland compositor listens for the program at /run/user/0/wayland-0 of the Linux tree, on a thread of its own
+  // as in the kernel; a stand-in desktop draws the windows (which answers their frame callbacks) and notes the framed ones' titles and a pixel of each.
+  wayland::Server wl_server(a);
+  wl_server.attach(4, 24);
+  wayland::SocketServer wl_sockets(wl_server, *process::system_unix_sockets(), a);
+#ifdef TCOS_EMU_DMABUF
+  wl_sockets.set_gpu_images(&wayland::make_dxg_image, &dxkernel);
+  std::atomic<int> wl_gpu_draws{0}, wl_cpu_draws{0};
+#endif
+  if (!wl_sockets.listen(fs)) printf("wayland: could not listen\n");
+  std::atomic<bool> wl_stop{false};
+  std::map<std::string, uint32_t> wl_titles;
+  std::thread wl_thread([&] {
+    std::vector<uint32_t> canvas(512 * 512);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(canvas.data(), canvas.size());
+    target.width = target.height = target.pitch = 512;
+#ifdef TCOS_EMU_DMABUF
+    graphics::DeviceRenderer2D on_device(adapter_device, a, {512, 512});
+    bool gpu_round = false;
+#endif
+    while (!wl_stop) {
+      while (wl_sockets.pump()) {}
+      wl_sockets.wait(2'000'000);
+      List<uint32_t> windows(a), changed(a);
+      List<desktop::IWindowsSession::Repaint> repainted(a);
+      wl_server.take_changes(&changed, &repainted);
+      wl_server.windows(&windows);
+      for (uint32_t w : windows.view()) {
+        desktop::WindowsWindowInfo info;
+        String title(a);
+        if (wl_server.window_info(w, &info, &title) && info.visible && info.caption) wl_titles[std::string(title.c_str())] = wl_server.window_pixel(w, 2, 2);
+        graphics::SoftwareRenderer2D renderer(target);
+        uint32_t dw = 0, dh = 0;
+#ifdef TCOS_EMU_DMABUF
+        gpu_round = !gpu_round && on_device.valid();
+        if (gpu_round) {
+          if (wl_server.draw_window(w, on_device, 0, 0, &dw, &dh)) ++wl_gpu_draws;
+          continue;
+        }
+        if (wl_server.draw_window(w, renderer, 0, 0, &dw, &dh)) ++wl_cpu_draws;
+#else
+        wl_server.draw_window(w, renderer, 0, 0, &dw, &dh);
+#endif
+      }
+    }
+  });
+#endif
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
@@ -179,6 +248,17 @@ int main(int argc, char** argv) {
   x11_stop = true;
   x11_thread.join();
   for (const std::string& t : x11_titles) printf("x11-desktop: framed window \"%s\"\n", t.c_str());
+#endif
+#ifdef TCOS_EMU_WAYLAND
+  wl_stop = true;
+  wl_thread.join();
+  for (const auto& t : wl_titles) printf("wayland-desktop: framed window \"%s\" pixel %08x\n", t.first.c_str(), t.second);
+#ifdef TCOS_EMU_DMABUF
+  printf("wayland-desktop: %d draws on the device, %d on the CPU\n", wl_gpu_draws.load(), wl_cpu_draws.load());
+  // (a dmabuf the program still has open holds an export of the kernel, which goes before the program: its descriptors are closed first)
+  if (process::Process* proc = p.process())
+    for (uint64_t fd = 0; fd < process::ProcessFiles::kMaxDescriptors; ++fd) proc->files().close(fd);
+#endif
 #endif
   printf("[exit=%u faulted=%d killed=%d vector=%d addr=%llx pc=%llx]\n", o.exit_code, o.faulted, o.killed, o.fault.vector, (unsigned long long)o.fault.address, (unsigned long long)o.fault.pc);
 }

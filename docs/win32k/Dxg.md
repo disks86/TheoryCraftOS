@@ -17,6 +17,17 @@ points at the parameter block, which has the same Windows x64 layout. The handle
 the services, records and limits below are the same for both kinds of process; only services this layer registered (`dxg::register_service`) are taken, anything else is
 `EINVAL`. The Linux Vulkan driver (`src/Linux/libvulkan`, [../Vulkan.md](../Vulkan.md)) is the user.
 
+GPU images as descriptors, the counterpart of Linux's dmabufs (what a Wayland client hands the compositor, [../Wayland.md](../Wayland.md)):
+
+- `TCOS_DXG_IOCTL_EXPORT` (`TcosDxgExport`: allocation, flags `TCOS_DXG_EXPORT_CLOEXEC`) makes a descriptor for an allocation of the process: a 2D image of one level and
+  one sample in an 8-bit four-channel colour format, made shareable (`kAllocShared`). The descriptor is a File-kind object whose file is a `process::DxgBufferFile`
+  (`src/Process/DxgBufferFile.hpp`) holding a `dxgk::ExportedAllocation` (`Kernel::export_allocation`): the image stays alive after the allocation is destroyed or the
+  process exits. It can be closed, duplicated, passed with `SCM_RIGHTS`, `fstat`ed and measured with `lseek(SEEK_END)`; not read, written or mapped.
+- `TCOS_DXG_IOCTL_IMPORT` (`TcosDxgImport`: fd, device) gives the process an allocation handle for such a descriptor's image on one of its devices (same adapter: else
+  `STATUS_INVALID_PARAMETER`), recorded like the allocations it creates; it answers the size, the kernel's format number and the pitch.
+- The kernel reads an export without a process: `Kernel::read_export` (the CPU's read-only view) and `acquire_export_image` (the device's image, sampled in place; refused
+  while a process has the allocation locked). The handlers are `linux_export` / `linux_import` in `Win32kDxg.cpp`; the ioctls are in `LinuxFiles.cpp`.
+
 ## Implemented (50)
 
 Adapters and devices: OpenAdapterFromLuid, OpenAdapterFromDeviceName (name of adapter n: `\\?\DISPLAY#TCOSDXG#<n>#{1ca05180-a699-450a-9a0c-de4fbe3ddd89}`),

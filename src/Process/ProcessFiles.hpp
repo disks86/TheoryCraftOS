@@ -59,9 +59,14 @@ struct OpenFlags {
 };
 
 // An open file or directory, shared by the descriptors that were duplicated from each other (they share the position too).
+class MemoryFile;
+class DxgBufferFile;
+
 struct OpenObject {
   explicit OpenObject(allocators::IAllocator& allocator) : path(allocator), pattern(allocator) {}
   UniquePointer<filesystem::IFile> file;
+  MemoryFile* memory = nullptr;      // `file` is a file in memory (memfd_create, MemoryFile.hpp): this is it (not owned; it can be mapped)
+  DxgBufferFile* gpu_buffer = nullptr;      // `file` is a GPU image (a dmabuf of /dev/dxg, DxgBufferFile.hpp): this is it (not owned)
   UniquePointer<filesystem::IDirectory> directory;
   String path;                       // the cleaned virtual path it was opened by
   String pattern;                    // directory listing: only names matching this (Windows wildcards); empty = all

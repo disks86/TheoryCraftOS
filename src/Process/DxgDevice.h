@@ -40,6 +40,35 @@ typedef struct TcosDxgCall {
 /* _IOWR('G', 1, TcosDxgCall): read and written, type 'G', number 1, 16 bytes. */
 #define TCOS_DXG_IOCTL_CALL 0xC0104701u
 
+/* A GPU image as a file descriptor (the counterpart of a Linux dmabuf: what a Wayland client passes in zwp_linux_buffer_params_v1.add). TCOS_DXG_IOCTL_EXPORT
+ * makes one for an allocation of the process: a 2D image of one level and one sample in an 8-bit four-channel colour format, made shareable (the allocation flag
+ * 1 << 7, kAllocShared). The descriptor holds the image on its own: it stays valid after the allocation is destroyed or the process exits. It can be closed,
+ * duplicated, passed with SCM_RIGHTS and measured with lseek(SEEK_END), not read, written or mapped. TCOS_DXG_IOCTL_IMPORT gives the process an allocation
+ * handle for the image of such a descriptor, on one of its devices (of the same adapter).
+ * Both answer 0 when the service ran (its NTSTATUS in `status`; fd / allocation only on success), -EFAULT for an unreadable structure, -EBADF for a descriptor
+ * that is not such an image (import), -EMFILE when the table is full (export), -ENODEV without a Direct3D layer. */
+typedef struct TcosDxgExport {
+  uint32_t allocation; /* the allocation handle */
+  uint32_t flags;      /* TCOS_DXG_EXPORT_CLOEXEC */
+  int32_t fd;          /* out: the descriptor */
+  int32_t status;      /* out: the NTSTATUS */
+} TcosDxgExport;
+#define TCOS_DXG_EXPORT_CLOEXEC 1u
+/* _IOWR('G', 2, TcosDxgExport), 16 bytes */
+#define TCOS_DXG_IOCTL_EXPORT 0xC0104702u
+
+typedef struct TcosDxgImport {
+  int32_t fd;          /* the descriptor of the image */
+  uint32_t device;     /* the device handle to open it on */
+  uint32_t allocation; /* out: the new allocation handle */
+  int32_t status;      /* out: the NTSTATUS */
+  uint32_t width, height;
+  uint32_t format;     /* out: the kernel's format number (the AW_FORMAT word of an allocation's description) */
+  uint32_t pitch;      /* out: bytes per row */
+} TcosDxgImport;
+/* _IOWR('G', 3, TcosDxgImport), 32 bytes */
+#define TCOS_DXG_IOCTL_IMPORT 0xC0204703u
+
 /* The services, numbered as the NtGdiDdDDI* system calls (src/Process/WindowsSyscalls.hpp; the kernel checks that the numbers agree). Any D3DKMT service of the kernel may be
  * named by its number; these are the ones the user-mode drivers use. */
 enum {

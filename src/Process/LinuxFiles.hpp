@@ -17,12 +17,15 @@
  */
 #pragma once
 #include <stdint.h>
+#include "Process/DxgBufferFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
 // The Linux file system calls (LinuxSyscalls.cpp maps numbers to these). Each returns the value for the result register: the result, or -errno.
 namespace process::linuxabi {
 
+uint64_t sys_memfd_create(Process& p, uint64_t name, uint64_t flags);
+uint64_t sys_fallocate(Process& p, uint64_t fd, uint64_t mode, uint64_t offset, uint64_t length);
 uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t flags);
 uint64_t sys_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);
 uint64_t sys_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);
@@ -55,6 +58,14 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
 // stores its NTSTATUS. False if `service` is not a D3DKMT service. win32k's Direct3D layer installs it (install_dxg); without one, ioctl on /dev/dxg answers ENODEV.
 using DxgServiceHandler = bool (*)(Process& process, uint32_t service, uint64_t params, uint32_t* status);
 void set_dxg_service_handler(DxgServiceHandler handler);
+// The GPU images of /dev/dxg (TCOS_DXG_IOCTL_EXPORT / IMPORT, DxgBufferFile.hpp), by the same layer: an export of allocation `allocation` of the process (with
+// its memory's size), and a handle of the process on `device` for an export. Both store the NTSTATUS; false when there is no Direct3D layer.
+struct DxgImported {
+  uint32_t allocation = 0, width = 0, height = 0, format = 0, pitch = 0;
+};
+using DxgExportHandler = bool (*)(Process& process, uint32_t allocation, SharedPointer<dxgk::ExportedAllocation>* out, uint64_t* bytes, uint32_t* status);
+using DxgImportHandler = bool (*)(Process& process, uint32_t device, const dxgk::ExportedAllocation& exported, DxgImported* out, uint32_t* status);
+void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler);
 
 // The errno (as a result register value, -errno) for a file system status.
 uint64_t errno_of_status(filesystem::Status status);

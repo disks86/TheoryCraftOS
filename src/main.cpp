@@ -21,6 +21,8 @@
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "X11/X11SocketServer.hpp"
+#include "Wayland/Dxg/WaylandDxgImage.hpp"
+#include "Wayland/WaylandSocketServer.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
 #include "OpenGl/WindowsGl.hpp"
@@ -2102,6 +2104,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         if (x11_sockets && x11_sockets->listen(0, &explorer_files.file_system()) && x11_sockets->start()) console::puts("x11: listening on DISPLAY=:0\n");
         else console::puts("x11: the X server could not listen\n");
       }
+    }
+    // The Wayland programs' windows: the kernel's compositor (src/Wayland), the desktop its window manager again, so a Wayland window gets the same frame
+    // as a Windows or an X one. Linux programs reach it at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run/user/0/wayland-0 in the Linux tree).
+    wayland::Server wayland_server(shared_allocator, [] { return hardware::uptime_us() / 1000; });
+    desktop.set_wayland_session(&wayland_server);
+    struct WaylandGuard { desktop::Desktop& d; ~WaylandGuard() { d.set_wayland_session(nullptr); } } wayland_guard{desktop};      // (the desktop lets go first)
+    UniquePointer<wayland::SocketServer> wayland_sockets;
+    if (process::UnixSocketManager* sockets = process::system_unix_sockets()) {
+      wayland_sockets = UniquePointer<wayland::SocketServer>::make(shared_allocator, wayland_server, *sockets, shared_allocator);
+      // GPU buffers (zwp_linux_dmabuf_v1): the dmabufs of /dev/dxg are drawn in place by the desktop when it draws on their GPU
+      if (wayland_sockets && dxgk::system_kernel()) wayland_sockets->set_gpu_images(&wayland::make_dxg_image, dxgk::system_kernel());
+      if (wayland_sockets && wayland_sockets->listen(explorer_files.file_system()) && wayland_sockets->start()) console::puts("wayland: listening on wayland-0\n");
+      else console::puts("wayland: the compositor could not listen\n");
     }
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);

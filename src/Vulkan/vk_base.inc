@@ -71,7 +71,7 @@ enum {
 /* The kernel's storage buffer slots (graphics::kMaxUavBuffers, kMaxSrvBuffers): u0 .. u3 are read and written, the read-only views t0 .. t3 are the slots after them. */
 enum { UAV_SLOTS = 4, SRV_SLOTS = 4 };
 /* dxgk::AllocationFlags and dxgk::Format */
-enum { A_VERTEX = 1u << 0, A_INDEX = 1u << 1, A_TEXTURE = 1u << 2, A_TARGET = 1u << 3, A_DEPTH = 1u << 4, A_PRESENT = 1u << 5, A_STAGING = 1u << 6, A_UAV = 1u << 9 };
+enum { A_VERTEX = 1u << 0, A_INDEX = 1u << 1, A_TEXTURE = 1u << 2, A_TARGET = 1u << 3, A_DEPTH = 1u << 4, A_PRESENT = 1u << 5, A_STAGING = 1u << 6, A_SHARED = 1u << 7, A_UAV = 1u << 9 };
 enum {
   DF_UNKNOWN = 0, DF_A8R8G8B8, DF_X8R8G8B8, DF_A8B8G8R8, DF_X8B8G8R8, DF_D32F, DF_D24S8, DF_RGBA16F, DF_RGBA32F, DF_A8R8G8B8_SRGB, DF_A8B8G8R8_SRGB, DF_RGBA16, DF_RGBA32UI, DF_RGBA32SI,
   DF_RGBA16UI, DF_RGBA16SI, DF_RGBA8UI, DF_RGBA16SN, DF_A2B10G10R10
@@ -131,6 +131,8 @@ typedef struct Mem {
   uint32_t version;            /* counts the writes the CPU may have made: a buffer or image synchronised with an older one is stale */
   bool mapped;
   uint32_t seen_submission;    /* the submission in which a mapped memory was last counted as written (g_submission) */
+  struct Img *image;           /* the image it is dedicated to (VkMemoryDedicatedAllocateInfo), else the first one bound to it: what vkGetMemoryFdKHR exports */
+  bool exportable;             /* made with VkExportMemoryAllocateInfo */
 } Mem;
 
 typedef struct Buf {
@@ -163,6 +165,7 @@ typedef struct Img {
   uint32_t synced;
   bool is_depth;
   bool swap_rb;
+  bool external;               /* VkExternalMemoryImageCreateInfo: its allocation is shareable (and sampled, so that a compositor draws it in place) */
 } Img;
 
 typedef struct View {

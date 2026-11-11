@@ -50,6 +50,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       computer_manager_(allocator),
       win32_windows_(allocator),
       x11_windows_(allocator),
+      wayland_windows_(allocator),
       notepad_(allocator),
       paint_(allocator),
       spreadsheet_(allocator),
@@ -688,11 +689,13 @@ void Desktop::tap_key(void* self, const hardware::KeyEvent& event, uint8_t modif
   Desktop& d = *static_cast<Desktop*>(self);
   d.win32_windows_.tap_key(event, modifiers);
   d.x11_windows_.tap_key(event, modifiers);
+  d.wayland_windows_.tap_key(event, modifiers);
 }
 void Desktop::tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y) {
   Desktop& d = *static_cast<Desktop*>(self);
   d.win32_windows_.tap_mouse(event, x, y);
   d.x11_windows_.tap_mouse(event, x, y);
+  d.wayland_windows_.tap_mouse(event, x, y);
 }
 
 Calendar* Desktop::open_calendar(TabFrame* into) {
@@ -1020,6 +1023,7 @@ void Desktop::monitors_changed() {
     if (!several) {
       win32_windows_.set_monitors({}, {});
       x11_windows_.set_monitors({}, {});
+      wayland_windows_.set_monitors({}, {});
       toasts_.clear_area();
       display_settings_.refresh();
       return;
@@ -1052,6 +1056,7 @@ void Desktop::monitors_changed() {
     windows_.set_areas(areas, count);
     win32_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
     x11_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
+    wayland_windows_.set_monitors(ArrayView<const gui::Rect2D>(regions, count), ArrayView<const gui::Rect2D>(areas, count));
     if (count) toasts_.set_area(areas[0]);   // the primary monitor above its taskbar
     display_settings_.refresh();
   });
@@ -1227,6 +1232,7 @@ void Desktop::pump(uint64_t uptime_us) {
   input_.pump();
   win32_windows_.pump(windows_);
   x11_windows_.pump(windows_);
+  wayland_windows_.pump(windows_);
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
   if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });

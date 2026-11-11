@@ -88,6 +88,11 @@ static const VkExtensionProperties kInstanceExtensions[] = {
 };
 static const VkExtensionProperties kDeviceExtensions[] = {
     {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SWAPCHAIN_SPEC_VERSION},
+#if VK_OS_EXTERNAL_MEMORY_FD
+    {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_SPEC_VERSION},
+    {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_KHR_EXTERNAL_MEMORY_FD_SPEC_VERSION},
+    {VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_SPEC_VERSION},
+#endif
 };
 
 static VkResult fill_extensions(const VkExtensionProperties *list, uint32_t n, uint32_t *count, VkExtensionProperties *out) {

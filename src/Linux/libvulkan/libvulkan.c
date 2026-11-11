@@ -20,7 +20,8 @@
  * reaches through /dev/dxg (src/Process/DxgDevice.h) instead of the NtGdiDdDDI* system calls. Every adapter of the kernel is a VkPhysicalDevice, as for a Windows program.
  *
  * This file is the Linux layer of the driver (vk_os.h): raw Linux system calls (x86-64, AArch64, RISC-V 64 and LoongArch 64: a program of another CPU runs on the kernel's
- * emulator with the same calls), memory from mmap, diagnostics to standard error when VULKAN_1_DEBUG is set, CLOCK_MONOTONIC, the ioctl of /dev/dxg, and
+ * emulator with the same calls), memory from mmap, diagnostics to standard error when VULKAN_1_DEBUG is set, CLOCK_MONOTONIC, the ioctl of /dev/dxg, images as
+ * dmabufs (/dev/dxg's export and import: VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf, what a Wayland client passes the compositor) and
  * VK_EXT_headless_surface (a surface without a window: its swapchain is shown on the display).
  *
  * It needs no C library: it is built freestanding into libvulkan.a (Linux programs here are linked statically: the system has no dynamic loader yet), and memcpy, memmove,
@@ -30,7 +31,8 @@
 #define VK_OS_NAME "libvulkan"
 #define VK_OS_EXPORT __attribute__((visibility("default")))
 #define VK_OS_INSTANCE_EXTENSIONS {VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_SPEC_VERSION},
-#define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT)
+#define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT) X(vkGetMemoryFdKHR) X(vkGetMemoryFdPropertiesKHR)
+#define VK_OS_EXTERNAL_MEMORY_FD 1   /* images as dmabufs of /dev/dxg (vk_external.inc) */
 #include "../../Vulkan/vk_driver.inc"
 
 /* ---- Linux system calls ------------------------------------------------------------------------------------------------------------------------------------------------ */
@@ -243,6 +245,35 @@ static KmtStatus kmt(uint32_t service, void *params) {
   if (r != 0) return r == -19 ? STATUS_NO_SUCH_DEVICE_KMT : STATUS_INVALID_PARAMETER_KMT;      /* (-ENODEV: the system has no Direct3D layer) */
   return call.status;
 }
+
+/* ---- images as dmabufs (TCOS_DXG_IOCTL_EXPORT / IMPORT) --------------------------------------------------------------------------------------------------------------- */
+static bool vk_os_export_fd(uint32_t allocation, int *fd) {
+  const int dxg = dxg_descriptor();
+  if (dxg < 0) return false;
+  TcosDxgExport e = {allocation, TCOS_DXG_EXPORT_CLOEXEC, -1, 0};
+  if (linux_call(SYS_IOCTL, dxg, (long)TCOS_DXG_IOCTL_EXPORT, (long)&e, 0, 0, 0) != 0 || !STATUS_OK(e.status) || e.fd < 0) {
+    vk_os_trace("vkGetMemoryFdKHR: /dev/dxg would not export the image\n");
+    return false;
+  }
+  *fd = e.fd;
+  return true;
+}
+
+static bool vk_os_import_fd(int fd, uint32_t device, uint32_t *allocation, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *pitch) {
+  const int dxg = dxg_descriptor();
+  if (dxg < 0) return false;
+  TcosDxgImport i;
+  memset(&i, 0, sizeof i);
+  i.fd = fd, i.device = device;
+  if (linux_call(SYS_IOCTL, dxg, (long)TCOS_DXG_IOCTL_IMPORT, (long)&i, 0, 0, 0) != 0 || !STATUS_OK(i.status) || i.allocation == 0) {
+    vk_os_trace("vkAllocateMemory: /dev/dxg would not import the descriptor\n");
+    return false;
+  }
+  *allocation = i.allocation, *width = i.width, *height = i.height, *format = i.format, *pitch = i.pitch;
+  return true;
+}
+
+static void vk_os_close_fd(int fd) { linux_call(SYS_CLOSE, fd, 0, 0, 0, 0, 0); }
 
 /* ---- VK_EXT_headless_surface -------------------------------------------------------------------------------------------------------------------------------------------- */
 enum { SURFACE_HEADLESS = 1 };

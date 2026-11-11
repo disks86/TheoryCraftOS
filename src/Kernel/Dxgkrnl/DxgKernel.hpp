@@ -25,6 +25,7 @@
 //   D3DKMTCreateContext / DestroyContext          create_context / destroy_context
 //   D3DKMTCreateAllocation / DestroyAllocation    create_allocation / destroy_allocation, query_allocation
 //   D3DKMTShareObjects / OpenResource             share_allocation / open_shared_allocation / close_share
+//   (Linux dmabuf: /dev/dxg's export / import)    export_allocation / import_allocation, and the kernel's own reading of an export: read_export, acquire_export_image
 //   D3DKMTLock / Unlock                           lock / unlock
 //   D3DKMTMakeResident / Evict / Trim             make_resident / evict / trim
 //   D3DKMTCreateSynchronizationObject2 and co.    create_sync / destroy_sync, signal_sync_cpu, wait_sync_cpu, signal_sync_gpu, wait_sync_gpu
@@ -88,6 +89,21 @@ struct AcquiredImage {
   graphics::IImage* image = nullptr;
 };
 
+// An image handed out of its process as a descriptor (a Linux dmabuf: /dev/dxg's export, Process/DxgBufferFile.hpp). It holds the allocation on its own - the
+// allocation stays alive while the export does, after the process destroyed its handle or exited - and any process can import it (import_allocation), or the
+// kernel read it in place (a compositor: read_export, acquire_export_image). Made only by export_allocation; shared with SharedPointer. Every export must be gone
+// before its kernel (the system's lives as long as the system; a test drops its descriptors first). Dropping the last use takes the kernel's lock, so it must
+// not happen while the caller holds it (nothing outside the kernel does).
+class ExportedAllocation;
+// What an export is: fixed when it is made.
+struct ExportInfo {
+  AllocationDesc desc;
+  uint32_t pitch = 0;      // bytes per row
+  uint64_t bytes = 0;      // its system-memory backing
+  uint32_t adapter = 0;    // the adapter's number
+};
+const ExportInfo& export_info(const ExportedAllocation& exported);
+
 class Kernel {
  public:
   static constexpr uint32_t kMaxAdapters = 8;
@@ -137,6 +153,18 @@ class Kernel {
   NtStatus share_allocation(ProcessId pid, Handle allocation, uint32_t* token);
   NtStatus open_shared_allocation(ProcessId pid, Handle device, uint32_t token, Handle* allocation, AllocationDesc* desc);
   NtStatus close_share(ProcessId pid, uint32_t token);
+  // An export of an allocation made kAllocShared: a 2D image of one level and one sample in an 8-bit colour format of four channels (what a compositor shows).
+  // kAccessDenied when it was not made shareable, kNotSupported for anything else.
+  NtStatus export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out);
+  // A handle of the process for the allocation of an export, on `device` (which must be on the export's adapter: kInvalidParameter).
+  NtStatus import_allocation(ProcessId pid, Handle device, const ExportedAllocation& exported, Handle* allocation, AllocationDesc* desc);
+  // The kernel reading an export (no process, no handle): the CPU's read-only view of it, valid until end_read_export (the work queued on it done first:
+  // kGraphicsAllocationBusy while some waits for a fence), or the device's own image to sample in place, as acquire_image lends it (it must be a render target
+  // and a texture, and not locked by the CPU meanwhile: kInvalidDeviceState). Both may be taken more than once; each is given back once.
+  NtStatus read_export(ExportedAllocation& exported, LockResult* out);
+  NtStatus end_read_export(ExportedAllocation& exported);
+  NtStatus acquire_export_image(ExportedAllocation& exported, AcquiredImage* out);
+  NtStatus release_export_image(ExportedAllocation& exported);
   // The CPU's view of one subresource (a mip level; 0 for a buffer). The view is the allocation's system-memory backing and stays valid until unlock().
   NtStatus lock(ProcessId pid, Handle allocation, uint32_t flags, uint32_t subresource, LockResult* out);
   NtStatus unlock(ProcessId pid, Handle allocation);
@@ -190,8 +218,10 @@ class Kernel {
   bool pump();
 
  private:
+  friend class ExportedAllocation;
   struct Process;
   struct ShareToken;
+  Adapter* adapter_of_locked(const Allocation& a);
   Process* find_process(ProcessId pid);
   bool pump_locked();
   NtStatus escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteReader& in, ByteWriter& out, ByteView reply);

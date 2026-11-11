@@ -62,6 +62,16 @@ static uint64_t vk_os_now_ns(void);
 typedef struct Surface Surface;
 static bool vk_os_surface_extent(const Surface *surface, uint32_t *width, uint32_t *height);
 
+/* GPU images as descriptors of the platform (VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf: Linux's dmabufs, made by /dev/dxg). A platform that has them
+ * defines VK_OS_EXTERNAL_MEMORY_FD to 1 and these three; the driver then offers the extensions and vkGetMemoryFdKHR (in its VK_OS_PROCS). An export is of an allocation the
+ * driver made shareable; an import gives a handle on `device` for a descriptor and says what the image is (the kernel's format number, AW_FORMAT); the descriptor stays the
+ * caller's either way. */
+#if VK_OS_EXTERNAL_MEMORY_FD
+static bool vk_os_export_fd(uint32_t allocation, int *fd);
+static bool vk_os_import_fd(int fd, uint32_t device, uint32_t *allocation, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *pitch);
+static void vk_os_close_fd(int fd);
+#endif
+
 /* (the driver also uses memcpy, memmove, memset and memcmp: the platform has them, from its C library or its own) */
 void *memcpy(void *d, const void *s, size_t n);
 void *memmove(void *d, const void *s, size_t n);
