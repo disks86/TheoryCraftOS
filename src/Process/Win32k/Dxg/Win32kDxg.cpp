@@ -57,6 +57,62 @@ bool linux_service(Process& process, uint32_t service, uint64_t params, uint32_t
   return true;
 }
 
+// /dev/dxg's GPU images (TCOS_DXG_IOCTL_EXPORT / IMPORT, LinuxFiles.cpp): an export of one of the process's allocations, and a handle of the process for one, recorded
+// as the allocations it creates are (so that D3DKMTDestroyAllocation and the process's exit let go of it).
+bool linux_export(Process& process, uint32_t allocation, SharedPointer<dxgk::ExportedAllocation>* out, uint64_t* bytes, uint32_t* status) {
+  SyscallRequest request;
+  request.number = uint32_t(N::NtGdiDdDDICreateAllocation);
+  Call call(process, request);
+  Session s(call);
+  if (!s.ok()) {
+    *status = s.failure();
+    return true;
+  }
+  kernel::ScopedMutex g(s.state().lock);
+  if (!s.state().find_allocation(allocation)) {
+    *status = dxgk::status::kInvalidHandle;
+    return true;
+  }
+  *status = s.kernel().export_allocation(s.pid(), allocation, out);
+  if (*status == dxgk::status::kSuccess) *bytes = dxgk::export_info(**out).bytes;
+  return true;
+}
+
+bool linux_import(Process& process, uint32_t device, const dxgk::ExportedAllocation& exported, linuxabi::DxgImported* out, uint32_t* status) {
+  SyscallRequest request;
+  request.number = uint32_t(N::NtGdiDdDDIOpenResource);
+  Call call(process, request);
+  Session s(call);
+  if (!s.ok()) {
+    *status = s.failure();
+    return true;
+  }
+  kernel::ScopedMutex g(s.state().lock);
+  ProcessState& ps = s.state();
+  if (!ps.find_device(device)) {
+    *status = dxgk::status::kInvalidHandle;
+    return true;
+  }
+  dxgk::Handle handle = 0;
+  dxgk::AllocationDesc desc;
+  *status = s.kernel().import_allocation(s.pid(), device, exported, &handle, &desc);
+  if (*status != dxgk::status::kSuccess) return true;
+  AllocationRecord rec;
+  rec.handle = handle;
+  rec.device = device;
+  if (!ps.allocations.push_back(rec)) {
+    s.kernel().destroy_allocation(s.pid(), handle);
+    *status = dxgk::status::kNoMemory;
+    return true;
+  }
+  out->allocation = handle;
+  out->width = desc.width;
+  out->height = desc.height;
+  out->format = static_cast<uint32_t>(desc.format);
+  out->pitch = dxgk::export_info(exported).pitch;
+  return true;
+}
+
 }  // namespace
 
 void register_service(WindowsSyscallNumber number, Handler handler) {
@@ -79,6 +135,7 @@ void install_dxg() {
   dxg::register_unsupported();
   register_process_exit_hook(dxg::process_exited);
   linuxabi::set_dxg_service_handler(&dxg::linux_service);
+  linuxabi::set_dxg_buffer_handlers(&dxg::linux_export, &dxg::linux_import);
 }
 
 }  // namespace process::win32k

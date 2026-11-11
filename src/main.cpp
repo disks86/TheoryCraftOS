@@ -21,6 +21,7 @@
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "X11/X11SocketServer.hpp"
+#include "Wayland/Dxg/WaylandDxgImage.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
 #include "Process/WindowsFonts.hpp"
 #include "Font/SystemFontService.hpp"
@@ -2087,6 +2088,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     UniquePointer<wayland::SocketServer> wayland_sockets;
     if (process::UnixSocketManager* sockets = process::system_unix_sockets()) {
       wayland_sockets = UniquePointer<wayland::SocketServer>::make(shared_allocator, wayland_server, *sockets, shared_allocator);
+      // GPU buffers (zwp_linux_dmabuf_v1): the dmabufs of /dev/dxg are drawn in place by the desktop when it draws on their GPU
+      if (wayland_sockets && dxgk::system_kernel()) wayland_sockets->set_gpu_images(&wayland::make_dxg_image, dxgk::system_kernel());
       if (wayland_sockets && wayland_sockets->listen(explorer_files.file_system()) && wayland_sockets->start()) console::puts("wayland: listening on wayland-0\n");
       else console::puts("wayland: the compositor could not listen\n");
     }

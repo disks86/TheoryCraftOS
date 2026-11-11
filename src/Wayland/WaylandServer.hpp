@@ -26,7 +26,11 @@
 //
 // Globals: wl_compositor 6, wl_subcompositor 1, wl_shm 2 (ARGB8888, XRGB8888, ABGR8888, XBGR8888), wl_seat 8 (pointer and keyboard; the keymap is a US
 // xkb_v1 keymap in a sealed file in memory), wl_output 4 (the primary monitor), wl_data_device_manager 3 (no transfers yet), xdg_wm_base 5,
-// zxdg_decoration_manager_v1 1.
+// zxdg_decoration_manager_v1 1, and zwp_linux_dmabuf_v1 3 when the transport can take GPU images (set_dmabuf; the same four formats, linear).
+//
+// GPU pictures. A zwp_linux_dmabuf_v1 buffer is a GPU image a client passed as a descriptor (on this system an export of the kernel's Direct3D layer, made with
+// /dev/dxg: Process/DxgBufferFile.hpp). The desktop draws it where it is: on the GPU, with no copy at all, when the desktop's renderer draws on the device the
+// image is on (IRenderer2D::draw_device_image), else from the CPU's view of it (one copy, as for wl_shm).
 //
 // Pictures. A wl_shm pool is a file in memory (memfd) the client passed with SCM_RIGHTS; the desktop draws a window's committed buffer straight from that
 // memory (draw_window), so a frame costs one copy, like a Win32 or an X window. Subsurfaces are drawn over their parent in their stacking order. A surface's
@@ -55,11 +59,31 @@
 namespace wayland {
 
 // A descriptor that came with a client's message (a wl_shm pool's file) or goes out with an event (the keymap). The transport makes them.
+// A GPU image a client passed (a dmabuf): what the desktop draws a zwp_linux_dmabuf_v1 buffer from. Pixels it reads are 0xAARRGGBB whatever order the
+// image keeps them in. The transport makes them (WaylandDxgImage.hpp over the kernel's Direct3D layer).
+class GpuImage {
+ public:
+  virtual uint32_t width() const = 0;
+  virtual uint32_t height() const = 0;
+  virtual uint32_t pitch() const = 0;      // bytes per row of its memory
+  // Draws its rectangle `source` at (x, y) with the renderer's clip and blend mode: in place when the renderer draws on the image's device, else from the CPU's
+  // view of it. False when nothing could be drawn (the GPU still works on it, or it is lost).
+  virtual bool draw(graphics::IRenderer2D& renderer, const graphics::Rect2D& source, int32_t x, int32_t y) = 0;
+  // Its pixels in `source` (inside the image), row after row, into `out` (source.width * source.height words). False when it cannot be read now.
+  virtual bool read(const graphics::Rect2D& source, ArrayView<uint32_t> out) = 0;
+
+ protected:
+  GpuImage() = default;
+  ~GpuImage() = default;
+};
+
 class Memory {
  public:
   // At least the first `size` bytes of it, which the server may read (and the client write meanwhile); empty when it is smaller or no memory at all.
   // The view stays valid until the next call or until the object goes.
   virtual ByteView map(uint64_t size) = 0;
+  // The GPU image it is (a dmabuf), or null: it is not one. It lives as long as this object.
+  virtual GpuImage* gpu() { return nullptr; }
 
  protected:
   Memory() = default;
@@ -95,6 +119,8 @@ class Server final : public desktop::IWindowsSession {
   // Called (outside the lock) whenever output for a client was produced by something other than its own request (input, the desktop, another client).
   void set_wake(Wake wake, void* context);
   void set_fd_maker(MakeFd make, void* context);
+  // Whether zwp_linux_dmabuf_v1 is offered (the transport makes GPU images of the descriptors clients pass). Only clients that bind after it see the change.
+  void set_dmabuf(bool offered);
 
   // --- the transport
   // A new connection: its number (1..kMaxClients-1), 0 when the table is full. `pid`: the process at the other end (0 unknown).
@@ -132,7 +158,8 @@ class Server final : public desktop::IWindowsSession {
   bool cursor_confined() override;
   uint32_t capture_window() override;
 
-  // Tests: the pixel (0xAARRGGBB as the client stored it) of a window's committed buffer at (x, y) of the window's surface; 0 when outside or none.
+  // Tests: the pixel (0xAARRGGBB as the client stored it; a GPU buffer's as GpuImage::read gives it) of a window's committed buffer at (x, y) of the window's
+  // surface; 0 when outside or none.
   uint32_t window_pixel(uint32_t window, int32_t x, int32_t y);
   // The evdev key code of a HID usage (0: none), and the keymap the keyboard gets (xkb_v1 text, NUL-terminated).
   static uint32_t evdev_code(uint8_t hid_usage);
@@ -141,7 +168,7 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams,
   };
   struct Surface;
   struct Client;
@@ -152,11 +179,20 @@ class Server final : public desktop::IWindowsSession {
     uint64_t size = 0;
   };
   struct BufferInfo {
-    SharedPointer<PoolMemory> memory;
+    SharedPointer<PoolMemory> memory;      // a wl_shm buffer's pool
+    Fd gpu;                                // a dmabuf's plane: its descriptor's gpu() is the picture (the top left width x height of it)
     int32_t offset = 0, width = 0, height = 0, stride = 0;
-    uint32_t format = 0;
+    uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one)
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
-    bool valid() const { return memory && width > 0; }
+    bool valid() const { return (memory || gpu) && width > 0; }
+    GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
+  };
+  // A zwp_linux_buffer_params_v1: the plane added so far (one: every format offered has one plane).
+  struct DmabufParams {
+    Fd plane;
+    uint32_t offset = 0, stride = 0;
+    uint64_t modifier = 0;
+    bool used = false;      // create or create_immed was called
   };
   struct RegionRects {
     explicit RegionRects(allocators::IAllocator& allocator) : rects(allocator), add(allocator) {}
@@ -178,6 +214,7 @@ class Server final : public desktop::IWindowsSession {
     BufferInfo buffer;                          // wl_buffer
     SharedPointer<RegionRects> region;          // wl_region
     Positioner positioner;                      // xdg_positioner
+    SharedPointer<DmabufParams> params;         // zwp_linux_buffer_params_v1
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
   struct State {      // a surface's double-buffered state
@@ -248,6 +285,7 @@ class Server final : public desktop::IWindowsSession {
   void send(Client& c, const Event& e);
   void delete_id(Client& c, uint32_t id);
   Resource* new_object(Client& c, uint32_t id, Iface iface, uint32_t version, uint32_t parent);
+  Resource* new_server_object(Client& c, Iface iface, uint32_t version, uint32_t* id);      // (an object the server makes: ids from 0xFF000000)
   Resource* object_of(Client& c, uint32_t id, Iface iface, uint32_t from);      // (a protocol error when it is not one: nullptr)
   void destroy_object(Client& c, uint32_t id);
   void bind(Client& c, uint32_t name, StringView interface, uint32_t version, uint32_t id);
@@ -269,6 +307,9 @@ class Server final : public desktop::IWindowsSession {
   void toplevel_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void popup_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void decoration_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- zwp_linux_dmabuf_v1 (WaylandDmabuf.cpp)
+  void dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  bool make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, int32_t width, int32_t height, uint32_t format, uint32_t flags, bool immediate, BufferInfo* out);
   void commit(Client& c, Surface& s);
   void apply(Client& c, Surface& s, State& state);
   bool synchronized(const Surface& s) const;
@@ -326,6 +367,7 @@ class Server final : public desktop::IWindowsSession {
   bool wake_wanted_ = false;
   MakeFd make_fd_ = nullptr;
   void* make_fd_context_ = nullptr;
+  bool dmabuf_ = false;
   Fd keymap_;
   UniquePointer<Client> clients_[kMaxClients];
   Hive<Surface> surfaces_;
@@ -345,6 +387,7 @@ class Server final : public desktop::IWindowsSession {
   bool attached_ = false;
   int32_t frame_border_ = 0, frame_title_ = 0;
   uint32_t place_counter_ = 0;
+  bool draw_missed_ = false;                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
   uint32_t active_window_ = 0;
   // input

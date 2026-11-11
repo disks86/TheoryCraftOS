@@ -60,7 +60,12 @@ constexpr uint32_t kSubcompositorBadSurface = 0, kSubcompositorBadParent = 1, kS
 constexpr uint32_t kStateMaximized = 1, kStateFullscreen = 2, kStateResizing = 3, kStateActivated = 4;
 // the server's wl_display
 constexpr uint32_t kDisplayId = 1;
-constexpr uint32_t kLastClientId = 0xFEFFFFFFu;
+constexpr uint32_t kLastClientId = 0xFEFFFFFFu, kFirstServerId = 0xFF000000u;
+// zwp_linux_dmabuf_v1: DRM formats (fourcc codes) and modifiers, the zwp_linux_buffer_params_v1 errors
+constexpr uint32_t kDrmArgb8888 = 0x34325241, kDrmXrgb8888 = 0x34325258, kDrmAbgr8888 = 0x34324241, kDrmXbgr8888 = 0x34324258;
+constexpr uint64_t kDrmModLinear = 0, kDrmModInvalid = 0x00FFFFFFFFFFFFFFull;
+constexpr uint32_t kParamsAlreadyUsed = 0, kParamsPlaneIdx = 1, kParamsPlaneSet = 2, kParamsIncomplete = 3, kParamsInvalidFormat = 4, kParamsInvalidDimensions = 5,
+                   kParamsOutOfBounds = 6, kParamsInvalidWlBuffer = 7;
 
 struct Server::Client {
   explicit Client(allocators::IAllocator& allocator) : in(allocator), out(allocator), fds_in(allocator), fds_out(allocator), objects(allocator) {}
@@ -72,6 +77,7 @@ struct Server::Client {
   Queue<Fd> fds_in;           // descriptors no request took yet
   List<Fd> fds_out;           // descriptors that go with `out`
   Dictionary<uint32_t, Resource> objects;
+  uint32_t next_server_id = kFirstServerId;      // the next id of an object the server makes (zwp_linux_buffer_params_v1.created)
 };
 
 // The arguments of one request. A malformed argument makes it fail (ok() false): the request is then a protocol error.

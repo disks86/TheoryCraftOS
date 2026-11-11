@@ -1,6 +1,9 @@
 /* The Vulkan driver, part 3: memory, buffers, images, samplers, shaders, descriptors, render passes. */
 
 /* ---- memory ------------------------------------------------------------------------------------------------------------------------------------------------------------- */
+#if VK_OS_EXTERNAL_MEMORY_FD
+static VkResult memory_external_info(Device *d, const VkMemoryAllocateInfo *ai, Mem *m);
+#endif
 VKAPI VkResult VKAPI_CALL vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *alloc, VkDeviceMemory *out) {
   Device *d = (Device *)device;
   (void)alloc;
@@ -13,6 +16,14 @@ VKAPI VkResult VKAPI_CALL vkAllocateMemory(VkDevice device, const VkMemoryAlloca
     return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   }
   m->dev = d, m->size = ai->allocationSize, m->type = ai->memoryTypeIndex, m->version = 1;
+#if VK_OS_EXTERNAL_MEMORY_FD
+  VkResult er = memory_external_info(d, ai, m);      /* (vk_external.inc: dedicated, exported or imported memory) */
+  if (er != VK_SUCCESS) {
+    vk_free(m->data);
+    vk_free(m);
+    return er;
+  }
+#endif
   *out = (VkDeviceMemory)m;
   return VK_SUCCESS;
 }
@@ -176,6 +187,7 @@ static VkResult image_create_allocation(Img *img) {
     /* A swapchain image is drawn into and shown; it is a texture only when the program samples it (some adapters cannot show an image that is also sampled: virgl
      * refuses to make one, and the present that needs it resident would lose the context). Copies and clears need no texture: the CPU does them on the image's memory. */
     if (img->swapchain) flags = A_TARGET | A_PRESENT | ((img->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ? A_TEXTURE : 0);
+    if (img->external) flags |= A_SHARED | A_TEXTURE;      /* (another process or the compositor samples it) */
   }
   uint32_t w[AW_WORDS];
   memset(w, 0, sizeof w);
@@ -228,6 +240,12 @@ VKAPI VkResult VKAPI_CALL vkCreateImage(VkDevice device, const VkImageCreateInfo
   img->mips = ci->mipLevels, img->layers = layers ? layers : 1, img->samples = samples;
   img->tiling = ci->tiling, img->usage = ci->usage, img->flags = ci->flags, img->kind = kind;
   img->is_depth = format_is_depth(ci->format);
+  for (const VkBaseInStructure *n = (const VkBaseInStructure *)ci->pNext; n; n = n->pNext)
+    if (n->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) img->external = ((const VkExternalMemoryImageCreateInfo *)n)->handleTypes != 0;
+  if (img->external && (img->is_depth || img->kind != 0 || img->mips != 1 || img->samples != 1 || img->bpp != 4)) {
+    vk_free(img);
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;      /* (what can be exported: a 2D colour image of one level and one sample, 8 bits a channel) */
+  }
   VkResult r = image_create_allocation(img);
   if (r != VK_SUCCESS) {
     vk_free(img);
@@ -256,6 +274,7 @@ VKAPI VkResult VKAPI_CALL vkBindImageMemory(VkDevice device, VkImage image, VkDe
   (void)device;
   if (offset > m->size || image_total_bytes(img) > m->size - offset) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
   img->mem = m, img->off = offset;
+  if (!m->image) m->image = img;
   return VK_SUCCESS;
 }
 VKAPI void VKAPI_CALL vkGetImageSparseMemoryRequirements(VkDevice device, VkImage image, uint32_t *count, VkSparseImageMemoryRequirements *r) {

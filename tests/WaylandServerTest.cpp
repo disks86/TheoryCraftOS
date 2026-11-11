@@ -20,7 +20,9 @@
 // its globals, shm pools and buffers, toplevels framed by the desktop (configure, ack, map, move, resize, maximize, minimize, close, decorations),
 // popups and their positioners, subsurfaces (sync and desync), drawing straight from the client's memory, frame callbacks, the seat (pointer focus and
 // the implicit grab, buttons, the wheel, the cursor a client sets, keyboard focus, keys, modifiers, the keymap), protocol errors, truncated and bit-flipped
-// streams, and the AF_UNIX transport with descriptors passed as SCM_RIGHTS, with several client threads and a desktop thread at once.
+// streams, and the AF_UNIX transport with descriptors passed as SCM_RIGHTS, with several client threads and a desktop thread at once; zwp_linux_dmabuf_v1
+// (formats, params, created / failed, the errors, fuzzed sessions) and GPU buffers over the kernel's Direct3D layer: exports and imports, drawing in place on
+// the image's device and from the CPU's view, an image outliving its process, client threads exporting while the desktop draws.
 // Run: tests/run_host_tests.sh WaylandServerTest
 
 #include <atomic>
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
@@ -38,11 +41,17 @@
 #include <thread>
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Graphics/Graphics3D/LockedDevice.hpp"
+#include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
+#include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Process/DxgBufferFile.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/UnixSockets.hpp"
+#include "Wayland/Dxg/WaylandDxgImage.hpp"
 #include "Wayland/WaylandServer.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
 
@@ -1423,6 +1432,610 @@ static void test_threads() {
   CHECK(listed(server).empty());
 }
 
+// ------------------------------------------------------------------ zwp_linux_dmabuf_v1 (a stand-in GPU image; the real one is test_dxg_* below)
+
+// A GPU image as the transport would make one: its picture is in `pixels` (0xAARRGGBB); `busy` makes draw and read fail as a GPU still working on it would.
+struct FakeGpu final : wayland::Memory, wayland::GpuImage {
+  uint32_t w, h;
+  std::vector<uint32_t> pixels;
+  bool busy = false;
+  int draws = 0;
+  FakeGpu(uint32_t width, uint32_t height, uint32_t color) : w(width), h(height), pixels(size_t(width) * height, color) {}
+  ByteView map(uint64_t) override { return ByteView(); }
+  wayland::GpuImage* gpu() override { return this; }
+  uint32_t width() const override { return w; }
+  uint32_t height() const override { return h; }
+  uint32_t pitch() const override { return w * 4; }
+  bool draw(graphics::IRenderer2D& renderer, const graphics::Rect2D& source, int32_t x, int32_t y) override {
+    if (busy) return false;
+    ++draws;
+    graphics::Surface s;
+    s.pixels = ArrayView<uint32_t>(pixels.data(), pixels.size());
+    s.width = w, s.height = h, s.pitch = w;
+    renderer.draw_image(s, source, x, y);
+    return true;
+  }
+  bool read(const graphics::Rect2D& r, ArrayView<uint32_t> out) override {
+    if (busy || r.x < 0 || r.y < 0 || uint64_t(r.x) + r.width > w || uint64_t(r.y) + r.height > h || out.size() < uint64_t(r.width) * r.height) return false;
+    size_t at = 0;
+    for (uint32_t y = 0; y < r.height; ++y)
+      for (uint32_t x = 0; x < r.width; ++x) out[at++] = pixels[size_t(r.y + y) * w + size_t(r.x) + x];
+    return true;
+  }
+};
+
+constexpr uint32_t kAR24 = 0x34325241, kXR24 = 0x34325258, kAB24 = 0x34324241, kXB24 = 0x34324258;
+
+// zwp_linux_buffer_params_v1 helpers: params, add plane 0 (fd), create_immed / create.
+struct DmabufApp : App {
+  uint32_t dmabuf = 0;
+  explicit DmabufApp(Server& s, uint32_t version = 3) : App(s) {
+    dmabuf = bind(reg, "zwp_linux_dmabuf_v1", version);
+    drop_events();
+  }
+  uint32_t params(Fd plane, uint32_t offset, uint32_t stride, uint64_t modifier = 0) {
+    const uint32_t p = new_id();
+    send(Msg(dmabuf, 1).u(p));
+    if (plane) send(Msg(p, 1).u(0).u(offset).u(stride).u(uint32_t(modifier >> 32)).u(uint32_t(modifier)), {plane});
+    return p;
+  }
+  uint32_t immed(uint32_t p, int32_t w, int32_t h, uint32_t format = kXR24, uint32_t flags = 0) {
+    const uint32_t b = new_id();
+    send(Msg(p, 3).u(b).i(w).i(h).u(format).u(flags));
+    return b;
+  }
+  void commit(Window& win, uint32_t buffer, int32_t w, int32_t h) {
+    send(Msg(win.surface, 1).u(buffer).i(0).i(0));
+    send(Msg(win.surface, 2).i(0).i(0).i(w).i(h));
+    send(Msg(win.surface, 6));
+  }
+};
+
+static void test_dmabuf() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {      // not offered until the transport can make GPU images
+    WClient c(server);
+    c.registry();
+    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 0);
+    const uint32_t r = c.new_id();
+    c.send(Msg(1, 1).u(r));
+    c.send(Msg(r, 0).u(9).s("zwp_linux_dmabuf_v1").u(3).u(c.new_id()));
+    CHECK(c.error());
+  }
+  server.set_dmabuf(true);
+  {      // the formats: modifier events (all linear) from version 3, format events before
+    WClient c(server);
+    const uint32_t r = c.registry();
+    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 1 && c.globals["zwp_linux_dmabuf_v1"].second == 3);
+    c.drop_events();
+    const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
+    std::vector<uint32_t> formats;
+    for (const Ev& e : c.events) if (e.object == d3 && e.opcode == 1 && e.u(1) == 0 && e.u(2) == 0) formats.push_back(e.u(0));
+    CHECK(formats.size() == 4 && c.count(d3, 0) == 0);
+    CHECK(std::find(formats.begin(), formats.end(), kAR24) != formats.end() && std::find(formats.begin(), formats.end(), kXB24) != formats.end());
+    c.drop_events();
+    const uint32_t d2 = c.bind(r, "zwp_linux_dmabuf_v1", 2);
+    CHECK(c.count(d2, 0) == 4 && c.count(d2, 1) == 0);
+  }
+  {      // a toplevel showing a GPU buffer; drawn by the image itself; released when replaced
+    DmabufApp app(server);
+    App::Window w = app.toplevel(true, "GPU");
+    Fd first = Fd::make_as<FakeGpu>(A, 120u, 80u, 0xFF204060u);
+    FakeGpu& g1 = static_cast<FakeGpu&>(*first);
+    const uint32_t b1 = app.immed(app.params(first, 0, 480), 120, 80);
+    app.commit(w, b1, 120, 80);
+    CHECK(!app.closing);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (list.empty()) return;
+    const uint32_t win = list[0];
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win, &info, &title) && info.surface.width == 120 && info.surface.height == 80);
+    CHECK(server.window_pixel(win, 5, 5) == 0xFF204060u);
+    g1.pixels[size_t(7) * 120 + 9] = 0xFFFFFFFFu;      // (read where it is: no copy was taken)
+    CHECK(server.window_pixel(win, 9, 7) == 0xFFFFFFFFu);
+    const uint32_t frame = app.new_id();
+    app.send(Msg(w.surface, 3).u(frame));
+    app.send(Msg(w.surface, 6));
+    std::vector<uint32_t> target(200 * 150, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = 200, ts.height = 150, ts.pitch = 200;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(win, r, 10, 20, &dw, &dh) && dw == 120 && dh == 80);
+    }
+    CHECK(g1.draws == 1 && target[size_t(20 + 3) * 200 + 10 + 3] == 0xFF204060u && target[size_t(20 + 7) * 200 + 10 + 9] == 0xFFFFFFFFu);
+    CHECK(app.has(frame, 0));
+    // a picture still being drawn on the GPU: nothing drawn, the desktop is asked to come back
+    List<uint32_t> changed(A);
+    List<desktop::IWindowsSession::Repaint> repainted(A);
+    server.take_changes(&changed, &repainted);
+    g1.busy = true;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    }
+    server.take_changes(&changed, &repainted);
+    CHECK(repainted.count() == 1 && repainted[0].window == win && repainted[0].dirty.width == 120);
+    CHECK(server.window_pixel(win, 5, 5) == 0);
+    g1.busy = false;
+    // `create` instead: the buffer comes as `created` with an id of the server's; the first buffer is released when it replaces it
+    Fd second = Fd::make_as<FakeGpu>(A, 100u, 60u, 0xFF00FF00u);
+    const uint32_t p2 = app.params(second, 0, 400);
+    app.send(Msg(p2, 2).i(100).i(60).u(kAR24).u(0));
+    Ev created = app.take(p2, 0);
+    CHECK(created.object == p2 && created.u(0) >= 0xFF000000u);
+    const uint32_t b2 = created.u(0);
+    app.commit(w, b2, 100, 60);
+    CHECK(app.has(b1, 0));      // release
+    CHECK(server.window_info(win, &info, &title) && info.surface.width == 100 && server.window_pixel(win, 50, 30) == 0xFF00FF00u);
+    app.send(Msg(p2, 0));
+    // destroying a server-made buffer gives no delete_id (its id is not the client's)
+    app.drop_events();
+    app.send(Msg(w.surface, 1).u(0).i(0).i(0));
+    app.send(Msg(w.surface, 6));
+    app.send(Msg(b2, 0));
+    bool deleted = false;
+    app.pull();
+    for (const Ev& e : app.events) deleted |= e.object == 1 && e.opcode == 1 && e.u(0) == b2;
+    CHECK(!deleted && !app.closing);
+    CHECK(listed(server).empty());      // (a null buffer unmapped it)
+    // the image outlives the buffer while a surface holds it, and goes with the last of them
+  }
+  // what `create` answers with failed, and create_immed with invalid_wl_buffer
+  {
+    DmabufApp app(server);
+    std::vector<uint8_t> plain(4096);
+    const uint32_t p = app.params(Fd::make_as<TestMemory>(A, &plain), 0, 64);      // (memory, not a GPU image)
+    app.send(Msg(p, 2).i(16).i(16).u(kXR24).u(0));
+    CHECK(app.has(p, 1) && !app.closing);
+    const uint32_t q = app.params(Fd::make_as<FakeGpu>(A, 32u, 32u, 0u), 0, 100);      // (another stride than the image's)
+    app.send(Msg(q, 2).i(16).i(16).u(kXR24).u(0));
+    CHECK(app.has(q, 1) && !app.closing);
+    const uint32_t f = app.params(Fd::make_as<FakeGpu>(A, 32u, 32u, 0u), 0, 128);      // (y-inverted)
+    app.send(Msg(f, 2).i(32).i(32).u(kXR24).u(1));
+    CHECK(app.has(f, 1) && !app.closing);
+    const uint32_t m = app.params(Fd::make_as<FakeGpu>(A, 32u, 32u, 0u), 0, 128, 0x0100000000000001ull);      // (a tiled layout)
+    app.send(Msg(m, 2).i(32).i(32).u(kXR24).u(0));
+    CHECK(app.has(m, 1) && !app.closing);
+    const uint32_t big = app.params(Fd::make_as<FakeGpu>(A, 32u, 32u, 0u), 0, 128);      // (larger than the image, but within its memory)
+    app.send(Msg(big, 2).i(33).i(16).u(kXR24).u(0));
+    CHECK(app.has(big, 1) && !app.closing);
+    const uint32_t implicit = app.params(Fd::make_as<FakeGpu>(A, 32u, 32u, 0u), 0, 128, 0x00FFFFFFFFFFFFFFull);      // (DRM_FORMAT_MOD_INVALID: taken as linear)
+    app.send(Msg(implicit, 2).i(32).i(32).u(kAB24).u(0));
+    CHECK(app.take(implicit, 0).object == implicit);
+    const uint32_t i2 = app.params(Fd::make_as<TestMemory>(A, &plain), 0, 64);
+    app.immed(i2, 16, 16);
+    uint32_t object = 0, code = 0;
+    CHECK(app.error(&object, &code) && object == i2 && code == 7);
+  }
+  // protocol errors
+  struct Case {
+    const char* what;
+    uint32_t code;
+    std::function<void(DmabufApp&)> run;
+  };
+  const Case cases[] = {
+      {"plane 1", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(1).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
+      {"plane set twice", 2, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.send(Msg(p, 1).u(0).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
+      {"no plane", 3, [](DmabufApp& a) { const uint32_t p = a.params(Fd(), 0, 0); a.immed(p, 16, 16); }},
+      {"format", 4, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16, 0x3231564Eu /* NV12 */); }},
+      {"size", 5, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 0, 16); }},
+      {"bounds", 6, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 1024, 64), 16, 16); }},
+      {"used", 0, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.immed(p, 16, 16); a.immed(p, 16, 16); }},
+      {"add after create", 0, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.immed(p, 16, 16); a.send(Msg(p, 1).u(0).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
+      {"no descriptor", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(0).u(0).u(64).u(0).u(0)); }},
+      {"immed on version 1", 1, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16); }},
+  };
+  for (const Case& k : cases) {
+    DmabufApp app(server, std::string(k.what) == "immed on version 1" ? 1 : 3);
+    k.run(app);
+    uint32_t object = 0, code = 0;
+    const bool err = app.error(&object, &code);
+    if (!err || code != k.code) printf("   dmabuf error case '%s': error %d code %u\n", k.what, err, code);
+    CHECK(err && code == k.code && app.closing);
+  }
+  CHECK(server.client_count() == 0);
+}
+
+// Truncated, chunked and bit-flipped dmabuf sessions: nothing the server is sent breaks it.
+static void test_dmabuf_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  server.set_dmabuf(true);
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(9).s("zwp_linux_dmabuf_v1").u(3).u(5));
+  add(Msg(3, 0).u(10));
+  add(Msg(4, 2).u(11).u(10));
+  add(Msg(11, 1).u(12));
+  add(Msg(10, 6));
+  add(Msg(11, 4).u(1));
+  add(Msg(5, 1).u(13));
+  add(Msg(13, 1).u(0).u(0).u(256).u(0).u(0));      // (the descriptor)
+  add(Msg(13, 3).u(14).i(64).i(64).u(kXR24).u(0));
+  add(Msg(10, 1).u(14).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(5, 1).u(15));
+  add(Msg(15, 1).u(0).u(0).u(256).u(0).u(0));
+  add(Msg(15, 2).i(32).i(32).u(kAR24).u(0));
+  add(Msg(15, 0));
+  add(Msg(14, 0));
+  add(Msg(1, 0).u(16));
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<FakeGpu>(A, 64u, 64u, 0xFF112233u), Fd::make_as<FakeGpu>(A, 64u, 64u, 0xFF445566u)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      server.window_pixel(w, 1, 1);
+    }
+    server.close_client(c);
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 32; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(99);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   dmabuf fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ GPU buffers over the kernel's Direct3D layer (dxgk exports, Wayland/Dxg)
+
+namespace dst = dxgk::status;
+
+// One process of the Direct3D layer with a device on adapter `adapter`.
+struct DxgProcess {
+  dxgk::Kernel& k;
+  dxgk::ProcessId pid;
+  dxgk::Handle adapter = 0, device = 0;
+  DxgProcess(dxgk::Kernel& kernel, dxgk::ProcessId id, uint32_t adapter_index = 0) : k(kernel), pid(id) {
+    CHECK(dst::ok(k.open_process(pid)) && dst::ok(k.open_adapter_from_index(pid, adapter_index, &adapter)) && dst::ok(k.create_device(pid, adapter, &device)));
+  }
+  dxgk::Handle image(uint32_t w, uint32_t h, uint32_t flags = dxgk::kAllocTexture | dxgk::kAllocRenderTarget | dxgk::kAllocShared, dxgk::Format f = dxgk::Format::A8R8G8B8) {
+    dxgk::AllocationDesc d;
+    d.flags = flags;
+    d.format = f;
+    d.width = w, d.height = h;
+    dxgk::Handle a = 0;
+    return dst::ok(k.create_allocation(pid, device, d, &a)) ? a : 0;
+  }
+  // Writes the picture: pixel (x, y) is pattern(x, y), as 0xAARRGGBB (stored in the format's order).
+  bool paint(dxgk::Handle a, uint32_t w, uint32_t h, const std::function<uint32_t(uint32_t, uint32_t)>& pattern, bool rgba = false) {
+    dxgk::LockResult v;
+    if (!dst::ok(k.lock(pid, a, dxgk::kLockDiscard, 0, &v))) return false;
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        uint32_t p = pattern(x, y);
+        if (rgba) p = (p & 0xFF00FF00u) | (p & 0xFFu) << 16 | (p >> 16 & 0xFFu);
+        memcpy(v.data.data() + uint64_t(y) * v.pitch + uint64_t(x) * 4, &p, 4);
+      }
+    return dst::ok(k.unlock(pid, a));
+  }
+};
+
+static uint32_t pattern_a(uint32_t x, uint32_t y) { return 0xFF000000u | (x * 4) << 16 | (y * 5) << 8 | ((x + y) & 0xFF); }
+
+// A file object of a GPU image, as /dev/dxg's export makes it (LinuxFiles.cpp).
+static SharedPointer<process::OpenObject> dmabuf_object(SharedPointer<dxgk::ExportedAllocation> exported) {
+  SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
+  const uint64_t bytes = dxgk::export_info(*exported).bytes;
+  UniquePointer<process::DxgBufferFile> f = UniquePointer<process::DxgBufferFile>::make(A, util::move(exported), bytes);
+  o->gpu_buffer = f.get();
+  o->file = util::move(f);
+  o->readable = true;
+  return o;
+}
+
+// The rules of exports, imports and the kernel's reads.
+static void test_dxg_exports() {
+  graphics::SoftwareDevice device{A, nullptr}, other{A, nullptr};
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0 && k.add_adapter(other, dxgk::AdapterConfig()) == 1);
+  SharedPointer<dxgk::ExportedAllocation> e;
+  {
+    DxgProcess p(k, 1), q(k, 2), elsewhere(k, 3, 1);
+    // what cannot be exported
+    CHECK(k.export_allocation(p.pid, 0x1234, &e) == dst::kInvalidHandle);
+    CHECK(k.export_allocation(p.pid, p.image(16, 16, dxgk::kAllocTexture | dxgk::kAllocRenderTarget), &e) == dst::kAccessDenied && !e);
+    CHECK(k.export_allocation(p.pid, p.image(16, 16, dxgk::kAllocDepthStencil | dxgk::kAllocShared, dxgk::Format::D32Float), &e) == dst::kNotSupported);
+    CHECK(k.export_allocation(p.pid, p.image(16, 16, dxgk::kAllocTexture | dxgk::kAllocShared, dxgk::Format::A32B32G32R32F), &e) == dst::kNotSupported);
+    dxgk::AllocationDesc buffer;
+    buffer.flags = dxgk::kAllocVertexBuffer | dxgk::kAllocShared;
+    buffer.size = 4096;
+    dxgk::Handle vb = 0;
+    CHECK(dst::ok(k.create_allocation(p.pid, p.device, buffer, &vb)) && k.export_allocation(p.pid, vb, &e) == dst::kNotSupported);
+    CHECK(k.export_allocation(q.pid, p.image(16, 16), &e) == dst::kInvalidHandle);      // (another process's handle)
+    // an export, what it says it is, and an import of it in another process: the same memory
+    const dxgk::Handle a = p.image(40, 30);
+    CHECK(a && p.paint(a, 40, 30, pattern_a));
+    CHECK(dst::ok(k.export_allocation(p.pid, a, &e)) && e);
+    if (!e) return;
+    const dxgk::ExportInfo& info = dxgk::export_info(*e);
+    CHECK(info.desc.width == 40 && info.desc.height == 30 && info.pitch == 160 && info.bytes >= 40 * 30 * 4 && info.adapter == 0);
+    dxgk::Handle imported = 0;
+    dxgk::AllocationDesc desc;
+    CHECK(dst::ok(k.import_allocation(q.pid, q.device, *e, &imported, &desc)) && desc.width == 40 && desc.format == dxgk::Format::A8R8G8B8);
+    dxgk::LockResult v;
+    CHECK(dst::ok(k.lock(q.pid, imported, dxgk::kLockReadOnly, 0, &v)));
+    uint32_t px = 0;
+    memcpy(&px, v.data.data() + 7 * 160 + 9 * 4, 4);
+    CHECK(px == pattern_a(9, 7));
+    CHECK(dst::ok(k.unlock(q.pid, imported)));
+    CHECK(k.import_allocation(elsewhere.pid, elsewhere.device, *e, &imported, &desc) == dst::kInvalidParameter);      // (another adapter's memory)
+    CHECK(k.import_allocation(q.pid, 0x999, *e, &imported, &desc) == dst::kInvalidHandle);
+    // the kernel's reads: counted, given back once each
+    dxgk::LockResult r1, r2;
+    CHECK(dst::ok(k.read_export(*e, &r1)) && dst::ok(k.read_export(*e, &r2)) && r1.data.data() == r2.data.data() && r1.pitch == 160);
+    CHECK(dst::ok(k.end_read_export(*e)) && dst::ok(k.end_read_export(*e)) && k.end_read_export(*e) == dst::kInvalidDeviceState);
+    dxgk::AcquiredImage lent;
+    CHECK(dst::ok(k.acquire_export_image(*e, &lent)) && lent.device == &device && lent.image);
+    CHECK(dst::ok(k.release_export_image(*e)) && k.release_export_image(*e) == dst::kInvalidDeviceState);
+    // while the process has the CPU's view of it, the device's image is not lent (the picture may be half written); reads still are
+    CHECK(dst::ok(k.lock(p.pid, a, 0, 0, &v)));
+    CHECK(k.acquire_export_image(*e, &lent) == dst::kInvalidDeviceState);
+    CHECK(dst::ok(k.read_export(*e, &r1)) && dst::ok(k.end_read_export(*e)));
+    CHECK(dst::ok(k.unlock(p.pid, a)));
+    // a texture that is no render target is read, never lent
+    SharedPointer<dxgk::ExportedAllocation> t;
+    CHECK(dst::ok(k.export_allocation(p.pid, p.image(8, 8, dxgk::kAllocTexture | dxgk::kAllocShared), &t)) && k.acquire_export_image(*t, &lent) == dst::kNotSupported);
+    // an export dropped with a read still out gives it back (and is safe)
+    CHECK(dst::ok(k.read_export(*t, &r1)));
+    t.reset();
+    // the allocation outlives its handle and its process while the export holds it
+    CHECK(dst::ok(k.destroy_allocation(p.pid, a)));
+  }
+  k.close_process(1);
+  k.close_process(2);
+  k.close_process(3);
+  dxgk::LockResult v;
+  CHECK(dst::ok(k.read_export(*e, &v)));
+  uint32_t px = 0;
+  memcpy(&px, v.data.data() + 29 * 160 + 39 * 4, 4);
+  CHECK(px == pattern_a(39, 29));
+  CHECK(dst::ok(k.end_read_export(*e)));
+  e.reset();      // (before the kernel)
+}
+
+// A dmabuf passed over the AF_UNIX transport with SCM_RIGHTS, shown by the compositor: drawn in place by a 2D renderer on the image's device (no copy),
+// from the CPU's view by one that is not (a CPU renderer, another device), and still shown after the process that made it is gone.
+static void test_dxg_compositor() {
+  graphics::SoftwareDevice raw{A, nullptr}, other_raw{A, nullptr};
+  graphics::LockedDevice device(raw), other(other_raw);
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  Server server(A);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  filesystem::RamFileSystem files(A);
+  constexpr uint32_t W = 64, H = 48;
+  {
+    wayland::SocketServer transport(server, sockets, A);
+    transport.set_gpu_images(&wayland::make_dxg_image, &k);
+    CHECK(transport.listen(files));
+    std::atomic<bool> stop{false};
+    std::thread pump([&] {
+      while (!stop) {
+        while (transport.pump()) {}
+        transport.wait(5'000'000);
+      }
+    });
+    DxgProcess p(k, 50);
+    const dxgk::Handle a = p.image(W, H);
+    CHECK(p.paint(a, W, H, pattern_a));
+    SharedPointer<dxgk::ExportedAllocation> exported;
+    CHECK(dst::ok(k.export_allocation(p.pid, a, &exported)));
+    SocketClient c(sockets);
+    CHECK(c.connect());
+    std::vector<uint8_t> batch;
+    auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); batch.insert(batch.end(), v.begin(), v.end()); };
+    add(Msg(1, 1).u(2));
+    add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+    add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(5));
+    add(Msg(2, 0).u(9).s("zwp_linux_dmabuf_v1").u(3).u(6));
+    add(Msg(3, 0).u(10));
+    add(Msg(5, 2).u(11).u(10));
+    add(Msg(11, 1).u(12));
+    add(Msg(10, 6));
+    CHECK(c.write(batch));
+    Ev modifier = c.next(6, 1);
+    CHECK(modifier.object == 6);
+    Ev conf = c.next(11, 0);
+    CHECK(conf.object == 11);
+    batch.clear();
+    add(Msg(11, 4).u(conf.u(0)));
+    add(Msg(6, 1).u(13));
+    CHECK(c.write(batch));
+    CHECK(c.write(Msg(13, 1).u(0).u(0).u(W * 4).u(0).u(0).done(), dmabuf_object(exported)));
+    exported.reset();      // (the descriptor in flight holds it now, as after the program closed its copy)
+    batch.clear();
+    add(Msg(13, 3).u(14).i(W).i(H).u(kXR24).u(0));
+    add(Msg(10, 1).u(14).i(0).i(0));
+    add(Msg(10, 2).i(0).i(0).i(W).i(H));
+    add(Msg(10, 6));
+    add(Msg(1, 0).u(15));
+    CHECK(c.write(batch));
+    CHECK(c.next(15, 0).object == 15);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      const uint32_t win = list[0];
+      CHECK(server.window_pixel(win, 9, 7) == pattern_a(9, 7));
+      auto compare = [&](const std::vector<uint32_t>& out, uint32_t stride, int32_t ox, int32_t oy, uint32_t mask) {
+        uint64_t differing = 0;
+        for (uint32_t y = 0; y < H; ++y)
+          for (uint32_t x = 0; x < W; ++x) differing += (out[size_t(oy + y) * stride + size_t(ox) + x] & mask) != (pattern_a(x, y) & mask);
+        return differing;
+      };
+      // the desktop's renderer on the image's device: the image is sampled where it is
+      graphics::DeviceRenderer2D gpu(device, A, {W + 20, H + 10});
+      CHECK(gpu.valid());
+      gpu.clear(0xFF303030u);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(win, gpu, 10, 5, &dw, &dh) && dw == W && dh == H);
+      std::vector<uint32_t> out(size_t(W + 20) * (H + 10));
+      CHECK(gpu.read_pixels(ArrayView<uint32_t>(out.data(), out.size())));
+      const uint64_t d1 = compare(out, W + 20, 10, 5, 0x00FFFFFFu);
+      printf("   dmabuf drawn on its device: %llu of %u pixels differ\n", (unsigned long long)d1, W * H);
+      CHECK(d1 == 0 && out[0] == 0xFF303030u);
+      // a CPU renderer: from the CPU's view
+      std::vector<uint32_t> cpu_out(size_t(W) * H, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(cpu_out.data(), cpu_out.size());
+      ts.width = W, ts.height = H, ts.pitch = W;
+      for (int round = 0; round < 2; ++round) {      // (the second time without asking for the device's image)
+        graphics::SoftwareRenderer2D cpu(ts);
+        CHECK(server.draw_window(win, cpu, 0, 0, &dw, &dh));
+        CHECK(compare(cpu_out, W, 0, 0, 0x00FFFFFFu) == 0);
+      }
+      // another device's renderer: the CPU's view again
+      graphics::DeviceRenderer2D foreign(other, A, {W, H});
+      CHECK(server.draw_window(win, foreign, 0, 0, &dw, &dh));
+      std::vector<uint32_t> fout(size_t(W) * H);
+      CHECK(foreign.read_pixels(ArrayView<uint32_t>(fout.data(), fout.size())) && compare(fout, W, 0, 0, 0x00FFFFFFu) == 0);
+      // the program draws a new picture into the same image: the next draw shows it (on the device too)
+      CHECK(p.paint(a, W, H, [](uint32_t x, uint32_t y) { return 0xFF000000u | (y * 3) << 16 | (x * 2); }));
+      gpu.clear(0);
+      CHECK(server.draw_window(win, gpu, 10, 5, &dw, &dh));
+      CHECK(gpu.read_pixels(ArrayView<uint32_t>(out.data(), out.size())));
+      CHECK((out[size_t(5 + 20) * (W + 20) + 10 + 30] & 0xFFFFFF) == ((20u * 3) << 16 | 30u * 2));
+      // the process goes; the picture stays (the descriptor holds it) until the client lets go of the buffer
+      k.close_process(p.pid);
+      CHECK((server.window_pixel(win, 30, 20) & 0xFFFFFF) == ((20u * 3) << 16 | 30u * 2));
+      // a descriptor of the GPU that is not the transport's kind of image: not a buffer
+    }
+    stop = true;
+    pump.join();
+  }
+  CHECK(server.client_count() == 0);
+}
+
+// Client processes on their own threads paint and commit their GPU buffers, export new ones, destroy their allocations and exit, while the desktop's thread
+// draws every window on the device and on the CPU and reads their pixels.
+static void test_dxg_threads() {
+  graphics::SoftwareDevice raw{A, nullptr};
+  graphics::LockedDevice device(raw);
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1600, 1200, {});
+  server.set_dmabuf(true);
+  // what the transport hands the server for a dmabuf
+  struct ImageFd final : wayland::Memory {
+    SharedPointer<wayland::GpuImage> image;
+    explicit ImageFd(SharedPointer<wayland::GpuImage> i) : image(util::move(i)) {}
+    ByteView map(uint64_t) override { return ByteView(); }
+    wayland::GpuImage* gpu() override { return image.get(); }
+  };
+  constexpr int kClients = 4, kFrames = 80;
+  std::atomic<int> running{kClients};
+  std::atomic<int> drawn{0};
+  std::thread desktop([&] {
+    graphics::DeviceRenderer2D gpu(device, A, {256, 256});
+    std::vector<uint32_t> canvas(256 * 256);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(canvas.data(), canvas.size());
+    ts.width = ts.height = ts.pitch = 256;
+    bool on_gpu = false;
+    while (running > 0) {
+      for (uint32_t w : listed(server)) {
+        uint32_t dw, dh;
+        on_gpu = !on_gpu;
+        if (on_gpu) {
+          if (server.draw_window(w, gpu, 0, 0, &dw, &dh)) ++drawn;
+        } else {
+          graphics::SoftwareRenderer2D cpu(ts);
+          if (server.draw_window(w, cpu, 0, 0, &dw, &dh)) ++drawn;
+        }
+        server.window_pixel(w, 3, 3);
+      }
+      List<uint32_t> changed(A);
+      List<desktop::IWindowsSession::Repaint> repainted(A);
+      server.take_changes(&changed, &repainted);
+    }
+  });
+  std::vector<std::thread> clients;
+  std::atomic<int> bad{0};
+  for (int i = 0; i < kClients; ++i)
+    clients.emplace_back([&, i] {
+      DxgProcess p(k, 100 + i);
+      DmabufApp app(server);
+      App::Window w = app.toplevel(true, "gpu-" + std::to_string(i));
+      dxgk::Handle a = 0;
+      uint32_t buffer = 0;
+      for (int f = 0; f < kFrames; ++f) {
+        if (f % 10 == 0) {      // a new image now and then: export, pass, the old allocation destroyed (its buffer still shown until replaced)
+          const dxgk::Handle next = p.image(64, 64);
+          SharedPointer<dxgk::ExportedAllocation> e;
+          if (!next || !dst::ok(k.export_allocation(p.pid, next, &e))) { ++bad; break; }
+          SharedPointer<process::OpenObject> object = dmabuf_object(util::move(e));
+          Fd fd = Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, *object));
+          if (a) k.destroy_allocation(p.pid, a);
+          a = next;
+          if (buffer) app.send(Msg(buffer, 0));
+          buffer = app.immed(app.params(fd, 0, 256), 64, 64);
+        }
+        const uint32_t color = 0xFF000000u | uint32_t(i * 50) << 16 | uint32_t(f * 5);
+        if (!p.paint(a, 64, 64, [color](uint32_t, uint32_t) { return color; })) ++bad;
+        app.commit(w, buffer, 64, 64);
+        if (app.closing) { ++bad; break; }
+        std::this_thread::sleep_for(std::chrono::microseconds(500));      // (so that the desktop draws in between)
+      }
+      k.close_process(p.pid);      // (the last image's export lives on in the buffer)
+      app.commit(w, buffer, 64, 64);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      --running;
+    });
+  for (std::thread& t : clients) t.join();
+  desktop.join();
+  printf("   dmabuf threads: %d windows drawn\n", drawn.load());
+  CHECK(bad == 0 && drawn > kClients * 4);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -1433,7 +2046,12 @@ int main() {
   test_seat();
   test_errors();
   test_fuzz();
+  test_dmabuf();
+  test_dmabuf_fuzz();
   test_socket_transport();
+  test_dxg_exports();
+  test_dxg_compositor();
+  test_dxg_threads();
   test_threads();
   free_made();
   if (g_failed) {

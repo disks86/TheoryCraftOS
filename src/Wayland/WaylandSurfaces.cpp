@@ -1305,6 +1305,11 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, i
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
+    if (GpuImage* image = s.current.image()) {      // a dmabuf: drawn where it is (see GpuImage::draw)
+      renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
+      if (!image->draw(renderer, {0, 0, static_cast<uint32_t>(s.current.width), static_cast<uint32_t>(s.current.height)}, x, y)) draw_missed_ = true;
+      continue;
+    }
     ArrayView<uint32_t> pixels = buffer_pixels(s.current);
     if (pixels.size() == 0) continue;
     graphics::Surface picture;

@@ -31,7 +31,9 @@ namespace {
 // view map() gave stays valid even if the client grows the file meanwhile).
 class KernelFd final : public Memory {
  public:
-  explicit KernelFd(SharedPointer<process::OpenObject> object) : object_(util::move(object)) {}
+  explicit KernelFd(SharedPointer<process::OpenObject> object, SharedPointer<GpuImage> image = SharedPointer<GpuImage>())
+      : object_(util::move(object)), image_(util::move(image)) {}
+  GpuImage* gpu() override { return image_.get(); }
   ByteView map(uint64_t size) override {
     if (!object_ || !object_->memory) return ByteView();
     uint64_t file_size = 0;
@@ -44,6 +46,7 @@ class KernelFd final : public Memory {
 
  private:
   SharedPointer<process::OpenObject> object_;
+  SharedPointer<GpuImage> image_;      // a GPU image (a dmabuf), made by the transport's maker
   process::BlockRef block_;
 };
 
@@ -91,6 +94,12 @@ Fd SocketServer::make_fd(void* self, ConstByteView contents) {
   object->file = util::move(file);
   object->readable = true;      // (every client maps the same pages, read-only)
   return Fd::make_as<KernelFd>(s.allocator_, util::move(object));
+}
+
+void SocketServer::set_gpu_images(MakeGpuImage make, void* context) {
+  make_gpu_ = make;
+  make_gpu_context_ = context;
+  server_.set_dmabuf(make != nullptr);
 }
 
 bool SocketServer::listen(filesystem::IFileSystem& files) {
@@ -190,9 +199,12 @@ bool SocketServer::pump() {
     for (uint64_t i = 0; received.dequeue(&entry); ++i) {
       Connection& c = *owners[i];
       SharedPointer<process::OpenObject> object;
-      if (entry.kind == process::DescriptorKind::File && entry.object && entry.object->memory) object = entry.object;
+      SharedPointer<GpuImage> image;
+      const bool file = entry.kind == process::DescriptorKind::File && entry.object;
+      if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, *entry.object);
+      if (file && (entry.object->memory || image)) object = entry.object;
       else unsent.enqueue(util::move(entry));
-      Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object));
+      Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object), util::move(image));
       if (!fd || !c.fds.push_back(util::move(fd))) c.dead = true;
     }
   }

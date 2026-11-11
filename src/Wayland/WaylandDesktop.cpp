@@ -143,10 +143,12 @@ bool Server::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32
     if (!s || !s->mapped || !s->current.valid()) return false;
     List<uint32_t> done(allocator_);
     const int32_t gx = s->geometry_set ? s->geometry.x : 0, gy = s->geometry_set ? s->geometry.y : 0;
+    draw_missed_ = false;
     draw_tree(*s, renderer, x - gx, y - gy, true, &done);
     renderer.set_blend(graphics::BlendMode::Alpha);
     int32_t w = 0, h = 0;
     actual_size(*s, &w, &h);
+    if (draw_missed_) note_repaint(*s, {0, 0, w, h});      // (a GPU picture that was still being drawn: the desktop comes back for it)
     *width = static_cast<uint32_t>(max32(w, 0));
     *height = static_cast<uint32_t>(max32(h, 0));
     // the frame callbacks of what was drawn: the client may draw the next frame
@@ -260,6 +262,10 @@ uint32_t Server::window_pixel(uint32_t window, int32_t x, int32_t y) {
   if (!s || !s->current.valid()) return 0;
   const int32_t bx = x + (s->geometry_set ? s->geometry.x : 0), by = y + (s->geometry_set ? s->geometry.y : 0);
   if (bx < 0 || by < 0 || bx >= s->current.width || by >= s->current.height) return 0;
+  if (GpuImage* image = s->current.image()) {      // (0xAARRGGBB whatever the image's order)
+    uint32_t pixel = 0;
+    return image->read({bx, by, 1, 1}, ArrayView<uint32_t>(&pixel, 1)) ? pixel : 0;
+  }
   ArrayView<uint32_t> pixels = buffer_pixels(s->current);
   const uint64_t at = uint64_t(by) * uint64_t(s->current.stride / 4) + uint64_t(bx);
   return at < pixels.size() ? pixels[at] : 0;

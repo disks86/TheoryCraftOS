@@ -285,12 +285,25 @@ bool Server::cursor_picture(uint32_t handle, uint32_t* system_id, List<uint32_t>
   const BufferInfo& b = cursor_surface_->current;
   if (b.width > 256 || b.height > 256) return false;
   ArrayView<uint32_t> pixels = buffer_pixels(b);
+  uint64_t row = uint64_t(b.stride / 4);
+  // a GPU cursor is read out first (as 0xAARRGGBB, rows of its width)
+  List<uint32_t> gpu_pixels(allocator_);
+  GpuImage* image = b.image();
+  if (image) {
+    const uint64_t count = uint64_t(b.width) * uint64_t(b.height);
+    if (!gpu_pixels.reserve(count)) return false;
+    for (uint64_t i = 0; i < count; ++i) gpu_pixels.push_back(0);
+    if (!image->read({0, 0, static_cast<uint32_t>(b.width), static_cast<uint32_t>(b.height)}, gpu_pixels.view()))
+      return false;
+    pixels = gpu_pixels.view();
+    row = uint64_t(b.width);
+  }
   if (pixels.size() == 0 || !argb->reserve(uint64_t(b.width) * uint64_t(b.height))) return false;
-  const bool swap = b.format == kFormatAbgr8888 || b.format == kFormatXbgr8888;
+  const bool swap = !image && (b.format == kFormatAbgr8888 || b.format == kFormatXbgr8888);
   const bool alpha = b.format == kFormatArgb8888 || b.format == kFormatAbgr8888;
   for (int32_t y = 0; y < b.height; ++y) {
     for (int32_t x = 0; x < b.width; ++x) {
-      uint32_t p = pixels[uint64_t(y) * uint64_t(b.stride / 4) + uint64_t(x)];
+      uint32_t p = pixels[uint64_t(y) * row + uint64_t(x)];
       if (swap) p = (p & 0xFF00FF00u) | ((p & 0xFFu) << 16) | ((p >> 16) & 0xFFu);
       if (!alpha) {
         p |= 0xFF000000u;

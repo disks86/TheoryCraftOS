@@ -9,4 +9,5 @@
 #include "vk_pipeline.inc"
 #include "vk_commands.inc"
 #include "vk_wsi.inc"
+#include "vk_external.inc"
 #include "vk_entry.inc"

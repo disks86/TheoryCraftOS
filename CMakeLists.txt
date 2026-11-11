@@ -762,7 +762,9 @@ add_executable(BOOTX64
   src/X11/X11SocketServer.cpp
   src/X11/X11Tables.cpp
   src/X11/X11Windows.cpp
+  src/Wayland/Dxg/WaylandDxgImage.cpp
   src/Wayland/WaylandDesktop.cpp
+  src/Wayland/WaylandDmabuf.cpp
   src/Wayland/WaylandInput.cpp
   src/Wayland/WaylandKeymap.cpp
   src/Wayland/WaylandServer.cpp

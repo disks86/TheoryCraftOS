@@ -23,8 +23,9 @@
 // goes out as the client's socket has room, its descriptors with the first of those bytes.
 //
 // Descriptors: one a client passes (SCM_RIGHTS) that is a file in memory (memfd_create, Process/MemoryFile.hpp) is memory the server reads in place (a
-// wl_shm pool); any other kind is handed to the server as one with no memory (the request that takes it fails). The ones the server sends (the keymap) are
-// files in memory made here, sealed.
+// wl_shm pool); one that is a GPU image (a dmabuf of /dev/dxg, Process/DxgBufferFile.hpp) becomes a GpuImage through the maker the kernel sets
+// (set_gpu_images: Wayland/Dxg/WaylandDxgImage.hpp), which also has the server offer zwp_linux_dmabuf_v1; any other kind is handed to the server as one with
+// no memory (the request that takes it fails). The ones the server sends (the keymap) are files in memory made here, sealed.
 //
 // Locking: the sockets are moved under the system's lock (UnixSocketManager's ISystemSync); the server is fed with that lock let go (the server's mutex
 // and the system lock are never held together). The server's wake-up sets a flag and notifies under the system lock, so the thread cannot miss it between
@@ -48,6 +49,9 @@ class SocketServer {
   SocketServer(const SocketServer&) = delete;
   SocketServer& operator=(const SocketServer&) = delete;
 
+  // Makes GPU images of the dmabufs clients pass (null: none; zwp_linux_dmabuf_v1 is offered while there is a maker). Set before start().
+  using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, process::OpenObject& object);
+  void set_gpu_images(MakeGpuImage make, void* context);
   // Binds the socket file (made afresh in `files`, the system's file system, where /Linux/run is). False when it could not be bound.
   bool listen(filesystem::IFileSystem& files);
   // One round: new connections, what came, what is owed. True when anything moved (call again before waiting).
@@ -85,6 +89,8 @@ class SocketServer {
   List<UniquePointer<Connection>> connections_;
   ByteBuffer chunk_;
   bool woken_ = false;      // (under the system lock)
+  MakeGpuImage make_gpu_ = nullptr;
+  void* make_gpu_context_ = nullptr;
   volatile bool stopping_ = false;
   kernel::Thread* thread_ = nullptr;
 };

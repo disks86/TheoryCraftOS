@@ -209,7 +209,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
   }
   OpenObject* object = p.files().object(fd);
   DirectoryEntry entry;
-  if (object->memory) {      // (a file in memory has no path to look at: a regular file of its size)
+  if (object->memory || object->gpu_buffer) {      // (a file in memory or a GPU image has no path to look at: a regular file of its size)
     entry.size = object->file->size();
     *m = meta_of(entry, object->path.view());
     return 0;
@@ -745,16 +745,90 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path) {
 
 namespace {
 DxgServiceHandler g_dxg_handler = nullptr;      // set once at boot, before any process runs (install_dxg)
+DxgExportHandler g_dxg_export = nullptr;
+DxgImportHandler g_dxg_import = nullptr;
+
+void put_le32(uint8_t* at, uint32_t v) {
+  for (int i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
+}
+
+// TCOS_DXG_IOCTL_EXPORT: a descriptor (a File-kind object whose file is a DxgBufferFile) for an allocation's export.
+uint64_t dxg_export(Process& p, uint64_t argument) {
+  uint8_t raw[16];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t allocation = reader.le32(), flags = reader.le32();
+  if (flags & ~uint32_t(TCOS_DXG_EXPORT_CLOEXEC)) return error(kEinval);
+  if (!g_dxg_export) return error(kEnodev);
+  SharedPointer<dxgk::ExportedAllocation> exported;
+  uint64_t bytes = 0;
+  uint32_t status = 0;
+  if (!g_dxg_export(p, allocation, &exported, &bytes, &status)) return error(kEnodev);
+  int64_t fd = -1;
+  if (exported) {
+    // (the object outlives the process when it is passed on: it comes from the system's allocator when there is one, as a memfd's does)
+    ProcessFiles& files = p.files();
+    ObjectManager* objects = system_objects();
+    allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
+    SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
+    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, util::move(exported), bytes);
+    if (!object || !file || !object->path.append("/dmabuf:dxg")) return error(kEnomem);
+    object->gpu_buffer = file.get();
+    object->file = util::move(file);
+    object->readable = true;
+    fd = files.install(DescriptorKind::File, object, 0);
+    if (fd < 0) return error(kEmfile);
+    files.set_close_on_exec(uint64_t(fd), (flags & TCOS_DXG_EXPORT_CLOEXEC) != 0);
+  }
+  uint8_t out[8];
+  put_le32(out, uint32_t(int32_t(fd)));
+  put_le32(out + 4, status);
+  if (p.write_user(argument + 8, ConstByteView(out, sizeof(out)))) return 0;
+  if (fd >= 0) p.files().close(uint64_t(fd));
+  return error(kEfault);
+}
+
+// TCOS_DXG_IOCTL_IMPORT: an allocation handle of the process for the image of a descriptor.
+uint64_t dxg_import(Process& p, uint64_t argument) {
+  uint8_t raw[32];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t fd = reader.le32(), device = reader.le32();
+  if (p.descriptor(fd) != DescriptorKind::File) return error(kEbadf);
+  SharedPointer<OpenObject> object = p.files().shared_object(fd);      // (held: another thread may close the descriptor meanwhile)
+  if (!object || !object->gpu_buffer || !object->gpu_buffer->exported()) return error(kEbadf);
+  if (!g_dxg_import) return error(kEnodev);
+  DxgImported imported;
+  uint32_t status = 0;
+  if (!g_dxg_import(p, device, *object->gpu_buffer->exported(), &imported, &status)) return error(kEnodev);
+  uint8_t out[24];
+  put_le32(out, imported.allocation);
+  put_le32(out + 4, status);
+  put_le32(out + 8, imported.width);
+  put_le32(out + 12, imported.height);
+  put_le32(out + 16, imported.format);
+  put_le32(out + 20, imported.pitch);
+  return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+}
 }  // namespace
 
 void set_dxg_service_handler(DxgServiceHandler handler) { g_dxg_handler = handler; }
+void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler) {
+  g_dxg_export = export_handler;
+  g_dxg_import = import_handler;
+}
 
-// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h). Everything else, and ioctl on other descriptors, is ENOTTY.
+// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h); TCOS_DXG_IOCTL_EXPORT / IMPORT make and open GPU images as descriptors. Everything else,
+// and ioctl on other descriptors, is ENOTTY.
 uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
-  if (kind != DescriptorKind::Dxg || uint32_t(request) != TCOS_DXG_IOCTL_CALL) return error(kEnotty);      // (the request is an unsigned int: the upper half is not part of it)
+  if (kind != DescriptorKind::Dxg) return error(kEnotty);
+  const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)
+  if (code == TCOS_DXG_IOCTL_EXPORT) return dxg_export(p, argument);
+  if (code == TCOS_DXG_IOCTL_IMPORT) return dxg_import(p, argument);
+  if (code != TCOS_DXG_IOCTL_CALL) return error(kEnotty);
   // TcosDxgCall: service (4), status (4), params (8)
   uint8_t raw[16];
   if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);

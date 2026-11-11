@@ -29,11 +29,13 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 8;
+constexpr uint32_t kGlobalCount = 9;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 5}, {"zxdg_decoration_manager_v1", 1},
+    {"zwp_linux_dmabuf_v1", 3},      // (only offered with set_dmabuf)
 };
+constexpr uint32_t kDmabufGlobal = 9;
 
 }  // namespace
 
@@ -253,6 +255,28 @@ Server::Resource* Server::new_object(Client& c, uint32_t id, Iface iface, uint32
   return c.objects.find(id);
 }
 
+Server::Resource* Server::new_server_object(Client& c, Iface iface, uint32_t version, uint32_t* id) {
+  if (c.objects.count() >= kMaxObjects || c.next_server_id < kFirstServerId) {      // (ids are not reused: after 16M of them the client is out)
+    post_error(c, kDisplayId, kErrorNoMemory, "too many objects");
+    return nullptr;
+  }
+  Resource r;
+  r.iface = iface;
+  r.version = version;
+  const uint32_t made = c.next_server_id++;
+  if (!c.objects.put(made, r)) {
+    post_error(c, kDisplayId, kErrorNoMemory, "out of memory");
+    return nullptr;
+  }
+  *id = made;
+  return c.objects.find(made);
+}
+
+void Server::set_dmabuf(bool offered) {
+  kernel::ScopedMutex lock(mutex_);
+  dmabuf_ = offered;
+}
+
 Server::Resource* Server::object_of(Client& c, uint32_t id, Iface iface, uint32_t from) {
   Resource* r = c.objects.find(id);
   if (!r || r->iface != iface) {
@@ -264,18 +288,19 @@ Server::Resource* Server::object_of(Client& c, uint32_t id, Iface iface, uint32_
 
 void Server::destroy_object(Client& c, uint32_t id) {
   c.objects.remove(id);
-  delete_id(c, id);
+  if (id <= kLastClientId) delete_id(c, id);      // (an id the server gave is not the client's to reuse: no delete_id, as libwayland)
 }
 
 // ------------------------------------------------------------------ the registry
 
 void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t version, uint32_t id) {
-  if (name == 0 || name > kGlobalCount || interface != StringView(kGlobals[name - 1].name) || version == 0 || version > kGlobals[name - 1].version) {
+  if (name == 0 || name > kGlobalCount || (name == kDmabufGlobal && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 ||
+      version > kGlobals[name - 1].version) {
     post_error(c, kDisplayId, kErrorInvalidObject, "invalid global");
     return;
   }
   constexpr Iface kIfaces[kGlobalCount] = {Iface::Compositor, Iface::Subcompositor, Iface::Shm, Iface::Seat,
-                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager};
+                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -329,6 +354,17 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       if (version >= 2) send(c, Event(object, 2));      // done
       return;
     }
+    case Iface::LinuxDmabuf: {
+      // the formats, all linear: format events before version 3, modifier events from it on
+      const uint32_t formats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
+      for (uint32_t f : formats) {
+        Event e(object, version >= 3 ? 1 : 0);
+        e.u(f);
+        if (version >= 3) e.u(uint32_t(kDrmModLinear >> 32)).u(uint32_t(kDrmModLinear));
+        send(c, e);
+      }
+      return;
+    }
     default: return;
   }
 }
@@ -350,6 +386,7 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         const uint32_t registry = in.u();
         if (!in.ok() || !new_object(c, registry, Iface::Registry, 1, id)) return;
         for (uint32_t g = 0; g < kGlobalCount; ++g) {
+          if (g + 1 == kDmabufGlobal && !dmabuf_) continue;
           Event e(registry, 0);
           e.u(g + 1).string(kGlobals[g].name).u(kGlobals[g].version);
           send(c, e);
@@ -435,6 +472,8 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::Popup: popup_request(c, id, r, opcode, in); return;
     case Iface::DecorationManager:
     case Iface::Decoration: decoration_request(c, id, r, opcode, in); return;
+    case Iface::LinuxDmabuf:
+    case Iface::BufferParams: dmabuf_request(c, id, r, opcode, in); return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");
       return;
