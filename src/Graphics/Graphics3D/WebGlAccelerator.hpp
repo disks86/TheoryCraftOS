@@ -26,6 +26,7 @@
 #include "Graphics/Graphics3D/IGraphicsDevice.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
 #include "WebGl/Accelerator.hpp"
 
@@ -40,6 +41,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   const char* name() const override { return device_.info().name; }
   webgl::AccelLimits limits() const override;
   uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) override;
+  uint32_t create_program_stages(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures, const webgl::AccelStages& stages) override;
   void destroy_program(uint32_t program) override;
   uint32_t create_texture(uint32_t w, uint32_t h) override;
   void destroy_texture(uint32_t texture) override;
@@ -57,11 +59,17 @@ class WebGlAccelerator final : public webgl::IAccelerator {
     IPipeline* pipeline = nullptr;
   };
   struct Program {
-    explicit Program(allocators::IAllocator& a) : variants(a) {}
+    explicit Program(allocators::IAllocator& a) : variants(a), gs_text(a), tcs_text(a), tes_text(a) {}
     IShaderModule* vs = nullptr;
     IShaderModule* fs = nullptr;
+    IShaderModule* gs = nullptr;    // the geometry stage, or nullptr
+    IShaderModule* hs = nullptr;    // the tessellation stages (both or neither)
+    IShaderModule* ds = nullptr;
     List<Variant> variants;
     uint32_t attributes = 0, varyings = 0, textures = 0;
+    uint8_t gs_input = 2;           // graphics::GeometryPrimitive the geometry stage takes
+    uint32_t patch_vertices = 0;    // with tessellation: the vertices of a patch
+    String gs_text, tcs_text, tes_text;   // (the device may read a module's text again when it makes a pipeline: these copies live as long as the modules)
   };
   struct Texture {
     IImage* image = nullptr;

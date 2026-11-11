@@ -892,11 +892,17 @@ class Parser {
   };
 
   // The keys of the geometry and tessellation layouts (others are accepted and ignored, as before).
-  bool layout_stage_key(StringView key, int32_t value, Quals* q) {
+  // The primitive a layout key names (GL enum values), or 0xFFFFFFFF.
+  static uint32_t layout_primitive(StringView key) {
     struct K { const char* name; uint32_t prim; };
     static const K kPrims[] = {{"points", 0}, {"lines", 1}, {"lines_adjacency", 0xA}, {"triangles", 4}, {"triangles_adjacency", 0xC}, {"line_strip", 3}, {"triangle_strip", 5},
                                {"quads", 7}, {"isolines", 0x8E7A}};
-    for (const K& k : kPrims) if (key.equals(k.name)) { q->prim = k.prim; return true; }
+    for (const K& k : kPrims) if (key.equals(k.name)) return k.prim;
+    return 0xFFFFFFFFu;
+  }
+  bool layout_stage_key(StringView key, int32_t value, Quals* q) {
+    const uint32_t prim = layout_primitive(key);
+    if (prim != 0xFFFFFFFFu) { q->prim = prim; return true; }
     if (key.equals("max_vertices")) q->max_vertices = value;
     else if (key.equals("invocations")) { if (value < 1 || value > 32) return err("bad number of geometry shader invocations"); q->invocations = value; }
     else if (key.equals("vertices")) { if (value < 1 || value > 32) return err("bad number of patch vertices"); q->vertices = value; }
@@ -1017,9 +1023,8 @@ class Parser {
       int32_t vertices = -1;
       for (; k < toks_.count() && !toks_[k].text.equals(")"); ++k) {
         if (toks_[k].kind != Tok::Ident) continue;
-        Quals q;
         if (toks_[k].text.equals("vertices") && k + 2 < toks_.count() && toks_[k + 2].kind == Tok::Int) vertices = static_cast<int32_t>(toks_[k + 2].ival);
-        else if (layout_stage_key(toks_[k].text, 0, &q) && q.prim != 0xFFFFFFFFu) prim = q.prim;
+        else if (layout_primitive(toks_[k].text) != 0xFFFFFFFFu) prim = layout_primitive(toks_[k].text);      // (only the names: the values are checked when the layout is parsed)
       }
       if (k + 2 >= toks_.count() || toks_[k + 2].kind != Tok::Punct || !toks_[k + 2].text.equals(";")) continue;
       const StringView dir = toks_[k + 1].text;
