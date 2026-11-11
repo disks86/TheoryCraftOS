@@ -35,6 +35,11 @@
 #include "Process/ProgramEnvironment.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#ifdef TCOS_EMU_X11
+#include <set>
+#include "Process/UnixSockets.hpp"
+#include "X11/X11SocketServer.hpp"
+#endif
 using namespace emulation;
 
 // With -DTCOS_EMU_DXG the program also has the kernel's Direct3D: win32k with the NtGdiDdDDI* services over a dxgk::Kernel that has one adapter, the software renderer (the
@@ -140,12 +145,40 @@ int main(int argc, char** argv) {
   process::win32k::install();
   process::win32k::install_dxg();
 #endif
+#ifdef TCOS_EMU_X11
+  // With -DTCOS_EMU_X11 the kernel's X server listens for the program at DISPLAY=:0 (the abstract name and /tmp/.X11-unix/X0 of the Linux tree), on a thread
+  // of its own as in the kernel; a stand-in desktop notes the titles of the top-level windows it is shown.
+  x11::Server x11_server(a);
+  x11_server.attach(6, 19);
+  x11::SocketServer x11_sockets(x11_server, *process::system_unix_sockets(), a);
+  if (!x11_sockets.listen(0, &fs)) printf("x11: could not listen\n");
+  std::atomic<bool> x11_stop{false};
+  std::set<std::string> x11_titles;
+  std::thread x11_thread([&] {
+    while (!x11_stop) {
+      while (x11_sockets.pump()) {}
+      x11_sockets.wait(2'000'000);
+      List<uint32_t> windows(a);
+      x11_server.windows(&windows);
+      for (uint32_t w : windows.view()) {
+        desktop::WindowsWindowInfo info;
+        String title(a);
+        if (x11_server.window_info(w, &info, &title) && info.visible && info.caption) x11_titles.insert(std::string(title.c_str()));
+      }
+    }
+  });
+#endif
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
 #ifdef TCOS_EMU_DXG
   process::win32k::dxg::shutdown_for_tests();      // (the layer's records point into the kernel and the allocator, which are going away)
   dxgk::set_system_kernel(nullptr);
+#endif
+#ifdef TCOS_EMU_X11
+  x11_stop = true;
+  x11_thread.join();
+  for (const std::string& t : x11_titles) printf("x11-desktop: framed window \"%s\"\n", t.c_str());
 #endif
   printf("[exit=%u faulted=%d killed=%d vector=%d addr=%llx pc=%llx]\n", o.exit_code, o.faulted, o.killed, o.fault.vector, (unsigned long long)o.fault.address, (unsigned long long)o.fault.pc);
 }

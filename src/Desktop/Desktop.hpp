@@ -244,6 +244,10 @@ class Desktop {
   // (Win32Windows.hpp). Null: none.
   void set_windows_session(IWindowsSession* session) { win32_windows_.set_session(session, &windows_); }
   Win32Windows& win32_windows() { return win32_windows_; }
+  // The X programs' windows and input (the kernel's X server, src/X11/X11Server.hpp): shown, framed and handled by the same code as the Windows programs'
+  // windows (Win32Windows speaks desktop::IWindowsSession, which the X server implements too), so both look and behave alike. Null: none.
+  void set_x11_session(IWindowsSession* session) { x11_windows_.set_session(session, &windows_); }
+  Win32Windows& x11_windows() { return x11_windows_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
   // Opens the computer manager, or brings it forward (restoring it if minimized); it refreshes once a second meanwhile.
@@ -423,6 +427,7 @@ class Desktop {
   FileExplorer explorer_;
   ComputerManager computer_manager_;
   Win32Windows win32_windows_;
+  Win32Windows x11_windows_;      // (the X server's windows: see set_x11_session)
   Notepad notepad_;
   FileProperties file_properties_;
   Paint paint_;
