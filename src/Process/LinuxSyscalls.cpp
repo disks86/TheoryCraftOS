@@ -17,11 +17,13 @@
  */
 #include "Process/AddressSpace.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
-// The Linux system-call interface: the calls a statically linked program needs to talk to the console, read the clock, sleep and exit. Numbers differ by
+// The Linux system-call interface: the calls a statically linked program needs to talk to the console, read the clock, sleep and exit, its files, threads, and
+// AF_UNIX sockets (LinuxSockets.cpp, shared with Windows programs). Numbers differ by
 // CPU: x86-64 has its own table, AArch64 and RISC-V 64 share the "generic" one. A call not listed returns -ENOSYS, which is what libc expects from a
 // kernel that lacks it. Results are the value or -errno in the result register.
 namespace process {
@@ -35,7 +37,9 @@ constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
-  Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed };
+  Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
+  Socket, Socketpair, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
+  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6 };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -67,6 +71,13 @@ constexpr NumberEntry kNumbers[] = {
     {162, 81, Call::Succeed},
     {56, 220, Call::Clone},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
     {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
+    // sockets (AF_UNIX: LinuxSockets.cpp)
+    {41, 198, Call::Socket},       {53, 199, Call::Socketpair}, {49, 200, Call::Bind},       {42, 203, Call::Connect},
+    {50, 201, Call::Listen},       {43, 202, Call::Accept},     {288, 242, Call::Accept4},   {44, 206, Call::Sendto},
+    {45, 207, Call::Recvfrom},     {46, 211, Call::Sendmsg},    {47, 212, Call::Recvmsg},    {307, 269, Call::Sendmmsg},
+    {299, 243, Call::Recvmmsg},    {48, 210, Call::Shutdown},   {51, 204, Call::Getsockname}, {52, 205, Call::Getpeername},
+    {54, 208, Call::Setsockopt},   {55, 209, Call::Getsockopt}, {7, kAbsent, Call::Poll},    {271, 73, Call::Ppoll},
+    {23, kAbsent, Call::Select},   {270, 72, Call::Pselect6},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -237,7 +248,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
       case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
-      case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0]);
+      case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0], a[1], a[2]);
       case Call::Fstat: return linuxabi::sys_fstat(process, arch_, a[0], a[1]);
       case Call::Newfstatat: return linuxabi::sys_statat(process, arch_, a[0], a[1], a[2], a[3]);
       case Call::Stat:
@@ -284,6 +295,31 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Getrandom: return do_getrandom(process, a[0], a[1]);
       case Call::Gettimeofday: return do_gettimeofday(process, a[0]);
       case Call::Getppid: return 0;
+      case Call::Socket: return linuxabi::sys_socket(process, a[0], a[1], a[2]);
+      case Call::Socketpair: return linuxabi::sys_socketpair(process, a[0], a[1], a[2], a[3]);
+      case Call::Bind: return linuxabi::sys_bind(process, a[0], a[1], a[2]);
+      case Call::Connect: return linuxabi::sys_connect(process, a[0], a[1], a[2]);
+      case Call::Listen: return linuxabi::sys_listen(process, a[0], a[1]);
+      case Call::Accept: return linuxabi::sys_accept4(process, a[0], a[1], a[2], 0);
+      case Call::Accept4: return linuxabi::sys_accept4(process, a[0], a[1], a[2], a[3]);
+      case Call::Sendto: return linuxabi::sys_sendto(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::Recvfrom: return linuxabi::sys_recvfrom(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::Sendmsg: return linuxabi::sys_sendmsg(process, a[0], a[1], a[2]);
+      case Call::Recvmsg: return linuxabi::sys_recvmsg(process, a[0], a[1], a[2]);
+      case Call::Sendmmsg: return linuxabi::sys_sendmmsg(process, a[0], a[1], a[2], a[3]);
+      case Call::Recvmmsg: return linuxabi::sys_recvmmsg(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Shutdown: return linuxabi::sys_shutdown(process, a[0], a[1]);
+      case Call::Getsockname: return linuxabi::sys_getsockname(process, a[0], a[1], a[2]);
+      case Call::Getpeername: return linuxabi::sys_getpeername(process, a[0], a[1], a[2]);
+      case Call::Setsockopt: return linuxabi::sys_setsockopt(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Getsockopt: return linuxabi::sys_getsockopt(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Poll: {      // (timeout in milliseconds; negative waits for ever)
+        const int64_t ms = int32_t(a[2]);
+        return linuxabi::sys_poll(process, a[0], a[1], ms < 0 ? ~uint64_t{0} : uint64_t(ms) * 1000000u);
+      }
+      case Call::Ppoll: return linuxabi::sys_ppoll(process, a[0], a[1], a[2]);
+      case Call::Select: return linuxabi::sys_select(process, a[0], a[1], a[2], a[3], a[4], false);
+      case Call::Pselect6: return linuxabi::sys_select(process, a[0], a[1], a[2], a[3], a[4], true);
       default: process.host().unhandled_syscall(SyscallAbi::Linux, r.number); return error(kEnosys);
     }
   }

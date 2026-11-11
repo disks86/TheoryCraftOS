@@ -23,6 +23,7 @@
 #include "Process/Objects.hpp"
 #include "Process/WindowsDebug.hpp"
 #include "Process/WindowsTokens.hpp"
+#include "Process/UnixSockets.hpp"
 
 namespace process {
 
@@ -66,6 +67,7 @@ Process::~Process() {
       if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
       else if (files_.kind(slot) == DescriptorKind::Pipe) windowsabi::pipe_token_release(files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Socket) windowsabi::socket_token_release(files_.token(slot));
+      else if (files_.kind(slot) == DescriptorKind::UnixSocket) descriptor_token_release(DescriptorKind::UnixSocket, files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Key) windowsabi::key_token_release(files_.token(slot));
     }
@@ -80,9 +82,32 @@ bool Process::close_descriptor(uint64_t slot) {
   if (kind == DescriptorKind::DebugObject) windowsabi::debug_drain_kills(runtime_);
   if (kind == DescriptorKind::Pipe) { windowsabi::pipe_handle_closed(*this, token); windowsabi::pipe_token_release(token); }
   if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
+  if (kind == DescriptorKind::UnixSocket) descriptor_token_release(kind, token);
   if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(token);
   if (kind == DescriptorKind::Key) windowsabi::key_token_release(token);
   return true;
+}
+
+void descriptor_token_add(DescriptorKind kind, uint64_t token) {
+  if (kind == DescriptorKind::UnixSocket) { if (UnixSocketManager* sockets = system_unix_sockets()) sockets->add_ref(uint32_t(token)); return; }
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_add(token);
+  else if (kind == DescriptorKind::Socket) windowsabi::socket_token_add(token);
+  else if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_add(token);
+  else if (kind == DescriptorKind::Key) windowsabi::key_token_add(token);
+  else if (is_object_kind(kind) && kind != DescriptorKind::Token) objects->add_ref(uint32_t(token));      // (an inherited token handle never took a use: kept as it was)
+}
+
+void descriptor_token_release(DescriptorKind kind, uint64_t token) {
+  if (kind == DescriptorKind::UnixSocket) { if (UnixSocketManager* sockets = system_unix_sockets()) sockets->release(uint32_t(token)); return; }
+  ObjectManager* objects = system_objects();
+  if (!objects) return;
+  if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
+  else if (kind == DescriptorKind::Socket) windowsabi::socket_token_release(token);
+  else if (kind == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(token);
+  else if (kind == DescriptorKind::Key) windowsabi::key_token_release(token);
+  else if (is_object_kind(kind)) objects->release(uint32_t(token));
 }
 
 void Process::release_handles() {

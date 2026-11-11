@@ -235,6 +235,11 @@ DNS lookups, the address codec with truncations and bit flips), `tests/windows_i
 (`tests/windows/wine/ws2_32/tcos_resolve.c`; Wine's protocol test had 1287 failures before this work, most in `WSAEnumProtocols`, `WSAStringToAddress`/`WSAAddressToString`, the legacy
 `inet_addr` forms and `getservbyname`).
 
+AF_UNIX: `socket(AF_UNIX, SOCK_STREAM, 0)` with `<afunix.h>`'s `SOCKADDR_UN` reaches the system's unix sockets, the same ones Linux programs use (a
+`C:\...` path is the file a Linux program calls `/mnt/c/...`; abstract names are shared too). The handle is a `DescriptorKind::UnixSocket`; the same services take it
+(`src/Process/WindowsUnixSockets.hpp`), `SO_RCVTIMEO`/`SO_SNDTIMEO` and `SO_ERROR` are real for it, and `WSAIoctl(SIO_AF_UNIX_GETPEERPID)` gives the peer's process id.
+See [UnixSockets.md](UnixSockets.md).
+
 Not done: `WSAAsyncSelect`/`WSAEventSelect`, overlapped socket I/O, applying `SO_RCVTIMEO`/`SO_SNDTIMEO` and the other accepted options, multicast (IPv4 and IPv6), raw
 sockets, reverse DNS, `gethostbyname`/`gethostbyaddr` (still stubs), the legacy `inet_addr` forms (hex, octal, fewer than four parts), binding to one particular local address
 (every socket uses the addresses of the interface it is on), and the scope id of a link-local address.

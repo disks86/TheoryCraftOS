@@ -30,6 +30,8 @@ namespace process {
 // A program sees one tree of its own. The OS keeps the trees of the two worlds side by side in its file system: "/Linux" is what a Linux program calls "/",
 // and "/Windows" is what a Windows program calls "C:\". A path a program writes is first made absolute against its current directory, then cleaned ("." and
 // ".." removed, ".." never climbing above the program's root), and only then joined to the root: a program cannot name anything outside its tree.
+// The one window between the two: a Linux program sees the Windows C: drive at /mnt/c (as under WSL), names compared without case there as Windows does, so
+// that files and unix sockets one kind of program makes are there for the other.
 enum class PathStyle : uint8_t {
   Posix,      // "/", names are bytes (UTF-8), case counts as the file system says
   Windows,    // "C:\dir\file", "\\??\\C:\dir\file" (NT), either slash, drive C only, no < > : " | ? * in names
@@ -41,7 +43,7 @@ constexpr uint64_t kMaxPath = 4096;
 PathResult resolve_path(PathStyle style, StringView cwd, StringView path, String* out);
 
 // What a descriptor (Linux file descriptor, Windows handle) refers to.
-enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, ObjectDirectory, SymbolicLink, Port };
+enum class DescriptorKind : uint8_t { Closed, ConsoleInput, ConsoleOutput, ConsoleError, File, Directory, Null, Zero, Random, Thread, Event, Mutex, Semaphore, Process, Pipe, Timer, Section, Job, Socket, ChangeNotification, Mailslot, Key, MountManager, DebugObject, Token, KeyedEvent, IoCompletion, Reserve, ObjectDirectory, SymbolicLink, Port, UnixSocket };
 
 // How open() treats the path. (The Linux O_* and Windows dispositions both reduce to these.)
 struct OpenFlags {
@@ -122,6 +124,11 @@ class ProcessFiles {
   int64_t open_device(DescriptorKind kind);
   // A descriptor for something the process keeps track of itself (a thread): `token` says which one. -1 if the table is full.
   int64_t open_token(DescriptorKind kind, uint64_t token);
+  // A descriptor for what another table's slot held (a descriptor passed over a unix socket): the use of `token` comes with it. -1 if no slot at or above
+  // `minimum` is free.
+  int64_t install(DescriptorKind kind, const SharedPointer<OpenObject>& object, uint64_t token, uint64_t minimum = 0);
+  // The open object of a slot, shared (null for kinds that have none).
+  SharedPointer<OpenObject> shared_object(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot].object : SharedPointer<OpenObject>(); }
   void set_token(uint64_t slot, uint64_t value) { if (slot < kMaxDescriptors) slots_[slot].token = value; }
   uint64_t token(uint64_t slot) const { return slot < kMaxDescriptors ? slots_[slot].token : 0; }
   // The lowest free descriptor at or above `minimum`; -1 if none.

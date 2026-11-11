@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Process/LinuxSockets.hpp"
 #include "Process/LinuxFiles.hpp"
 #include "Process/AddressSpace.hpp"
 
@@ -33,7 +34,7 @@ constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 constexpr uint64_t kAtRemoveDir = 0x200, kAtEmptyPath = 0x1000;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u, kIovMax = 1024, kChunk = 4096;
 // open(2) flags
-constexpr uint64_t kOAccMode = 3, kOWrite = 1, kORdWr = 2, kOCreat = 0x40, kOExcl = 0x80, kOTrunc = 0x200, kOAppend = 0x400, kOCloexec = 0x80000;
+constexpr uint64_t kOAccMode = 3, kOWrite = 1, kORdWr = 2, kOCreat = 0x40, kOExcl = 0x80, kOTrunc = 0x200, kOAppend = 0x400, kOCloexec = 0x80000, kONonBlock = 0x800;
 
 uint64_t error(int64_t value) { return uint64_t(-value); }
 
@@ -90,6 +91,12 @@ int64_t read_path(Process& p, uint64_t address, String* out) {
 
 uint64_t errno_of_or_zero(Status status) { return status == Status::Ok ? 0 : errno_of(status); }
 
+}  // namespace
+
+uint64_t errno_of_status(Status status) { return errno_of(status); }
+
+namespace {
+
 int64_t path_error(PathResult r) {
   switch (r) {
     case PathResult::Empty:
@@ -134,7 +141,7 @@ void put(ByteView out, uint64_t at, uint64_t value, uint32_t bytes) {
   for (uint32_t i = 0; i < bytes; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
 }
 
-constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000;
+constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000, kSIfSock = 0140000;
 
 struct Meta {
   uint32_t mode = 0;
@@ -175,6 +182,13 @@ uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) 
   return p.write_user(address, ConstByteView(buffer, x86 ? 144 : 128)) ? 0 : error(kEfault);
 }
 
+// A file bound to a unix socket is a socket to stat().
+void mark_socket(Process& p, StringView virtual_path, Meta* m) {
+  if ((m->mode & 0170000) != kSIfReg) return;
+  String host(p.files().allocator());
+  if (p.files().host_path_of(virtual_path, &host) && is_socket_file(host.view())) { m->mode = kSIfSock | 0755; m->size = 0; }
+}
+
 // What a descriptor looks like to fstat. 0 and the metadata, or -errno.
 int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
   switch (kind_of(p, fd)) {
@@ -185,6 +199,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Null: *m = device_meta(kSIfChr | 0666, 3); return 0;
     case DescriptorKind::Zero: *m = device_meta(kSIfChr | 0666, 5); return 0;
     case DescriptorKind::Random: *m = device_meta(kSIfChr | 0666, 9); return 0;
+    case DescriptorKind::UnixSocket: *m = device_meta(kSIfSock | 0777, p.files().token(fd)); return 0;
     default: break;
   }
   OpenObject* object = p.files().object(fd);
@@ -245,6 +260,7 @@ uint64_t read_from(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, boo
     case DescriptorKind::ConsoleOutput:
     case DescriptorKind::ConsoleError: return error(kEbadf);
     case DescriptorKind::Directory: return error(kEisdir);
+    case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_read(p, fd, buffer, count);
     case DescriptorKind::Null: return 0;
     case DescriptorKind::Zero:
     case DescriptorKind::Random: {
@@ -296,6 +312,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
       return faulted && done == 0 ? error(kEfault) : done;
     }
     case DescriptorKind::Directory: return error(kEisdir);
+    case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_write(p, fd, buffer, count);
     case DescriptorKind::Null:
     case DescriptorKind::Zero:
     case DescriptorKind::Random: return count;
@@ -325,6 +342,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
 uint64_t vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count, bool write) {
   if (count > kIovMax) return error(kEinval);
   if (p.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
+  if (p.descriptor(fd) == DescriptorKind::UnixSocket) return socket_vector_io(p, fd, iov, count, write);      // (one message is one readv(), not one per buffer)
   uint64_t total = 0;
   for (uint64_t i = 0; i < count; ++i) {
     uint64_t base = 0, length = 0;
@@ -398,7 +416,9 @@ uint64_t sys_statat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   DirectoryEntry entry;
   const Status status = files.stat(virtual_path.view(), &entry);
   if (status != Status::Ok) return errno_of(status);
-  return write_stat(p, arch, meta_of(entry, virtual_path.view()), buffer);
+  Meta meta = meta_of(entry, virtual_path.view());
+  mark_socket(p, virtual_path.view(), &meta);
+  return write_stat(p, arch, meta, buffer);
 }
 
 uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mask, uint64_t buffer) {
@@ -422,6 +442,7 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
       const Status status = files.stat(virtual_path.view(), &entry);
       if (status != Status::Ok) return errno_of(status);
       m = meta_of(entry, virtual_path.view());
+      mark_socket(p, virtual_path.view(), &m);
     }
   }
   uint8_t out[256] = {};
@@ -596,7 +617,9 @@ uint64_t sys_fsync(Process& p, uint64_t fd) {
 uint64_t sys_dup(Process& p, uint64_t fd) {
   if (p.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
   const int64_t target = p.files().duplicate(fd, 0);
-  return target < 0 ? error(kEmfile) : static_cast<uint64_t>(target);
+  if (target < 0) return error(kEmfile);
+  descriptor_token_add(p.files().kind(fd), p.files().token(fd));      // (the copy holds a use of a shared object, like the original)
+  return static_cast<uint64_t>(target);
 }
 
 uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags) {
@@ -608,7 +631,9 @@ uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags) 
   } else if (old_fd == new_fd || (flags & ~kOCloexec)) {
     return error(kEinval);
   }
+  if (p.descriptor(new_fd) != DescriptorKind::Closed) p.close_descriptor(new_fd);      // (what was there goes, with its use of a shared object)
   p.files().duplicate_to(old_fd, new_fd);
+  descriptor_token_add(p.files().kind(old_fd), p.files().token(old_fd));
   p.files().set_close_on_exec(new_fd, flags & kOCloexec);
   return new_fd;
 }
@@ -622,17 +647,21 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
       if (argument >= ProcessFiles::kMaxDescriptors) return error(kEinval);
       const int64_t target = files.duplicate(fd, argument);
       if (target < 0) return error(kEmfile);
+      descriptor_token_add(files.kind(fd), files.token(fd));
       files.set_close_on_exec(static_cast<uint64_t>(target), command == 1030);
       return static_cast<uint64_t>(target);
     }
     case 1: return files.close_on_exec(fd) ? 1 : 0;      // F_GETFD: FD_CLOEXEC
     case 2: files.set_close_on_exec(fd, argument & 1); return 0;
     case 3: {      // F_GETFL
+      if (files.kind(fd) == DescriptorKind::UnixSocket) return kORdWr | (socket_non_blocking(p, fd) ? kONonBlock : 0);
       OpenObject* object = files.object(fd);
       if (!object) return files.kind(fd) == DescriptorKind::ConsoleInput ? 0 : kORdWr;
       return (object->readable && object->writable ? kORdWr : object->writable ? kOWrite : 0) | (object->append ? kOAppend : 0);
     }
-    case 4: return 0;      // F_SETFL: nothing here can change (no non-blocking mode)
+    case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
+      if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
+      return 0;
     default: return error(kEinval);
   }
 }
@@ -648,6 +677,9 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path) {
   return status == Status::Ok ? error(kEinval) : errno_of(status);      // there are no symbolic links: what exists is not one
 }
 
-uint64_t sys_ioctl(Process& p, uint64_t fd) { return p.descriptor(fd) == DescriptorKind::Closed ? error(kEbadf) : error(kEnotty); }
+uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
+  if (p.descriptor(fd) == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);
+  return p.descriptor(fd) == DescriptorKind::Closed ? error(kEbadf) : error(kEnotty);
+}
 
 }  // namespace process::linuxabi

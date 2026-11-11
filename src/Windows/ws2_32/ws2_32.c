@@ -19,7 +19,9 @@
 /* ws2_32.dll for TheoryCraftOS: Winsock over this OS's own NT-ish socket services (src/Process/WindowsSockets.{hpp,cpp}; real Windows has none of its own, Winsock talks to
  * a device driver, afd.sys, through its own ioctl protocol, but there is no reason to copy that here). A SOCKET is the kernel HANDLE of the socket descriptor directly (both
  * are small, dense integers already, so there is no separate table to keep in sync - see advapi32's registry-is-a-path comment for the same idea applied to HKEYs). Sockets
- * are AF_INET or AF_INET6 (IPv6-only by default, dual-stack once IPV6_V6ONLY is turned off, as on Windows). The socket address a program hands in or reads back out
+ * are AF_INET or AF_INET6 (IPv6-only by default, dual-stack once IPV6_V6ONLY is turned off, as on Windows), or AF_UNIX (<afunix.h>: SOCK_STREAM, as on Windows; the
+ * system's unix sockets, src/Process/UnixSockets.hpp, which Linux programs share - a path such as "C:\\tmp\\app.sock" is the file a Linux program calls
+ * "/mnt/c/tmp/app.sock"). The socket address a program hands in or reads back out
  * (SOCKADDR_IN or SOCKADDR_IN6) goes to and comes from the services as its own bytes; the kernel reads and checks it (src/Process/SocketAddress.hpp). Name resolution
  * (getaddrinfo and friends) knows numeric addresses, localhost and this machine's own name, and asks the kernel's DNS resolver (NtSocketControl ResolveName) for the
  * rest. Built freestanding with the OS's mingw compiler, directly over kernel32.dll and ntdll.dll, the way a real ws2_32.dll sits over ntdll for everything but the socket
@@ -41,13 +43,15 @@ typedef struct sockaddr_ { USHORT sa_family; UCHAR sa_data[14]; } SOCKADDR, *LPS
 typedef struct sockaddr_in_ { SHORT sin_family; USHORT sin_port; IN_ADDR sin_addr; UCHAR sin_zero[8]; } SOCKADDR_IN, *LPSOCKADDR_IN;
 typedef struct { SHORT sin6_family; USHORT sin6_port; ULONG sin6_flowinfo; UCHAR sin6_addr[16]; ULONG sin6_scope_id; } SOCKADDR_IN6_;
 /* Room for either kind of address (a real SOCKADDR_STORAGE is 128 bytes; these services never give more than a SOCKADDR_IN6). */
-typedef union { SOCKADDR sa; SOCKADDR_IN in; SOCKADDR_IN6_ in6; } ANY_SOCKADDR_;
+typedef struct { USHORT sun_family; char sun_path[108]; } SOCKADDR_UN_;      /* <afunix.h> */
+typedef union { SOCKADDR sa; SOCKADDR_IN in; SOCKADDR_IN6_ in6; SOCKADDR_UN_ un; } ANY_SOCKADDR_;
 /* _WIN64's WSADATA orders its fields differently from the 32-bit one (iMaxSockets/iMaxUdpDg/lpVendorInfo before the description strings, not after) - this OS is
  * x86-64 only, so this is the one layout that matters, but getting it backwards would silently corrupt a real mingw-built program's WSAStartup call. */
 typedef struct { WORD wVersion, wHighVersion; USHORT iMaxSockets, iMaxUdpDg; PSTR lpVendorInfo; CHAR szDescription[257], szSystemStatus[129]; } WSADATA, *LPWSADATA;
 typedef struct { UINT fd_count; SOCKET fd_array[64]; } fd_set_;
 typedef struct { LONG tv_sec, tv_usec; } TIMEVAL_, *PTIMEVAL_;
 
+#define AF_UNIX_ 1
 #define AF_INET_ 2
 #define AF_INET6_ 23
 #define SOCK_STREAM_ 1
@@ -64,11 +68,16 @@ typedef struct { LONG tv_sec, tv_usec; } TIMEVAL_, *PTIMEVAL_;
 #define FIONREAD_ 0x4004667Fu
 
 #define WSAEINTR_ 10004
+#define WSAEACCES_ 10013
+#define WSAEMSGSIZE_ 10040
+#define WSAEPROTOTYPE_ 10041
+#define WSAESHUTDOWN_ 10058
 #define WSAEFAULT_ 10014
 #define WSAEINVAL_ 10022
 #define WSAENOPROTOOPT_ 10042
 #define WSAEAFNOSUPPORT_ 10047
 #define WSAESOCKTNOSUPPORT_ 10044
+#define WSAEPROTONOSUPPORT_ 10043
 #define WSAEWOULDBLOCK_ 10035
 #define WSAENOTSOCK_ 10038
 #define WSAEOPNOTSUPP_ 10045
@@ -114,6 +123,12 @@ static int wsa_error_for(NTSTATUS status) {
     case 0xC0000002u: return WSAEOPNOTSUPP_;
     case 0xC0000005u: return WSAEFAULT_;
     case 0xC000009Au: return WSAENOBUFS_;
+    case 0xC0000030u: return WSAEPROTOTYPE_;        /* STATUS_INVALID_PARAMETER_MIX: an AF_UNIX name bound by a socket of another type */
+    case 0xC000023Bu: return WSAEISCONN_;           /* STATUS_CONNECTION_ACTIVE */
+    case 0xC00000B1u: return WSAESHUTDOWN_;         /* STATUS_PIPE_CLOSING: the connection takes no more */
+    case 0xC0000206u: return WSAEMSGSIZE_;          /* STATUS_INVALID_BUFFER_SIZE */
+    case 0xC0000022u: return WSAEACCES_;
+    case 0xC00000B5u: return WSAETIMEDOUT_;         /* STATUS_IO_TIMEOUT: SO_RCVTIMEO / SO_SNDTIMEO passed */
     default: return WSAEINVAL_;
   }
 }
@@ -155,11 +170,13 @@ static int address_size(const SOCKADDR *name, int namelen) {
   if (!name || namelen < (int)sizeof(SHORT)) return 0;
   if (name->sa_family == AF_INET_) return (int)sizeof(SOCKADDR_IN);
   if (name->sa_family == AF_INET6_) return (int)sizeof(SOCKADDR_IN6_);
+  if (name->sa_family == AF_UNIX_) return namelen < (int)sizeof(SOCKADDR_UN_) ? namelen : (int)sizeof(SOCKADDR_UN_);      /* (the length says where the path ends) */
   return 0;
 }
 /* Checks an address a program hands in: WSAEFAULT for a missing or short one, WSAEAFNOSUPPORT for an unknown family. */
 static BOOL check_address(const SOCKADDR *name, int namelen) {
-  if (!name || namelen < (int)sizeof(SOCKADDR_IN)) { set_wsa_error(WSAEFAULT_); return FALSE; }
+  if (!name || namelen < (int)sizeof(SHORT)) { set_wsa_error(WSAEFAULT_); return FALSE; }
+  if (name->sa_family != AF_UNIX_ && namelen < (int)sizeof(SOCKADDR_IN)) { set_wsa_error(WSAEFAULT_); return FALSE; }
   const int need = address_size(name, namelen);
   if (need == 0) { set_wsa_error(WSAEAFNOSUPPORT_); return FALSE; }
   if (namelen < need) { set_wsa_error(WSAEFAULT_); return FALSE; }
@@ -179,6 +196,14 @@ static BOOL require_started(void) { if (g_started <= 0) { set_wsa_error(WSANOTIN
 EXPORT SOCKET WSAAPI socket(int af, int type, int protocol) {
   (void)protocol;
   if (!require_started()) return INVALID_SOCKET;
+  if (af == AF_UNIX_) {      /* AF_UNIX: stream sockets only, as on Windows */
+    if (type != SOCK_STREAM_) { set_wsa_error(WSAESOCKTNOSUPPORT_); return INVALID_SOCKET; }
+    if (protocol != 0) { set_wsa_error(WSAEPROTONOSUPPORT_); return INVALID_SOCKET; }
+    HANDLE h = NULL;
+    const NTSTATUS status = NtCreateSocket(AF_UNIX_, SOCK_STREAM_, 0, &h);
+    if (!NT_SUCCESS(status)) return fail_nt(status, INVALID_SOCKET);
+    return (SOCKET)(UINT_PTR)h;
+  }
   if (af != AF_INET_ && af != AF_INET6_) { set_wsa_error(WSAEAFNOSUPPORT_); return INVALID_SOCKET; }
   if (type != SOCK_STREAM_ && type != SOCK_DGRAM_) { set_wsa_error(WSAESOCKTNOSUPPORT_); return INVALID_SOCKET; }
   HANDLE h = NULL;
@@ -284,9 +309,11 @@ static int get_name(SOCKET s, ULONG operation, SOCKADDR *out, int *outlen) {
   if (!out || !outlen) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
   ANY_SOCKADDR_ name;
   memset(&name, 0, sizeof name);
-  const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, operation, NULL, 0, &name, sizeof name);
+  ULONG full = 0;      /* (an AF_UNIX socket's name says its own size here; the network ones leave it) */
+  const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, operation, &full, sizeof full, &name, sizeof name);
   if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
-  return give_address(&name, (ULONG)address_size(&name.sa, sizeof name), out, outlen) ? 0 : SOCKET_ERROR;
+  const ULONG size = name.sa.sa_family == AF_UNIX_ ? (full < sizeof(SOCKADDR_UN_) ? full : (ULONG)sizeof(SOCKADDR_UN_)) : (ULONG)address_size(&name.sa, sizeof name);
+  return give_address(&name, size, out, outlen) ? 0 : SOCKET_ERROR;
 }
 EXPORT int WSAAPI getsockname(SOCKET s, SOCKADDR *name, int *namelen) { return get_name(s, 2, name, namelen); }
 EXPORT int WSAAPI getpeername(SOCKET s, SOCKADDR *name, int *namelen) { return get_name(s, 3, name, namelen); }
@@ -914,6 +941,14 @@ static BOOL inert_option(int level, int name) {
 EXPORT int WSAAPI setsockopt(SOCKET s, int level, int optname, const char *optval, int optlen) {
   SOCKET_INFO_ info;
   if (!socket_info(s, &info)) return SOCKET_ERROR;
+  if (info.family == AF_UNIX_ && level == SOL_SOCKET_ && (optname == SO_RCVTIMEO_ || optname == SO_SNDTIMEO_)) {      /* (a DWORD of milliseconds, 0: none) */
+    if (!optval || optlen < 4) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+    ULONG in[2] = {optname == SO_SNDTIMEO_ ? 1u : 0u, 0};
+    memcpy(&in[1], optval, 4);
+    const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, 12 /* SetTimeout */, in, sizeof in, NULL, 0);
+    return NT_SUCCESS(status) ? 0 : (int)fail_nt(status, SOCKET_ERROR);
+  }
+  if (info.family == AF_UNIX_ && level != SOL_SOCKET_) { set_wsa_error(WSAENOPROTOOPT_); return SOCKET_ERROR; }
   if (level == IPPROTO_IPV6_ && optname == IPV6_V6ONLY_) {
     if (!optval || optlen < 1) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
     if (info.family != AF_INET6_) { set_wsa_error(WSAEINVAL_); return SOCKET_ERROR; }
@@ -934,7 +969,14 @@ EXPORT int WSAAPI getsockopt(SOCKET s, int level, int optname, char *optval, int
   if (!socket_info(s, &info)) return SOCKET_ERROR;
   if (!optval || !optlen) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
   DWORD value = 0;
-  if (level == SOL_SOCKET_ && optname == SO_TYPE_) value = info.type;
+  if (info.family == AF_UNIX_ && level != SOL_SOCKET_) { set_wsa_error(WSAENOPROTOOPT_); return SOCKET_ERROR; }
+  if (info.family == AF_UNIX_ && level == SOL_SOCKET_ && optname == SO_ERROR_) {      /* (what is pending: the other end went with data unread) */
+    ULONG pending = 0;
+    const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, 13 /* TakeError */, NULL, 0, &pending, sizeof pending);
+    if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
+    value = pending ? (DWORD)wsa_error_for((NTSTATUS)pending) : 0;
+  } else if (info.family == AF_UNIX_ && level == SOL_SOCKET_ && (optname == SO_SNDBUF_ || optname == SO_RCVBUF_)) value = 131072;      /* (UnixSocketManager::kBufferBytes) */
+  else if (level == SOL_SOCKET_ && optname == SO_TYPE_) value = info.type;
   else if (level == SOL_SOCKET_ && optname == SO_ERROR_) value = 0;      /* (a failed connect is reported by the call itself, so there is nothing pending here) */
   else if (level == SOL_SOCKET_ && (optname == SO_SNDBUF_ || optname == SO_RCVBUF_)) value = 16384;
   else if (level == SOL_SOCKET_ && optname == SO_LINGER_) {
@@ -1648,6 +1690,7 @@ EXPORT BOOL WSAAPI WSAGetOverlappedResult(SOCKET s, OVERLAPPED *ov, DWORD *bytes
 #define SIO_BSP_HANDLE_ 0x4800001Bu
 #define SIO_BSP_HANDLE_SELECT_ 0x4800001Cu
 #define SIO_BSP_HANDLE_POLL_ 0x4800001Du
+#define SIO_AF_UNIX_GETPEERPID_ 0x58000100u      /* <afunix.h>: _WSAIOR(IOC_VENDOR, 256) */
 EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *out, DWORD out_size, DWORD *returned, OVERLAPPED *ov, COMPLETION_ROUTINE_ routine) {
   SOCKET_INFO_ info;
   if (!socket_info(s, &info)) return SOCKET_ERROR;
@@ -1678,6 +1721,16 @@ EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *
       memcpy(out, &s, sizeof s);
       bytes = sizeof s;
       break;
+    case SIO_AF_UNIX_GETPEERPID_: {      /* the process id of the other end of an AF_UNIX connection (Windows or Linux) */
+      if (info.family != AF_UNIX_) { set_wsa_error(WSAEOPNOTSUPP_); return SOCKET_ERROR; }
+      if (!out || out_size < sizeof(ULONG)) { set_wsa_error(WSAEFAULT_); return SOCKET_ERROR; }
+      ULONG pid = 0;
+      const NTSTATUS status = NtSocketControl((HANDLE)(UINT_PTR)s, 11 /* GetPeerPid */, NULL, 0, &pid, sizeof pid);
+      if (!NT_SUCCESS(status)) return (int)fail_nt(status, SOCKET_ERROR);
+      memcpy(out, &pid, sizeof pid);
+      bytes = sizeof pid;
+      break;
+    }
     case SIO_GET_EXTENSION_FUNCTION_POINTER_:
       if (out && out_size >= sizeof(void *)) memset(out, 0, sizeof(void *));
       set_wsa_error(WSAEINVAL_);
@@ -1692,7 +1745,7 @@ EXPORT int WSAAPI WSAIoctl(SOCKET s, DWORD code, void *in, DWORD in_size, void *
 }
 
 /* ---- the protocol catalogue -------------------------------------------------------------------------------------------------------------------------------------------
- * Four entries, like the base MSAFD providers of a fresh Windows: TCP and UDP over IPv4 and IPv6 (no layered providers). */
+ * Five entries, like the base providers of a fresh Windows 10: TCP and UDP over IPv4 and IPv6, and AF_UNIX (no layered providers). */
 typedef struct { ULONG Data1; USHORT Data2, Data3; UCHAR Data4[8]; } GUID_;
 typedef struct {
   DWORD dwServiceFlags1, dwServiceFlags2, dwServiceFlags3, dwServiceFlags4, dwProviderFlags;
@@ -1706,11 +1759,13 @@ typedef struct {
 _Static_assert(sizeof(WSAPROTOCOL_INFOW_) == 628, "WSAPROTOCOL_INFOW is 628 bytes");
 static const GUID_ kTcpipProvider = {0xE70F1AA0, 0xAB8B, 0x11CF, {0x8C, 0xA3, 0x00, 0x80, 0x5F, 0x48, 0xA1, 0x92}};
 static const GUID_ kTcpip6Provider = {0xF9EAB0C0, 0x26D4, 0x11D0, {0xBB, 0xBF, 0x00, 0xAA, 0x00, 0x6C, 0x34, 0xE4}};
+static const GUID_ kUnixProvider = {0xA00943D9, 0x9C2E, 0x4633, {0x9B, 0x59, 0x00, 0x57, 0xA3, 0x16, 0x09, 0x94}};
 static const struct { int family, type, protocol; const char *name; } kProtocols[] = {
   {AF_INET_, SOCK_STREAM_, IPPROTO_TCP_, "MSAFD Tcpip [TCP/IP]"},
   {AF_INET_, SOCK_DGRAM_, IPPROTO_UDP_, "MSAFD Tcpip [UDP/IP]"},
   {AF_INET6_, SOCK_STREAM_, IPPROTO_TCP_, "MSAFD Tcpip [TCP/IPv6]"},
   {AF_INET6_, SOCK_DGRAM_, IPPROTO_UDP_, "MSAFD Tcpip [UDP/IPv6]"},
+  {AF_UNIX_, SOCK_STREAM_, 0, "AF_UNIX"},
 };
 #define PROTOCOL_COUNT (sizeof kProtocols / sizeof kProtocols[0])
 static BOOL same_guid(const GUID_ *a, const GUID_ *b) {
@@ -1720,16 +1775,17 @@ static BOOL same_guid(const GUID_ *a, const GUID_ *b) {
 }
 static void fill_protocol(WSAPROTOCOL_INFOW_ *p, UINT index) {
   memset(p, 0, sizeof *p);
-  const BOOL stream = kProtocols[index].type == SOCK_STREAM_, v6 = kProtocols[index].family == AF_INET6_;
+  const BOOL stream = kProtocols[index].type == SOCK_STREAM_, v6 = kProtocols[index].family == AF_INET6_, local = kProtocols[index].family == AF_UNIX_;
   p->dwServiceFlags1 = stream ? 0x00020066u /* GUARANTEED_DELIVERY|GUARANTEED_ORDER|GRACEFUL_CLOSE|EXPEDITED_DATA|IFS_HANDLES */
                               : 0x00020609u /* CONNECTIONLESS|MESSAGE_ORIENTED|SUPPORT_BROADCAST|SUPPORT_MULTIPOINT|IFS_HANDLES */;
   p->dwProviderFlags = 0x8;      /* PFL_MATCHES_PROTOCOL_ZERO */
-  p->ProviderId = v6 ? kTcpip6Provider : kTcpipProvider;
+  p->ProviderId = local ? kUnixProvider : v6 ? kTcpip6Provider : kTcpipProvider;
   p->dwCatalogEntryId = 1001 + index;
   p->ProtocolChain.ChainLen = 1;      /* BASE_PROTOCOL */
   p->iVersion = 2;
   p->iAddressFamily = kProtocols[index].family;
   p->iMaxSockAddr = p->iMinSockAddr = v6 ? (int)sizeof(SOCKADDR_IN6_) : (int)sizeof(SOCKADDR_IN);
+  if (local) { p->iMaxSockAddr = (int)sizeof(SOCKADDR_UN_); p->iMinSockAddr = (int)sizeof(USHORT); }
   p->iSocketType = kProtocols[index].type;
   p->iProtocol = kProtocols[index].protocol;
   p->dwMessageSize = stream ? 0 : 65467;

@@ -1078,15 +1078,8 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     discard();
     return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
   }
-  auto count_use = [](process::DescriptorKind kind, uint64_t token) {      // the child's table holds one more use of what the parent's does
-    if (process::ObjectManager* objects = process::system_objects()) {
-      if (kind == process::DescriptorKind::Pipe) process::windowsabi::pipe_token_add(token);
-    else if (kind == process::DescriptorKind::Socket) process::windowsabi::socket_token_add(token);
-      else if (kind == process::DescriptorKind::Mailslot) process::windowsabi::mailslot_token_add(token);
-      else if (kind == process::DescriptorKind::Key) process::windowsabi::key_token_add(token);
-      else if (kind == process::DescriptorKind::Event || kind == process::DescriptorKind::Mutex || kind == process::DescriptorKind::Semaphore || kind == process::DescriptorKind::Process || kind == process::DescriptorKind::Timer || kind == process::DescriptorKind::Section || kind == process::DescriptorKind::Job || kind == process::DescriptorKind::ChangeNotification || kind == process::DescriptorKind::DebugObject || kind == process::DescriptorKind::KeyedEvent || kind == process::DescriptorKind::IoCompletion || kind == process::DescriptorKind::Reserve || kind == process::DescriptorKind::ObjectDirectory || kind == process::DescriptorKind::SymbolicLink || kind == process::DescriptorKind::Port) objects->add_ref(uint32_t(token));
-    }
-  };
+  auto count_use = [](process::DescriptorKind kind, uint64_t token) { process::descriptor_token_add(kind, token); };      // the child's table holds one more use of what the parent's does
+
   if (spec.inherit_handles) {
     p.process()->files().inherit_from(program.process()->files(), count_use, spec.inherit_list, spec.inherit_list_count, spec.restrict_inherit);
   }

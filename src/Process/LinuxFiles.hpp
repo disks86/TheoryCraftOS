@@ -49,6 +49,8 @@ uint64_t sys_dup(Process& p, uint64_t fd);
 uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument);
 uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path);
-uint64_t sys_ioctl(Process& p, uint64_t fd);
+uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument);
+// The errno (as a result register value, -errno) for a file system status.
+uint64_t errno_of_status(filesystem::Status status);
 
 }  // namespace process::linuxabi

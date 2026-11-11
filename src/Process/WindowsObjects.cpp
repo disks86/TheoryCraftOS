@@ -925,6 +925,7 @@ uint32_t nt_duplicate_object(Process& p, const SyscallRequest& r) {
   if (is_object_kind(p.files().kind(slot))) if (ObjectManager* objects = system_objects()) objects->add_ref(uint32_t(p.files().token(slot)));
   if (p.files().kind(slot) == DescriptorKind::Pipe) pipe_token_add(p.files().token(slot));
   if (p.files().kind(slot) == DescriptorKind::Socket) socket_token_add(p.files().token(slot));
+  if (p.files().kind(slot) == DescriptorKind::UnixSocket) descriptor_token_add(DescriptorKind::UnixSocket, p.files().token(slot));
   if (p.files().kind(slot) == DescriptorKind::Mailslot) mailslot_token_add(p.files().token(slot));
   if (p.files().kind(slot) == DescriptorKind::Key) key_token_add(p.files().token(slot));
   if (target_at != 0 && !p.write_user_u64(target_at, (uint64_t(copy) + 1) * 4)) {
