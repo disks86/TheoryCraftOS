@@ -15,7 +15,7 @@ for p in stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unsta
   wayland-scanner client-header "$protocols/$p.xml" "$out/$(basename $p)-client-protocol.h"
   wayland-scanner private-code "$protocols/$p.xml" "$out/$(basename $p)-protocol.c"
 done
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp \
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp -o "$out/WaylandHostServer"
 gcc -O1 -g -Wall -I "$out" tests/wayland/wl_client.c "$out/xdg-shell-protocol.c" "$out/xdg-decoration-unstable-v1-protocol.c" -lwayland-client -lxkbcommon \
   -o "$out/wl_client"
@@ -49,6 +49,22 @@ if command -v foot >/dev/null; then
   cat "$out/wayland-foot.log"
   grep -q 'mapped .* "' "$out/wayland-foot.log" || { echo "foot showed no window"; cat "$out/foot.client.log"; status=1; }
   grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-foot.log" && status=1
+fi
+if command -v wl-copy >/dev/null && command -v wl-paste >/dev/null; then
+  echo "== wl-clipboard (copy and paste: the desktop's clipboard to a client, a client to another and to the desktop's clipboard)"
+  TCOS_CLIPBOARD_TEXT="text the desktop copied" run_server wayland-clip 12 ""
+  pasted=$(XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clip timeout 5 wl-paste --no-newline 2>"$out/clip.paste1.log" || true)
+  echo "pasted the desktop's: '$pasted'"
+  [ "$pasted" = "text the desktop copied" ] || status=1
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clip timeout 8 wl-copy "copied by wl-copy" 2>"$out/clip.copy.log" || true
+  sleep 0.5
+  pasted=$(XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clip timeout 5 wl-paste --no-newline 2>"$out/clip.paste2.log" || true)
+  echo "pasted wl-copy's: '$pasted'"
+  [ "$pasted" = "copied by wl-copy" ] || status=1
+  kill $server; wait $server || true
+  grep "clipboard:" "$out/wayland-clip.log" || true
+  grep -q "clipboard: copied by wl-copy" "$out/wayland-clip.log" || { echo "the desktop's clipboard did not get wl-copy's text"; status=1; }
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-clip.log" && { cat "$out/wayland-clip.log"; status=1; }
 fi
 [ $status -eq 0 ] && echo "wayland interop: all passed" || echo "wayland interop: FAILED"
 exit $status

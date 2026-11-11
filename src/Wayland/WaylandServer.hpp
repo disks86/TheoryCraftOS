@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Desktop/WindowsSession.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/Hive.hpp"
@@ -110,6 +111,17 @@ using Fd = SharedPointer<Memory>;
 // Makes a descriptor for the server to send: a file in memory holding `contents`, sealed against changes. Null on failure.
 using MakeFd = Fd (*)(void* context, ConstByteView contents);
 
+// What the server asks of its transport (take_requests): a pipe to read a client's data from (MakePipe: the transport makes it, hands the server the write
+// end with pipe_ready and the bytes, once the client closed its end, with pipe_read_done), or bytes to write into a descriptor a client passed and then let
+// go of (Write: the desktop's clipboard pasted into a client). Carried out outside the server's lock.
+struct TransportRequest {
+  enum class Kind : uint8_t { MakePipe, Write };
+  Kind kind = Kind::MakePipe;
+  uint32_t job = 0;
+  Fd fd;                             // Write: where to
+  SharedPointer<ByteBuffer> data;    // Write: what
+};
+
 struct Rect {
   int32_t x = 0, y = 0, w = 0, h = 0;
   bool empty() const { return w <= 0 || h <= 0; }
@@ -136,6 +148,14 @@ class Server final : public desktop::IWindowsSession {
   // Called (outside the lock) whenever output for a client was produced by something other than its own request (input, the desktop, another client).
   void set_wake(Wake wake, void* context);
   void set_fd_maker(MakeFd make, void* context);
+  // The desktop's clipboard, bridged to the Wayland selection (null: none). It must outlive the server.
+  void set_clipboard(kernel::Clipboard* clipboard);
+  // --- what the transport does for the server (see TransportRequest)
+  void take_requests(List<TransportRequest>* out);
+  void pipe_ready(uint32_t job, Fd write_end);
+  void pipe_read_done(uint32_t job, ConstByteView data);
+  // Now and then (the transport's rounds): commits waiting for an acquire point, the desktop's clipboard.
+  void tick();
   // Whether zwp_linux_dmabuf_v1 is offered (the transport makes GPU images of the descriptors clients pass). Only clients that bind after it see the change.
   void set_dmabuf(bool offered);
 
@@ -185,7 +205,7 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer,
   };
   struct Surface;
   struct Client;
@@ -205,6 +225,21 @@ class Server final : public desktop::IWindowsSession {
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
     bool valid() const { return (memory || gpu) && width > 0; }
     GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
+  };
+  // A wl_data_source: what it offers.
+  struct DataSourceInfo {
+    explicit DataSourceInfo(allocators::IAllocator& allocator) : mimes(allocator) {}
+    List<String> mimes;
+    uint32_t actions = 0;      // (version 3: what a drag may do: 1 copy, 2 move, 4 ask)
+    bool used = false;         // given to set_selection or start_drag (it cannot be given again)
+  };
+  // A wl_data_offer: whose data it is.
+  struct OfferInfo {
+    uint8_t source_client = 0;
+    uint32_t source_id = 0;      // the wl_data_source (0: the desktop's clipboard)
+    bool dnd = false;
+    uint32_t actions = 0, preferred = 0;      // the destination's (set_actions)
+    bool accepted = false;                    // a drag's destination accepted a type
   };
   // A zwp_linux_buffer_params_v1: the plane added so far (one: every format offered has one plane).
   struct DmabufParams {
@@ -235,6 +270,8 @@ class Server final : public desktop::IWindowsSession {
     Positioner positioner;                      // xdg_positioner
     SharedPointer<DmabufParams> params;         // zwp_linux_buffer_params_v1
     Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
+    SharedPointer<DataSourceInfo> source;       // wl_data_source
+    SharedPointer<OfferInfo> offer;             // wl_data_offer
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
   struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
@@ -336,6 +373,23 @@ class Server final : public desktop::IWindowsSession {
   void toplevel_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void popup_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void decoration_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- the selection, the desktop's clipboard, drag and drop (WaylandData.cpp)
+  void data_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void set_selection(Client* c, uint32_t source);
+  void send_selection(Client& c);
+  uint32_t make_offer(Client& c, uint32_t device, uint8_t source_client, uint32_t source_id, bool dnd);
+  DataSourceInfo* source_of(uint8_t client, uint32_t source);
+  void source_gone(Client& c, uint32_t source);
+  void poll_clipboard();
+  void fetch_selection_text();
+  void start_drag(Client& c, uint32_t source, Surface* origin);
+  void drag_moved();
+  void drag_focus(Surface* s, int32_t lx, int32_t ly);
+  void drag_button_released();
+  void end_drag(bool dropped);
+  uint32_t drag_action(const OfferInfo& o) const;
+  void request(TransportRequest r);
+  static void devices_of(Client& c, List<uint32_t>* out);      // (the client's wl_data_devices)
   // --- wp_linux_drm_syncobj_v1 (WaylandDmabuf.cpp)
   void syncobj_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   bool check_sync_points(Client& c, Surface& s);       // (commit: the protocol's rules; false: an error was posted)
@@ -427,6 +481,30 @@ class Server final : public desktop::IWindowsSession {
   int32_t frame_border_ = 0, frame_title_ = 0;
   uint32_t place_counter_ = 0;
   bool draw_missed_ = false;
+  // the selection: a client's wl_data_source, or the desktop's clipboard (sel_client_ 0, sel_desktop_)
+  kernel::Clipboard* clipboard_ = nullptr;
+  uint64_t clipboard_seen_ = 0;             // the clipboard's sequence the server last took in or set itself
+  uint8_t sel_client_ = 0;
+  uint32_t sel_source_ = 0;
+  bool sel_desktop_ = false;
+  uint8_t sel_sent_client_ = 0;             // the client the selection was last offered to (the keyboard focus's)
+  uint32_t fetch_job_ = 0;                  // the clipboard's copy of a client's selection being read (0: none)
+  String fetch_mime_;
+  String desktop_text_;                     // the clipboard's text, as tick() last read it (what a paste of the desktop's selection gets)
+  List<TransportRequest> requests_;
+  uint32_t next_job_ = 1;
+  // a drag (wl_data_device.start_drag)
+  struct Drag {
+    bool active = false;
+    uint8_t client = 0;
+    uint32_t source = 0;                    // its wl_data_source (0: a drag inside one client, without data)
+    Surface* origin = nullptr;
+    Surface* icon = nullptr;
+    Surface* focus = nullptr;               // the surface under it
+    uint32_t offer = 0;                     // the offer the focus's client was given
+    int32_t lx = 0, ly = 0;
+    bool dropped = false;                   // the drop happened; the source waits for the destination's finish
+  } drag_;
   uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
   uint32_t active_window_ = 0;

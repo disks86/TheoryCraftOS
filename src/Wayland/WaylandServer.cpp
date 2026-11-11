@@ -41,7 +41,7 @@ constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 }  // namespace
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
-    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator) {
+    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator) {
   monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
 }
 
@@ -163,7 +163,17 @@ void Server::close_client(uint32_t client) {
     List<Surface*> mine(allocator_);
     for (Surface& s : surfaces_) if (s.client == c->number) mine.push_back(&s);
     for (Surface* s : mine.view()) destroy_surface(*c, *s);
+    const uint8_t number = c->number;
+    if (drag_.client == number) drag_.source = 0, end_drag(false);
+    if (sel_sent_client_ == number) sel_sent_client_ = 0;
     clients_[client].reset();
+    if (sel_client_ == number) {      // (its selection goes with it)
+      sel_client_ = 0;
+      sel_source_ = 0;
+      fetch_job_ = 0;
+      if (keyboard_focus_)
+        if (Client* fc = client_of(keyboard_focus_->client)) send_selection(*fc);
+    }
   }
   wake();
 }
@@ -450,25 +460,10 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
       if (opcode == 0) destroy_object(c, id);      // release
       else post_error(c, id, kErrorInvalidMethod, "wl_output has no such request");
       return;
-    case Iface::DataDeviceManager: {
-      const uint32_t object = in.u();
-      if (opcode == 1) in.u();      // (the seat)
-      if (!in.ok()) return;
-      if (opcode == 0) new_object(c, object, Iface::DataSource, r.version, id);
-      else if (opcode == 1) new_object(c, object, Iface::DataDevice, r.version, id);
-      else post_error(c, id, kErrorInvalidMethod, "wl_data_device_manager has no such request");
-      return;
-    }
-    case Iface::DataSource:      // offer(mime), destroy, set_actions: nothing is transferred yet
-      if (opcode == 1) destroy_object(c, id);
-      else if (opcode == 0) in.string();
-      else if (opcode == 2) in.u();
-      else post_error(c, id, kErrorInvalidMethod, "wl_data_source has no such request");
-      return;
-    case Iface::DataDevice:      // start_drag, set_selection, release
-      if (opcode == 2) destroy_object(c, id);
-      else if (opcode > 2) post_error(c, id, kErrorInvalidMethod, "wl_data_device has no such request");
-      return;
+    case Iface::DataDeviceManager:
+    case Iface::DataSource:
+    case Iface::DataDevice:
+    case Iface::DataOffer: data_request(c, id, r, opcode, in); return;
     case Iface::WmBase: wm_base_request(c, id, r, opcode, in); return;
     case Iface::Positioner: positioner_request(c, id, r, opcode, in); return;
     case Iface::XdgSurface: xdg_surface_request(c, id, r, opcode, in); return;

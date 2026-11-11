@@ -2397,6 +2397,187 @@ static void test_dxg_fences() {
 
 }
 
+// ------------------------------------------------------------------ the selection, the desktop's clipboard, drag and drop
+
+struct DataApp : App {
+  uint32_t device = 0, pointer = 0;
+  explicit DataApp(Server& s) : App(s) {
+    device = new_id();
+    send(Msg(ddm, 1).u(device).u(seat));
+    pointer = new_id();
+    send(Msg(seat, 0).u(pointer));
+  }
+  uint32_t source(std::initializer_list<const char*> types, uint32_t actions = 0) {
+    const uint32_t s = new_id();
+    send(Msg(ddm, 0).u(s));
+    for (const char* t : types) send(Msg(s, 0).s(t));
+    if (actions) send(Msg(s, 2).u(actions));
+    return s;
+  }
+  // The offer the last selection event named (0: none), and its types.
+  uint32_t selection(std::vector<std::string>* types = nullptr) {
+    Ev sel = take(device, 5);
+    if (sel.object == 0) return ~0u;
+    const uint32_t offer = sel.u(0);
+    if (types) {
+      types->clear();
+      for (const Ev& e : events) if (e.object == offer && e.opcode == 0) types->push_back(e.s(0));
+    }
+    return offer;
+  }
+};
+
+static uint32_t shown_window(Server& server, App& app, App::Window& w, uint32_t color) {
+  std::vector<uint32_t> before = listed(server);
+  app.show(w, 100, 80, color);
+  for (uint32_t win : listed(server))
+    if (std::find(before.begin(), before.end(), win) == before.end()) return win;
+  return 0;
+}
+
+static void test_clipboard() {
+  kernel::Clipboard clipboard(A);
+  CHECK(clipboard.set_text("from the desktop"));
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_clipboard(&clipboard);
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(true, "A"), wb = b.toplevel(true, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    CHECK(win_a && win_b);
+    // A gets the keyboard: it is offered the desktop's text
+    a.drop_events();
+    server.activate_window(win_a);
+    std::vector<std::string> types;
+    const uint32_t offer = a.selection(&types);
+    CHECK(offer >= 0xFF000000u && offer != ~0u && types.size() == 5 && types[0] == "text/plain;charset=utf-8");
+    // pasting: the transport is asked to write the text into A's pipe
+    std::vector<uint8_t> pipe_a;
+    Fd pa = Fd::make_as<TestMemory>(A, &pipe_a);
+    a.send(Msg(offer, 1).s("text/plain;charset=utf-8"), {pa});
+    List<wayland::TransportRequest> requests(A);
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1 && requests[0].kind == wayland::TransportRequest::Kind::Write && requests[0].fd.get() == pa.get() &&
+          requests[0].data && std::string(reinterpret_cast<const char*>(requests[0].data->view().data()), requests[0].data->size()) == "from the desktop");
+    requests.clear();
+    // A copies: it is the selection; its text is read at once for the desktop's clipboard
+    const uint32_t src = a.source({"text/plain;charset=utf-8", "image/png"});
+    a.send(Msg(a.device, 1).u(src).u(0));
+    CHECK(a.selection(&types) != ~0u && types.size() == 2 && types[1] == "image/png");
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1 && requests[0].kind == wayland::TransportRequest::Kind::MakePipe);
+    if (requests.count() == 1) {
+      std::vector<uint8_t> pipe_w;
+      Fd pw = Fd::make_as<TestMemory>(A, &pipe_w);
+      const size_t fds_before = a.fds.size();
+      server.pipe_ready(requests[0].job, pw);
+      Ev send_ev = a.take(src, 1);
+      CHECK(send_ev.object == src && send_ev.s(0) == "text/plain;charset=utf-8" && a.fds.size() == fds_before + 1 && a.fds.back().get() == pw.get());
+      const std::string copied = "copied in A";
+      server.pipe_read_done(requests[0].job, ConstByteView(reinterpret_cast<const uint8_t*>(copied.data()), copied.size()));
+      String text(A);
+      CHECK(clipboard.get_text(&text) && text.view() == StringView("copied in A"));
+      server.tick();
+      CHECK(!a.has(src, 2));      // (the desktop's change was ours: A's selection stays)
+    }
+    requests.clear();
+    // B gets the keyboard: offered A's types; its paste goes to A as it is (the same descriptor)
+    b.drop_events();
+    server.activate_window(win_b);
+    const uint32_t offer_b = b.selection(&types);
+    CHECK(offer_b != ~0u && offer_b != 0 && types.size() == 2);
+    std::vector<uint8_t> pipe_b;
+    Fd pb = Fd::make_as<TestMemory>(A, &pipe_b);
+    const size_t a_fds = a.fds.size();
+    b.send(Msg(offer_b, 1).s("image/png"), {pb});
+    Ev forwarded = a.take(src, 1);
+    CHECK(forwarded.object == src && forwarded.s(0) == "image/png" && a.fds.size() == a_fds + 1 && a.fds.back().get() == pb.get());
+    // the desktop copies: A's source is cancelled; B (focused) is offered the desktop's text
+    CHECK(clipboard.set_text("desktop again"));
+    server.tick();
+    CHECK(a.has(src, 2));
+    CHECK(b.selection(&types) != ~0u && types.size() == 5);
+    // A copies again and lets go of its source: the selection is empty (B is told)
+    const uint32_t src2 = a.source({"text/plain"});
+    a.send(Msg(a.device, 1).u(src2).u(0));
+    CHECK(b.selection() != ~0u);
+    a.send(Msg(src2, 1));
+    CHECK(b.selection() == 0);
+    // a source cannot be given twice
+    a.send(Msg(a.device, 1).u(src).u(0));
+    uint32_t object = 0, code = 9;
+    CHECK(a.error(&object, &code) && object == a.device && code == 1);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+static void test_drag_and_drop() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(false, "A"), wb = b.toplevel(false, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    server.move_window(win_a, {10, 10, 100, 80});
+    server.move_window(win_b, {300, 10, 100, 80});
+    a.drop_events();
+    b.drop_events();
+    // A starts a drag from its surface while the button is held
+    server.mouse_position(40, 40);
+    server.mouse_button(1, true);
+    const uint32_t src = a.source({"text/uri-list"}, 1 | 2);      // copy | move
+    a.send(Msg(a.device, 0).u(src).u(wa.surface).u(0).u(0));
+    CHECK(!a.closing && a.has(a.pointer, 1));      // (A's pointer left: the drag has it)
+    // over B: entered with an offer of A's types and actions
+    server.mouse_position(330, 40);
+    Ev enter = b.take(b.device, 1);
+    CHECK(enter.object == b.device && enter.u(1) == wb.surface && enter.u(4) >= 0xFF000000u);
+    const uint32_t offer = enter.u(4);
+    CHECK(b.count(offer, 0) == 1 && b.take(offer, 1).u(0) == 3);      // (the type; source_actions copy | move)
+    server.mouse_position(335, 45);
+    CHECK(b.has(b.device, 3));      // motion
+    // B accepts the type and prefers to move: both are told (A heard target(null) when the drag left its own surface)
+    a.drop_events();
+    b.send(Msg(offer, 0).u(0).s("text/uri-list"));
+    CHECK(a.take(src, 0).s(0) == "text/uri-list");
+    b.send(Msg(offer, 4).u(1 | 2).u(2));
+    CHECK(b.take(offer, 2).u(0) == 2 && a.take(src, 5).u(0) == 2);
+    // the release drops; B receives the data from A; B's finish ends it
+    server.mouse_button(1, false);
+    CHECK(b.has(b.device, 4) && a.has(src, 3));      // drop, dnd_drop_performed
+    std::vector<uint8_t> pipe;
+    Fd p = Fd::make_as<TestMemory>(A, &pipe);
+    b.send(Msg(offer, 1).s("text/uri-list"), {p});
+    CHECK(a.take(src, 1).s(0) == "text/uri-list" && a.fds.back().get() == p.get());
+    b.send(Msg(offer, 3));
+    CHECK(a.has(src, 4) && !b.closing);      // dnd_finished
+    // a drag released over nothing that accepts: cancelled
+    server.mouse_position(40, 40);
+    server.mouse_button(1, true);
+    const uint32_t src2 = a.source({"text/plain"});
+    a.send(Msg(a.device, 0).u(src2).u(wa.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    server.mouse_button(1, false);
+    CHECK(a.has(src2, 2));
+    // a drag without a button held is cancelled at once
+    const uint32_t src3 = a.source({"text/plain"});
+    a.send(Msg(a.device, 0).u(src3).u(wa.surface).u(0).u(0));
+    CHECK(a.has(src3, 2));
+    // finishing without a drop is an error
+    b.send(Msg(offer, 3));
+    uint32_t code = 9;
+    CHECK(b.error(nullptr, &code) && code == 0);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2414,6 +2595,8 @@ int main() {
   test_dxg_compositor();
   test_dxg_cpu_mapping();
   test_syncobj();
+  test_clipboard();
+  test_drag_and_drop();
   test_dxg_fences();
   test_dxg_threads();
   test_threads();

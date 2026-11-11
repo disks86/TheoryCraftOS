@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -40,6 +41,7 @@
 #include <string>
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Wayland/WaylandServer.hpp"
 
 namespace {
@@ -152,6 +154,13 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
   wayland::Server server(g_allocator, &now_ms);
   server.set_fd_maker(&make_fd, nullptr);
+  // the desktop's clipboard: TCOS_CLIPBOARD_TEXT seeds it; what it holds at the end is printed ("clipboard: ...")
+  kernel::Clipboard clipboard(g_allocator);
+  if (const char* seed = getenv("TCOS_CLIPBOARD_TEXT")) clipboard.set_text(seed);
+  const uint64_t clipboard_start = clipboard.sequence();
+  server.set_clipboard(&clipboard);
+  struct Reading { uint32_t job; int fd; std::vector<uint8_t> data; };
+  std::vector<Reading> readings;
   server.attach(4, 24);
   const desktop::IWindowsSession::Monitor monitor[1] = {{{0, 0, 1280, 800}, {0, 0, 1280, 768}}};
   server.set_display(1280, 800, ArrayView<const desktop::IWindowsSession::Monitor>(monitor, 1));
@@ -217,6 +226,37 @@ int main(int argc, char** argv) {
           break;
         }
       }
+    }
+    // what the server asks of its transport: pipes read (a client's selection for the clipboard), the clipboard written into a client's pipe
+    server.tick();
+    {
+      List<wayland::TransportRequest> requests(g_allocator);
+      server.take_requests(&requests);
+      for (wayland::TransportRequest& r : requests.view()) {
+        if (r.kind == wayland::TransportRequest::Kind::MakePipe) {
+          int p[2];
+          if (pipe2(p, O_CLOEXEC | O_NONBLOCK) != 0) continue;
+          readings.push_back({r.job, p[0], {}});
+          server.pipe_ready(r.job, wayland::Fd::make_as<HostFd>(g_allocator, p[1]));
+        } else if (r.fd && r.data) {
+          const int fd = static_cast<const HostFd&>(*r.fd).fd();
+          const int flags = fcntl(fd, F_GETFL);
+          fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+          if (write(fd, r.data->view().data(), r.data->size()) != ssize_t(r.data->size())) printf("clipboard write failed\n");
+        }
+      }
+    }
+    for (size_t i = 0; i < readings.size();) {
+      uint8_t chunk[4096];
+      const ssize_t n = read(readings[i].fd, chunk, sizeof chunk);
+      if (n > 0) {
+        readings[i].data.insert(readings[i].data.end(), chunk, chunk + n);
+        continue;
+      }
+      if (n < 0 && errno == EAGAIN) { ++i; continue; }
+      server.pipe_read_done(readings[i].job, ConstByteView(readings[i].data.data(), readings[i].data.size()));
+      close(readings[i].fd);
+      readings.erase(readings.begin() + long(i));
     }
     // the desktop: new windows activated, everything drawn now and then (the frame callbacks), the script
     if (now_ms() >= next_draw) {
@@ -312,6 +352,9 @@ int main(int argc, char** argv) {
     close(c.fd);
     server.close_client(c.client);
   }
+  String text(g_allocator);
+  if (clipboard.sequence() != clipboard_start && clipboard.get_text(&text)) printf("clipboard: %s\n", text.c_str());
+  server.set_clipboard(nullptr);
   close(listener);
   unlink(path.c_str());
   return 0;

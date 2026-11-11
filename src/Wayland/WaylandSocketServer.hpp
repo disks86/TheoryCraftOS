@@ -64,8 +64,28 @@ class SocketServer {
   bool start();
   void stop();
   uint32_t connections() const { return static_cast<uint32_t>(connections_.count()); }
+  static constexpr uint64_t kMaxPipeRead = 16u << 20;      // what is read of a client's selection for the desktop's clipboard
+
+  struct Graveyard;      // (descriptors the server let go of, released by the transport: WaylandSocketServer.cpp)
 
  private:
+  // The server's TransportRequests being carried out: a pipe read until the client closes its end, bytes written into a client's pipe.
+  struct ReadJob {
+    explicit ReadJob(allocators::IAllocator& allocator) : data(allocator) {}
+    uint32_t job = 0, socket = 0;
+    ByteBuffer data;
+    bool done = false;
+  };
+  struct WriteJob {
+    uint32_t socket = 0;
+    SharedPointer<ByteBuffer> data;
+    uint64_t sent = 0;
+    bool done = false;
+  };
+  void drain_graveyard();
+  bool take_requests();
+  bool progress_jobs_locked();
+  bool finish_jobs();
   struct Connection {
     explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), fds(allocator), pending(allocator), pending_rights(allocator) {}
     uint32_t socket = 0, client = 0;
@@ -91,6 +111,9 @@ class SocketServer {
   List<UniquePointer<Connection>> connections_;
   ByteBuffer chunk_;
   bool woken_ = false;      // (under the system lock)
+  SharedPointer<Graveyard> graveyard_;
+  List<UniquePointer<ReadJob>> reads_;
+  List<UniquePointer<WriteJob>> writes_;
   MakeGpuImage make_gpu_ = nullptr;
   MakeGpuTimeline make_timeline_ = nullptr;
   void* make_gpu_context_ = nullptr;

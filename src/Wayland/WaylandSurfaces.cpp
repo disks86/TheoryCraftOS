@@ -429,6 +429,9 @@ void Server::release_buffer(Client& c, const BufferInfo& b) {
 }
 
 void Server::forget_surface(Surface& s) {
+  if (drag_.icon == &s) drag_.icon = nullptr;
+  if (drag_.focus == &s) drag_.focus = nullptr, drag_.offer = 0;
+  if (drag_.origin == &s) end_drag(false);      // (its origin went: the drag is cancelled)
   if (pointer_focus_ == &s) pointer_focus_ = nullptr;
   if (keyboard_focus_ == &s) keyboard_focus_ = nullptr;
   if (cursor_surface_ == &s) cursor_surface_ = nullptr;

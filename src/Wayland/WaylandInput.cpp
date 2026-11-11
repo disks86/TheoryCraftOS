@@ -111,6 +111,10 @@ void Server::set_pointer_focus(Surface* s, int32_t lx, int32_t ly) {
 
 // The pointer's surface again (after it moved, or the windows changed under it); `motion`: tell the focus where the pointer is now.
 void Server::pointer_moved(bool motion) {
+  if (drag_.active) {      // (a drag has the pointer: the data devices hear of it, not the pointers)
+    drag_moved();
+    return;
+  }
   int32_t lx = 0, ly = 0;
   Surface* under = nullptr;
   if (buttons_ != 0 && pointer_focus_) {      // the implicit grab: the press's surface keeps it
@@ -171,6 +175,12 @@ void Server::mouse_button(uint32_t button, bool down) {
     if (button < 1 || button > 3) return;
     const uint32_t bit = 1u << (button - 1);
     if (down == ((buttons_ & bit) != 0)) return;
+    if (drag_.active) {      // a drag: its end is the buttons' release (no button events go to the clients meanwhile)
+      if (down) buttons_ |= bit;
+      else buttons_ &= ~bit;
+      if (buttons_ == 0) drag_button_released();
+      goto done;
+    }
     if (down) {
       // a press outside the chain of the open popups closes them (a press in the chain's toplevel too, as menus expect)
       Surface* w = pointer_focus_;
@@ -201,6 +211,7 @@ void Server::mouse_button(uint32_t button, bool down) {
     else buttons_ &= ~bit;
     if (buttons_ == 0) pointer_moved(false);      // the grab is over: the focus may move on
   }
+done:
   wake();
 }
 
@@ -389,6 +400,7 @@ void Server::set_keyboard_focus(Surface* s) {
   if (!s) return;
   Client* c = client_of(s->client);
   if (!c) return;
+  if (sel_sent_client_ != c->number) send_selection(*c);      // (a client that gets the keyboard is offered the selection)
   List<uint32_t> keyboards(allocator_);
   ObjectCursor cursor;
   for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
