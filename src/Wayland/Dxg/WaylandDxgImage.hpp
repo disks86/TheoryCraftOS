@@ -38,5 +38,7 @@ namespace wayland {
 
 // A GpuImage for `object` when it is a GPU image of `kernel` (a dxgk::Kernel); null otherwise. (A SocketServer::MakeGpuImage.)
 SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
+// A GpuTimeline for `object` when it is a fence of the Direct3D layer (a sync object's timeline); null otherwise. (A SocketServer::MakeGpuTimeline.)
+SharedPointer<GpuTimeline> make_dxg_timeline(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
 
 }  // namespace wayland

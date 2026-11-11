@@ -43,6 +43,7 @@
 
 namespace dxgk {
 class ExportedAllocation;
+class ExportedSync;
 }
 
 namespace process {
@@ -96,6 +97,33 @@ class DxgBufferFile final : public filesystem::IFile {
   BlockRef copy_;                 // the CPU's copy (empty until the first mmap)
   bool written_shared_ = false;   // a writable shared mapping of the copy was made
   uint64_t moved_sum_ = 0;        // the checksum of the copy when it was last moved (either way)
+};
+
+// A fence passed around as a file descriptor: what /dev/dxg's TCOS_DXG_IOCTL_EXPORT_SYNC makes, the counterpart of a Linux DRM sync object's timeline (a Wayland
+// client hands the compositor one in wp_linux_drm_syncobj_manager_v1.import_timeline). Closed, duplicated, passed with SCM_RIGHTS like any file; it has no bytes.
+// It holds the export (dxgk::ExportedSync), which keeps the fence alive after its process destroyed it or exited.
+class DxgSyncFile final : public filesystem::IFile {
+ public:
+  explicit DxgSyncFile(SharedPointer<dxgk::ExportedSync> exported);
+  ~DxgSyncFile();
+  DxgSyncFile(const DxgSyncFile&) = delete;
+  DxgSyncFile& operator=(const DxgSyncFile&) = delete;
+  const SharedPointer<dxgk::ExportedSync>& exported() const { return exported_; }
+
+  uint64_t size() const override { return 0; }
+  filesystem::Status read(uint64_t, ByteView, uint64_t* transferred) override {
+    *transferred = 0;
+    return filesystem::Status::Unsupported;
+  }
+  filesystem::Status write(uint64_t, ConstByteView, uint64_t* transferred) override {
+    *transferred = 0;
+    return filesystem::Status::Unsupported;
+  }
+  filesystem::Status resize(uint64_t) override { return filesystem::Status::Unsupported; }
+  filesystem::Status flush() override { return filesystem::Status::Ok; }
+
+ private:
+  SharedPointer<dxgk::ExportedSync> exported_;
 };
 
 }  // namespace process

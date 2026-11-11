@@ -286,7 +286,12 @@ bool Server::synchronized(const Surface& s) const {
 }
 
 void Server::commit(Client& c, Surface& s) {
-  if (s.role == Role::Subsurface && s.parent && synchronized(s)) {      // kept until the parent's commit
+  if (!check_sync_points(c, s)) return;
+  if (s.pending.release.set()) {      // (the buffer's use from this commit ends at that point)
+    s.pending.buffer.release_timeline = s.pending.release.timeline;
+    s.pending.buffer.release_point = s.pending.release.point;
+  }
+  if (s.role == Role::Subsurface && s.parent && synchronized(s)) {      // kept until the parent's commit (its acquire point is not waited for)
     State& p = s.pending;
     State& k = s.cached;
     if (p.attached) { k.attached = true; k.buffer = p.buffer; }
@@ -301,6 +306,23 @@ void Server::commit(Client& c, Surface& s) {
   }
   State state = util::move(s.pending);
   s.pending = State();
+  if (s.waiting || (state.acquire.set() && !acquired(state))) {
+    // explicit sync: the picture may be used only once its acquire point is reached. One commit waits at a time: a newer one takes the place of the one
+    // waiting (whose buffer is let go unused), as a mailbox would. The desktop is asked to come back, which looks again.
+    if (s.waiting) signal_release(s.waiting_state.buffer), release_buffer(c, s.waiting_state.buffer);
+    else ++waiting_count_;
+    s.waiting = true;
+    s.waiting_state = util::move(state);
+    for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
+    s.pending_callbacks.clear();
+    finish_waiting(s, false);      // (reached meanwhile: applied now)
+    if (s.waiting) {
+      Surface* top = &s;
+      while (top->role == Role::Subsurface && top->parent) top = top->parent;
+      note_repaint(*top, {0, 0, 1, 1});
+    }
+    return;
+  }
   apply(c, s, state);
 }
 
@@ -311,6 +333,7 @@ void Server::apply(Client& c, Surface& s, State& state) {
   bool full = false;
   if (state.attached) {
     if (s.current.valid() && s.current.id != state.buffer.id) release_buffer(c, s.current);
+    else signal_release(s.current);      // (the same buffer again: the earlier commit's use of it is over)
     if (!state.buffer.valid() || !s.current.valid() || state.buffer.width != s.current.width || state.buffer.height != s.current.height) full = true;
     s.current = state.buffer;
     if (!state.damaged) full = true;      // (a new picture with no damage said: all of it)
@@ -398,6 +421,7 @@ void Server::apply(Client& c, Surface& s, State& state) {
 }
 
 void Server::release_buffer(Client& c, const BufferInfo& b) {
+  if (b.release_timeline) b.release_timeline->timeline()->signal(b.release_point);      // (explicit sync: even when the wl_buffer is gone)
   if (b.id == 0) return;
   Resource* r = c.objects.find(b.id);
   if (!r || r->iface != Iface::Buffer) return;
@@ -429,7 +453,12 @@ void Server::destroy_surface(Client& c, Surface& s) {
   for (Surface* child : s.stack.view()) if (child) child->parent = nullptr;
   for (Surface& other : surfaces_) if (other.popup_parent == &s) other.popup_parent = nullptr;
   // the objects of its roles are left without a surface
-  const uint32_t role_objects[3] = {s.xdg_id, s.role_id, s.decoration_id};
+  if (s.waiting) {      // (a commit that never came to be: its buffer is let go)
+    release_buffer(c, s.waiting_state.buffer);
+    s.waiting = false;
+    --waiting_count_;
+  }
+  const uint32_t role_objects[4] = {s.xdg_id, s.role_id, s.decoration_id, s.syncobj_id};
   for (uint32_t o : role_objects)
     if (o != 0)
       if (Resource* r = c.objects.find(o)) r->surface = nullptr;

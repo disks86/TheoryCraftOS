@@ -31,9 +31,11 @@ namespace {
 // view map() gave stays valid even if the client grows the file meanwhile).
 class KernelFd final : public Memory {
  public:
-  explicit KernelFd(SharedPointer<process::OpenObject> object, SharedPointer<GpuImage> image = SharedPointer<GpuImage>())
-      : object_(util::move(object)), image_(util::move(image)) {}
+  explicit KernelFd(SharedPointer<process::OpenObject> object, SharedPointer<GpuImage> image = SharedPointer<GpuImage>(),
+                    SharedPointer<GpuTimeline> timeline = SharedPointer<GpuTimeline>())
+      : object_(util::move(object)), image_(util::move(image)), timeline_(util::move(timeline)) {}
   GpuImage* gpu() override { return image_.get(); }
+  GpuTimeline* timeline() override { return timeline_.get(); }
   ByteView map(uint64_t size) override {
     if (!object_ || !object_->memory) return ByteView();
     uint64_t file_size = 0;
@@ -47,6 +49,7 @@ class KernelFd final : public Memory {
  private:
   SharedPointer<process::OpenObject> object_;
   SharedPointer<GpuImage> image_;      // a GPU image (a dmabuf), made by the transport's maker
+  SharedPointer<GpuTimeline> timeline_;      // a fence (a sync object's timeline), the same
   process::BlockRef block_;
 };
 
@@ -96,8 +99,9 @@ Fd SocketServer::make_fd(void* self, ConstByteView contents) {
   return Fd::make_as<KernelFd>(s.allocator_, util::move(object));
 }
 
-void SocketServer::set_gpu_images(MakeGpuImage make, void* context) {
+void SocketServer::set_gpu_images(MakeGpuImage make, MakeGpuTimeline make_timeline, void* context) {
   make_gpu_ = make;
+  make_timeline_ = make_timeline;
   make_gpu_context_ = context;
   server_.set_dmabuf(make != nullptr);
 }
@@ -200,11 +204,13 @@ bool SocketServer::pump() {
       Connection& c = *owners[i];
       SharedPointer<process::OpenObject> object;
       SharedPointer<GpuImage> image;
+      SharedPointer<GpuTimeline> timeline;
       const bool file = entry.kind == process::DescriptorKind::File && entry.object;
       if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, entry.object);
-      if (file && (entry.object->memory || image)) object = entry.object;
+      if (file && entry.object->gpu_sync && make_timeline_) timeline = make_timeline_(make_gpu_context_, allocator_, entry.object);
+      if (file && (entry.object->memory || image || timeline)) object = entry.object;
       else unsent.enqueue(util::move(entry));
-      Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object), util::move(image));
+      Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object), util::move(image), util::move(timeline));
       if (!fd || !c.fds.push_back(util::move(fd))) c.dead = true;
     }
   }

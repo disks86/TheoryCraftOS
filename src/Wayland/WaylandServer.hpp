@@ -81,6 +81,17 @@ class GpuImage {
   ~GpuImage() = default;
 };
 
+// A timeline a client passed (a DRM sync object; on this system a fence exported with /dev/dxg): wp_linux_drm_syncobj_v1's acquire and release points.
+class GpuTimeline {
+ public:
+  virtual uint64_t value() = 0;                // the point reached
+  virtual void signal(uint64_t point) = 0;     // raises it to `point` (nothing when it is there already)
+
+ protected:
+  GpuTimeline() = default;
+  ~GpuTimeline() = default;
+};
+
 class Memory {
  public:
   // At least the first `size` bytes of it, which the server may read (and the client write meanwhile); empty when it is smaller or no memory at all.
@@ -88,6 +99,8 @@ class Memory {
   virtual ByteView map(uint64_t size) = 0;
   // The GPU image it is (a dmabuf), or null: it is not one. It lives as long as this object.
   virtual GpuImage* gpu() { return nullptr; }
+  // The timeline it is (a sync object), or null. It lives as long as this object.
+  virtual GpuTimeline* timeline() { return nullptr; }
 
  protected:
   Memory() = default;
@@ -172,7 +185,7 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface,
   };
   struct Surface;
   struct Client;
@@ -185,6 +198,8 @@ class Server final : public desktop::IWindowsSession {
   struct BufferInfo {
     SharedPointer<PoolMemory> memory;      // a wl_shm buffer's pool
     Fd gpu;                                // a dmabuf's plane: its descriptor's gpu() is the picture (the top left width x height of it)
+    Fd release_timeline;                   // explicit sync: signalled at release_point when the compositor is done with this use of the buffer
+    uint64_t release_point = 0;
     int32_t offset = 0, width = 0, height = 0, stride = 0;
     uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one)
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
@@ -219,8 +234,14 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<RegionRects> region;          // wl_region
     Positioner positioner;                      // xdg_positioner
     SharedPointer<DmabufParams> params;         // zwp_linux_buffer_params_v1
+    Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
+  struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
+    Fd timeline;
+    uint64_t point = 0;
+    bool set() const { return timeline.get() != nullptr; }
+  };
   struct State {      // a surface's double-buffered state
     bool attached = false;      // attach() since the last commit (buffer is what it set; invalid: none)
     BufferInfo buffer;
@@ -230,6 +251,7 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<RegionRects> opaque, input;   // (input null after set: everywhere)
     bool geometry_set = false;
     Rect geometry;
+    SyncPoint acquire, release;  // explicit sync (wp_linux_drm_syncobj_surface_v1)
   };
   struct Surface {
     explicit Surface(allocators::IAllocator& allocator) : pending_callbacks(allocator), callbacks(allocator), stack(allocator), title(allocator) {}
@@ -237,6 +259,9 @@ class Server final : public desktop::IWindowsSession {
     uint32_t id = 0;                            // the wl_surface
     Role role = Role::None;
     uint32_t xdg_id = 0, role_id = 0, decoration_id = 0;      // xdg_surface; toplevel / popup / subsurface; zxdg_toplevel_decoration_v1
+    uint32_t syncobj_id = 0;                    // wp_linux_drm_syncobj_surface_v1 (0: implicit sync)
+    bool waiting = false;                       // a commit waits for its acquire point (explicit sync): `waiting_state`
+    State waiting_state;
     State pending, cached;                      // (cached: a synchronized subsurface's commit, applied with its parent's)
     bool has_cached = false;
     BufferInfo current;
@@ -311,6 +336,13 @@ class Server final : public desktop::IWindowsSession {
   void toplevel_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void popup_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void decoration_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- wp_linux_drm_syncobj_v1 (WaylandDmabuf.cpp)
+  void syncobj_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  bool check_sync_points(Client& c, Surface& s);       // (commit: the protocol's rules; false: an error was posted)
+  void signal_release(BufferInfo& b);
+  bool acquired(const State& state);
+  void finish_waiting(Surface& s, bool force);           // applies a commit whose acquire point was reached (or drops it: force)
+  void poll_waiting();
   // --- zwp_linux_dmabuf_v1 (WaylandDmabuf.cpp)
   void dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void send_dmabuf_feedback(Client& c, uint32_t feedback);
@@ -394,7 +426,8 @@ class Server final : public desktop::IWindowsSession {
   bool attached_ = false;
   int32_t frame_border_ = 0, frame_title_ = 0;
   uint32_t place_counter_ = 0;
-  bool draw_missed_ = false;                // (draw_window: a GPU picture of the tree could not be drawn)
+  bool draw_missed_ = false;
+  uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
   uint32_t active_window_ = 0;
   // input

@@ -29,13 +29,14 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 9;
+constexpr uint32_t kGlobalCount = 10;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 5}, {"zxdg_decoration_manager_v1", 1},
     {"zwp_linux_dmabuf_v1", 4},      // (only offered with set_dmabuf; 3 without an fd maker: version 4's feedback needs its format table)
+    {"wp_linux_drm_syncobj_manager_v1", 1},      // (with set_dmabuf too: the transport makes the timelines)
 };
-constexpr uint32_t kDmabufGlobal = 9;
+constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 
 }  // namespace
 
@@ -122,6 +123,7 @@ void Server::receive(uint32_t client, ConstByteView bytes, ArrayView<Fd> fds) {
     }
     if (!c->closing && !c->in.append(bytes)) post_error(*c, kDisplayId, kErrorNoMemory, "out of memory");
     if (!c->closing) process(*c);
+    poll_waiting();      // (commits waiting for an acquire point another client's request may have reached)
   }
   wake();      // (other clients may have been sent events)
 }
@@ -296,12 +298,12 @@ void Server::destroy_object(Client& c, uint32_t id) {
 
 void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t version, uint32_t id) {
   const uint32_t most = name == kDmabufGlobal && !make_fd_ ? 3 : name >= 1 && name <= kGlobalCount ? kGlobals[name - 1].version : 0;
-  if (name == 0 || name > kGlobalCount || (name == kDmabufGlobal && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 || version > most) {
+  if (name == 0 || name > kGlobalCount || ((name == kDmabufGlobal || name == kSyncobjGlobal) && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 || version > most) {
     post_error(c, kDisplayId, kErrorInvalidObject, "invalid global");
     return;
   }
   constexpr Iface kIfaces[kGlobalCount] = {Iface::Compositor, Iface::Subcompositor, Iface::Shm, Iface::Seat,
-                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf};
+                                           Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -388,7 +390,7 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         const uint32_t registry = in.u();
         if (!in.ok() || !new_object(c, registry, Iface::Registry, 1, id)) return;
         for (uint32_t g = 0; g < kGlobalCount; ++g) {
-          if (g + 1 == kDmabufGlobal && !dmabuf_) continue;
+          if ((g + 1 == kDmabufGlobal || g + 1 == kSyncobjGlobal) && !dmabuf_) continue;
           Event e(registry, 0);
           e.u(g + 1).string(kGlobals[g].name).u(g + 1 == kDmabufGlobal && !make_fd_ ? 3 : kGlobals[g].version);
           send(c, e);
@@ -477,6 +479,9 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::LinuxDmabuf:
     case Iface::BufferParams:
     case Iface::DmabufFeedback: dmabuf_request(c, id, r, opcode, in); return;
+    case Iface::SyncobjManager:
+    case Iface::SyncobjTimeline:
+    case Iface::SyncobjSurface: syncobj_request(c, id, r, opcode, in); return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");
       return;

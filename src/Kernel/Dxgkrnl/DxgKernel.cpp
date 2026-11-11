@@ -603,6 +603,66 @@ bool exportable_format(Format f) {
 }
 }  // namespace
 
+class ExportedSync {
+ public:
+  ExportedSync(Kernel& kernel, SharedPointer<SyncObject> sync) : kernel_(kernel), sync_(util::move(sync)) {}
+  ~ExportedSync() {
+    kernel::ScopedMutex g(kernel_.lock_);
+    sync_.reset();
+  }
+  ExportedSync(const ExportedSync&) = delete;
+  ExportedSync& operator=(const ExportedSync&) = delete;
+
+ private:
+  friend class Kernel;
+  friend uint64_t exported_sync_value(ExportedSync& exported);
+  friend void signal_exported_sync(ExportedSync& exported, uint64_t point);
+  Kernel& kernel_;
+  SharedPointer<SyncObject> sync_;
+};
+
+uint64_t exported_sync_value(ExportedSync& exported) {
+  kernel::ScopedMutex g(exported.kernel_.lock_);
+  return exported.sync_->value();
+}
+
+void signal_exported_sync(ExportedSync& exported, uint64_t point) {
+  Kernel& k = exported.kernel_;
+  kernel::ScopedMutex g(k.lock_);
+  if (exported.sync_->value() >= point) return;
+  exported.sync_->signal(point);
+  k.pump_locked();
+  if (k.hook_) k.hook_->wake();
+}
+
+NtStatus Kernel::export_sync(ProcessId pid, Handle sync, SharedPointer<ExportedSync>* out) {
+  SharedPointer<ExportedSync> made;
+  {
+    kernel::ScopedMutex g(lock_);
+    Process* p = find_process(pid);
+    SyncRec* rec = p ? p->syncs.raw(sync) : nullptr;
+    if (!rec) return status::kInvalidHandle;
+    if (rec->sync->type() != SyncType::Fence) return status::kNotSupported;
+    made = SharedPointer<ExportedSync>::make(allocator_, *this, rec->sync);
+    if (!made) return status::kNoMemory;
+  }
+  *out = util::move(made);      // (with the lock let go, as export_allocation)
+  return status::kSuccess;
+}
+
+NtStatus Kernel::import_sync(ProcessId pid, Handle device, const ExportedSync& exported, Handle* sync) {
+  if (&exported.kernel_ != this) return status::kInvalidParameter;
+  kernel::ScopedMutex g(lock_);
+  Process* p = find_process(pid);
+  if (!p || !p->devices.raw(device)) return status::kInvalidHandle;
+  SharedPointer<SyncRec> rec = SharedPointer<SyncRec>::make(allocator_);
+  if (!rec) return status::kNoMemory;
+  rec->sync = exported.sync_;
+  rec->device = device;
+  *sync = p->syncs.insert(rec);
+  return *sync ? status::kSuccess : status::kInsufficientResources;
+}
+
 NtStatus Kernel::export_allocation(ProcessId pid, Handle allocation, SharedPointer<ExportedAllocation>* out) {
   SharedPointer<ExportedAllocation> made;
   {

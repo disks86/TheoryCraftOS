@@ -98,7 +98,22 @@ class DxgImage final : public GpuImage {
   const graphics::IRenderer2D* refused_ = nullptr;
 };
 
+class DxgTimeline final : public GpuTimeline {
+ public:
+  explicit DxgTimeline(SharedPointer<process::OpenObject> object) : object_(util::move(object)) {}
+  uint64_t value() override { return dxgk::exported_sync_value(*object_->gpu_sync->exported()); }
+  void signal(uint64_t point) override { dxgk::signal_exported_sync(*object_->gpu_sync->exported(), point); }
+
+ private:
+  SharedPointer<process::OpenObject> object_;      // (its DxgSyncFile holds the fence's export)
+};
+
 }  // namespace
+
+SharedPointer<GpuTimeline> make_dxg_timeline(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
+  if (!kernel || !object || !object->gpu_sync || !object->gpu_sync->exported()) return SharedPointer<GpuTimeline>();
+  return SharedPointer<GpuTimeline>::make_as<DxgTimeline>(allocator, object);
+}
 
 SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
   if (!kernel || !object || !object->gpu_buffer || !object->gpu_buffer->exported()) return SharedPointer<GpuImage>();

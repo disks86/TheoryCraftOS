@@ -28,8 +28,8 @@ through the same input taps. `IWindowsSession::mouse_left` (new; a no-op for the
 not one of its own, so the compositor can send `wl_pointer.leave`.
 
 - **Globals.** `wl_compositor` 6, `wl_subcompositor` 1, `wl_shm` 2, `wl_seat` 8, `wl_output` 4 (the primary monitor), `wl_data_device_manager`
-  3 (objects only, nothing is transferred), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1 and `zwp_linux_dmabuf_v1` 4 (while the transport can make GPU
-  images: the kernel sets that up when it has the Direct3D layer).
+  3 (objects only, nothing is transferred), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1, `zwp_linux_dmabuf_v1` 4 and `wp_linux_drm_syncobj_manager_v1` 1 (these two while
+  the transport can make GPU images and timelines: the kernel sets that up when it has the Direct3D layer).
 - **One coordinate space.** The compositor's screen is the desktop's window manager area; its monitors and work areas come from `set_display`.
   The desktop's "surface" rectangle of a window is the client's window geometry (`xdg_surface.set_window_geometry`, else its buffer), so a
   client-side shadow is outside the frame and is neither drawn nor hit.
@@ -86,6 +86,13 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
 - **CPU writes.** A client may `mmap` its dmabuf and write it with the CPU (GBM-style clients): the mapping is a copy of the image
   ([win32k/Dxg.md](win32k/Dxg.md)); at each commit of a buffer made from it the compositor sends the copy to the image, when a writable mapping is still
   there and a checksum says the copy changed since it was last moved, so a client that renders on the GPU is never overwritten by an old copy.
+- **Explicit sync** (`wp_linux_drm_syncobj_manager_v1`). A timeline is a fence of the Direct3D layer exported with `/dev/dxg`
+  (`TCOS_DXG_IOCTL_EXPORT_SYNC`, [win32k/Dxg.md](win32k/Dxg.md)): the counterpart of a DRM sync object. A commit with a buffer names an acquire point and a
+  release point (both, a dmabuf, the release after the acquire on one timeline: every rule of the protocol is checked). A commit whose acquire point is not
+  reached waits while the surface keeps showing what it showed; it is applied when the point is found reached, at the next request of any client or the next
+  time the desktop draws (which it is asked to do). One commit waits per surface: a newer one replaces it and the older buffer is let go (release point,
+  `wl_buffer.release`). A release point is signalled when another buffer replaces the buffer, the same buffer is committed again, or the surface goes.
+  A synchronized subsurface's commit does not wait for its acquire point.
 - **Release.** As for `wl_shm`: when another buffer replaces it. The desktop reads the image while it draws (under the compositor's lock), so a client that
   re-renders a released image never races the desktop; a client that re-renders the attached image (as `tests/linux/waylandvktest.c` does) may be drawn
   half-way through a frame, as on any compositor that samples a buffer it did not release.
@@ -139,8 +146,9 @@ picture it drew last.
 ## Not done
 
 - **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
-  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). No explicit synchronization (`linux-drm-syncobj`, implicit fences): the
-  desktop draws what the image holds when it draws. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
+  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
+  once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
+  was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):
   a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
   Not run in QEMU yet (only on the CPU emulator and in the host tests, on the software renderer); not tried on virgl or a real GPU.

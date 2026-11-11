@@ -139,6 +139,7 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
 bool Server::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) {
   {
     kernel::ScopedMutex lock(mutex_);
+    poll_waiting();      // (commits whose acquire point the GPU reached meanwhile)
     Surface* s = window_surface(window);
     if (!s || !s->mapped || !s->current.valid()) return false;
     List<uint32_t> done(allocator_);

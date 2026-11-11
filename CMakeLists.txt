@@ -757,6 +757,7 @@ add_executable(BOOTX64
   src/Process/WindowsUnixSockets.cpp
   src/Process/UnixSockets.cpp
   src/Process/MemoryFile.cpp
+  src/Process/DxgBufferFile.cpp
   src/X11/X11Drawing.cpp
   src/X11/X11Input.cpp
   src/X11/X11Requests.cpp

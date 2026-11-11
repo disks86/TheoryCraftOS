@@ -28,6 +28,14 @@
 // Feedback (version 4): one tranche, the four formats, linear, on the main device: /dev/dxg's number (Process/DxgDevice.h), the one device a client makes its
 // buffers on here. The format table is a sealed file in memory of 16-byte entries (format, padding, modifier), the same for every client. Surface feedback is
 // the default feedback (one GPU: nothing differs per surface), and it never changes, so each feedback object gets it once.
+//
+// Explicit sync (wp_linux_drm_syncobj_manager_v1, version 1). A timeline is a fence a client passed (exported with /dev/dxg: TCOS_DXG_IOCTL_EXPORT_SYNC). A
+// commit with a buffer on a surface that has a wp_linux_drm_syncobj_surface_v1 names an acquire point (the picture is ready when the timeline reaches it) and a
+// release point (the compositor signals it when it is done with that use of the buffer). A commit whose acquire point is not reached yet waits (the surface
+// keeps showing what it showed); it is applied as soon as the point is found reached - at the next request of any client or the next time the desktop draws
+// (it is asked to come back) - so a client is never shown a picture the GPU is still drawing. One commit waits at a time per surface: a newer one replaces it
+// and the older buffer's release point is signalled unused. The release point of a buffer is signalled when another buffer replaces it, the same buffer is
+// committed again, or the surface goes. A synchronized subsurface's commit is applied with its parent's without waiting for its acquire point.
 #include "Process/DxgDevice.h"
 #include "Wayland/WaylandInternal.hpp"
 
@@ -230,6 +238,144 @@ void Server::dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode
       return;
     }
     default: post_error(c, id, kErrorInvalidMethod, "zwp_linux_buffer_params_v1 has no such request"); return;
+  }
+}
+
+// ------------------------------------------------------------------ wp_linux_drm_syncobj_v1
+
+bool Server::acquired(const State& state) {
+  if (!state.acquire.set()) return true;
+  GpuTimeline* t = state.acquire.timeline->timeline();
+  return t && t->value() >= state.acquire.point;
+}
+
+void Server::signal_release(BufferInfo& b) {
+  if (!b.release_timeline) return;
+  if (GpuTimeline* t = b.release_timeline->timeline()) t->signal(b.release_point);
+  b.release_timeline = Fd();
+}
+
+void Server::finish_waiting(Surface& s, bool force) {
+  if (!s.waiting) return;
+  if (!force && !acquired(s.waiting_state)) return;
+  Client* c = client_of(s.client);
+  State state = util::move(s.waiting_state);
+  s.waiting_state = State();
+  s.waiting = false;
+  --waiting_count_;
+  if (c) apply(*c, s, state);
+}
+
+void Server::poll_waiting() {
+  if (waiting_count_ == 0) return;
+  for (Surface& s : surfaces_) {
+    if (!s.waiting) continue;
+    finish_waiting(s, false);
+    if (s.waiting) {      // (still not reached: the desktop comes back for it)
+      Surface* top = &s;
+      while (top->role == Role::Subsurface && top->parent) top = top->parent;
+      note_repaint(*top, {0, 0, 1, 1});
+    }
+  }
+}
+
+// The rules of a commit on a surface with explicit sync (wp_linux_drm_syncobj_surface_v1): points need a buffer, a buffer needs both points, the buffer must be
+// a dmabuf, and on one timeline the release point must come after the acquire point.
+bool Server::check_sync_points(Client& c, Surface& s) {
+  State& p = s.pending;
+  if (s.syncobj_id == 0) return true;
+  const bool buffer = p.attached && p.buffer.valid();
+  if ((p.acquire.set() || p.release.set()) && !buffer) {
+    post_error(c, s.syncobj_id, kSyncobjNoBuffer, "sync points without a buffer");
+    return false;
+  }
+  if (!buffer) return true;
+  if (!p.acquire.set()) {
+    post_error(c, s.syncobj_id, kSyncobjNoAcquirePoint, "a buffer without an acquire point");
+    return false;
+  }
+  if (!p.release.set()) {
+    post_error(c, s.syncobj_id, kSyncobjNoReleasePoint, "a buffer without a release point");
+    return false;
+  }
+  if (!p.buffer.gpu) {
+    post_error(c, s.syncobj_id, kSyncobjUnsupportedBuffer, "explicit sync needs a dmabuf");
+    return false;
+  }
+  if (p.acquire.timeline->timeline() == p.release.timeline->timeline() && p.acquire.point >= p.release.point) {
+    post_error(c, s.syncobj_id, kSyncobjConflictingPoints, "the release point is not after the acquire point");
+    return false;
+  }
+  return true;
+}
+
+void Server::syncobj_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in) {
+  if (r.iface == Iface::SyncobjManager) {
+    switch (opcode) {
+      case 0: destroy_object(c, id); return;      // destroy
+      case 1: {                                   // get_surface(new id, surface)
+        const uint32_t object = in.u(), surface = in.object();
+        if (!in.ok()) return;
+        Resource* sr = object_of(c, surface, Iface::Surface, id);
+        if (!sr || !sr->surface) return;
+        if (sr->surface->syncobj_id != 0) {
+          post_error(c, id, kSyncobjSurfaceExists, "the surface has explicit sync already");
+          return;
+        }
+        Surface* s = sr->surface;
+        Resource* nr = new_object(c, object, Iface::SyncobjSurface, 1, id);
+        if (!nr) return;
+        nr->surface = s;
+        s->syncobj_id = object;
+        return;
+      }
+      case 2: {      // import_timeline(new id, fd)
+        const uint32_t object = in.u();
+        Fd fd = in.fd();
+        if (!in.ok()) return;
+        if (!fd || !fd->timeline()) {
+          post_error(c, id, kSyncobjInvalidTimeline, "not a timeline");
+          return;
+        }
+        Resource* nr = new_object(c, object, Iface::SyncobjTimeline, 1, id);
+        if (nr) nr->timeline = util::move(fd);
+        return;
+      }
+      default: post_error(c, id, kErrorInvalidMethod, "wp_linux_drm_syncobj_manager_v1 has no such request"); return;
+    }
+  }
+  if (r.iface == Iface::SyncobjTimeline) {
+    if (opcode == 0) destroy_object(c, id);      // destroy (points set with it keep the timeline)
+    else post_error(c, id, kErrorInvalidMethod, "wp_linux_drm_syncobj_timeline_v1 has no such request");
+    return;
+  }
+  // wp_linux_drm_syncobj_surface_v1
+  Surface* s = r.surface;
+  switch (opcode) {
+    case 0:      // destroy: back to implicit sync
+      if (s) {
+        s->syncobj_id = 0;
+        s->pending.acquire = SyncPoint();
+        s->pending.release = SyncPoint();
+      }
+      destroy_object(c, id);
+      return;
+    case 1:        // set_acquire_point(timeline, point_hi, point_lo)
+    case 2: {      // set_release_point
+      const uint32_t timeline = in.object(), hi = in.u(), lo = in.u();
+      if (!in.ok()) return;
+      if (!s) {
+        post_error(c, id, kSyncobjNoSurface, "the surface is gone");
+        return;
+      }
+      Resource* tr = object_of(c, timeline, Iface::SyncobjTimeline, id);
+      if (!tr) return;
+      SyncPoint& point = opcode == 1 ? s->pending.acquire : s->pending.release;
+      point.timeline = tr->timeline;
+      point.point = uint64_t{hi} << 32 | lo;
+      return;
+    }
+    default: post_error(c, id, kErrorInvalidMethod, "wp_linux_drm_syncobj_surface_v1 has no such request"); return;
   }
 }
 

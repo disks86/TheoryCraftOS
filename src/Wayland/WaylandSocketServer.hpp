@@ -50,8 +50,10 @@ class SocketServer {
   SocketServer& operator=(const SocketServer&) = delete;
 
   // Makes GPU images of the dmabufs clients pass (null: none; zwp_linux_dmabuf_v1 is offered while there is a maker). Set before start().
+  // The same makes timelines of the fences they pass (sync objects: wp_linux_drm_syncobj_v1).
   using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
-  void set_gpu_images(MakeGpuImage make, void* context);
+  using MakeGpuTimeline = SharedPointer<GpuTimeline> (*)(void* context, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
+  void set_gpu_images(MakeGpuImage make, MakeGpuTimeline make_timeline, void* context);
   // Binds the socket file (made afresh in `files`, the system's file system, where /Linux/run is). False when it could not be bound.
   bool listen(filesystem::IFileSystem& files);
   // One round: new connections, what came, what is owed. True when anything moved (call again before waiting).
@@ -90,6 +92,7 @@ class SocketServer {
   ByteBuffer chunk_;
   bool woken_ = false;      // (under the system lock)
   MakeGpuImage make_gpu_ = nullptr;
+  MakeGpuTimeline make_timeline_ = nullptr;
   void* make_gpu_context_ = nullptr;
   volatile bool stopping_ = false;
   kernel::Thread* thread_ = nullptr;

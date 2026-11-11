@@ -66,6 +66,10 @@ struct DxgImported {
 using DxgExportHandler = bool (*)(Process& process, uint32_t allocation, SharedPointer<dxgk::ExportedAllocation>* out, uint64_t* bytes, uint32_t* status);
 using DxgImportHandler = bool (*)(Process& process, uint32_t device, const dxgk::ExportedAllocation& exported, DxgImported* out, uint32_t* status);
 void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler);
+// Fences as descriptors (TCOS_DXG_IOCTL_EXPORT_SYNC / IMPORT_SYNC), by the same layer.
+using DxgExportSyncHandler = bool (*)(Process& process, uint32_t sync, SharedPointer<dxgk::ExportedSync>* out, uint32_t* status);
+using DxgImportSyncHandler = bool (*)(Process& process, uint32_t device, const dxgk::ExportedSync& exported, uint32_t* sync, uint32_t* status);
+void set_dxg_sync_handlers(DxgExportSyncHandler export_handler, DxgImportSyncHandler import_handler);
 
 // The errno (as a result register value, -errno) for a file system status.
 uint64_t errno_of_status(filesystem::Status status);

@@ -169,6 +169,47 @@ static int wait_event(u32 object, u32 opcode) {
     if (ev.object == object && ev.opcode == opcode) return 1;
   }
 }
+/* A D3DKMT service through /dev/dxg (its NTSTATUS; -1 when the ioctl failed). */
+static long dxg_fd = -1;
+static int kmt_call(u32 service, void *params) {
+  TcosDxgCall call = {service, 0, (unsigned long)params};
+  if (sys3(NR_IOCTL, dxg_fd, TCOS_DXG_IOCTL_CALL, &call) != 0) return -1;
+  return call.status;
+}
+static void put32(u8 *b, u32 at, u32 v) { copy(b + at, &v, 4); }
+static void put64(u8 *b, u32 at, u64 v) { copy(b + at, &v, 8); }
+static u32 get32(const u8 *b, u32 at) { u32 v; copy(&v, b + at, 4); return v; }
+static u32 make_fence(u32 device) {      /* D3DKMTCreateSynchronizationObject2, a fence starting at 0 */
+  u8 a[96];
+  zero(a, sizeof a);
+  put32(a, 0, device);
+  put32(a, 8, 3);
+  return kmt_call(TCOS_DXG_CREATE_SYNCHRONIZATION_OBJECT2, a) == 0 ? get32(a, 88) : 0;
+}
+static int signal_fence(u32 device, u32 fence, u64 value) {      /* D3DKMTSignalSynchronizationObjectFromCpu */
+  u8 a[32];
+  zero(a, sizeof a);
+  put32(a, 0, device);
+  put32(a, 4, 1);
+  put64(a, 8, (u64)&fence);
+  put64(a, 16, (u64)&value);
+  return kmt_call(TCOS_DXG_SIGNAL_SYNCHRONIZATION_OBJECT_FROM_CPU, a);
+}
+static int wait_fence(u32 device, u32 fence, u64 value) {      /* D3DKMTWaitForSynchronizationObjectFromCpu (no event: blocks) */
+  u8 a[48];
+  zero(a, sizeof a);
+  put32(a, 0, device);
+  put32(a, 4, 1);
+  put64(a, 8, (u64)&fence);
+  put64(a, 16, (u64)&value);
+  return kmt_call(TCOS_DXG_WAIT_FOR_SYNCHRONIZATION_OBJECT_FROM_CPU, a);
+}
+static int export_fence(u32 fence) {
+  TcosDxgExport ex = {fence, TCOS_DXG_EXPORT_CLOEXEC, -1, 0};
+  return sys3(NR_IOCTL, dxg_fd, TCOS_DXG_IOCTL_EXPORT_SYNC, &ex) == 0 && ex.status == 0 ? ex.fd : -1;
+}
+static void point(u32 so, u32 opcode, u32 timeline, u64 value) { begin(so, opcode); put(timeline); put((u32)(value >> 32)); put((u32)value); end(); }
+
 static const char *env_value(char **envp, const char *name) {
   for (; *envp; ++envp) {
     const char *e = *envp, *n = name;
@@ -453,7 +494,7 @@ __attribute__((used)) void start_c(long *stack) {
   CHECK(imported != VK_NULL_HANDLE);
   if (imported) CHECK(near(pixel_of(imported, 2, 2), 0xFFFF8000u));
   /* /dev/dxg's refusals: a descriptor that is not a GPU image; a handle that is no allocation */
-  const long dxg = sys6(NR_OPENAT, -100, (long)TCOS_DXG_DEVICE_PATH, 2 | 0x80000, 0, 0, 0);
+  long dxg = sys6(NR_OPENAT, -100, (long)TCOS_DXG_DEVICE_PATH, 2 | 0x80000, 0, 0, 0);
   CHECK(dxg >= 0);
   const long memfd = sys3(NR_MEMFD_CREATE, "not-gpu", 1, 0);
   TcosDxgImport im;
@@ -478,7 +519,7 @@ __attribute__((used)) void start_c(long *stack) {
   sock = sys3(NR_SOCKET, 1, 1 | 0x80000, 0);
   CHECK(sock >= 0 && sys3(NR_CONNECT, sock, address, at + 1) == 0);
   if (failed) goto done;
-  u32 g_compositor = 0, g_wm = 0, g_deco = 0, g_dmabuf = 0, dmabuf_version = 0;
+  u32 g_compositor = 0, g_wm = 0, g_deco = 0, g_dmabuf = 0, dmabuf_version = 0, g_syncobj = 0;
   begin(1, 1); put(2); end();
   begin(1, 0); put(3); end();
   while (next_event() && !(ev.object == 3 && ev.opcode == 0)) {
@@ -489,6 +530,7 @@ __attribute__((used)) void start_c(long *stack) {
     else if (same(name, "xdg_wm_base")) g_wm = global;
     else if (same(name, "zxdg_decoration_manager_v1")) g_deco = global;
     else if (same(name, "zwp_linux_dmabuf_v1")) g_dmabuf = global, dmabuf_version = arg(1 + (arg(1) + 3) / 4 + 1);
+    else if (same(name, "wp_linux_drm_syncobj_manager_v1")) g_syncobj = global;
   }
   CHECK(g_compositor && g_wm && g_deco && g_dmabuf && dmabuf_version == 4);
   begin(2, 0); put(g_compositor); put_s("wl_compositor"); put(5); put(10); end();
@@ -543,6 +585,53 @@ __attribute__((used)) void start_c(long *stack) {
   begin(30, 3); put(41); end();
   begin(30, 6); end();
   CHECK(wait_event(41, 0));      /* drawn by the desktop */
+  /* explicit sync: two fences of a device of our own, exported as timelines; a commit waits for its acquire point, the release point comes when its use ends */
+  {
+    dxg_fd = sys6(NR_OPENAT, -100, (long)TCOS_DXG_DEVICE_PATH, 2 | 0x80000, 0, 0, 0);
+    u8 en[16], infos[20 * 4], dv[64];
+    zero(en, sizeof en);
+    put32(en, 0, 4);
+    put64(en, 8, (u64)infos);
+    CHECK(kmt_call(TCOS_DXG_ENUM_ADAPTERS2, en) == 0 && get32(en, 0) >= 1);
+    zero(dv, sizeof dv);
+    put32(dv, 0, get32(infos, 0));
+    CHECK(kmt_call(TCOS_DXG_CREATE_DEVICE, dv) == 0);
+    const u32 device = get32(dv, 12);
+    const u32 fa = make_fence(device), fr = make_fence(device);
+    CHECK(device && fa && fr);
+    const int ta = export_fence(fa), tr = export_fence(fr);
+    CHECK(ta >= 0 && tr >= 0);
+    CHECK(export_fence(0x5555) == -1);      /* (no such sync object) */
+    TcosDxgImportSync is = {ta, device, 0, 0};
+    CHECK(sys3(NR_IOCTL, dxg_fd, TCOS_DXG_IOCTL_IMPORT_SYNC, &is) == 0 && is.status == 0 && is.sync != 0);      /* (the same fence, a second handle) */
+    CHECK(g_syncobj != 0);
+    begin(2, 0); put(g_syncobj); put_s("wp_linux_drm_syncobj_manager_v1"); put(1); put(19); end();
+    begin(19, 2); put(70); pending_fd = ta; end();      /* import_timeline */
+    begin(19, 2); put(71); pending_fd = tr; end();
+    sys3(NR_CLOSE, ta, 0, 0);
+    sys3(NR_CLOSE, tr, 0, 0);
+    begin(19, 1); put(72); put(30); end();               /* get_surface */
+    /* acquire point 1 not reached yet: the commit waits */
+    point(72, 1, 70, 1);
+    point(72, 2, 71, 1);
+    begin(30, 1); put(40); put(0); put(0); end();
+    begin(30, 2); put(0); put(0); put(W); put(H); end();
+    begin(30, 6); end();
+    begin(1, 0); put(73); end();
+    CHECK(wait_event(73, 0));
+    CHECK(signal_fence(device, is.sync, 1) == 0);      /* (through the imported handle: the same fence) */
+    /* the same buffer again with acquire 2 (reached first): applied at once, and the first commit's release point comes */
+    CHECK(signal_fence(device, fa, 2) == 0);
+    point(72, 1, 70, 2);
+    point(72, 2, 71, 3);
+    begin(30, 1); put(40); put(0); put(0); end();      /* (points need a buffer attached in the same commit) */
+    begin(30, 2); put(0); put(0); put(W); put(H); end();
+    begin(30, 6); end();
+    CHECK(wait_fence(device, fr, 1) == 0);      /* (blocks until the compositor signalled it) */
+    begin(72, 0); end();      /* back to implicit sync for the frames below */
+    begin(1, 0); put(74); end();
+    CHECK(wait_event(74, 0));
+  }
   /* frames rendered on the GPU into the same image, each committed and drawn */
   for (u32 frame = 0; frame < 6; ++frame) {
     render(framebuffer, 0.0f, 0.25f * (float)(frame % 4), 1.0f, -0.25f + 0.1f * (float)frame);

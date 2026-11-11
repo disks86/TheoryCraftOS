@@ -1905,7 +1905,7 @@ static void test_dxg_compositor() {
   constexpr uint32_t W = 64, H = 48;
   {
     wayland::SocketServer transport(server, sockets, A);
-    transport.set_gpu_images(&wayland::make_dxg_image, &k);
+    transport.set_gpu_images(&wayland::make_dxg_image, &wayland::make_dxg_timeline, &k);
     CHECK(transport.listen(files));
     std::atomic<bool> stop{false};
     std::thread pump([&] {
@@ -2178,6 +2178,225 @@ static void test_dxg_cpu_mapping() {
   free_made();
 }
 
+// ------------------------------------------------------------------ wp_linux_drm_syncobj_v1 (explicit sync)
+
+struct FakeTimeline final : wayland::Memory, wayland::GpuTimeline {
+  uint64_t at = 0;
+  ByteView map(uint64_t) override { return ByteView(); }
+  wayland::GpuTimeline* timeline() override { return this; }
+  uint64_t value() override { return at; }
+  void signal(uint64_t point) override { if (point > at) at = point; }
+};
+
+struct SyncApp : DmabufApp {
+  uint32_t manager = 0;
+  explicit SyncApp(Server& s) : DmabufApp(s) {
+    manager = bind(reg, "wp_linux_drm_syncobj_manager_v1");
+    drop_events();
+  }
+  uint32_t timeline(Fd fd) {
+    const uint32_t t = new_id();
+    send(Msg(manager, 2).u(t), {fd});
+    return t;
+  }
+  uint32_t sync_surface(uint32_t surface) {
+    const uint32_t o = new_id();
+    send(Msg(manager, 1).u(o).u(surface));
+    return o;
+  }
+  void points(uint32_t so, uint32_t acquire, uint64_t a, uint32_t release, uint64_t r) {
+    send(Msg(so, 1).u(acquire).u(uint32_t(a >> 32)).u(uint32_t(a)));
+    send(Msg(so, 2).u(release).u(uint32_t(r >> 32)).u(uint32_t(r)));
+  }
+  uint32_t gpu_buffer(uint32_t color) {
+    Fd g = Fd::make_as<FakeGpu>(A, 40u, 30u, color);
+    return immed(params(g, 0, 160), 40, 30);
+  }
+};
+
+static void test_syncobj() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {      // offered with GPU buffers only
+    WClient c(server);
+    c.registry();
+    CHECK(c.globals.count("wp_linux_drm_syncobj_manager_v1") == 0);
+  }
+  server.set_dmabuf(true);
+  {
+    SyncApp app(server);
+    CHECK(app.globals.count("wp_linux_drm_syncobj_manager_v1") == 1 && app.manager != 0);
+    App::Window w = app.toplevel(true, "explicit");
+    Fd acquire_fd = Fd::make_as<FakeTimeline>(A), release_fd = Fd::make_as<FakeTimeline>(A);
+    FakeTimeline& acquire = static_cast<FakeTimeline&>(*acquire_fd);
+    FakeTimeline& release = static_cast<FakeTimeline&>(*release_fd);
+    const uint32_t ta = app.timeline(acquire_fd), tr = app.timeline(release_fd);
+    const uint32_t so = app.sync_surface(w.surface);
+    CHECK(!app.closing);
+    // a commit whose acquire point is not reached waits: nothing shown
+    const uint32_t b1 = app.gpu_buffer(0xFF111111u);
+    app.points(so, ta, 1, tr, 1);
+    app.commit(w, b1, 40, 30);
+    CHECK(listed(server).empty() && !app.closing);
+    acquire.at = 1;
+    CHECK(app.roundtrip());      // (any request looks again)
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (list.empty()) return;
+    const uint32_t win = list[0];
+    CHECK(server.window_pixel(win, 3, 3) == 0xFF111111u);
+    // the next frame waits while the desktop keeps showing the first; the desktop's drawing looks again
+    const uint32_t b2 = app.gpu_buffer(0xFF222222u);
+    app.points(so, ta, 2, tr, 2);
+    app.commit(w, b2, 40, 30);
+    std::vector<uint32_t> target(100 * 100);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 100;
+    uint32_t dw, dh;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    }
+    CHECK(target[5 * 100 + 5] == 0xFF111111u && release.at == 0 && !app.has(b1, 0));
+    List<uint32_t> changed(A);
+    List<desktop::IWindowsSession::Repaint> repainted(A);
+    server.take_changes(&changed, &repainted);
+    CHECK(repainted.count() == 1 && repainted[0].window == win);      // (the desktop is asked to come back)
+    acquire.at = 2;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    }
+    CHECK(target[5 * 100 + 5] == 0xFF222222u);
+    CHECK(release.at == 1 && app.has(b1, 0));      // (the first buffer's use is over: its release point, and wl_buffer.release)
+    // two commits waiting: the newer takes the older's place, whose buffer is let go unused
+    const uint32_t b3 = app.gpu_buffer(0xFF333333u), b4 = app.gpu_buffer(0xFF444444u);
+    app.points(so, ta, 3, tr, 3);
+    app.commit(w, b3, 40, 30);
+    app.points(so, ta, 4, tr, 4);
+    app.commit(w, b4, 40, 30);
+    CHECK(release.at == 3 && app.has(b3, 0) && server.window_pixel(win, 3, 3) == 0xFF222222u);
+    acquire.at = 4;
+    CHECK(app.roundtrip() && server.window_pixel(win, 3, 3) == 0xFF444444u && release.at == 3);
+    // the same buffer again: the earlier use of it is over
+    acquire.at = 5;
+    app.points(so, ta, 5, tr, 6);
+    app.commit(w, b4, 40, 30);
+    CHECK(release.at == 4);      // (point 4 of b4's first commit; 6 is b4's current use)
+    // explicit sync dropped: implicit again (a commit without points)
+    app.send(Msg(so, 0));
+    app.commit(w, b2, 40, 30);
+    CHECK(!app.closing && release.at == 6 && server.window_pixel(win, 3, 3) == 0xFF222222u);
+    // a surface that goes with a commit waiting lets the buffer go
+    const uint32_t so2 = app.sync_surface(w.surface);
+    const uint32_t b5 = app.gpu_buffer(0xFF555555u);
+    app.points(so2, ta, 100, tr, 101);
+    app.commit(w, b5, 40, 30);
+    CHECK(release.at == 6);
+    app.send(Msg(w.toplevel, 0));
+    app.send(Msg(w.xdg, 0));
+    app.send(Msg(w.surface, 0));
+    CHECK(release.at == 101 && !app.closing);
+    // requests on the syncobj surface of a surface that went: no_surface
+    app.send(Msg(so2, 1).u(ta).u(0).u(7));
+    uint32_t object = 0, code = 0;
+    CHECK(app.error(&object, &code) && object == so2 && code == 1);
+  }
+  // the rules
+  struct Case {
+    const char* what;
+    uint32_t code;
+    std::function<void(SyncApp&, App::Window&, uint32_t so, uint32_t ta, uint32_t tr)> run;
+  };
+  const Case cases[] = {
+      {"surface exists", 0, [](SyncApp& a, App::Window& w, uint32_t, uint32_t, uint32_t) { a.sync_surface(w.surface); }},
+      {"not a timeline", 1, [](SyncApp& a, App::Window&, uint32_t, uint32_t, uint32_t) { std::vector<uint8_t> m(64); a.timeline(Fd::make_as<TestMemory>(A, &m)); }},
+      {"unsupported buffer", 2, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t tr) {
+         App::Pool p = a.pool(40 * 30 * 4);
+         const uint32_t b = a.buffer(p, 0, 40, 30, 160);
+         a.points(so, ta, 1, tr, 2);
+         a.commit(w, b, 40, 30);
+       }},
+      {"no buffer", 3, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t tr) { a.points(so, ta, 1, tr, 2); a.send(Msg(w.surface, 6)); }},
+      {"no acquire point", 4, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t, uint32_t tr) {
+         a.send(Msg(so, 2).u(tr).u(0).u(2));
+         a.commit(w, a.gpu_buffer(0), 40, 30);
+       }},
+      {"no release point", 5, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t) {
+         a.send(Msg(so, 1).u(ta).u(0).u(2));
+         a.commit(w, a.gpu_buffer(0), 40, 30);
+       }},
+      {"conflicting points", 6, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t) { a.points(so, ta, 5, ta, 5); a.commit(w, a.gpu_buffer(0), 40, 30); }},
+  };
+  for (const Case& k : cases) {
+    SyncApp app(server);
+    App::Window w = app.toplevel(true, "rules");
+    const uint32_t ta = app.timeline(Fd::make_as<FakeTimeline>(A)), tr = app.timeline(Fd::make_as<FakeTimeline>(A));
+    const uint32_t so = app.sync_surface(w.surface);
+    k.run(app, w, so, ta, tr);
+    uint32_t object = 0, code = 0;
+    const bool err = app.error(&object, &code);
+    if (!err || code != k.code) printf("   syncobj case '%s': error %d code %u\n", k.what, err, code);
+    CHECK(err && code == k.code && app.closing);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Real fences of the Direct3D layer: exported, imported in another process (the same fence), read and raised through the compositor's timeline.
+static void test_dxg_fences() {
+  graphics::SoftwareDevice device{A, nullptr};
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  {
+    DxgProcess p(k, 80), q(k, 81);
+    dxgk::Handle fence = 0, semaphore = 0;
+    CHECK(dst::ok(k.create_sync(p.pid, p.device, dxgk::SyncType::Fence, 5, 0, &fence)));
+    CHECK(dst::ok(k.create_sync(p.pid, p.device, dxgk::SyncType::Semaphore, 0, 4, &semaphore)));
+    SharedPointer<dxgk::ExportedSync> e;
+    CHECK(k.export_sync(p.pid, semaphore, &e) == dst::kNotSupported && !e);
+    CHECK(k.export_sync(p.pid, 0x4242, &e) == dst::kInvalidHandle);
+    CHECK(dst::ok(k.export_sync(p.pid, fence, &e)) && e);
+    if (!e) return;
+    CHECK(dxgk::exported_sync_value(*e) == 5);
+    dxgk::Handle imported = 0;
+    CHECK(dst::ok(k.import_sync(q.pid, q.device, *e, &imported)));
+    const uint64_t nine = 9;
+    CHECK(dst::ok(k.signal_sync_cpu(q.pid, ArrayView<const dxgk::Handle>(&imported, 1), ArrayView<const uint64_t>(&nine, 1))));
+    uint64_t value = 0;
+    CHECK(dst::ok(k.query_sync(p.pid, fence, &value)) && value == 9 && dxgk::exported_sync_value(*e) == 9);
+    // through the compositor's timeline (what the transport makes of the descriptor)
+    SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
+    UniquePointer<process::DxgSyncFile> f = UniquePointer<process::DxgSyncFile>::make(A, e);
+    o->gpu_sync = f.get();
+    o->file = util::move(f);
+    SharedPointer<wayland::GpuTimeline> t = wayland::make_dxg_timeline(&k, A, o);
+    CHECK(t && t->value() == 9);
+    if (t) {
+      t->signal(4);      // (never back)
+      CHECK(t->value() == 9);
+      t->signal(12);
+      CHECK(dst::ok(k.query_sync(q.pid, imported, &value)) && value == 12);
+    }
+    // a wait of the process for a point the compositor signals is satisfied
+    const uint64_t twelve = 12;
+    CHECK(dst::ok(k.wait_sync_cpu(p.pid, ArrayView<const dxgk::Handle>(&fence, 1), ArrayView<const uint64_t>(&twelve, 1), true, 0)));
+    // the fence outlives its process while the export holds it
+    k.close_process(p.pid);
+    k.close_process(q.pid);
+    if (t) {
+      t->signal(20);
+      CHECK(t->value() == 20);
+    }
+    t.reset();
+    o.reset();
+  }
+
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2194,6 +2413,8 @@ int main() {
   test_dxg_exports();
   test_dxg_compositor();
   test_dxg_cpu_mapping();
+  test_syncobj();
+  test_dxg_fences();
   test_dxg_threads();
   test_threads();
   free_made();

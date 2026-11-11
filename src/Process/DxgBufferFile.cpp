@@ -89,4 +89,7 @@ bool DxgBufferFile::flush_cpu_writes() {
   return copy_locked(true);
 }
 
+DxgSyncFile::DxgSyncFile(SharedPointer<dxgk::ExportedSync> exported) : exported_(util::move(exported)) {}
+DxgSyncFile::~DxgSyncFile() = default;
+
 }  // namespace process

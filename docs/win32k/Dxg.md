@@ -29,6 +29,9 @@ GPU images as descriptors, the counterpart of Linux's dmabufs (what a Wayland cl
   the copy to the image at a commit when a writable mapping is still there and the copy changed since it was last moved, for clients that skip the ioctl.
 - `TCOS_DXG_IOCTL_IMPORT` (`TcosDxgImport`: fd, device) gives the process an allocation handle for such a descriptor's image on one of its devices (same adapter: else
   `STATUS_INVALID_PARAMETER`), recorded like the allocations it creates; it answers the size, the kernel's format number and the pitch.
+- `TCOS_DXG_IOCTL_EXPORT_SYNC` / `IMPORT_SYNC` do the same for a fence (a sync object made as a D3DKMT fence: semaphores are `STATUS_NOT_SUPPORTED`): the
+  descriptor (`process::DxgSyncFile`) holds a `dxgk::ExportedSync`; the Wayland compositor reads and raises it as a `wp_linux_drm_syncobj` timeline
+  (`exported_sync_value`, `signal_exported_sync`). `/dev/dxg`'s `fstat` gives `st_rdev` `TCOS_DXG_DEVICE_NUMBER`, the device the compositor's dmabuf feedback names.
 - The kernel reads an export without a process: `Kernel::read_export` (the CPU's read-only view) and `acquire_export_image` (the device's image, sampled in place; refused
   while a process has the allocation locked). The handlers are `linux_export` / `linux_import` in `Win32kDxg.cpp`; the ioctls are in `LinuxFiles.cpp`.
 

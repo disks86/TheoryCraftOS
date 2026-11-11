@@ -66,6 +66,10 @@ constexpr uint32_t kDrmArgb8888 = 0x34325241, kDrmXrgb8888 = 0x34325258, kDrmAbg
 constexpr uint64_t kDrmModLinear = 0, kDrmModInvalid = 0x00FFFFFFFFFFFFFFull;
 constexpr uint32_t kParamsAlreadyUsed = 0, kParamsPlaneIdx = 1, kParamsPlaneSet = 2, kParamsIncomplete = 3, kParamsInvalidFormat = 4, kParamsInvalidDimensions = 5,
                    kParamsOutOfBounds = 6, kParamsInvalidWlBuffer = 7;
+// wp_linux_drm_syncobj_v1 errors: the manager's, the surface's
+constexpr uint32_t kSyncobjSurfaceExists = 0, kSyncobjInvalidTimeline = 1;
+constexpr uint32_t kSyncobjNoSurface = 1, kSyncobjUnsupportedBuffer = 2, kSyncobjNoBuffer = 3, kSyncobjNoAcquirePoint = 4, kSyncobjNoReleasePoint = 5,
+                   kSyncobjConflictingPoints = 6;
 
 struct Server::Client {
   explicit Client(allocators::IAllocator& allocator) : in(allocator), out(allocator), fds_in(allocator), fds_out(allocator), objects(allocator) {}

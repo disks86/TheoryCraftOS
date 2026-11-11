@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
   wl_server.attach(4, 24);
   wayland::SocketServer wl_sockets(wl_server, *process::system_unix_sockets(), a);
 #ifdef TCOS_EMU_DMABUF
-  wl_sockets.set_gpu_images(&wayland::make_dxg_image, &dxkernel);
+  wl_sockets.set_gpu_images(&wayland::make_dxg_image, &wayland::make_dxg_timeline, &dxkernel);
   std::atomic<int> wl_gpu_draws{0}, wl_cpu_draws{0};
 #endif
   if (!wl_sockets.listen(fs)) printf("wayland: could not listen\n");
