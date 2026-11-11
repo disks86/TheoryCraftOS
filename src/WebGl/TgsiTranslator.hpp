@@ -18,9 +18,12 @@
 
 // Turns a vertex and a fragment shader (GLSL ES 1.00/3.00 modules from Glsl.cpp) into TGSI text for a 3D device that runs shaders itself (virgl).
 //
-// Only the part of the language that maps straight onto a GPU without a real compiler is handled: float scalars, vectors and matrices; arithmetic, comparisons,
-// `if`; the common built-in functions; uniforms, attributes and varyings of those types; and in a fragment shader texture2D()/texture() of a uniform sampler2D. Anything else (loops, integers, user functions, other textures, derivatives,
-// uniform blocks, flat varyings, gl_FragCoord, discard in a loop ...) makes the translation fail and the draw then runs on the CPU rasterizer.
+// What is handled: float, integer and boolean scalars and vectors and float matrices (integers and booleans are kept as float values, exact below 2^24); arithmetic,
+// comparisons, `if`, `for` / `while` / `do` loops with break and continue, user functions (inlined at each call, with in / out / inout parameters and returns
+// anywhere), local arrays and uniform arrays indexed by constants or variables, discard, the common built-in functions; uniforms, attributes and (also flat)
+// varyings of those types, gl_FragCoord and gl_FrontFacing; and in a fragment shader texture2D()/texture() of a uniform sampler2D. Anything else (bitwise
+// integer operators, switch, other textures, derivatives, uniform blocks, structures in GLSL arrays, recursion ...) makes the translation fail and the draw then
+// runs on the CPU rasterizer.
 //
 // The output follows the conventions of graphics::ShaderModuleDesc::tgsi: attributes are IN[0..], varyings GENERIC[0..], and the uniforms of both stages share one
 // block of CONST rows (at most TgsiLimits::const_rows, the device's push constants). Clip space is converted from GL's (-w <= z <= w) to the device's (0 <= z <= w) at
@@ -50,7 +53,11 @@ struct TgsiLimits {
 struct TgsiLink {
   uint32_t vs_slot, fs_slot, count;
   bool saturate = false;   // written clamped to [0, 1] (a clamped vertex colour)
+  bool flat = false;       // not interpolated: the provoking (last) vertex's value
 };
+
+// How the values of a uniform or attribute become the floats the device's registers hold (integers and booleans are kept as float values on the device).
+enum : uint8_t { kTgsiAsIs = 0, kTgsiFromInt = 1, kTgsiFromUint = 2, kTgsiFromBool = 3 };
 
 // Where a CONST row gets its values: `comps` floats from `slot` of the shared (uniform) region of a stage.
 struct TgsiConstant {
@@ -58,6 +65,7 @@ struct TgsiConstant {
   uint16_t row;
   uint8_t comps;
   uint32_t slot;
+  uint8_t convert = kTgsiAsIs;   // int, uint or bool bits made float values
 };
 
 // Which vertex input a program attribute is: the private slot of the vertex shader's global (GLSL) or the shader location (WGSL), and its component count (the
@@ -65,6 +73,7 @@ struct TgsiConstant {
 struct TgsiAttribute {
   uint32_t slot;   // (the key)
   uint8_t comps;
+  uint8_t convert = kTgsiAsIs;   // an int / uint input: read as integers, sent as their float values
 };
 
 // What the fragment shader samples: SAMP[i] is samplers[i]. GLSL: a sampler2D uniform, and the texture unit it names is the value in `slot` of the fragment shader's
@@ -83,6 +92,7 @@ struct TgsiProgram {
   List<TgsiSampler> samplers;       // SAMP[i] of the fragment shader (WGSL: textureSample)
   uint32_t const_rows = 0;
   uint32_t varyings = 0;
+  bool uses_frag_coord = false;   // the fragment shader reads gl_FragCoord (in the device's pixels: the target must not be supersampled)
 };
 
 // False when the pair cannot run on the device (see the file comment); `why` (optional) then says what stopped it.

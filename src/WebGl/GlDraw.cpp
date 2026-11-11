@@ -1432,6 +1432,7 @@ bool GlContext::present(uint32_t* dst, uint32_t pitch, gpu::TouchBox* changed, b
 
 // What the accelerated path (GlAccel.cpp) shares with the software one.
 void read_vertex_attrib(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]) { read_attrib(at, element, at.size, false, out); }
+void read_vertex_attrib_int(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]) { read_attrib(at, element, at.size, true, out); }
 uint32_t vertex_attrib_element_bytes(const VertexAttrib& at) { return attrib_type_size(at.type) * at.size; }
 uint32_t read_index_value(const uint8_t* p, uint32_t type) { return read_index(p, type); }
 

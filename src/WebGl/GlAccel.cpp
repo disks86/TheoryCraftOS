@@ -213,8 +213,9 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   List<TgsiLink> links(a_);
   for (const VaryingLink& l : p.links) {
     // (a clamped colour is saturated in the shader: built with clamping on, see hw_draw)
-    if (l.flat) { p.accel_why = "a flat varying"; return false; }
-    if (!links.push_back(TgsiLink{l.vs_slot, l.fs_slot, l.count, l.clamp})) return false;
+    TgsiLink tl{l.vs_slot, l.fs_slot, l.count, l.clamp};
+    tl.flat = l.flat;
+    if (!links.push_back(tl)) return false;
   }
   UniquePointer<TgsiProgram> t = UniquePointer<TgsiProgram>::make(a_, a_);
   if (!t) return false;
@@ -341,6 +342,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (!hw_target(acc)) return no("no device target");
   if (!hw_valid_) return no("the device picture is out of date");
   const TgsiProgram& t = *p.tgsi;
+  if (t.uses_frag_coord && target.ss != 1) return no("gl_FragCoord on an antialiased drawing buffer");
 
   // the attributes of the translated shader, in the order of its IN[] registers
   Vao* vao = current_vao_ptr();
@@ -369,14 +371,20 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     return rebased < 0 ? 0 : rebased;
   };
   List<int64_t> tris(a_);
+  // (flat varyings take the last vertex's value on the device; with GL_FIRST_VERTEX_CONVENTION the first vertex is moved to the end, which keeps the winding)
+  bool any_flat = false;
+  for (const VaryingLink& l : p.links) any_flat = any_flat || l.flat;
+  const bool rotate = any_flat && desktop.active && desktop.first_vertex_convention;
   auto tri = [&](int32_t i0, int32_t i1, int32_t i2) {
     const int64_t a0 = index_at(i0), a1 = index_at(i1), a2 = index_at(i2);
     if (a0 < 0 || a1 < 0 || a2 < 0) return true;
+    if (rotate) return tris.push_back(a1) && tris.push_back(a2) && tris.push_back(a0);
     return tris.push_back(a0) && tris.push_back(a1) && tris.push_back(a2);
   };
   auto seg = [&](int32_t i0, int32_t i1) {
     const int64_t a0 = index_at(i0), a1 = index_at(i1);
     if (a0 < 0 || a1 < 0) return true;
+    if (rotate) return tris.push_back(a1) && tris.push_back(a0);
     return tris.push_back(a0) && tris.push_back(a1);
   };
   bool ok = true;
@@ -430,7 +438,14 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
         const uint32_t esize = vertex_attrib_element_bytes(at);
         const uint32_t stride = at.stride ? at.stride : esize;
         if (!b || at.offset + uint64_t{index} * stride + esize > b->data.size()) return no("an attribute past its buffer");
-        read_vertex_attrib(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+        if (t.attributes[k].convert == kTgsiAsIs) {
+          read_vertex_attrib(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+        } else {      // an integer input: read as the CPU reads it (integers), sent as their float values
+          read_vertex_attrib_int(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+          for (uint32_t& l : lanes) l = f2u(t.attributes[k].convert == kTgsiFromUint ? static_cast<float>(l) : static_cast<float>(static_cast<int32_t>(l)));
+        }
+      } else if (t.attributes[k].convert != kTgsiAsIs) {
+        for (int i = 0; i < 4; ++i) lanes[i] = f2u(static_cast<float>(at.cur_is_int ? at.cur_i[i] : static_cast<int32_t>(at.cur_f[i])));
       } else {
         for (int i = 0; i < 4; ++i) lanes[i] = f2u(at.cur_is_int ? static_cast<float>(at.cur_i[i]) : at.cur_f[i]);
       }
@@ -446,8 +461,17 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     for (const TgsiConstant& c : t.constants) {
       if (c.row != row) continue;
       const List<uint32_t>& shared = c.stage == 0 ? p.vs_shared : p.fs_shared;
-      for (uint32_t i = 0; i < c.comps && i < 4; ++i)
-        if (c.slot + i < shared.count()) lanes[i] = shared[c.slot + i];
+      for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
+        if (c.slot + i >= shared.count()) continue;
+        const uint32_t bits = shared[c.slot + i];
+        // (the device keeps integers and booleans as float values)
+        switch (c.convert) {
+          case kTgsiFromInt: lanes[i] = f2u(static_cast<float>(static_cast<int32_t>(bits))); break;
+          case kTgsiFromUint: lanes[i] = f2u(static_cast<float>(bits)); break;
+          case kTgsiFromBool: lanes[i] = f2u(bits ? 1.0f : 0.0f); break;
+          default: lanes[i] = bits; break;
+        }
+      }
     }
     for (uint32_t i = 0; i < 4; ++i)
       if (!constants.put32(lanes[i])) return no("out of memory");

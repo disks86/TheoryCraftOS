@@ -929,6 +929,7 @@ class GlContext final : public shader::ITextureHost {
 // Vertex fetch shared by the software and accelerated draws (GlDraw.cpp): the four float lanes (as bit patterns, missing ones 0, 0, 0, 1) of the attribute element at
 // `element`, its size in bytes, and an index of a given GL type read from `p`.
 void read_vertex_attrib(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]);
+void read_vertex_attrib_int(const VertexAttrib& at, const uint8_t* element, uint32_t out[4]);   // (an integer shader input: the lanes are integers)
 uint32_t vertex_attrib_element_bytes(const VertexAttrib& at);
 uint32_t read_index_value(const uint8_t* p, uint32_t type);
 

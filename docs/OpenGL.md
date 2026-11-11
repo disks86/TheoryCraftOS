@@ -55,6 +55,17 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
 
 - The program's shaders become TGSI once (`translate_to_tgsi`, with the device's `AccelLimits`: virgl takes 256 constant rows, 16 attributes, 14 varyings and 16
   textures), including the generated fixed-function ones. The vertices are assembled on the CPU (the draw's modes, restart index and base vertex) and sent as one list.
+- What the translator takes: loops (`for`, `while`, `do`, with break and continue), `switch`, user functions (inlined at each call, in / out / inout parameters,
+  returns anywhere: a flag the statements after a return or continue are guarded by), integers and booleans (kept as float values, exact below 2^24; integer
+  division truncates; shifts become multiplications), local arrays and uniform arrays indexed by variables (a chain of selects, and the address register),
+  matrix and array varyings (a register per column), flat varyings (the last vertex, as virgl's rasterizer does; GL_FIRST_VERTEX_CONVENTION rotates the
+  primitives), `gl_FragCoord`, `gl_FrontFacing`, `gl_FragData[0]`, discard, initialised globals, the trigonometric, hyperbolic, comparison and matrix built-ins
+  (`inverse` and `determinant` of 2 x 2 and 3 x 3), texture lookups with a level, bias, gradients or projection (the device's textures have one level), and
+  constants the decimal form cannot say (as their bits). Conditionals choose with CMP, so an infinity on the side not taken stays out of the result.
+- `src/WebGl/AccelConformance.cpp` has 23 scenes that draw a picture with the accelerator and without; the kernel runs them at boot on the machine's GPU
+  ("OpenGL: ...: as the CPU renderer"; all 23 match on virgl), `tests/GlAccelTest.cpp` on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with
+  DxgkrnlTest). `PiglitShaderTest --accel-survey` counts which piglit draws the hardware would take and why the others not (`SURVEY_REASON=text` lists
+  the tests): 709 of 1223 tests draw only on the device (222 before this translator work); most of the rest have geometry or tessellation stages.
 - State the device has goes with the draw: blend factors and equations, the colour mask and the depth function (`AccelState::custom_blend`), culling, scissor and
   viewport, lines and points one pixel wide. What it has not (the stencil test, polygon offset, polygon modes and stipples, flat shading, alpha test, logic ops,
   wide lines, point sizes, two-sided colour, gl_PrimitiveID, clip planes, geometry and tessellation stages, queries, transform feedback, framebuffer objects,
@@ -113,9 +124,10 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   layouts are reported as `Block.member`; `glBindFragDataLocation`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
-- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no loops, integers, user functions, uniform blocks, `discard` in a loop,
-  flat varyings, `gl_FragCoord`, derivatives or texture kinds other than 2D; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is
-  read back at each swap (no zero-copy present into the window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
+- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no geometry or tessellation stages, uniform blocks, bitwise integer
+  operators (other than shifts), derivatives, texture kinds other than 2D, vertex-shader textures, arrays of structures, recursion, `continue` inside a `switch`
+  or 4 x 4 `inverse`; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is read back at each swap (no zero-copy present into the
+  window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).
 - Wine's test still fails on rendering into DIBs (bitmap formats' read-back of GDI contents), some pixel-format choice details, and object-name expectations after sharing.

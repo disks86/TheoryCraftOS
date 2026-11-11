@@ -741,17 +741,39 @@ void collect(const std::string& dir, std::vector<std::string>* out) {
 
 }  // namespace
 
+// --accel-survey: an accelerator that takes every program the translator makes but never a clear, so the CPU keeps the picture (the results are the CPU's) while
+// each draw is still offered to it: a draw it would have taken ends as "the device picture is out of date", any other reason is what keeps it off the 3D hardware.
+struct SurveyAccel final : webgl::IAccelerator {
+  const char* name() const override { return "survey"; }
+  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true}; }
+  uint32_t create_program(const char*, const char*, uint32_t, uint32_t, uint32_t) override { return ++programs; }
+  void destroy_program(uint32_t) override {}
+  uint32_t create_texture(uint32_t, uint32_t) override { return 1; }
+  bool write_texture(uint32_t, ConstByteView) override { return true; }
+  uint32_t create_target(uint32_t, uint32_t) override { return 1; }
+  void destroy_target(uint32_t) override {}
+  bool clear(uint32_t, bool, const float*, bool, float) override { return false; }
+  bool draw(uint32_t, uint32_t, const webgl::AccelState&, ConstByteView, uint32_t, ConstByteView) override { return false; }
+  bool read_color(uint32_t, ByteView) override { return false; }
+  uint32_t programs = 0;
+};
+
 int main(int argc, char** argv) {
   if (argc < 2) { printf("usage: %s <piglit dir> [--update-xfail] [--filter s] [--verbose] [--trace]\n", argv[0]); return 2; }
   const std::string root = argv[1];
-  bool update = false, verbose = false, trace = false;
+  bool update = false, verbose = false, trace = false, survey = false;
   std::string filter;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--update-xfail")) update = true;
     else if (!strcmp(argv[i], "--verbose")) verbose = true;
     else if (!strcmp(argv[i], "--trace")) trace = true;
     else if (!strcmp(argv[i], "--filter") && i + 1 < argc) filter = argv[++i];
+    else if (!strcmp(argv[i], "--accel-survey")) survey = true;
   }
+  SurveyAccel survey_accel;
+  if (survey) webgl::set_accelerator(&survey_accel);
+  std::map<std::string, int> draw_reasons;
+  int survey_tests = 0, survey_all_gpu = 0;
   // The suites of the GLSL versions the context has.
   const char* const kDirs[] = {"tests/spec/glsl-1.10", "tests/spec/glsl-1.20", "tests/spec/glsl-1.30", "tests/spec/glsl-1.40", "tests/spec/glsl-1.50", "tests/spec/glsl-3.30", "tests/spec/arb_tessellation_shader", "tests/shaders"};
   std::vector<std::string> files;
@@ -791,6 +813,18 @@ int main(int argc, char** argv) {
       std::string why;
       if (!supported(t, extensions.c_str(), &why)) { o.kind = Outcome::Skip; o.why = why; }
       else o = r.run(t);
+      if (survey && o.kind != Outcome::Skip) {
+        const webgl::GlContext::HardwareStats& st = r.api.hardware_stats();
+        bool all = st.cpu_draws > 0;
+        for (const auto& reason : st.reasons) {
+          if (!reason.why) continue;
+          draw_reasons[reason.why] += static_cast<int>(reason.count);
+          if (const char* want = getenv("SURVEY_REASON"); want && strstr(reason.why, want)) printf("  survey: %s: %s\n", rel.c_str(), reason.why);
+          if (strcmp(reason.why, "the device picture is out of date") != 0) all = false;
+        }
+        ++survey_tests;
+        if (all) ++survey_all_gpu;
+      }
     }
     if (o.kind == Outcome::Skip) { ++skip[suite]; ++skip_reasons[o.why]; continue; }
     if (o.kind == Outcome::Pass) {
@@ -812,6 +846,13 @@ int main(int argc, char** argv) {
     tp += pass[s]; tf += fail[s]; ts += skip[s];
   }
   printf("piglit shader_test: %d passed, %d failed (%d not in the xfail list), %d skipped, %d xfail entries now pass\n", tp, tf, unexpected, ts, fixed);
+  if (survey) {
+    std::vector<std::pair<int, std::string>> top;
+    for (auto& r : draw_reasons) top.push_back({r.second, r.first});
+    std::sort(top.rbegin(), top.rend());
+    printf("accelerator survey: %d of %d tests would draw only on the 3D hardware; draws by what decided (\"the device picture is out of date\" = taken):\n", survey_all_gpu, survey_tests);
+    for (size_t i = 0; i < top.size() && i < 40; ++i) printf("  %6d  %s\n", top[i].first, top[i].second.c_str());
+  }
   if (verbose) {
     std::vector<std::pair<int, std::string>> top;
     for (auto& r : reasons) top.push_back({r.second, r.first});

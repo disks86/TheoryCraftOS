@@ -362,6 +362,7 @@ add_executable(BOOTX64
   src/WebGl/Accelerator.cpp
   src/WebGl/TgsiTranslator.cpp
   src/WebGl/GlAccel.cpp
+  src/WebGl/AccelConformance.cpp
   src/WebGl/GpuAccel.cpp
   src/WebGl/GlContext.cpp
   src/WebGl/GlProgram.cpp
