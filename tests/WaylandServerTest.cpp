@@ -422,7 +422,7 @@ static void test_registry() {
     const uint32_t r = c.registry();
     const char* names[] = {"wl_compositor", "wl_subcompositor", "wl_shm", "wl_seat", "wl_output", "wl_data_device_manager", "xdg_wm_base", "zxdg_decoration_manager_v1"};
     for (const char* n : names) CHECK(c.globals.count(n) == 1);
-    CHECK(c.globals["xdg_wm_base"].second == 5 && c.globals["wl_seat"].second == 8);
+    CHECK(c.globals["xdg_wm_base"].second == 6 && c.globals["wl_seat"].second == 8);
     c.drop_events();
     const uint32_t shm = c.bind(r, "wl_shm");
     int formats = 0;
@@ -1496,6 +1496,13 @@ static void test_dmabuf() {
   server.set_fd_maker(&make_test_fd, nullptr);
   server.attach(4, 24);
   server.set_display(1024, 768, {});
+  {      // without a maker of descriptors (no format table to send) version 4 is not offered
+    Server bare(A);
+    bare.set_dmabuf(true);
+    WClient c(bare);
+    c.registry();
+    CHECK(c.globals["zwp_linux_dmabuf_v1"].second == 3);
+  }
   {      // not offered until the transport can make GPU images
     WClient c(server);
     c.registry();
@@ -1509,7 +1516,7 @@ static void test_dmabuf() {
   {      // the formats: modifier events (all linear) from version 3, format events before
     WClient c(server);
     const uint32_t r = c.registry();
-    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 1 && c.globals["zwp_linux_dmabuf_v1"].second == 3);
+    CHECK(c.globals.count("zwp_linux_dmabuf_v1") == 1 && c.globals["zwp_linux_dmabuf_v1"].second == 4);
     c.drop_events();
     const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
     std::vector<uint32_t> formats;
@@ -1519,6 +1526,53 @@ static void test_dmabuf() {
     c.drop_events();
     const uint32_t d2 = c.bind(r, "zwp_linux_dmabuf_v1", 2);
     CHECK(c.count(d2, 0) == 4 && c.count(d2, 1) == 0);
+    // version 4: no format events; feedback objects say it all (the format table as a sealed file, /dev/dxg as the device, one tranche)
+    c.drop_events();
+    const uint32_t d4 = c.bind(r, "zwp_linux_dmabuf_v1", 4);
+    CHECK(c.count(d4, 0) == 0 && c.count(d4, 1) == 0);
+    const size_t fds_before = c.fds.size();
+    const uint32_t fb = c.new_id();
+    c.send(Msg(d4, 2).u(fb));
+    std::vector<uint16_t> order;
+    for (const Ev& e : c.events) if (e.object == fb) order.push_back(e.opcode);
+    CHECK((order == std::vector<uint16_t>{1, 2, 4, 5, 6, 3, 0}));
+    Ev table = c.take(fb, 1);
+    CHECK(table.u(0) == 64 && c.fds.size() == fds_before + 1);
+    if (c.fds.size() == fds_before + 1) {
+      ByteView t = c.fds.back()->map(64);
+      CHECK(t.size() >= 64);
+      if (t.size() >= 64) {
+        uint32_t f0 = 0, f3 = 0;
+        uint64_t m0 = 1;
+        memcpy(&f0, t.data(), 4);
+        memcpy(&m0, t.data() + 8, 8);
+        memcpy(&f3, t.data() + 48, 4);
+        CHECK(f0 == kAR24 && m0 == 0 && f3 == kXB24);
+      }
+    }
+    Ev main_device = c.take(fb, 2);
+    CHECK(main_device.u(0) == 8 && main_device.u(1) == ((10u << 8) | 243u) && main_device.u(2) == 0);
+    Ev tranche = c.take(fb, 5);
+    CHECK(tranche.u(0) == 8 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
+    c.send(Msg(fb, 0));      // destroy
+    CHECK(c.take(1, 1).u(0) == fb);
+    // per-surface feedback: the same
+    const uint32_t comp = c.bind(r, "wl_compositor");
+    const uint32_t surf = c.new_id();
+    c.send(Msg(comp, 0).u(surf));
+    const uint32_t sfb = c.new_id();
+    c.send(Msg(d4, 3).u(sfb).u(surf));
+    CHECK(c.has(sfb, 0) && c.has(sfb, 2) && !c.closing);
+    c.send(Msg(d4, 3).u(c.new_id()).u(comp));      // (not a surface)
+    CHECK(c.error() && c.closing);
+  }
+  {      // feedback is not a version 3 request
+    WClient c(server);
+    const uint32_t r = c.registry();
+    const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
+    c.send(Msg(d3, 2).u(c.new_id()));
+    uint32_t code = 9;
+    CHECK(c.error(nullptr, &code) && code == 1);
   }
   {      // a toplevel showing a GPU buffer; drawn by the image itself; released when replaced
     DmabufApp app(server);
@@ -1758,7 +1812,7 @@ static uint32_t pattern_a(uint32_t x, uint32_t y) { return 0xFF000000u | (x * 4)
 static SharedPointer<process::OpenObject> dmabuf_object(SharedPointer<dxgk::ExportedAllocation> exported) {
   SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
   const uint64_t bytes = dxgk::export_info(*exported).bytes;
-  UniquePointer<process::DxgBufferFile> f = UniquePointer<process::DxgBufferFile>::make(A, util::move(exported), bytes);
+  UniquePointer<process::DxgBufferFile> f = UniquePointer<process::DxgBufferFile>::make(A, A, util::move(exported), bytes);
   o->gpu_buffer = f.get();
   o->file = util::move(f);
   o->readable = true;
@@ -1851,7 +1905,7 @@ static void test_dxg_compositor() {
   constexpr uint32_t W = 64, H = 48;
   {
     wayland::SocketServer transport(server, sockets, A);
-    transport.set_gpu_images(&wayland::make_dxg_image, &k);
+    transport.set_gpu_images(&wayland::make_dxg_image, &wayland::make_dxg_timeline, &k);
     CHECK(transport.listen(files));
     std::atomic<bool> stop{false};
     std::thread pump([&] {
@@ -2011,7 +2065,7 @@ static void test_dxg_threads() {
           SharedPointer<dxgk::ExportedAllocation> e;
           if (!next || !dst::ok(k.export_allocation(p.pid, next, &e))) { ++bad; break; }
           SharedPointer<process::OpenObject> object = dmabuf_object(util::move(e));
-          Fd fd = Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, *object));
+          Fd fd = Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, object));
           if (a) k.destroy_allocation(p.pid, a);
           a = next;
           if (buffer) app.send(Msg(buffer, 0));
@@ -2036,6 +2090,874 @@ static void test_dxg_threads() {
   free_made();
 }
 
+// The CPU's view of a dmabuf (mmap's copy): filled from the image at the first map, DMA_BUF_IOCTL_SYNC both ways, writes through a writable shared mapping
+// reaching the window at each commit without the ioctl.
+static void test_dxg_cpu_mapping() {
+  graphics::SoftwareDevice device{A, nullptr};
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  server.set_dmabuf(true);
+  constexpr uint32_t W = 32, H = 20;
+  {
+    DxgProcess p(k, 70);
+    const dxgk::Handle a = p.image(W, H);
+    CHECK(p.paint(a, W, H, pattern_a));
+    SharedPointer<dxgk::ExportedAllocation> e;
+    CHECK(dst::ok(k.export_allocation(p.pid, a, &e)));
+    SharedPointer<process::OpenObject> object = dmabuf_object(e);
+    process::DxgBufferFile& file = *object->gpu_buffer;
+    using R = process::DxgBufferFile::SyncResult;
+    // without the Direct3D layer's copier there is nothing to map
+    process::set_dxg_buffer_copier(nullptr);
+    CHECK(!file.map_block(false) && file.sync(1) == R::NoCopier);
+    process::set_dxg_buffer_copier(&dxgk::copy_export);
+    CHECK(file.sync(1) == R::Ok);      // (nothing mapped yet: nothing to move)
+    CHECK(file.sync(0) == R::Invalid && file.sync(8 | 1) == R::Invalid);
+    process::BlockRef block = file.map_block(false);
+    CHECK(block && block.get()->capacity() % 4096 == 0 && block.get()->capacity() >= W * H * 4);
+    if (!block) return;
+    auto word = [&](uint32_t x, uint32_t y) { uint32_t v = 0; memcpy(&v, block.get()->bytes().data() + (y * W + x) * 4, 4); return v; };
+    auto put = [&](uint32_t x, uint32_t y, uint32_t v) { memcpy(block.get()->bytes().data() + (y * W + x) * 4, &v, 4); };
+    CHECK(word(5, 7) == pattern_a(5, 7) && word(W - 1, H - 1) == pattern_a(W - 1, H - 1));
+    // the GPU side changes: START|READ brings it in
+    CHECK(p.paint(a, W, H, [](uint32_t x, uint32_t) { return 0xFF000000u | x; }));
+    CHECK(word(9, 3) == pattern_a(9, 3));
+    CHECK(file.sync(process::DxgBufferFile::kSyncRead) == R::Ok && word(9, 3) == 0xFF000009u);
+    // the CPU writes: END|WRITE sends it to the image (which the process sees through its own handle)
+    put(4, 4, 0xFF123456u);
+    CHECK(file.sync(process::DxgBufferFile::kSyncEnd | process::DxgBufferFile::kSyncWrite) == R::Ok);
+    dxgk::LockResult v;
+    uint32_t px = 0;
+    CHECK(dst::ok(k.lock(p.pid, a, dxgk::kLockReadOnly, 0, &v)));
+    memcpy(&px, v.data.data() + 4 * v.pitch + 16, 4);
+    CHECK(px == 0xFF123456u);
+    CHECK(dst::ok(k.unlock(p.pid, a)));
+    // a second descriptor of the same export shares the copy
+    process::BlockRef again = file.map_block(true);
+    CHECK(again && again.get() == block.get());
+    // shown by the compositor; a CPU write through the writable mapping reaches the window at the next commit, without the ioctl
+    struct ImageFd final : wayland::Memory {
+      SharedPointer<wayland::GpuImage> image;
+      explicit ImageFd(SharedPointer<wayland::GpuImage> i) : image(util::move(i)) {}
+      ByteView map(uint64_t) override { return ByteView(); }
+      wayland::GpuImage* gpu() override { return image.get(); }
+    };
+    DmabufApp app(server);
+    App::Window w = app.toplevel(true, "mapped");
+    const uint32_t b = app.immed(app.params(Fd::make_as<ImageFd>(A, wayland::make_dxg_image(&k, A, object)), 0, W * 4), W, H);
+    app.commit(w, b, W, H);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      CHECK(server.window_pixel(list[0], 4, 4) == 0xFF123456u);
+      put(6, 2, 0xFF00AA00u);
+      CHECK(server.window_pixel(list[0], 6, 2) != 0xFF00AA00u);      // (not before the commit)
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF00AA00u);
+      // the GPU draws a new frame while the mapping is still there but the CPU wrote nothing since: the commit keeps the GPU's frame
+      CHECK(p.paint(a, W, H, [](uint32_t, uint32_t) { return 0xFF445566u; }));
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF445566u);
+      // the mappings go: later commits never send the old copy
+      block.reset();
+      again.reset();
+      CHECK(p.paint(a, W, H, [](uint32_t, uint32_t) { return 0xFF778899u; }));
+      app.send(Msg(w.surface, 2).i(0).i(0).i(W).i(H));
+      app.send(Msg(w.surface, 6));
+      CHECK(server.window_pixel(list[0], 6, 2) == 0xFF778899u);
+    }
+    CHECK(!app.closing);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ wp_linux_drm_syncobj_v1 (explicit sync)
+
+struct FakeTimeline final : wayland::Memory, wayland::GpuTimeline {
+  uint64_t at = 0;
+  ByteView map(uint64_t) override { return ByteView(); }
+  wayland::GpuTimeline* timeline() override { return this; }
+  uint64_t value() override { return at; }
+  void signal(uint64_t point) override { if (point > at) at = point; }
+};
+
+struct SyncApp : DmabufApp {
+  uint32_t manager = 0;
+  explicit SyncApp(Server& s) : DmabufApp(s) {
+    manager = bind(reg, "wp_linux_drm_syncobj_manager_v1");
+    drop_events();
+  }
+  uint32_t timeline(Fd fd) {
+    const uint32_t t = new_id();
+    send(Msg(manager, 2).u(t), {fd});
+    return t;
+  }
+  uint32_t sync_surface(uint32_t surface) {
+    const uint32_t o = new_id();
+    send(Msg(manager, 1).u(o).u(surface));
+    return o;
+  }
+  void points(uint32_t so, uint32_t acquire, uint64_t a, uint32_t release, uint64_t r) {
+    send(Msg(so, 1).u(acquire).u(uint32_t(a >> 32)).u(uint32_t(a)));
+    send(Msg(so, 2).u(release).u(uint32_t(r >> 32)).u(uint32_t(r)));
+  }
+  uint32_t gpu_buffer(uint32_t color) {
+    Fd g = Fd::make_as<FakeGpu>(A, 40u, 30u, color);
+    return immed(params(g, 0, 160), 40, 30);
+  }
+};
+
+static void test_syncobj() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {      // offered with GPU buffers only
+    WClient c(server);
+    c.registry();
+    CHECK(c.globals.count("wp_linux_drm_syncobj_manager_v1") == 0);
+  }
+  server.set_dmabuf(true);
+  {
+    SyncApp app(server);
+    CHECK(app.globals.count("wp_linux_drm_syncobj_manager_v1") == 1 && app.manager != 0);
+    App::Window w = app.toplevel(true, "explicit");
+    Fd acquire_fd = Fd::make_as<FakeTimeline>(A), release_fd = Fd::make_as<FakeTimeline>(A);
+    FakeTimeline& acquire = static_cast<FakeTimeline&>(*acquire_fd);
+    FakeTimeline& release = static_cast<FakeTimeline&>(*release_fd);
+    const uint32_t ta = app.timeline(acquire_fd), tr = app.timeline(release_fd);
+    const uint32_t so = app.sync_surface(w.surface);
+    CHECK(!app.closing);
+    // a commit whose acquire point is not reached waits: nothing shown
+    const uint32_t b1 = app.gpu_buffer(0xFF111111u);
+    app.points(so, ta, 1, tr, 1);
+    app.commit(w, b1, 40, 30);
+    CHECK(listed(server).empty() && !app.closing);
+    acquire.at = 1;
+    CHECK(app.roundtrip());      // (any request looks again)
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (list.empty()) return;
+    const uint32_t win = list[0];
+    CHECK(server.window_pixel(win, 3, 3) == 0xFF111111u);
+    // the next frame waits while the desktop keeps showing the first; the desktop's drawing looks again
+    const uint32_t b2 = app.gpu_buffer(0xFF222222u);
+    app.points(so, ta, 2, tr, 2);
+    app.commit(w, b2, 40, 30);
+    std::vector<uint32_t> target(100 * 100);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 100;
+    uint32_t dw, dh;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    }
+    CHECK(target[5 * 100 + 5] == 0xFF111111u && release.at == 0 && !app.has(b1, 0));
+    List<uint32_t> changed(A);
+    List<desktop::IWindowsSession::Repaint> repainted(A);
+    server.take_changes(&changed, &repainted);
+    CHECK(repainted.count() == 1 && repainted[0].window == win);      // (the desktop is asked to come back)
+    acquire.at = 2;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    }
+    CHECK(target[5 * 100 + 5] == 0xFF222222u);
+    CHECK(release.at == 1 && app.has(b1, 0));      // (the first buffer's use is over: its release point, and wl_buffer.release)
+    // two commits waiting: the newer takes the older's place, whose buffer is let go unused
+    const uint32_t b3 = app.gpu_buffer(0xFF333333u), b4 = app.gpu_buffer(0xFF444444u);
+    app.points(so, ta, 3, tr, 3);
+    app.commit(w, b3, 40, 30);
+    app.points(so, ta, 4, tr, 4);
+    app.commit(w, b4, 40, 30);
+    CHECK(release.at == 3 && app.has(b3, 0) && server.window_pixel(win, 3, 3) == 0xFF222222u);
+    acquire.at = 4;
+    CHECK(app.roundtrip() && server.window_pixel(win, 3, 3) == 0xFF444444u && release.at == 3);
+    // the same buffer again: the earlier use of it is over
+    acquire.at = 5;
+    app.points(so, ta, 5, tr, 6);
+    app.commit(w, b4, 40, 30);
+    CHECK(release.at == 4);      // (point 4 of b4's first commit; 6 is b4's current use)
+    // explicit sync dropped: implicit again (a commit without points)
+    app.send(Msg(so, 0));
+    app.commit(w, b2, 40, 30);
+    CHECK(!app.closing && release.at == 6 && server.window_pixel(win, 3, 3) == 0xFF222222u);
+    // a surface that goes with a commit waiting lets the buffer go
+    const uint32_t so2 = app.sync_surface(w.surface);
+    const uint32_t b5 = app.gpu_buffer(0xFF555555u);
+    app.points(so2, ta, 100, tr, 101);
+    app.commit(w, b5, 40, 30);
+    CHECK(release.at == 6);
+    app.send(Msg(w.toplevel, 0));
+    app.send(Msg(w.xdg, 0));
+    app.send(Msg(w.surface, 0));
+    CHECK(release.at == 101 && !app.closing);
+    // requests on the syncobj surface of a surface that went: no_surface
+    app.send(Msg(so2, 1).u(ta).u(0).u(7));
+    uint32_t object = 0, code = 0;
+    CHECK(app.error(&object, &code) && object == so2 && code == 1);
+  }
+  // the rules
+  struct Case {
+    const char* what;
+    uint32_t code;
+    std::function<void(SyncApp&, App::Window&, uint32_t so, uint32_t ta, uint32_t tr)> run;
+  };
+  const Case cases[] = {
+      {"surface exists", 0, [](SyncApp& a, App::Window& w, uint32_t, uint32_t, uint32_t) { a.sync_surface(w.surface); }},
+      {"not a timeline", 1, [](SyncApp& a, App::Window&, uint32_t, uint32_t, uint32_t) { std::vector<uint8_t> m(64); a.timeline(Fd::make_as<TestMemory>(A, &m)); }},
+      {"unsupported buffer", 2, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t tr) {
+         App::Pool p = a.pool(40 * 30 * 4);
+         const uint32_t b = a.buffer(p, 0, 40, 30, 160);
+         a.points(so, ta, 1, tr, 2);
+         a.commit(w, b, 40, 30);
+       }},
+      {"no buffer", 3, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t tr) { a.points(so, ta, 1, tr, 2); a.send(Msg(w.surface, 6)); }},
+      {"no acquire point", 4, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t, uint32_t tr) {
+         a.send(Msg(so, 2).u(tr).u(0).u(2));
+         a.commit(w, a.gpu_buffer(0), 40, 30);
+       }},
+      {"no release point", 5, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t) {
+         a.send(Msg(so, 1).u(ta).u(0).u(2));
+         a.commit(w, a.gpu_buffer(0), 40, 30);
+       }},
+      {"conflicting points", 6, [](SyncApp& a, App::Window& w, uint32_t so, uint32_t ta, uint32_t) { a.points(so, ta, 5, ta, 5); a.commit(w, a.gpu_buffer(0), 40, 30); }},
+  };
+  for (const Case& k : cases) {
+    SyncApp app(server);
+    App::Window w = app.toplevel(true, "rules");
+    const uint32_t ta = app.timeline(Fd::make_as<FakeTimeline>(A)), tr = app.timeline(Fd::make_as<FakeTimeline>(A));
+    const uint32_t so = app.sync_surface(w.surface);
+    k.run(app, w, so, ta, tr);
+    uint32_t object = 0, code = 0;
+    const bool err = app.error(&object, &code);
+    if (!err || code != k.code) printf("   syncobj case '%s': error %d code %u\n", k.what, err, code);
+    CHECK(err && code == k.code && app.closing);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Real fences of the Direct3D layer: exported, imported in another process (the same fence), read and raised through the compositor's timeline.
+static void test_dxg_fences() {
+  graphics::SoftwareDevice device{A, nullptr};
+  dxgk::Kernel k(A);
+  CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
+  {
+    DxgProcess p(k, 80), q(k, 81);
+    dxgk::Handle fence = 0, semaphore = 0;
+    CHECK(dst::ok(k.create_sync(p.pid, p.device, dxgk::SyncType::Fence, 5, 0, &fence)));
+    CHECK(dst::ok(k.create_sync(p.pid, p.device, dxgk::SyncType::Semaphore, 0, 4, &semaphore)));
+    SharedPointer<dxgk::ExportedSync> e;
+    CHECK(k.export_sync(p.pid, semaphore, &e) == dst::kNotSupported && !e);
+    CHECK(k.export_sync(p.pid, 0x4242, &e) == dst::kInvalidHandle);
+    CHECK(dst::ok(k.export_sync(p.pid, fence, &e)) && e);
+    if (!e) return;
+    CHECK(dxgk::exported_sync_value(*e) == 5);
+    dxgk::Handle imported = 0;
+    CHECK(dst::ok(k.import_sync(q.pid, q.device, *e, &imported)));
+    const uint64_t nine = 9;
+    CHECK(dst::ok(k.signal_sync_cpu(q.pid, ArrayView<const dxgk::Handle>(&imported, 1), ArrayView<const uint64_t>(&nine, 1))));
+    uint64_t value = 0;
+    CHECK(dst::ok(k.query_sync(p.pid, fence, &value)) && value == 9 && dxgk::exported_sync_value(*e) == 9);
+    // through the compositor's timeline (what the transport makes of the descriptor)
+    SharedPointer<process::OpenObject> o = SharedPointer<process::OpenObject>::make(A, A);
+    UniquePointer<process::DxgSyncFile> f = UniquePointer<process::DxgSyncFile>::make(A, e);
+    o->gpu_sync = f.get();
+    o->file = util::move(f);
+    SharedPointer<wayland::GpuTimeline> t = wayland::make_dxg_timeline(&k, A, o);
+    CHECK(t && t->value() == 9);
+    if (t) {
+      t->signal(4);      // (never back)
+      CHECK(t->value() == 9);
+      t->signal(12);
+      CHECK(dst::ok(k.query_sync(q.pid, imported, &value)) && value == 12);
+    }
+    // a wait of the process for a point the compositor signals is satisfied
+    const uint64_t twelve = 12;
+    CHECK(dst::ok(k.wait_sync_cpu(p.pid, ArrayView<const dxgk::Handle>(&fence, 1), ArrayView<const uint64_t>(&twelve, 1), true, 0)));
+    // the fence outlives its process while the export holds it
+    k.close_process(p.pid);
+    k.close_process(q.pid);
+    if (t) {
+      t->signal(20);
+      CHECK(t->value() == 20);
+    }
+    t.reset();
+    o.reset();
+  }
+
+}
+
+// ------------------------------------------------------------------ the selection, the desktop's clipboard, drag and drop
+
+struct DataApp : App {
+  uint32_t device = 0, pointer = 0;
+  explicit DataApp(Server& s) : App(s) {
+    device = new_id();
+    send(Msg(ddm, 1).u(device).u(seat));
+    pointer = new_id();
+    send(Msg(seat, 0).u(pointer));
+  }
+  uint32_t source(std::initializer_list<const char*> types, uint32_t actions = 0) {
+    const uint32_t s = new_id();
+    send(Msg(ddm, 0).u(s));
+    for (const char* t : types) send(Msg(s, 0).s(t));
+    if (actions) send(Msg(s, 2).u(actions));
+    return s;
+  }
+  // The offer the last selection event named (0: none), and its types.
+  uint32_t selection(std::vector<std::string>* types = nullptr) {
+    Ev sel = take(device, 5);
+    if (sel.object == 0) return ~0u;
+    const uint32_t offer = sel.u(0);
+    if (types) {
+      types->clear();
+      for (const Ev& e : events) if (e.object == offer && e.opcode == 0) types->push_back(e.s(0));
+    }
+    return offer;
+  }
+};
+
+static uint32_t shown_window(Server& server, App& app, App::Window& w, uint32_t color) {
+  std::vector<uint32_t> before = listed(server);
+  app.show(w, 100, 80, color);
+  for (uint32_t win : listed(server))
+    if (std::find(before.begin(), before.end(), win) == before.end()) return win;
+  return 0;
+}
+
+static void test_clipboard() {
+  kernel::Clipboard clipboard(A);
+  CHECK(clipboard.set_text("from the desktop"));
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_clipboard(&clipboard);
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(true, "A"), wb = b.toplevel(true, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    CHECK(win_a && win_b);
+    // A gets the keyboard: it is offered the desktop's text
+    a.drop_events();
+    server.activate_window(win_a);
+    std::vector<std::string> types;
+    const uint32_t offer = a.selection(&types);
+    CHECK(offer >= 0xFF000000u && offer != ~0u && types.size() == 5 && types[0] == "text/plain;charset=utf-8");
+    // pasting: the transport is asked to write the text into A's pipe
+    std::vector<uint8_t> pipe_a;
+    Fd pa = Fd::make_as<TestMemory>(A, &pipe_a);
+    a.send(Msg(offer, 1).s("text/plain;charset=utf-8"), {pa});
+    List<wayland::TransportRequest> requests(A);
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1 && requests[0].kind == wayland::TransportRequest::Kind::Write && requests[0].fd.get() == pa.get() &&
+          requests[0].data && std::string(reinterpret_cast<const char*>(requests[0].data->view().data()), requests[0].data->size()) == "from the desktop");
+    requests.clear();
+    // A copies: it is the selection; its text is read at once for the desktop's clipboard
+    const uint32_t src = a.source({"text/plain;charset=utf-8", "image/png"});
+    a.send(Msg(a.device, 1).u(src).u(0));
+    CHECK(a.selection(&types) != ~0u && types.size() == 2 && types[1] == "image/png");
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1 && requests[0].kind == wayland::TransportRequest::Kind::MakePipe);
+    if (requests.count() == 1) {
+      std::vector<uint8_t> pipe_w;
+      Fd pw = Fd::make_as<TestMemory>(A, &pipe_w);
+      const size_t fds_before = a.fds.size();
+      server.pipe_ready(requests[0].job, pw);
+      Ev send_ev = a.take(src, 1);
+      CHECK(send_ev.object == src && send_ev.s(0) == "text/plain;charset=utf-8" && a.fds.size() == fds_before + 1 && a.fds.back().get() == pw.get());
+      const std::string copied = "copied in A";
+      server.pipe_read_done(requests[0].job, ConstByteView(reinterpret_cast<const uint8_t*>(copied.data()), copied.size()));
+      String text(A);
+      CHECK(clipboard.get_text(&text) && text.view() == StringView("copied in A"));
+      server.tick();
+      CHECK(!a.has(src, 2));      // (the desktop's change was ours: A's selection stays)
+    }
+    requests.clear();
+    // B gets the keyboard: offered A's types; its paste goes to A as it is (the same descriptor)
+    b.drop_events();
+    server.activate_window(win_b);
+    const uint32_t offer_b = b.selection(&types);
+    CHECK(offer_b != ~0u && offer_b != 0 && types.size() == 2);
+    std::vector<uint8_t> pipe_b;
+    Fd pb = Fd::make_as<TestMemory>(A, &pipe_b);
+    const size_t a_fds = a.fds.size();
+    b.send(Msg(offer_b, 1).s("image/png"), {pb});
+    Ev forwarded = a.take(src, 1);
+    CHECK(forwarded.object == src && forwarded.s(0) == "image/png" && a.fds.size() == a_fds + 1 && a.fds.back().get() == pb.get());
+    // the desktop copies: A's source is cancelled; B (focused) is offered the desktop's text
+    CHECK(clipboard.set_text("desktop again"));
+    server.tick();
+    CHECK(a.has(src, 2));
+    CHECK(b.selection(&types) != ~0u && types.size() == 5);
+    // A copies again and lets go of its source: the selection is empty (B is told)
+    const uint32_t src2 = a.source({"text/plain"});
+    a.send(Msg(a.device, 1).u(src2).u(0));
+    CHECK(b.selection() != ~0u);
+    a.send(Msg(src2, 1));
+    CHECK(b.selection() == 0);
+    // a source cannot be given twice
+    a.send(Msg(a.device, 1).u(src).u(0));
+    uint32_t object = 0, code = 9;
+    CHECK(a.error(&object, &code) && object == a.device && code == 1);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+static void test_drag_and_drop() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(false, "A"), wb = b.toplevel(false, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    server.move_window(win_a, {10, 10, 100, 80});
+    server.move_window(win_b, {300, 10, 100, 80});
+    a.drop_events();
+    b.drop_events();
+    // A starts a drag from its surface while the button is held
+    server.mouse_position(40, 40);
+    server.mouse_button(1, true);
+    const uint32_t src = a.source({"text/uri-list"}, 1 | 2);      // copy | move
+    a.send(Msg(a.device, 0).u(src).u(wa.surface).u(0).u(0));
+    CHECK(!a.closing && a.has(a.pointer, 1));      // (A's pointer left: the drag has it)
+    // over B: entered with an offer of A's types and actions
+    server.mouse_position(330, 40);
+    Ev enter = b.take(b.device, 1);
+    CHECK(enter.object == b.device && enter.u(1) == wb.surface && enter.u(4) >= 0xFF000000u);
+    const uint32_t offer = enter.u(4);
+    CHECK(b.count(offer, 0) == 1 && b.take(offer, 1).u(0) == 3);      // (the type; source_actions copy | move)
+    server.mouse_position(335, 45);
+    CHECK(b.has(b.device, 3));      // motion
+    // B accepts the type and prefers to move: both are told (A heard target(null) when the drag left its own surface)
+    a.drop_events();
+    b.send(Msg(offer, 0).u(0).s("text/uri-list"));
+    CHECK(a.take(src, 0).s(0) == "text/uri-list");
+    b.send(Msg(offer, 4).u(1 | 2).u(2));
+    CHECK(b.take(offer, 2).u(0) == 2 && a.take(src, 5).u(0) == 2);
+    // the release drops; B receives the data from A; B's finish ends it
+    server.mouse_button(1, false);
+    CHECK(b.has(b.device, 4) && a.has(src, 3));      // drop, dnd_drop_performed
+    std::vector<uint8_t> pipe;
+    Fd p = Fd::make_as<TestMemory>(A, &pipe);
+    b.send(Msg(offer, 1).s("text/uri-list"), {p});
+    CHECK(a.take(src, 1).s(0) == "text/uri-list" && a.fds.back().get() == p.get());
+    b.send(Msg(offer, 3));
+    CHECK(a.has(src, 4) && !b.closing);      // dnd_finished
+    // a drag released over nothing that accepts: cancelled
+    server.mouse_position(40, 40);
+    server.mouse_button(1, true);
+    const uint32_t src2 = a.source({"text/plain"});
+    a.send(Msg(a.device, 0).u(src2).u(wa.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    server.mouse_button(1, false);
+    CHECK(a.has(src2, 2));
+    // a drag without a button held is cancelled at once
+    const uint32_t src3 = a.source({"text/plain"});
+    a.send(Msg(a.device, 0).u(src3).u(wa.surface).u(0).u(0));
+    CHECK(a.has(src3, 2));
+    // finishing without a drop is an error
+    b.send(Msg(offer, 3));
+    uint32_t code = 9;
+    CHECK(b.error(nullptr, &code) && code == 0);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ buffer scale and transform, wp_viewporter, wp_fractional_scale_v1
+
+static uint32_t pattern_px(uint32_t x, uint32_t y) { return 0xFF000000u | x << 8 | y; }
+
+static void test_mapping() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_dmabuf(true);
+  constexpr int32_t BW = 40, BH = 20;
+  struct Case {
+    const char* what;
+    std::function<void(App&, App::Window&, uint32_t viewport)> set;
+    int32_t sw, sh;                       // the surface's size
+    int32_t sx, sy, bx, by;               // a surface pixel and the buffer pixel it shows
+  };
+  const Case cases[] = {
+      {"scale 2", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 8).i(2)); }, 20, 10, 5, 3, 11, 7},
+      {"90", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(1)); }, 20, 40, 2, 30, 30, 17},
+      {"180", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(2)); }, 40, 20, 3, 5, 36, 14},
+      {"270", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(3)); }, 20, 40, 2, 30, 9, 2},
+      {"flipped", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(4)); }, 40, 20, 3, 5, 36, 5},
+      {"flipped 90", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(5)); }, 20, 40, 2, 30, 30, 2},
+      {"90 and scale 2", [](App& a, App::Window& w, uint32_t) { a.send(Msg(w.surface, 7).i(1)); a.send(Msg(w.surface, 8).i(2)); }, 10, 20, 1, 15, 31, 17},
+      {"viewport crop and stretch", [](App& a, App::Window&, uint32_t v) {
+         a.send(Msg(v, 1).i(10 * 256).i(5 * 256).i(20 * 256).i(10 * 256));
+         a.send(Msg(v, 2).i(40).i(20));
+       }, 40, 20, 39, 19, 29, 14},
+      {"viewport crop only", [](App& a, App::Window&, uint32_t v) { a.send(Msg(v, 1).i(10 * 256).i(5 * 256).i(20 * 256).i(10 * 256)); }, 20, 10, 0, 0, 10, 5},
+      {"viewport size only", [](App& a, App::Window&, uint32_t v) { a.send(Msg(v, 2).i(80).i(40)); }, 80, 40, 79, 39, 39, 19},
+  };
+  for (const Case& k : cases) {
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, k.what);
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    k.set(app, w, viewport);
+    App::Pool p = app.pool(size_t(BW) * BH * 4);
+    for (int32_t y = 0; y < BH; ++y)
+      for (int32_t x = 0; x < BW; ++x) {
+        const uint32_t v = pattern_px(uint32_t(x), uint32_t(y));
+        memcpy(p.memory->data() + (y * BW + x) * 4, &v, 4);
+      }
+    const uint32_t b = app.buffer(p, 0, BW, BH, BW * 4);
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 6));
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1 && !app.closing);
+    if (list.size() != 1) continue;
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(list[0], &info, &title));
+    const bool size_ok = int32_t(info.surface.width) == k.sw && int32_t(info.surface.height) == k.sh;
+    const uint32_t got = server.window_pixel(list[0], k.sx, k.sy);
+    // drawn: the same pixel lands where the surface's is (the renderer samples the buffer through the map; a stretch filters, so only the size is checked there)
+    std::vector<uint32_t> target(100 * 100, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 100;
+    {
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && int32_t(dw) == k.sw && int32_t(dh) == k.sh);
+    }
+    const bool plain = std::string(k.what).find("scale") == std::string::npos && std::string(k.what).find("stretch") == std::string::npos &&
+                       std::string(k.what).find("size only") == std::string::npos;
+    const uint32_t drawn = target[size_t(k.sy) * 100 + size_t(k.sx)];
+    if (!size_ok || got != pattern_px(uint32_t(k.bx), uint32_t(k.by)) || (plain && drawn != got))
+      printf("   mapping '%s': surface %ux%u, pixel %08x (want %08x), drawn %08x\n", k.what, info.surface.width, info.surface.height, got,
+             pattern_px(uint32_t(k.bx), uint32_t(k.by)), drawn);
+    CHECK(size_ok && got == pattern_px(uint32_t(k.bx), uint32_t(k.by)));
+    if (plain) CHECK(drawn == got);
+    CHECK(target[100 * 100 - 1] == 0);      // (nothing outside the surface)
+  }
+  {      // a GPU buffer turned: read through its image
+    DmabufApp app(server);
+    App::Window w = app.toplevel(true, "gpu turned");
+    Fd g = Fd::make_as<FakeGpu>(A, 40u, 20u, 0u);
+    FakeGpu& image = static_cast<FakeGpu&>(*g);
+    for (uint32_t y = 0; y < 20; ++y)
+      for (uint32_t x = 0; x < 40; ++x) image.pixels[y * 40 + x] = pattern_px(x, y);
+    const uint32_t b = app.immed(app.params(g, 0, 160), 40, 20);
+    app.send(Msg(w.surface, 7).i(2));
+    app.commit(w, b, 40, 20);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1);
+    if (!list.empty()) {
+      CHECK(server.window_pixel(list[0], 3, 5) == pattern_px(36, 14));
+      std::vector<uint32_t> target(100 * 100, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+      ts.width = ts.height = ts.pitch = 100;
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && target[5 * 100 + 3] == pattern_px(36, 14) && image.draws == 0);      // (read, not drawn in place)
+    }
+  }
+  {      // fractional scale: the preferred scale is 1 (120); version 6 surfaces are told the preferred buffer scale and transform
+    App app(server);
+    const uint32_t fsm = app.bind(app.reg, "wp_fractional_scale_manager_v1");
+    const uint32_t s = app.surface();
+    CHECK(app.take(s, 2).i(0) == 1 && app.has(s, 3));
+    const uint32_t f = app.new_id();
+    app.send(Msg(fsm, 1).u(f).u(s));
+    CHECK(app.take(f, 0).u(0) == 120);
+    app.send(Msg(fsm, 1).u(app.new_id()).u(s));
+    uint32_t code = 9;
+    CHECK(app.error(nullptr, &code) && code == 0);
+  }
+  // the rules
+  struct Rule {
+    const char* what;
+    uint32_t code;
+    std::function<void(App&, App::Window&, uint32_t viewporter, uint32_t viewport)> run;
+  };
+  const Rule rules[] = {
+      {"size not a multiple of the scale", 2, [](App& a, App::Window& w, uint32_t, uint32_t) {
+         a.send(Msg(w.surface, 8).i(3));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"source outside the buffer", 2, [](App& a, App::Window& w, uint32_t, uint32_t v) {
+         a.send(Msg(v, 1).i(30 * 256).i(0).i(20 * 256).i(10 * 256));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"fractional source without a destination", 1, [](App& a, App::Window& w, uint32_t, uint32_t v) {
+         a.send(Msg(v, 1).i(0).i(0).i(10 * 256 + 128).i(10 * 256));
+         a.show(w, 40, 20, 0xFF000000u);
+       }},
+      {"negative source", 0, [](App& a, App::Window&, uint32_t, uint32_t v) { a.send(Msg(v, 1).i(-256).i(0).i(256).i(256)); }},
+      {"zero destination", 0, [](App& a, App::Window&, uint32_t, uint32_t v) { a.send(Msg(v, 2).i(0).i(10)); }},
+      {"second viewport", 0, [](App& a, App::Window& w, uint32_t vp, uint32_t) { a.send(Msg(vp, 1).u(a.new_id()).u(w.surface)); }},
+      {"bad scale", 0, [](App& a, App::Window& w, uint32_t, uint32_t) { a.send(Msg(w.surface, 8).i(0)); }},
+      {"bad transform", 1, [](App& a, App::Window& w, uint32_t, uint32_t) { a.send(Msg(w.surface, 7).i(8)); }},
+  };
+  for (const Rule& k : rules) {
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, "rule");
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    k.run(app, w, viewporter, viewport);
+    uint32_t code = 99;
+    const bool err = app.error(nullptr, &code);
+    if (!err || code != k.code) printf("   mapping rule '%s': error %d code %u\n", k.what, err, code);
+    CHECK(err && code == k.code && app.closing);
+  }
+  {      // the viewport of a surface that went
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    const uint32_t s = app.surface();
+    const uint32_t v = app.new_id();
+    app.send(Msg(viewporter, 1).u(v).u(s));
+    app.send(Msg(s, 0));
+    app.send(Msg(v, 2).i(10).i(10));
+    uint32_t code = 9;
+    CHECK(app.error(nullptr, &code) && code == 3);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ the other protocols, pings, the minimized state
+
+static uint64_t g_fake_ms = 1000;
+static uint64_t fake_clock() { return g_fake_ms; }
+
+static void test_extras() {
+  Server server(A, &fake_clock);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  {
+    DataApp a(server), b(server);
+    App::Window wa = a.toplevel(true, "A"), wb = b.toplevel(true, "B");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    server.move_window(win_a, {10, 10, 120, 120});
+    server.move_window(win_b, {400, 10, 120, 120});
+    desktop::WindowsWindowInfo ia, ib;
+    String title(A);
+    auto info = [&](uint32_t w, desktop::WindowsWindowInfo* out) { CHECK(server.window_info(w, out, &title)); };
+    // --- xdg_activation_v1: a token from A lets it take the focus from B, once
+    server.activate_window(win_b);
+    const uint32_t act_a = a.bind(a.reg, "xdg_activation_v1");
+    const uint32_t token = a.new_id();
+    a.send(Msg(act_a, 1).u(token));
+    a.send(Msg(token, 3));
+    const std::string text = a.take(token, 0).s(0);
+    CHECK(!text.empty());
+    a.send(Msg(act_a, 2).s(text).u(wa.surface));
+    info(win_a, &ia);
+    info(win_b, &ib);
+    CHECK(ia.active && !ib.active);
+    server.activate_window(win_b);
+    a.send(Msg(act_a, 2).s(text).u(wa.surface));      // (spent)
+    a.send(Msg(act_a, 2).s("made-up").u(wa.surface));
+    info(win_a, &ia);
+    CHECK(!ia.active);
+    // --- wp_cursor_shape_v1: the text cursor over A
+    server.activate_window(win_a);
+    info(win_a, &ia);
+    server.mouse_position(ia.surface.x + 20, ia.surface.y + 20);
+    const uint32_t csm = a.bind(a.reg, "wp_cursor_shape_manager_v1");
+    const uint32_t shape = a.new_id();
+    a.send(Msg(csm, 1).u(shape).u(a.pointer));
+    a.send(Msg(shape, 1).u(0).u(9));      // text
+    desktop::IWindowsSession::Pointer p;
+    server.pointer(&p);
+    CHECK(!p.hidden && p.cursor == 0 && p.system_id == 32513);
+    a.send(Msg(shape, 1).u(0).u(29));      // nwse-resize
+    server.pointer(&p);
+    CHECK(p.system_id == 32642);
+    // --- zwp_relative_pointer_v1 and a persistent lock while A is active and has the pointer
+    const uint32_t rpm = a.bind(a.reg, "zwp_relative_pointer_manager_v1"), pc = a.bind(a.reg, "zwp_pointer_constraints_v1");
+    const uint32_t rel = a.new_id();
+    a.send(Msg(rpm, 1).u(rel).u(a.pointer));
+    const uint32_t lock = a.new_id();
+    a.send(Msg(pc, 1).u(lock).u(wa.surface).u(a.pointer).u(0).u(2));
+    CHECK(a.has(lock, 0) && server.cursor_confined());      // locked
+    int32_t cx0 = 0, cy0 = 0, cx = 0, cy = 0;
+    server.cursor(&cx0, &cy0);
+    a.drop_events();
+    server.mouse_motion(7, -3);
+    Ev rm = a.take(rel, 0);
+    CHECK(rm.object == rel && rm.i(2) == 7 * 256 && rm.i(3) == -3 * 256);
+    server.cursor(&cx, &cy);
+    CHECK(cx == cx0 && cy == cy0);      // (locked: the pointer stays)
+    server.activate_window(win_b);
+    CHECK(a.has(lock, 1) && !server.cursor_confined());      // unlocked: A is not active
+    server.activate_window(win_a);
+    CHECK(a.has(lock, 0) && server.cursor_confined());      // (persistent: back)
+    a.send(Msg(pc, 2).u(a.new_id()).u(wa.surface).u(a.pointer).u(0).u(1));
+    uint32_t object = 0, code = 0;
+    CHECK(a.error(&object, &code) && code == 1);      // already_constrained
+  }
+  {      // a one-shot confinement: the pointer stays in the surface; it ends with the focus and does not come back
+    App app(server);
+    const uint32_t pointer = app.new_id();
+    app.send(Msg(app.seat, 0).u(pointer));
+    App::Window w = app.toplevel(true, "confined");
+    const uint32_t win = shown_window(server, app, w, 0xFF101010u);
+    server.move_window(win, {50, 50, 120, 120});
+    server.activate_window(win);
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win, &info, &title));
+    server.mouse_position(info.surface.x + 10, info.surface.y + 10);
+    const uint32_t pc = app.bind(app.reg, "zwp_pointer_constraints_v1");
+    const uint32_t conf = app.new_id();
+    app.send(Msg(pc, 2).u(conf).u(w.surface).u(pointer).u(0).u(1));
+    CHECK(app.has(conf, 0) && server.cursor_confined());
+    server.mouse_motion(-500, -500);
+    int32_t x = 0, y = 0;
+    server.cursor(&x, &y);
+    CHECK(x == info.surface.x && y == info.surface.y);      // (at the surface's corner, not past it)
+    server.activate_window(0);
+    CHECK(app.has(conf, 1) && !server.cursor_confined());
+    server.activate_window(win);
+    app.drop_events();
+    server.mouse_motion(1, 1);
+    CHECK(!app.has(conf, 0) && !server.cursor_confined());      // (one-shot: over)
+  }
+  {      // --- zwp_primary_selection_v1 between two clients
+    App a(server), b(server);
+    App::Window wa = a.toplevel(true, "PA"), wb = b.toplevel(true, "PB");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu), win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    const uint32_t ma = a.bind(a.reg, "zwp_primary_selection_device_manager_v1"), mb = b.bind(b.reg, "zwp_primary_selection_device_manager_v1");
+    const uint32_t da = a.new_id(), db = b.new_id();
+    a.send(Msg(ma, 1).u(da).u(a.seat));
+    b.send(Msg(mb, 1).u(db).u(b.seat));
+    server.activate_window(win_a);
+    const uint32_t src = a.new_id();
+    a.send(Msg(ma, 0).u(src));
+    a.send(Msg(src, 0).s("text/plain;charset=utf-8"));
+    a.send(Msg(da, 0).u(src).u(0));
+    b.drop_events();
+    server.activate_window(win_b);
+    Ev sel = b.take(db, 1);
+    CHECK(sel.object == db && sel.u(0) >= 0xFF000000u);
+    const uint32_t offer = sel.u(0);
+    CHECK(b.take(offer, 0).s(0) == "text/plain;charset=utf-8");
+    std::vector<uint8_t> pipe;
+    Fd fd = Fd::make_as<TestMemory>(A, &pipe);
+    b.send(Msg(offer, 0).s("text/plain;charset=utf-8"), {fd});
+    Ev sent = a.take(src, 0);
+    CHECK(sent.object == src && sent.s(0) == "text/plain;charset=utf-8" && a.fds.back().get() == fd.get());
+    // B takes the primary selection: A's source is cancelled
+    const uint32_t src_b = b.new_id();
+    b.send(Msg(mb, 0).u(src_b));
+    b.send(Msg(db, 0).u(src_b).u(0));
+    CHECK(a.has(src, 1));
+  }
+  {      // --- wp_presentation: presented when drawn, discarded when replaced first
+    App app(server);
+    const uint32_t pres = app.bind(app.reg, "wp_presentation");
+    CHECK(app.take(pres, 0).u(0) == 1);      // clock_id: CLOCK_MONOTONIC
+    App::Window w = app.toplevel(true, "presented");
+    const uint32_t win = shown_window(server, app, w, 0xFF202020u);
+    const uint32_t f1 = app.new_id();
+    app.send(Msg(pres, 1).u(w.surface).u(f1));
+    app.show(w, 100, 80, 0xFF303030u);
+    const uint32_t f2 = app.new_id();
+    app.send(Msg(pres, 1).u(w.surface).u(f2));
+    app.show(w, 100, 80, 0xFF404040u);
+    CHECK(app.has(f1, 2));      // discarded: never shown
+    std::vector<uint32_t> target(200 * 200);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 200;
+    graphics::SoftwareRenderer2D r(ts);
+    uint32_t dw, dh;
+    g_fake_ms = 123456;
+    CHECK(server.draw_window(win, r, 0, 0, &dw, &dh));
+    Ev pr = app.take(f2, 1);
+    CHECK(pr.object == f2 && pr.u(1) == 123 && pr.u(2) == 456000000u && pr.u(3) == 16666667u);
+    CHECK(app.take(1, 1).u(0) == f1);      // (delete_id: the feedback objects go)
+  }
+  {      // --- idle inhibitors are counted; xdg-foreign makes another client's window the parent
+    App a(server), b(server);
+    const uint32_t idle = a.bind(a.reg, "zwp_idle_inhibit_manager_v1");
+    const uint32_t s = a.surface();
+    const uint32_t inh = a.new_id();
+    a.send(Msg(idle, 1).u(inh).u(s));
+    CHECK(server.idle_inhibited());
+    a.send(Msg(inh, 0));
+    CHECK(!server.idle_inhibited());
+    App::Window wa = a.toplevel(true, "parent"), wb = b.toplevel(true, "dialog");
+    shown_window(server, a, wa, 0xFF0000FFu);
+    const uint32_t win_b = shown_window(server, b, wb, 0xFF00FF00u);
+    const uint32_t exporter = a.bind(a.reg, "zxdg_exporter_v2"), importer = b.bind(b.reg, "zxdg_importer_v2");
+    const uint32_t exported = a.new_id();
+    a.send(Msg(exporter, 1).u(exported).u(wa.surface));
+    const std::string handle = a.take(exported, 0).s(0);
+    CHECK(!handle.empty());
+    const uint32_t imported = b.new_id();
+    b.send(Msg(importer, 1).u(imported).s(handle));
+    b.send(Msg(imported, 1).u(wb.surface));
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win_b, &info, &title) && info.owned);
+    a.send(Msg(wa.toplevel, 0));      // the parent goes: the import hears it, the dialog has no parent
+    a.send(Msg(wa.xdg, 0));
+    a.send(Msg(wa.surface, 0));
+    CHECK(b.has(imported, 0));
+    CHECK(server.window_info(win_b, &info, &title) && !info.owned);
+    const uint32_t unknown = b.new_id();
+    b.send(Msg(importer, 1).u(unknown).s("no-such-handle"));
+    CHECK(b.has(unknown, 0));
+    const uint32_t late = b.new_id();
+    b.send(Msg(importer, 1).u(late).s(handle));      // (the export is gone: destroyed at once)
+    CHECK(b.has(late, 0));
+  }
+  {      // --- pings: a client that does not answer is shown as not responding until it does; the minimized state
+    App app(server);
+    App::Window w = app.toplevel(true, "Editor");
+    const uint32_t win = shown_window(server, app, w, 0xFF505050u);
+    g_fake_ms = 200000;
+    app.drop_events();
+    server.window_command(win, desktop::IWindowsSession::Command::Close);
+    Ev ping = app.take(app.wm, 0);
+    CHECK(ping.object == app.wm && app.has(w.toplevel, 1));      // ping, and the close
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    g_fake_ms += 6000;
+    server.tick();
+    CHECK(server.window_info(win, &info, &title) && title.view() == StringView("Editor (Not Responding)"));
+    app.send(Msg(app.wm, 3).u(ping.u(0)));      // pong
+    CHECK(server.window_info(win, &info, &title) && title.view() == StringView("Editor"));
+    app.drop_events();
+    server.window_command(win, desktop::IWindowsSession::Command::Minimize);
+    Ev conf = app.take(w.toplevel, 0);
+    bool suspended = false;
+    for (size_t i = 0; i + 3 < conf.a.size() - 12; i += 4) suspended |= conf.u(3 + i / 4) == 9;
+    CHECK(conf.object == w.toplevel && suspended);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 int main() {
   test_memory_file();
   test_registry();
@@ -2051,6 +2973,13 @@ int main() {
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();
+  test_dxg_cpu_mapping();
+  test_syncobj();
+  test_clipboard();
+  test_mapping();
+  test_extras();
+  test_drag_and_drop();
+  test_dxg_fences();
   test_dxg_threads();
   test_threads();
   free_made();

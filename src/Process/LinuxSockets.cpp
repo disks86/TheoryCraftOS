@@ -626,6 +626,33 @@ uint64_t sys_socketpair(Process& p, uint64_t domain, uint64_t type, uint64_t pro
   return 0;
 }
 
+// pipe2(fds, flags) / pipe(fds): a one-way pipe, made as a connected AF_UNIX stream pair whose first end only reads and second only writes (each shut
+// the other way), so that it can be passed with SCM_RIGHTS like any socket - what Wayland's clipboard and drag and drop hand around. O_CLOEXEC and
+// O_NONBLOCK are SOCK_CLOEXEC and SOCK_NONBLOCK's values; O_DIRECT (packet mode) is refused. (fstat says a socket, not a FIFO.)
+uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags) {
+  if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
+  if (fds == 0) return error(kEfault);
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t a = 0, b = 0;
+  if (const UnixStatus st = m->create_pair(UnixType::Stream, p.id(), &a, &b); st != UnixStatus::Ok) return result_of(st);
+  {
+    Hold hold(*m);
+    m->shutdown_locked(a, false, true);      // (the read end sends nothing)
+    m->shutdown_locked(b, true, false);      // (the write end receives nothing)
+  }
+  const uint64_t fr = give_fd(p, *m, a, flags & kSockCloexec, flags & kSockNonBlock);
+  if (int64_t(fr) < 0) { m->release(b); return fr; }
+  const uint64_t fw = give_fd(p, *m, b, flags & kSockCloexec, flags & kSockNonBlock);
+  if (int64_t(fw) < 0) { p.close_descriptor(fr); return fw; }
+  if (!p.write_user_u32(fds, uint32_t(fr)) || !p.write_user_u32(fds + 4, uint32_t(fw))) {
+    p.close_descriptor(fr);
+    p.close_descriptor(fw);
+    return error(kEfault);
+  }
+  return 0;
+}
+
 uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);

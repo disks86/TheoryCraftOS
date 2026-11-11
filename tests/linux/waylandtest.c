@@ -31,7 +31,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
   return r;
 }
 enum { NR_READ = 0, NR_WRITE = 1, NR_CLOSE = 3, NR_FSTAT = 5, NR_LSEEK = 8, NR_MMAP = 9, NR_MUNMAP = 11, NR_PREAD = 17, NR_SOCKET = 41, NR_CONNECT = 42,
-       NR_SENDMSG = 46, NR_RECVMSG = 47, NR_FCNTL = 72, NR_FTRUNCATE = 77, NR_NANOSLEEP = 35, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_FALLOCATE = 285 };
+       NR_SENDMSG = 46, NR_RECVMSG = 47, NR_FCNTL = 72, NR_FTRUNCATE = 77, NR_NANOSLEEP = 35, NR_EXIT_GROUP = 231, NR_MEMFD_CREATE = 319, NR_FALLOCATE = 285, NR_PIPE2 = 293 };
 __asm__(".globl _start\n_start:\n  xor %ebp, %ebp\n  mov %rsp, %rdi\n  and $-16, %rsp\n  call start_c\n");
 #elif defined(__aarch64__)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -42,7 +42,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_FSTAT = 80, NR_LSEEK = 62, NR_MMAP = 222, NR_MUNMAP = 215, NR_PREAD = 67, NR_SOCKET = 198,
        NR_CONNECT = 203, NR_SENDMSG = 211, NR_RECVMSG = 212, NR_FCNTL = 25, NR_FTRUNCATE = 46, NR_NANOSLEEP = 101, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279,
-       NR_FALLOCATE = 47 };
+       NR_FALLOCATE = 47, NR_PIPE2 = 59 };
 __asm__(".globl _start\n_start:\n  mov x29, #0\n  mov x0, sp\n  mov x9, sp\n  and x9, x9, #-16\n  mov sp, x9\n  bl start_c\n");
 #elif defined(__riscv)
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
@@ -53,7 +53,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f) {
 }
 enum { NR_READ = 63, NR_WRITE = 64, NR_CLOSE = 57, NR_FSTAT = 80, NR_LSEEK = 62, NR_MMAP = 222, NR_MUNMAP = 215, NR_PREAD = 67, NR_SOCKET = 198,
        NR_CONNECT = 203, NR_SENDMSG = 211, NR_RECVMSG = 212, NR_FCNTL = 25, NR_FTRUNCATE = 46, NR_NANOSLEEP = 101, NR_EXIT_GROUP = 94, NR_MEMFD_CREATE = 279,
-       NR_FALLOCATE = 47 };
+       NR_FALLOCATE = 47, NR_PIPE2 = 59 };
 __asm__(".globl _start\n_start:\n  li s0, 0\n  mv a0, sp\n  andi sp, sp, -16\n  call start_c\n");
 #else
 #error "no runtime for this CPU"
@@ -165,7 +165,21 @@ static int wait_event(u32 object, u32 opcode) {
 }
 
 /* globals */
-static u32 g_compositor, g_shm, g_wm, g_seat, g_deco;
+static u32 g_compositor, g_shm, g_wm, g_seat, g_deco, g_ddm;
+/* the descriptor that came last (with the event just read), or -1 */
+static int take_fd(void) { return fds_count > 0 ? fds_in[--fds_count] : -1; }
+/* reads a pipe until its writer closes it */
+static unsigned long read_all(long fd, char* out, unsigned long room) {
+  unsigned long n = 0;
+  for (;;) {
+    const long got = sys3(NR_READ, fd, out + n, room - n);
+    if (got <= 0) break;
+    n += (unsigned long)got;
+    if (n == room) break;
+  }
+  return n;
+}
+static int text_is(const char* got, unsigned long n, const char* want) { return n == len(want) && starts(got, want); }
 static const char* env_value(char** envp, const char* name) {
   for (; *envp; ++envp) {
     const char* e = *envp;
@@ -209,6 +223,7 @@ __attribute__((used)) void start_c(long* stack) {
     else if (same(name, "xdg_wm_base")) g_wm = global;
     else if (same(name, "wl_seat")) g_seat = global;
     else if (same(name, "zxdg_decoration_manager_v1")) g_deco = global;
+    else if (same(name, "wl_data_device_manager")) g_ddm = global;
   }
   CHECK(g_compositor && g_shm && g_wm && g_seat && g_deco);
   begin(2, 0); put(g_compositor); put_s("wl_compositor"); put(5); put(10); end();
@@ -297,6 +312,56 @@ __attribute__((used)) void start_c(long* stack) {
   begin(1, 0); put(43); end();
   CHECK(wait_event(43, 0));
   CHECK(released_21);      /* the first buffer was let go (wl_buffer.release) when the third replaced it */
+
+  /* copy and paste through pipes (pipe2), passed both ways with SCM_RIGHTS: the desktop's text pasted here, a selection of ours read by the desktop's
+   * clipboard, and pasted back into ourselves (the compositor passes our own pipe on to our source) */
+  {
+    CHECK(g_ddm != 0);
+    begin(2, 0); put(g_ddm); put_s("wl_data_device_manager"); put(3); put(80); end();
+    begin(80, 1); put(81); put(13); end();      /* get_data_device: we have the keyboard, so the selection comes */
+    CHECK(wait_event(81, 5));
+    const u32 desktop_offer = arg(0);
+    CHECK(desktop_offer >= 0xFF000000u);
+    int p[2] = {-1, -1};
+    char got[256];
+    CHECK(sys3(NR_PIPE2, p, 0x80000, 0) == 0 && p[0] >= 0 && p[1] >= 0);
+    begin(desktop_offer, 1); put_s("text/plain;charset=utf-8"); pending_fd = p[1]; end();      /* receive */
+    sys3(NR_CLOSE, p[1], 0, 0);
+    unsigned long n = read_all(p[0], got, sizeof got);
+    CHECK(text_is(got, n, "text of the emulated desktop"));
+    sys3(NR_CLOSE, p[0], 0, 0);
+    /* our selection: the compositor asks for its text at once (for the desktop's clipboard) */
+    begin(80, 0); put(82); end();      /* create_data_source */
+    begin(82, 0); put_s("text/plain;charset=utf-8"); end();
+    begin(81, 1); put(82); put(0); end();      /* set_selection */
+    CHECK(wait_event(81, 5));                   /* (first: we have the keyboard, so we are offered our own selection) */
+    const u32 own_offer = arg(0);
+    CHECK(wait_event(82, 1));                   /* send(mime, fd): the compositor reads it for the desktop's clipboard */
+    int to_desktop = take_fd();
+    CHECK(to_desktop >= 0);
+    if (to_desktop >= 0) {
+      const char* text = "copied by the Linux program";
+      CHECK(sys3(NR_WRITE, to_desktop, text, len(text)) == (long)len(text));
+      sys3(NR_CLOSE, to_desktop, 0, 0);
+    }
+    /* pasting our own selection: our pipe goes to our source as it is */
+    CHECK(own_offer >= 0xFF000000u && own_offer != desktop_offer);
+    CHECK(sys3(NR_PIPE2, p, 0x80000, 0) == 0);
+    begin(own_offer, 1); put_s("text/plain;charset=utf-8"); pending_fd = p[1]; end();
+    sys3(NR_CLOSE, p[1], 0, 0);
+    CHECK(wait_event(82, 1));
+    const int forwarded = take_fd();
+    CHECK(forwarded >= 0);
+    if (forwarded >= 0) {
+      CHECK(sys3(NR_WRITE, forwarded, "round trip", 10) == 10);
+      sys3(NR_CLOSE, forwarded, 0, 0);
+    }
+    n = read_all(p[0], got, sizeof got);
+    CHECK(text_is(got, n, "round trip"));
+    sys3(NR_CLOSE, p[0], 0, 0);
+    begin(1, 0); put(83); end();
+    CHECK(wait_event(83, 0));
+  }
   if (argc > 1) sleep_ms(8000);      /* stay on screen a while */
 done:
   out("wayland-linux: ");

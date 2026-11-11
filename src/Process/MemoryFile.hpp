@@ -47,6 +47,7 @@ class MemoryBlock final : public SharedMemory {
   ByteView bytes() const { return ByteView(storage_, capacity_); }
   uint8_t* storage() const { return storage_; }      // (for AddressSpace::map_shared)
   uint64_t capacity() const { return capacity_; }
+  uint32_t uses() const { return __atomic_load_n(&references_, __ATOMIC_ACQUIRE); }      // (who holds it: the file, mappings, readers)
 
  private:
   MemoryBlock(allocators::IAllocator& allocator, uint8_t* storage, uint64_t capacity) : allocator_(allocator), storage_(storage), capacity_(capacity) {}

@@ -42,6 +42,8 @@
 #endif
 #ifdef TCOS_EMU_WAYLAND
 #include <map>
+#include <set>
+#include "Kernel/Clipboard.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Process/UnixSockets.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
@@ -272,9 +274,13 @@ int main(int argc, char** argv) {
   // as in the kernel; a stand-in desktop draws the windows (which answers their frame callbacks) and notes the framed ones' titles and a pixel of each.
   wayland::Server wl_server(a);
   wl_server.attach(4, 24);
+  kernel::Clipboard wl_clipboard(a);      // (the desktop's clipboard: its text is pasted into the program, what it copies lands here)
+  wl_clipboard.set_text("text of the emulated desktop");
+  wl_server.set_clipboard(&wl_clipboard);
+  std::set<uint32_t> wl_activated;
   wayland::SocketServer wl_sockets(wl_server, *process::system_unix_sockets(), a);
 #ifdef TCOS_EMU_DMABUF
-  wl_sockets.set_gpu_images(&wayland::make_dxg_image, &dxkernel);
+  wl_sockets.set_gpu_images(&wayland::make_dxg_image, &wayland::make_dxg_timeline, &dxkernel);
   std::atomic<int> wl_gpu_draws{0}, wl_cpu_draws{0};
 #endif
   if (!wl_sockets.listen(fs)) printf("wayland: could not listen\n");
@@ -300,6 +306,7 @@ int main(int argc, char** argv) {
         desktop::WindowsWindowInfo info;
         String title(a);
         if (wl_server.window_info(w, &info, &title) && info.visible && info.caption) wl_titles[std::string(title.c_str())] = wl_server.window_pixel(w, 2, 2);
+        if (!info.popup && wl_activated.insert(w).second) wl_server.activate_window(w);      // (a new window gets the keyboard, as on the desktop)
         graphics::SoftwareRenderer2D renderer(target);
         uint32_t dw = 0, dh = 0;
 #ifdef TCOS_EMU_DMABUF
@@ -451,6 +458,11 @@ int main(int argc, char** argv) {
   wl_stop = true;
   wl_thread.join();
   for (const auto& t : wl_titles) printf("wayland-desktop: framed window \"%s\" pixel %08x\n", t.first.c_str(), t.second);
+  {
+    String text(a);
+    if (wl_clipboard.get_text(&text)) printf("wayland-desktop: clipboard \"%s\"\n", text.c_str());
+  }
+  wl_server.set_clipboard(nullptr);
 #ifdef TCOS_EMU_DMABUF
   printf("wayland-desktop: %d draws on the device, %d on the CPU\n", wl_gpu_draws.load(), wl_cpu_draws.load());
   // (a dmabuf the program still has open holds an export of the kernel, which goes before the program: its descriptors are closed first)

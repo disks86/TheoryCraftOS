@@ -26,7 +26,8 @@
 //
 // Globals: wl_compositor 6, wl_subcompositor 1, wl_shm 2 (ARGB8888, XRGB8888, ABGR8888, XBGR8888), wl_seat 8 (pointer and keyboard; the keymap is a US
 // xkb_v1 keymap in a sealed file in memory), wl_output 4 (the primary monitor), wl_data_device_manager 3 (no transfers yet), xdg_wm_base 5,
-// zxdg_decoration_manager_v1 1, and zwp_linux_dmabuf_v1 3 when the transport can take GPU images (set_dmabuf; the same four formats, linear).
+// zxdg_decoration_manager_v1 1, and zwp_linux_dmabuf_v1 4 when the transport can take GPU images (set_dmabuf; the same four formats, linear; feedback
+// names /dev/dxg as the device).
 //
 // GPU pictures. A zwp_linux_dmabuf_v1 buffer is a GPU image a client passed as a descriptor (on this system an export of the kernel's Direct3D layer, made with
 // /dev/dxg: Process/DxgBufferFile.hpp). The desktop draws it where it is: on the GPU, with no copy at all, when the desktop's renderer draws on the device the
@@ -46,6 +47,7 @@
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
 #include "Desktop/WindowsSession.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/Hive.hpp"
@@ -71,10 +73,24 @@ class GpuImage {
   virtual bool draw(graphics::IRenderer2D& renderer, const graphics::Rect2D& source, int32_t x, int32_t y) = 0;
   // Its pixels in `source` (inside the image), row after row, into `out` (source.width * source.height words). False when it cannot be read now.
   virtual bool read(const graphics::Rect2D& source, ArrayView<uint32_t> out) = 0;
+  // A buffer of it was committed: what the client wrote through a CPU mapping of the descriptor goes to the image (a dmabuf mapped with mmap,
+  // Process/DxgBufferFile.hpp). False when that could not be done now.
+  virtual bool committed() { return true; }
 
  protected:
   GpuImage() = default;
   ~GpuImage() = default;
+};
+
+// A timeline a client passed (a DRM sync object; on this system a fence exported with /dev/dxg): wp_linux_drm_syncobj_v1's acquire and release points.
+class GpuTimeline {
+ public:
+  virtual uint64_t value() = 0;                // the point reached
+  virtual void signal(uint64_t point) = 0;     // raises it to `point` (nothing when it is there already)
+
+ protected:
+  GpuTimeline() = default;
+  ~GpuTimeline() = default;
 };
 
 class Memory {
@@ -84,6 +100,8 @@ class Memory {
   virtual ByteView map(uint64_t size) = 0;
   // The GPU image it is (a dmabuf), or null: it is not one. It lives as long as this object.
   virtual GpuImage* gpu() { return nullptr; }
+  // The timeline it is (a sync object), or null. It lives as long as this object.
+  virtual GpuTimeline* timeline() { return nullptr; }
 
  protected:
   Memory() = default;
@@ -92,6 +110,17 @@ class Memory {
 using Fd = SharedPointer<Memory>;
 // Makes a descriptor for the server to send: a file in memory holding `contents`, sealed against changes. Null on failure.
 using MakeFd = Fd (*)(void* context, ConstByteView contents);
+
+// What the server asks of its transport (take_requests): a pipe to read a client's data from (MakePipe: the transport makes it, hands the server the write
+// end with pipe_ready and the bytes, once the client closed its end, with pipe_read_done), or bytes to write into a descriptor a client passed and then let
+// go of (Write: the desktop's clipboard pasted into a client). Carried out outside the server's lock.
+struct TransportRequest {
+  enum class Kind : uint8_t { MakePipe, Write };
+  Kind kind = Kind::MakePipe;
+  uint32_t job = 0;
+  Fd fd;                             // Write: where to
+  SharedPointer<ByteBuffer> data;    // Write: what
+};
 
 struct Rect {
   int32_t x = 0, y = 0, w = 0, h = 0;
@@ -119,6 +148,14 @@ class Server final : public desktop::IWindowsSession {
   // Called (outside the lock) whenever output for a client was produced by something other than its own request (input, the desktop, another client).
   void set_wake(Wake wake, void* context);
   void set_fd_maker(MakeFd make, void* context);
+  // The desktop's clipboard, bridged to the Wayland selection (null: none). It must outlive the server.
+  void set_clipboard(kernel::Clipboard* clipboard);
+  // --- what the transport does for the server (see TransportRequest)
+  void take_requests(List<TransportRequest>* out);
+  void pipe_ready(uint32_t job, Fd write_end);
+  void pipe_read_done(uint32_t job, ConstByteView data);
+  // Now and then (the transport's rounds): commits waiting for an acquire point, the desktop's clipboard.
+  void tick();
   // Whether zwp_linux_dmabuf_v1 is offered (the transport makes GPU images of the descriptors clients pass). Only clients that bind after it see the change.
   void set_dmabuf(bool offered);
 
@@ -158,6 +195,8 @@ class Server final : public desktop::IWindowsSession {
   bool cursor_confined() override;
   uint32_t capture_window() override;
 
+  // Whether a client keeps the screen from going idle (zwp_idle_inhibit_manager_v1: a visible surface with an inhibitor).
+  bool idle_inhibited();
   // Tests: the pixel (0xAARRGGBB as the client stored it; a GPU buffer's as GpuImage::read gives it) of a window's committed buffer at (x, y) of the window's
   // surface; 0 when outside or none.
   uint32_t window_pixel(uint32_t window, int32_t x, int32_t y);
@@ -168,7 +207,10 @@ class Server final : public desktop::IWindowsSession {
  private:
   enum class Iface : uint8_t {
     Display, Registry, Callback, Compositor, Surface, Region, Subcompositor, Subsurface, Shm, ShmPool, Buffer, Seat, Pointer, Keyboard, Touch, Output,
-    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams,
+    DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
+    Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
+    RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
+    Importer, Imported,
   };
   struct Surface;
   struct Client;
@@ -181,11 +223,28 @@ class Server final : public desktop::IWindowsSession {
   struct BufferInfo {
     SharedPointer<PoolMemory> memory;      // a wl_shm buffer's pool
     Fd gpu;                                // a dmabuf's plane: its descriptor's gpu() is the picture (the top left width x height of it)
+    Fd release_timeline;                   // explicit sync: signalled at release_point when the compositor is done with this use of the buffer
+    uint64_t release_point = 0;
     int32_t offset = 0, width = 0, height = 0, stride = 0;
     uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one)
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
     bool valid() const { return (memory || gpu) && width > 0; }
     GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
+  };
+  // A wl_data_source: what it offers.
+  struct DataSourceInfo {
+    explicit DataSourceInfo(allocators::IAllocator& allocator) : mimes(allocator) {}
+    List<String> mimes;
+    uint32_t actions = 0;      // (version 3: what a drag may do: 1 copy, 2 move, 4 ask)
+    bool used = false;         // given to set_selection or start_drag (it cannot be given again)
+  };
+  // A wl_data_offer: whose data it is.
+  struct OfferInfo {
+    uint8_t source_client = 0;
+    uint32_t source_id = 0;      // the wl_data_source (0: the desktop's clipboard)
+    bool dnd = false;
+    uint32_t actions = 0, preferred = 0;      // the destination's (set_actions)
+    bool accepted = false;                    // a drag's destination accepted a type
   };
   // A zwp_linux_buffer_params_v1: the plane added so far (one: every format offered has one plane).
   struct DmabufParams {
@@ -215,8 +274,17 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<RegionRects> region;          // wl_region
     Positioner positioner;                      // xdg_positioner
     SharedPointer<DmabufParams> params;         // zwp_linux_buffer_params_v1
+    Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
+    SharedPointer<DataSourceInfo> source;       // wl_data_source, zwp_primary_selection_source_v1
+    SharedPointer<OfferInfo> offer;             // wl_data_offer, zwp_primary_selection_offer_v1
+    SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
+  struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
+    Fd timeline;
+    uint64_t point = 0;
+    bool set() const { return timeline.get() != nullptr; }
+  };
   struct State {      // a surface's double-buffered state
     bool attached = false;      // attach() since the last commit (buffer is what it set; invalid: none)
     BufferInfo buffer;
@@ -226,18 +294,38 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<RegionRects> opaque, input;   // (input null after set: everywhere)
     bool geometry_set = false;
     Rect geometry;
+    SyncPoint acquire, release;  // explicit sync (wp_linux_drm_syncobj_surface_v1)
+    // how the buffer maps onto the surface (0 / -1: not set in this commit)
+    int32_t scale = 0, transform = -1;
+    bool source_set = false, destination_set = false;      // wp_viewport (set_source / set_destination, -1 = unset)
+    int32_t source[4] = {-1, -1, -1, -1};                   // x, y, w, h in 24.8 fixed point
+    int32_t destination[2] = {-1, -1};
+  };
+  // How a surface's buffer maps onto it: buffer_transform, buffer_scale, then the viewport's crop and size.
+  struct BufferMapping {
+    int32_t scale = 1, transform = 0;
+    int32_t source[4] = {-1, -1, -1, -1};      // (24.8; -1: the whole of it)
+    int32_t destination[2] = {-1, -1};
+    bool identity() const { return scale == 1 && transform == 0 && source[0] == -1 && destination[0] == -1; }
   };
   struct Surface {
-    explicit Surface(allocators::IAllocator& allocator) : pending_callbacks(allocator), callbacks(allocator), stack(allocator), title(allocator) {}
+    explicit Surface(allocators::IAllocator& allocator)
+        : pending_callbacks(allocator), callbacks(allocator), pending_feedback(allocator), feedback(allocator), stack(allocator), title(allocator) {}
     uint8_t client = 0;
     uint32_t id = 0;                            // the wl_surface
     Role role = Role::None;
     uint32_t xdg_id = 0, role_id = 0, decoration_id = 0;      // xdg_surface; toplevel / popup / subsurface; zxdg_toplevel_decoration_v1
+    uint32_t syncobj_id = 0;                    // wp_linux_drm_syncobj_surface_v1 (0: implicit sync)
+    uint32_t viewport_id = 0, fractional_id = 0;      // wp_viewport, wp_fractional_scale_v1
+    BufferMapping mapping;
+    bool waiting = false;                       // a commit waits for its acquire point (explicit sync): `waiting_state`
+    State waiting_state;
     State pending, cached;                      // (cached: a synchronized subsurface's commit, applied with its parent's)
     bool has_cached = false;
     BufferInfo current;
     SharedPointer<RegionRects> input;           // null: everywhere
     List<uint32_t> pending_callbacks, callbacks;
+    List<uint32_t> pending_feedback, feedback;  // wp_presentation_feedback: of the next commit, of the picture shown
     // subsurfaces: the children with the surface itself (nullptr) among them, bottom first
     Surface* parent = nullptr;
     List<Surface*> stack;
@@ -307,8 +395,34 @@ class Server final : public desktop::IWindowsSession {
   void toplevel_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void popup_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void decoration_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- the selection, the desktop's clipboard, drag and drop (WaylandData.cpp)
+  void data_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void set_selection(Client* c, uint32_t source);
+  void send_selection(Client& c);
+  uint32_t make_offer(Client& c, uint32_t device, uint8_t source_client, uint32_t source_id, bool dnd);
+  DataSourceInfo* source_of(uint8_t client, uint32_t source);
+  void source_gone(Client& c, uint32_t source);
+  void poll_clipboard();
+  void fetch_selection_text();
+  void start_drag(Client& c, uint32_t source, Surface* origin);
+  void drag_moved();
+  void drag_focus(Surface* s, int32_t lx, int32_t ly);
+  void drag_button_released();
+  void end_drag(bool dropped);
+  uint32_t drag_action(const OfferInfo& o) const;
+  void request(TransportRequest r);
+  static void devices_of(Client& c, List<uint32_t>* out);      // (the client's wl_data_devices)
+  // --- wp_linux_drm_syncobj_v1 (WaylandDmabuf.cpp)
+  void syncobj_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  bool check_sync_points(Client& c, Surface& s);       // (commit: the protocol's rules; false: an error was posted)
+  void signal_release(BufferInfo& b);
+  bool acquired(const State& state);
+  void finish_waiting(Surface& s, bool force);           // applies a commit whose acquire point was reached (or drops it: force)
+  void poll_waiting();
   // --- zwp_linux_dmabuf_v1 (WaylandDmabuf.cpp)
   void dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void send_dmabuf_feedback(Client& c, uint32_t feedback);
+  Fd format_table_fd();
   bool make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, int32_t width, int32_t height, uint32_t format, uint32_t flags, bool immediate, BufferInfo* out);
   void commit(Client& c, Surface& s);
   void apply(Client& c, Surface& s, State& state);
@@ -324,6 +438,27 @@ class Server final : public desktop::IWindowsSession {
   void dismiss_popups(Surface* keep_root);
   void dismiss_children(Surface& s);
   void shown_size(const Surface& s, int32_t* w, int32_t* h) const;
+  // The surface's size from its buffer and mapping (0 x 0: no buffer), and where a surface point is in the buffer (false: outside it).
+  static void surface_size(const BufferInfo& b, const BufferMapping& m, int32_t* w, int32_t* h);
+  static void unviewported(const BufferInfo& b, const BufferMapping& m, float* w, float* h);
+  static bool surface_to_buffer(const BufferInfo& b, const BufferMapping& m, float sx, float sy, float* bx, float* by);
+  bool check_mapping(Client& c, Surface& s, const State& state);      // (commit: the scale and viewport rules; false: an error was posted)
+  void draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y);
+  void viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // --- the other protocols (WaylandExtras.cpp): activation, cursor shapes, the primary selection, relative pointer and constraints, presentation time,
+  // idle inhibitors, xdg-foreign; and the window manager's pings
+  void extras_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void activate_locked(Surface* s);
+  void send_primary_selection(Client& c);
+  void update_constraints();
+  void constraint_gone(Surface& s);
+  struct Constraint;
+  Constraint* active_constraint();
+  void relative_motion(int32_t dx, int32_t dy);
+  void ping(Client& c);
+  void check_pings();
+  void presented(Surface& s, bool shown);
+  void forget_exports(Surface& s);
   void actual_size(const Surface& s, int32_t* w, int32_t* h) const;
   static ArrayView<uint32_t> buffer_pixels(const BufferInfo& b);
   void copy_region(Client& c, uint32_t region, SharedPointer<RegionRects>* out, uint32_t from);
@@ -369,6 +504,7 @@ class Server final : public desktop::IWindowsSession {
   void* make_fd_context_ = nullptr;
   bool dmabuf_ = false;
   Fd keymap_;
+  Fd format_table_;      // zwp_linux_dmabuf_feedback_v1's format table (made once, sealed)
   UniquePointer<Client> clients_[kMaxClients];
   Hive<Surface> surfaces_;
   List<Surface*> stack_;                    // the mapped windows (toplevels and popups), bottom first
@@ -387,7 +523,60 @@ class Server final : public desktop::IWindowsSession {
   bool attached_ = false;
   int32_t frame_border_ = 0, frame_title_ = 0;
   uint32_t place_counter_ = 0;
-  bool draw_missed_ = false;                // (draw_window: a GPU picture of the tree could not be drawn)
+  bool draw_missed_ = false;
+  // the other protocols (WaylandExtras.cpp)
+  uint32_t cursor_shape_ = 0;               // wp_cursor_shape_v1: the system cursor (OCR_*) the client under the pointer chose; 0: none
+  uint8_t psel_client_ = 0;                 // the primary selection's source
+  uint32_t psel_source_ = 0;
+  uint8_t psel_sent_client_ = 0;
+  struct Constraint {
+    uint8_t client = 0;
+    uint32_t id = 0;
+    Surface* surface = nullptr;
+    bool lock = false, persistent = false, active = false, defunct = false;
+    SharedPointer<RegionRects> region;      // (null: the whole surface)
+    bool hint_set = false;
+    int32_t hint_x = 0, hint_y = 0;         // a lock's cursor position hint (surface pixels)
+  };
+  List<Constraint> constraints_;
+  uint64_t present_seq_ = 0;
+  List<String> tokens_;                     // xdg_activation_v1 tokens handed out and not used yet
+  uint32_t next_token_ = 1;
+  struct Exported {
+    uint8_t client = 0;
+    uint32_t id = 0;
+    Surface* surface = nullptr;
+    String handle;
+    explicit Exported(allocators::IAllocator& allocator) : handle(allocator) {}
+  };
+  List<UniquePointer<Exported>> exports_;
+  uint32_t next_export_ = 1;
+  uint32_t idle_inhibitors_ = 0;
+  // the selection: a client's wl_data_source, or the desktop's clipboard (sel_client_ 0, sel_desktop_)
+  kernel::Clipboard* clipboard_ = nullptr;
+  uint64_t clipboard_seen_ = 0;             // the clipboard's sequence the server last took in or set itself
+  uint8_t sel_client_ = 0;
+  uint32_t sel_source_ = 0;
+  bool sel_desktop_ = false;
+  uint8_t sel_sent_client_ = 0;             // the client the selection was last offered to (the keyboard focus's)
+  uint32_t fetch_job_ = 0;                  // the clipboard's copy of a client's selection being read (0: none)
+  String fetch_mime_;
+  String desktop_text_;                     // the clipboard's text, as tick() last read it (what a paste of the desktop's selection gets)
+  List<TransportRequest> requests_;
+  uint32_t next_job_ = 1;
+  // a drag (wl_data_device.start_drag)
+  struct Drag {
+    bool active = false;
+    uint8_t client = 0;
+    uint32_t source = 0;                    // its wl_data_source (0: a drag inside one client, without data)
+    Surface* origin = nullptr;
+    Surface* icon = nullptr;
+    Surface* focus = nullptr;               // the surface under it
+    uint32_t offer = 0;                     // the offer the focus's client was given
+    int32_t lx = 0, ly = 0;
+    bool dropped = false;                   // the drop happened; the source waits for the destination's finish
+  } drag_;
+  uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
   uint32_t active_window_ = 0;
   // input

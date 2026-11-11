@@ -28,6 +28,7 @@ namespace process::linuxabi {
 
 uint64_t sys_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol);
 uint64_t sys_socketpair(Process& p, uint64_t domain, uint64_t type, uint64_t protocol, uint64_t pair);
+uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags);      // (pipe(fds) is pipe2(fds, 0))
 uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length);
 uint64_t sys_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length);
 uint64_t sys_listen(Process& p, uint64_t fd, uint64_t backlog);

@@ -107,8 +107,7 @@ void Server::actual_size(const Surface& s, int32_t* w, int32_t* h) const {
     *w = s.geometry.w;
     *h = s.geometry.h;
   } else {
-    *w = s.current.valid() ? s.current.width : 0;
-    *h = s.current.valid() ? s.current.height : 0;
+    surface_size(s.current, s.mapping, w, h);
   }
 }
 
@@ -260,12 +259,16 @@ void Server::surface_request(Client& c, uint32_t id, Resource& r, uint16_t opcod
     case 6: commit(c, *s); return;
     case 7: {      // set_buffer_transform
       const int32_t t = in.i();
-      if (in.ok() && (t < 0 || t > 7)) post_error(c, id, kSurfaceInvalidTransform, "invalid transform");
+      if (!in.ok()) return;
+      if (t < 0 || t > 7) post_error(c, id, kSurfaceInvalidTransform, "invalid transform");
+      else s->pending.transform = t;
       return;
     }
-    case 8: {      // set_buffer_scale (pictures are shown 1:1: the output's scale is 1)
+    case 8: {      // set_buffer_scale
       const int32_t scale = in.i();
-      if (in.ok() && scale < 1) post_error(c, id, kSurfaceInvalidScale, "invalid scale");
+      if (!in.ok()) return;
+      if (scale < 1 || scale > 16) post_error(c, id, kSurfaceInvalidScale, "invalid scale");
+      else s->pending.scale = scale;
       return;
     }
     case 10:       // offset(x, y)
@@ -286,13 +289,22 @@ bool Server::synchronized(const Surface& s) const {
 }
 
 void Server::commit(Client& c, Surface& s) {
-  if (s.role == Role::Subsurface && s.parent && synchronized(s)) {      // kept until the parent's commit
+  if (!check_sync_points(c, s) || !check_mapping(c, s, s.pending)) return;
+  if (s.pending.release.set()) {      // (the buffer's use from this commit ends at that point)
+    s.pending.buffer.release_timeline = s.pending.release.timeline;
+    s.pending.buffer.release_point = s.pending.release.point;
+  }
+  if (s.role == Role::Subsurface && s.parent && synchronized(s)) {      // kept until the parent's commit (its acquire point is not waited for)
     State& p = s.pending;
     State& k = s.cached;
     if (p.attached) { k.attached = true; k.buffer = p.buffer; }
     if (p.damaged) { k.damage = k.damaged ? unite(k.damage, p.damage) : p.damage; k.damaged = true; }
     if (p.opaque_set) { k.opaque_set = true; k.opaque = p.opaque; }
     if (p.input_set) { k.input_set = true; k.input = p.input; }
+    if (p.scale > 0) k.scale = p.scale;
+    if (p.transform >= 0) k.transform = p.transform;
+    if (p.source_set) { k.source_set = true; for (int i = 0; i < 4; ++i) k.source[i] = p.source[i]; }
+    if (p.destination_set) { k.destination_set = true; k.destination[0] = p.destination[0]; k.destination[1] = p.destination[1]; }
     s.has_cached = true;
     s.pending = State();
     for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
@@ -301,6 +313,23 @@ void Server::commit(Client& c, Surface& s) {
   }
   State state = util::move(s.pending);
   s.pending = State();
+  if (s.waiting || (state.acquire.set() && !acquired(state))) {
+    // explicit sync: the picture may be used only once its acquire point is reached. One commit waits at a time: a newer one takes the place of the one
+    // waiting (whose buffer is let go unused), as a mailbox would. The desktop is asked to come back, which looks again.
+    if (s.waiting) signal_release(s.waiting_state.buffer), release_buffer(c, s.waiting_state.buffer);
+    else ++waiting_count_;
+    s.waiting = true;
+    s.waiting_state = util::move(state);
+    for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
+    s.pending_callbacks.clear();
+    finish_waiting(s, false);      // (reached meanwhile: applied now)
+    if (s.waiting) {
+      Surface* top = &s;
+      while (top->role == Role::Subsurface && top->parent) top = top->parent;
+      note_repaint(*top, {0, 0, 1, 1});
+    }
+    return;
+  }
   apply(c, s, state);
 }
 
@@ -311,10 +340,20 @@ void Server::apply(Client& c, Surface& s, State& state) {
   bool full = false;
   if (state.attached) {
     if (s.current.valid() && s.current.id != state.buffer.id) release_buffer(c, s.current);
+    else signal_release(s.current);      // (the same buffer again: the earlier commit's use of it is over)
     if (!state.buffer.valid() || !s.current.valid() || state.buffer.width != s.current.width || state.buffer.height != s.current.height) full = true;
     s.current = state.buffer;
     if (!state.damaged) full = true;      // (a new picture with no damage said: all of it)
   }
+  // how the buffer maps onto the surface (a change of it repaints all of it)
+  const BufferMapping before_mapping = s.mapping;
+  if (state.scale > 0) s.mapping.scale = state.scale;
+  if (state.transform >= 0) s.mapping.transform = state.transform;
+  if (state.source_set) for (int i = 0; i < 4; ++i) s.mapping.source[i] = state.source[i];
+  if (state.destination_set) s.mapping.destination[0] = state.destination[0], s.mapping.destination[1] = state.destination[1];
+  if (!s.mapping.identity() || !before_mapping.identity()) full = true;
+  // a GPU picture the client may have written through a CPU mapping: those writes reach the image now (GpuImage::committed)
+  if ((state.attached || state.damaged) && s.current.image()) s.current.image()->committed();
   if (state.input_set) s.input = state.input;
   if (state.geometry_set) {
     if (!s.geometry_set || s.geometry.x != state.geometry.x || s.geometry.y != state.geometry.y) full = true;
@@ -323,6 +362,10 @@ void Server::apply(Client& c, Surface& s, State& state) {
   }
   for (uint32_t cb : s.pending_callbacks.view()) s.callbacks.push_back(cb);
   s.pending_callbacks.clear();
+  // presentation feedback: a new picture discards what the old one's was waiting for
+  if (state.attached && s.feedback.count()) presented(s, false);
+  for (uint32_t f : s.pending_feedback.view()) s.feedback.push_back(f);
+  s.pending_feedback.clear();
   // the children's positions and synchronized commits come with this one
   for (Surface* child : s.stack.view()) {
     if (!child) continue;
@@ -396,6 +439,7 @@ void Server::apply(Client& c, Surface& s, State& state) {
 }
 
 void Server::release_buffer(Client& c, const BufferInfo& b) {
+  if (b.release_timeline) b.release_timeline->timeline()->signal(b.release_point);      // (explicit sync: even when the wl_buffer is gone)
   if (b.id == 0) return;
   Resource* r = c.objects.find(b.id);
   if (!r || r->iface != Iface::Buffer) return;
@@ -403,6 +447,11 @@ void Server::release_buffer(Client& c, const BufferInfo& b) {
 }
 
 void Server::forget_surface(Surface& s) {
+  constraint_gone(s);
+  forget_exports(s);
+  if (drag_.icon == &s) drag_.icon = nullptr;
+  if (drag_.focus == &s) drag_.focus = nullptr, drag_.offer = 0;
+  if (drag_.origin == &s) end_drag(false);      // (its origin went: the drag is cancelled)
   if (pointer_focus_ == &s) pointer_focus_ = nullptr;
   if (keyboard_focus_ == &s) keyboard_focus_ = nullptr;
   if (cursor_surface_ == &s) cursor_surface_ = nullptr;
@@ -427,11 +476,18 @@ void Server::destroy_surface(Client& c, Surface& s) {
   for (Surface* child : s.stack.view()) if (child) child->parent = nullptr;
   for (Surface& other : surfaces_) if (other.popup_parent == &s) other.popup_parent = nullptr;
   // the objects of its roles are left without a surface
-  const uint32_t role_objects[3] = {s.xdg_id, s.role_id, s.decoration_id};
+  if (s.waiting) {      // (a commit that never came to be: its buffer is let go)
+    release_buffer(c, s.waiting_state.buffer);
+    s.waiting = false;
+    --waiting_count_;
+  }
+  const uint32_t role_objects[6] = {s.xdg_id, s.role_id, s.decoration_id, s.syncobj_id, s.viewport_id, s.fractional_id};
   for (uint32_t o : role_objects)
     if (o != 0)
       if (Resource* r = c.objects.find(o)) r->surface = nullptr;
   if (s.current.valid()) release_buffer(c, s.current);
+  for (uint32_t f : s.pending_feedback.view()) s.feedback.push_back(f);      // (pictures that will never be shown)
+  presented(s, false);
   surfaces_.erase(&s);
 }
 
@@ -692,7 +748,16 @@ void Server::wm_base_request(Client& c, uint32_t id, Resource& r, uint16_t opcod
       s.xdg_id = object;
       return;
     }
-    case 3: in.u(); return;      // pong
+    case 3: {      // pong(serial): it answers
+      const uint32_t serial = in.u();
+      if (!in.ok() || serial != c.ping_serial) return;
+      c.ping_serial = 0;
+      if (c.not_responding) {
+        c.not_responding = false;
+        for (Surface& s : surfaces_) if (s.client == c.number && s.role == Role::Toplevel && s.window) note_changed(s);
+      }
+      return;
+    }
     default: post_error(c, id, kErrorInvalidMethod, "xdg_wm_base has no such request"); return;
   }
 }
@@ -866,6 +931,7 @@ void Server::configure_toplevel(Surface& s) {
   if (s.maximized) add(kStateMaximized);
   if (s.fullscreen) add(kStateFullscreen);
   if (s.activated) add(kStateActivated);
+  if (s.iconic && tr->version >= 6) add(9);      // suspended: minimized, nothing of it is seen
   Event e(s.role_id, 0);
   e.i(w).i(h).array(ConstByteView(states, n * 4));
   send(*c, e);
@@ -1305,6 +1371,12 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, i
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
+    if (s.feedback.count() && s.current.valid()) presented(s, true);      // (shown now: wp_presentation_feedback.presented)
+    if (!s.mapping.identity()) {      // turned, scaled or cropped: one affine map from the buffer to the screen (WaylandScale.cpp)
+      renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
+      draw_mapped(s, renderer, x, y);
+      continue;
+    }
     if (GpuImage* image = s.current.image()) {      // a dmabuf: drawn where it is (see GpuImage::draw)
       renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
       if (!image->draw(renderer, {0, 0, static_cast<uint32_t>(s.current.width), static_cast<uint32_t>(s.current.height)}, x, y)) draw_missed_ = true;

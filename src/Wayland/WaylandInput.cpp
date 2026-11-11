@@ -42,7 +42,9 @@ Server::Surface* Server::hit(Surface& s, int32_t x, int32_t y, int32_t* local_x,
       if (Surface* found = hit(*entry, x - entry->sub_x, y - entry->sub_y, local_x, local_y)) return found;
       continue;
     }
-    if (!s.current.valid() || x < 0 || y < 0 || x >= s.current.width || y >= s.current.height) continue;
+    int32_t sw = 0, sh = 0;
+    surface_size(s.current, s.mapping, &sw, &sh);
+    if (!s.current.valid() || x < 0 || y < 0 || x >= sw || y >= sh) continue;
     if (s.input && !s.input->contains(x, y)) continue;
     *local_x = x;
     *local_y = y;
@@ -91,9 +93,11 @@ void Server::set_pointer_focus(Surface* s, int32_t lx, int32_t ly) {
   pointer_focus_ = s;
   cursor_set_ = false;      // (the system arrow until the new client sets one)
   cursor_surface_ = nullptr;
+  cursor_shape_ = 0;
   ++cursor_handle_;
   pointer_lx_ = lx;
   pointer_ly_ = ly;
+  update_constraints();
   if (!s) return;
   Client* c = client_of(s->client);
   if (!c) return;
@@ -111,6 +115,10 @@ void Server::set_pointer_focus(Surface* s, int32_t lx, int32_t ly) {
 
 // The pointer's surface again (after it moved, or the windows changed under it); `motion`: tell the focus where the pointer is now.
 void Server::pointer_moved(bool motion) {
+  if (drag_.active) {      // (a drag has the pointer: the data devices hear of it, not the pointers)
+    drag_moved();
+    return;
+  }
   int32_t lx = 0, ly = 0;
   Surface* under = nullptr;
   if (buttons_ != 0 && pointer_focus_) {      // the implicit grab: the press's surface keeps it
@@ -145,23 +153,55 @@ void Server::pointer_moved(bool motion) {
 
 // ------------------------------------------------------------------ the desktop's pointer (desktop::IWindowsSession)
 
+// Where the pointer may go now: anywhere, nowhere (locked), or inside the confining surface (and its region's bounds).
+static void constrain(int32_t* x, int32_t* y, int32_t ox, int32_t oy, int32_t w, int32_t h) {
+  *x = max32(ox, min32(*x, ox + max32(w, 1) - 1));
+  *y = max32(oy, min32(*y, oy + max32(h, 1) - 1));
+}
+
 void Server::mouse_motion(int32_t dx, int32_t dy) {
   {
     kernel::ScopedMutex lock(mutex_);
+    relative_motion(dx, dy);      // (zwp_relative_pointer_v1: the motion as it came)
+    if (Constraint* k = active_constraint()) {
+      if (k->lock || !k->surface) goto done;      // (locked: the pointer stays; only the relative motion went)
+      int32_t ox = 0, oy = 0, w = 0, h = 0;
+      surface_origin(*k->surface, &ox, &oy);
+      surface_size(k->surface->current, k->surface->mapping, &w, &h);
+      int32_t x = pointer_x_ + dx, y = pointer_y_ + dy;
+      constrain(&x, &y, ox, oy, w, h);
+      pointer_x_ = x, pointer_y_ = y;
+      pointer_moved(true);
+      goto done;
+    }
     pointer_x_ = max32(0, min32(pointer_x_ + dx, static_cast<int32_t>(screen_w_) - 1));
     pointer_y_ = max32(0, min32(pointer_y_ + dy, static_cast<int32_t>(screen_h_) - 1));
     pointer_moved(true);
+    update_constraints();
   }
+done:
   wake();
 }
 
 void Server::mouse_position(int32_t x, int32_t y) {
   {
     kernel::ScopedMutex lock(mutex_);
-    pointer_x_ = max32(0, min32(x, static_cast<int32_t>(screen_w_) - 1));
-    pointer_y_ = max32(0, min32(y, static_cast<int32_t>(screen_h_) - 1));
+    x = max32(0, min32(x, static_cast<int32_t>(screen_w_) - 1));
+    y = max32(0, min32(y, static_cast<int32_t>(screen_h_) - 1));
+    relative_motion(x - pointer_x_, y - pointer_y_);
+    if (Constraint* k = active_constraint(); k && k->surface) {
+      if (k->lock) goto done;
+      int32_t ox = 0, oy = 0, w = 0, h = 0;
+      surface_origin(*k->surface, &ox, &oy);
+      surface_size(k->surface->current, k->surface->mapping, &w, &h);
+      constrain(&x, &y, ox, oy, w, h);
+    }
+    pointer_x_ = x;
+    pointer_y_ = y;
     pointer_moved(true);
+    update_constraints();
   }
+done:
   wake();
 }
 
@@ -171,6 +211,12 @@ void Server::mouse_button(uint32_t button, bool down) {
     if (button < 1 || button > 3) return;
     const uint32_t bit = 1u << (button - 1);
     if (down == ((buttons_ & bit) != 0)) return;
+    if (drag_.active) {      // a drag: its end is the buttons' release (no button events go to the clients meanwhile)
+      if (down) buttons_ |= bit;
+      else buttons_ &= ~bit;
+      if (buttons_ == 0) drag_button_released();
+      goto done;
+    }
     if (down) {
       // a press outside the chain of the open popups closes them (a press in the chain's toplevel too, as menus expect)
       Surface* w = pointer_focus_;
@@ -201,6 +247,7 @@ void Server::mouse_button(uint32_t button, bool down) {
     else buttons_ &= ~bit;
     if (buttons_ == 0) pointer_moved(false);      // the grab is over: the focus may move on
   }
+done:
   wake();
 }
 
@@ -254,7 +301,6 @@ void Server::cursor(int32_t* x, int32_t* y) {
   *y = pointer_y_;
 }
 
-bool Server::cursor_confined() { return false; }
 
 uint32_t Server::capture_window() {
   kernel::ScopedMutex lock(mutex_);
@@ -268,6 +314,10 @@ void Server::pointer(Pointer* out) {
   kernel::ScopedMutex lock(mutex_);
   *out = Pointer();
   if (!pointer_focus_ || !cursor_set_) return;      // the system arrow
+  if (!cursor_surface_ && cursor_shape_) {      // a named shape (wp_cursor_shape_v1): the desktop's own cursor
+    out->system_id = cursor_shape_;
+    return;
+  }
   if (!cursor_surface_ || !cursor_surface_->current.valid()) {
     out->hidden = true;
     return;
@@ -389,6 +439,8 @@ void Server::set_keyboard_focus(Surface* s) {
   if (!s) return;
   Client* c = client_of(s->client);
   if (!c) return;
+  if (sel_sent_client_ != c->number) send_selection(*c);      // (a client that gets the keyboard is offered the selection)
+  if (psel_sent_client_ != c->number) send_primary_selection(*c);      // (and the primary selection)
   List<uint32_t> keyboards(allocator_);
   ObjectCursor cursor;
   for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
@@ -509,6 +561,7 @@ void Server::pointer_request(Client& c, uint32_t id, Resource& r, uint16_t opcod
   if (!pointer_focus_ || pointer_focus_->client != c.number) return;      // (only the client the pointer is over sets it)
   cursor_set_ = true;
   cursor_surface_ = s;
+  cursor_shape_ = 0;
   cursor_hot_x_ = max32(-256, min32(hx, 256));
   cursor_hot_y_ = max32(-256, min32(hy, 256));
   ++cursor_handle_;

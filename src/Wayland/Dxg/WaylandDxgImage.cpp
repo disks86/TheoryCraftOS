@@ -25,6 +25,7 @@ namespace wayland {
 namespace {
 
 namespace status = dxgk::status;
+uint64_t g_in_place = 0, g_from_cpu = 0;      // (atomic: the desktop and tests draw from several threads)
 
 // The words of a locked image, for graphics::Surface. Safe: the view is the allocation's own backing (page-aligned memory of the video memory manager, checked
 // below), its rows are whole pixels (the pitch is width * 4 for the formats exported), and it stays valid until end_read_export, which the caller does after
@@ -36,7 +37,10 @@ ArrayView<uint32_t> pixel_words(ByteView bytes) {
 
 class DxgImage final : public GpuImage {
  public:
-  DxgImage(dxgk::Kernel& kernel, SharedPointer<dxgk::ExportedAllocation> exported) : kernel_(kernel), exported_(util::move(exported)), info_(dxgk::export_info(*exported_)) {}
+  DxgImage(dxgk::Kernel& kernel, SharedPointer<process::OpenObject> object)
+      : kernel_(kernel), object_(util::move(object)), exported_(object_->gpu_buffer->exported()), info_(dxgk::export_info(*exported_)) {}
+
+  bool committed() override { return object_->gpu_buffer->flush_cpu_writes(); }
 
   uint32_t width() const override { return info_.desc.width; }
   uint32_t height() const override { return info_.desc.height; }
@@ -48,7 +52,10 @@ class DxgImage final : public GpuImage {
       if (kernel_.acquire_export_image(*exported_, &lent) == status::kSuccess) {
         const bool shown = renderer.draw_device_image(*lent.device, *lent.image, source, x, y);
         kernel_.release_export_image(*exported_);
-        if (shown) return true;
+        if (shown) {
+          __atomic_add_fetch(&g_in_place, 1, __ATOMIC_RELAXED);
+          return true;
+        }
         refused_ = &renderer;      // (another device, or a CPU renderer: it will not take it next time either)
       }
     }
@@ -61,7 +68,7 @@ class DxgImage final : public GpuImage {
     picture.pitch = info_.pitch / 4;
     picture.format = dxgk::is_rgba_order(info_.desc.format) ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
     const bool ok = picture.pixels.size() >= uint64_t{picture.pitch} * picture.height;
-    if (ok) renderer.draw_image(picture, source, x, y);
+    if (ok) renderer.draw_image(picture, source, x, y), __atomic_add_fetch(&g_from_cpu, 1, __ATOMIC_RELAXED);
     kernel_.end_read_export(*exported_);
     return ok;
   }
@@ -89,16 +96,39 @@ class DxgImage final : public GpuImage {
 
  private:
   dxgk::Kernel& kernel_;
+  SharedPointer<process::OpenObject> object_;      // the descriptor (its DxgBufferFile has the CPU's copy, if it was mapped)
   SharedPointer<dxgk::ExportedAllocation> exported_;
   const dxgk::ExportInfo info_;
   const graphics::IRenderer2D* refused_ = nullptr;
 };
 
+class DxgTimeline final : public GpuTimeline {
+ public:
+  explicit DxgTimeline(SharedPointer<process::OpenObject> object) : object_(util::move(object)) {}
+  uint64_t value() override { return dxgk::exported_sync_value(*object_->gpu_sync->exported()); }
+  void signal(uint64_t point) override { dxgk::signal_exported_sync(*object_->gpu_sync->exported(), point); }
+
+ private:
+  SharedPointer<process::OpenObject> object_;      // (its DxgSyncFile holds the fence's export)
+};
+
 }  // namespace
 
-SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, process::OpenObject& object) {
-  if (!kernel || !object.gpu_buffer || !object.gpu_buffer->exported()) return SharedPointer<GpuImage>();
-  return SharedPointer<GpuImage>::make_as<DxgImage>(allocator, *static_cast<dxgk::Kernel*>(kernel), object.gpu_buffer->exported());
+DxgImageDraws dxg_image_draws() {
+  DxgImageDraws d;
+  d.in_place = __atomic_load_n(&g_in_place, __ATOMIC_RELAXED);
+  d.from_cpu = __atomic_load_n(&g_from_cpu, __ATOMIC_RELAXED);
+  return d;
+}
+
+SharedPointer<GpuTimeline> make_dxg_timeline(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
+  if (!kernel || !object || !object->gpu_sync || !object->gpu_sync->exported()) return SharedPointer<GpuTimeline>();
+  return SharedPointer<GpuTimeline>::make_as<DxgTimeline>(allocator, object);
+}
+
+SharedPointer<GpuImage> make_dxg_image(void* kernel, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object) {
+  if (!kernel || !object || !object->gpu_buffer || !object->gpu_buffer->exported()) return SharedPointer<GpuImage>();
+  return SharedPointer<GpuImage>::make_as<DxgImage>(allocator, *static_cast<dxgk::Kernel*>(kernel), object);
 }
 
 }  // namespace wayland

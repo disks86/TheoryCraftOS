@@ -41,7 +41,9 @@ static_assert(TCOS_DXG_CLOSE_ADAPTER == uint32_t(N::NtGdiDdDDICloseAdapter) && T
               TCOS_DXG_GET_DISPLAY_MODE_LIST == uint32_t(N::NtGdiDdDDIGetDisplayModeList) && TCOS_DXG_LOCK == uint32_t(N::NtGdiDdDDILock) &&
               TCOS_DXG_OPEN_ADAPTER_FROM_LUID == uint32_t(N::NtGdiDdDDIOpenAdapterFromLuid) && TCOS_DXG_PRESENT == uint32_t(N::NtGdiDdDDIPresent) &&
               TCOS_DXG_QUERY_ADAPTER_INFO == uint32_t(N::NtGdiDdDDIQueryAdapterInfo) && TCOS_DXG_RENDER == uint32_t(N::NtGdiDdDDIRender) &&
-              TCOS_DXG_UNLOCK == uint32_t(N::NtGdiDdDDIUnlock),
+              TCOS_DXG_UNLOCK == uint32_t(N::NtGdiDdDDIUnlock) && TCOS_DXG_CREATE_SYNCHRONIZATION_OBJECT2 == uint32_t(N::NtGdiDdDDICreateSynchronizationObject2) &&
+              TCOS_DXG_SIGNAL_SYNCHRONIZATION_OBJECT_FROM_CPU == uint32_t(N::NtGdiDdDDISignalSynchronizationObjectFromCpu) &&
+              TCOS_DXG_WAIT_FOR_SYNCHRONIZATION_OBJECT_FROM_CPU == uint32_t(N::NtGdiDdDDIWaitForSynchronizationObjectFromCpu),
               "DxgDevice.h's service numbers are the NtGdiDdDDI* system call numbers");
 
 // /dev/dxg (LinuxFiles.cpp): a D3DKMT service called by a Linux process. It runs as the system call of a Windows process would: the thunks take their one argument (the
@@ -113,6 +115,56 @@ bool linux_import(Process& process, uint32_t device, const dxgk::ExportedAllocat
   return true;
 }
 
+// The same for fences (TCOS_DXG_IOCTL_EXPORT_SYNC / IMPORT_SYNC): recorded as the sync objects the process creates.
+bool linux_export_sync(Process& process, uint32_t sync, SharedPointer<dxgk::ExportedSync>* out, uint32_t* status) {
+  SyscallRequest request;
+  request.number = uint32_t(N::NtGdiDdDDICreateSynchronizationObject2);
+  Call call(process, request);
+  Session s(call);
+  if (!s.ok()) {
+    *status = s.failure();
+    return true;
+  }
+  kernel::ScopedMutex g(s.state().lock);
+  if (!s.state().find_sync(sync)) {
+    *status = dxgk::status::kInvalidHandle;
+    return true;
+  }
+  *status = s.kernel().export_sync(s.pid(), sync, out);
+  return true;
+}
+
+bool linux_import_sync(Process& process, uint32_t device, const dxgk::ExportedSync& exported, uint32_t* sync, uint32_t* status) {
+  SyscallRequest request;
+  request.number = uint32_t(N::NtGdiDdDDICreateSynchronizationObject2);
+  Call call(process, request);
+  Session s(call);
+  if (!s.ok()) {
+    *status = s.failure();
+    return true;
+  }
+  kernel::ScopedMutex g(s.state().lock);
+  ProcessState& ps = s.state();
+  if (!ps.find_device(device)) {
+    *status = dxgk::status::kInvalidHandle;
+    return true;
+  }
+  dxgk::Handle handle = 0;
+  *status = s.kernel().import_sync(s.pid(), device, exported, &handle);
+  if (*status != dxgk::status::kSuccess) return true;
+  SyncRecord rec;
+  rec.handle = handle;
+  rec.device = device;
+  rec.type = dxgk::SyncType::Fence;
+  if (!ps.syncs.push_back(rec)) {
+    s.kernel().destroy_sync(s.pid(), handle);
+    *status = dxgk::status::kNoMemory;
+    return true;
+  }
+  *sync = handle;
+  return true;
+}
+
 }  // namespace
 
 void register_service(WindowsSyscallNumber number, Handler handler) {
@@ -136,6 +188,8 @@ void install_dxg() {
   register_process_exit_hook(dxg::process_exited);
   linuxabi::set_dxg_service_handler(&dxg::linux_service);
   linuxabi::set_dxg_buffer_handlers(&dxg::linux_export, &dxg::linux_import);
+  linuxabi::set_dxg_sync_handlers(&dxg::linux_export_sync, &dxg::linux_import_sync);
+  set_dxg_buffer_copier(&dxgk::copy_export);      // (mmap of a dmabuf: the CPU's copy, DxgBufferFile.hpp)
 }
 
 }  // namespace process::win32k

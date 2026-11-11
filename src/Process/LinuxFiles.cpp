@@ -150,6 +150,7 @@ constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000, kSIfSo
 struct Meta {
   uint32_t mode = 0;
   uint64_t size = 0, ino = 0, modified = 0, created = 0;
+  uint64_t rdev = 0;      // a device node's number (st_rdev)
 };
 
 Meta meta_of(const DirectoryEntry& e, StringView path) {
@@ -177,6 +178,7 @@ uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) 
   put(out, 8, m.ino, 8);
   put(out, x86 ? 16 : 20, 1, x86 ? 8 : 4);                  // st_nlink
   put(out, x86 ? 24 : 16, m.mode, 4);
+  put(out, x86 ? 40 : 32, m.rdev, 8);                      // st_rdev
   put(out, 48, m.size, 8);
   put(out, 56, 4096, x86 ? 8 : 4);                          // st_blksize
   put(out, 64, (m.size + 511) / 512, 8);                    // st_blocks
@@ -203,13 +205,16 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
     case DescriptorKind::Null: *m = device_meta(kSIfChr | 0666, 3); return 0;
     case DescriptorKind::Zero: *m = device_meta(kSIfChr | 0666, 5); return 0;
     case DescriptorKind::Random: *m = device_meta(kSIfChr | 0666, 9); return 0;
-    case DescriptorKind::Dxg: *m = device_meta(kSIfChr | 0666, 10); return 0;      // (a character device without a file object, like the others)
+    case DescriptorKind::Dxg:      // (a character device without a file object, like the others; its number is the one Wayland's dmabuf feedback names)
+      *m = device_meta(kSIfChr | 0666, 10);
+      m->rdev = TCOS_DXG_DEVICE_NUMBER;
+      return 0;
     case DescriptorKind::UnixSocket: *m = device_meta(kSIfSock | 0777, p.files().token(fd)); return 0;
     default: break;
   }
   OpenObject* object = p.files().object(fd);
   DirectoryEntry entry;
-  if (object->memory || object->gpu_buffer) {      // (a file in memory or a GPU image has no path to look at: a regular file of its size)
+  if (object->memory || object->gpu_buffer || object->gpu_sync) {      // (a file in memory, a GPU image or a fence has no path to look at: a regular file of its size)
     entry.size = object->file->size();
     *m = meta_of(entry, object->path.view());
     return 0;
@@ -747,6 +752,8 @@ namespace {
 DxgServiceHandler g_dxg_handler = nullptr;      // set once at boot, before any process runs (install_dxg)
 DxgExportHandler g_dxg_export = nullptr;
 DxgImportHandler g_dxg_import = nullptr;
+DxgExportSyncHandler g_dxg_export_sync = nullptr;
+DxgImportSyncHandler g_dxg_import_sync = nullptr;
 
 void put_le32(uint8_t* at, uint32_t v) {
   for (int i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
@@ -771,7 +778,7 @@ uint64_t dxg_export(Process& p, uint64_t argument) {
     ObjectManager* objects = system_objects();
     allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
     SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
-    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, util::move(exported), bytes);
+    UniquePointer<DxgBufferFile> file = UniquePointer<DxgBufferFile>::make(allocator, allocator, util::move(exported), bytes);
     if (!object || !file || !object->path.append("/dmabuf:dxg")) return error(kEnomem);
     object->gpu_buffer = file.get();
     object->file = util::move(file);
@@ -810,9 +817,82 @@ uint64_t dxg_import(Process& p, uint64_t argument) {
   put_le32(out + 20, imported.pitch);
   return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
 }
+// TCOS_DXG_IOCTL_EXPORT_SYNC: a descriptor (a File-kind object whose file is a DxgSyncFile) for a fence's export.
+uint64_t dxg_export_sync(Process& p, uint64_t argument) {
+  uint8_t raw[16];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t sync = reader.le32(), flags = reader.le32();
+  if (flags & ~uint32_t(TCOS_DXG_EXPORT_CLOEXEC)) return error(kEinval);
+  if (!g_dxg_export_sync) return error(kEnodev);
+  SharedPointer<dxgk::ExportedSync> exported;
+  uint32_t status = 0;
+  if (!g_dxg_export_sync(p, sync, &exported, &status)) return error(kEnodev);
+  int64_t fd = -1;
+  if (exported) {
+    ProcessFiles& files = p.files();
+    ObjectManager* objects = system_objects();
+    allocators::IAllocator& allocator = objects && objects->allocator() ? *objects->allocator() : files.allocator();
+    SharedPointer<OpenObject> object = SharedPointer<OpenObject>::make(allocator, allocator);
+    UniquePointer<DxgSyncFile> file = UniquePointer<DxgSyncFile>::make(allocator, util::move(exported));
+    if (!object || !file || !object->path.append("/syncobj:dxg")) return error(kEnomem);
+    object->gpu_sync = file.get();
+    object->file = util::move(file);
+    object->readable = true;
+    fd = files.install(DescriptorKind::File, object, 0);
+    if (fd < 0) return error(kEmfile);
+    files.set_close_on_exec(uint64_t(fd), (flags & TCOS_DXG_EXPORT_CLOEXEC) != 0);
+  }
+  uint8_t out[8];
+  put_le32(out, uint32_t(int32_t(fd)));
+  put_le32(out + 4, status);
+  if (p.write_user(argument + 8, ConstByteView(out, sizeof(out)))) return 0;
+  if (fd >= 0) p.files().close(uint64_t(fd));
+  return error(kEfault);
+}
+
+// TCOS_DXG_IOCTL_IMPORT_SYNC: a sync object handle of the process for a fence's descriptor.
+uint64_t dxg_import_sync(Process& p, uint64_t argument) {
+  uint8_t raw[16];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint32_t fd = reader.le32(), device = reader.le32();
+  if (p.descriptor(fd) != DescriptorKind::File) return error(kEbadf);
+  SharedPointer<OpenObject> object = p.files().shared_object(fd);
+  if (!object || !object->gpu_sync || !object->gpu_sync->exported()) return error(kEbadf);
+  if (!g_dxg_import_sync) return error(kEnodev);
+  uint32_t sync = 0, status = 0;
+  if (!g_dxg_import_sync(p, device, *object->gpu_sync->exported(), &sync, &status)) return error(kEnodev);
+  uint8_t out[8];
+  put_le32(out, sync);
+  put_le32(out + 4, status);
+  return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+}
+
+// DMA_BUF_IOCTL_SYNC (_IOW('b', 0, struct dma_buf_sync { u64 flags })) on a GPU image's descriptor: moves the picture between the image and the CPU's copy that
+// mmap maps (DxgBufferFile.hpp). EAGAIN while the GPU still works on the image. Anything else on a file is ENOTTY.
+uint64_t dmabuf_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
+  constexpr uint32_t kDmaBufIoctlSync = 0x40086200u;
+  constexpr int64_t kEagain = 11;
+  SharedPointer<OpenObject> object = p.files().shared_object(fd);
+  if (!object || !object->gpu_buffer || uint32_t(request) != kDmaBufIoctlSync) return error(kEnotty);
+  uint8_t raw[8];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  switch (object->gpu_buffer->sync(reader.le64())) {
+    case DxgBufferFile::SyncResult::Ok: return 0;
+    case DxgBufferFile::SyncResult::Busy: return error(kEagain);
+    case DxgBufferFile::SyncResult::NoCopier: return error(kEnodev);
+    default: return error(kEinval);
+  }
+}
 }  // namespace
 
 void set_dxg_service_handler(DxgServiceHandler handler) { g_dxg_handler = handler; }
+void set_dxg_sync_handlers(DxgExportSyncHandler export_handler, DxgImportSyncHandler import_handler) {
+  g_dxg_export_sync = export_handler;
+  g_dxg_import_sync = import_handler;
+}
 void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler) {
   g_dxg_export = export_handler;
   g_dxg_import = import_handler;
@@ -824,10 +904,13 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
   if (kind == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
+  if (kind == DescriptorKind::File) return dmabuf_ioctl(p, fd, request, argument);
   if (kind != DescriptorKind::Dxg) return error(kEnotty);
   const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)
   if (code == TCOS_DXG_IOCTL_EXPORT) return dxg_export(p, argument);
   if (code == TCOS_DXG_IOCTL_IMPORT) return dxg_import(p, argument);
+  if (code == TCOS_DXG_IOCTL_EXPORT_SYNC) return dxg_export_sync(p, argument);
+  if (code == TCOS_DXG_IOCTL_IMPORT_SYNC) return dxg_import_sync(p, argument);
   if (code != TCOS_DXG_IOCTL_CALL) return error(kEnotty);
   // TcosDxgCall: service (4), status (4), params (8)
   uint8_t raw[16];

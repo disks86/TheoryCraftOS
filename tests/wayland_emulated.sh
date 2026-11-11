@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-waylandemu
 mkdir -p "$work/obj"
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/Wayland/*.cpp src/Math/FloatMath.cpp src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
+         src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp tests/KernelStubs.cpp src/Wayland/*.cpp src/Math/FloatMath.cpp src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
          src/Hardware/GraphicsProcessingUnit/Font8x16.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_WAYLAND"
 objs=()
@@ -45,6 +45,7 @@ for t in "${targets[@]}"; do
   grep -q 'framed window "Linux Wayland" pixel ffaa5500' "$out" || { echo "the window did not reach the desktop with its last picture"; fail=1; }
   grep -q ", 0 failed" "$out" || fail=1
   grep -q "faulted=0" "$out" || fail=1
+  grep -q 'wayland-desktop: clipboard "copied by the Linux program"' "$out" || { echo "the desktop's clipboard did not get the program's selection"; fail=1; }
 done
 [ $fail -eq 0 ] && echo "wayland emulated: all passed" || echo "wayland emulated: FAILED"
 exit $fail

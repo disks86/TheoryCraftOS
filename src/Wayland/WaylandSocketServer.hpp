@@ -50,8 +50,10 @@ class SocketServer {
   SocketServer& operator=(const SocketServer&) = delete;
 
   // Makes GPU images of the dmabufs clients pass (null: none; zwp_linux_dmabuf_v1 is offered while there is a maker). Set before start().
-  using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, process::OpenObject& object);
-  void set_gpu_images(MakeGpuImage make, void* context);
+  // The same makes timelines of the fences they pass (sync objects: wp_linux_drm_syncobj_v1).
+  using MakeGpuImage = SharedPointer<GpuImage> (*)(void* context, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
+  using MakeGpuTimeline = SharedPointer<GpuTimeline> (*)(void* context, allocators::IAllocator& allocator, const SharedPointer<process::OpenObject>& object);
+  void set_gpu_images(MakeGpuImage make, MakeGpuTimeline make_timeline, void* context);
   // Binds the socket file (made afresh in `files`, the system's file system, where /Linux/run is). False when it could not be bound.
   bool listen(filesystem::IFileSystem& files);
   // One round: new connections, what came, what is owed. True when anything moved (call again before waiting).
@@ -62,8 +64,28 @@ class SocketServer {
   bool start();
   void stop();
   uint32_t connections() const { return static_cast<uint32_t>(connections_.count()); }
+  static constexpr uint64_t kMaxPipeRead = 16u << 20;      // what is read of a client's selection for the desktop's clipboard
+
+  struct Graveyard;      // (descriptors the server let go of, released by the transport: WaylandSocketServer.cpp)
 
  private:
+  // The server's TransportRequests being carried out: a pipe read until the client closes its end, bytes written into a client's pipe.
+  struct ReadJob {
+    explicit ReadJob(allocators::IAllocator& allocator) : data(allocator) {}
+    uint32_t job = 0, socket = 0;
+    ByteBuffer data;
+    bool done = false;
+  };
+  struct WriteJob {
+    uint32_t socket = 0;
+    SharedPointer<ByteBuffer> data;
+    uint64_t sent = 0;
+    bool done = false;
+  };
+  void drain_graveyard();
+  bool take_requests();
+  bool progress_jobs_locked();
+  bool finish_jobs();
   struct Connection {
     explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), fds(allocator), pending(allocator), pending_rights(allocator) {}
     uint32_t socket = 0, client = 0;
@@ -89,7 +111,11 @@ class SocketServer {
   List<UniquePointer<Connection>> connections_;
   ByteBuffer chunk_;
   bool woken_ = false;      // (under the system lock)
+  SharedPointer<Graveyard> graveyard_;
+  List<UniquePointer<ReadJob>> reads_;
+  List<UniquePointer<WriteJob>> writes_;
   MakeGpuImage make_gpu_ = nullptr;
+  MakeGpuTimeline make_timeline_ = nullptr;
   void* make_gpu_context_ = nullptr;
   volatile bool stopping_ = false;
   kernel::Thread* thread_ = nullptr;

@@ -103,6 +103,20 @@ struct ExportInfo {
   uint32_t adapter = 0;    // the adapter's number
 };
 const ExportInfo& export_info(const ExportedAllocation& exported);
+// Copies the image of an export to `bytes`, or `bytes` to it (`to_image`): the first bytes of its memory (rows `pitch` apart), as many as both have. The work
+// queued on it is done first; false while some waits for a fence, or when the image cannot be read. (The CPU's copy of a mapped dmabuf, Process/DxgBufferFile.hpp:
+// what process::set_dxg_buffer_copier is given.)
+bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+
+// A fence handed out of its process as a descriptor (a Linux DRM sync object's timeline: /dev/dxg's TCOS_DXG_IOCTL_EXPORT_SYNC, what a Wayland client passes in
+// wp_linux_drm_syncobj_manager_v1.import_timeline). It holds the fence on its own, any process can import it, and the kernel can read and raise its value
+// (a compositor waits for an acquire point and signals a release point). Only fences (their value never goes down). The same lifetime rules as an
+// ExportedAllocation: gone before the kernel, never dropped by someone holding the kernel's lock.
+class ExportedSync;
+// The fence's value now.
+uint64_t exported_sync_value(ExportedSync& exported);
+// Raises the fence to `point` (nothing when it is there already) and lets the work and waits that were held for it go on.
+void signal_exported_sync(ExportedSync& exported, uint64_t point);
 
 class Kernel {
  public:
@@ -161,6 +175,9 @@ class Kernel {
   // The kernel reading an export (no process, no handle): the CPU's read-only view of it, valid until end_read_export (the work queued on it done first:
   // kGraphicsAllocationBusy while some waits for a fence), or the device's own image to sample in place, as acquire_image lends it (it must be a render target
   // and a texture, and not locked by the CPU meanwhile: kInvalidDeviceState). Both may be taken more than once; each is given back once.
+  // An export of a fence of the process (kNotSupported for a semaphore), and a handle of the process on `device` for one.
+  NtStatus export_sync(ProcessId pid, Handle sync, SharedPointer<ExportedSync>* out);
+  NtStatus import_sync(ProcessId pid, Handle device, const ExportedSync& exported, Handle* sync);
   NtStatus read_export(ExportedAllocation& exported, LockResult* out);
   NtStatus end_read_export(ExportedAllocation& exported);
   NtStatus acquire_export_image(ExportedAllocation& exported, AcquiredImage* out);
@@ -219,6 +236,10 @@ class Kernel {
 
  private:
   friend class ExportedAllocation;
+  friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+  friend class ExportedSync;
+  friend uint64_t exported_sync_value(ExportedSync& exported);
+  friend void signal_exported_sync(ExportedSync& exported, uint64_t point);
   struct Process;
   struct ShareToken;
   Adapter* adapter_of_locked(const Allocation& a);

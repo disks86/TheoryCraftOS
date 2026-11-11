@@ -25,28 +25,55 @@ namespace wayland {
 using process::UnixName;
 using process::UnixStatus;
 
+// Descriptors the server let go of that hold a use of a token (a pipe's or a socket's end): released by the transport's thread, never under the server's lock
+// (releasing a socket takes the system lock, which is never taken inside the server's). After the transport is gone they are released at once.
+struct SocketServer::Graveyard {
+  explicit Graveyard(allocators::IAllocator& allocator) : dropped(allocator) {}
+  kernel::Mutex lock;
+  Queue<process::UnixInFlight> dropped;
+  bool closed = false;
+};
+
 namespace {
 
-// A descriptor as the server holds it: the open object a client passed (or one made here), and the block of its memory the server reads (kept, so the
-// view map() gave stays valid even if the client grows the file meanwhile).
+// A descriptor as the server holds it: what a client passed (or one made here) - the open object and the use of its token, so that it can be passed on to
+// another client as it is - and the block of its memory the server reads (kept, so the view map() gave stays valid even if the client grows the file
+// meanwhile).
 class KernelFd final : public Memory {
  public:
-  explicit KernelFd(SharedPointer<process::OpenObject> object, SharedPointer<GpuImage> image = SharedPointer<GpuImage>())
-      : object_(util::move(object)), image_(util::move(image)) {}
+  KernelFd(SharedPointer<SocketServer::Graveyard> graveyard, process::UnixInFlight entry, SharedPointer<GpuImage> image = SharedPointer<GpuImage>(),
+           SharedPointer<GpuTimeline> timeline = SharedPointer<GpuTimeline>())
+      : graveyard_(util::move(graveyard)), entry_(util::move(entry)), image_(util::move(image)), timeline_(util::move(timeline)) {}
+  ~KernelFd() {
+    if (entry_.token == 0 || !graveyard_) return;
+    bool now = false;
+    {
+      kernel::ScopedMutex hold(graveyard_->lock);
+      now = graveyard_->closed || !graveyard_->dropped.enqueue(util::move(entry_));
+    }
+    if (now && entry_.token != 0) process::descriptor_token_release(entry_.kind, entry_.token);
+  }
+  KernelFd(const KernelFd&) = delete;
+  KernelFd& operator=(const KernelFd&) = delete;
+  const process::UnixInFlight& entry() const { return entry_; }
+  const SharedPointer<process::OpenObject>& object() const { return object_ref(); }
   GpuImage* gpu() override { return image_.get(); }
+  GpuTimeline* timeline() override { return timeline_.get(); }
   ByteView map(uint64_t size) override {
-    if (!object_ || !object_->memory) return ByteView();
+    if (!entry_.object || !entry_.object->memory) return ByteView();
     uint64_t file_size = 0;
-    process::BlockRef block = object_->memory->block(&file_size);
+    process::BlockRef block = entry_.object->memory->block(&file_size);
     if (!block || block.get()->capacity() < size) return ByteView();
     block_ = util::move(block);
     return block_.get()->bytes();
   }
-  const SharedPointer<process::OpenObject>& object() const { return object_; }
 
  private:
-  SharedPointer<process::OpenObject> object_;
+  const SharedPointer<process::OpenObject>& object_ref() const { return entry_.object; }
+  SharedPointer<SocketServer::Graveyard> graveyard_;
+  process::UnixInFlight entry_;
   SharedPointer<GpuImage> image_;      // a GPU image (a dmabuf), made by the transport's maker
+  SharedPointer<GpuTimeline> timeline_;      // a fence (a sync object's timeline), the same
   process::BlockRef block_;
 };
 
@@ -56,8 +83,9 @@ const KernelFd& kernel_fd(const Fd& fd) { return static_cast<const KernelFd&>(*f
 }  // namespace
 
 SocketServer::SocketServer(Server& server, process::UnixSocketManager& sockets, allocators::IAllocator& allocator)
-    : server_(server), sockets_(sockets), allocator_(allocator), connections_(allocator), chunk_(allocator) {
+    : server_(server), sockets_(sockets), allocator_(allocator), connections_(allocator), chunk_(allocator), reads_(allocator), writes_(allocator) {
   chunk_.put_zeros(kReadChunk);
+  graveyard_ = SharedPointer<Graveyard>::make(allocator_, allocator_);
   server_.set_wake(&SocketServer::on_wake, this);
   server_.set_fd_maker(&SocketServer::make_fd, this);
 }
@@ -70,6 +98,134 @@ SocketServer::~SocketServer() {
   connections_.clear();
   if (listening_) sockets_.release(listener_);
   listening_ = false;
+  for (UniquePointer<ReadJob>& r : reads_.view()) sockets_.release(r->socket);
+  for (UniquePointer<WriteJob>& w : writes_.view()) sockets_.release(w->socket);
+  reads_.clear();
+  writes_.clear();
+  if (graveyard_) {      // (from now on what the server lets go of is released at once)
+    {
+      kernel::ScopedMutex hold(graveyard_->lock);
+      graveyard_->closed = true;
+    }
+    drain_graveyard();
+  }
+}
+
+void SocketServer::drain_graveyard() {
+  if (!graveyard_) return;
+  Queue<process::UnixInFlight> dropped(allocator_);
+  {
+    kernel::ScopedMutex hold(graveyard_->lock);
+    process::UnixInFlight e;
+    while (graveyard_->dropped.dequeue(&e)) dropped.enqueue(util::move(e));
+  }
+  sockets_.release_rights(dropped);
+}
+
+// The server's requests (outside every lock): a pipe made (its write end to the server, which hands it to the client; the read end read here), or a write
+// into a client's pipe end queued.
+bool SocketServer::take_requests() {
+  List<TransportRequest> requests(allocator_);
+  server_.take_requests(&requests);
+  for (TransportRequest& r : requests.view()) {
+    if (r.kind == TransportRequest::Kind::MakePipe) {
+      uint32_t a = 0, b = 0;
+      UniquePointer<ReadJob> job = UniquePointer<ReadJob>::make(allocator_, allocator_);
+      if (!job || sockets_.create_pair(process::UnixType::Stream, 0, &a, &b) != UnixStatus::Ok) {
+        server_.pipe_read_done(r.job, ConstByteView());
+        continue;
+      }
+      {
+        process::ISystemSync& sync = sockets_.sync();
+        sync.lock();
+        sockets_.shutdown_locked(a, false, true);
+        sockets_.shutdown_locked(b, true, false);
+        sync.unlock();
+      }
+      job->job = r.job;
+      job->socket = a;
+      process::UnixInFlight end;
+      end.kind = process::DescriptorKind::UnixSocket;
+      end.token = b;      // (the use create_pair gave it: the descriptor's now)
+      Fd fd = Fd::make_as<KernelFd>(allocator_, graveyard_, util::move(end));
+      if (!fd || !reads_.push_back(util::move(job))) {
+        sockets_.release(a);
+        if (!fd) sockets_.release(b);
+        server_.pipe_read_done(r.job, ConstByteView());
+        continue;
+      }
+      server_.pipe_ready(r.job, util::move(fd));
+    } else if (r.fd && r.data) {
+      const process::UnixInFlight& e = kernel_fd(r.fd).entry();
+      if (e.kind != process::DescriptorKind::UnixSocket || e.token == 0) continue;      // (only a pipe's or a socket's end can be written here)
+      UniquePointer<WriteJob> job = UniquePointer<WriteJob>::make(allocator_);
+      if (!job) continue;
+      sockets_.add_ref(uint32_t(e.token));
+      job->socket = uint32_t(e.token);
+      job->data = r.data;
+      if (!writes_.push_back(util::move(job))) sockets_.release(uint32_t(e.token));
+    }
+  }
+  return requests.count() != 0;
+}
+
+// Reads and writes what the sockets take now (the system lock held).
+bool SocketServer::progress_jobs_locked() {
+  bool moved = false;
+  for (UniquePointer<ReadJob>& r : reads_.view()) {
+    while (!r->done) {
+      process::UnixSocketManager::Received got;
+      Queue<process::UnixInFlight> rights(allocator_);
+      const UnixStatus st = sockets_.receive_locked(r->socket, chunk_.writable_view(), false, &got, &rights);
+      process::UnixInFlight e;
+      while (rights.dequeue(&e)) graveyard_->dropped.enqueue(util::move(e));      // (nothing should come with the data: let go later)
+      if (st == UnixStatus::WouldBlock) break;
+      moved = true;
+      if (st != UnixStatus::Ok || got.end_of_file || got.got == 0) {
+        r->done = true;
+        break;
+      }
+      const uint64_t room = kMaxPipeRead - r->data.size();
+      if (!r->data.append(chunk_.view().first(got.got < room ? got.got : room)) || got.got >= room) r->done = true;
+    }
+  }
+  for (UniquePointer<WriteJob>& w : writes_.view()) {
+    while (!w->done && w->sent < w->data->size()) {
+      uint32_t sent = 0;
+      const UnixStatus st = sockets_.send_locked(w->socket, w->data->view().subview(w->sent), nullptr, 0, nullptr, &sent);
+      if (st == UnixStatus::WouldBlock) break;
+      moved = true;
+      if (st != UnixStatus::Ok || sent == 0) w->done = true;
+      w->sent += sent;
+    }
+    if (w->sent >= w->data->size()) w->done = true;
+  }
+  return moved;
+}
+
+// The jobs that ended: what was read goes to the server; their sockets are let go (a writer's end closing is the reader's end of file).
+bool SocketServer::finish_jobs() {
+  bool moved = false;
+  for (uint64_t i = 0; i < reads_.count();) {
+    if (!reads_[i]->done) {
+      ++i;
+      continue;
+    }
+    server_.pipe_read_done(reads_[i]->job, reads_[i]->data.view());
+    sockets_.release(reads_[i]->socket);
+    reads_.remove_at(i);
+    moved = true;
+  }
+  for (uint64_t i = 0; i < writes_.count();) {
+    if (!writes_[i]->done) {
+      ++i;
+      continue;
+    }
+    sockets_.release(writes_[i]->socket);
+    writes_.remove_at(i);
+    moved = true;
+  }
+  return moved;
 }
 
 void SocketServer::on_wake(void* self) {
@@ -93,11 +249,15 @@ Fd SocketServer::make_fd(void* self, ConstByteView contents) {
   object->memory = file.get();
   object->file = util::move(file);
   object->readable = true;      // (every client maps the same pages, read-only)
-  return Fd::make_as<KernelFd>(s.allocator_, util::move(object));
+  process::UnixInFlight entry;
+  entry.kind = process::DescriptorKind::File;
+  entry.object = util::move(object);
+  return Fd::make_as<KernelFd>(s.allocator_, s.graveyard_, util::move(entry));
 }
 
-void SocketServer::set_gpu_images(MakeGpuImage make, void* context) {
+void SocketServer::set_gpu_images(MakeGpuImage make, MakeGpuTimeline make_timeline, void* context) {
   make_gpu_ = make;
+  make_timeline_ = make_timeline;
   make_gpu_context_ = context;
   server_.set_dmabuf(make != nullptr);
 }
@@ -138,6 +298,8 @@ bool SocketServer::listen(filesystem::IFileSystem& files) {
 }
 
 bool SocketServer::pump() {
+  server_.tick();      // (commits waiting for their acquire point, the desktop's clipboard)
+  drain_graveyard();
   bool moved = false;
   List<uint32_t> accepted(allocator_);
   List<uint64_t> accepted_pids(allocator_);
@@ -192,19 +354,24 @@ bool SocketServer::pump() {
       moved = true;
     }
   }
+  if (graveyard_) {
+    kernel::ScopedMutex hold(graveyard_->lock);      // (progress_jobs_locked may leave descriptors there)
+    moved |= progress_jobs_locked();
+  }
   sync.unlock();
+  moved |= finish_jobs();
   // the descriptors that came: memory files for the server; the others are let go (the server gets a stand-in with no memory)
   {
     process::UnixInFlight entry;
     for (uint64_t i = 0; received.dequeue(&entry); ++i) {
       Connection& c = *owners[i];
-      SharedPointer<process::OpenObject> object;
       SharedPointer<GpuImage> image;
+      SharedPointer<GpuTimeline> timeline;
       const bool file = entry.kind == process::DescriptorKind::File && entry.object;
-      if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, *entry.object);
-      if (file && (entry.object->memory || image)) object = entry.object;
-      else unsent.enqueue(util::move(entry));
-      Fd fd = Fd::make_as<KernelFd>(allocator_, util::move(object), util::move(image));
+      if (file && entry.object->gpu_buffer && make_gpu_) image = make_gpu_(make_gpu_context_, allocator_, entry.object);
+      if (file && entry.object->gpu_sync && make_timeline_) timeline = make_timeline_(make_gpu_context_, allocator_, entry.object);
+      // (every kind is kept as it came, with its use of its token: a pipe's end is passed on to another client as it is)
+      Fd fd = Fd::make_as<KernelFd>(allocator_, graveyard_, util::move(entry), util::move(image), util::move(timeline));
       if (!fd || !c.fds.push_back(util::move(fd))) c.dead = true;
     }
   }
@@ -242,13 +409,14 @@ bool SocketServer::pump() {
     if (server_.take_output(c.client, &c.pending, &fds)) c.closing = true;
     for (const Fd& fd : fds.view()) {
       if (!fd) continue;
-      process::UnixInFlight entry;
-      entry.kind = process::DescriptorKind::File;
-      entry.object = kernel_fd(fd).object();
-      if (!entry.object || !c.pending_rights.enqueue(util::move(entry))) c.closing = true;
+      process::UnixInFlight entry = kernel_fd(fd).entry();      // (a copy goes, with a use of its own)
+      if (entry.kind == process::DescriptorKind::Closed) continue;
+      if (entry.token != 0) process::descriptor_token_add(entry.kind, entry.token);
+      if (!c.pending_rights.enqueue(util::move(entry))) c.closing = true;
     }
     if (c.pending.size() != before) moved = true;
   }
+  moved |= take_requests();
   // the connections that are over: gone, or done and everything sent
   for (uint64_t i = 0; i < connections_.count();) {
     Connection& c = *connections_[i];
@@ -277,6 +445,12 @@ bool SocketServer::ready_locked() {
     if (r.readable || r.error || r.hangup) return true;
     if (p->sent < p->pending.size() && r.writable) return true;
   }
+  for (const UniquePointer<ReadJob>& j : reads_.view()) {
+    const process::UnixReadiness r = sockets_.readiness_locked(j->socket);
+    if (r.readable || r.error || r.hangup || r.read_hangup) return true;
+  }
+  for (const UniquePointer<WriteJob>& j : writes_.view())
+    if (sockets_.readiness_locked(j->socket).writable) return true;
   return false;
 }
 

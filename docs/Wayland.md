@@ -14,6 +14,10 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | HID usage to evdev codes, the xkb keymap | `src/Wayland/WaylandKeymap.cpp` |
 | AF_UNIX listener with SCM_RIGHTS, the compositor's kernel thread | `src/Wayland/WaylandSocketServer.{hpp,cpp}` |
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
+| The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
+| Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
+| Activation, cursor shapes, primary selection, relative pointer and constraints, presentation time, idle inhibit, xdg-foreign, pings | `src/Wayland/WaylandExtras.cpp` |
+| `pipe` / `pipe2` for Linux programs (what clipboard transfers go through) | `src/Process/LinuxSockets.cpp` |
 | GPU images over the kernel's Direct3D layer (kept apart: the rest builds without it) | `src/Wayland/Dxg/WaylandDxgImage.{hpp,cpp}` |
 | dmabufs: `/dev/dxg`'s export and import, the descriptor, the kernel's export object | `src/Process/DxgBufferFile.hpp`, `LinuxFiles.cpp`, `Win32kDxg.cpp`, `Kernel/Dxgkrnl/DxgKernel.{hpp,cpp}` |
 | Files in memory (`memfd_create`), mappable and readable by the kernel | `src/Process/MemoryFile.{hpp,cpp}`, `LinuxFiles.cpp`, `LinuxSyscalls.cpp` |
@@ -28,8 +32,10 @@ through the same input taps. `IWindowsSession::mouse_left` (new; a no-op for the
 not one of its own, so the compositor can send `wl_pointer.leave`.
 
 - **Globals.** `wl_compositor` 6, `wl_subcompositor` 1, `wl_shm` 2, `wl_seat` 8, `wl_output` 4 (the primary monitor), `wl_data_device_manager`
-  3 (objects only, nothing is transferred), `xdg_wm_base` 5, `zxdg_decoration_manager_v1` 1 and `zwp_linux_dmabuf_v1` 3 (while the transport can make GPU
-  images: the kernel sets that up when it has the Direct3D layer).
+  3 (copy and paste, drag and drop), `xdg_wm_base` 6, `zxdg_decoration_manager_v1` 1, `wp_viewporter` 1, `wp_fractional_scale_manager_v1` 1, `xdg_activation_v1` 1, `wp_cursor_shape_manager_v1` 1,
+  `zwp_primary_selection_device_manager_v1` 1, `zwp_relative_pointer_manager_v1` 1, `zwp_pointer_constraints_v1` 1, `wp_presentation` 1,
+  `zwp_idle_inhibit_manager_v1` 1, `zxdg_exporter_v2` 1, `zxdg_importer_v2` 1, `zwp_linux_dmabuf_v1` 4 and `wp_linux_drm_syncobj_manager_v1` 1 (the last two while
+  the transport can make GPU images and timelines: the kernel sets that up when it has the Direct3D layer).
 - **One coordinate space.** The compositor's screen is the desktop's window manager area; its monitors and work areas come from `set_display`.
   The desktop's "surface" rectangle of a window is the client's window geometry (`xdg_surface.set_window_geometry`, else its buffer), so a
   client-side shadow is outside the frame and is neither drawn nor hit.
@@ -59,6 +65,55 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   real modifiers: Shift 1, Lock 2, Control 4, Mod1/Alt 8, Mod2/NumLock 16, Mod4/Super 64. Keys repeat on the client side (`repeat_info` 25/s after
   600 ms), so the desktop's repeated presses of a held key are dropped.
 
+## The other protocols, and pings
+
+- **Activation** (`xdg_activation_v1`): tokens are made by the compositor and spent once; `activate` activates the surface's window as a click would.
+- **Cursor shapes** (`wp_cursor_shape_v1`): the 34 named shapes become the desktop's own cursors (the `OCR_*` shapes it has for Windows programs).
+- **Primary selection** (`zwp_primary_selection_v1`): the middle-button selection between Wayland clients, offered with the keyboard as the
+  clipboard's selection is; pastes go to the source with the client's descriptor. The desktop has no primary selection to bridge it to.
+- **Relative pointer and constraints** (`zwp_relative_pointer_v1`, `zwp_pointer_constraints_v1`): every motion is also sent as it came. A lock keeps the
+  pointer where it is (its hint is where it is put back), a confinement keeps it in the surface (or its region), while the surface has the pointer and
+  its window is active; the desktop then holds the pointer for the program as for a Windows program's `ClipCursor`, and Ctrl+Alt takes it back.
+  One-shot constraints end at their first release; persistent ones come back.
+- **Presentation time** (`wp_presentation`, clock `CLOCK_MONOTONIC`): a commit's feedback is `presented` when the desktop draws the picture (time,
+  60 Hz refresh, a sequence count) or `discarded` when a newer picture replaced it first.
+- **xdg-foreign** (`zxdg_exporter_v2`, `zxdg_importer_v2`): one client's toplevel exported as a handle becomes the parent of another client's
+  toplevel (the desktop shows it as owned); when the exported window goes, the imports hear `destroyed` and the dialogs lose their parent.
+- **Pings and the minimized state.** `xdg_wm_base.ping` goes when the user activates or closes a window; a client that has not answered after five
+  seconds is shown as not responding (its windows' titles end in "(Not Responding)", as on Windows) until it does. `xdg_wm_base` is version 6, so
+  a minimized toplevel is configured `suspended`.
+
+## Scale, transforms, viewports
+
+The desktop has no scale of its own, so the output's scale is 1 (`wl_output.scale`, `wl_surface.preferred_buffer_scale` and `preferred_buffer_transform`
+for version 6 surfaces, `wp_fractional_scale_v1.preferred_scale` 120). What a client asks of its buffer is honoured: `set_buffer_transform` (the eight
+rotations and flips, as Weston maps them), `set_buffer_scale` (1 .. 16; a version 6 surface whose buffer is not a multiple is `invalid_size`) and
+`wp_viewport` (a crop in 24.8 and a destination size, with the protocol's `bad_value`, `bad_size`, `out_of_buffer`, `no_surface`). They decide the
+surface's size (input, the window's size, configure), and the desktop draws the buffer through one affine map (`IRenderer2D::draw_image_transformed`, done
+by a GPU renderer's texture units; a stretch filters bilinearly). A GPU buffer with such a mapping is drawn from the CPU's view; a renderer that cannot
+transform stretches an upright crop and leaves a turned picture undrawn. A surface with a mapping is repainted whole at each commit.
+
+## Copy and paste, drag and drop
+
+- **The selection** is a client's `wl_data_source` or the desktop's clipboard text. The client with the keyboard is offered it (`wl_data_offer` with
+  its types, then `wl_data_device.selection`) when the keyboard comes to it and whenever the selection changes. A paste (`wl_data_offer.receive` with
+  a pipe) is passed on to the source's client as it is (`wl_data_source.send` with the same descriptor), or, for the desktop's text, the transport
+  writes the text into the pipe and closes it.
+- **The desktop's clipboard follows** (`kernel::Clipboard`, `Server::set_clipboard`). A client's selection with text (`text/plain;charset=utf-8`,
+  `text/plain`, `UTF8_STRING`, `STRING`, `TEXT`) is read at once through a pipe the transport makes (`TransportRequest`, up to 16 MiB) and put on
+  the clipboard, so Windows and desktop programs paste it; text the desktop's programs copy becomes the selection (the client's source is
+  cancelled). The clipboard is touched only outside the compositor's lock (its observer keeps the Windows clipboard the same and takes the system's
+  locks): `tick()`, which the transport calls each round, looks at it.
+- **Descriptors pass through.** A descriptor a client sends that the compositor does not read itself (a pipe's end) is kept with its use of its token
+  and sent on unchanged; one the compositor lets go of is released by the transport's thread (`SocketServer::Graveyard`), never under the
+  compositor's lock.
+- **Drag and drop** between Wayland clients: `start_drag` while a button is held takes the pointer; the surface under it is entered with an offer
+  of the source's types, followed and left; version 3's actions are negotiated (the destination's preference, else copy, move, ask) and told to
+  both; a release over a destination that accepted a type drops (`drop`, `dnd_drop_performed`), the destination receives as for a paste and
+  `finish`es (`dnd_finished`); anything else cancels. A drag without a source stays within its client.
+- **Linux pipes.** Linux programs here had no `pipe()`; `pipe` and `pipe2` are now AF_UNIX stream pairs shut one way each (`O_CLOEXEC`,
+  `O_NONBLOCK`), so they pass with `SCM_RIGHTS` like any socket. `fstat` calls them sockets, not FIFOs.
+
 ## GPU buffers (zwp_linux_dmabuf_v1)
 
 A client that renders on the GPU hands the compositor the image it rendered into, not a copy of its pixels. On this system a GPU image becomes a descriptor
@@ -72,6 +127,10 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
   never shows. `create` answers `created` with a `wl_buffer` of the server's ids (from 0xFF000000; no `delete_id` when it goes), or `failed`; `create_immed`
   answers a buffer that cannot be made with `invalid_wl_buffer`. Every other error of the protocol is checked (`already_used`, `plane_idx`, `plane_set`,
   `incomplete`, `invalid_format`, `invalid_dimensions`, `out_of_bounds`).
+- **Feedback (version 4).** `get_default_feedback` and `get_surface_feedback` answer one tranche with the four formats, linear, on the main device
+  `/dev/dxg` (`TCOS_DXG_DEVICE_NUMBER`, the `st_rdev` an `fstat` of `/dev/dxg` gives), and a format table in a sealed file in memory (16-byte entries:
+  format, padding, modifier). Version 4 sends no format or modifier events, as the protocol says. Without a maker of descriptors (the host harness) the
+  global is offered as version 3.
 - **Drawing, with no copy.** When the desktop draws the window (`draw_window`), the device's own image is lent (`dxgk::Kernel::acquire_export_image`: queued
   work on it done first, made resident and pinned while it is drawn) and drawn in place (`IRenderer2D::draw_device_image`) when the desktop's renderer draws on
   that device: the frame never passes through the CPU. On another device or the CPU renderer the picture is drawn from the CPU's view of it (`read_export`: one
@@ -79,6 +138,16 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
   time: the window is marked for a repaint and the desktop comes back for it.
 - **Lifetime.** The descriptor holds a `dxgk::ExportedAllocation`, which holds the allocation: a buffer keeps showing after the client destroyed its image or
   exited, until the buffer is replaced or destroyed. Dropping the last use takes the Direct3D layer's lock, never held by anyone who drops one.
+- **CPU writes.** A client may `mmap` its dmabuf and write it with the CPU (GBM-style clients): the mapping is a copy of the image
+  ([win32k/Dxg.md](win32k/Dxg.md)); at each commit of a buffer made from it the compositor sends the copy to the image, when a writable mapping is still
+  there and a checksum says the copy changed since it was last moved, so a client that renders on the GPU is never overwritten by an old copy.
+- **Explicit sync** (`wp_linux_drm_syncobj_manager_v1`). A timeline is a fence of the Direct3D layer exported with `/dev/dxg`
+  (`TCOS_DXG_IOCTL_EXPORT_SYNC`, [win32k/Dxg.md](win32k/Dxg.md)): the counterpart of a DRM sync object. A commit with a buffer names an acquire point and a
+  release point (both, a dmabuf, the release after the acquire on one timeline: every rule of the protocol is checked). A commit whose acquire point is not
+  reached waits while the surface keeps showing what it showed; it is applied when the point is found reached, at the next request of any client or the next
+  time the desktop draws (which it is asked to do). One commit waits per surface: a newer one replaces it and the older buffer is let go (release point,
+  `wl_buffer.release`). A release point is signalled when another buffer replaces the buffer, the same buffer is committed again, or the surface goes.
+  A synchronized subsurface's commit does not wait for its acquire point.
 - **Release.** As for `wl_shm`: when another buffer replaces it. The desktop reads the image while it draws (under the compositor's lock), so a client that
   re-renders a released image never races the desktop; a client that re-renders the attached image (as `tests/linux/waylandvktest.c` does) may be drawn
   half-way through a frame, as on any compositor that samples a buffer it did not release.
@@ -117,10 +186,19 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | What | How |
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
-| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot` | `tests/wayland_interop.sh` |
-| A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways | `tests/wayland_emulated.sh` |
+| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard) | `tests/wayland_interop.sh` |
+| Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
+| Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
+| Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
+| A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
+
+`tests/linux/waylandvktest.c` has also been run in QEMU on the real kernel (`TCOS_AUTORUN=/Linux/usr/bin/waylandvktest`, argument `stay`), on the
+software renderer (standard VGA) and on virgl (`-device virtio-gpu-gl-pci -display egl-headless`; the screen grabbed over `-vnc unix:...`, since QMP's
+`screendump` has no surface in that mode): 117 checks passed on both, the frame showed in a framed desktop window, and on virgl the kernel's count after
+the run (`autorun: wayland GPU buffer draws in place 33, from the CPU 0`, `wayland::dxg_image_draws`) shows every frame drawn in place by the desktop's GPU
+renderer.
 
 It has also been run in QEMU: the kernel started `tests/linux/waylandtest.c` (`TCOS_AUTORUN=/Linux/usr/bin/waylandtest`, argument `stay`), which
 passed its 30 checks with real page tables behind its memfd mappings; its window showed as an ordinary desktop frame with a taskbar button and the
@@ -129,23 +207,45 @@ picture it drew last.
 `tests/wayland_interop.sh` runs the compositor code on the development machine (`tests/wayland/WaylandHostServer.cpp`), with host descriptors.
 `foot` and GTK 4 (`zenity --info`, with `GSK_RENDERER=cairo`) showed their windows correctly there.
 
+## Plan: what GPU clients still need
+
+Real toolkits reach the GPU through Mesa (EGL, GBM) or the Vulkan loader, and both speak to the compositor through libwayland-client. In the order the work
+depends on itself:
+
+1. **A dynamic loader for Linux programs.** libwayland-client, libvulkan.so.1 and Mesa are shared libraries; the Linux layer runs static ELF only. The
+   loader is the gate for everything below (and for running distribution binaries such as foot or GTK applications inside the OS at all).
+2. **`VK_KHR_wayland_surface` in the shared Vulkan driver** (as `libvulkan.so.1`, or as an ICD of the system's loader). The pieces exist: a swapchain image
+   is an exportable image (`vk_external.inc`), a present is `zwp_linux_buffer_params_v1.create_immed` once per image, then attach / damage / commit, with
+   explicit sync's acquire point after the frame's work and the release point waited for in `vkAcquireNextImageKHR`. What is missing is the call path into
+   libwayland-client (`wl_proxy_marshal_flags`, a private event queue for the swapchain), which needs step 1.
+3. **GBM and EGL.** Mesa needs a GBM backend and an EGL platform over `/dev/dxg` instead of a DRM render node: buffers are `/dev/dxg` exports (made by
+   the Direct3D layer with the formats the feedback lists), and GL rendering would go to the kernel's OpenGL (`src/OpenGl`) or to a Zink-like layer on
+   the shared Vulkan driver. The second reuses more: GL over the Vulkan driver, buffers from step 2's code.
+4. **YUV and several planes** (video players' direct output): the Direct3D layer needs NV12 / P010 formats (with planes at offsets of one allocation), the
+   protocol handling more than plane 0, and the desktop's renderers a YUV-to-RGB draw (a shader on the device renderer, the existing conversion code of
+   `src/Hardware/VideoCodec` on the CPU).
+
 ## Not done
 
-- **GPU buffers.** `zwp_linux_dmabuf_v1` is version 3: no feedback objects (version 4: `get_default_feedback`, the format table, the main device),
-  which newer Mesa and wlroots-based clients prefer but do not need. No `wl_drm`. Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
-  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). No explicit synchronization (`linux-drm-syncobj`, implicit fences): the
-  desktop draws what the image holds when it draws. A dmabuf cannot be mapped or read by the CPU (`mmap`, `DMA_BUF_IOCTL_SYNC`), so GBM-style clients that
-  write their buffers with the CPU cannot use one. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (all need libwayland / the dynamic loader):
+- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
+  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
+  once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
+  was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
+  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (see the plan above):
   a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
-  Not run in QEMU yet (only on the CPU emulator and in the host tests, on the software renderer); not tried on virgl or a real GPU.
-- **Protocols.** No primary selection, `xdg_activation_v1`, `wp_viewporter`, `wp_fractional_scale_v1`, `wp_cursor_shape_v1`, text input,
-  pointer constraints, relative pointer, presentation time, idle inhibit, xdg-foreign, layer shell or tablets. `wl_touch` sends nothing.
-- **Clipboard and drag and drop.** `wl_data_device_manager` makes its objects but transfers nothing, and nothing is bridged to the desktop's
-  clipboard.
-- **Scale and transform.** The output's scale is 1. `set_buffer_scale` and `set_buffer_transform` are checked and then ignored, and buffers are
-  drawn 1:1. There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it.
-- **Window manager.** Minimizing sends no state. `show_window_menu` does nothing. A popup's `reactive` flag and parent size are ignored, and
-  `xdg_wm_base.ping` is never sent.
+  Not tried on a real GPU (only the software renderer and virgl).
+- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
+  panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
+  sessions no tablet or touch input). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
+  desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
+- **Clipboard and drag and drop.** Only text reaches the desktop's clipboard (pictures and other types stay between Wayland clients); the
+  desktop's pictures are not offered. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
+  and Windows or X programs are not bridged. Selection and drag serials are not checked.
+- **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
+  pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
+  mapping is ignored.
+- **Window manager.** `show_window_menu` does nothing (the desktop has no window menu to open). A popup's `reactive` flag and parent size are
+  ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.
 - **Windows programs.** Wayland needs descriptor passing, which Windows' `AF_UNIX` lacks, so only Linux programs are clients.

@@ -30,6 +30,9 @@
 #include <stdint.h>
 
 #define TCOS_DXG_DEVICE_PATH "/dev/dxg"
+/* Its device number (st_rdev, as glibc's makedev(10, 243): a misc character device, as WSL's /dev/dxg is). The Wayland compositor names it as the main device
+ * of its dmabuf feedback (zwp_linux_dmabuf_feedback_v1.main_device), so a client knows which device to make its buffers on. */
+#define TCOS_DXG_DEVICE_NUMBER ((10ull << 8) | 243ull)
 
 typedef struct TcosDxgCall {
   uint32_t service;   /* a TCOS_DXG_* number (the NtGdiDdDDI* system call number of the service) */
@@ -43,7 +46,8 @@ typedef struct TcosDxgCall {
 /* A GPU image as a file descriptor (the counterpart of a Linux dmabuf: what a Wayland client passes in zwp_linux_buffer_params_v1.add). TCOS_DXG_IOCTL_EXPORT
  * makes one for an allocation of the process: a 2D image of one level and one sample in an 8-bit four-channel colour format, made shareable (the allocation flag
  * 1 << 7, kAllocShared). The descriptor holds the image on its own: it stays valid after the allocation is destroyed or the process exits. It can be closed,
- * duplicated, passed with SCM_RIGHTS and measured with lseek(SEEK_END), not read, written or mapped. TCOS_DXG_IOCTL_IMPORT gives the process an allocation
+ * duplicated, passed with SCM_RIGHTS, measured with lseek(SEEK_END) and mapped (a CPU copy of the image, moved with DMA_BUF_IOCTL_SYNC as on Linux), not read or
+ * written. TCOS_DXG_IOCTL_IMPORT gives the process an allocation
  * handle for the image of such a descriptor, on one of its devices (of the same adapter).
  * Both answer 0 when the service ran (its NTSTATUS in `status`; fd / allocation only on success), -EFAULT for an unreadable structure, -EBADF for a descriptor
  * that is not such an image (import), -EMFILE when the table is full (export), -ENODEV without a Direct3D layer. */
@@ -69,6 +73,20 @@ typedef struct TcosDxgImport {
 /* _IOWR('G', 3, TcosDxgImport), 32 bytes */
 #define TCOS_DXG_IOCTL_IMPORT 0xC0204703u
 
+/* A fence (a sync object created as a D3DKMT fence: its value only goes up) as a file descriptor, the counterpart of a Linux DRM sync object's timeline (what a
+ * Wayland client passes in wp_linux_drm_syncobj_manager_v1.import_timeline). TCOS_DXG_IOCTL_EXPORT_SYNC takes a TcosDxgExport whose `allocation` is the sync
+ * object's handle; the descriptor holds the fence on its own. TCOS_DXG_IOCTL_IMPORT_SYNC gives the process a sync object handle on one of its devices for such a
+ * descriptor. The answers are those of the image ioctls above; a semaphore is STATUS_NOT_SUPPORTED. */
+typedef struct TcosDxgImportSync {
+  int32_t fd;          /* the descriptor of the fence */
+  uint32_t device;     /* the device handle to open it on */
+  uint32_t sync;       /* out: the new sync object handle */
+  int32_t status;      /* out: the NTSTATUS */
+} TcosDxgImportSync;
+/* _IOWR('G', 4, TcosDxgExport), _IOWR('G', 5, TcosDxgImportSync): 16 bytes each */
+#define TCOS_DXG_IOCTL_EXPORT_SYNC 0xC0104704u
+#define TCOS_DXG_IOCTL_IMPORT_SYNC 0xC0104705u
+
 /* The services, numbered as the NtGdiDdDDI* system calls (src/Process/WindowsSyscalls.hpp; the kernel checks that the numbers agree). Any D3DKMT service of the kernel may be
  * named by its number; these are the ones the user-mode drivers use. */
 enum {
@@ -76,6 +94,7 @@ enum {
   TCOS_DXG_CREATE_ALLOCATION = 4314,
   TCOS_DXG_CREATE_CONTEXT = 4316,
   TCOS_DXG_CREATE_DEVICE = 4319,
+  TCOS_DXG_CREATE_SYNCHRONIZATION_OBJECT2 = 4329,
   TCOS_DXG_DESTROY_ALLOCATION = 4333,
   TCOS_DXG_DESTROY_CONTEXT = 4334,
   TCOS_DXG_DESTROY_DEVICE = 4336,
@@ -88,7 +107,9 @@ enum {
   TCOS_DXG_PRESENT = 4418,
   TCOS_DXG_QUERY_ADAPTER_INFO = 4423,
   TCOS_DXG_RENDER = 4443,
-  TCOS_DXG_UNLOCK = 4477
+  TCOS_DXG_SIGNAL_SYNCHRONIZATION_OBJECT_FROM_CPU = 4469,
+  TCOS_DXG_UNLOCK = 4477,
+  TCOS_DXG_WAIT_FOR_SYNCHRONIZATION_OBJECT_FROM_CPU = 4485
 };
 
 #endif

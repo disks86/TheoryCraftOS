@@ -66,6 +66,10 @@ constexpr uint32_t kDrmArgb8888 = 0x34325241, kDrmXrgb8888 = 0x34325258, kDrmAbg
 constexpr uint64_t kDrmModLinear = 0, kDrmModInvalid = 0x00FFFFFFFFFFFFFFull;
 constexpr uint32_t kParamsAlreadyUsed = 0, kParamsPlaneIdx = 1, kParamsPlaneSet = 2, kParamsIncomplete = 3, kParamsInvalidFormat = 4, kParamsInvalidDimensions = 5,
                    kParamsOutOfBounds = 6, kParamsInvalidWlBuffer = 7;
+// wp_linux_drm_syncobj_v1 errors: the manager's, the surface's
+constexpr uint32_t kSyncobjSurfaceExists = 0, kSyncobjInvalidTimeline = 1;
+constexpr uint32_t kSyncobjNoSurface = 1, kSyncobjUnsupportedBuffer = 2, kSyncobjNoBuffer = 3, kSyncobjNoAcquirePoint = 4, kSyncobjNoReleasePoint = 5,
+                   kSyncobjConflictingPoints = 6;
 
 struct Server::Client {
   explicit Client(allocators::IAllocator& allocator) : in(allocator), out(allocator), fds_in(allocator), fds_out(allocator), objects(allocator) {}
@@ -77,7 +81,10 @@ struct Server::Client {
   Queue<Fd> fds_in;           // descriptors no request took yet
   List<Fd> fds_out;           // descriptors that go with `out`
   Dictionary<uint32_t, Resource> objects;
-  uint32_t next_server_id = kFirstServerId;      // the next id of an object the server makes (zwp_linux_buffer_params_v1.created)
+  uint32_t next_server_id = kFirstServerId;
+  uint32_t ping_serial = 0;            // xdg_wm_base.ping not answered yet (0: none)
+  uint64_t ping_sent = 0;              // when it went (the clock's milliseconds)
+  bool not_responding = false;         // it did not answer for kPingPatience: its windows' titles say so      // the next id of an object the server makes (zwp_linux_buffer_params_v1.created)
 };
 
 // The arguments of one request. A malformed argument makes it fail (ok() false): the request is then a protocol error.

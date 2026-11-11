@@ -2114,12 +2114,13 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // as a Windows or an X one. Linux programs reach it at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run/user/0/wayland-0 in the Linux tree).
     wayland::Server wayland_server(shared_allocator, [] { return hardware::uptime_us() / 1000; });
     desktop.set_wayland_session(&wayland_server);
+    wayland_server.set_clipboard(&clipboard);      // (copy and paste between Wayland programs and the desktop's)
     struct WaylandGuard { desktop::Desktop& d; ~WaylandGuard() { d.set_wayland_session(nullptr); } } wayland_guard{desktop};      // (the desktop lets go first)
     UniquePointer<wayland::SocketServer> wayland_sockets;
     if (process::UnixSocketManager* sockets = process::system_unix_sockets()) {
       wayland_sockets = UniquePointer<wayland::SocketServer>::make(shared_allocator, wayland_server, *sockets, shared_allocator);
-      // GPU buffers (zwp_linux_dmabuf_v1): the dmabufs of /dev/dxg are drawn in place by the desktop when it draws on their GPU
-      if (wayland_sockets && dxgk::system_kernel()) wayland_sockets->set_gpu_images(&wayland::make_dxg_image, dxgk::system_kernel());
+      // GPU buffers (zwp_linux_dmabuf_v1, wp_linux_drm_syncobj_v1): the dmabufs and fences of /dev/dxg; the desktop draws the images in place on their GPU
+      if (wayland_sockets && dxgk::system_kernel()) wayland_sockets->set_gpu_images(&wayland::make_dxg_image, &wayland::make_dxg_timeline, dxgk::system_kernel());
       if (wayland_sockets && wayland_sockets->listen(explorer_files.file_system()) && wayland_sockets->start()) console::puts("wayland: listening on wayland-0\n");
       else console::puts("wayland: the compositor could not listen\n");
     }
@@ -2184,6 +2185,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         console::put_hex(code);
         console::puts(" ");
         console::puts(message.view());
+        console::puts("\n");
+        const wayland::DxgImageDraws draws = wayland::dxg_image_draws();      // (how the desktop showed Wayland GPU buffers meanwhile)
+        console::puts("autorun: wayland GPU buffer draws in place ");
+        console::put_dec(static_cast<int64_t>(draws.in_place));
+        console::puts(", from the CPU ");
+        console::put_dec(static_cast<int64_t>(draws.from_cpu));
         console::puts("\n");
       }
     };

@@ -39,7 +39,7 @@ enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Ge
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
-  Socket, Socketpair, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
+  Socket, Socketpair, Pipe, Pipe2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
   Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
@@ -73,6 +73,7 @@ constexpr NumberEntry kNumbers[] = {
     {56, 220, Call::Clone},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
     {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
     // sockets (AF_UNIX: LinuxSockets.cpp)
+    {22, kAbsent, Call::Pipe},     {293, 59, Call::Pipe2},
     {41, 198, Call::Socket},       {53, 199, Call::Socketpair}, {49, 200, Call::Bind},       {42, 203, Call::Connect},
     {50, 201, Call::Listen},       {43, 202, Call::Accept},     {288, 242, Call::Accept4},   {44, 206, Call::Sendto},
     {45, 207, Call::Recvfrom},     {46, 211, Call::Sendmsg},    {47, 212, Call::Recvmsg},    {307, 269, Call::Sendmmsg},
@@ -127,16 +128,23 @@ uint64_t do_brk(Process& process, uint64_t request) {
 }
 
 // mmap() of a file in memory (memfd_create): its block is mapped as it is (MAP_SHARED), or as a copy-on-write view (MAP_PRIVATE). The pages past the
-// block's end cannot be mapped (ENXIO; Linux would map them and fault on use).
+// block's end cannot be mapped (ENXIO; Linux would map them and fault on use). A GPU image (a dmabuf of /dev/dxg) maps the CPU's copy of it the same way.
 uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   OpenObject* object = process.files().object(fd);
   if (!object) return error(kEbadf);
-  if (!object->memory) return error(kEnodev);      // (other files cannot be mapped yet)
+  if (!object->memory && !object->gpu_buffer) return error(kEnodev);      // (other files cannot be mapped yet)
   if (offset % AddressSpace::kPageSize != 0) return error(kEinval);
-  if (!object->readable || ((flags & kMapShared) && (prot & kProtWrite) && !object->writable)) return error(kEacces);
-  if ((flags & kMapShared) && (prot & kProtWrite) && (object->memory->seals() & (MemoryFile::kSealWrite | MemoryFile::kSealFutureWrite))) return error(kEperm);
-  uint64_t file_size = 0;
-  BlockRef block = object->memory->block(&file_size);
+  const bool shared_write = (flags & kMapShared) && (prot & kProtWrite);
+  BlockRef block;
+  if (object->gpu_buffer) {      // a GPU image: the CPU's copy of it (DxgBufferFile.hpp); a dmabuf is mapped for writing whatever its descriptor allows, as on Linux
+    block = object->gpu_buffer->map_block(shared_write);
+    if (!block) return error(kEnodev);
+  } else {
+    if (!object->readable || (shared_write && !object->writable)) return error(kEacces);
+    if (shared_write && (object->memory->seals() & (MemoryFile::kSealWrite | MemoryFile::kSealFutureWrite))) return error(kEperm);
+    uint64_t file_size = 0;
+    block = object->memory->block(&file_size);
+  }
   if (!block || offset >= block.get()->capacity() || size > block.get()->capacity() - offset) return error(kEnxio);
   uint64_t where = 0;
   if (flags & kMapFixed) {
@@ -332,6 +340,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Fallocate: return linuxabi::sys_fallocate(process, a[0], a[1], a[2], a[3]);
       case Call::Socket: return linuxabi::sys_socket(process, a[0], a[1], a[2]);
       case Call::Socketpair: return linuxabi::sys_socketpair(process, a[0], a[1], a[2], a[3]);
+      case Call::Pipe: return linuxabi::sys_pipe2(process, a[0], 0);
+      case Call::Pipe2: return linuxabi::sys_pipe2(process, a[0], a[1]);
       case Call::Bind: return linuxabi::sys_bind(process, a[0], a[1], a[2]);
       case Call::Connect: return linuxabi::sys_connect(process, a[0], a[1], a[2]);
       case Call::Listen: return linuxabi::sys_listen(process, a[0], a[1]);
