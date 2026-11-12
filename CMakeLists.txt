@@ -217,6 +217,7 @@ add_executable(BOOTX64
   src/Audio/Resampler.cpp
   src/Audio/AudioStream.cpp
   src/Audio/AudioMixer.cpp
+  src/DBus/Activation.cpp
   src/DBus/Auth.cpp
   src/DBus/Bus.cpp
   src/DBus/BusDriver.cpp
@@ -224,6 +225,7 @@ add_executable(BOOTX64
   src/DBus/Match.cpp
   src/DBus/Message.cpp
   src/DBus/Notifications.cpp
+  src/DBus/ProgramActivator.cpp
   src/DBus/SocketServer.cpp
   src/DBus/Wire.cpp
   src/PipeWire/Graph.cpp

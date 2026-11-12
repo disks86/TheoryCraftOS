@@ -191,7 +191,9 @@ struct BusDriverCall {
     reply("as", [&](Writer& w) {
       const Writer::ArrayMark m = w.begin_array(4);
       w.string(kBusName);
-      if (!activatable) {
+      if (activatable) {
+        for (const UniquePointer<ServiceFile>& service : bus.services_.view()) w.string(service->name.view());
+      } else {
         for (const Bus::Connection& c : bus.connections_)
           if (c.hello && !c.monitor && !c.closing) w.string(c.unique.view());
         for (const Bus::NameEntry& e : bus.names_)
@@ -403,12 +405,18 @@ struct BusDriverCall {
       Args args(call);
       const StringView name = args.s();
       if (name == kBusName || (valid_bus_name(name) && bus.owner_of(name))) return reply("u", [](Writer& w) { w.u32(kStartAlreadyRunning); });
+      if (valid_bus_name(name) && !is_unique_name(name) && bus.service_for(name)) {      // (1 once it has taken the name: Bus::finish_activations)
+        Bus::Activation* started = bus.activate(name, from, call);
+        if (started && !started->starters.push_back(Bus::Activation::Starter{from.id, call.serial, call.expects_reply()}))
+          error("org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
+        return;
+      }
       return error2("org.freedesktop.DBus.Error.ServiceUnknown", "The name ", name, " was not provided by any .service files");
     }
     if (member == "UpdateActivationEnvironment") {
       if (!signature_is("a{ss}")) return;
       if (bus.kind() == BusKind::System) return error("org.freedesktop.DBus.Error.AccessDenied", "Cannot change activation environment on a system bus.");
-      return empty_reply();      // (nothing is activated: there is no environment to change)
+      return empty_reply();      // (accepted; the activated services get the standard environment and the starter variables only)
     }
     if (member == "NameHasOwner") {
       if (!signature_is("s")) return;
@@ -459,8 +467,9 @@ struct BusDriverCall {
     if (member == "GetConnectionUnixUser" || member == "GetConnectionUnixProcessID" || member == "GetConnectionCredentials" ||
         member == "GetAdtAuditSessionData" || member == "GetConnectionSELinuxSecurityContext")
       return credentials(member);
-    if (member == "ReloadConfig") {
+    if (member == "ReloadConfig") {      // (the configuration is the service files)
       if (!signature_is("")) return;
+      bus.reload_services();
       return empty_reply();
     }
     if (member == "GetId") {

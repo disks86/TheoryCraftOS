@@ -34,6 +34,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "DBus/Activation.hpp"
 #include "DBus/Auth.hpp"
 #include "DBus/Bus.hpp"
 #include "DBus/Match.hpp"
@@ -1485,6 +1486,223 @@ static void test_transport_stream() {
   CHECK(matched && got == 2000);
 }
 
+// ---- activation and reply timeouts ---------------------------------------------------------------------------------------------------------------
+
+static void test_service_files() {
+  ServiceFile f(A);
+  CHECK(parse_service_file("# a comment\n[D-BUS Service]\nName=org.example.Svc\nExec=/usr/bin/svc --flag \"two words\"\nUser=root\nSystemdService=svc.service\n", &f));
+  CHECK(f.name == "org.example.Svc" && f.exec == "/usr/bin/svc --flag \"two words\"" && f.user == "root" && f.systemd_service == "svc.service");
+  CHECK(parse_service_file("[D-BUS Service]\r\nName = org.example.Crlf\r\nExec = /bin/x\r\n", &f) && f.name == "org.example.Crlf" && f.exec == "/bin/x");
+  CHECK(!parse_service_file("[Other]\nName=org.example.Svc\nExec=/x\n", &f));
+  CHECK(!parse_service_file("[D-BUS Service]\nName=:1.5\nExec=/x\n", &f));
+  CHECK(!parse_service_file("[D-BUS Service]\nName=org.example.Svc\n", &f));
+  CHECK(!parse_service_file("[D-BUS Service]\nName=bad\nExec=/x\n", &f));
+  CHECK(!parse_service_file("[D-BUS Service]\n[Other]\nName=org.example.Svc\nExec=/x\n", &f));
+  List<String> w(A);
+  CHECK(split_exec(A, "/usr/bin/a  b 'c d' \"e \\\"f\\\"\" g\\ h", &w) && w.count() == 5 && w[0] == "/usr/bin/a" && w[1] == "b" && w[2] == "c d" && w[3] == "e \"f\"" &&
+        w[4] == "g h");
+  CHECK(split_exec(A, "x''y \"\"", &w) && w.count() == 2 && w[0] == "xy" && w[1] == "");
+  CHECK(!split_exec(A, "/bin/a 'open", &w) && !split_exec(A, "   ", &w) && !split_exec(A, "", &w));
+  std::string many;
+  for (int i = 0; i < 70; ++i) many += "w ";
+  CHECK(!split_exec(A, StringView(many.c_str()), &w));
+  // garbage and bit flips: never a crash
+  const std::string good = "[D-BUS Service]\nName=org.example.Svc\nExec=/usr/bin/svc 'a b' \"c\"\n";
+  int accepted = 0;
+  for (size_t bit = 0; bit < good.size() * 8; ++bit) {
+    std::string t = good;
+    t[bit / 8] = char(t[bit / 8] ^ (1 << (bit % 8)));
+    accepted += parse_service_file(StringView(t.data(), t.size()), &f);
+    split_exec(A, StringView(t.data(), t.size()), &w);
+  }
+  CHECK(accepted > 0);
+  for (size_t len = 0; len < good.size(); ++len) parse_service_file(StringView(good.data(), len), &f);
+}
+
+struct FakeLauncher final : IServiceLauncher {
+  struct Run {
+    std::string name;
+    std::vector<std::string> argv;
+    State state = State::Running;
+    uint32_t code = 0;
+    bool forgotten = false;
+  };
+  std::vector<Run> runs;      // handle = index + 1
+  bool refuse = false;
+  uint64_t start(BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
+    if (refuse) { why->assign("refused"); return 0; }
+    Run r;
+    r.name = str(name);
+    for (const StringView& a : argv) r.argv.push_back(str(a));
+    runs.push_back(r);
+    return runs.size();
+  }
+  State poll(uint64_t handle, uint32_t* code, String* why) override {
+    *code = runs[handle - 1].code;
+    if (runs[handle - 1].state == State::CouldNotRun) why->assign("not an executable");
+    return runs[handle - 1].state;
+  }
+  void forget(uint64_t handle) override { runs[handle - 1].forgotten = true; }
+};
+
+static void write_file(filesystem::RamFileSystem& fs, const char* path, const std::string& text) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t n = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok && file->write(0, StringView(text.c_str()).bytes(), &n) == filesystem::Status::Ok);
+}
+
+static void test_activation() {
+  filesystem::RamFileSystem fs(A);
+  CHECK(fs.create_directory("/svc") == filesystem::Status::Ok && fs.create_directory("/svc2") == filesystem::Status::Ok);
+  write_file(fs, "/svc/org.example.Svc.service", "[D-BUS Service]\nName=org.example.Svc\nExec=/usr/bin/svc --serve 'x y'\n");
+  write_file(fs, "/svc/broken.service", "[D-BUS Service]\nName=org.example.Broken\nExec=/usr/bin/broken 'open\n");
+  write_file(fs, "/svc/not-a-service.txt", "[D-BUS Service]\nName=org.example.Ignored\nExec=/x\n");
+  write_file(fs, "/svc2/org.example.Svc.service", "[D-BUS Service]\nName=org.example.Svc\nExec=/second/one\n");      // (the first folder wins)
+  Bus bus(A, BusKind::System, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+  FakeLauncher launcher;
+  const StringView folders[] = {"/svc", "/svc2", "/missing"};
+  bus.set_activation(&launcher, &fs, ArrayView<const StringView>(folders, 3));
+  bus.tick(1000000);
+  CHECK(bus.activatable("org.example.Svc") && bus.activatable("org.example.Broken") && !bus.activatable("org.example.Ignored"));
+  Client caller(bus), other(bus);
+  caller.hello();
+  other.hello();
+  auto act = caller.reply(caller.bus_call("ListActivatableNames"));
+  CHECK(act && strings_of(*act) == (std::vector<std::string>{"org.freedesktop.DBus", "org.example.Svc", "org.example.Broken"}));
+  // a call to the name starts the service; the call waits
+  const uint32_t s1 = caller.call("org.example.Svc", "/", "org.example.Svc", "Hello", "s", [](Writer& w) { w.string("first"); });
+  const uint32_t s2 = caller.call("org.example.Svc", "/", "org.example.Svc", "Hello", "s", [](Writer& w) { w.string("second"); });
+  const uint32_t st = other.bus_call("StartServiceByName", "su", [](Writer& w) { w.string("org.example.Svc"); w.u32(0); });
+  CHECK(launcher.runs.size() == 1 && launcher.runs[0].argv == (std::vector<std::string>{"/usr/bin/svc", "--serve", "x y"}));
+  CHECK(!caller.reply(s1) && !other.reply(st) && bus.activations_running() == 1);
+  // the program comes up and takes the name: the calls arrive in order, StartServiceByName says 1
+  Client service(bus);
+  service.hello();
+  CHECK(service.request("org.example.Svc", 0) == kRequestPrimaryOwner);
+  auto in1 = service.take(kMethodCall, "Hello");
+  auto in2 = service.take(kMethodCall, "Hello");
+  CHECK(in1 && in2 && in1->serial == s1 && in2->serial == s2 && in1->sender == StringView(caller.unique.c_str()));
+  CHECK(other.u_reply(st) == kStartSuccess && bus.activations_running() == 0 && launcher.runs[0].forgotten);
+  service.send(kMethodReturn, caller.unique.c_str(), nullptr, nullptr, nullptr, "s", [](Writer& w) { w.string("hi"); }, 0, {}, s1);
+  CHECK(caller.s_reply(s1) == "hi");      // (the delayed call is a requested one: its reply goes through on the system bus)
+  CHECK(other.u_reply(other.bus_call("StartServiceByName", "su", [](Writer& w) { w.string("org.example.Svc"); w.u32(0); })) == kStartAlreadyRunning);
+  service.close();
+  // NO_AUTO_START: no start
+  CHECK(caller.error_of(caller.call("org.example.Svc", "/", "a.b", "M", "", {}, kNoAutoStart)) == "org.freedesktop.DBus.Error.NameHasNoOwner");
+  CHECK(launcher.runs.size() == 1);
+  // the program ends without taking the name
+  const uint32_t s3 = caller.call("org.example.Svc", "/", "a.b", "M");
+  const uint32_t st2 = other.bus_call("StartServiceByName", "su", [](Writer& w) { w.string("org.example.Svc"); w.u32(0); });
+  CHECK(launcher.runs.size() == 2);
+  launcher.runs[1].state = IServiceLauncher::State::Exited;
+  launcher.runs[1].code = 3;
+  bus.tick(2000000);
+  CHECK(caller.error_of(s3) == "org.freedesktop.DBus.Error.Spawn.ChildExited" && other.error_of(st2) == "org.freedesktop.DBus.Error.Spawn.ChildExited");
+  {
+    auto e = caller.reply(s3);
+    Reader r(e->body.view(), false);
+    StringView text;
+    CHECK(r.string(&text) && str(text).find("status 3") != std::string::npos);
+  }
+  // it could not run; it could not even be started; its Exec line is broken
+  const uint32_t s4 = caller.call("org.example.Svc", "/", "a.b", "M");
+  launcher.runs[2].state = IServiceLauncher::State::CouldNotRun;
+  bus.tick(2100000);
+  CHECK(caller.error_of(s4) == "org.freedesktop.DBus.Error.Spawn.ExecFailed");
+  launcher.refuse = true;
+  CHECK(caller.error_of(caller.call("org.example.Svc", "/", "a.b", "M")) == "org.freedesktop.DBus.Error.Spawn.ExecFailed");
+  launcher.refuse = false;
+  CHECK(caller.error_of(caller.call("org.example.Broken", "/", "a.b", "M")) == "org.freedesktop.DBus.Error.Spawn.FileInvalid");
+  // it does not take the name in time
+  bus.set_activation_timeout_us(1000000);
+  const uint32_t s5 = caller.call("org.example.Svc", "/", "a.b", "M");
+  bus.tick(2500000);
+  CHECK(!caller.reply(s5));
+  bus.tick(3600000);
+  CHECK(caller.error_of(s5) == "org.freedesktop.DBus.Error.TimedOut" && bus.activations_running() == 0);
+  // one connection may not fill the queue for everyone; NO_AUTO_START does not wait for a service that is starting
+  {
+    bus.set_activation_timeout_us(1000000);
+    Client flood(bus);
+    flood.hello();
+    uint32_t last = 0;
+    for (uint32_t i = 0; i <= Bus::kMaxQueuedPerConnection; ++i) last = flood.call("org.example.Svc", "/", "a.b", "M");
+    CHECK(flood.error_of(last) == "org.freedesktop.DBus.Error.LimitsExceeded");
+    const uint32_t other_call = caller.call("org.example.Svc", "/", "a.b", "M");
+    CHECK(!caller.reply(other_call));      // (another connection still gets in line)
+    CHECK(caller.error_of(caller.call("org.example.Svc", "/", "a.b", "M", "", {}, kNoAutoStart)) == "org.freedesktop.DBus.Error.NameHasNoOwner");
+    bus.tick(4700000);
+    CHECK(caller.error_of(other_call) == "org.freedesktop.DBus.Error.TimedOut" && flood.error_of(last - 1) == "org.freedesktop.DBus.Error.TimedOut");
+  }
+  // a caller that goes away while it waits: nothing is left behind
+  {
+    Client gone(bus);
+    gone.hello();
+    gone.call("org.example.Svc", "/", "a.b", "M");
+  }
+  Client late(bus);
+  late.hello();
+  CHECK(late.request("org.example.Svc", 0) == kRequestPrimaryOwner);
+  bus.tick(3700000);
+  CHECK(late.count(kMethodCall) == 0 && bus.activations_running() == 0);
+  late.close();
+  bus.tick(4800000);
+  // a name no file names, then the file is added: ReloadConfig (or the next miss, a second later) finds it
+  CHECK(caller.error_of(caller.call("org.example.New", "/", "a.b", "M")) == "org.freedesktop.DBus.Error.ServiceUnknown");
+  write_file(fs, "/svc/org.example.New.service", "[D-BUS Service]\nName=org.example.New\nExec=/usr/bin/new\n");
+  CHECK(caller.reply(caller.bus_call("ReloadConfig"))->type == kMethodReturn && bus.activatable("org.example.New"));
+  write_file(fs, "/svc/org.example.Newer.service", "[D-BUS Service]\nName=org.example.Newer\nExec=/usr/bin/newer\n");
+  caller.call("org.example.Newer", "/", "a.b", "M");      // (within a second of the last reading: not looked for yet)
+  CHECK(caller.count(kError) >= 1 && !bus.activatable("org.example.Newer"));
+  bus.tick(6000000);
+  const size_t before = launcher.runs.size();
+  caller.call("org.example.Newer", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == before + 1 && launcher.runs.back().argv[0] == "/usr/bin/newer");
+  // a bus without activation knows nothing to start
+  Bus plain(A, BusKind::Session, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+  Client p(plain);
+  p.hello();
+  CHECK(p.error_of(p.call("org.example.Svc", "/", "a.b", "M")) == "org.freedesktop.DBus.Error.ServiceUnknown");
+}
+
+static void test_reply_timeouts() {
+  Bus bus(A, BusKind::System, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+  bus.set_reply_timeout_us(1000000);
+  Client caller(bus), callee(bus);
+  caller.hello();
+  callee.hello();
+  const uint32_t early = caller.call(callee.unique.c_str(), "/", "a.b", "BeforeTheClock");      // (before the bus has a time: its clock starts at the first tick)
+  bus.tick(10000000);
+  const uint32_t s = caller.call(callee.unique.c_str(), "/", "a.b", "Hang");
+  const uint32_t answered = caller.call(callee.unique.c_str(), "/", "a.b", "Quick");
+  callee.send(kMethodReturn, caller.unique.c_str(), nullptr, nullptr, nullptr, "", {}, 0, {}, answered);
+  CHECK(caller.reply(answered) && caller.reply(answered)->type == kMethodReturn);
+  bus.tick(10900000);
+  CHECK(!caller.reply(s) && !caller.reply(early) && bus.pending_calls() == 2);
+  bus.tick(11100000);
+  CHECK(caller.error_of(s) == "org.freedesktop.DBus.Error.NoReply" && caller.error_of(early) == "org.freedesktop.DBus.Error.NoReply");
+  CHECK(bus.pending_calls() == 0);
+  // the reply that comes too late is an unrequested one: dropped on the system bus
+  caller.clear();
+  callee.send(kMethodReturn, caller.unique.c_str(), nullptr, nullptr, nullptr, "", {}, 0, {}, s);
+  CHECK(caller.count(kMethodReturn) == 0);
+  // many calls answered at once: the bookkeeping of their deadlines does not grow with them
+  for (int i = 0; i < 6000; ++i) {
+    const uint32_t q = caller.call(callee.unique.c_str(), "/", "a.b", "Q", "", {}, 0);
+    callee.send(kMethodReturn, caller.unique.c_str(), nullptr, nullptr, nullptr, "", {}, 0, {}, q);
+    if (i % 1000 == 0) { caller.clear(); callee.clear(); }
+  }
+  CHECK(bus.pending_calls() == 0);
+  bus.tick(20000000);
+  caller.clear();
+  CHECK(caller.count(kError) == 0);
+  // no timeout at all
+  bus.set_reply_timeout_us(0);
+  const uint32_t forever = caller.call(callee.unique.c_str(), "/", "a.b", "Forever");
+  bus.tick(900000000);
+  CHECK(!caller.reply(forever) && bus.pending_calls() == 1);
+}
+
 int main() {
   test_names();
   test_signatures();
@@ -1498,6 +1716,9 @@ int main() {
   test_monitor_and_protocol_errors();
   test_descriptors();
   test_notifications();
+  test_service_files();
+  test_activation();
+  test_reply_timeouts();
   test_transport_threads();
   test_transport_churn();
   test_transport_stream();

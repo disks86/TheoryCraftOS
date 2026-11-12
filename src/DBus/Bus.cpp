@@ -27,7 +27,7 @@ uint64_t reply_key(uint32_t caller, uint32_t serial) { return uint64_t(caller) <
 
 Bus::Bus(allocators::IAllocator& allocator, BusKind kind, StringView guid, StringView machine_id)
     : allocator_(allocator), kind_(kind), connections_(allocator), by_id_(allocator), names_(allocator), name_index_(allocator), pending_(allocator),
-      local_queue_(allocator), local_peers_(allocator), wire_(allocator), scratch_(allocator) {
+      expiries_(allocator), service_folders_(allocator), services_(allocator), activations_(allocator), local_queue_(allocator), local_peers_(allocator), wire_(allocator), scratch_(allocator) {
   guid.first(guid.size() < 32 ? guid.size() : 32).copy_to(ArrayView<char>(guid_, 33));
   machine_id.first(machine_id.size() < 32 ? machine_id.size() : 32).copy_to(ArrayView<char>(machine_id_, 33));
 }
@@ -148,13 +148,13 @@ void Bus::drop_pending(Connection& c) {
   const uint32_t id = c.id;
   for (;;) {
     List<uint64_t> keys(allocator_);
-    for (const KeyValue<uint64_t, uint32_t>& kv : pending_)
-      if ((kv.value == id || uint32_t(kv.key >> 32) == id) && !keys.push_back(kv.key)) break;
+    for (const KeyValue<uint64_t, Pending>& kv : pending_)
+      if ((kv.value.callee == id || uint32_t(kv.key >> 32) == id) && !keys.push_back(kv.key)) break;
     if (keys.count() == 0) return;
     for (uint64_t key : keys.view()) {
-      const uint32_t* callee = pending_.find(key);
+      const Pending* callee = pending_.find(key);
       const uint32_t caller = uint32_t(key >> 32);
-      const bool owed = callee && *callee == id && caller != id;
+      const bool owed = callee && callee->callee == id && caller != id;
       pending_.remove(key);
       Connection* waiting = find(caller);
       if (!waiting) continue;
@@ -216,6 +216,7 @@ void Bus::receive(uint32_t client, ConstByteView bytes, Queue<FdRef>* fds) {
   if (!c->closing && !bytes.empty() && !c->inbox.append(bytes)) close(*c);
   if (!c->closing && c->auth->done()) read_messages(*c);
   if (!c->closing && c->auth->done() && !c->auth->unix_fds() && c->inbox_fds.count()) close(*c);      // (descriptors it never asked to pass)
+  if (activations_.count()) finish_activations();
   deliver_locals();
 }
 
@@ -370,6 +371,29 @@ void Bus::route(Connection* from, Message& m) {
     return;
   }
   Connection* to = find(owner_of(m.destination.view()));
+  // a service that is starting (or has just taken its name, its queue not sent yet): the message waits behind the ones before it, in order
+  Activation* starting = nullptr;
+  for (UniquePointer<Activation>& a : activations_.view())
+    if (a->name == m.destination.view()) starting = a.get();
+  const bool may_start = !to && !is_unique_name(m.destination.view()) && !(m.flags & kNoAutoStart);
+  if (!starting && may_start && service_for(m.destination.view())) {
+    starting = activate(m.destination.view(), *from, m);
+    if (!starting) return;      // (it could not start: the caller has been told)
+  }
+  if (starting && (to || may_start)) {      // (a message that may not start the service and finds no owner gets the usual error below)
+    if (queued_for_activation_ >= kMaxQueuedForActivation || from->queued_for_activation >= kMaxQueuedPerConnection) {
+      error_to(*from, m, "org.freedesktop.DBus.Error.LimitsExceeded", "Too many messages are waiting for services to start");
+      return;
+    }
+    UniquePointer<Message> copy = UniquePointer<Message>::make(allocator_, allocator_);
+    if (!copy || !m.copy_to(copy.get()) || !starting->queued.push_back(Activation::Queued{from->id, util::move(copy)})) {
+      error_to(*from, m, "org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
+      return;
+    }
+    ++queued_for_activation_;
+    ++from->queued_for_activation;
+    return;
+  }
   if (!to) {
     if (m.expects_reply()) {
       String text(allocator_);
@@ -389,8 +413,8 @@ void Bus::route(Connection* from, Message& m) {
   }
   if (m.type == kMethodReturn || m.type == kError) {
     const uint64_t key = reply_key(to->id, m.reply_serial);
-    const uint32_t* callee = pending_.find(key);
-    if (callee && *callee == from->id) {
+    const Pending* callee = pending_.find(key);
+    if (callee && callee->callee == from->id) {
       pending_.remove(key);
       if (to->pending_calls) --to->pending_calls;
     } else if (kind_ == BusKind::System) {
@@ -407,16 +431,12 @@ void Bus::route(Connection* from, Message& m) {
     return;
   }
   if (m.expects_reply() && to != from) {
-    const uint64_t key = reply_key(from->id, m.serial);
-    if (!pending_.contains(key)) {
-      if (from->pending_calls >= kMaxPendingRepliesPerConnection) {
-        error_to(*from, m, "org.freedesktop.DBus.Error.LimitsExceeded", "The connection has too many calls waiting for replies");
-        return;
-      }
-      ++from->pending_calls;
+    const ExpectStatus st = expect_reply(*from, m.serial, *to);
+    if (st == ExpectStatus::TooMany) {
+      error_to(*from, m, "org.freedesktop.DBus.Error.LimitsExceeded", "The connection has too many calls waiting for replies");
+      return;
     }
-    if (!pending_.put(key, to->id)) {
-      --from->pending_calls;
+    if (st == ExpectStatus::NoMemory) {
       error_to(*from, m, "org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
       return;
     }
@@ -427,6 +447,260 @@ void Bus::route(Connection* from, Message& m) {
   }
   deliver(*to, m, wire_);
   broadcast(m, to, false);
+}
+
+// Notes that `from` waits for `to` to answer its call `serial`, until the reply timeout.
+Bus::ExpectStatus Bus::expect_reply(Connection& from, uint32_t serial, Connection& to) {
+  const uint64_t key = reply_key(from.id, serial);
+  const bool known = pending_.contains(key);
+  if (!known && from.pending_calls >= kMaxPendingRepliesPerConnection) return ExpectStatus::TooMany;
+  if (++generation_ == 0) generation_ = 1;
+  if (reply_timeout_us_ != 0) {
+    // stale entries (answered calls) are dropped when they are more than the live ones (the new queue replaces the old only when it was made whole)
+    if (expiries_.count() > 2 * pending_.count() + 4096) {
+      Queue<Expiry> live(allocator_);
+      bool whole = true;
+      for (const Expiry& e : expiries_) {
+        const Pending* p = pending_.find(e.key);
+        if (p && p->generation == e.generation && !live.enqueue(e)) { whole = false; break; }
+      }
+      if (whole) {
+        expiries_.clear();
+        Expiry e;
+        while (whole && live.dequeue(&e)) whole = expiries_.enqueue(e);
+      }
+    }
+    if (!expiries_.enqueue(Expiry{key, generation_, now_us_ ? now_us_ + reply_timeout_us_ : 0})) return ExpectStatus::NoMemory;
+    if (!now_us_) ++unset_deadlines_;
+  }
+  if (!pending_.put(key, Pending{to.id, generation_})) return ExpectStatus::NoMemory;      // (its Expiry, if made, is stale: skipped)
+  if (!known) ++from.pending_calls;
+  return ExpectStatus::Ok;
+}
+
+void Bus::expire_replies() {
+  if (reply_timeout_us_ == 0 || now_us_ == 0) return;
+  if (unset_deadlines_) {      // (calls made before the first tick: timed from it)
+    for (Expiry& e : expiries_)
+      if (e.deadline_us == 0) e.deadline_us = now_us_ + reply_timeout_us_;
+    unset_deadlines_ = 0;
+  }
+  for (Expiry* e = expiries_.front(); e && e->deadline_us <= now_us_; e = expiries_.front()) {
+    const Expiry gone = *e;
+    expiries_.dequeue();
+    const Pending* p = pending_.find(gone.key);
+    if (!p || p->generation != gone.generation) continue;      // (answered meanwhile)
+    pending_.remove(gone.key);
+    Connection* waiting = find(uint32_t(gone.key >> 32));
+    if (!waiting) continue;
+    if (waiting->pending_calls) --waiting->pending_calls;
+    if (waiting->closing) continue;
+    Message error(allocator_);
+    if (!from_bus(&error, kError) || !error.error_name.assign("org.freedesktop.DBus.Error.NoReply") || !error.destination.assign(waiting->unique.view()) ||
+        !error.signature.assign("s"))
+      continue;
+    error.has_reply_serial = true;
+    error.reply_serial = uint32_t(gone.key);
+    Writer w(error.body);
+    w.string("Did not receive a reply. Possible causes include: the remote application did not send a reply, the message bus security policy blocked the "
+             "reply, the reply timeout expired, or the network connection was broken.");
+    if (w.ok()) send_from_bus(error);
+  }
+}
+
+// --- activation
+
+void Bus::set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders) {
+  launcher_ = launcher;
+  service_files_ = files;
+  service_folders_.clear();
+  for (const StringView& f : folders) {
+    String folder(allocator_);
+    if (folder.assign(f)) service_folders_.push_back(util::move(folder));
+  }
+  reload_services();
+}
+
+uint32_t Bus::reload_services() {
+  services_.clear();
+  services_read_us_ = now_us_ ? now_us_ : 1;
+  if (!service_files_) return 0;
+  ByteBuffer text(allocator_);
+  String path(allocator_);
+  for (const String& folder : service_folders_.view()) {
+    UniquePointer<filesystem::IDirectory> dir;
+    if (service_files_->open_directory(folder.view(), &dir) != filesystem::Status::Ok) continue;
+    filesystem::DirectoryEntry entry;
+    while (dir->next(&entry) == filesystem::Status::Ok && services_.count() < kMaxServiceFiles) {
+      const StringView leaf = entry.name.view();
+      if (entry.type != filesystem::NodeType::File || !leaf.ends_with(".service") || entry.size > kMaxServiceFileBytes) continue;
+      path.clear();
+      if (!path.append(folder.view()) || !path.push_back('/') || !path.append(leaf)) continue;
+      UniquePointer<filesystem::IFile> file;
+      if (service_files_->open_file(path.view(), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) continue;
+      const uint64_t size = file->size();
+      if (size > kMaxServiceFileBytes) continue;
+      text.clear();
+      uint64_t got = 0;
+      if (!text.put_zeros(size) || file->read(0, text.writable_view(), &got) != filesystem::Status::Ok) continue;
+      UniquePointer<ServiceFile> service = UniquePointer<ServiceFile>::make(allocator_, allocator_);
+      if (!service || !parse_service_file(StringView(text.view().first(got)), service.get())) continue;
+      bool known = false;      // (the first folder that names it wins, as in dbus-daemon)
+      for (const UniquePointer<ServiceFile>& s : services_.view()) known |= s->name == service->name.view();
+      if (!known) services_.push_back(util::move(service));
+    }
+  }
+  return uint32_t(services_.count());
+}
+
+const ServiceFile* Bus::service_for(StringView name) {
+  if (!launcher_) return nullptr;
+  for (int pass = 0; pass < 2; ++pass) {
+    for (const UniquePointer<ServiceFile>& s : services_.view())
+      if (s->name == name) return s.get();
+    // not named: the files may have changed since they were read (at most once a second)
+    if (pass == 0 && now_us_ != 0 && now_us_ - services_read_us_ >= 1000000) reload_services();      // (no clock yet: what was read at the start stands)
+    else break;
+  }
+  return nullptr;
+}
+
+bool Bus::activatable(StringView name) const {
+  for (const UniquePointer<ServiceFile>& s : services_.view())
+    if (s->name == name) return true;
+  return false;
+}
+
+// The activation of `name` (started now, or already on its way). Null when it could not start: `asker` has been told why, for `call`.
+Bus::Activation* Bus::activate(StringView name, Connection& asker, const Message& call) {
+  for (UniquePointer<Activation>& a : activations_.view())
+    if (a->name == name) return a.get();
+  const ServiceFile* service = service_for(name);
+  if (!service) return nullptr;
+  if (activations_.count() >= kMaxActivations) {
+    error_to(asker, call, "org.freedesktop.DBus.Error.LimitsExceeded", "Too many services are starting");
+    return nullptr;
+  }
+  List<String> words(allocator_);
+  if (!split_exec(allocator_, service->exec.view(), &words)) {
+    String text(allocator_);
+    text.append("Invalid Exec line in the service file of ");
+    text.append(name);
+    error_to(asker, call, "org.freedesktop.DBus.Error.Spawn.FileInvalid", text.view());
+    return nullptr;
+  }
+  StringView argv[kMaxExecWords];
+  for (uint64_t i = 0; i < words.count(); ++i) argv[i] = words[i].view();
+  UniquePointer<Activation> a = UniquePointer<Activation>::make(allocator_, allocator_);
+  String why(allocator_);
+  if (!a || !a->name.assign(name)) {
+    error_to(asker, call, "org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
+    return nullptr;
+  }
+  a->handle = launcher_->start(kind_, name, ArrayView<const StringView>(argv, words.count()), &why);
+  if (a->handle == 0) {
+    String text(allocator_);
+    text.append("Failed to execute program ");
+    text.append(name);
+    if (!why.empty()) { text.append(": "); text.append(why.view()); }
+    error_to(asker, call, "org.freedesktop.DBus.Error.Spawn.ExecFailed", text.view());
+    return nullptr;
+  }
+  a->deadline_us = now_us_ ? now_us_ + activation_timeout_us_ : 0;
+  Activation* made = a.get();
+  if (!activations_.push_back(util::move(a))) {
+    launcher_->forget(made->handle);
+    error_to(asker, call, "org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
+    return nullptr;
+  }
+  return made;
+}
+
+void Bus::fail_activation(Activation& a, StringView error_name, StringView text) {
+  for (Activation::Queued& q : a.queued.view()) {
+    if (queued_for_activation_) --queued_for_activation_;
+    Connection* c = find(q.from);
+    if (c && c->queued_for_activation) --c->queued_for_activation;
+    if (c && !c->closing && q.message) error_to(*c, *q.message, error_name, text);
+  }
+  a.queued.clear();
+  for (const Activation::Starter& s : a.starters.view()) {
+    Connection* c = find(s.client);
+    if (!c || c->closing || !s.wants_reply) continue;
+    Message call(allocator_);      // (what error_to needs of the call: its serial, and that it wants an answer)
+    call.type = kMethodCall;
+    call.serial = s.serial;
+    error_to(*c, call, error_name, text);
+  }
+  a.starters.clear();
+}
+
+// Activations whose service has taken its name (the waiting messages go on, StartServiceByName says 1) or failed (everyone waiting is told).
+void Bus::finish_activations() {
+  for (uint64_t i = 0; i < activations_.count();) {
+    Activation& a = *activations_[i];
+    bool done = false;
+    if (owner_of(a.name.view())) {
+      List<Activation::Queued> queued(allocator_);
+      for (Activation::Queued& q : a.queued.view()) queued.push_back(util::move(q));
+      a.queued.clear();
+      for (const Activation::Starter& s : a.starters.view()) {
+        Connection* c = find(s.client);
+        if (!c || c->closing || !s.wants_reply) continue;
+        Message r(allocator_);
+        if (!from_bus(&r, kMethodReturn) || !r.destination.assign(c->unique.view()) || !r.signature.assign("u")) continue;
+        r.has_reply_serial = true;
+        r.reply_serial = s.serial;
+        Writer w(r.body);
+        w.u32(kStartSuccess);
+        if (!w.ok() || !encode_wire(r)) continue;
+        deliver(*c, r, wire_);
+        broadcast(r, c, false);
+      }
+      a.starters.clear();
+      launcher_->forget(a.handle);
+      activations_.remove_at(i);      // (before the messages go: one that asks for the service again finds it running)
+      for (Activation::Queued& q : queued.view()) {
+        if (queued_for_activation_) --queued_for_activation_;
+        Connection* c = find(q.from);
+        if (c && c->queued_for_activation) --c->queued_for_activation;
+        if (c && !c->closing && q.message) route(c, *q.message);
+      }
+      continue;
+    }
+    uint32_t code = 0;
+    String why(allocator_);
+    const IServiceLauncher::State st = launcher_->poll(a.handle, &code, &why);
+    String text(allocator_);
+    if (st == IServiceLauncher::State::Exited) {
+      text.append("Process ");
+      text.append(a.name.view());
+      text.append(" exited with status ");
+      text.append_uint(code);
+      fail_activation(a, "org.freedesktop.DBus.Error.Spawn.ChildExited", text.view());
+      done = true;
+    } else if (st == IServiceLauncher::State::CouldNotRun) {
+      text.append("Failed to execute program ");
+      text.append(a.name.view());
+      if (!why.empty()) { text.append(": "); text.append(why.view()); }
+      fail_activation(a, "org.freedesktop.DBus.Error.Spawn.ExecFailed", text.view());
+      done = true;
+    } else if (now_us_ && a.deadline_us == 0) {
+      a.deadline_us = now_us_ + activation_timeout_us_;
+    } else if (now_us_ && now_us_ >= a.deadline_us) {
+      text.append("Activation of ");
+      text.append(a.name.view());
+      text.append(" timed out");
+      fail_activation(a, "org.freedesktop.DBus.Error.TimedOut", text.view());
+      done = true;
+    }
+    if (done) {
+      launcher_->forget(a.handle);
+      activations_.remove_at(i);
+    } else {
+      ++i;
+    }
+  }
 }
 
 void Bus::deliver_locals() {
@@ -459,6 +733,9 @@ uint64_t Bus::output_waiting(uint32_t client) const {
 }
 
 void Bus::tick(uint64_t now_us) {
+  now_us_ = now_us ? now_us : 1;
+  expire_replies();
+  if (activations_.count()) finish_activations();
   for (uint64_t i = 0; i < local_peers_.count(); ++i) {
     Connection* c = find(local_peers_[i]);
     if (c && c->local) c->local->tick(now_us);

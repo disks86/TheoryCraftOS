@@ -74,6 +74,35 @@
 #include "DBus/Notifications.hpp"
 #include "DBus/SocketServer.hpp"
 #include "Process/UnixSockets.hpp"
+#include <functional>
+#include <memory>
+// Activated services run as more emulated programs: `run` (set in main, where the program's pieces are) starts one on a thread of its own.
+struct EmuLauncher final : dbus::IServiceLauncher {
+  struct Child {
+    std::atomic<int> state{0};      // 0 running, 1 exited, 2 could not run
+    std::atomic<uint32_t> code{0};
+  };
+  std::function<bool(const std::vector<std::string>&, Child&)> run;
+  std::vector<std::unique_ptr<Child>> children;
+  uint64_t start(dbus::BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
+    std::vector<std::string> args;
+    for (const StringView& a : argv) args.push_back(std::string(a.data(), a.size()));
+    children.push_back(std::make_unique<Child>());
+    if (!run || !run(args, *children.back())) {
+      children.pop_back();
+      why->assign("cannot load the program");
+      return 0;
+    }
+    printf("dbus activate: %.*s -> %s\n", int(name.size()), name.data(), args[0].c_str());
+    return children.size();
+  }
+  State poll(uint64_t handle, uint32_t* code, String*) override {
+    const Child& c = *children[handle - 1];
+    *code = c.code;
+    return c.state == 0 ? State::Running : c.state == 1 ? State::Exited : State::CouldNotRun;
+  }
+  void forget(uint64_t) override {}
+};
 // (the D-Bus transport's clock; the kernel's comes from the timestamp counter)
 namespace hardware {
 uint64_t uptime_us() {
@@ -536,6 +565,58 @@ int main(int argc, char** argv) {
   if (!dbus_notes.start()) printf("dbus: notifications did not start\n");
   dbus::SocketServer dbus_sockets(*process::system_unix_sockets(), a);
   if (!dbus::listen_standard_sockets(dbus_sockets, dbus_system, dbus_session, &fs, a)) printf("dbus: could not listen\n");
+  // TCOS_EMU_DBUS_SERVICES: a folder of .service files (in the Linux tree) for the session bus; their programs run as more emulated programs
+  EmuLauncher dbus_launcher;
+  std::vector<std::unique_ptr<process::UserProgram>> service_programs;
+  std::vector<std::unique_ptr<Ctl>> service_controls;
+  std::vector<std::thread> service_threads;
+  std::vector<std::vector<uint8_t>> service_images;
+  dbus_launcher.run = [&](const std::vector<std::string>& args, EmuLauncher::Child& child) {
+    const std::string path = std::string(filesystem::layout::kLinux) + args[0];
+    UniquePointer<filesystem::IFile> file;
+    if (fs.open_file(StringView(path.c_str()), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) {
+      printf("dbus service: no %s\n", path.c_str());
+      return false;
+    }
+    service_images.emplace_back(file->size());
+    std::vector<uint8_t>& image = service_images.back();
+    uint64_t got = 0;
+    file->read(0, ByteView(image.data(), image.size()), &got);
+    auto program = std::make_unique<process::UserProgram>(a, 200 + uint64_t(service_programs.size()), h);
+    program->set_file_system(&fs);
+    program->set_library_provider(&libs);
+    program->set_processor_count(1);
+    std::vector<StringView> sargs, senv;
+    for (const std::string& x : args) sargs.push_back(StringView(x.data(), x.size()));
+    const ConstByteView bytes(image.data(), image.size());
+    for (const StringView& e : process::default_environment(process::abi_for_executable(exe::identify_executable(bytes.at_most(exe::kIdentifyBytes))))) senv.push_back(e);
+    senv.push_back("DBUS_STARTER_ADDRESS=unix:path=/run/user/0/bus");
+    senv.push_back("DBUS_STARTER_BUS_TYPE=session");
+    if (program->load(bytes, ArrayView<const StringView>(sargs.data(), sargs.size()), ArrayView<const StringView>(senv.data(), senv.size()), ConstByteView(rnd, 16)) !=
+        process::LoadStatus::Ok) {
+      printf("dbus service: load failed (%.*s)\n", int(program->load_detail().size()), program->load_detail().data());
+      return false;
+    }
+    process::UserProgram* raw = program.get();
+    service_programs.push_back(std::move(program));
+    service_controls.push_back(std::make_unique<Ctl>());
+    Ctl* ctl_s = service_controls.back().get();
+    service_threads.emplace_back([&a, raw, ctl_s, &child] {
+      auto cpu_s = create_guest_cpu(raw->start().arch, a);
+      Sync sync_s; Threads th_s;
+      auto o = run_emulated_threads(*raw, *cpu_s.get(), *ctl_s, sync_s, th_s, a, 20000);
+      child.code = o.exit_code;
+      child.state = 1;
+      printf("dbus service: exit=%u faulted=%d\n", o.exit_code, o.faulted);
+    });
+    return true;
+  };
+  std::string services_folder;
+  if (const char* folder = getenv("TCOS_EMU_DBUS_SERVICES")) {
+    services_folder = std::string(filesystem::layout::kLinux) + folder;
+    const StringView folders[] = {StringView(services_folder.c_str())};
+    dbus_session.set_activation(&dbus_launcher, &fs, ArrayView<const StringView>(folders, 1));
+  }
   std::atomic<bool> dbus_stop{false};
   std::atomic<uint32_t> dbus_most{0};
   std::thread dbus_thread([&] {
@@ -550,6 +631,9 @@ int main(int argc, char** argv) {
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
 #ifdef TCOS_EMU_DBUS
+  for (auto& c : service_controls) c->stop = true;      // (the activated services end with the program that used them)
+  for (std::thread& t : service_threads) t.join();
+  printf("dbus: %zu services started\n", service_threads.size());
   for (int i = 0; i < 50 && dbus_sockets.connections() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
   dbus_stop = true;
   dbus_thread.join();
