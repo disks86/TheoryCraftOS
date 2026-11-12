@@ -766,6 +766,10 @@ int main(int argc, char** argv) {
   wl_server.set_clipboard(nullptr);
 #ifdef TCOS_EMU_DMABUF
   printf("wayland-desktop: %d draws on the device, %d on the CPU\n", wl_gpu_draws.load(), wl_cpu_draws.load());
+  {
+    const wayland::DxgImageDraws images = wayland::dxg_image_draws();
+    printf("wayland-desktop: GPU buffers drawn %llu times in place, %llu from the CPU\n", (unsigned long long)images.in_place, (unsigned long long)images.from_cpu);
+  }
   // (a dmabuf the program still has open holds an export of the kernel, which goes before the program: its descriptors are closed first)
   if (process::Process* proc = p.process())
     for (uint64_t fd = 0; fd < process::ProcessFiles::kMaxDescriptors; ++fd) proc->files().close(fd);
