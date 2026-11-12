@@ -76,6 +76,7 @@ struct GraphObject {
   uint32_t state = kNodeStateIdle;
   float volume = 1.0f;
   bool mute = false;
+  float balance_left = 1.0f, balance_right = 1.0f;   // the sides' share of the volume (the louder one is 1): a playing stream's pan
   SharedPointer<PlaybackStream> playback;            // a stream a protocol opened
   SharedPointer<RecordStream> record;                // a record stream a protocol opened
   SharedPointer<audio::AudioStream> native;          // a stream a native program opened on the mixer
@@ -146,6 +147,10 @@ class Graph {
   // hub's master gain and mute. (Record streams and the source go no higher than 1.)
   bool set_volume(uint32_t node, float volume, bool mute);
   bool get_volume(uint32_t node, float* volume, bool* mute);
+  // A playing stream's two sides (linear, 0 .. 1.5): the louder is its volume, the balance becomes its pan (audio::pan_for_gains). Other nodes have no
+  // balance: the louder side is their volume.
+  bool set_balance(uint32_t node, float left, float right, bool mute);
+  bool get_balance(uint32_t node, float* left, float* right, bool* mute);
   bool set_paused(uint32_t node, bool paused);
   uint32_t sink_id() const { return sink_; }
   // 0 when there is no capture hub.

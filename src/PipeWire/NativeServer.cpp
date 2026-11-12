@@ -98,9 +98,9 @@ void drop_front(ByteBuffer& b, uint64_t n) {
 
 }  // namespace
 
-void build_props_param(pod::Builder& b, float volume, bool mute, uint32_t channels) {
+void build_props_param(pod::Builder& b, float volume, bool mute, uint32_t channels, float left, float right) {
   const uint32_t n = channels == 1 ? 1 : 2;
-  const float volumes[2] = {volume, volume};
+  const float volumes[2] = {volume * (n == 1 ? 1.0f : left), volume * (n == 1 ? 1.0f : right)};
   const uint32_t map_stereo[2] = {kFL, kFR}, map_mono[1] = {kMono};
   const uint64_t f = b.begin_object(kObjectProps, kParamProps);
   b.property(kPropVolume);
@@ -460,7 +460,7 @@ void NativeServer::send_params(Client& c, Resource& r, uint32_t seq, uint32_t pa
     b.id(param_id);
     b.int32(0);
     b.int32(1);
-    if (param_id == kParamProps) build_props_param(b, volume, mute, format.channels);
+    if (param_id == kParamProps) build_props_param(b, volume, mute, format.channels, o.balance_left, o.balance_right);
     else build_format_param(b, param_id, format);
     b.end(f);
     end(c, m);
@@ -638,6 +638,8 @@ void NativeServer::node_method(Client& c, Resource& r, uint32_t opcode, pod::Par
       float volume = 1.0f;
       bool mute = false;
       if (!graph_.get_volume(r.global, &volume, &mute)) return;
+      float sides[2] = {volume, volume};
+      bool have_sides = false;
       pod::ObjectReader o;
       if (!o.open(param)) { protocol_error(c, r.id, kEINVAL, "Props must be an object"); return; }
       uint32_t key = 0, pflags = 0;
@@ -654,12 +656,16 @@ void NativeServer::node_method(Client& c, Resource& r, uint32_t opcode, pod::Par
               a.get32(i, &bits);
               const float f = __builtin_bit_cast(float, bits);
               if (f > loudest) loudest = f;
+              if (i < 2) sides[i] = f;
             }
             volume = loudest;
+            have_sides = a.count() >= 2;
           }
         }
       }
-      graph_.set_volume(r.global, volume, mute);
+      // two channels or more: the first two are front left and right (the channel map the node reports), a balance
+      if (have_sides) graph_.set_balance(r.global, sides[0], sides[1], mute);
+      else graph_.set_volume(r.global, volume, mute);
       break;
     }
     case kNodeSendCommand: break;

@@ -1699,6 +1699,55 @@ static void test_native_capture() {
   CHECK(g.record_count() == 0);
 }
 
+// A playing stream's balance: PulseAudio's per-channel volumes (pavucontrol's balance) become the stream's pan and read back; the mix follows.
+static void test_balance() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  PulseServer server(g, A);
+  PulseClient c(server);
+  uint8_t cookie[256] = {};
+  std::vector<uint8_t> body;
+  uint32_t cmd = 0;
+  uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  const pulse::SampleSpec spec{pulse::kS16Le, 2, 48000};
+  t = c.command(3, [&](pulse::TagWriter& w) { put_create_playback(w, spec, 19200, "balanced"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  uint32_t channel = 0, node = 0;
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    CHECK(r.u32(&channel) && r.u32(&node));
+  }
+  pulse::Cvolume v; v.channels = 2; v.values[0] = pulse::kVolumeNorm; v.values[1] = linear_to_pulse_volume(0.25f);
+  t = c.command(37, [&](pulse::TagWriter& w) { w.u32(node); w.cvolume(v); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  float l = 0, r = 0; bool mute = true;
+  CHECK(g.get_balance(node, &l, &r, &mute) && l == 1.0f && fabsf(r - 0.25f) < 0.01f && !mute);
+  t = c.command(29, [&](pulse::TagWriter& w) { w.u32(node); });      // the sink input's volume reads back per channel
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+    uint32_t idx, module, owner, sink; StringView name; pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume got;
+    CHECK(rd.u32(&idx) && rd.string(&name) && rd.u32(&module) && rd.u32(&owner) && rd.u32(&sink) && rd.sample_spec(&ss) && rd.channel_map(&map) && rd.cvolume(&got) &&
+          got.channels == 2 && got.values[0] == pulse::kVolumeNorm && got.values[1] == v.values[1]);
+  }
+  std::vector<uint8_t> tone = s16_constant(4800, 2, 8000);
+  c.packet(channel, ConstByteView(tone.data(), tone.size()));
+  dev.take();
+  mixer.pump();
+  std::vector<int16_t> out = dev.take();
+  CHECK(out.size() > 400 && out[200] > 7000 && out[201] > 1000 && out[201] < out[200] / 2);      // (louder on the left, still heard on the right)
+  // the native protocol's Props show the same two volumes
+  ByteBuffer pb(A);
+  pod::Builder b(pb);
+  build_props_param(b, 0.8f, false, 2, 1.0f, 0.5f);
+  CHECK(pb.size() > 0);
+  server.close_client(c.handle);
+}
+
 // ---- the Windows service -------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows_service() {
@@ -1926,6 +1975,7 @@ int main() {
   test_record_threads();
   test_monitor();
   test_native_capture();
+  test_balance();
   test_sockets();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());

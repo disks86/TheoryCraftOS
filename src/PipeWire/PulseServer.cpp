@@ -796,7 +796,10 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       if (cmd == kSetSinkInputVolume) {
         Cvolume v;
         if (!t.cvolume(&v) || v.channels == 0) return invalid();
-        volume = pulse_volume_to_linear(v.max());
+        // (two channels or more: the first two are front left and right, a balance; pavucontrol's balance slider)
+        if (v.channels >= 2) graph_.set_balance(index, pulse_volume_to_linear(v.values[0]), pulse_volume_to_linear(v.values[1]), mute);
+        else graph_.set_volume(index, pulse_volume_to_linear(v.max()), mute);
+        return send_simple_reply(c, tag);
       } else if (!t.boolean(&mute)) {
         return invalid();
       }
@@ -1182,7 +1185,12 @@ void PulseServer::fill_sink_input(Client& c, TagWriter& w, const GraphObject& o)
   w.u32(graph_.sink_id());
   w.sample_spec(spec);
   w.channel_map(default_map(spec.channels));
-  w.cvolume(flat_volume(spec.channels, linear_to_pulse_volume(o.volume)));
+  Cvolume volume = flat_volume(spec.channels, linear_to_pulse_volume(o.volume));
+  if (spec.channels >= 2) {
+    volume.values[0] = linear_to_pulse_volume(o.volume * o.balance_left);
+    volume.values[1] = linear_to_pulse_volume(o.volume * o.balance_right);
+  }
+  w.cvolume(volume);
   w.usec(kSinkLatencyUs);
   w.usec(kSinkLatencyUs);
   w.string("speex-float-1");

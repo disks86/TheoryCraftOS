@@ -226,13 +226,8 @@ uint32_t WindowsAudioService::set_volume(uint64_t pid, uint32_t stream, uint32_t
   float volume = 1.0f;
   bool mute = false;
   if (!graph_.get_volume(node, &volume, &mute)) return kInvalidHandle;
-  // the louder side is the stream's volume, the other one a pan (the sink has no balance: its volume is the louder side)
-  if (stream && stream != kSourceStream && !graph_.record_of(stream)) {
-    SharedPointer<PlaybackStream> s = graph_.playback_of(stream);
-    if (!s) return kInvalidHandle;
-    s->stream().set_pan(audio::pan_for_gains(left, right, s->stream().format().channels == 1));
-  }
-  return graph_.set_volume(node, static_cast<float>(left > right ? left : right) / 65535.0f, mute) ? kSuccess : kInvalidHandle;
+  // (a playing stream's louder side is its volume, the other one a pan; the master volumes and record streams have no balance)
+  return graph_.set_balance(node, static_cast<float>(left) / 65535.0f, static_cast<float>(right) / 65535.0f, mute) ? kSuccess : kInvalidHandle;
 }
 
 uint32_t WindowsAudioService::get_volume(uint64_t pid, uint32_t stream, uint32_t* left, uint32_t* right, bool* mute) {
@@ -241,22 +236,12 @@ uint32_t WindowsAudioService::get_volume(uint64_t pid, uint32_t stream, uint32_t
   uint32_t node = 0;
   const uint32_t st = volume_node(pid, stream, &node);
   if (st != kSuccess) return st;
-  float volume = 1.0f;
-  if (!graph_.get_volume(node, &volume, mute)) return kInvalidHandle;
-  if (volume > 1.0f) volume = 1.0f;
-  const uint32_t loudest = static_cast<uint32_t>(volume * 65535.0f + 0.5f);
-  *left = *right = loudest;
-  if (stream && stream != kSourceStream && !graph_.record_of(stream)) {
-    SharedPointer<PlaybackStream> s = graph_.playback_of(stream);
-    if (!s) return kInvalidHandle;
-    int32_t l = 0, r = 0;
-    audio::pan_gains(s->stream().pan(), s->stream().format().channels == 1, &l, &r);
-    const int32_t most = l > r ? l : r;
-    if (most > 0) {
-      *left = static_cast<uint32_t>((uint64_t{loudest} * static_cast<uint32_t>(l) + static_cast<uint32_t>(most) / 2) / static_cast<uint32_t>(most));
-      *right = static_cast<uint32_t>((uint64_t{loudest} * static_cast<uint32_t>(r) + static_cast<uint32_t>(most) / 2) / static_cast<uint32_t>(most));
-    }
-  }
+  float l = 1.0f, r = 1.0f;
+  if (!graph_.get_balance(node, &l, &r, mute)) return kInvalidHandle;
+  if (l > 1.0f) l = 1.0f;
+  if (r > 1.0f) r = 1.0f;
+  *left = static_cast<uint32_t>(l * 65535.0f + 0.5f);
+  *right = static_cast<uint32_t>(r * 65535.0f + 0.5f);
   return kSuccess;
 }
 

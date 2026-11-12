@@ -105,9 +105,11 @@ microphone: form factor `Microphone`, its own id and GUID, `DEVINTERFACE_AUDIO_C
 stream of the graph in its own format (any format the graph converts, as `AUTOCONVERTPCM` would), event-driven or polled, with `IAudioRenderClient`,
 `IAudioClock`, `IAudioStreamVolume`, `IChannelAudioVolume`; the process's audio session (`ISimpleAudioVolume`, `IAudioSessionControl2`,
 `IAudioSessionManager2`); `IAudioEndpointVolume` as the master volume (scalar = cube root of the amplitude, as `pactl`/`wpctl` show it) with change
-callbacks; `IAudioMeterInformation` (silence); `ActivateAudioInterfaceAsync`. The padding is what the graph's mixer has not taken yet
+callbacks (changes from outside the process, pactl or the desktop, too: a watcher thread looks every 100 ms while there are callbacks); session
+events (`IAudioSessionEvents`: volume, mute, active/inactive) and `IMMNotificationClient` (endpoints coming and going); `IAudioMeterInformation` (silence); `ActivateAudioInterfaceAsync`. The padding is what the graph's mixer has not taken yet
 (NtTcosAudio STATUS `[4]`), as in Windows, so the device's own queue never stops a client from writing; the clock is what the device has played.
-A stream's left/right volume pair becomes its volume and pan in the graph (`audio::pan_for_gains`), and `SET_MUTE` mutes without losing the volume.
+A stream's left/right volume pair becomes its volume and pan in the graph (`Graph::set_balance`, as PulseAudio's per-channel volumes and the
+native protocol's `channelVolumes` do), and `SET_MUTE` mutes without losing the volume.
 A capture endpoint's client is a record stream: a thread reads what the kernel recorded into the client's ring every period, `IAudioCaptureClient`
 hands it out a packet (10 ms) at a time with its device position and QPC time, `GetNextPacketSize` is 0 until a whole packet is there (what is left
 comes out once stopped), the padding is everything waiting to be read, and audio the kernel lost (`STATUS [5]`) flags the next packet
@@ -143,12 +145,13 @@ comes out once stopped), the padding is everything waiting to be read, and audio
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).
 - **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused);
-  endpoint and session notifications are accepted but never sent (nothing changes from outside the process); the master volume has no balance.
+  the master volume has no balance.
   DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`, no capture effects such as AEC or noise suppression) and no property sets
   (`IKsPropertySet`, EAX). WASAPI capture packets are always 10 ms
   (`IAudioClient3`'s smaller shared periods are not offered for capture either).
 - **More than one sink.** The graph follows the mixer's one output device; switching devices is the `AudioRouter`'s, not PipeWire's
   (`move-sink-input`, `set-default-sink` to another device do nothing).
-- **Formats, controls.** PulseAudio sample-rate updates, passthrough formats, per-channel volumes (the loudest channel is taken), PipeWire
-  `Route`/`Profile` params, and links made or destroyed by clients.
+- **Formats, controls.** PulseAudio sample-rate updates (`UPDATE_PLAYBACK_STREAM_SAMPLE_RATE`: an `AudioStream`'s rate is fixed), passthrough
+  formats, volumes beyond front left/right (a playing stream has a balance: `Graph::set_balance`; other channels follow the louder side; the sink
+  and source have none), PipeWire `Route`/`Profile` params, and links made or destroyed by clients.
 - **Not run in QEMU** with a real dynamically linked libpulse program: the Linux layer's dynamic loading of such programs is not validated yet.

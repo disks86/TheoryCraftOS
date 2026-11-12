@@ -122,7 +122,8 @@ class NativeServer final : public IProtocolServer {
 };
 
 // Builders shared with the tests: the param objects of a node (Props, EnumFormat/Format) as PipeWire writes them.
-void build_props_param(pod::Builder& b, float volume, bool mute, uint32_t channels);
+// (left, right: the sides' share of the volume, 1 for the louder)
+void build_props_param(pod::Builder& b, float volume, bool mute, uint32_t channels, float left = 1.0f, float right = 1.0f);
 void build_format_param(pod::Builder& b, uint32_t param_id, const PcmFormat& format);
 
 }  // namespace pipewire

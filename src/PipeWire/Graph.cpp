@@ -17,6 +17,7 @@
  */
 
 #include "PipeWire/Graph.hpp"
+#include "Audio/Pan.hpp"
 
 namespace pipewire {
 
@@ -675,6 +676,36 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
     capture_->set_master_gain(to_device_volume(volume));
     capture_->set_master_muted(mute);
   }
+  return true;
+}
+
+bool Graph::set_balance(uint32_t node_id, float left, float right, bool mute) {
+  if (!(left >= 0.0f)) left = 0.0f;
+  if (!(right >= 0.0f)) right = 0.0f;
+  const float volume = left > right ? left : right;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* node = find_locked(node_id);
+    if (!node || node->type != ObjectType::Node) return false;
+    audio::AudioStream* stream = node->playback ? &node->playback->stream() : node->native.get();
+    if (node->role == NodeRole::Playback && stream && volume > 0.0f) {
+      node->balance_left = left / volume;
+      node->balance_right = right / volume;
+      const bool mono = stream->format().channels == 1;
+      stream->set_pan(audio::pan_for_gains(static_cast<uint32_t>(node->balance_left * 65535.0f + 0.5f), static_cast<uint32_t>(node->balance_right * 65535.0f + 0.5f), mono));
+      touch_locked(*node);
+    }
+  }
+  return set_volume(node_id, volume, mute);
+}
+
+bool Graph::get_balance(uint32_t node_id, float* left, float* right, bool* mute) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(node_id);
+  if (!node || node->type != ObjectType::Node) return false;
+  *left = node->volume * node->balance_left;
+  *right = node->volume * node->balance_right;
+  *mute = node->mute;
   return true;
 }
 
