@@ -745,7 +745,7 @@ void collect(const std::string& dir, std::vector<std::string>* out) {
 // each draw is still offered to it: a draw it would have taken ends as "the device picture is out of date", any other reason is what keeps it off the 3D hardware.
 struct SurveyAccel final : webgl::IAccelerator {
   const char* name() const override { return "survey"; }
-  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true, true, true, true, true}; }
+  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true, true, true, true, true, 30}; }
   uint32_t create_program(const char*, const char*, uint32_t, uint32_t, uint32_t) override { return ++programs; }
   uint32_t create_program_stages(const char*, const char*, uint32_t, uint32_t, uint32_t, const webgl::AccelStages&) override { return ++programs; }
   void destroy_program(uint32_t) override {}

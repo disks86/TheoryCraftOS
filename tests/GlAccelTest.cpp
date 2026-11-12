@@ -186,9 +186,10 @@ static void test_translate_refusals() {
     // a lookup in the vertex shader
     prog = make_program(gl, "attribute vec2 pos; attribute vec3 col; uniform sampler2D tex; varying vec3 vcol; void main() { vcol = col; gl_Position = texture2D(tex, pos); }", kFs);
     CHECK(!translate(gl, a, prog, &t, &why));
-    // derivatives
+    // derivatives are DDX and DDY (fwidth: the sum of their absolute values)
     prog = make_program(gl, kVs, "#extension GL_OES_standard_derivatives : enable\nprecision mediump float; varying vec3 vcol; void main() { gl_FragColor = vec4(fwidth(vcol.x)); }");
-    CHECK(!translate(gl, a, prog, &t, &why));
+    CHECK(translate(gl, a, prog, &t, &why));
+    CHECK(strstr(t.fs.c_str(), "DDX") && strstr(t.fs.c_str(), "DDY"));
     // too many uniforms for the 128 bytes of constants
     prog = make_program(gl, kVs, "precision mediump float; varying vec3 vcol; uniform mat4 a; uniform mat4 b; uniform mat4 c; void main() { gl_FragColor = a * b * c * vec4(vcol, 1.0); }");
     CHECK(!translate(gl, a, prog, &t, &why));
@@ -1021,10 +1022,10 @@ static void test_webgpu_refusals() {
   FakeAccel fake;
   set_accelerator(&fake);
   {
-    // a bitwise integer operator in the vertex shader: it stays on the CPU
+    // a shift past what a float holds exactly, in the vertex shader: it stays on the CPU
     const char* looped =
         "struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32>, }\n"
-        "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VsOut { var o: VsOut; var s = 1u; s = s ^ 3u; o.pos = vec4<f32>(p, 0.0, 1.0); o.color = c; return o; }\n"
+        "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> VsOut { var o: VsOut; var s = 1u; s = s << 30u; o.pos = vec4<f32>(p, 0.0, 1.0); o.color = c; return o; }\n"
         "@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color, 1.0); }\n";
     GpuScene sc(a, looped);
     CHECK(sc.pass(false));
@@ -1139,7 +1140,7 @@ static void test_device_only_clear() {
 // A reference "device": the TGSI the translator wrote is run by the test interpreter (tests/TgsiMachine.hpp), on the CPU rasterizer of src/WebGl, with the state
 // of AccelState. A scene drawn by it and by the CPU path must give the same picture, which checks the translation (and GlAccel's packing of the inputs).
 struct TgsiAccel : IAccelerator {
-  struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; AccelStages st; };
+  struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; bool depth_out = false, derivatives = false; AccelStages st; };
   struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   std::vector<Prog> progs;
@@ -1148,7 +1149,7 @@ struct TgsiAccel : IAccelerator {
   int draws = 0, refused = 0;
   const char* name() const override { return "tgsi reference"; }
   bool stages = true;   // (false: a device without geometry and tessellation stages)
-  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true, true}; }
+  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true, true, 30}; }
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     return create_program_stages(vs, fs, attributes, varyings, textures, AccelStages());
   }
@@ -1175,6 +1176,8 @@ struct TgsiAccel : IAccelerator {
       if (line.find("FACE") != std::string::npos) p.face = i;
       at = eol;
     }
+    p.depth_out = p.fs.find("DCL OUT[1], POSITION") != std::string::npos;
+    p.derivatives = p.fs.find("DDX") != std::string::npos || p.fs.find("DDY") != std::string::npos;
     progs.push_back(p);
     return static_cast<uint32_t>(progs.size());
   }
@@ -1256,25 +1259,41 @@ struct TgsiAccel : IAccelerator {
       for (uint32_t i = 0; i < 8; ++i)      // (clip distances: interpolated after the varyings, a fragment where an enabled one is below zero is cut)
         if ((st->clip_mask >> i) & 1 && f.varyings[p->varyings * 4 + i] < 0) return;
       static tgsi_test::TgsiMachine m;
-      m = tgsi_test::TgsiMachine();
-      for (uint32_t r = 0; r < const_rows; ++r)
-        for (int k = 0; k < 4; ++k) m.cst[r][k] = constants[r * 4 + k];
-      for (uint32_t i = 0; i < p->varyings; ++i)
-        for (int k = 0; k < 4; ++k) m.in[i][k] = f.varyings[i * 4 + k];
-      if (p->position >= 0)
-        for (int k = 0; k < 4; ++k) m.in[p->position][k] = f.coord[k];
-      if (p->face >= 0) m.in[p->face][0] = m.in[p->face][1] = m.in[p->face][2] = m.in[p->face][3] = f.front ? 1.0f : -1.0f;
-      m.textures = &sampling;
-      if (!m.run(p->fs)) { ok = false; return; }
+      std::vector<float> vary(p->varyings * 4 + 8), log_x, log_y;
+      // (the shader at pixel (px, py) with the fragment's varyings there; derivatives run it to the right and above first, as the CPU does)
+      const auto run_at = [&](int32_t px, int32_t py, bool same, std::vector<float>* record) {
+        m = tgsi_test::TgsiMachine();
+        for (uint32_t r = 0; r < const_rows; ++r)
+          for (int k = 0; k < 4; ++k) m.cst[r][k] = constants[r * 4 + k];
+        if (same) for (uint64_t i = 0; i < vary.size(); ++i) vary[i] = f.varyings[i];
+        else f.varyings_at(px, py, vary.data(), static_cast<uint32_t>(vary.size()));
+        for (uint32_t i = 0; i < p->varyings; ++i)
+          for (int k = 0; k < 4; ++k) m.in[i][k] = vary[i * 4 + k];
+        if (p->position >= 0) {
+          for (int k = 0; k < 4; ++k) m.in[p->position][k] = f.coord[k];
+          m.in[p->position][0] = static_cast<float>(px) + 0.5f;
+          m.in[p->position][1] = static_cast<float>(py) + 0.5f;
+        }
+        if (p->face >= 0) m.in[p->face][0] = m.in[p->face][1] = m.in[p->face][2] = m.in[p->face][3] = f.front ? 1.0f : -1.0f;
+        m.textures = &sampling;
+        m.derivative_record = record;
+        if (!same) return m.run(p->fs);
+        m.derivative_x = &log_x;
+        m.derivative_y = &log_y;
+        return m.run(p->fs);
+      };
+      if (p->derivatives && (!run_at(f.x + 1, f.y, false, &log_x) || !run_at(f.x, f.y + 1, false, &log_y))) { ok = false; return; }
+      if (!run_at(f.x, f.y, true, nullptr)) { ok = false; return; }
       if (m.killed) return;
+      const float z = p->depth_out ? (m.out[1][2] < 0 ? 0 : (m.out[1][2] > 1 ? 1 : m.out[1][2])) : f.z;
       const uint64_t at = uint64_t(f.y) * t->w + uint64_t(f.x);
       if (st->depth_test) {
         const float d = t->depth[at];
         const uint8_t op = st->custom_blend ? st->depth_compare : 3;
-        const bool pass = op == 0 ? false : op == 1 ? f.z < d : op == 2 ? f.z == d : op == 3 ? f.z <= d : op == 4 ? f.z > d : op == 5 ? f.z != d : op == 6 ? f.z >= d : true;
+        const bool pass = op == 0 ? false : op == 1 ? z < d : op == 2 ? z == d : op == 3 ? z <= d : op == 4 ? z > d : op == 5 ? z != d : op == 6 ? z >= d : true;
         if (!pass) return;
       }
-      if (st->depth_write) t->depth[at] = f.z;
+      if (st->depth_write) t->depth[at] = z;
       float src[4], dst[4];
       for (int k = 0; k < 4; ++k) {
         src[k] = m.out[0][k] < 0 ? 0 : (m.out[0][k] > 1 ? 1 : m.out[0][k]);

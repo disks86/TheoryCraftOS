@@ -68,6 +68,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.tessellation = (info.features & kFeatureTessellation) != 0;
   l.clip_distances = (info.features & kFeatureClipDistances) != 0;
   l.float_textures = (info.features & kFeatureFloatFormats) != 0;
+  l.control_varyings = info.limits.control_varyings;
   return l;
 }
 
