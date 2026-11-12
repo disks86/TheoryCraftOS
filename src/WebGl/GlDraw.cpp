@@ -646,12 +646,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default && !desktop.primitive_sink && (mode <= 6 || p->has_extra()) && !(desktop.active && desktop.clip_mask)) {
+  if (target.is_default && !desktop.primitive_sink && (mode <= 6 || p->has_extra())) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
   } else if (target.is_default) {
     hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
-    hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : (mode > 6 ? "adjacency or patches without a geometry or tessellation stage" : "clip planes"));
+    hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : "adjacency or patches without a geometry or tessellation stage");
   }
 
   // varying flags for the rasterizer

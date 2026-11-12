@@ -536,6 +536,9 @@ struct GraphicsPipelineDesc {
   bool independent_blend = false;
   BlendState target_blend[kMaxColorTargets - 1];
   uint32_t color_target_count = 1;                    // kFeatureMultipleTargets: how many colour outputs the fragment shader writes (the render pass must have at least as many images); blend state applies to each
+  // kFeatureClipDistances: which clip distances the last stage before the rasterizer writes (TGSI: CLIPDIST[0] .x .. .w are 0 .. 3, CLIPDIST[1] 4 .. 7) cut the primitives:
+  // bit i, distance i (what is below zero is cut away).
+  uint8_t clip_distances = 0;
 };
 
 class IPipeline {
@@ -683,6 +686,7 @@ enum DeviceFeature : uint32_t {
   kFeatureTextureKinds = 1u << 8,      // ImageDesc::kind other than Texture2D, layer_count / write_layer_pixels / read_layer_pixels, ITextureSet::sample_volume
   kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
+  kFeatureClipDistances = 1u << 28,    // GraphicsPipelineDesc::clip_distances (TGSI shaders' CLIPDIST outputs)
 };
 
 

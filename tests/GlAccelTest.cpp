@@ -1148,7 +1148,7 @@ struct TgsiAccel : IAccelerator {
   int draws = 0, refused = 0;
   const char* name() const override { return "tgsi reference"; }
   bool stages = true;   // (false: a device without geometry and tessellation stages)
-  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages}; }
+  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true}; }
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     return create_program_stages(vs, fs, attributes, varyings, textures, AccelStages());
   }
@@ -1241,6 +1241,8 @@ struct TgsiAccel : IAccelerator {
     bool ok = true;
     void fragment(const gpu::Fragment& f) override {
       if (f.x < 0 || f.y < 0 || static_cast<uint32_t>(f.x) >= t->w || static_cast<uint32_t>(f.y) >= t->h) return;
+      for (uint32_t i = 0; i < 8; ++i)      // (clip distances: interpolated after the varyings, a fragment where an enabled one is below zero is cut)
+        if ((st->clip_mask >> i) & 1 && f.varyings[p->varyings * 4 + i] < 0) return;
       static tgsi_test::TgsiMachine m;
       m = tgsi_test::TgsiMachine();
       for (uint32_t r = 0; r < const_rows; ++r)
@@ -1379,21 +1381,33 @@ struct TgsiAccel : IAccelerator {
   bool tessellation(TestAllocator& alloc, const Prog& p, const float* cf, uint32_t rows, const Vtx* const* in, uint32_t n, uint32_t primitive_id, std::vector<std::vector<Vtx>>* out) {
     const int cps = property(p.tcs, "TCS_VERTICES_OUT");
     if (cps < 1 || cps > 32) return fail_stage(p.tcs);
-    // the control stage: each invocation sees what the ones before it wrote (they write only their own control point and patch registers)
+    // the control stage: the invocations side by side, each to its next BARRIER in turn, with the outputs (OUT[v][r] and the patch registers) shared
     static Machine acc;
     acc = Machine();
+    static std::vector<Machine> ms;
+    ms.resize(static_cast<size_t>(cps));
     for (int inv = 0; inv < cps; ++inv) {
-      static Machine m;
+      Machine& m = ms[static_cast<size_t>(inv)];
       m = Machine();
+      m.stop_at_barrier = true;
       stage_machine(m, cf, rows);
       for (uint32_t v = 0; v < n; ++v) memcpy(m.in2[v], in[v]->r, sizeof in[v]->r);
-      memcpy(m.out2, acc.out2, sizeof m.out2);
-      memcpy(m.out, acc.out, sizeof m.out);
       set_sv(m, p.tcs, "INVOCATIONID", static_cast<uint32_t>(inv));
       set_sv(m, p.tcs, "PRIM_ID", primitive_id);
-      if (!m.run(p.tcs)) return fail_stage(p.tcs);
-      memcpy(acc.out2, m.out2, sizeof m.out2);
-      memcpy(acc.out, m.out, sizeof m.out);
+    }
+    for (int round = 0; round < 64; ++round) {
+      bool waiting = false;
+      for (int inv = 0; inv < cps; ++inv) {
+        Machine& m = ms[static_cast<size_t>(inv)];
+        if (round > 0 && !m.at_barrier) continue;
+        memcpy(m.out2, acc.out2, sizeof m.out2);
+        memcpy(m.out, acc.out, sizeof m.out);
+        if (!(round == 0 ? m.run(p.tcs) : m.resume())) return fail_stage(p.tcs);
+        memcpy(acc.out2, m.out2, sizeof m.out2);
+        memcpy(acc.out, m.out, sizeof m.out);
+        waiting = waiting || m.at_barrier;
+      }
+      if (!waiting) break;
     }
     const int outer_reg = declared(p.tcs, "OUT", "TESSOUTER"), inner_reg = declared(p.tcs, "OUT", "TESSINNER");
     if (outer_reg < 0 || inner_reg < 0) return fail_stage(p.tcs);
@@ -1450,7 +1464,7 @@ struct TgsiAccel : IAccelerator {
       if (!m.run(p.vs)) { if (getenv("TGSI_TRACE")) printf("%s\n", p.vs.c_str()); ++refused; return false; }
       memcpy(vouts[v].r, m.out, sizeof vouts[v].r);
       for (int k = 0; k < 4; ++k) vs[v].pos[k] = m.out[0][k];
-      for (uint32_t i = 0; i < p.varyings; ++i)
+      for (uint32_t i = 0; i < p.varyings + 2; ++i)      // (and the clip distances after them)
         for (int k = 0; k < 4; ++k) vs[v].var[i * 4 + k] = m.out[1 + i][k];
     }
     // the geometry and tessellation stages: the primitives the rasterizer gets
@@ -1497,7 +1511,7 @@ struct TgsiAccel : IAccelerator {
     else { rs.sc_x = rs.sc_y = 0; rs.sc_w = static_cast<int32_t>(t.w); rs.sc_h = static_cast<int32_t>(t.h); }
     rs.cull = st.cull;
     rs.front_ccw = st.front_ccw;
-    rs.nvar = p.varyings * 4;
+    rs.nvar = (p.varyings + 2) * 4;
     rs.clip_z_zero_to_one = true;
     for (uint32_t i = 0; i < p.varyings && i < 16; ++i)
       for (int k = 0; k < 4; ++k) rs.flat[i * 4 + k] = p.flat[i];
@@ -1515,7 +1529,7 @@ struct TgsiAccel : IAccelerator {
         gpu::RVertex rv[3];
         for (size_t k = 0; k < prim.size() && k < 3; ++k) {
           for (int c = 0; c < 4; ++c) rv[k].pos[c] = prim[k].r[0][c];
-          for (uint32_t i = 0; i < p.varyings; ++i)
+          for (uint32_t i = 0; i < p.varyings + 2; ++i)
             for (int c = 0; c < 4; ++c) rv[k].var[i * 4 + c] = prim[k].r[1 + i][c];
         }
         if (prim.size() == 3) gpu::draw_triangle(rs, rv[0], rv[1], rv[2], px);
@@ -1620,10 +1634,6 @@ static void test_stage_programs() {
     CHECK(gl.get_error() == 0 && gl.hardware_stats().gpu_draws == 4);
     // what the translation refuses
     const struct { const char* tcs; const char* tes; const char* gs; uint32_t mode; const char* why; } refused[] = {
-        {"#version 400 core\nlayout(vertices = 3) out;\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; barrier(); gl_TessLevelOuter[0] = gl_out[0].gl_Position.x + 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
-         tes_coord, nullptr, 0xE, "another invocation"},
-        {"#version 400 core\nlayout(vertices = 3) out;\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = gl_TessLevelOuter[0]; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
-         tes_coord, nullptr, 0xE, "patch outputs"},
         {nullptr, nullptr, "#version 400 core\nlayout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; gl_ViewportIndex = 0; EmitVertex(); } }\n",
          4, "gl_ViewportIndex"},
         {nullptr, nullptr, "#version 400 core\nlayout(points) in; layout(points, max_vertices = 2) out;\nin vec4 v[]; out vec4 g; layout(stream = 1) out vec4 s;\nvoid main(){ gl_Position = gl_in[0].gl_Position; g = v[0]; EmitVertex(); s = v[0]; EmitStreamVertex(1); }\n",

@@ -48,6 +48,7 @@ struct AccelLimits {
   bool lines = false;         // AccelState::topology lines and points
   bool geometry = false;      // programs with a geometry stage (AccelStages::gs), and the adjacency topologies
   bool tessellation = false;  // programs with tessellation stages (AccelStages::tcs / tes), and patches
+  bool clip_distances = false;  // AccelState::clip_mask: the CLIPDIST outputs of the last stage cut the primitives
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
@@ -88,6 +89,8 @@ struct AccelState {
   // geometry stage takes the primitives its gs_input names, one with tessellation stages only patches.
   uint8_t topology = 0;
   uint32_t patch_vertices = 0;
+  // AccelLimits::clip_distances: the clip distances the program's last stage writes (CLIPDIST[0] .xyzw 0 .. 3, CLIPDIST[1] 4 .. 7) that cut its primitives, bit i distance i.
+  uint8_t clip_mask = 0;
   // The textures the program samples, by sampler index (SAMP[i] of its TGSI): texture handles from create_texture() and how each is read. texture_count is what the
   // program was created with.
   uint32_t texture_count = 0;

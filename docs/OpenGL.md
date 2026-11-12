@@ -68,23 +68,33 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   `gl_out[].x`), per-patch ones PATCH registers. The last stage before the rasterizer converts the position to the device's clip space. `EmitVertex()` writes the
   outputs and EMITs, `EndPrimitive()` is ENDPRIM. A control shader keeps its own control point's outputs in variables and writes them at the end, the control point
   chosen by a test of the invocation number for each (a register's vertex cannot be a variable). It writes its patch outputs and levels only if it wrote them,
-  by a flag; `barrier()` has nothing to wait for. When the evaluation shader reads the levels, they also go to it as two PATCH registers, because virgl cannot
+  by a flag. `barrier()` puts all of that out first and then waits (TGSI BARRIER), so what an invocation reads of another's control point after it
+  (`gl_out[j].x`, `x[j]`) is in that point's output register, chosen by `j`; a patch output it reads is its own value when it wrote one, else the register.
+  Outputs the evaluation stage does not read get registers too, and other invocations' positions are read from a copy in a GENERIC register (virgl does not give
+  back another invocation's POSITION output). When the evaluation shader reads the levels, they also go to it as two PATCH registers, because virgl cannot
   take TESSOUTER / TESSINNER as inputs. An evaluation stage without a control shader gets a generated one that passes the vertices on, with the default levels
   of `glPatchParameterfv` in two constant rows. The geometry stage's `gl_PrimitiveIDIn` is a PRIM_ID input; the others' `gl_PrimitiveID` and
   `gl_InvocationID` are system values. The draw's primitives are assembled on the CPU, as the CPU path assembles them (`GlAssemble.hpp`): patches, adjacency
   lists, and adjacency strips made lists. A program with a control stage is translated again when `GL_PATCH_VERTICES` changes. Refused and left to the CPU:
-  reading another invocation's outputs, or a control shader's own patch outputs; vertex streams; `gl_ViewportIndex`; built-in inputs other than `gl_Position`;
+  vertex streams; `gl_ViewportIndex`; built-in inputs other than `gl_Position`;
   arrays of arrays per vertex; flat varyings with `GL_FIRST_VERTEX_CONVENTION`.
-- `src/WebGl/AccelConformance.cpp` has 32 scenes that draw a picture with the accelerator and without, 9 of them desktop GL with geometry and tessellation
+- `src/WebGl/AccelConformance.cpp` has 38 scenes that draw a picture with the accelerator and without, 14 of them desktop GL with geometry and tessellation
   stages (two invocations and `gl_PrimitiveIDIn`, adjacency, points made quads, triangles and quads at equal and odd spacing, patch varyings, an evaluation stage
-  alone, tessellation and geometry together). The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 32 match on virgl), and
+  alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes) and one a uniform block. The kernel runs
+  them at boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 38 match on virgl), and
   `tests/GlAccelTest.cpp` runs them on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with DxgkrnlTest, with per-vertex registers and EMIT; the test's
   device runs the tessellator of `Software/Tessellator.hpp`). `PiglitShaderTest --accel-survey` counts which piglit draws the hardware would take and why the others not (`SURVEY_REASON=text` lists
-  the tests): 755 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages); the most
-  common reasons left are arrays of arrays per vertex (623 draws) and control shaders that read another invocation's outputs (240).
+  the tests): 825 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
+  barriers, uniform blocks and clip planes); most of the draws left are tests with arrays of arrays per vertex, which also need more varyings than virgl has.
+- Uniform blocks: their members are read like any uniform, from the stage's uniforms that the context fills from the bound buffers before each draw
+  (`load_uniform_blocks`). A program without vertex attributes gets a placeholder one, sent as zeros (`kTgsiNoAttribute`).
+- Clip planes (`GL_CLIP_DISTANCEi` / `GL_CLIP_PLANEi`): the last stage puts out eight distances (CLIPDIST, `GraphicsPipelineDesc::clip_distances` and
+  `kFeatureClipDistances` on the device, virgl's rasterizer enables), computed as the CPU path computes them: its `gl_ClipDistance`, or the user planes (eight constant
+  rows, `kTgsiClipPlanes`) against its `gl_ClipVertex`, or in the compatibility profile its `gl_Position`. A program is translated again
+  with them the first time it is drawn with clip planes on.
 - State the device has goes with the draw: blend factors and equations, the colour mask and the depth function (`AccelState::custom_blend`), culling, scissor and
   viewport, lines and points one pixel wide. What it has not (the stencil test, polygon offset, polygon modes and stipples, flat shading, alpha test, logic ops,
-  wide lines, point sizes, two-sided colour, gl_PrimitiveID in a fragment shader, clip planes, vertex streams, queries, transform feedback, framebuffer objects,
+  wide lines, point sizes, two-sided colour, gl_PrimitiveID in a fragment shader, vertex streams, queries, transform feedback, framebuffer objects,
   instancing, mipmapped or non-RGBA8 textures, constant blend colours ...) keeps the draw on the CPU.
 - The picture stays on the device between draws. A clear of the whole window is done there only, and the CPU's depth and stencil clears wait until the CPU needs
   them (`hw_fast_clear`, `hw_apply_pending_clears`). The picture comes back to the window's image when something reads it: a swap or a front-buffer read
@@ -140,7 +150,7 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   layouts are reported as `Block.member`; `glBindFragDataLocation`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
-- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams or cross-invocation reads in control shaders, uniform blocks, bitwise integer
+- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, arrays of arrays per vertex, shadow samplers, bitwise integer
   operators (other than shifts), derivatives, texture kinds other than 2D, vertex-shader textures, arrays of structures, recursion, `continue` inside a `switch`
   or 4 x 4 `inverse`; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is read back at each swap (no zero-copy present into the
   window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
