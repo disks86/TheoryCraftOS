@@ -218,10 +218,11 @@ depends on itself:
 1. **A dynamic loader for Linux programs: done** (`docs/LinuxDynamicPrograms.md`). The kernel maps a program's interpreter (glibc's `ld.so`), which
    loads the shared libraries itself. A libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, built with the development machine's
    glibc) passes its 24 checks against this compositor inside the OS, on the real kernel in QEMU and on the emulator.
-2. **`VK_KHR_wayland_surface` in the shared Vulkan driver** (as `libvulkan.so.1`, or as an ICD of the system's loader). The pieces exist: a swapchain image
-   is an exportable image (`vk_external.inc`), a present is `zwp_linux_buffer_params_v1.create_immed` once per image, then attach / damage / commit, with
-   explicit sync's acquire point after the frame's work and the release point waited for in `vkAcquireNextImageKHR`. What is missing is the call path into
-   libwayland-client (`wl_proxy_marshal_flags`, a private event queue for the swapchain), which needs step 1.
+2. **`VK_KHR_wayland_surface` in the shared Vulkan driver: done** ([Vulkan.md](Vulkan.md)). `libvulkan.so.1` (installed where the Khronos loader would be)
+   makes a swapchain's images shareable allocations, exports each once and makes it a `wl_buffer` with `create_immed`; a present is attach, damage and
+   commit (FIFO waits for the frame callback), an acquire takes an image whose buffer was released. The protocol goes through the program's own
+   libwayland-client (found with `dlsym`), on an event queue of the swapchain's. `tests/linux_vulkan_wayland_emulated.sh` runs a glibc + libwayland +
+   xdg-shell program through it.
 3. **GBM and EGL.** Mesa needs a GBM backend and an EGL platform over `/dev/dxg` instead of a DRM render node: buffers are `/dev/dxg` exports (made by
    the Direct3D layer with the formats the feedback lists), and GL rendering would go to the kernel's OpenGL (`src/OpenGl`) or to a Zink-like layer on
    the shared Vulkan driver. The second reuses more: GL over the Vulkan driver, buffers from step 2's code.
@@ -235,8 +236,8 @@ depends on itself:
   pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
   once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
-  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL, no `libgbm` and no `VK_KHR_wayland_surface` yet (see the plan above):
-  a client has to render into an exported image and pass it itself, as `tests/linux/waylandvktest.c` does; real toolkits (GTK, Qt) still use `wl_shm`.
+  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL and no `libgbm` yet (see the plan above): a
+  Vulkan program has `VK_KHR_wayland_surface`, but GL toolkits (GTK and Qt with GL) still fall back to `wl_shm`.
   Not tried on a real GPU (only the software renderer and virgl).
 - **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
   panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
