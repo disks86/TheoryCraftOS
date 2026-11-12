@@ -26,6 +26,7 @@
 #include "DBus/Bus.hpp"
 #include "DBus/MachineId.hpp"
 #include "DBus/Notifications.hpp"
+#include "DBus/ProgramActivator.hpp"
 #include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/NativeServer.hpp"
@@ -2162,9 +2163,18 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     char machine_id[33] = {}, system_guid[33] = {}, session_guid[33] = {};
     const bool dbus_ids = dbus::load_machine_id(&explorer_files.file_system(), smb_entropy, ArrayView<char>(machine_id, 33)) &&
                           dbus::random_hex_id(smb_entropy, ArrayView<char>(system_guid, 33)) && dbus::random_hex_id(smb_entropy, ArrayView<char>(session_guid, 33));
+    dbus::ProgramActivator dbus_activator(explorer_files.file_system(), shared_allocator);      // (before the buses: it outlives their use of it)
     dbus::Bus system_bus(shared_allocator, dbus::BusKind::System, StringView(system_guid), StringView(machine_id));
     dbus::Bus session_bus(shared_allocator, dbus::BusKind::Session, StringView(session_guid), StringView(machine_id));
     dbus::NotificationService dbus_notifications(session_bus, dbus_display, shared_allocator);
+    // Services started on demand: the programs the .service files in the standard folders name (a message for such a name, or StartServiceByName).
+    {
+      namespace layout = filesystem::layout;
+      const StringView session_folders[] = {layout::kSessionServicesFolder, layout::kLocalSessionServicesFolder};
+      const StringView system_folders[] = {layout::kSystemServicesFolder, layout::kLocalSystemServicesFolder};
+      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2));
+      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2));
+    }
     UniquePointer<dbus::SocketServer> dbus_sockets;
     if (dbus_ids && dbus_notifications.start()) {
       if (process::UnixSocketManager* sockets = process::system_unix_sockets())

@@ -14,19 +14,31 @@ work=${TMPDIR:-/tmp}/tcos-dbusinterop
 # (sun_path holds 108 bytes: the sockets get a short folder of their own)
 sock=$(mktemp -d /tmp/tcos-dbus.XXXXXX)
 mkdir -p "$work/obj"
-cleanup() { kill "${session_pid:-}" "${system_pid:-}" 2>/dev/null || true; rm -rf "$sock"; }
+cleanup() { kill "${session_pid:-}" "${system_pid:-}" "${act_pid:-}" 2>/dev/null || true; rm -rf "$sock"; }
 trap cleanup EXIT
-sources=(tests/dbus/DBusHostServer.cpp src/DBus/Auth.cpp src/DBus/Bus.cpp src/DBus/BusDriver.cpp src/DBus/Match.cpp src/DBus/Message.cpp src/DBus/Notifications.cpp
-         src/DBus/Wire.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp)
+sources=(tests/dbus/DBusHostServer.cpp src/DBus/Activation.cpp src/DBus/Auth.cpp src/DBus/Bus.cpp src/DBus/BusDriver.cpp src/DBus/Match.cpp src/DBus/Message.cpp src/DBus/Notifications.cpp
+         src/DBus/Wire.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
 g++ -fsanitize=address,undefined "$work"/obj/*.o -o "$work/dbushost"
 gcc -O1 -g -Wall tests/dbus/fdclient.c $(pkg-config --cflags --libs dbus-1) -o "$work/fdclient"
+gcc -O1 -g -Wall tests/dbus/echoservice.c $(pkg-config --cflags --libs dbus-1) -o "$work/echoservice"
+# services to start on demand: the echo service under two names, one that exits at once, one whose program is missing, one that never takes its name
+mkdir -p "$work/services"
+rm -f "$work/services"/*.service
+service() { printf '[D-BUS Service]\nName=%s\nExec=%s\n' "$1" "$2" > "$work/services/$1.service"; }
+service org.tcos.Echo "$work/echoservice org.tcos.Echo 20"
+service org.tcos.Echo2 "$work/echoservice 'org.tcos.Echo2' 20"
+service org.tcos.False "/bin/false"
+service org.tcos.Missing "$work/no-such-program"
+service org.tcos.Slow "/bin/sleep 30"
 
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 "$work/dbushost" "$sock/session" session 120 > "$work/session.out" 2> "$work/session.err" & session_pid=$!
 "$work/dbushost" "$sock/system" system 120 > "$work/system.out" 2> "$work/system.err" & system_pid=$!
-for _ in $(seq 50); do [ -S "$sock/session" ] && [ -S "$sock/system" ] && break; sleep 0.1; done
+# a third bus starts services on demand, with short timeouts: 1.5 s for a reply, 2 s for a service to take its name
+"$work/dbushost" "$sock/act" session 120 --services "$work/services" --reply-timeout-ms 1500 --activation-timeout-ms 2000 > "$work/act.out" 2> "$work/act.err" & act_pid=$!
+for _ in $(seq 50); do [ -S "$sock/session" ] && [ -S "$sock/system" ] && [ -S "$sock/act" ] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$sock/session DBUS_SYSTEM_BUS_ADDRESS=unix:path=$sock/system
 T="timeout 5"
 
@@ -82,6 +94,22 @@ check "the service showed the notifications" "grep -q 'notify: gdbus | From gdbu
 if command -v notify-send >/dev/null; then
   check "the service showed notify-send's" "grep -q 'From notify-send | libnotify over the kernel bus' $work/session.out"
 fi
-check "no sanitizer report" "! grep -q 'ERROR: AddressSanitizer\|runtime error' $work/session.err $work/system.err"
+# activation (the third bus)
+A="env DBUS_SESSION_BUS_ADDRESS=unix:path=$sock/act timeout 10"
+check "a call starts its service (dbus-send)" "$A dbus-send --session --print-reply --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Echo string:started-on-demand | grep -q 'string \"started-on-demand\"'"
+check "the activated service stays and answers again" "$A dbus-send --session --print-reply --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Echo string:again | grep -q 'string \"again\"' && [ \$(grep -c 'activate: org.tcos.Echo ' $work/act.out) = 1 ]"
+check "StartServiceByName (gdbus): 1, then 2" "$A gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.StartServiceByName org.tcos.Echo2 0 | grep -q '(uint32 1,)' && $A gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.StartServiceByName org.tcos.Echo2 0 | grep -q '(uint32 2,)'"
+check "busctl lists the activatable names" "$A busctl --user list --activatable --no-pager | grep -q org.tcos.Slow"
+check "a service that exits: Spawn.ChildExited" "{ $A dbus-send --session --print-reply --dest=org.tcos.False /x org.tcos.X.Y 2>&1 || true; } | grep -q 'Spawn.ChildExited'"
+check "a program that is not there: Spawn.ExecFailed" "{ $A dbus-send --session --print-reply --dest=org.tcos.Missing /x org.tcos.X.Y 2>&1 || true; } | grep -q 'Spawn.ExecFailed'"
+check "a service that never takes its name: TimedOut" "{ $A dbus-send --session --print-reply --dest=org.tcos.Slow /x org.tcos.X.Y 2>&1 || true; } | grep -q 'org.freedesktop.DBus.Error.TimedOut'"
+check "sd-bus StartUnit-free activation (busctl call)" "$A busctl --user call org.tcos.Echo2 /org/tcos/Echo org.tcos.Echo Echo s via-busctl | grep -q 'via-busctl'"
+# reply timeout: the bus answers a call nobody answers after 1.5 s (the client would wait 20 s)
+start=$(date +%s%N)
+$A dbus-send --session --print-reply --reply-timeout=20000 --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Hang > "$work/hang.out" 2>&1 || true
+elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
+check "an unanswered call gets NoReply from the bus (${elapsed} ms)" "grep -q 'org.freedesktop.DBus.Error.NoReply' $work/hang.out && [ $elapsed -ge 1000 ] && [ $elapsed -lt 6000 ]"
+$A dbus-send --session --print-reply --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Quit > /dev/null 2>&1 || true
+check "no sanitizer report" "! grep -q 'ERROR: AddressSanitizer\|runtime error' $work/session.err $work/system.err $work/act.err"
 [ $fail -eq 0 ] && echo "dbus interop: all passed" || echo "dbus interop: FAILED"
 exit $fail

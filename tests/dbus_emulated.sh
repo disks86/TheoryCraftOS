@@ -15,7 +15,7 @@ pkg-config --exists dbus-1 || { echo "skipped (no libdbus headers)"; exit 0; }
 work=${TMPDIR:-/tmp}/tcos-dbusemu-$(printf %s "$PWD" | cksum | cut -d" " -f1)
 mkdir -p "$work/obj"
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/DBus/*.cpp)
+         src/Kernel/Sync.cpp tests/KernelStubs.cpp $(ls src/DBus/*.cpp | grep -v ProgramActivator))
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_DBUS"
 objs=()
 jobs=()
@@ -29,6 +29,10 @@ if [ ${#jobs[@]} -gt 0 ]; then
 fi
 g++ -pthread "${objs[@]}" -o "$work/emurun"
 gcc -O1 -g tests/dbus/fdclient.c $(pkg-config --cflags --libs dbus-1) -o "$work/fdclient"
+gcc -O1 -g tests/dbus/echoservice.c $(pkg-config --cflags --libs dbus-1) -o "$work/echoservice"
+# the service started on demand inside the OS: its .service file in a folder of the Linux tree
+mkdir -p "$work/services"
+printf '[D-BUS Service]\nName=org.tcos.Echo\nExec=%s org.tcos.Echo 3\n' "$work/echoservice" > "$work/services/org.tcos.Echo.service"
 
 # the files a dynamically linked program needs: its interpreter and every library ldd finds
 files_for() {
@@ -36,9 +40,10 @@ files_for() {
     readelf -l "$1" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'; } | sort -u | paste -sd:
 }
 fail=0
-run() {      # run <name> <program> <arguments> <what the output must hold>...
+run() {      # run <name> <program> <arguments> <what the output must hold>...   (EXTRA_FILES: more files for the Linux tree, colon separated)
   local name=$1 program=$2 args=$3; shift 3
-  TCOS_EMU_ARGS="$args" TCOS_EMU_LINUX_FILES="$(files_for "$program")" "$work/emurun" "$program" > "$work/$name.out" 2>&1 || true
+  local files; files="$(files_for "$program")${EXTRA_FILES:+:$EXTRA_FILES}"
+  TCOS_EMU_ARGS="$args" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$program" > "$work/$name.out" 2>&1 || true
   local ok=1
   grep -q "\[exit=0 faulted=0" "$work/$name.out" || ok=0
   for want in "$@"; do grep -q -- "$want" "$work/$name.out" || ok=0; done
@@ -57,5 +62,10 @@ if command -v gdbus >/dev/null; then
   run "gdbus Notify" "$(command -v gdbus)" "call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications --method org.freedesktop.Notifications.Notify gdbus 0 x Hi there [] {} 2000" \
       '(uint32 1,)' 'dbus notify: gdbus | Hi | there | 2000'
 fi
+# a call starts its service: dbus-send asks org.tcos.Echo, the bus starts echoservice (a second emulated program, through its .service file) and the
+# answer comes back from it
+EXTRA_FILES="$work/echoservice:$(files_for "$work/echoservice"):$work/services/org.tcos.Echo.service" TCOS_EMU_DBUS_SERVICES="$work/services" \
+  run "dbus-send starts a service on demand" "$dbus_send" "--session --print-reply --reply-timeout=60000 --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Echo string:activated-inside-the-OS" \
+    'string "activated-inside-the-OS"' 'dbus activate: org.tcos.Echo' 'dbus: 1 services started'
 [ $fail -eq 0 ] && echo "dbus emulated: all passed" || echo "dbus emulated: FAILED"
 exit $fail

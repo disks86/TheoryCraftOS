@@ -25,6 +25,8 @@ Each address is also bound as an abstract socket name of the same text, which Wi
 | `BusDriver.cpp` | `org.freedesktop.DBus` and the bus object's Introspectable, Peer, Properties and Monitoring interfaces |
 | `Notifications.hpp/.cpp` | `org.freedesktop.Notifications`, served by the kernel itself on the session bus: a Notify is a desktop toast |
 | `SocketServer.hpp/.cpp` | The transport: one kernel thread (`dbus`) carries both buses' bytes and SCM_RIGHTS descriptors over `UnixSocketManager` |
+| `Activation.hpp/.cpp` | Service files (`[D-BUS Service]`, `Name=`, `Exec=`), the Exec line split as a shell would, and `IServiceLauncher` |
+| `ProgramActivator.hpp/.cpp` | The kernel's launcher: a service's program runs with `run_program()` on a kernel thread (`dbus-service`) with `DBUS_STARTER_ADDRESS` and `DBUS_STARTER_BUS_TYPE` |
 | `MachineId.hpp/.cpp` | `/etc/machine-id` (made once, kept) and each bus's GUID (new at each start) |
 
 `src/main.cpp` makes both buses after PipeWire, starts the Notifications service with a display that posts to `Desktop::toasts()`, and starts the
@@ -44,13 +46,14 @@ The behaviour follows the D-Bus Specification (0.43) and, where the specificatio
   says so with the `HeaderFiltering` feature).
 - **Hello** first (anything else closes the connection); unique names are `:1.N`. `NameOwnerChanged` and `NameAcquired` follow.
 - **Names:** RequestName (ALLOW_REPLACEMENT, REPLACE_EXISTING, DO_NOT_QUEUE; replies 1-4), ReleaseName, ListQueuedOwners, NameHasOwner, GetNameOwner,
-  ListNames, ListActivatableNames, StartServiceByName (nothing can be activated: `ServiceUnknown`, or `2` for a name that has an owner). When an owner goes,
-  the next in the queue takes over (`NameLost`, `NameOwnerChanged`, `NameAcquired`).
+  ListNames, ListActivatableNames, StartServiceByName (see Activation). When an owner goes, the next in the queue takes over (`NameLost`,
+  `NameOwnerChanged`, `NameAcquired`).
 - **Routing.** A message with a destination goes to that name's primary owner, plus connections whose match rules eavesdrop and monitors. One without
-  a destination goes to every connection whose rules match it, once each. A message to a name nobody has gets `ServiceUnknown` (auto-start allowed)
-  or `NameHasNoOwner`.
+  a destination goes to every connection whose rules match it, once each. A message to a name nobody has starts its service when a service file names it
+  and the message allows auto-start; otherwise it gets `ServiceUnknown` (auto-start allowed) or `NameHasNoOwner`.
 - **Replies** are delivered only to a call the bus delivered and that expects one. On the system bus an unrequested reply is dropped; the session bus lets
-  it through, as dbus-daemon's session policy does. A callee that goes away without answering makes the bus send the caller `NoReply`.
+  it through, as dbus-daemon's session policy does. A callee that goes away without answering makes the bus send the caller `NoReply`, and so does a
+  call that is not answered within the reply timeout (below).
 - **Match rules:** `type`, `sender` (a well-known sender follows the name's owner), `interface`, `member`, `path`, `path_namespace`, `destination`,
   `arg0`..`arg63`, `arg0path`..`arg63path`, `arg0namespace`, `eavesdrop`.
 - **Descriptors** (UNIX_FDS / SCM_RIGHTS) are passed on to recipients that negotiated them; to one that did not, the caller gets `NotSupported`. Each
@@ -62,10 +65,37 @@ The behaviour follows the D-Bus Specification (0.43) and, where the specificatio
   (`Features` = `HeaderFiltering`, `Interfaces` = `org.freedesktop.DBus.Monitoring`, both read only), ReloadConfig (nothing to reload),
   UpdateActivationEnvironment (accepted on the session bus, `AccessDenied` on the system bus, like dbus-daemon).
 
+### Activation
+
+Services are started on demand from `.service` files, as dbus-daemon does it: the session bus reads `/usr/share/dbus-1/services` and
+`/usr/local/share/dbus-1/services`, the system bus the `system-services` folders next to them (`filesystem::layout::kSessionServicesFolder` and
+friends; the first folder that names a service wins). A file is
+
+    [D-BUS Service]
+    Name=org.example.Service
+    Exec=/usr/bin/example-service --flag "an argument"
+
+(`User=` and `SystemdService=` are read and ignored: there is one user and no systemd.) A message for a well-known name nobody owns, without the
+NO_AUTO_START flag, and StartServiceByName start the program; the messages wait in the bus (at most 1024 in all, 64 services starting at once) and go
+on, in order, once the program has taken the name. StartServiceByName answers 1 then, 2 for a name already owned. If the program ends first the
+callers get `Spawn.ChildExited` ("Process X exited with status N"), if it cannot run `Spawn.ExecFailed`, if its Exec line is broken
+`Spawn.FileInvalid`, and if it has not taken the name after 25 s (`set_activation_timeout_us`) `TimedOut`. The program gets `DBUS_STARTER_ADDRESS`
+and `DBUS_STARTER_BUS_TYPE` (libdbus' `DBUS_BUS_STARTER`, GDBus' `G_BUS_TYPE_STARTER`) on top of the usual environment, runs from `/` of the Linux
+tree with no input, and prints to the debug console. The files are read at boot, on ReloadConfig, and again when a name is asked for that no file
+names (at most once a second), so a newly installed service is found without a reload.
+
+### Reply timeouts
+
+A call that expects a reply and is not answered within 5 minutes (`Bus::kDefaultReplyTimeoutUs`, dbus-daemon's old default; `set_reply_timeout_us`,
+0 = never) is answered by the bus with `org.freedesktop.DBus.Error.NoReply` ("Did not receive a reply..."), and the callee's late reply is then an
+unrequested one (dropped on the system bus). The deadlines are kept in one queue in the order they were set (the timeout is the same for every call),
+so expiring costs nothing per call that was answered in time; stale entries are dropped when they outnumber the waiting calls. The clock is the
+transport's (`tick()`); a call made before the first tick is timed from it.
+
 ### Limits
 
 2048 connections per bus, 512 names, 4096 match rules and 4096 waiting calls per connection, 64 monitors, 253 descriptors per message (one sendmsg),
-1024 descriptors received ahead of their messages, 128 MiB per message. A connection that does not read has at most 64 MiB queued in the bus: after
+1024 descriptors received ahead of their messages, 128 MiB per message, 1024 service files. A connection that does not read has at most 64 MiB queued in the bus: after
 that, calls to it get `LimitsExceeded`. The transport takes more output from a bus only while less than 256 KiB wait for a connection's socket.
 
 ## Services the kernel offers on the bus
@@ -87,18 +117,24 @@ system's lock (`ISystemSync`) and calls the buses with it let go; descriptors ar
 - `tests/run_host_tests.sh DBusTest`: names, signatures, marshalling round trips in both byte orders, every truncation and every bit flip of a body and
   of a message, garbage, the handshake as each client library does it (and broken ones), match rules, the bus driven by in-memory clients (name queues,
   calls, replies, NoReply, signals, eavesdropping, monitors, descriptors, protocol errors, a message fed a byte at a time), the Notifications service,
-  and the transport over a real `UnixSocketManager` with 8 client threads, an eventfd passed with SCM_RIGHTS, connections coming and going, and a reader that keeps up with a long signal stream (685 checks).
+  and the transport over a real `UnixSocketManager` with 8 client threads, an eventfd passed with SCM_RIGHTS, connections coming and going, and a reader that keeps up with a long signal stream (the activation and reply-timeout tests included).
 - `tests/dbus_interop.sh`: `tests/dbus/DBusHostServer.cpp` serves both buses on the host's sockets, and the host's dbus-send, dbus-monitor, busctl
-  (sd-bus), gdbus, notify-send and `tests/dbus/fdclient.c` (libdbus, a pipe passed with UNIX_FD) are pointed at them (26 checks).
+  (sd-bus), gdbus, notify-send and `tests/dbus/fdclient.c` (libdbus, a pipe passed with UNIX_FD) are pointed at them. A third bus starts
+  `tests/dbus/echoservice.c` on demand (fork and exec with the starter variables) and has short timeouts: auto-start from libdbus, sd-bus and GDBus,
+  StartServiceByName 1 then 2, ChildExited, ExecFailed, TimedOut, and NoReply from the bus for a call nobody answers (35 checks).
 - `tests/dbus_emulated.sh`: the host's real dbus-send, fdclient and gdbus, dynamically linked, run on the CPU emulator through the OS's Linux system calls
-  against the kernel's buses (`EmulationRun -DTCOS_EMU_DBUS`).
+  against the kernel's buses (`EmulationRun -DTCOS_EMU_DBUS`); dbus-send also starts echoservice on demand, as a second emulated program
+  (`TCOS_EMU_DBUS_SERVICES`).
+- QEMU (by hand, recipe in the project notes): a kernel that autoruns `/usr/bin/dbus-send ... org.tcos.Echo.Echo`, with echoservice, its libraries and
+  its service file on the primary disk: the kernel's launcher starts the service natively and the answer comes back.
 
 ## Not done
 
-- No activation: no `.service` files, no `StartServiceByName` of anything that is not running, no auto-start.
+- Activation: no systemd activation (`SystemdService=` is ignored), `User=` ignored, the environment of UpdateActivationEnvironment is not passed to
+  the services, no inotify (a changed file is found on a miss or ReloadConfig), a service that hangs while starting is not killed after the timeout.
 - No policy beyond the defaults: everything may send to everything (there is one user); no `<policy>` configuration, no `send_destination` rules,
   no `AccessDenied` for ordinary calls on the system bus.
 - No TCP or nonce-tcp transports, no `ANONYMOUS` or `DBUS_COOKIE_SHA1` mechanisms (Windows clients of D-Bus that need them cannot connect).
-- No reply timeouts kept by the bus (clients time out on their own), no `Debug.Stats`, no `GetConnectionCredentials` `UnixGroupIDs`/`ProcessFD`.
+- No per-call reply timeouts (the message carries none; one timeout for the bus), no `Debug.Stats`, no `GetConnectionCredentials` `UnixGroupIDs`/`ProcessFD`.
 - Notifications: no actions (`ActionInvoked`), icons, images, markup or sounds; hints are read past.
 - Other freedesktop services (`hostname1`, `login1`, `timedate1`, portals) are not served.

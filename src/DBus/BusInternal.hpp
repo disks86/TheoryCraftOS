@@ -39,6 +39,7 @@ struct Bus::Connection {
   List<UniquePointer<MatchRule>> matches;      // a monitor's: what it watches (none: everything)
   uint32_t names = 0;                  // names it owns or waits for
   uint32_t pending_calls = 0;          // its calls waiting for replies
+  uint32_t queued_for_activation = 0;  // its messages waiting for services to start
   uint32_t next_serial = 1;            // (a local connection's messages)
 };
 
@@ -50,6 +51,24 @@ struct Bus::NameEntry {
     uint32_t flags;
   };
   List<Owner> queue;      // [0] the primary owner
+};
+
+struct Bus::Activation {
+  explicit Activation(allocators::IAllocator& allocator) : name(allocator), queued(allocator), starters(allocator) {}
+  String name;
+  uint64_t handle = 0;              // the launcher's
+  uint64_t deadline_us = 0;         // 0: from the next tick on
+  struct Queued {
+    uint32_t from;
+    UniquePointer<Message> message;
+  };
+  List<Queued> queued;              // messages for the name, in the order they came
+  struct Starter {
+    uint32_t client;
+    uint32_t serial;
+    bool wants_reply;
+  };
+  List<Starter> starters;           // StartServiceByName calls waiting for the answer
 };
 
 class BusDriver {

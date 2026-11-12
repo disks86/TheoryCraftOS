@@ -21,7 +21,11 @@
 // descriptors (HostFd), handed on to the recipient as they are. The kernel's Notifications service is on the session bus, with a display that prints what
 // it is asked to show ("notify: <app> | <summary> | <body>") on stdout.
 //
-// Usage: DBusHostServer <socket path> <system|session> [seconds]   (runs until SIGTERM/SIGINT, or for that many seconds)
+// Services are started on demand from the .service files of --services <folder> (copied into a file system in memory at the start): HostLauncher
+// forks and execs their programs with DBUS_STARTER_ADDRESS, DBUS_STARTER_BUS_TYPE and the bus's own address variable set, as dbus-daemon does.
+//
+// Usage: DBusHostServer <socket path> <system|session> [seconds] [--services <folder>] [--reply-timeout-ms <n>] [--activation-timeout-ms <n>]
+//   (runs until SIGTERM/SIGINT, or for that many seconds)
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -30,12 +34,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <dirent.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <string>
 #include <chrono>
 #include <vector>
 #include "DBus/Bus.hpp"
 #include "DBus/Notifications.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
 
 namespace {
 
@@ -78,6 +86,69 @@ class PrintingDisplay final : public dbus::INotificationDisplay {
   uint32_t shown_ = 0;
 };
 
+// Starts a service's program as dbus-daemon does: a child process with the starter variables, polled with waitpid().
+class HostLauncher final : public dbus::IServiceLauncher {
+ public:
+  HostLauncher(std::string address, bool system) : address_(std::move(address)), system_(system) {}
+  uint64_t start(dbus::BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
+    std::vector<std::string> args;
+    for (const StringView& a : argv) args.push_back(std::string(a.data(), a.size()));
+    if (access(args[0].c_str(), X_OK) != 0) {      // (dbus-daemon learns that exec failed through a pipe; looking first comes to the same)
+      why->assign(strerror(errno));
+      return 0;
+    }
+    printf("activate: %.*s -> %s\n", int(name.size()), name.data(), args[0].c_str());
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+      setenv("DBUS_STARTER_ADDRESS", address_.c_str(), 1);
+      setenv("DBUS_STARTER_BUS_TYPE", system_ ? "system" : "session", 1);
+      setenv(system_ ? "DBUS_SYSTEM_BUS_ADDRESS" : "DBUS_SESSION_BUS_ADDRESS", address_.c_str(), 1);
+      std::vector<char*> v;
+      for (std::string& a : args) v.push_back(a.data());
+      v.push_back(nullptr);
+      execv(v[0], v.data());
+      _exit(127);
+    }
+    children_.push_back({pid, State::Running, 0});
+    return children_.size();
+  }
+  State poll(uint64_t handle, uint32_t* code, String*) override {
+    Child& c = children_[handle - 1];
+    if (c.state == State::Running) {
+      int status = 0;
+      if (waitpid(c.pid, &status, WNOHANG) == c.pid) {
+        c.state = State::Exited;
+        c.code = WIFEXITED(status) ? uint32_t(WEXITSTATUS(status)) : 128u + uint32_t(WTERMSIG(status));
+      }
+    }
+    *code = c.code;
+    return c.state;
+  }
+  void forget(uint64_t) override {}      // (a service that runs on is left to run; reap() collects it)
+  void reap() {
+    for (Child& c : children_) {
+      int status = 0;
+      if (c.state == State::Running && waitpid(c.pid, &status, WNOHANG) == c.pid) c.state = State::Exited;
+    }
+  }
+  void stop_all() {
+    for (Child& c : children_)
+      if (c.state == State::Running) kill(c.pid, SIGTERM);
+  }
+
+ private:
+  struct Child {
+    pid_t pid;
+    State state;
+    uint32_t code;
+  };
+  std::string address_;
+  bool system_;
+  std::vector<Child> children_;
+};
+
 volatile sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
 
@@ -105,7 +176,15 @@ int main(int argc, char** argv) {
     return 2;
   }
   const bool system = strcmp(argv[2], "system") == 0;
-  const double seconds = argc > 3 ? atof(argv[3]) : 0;
+  double seconds = 0;
+  const char* services = nullptr;
+  long reply_timeout_ms = -1, activation_timeout_ms = -1;
+  for (int i = 3; i < argc; ++i) {
+    if (strcmp(argv[i], "--services") == 0 && i + 1 < argc) services = argv[++i];
+    else if (strcmp(argv[i], "--reply-timeout-ms") == 0 && i + 1 < argc) reply_timeout_ms = atol(argv[++i]);
+    else if (strcmp(argv[i], "--activation-timeout-ms") == 0 && i + 1 < argc) activation_timeout_ms = atol(argv[++i]);
+    else seconds = atof(argv[i]);
+  }
   signal(SIGTERM, on_signal);
   signal(SIGINT, on_signal);
   signal(SIGPIPE, SIG_IGN);
@@ -117,6 +196,33 @@ int main(int argc, char** argv) {
     fprintf(stderr, "notifications did not start\n");
     return 1;
   }
+
+  // the service files, copied into a file system in memory (what the bus reads them from)
+  filesystem::RamFileSystem files(A);
+  HostLauncher launcher(std::string("unix:path=") + argv[1], system);
+  if (services) {
+    files.create_directory("/services");
+    if (DIR* d = opendir(services)) {
+      while (dirent* e = readdir(d)) {
+        const std::string leaf = e->d_name;
+        if (leaf.size() < 9 || leaf.substr(leaf.size() - 8) != ".service") continue;
+        FILE* f = fopen((std::string(services) + "/" + leaf).c_str(), "rb");
+        if (!f) continue;
+        std::vector<uint8_t> text(65536);
+        const size_t n = fread(text.data(), 1, text.size(), f);
+        fclose(f);
+        UniquePointer<filesystem::IFile> file;
+        uint64_t written = 0;
+        if (files.open_file(StringView(("/services/" + leaf).c_str()), filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok)
+          file->write(0, ConstByteView(text.data(), n), &written);
+      }
+      closedir(d);
+    }
+    const StringView folders[] = {"/services"};
+    bus.set_activation(&launcher, &files, ArrayView<const StringView>(folders, 1));
+  }
+  if (reply_timeout_ms >= 0) bus.set_reply_timeout_us(uint64_t(reply_timeout_ms) * 1000);
+  if (activation_timeout_ms > 0) bus.set_activation_timeout_us(uint64_t(activation_timeout_ms) * 1000);
 
   int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   sockaddr_un addr{};
@@ -177,6 +283,7 @@ int main(int argc, char** argv) {
       }
     }
     bus.tick(now_us());
+    launcher.reap();
     for (Client& c : clients) {
       ByteBuffer out(A);
       List<dbus::Bus::OutFd> outfds(A);
@@ -242,6 +349,7 @@ int main(int argc, char** argv) {
     bus.close_client(c.id);
     ::close(c.fd);
   }
+  launcher.stop_all();
   unlink(argv[1]);
   return 0;
 }

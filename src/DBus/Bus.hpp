@@ -28,7 +28,17 @@
 // anyway, as dbus-daemon's session policy allows); when the callee goes away without replying the caller gets org.freedesktop.DBus.Error.NoReply.
 // Names follow the specification's queueing rules (RequestName flags ALLOW_REPLACEMENT, REPLACE_EXISTING, DO_NOT_QUEUE), with NameOwnerChanged, NameLost
 // and NameAcquired. Descriptors (UNIX_FDS) are passed on to a recipient that negotiated them; to one that did not the sender gets NotSupported.
-// Nothing is activated: there are no .service files; a name the kernel serves itself is always running (see LocalPeer below).
+// Activation (setup with set_activation()): a message for a well-known name nobody owns that may start its service (no NO_AUTO_START flag), and
+// StartServiceByName, start the program its .service file names (Activation.hpp). The message waits in the bus until the program takes the name, then goes
+// on; if the program ends first, could not run or does not take the name within the activation timeout, the callers get the error dbus-daemon gives
+// (Spawn.ChildExited, Spawn.ExecFailed, TimedOut). The service files are read again on ReloadConfig, and when a name is asked for that no file names
+// (at most once a second). A name the kernel serves itself is always running (see LocalPeer below).
+//
+// Reply timeouts: a call that expects a reply and gets none within the reply timeout (set_reply_timeout_us(); default kDefaultReplyTimeoutUs, as
+// dbus-daemon's old default: today's dbus-daemon has none; 0 never) is answered by the bus with org.freedesktop.DBus.Error.NoReply, and a reply that
+// comes later is an unrequested one. The deadlines are kept in the order they were set, so the timeout is meant to be set once, before the bus is used
+// (a lower one set later applies to new calls only after the older ones expire). Time is the transport's clock as tick() gives it.
+// A service that has not taken its name by the activation timeout is not killed: the callers are told TimedOut, the program goes on (dbus-daemon kills it).
 //
 // A connection that breaks the protocol (an invalid message, a message before Hello, a monitor that sends) is closed, as dbus-daemon does.
 //
@@ -38,7 +48,9 @@
 // Threads: a Bus is used by one thread (the transport's); it has no lock. Local peers are called on that thread too.
 #pragma once
 #include <stdint.h>
+#include "DBus/Activation.hpp"
 #include "DBus/Auth.hpp"
+#include "FileSystem/IFileSystem.hpp"
 #include "DBus/Match.hpp"
 #include "DBus/Message.hpp"
 #include "ObjectContainer/Dictionary.hpp"
@@ -85,6 +97,12 @@ class Bus {
   static constexpr uint32_t kMaxIncomingFds = 1024;           // descriptors received ahead of their messages
   static constexpr uint64_t kMaxOutgoingBytes = 64u << 20;
   static constexpr uint32_t kMaxMonitors = 64;
+  static constexpr uint64_t kDefaultReplyTimeoutUs = 5ull * 60 * 1000 * 1000;      // 5 minutes
+  static constexpr uint64_t kActivationTimeoutUs = 25ull * 1000 * 1000;           // dbus-daemon's service_start_timeout (the default)
+  static constexpr uint32_t kMaxServiceFiles = 1024;
+  static constexpr uint32_t kMaxActivations = 64;
+  static constexpr uint32_t kMaxQueuedForActivation = 1024;                        // messages waiting for services to start, all together
+  static constexpr uint32_t kMaxQueuedPerConnection = 128;                         // ... and of one connection
 
   // `guid`: 32 hex digits (GetId, the authentication's OK); `machine_id`: 32 hex digits (Peer.GetMachineId).
   Bus(allocators::IAllocator& allocator, BusKind kind, StringView guid, StringView machine_id);
@@ -111,6 +129,17 @@ class Bus {
   void close_client(uint32_t client);
   // Work of its own (the local peers' timers); `now_us` is the transport's clock.
   void tick(uint64_t now_us);
+
+  // --- activation and timeouts
+  // Where service files are (folders of `files`, each with its *.service files) and what starts their programs. Reads them at once.
+  void set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders);
+  // Reads the service files again; returns how many name a service.
+  uint32_t reload_services();
+  bool activatable(StringView name) const;
+  uint32_t activations_running() const { return uint32_t(activations_.count()); }
+  void set_reply_timeout_us(uint64_t timeout_us) { reply_timeout_us_ = timeout_us; }
+  void set_activation_timeout_us(uint64_t timeout_us) { activation_timeout_us_ = timeout_us ? timeout_us : kActivationTimeoutUs; }
+  uint32_t pending_calls() const { return uint32_t(pending_.count()); }
 
   // --- the kernel's own connections
   uint32_t connect_local(LocalPeer& peer);
@@ -148,6 +177,16 @@ class Bus {
   void drop_pending(Connection& c);
   void release_all_names(Connection& c, bool tell_loser);
   bool encode_wire(const Message& m);
+  enum class ExpectStatus : uint8_t { Ok, TooMany, NoMemory };
+  ExpectStatus expect_reply(Connection& from, uint32_t serial, Connection& to);
+  void expire_replies();
+
+  // activation
+  struct Activation;
+  const ServiceFile* service_for(StringView name);
+  Activation* activate(StringView name, Connection& asker, const Message& call);
+  void finish_activations();
+  void fail_activation(Activation& a, StringView error_name, StringView text);
 
   // the bus's own messages
   bool from_bus(Message* m, uint8_t type);
@@ -170,7 +209,29 @@ class Bus {
   Dictionary<uint32_t, Connection*> by_id_;
   Hive<NameEntry> names_;
   Dictionary<const char*, NameEntry*> name_index_;
-  Dictionary<uint64_t, uint32_t> pending_;          // (caller << 32 | serial) -> callee
+  struct Pending {
+    uint32_t callee = 0;
+    uint32_t generation = 0;      // (which Expiry is this call's)
+  };
+  Dictionary<uint64_t, Pending> pending_;          // (caller << 32 | serial) -> callee
+  struct Expiry {
+    uint64_t key = 0;
+    uint32_t generation = 0;
+    uint64_t deadline_us = 0;     // 0: from the next tick on (the bus has no time yet)
+  };
+  Queue<Expiry> expiries_;        // in the order of their deadlines (the timeout is one for all); stale ones are skipped
+  uint32_t generation_ = 0;
+  uint32_t unset_deadlines_ = 0;      // expiries made before the first tick
+  uint64_t reply_timeout_us_ = kDefaultReplyTimeoutUs;
+  uint64_t activation_timeout_us_ = kActivationTimeoutUs;
+  uint64_t now_us_ = 0;
+  IServiceLauncher* launcher_ = nullptr;
+  filesystem::IFileSystem* service_files_ = nullptr;
+  List<String> service_folders_;
+  List<UniquePointer<ServiceFile>> services_;
+  uint64_t services_read_us_ = 0;
+  List<UniquePointer<Activation>> activations_;
+  uint32_t queued_for_activation_ = 0;
   struct Local {
     uint32_t client;
     UniquePointer<Message> message;
