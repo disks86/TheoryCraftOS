@@ -21,7 +21,7 @@
 // descriptors (HostFd), handed on to the recipient as they are. The kernel's Notifications service is on the session bus, with a display that prints what
 // it is asked to show ("notify: <app> | <summary> | <body>") on stdout.
 //
-// Services are started on demand from the .service files of --services <folder> (copied into a file system in memory at the start): HostLauncher
+// Services are started on demand from the .service files of --services <folder> (and their SystemdService= units from --units <folder>) (copied into a file system in memory at the start): HostLauncher
 // forks and execs their programs with DBUS_STARTER_ADDRESS, DBUS_STARTER_BUS_TYPE and the bus's own address variable set, as dbus-daemon does.
 //
 // Usage: DBusHostServer <socket path> <system|session> [seconds] [--services <folder>] [--reply-timeout-ms <n>] [--activation-timeout-ms <n>]
@@ -90,9 +90,11 @@ class PrintingDisplay final : public dbus::INotificationDisplay {
 class HostLauncher final : public dbus::IServiceLauncher {
  public:
   HostLauncher(std::string address, bool system) : address_(std::move(address)), system_(system) {}
-  uint64_t start(dbus::BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
-    std::vector<std::string> args;
-    for (const StringView& a : argv) args.push_back(std::string(a.data(), a.size()));
+  uint64_t start(const dbus::ServiceStart& service, String* why) override {
+    const StringView name = service.name;
+    std::vector<std::string> args, env;
+    for (const StringView& a : service.argv) args.push_back(std::string(a.data(), a.size()));
+    for (const StringView& e : service.environment) env.push_back(std::string(e.data(), e.size()));
     if (access(args[0].c_str(), X_OK) != 0) {      // (dbus-daemon learns that exec failed through a pipe; looking first comes to the same)
       why->assign(strerror(errno));
       return 0;
@@ -102,6 +104,10 @@ class HostLauncher final : public dbus::IServiceLauncher {
     const pid_t pid = fork();
     if (pid < 0) return 0;
     if (pid == 0) {
+      for (const std::string& e : env) {      // (the bus's activation environment and the unit's, then the starter variables)
+        const size_t eq = e.find('=');
+        if (eq != std::string::npos) setenv(e.substr(0, eq).c_str(), e.c_str() + eq + 1, 1);
+      }
       setenv("DBUS_STARTER_ADDRESS", address_.c_str(), 1);
       setenv("DBUS_STARTER_BUS_TYPE", system_ ? "system" : "session", 1);
       setenv(system_ ? "DBUS_SYSTEM_BUS_ADDRESS" : "DBUS_SESSION_BUS_ADDRESS", address_.c_str(), 1);
@@ -125,6 +131,12 @@ class HostLauncher final : public dbus::IServiceLauncher {
     }
     *code = c.code;
     return c.state;
+  }
+  void stop(uint64_t handle) override {      // (as dbus-daemon: SIGKILL; poll() reaps it)
+    Child& c = children_[handle - 1];
+    if (c.state == State::Running) kill(c.pid, SIGKILL);
+    printf("activate: stopped %d\n", int(c.pid));
+    fflush(stdout);
   }
   void forget(uint64_t) override {}      // (a service that runs on is left to run; reap() collects it)
   void reap() {
@@ -178,9 +190,11 @@ int main(int argc, char** argv) {
   const bool system = strcmp(argv[2], "system") == 0;
   double seconds = 0;
   const char* services = nullptr;
+  const char* units = nullptr;
   long reply_timeout_ms = -1, activation_timeout_ms = -1;
   for (int i = 3; i < argc; ++i) {
     if (strcmp(argv[i], "--services") == 0 && i + 1 < argc) services = argv[++i];
+    else if (strcmp(argv[i], "--units") == 0 && i + 1 < argc) units = argv[++i];
     else if (strcmp(argv[i], "--reply-timeout-ms") == 0 && i + 1 < argc) reply_timeout_ms = atol(argv[++i]);
     else if (strcmp(argv[i], "--activation-timeout-ms") == 0 && i + 1 < argc) activation_timeout_ms = atol(argv[++i]);
     else seconds = atof(argv[i]);
@@ -200,26 +214,32 @@ int main(int argc, char** argv) {
   // the service files, copied into a file system in memory (what the bus reads them from)
   filesystem::RamFileSystem files(A);
   HostLauncher launcher(std::string("unix:path=") + argv[1], system);
-  if (services) {
-    files.create_directory("/services");
-    if (DIR* d = opendir(services)) {
-      while (dirent* e = readdir(d)) {
-        const std::string leaf = e->d_name;
-        if (leaf.size() < 9 || leaf.substr(leaf.size() - 8) != ".service") continue;
-        FILE* f = fopen((std::string(services) + "/" + leaf).c_str(), "rb");
-        if (!f) continue;
-        std::vector<uint8_t> text(65536);
-        const size_t n = fread(text.data(), 1, text.size(), f);
-        fclose(f);
-        UniquePointer<filesystem::IFile> file;
-        uint64_t written = 0;
-        if (files.open_file(StringView(("/services/" + leaf).c_str()), filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok)
-          file->write(0, ConstByteView(text.data(), n), &written);
-      }
-      closedir(d);
+  // (a host folder's *.service files into a folder of the file system in memory; a link is copied as the file it points to)
+  const auto copy_folder = [&](const char* from, const char* to) {
+    files.create_directory(StringView(to));
+    DIR* d = opendir(from);
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+      const std::string leaf = e->d_name;
+      if (leaf.size() < 9 || leaf.substr(leaf.size() - 8) != ".service") continue;
+      FILE* f = fopen((std::string(from) + "/" + leaf).c_str(), "rb");
+      if (!f) continue;
+      std::vector<uint8_t> text(65536);
+      const size_t n = fread(text.data(), 1, text.size(), f);
+      fclose(f);
+      UniquePointer<filesystem::IFile> file;
+      uint64_t written = 0;
+      if (files.open_file(StringView((std::string(to) + "/" + leaf).c_str()), filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok)
+        file->write(0, ConstByteView(text.data(), n), &written);
     }
+    closedir(d);
+  };
+  if (services) {
+    copy_folder(services, "/services");
+    if (units) copy_folder(units, "/units");
     const StringView folders[] = {"/services"};
-    bus.set_activation(&launcher, &files, ArrayView<const StringView>(folders, 1));
+    const StringView unit_folders[] = {"/units"};
+    bus.set_activation(&launcher, &files, ArrayView<const StringView>(folders, 1), ArrayView<const StringView>(unit_folders, units ? 1 : 0));
   }
   if (reply_timeout_ms >= 0) bus.set_reply_timeout_us(uint64_t(reply_timeout_ms) * 1000);
   if (activation_timeout_ms > 0) bus.set_activation_timeout_us(uint64_t(activation_timeout_ms) * 1000);

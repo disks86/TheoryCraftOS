@@ -19,6 +19,7 @@
 /* A D-Bus service to be started on demand (tests/dbus_interop.sh, tests/dbus_emulated.sh): it connects to the bus that started it
  * (DBUS_BUS_STARTER: DBUS_STARTER_ADDRESS), takes the name argv[1] (default org.tcos.Echo) and serves /org/tcos/Echo:
  *   Echo(s) -> s       the same text back
+ *   Getenv(s) -> s     the value of an environment variable it was started with ("" if none: what the bus's activation environment gave it)
  *   Hang()             never answered (the bus's reply timeout answers instead)
  *   Quit()             answered, then the service ends
  * It ends by itself after argv[2] seconds without a call (default 10). */
@@ -48,6 +49,15 @@ int main(int argc, char** argv) {
           dbus_message_get_args(m, NULL, DBUS_TYPE_STRING, &text, DBUS_TYPE_INVALID);
           DBusMessage* r = dbus_message_new_method_return(m);
           dbus_message_append_args(r, DBUS_TYPE_STRING, &text, DBUS_TYPE_INVALID);
+          dbus_connection_send(c, r, NULL);
+          dbus_message_unref(r);
+        } else if (dbus_message_is_method_call(m, "org.tcos.Echo", "Getenv")) {
+          const char* variable = "";
+          dbus_message_get_args(m, NULL, DBUS_TYPE_STRING, &variable, DBUS_TYPE_INVALID);
+          const char* value = getenv(variable);
+          if (!value) value = "";
+          DBusMessage* r = dbus_message_new_method_return(m);
+          dbus_message_append_args(r, DBUS_TYPE_STRING, &value, DBUS_TYPE_INVALID);
           dbus_connection_send(c, r, NULL);
           dbus_message_unref(r);
         } else if (dbus_message_is_method_call(m, "org.tcos.Echo", "Quit")) {

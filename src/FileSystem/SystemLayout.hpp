@@ -118,6 +118,12 @@ inline constexpr const char* kSessionServicesFolder = "/Linux/usr/share/dbus-1/s
 inline constexpr const char* kSystemServicesFolder = "/Linux/usr/share/dbus-1/system-services";
 inline constexpr const char* kLocalSessionServicesFolder = "/Linux/usr/local/share/dbus-1/services";
 inline constexpr const char* kLocalSystemServicesFolder = "/Linux/usr/local/share/dbus-1/system-services";
+// systemd unit folders, where D-Bus looks for a service's SystemdService= unit (there is no systemd: the bus runs the unit's ExecStart itself). The
+// administrator's (/etc) come before the packages' (/usr/lib), as systemd reads them; the user folders are the session bus's.
+inline constexpr const char* kLocalSystemUnitsFolder = "/Linux/etc/systemd/system";
+inline constexpr const char* kSystemUnitsFolder = "/Linux/usr/lib/systemd/system";
+inline constexpr const char* kLocalUserUnitsFolder = "/Linux/etc/systemd/user";
+inline constexpr const char* kUserUnitsFolder = "/Linux/usr/lib/systemd/user";
 // The machine's id (/etc/machine-id: 32 hex digits, made at the first start; D-Bus's Peer.GetMachineId, libdbus and sd-bus read it).
 inline constexpr const char* kLinuxMachineId = "/Linux/etc/machine-id";
 // Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
