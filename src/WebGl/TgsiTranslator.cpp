@@ -350,16 +350,21 @@ class Gen {
     }
   }
   bool make_var(const Type& t, Var* v) {
-    if (t.array) {      // (each element a variable of its own)
-      if (t.array > kMaxArray || t.base == Base::Struct || t.base == Base::Sampler) return fail("an array the device cannot hold");
+    if (t.array) {      // (each element a variable of its own: a value, or a structure)
+      if (t.array > kMaxArray || t.base == Base::Sampler) return fail("an array the device cannot hold");
       const Type et = t.element();
-      if (!is_float_type(et)) return fail("an array the device cannot hold");
+      if (!is_float_type(et) && et.base != Base::Struct) return fail("an array the device cannot hold");
       const uint64_t first = elems_.count();
       if (first + t.array > 0xFFFF) return fail("too many variables");
+      // (the elements' places first: an element that is a structure with an array makes elements of its own, which must come after these)
+      for (uint32_t i = 0; i < t.array; ++i)
+        if (!elems_.push_back(Var())) return fail("too many variables");
       for (uint32_t i = 0; i < t.array; ++i) {
         Var e;
-        if (!make_var(et, &e) || !elems_.push_back(e)) return fail("too many variables");
+        if (!make_var(et, &e)) return false;
+        elems_[first + i] = e;
       }
+      if (elems_.count() > 0xFFFF) return fail("too many variables");
       *v = Var();
       v->valid = true;
       v->first = static_cast<uint16_t>(first);
@@ -430,6 +435,29 @@ class Gen {
   bool index_of(int32_t id, bool* constant, int32_t* k, Val* dynamic);
   bool clamp_index(const Val& idx, uint32_t count, Val* out);
   bool select(const Val& idx, uint32_t count, const Val* items, Val* out);
+  bool select_whole(const Type& t, const Val& idx, uint32_t count, const Val* items, Val* out);   // ... of structures or arrays
+  bool equal_whole(const Val& a, const Val& b, Val* out);   // a == b of structures, arrays or matrices: one boolean
+  // The places an assignment's target may be when indexes inside it are computed by the shader (a[i].b[j] = ...): each with the flag (a 0 / 1 temporary, or none)
+  // that says it is the one.
+  struct Place {
+    LV l;
+    int32_t flag = -1;
+  };
+  static constexpr uint32_t kMaxPlaces = 64;
+  bool places(int32_t id, List<Place>* out);   // (lists, not arrays: the kernel's stack is small)
+  bool has_dynamic_index(int32_t id) const;
+  bool lv_element(const LV& base, uint32_t e, LV* out);
+  // A uniform structure's member, its CONST rows taken when it is first read (uniform_struct).
+  bool resolve_member(uint64_t at) {
+    Val& mem = members_[at];
+    if (mem.kind != 3) return true;
+    uint32_t row;
+    const uint8_t convert = mem.num == kNumInt ? kTgsiFromInt : (mem.num == kNumUint ? kTgsiFromUint : (mem.num == kNumBool ? kTgsiFromBool : kTgsiAsIs));
+    if (!alloc_const(static_cast<uint32_t>(mem.ival), mem.rows, mem.cols, 1, &row, convert)) return false;
+    mem.kind = 0;
+    for (uint32_t c = 0; c < mem.cols; ++c) mem.c[c] = filled('C', static_cast<uint16_t>(row + c), mem.rows);
+    return true;
+  }
   bool flag_test(uint16_t flag, bool when_set);
   bool convert(const Val& in, uint8_t num, Val* out);
   bool atan2_of(const Val& y, const Val& x, Val* out);
@@ -539,6 +567,18 @@ bool Gen::alloc_const(uint32_t slot, uint32_t rows, uint32_t cols, uint32_t elem
   if (elems > sh_.limits.const_rows) return fail("too many uniforms");
   const uint32_t total = elems * cols;
   TgsiProgram& p = *sh_.out;
+  // (the same values asked for again - a uniform structure read in several places - are the same rows)
+  for (uint64_t k = 0; k + total <= p.constants.count(); ++k) {
+    bool same = true;
+    for (uint32_t j = 0; j < total && same; ++j) {
+      const TgsiConstant& c = p.constants[k + j];
+      same = c.stage == stage_ && c.comps == rows && c.slot == slot + j * rows && c.convert == convert && c.row == p.constants[k].row + j;
+    }
+    if (same) {
+      *row = p.constants[k].row;
+      return true;
+    }
+  }
   if (p.const_rows + total > sh_.limits.const_rows) return fail("too many uniforms");
   const uint32_t first = p.const_rows;
   for (uint32_t e = 0; e < elems; ++e)
@@ -588,11 +628,28 @@ bool Gen::uniform_struct(uint32_t slot, const Type& t, Val* out) {
     Val mv;
     if (ft.base == Base::Struct && ft.array == 0) {
       if (!uniform_struct(fslot, ft, &mv)) return false;
+    } else if (ft.array) {      // an array member: copied into variables (so that a variable can index it)
+      const Type et = ft.element();
+      if (!is_float_type(et) || ft.array > kMaxArray) return fail("a uniform member the device cannot take");
+      const uint8_t convert = et.base == Base::Int ? kTgsiFromInt : (et.base == Base::Uint ? kTgsiFromUint : (et.base == Base::Bool ? kTgsiFromBool : kTgsiAsIs));
+      Var av;
+      if (!make_var(ft, &av)) return false;
+      for (uint32_t e = 0; e < av.count; ++e) {
+        const Var el = elems_[static_cast<uint64_t>(av.first) + e];
+        uint32_t row;
+        if (!alloc_const(fslot + e * m_.slots_of(et), et.rows, et.cols, 1, &row, convert)) return false;
+        for (uint32_t c = 0; c < el.cols; ++c) {
+          const Oper src = filled('C', static_cast<uint16_t>(row + c), el.rows);
+          inst_rows("MOV", el.temp[c], el.rows, &src);
+        }
+      }
+      val_of(av, &mv);
     } else {
-      if (ft.base != Base::Float || ft.array || ft.rows < 1 || ft.rows > 4 || ft.cols < 1 || ft.cols > 4) return fail("a uniform member the device cannot take");
+      if (!is_float_type(ft)) return fail("a uniform member the device cannot take");
       mv.kind = 3;   // the CONST rows are taken when the member is first read (a shader rarely uses every member, and there are only a few rows)
       mv.rows = ft.rows;
       mv.cols = ft.cols;
+      mv.num = num_of(ft.base);
       mv.ival = static_cast<int32_t>(fslot);
     }
     members_[first + i] = mv;
@@ -616,6 +673,10 @@ bool Gen::make_struct(const Type& t, Val* out) {
     Val mv;
     if (ft.base == Base::Struct && ft.array == 0) {
       if (!make_struct(ft, &mv)) return false;
+    } else if (ft.array) {      // (an array member: its elements are variables, as an array's)
+      Var av;
+      if (!make_var(ft, &av)) return false;
+      val_of(av, &mv);
     } else {
       if (!is_float_type(ft) || !new_val(ft.rows, ft.cols, &mv)) return fail("a member of a type the device cannot hold");
     }
@@ -646,6 +707,12 @@ bool Gen::find_field(uint32_t sid, const Node& n, uint32_t* index) {
 
 bool Gen::lv_from_val(const Val& v, LV* out) {
   if (v.kind == 3 || v.kind == 2) return fail("assignment to a uniform or built-in");
+  if (v.kind == 4) {      // a whole array (a structure's member)
+    *out = LV();
+    out->count = v.count;
+    out->first = v.first;
+    return true;
+  }
   if (v.kind == 1) {
     *out = LV();
     out->agg = true;
@@ -751,7 +818,12 @@ bool Gen::global_val(uint64_t gi, Val* out) {
   const Global& g = *m_.globals[gi];
   switch (g.kind) {
     case GlobalKind::Const: {
-      if (g.init < 0 || g.type.array) return fail("a constant the device cannot take");
+      if (g.init < 0) return fail("a constant the device cannot take");
+      if (g.type.array || g.type.base == Base::Struct) {      // (made at the start: run())
+        if (gi >= globals_.count() || !globals_[gi].valid) return fail("a constant the device cannot take");
+        val_of(globals_[gi], out);
+        return true;
+      }
       return eval(g.init, out);
     }
     case GlobalKind::Buffer:   // (a WGSL var<uniform> is a buffer binding; a storage buffer is not for the device)
@@ -760,7 +832,6 @@ bool Gen::global_val(uint64_t gi, Val* out) {
     case GlobalKind::Uniform: {
       if (g.type.array) return fail("a uniform array used as a whole");
       if (g.type.base == Base::Struct) {
-        if (g.block >= 0) return fail("uniform blocks");
         Var& cached = globals_[gi];
         if (!cached.valid) {
           Val sv;
@@ -933,7 +1004,17 @@ bool Gen::store(const LV& l, const Val& v_in) {
     }
     return true;
   }
-  if (l.agg || v.kind) return fail("assignment of a whole structure");
+  if (l.agg || v.kind) {      // a whole structure: member by member
+    if (!l.agg || v.kind != 1 || l.sid != v.sid || l.sid >= m_.structs.count()) return fail("assignment of a whole structure");
+    const uint64_t members = m_.structs[l.sid]->fields.count();
+    for (uint64_t i = 0; i < members; ++i) {
+      LV ml;
+      if (!resolve_member(static_cast<uint64_t>(v.first) + i)) return false;
+      const Val mv = members_[static_cast<uint64_t>(v.first) + i];
+      if (!lv_from_val(members_[static_cast<uint64_t>(l.first) + i], &ml) || !store(ml, mv)) return false;
+    }
+    return true;
+  }
   if (l.cols > 1) {
     if (v.cols != l.cols || v.rows != l.rows) return fail("matrix assignment of another shape");
     for (uint32_t c = 0; c < l.cols; ++c) inst_rows("MOV", l.temp[c], l.rows, &v.c[c]);
@@ -1097,6 +1178,21 @@ bool Gen::binary(Op op, const Val& a_in, const Val& b_in, Val* out) {
   const bool b_const = b.is_int;
   const int32_t b_k = b.ival;
   if (!to_float(a) || !to_float(b)) return false;
+  if ((op == Op::Eq || op == Op::Ne) && (a.kind || b.kind || a.cols > 1 || b.cols > 1)) {      // structures, arrays, matrices: equal when every part is
+    Val eq;
+    if (!equal_whole(a, b, &eq)) return false;
+    if (op == Op::Eq) {
+      *out = eq;
+      return true;
+    }
+    Oper zero;
+    Val z;
+    if (!scalar_imm(0.0f, &zero)) return false;
+    z.c[0] = zero;
+    if (!elementwise("SEQ", eq, z, out)) return false;
+    out->num = kNumBool;
+    return true;
+  }
   if (a.kind || b.kind) return fail("arithmetic on a structure or array");
   // the kind of number of the result: that of both, a float with a float operand (desktop GL converts implicitly), unsigned for int with uint
   const uint8_t rnum = a.num == b.num ? a.num : (a.num == kNumFloat || b.num == kNumFloat ? kNumFloat : kNumUint);
@@ -1256,6 +1352,19 @@ bool Gen::construct(const Node& n, Val* out) {
     return true;
   }
   if (t.array == 0xFFFFFFFFu) return fail("an array constructor");
+  if (t.base == Base::Struct) {      // S(a, b, ...): a new structure variable, member by member
+    const StructDef* sd = m_.struct_of(t);
+    if (!sd || static_cast<uint64_t>(n.count) != sd->fields.count()) return fail("a constructor the device cannot take");
+    Var v;
+    if (!make_var(t, &v) || !v.is_struct) return false;
+    for (int32_t i = 0; i < n.count; ++i) {
+      Val e;
+      LV l;
+      if (!eval(m_.kids[static_cast<uint64_t>(n.first + i)], &e) || !lv_from_val(members_[static_cast<uint64_t>(v.first) + static_cast<uint32_t>(i)], &l) || !store(l, e)) return false;
+    }
+    val_of(v, out);
+    return true;
+  }
   if (!is_float_type(t) || n.count < 1 || n.count > 16) return fail("a constructor the device cannot take");
   Val args[16];
   uint32_t total = 0;
@@ -1938,6 +2047,19 @@ bool Gen::eval(int32_t id, Val* out) {
             m_.globals[static_cast<uint64_t>(gi)]->kind == GlobalKind::Uniform) {
           // a uniform array: its rows in CONST, by a constant index or through the address register (the index clamped to the array, as the CPU does)
           const Global& g = *m_.globals[static_cast<uint64_t>(gi)];
+          if (g.type.base == Base::Struct) {      // of structures: each element's members have rows of their own (uniform_struct)
+            const Type et = g.type.element();
+            const uint32_t stride = m_.slots_of(et);
+            if (g.type.array > kMaxArray) return fail("a uniform array the device cannot take");
+            if (constant) {
+              if (k < 0 || static_cast<uint32_t>(k) >= g.type.array) return fail("index out of range");
+              return uniform_struct(g.slot + static_cast<uint32_t>(k) * stride, et, out);
+            }
+            Val items[kMaxArray];
+            for (uint32_t e = 0; e < g.type.array; ++e)
+              if (!uniform_struct(g.slot + e * stride, et, &items[e])) return false;
+            return select_whole(et, iv, g.type.array, items, out);
+          }
           uint32_t row;
           if (!uniform_base(static_cast<uint64_t>(gi), &row)) return false;
           *out = Val();
@@ -1999,7 +2121,16 @@ bool Gen::eval(int32_t id, Val* out) {
         }
         Val items[kMaxArray];
         for (uint32_t e = 0; e < count; ++e) val_of(elems_[static_cast<uint64_t>(b.first) + e], &items[e]);
-        if (items[0].kind) return fail("an array of structures");
+        if (items[0].kind) {      // (structures, arrays: the copy's type from what the elements are)
+          Type et = n.type;
+          if (items[0].kind == 1) {
+            et = make_type(Base::Struct);
+            et.sid = items[0].sid;
+          } else if (n.type.base == Base::Void) {
+            return fail("an array of arrays the device cannot take");
+          }
+          return select_whole(et, iv, count, items, out);
+        }
         return select(iv, count, items, out);
       }
       if (b.kind || b.is_int) return fail("an index the device cannot take");
@@ -2042,14 +2173,8 @@ bool Gen::eval(int32_t id, Val* out) {
       if (b.kind == 1) {
         uint32_t f;
         if (!find_field(b.sid, n, &f)) return false;
-        Val& mem = members_[static_cast<uint64_t>(b.first) + f];
-        if (mem.kind == 3) {
-          uint32_t row;
-          if (!alloc_const(static_cast<uint32_t>(mem.ival), mem.rows, mem.cols, 1, &row)) return false;
-          mem.kind = 0;
-          for (uint32_t c = 0; c < mem.cols; ++c) mem.c[c] = filled('C', static_cast<uint16_t>(row + c), mem.rows);
-        }
-        *out = mem;
+        if (!resolve_member(static_cast<uint64_t>(b.first) + f)) return false;
+        *out = members_[static_cast<uint64_t>(b.first) + f];
         return out->kind != 2 || fail("a built-in input read by the shader");
       }
       if (!swizzle_indices(n, idx, &count)) return false;
@@ -2088,12 +2213,13 @@ bool Gen::eval(int32_t id, Val* out) {
 bool Gen::tex_call(const Node& n, Val* out) {
   if (!fs_) return fail("a texture lookup in a vertex shader");
   const bool wgsl = n.flags == 1;
+  const bool legacy = !wgsl && (n.flags & 2) != 0;      // shadow1D / shadow2D: a vec4 by GL_DEPTH_TEXTURE_MODE
   // The device's textures have no mipmaps (GlContext::hw_texture: one level, one filter): a level, bias or gradients choose nothing, so those lookups are plain ones;
   // a projective lookup divides the coordinate by its last component first. Offsets and gathers are the CPU's.
   const TexOp top = static_cast<TexOp>(n.op);
   const bool proj = top == TexOp::Proj || top == TexOp::ProjBias || top == TexOp::ProjLod;
   const bool plain = top == TexOp::Sample || top == TexOp::Bias || top == TexOp::Lod || top == TexOp::Grad || proj;
-  if (n.flags > 1 || !plain || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
+  if ((!wgsl && (n.flags & ~2u)) || !plain || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
   if (!wgsl && (n.count < 9 || static_cast<uint64_t>(n.first) + 9 > m_.kids.count() || m_.kids[static_cast<uint64_t>(n.first) + 7] >= 0 || m_.kids[static_cast<uint64_t>(n.first) + 8] >= 0))
     return fail("a texture lookup with an offset");
   if (wgsl && top != TexOp::Sample) return fail("a texture lookup the device cannot take");
@@ -2114,38 +2240,171 @@ bool Gen::tex_call(const Node& n, Val* out) {
     if (g->kind != GlobalKind::Handle || g->type.base != Base::Texture || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float ||
         s->kind != GlobalKind::Handle || s->type.base != Base::SamplerState || s->type.array)
       return fail("a texture the device cannot take");
-  } else if (g->kind != GlobalKind::Uniform || g->type.base != Base::Sampler || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float) {
+  } else if (g->kind != GlobalKind::Uniform || g->type.base != Base::Sampler || g->type.array || g->type.texel != Base::Float ||
+             (g->type.dim != kDim2D && g->type.dim != kDim1D && g->type.dim != kDimRect)) {
     return fail("a sampler the device cannot take");
   }
+  const uint8_t dim = wgsl ? kDim2D : g->type.dim;
+  const bool shadow = !wgsl && g->type.shadow;
+  if (legacy && !shadow) return fail("a texture lookup the device cannot take");
   TgsiProgram& p = *sh_.out;
   const uint32_t sampler_slot = wgsl ? s->slot : 0;
   uint32_t index = 0;
   while (index < p.samplers.count() && !(p.samplers[index].slot == g->slot && p.samplers[index].sampler_slot == sampler_slot && p.samplers[index].wgsl == wgsl)) ++index;
   if (index == p.samplers.count()) {
     if (index >= sh_.limits.samplers) return fail("too many samplers");
-    if (!p.samplers.push_back(TgsiSampler{g->slot, sampler_slot, wgsl})) return fail("out of memory");
+    TgsiSampler ts{g->slot, sampler_slot, wgsl};
+    ts.dim = dim;
+    ts.shadow = shadow;
+    if (shadow || dim == kDimRect) {      // (its rows: see TgsiSampler)
+      if (p.const_rows + 4 > sh_.limits.const_rows) return fail("too many uniforms");
+      ts.params = static_cast<int32_t>(p.const_rows);
+      for (uint32_t r = 0; r < 4; ++r)
+        if (!p.constants.push_back(TgsiConstant{kTgsiSamplerParams, static_cast<uint16_t>(p.const_rows + r), 4, index * 4 + r})) return fail("out of memory");
+      p.const_rows += 4;
+    }
+    if (!p.samplers.push_back(ts)) return fail("out of memory");
   }
+  const TgsiSampler ts = p.samplers[index];
   Val coord;
-  if (!eval(coord_id, &coord)) return false;
-  if (proj) {      // (s, t, q) or (s, t, r, q): s / q, t / q
-    if (coord.is_int || coord.kind || coord.cols != 1 || coord.rows < 3) return fail("a projective coordinate the device cannot take");
-    Val q, xy;
-    q.c[0] = component(coord.c[0], coord.rows - 1u);
-    xy.rows = 2;
-    xy.c[0] = coord.c[0];
-    if (!elementwise("DIV", xy, q, &coord)) return false;
+  if (!eval(coord_id, &coord) || !to_float(coord)) return false;
+  if (coord.kind || coord.cols != 1) return fail("a texture coordinate the device cannot take");
+  // what the coordinate holds: s (and t but in 1D), the reference of a comparison in its third component, a projective lookup's q last
+  const uint32_t nc = coord.rows;
+  const uint32_t needed = (shadow ? 3u : (dim == kDim1D ? 1u : 2u)) + (proj ? 1u : 0u);
+  if (nc < needed || (!proj && !shadow && nc != (dim == kDim1D ? 1u : 2u))) return fail("a texture coordinate the device cannot take");
+  Oper half;
+  uint16_t uv, ref = 0;
+  if (!scalar_imm(0.5f, &half) || !new_temp(&uv) || (shadow && !new_temp(&ref))) return false;
+  const Oper cs = component(coord.c[0], 0);
+  inst("MOV", uv, "x", &cs);
+  if (dim == kDim1D) {
+    inst("MOV", uv, "y", &half);
+  } else {
+    const Oper ct = component(coord.c[0], 1);
+    inst("MOV", uv, "y", &ct);
   }
-  if (coord.is_int || coord.cols != 1 || coord.rows != 2) return fail("a texture coordinate that is not a vec2");
-  if (!new_val(4, 1, out)) return false;
-  begin_inst("TEX");
-  body.append(" TEMP[");
-  body.append_uint(out->c[0].idx);
-  body.append("].xyzw, ");
-  put_oper(coord.c[0]);
-  body.append(", SAMP[");
-  body.append_uint(index);
-  body.append("], 2D");
-  end_inst();
+  if (shadow) {
+    const Oper cr = component(coord.c[0], 2);
+    inst("MOV", ref, "x", &cr);
+  }
+  if (proj) {
+    const Oper q = component(coord.c[0], nc - 1);
+    uint16_t rq;
+    if (!new_temp(&rq)) return false;
+    inst("RCP", rq, "x", &q);
+    const Oper rqx = component(filled('T', rq, 1), 0), uvo = filled('T', uv, 2);
+    inst("MUL", uv, dim == kDim1D ? "x" : "xy", &uvo, &rqx);
+    if (shadow) {
+      const Oper refo = component(filled('T', ref, 1), 0);
+      inst("MUL", ref, "x", &refo, &rqx);
+    }
+  }
+  const Oper size = ts.params >= 0 ? filled('C', static_cast<uint16_t>(ts.params + 1), 4) : Oper();
+  if (dim == kDimRect) {      // texels to the device's 0 .. 1
+    Oper inv = size;
+    inv.swz[0] = 2;
+    inv.swz[1] = 3;
+    const Oper uvo = filled('T', uv, 2);
+    inst("MUL", uv, "xy", &uvo, &inv);
+  }
+  const auto tex = [&](uint16_t dst, uint16_t at) {
+    begin_inst("TEX");
+    body.append(" TEMP[");
+    body.append_uint(dst);
+    body.append("].xyzw, ");
+    put_oper(filled('T', at, 2));
+    body.append(", SAMP[");
+    body.append_uint(index);
+    body.append("], 2D");
+    end_inst();
+  };
+  if (!shadow) {
+    if (!new_val(4, 1, out)) return false;
+    tex(out->c[0].idx, uv);
+    return true;
+  }
+  // The comparison of the reference with a texel's depth, weighted by the function: less, equal and greater than it.
+  const Oper p0 = filled('C', static_cast<uint16_t>(ts.params), 4);
+  const Oper refx = component(filled('T', ref, 1), 0);
+  const auto compare = [&](uint16_t texel, uint16_t* result) {
+    uint16_t v;
+    if (!new_temp(&v) || !new_temp(result)) return false;
+    const Oper d = component(filled('T', texel, 1), 0);
+    inst("SLT", v, "x", &refx, &d);
+    inst("SEQ", v, "y", &refx, &d);
+    inst("SLT", v, "z", &d, &refx);
+    const Oper vo = filled('T', v, 3);
+    inst("DP3", *result, "x", &vo, &p0);
+    return true;
+  };
+  uint16_t t0, nearest;
+  if (!new_temp(&t0)) return false;
+  tex(t0, uv);
+  if (!compare(t0, &nearest)) return false;
+  // linear: the four texels around the coordinate, each compared, weighted as bilinear filtering weighs them (the CPU's percentage-closer filtering)
+  uint16_t f, i0, a, acc;
+  if (!new_temp(&f) || !new_temp(&i0) || !new_temp(&a) || !new_temp(&acc)) return false;
+  Oper nhalf = half;
+  nhalf.neg = true;
+  const Oper uvo = filled('T', uv, 2);
+  inst("MAD", f, "xy", &uvo, &size, &nhalf);
+  const Oper fo = filled('T', f, 2);
+  inst("FLR", i0, "xy", &fo);
+  const Oper io = filled('T', i0, 2);
+  Oper nio = io;
+  nio.neg = true;
+  inst("ADD", a, "xy", &fo, &nio);
+  Oper zero;
+  if (!scalar_imm(0.0f, &zero)) return false;
+  inst("MOV", acc, "x", &zero);
+  Oper inv = size;
+  inv.swz[0] = 2;
+  inv.swz[1] = 3;
+  for (uint32_t k = 0; k < 4; ++k) {
+    const uint32_t ix = k & 1, iy = k >> 1;
+    const float off[4] = {static_cast<float>(ix) + 0.5f, static_cast<float>(iy) + 0.5f, 0, 0};
+    Oper offo;
+    uint16_t c, tk, cmp, w;
+    if (!imm(off, 2, &offo) || !new_temp(&c) || !new_temp(&tk) || !new_temp(&w)) return false;
+    inst("ADD", c, "xy", &io, &offo);
+    const Oper co = filled('T', c, 2);
+    inst("MUL", c, "xy", &co, &inv);
+    tex(tk, c);
+    if (!compare(tk, &cmp)) return false;
+    // the weight: (ix ? a.x : 1 - a.x) * (iy ? a.y : 1 - a.y)
+    Oper one;
+    if (!scalar_imm(1.0f, &one)) return false;
+    const Oper ax = component(filled('T', a, 2), 0), ay = component(filled('T', a, 2), 1);
+    Oper nax = ax, nay = ay;
+    nax.neg = nay.neg = true;
+    uint16_t wx, wy;
+    if (!new_temp(&wx) || !new_temp(&wy)) return false;
+    if (ix) inst("MOV", wx, "x", &ax);
+    else inst("ADD", wx, "x", &one, &nax);
+    if (iy) inst("MOV", wy, "x", &ay);
+    else inst("ADD", wy, "x", &one, &nay);
+    const Oper wxo = component(filled('T', wx, 1), 0), wyo = component(filled('T', wy, 1), 0);
+    inst("MUL", w, "x", &wxo, &wyo);
+    const Oper wo = component(filled('T', w, 1), 0), cmpo = component(filled('T', cmp, 1), 0), acco = component(filled('T', acc, 1), 0);
+    inst("MAD", acc, "x", &wo, &cmpo, &acco);
+  }
+  uint16_t r;
+  if (!new_temp(&r)) return false;
+  Oper lin = component(p0, 3);
+  lin.neg = true;
+  const Oper acco = component(filled('T', acc, 1), 0), neo = component(filled('T', nearest, 1), 0);
+  inst("CMP", r, "x", &lin, &acco, &neo);
+  const Oper ro = component(filled('T', r, 1), 0);
+  if (legacy) {
+    if (!new_val(4, 1, out)) return false;
+    const Oper m = filled('C', static_cast<uint16_t>(ts.params + 2), 4), b = filled('C', static_cast<uint16_t>(ts.params + 3), 4);
+    inst("MAD", out->c[0].idx, "xyzw", &ro, &m, &b);
+    return true;
+  }
+  *out = Val();
+  out->rows = 1;
+  out->c[0] = ro;
   return true;
 }
 
@@ -2178,6 +2437,72 @@ bool Gen::clamp_index(const Val& idx, uint32_t count, Val* out) {
   return elementwise("MAX", idx, zv, &t) && elementwise("MIN", t, lv, out);
 }
 
+bool Gen::equal_whole(const Val& a, const Val& b, Val* out) {
+  // the parts compared: a structure's members, an array's elements or a matrix's columns (fetched one at a time: the kernel's stack is small)
+  uint32_t n = 0;
+  if (a.kind == 1 || b.kind == 1) {
+    if (a.kind != 1 || b.kind != 1 || a.sid != b.sid || a.sid >= m_.structs.count()) return fail("a comparison of structures the device cannot take");
+    n = static_cast<uint32_t>(m_.structs[a.sid]->fields.count());
+  } else if (a.kind == 4 || b.kind == 4) {
+    if (a.kind != 4 || b.kind != 4 || a.count != b.count) return fail("a comparison of arrays of other sizes");
+    n = a.count;
+  } else {
+    if (a.kind || b.kind || a.cols != b.cols || a.rows != b.rows) return fail("a comparison of other shapes");
+    n = a.cols;
+  }
+  if (n == 0) return fail("an empty comparison");
+  const auto part = [&](const Val& w, uint32_t i, Val* p) {
+    if (w.kind == 1) {
+      if (!resolve_member(static_cast<uint64_t>(w.first) + i)) return false;
+      *p = members_[static_cast<uint64_t>(w.first) + i];
+    } else if (w.kind == 4) {
+      val_of(elems_[static_cast<uint64_t>(w.first) + i], p);
+    } else {
+      *p = Val();
+      p->rows = w.rows;
+      p->num = w.num;
+      p->c[0] = w.c[i];
+    }
+    return true;
+  };
+  Val acc;
+  for (uint32_t i = 0; i < n; ++i) {
+    Val pa, pb, e;
+    if (!part(a, i, &pa) || !part(b, i, &pb) || !binary(Op::Eq, pa, pb, &e)) return false;
+    if (i == 0) {
+      acc = e;
+    } else {
+      Val m;
+      if (!elementwise("MUL", acc, e, &m)) return false;
+      acc = m;
+    }
+  }
+  *out = acc;
+  out->num = kNumBool;
+  return true;
+}
+
+// items[idx] of structures or arrays, `t` their type: a copy of the first, then each other stored over it where the (clamped) index is its own.
+bool Gen::select_whole(const Type& t, const Val& idx, uint32_t count, const Val* items, Val* out) {
+  if (count == 0) return fail("an empty array");
+  Var copy;
+  LV cl;
+  Val ci;
+  if (!make_var(t, &copy)) return false;
+  lv_of(copy, &cl);
+  if (!store(cl, items[0]) || !clamp_index(idx, count, &ci)) return false;
+  for (uint32_t e = 1; e < count; ++e) {
+    Oper kv;
+    uint16_t tt;
+    if (!scalar_imm(static_cast<float>(e), &kv) || !new_temp(&tt)) return false;
+    const Oper cx = component(ci.c[0], 0);
+    inst("SEQ", tt, "x", &cx, &kv);
+    if (!cond_store(cl, items[e], component(filled('T', tt, 1), 0))) return false;
+  }
+  val_of(copy, out);
+  return true;
+}
+
 // items[idx] for an index computed by the shader: each item compared with the (clamped) index and the one that matches chosen.
 bool Gen::select(const Val& idx, uint32_t count, const Val* items, Val* out) {
   if (count == 0) return fail("an empty array");
@@ -2205,7 +2530,28 @@ bool Gen::select(const Val& idx, uint32_t count, const Val* items, Val* out) {
 bool Gen::cond_store(const LV& l, const Val& v_in, const Oper& t) {
   Val v = v_in;
   if (!to_float(v)) return false;
-  if (l.agg || l.count || v.kind) return fail("an assignment through a variable index the device cannot take");
+  if (l.count || v.kind == 4) {      // a whole array: element by element
+    if (!l.count || v.kind != 4 || v.count != l.count) return fail("assignment of arrays of other sizes");
+    for (uint32_t e = 0; e < l.count; ++e) {
+      LV el;
+      Val ev;
+      lv_of(elems_[static_cast<uint64_t>(l.first) + e], &el);
+      val_of(elems_[static_cast<uint64_t>(v.first) + e], &ev);
+      if (!cond_store(el, ev, t)) return false;
+    }
+    return true;
+  }
+  if (l.agg || v.kind) {      // a whole structure: member by member
+    if (!l.agg || v.kind != 1 || l.sid != v.sid || l.sid >= m_.structs.count()) return fail("an assignment through a variable index the device cannot take");
+    const uint64_t members = m_.structs[l.sid]->fields.count();
+    for (uint64_t i = 0; i < members; ++i) {
+      LV ml;
+      if (!resolve_member(static_cast<uint64_t>(v.first) + i)) return false;
+      const Val mv = members_[static_cast<uint64_t>(v.first) + i];
+      if (!lv_from_val(members_[static_cast<uint64_t>(l.first) + i], &ml) || !cond_store(ml, mv, t)) return false;
+    }
+    return true;
+  }
   Oper nt = component(t, 0);
   nt.neg = !nt.neg;
   if (l.cols > 1) {
@@ -2233,10 +2579,123 @@ bool Gen::cond_store(const LV& l, const Val& v_in, const Oper& t) {
   return true;
 }
 
+// Element e of an array, the column e of a matrix or the component e of a vector.
+bool Gen::lv_element(const LV& base, uint32_t e, LV* out) {
+  if (base.count) {
+    if (e >= base.count) return fail("index out of range");
+    lv_of(elems_[static_cast<uint64_t>(base.first) + e], out);
+    return true;
+  }
+  if (base.agg) return fail("an index of a structure");
+  if (base.cols > 1) {
+    if (e >= base.cols) return fail("index out of range");
+    *out = LV();
+    out->rows = base.rows;
+    out->n = base.rows;
+    out->temp[0] = base.temp[e];
+    return true;
+  }
+  if (e >= base.n) return fail("index out of range");
+  *out = base;
+  out->n = 1;
+  out->chan[0] = base.chan[e];
+  return true;
+}
+
+bool Gen::has_dynamic_index(int32_t id) const {
+  while (id >= 0) {
+    const Node& n = m_.nodes[static_cast<uint64_t>(id)];
+    if (n.kind == NodeKind::Index) {
+      if (is_control_output(n.a)) return false;
+      if (n.b < 0 || m_.nodes[static_cast<uint64_t>(n.b)].kind != NodeKind::Const) return true;
+    } else if (n.kind != NodeKind::Field && n.kind != NodeKind::Swizzle) {
+      return false;
+    }
+    id = n.a;
+  }
+  return false;
+}
+
+bool Gen::places(int32_t id, List<Place>* out) {
+  const Node& nd = m_.nodes[static_cast<uint64_t>(id)];
+  out->clear();
+  const auto add = [&](const LV& l, int32_t flag) {
+    if (out->count() >= kMaxPlaces) return fail("an assignment through too many variable indexes");
+    Place pl;
+    pl.l = l;
+    pl.flag = flag;
+    return out->push_back(pl) || fail("out of memory");
+  };
+  if (nd.kind == NodeKind::Index && !is_control_output(nd.a)) {
+    List<Place> base(body.allocator());
+    if (!places(nd.a, &base)) return false;
+    bool constant;
+    int32_t k;
+    Val iv;
+    if (!index_of(nd.b, &constant, &k, &iv)) return false;
+    for (const Place& bp : base) {
+      const uint32_t count = bp.l.count ? bp.l.count : (bp.l.cols > 1 ? bp.l.cols : bp.l.n);
+      LV el;
+      if (constant) {
+        if (k < 0 || !lv_element(bp.l, static_cast<uint32_t>(k), &el) || !add(el, bp.flag)) return fail("an indexed assignment the device cannot take");
+        continue;
+      }
+      Val ci;
+      if (count < 1 || count > kMaxArray || !clamp_index(iv, count, &ci)) return fail("an index the device cannot take");
+      for (uint32_t e = 0; e < count; ++e) {
+        Oper kv;
+        uint16_t t;
+        if (!scalar_imm(static_cast<float>(e), &kv) || !new_temp(&t) || !lv_element(bp.l, e, &el)) return false;
+        const Oper cx = component(ci.c[0], 0);
+        inst("SEQ", t, "x", &cx, &kv);
+        if (bp.flag >= 0) {      // (and the index before it chose this one)
+          const Oper tf = component(filled('T', t, 1), 0), bf = component(filled('T', static_cast<uint16_t>(bp.flag), 1), 0);
+          inst("MUL", t, "x", &tf, &bf);
+        }
+        if (!add(el, t)) return false;
+      }
+    }
+    return true;
+  }
+  if (nd.kind == NodeKind::Field && has_dynamic_index(nd.a)) {
+    List<Place> base(body.allocator());
+    if (!places(nd.a, &base)) return false;
+    for (const Place& bp : base) {
+      const LV& bl = bp.l;
+      LV r;
+      if (bl.agg) {
+        uint32_t f;
+        if (!find_field(bl.sid, nd, &f) || !lv_from_val(members_[static_cast<uint64_t>(bl.first) + f], &r)) return false;
+      } else {
+        uint32_t idx[4], count;
+        if (!swizzle_indices(nd, idx, &count) || bl.cols != 1) return fail("a swizzle of a matrix");
+        r = bl;
+        r.n = static_cast<uint8_t>(count);
+        for (uint32_t j = 0; j < count; ++j) {
+          if (idx[j] >= bl.n) return fail("swizzle out of range");
+          r.chan[j] = bl.chan[idx[j]];
+        }
+      }
+      if (!add(r, bp.flag)) return false;
+    }
+    return true;
+  }
+  LV l;
+  return lvalue(id, &l) && add(l, -1);
+}
+
 // target = v: an lvalue, or an element of an array, matrix or vector chosen by an index the shader computes (each element takes v where the index is its own).
 bool Gen::assign_to(int32_t target, const Val& v) {
   if (target < 0) return fail("missing expression");
   const Node& n = m_.nodes[static_cast<uint64_t>(target)];
+  if ((n.kind == NodeKind::Field || (n.kind == NodeKind::Index && !is_control_output(n.a))) && has_dynamic_index(n.a)) {      // inside an element chosen by a variable (a[i].x, a[i].b[2])
+    List<Place> ps(body.allocator());
+    if (!places(target, &ps)) return false;
+    for (const Place& pl : ps) {
+      if (pl.flag < 0 ? !store(pl.l, v) : !cond_store(pl.l, v, component(filled('T', static_cast<uint16_t>(pl.flag), 1), 0))) return false;
+    }
+    return true;
+  }
   if (n.kind == NodeKind::Index && !is_control_output(n.a)) {
     bool constant;
     int32_t k;
@@ -2848,7 +3307,14 @@ bool Gen::run() {
   // globals with an initializer (`float g = 1.0;` at file scope): the initializers run first, in their order
   for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
     const Global& g = *m_.globals[gi];
-    if (g.kind != GlobalKind::Private || g.init < 0) continue;
+    // (also the constant arrays and structures a shader reads, and its uniform structures: made here, before anything can be in a branch)
+    if (g.kind == GlobalKind::Uniform && g.referenced && g.type.base == Base::Struct && !g.type.array) {
+      Val ignored;
+      if (!global_val(gi, &ignored)) return false;
+      continue;
+    }
+    const bool aggregate_const = g.kind == GlobalKind::Const && g.referenced && g.init >= 0 && (g.type.array || g.type.base == Base::Struct);
+    if (!aggregate_const && (g.kind != GlobalKind::Private || g.init < 0)) continue;
     Var v;
     Val init;
     LV l;

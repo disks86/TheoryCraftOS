@@ -49,6 +49,7 @@ struct AccelLimits {
   bool geometry = false;      // programs with a geometry stage (AccelStages::gs), and the adjacency topologies
   bool tessellation = false;  // programs with tessellation stages (AccelStages::tcs / tes), and patches
   bool clip_distances = false;  // AccelState::clip_mask: the CLIPDIST outputs of the last stage cut the primitives
+  bool float_textures = false;  // create_texture_float (what a depth texture is sent as)
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
@@ -119,11 +120,23 @@ class IAccelerator {
     (void)h;
     return 0;
   }
+  // A texture of w x h texels of four 32-bit floats (AccelLimits::float_textures), read exactly as written with nearest filtering. 0: the device cannot have one.
+  virtual uint32_t create_texture_float(uint32_t w, uint32_t h) {
+    (void)w;
+    (void)h;
+    return 0;
+  }
   virtual void destroy_texture(uint32_t texture) { (void)texture; }
   // Replaces the contents: w * h * 4 bytes, R, G, B, A of each texel, the first row (t = 0) first.
   virtual bool write_texture(uint32_t texture, ConstByteView rgba) {
     (void)texture;
     (void)rgba;
+    return false;
+  }
+  // The same for a float texture: w * h * 16 bytes, R, G, B, A of each texel as little-endian floats.
+  virtual bool write_texture_float(uint32_t texture, ConstByteView rgba32f) {
+    (void)texture;
+    (void)rgba32f;
     return false;
   }
 
@@ -146,8 +159,8 @@ class IAccelerator {
 class AccelTextureCache {
  public:
   explicit AccelTextureCache(allocators::IAllocator& a) : entries_(a) {}
-  // The device texture holding `rgba` (w * h * 4 bytes) as texture `key`. 0: the device cannot.
-  uint32_t get(IAccelerator& acc, uint64_t key, uint32_t w, uint32_t h, ConstByteView rgba);
+  // The device texture holding `rgba` (w * h * 4 bytes; with `floats`, w * h * 16 bytes of floats: a float texture) as texture `key`. 0: the device cannot.
+  uint32_t get(IAccelerator& acc, uint64_t key, uint32_t w, uint32_t h, ConstByteView rgba, bool floats = false);
   void forget(IAccelerator& acc, uint64_t key);
   void release(IAccelerator& acc);   // every texture goes
 
@@ -155,6 +168,7 @@ class AccelTextureCache {
   struct Entry {
     uint64_t key, hash;
     uint32_t handle, w, h;
+    bool floats;
   };
   static constexpr uint64_t kMaxEntries = 64;   // more and the oldest goes
   List<Entry> entries_;

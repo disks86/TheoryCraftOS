@@ -909,7 +909,7 @@ class GlContext final : public shader::ITextureHost {
   uint32_t hw_w_ = 0, hw_h_ = 0;    // the size of hw_target_
   HardwareStats hw_stats_;
   AccelTextureCache hw_textures_;   // the device copies of the textures the accelerated draws sampled, by GL name
-  bool hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sampler);
+  bool hw_texture(const TgsiSampler& sampler_info, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16]);
   void hw_forget_texture(uint32_t name);
   void hw_drop();
   void hw_retarget(uint32_t w, uint32_t h);
