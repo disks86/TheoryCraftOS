@@ -804,14 +804,20 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
   if (monitor) node->props.set("stream.capture.sink", "true");
   name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
+  add_capture_ports_locked(*node, client, format, monitor);
+  return node_id;
+}
+
+// A node's input ports linked from the source (or the sink's monitor): mono, or front left and right (more channels are made from those two).
+void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, const PcmFormat& format, bool monitor) {
+  const uint32_t node_id = node_object.id;
   const uint32_t from_node = monitor ? sink_ : source_;
   const uint32_t* from_ports = monitor ? monitor_ports_ : source_ports_;
-  // ports: mono, or front left and right (more channels are made from those two)
   const uint32_t ports = format.channels == 1 ? 1 : 2;
-  node->input_ports = ports;
+  node_object.input_ports = ports;
   for (uint32_t i = 0; i < ports; ++i) {
     GraphObject* port = add_locked(ObjectType::Port, client);
-    if (!port) return node_id;
+    if (!port) return;
     port->channel = ports == 1 ? kMono : (i == 0 ? kFL : kFR);
     set_port_props(*port, node_id, i, kDirectionInput, "input_", allocator_);
     const uint32_t port_id = port->id;
@@ -819,7 +825,7 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
     for (uint32_t s = 0; s < 2; ++s) {
       if (ports == 2 && s != i) continue;
       GraphObject* link = add_locked(ObjectType::Link, client);
-      if (!link) return node_id;
+      if (!link) return;
       link->output_node = from_node;
       link->output_port = from_ports[s];
       link->input_node = node_id;
@@ -831,18 +837,11 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
       link->props.set("factory.name", "link-factory");
     }
   }
-  return node_id;
 }
 
-uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor) {
-  *out = SharedPointer<RecordStream>();
-  if (monitor ? !mixer_ : (!capture_ || !source_)) return 0;
-  if (!format.valid()) return 0;
-  {
-    kernel::ScopedMutex guard(mutex_);
-    GraphObject* c = find_locked(client);
-    if (!c || c->type != ObjectType::Client) return 0;
-  }
+SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor) {
+  if (monitor ? !mixer_ : (!capture_ || !source_)) return SharedPointer<RecordStream>();
+  if (!format.valid()) return SharedPointer<RecordStream>();
   audio::StreamFormat sf;
   sf.sample_rate = format.rate;
   sf.channels = format.channels == 1 ? 1 : 2;
@@ -858,12 +857,21 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
   } else {
     capture = capture_->open_stream(sf, ring, true);      // (marked: refresh() must not take it for a native program's)
   }
-  if (!capture) return 0;
+  if (!capture) return SharedPointer<RecordStream>();
   SharedPointer<RecordStream> record = SharedPointer<RecordStream>::make(allocator_, allocator_, format, capture);
-  if (!record) {
-    capture->close();
-    return 0;
+  if (!record) capture->close();
+  return record;
+}
+
+uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor) {
+  *out = SharedPointer<RecordStream>();
+  {
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* c = find_locked(client);
+    if (!c || c->type != ObjectType::Client) return 0;
   }
+  SharedPointer<RecordStream> record = open_record_stream(format, monitor);
+  if (!record) return 0;
   uint32_t id = 0;
   {
     kernel::ScopedMutex guard(mutex_);
@@ -873,11 +881,37 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     if (GraphObject* node = id ? find_locked(id) : nullptr) node->record = record;
   }
   if (!id) {
-    capture->close();
+    record->close();
     return 0;
   }
   *out = record;
   return id;
+}
+
+uint32_t Graph::create_filter(uint32_t client, const PcmFormat& out_format, const PcmFormat& in_format, const Properties& props,
+                              SharedPointer<PlaybackStream>* playback, SharedPointer<RecordStream>* record) {
+  *playback = SharedPointer<PlaybackStream>();
+  *record = SharedPointer<RecordStream>();
+  const StringView media_class = props.get("media.class");
+  uint32_t id = 0;
+  if (out_format.channels) {
+    id = create_playback(client, out_format, props, playback);
+    if (!id) return 0;
+    if (!in_format.channels) return id;
+    SharedPointer<RecordStream> in = open_record_stream(in_format, false);
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* node = find_locked(id);
+    if (!node) return id;
+    if (!media_class.empty()) node->props.set("media.class", media_class);
+    if (in) {
+      node->record = in;
+      add_capture_ports_locked(*node, client, in_format, false);
+      touch_locked(*node);
+      *record = in;
+    }
+    return id;
+  }
+  return in_format.channels ? create_record(client, in_format, props, record) : 0;
 }
 
 void Graph::remove_node_locked(uint32_t node_id, List<SharedPointer<PlaybackStream>>* stopped, bool drain) {

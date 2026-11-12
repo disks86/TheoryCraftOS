@@ -455,12 +455,15 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
   if (media == Media::Unknown) return false;      // (not known yet: the update may say)
   n.media = media;
   n.direction = class_direction(media_class, n.direction);
-  // a raw node's audio: its float ports in the node's direction are the stream's channels (one or two), at the graph's rate
+  // a raw node's audio (a pw_filter): its float output ports are the channels it plays, its float input ports those it records, at the graph's rate
   if (media == Media::Audio && n.raw) {
-    uint32_t channels = 0;
+    n.out_channels = n.in_channels = 0;
     for (UniquePointer<ClientPort>& p : n.ports.view())
-      if (p->media == Media::Audio && p->direction == n.direction) ++channels;
-    n.format = PcmFormat{SampleFormat::F32Le, 48000, channels == 1 ? 1u : 2u};
+      if (p->media == Media::Audio) ++(p->direction == kDirectionOutput ? n.out_channels : n.in_channels);
+    if (n.out_channels && !n.in_channels) n.direction = kDirectionOutput;
+    if (n.in_channels && !n.out_channels) n.direction = kDirectionInput;
+    const uint32_t channels = n.direction == kDirectionOutput ? n.out_channels : n.in_channels;
+    n.format = PcmFormat{SampleFormat::F32Le, 48000, channels ? channels : 1u};
   }
   Properties props(allocator_);
   props.copy_from(n.props);
@@ -470,7 +473,11 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
     StringView target = n.props.get("target.object");
     if (target.empty()) target = n.props.get("node.target");
     const uint32_t named = graph_.find_node(target);
-    if (VirtualSink* v = named ? virtual_sink(named) : nullptr) {
+    if (n.raw && n.out_channels && n.in_channels) {
+      // both ways (an effect): one node that records from the microphone and plays to the speakers
+      n.node = graph_.create_filter(c.graph_client, PcmFormat{SampleFormat::F32Le, 48000, n.out_channels}, PcmFormat{SampleFormat::F32Le, 48000, n.in_channels},
+                                    props, &n.playback, &n.record);
+    } else if (VirtualSink* v = named ? virtual_sink(named) : nullptr) {
       n.format = PcmFormat{SampleFormat::F32Le, v->rate, v->channels};
       n.virtual_sink = v->node;
       advance_virtual(*v, now_ns());
@@ -1359,8 +1366,8 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
     ConstByteView a = ConstByteView(data).subview(start, first), b = ConstByteView(data).first(length - first);
     switch (p.media) {
       case Media::Audio: {
-        // (one interleaved port: straight on; float ports are put together by the caller, through the scratch)
-        if (!n.raw || n.format.channels == 1) {
+        // (one interleaved port: straight on; a filter's float ports are put together by the caller, through the scratch)
+        if (!n.raw || (n.virtual_sink && n.format.channels == 1)) {
           const uint32_t frame = n.frame();
           if (n.virtual_sink) {
             if (VirtualSink* v = virtual_sink(n.virtual_sink)) {
@@ -1631,73 +1638,75 @@ void NativeServer::run_client_node(ClientNode& n, uint64_t now) {
   if (!n.activation || !n.io) return;
   n.cycle_ns = now;
   ByteView a = n.activation->memory();
-  // two float ports (a pw_filter's left and right): what they played, put together; what they are to hear, taken apart
-  auto play_pair = [&]() {
-    if (!(n.raw && n.media == Media::Audio && n.format.channels == 2 && n.direction == kDirectionOutput)) return;
-    ClientPort* sides[2] = {};
+  // a filter's float ports: what its outputs played, put together (a channel each) for the speakers; what its inputs are to hear (the microphone),
+  // taken apart (a channel each)
+  const bool filter_out = n.raw && n.media == Media::Audio && n.out_channels > 0 && !n.virtual_sink;
+  const bool filter_in = n.raw && n.media == Media::Audio && n.in_channels > 0 && !n.virtual_sink;
+  auto play_ports = [&]() {
+    if (!filter_out) return;
+    ClientPort* sides[kMaxPorts] = {};
     uint32_t found = 0;
     for (UniquePointer<ClientPort>& p : n.ports.view())
-      if (p->media == Media::Audio && p->direction == kDirectionOutput && found < 2) sides[found++] = p.get();
+      if (p->media == Media::Audio && p->direction == kDirectionOutput && found < n.out_channels) sides[found++] = p.get();
     n.scratch.clear();
-    uint64_t lengths[2] = {};
+    uint64_t starts[kMaxPorts] = {}, lengths[kMaxPorts] = {};
+    uint64_t frames = 0;      // (the longest port's: one that gave less is silent for the rest)
     for (uint32_t s = 0; s < found; ++s) {
-      const uint64_t before = n.scratch.size();
-      consume_output(n, *sides[s]);
-      lengths[s] = n.scratch.size() - before;
+      starts[s] = n.scratch.size();
+      if (sides[s]->buffers_sent && sides[s]->data_ready) consume_output(n, *sides[s]);
+      lengths[s] = n.scratch.size() - starts[s];
+      if (lengths[s] / 4 > frames) frames = lengths[s] / 4;
     }
-    const uint64_t frames = (found == 2 ? (lengths[0] < lengths[1] ? lengths[0] : lengths[1]) : lengths[0]) / 4;
-    if (frames == 0) return;
+    if (frames == 0 || !n.playback) return;
+    const uint64_t frame_bytes = 4ull * n.out_channels;
     ByteBuffer interleaved(allocator_);
-    if (!interleaved.put_zeros(frames * 8)) return;
-    ConstByteView left = n.scratch.view().first(frames * 4);
-    ConstByteView right = found == 2 ? n.scratch.view().subview(lengths[0], frames * 4) : left;
+    if (!interleaved.put_zeros(frames * frame_bytes)) return;
     ByteView out = interleaved.writable_view();
-    for (uint64_t f = 0; f < frames; ++f) {
-      out.subview(f * 8, 4).copy_from(left.subview(f * 4, 4));
-      out.subview(f * 8 + 4, 4).copy_from(right.subview(f * 4, 4));
-    }
-    if (n.playback) n.playback->write(interleaved.view());
+    const ConstByteView all = n.scratch.view();
+    for (uint32_t s = 0; s < found; ++s)
+      for (uint64_t f = 0; f < frames && f < lengths[s] / 4; ++f) out.subview(f * frame_bytes + 4ull * s, 4).copy_from(all.subview(starts[s] + f * 4, 4));
+    n.playback->write(interleaved.view());
   };
   auto take_outputs = [&]() {
     for (UniquePointer<ClientPort>& p : n.ports.view())
-      if (p->direction == kDirectionOutput && p->buffers_sent && p->data_ready && !(n.raw && p->media == Media::Audio && n.format.channels == 2))
-        consume_output(n, *p);
-    play_pair();
+      if (p->direction == kDirectionOutput && p->buffers_sent && p->data_ready && !(filter_out && p->media == Media::Audio)) consume_output(n, *p);
+    play_ports();
   };
   auto give_inputs = [&]() {
-    if (n.raw && n.media == Media::Audio && n.format.channels == 2 && n.direction == kDirectionInput) {
-      // two float ports: a quantum recorded in stereo, each side to its port
-      ClientPort* sides[2] = {};
+    if (filter_in) {
+      // a quantum recorded in the filter's channels, each to its port
+      ClientPort* sides[kMaxPorts] = {};
       uint32_t found = 0;
       for (UniquePointer<ClientPort>& p : n.ports.view())
-        if (p->media == Media::Audio && p->direction == kDirectionInput && p->buffers_sent && p->data_ready && found < 2) sides[found++] = p.get();
+        if (p->media == Media::Audio && p->direction == kDirectionInput && p->buffers_sent && p->data_ready && found < n.in_channels) sides[found++] = p.get();
+      const uint64_t frame_bytes = 4ull * n.in_channels;
       n.scratch.clear();
-      if (found == 0 || !n.scratch.put_zeros(uint64_t{n.quantum} * 8)) return;
-      uint32_t got = 0;
-      if (n.record) got = n.record->read(n.scratch.writable_view());
-      const uint64_t frames = got / 8;
-      for (uint32_t s = 0; s < found; ++s) {
-        ClientPort& p = *sides[s];
-        ByteView io = part(n.io->memory(), 8ull * p.index, 8);
-        const uint32_t id = p.next_buffer;
-        p.next_buffer = (p.next_buffer + 1) % p.n_buffers;
-        uint32_t maxsize = 0;
-        ByteView data = buffer_data(p, id, &maxsize);
-        if (maxsize < frames * 4) continue;
-        for (uint64_t f = 0; f < frames; ++f) data.subview(f * 4, 4).copy_from(n.scratch.view().subview(f * 8 + 4ull * s, 4));
-        ByteView chunk = part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.chunk_offset, 16);
-        store<uint32_t>(chunk, 0, 0);
-        store<uint32_t>(chunk, 4, static_cast<uint32_t>(frames * 4));
-        store<int32_t>(chunk, 8, 4);
-        store<int32_t>(chunk, 12, 0);
-        write_header_meta(p, id, static_cast<int64_t>(frames_ns(n.position, n.format.rate)));
-        store<uint32_t>(io, 4, id);
-        store<int32_t>(io, 0, kStatusHaveData);
+      if (found > 0 && n.scratch.put_zeros(uint64_t{n.quantum} * frame_bytes)) {
+        uint32_t got = 0;
+        if (n.record) got = n.record->read(n.scratch.writable_view());
+        const uint64_t frames = got / frame_bytes;
+        for (uint32_t s = 0; s < found; ++s) {
+          ClientPort& p = *sides[s];
+          ByteView io = part(n.io->memory(), 8ull * p.index, 8);
+          const uint32_t id = p.next_buffer;
+          p.next_buffer = (p.next_buffer + 1) % p.n_buffers;
+          uint32_t maxsize = 0;
+          ByteView data = buffer_data(p, id, &maxsize);
+          if (maxsize < frames * 4) continue;
+          for (uint64_t f = 0; f < frames; ++f) data.subview(f * 4, 4).copy_from(n.scratch.view().subview(f * frame_bytes + 4ull * s, 4));
+          ByteView chunk = buffer_chunk(p, id);
+          store<uint32_t>(chunk, 0, 0);
+          store<uint32_t>(chunk, 4, static_cast<uint32_t>(frames * 4));
+          store<int32_t>(chunk, 8, 4);
+          store<int32_t>(chunk, 12, 0);
+          write_header_meta(p, id, static_cast<int64_t>(frames_ns(n.position, n.format.rate)));
+          store<uint32_t>(io, 4, id);
+          store<int32_t>(io, 0, kStatusHaveData);
+        }
       }
-      return;
     }
     for (UniquePointer<ClientPort>& p : n.ports.view())
-      if (p->direction == kDirectionInput && p->buffers_sent && p->data_ready) fill_input(n, *p);
+      if (p->direction == kDirectionInput && p->buffers_sent && p->data_ready && !(filter_in && p->media == Media::Audio)) fill_input(n, *p);
   };
   if (n.driving) {
     // the program runs its cycles: what its outputs produced is taken, its inputs are given what there is

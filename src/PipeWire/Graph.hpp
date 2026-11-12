@@ -144,6 +144,10 @@ class Graph {
   // mixer plays, before the master volume). 0 when there is no capture hub (no mixer for a monitor), the format is not valid or the hub (the mixer's
   // taps) is full. *out is the stream the client reads from.
   uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false);
+  // A filter (a pw_filter with float ports both ways: an effect): one node that plays `out_format` to the sink (its output ports) and records
+  // `in_format` from the source (its input ports linked from it); either may have 0 channels. Its media class is kept.
+  uint32_t create_filter(uint32_t client, const PcmFormat& out_format, const PcmFormat& in_format, const Properties& props,
+                         SharedPointer<PlaybackStream>* playback, SharedPointer<RecordStream>* record);
   // `drain`: what is queued still plays; else it stops now. (A record node just stops.)
   void destroy_node(uint32_t node, bool drain = false);
   bool update_node(uint32_t node, const Properties& props, Properties::Mode mode);
@@ -225,6 +229,8 @@ class Graph {
   void remove_node_locked(uint32_t node, List<SharedPointer<PlaybackStream>>* stopped, bool drain);
   bool add_source_locked();
   uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor);
+  void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor);
+  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
   void sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live);

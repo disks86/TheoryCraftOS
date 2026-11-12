@@ -28,6 +28,9 @@
 //   midi         a pw_filter MIDI output (8 bit raw midi) playing 16 notes (on at the cycle's start, the last one's off half way through) and a 22-byte
 //                system exclusive message, and a pw_stream MIDI input: the input must hear the notes and the sysex whole through the server's MIDI bus,
 //                its controls in order, some past the cycle's start (the emulator counts what reached its synthesizer);
+//   filter       an effect: a pw_filter (Audio/Filter) with two float inputs and two float outputs, one node that records and plays at once: its
+//                inputs must hear the microphone (880 Hz left, 1320 Hz right), its outputs play a fiftieth of what came in (quiet: the interop test's
+//                check of the mixed output looks for loud parts);
 //   adapter      a virtual sink made with the adapter factory (support.null-audio-sink), a stream (PW_STREAM_FLAG_DRIVER: an audio driver, which the
 //                server makes follow its clock) playing 500 Hz into it and a stream recording from it: the recording must hold the tone.
 // Prints "pwmedia: <mode> ok ..." or "pwmedia: <mode> FAILED ...", and ends with 0 when it passed.
@@ -94,6 +97,12 @@ struct data {
   uint64_t played, recorded;
   float* capture;
   uint32_t captured;
+  // filter
+  struct pw_filter* effect;
+  void* fx_in[2];
+  void* fx_out[2];
+  float* fx_capture;
+  uint32_t fx_frames, fx_cycles;
   int result;
 };
 
@@ -673,6 +682,65 @@ static const struct pw_proxy_events sink_events = {
     .bound = sink_bound,
 };
 
+// ---- an effect: a filter with inputs and outputs -------------------------------------------------------------------------------------------------
+
+static void effect_process(void* userdata, struct spa_io_position* position) {
+  struct data* d = userdata;
+  const uint32_t n = position ? position->clock.duration : 1024;
+  ++d->fx_cycles;
+  const float* in[2];
+  float* out[2];
+  for (int k = 0; k < 2; ++k) {
+    in[k] = pw_filter_get_dsp_buffer(d->fx_in[k], n);
+    out[k] = pw_filter_get_dsp_buffer(d->fx_out[k], n);
+  }
+  for (int k = 0; k < 2; ++k)
+    if (out[k]) for (uint32_t i = 0; i < n; ++i) out[k][i] = in[k] ? in[k][i] * 0.02f : 0.f;
+  if (!in[0] || !in[1]) return;
+  for (uint32_t i = 0; i < n && d->fx_frames < CAPTURE; ++i, ++d->fx_frames) {
+    d->fx_capture[2 * d->fx_frames] = in[0][i];
+    d->fx_capture[2 * d->fx_frames + 1] = in[1][i];
+  }
+  if (d->fx_frames >= CAPTURE) {
+    // (the first tenth of a second skipped: the microphone may start late)
+    const float* s = d->fx_capture + 2 * 4800;
+    const uint32_t frames = CAPTURE - 4800;
+    const double l880 = goertzel(s, frames, 2, 880), r1320 = goertzel(s + 1, frames, 2, 1320), l1320 = goertzel(s, frames, 2, 1320);
+    char what[200];
+    snprintf(what, sizeof what, "(its inputs heard left 880 Hz %.3f, right 1320 Hz %.3f, left 1320 Hz %.3f over %u cycles; its outputs played it back)", l880, r1320,
+             l1320, d->fx_cycles);
+    finish(d, l880 > 0.1 && r1320 > 0.05 && l1320 < 0.02, what);
+  }
+}
+
+static const struct pw_filter_events effect_events = {
+    PW_VERSION_FILTER_EVENTS,
+    .process = effect_process,
+};
+
+static int run_filter(struct data* d) {
+  d->fx_capture = calloc(2 * CAPTURE, sizeof(float));
+  if (!d->fx_capture) return -1;
+  d->effect = pw_filter_new_simple(pw_main_loop_get_loop(d->loop), "tcos-effect",
+                                   pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Filter", PW_KEY_MEDIA_ROLE, "DSP",
+                                                     PW_KEY_MEDIA_CLASS, "Audio/Filter", NULL),
+                                   &effect_events, d);
+  const char* names[2] = {"FL", "FR"};
+  for (int k = 0; k < 2; ++k) {
+    char in_name[16], out_name[16];
+    snprintf(in_name, sizeof in_name, "input_%s", names[k]);
+    snprintf(out_name, sizeof out_name, "output_%s", names[k]);
+    d->fx_in[k] = pw_filter_add_port(d->effect, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+                                     pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono audio", PW_KEY_PORT_NAME, in_name, PW_KEY_AUDIO_CHANNEL, names[k], NULL),
+                                     NULL, 0);
+    d->fx_out[k] = pw_filter_add_port(d->effect, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+                                      pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono audio", PW_KEY_PORT_NAME, out_name, PW_KEY_AUDIO_CHANNEL, names[k], NULL),
+                                      NULL, 0);
+    if (!d->fx_in[k] || !d->fx_out[k]) return -1;
+  }
+  return pw_filter_connect(d->effect, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0 ? -1 : 0;
+}
+
 static int run_adapter(struct data* d) {
   d->capture = calloc(CAPTURE * 2, sizeof(float));
   struct pw_properties* props = pw_properties_new("factory.name", "support.null-audio-sink", PW_KEY_NODE_NAME, "tcos-null", PW_KEY_MEDIA_CLASS, "Audio/Sink",
@@ -703,6 +771,7 @@ int main(int argc, char** argv) {
   if (strncmp(d.mode, "video", 5) == 0) r = run_video(&d);
   else if (strcmp(d.mode, "midi") == 0) r = run_midi(&d);
   else if (strcmp(d.mode, "adapter") == 0) r = run_adapter(&d);
+  else if (strcmp(d.mode, "filter") == 0) r = run_filter(&d);
   if (r < 0) {
     printf("pwmedia: %s FAILED (could not set up)\n", d.mode);
     return 1;

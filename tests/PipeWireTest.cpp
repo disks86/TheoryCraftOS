@@ -3659,6 +3659,100 @@ static void test_client_node_media() {
     c.take_with_fds();
   }
 
+  // ---- an effect: a pw_filter with two float inputs and two float outputs is one node that records from the microphone and plays to the speakers;
+  // and one with six outputs (5.1) is folded into the speakers' two
+  {
+    NodeView fx;
+    fx.id = 9;
+    create_node(c, 9, {{"media.class", "Audio/Filter"}, {"media.type", "Audio"}, {"node.name", "tcos-effect"}});
+    for (int dir = 0; dir < 2; ++dir)
+      for (int port = 0; port < 2; ++port)
+        c.send(9, 3, [&](pod::Builder& b) { b.int32(dir); b.int32(port); b.int32(3); b.int32(1); enum_dsp_audio(b); port_info(b, 0, {{"format.dsp", "32 bit float mono audio"}}); });
+    node_update(c, 9);
+    set_active(c, 9, true);
+    for (int dir = 0; dir < 2; ++dir)
+      for (int port = 0; port < 2; ++port)
+        c.send(9, 3, [&](pod::Builder& b) { b.int32(dir); b.int32(port); b.int32(1); b.int32(1); buffers_param(b, 2, 32768, 4, 0); b.none(); });
+    fx.absorb(c);
+    CHECK(fx.starts == 1 && fx.ports[{0, 1}].bufs.size() == 2 && fx.ports[{1, 1}].bufs.size() == 2);
+    uint32_t in_ports = 0, out_ports = 0;
+    std::string fx_class;
+    g.visit(fx.node, [&](const GraphObject& o) { in_ports = o.input_ports; out_ports = o.output_ports; fx_class = std::string(o.props.get("media.class").data(), o.props.get("media.class").size()); });
+    CHECK(in_ports == 2 && out_ports == 2 && fx_class == "Audio/Filter" && g.playback_of(fx.node) && g.record_of(fx.node));
+    if (fx.starts == 1 && fx.ports[{0, 1}].bufs.size() == 2) {
+      mic.add(4800, 8000, -4000);
+      hub.pump();
+      put_u32(fx.activation->memory(), 0, 3);
+      tick();
+      CHECK(fx.wake->take_signals() == 1);
+      // its inputs: the microphone's left and right, a port each
+      for (int port = 0; port < 2; ++port) {
+        CHECK(u32_at(fx.io(0, port), 0) == 2);
+        const uint32_t id = u32_at(fx.io(0, port), 4);
+        if (id >= 2) continue;
+        ByteView buf = fx.buffer(0, port, id);
+        const uint32_t off = uint32_t(fx.ports[{0, port}].bufs[id].data);
+        CHECK(u32_at(buf, 4) == 4096);
+        float v = 0; memcpy(&v, buf.data() + off + 4 * 500, 4);
+        CHECK(std::abs(v - (port == 0 ? 8000.f : -4000.f) / 32768.f) < 0.01f);
+      }
+      // its outputs: the effect's (half of the input) to the speakers
+      for (int port = 0; port < 2; ++port) {
+        ByteView buf = fx.buffer(1, port, 0);
+        const uint32_t off = uint32_t(fx.ports[{1, port}].bufs[0].data);
+        const float v = port == 0 ? 0.125f : -0.0625f;
+        for (uint32_t i = 0; i < 1024; ++i) memcpy(buf.data() + off + 4 * i, &v, 4);
+        put_u32(buf, 0, 0); put_u32(buf, 4, 4096);
+        put_u32(fx.io(1, port), 0, 2); put_u32(fx.io(1, port), 4, 0);
+      }
+      put_u32(fx.activation->memory(), 0, 3);
+      dev.take();
+      tick();
+      mixer.pump();
+      std::vector<int16_t> out = dev.take();
+      CHECK(out.size() > 400 && abs(out[200] - 4096) < 40 && abs(out[201] + 2048) < 40);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+    c.take_with_fds();
+    g.refresh();
+    CHECK(!g.playback_of(fx.node) && !g.record_of(fx.node));
+
+    NodeView sx;
+    sx.id = 10;
+    create_node(c, 10, {{"media.class", "Stream/Output/Audio"}, {"media.type", "Audio"}});
+    for (int port = 0; port < 6; ++port)
+      c.send(10, 3, [&](pod::Builder& b) { b.int32(1); b.int32(port); b.int32(3); b.int32(1); enum_dsp_audio(b); port_info(b, 0, {{"format.dsp", "32 bit float mono audio"}}); });
+    node_update(c, 10);
+    set_active(c, 10, true);
+    for (int port = 0; port < 6; ++port)
+      c.send(10, 3, [&](pod::Builder& b) { b.int32(1); b.int32(port); b.int32(1); b.int32(1); buffers_param(b, 2, 32768, 4, 0); b.none(); });
+    sx.absorb(c);
+    CHECK(sx.starts == 1 && sx.ports[{1, 5}].bufs.size() == 2);
+    SharedPointer<PlaybackStream> six = g.playback_of(sx.node);
+    CHECK(six && six->format().channels == 6);
+    if (sx.starts == 1 && sx.ports[{1, 5}].bufs.size() == 2) {
+      put_u32(sx.activation->memory(), 0, 3);
+      tick();
+      // FL only: the left speaker alone
+      for (int port = 0; port < 6; ++port) {
+        ByteView buf = sx.buffer(1, port, 0);
+        const uint32_t off = uint32_t(sx.ports[{1, port}].bufs[0].data);
+        const float v = port == 0 ? 0.5f : 0.f;
+        for (uint32_t i = 0; i < 1024; ++i) memcpy(buf.data() + off + 4 * i, &v, 4);
+        put_u32(buf, 0, 0); put_u32(buf, 4, 4096);
+        put_u32(sx.io(1, port), 0, 2); put_u32(sx.io(1, port), 4, 0);
+      }
+      put_u32(sx.activation->memory(), 0, 3);
+      dev.take();
+      tick();
+      mixer.pump();
+      std::vector<int16_t> out = dev.take();
+      CHECK(out.size() > 400 && out[200] > 4000 && abs(out[201]) < 40);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(10); });
+    c.take_with_fds();
+  }
+
   // ---- the adapter: a virtual sink (support.null-audio-sink); a stream plays into it, another records what plays there
   {
     auto adapter = [&](NativeClient& cl, uint32_t id, const Props& props) {

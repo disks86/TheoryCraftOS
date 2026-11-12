@@ -159,6 +159,7 @@ class NativeServer final : public IProtocolServer {
     PcmFormat format{SampleFormat::F32Le, 48000, 2};
     uint32_t quantum = 1024;
     uint32_t frame() const { return 4u * format.channels; }
+    uint32_t out_channels = 0, in_channels = 0;      // (a raw node: a pw_filter) its float output and input ports: the channels it plays and records
     SharedPointer<PlaybackStream> playback;
     SharedPointer<RecordStream> record;
     SharedPointer<MidiQueue> midi_in;
@@ -167,7 +168,7 @@ class NativeServer final : public IProtocolServer {
     uint64_t virtual_cursor = 0;   // where in that sink's frames it plays or records next
     Properties props;
     List<UniquePointer<ClientPort>> ports;
-    ByteBuffer scratch;            // two float ports' frames interleaved (a pw_filter's left and right)
+    ByteBuffer scratch;            // a filter's float ports' frames, one port after another (played) or interleaved (recorded)
   };
   // A sink or source the adapter factory made (support.null-audio-sink, NativeClientNode.cpp): what the streams that play into it mix to, on the server's
   // clock, for the streams that record from it.

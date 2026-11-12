@@ -141,7 +141,7 @@ PY"
 # lingering virtual sink) and pw-play / pw-record aimed at it
 if pkg-config --exists libpipewire-0.3 && command -v pw-midiplay >/dev/null; then
   gcc -O1 -g -Wall -Wextra -o "$work/pwmedia" tests/linux/pwmedia.c $(pkg-config --cflags --libs libpipewire-0.3) -lm
-  for mode in video video-alloc video-yuv midi adapter; do
+  for mode in video video-alloc video-yuv midi filter adapter; do
     check "pwmedia $mode" "timeout 30 '$work/pwmedia' $mode 2> '$work/pwmedia-$mode.log' | tee -a '$work/pwmedia.out' | grep -q 'pwmedia: $mode ok'"
   done
   python3 - "$work/song.mid" <<'PY'
