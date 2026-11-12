@@ -536,7 +536,11 @@ static void test_toplevel() {
   app.send(Msg(w.toplevel, 8).i(450).i(350));
   server.move_window(win, {100, 120, 208, 132});
   CHECK(app.configured(w) && w.cw == 450 && w.ch == 350);
-  // activation: keyboard focus and the activated state
+  // activation: keyboard focus and the activated state. A new window is active from the moment it is shown (it gets the keys); the desktop taking the
+  // activation away and giving it back is seen by the client.
+  CHECK(server.window_info(win, &info, &title) && info.active);
+  server.activate_window(0);
+  CHECK(server.window_info(win, &info, &title) && !info.active);
   app.drop_events();
   server.activate_window(win);
   Ev c = app.take(w.toplevel, 0);
@@ -2935,6 +2939,9 @@ static void test_extras() {
     App app(server);
     App::Window w = app.toplevel(true, "Editor");
     const uint32_t win = shown_window(server, app, w, 0xFF505050u);
+    Ev mapped_ping = app.take(app.wm, 0);      // (being shown activated it, which pings: answered)
+    CHECK(mapped_ping.object == app.wm);
+    app.send(Msg(app.wm, 3).u(mapped_ping.u(0)));
     g_fake_ms = 200000;
     app.drop_events();
     server.window_command(win, desktop::IWindowsSession::Command::Close);

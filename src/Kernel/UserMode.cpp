@@ -287,6 +287,8 @@ Frame* on_syscall(Frame* frame, void*) {
   if (process::decode_x86_64(process->abi(), regs, &request)) frame->rax = process->syscall(request);
   else frame->rax = ~uint64_t{37};      // -ENOSYS
   self->syscall_frame = nullptr;
+  process::Process::LinuxThreadState::CloneRequest clone;
+  if (process->take_clone(&clone) && !task->start_linux_thread(*frame, clone)) frame->rax = uint64_t(-int64_t{11});      // clone()/clone3(): -EAGAIN if no thread
   uint64_t fs = 0, gs = 0;
   const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
@@ -960,6 +962,31 @@ bool Task::start_thread(const process::ThreadStart& start, bool suspended) {
   if (!t) return false;
   if (!sync_tables()) return false;      // the new thread's stack and TEB are in the tables before it runs
   return suspended || launch(t, kUserThreadKernelStack);
+}
+
+bool Task::start_linux_thread(const Frame& frame, const process::Process::LinuxThreadState::CloneRequest& clone) {
+  // The new thread is a copy of the calling one right after the call: every register (glibc's clone3 keeps the function and its argument in registers),
+  // 0 as the call's result, the stack it was given, and its own thread pointer when CLONE_SETTLS asked for one.
+  Thread* me = current_thread();
+  process::ThreadStart start;
+  start.id = clone.tid;
+  start.entry = frame.rip;
+  start.stack_pointer = clone.stack ? clone.stack : frame.rsp;
+  start.fs_base = clone.set_tls ? clone.tls : (me ? me->user_fs : 0);
+  start.gs_base = me ? me->user_gs : 0;
+  UserThread* t = add_thread(start);
+  bool started = false;
+  if (t) {
+    frame_to_context(frame, &t->saved);
+    t->saved.gpr[process::X86Context::kRax] = 0;
+    t->saved.gpr[process::X86Context::kRsp] = start.stack_pointer;
+    t->start_context_set = true;
+    started = sync_tables() && launch(t, kUserThreadKernelStack);
+  }
+  if (!started)      // no thread after all: the table entry the call made goes back
+    for (process::Process::LinuxThreadState::Thread& lt : program.process()->linux_threads().threads)
+      if (lt.used && lt.tid == clone.tid) { lt.used = false; lt.clear_child_tid = 0; }
+  return started;
 }
 
 bool Task::resume_thread(uint64_t id) {

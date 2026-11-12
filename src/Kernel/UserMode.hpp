@@ -118,6 +118,10 @@ struct Task final : process::IProcessRuntime {
   void notify() override { changed.notify_all(); }
   bool interrupted() override;
   bool start_thread(const process::ThreadStart& start, bool suspended) override;
+  bool supports_linux_threads() override { return true; }
+  // A Linux thread that clone()/clone3() asked for (Process::take_clone after the call), started as a copy of the calling thread's registers in `frame`. False
+  // if it could not be (the call then fails with EAGAIN).
+  bool start_linux_thread(const Frame& frame, const process::Process::LinuxThreadState::CloneRequest& clone);
   bool resume_thread(uint64_t id) override;
   uint64_t current_thread_id() override;
   void request_suspend(uint64_t id) override;

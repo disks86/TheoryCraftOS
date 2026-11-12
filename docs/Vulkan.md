@@ -33,7 +33,8 @@ in place of its own (same size and format, else `VK_ERROR_INVALID_EXTERNAL_HANDL
 sample, 8 bits a channel; `vkGetPhysicalDeviceExternal*Properties` and `VK_KHR_get_physical_device_properties2` are not there. This is how a Wayland client on this system
 renders on the GPU and hands its frames to the compositor (`zwp_linux_dmabuf_v1`, [Wayland.md](Wayland.md)).
 
-Linux programs link `libvulkan.a` statically (the system has no dynamic loader yet) and call the `vk*` functions directly or through `vkGetInstanceProcAddr`.
+Linux programs link `libvulkan.a` statically and call the `vk*` functions directly or through `vkGetInstanceProcAddr`. (The system now runs
+dynamically linked programs, `docs/LinuxDynamicPrograms.md`, but the driver is not built as a `libvulkan.so.1` yet.)
 
 Tests: `tests/VulkanShaderTest.cpp` (the translator, host, ASan + UBSan: `tests/run_host_tests.sh VulkanShaderTest`); `tests/windows/vulkantest.c` (the real DLL on every adapter of
 the machine, in QEMU); `tests/linux_vulkan.sh` (`tests/linux/vulkantest.c` over `libvulkan.a` as an x86-64, AArch64 and RISC-V Linux program on the kernel's CPU emulator, with

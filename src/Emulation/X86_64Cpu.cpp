@@ -1196,13 +1196,15 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
       const uint32_t leaf = static_cast<uint32_t>(s_.r[0]);
       uint32_t a = 0, b = 0, c = 0, dx = 0;
       if (leaf == 0) {
+        // "AuthenticAMD" (ebx, edx, ecx): C libraries read the feature leaves only for the vendors they know (glibc's ld.so skips leaf 1 for an unknown one and
+        // then refuses every library as "CPU ISA level is lower than required"), and the AMD-only extensions here (XOP, FMA4, TBM, LWP) fit that vendor.
         a = 0x24;
-        b = 0x534F4354u;      // "TCOS"
-        dx = 0x34365F58u;     // "X_64"
-        c = 0x554D455Fu;      // "_EMU"... in the ebx, edx, ecx order of the vendor string
+        b = 0x68747541u;      // "Auth"
+        dx = 0x69746E65u;     // "enti"
+        c = 0x444D4163u;      // "cAMD"
       } else if (leaf == 1) {
         a = 0x00000F00u;
-        dx = (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
+        dx = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 15) | (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26);      // FPU (x87), TSC, CX8, CMOV, MMX, FXSR, SSE, SSE2
         c = (1u << 0) | (1u << 9) | (1u << 12) | (1u << 19) | (1u << 20) | (1u << 22) | (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 1) | (1u << 25) | (1u << 13) | (1u << 30);      // SSE3, SSSE3, FMA, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C, RDRAND, PCLMULQDQ, AES
       } else if (leaf == 7 && static_cast<uint32_t>(s_.r[1]) == 1) {
         a = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 21) | (1u << 23);      // SHA512, SM3, SM4, RAO-INT, AVX-VNNI, AVX512_BF16, CMPCCXADD, AMX-FP16, AVX-IFMA
@@ -1239,6 +1241,14 @@ X86_64Cpu::Step X86_64Cpu::step_0f_op(GuestMemory& m, uint8_t op) {
         b = 17u | (32u << 8) | (6u << 16) | (88u << 24);
         c = 12u | (1u << 5) | (4u << 6) | (1u << 9) | (1u << 16) | (1u << 29) | (1u << 30) | (1u << 31);      // (12-bit latency rounded to 16 cycles, data addresses, version 1, 32 records at least, IP filtering, cache level and latency filtering)
         dx = 1u | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 29) | (1u << 30) | (1u << 31);
+      } else if (leaf == 0x80000005u) {      // L1 caches: 32 KiB data and 32 KiB instruction, 8 ways, 64-byte lines (what C libraries size copies by)
+        c = (32u << 24) | (8u << 16) | (1u << 8) | 64u;
+        dx = (32u << 24) | (8u << 16) | (1u << 8) | 64u;
+      } else if (leaf == 0x80000006u) {      // L2 512 KiB (8 ways), L3 16 MiB (in 512 KiB units), 64-byte lines
+        c = (512u << 16) | (6u << 12) | (1u << 8) | 64u;
+        dx = (32u << 18) | (6u << 12) | (1u << 8) | 64u;
+      } else if (leaf == 0x80000008u) {      // 48-bit physical and virtual addresses
+        a = 48u | (48u << 8);
       } else if (leaf == 0x80000001u) {
         c = (1u << 0) | (1u << 5) | (1u << 11) | (1u << 15) | (1u << 16) | (1u << 21);      // LAHF/SAHF, LZCNT, XOP, LWP, FMA4, TBM
         dx = (1u << 11) | (1u << 20) | (1u << 27) | (1u << 29);      // SYSCALL, NX, RDTSCP, long mode

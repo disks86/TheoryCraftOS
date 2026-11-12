@@ -31,11 +31,11 @@ namespace process {
 
 namespace {
 
-constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEexist = 17, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
-enum class Call : uint8_t { None, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
+enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
@@ -70,7 +70,7 @@ constexpr NumberEntry kNumbers[] = {
     {90, kAbsent, Call::Succeed},  {91, 52, Call::Succeed},     {268, 53, Call::Succeed},     {92, kAbsent, Call::Succeed},
     {93, 55, Call::Succeed},       {94, kAbsent, Call::Succeed}, {260, 54, Call::Succeed},    {280, 88, Call::Succeed},
     {162, 81, Call::Succeed},
-    {56, 220, Call::Clone},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
+    {56, 220, Call::Clone},        {435, 435, Call::Clone3},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
     {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
     // sockets (AF_UNIX: LinuxSockets.cpp)
     {22, kAbsent, Call::Pipe},     {293, 59, Call::Pipe2},
@@ -105,7 +105,8 @@ StringView machine_name(UserArch arch) {
 
 
 constexpr uint64_t kMapShared = 0x1, kMapPrivate = 0x2, kMapFixed = 0x10, kMapAnonymous = 0x20;
-constexpr uint64_t kMapOtherAccepted = 0x100 | 0x800 | 0x4000 | 0x8000 | 0x10000 | 0x40000;      // GROWSDOWN, DENYWRITE, NORESERVE, POPULATE, NONBLOCK, STACK/HUGETLB: hints we may ignore
+constexpr uint64_t kMapOtherAccepted = 0x100 | 0x800 | 0x4000 | 0x8000 | 0x10000 | 0x20000 | 0x40000;      // GROWSDOWN, DENYWRITE, NORESERVE, POPULATE, NONBLOCK, STACK, HUGETLB: hints we may ignore
+constexpr uint64_t kMapFixedNoreplace = 0x100000;      // MAP_FIXED_NOREPLACE: at exactly that address, EEXIST if anything is mapped there
 
 bool valid_protection(uint64_t prot) { return (prot & ~uint64_t{kProtRead | kProtWrite | kProtExecute}) == 0; }
 
@@ -129,11 +130,45 @@ uint64_t do_brk(Process& process, uint64_t request) {
 
 // mmap() of a file in memory (memfd_create): its block is mapped as it is (MAP_SHARED), or as a copy-on-write view (MAP_PRIVATE). The pages past the
 // block's end cannot be mapped (ENXIO; Linux would map them and fault on use). A GPU image (a dmabuf of /dev/dxg) maps the CPU's copy of it the same way.
+// A regular file (a library ld.so maps, a data file): the pages are a copy of the file made now, private to the mapping. Bytes past the end of the file
+// are zero. A shared mapping that is only read is the same copy (what another process writes to the file later is not seen); a shared mapping for
+// writing is not supported (ENODEV), as before.
+uint64_t map_file_copy(Process& process, AddressSpace& space, OpenObject& object, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset) {
+  if (!object.file) return error(kEnodev);      // (a directory, a link opened itself)
+  if (!object.readable || object.no_data_access) return error(kEacces);
+  if ((flags & kMapShared) && (prot & kProtWrite)) return error(kEnodev);
+  uint64_t where = 0;
+  if (flags & kMapFixed) {
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    if (!space.unmap(address, size)) return error(kEnomem);
+    where = address;
+  } else if (!space.find_free(size, address ? address : process.mmap_cursor(), &where)) {
+    return error(kEnomem);
+  }
+  if (!space.map(where, size, uint8_t(prot))) return error(kEnomem);
+  const uint64_t file_size = object.file->size();
+  const uint64_t available = offset < file_size ? file_size - offset : 0;
+  const uint64_t copy = available < size ? available : size;
+  uint8_t chunk[16384];
+  for (uint64_t done = 0; done < copy;) {
+    const uint64_t want = copy - done < sizeof(chunk) ? copy - done : sizeof(chunk);
+    uint64_t got = 0;
+    if (object.file->read(offset + done, ByteView(chunk, want), &got) != filesystem::Status::Ok || got == 0 ||
+        !space.write_privileged(where + done, ConstByteView(chunk, got))) {
+      space.unmap(where, size);
+      return error(kEnomem);
+    }
+    done += got;
+  }
+  if (!(flags & kMapFixed) && !address) process.set_mmap_cursor(where + size);
+  return where;
+}
+
 uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   OpenObject* object = process.files().object(fd);
   if (!object) return error(kEbadf);
-  if (!object->memory && !object->gpu_buffer) return error(kEnodev);      // (other files cannot be mapped yet)
   if (offset % AddressSpace::kPageSize != 0) return error(kEinval);
+  if (!object->memory && !object->gpu_buffer) return map_file_copy(process, space, *object, address, size, prot, flags, offset);
   const bool shared_write = (flags & kMapShared) && (prot & kProtWrite);
   BlockRef block;
   if (object->gpu_buffer) {      // a GPU image: the CPU's copy of it (DxgBufferFile.hpp); a dmabuf is mapped for writing whatever its descriptor allows, as on Linux
@@ -170,8 +205,14 @@ uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t p
   if (!space) return error(kEnomem);
   uint64_t size = 0;
   if (length == 0 || !AddressSpace::round_up(length, &size) || !valid_protection(prot)) return error(kEinval);
-  if (flags & ~(kMapShared | kMapPrivate | kMapFixed | kMapAnonymous | kMapOtherAccepted)) return error(kEinval);
+  if (flags & ~(kMapShared | kMapPrivate | kMapFixed | kMapAnonymous | kMapFixedNoreplace | kMapOtherAccepted)) return error(kEinval);
   if (((flags & kMapShared) != 0) == ((flags & kMapPrivate) != 0)) return error(kEinval);      // exactly one of the two
+  if (flags & kMapFixedNoreplace) {
+    uint64_t free_at = 0;
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    if (!space->find_free(size, address, &free_at) || free_at != address) return error(kEexist);
+    flags = (flags & ~kMapFixedNoreplace) | kMapFixed;
+  }
   if (!(flags & kMapAnonymous)) return map_memory_file(process, *space, address, size, prot, flags, fd, offset);
   uint64_t where = 0;
   if (flags & kMapFixed) {
@@ -275,6 +316,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Exit: return linuxabi::sys_thread_exit(process, uint32_t(a[0] & 0xFF));      // (a thread; the last one takes the process with it)
       case Call::ExitGroup: process.terminate(uint32_t(a[0] & 0xFF)); return 0;
       case Call::Clone: return linuxabi::sys_clone(process, arch_, a);
+      case Call::Clone3: return linuxabi::sys_clone3(process, arch_, a[0], a[1]);
       case Call::Futex: return linuxabi::sys_futex(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Tgkill: return 0;      // signals are not delivered; asking whether a thread exists, or sending one, succeeds
       case Call::SchedGetaffinity: return linuxabi::sys_sched_getaffinity(process, a[1], a[2]);
