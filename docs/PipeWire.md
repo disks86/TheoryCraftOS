@@ -11,7 +11,7 @@ program that records, of any kind, gets a record stream of it.
 | Native programs (media player, web audio, MIDI synth, ...) | `AudioMixer::open_stream` as before. `Graph::refresh` finds the streams and shows each as a node of the "TheoryCraftOS" client (`AudioStream::set_label` names it). |
 | Linux programs using libpulse (most desktop programs: browsers, SDL, games, `paplay`, `pactl`) | PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`, served by `PulseServer`, as pipewire-pulse does. |
 | Linux programs using libpipewire (`pw-dump`, `pw-cli`, `wpctl`, session tools) | PipeWire's native protocol (version 3) at `$XDG_RUNTIME_DIR/pipewire-0`, served by `NativeServer`. |
-| Windows programs | `winmm.dll` (`waveOut*`, `PlaySound`, `sndPlaySound`: `src/Windows/winmm/waveout.inc`; `waveIn*`: `wavein.inc`), `dsound.dll` (DirectSound 8: `src/Windows/dsound/dsound.c`; capture and full duplex: `capture.inc`) and WASAPI (`mmdevapi.dll`: `IMMDeviceEnumerator`, `IAudioClient3`, `IAudioCaptureClient` and the rest, `src/Windows/mmdevapi/mmdevapi.c`), all over the `NtTcosAudio` service (510, `src/Windows/tcos_audio.h`), served by `WindowsAudioService`. |
+| Windows programs | `winmm.dll` (`waveOut*`, `PlaySound`, `sndPlaySound`: `src/Windows/winmm/waveout.inc`; `waveIn*`: `wavein.inc`), `dsound.dll` (DirectSound 8: `src/Windows/dsound/dsound.c`; capture and full duplex: `capture.inc`) WASAPI (`mmdevapi.dll`: `IMMDeviceEnumerator`, `IAudioClient3`, `IAudioCaptureClient` and the rest, `src/Windows/mmdevapi/mmdevapi.c`) and XAudio2 2.9 and 2.8 (`xaudio2_9.dll`, `xaudio2_8.dll`: `src/Windows/xaudio2_9`), all over the `NtTcosAudio` service (510, `src/Windows/tcos_audio.h`), served by `WindowsAudioService`. |
 
 `XDG_RUNTIME_DIR` is `/run/user/0` in the Linux programs' default environment (`/Linux/run/user/0` on the system's disk; see
 [FileSystemLayout.md](FileSystemLayout.md)). Both sockets are also bound as abstract names, so Windows programs can reach them through ws2_32's
@@ -116,6 +116,17 @@ comes out once stopped), the padding is everything waiting to be read, and audio
 `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`. The capture endpoint's `IAudioEndpointVolume` is the microphone's master gain (`NtTcosAudio` stream
 0xFFFFFFFF); the session's volume applies to the process's render streams only.
 
+**XAudio2** (`xaudio2_9.dll`, and `xaudio2_8.dll` from the same source): each `IXAudio2` is one 32-bit float stream of the graph in its mastering
+voice's format, and an engine thread runs the voice graph a 10 ms quantum at a time, 20 to 100 ms ahead of the kernel. Source voices read their
+queued buffers (PCM 8/16/24/32-bit, float, MS-ADPCM decoded on submit; play and loop regions, loop counts, `ExitLoop`, `END_OF_STREAM`) a run at a time
+and resample with linear interpolation at the frequency ratio, then the voice's filter (state-variable low/band/high pass and notch, one-pole low and
+high pass), its effect chain (any XAPO: the program's own, or `CreateAudioVolumeMeter`, `CreateAudioReverb`, `CreateFX`'s EQ, mastering limiter,
+reverb and echo), volume, channel volumes and the sends' output matrices (with send filters) into submix voices (run by processing stage) and the
+mastering voice. Callbacks (engine and voice: passes, buffer start and end, loop end, stream end) run on the engine thread, which may re-enter the
+API; operation sets defer changes until `CommitChanges`. `GetPerformanceData` reports the engine's time in passes, the voices and the latency.
+X3DAudio (`X3DAudioInitialize`, `X3DAudioCalculate`: the matrix from distance curves, cones and constant-power panning over the speaker layout,
+Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in Windows.
+
 ## Tests
 
 - `tests/run_host_tests.sh PipeWireTest`: codecs (round trips, every truncation, bit flips), conversion both ways (every format through
@@ -133,7 +144,10 @@ comes out once stopped), the padding is everything waiting to be read, and audio
   loads `dsound.dll` and `mmdevapi.dll` while the program runs). The third run records from the emulator's microphone (880 Hz left at 8000, 1320 Hz
   right at 4000): `tests/windows/recordtest.c` through `waveIn` (22.05 kHz stereo), DirectSound capture (16 kHz float mono) and WASAPI capture (48 kHz
   stereo), each checking both tones' levels, while `pulsetest` records the same microphone with a PulseAudio record stream. The work folder is one
-  per checkout (`/tmp/tcos-pwemu-<checksum of the path>`), so another worktree's objects and DLLs are never taken for this one's.
+  per checkout (`/tmp/tcos-pwemu-<checksum of the path>`), so another worktree's objects and DLLs are never taken for this one's. The fourth run is
+  `tests/windows/xaudio2test.c`: a source voice into the mastering voice and one through a submix (400 and 600 Hz in the mix with the others),
+  callbacks, loops, operation sets, matrices, the frequency ratio, MS-ADPCM through a volume meter, the FX objects and X3DAudio. (Its mastering
+  voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
 
 ## Not done
 
@@ -144,7 +158,8 @@ comes out once stopped), the padding is everything waiting to be read, and audio
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).
-- **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused);
+- **More of Windows audio.** XAudio2 has no xWMA or XMA sources, no PLAY_TAILS, and no 2.7 COM classes (`xaudio2_7.dll`, `CLSID_XAudio2`);
+  its reverb has no early reflections or room filters. WASAPI has no exclusive mode (refused);
   the master volume has no balance.
   DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`, no capture effects such as AEC or noise suppression) and no property sets
   (`IKsPropertySet`, EAX). WASAPI capture packets are always 10 ms

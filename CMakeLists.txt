@@ -1223,7 +1223,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32
-      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops)
+      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1246,6 +1246,8 @@ if(TCOS_ARCH STREQUAL "x86_64")
   set(WINDOWS_IMPORTS_crypt32 advapi32 bcrypt)      # (DPAPI: the per-user key in the registry, AES and HMAC of bcrypt)
   set(WINDOWS_IMPORTS_secur32 advapi32)      # (GetUserNameExW: the user name of the token)
   set(WINDOWS_IMPORTS_mmdevapi ole32)      # (CoTaskMemAlloc for the strings, formats and property values it hands out)
+  set(WINDOWS_IMPORTS_xaudio2_9 ole32)      # (CoTaskMemAlloc for the XAPOs' registration properties and formats)
+  set(WINDOWS_IMPORTS_xaudio2_8 ole32)
   set(WINDOWS_STUB_RESULT_vulkan-1 0xFFFFFFF8u)   # (VK_ERROR_FEATURE_NOT_PRESENT for the exports that are not implemented)
   foreach(_library ${WINDOWS_STUB_LIBRARIES})
     if(DEFINED WINDOWS_STUB_RESULT_${_library})
@@ -1259,6 +1261,11 @@ if(TCOS_ARCH STREQUAL "x86_64")
     set(_own_depends "")
     if(EXISTS ${_own})
       file(GLOB _own_incs ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/*.h)
+      if(_library STREQUAL "xaudio2_8")
+        # (built from xaudio2_9's source)
+        file(GLOB _xa_incs ${CMAKE_SOURCE_DIR}/src/Windows/xaudio2_9/*.c ${CMAKE_SOURCE_DIR}/src/Windows/xaudio2_9/*.inc)
+        list(APPEND _own_incs ${_xa_incs})
+      endif()
       if(_library STREQUAL "vulkan-1")
         # (the driver is shared with the Linux libvulkan: src/Vulkan, and the /dev/dxg header for its service numbers)
         file(GLOB _shared_incs ${CMAKE_SOURCE_DIR}/src/Vulkan/*.inc ${CMAKE_SOURCE_DIR}/src/Vulkan/*.h)

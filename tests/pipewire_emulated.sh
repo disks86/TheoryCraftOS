@@ -5,8 +5,9 @@
 # PulseAudio protocol over socket(2), 500 Hz; no C library) run at the same time. Both must pass their checks, and the mixed output must hold all three
 # tones at once. A second run does the same with tests/windows/dsoundtest.c (dsound.dll at 600 Hz and WASAPI at 700 Hz, both from one program): all of
 # 300, 500, 600 and 700 Hz must be in the mix at once. A third run records: the emulator's microphone (880 Hz left, 1320 Hz right) is heard by
-# tests/windows/recordtest.c (waveIn, DirectSound capture, WASAPI capture) and by pulsetest's record stream at the same time.
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record]   (the Linux program's CPU, default x86_64; which runs, default all).
+# tests/windows/recordtest.c (waveIn, DirectSound capture, WASAPI capture) and by pulsetest's record stream at the same time. A fourth run plays
+# tests/windows/xaudio2test.c (XAudio2 2.9: 400 Hz from a source voice, 600 Hz through a submix): 300, 400, 500 and 600 Hz must be in the mix at once.
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,6 +41,7 @@ cp "$work"/build/windows/*.dll "$work/sys32/"
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/winmmtest.exe" tests/windows/winmmtest.c -lwinmm
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/dsoundtest.exe" tests/windows/dsoundtest.c -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/recordtest.exe" tests/windows/recordtest.c -lwinmm -ldsound -lole32 -luuid
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/xaudio2test.exe" tests/windows/xaudio2test.c -L"$work/build/windows" -l:xaudio2_9.dll -lole32 -luuid
 # the Linux program
 lld=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/gcc-ld/ld.lld 2>/dev/null | head -1 || true)
 case $arch in
@@ -92,6 +94,23 @@ if [ "$which" = all ] || [ "$which" = record ]; then
   grep -q "recordtest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL recordtest"; fail=1; }
   grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL pulsetest (with recordtest)"; fail=1; }
   grep -q "faulted=0" "$work/run-record.out" && grep -q "second program: exit=0" "$work/run-record.out" || { echo "FAIL a program faulted or failed (record run)"; fail=1; }
+fi
+if [ "$which" = all ] || [ "$which" = xaudio2 ]; then
+  TCOS_EMU_TONES=300,400,500,600 "$work/emurun" "$work/xaudio2test.exe" "$work/sys32" "$work/pulsetest-$arch" | tee "$work/run-xaudio2.out"
+  grep -q "xaudio2test: [0-9]* checks, 0 failed" "$work/run-xaudio2.out" || { echo "FAIL xaudio2test"; fail=1; }
+  grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run-xaudio2.out" || { echo "FAIL pulsetest (with xaudio2test)"; fail=1; }
+  grep -q "faulted=0" "$work/run-xaudio2.out" && grep -q "second program: exit=0" "$work/run-xaudio2.out" || { echo "FAIL a program faulted or failed (xaudio2 run)"; fail=1; }
+  # XAudio2's 400 Hz and 600 Hz (8000 and 0.25 into a mono mastering voice, at the centre: ~2828 and ~2896), with the native 300 Hz and the Linux 500 Hz
+  python3 - "$work/run-xaudio2.out" <<'PY' || fail=1
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"tones 300:(\d+) 400:(\d+) 500:(\d+) 600:(\d+) 700:(\d+); together (\d+)", text)
+assert m, "no audio summary"
+t300, t400, t500, t600, t700, together = map(int, m.groups())
+ok = 2200 < t300 < 2800 and 2400 < t400 < 3200 and 1800 < t500 < 2400 and 2400 < t600 < 3300 and together > 1500
+print("ok   the mix holds XAudio2's tones with the others" if ok else "FAIL the mix: %s" % m.group(0))
+sys.exit(0 if ok else 1)
+PY
 fi
 [ $fail -eq 0 ] && echo "pipewire emulated: all passed" || echo "pipewire emulated: FAILED"
 exit $fail
