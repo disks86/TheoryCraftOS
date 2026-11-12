@@ -31,6 +31,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <endpointvolume.h>
+#include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <stdio.h>
 #include <string.h>
@@ -441,11 +442,120 @@ static void wasapi_loopback(IMMDeviceEnumerator *en) {
   CoTaskMemFree(mix);
 }
 
+/* ---- notifications: an endpoint volume changed from outside mmdevapi (a direct NtTcosAudio call, as pactl's would be), session events ----------- */
+
+typedef struct {
+  IAudioEndpointVolumeCallback iface;
+  volatile LONG calls;
+  float last;
+} VolumeWatch;
+static HRESULT WINAPI vw_query(IAudioEndpointVolumeCallback *i, REFIID riid, void **out) {
+  if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IAudioEndpointVolumeCallback)) { *out = i; return S_OK; }
+  *out = NULL;
+  return E_NOINTERFACE;
+}
+static ULONG WINAPI vw_add_ref(IAudioEndpointVolumeCallback *i) { (void)i; return 2; }
+static ULONG WINAPI vw_release(IAudioEndpointVolumeCallback *i) { (void)i; return 1; }
+static HRESULT WINAPI vw_notify(IAudioEndpointVolumeCallback *i, PAUDIO_VOLUME_NOTIFICATION_DATA data) {
+  VolumeWatch *w = (VolumeWatch *)i;
+  w->last = data->fMasterVolume;
+  InterlockedIncrement(&w->calls);
+  return S_OK;
+}
+static IAudioEndpointVolumeCallbackVtbl kVolumeWatchVtbl = {vw_query, vw_add_ref, vw_release, vw_notify};
+
+typedef struct {
+  IAudioSessionEvents iface;
+  volatile LONG volume_calls, active, inactive;
+  float level;
+} SessionWatch;
+static HRESULT WINAPI sw_query(IAudioSessionEvents *i, REFIID riid, void **out) {
+  if (IsEqualGUID(riid, &IID_IUnknown) || IsEqualGUID(riid, &IID_IAudioSessionEvents)) { *out = i; return S_OK; }
+  *out = NULL;
+  return E_NOINTERFACE;
+}
+static ULONG WINAPI sw_add_ref(IAudioSessionEvents *i) { (void)i; return 2; }
+static ULONG WINAPI sw_release(IAudioSessionEvents *i) { (void)i; return 1; }
+static HRESULT WINAPI sw_display(IAudioSessionEvents *i, LPCWSTR n, LPCGUID c) { (void)i; (void)n; (void)c; return S_OK; }
+static HRESULT WINAPI sw_icon(IAudioSessionEvents *i, LPCWSTR n, LPCGUID c) { (void)i; (void)n; (void)c; return S_OK; }
+static HRESULT WINAPI sw_volume(IAudioSessionEvents *i, float level, WINBOOL mute, LPCGUID c) {
+  (void)mute; (void)c;
+  SessionWatch *w = (SessionWatch *)i;
+  w->level = level;
+  InterlockedIncrement(&w->volume_calls);
+  return S_OK;
+}
+static HRESULT WINAPI sw_channel(IAudioSessionEvents *i, DWORD n, float *v, DWORD ch, LPCGUID c) { (void)i; (void)n; (void)v; (void)ch; (void)c; return S_OK; }
+static HRESULT WINAPI sw_grouping(IAudioSessionEvents *i, LPCGUID g, LPCGUID c) { (void)i; (void)g; (void)c; return S_OK; }
+static HRESULT WINAPI sw_state(IAudioSessionEvents *i, AudioSessionState state) {
+  SessionWatch *w = (SessionWatch *)i;
+  if (state == AudioSessionStateActive) InterlockedIncrement(&w->active);
+  if (state == AudioSessionStateInactive) InterlockedIncrement(&w->inactive);
+  return S_OK;
+}
+static HRESULT WINAPI sw_disconnected(IAudioSessionEvents *i, AudioSessionDisconnectReason r) { (void)i; (void)r; return S_OK; }
+static IAudioSessionEventsVtbl kSessionWatchVtbl = {sw_query, sw_add_ref, sw_release, sw_display, sw_icon, sw_volume, sw_channel, sw_grouping, sw_state, sw_disconnected};
+
+typedef LONG (NTAPI *NtTcosAudioFn)(ULONG64 *);
+
+static void notifications(IMMDeviceEnumerator *en) {
+  IMMDevice *mic = NULL, *speakers = NULL;
+  CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eCapture, eConsole, &mic) == S_OK && mic);
+  CHECK(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &speakers) == S_OK && speakers);
+  if (!mic || !speakers) return;
+  IAudioEndpointVolume *mv = NULL;
+  CHECK(IMMDevice_Activate(mic, &IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void **)&mv) == S_OK && mv);
+  NtTcosAudioFn call = (NtTcosAudioFn)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtTcosAudio");
+  CHECK(call != NULL);
+  if (mv && call) {
+    VolumeWatch watch = {{&kVolumeWatchVtbl}, 0, 0};
+    CHECK(IAudioEndpointVolume_RegisterControlChangeNotify(mv, &watch.iface) == S_OK);
+    Sleep(300);      /* (the watcher has looked once) */
+    /* the microphone's gain to half, behind mmdevapi's back: the callback hears of it */
+    ULONG64 w[8] = {7 /* SET_VOLUME */, 0xFFFFFFFFull, 0x8000, 0x8000, 0, 0, 0, 0};
+    CHECK(call(w) == 0);
+    for (int k = 0; k < 40 && watch.calls == 0; ++k) Sleep(50);
+    CHECK(watch.calls >= 1 && watch.last > 0.75f && watch.last < 0.83f);      /* (the cube root of a half) */
+    const LONG before = watch.calls;
+    CHECK(IAudioEndpointVolume_SetMasterVolumeLevelScalar(mv, 1.0f, NULL) == S_OK);
+    Sleep(400);
+    CHECK(watch.calls == before + 1);      /* (its own change once, not again from the watcher) */
+    CHECK(IAudioEndpointVolume_UnregisterControlChangeNotify(mv, &watch.iface) == S_OK);
+    CHECK(IAudioEndpointVolume_UnregisterControlChangeNotify(mv, &watch.iface) == HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+  }
+  /* session events: the session's volume, and active/inactive as a stream starts and stops */
+  IAudioSessionManager2 *manager = NULL;
+  IAudioSessionControl *control = NULL;
+  ISimpleAudioVolume *simple = NULL;
+  CHECK(IMMDevice_Activate(speakers, &IID_IAudioSessionManager2, CLSCTX_ALL, NULL, (void **)&manager) == S_OK && manager);
+  if (!manager) return;
+  CHECK(IAudioSessionManager2_GetAudioSessionControl(manager, NULL, 0, &control) == S_OK && control);
+  CHECK(IAudioSessionManager2_GetSimpleAudioVolume(manager, NULL, 0, &simple) == S_OK && simple);
+  if (!control || !simple) return;
+  SessionWatch sw = {{&kSessionWatchVtbl}, 0, 0, 0, 0};
+  CHECK(IAudioSessionControl_RegisterAudioSessionNotification(control, &sw.iface) == S_OK);
+  CHECK(ISimpleAudioVolume_SetMasterVolume(simple, 0.5f, NULL) == S_OK && sw.volume_calls == 1 && sw.level == 0.5f);
+  CHECK(ISimpleAudioVolume_SetMasterVolume(simple, 1.0f, NULL) == S_OK && sw.volume_calls == 2);
+  IAudioClient *client = NULL;
+  WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
+  CHECK(IMMDevice_Activate(speakers, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&client) == S_OK && client);
+  if (client) {
+    CHECK(IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, &f, NULL) == S_OK);
+    CHECK(IAudioClient_Start(client) == S_OK && sw.active == 1);
+    CHECK(IAudioClient_Stop(client) == S_OK && sw.inactive == 1);
+    IAudioClient_Release(client);
+  }
+  CHECK(IAudioSessionControl_UnregisterAudioSessionNotification(control, &sw.iface) == S_OK);
+  CHECK(ISimpleAudioVolume_SetMasterVolume(simple, 0.9f, NULL) == S_OK && sw.volume_calls == 2);      /* (no longer told) */
+  ISimpleAudioVolume_SetMasterVolume(simple, 1.0f, NULL);
+}
+
 int main(void) {
   CHECK(SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED)));
   IMMDeviceEnumerator *en = NULL;
   CHECK(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void **)&en) == S_OK && en);
   if (en) endpoint_volume(en);
+  if (en) notifications(en);
   if (en) wasapi_loopback(en);      /* (early: the native stream plays for the emulator's first 6 s) */
   wave_in();
   directsound_capture();

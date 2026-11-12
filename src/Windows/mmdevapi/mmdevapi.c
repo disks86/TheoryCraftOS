@@ -35,8 +35,10 @@
  *    and balance), and the process's one audio session (ISimpleAudioVolume, IAudioSessionControl2, IAudioSessionManager2): the session's volume and
  *    mute apply to every stream of the process.
  *  - IAudioEndpointVolume is the graph's master volume on the render endpoint and the microphone's master gain on the capture endpoint (what pactl and
- *    wpctl show as the sink's and the source's: scalar = cube root of the amplitude, so 50% here is 50% there), with change notifications for changes
- *    made in this process; IAudioMeterInformation reads silence. The session's volume applies to the process's render streams.
+ *    wpctl show as the sink's and the source's: scalar = cube root of the amplitude, so 50% here is 50% there), with change notifications (for changes made
+ *    in this process at once; for changes from outside it, pactl or the desktop, within 100 ms through a watcher thread); IAudioMeterInformation reads silence. The session's volume applies to the process's render streams; its events
+ *    (IAudioSessionEvents) tell of volume and mute changes and of the session becoming active or inactive. IMMNotificationClient hears of endpoints
+ *    coming and going (a microphone plugged in or pulled out).
  *  - ActivateAudioInterfaceAsync activates on the default endpoints (DEVINTERFACE_AUDIO_RENDER, DEVINTERFACE_AUDIO_CAPTURE or an endpoint's id) and
  *    calls the handler on a thread of its own.
  * Built freestanding over kernel32.dll, ntdll.dll and ole32.dll (CoTaskMemAlloc). */
@@ -162,18 +164,90 @@ static Client *g_clients;
 static void apply_session_to_all(void);
 static BOOL any_started(void);
 
+/* A list of the program's callback objects (session events, notification clients, endpoint volume callbacks). They are called with no lock held:
+ * listeners_copy takes a reference to each, the caller calls them and listeners_drop lets go. */
+#define MAX_LISTENERS 16
+typedef struct {
+  SRWLOCK lock;
+  IUnknown *items[MAX_LISTENERS];
+} Listeners;
+static HRESULT listeners_add(Listeners *l, IUnknown *item) {
+  if (!item) return E_POINTER;
+  HRESULT hr = E_OUTOFMEMORY;
+  AcquireSRWLockExclusive(&l->lock);
+  for (int k = 0; k < MAX_LISTENERS; ++k)
+    if (!l->items[k]) {
+      l->items[k] = item;
+      IUnknown_AddRef(item);
+      hr = S_OK;
+      break;
+    }
+  ReleaseSRWLockExclusive(&l->lock);
+  return hr;
+}
+static HRESULT listeners_remove(Listeners *l, IUnknown *item) {
+  if (!item) return E_POINTER;
+  IUnknown *found = NULL;
+  AcquireSRWLockExclusive(&l->lock);
+  for (int k = 0; k < MAX_LISTENERS; ++k)
+    if (l->items[k] == item) {
+      found = item;
+      l->items[k] = NULL;
+      break;
+    }
+  ReleaseSRWLockExclusive(&l->lock);
+  if (!found) return E_NOTFOUND_;
+  IUnknown_Release(found);
+  return S_OK;
+}
+static int listeners_copy(Listeners *l, IUnknown **out) {
+  int n = 0;
+  AcquireSRWLockShared(&l->lock);
+  for (int k = 0; k < MAX_LISTENERS; ++k)
+    if (l->items[k]) {
+      out[n++] = l->items[k];
+      IUnknown_AddRef(l->items[k]);
+    }
+  ReleaseSRWLockShared(&l->lock);
+  return n;
+}
+static void listeners_drop(IUnknown **items, int n) {
+  for (int k = 0; k < n; ++k) IUnknown_Release(items[k]);
+}
+
+static Listeners g_session_events = {SRWLOCK_INIT, {0}};
+static void notify_session_volume(LPCGUID context) {
+  AcquireSRWLockShared(&g_lock);
+  const float level = g_session_volume;
+  const BOOL mute = g_session_mute;
+  ReleaseSRWLockShared(&g_lock);
+  IUnknown *items[MAX_LISTENERS];
+  const int n = listeners_copy(&g_session_events, items);
+  for (int k = 0; k < n; ++k) IAudioSessionEvents_OnSimpleVolumeChanged((IAudioSessionEvents *)items[k], level, mute, context);
+  listeners_drop(items, n);
+}
+/* The session became active (a stream started) or inactive (the last one stopped). */
+static void notify_session_state(BOOL active) {
+  IUnknown *items[MAX_LISTENERS];
+  const int n = listeners_copy(&g_session_events, items);
+  for (int k = 0; k < n; ++k) IAudioSessionEvents_OnStateChanged((IAudioSessionEvents *)items[k], active ? AudioSessionStateActive : AudioSessionStateInactive);
+  listeners_drop(items, n);
+}
+
 static HRESULT session_query(REFIID riid, void **out);
 
 static HRESULT WINAPI sv_query(ISimpleAudioVolume *i, REFIID riid, void **out) { (void)i; return session_query(riid, out); }
 static ULONG WINAPI sv_add_ref(ISimpleAudioVolume *i) { (void)i; return 2; }
 static ULONG WINAPI sv_release(ISimpleAudioVolume *i) { (void)i; return 1; }
 static HRESULT WINAPI sv_set_master(ISimpleAudioVolume *i, float level, LPCGUID context) {
-  (void)i; (void)context;
+  (void)i;
   if (!(level >= 0.0f && level <= 1.0f)) return E_INVALIDARG;
   AcquireSRWLockExclusive(&g_lock);
+  const BOOL changed = g_session_volume != level;
   g_session_volume = level;
   ReleaseSRWLockExclusive(&g_lock);
   apply_session_to_all();
+  if (changed) notify_session_volume(context);
   return S_OK;
 }
 static HRESULT WINAPI sv_get_master(ISimpleAudioVolume *i, float *level) {
@@ -185,11 +259,13 @@ static HRESULT WINAPI sv_get_master(ISimpleAudioVolume *i, float *level) {
   return S_OK;
 }
 static HRESULT WINAPI sv_set_mute(ISimpleAudioVolume *i, WINBOOL mute, LPCGUID context) {
-  (void)i; (void)context;
+  (void)i;
   AcquireSRWLockExclusive(&g_lock);
+  const BOOL changed = g_session_mute != (mute ? TRUE : FALSE);
   g_session_mute = mute ? TRUE : FALSE;
   ReleaseSRWLockExclusive(&g_lock);
   apply_session_to_all();
+  if (changed) notify_session_volume(context);
   return S_OK;
 }
 static HRESULT WINAPI sv_get_mute(ISimpleAudioVolume *i, WINBOOL *mute) {
@@ -270,8 +346,8 @@ static HRESULT WINAPI sc_set_grouping(IAudioSessionControl2 *i, LPCGUID grouping
   return S_OK;
 }
 /* (no session events are ever sent: the session does not change from outside the process) */
-static HRESULT WINAPI sc_register(IAudioSessionControl2 *i, IAudioSessionEvents *events) { (void)i; return events ? S_OK : E_POINTER; }
-static HRESULT WINAPI sc_unregister(IAudioSessionControl2 *i, IAudioSessionEvents *events) { (void)i; return events ? S_OK : E_POINTER; }
+static HRESULT WINAPI sc_register(IAudioSessionControl2 *i, IAudioSessionEvents *events) { (void)i; return listeners_add(&g_session_events, (IUnknown *)events); }
+static HRESULT WINAPI sc_unregister(IAudioSessionControl2 *i, IAudioSessionEvents *events) { (void)i; return listeners_remove(&g_session_events, (IUnknown *)events); }
 static HRESULT WINAPI sc_get_identifier(IAudioSessionControl2 *i, LPWSTR *id) {
   (void)i;
   WCHAR s[160];
@@ -682,6 +758,7 @@ static HRESULT WINAPI ac_get_device_period(IAudioClient3 *i, REFERENCE_TIME *def
 static HRESULT WINAPI ac_start(IAudioClient3 *i) {
   Client *c = from_client(i);
   if (!c->initialized) return AUDCLNT_E_NOT_INITIALIZED;
+  const BOOL was_active = any_started();
   EnterCriticalSection(&c->lock);
   HRESULT hr = S_OK;
   if (c->started) hr = AUDCLNT_E_NOT_STOPPED;
@@ -693,6 +770,7 @@ static HRESULT WINAPI ac_start(IAudioClient3 *i) {
   }
   LeaveCriticalSection(&c->lock);
   if (SUCCEEDED(hr)) SetEvent(c->wake);
+  if (SUCCEEDED(hr) && !was_active) notify_session_state(TRUE);
   return hr;
 }
 static HRESULT WINAPI ac_stop(IAudioClient3 *i) {
@@ -704,6 +782,7 @@ static HRESULT WINAPI ac_stop(IAudioClient3 *i) {
   if (was) audio_call(TCOS_AUDIO_PAUSE, c->stream, 1, 0, 0, 0, 0, NULL, NULL, NULL);
   c->started = FALSE;
   LeaveCriticalSection(&c->lock);
+  if (was && !any_started()) notify_session_state(FALSE);
   return was ? S_OK : S_FALSE;
 }
 static HRESULT WINAPI ac_reset(IAudioClient3 *i) {
@@ -1081,9 +1160,12 @@ static HRESULT new_client(void **out, int which) {
 
 /* ---- the endpoints' volume (the graph's master volume, the microphone's master gain) and meter ------------------------------------------------- */
 
-#define MAX_VOLUME_CALLBACKS 16
-static IAudioEndpointVolumeCallback *g_volume_callbacks[2][MAX_VOLUME_CALLBACKS];
-static SRWLOCK g_callback_lock = SRWLOCK_INIT;
+static Listeners g_volume_callbacks[2] = {{SRWLOCK_INIT, {0}}, {SRWLOCK_INIT, {0}}};
+static void start_watcher(void);
+/* What the endpoints' master volumes were when last told (the watcher tells the callbacks when someone outside the process changes them). */
+static SRWLOCK g_seen_lock = SRWLOCK_INIT;
+static float g_seen_scalar[2] = {-1, -1};
+static BOOL g_seen_mute[2];
 static IAudioEndpointVolume g_endpoint_volume[2];
 static int volume_endpoint(IAudioEndpointVolume *i) { return i == &g_endpoint_volume[CAPTURE] ? CAPTURE : RENDER; }
 /* The stream number NtTcosAudio's volume calls take for an endpoint's master volume. */
@@ -1117,10 +1199,14 @@ static void notify_volume(int which, LPCGUID context) {
   data->nChannels = 2;
   data->afChannelVolumes[0] = scalar;
   ((float *)(data->afChannelVolumes))[1] = scalar;
-  AcquireSRWLockShared(&g_callback_lock);
-  for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (g_volume_callbacks[which][k]) IAudioEndpointVolumeCallback_OnNotify(g_volume_callbacks[which][k], data);
-  ReleaseSRWLockShared(&g_callback_lock);
+  AcquireSRWLockExclusive(&g_seen_lock);
+  g_seen_scalar[which] = scalar;
+  g_seen_mute[which] = mute;
+  ReleaseSRWLockExclusive(&g_seen_lock);
+  IUnknown *items[MAX_LISTENERS];
+  const int n = listeners_copy(&g_volume_callbacks[which], items);
+  for (int k = 0; k < n; ++k) IAudioEndpointVolumeCallback_OnNotify((IAudioEndpointVolumeCallback *)items[k], data);
+  listeners_drop(items, n);
 }
 static HRESULT set_master(int which, float scalar, LPCGUID context) {
   if (!(scalar >= 0.0f && scalar <= 1.0f)) return E_INVALIDARG;
@@ -1147,35 +1233,13 @@ static HRESULT WINAPI ev_query(IAudioEndpointVolume *i, REFIID riid, void **out)
 static ULONG WINAPI ev_add_ref(IAudioEndpointVolume *i) { (void)i; return 2; }
 static ULONG WINAPI ev_release(IAudioEndpointVolume *i) { (void)i; return 1; }
 static HRESULT WINAPI ev_register(IAudioEndpointVolume *i, IAudioEndpointVolumeCallback *callback) {
-  if (!callback) return E_POINTER;
   const int which = volume_endpoint(i);
-  HRESULT hr = E_OUTOFMEMORY;
-  AcquireSRWLockExclusive(&g_callback_lock);
-  for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (!g_volume_callbacks[which][k]) {
-      g_volume_callbacks[which][k] = callback;
-      IAudioEndpointVolumeCallback_AddRef(callback);
-      hr = S_OK;
-      break;
-    }
-  ReleaseSRWLockExclusive(&g_callback_lock);
+  const HRESULT hr = listeners_add(&g_volume_callbacks[which], (IUnknown *)callback);
+  if (SUCCEEDED(hr)) start_watcher();
   return hr;
 }
 static HRESULT WINAPI ev_unregister(IAudioEndpointVolume *i, IAudioEndpointVolumeCallback *callback) {
-  if (!callback) return E_POINTER;
-  const int which = volume_endpoint(i);
-  IAudioEndpointVolumeCallback *found = NULL;
-  AcquireSRWLockExclusive(&g_callback_lock);
-  for (int k = 0; k < MAX_VOLUME_CALLBACKS; ++k)
-    if (g_volume_callbacks[which][k] == callback) {
-      found = callback;
-      g_volume_callbacks[which][k] = NULL;
-      break;
-    }
-  ReleaseSRWLockExclusive(&g_callback_lock);
-  if (!found) return E_NOTFOUND_;
-  IAudioEndpointVolumeCallback_Release(found);
-  return S_OK;
+  return listeners_remove(&g_volume_callbacks[volume_endpoint(i)], (IUnknown *)callback);
 }
 static HRESULT WINAPI ev_get_channel_count(IAudioEndpointVolume *i, UINT *count) {
   (void)i;
@@ -1554,9 +1618,72 @@ static HRESULT WINAPI en_get_device(IMMDeviceEnumerator *i, LPCWSTR id, IMMDevic
     }
   return E_NOTFOUND_;
 }
-/* (endpoints never come and go while a program runs here, so the callbacks are never called) */
-static HRESULT WINAPI en_register(IMMDeviceEnumerator *i, IMMNotificationClient *client) { (void)i; return client ? S_OK : E_POINTER; }
-static HRESULT WINAPI en_unregister(IMMDeviceEnumerator *i, IMMNotificationClient *client) { (void)i; return client ? S_OK : E_POINTER; }
+/* ---- the watcher: what changes from outside the process ----------------------------------------------------------------------------------------- *
+ * While the program listens (endpoint volume callbacks, notification clients), a thread looks every 100 ms at the endpoints' master volumes (pactl,
+ * wpctl or the desktop may change them) and at whether the microphone and the speakers are there (a USB headset plugged in or pulled out), and tells
+ * the callbacks what changed. */
+static Listeners g_notification_clients = {SRWLOCK_INIT, {0}};
+static volatile LONG g_watcher_started;
+static BOOL g_seen_present[2];
+
+static void notify_device_change(int which, BOOL present) {
+  IUnknown *items[MAX_LISTENERS];
+  const int n = listeners_copy(&g_notification_clients, items);
+  const WCHAR *id = endpoint_id(which);
+  const EDataFlow flow = which == CAPTURE ? eCapture : eRender;
+  for (int k = 0; k < n; ++k) {
+    IMMNotificationClient *c = (IMMNotificationClient *)items[k];
+    IMMNotificationClient_OnDeviceStateChanged(c, id, present ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED);
+    for (int role = eConsole; role < ERole_enum_count; ++role) IMMNotificationClient_OnDefaultDeviceChanged(c, flow, (ERole)role, present ? id : NULL);
+  }
+  listeners_drop(items, n);
+}
+
+static DWORD WINAPI watcher_thread(LPVOID param) {
+  (void)param;
+  for (int which = RENDER; which <= CAPTURE; ++which) g_seen_present[which] = has_endpoint(which);
+  for (;;) {
+    Sleep(100);
+    for (int which = RENDER; which <= CAPTURE; ++which) {
+      const BOOL present = has_endpoint(which);
+      if (present != g_seen_present[which]) {
+        g_seen_present[which] = present;
+        notify_device_change(which, present);
+      }
+      float scalar = 0;
+      BOOL mute = FALSE;
+      if (!present || !read_master(which, &scalar, &mute)) continue;
+      AcquireSRWLockShared(&g_seen_lock);
+      const BOOL changed = g_seen_scalar[which] >= 0 && (scalar != g_seen_scalar[which] || mute != g_seen_mute[which]);
+      const BOOL first = g_seen_scalar[which] < 0;
+      ReleaseSRWLockShared(&g_seen_lock);
+      if (changed) {
+        notify_volume(which, NULL);
+      } else if (first) {
+        AcquireSRWLockExclusive(&g_seen_lock);
+        g_seen_scalar[which] = scalar;
+        g_seen_mute[which] = mute;
+        ReleaseSRWLockExclusive(&g_seen_lock);
+      }
+    }
+  }
+  return 0;
+}
+
+static void start_watcher(void) {
+  if (InterlockedCompareExchange(&g_watcher_started, 1, 0) != 0) return;
+  HANDLE thread = CreateThread(NULL, 0, watcher_thread, NULL, 0, NULL);
+  if (thread) CloseHandle(thread);
+  else InterlockedExchange(&g_watcher_started, 0);
+}
+
+static HRESULT WINAPI en_register(IMMDeviceEnumerator *i, IMMNotificationClient *client) {
+  (void)i;
+  const HRESULT hr = listeners_add(&g_notification_clients, (IUnknown *)client);
+  if (SUCCEEDED(hr)) start_watcher();
+  return hr;
+}
+static HRESULT WINAPI en_unregister(IMMDeviceEnumerator *i, IMMNotificationClient *client) { (void)i; return listeners_remove(&g_notification_clients, (IUnknown *)client); }
 static const IMMDeviceEnumeratorVtbl kEnumeratorVtbl = {en_query, en_add_ref, en_release, en_enum, en_get_default, en_get_device, en_register, en_unregister};
 static IMMDeviceEnumerator g_enumerator = {(IMMDeviceEnumeratorVtbl *)&kEnumeratorVtbl};
 
