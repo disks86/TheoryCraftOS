@@ -21,19 +21,29 @@
  *
  * This file is the Linux layer of the driver (vk_os.h): raw Linux system calls (x86-64, AArch64, RISC-V 64 and LoongArch 64: a program of another CPU runs on the kernel's
  * emulator with the same calls), memory from mmap, diagnostics to standard error when VULKAN_1_DEBUG is set, CLOCK_MONOTONIC, the ioctl of /dev/dxg, images as
- * dmabufs (/dev/dxg's export and import: VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf, what a Wayland client passes the compositor) and
- * VK_EXT_headless_surface (a surface without a window: its swapchain is shown on the display).
+ * dmabufs (/dev/dxg's export and import: VK_KHR_external_memory_fd, VK_EXT_external_memory_dma_buf, what a Wayland client passes the compositor),
+ * VK_EXT_headless_surface (a surface without a window: its swapchain is shown on the display) and VK_KHR_wayland_surface (wayland.inc: a swapchain shown by a
+ * Wayland compositor, through the program's libwayland-client).
  *
- * It needs no C library: it is built freestanding into libvulkan.a (Linux programs here are linked statically: the system has no dynamic loader yet), and memcpy, memmove,
- * memset and memcmp are weak, so a C library's own win when the program has one. The program calls the vk* functions directly or through vkGetInstanceProcAddr. */
+ * It needs no C library: it is built freestanding, as libvulkan.a for programs linked statically and as libvulkan.so.1 (-DVK_SHARED) for programs of a C library,
+ * in place of the Khronos loader (the program loads this driver by the loader's name and calls it directly). memcpy, memmove, memset and memcmp are weak, so a
+ * C library's own win in a static program; the shared library has none and uses the C library's. The program calls the vk* functions directly
+ * or through vkGetInstanceProcAddr. */
 #include "../../Vulkan/khronos/vulkan/vulkan_core.h"
+struct wl_display;
+struct wl_surface;
+#include "../../Vulkan/khronos/vulkan/vulkan_wayland.h"
 
 #define VK_OS_NAME "libvulkan"
 #define VK_OS_EXPORT __attribute__((visibility("default")))
-#define VK_OS_INSTANCE_EXTENSIONS {VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_SPEC_VERSION},
-#define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT) X(vkGetMemoryFdKHR) X(vkGetMemoryFdPropertiesKHR)
+#define VK_OS_INSTANCE_EXTENSIONS {VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_SPEC_VERSION}, \
+                                  {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
+#define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT) X(vkGetMemoryFdKHR) X(vkGetMemoryFdPropertiesKHR) X(vkCreateWaylandSurfaceKHR) \
+                       X(vkGetPhysicalDeviceWaylandPresentationSupportKHR)
 #define VK_OS_EXTERNAL_MEMORY_FD 1   /* images as dmabufs of /dev/dxg (vk_external.inc) */
+#define VK_OS_COMPOSITOR_SURFACES 1  /* Wayland surfaces (wayland.inc) */
 #include "../../Vulkan/vk_driver.inc"
+
 
 /* ---- Linux system calls ------------------------------------------------------------------------------------------------------------------------------------------------ */
 #if defined(__x86_64__)
@@ -89,6 +99,7 @@ static void *map_pages(size_t bytes) {
 }
 
 /* ---- memory (weak: a C library's own are better and take their place) ------------------------------------------------------------------------------------------------ */
+#if !defined(VK_SHARED)
 __attribute__((weak)) void *memcpy(void *d, const void *s, size_t n) {
   uint8_t *p = d;
   const uint8_t *q = s;
@@ -118,6 +129,7 @@ __attribute__((weak)) int memcmp(const void *a, const void *b, size_t n) {
     if (*p != *q) return *p < *q ? -1 : 1;
   return 0;
 }
+#endif
 
 /* The heap: blocks of 32 .. 4096 bytes (powers of two, a free list each) cut from 64 KiB pieces of mmap, anything bigger mapped on its own. Every block starts with a 16-byte
  * header (keeps the user's part 16-byte aligned) that says which it is. One spin lock guards the lists: the driver's allocations are short and few per call. Freed small blocks
@@ -287,3 +299,5 @@ static bool vk_os_surface_extent(const Surface *s, uint32_t *w, uint32_t *h) {
   (void)s, (void)w, (void)h;
   return false;      /* (the program picks the swapchain's size) */
 }
+
+#include "wayland.inc"

@@ -18,6 +18,7 @@
 
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Utility/ByteStream.hpp"
 #include "WebGl/TgsiTranslator.hpp"
 
 namespace graphics {
@@ -66,6 +67,8 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.geometry = l.lines && (info.features & kFeatureGeometryShaders) != 0;
   l.tessellation = (info.features & kFeatureTessellation) != 0;
   l.clip_distances = (info.features & kFeatureClipDistances) != 0;
+  l.float_textures = (info.features & kFeatureFloatFormats) != 0;
+  l.control_varyings = info.limits.control_varyings;
   return l;
 }
 
@@ -164,14 +167,22 @@ void WebGlAccelerator::destroy_program(uint32_t handle) {
   programs_[handle - 1].reset();
 }
 
-uint32_t WebGlAccelerator::create_texture(uint32_t w, uint32_t h) {
+uint32_t WebGlAccelerator::create_texture(uint32_t w, uint32_t h) { return make_texture(w, h, false); }
+
+uint32_t WebGlAccelerator::create_texture_float(uint32_t w, uint32_t h) {
+  if (!(device_.info().features & kFeatureFloatFormats)) return 0;
+  return make_texture(w, h, true);
+}
+
+uint32_t WebGlAccelerator::make_texture(uint32_t w, uint32_t h, bool floats) {
   if (w == 0 || h == 0) return 0;
   kernel::ScopedMutex guard(lock_);
   UniquePointer<Texture> t = UniquePointer<Texture>::make(allocator_);
   if (!t) return 0;
   t->width = w;
   t->height = h;
-  t->image = device_.create_image({{w, h}, Format::B8G8R8A8Unorm, kImageSampled});
+  t->floats = floats;
+  t->image = device_.create_image({{w, h}, floats ? Format::R32G32B32A32Float : Format::B8G8R8A8Unorm, kImageSampled});
   if (!t->image) return 0;
   for (uint64_t i = 0; i < textures_.count(); ++i)
     if (!textures_[i]) {
@@ -193,7 +204,7 @@ void WebGlAccelerator::destroy_texture(uint32_t handle) {
 bool WebGlAccelerator::write_texture(uint32_t handle, ConstByteView rgba) {
   kernel::ScopedMutex guard(lock_);
   Texture* t = texture_at(handle);
-  if (!t) return false;
+  if (!t || t->floats) return false;
   const uint64_t texels = uint64_t{t->width} * t->height;
   if (rgba.size() != texels * 4) return false;
   ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, texels);
@@ -201,6 +212,28 @@ bool WebGlAccelerator::write_texture(uint32_t handle, ConstByteView rgba) {
   for (uint64_t i = 0; i < texels; ++i)   // 0xAARRGGBB
     scratch[i] = (uint32_t{rgba[i * 4 + 3]} << 24) | (uint32_t{rgba[i * 4]} << 16) | (uint32_t{rgba[i * 4 + 1]} << 8) | rgba[i * 4 + 2];
   const bool ok = t->image->write_pixels(scratch);
+  release_view(allocator_, scratch);
+  return ok;
+}
+
+bool WebGlAccelerator::write_texture_float(uint32_t handle, ConstByteView rgba32f) {
+  kernel::ScopedMutex guard(lock_);
+  Texture* t = texture_at(handle);
+  if (!t || !t->floats) return false;
+  const uint64_t texels = uint64_t{t->width} * t->height;
+  if (rgba32f.size() != texels * 16) return false;
+  ArrayView<Vec4> scratch = allocate_view<Vec4>(allocator_, texels);
+  if (scratch.empty()) return false;
+  ByteReader r(rgba32f);
+  for (Vec4& v : scratch) {
+    uint32_t c[4] = {0, 0, 0, 0};
+    for (uint32_t& w : c) w = r.le32();      // (the size was checked: every read is inside)
+    v.x = __builtin_bit_cast(float, c[0]);
+    v.y = __builtin_bit_cast(float, c[1]);
+    v.z = __builtin_bit_cast(float, c[2]);
+    v.w = __builtin_bit_cast(float, c[3]);
+  }
+  const bool ok = t->image->write_pixels_float(scratch);
   release_view(allocator_, scratch);
   return ok;
 }

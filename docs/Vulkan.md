@@ -4,15 +4,15 @@ One driver, two user-mode front doors. The driver is `src/Vulkan/` (`vk_driver.i
 interface in `spirv.h`; `khronos/` are the unchanged Khronos headers, Apache-2.0 OR MIT). What it needs from the system is the small interface of `src/Vulkan/vk_os.h`, and each
 userland has a file that provides it and includes the driver:
 
-| | Windows: `vulkan-1.dll` | Linux: `libvulkan.a` |
+| | Windows: `vulkan-1.dll` | Linux: `libvulkan.so.1` and `libvulkan.a` |
 |---|---|---|
 | Source | `src/Windows/vulkan-1/vulkan-1.c` | `src/Linux/libvulkan/libvulkan.c` |
-| Built by | the Windows DLL build (CMake `windows_dlls`, mingw) | `src/Linux/libvulkan/build.sh <out> [x86_64 aarch64 riscv64 loongarch64]` (clang, freestanding) |
+| Built by | the Windows DLL build (CMake `windows_dlls`, mingw) | `src/Linux/libvulkan/build.sh <out> [x86_64 aarch64 riscv64 loongarch64]` (clang, freestanding): `<out>/<cpu>/libvulkan.so.1` and `libvulkan.a` |
 | D3DKMT services (`kmt()`) | gdi32.dll's `D3DKMT*` thunks: the `NtGdiDdDDI*` system calls | `ioctl(TCOS_DXG_IOCTL_CALL)` on `/dev/dxg` (`src/Process/DxgDevice.h`) |
-| Memory | the process heap | `mmap` (size classes; memcpy/memset/memmove/memcmp weak, so a C library's win) |
+| Memory | the process heap | `mmap` (size classes); memcpy/memset/memmove/memcmp: the C library's in `libvulkan.so.1`, weak byte loops in `libvulkan.a` |
 | Diagnostics (`VULKAN_1_DEBUG`) | `OutputDebugStringA`, and standard error when set | standard error when set (read from `environ` if the program has a C library) |
 | Clock | `QueryPerformanceCounter` | `clock_gettime(CLOCK_MONOTONIC)` |
-| Surface | `VK_KHR_win32_surface` (a window's client area) | `VK_EXT_headless_surface` (no window: the swapchain flips onto the display) |
+| Surface | `VK_KHR_win32_surface` (a window's client area) | `VK_KHR_wayland_surface` (a Wayland window: the images go to the compositor as dmabufs, `src/Linux/libvulkan/wayland.inc`); `VK_EXT_headless_surface` (no window: the swapchain flips onto the display) |
 | Images as descriptors | - | `VK_KHR_external_memory`, `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf`: dmabufs of `/dev/dxg` (`vk_external.inc`) |
 
 Everything else - the instance, the physical devices, memory, buffers and images, the formats, pipelines and the SPIR-V to DXBC translation, command buffers, compute, queries,
@@ -25,6 +25,20 @@ A new platform (another Linux surface, a different transport) is a new file next
 include `vk_driver.inc`, then define `kmt`, `vk_alloc`, `vk_free`, `vk_os_trace`, `vk_os_now_ns`, `vk_os_surface_extent` and the surface functions (each makes its `Surface` with
 `make_surface(window, kind, out)`). Keep platform code out of `src/Vulkan`: no Windows or Linux types or calls there.
 
+A surface that a compositor shows (a platform turns them on with `VK_OS_COMPOSITOR_SURFACES` and `vk_os_swapchain_made` / `vk_os_swapchain_gone` / `vk_os_acquire` /
+`vk_os_present`, `src/Vulkan/vk_wsi.inc`) has the platform's state in `Surface.os`. Its swapchain images are shareable allocations, made as an image with
+`VkExternalMemoryImageCreateInfo` is (not flipped, so not `A_PRESENT`: virgl refuses an image that is both shown and sampled), and the platform hands them over. The surface
+reports an extent of 0xFFFFFFFF (the swapchain picks the window's size), B8G8R8A8_UNORM only, and opaque or premultiplied alpha.
+
+`VK_KHR_wayland_surface` (`src/Linux/libvulkan/wayland.inc`). The protocol goes through the program's own libwayland-client: libvulkan finds its functions with `dlopen`
+(`RTLD_NOLOAD` first: the copy the program loaded, whose `wl_display` it was given) and `dlsym`, so it does not link against it and needs it only when a Wayland surface is made
+(libwayland 1.20 or later: `wl_proxy_marshal_flags`). A swapchain binds `zwp_linux_dmabuf_v1` through a registry of its own on an event queue of its own, so the program's
+dispatching never runs the swapchain's handlers. Each image is exported once (`TCOS_DXG_IOCTL_EXPORT`) and made a `wl_buffer` with `create_immed` (plane 0, offset 0, the
+allocation's row pitch, the linear modifier, XRGB8888 or ARGB8888 for premultiplied alpha); a roundtrip then catches a compositor that refused them (`VK_ERROR_SURFACE_LOST_KHR`). A
+present attaches the image's buffer, damages all of it and commits (every submission has run when `vkQueueSubmit` returns, so the image holds the frame: no sync object is needed);
+FIFO asks for a frame callback and waits for the previous one first, MAILBOX and IMMEDIATE do not wait. An acquire hands out the oldest image whose buffer the compositor released
+and the program does not hold, waiting on the swapchain's queue for a release; with a timeout of 0 it answers `VK_NOT_READY`.
+
 Images as dmabufs (Linux; a platform turns them on with `VK_OS_EXTERNAL_MEMORY_FD` and `vk_os_export_fd` / `vk_os_import_fd` / `vk_os_close_fd`, `src/Vulkan/vk_external.inc`). An
 image's pixels are its allocation, not its memory, so what is exported is the allocation of the image the memory belongs to: the one `VkMemoryDedicatedAllocateInfo` names, else
 the first image bound to it. An image made with `VkExternalMemoryImageCreateInfo` has a shareable allocation that is also a texture (so that the compositor samples it);
@@ -33,14 +47,19 @@ in place of its own (same size and format, else `VK_ERROR_INVALID_EXTERNAL_HANDL
 sample, 8 bits a channel; `vkGetPhysicalDeviceExternal*Properties` and `VK_KHR_get_physical_device_properties2` are not there. This is how a Wayland client on this system
 renders on the GPU and hands its frames to the compositor (`zwp_linux_dmabuf_v1`, [Wayland.md](Wayland.md)).
 
-Linux programs link `libvulkan.a` statically and call the `vk*` functions directly or through `vkGetInstanceProcAddr`. (The system now runs
-dynamically linked programs, `docs/LinuxDynamicPrograms.md`, but the driver is not built as a `libvulkan.so.1` yet.)
+Linux programs of a C library load `libvulkan.so.1` (installed as `/usr/lib/libvulkan.so.1` of the Linux tree, `docs/LinuxDynamicPrograms.md`). It takes the place of the
+Khronos loader rather than being one of its drivers: a program built against the loader (`-lvulkan`, or `dlopen("libvulkan.so.1")` and `vkGetInstanceProcAddr`) calls the driver
+directly. It exports only the `vk*` functions (`-fvisibility=hidden`) and takes `dlopen`, `dlsym`, `environ` and the memcpy family from the program's C library. Static programs
+without a C library link `libvulkan.a` (no Wayland surface there: no `dlopen`).
 
 Tests: `tests/VulkanShaderTest.cpp` (the translator, host, ASan + UBSan: `tests/run_host_tests.sh VulkanShaderTest`); `tests/windows/vulkantest.c` (the real DLL on every adapter of
 the machine, in QEMU); `tests/linux_vulkan.sh` (`tests/linux/vulkantest.c` over `libvulkan.a` as an x86-64, AArch64 and RISC-V Linux program on the kernel's CPU emulator, with
 win32k's D3DKMT services and the software renderer behind `/dev/dxg`: the extensions, a triangle with push constants, a compute dispatch, a headless swapchain);
 `tests/wayland_dmabuf_emulated.sh` (`tests/linux/waylandvktest.c`: an exported image rendered frame after frame and shown by the Wayland compositor, an import of it, the ioctls'
-refusals, on the three CPUs);
+refusals, on the three CPUs); `tests/linux_vulkan_wayland_emulated.sh` (`tests/linux/vkswapchain.c`: a glibc program with libwayland-client and an xdg-shell toplevel over
+`libvulkan.so.1` with `VK_KHR_wayland_surface`: the surface's answers, FIFO and MAILBOX swapchains, a swapchain remade from another, `VK_NOT_READY`, the program's own queue beside
+the swapchain's, the window on the stand-in desktop with the last frame, drawn on the device and on the CPU; x86-64 on the CPU emulator; it also passed on the real kernel in
+QEMU, 41 checks, on standard VGA (the desktop drew the buffers from the CPU) and on virgl (all drawn in place on the GPU));
 `ProcessFilesTest` (`test_dxg_device`: `/dev/dxg`'s answers to bad requests, pointers and services). Lists regenerated by `scripts/gen-vulkan-exports.py` after a function is added
 (`src/Vulkan/vk_exports.inc` for the shared functions; a platform lists its own in `VK_OS_PROCS`).
 
@@ -133,6 +152,8 @@ the pass's stream has run). Kernel limits Godot's renderers run into next: array
 have one mip level, an 8-bit colour format and cannot be drawn into, and uniform data is the push constant block (`maxUniformBufferRange` 4096, below Vulkan's 16384). A window is not composed: a swapchain flips the whole display. The exports of the core that are not implemented are linked in as functions
 that answer `VK_ERROR_FEATURE_NOT_PRESENT` (`src/Windows/stubs/vulkan-1.inc`). Not validated on real GPUs: only the CPU renderer and what QEMU gives (virgl, standard VGA) run it.
 
-Linux: only `VK_EXT_headless_surface` - no `VK_KHR_wayland_surface` or `VK_KHR_xlib_surface` yet (a Wayland client renders into an exported image and passes it itself,
-`tests/linux/waylandvktest.c`; the surface extension needs libwayland-client, which needs the dynamic loader) - and `libvulkan.a` only (no `libvulkan.so.1`: no dynamic loader). The Linux
-library has been run on the CPU emulator with the software renderer (`tests/linux_vulkan.sh`), not yet as a native Linux process in QEMU.
+Linux: no `VK_KHR_xlib_surface` / `VK_KHR_xcb_surface`. `libvulkan.so.1` replaces the Khronos loader instead of being an ICD of it (no `vk_icdGetInstanceProcAddr`, no
+manifest in `/usr/share/vulkan/icd.d`): a program that brings its own loader does not find the driver, and there are no layers. Wayland: a finite acquire timeout is not kept (it waits
+until an image is released), no explicit sync (not needed while submissions run to the end in `vkQueueSubmit`), no `VK_KHR_present_wait` / `present_id`, no
+`VK_EXT_swapchain_maintenance1`, only B8G8R8A8_UNORM (no sRGB or 10-bit formats), no `VK_SUBOPTIMAL_KHR` on a window resize (a Wayland window takes its buffers' size anyway).
+`libvulkan.so.1` with Wayland has been run for x86-64 only (the development machine has no other C library), on the emulator and natively in QEMU.

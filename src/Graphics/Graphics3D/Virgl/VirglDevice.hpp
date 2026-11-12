@@ -45,6 +45,8 @@ class VirglDevice final : public IGraphicsDevice {
     l.texture_units = kMaxTextureUnits;
     l.vertex_attributes = kMaxVertexAttributes;
     l.varyings = gpu_.virgl_has_tessellation() ? 15 : 14;   // (GLSL 4.00 and later: a GL 4 host)
+    // (a GL 4 host's control stage puts out 32 vectors per control point, GL_MAX_TESS_CONTROL_OUTPUT_COMPONENTS 128: one is the position, one kept spare)
+    l.control_varyings = gpu_.virgl_has_tessellation() ? 30 : 0;
     return l;
   }
 

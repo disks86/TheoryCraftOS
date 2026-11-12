@@ -225,6 +225,14 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
       environment[environment_count++] = entry;
     }
   }
+  for (const StringView& entry : run.extra_environment)      // (a variable given here replaces the standard one of that name)
+    if (environment_count < 32) {
+      const uint64_t eq = entry.find('=');
+      bool replaced = false;
+      for (uint32_t i = 0; eq != StringView::npos && i < environment_count && !replaced; ++i)
+        if (environment[i].starts_with(entry.first(eq + 1))) { environment[i] = entry; replaced = true; }
+      if (!replaced) environment[environment_count++] = entry;
+    }
   const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), ArrayView<const StringView>(environment, environment_count), ConstByteView(random, sizeof(random)));
   if (status != process::LoadStatus::Ok) {
     fail(message, load_failure(status));

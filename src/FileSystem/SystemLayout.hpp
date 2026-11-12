@@ -107,6 +107,19 @@ inline constexpr const char* kRuntimeFolder = "/Linux/run/user/0";
 inline constexpr const char* kWaylandDisplay = "wayland-0";
 inline constexpr const char* kPipeWireSocket = "pipewire-0";
 inline constexpr const char* kPulseSocket = "pulse/native";
+// The kernel's D-Bus (src/DBus/SocketServer.hpp): the session bus is $XDG_RUNTIME_DIR/bus (DBUS_SESSION_BUS_ADDRESS), the system bus the standard
+// /run/dbus/system_bus_socket (DBUS_SYSTEM_BUS_ADDRESS's default), as Linux programs see them; kSystemBusFolder is where that is on the system's disk.
+inline constexpr const char* kSessionBusSocket = "bus";
+inline constexpr const char* kLinuxSystemBusSocket = "/run/dbus/system_bus_socket";
+inline constexpr const char* kSystemBusFolder = "/Linux/run/dbus";
+inline constexpr const char* kSystemBusSocket = "/Linux/run/dbus/system_bus_socket";
+// Where the buses find the .service files of the programs they start on demand (dbus-daemon's standard folders; src/DBus/Activation.hpp).
+inline constexpr const char* kSessionServicesFolder = "/Linux/usr/share/dbus-1/services";
+inline constexpr const char* kSystemServicesFolder = "/Linux/usr/share/dbus-1/system-services";
+inline constexpr const char* kLocalSessionServicesFolder = "/Linux/usr/local/share/dbus-1/services";
+inline constexpr const char* kLocalSystemServicesFolder = "/Linux/usr/local/share/dbus-1/system-services";
+// The machine's id (/etc/machine-id: 32 hex digits, made at the first start; D-Bus's Peer.GetMachineId, libdbus and sd-bus read it).
+inline constexpr const char* kLinuxMachineId = "/Linux/etc/machine-id";
 // Where device firmware is kept, as on Linux (/lib/firmware): the Intel NPU's is in intel/vpu.
 inline constexpr const char* kLinuxFirmware = "/Linux/lib/firmware";
 inline constexpr const char* kLinuxFirmwareIntelVpu = "/Linux/lib/firmware/intel/vpu";
@@ -142,9 +155,9 @@ inline constexpr const char* kWindowsFolders[] = {
 // presents devices and process information; here they start out empty.
 inline constexpr const char* kLinuxFolders[] = {
     kLinuxBin, "/Linux/boot", "/Linux/dev", kLinuxEtc, "/Linux/etc/opt", kLinuxHome, "/Linux/lib", kLinuxFirmware, "/Linux/lib/firmware/intel", kLinuxFirmwareIntelVpu, "/Linux/lib64", "/Linux/media",
-    "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", "/Linux/run/user", kRuntimeFolder, "/Linux/run/user/0/pulse", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
+    "/Linux/mnt", "/Linux/opt", "/Linux/proc", "/Linux/root", "/Linux/run", kSystemBusFolder, "/Linux/run/user", kRuntimeFolder, "/Linux/run/user/0/pulse", "/Linux/sbin", "/Linux/srv", "/Linux/sys", kLinuxTmp,
     "/Linux/usr", kLinuxUsrBin, "/Linux/usr/include", "/Linux/usr/lib", "/Linux/usr/lib64", "/Linux/usr/local", "/Linux/usr/local/bin",
-    "/Linux/usr/local/lib", "/Linux/usr/sbin", "/Linux/usr/share", "/Linux/var", "/Linux/var/cache", "/Linux/var/lib", "/Linux/var/log",
+    "/Linux/usr/local/lib", "/Linux/usr/sbin", "/Linux/usr/share", "/Linux/usr/share/dbus-1", kSessionServicesFolder, kSystemServicesFolder, "/Linux/var", "/Linux/var/cache", "/Linux/var/lib", "/Linux/var/log",
     "/Linux/var/tmp",
 };
 

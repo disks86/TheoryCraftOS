@@ -40,14 +40,17 @@ void GlContext::hw_forget_texture(uint32_t name) {
   if (hw_owner_) hw_textures_.forget(*hw_owner_, name);
 }
 
-// The texture bound to `unit` as the device can read it: a 2D texture of 8-bit RGBA texels with no mipmapping in use and a filter and wrap mode the device has.
-// Its texels are on the device when this returns true. False: the CPU samples it.
-bool GlContext::hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sampler) {
+// The texture bound to `unit` as the device can read sampler `ts`: a 2D (or 1D, rectangle) texture with no mipmapping in use and a filter and wrap mode the device has, of
+// 8-bit RGBA texels - or, for a shadow sampler, of depth, sent as a float texture with the depth in R and read with nearest filtering (the shader filters and
+// compares, by `params`: the sampler's four CONST rows, see TgsiSampler). Its texels are on the device when this returns true. False: the CPU samples it.
+bool GlContext::hw_texture(const TgsiSampler& ts, uint32_t unit, uint32_t* handle, AccelSampler* sampler, float params[16]) {
   constexpr uint32_t kMaxSide = 1024;
   if (unit >= kMaxTextureUnits) return false;
   const TextureUnit& u = units_[unit];
-  const Texture* t = texture_at(u.tex2d);
-  if (!t || t->target != 0x0DE1 || t->base_level != 0) return false;
+  const uint32_t name = ts.dim == shader::kDim1D ? u.tex1d : (ts.dim == shader::kDimRect ? u.rect : u.tex2d);
+  const uint32_t target = ts.dim == shader::kDim1D ? 0x0DE0 : (ts.dim == shader::kDimRect ? 0x84F5 : 0x0DE1);
+  const Texture* t = texture_at(name);
+  if (!t || t->target != target || t->base_level != 0) return false;
   SamplerObj so;
   if (u.sampler && u.sampler <= objects_->samplers.count() && objects_->samplers[u.sampler - 1]) so = *objects_->samplers[u.sampler - 1];
   else {
@@ -56,6 +59,7 @@ bool GlContext::hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sample
     so.wrap_s = t->wrap_s;
     so.wrap_t = t->wrap_t;
     so.compare_mode = t->compare_mode;
+    so.compare_func = t->compare_func;
   }
   const bool nearest = so.min_filter == 0x2600 && so.mag_filter == 0x2600, linear = so.min_filter == 0x2601 && so.mag_filter == 0x2601;
   if (!nearest && !linear) return false;   // (a mipmapped minification filter, or different filters for the two)
@@ -63,15 +67,50 @@ bool GlContext::hw_texture(uint32_t unit, uint32_t* handle, AccelSampler* sample
     *repeat = mode == 0x2901;
     return mode == 0x2901 || mode == 0x812F;
   };
-  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t) || so.compare_mode != 0) return false;
-  sampler->linear = linear;
+  if (!wrap(so.wrap_s, &sampler->repeat_s) || !wrap(so.wrap_t, &sampler->repeat_t)) return false;
+  if (!ts.shadow && so.compare_mode != 0) return false;      // (a comparison through a sampler that is not a shadow one: the CPU's)
+  if (ts.dim == shader::kDim1D) sampler->repeat_t = true;
+  sampler->linear = linear && !ts.shadow;
   bool cube;
   if (!texture_complete(*t, so, &cube) || t->images.count() == 0 || !t->images[0] || !t->images[0]->defined()) return false;
   const Image& im = *t->images[0];
-  if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed || im.w > kMaxSide || im.h > kMaxSide || im.d != 1 || im.ss != 1) return false;
+  if (im.w > kMaxSide || im.h > kMaxSide || im.d != 1 || im.ss != 1) return false;
   IAccelerator* acc = hw_owner_;
   if (!acc) return false;
-  *handle = hw_textures_.get(*acc, u.tex2d, im.w, im.h, im.px.view());
+  if (ts.params >= 0) {
+    for (uint32_t i = 0; i < 16; ++i) params[i] = 0;
+    // row 0: the weights of reference < depth, ==, > (GL_TEXTURE_COMPARE_FUNC less the value of GL_NEVER is those three bits: LESS 1, EQUAL 2, LEQUAL 3 ... ALWAYS 7),
+    // and linear filtering
+    const uint32_t bits = so.compare_func >= 0x0200 && so.compare_func <= 0x0207 ? so.compare_func - 0x0200 : 3;
+    params[0] = bits & 1 ? 1.0f : 0.0f;
+    params[1] = bits & 2 ? 1.0f : 0.0f;
+    params[2] = bits & 4 ? 1.0f : 0.0f;
+    params[3] = linear ? 1.0f : 0.0f;
+    // row 1: the size
+    params[4] = static_cast<float>(im.w);
+    params[5] = static_cast<float>(im.h);
+    params[6] = 1.0f / static_cast<float>(im.w);
+    params[7] = 1.0f / static_cast<float>(im.h);
+    // rows 2 and 3: shadow1D / shadow2D's vec4 = r * row 2 + row 3 (GL_DEPTH_TEXTURE_MODE)
+    const float m[4][8] = {{1, 1, 1, 0, 0, 0, 0, 1}, {1, 1, 1, 1, 0, 0, 0, 0}, {0, 0, 0, 1, 0, 0, 0, 0}, {1, 0, 0, 0, 0, 0, 0, 1}};
+    const uint32_t mode = t->depth_mode == 0x8049 ? 1 : (t->depth_mode == 0x1906 ? 2 : (t->depth_mode == 0x1903 ? 3 : 0));
+    for (uint32_t i = 0; i < 8; ++i) params[8 + i] = m[mode][i];
+  }
+  if (!ts.shadow) {
+    if (im.info->store != Store::U8x4 || im.info->srgb || im.info->is_signed) return false;
+    *handle = hw_textures_.get(*acc, name, im.w, im.h, im.px.view());
+    return *handle != 0;
+  }
+  // a shadow sampler: the depth texels as floats
+  if ((im.info->store != Store::Depth && im.info->store != Store::DepthStencil) || !acc->limits().float_textures) return false;
+  ByteBuffer floats(a_);
+  for (uint32_t y = 0; y < im.h; ++y)
+    for (uint32_t x = 0; x < im.w; ++x) {
+      uint32_t raw[4];
+      read_texel(im, x, y, 0, raw);
+      if (!floats.put32(raw[0]) || !floats.put32(0) || !floats.put32(0) || !floats.put32(f2u(1.0f))) return false;
+    }
+  *handle = hw_textures_.get(*acc, name, im.w, im.h, floats.view(), true);
   return *handle != 0;
 }
 
@@ -235,6 +274,7 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   limits.const_rows = al.const_rows;
   limits.attributes = al.attributes;
   limits.varyings = al.varyings;
+  limits.control_varyings = al.control_varyings;
   limits.samplers = al.textures;
   TgsiStages stages;
   stages.gs = p.extra[kStageGeometry] ? p.extra[kStageGeometry]->module.get() : nullptr;
@@ -392,7 +432,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   const uint32_t nattr = static_cast<uint32_t>(t.attributes.count());
   if (nattr == 0 || nattr > kTgsiMaxAttributes) return no("the number of attributes");
   for (uint32_t k = 0; k < nattr; ++k) {
-    if (t.attributes[k].slot == kTgsiNoAttribute) continue;      // (a program without attributes: zeros)
+    if (t.attributes[k].slot == kTgsiNoAttribute || t.attributes[k].slot == kTgsiVertexId) continue;      // (zeros, or the vertex's number: below)
     const AttribInfo* info = nullptr;
     for (const auto& ai : p.attribs)
       if (ai->slot == t.attributes[k].slot) info = ai.get();
@@ -498,7 +538,9 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     const uint32_t index = static_cast<uint32_t>(tris[v]);
     for (uint32_t k = 0; k < nattr; ++k) {
       if (!attribs[k]) {
-        for (uint32_t i = 0; i < 4; ++i)
+        const uint32_t x = t.attributes[k].slot == kTgsiVertexId ? f2u(static_cast<float>(index)) : 0;
+        if (!vertices.put32(x)) return no("out of memory");
+        for (uint32_t i = 1; i < 4; ++i)
           if (!vertices.put32(0)) return no("out of memory");
         continue;
       }
@@ -567,7 +609,17 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   st.texture_count = static_cast<uint32_t>(t.samplers.count());
   if (st.texture_count > kAccelMaxTextures) return no("too many textures");
   for (uint32_t k = 0; k < st.texture_count; ++k) {
-    if (t.samplers[k].slot >= p.fs_shared.count() || !hw_texture(p.fs_shared[t.samplers[k].slot], &st.textures[k], &st.samplers[k])) return no("a texture the device cannot sample");
+    float params[16];
+    if (t.samplers[k].slot >= p.fs_shared.count() || !hw_texture(t.samplers[k], p.fs_shared[t.samplers[k].slot], &st.textures[k], &st.samplers[k], params))
+      return no("a texture the device cannot sample");
+    if (t.samplers[k].params < 0) continue;
+    const uint64_t at = uint64_t{static_cast<uint32_t>(t.samplers[k].params)} * 16;      // (its rows: after the uniforms were packed)
+    if (at + sizeof params > constants.size()) return no("a texture the device cannot sample");
+    ByteView rows = constants.writable_view().subview(at, sizeof params);
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t bits = f2u(params[i]);
+      for (uint32_t b = 0; b < 4; ++b) rows[uint64_t{i} * 4 + b] = static_cast<uint8_t>(bits >> (8 * b));
+    }
   }
   st.vp_x = static_cast<float>(vp_[0]) * ss;
   st.vp_y = static_cast<float>(vp_[1]) * ss;

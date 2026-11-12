@@ -64,6 +64,7 @@ struct DeviceLimits {
   uint32_t texture_units = kBaseTextureUnits;           // GraphicsPipelineDesc::texture_count, bind_texture units
   uint32_t color_targets = kBaseColorTargets;           // kFeatureMultipleTargets: colour images of a pass
   uint32_t vertex_buffers = kBaseVertexBuffers;         // bind_vertex_buffer_slot slots
+  uint32_t control_varyings = 0;                        // tessellation: the vectors of each control point from the hull to the domain stage (0: `varyings`)
 };
 
 // --- Resources ---------------------------------------------------------------

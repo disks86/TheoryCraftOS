@@ -44,6 +44,9 @@ struct ProgramRun {
   // Run the program on the in-kernel emulator even when it is for this machine's own CPU (to compare the two, or to run it without the CPU's user mode). A program for
   // any other CPU is always emulated.
   bool force_emulation = false;
+  // More environment variables ("NAME=value") after the standard ones; one of the same name replaces the standard one. (D-Bus's starter variables for a
+  // service the bus starts.)
+  ArrayView<const StringView> extra_environment;
 };
 
 enum class RunResult : uint8_t {
