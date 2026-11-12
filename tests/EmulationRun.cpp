@@ -492,11 +492,15 @@ int main(int argc, char** argv) {
   // what programs play on MIDI (the graph's bus): counted for the summary
   struct CountingSynth final : midi::IMidiSink {
     std::mutex m;
-    uint32_t messages = 0, note_ons = 0;
+    uint32_t messages = 0, note_ons = 0, sysex = 0;
     void send(uint8_t status, uint8_t, uint8_t d2) override {
       std::lock_guard<std::mutex> g(m);
       ++messages;
       if ((status & 0xF0) == 0x90 && d2) ++note_ons;
+    }
+    void send_sysex(ConstByteView message) override {
+      std::lock_guard<std::mutex> g(m);
+      if (message.size() == 22 && message[0] == 0xF0 && message[1] == 0x7D) ++sysex;      // (pwmedia's: 20 bytes between F0 and F7)
     }
     void reset() override {}
   } midi_synth;
@@ -729,7 +733,7 @@ int main(int argc, char** argv) {
   }
   {
     std::lock_guard<std::mutex> g(midi_synth.m);
-    printf("midi: %u messages to the synthesizer, %u note-ons\n", midi_synth.messages, midi_synth.note_ons);
+    printf("midi: %u messages to the synthesizer, %u note-ons, %u system exclusive\n", midi_synth.messages, midi_synth.note_ons, midi_synth.sysex);
   }
   graph.midi_bus().set_output(nullptr);
   delete second_program;

@@ -2761,10 +2761,80 @@ static void test_video_channel() {
   CHECK(frame && frame->sequence == 1 && frame->pts == 77 && frame->pixels.size() == 768);
   if (frame) CHECK(frame->pixels.view()[256 + 5] == uint8_t(10 + 5 % 7) && frame->pixels.view()[512 + 255] == uint8_t(20 + 255 % 7));
   VideoFormat bad = f;
-  bad.format = 2;      // (I420: not carried)
+  bad.format = 1;      // (SPA_VIDEO_FORMAT_ENCODED is not a raw format)
+  CHECK(!bad.valid());
+  bad.format = 21;     // (v210: not carried)
   CHECK(!bad.valid());
   bad = f; bad.width = 9000;
   CHECK(!bad.valid());
+  bad = f; bad.subtype = 0x2000D;      // (bayer)
+  CHECK(!bad.valid());
+  // the planes of YUV and grey formats (odd sizes round the chroma up)
+  VideoFormat yuv;
+  yuv.width = 5; yuv.height = 3;
+  yuv.format = 2;      // I420
+  CHECK(yuv.valid() && yuv.planes() == 3 && yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 2 && yuv.plane(2).stride_divisor == 2 &&
+        yuv.frame_bytes() == 15 + 6 + 6 && yuv.plane_offset(2) == 21 && yuv.plane(3).rows == 0);
+  yuv.format = 23;     // NV12
+  CHECK(yuv.planes() == 2 && yuv.plane(1).row_bytes == 6 && yuv.plane(1).rows == 2 && yuv.frame_bytes() == 15 + 12);
+  yuv.format = 4;      // YUY2
+  CHECK(yuv.planes() == 1 && yuv.row_bytes() == 12 && yuv.frame_bytes() == 36);
+  yuv.format = 18;     // Y42B
+  CHECK(yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 3);
+  yuv.format = 17;     // Y41B
+  CHECK(yuv.plane(1).row_bytes == 2 && yuv.plane(1).stride_divisor == 4);
+  yuv.format = 20;     // Y444
+  CHECK(yuv.frame_bytes() == 45);
+  yuv.format = 25;     // GRAY8
+  CHECK(yuv.frame_bytes() == 15);
+  yuv.format = 27;     // GRAY16_LE
+  CHECK(yuv.frame_bytes() == 30);
+  yuv.format = 29;     // RGB16
+  CHECK(yuv.frame_bytes() == 30);
+  // a planar frame published plane by plane, each at its own stride; one plane short is refused
+  VideoChannel planar(A);
+  VideoFormat i420;
+  i420.format = 2; i420.width = 6; i420.height = 4;
+  planar.set_format(i420);
+  std::vector<uint8_t> y(8 * 4, 0), u(4 * 2, 0), v(5 * 2, 0);
+  for (size_t k = 0; k < y.size(); ++k) y[k] = uint8_t(k);
+  for (size_t k = 0; k < u.size(); ++k) u[k] = uint8_t(100 + k);
+  for (size_t k = 0; k < v.size(); ++k) v[k] = uint8_t(200 + k);
+  const VideoPlaneData parts[3] = {{ConstByteView(y.data(), y.size()), 8}, {ConstByteView(u.data(), u.size()), 4}, {ConstByteView(v.data(), v.size()), 5}};
+  CHECK(!planar.publish(ArrayView<const VideoPlaneData>(parts, 2), 0));
+  const VideoPlaneData short_v[3] = {parts[0], parts[1], {ConstByteView(v.data(), 5 + 2), 5}};
+  CHECK(!planar.publish(ArrayView<const VideoPlaneData>(short_v, 3), 0));
+  CHECK(planar.publish(ArrayView<const VideoPlaneData>(parts, 3), 5));
+  SharedPointer<VideoFrame> pf = planar.latest();
+  CHECK(pf && pf->pixels.size() == 24 + 6 + 6);
+  if (pf) {
+    const ConstByteView px = pf->pixels.view();
+    CHECK(px[6] == 8 && px[23] == 29 && px[24] == 100 && px[27] == 104 && px[30] == 200 && px[33] == 205);
+  }
+  // encoded: frames of any length up to kMaxEncodedFrame, size unknown allowed
+  VideoChannel enc(A);
+  VideoFormat h264;
+  h264.subtype = 0x20001;
+  CHECK(h264.encoded() && h264.valid() && h264.frame_bytes() == 0 && h264.planes() == 0);
+  enc.set_format(h264);
+  const uint8_t nal[] = {0, 0, 0, 1, 0x65, 0x88, 0x84};
+  CHECK(enc.publish(ConstByteView(nal, sizeof nal), 0, 9) && enc.latest() && enc.latest()->pixels.size() == sizeof nal);
+  CHECK(!enc.publish(ConstByteView(), 0, 0));
+  // random planes against random formats: never a crash, a frame only when every plane fits
+  std::mt19937 rng(21);
+  std::vector<uint8_t> junk(4096, 0x5A);
+  const uint32_t formats[] = {2, 3, 4, 5, 6, 7, 15, 17, 18, 19, 20, 23, 24, 25, 26, 29, 32};
+  for (int round = 0; round < 2000; ++round) {
+    VideoChannel ch2(A);
+    VideoFormat ff;
+    ff.format = formats[rng() % (sizeof formats / sizeof formats[0])];
+    ff.width = 1 + rng() % 40; ff.height = 1 + rng() % 20;
+    ch2.set_format(ff);
+    VideoPlaneData pl[4];
+    for (VideoPlaneData& d : pl) d = VideoPlaneData{ConstByteView(junk.data(), rng() % junk.size()), uint32_t(rng() % 200)};
+    const bool ok = ch2.publish(ArrayView<const VideoPlaneData>(pl, 1 + rng() % 4), 0);
+    if (ok) CHECK(ch2.latest() && ch2.latest()->pixels.size() == ff.frame_bytes());
+  }
   ch.close();
   CHECK(ch.closed() && !ch.publish(ConstByteView(rows.data(), rows.size()), 300, 0) && ch.frames() == 1);
   // a producer and watchers at once: each frame a watcher takes is whole (every byte its sequence's)
@@ -2806,8 +2876,10 @@ static void test_video_channel() {
 
 // What the server has told a client node, gathered from its messages.
 struct NodeView {
-  struct Buf { uint32_t mem = 0, off = 0, size = 0; std::vector<std::pair<uint32_t, uint32_t>> metas; uint32_t dtype = 0; int32_t data = 0, dflags = 0, mapoff = 0, maxsize = 0; };
-  struct PortView { std::vector<uint8_t> format; bool use = false; int32_t flags = 0; std::vector<Buf> bufs; Fd io; uint32_t io_off = 0; uint32_t peer = 0; };
+  struct Data { uint32_t type = 0; int32_t data = 0, flags = 0, mapoff = 0, maxsize = 0; };
+  struct Buf { uint32_t mem = 0, off = 0, size = 0; std::vector<std::pair<uint32_t, uint32_t>> metas; uint32_t dtype = 0; int32_t data = 0, dflags = 0, mapoff = 0, maxsize = 0; std::vector<Data> datas; };
+  struct PortView { std::vector<uint8_t> format; bool use = false; int32_t flags = 0; std::vector<Buf> bufs; Fd io; uint32_t io_off = 0; uint32_t peer = 0; int uses = 0, formats = 0; };
+  std::vector<uint32_t> removed;      // (remove_mem)
   uint32_t id = 0, node = 0, activation_mem = 0;
   std::map<uint32_t, Fd> mems;
   Fd activation, wake;
@@ -2829,6 +2901,7 @@ struct NodeView {
         p.int32(&mem); p.id(&type); p.next(&v); v.get_fd(&fd);
         if (fd >= 0 && size_t(fd) < own.size()) mems[uint32_t(mem)] = own[size_t(fd)];
       }
+      if (m.id == 0 && m.opcode == 7) { int32_t mem = 0; if (p.int32(&mem)) removed.push_back(uint32_t(mem)); }
       if (m.id == 0 && m.opcode == 3) {      // error
         int32_t eid = 0; p.int32(&eid);
         if (uint32_t(eid) == id) ++errors;
@@ -2862,20 +2935,31 @@ struct NodeView {
         }
         case 7: {
           int32_t dir = 0, port = 0; uint32_t pid = 0; int32_t flags = 0; pod::Value v;
-          if (p.int32(&dir) && p.int32(&port) && p.id(&pid) && p.int32(&flags) && p.pod(&v) && pid == 4) ports[{dir, port}].format.assign(v.whole.data(), v.whole.data() + v.whole.size());
+          if (p.int32(&dir) && p.int32(&port) && p.id(&pid) && p.int32(&flags) && p.pod(&v) && pid == 4) {
+            ports[{dir, port}].format.assign(v.whole.data(), v.whole.data() + v.whole.size());
+            ++ports[{dir, port}].formats;
+          }
           break;
         }
         case 8: {
           int32_t dir, port, mix, flags, n;
           if (!p.int32(&dir) || !p.int32(&port) || !p.int32(&mix) || !p.int32(&flags) || !p.int32(&n)) break;
           PortView& pv = ports[{dir, port}];
-          pv.use = true; pv.flags = flags; pv.bufs.clear();
+          pv.use = true; pv.flags = flags; pv.bufs.clear(); ++pv.uses;
           for (int32_t i = 0; i < n; ++i) {
             Buf b; int32_t mem, off, size, nm, nd;
             if (!p.int32(&mem) || !p.int32(&off) || !p.int32(&size) || !p.int32(&nm)) break;
             b.mem = uint32_t(mem); b.off = uint32_t(off); b.size = uint32_t(size);
             for (int32_t k = 0; k < nm; ++k) { uint32_t t = 0; int32_t sz = 0; p.id(&t); p.int32(&sz); b.metas.push_back({t, uint32_t(sz)}); }
-            if (!p.int32(&nd) || !p.id(&b.dtype) || !p.int32(&b.data) || !p.int32(&b.dflags) || !p.int32(&b.mapoff) || !p.int32(&b.maxsize)) break;
+            if (!p.int32(&nd)) break;
+            bool good = true;
+            for (int32_t k = 0; k < nd && good; ++k) {
+              Data d;
+              good = p.id(&d.type) && p.int32(&d.data) && p.int32(&d.flags) && p.int32(&d.mapoff) && p.int32(&d.maxsize);
+              if (good) b.datas.push_back(d);
+            }
+            if (!good || b.datas.empty()) break;
+            b.dtype = b.datas[0].type; b.data = b.datas[0].data; b.dflags = b.datas[0].flags; b.mapoff = b.datas[0].mapoff; b.maxsize = b.datas[0].maxsize;
             pv.bufs.push_back(b);
           }
           break;
@@ -2955,9 +3039,19 @@ static void enum_video(pod::Builder& b, uint32_t w, uint32_t h, bool choice_of_f
   b.property(0x20004); b.fraction(25, 1);
   b.end(o);
 }
-static void buffers_param(pod::Builder& b, int32_t count, int32_t size, int32_t stride, uint32_t types) {
+// A video EnumFormat of one raw format (or, with `subtype`, an encoded one) and size.
+static void enum_video_fixed(pod::Builder& b, uint32_t format, uint32_t w, uint32_t h, uint32_t subtype = 1) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(2); b.property(2); b.id(subtype);
+  if (subtype == 1) { b.property(0x20001); b.id(format); }
+  b.property(0x20003); b.rectangle(w, h);
+  b.property(0x20004); b.fraction(30, 1);
+  b.end(o);
+}
+static void buffers_param(pod::Builder& b, int32_t count, int32_t size, int32_t stride, uint32_t types, int32_t blocks = 0) {
   const uint64_t o = b.begin_object(0x40004, 5);
   b.property(1); b.int32(count);
+  if (blocks) { b.property(2); b.int32(blocks); }
   b.property(3); b.int32(size);
   if (stride) { b.property(4); b.int32(stride); }
   if (types) { b.property(6); const uint64_t ch = b.begin_choice(4, pod::kInt); b.choice_value32(types); b.end(ch); }
@@ -3349,6 +3443,151 @@ static void test_client_node_media() {
     CHECK(vp.errors == 1);
   }
 
+  // ---- planes and a format change: an NV12 camera with a block a plane, a watcher with them one after another; then the camera says I420 at another
+  // size: both are given the new Format, their old memory is removed and new buffers come (I420: three blocks); then an MJPEG camera and its watcher
+  {
+    NodeView yc;
+    yc.id = 7;
+    create_node(c, 7, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "yuv-camera"}});
+    node_update(c, 7);
+    set_active(c, 7, true);
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 23, 8, 4); port_info(b, 0, {}); });
+    yc.absorb(c);
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 64, 8, 0, 2); meta_param(b, 1, 32); b.none(); });
+    yc.absorb(c);
+    NodeView::PortView& ycp = yc.ports[{1, 0}];
+    CHECK(ycp.use && ycp.bufs.size() == 2 && yc.starts == 1);
+    if (ycp.bufs.size() == 2) CHECK(ycp.bufs[0].datas.size() == 2 && ycp.bufs[0].datas[1].data >= ycp.bufs[0].datas[0].data + 32);
+    NodeView yw;
+    yw.id = 4;
+    create_node(w, 4, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
+    node_update(w, 4);
+    set_active(w, 4, true);
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 320, 240, true); port_info(b, 0, {}); });
+    yw.absorb(w);
+    CHECK(yw.ports[{0, 0}].format == ycp.format);
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    yw.absorb(w);
+    NodeView::PortView& ywp = yw.ports[{0, 0}];
+    CHECK(yw.starts == 1 && ywp.bufs.size() == 2 && ywp.bufs[0].datas.size() == 1 && ywp.bufs[0].maxsize >= 48);
+    // a frame: luma in block 0 (each byte its index), chroma in block 1 (100 + index), each its own chunk
+    auto produce = [&](NodeView& cam, uint32_t buffer, const std::vector<std::vector<uint8_t>>& planes, const std::vector<uint32_t>& strides) {
+      NodeView::PortView& cp = cam.ports[{1, 0}];
+      ByteView part = cam.buffer(1, 0, buffer);
+      const NodeView::Buf& bf = cp.bufs[buffer];
+      uint32_t meta_bytes = 0;
+      for (const auto& m : bf.metas) meta_bytes += (m.second + 7) & ~7u;
+      for (size_t k = 0; k < planes.size() && k < bf.datas.size(); ++k) {
+        memcpy(part.data() + bf.datas[k].data, planes[k].data(), planes[k].size());
+        put_u32(part, meta_bytes + 16 * uint32_t(k), 0); put_u32(part, meta_bytes + 16 * uint32_t(k) + 4, uint32_t(planes[k].size()));
+        put_u32(part, meta_bytes + 16 * uint32_t(k) + 8, strides[k]);
+      }
+      put_u32(cam.io(1, 0), 0, 2); put_u32(cam.io(1, 0), 4, buffer);
+    };
+    auto watched = [&](NodeView& view) -> std::vector<uint8_t> {      // (the watcher's buffer now, by its chunk; empty when none came)
+      if (u32_at(view.io(0, 0), 0) != 2) return {};
+      const uint32_t id = u32_at(view.io(0, 0), 4);
+      NodeView::PortView& vp2 = view.ports[{0, 0}];
+      if (id >= vp2.bufs.size()) return {};
+      ByteView part = view.buffer(0, 0, id);
+      uint32_t meta_bytes = 0;
+      for (const auto& m : vp2.bufs[id].metas) meta_bytes += (m.second + 7) & ~7u;
+      const uint32_t size = u32_at(part, meta_bytes + 4);
+      std::vector<uint8_t> out(part.data() + vp2.bufs[id].data, part.data() + vp2.bufs[id].data + size);
+      put_u32(view.io(0, 0), 0, 1);
+      put_u32(view.activation->memory(), 0, 3);
+      return out;
+    };
+    std::vector<uint8_t> luma(32), chroma(16);
+    for (size_t k = 0; k < 32; ++k) luma[k] = uint8_t(k);
+    for (size_t k = 0; k < 16; ++k) chroma[k] = uint8_t(100 + k);
+    if (yc.starts && yw.starts && ycp.bufs.size() == 2) {
+      put_u32(yw.activation->memory(), 0, 3);
+      produce(yc, 0, {luma, chroma}, {8, 8});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(yw);
+      CHECK(got.size() == 48 && got[31] == 31 && got[32] == 100 && got[47] == 115);
+    }
+    // the camera changes to I420 6 x 4
+    const uint32_t old_camera_mem = ycp.bufs.empty() ? 0 : ycp.bufs[0].mem, old_watcher_mem = ywp.bufs.empty() ? 0 : ywp.bufs[0].mem;
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); enum_video_fixed(b, 2, 6, 4); b.none(); });
+    yc.absorb(c);
+    CHECK(ycp.formats == 2 && ycp.uses == 1 && std::count(yc.removed.begin(), yc.removed.end(), old_camera_mem) == 1);
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 64, 6, 0, 3); meta_param(b, 1, 32); b.none(); });
+    yc.absorb(c);
+    CHECK(ycp.uses == 2 && ycp.bufs.size() == 2 && ycp.bufs[0].mem == old_camera_mem && yc.starts == 1);      // (the removed id, again: as the pool does)
+    if (ycp.bufs.size() == 2) CHECK(ycp.bufs[0].datas.size() == 3);
+    tick();
+    yw.absorb(w);
+    CHECK(ywp.formats == 2 && std::count(yw.removed.begin(), yw.removed.end(), old_watcher_mem) == 1);
+    {
+      VideoFormat now_format;
+      pod::Parser fp(ConstByteView(ywp.format.data(), ywp.format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) {
+          if (key == 0x20001) v.get_id(&now_format.format);
+          if (key == 0x20003 && v.type == pod::kRectangle) { ByteReader r(v.body); now_format.width = r.le32(); now_format.height = r.le32(); }
+        }
+      }
+      CHECK(now_format.format == 2 && now_format.width == 6 && now_format.height == 4);
+    }
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    yw.absorb(w);
+    CHECK(ywp.uses == 2 && ywp.bufs.size() == 2 && ywp.bufs[0].mem == old_watcher_mem);
+    if (ycp.bufs.size() == 2 && ywp.bufs.size() == 2) {
+      std::vector<uint8_t> y6(24), u3(6), v3(6);
+      for (size_t k = 0; k < 24; ++k) y6[k] = uint8_t(k);
+      for (size_t k = 0; k < 6; ++k) { u3[k] = uint8_t(50 + k); v3[k] = uint8_t(80 + k); }
+      put_u32(yw.activation->memory(), 0, 3);
+      produce(yc, 1, {y6, u3, v3}, {6, 3, 3});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(yw);
+      CHECK(got.size() == 36 && got[23] == 23 && got[24] == 50 && got[30] == 80 && got[35] == 85);
+      SharedPointer<VideoChannel> ych = g.video_of(yc.node);
+      CHECK(ych && ych->format().format == 2 && ych->latest() && ych->latest()->pixels.size() == 36);
+    }
+    // MJPEG: whole compressed frames of any length
+    NodeView mc;
+    mc.id = 8;
+    create_node(c, 8, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "mjpeg-camera"}});
+    node_update(c, 8);
+    set_active(c, 8, true);
+    c.send(8, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 16, 16, 0x20002); port_info(b, 0, {}); });
+    mc.absorb(c);
+    c.send(8, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 1000, 0, 0); b.none(); });
+    mc.absorb(c);
+    NodeView mw;
+    mw.id = 5;
+    create_node(w, 5, {{"media.class", "Stream/Input/Video"}, {"target.object", "mjpeg-camera"}});
+    node_update(w, 5);
+    set_active(w, 5, true);
+    w.send(5, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 16, 16, 0x20002); port_info(b, 0, {}); });
+    mw.absorb(w);
+    w.send(5, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 1000, 0, 0); b.none(); });
+    mw.absorb(w);
+    CHECK(mc.starts == 1 && mw.starts == 1 && mw.ports[{0, 0}].format == mc.ports[{1, 0}].format);
+    if (mc.starts && mw.starts) {
+      std::vector<uint8_t> jpeg(300);
+      for (size_t k = 0; k < jpeg.size(); ++k) jpeg[k] = uint8_t(k * 3);
+      jpeg[0] = 0xFF; jpeg[1] = 0xD8;
+      put_u32(mw.activation->memory(), 0, 3);
+      produce(mc, 0, {jpeg}, {0});
+      tick();
+      tick(40);
+      CHECK(watched(mw) == jpeg);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(4); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(5); });
+    c.take_with_fds();
+    w.take_with_fds();
+  }
+
   // ---- an audio driver follows the server's clock: its position is an activation of the server's, and it is triggered as any other
   {
     NodeView ad;
@@ -3522,13 +3761,24 @@ static void test_client_node_media() {
     const uint32_t op = round % 3 == 0 ? 6u : 3u;
     if (op == 3) {
       b.int32(round % 2); b.int32(int32_t(rng() % 3)); b.int32(3); b.int32(3);
-      if (round % 3 == 1) enum_video(b, 1 + rng() % 64, 1 + rng() % 64); else enum_control(b);
-      buffers_param(b, int32_t(rng() % 20), int32_t(rng() % 100000), int32_t(rng() % 4096), uint32_t(rng() % 32));
+      if (round % 3 == 1) {
+        static const uint32_t raw[] = {2, 4, 12, 17, 18, 20, 23, 25};
+        if (round % 4 == 1) enum_video(b, 1 + rng() % 64, 1 + rng() % 64);
+        else if (round % 4 == 3) enum_video_fixed(b, 0, rng() % 64, rng() % 64, 0x20001 + rng() % 16);
+        else enum_video_fixed(b, raw[rng() % 8], 1 + rng() % 64, 1 + rng() % 64);
+      } else {
+        enum_control(b);
+      }
+      buffers_param(b, int32_t(rng() % 20), int32_t(rng() % 100000), int32_t(rng() % 4096), uint32_t(rng() % 32), int32_t(rng() % 6));
       meta_param(b, rng() % 10, int32_t(rng() % 200000));
       port_info(b, rng() % 8, {{"control.ump", "true"}});
     } else {
       b.int32(1); b.int32(0); b.int32(-1); b.int32(2);
-      for (int k = 0; k < 2; ++k) { b.int32(1); b.id(2); b.fd(k); b.int32(3); b.int32(int32_t(rng() % 8192)); b.int32(int32_t(rng() % 8192)); }
+      for (int k = 0; k < 2; ++k) {
+        const int datas = 1 + int(rng() % 3);
+        b.int32(datas);
+        for (int d = 0; d < datas; ++d) { b.id(2); b.fd(k); b.int32(3); b.int32(int32_t(rng() % 8192)); b.int32(int32_t(rng() % 8192)); }
+      }
     }
     b.end(f);
     std::vector<uint8_t> m(body.view().data(), body.view().data() + body.size());

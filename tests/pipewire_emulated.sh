@@ -213,7 +213,7 @@ PY
     grep -q "\[exit=0 faulted=0" "$work/run-pwmidi.out" && grep -q "midi: 24 messages to the synthesizer, 12 note-ons" "$work/run-pwmidi.out" &&
       echo "ok   pw-cat --midi (libpipewire) played its 12 notes on the synthesizer" || { echo "FAIL pw-cat --midi"; fail=1; }
     if [ $have_pwmedia -eq 1 ]; then
-      for mode in video video-alloc midi adapter; do
+      for mode in video video-alloc video-yuv midi adapter; do
         TCOS_EMU_ARGS="$mode" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$work/pwmedia" "$work/sys32" > "$work/run-pwmedia-$mode.out" 2>&1 || true
         grep -E "^pwmedia:|exit=" "$work/run-pwmedia-$mode.out"
         grep -q "pwmedia: $mode ok" "$work/run-pwmedia-$mode.out" && grep -q "\[exit=0 faulted=0" "$work/run-pwmedia-$mode.out" || { echo "FAIL pwmedia $mode"; fail=1; }

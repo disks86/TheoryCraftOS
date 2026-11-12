@@ -99,7 +99,7 @@ class NativeServer final : public IProtocolServer {
     ByteBuffer enum_format;        // its first EnumFormat as it came (fixated into its Format)
     bool format_sent = false, buffers_sent = false, data_ready = false, wants_alloc = false;
     // what its Buffers and Meta params ask for (0: not said)
-    uint32_t wanted_buffers = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
+    uint32_t wanted_buffers = 0, wanted_blocks = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
     struct Meta {
       uint32_t type = 0, size = 0, offset = 0;      // offset: in each buffer's part
     };
@@ -111,12 +111,15 @@ class NativeServer final : public IProtocolServer {
     // its buffers: in one memfd of the server's, n parts of `buffer_stride`: the metas, the chunk, then the data (unless the client gives the data)
     Fd buffers;
     uint32_t buffers_mem = 0, n_buffers = 0, buffer_stride = 0, chunk_offset = 0, data_offset = 0, data_size = 0, data_type = 0;
+    uint32_t blocks = 1;           // data blocks of each buffer (video: one a plane, as the port asks; else 1), each with its chunk (chunk_offset + 16 k) and
+                                   // its data (data_offset + data_size k)
+    bool renegotiate = false;      // its format is to change (the program's new EnumFormat, or a watcher's producer's new format): Format and buffers again
     bool alloc = false;            // the client allocates the data (port_use_buffers ALLOC, answered with port_buffers)
     struct ClientData {
       Fd fd;
       uint32_t mapoffset = 0, maxsize = 0;
     };
-    List<ClientData> client_data;  // (alloc) each buffer's data, as port_buffers gave it
+    List<ClientData> client_data;  // (alloc) each buffer's data blocks, as port_buffers gave them (buffer i's block k at i * blocks + k)
     uint32_t next_buffer = 0;
     uint64_t seq = 0;              // the SPA_META_Header seq the server writes next
     uint64_t video_seen = 0;       // (a watcher) the producer's last frame given
@@ -149,7 +152,8 @@ class NativeServer final : public IProtocolServer {
     uint32_t activation_mem = 0, io_mem = 0, driver_mem = 0;
     uint64_t position = 0, cycles = 0, triggered_at = 0;
     uint64_t next_cycle_ns = 0;    // clocked nodes (MIDI, video, virtual sinks): when the next cycle is due
-    uint64_t cycle_ns = 0;         // the time of the round being run (run_client_node): MIDI offsets are counted from it
+    uint64_t cycle_ns = 0;
+    bool renegotiate = false;      // a port's format is to change (ClientPort::renegotiate): the next tick sees to it         // the time of the round being run (run_client_node): MIDI offsets are counted from it
     uint32_t seen_cycle = 0;       // (driving) the program's cycle counter when last looked at
     // The adapter's port format (F32 at the stream's own rate and channels when its EnumFormat names them) and the frames of a cycle (its node.latency).
     PcmFormat format{SampleFormat::F32Le, 48000, 2};
@@ -179,7 +183,7 @@ class NativeServer final : public IProtocolServer {
     bool linger = false;
   };
   struct Client {
-    explicit Client(allocators::IAllocator& a) : inbox(a), outbox(a), resources(a), known(a), nodes(a), out_fds(a), in_fds(a), message_in_fds(a) {}
+    explicit Client(allocators::IAllocator& a) : inbox(a), outbox(a), resources(a), known(a), nodes(a), out_fds(a), in_fds(a), message_in_fds(a), free_mem_ids(a) {}
     uint32_t handle = 0;
     uint64_t pid = 0;
     uint32_t graph_client = 0;
@@ -197,6 +201,7 @@ class NativeServer final : public IProtocolServer {
     uint64_t message_start = 0;    // the message being written, and the descriptors it has so far
     uint32_t message_fds = 0;
     uint32_t next_mem_id = 0;
+    List<uint32_t> free_mem_ids;   // memory ids removed (remove_mem): the program's pool gives them out again, the last removed first (as pw_map does)
     List<Fd> in_fds;               // descriptors that came and no message has taken yet
     List<Fd> message_in_fds;       // the message being handled's descriptors (a POD Fd is an index into these)
   };
@@ -246,8 +251,13 @@ class NativeServer final : public IProtocolServer {
   void send_driver_position(Client& c, ClientNode& n);
   void maybe_start(Client& c, ClientNode& n);
   bool consume_output(ClientNode& n, ClientPort& p);
+  void publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts);
   bool fill_input(ClientNode& n, ClientPort& p);
-  ByteView buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize);
+  ByteView buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize, uint32_t block = 0);
+  ByteView buffer_chunk(ClientPort& p, uint32_t id, uint32_t block = 0);
+  void drop_port_buffers(Client& c, ClientPort& p);
+  uint32_t new_mem_id(Client& c);
+  void renegotiate(Client& c, ClientNode& n);
   void write_header_meta(ClientPort& p, uint32_t id, int64_t pts);
   bool buffer_busy(ClientPort& p, uint32_t id);
   bool cycle_due(ClientNode& n, uint64_t now_ns);

@@ -22,8 +22,12 @@
 //                (pw_stream video input, target.object the camera) in one program: the watcher must see the camera's frames whole and in order;
 //   video-alloc  the same with the camera allocating its own buffers (PW_STREAM_FLAG_ALLOC_BUFFERS: memfds it makes, given to the server with
 //                port_buffers);
-//   midi         a pw_filter MIDI output (8 bit raw midi) playing 16 notes and a pw_stream MIDI input: the input must hear them through the server's MIDI
-//                bus (the emulator counts what reached its synthesizer);
+//   video-yuv    the camera in NV12 with a data block a plane, the watcher with the planes one after another in one block; once the watcher has seen
+//                some frames the camera says it is I420 at another size now (pw_stream_update_params): both are negotiated again while streaming, and
+//                the watcher must see the I420 frames too;
+//   midi         a pw_filter MIDI output (8 bit raw midi) playing 16 notes (on at the cycle's start, the last one's off half way through) and a 22-byte
+//                system exclusive message, and a pw_stream MIDI input: the input must hear the notes and the sysex whole through the server's MIDI bus,
+//                its controls in order, some past the cycle's start (the emulator counts what reached its synthesizer);
 //   adapter      a virtual sink made with the adapter factory (support.null-audio-sink), a stream (PW_STREAM_FLAG_DRIVER: an audio driver, which the
 //                server makes follow its clock) playing 500 Hz into it and a stream recording from it: the recording must hold the tone.
 // Prints "pwmedia: <mode> ok ..." or "pwmedia: <mode> FAILED ...", and ends with 0 when it passed.
@@ -64,6 +68,12 @@ struct data {
   uint32_t produced;
   uint32_t seen, bad, last_frame;
   int camera_stride;
+  // video-yuv
+  int yuv;
+  uint32_t cam_format, cam_w, cam_h;      // the camera's Format now
+  uint32_t watch_format, watch_w, watch_h;
+  uint32_t nv12_seen, i420_seen;
+  int switch_now, switched;
   // midi
   struct pw_filter* filter;
   void* midi_port;
@@ -71,6 +81,9 @@ struct data {
   struct spa_hook midi_in_listener;
   uint32_t notes_sent, notes_heard;
   uint32_t heard_mask;
+  int sysex_sent, sysex_heard, offsets_bad, offsets_later;
+  uint8_t ump_sysex[64];
+  uint32_t ump_sysex_len;
   // adapter
   struct pw_proxy* sink;
   struct spa_hook sink_listener;
@@ -109,14 +122,24 @@ static void camera_param_changed(void* userdata, uint32_t id, const struct spa_p
   if (param == NULL || id != SPA_PARAM_Format) return;
   struct spa_video_info_raw info;
   if (spa_format_video_raw_parse(param, &info) < 0) return;
+  d->cam_format = info.format;
+  d->cam_w = info.size.width;
+  d->cam_h = info.size.height;
   d->camera_stride = SPA_ROUND_UP_N(info.size.width * 4, 4);
+  int blocks = 1, size = d->camera_stride * (int)info.size.height;
+  if (d->yuv) {
+    // a block a plane, each the luma's size at most; the luma's stride
+    d->camera_stride = (int)info.size.width;
+    blocks = info.format == SPA_VIDEO_FORMAT_NV12 ? 2 : 3;
+    size = d->camera_stride * (int)info.size.height;
+  }
   uint8_t buffer[1024];
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
   const struct spa_pod* params[2];
   params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
       SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
-      SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-      SPA_PARAM_BUFFERS_size, SPA_POD_Int(d->camera_stride * (int)info.size.height),
+      SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
+      SPA_PARAM_BUFFERS_size, SPA_POD_Int(size),
       SPA_PARAM_BUFFERS_stride, SPA_POD_Int(d->camera_stride),
       SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(d->alloc ? (1 << SPA_DATA_MemFd) : ((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
   params[1] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
@@ -162,12 +185,35 @@ static void camera_remove_buffer(void* userdata, struct pw_buffer* buffer) {
   if (sd->fd >= 0) close((int)sd->fd);
 }
 
+// (video-yuv) a frame's planes: luma row y = frame + y, chroma row y = frame * 3 + y
+static void camera_yuv(struct data* d, struct spa_buffer* buf, uint32_t frame) {
+  const uint32_t w = d->cam_w, h = d->cam_h, cw = (w + 1) / 2, ch = (h + 1) / 2;
+  const int nv12 = d->cam_format == SPA_VIDEO_FORMAT_NV12;
+  const uint32_t planes = nv12 ? 2 : 3;
+  if (buf->n_datas < planes) return;
+  for (uint32_t k = 0; k < planes; ++k) {
+    uint8_t* p = buf->datas[k].data;
+    if (p == NULL) return;
+    const uint32_t row = k == 0 ? w : nv12 ? cw * 2 : cw, rows = k == 0 ? h : ch;
+    if (buf->datas[k].maxsize < row * rows) return;
+    for (uint32_t y = 0; y < rows; ++y) memset(p + y * row, (int)((k == 0 ? frame : frame * 3) + y) & 0xFF, row);
+    buf->datas[k].chunk->offset = 0;
+    buf->datas[k].chunk->size = row * rows;
+    buf->datas[k].chunk->stride = (int32_t)row;
+  }
+}
+
 // a frame: blue = the frame's number, green = the row, red = the column
 static void camera_process(void* userdata) {
   struct data* d = userdata;
   struct pw_buffer* b = pw_stream_dequeue_buffer(d->camera);
   if (b == NULL) return;
   struct spa_buffer* buf = b->buffer;
+  if (d->yuv) {
+    if (d->produced < 4 * CAMERA_FRAMES) camera_yuv(d, buf, ++d->produced);
+    pw_stream_queue_buffer(d->camera, b);
+    return;
+  }
   uint8_t* p = buf->datas[0].data;
   if (p != NULL && d->produced < CAMERA_FRAMES) {
     const uint32_t frame = ++d->produced;
@@ -216,6 +262,20 @@ static const struct pw_stream_events camera_events = {
 static void on_timer(void* userdata, uint64_t expirations) {
   struct data* d = userdata;
   (void)expirations;
+  if (d->switch_now && !d->switched) {
+    // (video-yuv) the camera says another format: I420 at 40 x 30
+    d->switched = 1;
+    uint8_t buffer[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
+    const struct spa_pod* params[1];
+    params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_I420),
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE(40, 30)),
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(25, 1)));
+    pw_stream_update_params(d->camera, params, 1);
+  }
   if (d->camera && pw_stream_is_driving(d->camera)) pw_stream_trigger_process(d->camera);
 }
 
@@ -224,6 +284,28 @@ static void watcher_param_changed(void* userdata, uint32_t id, const struct spa_
   if (param == NULL || id != SPA_PARAM_Format) return;
   struct spa_video_info_raw info;
   if (spa_format_video_raw_parse(param, &info) < 0) return;
+  d->watch_format = info.format;
+  d->watch_w = info.size.width;
+  d->watch_h = info.size.height;
+  if (d->yuv) {
+    const int nv12 = info.format == SPA_VIDEO_FORMAT_NV12 && info.size.width == W && info.size.height == H;
+    const int i420 = info.format == SPA_VIDEO_FORMAT_I420 && info.size.width == 40 && info.size.height == 30;
+    if (!nv12 && !i420) {
+      char what[128];
+      snprintf(what, sizeof what, "(the watcher was offered format %u %ux%u)", info.format, info.size.width, info.size.height);
+      finish(d, 0, what);
+      return;
+    }
+    uint8_t buffer[512];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
+    const struct spa_pod* params[1];
+    params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 8),
+        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
+        SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)(info.size.width * info.size.height * 2)));
+    pw_stream_update_params(d->watcher, params, 1);
+    return;
+  }
   if (info.format != SPA_VIDEO_FORMAT_BGRA || info.size.width != W || info.size.height != H) {
     char what[128];
     snprintf(what, sizeof what, "(the watcher was offered format %u %ux%u)", info.format, info.size.width, info.size.height);
@@ -243,9 +325,54 @@ static void watcher_param_changed(void* userdata, uint32_t id, const struct spa_
   pw_stream_update_params(d->watcher, params, 2);
 }
 
+// (video-yuv) a frame in one block: the luma, then the chroma (NV12: one plane at the luma's stride; I420: two at half of it)
+static void watch_yuv(struct data* d, struct spa_buffer* buf) {
+  const uint8_t* p = buf->datas[0].data;
+  const struct spa_chunk* chunk = buf->datas[0].chunk;
+  const uint32_t w = d->watch_w, h = d->watch_h, ch = (h + 1) / 2;
+  const int nv12 = d->watch_format == SPA_VIDEO_FORMAT_NV12;
+  const uint32_t stride = chunk->stride > 0 ? (uint32_t)chunk->stride : w;
+  const uint32_t cstride = nv12 ? stride : (stride + 1) / 2, crow = nv12 ? ((w + 1) / 2) * 2 : (w + 1) / 2;
+  const uint32_t total = stride * h + cstride * ch * (nv12 ? 1 : 2);
+  if (p == NULL || chunk->size < stride * (h - 1) + w || chunk->offset > buf->datas[0].maxsize || buf->datas[0].maxsize - chunk->offset < total) {
+    ++d->bad;
+    return;
+  }
+  p += chunk->offset;
+  const uint8_t frame = p[0];
+  int whole = 1;
+  for (uint32_t y = 0; y < h && whole; ++y)
+    for (uint32_t x = 0; x < w; x += 3)
+      if (p[y * stride + x] != (uint8_t)(frame + y)) { whole = 0; break; }
+  for (uint32_t plane = 0; plane < (nv12 ? 1u : 2u) && whole; ++plane) {
+    const uint8_t* c = p + stride * h + plane * cstride * ch;
+    for (uint32_t y = 0; y < ch && whole; ++y)
+      for (uint32_t x = 0; x < crow; x += 2)
+        if (c[y * cstride + x] != (uint8_t)(frame * 3 + y)) { whole = 0; break; }
+  }
+  if (!whole) { ++d->bad; return; }
+  if (nv12) ++d->nv12_seen;
+  else ++d->i420_seen;
+  ++d->seen;
+  if (d->nv12_seen >= 6) d->switch_now = 1;
+}
+
 static void watcher_process(void* userdata) {
   struct data* d = userdata;
   struct pw_buffer* b;
+  if (d->yuv) {
+    while ((b = pw_stream_dequeue_buffer(d->watcher)) != NULL) {
+      watch_yuv(d, b->buffer);
+      pw_stream_queue_buffer(d->watcher, b);
+    }
+    if (d->i420_seen >= 6) {
+      char what[200];
+      snprintf(what, sizeof what, "(%u NV12 frames at %ux%u in two blocks, then %u I420 at 40x30 in three after the camera changed format; %u produced, %u bad)",
+               d->nv12_seen, W, H, d->i420_seen, d->produced, d->bad);
+      finish(d, d->bad == 0, what);
+    }
+    return;
+  }
   while ((b = pw_stream_dequeue_buffer(d->watcher)) != NULL) {
     struct spa_buffer* buf = b->buffer;
     const uint8_t* p = buf->datas[0].data;
@@ -292,7 +419,7 @@ static int run_video(struct data* d) {
   params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
       SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
       SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-      SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRA),
+      SPA_FORMAT_VIDEO_format, SPA_POD_Id(d->yuv ? SPA_VIDEO_FORMAT_NV12 : SPA_VIDEO_FORMAT_BGRA),
       SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(W, H), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(4096, 4096)),
       SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&SPA_FRACTION(25, 1)));
   pw_stream_add_listener(d->camera, &d->camera_listener, &camera_events, d);
@@ -303,10 +430,11 @@ static int run_video(struct data* d) {
   spa_pod_builder_init(&b, buffer, sizeof buffer);
   d->watcher = pw_stream_new(d->core, "tcos-watcher",
                              pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_TARGET_OBJECT, "tcos-camera", NULL));
+  const uint32_t first = d->yuv ? SPA_VIDEO_FORMAT_NV12 : SPA_VIDEO_FORMAT_BGRA, second = d->yuv ? SPA_VIDEO_FORMAT_I420 : SPA_VIDEO_FORMAT_RGBA;
   params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
       SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
       SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-      SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA),
+      SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, first, first, second),
       SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&SPA_RECTANGLE(320, 240), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(4096, 4096)),
       SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(25, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)));
   pw_stream_add_listener(d->watcher, &d->watcher_listener, &watcher_events, d);
@@ -337,9 +465,17 @@ static void midi_out_process(void* userdata, struct spa_io_position* position) {
     uint8_t on[3] = {0x90, (uint8_t)(60 + d->notes_sent), 100};
     spa_pod_builder_control(&builder, 0, SPA_CONTROL_Midi);
     spa_pod_builder_bytes(&builder, on, 3);
+    if (d->notes_sent == 3 && !d->sysex_sent) {
+      uint8_t sx[22] = {0xF0, 0x7D};
+      for (int k = 2; k < 21; ++k) sx[k] = (uint8_t)k;
+      sx[21] = 0xF7;
+      spa_pod_builder_control(&builder, 200, SPA_CONTROL_Midi);
+      spa_pod_builder_bytes(&builder, sx, sizeof sx);
+      d->sysex_sent = 1;
+    }
     if (d->notes_sent > 0) {
       uint8_t off[3] = {0x80, (uint8_t)(59 + d->notes_sent), 0};
-      spa_pod_builder_control(&builder, 10, SPA_CONTROL_Midi);
+      spa_pod_builder_control(&builder, 512, SPA_CONTROL_Midi);
       spa_pod_builder_bytes(&builder, off, 3);
     }
     ++d->notes_sent;
@@ -372,24 +508,43 @@ static void midi_in_process(void* userdata) {
       struct spa_pod* pod = spa_pod_from_data(sd->data, sd->maxsize, sd->chunk->offset, sd->chunk->size);
       if (pod && spa_pod_is_sequence(pod)) {
         struct spa_pod_control* c;
+        uint32_t last = 0;
         SPA_POD_SEQUENCE_FOREACH((struct spa_pod_sequence*)pod, c) {
           const uint8_t* bytes = SPA_POD_BODY(&c->value);
           const uint32_t size = SPA_POD_BODY_SIZE(&c->value);
-          if (c->type == SPA_CONTROL_Midi && size >= 2) midi_heard(d, bytes[0], bytes[1]);
-          if (c->type == SPA_CONTROL_UMP && size >= 4) {
-            uint32_t w;
-            memcpy(&w, bytes, 4);
-            if ((w >> 28) == 2 || (w >> 28) == 4) midi_heard(d, (uint8_t)(w >> 16), (uint8_t)(w >> 8) & 0x7F);
+          if (c->offset < last || c->offset >= 8192) ++d->offsets_bad;
+          if (c->offset > 0) ++d->offsets_later;
+          last = c->offset;
+          if (c->type == SPA_CONTROL_Midi && size == 22 && bytes[0] == 0xF0 && bytes[1] == 0x7D && bytes[20] == 20 && bytes[21] == 0xF7) ++d->sysex_heard;
+          else if (c->type == SPA_CONTROL_Midi && size >= 2) midi_heard(d, bytes[0], bytes[1]);
+          if (c->type == SPA_CONTROL_UMP) {
+            for (uint32_t at = 0; at + 4 <= size;) {
+              uint32_t w;
+              memcpy(&w, bytes + at, 4);
+              const uint32_t type = w >> 28;
+              if (type == 2 || type == 4) midi_heard(d, (uint8_t)(w >> 16), (uint8_t)(w >> 8) & 0x7F);
+              if (type == 3 && at + 8 <= size) {      // (a piece of system exclusive: put back together)
+                uint32_t w1;
+                memcpy(&w1, bytes + at + 4, 4);
+                const uint32_t status = (w >> 20) & 0xF, count = (w >> 16) & 0xF;
+                const uint8_t piece[6] = {(uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(w1 >> 24), (uint8_t)(w1 >> 16), (uint8_t)(w1 >> 8), (uint8_t)w1};
+                if (status <= 1) d->ump_sysex_len = 0;
+                for (uint32_t k = 0; k < count && k < 6 && d->ump_sysex_len < sizeof d->ump_sysex; ++k) d->ump_sysex[d->ump_sysex_len++] = piece[k];
+                if ((status == 0 || status == 3) && d->ump_sysex_len == 20 && d->ump_sysex[0] == 0x7D && d->ump_sysex[19] == 20) ++d->sysex_heard;
+              }
+              at += type >= 3 && type <= 4 ? 8 : 4;
+            }
           }
         }
       }
     }
     pw_stream_queue_buffer(d->midi_in, b);
   }
-  if (d->notes_heard == NOTES) {
-    char what[96];
-    snprintf(what, sizeof what, "(%u notes played by a pw_filter, all %u heard by a pw_stream)", d->notes_sent, d->notes_heard);
-    finish(d, 1, what);
+  if (d->notes_heard == NOTES && d->sysex_heard) {
+    char what[200];
+    snprintf(what, sizeof what, "(%u notes and a system exclusive message played by a pw_filter, all %u and the sysex heard by a pw_stream; offsets %s, %d past "
+             "the cycle's start)", d->notes_sent, d->notes_heard, d->offsets_bad ? "OUT OF ORDER" : "in order", d->offsets_later);
+    finish(d, d->offsets_bad == 0 && d->offsets_later > 0 && d->sysex_heard == 1, what);
   }
 }
 
@@ -535,6 +690,7 @@ int main(int argc, char** argv) {
   d.result = -1;
   d.mode = argc > 1 ? argv[1] : "video";
   d.alloc = strcmp(d.mode, "video-alloc") == 0;
+  d.yuv = strcmp(d.mode, "video-yuv") == 0;
   pw_init(&argc, &argv);
   d.loop = pw_main_loop_new(NULL);
   d.context = pw_context_new(pw_main_loop_get_loop(d.loop), NULL, 0);

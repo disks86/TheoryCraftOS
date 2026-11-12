@@ -273,7 +273,12 @@ int main(int argc, char** argv) {
   struct CountingSynth final : midi::IMidiSink {
     std::mutex m;
     std::vector<uint32_t> notes;
+    uint32_t sysex = 0;
     void send(uint8_t status, uint8_t d1, uint8_t d2) override { std::lock_guard<std::mutex> g(m); notes.push_back(uint32_t(status) << 16 | uint32_t(d1) << 8 | d2); }
+    void send_sysex(ConstByteView message) override {
+      std::lock_guard<std::mutex> g(m);
+      if (message.size() == 22 && message[0] == 0xF0 && message[1] == 0x7D) ++sysex;      // (pwmedia's: 20 bytes between F0 and F7)
+    }
     void reset() override {}
   } synth;
   graph.midi_bus().set_output(&synth);
@@ -380,7 +385,7 @@ int main(int argc, char** argv) {
     std::lock_guard<std::mutex> g(synth.m);
     uint32_t on = 0;
     for (uint32_t n : synth.notes) on += (n >> 16 & 0xF0) == 0x90;
-    fprintf(stderr, "pipewire-host: midi: %zu messages to the synthesizer, %u note-ons\n", synth.notes.size(), on);
+    fprintf(stderr, "pipewire-host: midi: %zu messages to the synthesizer, %u note-ons, %u system exclusive\n", synth.notes.size(), on, synth.sysex);
   }
   graph.midi_bus().set_output(nullptr);
   for (Conn& c : conns) { c.protocol->close_client(c.client); close(c.fd); }

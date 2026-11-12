@@ -141,7 +141,7 @@ PY"
 # lingering virtual sink) and pw-play / pw-record aimed at it
 if pkg-config --exists libpipewire-0.3 && command -v pw-midiplay >/dev/null; then
   gcc -O1 -g -Wall -Wextra -o "$work/pwmedia" tests/linux/pwmedia.c $(pkg-config --cflags --libs libpipewire-0.3) -lm
-  for mode in video video-alloc midi adapter; do
+  for mode in video video-alloc video-yuv midi adapter; do
     check "pwmedia $mode" "timeout 30 '$work/pwmedia' $mode 2> '$work/pwmedia-$mode.log' | tee -a '$work/pwmedia.out' | grep -q 'pwmedia: $mode ok'"
   done
   python3 - "$work/song.mid" <<'PY'
@@ -197,6 +197,7 @@ assert 6500 < best < 7500
 PY"
 if [ -f "$work/pwmedia" ]; then
   check "the synthesizer heard pw-midiplay's 12 notes and pwmedia's 16" "grep -q 'midi: [0-9]* messages to the synthesizer, 28 note-ons' '$work/server.log'"
+  check "the synthesizer got pwmedia's system exclusive message whole" "grep -q 'midi: [0-9]* messages to the synthesizer, [0-9]* note-ons, 1 system exclusive' '$work/server.log'"
 fi
 grep -q "ERROR: AddressSanitizer\|runtime error" "$work/server.log" && { echo "FAIL sanitizer report in the server"; fail=1; }
 exit $fail

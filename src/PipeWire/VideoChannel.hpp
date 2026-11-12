@@ -29,29 +29,52 @@
 
 namespace pipewire {
 
-// A raw video format as PipeWire says it (spa/param/video/raw.h): the SPA format id, the size and the frame rate.
+// One plane of a raw frame: its rows of row_bytes; a plane after the first in one block has the first's stride divided by stride_divisor (rounded up).
+struct VideoPlane {
+  uint32_t row_bytes = 0, rows = 0, stride_divisor = 1;
+};
+
+// A video format as PipeWire says it (spa/param/video/raw.h, spa/param/format.h): raw (the SPA format id, the size, the frame rate) or encoded (the
+// media subtype: H.264, MJPEG, VP8, VP9, H.265, ...; its frames are whole compressed pictures of any length).
 struct VideoFormat {
   static constexpr uint32_t kMaxSide = 8192;
-  uint32_t format = 0;          // SPA_VIDEO_FORMAT_* (RGBx 7 .. BGR 16: the packed RGB ones are carried)
-  uint32_t width = 0, height = 0;
+  static constexpr uint32_t kMaxPlanes = 4;
+  static constexpr uint32_t kSubtypeRaw = 1;
+  static constexpr uint64_t kMaxEncodedFrame = 16u << 20;
+  uint32_t subtype = kSubtypeRaw;      // SPA_MEDIA_SUBTYPE_raw, or an encoded one (SPA_MEDIA_SUBTYPE_h264 ...)
+  uint32_t format = 0;          // (raw) SPA_VIDEO_FORMAT_*: packed RGB, packed and planar YUV, grey (see planes())
+  uint32_t width = 0, height = 0;      // (encoded: may be 0, unknown)
   uint32_t rate_num = 0, rate_den = 1;
-  // Bytes a pixel takes (0: not a packed RGB format this server carries).
-  uint32_t pixel_bytes() const;
-  // The bytes of one row with no padding (0 when not valid).
-  uint32_t row_bytes() const { return valid() ? width * pixel_bytes() : 0; }
-  uint64_t frame_bytes() const { return uint64_t{row_bytes()} * height; }
-  bool valid() const { return pixel_bytes() != 0 && width >= 1 && height >= 1 && width <= kMaxSide && height <= kMaxSide; }
+  bool encoded() const { return subtype != kSubtypeRaw; }
+  // (raw) How many planes and what each is (0 planes: not a format this server carries).
+  uint32_t planes() const;
+  VideoPlane plane(uint32_t index) const;
+  // (raw) The bytes of the first plane's row with no padding (0 when not valid).
+  uint32_t row_bytes() const { return valid() && !encoded() ? plane(0).row_bytes : 0; }
+  // (raw) A whole frame with no padding, its planes one after another; 0 for encoded video.
+  uint64_t frame_bytes() const;
+  uint64_t plane_offset(uint32_t index) const;      // (raw) where a plane starts in such a frame
+  bool valid() const;
   bool operator==(const VideoFormat& o) const {
-    return format == o.format && width == o.width && height == o.height && rate_num == o.rate_num && rate_den == o.rate_den;
+    return subtype == o.subtype && format == o.format && width == o.width && height == o.height && rate_num == o.rate_num && rate_den == o.rate_den;
   }
 };
+
+// Whether a media subtype is an encoded video one this server carries.
+bool is_encoded_video_subtype(uint32_t subtype);
 
 struct VideoFrame {
   explicit VideoFrame(allocators::IAllocator& allocator) : pixels(allocator) {}
   VideoFormat format;
-  ByteBuffer pixels;            // rows of format.row_bytes(), no padding
+  ByteBuffer pixels;            // raw: the planes with no padding, one after another (format.plane_offset()); encoded: the frame's bytes
   uint64_t sequence = 0;        // 1 for the first frame published, then one more each frame
   int64_t pts = 0;              // the producer's time stamp (its SPA_META_Header pts), 0 if it said none
+};
+
+// Where a plane of a frame to publish is: its bytes, from its first row's start, and the bytes from one row's start to the next (raw only).
+struct VideoPlaneData {
+  ConstByteView data;
+  uint32_t stride = 0;
 };
 
 class VideoChannel {
@@ -63,9 +86,14 @@ class VideoChannel {
   // The producer's format (what watchers are offered); a new format takes effect for the frames published after it.
   void set_format(const VideoFormat& format);
   VideoFormat format();
-  // A frame: `stride` bytes from one row's start to the next's in `data` (at least the row's bytes). False when it does not fit the format, there is no
-  // memory, or the channel is closed.
-  bool publish(ConstByteView data, uint32_t stride, int64_t pts);
+  // A frame: raw, each plane of the format (strides at least the planes' rows); encoded, one with the frame's bytes (at most kMaxEncodedFrame). False
+  // when it does not fit the format, there is no memory, or the channel is closed.
+  bool publish(ArrayView<const VideoPlaneData> planes, int64_t pts);
+  // A frame of one plane (packed formats; encoded video with stride 0).
+  bool publish(ConstByteView data, uint32_t stride, int64_t pts) {
+    const VideoPlaneData one{data, stride};
+    return publish(ArrayView<const VideoPlaneData>(&one, 1), pts);
+  }
   // The latest frame (null before the first one).
   SharedPointer<VideoFrame> latest();
   uint64_t frames();

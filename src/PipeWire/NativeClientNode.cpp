@@ -53,7 +53,7 @@ namespace {
 enum : uint32_t { kCnGetNode = 1, kCnUpdate = 2, kCnPortUpdate = 3, kCnSetActive = 4, kCnEvent = 5, kCnPortBuffers = 6 };
 enum : uint32_t { kCnEvTransport = 0, kCnEvSetParam = 1, kCnEvSetIo = 2, kCnEvEvent = 3, kCnEvCommand = 4, kCnEvAddPort = 5, kCnEvRemovePort = 6,
                   kCnEvPortSetParam = 7, kCnEvPortUseBuffers = 8, kCnEvPortSetIo = 9, kCnEvSetActivation = 10, kCnEvPortSetMixInfo = 11 };
-constexpr uint32_t kCoreEvBoundId = 5, kCoreEvAddMem = 6, kCoreEvBoundProps = 8;
+constexpr uint32_t kCoreEvBoundId = 5, kCoreEvAddMem = 6, kCoreEvRemoveMem = 7, kCoreEvBoundProps = 8;
 constexpr uint32_t kPortUpdateParams = 1, kPortUpdateInfo = 2;
 
 // spa types and ids (spa/param/param.h, format.h, port-config.h, buffers.h, node/command.h, node/io.h, buffer/buffer.h, buffer/meta.h, control/control.h)
@@ -69,7 +69,7 @@ constexpr uint32_t kIoBuffers = 1, kIoClock = 3, kIoPosition = 7;
 constexpr uint32_t kIoClockSize = 160, kIoPositionSize = 1688;
 constexpr uint32_t kDataMemPtr = 1, kDataMemFd = 2, kDataMemId = 4, kDataReadWrite = 1 | 2;
 constexpr uint32_t kMemReadWrite = 1 | 2;
-constexpr uint32_t kBuffersBuffers = 1, kBuffersSize = 3, kBuffersStride = 4, kBuffersDataType = 6;
+constexpr uint32_t kBuffersBuffers = 1, kBuffersBlocks = 2, kBuffersSize = 3, kBuffersStride = 4, kBuffersDataType = 6;
 constexpr uint32_t kMetaParamType = 1, kMetaParamSize = 2;
 constexpr uint32_t kMetaHeader = 1, kMetaBusy = 7;
 constexpr uint32_t kControlMidi = 2, kControlUmp = 4;
@@ -269,19 +269,21 @@ NativeServer::Media media_of(const pod::Value& enum_format, bool* dsp) {
   }
   *dsp = subtype == kSubtypeDsp;
   if (type == kMediaAudio && (subtype == kSubtypeRaw || subtype == kSubtypeDsp)) return NativeServer::Media::Audio;
-  if (type == kMediaVideo && (subtype == kSubtypeRaw || subtype == kSubtypeDsp)) return NativeServer::Media::Video;
+  if (type == kMediaVideo && (subtype == kSubtypeRaw || subtype == kSubtypeDsp || is_encoded_video_subtype(subtype))) return NativeServer::Media::Video;
   if (type == kMediaApplication && subtype == kSubtypeControl) return NativeServer::Media::Midi;
   return NativeServer::Media::Unknown;
 }
 
-// The raw video format a (fixated) Format object says.
+// The video format a (fixated) Format object says (raw: its format, size and rate; encoded: its subtype, size and rate).
 VideoFormat video_of(const pod::Value& format) {
   VideoFormat out;
+  out.subtype = 0;
   pod::ObjectReader o;
   if (!o.open(format)) return out;
   uint32_t key = 0, flags = 0;
   pod::Value v;
   while (o.next(&key, &flags, &v)) {
+    if (key == kFormatMediaSubtype) id_or_default(v, &out.subtype);
     if (key == kFormatVideoFormat) id_or_default(v, &out.format);
     if (key == kFormatVideoSize) pair_or_default(v, pod::kRectangle, &out.width, &out.height);
     if (key == kFormatVideoFramerate) pair_or_default(v, pod::kFraction, &out.rate_num, &out.rate_den);
@@ -302,6 +304,20 @@ uint32_t class_direction(StringView media_class, uint32_t fallback) {
   if (media_class.find("Output") != StringView::npos || media_class.find("Source") != StringView::npos) return kDirectionOutput;
   if (media_class.find("Input") != StringView::npos || media_class.find("Sink") != StringView::npos) return kDirectionInput;
   return fallback;
+}
+
+// A plane's stride in a block that holds the planes one after another, the first with stride `stride0` (at least each plane's row).
+uint32_t plane_stride(const VideoFormat& v, uint32_t index, uint32_t stride0) {
+  const VideoPlane pl = v.plane(index);
+  if (index == 0) return stride0 > pl.row_bytes ? stride0 : pl.row_bytes;
+  const uint32_t scaled = (stride0 + pl.stride_divisor - 1) / pl.stride_divisor;
+  return scaled > pl.row_bytes ? scaled : pl.row_bytes;
+}
+// The bytes of a raw frame's planes at these strides (the first's `stride0`), one after another.
+uint64_t planes_bytes(const VideoFormat& v, uint32_t stride0, uint32_t first, uint32_t count) {
+  uint64_t total = 0;
+  for (uint32_t i = first; i < first + count && i < v.planes(); ++i) total += uint64_t{plane_stride(v, i, stride0)} * v.plane(i).rows;
+  return total;
 }
 
 // The period of a video port's frames (its frame rate), 1 ms .. 1 s; 40 ms when it says none.
@@ -362,11 +378,15 @@ void build_video_format_param(pod::Builder& b, uint32_t param_id, const VideoFor
   b.property(kFormatMediaType);
   b.id(kMediaVideo);
   b.property(kFormatMediaSubtype);
-  b.id(kSubtypeRaw);
-  b.property(kFormatVideoFormat);
-  b.id(v.format);
-  b.property(kFormatVideoSize);
-  b.rectangle(v.width, v.height);
+  b.id(v.subtype);
+  if (!v.encoded()) {
+    b.property(kFormatVideoFormat);
+    b.id(v.format);
+  }
+  if (v.width && v.height) {
+    b.property(kFormatVideoSize);
+    b.rectangle(v.width, v.height);
+  }
   b.property(kFormatVideoFramerate);
   b.fraction(v.rate_num, v.rate_den ? v.rate_den : 1);
   b.end(f);
@@ -522,7 +542,7 @@ void NativeServer::send_driver_position(Client& c, ClientNode& n) {
       n.follower = false;
       return;
     }
-    n.driver_mem = c.next_mem_id++;
+    n.driver_mem = new_mem_id(c);
     send_add_mem(c, n.driver_mem, n.driver);
     ByteView d = n.driver->memory();
     store<uint32_t>(d, kActStatus, kActFinished);
@@ -592,9 +612,9 @@ void NativeServer::create_client_node(Client& c, uint32_t new_id, const Properti
   // (the graph's node is made at set_active or the first port_update after it: the update before them may still say the stream's format, which the
   // node's stream is made in)
   // the activation memory and the transport (the client waits on `wake`; `done` is the other way)
-  node.activation_mem = c.next_mem_id++;
+  node.activation_mem = new_mem_id(c);
   send_add_mem(c, node.activation_mem, node.activation);
-  node.io_mem = c.next_mem_id++;
+  node.io_mem = new_mem_id(c);
   send_add_mem(c, node.io_mem, node.io);
   const uint64_t m = begin(c, new_id, kCnEvTransport);
   pod::Builder b(c.outbox);
@@ -703,6 +723,7 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
 // A port's buffers: as many as it asks for (2 .. 16), each in its own part of one memfd: its metadata, the chunk, then the data (as big as it asks, at
 // least a quantum of the largest for audio; at most 1 MiB, 64 MiB for video), unless the client allocates the data itself.
 bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
+  p.blocks = 1;
   p.n_buffers = p.wanted_buffers >= 1 && p.wanted_buffers <= kMaxBuffers ? (p.wanted_buffers < 2 ? 2 : p.wanted_buffers) : kBuffers;
   uint32_t data = 0;
   switch (p.media) {
@@ -717,10 +738,26 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
       if (data > kMaxDataSize) data = kMaxDataSize;
       break;
     default: {
-      const uint64_t frame = p.video.frame_bytes();
-      data = p.wanted_size > frame ? p.wanted_size : uint32_t(frame);
-      if (data == 0) data = kPage;
-      if (data > kMaxVideoData) return false;
+      // raw: one block a plane when the port asks for as many (else the planes one after another in one); encoded: a frame's bytes as asked, 4 MiB
+      uint64_t frame = 0;
+      if (p.video.encoded()) {
+        frame = p.wanted_size ? p.wanted_size : 4u << 20;
+      } else {
+        const uint32_t planes = p.video.planes();
+        if (planes > 1 && p.wanted_blocks >= planes && p.wanted_blocks <= VideoFormat::kMaxPlanes) p.blocks = p.wanted_blocks;
+        const uint32_t stride0 = p.wanted_stride;
+        if (p.blocks > 1)
+          for (uint32_t i = 0; i < planes; ++i) {
+            const uint64_t b = planes_bytes(p.video, stride0, i, 1);
+            if (b > frame) frame = b;
+          }
+        else
+          frame = planes_bytes(p.video, stride0, 0, planes);
+        if (p.wanted_size > frame) frame = p.wanted_size;
+      }
+      if (frame == 0) frame = kPage;
+      if (frame > kMaxVideoData) return false;
+      data = static_cast<uint32_t>(frame);
       break;
     }
   }
@@ -735,20 +772,23 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
     at += round_up(p.metas[i].size, 8);
   }
   p.chunk_offset = at;
-  at += 16;
+  at += 16 * p.blocks;
   if (p.alloc) {
     p.data_offset = 0;
     p.data_size = 0;
     p.buffer_stride = round_up(at, 64);
   } else {
+    // (each block's data page-aligned when it goes by memfd)
     p.data_offset = p.data_type == kDataMemId ? round_up(at, kPage) : round_up(at, 64);
-    p.data_size = round_up(data, 64);
-    p.buffer_stride = round_up(p.data_offset + p.data_size, p.data_type == kDataMemId ? kPage : 64u);
+    p.data_size = round_up(data, p.data_type == kDataMemId ? kPage : 64u);
+    const uint64_t stride = uint64_t{p.data_offset} + uint64_t{p.data_size} * p.blocks;
+    if (stride > kMaxVideoData + uint64_t{kPage} * 8) return false;
+    p.buffer_stride = round_up(static_cast<uint32_t>(stride), p.data_type == kDataMemId ? kPage : 64u);
   }
   const uint64_t total = uint64_t{p.n_buffers} * p.buffer_stride;
   p.buffers = maker_->make_memory(total, "pipewire-buffers");
   if (!p.buffers || p.buffers->memory().size() < total) return false;
-  p.buffers_mem = c.next_mem_id++;
+  p.buffers_mem = new_mem_id(c);
   send_add_mem(c, p.buffers_mem, p.buffers);
   // the port's one link: mix 0 (its peer: the speakers, the microphone, a virtual sink, the MIDI bridge or the node itself)
   uint32_t peer = n.node;
@@ -785,26 +825,29 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
         b.id(p.metas[k].type);
         b.int32(static_cast<int32_t>(p.metas[k].size));
       }
-      b.int32(1);      // datas
-      if (p.alloc) {
-        // (the data is the client's: the types it may use, as PipeWire says them for an allocating port)
-        b.id(types ? types : 1u << kDataMemFd);
-        b.int32(0);
-        b.int32(0);
-        b.int32(0);
-        b.int32(0);
-      } else if (p.data_type == kDataMemPtr) {
-        b.id(kDataMemPtr);
-        b.int32(static_cast<int32_t>(p.data_offset));      // (MemPtr: the offset in the buffer's part)
-        b.int32(static_cast<int32_t>(kDataReadWrite));
-        b.int32(0);
-        b.int32(static_cast<int32_t>(p.data_size));
-      } else {
-        b.id(kDataMemId);
-        b.int32(static_cast<int32_t>(p.buffers_mem));      // (MemId: the memory, mapped at mapoffset)
-        b.int32(static_cast<int32_t>(kDataReadWrite));
-        b.int32(static_cast<int32_t>(i * p.buffer_stride + p.data_offset));
-        b.int32(static_cast<int32_t>(p.data_size));
+      b.int32(static_cast<int32_t>(p.blocks));      // datas
+      for (uint32_t k = 0; k < p.blocks; ++k) {
+        const uint32_t data_at = p.data_offset + k * p.data_size;
+        if (p.alloc) {
+          // (the data is the client's: the types it may use, as PipeWire says them for an allocating port)
+          b.id(types ? types : 1u << kDataMemFd);
+          b.int32(0);
+          b.int32(0);
+          b.int32(0);
+          b.int32(0);
+        } else if (p.data_type == kDataMemPtr) {
+          b.id(kDataMemPtr);
+          b.int32(static_cast<int32_t>(data_at));      // (MemPtr: the offset in the buffer's part)
+          b.int32(static_cast<int32_t>(kDataReadWrite));
+          b.int32(0);
+          b.int32(static_cast<int32_t>(p.data_size));
+        } else {
+          b.id(kDataMemId);
+          b.int32(static_cast<int32_t>(p.buffers_mem));      // (MemId: the memory, mapped at mapoffset)
+          b.int32(static_cast<int32_t>(kDataReadWrite));
+          b.int32(static_cast<int32_t>(i * p.buffer_stride + data_at));
+          b.int32(static_cast<int32_t>(p.data_size));
+        }
       }
     }
     b.end(f);
@@ -852,6 +895,7 @@ void NativeServer::send_command(Client& c, ClientNode& n, uint32_t command) {
 // its buffers (and an allocating port its data).
 void NativeServer::negotiate(Client& c, ClientNode& n) {
   if (!n.node || !n.active) return;
+  if (n.renegotiate) renegotiate(c, n);
   for (UniquePointer<ClientPort>& pp : n.ports.view()) {
     ClientPort& p = *pp;
     if (p.media == Media::Unknown) continue;
@@ -891,7 +935,7 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
   // the params (each kind replaces what the port said of it before)
   bool has_enum = false, has_buffers = false, has_meta = false;
   ByteBuffer enum_format(allocator_);
-  uint32_t wanted_buffers = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
+  uint32_t wanted_buffers = 0, wanted_blocks = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
   ClientPort::Meta metas[ClientPort::kMaxMetas];
   uint32_t n_metas = 0;
   for (uint32_t i = 0; i < n_params; ++i) {
@@ -909,6 +953,7 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
       while (o.next(&key, &flags, &prop)) {
         uint32_t value = 0;
         if (key == kBuffersBuffers && int_or_default(prop, &value)) wanted_buffers = value;
+        if (key == kBuffersBlocks && int_or_default(prop, &value)) wanted_blocks = value;
         if (key == kBuffersSize && int_or_default(prop, &value)) wanted_size = value;
         if (key == kBuffersStride && int_or_default(prop, &value)) wanted_stride = value;
         if (key == kBuffersDataType && int_or_default(prop, &value)) wanted_types = value;
@@ -977,9 +1022,27 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
     pod::Value v;
     if (q.next(&v)) p->media = media_of(v, &p->dsp);
   }
-  if ((change_mask & kPortUpdateParams) && p->format_sent) {
+  if (has_enum && p->format_sent && p->media == Media::Video && p->direction == kDirectionOutput && !p->renegotiate) {
+    // a producer that says a new EnumFormat (pw_stream_update_params): when it fixates to another format, its port is negotiated again
+    ByteBuffer fixed(allocator_);
+    pod::Parser q(enum_format.view());
+    pod::Value v, fv;
+    if (q.next(&v) && media_of(v, &p->dsp) == Media::Video && fixate_object(v, &fixed)) {
+      pod::Parser fq(fixed.view());
+      if (fq.next(&fv)) {
+        const VideoFormat changed = video_of(fv);
+        if (changed.valid() && !(changed == p->video)) {
+          p->enum_format.clear();
+          p->enum_format.append(enum_format.view());
+          p->renegotiate = n.renegotiate = true;
+        }
+      }
+    }
+  }
+  if ((change_mask & kPortUpdateParams) && p->format_sent && !p->renegotiate) {
     if (has_buffers) {
       p->wanted_buffers = wanted_buffers;
+      p->wanted_blocks = wanted_blocks;
       p->wanted_size = wanted_size;
       p->wanted_stride = wanted_stride;
       p->wanted_types = wanted_types;
@@ -1012,7 +1075,7 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
   List<ClientPort::ClientData> datas(allocator_);
   for (int32_t i = 0; i < count; ++i) {
     int32_t n_datas = 0;
-    if (!args.int32(&n_datas) || n_datas < 1 || n_datas > 4) { protocol_error(c, n.resource, kEINVAL, "invalid port_buffers"); return; }
+    if (!args.int32(&n_datas) || n_datas < int32_t(p->blocks) || n_datas > 4) { protocol_error(c, n.resource, kEINVAL, "invalid port_buffers"); return; }
     for (int32_t k = 0; k < n_datas; ++k) {
       uint32_t type = 0;
       int32_t flags = 0, mapoffset = 0, maxsize = 0;
@@ -1022,7 +1085,7 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
         protocol_error(c, n.resource, kEINVAL, "invalid port_buffers");
         return;
       }
-      if (k > 0) continue;      // (one data block per buffer is used)
+      if (uint32_t(k) >= p->blocks) continue;      // (the blocks the server asked for are used)
       if (type != kDataMemFd) { protocol_error(c, n.resource, kENOTSUP, "only memfd buffers can be shared with the server"); return; }
       if (index < 0 || uint64_t(index) >= c.message_in_fds.count()) { protocol_error(c, n.resource, kEINVAL, "port_buffers without its descriptor"); return; }
       ClientPort::ClientData d;
@@ -1040,7 +1103,7 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
   p->client_data.clear();
   for (ClientPort::ClientData& d : datas) p->client_data.push_back(util::move(d));
   p->data_size = p->client_data.count() ? p->client_data[0].maxsize : 0;
-  p->data_ready = p->client_data.count() == p->n_buffers;
+  p->data_ready = p->client_data.count() == uint64_t{p->n_buffers} * p->blocks;
   maybe_start(c, n);
 }
 
@@ -1135,19 +1198,75 @@ void NativeServer::set_quantum(ClientNode& n) {
 // ---- the buffers ---------------------------------------------------------------------------------------------------------------------------------
 
 // Buffer `id`'s data (the server's, or the client's memfd for an allocating port); empty when there is none.
-ByteView NativeServer::buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize) {
+ByteView NativeServer::buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize, uint32_t block) {
   *maxsize = 0;
-  if (id >= p.n_buffers || !p.buffers) return ByteView();
+  if (id >= p.n_buffers || block >= p.blocks || !p.buffers) return ByteView();
   if (p.alloc) {
-    if (id >= p.client_data.count() || !p.client_data[id].fd) return ByteView();
-    ClientPort::ClientData& d = p.client_data[id];
+    const uint64_t index = uint64_t{id} * p.blocks + block;
+    if (index >= p.client_data.count() || !p.client_data[index].fd) return ByteView();
+    ClientPort::ClientData& d = p.client_data[index];
     ByteView data = part(d.fd->memory(), d.mapoffset, d.maxsize);
     *maxsize = static_cast<uint32_t>(data.size());
     return data;
   }
-  ByteView data = part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.data_offset, p.data_size);
+  ByteView data = part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.data_offset + uint64_t{block} * p.data_size, p.data_size);
   *maxsize = static_cast<uint32_t>(data.size());
   return data;
+}
+
+ByteView NativeServer::buffer_chunk(ClientPort& p, uint32_t id, uint32_t block) {
+  if (id >= p.n_buffers || block >= p.blocks || !p.buffers) return ByteView();
+  return part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.chunk_offset + 16ull * block, 16);
+}
+
+// The id the program's memory pool gives the next memory added: a removed one (the last removed first), else the next new one.
+uint32_t NativeServer::new_mem_id(Client& c) {
+  if (c.free_mem_ids.count() > 0) {
+    const uint32_t id = c.free_mem_ids[c.free_mem_ids.count() - 1];
+    c.free_mem_ids.remove_at(c.free_mem_ids.count() - 1);
+    return id;
+  }
+  return c.next_mem_id++;
+}
+
+// A port's buffers go (its format is to change): the program is told its memory is gone (it dropped the buffers when it was given the new Format).
+void NativeServer::drop_port_buffers(Client& c, ClientPort& p) {
+  if (p.buffers) {
+    const uint64_t m = begin(c, 0, kCoreEvRemoveMem);
+    pod::Builder b(c.outbox);
+    const uint64_t f = b.begin_struct();
+    b.int32(static_cast<int32_t>(p.buffers_mem));
+    b.end(f);
+    end(c, m);
+    c.free_mem_ids.push_back(p.buffers_mem);
+  }
+  p.buffers = Fd();
+  p.client_data.clear();
+  p.n_buffers = 0;
+  p.blocks = 1;
+  p.next_buffer = 0;
+}
+
+// Ports whose format is to change: they are given the new Format (the program drops its buffers), their old memory is removed, and new buffers follow
+// when the program says what it wants of them (negotiate). The node keeps running; its other ports go on.
+void NativeServer::renegotiate(Client& c, ClientNode& n) {
+  n.renegotiate = false;
+  for (UniquePointer<ClientPort>& pp : n.ports.view()) {
+    ClientPort& p = *pp;
+    if (!p.renegotiate) continue;
+    p.renegotiate = false;
+    if (n.io) {
+      store<int32_t>(n.io->memory(), 8ull * p.index, p.direction == kDirectionOutput ? kStatusNeedData : 0);
+      store<uint32_t>(n.io->memory(), 8ull * p.index + 4, kIdInvalid);
+    }
+    p.format_sent = false;
+    p.buffers_sent = false;
+    p.data_ready = false;
+    p.wants_alloc = false;
+    ByteBuffer format(allocator_);
+    if (fixate_format(n, p, &format)) send_port_param(c, n, p, format.view());
+    drop_port_buffers(c, p);
+  }
 }
 
 // The buffer's SPA_META_Header (if the port has one): what the server filled in, its time stamp and its number.
@@ -1177,6 +1296,44 @@ static int64_t header_pts(ByteView buffers, uint64_t base, const NativeServer::C
   return 0;
 }
 
+// A producer's frame to its video channel: encoded, the first block's bytes; raw, a plane in each block (the port has one a plane), else the planes one
+// after another in the first (`first`: its chunk's bytes, `stride0`: its chunk's stride).
+void NativeServer::publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts) {
+  const VideoFormat& v = p.video;
+  if (v.encoded()) {
+    n.video->publish(first, 0, pts);
+    return;
+  }
+  const uint32_t planes = v.planes();
+  VideoPlaneData data[VideoFormat::kMaxPlanes];
+  const uint32_t s0 = stride0 > 0 ? uint32_t(stride0) : v.plane(0).row_bytes;
+  if (p.blocks >= planes) {
+    for (uint32_t i = 0; i < planes; ++i) {
+      if (i == 0) {
+        data[0] = VideoPlaneData{first, s0};
+        continue;
+      }
+      uint32_t maxsize = 0;
+      ByteView block = buffer_data(p, id, &maxsize, i);
+      ByteView chunk = buffer_chunk(p, id, i);
+      const uint32_t offset = load<uint32_t>(chunk, 0), size = load<uint32_t>(chunk, 4);
+      const int32_t stride = load<int32_t>(chunk, 8);
+      ConstByteView bytes;
+      if (!ConstByteView(block).try_subview(offset, size, &bytes)) return;      // (a chunk outside its block: the frame is dropped)
+      data[i] = VideoPlaneData{bytes, stride > 0 ? uint32_t(stride) : v.plane(i).row_bytes};
+    }
+  } else {
+    uint64_t at = 0;
+    for (uint32_t i = 0; i < planes; ++i) {
+      const uint32_t st = plane_stride(v, i, s0);
+      if (at > first.size()) return;
+      data[i] = VideoPlaneData{first.subview(at), st};
+      at += uint64_t{st} * v.plane(i).rows;
+    }
+  }
+  n.video->publish(ArrayView<const VideoPlaneData>(data, planes), pts);
+}
+
 // What an output port produced this cycle (the buffer its io names with HAVE_DATA): to where the node's data goes; the buffer is handed back. False
 // when nothing came.
 bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
@@ -1193,7 +1350,7 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
   uint32_t maxsize = 0;
   ByteView data = buffer_data(p, id, &maxsize);
   const uint64_t base = uint64_t{id} * p.buffer_stride;
-  ByteView chunk = part(p.buffers->memory(), base + p.chunk_offset, 16);
+  ByteView chunk = buffer_chunk(p, id);
   const uint32_t offset = load<uint32_t>(chunk, 0), size = load<uint32_t>(chunk, 4);
   const int32_t stride = load<int32_t>(chunk, 8);
   if (maxsize > 0) {
@@ -1245,10 +1402,7 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
         break;
       }
       case Media::Video: {
-        if (n.video && p.video.valid()) {
-          const uint32_t row_stride = stride > 0 ? uint32_t(stride) : p.video.row_bytes();
-          n.video->publish(a, row_stride, header_pts(p.buffers->memory(), base, p));
-        }
+        if (n.video && p.video.valid() && b.size() == 0) publish_video(n, p, id, a, stride, header_pts(p.buffers->memory(), base, p));
         break;
       }
       default: break;
@@ -1348,24 +1502,53 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       break;
     }
     case Media::Video: {
+      // the producer's newest frame: encoded, its bytes; raw, a plane in each block (or one after another in the first), rows at the port's stride
       if (!n.video) return false;
       SharedPointer<VideoFrame> frame = n.video->latest();
       if (!frame || frame->sequence <= p.video_seen || !(frame->format == p.video)) return false;
-      const uint32_t row = p.video.row_bytes();
-      const uint32_t row_stride = p.wanted_stride >= row ? p.wanted_stride : row;
-      const uint64_t needed = uint64_t{row_stride} * (p.video.height - 1) + row;
-      if (needed > maxsize) return false;
-      for (uint32_t y = 0; y < p.video.height; ++y)
-        data.subview(uint64_t{y} * row_stride, row).copy_from(frame->pixels.view().subview(uint64_t{y} * row, row));
+      const VideoFormat& v = p.video;
+      if (v.encoded()) {
+        if (frame->pixels.size() > maxsize) return false;
+        data.first(frame->pixels.size()).copy_from(frame->pixels.view());
+        got = static_cast<uint32_t>(frame->pixels.size());
+        p.video_seen = frame->sequence;
+        break;
+      }
+      const uint32_t planes = v.planes();
+      const uint32_t s0 = plane_stride(v, 0, p.wanted_stride);
+      const bool separate = p.blocks >= planes && planes > 1;
+      if (!separate && planes_bytes(v, s0, 0, planes) > maxsize) return false;
+      uint64_t at = 0;
+      for (uint32_t i = 0; i < planes; ++i) {
+        const VideoPlane pl = v.plane(i);
+        const uint32_t st = plane_stride(v, i, s0);
+        const uint64_t bytes = uint64_t{st} * pl.rows;
+        uint32_t block_size = maxsize;
+        ByteView out = separate ? buffer_data(p, id, &block_size, i) : data;
+        if (separate) at = 0;
+        if (block_size < bytes || out.size() < at + bytes) return false;
+        const ConstByteView src = frame->pixels.view().subview(v.plane_offset(i), uint64_t{pl.row_bytes} * pl.rows);
+        for (uint32_t y = 0; y < pl.rows; ++y)
+          out.subview(at + uint64_t{y} * st, pl.row_bytes).copy_from(src.subview(uint64_t{y} * pl.row_bytes, pl.row_bytes));
+        if (separate && i > 0) {
+          ByteView chunk = buffer_chunk(p, id, i);
+          store<uint32_t>(chunk, 0, 0);
+          store<uint32_t>(chunk, 4, static_cast<uint32_t>(bytes));
+          store<int32_t>(chunk, 8, static_cast<int32_t>(st));
+          store<int32_t>(chunk, 12, 0);
+        }
+        if (i == 0) {
+          got = static_cast<uint32_t>(separate ? bytes : planes_bytes(v, s0, 0, planes));
+          stride = static_cast<int32_t>(st);
+        }
+        at += bytes;
+      }
       p.video_seen = frame->sequence;
-      got = static_cast<uint32_t>(needed);
-      stride = static_cast<int32_t>(row_stride);
       break;
     }
     default: return false;
   }
-  const uint64_t base = uint64_t{id} * p.buffer_stride;
-  ByteView chunk = part(p.buffers->memory(), base + p.chunk_offset, 16);
+  ByteView chunk = buffer_chunk(p, id);
   store<uint32_t>(chunk, 0, 0);
   store<uint32_t>(chunk, 4, got);
   store<int32_t>(chunk, 8, stride);
