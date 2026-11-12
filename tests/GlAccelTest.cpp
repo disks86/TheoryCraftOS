@@ -1140,7 +1140,7 @@ static void test_device_only_clear() {
 // of AccelState. A scene drawn by it and by the CPU path must give the same picture, which checks the translation (and GlAccel's packing of the inputs).
 struct TgsiAccel : IAccelerator {
   struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; AccelStages st; };
-  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; };
+  struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> f; bool floats = false; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   std::vector<Prog> progs;
   std::vector<Tex> texs;
@@ -1148,7 +1148,7 @@ struct TgsiAccel : IAccelerator {
   int draws = 0, refused = 0;
   const char* name() const override { return "tgsi reference"; }
   bool stages = true;   // (false: a device without geometry and tessellation stages)
-  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true}; }
+  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages, true, true}; }
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
     return create_program_stages(vs, fs, attributes, varyings, textures, AccelStages());
   }
@@ -1185,8 +1185,19 @@ struct TgsiAccel : IAccelerator {
   }
   bool write_texture(uint32_t t, ConstByteView rgba) override {
     Tex& x = texs.at(t - 1);
-    if (rgba.size() != x.rgba.size()) return false;
+    if (x.floats || rgba.size() != x.rgba.size()) return false;
     memcpy(x.rgba.data(), rgba.data(), rgba.size());
+    return true;
+  }
+  uint32_t create_texture_float(uint32_t w, uint32_t h) override {
+    Tex t{w, h, {}, std::vector<float>(uint64_t{w} * h * 4), true};
+    texs.push_back(t);
+    return static_cast<uint32_t>(texs.size());
+  }
+  bool write_texture_float(uint32_t t, ConstByteView v) override {
+    Tex& x = texs.at(t - 1);
+    if (!x.floats || v.size() != x.f.size() * 4) return false;
+    memcpy(x.f.data(), v.data(), v.size());
     return true;
   }
   uint32_t create_target(uint32_t w, uint32_t h) override {
@@ -1214,7 +1225,8 @@ struct TgsiAccel : IAccelerator {
         const auto wrap = [](int i, int n, bool repeat) { return repeat ? ((i % n) + n) % n : (i < 0 ? 0 : (i >= n ? n - 1 : i)); };
         x = wrap(x, static_cast<int>(t.w), sm.repeat_s);
         y = wrap(y, static_cast<int>(t.h), sm.repeat_t);
-        return t.rgba[(uint64_t(y) * t.w + uint64_t(x)) * 4 + k] / 255.0f;
+        const uint64_t at = (uint64_t(y) * t.w + uint64_t(x)) * 4 + k;
+        return t.floats ? t.f[at] : t.rgba[at] / 255.0f;
       };
       float r[4];
       const float fx = u * static_cast<float>(t.w), fy = v * static_cast<float>(t.h);

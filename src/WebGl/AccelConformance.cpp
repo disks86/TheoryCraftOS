@@ -55,6 +55,8 @@ void set_floats(GlContext& gl, uint32_t p, const char* name, uint32_t cols, uint
   gl.uniform(gl.get_uniform_location(p, name), 'f', cols, rows, count, lanes);
 }
 
+void depth_texture(GlContext& gl, uint32_t p, uint32_t target, uint32_t w, uint32_t h, uint32_t filter, uint32_t func);
+
 // a 2 x 2 RGBA texture on unit 0
 void upload_2x2(GlContext& gl, uint32_t tex, const uint8_t (&texels)[16]) {
   gl.active_texture(0x84C0);
@@ -119,6 +121,35 @@ constexpr Scene kScenes[] = {
        }},
       {"matrix constructors, inverse and determinant", kVs, kFsHead "void main(){ mat4 m4 = mat4(v.r + 1.0, 0.1, 0.2, 0.0, 0.3, v.g + 1.0, 0.1, 0.0, 0.0, 0.2, v.b + 1.0, 0.0, 0.5, 0.5, 0.5, 1.0); mat3 m3 = mat3(m4); mat2 m2 = mat2(m3); mat3 back = mat3(m2); mat3 i3 = inverse(m3); mat2 i2 = inverse(m2); vec4 fl = vec4(m2); o = vec4(determinant(m3) * 0.2, (i3 * vec3(1.0)).x * 0.5, (i2 * vec2(1.0)).y * 0.5 + back[2].z * 0.1, fl.w * 0.3); }\n", 5, nullptr},
       {"more built-ins", kVs, kFsHead "void main(){ float ip; float fr = modf(v.r * 3.7, ip); vec2 x = v.rg * 2.0 - 1.0; mat2 op = outerProduct(x, vec2(0.5, 0.25)); o = vec4(fr, ip / 4.0, sinh(x.x) * 0.3 + cosh(x.y) * 0.2 + tanh(x.x * 3.0) * 0.2, atanh(x.y * 0.5) * 0.4 + asinh(x.x) * 0.2 + acosh(1.0 + v.b) * 0.2 + op[1][0]); }\n", 5, nullptr},
+      {"a shadow sampler, nearest, GREATER", kVs, kFsHead "uniform highp sampler2DShadow u_t;\nvoid main(){ o = vec4(texture(u_t, vec3(v.rg, v.b)), v.g * 0.5, 0.25, 1.0); }\n", 5,
+       [](GlContext& gl, uint32_t p) { depth_texture(gl, p, 0x0DE1, 8, 8, 0x2600, 0x0204); }},
+      {"a shadow sampler, linear, LEQUAL, projective", kVs, kFsHead "uniform highp sampler2DShadow u_t;\nvoid main(){ o = vec4(textureProj(u_t, vec4(v.rg * 2.0, v.b * 2.0, 2.0)), 0.5, v.r, 1.0); }\n", 5,
+       [](GlContext& gl, uint32_t p) { depth_texture(gl, p, 0x0DE1, 8, 4, 0x2601, 0x0203); }},
+      {"arrays of structures: by a variable, whole copies, stores and ==", kVs,
+       kFsHead "struct L { vec3 c; float k; vec2 w[2]; };\n"
+       "void main(){ L ls[3]; for (int i = 0; i < 3; ++i) { ls[i].c = v.rgb * float(i + 1) * 0.3; ls[i].k = float(i) * 0.25; ls[i].w[0] = v.rg; ls[i].w[1] = vec2(float(i)) * 0.1; }\n"
+       "  int j = int(v.r * 2.9); L pick = ls[j]; L other = ls[(j + 1) % 3]; ls[j] = other; bool same = pick == ls[(j + 2) % 3]; bool self = pick == pick;\n"
+       "  o = vec4(pick.c * 0.5 + ls[j].c * 0.3, pick.k + pick.w[1].x + (same ? 0.5 : 0.0) + (self ? 0.1 : 0.0)); }\n", 5, nullptr},
+      {"structure constructors, constant arrays of structures, uniform structures with arrays", kVs,
+       kFsHead "struct P { vec2 a; float b; };\nconst P kp[2] = P[2](P(vec2(0.2, 0.4), 0.6), P(vec2(0.8, 0.1), 0.3));\nstruct U { vec4 tint; float s[3]; int n; };\nuniform U u;\n"
+       "void main(){ int j = int(v.g * 1.9); P q = kp[j]; P r = P(v.rg, v.b); o = vec4(q.a * 0.5 + r.a * 0.5, mix(q.b, r.b, 0.5) * u.s[int(v.r * 2.9)], 1.0) * u.tint + float(u.n) * 0.05; }\n", 5,
+       [](GlContext& gl, uint32_t p) {
+         const float tint[4] = {0.9f, 1.0f, 0.8f, 1.0f}, sv[3] = {0.5f, 1.0f, 1.5f};
+         const int32_t n = 2;
+         set_floats(gl, p, "u.tint", 1, 4, 1, tint);
+         set_floats(gl, p, "u.s", 1, 1, 3, sv);
+         gl.uniform(gl.get_uniform_location(p, "u.n"), 'i', 1, 1, 1, reinterpret_cast<const uint32_t*>(&n));
+       }},
+      {"uniform arrays of structures by a variable", kVs, kFsHead "struct M { vec3 c; float k; };\nuniform M ms[3];\nvoid main(){ int j = int(v.r * 2.9); o = vec4(ms[j].c * v.g + ms[2 - j].c * 0.25, ms[j].k); }\n", 5,
+       [](GlContext& gl, uint32_t p) {
+         const float c[3][3] = {{1, 0, 0}, {0, 1, 0}, {0.2f, 0.4f, 1}}, k[3] = {0.25f, 0.5f, 1.0f};
+         const char* const cn[3] = {"ms[0].c", "ms[1].c", "ms[2].c"};
+         const char* const kn[3] = {"ms[0].k", "ms[1].k", "ms[2].k"};
+         for (int i = 0; i < 3; ++i) {
+           set_floats(gl, p, cn[i], 1, 3, 1, c[i]);
+           set_floats(gl, p, kn[i], 1, 1, 1, &k[i]);
+         }
+       }},
       {"a uniform block", kVs, kFsHead "layout(std140) uniform B { vec4 tint; mat2 m; float s[3]; bool on; };\nvoid main(){ vec2 r = m * v.rg; o = vec4(r, v.b * s[int(v.r * 2.9)], 1.0) * tint + (on ? 0.1 : 0.0); }\n", 5,
        [](GlContext& gl, uint32_t p) {
          // std140: tint at 0, m's columns at 16 and 32, s[i] at 48 + 16 i, on at 96
@@ -137,6 +168,25 @@ constexpr Scene kScenes[] = {
 };
 #undef kFsHead
 #undef kHead
+
+// A w x h depth texture (32-bit float depth) on unit 0 of `target` (2D or 1D), with a filter and a comparison function, named by uniform u_t: a pattern of depths in tenths.
+void depth_texture(GlContext& gl, uint32_t p, uint32_t target, uint32_t w, uint32_t h, uint32_t filter, uint32_t func) {
+  ByteBuffer bytes(gl.allocator());
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) bytes.put32(__builtin_bit_cast(uint32_t, static_cast<float>((x * 7 + y * 3) % 11) / 10.0f));
+  const uint32_t tex = gl.create_texture();
+  gl.active_texture(0x84C0);
+  gl.bind_texture(target, tex);
+  gl.tex_image(target, 0, 0x8CAC, w, h, 1, 0, 0x1902, 0x1406, bytes.view(), true, false);
+  gl.tex_parameter(target, 0x2801, filter);
+  gl.tex_parameter(target, 0x2800, filter);
+  gl.tex_parameter(target, 0x2802, 0x812F);   // (clamped: the edges are the CPU's and the device's alike)
+  gl.tex_parameter(target, 0x2803, 0x812F);
+  gl.tex_parameter(target, 0x884C, 0x884E);   // COMPARE_REF_TO_TEXTURE
+  gl.tex_parameter(target, 0x884D, func);
+  const uint32_t unit = 0;
+  gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &unit);
+}
 
 // Clip planes on: distances 0 and 1, as GlApi sets them for a program (its clip varying), and the user planes x > -0.25 and x + y < 0.53125 (between pixel centres:
 // a plane through one would leave it to the rounding of each).
@@ -194,6 +244,25 @@ constexpr Scene kStageScenes[] = {
       {"geometry: a vertex shader without attributes", kDesk "out float c;\nvoid main(){ c = 0.7; }\n", kDeskFs, 0, nullptr, true,
        kDesk "layout(points) in; layout(triangle_strip, max_vertices = 4) out;\nin float c[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 4; ++i) { gl_Position = vec4(float(i % 2) * 1.4 - 0.8, float(i / 2) * 1.2 - 0.6, 0.0, 1.0); g = vec4(c[0], float(i) * 0.25, 1.0 - c[0], 1.0); EmitVertex(); } }\n",
        nullptr, nullptr, 0, 1},
+      {"shadow2D (legacy), nearest, LESS", "#version 120\nattribute vec2 pos; attribute vec4 col; varying vec4 v;\nvoid main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       "#version 120\nuniform sampler2DShadow u_t; varying vec4 v;\nvoid main(){ gl_FragColor = shadow2D(u_t, vec3(v.gr, v.b)) * 0.75 + vec4(0.0, 0.0, 0.2, 0.0); }\n", 5,
+       [](GlContext& gl, uint32_t p) { depth_texture(gl, p, 0x0DE1, 16, 8, 0x2600, 0x0201); }, true},
+      {"shadow1DProj (legacy), linear, GEQUAL", "#version 120\nattribute vec2 pos; attribute vec4 col; varying vec4 v;\nvoid main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       "#version 120\nuniform sampler1DShadow u_t; varying vec4 v;\nvoid main(){ gl_FragColor = shadow1DProj(u_t, vec4(v.r * 1.5, 0.0, v.b * 1.5, 1.5)); }\n", 5,
+       [](GlContext& gl, uint32_t p) { depth_texture(gl, p, 0x0DE0, 16, 1, 0x2601, 0x0206); }, true},
+      {"a rectangle texture", "#version 140\nin vec2 pos; in vec4 col; out vec4 v;\nvoid main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       "#version 140\nuniform sampler2DRect u_t; in vec4 v; out vec4 o;\nvoid main(){ o = texture(u_t, v.rg * vec2(2.0, 2.0)) * 0.8 + v * 0.2; }\n", 5,
+       [](GlContext& gl, uint32_t p) {
+         const uint32_t tex = gl.create_texture();
+         const uint8_t texels[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+         gl.active_texture(0x84C0);
+         gl.bind_texture(0x84F5, tex);
+         gl.tex_image(0x84F5, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(texels, sizeof texels), true, false);
+         gl.tex_parameter(0x84F5, 0x2801, 0x2600);
+         gl.tex_parameter(0x84F5, 0x2800, 0x2600);
+         const uint32_t unit = 0;
+         gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &unit);
+       }, true},
       {"clip distances", kDesk "in vec2 pos; in vec4 col; out vec4 g;\nvoid main(){ g = col; gl_Position = vec4(pos, 0.0, 1.0); gl_ClipDistance[0] = pos.x + 0.25; gl_ClipDistance[1] = 0.5 - pos.y; }\n", kDeskFs, 5, clip_two, true},
       {"clip planes against gl_ClipVertex (compatibility)", "#version 120\nattribute vec2 pos; attribute vec4 col; varying vec4 g;\nvoid main(){ g = col; gl_Position = vec4(pos, 0.0, 1.0); gl_ClipVertex = vec4(pos, 0.0, 1.0); }\n",
        "#version 120\nvarying vec4 g;\nvoid main(){ gl_FragColor = g; }\n", 5, clip_two, true},

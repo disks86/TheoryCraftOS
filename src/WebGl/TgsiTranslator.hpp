@@ -80,13 +80,22 @@ struct TgsiAttribute {
   uint8_t convert = kTgsiAsIs;   // an int / uint input: read as integers, sent as their float values
 };
 
-// What the fragment shader samples: SAMP[i] is samplers[i]. GLSL: a sampler2D uniform, and the texture unit it names is the value in `slot` of the fragment shader's
-// shared region. WGSL: a texture and a sampler binding, the handles in `slot` (texture) and `sampler_slot` (sampler) of the region.
+// What the fragment shader samples: SAMP[i] is samplers[i]. GLSL: a sampler1D / 2D / 2DRect uniform (or its shadow kind), and the texture unit it names is the value in `slot`
+// of the fragment shader's shared region; the device texture is a 2D one whatever the GL texture is (a 1D one is w x 1, read at t = 0.5). WGSL: a texture and a sampler
+// binding, the handles in `slot` (texture) and `sampler_slot` (sampler) of the region.
 struct TgsiSampler {
   uint32_t slot;
   uint32_t sampler_slot;
   bool wgsl;
+  uint8_t dim = 0;       // shader::kDim2D, kDim1D or kDimRect
+  // A depth comparison (a shadow sampler): the device texture is a float one with the texture's depth in R, read with nearest filtering. The comparison is the
+  // shader's, by the four CONST rows from `params` (TgsiConstant stage kTgsiSamplerParams): (weight of reference < depth, of ==, of >, 1 for linear filtering - four
+  // taps then), (w, h, 1 / w, 1 / h), and the vec4 that shadow1D / shadow2D give, r * row 2 + row 3 (GL_DEPTH_TEXTURE_MODE).
+  bool shadow = false;
+  int32_t params = -1;   // the first of those rows, when the sampler has them (shadow, or a rectangle: row 1 turns texels into the device's coordinates)
 };
+// TgsiConstant::stage of the samplers' rows (TgsiSampler::params): slot 4 i + r is row r of sampler i.
+constexpr uint8_t kTgsiSamplerParams = 7;
 
 // TgsiConstant::stage of the rows that hold the default tessellation levels (glPatchParameterfv) a program without a control stage uses: slots 0 .. 3 the outer levels,
 // 4 and 5 the inner ones.

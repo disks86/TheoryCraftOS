@@ -44,6 +44,8 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   uint32_t create_program_stages(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures, const webgl::AccelStages& stages) override;
   void destroy_program(uint32_t program) override;
   uint32_t create_texture(uint32_t w, uint32_t h) override;
+  uint32_t create_texture_float(uint32_t w, uint32_t h) override;
+  bool write_texture_float(uint32_t texture, ConstByteView rgba32f) override;
   void destroy_texture(uint32_t texture) override;
   bool write_texture(uint32_t texture, ConstByteView rgba) override;
   uint32_t create_target(uint32_t w, uint32_t h) override;
@@ -74,7 +76,9 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   struct Texture {
     IImage* image = nullptr;
     uint32_t width = 0, height = 0;
+    bool floats = false;   // R32G32B32A32Float (create_texture_float)
   };
+  uint32_t make_texture(uint32_t w, uint32_t h, bool floats);
   struct Target {
     IImage* color = nullptr;
     IImage* depth = nullptr;
