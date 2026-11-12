@@ -81,6 +81,13 @@ void Mpu401Output::send(uint8_t status, uint8_t data1, uint8_t data2) {
   if (kind != 0xC0 && kind != 0xD0) write_data(data2 & 0x7F);
 }
 
+void Mpu401Output::send_sysex(ConstByteView message) {
+  if (!present_ || message.size() < 2 || message[0] != 0xF0 || message[message.size() - 1] != 0xF7) return;
+  kernel::ScopedMutex lock(mutex_);
+  for (uint8_t b : message)
+    if (!write_data(b)) return;
+}
+
 void Mpu401Output::reset() {
   if (!present_) return;
   midi::silence(*this);

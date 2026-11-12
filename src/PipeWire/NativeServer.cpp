@@ -142,7 +142,9 @@ void build_format_param(pod::Builder& b, uint32_t param_id, const PcmFormat& for
 }
 
 NativeServer::NativeServer(Graph& graph, allocators::IAllocator& allocator, uint64_t (*clock)())
-    : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator), clock_(clock), virtuals_(allocator) {}
+    : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator), clock_(clock), virtuals_(allocator) {
+  if (clock) graph_.midi_bus().set_clock(clock);
+}
 
 NativeServer::~NativeServer() {
   for (UniquePointer<Client>& c : clients_.view()) graph_.remove_client(c->graph_client);
@@ -837,6 +839,7 @@ void NativeServer::tick() {
     }
   }
   running_nodes_ = running;
+  midi_waiting_ = graph_.midi_bus().pump(now) != 0;      // (programs' MIDI whose time has come, to the synthesizer)
   for (UniquePointer<Client>& c : clients_.view()) {
     if (c->closing) continue;
     update(*c);

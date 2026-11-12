@@ -70,7 +70,8 @@ class NativeServer final : public IProtocolServer {
   bool take_output(uint32_t client, ByteBuffer* out) override;
   void close_client(uint32_t client) override;
   void tick() override;
-  uint64_t tick_interval_us() const override { return running_nodes_ ? 5000 : 50000; }
+  // (1 ms while programs' MIDI waits for its time to sound)
+  uint64_t tick_interval_us() const override { return midi_waiting_ ? 1000 : running_nodes_ ? 5000 : 50000; }
   bool take_output_with_fds(uint32_t client, ByteBuffer* out, List<Fd>* fds) override;
   void set_descriptor_maker(IDescriptorMaker* maker) override { maker_ = maker; }
 
@@ -88,7 +89,7 @@ class NativeServer final : public IProtocolServer {
   // A port of a client node (NativeClientNode.cpp): its formats, the metadata and buffers the server gave it, and where its data goes.
   struct ClientPort {
     static constexpr uint32_t kMaxMetas = 8;
-    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a) {}
+    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a) {}
     uint32_t direction = 0, id = 0;
     uint32_t index = 0;            // its place in the node's io area (8 bytes each)
     uint64_t flags = 0;            // SPA_PORT_FLAG_* from its info
@@ -119,6 +120,7 @@ class NativeServer final : public IProtocolServer {
     uint32_t next_buffer = 0;
     uint64_t seq = 0;              // the SPA_META_Header seq the server writes next
     uint64_t video_seen = 0;       // (a watcher) the producer's last frame given
+    UmpDecoder ump_in;             // (a UMP output) its system exclusive pieces put together
   };
  private:
   struct Resource {
@@ -147,6 +149,7 @@ class NativeServer final : public IProtocolServer {
     uint32_t activation_mem = 0, io_mem = 0, driver_mem = 0;
     uint64_t position = 0, cycles = 0, triggered_at = 0;
     uint64_t next_cycle_ns = 0;    // clocked nodes (MIDI, video, virtual sinks): when the next cycle is due
+    uint64_t cycle_ns = 0;         // the time of the round being run (run_client_node): MIDI offsets are counted from it
     uint32_t seen_cycle = 0;       // (driving) the program's cycle counter when last looked at
     // The adapter's port format (F32 at the stream's own rate and channels when its EnumFormat names them) and the frames of a cycle (its node.latency).
     PcmFormat format{SampleFormat::F32Le, 48000, 2};
@@ -268,6 +271,7 @@ class NativeServer final : public IProtocolServer {
   uint64_t last_serial_ = 0;
   IDescriptorMaker* maker_ = nullptr;
   uint32_t running_nodes_ = 0;
+  bool midi_waiting_ = false;
   uint64_t (*clock_)() = nullptr;
   uint64_t ticks_ = 0;
   List<UniquePointer<VirtualSink>> virtuals_;

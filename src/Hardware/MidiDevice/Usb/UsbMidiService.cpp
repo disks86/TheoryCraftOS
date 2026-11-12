@@ -166,6 +166,20 @@ void UsbMidiService::play_program(uint8_t status, uint8_t data1, uint8_t data2) 
   live_->send(status, data1, data2);
 }
 
+void UsbMidiService::play_program_sysex(ConstByteView message) {
+  kernel::ScopedMutex lock(mutex_);
+  if (midi::IMidiOutput* out = sound_maker()) {
+    out->send_sysex(message);
+    return;
+  }
+  if (live_ && live_->running()) live_->send_sysex(message);      // (a reset to a synthesizer that is not playing changes nothing)
+}
+
+void UsbMidiService::send_sysex(ConstByteView message) {
+  kernel::ScopedMutex lock(mutex_);
+  if (midi::IMidiOutput* out = sound_maker()) out->send_sysex(message);
+}
+
 void UsbMidiService::route_input(uint8_t status, uint8_t data1, uint8_t data2) {
   ++routed_;
   if (tap_) tap_->send(status, data1, data2);

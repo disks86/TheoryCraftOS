@@ -313,10 +313,11 @@ uint64_t frame_period_ns(const VideoFormat& v) {
   return ns;
 }
 
-// A MIDI Sequence POD (spa_pod_sequence: unit, pad, then controls of offset, type and a POD) into messages: SPA_CONTROL_Midi's raw bytes and
-// SPA_CONTROL_UMP's packets; other controls are skipped.
+// A MIDI Sequence POD (spa_pod_sequence: unit, pad, then controls of offset, type and a POD) into messages, f(const MidiMessage&, uint32_t offset):
+// SPA_CONTROL_Midi's raw bytes (system exclusive whole, made with `allocator`) and SPA_CONTROL_UMP's packets (put together by `ump`, which keeps a
+// system exclusive message's pieces from one cycle to the next); other controls are skipped. `offset`: the control's frame in the cycle.
 template <class F>
-void parse_sequence(ConstByteView pod_bytes, F&& f) {
+void parse_sequence(ConstByteView pod_bytes, UmpDecoder& ump, allocators::IAllocator& allocator, F&& f) {
   if (pod_bytes.size() < 16) return;
   ByteReader h(pod_bytes.first(8));
   const uint32_t size = h.le32(), type = h.le32();
@@ -325,13 +326,14 @@ void parse_sequence(ConstByteView pod_bytes, F&& f) {
   uint64_t at = 0;
   while (body.size() - at >= 16) {
     ByteReader c(body.subview(at, 16));
-    c.le32();      // (the frame offset in the cycle: the server delivers a cycle's messages together)
+    const uint32_t offset = c.le32();
     const uint32_t control = c.le32(), value_size = c.le32();
     c.le32();      // (the value's type: Bytes)
     if (value_size > body.size() - at - 16) return;
     ConstByteView value = body.subview(at + 16, value_size);
+    auto at_offset = [&](const MidiMessage& m) { f(m, offset); };
     if (control == kControlMidi) {
-      parse_midi_bytes(value, f);
+      parse_midi_bytes(value, at_offset, &allocator);
     } else if (control == kControlUmp) {
       uint32_t words[4];
       uint64_t i = 0;
@@ -345,7 +347,7 @@ void parse_sequence(ConstByteView pod_bytes, F&& f) {
           words[k] = more.le32();
         }
         MidiMessage m;
-        if (ump_to_midi(ArrayView<const uint32_t>(words, n), &m)) f(m);
+        if (ump.decode(ArrayView<const uint32_t>(words, n), &m)) f(m, offset);
         i += uint64_t{n} * 4;
       }
     }
@@ -1229,12 +1231,16 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
         break;
       }
       case Media::Midi: {
-        // (a Sequence POD in the data; it cannot wrap: the chunk's offset is where it starts)
-        parse_sequence(a, [&](const MidiMessage& m0) {
+        // (a Sequence POD in the data; it cannot wrap: the chunk's offset is where it starts.) Each message sounds its offset's time after now: the
+        // cycle's messages keep their distances, a cycle late.
+        const uint64_t now = n.cycle_ns ? n.cycle_ns : now_ns();
+        const uint32_t rate = n.format.rate ? n.format.rate : 48000;
+        parse_sequence(a, p.ump_in, allocator_, [&](const MidiMessage& m0, uint32_t offset) {
           MidiMessage m = m0;
           m.source = n.node;
-          m.time_ns = now_ns();
-          graph_.midi_bus().publish(m);
+          const uint32_t in_cycle = offset < n.quantum ? offset : n.quantum;      // (an offset past the cycle: at its end)
+          m.time_ns = now + uint64_t{in_cycle} * 1000000000ull / rate;
+          graph_.midi_bus().publish(m, now);
         });
         break;
       }
@@ -1299,30 +1305,43 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       break;
     }
     case Media::Midi: {
-      // a Sequence of the messages waiting, each a control at offset 0 (SPA_CONTROL_UMP for a UMP port, else SPA_CONTROL_Midi's raw bytes)
+      // a Sequence of the messages whose time has come (before this cycle), each a control at its place in the cycle: the time it came, a cycle later
+      // (SPA_CONTROL_UMP for a UMP port, else SPA_CONTROL_Midi's raw bytes; system exclusive whole, or as UMP Data Messages)
       if (!n.midi_in || maxsize < 16) return false;
+      const uint32_t rate = n.format.rate ? n.format.rate : 48000;
+      const uint64_t period = frames_ns(n.quantum, rate);
+      const uint64_t now = n.cycle_ns;
+      const uint64_t window = now > period ? now - period : 0;
       ByteWriter w(data);
       w.le32(0);
       w.le32(pod::kSequence);
       w.le32(0);
       w.le32(0);
       uint64_t used = 16;
+      uint32_t last_offset = 0;
+      auto value_bytes = [&](const MidiMessage& m) -> uint64_t { return p.ump ? 4ull * ump_words_for(m) : m.wire().size(); };
       MidiMessage m;
-      while (maxsize - used >= 24 && n.midi_in->pop(&m)) {
-        const uint32_t value_size = p.ump ? 4 : m.size;
-        w.le32(0);
+      while (n.midi_in->pop_if([&](const MidiMessage& next) {
+               if (now && next.time_ns > now) return MidiQueue::Choice::Wait;      // (not yet)
+               const uint64_t padded = (value_bytes(next) + 7) & ~uint64_t{7};
+               if (padded + 16 > uint64_t{maxsize} - 16) return MidiQueue::Choice::Drop;      // (it can never fit this port's buffers)
+               return padded + 16 <= uint64_t{maxsize} - used ? MidiQueue::Choice::Take : MidiQueue::Choice::Wait;
+             }, &m)) {
+        uint64_t offset = m.time_ns > window ? (m.time_ns - window) * rate / 1000000000ull : 0;
+        if (offset >= n.quantum) offset = n.quantum - 1;
+        if (offset < last_offset) offset = last_offset;      // (in order: a Sequence's offsets never go back)
+        last_offset = static_cast<uint32_t>(offset);
+        const uint64_t size = value_bytes(m);
+        w.le32(last_offset);
         w.le32(p.ump ? kControlUmp : kControlMidi);
-        w.le32(value_size);
+        w.le32(static_cast<uint32_t>(size));
         w.le32(pod::kBytes);
-        if (p.ump) {
-          w.le32(midi_to_ump(m));
-          w.le32(0);
-        } else {
-          uint8_t padded[8] = {};
-          for (uint32_t k = 0; k < m.size; ++k) padded[k] = m.bytes[k];
-          w.bytes(ConstByteView(padded, 8));
-        }
-        used += 24;
+        if (p.ump) write_ump(m, [&](uint32_t word) { w.le32(word); });
+        else w.bytes(m.wire());
+        const uint64_t pad = ((size + 7) & ~uint64_t{7}) - size;
+        const uint8_t zeros[8] = {};
+        if (pad) w.bytes(ConstByteView(zeros, pad));
+        used += 16 + size + pad;
       }
       store<uint32_t>(data, 0, static_cast<uint32_t>(used - 8));
       got = static_cast<uint32_t>(used);
@@ -1427,6 +1446,7 @@ void NativeServer::trigger(ClientNode& n, uint64_t) {
 
 void NativeServer::run_client_node(ClientNode& n, uint64_t now) {
   if (!n.activation || !n.io) return;
+  n.cycle_ns = now;
   ByteView a = n.activation->memory();
   // two float ports (a pw_filter's left and right): what they played, put together; what they are to hear, taken apart
   auto play_pair = [&]() {

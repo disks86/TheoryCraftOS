@@ -57,6 +57,7 @@ class UsbMidiService final : public midi::IMidiOutput {
   // The sink programs play to: a sound maker, else the software synthesizer.
   midi::IMidiSink& program_output() { return program_output_; }
   void play_program(uint8_t status, uint8_t data1, uint8_t data2);
+  void play_program_sysex(ConstByteView message);
 
   // Takes over the MIDI devices present now and starts the thread (if the kernel runs threads). False only if the thread cannot be started.
   bool start();
@@ -81,6 +82,7 @@ class UsbMidiService final : public midi::IMidiOutput {
   // IMidiOutput - the notes of a song.
   bool available() const override;
   void send(uint8_t status, uint8_t data1, uint8_t data2) override;
+  void send_sysex(ConstByteView message) override;
   void reset() override;
   void flush() override;
 
@@ -89,6 +91,7 @@ class UsbMidiService final : public midi::IMidiOutput {
    public:
     explicit ProgramOutput(UsbMidiService& s) : service_(s) {}
     void send(uint8_t status, uint8_t data1, uint8_t data2) override { service_.play_program(status, data1, data2); }
+    void send_sysex(ConstByteView message) override { service_.play_program_sysex(message); }
     void reset() override { service_.reset(); }
 
    private:

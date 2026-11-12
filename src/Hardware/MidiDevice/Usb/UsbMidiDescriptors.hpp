@@ -47,6 +47,24 @@ bool parse_usb_midi_configuration(ConstByteView configuration, UsbMidiModel* out
 // Builds the packet for a channel message (status 0x80-0xEF) on `cable`; false for anything else.
 bool encode_usb_midi_packet(uint8_t cable, uint8_t status, uint8_t data1, uint8_t data2, uint8_t out[4]);
 
+// The packets of a system exclusive message (F0 .. F7) on `cable`: three bytes each with CIN 4, the last one with CIN 5, 6 or 7 (one, two or three bytes).
+// Calls put(const uint8_t packet[4]) for each; returns how many (0 when `message` is not one).
+template <class F>
+uint32_t encode_usb_midi_sysex(uint8_t cable, ConstByteView message, F&& put) {
+  if (message.size() < 2 || message[0] != 0xF0 || message[message.size() - 1] != 0xF7) return 0;
+  uint32_t packets = 0;
+  for (uint64_t at = 0; at < message.size(); at += 3) {
+    const uint64_t left = message.size() - at;
+    const uint8_t count = left >= 3 ? 3 : static_cast<uint8_t>(left);
+    const bool last = left <= 3;
+    uint8_t packet[4] = {static_cast<uint8_t>(((cable & 0x0F) << 4) | (last ? 0x4 + count : 0x4)), 0, 0, 0};
+    for (uint8_t k = 0; k < count; ++k) packet[1 + k] = message[at + k];
+    put(static_cast<const uint8_t*>(packet));
+    ++packets;
+  }
+  return packets;
+}
+
 // Calls receiver(context, status, data1, data2) for each channel message in the 4-byte packets of `data` (a trailing partial packet is ignored).
 // Packets of other kinds - system exclusive, system messages, clock - are skipped. Returns how many messages there were.
 using UsbMidiReceiver = void (*)(void* context, uint8_t status, uint8_t data1, uint8_t data2);

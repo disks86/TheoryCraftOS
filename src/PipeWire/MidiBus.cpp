@@ -97,23 +97,94 @@ bool ump_to_midi(ArrayView<const uint32_t> packet, MidiMessage* out) {
   return true;
 }
 
+bool make_sysex(allocators::IAllocator& allocator, ConstByteView bytes, MidiMessage* out) {
+  if (bytes.size() < 2 || bytes[0] != 0xF0 || bytes[bytes.size() - 1] != 0xF7) return false;
+  uint64_t length = 0;
+  for (uint64_t i = 0; i < bytes.size(); ++i) {
+    const uint8_t b = bytes[i];
+    if (b >= 0xF8) continue;
+    if (b >= 0x80 && i != 0 && i != bytes.size() - 1) return false;
+    ++length;
+  }
+  if (length > kMaxSysex) return false;
+  SharedPointer<ByteBuffer> buffer = SharedPointer<ByteBuffer>::make(allocator, allocator);
+  if (!buffer) return false;
+  for (uint64_t i = 0; i < bytes.size();) {      // (the runs between real-time bytes)
+    uint64_t end = i;
+    while (end < bytes.size() && bytes[end] < 0xF8) ++end;
+    if (end > i && !buffer->append(bytes.subview(i, end - i))) return false;
+    i = end + 1;
+  }
+  MidiMessage m;
+  m.sysex = util::move(buffer);
+  *out = util::move(m);
+  return true;
+}
+
+uint32_t ump_words_for(const MidiMessage& m) {
+  if (!m.is_sysex()) return 1;
+  const uint64_t body = m.sysex->size() >= 2 ? m.sysex->size() - 2 : 0;
+  const uint64_t packets = body == 0 ? 1 : (body + 5) / 6;
+  return static_cast<uint32_t>(packets * 2);
+}
+
+bool UmpDecoder::decode(ArrayView<const uint32_t> packet, MidiMessage* out) {
+  if (packet.size() == 0) return false;
+  const uint32_t w0 = packet[0];
+  if (w0 >> 28 != 0x3) return ump_to_midi(packet, out);
+  // a 64-bit Data Message: a piece of system exclusive (status 0 whole, 1 start, 2 continue, 3 end; up to six bytes)
+  if (packet.size() < 2) return false;
+  const uint32_t w1 = packet[1];
+  const uint32_t status = (w0 >> 20) & 0xF, count = (w0 >> 16) & 0xF;
+  if (status > 3 || count > 6) {
+    in_sysex_ = false;
+    return false;
+  }
+  if (status == 0 || status == 1) {
+    building_.clear();
+    const uint8_t start = 0xF0;
+    in_sysex_ = building_.append(ConstByteView(&start, 1));
+  } else if (!in_sysex_) {
+    return false;      // (a continuation without its start)
+  }
+  const uint8_t b[6] = {uint8_t(w0 >> 8), uint8_t(w0), uint8_t(w1 >> 24), uint8_t(w1 >> 16), uint8_t(w1 >> 8), uint8_t(w1)};
+  for (uint32_t k = 0; k < count && in_sysex_; ++k) {
+    const uint8_t d = b[k] & 0x7F;
+    in_sysex_ = building_.size() < kMaxSysex - 1 && building_.append(ConstByteView(&d, 1));
+  }
+  if (!in_sysex_ || status == 1 || status == 2) return false;
+  in_sysex_ = false;
+  const uint8_t end = 0xF7;
+  return building_.append(ConstByteView(&end, 1)) && make_sysex(allocator_, building_.view(), out);
+}
+
 uint32_t midi_to_ump(const MidiMessage& m) {
+  if (m.is_sysex()) return 0;
   const uint32_t type = m.bytes[0] >= 0xF0 ? 0x1u : 0x2u;
   return type << 28 | uint32_t(m.bytes[0]) << 16 | uint32_t(m.size > 1 ? m.bytes[1] : 0) << 8 | uint32_t(m.size > 2 ? m.bytes[2] : 0);
 }
 
 void MidiQueue::push(const MidiMessage& m) {
+  const uint64_t length = m.wire().size();
+  if (length > kMaxBytes) return;
   kernel::ScopedMutex guard(mutex_);
-  if (messages_.count() >= kMaxMessages) {
+  while (messages_.count() > 0 && (messages_.count() >= kMaxMessages || bytes_ > kMaxBytes - length)) {
+    bytes_ -= messages_.front()->wire().size();
     messages_.dequeue();
     ++lost_;
   }
-  if (!messages_.enqueue(m)) ++lost_;
+  if (messages_.enqueue(m)) bytes_ += length;
+  else ++lost_;
 }
 
 bool MidiQueue::pop(MidiMessage* out) {
   kernel::ScopedMutex guard(mutex_);
-  return messages_.dequeue(out);
+  MidiMessage* front = messages_.front();
+  if (!front) return false;
+  bytes_ -= front->wire().size();
+  *out = util::move(*front);
+  messages_.dequeue();
+  return true;
 }
 
 uint64_t MidiQueue::waiting() {
@@ -148,7 +219,12 @@ void MidiBus::unlisten(const MidiQueue* queue) {
     }
 }
 
-void MidiBus::deliver(const MidiMessage& m, bool to_output) {
+void MidiBus::play(midi::IMidiSink& output, const MidiMessage& m) {
+  if (m.is_sysex()) output.send_sysex(m.sysex->view());
+  else output.send(m.bytes[0], m.size > 1 ? m.bytes[1] : 0, m.size > 2 ? m.bytes[2] : 0);
+}
+
+void MidiBus::deliver(const MidiMessage& m, bool to_queues, bool to_output) {
   // the output and the queues are called with the bus's lock let go (copies of what is there now)
   midi::IMidiSink* output = nullptr;
   SharedPointer<MidiQueue> copies[kMaxListeners];
@@ -156,17 +232,50 @@ void MidiBus::deliver(const MidiMessage& m, bool to_output) {
   {
     kernel::ScopedMutex guard(mutex_);
     if (to_output) output = output_;
-    for (const SharedPointer<MidiQueue>& q : listeners_)
-      if (n < kMaxListeners && (m.source == 0 || q->owner() != m.source)) copies[n++] = q;
-    if (to_output) ++published_;
+    if (to_queues)
+      for (const SharedPointer<MidiQueue>& q : listeners_)
+        if (n < kMaxListeners && (m.source == 0 || q->owner() != m.source)) copies[n++] = q;
   }
-  if (output) output->send(m.bytes[0], m.size > 1 ? m.bytes[1] : 0, m.size > 2 ? m.bytes[2] : 0);
+  if (output) play(*output, m);
   for (uint32_t i = 0; i < n; ++i) copies[i]->push(m);
 }
 
-void MidiBus::publish(const MidiMessage& m) {
-  if (m.size == 0 || m.size > 3) return;
-  deliver(m, true);
+void MidiBus::publish(const MidiMessage& m, uint64_t now_ns) {
+  if (m.is_sysex() ? m.sysex->size() < 2 || m.sysex->size() > kMaxSysex : m.size == 0 || m.size > 3) return;
+  bool later = false;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    ++published_;
+    // (behind the ones already waiting when it is no later than they are, so the output hears a program's messages in order)
+    if ((m.time_ns > now_ns || scheduled_.count() > 0) && scheduled_.count() < kMaxScheduled) {
+      uint64_t at = scheduled_.count();
+      while (at > 0 && scheduled_[at - 1].time_ns > m.time_ns) --at;
+      later = scheduled_.insert(at, m);
+    }
+  }
+  deliver(m, true, !later);
+  if (later) pump(now_ns);
+}
+
+uint64_t MidiBus::pump(uint64_t now_ns) {
+  for (;;) {
+    MidiMessage m;
+    midi::IMidiSink* output = nullptr;
+    {
+      kernel::ScopedMutex guard(mutex_);
+      if (scheduled_.count() == 0) return 0;
+      if (scheduled_[0].time_ns > now_ns) return scheduled_[0].time_ns;
+      m = util::move(scheduled_[0]);
+      scheduled_.remove_at(0);
+      output = output_;
+    }
+    if (output) play(*output, m);
+  }
+}
+
+uint64_t MidiBus::next_due() {
+  kernel::ScopedMutex guard(mutex_);
+  return scheduled_.count() ? scheduled_[0].time_ns : 0;
 }
 
 void MidiBus::send(uint8_t status, uint8_t data1, uint8_t data2) {
@@ -176,7 +285,15 @@ void MidiBus::send(uint8_t status, uint8_t data1, uint8_t data2) {
   m.bytes[2] = data2;
   m.size = midi_message_size(status);
   if (m.size == 0) return;
-  deliver(m, false);
+  if (clock_) m.time_ns = clock_();
+  deliver(m, true, false);
+}
+
+void MidiBus::send_sysex(ConstByteView message) {
+  MidiMessage m;
+  if (!make_sysex(allocator_, message, &m)) return;
+  if (clock_) m.time_ns = clock_();
+  deliver(m, true, false);
 }
 
 }  // namespace pipewire

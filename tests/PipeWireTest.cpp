@@ -2456,10 +2456,20 @@ static void test_threads() {
 
 // ---- MIDI: the bus, its messages and UMP -------------------------------------------------------------------------------------------------------------
 
+static std::atomic<uint64_t> g_now_ns{1000000000ull};
+static uint64_t test_clock() { return g_now_ns.load(); }
+
 struct FakeMidiSink final : midi::IMidiSink {
   std::mutex m;
   std::vector<std::array<uint8_t, 3>> got;
-  void send(uint8_t status, uint8_t d1, uint8_t d2) override { std::lock_guard<std::mutex> g(m); got.push_back({status, d1, d2}); }
+  std::vector<std::vector<uint8_t>> sysex;
+  std::vector<uint64_t> when;      // (g_now_ns at each message, sysex too)
+  void send(uint8_t status, uint8_t d1, uint8_t d2) override { std::lock_guard<std::mutex> g(m); got.push_back({status, d1, d2}); when.push_back(g_now_ns); }
+  void send_sysex(ConstByteView x) override {
+    std::lock_guard<std::mutex> g(m);
+    sysex.emplace_back(x.data(), x.data() + x.size());
+    when.push_back(g_now_ns);
+  }
   void reset() override {}
   size_t count() { std::lock_guard<std::mutex> g(m); return got.size(); }
 };
@@ -2585,6 +2595,151 @@ static void test_midi_threads() {
   long expected = 0;      // (each listener hears the keyboard and every player but itself)
   for (int q = 0; q < 4; ++q) expected += long((q < kPlayers ? kPlayers - 1 : kPlayers) * kNotes + kNotes);
   CHECK(heard + lost == expected);
+  // messages for later from several threads while another pumps the clock: every one reaches the output, once (no lost or doubled message)
+  out.got.clear();
+  std::atomic<uint64_t> clock{0};
+  std::atomic<bool> playing{true};
+  std::thread pumper([&] {
+    while (playing.load() || bus.next_due()) {
+      bus.pump(clock.fetch_add(50) + 50);
+      std::this_thread::yield();
+    }
+  });
+  std::vector<std::thread> timed;
+  for (int p = 0; p < kPlayers; ++p)
+    timed.emplace_back([&, p] {
+      for (int i = 0; i < kNotes; ++i) {
+        MidiMessage m;
+        m.bytes[0] = uint8_t(0x90 | p); m.bytes[1] = uint8_t(i & 0x7F); m.bytes[2] = uint8_t((i >> 7) & 0x7F); m.size = 3;
+        m.source = uint32_t(100 + p);
+        const uint64_t now = clock.load();
+        m.time_ns = now + uint64_t(i % 7) * 30;      // (one in seven now, the others later)
+        bus.publish(m, now);
+      }
+    });
+  for (std::thread& t : timed) t.join();
+  playing = false;
+  pumper.join();
+  CHECK(out.count() == size_t(kPlayers * kNotes));
+  for (auto& q : queues) { MidiMessage m; while (q->pop(&m)) {} }
+  bus.set_output(nullptr);
+}
+
+// System exclusive (raw and UMP), the queues' byte limit, and the bus's output on time.
+static void test_midi_sysex_timing() {
+  // raw: whole with the allocator (a real-time byte inside is its own message, given first), skipped without; broken and unterminated ones dropped
+  const uint8_t bytes[] = {0xF0, 0x7E, 0x7F, 0xF8, 0x09, 0x01, 0xF7, 0x90, 1, 2, 0xF0, 1, 2, 0x80, 3, 4, 0xF0, 5, 6};
+  std::vector<MidiMessage> seen;
+  CHECK(parse_midi_bytes(ConstByteView(bytes, sizeof bytes), [&](const MidiMessage& m) { seen.push_back(m); }, &A) == 4);
+  CHECK(seen.size() == 4);
+  if (seen.size() == 4) {
+    CHECK(seen[0].bytes[0] == 0xF8 && !seen[0].is_sysex());
+    const uint8_t want[] = {0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7};
+    CHECK(seen[1].is_sysex() && seen[1].wire().size() == 6 && memcmp(seen[1].wire().data(), want, 6) == 0 && seen[1].size == 0);
+    CHECK(seen[2].bytes[0] == 0x90 && seen[3].bytes[0] == 0x80 && seen[3].bytes[1] == 3);      // (the sysex the note off broke is gone)
+  }
+  CHECK(parse_midi_bytes(ConstByteView(bytes, sizeof bytes), [&](const MidiMessage& m) { CHECK(!m.is_sysex()); }) == 3);
+  MidiMessage m;
+  const uint8_t not_sysex[] = {0xF0, 1, 0x90, 0xF7}, no_end[] = {0xF0, 1, 2}, minimal[] = {0xF0, 0xF7};
+  CHECK(!make_sysex(A, ConstByteView(not_sysex, 4), &m) && !make_sysex(A, ConstByteView(no_end, 3), &m) && make_sysex(A, ConstByteView(minimal, 2), &m));
+  std::vector<uint8_t> huge(kMaxSysex + 1, 0x11);
+  huge.front() = 0xF0; huge.back() = 0xF7;
+  CHECK(!make_sysex(A, ConstByteView(huge.data(), huge.size()), &m));
+  huge.pop_back(); huge.back() = 0xF7;
+  CHECK(make_sysex(A, ConstByteView(huge.data(), huge.size()), &m) && m.wire().size() == kMaxSysex);
+  // UMP: every length from empty to 40 data bytes and a long one, round trip through Data Messages (a channel message between the pieces)
+  for (uint32_t len : {0u, 1u, 5u, 6u, 7u, 12u, 13u, 40u, 1000u}) {
+    std::vector<uint8_t> x(len + 2);
+    x.front() = 0xF0; x.back() = 0xF7;
+    for (uint32_t k = 0; k < len; ++k) x[k + 1] = uint8_t((k * 7 + len) & 0x7F);
+    MidiMessage sx;
+    CHECK(make_sysex(A, ConstByteView(x.data(), x.size()), &sx));
+    std::vector<uint32_t> words;
+    CHECK(write_ump(sx, [&](uint32_t w) { words.push_back(w); }) == words.size() && words.size() == ump_words_for(sx));
+    UmpDecoder dec(A);
+    MidiMessage back, note;
+    int whole = 0, notes = 0;
+    for (size_t i = 0; i + 1 < words.size(); i += 2) {
+      const uint32_t pk[2] = {words[i], words[i + 1]};
+      if (dec.decode(ArrayView<const uint32_t>(pk, 2), &back)) ++whole;
+      const uint32_t nw[1] = {0x20903C40};
+      if (dec.decode(ArrayView<const uint32_t>(nw, 1), &note)) ++notes;
+    }
+    CHECK(whole == 1 && notes == int(words.size() / 2) && back.is_sysex() && back.wire().size() == x.size() &&
+          memcmp(back.wire().data(), x.data(), x.size()) == 0);
+  }
+  {
+    UmpDecoder dec(A);
+    const uint32_t cont[2] = {0x30220102, 0};      // (a continuation without its start)
+    CHECK(!dec.decode(ArrayView<const uint32_t>(cont, 2), &m) && !dec.building());
+    std::mt19937 rng(9);
+    for (int round = 0; round < 5000; ++round) {      // random packets: no crash; what comes out is MIDI 1.0
+      uint32_t w[2] = {uint32_t(rng()), uint32_t(rng())};
+      if (round % 3 == 0) w[0] = (w[0] & 0x0FFFFFFF) | 0x30000000;
+      MidiMessage out;
+      if (dec.decode(ArrayView<const uint32_t>(w, 1 + rng() % 2), &out)) {
+        if (out.is_sysex()) {
+          const ConstByteView v = out.wire();
+          CHECK(v.size() >= 2 && v[0] == 0xF0 && v[v.size() - 1] == 0xF7 && v.size() <= kMaxSysex);
+          for (uint64_t k = 1; k + 1 < v.size(); ++k) CHECK(v[k] < 0x80);
+        } else {
+          CHECK(out.size >= 1 && out.size <= 3 && out.bytes[0] >= 0x80);
+        }
+      }
+    }
+  }
+  // raw bytes with sysex: truncations and bit flips under the allocator
+  {
+    std::mt19937 rng(11);
+    for (int round = 0; round < 3000; ++round) {
+      std::vector<uint8_t> b(bytes, bytes + sizeof bytes);
+      if (round % 2) b.resize(rng() % (b.size() + 1));
+      else for (int k = 0; k < 3; ++k) b[rng() % b.size()] ^= uint8_t(1u << (rng() % 8));
+      parse_midi_bytes(ConstByteView(b.data(), b.size()), [&](const MidiMessage& x) {
+        if (x.is_sysex()) CHECK(x.wire().size() >= 2 && x.wire()[0] == 0xF0 && x.wire()[x.wire().size() - 1] == 0xF7);
+        else CHECK(x.size >= 1 && x.size <= 3);
+      }, &A);
+    }
+  }
+  // a queue keeps at most kMaxBytes; pop_if waits, drops and takes
+  MidiBus bus(A);
+  FakeMidiSink out;
+  bus.set_output(&out);
+  SharedPointer<MidiQueue> q = bus.listen(50);
+  std::vector<uint8_t> big(60000, 0x22);
+  big.front() = 0xF0; big.back() = 0xF7;
+  for (int i = 0; i < 20; ++i) bus.send_sysex(ConstByteView(big.data(), big.size()));
+  CHECK(q->waiting() == MidiQueue::kMaxBytes / 60000 && q->lost() == 20 - MidiQueue::kMaxBytes / 60000);
+  CHECK(out.sysex.empty());      // (a keyboard's sysex goes to the programs only)
+  CHECK(!q->pop_if([](const MidiMessage&) { return MidiQueue::Choice::Wait; }, &m) && q->waiting() == MidiQueue::kMaxBytes / 60000);
+  const uint64_t lost_before = q->lost();
+  CHECK(!q->pop_if([](const MidiMessage&) { return MidiQueue::Choice::Drop; }, &m) && q->waiting() == 0 && q->lost() == lost_before + 17);
+  // the output on time: later messages wait for pump(); one due now goes behind those already waiting that are not later
+  MidiMessage a1, a2, a3;
+  a1.bytes[0] = 0x90; a1.bytes[1] = 1; a1.size = 3; a1.source = 7; a1.time_ns = 100;
+  a2 = a1; a2.bytes[1] = 2; a2.time_ns = 50;
+  a3 = a1; a3.bytes[1] = 3; a3.time_ns = 0;
+  bus.publish(a1, 10);
+  bus.publish(a2, 10);
+  CHECK(out.count() == 0 && bus.next_due() == 50);
+  CHECK(q->waiting() == 2);      // (the other programs hear them at once, with their times)
+  bus.publish(a3, 10);
+  CHECK(out.count() == 1 && out.got[0][1] == 3);
+  CHECK(bus.pump(60) == 100 && out.count() == 2 && out.got[1][1] == 2);
+  CHECK(bus.pump(100) == 0 && out.count() == 3 && out.got[2][1] == 1 && bus.next_due() == 0);
+  MidiMessage sx;
+  CHECK(make_sysex(A, ConstByteView(minimal, 2), &sx));
+  sx.source = 7;
+  bus.publish(sx, 0);
+  CHECK(out.sysex.size() == 1 && out.sysex[0].size() == 2);
+  // more than kMaxScheduled waiting: the rest go at once
+  for (uint32_t i = 0; i < MidiBus::kMaxScheduled + 5; ++i) {
+    MidiMessage later = a1;
+    later.time_ns = 1000000 + i;
+    bus.publish(later, 0);
+  }
+  CHECK(out.count() == 3 + 5);
+  CHECK(bus.pump(~0ull) == 0 && out.count() == 3 + 5 + MidiBus::kMaxScheduled);
   bus.set_output(nullptr);
 }
 
@@ -2648,8 +2803,6 @@ static void test_video_channel() {
 
 // ---- client-node: metadata, client-allocated buffers, drivers, MIDI, video, filters, the adapter ------------------------------------------------------
 
-static std::atomic<uint64_t> g_now_ns{1000000000ull};
-static uint64_t test_clock() { return g_now_ns.load(); }
 
 // What the server has told a client node, gathered from its messages.
 struct NodeView {
@@ -2832,6 +2985,39 @@ static std::vector<uint8_t> sequence(const std::vector<std::vector<uint8_t>>& mi
   return out;
 }
 static void put_bytes(ByteView m, uint64_t at, const void* src, size_t n) { memcpy(m.data() + at, src, n); }
+// A Sequence of controls at offsets: {offset, control (2 Midi, 4 UMP), the value's bytes}.
+struct Control {
+  uint32_t offset, type;
+  std::vector<uint8_t> value;
+};
+static std::vector<uint8_t> sequence_at(const std::vector<Control>& controls) {
+  ByteBuffer body(A);
+  body.put32(0); body.put32(0);
+  for (const Control& c : controls) {
+    body.put32(c.offset); body.put32(c.type); body.put32(uint32_t(c.value.size())); body.put32(pod::kBytes);
+    body.append(ConstByteView(c.value.data(), c.value.size()));
+    body.put_zeros((8 - c.value.size() % 8) % 8);
+  }
+  ByteBuffer pod(A);
+  pod.put32(uint32_t(body.size())); pod.put32(pod::kSequence); pod.append(body.view());
+  return std::vector<uint8_t>(pod.view().data(), pod.view().data() + pod.size());
+}
+static std::vector<Control> read_sequence(const uint8_t* d, uint32_t size) {
+  std::vector<Control> out;
+  uint32_t at = 16;
+  while (at + 16 <= size) {
+    uint32_t off, type, len; memcpy(&off, d + at, 4); memcpy(&type, d + at + 4, 4); memcpy(&len, d + at + 8, 4);
+    if (len > size - at - 16) break;
+    out.push_back({off, type, std::vector<uint8_t>(d + at + 16, d + at + 16 + len)});
+    at += 16 + ((len + 7) & ~7u);
+  }
+  return out;
+}
+static std::vector<uint8_t> words_bytes(const std::vector<uint32_t>& w) {
+  std::vector<uint8_t> b(w.size() * 4);
+  memcpy(b.data(), w.data(), b.size());
+  return b;
+}
 
 static void test_client_node_media() {
   FakeDevice dev;
@@ -2921,6 +3107,85 @@ static void test_client_node_media() {
     }
     CHECK(heard.size() == 5);
     if (heard.size() == 5) CHECK(heard[0].bytes[1] == 60 && heard[3].bytes[1] == 0x3E && heard[4].bytes[1] == 70);
+
+    // ---- timing and system exclusive: notes at offsets 0, 480 and 960 (0, 10 and 20 ms at 48 kHz), a GM reset in raw bytes at 960, a 13-byte sysex
+    // in UMP pieces at 240; the synthesizer hears each at its time, the UMP listener gets them at the same distances and the sysex whole
+    synth.got.clear(); synth.sysex.clear(); synth.when.clear();
+    std::vector<uint32_t> ump_sx;
+    MidiMessage long_sx;
+    std::vector<uint8_t> long_bytes = {0xF0, 0x43, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0xF7};
+    CHECK(make_sysex(A, ConstByteView(long_bytes.data(), long_bytes.size()), &long_sx));
+    write_ump(long_sx, [&](uint32_t w) { ump_sx.push_back(w); });
+    CHECK(ump_sx.size() == 6);
+    const std::vector<uint8_t> timed = sequence_at({{0, 2, {0x90, 40, 100}},
+                                                    {240, 4, words_bytes({ump_sx[0], ump_sx[1]})},
+                                                    {300, 4, words_bytes({ump_sx[2], ump_sx[3], ump_sx[4], ump_sx[5]})},
+                                                    {480, 2, {0x90, 41, 100}},
+                                                    {960, 2, {0x90, 42, 100, 0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7}}});
+    // (the player's next cycle: answered with the sequence)
+    for (int i = 0; i < 60 && u32_at(mo.activation->memory(), 0) != 1; ++i) tick(1);
+    {
+      ByteView buf = mo.buffer(1, 0, 0);
+      const uint32_t data_off = uint32_t(mo.ports[{1, 0}].bufs[0].data);
+      put_bytes(buf, data_off, timed.data(), timed.size());
+      put_u32(buf, 0, 0); put_u32(buf, 4, uint32_t(timed.size()));
+      put_u32(mo.io(1, 0), 0, 2); put_u32(mo.io(1, 0), 4, 0);
+      put_u32(mo.activation->memory(), 0, 3);
+    }
+    const uint64_t played = g_now_ns + 1000000ull;      // (taken on the next tick)
+    std::vector<std::pair<uint64_t, Control>> got;      // (the listener: its cycle's time, each control)
+    for (int i = 0; i < 80; ++i) {
+      tick(1);
+      if (u32_at(mi.activation->memory(), 0) == 1) {
+        const uint32_t id = u32_at(mi.io(0, 0), 4);
+        if (u32_at(mi.io(0, 0), 0) == 2 && id < 2) {
+          ByteView in = mi.buffer(0, 0, id);
+          const uint32_t off = uint32_t(mi.ports[{0, 0}].bufs[id].data), size = u32_at(in, 4);
+          for (const Control& c : read_sequence(in.data() + off, size)) got.push_back({g_now_ns.load(), c});
+        }
+        put_u32(mi.io(0, 0), 0, 1);
+        put_u32(mi.activation->memory(), 0, 3);
+      }
+      if (u32_at(mo.activation->memory(), 0) == 1) put_u32(mo.activation->memory(), 0, 3);      // (the player has nothing more)
+    }
+    CHECK(synth.got.size() == 3 && synth.sysex.size() == 2 && synth.when.size() == 5);
+    if (synth.when.size() == 5 && synth.got.size() == 3 && synth.sysex.size() == 2) {
+      // in time order: note 40 at once, the long sysex at 5 ms (its last piece's offset: 300 = 6.25 ms), note 41 at 10 ms, note 42 and the reset at 20 ms
+      CHECK(synth.got[0][1] == 40 && synth.got[1][1] == 41 && synth.got[2][1] == 42);
+      CHECK(synth.sysex[0] == long_bytes && synth.sysex[1] == std::vector<uint8_t>({0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7}));
+      const int64_t ms[5] = {0, 6, 10, 20, 20};
+      for (int k = 0; k < 5; ++k) {
+        const int64_t late = int64_t(synth.when[size_t(k)]) - int64_t(played) - ms[k] * 1000000;
+        CHECK(late >= 0 && late <= 1000000);      // (within the 1 ms tick)
+      }
+    }
+    // the listener: its controls' times (the cycle's time, a period back, plus the offset) keep the distances
+    const double period_ns = 1024.0 * 1e9 / 48000.0;
+    std::vector<double> times;
+    std::vector<uint32_t> listener_words;
+    UmpDecoder dec(A);
+    std::vector<std::vector<uint8_t>> listener_sysex;
+    for (const auto& [cycle, c] : got) {
+      CHECK(c.type == 4 && c.value.size() % 4 == 0);
+      std::vector<uint32_t> w(c.value.size() / 4);
+      memcpy(w.data(), c.value.data(), c.value.size());
+      for (size_t i = 0; i < w.size();) {
+        const uint32_t n = ump_packet_words(w[i]);
+        if (i + n > w.size()) break;
+        MidiMessage x;
+        if (dec.decode(ArrayView<const uint32_t>(w.data() + i, n), &x)) {
+          times.push_back(double(cycle) - period_ns + c.offset * 1e9 / 48000.0);
+          if (x.is_sysex()) listener_sysex.emplace_back(x.wire().data(), x.wire().data() + x.wire().size());
+        }
+        i += n;
+      }
+    }
+    CHECK(times.size() == 5 && listener_sysex.size() == 2);
+    if (times.size() == 5) {
+      const double want[5] = {0, 6.25, 10, 20, 20};
+      for (int k = 0; k < 5; ++k) CHECK(std::abs((times[size_t(k)] - times[0]) / 1e6 - want[k]) < 1.5);
+    }
+    if (listener_sysex.size() == 2) CHECK(listener_sysex[0] == long_bytes);
   }
   c.send(0, 7, [](pod::Builder& b) { b.int32(3); });
   c.send(0, 7, [](pod::Builder& b) { b.int32(4); });
@@ -3385,6 +3650,7 @@ int main() {
   test_threads();
   test_midi_bus();
   test_midi_threads();
+  test_midi_sysex_timing();
   test_video_channel();
   test_client_node_media();
   test_socket_fds_in();
