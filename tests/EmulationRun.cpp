@@ -52,6 +52,12 @@
 #endif
 // With both -DTCOS_EMU_WAYLAND and -DTCOS_EMU_DXG the compositor also takes GPU buffers (zwp_linux_dmabuf_v1: dmabufs of /dev/dxg), and the stand-in desktop
 // draws every other round with a 2D renderer on the adapter's device (the image sampled in place), the others on the CPU. tests/wayland_dmabuf_emulated.sh.
+// With -DTCOS_EMU_GL the program also has the kernel's OpenGL (src/OpenGl over the CPU renderer), reached through /dev/dxg's TCOS_DXG_IOCTL_GL as in the kernel:
+// what src/Linux/libegl runs on. tests/linux_egl_wayland_emulated.sh.
+#ifdef TCOS_EMU_GL
+#include "OpenGl/GlService.hpp"
+#include "OpenGl/WindowsGl.hpp"
+#endif
 #if defined(TCOS_EMU_WAYLAND) && defined(TCOS_EMU_DXG)
 #define TCOS_EMU_DMABUF 1
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
@@ -362,6 +368,10 @@ int main(int argc, char** argv) {
   dxgk::set_system_kernel(&dxkernel);
   process::win32k::install();
   process::win32k::install_dxg();
+#endif
+#ifdef TCOS_EMU_GL
+  opengl::GlService gl_service(a);
+  opengl::install_linux_gl(gl_service);
 #endif
 #ifdef TCOS_EMU_X11
   // With -DTCOS_EMU_X11 the kernel's X server listens for the program at DISPLAY=:0 (the abstract name and /tmp/.X11-unix/X0 of the Linux tree), on a thread

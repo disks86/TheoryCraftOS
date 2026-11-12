@@ -1,12 +1,16 @@
 # OpenGL
 
 TheoryCraftOS has one OpenGL implementation, in the kernel (`src/OpenGl`). Every program personality reaches the same code: a user-mode library only encodes GL commands into
-a stream and hands it over. Windows programs use `opengl32.dll` (`src/Windows/opengl32`); a Linux `libGL` would use the same client header and service.
+a stream and hands it over. Windows programs use `opengl32.dll` (`src/Windows/opengl32`); Linux programs use `libEGL.so.1` (`src/Linux/libegl`, see
+[Linux: EGL and OpenGL ES](#linux-egl-and-opengl-es)), with the same client header, generated entry points and service.
 
 ```
-program ── opengl32.dll ─────────── NtTcosOpenGl (509) ── GlService ── GlApi ── webgl::GlContext ── rasterizer + shader interpreter
-           GlEntries.inc (generated)  src/Process/WindowsOpenGl.hpp     (contexts,   (desktop GL,   (src/WebGl: objects, draws,
-           + WGL (opengl32.c)         src/OpenGl/WindowsGl.cpp          surfaces)    fixed function) GLSL ES front end)
+program ── opengl32.dll ─────────── NtTcosOpenGl (509) ──┐
+           GlEntries.inc (generated)  src/Process/WindowsOpenGl.hpp
+           + WGL (opengl32.c)                            ├─ src/OpenGl/WindowsGl.cpp ── GlService ── GlApi ── webgl::GlContext ── rasterizer + shader interpreter
+program ── libEGL.so.1 ──────────── /dev/dxg ioctl ──────┘                             (contexts,   (desktop GL,   (src/WebGl: objects, draws,
+           GlEntries.inc + EGL        TCOS_DXG_IOCTL_GL                                  surfaces)    fixed function, GLSL ES front end)
+           (src/Linux/libegl)         (src/Process/DxgDevice.h)                                       OpenGL ES)
 ```
 
 ## The pieces
@@ -46,6 +50,49 @@ What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAG
   contexts, a 3.3 core context, swaps) and Wine's `opengl32` test (`tests/windows/wine/opengl32`, 4111 checks, 299 failing when written).
   Build the program into `build/winetests/opengl32_own.exe` (`x86_64-w64-mingw32-gcc -O1 -o build/winetests/opengl32_own.exe tests/windows/opengltest.c -lopengl32 -lgdi32 -luser32`)
   and run `scripts/winetest.sh opengl32 own opengl` from a short path (a symlink to the checkout, with `build` a symlink to a build directory configured from it).
+
+## Linux: EGL and OpenGL ES
+
+`src/Linux/libegl/libegl.c` is EGL 1.5 for glibc programs, built by `src/Linux/libegl/build.sh` against the development machine's glibc and libwayland-client
+(x86-64 only for now). It is installed in the Linux tree as `/usr/lib/libEGL.so.1`; `libGLESv2.so.2`, `libGL.so.1` and `libOpenGL.so.0` are empty libraries that
+need it, so a program linked against Mesa's (glvnd's) libraries, or one that opens them with `dlopen` and looks commands up with `dlsym` (libepoxy: GTK), reaches
+the one copy of the state in `libEGL.so.1`.
+
+- **Transport.** The 64-byte request of `NtTcosOpenGl` (`src/Process/WindowsOpenGl.hpp`) goes to the kernel with `/dev/dxg`'s `TCOS_DXG_IOCTL_GL`
+  (`src/Process/DxgDevice.h`); `opengl::gl_request` serves both. For a Linux process, memory handed to the program (strings, mapped buffers) comes from its mmap
+  area (`linuxabi::map_user_memory`) and the kernel never shows a window: SWAP answers 0 and the library reads the picture itself. `DESTROY_SURFACE` (9) is new
+  (eglDestroySurface; WGL never needed it).
+- **OpenGL ES.** A context made with the ES flag (8) reports `OpenGL ES 3.0` / `OpenGL ES GLSL ES 3.00`, 3.0 for `GL_MAJOR_VERSION`/`GL_MINOR_VERSION` and a list of
+  `GL_OES_*`/`GL_EXT_*` extensions; its shaders are always GLSL ES (one without `#version` is 1.00, not desktop 1.10). Otherwise it is the compatibility context, which
+  allows what ES allows (client arrays with the default vertex array). ES 2.0 and 3.0 are given (a 3.0 context for both), not 1.x or 3.1+.
+- **Desktop OpenGL** through EGL (`EGL_OPENGL_API`): up to 3.3, core (the default from 3.2, as EGL says) or compatibility.
+- **Displays.** Wayland (`EGL_KHR_platform_wayland`, `EGL_EXT_platform_wayland`, and `eglGetDisplay` of a `wl_display`, recognised by its interface pointer as Mesa
+  does) and surfaceless (`EGL_MESA_platform_surfaceless`, and `EGL_DEFAULT_DISPLAY`): pbuffers and contexts without a surface (`EGL_KHR_surfaceless_context`). Six
+  configs: RGBA8 or RGB8 (`'AR24'` / `'XR24'` as the native visual), with depth 24 + stencil 8, depth 24, or neither, each for windows and pbuffers and every API.
+  An `eglChooseConfig` that does not name a renderable type matches every config (EGL's default, ES 1.x, would match none).
+- **Window surfaces** are `wl_egl_window`s (libwayland-egl): the library takes `driver_private` and the resize and destroy callbacks. `eglSwapBuffers` swaps the
+  kernel's images, reads the new front image (top row first, B G R A) straight into a `wl_shm` buffer (`ARGB8888`, or `XRGB8888` for a config without alpha; one copy)
+  and attaches, damages (`damage_buffer` from version 4; the rectangles of `EGL_KHR/EXT_swap_buffers_with_damage` flipped to the buffer's rows) and commits it. With
+  a swap interval of 1 (the default) a swap first waits for the frame callback of the one before; 0 does not wait. Each window surface keeps up to three buffers and
+  its own event queue and wrappers of the `wl_surface` and `wl_shm`, so the program's queues never see its events and two threads swapping two windows never share
+  one. `wl_egl_window_resize` takes effect at once when the surface is current on the calling thread (the kernel's images are remade), else at the next swap; its
+  `dx`/`dy` move the next buffer (`wl_surface.offset` from version 5).
+- **Objects.** Handles are pointers checked against their display's lists, so a stale or made-up one is an EGL error. A context or surface destroyed while current
+  goes when it is released (EGL's "marked for deletion"); `eglTerminate` marks everything. A context current on another thread is `EGL_BAD_ACCESS` (the kernel's
+  `STATUS_RESOURCE_IN_USE`). Each thread's command buffer is allocated on first use (only a pointer is in thread-local storage, as a library opened with `dlopen`
+  must keep it small) and goes, with what it had current, when the thread ends.
+- **Fences** (EGL 1.5, `EGL_KHR_fence_sync`): every command has run when the call that sent it returns, so a fence is signalled when it is made.
+- **Test.** `tests/linux_egl_wayland_emulated.sh` runs `tests/linux/eglwayland.c` (86 checks: strings, configs and their order, ES 2.0/3.0 yes and 1.x/3.1 no, a
+  window surface on a decorated xdg-shell toplevel, GLSL ES 1.00 and 3.00 programs read back, swaps with interval 1 and 0 and with damage, a resize, a fence, a pbuffer
+  with a shared context, a second thread refused the busy context and drawing with its own, `dlopen`/`dlsym` of `libGLESv2.so.2` and `libGL.so.1`, a desktop 3.3 core
+  context, `eglGetProcAddress`) on the kernel's CPU emulator with the compositor and the kernel's GL (`-DTCOS_EMU_GL`); the window must reach the stand-in desktop with
+  the last frame's colour. `tests/run_host_tests.sh OpenGlTest` covers ES contexts and surface destruction in the service. On the real kernel in QEMU (the program
+  as the autorun, with `hold` as its argument to keep the window four seconds) it passed its 86 checks with standard VGA (the CPU renderer) and on virgl (its draws
+  on the GPU), and the framed window showed the last frame. (It needed `clock_nanosleep`, Linux system call 230, which glibc's `nanosleep` makes: added.)
+- **Not done.** No GLX (X11 programs), GBM, `EGL_KHR_image_base` / dmabuf import or export (`EGL_EXT_image_dma_buf_import`, `EGL_MESA_image_dma_buf_export`), buffer age,
+  `EGL_EXT_present_opaque`, sRGB window surfaces, multisampled configs, OpenGL ES 1.x or 3.1+, a read surface other than the draw surface (the context reads where it
+  draws), or binding pbuffers to textures. Frames go through `wl_shm` (one CPU copy into the buffer, and the compositor's), not a GPU buffer, even when the kernel's GL
+  drew on the 3D hardware. Only x86-64 (the development machine has no other C library), and not yet tried with GTK or Qt inside the OS.
 
 ## The 3D hardware
 

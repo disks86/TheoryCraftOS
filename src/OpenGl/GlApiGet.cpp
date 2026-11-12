@@ -39,6 +39,14 @@ const char* const kExtensions[] = {
 constexpr uint32_t kExtensionCount = sizeof(kExtensions) / sizeof(kExtensions[0]) - 0;
 
 bool real_extension(const char* e) { return StringView(e) != StringView("GL_ARB_blend_func_extended_unavailable_placeholder"); }
+// What an OpenGL ES context (EGL) reports: the ES names of what the engine does beyond ES 3.0's core.
+const char* const kEsExtensions[] = {
+    "GL_OES_element_index_uint", "GL_OES_texture_npot", "GL_OES_rgb8_rgba8", "GL_OES_depth24", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_standard_derivatives",
+    "GL_OES_vertex_array_object", "GL_EXT_read_format_bgra", "GL_EXT_unpack_subimage", "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax", "GL_EXT_texture_compression_s3tc"};
+ArrayView<const char* const> extensions_of(bool es) {
+  return es ? ArrayView<const char* const>(kEsExtensions, sizeof(kEsExtensions) / sizeof(kEsExtensions[0]))
+            : ArrayView<const char* const>(kExtensions, sizeof(kExtensions) / sizeof(kExtensions[0]));
+}
 }  // namespace
 
 uint64_t GlApi::glGetError() {
@@ -59,13 +67,13 @@ uint64_t GlApi::glGetString(GLenum name) {
       }
       return client_string(renderer_.c_str());
     }
-    case GL_VERSION: return client_string(kVersionString);
-    case GL_SHADING_LANGUAGE_VERSION: return client_string(kGlslVersionString);
+    case GL_VERSION: return client_string(config_.es ? kEsVersionString : kVersionString);
+    case GL_SHADING_LANGUAGE_VERSION: return client_string(config_.es ? kEsGlslVersionString : kGlslVersionString);
     case GL_EXTENSIONS: {
       if (config_.core_profile) { error(GL_INVALID_ENUM); return 0; }
       if (!extensions_address_) {
         String all(a_);
-        for (const char* e : kExtensions) {
+        for (const char* e : extensions_of(config_.es)) {
           if (!real_extension(e)) continue;
           all.append(e);
           all.append(" ");
@@ -85,7 +93,7 @@ uint64_t GlApi::glGetString(GLenum name) {
 uint64_t GlApi::glGetStringi(GLenum name, GLuint index) {
   if (name != GL_EXTENSIONS) { error(GL_INVALID_ENUM); return 0; }
   uint32_t at = 0;
-  for (const char* e : kExtensions) {
+  for (const char* e : extensions_of(config_.es)) {
     if (!real_extension(e)) continue;
     if (at == index) return client_string(e);
     ++at;
@@ -132,7 +140,7 @@ bool GlApi::get_values(uint32_t pname, double* out, uint32_t* count, uint32_t* k
     case GL_MINOR_VERSION: return one(config_.minor);
     case GL_CONTEXT_FLAGS: return one((config_.forward_compatible ? GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT : 0) | (config_.debug ? GL_CONTEXT_FLAG_DEBUG_BIT : 0));
     case GL_CONTEXT_PROFILE_MASK: return one(config_.core_profile ? GL_CONTEXT_CORE_PROFILE_BIT : GL_CONTEXT_COMPATIBILITY_PROFILE_BIT);
-    case GL_NUM_EXTENSIONS: { uint32_t n = 0; for (const char* e : kExtensions) if (real_extension(e)) ++n; return one(n); }
+    case GL_NUM_EXTENSIONS: { uint32_t n = 0; for (const char* e : extensions_of(config_.es)) if (real_extension(e)) ++n; return one(n); }
     case GL_MAX_LIGHTS: return one(kMaxLights);
     case GL_MAX_CLIP_PLANES: return one(kMaxClipPlanes);
     case GL_MAX_MODELVIEW_STACK_DEPTH: return one(kModelviewDepth);

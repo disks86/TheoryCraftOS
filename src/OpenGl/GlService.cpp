@@ -72,6 +72,11 @@ GlStatus GlService::create_context(uint64_t pid, const ContextRequest& request, 
   config.core_profile = request.core_profile;
   config.forward_compatible = request.forward_compatible;
   config.debug = request.debug;
+  config.es = request.es;
+  if (config.es) {      // (every ES context is 3.0, which runs ES 2.0 programs too)
+    config.major = 3;
+    config.minor = 0;
+  }
   c->api = UniquePointer<GlApi>::make(a_, a_, *group, config);
   if (!c->api) return GlStatus::NoMemory;
   c->group = group;
@@ -211,6 +216,24 @@ GlStatus GlService::swap(uint64_t pid, uint64_t window, uint32_t width, uint32_t
   }
   if (present && w) present(present_context, window, rows.view(), w, h);
   return GlStatus::Ok;
+}
+
+GlStatus GlService::destroy_surface(uint64_t pid, uint64_t window) {
+  SharedPointer<Process> p = process(pid, false);
+  if (!p) return GlStatus::InvalidHandle;
+  kernel::ScopedMutex g(p->lock);
+  for (uint64_t i = 0; i < p->surfaces.count(); ++i) {
+    if (!p->surfaces[i] || p->surfaces[i]->window != window) continue;
+    GlSurface* gone = p->surfaces[i]->surface.get();
+    for (const UniquePointer<Context>& c : p->contexts) {
+      if (!c || !c->api || c->api->surface() != gone) continue;
+      c->api->bind_surface(nullptr);
+      c->window = 0;
+    }
+    p->surfaces.remove_at(i);
+    return GlStatus::Ok;
+  }
+  return GlStatus::InvalidHandle;
 }
 
 bool GlService::take_flushed(uint64_t pid, uint64_t window) {

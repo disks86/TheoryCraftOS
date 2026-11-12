@@ -33,6 +33,7 @@ namespace opengl {
 struct ContextRequest {
   uint32_t major = 4, minor = 6;
   bool core_profile = false, forward_compatible = false, debug = false;
+  bool es = false;         // OpenGL ES (EGL): the version strings, extensions and shading language of OpenGL ES 3.0
   uint32_t share = 0;      // a context of the same process whose objects the new one shares (0: none)
 };
 
@@ -68,6 +69,8 @@ class GlService {
   GlStatus read_front(uint64_t pid, uint64_t window, ByteView out, uint32_t pitch, uint32_t* width, uint32_t* height);
   // A single-buffered surface that was flushed since the last call (glFlush): shown like a swap would.
   bool take_flushed(uint64_t pid, uint64_t window);
+  // The surface of a window goes (eglDestroySurface); a context drawing to it is left with no drawable. InvalidHandle if there is none.
+  GlStatus destroy_surface(uint64_t pid, uint64_t window);
   void process_exited(uint64_t pid);
   uint32_t context_count(uint64_t pid);
   // How a context's draws have gone so far (on the 3D hardware or on the CPU); false if there is no such context. `accelerator` (optional): the name of the 3D hardware

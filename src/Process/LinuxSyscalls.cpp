@@ -35,7 +35,7 @@ constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 2
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
-enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
+enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, ClockNanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
@@ -54,7 +54,7 @@ constexpr NumberEntry kNumbers[] = {
     {39, 172, Call::Getpid},       {186, 178, Call::Gettid},    {102, 174, Call::Getuid},     {104, 176, Call::Getgid},
     {107, 175, Call::Getuid},      {108, 177, Call::Getgid},    {118, 148, Call::Getresid},   {120, 150, Call::Getresid},      // (geteuid, getegid, getresuid, getresgid: root)
     {60, 93, Call::Exit},          {231, 94, Call::ExitGroup},  {63, 160, Call::Uname},       {228, 113, Call::ClockGettime},
-    {35, 101, Call::Nanosleep},    {24, 124, Call::SchedYield}, {218, 96, Call::SetTidAddress},
+    {35, 101, Call::Nanosleep},    {230, 115, Call::ClockNanosleep},    {24, 124, Call::SchedYield}, {218, 96, Call::SetTidAddress},
     {12, 214, Call::Brk},          {9, 222, Call::Mmap},        {11, 215, Call::Munmap},      {10, 226, Call::Mprotect},
     {158, kAbsent, Call::ArchPrctl}, {16, 29, Call::Ioctl},     {5, 80, Call::Fstat},         {262, 79, Call::Newfstatat},
     {8, 62, Call::Lseek},          {257, 56, Call::Openat},     {267, 78, Call::Readlinkat},  {13, 134, Call::RtSigaction},
@@ -337,6 +337,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Uname: return write_uname(process, a[0]);
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);
       case Call::Nanosleep: return nanosleep(process, a[0], a[1]);
+      case Call::ClockNanosleep: return clock_nanosleep(process, a[0], a[1], a[2]);
       case Call::Brk: return do_brk(process, a[0]);
       case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
@@ -465,6 +466,25 @@ class LinuxSyscalls final : public ISyscallInterface {
     return 0;
   }
 
+  // clock_nanosleep (what glibc's nanosleep and sleep call): a relative time, or with TIMER_ABSTIME a time of the clock to sleep until (none if it passed).
+  // Sleeps are never interrupted, so the time left is never written.
+  static uint64_t clock_nanosleep(Process& process, uint64_t clock, uint64_t flags, uint64_t request) {
+    constexpr uint64_t kTimerAbstime = 1;
+    if (clock != 0 && clock != 1 && clock != 4 && clock != 7) return error(kEinval);      // REALTIME, MONOTONIC, MONOTONIC_RAW, BOOTTIME
+    if (flags & ~kTimerAbstime) return error(kEinval);
+    uint64_t seconds = 0, nanos = 0;
+    if (!process.read_user_u64(request, &seconds) || !process.read_user_u64(request + 8, &nanos)) return error(kEfault);
+    if (int64_t(seconds) < 0 || nanos >= 1000000000u) return error(kEinval);
+    const uint64_t kMaxSeconds = (~uint64_t{0} - 999999999u) / 1000000000u;
+    uint64_t ns = seconds > kMaxSeconds ? ~uint64_t{0} : seconds * 1000000000u + nanos;
+    if (flags & kTimerAbstime) {
+      const uint64_t now = clock == 0 ? process.host().realtime_ns() : process.host().monotonic_ns();
+      ns = ns > now ? ns - now : 0;
+    }
+    if (ns) process.block_sleep(ns);
+    return 0;
+  }
+
   UserArch arch_;
 };
 
@@ -472,6 +492,17 @@ namespace {
 // Constant-initialised: no run-time setup, nothing to guard.
 constexpr LinuxSyscalls kX86(UserArch::X86_64), kArm(UserArch::AArch64), kRiscV(UserArch::RiscV64), kLoong(UserArch::LoongArch64);
 }  // namespace
+
+namespace linuxabi {
+uint64_t map_user_memory(Process& process, uint64_t bytes) {
+  const uint64_t r = do_mmap(process, 0, bytes, kProtRead | kProtWrite, kMapPrivate | kMapAnonymous, ~uint64_t{0}, 0);
+  return r > ~uint64_t{4095} ? 0 : r;      // (-errno is a failure)
+}
+void unmap_user_memory(Process& process, uint64_t address, uint64_t bytes) {
+  uint64_t size = 0;
+  if (address && AddressSpace::round_up(bytes ? bytes : 1, &size)) do_munmap(process, address, size);
+}
+}  // namespace linuxabi
 
 const ISyscallInterface& linux_interface(UserArch arch) {
   return arch == UserArch::X86_64 ? kX86 : arch == UserArch::AArch64 ? kArm : arch == UserArch::LoongArch64 ? kLoong : kRiscV;
