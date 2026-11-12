@@ -1045,6 +1045,9 @@ void Server::map_window(Surface& s) {
     }
   }
   if (s.role == Role::Popup && s.grab) set_keyboard_focus(&s);
+  // A new window takes the activation and the keyboard, as a program's window does when it is first shown on the desktop (which takes the activation
+  // from what the session reports, so a window nobody activates would never get keys until it is clicked).
+  if (s.role == Role::Toplevel) activate_locked(&s);
   pointer_moved(false);
 }
 

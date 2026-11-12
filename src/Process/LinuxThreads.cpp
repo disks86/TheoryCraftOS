@@ -22,10 +22,10 @@ namespace linuxabi {
 
 namespace {
 
-constexpr int64_t kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38, kEintr = 4, kEtimedout = 110, kEnomem = 12;
+constexpr int64_t kE2big = 7, kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38, kEintr = 4, kEtimedout = 110, kEnomem = 12;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
-constexpr uint64_t kCloneVm = 0x100, kCloneFs = 0x200, kCloneFiles = 0x400, kCloneSighand = 0x800, kCloneThread = 0x10000, kCloneSysvsem = 0x40000000,
+constexpr uint64_t kCloneVm = 0x100, kCloneFs = 0x200, kCloneFiles = 0x400, kCloneSighand = 0x800, kCloneThread = 0x10000, kCloneSysvsem = 0x40000,
                    kCloneSettls = 0x80000, kCloneParentSettid = 0x100000, kCloneChildCleartid = 0x200000, kCloneDetached = 0x400000, kCloneChildSettid = 0x1000000;
 constexpr uint64_t kCloneRequired = kCloneVm | kCloneFs | kCloneFiles | kCloneSighand | kCloneThread;
 constexpr uint64_t kCloneAllowed = kCloneRequired | kCloneSysvsem | kCloneSettls | kCloneParentSettid | kCloneChildCleartid | kCloneDetached | kCloneChildSettid;
@@ -86,6 +86,37 @@ uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* a) {
   state.clone.set_tls = (flags & kCloneSettls) != 0;
   state.clone.tls = tls;
   return tid;
+}
+
+uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size) {
+  // struct clone_args: flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls (the first version, 64 bytes), then set_tid,
+  // set_tid_size, cgroup. Only what a thread library asks for: no pidfd, no exit signal (that is fork), no set_tid and no cgroup.
+  constexpr uint64_t kVersion0 = 64, kLargest = 88;
+  if (size < kVersion0 || size > 4096) return error(kEinval);
+  uint8_t raw[kLargest] = {};
+  if (!p.read_user(arguments, ByteView(raw, size < kLargest ? size : kLargest))) return error(kEfault);
+  auto word = [&](uint32_t index) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < 8; ++i) v |= uint64_t(raw[index * 8 + i]) << (8 * i);
+    return v;
+  };
+  const uint64_t flags = word(0), pidfd = word(1), child_tid = word(2), parent_tid = word(3), exit_signal = word(4), stack = word(5), stack_size = word(6), tls = word(7);
+  (void)pidfd;      // (only read with CLONE_PIDFD, which is not supported; glibc fills it in anyway)
+  if (exit_signal != 0 || (flags & 0x1000u)) return error(kEinval);      // CLONE_PIDFD
+  if (size >= kLargest && (word(8) != 0 || word(9) != 0 || word(10) != 0)) return error(kEinval);
+  if (size > kLargest) {      // (a newer structure: what this does not know must be zero)
+    uint8_t rest[64];
+    for (uint64_t at = kLargest; at < size; at += sizeof(rest)) {
+      const uint64_t n = size - at < sizeof(rest) ? size - at : sizeof(rest);
+      if (!p.read_user(arguments + at, ByteView(rest, n))) return error(kEfault);
+      for (uint64_t i = 0; i < n; ++i) if (rest[i]) return error(kE2big);
+    }
+  }
+  if ((stack == 0) != (stack_size == 0) || (stack && stack_size > ~uint64_t{0} - stack)) return error(kEinval);
+  const uint64_t top = stack ? stack + stack_size : 0;      // (clone3 names the lowest address and the size; the thread starts at the top)
+  const bool tls_last = arch == UserArch::X86_64 || arch == UserArch::LoongArch64;
+  const uint64_t a[5] = {flags & ~uint64_t{0xFF}, top, parent_tid, tls_last ? child_tid : tls, tls_last ? tls : child_tid};
+  return sys_clone(p, arch, a);
 }
 
 uint64_t sys_set_tid_address(Process& p, uint64_t address) {

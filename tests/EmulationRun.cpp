@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <vector>
 #include "Emulation/GuestCpu.hpp"
 #include "Process/Process.hpp"
 #include "Process/ModuleLoader.hpp"
@@ -35,6 +36,7 @@
 #include "Process/ProgramEnvironment.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #ifdef TCOS_EMU_X11
 #include <set>
 #include "Process/UnixSockets.hpp"
@@ -199,6 +201,29 @@ int main(int argc, char** argv) {
   A a; H h; Libs libs; if (argc > 2) libs.dir = argv[2];
   filesystem::RamFileSystem fs(a);
   process::prepare_program_folders(fs);
+  // TCOS_EMU_LINUX_FILES: host files (colon separated) put at the same paths in the Linux tree, links resolved on the host: what a dynamically linked
+  // program needs (its interpreter and libraries, tests/linux_dynamic_emulated.sh). A missing folder on the way is made.
+  if (const char* list = getenv("TCOS_EMU_LINUX_FILES")) {
+    std::string all = list;
+    for (size_t at = 0; at <= all.size();) {
+      size_t end = all.find(':', at);
+      if (end == std::string::npos) end = all.size();
+      const std::string host = all.substr(at, end - at);
+      at = end + 1;
+      if (host.empty()) continue;
+      bool read_ok = false;
+      const std::vector<uint8_t> bytes = slurp(host, &read_ok);
+      if (!read_ok) { printf("linux files: cannot read %s\n", host.c_str()); continue; }
+      const std::string path = std::string(filesystem::layout::kLinux) + host;
+      for (size_t k = 1; k < path.size(); ++k)
+        if (path[k] == '/') fs.create_directory(StringView(path.substr(0, k).c_str()));
+      UniquePointer<filesystem::IFile> file;
+      uint64_t written = 0;
+      if (fs.open_file(StringView(path.c_str()), filesystem::OpenMode::CreateOrOpen, &file) != filesystem::Status::Ok ||
+          file->write(0, ConstByteView(bytes.data(), bytes.size()), &written) != filesystem::Status::Ok)
+        printf("linux files: cannot write %s\n", path.c_str());
+    }
+  }
 #ifdef TCOS_EMU_AUDIO
   // the libraries in System32 as well, for what a program loads while it runs (ole32 loading dsound.dll or mmdevapi.dll for CoCreateInstance)
   if (argc > 2)
@@ -224,7 +249,34 @@ int main(int argc, char** argv) {
   p.set_library_provider(&libs);
   p.set_processor_count(1);
   StringView av[] = {"C:\\test.exe"}; uint8_t rnd[16] = {};
-  auto st = p.load(ConstByteView(b.data(), b.size()), ArrayView<const StringView>(av, 1), process::default_environment(process::abi_for_executable(exe::identify_executable(ConstByteView(b.data(), b.size()).at_most(exe::kIdentifyBytes)))), ConstByteView(rnd, 16));
+  // TCOS_EMU_ENV: more environment variables for the program (space separated NAME=value, such as LD_DEBUG=libs).
+  std::vector<StringView> environment;
+  for (const StringView& e : process::default_environment(process::abi_for_executable(exe::identify_executable(ConstByteView(b.data(), b.size()).at_most(exe::kIdentifyBytes))))) environment.push_back(e);
+  std::vector<std::string> extra_environment;
+  if (const char* extra = getenv("TCOS_EMU_ENV")) {
+    std::string all = extra;
+    for (size_t at = 0; at < all.size();) {
+      size_t end = all.find(' ', at);
+      if (end == std::string::npos) end = all.size();
+      if (end > at) extra_environment.push_back(all.substr(at, end - at));
+      at = end + 1;
+    }
+  }
+  for (const std::string& e : extra_environment) environment.push_back(StringView(e.data(), e.size()));
+  // TCOS_EMU_ARGS: arguments after argv[0] (space separated).
+  std::vector<std::string> extra_arguments;
+  std::vector<StringView> arguments{av[0]};
+  if (const char* extra = getenv("TCOS_EMU_ARGS")) {
+    std::string all = extra;
+    for (size_t at = 0; at < all.size();) {
+      size_t end = all.find(' ', at);
+      if (end == std::string::npos) end = all.size();
+      if (end > at) extra_arguments.push_back(all.substr(at, end - at));
+      at = end + 1;
+    }
+  }
+  for (const std::string& e : extra_arguments) arguments.push_back(StringView(e.data(), e.size()));
+  auto st = p.load(ConstByteView(b.data(), b.size()), ArrayView<const StringView>(arguments.data(), arguments.size()), ArrayView<const StringView>(environment.data(), environment.size()), ConstByteView(rnd, 16));
   if (st != process::LoadStatus::Ok) { printf("load failed %d (%.*s)\n", (int)st, (int)p.load_detail().size(), p.load_detail().data()); return 2; }
   auto cpu = create_guest_cpu(p.start().arch, a);
   Sync sync; Threads th; Ctl ctl;

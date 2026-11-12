@@ -42,11 +42,10 @@ struct Run {
 
 }  // namespace
 
-LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& space, LoadedImage* out) {
-  if (!elf.is_64() || elf.data_encoding() != exe::ElfData::Little) return LoadStatus::Unsupported;
-  if (!elf.interpreter().empty()) return LoadStatus::NeedsLibraries;
-  if (elf.type() != exe::kElfExecutable && elf.type() != exe::kElfShared) return LoadStatus::Unsupported;
-  const uint64_t bias = elf.type() == exe::kElfShared ? kElfPieBase : 0;
+namespace {
+
+// Maps the PT_LOAD segments of `elf` at `bias` (0 for a fixed-address executable) and copies their file bytes.
+LoadStatus map_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& space, uint64_t bias, LoadedImage* out) {
 
   // Pass 1: check every PT_LOAD and map the runs.
   Run run;
@@ -92,6 +91,42 @@ LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& s
     if (image.phdr == 0 && elf.program_header_offset() >= seg.offset && elf.program_header_offset() - seg.offset < seg.file_size) image.phdr = seg.vaddr + bias + (elf.program_header_offset() - seg.offset);
   }
   if (!space.check(image.entry, 1, kProtExecute)) return LoadStatus::Malformed;
+  *out = image;
+  return LoadStatus::Ok;
+}
+
+// A program whose segments reach into the interpreter's place (a fixed-address program at that height) cannot have one there.
+bool loader_overlaps(const LoadedImage& program) { return program.end > kElfInterpreterBase && program.base < kElfInterpreterBase + kElfInterpreterSpan; }
+
+bool loadable(const exe::ElfFile& elf) {
+  return elf.is_64() && elf.data_encoding() == exe::ElfData::Little && (elf.type() == exe::kElfExecutable || elf.type() == exe::kElfShared);
+}
+
+}  // namespace
+
+LoadStatus load_elf(const exe::ElfFile& elf, ConstByteView file, AddressSpace& space, LoadedImage* out) {
+  if (!loadable(elf)) return LoadStatus::Unsupported;
+  if (!elf.interpreter().empty()) return LoadStatus::NeedsLibraries;
+  return map_elf(elf, file, space, elf.type() == exe::kElfShared ? kElfPieBase : 0, out);
+}
+
+LoadStatus load_dynamic_elf(const exe::ElfFile& elf, ConstByteView file, const exe::ElfFile& interpreter, ConstByteView interpreter_file, AddressSpace& space,
+                            LoadedImage* out) {
+  if (!loadable(elf)) return LoadStatus::Unsupported;
+  // The interpreter is a shared object of its own (ld.so asks for no interpreter itself), for the same CPU as the program.
+  if (!loadable(interpreter) || interpreter.type() != exe::kElfShared || !interpreter.interpreter().empty() || interpreter.machine() != elf.machine())
+    return LoadStatus::Malformed;
+  LoadedImage program, loader;
+  LoadStatus status = map_elf(elf, file, space, elf.type() == exe::kElfShared ? kElfPieBase : 0, &program);
+  if (status != LoadStatus::Ok) return status;
+  if (loader_overlaps(program)) return LoadStatus::Malformed;
+  status = map_elf(interpreter, interpreter_file, space, kElfInterpreterBase, &loader);
+  if (status != LoadStatus::Ok) return status;
+  if (loader.end > kElfInterpreterBase + kElfInterpreterSpan) return LoadStatus::Malformed;
+  LoadedImage image = program;
+  image.entry = loader.entry;      // the thread starts in the loader, which finds the program by AT_PHDR and jumps to AT_ENTRY
+  image.program_entry = program.entry;
+  image.interpreter_base = kElfInterpreterBase;
   *out = image;
   return LoadStatus::Ok;
 }
@@ -277,7 +312,8 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
     hwcap2 = 0x777e | 0x7F800000 | (uint64_t{1} << 37) | (uint64_t{0xFFF} << 48);      // + SME, its integer and floating point outer products, FA64, SME2, and FPMR, LUT, FAMINMAX, FP8 (and its SME forms, and SME_LUTv2)
   }
   struct Aux { uint64_t key, value; };
-  const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, 0}, {8, 0}, {9, image.entry}, {11, 0}, {12, 0},
+  const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, image.interpreter_base}, {8, 0},
+                     {9, image.program_entry ? image.program_entry : image.entry}, {11, 0}, {12, 0},
                      {13, 0}, {14, 0}, {15, platform_at}, {16, hwcap}, {17, 100}, {23, 0}, {25, random_address}, {26, hwcap2}, {31, executable_at}, {0, 0}};
   const uint64_t words = 1 + arguments.size() + 1 + environment.size() + 1 + 2 * (sizeof(aux) / sizeof(aux[0]));
   if (words * 8 > random_address) return LoadStatus::Malformed;

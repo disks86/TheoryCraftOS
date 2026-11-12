@@ -139,6 +139,21 @@ X86_64Cpu::Step X86_64Cpu::step_vex(GuestMemory& m, uint8_t first) {
         s_.rip += d_.position;
         return Step::Ok;
       }
+      if (op == 0xAE) {      // vldmxcsr m32 (/2), vstmxcsr m32 (/3): VEX.LZ.0F.WIG AE, no other form
+        if (!decode_modrm() || !finish_decode()) return bad_decode();
+        const uint32_t kind = d_.reg & 7;
+        if (pp != 0 || wide || vvvv != 0 || d_.mod == 3 || (kind != 2 && kind != 3)) return fail(6);
+        if (kind == 2) {
+          uint64_t v = 0;
+          if (!load(m, memory_address(), 4, &v)) return Step::Fault;
+          if (v & ~uint64_t{0xFFFF}) return fail(13);      // reserved bits
+          s_.mxcsr = static_cast<uint32_t>(v);
+        } else if (!store(m, memory_address(), 4, s_.mxcsr)) {
+          return Step::Fault;
+        }
+        s_.rip += d_.position;
+        return Step::Ok;
+      }
       if (op == 0x41 || op == 0x42 || op == 0x44 || op == 0x45 || op == 0x46 || op == 0x47 || op == 0x4A || op == 0x4B || (op >= 0x90 && op <= 0x93) || op == 0x98 || op == 0x99) return kmask_instruction(m, 1, op, d_.rex_w || false, vvvv);
       return vex_simd(m, op, 0, wide, vvvv);
     }
