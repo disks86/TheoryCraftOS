@@ -23,6 +23,10 @@
 #include "X11/X11SocketServer.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
+#include "DBus/Bus.hpp"
+#include "DBus/MachineId.hpp"
+#include "DBus/Notifications.hpp"
+#include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
@@ -2143,6 +2147,35 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         Entry(Level::Ok, "PipeWire").text("graph running; listening at ").text(filesystem::layout::kLinuxRuntimeFolder).text("/pipewire-0 and /pulse/native");
       else
         Entry(Level::Warning, "PipeWire").text("the PipeWire sockets could not listen");
+    }
+    // The kernel's D-Bus (src/DBus): the message bus dbus-daemon would be, for the system (/run/dbus/system_bus_socket) and the session
+    // ($XDG_RUNTIME_DIR/bus), over the system's AF_UNIX sockets. The kernel serves org.freedesktop.Notifications on the session bus itself: a Notify
+    // (notify-send, libnotify) is one of the desktop's toasts. (Gone before the desktop is.)
+    struct DesktopNotificationDisplay final : dbus::INotificationDisplay {
+      desktop::Desktop& d;
+      explicit DesktopNotificationDisplay(desktop::Desktop& desk) : d(desk) {}
+      uint32_t show(StringView app, StringView summary, StringView body, uint32_t timeout_ms) override {
+        return d.toasts().post(summary.empty() ? app : summary, body, gui::NoticeKind::Information, timeout_ms);
+      }
+      void close(uint32_t toast) override { d.toasts().dismiss(toast); }
+    } dbus_display(desktop);
+    char machine_id[33] = {}, system_guid[33] = {}, session_guid[33] = {};
+    const bool dbus_ids = dbus::load_machine_id(&explorer_files.file_system(), smb_entropy, ArrayView<char>(machine_id, 33)) &&
+                          dbus::random_hex_id(smb_entropy, ArrayView<char>(system_guid, 33)) && dbus::random_hex_id(smb_entropy, ArrayView<char>(session_guid, 33));
+    dbus::Bus system_bus(shared_allocator, dbus::BusKind::System, StringView(system_guid), StringView(machine_id));
+    dbus::Bus session_bus(shared_allocator, dbus::BusKind::Session, StringView(session_guid), StringView(machine_id));
+    dbus::NotificationService dbus_notifications(session_bus, dbus_display, shared_allocator);
+    UniquePointer<dbus::SocketServer> dbus_sockets;
+    if (dbus_ids && dbus_notifications.start()) {
+      if (process::UnixSocketManager* sockets = process::system_unix_sockets())
+        dbus_sockets = UniquePointer<dbus::SocketServer>::make(shared_allocator, *sockets, shared_allocator);
+      if (dbus_sockets && dbus::listen_standard_sockets(*dbus_sockets, system_bus, session_bus, &explorer_files.file_system(), shared_allocator) && dbus_sockets->start())
+        Entry(Level::Ok, "D-Bus").text("system and session buses running; listening at ").text(filesystem::layout::kLinuxSystemBusSocket).text(" and ")
+            .text(filesystem::layout::kLinuxRuntimeFolder).text("/bus");
+      else
+        Entry(Level::Warning, "D-Bus").text("the D-Bus sockets could not listen");
+    } else {
+      Entry(Level::Warning, "D-Bus").text("the buses could not start (no machine id)");
     }
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);

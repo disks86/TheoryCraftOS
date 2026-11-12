@@ -69,6 +69,18 @@
 #include "PipeWire/WindowsAudioService.hpp"
 #include "Process/UnixSockets.hpp"
 #endif
+#ifdef TCOS_EMU_DBUS
+#include "DBus/Bus.hpp"
+#include "DBus/Notifications.hpp"
+#include "DBus/SocketServer.hpp"
+#include "Process/UnixSockets.hpp"
+// (the D-Bus transport's clock; the kernel's comes from the timestamp counter)
+namespace hardware {
+uint64_t uptime_us() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+}  // namespace hardware
+#endif
 using namespace emulation;
 
 // With -DTCOS_EMU_AUDIO the kernel's PipeWire is there: the graph over a mixer whose device drains in real time and keeps what it got, its sockets at
@@ -507,9 +519,43 @@ int main(int argc, char** argv) {
     }
   }
 #endif
+#ifdef TCOS_EMU_DBUS
+  // With -DTCOS_EMU_DBUS the kernel's D-Bus is there: the system bus at /run/dbus/system_bus_socket and the session bus at /run/user/0/bus (with the
+  // Notifications service, which prints what it shows), carried by a thread of their own (tests/dbus_emulated.sh).
+  struct PrintingDisplay final : dbus::INotificationDisplay {
+    std::atomic<uint32_t> shown{0};
+    uint32_t show(StringView app, StringView summary, StringView body, uint32_t timeout) override {
+      printf("dbus notify: %.*s | %.*s | %.*s | %u\n", int(app.size()), app.data(), int(summary.size()), summary.data(), int(body.size()), body.data(), timeout);
+      return ++shown;
+    }
+    void close(uint32_t) override {}
+  } dbus_display;
+  dbus::Bus dbus_system(a, dbus::BusKind::System, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+  dbus::Bus dbus_session(a, dbus::BusKind::Session, "abcdef0123456789abcdef0123456789", "fedcba9876543210fedcba9876543210");
+  dbus::NotificationService dbus_notes(dbus_session, dbus_display, a);
+  if (!dbus_notes.start()) printf("dbus: notifications did not start\n");
+  dbus::SocketServer dbus_sockets(*process::system_unix_sockets(), a);
+  if (!dbus::listen_standard_sockets(dbus_sockets, dbus_system, dbus_session, &fs, a)) printf("dbus: could not listen\n");
+  std::atomic<bool> dbus_stop{false};
+  std::atomic<uint32_t> dbus_most{0};
+  std::thread dbus_thread([&] {
+    while (!dbus_stop) {
+      for (int i = 0; i < 16 && dbus_sockets.pump(hardware::uptime_us()); ++i) {}
+      if (dbus_session.connections() > dbus_most) dbus_most = dbus_session.connections();
+      dbus_sockets.wait(2'000'000);
+    }
+  });
+#endif
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
+#ifdef TCOS_EMU_DBUS
+  for (int i = 0; i < 50 && dbus_sockets.connections() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  dbus_stop = true;
+  dbus_thread.join();
+  printf("dbus: most session connections %u (the service included), %u notifications shown, %u connections left\n", dbus_most.load(), dbus_display.shown.load(),
+         dbus_sockets.connections());
+#endif
   // TCOS_EMU_SAVE: files the program wrote, copied out of the Linux tree (space separated linux-path=host-path, such as what pw-record recorded).
   if (const char* list = getenv("TCOS_EMU_SAVE")) {
     std::string all = list;
