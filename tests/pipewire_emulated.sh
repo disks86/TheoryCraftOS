@@ -9,7 +9,10 @@
 # tests/windows/xaudio2test.c (XAudio2 2.9: 400 Hz from a source voice, 600 Hz through a submix): 300, 400, 500 and 600 Hz must be in the mix at once.
 # A fifth run plays winmmtest next to tests/linux/pwnodetest.c (libpipewire's pw_stream side of client-node over pipewire-0: memfds and eventfds passed
 # with SCM_RIGHTS, mmap, ppoll; 500 Hz, then recording the microphone): 300, 400 and 500 Hz must be in the mix at once.
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode]   (the Linux program's CPU, default x86_64; which runs, default all).
+# A sixth run (x86-64, when the host has pw-cat) runs the host's real libpipewire: pw-cat (pw-play) and its libraries, SPA plugins, modules and
+# client.conf copied into the Linux tree, dynamically linked through glibc's ld.so. It plays a 500 Hz WAV next to the native stream (both must be in the
+# mix at once), then records 24000 frames of the microphone into a WAV that is copied out and checked (880 Hz left, 1320 Hz right).
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode|libpipewire]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -132,6 +135,61 @@ ok = 2200 < native < 2800 and 3600 < windows < 4400 and 1800 < linux < 2400 and 
 print("ok   the mix holds the client-node's tone with the others" if ok else "FAIL the mix: %s" % m.group(0))
 sys.exit(0 if ok else 1)
 PY
+fi
+if { [ "$which" = all ] || [ "$which" = libpipewire ]; } && [ "$arch" = x86_64 ]; then
+  if ! command -v pw-cat >/dev/null || [ ! -f /usr/share/pipewire/client.conf ]; then
+    echo "skipped libpipewire (no pw-cat on this machine)"
+  else
+    # the files pw-cat needs: its interpreter, every library ldd finds, the plugins and modules it loads, its configuration
+    pwcat=$(command -v pw-cat)
+    extra=()
+    for m in protocol-native client-node client-device adapter metadata rt session-manager; do extra+=("/usr/lib/pipewire-0.3/libpipewire-module-$m.so"); done
+    for l in support/libspa-support support/libspa-dbus support/libspa-journal audioconvert/libspa-audioconvert; do extra+=("/usr/lib/spa-0.2/$l.so"); done
+    python3 - "$work/tone500.wav" <<'PY'
+import math, struct, sys
+r, n = 48000, 48000 * 3
+d = b"".join(struct.pack("<hh", int(4243 * math.sin(2 * math.pi * 500 * i / r)), int(4243 * math.sin(2 * math.pi * 500 * i / r))) for i in range(n))
+open(sys.argv[1], "wb").write(b"RIFF" + struct.pack("<I", 36 + len(d)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 2, r, r * 4, 4, 16) + b"data" + struct.pack("<I", len(d)) + d)
+PY
+    files=$( { ldd "$pwcat" | awk '/=>/ { if ($3 ~ /^\//) print $3 } /^\t\// { print $1 }'
+               for l in "${extra[@]}"; do [ -f "$l" ] && { ldd "$l" | awk '/=>/ { if ($3 ~ /^\//) print $3 }'; echo "$l"; }; done
+               readelf -l "$pwcat" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'
+               echo /usr/share/pipewire/client.conf; echo "$work/tone500.wav"; } | sort -u | paste -sd:)
+    TCOS_EMU_TONES=300,500 TCOS_EMU_ARGS="--playback $work/tone500.wav" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$pwcat" "$work/sys32" > "$work/run-pwplay.out" 2>&1 || true
+    grep -E "^\[E\]" "$work/run-pwplay.out" | grep -v mod.rt || true
+    grep -E "^audio: native|exit=" "$work/run-pwplay.out"
+    grep -q "\[exit=0 faulted=0" "$work/run-pwplay.out" || { echo "FAIL pw-play (libpipewire) did not end well"; fail=1; }
+    python3 - "$work/run-pwplay.out" <<'PY' || fail=1
+import re, sys
+m = re.search(r"tones 300:(\d+) 400:(\d+) 500:(\d+) 600:(\d+) 700:(\d+); together (\d+)", open(sys.argv[1]).read())
+assert m, "no audio summary"
+t300, t500, together = int(m.group(1)), int(m.group(3)), int(m.group(6))
+ok = 2200 < t300 < 2800 and 1800 < t500 < 2400 and together > 1500
+print("ok   libpipewire's pw-play is in the mix with the native stream" if ok else "FAIL the mix: %s" % m.group(0))
+sys.exit(0 if ok else 1)
+PY
+    rm -f "$work/pwrecord.wav"
+    TCOS_EMU_SAVE="/tmp/pwrecord.wav=$work/pwrecord.wav" TCOS_EMU_ARGS="--record -n 24000 /tmp/pwrecord.wav" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$pwcat" "$work/sys32" > "$work/run-pwrecord.out" 2>&1 || true
+    grep -q "faulted=0" "$work/run-pwrecord.out" || { echo "FAIL pw-record (libpipewire) faulted"; fail=1; }      # (pw-cat -n ends with 1 on Linux too)
+    python3 - "$work/pwrecord.wav" <<'PY' || fail=1
+import math, struct, sys, wave
+try:
+    w = wave.open(sys.argv[1])
+except Exception as e:
+    print("FAIL pw-record wrote nothing usable: %s" % e); sys.exit(1)
+n, ch, r = w.getnframes(), w.getnchannels(), w.getframerate()
+d = struct.unpack("<%dh" % (n * ch), w.readframes(n))
+def amp(side, f, start=12000, cnt=4800):
+    s1 = s2 = 0.0; c = 2 * math.cos(2 * math.pi * f / r)
+    for i in range(start, start + cnt):
+        s0 = d[i * ch + side] + c * s1 - s2; s2 = s1; s1 = s0
+    return math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / cnt
+l880, r1320, l1320, r880 = amp(0, 880), amp(1, 1320), amp(0, 1320), amp(1, 880)
+ok = n == 24000 and ch == 2 and 7000 < l880 < 9000 and 3400 < r1320 < 4600 and l1320 < 500 and r880 < 500
+print("%s pw-record (libpipewire) recorded 880 Hz left %.0f, 1320 Hz right %.0f" % ("ok  " if ok else "FAIL", l880, r1320))
+sys.exit(0 if ok else 1)
+PY
+  fi
 fi
 [ $fail -eq 0 ] && echo "pipewire emulated: all passed" || echo "pipewire emulated: FAILED"
 exit $fail

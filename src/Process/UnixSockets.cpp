@@ -79,6 +79,86 @@ UnixStatus UnixSocketManager::create_event(uint64_t owner_pid, uint64_t initial,
   return UnixStatus::Ok;
 }
 
+UnixStatus UnixSocketManager::create_timer(uint64_t owner_pid, uint32_t clock, uint32_t* id) {
+  Hold hold(sync_);
+  const UnixStatus st = make_locked(UnixType::Timer, owner_pid, id);
+  if (st == UnixStatus::Ok) at(*id)->timer_clock = clock;
+  return st;
+}
+
+UnixStatus UnixSocketManager::create_epoll(uint64_t owner_pid, uint32_t* id) {
+  Hold hold(sync_);
+  return make_locked(UnixType::Epoll, owner_pid, id);
+}
+
+UnixStatus UnixSocketManager::create_signal(uint64_t owner_pid, uint32_t* id) {
+  Hold hold(sync_);
+  return make_locked(UnixType::Signal, owner_pid, id);
+}
+
+bool UnixSocketManager::timer_state_locked(uint32_t id, uint32_t* clock, uint64_t* deadline, uint64_t* interval) const {
+  const Socket* s = at(id);
+  if (!s || s->type != UnixType::Timer) return false;
+  *clock = s->timer_clock;
+  *deadline = s->timer_deadline;
+  *interval = s->timer_interval;
+  return true;
+}
+
+UnixStatus UnixSocketManager::timer_arm_locked(uint32_t id, uint64_t deadline, uint64_t interval) {
+  Socket* s = at(id);
+  if (!s) return UnixStatus::BadSocket;
+  if (s->type != UnixType::Timer) return UnixStatus::WrongType;
+  s->timer_deadline = deadline;
+  s->timer_interval = deadline ? interval : 0;
+  s->counter = 0;
+  sync_.notify_all();      // (waiters look again at when it is due)
+  return UnixStatus::Ok;
+}
+
+void UnixSocketManager::timer_advance_locked(uint32_t id, uint64_t now) {
+  Socket* s = at(id);
+  if (!s || s->type != UnixType::Timer || s->timer_deadline == 0 || now < s->timer_deadline) return;
+  uint64_t fired = 1;
+  if (s->timer_interval) {
+    fired += (now - s->timer_deadline) / s->timer_interval;
+    const uint64_t step = fired > ~uint64_t{0} / s->timer_interval ? ~uint64_t{0} : fired * s->timer_interval;
+    s->timer_deadline = step > ~uint64_t{0} - s->timer_deadline ? 0 : s->timer_deadline + step;      // (one that would pass 2^64 ns stops)
+  } else {
+    s->timer_deadline = 0;
+  }
+  s->counter = fired > ~uint64_t{0} - s->counter ? ~uint64_t{0} : s->counter + fired;
+  sync_.notify_all();
+}
+
+UnixStatus UnixSocketManager::timer_take_locked(uint32_t id, uint64_t* expirations) {
+  *expirations = 0;
+  Socket* s = at(id);
+  if (!s) return UnixStatus::BadSocket;
+  if (s->type != UnixType::Timer) return UnixStatus::WrongType;
+  if (s->counter == 0) return UnixStatus::WouldBlock;
+  *expirations = s->counter;
+  s->counter = 0;
+  return UnixStatus::Ok;
+}
+
+List<UnixEpollEntry>* UnixSocketManager::epoll_interest_locked(uint32_t id) {
+  Socket* s = at(id);
+  return s && s->type == UnixType::Epoll ? &s->interest : nullptr;
+}
+
+void UnixSocketManager::epoll_changed_locked(uint32_t id) {
+  Socket* s = at(id);
+  if (!s || s->type != UnixType::Epoll) return;
+  ++s->counter;
+  sync_.notify_all();
+}
+
+uint64_t UnixSocketManager::epoll_changes_locked(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && s->type == UnixType::Epoll ? s->counter : 0;
+}
+
 bool UnixSocketManager::is_event_locked(uint32_t id) const {
   const Socket* s = at(id);
   return s && s->type == UnixType::Event;
@@ -361,7 +441,7 @@ UnixStatus UnixSocketManager::send_locked(uint32_t id, ConstByteView data, const
   *sent = 0;
   Socket* s = at(id);
   if (!s) return UnixStatus::BadSocket;
-  if (s->type == UnixType::Event) return UnixStatus::NotSupported;      // (an eventfd is not a socket)
+  if (!unix_type_is_socket(s->type)) return UnixStatus::NotSupported;      // (an eventfd, a timer, ... is not a socket)
   if (rights && rights->count() > kMaxRights) return UnixStatus::Invalid;
   if (s->shut_write) return UnixStatus::Broken;
   if (s->type == UnixType::Datagram) {
@@ -423,7 +503,7 @@ UnixStatus UnixSocketManager::receive_locked(uint32_t id, ByteView buffer, bool 
   *out = Received();
   Socket* s = at(id);
   if (!s) return UnixStatus::BadSocket;
-  if (s->type == UnixType::Event) return UnixStatus::NotSupported;
+  if (!unix_type_is_socket(s->type)) return UnixStatus::NotSupported;
   if (s->records.count() == 0) {
     if (s->pending_error != UnixStatus::Ok) {
       const UnixStatus error = s->pending_error;
@@ -517,6 +597,11 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
     r.writable = s->counter < kEventMax;
     return r;
   }
+  if (s->type == UnixType::Timer) {
+    r.readable = s->counter > 0;      // (as of the last timer_advance_locked)
+    return r;
+  }
+  if (!unix_type_is_socket(s->type)) return r;      // (an epoll instance is evaluated by the Linux layer; a signalfd never fires)
   r.error = s->pending_error != UnixStatus::Ok;
   if (s->state == State::Listening) {
     r.readable = s->backlog.count() != 0;

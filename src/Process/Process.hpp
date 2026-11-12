@@ -40,6 +40,18 @@ class IUserMemory {
  public:
   virtual bool read(uint64_t address, ByteView out) = 0;
   virtual bool write(uint64_t address, ConstByteView data) = 0;
+  // An atomic compare-and-exchange of the aligned 32-bit word at `address` (what the program's threads change with their own atomic instructions meanwhile:
+  // a futex word). *observed: the value it had. False if the word cannot be written. This default reads then writes: atomic only while no other thread of
+  // the program runs (one CPU, or a fake memory in a test); memory other threads really share (AddressSpace) overrides it.
+  virtual bool compare_exchange32(uint64_t address, uint32_t expected, uint32_t desired, uint32_t* observed) {
+    if (address & 3) return false;
+    uint8_t b[4];
+    if (!read(address, ByteView(b, 4))) return false;
+    *observed = uint32_t{b[0]} | uint32_t{b[1]} << 8 | uint32_t{b[2]} << 16 | uint32_t{b[3]} << 24;
+    if (*observed != expected) return true;
+    const uint8_t d[4] = {uint8_t(desired), uint8_t(desired >> 8), uint8_t(desired >> 16), uint8_t(desired >> 24)};
+    return write(address, ConstByteView(d, 4));
+  }
 
  protected:
   IUserMemory() = default;
@@ -248,6 +260,7 @@ class Process {
   IProcessHost& host() { return host_; }
   bool read_user(uint64_t address, ByteView out) { return memory_.read(address, out); }
   bool write_user(uint64_t address, ConstByteView data) { return memory_.write(address, data); }
+  bool compare_exchange_user32(uint64_t address, uint32_t expected, uint32_t desired, uint32_t* observed) { return memory_.compare_exchange32(address, expected, desired, observed); }
   bool read_user_u64(uint64_t address, uint64_t* out);
   bool write_user_u64(uint64_t address, uint64_t value);
   bool write_user_u32(uint64_t address, uint32_t value);

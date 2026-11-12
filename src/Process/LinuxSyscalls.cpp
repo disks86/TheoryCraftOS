@@ -39,7 +39,8 @@ enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Ge
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
-  Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
+  Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
+  EpollCtl, EpollWait, EpollPwait, EpollPwait2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
   Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
@@ -74,6 +75,9 @@ constexpr NumberEntry kNumbers[] = {
     {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
     // sockets (AF_UNIX: LinuxSockets.cpp)
     {22, kAbsent, Call::Pipe},     {293, 59, Call::Pipe2},      {284, kAbsent, Call::Eventfd}, {290, 19, Call::Eventfd2},
+    {283, 85, Call::TimerfdCreate}, {286, 86, Call::TimerfdSettime}, {287, 87, Call::TimerfdGettime}, {282, kAbsent, Call::Signalfd},
+    {289, 74, Call::Signalfd4},    {213, kAbsent, Call::EpollCreate}, {291, 20, Call::EpollCreate1}, {233, 21, Call::EpollCtl},
+    {232, kAbsent, Call::EpollWait}, {281, 22, Call::EpollPwait}, {441, 441, Call::EpollPwait2},
     {41, 198, Call::Socket},       {53, 199, Call::Socketpair}, {49, 200, Call::Bind},       {42, 203, Call::Connect},
     {50, 201, Call::Listen},       {43, 202, Call::Accept},     {288, 242, Call::Accept4},   {44, 206, Call::Sendto},
     {45, 207, Call::Recvfrom},     {46, 211, Call::Sendmsg},    {47, 212, Call::Recvmsg},    {307, 269, Call::Sendmmsg},
@@ -386,6 +390,16 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Pipe2: return linuxabi::sys_pipe2(process, a[0], a[1]);
       case Call::Eventfd: return linuxabi::sys_eventfd2(process, a[0], 0);
       case Call::Eventfd2: return linuxabi::sys_eventfd2(process, a[0], a[1]);
+      case Call::TimerfdCreate: return linuxabi::sys_timerfd_create(process, a[0], a[1]);
+      case Call::TimerfdSettime: return linuxabi::sys_timerfd_settime(process, a[0], a[1], a[2], a[3]);
+      case Call::TimerfdGettime: return linuxabi::sys_timerfd_gettime(process, a[0], a[1]);
+      case Call::Signalfd: return linuxabi::sys_signalfd4(process, a[0], a[1], a[2], 0);
+      case Call::Signalfd4: return linuxabi::sys_signalfd4(process, a[0], a[1], a[2], a[3]);
+      case Call::EpollCreate: return int32_t(a[0]) <= 0 ? error(kEinval) : linuxabi::sys_epoll_create1(process, 0);
+      case Call::EpollCreate1: return linuxabi::sys_epoll_create1(process, a[0]);
+      case Call::EpollCtl: return linuxabi::sys_epoll_ctl(process, a[0], a[1], a[2], a[3]);
+      case Call::EpollWait: case Call::EpollPwait: return linuxabi::sys_epoll_wait(process, a[0], a[1], a[2], a[3]);
+      case Call::EpollPwait2: return linuxabi::sys_epoll_pwait2(process, a[0], a[1], a[2], a[3]);
       case Call::Bind: return linuxabi::sys_bind(process, a[0], a[1], a[2]);
       case Call::Connect: return linuxabi::sys_connect(process, a[0], a[1], a[2]);
       case Call::Listen: return linuxabi::sys_listen(process, a[0], a[1]);

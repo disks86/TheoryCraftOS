@@ -112,6 +112,12 @@ Fd SocketServer::make_memory(uint64_t size, StringView name) {
 Fd SocketServer::make_event() {
   uint32_t id = 0;
   if (sockets_.create_event(0, 0, false, &id) != UnixStatus::Ok) return Fd();
+  {      // (EFD_NONBLOCK, as PipeWire makes them: a client empties one with a read that must not wait)
+    process::ISystemSync& sync = sockets_.sync();
+    sync.lock();
+    sockets_.set_non_blocking_locked(id, true);
+    sync.unlock();
+  }
   process::UnixInFlight entry;
   entry.kind = process::DescriptorKind::UnixSocket;
   entry.token = id;

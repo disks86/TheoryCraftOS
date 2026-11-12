@@ -95,6 +95,10 @@ class NativeServer final : public IProtocolServer {
     uint32_t wanted_buffers = 0, wanted_size = 0;      // what the port's Buffers param asks for (0: not said)
     uint32_t buffer_stride = 0, data_size = 0;          // the layout chosen
     uint64_t position = 0, cycles = 0, triggered_at = 0;
+    // The port's format (F32, the stream's own rate and channels when its EnumFormat names them) and the frames of a cycle (its node.latency).
+    PcmFormat format{SampleFormat::F32Le, 48000, 2};
+    uint32_t quantum = 1024;
+    uint32_t frame() const { return 4u * format.channels; }
     SharedPointer<PlaybackStream> playback;
     SharedPointer<RecordStream> record;
     Properties props;
@@ -159,6 +163,7 @@ class NativeServer final : public IProtocolServer {
   void send_port_config(Client& c, ClientNode& n);
   void send_port_format(Client& c, ClientNode& n);
   bool send_buffers(Client& c, ClientNode& n);
+  void set_quantum(ClientNode& n);
   void send_command(Client& c, ClientNode& n, uint32_t command);
   void run_client_node(ClientNode& n, uint64_t now_ns);
   void trigger(ClientNode& n, uint64_t now_ns);

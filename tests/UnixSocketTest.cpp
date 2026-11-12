@@ -80,6 +80,15 @@ struct FakeMemory final : IUserMemory {
     return true;
   }
   uint8_t* at(uint64_t a) { return &bytes[a - kBase]; }
+  // (really atomic: the PI futex test's threads change the word with their own atomics meanwhile; the vector's storage is malloc-aligned and `a` is
+  // a multiple of 4, so the word is aligned)
+  bool compare_exchange32(uint64_t a, uint32_t expected, uint32_t desired, uint32_t* observed) override {
+    if ((a & 3) || a < kBase || a - kBase > bytes.size() - 4) return false;
+    __atomic_compare_exchange_n(word(a), &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    *observed = expected;
+    return true;
+  }
+  uint32_t* word(uint64_t a) { return reinterpret_cast<uint32_t*>(at(a)); }
   void put(uint64_t a, const void* data, size_t n) { memcpy(at(a), data, n); }
   void put32(uint64_t a, uint32_t v) { for (int i = 0; i < 4; ++i) bytes[a - kBase + i] = uint8_t(v >> (8 * i)); }
   void put64(uint64_t a, uint64_t v) { for (int i = 0; i < 8; ++i) bytes[a - kBase + i] = uint8_t(v >> (8 * i)); }
@@ -112,8 +121,9 @@ struct Runtime final : IProcessRuntime {
 // Linux x86-64 numbers.
 enum : uint64_t { kRead = 0, kWrite = 1, kClose = 3, kStat = 4, kFstat = 5, kPoll = 7, kIoctl = 16, kReadv = 19, kWritev = 20, kSocket = 41, kConnect = 42,
                   kAccept = 43, kSendto = 44, kRecvfrom = 45, kSendmsg = 46, kRecvmsg = 47, kShutdown = 48, kBind = 49, kListen = 50, kGetsockname = 51,
-                  kGetpeername = 52, kSocketpair = 53, kSetsockopt = 54, kGetsockopt = 55, kFcntl = 72, kUnlink = 87, kOpen = 2, kDup = 32, kAccept4 = 288, kEventfd = 284, kEventfd2 = 290 };
-constexpr int64_t kEnoent = 2, kEbadf = 9, kEagain = 11, kEinval = 22, kEpipe = 32, kEnotsock = 88, kEprototype = 91, kEafnosupport = 97, kEaddrinuse = 98,
+                  kGetpeername = 52, kSocketpair = 53, kSetsockopt = 54, kGetsockopt = 55, kFcntl = 72, kUnlink = 87, kOpen = 2, kDup = 32, kAccept4 = 288, kEventfd = 284, kEventfd2 = 290,
+                  kTimerfdCreate = 283, kTimerfdSettime = 286, kTimerfdGettime = 287, kEpollCreate1 = 291, kEpollCtl = 233, kEpollWait = 232, kEpollPwait2 = 441, kSignalfd4 = 289 };
+constexpr int64_t kEnoent = 2, kEbadf = 9, kEexist = 17, kEperm = 1, kEagain = 11, kEinval = 22, kEpipe = 32, kEnotsock = 88, kEprototype = 91, kEafnosupport = 97, kEaddrinuse = 98,
                   kEisconn = 106, kEnotconn = 107, kEconnrefused = 111, kEconnreset = 104;
 constexpr uint32_t kStatusWouldBlock = 0xC0000103u, kStatusRefused = 0xC0000236u, kStatusAddressInUse = 0xC000020Au;
 
@@ -620,6 +630,260 @@ static void test_linux_eventfd() {
   (void)other;
 }
 
+static uint64_t now_ns() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+
+// timerfd: one-shot, periodic, absolute, disarmed; poll() and a blocking read wake when it fires, also when another thread arms it during the wait.
+static void test_linux_timerfd() {
+  System sys;
+  Proc l(160, SyscallAbi::Linux, &sys.fs);
+  const uint64_t spec = l.alloc(32), value = l.alloc(8), cur = l.alloc(32);
+  auto arm = [&](int64_t fd, uint64_t first_ns, uint64_t interval_ns, uint64_t flags = 0) {
+    l.memory.put64(spec, interval_ns / 1000000000u); l.memory.put64(spec + 8, interval_ns % 1000000000u);
+    l.memory.put64(spec + 16, first_ns / 1000000000u); l.memory.put64(spec + 24, first_ns % 1000000000u);
+    return l.sys(kTimerfdSettime, fd, flags, spec, 0);
+  };
+  CHECK(l.sys(kTimerfdCreate, 5, 0) == -kEinval);      // (CLOCK_PROCESS_CPUTIME_ID: not a timer clock)
+  CHECK(l.sys(kTimerfdCreate, 1, 0x4) == -kEinval);
+  const int64_t t = l.sys(kTimerfdCreate, 1 /* CLOCK_MONOTONIC */, 0x800 /* TFD_NONBLOCK */);
+  CHECK(t >= 3);
+  CHECK(l.sys(kRead, t, value, 8) == -kEagain);
+  CHECK(l.sys(kRead, t, value, 4) == -kEinval);
+  // one-shot, 30 ms: gettime counts down; poll waits for it
+  CHECK(arm(t, 30000000, 0) == 0);
+  CHECK(l.sys(kTimerfdGettime, t, cur) == 0 && l.memory.get64(cur) == 0 && l.memory.get64(cur + 8) == 0);
+  const uint64_t left = l.memory.get64(cur + 16) * 1000000000u + l.memory.get64(cur + 24);
+  CHECK(left > 0 && left <= 30000000);
+  const uint64_t fds = l.alloc(8);
+  l.memory.put32(fds, uint32_t(t)); l.memory.put32(fds + 4, 1);
+  uint64_t before = now_ns();
+  CHECK(l.sys(kPoll, fds, 1, 2000) == 1 && (l.memory.get32(fds + 4) >> 16) == 1);
+  uint64_t took = now_ns() - before;
+  CHECK(took >= 25000000 && took < 1000000000);
+  CHECK(l.sys(kRead, t, value, 8) == 8 && l.memory.get64(value) == 1);
+  CHECK(l.sys(kRead, t, value, 8) == -kEagain);
+  CHECK(l.sys(kTimerfdGettime, t, cur) == 0 && l.memory.get64(cur + 16) == 0 && l.memory.get64(cur + 24) == 0);      // (disarmed now)
+  // periodic, 5 ms: about six in 32 ms
+  CHECK(arm(t, 5000000, 5000000) == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(32));
+  CHECK(l.sys(kRead, t, value, 8) == 8);
+  const uint64_t ticks = l.memory.get64(value);
+  CHECK(ticks >= 5 && ticks <= 8);
+  CHECK(l.sys(kTimerfdGettime, t, cur) == 0 && l.memory.get64(cur + 8) == 5000000);
+  // disarmed by a zero value
+  CHECK(arm(t, 0, 0) == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(8));
+  CHECK(l.sys(kRead, t, value, 8) == -kEagain);
+  // absolute (TFD_TIMER_ABSTIME), with a blocking read
+  CHECK(l.sys(kFcntl, t, 4, 0) == 0);
+  before = now_ns();
+  CHECK(arm(t, before + 15000000, 0, 1) == 0);
+  CHECK(l.sys(kRead, t, value, 8) == 8 && l.memory.get64(value) == 1);
+  took = now_ns() - before;
+  CHECK(took >= 12000000 && took < 1000000000);
+  // poll for ever wakes when another thread arms the timer meanwhile
+  l.memory.put32(fds + 4, 1);
+  std::thread armer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Proc& q = l;
+    const uint64_t sp = q.alloc(32);
+    q.memory.put64(sp, 0); q.memory.put64(sp + 8, 0); q.memory.put64(sp + 16, 0); q.memory.put64(sp + 24, 10000000);
+    CHECK(q.sys(kTimerfdSettime, t, 0, sp, 0) == 0);
+  });
+  before = now_ns();
+  CHECK(l.sys(kPoll, fds, 1, uint64_t(-1)) == 1);
+  took = now_ns() - before;
+  armer.join();
+  CHECK(took >= 25000000 && took < 2000000000);
+  CHECK(l.sys(kRead, t, value, 8) == 8);
+  // not a timer
+  const int64_t e = l.sys(kEventfd2, 0, 0);
+  CHECK(arm(e, 1000, 0) == -kEinval && l.sys(kTimerfdGettime, e, cur) == -kEinval);
+  // a bad itimerspec
+  l.memory.put64(spec + 24, 1000000000);
+  CHECK(l.sys(kTimerfdSettime, t, 0, spec, 0) == -kEinval);
+  CHECK(l.sys(kTimerfdSettime, t, 4, spec, 0) == -kEinval);
+  for (int64_t fd : {t, e}) CHECK(l.sys(kClose, fd) == 0);
+}
+
+// epoll: level-triggered reports with the program's data, MOD and DEL, EEXIST/ENOENT/EPERM, one-shot, a timer and a socket in one set, a descriptor
+// closed while in the set, and a waiter woken by another thread's EPOLL_CTL_ADD. signalfd: made, never ready.
+static void test_linux_epoll() {
+  System sys;
+  Proc l(170, SyscallAbi::Linux, &sys.fs);
+  const uint64_t ev = l.alloc(12), out = l.alloc(12 * 8), one = l.alloc(8);
+  auto ctl = [&](int64_t ep, uint64_t op, int64_t fd, uint32_t events, uint64_t data) {
+    l.memory.put32(ev, events); l.memory.put64(ev + 4, data);      // (x86-64: packed, the data at 4)
+    return l.sys(kEpollCtl, ep, op, fd, ev);
+  };
+  auto wait = [&](int64_t ep, int64_t ms, uint32_t max = 8) { return l.sys(kEpollWait, ep, out, max, uint64_t(ms)); };
+  CHECK(l.sys(kEpollCreate1, 1) == -kEinval);
+  const int64_t ep = l.sys(kEpollCreate1, 0x80000);
+  CHECK(ep >= 3 && l.sys(kFcntl, ep, 1) == 1);
+  const int64_t e = l.sys(kEventfd2, 0, 0x800);
+  CHECK(ctl(ep, 1, e, 1 /* EPOLLIN */, 0x1122334455667788ull) == 0);
+  CHECK(ctl(ep, 1, e, 1, 0) == -kEexist);
+  CHECK(wait(ep, 0) == 0);
+  l.memory.put64(one, 1);
+  CHECK(l.sys(kWrite, e, one, 8) == 8);
+  CHECK(wait(ep, 0) == 1 && l.memory.get32(out) == 1 && l.memory.get64(out + 4) == 0x1122334455667788ull);
+  CHECK(wait(ep, 0) == 1);      // (level-triggered: still readable)
+  CHECK(ctl(ep, 3, e, 4 /* EPOLLOUT */, 7) == 0);
+  CHECK(wait(ep, 0) == 1 && l.memory.get32(out) == 4 && l.memory.get64(out + 4) == 7);
+  CHECK(ctl(ep, 2, e, 0, 0) == 0 && wait(ep, 0) == 0);
+  CHECK(ctl(ep, 2, e, 0, 0) == -kEnoent && ctl(ep, 3, e, 1, 0) == -kEnoent);
+  CHECK(ctl(ep, 4, e, 1, 0) == -kEinval && ctl(ep, 1, ep, 1, 0) == -kEinval && ctl(ep, 1, 900, 1, 0) == -kEbadf && ctl(e, 1, e, 1, 0) == -kEinval);
+  CHECK(wait(ep, 0, 0) == -kEinval && wait(e, 0) == -kEinval);
+  // a regular file: EPERM
+  const int64_t file = l.sys(kOpen, l.text("/tmp/epoll.txt"), 0x42, 0644);
+  CHECK(file >= 0 && ctl(ep, 1, file, 1, 0) == -kEperm);
+  // one-shot: once, until MOD
+  CHECK(ctl(ep, 1, e, 1 | (1u << 30), 9) == 0);
+  CHECK(wait(ep, 0) == 1 && wait(ep, 0) == 0);
+  CHECK(ctl(ep, 3, e, 1 | (1u << 30), 10) == 0 && wait(ep, 0) == 1 && l.memory.get64(out + 4) == 10);
+  CHECK(l.sys(kRead, e, one, 8) == 8 && ctl(ep, 2, e, 0, 0) == 0);
+  // a timer and one end of a socket pair: the wait (for ever) ends when the timer fires; then the socket's data comes too
+  const int64_t t = l.sys(kTimerfdCreate, 1, 0x800);
+  const uint64_t pair = l.alloc(8);
+  CHECK(l.sys(kSocketpair, 1, 1, 0, pair) == 0);
+  const int64_t pa = l.memory.get32(pair), pb = l.memory.get32(pair + 4);
+  CHECK(ctl(ep, 1, t, 1, 100) == 0 && ctl(ep, 1, pb, 1 | 0x2000, 200) == 0);
+  const uint64_t spec = l.alloc(32);
+  l.memory.put64(spec, 0); l.memory.put64(spec + 8, 0); l.memory.put64(spec + 16, 0); l.memory.put64(spec + 24, 20000000);
+  CHECK(l.sys(kTimerfdSettime, t, 0, spec, 0) == 0);
+  uint64_t before = now_ns();
+  CHECK(wait(ep, -1) == 1 && l.memory.get64(out + 4) == 100);
+  CHECK(now_ns() - before >= 15000000);
+  CHECK(l.lsend(pa, "hi") == 2);
+  CHECK(wait(ep, 0) == 2);      // (the timer's expiration not read yet: both)
+  CHECK(l.sys(kRead, t, one, 8) == 8);
+  CHECK(wait(ep, 0) == 1 && l.memory.get64(out + 4) == 200);
+  // epoll_pwait2 with a timespec: nothing more for 10 ms
+  int64_t r = 0;
+  CHECK(l.lrecv(pb, 8, &r) == "hi");
+  const uint64_t ts = l.alloc(16);
+  l.memory.put64(ts, 0); l.memory.put64(ts + 8, 10000000);
+  before = now_ns();
+  CHECK(l.sys(kEpollPwait2, ep, out, 8, ts) == 0 && now_ns() - before >= 9000000);
+  // the other end closed: EPOLLIN | EPOLLRDHUP (and the hang-up)
+  CHECK(l.sys(kClose, pa) == 0);
+  CHECK(wait(ep, 0) == 1 && (l.memory.get32(out) & 0x2001) == 0x2001);
+  // a descriptor closed while in the set is dropped: its number can be added again (now something else)
+  CHECK(l.sys(kClose, pb) == 0);
+  CHECK(wait(ep, 0) == 0);
+  const int64_t e2 = l.sys(kEventfd2, 1, 0);
+  CHECK(e2 == pb || e2 >= 3);
+  CHECK(ctl(ep, 1, e2, 1, 300) == 0);
+  CHECK(wait(ep, 0) == 1 && l.memory.get64(out + 4) == 300);
+  CHECK(ctl(ep, 2, e2, 0, 0) == 0 && ctl(ep, 2, t, 0, 0) == 0);
+  // a waiter for ever, woken by another thread adding a ready descriptor
+  std::thread adder([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const uint64_t ev2 = l.alloc(12);
+    l.memory.put32(ev2, 1); l.memory.put64(ev2 + 4, 400);
+    CHECK(l.sys(kEpollCtl, ep, 1, e2, ev2) == 0);
+  });
+  CHECK(wait(ep, -1) == 1 && l.memory.get64(out + 4) == 400);
+  adder.join();
+  // signalfd: never ready
+  const uint64_t mask = l.alloc(8);
+  l.memory.put64(mask, 1u << 1);
+  CHECK(l.sys(kSignalfd4, uint64_t(-1), mask, 4, 0) == -kEinval);
+  const int64_t sfd = l.sys(kSignalfd4, uint64_t(-1), mask, 8, 0x800);
+  CHECK(sfd >= 3);
+  CHECK(l.sys(kSignalfd4, sfd, mask, 8, 0) == sfd);
+  const uint64_t info = l.alloc(128);
+  CHECK(l.sys(kRead, sfd, info, 128) == -kEagain);
+  CHECK(ctl(ep, 1, sfd, 1, 500) == 0 && wait(ep, 0) == 1);      // (only e2 is ready)
+  for (int64_t fd : {sfd, e2, t, e, file, ep}) CHECK(l.sys(kClose, fd) == 0);
+}
+
+// PI futexes as glibc's PTHREAD_PRIO_INHERIT mutexes use them: four threads take one lock 3000 times each, by the user-space fast path (an atomic
+// 0 -> tid) or FUTEX_LOCK_PI when it is held, and give it back by tid -> 0 or FUTEX_UNLOCK_PI when FUTEX_WAITERS is set. Nobody is ever inside
+// together, no update is lost, and the word ends at 0. Then the error cases: TRYLOCK_PI on a held lock, UNLOCK_PI by another thread, LOCK_PI of
+// one's own lock, a LOCK_PI2 deadline that passes.
+struct PiRuntime final : IProcessRuntime {
+  std::mutex m;
+  std::condition_variable_any cv;
+  static thread_local uint64_t tid;
+  void lock() override { m.lock(); }
+  void unlock() override { m.unlock(); }
+  bool wait(uint64_t ns) override {
+    if (ns > 1000000000000ull) { cv.wait(m); return true; }
+    return cv.wait_for(m, std::chrono::nanoseconds(ns)) == std::cv_status::no_timeout;
+  }
+  void notify() override { cv.notify_all(); }
+  bool interrupted() override { return false; }
+  bool start_thread(const ThreadStart&, bool) override { return false; }
+  bool resume_thread(uint64_t) override { return false; }
+  uint64_t current_thread_id() override { return tid; }
+};
+thread_local uint64_t PiRuntime::tid = 0;
+
+static void test_linux_pi_futex() {
+  System sys;
+  Proc l(180, SyscallAbi::Linux, &sys.fs);
+  PiRuntime rt;
+  l.process.attach_runtime(&rt);
+  constexpr uint64_t kFutex = 202;
+  constexpr uint32_t kWaiters = 0x80000000u, kLockPi = 6 | 128, kUnlockPi = 7 | 128, kTrylockPi = 8 | 128, kLockPi2 = 13 | 128;
+  const uint64_t word = l.alloc(8);
+  l.memory.put32(word, 0);
+  auto call = [&](uint32_t op, uint64_t timeout = 0) {
+    rt.lock();
+    const int64_t r = l.sys(kFutex, word, op, 0, timeout);
+    rt.unlock();
+    return r;
+  };
+  std::atomic<int> inside{0}, overlaps{0}, kernel_locks{0}, kernel_unlocks{0};
+  int64_t counter = 0;
+  constexpr int kThreads = 4, kRounds = 3000;
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t)
+    threads.emplace_back([&, t] {
+      PiRuntime::tid = 0x100 + uint64_t(t);
+      const uint32_t self = uint32_t(PiRuntime::tid);
+      for (int i = 0; i < kRounds; ++i) {
+        uint32_t expected = 0;
+        if (!__atomic_compare_exchange_n(l.memory.word(word), &expected, self, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+          ++kernel_locks;
+          if (call(kLockPi) != 0) { CHECK(!"FUTEX_LOCK_PI"); return; }
+        }
+        CHECK((__atomic_load_n(l.memory.word(word), __ATOMIC_ACQUIRE) & 0x3FFFFFFFu) == self);
+        if (inside.fetch_add(1) != 0) ++overlaps;
+        ++counter;
+        if (i % 7 == 0) std::this_thread::yield();
+        inside.fetch_sub(1);
+        expected = self;
+        if (!__atomic_compare_exchange_n(l.memory.word(word), &expected, 0, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+          ++kernel_unlocks;      // (FUTEX_WAITERS is set: the kernel hands it on)
+          if (call(kUnlockPi) != 0) { CHECK(!"FUTEX_UNLOCK_PI"); return; }
+        }
+      }
+    });
+  for (std::thread& t : threads) t.join();
+  printf("   pi futex: %d locks and %d unlocks went to the kernel\n", kernel_locks.load(), kernel_unlocks.load());
+  CHECK(overlaps.load() == 0 && counter == int64_t(kThreads) * kRounds && l.memory.get32(word) == 0);
+  // the error cases, from thread 0x200
+  PiRuntime::tid = 0x200;
+  CHECK(call(kLockPi) == 0 && l.memory.get32(word) == 0x200);
+  CHECK(call(kLockPi) == -35);      // EDEADLK: one's own
+  CHECK(call(kTrylockPi) == -35);
+  std::thread other([&] {
+    PiRuntime::tid = 0x201;
+    CHECK(call(kTrylockPi) == -kEagain);
+    CHECK(call(kUnlockPi) == -kEperm);      // not the owner
+    const uint64_t ts = l.alloc(16);
+    l.memory.put64(ts, 0); l.memory.put64(ts + 8, 5000000);      // (a monotonic time long past)
+    CHECK(call(kLockPi2, ts) == -110);      // ETIMEDOUT
+    CHECK((l.memory.get32(word) & kWaiters) != 0);      // (it said it waits, and the owner must come to the kernel)
+  });
+  other.join();
+  CHECK(call(kUnlockPi) == 0 && l.memory.get32(word) == 0);
+  CHECK(call(kUnlockPi) == -kEperm);
+  CHECK(l.sys(kFutex, word + 1, kLockPi, 0, 0) == -kEinval);      // (not aligned)
+  l.process.attach_runtime(&l.runtime);
+}
+
 // --- Windows -------------------------------------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows() {
@@ -884,6 +1148,9 @@ int main() {
   printf("-- linux_datagram_names\n"); fflush(stdout); test_linux_datagram_names();
   printf("-- linux_rights\n"); fflush(stdout); test_linux_rights();
   printf("-- linux_eventfd\n"); fflush(stdout); test_linux_eventfd();
+  printf("-- linux_timerfd\n"); fflush(stdout); test_linux_timerfd();
+  printf("-- linux_epoll\n"); fflush(stdout); test_linux_epoll();
+  printf("-- linux_pi_futex\n"); fflush(stdout); test_linux_pi_futex();
   printf("-- windows\n"); fflush(stdout); test_windows();
   printf("-- cross_world\n"); fflush(stdout); test_cross_world();
   printf("-- threads\n"); fflush(stdout); test_threads();

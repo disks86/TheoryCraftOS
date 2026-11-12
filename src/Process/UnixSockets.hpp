@@ -19,6 +19,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "ObjectContainer/List.hpp"
 #include "ObjectContainer/Queue.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
@@ -53,7 +54,23 @@
 namespace process {
 
 enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      // the Linux SOCK_* numbers (Windows has the same for the first two)
-                                Event = 0x40 };      // not a socket: Linux's eventfd, a counter kept here so that poll(), wake-ups and SCM_RIGHTS treat it as they treat sockets
+                                // Not sockets: Linux descriptors kept here so that poll(), wake-ups and SCM_RIGHTS treat them as they treat sockets.
+                                Event = 0x40,        // eventfd: a counter
+                                Timer = 0x41,        // timerfd: expirations of a deadline (the Linux layer advances it from the process's clocks)
+                                Epoll = 0x42,        // epoll: an interest list (the Linux layer evaluates it)
+                                Signal = 0x43 };     // signalfd: no signal is routed to it (never ready)
+inline bool unix_type_is_socket(UnixType t) { return uint8_t(t) < 0x40; }
+
+// One descriptor an epoll instance watches: the descriptor number in the process that added it and what was there (kind, socket id), so that a
+// descriptor closed or reused meanwhile is noticed and dropped.
+struct UnixEpollEntry {
+  int32_t fd = -1;
+  uint32_t events = 0;       // EPOLLIN, EPOLLOUT, ... and the EPOLLONESHOT / EPOLLET flags
+  uint64_t data = 0;
+  DescriptorKind kind = DescriptorKind::Closed;
+  uint64_t token = 0;
+  bool disabled = false;     // (EPOLLONESHOT: reported once, until EPOLL_CTL_MOD)
+};
 
 // What an operation came to. Each ABI turns it into its own error (an errno, a WSA error through an NTSTATUS).
 enum class UnixStatus : uint8_t {
@@ -120,6 +137,11 @@ class UnixSocketManager {
   // counter is above 0 and writable while it can take one more. One use, as create() gives.
   UnixStatus create_event(uint64_t owner_pid, uint64_t initial, bool semaphore, uint32_t* id);
   static constexpr uint64_t kEventMax = 0xFFFFFFFFFFFFFFFEull;
+  // timerfd_create(clock): a timer of that clock (CLOCK_REALTIME 0, CLOCK_MONOTONIC 1, ...), disarmed. epoll_create1(), signalfd(): see UnixType.
+  UnixStatus create_timer(uint64_t owner_pid, uint32_t clock, uint32_t* id);
+  UnixStatus create_epoll(uint64_t owner_pid, uint32_t* id);
+  UnixStatus create_signal(uint64_t owner_pid, uint32_t* id);
+  static constexpr uint32_t kMaxEpollEntries = 4096;
 
   // --- operations (the lock held). `pid` is the calling process's id.
   bool exists_locked(uint32_t id) const { return at(id) != nullptr; }
@@ -159,6 +181,17 @@ class UnixSocketManager {
   UnixStatus event_add_locked(uint32_t id, uint64_t value);
   UnixStatus event_take_locked(uint32_t id, uint64_t* value);
   bool is_event_locked(uint32_t id) const;
+  // A timer: its clock, absolute deadline in that clock (0: disarmed) and interval; armed afresh (expirations start again at 0; wakes waiters);
+  // advanced to `now` (expirations counted, the deadline moved on by whole intervals, or disarmed); its expirations taken (WouldBlock while 0).
+  bool timer_state_locked(uint32_t id, uint32_t* clock, uint64_t* deadline, uint64_t* interval) const;
+  UnixStatus timer_arm_locked(uint32_t id, uint64_t deadline, uint64_t interval);
+  void timer_advance_locked(uint32_t id, uint64_t now);
+  UnixStatus timer_take_locked(uint32_t id, uint64_t* expirations);
+  // An epoll instance's interest list (nullptr: not one).
+  List<UnixEpollEntry>* epoll_interest_locked(uint32_t id);
+  // Counts changes of an interest list (epoll_ctl), so that an epoll_wait waiting on a copy of it looks again (wakes waiters). 0: not an epoll instance.
+  void epoll_changed_locked(uint32_t id);
+  uint64_t epoll_changes_locked(uint32_t id) const;
   UnixReadiness readiness_locked(uint32_t id) const;
   uint32_t readable_bytes_locked(uint32_t id) const;      // FIONREAD: bytes waiting (a message socket: the size of the next message)
   bool local_name_locked(uint32_t id, UnixName* out) const;
@@ -197,7 +230,7 @@ class UnixSocketManager {
     UnixName from;               // the sender's name (datagrams)
   };
   struct Socket {
-    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), data(allocator), records(allocator), rights(allocator), backlog(allocator) {}
+    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), data(allocator), records(allocator), rights(allocator), backlog(allocator), interest(allocator) {}
     uint32_t id = 0;
     uint32_t references = 0;
     UnixType type = UnixType::Stream;
@@ -214,8 +247,11 @@ class UnixSocketManager {
     bool shut_read = false, shut_write = false;
     UnixStatus pending_error = UnixStatus::Ok;
     bool non_blocking = false, pass_credentials = false;
-    uint64_t counter = 0;                // an eventfd's value (UnixType::Event)
+    uint64_t counter = 0;                // an eventfd's value (UnixType::Event), a timer's expirations (UnixType::Timer)
     bool semaphore = false;
+    uint32_t timer_clock = 0;
+    uint64_t timer_deadline = 0, timer_interval = 0;
+    List<UnixEpollEntry> interest;
     uint64_t receive_timeout = ~uint64_t{0}, send_timeout = ~uint64_t{0};
     // The receive queue: bytes [data_head, data.size()) of `data`, split into records; the descriptors they carry, in order.
     ByteBuffer data;

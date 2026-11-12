@@ -29,7 +29,8 @@ program that records, of any kind, gets a record stream of it.
 | PipeWire's native protocol | `NativeServer.{hpp,cpp}`; `client-node` (pw_stream) in `NativeClientNode.cpp` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
-| eventfd (`eventfd`, `eventfd2`): a counter in the AF_UNIX manager (`UnixType::Event`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
+| eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
+| Priority-inheritance futexes (glibc's `PTHREAD_PRIO_INHERIT` mutexes, which libpipewire's loops use) | `src/Process/LinuxThreads.cpp`, `IUserMemory::compare_exchange32` |
 | NtTcosAudio | `src/Process/WindowsAudio.{hpp,cpp}` (layout, handler pointer), `WindowsAudioService.{hpp,cpp}` (the work), `src/Windows/tcos_audio.h` (the DLLs' side) |
 | Start-up | `src/main.cpp` (after the X server) |
 
@@ -62,18 +63,37 @@ program that records, of any kind, gets a record stream of it.
   OPEN_CAPTURE takes it with `[1] = 1`, which WASAPI's `AUDCLNT_STREAMFLAGS_LOOPBACK` on the render endpoint uses.
 
 - **client-node (libpipewire's `pw_stream`).** `pw-play`, `pw-record` and every `pw_stream` program export their own node: Core
-  `create_object("client-node", ..., version 6)`. The server makes it a playback or record stream of the graph (by `media.class`) and hands the
+  `create_object("client-node", ..., version 6)`. The server makes it a playback or record stream of the graph (by `media.class`; at
+  `set_active` or the first `port_update`, so that the update before them can say the stream's format) and hands the
   client, with SCM_RIGHTS, the memory it shares with the kernel (memfds: the node's `pw_node_activation`, the port's buffers and its
   `spa_io_buffers` area) and two eventfds (the wake and done signals of `transport`). It drives the adapter the stream wraps: a PortConfig
-  (convert mode, F32 stereo 48 kHz; the AVX2 S16 output of audioconvert assumes an aligned destination and crashes), the port's Format, then
-  buffers as the port's Buffers param asks (2 to 16, 64-byte aligned, at least 8192 frames), the io area and Start. Each cycle (1024 frames, a
-  quantum at 48 kHz) the server writes the clock into the activation, sets it TRIGGERED and signals the wake eventfd; the client processes and
-  sets FINISHED. A playback node is triggered while its stream holds less than three quanta, and the buffer it filled (HAVE_DATA) goes into the
+  (convert mode, F32 at the stream's own rate and channel count, mono or stereo, from the EnumFormat in its update, else 48 kHz stereo; F32
+  because the AVX2 S16 output of audioconvert assumes an aligned destination and crashes), the port's Format, then
+  buffers as the port's Buffers param asks (2 to 16, 64-byte aligned, at least 8192 frames), the io area and Start. Each cycle (the stream's
+  `node.force-quantum`, or its `node.latency` "N/D" as N * rate / D frames, else 1024; 64 to 8192) the server writes the clock into the activation, sets it TRIGGERED and signals the wake eventfd; the client processes and
+  sets FINISHED. A playback node is triggered while its stream holds less than two cycles (at least 3072 frames), and the buffer it filled (HAVE_DATA) goes into the
   `PlaybackStream`; a record node gets a buffer filled from its `RecordStream` before each trigger. A cycle that never finishes is given up after
   100 ticks and triggered again; `set_active(false)` pauses. The `pipewire` thread ticks every 5 ms while nodes run (50 ms otherwise). Descriptors
   are the transport's (`IDescriptorMaker`): `SocketServer` makes memfds (`MemoryFile`, whose block the kernel reads and writes in place while the
-  client maps it) and eventfds (counters in the AF_UNIX manager, so `poll()`, wake-ups and SCM_RIGHTS take them as sockets), sends each take's
+  client maps it) and eventfds (counters in the AF_UNIX manager, so `poll()`, wake-ups and SCM_RIGHTS take them as sockets; `EFD_NONBLOCK`, as
+  PipeWire makes them: libpipewire empties one with a read that must not wait), sends each take's
   descriptors with its first bytes, and releases what the protocol let go of from its own thread (a graveyard).
+
+- **libpipewire itself in the OS.** The real libpipewire runs on the Linux layer (dynamically linked through glibc's `ld.so`, see
+  [LinuxDynamicPrograms.md](LinuxDynamicPrograms.md)): its loops are `epoll` sets of eventfds, timerfds, signalfds and sockets, guarded by
+  `PTHREAD_PRIO_INHERIT` mutexes. So the Linux layer has:
+  - `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `epoll_pwait2`: an interest list kept in the AF_UNIX manager, evaluated as `poll()`
+    evaluates descriptors. The list is copied and checked against the descriptor table outside the system lock (a descriptor closed or reused
+    meanwhile is dropped, as Linux drops a closed file's); a change made while a thread waits (`epoll_ctl` from another thread) wakes it to look
+    again. `EPOLLONESHOT` reports once until `EPOLL_CTL_MOD`; `EPOLLET` is level-triggered (a program reading until EAGAIN sees the same).
+    Regular files are refused (EPERM), as on Linux.
+  - `timerfd_create`, `timerfd_settime` (relative, `TFD_TIMER_ABSTIME`, periodic, disarming), `timerfd_gettime`: the timer is kept in the
+    manager and advanced from the process's clocks whenever it is looked at; `poll()`, `select()`, `epoll_wait` and a blocking `read()` wake when
+    the first timer they watch is due (and look again when another thread arms one).
+  - `signalfd4`: a descriptor no signal is routed to (signals are not delivered to descriptors); a loop can hold it.
+  - PI futexes (`FUTEX_LOCK_PI`, `LOCK_PI2`, `TRYLOCK_PI`, `UNLOCK_PI`): the owner's tid and `FUTEX_WAITERS` in the word as on Linux, through an
+    atomic compare-and-exchange on the user's page (`AddressSpace::compare_exchange32`). Without them glibc refuses PI mutexes (ENOTSUP), and
+    libpipewire's data loop with them. No priority is lent (the scheduler has no donation).
 
 ## What the protocols serve
 
@@ -174,15 +194,25 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
   The fifth run is `tests/linux/pwnodetest.c` (no C library) next to `winmmtest`: the `pw_stream` side of client-node through the OS's own system
   calls (SCM_RIGHTS, `mmap(MAP_SHARED)` of the passed memfds, `ppoll` and `read`/`write` on the eventfds), 4 s of 500 Hz, then half a second of
-  the microphone on an input node, each side's tone checked; the mix must hold 300, 400 and 500 Hz at once.
+  the microphone on an input node, each side's tone checked; the mix must hold 300, 400 and 500 Hz at once. The sixth run (`libpipewire`, x86-64,
+  when the machine has `pw-cat`) runs the host's real `pw-cat` with its libraries, SPA plugins (`libspa-support`, `libspa-audioconvert`, ...),
+  modules (`protocol-native`, `client-node`, `adapter`, ...) and `client.conf` copied into the Linux tree: `pw-play` of a 500 Hz WAV must be in
+  the mix with the native stream, and `pw-record -n 24000` must write a WAV (copied out with `TCOS_EMU_SAVE`) that holds 880 Hz on the left and
+  1320 Hz on the right. `TCOS_EMU_STRACE=1` prints every system call of the emulated program with its result.
+- `tests/run_host_tests.sh UnixSocketTest`: timerfd (one-shot, periodic, absolute, disarmed, `poll()` and a blocking read woken when it fires, also
+  when another thread arms it meanwhile) and epoll (data, MOD/DEL, EEXIST/ENOENT/EPERM, one-shot, a timer and a socket in one set, a hang-up, a
+  descriptor closed while in the set, a waiter woken by another thread's `EPOLL_CTL_ADD`, signalfd) and PI futexes (four threads sharing one
+  lock through glibc's fast path and `FUTEX_LOCK_PI`/`UNLOCK_PI`; EDEADLK, EPERM, EAGAIN, ETIMEDOUT).
 
 ## Not done
 
-- **libpipewire itself in the OS.** client-node works (real `pw-play`/`pw-record` on the host server, and a freestanding client in the emulator),
-  but the real libpipewire has not run inside the OS: its loop needs `epoll` and `timerfd`, which the Linux layer does not have yet (eventfd it has).
-- **client-node limits.** One port per node, F32 stereo 48 kHz at the port (the adapter converts), a fixed 1024-frame quantum, no metadata
-  (`SPA_META_Header`, `Busy`), no `spa_io_position` for the port, no client-allocated buffers (`port_buffers`), no `pw_filter` or `pw_stream` with
-  `PW_STREAM_FLAG_DRIVER`, no MIDI or video. The `adapter` factory (`pw-cli create-node adapter`) is refused.
+- **libpipewire in QEMU.** The real `pw-play` and `pw-record` run on the CPU emulator over the OS's system calls; they have not been run in the real
+  kernel under QEMU yet (the same files would have to be put on the disk image, as `LinuxDynamicPrograms.md` describes).
+- **Signals and realtime.** A signalfd never fires (signals are not routed to descriptors), so `pw-cat` cannot be stopped with Ctrl+C through its
+  loop; `module-rt` finds no RTKit or session bus and runs without realtime priority (as it does on Linux without them).
+- **client-node limits.** One port per node, mono or stereo at the port (a wider stream is downmixed by the adapter in the program), no metadata
+  (`SPA_META_Header`, `Busy`), no client-allocated buffers (`port_buffers`), no `pw_filter` or `pw_stream` with `PW_STREAM_FLAG_DRIVER`, no MIDI
+  or video. The `adapter` factory (`pw-cli create-node adapter`) is refused.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).

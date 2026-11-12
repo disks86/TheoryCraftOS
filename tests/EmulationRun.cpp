@@ -224,7 +224,17 @@ struct Threads final : IThreadSpawner {
   void join(void* h) override { static_cast<Hd*>(h)->t.join(); delete static_cast<Hd*>(h); }
   uint64_t self() override { return std::hash<std::thread::id>()(std::this_thread::get_id()); }
 };
-struct Ctl final : IRunControl { std::atomic<bool> stop{false}; bool stop_requested() override { return stop; } void yield() override { std::this_thread::yield(); } };
+struct Ctl final : IRunControl {
+  std::atomic<bool> stop{false};
+  bool trace = getenv("TCOS_EMU_STRACE") != nullptr;      // every system call on stderr, with its result
+  bool stop_requested() override { return stop; }
+  void yield() override { std::this_thread::yield(); }
+  void on_syscall(uint64_t tid, const process::SyscallRequest& r, bool done, uint64_t result) override {
+    if (!trace) return;
+    if (!done) fprintf(stderr, "[%llx] > %llu(%llx, %llx, %llx, %llx)\n", (unsigned long long)tid, (unsigned long long)r.number, (unsigned long long)r.args[0], (unsigned long long)r.args[1], (unsigned long long)r.args[2], (unsigned long long)r.args[3]);
+    else fprintf(stderr, "[%llx] < %llu = %lld\n", (unsigned long long)tid, (unsigned long long)r.number, (long long)result);
+  }
+};
 static std::vector<uint8_t> slurp(const std::string& p, bool* ok) { FILE* f = fopen(p.c_str(), "rb"); *ok = f; std::vector<uint8_t> b; if (!f) return b; uint8_t buf[4096]; size_t n; while ((n = fread(buf, 1, 4096, f)) > 0) b.insert(b.end(), buf, buf + n); fclose(f); return b; }
 struct Libs final : process::ILibraryProvider {
   std::string dir; std::map<std::string, std::vector<uint8_t>> cache;
@@ -497,6 +507,25 @@ int main(int argc, char** argv) {
   std::thread watchdog([&] { for (int i = 0; i < 600 && !ctl.stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100)); ctl.stop = true; });
   auto o = run_emulated_threads(p, *cpu.get(), ctl, sync, th, a, 20000);
   bool wasstop = ctl.stop; ctl.stop = true; watchdog.join();
+  // TCOS_EMU_SAVE: files the program wrote, copied out of the Linux tree (space separated linux-path=host-path, such as what pw-record recorded).
+  if (const char* list = getenv("TCOS_EMU_SAVE")) {
+    std::string all = list;
+    for (size_t at = 0; at < all.size();) {
+      size_t end = all.find(' ', at);
+      if (end == std::string::npos) end = all.size();
+      const std::string pair = all.substr(at, end - at);
+      at = end + 1;
+      const size_t eq = pair.find('=');
+      if (eq == std::string::npos) continue;
+      const std::string from = std::string(filesystem::layout::kLinux) + pair.substr(0, eq), to = pair.substr(eq + 1);
+      UniquePointer<filesystem::IFile> file;
+      if (fs.open_file(StringView(from.c_str()), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) { printf("save: no %s\n", from.c_str()); continue; }
+      std::vector<uint8_t> bytes(file->size());
+      uint64_t got = 0;
+      file->read(0, ByteView(bytes.data(), bytes.size()), &got);
+      if (FILE* f = fopen(to.c_str(), "wb")) { fwrite(bytes.data(), 1, got, f); fclose(f); printf("save: %s, %llu bytes\n", to.c_str(), (unsigned long long)got); }
+    }
+  }
 #ifdef TCOS_EMU_DXG
   process::win32k::dxg::shutdown_for_tests();      // (the layer's records point into the kernel and the allocator, which are going away)
   dxgk::set_system_kernel(nullptr);

@@ -214,7 +214,11 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
     }
     process::SyscallRequest request;
     uint64_t result = ~uint64_t{37};      // -ENOSYS
-    if (cpu.pending_syscall(process_->abi(), &request)) result = process_->syscall(request);
+    if (cpu.pending_syscall(process_->abi(), &request)) {
+      control_.on_syscall(slot.tid, request, false, 0);
+      result = process_->syscall(request);
+      control_.on_syscall(slot.tid, request, true, result);
+    }
     process::Process::LinuxThreadState::CloneRequest clone;
     if (process_->take_clone(&clone)) {      // clone(): the child starts as a copy of this thread, right after the call, with 0 as the result
       Slot* child = (threads_ && allocator_) ? free_slot() : nullptr;

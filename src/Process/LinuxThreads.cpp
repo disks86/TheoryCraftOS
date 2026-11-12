@@ -22,7 +22,7 @@ namespace linuxabi {
 
 namespace {
 
-constexpr int64_t kE2big = 7, kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38, kEintr = 4, kEtimedout = 110, kEnomem = 12;
+constexpr int64_t kEperm = 1, kEdeadlk = 35, kE2big = 7, kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38, kEintr = 4, kEtimedout = 110, kEnomem = 12;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
 constexpr uint64_t kCloneVm = 0x100, kCloneFs = 0x200, kCloneFiles = 0x400, kCloneSighand = 0x800, kCloneThread = 0x10000, kCloneSysvsem = 0x40000,
@@ -36,6 +36,89 @@ Process::LinuxThreadState::Thread* find_thread(Process& p, uint64_t tid) {
   for (Process::LinuxThreadState::Thread& t : p.linux_threads().threads)
     if (t.used && t.tid == tid) return &t;
   return nullptr;
+}
+
+// Priority-inheritance futexes (FUTEX_LOCK_PI, TRYLOCK_PI, UNLOCK_PI, LOCK_PI2): the word holds the owner's thread id and FUTEX_WAITERS while threads
+// wait in the kernel, as on Linux, so glibc's PTHREAD_PRIO_INHERIT mutexes (and its check that the kernel has them) work. No priority is lent to the
+// owner: the scheduler has no priority donation, so these are fair sleeping locks.
+constexpr uint32_t kFutexWaiters = 0x80000000u, kFutexTidMask = 0x3FFFFFFFu;      // (FUTEX_OWNER_DIED, 0x40000000, is kept as it is)
+
+uint64_t futex_deadline(Process& p, uint64_t timeout, bool realtime, uint64_t* deadline) {      // (an absolute time on the chosen clock)
+  *deadline = ~uint64_t{0};
+  if (!timeout) return 0;
+  uint64_t seconds = 0, nanos = 0;
+  if (!p.read_user_u64(timeout, &seconds) || !p.read_user_u64(timeout + 8, &nanos)) return error(kEfault);
+  if (int64_t(seconds) < 0 || nanos >= 1000000000u) return error(kEinval);
+  const uint64_t now = p.host().monotonic_ns();
+  const uint64_t max_seconds = (~uint64_t{0} - 999999999u) / 1000000000u;
+  const uint64_t ns = seconds > max_seconds ? ~uint64_t{0} : seconds * 1000000000u + nanos;
+  const uint64_t clock_now = realtime ? p.host().realtime_ns() : now;
+  *deadline = ns <= clock_now ? now : (ns - clock_now > ~uint64_t{0} - now ? ~uint64_t{0} : now + (ns - clock_now));
+  return 0;
+}
+
+uint64_t futex_lock_pi(Process& p, uint64_t address, bool try_only, uint64_t deadline) {
+  IProcessRuntime* runtime = p.runtime();
+  const uint32_t self = uint32_t(current_tid(p)) & kFutexTidMask;
+  for (;;) {
+    uint32_t seen = 0;
+    if (!p.compare_exchange_user32(address, 0, self, &seen)) return error(kEfault);
+    if (seen == 0) return 0;
+    const uint32_t owner = seen & kFutexTidMask;
+    if (owner == self) return error(kEdeadlk);
+    if (owner == 0) {      // (no owner, only the waiters bit, or the owner died: it is ours, the bits kept)
+      uint32_t again = 0;
+      if (!p.compare_exchange_user32(address, seen, self | (seen & kFutexWaiters), &again)) return error(kEfault);
+      if (again == seen) return 0;
+      continue;
+    }
+    if (try_only) return error(kEagain);
+    if (!runtime) return error(kEnosys);
+    if (!(seen & kFutexWaiters)) {      // (the owner must come to the kernel to unlock now)
+      uint32_t again = 0;
+      if (!p.compare_exchange_user32(address, seen, seen | kFutexWaiters, &again)) return error(kEfault);
+      if (again != seen) continue;
+    }
+    Process::LinuxThreadState::Waiter* w = nullptr;
+    for (Process::LinuxThreadState::Waiter& candidate : p.linux_threads().waiters)
+      if (!candidate.used) { w = &candidate; break; }
+    if (!w) return error(kEnomem);
+    w->used = true;
+    w->woken = false;
+    w->address = address;
+    w->bitset = ~0u;
+    uint64_t result = 0;
+    while (!w->woken) {
+      if (runtime->interrupted() || p.exited()) { result = error(kEintr); break; }
+      uint64_t left = ~uint64_t{0};
+      if (deadline != ~uint64_t{0}) {
+        const uint64_t now = p.host().monotonic_ns();
+        if (now >= deadline) { result = error(kEtimedout); break; }
+        left = deadline - now;
+      }
+      runtime->wait(left);
+    }
+    w->used = false;
+    if (result) return result;
+  }
+}
+
+uint64_t futex_unlock_pi(Process& p, uint64_t address) {
+  const uint32_t self = uint32_t(current_tid(p)) & kFutexTidMask;
+  uint32_t waiting = 0;
+  for (const Process::LinuxThreadState::Waiter& w : p.linux_threads().waiters)
+    if (w.used && !w.woken && w.address == address) ++waiting;
+  for (;;) {
+    uint8_t raw[4];
+    if (!p.read_user(address, ByteView(raw, 4))) return error(kEfault);
+    const uint32_t seen = uint32_t{raw[0]} | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24);
+    if ((seen & kFutexTidMask) != self) return error(kEperm);
+    uint32_t again = 0;
+    if (!p.compare_exchange_user32(address, seen, waiting > 1 ? kFutexWaiters : 0, &again)) return error(kEfault);
+    if (again == seen) break;
+  }
+  if (waiting) futex_wake(p, address, 1, ~0u);      // (it takes the lock itself, or waits again if another thread was quicker)
+  return 0;
 }
 
 }  // namespace
@@ -213,6 +296,16 @@ uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, ui
       w->used = false;
       return result;
     }
+    case 6: case 13: case 8: {      // FUTEX_LOCK_PI (a CLOCK_REALTIME deadline), FUTEX_LOCK_PI2 (monotonic unless FUTEX_CLOCK_REALTIME), FUTEX_TRYLOCK_PI
+      if (address & 3) return error(kEinval);
+      uint64_t deadline = ~uint64_t{0};
+      if (command != 8)
+        if (const uint64_t r = futex_deadline(p, timeout_or_count, command == 6 || realtime, &deadline); r) return r;
+      return futex_lock_pi(p, address, command == 8, deadline);
+    }
+    case 7:      // FUTEX_UNLOCK_PI
+      if (address & 3) return error(kEinval);
+      return futex_unlock_pi(p, address);
     default:
       return error(kEnosys);
   }

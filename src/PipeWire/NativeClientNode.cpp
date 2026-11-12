@@ -47,6 +47,7 @@ enum : uint32_t { kCnEvTransport = 0, kCnEvSetParam = 1, kCnEvSetIo = 2, kCnEvEv
 constexpr uint32_t kCoreEvBoundId = 5, kCoreEvAddMem = 6, kCoreEvBoundProps = 8;
 
 // spa types and ids (spa/param/param.h, port-config.h, node/command.h, node/io.h, buffer/buffer.h)
+constexpr uint32_t kParamEnumFormat = 3, kObjectFormat = 0x40003, kFormatAudioRate = 0x10003, kFormatAudioChannels = 0x10004;
 constexpr uint32_t kParamFormat = 4, kParamPortConfig = 11, kObjectPortConfig = 0x40008, kObjectBuffers = 0x40004;
 constexpr uint32_t kPortConfigDirection = 1, kPortConfigMode = 2, kPortConfigMonitor = 3, kPortConfigControl = 4, kPortConfigFormat = 5, kModeConvert = 2;
 constexpr uint32_t kCommandNode = 0x30002, kCommandPause = 1, kCommandStart = 2;
@@ -68,11 +69,11 @@ constexpr uint64_t kSegmentRate = 24;
 constexpr uint32_t kPositionRunning = 2;
 
 // the buffers: a spa_chunk, then the data, in each buffer's own part of one memfd
-constexpr uint32_t kQuantum = 1024, kRate = 48000, kFrame = 8;      // F32LE stereo
+constexpr uint32_t kMinQuantum = 64, kMaxChannels = 2, kMinRate = 8000, kMaxRate = 192000;      // (a port is F32 at its stream's rate, mono or stereo)
 constexpr uint32_t kBuffers = 3, kMaxBuffers = 16, kMaxFrames = 8192, kDataOffset = 64;
 constexpr uint32_t kMaxDataSize = 1u << 20;      // the most a buffer's data may be (what the port asks for, within reason)
 constexpr uint32_t kBuffersBuffers = 1, kBuffersSize = 3;      // spa/param/buffers.h
-constexpr uint64_t kAheadBytes = 3ull * kQuantum * kFrame;      // what playback keeps queued in the graph
+constexpr uint32_t kAheadFrames = 3072;      // what playback keeps queued in the graph at least (and two cycles' worth)
 constexpr uint32_t kTimeoutTicks = 100;                         // a cycle that never finishes is given up after this many ticks
 
 // ---- the shared records ------------------------------------------------------------------------------------------------------------------------------
@@ -97,7 +98,26 @@ void store(ByteView memory, uint64_t offset, T value) {
 }
 void store_double(ByteView memory, uint64_t offset, double value) { store<uint64_t>(memory, offset, __builtin_bit_cast(uint64_t, value)); }
 
-uint64_t frames_ns(uint64_t frames) { return frames * 1000000000ull / kRate; }
+uint64_t frames_ns(uint64_t frames, uint32_t rate) { return frames * 1000000000ull / rate; }
+
+// "N/D" (node.latency, node.force-quantum's "N"): true with both numbers, each at most 2^31.
+bool parse_fraction(StringView text, uint32_t* num, uint32_t* den) {
+  uint64_t parts[2] = {0, 1};
+  uint32_t which = 0;
+  bool digits = false;
+  for (uint64_t i = 0; i < text.size(); ++i) {
+    const char ch = text[i];
+    if (ch == '/' && which == 0 && digits) { which = 1; parts[1] = 0; digits = false; continue; }
+    if (ch < '0' || ch > '9') return false;
+    parts[which] = parts[which] * 10 + uint64_t(ch - '0');
+    if (parts[which] > 0x80000000ull) return false;
+    digits = true;
+  }
+  if (!digits || parts[1] == 0) return false;
+  *num = uint32_t(parts[0]);
+  *den = uint32_t(parts[1]);
+  return true;
+}
 
 // Reads the inline dict of an update (Int n, then n key/value strings) into `out`.
 bool read_inline_dict(pod::Parser& p, Properties* out) {
@@ -117,7 +137,6 @@ void push_empty_dict(pod::Builder& b) {
   b.end(f);
 }
 
-const PcmFormat kMixFormat{SampleFormat::F32Le, kRate, 2};
 
 // An Int property of a param, or a Choice of Ints' default (its first value).
 bool int_or_default(const pod::Value& v, uint32_t* out) {
@@ -168,10 +187,10 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
   props.set("client.api", "pipewire");
   if (plays) {
     n.direction = kDirectionOutput;
-    n.node = graph_.create_playback(c.graph_client, kMixFormat, props, &n.playback);
+    n.node = graph_.create_playback(c.graph_client, n.format, props, &n.playback);
   } else {
     n.direction = kDirectionInput;
-    n.node = graph_.create_record(c.graph_client, kMixFormat, props, &n.record, props.get("stream.capture.sink") == StringView("true"));
+    n.node = graph_.create_record(c.graph_client, n.format, props, &n.record, props.get("stream.capture.sink") == StringView("true"));
   }
   if (!n.node) return false;
   // the proxy is bound to the node (bound_props, core 4; bound_id before)
@@ -227,12 +246,12 @@ void NativeServer::create_client_node(Client& c, uint32_t new_id, const Properti
   const StringView clock_name("tcos.driver");
   name.first(clock_name.size()).copy_from(clock_name.bytes());
   store<uint32_t>(a, clock + kClockRate, 1);
-  store<uint32_t>(a, clock + kClockRate + 4, kRate);
-  store<uint64_t>(a, clock + kClockDuration, kQuantum);
+  store<uint32_t>(a, clock + kClockRate + 4, n->format.rate);
+  store<uint64_t>(a, clock + kClockDuration, n->quantum);
   store_double(a, clock + kClockRateDiff, 1.0);
   store<uint32_t>(a, clock + kClockTargetRate, 1);
-  store<uint32_t>(a, clock + kClockTargetRate + 4, kRate);
-  store<uint64_t>(a, clock + kClockTargetDuration, kQuantum);
+  store<uint32_t>(a, clock + kClockTargetRate + 4, n->format.rate);
+  store<uint64_t>(a, clock + kClockTargetDuration, n->quantum);
   store<uint32_t>(a, kActPosition + kPosState, kPositionRunning);
   store<uint32_t>(a, kActPosition + kPosSegmentCount, 1);
   store_double(a, kActPosition + kPosSegments + kSegmentRate, 1.0);
@@ -244,7 +263,8 @@ void NativeServer::create_client_node(Client& c, uint32_t new_id, const Properti
     remove_resource(c, new_id);
     return refuse(kENOMEM, "out of memory");
   }
-  make_graph_node(c, node);      // (pw_stream names its media class here; others do in their update)
+  // (the graph's node is made at set_active or the first port_update: the update before them may still say the stream's format, which the node's
+  // stream is made in)
   // the activation memory and the transport (the client waits on `wake`; `done` is the other way)
   node.activation_mem = c.next_mem_id++;
   send_add_mem(c, node.activation_mem, node.activation);
@@ -273,6 +293,14 @@ void NativeServer::destroy_client_node(Client& c, uint32_t resource_id) {
 // ---- the server's messages -----------------------------------------------------------------------------------------------------------------------
 
 void NativeServer::send_port_config(Client& c, ClientNode& n) {
+  if (n.activation) {      // (the clock at the stream's rate and cycle, now that its update said them)
+    ByteView a = n.activation->memory();
+    const uint64_t clock = kActPosition + kPosClock;
+    store<uint32_t>(a, clock + kClockRate + 4, n.format.rate);
+    store<uint64_t>(a, clock + kClockDuration, n.quantum);
+    store<uint32_t>(a, clock + kClockTargetRate + 4, n.format.rate);
+    store<uint64_t>(a, clock + kClockTargetDuration, n.quantum);
+  }
   const uint64_t m = begin(c, n.resource, kCnEvSetParam);
   pod::Builder b(c.outbox);
   const uint64_t f = b.begin_struct();
@@ -288,7 +316,7 @@ void NativeServer::send_port_config(Client& c, ClientNode& n) {
   b.property(kPortConfigControl);
   b.boolean(false);
   b.property(kPortConfigFormat);
-  build_format_param(b, kParamFormat, kMixFormat);
+  build_format_param(b, kParamFormat, n.format);
   b.end(o);
   b.end(f);
   end(c, m);
@@ -303,7 +331,7 @@ void NativeServer::send_port_format(Client& c, ClientNode& n) {
   b.int32(0);
   b.id(kParamFormat);
   b.int32(0);
-  build_format_param(b, kParamFormat, kMixFormat);
+  build_format_param(b, kParamFormat, n.format);
   b.end(f);
   end(c, m);
   n.format_sent = true;
@@ -312,7 +340,7 @@ void NativeServer::send_port_format(Client& c, ClientNode& n) {
 bool NativeServer::send_buffers(Client& c, ClientNode& n) {
   // as many as the port asks for (2 .. 16) and as big (at least a quantum of the largest, 8192 frames; at most 1 MiB), each in its own 64-byte-aligned part
   n.n_buffers = n.wanted_buffers >= 2 && n.wanted_buffers <= kMaxBuffers ? n.wanted_buffers : kBuffers;
-  uint32_t data = n.wanted_size > kMaxFrames * kFrame ? n.wanted_size : kMaxFrames * kFrame;
+  uint32_t data = n.wanted_size > kMaxFrames * n.frame() ? n.wanted_size : kMaxFrames * n.frame();
   if (data > kMaxDataSize) data = kMaxDataSize;
   data = (data + 63) & ~63u;
   n.data_size = data;
@@ -409,6 +437,18 @@ void NativeServer::client_node_method(Client& c, Resource& r, uint32_t opcode, p
       for (int32_t i = 0; i < n_params; ++i) {
         pod::Value v;
         if (!args.pod(&v)) { protocol_error(c, r.id, kEINVAL, "invalid update"); return; }
+        // the stream's EnumFormat or Format: its rate and channels become the port's (until the graph node is made: a stream's format is fixed then)
+        pod::ObjectReader o;
+        if (n->node || !o.open(v) || o.object_type() != kObjectFormat || (o.object_id() != kParamEnumFormat && o.object_id() != kParamFormat)) continue;
+        uint32_t key = 0, flags = 0, rate = 0, channels = 0;
+        pod::Value prop;
+        while (o.next(&key, &flags, &prop)) {
+          if (key == kFormatAudioRate) int_or_default(prop, &rate);
+          if (key == kFormatAudioChannels) int_or_default(prop, &channels);
+        }
+        if (rate >= kMinRate && rate <= kMaxRate) n->format.rate = rate;
+        if (channels >= 1 && channels <= kMaxChannels) n->format.channels = channels;
+        set_quantum(*n);      // (node.latency's frames are at its own rate)
       }
       pod::Value info;
       if (!args.pod(&info)) { protocol_error(c, r.id, kEINVAL, "invalid update"); return; }
@@ -423,8 +463,8 @@ void NativeServer::client_node_method(Client& c, Resource& r, uint32_t opcode, p
         }
         if (props.count()) {
           n->props.update(props, Properties::Mode::kReplace);
+          set_quantum(*n);
           if (n->node) graph_.update_node(n->node, props, Properties::Mode::kReplace);
-          else make_graph_node(c, *n);
         }
       }
       return;
@@ -492,23 +532,35 @@ void NativeServer::client_node_method(Client& c, Resource& r, uint32_t opcode, p
   }
 }
 
+// A cycle's frames: node.force-quantum (frames), else node.latency ("N/D": N frames at rate D, so N * rate / D at the port's), else 1024; 64 to 8192.
+void NativeServer::set_quantum(ClientNode& n) {
+  uint32_t num = 0, den = 1;
+  uint64_t frames = 1024;
+  if (parse_fraction(n.props.get("node.force-quantum"), &num, &den) && den == 1 && num) frames = num;
+  else if (parse_fraction(n.props.get("node.latency"), &num, &den) && num) frames = uint64_t{num} * n.format.rate / den;
+  if (frames < kMinQuantum) frames = kMinQuantum;
+  if (frames > kMaxFrames) frames = kMaxFrames;
+  n.quantum = static_cast<uint32_t>(frames);
+}
+
 // ---- the cycle -----------------------------------------------------------------------------------------------------------------------------------
 
 void NativeServer::trigger(ClientNode& n, uint64_t) {
   ByteView a = n.activation->memory();
   const uint32_t status = load<uint32_t>(a, kActStatus);
   if (status == kActInactive) return;      // (the client has not added the node to its loop yet)
-  const uint64_t nsec = frames_ns(n.position);
+  const uint64_t nsec = frames_ns(n.position, n.format.rate);
   const uint64_t clock = kActPosition + kPosClock;
   store<uint64_t>(a, clock + kClockNsec, nsec);
   store<uint64_t>(a, clock + kClockPosition, n.position);
-  store<uint64_t>(a, clock + kClockDuration, kQuantum);
-  store<uint64_t>(a, clock + kClockNextNsec, nsec + frames_ns(kQuantum));
+  store<uint32_t>(a, clock + kClockRate + 4, n.format.rate);
+  store<uint64_t>(a, clock + kClockDuration, n.quantum);
+  store<uint64_t>(a, clock + kClockNextNsec, nsec + frames_ns(n.quantum, n.format.rate));
   store<uint32_t>(a, clock + kClockCycle, static_cast<uint32_t>(n.cycles));
   store<uint64_t>(a, kActSignalTime, nsec);
   store<uint32_t>(a, kActStatus, kActNotTriggered);
   store<uint32_t>(a, kActStatus, kActTriggered);
-  n.position += kQuantum;
+  n.position += n.quantum;
   ++n.cycles;
   n.pending = true;
   n.triggered_at = 0;
@@ -536,8 +588,8 @@ void NativeServer::run_client_node(ClientNode& n, uint64_t now) {
           const uint32_t start = offset % maxsize, length = size < maxsize ? size : maxsize;
           ConstByteView data = ConstByteView(bufs).subview(base + kDataOffset, maxsize);
           const uint32_t first = length < maxsize - start ? length : maxsize - start;
-          n.playback->write(data.subview(start, first - first % kFrame));
-          if (length > first) n.playback->write(data.first(length - first - (length - first) % kFrame));
+          n.playback->write(data.subview(start, first - first % n.frame()));
+          if (length > first) n.playback->write(data.first(length - first - (length - first) % n.frame()));
           store<uint32_t>(io, 4, id);      // (handed back)
         } else {
           store<uint32_t>(io, 4, kIdInvalid);      // (nothing came: nothing to hand back, or the producer would get a buffer twice)
@@ -548,16 +600,17 @@ void NativeServer::run_client_node(ClientNode& n, uint64_t now) {
   }
   if (n.pending) return;
   if (n.playback) {
-    if (n.playback->waiting_bytes() < kAheadBytes) trigger(n, now);
+    const uint64_t ahead = 2ull * n.quantum > kAheadFrames ? 2ull * n.quantum : kAheadFrames;
+    if (n.playback->waiting_bytes() < ahead * n.frame()) trigger(n, now);
   } else if (n.record) {
-    if (n.record->available_bytes() < uint64_t{kQuantum} * kFrame) return;
+    if (n.record->available_bytes() < uint64_t{n.quantum} * n.frame()) return;
     const uint32_t id = n.next_buffer;
     n.next_buffer = (n.next_buffer + 1) % n.n_buffers;
     const uint64_t base = uint64_t{id} * n.buffer_stride;
-    const uint32_t got = n.record->read(bufs.subview(base + kDataOffset, uint64_t{kQuantum} * kFrame));
+    const uint32_t got = n.record->read(bufs.subview(base + kDataOffset, uint64_t{n.quantum} * n.frame()));
     store<uint32_t>(bufs, base, 0);
     store<uint32_t>(bufs, base + 4, got);
-    store<int32_t>(bufs, base + 8, static_cast<int32_t>(kFrame));
+    store<int32_t>(bufs, base + 8, static_cast<int32_t>(n.frame()));
     store<int32_t>(bufs, base + 12, 0);
     store<uint32_t>(io, 4, id);
     store<int32_t>(io, 0, kStatusHaveData);

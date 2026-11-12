@@ -190,6 +190,23 @@ bool AddressSpace::is_shared(uint64_t address) const {
   return i < regions_.count() && regions_[i]->base <= address && regions_[i]->shared != nullptr;
 }
 
+namespace {
+// The futex word inside a page: `page` is page-aligned memory of this address space and `offset` a multiple of 4 below kPageSize, so the word is aligned
+// and lies wholly inside memory that lives as long as the page (the caller holds the layout steady for the call).
+uint32_t* word_in_page(uint8_t* page, uint64_t offset) { return reinterpret_cast<uint32_t*>(page + offset); }
+}  // namespace
+
+bool AddressSpace::compare_exchange32(uint64_t address, uint32_t expected, uint32_t desired, uint32_t* observed) {
+  if (address & 3) return false;
+  if (!(check(address, 4, kProtWrite) || (break_copy_on_write(address, 4) && check(address, 4, kProtWrite)))) return false;
+  uint8_t* page = materialize(address);
+  if (!page) return false;
+  uint32_t* word = word_in_page(page, address & (kPageSize - 1));
+  __atomic_compare_exchange_n(word, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  *observed = expected;      // (the builtin leaves the value it found there)
+  return true;
+}
+
 const uint8_t* AddressSpace::page_memory(uint64_t page) const {
   const uint64_t i = first_ending_after(page);
   if (i >= regions_.count() || regions_[i]->base > page) return nullptr;
