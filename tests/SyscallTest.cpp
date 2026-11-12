@@ -249,6 +249,22 @@ static void test_linux() {
   mem.put64(kBase + 0x700, 0x7FFFFFFFFFFFFFFFull);
   CHECK(p.syscall(req(35, kBase + 0x700, 0)) == 0);                       // clamps instead of wrapping
 
+  // clock_nanosleep (glibc's nanosleep): relative, and until a time of the clock (TIMER_ABSTIME; the monotonic clock reads 42 ns here)
+  host.slept = 0;
+  mem.put64(kBase + 0x700, 0); mem.put64(kBase + 0x708, 300);
+  CHECK(p.syscall(req(230, 1, 0, kBase + 0x700)) == 0 && host.slept == 300);
+  host.slept = 0;
+  mem.put64(kBase + 0x708, 1042);
+  CHECK(p.syscall(req(230, 1, 1, kBase + 0x700)) == 0 && host.slept == 1000);
+  host.slept = 0;
+  mem.put64(kBase + 0x708, 40);
+  CHECK(p.syscall(req(230, 1, 1, kBase + 0x700)) == 0 && host.slept == 0);      // already past: no sleep
+  CHECK(sres(p.syscall(req(230, 77, 0, kBase + 0x700))) == -22);               // no such clock
+  CHECK(sres(p.syscall(req(230, 1, 2, kBase + 0x700))) == -22);                // unknown flag
+  CHECK(sres(p.syscall(req(230, 1, 0, 0))) == -14);
+  mem.put64(kBase + 0x708, 1000000000ull);
+  CHECK(sres(p.syscall(req(230, 0, 0, kBase + 0x700))) == -22);
+
   // close
   CHECK(p.syscall(req(3, 1)) == 0);
   CHECK(sres(p.syscall(req(1, 1, kBase + 0x100, 5))) == -9);

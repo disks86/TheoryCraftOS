@@ -22,7 +22,8 @@
 //    0 ULONG size (64)  4 ULONG operation  8 ULONG context  12 ULONG share  16 ULONG64 window (HWND)  24 PVOID data  32 ULONG length  36 ULONG width  40 ULONG height
 //   44 ULONG flags  48 ULONG64 result  56 ULONG major  60 ULONG minor
 //
-//   1 CREATE_CONTEXT  major, minor, share (0 or a context to share objects with), flags (1 core profile, 2 forward compatible, 4 debug); result = the context.
+//   1 CREATE_CONTEXT  major, minor, share (0 or a context to share objects with), flags (1 core profile, 2 forward compatible, 4 debug, 8 OpenGL ES: the version
+//                     strings, extensions and shading language of OpenGL ES 3.0, for EGL); result = the context.
 //   2 DELETE_CONTEXT  context.
 //   3 MAKE_CURRENT    context (0: release the thread's), window (0: no drawable), width, height of its client area, flags (1 double buffered, 2 depth, 4 stencil, 8 accumulation,
 //                     16 alpha). A context current on another thread: STATUS_RESOURCE_IN_USE.
@@ -31,6 +32,8 @@
 //   6 READ_FRONT      window, data = width * height * 4 bytes (B, G, R, A, top row first), length = their size; width and height are written back (with data null: only those).
 //   7 SHARE_LISTS     share = the source, context = the one that takes its objects.
 //   8 FLUSHED         window: shows a single-buffered window after glFlush/glFinish (result as SWAP), result 2 when nothing was drawn since.
+//   9 DESTROY_SURFACE window: its images go; a context drawing to it is left with no drawable.
+// The same request reaches the kernel from Linux programs through /dev/dxg (TCOS_DXG_IOCTL_GL, DxgDevice.h).
 // STATUS_INVALID_HANDLE for a context or window that is not there, STATUS_INVALID_DEVICE_STATE for EXECUTE without a current context, STATUS_NOT_SUPPORTED without OpenGL.
 #pragma once
 #include <stdint.h>

@@ -87,6 +87,19 @@ typedef struct TcosDxgImportSync {
 #define TCOS_DXG_IOCTL_EXPORT_SYNC 0xC0104704u
 #define TCOS_DXG_IOCTL_IMPORT_SYNC 0xC0104705u
 
+/* The kernel's OpenGL (src/OpenGl, docs/OpenGL.md) for a Linux process: what a Windows program does with the NtTcosOpenGl system call (opengl32.dll), a Linux
+ * library (src/Linux/libegl: EGL, OpenGL ES and OpenGL) does with this ioctl. `request` is the address of the same 64-byte request (src/Process/WindowsOpenGl.hpp:
+ * size, operation, context, share, window, data, length, width, height, flags, result, major, minor), with the same operations and the same NTSTATUS in `status`.
+ * A window is a number the library chooses (an EGL surface's); the kernel never shows it, so SWAP answers 0 and the library reads the picture with READ_FRONT.
+ * The ioctl answers 0 when the request ran, -EFAULT when the TcosDxgGl cannot be read or written, -ENODEV when the system has no OpenGL. */
+typedef struct TcosDxgGl {
+  uint64_t request;    /* the address of the 64-byte request */
+  int32_t status;      /* out: the NTSTATUS */
+  uint32_t reserved;   /* 0 */
+} TcosDxgGl;
+/* _IOWR('G', 6, TcosDxgGl), 16 bytes */
+#define TCOS_DXG_IOCTL_GL 0xC0104706u
+
 /* The services, numbered as the NtGdiDdDDI* system calls (src/Process/WindowsSyscalls.hpp; the kernel checks that the numbers agree). Any D3DKMT service of the kernel may be
  * named by its number; these are the ones the user-mode drivers use. */
 enum {

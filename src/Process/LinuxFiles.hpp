@@ -70,6 +70,15 @@ void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler i
 using DxgExportSyncHandler = bool (*)(Process& process, uint32_t sync, SharedPointer<dxgk::ExportedSync>* out, uint32_t* status);
 using DxgImportSyncHandler = bool (*)(Process& process, uint32_t device, const dxgk::ExportedSync& exported, uint32_t* sync, uint32_t* status);
 void set_dxg_sync_handlers(DxgExportSyncHandler export_handler, DxgImportSyncHandler import_handler);
+// The kernel's OpenGL behind /dev/dxg (TCOS_DXG_IOCTL_GL): runs the request at `request` (src/Process/WindowsOpenGl.hpp's layout) and answers its NTSTATUS. The kernel's
+// OpenGL installs it (opengl::install_linux_gl); without one the ioctl answers ENODEV.
+using GlRequestHandler = uint32_t (*)(Process& process, uint64_t request);
+void set_gl_request_handler(GlRequestHandler handler);
+
+// Read-write memory in a Linux process for the kernel's own services (a string or a mapped buffer handed to the program), where mmap would put it; 0 if there is none.
+// Freed with unmap_user_memory and the same size.
+uint64_t map_user_memory(Process& process, uint64_t bytes);
+void unmap_user_memory(Process& process, uint64_t address, uint64_t bytes);
 
 // The errno (as a result register value, -errno) for a file system status.
 uint64_t errno_of_status(filesystem::Status status);

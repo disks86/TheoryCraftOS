@@ -93,7 +93,8 @@ void GlApi::glShaderSource(GLuint shader, GLsizei count, UserPtr string, UserPtr
   if (so && so->type == GL_VERTEX_SHADER) stage = DesktopStage::Vertex;
   else if (so && so->type == GL_FRAGMENT_SHADER) stage = DesktopStage::Fragment;
   else if (so && so->type == GL_TESS_CONTROL_SHADER) stage = DesktopStage::Control;
-  if (so && translate_desktop_glsl(whole.view(), stage, &translated, &uses)) gl_.shader_source(object, translated.view());
+  // (in an OpenGL ES context every shader is GLSL ES: one without a #version is ES 1.00, as the front end takes it)
+  if (so && !config_.es && translate_desktop_glsl(whole.view(), stage, &translated, &uses)) gl_.shader_source(object, translated.view());
   else gl_.shader_source(object, whole.view());
 }
 void GlApi::glCompileShader(GLuint shader) {
