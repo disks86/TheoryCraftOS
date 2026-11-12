@@ -26,6 +26,7 @@
 // test of the CPU draws knows nothing of the hardware draws that came before them.
 
 #include "WebGl/GlContext.hpp"
+#include "WebGl/GlAssemble.hpp"
 
 namespace webgl {
 
@@ -206,9 +207,17 @@ void GlContext::hw_after_clear(uint32_t mask, bool whole) {
 }
 
 bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
+  // (a program with tessellation stages is translated for one patch size: the control stage's input, or the evaluation stage's without one)
+  const bool tess = p.extra[kStageTessEval] != nullptr;
+  if (p.accel_tried && tess && p.accel_patch_vertices != desktop.patch_vertices) {
+    const char* why = p.accel_why;
+    p.release_accel();
+    p.accel_why = why;
+  }
   if (p.accel_tried) return p.accel_program != 0;
   p.accel_tried = true;
   p.accel = &acc;
+  p.accel_patch_vertices = desktop.patch_vertices;
   if (!p.vsm || !p.fsm) return false;
   List<TgsiLink> links(a_);
   for (const VaryingLink& l : p.links) {
@@ -225,9 +234,31 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   limits.attributes = al.attributes;
   limits.varyings = al.varyings;
   limits.samplers = al.textures;
-  if (!translate_to_tgsi(a_, *p.vsm, *p.fsm, links.view(), t.get(), &p.accel_why, limits)) return false;
+  TgsiStages stages;
+  stages.gs = p.extra[kStageGeometry] ? p.extra[kStageGeometry]->module.get() : nullptr;
+  stages.tcs = p.extra[kStageTessControl] ? p.extra[kStageTessControl]->module.get() : nullptr;
+  stages.tes = tess ? p.extra[kStageTessEval]->module.get() : nullptr;
+  stages.patch_vertices = desktop.patch_vertices;
+  if ((stages.gs && !al.geometry) || (stages.tes && !al.tessellation)) {
+    p.accel_why = "geometry or tessellation shaders on a device without them";
+    return false;
+  }
+  if (!translate_program_to_tgsi(a_, *p.vsm, *p.fsm, stages, links.view(), t.get(), &p.accel_why, limits)) return false;
   p.accel_why = "the device refused the shaders";
-  p.accel_program = acc.create_program(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings, static_cast<uint32_t>(t->samplers.count()));
+  AccelStages as;
+  as.gs = t->gs.size() ? t->gs.c_str() : nullptr;
+  as.tcs = t->tcs.size() ? t->tcs.c_str() : nullptr;
+  as.tes = t->tes.size() ? t->tes.c_str() : nullptr;
+  as.gs_input = t->gs_input;
+  as.gs_output = t->gs_output;
+  as.gs_max_vertices = t->gs_max_vertices;
+  as.gs_invocations = t->gs_invocations;
+  as.patch_vertices = t->patch_vertices;
+  as.tcs_vertices = t->tcs_vertices;
+  as.tess_domain = t->tess_domain;
+  as.tess_partitioning = t->tess_partitioning;
+  as.tess_output = t->tess_output;
+  p.accel_program = acc.create_program_stages(t->vs.c_str(), t->fs.c_str(), static_cast<uint32_t>(t->attributes.count()), t->varyings, static_cast<uint32_t>(t->samplers.count()), as);
   if (p.accel_program) {
     p.tgsi = static_cast<UniquePointer<TgsiProgram>&&>(t);
     p.accel_why = nullptr;
@@ -257,12 +288,19 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   if (!default_draw_back_ || target.color[0] != dcolor_ || target.color_count != 1 || !dcolor_->defined() || desktop.front_also) return no("not one default colour buffer");
   if (instances != 1) return no("instancing");
   const AccelLimits limits = acc->limits();
-  const bool lines = mode >= 1 && mode <= 3, points = mode == 0;
+  // What the rasterizer gets: the last stage's primitives (the geometry shader's, the tessellator's, or the draw's own).
+  const ExtraStage* gs = p.extra[kStageGeometry].get();
+  const ExtraStage* tes = p.extra[kStageTessEval].get();
+  uint32_t raster = mode;
+  if (gs) raster = gs->module->gs_output == 0 ? 0 : (gs->module->gs_output == 3 ? 1 : 4);
+  else if (tes) raster = tes->module->tes_point_mode ? 0 : (tes->module->tes_mode == 0x8E7A ? 1 : 4);
+  const bool lines = raster >= 1 && raster <= 3, points = raster == 0;
   if ((lines || points) && !limits.lines) return no("points or lines");
   if (lines && (line_width_ > 1.0f || (desktop.active && desktop.line_stipple))) return no("wide or stippled lines");
   if (points) {      // (one pixel: a size the program or the state sets is the CPU's)
-    const int32_t ps = p.vsm->find_builtin_global(shader::kBvPointSize);
-    if (ps >= 0 && p.vsm->globals[static_cast<uint64_t>(ps)]->referenced) return no("a point size");
+    const shader::Module& last = p.last_module();
+    const int32_t ps = last.find_builtin_global(shader::kBvPointSize);
+    if (ps >= 0 && last.globals[static_cast<uint64_t>(ps)]->referenced) return no("a point size");
     if (desktop.active && (desktop.point_size != 1.0f || desktop.point_sprite || desktop.point_atten[1] != 0 || desktop.point_atten[2] != 0)) return no("a point size");
   }
   if (tf_active_ || rasterizer_discard_) return no("transform feedback or rasterizer discard");
@@ -375,6 +413,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   bool any_flat = false;
   for (const VaryingLink& l : p.links) any_flat = any_flat || l.flat;
   const bool rotate = any_flat && desktop.active && desktop.first_vertex_convention;
+  if (rotate && p.has_extra()) return no("flat varyings with the first vertex convention");      // (the provoking vertex is then the last stage's: nothing to rotate)
   auto tri = [&](int32_t i0, int32_t i1, int32_t i2) {
     const int64_t a0 = index_at(i0), a1 = index_at(i1), a2 = index_at(i2);
     if (a0 < 0 || a1 < 0 || a2 < 0) return true;
@@ -388,7 +427,29 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     return tris.push_back(a0) && tris.push_back(a1);
   };
   bool ok = true;
-  if (mode == 0) {
+  uint8_t topology = static_cast<uint8_t>(points ? 2 : (lines ? 1 : 0));
+  if (p.has_extra()) {
+    // The draw's primitives as the first stage after the vertex shader takes them: patches for tessellation, the geometry shader's input primitive (lists of the
+    // device's topologies; adjacency strips become lists as the CPU makes them).
+    uint32_t takes;      // the GL primitive the stages take (as gs_input numbers them)
+    if (tes) {
+      if (mode != 0xE) return no("a primitive the program does not take");
+      if (!limits.tessellation || desktop.patch_vertices < 1 || desktop.patch_vertices > 32) return no("patches the device cannot take");
+      takes = 0xE;
+      topology = 3;
+    } else {
+      takes = mode == 0 ? 0 : (mode <= 3 ? 1 : (mode <= 6 ? 4 : (mode <= 0xB ? 0xA : (mode <= 0xD ? 0xC : 0xE))));
+      if (!gs || takes != gs->module->gs_input) return no("a primitive the program does not take");      // (an error: the CPU path says so)
+      topology = static_cast<uint8_t>(takes == 0 ? 2 : takes == 1 ? 1 : takes == 0xA ? 4 : takes == 0xC ? 5 : 0);
+    }
+    if (!limits.geometry && gs) return no("geometry shaders on a device without them");
+    auto vertex = [&](int32_t i) -> int64_t { return index_at(i); };
+    auto primitive = [&](const int32_t* pos, uint32_t n) {
+      for (uint32_t k = 0; k < n && ok; ++k) ok = tris.push_back(index_at(pos[k]));
+      if (tris.count() > kMaxAccelVertices) ok = false;
+    };
+    assemble_primitives(mode, count, desktop.patch_vertices, vertex, primitive);
+  } else if (mode == 0) {
     for (int32_t i = 0; i < count && ok; ++i) {
       const int64_t v = index_at(i);
       if (v >= 0) ok = tris.push_back(v);
@@ -460,7 +521,16 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     uint32_t lanes[4] = {0, 0, 0, 0};
     for (const TgsiConstant& c : t.constants) {
       if (c.row != row) continue;
-      const List<uint32_t>& shared = c.stage == 0 ? p.vs_shared : p.fs_shared;
+      if (c.stage == kTgsiPatchLevels) {      // (the default tessellation levels: outer, then inner)
+        for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
+          const uint32_t at = c.slot + i;
+          lanes[i] = f2u(at < 4 ? desktop.patch_outer[at] : (at < 6 ? desktop.patch_inner[at - 4] : 0.0f));
+        }
+        continue;
+      }
+      const ExtraStage* extra = c.stage >= 2 && c.stage < 5 ? p.extra[c.stage - 2].get() : nullptr;
+      if (c.stage >= 2 && !extra) continue;
+      const List<uint32_t>& shared = c.stage == 0 ? p.vs_shared : (c.stage == 1 ? p.fs_shared : extra->shared);
       for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
         if (c.slot + i >= shared.count()) continue;
         const uint32_t bits = shared[c.slot + i];
@@ -504,7 +574,8 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   st.depth_test = depth_test;
   st.depth_write = dmask_ && depth;
   st.blend = blend_;
-  st.topology = points ? 2 : (lines ? 1 : 0);
+  st.topology = topology;
+  st.patch_vertices = topology == 3 ? desktop.patch_vertices : 0;
   if (lines || points) st.cull = 0;      // (only polygons are culled)
   if (custom) {
     st.custom_blend = true;

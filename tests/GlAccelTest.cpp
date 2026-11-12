@@ -28,6 +28,8 @@
 #include "WebGl/TgsiTranslator.hpp"
 #include "WebGl/Raster.hpp"
 #include "WebGl/AccelConformance.hpp"
+#include "Graphics/Graphics3D/Software/Tessellator.hpp"
+#include <vector>
 #include "TgsiMachine.hpp"
 #include <math.h>
 #include <string>
@@ -1136,8 +1138,8 @@ static void test_device_only_clear() {
 // --- The translated shaders run as the CPU runs the GLSL --------------------------------------------------------------------------------------------------
 // A reference "device": the TGSI the translator wrote is run by the test interpreter (tests/TgsiMachine.hpp), on the CPU rasterizer of src/WebGl, with the state
 // of AccelState. A scene drawn by it and by the CPU path must give the same picture, which checks the translation (and GlAccel's packing of the inputs).
-struct TgsiAccel final : IAccelerator {
-  struct Prog { std::string vs, fs; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; };
+struct TgsiAccel : IAccelerator {
+  struct Prog { std::string vs, fs, gs, tcs, tes; uint32_t attributes = 0, varyings = 0, textures = 0; bool flat[16] = {}; int position = -1, face = -1; AccelStages st; };
   struct Tex { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; };
   struct Tgt { uint32_t w = 0, h = 0; std::vector<uint8_t> rgba; std::vector<float> depth; };
   std::vector<Prog> progs;
@@ -1145,11 +1147,21 @@ struct TgsiAccel final : IAccelerator {
   std::vector<Tgt> tgts;
   int draws = 0, refused = 0;
   const char* name() const override { return "tgsi reference"; }
-  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true}; }
+  bool stages = true;   // (false: a device without geometry and tessellation stages)
+  AccelLimits limits() const override { return AccelLimits{256, 16, 14, 16, true, true, stages, stages}; }
   uint32_t create_program(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures) override {
+    return create_program_stages(vs, fs, attributes, varyings, textures, AccelStages());
+  }
+  uint32_t create_program_stages(const char* vs, const char* fs, uint32_t attributes, uint32_t varyings, uint32_t textures, const AccelStages& stages) override {
     Prog p;
     p.vs = vs;
     p.fs = fs;
+    if (stages.gs) p.gs = stages.gs;
+    if (stages.tcs) p.tcs = stages.tcs;
+    if (stages.tes) p.tes = stages.tes;
+    p.st = stages;
+    p.st.gs = p.st.tcs = p.st.tes = nullptr;
+    if (getenv("TGSI_DUMP")) printf("--- vs\n%s--- tcs\n%s--- tes\n%s--- gs\n%s--- fs\n%s", vs, p.tcs.c_str(), p.tes.c_str(), p.gs.c_str(), fs);
     p.attributes = attributes;
     p.varyings = varyings;
     p.textures = textures;
@@ -1284,6 +1296,141 @@ struct TgsiAccel final : IAccelerator {
         if (mask & (1 << k)) t->rgba[at * 4 + k] = to8(res[k]);
     }
   };
+  // A vertex as a stage put it out: all its OUT registers (0 the position, 1 + n GENERIC[n] by the translator's numbering; the next stage's IN[v][r] is OUT[r]).
+  struct Vtx { float r[tgsi_test::TgsiMachine::kRegs][4]; };
+  using Machine = tgsi_test::TgsiMachine;
+  // The register a declaration gives a semantic in a stage's text (DCL FILE[...][n], SEMANTIC or DCL FILE[n], SEMANTIC), or -1.
+  static int declared(const std::string& text, const char* file, const char* semantic) {
+    const std::string want = std::string("DCL ") + file + "[";
+    const size_t sl = strlen(semantic);
+    size_t at = 0;
+    while ((at = text.find(want, at)) != std::string::npos) {
+      const size_t eol = text.find('\n', at);
+      const std::string line = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+      at = eol == std::string::npos ? text.size() : eol;
+      const size_t comma = line.find(", ");
+      if (comma == std::string::npos || line.compare(comma + 2, sl, semantic) != 0) continue;
+      const char next = comma + 2 + sl < line.size() ? line[comma + 2 + sl] : 0;
+      if (next && next != ',' && next != '[') continue;
+      size_t b = want.size();
+      if (line.compare(b, 2, "][") == 0) b += 2;
+      return atoi(line.c_str() + b);
+    }
+    return -1;
+  }
+  static int property(const std::string& text, const char* name) {
+    const size_t at = text.find(std::string("PROPERTY ") + name + " ");
+    return at == std::string::npos ? -1 : atoi(text.c_str() + at + 10 + strlen(name));
+  }
+  static int named_property(const std::string& text, const char* name, const char* const* names, int count) {
+    const size_t at = text.find(std::string("PROPERTY ") + name + " ");
+    if (at == std::string::npos) return -1;
+    const std::string rest = text.substr(at + 10 + strlen(name), text.find('\n', at) - at - 10 - strlen(name));
+    for (int i = 0; i < count; ++i) if (rest == names[i]) return i;
+    return -1;
+  }
+  bool stage_machine(Machine& m, const float* cf, uint32_t rows) {
+    for (uint32_t r = 0; r < rows; ++r)
+      for (int k = 0; k < 4; ++k) m.cst[r][k] = cf[r * 4 + k];
+    return true;
+  }
+  static void set_sv(Machine& m, const std::string& text, const char* semantic, uint32_t value) {
+    const int i = declared(text, "SV", semantic);
+    if (i >= 0 && i < 8) m.sv[i][0] = m.sv[i][1] = m.sv[i][2] = m.sv[i][3] = __builtin_bit_cast(float, value);
+  }
+  bool fail_stage(const std::string& text) {
+    if (getenv("TGSI_TRACE")) printf("%s\n", text.c_str());
+    ++refused;
+    return false;
+  }
+  // The geometry stage over one primitive: the primitives it makes (vertex lists of 1, 2 or 3).
+  bool geometry(const Prog& p, const float* cf, uint32_t rows, const Vtx* const* in, uint32_t n, uint32_t primitive_id, std::vector<std::vector<Vtx>>* out) {
+    static const char* const kOut[] = {"POINTS", "LINE_STRIP", "TRIANGLE_STRIP"};
+    const int topology = named_property(p.gs, "GS_OUTPUT_PRIMITIVE", kOut, 3);
+    const int invocations = property(p.gs, "GS_INVOCATIONS");
+    const int max_vertices = property(p.gs, "GS_MAX_OUTPUT_VERTICES");
+    for (int inv = 0; inv < (invocations > 0 ? invocations : 1); ++inv) {
+      static Machine m;
+      m = Machine();
+      stage_machine(m, cf, rows);
+      for (uint32_t v = 0; v < n; ++v) memcpy(m.in2[v], in[v]->r, sizeof in[v]->r);
+      set_sv(m, p.gs, "INVOCATIONID", static_cast<uint32_t>(inv));
+      const int pin = declared(p.gs, "IN", "PRIM_ID");      // (an input in the geometry stage)
+      if (pin >= 0) m.in[pin][0] = __builtin_bit_cast(float, primitive_id);
+      if (!m.run(p.gs)) return fail_stage(p.gs);
+      std::vector<Vtx> strip;
+      for (size_t e = 0; e < m.emitted.size() && static_cast<int>(e) < max_vertices; ++e) {
+        if (m.emitted[e].cut) strip.clear();
+        Vtx v;
+        memcpy(v.r, m.emitted[e].out, sizeof v.r);
+        strip.push_back(v);
+        const size_t k = strip.size();
+        if (topology == 0) out->push_back({v});
+        else if (topology == 1 && k >= 2) out->push_back({strip[k - 2], v});
+        else if (topology == 2 && k >= 3) {
+          if ((k - 3) % 2 == 0) out->push_back({strip[k - 3], strip[k - 2], v});
+          else out->push_back({strip[k - 2], strip[k - 3], v});
+        }
+      }
+    }
+    return true;
+  }
+  // The tessellation stages over one patch: the primitives the evaluation stage's vertices make.
+  bool tessellation(TestAllocator& alloc, const Prog& p, const float* cf, uint32_t rows, const Vtx* const* in, uint32_t n, uint32_t primitive_id, std::vector<std::vector<Vtx>>* out) {
+    const int cps = property(p.tcs, "TCS_VERTICES_OUT");
+    if (cps < 1 || cps > 32) return fail_stage(p.tcs);
+    // the control stage: each invocation sees what the ones before it wrote (they write only their own control point and patch registers)
+    static Machine acc;
+    acc = Machine();
+    for (int inv = 0; inv < cps; ++inv) {
+      static Machine m;
+      m = Machine();
+      stage_machine(m, cf, rows);
+      for (uint32_t v = 0; v < n; ++v) memcpy(m.in2[v], in[v]->r, sizeof in[v]->r);
+      memcpy(m.out2, acc.out2, sizeof m.out2);
+      memcpy(m.out, acc.out, sizeof m.out);
+      set_sv(m, p.tcs, "INVOCATIONID", static_cast<uint32_t>(inv));
+      set_sv(m, p.tcs, "PRIM_ID", primitive_id);
+      if (!m.run(p.tcs)) return fail_stage(p.tcs);
+      memcpy(acc.out2, m.out2, sizeof m.out2);
+      memcpy(acc.out, m.out, sizeof m.out);
+    }
+    const int outer_reg = declared(p.tcs, "OUT", "TESSOUTER"), inner_reg = declared(p.tcs, "OUT", "TESSINNER");
+    if (outer_reg < 0 || inner_reg < 0) return fail_stage(p.tcs);
+    float outer[4], inner[2];
+    for (int k = 0; k < 4; ++k) outer[k] = acc.out[outer_reg][k];
+    for (int k = 0; k < 2; ++k) inner[k] = acc.out[inner_reg][k];
+    const int mode = property(p.tes, "TES_PRIM_MODE"), spacing = property(p.tes, "TES_SPACING"), cw = property(p.tes, "TES_VERTEX_ORDER_CW"), points = property(p.tes, "TES_POINT_MODE");
+    const graphics::TessDomain domain = mode == 1 ? graphics::TessDomain::Isoline : mode == 7 ? graphics::TessDomain::Quad : graphics::TessDomain::Triangle;
+    const graphics::TessPartitioning part = spacing == 0 ? graphics::TessPartitioning::FractionalOdd : spacing == 1 ? graphics::TessPartitioning::FractionalEven : graphics::TessPartitioning::Integer;
+    const graphics::TessOutput output = points == 1 ? graphics::TessOutput::Point : domain == graphics::TessDomain::Isoline ? graphics::TessOutput::Line : cw == 1 ? graphics::TessOutput::TriangleCw : graphics::TessOutput::TriangleCcw;
+    graphics::Tessellator tess(alloc);
+    if (!tess.tessellate(domain, part, output, outer, inner)) return true;      // (culled)
+    std::vector<Vtx> made;
+    for (const graphics::Tessellator::Point& pt : tess.points()) {
+      static Machine m;
+      m = Machine();
+      stage_machine(m, cf, rows);
+      for (int v = 0; v < cps; ++v) memcpy(m.in2[v], acc.out2[v], sizeof acc.out2[v]);
+      memcpy(m.in, acc.out, sizeof m.in);      // (the patch registers: the same numbers in both stages)
+      const float w = domain == graphics::TessDomain::Triangle ? 1.0f - pt.u - pt.v : 0.0f;
+      const int c = declared(p.tes, "SV", "TESSCOORD");
+      if (c >= 0) { m.sv[c][0] = pt.u; m.sv[c][1] = pt.v; m.sv[c][2] = w < 0 ? 0.0f : w; m.sv[c][3] = 0; }
+      set_sv(m, p.tes, "PRIM_ID", primitive_id);
+      if (!m.run(p.tes)) return fail_stage(p.tes);
+      Vtx v;
+      memcpy(v.r, m.out, sizeof v.r);
+      made.push_back(v);
+    }
+    const uint32_t per = output == graphics::TessOutput::Point ? 1 : output == graphics::TessOutput::Line ? 2 : 3;
+    const ArrayView<const uint16_t> ix = tess.indices();
+    for (uint64_t i = 0; i + per <= ix.size(); i += per) {
+      std::vector<Vtx> prim;
+      for (uint32_t k = 0; k < per; ++k) prim.push_back(made.at(ix[i + k]));
+      out->push_back(prim);
+    }
+    return true;
+  }
   bool draw(uint32_t target, uint32_t program, const AccelState& st, ConstByteView vertices, uint32_t count, ConstByteView constants) override {
     ++draws;
     Tgt& t = tgts.at(target - 1);
@@ -1292,16 +1439,50 @@ struct TgsiAccel final : IAccelerator {
     const float* cf = reinterpret_cast<const float*>(constants.data());
     const uint32_t rows = static_cast<uint32_t>(constants.size() / 16);
     std::vector<gpu::RVertex> vs(count);
+    std::vector<Vtx> vouts(count);
     for (uint32_t v = 0; v < count; ++v) {
-      tgsi_test::TgsiMachine m;
+      static Machine m;
+      m = Machine();
       for (uint32_t r = 0; r < rows; ++r)
         for (int k = 0; k < 4; ++k) m.cst[r][k] = cf[r * 4 + k];
       for (uint32_t a = 0; a < p.attributes; ++a)
         for (int k = 0; k < 4; ++k) m.in[a][k] = vf[(v * p.attributes + a) * 4 + k];
       if (!m.run(p.vs)) { if (getenv("TGSI_TRACE")) printf("%s\n", p.vs.c_str()); ++refused; return false; }
+      memcpy(vouts[v].r, m.out, sizeof vouts[v].r);
       for (int k = 0; k < 4; ++k) vs[v].pos[k] = m.out[0][k];
       for (uint32_t i = 0; i < p.varyings; ++i)
         for (int k = 0; k < 4; ++k) vs[v].var[i * 4 + k] = m.out[1 + i][k];
+    }
+    // the geometry and tessellation stages: the primitives the rasterizer gets
+    std::vector<std::vector<Vtx>> prims;
+    const bool staged = !p.gs.empty() || !p.tes.empty();
+    if (staged) {
+      static const uint32_t kPer[6] = {3, 2, 1, 0, 4, 6};
+      const uint32_t per = st.topology == 3 ? st.patch_vertices : kPer[st.topology];
+      if (per == 0 || per > 32) { ++refused; return false; }
+      TestAllocator alloc;
+      uint32_t id = 0;
+      for (uint32_t first = 0; first + per <= count; first += per, ++id) {
+        const Vtx* in[32];
+        for (uint32_t k = 0; k < per; ++k) in[k] = &vouts[first + k];
+        std::vector<std::vector<Vtx>> mid;
+        if (!p.tes.empty()) {
+          if (!tessellation(alloc, p, cf, rows, in, per, id, &mid)) return false;
+        } else {
+          std::vector<Vtx> prim;
+          for (uint32_t k = 0; k < per; ++k) prim.push_back(*in[k]);
+          mid.push_back(prim);
+        }
+        if (p.gs.empty()) {
+          for (auto& m : mid) prims.push_back(m);
+          continue;
+        }
+        for (size_t q = 0; q < mid.size(); ++q) {
+          const Vtx* gin[6];
+          for (size_t k = 0; k < mid[q].size() && k < 6; ++k) gin[k] = &mid[q][k];
+          if (!geometry(p, cf, rows, gin, static_cast<uint32_t>(mid[q].size()), p.tes.empty() ? id : static_cast<uint32_t>(q), &prims)) return false;
+        }
+      }
     }
     gpu::RasterState rs;
     rs.vp_x = static_cast<int32_t>(st.vp_x);
@@ -1329,7 +1510,19 @@ struct TgsiAccel final : IAccelerator {
     px.const_rows = rows;
     px.sampling.acc = this;
     px.sampling.st = &st;
-    if (st.topology == 0) for (uint32_t v = 0; v + 2 < count; v += 3) gpu::draw_triangle(rs, vs[v], vs[v + 1], vs[v + 2], px);
+    if (staged) {
+      for (const std::vector<Vtx>& prim : prims) {
+        gpu::RVertex rv[3];
+        for (size_t k = 0; k < prim.size() && k < 3; ++k) {
+          for (int c = 0; c < 4; ++c) rv[k].pos[c] = prim[k].r[0][c];
+          for (uint32_t i = 0; i < p.varyings; ++i)
+            for (int c = 0; c < 4; ++c) rv[k].var[i * 4 + c] = prim[k].r[1 + i][c];
+        }
+        if (prim.size() == 3) gpu::draw_triangle(rs, rv[0], rv[1], rv[2], px);
+        else if (prim.size() == 2) gpu::draw_line(rs, rv[0], rv[1], px);
+        else if (prim.size() == 1) gpu::draw_point(rs, rv[0], px);
+      }
+    } else if (st.topology == 0) for (uint32_t v = 0; v + 2 < count; v += 3) gpu::draw_triangle(rs, vs[v], vs[v + 1], vs[v + 2], px);
     else if (st.topology == 1) for (uint32_t v = 0; v + 1 < count; v += 2) gpu::draw_line(rs, vs[v], vs[v + 1], px);
     else for (uint32_t v = 0; v < count; ++v) gpu::draw_point(rs, vs[v], px);
     if (!px.ok) { if (getenv("TGSI_TRACE")) printf("%s\n", p.fs.c_str()); ++refused; }
@@ -1361,6 +1554,116 @@ static void test_translated_shaders_match_the_cpu() {
   CHECK(a.live == 0);
 }
 
+// A desktop GL program of the stages given (nullptr: not there).
+static uint32_t make_stage_program(GlContext& gl, const char* vs, const char* tcs, const char* tes, const char* gs, const char* fs) {
+  const uint32_t p = gl.create_program();
+  const struct { uint32_t type; const char* source; } stages[5] = {{0x8B31, vs}, {0x8B30, fs}, {0x8DD9, gs}, {0x8E88, tcs}, {0x8E87, tes}};
+  for (const auto& st : stages) {
+    if (!st.source) continue;
+    const uint32_t s = gl.create_shader(st.type);
+    gl.shader_source(s, st.source);
+    gl.compile_shader(s);
+    gl.attach_shader(p, s);
+  }
+  gl.link_program(p);
+  double ok = 0;
+  gl.program_status(p, 0x8B82, &ok);
+  if (!ok) printf("link: %.*s\n", static_cast<int>(gl.program_log(p).size()), gl.program_log(p).data());
+  return p;
+}
+
+// Programs with geometry and tessellation stages: translated again for another patch size, a primitive the program does not take is the CPU's error, and what
+// the translation refuses (or a device without the stages) leaves the draw to the CPU, saying why.
+static void test_stage_programs() {
+  TestAllocator a;
+  TgsiAccel ref;
+  set_accelerator(&ref);
+  {
+    GlContext gl(a, true, 32, 32, noaa());
+    gl.desktop.active = true;
+    const char* vs = "#version 400 core\nin vec2 pos; out vec4 v;\nvoid main(){ v = vec4(pos * 0.5 + 0.5, 0.0, 1.0); gl_Position = vec4(pos, 0.0, 1.0); }\n";
+    const char* fs = "#version 400 core\nin vec4 g; out vec4 o;\nvoid main(){ o = g; }\n";
+    const char* tes = "#version 400 core\nlayout(triangles) in;\nin vec4 v[]; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; g = v[0]; }\n";
+    const char* tes_coord = "#version 400 core\nlayout(triangles) in;\nout vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; g = vec4(c, 1.0); }\n";
+    const char* gs_tri = "#version 400 core\nlayout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; EmitVertex(); } }\n";
+    const float verts[12] = {-1, -1, 1, -1, -1, 1, 1, 1, 1, -1, -1, 1};
+    const uint32_t buf = gl.create_buffer();
+    gl.bind_buffer(0x8892, buf);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof verts), 0, 0x88E4);
+    const auto use = [&](uint32_t p) {
+      gl.use_program(p);
+      const int32_t l = gl.get_attrib_location(p, "pos");
+      gl.enable_vertex_attrib(static_cast<uint32_t>(l), true);
+      gl.vertex_attrib_pointer(static_cast<uint32_t>(l), 2, 0x1406, false, 8, 0, false);
+    };
+    gl.clear_color(0, 0, 0, 1);
+    gl.clear(0x4000);
+    // an evaluation stage alone: the program is made for the draw's patch size, and made again for another
+    use(make_stage_program(gl, vs, nullptr, tes, nullptr, fs));
+    gl.desktop.patch_vertices = 3;
+    gl.draw_arrays(0xE, 0, 6, 1);
+    const size_t made = ref.progs.size();
+    CHECK(gl.hardware_stats().gpu_draws == 1 && made >= 1);
+    gl.draw_arrays(0xE, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == 2 && ref.progs.size() == made);
+    gl.desktop.patch_vertices = 6;
+    gl.draw_arrays(0xE, 0, 6, 1);
+    CHECK(gl.hardware_stats().gpu_draws == 3 && ref.progs.size() == made + 1);
+    gl.desktop.patch_vertices = 3;
+    // a geometry stage that takes triangles, drawn with lines: GL's error, from the CPU path
+    use(make_stage_program(gl, vs, nullptr, nullptr, gs_tri, fs));
+    CHECK(gl.get_error() == 0);
+    gl.draw_arrays(1, 0, 6, 1);
+    CHECK(gl.get_error() == 0x502 && gl.hardware_stats().gpu_draws == 3);
+    gl.clear(0x4000);      // (the refused draw left the device picture behind the CPU's)
+    gl.draw_arrays(4, 0, 6, 1);
+    CHECK(gl.get_error() == 0 && gl.hardware_stats().gpu_draws == 4);
+    // what the translation refuses
+    const struct { const char* tcs; const char* tes; const char* gs; uint32_t mode; const char* why; } refused[] = {
+        {"#version 400 core\nlayout(vertices = 3) out;\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; barrier(); gl_TessLevelOuter[0] = gl_out[0].gl_Position.x + 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
+         tes_coord, nullptr, 0xE, "another invocation"},
+        {"#version 400 core\nlayout(vertices = 3) out;\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = gl_TessLevelOuter[0]; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
+         tes_coord, nullptr, 0xE, "patch outputs"},
+        {nullptr, nullptr, "#version 400 core\nlayout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; gl_ViewportIndex = 0; EmitVertex(); } }\n",
+         4, "gl_ViewportIndex"},
+        {nullptr, nullptr, "#version 400 core\nlayout(points) in; layout(points, max_vertices = 2) out;\nin vec4 v[]; out vec4 g; layout(stream = 1) out vec4 s;\nvoid main(){ gl_Position = gl_in[0].gl_Position; g = v[0]; EmitVertex(); s = v[0]; EmitStreamVertex(1); }\n",
+         0, "vertex streams"},
+    };
+    for (const auto& c : refused) {
+      use(make_stage_program(gl, vs, c.tcs, c.tes, c.gs, fs));
+      const uint64_t before = gl.hardware_stats().gpu_draws;
+      gl.draw_arrays(c.mode, 0, 6, 1);
+      const char* why = gl.hardware_stats().last_refusal;
+      if (!why || !strstr(why, c.why)) printf("refusal: %s (wanted %s)\n", why ? why : "-", c.why);
+      CHECK(gl.get_error() == 0 && gl.hardware_stats().gpu_draws == before && why && strstr(why, c.why));
+    }
+  }
+  {
+    // a device without the stages: the CPU draws
+    ref.stages = false;
+    GlContext gl(a, true, 32, 32, noaa());
+    gl.desktop.active = true;
+    const uint32_t p = make_stage_program(gl, "#version 400 core\nin vec2 pos; out vec4 v;\nvoid main(){ v = vec4(1.0); gl_Position = vec4(pos, 0.0, 1.0); }\n", nullptr, nullptr,
+                                          "#version 400 core\nlayout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; EmitVertex(); } }\n",
+                                          "#version 400 core\nin vec4 g; out vec4 o;\nvoid main(){ o = g; }\n");
+    const float verts[6] = {-1, -1, 1, -1, -1, 1};
+    const uint32_t buf = gl.create_buffer();
+    gl.bind_buffer(0x8892, buf);
+    gl.buffer_data(0x8892, ConstByteView(reinterpret_cast<const uint8_t*>(verts), sizeof verts), 0, 0x88E4);
+    gl.use_program(p);
+    const int32_t l = gl.get_attrib_location(p, "pos");
+    gl.enable_vertex_attrib(static_cast<uint32_t>(l), true);
+    gl.vertex_attrib_pointer(static_cast<uint32_t>(l), 2, 0x1406, false, 8, 0, false);
+    gl.clear(0x4000);
+    gl.draw_arrays(4, 0, 3, 1);
+    const char* why = gl.hardware_stats().last_refusal;
+    CHECK(gl.hardware_stats().gpu_draws == 0 && why && strstr(why, "device without them"));
+    CHECK(pixel(gl, 4, 4) == 0xFFFFFFFFu);      // (drawn on the CPU)
+  }
+  set_accelerator(nullptr);
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_translate_basic();
   test_translate_matrix_and_functions();
@@ -1373,6 +1676,7 @@ int main() {
   test_wide_device_state();
   test_device_only_clear();
   test_translated_shaders_match_the_cpu();
+  test_stage_programs();
   test_refused_program_and_failed_draw();
   test_uniforms_and_depth();
   test_no_accelerator();

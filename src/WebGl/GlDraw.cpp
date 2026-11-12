@@ -19,6 +19,7 @@
 // Drawing for the GL context: vertex fetch and shading, primitive assembly, the per-fragment pipeline (shader, stencil, depth, blending), clears, reads, blits
 // and presenting the drawing buffer.
 #include "WebGl/GlContext.hpp"
+#include "WebGl/GlAssemble.hpp"
 #include "WebGl/GlPixels.hpp"
 #include "WebGl/GlStages.hpp"
 
@@ -470,73 +471,6 @@ uint32_t GlContext::fetch_index(const uint8_t* idx, uint32_t type, uint32_t i) c
   return read_index(idx + uint64_t{i} * sz, type);
 }
 
-// Calls `primitive(positions, n)` for every primitive of a draw in `mode`, with the positions in the draw's vertex list of its vertices (in the order the next stage takes them:
-// adjacency primitives as the geometry stage's input arrays have them). A restart index (`vertex(i)` below 0) begins a new strip or list.
-template <class Vertex, class Primitive>
-static void assemble(uint32_t mode, int32_t count, uint32_t patch_vertices, Vertex& vertex, Primitive& primitive) {
-  int32_t pos[32];
-  int32_t start = 0;
-  for (int32_t i = 0; i <= count; ++i) {
-    if (i < count && vertex(i) >= 0) continue;
-    const int32_t n = i - start;      // a run between restarts: [start, i)
-    const auto emit = [&](uint32_t k) { primitive(pos, k); };
-    switch (mode) {
-      case 0: for (int32_t k = 0; k < n; ++k) { pos[0] = start + k; emit(1); } break;
-      case 1: for (int32_t k = 0; k + 1 < n; k += 2) { pos[0] = start + k; pos[1] = start + k + 1; emit(2); } break;
-      case 2: case 3:
-        for (int32_t k = 0; k + 1 < n; ++k) { pos[0] = start + k; pos[1] = start + k + 1; emit(2); }
-        if (mode == 2 && n > 2) { pos[0] = start + n - 1; pos[1] = start; emit(2); }
-        break;
-      case 4: for (int32_t k = 0; k + 2 < n; k += 3) { pos[0] = start + k; pos[1] = start + k + 1; pos[2] = start + k + 2; emit(3); } break;
-      case 5:
-        for (int32_t k = 0; k + 2 < n; ++k) {
-          pos[0] = start + k + (k & 1);
-          pos[1] = start + k + 1 - (k & 1);
-          pos[2] = start + k + 2;
-          emit(3);
-        }
-        break;
-      case 6: for (int32_t k = 1; k + 1 < n; ++k) { pos[0] = start; pos[1] = start + k; pos[2] = start + k + 1; emit(3); } break;
-      case 0xA: for (int32_t k = 0; k + 3 < n; k += 4) { for (int32_t j = 0; j < 4; ++j) pos[j] = start + k + j; emit(4); } break;
-      case 0xB: for (int32_t k = 0; k + 3 < n; ++k) { for (int32_t j = 0; j < 4; ++j) pos[j] = start + k + j; emit(4); } break;
-      case 0xC: for (int32_t k = 0; k + 5 < n; k += 6) { for (int32_t j = 0; j < 6; ++j) pos[j] = start + k + j; emit(6); } break;
-      case 0xD: {
-        // A triangle strip with adjacency (GL 4.6, table 10.1, 1-based there): which vertices make triangle t of the strip, as (first, its adjacent, second, ..., third, ...).
-        const int32_t tris = n >= 6 ? (n - 4) / 2 : 0;
-        for (int32_t t = 0; t < tris; ++t) {
-          int32_t v[6];      // 1-based as in the table: 1st, adj 1-2, 2nd, adj 2-3, 3rd, adj 3-1
-          const int32_t i2 = 2 * t;
-          if (tris == 1) { const int32_t a[6] = {1, 2, 3, 6, 5, 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
-          else if (t == 0) { const int32_t a[6] = {1, 2, 3, 7, 5, 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
-          else if (t == tris - 1) {
-            if (t & 1) { const int32_t a[6] = {i2 + 3, i2 - 1, i2 + 1, i2 + 4, i2 + 5, i2 + 6}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
-            else { const int32_t a[6] = {i2 + 1, i2 - 1, i2 + 3, i2 + 6, i2 + 5, i2 + 4}; for (int j = 0; j < 6; ++j) v[j] = a[j]; }
-          } else if (t & 1) {
-            const int32_t a[6] = {i2 + 3, i2 - 1, i2 + 1, i2 + 4, i2 + 5, i2 + 7};
-            for (int j = 0; j < 6; ++j) v[j] = a[j];
-          } else {
-            const int32_t a[6] = {i2 + 1, i2 - 1, i2 + 3, i2 + 7, i2 + 5, i2 + 4};
-            for (int j = 0; j < 6; ++j) v[j] = a[j];
-          }
-          bool inside = true;
-          for (int j = 0; j < 6; ++j) { pos[j] = start + v[j] - 1; inside = inside && v[j] >= 1 && v[j] <= n; }
-          if (inside) emit(6);
-        }
-        break;
-      }
-      case 0xE:
-        if (patch_vertices >= 1 && patch_vertices <= 32)
-          for (int32_t k = 0; k + static_cast<int32_t>(patch_vertices) <= n; k += static_cast<int32_t>(patch_vertices)) {
-            for (uint32_t j = 0; j < patch_vertices; ++j) pos[j] = start + k + static_cast<int32_t>(j);
-            emit(patch_vertices);
-          }
-        break;
-      default: break;
-    }
-    start = i + 1;
-  }
-}
-
 // Whether a triangle faces the viewer, as the polygon modes and two-sided colour decide it (window-space winding against glFrontFace).
 static bool triangle_front(const gpu::RasterState& rs, const gpu::RVertex& a, const gpu::RVertex& b, const gpu::RVertex& c) {
   const float iwa = a.pos[3] != 0 ? 1 / a.pos[3] : 0, iwb = b.pos[3] != 0 ? 1 / b.pos[3] : 0, iwc = c.pos[3] != 0 ? 1 / c.pos[3] : 0;
@@ -631,7 +565,7 @@ bool GlContext::draw_through_stages(ProgramObj& p, uint32_t mode, int32_t count,
       if (tes) pipe.patch_primitive(primitive_id);      // (a tessellation stage's primitives: the patch's number)
       if (!stages.primitive(ArrayView<const uint32_t* const>(recs, n < 32 ? n : 32), primitive_id++)) ok = false;
     };
-    assemble(mode, count, desktop.patch_vertices, vertex, primitive);
+    assemble_primitives(mode, count, desktop.patch_vertices, vertex, primitive);
   }
   if (!ok) set_error(INVALID_OPERATION);
   return ok;
@@ -712,12 +646,12 @@ bool GlContext::run_draw(uint32_t mode, int32_t first, int32_t count, uint32_t i
   }
 
   // The 3D hardware takes the draw if it can (default framebuffer, shaders and state the device has); otherwise the picture is brought back to the CPU first.
-  if (target.is_default && !desktop.primitive_sink && !p->has_extra() && mode <= 6 && !(desktop.active && desktop.clip_mask)) {
+  if (target.is_default && !desktop.primitive_sink && (mode <= 6 || p->has_extra()) && !(desktop.active && desktop.clip_mask)) {
     if (hw_draw(*p, target, mode, first, count, index_type, idx, indexed, instances)) return true;
     hw_cpu_write();
   } else if (target.is_default) {
     hw_cpu_write();      // (the CPU draws over the device's picture: it comes back first)
-    hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : (p->has_extra() ? "geometry or tessellation shaders" : (mode > 6 ? "adjacency or patches" : "clip planes")));
+    hw_stats_.refused(desktop.primitive_sink ? "selection or feedback" : (mode > 6 ? "adjacency or patches without a geometry or tessellation stage" : "clip planes"));
   }
 
   // varying flags for the rasterizer
