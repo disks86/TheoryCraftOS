@@ -434,7 +434,19 @@ int main(int argc, char** argv) {
   capture_hub.initialize();
   pipewire::Graph graph(a, &mixer, &capture_hub);
   graph.initialize();
-  pipewire::NativeServer pw_native(graph, a);
+  pipewire::NativeServer pw_native(graph, a, [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); });
+  // what programs play on MIDI (the graph's bus): counted for the summary
+  struct CountingSynth final : midi::IMidiSink {
+    std::mutex m;
+    uint32_t messages = 0, note_ons = 0;
+    void send(uint8_t status, uint8_t, uint8_t d2) override {
+      std::lock_guard<std::mutex> g(m);
+      ++messages;
+      if ((status & 0xF0) == 0x90 && d2) ++note_ons;
+    }
+    void reset() override {}
+  } midi_synth;
+  graph.midi_bus().set_output(&midi_synth);
   pipewire::PulseServer pw_pulse(graph, a);
   pipewire::WindowsAudioService windows_audio(graph, a);
   pipewire::install_windows_audio(windows_audio);
@@ -572,6 +584,11 @@ int main(int argc, char** argv) {
     }
     printf("audio: tones 300:%.0f 400:%.0f 500:%.0f 600:%.0f 700:%.0f; together %.0f\n", best_tone[0], best_tone[1], best_tone[2], best_tone[3], best_tone[4], best_together);
   }
+  {
+    std::lock_guard<std::mutex> g(midi_synth.m);
+    printf("midi: %u messages to the synthesizer, %u note-ons\n", midi_synth.messages, midi_synth.note_ons);
+  }
+  graph.midi_bus().set_output(nullptr);
   delete second_program;
 #endif
 #ifdef TCOS_EMU_X11

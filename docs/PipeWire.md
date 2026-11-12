@@ -26,7 +26,9 @@ program that records, of any kind, gets a record stream of it.
 | A protocol client's record stream: 16-bit mono or stereo from an `audio::CaptureStream` of the hub, turned into the program's format and channels | `RecordStream.{hpp,cpp}` |
 | SPA PODs (the native protocol's values) | `Pod.{hpp,cpp}` |
 | PulseAudio tagstructs and property lists | `Tagstruct.{hpp,cpp}`, `Properties.hpp` |
-| PipeWire's native protocol | `NativeServer.{hpp,cpp}`; `client-node` (pw_stream) in `NativeClientNode.cpp` |
+| PipeWire's native protocol | `NativeServer.{hpp,cpp}`; `client-node` (pw_stream, pw_filter) and the `adapter` factory's virtual sinks in `NativeClientNode.cpp` |
+| MIDI: the bus every program's MIDI port is on (to the synthesizer, from keyboards), raw MIDI and UMP | `MidiBus.{hpp,cpp}` |
+| Video: what a producer shows, for its watchers and the kernel | `VideoChannel.{hpp,cpp}` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
 | eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
@@ -62,22 +64,68 @@ program that records, of any kind, gets a record stream of it.
   `tcos_output.stereo.monitor` (index sink | 1 << 24, `@DEFAULT_MONITOR@`, the default source when there is no microphone); `NtTcosAudio`'s
   OPEN_CAPTURE takes it with `[1] = 1`, which WASAPI's `AUDCLNT_STREAMFLAGS_LOOPBACK` on the render endpoint uses.
 
-- **client-node (libpipewire's `pw_stream`).** `pw-play`, `pw-record` and every `pw_stream` program export their own node: Core
-  `create_object("client-node", ..., version 6)`. The server makes it a playback or record stream of the graph (by `media.class`; at
-  `set_active` or the first `port_update`, so that the update before them can say the stream's format) and hands the
-  client, with SCM_RIGHTS, the memory it shares with the kernel (memfds: the node's `pw_node_activation`, the port's buffers and its
-  `spa_io_buffers` area) and two eventfds (the wake and done signals of `transport`). It drives the adapter the stream wraps: a PortConfig
-  (convert mode, F32 at the stream's own rate and channel count, mono or stereo, from the EnumFormat in its update, else 48 kHz stereo; F32
-  because the AVX2 S16 output of audioconvert assumes an aligned destination and crashes), the port's Format, then
-  buffers as the port's Buffers param asks (2 to 16, 64-byte aligned, at least 8192 frames), the io area and Start. Each cycle (the stream's
-  `node.force-quantum`, or its `node.latency` "N/D" as N * rate / D frames, else 1024; 64 to 8192) the server writes the clock into the activation, sets it TRIGGERED and signals the wake eventfd; the client processes and
-  sets FINISHED. A playback node is triggered while its stream holds less than two cycles (at least 3072 frames), and the buffer it filled (HAVE_DATA) goes into the
-  `PlaybackStream`; a record node gets a buffer filled from its `RecordStream` before each trigger. A cycle that never finishes is given up after
-  100 ticks and triggered again; `set_active(false)` pauses. The `pipewire` thread ticks every 5 ms while nodes run (50 ms otherwise). Descriptors
-  are the transport's (`IDescriptorMaker`): `SocketServer` makes memfds (`MemoryFile`, whose block the kernel reads and writes in place while the
-  client maps it) and eventfds (counters in the AF_UNIX manager, so `poll()`, wake-ups and SCM_RIGHTS take them as sockets; `EFD_NONBLOCK`, as
-  PipeWire makes them: libpipewire empties one with a read that must not wait), sends each take's
-  descriptors with its first bytes, and releases what the protocol let go of from its own thread (a graveyard).
+- **client-node (libpipewire's `pw_stream` and `pw_filter`).** `pw-play`, `pw-record`, `pw-midiplay`, camera and screen-sharing programs and every
+  `pw_stream` or `pw_filter` program export their own node: Core `create_object("client-node", ..., version 6)`. The server hands the client, with
+  SCM_RIGHTS, the memory it shares with the kernel (memfds: the node's `pw_node_activation`, the ports' `spa_io_buffers` areas, each port's
+  buffers) and two eventfds (the wake and done signals of `transport`). At `set_active` (or the first `port_update` after it, so that the update
+  before can say the stream's format) the graph node is made, by `media.class` (and the ports' formats): audio into a `PlaybackStream` or from a
+  `RecordStream` (or into and out of a virtual sink the stream names with `target.object`), MIDI onto the graph's `MidiBus`, video into a
+  `VideoChannel` of a producer's or from one. The node is bound (`bound_props`) and told its clock and position again (`set_io` Clock and Position:
+  the activation now names the node, and a driver is driving when they name the same clock).
+  - **Adapters and raw nodes.** A `pw_stream` of audio or video wraps an adapter, which has no ports until it is configured: audio gets a PortConfig
+    in convert mode (F32 at the stream's own rate and channel count, mono or stereo, from the EnumFormat in its update, else 48 kHz stereo; F32
+    because the AVX2 S16 output of audioconvert assumes an aligned destination and crashes), video in passthrough mode (the stream's own port). A
+    node whose ports came before it was active (a `pw_filter`; a MIDI `pw_stream`, which has no adapter) is raw and keeps its ports: up to 16 of
+    them, each with its own io area. Two float audio ports of a filter (`32 bit float mono audio`) are the left and right of one stereo stream.
+  - **Formats.** The adapter's audio port gets the server's PortConfig format; any other port its own EnumFormat fixated (every Choice its default:
+    a camera's size and frame rate, a MIDI port's `application/control`, a float port's DSP format); a video watcher the format of the producer it
+    is linked to (`target.object` names the producer by `node.name`, `object.serial` or id, else the first producer; until there is one it waits).
+  - **Buffers and metadata.** Once a port took its format and says what it wants (its Buffers param: how many, 2 to 16; the data's size and stride;
+    the memory types; its Meta params), the server makes its buffers in one memfd: each buffer's metadata (`SPA_META_Header`, `Busy`, `VideoCrop`,
+    `VideoDamage`, `Cursor`, ... as the port asks, up to 8, each rounded to 8 bytes), the chunk, then the data (audio at least 8192 frames, MIDI
+    16 KiB unless it asks for more, video what the port asks; MemPtr, or MemId with page-aligned data when the port takes only memfds). The server
+    fills in `SPA_META_Header` (time stamp, sequence number) on what it gives, reads a producer's time stamp from it, and does not write a buffer
+    whose `SPA_META_Busy` count is not 0.
+  - **Client-allocated buffers.** An output port that can allocate (`SPA_PORT_FLAG_CAN_ALLOC_BUFFERS`: `PW_STREAM_FLAG_ALLOC_BUFFERS`, a DMA-BUF or
+    memfd producer) gets `port_use_buffers` with `SPA_NODE_BUFFERS_FLAG_ALLOC`: the metadata and chunks in the server's memory, no data (its type is
+    the mask of types it may use, as PipeWire says it). It answers with `port_buffers`: each buffer's memfd (passed with SCM_RIGHTS), offset and
+    size, which the server maps (`SocketServer` turns a client's memfd into a descriptor of the file's bytes) and reads in place. A DMA-BUF is
+    refused (ENOTSUP); so is a buffer outside its memfd or a descriptor that did not come.
+  - **Cycles.** Each cycle (the stream's `node.force-quantum`, or its `node.latency` "N/D" as N * rate / D frames, else 1024; 64 to 8192) the server
+    writes the clock into the activation, sets it TRIGGERED and signals the wake eventfd; the client processes and sets FINISHED, and what its
+    outputs produced (HAVE_DATA) is taken and the buffer handed back. Inputs are filled before the trigger. Playback to the speakers is triggered
+    while its stream holds less than two cycles (at least 3072 frames), recording once a quantum is recorded, MIDI, video and virtual sinks on the
+    server's clock (a video watcher when its producer has a new frame). A cycle that never finishes is given up after 100 ticks and triggered
+    again; `set_active(false)` pauses. The `pipewire` thread ticks every 5 ms while nodes run (50 ms otherwise).
+  - **Drivers.** A video or MIDI node with `node.driver` (`PW_STREAM_FLAG_DRIVER`: a camera, `video-src`; the program calls
+    `pw_stream_trigger_process` on its own timer) drives itself: its activation requires its own trigger once a cycle, the server never triggers it,
+    and takes what its outputs' io areas hold (and fills its inputs) as they say. An audio driver follows the server's clock instead (as in PipeWire,
+    where the sound card's driver wins): its position is an activation of the server's (`set_io` Position to another memfd), so it is not driving
+    and is triggered as any other stream.
+  - **MIDI.** A MIDI output's buffers hold a Sequence of controls: `SPA_CONTROL_Midi` (raw MIDI 1.0 bytes, running status, real-time bytes in the
+    middle of a message) and `SPA_CONTROL_UMP` (MIDI 1.0 and MIDI 2.0 channel voice and system packets, scaled down); every message goes to the
+    bus. A MIDI input is given a Sequence of what the bus brought since its last cycle: UMP for a port with `control.ump` (`32 bit raw UMP`), else
+    raw MIDI. The bus sends programs' notes to the synthesizer (in the kernel: a USB synthesizer or the MPU-401 when there is one, else the
+    software synthesizer through the mixer, which keeps running a few seconds after a program's last note) and to every other program's MIDI
+    input; keyboards' keys go to the programs' inputs too. The graph shows the bus as the node `tcos_midi.bridge` (`Midi/Bridge`), each program's
+    MIDI node linked to it.
+  - **Video.** A producer's frames (packed RGB formats: RGBx, BGRx, xRGB, xBGR, RGBA, BGRA, ARGB, ABGR, RGB, BGR; up to 8192 on a side) are
+    copied out of its buffer into its `VideoChannel` at each cycle, whole; a watcher's input is given the newest frame it has not had. The kernel can
+    take a channel's frames too (`Graph::video_of`).
+  Descriptors are the transport's (`IDescriptorMaker`): `SocketServer` makes memfds (`MemoryFile`, whose block the kernel reads and writes in place
+  while the client maps it) and eventfds (counters in the AF_UNIX manager, so `poll()`, wake-ups and SCM_RIGHTS take them as sockets;
+  `EFD_NONBLOCK`, as PipeWire makes them: libpipewire empties one with a read that must not wait), sends each take's descriptors with its first
+  bytes, takes the descriptors clients send (`receive_with_fds`: each message's `n_fds` are the next ones that came), and releases what the
+  protocol let go of from its own thread (a graveyard).
+
+- **The adapter factory: virtual sinks.** `pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=... }'` (and
+  `pw_core_create_object(core, "adapter", ...)`) makes a virtual sink: a graph node (`Audio/Sink`, or the media class given) with input ports and
+  as many monitor ports (`audio.channels` or `audio.position`, mono or stereo; `audio.rate`, default 48 kHz), bound to the client's proxy. Streams
+  that name it (`target.object`) play into it or record from it instead of the devices: their PortConfig format is the sink's, what they play is
+  mixed into a ring of float frames at each stream's place on the sink's clock (the server's), and what records from it hears that mix a moment
+  later (a stream that falls behind starts again from now). With `object.linger=true` it stays when its client goes (it is the kernel's then);
+  `Core destroy` of its proxy removes it, and its streams make and hear silence. Other SPA factories (`api.alsa.pcm.sink`, `audiotestsrc`, ...)
+  are refused with `-ENOTSUP`: no SPA plugin runs in the kernel.
 
 - **libpipewire itself in the OS.** The real libpipewire runs on the Linux layer (dynamically linked through glibc's `ld.so`, see
   [LinuxDynamicPrograms.md](LinuxDynamicPrograms.md)): its loops are `epoll` sets of eventfds, timerfds, signalfds and sockets, guarded by
@@ -109,9 +157,12 @@ source-output subscription events. Sample formats: U8, A-law, µ-law, S16, S24, 
 **PipeWire native**: Core hello/sync/pong/get_registry/destroy, Registry bind for Core, Client, Device, Node, Port, Link and Metadata, the info of
 bound objects (sent again when they change), Client update_properties/get_permissions, Node and Port enum_params/subscribe_params (Props, EnumFormat,
 Format), Node set_param(Props) for volume and mute (the source's too), the metadata's `default.audio.sink` and `default.audio.source`.
-`client-node` (Core create_object): ClientNode update, port_update, set_active, get_node/event/port_buffers (accepted, unused); the events
-transport, set_param (PortConfig), port_set_param (Format), port_use_buffers, port_set_io, port_set_mix_info, command (Start, Pause), and Core
-add_mem for every memfd. Other factories (`adapter`, `link-factory`, `metadata`, `spa-node-factory`) are refused with `-ENOTSUP`.
+`client-node` (Core create_object): ClientNode update, port_update (its params: EnumFormat, Buffers, Meta; its info: flags, properties),
+set_active, port_buffers (a port's own memfds), get_node and event (accepted, unused); the events transport, set_param (PortConfig), set_io
+(Clock, Position), port_set_param (Format), port_use_buffers (with metadata; ALLOC for a port that allocates), port_set_io, port_set_mix_info,
+command (Start, Pause), and Core add_mem for every memfd. `adapter` (Core create_object, `PipeWire:Interface:Node`) makes
+`support.null-audio-sink` virtual sinks. Other factories (`link-factory`, `metadata`, `spa-node-factory`) and other `factory.name`s of the adapter are
+refused with `-ENOTSUP`. MIDI nodes and ports show `application/control` as their format; video ones their producer's.
 
 **winmm**: `waveOutOpen` (PCM 8/16/24/32-bit, float 32/64, `WAVE_FORMAT_EXTENSIBLE`, `WAVE_FORMAT_QUERY`, function/event/window/thread callbacks),
 prepare/unprepare/write, pause/restart/reset/break loop, position (bytes, samples, ms; frozen while paused), per-stream and master volume, device caps,
@@ -173,7 +224,15 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   CREATE_RECORD_STREAM and bit flips), the Windows service both ways, the AF_UNIX transport, several threads at once. client-node: the setup a
   `pw_stream` goes through, playback and recording cycles on a real mixer and hub, an empty cycle, a cycle that times out, pause, 600 truncated or
   bit-flipped update, port_update and set_active messages, a descriptor maker that fails; and the same through `SocketServer` over AF_UNIX
-  sockets, with the memfds and eventfds it makes received by SCM_RIGHTS (the client writes the memory the kernel reads; nothing leaks).
+  sockets, with the memfds and eventfds it makes received by SCM_RIGHTS (the client writes the memory the kernel reads; nothing leaks). The MIDI bus
+  (raw MIDI with running status, system exclusive, real-time bytes inside messages, cut-short messages; UMP both ways; routing; a full queue;
+  3000 truncated or bit-flipped inputs; four listeners and four senders on threads at once) and the video channel (strides, cut-short frames, a
+  producer and three watchers on threads checking every frame is whole). client-node's media: a raw MIDI output (no PortConfig, cycles on the
+  clock, raw MIDI and UMP to the synthesizer) heard by a UMP input with a keyboard; a driver camera with `SPA_META_Header` and `VideoDamage` (never
+  triggered, its frames taken from its io) and a watcher given its format and frames; a camera that allocates its own buffers (`port_buffers`:
+  refused without its descriptor, outside its memfd, for a DMA-BUF); an audio driver made to follow; a filter's two float ports played as stereo;
+  the adapter (a virtual sink played into and recorded from, a refused `factory.name`, destroying it, `object.linger`); 900 truncated or
+  bit-flipped port_update and port_buffers messages. The transport takes a memfd and an eventfd from a client.
 - `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
   from another thread, passing it with SCM_RIGHTS).
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl`, `paplay` and `parecord` against
@@ -181,6 +240,9 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   `paplay` at once; the mixed output must hold both tones at the right levels; `parecord` must record each side's tone; the source's and a source
   output's volume set through `pactl` must read back. The host's real `pw-play` and `pw-record` (libpipewire 1.x) go through client-node (the
   host server's maker makes real memfds and eventfds): the mix must hold `pw-play`'s tone, and `pw-record` must record each side's tone.
+  `tests/linux/pwmedia.c`, built against the host's libpipewire, runs its four modes (below); `pw-midiplay` plays a MIDI file (the server's
+  synthesizer must get all its notes); `pw-cli create-node adapter` makes a lingering null sink that `pw-cli ls` lists, `pw-play --target` plays into
+  and `pw-record --target` records from (the recording must hold the tone at full level).
 - `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
@@ -198,7 +260,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   when the machine has `pw-cat`) runs the host's real `pw-cat` with its libraries, SPA plugins (`libspa-support`, `libspa-audioconvert`, ...),
   modules (`protocol-native`, `client-node`, `adapter`, ...) and `client.conf` copied into the Linux tree: `pw-play` of a 500 Hz WAV must be in
   the mix with the native stream, and `pw-record -n 24000` must write a WAV (copied out with `TCOS_EMU_SAVE`) that holds 880 Hz on the left and
-  1320 Hz on the right. `TCOS_EMU_STRACE=1` prints every system call of the emulated program with its result.
+  1320 Hz on the right. Then `pw-cat --midi` plays a 12-note MIDI file (all 12 must reach the emulator's synthesizer), and `tests/linux/pwmedia.c`
+  runs each mode: `video` (a driver camera, `PW_STREAM_FLAG_DRIVER` with `SPA_META_Header`, and a watcher in one program: 15 frames seen whole and in
+  order), `video-alloc` (the same with `PW_STREAM_FLAG_ALLOC_BUFFERS`: the camera's own memfds), `midi` (a `pw_filter` MIDI output's 16 notes heard
+  by a `pw_stream` MIDI input) and `adapter` (a virtual sink made with the adapter factory, an audio driver playing 500 Hz into it, a stream
+  recording it: the tone at its level). `TCOS_EMU_STRACE=1` prints every system call of the emulated program with its result.
 - `tests/run_host_tests.sh UnixSocketTest`: timerfd (one-shot, periodic, absolute, disarmed, `poll()` and a blocking read woken when it fires, also
   when another thread arms it meanwhile) and epoll (data, MOD/DEL, EEXIST/ENOENT/EPERM, one-shot, a timer and a socket in one set, a hang-up, a
   descriptor closed while in the set, a waiter woken by another thread's `EPOLL_CTL_ADD`, signalfd) and PI futexes (four threads sharing one
@@ -210,9 +276,17 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   kernel under QEMU yet (the same files would have to be put on the disk image, as `LinuxDynamicPrograms.md` describes).
 - **Signals and realtime.** A signalfd never fires (signals are not routed to descriptors), so `pw-cat` cannot be stopped with Ctrl+C through its
   loop; `module-rt` finds no RTKit or session bus and runs without realtime priority (as it does on Linux without them).
-- **client-node limits.** One port per node, mono or stereo at the port (a wider stream is downmixed by the adapter in the program), no metadata
-  (`SPA_META_Header`, `Busy`), no client-allocated buffers (`port_buffers`), no `pw_filter` or `pw_stream` with `PW_STREAM_FLAG_DRIVER`, no MIDI
-  or video. The `adapter` factory (`pw-cli create-node adapter`) is refused.
+- **client-node limits.** A node's audio goes one way (its media class's): a filter's ports of the other direction get nothing, and a filter's
+  audio is its first two float ports. Mono or stereo audio at a port (a wider stream is downmixed by the adapter in the program). Video formats are
+  the packed RGB ones (no YUV, no encoded video, no DSP float video, no DMA-BUFs: a DMA-BUF producer is refused). MIDI messages are three bytes at
+  most (system exclusive is not carried) and a cycle's messages all go at its start (no sub-cycle timing). `SPA_META_Busy` is honoured but never
+  set by the server; cursor, bitmap and damage metadata are carried, not read. No `set_activation` peers (the server is every node's only peer),
+  links made by clients (`link-factory`), latency or tag params passed on, or renegotiation after Start (a stream that changes its format is not
+  told a new one). The kernel shows no camera or screen as a video source of its own (a program's producer is the only kind), and the desktop does
+  not show a channel's frames yet.
+- **The adapter's other factories.** Only `support.null-audio-sink`; virtual sinks are reached by the native protocol's streams only (PulseAudio's
+  and Windows' streams still play to the speakers, and `pactl load-module module-null-sink` is not served). A virtual sink's clock is the server's
+  (no device paces it).
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).

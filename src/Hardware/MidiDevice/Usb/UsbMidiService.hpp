@@ -24,6 +24,9 @@
 //     be played at once, with or without MIDI hardware.
 //   - Output. The service is an IMidiOutput for the media player that is available() when a synthesizer is plugged in or the fallback output is,
 //     and sends the notes of a song there.
+//   - Programs. What programs play (the kernel's PipeWire MIDI bus: pw-midiplay, a sequencer) goes through program_output() to the same sound maker,
+//     else to the software synthesizer, which then keeps running a while after the last note. What keyboards play is also handed to the input tap
+//     (the bus, for programs that record MIDI).
 //
 // A thread polls the devices every couple of milliseconds and looks for new ones a few times a second (step() does one round, for machines and
 // tests without threads). USB devices are served only on host controllers that can keep a bulk IN endpoint armed (xHCI, EHCI); on the others
@@ -49,6 +52,11 @@ class UsbMidiService final : public midi::IMidiOutput {
 
   // Another output that keyboards are routed to, and songs are played on, when no USB synthesizer is there (the MPU-401). Must outlive the service.
   void set_fallback_output(midi::IMidiOutput* output) { fallback_ = output; }
+  // Where keyboards' keys also go (null: nowhere else). Its send() is called with the service's lock held: it must not call the service.
+  void set_input_tap(midi::IMidiSink* tap);
+  // The sink programs play to: a sound maker, else the software synthesizer.
+  midi::IMidiSink& program_output() { return program_output_; }
+  void play_program(uint8_t status, uint8_t data1, uint8_t data2);
 
   // Takes over the MIDI devices present now and starts the thread (if the kernel runs threads). False only if the thread cannot be started.
   bool start();
@@ -77,6 +85,16 @@ class UsbMidiService final : public midi::IMidiOutput {
   void flush() override;
 
  private:
+  class ProgramOutput final : public midi::IMidiSink {
+   public:
+    explicit ProgramOutput(UsbMidiService& s) : service_(s) {}
+    void send(uint8_t status, uint8_t data1, uint8_t data2) override { service_.play_program(status, data1, data2); }
+    void reset() override { service_.reset(); }
+
+   private:
+    UsbMidiService& service_;
+  };
+  static constexpr uint32_t kProgramScans = 25;      // (scans the software synthesizer keeps running after a program's last note: about 5 s)
   static void thread_main(void* self);
   static void on_message(void* self, uint8_t status, uint8_t data1, uint8_t data2);
   void scan_devices();
@@ -89,6 +107,9 @@ class UsbMidiService final : public midi::IMidiOutput {
   audio::AudioMixer* mixer_;
   allocators::IAllocator& allocator_;
   midi::IMidiOutput* fallback_ = nullptr;
+  midi::IMidiSink* tap_ = nullptr;
+  ProgramOutput program_output_{*this};
+  uint32_t program_scans_ = kProgramScans;      // scans since a program last played (kProgramScans: not lately)
   mutable kernel::Mutex mutex_;
   List<UniquePointer<UsbMidiDevice>> devices_;
   UsbPortWatcher watcher_;

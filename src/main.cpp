@@ -2129,7 +2129,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll, dsound.dll, WASAPI and NtTcosAudio. Recording goes the same ways
     // through the capture hub: the graph's source is the microphone it shares. (Gone before the mixer and the hub are.)
     pipewire::Graph media_graph(shared_allocator, mixer.get(), capture_hub.get());
-    pipewire::NativeServer pipewire_native(media_graph, shared_allocator);
+    pipewire::NativeServer pipewire_native(media_graph, shared_allocator, [] { return hardware::uptime_us() * 1000; });
+    // MIDI: what programs play sounds on the machine's synthesizer (a USB one, the MPU-401, else the software one); what keyboards play is heard by
+    // the programs that record MIDI. (Undone before the graph goes.)
+    media_graph.midi_bus().set_output(&usb_midi.program_output());
+    usb_midi.set_input_tap(&media_graph.midi_bus());
+    struct MidiGuard {
+      hardware::UsbMidiService& s;
+      pipewire::Graph& g;
+      ~MidiGuard() {
+        s.set_input_tap(nullptr);
+        g.midi_bus().set_output(nullptr);
+      }
+    } midi_guard{usb_midi, media_graph};
     pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
     pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);
     UniquePointer<pipewire::SocketServer> pipewire_sockets;

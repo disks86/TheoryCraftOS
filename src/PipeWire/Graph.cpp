@@ -99,7 +99,7 @@ bool interface_from_name(StringView name, ObjectType* out) {
 }
 
 Graph::Graph(allocators::IAllocator& allocator, audio::AudioMixer* mixer, audio::AudioCaptureHub* capture)
-    : allocator_(allocator), mixer_(mixer), capture_(capture), objects_(allocator), retired_(allocator) {}
+    : allocator_(allocator), mixer_(mixer), capture_(capture), objects_(allocator), retired_(allocator), midi_(allocator) {}
 
 Graph::~Graph() {
   // the streams that are still playing stop with the graph
@@ -109,6 +109,7 @@ Graph::~Graph() {
       o->playback->close();
     }
     if (o->record) o->record->close();
+    if (o->video && o->direction_of_node == kDirectionOutput) o->video->close();
   }
 }
 
@@ -239,6 +240,7 @@ bool Graph::initialize() {
       source->mute = gain_muted;
     }
   }
+  if (!add_midi_bridge_locked()) return false;
   set_default_metadata_locked();
   if (mixer_) {
     master_ = mixer_->master_volume();
@@ -286,6 +288,313 @@ bool Graph::add_source_locked() {
     source_ports_[i] = port->id;
   }
   return true;
+}
+
+// The MIDI bus as a node, as PipeWire's Midi-Bridge shows the machine's MIDI ports: programs' MIDI outputs are linked to its input, its output to their
+// inputs.
+bool Graph::add_midi_bridge_locked() {
+  GraphObject* bridge = add_locked(ObjectType::Node, 0);
+  if (!bridge) return false;
+  midi_bridge_ = bridge->id;
+  bridge->role = NodeRole::MidiBridge;
+  bridge->input_ports = 1;
+  bridge->output_ports = 1;
+  bridge->props.set("node.name", "tcos_midi.bridge");
+  bridge->props.set("node.description", "MIDI");
+  bridge->props.set("node.nick", "MIDI");
+  bridge->props.set("media.class", "Midi/Bridge");
+  bridge->props.set("factory.name", "api.tcos.midi");
+  bridge->props.set("priority.session", "100");
+  return add_port_locked(0, midi_bridge_, 0, kDirectionInput, "playback_0", "8 bit raw midi", &midi_bridge_ports_[0]) &&
+         add_port_locked(0, midi_bridge_, 0, kDirectionOutput, "capture_0", "8 bit raw midi", &midi_bridge_ports_[1]);
+}
+
+bool Graph::add_port_locked(uint32_t client, uint32_t node, uint32_t index, uint32_t direction, StringView name, StringView dsp, uint32_t* id) {
+  GraphObject* owner = find_locked(node);
+  const NodeRole role = owner ? owner->role : NodeRole::None;
+  SharedPointer<VideoChannel> video = owner ? owner->video : SharedPointer<VideoChannel>();
+  GraphObject* port = add_locked(ObjectType::Port, client);
+  if (!port) return false;
+  // (a MIDI or video node's ports say so: their formats are the node's kind; a video port shows its producer's)
+  if (role == NodeRole::MidiStream || role == NodeRole::MidiBridge || role == NodeRole::VideoStream) port->role = role;
+  port->video = video;
+  port->node = node;
+  port->direction = direction;
+  port->channel = index;
+  port->props.set("port.name", name);
+  port->props.set("port.direction", direction == kDirectionInput ? "in" : "out");
+  port->props.set_uint("port.id", index);
+  port->props.set_uint("node.id", node);
+  if (!dsp.empty()) port->props.set("format.dsp", dsp);
+  if (id) *id = port->id;
+  return true;
+}
+
+bool Graph::add_link_locked(uint32_t client, uint32_t out_node, uint32_t out_port, uint32_t in_node, uint32_t in_port) {
+  GraphObject* link = add_locked(ObjectType::Link, client);
+  if (!link) return false;
+  link->output_node = out_node;
+  link->output_port = out_port;
+  link->input_node = in_node;
+  link->input_port = in_port;
+  link->props.set_uint("link.output.node", out_node);
+  link->props.set_uint("link.output.port", out_port);
+  link->props.set_uint("link.input.node", in_node);
+  link->props.set_uint("link.input.port", in_port);
+  link->props.set("factory.name", "link-factory");
+  return true;
+}
+
+// The id of `node`'s port `index` of that direction (in the order they were made), 0 if there is none.
+uint32_t Graph::port_of_locked(uint32_t node, uint32_t direction, uint32_t index) {
+  uint32_t n = 0;
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Port && o->node == node && o->direction == direction && n++ == index) return o->id;
+  return 0;
+}
+
+GraphObject* Graph::add_media_node_locked(uint32_t client, NodeRole role, const Properties& props, const char* media_class, uint32_t direction) {
+  GraphObject* node = add_locked(ObjectType::Node, client);
+  if (!node) return nullptr;
+  node->role = role;
+  node->direction_of_node = direction;
+  node->state = kNodeStateRunning;
+  if (GraphObject* c = find_locked(client)) node->origin = c->origin;
+  node->props.update(props, Properties::Mode::kReplace);
+  if (!node->props.has("media.class") || node->props.get("media.class").empty()) node->props.set("media.class", media_class);
+  node->props.set_uint("object.id", node->id);
+  node->props.set_uint("object.serial", node->object_serial);
+  node->props.set_uint("client.id", client);
+  if (!node->props.has("node.name") || node->props.get("node.name").empty()) {
+    String name(allocator_);
+    name.append(node->props.has("application.name") ? node->props.get("application.name") : StringView("stream"));
+    name.push_back('.');
+    name.append_uint(node->id);
+    node->props.set("node.name", name.view());
+  }
+  if (GraphObject* c = find_locked(client)) {
+    if (!node->props.has("application.name") && c->props.has("application.name")) node->props.set("application.name", c->props.get("application.name"));
+    node->props.set_uint("application.process.id", c->pid);
+  }
+  return node;
+}
+
+uint32_t Graph::create_midi_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<MidiQueue>* in) {
+  if (in) *in = SharedPointer<MidiQueue>();
+  uint32_t id = 0;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* c = find_locked(client);
+    if (!c || c->type != ObjectType::Client) return 0;
+    GraphObject* node = add_media_node_locked(client, NodeRole::MidiStream, props, direction == kDirectionOutput ? "Stream/Output/Midi" : "Stream/Input/Midi",
+                                              direction);
+    if (!node) return 0;
+    id = node->id;
+    node->props.set("media.type", "Midi");
+    uint32_t port = 0;
+    if (direction == kDirectionOutput) {
+      node->output_ports = 1;
+      if (!add_port_locked(client, id, 0, kDirectionOutput, "output", "8 bit raw midi", &port) ||
+          !add_link_locked(client, id, port, midi_bridge_, midi_bridge_ports_[0])) {
+        List<SharedPointer<PlaybackStream>> none(allocator_);
+        remove_node_locked(id, &none, false);
+        return 0;
+      }
+      return id;
+    }
+    node->input_ports = 1;
+    if (!add_port_locked(client, id, 0, kDirectionInput, "input", "8 bit raw midi", &port) ||
+        !add_link_locked(client, midi_bridge_, midi_bridge_ports_[1], id, port)) {
+      List<SharedPointer<PlaybackStream>> none(allocator_);
+      remove_node_locked(id, &none, false);
+      return 0;
+    }
+  }
+  // (the bus is called without the graph's lock)
+  SharedPointer<MidiQueue> q = midi_.listen(id);
+  if (!q) {
+    destroy_node(id);
+    return 0;
+  }
+  {
+    kernel::ScopedMutex guard(mutex_);
+    if (GraphObject* node = find_locked(id)) node->midi_in = q;
+  }
+  if (in) *in = q;
+  return id;
+}
+
+uint32_t Graph::create_video_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<VideoChannel>* channel) {
+  *channel = SharedPointer<VideoChannel>();
+  SharedPointer<VideoChannel> made;
+  if (direction == kDirectionOutput) {
+    made = SharedPointer<VideoChannel>::make(allocator_, allocator_);
+    if (!made) return 0;
+  }
+  uint32_t id = 0;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    GraphObject* c = find_locked(client);
+    if (!c || c->type != ObjectType::Client) return 0;
+    GraphObject* node = add_media_node_locked(client, NodeRole::VideoStream, props, direction == kDirectionOutput ? "Stream/Output/Video" : "Stream/Input/Video",
+                                              direction);
+    if (!node) return 0;
+    id = node->id;
+    node->props.set("media.type", "Video");
+    node->video = made;
+    if (direction == kDirectionOutput) node->output_ports = 1;
+    else node->input_ports = 1;
+    if (!add_port_locked(client, id, 0, direction, direction == kDirectionOutput ? "output_0" : "input_0", "", nullptr)) {
+      List<SharedPointer<PlaybackStream>> none(allocator_);
+      remove_node_locked(id, &none, false);
+      return 0;
+    }
+  }
+  if (direction == kDirectionOutput) {
+    *channel = made;
+    return id;
+  }
+  link_video(id, channel);
+  return id;
+}
+
+bool Graph::link_video(uint32_t node_id, SharedPointer<VideoChannel>* channel) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(node_id);
+  if (!node || node->role != NodeRole::VideoStream || node->direction_of_node != kDirectionInput) return false;
+  if (node->video) {
+    *channel = node->video;
+    return true;
+  }
+  // the producer the watcher names, else the first one
+  const StringView target = node->props.has("target.object") ? node->props.get("target.object") : node->props.get("node.target");
+  GraphObject* producer = nullptr;
+  for (const UniquePointer<GraphObject>& o : objects_.view()) {
+    if (o->type != ObjectType::Node || o->role != NodeRole::VideoStream || o->direction_of_node != kDirectionOutput || !o->video || o->id == node_id) continue;
+    if (target.empty() || target == o->props.get("node.name") || target == o->props.get("object.serial") || target == o->props.get("object.id")) {
+      producer = o.get();
+      break;
+    }
+  }
+  if (!producer) return false;
+  const uint32_t out_port = port_of_locked(producer->id, kDirectionOutput, 0), in_port = port_of_locked(node_id, kDirectionInput, 0);
+  if (!out_port || !in_port || !add_link_locked(node->client, producer->id, out_port, node_id, in_port)) return false;
+  node->video = producer->video;
+  touch_locked(*node);
+  for (UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Port && o->node == node_id) {
+      o->video = producer->video;
+      touch_locked(*o);
+    }
+  *channel = node->video;
+  return true;
+}
+
+SharedPointer<VideoChannel> Graph::video_of(uint32_t node_id) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(node_id);
+  return node && node->type == ObjectType::Node ? node->video : SharedPointer<VideoChannel>();
+}
+
+uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate) {
+  if (channels < 1 || channels > 2) return 0;
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* c = find_locked(client);
+  if (!c || c->type != ObjectType::Client) return 0;
+  GraphObject* node = add_media_node_locked(client, NodeRole::Virtual, props, "Audio/Sink", kDirectionInput);
+  if (!node) return 0;
+  const uint32_t id = node->id;
+  node->format = PcmFormat{SampleFormat::F32Le, rate, channels};
+  node->state = kNodeStateIdle;
+  node->props.set_uint("audio.channels", channels);
+  node->props.set_uint("audio.rate", rate);
+  node->props.set("audio.format", "F32LE");
+  node->props.set("audio.position", channels == 1 ? "MONO" : "FL,FR");
+  if (!node->props.has("factory.name")) node->props.set("factory.name", "support.null-audio-sink");
+  if (!node->props.has("node.description")) node->props.set("node.description", node->props.get("node.name"));
+  node->input_ports = channels;
+  node->output_ports = channels;
+  bool ok = true;
+  for (uint32_t i = 0; i < channels && ok; ++i) {
+    const char* side = channels == 1 ? "MONO" : (i == 0 ? "FL" : "FR");
+    String in(allocator_), out(allocator_);
+    in.append("playback_");
+    in.append(side);
+    out.append("monitor_");
+    out.append(side);
+    ok = add_port_locked(client, id, i, kDirectionInput, in.view(), "32 bit float mono audio", nullptr) &&
+         add_port_locked(client, id, i, kDirectionOutput, out.view(), "32 bit float mono audio", nullptr);
+  }
+  if (!ok) {
+    List<SharedPointer<PlaybackStream>> none(allocator_);
+    remove_node_locked(id, &none, false);
+    return 0;
+  }
+  return id;
+}
+
+void Graph::keep_node(uint32_t node_id) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(node_id);
+  if (!node || node->type != ObjectType::Node) return;
+  // the node and its ports become the kernel's (the native client's): they stay when the program goes
+  node->client = native_client_;
+  node->props.set_uint("client.id", native_client_);
+  for (UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Port && o->node == node_id) o->client = native_client_;
+  touch_locked(*node);
+}
+
+uint32_t Graph::create_linked_stream(uint32_t client, const PcmFormat& format, const Properties& props, uint32_t direction, uint32_t peer) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* c = find_locked(client);
+  GraphObject* target = find_locked(peer);
+  if (!c || c->type != ObjectType::Client || !target || target->role != NodeRole::Virtual || !format.valid()) return 0;
+  GraphObject* node = add_media_node_locked(client, NodeRole::Linked, props, direction == kDirectionOutput ? "Stream/Output/Audio" : "Stream/Input/Audio",
+                                            direction);
+  if (!node) return 0;
+  const uint32_t id = node->id;
+  node->format = format;
+  node->props.set("media.class", direction == kDirectionOutput ? "Stream/Output/Audio" : "Stream/Input/Audio");
+  node->props.set("target.object", target->props.get("node.name"));
+  node->props.set_uint("audio.channels", format.channels);
+  node->props.set_uint("audio.rate", format.rate);
+  node->props.set("audio.format", format.name());
+  const uint32_t channels = format.channels == 1 ? 1 : 2, peers = target->format.channels;
+  if (direction == kDirectionOutput) node->output_ports = channels;
+  else node->input_ports = channels;
+  bool ok = true;
+  for (uint32_t i = 0; i < channels && ok; ++i) {
+    const char* side = channels == 1 ? "MONO" : (i == 0 ? "FL" : "FR");
+    String name(allocator_);
+    name.append(direction == kDirectionOutput ? "output_" : "input_");
+    name.append(side);
+    uint32_t port = 0;
+    ok = add_port_locked(client, id, i, direction, name.view(), "32 bit float mono audio", &port);
+    // to the peer's matching side (mono to each side)
+    for (uint32_t s = 0; s < peers && ok; ++s) {
+      if (channels == 2 && peers == 2 && s != i) continue;
+      const uint32_t peer_port = port_of_locked(peer, direction == kDirectionOutput ? kDirectionInput : kDirectionOutput, s);
+      if (!peer_port) continue;
+      ok = direction == kDirectionOutput ? add_link_locked(client, id, port, peer, peer_port) : add_link_locked(client, peer, peer_port, id, port);
+    }
+  }
+  if (!ok) {
+    List<SharedPointer<PlaybackStream>> none(allocator_);
+    remove_node_locked(id, &none, false);
+    return 0;
+  }
+  return id;
+}
+
+uint32_t Graph::find_node(StringView target) {
+  if (target.empty()) return 0;
+  kernel::ScopedMutex guard(mutex_);
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node &&
+        (target == o->props.get("node.name") || target == o->props.get("object.serial") || target == o->props.get("object.id")))
+      return o->id;
+  return 0;
 }
 
 void Graph::set_default_metadata_locked() {
@@ -573,8 +882,20 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
 
 void Graph::remove_node_locked(uint32_t node_id, List<SharedPointer<PlaybackStream>>* stopped, bool drain) {
   GraphObject* node = find_locked(node_id);
-  if (!node || node->type != ObjectType::Node || (node->role != NodeRole::Playback && node->role != NodeRole::Capture)) return;
+  if (!node || node->type != ObjectType::Node) return;
+  if (node->role != NodeRole::Playback && node->role != NodeRole::Capture && node->role != NodeRole::MidiStream && node->role != NodeRole::VideoStream &&
+      node->role != NodeRole::Virtual && node->role != NodeRole::Linked)
+    return;
   if (node->record) node->record->close();
+  if (node->video && node->direction_of_node == kDirectionOutput) node->video->close();
+  if (node->midi_in) midi_.unlisten(node->midi_in.get());      // (the bus's lock is never held while the graph's is taken)
+  // a producer's watchers lose it (their link goes below; link_video() finds another)
+  if (node->role == NodeRole::VideoStream && node->direction_of_node == kDirectionOutput)
+    for (UniquePointer<GraphObject>& o : objects_.view())
+      if (o->role == NodeRole::VideoStream && o->direction_of_node == kDirectionInput && o->video.get() == node->video.get()) {
+        o->video = SharedPointer<VideoChannel>();
+        touch_locked(*o);
+      }
   if (node->playback) {
     retired_.push_back(node->playback->shared_stream());
     if (drain) node->playback->close();

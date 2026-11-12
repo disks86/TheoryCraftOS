@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -372,7 +373,8 @@ static void test_graph() {
   CHECK(mixer.initialize());
   Graph g(A, &mixer);
   CHECK(g.initialize());
-  CHECK(count_type(g, ObjectType::Node) == 1 && count_type(g, ObjectType::Port) == 4 && count_type(g, ObjectType::Device) == 1 && count_type(g, ObjectType::Metadata) == 1);      // (the sink: two playback ports, two monitor ports)
+  // (the sink: two playback ports, two monitor ports; the MIDI bridge: an input and an output port)
+  CHECK(count_type(g, ObjectType::Node) == 2 && count_type(g, ObjectType::Port) == 6 && count_type(g, ObjectType::Device) == 1 && count_type(g, ObjectType::Metadata) == 1);
   bool sink_ok = false;
   g.visit(g.sink_id(), [&](const GraphObject& o) { sink_ok = o.props.get("media.class") == StringView("Audio/Sink") && o.role == NodeRole::Sink; });
   CHECK(sink_ok);
@@ -400,7 +402,7 @@ static void test_graph() {
   g.refresh();
   CHECK(g.serial() > before);
   CHECK(g.playback_count() == 3);
-  CHECK(count_type(g, ObjectType::Link) == 6 && count_type(g, ObjectType::Port) == 4 + 6);
+  CHECK(count_type(g, ObjectType::Link) == 6 && count_type(g, ObjectType::Port) == 6 + 6);
   bool native_seen = false;
   g.for_each([&](const GraphObject& o) {
     if (o.native.get() == native.get()) native_seen = o.client == g.native_client_id() && o.props.get("application.name") == StringView("Media Player");
@@ -1809,14 +1811,16 @@ struct ExportedNode {
 };
 
 // (latency, rate, channels: what the update's props and EnumFormat say of the stream, as pw_stream sends them; 0 / nullptr: not said)
+using Props = std::vector<std::pair<std::string, std::string>>;
 static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_class, uint32_t direction, const char* latency = nullptr, uint32_t rate = 0,
-                                uint32_t channels = 0) {
+                                uint32_t channels = 0, const Props& extra = {}) {
   ExportedNode e;
   e.id = id;
   c.send(0, 6, [&](pod::Builder& b) {      // create_object
     b.string("client-node"); b.string("PipeWire:Interface:ClientNode"); b.int32(6);
     const uint64_t d = b.begin_struct();
-    b.int32(2); b.string("media.class"); b.string(media_class); b.string("application.name"); b.string("pw-test");
+    b.int32(2 + int32_t(extra.size())); b.string("media.class"); b.string(media_class); b.string("application.name"); b.string("pw-test");
+    for (const auto& kv : extra) { b.string(StringView(kv.first.c_str())); b.string(StringView(kv.second.c_str())); }
     b.end(d);
     b.int32(int32_t(id));
   });
@@ -2450,6 +2454,917 @@ static void test_threads() {
   CHECK(service.stream_count() == 0 && g.playback_count() == 0);
 }
 
+// ---- MIDI: the bus, its messages and UMP -------------------------------------------------------------------------------------------------------------
+
+struct FakeMidiSink final : midi::IMidiSink {
+  std::mutex m;
+  std::vector<std::array<uint8_t, 3>> got;
+  void send(uint8_t status, uint8_t d1, uint8_t d2) override { std::lock_guard<std::mutex> g(m); got.push_back({status, d1, d2}); }
+  void reset() override {}
+  size_t count() { std::lock_guard<std::mutex> g(m); return got.size(); }
+};
+
+static void test_midi_bus() {
+  // raw bytes: running status, system exclusive skipped, real time inside a message, a cut-short message dropped
+  const uint8_t bytes[] = {0x90, 60, 100, 62, 90, 0xF0, 1, 2, 3, 0xF7, 0xB0, 7, 0xF8, 64, 0xC2, 5, 0xE0, 0x10};
+  std::vector<MidiMessage> seen;
+  const uint32_t n = parse_midi_bytes(ConstByteView(bytes, sizeof bytes), [&](const MidiMessage& m) { seen.push_back(m); });
+  CHECK(n == 5 && seen.size() == 5);
+  if (seen.size() == 5) {
+    CHECK(seen[0].bytes[0] == 0x90 && seen[0].bytes[1] == 60 && seen[0].bytes[2] == 100 && seen[0].size == 3);
+    CHECK(seen[1].bytes[0] == 0x90 && seen[1].bytes[1] == 62 && seen[1].bytes[2] == 90);      // (running status)
+    CHECK(seen[2].bytes[0] == 0xF8 && seen[2].size == 1);                                    // (clock, in the middle of the controller)
+    CHECK(seen[3].bytes[0] == 0xB0 && seen[3].bytes[1] == 7 && seen[3].bytes[2] == 64);
+    CHECK(seen[4].bytes[0] == 0xC2 && seen[4].bytes[1] == 5 && seen[4].size == 2);
+  }
+  CHECK(midi_message_size(0xF0) == 0 && midi_message_size(0x40) == 0 && midi_message_size(0xF2) == 3 && midi_message_size(0xD3) == 2);
+  // UMP: MIDI 1.0 channel voice, system, MIDI 2.0 channel voice scaled down; round trips
+  MidiMessage m;
+  const uint32_t w1[1] = {0x20903C40};
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(w1, 1), &m) && m.bytes[0] == 0x90 && m.bytes[1] == 0x3C && m.bytes[2] == 0x40 && m.size == 3);
+  CHECK(midi_to_ump(m) == 0x20903C40);
+  const uint32_t sys[1] = {0x10F80000};
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(sys, 1), &m) && m.bytes[0] == 0xF8 && m.size == 1);
+  const uint32_t v2[2] = {0x40913C00, 0xFFFF0000};      // note on, velocity 65535 -> 127
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(v2, 2), &m) && m.bytes[0] == 0x91 && m.bytes[1] == 0x3C && m.bytes[2] == 127);
+  const uint32_t v2zero[2] = {0x40913C00, 0x00000000};      // (a MIDI 2.0 note on of velocity 0 is still a note on)
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(v2zero, 2), &m) && m.bytes[2] == 1);
+  const uint32_t bend[2] = {0x40E00000, 0x80000000};      // the middle: 8192
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(bend, 2), &m) && m.bytes[1] == 0 && m.bytes[2] == 0x40);
+  const uint32_t prog[2] = {0x40C50000, 0x2A000000};
+  CHECK(ump_to_midi(ArrayView<const uint32_t>(prog, 2), &m) && m.bytes[0] == 0xC5 && m.bytes[1] == 0x2A && m.size == 2);
+  const uint32_t data64[2] = {0x30160102, 0x03040506};      // (a SysEx7 packet: not MIDI 1.0)
+  CHECK(!ump_to_midi(ArrayView<const uint32_t>(data64, 2), &m) && ump_packet_words(0x30000000) == 2 && ump_packet_words(0xF0000000) == 4);
+  CHECK(!ump_to_midi(ArrayView<const uint32_t>(v2, 1), &m));      // (cut short)
+  // every truncation and bit flips of bytes: no crash, never more messages than bytes
+  std::mt19937 rng(5);
+  for (int round = 0; round < 3000; ++round) {
+    std::vector<uint8_t> b(bytes, bytes + sizeof bytes);
+    if (round % 2) b.resize(rng() % (b.size() + 1));
+    else for (int k = 0; k < 3; ++k) b[rng() % b.size()] ^= uint8_t(1u << (rng() % 8));
+    uint32_t count = 0;
+    parse_midi_bytes(ConstByteView(b.data(), b.size()), [&](const MidiMessage& x) { ++count; CHECK(x.size >= 1 && x.size <= 3); });
+    CHECK(count <= b.size());
+    uint32_t words[4] = {uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), uint32_t(rng())};
+    MidiMessage u;
+    if (ump_to_midi(ArrayView<const uint32_t>(words, 1 + rng() % 4), &u)) CHECK(u.size >= 1 && u.size <= 3 && u.bytes[0] >= 0x80);
+  }
+  // the bus: a program's notes to the output and the other programs, not back to itself; a keyboard's to the programs only
+  MidiBus bus(A);
+  FakeMidiSink out;
+  bus.set_output(&out);
+  SharedPointer<MidiQueue> a = bus.listen(10), b = bus.listen(20);
+  CHECK(a && b);
+  MidiMessage note;
+  note.bytes[0] = 0x90; note.bytes[1] = 64; note.bytes[2] = 80; note.size = 3; note.source = 10;
+  bus.publish(note);
+  MidiMessage got;
+  CHECK(out.count() == 1 && !a->pop(&got) && b->pop(&got) && got.bytes[1] == 64 && got.source == 10);
+  bus.send(0x80, 64, 0);
+  CHECK(out.count() == 1 && a->pop(&got) && got.bytes[0] == 0x80 && b->pop(&got));
+  // a queue holds at most kMaxMessages: the oldest go, counted
+  for (uint32_t i = 0; i < MidiQueue::kMaxMessages + 10; ++i) bus.send(0x90, uint8_t(i & 0x7F), 1);
+  CHECK(a->waiting() == MidiQueue::kMaxMessages && a->lost() == 10);
+  bus.unlisten(a.get());
+  bus.send(0x90, 1, 1);
+  CHECK(a->waiting() == MidiQueue::kMaxMessages);
+  // (a status byte that is not a message is not sent)
+  bus.send(0x40, 1, 1);
+  CHECK(b->waiting() == MidiQueue::kMaxMessages);
+  bus.set_output(nullptr);
+}
+
+// The bus from several threads: programs playing, a keyboard, listeners reading; every message a listener hears arrives whole and in its sender's order.
+static void test_midi_threads() {
+  MidiBus bus(A);
+  FakeMidiSink out;
+  bus.set_output(&out);
+  constexpr int kPlayers = 3, kNotes = 2000;
+  std::vector<SharedPointer<MidiQueue>> queues;
+  for (int i = 0; i < 4; ++i) queues.push_back(bus.listen(uint32_t(100 + i)));
+  std::atomic<bool> done{false};
+  std::atomic<int> bad{0};
+  std::vector<std::thread> threads;
+  for (int p = 0; p < kPlayers; ++p)
+    threads.emplace_back([&, p] {
+      for (int i = 0; i < kNotes; ++i) {
+        MidiMessage m;
+        m.bytes[0] = uint8_t(0x90 | p); m.bytes[1] = uint8_t(i & 0x7F); m.bytes[2] = uint8_t((i >> 7) & 0x7F); m.size = 3;
+        m.source = uint32_t(100 + p);
+        bus.publish(m);
+      }
+    });
+  threads.emplace_back([&] { for (int i = 0; i < kNotes; ++i) bus.send(0xB0, 1, uint8_t(i & 0x7F)); });
+  std::vector<std::thread> readers;
+  std::atomic<long> heard{0};
+  for (int q = 0; q < 4; ++q)
+    readers.emplace_back([&, q] {
+      int last[kPlayers];
+      for (int& l : last) l = -1;
+      MidiMessage m;
+      for (;;) {
+        const bool finished = done.load();
+        while (queues[size_t(q)]->pop(&m)) {
+          ++heard;
+          if ((m.bytes[0] & 0xF0) != 0x90) continue;
+          const int p = m.bytes[0] & 0x0F;
+          const int i = m.bytes[1] | m.bytes[2] << 7;
+          if (p >= kPlayers || i <= last[p] || m.source == uint32_t(100 + q)) ++bad;
+          last[p] = i;
+        }
+        if (finished) break;
+        std::this_thread::yield();
+      }
+    });
+  for (std::thread& t : threads) t.join();
+  done = true;
+  for (std::thread& t : readers) t.join();
+  CHECK(bad == 0 && out.count() == size_t(kPlayers * kNotes) && bus.published() == uint64_t(kPlayers * kNotes));
+  long lost = 0;
+  for (auto& q : queues) lost += long(q->lost());
+  long expected = 0;      // (each listener hears the keyboard and every player but itself)
+  for (int q = 0; q < 4; ++q) expected += long((q < kPlayers ? kPlayers - 1 : kPlayers) * kNotes + kNotes);
+  CHECK(heard + lost == expected);
+  bus.set_output(nullptr);
+}
+
+// ---- video: the channel a producer publishes on -------------------------------------------------------------------------------------------------------
+
+static void test_video_channel() {
+  VideoChannel ch(A);
+  std::vector<uint8_t> rows(3 * 300, 0);
+  CHECK(!ch.publish(ConstByteView(rows.data(), rows.size()), 256, 0));      // (no format yet)
+  VideoFormat f;
+  f.format = 12; f.width = 64; f.height = 3; f.rate_num = 30; f.rate_den = 1;
+  CHECK(f.valid() && f.row_bytes() == 256 && f.frame_bytes() == 768);
+  ch.set_format(f);
+  for (size_t y = 0; y < 3; ++y) for (size_t x = 0; x < 256; ++x) rows[y * 300 + x] = uint8_t(y * 10 + x % 7);
+  CHECK(!ch.publish(ConstByteView(rows.data(), 2 * 300 + 255), 300, 0));      // (the last row cut short)
+  CHECK(!ch.publish(ConstByteView(rows.data(), rows.size()), 200, 0));        // (a stride shorter than a row)
+  CHECK(ch.publish(ConstByteView(rows.data(), 2 * 300 + 256), 300, 77));
+  SharedPointer<VideoFrame> frame = ch.latest();
+  CHECK(frame && frame->sequence == 1 && frame->pts == 77 && frame->pixels.size() == 768);
+  if (frame) CHECK(frame->pixels.view()[256 + 5] == uint8_t(10 + 5 % 7) && frame->pixels.view()[512 + 255] == uint8_t(20 + 255 % 7));
+  VideoFormat bad = f;
+  bad.format = 2;      // (I420: not carried)
+  CHECK(!bad.valid());
+  bad = f; bad.width = 9000;
+  CHECK(!bad.valid());
+  ch.close();
+  CHECK(ch.closed() && !ch.publish(ConstByteView(rows.data(), rows.size()), 300, 0) && ch.frames() == 1);
+  // a producer and watchers at once: each frame a watcher takes is whole (every byte its sequence's)
+  VideoChannel live(A);
+  VideoFormat big;
+  big.format = 8; big.width = 320; big.height = 240;
+  live.set_format(big);
+  std::atomic<bool> done{false};
+  std::atomic<int> torn{0}, taken{0};
+  std::thread producer([&] {
+    std::vector<uint8_t> px(big.frame_bytes());
+    for (int i = 1; i <= 300; ++i) {
+      memset(px.data(), i & 0xFF, px.size());
+      live.publish(ConstByteView(px.data(), px.size()), big.row_bytes(), i);
+    }
+    done = true;
+  });
+  std::vector<std::thread> watchers;
+  for (int w = 0; w < 3; ++w)
+    watchers.emplace_back([&] {
+      uint64_t seen = 0;
+      while (!done.load() || seen < live.frames()) {
+        SharedPointer<VideoFrame> fr = live.latest();
+        if (!fr || fr->sequence == seen) { std::this_thread::yield(); continue; }
+        if (fr->sequence < seen) ++torn;
+        seen = fr->sequence;
+        const uint8_t want = uint8_t(fr->pts & 0xFF);
+        for (uint8_t byte : fr->pixels.view()) if (byte != want) { ++torn; break; }
+        ++taken;
+      }
+    });
+  producer.join();
+  for (std::thread& t : watchers) t.join();
+  CHECK(torn == 0 && taken > 0 && live.frames() == 300);
+}
+
+// ---- client-node: metadata, client-allocated buffers, drivers, MIDI, video, filters, the adapter ------------------------------------------------------
+
+static std::atomic<uint64_t> g_now_ns{1000000000ull};
+static uint64_t test_clock() { return g_now_ns.load(); }
+
+// What the server has told a client node, gathered from its messages.
+struct NodeView {
+  struct Buf { uint32_t mem = 0, off = 0, size = 0; std::vector<std::pair<uint32_t, uint32_t>> metas; uint32_t dtype = 0; int32_t data = 0, dflags = 0, mapoff = 0, maxsize = 0; };
+  struct PortView { std::vector<uint8_t> format; bool use = false; int32_t flags = 0; std::vector<Buf> bufs; Fd io; uint32_t io_off = 0; uint32_t peer = 0; };
+  uint32_t id = 0, node = 0, activation_mem = 0;
+  std::map<uint32_t, Fd> mems;
+  Fd activation, wake;
+  int config_mode = -1;
+  bool config_format = false;
+  std::map<std::pair<int, int>, PortView> ports;
+  std::map<uint32_t, std::tuple<uint32_t, uint32_t, uint32_t>> set_io;      // area -> mem, offset, size
+  int starts = 0, pauses = 0, errors = 0;
+  uint64_t next_fd = 0;
+  void absorb(NativeClient& c) {
+    next_fd = c.fds.size();      // (this take's descriptors are the ones it adds)
+    std::vector<NativeMessage> msgs = c.take_with_fds();
+    for (NativeMessage& m : msgs) {
+      std::vector<Fd> own(c.fds.begin() + long(next_fd), c.fds.begin() + long(next_fd + m.n_fds));
+      next_fd += m.n_fds;
+      pod::Parser p = args_of(m);
+      if (m.id == 0 && m.opcode == 6) {
+        int32_t mem = 0; uint32_t type = 0; int64_t fd = -1; pod::Value v;
+        p.int32(&mem); p.id(&type); p.next(&v); v.get_fd(&fd);
+        if (fd >= 0 && size_t(fd) < own.size()) mems[uint32_t(mem)] = own[size_t(fd)];
+      }
+      if (m.id == 0 && m.opcode == 3) {      // error
+        int32_t eid = 0; p.int32(&eid);
+        if (uint32_t(eid) == id) ++errors;
+      }
+      if (m.id == 0 && (m.opcode == 8 || m.opcode == 5)) { int32_t pid = 0, nid = 0; if (p.int32(&pid) && p.int32(&nid) && uint32_t(pid) == id) node = uint32_t(nid); }
+      if (m.id != id) continue;
+      switch (m.opcode) {
+        case 0: {
+          pod::Value r, w; int32_t mem = 0, off = 0, size = 0; int64_t rf = -1;
+          if (p.next(&r) && p.next(&w) && p.int32(&mem) && p.int32(&off) && p.int32(&size) && r.get_fd(&rf) && rf >= 0 && size_t(rf) < own.size()) {
+            wake = own[size_t(rf)];
+            activation = mems[uint32_t(mem)];
+            activation_mem = uint32_t(mem);
+          }
+          break;
+        }
+        case 1: {
+          uint32_t pid = 0; int32_t flags = 0; pod::Value obj; pod::ObjectReader o;
+          if (p.id(&pid) && p.int32(&flags) && p.pod(&obj) && o.open(obj) && pid == 11) {
+            uint32_t key = 0, f = 0, mode = 0; pod::Value v;
+            while (o.next(&key, &f, &v)) { if (key == 2) v.get_id(&mode); if (key == 5) config_format = true; }
+            config_mode = int(mode);
+          }
+          break;
+        }
+        case 2: { uint32_t area = 0; int32_t mem = 0, off = 0, size = 0; if (p.id(&area) && p.int32(&mem) && p.int32(&off) && p.int32(&size)) set_io[area] = {uint32_t(mem), uint32_t(off), uint32_t(size)}; break; }
+        case 4: {
+          pod::Value obj; pod::ObjectReader o;
+          if (p.pod(&obj) && o.open(obj)) { if (o.object_id() == 2) ++starts; if (o.object_id() == 1) ++pauses; }
+          break;
+        }
+        case 7: {
+          int32_t dir = 0, port = 0; uint32_t pid = 0; int32_t flags = 0; pod::Value v;
+          if (p.int32(&dir) && p.int32(&port) && p.id(&pid) && p.int32(&flags) && p.pod(&v) && pid == 4) ports[{dir, port}].format.assign(v.whole.data(), v.whole.data() + v.whole.size());
+          break;
+        }
+        case 8: {
+          int32_t dir, port, mix, flags, n;
+          if (!p.int32(&dir) || !p.int32(&port) || !p.int32(&mix) || !p.int32(&flags) || !p.int32(&n)) break;
+          PortView& pv = ports[{dir, port}];
+          pv.use = true; pv.flags = flags; pv.bufs.clear();
+          for (int32_t i = 0; i < n; ++i) {
+            Buf b; int32_t mem, off, size, nm, nd;
+            if (!p.int32(&mem) || !p.int32(&off) || !p.int32(&size) || !p.int32(&nm)) break;
+            b.mem = uint32_t(mem); b.off = uint32_t(off); b.size = uint32_t(size);
+            for (int32_t k = 0; k < nm; ++k) { uint32_t t = 0; int32_t sz = 0; p.id(&t); p.int32(&sz); b.metas.push_back({t, uint32_t(sz)}); }
+            if (!p.int32(&nd) || !p.id(&b.dtype) || !p.int32(&b.data) || !p.int32(&b.dflags) || !p.int32(&b.mapoff) || !p.int32(&b.maxsize)) break;
+            pv.bufs.push_back(b);
+          }
+          break;
+        }
+        case 9: {
+          int32_t dir, port, mix, mem, off, size; uint32_t area;
+          if (p.int32(&dir) && p.int32(&port) && p.int32(&mix) && p.id(&area) && p.int32(&mem) && p.int32(&off) && p.int32(&size) && area == 1) {
+            ports[{dir, port}].io = mems[uint32_t(mem)];
+            ports[{dir, port}].io_off = uint32_t(off);
+          }
+          break;
+        }
+        case 11: { int32_t dir, port, mix, peer; if (p.int32(&dir) && p.int32(&port) && p.int32(&mix) && p.int32(&peer)) ports[{dir, port}].peer = uint32_t(peer); break; }
+        default: break;
+      }
+    }
+  }
+  ByteView buffer(int dir, int port, uint32_t i) {
+    Buf& b = ports[{dir, port}].bufs[i];
+    return mems[b.mem]->memory().subview(b.off, b.size);
+  }
+  ByteView io(int dir, int port) { PortView& pv = ports[{dir, port}]; return pv.io->memory().subview(pv.io_off, 8); }
+};
+
+static void create_node(NativeClient& c, uint32_t id, const Props& props) {
+  c.send(0, 6, [&](pod::Builder& b) {
+    b.string("client-node"); b.string("PipeWire:Interface:ClientNode"); b.int32(6);
+    const uint64_t d = b.begin_struct();
+    b.int32(int32_t(props.size()));
+    for (const auto& kv : props) { b.string(StringView(kv.first.c_str())); b.string(StringView(kv.second.c_str())); }
+    b.end(d);
+    b.int32(int32_t(id));
+  });
+}
+static void node_update(NativeClient& c, uint32_t id) {
+  c.send(id, 2, [&](pod::Builder& b) {
+    b.int32(3); b.int32(0);
+    const uint64_t i = b.begin_struct();
+    b.int32(0); b.int32(1); b.int64(7); b.int64(0); b.int32(0); b.int32(0);
+    b.end(i);
+  });
+}
+static void set_active(NativeClient& c, uint32_t id, bool on) { c.send(id, 4, [&](pod::Builder& b) { b.boolean(on); }); }
+// A port's info: its flags and properties.
+static void port_info(pod::Builder& b, uint64_t flags, const Props& props) {
+  const uint64_t i = b.begin_struct();
+  b.int64(0xF); b.int64(int64_t(flags)); b.int32(0); b.int32(1);
+  b.int32(int32_t(props.size()));
+  for (const auto& kv : props) { b.string(StringView(kv.first.c_str())); b.string(StringView(kv.second.c_str())); }
+  b.int32(0);
+  b.end(i);
+}
+static void enum_control(pod::Builder& b) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(6); b.property(2); b.id(0x60001);
+  b.end(o);
+}
+static void enum_dsp_audio(pod::Builder& b) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(1); b.property(2); b.id(2); b.property(0x10001); b.id(0x203);      // (F32P)
+  b.end(o);
+}
+// A video EnumFormat: BGRA, a size range around `w` x `h`, 25 frames a second.
+static void enum_video(pod::Builder& b, uint32_t w, uint32_t h, bool choice_of_formats = false) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(2); b.property(2); b.id(1);
+  b.property(0x20001);
+  if (choice_of_formats) { const uint64_t ch = b.begin_choice(3, pod::kId); b.choice_value32(12); b.choice_value32(12); b.choice_value32(11); b.end(ch); }
+  else b.id(12);
+  b.property(0x20003);
+  {
+    ByteBuffer rect(A);      // a Choice (Range) of Rectangles: default, min, max
+    rect.put32(16 + 24); rect.put32(pod::kChoice); rect.put32(1); rect.put32(0); rect.put32(8); rect.put32(pod::kRectangle);
+    rect.put32(w); rect.put32(h); rect.put32(1); rect.put32(1); rect.put32(4096); rect.put32(4096);
+    b.raw(rect.view());
+  }
+  b.property(0x20004); b.fraction(25, 1);
+  b.end(o);
+}
+static void buffers_param(pod::Builder& b, int32_t count, int32_t size, int32_t stride, uint32_t types) {
+  const uint64_t o = b.begin_object(0x40004, 5);
+  b.property(1); b.int32(count);
+  b.property(3); b.int32(size);
+  if (stride) { b.property(4); b.int32(stride); }
+  if (types) { b.property(6); const uint64_t ch = b.begin_choice(4, pod::kInt); b.choice_value32(types); b.end(ch); }
+  b.end(o);
+}
+static void meta_param(pod::Builder& b, uint32_t type, int32_t size) {
+  const uint64_t o = b.begin_object(0x40005, 6);
+  b.property(1); b.id(type); b.property(2); b.int32(size);
+  b.end(o);
+}
+// A Sequence of MIDI controls: raw bytes (SPA_CONTROL_Midi) and UMP words (SPA_CONTROL_UMP).
+static std::vector<uint8_t> sequence(const std::vector<std::vector<uint8_t>>& midi, const std::vector<uint32_t>& ump) {
+  ByteBuffer body(A);
+  body.put32(0); body.put32(0);
+  for (const auto& m : midi) {
+    body.put32(0); body.put32(2); body.put32(uint32_t(m.size())); body.put32(pod::kBytes);
+    body.append(ConstByteView(m.data(), m.size()));
+    body.put_zeros((8 - m.size() % 8) % 8);
+  }
+  for (uint32_t w : ump) { body.put32(0); body.put32(4); body.put32(4); body.put32(pod::kBytes); body.put32(w); body.put32(0); }
+  std::vector<uint8_t> out;
+  ByteBuffer pod(A);
+  pod.put32(uint32_t(body.size())); pod.put32(pod::kSequence); pod.append(body.view());
+  out.assign(pod.view().data(), pod.view().data() + pod.size());
+  return out;
+}
+static void put_bytes(ByteView m, uint64_t at, const void* src, size_t n) { memcpy(m.data() + at, src, n); }
+
+static void test_client_node_media() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  NativeServer server(g, A, &test_clock);
+  FakeMaker maker;
+  server.set_descriptor_maker(&maker);
+  FakeMidiSink synth;
+  g.midi_bus().set_output(&synth);
+  auto tick = [&](uint64_t ms = 5) { g_now_ns += ms * 1000000ull; server.tick(); };
+
+  // ---- MIDI out: a raw node (its port came before it was active: no PortConfig), its Format the port's own, cycles on the server's clock
+  NativeClient c(server);
+  c.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+  c.take_with_fds();
+  NodeView mo;
+  mo.id = 3;
+  create_node(c, 3, {{"media.class", "Stream/Output/Midi"}, {"media.type", "Midi"}, {"application.name", "pw-midiplay"}});
+  mo.absorb(c);
+  c.send(3, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_control(b); port_info(b, 0, {{"format.dsp", "8 bit raw midi"}}); });
+  node_update(c, 3);
+  set_active(c, 3, true);
+  mo.absorb(c);
+  CHECK(mo.config_mode == -1 && mo.node != 0 && !mo.ports[{1, 0}].format.empty());
+  CHECK(mo.set_io.count(3) && mo.set_io.count(7) && std::get<0>(mo.set_io[7]) == mo.activation_mem && std::get<1>(mo.set_io[7]) == 560);      // clock, position
+  bool midi_node = false;
+  g.visit(mo.node, [&](const GraphObject& o) { midi_node = o.role == NodeRole::MidiStream && o.props.get("media.class") == StringView("Stream/Output/Midi"); });
+  CHECK(midi_node);
+  c.send(3, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); enum_control(b); buffers_param(b, 2, 4096, 0, 0); b.none(); });
+  mo.absorb(c);
+  CHECK(mo.ports[{1, 0}].use && mo.ports[{1, 0}].bufs.size() == 2 && mo.starts == 1 && mo.ports[{1, 0}].peer == g.midi_bridge_id());
+  // ---- MIDI in (another node, UMP): hears the first one and keyboards
+  NodeView mi;
+  mi.id = 4;
+  create_node(c, 4, {{"media.class", "Midi/Sink"}, {"application.name", "pw-midirecord"}});
+  c.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_control(b); port_info(b, 0, {{"control.ump", "true"}}); });
+  set_active(c, 4, true);
+  mi.absorb(c);
+  c.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 4096, 0, 0); b.none(); });
+  mi.absorb(c);
+  CHECK(mi.node && mi.starts == 1 && mi.config_mode == -1);
+  if (mo.starts && mi.starts) {
+    put_u32(mo.activation->memory(), 0, 3);
+    put_u32(mi.activation->memory(), 0, 3);
+    tick();
+    CHECK(u32_at(mo.activation->memory(), 0) == 1 && mo.wake->take_signals() == 1);      // (triggered on the clock)
+    const std::vector<uint8_t> seq = sequence({{0x90, 60, 100, 62, 90}, {0x80, 60, 0}}, {0x20903E50});
+    ByteView buf = mo.buffer(1, 0, 1);
+    const uint32_t data_off = uint32_t(mo.ports[{1, 0}].bufs[1].data);
+    put_bytes(buf, data_off, seq.data(), seq.size());
+    put_u32(buf, 0, 0); put_u32(buf, 4, uint32_t(seq.size()));
+    put_u32(mo.io(1, 0), 0, 2); put_u32(mo.io(1, 0), 4, 1);
+    put_u32(mo.activation->memory(), 0, 3);
+    tick();
+    CHECK(synth.count() == 4);
+    if (synth.count() == 4) CHECK(synth.got[0][0] == 0x90 && synth.got[1][1] == 62 && synth.got[2][0] == 0x80 && synth.got[3][1] == 0x3E);
+    CHECK(u32_at(mo.io(1, 0), 0) == 1 && u32_at(mo.io(1, 0), 4) == 1);      // (handed back)
+    g.midi_bus().send(0x90, 70, 30);      // a keyboard
+    CHECK(synth.count() == 4);            // (a keyboard's notes are sounded by its own service, not the bus's output)
+    // the listener's cycles (each its own buffer): what the bus brought, gathered (the first may have come before the notes did)
+    std::vector<MidiMessage> heard;
+    for (int i = 0; i < 12; ++i) {
+      tick(25);
+      if (u32_at(mi.activation->memory(), 0) != 1) continue;
+      const uint32_t id = u32_at(mi.io(0, 0), 4);
+      CHECK(u32_at(mi.io(0, 0), 0) == 2 && id < 2);
+      if (id < 2) {
+        ByteView in = mi.buffer(0, 0, id);
+        const uint32_t off = uint32_t(mi.ports[{0, 0}].bufs[id].data), size = u32_at(in, 4);
+        CHECK(size >= 16 && size < 4096);
+        // (the server writes UMP controls to a UMP port)
+        const uint8_t* d = in.data() + off;
+        for (uint32_t at = 16; at + 24 <= size; at += 24) {
+          uint32_t ctl, w; memcpy(&ctl, d + at + 4, 4); memcpy(&w, d + at + 16, 4);
+          MidiMessage m; const uint32_t words[1] = {w};
+          if (ctl == 4 && ump_to_midi(ArrayView<const uint32_t>(words, 1), &m)) heard.push_back(m);
+        }
+      }
+      put_u32(mi.io(0, 0), 0, 1);
+      put_u32(mi.activation->memory(), 0, 3);
+    }
+    CHECK(heard.size() == 5);
+    if (heard.size() == 5) CHECK(heard[0].bytes[1] == 60 && heard[3].bytes[1] == 0x3E && heard[4].bytes[1] == 70);
+  }
+  c.send(0, 7, [](pod::Builder& b) { b.int32(3); });
+  c.send(0, 7, [](pod::Builder& b) { b.int32(4); });
+  c.take_with_fds();
+  CHECK(g.midi_bus().published() >= 3);
+
+  // ---- video: a driver producer with metadata (it runs its own cycles; the server takes what its io says)
+  NodeView vp;
+  vp.id = 5;
+  create_node(c, 5, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"application.name", "video-src"}, {"node.name", "test-camera"}});
+  node_update(c, 5);
+  set_active(c, 5, true);
+  vp.absorb(c);
+  CHECK(vp.config_mode == 1 && !vp.config_format && vp.node);      // (passthrough: the stream's own port)
+  c.send(5, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 64, 8); port_info(b, 0, {}); });
+  vp.absorb(c);
+  VideoFormat fixed;
+  if (!vp.ports[{1, 0}].format.empty()) {
+    pod::Parser fp(ConstByteView(vp.ports[{1, 0}].format.data(), vp.ports[{1, 0}].format.size()));
+    pod::Value fv; pod::ObjectReader o;
+    if (fp.next(&fv) && o.open(fv)) {
+      uint32_t key, fl; pod::Value v;
+      while (o.next(&key, &fl, &v)) {
+        if (key == 0x20001) v.get_id(&fixed.format);
+        if (key == 0x20003 && v.type == pod::kRectangle) { ByteReader r(v.body); fixed.width = r.le32(); fixed.height = r.le32(); }
+        if (key == 0x20004 && v.type == pod::kFraction) { ByteReader r(v.body); fixed.rate_num = r.le32(); fixed.rate_den = r.le32(); }
+      }
+    }
+  }
+  CHECK(fixed.format == 12 && fixed.width == 64 && fixed.height == 8 && fixed.rate_num == 25);      // (the defaults of its choices)
+  c.send(5, 3, [](pod::Builder& b) {
+    b.int32(1); b.int32(0); b.int32(1); b.int32(3);
+    buffers_param(b, 2, 64 * 8 * 4, 256, (1u << 1) | (1u << 2)); meta_param(b, 1, 32); meta_param(b, 3, 64);
+    b.none();
+  });
+  vp.absorb(c);
+  NodeView::PortView& vpp = vp.ports[{1, 0}];
+  CHECK(vpp.use && vpp.bufs.size() == 2 && vp.starts == 1);
+  if (vpp.bufs.size() == 2) {
+    const NodeView::Buf& b0 = vpp.bufs[0];
+    CHECK(b0.metas.size() == 2 && b0.metas[0] == std::make_pair(1u, 32u) && b0.metas[1] == std::make_pair(3u, 64u) && b0.dtype == 1 && b0.maxsize >= 2048);
+    CHECK(b0.data >= 32 + 64 + 16);      // (the metadata, the chunk, then the data)
+  }
+  CHECK(u32_at(vp.activation->memory(), 12) == 1);      // (a driver's own trigger is required)
+  SharedPointer<VideoChannel> camera = g.video_of(vp.node);
+  CHECK(camera && camera->format().width == 64);
+  // ---- a watcher (another client): offered the producer's format, given its frames
+  NativeClient w(server);
+  w.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+  w.take_with_fds();
+  NodeView vw;
+  vw.id = 3;
+  create_node(w, 3, {{"media.class", "Stream/Input/Video"}, {"target.object", "test-camera"}});
+  node_update(w, 3);
+  set_active(w, 3, true);
+  vw.absorb(w);
+  CHECK(vw.config_mode == 1);
+  w.send(3, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 320, 240, true); port_info(b, 0, {}); });
+  vw.absorb(w);
+  CHECK(vw.ports[{0, 0}].format == vpp.format);      // (the producer's format, not its own default)
+  w.send(3, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 64 * 8 * 4, 256, 0); meta_param(b, 1, 32); b.none(); });
+  vw.absorb(w);
+  CHECK(vw.starts == 1 && vw.ports[{0, 0}].bufs.size() == 3);
+  if (vp.starts && vw.starts && vpp.bufs.size() == 2) {
+    put_u32(vw.activation->memory(), 0, 3);
+    tick();
+    CHECK(vw.wake->take_signals() == 0);      // (no frame yet)
+    // the producer's cycle: a frame in buffer 0 (rows of 256 bytes, each its row number), its header's pts, HAVE_DATA
+    ByteView b0 = vp.buffer(1, 0, 0);
+    const uint32_t d0 = uint32_t(vpp.bufs[0].data);
+    for (uint32_t y = 0; y < 8; ++y) memset(b0.data() + d0 + y * 256, int(y + 1), 256);
+    const uint32_t chunk_at = 96;      // (after the header and the damage)
+    put_u32(b0, chunk_at, 0); put_u32(b0, chunk_at + 4, 2048); put_u32(b0, chunk_at + 8, 256);
+    const int64_t pts = 4242;
+    memcpy(b0.data() + 8, &pts, 8);
+    put_u32(vp.io(1, 0), 0, 2); put_u32(vp.io(1, 0), 4, 0);
+    tick();
+    CHECK(camera->frames() == 1 && u32_at(vp.io(1, 0), 0) == 1 && u32_at(vp.io(1, 0), 4) == 0 && vp.wake->take_signals() == 0);
+    SharedPointer<VideoFrame> fr = camera->latest();
+    CHECK(fr && fr->pts == 4242 && fr->pixels.view()[0] == 1 && fr->pixels.view()[7 * 256] == 8);
+    tick(40);      // (the watcher: a new frame, so a cycle)
+    CHECK(vw.wake->take_signals() == 1 && u32_at(vw.io(0, 0), 0) == 2);
+    const uint32_t id = u32_at(vw.io(0, 0), 4);
+    if (id < 3) {
+      ByteView in = vw.buffer(0, 0, id);
+      const uint32_t off = uint32_t(vw.ports[{0, 0}].bufs[id].data);
+      CHECK(in.data()[off] == 1 && in.data()[off + 5 * 256 + 9] == 6 && u32_at(in, 32 + 4) == 2048 && u32_at(in, 32 + 8) == 256);
+      uint64_t seq = 99; memcpy(&seq, in.data() + 24, 8);
+      CHECK(seq == 0);      // (its first header)
+    }
+    put_u32(vw.io(0, 0), 0, 1);
+    put_u32(vw.activation->memory(), 0, 3);
+    tick(40);
+    tick(40);
+    CHECK(vw.wake->take_signals() == 0);      // (no new frame: no cycle)
+  }
+
+  // ---- client-allocated buffers: a port that can allocate (CAN_ALLOC_BUFFERS) and takes memfds gets buffers without data, then gives its own
+  NodeView va;
+  va.id = 6;
+  create_node(c, 6, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "alloc-camera"}});
+  node_update(c, 6);
+  set_active(c, 6, true);
+  c.send(6, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+  va.absorb(c);
+  c.send(6, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 512, 128, 1u << 2); meta_param(b, 1, 32); b.none(); });
+  va.absorb(c);
+  NodeView::PortView& vap = va.ports[{1, 0}];
+  CHECK(vap.use && vap.flags == 1 && vap.bufs.size() == 2 && va.starts == 0);
+  if (vap.bufs.size() == 2) CHECK(vap.bufs[0].dtype == (1u << 2) && vap.bufs[0].maxsize == 0 && vap.bufs[0].metas.size() == 1);
+  auto send_port_buffers = [&](std::vector<Fd> fds, std::vector<std::array<int32_t, 4>> datas) {      // type, fd index, mapoffset, maxsize
+    ByteBuffer body(A);
+    pod::Builder b(body);
+    const uint64_t f = b.begin_struct();
+    b.int32(1); b.int32(0); b.int32(-1); b.int32(int32_t(datas.size()));
+    for (const auto& d : datas) { b.int32(1); b.id(uint32_t(d[0])); b.fd(d[1]); b.int32(3); b.int32(d[2]); b.int32(d[3]); }
+    b.end(f);
+    ByteBuffer msg(A);
+    msg.put32(6); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(uint32_t(fds.size()));
+    msg.append(body.view());
+    List<Fd> list(A);
+    for (Fd& fd : fds) list.push_back(fd);
+    server.receive_with_fds(c.handle, msg.view(), list);
+  };
+  Fd own0 = Fd::make_as<FakeFd>(A, 4096, false), own1 = Fd::make_as<FakeFd>(A, 4096, false);
+  // refused: a descriptor that did not come, a buffer outside its memfd, a DMA-BUF
+  send_port_buffers({own0}, {{2, 0, 0, 512}, {2, 1, 0, 512}});
+  va.absorb(c);
+  send_port_buffers({own0, own1}, {{2, 0, 0, 512}, {2, 1, 3700, 512}});
+  va.absorb(c);
+  send_port_buffers({own0, own1}, {{3, 0, 0, 512}, {3, 1, 0, 512}});
+  va.absorb(c);
+  CHECK(va.errors == 3 && va.starts == 0);
+  send_port_buffers({own0, own1}, {{2, 0, 0, 512}, {2, 1, 1024, 512}});
+  va.absorb(c);
+  CHECK(va.errors == 3 && va.starts == 1);
+  if (va.starts && vap.bufs.size() == 2) {
+    // the client's frame is in its own memory (buffer 1: at 1024 of its second memfd)
+    ByteView mine = own1->memory();
+    for (uint32_t y = 0; y < 4; ++y) memset(mine.data() + 1024 + y * 128, int(0x40 + y), 128);
+    ByteView part1 = va.buffer(1, 0, 1);
+    put_u32(part1, 32, 0); put_u32(part1, 36, 512); put_u32(part1, 40, 128);
+    put_u32(va.io(1, 0), 0, 2); put_u32(va.io(1, 0), 4, 1);
+    tick();
+    SharedPointer<VideoChannel> ch = g.video_of(va.node);
+    SharedPointer<VideoFrame> fr = ch ? ch->latest() : SharedPointer<VideoFrame>();
+    CHECK(fr && fr->format.width == 32 && fr->pixels.view()[0] == 0x40 && fr->pixels.view()[3 * 128 + 127] == 0x43);
+  }
+  // a port_buffers for a port that was not asked to allocate is refused
+  {
+    ByteBuffer body(A);
+    pod::Builder b(body);
+    const uint64_t f = b.begin_struct();
+    b.int32(1); b.int32(0); b.int32(-1); b.int32(2);
+    b.end(f);
+    ByteBuffer msg(A);
+    msg.put32(5); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(0);
+    msg.append(body.view());
+    server.receive(c.handle, msg.view());
+    vp.absorb(c);
+    CHECK(vp.errors == 1);
+  }
+
+  // ---- an audio driver follows the server's clock: its position is an activation of the server's, and it is triggered as any other
+  {
+    NodeView ad;
+    ad.id = 7;
+    create_node(c, 7, {{"media.class", "Stream/Output/Audio"}, {"node.driver", "true"}});
+    node_update(c, 7);
+    set_active(c, 7, true);
+    ad.absorb(c);
+    CHECK(ad.config_mode == 2 && ad.set_io.count(7) && std::get<0>(ad.set_io[7]) != ad.activation_mem && ad.mems.count(std::get<0>(ad.set_io[7])));
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); build_format_param(b, 3, PcmFormat{SampleFormat::F32Le, 48000, 2}); b.none(); });
+    c.send(7, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 32768, 8, 0); b.none(); });
+    ad.absorb(c);
+    CHECK(ad.starts == 1);
+    put_u32(ad.activation->memory(), 0, 3);
+    tick();
+    CHECK(ad.wake->take_signals() == 1 && u32_at(ad.mems[std::get<0>(ad.set_io[7])]->memory(), 560 + 96) == 1024);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
+    c.take_with_fds();
+  }
+
+  // ---- an adapter's port that says no EnumFormat (as pwnodetest does) still gets the adapter's format, buffers and Start
+  {
+    NodeView an;
+    an.id = 9;
+    create_node(c, 9, {{"media.class", "Stream/Output/Audio"}});
+    node_update(c, 9);
+    set_active(c, 9, true);
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(0); b.none(); });
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); buffers_param(b, 3, 8192, 0, 0); b.none(); });
+    an.absorb(c);
+    CHECK(an.config_mode == 2 && !an.ports[{1, 0}].format.empty() && an.ports[{1, 0}].bufs.size() == 3 && an.starts == 1);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+    c.take_with_fds();
+  }
+
+  // ---- a pw_filter with two float outputs: what they play is put together into one stereo stream
+  {
+    NodeView fl;
+    fl.id = 8;
+    create_node(c, 8, {{"media.class", "Stream/Output/Audio"}, {"media.type", "Audio"}});
+    for (int port = 0; port < 2; ++port)
+      c.send(8, 3, [&](pod::Builder& b) { b.int32(1); b.int32(port); b.int32(3); b.int32(1); enum_dsp_audio(b); port_info(b, 0, {{"format.dsp", "32 bit float mono audio"}}); });
+    node_update(c, 8);
+    set_active(c, 8, true);
+    for (int port = 0; port < 2; ++port)
+      c.send(8, 3, [&](pod::Builder& b) { b.int32(1); b.int32(port); b.int32(1); b.int32(1); buffers_param(b, 2, 32768, 4, 0); b.none(); });
+    fl.absorb(c);
+    CHECK(fl.config_mode == -1 && fl.starts == 1 && fl.ports[{1, 0}].bufs.size() == 2 && fl.ports[{1, 1}].bufs.size() == 2);
+    if (fl.starts == 1 && fl.ports[{1, 1}].bufs.size() == 2) {
+      put_u32(fl.activation->memory(), 0, 3);
+      tick();
+      CHECK(fl.wake->take_signals() == 1);
+      for (int port = 0; port < 2; ++port) {
+        ByteView buf = fl.buffer(1, port, 0);
+        const uint32_t off = uint32_t(fl.ports[{1, port}].bufs[0].data);
+        const float v = port == 0 ? 0.25f : -0.25f;
+        for (uint32_t i = 0; i < 1024; ++i) memcpy(buf.data() + off + 4 * i, &v, 4);
+        put_u32(buf, 0, 0); put_u32(buf, 4, 4096);
+        put_u32(fl.io(1, port), 0, 2); put_u32(fl.io(1, port), 4, 0);
+      }
+      put_u32(fl.activation->memory(), 0, 3);
+      dev.take();
+      tick();
+      mixer.pump();
+      std::vector<int16_t> out = dev.take();
+      CHECK(out.size() > 400 && abs(out[200] - 8191) < 40 && abs(out[201] + 8191) < 40);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
+    c.take_with_fds();
+  }
+
+  // ---- the adapter: a virtual sink (support.null-audio-sink); a stream plays into it, another records what plays there
+  {
+    auto adapter = [&](NativeClient& cl, uint32_t id, const Props& props) {
+      cl.send(0, 6, [&](pod::Builder& b) {
+        b.string("adapter"); b.string("PipeWire:Interface:Node"); b.int32(3);
+        const uint64_t d = b.begin_struct();
+        b.int32(int32_t(props.size()));
+        for (const auto& kv : props) { b.string(StringView(kv.first.c_str())); b.string(StringView(kv.second.c_str())); }
+        b.end(d);
+        b.int32(int32_t(id));
+      });
+    };
+    NodeView ns;
+    ns.id = 30;
+    adapter(c, 30, {{"factory.name", "support.null-audio-sink"}, {"node.name", "my-sink"}, {"media.class", "Audio/Sink"}, {"audio.position", "FL,FR"}});
+    ns.absorb(c);
+    CHECK(ns.node && server.virtual_sinks() == 1);
+    bool virtual_ok = false;
+    g.visit(ns.node, [&](const GraphObject& o) { virtual_ok = o.role == NodeRole::Virtual && o.input_ports == 2 && o.output_ports == 2 && o.props.get("media.class") == StringView("Audio/Sink"); });
+    CHECK(virtual_ok && g.find_node("my-sink") == ns.node);
+    NodeView refused;
+    refused.id = 31;
+    adapter(c, 31, {{"factory.name", "api.alsa.pcm.sink"}});
+    refused.absorb(c);
+    CHECK(refused.errors == 1 && server.virtual_sinks() == 1);
+    const uint32_t playing_before = g.playback_count();
+    ExportedNode into = export_node(c, 32, "Stream/Output/Audio", 1, nullptr, 0, 0, {{"target.object", "my-sink"}});
+    ExportedNode from = export_node(c, 33, "Stream/Input/Audio", 0, nullptr, 0, 0, {{"target.object", "my-sink"}});
+    CHECK(into.ok && from.ok && g.playback_count() == playing_before);      // (not to the speakers)
+    bool linked = false;
+    g.visit(into.node, [&](const GraphObject& o) { linked = o.role == NodeRole::Linked && o.props.get("target.object") == StringView("my-sink"); });
+    CHECK(linked);
+    if (into.ok && from.ok) {
+      put_u32(into.activation->memory(), 0, 3);
+      put_u32(from.activation->memory(), 0, 3);
+      bool heard = false;
+      for (int round = 0; round < 60 && !heard; ++round) {
+        tick(10);
+        ByteView a = into.activation->memory();
+        if (u32_at(a, 0) == 1) {      // its cycle: 1024 frames of 0.3 / -0.3
+          const uint32_t id = round % 2;
+          const uint64_t base = uint64_t(id) * into.buffer_stride;
+          ByteView bufs = into.buffers->memory();
+          for (uint32_t i = 0; i < 1024; ++i) {
+            const float l = 0.3f, r = -0.3f;
+            memcpy(bufs.data() + base + into.data_offset + 8 * i, &l, 4);
+            memcpy(bufs.data() + base + into.data_offset + 8 * i + 4, &r, 4);
+          }
+          put_u32(bufs, base, 0); put_u32(bufs, base + 4, 8192);
+          put_u32(into.io->memory(), 0, 2); put_u32(into.io->memory(), 4, id);
+          put_u32(a, 0, 3);
+        }
+        ByteView fa = from.activation->memory();
+        if (u32_at(fa, 0) == 1) {
+          const uint32_t id = u32_at(from.io->memory(), 0);
+          (void)id;
+          const uint32_t bid = u32_at(from.io->memory(), 4);
+          if (bid < from.n_buffers) {
+            float l = 0, r = 0;
+            const uint64_t base = uint64_t(bid) * from.buffer_stride + from.data_offset;
+            memcpy(&l, from.buffers->memory().data() + base + 8 * 512, 4);
+            memcpy(&r, from.buffers->memory().data() + base + 8 * 512 + 4, 4);
+            heard = fabsf(l - 0.3f) < 0.001f && fabsf(r + 0.3f) < 0.001f;
+          }
+          put_u32(from.io->memory(), 0, 1);
+          put_u32(fa, 0, 3);
+        }
+      }
+      CHECK(heard);
+    }
+    // destroying the sink: its streams make and hear silence, nothing breaks
+    c.send(0, 7, [](pod::Builder& b) { b.int32(30); });
+    c.take_with_fds();
+    CHECK(server.virtual_sinks() == 0 && g.find_node("my-sink") == 0);
+    for (int i = 0; i < 5; ++i) tick(10);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(32); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(33); });
+    c.take_with_fds();
+    // a lingering one stays when its client goes (the kernel's then), one that does not goes
+    NativeClient l(server);
+    l.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+    l.take_with_fds();
+    adapter(l, 3, {{"factory.name", "support.null-audio-sink"}, {"node.name", "kept"}, {"object.linger", "true"}, {"audio.channels", "1"}});
+    adapter(l, 4, {{"factory.name", "support.null-audio-sink"}, {"node.name", "gone"}});
+    l.take_with_fds();
+    CHECK(server.virtual_sinks() == 2);
+    server.close_client(l.handle);
+    const uint32_t kept = g.find_node("kept");
+    uint32_t owner = 99;
+    g.visit(kept, [&](const GraphObject& o) { owner = o.client; });
+    CHECK(kept && owner == g.native_client_id() && g.find_node("gone") == 0 && server.virtual_sinks() == 1);
+  }
+
+  // ---- garbage: every truncation and bit flips of the new messages (port_update with metadata and info, port_buffers)
+  std::mt19937 rng(41);
+  for (int round = 0; round < 900; ++round) {
+    ByteBuffer body(A);
+    pod::Builder b(body);
+    const uint64_t f = b.begin_struct();
+    const uint32_t op = round % 3 == 0 ? 6u : 3u;
+    if (op == 3) {
+      b.int32(round % 2); b.int32(int32_t(rng() % 3)); b.int32(3); b.int32(3);
+      if (round % 3 == 1) enum_video(b, 1 + rng() % 64, 1 + rng() % 64); else enum_control(b);
+      buffers_param(b, int32_t(rng() % 20), int32_t(rng() % 100000), int32_t(rng() % 4096), uint32_t(rng() % 32));
+      meta_param(b, rng() % 10, int32_t(rng() % 200000));
+      port_info(b, rng() % 8, {{"control.ump", "true"}});
+    } else {
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(2);
+      for (int k = 0; k < 2; ++k) { b.int32(1); b.id(2); b.fd(k); b.int32(3); b.int32(int32_t(rng() % 8192)); b.int32(int32_t(rng() % 8192)); }
+    }
+    b.end(f);
+    std::vector<uint8_t> m(body.view().data(), body.view().data() + body.size());
+    if (round % 2) m.resize(rng() % (m.size() + 1));
+    else for (int k = 0; k < 3; ++k) m[rng() % m.size()] ^= uint8_t(1u << (rng() % 8));
+    ByteBuffer msg(A);
+    const uint32_t target = 5 + uint32_t(round % 2);
+    msg.put32(target); msg.put32(op << 24 | uint32_t(m.size())); msg.put32(0); msg.put32(op == 6 ? 2u : 0u);
+    msg.append(ConstByteView(m.data(), m.size()));
+    List<Fd> fds(A);
+    if (op == 6) { fds.push_back(Fd::make_as<FakeFd>(A, 4096, false)); fds.push_back(Fd::make_as<FakeFd>(A, 64, false)); }
+    server.receive_with_fds(c.handle, msg.view(), fds);
+    tick();
+    c.take_with_fds();
+  }
+  server.close_client(c.handle);
+  server.close_client(w.handle);
+  CHECK(server.client_count() == 0);
+  g.midi_bus().set_output(nullptr);
+}
+
+// ---- the transport takes descriptors from clients -----------------------------------------------------------------------------------------------------
+
+// A protocol that keeps what it was given (bytes and descriptors).
+struct CaptureProtocol final : IProtocolServer {
+  std::vector<uint8_t> bytes;
+  std::vector<Fd> fds;
+  uint32_t open_client(uint64_t) override { return 1; }
+  void receive(uint32_t, ConstByteView b) override { bytes.insert(bytes.end(), b.data(), b.data() + b.size()); }
+  void receive_with_fds(uint32_t client, ConstByteView b, List<Fd>& in) override {
+    for (Fd& f : in) fds.push_back(f);
+    in.clear();
+    receive(client, b);
+  }
+  bool take_output(uint32_t, ByteBuffer*) override { return false; }
+  void close_client(uint32_t) override {}
+  void tick() override {}
+  uint64_t tick_interval_us() const override { return 10000; }
+};
+
+static void test_socket_fds_in() {
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  CaptureProtocol proto;
+  const int live_before = A.live.load();
+  {
+    SocketServer server(sockets, A);
+    CHECK(server.listen(proto, "/run/user/0/capture-test", StringView(), nullptr));
+    uint32_t sock = 0;
+    CHECK(sockets.create(process::UnixType::Stream, 9, &sock) == process::UnixStatus::Ok);
+    sync.lock();
+    CHECK(sockets.connect_locked(sock, process::UnixName::from(process::UnixName::Kind::Abstract, StringView("/run/user/0/capture-test").bytes()), StringView(), 9) ==
+          process::UnixStatus::Ok);
+    sync.unlock();
+    server.pump();
+    // a memfd the client wrote into, and an eventfd
+    SharedPointer<process::OpenObject> object = SharedPointer<process::OpenObject>::make(A, A);
+    UniquePointer<process::MemoryFile> file = UniquePointer<process::MemoryFile>::make(A, A, true);
+    CHECK(file->resize(6000) == filesystem::Status::Ok);
+    uint64_t written = 0;
+    const char text[] = "client bytes";
+    CHECK(file->write(5000, ConstByteView(reinterpret_cast<const uint8_t*>(text), sizeof text), &written) == filesystem::Status::Ok);
+    object->memory = file.get();
+    object->file = util::move(file);
+    object->readable = object->writable = true;
+    uint32_t event = 0;
+    CHECK(sockets.create_event(0, 0, false, &event) == process::UnixStatus::Ok);
+    Queue<process::UnixInFlight> rights(A);
+    process::UnixInFlight mem;
+    mem.kind = process::DescriptorKind::File;
+    mem.object = object;
+    rights.enqueue(util::move(mem));
+    process::UnixInFlight ev;
+    ev.kind = process::DescriptorKind::UnixSocket;
+    ev.token = event;
+    rights.enqueue(util::move(ev));
+    sync.lock();
+    uint32_t sent = 0;
+    const uint8_t hello[4] = {1, 2, 3, 4};
+    CHECK(sockets.send_locked(sock, ConstByteView(hello, 4), nullptr, 9, &rights, &sent) == process::UnixStatus::Ok && sent == 4);
+    sync.unlock();
+    for (int i = 0; i < 3; ++i) server.pump();
+    CHECK(proto.bytes.size() == 4 && proto.fds.size() == 2);
+    if (proto.fds.size() == 2) {
+      ByteView m = proto.fds[0]->memory();
+      CHECK(m.size() == 6000 && memcmp(m.data() + 5000, text, sizeof text) == 0);      // (the file's bytes, as big as the file)
+      CHECK(proto.fds[1]->memory().empty() && proto.fds[1]->signal());
+      sync.lock();
+      uint64_t value = 0;
+      CHECK(sockets.event_take_locked(event, &value) == process::UnixStatus::Ok && value == 1);      // (the same eventfd)
+      sync.unlock();
+    }
+    proto.fds.clear();
+    object = SharedPointer<process::OpenObject>();
+    sockets.release(event);
+    sockets.release(sock);
+    for (int i = 0; i < 3; ++i) server.pump();
+  }
+  CHECK(A.live.load() <= live_before + 4);
+}
+
 int main() {
   test_pod();
   test_tagstruct();
@@ -2468,6 +3383,11 @@ int main() {
   test_sockets();
   test_socket_client_node();
   test_threads();
+  test_midi_bus();
+  test_midi_threads();
+  test_video_channel();
+  test_client_node_media();
+  test_socket_fds_in();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());
   return g_failed ? 1 : 0;
 }

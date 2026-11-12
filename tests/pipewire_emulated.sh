@@ -11,7 +11,10 @@
 # with SCM_RIGHTS, mmap, ppoll; 500 Hz, then recording the microphone): 300, 400 and 500 Hz must be in the mix at once.
 # A sixth run (x86-64, when the host has pw-cat) runs the host's real libpipewire: pw-cat (pw-play) and its libraries, SPA plugins, modules and
 # client.conf copied into the Linux tree, dynamically linked through glibc's ld.so. It plays a 500 Hz WAV next to the native stream (both must be in the
-# mix at once), then records 24000 frames of the microphone into a WAV that is copied out and checked (880 Hz left, 1320 Hz right).
+# mix at once), then records 24000 frames of the microphone into a WAV that is copied out and checked (880 Hz left, 1320 Hz right). Then pw-cat --midi
+# plays a MIDI file (all 12 notes must reach the server's synthesizer), and tests/linux/pwmedia.c (built against the host's libpipewire) runs each of its
+# modes: a driver camera and a watcher (video), the same with the camera's own memfd buffers (video-alloc), a pw_filter's MIDI heard by a pw_stream
+# (midi), and a virtual sink of the adapter factory played into by an audio driver and recorded from (adapter).
 # Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode|libpipewire]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
@@ -144,7 +147,9 @@ if { [ "$which" = all ] || [ "$which" = libpipewire ]; } && [ "$arch" = x86_64 ]
     pwcat=$(command -v pw-cat)
     extra=()
     for m in protocol-native client-node client-device adapter metadata rt session-manager; do extra+=("/usr/lib/pipewire-0.3/libpipewire-module-$m.so"); done
-    for l in support/libspa-support support/libspa-dbus support/libspa-journal audioconvert/libspa-audioconvert; do extra+=("/usr/lib/spa-0.2/$l.so"); done
+    for l in support/libspa-support support/libspa-dbus support/libspa-journal audioconvert/libspa-audioconvert videoconvert/libspa-videoconvert control/libspa-control; do
+      extra+=("/usr/lib/spa-0.2/$l.so")
+    done
     python3 - "$work/tone500.wav" <<'PY'
 import math, struct, sys
 r, n = 48000, 48000 * 3
@@ -155,6 +160,19 @@ PY
                for l in "${extra[@]}"; do [ -f "$l" ] && { ldd "$l" | awk '/=>/ { if ($3 ~ /^\//) print $3 }'; echo "$l"; }; done
                readelf -l "$pwcat" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'
                echo /usr/share/pipewire/client.conf; echo "$work/tone500.wav"; } | sort -u | paste -sd:)
+    have_pwmedia=0
+    if pkg-config --exists libpipewire-0.3; then
+      gcc -O1 -g -Wall -Wextra -o "$work/pwmedia" tests/linux/pwmedia.c $(pkg-config --cflags --libs libpipewire-0.3) -lm && have_pwmedia=1
+    fi
+    python3 - "$work/song.mid" <<'PY'
+import struct, sys
+ev = b"".join(b"\x00" + bytes([0x90, 60 + i, 100]) + b"\x60" + bytes([0x80, 60 + i, 0]) for i in range(12)) + b"\x00\xff\x2f\x00"
+open(sys.argv[1], "wb").write(b"MThd" + struct.pack(">IHHH", 6, 0, 1, 480) + b"MTrk" + struct.pack(">I", len(ev)) + ev)
+PY
+    files="$files:$work/song.mid"
+    if [ $have_pwmedia -eq 1 ]; then
+      files="$files:$( { ldd "$work/pwmedia" | awk '/=>/ { if ($3 ~ /^\//) print $3 }'; } | sort -u | paste -sd:)"
+    fi
     TCOS_EMU_TONES=300,500 TCOS_EMU_ARGS="--playback $work/tone500.wav" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$pwcat" "$work/sys32" > "$work/run-pwplay.out" 2>&1 || true
     grep -E "^\[E\]" "$work/run-pwplay.out" | grep -v mod.rt || true
     grep -E "^audio: native|exit=" "$work/run-pwplay.out"
@@ -189,6 +207,20 @@ ok = n == 24000 and ch == 2 and 7000 < l880 < 9000 and 3400 < r1320 < 4600 and l
 print("%s pw-record (libpipewire) recorded 880 Hz left %.0f, 1320 Hz right %.0f" % ("ok  " if ok else "FAIL", l880, r1320))
 sys.exit(0 if ok else 1)
 PY
+    # MIDI: pw-cat --midi plays a song of 12 notes; every one reaches the synthesizer
+    TCOS_EMU_ARGS="--playback --midi $work/song.mid" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$pwcat" "$work/sys32" > "$work/run-pwmidi.out" 2>&1 || true
+    grep -E "^midi:|exit=" "$work/run-pwmidi.out"
+    grep -q "\[exit=0 faulted=0" "$work/run-pwmidi.out" && grep -q "midi: 24 messages to the synthesizer, 12 note-ons" "$work/run-pwmidi.out" &&
+      echo "ok   pw-cat --midi (libpipewire) played its 12 notes on the synthesizer" || { echo "FAIL pw-cat --midi"; fail=1; }
+    if [ $have_pwmedia -eq 1 ]; then
+      for mode in video video-alloc midi adapter; do
+        TCOS_EMU_ARGS="$mode" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$work/pwmedia" "$work/sys32" > "$work/run-pwmedia-$mode.out" 2>&1 || true
+        grep -E "^pwmedia:|exit=" "$work/run-pwmedia-$mode.out"
+        grep -q "pwmedia: $mode ok" "$work/run-pwmedia-$mode.out" && grep -q "\[exit=0 faulted=0" "$work/run-pwmedia-$mode.out" || { echo "FAIL pwmedia $mode"; fail=1; }
+      done
+    else
+      echo "skipped pwmedia (no libpipewire headers on this machine)"
+    fi
   fi
 fi
 [ $fail -eq 0 ] && echo "pipewire emulated: all passed" || echo "pipewire emulated: FAILED"
