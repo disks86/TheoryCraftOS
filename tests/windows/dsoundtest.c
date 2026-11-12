@@ -19,7 +19,7 @@
 /* dsound.dll and WASAPI (mmdevapi.dll) over the kernel's PipeWire graph, at the same time: a DirectSound looping buffer plays 600 Hz (mono, 24 kHz,
  * mixed by dsound's own mixer) while a WASAPI event-driven client plays 700 Hz (the engine's float stereo). Also: enumeration, device ids, caps, the
  * primary buffer and listener, Lock across the end, position notifications, cursors, volume/pan/frequency, duplicates sharing memory, a one-shot
- * buffer's stop notification, deferred 3D settings; the endpoint enumerator, properties, formats, padding, the clock, Stop/Reset, stream, session
+ * buffer's stop notification, deferred 3D settings, the Doppler shift; the endpoint enumerator, properties, formats, padding, the clock, Stop/Reset, stream, session
  * and endpoint volume with its callback, the session manager and ActivateAudioInterfaceAsync. Run by tests/pipewire_emulated.sh on the CPU emulator
  * with a Linux program and a native stream playing too. Prints "dsoundtest: N checks, M failed". */
 #define COBJMACROS
@@ -205,7 +205,43 @@ static void directsound_start(void) {
     D3DVALUE r = 0;
     CHECK(IDirectSound3DListener_SetRolloffFactor(listener, 2, DS3D_IMMEDIATE) == DS_OK && IDirectSound3DListener_GetRolloffFactor(listener, &r) == DS_OK && r == 2);
     CHECK(IDirectSound3DListener_SetRolloffFactor(listener, 11, DS3D_IMMEDIATE) == DSERR_INVALIDPARAM);
+    CHECK(IDirectSound3DListener_SetRolloffFactor(listener, 1, DS3D_IMMEDIATE) == DS_OK);
     IDirectSound3DBuffer_Release(b3);
+  }
+  /* Doppler: two silent 3D loops 10 units ahead, one coming at the listener at a tenth of the speed of sound: it is read 1/0.9 = 1.11 times as fast */
+  if (listener) {
+    DSBUFFERDESC dd = {sizeof dd, DSBCAPS_CTRL3D | DSBCAPS_CTRLVOLUME | DSBCAPS_GETCURRENTPOSITION2, DS_RATE * 4, 0, &mono, {0}};      /* 2 s */
+    IDirectSoundBuffer *still = NULL, *moving = NULL;
+    IDirectSound3DBuffer *s3 = NULL, *m3 = NULL;
+    CHECK(IDirectSound8_CreateSoundBuffer(g_ds, &dd, &still, NULL) == DS_OK && IDirectSound8_CreateSoundBuffer(g_ds, &dd, &moving, NULL) == DS_OK);
+    if (still && moving) {
+      IDirectSoundBuffer_QueryInterface(still, &IID_IDirectSound3DBuffer, (void **)&s3);
+      IDirectSoundBuffer_QueryInterface(moving, &IID_IDirectSound3DBuffer, (void **)&m3);
+    }
+    if (s3 && m3) {
+      IDirectSoundBuffer_SetVolume(still, DSBVOLUME_MIN);
+      IDirectSoundBuffer_SetVolume(moving, DSBVOLUME_MIN);
+      CHECK(IDirectSound3DBuffer_SetPosition(s3, 0, 0, 10, DS3D_IMMEDIATE) == DS_OK && IDirectSound3DBuffer_SetPosition(m3, 0, 0, 10, DS3D_IMMEDIATE) == DS_OK);
+      CHECK(IDirectSound3DBuffer_SetVelocity(m3, 0, 0, -34.33f, DS3D_IMMEDIATE) == DS_OK);
+      CHECK(IDirectSound3DListener_SetDopplerFactor(listener, 1, DS3D_IMMEDIATE) == DS_OK);
+      DWORD p0 = 0, w0s = 0, w0m = 0, w1s = 0, w1m = 0;
+      CHECK(IDirectSoundBuffer_Play(still, 0, 0, DSBPLAY_LOOPING) == DS_OK && IDirectSoundBuffer_Play(moving, 0, 0, DSBPLAY_LOOPING) == DS_OK);
+      Sleep(60);
+      IDirectSoundBuffer_GetCurrentPosition(still, &p0, &w0s);
+      IDirectSoundBuffer_GetCurrentPosition(moving, &p0, &w0m);
+      Sleep(400);
+      IDirectSoundBuffer_GetCurrentPosition(still, &p0, &w1s);
+      IDirectSoundBuffer_GetCurrentPosition(moving, &p0, &w1m);
+      const double ratio = w1s > w0s ? (double)(w1m - w0m) / (double)(w1s - w0s) : 0;
+      printf("Doppler: the moving buffer was read %.3f times as fast\n", ratio);
+      CHECK(ratio > 1.08 && ratio < 1.14);
+      IDirectSoundBuffer_Stop(still);
+      IDirectSoundBuffer_Stop(moving);
+    }
+    if (s3) IDirectSound3DBuffer_Release(s3);
+    if (m3) IDirectSound3DBuffer_Release(m3);
+    if (still) IDirectSoundBuffer_Release(still);
+    if (moving) IDirectSoundBuffer_Release(moving);
   }
   if (thing) IDirectSoundBuffer_Release(thing);
   if (listener) IDirectSound3DListener_Release(listener);

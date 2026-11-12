@@ -22,12 +22,12 @@
  * Linux and other Windows programs' sound is mixed with it) and a thread that mixes its playing secondary buffers into it every 5 ms, about 30 ms
  * ahead of what the device plays. A buffer is read at its own frequency (linear interpolation, so SetFrequency changes pitch at once), with its
  * volume (hundredths of a dB) and pan, or with its 3D position against the listener: distance with the rolloff factor and min/max distances, the
- * cone, and an equal-power pan from the direction (no Doppler shift, no HRTF). The primary buffer's volume and pan apply to the whole mix; with
+ * cone, an equal-power pan from the direction and the Doppler shift from both velocities (no HRTF). The primary buffer's volume and pan apply to the whole mix; with
  * DSSCL_WRITEPRIMARY the program writes the primary buffer itself, in its own format.
  *
  * The play cursor is where the device is (what the kernel says it has played), the write cursor where the mixer has read up to; position
  * notifications fire as the play cursor passes them. Buffers made with DuplicateSoundBuffer share their memory. Capture (DirectSoundCapture8, its
- * buffers, full duplex) records from the graph's source: capture.inc. Not done: effects (SetFX: DSERR_FXUNAVAILABLE, no capture effects), Doppler,
+ * buffers, full duplex) records from the graph's source: capture.inc. Not done: effects (SetFX: DSERR_FXUNAVAILABLE, no capture effects),
  * property sets. The classes have a factory (DllGetClassObject; ole32 finds this library for CLSID_DirectSound(8), CLSID_DirectSoundCapture(8) and
  * CLSID_DirectSoundFullDuplex). Built freestanding over
  * kernel32.dll and ntdll.dll. */
@@ -256,6 +256,32 @@ static void gains_3d(const Device *d, const Buffer *b, double *gain, double *sid
   }
 }
 
+/* The Doppler shift of a 3D buffer: how much faster (above 1) or slower its sound reaches the listener, from both velocities along the line between
+ * them, the listener's Doppler factor and the speed of sound in the program's units (343.3 m/s over the distance factor, metres per unit). */
+static double doppler_ratio(const Device *d, const Buffer *b) {
+  const DS3DBUFFER *p = &b->params;
+  const DS3DLISTENER *l = &d->listener;
+  if (!(b->flags & DSBCAPS_CTRL3D) || b->primary || p->dwMode == DS3DMODE_DISABLE || !(l->flDopplerFactor > 0)) return 1;
+  const BOOL head = p->dwMode == DS3DMODE_HEADRELATIVE;
+  const Vec zero_v = {0, 0, 0};
+  const Vec rel = head ? vec(p->vPosition) : sub(vec(p->vPosition), vec(l->vPosition));
+  const double distance = length(rel);
+  if (distance < 1e-6) return 1;
+  const Vec u = {rel.x / distance, rel.y / distance, rel.z / distance};      /* from the listener to the source */
+  const double c = 343.3 / (l->flDistanceFactor > 0 ? l->flDistanceFactor : 1);
+  const double f = l->flDopplerFactor;
+  double listener_v = dot(head ? zero_v : vec(l->vVelocity), u) * f;      /* towards the source: higher */
+  double source_v = dot(vec(p->vVelocity), u) * f;                         /* away from the listener: lower */
+  /* (no faster than sound, either way) */
+  const double most = 0.9 * c;
+  if (listener_v > most) listener_v = most;
+  if (listener_v < -most) listener_v = -most;
+  if (source_v > most) source_v = most;
+  if (source_v < -most) source_v = -most;
+  const double ratio = (c + listener_v) / (c + source_v);
+  return ratio < 0.1 ? 0.1 : ratio > 10 ? 10 : ratio;
+}
+
 /* What `b` contributes to each side now. */
 static void buffer_gains(const Device *d, const Buffer *b, float *left, float *right) {
   double g = hundredths_db(b->volume), l = 1, r = 1;
@@ -330,6 +356,8 @@ static LONG to_q15(float g) {
   return g >= 1.0f ? 32768 : (LONG)(g * 32768.0f + 0.5f);
 }
 
+static ULONG64 step_of(const Device *d, const Buffer *b);
+
 /* Mixes `n` output frames of `b` into d->mix, in fixed point: the read position is frames << 32 (its top 15 fraction bits interpolate), the gains
  * are Q15. */
 static void mix_buffer(Device *d, Buffer *b, DWORD n) {
@@ -341,7 +369,7 @@ static void mix_buffer(Device *d, Buffer *b, DWORD n) {
   float fl, fr;
   buffer_gains(d, b, &fl, &fr);
   const LONG gl = to_q15(fl), gr = to_q15(fr);
-  const ULONG64 step = ((ULONG64)b->frequency << 32) / OUT_RATE;
+  const ULONG64 step = step_of(d, b);
   const ULONG64 end = (ULONG64)b->frames << 32;
   const BOOL fast = b->tag == 1 && b->format.Format.wBitsPerSample == 16 && b->format.Format.nChannels <= 2;
   const short *samples = fast ? buffer_samples16(b) : NULL;
@@ -383,6 +411,49 @@ static void mix_buffer(Device *d, Buffer *b, DWORD n) {
     d->mix[2 * i + 1] += (r * gr) >> 15;
     b->position += step;
   }
+}
+
+/* A buffer's reading step now: frames << 32 per output frame, with its frequency and Doppler shift. */
+static ULONG64 step_of(const Device *d, const Buffer *b) {
+  const double doppler = doppler_ratio(d, b);
+  return doppler == 1 ? ((ULONG64)b->frequency << 32) / OUT_RATE : (ULONG64)((double)b->frequency * doppler * 4294967296.0 / OUT_RATE);
+}
+
+/* Takes back what was mixed ahead and is not in the device yet (the kernel's stream and what waits here to be sent), so that a buffer that starts or
+ * stops is heard doing so at once instead of after the 30 ms or more mixed ahead: every playing buffer steps back as many output frames and they are
+ * mixed again at the next tick. (What the device holds, a few milliseconds, still plays, as in Windows.) */
+static void rewind_locked(Device *d) {
+  if (!d->stream) return;
+  ULONG64 waiting = 0;
+  if (tcos_audio_status(d->stream, &waiting, NULL, NULL, NULL) != 0) return;
+  ULONG64 back = waiting / 4 + (d->pending_frames - d->pending_offset);
+  if (back > d->produced) back = d->produced;
+  if (back == 0) return;
+  audio_call(TCOS_AUDIO_FLUSH, d->stream, 0, 0, 0, 0, 0, NULL, NULL, NULL);
+  d->pending_frames = d->pending_offset = 0;
+  const ULONG64 now = d->produced - back;
+  for (Buffer *b = d->buffers; b; b = b->next) {
+    if (!b->playing || b->frames == 0) continue;
+    const ULONG64 step = step_of(d, b), end = (ULONG64)b->frames << 32;
+    if (b->ending) {
+      if (b->ended_at <= now) continue;      /* (its end is in the device already) */
+      const ULONG64 frames = b->ended_at - now, delta = frames * step;
+      b->ending = FALSE;
+      b->position = delta < end ? end - delta : 0;
+    } else {
+      const ULONG64 since = d->produced > b->started_at ? d->produced - b->started_at : 0;
+      ULONG64 delta = (back < since ? back : since) * step;
+      if (b->looping) {
+        delta %= end;
+        b->position = b->position >= delta ? b->position - delta : b->position + end - delta;
+      } else {
+        b->position = b->position > delta ? b->position - delta : 0;
+      }
+    }
+    if (b->started_at > now) b->started_at = now;
+  }
+  d->produced = now;
+  if (d->played > d->produced) d->played = d->produced;
 }
 
 static BOOL open_stream_locked(Device *d) {
@@ -746,6 +817,7 @@ static HRESULT WINAPI b_play(IDirectSoundBuffer8 *i, DWORD reserved, DWORD prior
   const BOOL was = b->playing && !b->ending;
   b->looping = (flags & DSBPLAY_LOOPING) != 0;
   if (!was) {
+    rewind_locked(d);      /* (it is heard from now, not after what the others had mixed ahead) */
     if (b->ending) b->position = 0;
     b->playing = TRUE;
     b->ending = FALSE;
@@ -836,6 +908,7 @@ static HRESULT WINAPI b_stop(IDirectSoundBuffer8 *i) {
     b->playing = b->ending = FALSE;
     b->last_play = at;
     if (b->primary) unlink_locked(d, b);
+    rewind_locked(d);      /* (what it had mixed ahead goes; the others are mixed again without it) */
     fire_stop_notifications(b);
   }
   LeaveCriticalSection(&d->lock);

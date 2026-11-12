@@ -88,7 +88,9 @@ its playing secondary buffers into it every 5 ms (fixed point; linear interpolat
 `Play`/`Stop` (looping, one-shot), cursors (play = what the device has played, write = where the mixer has read to), `SetCurrentPosition`,
 volume (hundredths of a dB), pan, frequency (100 Hz to 200 kHz, at once), position notifications and `DSBPN_OFFSETSTOP`, `DuplicateSoundBuffer`
 (shared samples), 3D buffers and the listener (distance with min/max and rolloff, the cone, an equal-power pan from the direction, head-relative and
-disabled modes, deferred settings and `CommitDeferredSettings`). The primary buffer's volume and pan are the whole mix's; with `DSSCL_WRITEPRIMARY`
+disabled modes, deferred settings and `CommitDeferredSettings`, the Doppler shift from the buffer's and the listener's velocities with the Doppler
+and distance factors). `Play` and `Stop` take back what was mixed ahead and is not in the device yet (the kernel stream is flushed and every playing
+buffer steps back as many frames), so a sound starts and stops at once rather than 30 ms or more later. The primary buffer's volume and pan are the whole mix's; with `DSSCL_WRITEPRIMARY`
 the program writes it itself. Enumeration (the primary driver and one device), `GetDeviceID`, caps, cooperative levels, speaker configuration and
 the class factory (`CLSID_DirectSound`, `CLSID_DirectSound8`; ole32 finds `dsound.dll` for them). Capture: `DirectSoundCaptureCreate(8)`,
 `DirectSoundCaptureEnumerate`, `GetDeviceID` for the default (voice) capture device, `IDirectSoundCapture8` (caps, several buffers at once) and
@@ -142,8 +144,8 @@ comes out once stopped), the padding is everything waiting to be read, and audio
   `set-default-source` to another device do nothing).
 - **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused);
   endpoint and session notifications are accepted but never sent (nothing changes from outside the process); the master volume has no balance.
-  DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`, no capture effects such as AEC or noise suppression), no Doppler shift, no
-  property sets (`IKsPropertySet`, EAX); after `Stop` what it had mixed ahead (30 ms or more) still plays. WASAPI capture packets are always 10 ms
+  DirectSound has no effects (`SetFX` answers `DSERR_FXUNAVAILABLE`, no capture effects such as AEC or noise suppression) and no property sets
+  (`IKsPropertySet`, EAX). WASAPI capture packets are always 10 ms
   (`IAudioClient3`'s smaller shared periods are not offered for capture either).
 - **More than one sink.** The graph follows the mixer's one output device; switching devices is the `AudioRouter`'s, not PipeWire's
   (`move-sink-input`, `set-default-sink` to another device do nothing).
