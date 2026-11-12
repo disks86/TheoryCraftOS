@@ -20,7 +20,9 @@
 // (src/Process/WindowsOpenGl.hpp) for both. They differ in where the memory handed to the program comes from and in that a Linux window is never shown by the kernel.
 #include "OpenGl/WindowsGl.hpp"
 #include "OpenGl/GlService.hpp"
+#include "Process/DxgBufferFile.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Process/ProcessFiles.hpp"
 #include "Process/WindowsMemory.hpp"
 #include "Process/WindowsOpenGl.hpp"
 
@@ -31,7 +33,7 @@ namespace {
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kNoMemory = 0xC0000017u, kNotSupported = 0xC00000BBu,
                    kInvalidDeviceState = 0xC0000184u, kResourceInUse = 0xC0000708u;
 constexpr uint32_t kRequestSize = 64;
-enum : uint32_t { kCreate = 1, kDelete, kMakeCurrent, kExecute, kSwap, kReadFront, kShareLists, kFlushed, kDestroySurface };
+enum : uint32_t { kCreate = 1, kDelete, kMakeCurrent, kExecute, kSwap, kReadFront, kShareLists, kFlushed, kDestroySurface, kFrontToBuffer };
 
 uint32_t le32(ConstByteView b, uint32_t at) { return uint32_t(b[at]) | uint32_t(b[at + 1]) << 8 | uint32_t(b[at + 2]) << 16 | uint32_t(b[at + 3]) << 24; }
 uint64_t le64(ConstByteView b, uint32_t at) { return uint64_t(le32(b, at)) | uint64_t(le32(b, at + 4)) << 32; }
@@ -75,6 +77,47 @@ void present_to_window(void* context, uint64_t window, ConstByteView rgba, uint3
   PresentState& st = *static_cast<PresentState*>(context);
   process::windowsabi::GlWindowPresent present = process::windowsabi::gl_window_present();
   st.shown = present && present(window, rgba, width, height);
+}
+
+// FRONT_TO_BUFFER: the window's front image into the GPU image of dmabuf `fd`, in the image's channel order and rows (8-bit, four channels).
+uint32_t front_to_buffer(GlService& service, process::Process& p, uint64_t at, uint64_t window, uint64_t fd) {
+  if (fd > 0x7FFFFFFFu || p.descriptor(fd) != process::DescriptorKind::File) return kInvalidHandle;
+  const SharedPointer<process::OpenObject> object = p.files().shared_object(fd);      // (held: another thread may close the descriptor meanwhile)
+  if (!object || !object->gpu_buffer) return kInvalidHandle;
+  process::DxgBufferImage image;
+  if (!object->gpu_buffer->describe(&image)) return kNotSupported;
+  const bool bgra = image.format == 1 || image.format == 2 || image.format == 9;      // (dxgk::Format A8R8G8B8, X8R8G8B8, A8R8G8B8Srgb: B, G, R, A bytes as the front)
+  const bool rgba = image.format == 3 || image.format == 4 || image.format == 10;     // (A8B8G8R8, X8B8G8R8, A8B8G8R8Srgb)
+  if ((!bgra && !rgba) || image.width == 0 || image.height == 0 || image.pitch / 4 < image.width) return kInvalidHandle;
+  uint32_t w = 0, h = 0;
+  GlStatus s = service.read_front(p.id(), window, ByteView(), 0, &w, &h);
+  if (s != GlStatus::Ok) return to_nt(s);
+  uint8_t wh[8];
+  for (int i = 0; i < 4; ++i) { wh[i] = uint8_t(w >> (8 * i)); wh[4 + i] = uint8_t(h >> (8 * i)); }
+  if (!p.write_user(at + 36, ConstByteView(wh, 8))) return kAccessViolation;
+  if (w == 0 || h == 0) return kSuccess;
+  ByteBuffer front(service.allocator());
+  if (!front.put_zeros(uint64_t{w} * h * 4)) return kNoMemory;
+  s = service.read_front(p.id(), window, front.writable_view(), w * 4, &w, &h);
+  if (s != GlStatus::Ok) return to_nt(s);
+  // the image's own rows: the front's pixels where both have them, its old pixels elsewhere (read first, so a smaller front leaves them as they were)
+  const uint32_t rows = h < image.height ? h : image.height, columns = w < image.width ? w : image.width;
+  ByteBuffer pixels(service.allocator());
+  if (!pixels.put_zeros(uint64_t{image.pitch} * image.height)) return kNoMemory;
+  if ((columns < image.width || rows < image.height) && !object->gpu_buffer->copy_image(pixels.writable_view(), false)) return kResourceInUse;
+  ByteView out = pixels.writable_view();
+  const ConstByteView in = front.view();
+  for (uint32_t y = 0; y < rows; ++y) {
+    ByteView row = out.subview(uint64_t{y} * image.pitch, uint64_t{columns} * 4);
+    row.copy_from(in.subview(uint64_t{y} * w * 4, uint64_t{columns} * 4));
+    if (rgba)
+      for (uint32_t x = 0; x < columns; ++x) {      // (B, G, R, A -> R, G, B, A)
+        const uint8_t b = row[x * 4];
+        row[x * 4] = row[x * 4 + 2];
+        row[x * 4 + 2] = b;
+      }
+  }
+  return object->gpu_buffer->copy_image(pixels.writable_view(), true) ? kSuccess : kResourceInUse;
 }
 
 uint64_t thread_of(process::Process& p) {
@@ -165,6 +208,7 @@ uint32_t gl_request(process::Process& p, uint64_t at, bool linux_process) {
       return p.write_user(data, pixels.view()) ? kSuccess : kAccessViolation;
     }
     case kDestroySurface: return to_nt(service->destroy_surface(pid, window));
+    case kFrontToBuffer: return linux_process ? front_to_buffer(*service, p, at, window, data) : kNotSupported;
     default: return kInvalidParameter;
   }
 }

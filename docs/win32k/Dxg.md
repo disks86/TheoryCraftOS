@@ -27,6 +27,9 @@ GPU images as descriptors, the counterpart of Linux's dmabufs (what a Wayland cl
   manager's memory, which a process cannot map). `DMA_BUF_IOCTL_SYNC` moves the picture as on Linux: `START|READ` from the image (after the GPU's queued work on it:
   `EAGAIN` while some waits for a fence), `END|WRITE` to it (`dxgk::copy_export`, given to the process layer by `install_dxg`). The Wayland compositor also sends
   the copy to the image at a commit when a writable mapping is still there and the copy changed since it was last moved, for clients that skip the ioctl.
+- The kernel's own producers write the image past that copy: the OpenGL of a Linux process copies its frames into a dmabuf with `DxgBufferFile::copy_image`
+  (`FRONT_TO_BUFFER`, [../OpenGL.md](../OpenGL.md#linux-egl-and-opengl-es)), knowing its size, pitch and format from `DxgBufferFile::describe` (the describer,
+  `dxgk::export_info`, is given at boot with the copier). A mapping sees those pixels after `DMA_BUF_IOCTL_SYNC` `START|READ`, as on Linux.
 - `TCOS_DXG_IOCTL_IMPORT` (`TcosDxgImport`: fd, device) gives the process an allocation handle for such a descriptor's image on one of its devices (same adapter: else
   `STATUS_INVALID_PARAMETER`), recorded like the allocations it creates; it answers the size, the kernel's format number and the pitch.
 - `TCOS_DXG_IOCTL_EXPORT_SYNC` / `IMPORT_SYNC` do the same for a fence (a sync object made as a D3DKMT fence: semaphores are `STATUS_NOT_SUPPORTED`): the
