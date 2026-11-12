@@ -72,6 +72,13 @@ static bool vk_os_import_fd(int fd, uint32_t device, uint32_t *allocation, uint3
 static void vk_os_close_fd(int fd);
 #endif
 
+/* Surfaces a compositor shows (VK_KHR_wayland_surface): a platform that has them defines VK_OS_COMPOSITOR_SURFACES to 1 and these four (vk_wsi.inc). Its surface has `os` set
+ * (freed with vk_free when the surface goes); a swapchain of it has images whose allocations are shareable, and
+ *   vk_os_swapchain_made   hands them to the compositor (a buffer each), after they were made; a failure undoes the swapchain
+ *   vk_os_swapchain_gone   takes them back, before they are freed
+ *   vk_os_acquire          picks an image the compositor is done with and the program does not hold (waits up to `timeout` ns for one: VK_TIMEOUT / VK_NOT_READY)
+ *   vk_os_present          shows image `index`; every submission before it has run, so the image holds the frame */
+
 /* (the driver also uses memcpy, memmove, memset and memcmp: the platform has them, from its C library or its own) */
 void *memcpy(void *d, const void *s, size_t n);
 void *memmove(void *d, const void *s, size_t n);

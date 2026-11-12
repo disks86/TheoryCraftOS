@@ -15,9 +15,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-# Builds libvulkan.a for Linux programs (src/Linux/libvulkan/libvulkan.c: the shared driver of src/Vulkan over /dev/dxg), freestanding, with clang.
-# Usage: src/Linux/libvulkan/build.sh <out-dir> [x86_64|aarch64|riscv64|loongarch64 ...]   (default: x86_64)  ->  <out-dir>/<cpu>/libvulkan.a
-# A program links it statically (there is no dynamic loader yet): clang --target=<cpu>-linux-gnu -static ... -L <out-dir>/<cpu> -lvulkan, or the archive by name.
+# Builds libvulkan for Linux programs (src/Linux/libvulkan/libvulkan.c: the shared driver of src/Vulkan over /dev/dxg), freestanding, with clang:
+#   <out-dir>/<cpu>/libvulkan.a     for programs linked statically: clang --target=<cpu>-linux-gnu -static ... <out-dir>/<cpu>/libvulkan.a
+#   <out-dir>/<cpu>/libvulkan.so.1  for programs of a C library (glibc's ld.so loads it): it takes the Khronos loader's place, so a program built against the
+#                                   loader (-lvulkan) runs on it unchanged; it is installed in the Linux tree as /usr/lib/libvulkan.so.1
+# Usage: src/Linux/libvulkan/build.sh <out-dir> [x86_64|aarch64|riscv64|loongarch64 ...]   (default: x86_64)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:?usage: build.sh <out-dir> [cpu ...]}
@@ -40,4 +42,8 @@ for cpu in "${cpus[@]}"; do
     -c "$here/libvulkan.c" -o "$out/$cpu/libvulkan.o"
   rm -f "$out/$cpu/libvulkan.a"
   "$AR" rcs "$out/$cpu/libvulkan.a" "$out/$cpu/libvulkan.o"
+  # the shared library: position independent, only the vk* functions exported (the C library's memcpy family, dlopen and environ come from the program)
+  "$CC" --target="$cpu-linux-gnu" "${extra[@]}" -std=gnu11 -O2 -ffreestanding -fno-stack-protector -fPIC -fvisibility=hidden -fno-asynchronous-unwind-tables -DVK_SHARED \
+    -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
+    -shared -nostdlib -fuse-ld=lld -Wl,-soname,libvulkan.so.1 -Wl,--hash-style=both -Wl,-z,now -o "$out/$cpu/libvulkan.so.1" "$here/libvulkan.c"
 done

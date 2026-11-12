@@ -252,19 +252,22 @@ int main(int argc, char** argv) {
   filesystem::RamFileSystem fs(a);
   process::prepare_program_folders(fs);
   // TCOS_EMU_LINUX_FILES: host files (colon separated) put at the same paths in the Linux tree, links resolved on the host: what a dynamically linked
-  // program needs (its interpreter and libraries, tests/linux_dynamic_emulated.sh). A missing folder on the way is made.
+  // program needs (its interpreter and libraries, tests/linux_dynamic_emulated.sh). An entry host=path puts the host file at that path of the Linux tree instead
+  // (a library installed under its system name: tests/linux_vulkan_wayland_emulated.sh). A missing folder on the way is made.
   if (const char* list = getenv("TCOS_EMU_LINUX_FILES")) {
     std::string all = list;
     for (size_t at = 0; at <= all.size();) {
       size_t end = all.find(':', at);
       if (end == std::string::npos) end = all.size();
-      const std::string host = all.substr(at, end - at);
+      std::string host = all.substr(at, end - at), inside;
       at = end + 1;
+      if (const size_t eq = host.find('='); eq != std::string::npos) inside = host.substr(eq + 1), host = host.substr(0, eq);
       if (host.empty()) continue;
+      if (inside.empty()) inside = host;
       bool read_ok = false;
       const std::vector<uint8_t> bytes = slurp(host, &read_ok);
       if (!read_ok) { printf("linux files: cannot read %s\n", host.c_str()); continue; }
-      const std::string path = std::string(filesystem::layout::kLinux) + host;
+      const std::string path = std::string(filesystem::layout::kLinux) + inside;
       for (size_t k = 1; k < path.size(); ++k)
         if (path[k] == '/') fs.create_directory(StringView(path.substr(0, k).c_str()));
       UniquePointer<filesystem::IFile> file;
