@@ -65,6 +65,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.lines = (info.features & kFeatureLines) != 0;
   l.geometry = l.lines && (info.features & kFeatureGeometryShaders) != 0;
   l.tessellation = (info.features & kFeatureTessellation) != 0;
+  l.clip_distances = (info.features & kFeatureClipDistances) != 0;
   return l;
 }
 
@@ -239,7 +240,7 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   // GL's window rows are the device's rows in the same order (row 0 is the bottom of the GL window, which the device draws as its first row), so the picture is the
   // device's upside down and a counter-clockwise triangle in GL is a clockwise one for the device.
   const uint32_t cull = s.cull > 2 ? 0 : s.cull;
-  uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u);
+  uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u) | uint64_t{s.clip_mask} << 40;
   if (s.custom_blend) {
     key |= uint64_t{1} << 6;
     key |= uint64_t{s.src_rgb & 15} << 8 | uint64_t{s.dst_rgb & 15} << 12 | uint64_t{s.src_alpha & 15} << 16 | uint64_t{s.dst_alpha & 15} << 20;
@@ -262,6 +263,7 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   d.front_face = s.front_ccw ? FrontFace::Clockwise : FrontFace::CounterClockwise;
   d.depth_test = s.depth_test;
   d.depth_write = s.depth_write;
+  d.clip_distances = s.clip_mask;
   if (s.custom_blend) {      // (the numbers are the device's: Accelerator.hpp)
     if (s.src_rgb > 10 || s.dst_rgb > 10 || s.src_alpha > 10 || s.dst_alpha > 10 || s.op_rgb > 4 || s.op_alpha > 4 || s.depth_compare > 7) return nullptr;
     d.blend.custom = true;
@@ -387,6 +389,7 @@ bool WebGlAccelerator::draw(uint32_t handle, uint32_t program, const webgl::Acce
   }
   if ((state.topology == 4 || state.topology == 5) && !p->gs) return false;
   if (state.custom_blend && !(info.features & kFeatureBlendState)) return false;
+  if (state.clip_mask && !(info.features & kFeatureClipDistances)) return false;
   return run_pass(*t, false, Vec4(), false, 1.0f, p, &state, vertices, vertex_count, constants);
 }
 

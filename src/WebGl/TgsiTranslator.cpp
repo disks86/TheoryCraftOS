@@ -36,8 +36,9 @@ uint8_t num_of(Base b) { return b == Base::Int ? kNumInt : (b == Base::Uint ? kN
 
 // A TGSI source operand: a register file and index, a swizzle, and a negate flag. 'T' temporary, 'I' input, 'C' constant, 'M' immediate.
 struct Oper {
-  char file = 'T';
+  char file = 'T';   // (and 'O': an output a control shader reads, OUT[dim][idx] or OUT[idx])
   uint16_t idx = 0;
+  int16_t dim = -1;   // a two-dimensional register's vertex
   uint8_t swz[4] = {0, 1, 2, 3};
   bool neg = false;
 };
@@ -225,7 +226,13 @@ class Gen {
       case 'T': body.append("TEMP"); break;
       case 'I': body.append("IN"); break;
       case 'C': body.append("CONST"); break;
+      case 'O': body.append("OUT"); break;
       default: body.append("IMM"); break;
+    }
+    if (o.dim >= 0) {
+      body.push_back('[');
+      body.append_uint(static_cast<uint32_t>(o.dim));
+      body.push_back(']');
     }
     body.push_back('[');
     body.append_uint(o.idx);
@@ -439,7 +446,10 @@ class Gen {
   // --- the geometry and tessellation stages
   bool stage_start();                    // their inputs and system values, into variables
   bool write_vertex_outputs();           // the position and the varyings of a stage that puts out vertices (vertex, evaluation, geometry at EmitVertex)
-  bool control_end();                    // a control stage's outputs
+  bool write_clip_distances();           // ... and its clip distances (TgsiStages::clip)
+  bool control_end();                    // a control stage's outputs (at the end, and at each barrier())
+  bool control_read(const Node& index, Val* out);   // another invocation's output, as the last barrier() left it
+  bool patch_read(uint64_t gi, Val* out);           // a control stage's patch output or level
   bool system_value(const char* semantic, bool integer, uint32_t rows, const Var& v);
   bool in2d(uint16_t temp, const char* mask, uint32_t vertex, uint32_t reg, const char* swizzle = "xyzw");
   bool control_output(const Node& index_node, Var* out);   // gl_out[gl_InvocationID].x / x[gl_InvocationID] of a control stage
@@ -450,6 +460,7 @@ class Gen {
   // after run(): what the assembler declares beyond the shader's own registers
   int32_t position_in = -1, face_in = -1;   // a fragment shader's gl_FragCoord / gl_FrontFacing inputs
   int32_t primitive_in = -1;                 // a geometry shader's gl_PrimitiveIDIn input
+  bool clip_out = false;                     // the stage writes CLIPDIST[0], CLIPDIST[1] after its varyings
   bool uses_addr = false;                    // ARL (a uniform array indexed by a variable)
   static constexpr uint32_t kMaxSystemValues = 4;
   const char* sv_names[kMaxSystemValues] = {};   // SV[i]'s semantic
@@ -477,6 +488,7 @@ class Gen {
     bool ready = false;
   };
   List<StageVar> stage_vars_;
+  int32_t clip_row_ = -1;        // the user clip planes' first CONST row (write_clip_distances)
   int32_t invocation_gi_ = -1;   // a control stage's gl_InvocationID (always in a variable: its outputs are written by it)
   uint32_t ntemp_ = 0;
   uint32_t inst_ = 0;
@@ -552,7 +564,7 @@ bool Gen::uniform_base(uint64_t gi, uint32_t* row) {
     }
   const Global& g = *m_.globals[gi];
   const Type& t = g.type;
-  if (g.block >= 0) return fail("uniform blocks");
+  // (a uniform block's member is read like any uniform: the context copies the block's buffer into the stage's uniforms before each draw, load_uniform_blocks)
   if (!is_float_type(t.element())) return fail("a uniform of a type the device cannot take");
   const uint8_t convert = t.base == Base::Int ? kTgsiFromInt : (t.base == Base::Uint ? kTgsiFromUint : (t.base == Base::Bool ? kTgsiFromBool : kTgsiAsIs));
   uint32_t first;
@@ -808,12 +820,13 @@ bool Gen::global_val(uint64_t gi, Val* out) {
     case GlobalKind::Out:
     case GlobalKind::Private: {
       if (g.kind == GlobalKind::Builtin && fs_ && (g.builtin == kBvFragCoord || g.builtin == kBvFrontFacing)) return frag_input(g.builtin == kBvFrontFacing, out);
-      if (g.kind == GlobalKind::Builtin && g.builtin != kBvPosition && g.builtin != kBvPointSize && g.builtin != kBvFragColor && !(fs_ && g.builtin == kBvFragData))
+      if (g.kind == GlobalKind::Builtin && g.builtin != kBvPosition && g.builtin != kBvPointSize && g.builtin != kBvFragColor && !(fs_ && g.builtin == kBvFragData) &&
+          !(!fs_ && g.builtin == kBvClipDistance))
         return fail("a built-in variable");
       if ((g.builtin == kBvFragColor) != (fs_ && g.builtin == kBvFragColor) || (!fs_ && g.builtin == kBvFragColor)) return fail("gl_FragColor in a vertex shader");
       if (fs_ && (g.builtin == kBvPosition || g.builtin == kBvPointSize)) return fail("a vertex output in a fragment shader");
       if (stage_ == kStControl && g.kind == GlobalKind::Out && g.per_vertex) return fail("a control stage output of another invocation, or all of them");
-      if (stage_ == kStControl && g.kind == GlobalKind::Out && g.patch) return fail("a control stage reading its patch outputs");
+      if (stage_ == kStControl && g.kind == GlobalKind::Out && g.patch) return patch_read(gi, out);
       if (entry_ < 0 && g.kind == GlobalKind::Private && g.is_read_only && (gi >= stage_vars_.count() || !stage_vars_[gi].ready)) return fail("a system value the device does not give");
       if (g.kind == GlobalKind::Out && g.name.view().equals("gl_ViewportIndex")) return fail("gl_ViewportIndex");
       Var v;
@@ -1357,8 +1370,11 @@ bool Gen::builtin(const Node& n, Val* out) {
     case BuiltinFn::EmitStreamVertex:
     case BuiltinFn::EndStreamPrimitive: return fail("vertex streams");
     case BuiltinFn::Barrier:
-      // (a control stage's invocations write their outputs at the end and never read each other's: there is nothing to wait for)
+      // (a control stage's invocations put out what they wrote, then wait for each other: what they read of each other after it is in the output registers)
       if (stage_ != kStControl) return fail("barrier()");
+      if (!control_end()) return false;
+      begin_inst("BARRIER");
+      end_inst();
       *out = Val();
       return true;
     default: break;
@@ -1904,7 +1920,9 @@ bool Gen::eval(int32_t id, Val* out) {
       return eval(n.a, &ignored) && eval(n.b, out);
     }
     case NodeKind::Index: {
-      if (is_control_output(n.a)) {      // a control stage reading its own control point's output
+      if (is_control_output(n.a)) {      // a control stage reading its own control point's output, or another's
+        const bool own = invocation_gi_ >= 0 && n.b >= 0 && m_.nodes[static_cast<uint64_t>(n.b)].kind == NodeKind::Global && m_.nodes[static_cast<uint64_t>(n.b)].ival == invocation_gi_;
+        if (!own) return control_read(n, out);
         Var v;
         if (!control_output(n, &v)) return false;
         val_of(v, out);
@@ -3079,6 +3097,80 @@ bool Gen::control_output(const Node& index, Var* out) {
   return true;
 }
 
+// gl_out[j].x / x[j] of a control stage, j not its own invocation: OUT[k][r] of control point k (what invocation k put out at its last barrier()), chosen by j.
+bool Gen::control_read(const Node& index, Val* out) {
+  const int32_t gi = m_.nodes[static_cast<uint64_t>(index.a)].ival;
+  const Global& g = *m_.globals[static_cast<uint64_t>(gi)];
+  if (g.inner) return fail("an array of arrays per vertex");
+  uint32_t reg = 0;
+  const IoLink* l = nullptr;
+  if (out_)
+    for (const IoLink& k : out_->links) if (k.out_gi == gi && !k.patch) l = &k;
+  if (l) reg = 1 + l->base;      // (the position: its copy, see stage_boundary)
+  else if (!g.name.view().equals("gl_out.gl_Position")) return fail("a control stage output of another invocation");
+  const Type et = g.type.element();
+  if (!is_float_type(et)) return fail("a control stage output of another invocation");
+  const uint32_t n = m_.tcs_vertices > 0 ? static_cast<uint32_t>(m_.tcs_vertices) : 0;
+  if (n < 1 || n > kMaxArray) return fail("a patch size the device cannot take");
+  Val items[kMaxArray];
+  for (uint32_t k = 0; k < n; ++k) {
+    items[k] = Val();
+    items[k].rows = et.rows;
+    items[k].cols = et.cols;
+    items[k].num = num_of(et.base);
+    for (uint32_t c = 0; c < et.cols; ++c) {
+      items[k].c[c] = filled('O', static_cast<uint16_t>(reg + c), et.rows);
+      items[k].c[c].dim = static_cast<int16_t>(k);
+    }
+  }
+  bool constant;
+  int32_t k;
+  Val iv;
+  if (!index_of(index.b, &constant, &k, &iv)) return false;
+  if (!constant) return select(iv, n, items, out);
+  if (k < 0 || static_cast<uint32_t>(k) >= n) return fail("index out of range");
+  if (!new_val(et.rows, et.cols, out)) return false;      // (a copy: an output register is not an operand everywhere)
+  out->num = items[k].num;
+  for (uint32_t c = 0; c < et.cols; ++c) inst_rows("MOV", out->c[c].idx, et.rows, &items[k].c[c]);
+  return true;
+}
+
+// A control stage's patch output or tessellation level read: its own value when it wrote one, else the output register (what an invocation put out at a barrier()).
+bool Gen::patch_read(uint64_t gi, Val* out) {
+  const Global& g = *m_.globals[gi];
+  if (gi >= stage_vars_.count() || stage_vars_[gi].flag < 0 || !out_) return fail("a patch output the device cannot take");
+  const StringView name = g.name.view();
+  const bool outer = name.equals("gl_TessLevelOuter"), inner = name.equals("gl_TessLevelInner");
+  const uint32_t patch_out = 1 + out_->registers;
+  uint32_t reg;
+  if (outer || inner) {
+    reg = patch_out + out_->patch_registers + (inner ? 1 : 0);
+  } else {
+    const IoLink* l = nullptr;
+    for (const IoLink& k : out_->links) if (k.out_gi == static_cast<int32_t>(gi) && k.patch) l = &k;
+    if (!l) return fail("a patch output the device cannot take");
+    reg = patch_out + l->base;
+  }
+  Var var, copy;
+  if (!global_var(gi, &var) || !make_var(g.type, &copy)) return false;
+  Oper flag = component(filled('T', static_cast<uint16_t>(stage_vars_[gi].flag), 1), 0);
+  flag.neg = true;
+  const uint32_t elements = var.count ? var.count : 1;
+  for (uint32_t e = 0; e < elements; ++e) {
+    const Var& el = var.count ? elems_[static_cast<uint64_t>(var.first) + e] : var;
+    const Var& cl = copy.count ? elems_[static_cast<uint64_t>(copy.first) + e] : copy;
+    for (uint32_t c = 0; c < el.cols; ++c) {
+      Oper src = filled('O', static_cast<uint16_t>(outer || inner ? reg : reg++), el.rows);
+      if (outer || inner)      // (a level: a component of TESSOUTER / TESSINNER)
+        for (uint8_t& k : src.swz) k = static_cast<uint8_t>(e & 3);
+      const Oper own = filled('T', el.temp[c], el.rows);
+      inst_rows("CMP", cl.temp[c], el.rows, &flag, &own, &src);
+    }
+  }
+  val_of(copy, out);
+  return true;
+}
+
 // The position and the varyings of a vertex: at the end of a vertex or evaluation shader, at each EmitVertex() of a geometry shader. The last stage before the
 // rasterizer converts the position to the device's clip space; the others pass it on as it is.
 bool Gen::write_vertex_outputs() {
@@ -3106,6 +3198,7 @@ bool Gen::write_vertex_outputs() {
     end_inst();
   }
   if (!out_) return fail("a stage without its outputs");
+  if (last_ && sh_.stages.clip && !write_clip_distances()) return false;
   for (const IoLink& l : out_->links) {
     Var v;
     if (l.out_gi < 0 || !global_var(static_cast<uint64_t>(l.out_gi), &v)) return fail("a varying the stage does not declare");
@@ -3116,6 +3209,57 @@ bool Gen::write_vertex_outputs() {
       const Var& el = v.count ? elems_[static_cast<uint64_t>(v.first) + e] : v;
       for (uint32_t c = 0; c < el.cols; ++c) out_mov(reg++, mask_of(el.rows), filled('T', el.temp[c], el.rows), l.saturate);
     }
+  }
+  return true;
+}
+
+// The clip distances of the vertex, the eight of them in OUT[1 + varyings] and the one after (CLIPDIST[0], [1]): what the CPU path computes (GlProgram.cpp, the
+// last stage's clip_distance_slot / clip_vertex_slot).
+bool Gen::write_clip_distances() {
+  const uint32_t first = 1 + out_->registers;
+  clip_out = true;
+  // a gl_ClipDistance the shader writes (its own redeclaration, or the built-in)
+  for (uint64_t k = m_.globals.count(); k > 0; --k) {
+    const Global& g = *m_.globals[k - 1];
+    const bool distance = g.name.view().equals("gl_ClipDistance") && (g.kind == GlobalKind::Out || (g.kind == GlobalKind::Builtin && g.builtin == kBvClipDistance));
+    if (!distance || !g.referenced || !g.type.array) continue;
+    Var v;
+    Oper one;
+    if (!global_var(k - 1, &v) || !v.count || !scalar_imm(1.0f, &one)) return fail("clip distances the device cannot take");
+    for (uint32_t i = 0; i < 8; ++i) {
+      const Oper src = i < v.count ? filled('T', elems_[static_cast<uint64_t>(v.first) + i].temp[0], 1) : one;
+      out_mov(first + i / 4, kChan[i % 4], src);
+    }
+    return true;
+  }
+  // else the user planes against gl_ClipVertex, or the compatibility profile's gl_Position
+  int32_t src_gi = m_.find_global(StringView("gl_ClipVertex"));
+  if (src_gi >= 0 && !m_.globals[static_cast<uint64_t>(src_gi)]->referenced) src_gi = -1;
+  if (src_gi < 0 && m_.compatibility) src_gi = m_.find_builtin_global(kBvPosition);
+  if (src_gi < 0) {      // (nothing to clip with: inside)
+    Oper one;
+    if (!scalar_imm(1.0f, &one)) return false;
+    out_mov(first, "xyzw", one);
+    out_mov(first + 1, "xyzw", one);
+    return true;
+  }
+  Var src;
+  if (!global_var(static_cast<uint64_t>(src_gi), &src) || src.count || src.is_struct || src.rows != 4) return fail("clip distances the device cannot take");
+  if (clip_row_ < 0) {      // (the planes' rows, once: a geometry shader comes here at each EmitVertex())
+    if (sh_.out->const_rows + 8 > sh_.limits.const_rows) return fail("too many uniforms");
+    clip_row_ = static_cast<int32_t>(sh_.out->const_rows);
+    sh_.out->const_rows += 8;
+    for (uint32_t i = 0; i < 8; ++i)
+      if (!sh_.out->constants.push_back(TgsiConstant{kTgsiClipPlanes, static_cast<uint16_t>(clip_row_ + static_cast<int32_t>(i)), 4, i * 4})) return fail("out of memory");
+  }
+  const uint32_t row = static_cast<uint32_t>(clip_row_);
+  uint16_t t;
+  if (!new_temp(&t)) return false;
+  const Oper sv = filled('T', src.temp[0], 4);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const Oper plane = filled('C', static_cast<uint16_t>(row + i), 4);
+    inst("DP4", t, "x", &plane, &sv);
+    out_mov(first + i / 4, kChan[i % 4], component(filled('T', t, 1), 0));
   }
   return true;
 }
@@ -3251,6 +3395,7 @@ void stage_header(String& out, const Gen& g, const Shared& sh) {
       break;
     }
   }
+  if (g.clip_out) out.append("PROPERTY NUM_CLIPDIST_ENABLED 8\n");
   put_decl(out, "IN", true, 0, "POSITION");
   for (uint32_t i = 0; i < in_regs; ++i) put_decl(out, "IN", true, 1 + i, "GENERIC", static_cast<int32_t>(i));
   if (g.primitive_in >= 0) put_decl(out, "IN", false, static_cast<uint32_t>(g.primitive_in), "PRIM_ID");
@@ -3260,6 +3405,8 @@ void stage_header(String& out, const Gen& g, const Shared& sh) {
   const bool control = g.stage() == kStControl;
   put_decl(out, "OUT", control, 0, "POSITION");
   for (uint32_t i = 0; i < out_regs; ++i) put_decl(out, "OUT", control, 1 + i, "GENERIC", static_cast<int32_t>(i));
+  if (g.clip_out)
+    for (uint32_t i = 0; i < 2; ++i) put_decl(out, "OUT", false, 1 + out_regs + i, "CLIPDIST", static_cast<int32_t>(i));
   if (control && ob) {
     for (uint32_t i = 0; i < ob->patch_registers; ++i) put_decl(out, "OUT", false, 1 + out_regs + i, "PATCH", static_cast<int32_t>(i));
     put_decl(out, "OUT", false, 1 + out_regs + ob->patch_registers, "TESSOUTER");
@@ -3298,6 +3445,7 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
     out.append("DCL OUT[0], COLOR\n");
   } else {
     out.append("VERT\n");
+    if (g.clip_out) out.append("PROPERTY NUM_CLIPDIST_ENABLED 8\n");
     for (uint32_t i = 0; i < attributes; ++i) {
       out.append("DCL IN[");
       out.append_uint(i);
@@ -3311,6 +3459,8 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
       out.append_uint(i);
       out.append("]\n");
     }
+    if (g.clip_out)
+      for (uint32_t i = 0; i < 2; ++i) put_decl(out, "OUT", false, 1 + varyings + i, "CLIPDIST", static_cast<int32_t>(i));
   }
   for (uint32_t i = 0; i < g.nsv; ++i) {
     out.append("DCL SV[");
@@ -3466,6 +3616,39 @@ bool stage_boundary(Shared& sh, const Module& producer, bool producer_is_control
     }
     if (!b.links.push_back(l)) return refuse(sh, "out of memory");
   }
+  // (a control stage that reads other invocations' positions reads them from a copy in a GENERIC register: the host does not give back the POSITION output of another)
+  const int32_t pos_gi = producer_is_control ? producer.find_global(StringView("gl_out.gl_Position")) : -1;
+  bool position_read = false;
+  for (const Node& nd : producer.nodes)
+    if (pos_gi >= 0 && nd.kind == NodeKind::Index && nd.a >= 0 && producer.nodes[static_cast<uint64_t>(nd.a)].kind == NodeKind::Global &&
+        producer.nodes[static_cast<uint64_t>(nd.a)].ival == pos_gi) {
+      const int32_t inv = producer.find_global(StringView("gl_InvocationID"));
+      const bool own = nd.b >= 0 && producer.nodes[static_cast<uint64_t>(nd.b)].kind == NodeKind::Global && producer.nodes[static_cast<uint64_t>(nd.b)].ival == inv;
+      position_read = position_read || !own;
+    }
+  if (position_read) {
+    IoLink l;
+    l.out_gi = pos_gi;
+    l.regs = 1;
+    l.base = b.registers++;
+    if (!b.links.push_back(l)) return refuse(sh, "out of memory");
+  }
+  // (a control stage's outputs the evaluation stage does not read have registers too: its invocations may read each other's)
+  for (uint64_t pi = 0; producer_is_control && pi < producer.globals.count(); ++pi) {
+    const Global& pg = *producer.globals[pi];
+    if (pg.kind != GlobalKind::Out || !pg.referenced || pg.builtin != kBvNone || pg.inner || pg.name.view().starts_with("gl_") || (!pg.per_vertex && !pg.patch)) continue;
+    bool linked = false;
+    for (const IoLink& l : b.links) linked = linked || l.out_gi == static_cast<int32_t>(pi);
+    const Type et = pg.type.element();
+    if (linked || !varying_value(et) || (pg.patch && pg.type.array > 32)) continue;
+    IoLink l;
+    l.out_gi = static_cast<int32_t>(pi);
+    l.patch = pg.patch;
+    l.regs = pg.patch ? (pg.type.array ? pg.type.array : 1) * et.cols : et.cols;
+    l.base = pg.patch ? b.patch_registers : b.registers;
+    (pg.patch ? b.patch_registers : b.registers) += l.regs;
+    if (!b.links.push_back(l)) return refuse(sh, "out of memory");
+  }
   if (b.registers > sh.limits.varyings) return refuse(sh, "too many varyings");
   return b.patch_registers + (b.levels ? 2 : 0) <= kMaxPatchRegisters || refuse(sh, "too many patch varyings");
 }
@@ -3599,9 +3782,9 @@ bool translate_program_to_tgsi(allocators::IAllocator& a, const Module& vs, cons
     }
   }
   for (uint32_t i = 0; ok && i < n; ++i) ok = gens[i]->run();
-  if (ok && out->attributes.count() == 0) {
+  if (ok && out->attributes.count() == 0 && !out->attributes.push_back(TgsiAttribute{kTgsiNoAttribute, 4})) {      // (a placeholder: see kTgsiNoAttribute)
     ok = false;
-    sh.why = "no vertex attributes";
+    sh.why = "out of memory";
   }
   // the default tessellation levels of a program without a control stage: two CONST rows
   uint32_t levels_row = 0;

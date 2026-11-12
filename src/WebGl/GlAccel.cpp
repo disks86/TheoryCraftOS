@@ -209,7 +209,8 @@ void GlContext::hw_after_clear(uint32_t mask, bool whole) {
 bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   // (a program with tessellation stages is translated for one patch size: the control stage's input, or the evaluation stage's without one)
   const bool tess = p.extra[kStageTessEval] != nullptr;
-  if (p.accel_tried && tess && p.accel_patch_vertices != desktop.patch_vertices) {
+  const bool clip = desktop.active && desktop.clip_mask != 0;
+  if (p.accel_tried && ((tess && p.accel_patch_vertices != desktop.patch_vertices) || (clip && !p.accel_clip))) {
     const char* why = p.accel_why;
     p.release_accel();
     p.accel_why = why;
@@ -218,6 +219,7 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   p.accel_tried = true;
   p.accel = &acc;
   p.accel_patch_vertices = desktop.patch_vertices;
+  p.accel_clip = clip;
   if (!p.vsm || !p.fsm) return false;
   List<TgsiLink> links(a_);
   for (const VaryingLink& l : p.links) {
@@ -239,6 +241,7 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   stages.tcs = p.extra[kStageTessControl] ? p.extra[kStageTessControl]->module.get() : nullptr;
   stages.tes = tess ? p.extra[kStageTessEval]->module.get() : nullptr;
   stages.patch_vertices = desktop.patch_vertices;
+  stages.clip = clip;
   if ((stages.gs && !al.geometry) || (stages.tes && !al.tessellation)) {
     p.accel_why = "geometry or tessellation shaders on a device without them";
     return false;
@@ -304,6 +307,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     if (desktop.active && (desktop.point_size != 1.0f || desktop.point_sprite || desktop.point_atten[1] != 0 || desktop.point_atten[2] != 0)) return no("a point size");
   }
   if (tf_active_ || rasterizer_discard_) return no("transform feedback or rasterizer discard");
+  if (desktop.active && desktop.clip_mask && (!limits.clip_distances || !desktop.clip_indexed || (desktop.clip_mask & ~0xFFu))) return no("clip planes");
   if (query_active_[0] || query_active_[1]) return no("an occlusion query");
   for (uint32_t q : prim_queries_[0]) if (q) return no("a primitive query");      // (primitives generated: counted on the CPU)
   // (the device's shaders saturate the compatibility colours: with clamping turned off, the CPU draws)
@@ -388,6 +392,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   const uint32_t nattr = static_cast<uint32_t>(t.attributes.count());
   if (nattr == 0 || nattr > kTgsiMaxAttributes) return no("the number of attributes");
   for (uint32_t k = 0; k < nattr; ++k) {
+    if (t.attributes[k].slot == kTgsiNoAttribute) continue;      // (a program without attributes: zeros)
     const AttribInfo* info = nullptr;
     for (const auto& ai : p.attribs)
       if (ai->slot == t.attributes[k].slot) info = ai.get();
@@ -492,6 +497,11 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   for (uint64_t v = 0; v < tris.count(); ++v) {
     const uint32_t index = static_cast<uint32_t>(tris[v]);
     for (uint32_t k = 0; k < nattr; ++k) {
+      if (!attribs[k]) {
+        for (uint32_t i = 0; i < 4; ++i)
+          if (!vertices.put32(0)) return no("out of memory");
+        continue;
+      }
       const VertexAttrib& at = *attribs[k];
       uint32_t lanes[4];
       if (at.enabled) {
@@ -521,6 +531,10 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     uint32_t lanes[4] = {0, 0, 0, 0};
     for (const TgsiConstant& c : t.constants) {
       if (c.row != row) continue;
+      if (c.stage == kTgsiClipPlanes) {      // (the user clip planes, eye space)
+        for (uint32_t i = 0; i < c.comps && i < 4; ++i) lanes[i] = f2u(c.slot / 4 < 8 ? desktop.clip_planes[c.slot / 4][i] : 0.0f);
+        continue;
+      }
       if (c.stage == kTgsiPatchLevels) {      // (the default tessellation levels: outer, then inner)
         for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
           const uint32_t at = c.slot + i;
@@ -576,6 +590,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   st.blend = blend_;
   st.topology = topology;
   st.patch_vertices = topology == 3 ? desktop.patch_vertices : 0;
+  st.clip_mask = desktop.active ? static_cast<uint8_t>(desktop.clip_mask) : 0;
   if (lines || points) st.cull = 0;      // (only polygons are culled)
   if (custom) {
     st.custom_blend = true;

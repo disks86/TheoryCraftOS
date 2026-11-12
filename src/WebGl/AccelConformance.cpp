@@ -119,11 +119,36 @@ constexpr Scene kScenes[] = {
        }},
       {"matrix constructors, inverse and determinant", kVs, kFsHead "void main(){ mat4 m4 = mat4(v.r + 1.0, 0.1, 0.2, 0.0, 0.3, v.g + 1.0, 0.1, 0.0, 0.0, 0.2, v.b + 1.0, 0.0, 0.5, 0.5, 0.5, 1.0); mat3 m3 = mat3(m4); mat2 m2 = mat2(m3); mat3 back = mat3(m2); mat3 i3 = inverse(m3); mat2 i2 = inverse(m2); vec4 fl = vec4(m2); o = vec4(determinant(m3) * 0.2, (i3 * vec3(1.0)).x * 0.5, (i2 * vec2(1.0)).y * 0.5 + back[2].z * 0.1, fl.w * 0.3); }\n", 5, nullptr},
       {"more built-ins", kVs, kFsHead "void main(){ float ip; float fr = modf(v.r * 3.7, ip); vec2 x = v.rg * 2.0 - 1.0; mat2 op = outerProduct(x, vec2(0.5, 0.25)); o = vec4(fr, ip / 4.0, sinh(x.x) * 0.3 + cosh(x.y) * 0.2 + tanh(x.x * 3.0) * 0.2, atanh(x.y * 0.5) * 0.4 + asinh(x.x) * 0.2 + acosh(1.0 + v.b) * 0.2 + op[1][0]); }\n", 5, nullptr},
+      {"a uniform block", kVs, kFsHead "layout(std140) uniform B { vec4 tint; mat2 m; float s[3]; bool on; };\nvoid main(){ vec2 r = m * v.rg; o = vec4(r, v.b * s[int(v.r * 2.9)], 1.0) * tint + (on ? 0.1 : 0.0); }\n", 5,
+       [](GlContext& gl, uint32_t p) {
+         // std140: tint at 0, m's columns at 16 and 32, s[i] at 48 + 16 i, on at 96
+         float block[28] = {0.9f, 0.8f, 1.0f, 1.0f, 0.5f, 0.25f, 0, 0, -0.25f, 0.75f, 0, 0, 0.3f, 0, 0, 0, 0.6f, 0, 0, 0, 0.9f, 0, 0, 0, 0, 0, 0, 0};
+         ByteBuffer bytes(gl.allocator());
+         for (float f : block) bytes.put32(__builtin_bit_cast(uint32_t, f));
+         bytes.writable_view()[96] = 1;
+         const uint32_t buf = gl.create_buffer();
+         gl.bind_buffer(0x8A11, buf);
+         gl.buffer_data(0x8A11, bytes.view(), 0, 0x88E4);
+         gl.bind_buffer_range(0x8A11, 1, buf, 0, bytes.size());
+         gl.uniform_block_binding(p, gl.get_uniform_block_index(p, StringView("B")), 1);
+       }},
       {"gl_FragData", "attribute vec2 pos; attribute vec4 col; varying vec4 v; void main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }",
        "precision mediump float; varying vec4 v; void main(){ gl_FragData[0] = v.bgra; }", 5, nullptr},
 };
 #undef kFsHead
 #undef kHead
+
+// Clip planes on: distances 0 and 1, as GlApi sets them for a program (its clip varying), and the user planes x > -0.25 and x + y < 0.53125 (between pixel centres:
+// a plane through one would leave it to the rounding of each).
+void clip_two(GlContext& gl, uint32_t p) {
+  const ProgramObj* po = gl.program(p);
+  gl.desktop.clip_varying = po ? po->clip_varying : -1;
+  gl.desktop.clip_mask = gl.desktop.clip_varying >= 0 ? 3 : 0;
+  gl.desktop.clip_indexed = true;
+  const float planes[2][4] = {{1, 0, 0, 0.25f}, {-1, -1, 0, 0.53125f}};
+  for (int i = 0; i < 2; ++i)
+    for (int k = 0; k < 4; ++k) gl.desktop.clip_planes[i][k] = planes[i][k];
+}
 
 // The scenes with geometry and tessellation stages. The vertex shader is the one above in desktop GLSL; the stages after it read v and vk per vertex.
 #define kDesk "#version 400 core\n"
@@ -159,6 +184,21 @@ constexpr Scene kStageScenes[] = {
        [](GlContext& gl, uint32_t) { gl.desktop.patch_outer[0] = 3; gl.desktop.patch_outer[1] = 2; gl.desktop.patch_outer[2] = 4; gl.desktop.patch_inner[0] = 2; }, true, nullptr, nullptr,
        kDesk "layout(triangles, equal_spacing, cw) in;\nin vec4 v[]; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; gl_Position.y -= c.x * c.z * 0.5; g = v[0] * c.x + v[1] * c.y + v[2] * c.z; g.b = gl_TessLevelOuter[2] * 0.2 * c.y; g.a = 1.0; }\n",
        3, 6},
+      {"tessellation: outputs read across barrier(), patch outputs read back", kDeskVs, kDeskFs, 0xE, nullptr, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nin vec4 v[]; out vec4 tv[]; out float w[]; patch out vec4 pc;\n"
+       "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; w[gl_InvocationID] = float(gl_InvocationID) * 0.3 + v[gl_InvocationID].r * 0.2;\n"
+       "  if (gl_InvocationID == 0) { gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = gl_TessLevelOuter[0] + 1.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; pc = v[0]; }\n"
+       "  barrier();\n"
+       "  int next = (gl_InvocationID + 1) % 3; tv[gl_InvocationID] = vec4(w[next], gl_out[next].gl_Position.x * 0.5 + 0.5, pc.b, 1.0) * 0.5 + v[gl_InvocationID] * 0.5; }\n",
+       kTriTes, 3, 6},
+      {"geometry: a vertex shader without attributes", kDesk "out float c;\nvoid main(){ c = 0.7; }\n", kDeskFs, 0, nullptr, true,
+       kDesk "layout(points) in; layout(triangle_strip, max_vertices = 4) out;\nin float c[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 4; ++i) { gl_Position = vec4(float(i % 2) * 1.4 - 0.8, float(i / 2) * 1.2 - 0.6, 0.0, 1.0); g = vec4(c[0], float(i) * 0.25, 1.0 - c[0], 1.0); EmitVertex(); } }\n",
+       nullptr, nullptr, 0, 1},
+      {"clip distances", kDesk "in vec2 pos; in vec4 col; out vec4 g;\nvoid main(){ g = col; gl_Position = vec4(pos, 0.0, 1.0); gl_ClipDistance[0] = pos.x + 0.25; gl_ClipDistance[1] = 0.5 - pos.y; }\n", kDeskFs, 5, clip_two, true},
+      {"clip planes against gl_ClipVertex (compatibility)", "#version 120\nattribute vec2 pos; attribute vec4 col; varying vec4 g;\nvoid main(){ g = col; gl_Position = vec4(pos, 0.0, 1.0); gl_ClipVertex = vec4(pos, 0.0, 1.0); }\n",
+       "#version 120\nvarying vec4 g;\nvoid main(){ gl_FragColor = g; }\n", 5, clip_two, true},
+      {"geometry: clip distances from the geometry stage", kDeskVs, kDeskFs, 4, clip_two, true,
+       kDesk "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; gl_ClipDistance[0] = gl_in[i].gl_Position.y + 0.25; gl_ClipDistance[1] = 1.0; EmitVertex(); } }\n"},
       {"tessellation and geometry together", kDeskVs, kDeskFs, 0xE, nullptr, true,
        kDesk "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 g0[]; out vec4 g;\nvoid main(){ vec4 c = (gl_in[0].gl_Position + gl_in[1].gl_Position + gl_in[2].gl_Position) / 3.0; for (int i = 0; i < 3; ++i) { gl_Position = mix(c, gl_in[i].gl_Position, 0.8); g = g0[i]; EmitVertex(); } }\n",
        kPassTcs3,

@@ -49,13 +49,20 @@ class TgsiMachine {
   struct Emitted { float out[kRegs][4]; bool cut; };
   std::vector<Emitted> emitted;
   bool pending_cut = false;
+  bool stop_at_barrier = false;   // a BARRIER stops run() / resume() (else it does nothing)
+  bool at_barrier = false;        // ... and they stopped at one
   int addr = 0;
   bool killed = false;
   const graphics::ITextureSet* textures = nullptr;
 
   // Runs `text`; false when it does not parse or uses something the machine has not got.
   bool run(const std::string& text) {
-    std::vector<std::string> body;
+    std::vector<std::string>& body = body_;
+    body.clear();
+    pc_ = 0;
+    loops_.clear();
+    steps_ = 0;
+    at_barrier = false;
     size_t at = 0;
     while (at < text.size()) {
       size_t end = text.find('\n', at);
@@ -100,9 +107,16 @@ class TgsiMachine {
       }
     }
     if (!stack.empty()) return false;
-    std::vector<size_t> loops;
-    uint32_t steps = 0;
-    for (size_t pc = 0; pc < body.size();) {
+    return resume();
+  }
+  // Goes on after a BARRIER (run() and resume() return there with at_barrier set: a control shader's invocations are run side by side to each one).
+  bool resume() {
+    at_barrier = false;
+    std::vector<std::string>& body = body_;
+    std::vector<size_t>& loops = loops_;
+    uint32_t& steps = steps_;
+    size_t& pc = pc_;
+    while (pc < body.size()) {
       const std::string& l = body[pc];
       const size_t sp = l.find(' ');
       const std::string op = l.substr(0, sp);
@@ -121,6 +135,11 @@ class TgsiMachine {
       }
       ++pc;
       if (op == "END") break;
+      if (op == "BARRIER") {
+        if (!stop_at_barrier) continue;
+        at_barrier = true;
+        return true;
+      }
       if (op == "ELSE") {   // the true branch ended: to the ENDIF
         size_t e = pc;
         int depth = 0;
@@ -188,6 +207,10 @@ class TgsiMachine {
   }
 
  private:
+  std::vector<std::string> body_;
+  std::vector<size_t> loops_;
+  size_t pc_ = 0;
+  uint32_t steps_ = 0;
   struct Ref {
     bool neg = false, abs = false;
     std::string file;
@@ -317,7 +340,7 @@ class TgsiMachine {
       pending_cut = true;
       return true;
     }
-    if (op == "BARRIER" || op == "MEMBAR") return true;
+    if (op == "MEMBAR") return true;
     if (op == "KILL_IF") {
       if (!need(1) || !fetch(args[0], a)) return false;
       for (float x : a) killed = killed || x < 0;

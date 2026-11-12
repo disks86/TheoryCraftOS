@@ -71,6 +71,9 @@ struct TgsiConstant {
 
 // Which vertex input a program attribute is: the private slot of the vertex shader's global (GLSL) or the shader location (WGSL), and its component count (the
 // input is always a vec4 on the device).
+// TgsiAttribute::slot of the input a program without attributes is given (the device draws with one at least): it reads nothing, and zeros are sent.
+constexpr uint32_t kTgsiNoAttribute = 0xFFFFFFFFu;
+
 struct TgsiAttribute {
   uint32_t slot;   // (the key)
   uint8_t comps;
@@ -88,6 +91,8 @@ struct TgsiSampler {
 // TgsiConstant::stage of the rows that hold the default tessellation levels (glPatchParameterfv) a program without a control stage uses: slots 0 .. 3 the outer levels,
 // 4 and 5 the inner ones.
 constexpr uint8_t kTgsiPatchLevels = 5;
+// ... and of the user clip planes (glClipPlane, eye space) a program with clip distances compares its gl_ClipVertex or gl_Position with: slot 4 i is plane i.
+constexpr uint8_t kTgsiClipPlanes = 6;
 
 // The stages of a desktop GL program between its vertex and fragment shaders (nullptr: not there), and the patch size its draws use (GL_PATCH_VERTICES: what the
 // control stage takes, or the evaluation stage without one).
@@ -96,6 +101,9 @@ struct TgsiStages {
   const shader::Module* tcs = nullptr;
   const shader::Module* tes = nullptr;
   uint32_t patch_vertices = 0;
+  // The last stage before the rasterizer puts out eight clip distances (CLIPDIST[0], CLIPDIST[1]), as the CPU path has them: its gl_ClipDistance, or the user planes
+  // against its gl_ClipVertex, or (compatibility) its gl_Position; +1 (inside) when it has none of them.
+  bool clip = false;
 };
 
 struct TgsiProgram {
