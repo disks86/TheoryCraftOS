@@ -43,11 +43,13 @@ namespace webgl {
 constexpr uint32_t kTgsiMaxConstRows = 256;
 constexpr uint32_t kTgsiMaxAttributes = 16;
 constexpr uint32_t kTgsiMaxVaryings = 16;
+constexpr uint32_t kTgsiMaxControlVaryings = 32;   // (from a tessellation control stage)
 constexpr uint32_t kTgsiMaxSamplers = 16;
 
 // What the device the shaders are for takes: CONST rows (its push constants), vertex inputs, varyings and fragment samplers. The defaults are what every device has.
 struct TgsiLimits {
   uint32_t const_rows = 8, attributes = 4, varyings = 4, samplers = 2;
+  uint32_t control_varyings = 0;   // the registers per control point from a tessellation control stage to the evaluation stage (0: `varyings`)
 };
 
 // A varying the vertex shader writes and the fragment shader reads: their private slots and the number of floats.
@@ -73,6 +75,8 @@ struct TgsiConstant {
 // input is always a vec4 on the device).
 // TgsiAttribute::slot of the input a program without attributes is given (the device draws with one at least): it reads nothing, and zeros are sent.
 constexpr uint32_t kTgsiNoAttribute = 0xFFFFFFFFu;
+// ... and of gl_VertexID: the draw's number of each vertex (the index with the base vertex, or first + i), as a float.
+constexpr uint32_t kTgsiVertexId = 0xFFFFFFFEu;
 
 struct TgsiAttribute {
   uint32_t slot;   // (the key)

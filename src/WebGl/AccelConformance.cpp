@@ -121,6 +121,18 @@ constexpr Scene kScenes[] = {
        }},
       {"matrix constructors, inverse and determinant", kVs, kFsHead "void main(){ mat4 m4 = mat4(v.r + 1.0, 0.1, 0.2, 0.0, 0.3, v.g + 1.0, 0.1, 0.0, 0.0, 0.2, v.b + 1.0, 0.0, 0.5, 0.5, 0.5, 1.0); mat3 m3 = mat3(m4); mat2 m2 = mat2(m3); mat3 back = mat3(m2); mat3 i3 = inverse(m3); mat2 i2 = inverse(m2); vec4 fl = vec4(m2); o = vec4(determinant(m3) * 0.2, (i3 * vec3(1.0)).x * 0.5, (i2 * vec2(1.0)).y * 0.5 + back[2].z * 0.1, fl.w * 0.3); }\n", 5, nullptr},
       {"more built-ins", kVs, kFsHead "void main(){ float ip; float fr = modf(v.r * 3.7, ip); vec2 x = v.rg * 2.0 - 1.0; mat2 op = outerProduct(x, vec2(0.5, 0.25)); o = vec4(fr, ip / 4.0, sinh(x.x) * 0.3 + cosh(x.y) * 0.2 + tanh(x.x * 3.0) * 0.2, atanh(x.y * 0.5) * 0.4 + asinh(x.x) * 0.2 + acosh(1.0 + v.b) * 0.2 + op[1][0]); }\n", 5, nullptr},
+      {"derivatives: dFdx, dFdy and fwidth", kVs, kFsHead "void main(){ vec2 w = v.rg * 8.0 + v.b; o = vec4(dFdx(v.r) * 12.0 + 0.5, dFdy(v.b) * 12.0 + 0.25, fwidth(w).y * 0.5, dFdx(gl_FragCoord.x) * 0.5 + dFdy(gl_FragCoord.y) * 0.25); }\n", 5, nullptr},
+      {"gl_FragDepth with a depth test", kVs, kFsHead "void main(){ gl_FragDepth = (gl_FragCoord.x > 16.3 ? 0.375 : 0.0625) + gl_FragCoord.y / 64.0; o = vec4(v.rgb, 1.0); }\n", 5,
+       [](GlContext& gl, uint32_t) { gl.enable(0x0B71, true); gl.depth_func(0x0201); gl.clear_depth(0.5f); }},
+      {"gl_VertexID", kHead "in vec2 pos; in vec4 col; out vec4 v; out float vk;\nvoid main(){ v = col * (float(gl_VertexID) * 0.2 + 0.3); vk = float(gl_VertexID % 2); gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kFsHead "void main(){ o = vec4(v.rgb, 1.0) + vec4(0.0, 0.0, vk * 0.25, 0.0); }\n", 4, nullptr},
+      {"structure varyings", kHead "struct P { vec2 a; float b[2]; mat2 m; };\nin vec2 pos; in vec4 col; in float k; out P s; flat out ivec2 n;\nvoid main(){ s.a = col.rg; s.b[0] = col.b; s.b[1] = k * 0.2; s.m = mat2(col.r, col.g, col.b, 1.0) * 0.5; n = ivec2(int(k), 3); gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kHead "precision highp float;\nstruct P { vec2 a; float b[2]; mat2 m; };\nin P s; flat in ivec2 n; out vec4 o;\nvoid main(){ o = vec4(s.a * 0.7 + s.m[1] * 0.3, s.b[0] * 0.5 + s.b[1], float(n.x + n.y) * 0.1); }\n", 4, nullptr},
+      {"packed varyings: more scalars and vec2 than registers", kHead "in vec2 pos; in vec4 col; in float k; out float f[12]; out vec2 w[6]; flat out int n[3];\nvoid main(){ for (int i = 0; i < 12; ++i) f[i] = col[i % 4] * float(i + 1) * 0.08; for (int i = 0; i < 6; ++i) w[i] = col.ba * float(i) * 0.15; n[0] = int(k); n[1] = 2; n[2] = int(k) * 3; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kHead "precision highp float;\nin float f[12]; in vec2 w[6]; flat in int n[3]; out vec4 o;\nvoid main(){ int j = n[0] % 3; o = vec4(f[11] * 0.5 + f[j], f[5] + w[j + 1].x, w[5].y * 0.5 + f[8] * 0.2, float(n[1] + n[2]) * 0.05); }\n", 4, nullptr},
+      {"bitwise integer operators", kVs, kFsHead "void main(){ int a = int(v.r * 255.0), b = int(v.g * 255.0); uint u = uint(b) ^ 0x5Au; ivec2 m = ivec2(a, b) & ivec2(0xF0, 0x3C); o = vec4(float(a & b) / 255.0, float(a | 0x0F) / 255.0, float(u) / 255.0, float(~a + 256 + (m.x | m.y)) / 512.0); }\n", 5, nullptr},
+      {"uniform arrays used whole", kVs, kFsHead "uniform vec4 u_a[3];\nfloat sum(vec4 x[3]) { return x[0].r + x[1].g + x[2].b; }\nvoid main(){ vec4 c[3] = u_a; c[1] = v; o = vec4(sum(u_a) * 0.3, sum(c) * 0.3, u_a == c ? 1.0 : 0.25, 1.0); }\n", 5,
+       [](GlContext& gl, uint32_t p) { const float f[12] = {0.5f, 0.1f, 0.2f, 1, 0.3f, 0.7f, 0.1f, 1, 0.2f, 0.4f, 0.9f, 1}; set_floats(gl, p, "u_a", 1, 4, 3, f); }},
       {"a shadow sampler, nearest, GREATER", kVs, kFsHead "uniform highp sampler2DShadow u_t;\nvoid main(){ o = vec4(texture(u_t, vec3(v.rg, v.b)), v.g * 0.5, 0.25, 1.0); }\n", 5,
        [](GlContext& gl, uint32_t p) { depth_texture(gl, p, 0x0DE1, 8, 8, 0x2600, 0x0204); }},
       {"a shadow sampler, linear, LEQUAL, projective", kVs, kFsHead "uniform highp sampler2DShadow u_t;\nvoid main(){ o = vec4(textureProj(u_t, vec4(v.rg * 2.0, v.b * 2.0, 2.0)), 0.5, v.r, 1.0); }\n", 5,
@@ -272,6 +284,36 @@ constexpr Scene kStageScenes[] = {
        kDesk "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 g0[]; out vec4 g;\nvoid main(){ vec4 c = (gl_in[0].gl_Position + gl_in[1].gl_Position + gl_in[2].gl_Position) / 3.0; for (int i = 0; i < 3; ++i) { gl_Position = mix(c, gl_in[i].gl_Position, 0.8); g = g0[i]; EmitVertex(); } }\n",
        kPassTcs3,
        kDesk "layout(triangles, equal_spacing, ccw) in;\nin vec4 tv[]; out vec4 g0;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; g0 = tv[0] * c.x + tv[1] * c.y + tv[2] * c.z; }\n",
+       3, 6},
+      {"geometry: arrays per vertex and gl_in[].gl_ClipDistance",
+       kDesk "in vec2 pos; in vec4 col; in float k; out vec4 v[2]; out float vk;\nvoid main(){ v[0] = col; v[1] = col.gbra * 0.5; vk = k; gl_Position = vec4(pos, 0.0, 1.0); gl_ClipDistance[0] = k * 0.25; gl_ClipDistance[1] = col.r; }\n",
+       kDeskFs, 4, nullptr, true,
+       kDesk "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[][2]; out vec4 g;\nvoid main(){ int j = int(gl_in[0].gl_ClipDistance[0] * 4.0) % 2; for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i][j] * 0.6 + v[i][1 - j] * 0.2 + vec4(gl_in[i].gl_ClipDistance[1] * 0.2); EmitVertex(); } }\n"},
+      {"tessellation: arrays per control point, written and read by a variable", kDeskVs, kDeskFs, 0xE,
+       [](GlContext& gl, uint32_t p) { const uint32_t n = 2; gl.uniform(gl.get_uniform_location(p, "u_n"), 'i', 1, 1, 1, &n); }, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nin vec4 v[]; out vec2 a[][3]; uniform int u_n;\n"
+       "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; for (int i = 0; i < 3; ++i) a[gl_InvocationID][i] = v[gl_InvocationID].rg * float(i) * 0.4;\n"
+       "  a[gl_InvocationID][u_n] = v[gl_InvocationID].ba; gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0;\n"
+       "  barrier();\n"
+       "  int next = (gl_InvocationID + 1) % 3; a[gl_InvocationID][0] = a[next][u_n] * 0.5 + a[next][1]; }\n",
+       kDesk "layout(triangles, equal_spacing, ccw) in;\nin vec2 a[][3]; uniform int u_n; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec2 s = vec2(0.0); for (int i = 0; i < 3; ++i) s += a[i][0] * c[i] + a[i][u_n] * 0.3 * c[i]; g = vec4(s, a[1][2].y, 1.0); }\n",
+       3, 6},
+      {"tessellation: twenty registers per control point", kDeskVs, kDeskFs, 0xE, nullptr, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nin vec4 v[]; out vec4 a[][20];\n"
+       "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; for (int i = 0; i < 20; ++i) a[gl_InvocationID][i] = v[gl_InvocationID] * (float(i) * 0.05);\n"
+       "  gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
+       kDesk "layout(triangles, equal_spacing, ccw) in;\nin vec4 a[][20]; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec4 s = vec4(0.0); for (int i = 0; i < 3; ++i) s += (a[i][19] * 0.6 + a[i][7] + a[i][2]) * c[i]; g = vec4(s.rgb, 1.0); }\n",
+       3, 6},
+      {"geometry: gl_ClipVertex through gl_in[] (compatibility)", "#version 150 compatibility\nin vec2 pos; in vec4 col; out vec4 v;\nvoid main(){ gl_Position = vec4(pos, 0.0, 1.0); v = col; gl_ClipVertex = vec4(pos * 0.8, 0.0, 1.0); }\n",
+       "#version 150 compatibility\nin vec4 g;\nvoid main(){ gl_FragColor = g; }\n", 4, clip_two, true,
+       "#version 150 compatibility\nlayout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nin vec4 v[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = v[i]; gl_ClipVertex = gl_in[i].gl_ClipVertex * 1.25; EmitVertex(); } }\n"},
+      {"tessellation: packed arrays per control point (31 vec2)", kDeskVs, kDeskFs, 0xE,
+       [](GlContext& gl, uint32_t p) { const uint32_t n = 5; gl.uniform(gl.get_uniform_location(p, "u_n"), 'i', 1, 1, 1, &n); }, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nin vec4 v[]; out block { vec2 m1[16]; vec2 m2[15]; } var[]; uniform int u_n;\n"
+       "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; for (int i = 0; i < 16; ++i) var[gl_InvocationID].m1[i] = v[gl_InvocationID].rg * float(i) * 0.06;\n"
+       "  for (int i = 0; i < 15; ++i) var[gl_InvocationID].m2[i] = v[gl_InvocationID].ba * float(15 - i) * 0.06; var[gl_InvocationID].m1[u_n] = vec2(0.9, 0.1);\n"
+       "  gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
+       kDesk "layout(triangles, equal_spacing, ccw) in;\nin block { vec2 m1[16]; vec2 m2[15]; } var[]; uniform int u_n; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec2 s = vec2(0.0); for (int i = 0; i < 3; ++i) s += (var[i].m1[u_n] * 0.5 + var[i].m1[15] * 0.3 + var[i].m2[u_n + 3]) * c[i]; g = vec4(s, var[2].m2[14].y, 1.0); }\n",
        3, 6},
 };
 #undef kDeskFs

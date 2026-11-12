@@ -50,6 +50,7 @@ struct AccelLimits {
   bool tessellation = false;  // programs with tessellation stages (AccelStages::tcs / tes), and patches
   bool clip_distances = false;  // AccelState::clip_mask: the CLIPDIST outputs of the last stage cut the primitives
   bool float_textures = false;  // create_texture_float (what a depth texture is sent as)
+  uint32_t control_varyings = 0;  // tessellation: the registers per control point from the control to the evaluation stage (0: `varyings`)
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the

@@ -274,6 +274,7 @@ bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
   limits.const_rows = al.const_rows;
   limits.attributes = al.attributes;
   limits.varyings = al.varyings;
+  limits.control_varyings = al.control_varyings;
   limits.samplers = al.textures;
   TgsiStages stages;
   stages.gs = p.extra[kStageGeometry] ? p.extra[kStageGeometry]->module.get() : nullptr;
@@ -431,7 +432,7 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   const uint32_t nattr = static_cast<uint32_t>(t.attributes.count());
   if (nattr == 0 || nattr > kTgsiMaxAttributes) return no("the number of attributes");
   for (uint32_t k = 0; k < nattr; ++k) {
-    if (t.attributes[k].slot == kTgsiNoAttribute) continue;      // (a program without attributes: zeros)
+    if (t.attributes[k].slot == kTgsiNoAttribute || t.attributes[k].slot == kTgsiVertexId) continue;      // (zeros, or the vertex's number: below)
     const AttribInfo* info = nullptr;
     for (const auto& ai : p.attribs)
       if (ai->slot == t.attributes[k].slot) info = ai.get();
@@ -537,7 +538,9 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     const uint32_t index = static_cast<uint32_t>(tris[v]);
     for (uint32_t k = 0; k < nattr; ++k) {
       if (!attribs[k]) {
-        for (uint32_t i = 0; i < 4; ++i)
+        const uint32_t x = t.attributes[k].slot == kTgsiVertexId ? f2u(static_cast<float>(index)) : 0;
+        if (!vertices.put32(x)) return no("out of memory");
+        for (uint32_t i = 1; i < 4; ++i)
           if (!vertices.put32(0)) return no("out of memory");
         continue;
       }

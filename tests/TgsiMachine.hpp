@@ -54,6 +54,12 @@ class TgsiMachine {
   int addr = 0;
   bool killed = false;
   const graphics::ITextureSet* textures = nullptr;
+  // Derivatives (DDX, DDY) as the CPU takes them (src/WebGl/GlDraw.cpp): the shader runs at the pixel to the right and the one above with `derivative_record`
+  // set, which logs each derivative's source (and gives 0), then at the pixel itself with the two logs, a derivative being the logged value less its own. DDY
+  // is TGSI's: along the window's y going down (the upper-left origin, as virgl has it), so it is the negation of the difference with the pixel above.
+  std::vector<float>* derivative_record = nullptr;
+  const std::vector<float>* derivative_x = nullptr;
+  const std::vector<float>* derivative_y = nullptr;
 
   // Runs `text`; false when it does not parse or uses something the machine has not got.
   bool run(const std::string& text) {
@@ -211,6 +217,7 @@ class TgsiMachine {
   std::vector<size_t> loops_;
   size_t pc_ = 0;
   uint32_t steps_ = 0;
+  size_t derivative_count_ = 0;
   struct Ref {
     bool neg = false, abs = false;
     std::string file;
@@ -323,6 +330,17 @@ class TgsiMachine {
       if (!need(2) || !fetch(args[1], a)) return false;
       addr = op == "UARL" ? static_cast<int>(__builtin_bit_cast(uint32_t, a[0])) : static_cast<int>(floorf(op == "ARR" ? a[0] + 0.5f : a[0]));
       return true;
+    }
+    if (op == "DDX" || op == "DDY") {
+      if (!need(2) || !fetch(args[1], a)) return false;
+      const size_t at = derivative_count_++ * 4;
+      const std::vector<float>* log = op == "DDX" ? derivative_x : derivative_y;
+      for (int k = 0; k < 4; ++k) {
+        if (derivative_record) derivative_record->push_back(a[k]);
+        const float d = log && at + 4 <= log->size() ? (*log)[at + k] - a[k] : 0.0f;
+        r[k] = op == "DDY" ? -d : d;
+      }
+      return store(args[0], r);
     }
     if (op == "KILL") {
       killed = true;

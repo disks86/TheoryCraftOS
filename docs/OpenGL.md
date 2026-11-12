@@ -75,19 +75,31 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   take TESSOUTER / TESSINNER as inputs. An evaluation stage without a control shader gets a generated one that passes the vertices on, with the default levels
   of `glPatchParameterfv` in two constant rows. The geometry stage's `gl_PrimitiveIDIn` is a PRIM_ID input; the others' `gl_PrimitiveID` and
   `gl_InvocationID` are system values. The draw's primitives are assembled on the CPU, as the CPU path assembles them (`GlAssemble.hpp`): patches, adjacency
-  lists, and adjacency strips made lists. A program with a control stage is translated again when `GL_PATCH_VERTICES` changes. Refused and left to the CPU:
-  vertex streams; `gl_ViewportIndex`; built-in inputs other than `gl_Position`;
-  arrays of arrays per vertex; flat varyings with `GL_FIRST_VERTEX_CONVENTION`.
-- `src/WebGl/AccelConformance.cpp` has 46 scenes that draw a picture with the accelerator and without, 14 of them desktop GL with geometry and tessellation
+  lists, and adjacency strips made lists. A program with a control stage is translated again when `GL_PATCH_VERTICES` changes. Arrays of arrays per vertex
+  (`in vec4 v[][2]`, a block member array, `gl_in[].gl_ClipDistance`) put each vertex's elements in consecutive registers; the front end's flat index
+  `i * inner + j` is decomposed again for a control stage's own point (`x[gl_InvocationID][j]`, `j` a variable too). `gl_in[].X` of any other built-in or
+  compatibility varying (`gl_ClipVertex`, `gl_FrontColor`, `gl_TexCoord[]`: `tcos_*`) is the stage before's `X`. A per-vertex input holds only the vertices of
+  the primitive or patch (a control stage's `gl_in[]` is `gl_MaxPatchVertices` long). Refused and left to the CPU: vertex streams; `gl_ViewportIndex`; structure
+  varyings between the extra stages; flat varyings with `GL_FIRST_VERTEX_CONVENTION`.
+- Varying packing: when a boundary's links take more registers than the device has, the links of scalars and vec2 share registers (four scalars or two vec2 to
+  one, `IoLink::pack`, `spot_of`), written and read at their channels. Between the control and the evaluation stage the device has more room
+  (`DeviceLimits::control_varyings`, 30 on a GL 4 virgl host). Structure varyings to the fragment shader take a register per column of each member.
+- Fragment derivatives are DDX and DDY; TGSI's DDY runs down the window (the upper-left origin, as virgl showed), so `dFdy` is its negation. `gl_FragDepth` is
+  the z of a POSITION output. `gl_VertexID` is an attribute the context fills with each vertex's number (`kTgsiVertexId`). Bitwise `&`, `|`, `^` go through the
+  device's integers (F2I / F2U and back; exact while the values stay below 2^24, as all the translation's integers), `~` of a signed integer is `-x - 1`. A
+  uniform array the shader uses whole (passed to a function, compared, copied) is copied into a variable at the start; the item lists that index by a variable
+  are on the heap, so arrays of up to 128 elements are taken.
+- `src/WebGl/AccelConformance.cpp` has 58 scenes that draw a picture with the accelerator and without, 20 of them desktop GL with geometry and tessellation
   stages (two invocations and `gl_PrimitiveIDIn`, adjacency, points made quads, triangles and quads at equal and odd spacing, patch varyings, an evaluation stage
-  alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes, legacy shadow lookups, a rectangle texture),
-  plus a uniform block, shadow samplers and structures in GLSL ES. The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 46
-  match on virgl), and
+  alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes, legacy shadow lookups, a rectangle texture,
+  arrays per vertex and per control point, packed control-point arrays, `gl_ClipVertex` through `gl_in[]`), plus a uniform block, shadow samplers, structures,
+  derivatives, `gl_FragDepth`, `gl_VertexID`, bitwise operators, whole uniform arrays, structure varyings and packed varyings in GLSL ES. The kernel runs them at
+  boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 58 match on virgl), and
   `tests/GlAccelTest.cpp` runs them on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with DxgkrnlTest, with per-vertex registers and EMIT; the test's
   device runs the tessellator of `Software/Tessellator.hpp`). `PiglitShaderTest --accel-survey` counts which piglit draws the hardware would take and why the others not (`SURVEY_REASON=text` lists
-  the tests): 923 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
-  barriers, uniform blocks and clip planes, 825 before shadow samplers and structures); most of the draws left are tests with arrays of arrays per vertex, which
-  also need more varyings than virgl has.
+  the tests): 1002 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
+  barriers, uniform blocks and clip planes, 825 before shadow samplers and structures, 923 before derivatives, arrays per vertex and packing); most of the draws
+  left are the variable-indexing stress tests of 31 vec3 / vec4 per vertex, more than any of virgl's stages take.
 - Shadow samplers (`sampler1DShadow`, `sampler2DShadow`, `sampler2DRectShadow`; `texture`, `textureProj`, legacy `shadow1D` / `shadow2D` and their `Proj`
   forms): the depth texture goes to the device as a float texture with the depth in R (`IAccelerator::create_texture_float`, virgl's R32G32B32A32Float), read
   with nearest filtering, and the comparison is the shader's: three weights (reference below, equal to, above the depth) from the compare function, and with
@@ -161,9 +173,9 @@ The desktop's 3D Test can draw its cube through the kernel GL path (the command 
   layouts are reported as `Block.member`; `glBindFragDataLocation`.
 - Clip distances (`gl_ClipDistance` with `GL_CLIP_DISTANCEi`, a compatibility shader's `gl_ClipVertex` against the user planes, or `gl_Position` when it writes neither) are
   tested per fragment, as interpolated varyings, like the fixed-function clip planes; a primitive is not cut geometrically.
-- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, arrays of arrays per vertex, structure varyings, samplers in structures, bitwise integer
-  operators (other than shifts), derivatives, texture kinds other than 2D, vertex-shader textures, arrays of structures, recursion, `continue` inside a `switch`
-  or 4 x 4 `inverse`; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is read back at each swap (no zero-copy present into the
+- The 3D hardware takes only part of GL (see "The 3D hardware"): the translator has no vertex streams, structure varyings between the extra stages, samplers in
+  structures, `~` of unsigned integers, shifts past 23 bits, fragment `gl_PrimitiveID`, point sizes, texture kinds other than 1D / 2D / rectangle,
+  vertex-shader textures, recursion, `continue` inside a `switch` or 4 x 4 `inverse`; no framebuffer objects, stencil, mipmaps or instancing on the device; the picture is read back at each swap (no zero-copy present into the
   window). Only virgl takes TGSI today (the AMD GCN compiler takes a subset).
 - No `KHR_debug` callbacks (a kernel cannot call into the program), no multisampling, `wglUseFontOutlines`, overlay planes, `wglCopyContext`, GL 4.x beyond the few 4.3/4.5
   queries programs call unconditionally, compressed images are not kept as blocks (`glGetCompressedTexImage` fails).
