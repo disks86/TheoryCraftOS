@@ -43,7 +43,7 @@ static struct wl_output* output;
 static struct wl_data_device_manager* ddm;
 static struct xdg_wm_base* wm;
 static struct zxdg_decoration_manager_v1* deco_manager;
-static int shm_xrgb = 0, output_done = 0, output_w = 0;
+static int shm_xrgb = 0, output_done = 0, output_w = 0, output_h = 0;
 static struct xkb_context* xkb;
 static struct xkb_keymap* keymap;
 static struct xkb_state* xkb_state;
@@ -64,7 +64,7 @@ static void shm_format(void* d, struct wl_shm* s, uint32_t format) { if (format 
 static const struct wl_shm_listener shm_listener = {shm_format};
 
 static void out_geometry(void* d, struct wl_output* o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sp, const char* make, const char* model, int32_t t) {}
-static void out_mode(void* d, struct wl_output* o, uint32_t flags, int32_t w, int32_t h, int32_t refresh) { output_w = w; }
+static void out_mode(void* d, struct wl_output* o, uint32_t flags, int32_t w, int32_t h, int32_t refresh) { output_w = w; output_h = h; }
 static void out_done(void* d, struct wl_output* o) { output_done = 1; }
 static void out_scale(void* d, struct wl_output* o, int32_t s) {}
 static void out_name(void* d, struct wl_output* o, const char* n) {}
@@ -208,7 +208,14 @@ static int wait_for(int* cond, int want, int ms) {
   return *cond >= want;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  // The same choices as arguments, for where no environment can be given (the kernel's autorun): --parallel, --screen=WxH or --screen=any
+  const char* screen_choice = getenv("WL_CLIENT_SCREEN");
+  int parallel_choice = getenv("WL_CLIENT_PARALLEL") != NULL;
+  for (int i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--parallel") == 0) parallel_choice = 1;
+    else if (strncmp(argv[i], "--screen=", 9) == 0) screen_choice = argv[i] + 9;
+  }
   display = wl_display_connect(NULL);
   CHECK(display != NULL);
   if (!display) return 1;
@@ -218,11 +225,18 @@ int main(void) {
   wl_display_roundtrip(display);
   CHECK(compositor && subcompositor && shm && seat && output && ddm && wm && deco_manager);
   wl_display_roundtrip(display);
-  CHECK(shm_xrgb && output_done && output_w == 1280);
+  // WL_CLIENT_SCREEN=WxH[/work height]: the desktop's size and the height of its work area (the host server's is 1280x800 with 768 above its
+  // taskbar; the kernel's emulated desktop in tests/linux_dynamic_emulated.sh is another)
+  int screen_w = 1280, screen_h = 800, work_h = 768;
+  const int screen_any = screen_choice && strcmp(screen_choice, "any") == 0;
+  if (screen_any) screen_w = output_w, screen_h = work_h = output_h;      // (whatever the desktop is, as long as it says)
+  else if (screen_choice && sscanf(screen_choice, "%dx%d/%d", &screen_w, &screen_h, &work_h) < 3) work_h = screen_h;
+  CHECK(shm_xrgb && output_done && output_w > 0 && output_w == screen_w && output_h == screen_h);
+  if (output_w != screen_w || output_h != screen_h) printf("the output is %dx%d\n", output_w, output_h);
   wl_display_roundtrip(display);      // (the keyboard was asked for when the seat said what it has: its keymap comes now)
   CHECK(keymap != NULL);
   // WL_CLIENT_PARALLEL: one of several at once; the host server's scripted input goes to one window only, so this one does without it
-  const int parallel = getenv("WL_CLIENT_PARALLEL") != NULL;
+  const int parallel = parallel_choice;
   struct wl_data_device* data_device = wl_data_device_manager_get_data_device(ddm, seat);
 
   // a decorated toplevel
@@ -289,7 +303,10 @@ int main(void) {
   // maximized: the work area inside the frame
   const int before = configured;
   xdg_toplevel_set_maximized(tl);
-  CHECK(wait_for(&configured, before + 1, 2000) && cfg_max && cfg_w == 1280 - 8 && cfg_h == 768 - 32);
+  // (a desktop of unknown size: its frames and taskbar, which the client cannot know, take some of the screen; inside the screen, then)
+  CHECK(wait_for(&configured, before + 1, 2000) && cfg_max &&
+        (screen_any ? cfg_w > screen_w / 2 && cfg_h > screen_h / 2 && cfg_w <= screen_w && cfg_h < screen_h : cfg_w == screen_w - 8 && cfg_h == work_h - 32));
+  if (screen_any) printf("maximized to %dx%d on %dx%d\n", cfg_w, cfg_h, screen_w, screen_h);
   struct wl_buffer* big = make_buffer(cfg_w, cfg_h, 0xFF444444);
   wl_surface_attach(surface, big, 0, 0);
   wl_surface_damage_buffer(surface, 0, 0, cfg_w, cfg_h);

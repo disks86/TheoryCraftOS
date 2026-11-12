@@ -19,7 +19,10 @@
 #include "Executable/ElfFile.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "Executable/PeFile.hpp"
+#include "FileSystem/SystemLayout.hpp"
+#include "Process/ProcessFiles.hpp"
 #include "Process/WindowsStartup.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 
 namespace process {
@@ -251,6 +254,49 @@ uint32_t UserProgram::unload_module(uint64_t base) {
   return unload_library(space_, modules_.get(), base) ? 0 : 0xC0000008u;
 }
 
+namespace {
+
+constexpr uint64_t kMaxInterpreterBytes = 64ull << 20;
+
+// The bytes of a file of the Linux tree by the path a Linux program would use ("/lib64/ld-linux-x86-64.so.2"), following symbolic links on the way and at
+// the end (distributions make the interpreter's path a link). False if it is not there, is too big, or the links go round.
+bool read_linux_file(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, StringView linux_path, ByteBuffer* out) {
+  UniquePointer<ProcessFiles> view = UniquePointer<ProcessFiles>::make(allocator, PathStyle::Posix);
+  if (!view) return false;
+  const StringView root(filesystem::layout::kLinux);
+  view->attach(allocator, fs, root);
+  String wanted(allocator), canonical(allocator), host(allocator), target(allocator);
+  if (!wanted.assign(linux_path)) return false;
+  for (uint32_t hop = 0;; ++hop) {
+    if (hop > 8 || !view->canonical_path(wanted.view(), &canonical)) return false;
+    if (!host.assign(root) || !host.append(canonical.view())) return false;
+    bool to_directory = false;
+    target.clear();
+    if (fs.read_symbolic_link(host.view(), &target, &to_directory) != filesystem::Status::Ok || target.empty()) break;
+    if (target[0] == '/') {      // (a link's target is kept as a path of the file system underneath; one made outside the OS may be the Linux spelling)
+      const StringView t = target.view();
+      const bool hosted = t.size() >= root.size() && t.first(root.size()) == root && (t.size() == root.size() || t[root.size()] == '/');
+      if (!wanted.assign(hosted ? t.without_prefix(root.size()) : t)) return false;
+    } else {
+      const uint64_t slash = canonical.view().rfind('/');
+      if (!wanted.assign(canonical.view().first(slash == StringView::npos ? 0 : slash)) || !wanted.push_back('/') || !wanted.append(target.view())) return false;
+    }
+  }
+  UniquePointer<filesystem::IFile> file;
+  if (fs.open_file(host.view(), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok || !file) return false;
+  const uint64_t size = file->size();
+  if (size == 0 || size > kMaxInterpreterBytes || !out->put_zeros(size)) return false;
+  uint64_t done = 0;
+  while (done < size) {
+    uint64_t got = 0;
+    if (file->read(done, out->writable_view().subview(done, size - done), &got) != filesystem::Status::Ok || got == 0) return false;
+    done += got;
+  }
+  return true;
+}
+
+}  // namespace
+
 LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arguments, ArrayView<const StringView> environment, ConstByteView random) {
   if (process_) return LoadStatus::Malformed;      // already loaded
   const exe::ExecutableKind kind = exe::identify_executable(file.at_most(exe::kIdentifyBytes));
@@ -265,7 +311,21 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     exe::ElfFile elf(allocator_);
     if (!elf.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(elf, &binding)) return LoadStatus::Unsupported;
-    LoadStatus status = load_elf(elf, file, space_, &image);
+    LoadStatus status = LoadStatus::Ok;
+    if (elf.interpreter().empty()) {
+      status = load_elf(elf, file, space_, &image);
+    } else {      // dynamically linked: its interpreter (ld.so) from the Linux tree does the linking
+      ByteBuffer interpreter_file(allocator_);
+      exe::ElfFile interpreter(allocator_);
+      if (!files_ || !read_linux_file(allocator_, *files_, elf.interpreter(), &interpreter_file)) {
+        detail_.assign(StringView("the interpreter "));
+        detail_.append(elf.interpreter());
+        detail_.append(StringView(" was not found"));
+        return LoadStatus::NeedsLibraries;
+      }
+      if (!interpreter.parse(interpreter_file.view())) return LoadStatus::Malformed;
+      status = load_dynamic_elf(elf, file, interpreter, interpreter_file.view(), space_, &image);
+    }
     if (status == LoadStatus::Ok) status = map_stack(space_, kDefaultStackBytes, &stack_top);
     if (status == LoadStatus::Ok) status = build_linux_stack(space_, stack_top, image, arguments, environment, path, random, &stack_pointer,
                                                                        binding.arch == UserArch::AArch64 ? StringView("aarch64") : binding.arch == UserArch::RiscV64 ? StringView("riscv64") : binding.arch == UserArch::LoongArch64 ? StringView("loongarch64") : StringView("x86_64"));

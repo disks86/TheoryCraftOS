@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/ImageLoader.hpp"
 #include "Process/Process.hpp"
@@ -399,9 +401,9 @@ static void test_stacks() {
   CHECK(windows_initial_stack_pointer(top) % 16 == 8 && top - windows_initial_stack_pointer(top) >= 0x28);
 }
 
-static SyscallRequest lin(uint64_t n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0) {
+static SyscallRequest lin(uint64_t n, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0, uint64_t a5 = 0) {
   SyscallRequest r;
-  r.number = n; r.args[0] = a0; r.args[1] = a1; r.args[2] = a2; r.args[3] = a3; r.args[4] = a4;
+  r.number = n; r.args[0] = a0; r.args[1] = a1; r.args[2] = a2; r.args[3] = a3; r.args[4] = a4; r.args[5] = a5;
   return r;
 }
 static int64_t sres(uint64_t v) { return int64_t(v); }
@@ -443,7 +445,7 @@ static void test_linux_memory() {
   CHECK(sres(p.syscall(lin(10, a, 4096, 0x100))) == -22);                // unknown protection bit
   CHECK(sres(p.syscall(lin(9, 0, 0, 3, anon, ~uint64_t{0}))) == -22);   // empty
   CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x20, ~uint64_t{0}))) == -22); // neither shared nor private
-  CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x2, 3))) == -19);            // a file: not supported
+  CHECK(sres(p.syscall(lin(9, 0, 4096, 3, 0x2, 3))) == -9);             // no such descriptor (files are mapped: test_dynamic_user_program)
   CHECK(sres(p.syscall(lin(9, 0, 4096, 0x80, anon, ~uint64_t{0}))) == -22);
   CHECK(sres(p.syscall(lin(9, 0, ~uint64_t{0}, 3, anon, ~uint64_t{0}))) == -22);    // length overflows the page rounding
   CHECK(sres(p.syscall(lin(9, 0, 1ull << 40, 3, anon, ~uint64_t{0}))) == -12);       // over the budget
@@ -928,6 +930,267 @@ static void test_windows_startup() {
   }
 }
 
+// --- dynamically linked programs: the kernel maps the program and its interpreter (ld.so), which maps the libraries with open + mmap -----------------
+
+static const char kInterp[] = "/lib64/ld-linux-x86-64.so.2";
+
+// make_elf() with a third program header: PT_INTERP naming `interp` (inside the first segment, after the headers).
+static Bytes make_dynamic_elf(uint16_t type = 2, const char* interp = kInterp) {
+  Bytes b = make_elf(type, type == 3 ? 0x100 : 0x400100);
+  put(b, 56, 3, 2);
+  const uint64_t o = 64 + 56 * 2;
+  const uint64_t at = 0x180, size = std::string(interp).size() + 1;
+  put(b, o, 3, 4); put(b, o + 4, 4, 4); put(b, o + 8, at, 8); put(b, o + 16, (type == 3 ? 0 : 0x400000) + at, 8); put(b, o + 24, 0, 8);
+  put(b, o + 32, size, 8); put(b, o + 40, size, 8); put(b, o + 48, 1, 8);
+  put_text(b, at, std::string(interp) + std::string(1, '\0'));
+  return b;
+}
+// The interpreter: a shared object (no interpreter of its own) whose code starts with the byte 0x90.
+static Bytes make_interpreter(uint16_t machine = 62) {
+  Bytes b = make_elf(3, 0x100);
+  put(b, 18, machine, 2);
+  put_text(b, 0x100, "\x90");
+  return b;
+}
+
+static bool aux_value(AddressSpace& s, uint64_t sp, uint64_t key, uint64_t* value) {
+  auto word = [&](uint64_t a) { uint8_t raw[8] = {}; s.read(a, ByteView(raw, 8)); uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= uint64_t(raw[i]) << (8 * i); return v; };
+  uint64_t at = sp + 8 * (word(sp) + 2);      // past argc, argv and its null
+  while (word(at)) at += 8;                    // the environment
+  for (at += 8; word(at) != 0; at += 16)
+    if (word(at) == key) { *value = word(at + 8); return true; }
+  return false;
+}
+
+static void test_load_dynamic_elf() {
+  Parsed program(make_dynamic_elf()), interp(make_interpreter());
+  CHECK(program.parse() && interp.parse() && program.elf.interpreter() == StringView(kInterp));
+  LoadedImage image;
+  {
+    AddressSpace s(A);
+    CHECK(load_elf(program.elf, view(program.file), s, &image) == LoadStatus::NeedsLibraries);
+  }
+  AddressSpace s(A);
+  CHECK(load_dynamic_elf(program.elf, view(program.file), interp.elf, view(interp.file), s, &image) == LoadStatus::Ok);
+  CHECK(image.entry == kElfInterpreterBase + 0x100 && image.program_entry == 0x400100 && image.interpreter_base == kElfInterpreterBase);
+  CHECK(image.base == 0x400000 && image.phdr == 0x400040 && image.phnum == 3);      // (the program's, for AT_PHDR)
+  uint8_t code = 0;
+  CHECK(s.read(kElfInterpreterBase + 0x100, ByteView(&code, 1)) && code == 0x90);
+  CHECK(s.read(0x400100, ByteView(&code, 1)) && code == 0xC3);
+  uint8_t prot = 0;
+  CHECK(s.protection_at(kElfInterpreterBase, &prot) && prot == (kProtRead | kProtExecute));
+
+  // The startup block tells the interpreter where it is and where the program starts.
+  uint64_t top = 0, sp = 0, v = 0;
+  const StringView args[] = {"prog"};
+  uint8_t random[16] = {};
+  CHECK(map_stack(s, 1 << 20, &top) == LoadStatus::Ok);
+  CHECK(build_linux_stack(s, top, image, ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), "prog", ConstByteView(random, 16), &sp) == LoadStatus::Ok);
+  CHECK(aux_value(s, sp, 7, &v) && v == kElfInterpreterBase);      // AT_BASE
+  CHECK(aux_value(s, sp, 9, &v) && v == 0x400100);                 // AT_ENTRY: the program's, not the interpreter's
+  CHECK(aux_value(s, sp, 3, &v) && v == 0x400040);                 // AT_PHDR
+  // A static program keeps AT_BASE 0 and its own AT_ENTRY.
+  Parsed plain(make_elf());
+  CHECK(plain.parse());
+  AddressSpace s2(A);
+  LoadedImage still;
+  CHECK(load_elf(plain.elf, view(plain.file), s2, &still) == LoadStatus::Ok && map_stack(s2, 1 << 20, &top) == LoadStatus::Ok);
+  CHECK(build_linux_stack(s2, top, still, ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), "prog", ConstByteView(random, 16), &sp) == LoadStatus::Ok);
+  CHECK(aux_value(s2, sp, 7, &v) && v == 0 && aux_value(s2, sp, 9, &v) && v == 0x400100);
+
+  // A position-independent program goes to the PIE base, the interpreter to its own place.
+  Parsed pie(make_dynamic_elf(3));
+  CHECK(pie.parse());
+  AddressSpace s3(A);
+  CHECK(load_dynamic_elf(pie.elf, view(pie.file), interp.elf, view(interp.file), s3, &image) == LoadStatus::Ok);
+  CHECK(image.program_entry == kElfPieBase + 0x100 && image.entry == kElfInterpreterBase + 0x100);
+
+  // Interpreters that cannot be: an executable, one for another CPU, one that asks for an interpreter itself.
+  auto with = [&](const Bytes& loader) {
+    Parsed i(loader);
+    if (!i.parse()) return LoadStatus::Malformed;
+    AddressSpace sp4(A);
+    LoadedImage out;
+    return load_dynamic_elf(program.elf, view(program.file), i.elf, view(i.file), sp4, &out);
+  };
+  CHECK(with(make_elf()) == LoadStatus::Malformed);
+  CHECK(with(make_interpreter(183)) == LoadStatus::Malformed);      // AArch64
+  CHECK(with(make_dynamic_elf(3)) == LoadStatus::Malformed);
+  // A fixed-address program in the interpreter's place.
+  Bytes high = make_dynamic_elf();
+  put(high, 64 + 56 + 16, kElfInterpreterBase + 0x1000, 8); put(high, 64 + 56 + 24, kElfInterpreterBase + 0x1000, 8);
+  Parsed hi(high);
+  CHECK(hi.parse());
+  AddressSpace s5(A);
+  CHECK(load_dynamic_elf(hi.elf, view(hi.file), interp.elf, view(interp.file), s5, &image) == LoadStatus::Malformed);
+
+  // Truncated and bit-flipped interpreters and programs: any answer, no fault (the host test runs with the sanitizers).
+  uint32_t seed = 12345;
+  auto next = [&]() { seed = seed * 1103515245u + 12345u; return seed >> 8; };
+  for (int round = 0; round < 600; ++round) {
+    Bytes p2 = make_dynamic_elf(round & 1 ? 3 : 2), i2 = make_interpreter();
+    Bytes& victim = round % 3 == 0 ? p2 : i2;
+    if (round % 4 == 0) victim.resize(next() % victim.size());
+    else for (int k = 0; k < 1 + int(next() % 4); ++k) { const uint32_t at = next() % 0x200; if (at < victim.size()) victim[at] ^= uint8_t(1u << (next() % 8)); }
+    exe::ElfFile pe(A), ie(A);
+    if (!pe.parse(view(p2)) || !ie.parse(view(i2))) continue;
+    AddressSpace s6(A, 8 << 20);
+    LoadedImage out;
+    (void)load_dynamic_elf(pe, view(p2), ie, view(i2), s6, &out);
+  }
+}
+
+// What a Linux process can do to regular files with mmap (how ld.so maps libraries), on a RAM file system.
+static void put_file(filesystem::RamFileSystem& fs, const char* path, const Bytes& bytes) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateOrOpen, &file) == filesystem::Status::Ok && file->write(0, view(bytes), &written) == filesystem::Status::Ok);
+}
+
+static void test_dynamic_user_program() {
+  FakeHost host;
+  uint8_t random[16] = {};
+  const StringView args[] = {"prog"};
+  filesystem::RamFileSystem fs(A);
+  CHECK(fs.create_directory("/Linux") == filesystem::Status::Ok && fs.create_directory("/Linux/usr") == filesystem::Status::Ok &&
+        fs.create_directory("/Linux/usr/lib") == filesystem::Status::Ok);
+  // Not there yet: NeedsLibraries, and the detail names the interpreter.
+  {
+    UserProgram u(A, 50, host);
+    u.set_file_system(&fs);
+    CHECK(u.load(view(make_dynamic_elf()), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16)) == LoadStatus::NeedsLibraries);
+    CHECK(u.load_detail().find(StringView(kInterp)) != StringView::npos);
+  }
+  {
+    UserProgram u(A, 51, host);      // no file system at all
+    CHECK(u.load(view(make_dynamic_elf()), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16)) == LoadStatus::NeedsLibraries);
+  }
+  // As distributions have it: /lib64 is a link to usr/lib, and the interpreter's name a link to the versioned file.
+  put_file(fs, "/Linux/usr/lib/ld-2.99.so", make_interpreter());
+  CHECK(fs.create_symbolic_link("/Linux/lib64", "/Linux/usr/lib", true) == filesystem::Status::Ok);
+  CHECK(fs.create_symbolic_link("/Linux/usr/lib/ld-linux-x86-64.so.2", "ld-2.99.so", false) == filesystem::Status::Ok);
+  UserProgram u(A, 52, host);
+  u.set_file_system(&fs);
+  CHECK(u.load(view(make_dynamic_elf()), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16)) == LoadStatus::Ok);
+  CHECK(u.start().entry == kElfInterpreterBase + 0x100 && u.image().program_entry == 0x400100 && u.image().interpreter_base == kElfInterpreterBase);
+  // Links that go round are refused.
+  CHECK(fs.create_symbolic_link("/Linux/usr/lib/loop-a", "loop-b", false) == filesystem::Status::Ok);
+  CHECK(fs.create_symbolic_link("/Linux/usr/lib/loop-b", "loop-a", false) == filesystem::Status::Ok);
+  UserProgram looped(A, 53, host);
+  looped.set_file_system(&fs);
+  CHECK(looped.load(view(make_dynamic_elf(2, "/usr/lib/loop-a")), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16)) == LoadStatus::NeedsLibraries);
+  // An interpreter that is not an ELF file.
+  put_file(fs, "/Linux/usr/lib/not-elf.so", Bytes(4096, 0x41));
+  UserProgram junk(A, 54, host);
+  junk.set_file_system(&fs);
+  CHECK(junk.load(view(make_dynamic_elf(2, "/usr/lib/not-elf.so")), ArrayView<const StringView>(args, 1), ArrayView<const StringView>(), ConstByteView(random, 16)) == LoadStatus::Malformed);
+
+  // mmap of regular files.
+  Process& p = *u.process();
+  Bytes library(3 * 4096 + 100);
+  for (size_t i = 0; i < library.size(); ++i) library[i] = uint8_t(i * 7 + 1);
+  put_file(fs, "/Linux/usr/lib/libdemo.so", library);
+  auto path_in = [&](const char* text) {      // (a string in the program's memory for openat)
+    const uint64_t at = 0x601000 + 0x800;
+    CHECK(u.address_space().write(at, ConstByteView(reinterpret_cast<const uint8_t*>(text), std::string(text).size() + 1)));
+    return at;
+  };
+  const int64_t fd = sres(p.syscall(lin(257, uint64_t(-100), path_in("/usr/lib/libdemo.so"), 0)));
+  CHECK(fd >= 3);
+  // The whole file, private: the bytes, zero after the end of the file, writable without touching the file.
+  const int64_t whole = sres(p.syscall(lin(9, 0, 5 * 4096, kProtRead | kProtWrite, 0x02, uint64_t(fd), 0)));
+  CHECK(whole > 0 && whole % 4096 == 0);
+  Bytes got(5 * 4096);
+  CHECK(u.address_space().read(uint64_t(whole), ByteView(got.data(), got.size())));
+  bool same = true, zero_after = true;
+  for (size_t i = 0; i < library.size(); ++i) same = same && got[i] == library[i];
+  for (size_t i = library.size(); i < got.size(); ++i) zero_after = zero_after && got[i] == 0;
+  CHECK(same && zero_after);
+  uint8_t poke = 0xEE;
+  CHECK(u.address_space().write(uint64_t(whole), ConstByteView(&poke, 1)));
+  const int64_t again = sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x02 | 0x800, uint64_t(fd), 0)));      // (MAP_DENYWRITE is accepted)
+  uint8_t first = 0;
+  CHECK(again > 0 && u.address_space().read(uint64_t(again), ByteView(&first, 1)) && first == library[0]);
+  // An offset and MAP_FIXED over a part of an earlier mapping (what ld.so does with each segment), read-only and executable.
+  const int64_t fixed = sres(p.syscall(lin(9, uint64_t(whole) + 4096, 4096, kProtRead | kProtExecute, 0x02 | 0x10, uint64_t(fd), 2 * 4096)));
+  uint8_t moved = 0, prot = 0;
+  CHECK(fixed == whole + 4096 && u.address_space().read(uint64_t(fixed), ByteView(&moved, 1)) && moved == library[2 * 4096]);
+  CHECK(u.address_space().protection_at(uint64_t(fixed), &prot) && prot == (kProtRead | kProtExecute));
+  // A shared mapping only read is the same copy; one for writing is not supported; an offset that is not page aligned is refused.
+  CHECK(sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x01, uint64_t(fd), 0))) > 0);
+  CHECK(sres(p.syscall(lin(9, 0, 4096, kProtRead | kProtWrite, 0x01, uint64_t(fd), 0))) == -19);
+  CHECK(sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x02, uint64_t(fd), 100))) == -22);
+  CHECK(sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x02, 900, 0))) == -9);
+  // Past the end of the file: all zero.
+  const int64_t beyond = sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x02, uint64_t(fd), 8 * 4096)));
+  CHECK(beyond > 0 && u.address_space().read(uint64_t(beyond), ByteView(&first, 1)) && first == 0);
+  // A file opened only for writing cannot be mapped.
+  const int64_t wfd = sres(p.syscall(lin(257, uint64_t(-100), path_in("/usr/lib/libdemo.so"), 1)));
+  CHECK(wfd >= 3 && sres(p.syscall(lin(9, 0, 4096, kProtRead, 0x02, uint64_t(wfd), 0))) == -13);
+  // MAP_FIXED_NOREPLACE: EEXIST over a mapping, the address itself where it is free; MAP_STACK is accepted.
+  CHECK(sres(p.syscall(lin(9, uint64_t(whole), 4096, kProtRead, 0x02 | 0x100000, uint64_t(fd), 0))) == -17);
+  CHECK(sres(p.syscall(lin(9, 0x30000000, 4096, kProtRead | kProtWrite, 0x22 | 0x100000, ~uint64_t{0}, 0))) == 0x30000000);
+  CHECK(sres(p.syscall(lin(9, 0x30000001, 4096, kProtRead, 0x22 | 0x100000, ~uint64_t{0}, 0))) == -22);
+  CHECK(sres(p.syscall(lin(9, 0, 4096 * 4, kProtRead | kProtWrite, 0x22 | 0x20000, ~uint64_t{0}, 0))) > 0);
+}
+
+// clone3, as glibc's pthread_create calls it: the same thread request as clone, with the stack given as its lowest address and size.
+struct ThreadRuntime final : IProcessRuntime {
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t) override { return true; }
+  void notify() override {}
+  bool interrupted() override { return false; }
+  bool start_thread(const ThreadStart&, bool) override { return false; }
+  bool resume_thread(uint64_t) override { return false; }
+  uint64_t current_thread_id() override { return 1; }
+  bool supports_linux_threads() override { return true; }
+};
+
+static void test_clone3() {
+  AddressSpace s(A, 16 << 20);
+  FakeHost host;
+  ProcessBinding binding{SyscallAbi::Linux, UserArch::X86_64, syscall_interface(SyscallAbi::Linux, UserArch::X86_64)};
+  Process p(1, binding, s, host);
+  p.attach_address_space(s, 0x700000);
+  CHECK(s.map(0x10000, 4096, kProtRead | kProtWrite));
+  auto args_at = [&](std::vector<uint64_t> words) {
+    Bytes raw;
+    for (size_t i = 0; i < words.size(); ++i) put(raw, i * 8, words[i], 8);
+    CHECK(s.write(0x10000, view(raw)));
+    return uint64_t{0x10000};
+  };
+  const uint64_t thread_flags = 0x3D0F00;      // VM, FS, FILES, SIGHAND, THREAD, SYSVSEM, SETTLS, PARENT_SETTID, CHILD_CLEARTID: glibc's
+  // flags, pidfd (glibc fills it in without CLONE_PIDFD), child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup
+  std::vector<uint64_t> good = {thread_flags, 0x10800, 0x10900, 0x10800, 0, 0x200000, 0x8000, 0x12345000, 0, 0, 0};
+  CHECK(sres(p.syscall(lin(435, args_at(good), 88))) == -38);      // no runtime that runs threads: ENOSYS, so glibc falls back as on an old kernel
+  ThreadRuntime runtime;
+  p.attach_runtime(&runtime);
+  const int64_t tid = sres(p.syscall(lin(435, args_at(good), 88)));
+  CHECK(tid > 1);
+  Process::LinuxThreadState::CloneRequest request;
+  CHECK(p.take_clone(&request) && request.tid == uint64_t(tid) && request.stack == 0x208000 && request.set_tls && request.tls == 0x12345000);
+  uint8_t raw[4] = {};
+  CHECK(s.read(0x10800, ByteView(raw, 4)) && int64_t(raw[0] | (raw[1] << 8) | (raw[2] << 16) | (uint32_t(raw[3]) << 24)) == (tid & 0x7FFFFFFF));      // CLONE_PARENT_SETTID
+  std::vector<uint64_t> v0(good.begin(), good.begin() + 8);
+  CHECK(sres(p.syscall(lin(435, args_at(v0), 64))) > 1 && p.take_clone(&request));      // the first, 64-byte version
+  // Refused: a fork (an exit signal), CLONE_PIDFD, set_tid, a cgroup, a stack without a size, a structure too small, unknown fields not zero.
+  auto refused = [&](size_t index, uint64_t value, uint64_t size = 88) { std::vector<uint64_t> w = good; w[index] = value; return sres(p.syscall(lin(435, args_at(w), size))); };
+  CHECK(refused(4, 17) == -22);
+  CHECK(refused(0, thread_flags | 0x1000) == -22);
+  CHECK(refused(8, 0x10a00) == -22 && refused(9, 1) == -22 && refused(10, 3) == -22);
+  CHECK(refused(6, 0) == -22);
+  CHECK(sres(p.syscall(lin(435, args_at(good), 32))) == -22);
+  std::vector<uint64_t> longer = good;
+  longer.push_back(0); longer.push_back(5);
+  CHECK(sres(p.syscall(lin(435, args_at(longer), 104))) == -7);      // E2BIG
+  longer.back() = 0;
+  CHECK(sres(p.syscall(lin(435, args_at(longer), 104))) > 1 && p.take_clone(&request));
+  CHECK(sres(p.syscall(lin(435, 0x900000, 88))) == -14);
+  // clone itself, with glibc's flags (CLONE_SYSVSEM is 0x40000).
+  CHECK(sres(p.syscall(lin(56, thread_flags, 0x300000, 0x10800, 0x10900, 0x1000))) > 1 && p.take_clone(&request) && request.stack == 0x300000);
+}
+
 int main() {
   test_address_space();
   test_load_elf();
@@ -942,6 +1205,9 @@ int main() {
   test_user_page_tables();
   test_linux_thread_pointer_and_startup_calls();
   test_windows_startup();
+  test_load_dynamic_elf();
+  test_dynamic_user_program();
+  test_clone3();
   CHECK(A.live == 0);
   if (g_failed) {
     printf("%d check(s) failed\n", g_failed);

@@ -67,7 +67,7 @@ StringView load_failure(process::LoadStatus status) {
     case process::LoadStatus::NotExecutable: return "this is not a program";
     case process::LoadStatus::Malformed: return "the program file is damaged, or its layout is not one this OS can load";
     case process::LoadStatus::Unsupported: return "this kind of program cannot run here (only 64-bit programs for Linux, and x86-64 programs for Windows)";
-    case process::LoadStatus::NeedsLibraries: return "the program needs shared libraries or DLLs, which this OS does not have yet (it must be statically linked, or use the NT interface directly)";
+    case process::LoadStatus::NeedsLibraries: return "the program needs shared libraries that are not installed (a Linux program's interpreter, such as /lib64/ld-linux-x86-64.so.2, and its libraries go in /Linux; DLLs in /Windows)";
     case process::LoadStatus::OutOfMemory: return "not enough memory to start the program";
     default: return "the program could not be loaded";
   }

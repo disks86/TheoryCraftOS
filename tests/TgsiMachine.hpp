@@ -41,14 +41,28 @@ inline bool tgsi_if(const std::string& op) { return op == "IF" || op == "UIF"; }
 
 class TgsiMachine {
  public:
-  float temp[1024][4] = {}, in[32][4] = {}, out[16][4] = {}, cst[4100][4] = {}, imm[256][4] = {}, sv[4][4] = {};   // (sv: VERTEXID, INSTANCEID)
+  static constexpr int kRegs = 64, kVertices = 32;
+  float temp[1024][4] = {}, in[kRegs][4] = {}, out[kRegs][4] = {}, cst[4100][4] = {}, imm[256][4] = {}, sv[8][4] = {};   // (sv: VERTEXID, INSTANCEID ...)
+  // The geometry and tessellation stages: inputs per vertex (IN[v][r]), a control shader's outputs per control point (OUT[v][r]), and a geometry shader's
+  // emitted vertices (all its OUT registers at each EMIT; `cut` says a primitive ended before the vertex).
+  float in2[kVertices][kRegs][4] = {}, out2[kVertices][kRegs][4] = {};
+  struct Emitted { float out[kRegs][4]; bool cut; };
+  std::vector<Emitted> emitted;
+  bool pending_cut = false;
+  bool stop_at_barrier = false;   // a BARRIER stops run() / resume() (else it does nothing)
+  bool at_barrier = false;        // ... and they stopped at one
   int addr = 0;
   bool killed = false;
   const graphics::ITextureSet* textures = nullptr;
 
   // Runs `text`; false when it does not parse or uses something the machine has not got.
   bool run(const std::string& text) {
-    std::vector<std::string> body;
+    std::vector<std::string>& body = body_;
+    body.clear();
+    pc_ = 0;
+    loops_.clear();
+    steps_ = 0;
+    at_barrier = false;
     size_t at = 0;
     while (at < text.size()) {
       size_t end = text.find('\n', at);
@@ -93,9 +107,16 @@ class TgsiMachine {
       }
     }
     if (!stack.empty()) return false;
-    std::vector<size_t> loops;
-    uint32_t steps = 0;
-    for (size_t pc = 0; pc < body.size();) {
+    return resume();
+  }
+  // Goes on after a BARRIER (run() and resume() return there with at_barrier set: a control shader's invocations are run side by side to each one).
+  bool resume() {
+    at_barrier = false;
+    std::vector<std::string>& body = body_;
+    std::vector<size_t>& loops = loops_;
+    uint32_t& steps = steps_;
+    size_t& pc = pc_;
+    while (pc < body.size()) {
       const std::string& l = body[pc];
       const size_t sp = l.find(' ');
       const std::string op = l.substr(0, sp);
@@ -114,6 +135,11 @@ class TgsiMachine {
       }
       ++pc;
       if (op == "END") break;
+      if (op == "BARRIER") {
+        if (!stop_at_barrier) continue;
+        at_barrier = true;
+        return true;
+      }
       if (op == "ELSE") {   // the true branch ended: to the ENDIF
         size_t e = pc;
         int depth = 0;
@@ -181,10 +207,15 @@ class TgsiMachine {
   }
 
  private:
+  std::vector<std::string> body_;
+  std::vector<size_t> loops_;
+  size_t pc_ = 0;
+  uint32_t steps_ = 0;
   struct Ref {
     bool neg = false, abs = false;
     std::string file;
     int index = 0;
+    int dim = -1;   // FILE[dim][index]
     bool relative = false;
     std::string swz;
   };
@@ -211,7 +242,14 @@ class TgsiMachine {
       }
     }
     if (rb == lb) return false;
-    const std::string inner = s.substr(lb + 1, rb - lb - 1);
+    std::string inner = s.substr(lb + 1, rb - lb - 1);
+    if (rb + 1 < s.size() && s[rb + 1] == '[') {      // two-dimensional: [vertex][register]
+      const size_t rb2 = s.find(']', rb + 1);
+      if (rb2 == std::string::npos) return false;
+      r->dim = atoi(inner.c_str());
+      inner = s.substr(rb + 2, rb2 - rb - 2);
+      rb = rb2;
+    }
     if (inner.rfind("ADDR[0].x+", 0) == 0) r->relative = true, r->index = atoi(inner.c_str() + 10);
     else r->index = atoi(inner.c_str());
     if (rb + 1 < s.size()) {
@@ -224,10 +262,16 @@ class TgsiMachine {
     int index = r.index + (r.relative ? addr : 0);
     static float zero[4];
     zero[0] = zero[1] = zero[2] = zero[3] = 0;
+    if (r.dim >= 0) {
+      if (r.dim >= kVertices || index < 0 || index >= kRegs) return nullptr;
+      if (r.file == "IN") return in2[r.dim][index];
+      if (r.file == "OUT") return out2[r.dim][index];
+      return nullptr;
+    }
     if (r.file == "TEMP") return index >= 0 && index < 1024 ? temp[index] : nullptr;
-    if (r.file == "IN") return index >= 0 && index < 32 ? in[index] : nullptr;
-    if (r.file == "SV") return index >= 0 && index < 4 ? sv[index] : nullptr;
-    if (r.file == "OUT") return index >= 0 && index < 16 ? out[index] : nullptr;
+    if (r.file == "IN") return index >= 0 && index < kRegs ? in[index] : nullptr;
+    if (r.file == "SV") return index >= 0 && index < 8 ? sv[index] : nullptr;
+    if (r.file == "OUT") return index >= 0 && index < kRegs ? out[index] : nullptr;
     if (r.file == "IMM") return index >= 0 && index < 256 ? imm[index] : nullptr;
     if (r.file == "CONST") return index >= 0 && index < 4100 ? cst[index] : zero;
     return nullptr;
@@ -284,6 +328,19 @@ class TgsiMachine {
       killed = true;
       return true;
     }
+    if (op == "EMIT") {
+      Emitted e;
+      memcpy(e.out, out, sizeof out);
+      e.cut = pending_cut;
+      pending_cut = false;
+      emitted.push_back(e);
+      return true;
+    }
+    if (op == "ENDPRIM") {
+      pending_cut = true;
+      return true;
+    }
+    if (op == "MEMBAR") return true;
     if (op == "KILL_IF") {
       if (!need(1) || !fetch(args[0], a)) return false;
       for (float x : a) killed = killed || x < 0;

@@ -28,6 +28,8 @@ namespace linuxabi {
 //   clone: only the flag set a threading library uses (VM, FS, FILES, SIGHAND, THREAD, plus SETTLS and the tid pointers). The caller's registers are copied for the
 //   child by whoever runs the program (Process::take_clone).
 uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* args);
+// clone3(struct clone_args*, size), what glibc tries first: the same threads as sys_clone (EINVAL for a pidfd, an exit signal, set_tid or a cgroup).
+uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size);
 //   futex: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET (private flag ignored); the rest is -ENOSYS.
 uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, uint64_t timeout_or_count, uint64_t address2, uint64_t value3);
 uint64_t sys_set_tid_address(Process& p, uint64_t address);

@@ -43,9 +43,11 @@ void WebGlAccelerator::destroy_program_locked(Program& p) {
   for (Variant& v : p.variants)
     if (v.pipeline) device_.destroy_pipeline(v.pipeline);
   p.variants.clear();
-  if (p.vs) device_.destroy_shader_module(p.vs);
-  if (p.fs) device_.destroy_shader_module(p.fs);
-  p.vs = p.fs = nullptr;
+  IShaderModule** const modules[5] = {&p.vs, &p.fs, &p.gs, &p.hs, &p.ds};
+  for (IShaderModule** m : modules) {
+    if (*m) device_.destroy_shader_module(*m);
+    *m = nullptr;
+  }
   p.attributes = p.varyings = p.textures = 0;
 }
 
@@ -61,12 +63,26 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.textures = units < webgl::kAccelMaxTextures ? units : webgl::kAccelMaxTextures;
   l.blend_state = (info.features & kFeatureBlendState) != 0;
   l.lines = (info.features & kFeatureLines) != 0;
+  l.geometry = l.lines && (info.features & kFeatureGeometryShaders) != 0;
+  l.tessellation = (info.features & kFeatureTessellation) != 0;
+  l.clip_distances = (info.features & kFeatureClipDistances) != 0;
   return l;
 }
 
 uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) {
+  return create_program_stages(vs_tgsi, fs_tgsi, attributes, varyings, textures, webgl::AccelStages());
+}
+
+uint32_t WebGlAccelerator::create_program_stages(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures,
+                                                 const webgl::AccelStages& stages) {
   const webgl::AccelLimits l = limits();
   if (attributes == 0 || attributes > l.attributes || varyings > l.varyings || textures > l.textures) return 0;
+  const bool tess = stages.tcs || stages.tes;
+  if ((stages.gs && !l.geometry) || (tess && (!l.tessellation || !stages.tcs || !stages.tes))) return 0;
+  if (stages.gs && (stages.gs_input > 4 || stages.gs_output > 2 || stages.gs_max_vertices == 0 || stages.gs_invocations == 0 || stages.gs_invocations > 32)) return 0;
+  if (tess && (stages.patch_vertices == 0 || stages.patch_vertices > kMaxPatchControlPoints || stages.tcs_vertices == 0 || stages.tcs_vertices > kMaxPatchControlPoints ||
+               stages.tess_domain > 2 || stages.tess_partitioning > 3 || stages.tess_output > 3))
+    return 0;
   kernel::ScopedMutex guard(lock_);
   UniquePointer<Program> p = UniquePointer<Program>::make(allocator_, allocator_);
   if (!p) return 0;
@@ -81,6 +97,48 @@ uint32_t WebGlAccelerator::create_program(const char* vs_tgsi, const char* fs_tg
   if (!p->vs || !p->fs) {   // a device without TGSI refuses here, and the draw stays on the CPU
     destroy_program_locked(*p);
     return 0;
+  }
+  if (stages.gs) {
+    if (!p->gs_text.assign(StringView(stages.gs))) {
+      destroy_program_locked(*p);
+      return 0;
+    }
+    ShaderModuleDesc gd;
+    gd.stage = ShaderStage::Geometry;
+    gd.tgsi = p->gs_text.c_str();
+    gd.geometry_input = static_cast<GeometryPrimitive>(stages.gs_input);
+    gd.geometry_output = static_cast<GeometryTopology>(stages.gs_output);
+    gd.geometry_max_vertices = stages.gs_max_vertices;
+    gd.geometry_instances = stages.gs_invocations;
+    p->gs = device_.create_shader_module(gd);
+    p->gs_input = stages.gs_input;
+    if (!p->gs) {
+      destroy_program_locked(*p);
+      return 0;
+    }
+  }
+  if (tess) {
+    if (!p->tcs_text.assign(StringView(stages.tcs)) || !p->tes_text.assign(StringView(stages.tes))) {
+      destroy_program_locked(*p);
+      return 0;
+    }
+    ShaderModuleDesc td;      // (both stages say the tessellator's settings, as the device wants)
+    td.tess_input_points = stages.patch_vertices;
+    td.tess_output_points = stages.tcs_vertices;
+    td.tess_domain = static_cast<TessDomain>(stages.tess_domain);
+    td.tess_partitioning = static_cast<TessPartitioning>(stages.tess_partitioning);
+    td.tess_output = static_cast<TessOutput>(stages.tess_output);
+    td.stage = ShaderStage::Hull;
+    td.tgsi = p->tcs_text.c_str();
+    p->hs = device_.create_shader_module(td);
+    td.stage = ShaderStage::Domain;
+    td.tgsi = p->tes_text.c_str();
+    p->ds = p->hs ? device_.create_shader_module(td) : nullptr;
+    p->patch_vertices = stages.patch_vertices;
+    if (!p->hs || !p->ds) {
+      destroy_program_locked(*p);
+      return 0;
+    }
   }
   p->attributes = attributes;
   p->varyings = varyings;
@@ -182,7 +240,7 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   // GL's window rows are the device's rows in the same order (row 0 is the bottom of the GL window, which the device draws as its first row), so the picture is the
   // device's upside down and a counter-clockwise triangle in GL is a clockwise one for the device.
   const uint32_t cull = s.cull > 2 ? 0 : s.cull;
-  uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u);
+  uint64_t key = cull | (s.front_ccw ? 4u : 0u) | (s.depth_test ? 8u : 0u) | (s.depth_write ? 16u : 0u) | (s.blend ? 32u : 0u) | uint64_t{s.clip_mask} << 40;
   if (s.custom_blend) {
     key |= uint64_t{1} << 6;
     key |= uint64_t{s.src_rgb & 15} << 8 | uint64_t{s.dst_rgb & 15} << 12 | uint64_t{s.src_alpha & 15} << 16 | uint64_t{s.dst_alpha & 15} << 20;
@@ -193,6 +251,9 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   GraphicsPipelineDesc d;
   d.vertex_shader = p.vs;
   d.fragment_shader = p.fs;
+  d.geometry_shader = p.gs;
+  d.hull_shader = p.hs;
+  d.domain_shader = p.ds;
   d.vertex_stride = p.attributes * 16;
   d.attribute_count = p.attributes;
   for (uint32_t i = 0; i < p.attributes; ++i) d.attributes[i] = {i, VertexFormat::Float4, i * 16};
@@ -202,6 +263,7 @@ IPipeline* WebGlAccelerator::pipeline_for(Program& p, const webgl::AccelState& s
   d.front_face = s.front_ccw ? FrontFace::Clockwise : FrontFace::CounterClockwise;
   d.depth_test = s.depth_test;
   d.depth_write = s.depth_write;
+  d.clip_distances = s.clip_mask;
   if (s.custom_blend) {      // (the numbers are the device's: Accelerator.hpp)
     if (s.src_rgb > 10 || s.dst_rgb > 10 || s.src_alpha > 10 || s.dst_alpha > 10 || s.op_rgb > 4 || s.op_alpha > 4 || s.depth_compare > 7) return nullptr;
     d.blend.custom = true;
@@ -288,7 +350,10 @@ bool WebGlAccelerator::run_pass(Target& t, bool clear_color, const Vec4& color, 
     Rect2D sc{0, 0, t.width, t.height};
     if (state->scissor) sc = Rect2D{state->sc_x, state->sc_y, state->sc_w, state->sc_h};
     commands_->set_scissor(sc);
-    if (state->topology) commands_->set_primitive_topology(state->topology == 1 ? PrimitiveTopology::LineList : PrimitiveTopology::PointList);
+    static constexpr PrimitiveTopology kTopologies[6] = {PrimitiveTopology::TriangleList, PrimitiveTopology::LineList, PrimitiveTopology::PointList,
+                                                         PrimitiveTopology::PatchList, PrimitiveTopology::LineListAdjacency, PrimitiveTopology::TriangleListAdjacency};
+    if (state->topology == 3) commands_->set_patch_control_points(program->patch_vertices);
+    if (state->topology) commands_->set_primitive_topology(kTopologies[state->topology]);
     commands_->draw(vertex_count);
   }
   commands_->end_render_pass();
@@ -315,8 +380,16 @@ bool WebGlAccelerator::draw(uint32_t handle, uint32_t program, const webgl::Acce
   if (!t || !p || vertex_count == 0 || vertices.size() != uint64_t{vertex_count} * p->attributes * 16 || constants.size() > kMaxPushConstantBytes || constants.size() % 16) return false;
   const DeviceInfo info = device_.info();
   if (constants.size() > info.max_push_constant_bytes) return false;
-  if (state.topology > 2 || (state.topology && !(info.features & kFeatureLines))) return false;
+  if (state.topology > 5 || (state.topology && !(info.features & kFeatureLines))) return false;
+  // (patches go to the tessellation stages and only there, with as many vertices as the program was made for; adjacency only to a geometry stage that takes it)
+  if ((state.topology == 3) != (p->hs != nullptr) || (state.topology == 3 && (state.patch_vertices != p->patch_vertices || vertex_count % p->patch_vertices))) return false;
+  if (p->gs && !p->hs) {
+    static constexpr uint8_t kTakes[6] = {2, 1, 0, 0xFF, 3, 4};   // (the GeometryPrimitive each topology makes)
+    if (kTakes[state.topology] != p->gs_input) return false;
+  }
+  if ((state.topology == 4 || state.topology == 5) && !p->gs) return false;
   if (state.custom_blend && !(info.features & kFeatureBlendState)) return false;
+  if (state.clip_mask && !(info.features & kFeatureClipDistances)) return false;
   return run_pass(*t, false, Vec4(), false, 1.0f, p, &state, vertices, vertex_count, constants);
 }
 

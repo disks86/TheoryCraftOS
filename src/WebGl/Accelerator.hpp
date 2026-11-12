@@ -46,6 +46,22 @@ struct AccelLimits {
   uint32_t const_rows = 8, attributes = 4, varyings = 4, textures = 2;
   bool blend_state = false;   // AccelState's custom blending, colour mask and depth functions
   bool lines = false;         // AccelState::topology lines and points
+  bool geometry = false;      // programs with a geometry stage (AccelStages::gs), and the adjacency topologies
+  bool tessellation = false;  // programs with tessellation stages (AccelStages::tcs / tes), and patches
+  bool clip_distances = false;  // AccelState::clip_mask: the CLIPDIST outputs of the last stage cut the primitives
+};
+
+// The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
+// device's: graphics::GeometryPrimitive, GeometryTopology, TessDomain, TessPartitioning and TessOutput (IGraphicsDevice.hpp).
+struct AccelStages {
+  const char* gs = nullptr;    // a geometry shader, or nullptr
+  uint8_t gs_input = 2, gs_output = 2;   // GeometryPrimitive (2 triangles), GeometryTopology (2 a triangle strip)
+  uint32_t gs_max_vertices = 0, gs_invocations = 1;
+  const char* tcs = nullptr;   // the control and evaluation shaders: both or neither
+  const char* tes = nullptr;
+  uint32_t patch_vertices = 0;   // the vertices of a patch the draws make (the control shader's input), and of the control shader's output patch
+  uint32_t tcs_vertices = 0;
+  uint8_t tess_domain = 1, tess_partitioning = 0, tess_output = 1;   // TessDomain (1 triangles), TessPartitioning (0 integer), TessOutput (1 counter-clockwise triangles)
 };
 
 struct AccelState {
@@ -68,8 +84,13 @@ struct AccelState {
   uint8_t op_rgb = 0, op_alpha = 0;                                 // graphics::BlendOp
   uint8_t color_mask = 0xF;
   uint8_t depth_compare = 3;                                        // graphics::CompareOp (LessEqual)
-  // AccelLimits::lines: what the vertices make, 0 a list of triangles, 1 of lines, 2 of points (one pixel wide)
+  // AccelLimits::lines: what the vertices make, 0 a list of triangles, 1 of lines, 2 of points (one pixel wide); AccelLimits::tessellation: 3 a list of patches of
+  // patch_vertices vertices each; AccelLimits::geometry: 4 a list of lines with adjacency (4 vertices each), 5 of triangles with adjacency (6 each). A program with a
+  // geometry stage takes the primitives its gs_input names, one with tessellation stages only patches.
   uint8_t topology = 0;
+  uint32_t patch_vertices = 0;
+  // AccelLimits::clip_distances: the clip distances the program's last stage writes (CLIPDIST[0] .xyzw 0 .. 3, CLIPDIST[1] 4 .. 7) that cut its primitives, bit i distance i.
+  uint8_t clip_mask = 0;
   // The textures the program samples, by sampler index (SAMP[i] of its TGSI): texture handles from create_texture() and how each is read. texture_count is what the
   // program was created with.
   uint32_t texture_count = 0;
@@ -85,6 +106,11 @@ class IAccelerator {
   // Compiles a TGSI vertex/fragment pair: `attributes` float4 inputs (IN[0..]), `varyings` float4 outputs, and `textures` 2D samplers (SAMP[0..] of the fragment
   // shader, at most limits().textures). 0: the device cannot run it.
   virtual uint32_t create_program(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures) = 0;
+  // The same with geometry or tessellation stages (`varyings`: the fragment shader's inputs). The default takes only programs without them.
+  virtual uint32_t create_program_stages(const char* vs_tgsi, const char* fs_tgsi, uint32_t attributes, uint32_t varyings, uint32_t textures, const AccelStages& stages) {
+    if (stages.gs || stages.tcs || stages.tes) return 0;
+    return create_program(vs_tgsi, fs_tgsi, attributes, varyings, textures);
+  }
   virtual void destroy_program(uint32_t program) = 0;
 
   // A texture of w x h texels (RGBA8, straight alpha, no mipmaps). 0: the device cannot have one (the default: programs with samplers are then refused).

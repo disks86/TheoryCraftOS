@@ -356,12 +356,16 @@ struct ProgramObj {
   uint32_t accel_program = 0;
   bool accel_tried = false;
   const char* accel_why = nullptr;   // why the shaders cannot run on the accelerator (a static string), when they cannot
+  uint32_t accel_patch_vertices = 0; // with tessellation: the GL_PATCH_VERTICES the translation was made for (another one translates again)
+  bool accel_clip = false;           // the translation puts out clip distances (made again with them when clip planes are first enabled for the program)
   ~ProgramObj() { release_accel(); }
   void release_accel() {
     if (accel && accel_program) accel->destroy_program(accel_program);
     accel = nullptr;
     accel_program = 0;
     accel_tried = false;
+    accel_patch_vertices = 0;
+    accel_clip = false;
     tgsi.reset();
   }
 };

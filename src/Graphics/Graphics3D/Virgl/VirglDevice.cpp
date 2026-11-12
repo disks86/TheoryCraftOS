@@ -653,7 +653,7 @@ class VirglPipeline final : public VirglPipelineBase {
                ((front_ccw ? 1u : 0u) << 15) | (desc.multisample ? 1u << 25 : 0u) /*multisample*/ | (1u << 29) /*half pixel center*/ | (1u << 30) /*bottom edge rule*/;
     cmd[n++] = float_bits(1.0f);  // point size
     cmd[n++] = 0;                 // sprite coord enable
-    cmd[n++] = 0;                 // line stipple, clip planes
+    cmd[n++] = uint32_t{desc.clip_distances} << 24;   // line stipple, clip planes (the clip distances enabled)
     cmd[n++] = float_bits(1.0f);  // line width
     cmd[n++] = 0;
     cmd[n++] = 0;

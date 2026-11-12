@@ -67,6 +67,9 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
 
 ## The other protocols, and pings
 
+- **New windows are active.** A toplevel that is mapped takes the activation and the keyboard, as a program's window does when it is first shown.
+  The desktop takes the activation from what the session reports, so before this a Wayland window got no keys until it was clicked. (Found on the
+  real kernel: the libwayland test client waited for its activated configure.)
 - **Activation** (`xdg_activation_v1`): tokens are made by the compositor and spent once; `activate` activates the surface's window as a click would.
 - **Cursor shapes** (`wp_cursor_shape_v1`): the 34 named shapes become the desktop's own cursors (the `OCR_*` shapes it has for Windows programs).
 - **Primary selection** (`zwp_primary_selection_v1`): the middle-button selection between Wayland clients, offered with the keyboard as the
@@ -212,8 +215,9 @@ picture it drew last.
 Real toolkits reach the GPU through Mesa (EGL, GBM) or the Vulkan loader, and both speak to the compositor through libwayland-client. In the order the work
 depends on itself:
 
-1. **A dynamic loader for Linux programs.** libwayland-client, libvulkan.so.1 and Mesa are shared libraries; the Linux layer runs static ELF only. The
-   loader is the gate for everything below (and for running distribution binaries such as foot or GTK applications inside the OS at all).
+1. **A dynamic loader for Linux programs: done** (`docs/LinuxDynamicPrograms.md`). The kernel maps a program's interpreter (glibc's `ld.so`), which
+   loads the shared libraries itself. A libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, built with the development machine's
+   glibc) passes its 24 checks against this compositor inside the OS, on the real kernel in QEMU and on the emulator.
 2. **`VK_KHR_wayland_surface` in the shared Vulkan driver** (as `libvulkan.so.1`, or as an ICD of the system's loader). The pieces exist: a swapchain image
    is an exportable image (`vk_external.inc`), a present is `zwp_linux_buffer_params_v1.create_immed` once per image, then attach / damage / commit, with
    explicit sync's acquire point after the frame's work and the release point waited for in `vkAcquireNextImageKHR`. What is missing is the call path into
@@ -249,5 +253,6 @@ depends on itself:
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.
 - **Windows programs.** Wayland needs descriptor passing, which Windows' `AF_UNIX` lacks, so only Linux programs are clients.
-- **Real programs in the OS.** No dynamically linked Wayland program (libwayland in `/Linux`) has been run inside the OS yet. The real-library tests
-  run on the development machine against the same compositor code, and the in-OS test uses the raw protocol.
+- **Real programs in the OS.** Only the test client has been run inside the OS with the real libwayland (`tests/linux_dynamic_emulated.sh`, and
+  QEMU). foot and GTK applications run against the same compositor code on the development machine (`tests/wayland_interop.sh`), not yet inside the
+  OS: they need more libraries in the disk image, and probably more system calls.
