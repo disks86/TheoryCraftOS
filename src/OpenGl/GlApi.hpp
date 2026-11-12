@@ -89,6 +89,7 @@ struct ContextConfig {
   bool forward_compatible = false;
   bool debug = false;
   bool robust = false;
+  bool es = false;      // OpenGL ES 3.0 (EGL): its strings and extensions; shaders without a #version are GLSL ES 1.00
   uint32_t stencil_bits = 8, depth_bits = 24, alpha_bits = 8;
 };
 
@@ -126,6 +127,8 @@ class GlApi {
 
   static constexpr const char* kVersionString = "3.3.0 Compatibility Profile TheoryCraftOS";
   static constexpr const char* kGlslVersionString = "3.30";
+  static constexpr const char* kEsVersionString = "OpenGL ES 3.0 TheoryCraftOS";
+  static constexpr const char* kEsGlslVersionString = "OpenGL ES GLSL ES 3.00";
   allocators::IAllocator& allocator() { return a_; }
 
  private:

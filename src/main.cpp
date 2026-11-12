@@ -822,9 +822,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.
   static font::SystemFontService system_fonts(shared_allocator);
   process::windowsabi::set_font_service(&system_fonts);
-  // The system's OpenGL, for every program (opengl32.dll reaches it with NtTcosOpenGl); a process's contexts and surfaces go when it ends.
+  // The system's OpenGL, for every program (opengl32.dll reaches it with NtTcosOpenGl, Linux's libEGL through /dev/dxg); a process's contexts and surfaces go when
+  // it ends.
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
+  opengl::install_linux_gl(system_gl);
   system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
     Entry e(Level::Info, "OpenGL");
     e.text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");

@@ -754,6 +754,7 @@ DxgExportHandler g_dxg_export = nullptr;
 DxgImportHandler g_dxg_import = nullptr;
 DxgExportSyncHandler g_dxg_export_sync = nullptr;
 DxgImportSyncHandler g_dxg_import_sync = nullptr;
+GlRequestHandler g_gl_handler = nullptr;
 
 void put_le32(uint8_t* at, uint32_t v) {
   for (int i = 0; i < 4; ++i) at[i] = uint8_t(v >> (8 * i));
@@ -893,12 +894,14 @@ void set_dxg_sync_handlers(DxgExportSyncHandler export_handler, DxgImportSyncHan
   g_dxg_export_sync = export_handler;
   g_dxg_import_sync = import_handler;
 }
+void set_gl_request_handler(GlRequestHandler handler) { g_gl_handler = handler; }
 void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler import_handler) {
   g_dxg_export = export_handler;
   g_dxg_import = import_handler;
 }
 
-// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h); TCOS_DXG_IOCTL_EXPORT / IMPORT make and open GPU images as descriptors. Everything else,
+// ioctl on /dev/dxg: TCOS_DXG_IOCTL_CALL runs one D3DKMT service (DxgDevice.h); TCOS_DXG_IOCTL_EXPORT / IMPORT make and open GPU images as descriptors; TCOS_DXG_IOCTL_GL
+// runs a request of the kernel's OpenGL. Everything else,
 // and ioctl on other descriptors, is ENOTTY.
 uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
   const DescriptorKind kind = p.descriptor(fd);
@@ -911,6 +914,17 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   if (code == TCOS_DXG_IOCTL_IMPORT) return dxg_import(p, argument);
   if (code == TCOS_DXG_IOCTL_EXPORT_SYNC) return dxg_export_sync(p, argument);
   if (code == TCOS_DXG_IOCTL_IMPORT_SYNC) return dxg_import_sync(p, argument);
+  if (code == TCOS_DXG_IOCTL_GL) {
+    // TcosDxgGl: request (8), status (4), reserved (4)
+    uint8_t raw[16];
+    if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    const uint64_t request = reader.le64();
+    if (!g_gl_handler) return error(kEnodev);
+    uint8_t out[4];
+    put_le32(out, g_gl_handler(p, request));
+    return p.write_user(argument + 8, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+  }
   if (code != TCOS_DXG_IOCTL_CALL) return error(kEnotty);
   // TcosDxgCall: service (4), status (4), params (8)
   uint8_t raw[16];

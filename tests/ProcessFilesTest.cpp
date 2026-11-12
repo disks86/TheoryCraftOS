@@ -306,6 +306,12 @@ static bool fake_dxg(Process&, uint32_t service, uint64_t params, uint32_t* stat
   *status = 0xC0000123u;
   return true;
 }
+static uint64_t g_gl_request = 0;
+static uint32_t fake_gl(Process&, uint64_t request) {
+  g_gl_request = request;
+  return 0xC000000Du;      // STATUS_INVALID_PARAMETER: what the GL answered
+}
+
 static void test_dxg_device() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
@@ -342,6 +348,20 @@ static void test_dxg_device() {
   CHECK(sres(p.syscall(lin(16, null_fd, TCOS_DXG_IOCTL_CALL, call))) == -25);      // only /dev/dxg takes it
   CHECK(sres(p.syscall(lin(16, 900, TCOS_DXG_IOCTL_CALL, call))) == -9);
   linuxabi::set_dxg_service_handler(nullptr);
+
+  // The kernel's OpenGL (TCOS_DXG_IOCTL_GL): request (8), status (4), reserved (4). It needs no Direct3D layer, only the GL.
+  uint8_t gl_block[16] = {};
+  for (int i = 0; i < 8; ++i) gl_block[i] = uint8_t(uint64_t{0xABCDEF012345} >> (8 * i));
+  CHECK(rig.space.write_privileged(call, ConstByteView(gl_block, 16)));
+  linuxabi::set_gl_request_handler(nullptr);
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_GL, call))) == -19);      // no OpenGL: ENODEV
+  linuxabi::set_gl_request_handler(&fake_gl);
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_GL, 0))) == -14);
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_GL, 0x2FFF8))) == -14);      // runs off the end of the mapping
+  CHECK(sres(p.syscall(lin(16, fd, TCOS_DXG_IOCTL_GL, call))) == 0);
+  CHECK(g_gl_request == 0xABCDEF012345ull && rig.bytes(call + 8, 4) == std::string("\x0D\x00\x00\xC0", 4));      // the status written back
+  CHECK(sres(p.syscall(lin(16, null_fd, TCOS_DXG_IOCTL_GL, call))) == -25);      // only /dev/dxg
+  linuxabi::set_gl_request_handler(nullptr);
 }
 
 // --- Windows --------------------------------------------------------------------------------------------------------------------------------------

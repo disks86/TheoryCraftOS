@@ -109,10 +109,10 @@ struct Fixture {
   ShareGroup group{g_alloc};
   GlSurface surface;
   GlApi api;
-  explicit Fixture(bool core = false, bool accum = false) : surface(g_alloc, config(accum)), api(g_alloc, group, context(core)) {
+  explicit Fixture(bool core = false, bool accum = false, bool es = false) : surface(g_alloc, config(accum)), api(g_alloc, group, context(core, es)) {
     g_api = &api;
     api.bind_surface(&surface);
-    if (!core) {
+    if (!core && !es) {
       glMatrixMode(GL_PROJECTION);
       glLoadIdentity();
       glOrtho(0, W, 0, H, -1, 1);
@@ -122,7 +122,13 @@ struct Fixture {
   }
   ~Fixture() { gl_stream_flush(); g_api = nullptr; }
   static SurfaceConfig config(bool accum) { SurfaceConfig c; c.width = W; c.height = H; c.accum_bits = accum ? 64 : 0; return c; }
-  static ContextConfig context(bool core) { ContextConfig c; c.core_profile = core; return c; }
+  static ContextConfig context(bool core, bool es) {
+    ContextConfig c;
+    c.core_profile = core;
+    c.es = es;
+    if (es) { c.major = 3; c.minor = 0; }
+    return c;
+  }
 };
 
 static void test_strings_and_errors() {
@@ -1810,6 +1816,60 @@ static void test_core_profile() {
   CHECK(e && strncmp(e, "GL_", 3) == 0);
 }
 
+// An OpenGL ES context (EGL's): ES strings and extensions, and a shader without a #version is GLSL ES 1.00 (not desktop GLSL 1.10).
+static void test_es_context() {
+  Fixture f(false, false, true);
+  const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+  CHECK(version && strncmp(version, "OpenGL ES 3.0", 13) == 0);
+  const char* glsl = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
+  CHECK(glsl && strncmp(glsl, "OpenGL ES GLSL ES 3.00", 22) == 0);
+  GLint major = 0, minor = -1;
+  glGetIntegerv(GL_MAJOR_VERSION, &major);
+  glGetIntegerv(GL_MINOR_VERSION, &minor);
+  CHECK(major == 3 && minor == 0);
+  const char* ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+  CHECK(ext && strstr(ext, "GL_OES_element_index_uint") && !strstr(ext, "GL_ARB_"));
+  GLint count = 0;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+  const char* first = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, 0));
+  CHECK(count > 0 && first && strncmp(first, "GL_OES_", 7) == 0);
+  // GLSL ES 1.00 without a #version line: attribute, varying, gl_FragColor and precision as an ES 2.0 program writes them
+  const char* vs = "attribute vec2 pos;\nvarying vec2 v;\nvoid main(){ v = pos; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+  const char* fs = "precision mediump float;\nvarying vec2 v;\nuniform vec4 color;\nvoid main(){ gl_FragColor = color; }\n";
+  const GLuint v = glCreateShader(GL_VERTEX_SHADER), s = glCreateShader(GL_FRAGMENT_SHADER);
+  glShaderSource(v, 1, &vs, nullptr);
+  glShaderSource(s, 1, &fs, nullptr);
+  glCompileShader(v);
+  glCompileShader(s);
+  GLint ok = 0, ok2 = 0;
+  glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok2);
+  CHECK(ok == GL_TRUE && ok2 == GL_TRUE);
+  const GLuint p = glCreateProgram();
+  glAttachShader(p, v);
+  glAttachShader(p, s);
+  glBindAttribLocation(p, 0, "pos");
+  glLinkProgram(p);
+  glGetProgramiv(p, GL_LINK_STATUS, &ok);
+  CHECK(ok == GL_TRUE);
+  glUseProgram(p);
+  glUniform4f(glGetUniformLocation(p, "color"), 1, 0, 1, 1);
+  glClearColor(0, 0, 0, 1);
+  glClear(GL_COLOR_BUFFER_BIT);
+  const float quad[] = {-1, -1, 0, -1, -1, 0, 0, 0};
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);      // (client arrays with the default vertex array, as ES allows)
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  glDisableVertexAttribArray(0);
+  CHECK(near(pixel(10, 10), 255, 0, 255));
+  CHECK(near(pixel(50, 50), 0, 0, 0));
+  CHECK(glGetError() == GL_NO_ERROR);
+  glUseProgram(0);
+  glDeleteProgram(p);
+  glDeleteShader(v);
+  glDeleteShader(s);
+}
+
 // wglShareLists on a context that already has state: it keeps it and sees the other context's objects.
 static void test_join_group() {
   Fixture first;
@@ -1876,6 +1936,22 @@ static void test_service() {
   uint32_t w = 0, h = 0;
   CHECK(service.read_front(1, 0x100, ByteView(front, sizeof(front)), 32, &w, &h) == GlStatus::Ok);
   CHECK(front[0] == 0 && front[2] == 255);      // B, G, R, A
+  // a surface that goes (eglDestroySurface) leaves the context drawing to it with none; its window is unknown afterwards
+  SurfaceRequest gone = s;
+  gone.window = 0x200;
+  CHECK(service.make_current(1, 10, a, gone) == GlStatus::Ok);
+  CHECK(service.destroy_surface(1, 0x200) == GlStatus::Ok);
+  CHECK(service.destroy_surface(1, 0x200) == GlStatus::InvalidHandle);
+  CHECK(service.read_front(1, 0x200, ByteView(), 0, &w, &h) == GlStatus::InvalidHandle);
+  CHECK(service.execute(1, 10, ConstByteView(reinterpret_cast<const uint8_t*>(words), n * 4), g_memory, &result) == GlStatus::Ok);      // (current, no drawable)
+  CHECK(service.read_front(1, 0x100, ByteView(), 0, &w, &h) == GlStatus::Ok && w == 8);      // (the other window is still there)
+  // an ES context through the service: 3.0 whatever was asked
+  ContextRequest es;
+  es.es = true;
+  es.major = 2;
+  uint32_t e = 0;
+  CHECK(service.create_context(1, es, &e) == GlStatus::Ok);
+  CHECK(service.delete_context(1, e) == GlStatus::Ok);
   // a current context with state of its own takes another's objects and keeps its state
   uint32_t c = 0;
   r.share = 0;
@@ -1939,6 +2015,7 @@ int main() {
   test_framebuffer_object();
   test_evaluator();
   test_core_profile();
+  test_es_context();
   test_join_group();
   test_service();
   test_bad_streams();

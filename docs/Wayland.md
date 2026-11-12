@@ -223,9 +223,11 @@ depends on itself:
    commit (FIFO waits for the frame callback), an acquire takes an image whose buffer was released. The protocol goes through the program's own
    libwayland-client (found with `dlsym`), on an event queue of the swapchain's. `tests/linux_vulkan_wayland_emulated.sh` runs a glibc + libwayland +
    xdg-shell program through it.
-3. **GBM and EGL.** Mesa needs a GBM backend and an EGL platform over `/dev/dxg` instead of a DRM render node: buffers are `/dev/dxg` exports (made by
-   the Direct3D layer with the formats the feedback lists), and GL rendering would go to the kernel's OpenGL (`src/OpenGl`) or to a Zink-like layer on
-   the shared Vulkan driver. The second reuses more: GL over the Vulkan driver, buffers from step 2's code.
+3. **EGL: done; GBM: not.** `libEGL.so.1` of `src/Linux/libegl` ([OpenGL.md](OpenGL.md#linux-egl-and-opengl-es)) is EGL 1.5 with OpenGL ES 2.0/3.0 and
+   OpenGL 3.3 over the kernel's OpenGL (`src/OpenGl`), reached through `/dev/dxg`; a window surface is a `wl_egl_window` whose frames are `wl_shm` buffers
+   (the front image read straight into the buffer at each swap). `tests/linux_egl_wayland_emulated.sh` runs a glibc + libwayland-egl + xdg-shell program
+   through it. Still to do: frames as GPU buffers (the kernel's GL drawing into a `/dev/dxg` allocation exported as a dmabuf, as step 2 does for Vulkan),
+   `EGL_EXT_image_dma_buf_import`, and a `libgbm` over `/dev/dxg` for programs that allocate buffers themselves.
 4. **YUV and several planes** (video players' direct output): the Direct3D layer needs NV12 / P010 formats (with planes at offsets of one allocation), the
    protocol handling more than plane 0, and the desktop's renderers a YUV-to-RGB draw (a shader on the device renderer, the existing conversion code of
    `src/Hardware/VideoCodec` on the CPU).
@@ -236,8 +238,7 @@ depends on itself:
   pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
   once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
-  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. There is no EGL and no `libgbm` yet (see the plan above): a
-  Vulkan program has `VK_KHR_wayland_surface`, but GL toolkits (GTK and Qt with GL) still fall back to `wl_shm`.
+  writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL draws GL programs' frames into `wl_shm` buffers, not GPU buffers, and there is no `libgbm` yet (see the plan above).
   Not tried on a real GPU (only the software renderer and virgl).
 - **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
   panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
