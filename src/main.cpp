@@ -2174,8 +2174,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       namespace layout = filesystem::layout;
       const StringView session_folders[] = {layout::kSessionServicesFolder, layout::kLocalSessionServicesFolder};
       const StringView system_folders[] = {layout::kSystemServicesFolder, layout::kLocalSystemServicesFolder};
-      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2));
-      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2));
+      const StringView session_units[] = {layout::kLocalUserUnitsFolder, layout::kUserUnitsFolder};
+      const StringView system_units[] = {layout::kLocalSystemUnitsFolder, layout::kSystemUnitsFolder};
+      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2), ArrayView<const StringView>(session_units, 2));
+      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2), ArrayView<const StringView>(system_units, 2));
     }
     UniquePointer<dbus::SocketServer> dbus_sockets;
     if (dbus_ids && dbus_notifications.start()) {

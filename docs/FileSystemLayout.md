@@ -36,7 +36,9 @@ kernel-mode Direct3D layer, see [Vulkan.md](Vulkan.md)) without files behind the
 (`/Linux/tmp/.X11-unix/X0`, `kX11SocketFolder`; see [X11.md](X11.md)), which it makes at start. The kernel's Wayland compositor listens at `/run/user/0/wayland-0` (`XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY` of every
 Linux program; `/Linux/run/user/0/wayland-0`, `kRuntimeFolder`; see [Wayland.md](Wayland.md)), also made at start, and the kernel's PipeWire listens there too, at `pipewire-0` and `pulse/native` (see
 [PipeWire.md](PipeWire.md)). The kernel's D-Bus session bus is at `/run/user/0/bus` (`DBUS_SESSION_BUS_ADDRESS`, `kSessionBusSocket`) and its system bus
-at the standard `/run/dbus/system_bus_socket` (`/Linux/run/dbus`, `kSystemBusFolder`; see [DBus.md](DBus.md)). Use the `kWindows*` and `kLinux*`
+at the standard `/run/dbus/system_bus_socket` (`/Linux/run/dbus`, `kSystemBusFolder`; see [DBus.md](DBus.md)). The buses start services from the
+standard `dbus-1/services` and `dbus-1/system-services` folders (`kSessionServicesFolder`, ...), and run a service's systemd unit from
+`/etc/systemd/{system,user}` or `/usr/lib/systemd/{system,user}` (`kSystemUnitsFolder`, ...). Use the `kWindows*` and `kLinux*`
 constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
 
 Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads

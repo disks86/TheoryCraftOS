@@ -23,11 +23,24 @@ namespace dbus {
 
 namespace {
 uint64_t reply_key(uint32_t caller, uint32_t serial) { return uint64_t(caller) << 32 | serial; }
+
+// Reads a small text file whole (a service file, a unit). False when it is missing, not a file or bigger than `limit`.
+bool read_small_file(filesystem::IFileSystem& files, StringView path, uint64_t limit, ByteBuffer* text) {
+  UniquePointer<filesystem::IFile> file;
+  if (files.open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
+  const uint64_t size = file->size();
+  if (size > limit) return false;
+  text->clear();
+  uint64_t got = 0;
+  if (!text->put_zeros(size) || file->read(0, text->writable_view(), &got) != filesystem::Status::Ok || got > size) return false;
+  text->truncate(got);
+  return true;
+}
 }  // namespace
 
 Bus::Bus(allocators::IAllocator& allocator, BusKind kind, StringView guid, StringView machine_id)
     : allocator_(allocator), kind_(kind), connections_(allocator), by_id_(allocator), names_(allocator), name_index_(allocator), pending_(allocator),
-      expiries_(allocator), service_folders_(allocator), services_(allocator), activations_(allocator), local_queue_(allocator), local_peers_(allocator), wire_(allocator), scratch_(allocator) {
+      expiries_(allocator), service_folders_(allocator), unit_folders_(allocator), activation_environment_(allocator), services_(allocator), activations_(allocator), local_queue_(allocator), local_peers_(allocator), wire_(allocator), scratch_(allocator) {
   guid.first(guid.size() < 32 ? guid.size() : 32).copy_to(ArrayView<char>(guid_, 33));
   machine_id.first(machine_id.size() < 32 ? machine_id.size() : 32).copy_to(ArrayView<char>(machine_id_, 33));
 }
@@ -455,7 +468,7 @@ Bus::ExpectStatus Bus::expect_reply(Connection& from, uint32_t serial, Connectio
   const bool known = pending_.contains(key);
   if (!known && from.pending_calls >= kMaxPendingRepliesPerConnection) return ExpectStatus::TooMany;
   if (++generation_ == 0) generation_ = 1;
-  if (reply_timeout_us_ != 0) {
+  {      // (every call is timed, also while the timeout is off, so that turning it on times them all from when they were made)
     // stale entries (answered calls) are dropped when they are more than the live ones (the new queue replaces the old only when it was made whole)
     if (expiries_.count() > 2 * pending_.count() + 4096) {
       Queue<Expiry> live(allocator_);
@@ -470,8 +483,8 @@ Bus::ExpectStatus Bus::expect_reply(Connection& from, uint32_t serial, Connectio
         while (whole && live.dequeue(&e)) whole = expiries_.enqueue(e);
       }
     }
-    if (!expiries_.enqueue(Expiry{key, generation_, now_us_ ? now_us_ + reply_timeout_us_ : 0})) return ExpectStatus::NoMemory;
-    if (!now_us_) ++unset_deadlines_;
+    if (!expiries_.enqueue(Expiry{key, generation_, now_us_})) return ExpectStatus::NoMemory;
+    if (!now_us_) unset_times_ = true;
   }
   if (!pending_.put(key, Pending{to.id, generation_})) return ExpectStatus::NoMemory;      // (its Expiry, if made, is stale: skipped)
   if (!known) ++from.pending_calls;
@@ -479,13 +492,16 @@ Bus::ExpectStatus Bus::expect_reply(Connection& from, uint32_t serial, Connectio
 }
 
 void Bus::expire_replies() {
-  if (reply_timeout_us_ == 0 || now_us_ == 0) return;
-  if (unset_deadlines_) {      // (calls made before the first tick: timed from it)
-    for (Expiry& e : expiries_)
-      if (e.deadline_us == 0) e.deadline_us = now_us_ + reply_timeout_us_;
-    unset_deadlines_ = 0;
+  if (now_us_ == 0) return;
+  if (unset_times_) {      // (calls made before the first tick, all at the front: timed from it)
+    for (Expiry& e : expiries_) {
+      if (e.made_us != 0) break;
+      e.made_us = now_us_;
+    }
+    unset_times_ = false;
   }
-  for (Expiry* e = expiries_.front(); e && e->deadline_us <= now_us_; e = expiries_.front()) {
+  if (reply_timeout_us_ == 0) return;
+  for (Expiry* e = expiries_.front(); e && now_us_ >= e->made_us && now_us_ - e->made_us >= reply_timeout_us_; e = expiries_.front()) {
     const Expiry gone = *e;
     expiries_.dequeue();
     const Pending* p = pending_.find(gone.key);
@@ -510,7 +526,7 @@ void Bus::expire_replies() {
 
 // --- activation
 
-void Bus::set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders) {
+void Bus::set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders, ArrayView<const StringView> unit_folders) {
   launcher_ = launcher;
   service_files_ = files;
   service_folders_.clear();
@@ -518,7 +534,61 @@ void Bus::set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* fi
     String folder(allocator_);
     if (folder.assign(f)) service_folders_.push_back(util::move(folder));
   }
+  unit_folders_.clear();
+  for (const StringView& f : unit_folders) {
+    String folder(allocator_);
+    if (folder.assign(f)) unit_folders_.push_back(util::move(folder));
+  }
   reload_services();
+}
+
+Bus::EnvStatus Bus::set_activation_variable(StringView name, StringView value) {
+  if (name.empty() || name.contains('=')) return EnvStatus::Invalid;
+  for (String& e : activation_environment_.view()) {
+    const StringView v = e.view();
+    if (v.size() <= name.size() || v[name.size()] != '=' || !v.starts_with(name)) continue;
+    const uint64_t old_value = v.size() - name.size() - 1;
+    if (value.size() > old_value && value.size() - old_value > kMaxActivationEnvironmentBytes - activation_environment_bytes_) return EnvStatus::TooMany;
+    String entry(allocator_);
+    if (!entry.append(name) || !entry.push_back('=') || !entry.append(value)) return EnvStatus::NoMemory;
+    activation_environment_bytes_ = activation_environment_bytes_ - old_value + value.size();
+    e = util::move(entry);
+    return EnvStatus::Ok;
+  }
+  if (activation_environment_.count() >= kMaxActivationEnvironment) return EnvStatus::TooMany;
+  const uint64_t bytes = name.size() + 1 + value.size();
+  if (name.size() > kMaxActivationEnvironmentBytes || value.size() > kMaxActivationEnvironmentBytes || bytes > kMaxActivationEnvironmentBytes - activation_environment_bytes_)
+    return EnvStatus::TooMany;
+  String entry(allocator_);
+  if (!entry.append(name) || !entry.push_back('=') || !entry.append(value) || !activation_environment_.push_back(util::move(entry))) return EnvStatus::NoMemory;
+  activation_environment_bytes_ += bytes;
+  return EnvStatus::Ok;
+}
+
+// The text of a systemd unit, from the first unit folder that has it by name, else from a unit there whose [Install] Alias= names it.
+bool Bus::find_unit(StringView unit, ByteBuffer* text) {
+  if (!service_files_ || unit.empty() || unit.contains('/') || !unit.ends_with(".service") || unit.size() > 255) return false;
+  String path(allocator_);
+  for (const String& folder : unit_folders_.view()) {
+    path.clear();
+    if (path.append(folder.view()) && path.push_back('/') && path.append(unit) && read_small_file(*service_files_, path.view(), kMaxServiceFileBytes, text))
+      return true;
+  }
+  uint32_t looked_at = 0;
+  for (const String& folder : unit_folders_.view()) {
+    UniquePointer<filesystem::IDirectory> dir;
+    if (service_files_->open_directory(folder.view(), &dir) != filesystem::Status::Ok) continue;
+    filesystem::DirectoryEntry entry;
+    while (dir->next(&entry) == filesystem::Status::Ok && looked_at < kMaxServiceFiles) {
+      const StringView leaf = entry.name.view();
+      if (entry.type != filesystem::NodeType::File || entry.is_symlink || !leaf.ends_with(".service") || entry.size > kMaxServiceFileBytes) continue;
+      ++looked_at;
+      path.clear();
+      if (!path.append(folder.view()) || !path.push_back('/') || !path.append(leaf)) continue;
+      if (read_small_file(*service_files_, path.view(), kMaxServiceFileBytes, text) && unit_has_alias(StringView(text->view()), unit)) return true;
+    }
+  }
+  return false;
 }
 
 uint32_t Bus::reload_services() {
@@ -536,15 +606,9 @@ uint32_t Bus::reload_services() {
       if (entry.type != filesystem::NodeType::File || !leaf.ends_with(".service") || entry.size > kMaxServiceFileBytes) continue;
       path.clear();
       if (!path.append(folder.view()) || !path.push_back('/') || !path.append(leaf)) continue;
-      UniquePointer<filesystem::IFile> file;
-      if (service_files_->open_file(path.view(), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) continue;
-      const uint64_t size = file->size();
-      if (size > kMaxServiceFileBytes) continue;
-      text.clear();
-      uint64_t got = 0;
-      if (!text.put_zeros(size) || file->read(0, text.writable_view(), &got) != filesystem::Status::Ok) continue;
+      if (!read_small_file(*service_files_, path.view(), kMaxServiceFileBytes, &text)) continue;
       UniquePointer<ServiceFile> service = UniquePointer<ServiceFile>::make(allocator_, allocator_);
-      if (!service || !parse_service_file(StringView(text.view().first(got)), service.get())) continue;
+      if (!service || !parse_service_file(StringView(text.view()), service.get())) continue;
       bool known = false;      // (the first folder that names it wins, as in dbus-daemon)
       for (const UniquePointer<ServiceFile>& s : services_.view()) known |= s->name == service->name.view();
       if (!known) services_.push_back(util::move(service));
@@ -581,23 +645,35 @@ Bus::Activation* Bus::activate(StringView name, Connection& asker, const Message
     error_to(asker, call, "org.freedesktop.DBus.Error.LimitsExceeded", "Too many services are starting");
     return nullptr;
   }
+  // the command: the systemd unit's, when the unit is there (there is no systemd to ask), else Exec
+  UnitService unit(allocator_);
+  bool from_unit = false;
+  if (!service->systemd_service.empty()) {
+    ByteBuffer text(allocator_);
+    from_unit = find_unit(service->systemd_service.view(), &text) && parse_unit_service(allocator_, StringView(text.view()), &unit);
+  }
   List<String> words(allocator_);
-  if (!split_exec(allocator_, service->exec.view(), &words)) {
+  if (!from_unit && !split_exec(allocator_, service->exec.view(), &words)) {
     String text(allocator_);
     text.append("Invalid Exec line in the service file of ");
     text.append(name);
     error_to(asker, call, "org.freedesktop.DBus.Error.Spawn.FileInvalid", text.view());
     return nullptr;
   }
-  StringView argv[kMaxExecWords];
-  for (uint64_t i = 0; i < words.count(); ++i) argv[i] = words[i].view();
+  const List<String>& command = from_unit ? unit.argv : words;
+  List<StringView> argv(allocator_), environment(allocator_);
+  bool listed = true;
+  for (const String& w : command.view()) listed &= argv.push_back(w.view());
+  for (const String& e : activation_environment_.view()) listed &= environment.push_back(e.view());
+  for (const String& e : unit.environment.view()) listed &= environment.push_back(e.view());      // (the unit's win over the bus's, as in systemd)
   UniquePointer<Activation> a = UniquePointer<Activation>::make(allocator_, allocator_);
   String why(allocator_);
-  if (!a || !a->name.assign(name)) {
+  if (!listed || !a || !a->name.assign(name)) {
     error_to(asker, call, "org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
     return nullptr;
   }
-  a->handle = launcher_->start(kind_, name, ArrayView<const StringView>(argv, words.count()), &why);
+  ServiceStart start{kind_, name, ArrayView<const StringView>(argv.view()), ArrayView<const StringView>(environment.view()), service->user.view()};
+  a->handle = launcher_->start(start, &why);
   if (a->handle == 0) {
     String text(allocator_);
     text.append("Failed to execute program ");
@@ -691,6 +767,7 @@ void Bus::finish_activations() {
       text.append("Activation of ");
       text.append(a.name.view());
       text.append(" timed out");
+      launcher_->stop(a.handle);      // (as dbus-daemon kills the child: one that took its name late would hold it with nobody waiting)
       fail_activation(a, "org.freedesktop.DBus.Error.TimedOut", text.view());
       done = true;
     }

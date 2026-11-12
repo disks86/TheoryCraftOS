@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Program/ProgramRunner.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Program/ProgramHost.hpp"
 #include "Emulation/GuestCpu.hpp"
 #include "EmulationJit/GuestJit.hpp"
@@ -39,7 +40,7 @@ namespace desktop {
 namespace {
 
 constexpr uint64_t kMaxProgramBytes = 1ull << 30;
-constexpr uint32_t kMaxArguments = 16;
+constexpr uint32_t kMaxArguments = 64;      // (a D-Bus service's Exec line may have up to dbus::kMaxExecWords words)
 
 bool fail(String* message, StringView text) {
   message->assign(text);
@@ -209,31 +210,34 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   program.set_processor_count(processors);
   // The environment the shell gives a program, with the real number of processors.
   ArrayView<const StringView> standard = process::default_environment(abi);
-  StringView environment[32];
-  uint32_t environment_count = 0;
+  List<StringView> environment(allocator);
   String processors_entry(allocator);
+  bool listed = true;
   for (const StringView& entry : standard) {
-    if (environment_count >= 31) break;
     if (abi == process::SyscallAbi::Windows && entry.size() > 21 && StringView(entry.data(), 21).equals("NUMBER_OF_PROCESSORS=")) {
       processors_entry.assign("NUMBER_OF_PROCESSORS=");
       char digits[12];
       uint32_t n = 0, value = processors ? processors : 1;
       do { digits[n++] = char('0' + value % 10); value /= 10; } while (value);
       while (n) processors_entry.push_back(digits[--n]);
-      environment[environment_count++] = processors_entry.view();
+      listed &= environment.push_back(processors_entry.view());
     } else {
-      environment[environment_count++] = entry;
+      listed &= environment.push_back(entry);
     }
   }
-  for (const StringView& entry : run.extra_environment)      // (a variable given here replaces the standard one of that name)
-    if (environment_count < 32) {
-      const uint64_t eq = entry.find('=');
-      bool replaced = false;
-      for (uint32_t i = 0; eq != StringView::npos && i < environment_count && !replaced; ++i)
-        if (environment[i].starts_with(entry.first(eq + 1))) { environment[i] = entry; replaced = true; }
-      if (!replaced) environment[environment_count++] = entry;
-    }
-  const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), ArrayView<const StringView>(environment, environment_count), ConstByteView(random, sizeof(random)));
+  for (const StringView& entry : run.extra_environment) {      // (a variable given here replaces one of that name before it: standard, or given earlier)
+    if (environment.count() >= kMaxEnvironment) break;
+    const uint64_t eq = entry.find('=');
+    bool replaced = false;
+    for (StringView& e : environment.view())
+      if (!replaced && eq != StringView::npos && e.starts_with(entry.first(eq + 1))) { e = entry; replaced = true; }
+    if (!replaced) listed &= environment.push_back(entry);
+  }
+  if (!listed) {
+    fail(message, "not enough memory to start the program");
+    return RunResult::CouldNotRun;
+  }
+  const process::LoadStatus status = program.load(image.view(), ArrayView<const StringView>(argv, argc), ArrayView<const StringView>(environment.view()), ConstByteView(random, sizeof(random)));
   if (status != process::LoadStatus::Ok) {
     fail(message, load_failure(status));
     if (!program.load_detail().empty()) {

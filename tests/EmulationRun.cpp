@@ -87,14 +87,17 @@ struct EmuLauncher final : dbus::IServiceLauncher {
   struct Child {
     std::atomic<int> state{0};      // 0 running, 1 exited, 2 could not run
     std::atomic<uint32_t> code{0};
+    std::atomic<bool>* stop = nullptr;      // (its run control's)
   };
-  std::function<bool(const std::vector<std::string>&, Child&)> run;
+  std::function<bool(const std::vector<std::string>&, const std::vector<std::string>&, Child&)> run;
   std::vector<std::unique_ptr<Child>> children;
-  uint64_t start(dbus::BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
-    std::vector<std::string> args;
-    for (const StringView& a : argv) args.push_back(std::string(a.data(), a.size()));
+  uint64_t start(const dbus::ServiceStart& service, String* why) override {
+    const StringView name = service.name;
+    std::vector<std::string> args, env;
+    for (const StringView& a : service.argv) args.push_back(std::string(a.data(), a.size()));
+    for (const StringView& e : service.environment) env.push_back(std::string(e.data(), e.size()));
     children.push_back(std::make_unique<Child>());
-    if (!run || !run(args, *children.back())) {
+    if (!run || !run(args, env, *children.back())) {
       children.pop_back();
       why->assign("cannot load the program");
       return 0;
@@ -106,6 +109,9 @@ struct EmuLauncher final : dbus::IServiceLauncher {
     const Child& c = *children[handle - 1];
     *code = c.code;
     return c.state == 0 ? State::Running : c.state == 1 ? State::Exited : State::CouldNotRun;
+  }
+  void stop(uint64_t handle) override {
+    if (children[handle - 1]->stop) *children[handle - 1]->stop = true;
   }
   void forget(uint64_t) override {}
 };
@@ -581,7 +587,7 @@ int main(int argc, char** argv) {
   std::vector<std::unique_ptr<Ctl>> service_controls;
   std::vector<std::thread> service_threads;
   std::vector<std::vector<uint8_t>> service_images;
-  dbus_launcher.run = [&](const std::vector<std::string>& args, EmuLauncher::Child& child) {
+  dbus_launcher.run = [&](const std::vector<std::string>& args, const std::vector<std::string>& env, EmuLauncher::Child& child) {
     const std::string path = std::string(filesystem::layout::kLinux) + args[0];
     UniquePointer<filesystem::IFile> file;
     if (fs.open_file(StringView(path.c_str()), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) {
@@ -600,8 +606,17 @@ int main(int argc, char** argv) {
     for (const std::string& x : args) sargs.push_back(StringView(x.data(), x.size()));
     const ConstByteView bytes(image.data(), image.size());
     for (const StringView& e : process::default_environment(process::abi_for_executable(exe::identify_executable(bytes.at_most(exe::kIdentifyBytes))))) senv.push_back(e);
-    senv.push_back("DBUS_STARTER_ADDRESS=unix:path=/run/user/0/bus");
-    senv.push_back("DBUS_STARTER_BUS_TYPE=session");
+    std::vector<std::string> extra = env;      // (the bus's and the unit's variables, then the starter ones: a later one of a name replaces the earlier)
+    extra.push_back("DBUS_STARTER_ADDRESS=unix:path=/run/user/0/bus");
+    extra.push_back("DBUS_STARTER_BUS_TYPE=session");
+    for (const std::string& e : extra) {
+      const StringView entry(e.data(), e.size());
+      const uint64_t eq = entry.find('=');
+      bool replaced = false;
+      for (StringView& old : senv)
+        if (!replaced && eq != StringView::npos && old.starts_with(entry.first(eq + 1))) { old = entry; replaced = true; }
+      if (!replaced) senv.push_back(entry);
+    }
     if (program->load(bytes, ArrayView<const StringView>(sargs.data(), sargs.size()), ArrayView<const StringView>(senv.data(), senv.size()), ConstByteView(rnd, 16)) !=
         process::LoadStatus::Ok) {
       printf("dbus service: load failed (%.*s)\n", int(program->load_detail().size()), program->load_detail().data());
@@ -611,6 +626,7 @@ int main(int argc, char** argv) {
     service_programs.push_back(std::move(program));
     service_controls.push_back(std::make_unique<Ctl>());
     Ctl* ctl_s = service_controls.back().get();
+    child.stop = &ctl_s->stop;
     service_threads.emplace_back([&a, raw, ctl_s, &child] {
       auto cpu_s = create_guest_cpu(raw->start().arch, a);
       Sync sync_s; Threads th_s;
