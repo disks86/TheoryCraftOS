@@ -1808,7 +1808,9 @@ struct ExportedNode {
   bool ok = false;
 };
 
-static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_class, uint32_t direction) {
+// (latency, rate, channels: what the update's props and EnumFormat say of the stream, as pw_stream sends them; 0 / nullptr: not said)
+static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_class, uint32_t direction, const char* latency = nullptr, uint32_t rate = 0,
+                                uint32_t channels = 0) {
   ExportedNode e;
   e.id = id;
   c.send(0, 6, [&](pod::Builder& b) {      // create_object
@@ -1847,13 +1849,15 @@ static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_
     return mine;
   };
   std::vector<NativeMessage> msgs = take();
-  CHECK(e.node != 0 && e.activation && e.wake);
+  CHECK(e.activation && e.wake);
   // the node's update, then active: the server answers with a PortConfig
-  c.send(id, 2, [](pod::Builder& b) {
-    b.int32(3); b.int32(0);
+  c.send(id, 2, [&](pod::Builder& b) {
+    b.int32(3); b.int32(rate ? 1 : 0);
+    if (rate) build_format_param(b, 3, PcmFormat{SampleFormat::F32Le, rate, channels});
     const uint64_t i = b.begin_struct();
     b.int32(0); b.int32(1); b.int64(7); b.int64(0);
-    b.int32(1); b.string("node.name"); b.string("pw-test-node");
+    b.int32(latency ? 2 : 1); b.string("node.name"); b.string("pw-test-node");
+    if (latency) { b.string("node.latency"); b.string(latency); }
     b.int32(0);
     b.end(i);
   });
@@ -1870,7 +1874,7 @@ static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_
         port_config = dir == direction && mode == 2;
       }
     }
-  CHECK(port_config);
+  CHECK(port_config && e.node != 0);      // (the node is bound once it is active: its format is known by then)
   // the port appears (its EnumFormat): the server sets the Format
   c.send(id, 3, [&](pod::Builder& b) {
     b.int32(int32_t(direction)); b.int32(0); b.int32(3); b.int32(1);
@@ -2001,6 +2005,40 @@ static void test_client_node() {
     for (const NativeMessage& m : c.take_with_fds()) paused |= m.id == 3 && m.opcode == 4;
     server.tick();
     CHECK(paused && server.running_nodes() == 0);
+  }
+
+  // ---- the stream's own rate, channels and latency: a 44.1 kHz mono stream asking for 512-frame cycles gets them (no conversion in the program)
+  {
+    ExportedNode own = export_node(c, 5, "Stream/Output/Audio", 1, "512/44100", 44100, 1);
+    CHECK(own.ok);
+    if (own.ok) {
+      ByteView act = own.activation->memory();
+      CHECK(u32_at(act, 560 + 80 + 4) == 44100 && u32_at(act, 560 + 96) == 512);
+      put_u32(act, 0, 3);
+      server.tick();
+      CHECK(u32_at(act, 0) == 1 && u32_at(act, 560 + 80 + 4) == 44100 && u32_at(act, 560 + 96) == 512);
+      CHECK(own.data_size >= 8192 * 4);      // (8192 frames of one channel at least)
+      bool mono = false;
+      g.visit(own.node, [&](const GraphObject& o) { mono = o.props.get("node.latency") == StringView("512/44100"); });
+      CHECK(mono);
+      c.send(0, 7, [](pod::Builder& b) { b.int32(5); });      // Core destroy
+      c.take_with_fds();
+      server.tick();
+    }
+    // node.latency without a format: at the default 48 kHz; a silly one is held to 64 .. 8192 frames
+    ExportedNode small = export_node(c, 6, "Stream/Output/Audio", 1, "1/48000");
+    CHECK(small.ok && u32_at(small.activation->memory(), 560 + 96) == 64);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(6); });
+    c.take_with_fds();
+    ExportedNode big = export_node(c, 7, "Stream/Output/Audio", 1, "100000/1000");
+    CHECK(big.ok && u32_at(big.activation->memory(), 560 + 96) == 8192);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
+    c.take_with_fds();
+    ExportedNode bad = export_node(c, 8, "Stream/Output/Audio", 1, "12/0", 300000, 9);      // (refused values: the defaults)
+    CHECK(bad.ok && u32_at(bad.activation->memory(), 560 + 96) == 1024 && u32_at(bad.activation->memory(), 560 + 80 + 4) == 48000);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
+    c.take_with_fds();
+    server.tick();
   }
 
   // ---- recording: the server fills a buffer from the microphone before each cycle

@@ -29,7 +29,15 @@ namespace process::linuxabi {
 uint64_t sys_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol);
 uint64_t sys_socketpair(Process& p, uint64_t domain, uint64_t type, uint64_t protocol, uint64_t pair);
 uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags);
-uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags);      // (eventfd(initial) is eventfd2(initial, 0))      // (pipe(fds) is pipe2(fds, 0))
+uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags);      // (eventfd(initial) is eventfd2(initial, 0))
+uint64_t sys_timerfd_create(Process& p, uint64_t clock, uint64_t flags);
+uint64_t sys_timerfd_settime(Process& p, uint64_t fd, uint64_t flags, uint64_t value, uint64_t old);
+uint64_t sys_timerfd_gettime(Process& p, uint64_t fd, uint64_t current);
+uint64_t sys_signalfd4(Process& p, uint64_t fd, uint64_t mask, uint64_t size, uint64_t flags);
+uint64_t sys_epoll_create1(Process& p, uint64_t flags);
+uint64_t sys_epoll_ctl(Process& p, uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);
+uint64_t sys_epoll_wait(Process& p, uint64_t epfd, uint64_t events, uint64_t max_events, uint64_t timeout_ms);      // (epoll_pwait: the same, the mask ignored)
+uint64_t sys_epoll_pwait2(Process& p, uint64_t epfd, uint64_t events, uint64_t max_events, uint64_t timespec);      // (pipe(fds) is pipe2(fds, 0))
 uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length);
 uint64_t sys_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length);
 uint64_t sys_listen(Process& p, uint64_t fd, uint64_t backlog);

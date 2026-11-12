@@ -159,6 +159,8 @@ class AddressSpace final : public IUserMemory {
   // IUserMemory: the program's access. Needs read (or write) permission on every page; fails without changing anything otherwise.
   bool read(uint64_t address, ByteView out) override { return check(address, out.size(), kProtRead) && copy_out(address, out); }
   bool write(uint64_t address, ConstByteView data) override { return (check(address, data.size(), kProtWrite) || (break_copy_on_write(address, data.size()) && check(address, data.size(), kProtWrite))) && copy_in(address, data); }
+  // (atomic on the page itself, which the program's threads on other CPUs see through the page tables)
+  bool compare_exchange32(uint64_t address, uint32_t expected, uint32_t desired, uint32_t* observed) override;
 
   // Is every byte of the range mapped with at least these permissions?
   bool check(uint64_t address, uint64_t size, uint8_t protection) const;

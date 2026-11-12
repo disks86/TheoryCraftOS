@@ -498,10 +498,31 @@ struct Watched {
   uint32_t id = 0;
 };
 
-// What poll() reports for one descriptor, for the events asked for (the lock held). Sockets report their state; anything else is ready.
-uint16_t poll_events_locked(UnixSocketManager* m, const Watched& w, uint16_t events) {
+// Now, in a timer's clock: CLOCK_REALTIME (0) and CLOCK_REALTIME_ALARM (8) are the wall clock, the others (MONOTONIC 1, BOOTTIME 7, BOOTTIME_ALARM 9) the
+// monotonic one (nothing here sleeps, so BOOTTIME is MONOTONIC).
+uint64_t clock_now(Process& p, uint32_t clock) { return clock == 0 || clock == 8 ? p.host().realtime_ns() : p.host().monotonic_ns(); }
+
+constexpr uint64_t kNever = ~uint64_t{0};
+
+// A timer brought up to now (the lock held): its expirations counted. *due (when given): made no later than when it next fires, on the monotonic clock.
+void advance_timer_locked(Process& p, UnixSocketManager& m, uint32_t id, uint64_t* due) {
+  uint32_t clock = 0;
+  uint64_t deadline = 0, interval = 0;
+  if (!m.timer_state_locked(id, &clock, &deadline, &interval)) return;
+  const uint64_t now = clock_now(p, clock);
+  m.timer_advance_locked(id, now);
+  if (!due || !m.timer_state_locked(id, &clock, &deadline, &interval) || deadline == 0) return;
+  const uint64_t mono = p.host().monotonic_ns(), left = deadline > now ? deadline - now : 0;
+  const uint64_t at = left > kNever - mono ? kNever - 1 : mono + left;
+  if (at < *due) *due = at;
+}
+
+// What poll() reports for one descriptor, for the events asked for (the lock held). Sockets report their state; anything else is ready. A timer is
+// advanced first, and *due notes when it fires next.
+uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, uint16_t events, uint64_t* due) {
   if (w.kind == DescriptorKind::Closed) return kPollNval;
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
+  advance_timer_locked(p, *m, w.id, due);
   const UnixReadiness r = m->readiness_locked(w.id);
   uint16_t out = 0;
   if (r.readable) out |= events & (kPollIn | kPollRdNorm);
@@ -512,23 +533,45 @@ uint16_t poll_events_locked(UnixSocketManager* m, const Watched& w, uint16_t eve
   return out;
 }
 
-// Waits until one of the descriptors is ready or `timeout_ns` (~0: for ever) passes. `evaluate` (lock held) returns how many are ready.
+// Waits until one of the descriptors is ready or `timeout_ns` (~0: for ever) passes. `evaluate(m, &due)` (lock held) returns how many are ready and lowers
+// `due` to when the first timer it watches fires (monotonic ns; the wait wakes then), or returns -1 to be waited for again from the start (what it waits on
+// changed: an epoll set), which ends the wait with kLookAgain.
+constexpr int64_t kLookAgain = -100000;
+constexpr uint64_t kTimerSlack = 50000;      // (a timer due this much sooner than the wait's end is not worth waking early for)
 template <typename Evaluate>
 int64_t wait_ready(Process& p, uint64_t timeout_ns, Evaluate&& evaluate) {
   UnixSocketManager* m = system_unix_sockets();
   if (!m) {      // no sockets at all: everything is ready already (or nothing ever will be)
-    const uint32_t n = evaluate(nullptr);
-    if (n != 0 || timeout_ns == 0) return n;
-    if (timeout_ns != ~uint64_t{0}) p.block_sleep(timeout_ns);
+    uint64_t due = kNever;
+    const int64_t n = evaluate(nullptr, &due);
+    if (n != 0 || timeout_ns == 0) return n < 0 ? 0 : n;
+    if (timeout_ns != kNever) p.block_sleep(timeout_ns);
     return 0;
   }
-  uint32_t ready = 0;
-  const uint32_t waited = unix_wait(p, *m, timeout_ns, [&] {
-    ready = evaluate(m);
-    return ready != 0 || timeout_ns == 0;
-  });
-  if (waited == 2) return -kEintr;
-  return waited == 1 ? 0 : int64_t(ready);
+  const uint64_t started = p.host().monotonic_ns();
+  const uint64_t end = timeout_ns == kNever ? kNever : (timeout_ns > kNever - 1 - started ? kNever - 1 : started + timeout_ns);
+  uint64_t cap = kNever;      // when the first timer watched fires
+  for (;;) {
+    const uint64_t now = p.host().monotonic_ns();
+    const uint64_t until = end < cap ? end : cap;
+    const uint64_t slice = until == kNever ? kNever : (until > now ? until - now : 0);
+    int64_t ready = 0;
+    bool again = false;
+    const uint32_t waited = unix_wait(p, *m, slice, [&] {
+      uint64_t due = kNever;
+      ready = evaluate(m, &due);
+      if (ready < 0) return true;
+      if (ready != 0 || timeout_ns == 0) return true;
+      if (due != kNever && (cap == kNever || due + kTimerSlack < cap)) { cap = due; again = true; return true; }      // (sooner than the wait's end)
+      return false;
+    });
+    if (waited == 2) return -kEintr;
+    if (waited == 0 && ready < 0) return kLookAgain;
+    if (waited == 0 && !again) return ready;
+    if (waited == 0) continue;
+    if (end != kNever && p.host().monotonic_ns() >= end) return 0;
+    cap = kNever;      // (a timer's time came: it is looked at again)
+  }
 }
 
 Watched watch(Process& p, uint64_t fd) {
@@ -560,13 +603,13 @@ uint64_t do_poll(Process& p, uint64_t fds, uint64_t count, uint64_t timeout_ns) 
     const int32_t fd = int32_t(in.le32());
     watched.push_back(fd < 0 ? Watched{DescriptorKind::Closed, ~uint32_t{0}} : watch(p, uint64_t(fd)));
   }
-  const int64_t r = wait_ready(p, timeout_ns, [&](UnixSocketManager* m) {
-    uint32_t ready = 0;
+  const int64_t r = wait_ready(p, timeout_ns, [&](UnixSocketManager* m, uint64_t* due) {
+    int64_t ready = 0;
     for (uint64_t i = 0; i < count; ++i) {
       ByteReader in(raw.view().subview(i * 8, 8));
       const int32_t fd = int32_t(in.le32());
       const uint16_t events = in.le16();
-      const uint16_t revents = fd < 0 ? 0 : poll_events_locked(m, watched[i], events);
+      const uint16_t revents = fd < 0 ? 0 : poll_events_locked(p, m, watched[i], events, due);
       ByteWriter w{raw.writable_view().subview(i * 8 + 6, 2)};
       w.le16(revents);
       if (revents) ++ready;
@@ -963,14 +1006,14 @@ uint64_t sys_select(Process& p, uint64_t count, uint64_t read_set, uint64_t writ
   List<Watched> watched(*allocator);
   if (!watched.reserve(count)) return error(kEnomem);
   for (uint64_t fd = 0; fd < count; ++fd) watched.push_back(watch(p, fd));
-  const int64_t r = wait_ready(p, timeout, [&](UnixSocketManager* m) {
-    uint32_t ready = 0;
+  const int64_t r = wait_ready(p, timeout, [&](UnixSocketManager* m, uint64_t* due) {
+    int64_t ready = 0;
     for (uint32_t k = 0; k < 3; ++k) for (uint64_t i = 0; i < bytes; ++i) out_sets[k][i] = 0;
     for (uint64_t fd = 0; fd < count; ++fd) {
       const uint8_t bit = uint8_t(1u << (fd % 8));
       const bool want_read = in_sets[0][fd / 8] & bit, want_write = in_sets[1][fd / 8] & bit, want_except = in_sets[2][fd / 8] & bit;
       if (!want_read && !want_write && !want_except) continue;
-      const uint16_t got = poll_events_locked(m, watched[fd], uint16_t(kPollIn | kPollOut));
+      const uint16_t got = poll_events_locked(p, m, watched[fd], uint16_t(kPollIn | kPollOut), due);
       if (want_read && (got & (kPollIn | kPollHup | kPollErr))) { out_sets[0][fd / 8] |= bit; ++ready; }
       if (want_write && (got & (kPollOut | kPollErr))) { out_sets[1][fd / 8] |= bit; ++ready; }
       if (want_except && (got & kPollErr) && watched[fd].kind == DescriptorKind::UnixSocket) { out_sets[2][fd / 8] |= bit; ++ready; }
@@ -994,6 +1037,306 @@ uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags) {
   uint32_t id = 0;
   if (const UnixStatus st = m->create_event(p.id(), uint32_t(initial), flags & kEfdSemaphore, &id); st != UnixStatus::Ok) return result_of(st);
   return give_fd(p, *m, id, flags & kSockCloexec, flags & kSockNonBlock);
+}
+
+// --- timerfd, epoll, signalfd: descriptors of the AF_UNIX manager too (UnixType::Timer, Epoll, Signal) ---------------------------------------------------------
+
+namespace {
+
+constexpr int64_t kEexist = 17, kEnospc = 28;
+constexpr uint64_t kNsPerSecond = 1000000000u;
+
+// The kind of manager descriptor behind `fd` (*type), or -errno (EBADF; EINVAL when it is a socket or another kind).
+int64_t special_of(Process& p, uint64_t fd, UnixType wanted, Sock* s) {
+  if (const int64_t r = socket_of(p, fd, s); r < 0) return r == -kEnotsock ? -kEinval : r;
+  Hold hold(*s->m);
+  UnixType type;
+  if (!s->m->type_locked(s->id, &type)) return -kEbadf;
+  return type == wanted ? 0 : -kEinval;
+}
+
+UnixType type_of(const Sock& s) {
+  Hold hold(*s.m);
+  UnixType type = UnixType::Stream;
+  s.m->type_locked(s.id, &type);
+  return type;
+}
+
+// A timespec of the program's: 0, or -errno (EFAULT, EINVAL for a negative or >= 1 s nanosecond part). Seconds past 2^64 ns saturate.
+int64_t read_timespec(Process& p, uint64_t at, uint64_t* ns) {
+  uint64_t seconds = 0, nanos = 0;
+  if (!p.read_user_u64(at, &seconds) || !p.read_user_u64(at + 8, &nanos)) return -kEfault;
+  if (int64_t(seconds) < 0 || nanos >= kNsPerSecond) return -kEinval;
+  *ns = seconds >= (kNever - nanos) / kNsPerSecond ? kNever - 1 : seconds * kNsPerSecond + nanos;
+  return 0;
+}
+bool write_timespec(Process& p, uint64_t at, uint64_t ns) { return p.write_user_u64(at, ns / kNsPerSecond) && p.write_user_u64(at + 8, ns % kNsPerSecond); }
+
+// A timer's itimerspec now: the interval and how long until it fires (0: disarmed).
+bool write_itimerspec(Process& p, uint64_t at, const Sock& s) {
+  uint32_t clock = 0;
+  uint64_t deadline = 0, interval = 0, now = 0;
+  {
+    Hold hold(*s.m);
+    advance_timer_locked(p, *s.m, s.id, nullptr);
+    s.m->timer_state_locked(s.id, &clock, &deadline, &interval);
+    now = clock_now(p, clock);
+  }
+  const uint64_t left = deadline == 0 ? 0 : (deadline > now ? deadline - now : 1);      // (due already: it fires at the next look)
+  return write_timespec(p, at, interval) && write_timespec(p, at + 16, left);
+}
+
+// A timer's read: the expirations since the last read (8 bytes), waiting until there is one.
+uint64_t timer_read(Process& p, const Sock& s, uint64_t buffer, uint64_t count) {
+  if (count < 8) return error(kEinval);
+  bool non_blocking = false;
+  {
+    Hold hold(*s.m);
+    non_blocking = s.m->non_blocking_locked(s.id);
+  }
+  uint64_t value = 0;
+  const int64_t r = wait_ready(p, non_blocking ? 0 : kNever, [&](UnixSocketManager* m, uint64_t* due) -> int64_t {
+    if (!m) return 0;
+    advance_timer_locked(p, *m, s.id, due);
+    return m->timer_take_locked(s.id, &value) == UnixStatus::Ok ? 1 : 0;
+  });
+  if (r < 0) return error(-r);
+  if (r == 0) return error(kEagain);
+  uint8_t bytes[8];
+  for (uint32_t i = 0; i < 8; ++i) bytes[i] = uint8_t(value >> (8 * i));
+  return p.write_user(buffer, ConstByteView(bytes, 8)) ? 8 : error(kEfault);
+}
+
+// What a descriptor of the program's is, to tell later that it is still the same one (the kind and its object's token).
+UnixEpollEntry identity(Process& p, int32_t fd) {
+  UnixEpollEntry e;
+  e.fd = fd;
+  e.kind = p.files().kind(uint64_t(fd));
+  e.token = e.kind == DescriptorKind::Closed ? 0 : p.files().token(uint64_t(fd));
+  return e;
+}
+
+// epoll_event: struct { uint32_t events; uint64_t data; }, packed on x86-64 (12 bytes), aligned elsewhere (16).
+uint64_t epoll_event_size(Process& p) { return p.arch() == UserArch::X86_64 ? 12 : 16; }
+uint64_t epoll_data_offset(Process& p) { return p.arch() == UserArch::X86_64 ? 4 : 8; }
+
+constexpr uint32_t kEpollIn = 0x1, kEpollOut = 0x4, kEpollErr = 0x8, kEpollHup = 0x10, kEpollRdHup = 0x2000, kEpollExclusive = 1u << 28,
+                   kEpollWakeUp = 1u << 29, kEpollOneShot = 1u << 30, kEpollEt = 1u << 31;
+constexpr uint32_t kEpollReported = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x80 | 0x100 | 0x200 | 0x2000;      // IN PRI OUT ERR HUP RDNORM RDBAND WRNORM WRBAND RDHUP
+
+}  // namespace
+
+uint64_t sys_timerfd_create(Process& p, uint64_t clock, uint64_t flags) {
+  if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
+  if (clock != 0 && clock != 1 && clock != 7 && clock != 8 && clock != 9) return error(kEinval);
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t id = 0;
+  if (const UnixStatus st = m->create_timer(p.id(), uint32_t(clock), &id); st != UnixStatus::Ok) return result_of(st);
+  return give_fd(p, *m, id, flags & kSockCloexec, flags & kSockNonBlock);
+}
+
+// timerfd_settime(fd, flags, new, old): TFD_TIMER_ABSTIME (1) takes the value as a time of the timer's clock; TFD_TIMER_CANCEL_ON_SET (2) is accepted (the
+// wall clock is never set here). A value of 0 disarms.
+uint64_t sys_timerfd_settime(Process& p, uint64_t fd, uint64_t flags, uint64_t value, uint64_t old) {
+  Sock s;
+  if (const int64_t r = special_of(p, fd, UnixType::Timer, &s); r < 0) return error(-r);
+  if (flags & ~uint64_t{3}) return error(kEinval);
+  if (value == 0) return error(kEfault);
+  uint64_t interval = 0, first = 0;
+  if (const int64_t r = read_timespec(p, value, &interval); r < 0) return error(-r);
+  if (const int64_t r = read_timespec(p, value + 16, &first); r < 0) return error(-r);
+  if (old && !write_itimerspec(p, old, s)) return error(kEfault);
+  Hold hold(*s.m);
+  uint32_t clock = 0;
+  uint64_t d = 0, i = 0;
+  s.m->timer_state_locked(s.id, &clock, &d, &i);
+  uint64_t deadline = 0;
+  if (first != 0) {
+    if (flags & 1) {
+      deadline = first;
+    } else {
+      const uint64_t now = clock_now(p, clock);
+      deadline = first > kNever - 1 - now ? kNever - 1 : now + first;
+    }
+  }
+  return result_of(s.m->timer_arm_locked(s.id, deadline, interval));
+}
+
+uint64_t sys_timerfd_gettime(Process& p, uint64_t fd, uint64_t current) {
+  Sock s;
+  if (const int64_t r = special_of(p, fd, UnixType::Timer, &s); r < 0) return error(-r);
+  return write_itimerspec(p, current, s) ? 0 : error(kEfault);
+}
+
+// signalfd4(fd, mask, size, flags) / signalfd(fd, mask, size): no signal is routed to it (signals are not delivered to descriptors here), so it is never
+// readable; a program's loop can still hold it. With fd != -1 the mask of that one is "changed".
+uint64_t sys_signalfd4(Process& p, uint64_t fd, uint64_t mask, uint64_t size, uint64_t flags) {
+  if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
+  if (size != 8) return error(kEinval);
+  uint64_t bits = 0;
+  if (!p.read_user_u64(mask, &bits)) return error(kEfault);
+  if (int32_t(fd) != -1) {
+    Sock s;
+    if (const int64_t r = special_of(p, fd, UnixType::Signal, &s); r < 0) return error(-r);
+    return fd;
+  }
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t id = 0;
+  if (const UnixStatus st = m->create_signal(p.id(), &id); st != UnixStatus::Ok) return result_of(st);
+  return give_fd(p, *m, id, flags & kSockCloexec, flags & kSockNonBlock);
+}
+
+uint64_t sys_epoll_create1(Process& p, uint64_t flags) {
+  if (flags & ~kSockCloexec) return error(kEinval);
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t id = 0;
+  if (const UnixStatus st = m->create_epoll(p.id(), &id); st != UnixStatus::Ok) return result_of(st);
+  return give_fd(p, *m, id, flags & kSockCloexec, false);
+}
+
+// epoll_ctl(epfd, op, fd, event): EPOLL_CTL_ADD 1, DEL 2, MOD 3. Regular files and folders are refused (EPERM), as on Linux; an epoll instance cannot watch
+// itself. EPOLLET is taken as level-triggered (a program that reads until EAGAIN, as edge-triggered ones must, sees the same); EPOLLONESHOT reports once.
+uint64_t sys_epoll_ctl(Process& p, uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event) {
+  Sock s;
+  if (const int64_t r = special_of(p, epfd, UnixType::Epoll, &s); r < 0) return error(-r);
+  if (op < 1 || op > 3) return error(kEinval);
+  if (int64_t(fd) < 0 || fd > 0x7FFFFFFF) return error(kEbadf);
+  UnixEpollEntry entry = identity(p, int32_t(fd));
+  if (entry.kind == DescriptorKind::Closed) return error(kEbadf);
+  if (entry.kind == DescriptorKind::File || entry.kind == DescriptorKind::Directory) return error(kEperm);
+  if (fd == epfd) return error(kEinval);
+  if (op != 2) {
+    if (event == 0) return error(kEfault);
+    uint32_t events = 0;
+    uint64_t data = 0;
+    if (!read_u32(p, event, &events) || !p.read_user_u64(event + epoll_data_offset(p), &data)) return error(kEfault);
+    if ((events & kEpollExclusive) && op == 3) return error(kEinval);
+    entry.events = events & ~(kEpollExclusive | kEpollWakeUp);
+    entry.data = data;
+  }
+  Hold hold(*s.m);
+  List<UnixEpollEntry>* list = s.m->epoll_interest_locked(s.id);
+  if (!list) return error(kEbadf);
+  uint64_t found = list->count();
+  for (uint64_t i = 0; i < list->count(); ++i) {
+    const UnixEpollEntry& e = (*list)[i];
+    if (e.fd == entry.fd && e.kind == entry.kind && e.token == entry.token) { found = i; break; }
+  }
+  if (op == 1) {
+    if (found != list->count()) return error(kEexist);
+    if (list->count() >= UnixSocketManager::kMaxEpollEntries) return error(kEnospc);
+    if (!list->push_back(entry)) return error(kEnomem);
+  } else if (found == list->count()) {
+    return error(kEnoent);
+  } else if (op == 2) {
+    list->remove_at(found);
+  } else {
+    (*list)[found] = entry;      // (EPOLL_CTL_MOD also re-enables a one-shot entry)
+  }
+  s.m->epoll_changed_locked(s.id);
+  return 0;
+}
+
+namespace {
+
+// epoll_wait's work: a copy of the interest list (taken under the lock, checked against the descriptor table outside it: an entry whose descriptor was
+// closed or now holds something else is dropped, as Linux drops a closed file's), then poll's evaluation of each, again from the start when the list changes.
+uint64_t do_epoll_wait(Process& p, uint64_t epfd, uint64_t events, uint64_t max_events, uint64_t timeout_ns) {
+  Sock s;
+  if (const int64_t r = special_of(p, epfd, UnixType::Epoll, &s); r < 0) return error(-r);
+  if (int32_t(max_events) <= 0 || max_events > 0x7FFFFFFF / 16) return error(kEinval);
+  allocators::IAllocator* allocator = call_allocator(p);
+  if (!allocator) return error(kEnomem);
+  struct Snap {
+    UnixEpollEntry entry;
+    Watched watched;
+  };
+  const uint64_t size = epoll_event_size(p), data_at = epoll_data_offset(p);
+  ByteBuffer out(*allocator);
+  for (;;) {
+    List<Snap> snap(*allocator);
+    uint64_t changes = 0;
+    {
+      Hold hold(*s.m);
+      List<UnixEpollEntry>* list = s.m->epoll_interest_locked(s.id);
+      if (!list) return error(kEbadf);
+      changes = s.m->epoll_changes_locked(s.id);
+      if (!snap.reserve(list->count())) return error(kEnomem);
+      for (const UnixEpollEntry& e : list->view()) snap.push_back(Snap{e, Watched{}});
+    }
+    // (outside the lock: the descriptor table)
+    bool stale = false;
+    for (Snap& x : snap.view()) {
+      const UnixEpollEntry now = identity(p, x.entry.fd);
+      if (now.kind != x.entry.kind || now.token != x.entry.token) {
+        stale = true;
+        x.watched.kind = DescriptorKind::Closed;      // (marks it to be dropped)
+        continue;
+      }
+      x.watched = watch(p, uint64_t(x.entry.fd));
+    }
+    if (stale) {
+      Hold hold(*s.m);
+      if (List<UnixEpollEntry>* list = s.m->epoll_interest_locked(s.id)) {
+        for (uint64_t i = 0; i < list->count();) {
+          const UnixEpollEntry& e = (*list)[i];
+          bool drop = false;
+          for (const Snap& x : snap.view())
+            drop |= x.watched.kind == DescriptorKind::Closed && x.entry.fd == e.fd && x.entry.kind == e.kind && x.entry.token == e.token;
+          if (drop) list->remove_at(i);
+          else ++i;
+        }
+        s.m->epoll_changed_locked(s.id);
+      }
+      continue;      // (from the start, with the list as it is now)
+    }
+    out.clear();
+    uint32_t written = 0;
+    const int64_t r = wait_ready(p, timeout_ns, [&](UnixSocketManager* m, uint64_t* due) -> int64_t {
+      if (!m || m->epoll_changes_locked(s.id) != changes) return -1;
+      written = 0;
+      out.clear();
+      List<UnixEpollEntry>* list = m->epoll_interest_locked(s.id);
+      for (uint64_t i = 0; i < snap.count() && written < max_events; ++i) {
+        const Snap& x = snap[i];
+        if (x.entry.disabled) continue;
+        const uint16_t asked = uint16_t((x.entry.events & kEpollReported) | kEpollErr | kEpollHup);
+        const uint32_t got = poll_events_locked(p, m, x.watched, asked, due) & (asked | kPollNval);
+        if (!got || got == kPollNval) continue;
+        uint8_t record[16] = {};
+        ByteWriter w{ByteView(record, size)};
+        w.le32(got & ~uint32_t{kPollNval});
+        if (data_at == 8) w.le32(0);
+        w.le64(x.entry.data);
+        if (!out.append(ConstByteView(record, size))) return 0;
+        ++written;
+        if ((x.entry.events & kEpollOneShot) && list && i < list->count()) (*list)[i].disabled = true;      // (the copy is the list as it was: same order)
+      }
+      return written;
+    });
+    if (r == kLookAgain) continue;      // (the list changed: look again)
+    if (r < 0) return error(-r);
+    if (r == 0) return 0;
+    if (!p.write_user(events, out.view())) return error(kEfault);
+    return uint64_t(r);
+  }
+}
+
+}  // namespace
+
+uint64_t sys_epoll_wait(Process& p, uint64_t epfd, uint64_t events, uint64_t max_events, uint64_t timeout_ms) {
+  const int64_t ms = int32_t(timeout_ms);
+  return do_epoll_wait(p, epfd, events, max_events, ms < 0 ? kNever : uint64_t(ms) * 1000000u);
+}
+
+uint64_t sys_epoll_pwait2(Process& p, uint64_t epfd, uint64_t events, uint64_t max_events, uint64_t timespec) {
+  uint64_t timeout = kNever;
+  if (timespec != 0)
+    if (const int64_t r = read_timespec(p, timespec, &timeout); r < 0) return error(-r);
+  return do_epoll_wait(p, epfd, events, max_events, timeout);
 }
 
 namespace {
@@ -1029,12 +1372,33 @@ uint64_t event_write(Process& p, const Sock& s, uint64_t buffer, uint64_t count)
 
 uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   Sock s;
-  if (socket_of(p, fd, &s) == 0 && is_event(s)) return event_read(p, s, buffer, count);
+  if (socket_of(p, fd, &s) == 0) {
+    switch (type_of(s)) {
+      case UnixType::Event: return event_read(p, s, buffer, count);
+      case UnixType::Timer: return timer_read(p, s, buffer, count);
+      case UnixType::Epoll: return error(kEinval);
+      case UnixType::Signal: {      // (never readable: waits for ever, or EAGAIN)
+        if (count < 128) return error(kEinval);
+        bool non_blocking = false;
+        {
+          Hold hold(*s.m);
+          non_blocking = s.m->non_blocking_locked(s.id);
+        }
+        const int64_t r = wait_ready(p, non_blocking ? 0 : kNever, [](UnixSocketManager*, uint64_t*) -> int64_t { return 0; });
+        return error(r < 0 ? -r : kEagain);
+      }
+      default: break;
+    }
+  }
   return sys_recvfrom(p, fd, buffer, count, 0, 0, 0);
 }
 uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   Sock s;
-  if (socket_of(p, fd, &s) == 0 && is_event(s)) return event_write(p, s, buffer, count);
+  if (socket_of(p, fd, &s) == 0) {
+    const UnixType type = type_of(s);
+    if (type == UnixType::Event) return event_write(p, s, buffer, count);
+    if (!unix_type_is_socket(type)) return error(kEinval);
+  }
   return sys_sendto(p, fd, buffer, count, 0, 0, 0);
 }
 

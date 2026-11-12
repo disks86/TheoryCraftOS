@@ -114,6 +114,8 @@ class IRunControl {
  public:
   virtual bool stop_requested() = 0;
   virtual void yield() = 0;
+  // Told of each system call a thread makes, before (done false) and after it (a trace for debugging; nothing by default).
+  virtual void on_syscall(uint64_t tid, const process::SyscallRequest& request, bool done, uint64_t result) { (void)tid; (void)request; (void)done; (void)result; }
 
  protected:
   IRunControl() = default;
