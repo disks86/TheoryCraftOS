@@ -20,10 +20,42 @@
 // (graph changes, flow control). All of it is called from the socket server's one thread, so an implementation needs no lock of its own.
 #pragma once
 #include <stdint.h>
+#include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
 #include "Utility/ByteBuffer.hpp"
+#include "Utility/SharedPointer.hpp"
+#include "Utility/StringView.hpp"
 
 namespace pipewire {
+
+// A descriptor a protocol hands to a client: shared memory the server reads and writes in place (a memfd the client maps), or an eventfd the two wake each
+// other with. The transport makes them (IDescriptorMaker) and passes them with the message they belong to (SCM_RIGHTS).
+class Descriptor {
+ public:
+  // The memory's bytes (empty for an eventfd).
+  virtual ByteView memory() = 0;
+  // An eventfd: adds one to its counter (wakes whoever waits on it).
+  virtual bool signal() = 0;
+  // An eventfd: the counter, read and reset (0 when nothing was signalled).
+  virtual uint64_t take_signals() = 0;
+
+ protected:
+  Descriptor() = default;
+  ~Descriptor() = default;      // (made with SharedPointer::make_as, which destroys the real type)
+};
+using Fd = SharedPointer<Descriptor>;
+
+class IDescriptorMaker {
+ public:
+  // Shared memory of `size` bytes (zeroed), mapped for the server; empty when it cannot be made.
+  virtual Fd make_memory(uint64_t size, StringView name) = 0;
+  // An eventfd (non-blocking, counter 0).
+  virtual Fd make_event() = 0;
+
+ protected:
+  IDescriptorMaker() = default;
+  ~IDescriptorMaker() = default;
+};
 
 class IProtocolServer {
  public:
@@ -38,6 +70,14 @@ class IProtocolServer {
   // Work of its own; called every round and at least every tick_interval_us().
   virtual void tick() = 0;
   virtual uint64_t tick_interval_us() const = 0;
+  // For protocols that pass descriptors: what take_output() gives, and the descriptors its messages carry, in order (the transport sends them with the
+  // first of those bytes, so each arrives no later than its message).
+  virtual bool take_output_with_fds(uint32_t client, ByteBuffer* out, List<Fd>* fds) {
+    (void)fds;
+    return take_output(client, out);
+  }
+  // The transport's maker of descriptors (none: the protocol offers nothing that needs them).
+  virtual void set_descriptor_maker(IDescriptorMaker* maker) { (void)maker; }
 
  protected:
   IProtocolServer() = default;

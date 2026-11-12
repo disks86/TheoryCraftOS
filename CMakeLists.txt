@@ -219,6 +219,7 @@ add_executable(BOOTX64
   src/Audio/AudioMixer.cpp
   src/PipeWire/Graph.cpp
   src/PipeWire/NativeServer.cpp
+  src/PipeWire/NativeClientNode.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp

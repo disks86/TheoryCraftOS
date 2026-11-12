@@ -196,6 +196,7 @@ uint32_t NativeServer::open_client(uint64_t pid) {
 void NativeServer::close_client(uint32_t handle) {
   for (uint64_t i = 0; i < clients_.count(); ++i)
     if (clients_[i]->handle == handle) {
+      while (clients_[i]->nodes.count()) destroy_client_node(*clients_[i], clients_[i]->nodes[0]->resource);
       graph_.remove_client(clients_[i]->graph_client);
       clients_.remove_at(i);
       return;
@@ -209,6 +210,20 @@ bool NativeServer::take_output(uint32_t handle, ByteBuffer* out) {
     if (!out->append(c->outbox.view())) return true;
     c->outbox.clear();
   }
+  c->out_fds.clear();      // (a transport that cannot pass them: the messages that needed them are of no use without, nothing better to do)
+  return c->closing;
+}
+
+bool NativeServer::take_output_with_fds(uint32_t handle, ByteBuffer* out, List<Fd>* fds) {
+  Client* c = find(handle);
+  if (!c) return true;
+  if (c->outbox.size()) {
+    if (!out->append(c->outbox.view())) return true;
+    c->outbox.clear();
+  }
+  for (Fd& fd : c->out_fds)
+    if (!fds->push_back(fd)) c->closing = true;
+  c->out_fds.clear();
   return c->closing;
 }
 
@@ -255,7 +270,10 @@ void NativeServer::dispatch(Client& c, uint32_t id, uint32_t opcode, ConstByteVi
   switch (r->type) {
     case ObjectType::Core: core_method(c, opcode, args); break;
     case ObjectType::Client: client_method(c, *r, opcode, args); break;
-    case ObjectType::Node: case ObjectType::Port: case ObjectType::Device: node_method(c, *r, opcode, args); break;
+    case ObjectType::Node: case ObjectType::Port: case ObjectType::Device:
+      if (r->client_node) client_node_method(c, *r, opcode, args);
+      else node_method(c, *r, opcode, args);
+      break;
     case ObjectType::Metadata:
       // set_property / clear: the one sink stays the default; accepted and answered with the properties as they are
       if (opcode == kMetadataSetProperty || opcode == kMetadataClear) send_metadata(c, *r);
@@ -268,6 +286,8 @@ void NativeServer::dispatch(Client& c, uint32_t id, uint32_t opcode, ConstByteVi
 
 uint64_t NativeServer::begin(Client& c, uint32_t id, uint32_t opcode) {
   const uint64_t start = c.outbox.size();
+  c.message_start = start;
+  c.message_fds = 0;
   c.outbox.put32(id);
   c.outbox.put32(opcode << 24);
   c.outbox.put32(++c.send_seq);
@@ -284,6 +304,7 @@ void NativeServer::end(Client& c, uint64_t start) {
   ByteReader h(c.outbox.view().subview(start + 4, 4));
   const uint32_t opcode = h.le32() >> 24;
   c.outbox.patch32(start + 4, opcode << 24 | static_cast<uint32_t>(size));
+  if (start == c.message_start) c.outbox.patch32(start + 12, c.message_fds);
 }
 
 void NativeServer::send_done(Client& c, uint32_t id, uint32_t seq) {
@@ -508,7 +529,11 @@ void NativeServer::core_method(Client& c, uint32_t opcode, pod::Parser& args) {
         protocol_error(c, 0, kEINVAL, "invalid create_object");
         return;
       }
-      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP, "no such factory (play and record through the PulseAudio socket)");
+      if (factory == StringView("client-node") && type == StringView("PipeWire:Interface:ClientNode") && maker_) {
+        create_client_node(c, static_cast<uint32_t>(new_id), props);
+        break;
+      }
+      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP, "no such factory (play and record with pw_stream or the PulseAudio socket)");
       send_remove_id(c, static_cast<uint32_t>(new_id));
       break;
     }
@@ -516,7 +541,8 @@ void NativeServer::core_method(Client& c, uint32_t opcode, pod::Parser& args) {
       int32_t id = 0;
       if (!args.int32(&id)) return;
       if (id <= 1) { protocol_error(c, static_cast<uint32_t>(id), kEINVAL, "cannot destroy the core or the client"); return; }
-      if (resource(c, static_cast<uint32_t>(id))) {
+      if (Resource* r = resource(c, static_cast<uint32_t>(id))) {
+        if (r->client_node) destroy_client_node(c, static_cast<uint32_t>(id));
         remove_resource(c, static_cast<uint32_t>(id));
         send_remove_id(c, static_cast<uint32_t>(id));
       }
@@ -710,7 +736,7 @@ void NativeServer::send_globals(Client& c) {
   for (uint32_t id : gone)
     for (uint64_t k = c.resources.count(); k > 0; --k) {
       const Resource& r = c.resources[k - 1];
-      if (!r.registry && r.global == id && r.id > 1) {
+      if (!r.registry && !r.client_node && r.global == id && r.id > 1) {
         const uint32_t proxy = r.id;
         c.resources.remove_at(k - 1);
         send_remove_id(c, proxy);
@@ -728,7 +754,7 @@ void NativeServer::update(Client& c) {
   if (c.has_registry) send_globals(c);
   for (uint64_t k = 0; k < c.resources.count(); ++k) {
     Resource& r = c.resources[k];
-    if (r.registry || r.type == ObjectType::Core) continue;
+    if (r.registry || r.type == ObjectType::Core || r.client_node) continue;
     uint64_t changed = 0;
     for (const GraphEntry& e : snapshot_)
       if (e.id == r.global) changed = e.changed;
@@ -747,6 +773,17 @@ void NativeServer::update(Client& c) {
 
 void NativeServer::tick() {
   graph_.refresh();
+  // the client nodes' cycles first: they are the time-critical part
+  uint32_t running = 0;
+  for (UniquePointer<Client>& c : clients_.view()) {
+    if (c->closing) continue;
+    for (UniquePointer<ClientNode>& n : c->nodes.view()) {
+      if (!n->started) continue;
+      ++running;
+      run_client_node(*n, 0);
+    }
+  }
+  running_nodes_ = running;
   for (UniquePointer<Client>& c : clients_.view()) {
     if (c->closing) continue;
     update(*c);

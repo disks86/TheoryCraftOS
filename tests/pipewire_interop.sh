@@ -3,10 +3,12 @@
 # the native protocol and the PulseAudio protocol on the host's AF_UNIX sockets, then the host's own pw-dump, pw-cli, wpctl, pactl and paplay are pointed
 # at them (PIPEWIRE_REMOTE, PULSE_SERVER). Two paplay runs play at once; the server's mixed output must hold both tones at the right levels. The server's
 # microphone hears 880 Hz on the left and 1320 Hz on the right: parecord (and pw-dump, pactl's source commands) must find the source and record both.
+# libpipewire's own streams go through the client-node factory (shared memory and eventfds passed with SCM_RIGHTS): pw-play's tone must be in the mix
+# and pw-record must record both sides of the microphone.
 # Usage: tests/pipewire_interop.sh     (needs pipewire's and pulseaudio's client tools and python3; skipped without them)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for tool in pw-dump pw-cli pactl paplay parecord python3; do
+for tool in pw-dump pw-cli pactl paplay parecord pw-play pw-record python3; do
   command -v "$tool" >/dev/null || { echo "skipped (no $tool)"; exit 0; }
 done
 work=${TMPDIR:-/tmp}/tcos-pwinterop
@@ -14,7 +16,7 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
          src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
@@ -88,8 +90,8 @@ l880, l1320, r880, r1320 = mag(left, 880), mag(left, 1320), mag(right, 880), mag
 print('   left 880 Hz %.0f, 1320 Hz %.0f; right 880 Hz %.0f, 1320 Hz %.0f' % (l880, l1320, r880, r1320))
 assert 7200 < l880 < 8800 and 3600 < r1320 < 4400 and l1320 < 300 and r880 < 300
 PY"
-(timeout 4 pactl subscribe > "$work/subscribe.txt" 2>&1 || true) &
-(sleep 0.7; timeout 5 pactl list sink-inputs > "$work/inputs.txt" 2>&1 || true) &
+(timeout 4 pactl subscribe > "$work/subscribe.txt" 2>&1 || true) & subscriber=$!
+(sleep 0.7; timeout 5 pactl list sink-inputs > "$work/inputs.txt" 2>&1 || true) & inputs=$!
 sleep 0.3
 start=$(date +%s%N)
 timeout 15 paplay "$work/a.wav" & a=$!
@@ -99,7 +101,7 @@ check "paplay (44.1 kHz stereo)" "wait $a"
 check "paplay (22.05 kHz mono) at the same time" "wait $b"
 elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
 check "played in real time (${elapsed} ms for 1.5 s)" "[ $elapsed -ge 1300 ] && [ $elapsed -le 4000 ]"
-wait
+wait $subscriber $inputs || true      # (not a bare wait: the server is a background job too)
 wait $monitor || true
 check "parecord of the monitor heard both paplay tones" "python3 - '$work/monitor.raw' <<'PY'
 import cmath, math, struct, sys
@@ -113,6 +115,25 @@ assert 7000 < a < 9000 and 3700 < b < 4700      # (before the master volume: 800
 PY"
 check "pactl list sink-inputs saw both" "[ \$(grep -c 'application.name = \"paplay\"' '$work/inputs.txt') -eq 2 ]"
 check "pactl subscribe saw the streams come and go" "grep -q \"'new' on sink-input\" '$work/subscribe.txt' && grep -q \"'remove' on sink-input\" '$work/subscribe.txt'"
+# libpipewire's pw_stream: pw-play (a 1 s tone at 44.1 kHz) and pw-record (2 s at 44.1 kHz), through client-node
+python3 - "$work" <<'PY'
+import math, struct, wave, sys
+w = wave.open(sys.argv[1] + "/c.wav", "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
+w.writeframes(b"".join(struct.pack("<hh", int(7000 * math.sin(2 * math.pi * 330 * i / 44100)), int(7000 * math.sin(2 * math.pi * 330 * i / 44100))) for i in range(44100)))
+w.close()
+PY
+check "pw-play through client-node" "timeout 15 pw-play '$work/c.wav' 2> '$work/pw-play.log'"
+rm -f "$work/pw-rec.wav"
+timeout -s INT 2 pw-record --rate 44100 --channels 2 "$work/pw-rec.wav" 2> "$work/pw-record.log" || true
+check "pw-record recorded both sides of the microphone" "python3 - '$work/pw-rec.wav' <<'PY'
+import cmath, math, struct, sys, wave
+w = wave.open(sys.argv[1]); n = w.getnframes(); assert n > 44100, n
+s = struct.unpack('<%dh' % (2 * n), w.readframes(n)); left, right = s[2 * (n - 11025)::2], s[2 * (n - 11025) + 1::2]
+mag = lambda x, f: 2 * abs(sum(v * cmath.exp(-2j * math.pi * f * k / 44100) for k, v in enumerate(x))) / len(x)
+l880, r1320, l1320, r880 = mag(left, 880), mag(right, 1320), mag(left, 1320), mag(right, 880)
+print('   pw-record: left 880 Hz %.0f, right 1320 Hz %.0f' % (l880, r1320))
+assert 7200 < l880 < 8800 and 3600 < r1320 < 4400 and l1320 < 300 and r880 < 300
+PY"
 pkill -TERM -f "$work/pwhost $sock" || true
 for _ in $(seq 50); do pgrep -f "$work/pwhost $sock" >/dev/null || break; sleep 0.1; done
 check "the mixed output holds both tones" "python3 - '$work/out.wav' <<'PY'
@@ -125,6 +146,14 @@ mag = lambda f: abs(sum(v * cmath.exp(-2j * math.pi * f * k / 48000) for k, v in
 a, b, off = mag(440), mag(660), mag(1000)
 print('   440 Hz %.0f, 660 Hz %.0f, 1 kHz %.0f' % (a, b, off))
 assert 3700 < a < 4300 and 1900 < b < 2350 and off < 100      # 8000/2, and 6000 * 0.707 (a mono stream at the centre) / 2
+# pw-play's 330 Hz, later on its own: full scale (7000) on the left
+best = 0
+for at in range(0, len(left) - 9600, 4800):
+    seg = left[at:at + 9600]
+    m = abs(sum(v * cmath.exp(-2j * math.pi * 330 * k / 48000) for k, v in enumerate(seg))) * 2 / len(seg)
+    best = max(best, m)
+print('   pw-play 330 Hz %.0f' % best)
+assert 6500 < best < 7500
 PY"
 grep -q "ERROR: AddressSanitizer\|runtime error" "$work/server.log" && { echo "FAIL sanitizer report in the server"; fail=1; }
 exit $fail

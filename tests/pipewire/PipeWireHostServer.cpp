@@ -19,6 +19,7 @@
 // The kernel's PipeWire (src/PipeWire: the graph, the native and the PulseAudio protocol) served on the development machine's own AF_UNIX sockets, so
 // that the real libpipewire and libpulse tools (pw-dump, pw-cli, pactl, paplay) can be pointed at it: tests/pipewire_interop.sh does that.
 // The mixer plays into a device that drains in real time (48 kHz) and keeps everything it was given; at the end that is written as a WAV file.
+// The native protocol's client-node (pw-play, pw-record) gets real memfds and eventfds from this host (HostMaker), passed with SCM_RIGHTS.
 //
 // Usage: PipeWireHostServer <native socket path> <pulse socket path> <out.wav> [seconds]   (runs until SIGTERM/SIGINT, or for that many seconds)
 #include <errno.h>
@@ -28,12 +29,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -159,13 +163,90 @@ int listen_on(const char* path) {
   return fd;
 }
 
+// A descriptor of this host: a memfd mapped here, or an eventfd.
+class HostFd final : public Descriptor {
+ public:
+  HostFd(int fd, uint8_t* map, uint64_t size) : fd_(fd), map_(map), size_(size) {}
+  ~HostFd() {
+    if (map_) munmap(map_, size_);
+    if (fd_ >= 0) close(fd_);
+  }
+  ByteView memory() override { return map_ ? ByteView(map_, size_) : ByteView(); }
+  bool signal() override {
+    const uint64_t one = 1;
+    return write(fd_, &one, sizeof one) == sizeof one;
+  }
+  uint64_t take_signals() override {
+    uint64_t n = 0;
+    return read(fd_, &n, sizeof n) == sizeof n ? n : 0;
+  }
+  int fd() const { return fd_; }
+
+ private:
+  int fd_;
+  uint8_t* map_;
+  uint64_t size_;
+};
+
+class HostMaker final : public IDescriptorMaker {
+ public:
+  Fd make_memory(uint64_t size, StringView name) override {
+    char label[64];
+    snprintf(label, sizeof label, "%.*s", int(name.size() < 60 ? name.size() : 60), name.data());
+    const int fd = memfd_create(label, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return Fd();
+    if (ftruncate(fd, off_t(size)) != 0) { close(fd); return Fd(); }
+    void* map = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { close(fd); return Fd(); }
+    return Fd::make_as<HostFd>(A, fd, static_cast<uint8_t*>(map), size);
+  }
+  Fd make_event() override {
+    const int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    return fd < 0 ? Fd() : Fd::make_as<HostFd>(A, fd, nullptr, 0);
+  }
+};
+
+// Output owed to a connection: bytes, and the descriptors that go with the first of them.
+struct Segment {
+  std::vector<uint8_t> bytes;
+  std::vector<Fd> fds;
+  size_t sent = 0;
+};
+
 struct Conn {
   int fd;
   uint32_t client;
   IProtocolServer* protocol;
-  std::vector<uint8_t> pending;
+  std::deque<Segment> pending;
   bool closing = false;
 };
+
+// Sends what it can of the first segment (its descriptors with its first bytes); returns the bytes sent, -1 on an error, 0 when the socket is full.
+ssize_t send_segment(int fd, Segment& s) {
+  iovec v{s.bytes.data() + s.sent, s.bytes.size() - s.sent};
+  msghdr m{};
+  m.msg_iov = &v;
+  m.msg_iovlen = 1;
+  std::vector<uint8_t> control;
+  if (s.sent == 0 && !s.fds.empty()) {
+    control.resize(CMSG_SPACE(sizeof(int) * s.fds.size()));
+    m.msg_control = control.data();
+    m.msg_controllen = control.size();
+    cmsghdr* c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int) * s.fds.size());
+    int* out = reinterpret_cast<int*>(CMSG_DATA(c));      // (the cmsg area is aligned for ints by CMSG_SPACE)
+    for (size_t i = 0; i < s.fds.size(); ++i) out[i] = static_cast<HostFd&>(*s.fds[i]).fd();
+  }
+  const ssize_t n = sendmsg(fd, &m, MSG_NOSIGNAL);
+  if (n > 0) {
+    s.sent += size_t(n);
+    s.fds.clear();      // (the receiver has its copies now)
+    return n;
+  }
+  return n < 0 && errno != EAGAIN && errno != EWOULDBLOCK ? -1 : 0;
+}
 
 }  // namespace
 
@@ -187,6 +268,8 @@ int main(int argc, char** argv) {
   Graph graph(A, &mixer, &capture);
   if (!graph.initialize()) return 1;
   NativeServer native(graph, A);
+  HostMaker maker;
+  native.set_descriptor_maker(&maker);
   PulseServer pulse(graph, A);
   const int listeners[2] = {listen_on(argv[1]), listen_on(argv[2])};
   IProtocolServer* protocols[2] = {&native, &pulse};
@@ -206,7 +289,7 @@ int main(int argc, char** argv) {
     std::vector<pollfd> fds;
     for (int l : listeners) fds.push_back(pollfd{l, POLLIN, 0});
     for (Conn& c : conns) fds.push_back(pollfd{c.fd, short(POLLIN | (c.pending.empty() ? 0 : POLLOUT)), 0});
-    poll(fds.data(), fds.size(), 5);
+    poll(fds.data(), fds.size(), native.running_nodes() ? 2 : 5);
     for (int i = 0; i < 2; ++i)
       if (fds[i].revents & POLLIN)
         for (;;) {
@@ -232,12 +315,20 @@ int main(int argc, char** argv) {
     pulse.tick();
     for (Conn& c : conns) {
       ByteBuffer out(A);
-      if (c.protocol->take_output(c.client, &out)) c.closing = true;
-      c.pending.insert(c.pending.end(), out.view().data(), out.view().data() + out.size());
+      List<Fd> fds(A);
+      if (c.protocol->take_output_with_fds(c.client, &out, &fds)) c.closing = true;
+      if (out.size() || fds.count()) {
+        Segment seg;
+        seg.bytes.assign(out.view().data(), out.view().data() + out.size());
+        for (Fd& f : fds) seg.fds.push_back(f);
+        c.pending.push_back(std::move(seg));
+      }
       while (!c.pending.empty()) {
-        const ssize_t n = send(c.fd, c.pending.data(), c.pending.size(), MSG_NOSIGNAL);
-        if (n > 0) { c.pending.erase(c.pending.begin(), c.pending.begin() + n); continue; }
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { c.closing = true; c.pending.clear(); }
+        Segment& s = c.pending.front();
+        if (s.sent == s.bytes.size()) { c.pending.pop_front(); continue; }
+        const ssize_t n = send_segment(c.fd, s);
+        if (n > 0) continue;
+        if (n < 0) { c.closing = true; c.pending.clear(); }
         break;
       }
     }
