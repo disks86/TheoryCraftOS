@@ -52,7 +52,8 @@
 // (release() does that, see take_dropped_locked()).
 namespace process {
 
-enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5 };      // the Linux SOCK_* numbers (Windows has the same for the first two)
+enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      // the Linux SOCK_* numbers (Windows has the same for the first two)
+                                Event = 0x40 };      // not a socket: Linux's eventfd, a counter kept here so that poll(), wake-ups and SCM_RIGHTS treat it as they treat sockets
 
 // What an operation came to. Each ABI turns it into its own error (an errno, a WSA error through an NTSTATUS).
 enum class UnixStatus : uint8_t {
@@ -115,6 +116,10 @@ class UnixSocketManager {
   // The last use gone, the socket goes: its name is freed, its peer sees the end of the connection, and the descriptors its queue still held are released.
   void release(uint32_t id);
   bool exists(uint32_t id);
+  // eventfd(): a counter (UnixType::Event) starting at `initial`; `semaphore` (EFD_SEMAPHORE) makes a read take one instead of all. It is readable while the
+  // counter is above 0 and writable while it can take one more. One use, as create() gives.
+  UnixStatus create_event(uint64_t owner_pid, uint64_t initial, bool semaphore, uint32_t* id);
+  static constexpr uint64_t kEventMax = 0xFFFFFFFFFFFFFFFEull;
 
   // --- operations (the lock held). `pid` is the calling process's id.
   bool exists_locked(uint32_t id) const { return at(id) != nullptr; }
@@ -149,6 +154,11 @@ class UnixSocketManager {
   UnixStatus receive_locked(uint32_t id, ByteView buffer, bool peek, Received* out, Queue<UnixInFlight>* rights);
   UnixStatus shutdown_locked(uint32_t id, bool reading, bool writing);
 
+  // An eventfd's write (adds `value`: WouldBlock if the counter would pass kEventMax; Invalid for ~0) and read (*value: the counter, or 1 with
+  // EFD_SEMAPHORE; WouldBlock while it is 0). Both wake waiters. WrongType for a socket.
+  UnixStatus event_add_locked(uint32_t id, uint64_t value);
+  UnixStatus event_take_locked(uint32_t id, uint64_t* value);
+  bool is_event_locked(uint32_t id) const;
   UnixReadiness readiness_locked(uint32_t id) const;
   uint32_t readable_bytes_locked(uint32_t id) const;      // FIONREAD: bytes waiting (a message socket: the size of the next message)
   bool local_name_locked(uint32_t id, UnixName* out) const;
@@ -204,6 +214,8 @@ class UnixSocketManager {
     bool shut_read = false, shut_write = false;
     UnixStatus pending_error = UnixStatus::Ok;
     bool non_blocking = false, pass_credentials = false;
+    uint64_t counter = 0;                // an eventfd's value (UnixType::Event)
+    bool semaphore = false;
     uint64_t receive_timeout = ~uint64_t{0}, send_timeout = ~uint64_t{0};
     // The receive queue: bytes [data_head, data.size()) of `data`, split into records; the descriptors they carry, in order.
     ByteBuffer data;

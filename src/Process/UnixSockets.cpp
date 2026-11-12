@@ -68,6 +68,46 @@ UnixStatus UnixSocketManager::create(UnixType type, uint64_t owner_pid, uint32_t
   return make_locked(type, owner_pid, id);
 }
 
+UnixStatus UnixSocketManager::create_event(uint64_t owner_pid, uint64_t initial, bool semaphore, uint32_t* id) {
+  if (initial > kEventMax) return UnixStatus::Invalid;
+  Hold hold(sync_);
+  const UnixStatus st = make_locked(UnixType::Event, owner_pid, id);
+  if (st != UnixStatus::Ok) return st;
+  Socket* s = at(*id);
+  s->counter = initial;
+  s->semaphore = semaphore;
+  return UnixStatus::Ok;
+}
+
+bool UnixSocketManager::is_event_locked(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && s->type == UnixType::Event;
+}
+
+UnixStatus UnixSocketManager::event_add_locked(uint32_t id, uint64_t value) {
+  Socket* s = at(id);
+  if (!s) return UnixStatus::BadSocket;
+  if (s->type != UnixType::Event) return UnixStatus::WrongType;
+  if (value == ~uint64_t{0}) return UnixStatus::Invalid;
+  if (value > kEventMax - s->counter) return UnixStatus::WouldBlock;
+  if (value == 0) return UnixStatus::Ok;
+  s->counter += value;
+  sync_.notify_all();
+  return UnixStatus::Ok;
+}
+
+UnixStatus UnixSocketManager::event_take_locked(uint32_t id, uint64_t* value) {
+  *value = 0;
+  Socket* s = at(id);
+  if (!s) return UnixStatus::BadSocket;
+  if (s->type != UnixType::Event) return UnixStatus::WrongType;
+  if (s->counter == 0) return UnixStatus::WouldBlock;
+  *value = s->semaphore ? 1 : s->counter;
+  s->counter -= *value;
+  sync_.notify_all();
+  return UnixStatus::Ok;
+}
+
 UnixStatus UnixSocketManager::create_pair(UnixType type, uint64_t owner_pid, uint32_t* first, uint32_t* second) {
   Queue<UnixInFlight> dropped(allocator_);
   UnixStatus status;
@@ -321,6 +361,7 @@ UnixStatus UnixSocketManager::send_locked(uint32_t id, ConstByteView data, const
   *sent = 0;
   Socket* s = at(id);
   if (!s) return UnixStatus::BadSocket;
+  if (s->type == UnixType::Event) return UnixStatus::NotSupported;      // (an eventfd is not a socket)
   if (rights && rights->count() > kMaxRights) return UnixStatus::Invalid;
   if (s->shut_write) return UnixStatus::Broken;
   if (s->type == UnixType::Datagram) {
@@ -382,6 +423,7 @@ UnixStatus UnixSocketManager::receive_locked(uint32_t id, ByteView buffer, bool 
   *out = Received();
   Socket* s = at(id);
   if (!s) return UnixStatus::BadSocket;
+  if (s->type == UnixType::Event) return UnixStatus::NotSupported;
   if (s->records.count() == 0) {
     if (s->pending_error != UnixStatus::Ok) {
       const UnixStatus error = s->pending_error;
@@ -470,6 +512,11 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
   UnixReadiness r;
   const Socket* s = at(id);
   if (!s) { r.error = r.hangup = true; return r; }
+  if (s->type == UnixType::Event) {
+    r.readable = s->counter > 0;
+    r.writable = s->counter < kEventMax;
+    return r;
+  }
   r.error = s->pending_error != UnixStatus::Ok;
   if (s->state == State::Listening) {
     r.readable = s->backlog.count() != 0;

@@ -10,7 +10,7 @@ program that records, of any kind, gets a record stream of it.
 | --- | --- |
 | Native programs (media player, web audio, MIDI synth, ...) | `AudioMixer::open_stream` as before. `Graph::refresh` finds the streams and shows each as a node of the "TheoryCraftOS" client (`AudioStream::set_label` names it). |
 | Linux programs using libpulse (most desktop programs: browsers, SDL, games, `paplay`, `pactl`) | PulseAudio's native protocol at `$XDG_RUNTIME_DIR/pulse/native`, served by `PulseServer`, as pipewire-pulse does. |
-| Linux programs using libpipewire (`pw-dump`, `pw-cli`, `wpctl`, session tools) | PipeWire's native protocol (version 3) at `$XDG_RUNTIME_DIR/pipewire-0`, served by `NativeServer`. |
+| Linux programs using libpipewire (`pw-dump`, `pw-cli`, `wpctl`, session tools; `pw-play`, `pw-record`, `pw-cat` and other `pw_stream` programs) | PipeWire's native protocol (version 3) at `$XDG_RUNTIME_DIR/pipewire-0`, served by `NativeServer` (streams through `client-node`: `NativeClientNode.cpp`). |
 | Windows programs | `winmm.dll` (`waveOut*`, `PlaySound`, `sndPlaySound`: `src/Windows/winmm/waveout.inc`; `waveIn*`: `wavein.inc`), `dsound.dll` (DirectSound 8: `src/Windows/dsound/dsound.c`; capture and full duplex: `capture.inc`) WASAPI (`mmdevapi.dll`: `IMMDeviceEnumerator`, `IAudioClient3`, `IAudioCaptureClient` and the rest, `src/Windows/mmdevapi/mmdevapi.c`) and XAudio2 2.9 and 2.8 (`xaudio2_9.dll`, `xaudio2_8.dll`: `src/Windows/xaudio2_9`), all over the `NtTcosAudio` service (510, `src/Windows/tcos_audio.h`), served by `WindowsAudioService`. |
 
 `XDG_RUNTIME_DIR` is `/run/user/0` in the Linux programs' default environment (`/Linux/run/user/0` on the system's disk; see
@@ -26,9 +26,10 @@ program that records, of any kind, gets a record stream of it.
 | A protocol client's record stream: 16-bit mono or stereo from an `audio::CaptureStream` of the hub, turned into the program's format and channels | `RecordStream.{hpp,cpp}` |
 | SPA PODs (the native protocol's values) | `Pod.{hpp,cpp}` |
 | PulseAudio tagstructs and property lists | `Tagstruct.{hpp,cpp}`, `Properties.hpp` |
-| PipeWire's native protocol | `NativeServer.{hpp,cpp}` |
+| PipeWire's native protocol | `NativeServer.{hpp,cpp}`; `client-node` (pw_stream) in `NativeClientNode.cpp` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
-| AF_UNIX listeners and the `pipewire` kernel thread | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
+| AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
+| eventfd (`eventfd`, `eventfd2`): a counter in the AF_UNIX manager (`UnixType::Event`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
 | NtTcosAudio | `src/Process/WindowsAudio.{hpp,cpp}` (layout, handler pointer), `WindowsAudioService.{hpp,cpp}` (the work), `src/Windows/tcos_audio.h` (the DLLs' side) |
 | Start-up | `src/main.cpp` (after the X server) |
 
@@ -60,6 +61,20 @@ program that records, of any kind, gets a record stream of it.
   `tcos_output.stereo.monitor` (index sink | 1 << 24, `@DEFAULT_MONITOR@`, the default source when there is no microphone); `NtTcosAudio`'s
   OPEN_CAPTURE takes it with `[1] = 1`, which WASAPI's `AUDCLNT_STREAMFLAGS_LOOPBACK` on the render endpoint uses.
 
+- **client-node (libpipewire's `pw_stream`).** `pw-play`, `pw-record` and every `pw_stream` program export their own node: Core
+  `create_object("client-node", ..., version 6)`. The server makes it a playback or record stream of the graph (by `media.class`) and hands the
+  client, with SCM_RIGHTS, the memory it shares with the kernel (memfds: the node's `pw_node_activation`, the port's buffers and its
+  `spa_io_buffers` area) and two eventfds (the wake and done signals of `transport`). It drives the adapter the stream wraps: a PortConfig
+  (convert mode, F32 stereo 48 kHz; the AVX2 S16 output of audioconvert assumes an aligned destination and crashes), the port's Format, then
+  buffers as the port's Buffers param asks (2 to 16, 64-byte aligned, at least 8192 frames), the io area and Start. Each cycle (1024 frames, a
+  quantum at 48 kHz) the server writes the clock into the activation, sets it TRIGGERED and signals the wake eventfd; the client processes and
+  sets FINISHED. A playback node is triggered while its stream holds less than three quanta, and the buffer it filled (HAVE_DATA) goes into the
+  `PlaybackStream`; a record node gets a buffer filled from its `RecordStream` before each trigger. A cycle that never finishes is given up after
+  100 ticks and triggered again; `set_active(false)` pauses. The `pipewire` thread ticks every 5 ms while nodes run (50 ms otherwise). Descriptors
+  are the transport's (`IDescriptorMaker`): `SocketServer` makes memfds (`MemoryFile`, whose block the kernel reads and writes in place while the
+  client maps it) and eventfds (counters in the AF_UNIX manager, so `poll()`, wake-ups and SCM_RIGHTS take them as sockets), sends each take's
+  descriptors with its first bytes, and releases what the protocol let go of from its own thread (a graveyard).
+
 ## What the protocols serve
 
 **PulseAudio** (protocol 35 and older): AUTH (no shared memory is offered, so libpulse sends the audio in the packets), SET_CLIENT_NAME, playback
@@ -74,6 +89,9 @@ source-output subscription events. Sample formats: U8, A-law, µ-law, S16, S24, 
 **PipeWire native**: Core hello/sync/pong/get_registry/destroy, Registry bind for Core, Client, Device, Node, Port, Link and Metadata, the info of
 bound objects (sent again when they change), Client update_properties/get_permissions, Node and Port enum_params/subscribe_params (Props, EnumFormat,
 Format), Node set_param(Props) for volume and mute (the source's too), the metadata's `default.audio.sink` and `default.audio.source`.
+`client-node` (Core create_object): ClientNode update, port_update, set_active, get_node/event/port_buffers (accepted, unused); the events
+transport, set_param (PortConfig), port_set_param (Format), port_use_buffers, port_set_io, port_set_mix_info, command (Start, Pause), and Core
+add_mem for every memfd. Other factories (`adapter`, `link-factory`, `metadata`, `spa-node-factory`) are refused with `-ENOTSUP`.
 
 **winmm**: `waveOutOpen` (PCM 8/16/24/32-bit, float 32/64, `WAVE_FORMAT_EXTENSIBLE`, `WAVE_FORMAT_QUERY`, function/event/window/thread callbacks),
 prepare/unprepare/write, pause/restart/reset/break loop, position (bytes, samples, ms; frozen while paused), per-stream and master volume, device caps,
@@ -132,12 +150,18 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
 - `tests/run_host_tests.sh PipeWireTest`: codecs (round trips, every truncation, bit flips), conversion both ways (every format through
   `convert_from_s16` and back), the graph mixing native, Linux and Windows streams on a real mixer, recording from a fake microphone through a real
   capture hub (the source, record nodes and links, gains, pause, unplugging), both protocols as clients drive them and fed garbage (every truncation of
-  CREATE_RECORD_STREAM and bit flips), the Windows service both ways, the AF_UNIX transport, several threads at once.
+  CREATE_RECORD_STREAM and bit flips), the Windows service both ways, the AF_UNIX transport, several threads at once. client-node: the setup a
+  `pw_stream` goes through, playback and recording cycles on a real mixer and hub, an empty cycle, a cycle that times out, pause, 600 truncated or
+  bit-flipped update, port_update and set_active messages, a descriptor maker that fails; and the same through `SocketServer` over AF_UNIX
+  sockets, with the memfds and eventfds it makes received by SCM_RIGHTS (the client writes the memory the kernel reads; nothing leaks).
+- `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
+  from another thread, passing it with SCM_RIGHTS).
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl`, `paplay` and `parecord` against
   `tests/pipewire/PipeWireHostServer.cpp` (the same graph and protocols on host sockets, a microphone that hears 880 Hz left and 1320 Hz right). Two
   `paplay` at once; the mixed output must hold both tones at the right levels; `parecord` must record each side's tone; the source's and a source
-  output's volume set through `pactl` must read back.
-- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
+  output's volume set through `pactl` must read back. The host's real `pw-play` and `pw-record` (libpipewire 1.x) go through client-node (the
+  host server's maker makes real memfds and eventfds): the mix must hold `pw-play`'s tone, and `pw-record` must record each side's tone.
+- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
   Linux program and the native stream, and all four tones must be in the mix at once (the DLLs are also put in the RAM disk's System32, since ole32
@@ -148,13 +172,17 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   `tests/windows/xaudio2test.c`: a source voice into the mastering voice and one through a submix (400 and 600 Hz in the mix with the others),
   callbacks, loops, operation sets, matrices, the frequency ratio, MS-ADPCM through a volume meter, the FX objects and X3DAudio. (Its mastering
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
+  The fifth run is `tests/linux/pwnodetest.c` (no C library) next to `winmmtest`: the `pw_stream` side of client-node through the OS's own system
+  calls (SCM_RIGHTS, `mmap(MAP_SHARED)` of the passed memfds, `ppoll` and `read`/`write` on the eventfds), 4 s of 500 Hz, then half a second of
+  the microphone on an input node, each side's tone checked; the mix must hold 300, 400 and 500 Hz at once.
 
 ## Not done
 
-- **libpipewire playback.** `pw_stream` programs (`pw-cat`, `pw-play`) ask Core::create_object for the `client-node`/`adapter` factories, which need
-  shared-memory buffers (memfd + `mmap(MAP_SHARED)` of a descriptor) and eventfds; the Linux layer has neither yet, so the server answers `-ENOTSUP`.
-  Those programs fail; libpulse programs work.
-- **libpipewire recording** has the playback side's gap (`pw_stream` needs `client-node`); `pw-record` fails, `parecord` works.
+- **libpipewire itself in the OS.** client-node works (real `pw-play`/`pw-record` on the host server, and a freestanding client in the emulator),
+  but the real libpipewire has not run inside the OS: its loop needs `epoll` and `timerfd`, which the Linux layer does not have yet (eventfd it has).
+- **client-node limits.** One port per node, F32 stereo 48 kHz at the port (the adapter converts), a fixed 1024-frame quantum, no metadata
+  (`SPA_META_Header`, `Busy`), no `spa_io_position` for the port, no client-allocated buffers (`port_buffers`), no `pw_filter` or `pw_stream` with
+  `PW_STREAM_FLAG_DRIVER`, no MIDI or video. The `adapter` factory (`pw-cli create-node adapter`) is refused.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).

@@ -7,7 +7,9 @@
 # 300, 500, 600 and 700 Hz must be in the mix at once. A third run records: the emulator's microphone (880 Hz left, 1320 Hz right) is heard by
 # tests/windows/recordtest.c (waveIn, DirectSound capture, WASAPI capture) and by pulsetest's record stream at the same time. A fourth run plays
 # tests/windows/xaudio2test.c (XAudio2 2.9: 400 Hz from a source voice, 600 Hz through a submix): 300, 400, 500 and 600 Hz must be in the mix at once.
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2]   (the Linux program's CPU, default x86_64; which runs, default all).
+# A fifth run plays winmmtest next to tests/linux/pwnodetest.c (libpipewire's pw_stream side of client-node over pipewire-0: memfds and eventfds passed
+# with SCM_RIGHTS, mmap, ppoll; 500 Hz, then recording the microphone): 300, 400 and 500 Hz must be in the mix at once.
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -53,6 +55,8 @@ linker=(-fuse-ld=lld)
 [ -n "$lld" ] && linker=("--ld-path=$lld")
 clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables "${linker[@]}" \
   -Wall -Wextra -o "$work/pulsetest-$arch" tests/linux/pulsetest.c
+clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables "${linker[@]}" \
+  -Wall -Wextra -o "$work/pwnodetest-$arch" tests/linux/pwnodetest.c
 
 fail=0
 if [ "$which" = all ] || [ "$which" = winmm ]; then
@@ -109,6 +113,23 @@ assert m, "no audio summary"
 t300, t400, t500, t600, t700, together = map(int, m.groups())
 ok = 2200 < t300 < 2800 and 2400 < t400 < 3200 and 1800 < t500 < 2400 and 2400 < t600 < 3300 and together > 1500
 print("ok   the mix holds XAudio2's tones with the others" if ok else "FAIL the mix: %s" % m.group(0))
+sys.exit(0 if ok else 1)
+PY
+fi
+if [ "$which" = all ] || [ "$which" = pwnode ]; then
+  "$work/emurun" "$work/winmmtest.exe" "$work/sys32" "$work/pwnodetest-$arch" | tee "$work/run-pwnode.out"
+  grep -q "winmmtest: [0-9]* checks, 0 failed" "$work/run-pwnode.out" || { echo "FAIL winmmtest (with pwnodetest)"; fail=1; }
+  grep -q "pwnodetest: [0-9]* checks, 0 failed" "$work/run-pwnode.out" || { echo "FAIL pwnodetest"; fail=1; }
+  grep -q "faulted=0" "$work/run-pwnode.out" && grep -q "second program: exit=0" "$work/run-pwnode.out" || { echo "FAIL a program faulted or failed (pwnode run)"; fail=1; }
+  # the client-node's 500 Hz (0.1295 on each side: the same in the mix as pulsetest's) with the native 300 Hz and winmm's 400 Hz, all at once
+  python3 - "$work/run-pwnode.out" <<'PY' || fail=1
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r"native 300 Hz (\d+), windows 400 Hz (\d+), linux 500 Hz (\d+); all three at once (\d+)", text)
+assert m, "no audio summary"
+native, windows, linux, together = map(int, m.groups())
+ok = 2200 < native < 2800 and 3600 < windows < 4400 and 1800 < linux < 2400 and together > 1500
+print("ok   the mix holds the client-node's tone with the others" if ok else "FAIL the mix: %s" % m.group(0))
 sys.exit(0 if ok else 1)
 PY
 fi

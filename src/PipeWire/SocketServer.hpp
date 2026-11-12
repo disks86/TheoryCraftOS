@@ -25,18 +25,24 @@
 // protocol lets kMaxPending bytes pile up unsent is dropped. Each round also ticks the protocols (graph changes, flow control), at least every
 // few milliseconds.
 //
+// Descriptors: the server is the protocols' IDescriptorMaker. Memory is a file in memory (memfd, Process/MemoryFile.hpp) the kernel reads and writes in
+// place while the client maps it; an event is an eventfd (UnixType::Event in the socket manager). What a protocol hands out goes with SCM_RIGHTS on the
+// first bytes of the output it came with. Descriptors the protocols let go of are released by this thread (a graveyard), never under another lock.
+//
 // Locking: as the X server's transport: sockets are moved under the system's lock, the protocols are called with it let go.
+// (an event's signal() and take_signals() take the system's lock for a moment: they are called from the protocols' tick, with it let go.)
 #pragma once
 #include <stdint.h>
 #include "FileSystem/IFileSystem.hpp"
 #include "Kernel/Thread.hpp"
 #include "PipeWire/ProtocolServer.hpp"
 #include "Process/UnixSockets.hpp"
+#include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace pipewire {
 
-class SocketServer {
+class SocketServer final : public IDescriptorMaker {
  public:
   static constexpr uint32_t kMaxListeners = 8;
   static constexpr uint64_t kReadChunk = 64 * 1024;
@@ -57,6 +63,10 @@ class SocketServer {
   bool start();
   void stop();
   uint32_t connections() const { return static_cast<uint32_t>(connections_.count()); }
+  // --- IDescriptorMaker
+  Fd make_memory(uint64_t size, StringView name) override;
+  Fd make_event() override;
+  struct Graveyard;
 
  private:
   struct Listener {
@@ -64,12 +74,18 @@ class SocketServer {
     IProtocolServer* protocol;
   };
   struct Connection {
-    explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), pending(allocator) {}
+    explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), pending(allocator), batches(allocator) {}
     uint32_t socket = 0, client = 0;
     IProtocolServer* protocol = nullptr;
     ByteBuffer inbox;
     ByteBuffer pending;
     uint64_t sent = 0;
+    struct Batch {      // descriptors still to go (each with a use of its own), with the byte `at` of `pending` and after the batches before
+      explicit Batch(allocators::IAllocator& allocator) : rights(allocator) {}
+      uint64_t at = 0;
+      Queue<process::UnixInFlight> rights;
+    };
+    List<UniquePointer<Batch>> batches;
     bool dead = false;
     bool closing = false;
   };
@@ -81,6 +97,11 @@ class SocketServer {
   static void thread_main(void* self);
   bool ready_locked();
   bool bind_one(process::UnixName::Kind kind, StringView name, StringView host_path, IProtocolServer& protocol);
+  void send_owed_locked(Connection& c, bool* moved);
+  void queue_fds(Connection& c, uint64_t at, const List<Fd>& fds);
+  void drop_rights(Connection& c);
+  void drain_graveyard();
+  void release_entries(Queue<process::UnixInFlight>& entries);
 
   process::UnixSocketManager& sockets_;
   allocators::IAllocator& allocator_;
@@ -90,6 +111,7 @@ class SocketServer {
   uint32_t protocol_count_ = 0;
   List<UniquePointer<Connection>> connections_;
   ByteBuffer chunk_;
+  SharedPointer<Graveyard> graveyard_;
   volatile bool stopping_ = false;
   kernel::Thread* thread_ = nullptr;
 };

@@ -39,6 +39,7 @@
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/RecordStream.hpp"
 #include "PipeWire/SocketServer.hpp"
+#include "Process/MemoryFile.hpp"
 #include "PipeWire/Tagstruct.hpp"
 #include "Audio/Pan.hpp"
 #include "PipeWire/WindowsAudioService.hpp"
@@ -491,12 +492,21 @@ struct NativeMessage {
   std::vector<uint8_t> payload;
 };
 
+// How a NativeClient reaches the server when not by calling it: a socket (the kernel's transport, SocketServer).
+struct NativeTransport {
+  virtual void send(ConstByteView bytes) = 0;
+  virtual void take(ByteBuffer* out, std::vector<Fd>* fds) = 0;
+  virtual ~NativeTransport() = default;
+};
+
 struct NativeClient {
   NativeServer& server;
   uint32_t handle;
   uint32_t seq = 0;
   std::vector<uint8_t> in;
+  NativeTransport* transport = nullptr;
   NativeClient(NativeServer& s) : server(s), handle(s.open_client(77)) {}
+  NativeClient(NativeServer& s, NativeTransport& t) : server(s), handle(0), transport(&t) {}
   template <class F>
   void send(uint32_t id, uint32_t opcode, F&& args) {
     ByteBuffer body(A);
@@ -507,12 +517,17 @@ struct NativeClient {
     ByteBuffer msg(A);
     msg.put32(id); msg.put32(opcode << 24 | uint32_t(body.size())); msg.put32(++seq); msg.put32(0);
     msg.append(body.view());
-    server.receive(handle, msg.view());
+    if (transport) transport->send(msg.view());
+    else server.receive(handle, msg.view());
   }
   std::vector<Fd> fds;      // what take_with_fds() collected, in order
   std::vector<NativeMessage> take_with_fds() {
-    List<Fd> got(A);
     ByteBuffer out(A);
+    if (transport) {
+      transport->take(&out, &fds);
+      return parse(out);
+    }
+    List<Fd> got(A);
     server.take_output_with_fds(handle, &out, &got);
     for (Fd& f : got) fds.push_back(f);
     return parse(out);
@@ -2196,6 +2211,130 @@ static void test_sockets() {
   CHECK(server.connections() == 0 && pulse.client_count() == 0 && native.client_count() == 0);
 }
 
+// ---- client-node through the kernel's transport: memfds and eventfds made by SocketServer, passed with SCM_RIGHTS ---------------------------------
+
+// A descriptor the client received: a memfd's block (the same memory the server writes), or an eventfd of the socket manager.
+struct ReceivedFd final : Descriptor {
+  process::UnixSocketManager& sockets;
+  process::UnixInFlight entry;
+  process::BlockRef block;
+  ReceivedFd(process::UnixSocketManager& m, process::UnixInFlight e) : sockets(m), entry(util::move(e)) {
+    if (entry.object && entry.object->memory) {
+      uint64_t size = 0;
+      block = entry.object->memory->block(&size);
+    }
+  }
+  ~ReceivedFd() { if (entry.kind == process::DescriptorKind::UnixSocket && entry.token) sockets.release(uint32_t(entry.token)); }
+  ByteView memory() override { return block ? block.get()->bytes() : ByteView(); }
+  bool signal() override {
+    sockets.sync().lock();
+    const bool ok = sockets.event_add_locked(uint32_t(entry.token), 1) == process::UnixStatus::Ok;
+    sockets.sync().unlock();
+    return ok;
+  }
+  uint64_t take_signals() override {
+    uint64_t v = 0;
+    sockets.sync().lock();
+    sockets.event_take_locked(uint32_t(entry.token), &v);
+    sockets.sync().unlock();
+    return v;
+  }
+};
+
+struct SocketTransport final : NativeTransport {
+  process::UnixSocketManager& sockets;
+  SocketServer& server;
+  uint32_t sock;
+  uint32_t received_events = 0, received_memory = 0;
+  SocketTransport(process::UnixSocketManager& m, SocketServer& s, uint32_t id) : sockets(m), server(s), sock(id) {}
+  void send(ConstByteView bytes) override {
+    sockets.sync().lock();
+    uint32_t sent = 0;
+    CHECK(sockets.send_locked(sock, bytes, nullptr, 9, nullptr, &sent) == process::UnixStatus::Ok && sent == bytes.size());
+    sockets.sync().unlock();
+  }
+  void take(ByteBuffer* out, std::vector<Fd>* fds) override {
+    for (int i = 0; i < 4; ++i) server.pump();
+    uint8_t chunk[4096];
+    for (;;) {
+      process::UnixSocketManager::Received got;
+      Queue<process::UnixInFlight> rights(A);
+      sockets.sync().lock();
+      const process::UnixStatus st = sockets.receive_locked(sock, ByteView(chunk, sizeof chunk), false, &got, &rights);
+      sockets.sync().unlock();
+      process::UnixInFlight e;
+      while (rights.dequeue(&e)) {
+        if (e.kind == process::DescriptorKind::UnixSocket) ++received_events;
+        else if (e.object && e.object->memory) ++received_memory;
+        fds->push_back(Fd::make_as<ReceivedFd>(A, sockets, util::move(e)));
+      }
+      if (st != process::UnixStatus::Ok || got.got == 0) break;
+      out->append(ConstByteView(chunk, got.got));
+    }
+  }
+};
+
+static void test_socket_client_node() {
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  NativeServer native(g, A);
+  PulseServer pulse(g, A);
+  const int live_before = A.live.load();
+  {
+    SocketServer server(sockets, A);
+    CHECK(listen_standard_sockets(server, native, pulse, nullptr, A));
+    uint32_t sock = 0;
+    CHECK(sockets.create(process::UnixType::Stream, 9, &sock) == process::UnixStatus::Ok);
+    sync.lock();
+    CHECK(sockets.connect_locked(sock, process::UnixName::from(process::UnixName::Kind::Abstract, StringView("/run/user/0/pipewire-0").bytes()), StringView(), 9) ==
+          process::UnixStatus::Ok);
+    sync.unlock();
+    SocketTransport t(sockets, server, sock);
+    {
+      NativeClient c(native, t);
+      c.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+      c.take_with_fds();
+      ExportedNode play = export_node(c, 3, "Stream/Output/Audio", 1);
+      // the activation, the buffers and the io area came as memfds; the wake and done fds as eventfds
+      CHECK(play.ok && t.received_memory >= 3 && t.received_events == 2 && g.playback_count() == 1);
+      if (play.ok) {
+        ByteView act = play.activation->memory(), io = play.io->memory(), bufs = play.buffers->memory();
+        CHECK(act.size() >= 2312 && u32_at(act, 0) == 4 && u32_at(act, 544) == 1);      // what the server wrote, seen through the client's memory
+        put_u32(act, 0, 3);
+        for (int i = 0; i < 3; ++i) server.pump();
+        CHECK(native.running_nodes() == 1 && u32_at(act, 0) == 1 && play.wake->take_signals() == 1);      // triggered through the eventfd
+        const uint64_t base = 1ull * play.buffer_stride;
+        for (uint32_t i = 0; i < 1024; ++i) {
+          const float l = 0.5f, r = 0.5f;
+          memcpy(bufs.data() + base + play.data_offset + 8 * i, &l, 4);
+          memcpy(bufs.data() + base + play.data_offset + 8 * i + 4, &r, 4);
+        }
+        put_u32(bufs, base, 0); put_u32(bufs, base + 4, 8192);
+        put_u32(io, 0, 2); put_u32(io, 4, 1);
+        put_u32(act, 0, 3);
+        dev.take();
+        server.pump();
+        CHECK(u32_at(io, 0) == 1 && u32_at(io, 4) == 1);
+        mixer.pump();
+        std::vector<int16_t> out = dev.take();
+        CHECK(out.size() > 400 && abs(out[200] - 16383) < 60);
+      }
+    }
+    // the client goes: its node, connection and every descriptor with them
+    sockets.release(sock);
+    for (int i = 0; i < 5; ++i) server.pump();
+    CHECK(server.connections() == 0 && native.client_count() == 0 && g.playback_count() == 0);
+  }
+  // nothing is left: every memfd, eventfd and socket was let go
+  printf("socket client-node: %d allocations still held\n", A.live.load() - live_before);
+  CHECK(A.live.load() <= live_before + 8);
+}
+
 // ---- threads -------------------------------------------------------------------------------------------------------------------------------------
 
 static void test_threads() {
@@ -2289,6 +2428,7 @@ int main() {
   test_balance();
   test_client_node();
   test_sockets();
+  test_socket_client_node();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());
   return g_failed ? 1 : 0;

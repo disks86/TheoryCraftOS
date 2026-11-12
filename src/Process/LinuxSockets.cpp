@@ -984,8 +984,59 @@ uint64_t sys_select(Process& p, uint64_t count, uint64_t read_set, uint64_t writ
   return uint64_t(r);
 }
 
-uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) { return sys_recvfrom(p, fd, buffer, count, 0, 0, 0); }
-uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) { return sys_sendto(p, fd, buffer, count, 0, 0, 0); }
+// eventfd2(initial, flags) / eventfd(initial): a counter (UnixType::Event in the AF_UNIX manager, so that poll() and SCM_RIGHTS take it like a socket).
+// EFD_CLOEXEC and EFD_NONBLOCK are O_CLOEXEC and O_NONBLOCK; EFD_SEMAPHORE makes a read take one.
+uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags) {
+  constexpr uint64_t kEfdSemaphore = 1;
+  if (flags & ~(kSockNonBlock | kSockCloexec | kEfdSemaphore)) return error(kEinval);
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t id = 0;
+  if (const UnixStatus st = m->create_event(p.id(), uint32_t(initial), flags & kEfdSemaphore, &id); st != UnixStatus::Ok) return result_of(st);
+  return give_fd(p, *m, id, flags & kSockCloexec, flags & kSockNonBlock);
+}
+
+namespace {
+
+// An eventfd's read (8 bytes: the counter, which waits while it is 0) and write (8 bytes added, which waits while they would not fit).
+bool is_event(const Sock& s) {
+  Hold hold(*s.m);
+  return s.m->is_event_locked(s.id);
+}
+
+uint64_t event_read(Process& p, const Sock& s, uint64_t buffer, uint64_t count) {
+  if (count < 8) return error(kEinval);
+  uint64_t value = 0;
+  const int64_t r = run_blocking(p, s, false, false, [&] { return s.m->event_take_locked(s.id, &value); });
+  if (r < 0) return error(-r);
+  uint8_t bytes[8];
+  for (uint32_t i = 0; i < 8; ++i) bytes[i] = uint8_t(value >> (8 * i));
+  return p.write_user(buffer, ConstByteView(bytes, 8)) ? 8 : error(kEfault);      // (the value is gone if the buffer is bad, as on Linux)
+}
+
+uint64_t event_write(Process& p, const Sock& s, uint64_t buffer, uint64_t count) {
+  if (count < 8) return error(kEinval);
+  uint8_t bytes[8];
+  if (!p.read_user(buffer, ByteView(bytes, 8))) return error(kEfault);
+  uint64_t value = 0;
+  for (uint32_t i = 0; i < 8; ++i) value |= uint64_t(bytes[i]) << (8 * i);
+  if (value == ~uint64_t{0}) return error(kEinval);
+  const int64_t r = run_blocking(p, s, true, false, [&] { return s.m->event_add_locked(s.id, value); });
+  return r < 0 ? error(-r) : 8;
+}
+
+}  // namespace
+
+uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
+  Sock s;
+  if (socket_of(p, fd, &s) == 0 && is_event(s)) return event_read(p, s, buffer, count);
+  return sys_recvfrom(p, fd, buffer, count, 0, 0, 0);
+}
+uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
+  Sock s;
+  if (socket_of(p, fd, &s) == 0 && is_event(s)) return event_write(p, s, buffer, count);
+  return sys_sendto(p, fd, buffer, count, 0, 0, 0);
+}
 
 uint64_t socket_vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count, bool write) {
   Sock s;

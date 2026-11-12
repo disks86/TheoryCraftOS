@@ -112,7 +112,7 @@ struct Runtime final : IProcessRuntime {
 // Linux x86-64 numbers.
 enum : uint64_t { kRead = 0, kWrite = 1, kClose = 3, kStat = 4, kFstat = 5, kPoll = 7, kIoctl = 16, kReadv = 19, kWritev = 20, kSocket = 41, kConnect = 42,
                   kAccept = 43, kSendto = 44, kRecvfrom = 45, kSendmsg = 46, kRecvmsg = 47, kShutdown = 48, kBind = 49, kListen = 50, kGetsockname = 51,
-                  kGetpeername = 52, kSocketpair = 53, kSetsockopt = 54, kGetsockopt = 55, kFcntl = 72, kUnlink = 87, kOpen = 2, kDup = 32, kAccept4 = 288 };
+                  kGetpeername = 52, kSocketpair = 53, kSetsockopt = 54, kGetsockopt = 55, kFcntl = 72, kUnlink = 87, kOpen = 2, kDup = 32, kAccept4 = 288, kEventfd = 284, kEventfd2 = 290 };
 constexpr int64_t kEnoent = 2, kEbadf = 9, kEagain = 11, kEinval = 22, kEpipe = 32, kEnotsock = 88, kEprototype = 91, kEafnosupport = 97, kEaddrinuse = 98,
                   kEisconn = 106, kEnotconn = 107, kEconnrefused = 111, kEconnreset = 104;
 constexpr uint32_t kStatusWouldBlock = 0xC0000103u, kStatusRefused = 0xC0000236u, kStatusAddressInUse = 0xC000020Au;
@@ -538,6 +538,88 @@ static void test_linux_rights() {
   for (int64_t fd : {out, pa}) CHECK(sender.sys(kClose, fd) == 0);
 }
 
+// eventfd: a counter that read() empties (one at a time with EFD_SEMAPHORE), poll() sees, a blocked read wakes on a write from another thread, and SCM_RIGHTS
+// passes to another process like a socket.
+static void test_linux_eventfd() {
+  System sys;
+  Proc l(150, SyscallAbi::Linux, &sys.fs), other(151, SyscallAbi::Linux, &sys.fs);
+  const uint64_t value = l.alloc(8);
+  CHECK(l.sys(kEventfd2, 0, 0x4 /* not a flag */) == -kEinval);
+  const int64_t e = l.sys(kEventfd2, 3, 0x800 /* EFD_NONBLOCK */);
+  CHECK(e >= 3);
+  CHECK(l.sys(kRead, e, value, 4) == -kEinval);      // (fewer than 8 bytes)
+  CHECK(l.sys(kRead, e, value, 8) == 8 && l.memory.get64(value) == 3);
+  CHECK(l.sys(kRead, e, value, 8) == -kEagain);
+  const uint64_t fds = l.alloc(8);
+  l.memory.put32(fds, uint32_t(e)); l.memory.put32(fds + 4, 1 | 4);      // POLLIN | POLLOUT
+  CHECK(l.sys(kPoll, fds, 1, 0) == 1 && (l.memory.get32(fds + 4) >> 16) == 4);
+  l.memory.put64(value, 5);
+  CHECK(l.sys(kWrite, e, value, 8) == 8);
+  l.memory.put64(value, 2);
+  CHECK(l.sys(kWrite, e, value, 8) == 8);
+  CHECK(l.sys(kPoll, fds, 1, 0) == 1 && (l.memory.get32(fds + 4) >> 16) == 5);
+  CHECK(l.sys(kRead, e, value, 8) == 8 && l.memory.get64(value) == 7);
+  // Writes that would pass 2^64 - 2 wait (EAGAIN here); ~0 is refused.
+  l.memory.put64(value, ~uint64_t{0});
+  CHECK(l.sys(kWrite, e, value, 8) == -kEinval);
+  l.memory.put64(value, ~uint64_t{1});
+  CHECK(l.sys(kWrite, e, value, 8) == 8);
+  l.memory.put64(value, 1);
+  CHECK(l.sys(kWrite, e, value, 8) == -kEagain);
+  CHECK(l.sys(kPoll, fds, 1, 0) == 1 && (l.memory.get32(fds + 4) >> 16) == 1);
+  CHECK(l.sys(kRead, e, value, 8) == 8 && l.memory.get64(value) == ~uint64_t{1});
+  // Not a socket's calls.
+  CHECK(l.lsend(e, "x") < 0);
+  // eventfd(initial): no flags, the whole count. EFD_SEMAPHORE: one at a time.
+  const int64_t sem = l.sys(kEventfd, 2);
+  CHECK(sem >= 3);
+  CHECK(l.sys(kRead, sem, value, 8) == 8 && l.memory.get64(value) == 2);
+  CHECK(l.sys(kClose, sem) == 0);
+  const int64_t s2 = l.sys(kEventfd2, 2, 1 | 0x800);
+  CHECK(l.sys(kRead, s2, value, 8) == 8 && l.memory.get64(value) == 1);
+  CHECK(l.sys(kRead, s2, value, 8) == 8 && l.memory.get64(value) == 1);
+  CHECK(l.sys(kRead, s2, value, 8) == -kEagain);
+  CHECK(l.sys(kClose, s2) == 0);
+  // A blocking read wakes on another thread's write.
+  const int64_t b = l.sys(kEventfd2, 0, 0);
+  std::atomic<bool> woke{false};
+  std::thread reader([&] {
+    const uint64_t got = l.alloc(8);
+    CHECK(l.sys(kRead, b, got, 8) == 8 && l.memory.get64(got) == 9);
+    woke = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  CHECK(!woke.load());
+  const uint64_t nine = l.alloc(8);
+  l.memory.put64(nine, 9);
+  CHECK(l.sys(kWrite, b, nine, 8) == 8);
+  reader.join();
+  CHECK(woke.load());
+  // Passed with SCM_RIGHTS: the same counter in the other process.
+  const uint64_t pair = l.alloc(8);
+  CHECK(l.sys(kSocketpair, 1, 1, 0, pair) == 0);
+  const int64_t pa = l.memory.get32(pair), pb = l.memory.get32(pair + 4);
+  const uint64_t iov = l.alloc(16), control = l.alloc(24), msg = l.alloc(56);
+  l.memory.put64(iov, l.data("E")); l.memory.put64(iov + 8, 1);
+  l.memory.put64(control, 20); l.memory.put32(control + 8, 1); l.memory.put32(control + 12, 1); l.memory.put32(control + 16, uint32_t(b));
+  memset(l.memory.at(msg), 0, 56);
+  l.memory.put64(msg + 16, iov); l.memory.put64(msg + 24, 1); l.memory.put64(msg + 32, control); l.memory.put64(msg + 40, 24);
+  CHECK(l.sys(kSendmsg, pa, msg, 0) == 1);
+  const uint64_t rbuf = l.alloc(4), riov = l.alloc(16), rcontrol = l.alloc(64), rmsg = l.alloc(56);
+  l.memory.put64(riov, rbuf); l.memory.put64(riov + 8, 4);
+  memset(l.memory.at(rmsg), 0, 56);
+  l.memory.put64(rmsg + 16, riov); l.memory.put64(rmsg + 24, 1); l.memory.put64(rmsg + 32, rcontrol); l.memory.put64(rmsg + 40, 64);
+  CHECK(l.sys(kRecvmsg, pb, rmsg, 0) == 1);
+  const int64_t passed = l.memory.get32(rcontrol + 16);
+  CHECK(passed >= 3 && passed != b);
+  l.memory.put64(nine, 4);
+  CHECK(l.sys(kWrite, passed, nine, 8) == 8);
+  CHECK(l.sys(kClose, passed) == 0);
+  CHECK(l.sys(kRead, b, value, 8) == 8 && l.memory.get64(value) == 4);
+  for (int64_t fd : {b, e, pa, pb}) CHECK(l.sys(kClose, fd) == 0);
+  (void)other;
+}
+
 // --- Windows -------------------------------------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows() {
@@ -801,6 +883,7 @@ int main() {
   printf("-- linux_named\n"); fflush(stdout); test_linux_named();
   printf("-- linux_datagram_names\n"); fflush(stdout); test_linux_datagram_names();
   printf("-- linux_rights\n"); fflush(stdout); test_linux_rights();
+  printf("-- linux_eventfd\n"); fflush(stdout); test_linux_eventfd();
   printf("-- windows\n"); fflush(stdout); test_windows();
   printf("-- cross_world\n"); fflush(stdout); test_cross_world();
   printf("-- threads\n"); fflush(stdout); test_threads();
