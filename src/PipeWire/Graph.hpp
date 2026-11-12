@@ -79,6 +79,7 @@ struct GraphObject {
   SharedPointer<PlaybackStream> playback;            // a stream a protocol opened
   SharedPointer<RecordStream> record;                // a record stream a protocol opened
   SharedPointer<audio::AudioStream> native;          // a stream a native program opened on the mixer
+  SharedPointer<audio::CaptureStream> native_capture;      // a stream a native program opened on the capture hub
   uint32_t input_ports = 0, output_ports = 0;
   bool monitor = false;                              // a record node of the sink's monitor (what plays), not of the source
   // a port
@@ -190,6 +191,7 @@ class Graph {
   uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
+  void sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live);
   uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props);
   void set_default_metadata_locked();
   void sync_sink_locked(const char* device_name, uint8_t master, bool muted);

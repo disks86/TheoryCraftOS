@@ -84,11 +84,12 @@ bool AudioCaptureHub::initialize() {
   return !chunk_.empty();
 }
 
-SharedPointer<CaptureStream> AudioCaptureHub::open_stream(const StreamFormat& format, uint32_t ring_bytes) {
+SharedPointer<CaptureStream> AudioCaptureHub::open_stream(const StreamFormat& format, uint32_t ring_bytes, bool server_owned) {
   kernel::ScopedMutex guard(mutex_);
   if (streams_.count() >= kMaxStreams) return SharedPointer<CaptureStream>();
   SharedPointer<CaptureStream> stream = SharedPointer<CaptureStream>::make(allocator_, allocator_, format);
   if (!stream || !stream->allocate(ring_bytes)) return SharedPointer<CaptureStream>();
+  stream->set_server_owned(server_owned);
   if (streams_.count() == 0 && device_) device_->flush();  // the first listener hears from now, not from earlier
   if (!streams_.push_back(stream)) return SharedPointer<CaptureStream>();
   ++stats_.streams_opened;
@@ -98,6 +99,15 @@ SharedPointer<CaptureStream> AudioCaptureHub::open_stream(const StreamFormat& fo
 uint32_t AudioCaptureHub::stream_count() {
   kernel::ScopedMutex guard(mutex_);
   return static_cast<uint32_t>(streams_.count());
+}
+
+bool AudioCaptureHub::snapshot_streams(List<SharedPointer<CaptureStream>>* out) {
+  out->clear();
+  kernel::ScopedMutex guard(mutex_);
+  if (!out->reserve(streams_.count())) return false;
+  for (const SharedPointer<CaptureStream>& s : streams_)
+    if (!s->closed() && !out->push_back(s)) return false;
+  return true;
 }
 
 CaptureHubStatistics AudioCaptureHub::statistics() {

@@ -59,6 +59,7 @@ UniquePointer<rtc::IRtcAudioSource> DesktopRtcAudio::open_microphone() {
   if (!capture_) return UniquePointer<rtc::IRtcAudioSource>();
   SharedPointer<audio::CaptureStream> stream = capture_->open_stream(kVoice);
   if (!stream) return UniquePointer<rtc::IRtcAudioSource>();
+  stream->set_label("Web Browser");      // (the graph shows it as a source output)
   UniquePointer<Microphone> mic = UniquePointer<Microphone>::make(allocator_, util::move(stream));
   return UniquePointer<rtc::IRtcAudioSource>(static_cast<UniquePointer<Microphone>&&>(mic));
 }

@@ -1661,6 +1661,44 @@ static void test_monitor() {
   CHECK(g.record_count() == 0 && mixer.tap_count() == 0);
 }
 
+// A native program's record stream (WebRTC's microphone through the desktop) shows up as a source output of the native client, with its gain as volume.
+static void test_native_capture() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  SharedPointer<audio::CaptureStream> web = hub.open_stream(audio::StreamFormat{16000, 1, audio::SampleType::S16});
+  CHECK(web);
+  web->set_label("Web Browser");
+  g.refresh();
+  uint32_t node = 0;
+  g.for_each([&](const GraphObject& o) {
+    if (o.type == ObjectType::Node && o.role == NodeRole::Capture && o.native_capture.get() == web.get() && o.origin == Origin::Native &&
+        o.client == g.native_client_id() && o.props.get("application.name") == StringView("Web Browser") && o.format.rate == 16000)
+      node = o.id;
+  });
+  CHECK(node != 0 && g.record_count() == 1);
+  g.refresh();
+  CHECK(g.record_count() == 1);      // (not again)
+  CHECK(g.set_volume(node, 0.5f, true) && web->muted() && web->gain() == uint8_t(0.5f * hardware::kAudioMaxVolume + 0.5f));
+  // the graph's own record streams are not taken for native ones
+  const uint32_t client = g.add_client(Origin::Linux, 9, "protocol-pulse", "");
+  SharedPointer<RecordStream> rec;
+  CHECK(g.create_record(client, PcmFormat{}, Properties(A), &rec) && rec->capture().server_owned());
+  g.refresh();
+  CHECK(g.record_count() == 2);
+  // it ends: its node goes
+  web->close();
+  g.refresh();
+  CHECK(g.record_count() == 1 && !g.visit(node, [](const GraphObject&) {}));
+  g.remove_client(client);
+  CHECK(g.record_count() == 0);
+}
+
 // ---- the Windows service -------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows_service() {
@@ -1887,6 +1925,7 @@ int main() {
   test_record();
   test_record_threads();
   test_monitor();
+  test_native_capture();
   test_sockets();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());

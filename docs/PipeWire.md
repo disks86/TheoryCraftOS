@@ -51,7 +51,9 @@ program that records, of any kind, gets a record stream of it.
   `Stream/Input/Audio` node linked from the source; the hub resamples, `RecordStream` converts to the program's format (each output channel takes its
   side; centre and mono the average, LFE silence). The source's volume and mute are the hub's master gain and mute (the microphone's), a record
   stream's its `CaptureStream`'s gain (neither goes above 1). A paused (corked, stopped) record stream drops what the microphone hears meanwhile, so it
-  starts again with sound from the moment it resumes. Native capture streams (WebRTC's through the desktop) are not shown as nodes.
+  starts again with sound from the moment it resumes. Native programs' record streams on the hub (WebRTC's microphone through the desktop, labelled
+  "Web Browser" with `CaptureStream::set_label`) are found by `refresh()` and shown as record nodes of the "TheoryCraftOS" client, with their gain
+  as volume; the graph's own streams are marked `server_owned` so they are not shown twice.
 - **The monitor.** The sink has output ports `monitor_FL`/`monitor_FR` (`port.monitor`). `create_record(..., monitor = true)` makes a record stream
   that the mixer feeds what it mixes (`AudioMixer::add_tap`, an `IAudioTap` such as a `CaptureStream`), before the master volume (the device's). While
   nothing plays nothing is mixed, so a monitor stream hears nothing (as WASAPI loopback does) rather than silence. PulseAudio shows it as the source
@@ -136,8 +138,6 @@ comes out once stopped), the padding is everything waiting to be read, and audio
   Those programs fail; libpulse programs work.
 - **libpipewire recording** has the playback side's gap (`pw_stream` needs `client-node`); `pw-record` fails, `parecord` works.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
-- **Native recorders in the graph.** The hub's own streams (WebRTC's `getUserMedia` through the desktop) are not shown as nodes, so `pactl list
-  source-outputs` does not list them.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).
 - **More of Windows audio.** XAudio2 is still missing (it would go over WASAPI). WASAPI has no exclusive mode (refused);

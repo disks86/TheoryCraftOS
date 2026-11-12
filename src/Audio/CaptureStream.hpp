@@ -23,6 +23,7 @@
 #include "Audio/StreamFormat.hpp"
 #include "Hardware/AudioDevice/CaptureRing.hpp"
 #include "Kernel/Sync.hpp"
+#include "Utility/FixedString.hpp"
 
 namespace audio {
 
@@ -66,6 +67,19 @@ class CaptureStream final : public IAudioTap {
 
   hardware::AudioCaptureStatistics statistics();
 
+  // Who records ("Web Browser", ...), shown by the sound server's graph (src/PipeWire). Longer names are cut.
+  void set_label(StringView label) {
+    kernel::ScopedMutex guard(mutex_);
+    label_ = FixedString<48>(label.size() > 47 ? label.first(47) : label);
+  }
+  FixedString<48> label() {
+    kernel::ScopedMutex guard(mutex_);
+    return label_;
+  }
+  // A sound server's own stream, which it lists itself (the graph does not show it twice). Set before the stream is shared.
+  void set_server_owned(bool owned) { __atomic_store_n(&server_owned_, owned, __ATOMIC_RELEASE); }
+  bool server_owned() const { return __atomic_load_n(&server_owned_, __ATOMIC_ACQUIRE); }
+
   // Hub side: appends recorded frames (in the device's format; they are converted here).
   void deliver(ConstByteView pcm) override;
 
@@ -78,6 +92,8 @@ class CaptureStream final : public IAudioTap {
   uint8_t gain_ = hardware::kAudioMaxVolume;
   bool muted_ = false;
   bool closed_ = false;
+  FixedString<48> label_;
+  bool server_owned_ = false;
 };
 
 }  // namespace audio

@@ -546,7 +546,7 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     capture = SharedPointer<audio::CaptureStream>::make(allocator_, allocator_, sf);
     if (capture && (!capture->allocate(ring) || !mixer_->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
   } else {
-    capture = capture_->open_stream(sf, ring);
+    capture = capture_->open_stream(sf, ring, true);      // (marked: refresh() must not take it for a native program's)
   }
   if (!capture) return 0;
   SharedPointer<RecordStream> record = SharedPointer<RecordStream>::make(allocator_, allocator_, format, capture);
@@ -655,6 +655,9 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
     } else if (node->record) {
       node->record->capture().set_gain(to_device_volume(volume));
       node->record->capture().set_muted(mute);
+    } else if (node->native_capture) {
+      node->native_capture->set_gain(to_device_volume(volume));
+      node->native_capture->set_muted(mute);
     } else if (node->playback) {
       node->playback->stream().set_volume(to_device_volume(volume));
       node->playback->stream().set_muted(mute);
@@ -721,6 +724,43 @@ void Graph::sync_sink_locked(const char* device_name, uint8_t master, bool muted
   }
 }
 
+void Graph::sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live) {
+  auto is_live = [&](const audio::CaptureStream* s) {
+    for (const SharedPointer<audio::CaptureStream>& l : live)
+      if (l.get() == s) return true;
+    return false;
+  };
+  // native record streams that ended
+  List<uint32_t> ended(allocator_);
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->native_capture && (o->native_capture->closed() || !is_live(o->native_capture.get()))) ended.push_back(o->id);
+  List<SharedPointer<PlaybackStream>> none(allocator_);
+  for (uint32_t id : ended) remove_node_locked(id, &none, false);
+  // and new ones (the hub's streams that are not the graph's own record streams)
+  for (const SharedPointer<audio::CaptureStream>& l : live) {
+    bool known = false;
+    for (const UniquePointer<GraphObject>& o : objects_.view())
+      if (o->native_capture.get() == l.get() || (o->record && &o->record->capture() == l.get())) {
+        known = true;
+        break;
+      }
+    if (known || l->server_owned()) continue;
+    const audio::StreamFormat& sf = l->format();
+    PcmFormat format{sf.type == audio::SampleType::S16 ? SampleFormat::S16Le : SampleFormat::U8, sf.sample_rate, sf.channels};
+    Properties props(allocator_);
+    const FixedString<48> label = l->label();
+    props.set("application.name", label.empty() ? StringView("TheoryCraftOS") : label.view());
+    props.set("media.name", label.empty() ? StringView("Recording") : label.view());
+    props.set("client.api", "tcos-native");
+    const uint32_t id = add_record_node_locked(native_client_, Origin::Native, format, props, false);
+    if (GraphObject* node = id ? find_locked(id) : nullptr) {
+      node->native_capture = l;
+      node->volume = l->gain() / float(hardware::kAudioMaxVolume);
+      node->mute = l->muted();
+    }
+  }
+}
+
 void Graph::sync_source_locked(StringView device_name, uint8_t gain, bool muted) {
   GraphObject* source = find_locked(source_);
   if (!source) return;
@@ -765,8 +805,11 @@ void Graph::refresh() {
     const FixedString<64> name = capture_->source_name();
     const uint8_t gain = capture_->master_gain();
     const bool muted = capture_->master_muted();
+    List<SharedPointer<audio::CaptureStream>> live(allocator_);
+    const bool listed = capture_->snapshot_streams(&live);
     kernel::ScopedMutex guard(mutex_);
     sync_source_locked(name.view(), gain, muted);
+    if (listed) sync_native_capture_locked(live);
   }
   if (!mixer_) return;
   List<SharedPointer<audio::AudioStream>> live(allocator_);

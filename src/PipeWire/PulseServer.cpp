@@ -739,7 +739,9 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       if (!t.u32(&index)) return invalid();
       float volume = 1.0f;
       bool mute = false;
-      if (!graph_.record_of(index) || !graph_.get_volume(index, &volume, &mute)) return send_error(c, tag, kErrNoEntity);
+      bool source_output = false;      // (a record stream of any kind, the native ones too)
+      graph_.visit(index, [&](const GraphObject& o) { source_output = o.type == ObjectType::Node && o.role == NodeRole::Capture; });
+      if (!source_output || !graph_.get_volume(index, &volume, &mute)) return send_error(c, tag, kErrNoEntity);
       if (cmd == kSetSourceOutputVolume) {
         Cvolume v;
         if (!t.cvolume(&v) || v.channels == 0) return invalid();

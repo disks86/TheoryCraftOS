@@ -69,7 +69,8 @@ class AudioCaptureHub {
 
   // A new stream, or an empty pointer at kMaxStreams / out of memory.
   // The program reads in `format` (default: the device's own, 48 kHz 16-bit stereo, which needs no conversion).
-  SharedPointer<CaptureStream> open_stream(const StreamFormat& format, uint32_t ring_bytes = CaptureStream::kDefaultRingBytes);
+  // `server_owned`: the sound server's own stream (CaptureStream::server_owned(), set before anyone can see it).
+  SharedPointer<CaptureStream> open_stream(const StreamFormat& format, uint32_t ring_bytes = CaptureStream::kDefaultRingBytes, bool server_owned = false);
   SharedPointer<CaptureStream> open_stream(uint32_t ring_bytes = CaptureStream::kDefaultRingBytes) {
     return open_stream(StreamFormat(), ring_bytes);
   }
@@ -95,6 +96,8 @@ class AudioCaptureHub {
   bool master_muted() const;
 
   uint32_t stream_count();
+  // The streams open now (copies of the pointers, taken under the hub's lock), for the sound server's graph. False if out of memory.
+  bool snapshot_streams(List<SharedPointer<CaptureStream>>* out);
   CaptureHubStatistics statistics();
   // (the source in use, which must exist; see source() when it can change)
   hardware::IAudioCapture& device() { return *device_; }
