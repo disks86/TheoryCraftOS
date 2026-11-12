@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -486,7 +487,7 @@ static void test_graph() {
 // ---- the native protocol -------------------------------------------------------------------------------------------------------------------------
 
 struct NativeMessage {
-  uint32_t id, opcode, seq;
+  uint32_t id, opcode, seq, n_fds = 0;
   std::vector<uint8_t> payload;
 };
 
@@ -508,9 +509,20 @@ struct NativeClient {
     msg.append(body.view());
     server.receive(handle, msg.view());
   }
+  std::vector<Fd> fds;      // what take_with_fds() collected, in order
+  std::vector<NativeMessage> take_with_fds() {
+    List<Fd> got(A);
+    ByteBuffer out(A);
+    server.take_output_with_fds(handle, &out, &got);
+    for (Fd& f : got) fds.push_back(f);
+    return parse(out);
+  }
   std::vector<NativeMessage> take() {
     ByteBuffer out(A);
     server.take_output(handle, &out);
+    return parse(out);
+  }
+  std::vector<NativeMessage> parse(ByteBuffer& out) {
     in.insert(in.end(), out.view().data(), out.view().data() + out.size());
     std::vector<NativeMessage> r;
     size_t at = 0;
@@ -520,7 +532,7 @@ struct NativeClient {
       m.id = h.le32();
       const uint32_t w = h.le32();
       m.seq = h.le32();
-      h.le32();
+      m.n_fds = h.le32();
       m.opcode = w >> 24;
       const uint32_t size = w & 0xFFFFFF;
       if (in.size() - at - 16 < size) break;
@@ -1748,6 +1760,305 @@ static void test_balance() {
   server.close_client(c.handle);
 }
 
+// ---- client-node (libpipewire's pw_stream) ------------------------------------------------------------------------------------------------------
+
+// Descriptors in memory: shared memory is a block of this process, an eventfd a counter.
+struct FakeFd final : Descriptor {
+  std::vector<uint8_t> bytes;
+  uint8_t* aligned = nullptr;
+  uint64_t size = 0;
+  std::atomic<uint64_t> counter{0};
+  bool event = false;
+  FakeFd(uint64_t n, bool is_event) : bytes(is_event ? 0 : n + 4096), size(is_event ? 0 : n), event(is_event) {
+    if (!is_event) aligned = bytes.data() + (4096 - reinterpret_cast<uintptr_t>(bytes.data()) % 4096) % 4096;
+  }
+  ByteView memory() override { return event ? ByteView() : ByteView(aligned, size); }
+  bool signal() override { if (!event) return false; ++counter; return true; }
+  uint64_t take_signals() override { return counter.exchange(0); }
+};
+struct FakeMaker final : IDescriptorMaker {
+  int made = 0;
+  bool fail = false;
+  Fd make_memory(uint64_t size, StringView) override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, size, false); }
+  Fd make_event() override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, 0, true); }
+};
+
+static uint32_t u32_at(ByteView m, uint64_t at) { uint32_t v; memcpy(&v, m.data() + at, 4); return v; }
+static void put_u32(ByteView m, uint64_t at, uint32_t v) { memcpy(m.data() + at, &v, 4); }
+
+// The setup a pw_stream goes through, as libpipewire 1.x sends it; returns the ClientNode id, the activation, io and buffer memory and the wake fd.
+struct ExportedNode {
+  uint32_t id = 0, node = 0, n_buffers = 0, buffer_stride = 0, data_offset = 0, data_size = 0;
+  Fd activation, io, buffers, wake;
+  bool ok = false;
+};
+
+static ExportedNode export_node(NativeClient& c, uint32_t id, const char* media_class, uint32_t direction) {
+  ExportedNode e;
+  e.id = id;
+  c.send(0, 6, [&](pod::Builder& b) {      // create_object
+    b.string("client-node"); b.string("PipeWire:Interface:ClientNode"); b.int32(6);
+    const uint64_t d = b.begin_struct();
+    b.int32(2); b.string("media.class"); b.string(media_class); b.string("application.name"); b.string("pw-test");
+    b.end(d);
+    b.int32(int32_t(id));
+  });
+  std::map<uint32_t, Fd> mems;
+  uint64_t next_fd = c.fds.size();
+  auto take = [&] {
+    std::vector<NativeMessage> msgs = c.take_with_fds();
+    std::vector<NativeMessage> mine;
+    for (NativeMessage& m : msgs) {
+      // the descriptors of this message are the next n_fds collected
+      std::vector<Fd> own(c.fds.begin() + long(next_fd), c.fds.begin() + long(next_fd + m.n_fds));
+      next_fd += m.n_fds;
+      if (m.id == 0 && m.opcode == 6) {      // add_mem: id, type, fd, flags
+        int32_t mem = 0; uint32_t type = 0; int64_t fd = -1;
+        pod::Parser q = args_of(m); pod::Value v;
+        q.int32(&mem); q.id(&type); q.next(&v); v.get_fd(&fd);
+        if (type == 2 && fd >= 0 && size_t(fd) < own.size()) mems[uint32_t(mem)] = own[size_t(fd)];
+      }
+      if (m.id == 0 && m.opcode == 8) { pod::Parser p = args_of(m); int32_t pid = 0, node = 0; if (p.int32(&pid) && p.int32(&node) && uint32_t(pid) == id) e.node = uint32_t(node); }
+      if (m.id == id && m.opcode == 0) {      // transport: readfd, writefd, mem, offset, size
+        pod::Parser p = args_of(m); pod::Value r, w; int32_t mem = 0, off = 0, size = 0; int64_t rf = -1;
+        if (p.next(&r) && p.next(&w) && p.int32(&mem) && p.int32(&off) && p.int32(&size) && r.get_fd(&rf) && rf >= 0 && size_t(rf) < own.size()) {
+          e.wake = own[size_t(rf)];
+          e.activation = mems[uint32_t(mem)];
+          CHECK(size == 2312 && off == 0 && m.n_fds == 2);
+        }
+      }
+      if (m.id == id) mine.push_back(m);
+    }
+    return mine;
+  };
+  std::vector<NativeMessage> msgs = take();
+  CHECK(e.node != 0 && e.activation && e.wake);
+  // the node's update, then active: the server answers with a PortConfig
+  c.send(id, 2, [](pod::Builder& b) {
+    b.int32(3); b.int32(0);
+    const uint64_t i = b.begin_struct();
+    b.int32(0); b.int32(1); b.int64(7); b.int64(0);
+    b.int32(1); b.string("node.name"); b.string("pw-test-node");
+    b.int32(0);
+    b.end(i);
+  });
+  c.send(id, 4, [](pod::Builder& b) { b.boolean(true); });
+  msgs = take();
+  bool port_config = false;
+  for (const NativeMessage& m : msgs)
+    if (m.opcode == 1) {
+      pod::Parser p = args_of(m); uint32_t pid = 0; int32_t flags = 0; pod::Value obj;
+      pod::ObjectReader o;
+      if (p.id(&pid) && p.int32(&flags) && p.pod(&obj) && o.open(obj) && pid == 11 && o.object_type() == 0x40008) {
+        uint32_t key = 0, f = 0, dir = 99, mode = 0; pod::Value v;
+        while (o.next(&key, &f, &v)) { if (key == 1) v.get_id(&dir); if (key == 2) v.get_id(&mode); }
+        port_config = dir == direction && mode == 2;
+      }
+    }
+  CHECK(port_config);
+  // the port appears (its EnumFormat): the server sets the Format
+  c.send(id, 3, [&](pod::Builder& b) {
+    b.int32(int32_t(direction)); b.int32(0); b.int32(3); b.int32(1);
+    build_format_param(b, 3, PcmFormat{SampleFormat::F32Le, 48000, 2});
+    b.none();
+  });
+  msgs = take();
+  bool format = false;
+  for (const NativeMessage& m : msgs)
+    if (m.opcode == 7) { pod::Parser p = args_of(m); int32_t dir = -1, port = -1; uint32_t pid = 0; format = p.int32(&dir) && p.int32(&port) && p.id(&pid) && pid == 4 && dir == int32_t(direction) && port == 0; }
+  CHECK(format);
+  // the port takes it and says what buffers it wants: the server gives them, the io area and Start
+  c.send(id, 3, [&](pod::Builder& b) {
+    b.int32(int32_t(direction)); b.int32(0); b.int32(3); b.int32(1);
+    const uint64_t o = b.begin_object(0x40004, 5);
+    b.property(1); { const uint64_t ch = b.begin_choice(1, pod::kInt); b.choice_value32(4); b.choice_value32(2); b.choice_value32(8); b.end(ch); }
+    b.property(3); b.int32(20000);
+    b.end(o);
+    b.none();
+  });
+  msgs = take();
+  bool mix = false, buffers = false, io = false, start = false;
+  for (const NativeMessage& m : msgs) {
+    if (m.opcode == 11) mix = true;
+    if (m.opcode == 8) {
+      pod::Parser p = args_of(m); int32_t dir, port, mixid, flags, n;
+      if (p.int32(&dir) && p.int32(&port) && p.int32(&mixid) && p.int32(&flags) && p.int32(&n)) {
+        e.n_buffers = uint32_t(n);
+        int32_t mem, off, size, metas, datas, dflags, mapoff, maxsize, dataoff; uint32_t dtype;
+        if (p.int32(&mem) && p.int32(&off) && p.int32(&size) && p.int32(&metas) && p.int32(&datas) && p.id(&dtype) && p.int32(&dataoff) && p.int32(&dflags) &&
+            p.int32(&mapoff) && p.int32(&maxsize)) {
+          e.buffers = mems[uint32_t(mem)];
+          e.buffer_stride = uint32_t(size);
+          e.data_offset = uint32_t(dataoff);
+          e.data_size = uint32_t(maxsize);
+          buffers = dtype == 1 && datas == 1 && metas == 0 && maxsize >= 20000 && (mixid == (direction == 1 ? -1 : 0));
+        }
+      }
+    }
+    if (m.opcode == 9) {
+      pod::Parser p = args_of(m); int32_t dir, port, mixid, mem, off, size; uint32_t ioid;
+      if (p.int32(&dir) && p.int32(&port) && p.int32(&mixid) && p.id(&ioid) && p.int32(&mem) && p.int32(&off) && p.int32(&size)) {
+        e.io = mems[uint32_t(mem)];
+        io = ioid == 1 && size == 8;
+      }
+    }
+    if (m.opcode == 4) start = true;
+  }
+  CHECK(mix && buffers && io && start && e.n_buffers == 4 && e.buffers && e.io);
+  e.ok = mix && buffers && io && start && e.buffers && e.io;
+  return e;
+}
+
+static void test_client_node() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  NativeServer server(g, A);
+  // without a descriptor maker client-node is refused
+  {
+    NativeClient c(server);
+    c.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+    c.take();
+    c.send(0, 6, [](pod::Builder& b) {
+      b.string("client-node"); b.string("PipeWire:Interface:ClientNode"); b.int32(6);
+      const uint64_t d = b.begin_struct(); b.int32(0); b.end(d);
+      b.int32(3);
+    });
+    bool refused = false;
+    for (const NativeMessage& m : c.take()) refused |= m.id == 0 && m.opcode == 3;
+    CHECK(refused && g.playback_count() == 0);
+    server.close_client(c.handle);
+  }
+  FakeMaker maker;
+  server.set_descriptor_maker(&maker);
+  NativeClient c(server);
+  c.send(0, 1, [](pod::Builder& b) { b.int32(4); });
+  c.take_with_fds();
+
+  // ---- playback: the stream fills a buffer each cycle
+  ExportedNode play = export_node(c, 3, "Stream/Output/Audio", 1);
+  CHECK(play.ok && g.playback_count() == 1 && server.running_nodes() == 0);
+  bool named = false;
+  g.visit(play.node, [&](const GraphObject& o) { named = o.props.get("application.name") == StringView("pw-test") && o.props.get("client.api") == StringView("pipewire"); });
+  CHECK(named);
+  if (play.ok) {
+    ByteView act = play.activation->memory(), io = play.io->memory(), bufs = play.buffers->memory();
+    CHECK(u32_at(act, 0) == 4 && u32_at(act, 544) == 1);      // INACTIVE until the client is ready; server version 1
+    server.tick();
+    CHECK(play.wake->take_signals() == 0);      // (not triggered while inactive)
+    put_u32(act, 0, 3);      // the client added the node to its loop: FINISHED
+    server.tick();
+    CHECK(server.running_nodes() == 1 && u32_at(act, 0) == 1 && play.wake->take_signals() == 1);      // TRIGGERED, signalled
+    CHECK(u32_at(act, 560 + 80 + 4) == 48000 && u32_at(act, 560 + 96) == 1024);      // the clock: 1/48000, a 1024-frame quantum
+    // the client fills buffer 2 with 1024 frames of 0.25 / -0.25, says HAVE_DATA and FINISHED
+    const uint64_t base = 2ull * play.buffer_stride;
+    for (uint32_t i = 0; i < 1024; ++i) {
+      const float l = 0.25f, r = -0.25f;
+      memcpy(bufs.data() + base + play.data_offset + 8 * i, &l, 4);
+      memcpy(bufs.data() + base + play.data_offset + 8 * i + 4, &r, 4);
+    }
+    put_u32(bufs, base, 0); put_u32(bufs, base + 4, 8192);
+    put_u32(io, 0, 2); put_u32(io, 4, 2);
+    put_u32(act, 0, 3);
+    dev.take();
+    server.tick();
+    CHECK(u32_at(io, 0) == 1 && u32_at(io, 4) == 2);      // NEED_DATA, buffer 2 handed back
+    CHECK(u32_at(act, 0) == 1);      // and the next cycle triggered at once (the stream wants three quanta)
+    mixer.pump();
+    std::vector<int16_t> out = dev.take();
+    CHECK(out.size() > 400 && abs(out[200] - 8191) < 40 && abs(out[201] + 8191) < 40);
+    // a cycle without data hands nothing back
+    put_u32(io, 0, 1); put_u32(io, 4, 1);
+    put_u32(act, 0, 3);
+    server.tick();
+    CHECK(u32_at(io, 4) == 0xFFFFFFFFu);
+    // a cycle that never finishes is given up after a while and triggered again
+    for (int i = 0; i < 120; ++i) { server.tick(); mixer.pump(); dev.play_all(); }
+    CHECK(play.wake->take_signals() >= 2);
+    // set_active(false): Pause, no more cycles
+    c.send(3, 4, [](pod::Builder& b) { b.boolean(false); });
+    bool paused = false;
+    for (const NativeMessage& m : c.take_with_fds()) paused |= m.id == 3 && m.opcode == 4;
+    server.tick();
+    CHECK(paused && server.running_nodes() == 0);
+  }
+
+  // ---- recording: the server fills a buffer from the microphone before each cycle
+  ExportedNode rec = export_node(c, 4, "Stream/Input/Audio", 0);
+  CHECK(rec.ok && g.record_count() == 1);
+  if (rec.ok) {
+    ByteView act = rec.activation->memory(), io = rec.io->memory(), bufs = rec.buffers->memory();
+    put_u32(act, 0, 3);
+    server.tick();
+    CHECK(rec.wake->take_signals() == 0);      // (nothing recorded yet)
+    mic.add(2400, 16384, -8192);
+    hub.pump();
+    server.tick();
+    CHECK(rec.wake->take_signals() == 1 && u32_at(io, 0) == 2);
+    const uint32_t id = u32_at(io, 4);
+    CHECK(id < rec.n_buffers);
+    if (id < rec.n_buffers) {
+      const uint64_t base = uint64_t(id) * rec.buffer_stride;
+      float l = 0, r = 0;
+      memcpy(&l, bufs.data() + base + rec.data_offset + 8 * 100, 4);
+      memcpy(&r, bufs.data() + base + rec.data_offset + 8 * 100 + 4, 4);
+      CHECK(u32_at(bufs, base + 4) == 8192 && fabsf(l - 0.5f) < 0.001f && fabsf(r + 0.25f) < 0.001f);
+    }
+    put_u32(act, 0, 3);
+    server.tick();      // (the client took it; another quantum is waiting)
+    CHECK(rec.wake->take_signals() == 1 && u32_at(io, 4) != id);
+  }
+
+  // ---- garbage: every truncation and bit flips of the client's client-node messages, and Core destroy
+  std::mt19937 rng(23);
+  for (int round = 0; round < 600; ++round) {
+    ByteBuffer body(A);
+    pod::Builder b(body);
+    const uint64_t f = b.begin_struct();
+    const uint32_t op = 2 + uint32_t(round % 3);
+    if (op == 2) {
+      b.int32(3); b.int32(1); b.raw(ConstByteView());
+      const uint64_t i = b.begin_struct(); b.int32(0); b.int32(1); b.int64(7); b.int64(0); b.int32(1); b.string("k"); b.string("v"); b.int32(0); b.end(i);
+    } else if (op == 3) {
+      b.int32(1); b.int32(0); b.int32(3); b.int32(1);
+      const uint64_t o = b.begin_object(0x40004, 5); b.property(3); b.int32(int32_t(rng() % 100000)); b.end(o);
+      b.none();
+    } else {
+      b.boolean(round % 2);
+    }
+    b.end(f);
+    std::vector<uint8_t> m(body.view().data(), body.view().data() + body.size());
+    if (round % 2) m.resize(rng() % (m.size() + 1));
+    else for (int k = 0; k < 3; ++k) m[rng() % m.size()] ^= uint8_t(1u << (rng() % 8));
+    ByteBuffer msg(A);
+    msg.put32(3); msg.put32(op << 24 | uint32_t(m.size())); msg.put32(0); msg.put32(0);
+    msg.append(ConstByteView(m.data(), m.size()));
+    server.receive(c.handle, msg.view());
+    server.tick();
+    c.take_with_fds();
+  }
+  c.send(0, 7, [](pod::Builder& b) { b.int32(3); });      // Core destroy of the playback node
+  c.take_with_fds();
+  CHECK(g.playback_count() == 0 && g.record_count() == 1);
+  // the maker fails: refused, nothing left behind
+  maker.fail = true;
+  c.send(0, 6, [](pod::Builder& b) {
+    b.string("client-node"); b.string("PipeWire:Interface:ClientNode"); b.int32(6);
+    const uint64_t d = b.begin_struct(); b.int32(1); b.string("media.class"); b.string("Stream/Output/Audio"); b.end(d);
+    b.int32(9);
+  });
+  bool refused = false;
+  for (const NativeMessage& m : c.take_with_fds()) refused |= m.id == 0 && m.opcode == 3;
+  CHECK(refused && g.playback_count() == 0);
+  server.close_client(c.handle);
+  CHECK(g.record_count() == 0 && server.client_count() == 0);
+}
+
 // ---- the Windows service -------------------------------------------------------------------------------------------------------------------------
 
 static void test_windows_service() {
@@ -1976,6 +2287,7 @@ int main() {
   test_monitor();
   test_native_capture();
   test_balance();
+  test_client_node();
   test_sockets();
   test_threads();
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());
