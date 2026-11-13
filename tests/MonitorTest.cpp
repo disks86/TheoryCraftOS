@@ -399,6 +399,37 @@ static void test_monitor_display() {
     CHECK(!zoom.update(scaled, none, 1) && zoom.width() == 533);
     // Blitting past the desktop is harmless.
     zoom.blit(500, 250, 100, 100, mid.data(), 533);
+
+    // HiDPI: the desktop drawn at twice the layout (render scale 2). A 200 % monitor shows it 1:1, one copy; a 100 % monitor beside it every other
+    // pixel; a 300 % one at 3/2.
+    CHECK(scaled.set_mode(0, 800, 400, 200));
+    CHECK(zoom.update(scaled, one, 1, 2) && !zoom.scaling() && zoom.render_scale() == 2 && zoom.width() == 800 && zoom.height() == 400);
+    std::vector<uint32_t> sharp = desktop_picture(800, 400);
+    gpu2.blits = 0;
+    zoom.blit(0, 0, 800, 400, sharp.data(), 800);
+    CHECK(gpu2.blits == 1 && gpu2.screen[1] == pixel_of(1, 0) && gpu2.screen[size_t{399} * 800 + 799] == pixel_of(799, 399));
+    MonitorLayout mixed(a);
+    CHECK(mixed.add(0, 800, 400) && mixed.set_mode(0, 800, 400, 200) && mixed.add(1, 400, 300));      // A 200 % (400x200), B 100 % (400x300) beside it
+    ScanoutPlacement two[2] = {{0, 0, 0, 800, 400}, {1, 800, 0, 400, 300}};
+    FakeGpu gpu3;
+    gpu3.w = 1200;
+    gpu3.h = 400;
+    MonitorDisplay both(gpu3, a);
+    CHECK(both.update(mixed, two, 2, 2) && both.scaling() && both.width() == 1600 && both.height() == 600);
+    std::vector<uint32_t> wide = desktop_picture(1600, 600);
+    both.blit(0, 0, 1600, 600, wide.data(), 1600);
+    CHECK(gpu3.screen[size_t{3} * 1200 + 5] == pixel_of(5, 3));                          // A: 1:1
+    CHECK(gpu3.screen[size_t{3} * 1200 + 800 + 5] == pixel_of(800 + 10, 6));             // B: desktop (800 + 2x, 2y)
+    CHECK(gpu3.screen[size_t{299} * 1200 + 1199] == pixel_of(800 + 798, 598));
+    // a part of the picture on B: just its pixels
+    gpu3.screen.assign(size_t{1200} * 400, 0);
+    both.blit(820, 40, 4, 2, wide.data() + 40 * 1600 + 820, 1600);
+    CHECK(gpu3.screen[size_t{20} * 1200 + 810] == pixel_of(820, 40) && gpu3.screen[size_t{20} * 1200 + 811] == pixel_of(822, 40) && gpu3.screen[size_t{20} * 1200 + 812] == 0);
+    CHECK(scaled.set_mode(0, 800, 400, 300) && scaled.at(0).rect.width == 266);
+    CHECK(zoom.update(scaled, one, 1, 2) && zoom.scaling() && zoom.width() == 532);
+    std::vector<uint32_t> third = desktop_picture(532, 266);
+    zoom.blit(0, 0, 532, 266, third.data(), 532);
+    CHECK(gpu2.screen[0] == pixel_of(0, 0) && gpu2.screen[3] == pixel_of(2, 0) && gpu2.screen[799] == pixel_of(531, 0));
   }
   CHECK(a.live == 0);
 }
@@ -412,6 +443,7 @@ static void test_system_monitors() {
     m.initialize();
     CHECK(m.count() == 1 && strcmp(m.monitor(0).name(), "Display") == 0 && m.layout().count() == 1 && m.layout().bounds() == MonitorRect({0, 0, 1024, 768}));
     CHECK(!m.multi_display() && m.apply() && m.desktop_width() == 1024 && m.desktop_height() == 768);
+    CHECK(m.render_scale() == 1);
     SystemMonitors none(nullptr, a);
     none.initialize();
     CHECK(none.count() == 0 && none.layout().count() == 0);

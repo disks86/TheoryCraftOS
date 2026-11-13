@@ -151,6 +151,9 @@ class Server final : public desktop::IWindowsSession {
   void program_drop_done(bool taken) override;
   bool program_drag(String* text, int32_t* x, int32_t* y) override;
   void program_drag_answer(bool would_take) override;
+  // A finger: taken (XInput 2.2 TouchBegin / TouchUpdate / TouchEnd, X11Input2.cpp) when a window under it selected touch events; else the desktop
+  // moves the pointer with it.
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override;
 
   // Tests: the pixel of a top-level's picture (0 when outside or none).
   uint32_t picture_pixel(uint32_t window, int32_t x, int32_t y);
@@ -183,8 +186,13 @@ class Server final : public desktop::IWindowsSession {
     uint8_t client = 0;
     uint32_t mask = 0;
   };
+  struct XiSelection {      // XISelectEvents: a client's XI2 event mask (the first 32 events) for one device on a window
+    uint8_t client = 0;
+    uint16_t device = 0;
+    uint32_t mask = 0;
+  };
   struct Window {
-    explicit Window(allocators::IAllocator& allocator) : children(allocator), selections(allocator), properties(allocator) {}
+    explicit Window(allocators::IAllocator& allocator) : children(allocator), selections(allocator), properties(allocator), xi(allocator) {}
     uint32_t id = 0;
     uint8_t owner = 0;
     Window* parent = nullptr;
@@ -207,6 +215,7 @@ class Server final : public desktop::IWindowsSession {
     bool placed = false, iconic = false, maximized = false, fullscreen = false, above = false;
     Rect restore;                           // the inside before it was maximized
     uint32_t icon = 0;                      // the icon handle the desktop is given (0: none)
+    List<XiSelection> xi;                   // XInput 2 selections (X11Input2.cpp)
   };
   struct Gc {
     uint32_t id = 0;
@@ -323,6 +332,10 @@ class Server final : public desktop::IWindowsSession {
   bool has_protocol(Window& w, uint32_t protocol);
   uint32_t intern(StringView name);       // (never fails for the server's own names: they fit)
 
+  // --- XInput 2 (X11Input2.cpp)
+  void xinput_request(Client& c, uint8_t minor, WireReader& r);
+  void xi_client_gone(uint8_t client);
+
   // --- drag and drop (X11DragAndDrop.cpp)
   void xdnd_setup();                                                          // the atoms, the root's XdndAware
   bool xdnd_client_message(Window& target, const Packet& p);                  // an XDND message to the root or the source window: handled (true)
@@ -422,6 +435,17 @@ class Server final : public desktop::IWindowsSession {
   Grab pointer_grab_, keyboard_grab_;
   uint32_t last_time_ = 0;
   uint64_t fake_clock_ = 0;
+  // XInput 2 touches the desktop handed the server (its contact id, the XI touch id, the window and client that own it)
+  struct XiTouchSlot {
+    bool live = false;
+    uint32_t desktop_id = 0, touch_id = 0, window = 0;
+    uint8_t client = 0;
+    uint16_t device = 0;
+  };
+  static constexpr uint32_t kMaxXiTouches = 16;
+  XiTouchSlot xi_touches_[kMaxXiTouches];
+  uint32_t next_xi_touch_ = 1;
+  void xi_touch_event(uint16_t type, const XiTouchSlot& t, int32_t x, int32_t y);
   // drag and drop (XDND): its atoms
   struct XdndAtoms {
     uint32_t aware = 0, enter = 0, position = 0, status = 0, leave = 0, drop = 0, finished = 0, selection = 0, action_copy = 0, type_list = 0;

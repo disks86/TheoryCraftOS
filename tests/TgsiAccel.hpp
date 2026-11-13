@@ -420,6 +420,7 @@ struct TgsiAccel : IAccelerator {
       if (per == 0 || per > 32) { ++refused; return false; }
       Allocator alloc;
       uint32_t id = 0;
+      uint32_t gs_id = 0;      // (after tessellation the geometry stage counts the primitives of the whole draw, not of each patch)
       for (uint32_t first = 0; first + per <= count; first += per, ++id) {
         const Vtx* in[32];
         for (uint32_t k = 0; k < per; ++k) in[k] = &vouts[first + k];
@@ -438,7 +439,7 @@ struct TgsiAccel : IAccelerator {
         for (size_t q = 0; q < mid.size(); ++q) {
           const Vtx* gin[6];
           for (size_t k = 0; k < mid[q].size() && k < 6; ++k) gin[k] = &mid[q][k];
-          if (!geometry(p, cf, rows, gin, static_cast<uint32_t>(mid[q].size()), p.tes.empty() ? id : static_cast<uint32_t>(q), &prims)) return false;
+          if (!geometry(p, cf, rows, gin, static_cast<uint32_t>(mid[q].size()), p.tes.empty() ? id : gs_id++, &prims)) return false;
         }
       }
     }

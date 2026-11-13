@@ -587,6 +587,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/QEMU/QemuStdVgaGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
+  src/Graphics/Graphics2D/ScaledRenderer2D.cpp
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
   src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
   src/Graphics/Graphics3D/BuiltinShaders.cpp
@@ -821,6 +822,7 @@ add_executable(BOOTX64
   src/X11/X11DragAndDrop.cpp
   src/X11/X11Drawing.cpp
   src/X11/X11Input.cpp
+  src/X11/X11Input2.cpp
   src/X11/X11Requests.cpp
   src/X11/X11SocketServer.cpp
   src/X11/X11Tables.cpp

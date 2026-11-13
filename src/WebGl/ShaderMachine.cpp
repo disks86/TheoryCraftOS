@@ -408,6 +408,32 @@ bool Interp::binary(Op op, const Ref& a, const Ref& b, Ref* out) {
 
 // --- Interp: constructors -----------------------------------------------------------------------------------------------------------------------------------
 
+// An array constructor of more elements than construct() takes arguments (vec4[](...) of 256 constants): the array is made first and each element is evaluated
+// into it in turn, so no list of the arguments is needed.
+bool Interp::construct_long_array(const Node& node, Ref* out) {
+  Ref first;
+  if (!eval(mod.kids[static_cast<uint64_t>(node.first)], &first)) return false;
+  Type ct = node.type;
+  if (ct.base == Base::Void) {      // (WGSL array(a, b, ...): the element type is the first argument's)
+    if (ct.array != 0xFFFFFFFFu || first.t.array) return fail("array of arrays needs a type");
+    ct = first.t;
+    ct.array = static_cast<uint32_t>(node.count);
+  }
+  uint32_t* w;
+  if (!new_value(ct, out, &w)) return false;
+  const Type et = ct.element();
+  const uint32_t es = slots(et);
+  for (int32_t i = 0; i < node.count && static_cast<uint32_t>(i) < ct.array; ++i) {
+    Ref arg = first;
+    if (i > 0 && !eval(mod.kids[static_cast<uint64_t>(node.first + i)], &arg)) return false;
+    LRef l;
+    l.p = w + static_cast<uint64_t>(i) * es;
+    l.t = et;
+    if (!store(l, arg)) return false;
+  }
+  return true;
+}
+
 bool Interp::construct(const Type& t, const Ref* args, uint32_t n, Ref* out) {
   uint32_t* w;
   if (!new_value(t, out, &w)) return false;
@@ -552,10 +578,18 @@ bool Interp::lvalue(int32_t id, LRef* out) {
     }
     case NodeKind::Index: {
       LRef base;
-      if (!lvalue(node.a, &base) || base.n) return false;
+      if (!lvalue(node.a, &base)) return false;
       Ref idx;
       if (!eval(node.b, &idx)) return false;
       int64_t i = idx.t.base == Base::Float ? static_cast<int64_t>(u2f(idx.p[0])) : (idx.t.base == Base::Int ? u2i(idx.p[0]) : static_cast<int64_t>(idx.p[0]));
+      if (base.n) {      // v.wzyx[i]: component i of the swizzle (clamped as any index)
+        if (i < 0) i = 0;
+        if (i >= base.n) i = base.n - 1;
+        out->p = base.p + base.swz[i];
+        out->t = make_type(base.t.base);
+        out->n = 0;
+        return true;
+      }
       Type et;
       uint32_t es, count;
       if (base.t.array) {
@@ -587,8 +621,8 @@ bool Interp::lvalue(int32_t id, LRef* out) {
     }
     case NodeKind::Field: {
       LRef base;
-      if (!lvalue(node.a, &base) || base.n) return false;
-      if (base.t.base == Base::Struct && base.t.array == 0) {
+      if (!lvalue(node.a, &base)) return false;
+      if (base.n == 0 && base.t.base == Base::Struct && base.t.array == 0) {
         Ref r, f;
         r.p = base.p;
         r.t = base.t;
@@ -600,6 +634,12 @@ bool Interp::lvalue(int32_t id, LRef* out) {
       }
       uint32_t idx[4], n;
       if (!read_swizzle(node, idx, &n)) return fail("bad swizzle");
+      if (base.n) {      // a swizzle of a swizzle (v.xzy.z): the components of the inner one it names
+        for (uint32_t i = 0; i < n; ++i) {
+          if (idx[i] >= base.n) return fail("bad swizzle");
+          idx[i] = base.swz[idx[i]];
+        }
+      }
       out->p = base.p;
       out->t = base.t;
       out->n = static_cast<uint8_t>(n);
@@ -758,6 +798,7 @@ bool Interp::eval(int32_t id, Ref* out) {
       return true;
     }
     case NodeKind::Construct: {
+      if (node.type.array && node.count > 16) return construct_long_array(node, out);
       Ref args[16];
       if (node.count > 16) return fail("too many constructor arguments");
       for (int32_t i = 0; i < node.count; ++i)

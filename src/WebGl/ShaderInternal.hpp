@@ -60,6 +60,7 @@ struct Interp {
   bool binary(Op op, const Ref& a, const Ref& b, Ref* out);
   bool unary(Op op, const Ref& a, Ref* out);
   bool construct(const Type& t, const Ref* args, uint32_t n, Ref* out);
+  bool construct_long_array(const Node& node, Ref* out);
   bool convert_to(const Ref& src, Base to, Ref* out);
   bool field_of(const Ref& base, const Node& node, Ref* out);
   bool call_user(int32_t fn, const Node& node, Ref* out);

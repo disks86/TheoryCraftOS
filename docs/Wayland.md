@@ -129,8 +129,12 @@ Each batch ends with `done(serial)`, the serial being the number of commits the 
 
 ## Scale, transforms, viewports
 
-The desktop has no scale of its own, so the output's scale is 1 (`wl_output.scale`, `wl_surface.preferred_buffer_scale` and `preferred_buffer_transform`
-for version 6 surfaces, `wp_fractional_scale_v1.preferred_scale` 120). What a client asks of its buffer is honoured: `set_buffer_transform` (the eight
+The output's scale is the desktop's device scale (HiDPI, see [Display.md](Display.md)): 1, or 2 / 3 / 4 when a monitor is set to that whole scale, which
+makes the desktop draw that many device pixels per unit. It is said by `wl_output.scale` (and a mode of the device size), `wl_surface.preferred_buffer_scale`
+for version 6 surfaces (with `preferred_buffer_transform` normal) and `wp_fractional_scale_v1.preferred_scale` (scale x 120), again to every client when it
+changes. All coordinates stay the desktop's units (input, configure, geometry); only drawing changes: the desktop draws a window on its device renderer
+(`draw_window_scaled`), where a buffer made at the device scale with no transform or viewport lands 1:1 (sharp; a GPU buffer where it is), and any
+other through the affine map below, enlarged by the device scale (a whole enlargement of an upright buffer is not filtered). What a client asks of its buffer is honoured: `set_buffer_transform` (the eight
 rotations and flips, as Weston maps them), `set_buffer_scale` (1 .. 16; a version 6 surface whose buffer is not a multiple is `invalid_size`) and
 `wp_viewport` (a crop in 24.8 and a destination size, with the protocol's `bad_value`, `bad_size`, `out_of_buffer`, `no_surface`). They decide the
 surface's size (input, the window's size, configure), and the desktop draws the buffer through one affine map (`IRenderer2D::draw_image_transformed`, done
@@ -287,7 +291,7 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
 | Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing); `slurp`'s full-screen overlay (layer shell) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
-| Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
+| Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale; HiDPI: device scale 2 announced on outputs, surfaces and fractional scales (and back to 1), a scale-2 buffer drawn 1:1 and a scale-1 buffer enlarged by `draw_window_scaled` | `tests/run_host_tests.sh WaylandServerTest` |
 | Drags with the desktop: a desktop file entered, followed, accepted, dropped and read as a percent-encoded URI and as its Linux path, text, a path Linux cannot see, refusals, Escape, a client's drag let go over the desktop read from its source (URIs to system paths, comments and other schemes left out), taken, not taken, nothing usable, the source going, fuzzed URI lists; the GUI's drag tracking and `drop_at`, a desktop drag over a program's frame through the desktop (never the program's mouse), a program's drop of two files on a desktop window, a program's drag over the desktop before the drop (read once, shown, the answer as target and action, back over a surface, let go before the read ended, nothing usable, the source going; the window's `outside_drag_at`), `/mnt/desktop` for Linux programs and the two views' paths | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest`, `ProcessFilesTest`; `tests/wayland_interop.sh` drops a desktop file on foot, which pastes `'/mnt/desktop/Documents/a b.txt'` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
@@ -355,9 +359,9 @@ depends on itself:
   one item and only copies; a client's drag over the desktop is shown and answered from its first item only, and
   takes URIs and text only (no pictures or other types). Windows programs take dropped files (`WM_DROPFILES`, see
   [WindowsUserMode.md](WindowsUserMode.md)), X programs take them through XDND (see [X11.md](X11.md)). Selection and drag serials are not checked.
-- **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
-  pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
-  mapping is ignored.
+- **Scale.** Whole scales only: a monitor at 125 / 150 / 175 % is still drawn at the logical size and stretched, and the preferred scale is never
+  fractional. One scale for every monitor (the largest whole one: a 100 % monitor beside a 200 % one is shown the 2x picture halved). There is one
+  `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's mapping is ignored (it is enlarged like the desktop's own).
 - **Window manager.** The window menu has no Move or Size items (the desktop moves windows by their title bar only). A popup's `reactive` flag and parent size are
   ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within

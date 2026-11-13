@@ -83,6 +83,10 @@ class SystemMonitors {
   // 175, 200, 250, 300, 400.
   uint32_t compatible_scales(uint32_t id, uint32_t* out, uint32_t capacity, uint32_t width = 0, uint32_t height = 0) const;
   uint32_t scale_of(uint32_t id) const;
+  // HiDPI: how many device pixels the desktop draws per unit of the layout: the largest whole scale (200 %: 2, 300 %: 3) of the enabled monitors, 1
+  // when none has one. The desktop's pictures are the layout this many times over (MonitorDisplay maps them onto each monitor), and programs that
+  // can draw at this scale are drawn sharp.
+  uint32_t render_scale() const;
   // Each fails (and changes nothing) if the value is not among the compatible ones, or the device refuses. The layout is changed; call apply() to show it.
   bool set_resolution(uint32_t id, uint32_t width, uint32_t height);
   bool set_refresh(uint32_t id, uint32_t refresh_millihz);

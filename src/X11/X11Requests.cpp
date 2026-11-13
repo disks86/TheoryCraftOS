@@ -1688,21 +1688,24 @@ void Server::dispatch(Client& c, uint8_t opcode, uint8_t data, WireReader& r, ui
       r.skip(2);
       ConstByteView name = string_of(r, n);
       if (!r.ok()) { error(c, error::kLength, 0, 98); return; }
-      const bool big = StringView(name).equals("BIG-REQUESTS");
+      const bool big = StringView(name).equals("BIG-REQUESTS"), xi = StringView(name).equals("XInputExtension");
       WireWriter o = reply(c, 0, 0);
-      o.u8(big ? 1 : 0);
-      o.u8(big ? kBigRequestsOpcode : 0);
-      o.u8(0);
-      o.u8(0);
+      o.u8(big || xi ? 1 : 0);
+      o.u8(big ? kBigRequestsOpcode : xi ? kXInputOpcode : 0);
+      o.u8(xi ? kXInputFirstEvent : 0);
+      o.u8(xi ? kXInputFirstError : 0);
       o.zeros(20);
       return;
     }
     case 99: {
-      const StringView name = "BIG-REQUESTS";
-      WireWriter o = reply(c, 1, static_cast<uint32_t>(pad4(1 + name.size()) / 4));
+      const StringView names[2] = {"BIG-REQUESTS", "XInputExtension"};
+      const uint64_t bytes = 1 + names[0].size() + 1 + names[1].size();
+      WireWriter o = reply(c, 2, static_cast<uint32_t>(pad4(bytes) / 4));
       o.zeros(24);
-      o.u8(static_cast<uint8_t>(name.size()));
-      o.bytes(name.bytes());
+      for (const StringView& name : names) {
+        o.u8(static_cast<uint8_t>(name.size()));
+        o.bytes(name.bytes());
+      }
       o.pad4();
       return;
     }
@@ -1817,6 +1820,7 @@ void Server::dispatch(Client& c, uint8_t opcode, uint8_t data, WireReader& r, ui
       return;
     }
     case 127: return;
+    case kXInputOpcode: xinput_request(c, data, r); return;
     case kBigRequestsOpcode: {
       if (data != 0) { error(c, error::kRequest, 0, opcode, data); return; }
       c.big_requests = true;
