@@ -80,6 +80,12 @@ class Win32Window : public gui::Frame {
 
  protected:
   bool close_requested() override;      // the program is asked (SC_CLOSE); it destroys the window if it agrees
+  // The desktop's drags over the program's window go to the session (IWindowsSession::desktop_drag), which tells the program.
+  bool tracks_drag() const override { return true; }
+  void on_drag_over(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
+  void on_drag_leave() override;
+  bool accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const override;
+  void on_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
 
  private:
   friend class Win32Windows;
@@ -93,6 +99,7 @@ class Win32Window : public gui::Frame {
   State sent_state_ = State::Normal;    // the state last asked of the program
   uint32_t state_hold_ = 0;             // pumps left during which the program's older state does not undo the user's
   bool known_active_ = false;
+  bool drag_taken_ = false;             // the program under the desktop's drag would take it (the last desktop_drag said so)
   uint32_t icon_ = 0;                   // the icon handle the frame shows
 };
 
@@ -100,7 +107,7 @@ class Win32Windows {
  public:
   static constexpr uint32_t kHoldPumps = 30;
 
-  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator) {}
+  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator), drop_items_(allocator) {}
   ~Win32Windows();
   // Null: none (the frames are taken down).
   void set_session(IWindowsSession* session, gui::WindowManager* manager);
@@ -175,6 +182,12 @@ class Win32Windows {
   // The input method: Unicode entry (Ctrl+Shift+U, hex digits, Space or Enter), into a window that takes composed text (IWindowsSession::text_input).
   // Returns true when it took the key (it then never reaches the program).
   bool compose_key(uint8_t usage, uint8_t modifiers);
+  // A program's drag dropped on the desktop (IWindowsSession::take_program_drop): its items, the next to drop, where.
+  void pump_program_drop(gui::WindowManager& manager);
+  bool dropping_ = false, drop_taken_ = false;
+  String drop_items_;
+  uint64_t drop_next_ = 0;
+  int32_t drop_x_ = 0, drop_y_ = 0;
   bool composing_ = false;
   uint32_t compose_window_ = 0, compose_code_ = 0;
   uint8_t compose_digits_ = 0;

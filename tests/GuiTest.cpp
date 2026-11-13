@@ -1684,6 +1684,25 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     log.push_back("commit '" + std::string(t.data(), t.size()) + "'");
     return true;
   }
+  // drags with the desktop: the program takes the desktop's drag while take_drags; program_drop is a drag a program let go over the desktop
+  bool take_drags = false;
+  std::string program_drop;
+  int32_t program_x = 0, program_y = 0;
+  bool desktop_drag(uint32_t w, int32_t x, int32_t y, StringView t) override {
+    log.push_back("ddrag " + std::to_string(w) + " " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(t.data() ? t.data() : "", t.size()));
+    return take_drags && w != 0;
+  }
+  bool desktop_drop() override { log.push_back("ddrop"); return take_drags; }
+  void desktop_drag_end() override { log.push_back("dend"); }
+  bool take_program_drop(String* text, int32_t* x, int32_t* y) override {
+    if (program_drop.empty()) return false;
+    text->assign(StringView(program_drop.c_str()));
+    *x = program_x;
+    *y = program_y;
+    program_drop.clear();
+    return true;
+  }
+  void program_drop_done(bool taken) override { log.push_back(std::string("program_drop_done ") + (taken ? "1" : "0")); }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
   uint32_t capture_window() override { return 0; }
@@ -1881,6 +1900,175 @@ static void test_windows_text_input() {
   press(key::k1 + 1);
   d.step(9000);
   CHECK(keys_of(key::k1 + 1) == 2 && keys_of(key::k1) == 0);
+}
+
+// Drag and drop: a control that starts a drag when the mouse moves with the button down, one that follows drags over it, and one that takes drops.
+struct DragSourceControl final : Control {
+  explicit DragSourceControl(allocators::IAllocator& a, const char* t) : Control(a), text(t) {}
+  const char* text;
+  bool down = false;
+  int ended = 0;
+  void on_mouse_down(const MouseArgs&) override { down = true; }
+  void on_mouse_up(const MouseArgs&) override { down = false; }
+  void on_mouse_move(const MouseArgs&) override { if (down && window() && !window()->dragging()) window()->begin_drag(this, StringView(text)); }
+  void on_drag_ended(bool, int32_t, int32_t) override { ++ended; }
+};
+struct DragTracker final : Control {
+  DragTracker(allocators::IAllocator& a, std::vector<std::string>* l, bool track) : Control(a), log(l), track(track) {}
+  std::vector<std::string>* log;
+  bool track, accept = false;
+  bool tracks_drag() const override { return track; }
+  void on_drag_over(StringView t, int32_t x, int32_t y, const Control*) override {
+    log->push_back("over " + std::string(t.data(), t.size()) + " " + std::to_string(x) + " " + std::to_string(y));
+  }
+  void on_drag_leave() override { log->push_back("leave"); }
+  bool accepts_drop(StringView, int32_t, int32_t, const Control*) const override { return accept; }
+  void on_drop(StringView t, int32_t, int32_t, const Control* source) override {
+    log->push_back("drop " + std::string(t.data(), t.size()) + (source ? " from a control" : " from nowhere"));
+  }
+};
+
+static void test_drag_tracking() {
+  TestAllocator a;
+  Screen screen(a, 400, 300);
+  Theme theme;
+  Window w(a, screen.renderer, theme, {400, 300});
+  std::vector<std::string> log;
+  DragSourceControl source(a, "/Desktop/a.txt");
+  DragTracker tracker(a, &log, true), other(a, &log, false);
+  source.set_bounds({0, 0, 100, 100});
+  tracker.set_bounds({200, 0, 100, 100});
+  other.set_bounds({200, 150, 100, 100});
+  w.add(&source);
+  w.add(&tracker);
+  w.add(&other);
+  w.layout();
+  // over the tracker it hears where; away it hears it left; back, released over it while it takes drops: dropped, no leave
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  CHECK(w.dragging());
+  w.mouse_move(250, 40);
+  w.mouse_move(260, 45);
+  w.mouse_move(250, 200);
+  CHECK((log == std::vector<std::string>{"over /Desktop/a.txt 50 40", "over /Desktop/a.txt 60 45", "leave"}));
+  log.clear();
+  tracker.accept = true;
+  w.mouse_move(210, 10);
+  w.mouse_button(210, 10, MouseButton::Left, false);      // (no handler thread: the drop runs at once)
+  CHECK((log == std::vector<std::string>{"over /Desktop/a.txt 10 10", "over /Desktop/a.txt 10 10", "drop /Desktop/a.txt from a control"}));
+  CHECK(source.ended == 1 && !w.dragging());
+  // released over it while it does not take it: it hears the drag left
+  log.clear();
+  tracker.accept = false;
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  w.mouse_move(210, 10);
+  w.mouse_button(210, 10, MouseButton::Left, false);
+  CHECK(!log.empty() && log.back() == "leave");
+  // Escape cancels: left too
+  log.clear();
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  w.mouse_move(210, 10);
+  KeyArgs esc;
+  esc.usage = hardware::key::kEscape;
+  w.key(esc);
+  CHECK(!w.dragging() && !log.empty() && log.back() == "leave");
+  w.mouse_button(210, 10, MouseButton::Left, false);
+  // drop_at: a drop with no drag and no source, to whoever takes it
+  log.clear();
+  tracker.accept = true;
+  CHECK(w.drop_at(250, 50, "/Linux/root/x.txt"));
+  CHECK(!log.empty() && log.back() == "drop /Linux/root/x.txt from nowhere" && !w.drop_pending());
+  CHECK(!w.drop_at(250, 200, "x") && !w.drop_at(250, 50, StringView()));      // (nobody there takes drops; nothing to drop)
+}
+
+// The desktop's drags over a program's window go to its session (desktop_drag / desktop_drop), never to the program as mouse input; a program's drag let
+// go over the desktop is dropped, item by item, on the desktop's window under it.
+static void test_windows_drag_bridge() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  FakeKeyboard kb;
+  FakeMouse mouse;
+  FakeWindowsSession s(a);
+  desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+  d.set_windows_session(&s);
+  gui::WindowManager& wm = d.windows();
+  d.step(0);
+  const Point mo = wm.window_origin();
+  s.add(7, false, {400, 100, 200, 150}, "Program", true);
+  std::vector<std::string> log;
+  Frame from(a), to(a);
+  DragSourceControl source(a, "/Desktop/Documents/a.txt");
+  DragTracker sink(a, &log, false);
+  sink.accept = true;
+  source.set_dock(DockStyle::Fill);
+  sink.set_dock(DockStyle::Fill);
+  from.add(&source);
+  to.add(&sink);
+  from.set_bounds({20, 20, 200, 150});
+  to.set_bounds({20, 300, 200, 150});
+  CHECK(wm.add_window(&from) && wm.add_window(&to));
+  d.step(1000);
+  // (absolute pointer positions: the screen's pixels in 0..32767)
+  auto at = [&](int32_t x, int32_t y, uint8_t buttons) { mouse.at(uint32_t((mo.x + x) * 32768 / 800), uint32_t((mo.y + y) * 32768 / 600), buttons); };
+  mouse.absolute = true;
+  s.take_drags = true;
+  s.log.clear();
+  const Rect2D sb = source.bounds();
+  const Point sp = source.window_origin();
+  const int32_t sx = sp.x - mo.x + int32_t(sb.width) / 2, sy = sp.y - mo.y + int32_t(sb.height) / 2;
+  at(sx, sy, 0);
+  at(sx, sy, hardware::mouse_button::kLeft);
+  at(sx + 12, sy + 3, hardware::mouse_button::kLeft);
+  at(500, 170, hardware::mouse_button::kLeft);
+  at(505, 172, hardware::mouse_button::kLeft);
+  at(505, 172, 0);
+  for (int i = 0; i < 6; ++i) d.step(2000 + i * 20);
+  std::vector<std::string> drags;
+  bool buttons = false;
+  for (const std::string& e : s.log) {
+    if (e.rfind("ddrag", 0) == 0 || e == "ddrop" || e == "dend") drags.push_back(e);
+    if (e.rfind("button", 0) == 0) buttons = true;
+  }
+  CHECK(drags.size() >= 2 && drags[0].rfind("ddrag 7 ", 0) == 0 && drags[0].find(" /Desktop/Documents/a.txt") != std::string::npos);
+  CHECK(!drags.empty() && drags.back() == "ddrop");
+  CHECK(!buttons);      // (the program never saw the desktop's drag as its mouse)
+  // the program does not take it: the drag over it ends unused
+  s.take_drags = false;
+  s.log.clear();
+  mouse.head = mouse.tail = 0;
+  at(sx, sy, 0);
+  at(sx, sy, hardware::mouse_button::kLeft);
+  at(sx + 12, sy + 3, hardware::mouse_button::kLeft);
+  at(500, 170, hardware::mouse_button::kLeft);
+  at(500, 170, 0);
+  for (int i = 0; i < 6; ++i) d.step(3000 + i * 20);
+  bool ended = false, dropped = false;
+  for (const std::string& e : s.log) ended |= e == "dend", dropped |= e == "ddrop";
+  CHECK(ended && !dropped);
+  // a program's drag let go over the desktop's window: each item dropped there; the session told something took it
+  const Point tp = sink.window_origin();
+  s.program_drop = "/Desktop/Documents/a b.txt\n/Linux/root/x.txt";
+  s.program_x = tp.x - mo.x + 30;
+  s.program_y = tp.y - mo.y + 30;
+  s.log.clear();
+  for (int i = 0; i < 8; ++i) d.step(4000 + i * 20);
+  CHECK((log == std::vector<std::string>{"drop /Desktop/Documents/a b.txt from nowhere", "drop /Linux/root/x.txt from nowhere"}));
+  bool done = false;
+  for (const std::string& e : s.log) done |= e == "program_drop_done 1";
+  CHECK(done);
+  // over nothing that takes it: told so
+  s.program_drop = "/x";
+  s.program_x = 700;
+  s.program_y = 500;
+  s.log.clear();
+  for (int i = 0; i < 4; ++i) d.step(5000 + i * 20);
+  done = false;
+  for (const std::string& e : s.log) done |= e == "program_drop_done 0";
+  CHECK(done);
+  wm.remove_window(&from);
+  wm.remove_window(&to);
 }
 
 // Touches over a program's window: a session that takes them gets the contact (with the window and the programs' coordinates) to its end; one that does
@@ -2449,6 +2637,8 @@ int main() {
   test_windows();
   test_windows_layers();
   test_windows_text_input();
+  test_drag_tracking();
+  test_windows_drag_bridge();
   test_modal_and_dialog();
   test_notice_dialog();
   test_switcher();
