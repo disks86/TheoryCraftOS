@@ -624,7 +624,8 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::OutOfMemory;
   }
-  seq_one_to_one_ = config.codec != VideoCodec::H264 && config.codec != VideoCodec::Mpeg4;   // (VP8, VP9, AV1 and H.263 give a picture for a packet at once, or none)
+  // (VP8, VP9 and AV1 give a picture for a packet at once, or none; H.264, MPEG-4 Part 2 and H.263 version 2 may hold pictures back for reordering.)
+  seq_one_to_one_ = config.codec != VideoCodec::H264 && config.codec != VideoCodec::Mpeg4 && config.codec != VideoCodec::H263;
   width_ = track->width;
   height_ = track->height;
   duration_us_ = seq_times_[seq_times_.count() - 1];

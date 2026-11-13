@@ -341,14 +341,15 @@ void quarter_sample(const Samples& s, int sx, int n, int dxy, bool rnd, Predicti
 
 // Writes a prediction into the picture being decoded at (x, y), row k on line y + k * step; `average`: the mean with what is there (the second direction of a B
 // macroblock, rounded up).
-void store(const Picture& p, int c, int x, int y, int step, int w, int h, const Prediction& pred, bool average) {
+// average: 0 replaces what is there, 1 takes the mean with it rounded up (MPEG-4 B planes), 2 the mean truncated (H.263 B pictures and B parts).
+void store(const Picture& p, int c, int x, int y, int step, int w, int h, const Prediction& pred, int average) {
   const ByteView plane = p.view(c);
   const int stride = p.stride[c];
   for (int r = 0; r < h; ++r) {
     const ByteView row = plane.subview(static_cast<uint64_t>(y + r * step) * static_cast<uint64_t>(stride) + static_cast<uint64_t>(x), static_cast<uint64_t>(w));
     for (int i = 0; i < w; ++i) {
       const int v = pred.v[r][i];
-      row[static_cast<uint64_t>(i)] = static_cast<uint8_t>(average ? (row[static_cast<uint64_t>(i)] + v + 1) >> 1 : v);
+      row[static_cast<uint64_t>(i)] = static_cast<uint8_t>(average ? (row[static_cast<uint64_t>(i)] + v + (average == 1 ? 1 : 0)) >> 1 : v);
     }
   }
 }
@@ -362,7 +363,8 @@ int round_chroma(int x) {
 }  // namespace
 
 // Predicts the macroblock (mb_x_, mb_y_) from `ref` with the vectors of direction `dir` (0 forward, 1 backward).
-void Core::motion(const Mb& mb, int dir, const Picture& ref, bool average) {
+void Core::motion(const Mb& mb, int dir, const Picture& ref, bool average_with_previous, bool truncate) {
+  const int average = average_with_previous ? (truncate ? 2 : 1) : 0;
   const bool rnd = !pic_.no_rounding;
   const bool qpel = vol_.quarter_sample && !pic_.short_header;
   const PlaneRef luma = plane_of(ref, 0), cb = plane_of(ref, 1), cr = plane_of(ref, 2);
@@ -767,7 +769,7 @@ void Core::reconstruct(Mb& mb) {
   if (!mb.intra) {
     if (pic_.type == kPictureB) {
       if (mb.dir & kForward) motion(mb, 0, *anchor_[0], false);
-      if (mb.dir & kBackward) motion(mb, 1, *anchor_[1], (mb.dir & kForward) != 0);
+      if (mb.dir & kBackward) motion(mb, 1, *anchor_[1], (mb.dir & kForward) != 0, pic_.short_header);
     } else if (mb.mcsel) {
       global_motion(*anchor_[1]);
     } else if (pic_.short_header && pic_.obmc) {
@@ -805,7 +807,114 @@ void Core::reconstruct(Mb& mb) {
       }
     }
   }
+  // A PB-frame's B part is predicted from this macroblock as reconstructed and clipped, before the deblocking filter (Annex J.3).
+  if (cur_b_ && pic_.short_header) reconstruct_b_part(mb);
   if (pic_.short_header && pic_.deblocking) deblock_macroblock(mb);
+}
+
+namespace {
+// A sample at half-sample position (x2, y2) of a plane (6.1.2 with RCONTROL 0), coordinates clamped to the plane.
+int half_sample_at(const PlaneRef& p, int x2, int y2) {
+  const int x = x2 >> 1, y = y2 >> 1, fx = x2 & 1, fy = y2 & 1;
+  auto at = [&](int xx, int yy) -> int {
+    xx = clamp_int(xx, 0, p.width - 1);
+    yy = clamp_int(yy, 0, p.height - 1);
+    return p.data[static_cast<uint64_t>(yy) * static_cast<uint64_t>(p.stride) + static_cast<uint64_t>(xx)];
+  };
+  const int a = at(x, y);
+  if (!fx && !fy) return a;
+  if (fx && !fy) return (a + at(x + 1, y) + 1) >> 1;
+  if (!fx) return (a + at(x, y + 1) + 1) >> 1;
+  return (a + at(x + 1, y) + at(x, y + 1) + at(x + 1, y + 1) + 2) >> 2;
+}
+}  // namespace
+
+// G.5 and M.2: the B part of a PB-frame macroblock. Bidirectional: forward with MVF from the previous reference picture, averaged (truncated) with backward
+// with MVB from this frame's P macroblock (PREC) where MVB stays inside it, forward only elsewhere; Annex M adds forward prediction with its own vector and
+// backward prediction (PREC itself). Then the B blocks' residual.
+void Core::reconstruct_b_part(Mb& mb) {
+  const Picture& out = *cur_b_;
+  const PlaneRef prev[3] = {plane_of(*anchor_[1], 0), plane_of(*anchor_[1], 1), plane_of(*anchor_[1], 2)};
+  const PlaneRef prec[3] = {plane_of(*cur_, 0), plane_of(*cur_, 1), plane_of(*cur_, 2)};
+  const int x0 = mb_x_ * 16, y0 = mb_y_ * 16, cx0 = mb_x_ * 8, cy0 = mb_y_ * 8;
+  const MbInfo& info = cur_->mbs[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+  Prediction luma, chroma[2];
+  Samples s;
+  if (mb.b_mode == kBBackward) {
+    for (int r = 0; r < 16; ++r)
+      for (int i = 0; i < 16; ++i) luma.v[r][i] = static_cast<uint8_t>(half_sample_at(prec[0], (x0 + i) * 2, (y0 + r) * 2));
+    for (int c = 0; c < 2; ++c)
+      for (int r = 0; r < 8; ++r)
+        for (int i = 0; i < 8; ++i) chroma[c].v[r][i] = static_cast<uint8_t>(half_sample_at(prec[1 + c], (cx0 + i) * 2, (cy0 + r) * 2));
+  } else if (mb.b_mode == kBForward) {
+    const int mx = mb.mvd[0], my = mb.mvd[1];
+    const int sx = x0 + (mx >> 1), sy = y0 + (my >> 1);
+    fetch(prev[0], sx, sy, 1, 17, 17, s);
+    half_sample(s, 16, 16, ((my & 1) << 1) | (mx & 1), true, luma);
+    const int uvdxy = (((my & 1) << 1) | (mx & 1)) | (my & 2) | ((mx & 2) >> 1);
+    for (int c = 0; c < 2; ++c) {
+      fetch(prev[1 + c], sx >> 1, sy >> 1, 1, 9, 9, s);
+      half_sample(s, 8, 8, uvdxy, true, chroma[c]);
+    }
+  } else {
+    int mvf[4][2], mvb[4][2], sum_f[2] = {0, 0}, sum_b[2] = {0, 0};
+    for (int b = 0; b < 4; ++b)
+      for (int c = 0; c < 2; ++c) {
+        const int mv = info.mv[b][c];
+        const int mvd = pb_mode_ == 1 ? mb.mvd[c] : 0;
+        mvf[b][c] = trb_ * mv / trd_ + mvd;
+        mvb[b][c] = mvd == 0 ? (trb_ - trd_) * mv / trd_ : mvf[b][c] - mv;
+        sum_f[c] += mvf[b][c];
+        sum_b[c] += mvb[b][c];
+      }
+    for (int b = 0; b < 4; ++b) {
+      const int nh = b & 1, nv = b >> 1;
+      const int bx = x0 + nh * 8, by = y0 + nv * 8;
+      Prediction f;
+      fetch(prev[0], bx + (mvf[b][0] >> 1), by + (mvf[b][1] >> 1), 1, 9, 9, s);
+      half_sample(s, 8, 8, ((mvf[b][1] & 1) << 1) | (mvf[b][0] & 1), true, f);
+      for (int r = 0; r < 8; ++r)
+        for (int i = 0; i < 8; ++i) luma.v[nv * 8 + r][nh * 8 + i] = f.v[r][i];
+      // G.5's procedure for luminance: the pixels whose backward sample lies inside PREC (C division, truncating).
+      const int mh = mvb[b][0], mv = mvb[b][1];
+      const int i_lo = nh * 8 + (0 > (-mh + 1) / 2 - nh * 8 ? 0 : (-mh + 1) / 2 - nh * 8);
+      const int i_hi = nh * 8 + (7 < 15 - (mh + 1) / 2 - nh * 8 ? 7 : 15 - (mh + 1) / 2 - nh * 8);
+      const int j_lo = nv * 8 + (0 > (-mv + 1) / 2 - nv * 8 ? 0 : (-mv + 1) / 2 - nv * 8);
+      const int j_hi = nv * 8 + (7 < 15 - (mv + 1) / 2 - nv * 8 ? 7 : 15 - (mv + 1) / 2 - nv * 8);
+      for (int i = i_lo; i <= i_hi; ++i)
+        for (int j = j_lo; j <= j_hi; ++j) {
+          const int back = half_sample_at(prec[0], (x0 + i) * 2 + mh, (y0 + j) * 2 + mv);
+          luma.v[j][i] = static_cast<uint8_t>((luma.v[j][i] + back) / 2);
+        }
+    }
+    const int mfx = round_chroma(sum_f[0]), mfy = round_chroma(sum_f[1]), mbx = round_chroma(sum_b[0]), mby = round_chroma(sum_b[1]);
+    for (int c = 0; c < 2; ++c) {
+      fetch(prev[1 + c], cx0 + (mfx >> 1), cy0 + (mfy >> 1), 1, 9, 9, s);
+      half_sample(s, 8, 8, ((mfy & 1) << 1) | (mfx & 1), true, chroma[c]);
+      const int i_lo = 0 > (-mbx + 1) / 2 ? 0 : (-mbx + 1) / 2, i_hi = 7 < 7 - (mbx + 1) / 2 ? 7 : 7 - (mbx + 1) / 2;
+      const int j_lo = 0 > (-mby + 1) / 2 ? 0 : (-mby + 1) / 2, j_hi = 7 < 7 - (mby + 1) / 2 ? 7 : 7 - (mby + 1) / 2;
+      for (int i = i_lo; i <= i_hi; ++i)
+        for (int j = j_lo; j <= j_hi; ++j) {
+          const int back = half_sample_at(prec[1 + c], (cx0 + i) * 2 + mbx, (cy0 + j) * 2 + mby);
+          chroma[c].v[j][i] = static_cast<uint8_t>((chroma[c].v[j][i] + back) / 2);
+        }
+    }
+  }
+  store(out, 0, x0, y0, 1, 16, 16, luma, 0);
+  store(out, 1, cx0, cy0, 1, 8, 8, chroma[0], 0);
+  store(out, 2, cx0, cy0, 1, 8, 8, chroma[1], 0);
+  for (int n = 0; n < 6; ++n) {
+    if (mb.b_last[n] < 0) continue;
+    int residual[64];
+    idct(ArrayView<const int16_t>(mb.b_block[n]), residual);
+    const int c = n < 4 ? 0 : n - 3;
+    const int x = n < 4 ? x0 + (n & 1) * 8 : cx0, y = n < 4 ? y0 + (n >> 1) * 8 : cy0;
+    const ByteView plane = out.view(c);
+    for (int r = 0; r < 8; ++r) {
+      const ByteView row = plane.subview(static_cast<uint64_t>(y + r) * static_cast<uint64_t>(out.stride[c]) + static_cast<uint64_t>(x), 8);
+      for (uint64_t i = 0; i < 8; ++i) row[i] = clip_pixel(row[i] + residual[r * 8 + static_cast<int>(i)]);
+    }
+  }
 }
 
 // Macroblocks [from, to) could not be decoded: they are copied from the reference (an intra picture without one is left grey), and count as not coded for the
@@ -825,6 +934,15 @@ void Core::conceal(int from, int to) {
       Mb copy;
       copy.mv_type = kMv16x16;
       motion(copy, 0, *ref, false);
+      if (cur_b_) {   // (a PB-frame's B part: the same)
+        for (int c = 0; c < 3; ++c) {
+          const int size = c == 0 ? 16 : 8;
+          for (int r = 0; r < size; ++r) {
+            const uint64_t at = static_cast<uint64_t>(mb_y_ * size + r) * static_cast<uint64_t>(cur_->stride[c]) + static_cast<uint64_t>(mb_x_ * size);
+            cur_b_->view(c).subview(at, static_cast<uint64_t>(size)).copy_from(ConstByteView(cur_->view(c).subview(at, static_cast<uint64_t>(size))));
+          }
+        }
+      }
       continue;
     }
     for (int c = 0; c < 3; ++c) {

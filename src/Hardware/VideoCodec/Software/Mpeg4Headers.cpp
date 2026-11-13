@@ -287,10 +287,12 @@ bool parse_short_header(ConstByteView data, const ShortHeader* previous, ShortHe
     h.long_vectors = b.u(1) != 0;
     if (b.u(1)) return false;                      // syntax-based arithmetic coding
     h.advanced_prediction = b.u(1) != 0;
-    if (b.u(1)) return false;                      // PB frames
+    if (b.u(1)) h.pb = 1;                          // PB-frames (Annex G)
+    if (h.pb && !h.inter) return false;
     h.quant = static_cast<uint8_t>(b.u(5));
     h.continuous_presence = b.u(1) != 0;
     if (h.continuous_presence) b.u(2);             // PSBI
+    h.tr = h.temporal_reference;
   } else {
     // 5.1.4 PLUSPTYPE.
     h.plus = true;
@@ -312,13 +314,18 @@ bool parse_short_header(ConstByteView data, const ShortHeader* previous, ShortHe
     } else if (ufep == 0 && previous && previous->plus) {
       h = *previous;
       h.plus = true;
+      h.pb = 0;
+      h.b_picture = false;
+      h.trb = h.dbquant = 0;
       format = 0;                                  // (the size is the previous one's)
     } else {
       return false;
     }
-    const uint32_t type = b.u(3);                  // MPPTYPE
-    if (type > 1) return false;                    // I and P only
-    h.inter = type == 1;
+    const uint32_t type = b.u(3);                  // MPPTYPE: I, P, Improved PB, B (EI, EP: scalability layers, not decoded)
+    if (type > 3) return false;
+    h.inter = type != 0;
+    if (type == 2) h.pb = 2;
+    h.b_picture = type == 3;
     if (b.u(1) || b.u(1)) return false;            // reference picture resampling, reduced resolution update
     h.no_rounding = b.u(1) != 0;
     if (b.u(2) != 0 || b.u(1) != 1) return false;  // reserved, start code emulation bit
@@ -337,14 +344,29 @@ bool parse_short_header(ConstByteView data, const ShortHeader* previous, ShortHe
         h.width = kFormats[format][0];
         h.height = kFormats[format][1];
       }
-      if (h.custom_pcf) b.u(8);                    // 5.1.7 CPCFC: clock conversion code and divisor
+      if (h.custom_pcf) {
+        // 5.1.7 CPCFC: the clock is 1 800 000 / (divisor * (1000 + conversion code)) Hz.
+        const uint32_t code = b.u(1), divisor = b.u(7);
+        if (divisor == 0) return false;
+        h.tick_us = static_cast<uint32_t>((uint64_t{divisor} * (1000 + code) * 1000000 + 900000) / 1800000);
+      }
     }
-    if (h.custom_pcf) b.u(2);                      // ETR
+    h.tr = h.temporal_reference;
+    if (h.custom_pcf) h.tr = static_cast<uint16_t>(h.tr | (b.u(2) << 8));   // ETR
     if (ufep == 1) {
       if (h.umv_plus && b.u(1) == 0) b.u(1);       // UUI
       if (h.slice_structured && b.u(2) != 0) return false;   // SSS: rectangular or arbitrarily ordered slices
     }
+    if (h.b_picture) {
+      if (b.u(4) != 1) return false;               // ELNUM: the base layer only
+      if (ufep == 1 && b.u(4) != 1) return false;  // RLNUM
+    }
     h.quant = static_cast<uint8_t>(b.u(5));
+  }
+  if (h.pb) {
+    h.trb = static_cast<uint8_t>(b.u(h.custom_pcf ? 5 : 3));   // TRB
+    h.dbquant = static_cast<uint8_t>(b.u(2));                  // DBQUANT
+    if (h.trb == 0) return false;
   }
   if (h.quant == 0) return false;
   for (int spare = 0; b.u(1); ++spare) {           // PEI and PSPARE

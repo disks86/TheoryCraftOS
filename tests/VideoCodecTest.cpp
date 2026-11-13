@@ -2097,7 +2097,10 @@ static void test_mpeg4() {
                         {"h263dec_ip.h263", VideoCodec::H263, 128, 96, 8},        {"h263dec_q.h263", VideoCodec::H263, 128, 96, 8},
                         {"h263dec_ip.h263", VideoCodec::Mpeg4, 128, 96, 8},       // (an MPEG-4 decoder takes the short header too)
                         {"m4vdec_partitioned.m4v", VideoCodec::Mpeg4, 96, 64, 8}, {"m4vdec_gmc.m4v", VideoCodec::Mpeg4, 128, 96, 7},
-                        {"h263dec_plus.h263", VideoCodec::H263, 112, 80, 8},      {"m4vdec_rvlc.m4v", VideoCodec::Mpeg4, 48, 32, 4}};
+                        {"h263dec_plus.h263", VideoCodec::H263, 112, 80, 8},      {"m4vdec_rvlc.m4v", VideoCodec::Mpeg4, 48, 32, 4},
+                        // (PB-frames, Improved PB-frames and B pictures: streams and pictures from scripts/gen_h263_bframe_streams.py's model of the Recommendation)
+                        {"h263dec_pb.h263", VideoCodec::H263, 128, 96, 9},        {"h263dec_ipb.h263", VideoCodec::H263, 128, 96, 9},
+                        {"h263dec_b.h263", VideoCodec::H263, 128, 96, 5}};
   TestAllocator a;
   for (const Case& c : cases) {
     const std::vector<uint8_t> stream = read_data_file(c.name);
@@ -2201,7 +2204,7 @@ static void test_h263_obmc() {
 static void test_mpeg4_robustness() {
   TestAllocator a;
   const char* names[] = {"m4vdec_packets.m4v", "m4vdec_bframes.m4v",     "m4vdec_qpel.m4v",   "m4vdec_interlaced.m4v", "m4vdec_xvid.m4v",
-                         "m4vdec_partitioned.m4v", "m4vdec_gmc.m4v", "m4vdec_rvlc.m4v", "h263dec_ip.h263", "h263dec_plus.h263",     "h263dec_obmcplus.h263"};
+                         "m4vdec_partitioned.m4v", "m4vdec_gmc.m4v", "m4vdec_rvlc.m4v", "h263dec_ip.h263", "h263dec_plus.h263",     "h263dec_obmcplus.h263", "h263dec_pb.h263", "h263dec_ipb.h263", "h263dec_b.h263"};
   uint32_t seed = 12345;
   auto random = [&seed]() {
     seed = seed * 1103515245u + 12345u;
@@ -2215,7 +2218,7 @@ static void test_mpeg4_robustness() {
     for (size_t cut = 0; cut < stream.size(); cut += 97) {
       const std::vector<uint8_t> part(stream.begin(), stream.begin() + static_cast<long>(cut));
       const Mpeg4Run run = mpeg4_run(a, codec, part, nullptr, 0, 0);
-      CHECK(run.frames <= 9);
+      CHECK(run.frames <= 10);
     }
     const std::vector<std::pair<size_t, size_t>> units = split_mpeg4(stream);
     for (size_t u = 0; u < units.size(); ++u) {

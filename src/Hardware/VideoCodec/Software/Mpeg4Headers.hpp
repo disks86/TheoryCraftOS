@@ -84,8 +84,8 @@ struct VopHeader {
 // The picture header of an H.263 stream (ITU-T H.263 5.1; the baseline one is the same as an MPEG-4 short video header), version 1 or 2 (PLUSPTYPE). Taken:
 // the standard and custom source formats, I and P pictures, and Annexes D (unrestricted vectors), F (advanced prediction), I (advanced intra coding), J
 // (deblocking filter), K (slice structured, rectangular and arbitrary order slices excepted), S (alternative inter VLC) and T (modified quantisation).
-// Refused: arithmetic coding (E), PB and B pictures (G, M, O), reference picture selection (N), independent segments (R), reduced resolution (Q) and
-// reference picture resampling (P).
+// Also PB-frames (G), Improved PB-frames (M) and B pictures (O, temporal scalability). Refused: arithmetic coding (E), EI and EP pictures (O's SNR and
+// spatial scalability), reference picture selection (N), independent segments (R), reduced resolution (Q) and reference picture resampling (P).
 struct ShortHeader {
   uint32_t width = 0, height = 0;
   uint8_t temporal_reference = 0;
@@ -104,6 +104,12 @@ struct ShortHeader {
   bool custom_pcf = false;                          // a custom picture clock: 2 more bits of temporal reference
   bool no_rounding = false;                         // RTYPE (version 2 P pictures)
   uint32_t first_mb = 0;                            // slice structured: the first slice's macroblock address
+  uint8_t pb = 0;                                   // 1: a PB-frame (Annex G), 2: an Improved PB-frame (Annex M)
+  bool b_picture = false;                           // a B picture (Annex O)
+  uint8_t trb = 0;                                  // PB-frames: TRB, the B part's distance from the previous reference in picture clock ticks
+  uint8_t dbquant = 0;                              // PB-frames: DBQUANT, the B part's quantiser relative to the P part's
+  uint16_t tr = 0;                                  // the temporal reference with its extension (ETR, custom picture clock): 8 or 10 bits
+  uint32_t tick_us = 33367;                         // a picture clock tick in microseconds: 1001/30 ms, or the custom picture clock's
   uint64_t header_bits = 0;                         // bits from the picture start code to the first macroblock
 };
 

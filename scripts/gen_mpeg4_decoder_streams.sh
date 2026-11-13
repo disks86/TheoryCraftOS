@@ -66,6 +66,9 @@ ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$(src 128x96)" -fra
 # Data partitioning with reversible VLCs: no encoder writes them; a synthetic stream (scripts/gen_mpeg4_rvlc_stream.py), decoded by FFmpeg
 python3 scripts/gen_mpeg4_rvlc_stream.py > /dev/null
 ref "$out/m4vdec_rvlc.m4v"
+# H.263 PB-frames (Annex G), Improved PB-frames (M) and B pictures (O): no encoder writes them; scripts/gen_h263_bframe_streams.py writes them and
+# reconstructs the pictures from its own model of the Recommendation
+python3 scripts/gen_h263_bframe_streams.py > /dev/null
 # The player's files (tests/VideoPlayerTest.cpp): the MPEG-4 stream with B planes remuxed into MP4 and AVI; H.263 encoded straight into 3GP and AVI (a remux of
 # the raw H.263 stream would mark every picture a key frame)
 ffmpeg -nostdin -hide_banner -loglevel error -y -r 25 -i "$out/m4vdec_bframes.m4v" -c copy "$out/player_mpeg4.mp4"
