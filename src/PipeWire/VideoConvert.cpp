@@ -81,29 +81,29 @@ bool packed_yuv(uint32_t format, PackedYuv* out) {
     default: return false;
   }
 }
-// A planar or semi-planar YUV format: its chroma's subsampling, a sample's bytes (1, or 2 little-endian), how far a sample is shifted from 8 bits
-// (10-bit: 2; P010's top ten bits of 16: 8, written as value << 8), whether U and V are one interleaved plane, and whether V comes first.
+// A planar or semi-planar YUV format: its chroma's subsampling, a sample's bytes (1, or 2 little-endian), its bits, whether a 16-bit sample holds
+// them in its top bits (P010) rather than its bottom ones, whether U and V are one interleaved plane, and whether V comes first.
 struct PlanarYuv {
-  uint8_t sx, sy, bytes, shift;
-  bool semi, v_first;
+  uint8_t sx, sy, bytes, depth;
+  bool msb, semi, v_first;
 };
 bool planar_yuv(uint32_t format, PlanarYuv* out) {
   switch (format) {
-    case kI420: *out = {2, 2, 1, 0, false, false}; return true;
-    case kYV12: *out = {2, 2, 1, 0, false, true}; return true;
-    case kY41B: *out = {4, 1, 1, 0, false, false}; return true;
-    case kY42B: *out = {2, 1, 1, 0, false, false}; return true;
-    case kY444: *out = {1, 1, 1, 0, false, false}; return true;
-    case kNV12: *out = {2, 2, 1, 0, true, false}; return true;
-    case kNV21: *out = {2, 2, 1, 0, true, true}; return true;
-    case kNV16: *out = {2, 1, 1, 0, true, false}; return true;
-    case kNV61: *out = {2, 1, 1, 0, true, true}; return true;
-    case kNV24: *out = {1, 1, 1, 0, true, false}; return true;
-    case kI420_10LE: *out = {2, 2, 2, 2, false, false}; return true;
-    case kI422_10LE: *out = {2, 1, 2, 2, false, false}; return true;
-    case kY444_10LE: *out = {1, 1, 2, 2, false, false}; return true;
-    case kI420_12LE: *out = {2, 2, 2, 4, false, false}; return true;
-    case kP010_10LE: *out = {2, 2, 2, 8, true, false}; return true;
+    case kI420: *out = {2, 2, 1, 8, false, false, false}; return true;
+    case kYV12: *out = {2, 2, 1, 8, false, false, true}; return true;
+    case kY41B: *out = {4, 1, 1, 8, false, false, false}; return true;
+    case kY42B: *out = {2, 1, 1, 8, false, false, false}; return true;
+    case kY444: *out = {1, 1, 1, 8, false, false, false}; return true;
+    case kNV12: *out = {2, 2, 1, 8, false, true, false}; return true;
+    case kNV21: *out = {2, 2, 1, 8, false, true, true}; return true;
+    case kNV16: *out = {2, 1, 1, 8, false, true, false}; return true;
+    case kNV61: *out = {2, 1, 1, 8, false, true, true}; return true;
+    case kNV24: *out = {1, 1, 1, 8, false, true, false}; return true;
+    case kI420_10LE: *out = {2, 2, 2, 10, false, false, false}; return true;
+    case kI422_10LE: *out = {2, 1, 2, 10, false, false, false}; return true;
+    case kY444_10LE: *out = {1, 1, 2, 10, false, false, false}; return true;
+    case kI420_12LE: *out = {2, 2, 2, 12, false, false, false}; return true;
+    case kP010_10LE: *out = {2, 2, 2, 10, true, true, false}; return true;
     default: return false;
   }
 }
@@ -120,17 +120,33 @@ bool known(uint32_t format) {
   }
 }
 
-uint8_t clamp8(int32_t v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); }
-// BT.601, limited range
-void yuv_to_rgb(int32_t y, int32_t u, int32_t v, uint8_t* r, uint8_t* g, uint8_t* b) {
-  const int32_t c = 298 * (y - 16), d = u - 128, e = v - 128;
-  *r = clamp8((c + 409 * e + 128) >> 8);
-  *g = clamp8((c - 100 * d - 208 * e + 128) >> 8);
-  *b = clamp8((c + 516 * d + 128) >> 8);
+// ---- the pivot: 16 bits a component (0 .. 65535), so that 10-, 12- and 16-bit formats keep their bits on the way through
+
+uint16_t clamp16(int64_t v) { return static_cast<uint16_t>(v < 0 ? 0 : v > 65535 ? 65535 : v); }
+// an n-bit value (n <= 16) to 16 bits and back, full scale to full scale (0 -> 0, all ones -> 65535), rounded
+uint16_t widen(uint32_t v, uint32_t bits) { return static_cast<uint16_t>((uint64_t{v} * 65535 + ((1u << bits) - 1) / 2) / ((1u << bits) - 1)); }
+uint32_t narrow(uint32_t v16, uint32_t bits) { return static_cast<uint32_t>((uint64_t{v16} * ((1u << bits) - 1) + 32767) / 65535); }
+
+// BT.601 limited range, on samples scaled to 16 bits (an n-bit sample << (16 - n): black Y 4096, white 60160, chroma 32768 +- 28672), in 16.16
+// fixed point: R = (Y - 4096) * 65535 / 56064 + 1.402 * (V - 32768) * 65535 / 57344, ...
+void yuv_to_rgb(int64_t y, int64_t u, int64_t v, uint16_t* r, uint16_t* g, uint16_t* b) {
+  const int64_t c = 76607 * (y - 4096), d = u - 32768, e = v - 32768;
+  *r = clamp16((c + 105004 * e + 32768) >> 16);
+  *g = clamp16((c - 25775 * d - 53488 * e + 32768) >> 16);
+  *b = clamp16((c + 132720 * d + 32768) >> 16);
 }
-uint8_t luma(int32_t r, int32_t g, int32_t b) { return clamp8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16); }
-uint8_t chroma_u(int32_t r, int32_t g, int32_t b) { return clamp8(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128); }
-uint8_t chroma_v(int32_t r, int32_t g, int32_t b) { return clamp8(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128); }
+int64_t luma(int64_t r, int64_t g, int64_t b) { return ((16763 * r + 32910 * g + 6391 * b + 32768) >> 16) + 4096; }
+int64_t chroma_u(int64_t r, int64_t g, int64_t b) { return ((-9676 * r - 18996 * g + 28672 * b + 32768) >> 16) + 32768; }
+int64_t chroma_v(int64_t r, int64_t g, int64_t b) { return ((28672 * r - 24010 * g - 4663 * b + 32768) >> 16) + 32768; }
+// full range (grey)
+uint16_t grey(int64_t r, int64_t g, int64_t b) { return clamp16((19595 * r + 38470 * g + 7471 * b + 32768) >> 16); }
+// a 16-bit-scaled video sample as `bits` bits (rounded, kept in range)
+uint32_t video_sample(int64_t v16, uint32_t bits) {
+  const uint32_t shift = 16 - bits;
+  const int64_t v = shift ? (v16 + (int64_t{1} << (shift - 1))) >> shift : v16;
+  const int64_t top = (int64_t{1} << bits) - 1;
+  return static_cast<uint32_t>(v < 0 ? 0 : v > top ? top : v);
+}
 
 uint32_t le16(ConstByteView v, uint64_t at) { return uint32_t(v[at]) | uint32_t(v[at + 1]) << 8; }
 uint32_t le32(ConstByteView v, uint64_t at) { return le16(v, at) | le16(v, at + 2) << 16; }
@@ -142,7 +158,7 @@ void put32(ByteView v, uint64_t at, uint32_t x) {
   put16(v, at, x & 0xFFFF);
   put16(v, at + 2, x >> 16);
 }
-// IEEE half and single floats to and from 0..255 (clamped)
+// IEEE half and single floats to and from 0 .. 65535 (clamped)
 float half_to_float(uint32_t h) {
   const uint32_t sign = h >> 15, exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
   float v;
@@ -159,13 +175,19 @@ uint32_t float_to_half(float f) {      // (0 .. 1 only: what a colour is)
     f *= 2.0f;
     --exponent;
   }
-  return static_cast<uint32_t>(exponent) << 10 | (static_cast<uint32_t>((f - 1.0f) * 1024.0f + 0.5f) & 0x3FF);
+  uint32_t mantissa = static_cast<uint32_t>((f - 1.0f) * 1024.0f + 0.5f);
+  if (mantissa >= 1024) {      // (rounded up to the next power of two)
+    mantissa = 0;
+    ++exponent;
+  }
+  return static_cast<uint32_t>(exponent) << 10 | mantissa;
 }
-uint8_t unit_to8(float f) { return clamp8(static_cast<int32_t>(f * 255.0f + 0.5f)); }
+uint16_t unit_to16(float f) { return clamp16(static_cast<int64_t>(f * 65535.0f + 0.5f)); }
+float unit_of16(uint16_t v) { return static_cast<float>(v) / 65535.0f; }
 
-// One pixel as 8-bit red, green, blue and alpha, from a frame of a format that is not YUV.
+// One pixel as 16-bit red, green, blue and alpha.
 struct Rgba {
-  uint8_t r, g, b, a;
+  uint16_t r, g, b, a;
 };
 Rgba read_rgb(const VideoFormat& f, ConstByteView in, uint32_t x, uint32_t y) {
   const uint64_t row = f.plane(0).row_bytes, at0 = uint64_t{y} * row;
@@ -173,44 +195,45 @@ Rgba read_rgb(const VideoFormat& f, ConstByteView in, uint32_t x, uint32_t y) {
   Rgb10Layout l10;
   if (rgb_layout(f.format, &l)) {
     const ConstByteView px = in.subview(at0 + uint64_t{x} * l.bytes, l.bytes);
-    return {px[uint64_t(l.r)], px[uint64_t(l.g)], px[uint64_t(l.b)], l.a >= 0 ? px[uint64_t(l.a)] : uint8_t(0xFF)};
+    return {uint16_t(px[uint64_t(l.r)] * 257), uint16_t(px[uint64_t(l.g)] * 257), uint16_t(px[uint64_t(l.b)] * 257),
+            uint16_t(l.a >= 0 ? px[uint64_t(l.a)] * 257 : 65535)};
   }
   if (rgb10_layout(f.format, &l10)) {
     const uint32_t w = le32(in, at0 + 4ull * x);
-    const uint8_t a = l10.a >= 0 ? static_cast<uint8_t>(((w >> l10.a) & 3) * 85) : 0xFF;
-    return {static_cast<uint8_t>((w >> l10.r) >> 2 & 0xFF), static_cast<uint8_t>((w >> l10.g) >> 2 & 0xFF), static_cast<uint8_t>((w >> l10.b) >> 2 & 0xFF), a};
+    const uint16_t a = l10.a >= 0 ? static_cast<uint16_t>(((w >> l10.a) & 3) * 21845) : 65535;
+    return {widen((w >> l10.r) & 0x3FF, 10), widen((w >> l10.g) & 0x3FF, 10), widen((w >> l10.b) & 0x3FF, 10), a};
   }
   switch (f.format) {
-    case kGRAY8: { const uint8_t v = in[at0 + x]; return {v, v, v, 0xFF}; }
+    case kGRAY8: { const uint16_t v = uint16_t(in[at0 + x] * 257); return {v, v, v, 65535}; }
     case kGRAY16_LE: case kGRAY16_BE: {
-      const uint8_t v = f.format == kGRAY16_LE ? in[at0 + 2ull * x + 1] : in[at0 + 2ull * x];      // (the high byte)
-      return {v, v, v, 0xFF};
+      const uint16_t v = static_cast<uint16_t>(f.format == kGRAY16_LE ? le16(in, at0 + 2ull * x) : uint32_t(in[at0 + 2ull * x]) << 8 | in[at0 + 2ull * x + 1]);
+      return {v, v, v, 65535};
     }
     case kRGB16: case kBGR16: {      // 5:6:5 in a little-endian word, red (or blue) on top
       const uint32_t w = le16(in, at0 + 2ull * x);
-      const uint8_t hi = static_cast<uint8_t>(((w >> 11) & 31) * 255 / 31), mid = static_cast<uint8_t>(((w >> 5) & 63) * 255 / 63), lo = static_cast<uint8_t>((w & 31) * 255 / 31);
-      return f.format == kRGB16 ? Rgba{hi, mid, lo, 0xFF} : Rgba{lo, mid, hi, 0xFF};
+      const uint16_t hi = widen((w >> 11) & 31, 5), mid = widen((w >> 5) & 63, 6), lo = widen(w & 31, 5);
+      return f.format == kRGB16 ? Rgba{hi, mid, lo, 65535} : Rgba{lo, mid, hi, 65535};
     }
     case kRGB15: case kBGR15: {      // x:5:5:5
       const uint32_t w = le16(in, at0 + 2ull * x);
-      const uint8_t hi = static_cast<uint8_t>(((w >> 10) & 31) * 255 / 31), mid = static_cast<uint8_t>(((w >> 5) & 31) * 255 / 31), lo = static_cast<uint8_t>((w & 31) * 255 / 31);
-      return f.format == kRGB15 ? Rgba{hi, mid, lo, 0xFF} : Rgba{lo, mid, hi, 0xFF};
+      const uint16_t hi = widen((w >> 10) & 31, 5), mid = widen((w >> 5) & 31, 5), lo = widen(w & 31, 5);
+      return f.format == kRGB15 ? Rgba{hi, mid, lo, 65535} : Rgba{lo, mid, hi, 65535};
     }
-    case kARGB64: {      // A, R, G, B of 16 bits each (little-endian): their high bytes
+    case kARGB64: {      // A, R, G, B of 16 bits each (little-endian)
       const uint64_t at = at0 + 8ull * x;
-      return {in[at + 3], in[at + 5], in[at + 7], in[at + 1]};
+      return {uint16_t(le16(in, at + 2)), uint16_t(le16(in, at + 4)), uint16_t(le16(in, at + 6)), uint16_t(le16(in, at))};
     }
     case kRGBA_F16: {
       const uint64_t at = at0 + 8ull * x;
-      return {unit_to8(half_to_float(le16(in, at))), unit_to8(half_to_float(le16(in, at + 2))), unit_to8(half_to_float(le16(in, at + 4))),
-              unit_to8(half_to_float(le16(in, at + 6)))};
+      return {unit_to16(half_to_float(le16(in, at))), unit_to16(half_to_float(le16(in, at + 2))), unit_to16(half_to_float(le16(in, at + 4))),
+              unit_to16(half_to_float(le16(in, at + 6)))};
     }
     case kRGBA_F32: {
       const uint64_t at = at0 + 16ull * x;
-      return {unit_to8(__builtin_bit_cast(float, le32(in, at))), unit_to8(__builtin_bit_cast(float, le32(in, at + 4))),
-              unit_to8(__builtin_bit_cast(float, le32(in, at + 8))), unit_to8(__builtin_bit_cast(float, le32(in, at + 12)))};
+      return {unit_to16(__builtin_bit_cast(float, le32(in, at))), unit_to16(__builtin_bit_cast(float, le32(in, at + 4))),
+              unit_to16(__builtin_bit_cast(float, le32(in, at + 8))), unit_to16(__builtin_bit_cast(float, le32(in, at + 12)))};
     }
-    default: return {0, 0, 0, 0xFF};
+    default: return {0, 0, 0, 65535};
   }
 }
 void write_rgb(const VideoFormat& f, ByteView out, uint32_t x, uint32_t y, Rgba c) {
@@ -220,55 +243,54 @@ void write_rgb(const VideoFormat& f, ByteView out, uint32_t x, uint32_t y, Rgba 
   if (rgb_layout(f.format, &l)) {
     ByteView o = out.subview(at0 + uint64_t{x} * l.bytes, l.bytes);
     if (l.bytes == 4) o.fill(0xFF);      // (the x byte)
-    o[uint64_t(l.r)] = c.r;
-    o[uint64_t(l.g)] = c.g;
-    o[uint64_t(l.b)] = c.b;
-    if (l.a >= 0) o[uint64_t(l.a)] = c.a;
+    o[uint64_t(l.r)] = static_cast<uint8_t>(narrow(c.r, 8));
+    o[uint64_t(l.g)] = static_cast<uint8_t>(narrow(c.g, 8));
+    o[uint64_t(l.b)] = static_cast<uint8_t>(narrow(c.b, 8));
+    if (l.a >= 0) o[uint64_t(l.a)] = static_cast<uint8_t>(narrow(c.a, 8));
     return;
   }
-  auto ten = [](uint8_t v) { return uint32_t(v) << 2 | uint32_t(v) >> 6; };
   if (rgb10_layout(f.format, &l10)) {
-    uint32_t w = ten(c.r) << l10.r | ten(c.g) << l10.g | ten(c.b) << l10.b;
-    w |= (l10.a >= 0 ? uint32_t(c.a) >> 6 : 3u) << (l10.a >= 0 ? l10.a : (l10.r == 22 || l10.b == 22 ? 0 : 30));      // (alpha, or the x bits all set)
+    uint32_t w = narrow(c.r, 10) << l10.r | narrow(c.g, 10) << l10.g | narrow(c.b, 10) << l10.b;
+    w |= (l10.a >= 0 ? narrow(c.a, 2) : 3u) << (l10.a >= 0 ? l10.a : (l10.r == 22 || l10.b == 22 ? 0 : 30));      // (alpha, or the x bits all set)
     put32(out, at0 + 4ull * x, w);
     return;
   }
   switch (f.format) {
-    case kGRAY8: out[at0 + x] = clamp8((77 * c.r + 150 * c.g + 29 * c.b + 128) >> 8); return;      // (GRAY8 is full range)
+    case kGRAY8: out[at0 + x] = static_cast<uint8_t>(narrow(grey(c.r, c.g, c.b), 8)); return;      // (grey is full range)
     case kGRAY16_LE: case kGRAY16_BE: {
-      const uint32_t v = uint32_t(clamp8((77 * c.r + 150 * c.g + 29 * c.b + 128) >> 8)) * 257;
+      const uint32_t v = grey(c.r, c.g, c.b);
       if (f.format == kGRAY16_LE) put16(out, at0 + 2ull * x, v);
       else { out[at0 + 2ull * x] = static_cast<uint8_t>(v >> 8); out[at0 + 2ull * x + 1] = static_cast<uint8_t>(v); }
       return;
     }
     case kRGB16: case kBGR16: {
-      const uint32_t hi = (f.format == kRGB16 ? c.r : c.b) >> 3, lo = (f.format == kRGB16 ? c.b : c.r) >> 3;
-      put16(out, at0 + 2ull * x, hi << 11 | uint32_t(c.g >> 2) << 5 | lo);
+      const uint32_t hi = narrow(f.format == kRGB16 ? c.r : c.b, 5), lo = narrow(f.format == kRGB16 ? c.b : c.r, 5);
+      put16(out, at0 + 2ull * x, hi << 11 | narrow(c.g, 6) << 5 | lo);
       return;
     }
     case kRGB15: case kBGR15: {
-      const uint32_t hi = (f.format == kRGB15 ? c.r : c.b) >> 3, lo = (f.format == kRGB15 ? c.b : c.r) >> 3;
-      put16(out, at0 + 2ull * x, 0x8000u | hi << 10 | uint32_t(c.g >> 3) << 5 | lo);
+      const uint32_t hi = narrow(f.format == kRGB15 ? c.r : c.b, 5), lo = narrow(f.format == kRGB15 ? c.b : c.r, 5);
+      put16(out, at0 + 2ull * x, 0x8000u | hi << 10 | narrow(c.g, 5) << 5 | lo);
       return;
     }
     case kARGB64: {
       const uint64_t at = at0 + 8ull * x;
-      put16(out, at, uint32_t(c.a) * 257);
-      put16(out, at + 2, uint32_t(c.r) * 257);
-      put16(out, at + 4, uint32_t(c.g) * 257);
-      put16(out, at + 6, uint32_t(c.b) * 257);
+      put16(out, at, c.a);
+      put16(out, at + 2, c.r);
+      put16(out, at + 4, c.g);
+      put16(out, at + 6, c.b);
       return;
     }
     case kRGBA_F16: {
       const uint64_t at = at0 + 8ull * x;
-      const uint8_t v[4] = {c.r, c.g, c.b, c.a};
-      for (int k = 0; k < 4; ++k) put16(out, at + 2ull * k, float_to_half(static_cast<float>(v[k]) / 255.0f));
+      const uint16_t v[4] = {c.r, c.g, c.b, c.a};
+      for (int k = 0; k < 4; ++k) put16(out, at + 2ull * k, float_to_half(unit_of16(v[k])));
       return;
     }
     case kRGBA_F32: {
       const uint64_t at = at0 + 16ull * x;
-      const uint8_t v[4] = {c.r, c.g, c.b, c.a};
-      for (int k = 0; k < 4; ++k) put32(out, at + 4ull * k, __builtin_bit_cast(uint32_t, static_cast<float>(v[k]) / 255.0f));
+      const uint16_t v[4] = {c.r, c.g, c.b, c.a};
+      for (int k = 0; k < 4; ++k) put32(out, at + 4ull * k, __builtin_bit_cast(uint32_t, unit_of16(v[k])));
       return;
     }
     default: return;
@@ -280,58 +302,66 @@ bool is_yuv(uint32_t format) {
   PlanarYuv q;
   return packed_yuv(format, &p) || planar_yuv(format, &q) || format == kAYUV || format == kAYUV64;
 }
-// One pixel's Y, U, V (8 bits) and alpha, from a YUV frame.
-void read_yuv(const VideoFormat& f, ConstByteView in, uint32_t x, uint32_t y, int32_t* Y, int32_t* U, int32_t* V, uint8_t* A) {
-  *A = 0xFF;
+// One pixel's Y, U, V scaled to 16 bits (a sample << (16 - its bits)) and its alpha (0 .. 65535), from a YUV frame.
+void read_yuv(const VideoFormat& f, ConstByteView in, uint32_t x, uint32_t y, int64_t* Y, int64_t* U, int64_t* V, uint16_t* A) {
+  *A = 65535;
   PackedYuv p;
   PlanarYuv q;
   const uint64_t row0 = f.plane(0).row_bytes;
   if (packed_yuv(f.format, &p)) {
     const ConstByteView pair = in.subview(uint64_t{y} * row0 + 4ull * (x / 2), 4);
-    *Y = pair[x % 2 ? p.y1 : p.y0];
-    *U = pair[p.u];
-    *V = pair[p.v];
+    *Y = int64_t{pair[x % 2 ? p.y1 : p.y0]} << 8;
+    *U = int64_t{pair[p.u]} << 8;
+    *V = int64_t{pair[p.v]} << 8;
     return;
   }
-  if (f.format == kAYUV || f.format == kAYUV64) {
-    const uint32_t step = f.format == kAYUV ? 1 : 2, off = f.format == kAYUV ? 0 : 1;      // (AYUV64: the high bytes of little-endian 16-bit samples)
-    const ConstByteView px = in.subview(uint64_t{y} * row0 + 4ull * step * x, 4ull * step);
-    *A = px[off];
-    *Y = px[step + off];
-    *U = px[2 * step + off];
-    *V = px[3 * step + off];
+  if (f.format == kAYUV) {
+    const ConstByteView px = in.subview(uint64_t{y} * row0 + 4ull * x, 4);
+    *A = static_cast<uint16_t>(px[0] * 257);
+    *Y = int64_t{px[1]} << 8;
+    *U = int64_t{px[2]} << 8;
+    *V = int64_t{px[3]} << 8;
+    return;
+  }
+  if (f.format == kAYUV64) {      // (16-bit little-endian samples)
+    const uint64_t at = uint64_t{y} * row0 + 8ull * x;
+    *A = static_cast<uint16_t>(le16(in, at));
+    *Y = le16(in, at + 2);
+    *U = le16(in, at + 4);
+    *V = le16(in, at + 6);
     return;
   }
   planar_yuv(f.format, &q);
-  auto sample = [&](uint64_t at) -> int32_t {
-    const uint32_t v = q.bytes == 1 ? in[at] : le16(in, at);
-    return static_cast<int32_t>(v >> q.shift);
+  auto sample = [&](uint64_t at) -> int64_t {
+    const uint32_t raw = q.bytes == 1 ? in[at] : le16(in, at);
+    const uint32_t v = q.msb ? raw >> (16 - q.depth) : raw & ((1u << q.depth) - 1);
+    return int64_t{v} << (16 - q.depth);
   };
   *Y = sample(uint64_t{y} * row0 + uint64_t{x} * q.bytes);
   const uint64_t cx = x / q.sx, cy = y / q.sy;
   const VideoPlane c = f.plane(1);
   if (q.semi) {
     const uint64_t at = f.plane_offset(1) + cy * c.row_bytes + cx * 2 * q.bytes;
-    const int32_t first = sample(at), second = sample(at + q.bytes);
+    const int64_t first = sample(at), second = sample(at + q.bytes);
     *U = q.v_first ? second : first;
     *V = q.v_first ? first : second;
   } else {
-    const int32_t first = sample(f.plane_offset(1) + cy * c.row_bytes + cx * q.bytes), second = sample(f.plane_offset(2) + cy * c.row_bytes + cx * q.bytes);
+    const int64_t first = sample(f.plane_offset(1) + cy * c.row_bytes + cx * q.bytes), second = sample(f.plane_offset(2) + cy * c.row_bytes + cx * q.bytes);
     *U = q.v_first ? second : first;
     *V = q.v_first ? first : second;
   }
 }
 
-// The frame as RGBA (4 bytes a pixel, row after row). `in` holds every plane (checked by the caller).
-void to_rgba(const VideoFormat& f, ConstByteView in, ByteView rgba) {
+// The frame as 16-bit RGBA (4 components a pixel, row after row). `in` holds every plane (checked by the caller).
+void to_rgba(const VideoFormat& f, ConstByteView in, ArrayView<uint16_t> rgba) {
   const uint32_t w = f.width, h = f.height;
   const bool yuv = is_yuv(f.format);
   for (uint32_t y = 0; y < h; ++y)
     for (uint32_t x = 0; x < w; ++x) {
-      ByteView out = rgba.subview((uint64_t{y} * w + x) * 4, 4);
+      ArrayView<uint16_t> out = rgba.subview((uint64_t{y} * w + x) * 4, 4);
       if (yuv) {
-        int32_t Y, U, V;
-        uint8_t a;
+        int64_t Y, U, V;
+        uint16_t a;
         read_yuv(f, in, x, y, &Y, &U, &V, &a);
         yuv_to_rgb(Y, U, V, &out[0], &out[1], &out[2]);
         out[3] = a;
@@ -345,11 +375,11 @@ void to_rgba(const VideoFormat& f, ConstByteView in, ByteView rgba) {
     }
 }
 
-// The RGBA frame in `f`'s layout (`out` is f.frame_bytes()).
-void from_rgba(const VideoFormat& f, ConstByteView rgba, ByteView out) {
+// The 16-bit RGBA frame in `f`'s layout (`out` is f.frame_bytes()).
+void from_rgba(const VideoFormat& f, ArrayView<const uint16_t> rgba, ByteView out) {
   const uint32_t w = f.width, h = f.height;
   auto px = [&](uint32_t x, uint32_t y) {
-    const ConstByteView q = rgba.subview((uint64_t{y} * w + x) * 4, 4);
+    const ArrayView<const uint16_t> q = rgba.subview((uint64_t{y} * w + x) * 4, 4);
     return Rgba{q[0], q[1], q[2], q[3]};
   };
   if (!is_yuv(f.format)) {
@@ -363,33 +393,41 @@ void from_rgba(const VideoFormat& f, ConstByteView rgba, ByteView out) {
     for (uint32_t y = 0; y < h; ++y)
       for (uint32_t x = 0; x < w; x += 2) {
         const Rgba a = px(x, y), b = x + 1 < w ? px(x + 1, y) : a;
+        const int64_t r = (int64_t{a.r} + b.r) / 2, g = (int64_t{a.g} + b.g) / 2, bl = (int64_t{a.b} + b.b) / 2;
         ByteView pair = out.subview(uint64_t{y} * row0 + 2ull * x, 4);
-        pair[p.y0] = luma(a.r, a.g, a.b);
-        pair[p.y1] = luma(b.r, b.g, b.b);
-        pair[p.u] = chroma_u((a.r + b.r) / 2, (a.g + b.g) / 2, (a.b + b.b) / 2);
-        pair[p.v] = chroma_v((a.r + b.r) / 2, (a.g + b.g) / 2, (a.b + b.b) / 2);
+        pair[p.y0] = static_cast<uint8_t>(video_sample(luma(a.r, a.g, a.b), 8));
+        pair[p.y1] = static_cast<uint8_t>(video_sample(luma(b.r, b.g, b.b), 8));
+        pair[p.u] = static_cast<uint8_t>(video_sample(chroma_u(r, g, bl), 8));
+        pair[p.v] = static_cast<uint8_t>(video_sample(chroma_v(r, g, bl), 8));
       }
     return;
   }
   if (f.format == kAYUV || f.format == kAYUV64) {
-    const uint32_t step = f.format == kAYUV ? 1 : 2;
     for (uint32_t y = 0; y < h; ++y)
       for (uint32_t x = 0; x < w; ++x) {
         const Rgba c = px(x, y);
-        const uint8_t v[4] = {c.a, luma(c.r, c.g, c.b), chroma_u(c.r, c.g, c.b), chroma_v(c.r, c.g, c.b)};
-        ByteView o = out.subview(uint64_t{y} * row0 + 4ull * step * x, 4ull * step);
-        for (uint32_t k = 0; k < 4; ++k) {
-          if (step == 1) o[k] = v[k];
-          else put16(o, 2ull * k, uint32_t(v[k]) * 257);
+        if (f.format == kAYUV) {
+          ByteView o = out.subview(uint64_t{y} * row0 + 4ull * x, 4);
+          o[0] = static_cast<uint8_t>(narrow(c.a, 8));
+          o[1] = static_cast<uint8_t>(video_sample(luma(c.r, c.g, c.b), 8));
+          o[2] = static_cast<uint8_t>(video_sample(chroma_u(c.r, c.g, c.b), 8));
+          o[3] = static_cast<uint8_t>(video_sample(chroma_v(c.r, c.g, c.b), 8));
+        } else {
+          const uint64_t at = uint64_t{y} * row0 + 8ull * x;
+          put16(out, at, c.a);
+          put16(out, at + 2, video_sample(luma(c.r, c.g, c.b), 16));
+          put16(out, at + 4, video_sample(chroma_u(c.r, c.g, c.b), 16));
+          put16(out, at + 6, video_sample(chroma_v(c.r, c.g, c.b), 16));
         }
       }
     return;
   }
   PlanarYuv q;
   planar_yuv(f.format, &q);
-  auto put_sample = [&](uint64_t at, uint8_t v) {
-    if (q.bytes == 1) out[at] = v;
-    else put16(out, at, q.shift == 8 ? uint32_t(v) << 8 : (uint32_t(v) << q.shift) | (uint32_t(v) >> (8 - q.shift)));
+  auto put_sample = [&](uint64_t at, int64_t v16) {
+    const uint32_t v = video_sample(v16, q.depth);
+    if (q.bytes == 1) out[at] = static_cast<uint8_t>(v);
+    else put16(out, at, q.msb ? v << (16 - q.depth) : v);
   };
   for (uint32_t y = 0; y < h; ++y)
     for (uint32_t x = 0; x < w; ++x) {
@@ -401,7 +439,7 @@ void from_rgba(const VideoFormat& f, ConstByteView rgba, ByteView out) {
   const uint32_t cw = (w + q.sx - 1) / q.sx, ch = (h + q.sy - 1) / q.sy;
   for (uint32_t cy = 0; cy < ch; ++cy)
     for (uint32_t cx = 0; cx < cw; ++cx) {
-      int32_t rs = 0, gs = 0, bs = 0, n = 0;
+      int64_t rs = 0, gs = 0, bs = 0, n = 0;
       for (uint32_t dy = 0; dy < q.sy; ++dy)
         for (uint32_t dx = 0; dx < q.sx; ++dx) {
           const uint32_t x = cx * q.sx + dx, y = cy * q.sy + dy;
@@ -412,7 +450,7 @@ void from_rgba(const VideoFormat& f, ConstByteView rgba, ByteView out) {
           bs += c.b;
           ++n;
         }
-      const uint8_t U = chroma_u(rs / n, gs / n, bs / n), V = chroma_v(rs / n, gs / n, bs / n);
+      const int64_t U = chroma_u(rs / n, gs / n, bs / n), V = chroma_v(rs / n, gs / n, bs / n);
       if (q.semi) {
         const uint64_t at = f.plane_offset(1) + uint64_t{cy} * cp.row_bytes + uint64_t{cx} * 2 * q.bytes;
         put_sample(at, q.v_first ? V : U);
@@ -455,8 +493,8 @@ AxisTaps axis_taps(uint32_t i, uint32_t source, uint32_t dest) {
   return t;
 }
 
-// An RGBA frame of sw x sh as one of dw x dh, axis by axis (averaged where it shrinks, bilinear where it grows), in fixed point.
-void scale_rgba(ConstByteView in, uint32_t sw, uint32_t sh, ByteView out, uint32_t dw, uint32_t dh) {
+// A 16-bit RGBA frame of sw x sh as one of dw x dh, axis by axis (averaged where it shrinks, bilinear where it grows), in fixed point.
+void scale_rgba(ArrayView<const uint16_t> in, uint32_t sw, uint32_t sh, ArrayView<uint16_t> out, uint32_t dw, uint32_t dh) {
   for (uint32_t y = 0; y < dh; ++y) {
     const AxisTaps ty = axis_taps(y, sh, dh);
     for (uint32_t x = 0; x < dw; ++x) {
@@ -466,15 +504,24 @@ void scale_rgba(ConstByteView in, uint32_t sw, uint32_t sh, ByteView out, uint32
         const uint64_t wy = ty.linear ? (j == 0 ? 256 - ty.weight : ty.weight) : 256;
         for (uint32_t k = 0; k < tx.count; ++k) {
           const uint64_t wx = tx.linear ? (k == 0 ? 256 - tx.weight : tx.weight) : 256;
-          const ConstByteView q = in.subview((uint64_t{ty.first + j} * sw + tx.first + k) * 4, 4);
+          const ArrayView<const uint16_t> q = in.subview((uint64_t{ty.first + j} * sw + tx.first + k) * 4, 4);
           for (uint64_t c = 0; c < 4; ++c) sum[c] += q[c] * wx * wy;
           total += wx * wy;
         }
       }
-      ByteView o = out.subview((uint64_t{y} * dw + x) * 4, 4);
-      for (uint64_t c = 0; c < 4; ++c) o[c] = static_cast<uint8_t>(total ? (sum[c] + total / 2) / total : 0);
+      ArrayView<uint16_t> o = out.subview((uint64_t{y} * dw + x) * 4, 4);
+      for (uint64_t c = 0; c < 4; ++c) o[c] = static_cast<uint16_t>(total ? (sum[c] + total / 2) / total : 0);
     }
   }
+}
+
+// A pivot frame of `pixels` pixels.
+bool pivot(List<uint16_t>* p, uint64_t pixels) {
+  p->clear();
+  if (pixels > UINT64_MAX / 4 || !p->reserve(pixels * 4)) return false;
+  for (uint64_t i = 0; i < pixels * 4; ++i)
+    if (!p->push_back(0)) return false;
+  return true;
 }
 
 }  // namespace
@@ -487,17 +534,17 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
   out->clear();
   const bool same_size = from.width == to.width && from.height == to.height;
   if (from.format == to.format && same_size) return out->append(in.first(from.frame_bytes()));
-  ByteBuffer rgba(out->allocator());
-  if (!rgba.put_zeros(uint64_t{from.width} * from.height * 4) || !out->put_zeros(to.frame_bytes())) return false;
-  to_rgba(from, in, rgba.writable_view());
+  List<uint16_t> rgba(out->allocator());
+  if (!pivot(&rgba, uint64_t{from.width} * from.height) || !out->put_zeros(to.frame_bytes())) return false;
+  to_rgba(from, in, rgba.view());
   if (!same_size) {      // (another size: scaled as RGBA)
-    ByteBuffer scaled(out->allocator());
-    if (!scaled.put_zeros(uint64_t{to.width} * to.height * 4)) return false;
-    scale_rgba(rgba.view(), from.width, from.height, scaled.writable_view(), to.width, to.height);
-    from_rgba(to, scaled.view(), out->writable_view());
+    List<uint16_t> scaled(out->allocator());
+    if (!pivot(&scaled, uint64_t{to.width} * to.height)) return false;
+    scale_rgba(ArrayView<const uint16_t>(rgba.view()), from.width, from.height, scaled.view(), to.width, to.height);
+    from_rgba(to, ArrayView<const uint16_t>(scaled.view()), out->writable_view());
     return true;
   }
-  from_rgba(to, rgba.view(), out->writable_view());
+  from_rgba(to, ArrayView<const uint16_t>(rgba.view()), out->writable_view());
   return true;
 }
 

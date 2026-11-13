@@ -20,8 +20,9 @@
 // does in the program; here the server does it). Every raw format VideoFormat carries: packed RGB of 8 bits (RGBx ... BGR), 16 (RGB16, BGR16,
 // RGB15, BGR15) and 10 bits a component (xRGB_210LE ... BGRA_102LE), ARGB64, float RGBA (F16, F32 and dsp), planar and semi-planar YUV of 8, 10 and
 // 12 bits (I420, YV12, Y41B, Y42B, Y444, NV12, NV21, NV16, NV61, NV24, I420_10LE, I422_10LE, Y444_10LE, I420_12LE, P010), packed YUV (YUY2, UYVY,
-// YVYU, VYUY, AYUV, AYUV64) and grey (GRAY8, GRAY16). Through 8-bit RGBA: deeper formats lose their low bits. YUV is BT.601 limited range (as
-// cameras send it), grey full range; chroma is averaged over the pixels it covers. The frames are VideoChannel's: planes with no padding, one
+// YVYU, VYUY, AYUV, AYUV64) and grey (GRAY8, GRAY16). Through RGBA of 16 bits a component, so 10-, 12- and 16-bit formats keep their bits (a
+// 10-bit YUV frame made 16-bit RGB and back is what it was). YUV is BT.601 limited range (as cameras send it), grey full range; chroma is averaged
+// over the pixels it covers. The frames are VideoChannel's: planes with no padding, one
 // after another.
 #pragma once
 #include <stdint.h>

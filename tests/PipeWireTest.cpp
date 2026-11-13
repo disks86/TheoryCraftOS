@@ -2823,6 +2823,111 @@ static std::vector<std::vector<uint8_t>> reference_pictures(hardware::VideoCodec
   return out;
 }
 
+// Deep formats keep their bits through the conversion (16 bits a component): a 10-bit luma ramp of every value from black to white comes back exact
+// (or within one), every value still its own; 16-bit RGB through float and back within one; grey and 10-bit RGB through 16-bit RGB exactly; frames
+// made from 16-bit RGB come out the same when made again through another deep format.
+static std::vector<uint8_t> le16_bytes(const std::vector<uint16_t>& v) {
+  std::vector<uint8_t> b(v.size() * 2);
+  for (size_t i = 0; i < v.size(); ++i) { b[2 * i] = uint8_t(v[i]); b[2 * i + 1] = uint8_t(v[i] >> 8); }
+  return b;
+}
+static std::vector<uint16_t> le16_words(ConstByteView b) {
+  std::vector<uint16_t> v(b.size() / 2);
+  for (size_t i = 0; i < v.size(); ++i) v[i] = uint16_t(b[2 * i] | b[2 * i + 1] << 8);
+  return v;
+}
+static bool convert_bytes(uint32_t from, uint32_t to, uint32_t w, uint32_t h, const std::vector<uint8_t>& in, std::vector<uint8_t>* out) {
+  VideoFormat a, b;
+  a.format = from; a.width = w; a.height = h;
+  b.format = to; b.width = w; b.height = h;
+  ByteBuffer o(A);
+  if (!convert_video(a, ConstByteView(in.data(), in.size()), b, &o) || o.size() != b.frame_bytes()) return false;
+  out->assign(o.view().data(), o.view().data() + o.size());
+  return true;
+}
+
+static void test_deep_conversion() {
+  // Y444_10LE: luma 64 .. 940 (black .. white), chroma neutral (512); to ARGB64 and back
+  const uint32_t n = 940 - 64 + 1, w = 877, h = 1;
+  CHECK(n == w);
+  std::vector<uint16_t> y444(size_t(w) * h * 3);
+  for (uint32_t i = 0; i < w; ++i) {
+    y444[i] = uint16_t(64 + i);
+    y444[w + i] = 512;
+    y444[2 * w + i] = 512;
+  }
+  std::vector<uint8_t> rgb64, back;
+  CHECK(convert_bytes(47, 39, w, h, le16_bytes(y444), &rgb64) && convert_bytes(39, 47, w, h, rgb64, &back));
+  const std::vector<uint16_t> again = le16_words(ConstByteView(back.data(), back.size()));
+  int worst = 0, distinct = 0;
+  for (uint32_t i = 0; i < w && again.size() == y444.size(); ++i) {
+    worst = std::max(worst, abs(int(again[i]) - int(y444[i])));
+    worst = std::max(worst, abs(int(again[w + i]) - 512));
+    worst = std::max(worst, abs(int(again[2 * w + i]) - 512));
+    distinct += i == 0 || again[i] != again[i - 1];
+  }
+  CHECK(again.size() == y444.size() && worst <= 1 && distinct == int(w));
+  // black and white land on the ends of 16-bit RGB
+  const std::vector<uint16_t> argb = le16_words(ConstByteView(rgb64.data(), rgb64.size()));
+  CHECK(argb.size() == size_t(w) * 4 && argb[1] == 0 && argb[2] == 0 && argb[(w - 1) * 4 + 1] == 65535 && argb[(w - 1) * 4 + 3] == 65535 && argb[0] == 65535);
+  // 16-bit RGB of random values through RGBA_F32 and back: within one
+  std::mt19937 rng(5);
+  const uint32_t rw = 32, rh = 8;
+  std::vector<uint16_t> random(size_t(rw) * rh * 4);
+  for (uint16_t& v : random) v = uint16_t(rng());
+  std::vector<uint8_t> f32, from_f32;
+  CHECK(convert_bytes(39, 79, rw, rh, le16_bytes(random), &f32) && convert_bytes(79, 39, rw, rh, f32, &from_f32));
+  const std::vector<uint16_t> rf = le16_words(ConstByteView(from_f32.data(), from_f32.size()));
+  worst = 0;
+  for (size_t i = 0; i < random.size() && rf.size() == random.size(); ++i) worst = std::max(worst, abs(int(rf[i]) - int(random[i])));
+  CHECK(rf.size() == random.size() && worst <= 1);
+  // GRAY16 through ARGB64: exact
+  std::vector<uint16_t> grey16(size_t(rw) * rh);
+  for (uint16_t& v : grey16) v = uint16_t(rng());
+  std::vector<uint8_t> g64, gback;
+  CHECK(convert_bytes(27, 39, rw, rh, le16_bytes(grey16), &g64) && convert_bytes(39, 27, rw, rh, g64, &gback));
+  CHECK(le16_words(ConstByteView(gback.data(), gback.size())) == grey16);
+  // xRGB_210LE through ARGB64: exact
+  std::vector<uint8_t> rgb10(size_t(rw) * rh * 4), r64, rback;
+  for (size_t i = 0; i < rgb10.size(); i += 4) {
+    const uint32_t word = 0xC0000000u | (rng() & 0x3FFFFFFFu);
+    for (int k = 0; k < 4; ++k) rgb10[i + size_t(k)] = uint8_t(word >> (8 * k));
+  }
+  CHECK(convert_bytes(80, 39, rw, rh, rgb10, &r64) && convert_bytes(39, 80, rw, rh, r64, &rback) && rback == rgb10);
+  // a deep frame (10-bit 4:4:4: luma varying, chroma a little off neutral and the same over each 4 x 4 block, so every format can hold it and it stays
+  // in gamut) made each deep format, then made again through another: the same within one (12-bit: within four, a 10-bit source's steps)
+  std::vector<uint16_t> blocky(size_t(rw) * rh * 3);
+  for (uint32_t y = 0; y < rh; ++y)
+    for (uint32_t x = 0; x < rw; ++x) {
+      const size_t i = size_t(y) * rw + x;
+      blocky[i] = uint16_t(200 + (x * 37 + y * 11 + rng() % 7) % 600);
+      const uint32_t block = (y / 4) * 8 + x / 4;
+      blocky[size_t(rw) * rh + i] = uint16_t(512 - 50 + (block * 13) % 100);
+      blocky[2 * size_t(rw) * rh + i] = uint16_t(512 - 50 + (block * 29) % 100);
+    }
+  const uint32_t deep[] = {43, 45, 47, 62, 73, 40};
+  for (uint32_t format : deep) {
+    std::vector<uint8_t> a1;
+    CHECK(convert_bytes(47, format, rw, rh, le16_bytes(blocky), &a1));
+    for (uint32_t other : deep) {
+      std::vector<uint8_t> mid, a2;
+      if (!convert_bytes(format, other, rw, rh, a1, &mid) || !convert_bytes(other, format, rw, rh, mid, &a2)) {
+        CHECK(false);
+        continue;
+      }
+      const std::vector<uint16_t> x1 = le16_words(ConstByteView(a1.data(), a1.size())), x2 = le16_words(ConstByteView(a2.data(), a2.size()));
+      int diff = 0;
+      for (size_t i = 0; i < x1.size() && x2.size() == x1.size(); ++i) {
+        const int a = format == 62 ? x1[i] >> 6 : x1[i], b = format == 62 ? x2[i] >> 6 : x2[i];
+        diff = std::max(diff, abs(a - b));
+      }
+      const int allowed = format == 40 ? 64 : format == 73 ? 4 : 1;      // (AYUV64: 16-bit samples of a 10-bit source; I420_12LE: 12-bit)
+      if (diff > allowed) printf("deep %u via %u: %d\n", format, other, diff);
+      CHECK(x2.size() == x1.size() && diff <= allowed);
+    }
+  }
+}
+
 // VideoDecodeSession: H.264 (from the encoder) and VP8 (a file) decoded as a decoder of the codecs would, the codec switched in the middle; without
 // decoders only Motion JPEG; truncated and bit-flipped frames are refused or decoded, never read past; decode_video to another format and size.
 static void test_video_decode() {
@@ -5147,6 +5252,7 @@ int main() {
   test_pulse_modules();
   test_camera_sources();
   test_screen_source();
+  test_deep_conversion();
   test_video_decode();
   test_video_watcher();
   test_record_convert();
