@@ -93,7 +93,10 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       extra_calculators_(allocator),
       extra_calendars_(allocator),
       extra_todos_(allocator),
-      hosts_(allocator) {
+      hosts_(allocator),
+      installed_apps_(allocator),
+      listed_apps_(allocator),
+      scanned_apps_(allocator) {
   // Taskbar: Start at the left, the clock in a sunken tray at the right, the window switcher in between.
   taskbar_.set_style(PanelStyle::Raised);
   taskbar_.set_dock(DockStyle::Bottom);
@@ -120,7 +123,9 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("Video Viewer", {&Desktop::on_video_viewer, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
-  start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
+  about_item_ = start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});   // (the installed applications go before it)
+  start_.on_opening({&Desktop::on_start_opening, this});
+  start_.on_closed({&Desktop::on_start_closed, this});
   start_.menu().add_separator();
   start_.menu().add_item("Shut Down...", {&Desktop::on_shut_down, this});
 
@@ -351,6 +356,111 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   });
   media_player_.set_file_system(fs);
   file_dialog_.set_file_system(fs);
+  request_app_scan();   // the installed applications of this filesystem, for the Start menu
+}
+
+// --- the installed applications ----------------------------------------------------------------------------------------------------------
+
+void Desktop::request_app_scan() {
+  bool start = false;
+  window_.locked([&] {
+    if (!fs_) return;
+    if (scan_running_) {
+      scan_again_ = true;
+      return;
+    }
+    scan_running_ = true;
+    scan_fs_ = fs_;
+    start = true;
+  });
+  if (start && !window_.run_async(&Desktop::scan_apps_work, this, {&Desktop::on_apps_scanned, this})) window_.locked([&] { scan_running_ = false; });
+}
+
+void Desktop::scan_apps_work(void* self) {
+  auto* d = static_cast<Desktop*>(self);
+  d->scanned_apps_.clear();
+  (void)find_installed_apps(*d->scan_fs_, d->allocator_, &d->scanned_apps_);   // (out of memory: what was found is listed)
+}
+
+void Desktop::on_apps_scanned(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  bool again = false;
+  d->window_.locked([&] {
+    d->scan_running_ = false;
+    d->scan_ready_ = true;
+    d->apply_scanned_apps();
+    again = d->scan_again_;
+    d->scan_again_ = false;
+  });
+  if (again) d->request_app_scan();
+}
+
+void Desktop::apply_scanned_apps() {
+  if (!scan_ready_ || scan_running_ || start_.open()) return;
+  scan_ready_ = false;
+  gui::Menu& menu = start_.menu();
+  // Nothing to do if the menu already lists exactly these, in this order.
+  bool same = listed_apps_.count() == scanned_apps_.count();
+  for (uint64_t i = 0; same && i < listed_apps_.count(); ++i) same = same_installed_app(listed_apps_[i]->app, scanned_apps_[i]);
+  if (same) {
+    scanned_apps_.clear();
+    return;
+  }
+  for (InstalledEntry* e : listed_apps_.view()) {
+    if (e->item) menu.remove_item(e->item);
+    e->item = nullptr;
+  }
+  listed_apps_.clear();
+  if (scanned_apps_.count() == 0 && apps_separator_) {
+    menu.remove_item(apps_separator_);
+    apps_separator_ = nullptr;
+  }
+  if (scanned_apps_.count() > 0 && !apps_separator_) {
+    const int32_t at = menu.index_of(about_item_);
+    apps_separator_ = menu.insert_separator(at < 0 ? menu.item_count() : static_cast<uint32_t>(at));
+  }
+  for (InstalledApp& app : scanned_apps_.view()) {
+    InstalledEntry* entry = nullptr;
+    for (auto& e : installed_apps_)
+      if (!e->item && same_installed_app(e->app, app)) { entry = e.get(); break; }
+    if (!entry) {
+      UniquePointer<InstalledEntry> made = UniquePointer<InstalledEntry>::make(allocator_, allocator_, this);
+      if (!made) break;
+      made->app = static_cast<InstalledApp&&>(app);
+      entry = made.get();
+      if (!installed_apps_.push_back(util::move(made))) break;
+    }
+    const int32_t at = menu.index_of(about_item_);
+    entry->item = menu.insert_item(at < 0 ? menu.item_count() : static_cast<uint32_t>(at), entry->app.label.view(), {&Desktop::on_installed_app, entry});
+    if (entry->item && !listed_apps_.push_back(entry)) {
+      menu.remove_item(entry->item);
+      entry->item = nullptr;
+    }
+  }
+  scanned_apps_.clear();
+}
+
+void Desktop::on_start_opening(void* self, Control&) { static_cast<Desktop*>(self)->request_app_scan(); }
+
+void Desktop::on_start_closed(void* self, Control&) {
+  auto* d = static_cast<Desktop*>(self);
+  d->window_.locked([&] { d->apply_scanned_apps(); });
+}
+
+// Opens a terminal in the application's folder and starts it there (the terminal shows what a console program prints and hosts its
+// dialogs; a window it opens is a window of the desktop).
+void Desktop::on_installed_app(void* self, Control&) {
+  auto* entry = static_cast<InstalledEntry*>(self);
+  Desktop* d = entry->desktop;
+  String folder(d->allocator_), line(d->allocator_);
+  bool listed = false;
+  d->window_.locked([&] {
+    listed = entry->item && folder.assign(entry->app.working_directory.view()) && installed_app_command_line(entry->app, &line);
+  });
+  if (!listed) return;
+  Terminal* terminal = d->open_terminal();
+  if (terminal && !terminal->start_command(folder.view(), line.view()))
+    gui::NoticeDialog::post(&d->notice_dialog_, &d->windows_, gui::NoticeKind::Error, "Not enough memory to start the application.");
 }
 
 void Desktop::set_program_launcher(IProgramLauncher* launcher) {

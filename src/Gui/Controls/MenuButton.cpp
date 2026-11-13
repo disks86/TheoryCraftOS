@@ -36,12 +36,20 @@ void MenuButton::paint(Painter& painter) {
 void MenuButton::open_menu() {
   UiGuard lock(this);
   Window* w = window();
-  if (!w || open_ || menu_.item_count() == 0) return;
+  if (!w || open_) return;
+  fire(opening_);
+  if (open_ || menu_.item_count() == 0) return;
   popup_.show(&menu_);
   const Point o = window_origin();
   const int32_t y = direction_ == Direction::Up ? o.y - popup_.preferred_size().height : o.y + static_cast<int32_t>(bounds_.height);
   if (w->open_popup(&popup_, this, o.x, y)) open_ = true;  // after open_popup: it closes any previous popup
   invalidate();
+}
+
+void MenuButton::on_popup_closed(Control*) {
+  open_ = false;
+  invalidate();
+  fire(closed_);
 }
 
 void MenuButton::close_menu() {

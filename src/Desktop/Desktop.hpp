@@ -19,6 +19,8 @@
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
 // upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "To-Do", "Paint", "Media Player", "3D Test",
+// then the Windows and Linux applications installed on the system as "Name (Windows)" / "Name (Linux)" (InstalledApps.hpp: their Start menu
+// shortcuts and desktop entries, looked for again each time the menu opens; one starts in a new Terminal window),
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -56,6 +58,7 @@
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
+#include "Desktop/InstalledApps.hpp"
 #include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
@@ -393,6 +396,25 @@ class Desktop {
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
 
+  // --- the installed Windows and Linux applications in the Start menu
+  // One per application listed since the desktop started. An entry is never freed or reused while the desktop lives (an application that
+  // goes away only loses its menu item), so a click on it that is still queued when the menu changes finds valid memory and does nothing.
+  struct InstalledEntry {
+    InstalledEntry(allocators::IAllocator& allocator, Desktop* owner) : desktop(owner), app(allocator) {}
+    Desktop* desktop;
+    InstalledApp app;
+    gui::MenuItem* item = nullptr;   // nullptr while it is not in the menu
+  };
+  // Looks for the installed applications on a thread of its own (again once it is done, if asked while it runs).
+  void request_app_scan();
+  // Puts the last scan into the menu, if there is one and the menu is closed. Under the window lock.
+  void apply_scanned_apps();
+  static void scan_apps_work(void* self);
+  static void on_apps_scanned(void* self, gui::Control&);
+  static void on_start_opening(void* self, gui::Control&);
+  static void on_start_closed(void* self, gui::Control&);
+  static void on_installed_app(void* self, gui::Control&);   // self: the InstalledEntry
+
   // Windows beyond the first of their kind (the members below): made when asked for, destroyed from pump() once they are closed.
   template <class T>
   T* open_instance(T& first, List<UniquePointer<T>>& extras, void (Desktop::*setup)(T&), gui::TabFrame* into);
@@ -507,6 +529,13 @@ class Desktop {
   List<UniquePointer<Calendar>> extra_calendars_;
   List<UniquePointer<Todo>> extra_todos_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
+  List<UniquePointer<InstalledEntry>> installed_apps_;
+  List<InstalledEntry*> listed_apps_;        // the ones in the menu now, in menu order
+  List<InstalledApp> scanned_apps_;          // what the last scan found, until it is in the menu (only the scan thread touches it while one runs)
+  filesystem::IFileSystem* scan_fs_ = nullptr;
+  gui::MenuItem* about_item_ = nullptr;      // the installed applications go just before it,
+  gui::MenuItem* apps_separator_ = nullptr;  // after a separator of their own
+  bool scan_running_ = false, scan_again_ = false, scan_ready_ = false;
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;
   DisplayChanger changer_ = nullptr;

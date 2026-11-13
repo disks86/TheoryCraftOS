@@ -63,6 +63,7 @@
 #include "Desktop/ComputerManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/DrawingCanvas.hpp"
@@ -2323,6 +2324,91 @@ static void test_wireless_menu() {
   CHECK(a.live == 0);
 }
 
+
+// --- Installed applications in the Start menu ----------------------------------------------------------------------------------
+
+static void write_bytes(filesystem::IFileSystem& fs, const char* path, ConstByteView data) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  if (file) CHECK(file->write(0, data, &written) == filesystem::Status::Ok && written == data.size());
+}
+
+static int32_t menu_index(const gui::Menu& menu, const char* text) {
+  for (uint32_t i = 0; i < menu.item_count(); ++i)
+    if (menu.item(i)->text.view().equals(text)) return static_cast<int32_t>(i);
+  return -1;
+}
+
+// The Windows and Linux applications installed on the disk are in the Start menu as "Name (Windows)" and "Name (Linux)", after the
+// desktop's own programs and before About; the list follows the disk each time the menu opens, and choosing one opens a terminal that runs it.
+static void test_start_menu_installed_apps() {
+  namespace layout = filesystem::layout;
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem ram(a);
+    for (const char* f : layout::kFolders) ram.create_directory(f);
+    for (const char* f : layout::kWindowsFolders) ram.create_directory(f);
+    for (const char* f : layout::kLinuxFolders) ram.create_directory(f);
+    for (const char* f : {"/Windows/ProgramData/Microsoft/Windows", "/Windows/ProgramData/Microsoft/Windows/Start Menu", layout::kWindowsStartMenuPrograms,
+                          "/Windows/Program Files/Google", "/Windows/Program Files/Google/Chrome", "/Windows/Program Files/Google/Chrome/Application",
+                          layout::kLinuxApplications})
+      ram.create_directory(f);
+    uint8_t pe[0x48] = {'M', 'Z'};
+    pe[0x3C] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+    write_bytes(ram, "/Windows/Program Files/Google/Chrome/Application/chrome.exe", ConstByteView(pe, sizeof pe));
+    // A shortcut with a relative path only (ANSI): from ...\Start Menu\Programs up to C:\ and down to Chrome.
+    const char* relative = "..\\..\\..\\..\\..\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    std::vector<uint8_t> lnk(0x4C, 0);
+    const uint8_t clsid[16] = {0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
+    lnk[0] = 0x4C;
+    memcpy(&lnk[4], clsid, 16);
+    lnk[20] = 0x08;   // HasRelativePath
+    lnk.push_back(uint8_t(strlen(relative)));
+    lnk.push_back(0);
+    lnk.insert(lnk.end(), relative, relative + strlen(relative));
+    for (int i = 0; i < 4; ++i) lnk.push_back(0);
+    write_bytes(ram, "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk", ConstByteView(lnk.data(), lnk.size()));
+    uint8_t elf[64] = {0x7F, 'E', 'L', 'F', 2, 1, 1};
+    write_bytes(ram, "/Linux/usr/bin/firefox", ConstByteView(elf, sizeof elf));
+    make_file(ram, "/Linux/usr/share/applications/firefox.desktop", "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %u\n");
+
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    gui::MenuButton& start = d.start_button();
+    gui::Menu& menu = start.menu();
+    const uint32_t before = menu.item_count();
+    CHECK(menu_index(menu, "Firefox (Linux)") < 0);
+    d.set_file_system(&ram);
+    const int32_t firefox = menu_index(menu, "Firefox (Linux)"), chrome = menu_index(menu, "Google Chrome (Windows)");
+    const int32_t about = menu_index(menu, "About TheoryCraftOS..."), test3d = menu_index(menu, "3D Test");
+    CHECK(menu.item_count() == before + 3);
+    CHECK(firefox == test3d + 2 && menu.item(static_cast<uint32_t>(test3d + 1))->separator && chrome == firefox + 1 && about == chrome + 1);
+
+    // Uninstalled: gone the next time the menu opens. Nothing changes while it is open.
+    CHECK(ram.remove("/Linux/usr/share/applications/firefox.desktop") == filesystem::Status::Ok);
+    start.toggle_menu();
+    CHECK(menu_index(menu, "Firefox (Linux)") < 0 && menu_index(menu, "Google Chrome (Windows)") == test3d + 2 && menu.item_count() == before + 2);
+    start.toggle_menu();
+
+    // Choosing Chrome opens a terminal in its folder, which runs it (no program launcher here: the terminal says it cannot run it yet).
+    CHECK(!d.terminal().manager());
+    start.activate(menu.item(static_cast<uint32_t>(menu_index(menu, "Google Chrome (Windows)"))));
+    CHECK(d.terminal().manager() != nullptr);
+    CHECK(d.terminal().shell().cwd().equals("/Windows/Program Files/Google/Chrome/Application"));
+    bool ran = false;
+    for (uint32_t i = 0; i < d.terminal().view().line_count(); ++i)
+      if (d.terminal().view().line(i).find(StringView("\"/Windows/Program Files/Google/Chrome/Application/chrome.exe\"")) != StringView::npos) ran = true;
+    CHECK(ran);
+
+    // Everything uninstalled: the separator goes too.
+    CHECK(ram.remove("/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk") == filesystem::Status::Ok);
+    start.toggle_menu();
+    start.toggle_menu();
+    CHECK(menu.item_count() == before && menu_index(menu, "Google Chrome (Windows)") < 0);
+  }
+  CHECK(a.live == 0);
+}
 
 // --- The Bluetooth window ------------------------------------------------------------------------------------
 
@@ -8731,6 +8817,7 @@ static void test_web_browser_tabs() {
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
+  test_start_menu_installed_apps();
   test_video_viewer();
   test_data_grid();
   test_window_rests();

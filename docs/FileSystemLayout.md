@@ -41,6 +41,13 @@ standard `dbus-1/services` and `dbus-1/system-services` folders (`kSessionServic
 `/etc/systemd/{system,user}` or `/usr/lib/systemd/{system,user}` (`kSystemUnitsFolder`, ...). Use the `kWindows*` and `kLinux*`
 constants for the places programs are installed (`kWindowsSystem32`, `kLinuxBin`, ...).
 
+Installed applications appear in the desktop's Start menu as "Name (Windows)" or "Name (Linux)" (`src/Desktop/InstalledApps.hpp`). They are found
+the way those systems' own menus find them: Windows shortcuts (`.lnk`) under `/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs`
+(`kWindowsStartMenuPrograms`) and each user's `AppData/Roaming/Microsoft/Windows/Start Menu/Programs` (`kWindowsUserStartMenuPrograms`), and Linux
+desktop entries (`.desktop`) under `/usr/share/applications`, `/usr/local/share/applications` and root's `~/.local/share/applications`
+(`kLinuxApplications`, `kLinuxLocalApplications`, `kLinuxRootApplications`). An installer that puts its shortcut or desktop entry there is listed
+the next time the Start menu opens; only entries whose program is a PE or ELF file on the disk are shown, and uninstallers are left out.
+
 Device firmware follows the Linux convention: `/Linux/lib/firmware` (`kLinuxFirmware`), seen by Linux processes as `/lib/firmware`. The Intel NPU driver reads
 `/Linux/lib/firmware/intel/vpu/vpu_<generation>_v1.bin` (`kLinuxFirmwareIntelVpu`; the file comes from the linux-firmware package, the OS does not carry it).
 
