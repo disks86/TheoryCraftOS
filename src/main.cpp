@@ -36,6 +36,7 @@
 #include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
+#include "PipeWire/StackRtpNetwork.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "PipeWire/WindowsAudioService.hpp"
 #include "Process/WindowsFonts.hpp"
@@ -2170,7 +2171,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         g.midi_bus().set_output(nullptr);
       }
     } midi_guard{usb_midi, media_graph};
+    // The remembered stream volumes (module-stream-restore, loaded as PulseAudio's default.pa does; a file in the PipeWire folder of the AppStore).
+    pipewire::FileStreamRestore stream_restore_file(explorer_files.file_system());
     pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
+    pipewire_pulse.set_stream_restore_storage(&stream_restore_file);
+    pipewire::StackRtpNetwork rtp_network;      // (module-rtp-send and -recv over the system's network stacks)
+    pipewire_pulse.set_rtp_network(&rtp_network);
+    {
+      uint32_t restore_error = 0;
+      if (!pipewire_pulse.load_module(StringView("module-stream-restore"), StringView(), &restore_error))
+        Entry(Level::Warning, "PipeWire").text("module-stream-restore did not load: ").dec(restore_error);
+    }
     pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);
     // The cameras as video sources of the graph (a node each; a camera streams while a program watches it): updated from the loop below.
     pipewire::CameraSources camera_sources(media_graph, shared_allocator);

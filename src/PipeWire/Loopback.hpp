@@ -83,8 +83,9 @@ class EchoCancelLoop {
   EchoCancelLoop& operator=(const EchoCancelLoop&) = delete;
 
   // `mic`: the source master; `master`: the sink master (0 the speakers); `sink` and `source`: the module's virtual sink and source; `channels`
-  // of the source (1 or 2: the cancelled mono in each).
-  [[nodiscard]] bool open(uint32_t client, Loopback::From mic, uint32_t master, uint32_t sink, uint32_t source, uint32_t channels, bool passthrough);
+  // of the source (1 or 2: the cancelled mono in each). `options`: what follows the canceller; `partitions`: its filter's length in blocks.
+  [[nodiscard]] bool open(uint32_t client, Loopback::From mic, uint32_t master, uint32_t sink, uint32_t source, uint32_t channels, bool passthrough,
+                          const EchoCanceller::Options& options = EchoCanceller::Options(), uint32_t partitions = EchoCanceller::kDefaultPartitions);
   void close();
   // Moves what arrived on; returns the microphone samples that went into the source.
   uint64_t pump();

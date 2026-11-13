@@ -34,6 +34,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
@@ -251,6 +253,67 @@ ssize_t send_segment(int fd, Segment& s) {
 
 }  // namespace
 
+// The RTP modules' network on the host: real UDP sockets (non-blocking), multicast joined on any interface.
+struct HostUdpSocket final : network::IUdpSocket {
+  int fd = -1;
+  uint16_t port = 0;
+  ~HostUdpSocket() { if (fd >= 0) ::close(fd); }
+  uint16_t local_port() const override { return port; }
+  bool send_to(network::Ipv4Address address, uint16_t to, ConstByteView data) override {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(to);
+    memcpy(&a.sin_addr, address.octets, 4);
+    return fd >= 0 && ::sendto(fd, data.data(), data.size(), 0, reinterpret_cast<sockaddr*>(&a), sizeof a) == ssize_t(data.size());
+  }
+  bool receive_from(ByteView buffer, network::Ipv4Address* from, uint16_t* from_port, uint32_t* length) override {
+    if (fd < 0) return false;
+    sockaddr_in a{};
+    socklen_t n = sizeof a;
+    const ssize_t got = ::recvfrom(fd, buffer.data(), buffer.size(), MSG_DONTWAIT | MSG_TRUNC, reinterpret_cast<sockaddr*>(&a), &n);
+    if (got < 0) return false;
+    memcpy(from->octets, &a.sin_addr, 4);
+    *from_port = ntohs(a.sin_port);
+    *length = uint32_t(got);
+    return true;
+  }
+  uint32_t pending() const override { return 0; }
+  void close() override {
+    if (fd >= 0) ::close(fd);
+    fd = -1;
+  }
+};
+struct HostRtpNetwork final : IRtpNetwork {
+  std::vector<SharedPointer<HostUdpSocket>> sockets;
+  SharedPointer<network::IUdpSocket> open(uint16_t port) override {
+    SharedPointer<HostUdpSocket> s = SharedPointer<HostUdpSocket>::make(A);
+    s->fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    const int one = 1;
+    setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (s->fd < 0 || ::bind(s->fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) return SharedPointer<network::IUdpSocket>();
+    socklen_t n = sizeof a;
+    getsockname(s->fd, reinterpret_cast<sockaddr*>(&a), &n);
+    s->port = ntohs(a.sin_port);
+    sockets.push_back(s);
+    return s;
+  }
+  bool join(network::Ipv4Address group) override {
+    // (on the SAP socket and the others already open: the host joins per socket)
+    ip_mreq m{};
+    memcpy(&m.imr_multiaddr, group.octets, 4);
+    m.imr_interface.s_addr = htonl(INADDR_ANY);
+    bool any = false;
+    for (auto& s : sockets) any |= s->fd >= 0 && setsockopt(s->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) == 0;
+    return any;
+  }
+  void leave(network::Ipv4Address) override {}
+  network::Ipv4Address local_address() override { return network::Ipv4Address::make(127, 0, 0, 1); }
+};
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     fprintf(stderr, "usage: %s <native socket> <pulse socket> <out.wav> [seconds]\n", argv[0]);
@@ -285,6 +348,10 @@ int main(int argc, char** argv) {
   HostMaker maker;
   native.set_descriptor_maker(&maker);
   PulseServer pulse(graph, A);
+  HostRtpNetwork rtp_network;
+  pulse.set_rtp_network(&rtp_network);
+  // (module-stream-restore is not loaded here as the kernel loads it at start-up: it would carry one check's volumes into the next; the interop
+  // script loads it for its own check)
   const int listeners[2] = {listen_on(argv[1]), listen_on(argv[2])};
   IProtocolServer* protocols[2] = {&native, &pulse};
   std::thread mix([&] {

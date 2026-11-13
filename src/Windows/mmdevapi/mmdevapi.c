@@ -21,7 +21,8 @@
  *
  *  - CLSID_MMDeviceEnumerator (DllGetClassObject; ole32 finds this library for it) enumerates one render endpoint, the graph's sink, while the kernel
  *    has an audio device, one more render endpoint for each of the graph's virtual sinks (its null sinks: their clients play into them and their
- *    loopback clients record them; their volume is the sink's own), and one capture endpoint, the graph's source, while there is a microphone. Their
+ *    loopback clients record them; their volume is the sink's own), one capture endpoint, the graph's source, while there is a microphone, and one
+ *    more capture endpoint for each of the graph's virtual sources (module-remap-source, echo-cancel-source, ...: their clients record them). Their
  *    property stores have the names, form factor, speakers and the engine's format (32-bit float stereo at 48 kHz).
  *  - IAudioClient/2/3 in shared mode: every initialized client is a stream of the graph in the client's own format (PCM 8/16/24/32-bit or float, any
  *    rate the graph takes: the kernel converts, as AUTOCONVERTPCM would), mixed there with the native, Linux and other Windows programs' sound. The
@@ -133,10 +134,12 @@ static WCHAR *task_string(const WCHAR *s) {
 }
 static BOOL has_device(void) { return tcos_audio_devices() != 0; }
 
-/* The graph's virtual sinks (its null sinks: pw-cli create-node adapter ..., or PulseAudio's) as more render endpoints, FIRST_VIRTUAL onwards. A sink
- * keeps its slot while it is there (refresh_virtual, when the endpoints are listed or looked up); a slot whose sink went is empty (node 0). */
+/* The graph's virtual sinks (its null sinks: pw-cli create-node adapter ..., or PulseAudio's) as more render endpoints, and its virtual sources
+ * (module-remap-source, -virtual-source, echo-cancel-source, Audio/Source/Virtual adapters) as more capture endpoints, FIRST_VIRTUAL onwards. One
+ * keeps its slot while it is there (refresh_virtual, when the endpoints are listed or looked up); a slot whose node went is empty (node 0). */
 typedef struct {
   ULONG64 node;
+  BOOL capture;      /* (a virtual source) */
   WCHAR name[96];
   WCHAR id[72];
   WCHAR guid[40];
@@ -151,20 +154,34 @@ static ULONG64 virtual_node(int which) {
   ReleaseSRWLockShared(&g_virtual_lock);
   return node;
 }
+static BOOL virtual_capture(int which) {
+  if (!is_virtual(which)) return FALSE;
+  AcquireSRWLockShared(&g_virtual_lock);
+  const BOOL capture = g_virtual[which - FIRST_VIRTUAL].node && g_virtual[which - FIRST_VIRTUAL].capture;
+  ReleaseSRWLockShared(&g_virtual_lock);
+  return capture;
+}
+/* An endpoint that records: the microphone's, or a virtual source's. */
+static BOOL is_capture(int which) { return which == CAPTURE || virtual_capture(which); }
 static void hex_tail(WCHAR *out, ULONG64 v, int digits) {
   for (int k = digits - 1; k >= 0; --k, v >>= 4) out[k] = (WCHAR)("0123456789abcdef"[v & 0xF]);
 }
 static void refresh_virtual(void) {
   ULONG64 nodes[TCOS_AUDIO_MAX_VIRTUAL] = {0};
+  BOOL captures[TCOS_AUDIO_MAX_VIRTUAL] = {0};
   char names[TCOS_AUDIO_MAX_VIRTUAL][96];
   ULONG64 count = 0;
   int found = 0;
-  for (ULONG64 k = 0; k < TCOS_AUDIO_MAX_VIRTUAL; ++k) {
-    names[found][0] = 0;
-    const ULONG64 node = tcos_audio_virtual_sink(k, names[found], sizeof names[found], &count);
-    if (!node) break;
-    nodes[found++] = node;
-  }
+  /* the sinks, then the sources (the graph has at most TCOS_AUDIO_MAX_VIRTUAL of both together) */
+  for (int sources = 0; sources < 2; ++sources)
+    for (ULONG64 k = 0; k < TCOS_AUDIO_MAX_VIRTUAL && found < TCOS_AUDIO_MAX_VIRTUAL; ++k) {
+      names[found][0] = 0;
+      const ULONG64 node = sources ? tcos_audio_virtual_source(k, names[found], sizeof names[found], &count)
+                                   : tcos_audio_virtual_sink(k, names[found], sizeof names[found], &count);
+      if (!node) break;
+      captures[found] = sources;
+      nodes[found++] = node;
+    }
   AcquireSRWLockExclusive(&g_virtual_lock);
   /* (the slots of sinks that went are emptied; the sinks that came take free slots) */
   for (int slot = 0; slot < TCOS_AUDIO_MAX_VIRTUAL; ++slot) {
@@ -179,21 +196,24 @@ static void refresh_virtual(void) {
     if (slot < 0) continue;
     VirtualSink *v = &g_virtual[slot];
     v->node = nodes[f];
+    v->capture = captures[f];
     int n = 0;
     for (const char *c = names[f]; *c && n < 95; ++c) v->name[n++] = (WCHAR)(unsigned char)*c;      /* (ASCII as it comes; more is shown as it is) */
     v->name[n] = 0;
-    /* its id: the render endpoint's, with the node in the last part of the GUID */
+    /* its id: the render (capture) endpoint's, with the node in the last part of the GUID (as dsound.dll's GUIDs for them) */
     const WCHAR guid[] = L"{5af3a3c2-6e1b-4b4e-8d2f-000000000000}";
     copy(v->guid, guid, sizeof guid);
+    if (v->capture) v->guid[8] = L'3';
     hex_tail(v->guid + 25, nodes[f], 12);
     const WCHAR prefix[] = L"{0.0.0.00000000}.";
     copy(v->id, prefix, sizeof prefix - sizeof(WCHAR));
+    if (v->capture) v->id[5] = L'1';
     copy(v->id + (sizeof prefix / sizeof(WCHAR) - 1), v->guid, sizeof v->guid);
   }
   ReleaseSRWLockExclusive(&g_virtual_lock);
 }
 static BOOL has_endpoint(int which) {
-  if (is_virtual(which)) return virtual_node(which) != 0 && has_device();
+  if (is_virtual(which)) return virtual_node(which) != 0 && (virtual_capture(which) || has_device());      /* (a virtual source needs no microphone) */
   return which == CAPTURE ? tcos_audio_input_devices() != 0 : has_device();
 }
 
@@ -1207,8 +1227,8 @@ static const IChannelAudioVolumeVtbl kChannelVolumeVtbl = {cav_query, cav_add_re
 static HRESULT new_client(void **out, int which) {
   Client *c = (Client *)alloc(sizeof *c);
   if (!c) return E_OUTOFMEMORY;
-  c->capture = which == CAPTURE;
-  c->target = virtual_node(which);
+  c->capture = is_capture(which);
+  c->target = virtual_node(which);      /* (a virtual sink to play into or loop back, or a virtual source to record) */
   c->capture_client.lpVtbl = (IAudioCaptureClientVtbl *)&kCaptureClientVtbl;
   c->client.lpVtbl = (IAudioClient3Vtbl *)&kClientVtbl;
   c->render.lpVtbl = (IAudioRenderClientVtbl *)&kRenderVtbl;
@@ -1480,10 +1500,12 @@ static HRESULT activate(int which, REFIID riid, DWORD context, PROPVARIANT *para
     CreateFn create = dsound ? (CreateFn)(void *)GetProcAddress(dsound, "DirectSoundCreate8") : NULL;
     return create ? create(&kEndpointGuid, out, NULL) : E_NOINTERFACE;
   }
-  if (which == CAPTURE && same_guid(riid, &kIidDirectSoundCapture)) {      /* (IID_IDirectSoundCapture8 is the same) */
+  if (is_capture(which) && same_guid(riid, &kIidDirectSoundCapture)) {      /* (IID_IDirectSoundCapture8 is the same) */
     HMODULE dsound = LoadLibraryA("dsound.dll");
     CreateFn create = dsound ? (CreateFn)(void *)GetProcAddress(dsound, "DirectSoundCaptureCreate8") : NULL;
-    return create ? create(&kCaptureEndpointGuid, out, NULL) : E_NOINTERFACE;
+    GUID source;
+    if (which != CAPTURE) tcos_audio_virtual_source_guid(virtual_node(which), &source);      /* (a virtual source: dsound's GUID for it) */
+    return create ? create(which == CAPTURE ? &kCaptureEndpointGuid : &source, out, NULL) : E_NOINTERFACE;
   }
   return E_NOINTERFACE;
 }
@@ -1522,7 +1544,7 @@ static HRESULT WINAPI ps_get_at(IPropertyStore *i, DWORD index, PROPERTYKEY *key
 static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVARIANT *value) {
   if (!key || !value) return E_POINTER;
   const int which = property_endpoint(i);
-  const BOOL capture = which == CAPTURE;
+  const BOOL capture = is_capture(which);
   zero(value, sizeof *value);
   const WCHAR *text = NULL;
   WCHAR virtual_text[96];
@@ -1536,8 +1558,8 @@ static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVA
     virtual_text[n] = 0;
     ReleaseSRWLockShared(&g_virtual_lock);
     if (same_key(key, &PKEY_Device_FriendlyName) || same_key(key, &PKEY_AudioEndpoint_GUID)) text = virtual_text;
-    else if (same_key(key, &PKEY_Device_DeviceDesc)) text = L"Virtual sink";
-    else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = L"PipeWire null sink";
+    else if (same_key(key, &PKEY_Device_DeviceDesc)) text = capture ? L"Virtual source" : L"Virtual sink";
+    else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = capture ? L"PipeWire virtual source" : L"PipeWire null sink";
   } else if (same_key(key, &PKEY_Device_FriendlyName)) text = capture ? kCaptureFriendlyName : kFriendlyName;
   else if (same_key(key, &PKEY_Device_DeviceDesc)) text = capture ? kCaptureDescription : kDeviceDescription;
   else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = kInterfaceName;
@@ -1630,7 +1652,7 @@ static ULONG WINAPI ep_add_ref(IMMEndpoint *i) { (void)i; return 2; }
 static ULONG WINAPI ep_release(IMMEndpoint *i) { (void)i; return 1; }
 static HRESULT WINAPI ep_get_data_flow(IMMEndpoint *i, EDataFlow *flow) {
   if (!flow) return E_POINTER;
-  *flow = endpoint_of(i) == CAPTURE ? eCapture : eRender;
+  *flow = is_capture(endpoint_of(i)) ? eCapture : eRender;
   return S_OK;
 }
 static const IMMEndpointVtbl kEndpointVtbl = {ep_query, ep_add_ref, ep_release, ep_get_data_flow};
@@ -1694,12 +1716,12 @@ static HRESULT WINAPI en_enum(IMMDeviceEnumerator *i, EDataFlow flow, DWORD mask
   c->iface.lpVtbl = (IMMDeviceCollectionVtbl *)&kCollectionVtbl;
   c->refs = 1;
   refresh_virtual();
-  /* the speakers, the virtual sinks (render endpoints too), the microphone */
+  /* the speakers, the virtual sinks and sources (render and capture endpoints), the microphone */
   static const int kOrder[] = {RENDER, -1, CAPTURE};
   for (int o = 0; o < 3; ++o) {
     const int first = kOrder[o] >= 0 ? kOrder[o] : FIRST_VIRTUAL, last = kOrder[o] >= 0 ? kOrder[o] : ENDPOINTS - 1;
     for (int which = first; which <= last; ++which) {
-      if (flow != eAll && flow != (which == CAPTURE ? eCapture : eRender)) continue;
+      if (flow != eAll && flow != (is_capture(which) ? eCapture : eRender)) continue;
       if (is_virtual(which) && !virtual_node(which)) continue;      /* (an empty slot) */
       const DWORD state = has_endpoint(which) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
       if ((mask & state) && c->count < ENDPOINTS) c->items[c->count++] = which;
@@ -1746,7 +1768,7 @@ static void notify_device_change(int which, BOOL present) {
   const int n = listeners_copy(&g_notification_clients, items);
   WCHAR buffer[72];
   const WCHAR *id = endpoint_id_into(which, buffer);
-  const EDataFlow flow = which == CAPTURE ? eCapture : eRender;
+  const EDataFlow flow = is_capture(which) ? eCapture : eRender;
   for (int k = 0; k < n; ++k) {
     IMMNotificationClient *c = (IMMNotificationClient *)items[k];
     IMMNotificationClient_OnDeviceStateChanged(c, id, present ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED);

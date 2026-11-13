@@ -24,10 +24,11 @@
 __declspec(dllimport) LONG NTAPI NtTcosAudio(ULONG64 *arguments);
 
 enum { TCOS_AUDIO_OPEN = 1, TCOS_AUDIO_CLOSE, TCOS_AUDIO_WRITE, TCOS_AUDIO_STATUS, TCOS_AUDIO_FLUSH, TCOS_AUDIO_PAUSE, TCOS_AUDIO_SET_VOLUME,
-       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE, TCOS_AUDIO_OPEN_CAPTURE, TCOS_AUDIO_READ, TCOS_AUDIO_VIRTUAL_SINKS };
+       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE, TCOS_AUDIO_OPEN_CAPTURE, TCOS_AUDIO_READ, TCOS_AUDIO_VIRTUAL_SINKS,
+       TCOS_AUDIO_VIRTUAL_SOURCES };
 #define TCOS_AUDIO_SOURCE_STREAM 0xFFFFFFFFull      /* (the volume calls' stream number for the microphone's master gain; 0 is the master volume) */
-#define TCOS_AUDIO_VIRTUAL_STREAM 0x80000000ull     /* (| a virtual sink's node: the volume calls' stream number for its master volume) */
-#define TCOS_AUDIO_MAX_VIRTUAL 16                   /* (virtual sinks the graph has at most) */
+#define TCOS_AUDIO_VIRTUAL_STREAM 0x80000000ull     /* (| a virtual sink's or source's node: the volume calls' stream number for its volume) */
+#define TCOS_AUDIO_MAX_VIRTUAL 16                   /* (virtual sinks and sources the graph has at most, together) */
 #define TCOS_STATUS_INVALID_PARAMETER ((LONG)0xC000000D)
 
 /* One call: [0] operation, [1] stream, [2..6] parameters; *out5, *out6, *out7 (each may be NULL) get what the kernel wrote back. */
@@ -121,6 +122,15 @@ static inline ULONG64 tcos_audio_virtual_sink(ULONG64 which, char *text, int siz
   return node;
 }
 
+/* The virtual source number `which` (0, 1, ...), as tcos_audio_virtual_sink: module-remap-source's, -virtual-source's, echo-cancel-source, ... */
+static inline ULONG64 tcos_audio_virtual_source(ULONG64 which, char *text, int size, ULONG64 *count) {
+  ULONG64 node = 0, n = 0, length = 0;
+  if (audio_call(TCOS_AUDIO_VIRTUAL_SOURCES, 0, which, (ULONG64)(ULONG_PTR)text, size > 1 ? (ULONG64)(size - 1) : 0, 0, 0, &node, &n, &length) != 0) node = n = length = 0;
+  if (text && size > 0) text[length < (ULONG64)size ? length : (ULONG64)size - 1] = 0;
+  if (count) *count = n;
+  return node;
+}
+
 /* A virtual sink's device GUID (DirectSound's, and the last part of its WASAPI endpoint id): the speakers' {5af3a3c2-6e1b-4b4e-8d2f-...} with the
  * sink's node in its last six bytes. tcos_audio_virtual_node gives the node back (0 when the GUID is not one of these). */
 static inline void tcos_audio_virtual_guid(ULONG64 node, GUID *out) {
@@ -142,8 +152,28 @@ static inline ULONG64 tcos_audio_virtual_node(const GUID *g) {
   return 0;
 }
 
+/* A virtual source's capture device GUID: the microphone's {5af3a3c3-6e1b-4b4e-8d2f-...} with the source's node in its last six bytes; and back
+ * (0 when the GUID is not one of the virtual sources there are now). */
+static inline void tcos_audio_virtual_source_guid(ULONG64 node, GUID *out) {
+  tcos_audio_virtual_guid(node, out);
+  out->Data1 = 0x5AF3A3C3;
+}
+static inline ULONG64 tcos_audio_virtual_source_node(const GUID *g) {
+  if (!g || g->Data1 != 0x5AF3A3C3 || g->Data2 != 0x6E1B || g->Data3 != 0x4B4E || g->Data4[0] != 0x8D || g->Data4[1] != 0x2F) return 0;
+  ULONG64 node = 0;
+  for (int k = 0; k < 6; ++k) node = node << 8 | g->Data4[2 + k];
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    ULONG64 count = 0;
+    const ULONG64 n = tcos_audio_virtual_source(i, NULL, 0, &count);
+    if (!n) break;
+    if (n == node) return node;
+  }
+  return 0;
+}
+
 /* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream of the microphone or (`monitor`)
- * of what the mixer plays; with `target` (a virtual sink's node), into that sink or (capture) of its monitor. 0 when it cannot be opened. */
+ * of what the mixer plays; with `target` (a virtual sink's node), into that sink or (capture) of its monitor, or (capture) a virtual source's node:
+ * of that source. 0 when it cannot be opened. */
 static inline ULONG64 tcos_audio_open_to(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, ULONG64 target, LONG *status) {
   char name[128];
   program_name(name, sizeof name);

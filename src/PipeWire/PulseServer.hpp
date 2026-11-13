@@ -46,6 +46,8 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/Loopback.hpp"
 #include "PipeWire/ProtocolServer.hpp"
+#include "PipeWire/Rtp.hpp"
+#include "PipeWire/StreamRestore.hpp"
 #include "PipeWire/Tagstruct.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -106,6 +108,7 @@ class PulseServer final : public IProtocolServer {
     bool authorized = false;
     bool closing = false;
     uint32_t subscriptions = 0;
+    bool restore_events = false;      // (module-stream-restore's SUBSCRIBE)
     uint32_t next_channel = 0;
     ByteBuffer inbox;
     ByteBuffer outbox;
@@ -168,6 +171,11 @@ class PulseServer final : public IProtocolServer {
  public:
   static constexpr uint32_t kModuleFlag = 1u << 29;      // (module indexes, as pipewire-pulse numbers them)
   static constexpr uint32_t kMaxModules = 16;
+  // Where module-stream-restore keeps its entries (null: only while it is loaded). Set before it is loaded.
+  void set_stream_restore_storage(IStreamRestoreStorage* storage) { restore_storage_ = storage; }
+  // The network module-rtp-send and -recv use (null: they are refused). Set before they are loaded.
+  void set_rtp_network(IRtpNetwork* network) { rtp_network_ = network; }
+  StreamRestore* stream_restore() { return restore_.get(); }
   // What LOAD_MODULE does: the module's index, or 0 with *error a PulseAudio error.
   uint32_t load_module(StringView name, StringView arguments, uint32_t* error);
   bool unload_module(uint32_t index);
@@ -185,6 +193,8 @@ class PulseServer final : public IProtocolServer {
     String name, arguments;
     List<UniquePointer<Loopback>> loops;      // (module-loopback: one; -remap-sink: into its master; -combine-sink: one a slave; -*-source: from its master)
     UniquePointer<EchoCancelLoop> echo;       // (module-echo-cancel)
+    UniquePointer<RtpSender> rtp_send;        // (module-rtp-send)
+    UniquePointer<RtpReceiver> rtp_recv;      // (module-rtp-recv)
   };
   // A virtual sink (`source`: source) of a module's arguments, the kernel's.
   uint32_t module_node(const Properties& args, bool source, const char* default_name, uint32_t* error);
@@ -193,6 +203,14 @@ class PulseServer final : public IProtocolServer {
   void fill_module(pulse::TagWriter& w, uint32_t version, const Module& m);
   List<UniquePointer<Module>> modules_;
   uint32_t next_module_ = 0;
+  // module-stream-restore (while it is loaded): the remembered volumes, its module index, and its extension
+  IStreamRestoreStorage* restore_storage_ = nullptr;
+  IRtpNetwork* rtp_network_ = nullptr;
+  uint32_t rtp_seed_ = 0x9E3779B9u;
+  UniquePointer<StreamRestore> restore_;
+  uint32_t restore_module_ = 0;
+  void extension(Client& c, uint32_t tag, pulse::TagReader& t);
+  void send_restore_events();
 };
 
 // PulseAudio's volumes are cubic: (volume / PA_VOLUME_NORM)^3 is the linear factor PipeWire and the mixer use.

@@ -1530,6 +1530,10 @@ EXPORT HRESULT WINAPI GetDeviceID(LPCGUID source, LPGUID dest) {
     *dest = *source;
     return DS_OK;
   }
+  if (tcos_audio_virtual_source_node(source)) {      /* (a virtual source's GUID too) */
+    *dest = *source;
+    return DS_OK;
+  }
   if (capture_guid(source) && !same_guid(source, &kGuidNull)) {
     if (!tcos_audio_input_devices()) return DSERR_NODRIVER;
     *dest = kCaptureGuid;

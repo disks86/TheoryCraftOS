@@ -531,6 +531,14 @@ int main(int argc, char** argv) {
   } midi_synth;
   graph.midi_bus().set_output(&midi_synth);
   pipewire::PulseServer pw_pulse(graph, a);
+  // TCOS_EMU_NULL_SOURCE: a virtual source ("emu-vsrc", "Emulated virtual source"): module-remap-source of the microphone with its sides swapped (so
+  // it is told from the microphone: 1320 Hz on the left, 880 Hz on the right)
+  if (getenv("TCOS_EMU_NULL_SOURCE")) {
+    uint32_t error = 0;
+    if (!pw_pulse.load_module(StringView("module-remap-source"),
+                              StringView("source_name=emu-vsrc source_properties='device.description=\"Emulated virtual source\"' channel_map=front-right,front-left"), &error))
+      fprintf(stderr, "emurun: no virtual source could be made (%u)\n", error);
+  }
   pipewire::WindowsAudioService windows_audio(graph, a);
   pipewire::install_windows_audio(windows_audio);
   pipewire::SocketServer pw_sockets(*process::system_unix_sockets(), a);

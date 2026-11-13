@@ -206,6 +206,8 @@ class Graph {
   uint32_t create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate);
   // The clock virtual sinks play on (nanoseconds, monotonic); without one, no virtual sink can be made.
   void set_clock(uint64_t (*now_ns)()) { clock_.set(now_ns); }
+  // The graph's clock now (nanoseconds; 0 without one).
+  uint64_t now_ns() const { return clock_.now_us() * 1000; }
   // Where watchers of encoded video get decoders for codecs other than Motion JPEG (the machine's video codecs); without, only Motion JPEG is
   // decoded. Set once, before the protocol servers run.
   void set_video_codecs(IVideoCodecs* decoders) { __atomic_store_n(&decoders_, decoders, __ATOMIC_RELEASE); }

@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <array>
+#include <deque>
+#include <set>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -2785,9 +2787,14 @@ static void test_source_modules() {
 }
 
 // module-echo-cancel: a far end played into echo-cancel-sink reaches the speakers, and the microphone hears it back (half as loud, a little late, as
-// a room would); what the echo-cancel source gives has that echo taken out. With aec_method=null it is the microphone as it is.
+// a room would); what the echo-cancel source gives has that echo taken out. With aec_method=null it is the microphone as it is. Three ways: nlms (the
+// filter alone), null, and webrtc's defaults with aec_args (noise suppression off: the test's talker is a steady tone, which it would take for noise;
+// the high pass, residual echo suppression and the extended filter on).
 static void test_echo_cancel_module() {
-  for (int null_method = 0; null_method < 2; ++null_method) {
+  static const char* const kArgs[] = {"aec_method=nlms channels=1", "aec_method=null channels=1",
+                                      "channels=1 aec_args='webrtc.noise_suppression=false high_pass_filter=1 extended_filter=true'"};
+  for (int method = 0; method < 3; ++method) {
+    const bool null_method = method == 1;
     FakeDevice dev;
     audio::AudioMixer mixer(dev, A);
     CHECK(mixer.initialize());
@@ -2800,7 +2807,7 @@ static void test_echo_cancel_module() {
     PulseServer server(g, A);
     WindowsAudioService service(g, A);
     uint32_t error = 0;
-    const uint32_t module = server.load_module(StringView("module-echo-cancel"), StringView(null_method ? "aec_method=null channels=1" : "channels=1"), &error);
+    const uint32_t module = server.load_module(StringView("module-echo-cancel"), StringView(kArgs[method]), &error);
     CHECK(module != 0 && error == 0);
     const uint32_t sink = g.find_node("echo-cancel-sink"), source = g.find_node("echo-cancel-source");
     CHECK(g.is_virtual_sink(sink) && g.is_virtual_source(source) && server.module_of(sink) == module && server.module_of(source) == module);
@@ -2860,7 +2867,7 @@ static void test_echo_cancel_module() {
       }
     }
     const double erle = 10.0 * std::log10(mic_energy / (out_energy > 1 ? out_energy : 1));
-    printf("echo-cancel (%s): speakers %.3g, microphone %.3g (%llu samples), source %.3g (%llu): %.1f dB taken out\n", null_method ? "null" : "nlms",
+    printf("echo-cancel (%s): speakers %.3g, microphone %.3g (%llu samples), source %.3g (%llu): %.1f dB taken out\n", kArgs[method],
            speaker_energy, mic_energy, (unsigned long long)mic_samples, out_energy, (unsigned long long)out_samples, erle);
     printf("   with a near-end talker: voice %.3g, source %.3g\n", talk_energy, talk_out_energy);
     CHECK(speaker_energy > 1e9);      // (the far end reached the speakers)
@@ -2869,8 +2876,9 @@ static void test_echo_cancel_module() {
     } else {
       CHECK(erle > 10.0);
       CHECK(out_samples > mic_samples * 9 / 10);      // (the source carried audio all along, not silence)
-      // the talker comes through whole while the far end goes on: about the voice's energy, not much of the echo's on top
-      CHECK(talk_out_energy > 0.6 * talk_energy && talk_out_energy < 0.6 * talk_energy + 0.5 * mic_energy + 0.4 * talk_energy);
+      // the talker comes through (whole with the filter alone; the suppressor may take a little of it with the echo while the far end goes on)
+      const double least = method == 0 ? 0.6 : 0.4;
+      CHECK(talk_out_energy > least * talk_energy && talk_out_energy < talk_energy + 0.5 * mic_energy);
     }
     service.process_exited(42);
     g.destroy_node(rn);
@@ -2887,6 +2895,8 @@ static void test_echo_cancel_module() {
     PulseServer server(g, A);
     uint32_t error = 0;
     CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("aec_method=speex"), &error) && error == 19);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("aec_args='noise_suppression=maybe'"), &error) && error == 3);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("aec_args='noise_suppression=1"), &error) && error == 3);      // (quote not closed)
     CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("sink_master=nowhere"), &error) && error == 5);
     CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("source_master=nowhere"), &error) && error == 5);
     List<uint32_t> virtuals(A);
@@ -2895,6 +2905,535 @@ static void test_echo_cancel_module() {
     const uint32_t m = server.load_module(StringView("module-echo-cancel"), StringView(""), &error);
     CHECK(m != 0);
   }
+}
+
+// module-stream-restore: a stream's volume changed is remembered under PulseAudio's key and given to the next stream of that key, also after a
+// "reboot" (the entries from the storage); written a second after the last change; the file's format survives truncation and bit flips; the
+// extension (TEST, READ, WRITE in its three modes, DELETE, SUBSCRIBE and its EVENT) over the protocol.
+struct MemoryRestore final : IStreamRestoreStorage {
+  std::vector<uint8_t> bytes;
+  int saves = 0;
+  bool load(ByteBuffer& out) override {
+    if (bytes.empty()) return false;
+    out.clear();
+    return out.append(ConstByteView(bytes.data(), bytes.size()));
+  }
+  bool save(ConstByteView b) override {
+    bytes.assign(b.data(), b.data() + b.size());
+    ++saves;
+    return true;
+  }
+};
+
+static void test_stream_restore() {
+  // ---- keys
+  {
+    Properties p(A);
+    String key(A);
+    p.set("application.name", "Firefox");
+    CHECK(StreamRestore::key_of(p, false, &key) && key.view() == StringView("sink-input-by-application-name:Firefox"));
+    p.set("application.id", "org.mozilla.firefox");
+    CHECK(StreamRestore::key_of(p, true, &key) && key.view() == StringView("source-output-by-application-id:org.mozilla.firefox"));
+    p.set("media.role", "Music");
+    CHECK(StreamRestore::key_of(p, false, &key) && key.view() == StringView("sink-input-by-media-role:music"));
+    p.set("media.role", "Communication");
+    CHECK(StreamRestore::key_of(p, false, &key) && key.view() == StringView("sink-input-by-media-role:phone"));
+    Properties none(A);
+    CHECK(!StreamRestore::key_of(none, false, &key));
+    none.set("media.name", "Playback");
+    CHECK(StreamRestore::key_of(none, false, &key) && key.view() == StringView("sink-input-by-media-name:Playback"));
+  }
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  MemoryRestore storage;
+  const uint32_t client = g.add_client(Origin::Linux, 70, "protocol-pulse", "pipewire-pulse");
+  auto open_stream = [&](const char* app, uint32_t channels) {
+    Properties p(A);
+    p.set("application.name", app);
+    SharedPointer<PlaybackStream> s;
+    return g.create_playback(client, PcmFormat{SampleFormat::S16Le, 48000, channels}, p, &s);
+  };
+  {
+    PulseServer server(g, A);
+    server.set_stream_restore_storage(&storage);
+    uint32_t error = 0;
+    const uint32_t module = server.load_module(StringView("module-stream-restore"), StringView("restore_device=false"), &error);
+    CHECK(module && server.stream_restore());
+    CHECK(!server.load_module(StringView("module-stream-restore"), StringView(), &error) && error == 4);      // (once)
+    CHECK(!server.load_module(StringView("module-stream-restore"), StringView("bogus=1"), &error));
+    // a player's volume changed: remembered (and saved a second later, not before)
+    const uint32_t a = open_stream("player", 2);
+    server.tick();
+    CHECK(g.set_balance(a, 0.5f, 0.25f, false));
+    server.tick();
+    StreamRestore& r = *server.stream_restore();
+    const RestoreEntry* e = r.find("sink-input-by-application-name:player");
+    CHECK(e && e->channels == 2 && !e->mute && e->volumes[0] > e->volumes[1] && e->positions[0] == 1 && e->positions[1] == 2);
+    CHECK(storage.saves == 0);
+    g_now_ns += 1200000000ull;
+    server.tick();
+    CHECK(storage.saves == 1 && !storage.bytes.empty());
+    // the next stream of that application starts so; another application's does not
+    const uint32_t b = open_stream("player", 2), other = open_stream("other", 2);
+    server.tick();
+    float l = 0, rr = 0, v = 0;
+    bool mute = true;
+    CHECK(g.get_balance(b, &l, &rr, &mute) && l > 0.49f && l < 0.51f && rr > 0.24f && rr < 0.26f && !mute);
+    CHECK(g.get_volume(other, &v, &mute) && v > 0.99f);
+    // muting is remembered too; a mono stream's volume as one channel
+    CHECK(g.set_volume(other, 0.3f, true));
+    const uint32_t mono = open_stream("mono-app", 1);
+    server.tick();
+    CHECK(g.set_volume(mono, 0.6f, false));
+    server.tick();
+    e = r.find("sink-input-by-application-name:other");
+    CHECK(e && e->mute);
+    e = r.find("sink-input-by-application-name:mono-app");
+    CHECK(e && e->channels == 1 && e->positions[0] == 0);
+    // the module's own streams are not remembered
+    CHECK(server.load_module(StringView("module-null-sink"), StringView("sink_name=x"), &error) &&
+          server.load_module(StringView("module-loopback"), StringView("source=x.monitor"), &error));
+    server.tick();
+    g.for_each([&](const GraphObject& o) {
+      if (o.type == ObjectType::Node && o.props.get("application.name") == StringView("Loopback")) CHECK(o.props.get("state.restore") == StringView("false"));
+    });
+    CHECK(!r.find("sink-input-by-application-name:Loopback") && !r.find("source-output-by-application-name:Loopback"));
+    // ---- the extension over the protocol
+    PulseClient c(server);
+    uint8_t cookie[256] = {};
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99;
+    uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    auto ext = [&](uint32_t sub, auto&& more) {
+      return c.command(87, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("module-stream-restore"); w.u32(sub); more(w); });
+    };
+    t = ext(0, [](pulse::TagWriter&) {});      // TEST
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t version = 0;
+      CHECK(rd.u32(&version) && version == 1 && rd.at_end());
+    }
+    // by its module index too; another extension is not there
+    t = c.command(87, [&](pulse::TagWriter& w) { w.u32(module); w.string_null(); w.u32(0); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(87, [&](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("module-device-manager"); w.u32(0); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    t = ext(4, [](pulse::TagWriter& w) { w.boolean(true); });      // SUBSCRIBE
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    // READ: the three entries, the player's with its volumes
+    auto read_all = [&](std::map<std::string, std::pair<uint32_t, bool>>* out) {
+      out->clear();
+      const uint32_t rt = ext(1, [](pulse::TagWriter&) {});
+      std::vector<uint8_t> rb;
+      uint32_t rc = 99;
+      if (!find_reply(c.take(), rt, &rb, &rc) || rc != 2) return false;
+      pulse::TagReader rd(ConstByteView(rb.data(), rb.size()));
+      while (!rd.at_end()) {
+        StringView name, device; bool null_device = false, m = false; pulse::ChannelMap map; pulse::Cvolume vol;
+        if (!rd.string(&name) || !rd.channel_map(&map) || !rd.cvolume(&vol) || !rd.string(&device, &null_device) || !rd.boolean(&m)) return false;
+        (*out)[std::string(name.data(), name.size())] = {vol.channels ? vol.values[0] : 0, m};
+      }
+      return true;
+    };
+    std::map<std::string, std::pair<uint32_t, bool>> listed;
+    CHECK(read_all(&listed) && listed.size() == 3 && listed.count("sink-input-by-application-name:player"));
+    // WRITE merge with apply: the stream of that key there now gets it; an EVENT goes to the subscriber
+    t = ext(2, [](pulse::TagWriter& w) {
+      w.u32(1); w.boolean(true);
+      w.string("sink-input-by-application-name:player");
+      pulse::ChannelMap map; map.channels = 2; map.positions[0] = 1; map.positions[1] = 2; w.channel_map(map);
+      pulse::Cvolume vol; vol.channels = 2; vol.values[0] = vol.values[1] = 0x8000; w.cvolume(vol);
+      w.string_null(); w.boolean(false);
+      w.string("sink-input-by-media-role:game");
+      pulse::ChannelMap none; w.channel_map(none);
+      pulse::Cvolume novol; w.cvolume(novol);
+      w.string("tcos_output.stereo"); w.boolean(true);
+    });
+    std::vector<PulsePacket> packets = c.take();
+    CHECK(find_reply(packets, t, &body, &cmd) && cmd == 2);
+    bool event = false;
+    for (const PulsePacket& pk : packets) {
+      pulse::TagReader rd(ConstByteView(pk.payload.data(), pk.payload.size()));
+      uint32_t command = 0, tg = 0, idx = 0, sub = 0; StringView nm;
+      if (rd.u32(&command) && command == 87 && rd.u32(&tg) && tg == 0xFFFFFFFFu && rd.u32(&idx) && rd.string(&nm) && rd.u32(&sub))
+        event |= idx == module && nm == StringView("module-stream-restore") && sub == 5;
+    }
+    CHECK(event);
+    CHECK(g.get_balance(b, &l, &rr, &mute) && l > 0.11f && l < 0.14f && rr > 0.11f && rr < 0.14f);      // (0x8000: half the cubic volume, an eighth)
+    CHECK(read_all(&listed) && listed.size() == 4 && listed["sink-input-by-media-role:game"].second && listed["sink-input-by-application-name:player"].first == 0x8000);
+    const RestoreEntry* game = r.find("sink-input-by-media-role:game");
+    CHECK(game && game->device.view() == StringView("tcos_output.stereo") && game->channels == 0);
+    // a stream given that volume by the extension is not then taken as changed by itself
+    server.tick();
+    CHECK(r.find("sink-input-by-application-name:player")->volumes[0] == 0x8000);
+    // WRITE replace: only the ones there; DELETE; WRITE set: exactly these
+    t = ext(2, [](pulse::TagWriter& w) {
+      w.u32(2); w.boolean(false);
+      w.string("sink-input-by-application-name:nobody");
+      pulse::ChannelMap none; w.channel_map(none); pulse::Cvolume novol; w.cvolume(novol); w.string_null(); w.boolean(true);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && !r.find("sink-input-by-application-name:nobody"));
+    t = ext(3, [](pulse::TagWriter& w) { w.string("sink-input-by-media-role:game"); w.string("sink-input-by-application-name:other"); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && !r.find("sink-input-by-media-role:game") && !r.find("sink-input-by-application-name:other"));
+    t = ext(2, [](pulse::TagWriter& w) {
+      w.u32(0); w.boolean(false);
+      w.string("source-output-by-application-name:recorder");
+      pulse::ChannelMap map; map.channels = 1; w.channel_map(map); pulse::Cvolume vol; vol.channels = 1; vol.values[0] = 0x10000; w.cvolume(vol);
+      w.string_null(); w.boolean(false);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2 && r.entries().count() == 1 && r.find("source-output-by-application-name:recorder"));
+    // refused: a bad mode, a map that does not fit its volume, an empty name, a cut-off entry
+    t = ext(2, [](pulse::TagWriter& w) { w.u32(7); w.boolean(false); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    t = ext(2, [](pulse::TagWriter& w) {
+      w.u32(1); w.boolean(false); w.string("sink-input-by-application-name:x");
+      pulse::ChannelMap map; map.channels = 1; w.channel_map(map); pulse::Cvolume vol; vol.channels = 2; w.cvolume(vol); w.string_null(); w.boolean(false);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    t = ext(2, [](pulse::TagWriter& w) {
+      w.u32(1); w.boolean(false); w.string("");
+      pulse::ChannelMap none; w.channel_map(none); pulse::Cvolume novol; w.cvolume(novol); w.string_null(); w.boolean(false);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    t = ext(2, [](pulse::TagWriter& w) { w.u32(1); w.boolean(false); w.string("sink-input-by-application-name:cut"); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    CHECK(r.entries().count() == 1);
+    // unloaded: written at once; the extension goes with it
+    CHECK(server.unload_module(module) && !server.stream_restore());
+    t = ext(0, [](pulse::TagWriter&) {});
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    server.close_client(c.handle);
+  }
+  // ---- "after a reboot": a new server, the entries from the storage
+  {
+    PulseServer server(g, A);
+    server.set_stream_restore_storage(&storage);
+    uint32_t error = 0;
+    CHECK(server.load_module(StringView("module-stream-restore"), StringView(), &error));
+    CHECK(server.stream_restore() && server.stream_restore()->entries().count() == 1 && server.stream_restore()->find("source-output-by-application-name:recorder"));
+    // a player's volume changed, then its server goes before a second passed: written on the way out
+    const uint32_t s = open_stream("late", 2);
+    server.tick();
+    CHECK(g.set_volume(s, 0.4f, false));
+    server.tick();
+  }
+  {
+    StreamRestore r(g, A, &storage);
+    r.load();
+    CHECK(r.find("sink-input-by-application-name:late") && r.entries().count() == 2);
+  }
+  // ---- the file: round trip, truncation at every length, bit flips
+  {
+    StreamRestore r(g, A, nullptr);
+    CHECK(r.deserialise(ConstByteView(storage.bytes.data(), storage.bytes.size())) && r.entries().count() == 2);
+    ByteBuffer again(A);
+    CHECK(r.serialise(again) && again.size() == storage.bytes.size() && memcmp(again.view().data(), storage.bytes.data(), again.size()) == 0);
+    for (size_t n = 0; n < storage.bytes.size(); ++n) {
+      StreamRestore cut(g, A, nullptr);
+      CHECK(!cut.deserialise(ConstByteView(storage.bytes.data(), n)) && cut.entries().count() == 0);
+    }
+    std::vector<uint8_t> longer = storage.bytes;
+    longer.push_back(0);
+    CHECK(!r.deserialise(ConstByteView(longer.data(), longer.size())) && r.entries().count() == 2);      // (trailing bytes: refused, nothing changed)
+    std::mt19937 rng(5);
+    int accepted = 0;
+    for (int k = 0; k < 4000; ++k) {
+      std::vector<uint8_t> flipped = storage.bytes;
+      flipped[rng() % flipped.size()] ^= uint8_t(1u << (rng() % 8));
+      StreamRestore f(g, A, nullptr);
+      if (f.deserialise(ConstByteView(flipped.data(), flipped.size()))) {
+        ++accepted;
+        ByteBuffer out(A);
+        CHECK(f.serialise(out) && out.size() == flipped.size());      // (what is taken is whole: it writes back the same size)
+      }
+    }
+    printf("stream restore: %d of 4000 bit-flipped files taken (the flips in volumes and names)\n", accepted);
+    // a storage with a broken file: taken as empty
+    MemoryRestore broken;
+    broken.bytes = {'T', 'C', 'S', 'R', 9, 0, 0, 0};
+    StreamRestore b(g, A, &broken);
+    b.load();
+    CHECK(b.entries().count() == 0);
+  }
+}
+
+// RTP, SAP and SDP (src/PipeWire/Rtp.hpp): packets, announcements and descriptions both ways, cut short and bit-flipped; module-rtp-send and
+// module-rtp-recv over an in-memory network (a tone played into one null sink comes out of another's monitor, lost packets made silence, a sender
+// that goes withdrawn).
+struct FakeNetwork final : IRtpNetwork {
+  struct Datagram {
+    network::Ipv4Address from;
+    uint16_t from_port;
+    std::vector<uint8_t> data;
+  };
+  struct Socket final : network::IUdpSocket {
+    FakeNetwork* net;
+    uint16_t port;
+    std::deque<Datagram> queue;
+    bool closed = false;
+    uint16_t local_port() const override { return port; }
+    bool send_to(network::Ipv4Address address, uint16_t to, ConstByteView data) override { return net->deliver(port, address, to, data); }
+    bool receive_from(ByteView buffer, network::Ipv4Address* from, uint16_t* from_port, uint32_t* length) override {
+      if (queue.empty()) return false;
+      Datagram d = std::move(queue.front());
+      queue.pop_front();
+      const size_t n = d.data.size() < buffer.size() ? d.data.size() : buffer.size();
+      if (n) memcpy(buffer.data(), d.data.data(), n);
+      *from = d.from;
+      *from_port = d.from_port;
+      *length = uint32_t(d.data.size());
+      return true;
+    }
+    uint32_t pending() const override { return uint32_t(queue.size()); }
+    void close() override { closed = true; }
+  };
+  std::vector<SharedPointer<Socket>> sockets;
+  std::set<uint32_t> groups;
+  uint16_t next_port = 50000;
+  uint32_t sent = 0, dropped = 0, drop_every = 0, rtp_seen = 0;
+  bool deliver(uint16_t from_port, network::Ipv4Address to, uint16_t port, ConstByteView data) {
+    ++sent;
+    // (every drop_every-th RTP packet lost: not the announcements)
+    if (port != rtp::kSapPort && drop_every && ++rtp_seen % drop_every == 0) { ++dropped; return true; }
+    if (to.is_multicast() && !groups.count(to.value())) return true;      // (nobody joined: it goes nowhere)
+    for (SharedPointer<Socket>& s : sockets)
+      if (!s->closed && s->port == port) s->queue.push_back(Datagram{network::Ipv4Address::make(10, 0, 0, 5), from_port, std::vector<uint8_t>(data.data(), data.data() + data.size())});
+    return true;
+  }
+  SharedPointer<network::IUdpSocket> open(uint16_t port) override {
+    for (SharedPointer<Socket>& s : sockets)
+      if (!s->closed && port && s->port == port) return SharedPointer<network::IUdpSocket>();      // (in use)
+    SharedPointer<Socket> s = SharedPointer<Socket>::make(A);
+    s->net = this;
+    s->port = port ? port : next_port++;
+    sockets.push_back(s);
+    return s;
+  }
+  bool join(network::Ipv4Address group) override { groups.insert(group.value()); return true; }
+  void leave(network::Ipv4Address group) override { groups.erase(group.value()); }
+  network::Ipv4Address local_address() override { return network::Ipv4Address::make(10, 0, 0, 5); }
+};
+
+static void test_rtp_codings() {
+  // ---- RTP packets
+  {
+    rtp::Header h;
+    h.payload_type = 127; h.sequence = 0xFFFE; h.timestamp = 0x12345678; h.ssrc = 0xCAFEBABE; h.marker = true;
+    uint8_t packet[12 + 4] = {};
+    CHECK(rtp::write_header(h, ByteView(packet, 12)));
+    packet[12] = 1; packet[13] = 2; packet[14] = 3; packet[15] = 4;
+    rtp::Header back;
+    ConstByteView payload;
+    CHECK(rtp::parse_packet(ConstByteView(packet, 16), &back, &payload) && back.payload_type == 127 && back.sequence == 0xFFFE && back.timestamp == 0x12345678 &&
+          back.ssrc == 0xCAFEBABE && back.marker && payload.size() == 4 && payload[0] == 1);
+    CHECK(!rtp::write_header(h, ByteView(packet, 11)));
+    for (size_t n = 0; n < 12; ++n) CHECK(!rtp::parse_packet(ConstByteView(packet, n), &back, &payload));
+    // contributing sources, an extension and padding stepped over
+    std::vector<uint8_t> p = {0xB2, 10, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3,      // V2, padding, extension, 2 CSRC
+                              1, 1, 1, 1, 2, 2, 2, 2,                      // CSRC
+                              0xBE, 0xDE, 0, 1, 9, 9, 9, 9,                // extension of one word
+                              7, 7, 7, 7, 7, 7, 0, 0, 3};                  // payload of 6, padding of 3
+    CHECK(rtp::parse_packet(ConstByteView(p.data(), p.size()), &back, &payload) && payload.size() == 6 && payload[0] == 7 && back.payload_type == 10);
+    for (size_t n = 0; n < p.size(); ++n) {
+      ConstByteView cut;
+      if (rtp::parse_packet(ConstByteView(p.data(), n), &back, &cut)) CHECK(cut.size() <= n);
+    }
+    std::vector<uint8_t> bad = p;
+    bad.back() = 200;      // (padding longer than the packet)
+    CHECK(!rtp::parse_packet(ConstByteView(bad.data(), bad.size()), &back, &payload));
+    bad = p;
+    bad[0] = 0x40;      // (version 1)
+    CHECK(!rtp::parse_packet(ConstByteView(bad.data(), bad.size()), &back, &payload));
+  }
+  // ---- payload types and formats
+  CHECK(rtp::payload_type_for("L16", 44100, 2) == 10 && rtp::payload_type_for("L16", 44100, 1) == 11 && rtp::payload_type_for("PCMU", 8000, 1) == 0 &&
+        rtp::payload_type_for("PCMA", 8000, 1) == 8 && rtp::payload_type_for("L16", 48000, 2) == 127);
+  PcmFormat f;
+  CHECK(rtp::pcm_format_of("L16", 48000, 2, &f) && f.format == SampleFormat::S16Be && rtp::pcm_format_of("PCMU", 8000, 1, &f) && f.format == SampleFormat::Ulaw);
+  CHECK(!rtp::pcm_format_of("opus", 48000, 2, &f) && !rtp::pcm_format_of("L16", 0, 2, &f));
+  network::Ipv4Address a;
+  CHECK(rtp::parse_address("224.0.0.56", &a) && a == rtp::kSapAddress);
+  CHECK(!rtp::parse_address("224.0.0", &a) && !rtp::parse_address("224.0.0.256", &a) && !rtp::parse_address("1.2.3.4.5", &a) && !rtp::parse_address("a.b.c.d", &a) &&
+        !rtp::parse_address("", &a) && !rtp::parse_address("1..2.3", &a));
+  // ---- SDP
+  rtp::Session s(A);
+  s.name.assign("Kitchen speakers");
+  s.user.assign("-");
+  s.session_id = 77;
+  s.origin = network::Ipv4Address::make(10, 0, 0, 5);
+  s.address = rtp::kSapAddress;
+  s.port = 46000;
+  s.payload_type = 127;
+  s.encoding.assign("L16");
+  s.rate = 48000;
+  s.channels = 2;
+  String sdp(A);
+  CHECK(rtp::make_sdp(s, 3900000000ull, &sdp));
+  rtp::Session back(A);
+  CHECK(rtp::parse_sdp(sdp.view(), &back) && back.name.view() == StringView("Kitchen speakers") && back.session_id == 77 && back.origin == s.origin &&
+        back.address == s.address && back.port == 46000 && back.payload_type == 127 && back.encoding.view() == StringView("L16") && back.rate == 48000 &&
+        back.channels == 2);
+  // PulseAudio's own, with CR LF and a TTL on the address; a static payload type without rtpmap
+  {
+    const char* pulse = "v=0\r\no=user 3936448543 0 IN IP4 192.168.1.20\r\ns=PulseAudio RTP Stream on host\r\nc=IN IP4 224.0.0.56/255\r\nt=3936448543 0\r\n"
+                        "a=recvonly\r\nm=audio 46000 RTP/AVP 10\r\na=type:broadcast\r\n";
+    rtp::Session p(A);
+    CHECK(rtp::parse_sdp(pulse, &p) && p.payload_type == 10 && p.encoding.view() == StringView("L16") && p.rate == 44100 && p.channels == 2 && p.address == rtp::kSapAddress);
+    const char* no_media = "v=0\nc=IN IP4 1.2.3.4\nm=video 5000 RTP/AVP 96\n";
+    rtp::Session q(A);
+    CHECK(!rtp::parse_sdp(no_media, &q));
+    const char* other_codec = "v=0\nc=IN IP4 1.2.3.4\nm=audio 5000 RTP/AVP 96\na=rtpmap:96 opus/48000/2\n";
+    CHECK(!rtp::parse_sdp(other_codec, &q));
+    const char* mismatch = "v=0\nc=IN IP4 1.2.3.4\nm=audio 5000 RTP/AVP 96\na=rtpmap:97 L16/48000/2\n";
+    CHECK(!rtp::parse_sdp(mismatch, &q));
+    const char* huge_port = "v=0\nc=IN IP4 1.2.3.4\nm=audio 99999 RTP/AVP 10\n";
+    CHECK(!rtp::parse_sdp(huge_port, &q));
+  }
+  for (size_t n = 0; n < sdp.size(); ++n) {
+    rtp::Session cut(A);
+    if (rtp::parse_sdp(sdp.view().first(n), &cut)) CHECK(cut.port != 0 && cut.rate > 0);      // (a cut that keeps every line it needs is fine)
+  }
+  // ---- SAP
+  ByteBuffer sap(A);
+  CHECK(rtp::make_sap(sdp.view(), s.origin, 0xBEEF, false, &sap));
+  bool deletion = true;
+  uint16_t hash = 0;
+  network::Ipv4Address origin;
+  StringView text;
+  CHECK(rtp::parse_sap(sap.view(), &deletion, &hash, &origin, &text) && !deletion && hash == 0xBEEF && origin == s.origin && text == sdp.view());
+  CHECK(rtp::make_sap(sdp.view(), s.origin, 0xBEEF, true, &sap) && rtp::parse_sap(sap.view(), &deletion, &hash, &origin, &text) && deletion);
+  for (size_t n = 0; n < 8 + 16; ++n) CHECK(!rtp::parse_sap(sap.view().first(n), &deletion, &hash, &origin, &text));
+  // a payload with no type that is SDP itself; an IPv6 origin, encryption and another type refused
+  {
+    std::vector<uint8_t> raw = {0x20, 0, 1, 2, 10, 0, 0, 5};
+    for (char ch : std::string("v=0\nc=IN IP4 1.2.3.4\nm=audio 5000 RTP/AVP 10\n")) raw.push_back(uint8_t(ch));
+    CHECK(rtp::parse_sap(ConstByteView(raw.data(), raw.size()), &deletion, &hash, &origin, &text) && text.size() > 10);
+    raw[0] = 0x30;
+    CHECK(!rtp::parse_sap(ConstByteView(raw.data(), raw.size()), &deletion, &hash, &origin, &text));
+    raw[0] = 0x22;
+    CHECK(!rtp::parse_sap(ConstByteView(raw.data(), raw.size()), &deletion, &hash, &origin, &text));
+    std::vector<uint8_t> typed = {0x20, 0, 1, 2, 10, 0, 0, 5};
+    for (char ch : std::string("text/plain")) typed.push_back(uint8_t(ch));
+    typed.push_back(0);
+    typed.push_back('x');
+    CHECK(!rtp::parse_sap(ConstByteView(typed.data(), typed.size()), &deletion, &hash, &origin, &text));
+  }
+  // bit flips through all three: nothing read past what there is (ASan), and what is taken is sane
+  std::mt19937 rng(11);
+  int taken = 0;
+  for (int k = 0; k < 6000; ++k) {
+    std::vector<uint8_t> b(sap.view().data(), sap.view().data() + sap.size());
+    const int flips = 1 + int(rng() % 3);
+    for (int i = 0; i < flips; ++i) b[rng() % b.size()] ^= uint8_t(1u << (rng() % 8));
+    if (rng() % 4 == 0) b.resize(rng() % b.size());
+    StringView t;
+    if (!rtp::parse_sap(ConstByteView(b.data(), b.size()), &deletion, &hash, &origin, &t)) continue;
+    rtp::Session x(A);
+    if (rtp::parse_sdp(t, &x)) {
+      ++taken;
+      CHECK(x.port != 0 && x.rate > 0 && x.channels > 0 && x.channels <= 64);
+    }
+    rtp::Header h;
+    ConstByteView pl;
+    if (rtp::parse_packet(ConstByteView(b.data(), b.size()), &h, &pl)) CHECK(pl.size() <= b.size());
+  }
+  printf("rtp: %d of 6000 damaged announcements still described a stream\n", taken);
+}
+
+static void test_rtp_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  FakeNetwork net;
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  uint32_t error = 0;
+  auto load = [&](const char* module, const char* args) { return server.load_module(StringView(module), StringView(args), &error); };
+  CHECK(!load("module-rtp-send", "") && error == 19);      // (no network yet)
+  server.set_rtp_network(&net);
+  CHECK(load("module-null-sink", "sink_name=net-in") && load("module-null-sink", "sink_name=net-out"));
+  const uint32_t in = g.find_node("net-in"), out = g.find_node("net-out");
+  // refused: Opus, another format, a bad address, port or mtu, a source that is not there
+  CHECK(!load("module-rtp-send", "enable_opus=true") && error == 19);
+  CHECK(!load("module-rtp-send", "format=float32le") && error == 19);
+  CHECK(!load("module-rtp-send", "destination_ip=300.1.1.1") && error == 3);
+  CHECK(!load("module-rtp-send", "port=0") && error == 3);
+  CHECK(!load("module-rtp-send", "mtu=20") && error == 3);
+  CHECK(!load("module-rtp-send", "source=nowhere") && error == 5);
+  CHECK(!load("module-rtp-recv", "sink=nowhere") && error == 5);
+  CHECK(!load("module-rtp-recv", "latency_msec=1") && error == 3);
+  // the receiver first (on the SAP port), then the sender of net-in's monitor, to the default group (where its announcements go too: PulseAudio
+  // announces a stream on its own address)
+  const uint32_t recv = load("module-rtp-recv", "sink=net-out latency_msec=200");
+  CHECK(recv != 0);
+  const uint32_t send = load("module-rtp-send", "source=net-in.monitor port=46100 mtu=1280 stream_name=Kitchen");
+  CHECK(send != 0);
+  // plays `hz` into net-in, ticks, and returns what net-out's monitor heard after 0.3 s
+  auto run = [&](double hz, int ticks) {
+    uint32_t pout = 0, pin = 0, taken = 0, got = 0;
+    std::vector<int16_t> heard;
+    if (service.open(44, PcmFormat{SampleFormat::S16Le, 48000, 2}, "radio.exe", &pout, in) != 0 ||
+        service.open_capture(44, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &pin, false, out) != 0)
+      return heard;
+    std::vector<uint8_t> pcm(48000 * 4 * 3);
+    for (uint32_t i = 0; i < 48000 * 3; ++i) {
+      const int16_t v = int16_t(7000 * sin(2 * M_PI * hz * i / 48000));
+      pcm[4 * i] = pcm[4 * i + 2] = uint8_t(v);
+      pcm[4 * i + 1] = pcm[4 * i + 3] = uint8_t(uint16_t(v) >> 8);
+    }
+    uint64_t written = 0;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int t = 0; t < ticks; ++t) {
+      if (written < pcm.size() && service.write(44, pout, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      if (service.read(44, pin, ByteView(buf.data(), buf.size()), &got) == 0)
+        for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(44);
+    if (heard.size() > 2 * 14400) heard.erase(heard.begin(), heard.begin() + 2 * 14400);
+    return heard;
+  };
+  std::vector<int16_t> heard = run(650, 400);
+  const double level = tone_level(heard, 2, 0, 650, 48000);
+  bool session = false;
+  g.for_each([&](const GraphObject& o) { session |= o.type == ObjectType::Node && o.props.get("node.name") == StringView("rtp-recv") && o.props.get("media.name") == StringView("Kitchen"); });
+  printf("rtp: %u datagrams sent, the receiver's stream \"Kitchen\" %s; 650 Hz in net-out %.3f (%zu samples)\n", net.sent, session ? "there" : "missing", level, heard.size());
+  CHECK(session && level > 0.15);
+  CHECK(net.groups.count(rtp::kSapAddress.value()) == 1);      // (the announcements' and the stream's group joined)
+  // a tenth of the packets lost: made silence, the tone still there, the losses counted
+  net.drop_every = 10;
+  heard = run(650, 400);
+  const double lossy = tone_level(heard, 2, 0, 650, 48000);
+  printf("rtp: with %u packets lost, 650 Hz %.3f\n", net.dropped, lossy);
+  CHECK(net.dropped > 5 && lossy > 0.1);
+  net.drop_every = 0;
+  // the sender goes: its deletion takes the receiver's stream away
+  CHECK(server.unload_module(send));
+  g_now_ns += 5000000;
+  server.tick();
+  uint32_t left = 0;
+  g.for_each([&](const GraphObject& o) { left += o.type == ObjectType::Node && o.props.get("node.name") == StringView("rtp-recv"); });
+  CHECK(left == 0);
+  // a mu-law sender: 8 kHz mono, payload type 0
+  const uint32_t ulaw = load("module-rtp-send", "source=net-in.monitor format=ulaw port=46102");
+  CHECK(ulaw != 0);
+  heard = run(440, 300);
+  const double telephone = tone_level(heard, 2, 0, 440, 48000);
+  printf("rtp: mu-law 8 kHz: 440 Hz %.3f\n", telephone);
+  CHECK(telephone > 0.1);
+  CHECK(server.unload_module(ulaw) && server.unload_module(recv));
+  for (const SharedPointer<FakeNetwork::Socket>& s : net.sockets) CHECK(s->closed);
+  CHECK(net.groups.empty());
 }
 
 // A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
@@ -6470,6 +7009,9 @@ int main() {
   RUN(test_loopback_modules);
   RUN(test_source_modules);
   RUN(test_echo_cancel_module);
+  RUN(test_stream_restore);
+  RUN(test_rtp_codings);
+  RUN(test_rtp_modules);
   RUN(test_camera_sources);
   RUN(test_screen_source);
   RUN(test_deep_conversion);

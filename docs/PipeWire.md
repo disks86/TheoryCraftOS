@@ -37,7 +37,9 @@ program that records, of any kind, gets a record stream of it.
 | The kernel's own watcher (the desktop's Video Viewer) | `VideoWatcher.{hpp,cpp}`, `src/Desktop/VideoViewer.{hpp,cpp}` |
 | A virtual sink's audio: a mixer of its own over a silent device on the graph's clock | `VirtualSink.hpp` |
 | Audio from a source (or a sink's monitor) into a sink or a virtual source: PulseAudio's loopback, remap/virtual sink and source, combine-sink modules; module-echo-cancel's streams | `Loopback.{hpp,cpp}` |
-| The acoustic echo canceller (bulk delay estimate, partitioned frequency-domain NLMS, foreground/background filters) | `EchoCanceller.{hpp,cpp}` |
+| The acoustic echo canceller (bulk delay estimate, partitioned frequency-domain NLMS, foreground/background filters; high pass, residual echo and noise suppression, comfort noise, gain control) | `EchoCanceller.{hpp,cpp}` |
+| Remembered stream volumes (module-stream-restore and its extension), kept in `/AppStore/PipeWire/stream-restore.bin` | `StreamRestore.{hpp,cpp}` |
+| Audio over the network: RTP, SAP and SDP; module-rtp-send and -recv | `Rtp.{hpp,cpp}`, `StackRtpNetwork.hpp` (the kernel's network stacks) |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
 | eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
@@ -248,13 +250,26 @@ with about the latency queued (a backlog beyond twice that dropped, the newest k
 `module-virtual-sink` is a remap sink that keeps the channel order. Sources: `module-remap-source` (a virtual source hearing its master, left and
 right exchanged when the maps disagree; default name `<master>.remapped`), `module-virtual-source` (`vsource`; with `uplink_sink=` also a virtual sink
 whose audio the source hears) and `module-echo-cancel` (`echo-cancel-sink` played on into `sink_master`, `echo-cancel-source` the `source_master` with
-the sink's audio taken out by `EchoCanceller.cpp`; `aec_method` webrtc, the default, or nlms both mean that canceller, null passes the microphone
-through, others are refused with `PA_ERR_NOTSUPPORTED`). A virtual source is a graph node of media class `Audio/Source/Virtual` (ports `input_*` and
+the sink's audio taken out by `EchoCanceller.cpp`; `aec_method` webrtc (the default: the canceller with a high pass, residual echo and noise
+suppression, comfort noise and the extended filter of 170 ms, as webrtc's defaults are), nlms (the canceller's filter alone, 85 ms) or null (the
+microphone through as it is); others are refused with `PA_ERR_NOTSUPPORTED`. `aec_args` sets `high_pass_filter`, `noise_suppression`,
+`echo_suppression`, `gain_control` (also `analog_gain_control`, `digital_gain_control`) and `extended_filter`, by PulseAudio's names or pipewire's
+`webrtc.*` ones; a value that is not a boolean is refused, other keys are taken and not used, as webrtc does). A virtual source is a graph node of media class `Audio/Source/Virtual` (ports `input_*` and
 `capture_*`, as null-audio-sink names them; the native protocol's adapter makes one too): it lists as a source of its own (its node.name, no monitor
 of anything, its own volume and mute, which scale what records it), is found by name or by its node id (LOOKUP_SOURCE gives the id itself), and
 record streams on it name it as it is. `module-always-sink` and `module-switch-on-connect` load (once each) and do nothing more: there is always the
 speakers' sink, and the mixer and capture hub already follow plugged-in devices. An empty `master`, `source_master`, `sink_master`, `source` or `sink`
-means the default one. A module whose node goes another way (pw-cli destroy) goes with all it made. Record
+means the default one. A module whose node goes another way (pw-cli destroy) goes with all it made. `module-stream-restore` (loaded by the kernel at
+start-up, as default.pa does; once): a stream whose volume or mute changes, by any protocol, has it remembered under PulseAudio's key
+(`sink-input-by-media-role:music`, else `-by-application-id:`, `-by-application-name:`, `-by-media-name:`; `source-output-...` for record streams),
+and the next stream of that key starts with it; the entries are written to `/AppStore/PipeWire/stream-restore.bin` a second after the last change
+(and when the module or the server goes), and its extension (EXTENSION 87: TEST answers version 1, READ, WRITE set/merge/replace with apply,
+DELETE, SUBSCRIBE and the EVENT it sends) is what pavucontrol and `pa_ext_stream_restore_*` use; the modules' own streams carry `state.restore=false`
+and are not remembered. `module-rtp-send` (source - the speakers' monitor by default -, format s16be/ulaw/alaw, rate, channels, destination_ip
+224.0.0.56, port 46000, mtu 1280, stream_name) records a source and sends RTP, announced by SAP every 5 s on the stream's own address (as PulseAudio
+does) and withdrawn when it goes; `module-rtp-recv` (sink, sap_address 224.0.0.56, latency_msec 500) plays every announced L16/PCMU/PCMA stream
+into a sink (late and repeated packets dropped, up to 64 lost ones made silence, a stream not announced for 20 s dropped). Both need the network
+(`PulseServer::set_rtp_network`; the kernel's is `StackRtpNetwork`, the first interface with an address). Record
 streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
 server sends what they record on their channel a fragment at a time (`fragsize`, 50 ms by default, 5 to 250 ms), and stops sending to a client that
 does not read (the hub's ring drops the oldest audio instead). Source and source-output info and lists, their volume and mute (SET_SOURCE_OUTPUT_VOLUME
@@ -367,10 +382,19 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   protocol, never found as a sink), module-virtual-source with an uplink sink (the microphone and the uplink both heard; the uplink destroyed takes
   the module), the policy modules (loaded once), and module-echo-cancel end to end (a far end into echo-cancel-sink reaching the speakers, the
   microphone hearing it back, more than 10 dB of it gone from echo-cancel-source; with aec_method=null the microphone as it was; unknown methods and
-  missing masters refused, nothing left behind). `EchoCancellerTest` checks the canceller alone on synthetic rooms (speech-like far ends through a
+  missing masters refused, nothing left behind; webrtc's defaults through aec_args, bad aec_args refused), module-stream-restore (keys,
+  a changed volume remembered and saved a second later, given to the next stream of its key and not another's, mute and mono entries, the
+  modules' own streams not remembered, the extension's TEST/READ/WRITE set, merge with apply, replace/DELETE/SUBSCRIBE with its EVENT and refusals,
+  "a reboot": a new server reading the entries back and writing on the way out; the file cut at every length and 4000 bit flips), and RTP (packets
+  with contributing sources, extensions and padding, payload types, SDP both ways and PulseAudio's own, SAP both ways, cut and bit-flipped;
+  module-rtp-send to module-rtp-recv over an in-memory network: a tone through, a tenth of the packets lost, the sender's deletion taking the
+  receiver's stream, mu-law at 8 kHz, every socket closed and group left). `EchoCancellerTest` checks the canceller alone on synthetic rooms (speech-like far ends through a
   delay and reflections): a 42 ms echo (over 20 dB taken out), a 250 ms one (the bulk delay found within 25 ms, over 18 dB), double talk (the near
   talker kept, the echo still cancelled, the filter not pulled away), an echo path that changes, a far end that never plays (the microphone passed
-  as it is), NaNs, infinities, huge values and bit flips (output finite, still converging after), and blocks of the wrong size; the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
+  as it is), NaNs, infinities, huge values and bit flips (output finite, still converging after), blocks of the wrong size, the high pass (a DC
+  offset gone, 1 kHz kept), the suppressor on a distorting loudspeaker (over 10 dB more taken out, the near talker kept), noise suppression (the
+  pauses' noise 17 dB down, the speech kept), gain control (a quiet talker brought to -18 dBFS, a loud one limited under -0.5 dBFS) and comfort noise
+  (no holes of silence where the echo is cut); the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
   tap (flips and blits handed over, not when unwanted or refused, adapters added after it). Zero-copy: a DMA-BUF camera of three buffers and a
   DMA-BUF watcher (given the camera's very descriptors as DMA-BUFs, read-only; each frame's buffer, nothing read from the images and no pixels in
   the channel; the camera's buffer held until the watcher recycled it, the oldest free one going back; a watcher that did not run let go of the
@@ -405,8 +429,12 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   what paplay plays into the uplink; `module-echo-cancel` (its master source the master sink's monitor: a perfect echo) must pass the far end on to
   the sink master and leave less than a twentieth of it in echo-cancel-source after the first second, while a tone played straight into the sink
   master (a local voice) comes through; `module-always-sink` loads once; `pw-cli
-  create-node adapter` with `media.class=Audio/Source/Virtual` must list as a source to pactl, not a sink.
-- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|xaudio2|pwnode|libpipewire]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
+  create-node adapter` with `media.class=Audio/Source/Virtual` must list as a source to pactl, not a sink. libpulse's `pa_ext_stream_restore_*`
+  (`tests/pipewire/pulse_restore.c`, built against the host's libpulse) must test, write, read and delete entries, a new stream must start at its
+  remembered volume and a slider move must be remembered. GStreamer must receive module-rtp-send's stream (`udpsrc ! rtpL16depay`, the tone at full
+  level) and its SAP announcement must hold PulseAudio's SDP; module-rtp-recv, given a SAP announcement, must play GStreamer's `rtpL16pay` stream
+  into its sink.
+- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|nullsource|xaudio2|pwnode|libpipewire]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
   Linux program and the native stream, and all four tones must be in the mix at once (the DLLs are also put in the RAM disk's System32, since ole32
@@ -417,7 +445,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   run makes a virtual sink in the emulator (`TCOS_EMU_NULL_SINK`) and runs `tests/windows/virtualsinktest.c`: WASAPI must list it as a render
   endpoint of its own (found by its name, its id found again, its volume apart from the speakers'), and a loopback client on it must record the
   600 Hz another client plays into it and none of the speakers' native 300 Hz; then winmm's device 1 (400 Hz) and a DirectSound device made for
-  its enumerated GUID (500 Hz) must be heard there too. The fourth run is
+  its enumerated GUID (500 Hz) must be heard there too. The `nullsource` run makes a virtual source (`TCOS_EMU_NULL_SOURCE`: module-remap-source
+  of the emulated microphone, sides swapped) and runs `tests/windows/virtualsourcetest.c`: WASAPI must list it as a capture endpoint of its own (not
+  a render one; an id of `{0.0.1.`; its volume scaling what is recorded; loopback refused) whose client records the swapped sides, the microphone's
+  endpoint the other way round; winmm's input device 1 (named after it) and a DirectSound capture buffer of its enumerated GUID must record the
+  same. (NtTcosAudio 14 VIRTUAL_SOURCES lists them; OPEN_CAPTURE takes a virtual source's node.) The fourth run is
   `tests/windows/xaudio2test.c`: a source voice into the mastering voice and one through a submix (400 and 600 Hz in the mix with the others),
   callbacks, loops, operation sets, matrices, the frequency ratio, MS-ADPCM through a volume meter, the FX objects and X3DAudio. (Its mastering
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
@@ -464,11 +496,14 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   present, the program's frames win until it has been quiet for 250 ms (the display shows whichever presented last). The Video Viewer shows one
   source at a time.
 - **The adapter's other factories.** Only `support.null-audio-sink` (and PulseAudio's `module-null-sink`, -loopback, -remap-sink, -virtual-sink,
-  -combine-sink, -remap-source, -virtual-source, -echo-cancel, -always-sink and -switch-on-connect); no `module-ladspa-sink`/`-source`, pipe, RTP,
-  ROC, RAOP, tunnel, zeroconf or `module-x11-bell` modules, and no `module-stream-restore`/`device-restore` (volumes are not remembered). The echo
-  canceller has no residual echo suppressor, noise suppression, gain control or comfort noise (webrtc's extras), works in mono (a stereo
-  echo-cancel source carries the same in both), its echo tail is 85 ms after the bulk delay it finds (up to half a second), and `aec_args` is accepted
-  but not read. Windows programs do not see virtual sources as capture devices. A remap sink or source only exchanges left and right
+  -combine-sink, -remap-source, -virtual-source, -echo-cancel, -always-sink, -switch-on-connect, -stream-restore, -rtp-send and -rtp-recv); no
+  `module-ladspa-sink`/`-source` (it loads native plugin libraries into the server, which here is the kernel), no pipe modules (Linux programs have no
+  FIFO files yet), no tunnel modules (they need a PulseAudio client of their own over TCP, and the server listens on its AF_UNIX socket only: no
+  `module-native-protocol-tcp`), no ROC, RAOP, zeroconf, `module-device-restore` or `module-x11-bell`. Stream restore keeps the device an entry names
+  but does not move streams to it. RTP is IPv4 only, without Opus or RTCP (no clock drift correction: a sender faster than the speakers has packets
+  dropped past twice the latency). The echo canceller works in mono (a stereo echo-cancel source carries the same in both); its suppressor is a
+  spectral one, not webrtc's (it costs some of a near talker during double talk: about 2 dB in the tests). A remap sink or source only exchanges left
+  and right
   (no other channel orders or remixing); loopbacks are stereo or mono at 48 kHz, and their latency is not adjusted to drift. A virtual sink's mixer works at 48 kHz stereo: streams into it are mixed there and its
   monitor is made the sink's own format, so what the sink's rate and channels cannot carry is lost, but it is not mixed at that rate.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.

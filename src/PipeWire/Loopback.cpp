@@ -42,6 +42,7 @@ bool Loopback::open(uint32_t client, From from, uint32_t to, uint32_t channels, 
   props.set("media.name", name);
   props.set("node.name", name);
   props.set("application.name", "Loopback");
+  props.set("state.restore", "false");      // (the module's own streams: their volumes are not remembered)
   record_node_ = graph_.create_record(client, format, props, &record_, from.monitor, from.monitor ? from.sink : 0);
   if (!record_node_ || !record_) {
     close();
@@ -158,17 +159,20 @@ float EchoCancelLoop::Ring::pop() {
 EchoCancelLoop::EchoCancelLoop(Graph& graph, allocators::IAllocator& allocator)
     : graph_(graph), allocator_(allocator), aec_(allocator), scratch_(allocator), far_ring_(allocator), mic_ring_(allocator) {}
 
-bool EchoCancelLoop::open(uint32_t client, Loopback::From mic, uint32_t master, uint32_t sink, uint32_t source, uint32_t channels, bool passthrough) {
+bool EchoCancelLoop::open(uint32_t client, Loopback::From mic, uint32_t master, uint32_t sink, uint32_t source, uint32_t channels, bool passthrough,
+                          const EchoCanceller::Options& options, uint32_t partitions) {
   close();
   if (channels < 1 || channels > 2 || !sink || !source) return false;
   if (mic.monitor && (mic.sink == sink || mic.sink == source)) return false;      // (it would hear itself)
   if (master == sink || master == source) return false;
   channels_ = channels;
   passthrough_ = passthrough;
-  if (!aec_.initialize(EchoCanceller::kDefaultPartitions, kEchoRate / 2) || !far_ring_.size(kRingSamples) || !mic_ring_.size(kRingSamples)) return false;
+  if (!aec_.initialize(partitions, kEchoRate / 2) || !far_ring_.size(kRingSamples) || !mic_ring_.size(kRingSamples)) return false;
+  aec_.set_options(options);
   idle_samples_ = far_samples_ = near_samples_ = 0;
   Properties props(allocator_);
   props.set("application.name", "Echo-Cancel");
+  props.set("state.restore", "false");
   // the far end: the echo-cancel sink's monitor, on into the sink master
   props.set("media.name", "echo-cancel playback");
   props.set("node.name", "echo-cancel.playback");

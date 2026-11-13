@@ -276,6 +276,214 @@ static void test_sizes() {
   CHECK(aec.process(ArrayView<const float>(buffer, kBlock), ArrayView<const float>(buffer, kBlock), ArrayView<float>(out, kBlock)));
 }
 
+
+// A white noise source (a fan, a room's hum) at `level` (its RMS is about level / sqrt(3)).
+struct Noise {
+  explicit Noise(uint32_t seed, float level) : state(seed), level(level) {}
+  uint32_t state;
+  float level;
+  float next() {
+    state = state * 1103515245u + 12345u;
+    return level * (static_cast<float>(state >> 8) / 8388608.0f - 1.0f);
+  }
+};
+
+// A talker that speaks for 400 ms and is quiet for 400 ms, by turns (sample `at` of the run): `speaking` says which.
+static bool speaking(uint64_t at) { return (at / 19200) % 2 == 0; }
+
+static void test_high_pass() {
+  // a DC offset and 30 Hz rumble on the microphone: gone; a 1 kHz tone kept
+  EchoCanceller aec(A);
+  CHECK(aec.initialize(4, 0));
+  EchoCanceller::Options o;
+  o.high_pass_filter = true;
+  aec.set_options(o);
+  CHECK(aec.latency() == 0);
+  float far[kBlock] = {}, near[kBlock], out[kBlock];
+  double mean = 0, tone_in = 0, tone_out = 0;
+  uint64_t n = 0, at = 0;
+  for (int b = 0; b < 400; ++b) {
+    for (uint32_t i = 0; i < kBlock; ++i, ++at) {
+      const double t = double(at) / kRate;
+      near[i] = float(0.3 + 0.2 * std::sin(2 * M_PI * 30 * t) + 0.1 * std::sin(2 * M_PI * 1000 * t));
+    }
+    CHECK(aec.process(ArrayView<const float>(far, kBlock), ArrayView<const float>(near, kBlock), ArrayView<float>(out, kBlock)));
+    if (b < 100) continue;
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      mean += out[i];
+      tone_out += double(out[i]) * out[i];
+      const double t = double(at - kBlock + i) / kRate;
+      tone_in += 0.01 * std::sin(2 * M_PI * 1000 * t) * std::sin(2 * M_PI * 1000 * t);
+      ++n;
+    }
+  }
+  mean /= double(n);
+  printf("high pass: mean %.5f, 1 kHz kept %.2f of its energy (with the rumble's rest)\n", mean, tone_out / tone_in);
+  CHECK(std::fabs(mean) < 0.002);
+  CHECK(tone_out / tone_in > 0.9 && tone_out / tone_in < 1.3);      // (30 Hz is down 17 dB: a little of it is left)
+}
+
+// Echo through a loudspeaker that distorts (soft clipping): the linear filter cannot take it all; the suppressor takes most of what is left.
+static double nonlinear_run(bool suppress, double* talk_ratio) {
+  EchoCanceller aec(A);
+  CHECK(aec.initialize(16, 0));
+  EchoCanceller::Options o;
+  o.echo_suppression = suppress;
+  aec.set_options(o);
+  Talker far(41, 1.6f), voice(43, 0.5f);
+  Room r = room(1500, 1.0f);
+  float f[kBlock], n[kBlock], out[kBlock], echo_part[kBlock];
+  double echo_in = 0, echo_left = 0, talk_in = 0, talk_out = 0;
+  std::vector<float> echoes, voices;      // (what went in, to measure what comes out a latency later)
+  const uint32_t latency = aec.latency();
+  for (int b = 0; b < 2400; ++b) {
+    const bool talk = b >= 1800;      // (the last 1.3 s: a near-end talker too)
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      f[i] = far.next();
+      const float played = std::tanh(1.5f * f[i]) / 1.5f;      // (the loudspeaker distorts what it is given)
+      echo_part[i] = r.play(played);
+      const float v = talk ? voice.next() : 0.0f;
+      n[i] = echo_part[i] + v;
+      echoes.push_back(echo_part[i]);
+      voices.push_back(v);
+    }
+    CHECK(aec.process(ArrayView<const float>(f, kBlock), ArrayView<const float>(n, kBlock), ArrayView<float>(out, kBlock)));
+    if (b < 1000) continue;
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      const size_t at = size_t(b) * kBlock + i;
+      if (at < latency) continue;
+      const float e = echoes[at - latency], v = voices[at - latency];
+      if (!talk) {
+        echo_in += double(e) * e;
+        echo_left += double(out[i]) * out[i];
+      } else {
+        talk_in += double(v) * v;
+        talk_out += double(out[i]) * out[i];
+      }
+    }
+  }
+  *talk_ratio = talk_out / (talk_in > 0 ? talk_in : 1);
+  return 10.0 * std::log10(echo_in / (echo_left > 1e-20 ? echo_left : 1e-20));
+}
+
+static void test_residual_suppression() {
+  double talk_plain = 0, talk_suppressed = 0;
+  const double plain = nonlinear_run(false, &talk_plain), suppressed = nonlinear_run(true, &talk_suppressed);
+  printf("distorting loudspeaker: %.1f dB of echo gone by the filter alone, %.1f dB with the suppressor; near talker kept %.2f / %.2f of its energy\n", plain,
+         suppressed, talk_plain, talk_suppressed);
+  CHECK(suppressed > plain + 8.0);
+  CHECK(talk_suppressed > 0.4);      // (double talk: the talker comes through, some of it suppressed with the echo)
+}
+
+static void test_noise_suppression() {
+  // a talker in a noisy room: the noise in the pauses goes down by more than 10 dB, the speech stays
+  EchoCanceller aec(A);
+  CHECK(aec.initialize(4, 0));
+  EchoCanceller::Options o;
+  o.noise_suppression = true;
+  aec.set_options(o);
+  CHECK(aec.latency() == kBlock);
+  Talker voice(5, 1.0f);
+  Noise noise(9, 0.03f);
+  float far[kBlock] = {}, near[kBlock], out[kBlock];
+  std::vector<float> noises, voices;
+  double pause_in = 0, pause_out = 0, speech_in = 0, speech_out = 0;
+  for (int b = 0; b < 1500; ++b) {
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      const uint64_t at = uint64_t(b) * kBlock + i;
+      const float v = speaking(at) ? voice.next() : 0.0f, w = noise.next();
+      near[i] = v + w;
+      voices.push_back(v);
+      noises.push_back(w);
+    }
+    CHECK(aec.process(ArrayView<const float>(far, kBlock), ArrayView<const float>(near, kBlock), ArrayView<float>(out, kBlock)));
+    if (b < 500) continue;      // (the floor found first)
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      const uint64_t at = uint64_t(b) * kBlock + i - kBlock;      // (the sample coming out now went in a block ago)
+      if (speaking(at)) {
+        // (well inside a 400 ms stretch only: the edges are neither)
+        if (at % 19200 < 2400 || at % 19200 > 16800) continue;
+        speech_in += double(voices[at]) * voices[at] + double(noises[at]) * noises[at];
+        speech_out += double(out[i]) * out[i];
+      } else {
+        if (at % 19200 < 4800) continue;      // (a speech's tail, and the suppressor letting go)
+        pause_in += double(noises[at]) * noises[at];
+        pause_out += double(out[i]) * out[i];
+      }
+    }
+  }
+  const double reduction = 10.0 * std::log10(pause_in / (pause_out > 1e-20 ? pause_out : 1e-20)), kept = speech_out / speech_in;
+  printf("noise suppression: the pauses' noise %.1f dB down, speech kept %.2f of its energy\n", reduction, kept);
+  CHECK(reduction > 10.0);
+  CHECK(kept > 0.6 && kept < 1.2);
+}
+
+static void test_gain_control() {
+  // a quiet talker (about -40 dBFS) brought up towards -18 dBFS; a loud one (peaks past full scale) never over -0.5 dBFS
+  for (int loud = 0; loud < 2; ++loud) {
+    EchoCanceller aec(A);
+    CHECK(aec.initialize(4, 0));
+    EchoCanceller::Options o;
+    o.gain_control = true;
+    aec.set_options(o);
+    Talker voice(13, loud ? 6.0f : 0.05f);
+    Noise noise(17, 0.0005f);
+    float far[kBlock] = {}, near[kBlock], out[kBlock];
+    double voiced = 0, peak = 0;
+    uint64_t voiced_samples = 0;
+    for (int b = 0; b < 1800; ++b) {
+      for (uint32_t i = 0; i < kBlock; ++i) {
+        const uint64_t at = uint64_t(b) * kBlock + i;
+        near[i] = (speaking(at) ? voice.next() : 0.0f) + noise.next();
+      }
+      CHECK(aec.process(ArrayView<const float>(far, kBlock), ArrayView<const float>(near, kBlock), ArrayView<float>(out, kBlock)));
+      for (float v : out) peak = std::fabs(v) > peak ? std::fabs(v) : peak;
+      if (b < 1200 || !aec.voice()) continue;
+      for (float v : out) voiced += double(v) * v;
+      voiced_samples += kBlock;
+    }
+    const double level = voiced_samples ? 10.0 * std::log10(voiced / double(voiced_samples)) : -200;
+    printf("gain control (%s talker): voice at %.1f dBFS (target %.1f), gain %.1f, peak %.3f\n", loud ? "loud" : "quiet", level,
+           10.0 * std::log10(EchoCanceller::kTargetLevel), aec.gain(), peak);
+    CHECK(peak <= 0.95);
+    if (!loud) CHECK(level > -24.0 && level < -12.0 && aec.gain() > 4.0f);
+    else CHECK(aec.gain() < 1.0f);
+  }
+}
+
+static void test_comfort_noise() {
+  // the echo suppressed in a room with a noise floor: where the echo is cut away the output keeps that floor (comfort noise) instead of holes of
+  // silence that the far end would hear as the line dropping
+  EchoCanceller aec(A);
+  CHECK(aec.initialize(16, 0));
+  EchoCanceller::Options o;
+  o.echo_suppression = true;
+  aec.set_options(o);
+  Talker far(61, 1.6f);
+  Noise noise(67, 0.01f);
+  Room r = room(900, 1.0f);
+  float f[kBlock], n[kBlock], out[kBlock];
+  int blocks = 0, holes = 0;
+  double noise_block = 0;
+  for (int b = 0; b < 2000; ++b) {
+    double w_energy = 0, out_energy = 0;
+    for (uint32_t i = 0; i < kBlock; ++i) {
+      f[i] = far.next();
+      const float w = noise.next();
+      n[i] = r.play(std::tanh(1.5f * f[i]) / 1.5f) + w;
+      w_energy += double(w) * w;
+    }
+    CHECK(aec.process(ArrayView<const float>(f, kBlock), ArrayView<const float>(n, kBlock), ArrayView<float>(out, kBlock)));
+    for (float v : out) out_energy += double(v) * v;
+    if (b < 1000) continue;
+    noise_block = w_energy;
+    ++blocks;
+    holes += out_energy < 0.1 * w_energy;
+  }
+  printf("comfort noise: %d of %d blocks under a tenth of the room's noise (leak %.3f; noise %.2g a block)\n", holes, blocks, aec.leak(), noise_block);
+  CHECK(holes * 20 < blocks);
+}
+
 int main() {
   test_sizes();
   test_silence_and_passthrough();
@@ -284,6 +492,11 @@ int main() {
   test_double_talk();
   test_path_change();
   test_bad_input();
+  test_high_pass();
+  test_residual_suppression();
+  test_noise_suppression();
+  test_gain_control();
+  test_comfort_noise();
   printf("EchoCancellerTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

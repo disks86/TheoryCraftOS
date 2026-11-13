@@ -46,12 +46,41 @@ bool sized(List<T>& list, uint64_t count) {
 }
 
 float magnitude_squared(float re, float im) { return re * re + im * im; }
+
+// A square root without the C library (Newton's method from a guess by halving the exponent; within a part in 10^7 after four steps).
+float root(float x) {
+  if (!(x > 0.0f)) return 0.0f;
+  uint32_t bits;
+  __builtin_memcpy(&bits, &x, 4);
+  bits = (bits >> 1) + 0x1FC00000u;
+  float r;
+  __builtin_memcpy(&r, &bits, 4);
+  for (int k = 0; k < 4; ++k) r = 0.5f * (r + x / r);
+  return r;
+}
+float clamp(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// the high pass: 80 Hz, Q 1/sqrt(2), at 48 kHz (RBJ's biquad)
+constexpr float kHpB0 = 0.9926225427561189f, kHpB1 = -1.9852450855122379f, kHpB2 = 0.9926225427561189f;
+constexpr float kHpA1 = -1.9851906578962613f, kHpA2 = 0.9852995131282146f;
+// the post filter
+constexpr float kEchoFloor = 0.0316f;           // the most the residual echo is suppressed (-30 dB in amplitude)
+constexpr float kNoiseFloor = 0.1f;             // the most noise is suppressed (-20 dB)
+constexpr float kOverSuppression = 4.0f;        // the residual echo taken as this much louder than estimated (it is better gone)
+constexpr float kPowerSmoothingPost = 0.85f;    // how much of the error's smoothed power per bin is kept each block (the noise floor follows that)
+constexpr float kNoiseBias = 2.0f;              // the smoothed power's minimum sits about this far under the noise's mean
+constexpr float kNoiseRise = 1.005f;            // the noise floor's rise per block (about 4 dB a second)
+constexpr float kNoiseFall = 0.3f;              // how much of a lower power the floor takes at once
+constexpr float kLeakSmoothing = 0.95f;
+// the gain control
+constexpr float kMinGain = 0.25f, kMaxGain = 16.0f, kGainStep = 0.02f, kPeak = 0.944f;
 }  // namespace
 
 EchoCanceller::EchoCanceller(allocators::IAllocator& allocator)
     : allocator_(allocator), twiddles_(allocator), reversed_(allocator), far_history_(allocator), far_spectra_(allocator), foreground_(allocator),
       background_(allocator), power_(allocator), scratch_(allocator), scratch2_(allocator), echo_fg_(allocator), echo_bg_(allocator),
-      far_envelope_(allocator), near_envelope_(allocator) {}
+      far_envelope_(allocator), near_envelope_(allocator), window_(allocator), previous_error_(allocator), previous_echo_(allocator), overlap_(allocator),
+      error_spectrum_(allocator), echo_spectrum_(allocator), noise_(allocator), smoothed_(allocator), previous_gain_(allocator), previous_snr_(allocator) {}
 
 bool EchoCanceller::initialize(uint32_t partitions, uint32_t max_delay) {
   if (partitions < 1 || partitions > kMaxPartitions || max_delay > kMaxDelayLimit) return false;
@@ -62,8 +91,21 @@ bool EchoCanceller::initialize(uint32_t partitions, uint32_t max_delay) {
       !sized(far_spectra_, uint64_t{partitions} * kBins) || !sized(foreground_, uint64_t{partitions} * kBins) ||
       !sized(background_, uint64_t{partitions} * kBins) || !sized(power_, kBins) || !sized(scratch_, kFftSize) || !sized(scratch2_, kFftSize) ||
       !sized(echo_fg_, kBlock) || !sized(echo_bg_, kBlock) || !sized(far_envelope_, kEnvelopeWindow + lags) ||
-      !sized(near_envelope_, kEnvelopeWindow + lags))
+      !sized(near_envelope_, kEnvelopeWindow + lags) || !sized(window_, kFftSize) || !sized(previous_error_, kBlock) || !sized(previous_echo_, kBlock) ||
+      !sized(overlap_, kBlock) || !sized(error_spectrum_, kFftSize) || !sized(echo_spectrum_, kFftSize) || !sized(noise_, kBins) || !sized(smoothed_, kBins) ||
+      !sized(previous_gain_, kBins) || !sized(previous_snr_, kBins))
     return false;
+  // sqrt-Hann: sin(pi n / N), by rotation in double (cos and sin of pi / 512); its squares of half-overlapped frames add up to 1
+  {
+    const double step_cos = 0.9999811752826011, step_sin = 0.006135884649154475;
+    double c = 1.0, sn = 0.0;
+    for (float& w : window_.view()) {
+      w = static_cast<float>(sn);
+      const double nc = c * step_cos - sn * step_sin;
+      sn = sn * step_cos + c * step_sin;
+      c = nc;
+    }
+  }
   // e^(-2 pi i k / N), by rotation in double (cos and sin of 2 pi / 512)
   static_assert(kFftSize == 512, "the rotation below is 2 pi / 512");
   const double step_cos = 0.9999247018391445, step_sin = 0.012271538285719925;
@@ -103,6 +145,140 @@ void EchoCanceller::reset() {
   envelopes_ = 0;
   far_acc_ = near_acc_ = 0.0f;
   acc_count_ = since_estimate_ = 0;
+  reset_post();
+}
+
+void EchoCanceller::reset_post() {
+  hp_x1_ = hp_x2_ = hp_y1_ = hp_y2_ = 0.0f;
+  for (float& v : previous_error_.view()) v = 0.0f;
+  for (float& v : previous_echo_.view()) v = 0.0f;
+  for (float& v : overlap_.view()) v = 0.0f;
+  for (float& v : noise_.view()) v = 0.0f;
+  for (float& v : smoothed_.view()) v = 0.0f;
+  for (float& v : previous_gain_.view()) v = 1.0f;
+  for (float& v : previous_snr_.view()) v = 0.0f;
+  cov_ey_ = var_yy_ = leak_ = 0.0f;
+  noise_started_ = false;
+  agc_gain_ = 1.0f;
+  agc_level_ = block_noise_ = 0.0f;
+  voice_ = false;
+}
+
+void EchoCanceller::set_options(const Options& options) {
+  options_ = options;
+  reset_post();
+}
+
+void EchoCanceller::post_filter(ArrayView<float> block, ArrayView<const float> echo, bool active) {
+  // the frame: the previous block and this one, windowed, for the error and for the echo estimate
+  ArrayView<Complex> e = error_spectrum_.view(), y = echo_spectrum_.view();
+  for (uint32_t i = 0; i < kFftSize; ++i) {
+    const float ev = i < kBlock ? previous_error_[i] : block[i - kBlock], yv = i < kBlock ? previous_echo_[i] : echo[i - kBlock];
+    e[i] = Complex{ev * window_[i], 0.0f};
+    y[i] = Complex{yv * window_[i], 0.0f};
+  }
+  for (uint32_t i = 0; i < kBlock; ++i) {
+    previous_error_[i] = block[i];
+    previous_echo_[i] = echo[i];
+  }
+  fft(e, false);
+  fft(y, false);
+  // the leak: how the error's power spectrum follows the echo estimate's (the residual echo), measured while the far end plays
+  if (options_.echo_suppression && active) {
+    float mean_e = 0.0f, mean_y = 0.0f;
+    for (uint32_t k = 0; k < kBins; ++k) {
+      mean_e += magnitude_squared(e[k].re, e[k].im);
+      mean_y += magnitude_squared(y[k].re, y[k].im);
+    }
+    mean_e /= kBins;
+    mean_y /= kBins;
+    float cov = 0.0f, var = 0.0f;
+    for (uint32_t k = 0; k < kBins; ++k) {
+      const float de = magnitude_squared(e[k].re, e[k].im) - mean_e, dy = magnitude_squared(y[k].re, y[k].im) - mean_y;
+      cov += de * dy;
+      var += dy * dy;
+    }
+    cov_ey_ = kLeakSmoothing * cov_ey_ + (1.0f - kLeakSmoothing) * cov;
+    var_yy_ = kLeakSmoothing * var_yy_ + (1.0f - kLeakSmoothing) * var;
+    leak_ = var_yy_ > 1e-20f ? clamp(cov_ey_ / var_yy_, 0.005f, 0.5f) : 0.005f;
+  }
+  // the echo estimate's mean power: a loudspeaker's distortion puts residual echo where the estimate itself has little (harmonics), so part of the
+  // residual is taken as spread over the band
+  float echo_mean = 0.0f;
+  for (uint32_t k = 0; k < kBins; ++k) echo_mean += magnitude_squared(y[k].re, y[k].im);
+  echo_mean /= kBins;
+  // the gains
+  ArrayView<Complex> out = scratch2_.view();
+  const float floor = options_.noise_suppression ? kNoiseFloor : 1.0f;
+  for (uint32_t k = 0; k < kBins; ++k) {
+    const float power = magnitude_squared(e[k].re, e[k].im) + 1e-12f;
+    const float residual = options_.echo_suppression && active ? leak_ * (0.7f * magnitude_squared(y[k].re, y[k].im) + 0.3f * echo_mean) : 0.0f;
+    // the noise floor: the minimum of the smoothed power, followed down at once and up slowly (not while the residual echo is most of the power: it
+    // would be taken for noise), its bias made up
+    smoothed_[k] = noise_started_ ? kPowerSmoothingPost * smoothed_[k] + (1.0f - kPowerSmoothingPost) * power : power;
+    if (!noise_started_) noise_[k] = smoothed_[k];
+    else if (residual < 0.5f * power) noise_[k] = smoothed_[k] < noise_[k] ? smoothed_[k] : noise_[k] * kNoiseRise;
+    const float noise = kNoiseBias * noise_[k];
+    float gain = 1.0f;
+    if (options_.echo_suppression && residual > 0.0f) gain = clamp(1.0f - kOverSuppression * residual / power, kEchoFloor, 1.0f);
+    float echo_gain = gain;
+    if (options_.noise_suppression) {
+      // decision-directed a priori SNR (Ephraim and Malah), Wiener gain
+      const float posterior = power / (noise + 1e-12f);
+      const float prior = 0.98f * previous_gain_[k] * previous_gain_[k] * previous_snr_[k] + 0.02f * (posterior > 1.0f ? posterior - 1.0f : 0.0f);
+      const float wiener = clamp(prior / (1.0f + prior), kNoiseFloor, 1.0f);
+      previous_gain_[k] = wiener;
+      previous_snr_[k] = posterior;
+      if (wiener < gain) gain = wiener;
+    }
+    out[k] = Complex{e[k].re * gain, e[k].im * gain};
+    // comfort noise where the echo was cut away: the noise floor (after its own suppression), at a random phase
+    if (options_.echo_suppression && echo_gain < 1.0f) {
+      const float level = root(noise) * floor * (1.0f - echo_gain) * 0.7071f;
+      random_ = random_ * 1664525u + 1013904223u;
+      const float re = static_cast<float>(static_cast<int32_t>(random_)) / 2147483648.0f;
+      random_ = random_ * 1664525u + 1013904223u;
+      const float im = static_cast<float>(static_cast<int32_t>(random_)) / 2147483648.0f;
+      out[k].re += level * re;
+      out[k].im += level * im;
+    }
+  }
+  noise_started_ = true;
+  out[0].im = 0.0f;
+  out[kBlock].im = 0.0f;
+  for (uint32_t k = 1; k < kBlock; ++k) {
+    out[kFftSize - k].re = out[k].re;
+    out[kFftSize - k].im = -out[k].im;
+  }
+  fft(out, true);
+  // overlap-add: the first half with what the last frame left is the previous block, done
+  for (uint32_t i = 0; i < kBlock; ++i) {
+    block[i] = overlap_[i] + out[i].re * window_[i];
+    overlap_[i] = out[kBlock + i].re * window_[kBlock + i];
+  }
+}
+
+void EchoCanceller::gain_control(ArrayView<float> block) {
+  float mean_square = 0.0f, peak = 0.0f;
+  for (float v : block) {
+    mean_square += v * v;
+    const float a = v < 0.0f ? -v : v;
+    if (a > peak) peak = a;
+  }
+  mean_square /= kBlock;
+  // the voice detector: a block well above the floor of the blocks' powers (that floor tracked as the noise floor is)
+  if (block_noise_ <= 0.0f) block_noise_ = mean_square;
+  else block_noise_ = mean_square < block_noise_ ? (1.0f - kNoiseFall) * block_noise_ + kNoiseFall * mean_square
+                                                 : (block_noise_ * kNoiseRise < mean_square ? block_noise_ * kNoiseRise : mean_square);
+  voice_ = mean_square > 4.0f * block_noise_ + 1e-9f;
+  if (voice_) {
+    agc_level_ = agc_level_ <= 0.0f ? mean_square : 0.95f * agc_level_ + 0.05f * mean_square;
+    const float wanted = clamp(root(kTargetLevel / (agc_level_ + 1e-12f)), kMinGain, kMaxGain);
+    agc_gain_ += (wanted - agc_gain_) * kGainStep;
+  }
+  float gain = agc_gain_;
+  if (peak * gain > kPeak) gain = kPeak / peak;      // (the limiter: this block's peak kept under -0.5 dBFS)
+  for (float& v : block) v *= gain;
 }
 
 float EchoCanceller::erle() const {
@@ -239,8 +415,23 @@ bool EchoCanceller::process(ArrayView<const float> far_in, ArrayView<const float
   // the far end into its history; both into the delay estimator's envelopes
   const uint64_t ring = far_history_.count();
   float far_energy = 0.0f;
+  // the microphone, high-passed when asked
+  float near_block[kBlock];
   for (uint32_t i = 0; i < kBlock; ++i) {
-    const float f = finite_or_zero(far_in[i]), n = finite_or_zero(near_in[i]);
+    const float x = finite_or_zero(near_in[i]);
+    if (!options_.high_pass_filter) {
+      near_block[i] = x;
+      continue;
+    }
+    const float yv = kHpB0 * x + kHpB1 * hp_x1_ + kHpB2 * hp_x2_ - kHpA1 * hp_y1_ - kHpA2 * hp_y2_;
+    hp_x2_ = hp_x1_;
+    hp_x1_ = x;
+    hp_y2_ = hp_y1_;
+    hp_y1_ = (yv - yv) == 0.0f ? yv : 0.0f;
+    near_block[i] = hp_y1_;
+  }
+  for (uint32_t i = 0; i < kBlock; ++i) {
+    const float f = finite_or_zero(far_in[i]), n = near_block[i];
     far_history_[(far_written_ + i) % ring] = f;
     far_acc_ += f < 0.0f ? -f : f;
     near_acc_ += n < 0.0f ? -n : n;
@@ -281,7 +472,7 @@ bool EchoCanceller::process(ArrayView<const float> far_in, ArrayView<const float
   float near_energy = 0.0f, fg_error = 0.0f, bg_error = 0.0f;
   ArrayView<Complex> e = scratch2_.view();
   for (uint32_t i = 0; i < kBlock; ++i) {
-    const float d = finite_or_zero(near_in[i]);
+    const float d = near_block[i];
     const float ef = d - echo_fg_[i], eb = d - echo_bg_[i];
     out[i] = ef;
     near_energy += d * d;
@@ -327,6 +518,9 @@ bool EchoCanceller::process(ArrayView<const float> far_in, ArrayView<const float
       ++background_resets_;
     }
   }
+  // what follows the filter
+  if (options_.echo_suppression || options_.noise_suppression) post_filter(out, echo_fg_.view(), active);
+  if (options_.gain_control) gain_control(out);
   return true;
 }
 

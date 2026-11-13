@@ -16,7 +16,7 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/VideoConvert.cpp src/PipeWire/VideoDecode.cpp src/PipeWire/Loopback.cpp src/PipeWire/EchoCanceller.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/VideoConvert.cpp src/PipeWire/VideoDecode.cpp src/PipeWire/Loopback.cpp src/PipeWire/EchoCanceller.cpp src/PipeWire/StreamRestore.cpp src/PipeWire/Rtp.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
          src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
@@ -260,7 +260,8 @@ check "pactl load-module module-virtual-source" "[ -n '$vsrc' ] && timeout 5 pac
 record_while pa-vsrc "$work/vsrc.raw" pa-up "$work/tone500.wav"
 check "the virtual source heard its uplink sink" "heard '$work/vsrc.raw' 500 0 3000"
 timeout 5 pactl unload-module "$vsrc"
-aec=$(timeout 5 pactl load-module module-echo-cancel source_master=lb-b.monitor sink_master=lb-b 2> /dev/null)
+# (the local voice is a steady tone, which noise suppression would take for noise: off through aec_args)
+aec=$(timeout 5 pactl load-module module-echo-cancel source_master=lb-b.monitor sink_master=lb-b "aec_args='noise_suppression=0'" 2> /dev/null)
 check "pactl load-module module-echo-cancel" "[ -n '$aec' ] && timeout 5 pactl list short sources | grep -q 'echo-cancel-source' && timeout 5 pactl list short sinks | grep -q 'echo-cancel-sink'"
 record_while lb-b.monitor "$work/aec-far.raw" echo-cancel-sink "$work/left700.wav"
 check "what plays into echo-cancel-sink reaches its sink master" "heard '$work/aec-far.raw' 700 0 3000"
@@ -298,6 +299,68 @@ fi
 always=$(timeout 5 pactl load-module module-always-sink 2> /dev/null)
 check "pactl load-module module-always-sink, once" "[ -n '$always' ] && ! timeout 5 pactl load-module module-always-sink 2> /dev/null && timeout 5 pactl unload-module '$always'"
 check "the source modules went with unload-module" "! timeout 5 pactl list short sources | grep -q 'pa-rsrc\|pa-vsrc\|echo-cancel' && ! timeout 5 pactl list short sinks | grep -q 'pa-up\|echo-cancel'"
+# module-stream-restore through libpulse's pa_ext_stream_restore_*: written, read, given to a new stream, a slider remembered, deleted (loaded with
+# pactl for this check only: the kernel loads it at start-up, but here it would carry the volumes of one check into the next)
+restore=$(timeout 5 pactl load-module module-stream-restore 2> /dev/null)
+check "pactl load-module module-stream-restore" "[ -n '$restore' ] && timeout 5 pactl list short modules | grep -q 'module-stream-restore'"
+if gcc -O1 -Wall -o "$work/pulse_restore" tests/pipewire/pulse_restore.c $(pkg-config --cflags --libs libpulse) 2> "$work/pulse_restore.build"; then
+  check "pa_ext_stream_restore: test, write, read, a new stream at its volume, a slider remembered, delete" "timeout 30 '$work/pulse_restore' | tee '$work/pulse_restore.out' | grep -q 'pulse_restore: [0-9]* checks, 0 failed'"
+  grep "pulse_restore:" "$work/pulse_restore.out" | sed 's/^/   /'
+else
+  echo "skip pa_ext_stream_restore (no libpulse to build against)"
+fi
+check "pactl unload-module module-stream-restore" "timeout 5 pactl unload-module '$restore' && ! timeout 5 pactl list short modules | grep -q 'module-stream-restore'"
+# module-rtp-send to GStreamer (udpsrc ! rtpL16depay): the tone played into lb-a arrives, announced by SAP (PulseAudio's SDP, on the stream's own
+# address); module-rtp-recv from GStreamer (rtpL16pay ! udpsink) announced by a SAP packet of our making: the tone comes out of lb-b's monitor
+if command -v gst-launch-1.0 > /dev/null; then
+  rm -f "$work/rtp-sap.bin" "$work/rtp-in.raw"
+  python3 - "$work/rtp-sap.bin" <<'PY' & sap_listener=$!
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 9875)); s.settimeout(6)
+try:
+    data, _ = s.recvfrom(65536); open(sys.argv[1], "wb").write(data)
+except socket.timeout:
+    pass
+PY
+  sleep 0.3
+  (timeout -s INT 4 gst-launch-1.0 -q udpsrc address=127.0.0.1 port=46010 \
+      caps="application/x-rtp,media=audio,clock-rate=48000,encoding-name=L16,channels=2,payload=127" ! rtpL16depay ! audioconvert ! \
+      audio/x-raw,format=S16LE ! filesink location="$work/rtp-in.raw" > /dev/null 2>&1 || true) & gst_rx=$!      # (raw: a WAV header is not finished on SIGINT)
+  sleep 0.5
+  rtpsend=$(timeout 5 pactl load-module module-rtp-send source=lb-a.monitor destination_ip=127.0.0.1 port=46010 stream_name=Interop 2> /dev/null)
+  check "pactl load-module module-rtp-send" "[ -n '$rtpsend' ]"
+  timeout 10 paplay --device=lb-a "$work/left700.wav" 2> /dev/null || true
+  wait $gst_rx || true
+  wait $sap_listener || true
+  timeout 5 pactl unload-module "$rtpsend" 2> /dev/null || true
+  check "the SAP announcement described the stream (L16/48000/2 on port 46010, its name)" "python3 - '$work/rtp-sap.bin' <<'PY'
+import sys
+b = open(sys.argv[1], 'rb').read()
+assert b[0] >> 5 == 1 and b[8:24] == b'application/sdp\0', b[:24]
+sdp = b[24:].decode()
+print('   ' + sdp.replace('\n', ' | '))
+assert 'm=audio 46010 RTP/AVP 127' in sdp and 'a=rtpmap:127 L16/48000/2' in sdp and 's=Interop' in sdp and 'c=IN IP4 127.0.0.1' in sdp
+PY"
+  check "GStreamer received module-rtp-send's tone" "heard '$work/rtp-in.raw' 700 0 3000"
+  rtprecv=$(timeout 5 pactl load-module module-rtp-recv sink=lb-b sap_address=127.0.0.1 latency_msec=200 2> /dev/null)
+  check "pactl load-module module-rtp-recv" "[ -n '$rtprecv' ]"
+  python3 - <<'PY'
+import socket
+sdp = "v=0\r\no=- 4242 0 IN IP4 127.0.0.1\r\ns=GStreamer tone\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 46012 RTP/AVP 127\r\na=rtpmap:127 L16/48000/2\r\n"
+pkt = bytes([0x20, 0, 0x12, 0x34, 127, 0, 0, 1]) + b"application/sdp\0" + sdp.encode()
+socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(pkt, ("127.0.0.1", 9875))
+PY
+  sleep 0.3
+  rm -f "$work/rtp-out.raw"
+  (timeout -s INT 3 parecord --raw --device=lb-b.monitor --format=s16le --rate=48000 --channels=2 "$work/rtp-out.raw" 2> /dev/null || true) & rec=$!
+  timeout 6 gst-launch-1.0 -q audiotestsrc freq=900 volume=0.25 num-buffers=150 is-live=true ! audio/x-raw,format=S16BE,rate=48000,channels=2 ! \
+      rtpL16pay pt=127 ! udpsink host=127.0.0.1 port=46012 > /dev/null 2>&1 || true
+  wait $rec || true
+  check "module-rtp-recv played GStreamer's tone into its sink" "heard '$work/rtp-out.raw' 900 0 3000"
+  check "pactl unload-module module-rtp-recv" "timeout 5 pactl unload-module '$rtprecv'"
+else
+  echo "skip RTP (no gst-launch-1.0)"
+fi
 pkill -TERM -f "$work/pwhost $sock" || true
 for _ in $(seq 50); do pgrep -f "$work/pwhost $sock" >/dev/null || break; sleep 0.1; done
 check "the mixed output holds both tones" "python3 - '$work/out.wav' <<'PY'

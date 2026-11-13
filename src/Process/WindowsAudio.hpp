@@ -39,12 +39,15 @@
 //   9 DEVICES     [6] = the number of input devices (0 or 1: a microphone is there), [7] = the number of output devices (0 or 1: the mixer's).
 //  10 SET_MUTE    [1] (0: master, 0xFFFFFFFF: microphone), [2] 1 muted, 0 not. The volume is kept.
 //  11 OPEN_CAPTURE  as OPEN, [1] 0: the microphone, 1: the monitor (what the mixer plays, for WASAPI loopback), else a virtual sink's node: its
-//                 monitor (what plays into it); [7] = a capture stream that records from now.
+//                 monitor (what plays into it), or a virtual source's node (VIRTUAL_SOURCES); [7] = a capture stream that records from now.
 //  12 READ        [1], [2] buffer, [3] bytes (at most 1 MiB); [7] = the bytes read (whole frames; 0 when nothing is waiting). Never blocks.
 //  13 VIRTUAL_SINKS  [2] which (0, 1, ...), [3] a buffer, [4] its size (at most 255); [5] = that virtual sink's node (0 past the last), [6] = how many
 //                 there are, [7] = the length of its description written to [3] (UTF-8). The virtual sinks are the PipeWire graph's null sinks (pw-cli
 //                 create-node adapter ...): a program plays into one with OPEN [1] = its node, records it with OPEN_CAPTURE [1] = its node, and
 //                 its master volume is the volume calls' stream 0x80000000 | its node.
+//  14 VIRTUAL_SOURCES  as VIRTUAL_SINKS, for the graph's virtual sources (Audio/Source/Virtual: module-remap-source, -virtual-source,
+//                 -echo-cancel's echo-cancel-source, pw-cli adapters): a program records one with OPEN_CAPTURE [1] = its node, and its volume (what
+//                 its recorders hear it at) is the volume calls' stream 0x80000000 | its node.
 // STATUS_INVALID_HANDLE for a stream the process does not have, STATUS_INVALID_PARAMETER for a format the graph cannot take, STATUS_DEVICE_NOT_CONNECTED
 // when there is no audio device (or, for OPEN_CAPTURE, no capture hub), STATUS_NOT_SUPPORTED without the graph.
 #pragma once

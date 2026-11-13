@@ -57,7 +57,7 @@ class WindowsAudioService {
   uint32_t open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, uint32_t target = 0);
   uint32_t write(uint64_t pid, uint32_t stream, ConstByteView pcm, uint32_t* taken);
   // A record stream: what the microphone hears from now, in `format` (with `monitor`: what the mixer plays, WASAPI's loopback capture).
-  // `target`: a virtual sink whose monitor to record (what plays into it).
+  // `target`: a virtual sink whose monitor to record (what plays into it), or a virtual source to record.
   uint32_t open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, bool monitor = false, uint32_t target = 0);
   uint32_t read(uint64_t pid, uint32_t stream, ByteView out, uint32_t* got);
   uint32_t close(uint64_t pid, uint32_t stream, bool drain);

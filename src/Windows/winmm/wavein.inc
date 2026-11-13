@@ -17,7 +17,8 @@
  */
 
 /* winmm's wave input over the kernel's PipeWire graph: every HWAVEIN is a capture stream of the graph (NtTcosAudio's OPEN_CAPTURE and READ), which hears
- * the microphone along with every other program that records. Included by winmm.c after waveout.inc.
+ * the microphone along with every other program that records. Included by winmm.c after waveout.inc. The devices: 0 the microphone (when there is
+ * one), then the graph's virtual sources (module-remap-source, -virtual-source, echo-cancel-source, ...), a device each; the mapper is device 0.
  *
  * A device has a worker thread: while recording (waveInStart until waveInStop or waveInReset) it reads what the kernel has into the queued WAVEHDRs in order
  * and marks a header done (dwBytesRecorded, WHDR_DONE, WIM_DATA through the program's callback, event, window or thread) once it is full. waveInStop returns
@@ -28,6 +29,7 @@
 
 typedef struct WaveIn {
   ULONG64 stream;
+  UINT device;               /* (its device number) */
   HWAVEIN self;
   WAVEFORMATEX format;
   DWORD frame;
@@ -44,9 +46,25 @@ typedef struct WaveIn {
 static WaveIn *g_waveins[MAX_WAVEINS];
 static SRWLOCK g_waveins_lock = SRWLOCK_INIT;
 
-static UINT wavein_devices(void) {
+/* The microphone's devices: 1 when there is one, else 0 (the virtual sources then start at 0). */
+static UINT wavein_microphones(void) {
   ULONG64 inputs = 0, outputs = 0;
   return audio_call(TCOS_AUDIO_DEVICES, 0, 0, 0, 0, 0, 0, NULL, &inputs, &outputs) == 0 && inputs ? WAVE_DEVICES : 0;
+}
+static UINT wavein_devices(void) {
+  ULONG64 virtuals = 0;
+  tcos_audio_virtual_source(0, NULL, 0, &virtuals);
+  return wavein_microphones() + (UINT)(virtuals < TCOS_AUDIO_MAX_VIRTUAL ? virtuals : TCOS_AUDIO_MAX_VIRTUAL);
+}
+/* A device number's virtual source (its node; 0: the microphone), and its name; FALSE for a number with no device. */
+static BOOL wavein_device_node(UINT id, ULONG64 *node, char *name, int size) {
+  *node = 0;
+  const UINT microphones = wavein_microphones();
+  if (id == WAVE_MAPPER) id = 0;
+  if (id < microphones) return TRUE;
+  ULONG64 count = 0;
+  *node = tcos_audio_virtual_source(id - microphones, name, size, &count);
+  return *node != 0;
 }
 
 static WaveIn *wavein_lookup(HWAVEIN h) {
@@ -134,7 +152,9 @@ EXPORT MMRESULT WINAPI waveInOpen(LPHWAVEIN out, UINT id, LPCWAVEFORMATEX format
   if (out) *out = NULL;
   if (!format) return MMSYSERR_INVALPARAM;
   if (!wavein_devices()) return id == WAVE_MAPPER ? MMSYSERR_NODRIVER : MMSYSERR_BADDEVICEID;
-  if (id != WAVE_MAPPER && id >= WAVE_DEVICES && !(flags & WAVE_MAPPED)) return MMSYSERR_BADDEVICEID;
+  /* (WAVE_MAPPED: the device the id names, through the mapper - which changes nothing here) */
+  ULONG64 node = 0;
+  if (!wavein_device_node(id, &node, NULL, 0)) return MMSYSERR_BADDEVICEID;
   const ULONG64 code = wave_format_code(format);
   if (!code) return WAVERR_BADFORMAT;
   if (flags & WAVE_FORMAT_QUERY) return MMSYSERR_NOERROR;
@@ -144,13 +164,15 @@ EXPORT MMRESULT WINAPI waveInOpen(LPHWAVEIN out, UINT id, LPCWAVEFORMATEX format
   char name[128];
   program_name(name, sizeof name);
   ULONG64 stream = 0;
-  LONG st = audio_call(TCOS_AUDIO_OPEN_CAPTURE, 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream);
+  /* (OPEN_CAPTURE [1]: 0 the microphone, a virtual source's node) */
+  LONG st = audio_call(TCOS_AUDIO_OPEN_CAPTURE, node, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream);
   if (st != 0) {
     HeapFree(GetProcessHeap(), 0, w);
     return st == TCOS_STATUS_INVALID_PARAMETER ? WAVERR_BADFORMAT : MMSYSERR_ALLOCATED;
   }
   audio_call(TCOS_AUDIO_PAUSE, stream, 1, 0, 0, 0, 0, NULL, NULL, NULL);      /* (it records from waveInStart) */
   w->stream = stream;
+  w->device = id == WAVE_MAPPER ? 0 : id;
   w->format = *format;
   w->format.cbSize = 0;
   w->frame = format->nBlockAlign;
@@ -301,16 +323,20 @@ EXPORT MMRESULT WINAPI waveInGetPosition(HWAVEIN h, LPMMTIME time, UINT size) {
 }
 
 EXPORT MMRESULT WINAPI waveInGetID(HWAVEIN h, LPUINT id) {
-  if (!wavein_lookup(h)) return MMSYSERR_INVALHANDLE;
+  WaveIn *w = wavein_lookup(h);
+  if (!w) return MMSYSERR_INVALHANDLE;
   if (!id) return MMSYSERR_INVALPARAM;
-  *id = 0;
+  *id = w->device;
   return MMSYSERR_NOERROR;
 }
 
 EXPORT MMRESULT WINAPI waveInMessage(HWAVEIN h, UINT message, DWORD_PTR a, DWORD_PTR b) { (void)h; (void)message; (void)a; (void)b; return MMSYSERR_NOTSUPPORTED; }
 
 static void fill_input_caps_name(WCHAR *w, CHAR *a, UINT id) {
+  char described[MAXPNAMELEN];
+  ULONG64 node = 0;
   const char *name = id == WAVE_MAPPER ? "Microsoft Sound Mapper" : "TheoryCraftOS Microphone";
+  if (id != WAVE_MAPPER && wavein_device_node(id, &node, described, sizeof described) && node) name = described;      /* (a virtual source: its description) */
   int i = 0;
   for (; name[i] && i < MAXPNAMELEN - 1; ++i) { if (w) w[i] = (WCHAR)name[i]; if (a) a[i] = name[i]; }
   if (w) w[i] = 0;
@@ -319,10 +345,12 @@ static void fill_input_caps_name(WCHAR *w, CHAR *a, UINT id) {
 
 /* The device number a capabilities query names (a handle stands for its device); FALSE when there is no such device. */
 static BOOL wavein_caps_id(UINT_PTR *id) {
-  if (!wavein_devices()) return FALSE;
-  if ((UINT)*id == WAVE_MAPPER || *id < WAVE_DEVICES) return TRUE;
-  if (!wavein_lookup((HWAVEIN)*id)) return FALSE;
-  *id = 0;
+  const UINT devices = wavein_devices();
+  if (!devices) return FALSE;
+  if ((UINT)*id == WAVE_MAPPER || *id < devices) return TRUE;
+  WaveIn *w = wavein_lookup((HWAVEIN)*id);
+  if (!w) return FALSE;
+  *id = w->device;
   return TRUE;
 }
 

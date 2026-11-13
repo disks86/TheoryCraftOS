@@ -179,6 +179,7 @@ PulseServer::PulseServer(Graph& graph, allocators::IAllocator& allocator)
 PulseServer::~PulseServer() {
   for (UniquePointer<Client>& c : clients_.view()) graph_.remove_client(c->graph_client);
   for (UniquePointer<Module>& m : modules_.view()) destroy_module_nodes(*m);
+  if (restore_) restore_->flush();
 }
 
 // ---- modules ----------------------------------------------------------------------------------------------------------------------------------------
@@ -231,6 +232,8 @@ void PulseServer::destroy_module_nodes(Module& m) {
   // its streams first (they record from and play into its nodes), then the nodes
   m.loops.clear();
   m.echo = UniquePointer<EchoCancelLoop>();
+  m.rtp_send = UniquePointer<RtpSender>();
+  m.rtp_recv = UniquePointer<RtpReceiver>();
   if (m.node && graph_.is_virtual(m.node)) graph_.destroy_node(m.node);
   if (m.extra && graph_.is_virtual(m.extra)) graph_.destroy_node(m.extra);
   m.node = m.extra = 0;
@@ -329,7 +332,8 @@ uint32_t PulseServer::module_node(const Properties& args, bool source, const cha
 uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_t* error) {
   *error = 0;
   prune_modules();
-  enum class Kind { NullSink, Loopback, RemapSink, VirtualSink, CombineSink, RemapSource, VirtualSource, EchoCancel, AlwaysSink, SwitchOnConnect };
+  enum class Kind { NullSink, Loopback, RemapSink, VirtualSink, CombineSink, RemapSource, VirtualSource, EchoCancel, AlwaysSink, SwitchOnConnect,
+                    StreamRestoreModule, RtpSend, RtpRecv };
   // the modules there are, and the arguments each takes (pipewire-pulse's; a module refuses others)
   static const char* const kNullSink[] = {"sink_name", "sink_properties", "format", "rate", "channels", "channel_map"};
   static const char* const kLoopback[] = {"source", "sink", "latency_msec", "channels", "rate", "format", "channel_map", "remix", "source_dont_move",
@@ -350,6 +354,10 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
                                             "autoloaded", "save_aec", "use_volume_sharing", "use_master_format"};
   static const char* const kAlwaysSink[] = {"sink_name"};
   static const char* const kSwitchOnConnect[] = {"only_from_unavailable", "ignore_virtual", "blocklist"};
+  static const char* const kRtpSend[] = {"source", "format", "channels", "rate", "destination_ip", "source_ip", "port", "mtu", "loop", "ttl",
+                                         "inhibit_auto_suspend", "stream_name", "enable_opus"};
+  static const char* const kRtpRecv[] = {"sink", "sap_address", "latency_msec"};
+  static const char* const kStreamRestore[] = {"restore_device", "restore_volume", "restore_muted", "on_hotplug", "on_rescue", "fallback_table"};
   struct Entry {
     const char* name;
     Kind kind;
@@ -368,6 +376,9 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
       {"module-echo-cancel", Kind::EchoCancel, TCOS_ARGS(kEchoCancel), false},
       {"module-always-sink", Kind::AlwaysSink, TCOS_ARGS(kAlwaysSink), true},
       {"module-switch-on-connect", Kind::SwitchOnConnect, TCOS_ARGS(kSwitchOnConnect), true},
+      {"module-stream-restore", Kind::StreamRestoreModule, TCOS_ARGS(kStreamRestore), true},
+      {"module-rtp-send", Kind::RtpSend, TCOS_ARGS(kRtpSend), false},
+      {"module-rtp-recv", Kind::RtpRecv, TCOS_ARGS(kRtpRecv), false},
   };
 #undef TCOS_ARGS
   const Entry* entry = nullptr;
@@ -522,6 +533,33 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
       const StringView method = args.get("aec_method");
       if (!method.empty() && method != StringView("webrtc") && method != StringView("null") && method != StringView("nlms"))
         return fail(kErrNotSupported);
+      // what follows the canceller: webrtc's defaults (a high pass, noise and residual echo suppression, the extended filter; no gain control), or for
+      // nlms the filter alone; aec_args sets them, by pulseaudio's names or pipewire's webrtc.* ones (others are taken and not used, as webrtc does)
+      EchoCanceller::Options options;
+      bool extended = method.empty() || method == StringView("webrtc");
+      if (extended) options.high_pass_filter = options.noise_suppression = options.echo_suppression = true;
+      if (args.has("aec_args")) {
+        Properties aec(allocator_);
+        if (!parse_module_arguments(args.get("aec_args"), &aec)) return fail(kErrInvalid);
+        bool bad = false;
+        auto flag = [&](StringView value) {
+          if (value == StringView("1") || value == StringView("true") || value == StringView("yes") || value == StringView("on")) return true;
+          if (!(value == StringView("0") || value == StringView("false") || value == StringView("no") || value == StringView("off"))) bad = true;
+          return false;
+        };
+        for (uint64_t k = 0; k < aec.count(); ++k) {
+          StringView key = aec.at(k).key.view();
+          const StringView value = aec.at(k).value.view(), prefix("webrtc.");
+          if (key.size() > prefix.size() && key.first(prefix.size()) == prefix) key = key.substr(prefix.size());
+          if (key == StringView("high_pass_filter")) options.high_pass_filter = flag(value);
+          else if (key == StringView("noise_suppression")) options.noise_suppression = flag(value);
+          else if (key == StringView("echo_suppression")) options.echo_suppression = flag(value);
+          else if (key == StringView("gain_control") || key == StringView("analog_gain_control") || key == StringView("digital_gain_control"))
+            options.gain_control = flag(value) || options.gain_control;
+          else if (key == StringView("extended_filter")) extended = flag(value);
+        }
+        if (bad) return fail(kErrInvalid);
+      }
       Properties sink_args(allocator_), source_args(allocator_);
       for (uint64_t k = 0; k < args.count(); ++k) {
         const StringView key = args.at(k).key.view(), value = args.at(k).value.view();
@@ -537,10 +575,58 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
       m->node = module_node(source_args, true, "echo-cancel-source", error);
       if (!m->node) return fail(*error ? *error : kErrInvalid);
       m->echo = UniquePointer<EchoCancelLoop>::make(allocator_, graph_, allocator_);
-      if (!m->echo || !m->echo->open(graph_.native_client_id(), mic, master, m->extra, m->node, channels_of(m->node), method == StringView("null")))
+      if (!m->echo || !m->echo->open(graph_.native_client_id(), mic, master, m->extra, m->node, channels_of(m->node), method == StringView("null"), options,
+                                     extended ? 2 * EchoCanceller::kDefaultPartitions : EchoCanceller::kDefaultPartitions))
         return fail(kErrInvalid);
       break;
     }
+    case Kind::RtpSend: {
+      // a source (default: the speakers' monitor, as PulseAudio's) recorded and sent: format s16be (L16), ulaw or alaw; destination_ip, port, mtu
+      if (!rtp_network_) return fail(kErrNotSupported);
+      if (args.get("enable_opus") == StringView("true") || args.get("enable_opus") == StringView("1")) return fail(kErrNotSupported);
+      Loopback::From from{true, 0};
+      if (args.has("source") && !source_origin(args.get("source"), &from)) return fail(kErrNoEntity);
+      RtpSender::Options o;
+      const StringView format = args.get("format");
+      o.encoding = format.empty() || format == StringView("s16be") ? StringView("L16") : format == StringView("ulaw") ? StringView("PCMU")
+                   : format == StringView("alaw") ? StringView("PCMA") : StringView();
+      if (o.encoding.empty()) return fail(kErrNotSupported);
+      uint32_t number = 0;
+      if (args.has("rate") && (!parse_number(args.get("rate"), &number) || number < 1000 || number > 192000)) return fail(kErrInvalid);
+      if (args.has("rate")) o.rate = number;
+      if (args.has("channels") && (!parse_number(args.get("channels"), &number) || number < 1 || number > 2)) return fail(kErrInvalid);
+      if (args.has("channels")) o.channels = number;
+      if (o.encoding != StringView("L16") && !args.has("rate")) o.rate = 8000;      // (mu-law and A-law are telephone audio: 8 kHz mono)
+      if (o.encoding != StringView("L16") && !args.has("channels")) o.channels = 1;
+      if (args.has("destination_ip") && !rtp::parse_address(args.get("destination_ip"), &o.destination)) return fail(kErrInvalid);
+      if (args.has("port") && (!parse_number(args.get("port"), &number) || number == 0 || number > 65535)) return fail(kErrInvalid);
+      if (args.has("port")) o.port = static_cast<uint16_t>(number);
+      if (args.has("mtu") && (!parse_number(args.get("mtu"), &number) || number < 128 || number > 9000)) return fail(kErrInvalid);
+      if (args.has("mtu")) o.mtu = number;
+      o.stream_name = args.get("stream_name");
+      m->rtp_send = UniquePointer<RtpSender>::make(allocator_, graph_, *rtp_network_, allocator_);
+      rtp_seed_ = rtp_seed_ * 1664525u + 1013904223u + static_cast<uint32_t>(graph_.now_ns());
+      if (!m->rtp_send || !m->rtp_send->open(graph_.native_client_id(), from, o, rtp_seed_)) return fail(kErrInvalid);
+      break;
+    }
+    case Kind::RtpRecv: {
+      // the streams announced on sap_address (224.0.0.56 by default) played into a sink (default: the speakers), latency_msec queued (500)
+      if (!rtp_network_) return fail(kErrNotSupported);
+      uint32_t to = 0, latency = 500;
+      network::Ipv4Address sap = rtp::kSapAddress;
+      if (!sink_target(args.get("sink"), &to)) return fail(kErrNoEntity);
+      if (args.has("sap_address") && !rtp::parse_address(args.get("sap_address"), &sap)) return fail(kErrInvalid);
+      if (args.has("latency_msec") && (!parse_number(args.get("latency_msec"), &latency) || latency < 10 || latency > 5000)) return fail(kErrInvalid);
+      m->rtp_recv = UniquePointer<RtpReceiver>::make(allocator_, graph_, *rtp_network_, allocator_);
+      if (!m->rtp_recv || !m->rtp_recv->open(graph_.native_client_id(), to, sap, latency)) return fail(kErrInvalid);
+      break;
+    }
+    case Kind::StreamRestoreModule:
+      // the remembered volumes, from the storage; streams get them from the next tick
+      restore_ = UniquePointer<StreamRestore>::make(allocator_, graph_, allocator_, restore_storage_);
+      if (!restore_) return fail(kErrTooLarge);
+      restore_->load();
+      break;
     case Kind::AlwaysSink:
       // (the speakers' sink is always there, mixer or not: there is never a moment without a sink to fall back to)
     case Kind::SwitchOnConnect:
@@ -550,6 +636,7 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
   }
   m->index = next_module_++ | kModuleFlag;
   const uint32_t index = m->index;
+  if (kind == Kind::StreamRestoreModule) restore_module_ = index;
   if (!modules_.push_back(util::move(m))) {
     // (the module could not be kept: what it made goes; m still holds it when push_back fails)
     if (m) destroy_module_nodes(*m);
@@ -563,11 +650,120 @@ bool PulseServer::unload_module(uint32_t index) {
   prune_modules();
   for (uint64_t k = 0; k < modules_.count(); ++k) {
     if (modules_[k]->index != index) continue;
+    if (index == restore_module_ && restore_) {      // (what changed is written before it goes)
+      restore_->flush();
+      restore_ = UniquePointer<StreamRestore>();
+      restore_module_ = 0;
+    }
     destroy_module_nodes(*modules_[k]);
     modules_.remove_at(k);
     return true;
   }
   return false;
+}
+
+// The extensions: module-stream-restore's (pa_ext_stream_restore_*), while it is loaded. [index or name of the module] [subcommand] ...
+void PulseServer::extension(Client& c, uint32_t tag, TagReader& t) {
+  enum : uint32_t { kTest = 0, kRead = 1, kWrite = 2, kDelete = 3, kSubscribeRestore = 4 };
+  uint32_t index = 0, sub = 0;
+  StringView name;
+  bool null_name = true;
+  if (!t.u32(&index) || !t.string(&name, &null_name) || !t.u32(&sub)) return send_error(c, tag, kErrProtocol);
+  const bool restore = restore_ && ((!null_name && name == StringView("module-stream-restore")) || (null_name && index == restore_module_));
+  if (!restore) return send_error(c, tag, kErrNoExtension);
+  switch (sub) {
+    case kTest: {
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter(c.outbox).u32(StreamRestore::kFormatVersion);      // (the extension's version: 1)
+      end_command(c, m);
+      return;
+    }
+    case kRead: {
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      for (const UniquePointer<RestoreEntry>& e : restore_->entries().view()) {
+        pulse::ChannelMap map;
+        pulse::Cvolume volume;
+        map.channels = volume.channels = e->channels > pulse::kChannelsMax ? uint8_t(pulse::kChannelsMax) : e->channels;
+        for (uint32_t i = 0; i < map.channels; ++i) {
+          map.positions[i] = e->positions[i];
+          volume.values[i] = e->volumes[i];
+        }
+        w.string(e->name.view());
+        w.channel_map(map);
+        w.cvolume(volume);
+        if (e->device.empty()) w.string_null();
+        else w.string(e->device.view());
+        w.boolean(e->mute);
+      }
+      end_command(c, m);
+      return;
+    }
+    case kWrite: {
+      uint32_t mode = 0;
+      bool apply = false;
+      if (!t.u32(&mode) || !t.boolean(&apply) || mode > 2) return send_error(c, tag, kErrInvalid);
+      List<UniquePointer<RestoreEntry>> entries(allocator_);
+      while (!t.at_end()) {
+        UniquePointer<RestoreEntry> e = UniquePointer<RestoreEntry>::make(allocator_, allocator_);
+        StringView entry_name, device;
+        bool null_device = true;
+        pulse::ChannelMap map;
+        pulse::Cvolume volume;
+        bool mute = false;
+        if (!e || !t.string(&entry_name) || !t.channel_map(&map) || !t.cvolume(&volume) || !t.string(&device, &null_device) || !t.boolean(&mute))
+          return send_error(c, tag, kErrProtocol);
+        // (a volume and its map must agree, as libpulse checks; a name must be there)
+        if (entry_name.empty() || entry_name.size() > StreamRestore::kMaxNameBytes || (volume.channels && map.channels != volume.channels))
+          return send_error(c, tag, kErrInvalid);
+        if (entries.count() >= StreamRestore::kMaxEntries || !e->name.assign(entry_name) || !e->device.assign(null_device ? StringView() : device))
+          return send_error(c, tag, kErrTooLarge);
+        e->channels = volume.channels;
+        for (uint32_t i = 0; i < volume.channels && i < RestoreEntry::kMaxChannels; ++i) {
+          e->positions[i] = map.positions[i];
+          e->volumes[i] = volume.values[i];
+        }
+        e->mute = mute;
+        entries.push_back(util::move(e));
+      }
+      List<const RestoreEntry*> pointers(allocator_);
+      for (const UniquePointer<RestoreEntry>& e : entries.view()) pointers.push_back(e.get());
+      if (!restore_->write(static_cast<StreamRestore::Mode>(mode), pointers.view(), apply)) return send_error(c, tag, kErrInvalid);
+      send_simple_reply(c, tag);
+      send_restore_events();
+      return;
+    }
+    case kDelete: {
+      while (!t.at_end()) {
+        StringView entry_name;
+        if (!t.string(&entry_name)) return send_error(c, tag, kErrProtocol);
+        restore_->remove(entry_name);
+      }
+      send_simple_reply(c, tag);
+      send_restore_events();
+      return;
+    }
+    case kSubscribeRestore: {
+      bool enabled = false;
+      if (!t.boolean(&enabled)) return send_error(c, tag, kErrProtocol);
+      c.restore_events = enabled;
+      return send_simple_reply(c, tag);
+    }
+    default: return send_error(c, tag, kErrNotSupported);
+  }
+}
+
+void PulseServer::send_restore_events() {
+  // (EXTENSION with no tag: the module, its name, EVENT)
+  for (UniquePointer<Client>& c : clients_.view()) {
+    if (!c->restore_events || c->closing) continue;
+    const uint64_t m = begin_command(*c, kExtension, kTagNone);
+    TagWriter w(c->outbox);
+    w.u32(restore_module_);
+    w.string("module-stream-restore");
+    w.u32(5);
+    end_command(*c, m);
+  }
 }
 
 void PulseServer::fill_module(TagWriter& w, uint32_t version, const Module& m) {
@@ -591,6 +787,9 @@ void PulseServer::fill_module(TagWriter& w, uint32_t version, const Module& m) {
                                     : n == StringView("module-echo-cancel")       ? "Acoustic echo canceller"
                                     : n == StringView("module-always-sink")       ? "Always keeps at least one sink loaded"
                                     : n == StringView("module-switch-on-connect") ? "Switch to new devices on connect"
+                                    : n == StringView("module-stream-restore")    ? "Automatically restore the volume/mute/device state of streams"
+                                    : n == StringView("module-rtp-send")          ? "Read data from source and send it to the network"
+                                    : n == StringView("module-rtp-recv")          ? "Receive data from a network via RTP/SAP/SDP"
                                                                                   : "");
     w.proplist(props);
   }
@@ -1349,7 +1548,7 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       end_command(c, m);
       return;
     }
-    case kExtension: return send_error(c, tag, kErrNoExtension);
+    case kExtension: return extension(c, tag, t);
     case kCreateUploadStream: case kUpdatePlaybackStreamSampleRate: case kUpdateRecordStreamSampleRate: case kMoveSinkInput:
     case kMoveSourceOutput: case kSetSinkPort: case kSetSourcePort: case kSetCardProfile: case kSendObjectMessage:
       return send_error(c, tag, kErrNotSupported);
@@ -1921,7 +2120,10 @@ void PulseServer::tick() {
   for (UniquePointer<Module>& m : modules_.view()) {      // (the modules' loopbacks: what was recorded on to where it goes)
     for (UniquePointer<Loopback>& loop : m->loops.view()) loop->pump();
     if (m->echo) m->echo->pump();
+    if (m->rtp_send) m->rtp_send->pump(graph_.now_ns());
+    if (m->rtp_recv) m->rtp_recv->pump(graph_.now_ns());
   }
+  if (restore_ && restore_->tick(graph_.now_ns())) send_restore_events();
   const bool changed = graph_.serial() != last_serial_;
   if (changed) {
     last_serial_ = graph_.serial();

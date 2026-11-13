@@ -81,6 +81,10 @@ inline constexpr const char* kBluetoothBonds = "/AppStore/Bluetooth/bonds.bin";
 inline constexpr const char* kFstrimFolder = "/AppStore/FileSystem";
 inline constexpr const char* kFstrimState = "/AppStore/FileSystem/fstrim.state";
 
+// The sound server's remembered stream volumes (PipeWire's module-stream-restore, src/PipeWire/StreamRestore; the "PipeWire" application's folder).
+inline constexpr const char* kPipeWireFolder = "/AppStore/PipeWire";
+inline constexpr const char* kStreamRestore = "/AppStore/PipeWire/stream-restore.bin";
+
 // The name the EFI system partition is mounted under (the folder "/EFI").
 inline constexpr const char* kEfiMountName = "EFI";
 

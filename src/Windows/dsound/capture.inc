@@ -21,7 +21,8 @@
  *
  * A buffer is a ring in the program's format. While it captures (Start until Stop, or until the end without DSCBSTART_LOOPING) a thread reads what the
  * kernel has into the ring every 5 ms at the capture cursor and signals the position notifications it passes (DSBPN_OFFSETSTOP on Stop). The capture
- * and read cursors are the same: everything before them is there to Lock. One device (the graph's source) with several buffers at once
+ * and read cursors are the same: everything before them is there to Lock. The devices are the graph's source (the microphone) and its virtual
+ * sources (module-remap-source, -virtual-source, echo-cancel-source: a GUID each, see tcos_audio_virtual_source_guid), several buffers at once
  * (DSCCAPS_MULTIPLECAPTURE); capture effects (DSCBCAPS_CTRLFX) are not there. IDirectSoundFullDuplex opens a capture buffer and a playback buffer
  * together. */
 
@@ -36,6 +37,7 @@ typedef struct CaptureDevice {
   IDirectSoundCapture iface;
   LONG refs;
   BOOL initialized;
+  ULONG64 node;      /* (a virtual source's node; 0: the microphone) */
 } CaptureDevice;
 
 typedef struct CaptureBuffer {
@@ -346,7 +348,7 @@ static HRESULT WINAPI c_create_capture_buffer(IDirectSoundCapture *i, LPCDSCBUFF
   InitializeCriticalSection(&b->lock);
   b->wake = CreateEventA(NULL, FALSE, FALSE, NULL);
   LONG st = 0;
-  b->stream = b->data && b->wake ? tcos_audio_open_kind(f, TRUE, &st) : 0;
+  b->stream = b->data && b->wake ? tcos_audio_open_to(f, TRUE, FALSE, d->node, &st) : 0;
   if (b->stream) audio_call(TCOS_AUDIO_PAUSE, b->stream, 1, 0, 0, 0, 0, NULL, NULL, NULL);      /* (it records from Start) */
   b->thread = b->stream ? CreateThread(NULL, 0, capture_thread, b, 0, NULL) : NULL;
   if (b->thread) SetThreadPriority(b->thread, THREAD_PRIORITY_TIME_CRITICAL);
@@ -373,8 +375,11 @@ static HRESULT WINAPI c_get_caps(IDirectSoundCapture *i, LPDSCCAPS caps) {
 static HRESULT WINAPI c_initialize(IDirectSoundCapture *i, LPCGUID guid) {
   CaptureDevice *d = from_capture(i);
   if (d->initialized) return DSERR_ALREADYINITIALIZED;
-  if (!capture_guid(guid)) return DSERR_NODRIVER;
-  if (!tcos_audio_input_devices()) return DSERR_NODRIVER;
+  /* the microphone, or one of the graph's virtual sources by its GUID */
+  const ULONG64 node = guid && !capture_guid(guid) ? tcos_audio_virtual_source_node(guid) : 0;
+  if (!node && !capture_guid(guid)) return DSERR_NODRIVER;
+  if (!node && !tcos_audio_input_devices()) return DSERR_NODRIVER;
+  d->node = node;
   d->initialized = TRUE;
   return DS_OK;
 }
@@ -478,22 +483,59 @@ static const char kCaptureDescriptionA[] = "Microphone (TheoryCraftOS)";
 static const char kCapturePrimaryA[] = "Primary Sound Capture Driver";
 static const char kCaptureModuleA[] = "{0.0.1.00000000}.{5af3a3c3-6e1b-4b4e-8d2f-1c0a7e5d9b31}";
 
+/* The virtual source number `which`: its GUID, description and module (its WASAPI endpoint id); FALSE past the last. */
+static BOOL virtual_capture_device(ULONG64 which, GUID *guid, char *description, int size, char *module) {
+  ULONG64 count = 0;
+  const ULONG64 node = tcos_audio_virtual_source(which, description, size, &count);
+  if (!node) return FALSE;
+  tcos_audio_virtual_source_guid(node, guid);
+  static const char hex[] = "0123456789abcdef";
+  const char prefix[] = "{0.0.1.00000000}.{5af3a3c3-6e1b-4b4e-8d2f-";
+  int k = 0;
+  for (; prefix[k]; ++k) module[k] = prefix[k];
+  for (int d = 11; d >= 0; --d) module[k++] = hex[(node >> (4 * d)) & 0xF];
+  module[k++] = '}';
+  module[k] = 0;
+  return TRUE;
+}
+
+/* The primary driver and the microphone when there is one, then the graph's virtual sources, a device each. */
 EXPORT HRESULT WINAPI DirectSoundCaptureEnumerateA(LPDSENUMCALLBACKA callback, LPVOID context) {
   if (!callback) return DSERR_INVALIDPARAM;
-  if (!tcos_audio_input_devices()) return DS_OK;
-  if (!callback(NULL, kCapturePrimaryA, "", context)) return DS_OK;
-  callback((LPGUID)&kCaptureGuid, kCaptureDescriptionA, kCaptureModuleA, context);
+  if (tcos_audio_input_devices()) {
+    if (!callback(NULL, kCapturePrimaryA, "", context)) return DS_OK;
+    if (!callback((LPGUID)&kCaptureGuid, kCaptureDescriptionA, kCaptureModuleA, context)) return DS_OK;
+  }
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    GUID guid;
+    char description[96], module[80];
+    if (!virtual_capture_device(i, &guid, description, sizeof description, module)) break;
+    if (!callback(&guid, description, module, context)) break;
+  }
   return DS_OK;
 }
 EXPORT HRESULT WINAPI DirectSoundCaptureEnumerateW(LPDSENUMCALLBACKW callback, LPVOID context) {
   if (!callback) return DSERR_INVALIDPARAM;
-  if (!tcos_audio_input_devices()) return DS_OK;
-  WCHAR primary[sizeof kCapturePrimaryA], description[sizeof kCaptureDescriptionA], module[sizeof kCaptureModuleA], empty[1] = {0};
-  for (SIZE_T k = 0; k < sizeof kCapturePrimaryA; ++k) primary[k] = (WCHAR)kCapturePrimaryA[k];
-  for (SIZE_T k = 0; k < sizeof kCaptureDescriptionA; ++k) description[k] = (WCHAR)kCaptureDescriptionA[k];
-  for (SIZE_T k = 0; k < sizeof kCaptureModuleA; ++k) module[k] = (WCHAR)kCaptureModuleA[k];
-  if (!callback(NULL, primary, empty, context)) return DS_OK;
-  callback((LPGUID)&kCaptureGuid, description, module, context);
+  if (tcos_audio_input_devices()) {
+    WCHAR primary[sizeof kCapturePrimaryA], description[sizeof kCaptureDescriptionA], module[sizeof kCaptureModuleA], empty[1] = {0};
+    for (SIZE_T k = 0; k < sizeof kCapturePrimaryA; ++k) primary[k] = (WCHAR)kCapturePrimaryA[k];
+    for (SIZE_T k = 0; k < sizeof kCaptureDescriptionA; ++k) description[k] = (WCHAR)kCaptureDescriptionA[k];
+    for (SIZE_T k = 0; k < sizeof kCaptureModuleA; ++k) module[k] = (WCHAR)kCaptureModuleA[k];
+    if (!callback(NULL, primary, empty, context)) return DS_OK;
+    if (!callback((LPGUID)&kCaptureGuid, description, module, context)) return DS_OK;
+  }
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    GUID guid;
+    char da[96], ma[80];
+    WCHAR dw[96], mw[80];
+    if (!virtual_capture_device(i, &guid, da, sizeof da, ma)) break;
+    int k = 0;
+    for (; da[k] && k < 95; ++k) dw[k] = (WCHAR)(unsigned char)da[k];
+    dw[k] = 0;
+    for (k = 0; ma[k] && k < 79; ++k) mw[k] = (WCHAR)ma[k];
+    mw[k] = 0;
+    if (!callback(&guid, dw, mw, context)) break;
+  }
   return DS_OK;
 }
 
