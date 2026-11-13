@@ -175,7 +175,15 @@ class IWindowsSession {
     (void)text, (void)x, (void)y;
     return false;
   }
-  virtual void program_drop_done(bool taken) { (void)taken; }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
+  virtual void program_drop_done(bool taken) { (void)taken; }
+  // A program's drag over the desktop (outside the session's windows), before it is let go: true while one is there and what it carries is known (as
+  // take_program_drop has it), with where the pointer is (the screen's coordinates). The desktop shows it and answers with program_drag_answer whether
+  // what is under the pointer would take it, which the program hears (its pointer may show it).
+  virtual bool program_drag(String* text, int32_t* x, int32_t* y) {
+    (void)text, (void)x, (void)y;
+    return false;
+  }
+  virtual void program_drag_answer(bool would_take) { (void)would_take; }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
   virtual uint32_t capture_window() = 0;                                      // the window that captured the mouse (SetCapture), 0: none

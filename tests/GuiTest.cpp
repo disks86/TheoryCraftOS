@@ -1703,6 +1703,17 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     return true;
   }
   void program_drop_done(bool taken) override { log.push_back(std::string("program_drop_done ") + (taken ? "1" : "0")); }
+  // program_drag: a program's drag over the desktop (not let go yet)
+  std::string program_drag_items;
+  int32_t drag_x = 0, drag_y = 0;
+  bool program_drag(String* text, int32_t* x, int32_t* y) override {
+    if (program_drag_items.empty()) return false;
+    text->assign(StringView(program_drag_items.c_str()));
+    *x = drag_x;
+    *y = drag_y;
+    return true;
+  }
+  void program_drag_answer(bool would_take) override { log.push_back(std::string("answer ") + (would_take ? "1" : "0")); }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
   uint32_t capture_window() override { return 0; }
@@ -1981,6 +1992,25 @@ static void test_drag_tracking() {
   CHECK(w.drop_at(250, 50, "/Linux/root/x.txt"));
   CHECK(!log.empty() && log.back() == "drop /Linux/root/x.txt from nowhere" && !w.drop_pending());
   CHECK(!w.drop_at(250, 200, "x") && !w.drop_at(250, 50, StringView()));      // (nobody there takes drops; nothing to drop)
+  // outside_drag_at: a drag with no source shown over the window; the answer is whether the control there would take it, nothing is dropped
+  log.clear();
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt") && w.outside_dragging());
+  CHECK((log == std::vector<std::string>{"over /Desktop/b.txt 50 50"}));
+  tracker.accept = false;
+  CHECK(!w.outside_drag_at(260, 50, "/Desktop/b.txt"));
+  CHECK(!w.outside_drag_at(250, 200, "/Desktop/b.txt") && !log.empty() && log.back() == "leave");      // (over a control that does not follow drags)
+  tracker.accept = true;
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt", "b.txt (+1)"));
+  log.clear();
+  w.outside_drag_end();
+  CHECK(!w.outside_dragging() && (log == std::vector<std::string>{"leave"}));
+  CHECK(!w.outside_drag_at(250, 50, StringView()));
+  // the window's own drag wins over one from outside, which is refused while it runs
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt"));
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  CHECK(w.dragging() && !w.outside_dragging() && !w.outside_drag_at(250, 50, "/Desktop/b.txt"));
+  w.mouse_button(250, 50, MouseButton::Left, false);
 }
 
 // The desktop's drags over a program's window go to its session (desktop_drag / desktop_drop), never to the program as mouse input; a program's drag let
@@ -2067,6 +2097,27 @@ static void test_windows_drag_bridge() {
   done = false;
   for (const std::string& e : s.log) done |= e == "program_drop_done 0";
   CHECK(done);
+  // a program's drag over the desktop before it is let go: shown on the desktop's window, and the program hears whether what is under it would take it
+  gui::Window* dw = wm.window();
+  s.program_drag_items = "/Desktop/Documents/a b.txt\n/Linux/root/x.txt";
+  s.drag_x = tp.x - mo.x + 30;
+  s.drag_y = tp.y - mo.y + 30;
+  s.log.clear();
+  log.clear();
+  for (int i = 0; i < 2; ++i) d.step(6000 + i * 20);
+  CHECK(dw && dw->outside_dragging());
+  CHECK(!s.log.empty() && s.log.back() == "answer 1");
+  bool dropped_early = false;
+  for (const std::string& e : log) dropped_early |= e.rfind("drop", 0) == 0;
+  CHECK(!dropped_early);
+  s.drag_x = 700;
+  s.drag_y = 500;
+  s.log.clear();
+  d.step(6100);
+  CHECK(!s.log.empty() && s.log.back() == "answer 0" && dw->outside_dragging());
+  s.program_drag_items.clear();
+  d.step(6200);
+  CHECK(!dw->outside_dragging());
   wm.remove_window(&from);
   wm.remove_window(&to);
 }

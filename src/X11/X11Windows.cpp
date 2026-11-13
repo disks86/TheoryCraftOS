@@ -76,7 +76,7 @@ enum WellKnown : uint32_t {
   kNetWmWindowTypeNotification, kNetWmWindowTypeCombo, kNetWmWindowTypeDnd, kNetWmWindowTypeSplash, kNetWmWindowTypeDock, kNetWmWindowTypeDesktop,
   kNetWmIcon, kNetWmPid, kNetFrameExtents, kNetRequestFrameExtents, kNetCloseWindow, kNetWmMoveresize, kNetMoveresizeWindow, kMotifWmHints,
   kNetWmAllowedActions, kNetWmActionMove, kNetWmActionResize, kNetWmActionMinimize, kNetWmActionMaximizeHorz, kNetWmActionMaximizeVert,
-  kNetWmActionClose, kNetWmActionFullscreen, kNetWmPing, kGtkShowWindowMenu, kLastWellKnown
+  kNetWmActionClose, kNetWmActionFullscreen, kNetWmPing, kGtkShowWindowMenu, kNetWmStrut, kNetWmStrutPartial, kLastWellKnown
 };
 
 constexpr const char* kWellKnownNames[] = {
@@ -90,7 +90,7 @@ constexpr const char* kWellKnownNames[] = {
     "_NET_WM_ICON", "_NET_WM_PID", "_NET_FRAME_EXTENTS", "_NET_REQUEST_FRAME_EXTENTS", "_NET_CLOSE_WINDOW", "_NET_WM_MOVERESIZE",
     "_NET_MOVERESIZE_WINDOW", "_MOTIF_WM_HINTS", "_NET_WM_ALLOWED_ACTIONS", "_NET_WM_ACTION_MOVE", "_NET_WM_ACTION_RESIZE", "_NET_WM_ACTION_MINIMIZE",
     "_NET_WM_ACTION_MAXIMIZE_HORZ", "_NET_WM_ACTION_MAXIMIZE_VERT", "_NET_WM_ACTION_CLOSE", "_NET_WM_ACTION_FULLSCREEN", "_NET_WM_PING",
-    "_GTK_SHOW_WINDOW_MENU"};
+    "_GTK_SHOW_WINDOW_MENU", "_NET_WM_STRUT", "_NET_WM_STRUT_PARTIAL"};
 static_assert(sizeof kWellKnownNames / sizeof kWellKnownNames[0] == kLastWellKnown - kWmProtocols, "one name per well-known atom");
 
 constexpr uint32_t kMaxChanges = 256;
@@ -144,7 +144,8 @@ Server::Server(allocators::IAllocator& allocator, Clock clock)
     set_property32(*root_, kNetCurrentDesktop, atom::kCardinal, zero);
     set_property32(*root_, kNetActiveWindow, atom::kWindow, zero);
   }
-  monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
+  monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)},
+                  {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
   monitor_count_ = 1;
   update_root_lists();
 }
@@ -634,7 +635,7 @@ void Server::property_changed(Window& w, uint32_t atom, bool deleted) {
       note_changed(w);
       break;
     case atom::kWmName: case kNetWmName: case atom::kWmHints: case atom::kWmNormalHints: case kMotifWmHints: case atom::kWmTransientFor:
-    case kNetWmWindowType: case kWmProtocols:
+    case kNetWmWindowType: case kWmProtocols: case kNetWmStrut: case kNetWmStrutPartial:
       note_changed(w);
       break;
     default: break;
@@ -714,7 +715,9 @@ void Server::place(Window& top) {
   frame_margins(top, &l, &t, &r, &b);
   uint32_t flags = 0;
   property32(top, atom::kWmNormalHints, 0, &flags);
-  const bool positioned = (flags & (1u | 4u)) != 0 || top.override_redirect || top.x != 0 || top.y != 0;
+  const uint32_t type = window_type(top);
+  const bool positioned = (flags & (1u | 4u)) != 0 || top.override_redirect || top.x != 0 || top.y != 0 || type == kNetWmWindowTypeDock ||
+                          type == kNetWmWindowTypeDesktop;      // (panels and desktop windows place themselves)
   if (positioned) {
     if (top.override_redirect || top.win_gravity == 10) return;      // (the inside goes where it was asked to: no frame, or StaticGravity)
     top.x += l;
@@ -1029,11 +1032,14 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
     monitor_count_ = 0;
     for (const Monitor& m : monitors) {
       if (monitor_count_ == 8) break;
+      const desktop::WindowsRect& panel = m.panel_area.width != 0 && m.panel_area.height != 0 ? m.panel_area : m.work;
       monitors_[monitor_count_++] = {{m.rect.x, m.rect.y, static_cast<int32_t>(m.rect.width), static_cast<int32_t>(m.rect.height)},
-                                     {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)}};
+                                     {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)},
+                                     {panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)}};
     }
     if (monitor_count_ == 0) {
-      monitors_[0] = {{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}, {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}};
+      monitors_[0] = {{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}, {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)},
+                      {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}};
       monitor_count_ = 1;
     }
     if (root_ && resized) {
@@ -1041,6 +1047,10 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       root_->height = height;
       send_configure_notify(*root_);
     }
+    // what a strut keeps is counted from the panel areas, which may have moved
+    if (root_)
+      for (Window* w : root_->children.view())
+        if (!w->input_only && (find_property(*w, kNetWmStrutPartial) || find_property(*w, kNetWmStrut))) note_changed(*w);
     update_root_lists();
   }
   wake();
@@ -1107,6 +1117,44 @@ void append_latin1(String* out, ConstByteView text) {
 
 }  // namespace
 
+// The space a window keeps along an edge of the screen (_NET_WM_STRUT_PARTIAL, else _NET_WM_STRUT: left, right, top, bottom, counted from the edge of the
+// root window) as the desktop takes it: one edge (the one that keeps the most), counted from that edge of the panel area of the monitor the window is
+// on (the desktop's taskbar is already outside it, so a dock along the taskbar's edge keeps only what goes past it). A partial strut's range must
+// cross that monitor.
+void Server::strut(Window& w, uint8_t* edge, uint32_t* size) {
+  *edge = 0;
+  *size = 0;
+  Property* p = find_property(w, kNetWmStrutPartial);
+  const bool partial = p && p->format == 32 && p->data.size() >= 12 * 4;
+  if (!partial) p = find_property(w, kNetWmStrut);
+  if (!p || p->format != 32 || p->data.size() < 4 * 4) return;
+  uint32_t v[12] = {};
+  for (uint32_t i = 0; i < (partial ? 12u : 4u); ++i) word_at(p->data.view(), i, &v[i]);
+  const int64_t cx = int64_t{w.x} + w.width / 2, cy = int64_t{w.y} + w.height / 2;
+  const WorkArea* m = &monitors_[0];
+  for (uint32_t i = 0; i < monitor_count_; ++i) {
+    const Rect& r = monitors_[i].rect;
+    if (cx >= r.x && cx < int64_t{r.x} + r.w && cy >= r.y && cy < int64_t{r.y} + r.h) m = &monitors_[i];
+  }
+  const Rect& a = m->panel;
+  // how far each edge of the panel area is from that edge of the screen (X's struts count from the screen's edges)
+  const int64_t from[4] = {a.x, int64_t{screen_w_} - (int64_t{a.x} + a.w), a.y, int64_t{screen_h_} - (int64_t{a.y} + a.h)};
+  // a partial strut's start and end (along the edge: y for left/right, x for top/bottom) against the monitor
+  const int64_t lo[4] = {m->rect.y, m->rect.y, m->rect.x, m->rect.x};
+  const int64_t hi[4] = {int64_t{m->rect.y} + m->rect.h, int64_t{m->rect.y} + m->rect.h, int64_t{m->rect.x} + m->rect.w, int64_t{m->rect.x} + m->rect.w};
+  static constexpr uint8_t kEdge[4] = {1, 3, 2, 4};      // left, right, top, bottom as WindowsWindowInfo's reserve_edge
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (v[i] == 0) continue;
+    if (partial && (int64_t{v[4 + 2 * i + 1]} < lo[i] || int64_t{v[4 + 2 * i]} >= hi[i])) continue;
+    const int64_t keep = int64_t{v[i]} - (from[i] > 0 ? from[i] : 0);
+    if (keep <= 0 || keep > 32767) continue;
+    if (static_cast<uint32_t>(keep) > *size) {
+      *size = static_cast<uint32_t>(keep);
+      *edge = kEdge[i];
+    }
+  }
+}
+
 bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) {
   kernel::ScopedMutex lock(mutex_);
   *out = desktop::WindowsWindowInfo();
@@ -1135,8 +1183,11 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
     ByteReader in(state->data.view());
     while (in.remaining() >= 4) if (in.le32() == kNetWmStateSkipTaskbar) skip_taskbar = true;
   }
-  out->tool = type == kNetWmWindowTypeUtility || type == kNetWmWindowTypeToolbar || skip_taskbar;
+  const bool dock = type == kNetWmWindowTypeDock, backdrop = type == kNetWmWindowTypeDesktop;
+  out->tool = type == kNetWmWindowTypeUtility || type == kNetWmWindowTypeToolbar || skip_taskbar || dock || backdrop;
   out->topmost = w->above;
+  out->layer = dock ? int8_t(1) : backdrop ? int8_t(-2) : int8_t(0);      // (a panel above the windows, a desktop window below them all)
+  strut(*w, &out->reserve_edge, &out->reserve);
   out->popup = w->override_redirect || type == kNetWmWindowTypeMenu || type == kNetWmWindowTypePopupMenu || type == kNetWmWindowTypeDropdownMenu ||
                type == kNetWmWindowTypeTooltip || type == kNetWmWindowTypeCombo || type == kNetWmWindowTypeDnd || type == kNetWmWindowTypeNotification;
   uint32_t transient = 0;

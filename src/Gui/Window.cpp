@@ -102,15 +102,16 @@ void Window::render() {
     Painter painter(*r, theme_);
     paint_tree(painter);
     if (popup_) popup_->paint_tree(painter);
-    if (drag_source_) {
-      // The dragged item follows the pointer: its name in a small box.
+    if (drag_source_ || outside_drag_) {
+      // The dragged item follows the pointer: its name in a small box (a program's item that nothing here would take: greyed).
       painter.renderer().reset_clip();
       const StringView name = drag_label_.empty() ? drag_text_.view().substr(drag_text_.view().rfind('/') + 1) : drag_label_.view();
       const int32_t w = Painter::text_width(name) + 8, h = Painter::kGlyphHeight + 4;
       const int32_t bx = cursor_.x + 14, by = cursor_.y + 14;
+      const bool lit = drag_source_ || outside_taken_;
       painter.fill({bx - 1, by - 1, static_cast<uint32_t>(w + 2), static_cast<uint32_t>(h + 2)}, theme_.dark);
-      painter.fill({bx, by, static_cast<uint32_t>(w), static_cast<uint32_t>(h)}, theme_.selection);
-      painter.text(bx + 4, by + 2, name, theme_.selection_text);
+      painter.fill({bx, by, static_cast<uint32_t>(w), static_cast<uint32_t>(h)}, lit ? theme_.selection : theme_.face);
+      painter.text(bx + 4, by + 2, name, lit ? theme_.selection_text : theme_.disabled_text);
     }
     if (cursor_visible_) {
       painter.renderer().reset_clip();
@@ -361,6 +362,7 @@ void Window::mouse_button(int32_t x, int32_t y, MouseButton button, bool pressed
 
 bool Window::begin_drag(Control* source, StringView text, StringView label) {
   UiGuard lock(this);
+  if (outside_drag_) outside_drag_end();      // (the window's own drag wins)
   if (drag_source_ || !source || captured_ != source || text.empty() || !drag_text_.assign(text) || !drag_label_.assign(label)) return false;
   drag_source_ = source;
   mark_dirty();
@@ -409,6 +411,42 @@ bool Window::drop_at(int32_t x, int32_t y, StringView text) {
   if (text.empty() || drop_target_) return false;      // (one drop waits for the handler thread at a time)
   mark_dirty();
   return offer_drop(x, y, text, nullptr) != nullptr;
+}
+
+bool Window::outside_drag_at(int32_t x, int32_t y, StringView text, StringView label) {
+  UiGuard lock(this);
+  if (drag_source_ || text.empty()) return false;
+  if (!outside_drag_ || !drag_text_.view().equals(text) || !drag_label_.view().equals(label)) {
+    if (!drag_text_.assign(text) || !drag_label_.assign(label)) {
+      outside_drag_end();
+      return false;
+    }
+  }
+  outside_drag_ = true;
+  track_drag(x, y);
+  bool taken = false;
+  Point origin;
+  for (Control* c = target_at(x, y, &origin); c; c = c->parent_) {
+    if (!c->effectively_enabled()) break;      // (as offer_drop)
+    const Point o = c->window_origin();
+    if (c->accepts_drop(drag_text_.view(), x - o.x, y - o.y, nullptr)) {
+      taken = true;
+      break;
+    }
+  }
+  outside_taken_ = taken;
+  mark_dirty();
+  return taken;
+}
+
+void Window::outside_drag_end() {
+  UiGuard lock(this);
+  if (!outside_drag_) return;
+  leave_drag(nullptr);
+  outside_drag_ = outside_taken_ = false;
+  drag_text_.clear();
+  drag_label_.clear();
+  mark_dirty();
 }
 
 void Window::cancel_drag() {

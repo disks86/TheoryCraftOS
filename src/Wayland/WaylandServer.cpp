@@ -45,7 +45,7 @@ constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 }  // namespace
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
-    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator), touches_(allocator), desktop_drag_text_(allocator), desktop_drag_uri_(allocator), desktop_drag_linux_(allocator), program_drop_(allocator) {
+    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator), touches_(allocator), desktop_drag_text_(allocator), desktop_drag_uri_(allocator), desktop_drag_linux_(allocator), program_drop_(allocator), program_drag_(allocator) {
   monitors_[0].rect = monitors_[0].work = monitors_[0].panel = {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)};
 }
 

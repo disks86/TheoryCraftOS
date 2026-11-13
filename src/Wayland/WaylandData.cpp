@@ -275,6 +275,14 @@ void Server::pipe_ready(uint32_t job, Fd write_end) {
       send(*c, e);
       return;
     }
+    if (job != 0 && job == program_drag_.job && !program_drag_.read) {      // a drag over the desktop: the same, before it is let go
+      Client* c = client_of(program_drag_.client);
+      if (!c || !source_of(program_drag_.client, program_drag_.source)) return;
+      Event e(program_drag_.source, 1);      // send(mime, fd)
+      e.string(program_drag_.mime.view()).fd(write_end);
+      send(*c, e);
+      return;
+    }
     if (job == 0 || job != fetch_job_ || !source_of(sel_client_, sel_source_)) return;      // (the selection changed meanwhile: the pipe is closed unused)
     Client* c = client_of(sel_client_);
     Event e(sel_source_, 1);      // send(mime, fd)
@@ -292,6 +300,11 @@ void Server::pipe_read_done(uint32_t job, ConstByteView data) {
     kernel::ScopedMutex lock(mutex_);
     if (job != 0 && job == program_drop_.job) {
       program_drop_read(data);      // (WaylandDragBridge.cpp)
+      return;
+    }
+    if (job != 0 && job == program_drag_.job && !program_drag_.read) {
+      program_drag_.read = true;
+      drop_items(data, program_drag_.uri, &program_drag_.text);      // (empty: nothing for the desktop; the drag is not shown there)
       return;
     }
     if (job == 0 || job != fetch_job_) return;
@@ -325,6 +338,7 @@ void Server::source_gone(Client& c, uint32_t source) {
     end_drag(false);
   }
   if (program_drop_.job != 0 && program_drop_.client == c.number && program_drop_.source == source) reset_program_drop();
+  if (program_drag_.job != 0 && program_drag_.client == c.number && program_drag_.source == source) reset_program_drag();
 }
 
 // ------------------------------------------------------------------ requests
@@ -548,6 +562,7 @@ void Server::start_drag(Client& c, uint32_t source, Surface* origin) {
   }
   Surface* icon = drag_.icon;
   drag_ = Drag();
+  reset_program_drag();
   drag_.active = true;
   drag_.client = c.number;
   drag_.source = source;
@@ -563,6 +578,7 @@ void Server::drag_at(int32_t x, int32_t y) {
   int32_t lx = 0, ly = 0;
   Surface* under = surface_at(x, y, &lx, &ly);
   if (under && drag_.source == 0 && !drag_.desktop && under->client != drag_.client) under = nullptr;      // (a drag without data stays in its client)
+  program_drag_at(x, y, under == nullptr);      // (a client's drag over the desktop: WaylandDragBridge.cpp)
   if (under != drag_.focus) {
     drag_focus(under, lx, ly);
     return;
@@ -647,6 +663,7 @@ void Server::end_drag(bool dropped) {
   if (Client* sc = client_of(drag_.client); sc && source_of(drag_.client, drag_.source)) send(*sc, Event(drag_.source, 2));      // cancelled
   const bool was_active = drag_.active;
   drag_ = Drag();
+  reset_program_drag();
   if (was_active) pointer_moved(false);
 }
 

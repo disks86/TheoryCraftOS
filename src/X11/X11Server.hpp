@@ -300,6 +300,7 @@ class Server final : public desktop::IWindowsSession {
   bool decorated(Window& top);
   bool property32(Window& w, uint32_t atom, uint32_t index, uint32_t* out);
   uint32_t window_type(Window& w);
+  void strut(Window& w, uint8_t* edge, uint32_t* size);
   Rect work_area_for(Window& top);
   void set_maximized(Window& top, bool on);
   void set_fullscreen(Window& top, bool on);
@@ -373,7 +374,7 @@ class Server final : public desktop::IWindowsSession {
   // the screen and the desktop
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
-    Rect rect, work;
+    Rect rect, work, panel;      // panel: the work area without what windows reserve (where panels are placed)
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 0;

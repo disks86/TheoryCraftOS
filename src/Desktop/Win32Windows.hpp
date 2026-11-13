@@ -107,7 +107,7 @@ class Win32Windows {
  public:
   static constexpr uint32_t kHoldPumps = 30;
 
-  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator), drop_items_(allocator) {}
+  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator), drop_items_(allocator), drag_items_(allocator), drag_label_(allocator) {}
   ~Win32Windows();
   // Null: none (the frames are taken down).
   void set_session(IWindowsSession* session, gui::WindowManager* manager);
@@ -184,6 +184,9 @@ class Win32Windows {
   bool compose_key(uint8_t usage, uint8_t modifiers);
   // A program's drag dropped on the desktop (IWindowsSession::take_program_drop): its items, the next to drop, where.
   void pump_program_drop(gui::WindowManager& manager);
+  void pump_program_drag(gui::WindowManager& manager);      // a program's drag over the desktop: shown, and the program told whether it would be taken
+  gui::Window* drag_window_ = nullptr;                       // the window showing it (null: none)
+  String drag_items_, drag_label_;
   bool dropping_ = false, drop_taken_ = false;
   String drop_items_;
   uint64_t drop_next_ = 0;
