@@ -23,7 +23,8 @@
 //
 // The touchpad becomes a relative mouse: one finger moves the pointer (16 counts to the millimetre), two fingers scroll (a wheel notch for each 6 mm), a tap clicks (one finger:
 // left, two: right, three: middle; a touch shorter than 220 ms that moves less than 2.5 mm), the pad's own button clicks (the bottom right quarter is the right button). A touch
-// the device marks as not confident (a palm) is ignored. The touchscreen becomes an absolute pointer: the first finger down is the left button at its position.
+// the device marks as not confident (a palm) is ignored. The touchscreen is a touch device (touch(): its contacts as touch events) and, while its pointer emulation
+// is on, also an absolute pointer: the first finger down is the left button at its position.
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
@@ -34,6 +35,8 @@
 #include "Hardware/Bus/I2c/I2cHidDevice.hpp"
 #include "Hardware/Clock/IClock.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
+#include "Hardware/Touch/ITouch.hpp"
+#include "Hardware/Touch/TouchTracker.hpp"
 #include "Kernel/Sync.hpp"
 
 namespace hardware {
@@ -66,8 +69,24 @@ class I2cHidPointer final : public IMouse, public IHidFunctionHost {
   bool is_absolute() const override { return kind_ == Kind::Touchscreen; }
   uint32_t max_x() const override { return kind_ == Kind::Touchscreen ? range_x_ : 0; }
   uint32_t max_y() const override { return kind_ == Kind::Touchscreen ? range_y_ : 0; }
+  // The touchscreen's contacts (null for a touchpad or a mouse): a touch device of its own, read from the same reports.
+  ITouch* touch() { return kind_ == Kind::Touchscreen ? &touch_side_ : nullptr; }
 
  private:
+  class TouchSide final : public ITouch {
+   public:
+    explicit TouchSide(I2cHidPointer& owner) : owner_(owner) {}
+    const char* name() const override { return owner_.name(); }
+    bool initialize() override { return true; }
+    void shutdown() override {}
+    bool poll(TouchEvent* out) override { return owner_.poll_touch(out); }
+    void set_pointer_emulation(bool on) override { owner_.set_pointer_emulation(on); }
+   private:
+    I2cHidPointer& owner_;
+  };
+  bool poll_touch(TouchEvent* out);
+  void set_pointer_emulation(bool on);
+
   struct Contact {
     bool down = false;               // tip switch (and confident)
     uint32_t id = 0;
@@ -113,6 +132,11 @@ class I2cHidPointer final : public IMouse, public IHidFunctionHost {
   Contact frame_contacts_[kMaxContacts];
   uint32_t frame_count_ = 0, frame_expected_ = 0, frame_collected_ = 0;
   bool frame_open_ = false;
+
+  // the touchscreen's contacts as touch events, and whether it is also a mouse
+  TouchSide touch_side_{*this};
+  TouchTracker touches_;
+  bool emulation_ = true;
 
   // the touchpad's gesture state
   Track previous_[kMaxContacts];

@@ -36,7 +36,7 @@ constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one r
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
 enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, ClockGetres, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, ClockNanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
-  SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Getppid, Madvise,
+  SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Time, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
@@ -59,7 +59,7 @@ constexpr NumberEntry kNumbers[] = {
     {158, kAbsent, Call::ArchPrctl}, {16, 29, Call::Ioctl},     {5, 80, Call::Fstat},         {262, 79, Call::Newfstatat},
     {8, 62, Call::Lseek},          {257, 56, Call::Openat},     {267, 78, Call::Readlinkat},  {13, 134, Call::RtSigaction},
     {14, 135, Call::RtSigprocmask}, {131, 132, Call::Sigaltstack}, {273, 99, Call::SetRobustList}, {334, 293, Call::Rseq},
-    {302, 261, Call::Prlimit64},   {318, 278, Call::Getrandom}, {96, 169, Call::Gettimeofday}, {110, 173, Call::Getppid},
+    {302, 261, Call::Prlimit64},   {318, 278, Call::Getrandom}, {96, 169, Call::Gettimeofday}, {201, kAbsent, Call::Time}, {110, 173, Call::Getppid},
     {28, 233, Call::Madvise},
     {2, kAbsent, Call::Open},      {4, kAbsent, Call::Stat},    {6, kAbsent, Call::Lstat},    {17, 67, Call::Pread},
     {18, 68, Call::Pwrite},        {19, 65, Call::Readv},       {217, 61, Call::Getdents64},  {83, kAbsent, Call::Mkdir},
@@ -394,6 +394,11 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Prlimit64: return do_prlimit(process, a[1], a[3]);
       case Call::Getrandom: return do_getrandom(process, a[0], a[1]);
       case Call::Gettimeofday: return do_gettimeofday(process, a[0]);
+      case Call::Time: {      // time(tloc): the seconds since 1970, also stored at tloc when it is not null (x86-64 only: the generic table has no time)
+        const uint64_t seconds = process.host().realtime_ns() / 1000000000u;
+        if (a[0] != 0 && !process.write_user_u64(a[0], seconds)) return error(kEfault);
+        return seconds;
+      }
       case Call::Getppid: return 0;
       case Call::MemfdCreate: return linuxabi::sys_memfd_create(process, a[0], a[1]);
       case Call::Fallocate: return linuxabi::sys_fallocate(process, a[0], a[1], a[2], a[3]);

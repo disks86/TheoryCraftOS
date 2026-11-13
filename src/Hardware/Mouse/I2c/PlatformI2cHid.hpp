@@ -39,6 +39,7 @@
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Mouse/I2c/I2cHidPointer.hpp"
 #include "Hardware/Pen/CompositePen.hpp"
+#include "Hardware/Touch/CompositeTouch.hpp"
 #include "Hardware/Pen/I2c/I2cHidPen.hpp"
 #include "Hardware/Sensor/HidSensor.hpp"
 #include "Hardware/Sensor/SensorHub.hpp"
@@ -65,6 +66,8 @@ class PlatformI2cHid {
 
   // Where the pens and the sensors of the devices go (before start(); without them those functions are left alone).
   void set_pens(CompositePen* pens) { pens_ = pens; }
+  // Where the touchscreens' contacts go (each touchscreen is a mouse as well, until the touches are read: ITouch).
+  void set_touches(CompositeTouch* touches) { touches_ = touches; }
   void set_sensors(SensorHub* sensors) { sensors_ = sensors; }
   // Loads the tables, finds the devices, brings them up. Returns how many pointers were added to `mice`.
   uint32_t start(const AcpiTables& tables, CompositeMouse& mice);
@@ -116,6 +119,7 @@ class PlatformI2cHid {
   List<UniquePointer<GpioAttentionLine>> lines_;
   List<UniquePointer<Pointer>> pointers_;
   CompositePen* pens_ = nullptr;
+  CompositeTouch* touches_ = nullptr;
   SensorHub* sensors_ = nullptr;
   Report reports_[kMaxReports];
   uint32_t report_count_ = 0, tables_loaded_ = 0;

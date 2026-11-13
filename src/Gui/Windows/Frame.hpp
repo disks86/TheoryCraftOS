@@ -29,15 +29,20 @@
 // half of the desktop area - the left or right half, or the upper or lower one - and pressing the one of the edge the window is docked at
 // puts it back. A sixth button tiles all the windows (up to four, the topmost ones) into a grid, a quarter of the area each. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
 // and restoring that brings back the size it had before it was docked.
+// The window menu (Restore, Minimize, Maximize, Close, as the taskbar button's menu has them) opens on a right click on the title bar, on Alt+Space, and when a
+// program of another windowing system asks for it (show_window_menu: a Wayland client's xdg_toplevel.show_window_menu, which draws its own title bar).
 #pragma once
 #include "Gui/Control.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace gui {
 
 class WindowManager;
 class TabFrame;
+class ContextMenu;
+class MenuItem;
 
 class Frame : public Control {
  public:
@@ -50,6 +55,7 @@ class Frame : public Control {
                               DockLeft, DockRight, DockTop, DockBottom, Tile };
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator), icon_(allocator) {}
+  ~Frame();
 
   void set_title(StringView title) {
     UiGuard lock(this);
@@ -128,6 +134,11 @@ class Frame : public Control {
   // The tile button: the windows are arranged in a grid (see WindowManager::tile()); pressed again by a tiled window, they all go back.
   void tile();
 
+  // Opens the window menu at (x, y), frame coordinates (from_keyboard: its first item highlighted). False when it cannot (the frame is in no window, is a
+  // tab, or a menu is open already). The menu is made the first time.
+  bool show_window_menu(int32_t x, int32_t y, bool from_keyboard = false);
+  ContextMenu* window_menu() const { return window_menu_.get(); }      // (tests: null until it was first opened)
+
   // Where a point (frame coordinates) lies: a button, the title bar, a border, the client area.
   Part part_at(int32_t x, int32_t y) const;
   Rect2D button_rect(Part button) const;
@@ -159,6 +170,11 @@ class Frame : public Control {
   friend class WindowManager;
   friend class TabFrame;
   void host_changed_title();
+  static void menu_opening(void* self, Control&);
+  static void menu_restore(void* self, Control&);
+  static void menu_minimize(void* self, Control&);
+  static void menu_maximize(void* self, Control&);
+  static void menu_close(void* self, Control&);
 
   bool button_enabled(Part button) const;
   void draw_button(Painter& painter, Part button);
@@ -188,6 +204,9 @@ class Frame : public Control {
   Part dragging_ = Part::None;  // TitleBar (moving) or a border (resizing)
   int32_t grab_x_ = 0, grab_y_ = 0;
   Rect2D grab_bounds_;
+  // The window menu (made when first opened).
+  UniquePointer<ContextMenu> window_menu_;
+  MenuItem *restore_item_ = nullptr, *minimize_item_ = nullptr, *maximize_item_ = nullptr, *close_item_ = nullptr;
 };
 
 }  // namespace gui

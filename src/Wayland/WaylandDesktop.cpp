@@ -102,6 +102,15 @@ uint32_t Server::take_drag(uint32_t* edge) {
   return w;
 }
 
+uint32_t Server::take_window_menu(int32_t* x, int32_t* y) {
+  kernel::ScopedMutex lock(mutex_);
+  const uint32_t w = menu_window_;
+  *x = menu_x_;
+  *y = menu_y_;
+  menu_window_ = 0;
+  return w;
+}
+
 void Server::windows(List<uint32_t>* out) {
   kernel::ScopedMutex lock(mutex_);
   out->clear();

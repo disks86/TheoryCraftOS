@@ -1388,6 +1388,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SensorHub sensors;
   input.mice().add(&pen_mouse);
   i2c_hid.set_pens(&pens);
+  i2c_hid.set_touches(&input.touches());
   i2c_hid.set_sensors(&sensors);
   if (paging_ok && i2c_acpi_tables.initialize()) {
     const uint32_t started = i2c_hid.start(i2c_acpi_tables, input.mice());
@@ -1522,6 +1523,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
+    desktop.set_touch(&input.touches());      // (touchscreens: virtio-multitouch and the I2C ones)
+    desktop.set_pens(&pens, &pen_mouse);       // (the pen mouse stops: the desktop moves the pointer with pens nobody takes)
     desktop.window().show_cursor(input.mice().count() > 0);
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);

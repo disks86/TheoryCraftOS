@@ -26,6 +26,7 @@
 #include <map>
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -561,6 +562,155 @@ struct FakeMouse final : hardware::IMouse {
   void move(int32_t dx, int32_t dy, uint8_t buttons) { events[tail++] = {dx, dy, 0, buttons, false, 0, 0, 0, 0}; }
   void at(uint32_t x, uint32_t y, uint8_t buttons) { events[tail++] = {0, 0, 0, buttons, true, x, y, 32767, 32767}; }
 };
+
+// A touchscreen whose range is the screen's pixels (max 799 x 599), so a contact lands on the pixel it names.
+struct FakeTouch final : hardware::ITouch {
+  std::vector<hardware::TouchEvent> events;
+  bool emulation = true;
+  const char* name() const override { return "fake touch"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool poll(hardware::TouchEvent* out) override {
+    if (events.empty()) return false;
+    *out = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  void set_pointer_emulation(bool on) override { emulation = on; }
+  void put(hardware::TouchPhase phase, uint32_t id, uint32_t x, uint32_t y, uint32_t mx = 799, uint32_t my = 599) {
+    hardware::TouchEvent e;
+    e.phase = phase, e.id = id, e.x = x, e.y = y, e.max_x = mx, e.max_y = my;
+    events.push_back(e);
+  }
+};
+
+// A pen whose range is the screen's pixels.
+struct FakePen final : hardware::IPen {
+  std::vector<hardware::PenEvent> events;
+  const char* name() const override { return "fake pen"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool poll(hardware::PenEvent* out) override {
+    if (events.empty()) return false;
+    *out = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  uint32_t max_x() const override { return 799; }
+  uint32_t max_y() const override { return 599; }
+  uint16_t max_pressure() const override { return 1000; }
+  bool has_tilt() const override { return true; }
+  void put(bool in_range, bool tip, uint32_t x, uint32_t y, uint8_t buttons = 0, uint16_t pressure = 0, uint32_t mx = 799, uint32_t my = 599) {
+    hardware::PenEvent e;
+    e.in_range = in_range, e.tip = tip, e.x = x, e.y = y, e.buttons = buttons, e.pressure = pressure, e.max_pressure = 1000, e.max_x = mx, e.max_y = my;
+    events.push_back(e);
+  }
+};
+
+// Pens in the input pump: offered to the tap first; one it does not take is the pointer (the tip the left button, the barrel the right one).
+struct PenTapLog {
+  int calls = 0;
+  bool take = false;
+  static bool tap(void* self, const hardware::PenEvent&, int32_t, int32_t) {
+    auto* l = static_cast<PenTapLog*>(self);
+    ++l->calls;
+    return l->take;
+  }
+};
+
+static void test_input_pump_pen() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    Button b(a);
+    b.set_bounds({10, 10, 60, 30});
+    w.add(&b);
+    w.layout();
+    Counter clicks;
+    b.on_click(clicks.handler());
+    FakePen pen;
+    PenTapLog log;
+    InputPump pump(w, nullptr, nullptr);
+    pump.set_pen(&pen, &PenTapLog::tap, &log);
+    // hovering moves the pointer; the tip on the button and lifted clicks it
+    pen.put(true, false, 150, 80, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 150 && pump.cursor().y == 80 && clicks.count == 0);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pen.put(true, true, 20, 20, 0, 500, 199, 99);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && log.calls == 4);
+    // the same report again: nothing for the pointer (no move, no click)
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1);
+    // taken by a program: the pointer does not move
+    log.take = true;
+    pen.put(true, true, 100, 50, 0, 500, 199, 99);
+    pen.put(true, false, 100, 50, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 20 && clicks.count == 1);
+  }
+  CHECK(a.live == 0);
+}
+
+// Touches in the input pump: the tap is asked first; a contact it does not take is the left button where it is (one at a time).
+struct TouchTapLog {
+  std::vector<std::string> calls;
+  uint32_t take_id = 999;
+  static bool tap(void* self, const hardware::TouchEvent& e, int32_t x, int32_t y) {
+    auto* l = static_cast<TouchTapLog*>(self);
+    l->calls.push_back(std::to_string(int(e.phase)) + " " + std::to_string(e.id) + " " + std::to_string(x) + " " + std::to_string(y));
+    return e.id == l->take_id;
+  }
+};
+
+static void test_input_pump_touch() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    Button b(a);
+    b.set_bounds({10, 10, 60, 30});
+    w.add(&b);
+    w.layout();
+    Counter clicks;
+    b.on_click(clicks.handler());
+    FakeTouch touch;
+    TouchTapLog log;
+    InputPump pump(w, nullptr, nullptr);
+    pump.set_touch(&touch, &TouchTapLog::tap, &log);
+    // a finger on the button, lifted: a click there; the tap was asked each time, in window coordinates
+    touch.put(hardware::TouchPhase::Down, 1, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 1, 20, 20, 199, 99);
+    CHECK(pump.pump() == 2);
+    CHECK(clicks.count == 1 && pump.cursor().x == 20 && pump.cursor().y == 20);
+    CHECK(log.calls.size() == 2 && log.calls[0] == "0 1 20 20" && log.calls[1] == "2 1 20 20");
+    // a second finger while the first is down: not the button (only the first finger is)
+    touch.put(hardware::TouchPhase::Down, 2, 150, 80, 199, 99);
+    touch.put(hardware::TouchPhase::Down, 3, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 3, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 2, 150, 80, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && pump.cursor().x == 150);
+    // a finger the tap takes: no pointer at all
+    log.take_id = 4;
+    touch.put(hardware::TouchPhase::Down, 4, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 4, 20, 20, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && pump.cursor().x == 150);
+    // cancel lets the button go where the finger was (a mouse has no cancel: for the button it is a release, so a click)
+    touch.put(hardware::TouchPhase::Down, 5, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Cancel, 5, 20, 20, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 2);
+  }
+  CHECK(a.live == 0);
+}
 
 static void test_input_pump() {
   TestAllocator a;
@@ -1438,6 +1588,9 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   uint32_t monitor_count = 0;
   uint32_t drag_window = 0, drag_edge = 0;
   uint32_t take_drag(uint32_t* edge) override { const uint32_t w = drag_window; *edge = drag_edge; drag_window = drag_edge = 0; return w; }
+  uint32_t menu_window = 0;
+  int32_t menu_x = 0, menu_y = 0;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override { const uint32_t w = menu_window; *x = menu_x; *y = menu_y; menu_window = 0; return w; }
   Pointer ptr;
   void pointer(Pointer* out) override { *out = ptr; }
   // cursor 50: a 2 x 2 picture; icon 60: a 16 x 16 red one; anything else a system shape
@@ -1498,6 +1651,18 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   void mouse_motion(int32_t dx, int32_t dy) override { note("motion", dx, dy); cx += dx; cy += dy; clamp(); }
   void mouse_position(int32_t x, int32_t y) override { note("position", x, y); cx = x; cy = y; clamp(); }
   void mouse_button(uint32_t button, bool down) override { note("button", int32_t(button), down); }
+  bool take_touches = false, take_pens = false;
+  bool pen(const desktop::PenInput& p) override {
+    if (!take_pens) return false;
+    log.push_back("pen " + std::to_string(p.in_range) + " " + std::to_string(p.tip) + " " + std::to_string(p.window) + " " + std::to_string(p.x) + " " +
+                  std::to_string(p.y) + " " + std::to_string(p.pressure));
+    return true;
+  }
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override {
+    if (phase == hardware::TouchPhase::Down && !take_touches) return false;
+    log.push_back("touch " + std::to_string(int(phase)) + " " + std::to_string(id) + " " + std::to_string(window) + " " + std::to_string(x) + " " + std::to_string(y));
+    return true;
+  }
   void mouse_wheel(int32_t notches) override { note("wheel", notches, 0); }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
@@ -1508,6 +1673,90 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     cy = cy < 120 ? 120 : cy > 140 ? 140 : cy;
   }
 };
+
+// Touches over a program's window: a session that takes them gets the contact (with the window and the programs' coordinates) to its end; one that does
+// not has the pointer moved and pressed for it; the devices stop emulating a mouse once the desktop reads them.
+static void test_windows_touch() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeTouch touch;
+    FakeWindowsSession s(a);
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_windows_session(&s);
+    d.set_touch(&touch);
+    CHECK(!touch.emulation);
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    const Point mo = wm.window_origin();
+    s.add(7, true, {100, 80, 200, 150}, "Notepad", true);
+    d.step(1000);
+    s.log.clear();
+    // taken: Down names window 7, Motion and Up follow (also outside the window)
+    s.take_touches = true;
+    touch.put(hardware::TouchPhase::Down, 1, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Motion, 1, uint32_t(mo.x + 500), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Up, 1, uint32_t(mo.x + 500), uint32_t(mo.y + 120));
+    d.step(2000);
+    std::vector<std::string> touches;
+    for (const std::string& e : s.log) if (e.rfind("touch", 0) == 0) touches.push_back(e);
+    CHECK(touches.size() == 3 && touches[0] == "touch 0 1 7 150 120" && touches[1] == "touch 1 1 0 500 120" && touches[2] == "touch 2 1 0 500 120");
+    bool pointer = false;
+    for (const std::string& e : s.log) pointer |= e.rfind("button", 0) == 0;
+    CHECK(!pointer);      // (no pointer emulation for a taken contact)
+    s.log.clear();
+    // refused: the pointer goes there and presses, as a mouse would
+    s.take_touches = false;
+    touch.put(hardware::TouchPhase::Down, 2, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Up, 2, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    d.step(3000);
+    bool pressed = false, released = false;
+    for (const std::string& e : s.log) {
+      pressed |= e == "button 1 1";
+      released |= e == "button 1 0";
+    }
+    CHECK(pressed && released && d.pointer().x == mo.x + 150 && d.pointer().y == mo.y + 120);
+    // on the desktop (no program's window): the desktop's pointer, the session not asked
+    s.log.clear();
+    s.take_touches = true;
+    touch.put(hardware::TouchPhase::Down, 3, uint32_t(mo.x + 600), uint32_t(mo.y + 400));
+    touch.put(hardware::TouchPhase::Up, 3, uint32_t(mo.x + 600), uint32_t(mo.y + 400));
+    d.step(4000);
+    bool asked = false;
+    for (const std::string& e : s.log) asked |= e.rfind("touch", 0) == 0;
+    CHECK(!asked && d.pointer().x == mo.x + 600);
+
+    // pens: the pen mouse stops once the desktop reads the pens; a session that takes the pen gets it (the pressure scaled to 65535) until it leaves the
+    // range; one that does not has the pointer moved by it
+    FakePen pens;
+    hardware::CompositePen all_pens;
+    all_pens.add(&pens);
+    hardware::PenMouse pen_mouse(all_pens);
+    d.set_pens(&all_pens, &pen_mouse);
+    hardware::MouseEvent nothing;
+    pens.put(true, false, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    CHECK(!pen_mouse.poll(&nothing) && pens.events.size() == 1);      // (disabled: it leaves the pen's events alone)
+    s.log.clear();
+    s.take_pens = true;
+    pens.put(true, true, uint32_t(mo.x + 150), uint32_t(mo.y + 120), 0, 500);
+    pens.put(true, true, uint32_t(mo.x + 600), uint32_t(mo.y + 120), 0, 1000);      // (outside the window, still the session's)
+    pens.put(false, false, uint32_t(mo.x + 600), uint32_t(mo.y + 120));
+    d.step(5000);
+    std::vector<std::string> pen_log;
+    for (const std::string& e : s.log) if (e.rfind("pen", 0) == 0) pen_log.push_back(e);
+    CHECK(pen_log.size() == 4 && pen_log[0] == "pen 1 0 7 150 120 0" && pen_log[1] == "pen 1 1 7 150 120 32767" && pen_log[2] == "pen 1 1 0 600 120 65535" &&
+          pen_log[3] == "pen 0 0 0 600 120 0");
+    CHECK(d.pointer().x == mo.x + 600);      // (the pointer did not follow the pen)
+    s.take_pens = false;
+    pens.put(true, false, uint32_t(mo.x + 160), uint32_t(mo.y + 130));
+    d.step(6000);
+    CHECK(d.pointer().x == mo.x + 160 && d.pointer().y == mo.y + 130);
+    d.set_windows_session(nullptr);
+  }
+  CHECK(a.live == 0);
+}
 
 static void test_windows_screen() {
   TestAllocator a;
@@ -1735,6 +1984,24 @@ static void test_windows_more() {
     CHECK(h8->bounds().x == 330 && h8->bounds().width == 240 && h8->bounds().height == 160);
     mouse.move(0, 0, 0);
     d.step(13000);
+
+    // the window menu the program asks for (its own title bar): the frame's, where it asked (client coordinates); Minimize there minimizes the window
+    CHECK(h8->window_menu() == nullptr || !h8->window_menu()->open());
+    s.menu_window = 8;
+    s.menu_x = 15;
+    s.menu_y = 4;
+    d.step(13100);
+    CHECK(h8->window_menu() && h8->window_menu()->open());
+    if (h8->window_menu() && d.window().popup()) {
+      const gui::Rect2D pop = d.window().popup()->bounds();
+      const gui::Point client = h8->view().window_origin();
+      CHECK(pop.x == client.x + 15 && pop.y == client.y + 4);
+      CHECK(!h8->window_menu()->find_item("Restore")->enabled() && h8->window_menu()->find_item("Close")->enabled());
+      d.window().close_popup();
+    }
+    s.menu_window = 99;      // (no such window: nothing opens)
+    d.step(13200);
+    CHECK(!d.window().popup());
 
     // the cursor the program shows over its windows
     CHECK(h8->picture_area(&pic));
@@ -1964,6 +2231,8 @@ int main() {
   test_menu();
   test_rendering();
   test_input_pump();
+  test_input_pump_touch();
+  test_input_pump_pen();
   test_select_all_from_keyboard();
   test_desktop();
   test_desktop_monitors();
@@ -1974,6 +2243,7 @@ int main() {
   test_switcher();
   test_desktop_toasts();
   test_windows_screen();
+  test_windows_touch();
   test_x11_frames();
   test_windows_more();
   test_font_unicode();

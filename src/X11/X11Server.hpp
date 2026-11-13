@@ -22,7 +22,7 @@
 // desktop::IWindowsSession the Windows programs' windows use (Win32Windows.hpp), so an X window and a Win32 window get the same frame, title bar, buttons,
 // taskbar button and Alt+Tab place, and are moved, sized, minimized, maximized, activated and closed the same way. The server is an ICCCM / EWMH window
 // manager on the inside: a top-level's requested position is its frame's (NorthWest gravity), its title comes from _NET_WM_NAME or WM_NAME, WM_DELETE_WINDOW
-// closes it politely, _MOTIF_WM_HINTS without decorations and override-redirect windows get no frame, _NET_WM_MOVERESIZE starts a drag of the frame, and
+// closes it politely, _MOTIF_WM_HINTS without decorations and override-redirect windows get no frame, _NET_WM_MOVERESIZE starts a drag of the frame, _GTK_SHOW_WINDOW_MENU opens its window menu, and
 // _NET_WM_STATE / WM_CHANGE_STATE maximize and minimize it. Other window managers cannot run (selecting SubstructureRedirect on the root is BadAccess).
 //
 // Pictures. Every top-level window has one picture of its inside (32-bit 0xAARRGGBB pixels); its subwindows draw into the part of it that they cover,
@@ -126,6 +126,7 @@ class Server final : public desktop::IWindowsSession {
   void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) override;
   void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) override;
   uint32_t take_drag(uint32_t* edge) override;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override;
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
@@ -381,6 +382,8 @@ class Server final : public desktop::IWindowsSession {
   List<Change> changes_;
   bool changes_overflow_ = false;
   uint32_t drag_window_ = 0, drag_edge_ = 0;
+  uint32_t menu_window_ = 0;      // _GTK_SHOW_WINDOW_MENU of a top-level, until the desktop takes it
+  int32_t menu_x_ = 0, menu_y_ = 0;
   uint32_t place_counter_ = 0;
   uint32_t next_icon_ = 0x80000001u;
   // focus and input

@@ -1208,7 +1208,16 @@ void Server::toplevel_request(Client& c, uint32_t id, Resource& r, uint16_t opco
       return;
     }
     case 3: in.string(); return;      // set_app_id
-    case 4: in.object(); in.u(); in.i(); in.i(); return;      // show_window_menu
+    case 4: {      // show_window_menu(seat, serial, x, y): the desktop opens the frame's window menu there (x, y: of the window geometry, its client area)
+      in.object();
+      in.u();
+      const int32_t x = in.i(), y = in.i();
+      if (!in.ok() || !s || !s->mapped) return;
+      menu_window_ = s->window;
+      menu_x_ = x;
+      menu_y_ = y;
+      return;
+    }
     case 5:        // move(seat, serial)
     case 6: {      // resize(seat, serial, edges)
       in.object();

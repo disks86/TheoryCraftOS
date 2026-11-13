@@ -41,7 +41,9 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   client-side shadow is outside the frame and is neither drawn nor hit.
 - **Decorations.** A client that asks for an `zxdg_toplevel_decoration_v1` always gets `server_side`: the desktop draws its frame, like a Win32
   window's. A client that does not ask (GTK) draws its own and moves or sizes itself with `xdg_toplevel.move` / `resize`, which become the
-  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does.
+  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does; its right click on that title bar sends
+  `xdg_toplevel.show_window_menu`, and the desktop opens the frame's window menu there (`take_window_menu`: Restore, Minimize, Maximize, Close, the
+  menu every frame has on its title bar and on Alt+Space).
 - **Configure.** The first commit gets a configure with size 0 x 0 (the client chooses), `configure_bounds` (the work area inside a frame) and
   `wm_capabilities` (maximize, fullscreen, minimize). The user sizing the frame sends a configure with the new size; until the client commits after
   acknowledging it, the desktop is told the asked-for size and paints what the buffer does not cover black, as for a Win32 window that has not caught
@@ -98,6 +100,20 @@ transform stretches an upright crop and leaves a turned picture undrawn. A surfa
 
 ## Copy and paste, drag and drop
 
+- **Touch** (`wl_touch`; the seat says pointer, keyboard and touch). The desktop reads the touchscreens (`hardware::ITouch`: QEMU's
+  virtio-multitouch, `src/Hardware/Touch/Virtio`, and I2C-HID touchscreens) and offers each finger that lands on a Wayland window to the compositor
+  (`IWindowsSession::touch`). A client with a `wl_touch` gets it: `down` (with the surface under the finger and its place in it), then `motion`
+  (in that surface's coordinates, wherever the finger goes) and `up`, each followed by `frame`; a cancelled contact is `cancel` (all of the client's).
+  A finger over a client without a `wl_touch` is refused, and the desktop moves the pointer with it instead (the first such finger is the left
+  button), as it does over its own windows and Win32 and X windows.
+- **Pens** (`zwp_tablet_manager_v2` version 1, `src/Wayland/WaylandTablet.cpp`). A client's tablet seat is told of one tablet ("TheoryCraftOS pen")
+  and two tools, the pen and its eraser, each with pressure and tilt. The desktop hands the compositor the pens (`hardware::IPen`, through
+  `IWindowsSession::pen`); over a surface of a client with a tablet seat the tool of the end near the screen comes into proximity of that surface
+  (`proximity_in`), then each report is `motion`, `pressure` (0 to 65535), `tilt`, `down` / `up` as the tip touches or lifts, `button` for the barrel
+  buttons (`BTN_STYLUS`, `BTN_STYLUS2`) and a `frame`. While the tip touches, the surface keeps the pen wherever it goes; otherwise it follows the
+  surface under it (`proximity_out` from the old one). Over a client without a tablet seat, or nowhere, the pen is refused and the desktop moves the
+  pointer with it (`hardware::PenMouse`'s rules, done by the input pump since the desktop reads the pens itself). No pads, rings, strips or dials, no
+  hardware serials or ids, no distance, rotation, slider or wheel, and a tool's `set_cursor` is ignored (the desktop draws its own pointer).
 - **The selection** is a client's `wl_data_source` or the desktop's clipboard (its text, or its picture). The client with the keyboard is offered it (`wl_data_offer` with
   its types, then `wl_data_device.selection`) when the keyboard comes to it and whenever the selection changes. A paste (`wl_data_offer.receive` with
   a pipe) is passed on to the source's client as it is (`wl_data_source.send` with the same descriptor), or, for the desktop's text or picture, the
@@ -247,8 +263,8 @@ depends on itself:
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL's frames are GPU buffers, but the kernel's GL copies each frame into the buffer's image with the CPU instead of drawing there (see the plan above).
   Not tried on a real GPU (only the software renderer and virgl).
 - **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
-  panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
-  sessions no tablet or touch input). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
+  panels and background, and its window list has no layers below normal windows). Touches have no shape or orientation events and no touch-to-pointer fallback inside a client that has a `wl_touch` (a client that binds
+  one gets every finger that lands on its surfaces). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
   desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
 - **Clipboard and drag and drop.** Text and PNG pictures reach the desktop's clipboard; other types (HTML, URIs, other image formats such as
   `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
@@ -256,7 +272,7 @@ depends on itself:
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.
-- **Window manager.** `show_window_menu` does nothing (the desktop has no window menu to open). A popup's `reactive` flag and parent size are
+- **Window manager.** The window menu has no Move or Size items (the desktop moves windows by their title bar only). A popup's `reactive` flag and parent size are
   ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.
