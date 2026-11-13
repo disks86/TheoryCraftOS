@@ -38,11 +38,13 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
     monitor_count_ = 0;
     for (const Monitor& m : monitors) {
       if (monitor_count_ == 8) break;
+      const desktop::WindowsRect& panel = m.panel_area.width > 0 && m.panel_area.height > 0 ? m.panel_area : m.work;
       monitors_[monitor_count_++] = {{m.rect.x, m.rect.y, static_cast<int32_t>(m.rect.width), static_cast<int32_t>(m.rect.height)},
-                                     {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)}};
+                                     {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)},
+                                     {panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)}};
     }
     if (monitor_count_ == 0) {
-      monitors_[0] = {{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}, {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}};
+      monitors_[0].rect = monitors_[0].work = monitors_[0].panel = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
       monitor_count_ = 1;
     }
     // the outputs say so again; maximized and full-screen windows get the new size
@@ -60,6 +62,7 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       }
       for (uint64_t k = 0; k < outputs.count(); ++k) announce(*c, outputs[k], Iface::Output, versions[k]);
     }
+    arrange_layers();      // (panels follow their monitor)
     for (Surface* s : stack_.view())
       if (s->role == Role::Toplevel && (s->maximized || s->fullscreen)) {
         const Rect area = s->fullscreen ? monitor_for(*s) : work_area_for(*s);
@@ -136,12 +139,25 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
   out->maximize_box = out->sizable;
   out->popup = s->role == Role::Popup;
   out->owned = out->popup || s->parent_window != 0;
+  if (Surface* root = s->role == Role::Layer ? s : s->role == Role::Popup ? root_toplevel(s) : nullptr; root && root->role == Role::Layer) {
+    // a layer surface (and its popups): a band of the desktop's stack, placed by the compositor, no frame, no taskbar button
+    static constexpr int8_t kBands[4] = {-2, -1, 1, 2};      // background, bottom, top, overlay
+    out->layer = kBands[root->layer_current.layer & 3];
+    if (s->role == Role::Layer) {
+      out->tool = true;
+      out->popup = s->layer_current.keyboard == 0;      // (never activated: keys never go to it)
+      out->owned = false;
+      out->active = s->window == active_window_;
+      out->reserve_edge = s->reserve_edge;
+      out->reserve = s->reserve;
+    }
+  }
   int32_t l, t, r, b;
   frame_margins(*s, &l, &t, &r, &b);
   const Rect c = content_rect(*s);
   out->surface = {c.x, c.y, static_cast<uint32_t>(max32(c.w, 0)), static_cast<uint32_t>(max32(c.h, 0))};
   out->window = {c.x - l, c.y - t, static_cast<uint32_t>(max32(c.w, 0) + l + r), static_cast<uint32_t>(max32(c.h, 0) + t + b)};
-  if (toplevel) title->append(s->title.view());
+  if (toplevel || s->role == Role::Layer) title->append(s->title.view());
   if (Client* c = client_of(s->client); toplevel && c && c->not_responding) title->append(" (Not Responding)");      // (it does not answer pings: WaylandExtras.cpp)
   return true;
 }
@@ -211,7 +227,7 @@ void Server::activate_window(uint32_t window) {
   {
     kernel::ScopedMutex lock(mutex_);
     Surface* s = window_surface(window);
-    if (s && s->role != Role::Toplevel) s = nullptr;      // (popups are not activated: their toplevel stays active)
+    if (s && s->role != Role::Toplevel && !(s->role == Role::Layer && s->layer_current.keyboard != 0)) s = nullptr;      // (popups are not activated: their toplevel stays active)
     if (window != 0 && (!s || !s->mapped)) return;
     activate_locked(s);      // (WaylandExtras.cpp)
   }

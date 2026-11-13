@@ -69,7 +69,8 @@ uint32_t system_cursor(uint32_t shape) {
 // ------------------------------------------------------------------ activation (also the desktop's activate_window)
 
 void Server::activate_locked(Surface* s) {
-  if (s && s->role != Role::Toplevel) s = nullptr;      // (popups are not activated: their toplevel stays active)
+  // (popups are not activated: their toplevel stays active; a layer surface only when it takes the keyboard)
+  if (s && s->role != Role::Toplevel && !(s->role == Role::Layer && s->layer_current.keyboard != 0)) s = nullptr;
   Surface* old = window_surface(active_window_);
   if (s) raise(*s);
   if (old != s) {
@@ -82,7 +83,7 @@ void Server::activate_locked(Surface* s) {
     active_window_ = s ? s->window : 0;
     if (s) {
       s->activated = true;
-      if (s->initial_configure) configure_toplevel(*s);
+      if (s->initial_configure && s->role == Role::Toplevel) configure_toplevel(*s);
       note_changed(*s);
     }
   }

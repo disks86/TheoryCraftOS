@@ -224,7 +224,7 @@ class Server final : public desktop::IWindowsSession {
     DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
     Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
     RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
-    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool,
+    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool, LayerShell, LayerSurface,
   };
   struct Surface;
   struct Client;
@@ -308,7 +308,20 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
     uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
   };
-  enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
+  enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor, Layer };
+  // A layer surface's double-buffered state (zwlr_layer_surface_v1).
+  struct LayerConfig {
+    uint32_t width = 0, height = 0;          // (0: as wide / high as the anchors make it)
+    uint32_t anchor = 0;                     // 1 top, 2 bottom, 4 left, 8 right
+    int32_t zone = 0;                        // the exclusive zone (-1: ignores the others' zones)
+    int32_t margin[4] = {0, 0, 0, 0};        // top, right, bottom, left
+    uint32_t keyboard = 0;                   // 0 none, 1 exclusive, 2 on demand
+    uint32_t layer = 0;                      // 0 background, 1 bottom, 2 top, 3 overlay
+    bool operator==(const LayerConfig& o) const {
+      return width == o.width && height == o.height && anchor == o.anchor && zone == o.zone && margin[0] == o.margin[0] && margin[1] == o.margin[1] &&
+             margin[2] == o.margin[2] && margin[3] == o.margin[3] && keyboard == o.keyboard && layer == o.layer;
+    }
+  };
   struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
     Fd timeline;
     uint64_t point = 0;
@@ -381,6 +394,11 @@ class Server final : public desktop::IWindowsSession {
     Positioner positioner;
     Rect placement;                             // relative to the parent's window geometry
     bool grab = false;
+    // a layer surface (WaylandLayerShell.cpp): its state, the size the last configure asked for, the edge it keeps (Frame::Edge numbers) and how much
+    LayerConfig layer_pending, layer_current;
+    int32_t layer_w = 0, layer_h = 0;
+    uint8_t reserve_edge = 0;
+    uint32_t reserve = 0;
   };
   struct Change {
     uint32_t window = 0;
@@ -548,7 +566,7 @@ class Server final : public desktop::IWindowsSession {
   // the screen and the desktop
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
-    Rect rect, work;
+    Rect rect, work, panel;      // (panel: where layer surfaces anchor - the work area before the windows' reservations)
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 1;
@@ -636,6 +654,11 @@ class Server final : public desktop::IWindowsSession {
   PenFocus pen_;
   void pen_leave();               // proximity_out (and up first, if the tip touched) to the client that has the pen
   void tablet_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void layer_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  // A layer surface's commit (from apply): checks, the first configure, mapping. False: a protocol error was posted.
+  bool commit_layer(Client& c, Surface& s, bool had_buffer);
+  // Places every layer surface again (anchors, margins, the others' exclusive zones) and asks those whose size changed for the new one.
+  void arrange_layers();
   void announce_tablet(Client& c, uint32_t seat_id, Resource& seat);
   uint32_t menu_window_ = 0;                // a toplevel's show_window_menu, until the desktop takes it
   int32_t menu_x_ = 0, menu_y_ = 0;

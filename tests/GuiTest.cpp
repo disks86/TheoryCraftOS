@@ -1676,6 +1676,99 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
 
 // Touches over a program's window: a session that takes them gets the contact (with the window and the programs' coordinates) to its end; one that does
 // not has the pointer moved and pressed for it; the devices stop emulating a mouse once the desktop reads them.
+// Layers (Frame::Layer): bands of the stack that raising never crosses, and edges windows reserve out of the work areas.
+static void test_windows_layers() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  Theme theme;
+  Window w(a, screen.renderer, theme, {800, 600});
+  WindowManager mgr(a);
+  mgr.set_dock(DockStyle::Fill);
+  w.add(&mgr);
+  w.layout();
+  Frame back(a), normal1(a), normal2(a), panel(a), overlay(a);
+  back.set_layer(Frame::Layer::Background);
+  back.set_decorated(false);
+  back.set_activatable(false);
+  back.set_bounds({0, 0, 800, 600});
+  normal1.set_bounds({50, 50, 300, 200});
+  normal2.set_bounds({100, 80, 300, 200});
+  panel.set_layer(Frame::Layer::Top);
+  panel.set_decorated(false);
+  panel.set_activatable(false);
+  panel.set_bounds({0, 0, 800, 30});
+  overlay.set_layer(Frame::Layer::Overlay);
+  overlay.set_decorated(false);
+  overlay.set_bounds({300, 200, 200, 100});
+  // added in a muddled order: the bands hold whatever came last
+  CHECK(mgr.add_window(&panel) && mgr.add_window(&normal1) && mgr.add_window(&back) && mgr.add_window(&overlay) && mgr.add_window(&normal2));
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.stacking_index(&normal1) == 1 && mgr.stacking_index(&normal2) == 2 && mgr.stacking_index(&panel) == 3 &&
+        mgr.stacking_index(&overlay) == 4);
+  CHECK(mgr.active() == &normal2);
+  // raising a normal window keeps it under the panel; a click on the background does not bring it up
+  mgr.activate(&normal1);
+  CHECK(mgr.stacking_index(&normal1) == 2 && mgr.stacking_index(&panel) == 3);
+  click(w, 700, 500);
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.active() == &normal1);
+  CHECK(w.hit_test(400, 10) == &panel && w.hit_test(400, 250) == &overlay);
+  // a program's own order (place_next_to) cannot take a window out of its band
+  mgr.place_next_to(&normal2, &overlay, true);
+  CHECK(mgr.stacking_index(&normal2) <= 2 && mgr.stacking_index(&panel) == 3 && mgr.stacking_index(&overlay) == 4);
+  // moving to another band re-sorts
+  normal2.set_layer(Frame::Layer::Overlay);
+  CHECK(mgr.stacking_index(&normal2) >= 3 && mgr.stacking_index(&panel) == 2);
+  normal2.set_layer(Frame::Layer::Normal);
+  CHECK(mgr.stacking_index(&panel) == 3);
+  // layered windows are placed where they are said to be: not kept inside, not cycled
+  panel.set_bounds({0, -5, 800, 30});
+  w.layout();
+  CHECK(panel.bounds().y == -5);
+  panel.set_bounds({0, 0, 800, 30});
+  for (int i = 0; i < 4; ++i) {
+    mgr.cycle(true);
+    CHECK(mgr.active() == &normal1 || mgr.active() == &normal2);
+  }
+  // reserving: the top panel keeps 30 pixels; maximized windows and the areas leave it out
+  const uint32_t serial = mgr.reserve_serial();
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 600);
+  panel.set_reserve(Frame::Edge::Top, 30);
+  CHECK(mgr.reserve_serial() != serial);
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 570 && mgr.full_area(0).y == 0 && mgr.full_area(0).height == 600);
+  mgr.maximize(&normal1);
+  CHECK(normal1.bounds().y == 30 && normal1.bounds().height == 570);
+  // a second reservation on another edge, then the panel hidden: the space comes back and the maximized window follows
+  Frame dock(a);
+  dock.set_layer(Frame::Layer::Bottom);
+  dock.set_decorated(false);
+  dock.set_bounds({0, 560, 800, 40});
+  dock.set_reserve(Frame::Edge::Bottom, 40);
+  CHECK(mgr.add_window(&dock));
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 530 && normal1.bounds().height == 530);
+  CHECK(mgr.stacking_index(&dock) == 1);      // (above the background, below the normal windows)
+  mgr.remove_window(&panel);
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 560 && normal1.bounds().y == 0 && normal1.bounds().height == 560);
+  mgr.minimize(&dock);
+  CHECK(mgr.area(0).height == 600);
+  mgr.activate(&dock);
+  CHECK(mgr.area(0).height == 560);
+  // several areas: a reservation counts only on the area it is on
+  const Rect2D areas[2] = {{0, 0, 400, 600}, {400, 0, 400, 600}};
+  mgr.set_areas(areas, 2);
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 560);      // (the dock spans both)
+  dock.set_bounds({0, 560, 400, 40});
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 600);
+  // more than the area: a pixel is left
+  dock.set_reserve(Frame::Edge::Bottom, 5000);
+  CHECK(mgr.area(0).height == 1 && mgr.area(0).y == 0);
+  dock.set_reserve(Frame::Edge::None, 0);
+  CHECK(mgr.area(0).height == 600);
+  mgr.remove_window(&dock);
+  mgr.remove_window(&back);
+  mgr.remove_window(&overlay);
+  mgr.remove_window(&normal1);
+  mgr.remove_window(&normal2);
+}
+
 static void test_windows_touch() {
   TestAllocator a;
   {
@@ -2238,6 +2331,7 @@ int main() {
   test_desktop_monitors();
   test_clock();
   test_windows();
+  test_windows_layers();
   test_modal_and_dialog();
   test_notice_dialog();
   test_switcher();

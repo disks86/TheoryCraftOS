@@ -47,6 +47,26 @@ void Frame::run_closed_handler(Window* window) {
   else closed(*this);
 }
 
+void Frame::set_layer(Layer layer) {
+  UiGuard lock(this);
+  if (layer == layer_) return;
+  layer_ = layer;
+  if (WindowManager* m = manager_) {
+    m->sort_layers();
+    if (reserve_edge_ != Edge::None && reserve_size_ > 0) m->reserves_changed();
+  }
+}
+
+void Frame::set_reserve(Edge edge, uint32_t size) {
+  UiGuard lock(this);
+  if (size == 0) edge = Edge::None;
+  if (edge == Edge::None) size = 0;
+  if (edge == reserve_edge_ && size == reserve_size_) return;
+  reserve_edge_ = edge;
+  reserve_size_ = size;
+  if (WindowManager* m = manager_) m->reserves_changed();
+}
+
 bool Frame::fullscreen() const { return host_ ? host_->fullscreen_ : fullscreen_; }
 
 void Frame::set_fullscreen(bool on) {

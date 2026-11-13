@@ -175,16 +175,18 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     gui::UiGuard lock(&manager);
     bounds = manager.bounds();
     if (bounds.width == 0 || bounds.height == 0) return;
-    send = !display_sent_ || !same(bounds, sent_bounds_);
+    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_;
     if (send) {
       const gui::Point o = manager.window_origin();
-      if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0))};
+      if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0)), windows_rect(manager.full_area(0))};
       for (uint32_t i = 0; i < monitor_count_; ++i) {
         const gui::Rect2D r = regions_[i], a = areas_[i];      // (desktop window coordinates; the window manager's area are a shift of them)
-        monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, {a.x - o.x, a.y - o.y, a.width, a.height}};
+        const gui::Rect2D full = {a.x - o.x, a.y - o.y, a.width, a.height};
+        monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, windows_rect(manager.without_reserved(full)), windows_rect(full)};
       }
       display_sent_ = true;
       sent_bounds_ = bounds;
+      sent_reserve_serial_ = manager.reserve_serial();
     }
   }
   if (first) {
@@ -309,6 +311,9 @@ void Win32Windows::apply(gui::WindowManager& manager, uint32_t window, const Win
   h->set_minimize_enabled(info.minimize_box);
   h->set_maximize_enabled(info.maximize_box);
   h->set_in_taskbar(!info.popup && !info.tool && !info.owned);
+  using Layer = gui::Frame::Layer;
+  const int8_t layer = info.layer != 0 ? info.layer : info.topmost ? int8_t(1) : int8_t(0);
+  const Layer want_layer = layer <= -2 ? Layer::Background : layer == -1 ? Layer::Bottom : layer == 0 ? Layer::Normal : layer == 1 ? Layer::Top : Layer::Overlay;
   const gui::Rect2D r = gui_rect(info.window);
   const State want = info.minimized ? State::Minimized : info.maximized ? State::Maximized : State::Normal;
   if (fresh) {
@@ -320,6 +325,8 @@ void Win32Windows::apply(gui::WindowManager& manager, uint32_t window, const Win
     }
     h->known_ = h->sent_ = h->bounds();
   }
+  h->set_layer(want_layer);
+  h->set_reserve(info.reserve_edge <= 4 ? static_cast<gui::Frame::Edge>(info.reserve_edge) : gui::Frame::Edge::None, info.reserve);
   h->set_activatable(!info.popup);
   // the state: a minimized frame comes back to what it was before (which may be maximized), then goes where the program is (unless the user just changed it and
   // the program has not caught up)

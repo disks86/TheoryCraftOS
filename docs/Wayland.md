@@ -15,6 +15,7 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | AF_UNIX listener with SCM_RIGHTS, the compositor's kernel thread | `src/Wayland/WaylandSocketServer.{hpp,cpp}` |
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
 | YUV formats: their layouts and the conversion to RGB (`wl_shm` and dmabuf) | `src/Wayland/WaylandYuv.{hpp,cpp}` |
+| `zwlr_layer_shell_v1`: panels, backgrounds, overlays | `src/Wayland/WaylandLayerShell.cpp`; the desktop's layers and reserved edges in `src/Gui/Windows/{Frame,WindowManager}` |
 | The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
 | Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
 | Activation, cursor shapes, primary selection, relative pointer and constraints, presentation time, idle inhibit, xdg-foreign, pings | `src/Wayland/WaylandExtras.cpp` |
@@ -88,6 +89,29 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
 - **Pings and the minimized state.** `xdg_wm_base.ping` goes when the user activates or closes a window; a client that has not answered after five
   seconds is shown as not responding (its windows' titles end in "(Not Responding)", as on Windows) until it does. `xdg_wm_base` is version 6, so
   a minimized toplevel is configured `suspended`.
+
+## Layer shell (panels, backgrounds, overlays)
+
+`zwlr_layer_shell_v1` version 4 (`src/Wayland/WaylandLayerShell.cpp`): bars, docks, wallpapers, notifications, launchers and lock-screen-like overlays.
+
+- **The desktop's layers.** A layer surface is a desktop window in a band of the stack (`gui::Frame::Layer`, `WindowsWindowInfo::layer`): background
+  and bottom under the normal windows, top and overlay over them. The window manager keeps the bands whatever is raised or restacked (a click, a
+  program's own order, activation); windows outside the normal band are placed where their program says (not kept inside an area, never maximized,
+  docked, tiled or cycled with Alt+Tab), have no frame and no taskbar button. Windows programs' topmost windows (`WS_EX_TOPMOST`) and X windows with
+  `_NET_WM_STATE_ABOVE` now go in the top band the same way. Popups of a layer surface (`get_popup`, an `xdg_popup` made without a parent) are in its band.
+- **Placement.** From the anchors (top, bottom, left, right), the size (0 along an axis anchored at both ends: as long as the anchors span) and the
+  margins, inside the monitor's panel area: the work area with the taskbar left out but not what windows reserve (`Monitor::panel_area`), so a panel
+  never moves away from the space it keeps. A configure goes whenever the size the anchors give changes (the monitors, other surfaces' zones).
+- **Exclusive zones.** A surface anchored to one edge (or to one edge and both of its neighbours) with a positive zone keeps zone + that edge's margin
+  (`WindowsWindowInfo::reserve`). The window manager leaves reserved edges out of its areas (`WindowManager::area`, `without_reserved`), so the
+  desktop's own windows, and every session's work area (`Monitor::work`, sent again when a reservation changes), stay clear: maximized Wayland,
+  Windows and X windows go below a top panel. Among the layer surfaces, zone 0 places a surface inside what the others keep, a positive zone or -1
+  in all of the panel area.
+- **Keyboard.** `none`: never activated (clicks reach it, keys do not); `on_demand`: activated when clicked, like a window; `exclusive`: activated
+  when mapped in the top or overlay band.
+- **Checked:** another role or a buffer already there (`role`, `already_constructed`), the layer (`invalid_layer`, also for `set_layer`), the anchor
+  bits, the keyboard mode (`on_demand` from version 4), a size of 0 without both anchors at commit (`invalid_size`), a buffer before the first configure
+  (`invalid_surface_state`), `get_popup` of a popup that has a parent; an `xdg_popup` still without a parent at its first commit is `invalid_popup_parent`.
 
 ## Scale, transforms, viewports
 
@@ -228,11 +252,12 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | What | How |
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
-| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing) | `tests/wayland_interop.sh` |
+| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing); `slurp`'s full-screen overlay (layer shell) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
+| Layer shell: a top panel keeping its height, a notification anchored with margins, a bar below the panel's zone, zone -1, a size change re-placing the others, the monitors' panel area, a maximized toplevel under the panel, `set_layer`, a destroyed panel freeing its zone, unmap and map again, the three keyboard modes, a popup of a layer surface, every protocol error, about 1600 fuzzed sessions; the window manager's bands and reserved edges (raising, restacking, a band change, Alt+Tab, maximize, several areas, too large a reservation) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
 | YUV: all 17 formats converted at five sizes with and without row padding against a floating-point BT.601 reference, every truncation (a plane one byte short, a stride shorter than its row, a missing plane, a short output) refused with nothing written, random samples; the `wl_shm` layouts; NV12 at an odd pool offset, YUYV, I420 and P010 through `wl_shm` (drawn, sampled, a later commit showing the new picture); NV12 in two descriptors and I420 in one through dmabuf; every refusal and error; about 1600 fuzzed sessions | `tests/run_host_tests.sh WaylandServerTest` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
@@ -282,8 +307,10 @@ depends on itself:
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL's frames are GPU buffers, but the kernel's GL copies each frame into the buffer's image with the CPU instead of drawing there (see the plan above).
   Not tried on a real GPU (only the software renderer and virgl).
-- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
-  panels and background, and its window list has no layers below normal windows). Touches have no shape or orientation events and no touch-to-pointer fallback inside a client that has a `wl_touch` (a client that binds
+- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet). Layer shell: one output (the primary monitor; the output
+  argument is only checked), no `zwlr_layer_surface_v1.closed` (outputs never go away), version 5's `set_exclusive_edge` not offered, exclusive zones
+  of one edge add up in no particular order (wlroots keeps the order of arrival), and the desktop's own taskbar is not one of the reserved edges (layer
+  surfaces are placed above it). X windows' struts (`_NET_WM_STRUT`) and dock windows do not reserve edges yet. Touches have no shape or orientation events and no touch-to-pointer fallback inside a client that has a `wl_touch` (a client that binds
   one gets every finger that lands on its surfaces). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
   desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
 - **Clipboard and drag and drop.** Text and PNG pictures reach the desktop's clipboard; other types (HTML, URIs, other image formats such as

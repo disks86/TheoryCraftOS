@@ -90,6 +90,18 @@ class Frame : public Control {
   bool activatable() const { return activatable_; }
   // The client area is wholly painted by its controls (a picture that covers it): the frame does not fill it first.
   void set_opaque_client(bool opaque) { UiGuard lock(this); opaque_client_ = opaque; invalidate(); }
+  // The band of the stack the window lives in: the manager keeps every window of a lower layer below every window of a higher one, whatever is raised.
+  // Normal is the desktop's and the programs' windows; the others are panels, backgrounds, docks and overlays (a Wayland layer surface, a Windows program's
+  // topmost window). A window of another layer is placed where its program says: the manager does not keep it inside an area, maximize, dock, tile or cycle it.
+  enum class Layer : int8_t { Background = -2, Bottom = -1, Normal = 0, Top = 1, Overlay = 2 };
+  void set_layer(Layer layer);
+  Layer layer() const { return layer_; }
+  // Space the window keeps for itself along an edge of the area it is on (a panel's exclusive zone): the manager's areas leave out `size` pixels from that
+  // edge while the window is shown, so maximized windows and new ones stay clear of it. Edge None (or size 0): nothing kept.
+  enum class Edge : uint8_t { None, Left, Top, Right, Bottom };
+  void set_reserve(Edge edge, uint32_t size);
+  Edge reserve_edge() const { return reserve_edge_; }
+  uint32_t reserve_size() const { return reserve_size_; }
   // Whether the taskbar (and Alt+Tab) list the window.
   void set_in_taskbar(bool in_taskbar) { UiGuard lock(this); in_taskbar_ = in_taskbar; }
   bool in_taskbar() const { return in_taskbar_ && !modal_; }
@@ -191,6 +203,9 @@ class Frame : public Control {
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
   bool decorated_ = true, activatable_ = true, in_taskbar_ = true, opaque_client_ = false;
+  Layer layer_ = Layer::Normal;
+  Edge reserve_edge_ = Edge::None;
+  uint32_t reserve_size_ = 0;
   Dock docked_ = Dock::None;
   uint8_t tile_slot_ = 0, tile_count_ = 0;   // the place in the grid while docked_ is Tile
   TabFrame* host_ = nullptr;

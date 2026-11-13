@@ -128,5 +128,26 @@ PY
     grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-gst-$format.log" && { cat "$out/wayland-gst-$format.log"; status=1; }
   done
 fi
+if command -v slurp >/dev/null; then
+  # a layer-shell client: slurp's overlay (zwlr_layer_shell_v1, overlay layer, all four anchors, zone -1, the keyboard taken) over the whole monitor
+  echo "== slurp (layer shell)"
+  run_server wayland-slurp 9 "$out/slurp.ppm"      # (slurp's first start may take seconds: fontconfig)
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-slurp timeout 8 slurp -b 20304080 < /dev/null > "$out/slurp.client.log" 2>&1 || true      # (slurp reads boxes from a stdin that is no terminal)
+  wait $server || true
+  cat "$out/wayland-slurp.log"
+  grep -q 'mapped .* "selection" 1280x768' "$out/wayland-slurp.log" || { echo "slurp showed no full-screen overlay"; cat "$out/slurp.client.log"; status=1; }
+  python3 - "$out/slurp.ppm" <<'PY' || status=1
+import sys
+data = open(sys.argv[1], 'rb').read()
+parts = data.split(b'\n', 3)
+w, h = map(int, parts[1].split()); px = parts[3]
+i = (400 * w + 600) * 3
+got = tuple(px[i:i + 3])
+print('slurp overlay pixel', got)
+# (cairo's premultiplied 0x20304080: half of each channel)
+assert all(abs(a - b) <= 2 for a, b in zip(got, (16, 24, 32))), 'wrong colour'
+PY
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-slurp.log" && { cat "$out/wayland-slurp.log"; status=1; }
+fi
 [ $status -eq 0 ] && echo "wayland interop: all passed" || echo "wayland interop: FAILED"
 exit $status

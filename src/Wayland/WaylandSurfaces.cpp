@@ -75,13 +75,15 @@ bool Server::RegionRects::contains(int32_t x, int32_t y) const {
 
 Server::Surface* Server::window_surface(uint32_t window) {
   if (window == 0) return nullptr;
-  for (Surface& s : surfaces_) if (s.window == window && s.role_id != 0 && (s.role == Role::Toplevel || s.role == Role::Popup)) return &s;
+  for (Surface& s : surfaces_)
+    if (s.window == window && s.role_id != 0 && (s.role == Role::Toplevel || s.role == Role::Popup || s.role == Role::Layer)) return &s;
   return nullptr;
 }
 
+// The window a popup chain hangs from: a toplevel or a layer surface.
 Server::Surface* Server::root_toplevel(Surface* s) {
   for (uint32_t guard = 0; s && s->role == Role::Popup && guard < 64; ++guard) s = s->popup_parent;
-  return s && s->role == Role::Toplevel ? s : nullptr;
+  return s && (s->role == Role::Toplevel || s->role == Role::Layer) ? s : nullptr;
 }
 
 bool Server::decorated(const Surface& s) const { return attached_ && s.role == Role::Toplevel && s.server_decorated && !s.fullscreen; }
@@ -461,11 +463,23 @@ void Server::apply(Client& c, Surface& s, State& state) {
     note_repaint(*top, {state.damage.x + ox, state.damage.y + oy, state.damage.w, state.damage.h});
   }
   // the roles
+  if (s.role == Role::Layer) {
+    commit_layer(c, s, had_buffer);      // (WaylandLayerShell.cpp)
+    return;
+  }
   if (s.role == Role::Toplevel || s.role == Role::Popup) {
     if (s.role_id == 0 || s.xdg_id == 0) return;
     if (!s.initial_configure) {
       if (s.current.valid()) {
         post_error(c, s.xdg_id, 3, "buffer committed before the first configure");      // xdg_surface.unconfigured_buffer
+        return;
+      }
+      if (s.role == Role::Popup && !s.popup_parent) {      // (made without a parent, and none was given since: zwlr_layer_surface_v1.get_popup)
+        uint32_t wm = s.xdg_id;
+        ObjectCursor cursor;
+        for (bool more = c.objects.first(&cursor); more; more = c.objects.next(&cursor))
+          if (c.objects.element(cursor)->value.iface == Iface::WmBase) { wm = c.objects.element(cursor)->key; break; }
+        post_error(c, wm, kXdgInvalidPopupParent, "a popup without a parent");
         return;
       }
       s.initial_configure = true;
@@ -539,7 +553,9 @@ void Server::destroy_surface(Client& c, Surface& s) {
   if (s.current.valid()) release_buffer(c, s.current);
   for (uint32_t f : s.pending_feedback.view()) s.feedback.push_back(f);      // (pictures that will never be shown)
   presented(s, false);
+  const bool layer = s.role == Role::Layer;
   surfaces_.erase(&s);
+  if (layer) arrange_layers();      // (its exclusive zone is free again)
 }
 
 // ------------------------------------------------------------------ wl_region
@@ -936,7 +952,8 @@ void Server::xdg_surface_request(Client& c, uint32_t id, Resource& r, uint16_t o
       Resource* parent_r = parent ? object_of(c, parent, Iface::XdgSurface, id) : nullptr;
       if (parent && !parent_r) return;
       Surface* ps = parent_r ? parent_r->surface : nullptr;
-      if (!ps || (ps->role != Role::Toplevel && ps->role != Role::Popup) || ps->role_id == 0) {
+      // (no parent: another protocol gives it one before the first commit - zwlr_layer_surface_v1.get_popup)
+      if (parent && (!ps || (ps->role != Role::Toplevel && ps->role != Role::Popup) || ps->role_id == 0)) {
         post_error(c, id, kXdgInvalidPopupParent, "a popup needs a toplevel or popup parent");
         return;
       }

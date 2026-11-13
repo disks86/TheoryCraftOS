@@ -25,6 +25,7 @@
 // the image's device and from the CPU's view, an image outliving its process, client threads exporting while the desktop draws.
 // Run: tests/run_host_tests.sh WaylandServerTest
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -740,11 +741,14 @@ static void test_popups() {
   CHECK(listed(server).size() == 1);
   // the keyboard is back with the window
   CHECK(app.take(keyboard, 1).u(1) == w.surface);
-  // a popup without a parent is an error
+  // a popup without a parent is an error at its first commit (another protocol may give it one before: zwlr_layer_surface_v1.get_popup)
   const uint32_t s3 = app.surface(), x3 = app.new_id();
   app.send(Msg(app.wm, 2).u(x3).u(s3));
   app.send(Msg(x3, 2).u(app.new_id()).u(0).u(pos));
-  CHECK(app.error() && app.closing);
+  CHECK(!app.closing);
+  app.send(Msg(s3, 6));
+  uint32_t eo = 0, ec = 0;
+  CHECK(app.error(&eo, &ec) && eo == app.wm && ec == 3 && app.closing);
 }
 
 // ------------------------------------------------------------------ subsurfaces
@@ -2329,6 +2333,365 @@ static void test_yuv_fuzz() {
   free_made();
 }
 
+// ------------------------------------------------------------------ zwlr_layer_shell_v1
+
+struct LayerApp : App {
+  uint32_t shell = 0;
+  explicit LayerApp(Server& s, uint32_t version = 4) : App(s) {
+    shell = bind(reg, "zwlr_layer_shell_v1", version);
+    drop_events();
+  }
+  struct Layer {
+    uint32_t surface = 0, layer = 0, serial = 0;
+    int32_t cw = 0, ch = 0;
+  };
+  // get_layer_surface, the state, the initial commit; the configure taken and acknowledged
+  Layer make(uint32_t band, uint32_t anchor, uint32_t w, uint32_t h, int32_t zone = 0, std::array<int32_t, 4> margin = {0, 0, 0, 0}, uint32_t keyboard = 0,
+             const std::string& name = "panel") {
+    Layer l;
+    l.surface = surface();
+    l.layer = new_id();
+    send(Msg(shell, 0).u(l.layer).u(l.surface).u(0).u(band).s(name));
+    send(Msg(l.layer, 1).u(anchor));
+    send(Msg(l.layer, 0).u(w).u(h));
+    send(Msg(l.layer, 2).i(zone));
+    send(Msg(l.layer, 3).i(margin[0]).i(margin[1]).i(margin[2]).i(margin[3]));
+    if (keyboard) send(Msg(l.layer, 4).u(keyboard));
+    send(Msg(l.surface, 6));
+    configured(l);
+    return l;
+  }
+  bool configured(Layer& l) {
+    Ev c = take(l.layer, 0);
+    if (c.object == 0) return false;
+    l.serial = c.u(0);
+    l.cw = c.i(1);
+    l.ch = c.i(2);
+    send(Msg(l.layer, 6).u(l.serial));
+    return true;
+  }
+  void draw(Layer& l, int32_t w, int32_t h, uint32_t color) {
+    Pool p = pool(size_t(w) * h * 4);
+    fill(p, 0, w, h, w * 4, color);
+    const uint32_t b = buffer(p, 0, w, h, w * 4);
+    send(Msg(l.surface, 1).u(b).i(0).i(0));
+    send(Msg(l.surface, 2).i(0).i(0).i(w).i(h));
+    send(Msg(l.surface, 6));
+  }
+};
+
+static bool info_of(Server& server, uint32_t window, desktop::WindowsWindowInfo* info) {
+  String title(A);
+  return server.window_info(window, info, &title);
+}
+
+static void test_layer_shell() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  constexpr uint32_t T = 1, B = 2, L = 4, R = 8;
+  {
+    LayerApp app(server);
+    CHECK(app.globals["zwlr_layer_shell_v1"].second == 4);
+    // a top panel across the screen, 30 high, keeping its height
+    LayerApp::Layer panel = app.make(2, T | L | R, 0, 30, 30);
+    CHECK(panel.cw == 1024 && panel.ch == 30 && listed(server).empty());
+    app.draw(panel, 1024, 30, 0xFF203040u);
+    CHECK(!app.closing && listed(server).size() == 1);
+    const uint32_t pwin = listed(server)[0];
+    desktop::WindowsWindowInfo info;
+    CHECK(info_of(server, pwin, &info) && info.visible && !info.caption && info.tool && info.popup && !info.owned && info.layer == 1);
+    CHECK(info.reserve_edge == 2 && info.reserve == 30 && info.window.x == 0 && info.window.y == 0 && info.window.width == 1024 && info.window.height == 30);
+    CHECK(server.window_pixel(pwin, 5, 5) == 0xFF203040u);
+    // a notification at the bottom right with margins (zone 0: inside what the panel leaves)
+    LayerApp::Layer note = app.make(3, B | R, 200, 100, 0, {0, 10, 12, 0}, 0, "notifications");
+    CHECK(note.cw == 200 && note.ch == 100);
+    app.draw(note, 200, 100, 0xFFFFFF00u);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 2);
+    const uint32_t nwin = list.size() == 2 ? list[1] : 0;
+    String title(A);
+    CHECK(server.window_info(nwin, &info, &title) && info.layer == 2 && info.window.x == 1024 - 10 - 200 && info.window.y == 768 - 12 - 100 && info.reserve == 0);
+    CHECK(title.view() == StringView("notifications"));
+    // anchored to the top only: below the panel's zone, centred across
+    LayerApp::Layer bar = app.make(1, T, 100, 50, 0, {4, 0, 0, 0});
+    app.draw(bar, 100, 50, 0xFF00FF00u);
+    list = listed(server);
+    const uint32_t bwin = list.size() == 3 ? list[2] : 0;
+    CHECK(info_of(server, bwin, &info) && info.layer == -1 && info.window.x == (1024 - 100) / 2 && info.window.y == 30 + 4);
+    // zone -1 ignores the panel: at the very top
+    LayerApp::Layer over = app.make(3, T, 64, 64, -1);
+    app.draw(over, 64, 64, 0xFF0000FFu);
+    list = listed(server);
+    const uint32_t owin = list.size() == 4 ? list[3] : 0;
+    CHECK(info_of(server, owin, &info) && info.window.y == 0);
+    // the client changes the panel's size: a new configure; the bar below follows
+    app.send(Msg(panel.layer, 0).u(0).u(40));
+    app.send(Msg(panel.layer, 2).i(40));
+    app.send(Msg(panel.surface, 6));
+    CHECK(app.configured(panel) && panel.cw == 1024 && panel.ch == 40);
+    app.draw(panel, 1024, 40, 0xFF203040u);
+    CHECK(info_of(server, pwin, &info) && info.reserve == 40 && info.window.height == 40);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 40 + 4);
+    // the monitors: anchored to the panel area (the taskbar left out), zones not counted twice
+    desktop::IWindowsSession::Monitor m;
+    m.rect = {0, 0, 1024, 768};
+    m.work = {0, 40, 1024, 688};      // (what the desktop says once it knows the reservation)
+    m.panel_area = {0, 0, 1024, 728};
+    server.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+    CHECK(info_of(server, pwin, &info) && info.window.y == 0);
+    CHECK(info_of(server, nwin, &info) && info.window.y == 728 - 12 - 100);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 44);
+    CHECK(!app.has(panel.layer, 0));      // (the same size: no configure)
+    // a maximized toplevel gets the work area
+    App::Window win = app.toplevel(true, "max");
+    app.show(win, 200, 100, 0xFF808080u);
+    app.drop_events();
+    app.send(Msg(win.toplevel, 9));      // set_maximized
+    Ev mc = app.take(win.toplevel, 0);
+    CHECK(mc.object == win.toplevel && mc.i(1) == 688 - 24 - 4 - 4);      // (inside the frame: border, title)
+    // set_layer (2): to the overlay band
+    app.send(Msg(bar.layer, 8).u(3));
+    app.send(Msg(bar.surface, 6));
+    CHECK(info_of(server, bwin, &info) && info.layer == 2);
+    // destroying the panel frees its zone: the bar goes up
+    app.send(Msg(panel.layer, 7));
+    CHECK(!info_of(server, pwin, &info) || !info.visible);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 4);
+    app.send(Msg(panel.surface, 0));
+    // a null buffer unmaps; a new initial commit starts over
+    app.send(Msg(note.surface, 1).u(0).i(0).i(0));
+    app.send(Msg(note.surface, 6));
+    CHECK(info_of(server, nwin, &info) == false || !info.visible);
+    app.send(Msg(note.surface, 6));
+    CHECK(app.configured(note) && note.cw == 200);
+    app.draw(note, 200, 100, 0xFFFFFF00u);
+    CHECK(info_of(server, nwin, &info) && info.visible);
+    CHECK(!app.closing);
+  }
+  // keyboard: exclusive takes it when mapped; on_demand when the desktop activates it; none never
+  {
+    LayerApp app(server);
+    const uint32_t keyboard = app.new_id();
+    app.send(Msg(app.seat, 1).u(keyboard));
+    app.drop_events();
+    std::vector<uint32_t> before = listed(server);
+    LayerApp::Layer lock = app.make(3, T | B | L | R, 0, 0, -1, {0, 0, 0, 0}, 1, "lock");
+    CHECK(lock.cw == 1024 && lock.ch == 728);      // (the panel area the last block's monitors gave)
+    app.draw(lock, lock.cw, lock.ch, 0xFF000000u);
+    Ev enter = app.take(keyboard, 1);
+    CHECK(enter.object == keyboard && enter.u(1) == lock.surface);
+    const uint32_t lwin = new_window(server, before);
+    desktop::WindowsWindowInfo info;
+    CHECK(info_of(server, lwin, &info) && info.active && !info.popup);
+    app.send(Msg(lock.layer, 7));
+    app.drop_events();
+    before = listed(server);
+    LayerApp::Layer menu = app.make(2, T | L, 300, 400, 0, {0, 0, 0, 0}, 2, "launcher");
+    app.draw(menu, 300, 400, 0xFF112233u);
+    CHECK(!app.has(keyboard, 1));
+    const uint32_t mwin = new_window(server, before);
+    server.activate_window(mwin);
+    Ev e2 = app.take(keyboard, 1);
+    CHECK(e2.object == keyboard && e2.u(1) == menu.surface);
+    before = listed(server);
+    LayerApp::Layer quiet = app.make(2, B, 100, 20);
+    app.draw(quiet, 100, 20, 0xFF445566u);
+    const uint32_t qwin = new_window(server, before);
+    server.activate_window(qwin);
+    CHECK(!app.has(keyboard, 1) && info_of(server, qwin, &info) && !info.active && info.popup);
+    // a popup of a layer surface: made without a parent, given this one; in the same band
+    const uint32_t pos = app.new_id();
+    app.send(Msg(app.wm, 1).u(pos));
+    app.send(Msg(pos, 1).i(120).i(80));
+    app.send(Msg(pos, 2).i(10).i(10).i(20).i(20));
+    const uint32_t ps = app.surface(), pxdg = app.new_id(), popup = app.new_id();
+    app.send(Msg(app.wm, 2).u(pxdg).u(ps));
+    app.send(Msg(pxdg, 2).u(popup).u(0).u(pos));
+    app.send(Msg(menu.layer, 5).u(popup));
+    app.send(Msg(ps, 6));
+    Ev pc = app.take(popup, 0);
+    CHECK(pc.object == popup && !app.closing);
+    Ev px = app.take(pxdg, 0);
+    app.send(Msg(pxdg, 4).u(px.u(0)));
+    before = listed(server);
+    App::Window pw;
+    pw.surface = ps;
+    app.show(pw, 120, 80, 0xFF00FFFFu);
+    const uint32_t popwin = new_window(server, before);
+    CHECK(info_of(server, popwin, &info) && info.popup && info.layer == 1 && info.window.x == pc.i(0) && info.window.y == pc.i(1));
+    CHECK(!app.closing);
+  }
+  // errors
+  struct Case {
+    const char* what;
+    bool on_shell;      // the error is the shell's (else the layer surface's)
+    uint32_t code;
+    std::function<void(LayerApp&, uint32_t layer, uint32_t surface)> run;
+  };
+  const Case cases[] = {
+      {"another role", true, 0, [](LayerApp& a, uint32_t, uint32_t) { App::Window w = a.toplevel(); a.send(Msg(a.shell, 0).u(a.new_id()).u(w.surface).u(0).u(2).s("x")); }},
+      {"a buffer already", true, 2, [](LayerApp& a, uint32_t, uint32_t) {
+         const uint32_t s = a.surface();
+         App::Pool p = a.pool(64);
+         a.send(Msg(s, 1).u(a.buffer(p, 0, 4, 4, 16)).i(0).i(0));
+         a.send(Msg(a.shell, 0).u(a.new_id()).u(s).u(0).u(2).s("x"));
+       }},
+      {"layer 4", true, 1, [](LayerApp& a, uint32_t, uint32_t) { a.send(Msg(a.shell, 0).u(a.new_id()).u(a.surface()).u(0).u(4).s("x")); }},
+      {"not an output", true, 0, [](LayerApp& a, uint32_t, uint32_t) { a.send(Msg(a.shell, 0).u(a.new_id()).u(a.surface()).u(a.compositor).u(2).s("x")); }},
+      {"anchor 16", false, 2, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 1).u(16)); }},
+      {"keyboard 3", false, 3, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 4).u(3)); }},
+      {"width 0 unanchored", false, 1, [](LayerApp& a, uint32_t l, uint32_t s) { a.send(Msg(l, 0).u(0).u(10)); a.send(Msg(l, 1).u(1)); a.send(Msg(s, 6)); }},
+      {"height 0 unanchored", false, 1, [](LayerApp& a, uint32_t l, uint32_t s) { a.send(Msg(l, 0).u(10).u(0)); a.send(Msg(l, 1).u(4 | 8)); a.send(Msg(s, 6)); }},
+      {"buffer before configure", false, 0, [](LayerApp& a, uint32_t l, uint32_t s) {
+         a.send(Msg(l, 0).u(4).u(4));
+         App::Pool p = a.pool(64);
+         a.send(Msg(s, 1).u(a.buffer(p, 0, 4, 4, 16)).i(0).i(0));
+         a.send(Msg(s, 6));
+       }},
+      {"set_layer 4", false, 1, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 8).u(4)); }},
+      {"popup with a parent", false, 0, [](LayerApp& a, uint32_t l, uint32_t) {
+         App::Window w = a.toplevel();
+         const uint32_t pos = a.new_id();
+         a.send(Msg(a.wm, 1).u(pos));
+         a.send(Msg(pos, 1).i(10).i(10));
+         a.send(Msg(pos, 2).i(0).i(0).i(1).i(1));
+         const uint32_t ps = a.surface(), pxdg = a.new_id(), popup = a.new_id();
+         a.send(Msg(a.wm, 2).u(pxdg).u(ps));
+         a.send(Msg(pxdg, 2).u(popup).u(w.xdg).u(pos));
+         a.send(Msg(l, 5).u(popup));
+       }},
+      {"popup without a parent", false, 99, [](LayerApp& a, uint32_t, uint32_t) {
+         const uint32_t pos = a.new_id();
+         a.send(Msg(a.wm, 1).u(pos));
+         a.send(Msg(pos, 1).i(10).i(10));
+         a.send(Msg(pos, 2).i(0).i(0).i(1).i(1));
+         const uint32_t ps = a.surface(), pxdg = a.new_id(), popup = a.new_id();
+         a.send(Msg(a.wm, 2).u(pxdg).u(ps));
+         a.send(Msg(pxdg, 2).u(popup).u(0).u(pos));
+         a.send(Msg(ps, 6));
+       }},
+  };
+  for (const Case& k : cases) {
+    LayerApp app(server);
+    const uint32_t s = app.surface(), l = app.new_id();
+    app.send(Msg(app.shell, 0).u(l).u(s).u(0).u(2).s("errors"));
+    k.run(app, l, s);
+    uint32_t object = 0, code = 0;
+    const bool err = app.error(&object, &code);
+    const uint32_t want_object = k.code == 99 ? app.wm : k.on_shell ? app.shell : l;
+    const uint32_t want_code = k.code == 99 ? 3 : k.code;
+    if (!err || object != want_object || code != want_code) printf("   layer error case '%s': error %d on %u code %u\n", k.what, err, object, code);
+    CHECK(err && object == want_object && code == want_code && app.closing);
+  }
+  {      // version 3: no on_demand; set_layer from 2 on
+    LayerApp app(server, 3);
+    const uint32_t s = app.surface(), l = app.new_id();
+    app.send(Msg(app.shell, 0).u(l).u(s).u(0).u(2).s("v3"));
+    app.send(Msg(l, 4).u(2));
+    uint32_t object = 0, code = 0;
+    CHECK(app.error(&object, &code) && object == l && code == 3);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Bit flips over a session that makes panels, a popup of one and changes them.
+static void test_layer_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(23).s("zwlr_layer_shell_v1").u(4).u(5));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(6));
+  add(Msg(3, 0).u(10));
+  add(Msg(5, 0).u(11).u(10).u(0).u(2).s("panel"));
+  add(Msg(11, 1).u(1 | 4 | 8));
+  add(Msg(11, 0).u(0).u(30));
+  add(Msg(11, 2).i(30));
+  add(Msg(11, 3).i(2).i(3).i(4).i(5));
+  add(Msg(11, 4).u(2));
+  add(Msg(10, 6));
+  add(Msg(11, 6).u(1));
+  add(Msg(6, 0).u(12).i(4096 * 32));
+  add(Msg(12, 0).u(13).i(0).i(64).i(30).i(256).u(1));
+  add(Msg(10, 1).u(13).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(4, 1).u(14));                                   // positioner
+  add(Msg(14, 1).i(50).i(40));
+  add(Msg(14, 2).i(0).i(0).i(10).i(10));
+  add(Msg(3, 0).u(15));
+  add(Msg(4, 2).u(16).u(15));
+  add(Msg(16, 2).u(17).u(0).u(14));                       // popup, no parent
+  add(Msg(11, 5).u(17));                                  // get_popup
+  add(Msg(15, 6));
+  add(Msg(11, 8).u(3));
+  add(Msg(11, 0).u(100).u(0));
+  add(Msg(11, 1).u(2 | 4));
+  add(Msg(10, 6));
+  add(Msg(11, 7));
+  add(Msg(10, 0));
+  add(Msg(1, 0).u(18));
+  std::vector<uint8_t> pool(4096 * 32, 0x55);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &pool)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      desktop::WindowsWindowInfo info;
+      info_of(server, w, &info);
+      server.activate_window(w);
+      server.window_pixel(w, 1, 1);
+    }
+    desktop::IWindowsSession::Monitor m;
+    m.rect = {0, 0, 800, 600};
+    m.work = {0, 30, 800, 540};
+    m.panel_area = {0, 0, 800, 570};
+    server.set_display(800, 600, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+    server.close_client(c);
+    server.set_display(800, 600, {});
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(77);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   layer fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 // ------------------------------------------------------------------ GPU buffers over the kernel's Direct3D layer (dxgk exports, Wayland/Dxg)
 
 namespace dst = dxgk::status;
@@ -3645,6 +4008,8 @@ int main() {
   test_yuv_convert();
   test_yuv_buffers();
   test_yuv_fuzz();
+  test_layer_shell();
+  test_layer_fuzz();
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();
