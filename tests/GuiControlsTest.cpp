@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Gui/Controls/PageView.hpp"
+#include "Browser/PagePicture.hpp"
 #include "Gui/Color.hpp"
 #include "Gui/Controls/Accordion.hpp"
 #include "Gui/Controls/BarChart.hpp"
@@ -1599,8 +1601,90 @@ static void test_date_picker() {
   CHECK(a.live == 0);
 }
 
+// The page view keeps its page between frames: a video's new frame (invalidate_objects) draws the page again only where that video is, a frame with no
+// change draws none of it, and a new picture or invalidate_page() draws all of it. Where the renderer keeps no layers, everything is drawn every frame.
+struct CountingObjects final : browser::IObjectPainter {
+  int calls[3] = {0, 0, 0};   // paint_object per node (1, 2)
+  uint32_t color = 0xFF00FF00u;
+  void paint_object(graphics::IRenderer2D& r, uint32_t node, browser::ObjectKind, int32_t x, int32_t y, uint32_t w, uint32_t h, const graphics::Rect2D&) override {
+    if (node < 3) ++calls[node];
+    r.fill_rect({x, y, w, h}, color);
+  }
+};
+
+static UniquePointer<browser::PagePicture> two_videos(TestAllocator& a) {
+  auto picture = UniquePointer<browser::PagePicture>::make(a, a);
+  paint::Op background;
+  background.kind = paint::OpKind::FillRect;
+  background.rect = {0, 0, 200, 150};
+  background.color = 0xFF202020u;
+  picture->list.add(background);
+  for (uint32_t node = 1; node <= 2; ++node) {
+    paint::Op video;
+    video.kind = paint::OpKind::Object;
+    video.node = node;
+    video.rect = {10, node == 1 ? 10 : 80, 60, 40};
+    picture->list.add(video);
+  }
+  picture->list.set_extent(200, 400);   // (taller than the view: it scrolls)
+  return picture;
+}
+
+static void test_page_view_layer() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 220, 160);
+    graphics::SoftwareRenderer2D renderer(screen.surface, nullptr, &a);   // (with memory: it keeps layers)
+    Window w(a, renderer, theme, {220, 160});
+    PageView view(a);
+    view.set_bounds({0, 0, 220, 160});
+    w.add(&view);
+    CountingObjects objects;
+    view.set_picture(two_videos(a));
+    view.set_object_painter(&objects);
+    w.render();
+    CHECK(objects.calls[1] == 1 && objects.calls[2] == 1 && screen.px(30, 30) == 0xFF00FF00u && screen.px(150, 120) == 0xFF202020u);
+    w.render();   // nothing changed: the layer as it is
+    CHECK(objects.calls[1] == 1 && objects.calls[2] == 1 && screen.px(30, 30) == 0xFF00FF00u && screen.px(30, 100) == 0xFF00FF00u);
+    objects.color = 0xFFFF0000u;   // a new frame of video 1
+    const uint32_t one[1] = {1};
+    view.invalidate_objects(ArrayView<const uint32_t>(one, 1));
+    w.render();
+    CHECK(objects.calls[1] == 2 && objects.calls[2] == 1);   // (video 2 is elsewhere: not drawn again)
+    CHECK(screen.px(30, 30) == 0xFFFF0000u && screen.px(30, 100) == 0xFF00FF00u && screen.px(150, 120) == 0xFF202020u);
+    view.invalidate_page();   // anything may have changed: all of it
+    w.render();
+    CHECK(objects.calls[1] == 3 && objects.calls[2] == 2 && screen.px(30, 100) == 0xFFFF0000u);
+    const uint32_t unknown[1] = {9};   // (an element not in the picture: nothing to draw again)
+    view.invalidate_objects(ArrayView<const uint32_t>(unknown, 1));
+    w.render();
+    CHECK(objects.calls[1] == 3 && objects.calls[2] == 2);
+    view.scroll_to_y(5);   // (scrolled: all of it, moved)
+    w.render();
+    CHECK(objects.calls[1] == 4 && objects.calls[2] == 3);
+    view.set_object_painter(nullptr);
+  }
+  {   // a renderer without layers: drawn straight, every frame
+    Screen screen(a, 220, 160);
+    Window w(a, screen.renderer, theme, {220, 160});
+    PageView view(a);
+    view.set_bounds({0, 0, 220, 160});
+    w.add(&view);
+    CountingObjects objects;
+    view.set_picture(two_videos(a));
+    view.set_object_painter(&objects);
+    w.render();
+    w.render();
+    CHECK(objects.calls[1] == 2 && objects.calls[2] == 2 && screen.px(30, 30) == 0xFF00FF00u);
+    view.set_object_painter(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_helpers();
+  test_page_view_layer();
   test_slider();
   test_knob();
   test_accordion();

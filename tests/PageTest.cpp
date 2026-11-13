@@ -202,6 +202,14 @@ struct FakeClip final : IVideoClip {
   bool muted = false, native_rate = false;   // (native_rate: this clip plays at other speeds itself)
   uint32_t serial = 1;
   int updates = 0;
+  bool counts_frames = false;   // reports frames_presented (the test moves it): the page is drawn again only for a new frame
+  uint64_t frames_presented = 0;
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
+    if (!counts_frames) return false;
+    *presented = frames_presented;
+    *dropped = 0;
+    return true;
+  }
   bool play() override { is_playing = true; return true; }
   void pause() override { is_playing = false; }
   void seek(int64_t us) override { position = us < 0 ? 0 : us > duration ? duration : us; ++serial; }
@@ -1625,7 +1633,10 @@ static void test_images() {
     page.step_objects(static_cast<double>(env.clock));
     page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
     const uint32_t first = target.at(2, 2);
+    uint32_t nodes[4];
+    page.take_visual_changes(ArrayView<uint32_t>(nodes, 4));   // (what loading changed)
     page.step_objects(static_cast<double>(env.clock + 150));
+    CHECK(page.take_visual_changes(ArrayView<uint32_t>(nodes, 4)) == 1 && nodes[0] == run->node);   // its next frame: the picture alone changed
     page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
     CHECK(first != target.at(2, 2) && (first == 0xFFFF0000u || first == 0xFF0000FFu));
     double due;
@@ -2017,6 +2028,22 @@ static void test_video() {
     CHECK(env.last_clip->updates >= 2);
     double due;
     CHECK(page.next_timer(&due));   // (a playing video wants the next frame soon)
+    // what changed on screen while it plays: the video alone (where it is drawn again, not the page), and only when it showed a new frame
+    {
+      uint32_t nodes[16];
+      const ArrayView<uint32_t> into(nodes, 16);
+      page.take_visual_changes(into);   // (what loading changed)
+      env.last_clip->duration = 100000000;
+      env.last_clip->counts_frames = true;
+      env.last_clip->frames_presented = 5;
+      page.step_objects(static_cast<double>(env.clock + 600));
+      CHECK(page.take_visual_changes(into) == 1 && nodes[0] == run->node);
+      page.step_objects(static_cast<double>(env.clock + 700));   // (no new frame)
+      CHECK(page.take_visual_changes(into) == 0);
+      env.last_clip->frames_presented = 6;
+      CHECK(page.step_objects(static_cast<double>(env.clock + 800)));   // (step_objects says so, and leaves it to be taken)
+      CHECK(page.take_visual_changes(ArrayView<uint32_t>()) == PageObjects::kChangedEverything);   // (no room for the list: everything)
+    }
     // script control
     page.load("");
     (void)0;

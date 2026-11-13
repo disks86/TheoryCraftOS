@@ -90,6 +90,17 @@ class PageView : public Control {
   void set_object_painter(browser::IObjectPainter* painter) {
     UiGuard lock(this);
     objects_ = painter;
+    ++content_version_;
+    invalidate();
+  }
+  // What the object painter draws changed. invalidate_objects(): only the pictures of these elements (the serials of their Object entries in the
+  // picture: a video's new frame), so only where they are is drawn again; invalidate_page(): anything (a picture loaded), the whole page is drawn again.
+  // The page is kept between frames as a picture of its own (where the renderer can: IRenderer2D::begin_retained), so a video playing in a big page
+  // costs its own rectangle each frame, not the page.
+  void invalidate_objects(ArrayView<const uint32_t> nodes);
+  void invalidate_page() {
+    UiGuard lock(this);
+    ++content_version_;
     invalidate();
   }
   uint8_t clicked_object() const { return clicked_object_; }
@@ -141,8 +152,19 @@ class PageView : public Control {
   void set_hover_node(uint32_t link_node);
   bool hit(int32_t x, int32_t y, paint::HitResult* result) const;   // the picture's thing at a point of this control
   static void scroll_changed(void* self, Control&);
+  // The page into the retained layer: all of `layer` (frame coordinates) when `full`, else where the changed objects are; false if the renderer
+  // keeps no layers (then paint() draws the page straight onto the frame).
+  bool update_layer(graphics::IRenderer2D& r, const graphics::Rect2D& layer, int32_t left, int32_t top, uint32_t paper, bool full);
+  bool changed_objects_area(int32_t left, int32_t top, const graphics::Rect2D& layer, graphics::Rect2D* area) const;
 
   UniquePointer<browser::PagePicture> picture_;
+  // The retained layer: its key (unique to this view), the content it holds (content_version_ and scroll_y_ when drawn), and the objects that changed since.
+  uint64_t layer_key_ = 0;
+  uint64_t content_version_ = 1, drawn_version_ = 0;
+  int32_t drawn_scroll_ = 0;
+  static constexpr uint32_t kMaxChangedObjects = 16;
+  uint32_t changed_objects_[kMaxChangedObjects] = {};
+  uint32_t changed_object_count_ = 0;
   UniquePointer<font::FontSet> fonts_;   // the painter's fonts (made with the first picture): the page was measured with another set, on another thread
   bool picture_mode_ = false;
   int32_t scroll_y_ = 0, viewport_w_ = 1, viewport_h_ = 1, notified_w_ = 0, notified_h_ = 0;

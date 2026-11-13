@@ -731,6 +731,63 @@ static void test_groups(Rig& g) {
   CHECK(!r.end_group(none, 255, ImageFilter::Nearest));   // (no group open)
 }
 
+// Retained layers: what is drawn into one stays there from frame to frame and reaches the target only with draw_retained(); a later update redraws only
+// its rectangle; a new size, or a layer pushed out by others, comes back fresh (to be drawn whole).
+static void test_retained(Rig& g) {
+  IRenderer2D& r = *g.r;
+  const Rect2D bounds{8, 8, 32, 32};
+  bool fresh = false;
+  g.reset();
+  CHECK(r.begin_retained(7, bounds, {0, 0, 1, 1}, &fresh) && fresh);   // (new: the clip is all of it, whatever the update says)
+  r.fill_rect({0, 0, 64, 64}, kRed);   // (clipped to the bounds)
+  r.fill_rect({10, 10, 4, 4}, kGreen);
+  bool again = false;
+  CHECK(!r.begin_retained(8, bounds, bounds, &again));   // (layers do not nest)
+  r.end_retained();
+  g.read();
+  CHECK(g.at(10, 10) == kBlack && g.at(30, 30) == kBlack);   // nothing on the frame yet
+  CHECK(r.draw_retained(7, bounds));
+  g.read();
+  CHECK(g.at(10, 10) == kGreen && g.at(8, 8) == kRed && g.at(39, 39) == kRed && g.at(40, 40) == kBlack && g.at(7, 7) == kBlack);
+  // the next frame: only the update is drawn again
+  g.reset();
+  CHECK(r.begin_retained(7, bounds, {20, 20, 4, 4}, &fresh) && !fresh);
+  r.fill_rect({0, 0, 64, 64}, kBlue);
+  r.end_retained();
+  CHECK(r.draw_retained(7, bounds));
+  g.read();
+  CHECK(g.at(10, 10) == kGreen && g.at(21, 21) == kBlue && g.at(23, 23) == kBlue && g.at(24, 24) == kRed && g.at(19, 19) == kRed);
+  // laid elsewhere (a window that moved) and under the clip in force
+  g.reset();
+  r.push_clip_rect({0, 0, 40, 64});
+  CHECK(r.draw_retained(7, {20, 20, 32, 32}));
+  r.pop_clip();
+  g.read();
+  CHECK(g.at(22, 22) == kGreen && g.at(33, 33) == kBlue && g.at(39, 33) == kRed && g.at(40, 33) == kBlack && g.at(19, 20) == kBlack);
+  // another size: fresh, and the old size is gone
+  CHECK(r.begin_retained(7, {8, 8, 16, 16}, {8, 8, 1, 1}, &fresh) && fresh);
+  r.end_retained();
+  CHECK(!r.draw_retained(7, bounds) && r.draw_retained(7, {8, 8, 16, 16}));
+  CHECK(!r.draw_retained(99, bounds));   // (never made)
+  // the least recently used layer makes room for new ones
+  for (uint64_t key = 100; key < 104; ++key) {
+    CHECK(r.begin_retained(key, bounds, bounds, &fresh) && fresh);
+    r.end_retained();
+  }
+  CHECK(r.begin_retained(7, {8, 8, 16, 16}, {8, 8, 1, 1}, &fresh) && fresh);   // (7 was used least recently: dropped)
+  r.end_retained();
+  CHECK(r.begin_retained(103, bounds, bounds, &fresh) && !fresh);   // (103 is still there)
+  // groups and layers drawn inside it, and ones left open, end with it
+  r.fill_rect(bounds, kWhite);
+  r.push_layer({8, 8, 8, 8}, 255);
+  r.fill_rect({8, 8, 4, 4}, kRed);
+  r.end_retained();
+  g.reset();
+  CHECK(r.draw_retained(103, bounds));
+  g.read();
+  CHECK(g.at(9, 9) == kRed && g.at(13, 13) == kWhite && g.at(30, 30) == kWhite);
+}
+
 // The masks of rounded and mask clips are kept: the same clip again (even moved) is found made, a different one is made, and the picture is the same either way.
 static void test_mask_cache(Rig& g) {
   IRenderer2D& r = *g.r;
@@ -1349,6 +1406,7 @@ static void test_primitives() {
     test_layers(g);
     test_copy_rect(g);
     test_extreme_arguments(g, a);
+    test_retained(g);
     // Without an allocator rounded clips and layers degrade instead of failing.
     Surface plain_surface = make_surface(a, kW, kH);
     SoftwareRenderer2D plain(plain_surface);
@@ -1360,6 +1418,8 @@ static void test_primitives() {
     plain.fill_rect({50, 50, 4, 4}, kRed);
     plain.pop_layer();
     CHECK(px(plain_surface, 8, 8) == kWhite && px(plain_surface, 7, 8) == kBlack && px(plain_surface, 51, 51) == kRed);
+    bool fresh = true;
+    CHECK(!plain.begin_retained(1, {0, 0, 8, 8}, {0, 0, 8, 8}, &fresh) && !fresh);   // (no retained layers without memory: drawn straight)
     release_view(a, plain_surface.pixels);
 
     // The same drawing in the other pixel order.
@@ -1397,6 +1457,7 @@ static void test_primitives() {
     test_layers(g);
     test_copy_rect(g);
     test_extreme_arguments(g, a);
+    test_retained(g);
     release_view(a, g.frame);
   }
   CHECK(a.live == 0);

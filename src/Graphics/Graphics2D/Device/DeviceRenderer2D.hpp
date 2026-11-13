@@ -106,6 +106,9 @@ class DeviceRenderer2D final : public IRenderer2D {
   void pop_layer() override;
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
+  bool begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) override;
+  void end_retained() override;
+  bool draw_retained(uint64_t key, const Rect2D& bounds) override;
   void present() override;
 
   // How many clip masks were found already made (and how many had to be made) since this renderer began: the masks of rounded and mask clips are kept between frames.
@@ -224,7 +227,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   BlendMode blend_ = BlendMode::Alpha;
   bool valid_ = false;
   // Offscreen groups: the pipelines that keep premultiplied colors in them, the one that lays a group over its parent, and the stack.
-  static constexpr uint32_t kMaxGroups = 4;
+  static constexpr uint32_t kMaxGroups = 5;   // (a retained layer takes one)
   struct Group {
     IImage* image = nullptr;
     Rect2D bounds;                 // in target coordinates (the image is this big)
@@ -237,7 +240,20 @@ class DeviceRenderer2D final : public IRenderer2D {
     bool detached = false;         // a filter group: its clip is its bounds alone
     uint32_t prev_detach = 0xFFFFFFFFu;      // detach_index_ outside it
     uint32_t prev_overflow = 0;
+    bool retained = false;         // a retained layer: the image is the retained table's, kept when the group ends, and laid on the target only by draw_retained()
   };
+  // Retained layers (begin_retained): their images, kept between frames, the least recently used dropped first.
+  static constexpr uint32_t kMaxRetained = 4;
+  static constexpr uint64_t kMaxRetainedPixels = uint64_t{1} << 24;   // (one layer: 4096 x 4096)
+  struct RetainedEntry {
+    uint64_t key = 0, used = 0;
+    IImage* image = nullptr;
+    uint32_t width = 0, height = 0;
+  };
+  RetainedEntry retained_[kMaxRetained];
+  uint64_t retained_clock_ = 0;
+  bool in_retained_ = false;
+  RetainedEntry* find_retained(uint64_t key);
   // The glyph atlas: the coverage of glyphs (as alpha), kept from frame to frame, so a glyph is made and sent up once and drawn tinted by the GPU
   // (a vertex color) whenever it is wanted. Shelf packing; when it is full, it starts again.
   static constexpr uint32_t kAtlasSize = 1024, kAtlasTable = 4096, kAtlasMaxGlyph = 128, kMaxGlyphVertices = 6 * 4096;

@@ -1067,9 +1067,11 @@ void WebBrowser::settle() {
   }
   if (!live_) return;
   canvas_accelerated_ = live_->objects().accelerated();
-  if (live_->take_visual_change()) {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again)
-    UiGuard lock(&page_);
-    page_.invalidate();
+  {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again - for a video's frame, only where the video is)
+    uint32_t nodes[16];
+    const uint32_t changed = live_->take_visual_changes(ArrayView<uint32_t>(nodes, 16));
+    if (changed == browser::PageObjects::kChangedEverything) page_.invalidate_page();
+    else if (changed != 0) page_.invalidate_objects(ArrayView<const uint32_t>(nodes, changed));
   }
   update_key_capture();
   const uint64_t now_ms = __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE);

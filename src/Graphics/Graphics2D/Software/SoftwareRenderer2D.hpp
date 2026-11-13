@@ -72,6 +72,9 @@ class SoftwareRenderer2D final : public IRenderer2D {
   bool push_layer(const Rect2D& bounds, uint8_t opacity) override;
   void pop_layer() override;
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
+  bool begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) override;
+  void end_retained() override;
+  bool draw_retained(uint64_t key, const Rect2D& bounds) override;
   void present() override;
   bool read_frame(ArrayView<uint32_t> out) override;
 
@@ -122,6 +125,18 @@ class SoftwareRenderer2D final : public IRenderer2D {
   uint32_t clip_depth_ = 0, clip_floor_ = 0, clip_overflow_ = 0;
   LayerEntry layers_[kMaxLayerDepth];
   uint32_t layer_depth_ = 0, layer_overflow_ = 0;
+  // Retained layers (begin_retained): their pixels, kept between frames in the target's format, the least recently used dropped first.
+  static constexpr uint32_t kMaxRetained = 4;
+  static constexpr uint64_t kMaxRetainedPixels = uint64_t{1} << 24;
+  struct RetainedEntry {
+    uint64_t key = 0, used = 0;
+    Surface surface;
+  };
+  RetainedEntry retained_[kMaxRetained];
+  uint64_t retained_clock_ = 0;
+  bool in_retained_ = false;
+  LayerEntry retained_saved_;   // what was being drawn to while a retained layer is drawn
+  RetainedEntry* find_retained(uint64_t key);
   BlendMode blend_ = BlendMode::Alpha;
 };
 
