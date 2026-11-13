@@ -118,6 +118,7 @@ class NativeServer final : public IProtocolServer {
     struct ClientData {
       Fd fd;
       uint32_t mapoffset = 0, maxsize = 0;
+      bool gpu = false;            // a dmabuf: fd's memory is the server's copy, filled from the image before each frame is read
     };
     List<ClientData> client_data;  // (alloc) each buffer's data blocks, as port_buffers gave them (buffer i's block k at i * blocks + k)
     uint32_t next_buffer = 0;

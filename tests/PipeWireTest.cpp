@@ -1801,6 +1801,23 @@ struct FakeFd final : Descriptor {
   bool signal() override { if (!event) return false; ++counter; return true; }
   uint64_t take_signals() override { return counter.exchange(0); }
 };
+// A dmabuf: a GPU image whose pixels the server copies out (sync_from_gpu) into memory(); `busy` as the GPU still drawing.
+struct FakeGpuFd final : Descriptor {
+  std::vector<uint8_t> image, copy;
+  bool busy = false;
+  int syncs = 0;
+  explicit FakeGpuFd(uint64_t n) : image(n, 0), copy(n, 0) {}
+  ByteView memory() override { return ByteView(copy.data(), copy.size()); }
+  bool signal() override { return false; }
+  uint64_t take_signals() override { return 0; }
+  bool gpu() const override { return true; }
+  bool sync_from_gpu() override {
+    ++syncs;
+    if (busy) return false;
+    copy = image;
+    return true;
+  }
+};
 struct FakeMaker final : IDescriptorMaker {
   int made = 0;
   bool fail = false;
@@ -3780,6 +3797,55 @@ static void test_client_node_media() {
     SharedPointer<VideoChannel> ch = g.video_of(va.node);
     SharedPointer<VideoFrame> fr = ch ? ch->latest() : SharedPointer<VideoFrame>();
     CHECK(fr && fr->format.width == 32 && fr->pixels.view()[0] == 0x40 && fr->pixels.view()[3 * 128 + 127] == 0x43);
+  }
+  // DMA-BUFs: a camera whose buffers are GPU images; each frame is copied out of the image before it is read, and one the GPU still draws is not taken
+  {
+    NodeView vd;
+    vd.id = 9;
+    create_node(c, 9, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "gpu-camera"}});
+    node_update(c, 9);
+    set_active(c, 9, true);
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    vd.absorb(c);
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    vd.absorb(c);
+    NodeView::PortView& vdp = vd.ports[{1, 0}];
+    CHECK(vdp.use && vdp.flags == 1 && vdp.bufs.size() == 2 && vdp.bufs[0].dtype == (1u << 3));
+    SharedPointer<FakeGpuFd> g0 = SharedPointer<FakeGpuFd>::make(A, 512), g1 = SharedPointer<FakeGpuFd>::make(A, 512);
+    auto send_gpu_buffers = [&](std::vector<Fd> fds, int32_t type) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(2);
+      for (int k = 0; k < 2; ++k) { b.int32(1); b.id(uint32_t(type)); b.fd(k); b.int32(3); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(9); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(2);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& fd : fds) list.push_back(fd);
+      server.receive_with_fds(c.handle, msg.view(), list);
+    };
+    send_gpu_buffers({Fd(g0), Fd(g1)}, 3);
+    vd.absorb(c);
+    CHECK(vd.errors == 0 && vd.starts == 1);
+    if (vd.starts) {
+      for (uint32_t y = 0; y < 4; ++y) memset(g1->image.data() + y * 128, int(0x60 + y), 128);
+      ByteView part1 = vd.buffer(1, 0, 1);
+      put_u32(part1, 32, 0); put_u32(part1, 36, 512); put_u32(part1, 40, 128);
+      g1->busy = true;      // (still being drawn: not taken, handed back)
+      put_u32(vd.io(1, 0), 0, 2); put_u32(vd.io(1, 0), 4, 1);
+      tick();
+      SharedPointer<VideoChannel> ch = g.video_of(vd.node);
+      CHECK(ch && ch->frames() == 0 && g1->syncs == 1 && u32_at(vd.io(1, 0), 0) == 1);
+      g1->busy = false;
+      put_u32(vd.io(1, 0), 0, 2); put_u32(vd.io(1, 0), 4, 1);
+      tick();
+      SharedPointer<VideoFrame> fr = ch ? ch->latest() : SharedPointer<VideoFrame>();
+      CHECK(g1->syncs == 2 && fr && fr->pixels.view()[0] == 0x60 && fr->pixels.view()[3 * 128 + 127] == 0x63);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+    c.take_with_fds();
   }
   // a port_buffers for a port that was not asked to allocate is refused
   {

@@ -39,6 +39,10 @@ class Descriptor {
   virtual bool signal() = 0;
   // An eventfd: the counter, read and reset (0 when nothing was signalled).
   virtual uint64_t take_signals() = 0;
+  // A GPU image a client handed over (a dmabuf: on this system an export of /dev/dxg): memory() is the server's copy of its pixels, which
+  // sync_from_gpu() fills from the image (false when the GPU still works on it, or it cannot be read).
+  virtual bool gpu() const { return false; }
+  virtual bool sync_from_gpu() { return false; }
 
  protected:
   Descriptor() = default;

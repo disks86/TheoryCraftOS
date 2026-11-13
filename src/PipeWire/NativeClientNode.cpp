@@ -68,7 +68,7 @@ constexpr uint32_t kModePassthrough = 1, kModeConvert = 2;
 constexpr uint32_t kCommandNode = 0x30002, kCommandPause = 1, kCommandStart = 2;
 constexpr uint32_t kIoBuffers = 1, kIoClock = 3, kIoPosition = 7;
 constexpr uint32_t kIoClockSize = 160, kIoPositionSize = 1688;
-constexpr uint32_t kDataMemPtr = 1, kDataMemFd = 2, kDataMemId = 4, kDataReadWrite = 1 | 2;
+constexpr uint32_t kDataMemPtr = 1, kDataMemFd = 2, kDataDmaBuf = 3, kDataMemId = 4, kDataReadWrite = 1 | 2;
 constexpr uint32_t kMemReadWrite = 1 | 2;
 constexpr uint32_t kBuffersBuffers = 1, kBuffersBlocks = 2, kBuffersSize = 3, kBuffersStride = 4, kBuffersDataType = 6;
 constexpr uint32_t kMetaParamType = 1, kMetaParamSize = 2;
@@ -1139,10 +1139,13 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
         return;
       }
       if (uint32_t(k) >= p->blocks) continue;      // (the blocks the server asked for are used)
-      if (type != kDataMemFd) { protocol_error(c, n.resource, kENOTSUP, "only memfd buffers can be shared with the server"); return; }
+      if (type != kDataMemFd && type != kDataDmaBuf) { protocol_error(c, n.resource, kENOTSUP, "only memfd and DMA-BUF buffers can be shared with the server"); return; }
       if (index < 0 || uint64_t(index) >= c.message_in_fds.count()) { protocol_error(c, n.resource, kEINVAL, "port_buffers without its descriptor"); return; }
       ClientPort::ClientData d;
       d.fd = c.message_in_fds[uint64_t(index)];
+      // (a DMA-BUF must be a GPU image the server can read: on this system an export of /dev/dxg)
+      if (type == kDataDmaBuf && (!d.fd || !d.fd->gpu())) { protocol_error(c, n.resource, kENOTSUP, "a DMA-BUF the server cannot read (not an export of /dev/dxg)"); return; }
+      d.gpu = type == kDataDmaBuf;
       d.mapoffset = static_cast<uint32_t>(mapoffset);
       d.maxsize = static_cast<uint32_t>(maxsize);
       const uint64_t size = d.fd ? d.fd->memory().size() : 0;
@@ -1400,6 +1403,20 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
     }
     return false;
   }
+  // (a DMA-BUF's pixels: brought into the server's copy first; a frame the GPU is still drawing is not taken)
+  if (p.alloc)
+    for (uint32_t k = 0; k < p.blocks; ++k) {
+      const uint64_t index = uint64_t{id} * p.blocks + k;
+      if (index < p.client_data.count() && p.client_data[index].gpu && !p.client_data[index].fd->sync_from_gpu()) {
+        if (!n.driving) {
+          store<uint32_t>(io, 4, id);      // (handed back unread)
+          store<int32_t>(io, 0, kStatusNeedData);
+        } else {
+          exchange_if<int32_t>(io, 0, status, kStatusNeedData);
+        }
+        return false;
+      }
+    }
   uint32_t maxsize = 0;
   ByteView data = buffer_data(p, id, &maxsize);
   const uint64_t base = uint64_t{id} * p.buffer_stride;
