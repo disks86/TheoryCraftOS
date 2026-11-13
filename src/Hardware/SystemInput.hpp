@@ -30,6 +30,7 @@
 #include "Hardware/Mouse/CompositeMouse.hpp"
 #include "Hardware/Mouse/Ps2/Ps2Mouse.hpp"
 #include "Hardware/Mouse/Usb/UsbHidMouse.hpp"
+#include "Hardware/Touch/CompositeTouch.hpp"
 #include "Kernel/Thread.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/StringView.hpp"
@@ -39,6 +40,7 @@
 namespace hardware {
 
 class VmmDev;
+class VirtioTouch;
 
 // Finds every keyboard and mouse the machine has - PS/2, USB HID (behind xHCI
 // root ports) and virtio-input - brings them up and merges them into one
@@ -74,6 +76,8 @@ class SystemInput {
 
   IKeyboard& keyboard() { return keyboards_; }
   IMouse& mouse() { return mice_; }
+  // The touchscreens (virtio-multitouch here; other drivers add theirs): their contacts. Each is a mouse as well until pointer emulation is turned off.
+  CompositeTouch& touches() { return touches_; }
 
   // Another driver's keyboards and mice (see InputSource.hpp): registered once, then served by poll() and detached by shutdown(). The source must outlive this object or be removed.
   static constexpr uint32_t kMaxSources = 8;
@@ -130,6 +134,9 @@ class SystemInput {
 
   CompositeKeyboard keyboards_;
   CompositeMouse mice_;
+  CompositeTouch touches_;
+  static constexpr uint32_t kMaxVirtioTouch = 4;
+  VirtioTouch* virtio_touch_[kMaxVirtioTouch] = {};      // (owned by owned_: taken out of touches_ and mice_ before they go)
   List<UniquePointer<IHardware>> owned_;  // the allocator-backed devices, freed with the list
   UsbPortWatcher watcher_;
   UsbHidKeyboard* usb_keyboards_[CompositeKeyboard::kMaxKeyboards] = {};   // the USB devices among them, to find those that left

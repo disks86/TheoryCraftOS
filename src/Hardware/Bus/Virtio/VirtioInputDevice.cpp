@@ -27,7 +27,7 @@ constexpr uint8_t kCfgEvBits = 0x11;   // bitmap of supported codes for event ty
 constexpr uint8_t kCfgAbsInfo = 0x12;  // virtio_input_absinfo for axis `subselect`
 
 constexpr uint16_t kKeyA = 30;
-constexpr uint16_t kRelX = 0, kAbsX = 0, kAbsY = 1;
+constexpr uint16_t kRelX = 0, kAbsX = 0, kAbsY = 1, kAbsMtPositionX = 0x35, kAbsMtPositionY = 0x36;
 }  // namespace
 
 uint8_t VirtioInputDevice::query(uint8_t select, uint8_t subselect, ByteView data) const {
@@ -45,6 +45,7 @@ bool VirtioInputDevice::supports(uint8_t type, uint16_t code) const {
 }
 
 VirtioInputKind VirtioInputDevice::classify() const {
+  if (supports(kEvAbs, kAbsMtPositionX) && supports(kEvAbs, kAbsMtPositionY)) return VirtioInputKind::Touch;
   if (supports(kEvAbs, kAbsX) && supports(kEvAbs, kAbsY)) return VirtioInputKind::Tablet;
   if (supports(kEvRel, kRelX)) return VirtioInputKind::Mouse;
   if (supports(kEvKey, kKeyA)) return VirtioInputKind::Keyboard;
@@ -61,10 +62,11 @@ bool VirtioInputDevice::initialize() {
     transport_.shutdown();
     return false;
   }
-  if (kind_ == VirtioInputKind::Tablet) {
+  if (kind_ == VirtioInputKind::Tablet || kind_ == VirtioInputKind::Touch) {
     for (uint8_t axis = 0; axis < 2; ++axis) {
       uint8_t info[20];  // struct { u32 min, max, fuzz, flat, res; }
-      if (query(kCfgAbsInfo, axis, ByteView(info)) >= 8)
+      const uint8_t code = static_cast<uint8_t>(kind_ == VirtioInputKind::Touch ? kAbsMtPositionX + axis : axis);
+      if (query(kCfgAbsInfo, code, ByteView(info)) >= 8)
         abs_max_[axis] = info[4] | (info[5] << 8) | (info[6] << 16) | (uint32_t{info[7]} << 24);
     }
   }

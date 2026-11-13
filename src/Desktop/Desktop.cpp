@@ -697,6 +697,16 @@ void Desktop::tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* 
   d.x11_windows_.tap_mouse(event, x, y);
   d.wayland_windows_.tap_mouse(event, x, y);
 }
+// A touch goes to the programs' windows that take touches (Wayland clients with wl_touch); else the input pump moves the pointer with it.
+bool Desktop::tap_touch(void* self, const hardware::TouchEvent& event, int32_t x, int32_t y) {
+  Desktop& d = *static_cast<Desktop*>(self);
+  return d.wayland_windows_.tap_touch(event, x, y) || d.win32_windows_.tap_touch(event, x, y) || d.x11_windows_.tap_touch(event, x, y);
+}
+
+void Desktop::set_touch(hardware::ITouch* touch) {
+  input_.set_touch(touch, &Desktop::tap_touch, this);
+  if (touch) touch->set_pointer_emulation(false);      // (the desktop moves the pointer with the fingers nobody takes, itself)
+}
 
 Calendar* Desktop::open_calendar(TabFrame* into) {
   Calendar* calendar = open_instance(calendar_, extra_calendars_, &Desktop::setup_calendar, into);

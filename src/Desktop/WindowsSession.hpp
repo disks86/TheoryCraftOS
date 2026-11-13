@@ -24,6 +24,7 @@
 #pragma once
 #include <stdint.h>
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
+#include "Hardware/Touch/ITouch.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
 
@@ -101,7 +102,14 @@ class IWindowsSession {
   virtual void mouse_position(int32_t x, int32_t y) = 0;
   virtual void mouse_button(uint32_t button, bool down) = 0;                  // 1 left, 2 right, 3 middle
   virtual void mouse_wheel(int32_t notches) = 0;                              // + away from the user
-  virtual void mouse_left() {}                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
+  virtual void mouse_left() {}
+  // A finger on the screen, in the programs' screen coordinates (as the mouse's). Down names the session's window under it; the session answers
+  // whether it takes the contact (its program reads touches: Wayland's wl_touch). A contact taken at Down gets its Motion and its Up (or Cancel) wherever
+  // they are; one refused moves the pointer instead (the desktop emulates a mouse with it). By default none is taken.
+  virtual bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
+    (void)phase, (void)id, (void)window, (void)x, (void)y;
+    return false;
+  }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
   virtual uint32_t capture_window() = 0;                                      // the window that captured the mouse (SetCapture), 0: none

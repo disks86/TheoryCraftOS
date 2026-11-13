@@ -433,7 +433,7 @@ static void test_registry() {
     CHECK(formats == 4);
     const uint32_t seat = c.bind(r, "wl_seat");
     Ev caps = c.take(seat, 0);
-    CHECK(caps.object == seat && caps.u(0) == 3);
+    CHECK(caps.object == seat && caps.u(0) == 7);      // (pointer, keyboard, touch)
     CHECK(c.take(seat, 1).s(0) == "seat0");
     const uint32_t output = c.bind(r, "wl_output");
     Ev mode = c.take(output, 1);
@@ -803,6 +803,60 @@ static void test_subsurfaces() {
 }
 
 // ------------------------------------------------------------------ the seat
+
+// Touches: a finger over a client with a wl_touch goes to it (down, motion, up, each with a frame, coordinates of the surface it went down on), over a
+// client without one it is refused (the desktop moves the pointer), cancel, and a client that goes away loses its contacts.
+static void test_touch() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1000, 800, {});
+  App a(server), b(server);
+  App::Window wa = a.toplevel(false, "a"), wb = b.toplevel(false, "b");
+  a.show(wa, 300, 300, 0xFF111111u);
+  b.show(wb, 300, 300, 0xFF222222u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  server.move_window(list[0], {0, 0, 300, 300});
+  server.move_window(list[1], {400, 0, 300, 300});
+  const uint32_t ta = a.new_id();
+  a.send(Msg(a.seat, 2).u(ta));      // get_touch: only a reads touches
+  a.drop_events();
+  b.drop_events();
+  // a finger on a: taken, down with a's surface and the place in it
+  CHECK(server.touch(hardware::TouchPhase::Down, 5, list[0], 30, 40));
+  Ev down = a.take(ta, 0);
+  CHECK(down.object == ta && down.u(2) == wa.surface && down.i(3) == 5 && down.i(4) == 30 * 256 && down.i(5) == 40 * 256);
+  CHECK(a.has(ta, 3));      // frame
+  // it moves out of a's window: still a's, in a's coordinates
+  CHECK(server.touch(hardware::TouchPhase::Motion, 5, 0, 350, 45));
+  Ev motion = a.take(ta, 2);
+  CHECK(motion.object == ta && motion.i(1) == 5 && motion.i(2) == 350 * 256 && motion.i(3) == 45 * 256);
+  // a second finger on b: b has no wl_touch, refused (and b hears nothing)
+  CHECK(!server.touch(hardware::TouchPhase::Down, 6, list[1], 420, 10));
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 6, 0, 421, 10));      // (and its motion is nobody's)
+  // up: a's touch ends
+  CHECK(server.touch(hardware::TouchPhase::Up, 5, 0, 350, 45));
+  Ev up = a.take(ta, 1);
+  CHECK(up.object == ta && up.i(2) == 5);
+  CHECK(!server.touch(hardware::TouchPhase::Up, 5, 0, 350, 45));      // (no longer anyone's)
+  // nowhere: refused
+  CHECK(!server.touch(hardware::TouchPhase::Down, 7, 0, 900, 700));
+  // cancel: a hears cancel, and its contacts are gone
+  CHECK(server.touch(hardware::TouchPhase::Down, 8, list[0], 10, 10));
+  CHECK(server.touch(hardware::TouchPhase::Down, 9, list[0], 20, 20));
+  a.drop_events();
+  CHECK(server.touch(hardware::TouchPhase::Cancel, 8, 0, 10, 10));
+  CHECK(a.has(ta, 4));
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 9, 0, 21, 20));      // (the protocol cancels all of a's)
+  // a client that goes away mid-touch: its contacts are nobody's
+  CHECK(server.touch(hardware::TouchPhase::Down, 10, list[0], 10, 10));
+  server.close_client(a.number);
+  a.number = 0;
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 10, 0, 11, 10));
+  free_made();
+}
+
 
 static void test_seat() {
   Server server(A);
@@ -3092,6 +3146,7 @@ int main() {
   test_popups();
   test_subsurfaces();
   test_seat();
+  test_touch();
   test_errors();
   test_fuzz();
   test_dmabuf();

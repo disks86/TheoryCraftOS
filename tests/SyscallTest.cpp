@@ -249,6 +249,11 @@ static void test_linux() {
   mem.put64(kBase + 0x700, 0x7FFFFFFFFFFFFFFFull);
   CHECK(p.syscall(req(35, kBase + 0x700, 0)) == 0);                       // clamps instead of wrapping
 
+  // time (x86-64 201): the seconds, also stored where asked
+  CHECK(p.syscall(req(201, 0)) == 1700000000);
+  mem.put64(kBase + 0x710, 0);
+  CHECK(p.syscall(req(201, kBase + 0x710)) == 1700000000 && mem.get64(kBase + 0x710) == 1700000000);
+  CHECK(sres(p.syscall(req(201, 8))) == -14);
   // clock_nanosleep (glibc's nanosleep): relative, and until a time of the clock (TIMER_ABSTIME; the monotonic clock reads 42 ns here)
   host.slept = 0;
   mem.put64(kBase + 0x700, 0); mem.put64(kBase + 0x708, 300);

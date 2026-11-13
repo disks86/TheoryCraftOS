@@ -684,6 +684,33 @@ static void test_touchscreen() {
   rig.send(two, 2, 2);
   n = rig.drain(ev, 16);
   CHECK(n == 1 && ev[0].x == 900 && ev[0].y == 900);
+  // the same reports as touch events: every contact, Down / Motion / Up
+  ITouch* touch = rig.pointer->touch();
+  CHECK(touch != nullptr);
+  if (!touch) return;
+  TouchEvent te[16];
+  uint32_t tn = 0;
+  while (tn < 16 && touch->poll(&te[tn])) ++tn;
+  CHECK(tn == 5);
+  if (tn == 5) {
+    CHECK(te[0].phase == TouchPhase::Down && te[0].id == 3 && te[0].x == 2048 && te[0].y == 1024 && te[0].max_x == 4095);
+    CHECK(te[1].phase == TouchPhase::Motion && te[1].id == 3 && te[1].x == 3000);
+    CHECK(te[2].phase == TouchPhase::Up && te[2].id == 3);
+    CHECK(te[3].phase == TouchPhase::Down && te[3].id == 7 && te[4].phase == TouchPhase::Down && te[4].id == 4 && te[4].x == 900);
+  }
+  // pointer emulation off (the desktop reads the touches): no mouse events, the touch events go on
+  touch->set_pointer_emulation(false);
+  two[1].x = 950;
+  rig.send(two, 2, 2);
+  CHECK(rig.drain(ev, 16) == 0);
+  tn = 0;
+  while (tn < 16 && touch->poll(&te[tn])) ++tn;
+  CHECK(tn == 1 && te[0].phase == TouchPhase::Motion && te[0].id == 4 && te[0].x == 950);
+  rig.send(nullptr, 0, 0);
+  CHECK(rig.drain(ev, 16) == 0);
+  tn = 0;
+  while (tn < 16 && touch->poll(&te[tn])) ++tn;
+  CHECK(tn == 2 && te[0].phase == TouchPhase::Up && te[1].phase == TouchPhase::Up);
 }
 
 static void test_mouse_mode() {

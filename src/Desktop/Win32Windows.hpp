@@ -100,7 +100,7 @@ class Win32Windows {
  public:
   static constexpr uint32_t kHoldPumps = 30;
 
-  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator) {}
+  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator) {}
   ~Win32Windows();
   // Null: none (the frames are taken down).
   void set_session(IWindowsSession* session, gui::WindowManager* manager);
@@ -114,6 +114,9 @@ class Win32Windows {
   // The input taps (see gui::InputPump::set_taps), forwarded by the desktop. `x`, `y`: where the pointer is about to be (desktop window coordinates).
   void tap_key(const hardware::KeyEvent& event, uint8_t modifiers);
   void tap_mouse(const hardware::MouseEvent& event, int32_t* x, int32_t* y);
+  // A touch event at (x, y), window coordinates: true when the session took it (a contact it took at Down, or a Down over one of its windows that it
+  // takes, whose frame is then activated as a click would). Not under the UI lock.
+  bool tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y);
 
   uint32_t count() const { return static_cast<uint32_t>(hosts_.count()); }
   // The cursor the programs show (pump() keeps it; read under the UI lock).
@@ -161,6 +164,7 @@ class Win32Windows {
   void follow_pointer(gui::WindowManager& manager);      // (not under the UI lock)      // the window manager's active frame as last seen (a change since is the user's)
   // input (the input pump's thread)
   bool grabbed_ = false;                   // the pointer is the Windows programs'
+  List<uint32_t> touches_;                 // the contacts the session took (until they lift)
   bool released_ = false;                  // Ctrl+Alt let a confined pointer go: nothing is handed over until the next click on a Windows window
   uint8_t buttons_ = 0;                    // the buttons held as the programs know them (hardware::mouse_button bits)
   uint8_t keys_down_[32] = {};             // the keys whose press was handed over (their release is too)

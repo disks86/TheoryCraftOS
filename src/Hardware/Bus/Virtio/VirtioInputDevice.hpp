@@ -29,7 +29,7 @@ struct VirtioInputEvent {
   uint32_t value;  // key: 0 up, 1 down, 2 repeat; axes: signed amount or position
 };
 
-enum class VirtioInputKind : uint8_t { Unknown, Keyboard, Mouse, Tablet };
+enum class VirtioInputKind : uint8_t { Unknown, Keyboard, Mouse, Tablet, Touch };      // Touch: multitouch (ABS_MT_POSITION_X / Y), QEMU's virtio-multitouch
 
 constexpr uint16_t kEvSyn = 0, kEvKey = 1, kEvRel = 2, kEvAbs = 3;
 
@@ -48,7 +48,7 @@ class VirtioInputDevice final : public IHardware {
   void shutdown() override;
 
   VirtioInputKind kind() const { return kind_; }
-  // Largest value of an absolute axis (0 = X, 1 = Y); 0 if unknown.
+  // Largest value of an absolute axis (0 = X, 1 = Y: for a touch device its contacts' ABS_MT_POSITION_X / Y); 0 if unknown.
   uint32_t absolute_max(uint8_t axis) const;
 
   // The next event from the device, or false if none is waiting.

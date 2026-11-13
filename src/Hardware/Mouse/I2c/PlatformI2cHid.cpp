@@ -300,6 +300,7 @@ bool PlatformI2cHid::setup_device(acpi::Node* device, CompositeMouse& mice, Repo
     p->pointer->shutdown();
     return true;
   }
+  if (touches_ && p->pointer->touch()) touches_->add(p->pointer->touch());      // (a touchscreen: its contacts too)
   report->outcome = Outcome::Started;
   pointers_.push_back(util::move(p));
   return true;
@@ -351,6 +352,7 @@ void PlatformI2cHid::stop(CompositeMouse& mice) {
   for (uint64_t i = 0; i < pointers_.count(); ++i) {
     Pointer& p = *pointers_[i];
     if (p.as_mouse) mice.remove(p.pointer.get());
+    if (touches_ && p.pointer->touch()) touches_->remove(p.pointer->touch());
     if (p.pen) { if (pens_) pens_->remove(p.pen.get()); p.pen->shutdown(); }
     for (auto& sensor : p.sensors)
       if (sensor) { if (sensors_) sensors_->remove(sensor.get()); sensor->shutdown(); }

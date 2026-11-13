@@ -439,6 +439,35 @@ void Win32Windows::tap_key(const hardware::KeyEvent& event, uint8_t modifiers) {
   session_->key(event.usage, true, modifiers);
 }
 
+bool Win32Windows::tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y) {
+  if (!session_ || !manager_ || !attached_) return false;
+  gui::Point origin;
+  Win32Window* over = nullptr;
+  {
+    gui::UiGuard lock(manager_);
+    origin = manager_->window_origin();
+    if (event.phase == hardware::TouchPhase::Down) {
+      gui::Rect2D area;
+      over = host_under(*manager_, x - origin.x, y - origin.y, &area);
+    }
+  }
+  const int32_t sx = x - origin.x, sy = y - origin.y;      // (the programs' screen = the window manager's area)
+  if (event.phase == hardware::TouchPhase::Down) {
+    if (!over || !session_->touch(event.phase, event.id, over->window(), sx, sy)) return false;
+    touches_.push_back(event.id);
+    gui::UiGuard lock(manager_);
+    if (host(over->window()) == over) over->activate();      // (a touch on a window brings it forward, as a click does)
+    return true;
+  }
+  for (uint64_t i = 0; i < touches_.count(); ++i) {
+    if (touches_[i] != event.id) continue;
+    session_->touch(event.phase, event.id, 0, sx, sy);
+    if (event.phase == hardware::TouchPhase::Up || event.phase == hardware::TouchPhase::Cancel) touches_.remove_at(i);
+    return true;
+  }
+  return false;
+}
+
 void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int32_t* y) {
   if (!session_ || !manager_ || !attached_) return;
   gui::Point origin;

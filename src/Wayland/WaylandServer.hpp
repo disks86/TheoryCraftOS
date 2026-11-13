@@ -198,6 +198,9 @@ class Server final : public desktop::IWindowsSession {
   void mouse_button(uint32_t button, bool down) override;
   void mouse_wheel(int32_t notches) override;
   void mouse_left() override;
+  // Touches (wl_touch): a Down over a surface whose client has a wl_touch is taken (down, then the contact's motion and up go to that client, each with
+  // a frame); else refused (the desktop moves the pointer with it). Cancel: the client is told its touches are cancelled.
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -593,6 +596,13 @@ class Server final : public desktop::IWindowsSession {
   } drag_;
   uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
+  struct TouchContact {
+    uint32_t id = 0;              // the desktop's contact (the client sees it as its touch id)
+    uint8_t client = 0;
+    uint32_t surface = 0;         // the surface it went down on (its object id)
+    int32_t origin_x = 0, origin_y = 0;      // where that surface's (0, 0) was on the screen at the time
+  };
+  List<TouchContact> touches_;    // the contacts clients took, until they lift
   uint32_t menu_window_ = 0;                // a toplevel's show_window_menu, until the desktop takes it
   int32_t menu_x_ = 0, menu_y_ = 0;
   uint32_t active_window_ = 0;

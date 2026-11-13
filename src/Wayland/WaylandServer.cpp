@@ -44,7 +44,7 @@ constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 }  // namespace
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
-    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator) {
+    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator), touches_(allocator) {
   monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
 }
 
@@ -169,6 +169,7 @@ void Server::close_client(uint32_t client) {
     const uint8_t number = c->number;
     if (drag_.client == number) drag_.source = 0, end_drag(false);
     for (uint64_t i = constraints_.count(); i-- > 0;) if (constraints_[i].client == number) constraints_.remove_at(i);
+    for (uint64_t i = touches_.count(); i-- > 0;) if (touches_[i].client == number) touches_.remove_at(i);      // (its fingers: nobody's now)
     if (psel_client_ == number) psel_client_ = 0, psel_source_ = 0;
     if (psel_sent_client_ == number) psel_sent_client_ = 0;
     if (sel_sent_client_ == number) sel_sent_client_ = 0;
@@ -342,7 +343,7 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
     }
     case Iface::Seat: {
       Event caps(object, 0);
-      caps.u(3);      // pointer | keyboard
+      caps.u(7);      // pointer | keyboard | touch (fingers go to a client that has a wl_touch, else they move the pointer)
       send(c, caps);
       if (version >= 2) {
         Event n(object, 1);

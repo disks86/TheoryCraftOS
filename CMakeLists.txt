@@ -942,6 +942,10 @@ add_executable(BOOTX64
   src/Hardware/Pen/CompositePen.cpp
   src/Hardware/Pen/PenMouse.cpp
   src/Hardware/Pen/I2c/I2cHidPen.cpp
+  src/Hardware/Touch/CompositeTouch.cpp
+  src/Hardware/Touch/LinuxMultitouch.cpp
+  src/Hardware/Touch/TouchTracker.cpp
+  src/Hardware/Touch/Virtio/VirtioTouch.cpp
   src/Hardware/Sensor/SensorHub.cpp
   src/Hardware/Sensor/HidSensor.cpp
   src/Hardware/Sensor/AcpiAmbientLight.cpp
