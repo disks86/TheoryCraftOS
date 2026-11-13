@@ -122,6 +122,22 @@ bool drop_files(const DropTarget& target, ArrayView<const char16_t> names);
 // The DROPFILES block (x64: pFiles, pt, fNC, fWide, then the wide names) of process `pid`'s drop `ticket`: its size, and when `out` is not empty
 // (exactly that size), the block in it, after which the drop is gone. 0: no such drop (or `out` has the wrong size). The caller holds the lock.
 uint64_t take_drop(uint64_t pid, uint32_t ticket, ByteView out);
+// Touches (Win32kUserTouch.cpp). touch_input: a finger of the desktop's (its contact `id`) at (x, y) of the screen; at Down over the top-level
+// `top_level` it is taken (true) by the window under it, which gets WM_POINTERENTER / DOWN / UPDATE / UP / LEAVE (or WM_TOUCH when it, or the window
+// above it, called RegisterTouchWindow) until the finger goes; DefWindowProc turns the first finger's unhandled messages into the mouse's. Takes the lock.
+bool touch_input(uint32_t top_level, uint8_t phase, uint32_t id, int32_t x, int32_t y);      // phase: hardware::TouchPhase
+bool touch_input_locked(uint32_t top_level, uint8_t phase, uint32_t id, int32_t x, int32_t y);      // (the caller holds the lock: InjectTouchInput)
+uint32_t top_level_at(int32_t x, int32_t y);      // the top-level under a point of the screen (0: none); the caller holds the lock
+// For user32 (the caller holds the lock): the POINTER_TOUCH_INFO (144 bytes) of one of the process's pointers; the TOUCHINPUT records (48 bytes each)
+// of a WM_TOUCH handle (`out` empty: how many); closing that handle; a window's RegisterTouchWindow state (op 0 unregister, 1 register with `flags`,
+// 2 ask: the flags + 1, 0 when not a touch window); whether the machine has had a touch (SM_DIGITIZER).
+bool pointer_touch_info(uint64_t pid, uint32_t pointer_id, ByteView out);
+uint32_t touch_input_info(uint64_t pid, uint32_t handle, ByteView out);
+bool close_touch_input(uint64_t pid, uint32_t handle);
+uint64_t touch_window_state(uint32_t hwnd, uint32_t op, uint32_t flags);
+bool touch_available();
+// DefWindowProc of WM_POINTERDOWN / UPDATE / UP and WM_TOUCH: the first finger as the mouse (moves and the left button). The caller holds the lock.
+void promote_touch(uint64_t pid, uint32_t message, uint64_t wparam, uint64_t lparam);
 bool window_redirected_locked(uint32_t hwnd);
 bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t width, uint32_t height, uint32_t pitch, bool rgba);                       // SC_CLOSE, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE
 

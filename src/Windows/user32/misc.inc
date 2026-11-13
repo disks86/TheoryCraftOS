@@ -21,7 +21,7 @@
  *   strings         LoadStringW/A from the RT_STRING bundles of a module (also the "pointer to the resource" mode of a zero length), OEM <-> ANSI conversions
  *   message boxes   MessageBox*: there is no dialog yet; the text goes to the debugger output and the default button is the answer
  *   stations        window stations and desktops over win32k's station services (src/Process/Win32k/Win32kUserStation.cpp)
- *   input           hot keys, TrackMouseEvent, GetLastInputInfo over win32k; pointer (pen/touch) devices: none
+ *   input           hot keys, TrackMouseEvent, GetLastInputInfo over win32k; touch pointers and WM_TOUCH over win32k (no pen pointers)
  *   notifications   power setting, suspend/resume and device notifications: handles that register nothing (no such broadcasts are sent here)
  *   painting        DrawEdge, DrawFrameControl (plain 3D frames), InvertRect, window regions, WindowFromDC
  *   DDE             not available: every call fails as DDEML does before DdeInitialize succeeds. */
@@ -417,8 +417,22 @@ EXPORT BOOL WINAPI GetLastInputInfo(LASTINPUTINFO_ *info) {
   return TRUE;
 }
 
-/* Pointer (pen and touch) devices: there are none, and no pointer ids exist. */
+/* Pointer (pen and touch) devices: none is listed, but fingers on the desktop's screen come as pointers (ids from 2; win32k's Win32kUserTouch.cpp) whose
+ * POINTER_TOUCH_INFO the kernel fills (NtUserCallTwoParam TCOS_POINTER_TOUCH_INFO); one entry per frame and no history. WM_TOUCH handles are read with
+ * TCOS_TOUCH_INPUT_INFO and closed with TCOS_CLOSE_TOUCH_INPUT; RegisterTouchWindow is TCOS_TOUCH_WINDOW. Pens are not pointers yet. */
 #define ERROR_INVALID_POINTER_ ERROR_INVALID_PARAMETER
+#define TCOS_POINTER_TOUCH_INFO 0x7C01u
+#define TCOS_TOUCH_INPUT_INFO 0x7C02u
+#define TCOS_CLOSE_TOUCH_INPUT 0x7C03u
+#define TCOS_TOUCH_WINDOW 0x7C04u
+#define POINTER_INFO_SIZE_ 96u
+#define POINTER_TOUCH_INFO_SIZE_ 144u
+#define TOUCHINPUT_SIZE_ 48u
+#ifndef ERROR_INSUFFICIENT_BUFFER
+#define ERROR_INSUFFICIENT_BUFFER 122
+#endif
+static void copy_info(void *to, const BYTE *from, UINT size) { BYTE *d = to; for (UINT i = 0; i < size; ++i) d[i] = from[i]; }
+static BOOL touch_info(UINT32 id, BYTE *out) { return NtUserCallTwoParam(id, (ULONG_PTR)out, TCOS_POINTER_TOUCH_INFO) == 1; }
 EXPORT BOOL WINAPI GetPointerDevices(UINT32 *count, void *devices) {
   (void)devices;
   if (!count) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
@@ -427,12 +441,87 @@ EXPORT BOOL WINAPI GetPointerDevices(UINT32 *count, void *devices) {
 }
 EXPORT BOOL WINAPI GetPointerDevice(HANDLE device, void *info) { (void)device; (void)info; SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
 EXPORT BOOL WINAPI GetPointerDeviceRects(HANDLE device, RECT_ *pointer, RECT_ *display) { (void)device; (void)pointer; (void)display; SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-EXPORT BOOL WINAPI GetPointerType(UINT32 id, DWORD *type) { (void)id; if (type) *type = 0; SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
-EXPORT BOOL WINAPI GetPointerInfo(UINT32 id, void *info) { (void)id; (void)info; SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
+EXPORT BOOL WINAPI GetPointerType(UINT32 id, DWORD *type) {
+  BYTE t[POINTER_TOUCH_INFO_SIZE_];
+  if (!type) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!touch_info(id, t)) { *type = 0; SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
+  *type = 2;      /* PT_TOUCH */
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetPointerInfo(UINT32 id, void *info) {
+  BYTE t[POINTER_TOUCH_INFO_SIZE_];
+  if (!info) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!touch_info(id, t)) { SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
+  copy_info(info, t, POINTER_INFO_SIZE_);
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetPointerTouchInfo(UINT32 id, void *info) {
+  BYTE t[POINTER_TOUCH_INFO_SIZE_];
+  if (!info) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!touch_info(id, t)) { SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
+  copy_info(info, t, POINTER_TOUCH_INFO_SIZE_);
+  return TRUE;
+}
+/* The frame and history forms: one pointer, one entry. */
+static BOOL one_entry(UINT32 id, UINT32 *count, void *info, UINT32 size) {
+  BYTE t[POINTER_TOUCH_INFO_SIZE_];
+  if (!count) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!touch_info(id, t)) { SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
+  if (!info || *count < 1) { *count = 1; SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+  *count = 1;
+  copy_info(info, t, size);
+  return TRUE;
+}
+EXPORT BOOL WINAPI GetPointerFrameInfo(UINT32 id, UINT32 *count, void *info) { return one_entry(id, count, info, POINTER_INFO_SIZE_); }
+EXPORT BOOL WINAPI GetPointerFrameTouchInfo(UINT32 id, UINT32 *count, void *info) { return one_entry(id, count, info, POINTER_TOUCH_INFO_SIZE_); }
+EXPORT BOOL WINAPI GetPointerInfoHistory(UINT32 id, UINT32 *count, void *info) { return one_entry(id, count, info, POINTER_INFO_SIZE_); }
+EXPORT BOOL WINAPI GetPointerTouchInfoHistory(UINT32 id, UINT32 *count, void *info) { return one_entry(id, count, info, POINTER_TOUCH_INFO_SIZE_); }
+EXPORT BOOL WINAPI GetPointerFrameInfoHistory(UINT32 id, UINT32 *entries, UINT32 *pointers, void *info) {
+  if (!pointers) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (entries) *entries = 1;
+  return one_entry(id, pointers, info, POINTER_INFO_SIZE_);
+}
+EXPORT BOOL WINAPI GetPointerFrameTouchInfoHistory(UINT32 id, UINT32 *entries, UINT32 *pointers, void *info) {
+  if (!pointers) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (entries) *entries = 1;
+  return one_entry(id, pointers, info, POINTER_TOUCH_INFO_SIZE_);
+}
+EXPORT BOOL WINAPI SkipPointerFrameMessages(UINT32 id) { (void)id; return TRUE; }
 EXPORT BOOL WINAPI GetPointerPenInfo(UINT32 id, void *info) { (void)id; (void)info; SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
-EXPORT BOOL WINAPI GetPointerTouchInfo(UINT32 id, void *info) { (void)id; (void)info; SetLastError(ERROR_INVALID_POINTER_); return FALSE; }
 EXPORT BOOL WINAPI RegisterPointerDeviceNotifications(HANDLE hwnd, BOOL range) { (void)range; if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; } return TRUE; }
-EXPORT BOOL WINAPI CloseTouchInputHandle(HANDLE input) { (void)input; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+/* Touch injection: the contacts (POINTER_TOUCH_INFO) go through the path the desktop's fingers take. */
+SVC NtUserInitializeTouchInjection(ULONG_PTR max, ULONG_PTR mode);
+SVC NtUserInjectTouchInput(ULONG_PTR count, ULONG_PTR contacts);
+EXPORT BOOL WINAPI InitializeTouchInjection(UINT32 max, DWORD mode) { return (NtUserInitializeTouchInjection(max, mode) & 0xFFFFFFFFu) != 0; }
+EXPORT BOOL WINAPI InjectTouchInput(UINT32 count, const void *contacts) {
+  if (!contacts) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  return (NtUserInjectTouchInput(count, (ULONG_PTR)contacts) & 0xFFFFFFFFu) != 0;
+}
+/* WM_TOUCH (Windows 7's touch messages) */
+EXPORT BOOL WINAPI RegisterTouchWindow(HANDLE hwnd, ULONG flags) {
+  if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  return NtUserCallTwoParam((ULONG_PTR)hwnd, 1u | ((ULONG_PTR)(flags & 0x3FFFFFFFu) << 2), TCOS_TOUCH_WINDOW) != 0;
+}
+EXPORT BOOL WINAPI UnregisterTouchWindow(HANDLE hwnd) {
+  if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }
+  NtUserCallTwoParam((ULONG_PTR)hwnd, 0, TCOS_TOUCH_WINDOW);
+  return TRUE;
+}
+EXPORT BOOL WINAPI IsTouchWindow(HANDLE hwnd, ULONG *flags) {
+  const ULONG_PTR state = NtUserCallTwoParam((ULONG_PTR)hwnd, 2, TCOS_TOUCH_WINDOW);
+  if (flags) *flags = state ? (ULONG)(state - 1) : 0;
+  return state != 0;
+}
+EXPORT BOOL WINAPI GetTouchInputInfo(HANDLE input, UINT count, void *inputs, int size) {
+  if (!inputs || count == 0 || size != (int)TOUCHINPUT_SIZE_) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  const ULONG_PTR have = NtUserCallTwoParam((ULONG_PTR)input, 0, TCOS_TOUCH_INPUT_INFO);
+  if (have == 0) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  return NtUserCallTwoParam((ULONG_PTR)input, (ULONG_PTR)inputs, TCOS_TOUCH_INPUT_INFO) == 1;      /* (one input per WM_TOUCH) */
+}
+EXPORT BOOL WINAPI CloseTouchInputHandle(HANDLE input) {
+  if (NtUserCallTwoParam((ULONG_PTR)input, 0, TCOS_CLOSE_TOUCH_INPUT) != 1) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+  return TRUE;
+}
 
 /* ---- notifications ---------------------------------------------------------------------------------------------------------------------------------------------- */
 
