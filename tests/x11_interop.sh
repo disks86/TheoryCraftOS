@@ -8,10 +8,11 @@ display=${1:-87}
 out=${TMPDIR:-/tmp}/tcos-x11-interop
 mkdir -p "$out"
 if [ ! -f /usr/include/X11/Xlib.h ]; then echo "skipped (no libX11 headers)"; exit 0; fi
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/x11/X11HostServer.cpp src/X11/X11Drawing.cpp src/X11/X11Input.cpp src/X11/X11Requests.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/x11/X11HostServer.cpp src/X11/X11DragAndDrop.cpp src/X11/X11Drawing.cpp src/X11/X11Input.cpp src/X11/X11Requests.cpp \
   src/X11/X11Tables.cpp src/X11/X11Windows.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp \
   -o "$out/X11HostServer"
 gcc -O1 -g -Wall tests/x11/xlib_client.c -lX11 -o "$out/xlib_client"
+gcc -O1 -g -Wall tests/x11/xdnd_client.c -lX11 -o "$out/xdnd_client"
 
 "$out/X11HostServer" "$display" 60 "$out/windows.ppm" > "$out/server.log" 2>&1 &
 server=$!
@@ -34,5 +35,16 @@ grep -h "checks" "$out"/parallel.*.log
 kill "$server"
 wait "$server" || true
 if grep -q "ERROR: AddressSanitizer\|runtime error" "$out/server.log"; then cat "$out/server.log"; status=1; fi
+# XDND with the desktop: a server of its own that plays the desktop's part (TCOS_XDND)
+echo "== xdnd_client"
+TCOS_XDND=1 "$out/X11HostServer" "$((display + 1))" 30 > "$out/xdnd-server.log" 2>&1 &
+xserver=$!
+for _ in $(seq 50); do grep -q listening "$out/xdnd-server.log" 2>/dev/null && break; sleep 0.1; done
+DISPLAY=:$((display + 1)) XAUTHORITY=/dev/null "$out/xdnd_client" || status=1
+kill "$xserver" 2>/dev/null || true
+wait "$xserver" || true
+grep "desktop drop\|program drop" "$out/xdnd-server.log" || true
+grep -q "program drop at 700,450: /Desktop/Documents/b.txt" "$out/xdnd-server.log" || { echo "the desktop did not get the client's file"; status=1; }
+if grep -q "ERROR: AddressSanitizer\|runtime error" "$out/xdnd-server.log"; then cat "$out/xdnd-server.log"; status=1; fi
 [ $status -eq 0 ] && echo "x11 interop: all passed" || echo "x11 interop: FAILED"
 exit $status

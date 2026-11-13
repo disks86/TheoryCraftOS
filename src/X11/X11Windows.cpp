@@ -99,7 +99,8 @@ constexpr uint32_t kMaxChanges = 256;
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
     : allocator_(allocator), clock_(clock), resources_(allocator), windows_(allocator), gcs_(allocator), pixmaps_(allocator), cursors_(allocator),
-      fonts_(allocator), atoms_(allocator), selection_owners_(allocator), changes_(allocator) {
+      fonts_(allocator), atoms_(allocator), selection_owners_(allocator), changes_(allocator), out_text_(allocator), out_uri_(allocator),
+      out_linux_(allocator), in_text_(allocator) {
   for (const char* name : kPredefinedAtoms) intern(name);
   for (const char* name : kWellKnownNames) intern(name);
   root_ = windows_.emplace(allocator_);
@@ -147,6 +148,7 @@ Server::Server(allocators::IAllocator& allocator, Clock clock)
   monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)},
                   {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
   monitor_count_ = 1;
+  xdnd_setup();
   update_root_lists();
 }
 
@@ -255,6 +257,7 @@ void Server::close_client(uint32_t client) {
 // Everything the client made goes: its windows (with whatever is inside them), then the rest; its grabs, selections and event selections end.
 void Server::free_client_resources(uint8_t client) {
   release_grabs_of(client);
+  xdnd_client_gone(client);
   for (uint64_t i = 0; i < selection_owners_.count();) {
     if (selection_owners_[i].client == client) selection_owners_.remove_at(i);
     else ++i;
