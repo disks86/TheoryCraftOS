@@ -170,7 +170,8 @@ class Frame : public Control {
   virtual void manager_changed() {}
   // Asked before close() closes the window: false keeps it open (a Windows program's window asks the program, which destroys it if it agrees).
   virtual bool close_requested() { return true; }
-  // Told when the window manager closes the frame (after it was taken out): a tabbed window closes its tabs.
+  // Told when the window manager closes the frame (after it was taken out), or its tabbed window closes it as a tab: a tabbed window closes its tabs,
+  // a program lets go of what it was doing (a page stops its sounds and scripts).
   virtual void window_closed(Window* /*window*/) {}
   // A tab changed its title / the host is asked to...
   virtual void tab_title_changed(Frame* /*tab*/) {}

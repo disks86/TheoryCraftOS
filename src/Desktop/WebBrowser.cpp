@@ -319,12 +319,39 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   add(&page_);   // Fill goes last
   update_buttons();
   update_title(StringView());
+  gone_handler_ = {&WebBrowser::on_window_gone, this};
+  show_welcome();
+}
 
-  Fetched welcome(allocator);
+void WebBrowser::show_welcome() {
+  Fetched welcome(allocator());
   welcome.body.append(ConstByteView(reinterpret_cast<const uint8_t*>(kWelcome), sizeof kWelcome - 1));
   welcome.type.assign("text/html");
   show(welcome);
   say("Type an address and press Enter.");
+}
+
+// The window (or the tab) was closed. The first browser of the desktop is kept to be opened again, so its page would go on playing its videos and sounds
+// and running its scripts unseen: the page is let go of on the handler thread (where the page lives), and the window starts afresh next time.
+void WebBrowser::window_closed(gui::Window*) { queue(gone_handler_, *this, true); }
+
+void WebBrowser::on_window_gone(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  {
+    UiGuard lock(b);
+    b->request_ = Request::None;
+    b->want_go_ = b->want_post_ = b->want_close_ = b->defer_reload_ = false;
+    b->defer_history_ = 0;
+    b->defer_opens_.clear();
+    b->defer_open_targets_.clear();
+    b->defer_open_types_.clear();
+    b->defer_open_bodies_.clear();
+    b->leave_confirmed_ = false;
+    b->history_.clear();
+    b->current_.clear();
+    b->referrer_.clear();
+  }
+  b->show_welcome();   // (unloads the page: pagehide and unload run, its media players and sounds are closed)
 }
 
 bool WebBrowser::RtcRandom::fill(ByteView out) { return browser::system_random(out); }

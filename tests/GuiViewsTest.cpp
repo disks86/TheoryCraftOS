@@ -8613,6 +8613,18 @@ static void test_web_navigation() {
     CHECK(d.web_browser_count() == before);
     // (a window the user opened is not closed by its page)
     CHECK(b->navigate("http://closer.test/now") && b->address().equals("http://closer.test/now") && d.web_browser_count() == before);
+
+    // Closing the window lets the page go (its scripts stop, and its videos and sounds with them): the desktop keeps its first browser to open again,
+    // and that one starts on the welcome page with no history
+    CHECK(b->navigate("http://one.test/") && b->can_go_back());
+    host->close();
+    CHECK(!b->manager() && b->address().empty() && !b->can_go_back() && b->address_box().text().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
+    d.step(1000000);
+    CHECK(d.open_web_browser() == b && b->manager() && b->address().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
+    // (a tab closed on its own is told too)
+    CHECK(b->navigate("http://one.test/") && run_contains(*b, "Page "));
+    static_cast<gui::TabFrame*>(b->host())->close_tab(b);
+    CHECK(!b->manager() && b->address().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
   }
   CHECK(a.live == 0);
 }

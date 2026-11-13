@@ -130,6 +130,7 @@ void TabFrame::close_tab(Frame* tab) {
   UiGuard lock(this);
   Window* w = window();
   if (!remove_tab(tab)) return;
+  tab->window_closed(w);   // (a tab is told it was closed the way a window is)
   tab->run_closed_handler(w);
   if (tabs_.count() == 0) close();
 }
@@ -185,6 +186,7 @@ void TabFrame::window_closed(Window* window) {
   while (tabs_.count()) {
     Frame* tab = tabs_[0];
     remove_tab(tab);
+    tab->window_closed(window);
     tab->run_closed_handler(window);
   }
 }

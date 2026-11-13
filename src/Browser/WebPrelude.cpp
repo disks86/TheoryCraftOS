@@ -5890,6 +5890,10 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     Object.defineProperty(g, '__upgrading', { value: el, writable: true, configurable: true });   // (HTMLElement() hands this element out: the construction stack)
     try { __super_init(def.ctor, el); } catch (e) { reportError(e); }   // (new.target of a class constructor is def.ctor, as when super() runs it)
     g.__upgrading = undefined;
+    // The changes made to the element so far (by the parser, a clone, a script before define(), its own constructor) are not reactions: the attributes it
+    // has now are told below, once. Records up to here are taken into the queue, and the ones of this element are skipped by reactions().
+    takeLog();
+    Object.defineProperty(el, '__ceSeq', { value: logSeq, writable: true, configurable: true });
     for (var i = 0; i < def.observed.length; i++) {
       var a = def.observed[i];
       if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
@@ -5932,18 +5936,30 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       });
     } else if (record.type === 'attributes') {
       var el = record.target, def = el.nodeType === 1 ? defOf(el) : null;
-      if (def && el.__ce !== undefined && def.observed.indexOf(record.attributeName) >= 0)
+      if (def && el.__ce !== undefined && record.__seq > (el.__ceSeq || 0) && def.observed.indexOf(record.attributeName) >= 0)
         callback(el, 'attributeChangedCallback', [record.attributeName, record.oldValue, el.getAttribute(record.attributeName)]);
     }
   }
   // The changes since the last time: custom element reactions run, observers get their records queued.
-  function processLog() {
+  // The records wait in one queue, numbered in the order they happened: a reaction that changes the DOM (or upgrades an element, which takes the log
+  // early) adds to the end of the same queue, so they are handled in order whoever drains it.
+  var logQueue = [], logHead = 0, logSeq = 0;
+  function takeLog() {
     var records = __take_mutations();
     for (var i = 0; i < records.length; i++) {
-      var r = records[i];
+      records[i].__seq = ++logSeq;
+      logQueue.push(records[i]);
+    }
+  }
+  function processLog() {
+    takeLog();
+    while (logHead < logQueue.length) {
+      var r = logQueue[logHead++];
       if (r.target.nodeType === 1 || r.type === 'childList') reactions(r);
       deliver(r);
     }
+    logQueue.length = 0;
+    logHead = 0;
   }
   hide(g, '__process_mutations', processLog);
   hide(g, '__deliver_mutations', function () {

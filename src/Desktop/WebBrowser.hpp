@@ -195,6 +195,9 @@ class WebBrowser : public gui::Frame {
   void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { navigate(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
+ protected:
+  void window_closed(gui::Window* window) override;
+
  private:
   enum class Request : uint8_t { None, Go, Back, Forward, Reload, Submit };
   struct Fetched;
@@ -285,6 +288,8 @@ class WebBrowser : public gui::Frame {
   static void on_caret(void* self, gui::Control&);
   void restart_caret();
   static void on_visibility(void* self, gui::Control&);
+  static void on_window_gone(void* self, gui::Control&);
+  void show_welcome();
   bool window_shown();
   static void on_toggle_scripts(void* self, gui::Control&);
   static void on_toggle_dark(void* self, gui::Control&);
@@ -443,6 +448,7 @@ class WebBrowser : public gui::Frame {
   bool refresh_deferred_ = false;   // (written by tick and the handler thread alike: atomic)
   bool page_shown_ = true;   // Page Visibility: is the tab selected in a window that is not minimized (written by tick, read on the handler thread)
   gui::Handler visibility_handler_;
+  gui::Handler gone_handler_;   // (the window was closed: the page goes, and its sounds with it)
   uint32_t reported_errors_ = 0;
   uint32_t script_errors_ = 0;
   String script_log_;

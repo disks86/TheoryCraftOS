@@ -4795,6 +4795,20 @@ static void test_messaging() {
                  "customElements.define('x-late', class extends HTMLElement { connectedCallback() { log.push('up:' + this.id); } greet() { return 'hello'; } });"
                  "log.push(document.getElementById('a').greet(), customElements.get('x-late') !== undefined, customElements.get('nope'));"
                  "setTimeout(function () { console.log(log.join('|')); }, 5);", "up:a|up:b|hello|true|", nullptr, "https://app.example/"));
+  {   // an upgrade tells the attributes the element has once, before connectedCallback; the changes that made them are not told again afterwards
+      // (YouTube's dom-if throws Error("..`restamp") when attributeChangedCallback comes after connectedCallback)
+    const char* kStrict =
+        "var log = []; class S extends HTMLElement { static get observedAttributes() { return ['restamp']; } constructor() { super(); this.on = false; }"
+        "connectedCallback() { this.on = true; log.push('connected:' + this.id); } attributeChangedCallback(n, o, v) { if (this.on) throw Error('late:' + n); log.push('attr:' + this.id + ':' + n + ':' + o + ':' + v); } }"
+        "window.onerror = function (m) { log.push('error:' + m); };";
+    CHECK(async_is((std::string(kStrict) + "document.body.innerHTML = '<x-strict id=a restamp></x-strict>'; customElements.define('x-strict', S);"
+                   "setTimeout(function () { console.log(log.join('|')); }, 5);").c_str(), "attr:a:restamp:null:|connected:a", nullptr, "https://app.example/"));
+    CHECK(async_is((std::string(kStrict) + "customElements.define('x-strict', S); var t = document.createElement('template'); t.innerHTML = '<x-strict id=b restamp></x-strict>';"
+                   "document.body.appendChild(document.importNode(t.content, true)); var c = document.getElementById('b').cloneNode(true); c.id = 'c'; document.body.appendChild(c);"
+                   "setTimeout(function () { console.log(log.join('|')); }, 5);").c_str(), "attr:b:restamp:null:|connected:b|attr:b:restamp:null:|connected:c", nullptr, "https://app.example/"));
+    CHECK(async_is((std::string(kStrict) + "customElements.define('x-strict', S); var e = document.createElement('x-strict'); e.id = 'd'; e.setAttribute('restamp', '1'); document.body.appendChild(e);"
+                   "setTimeout(function () { console.log(log.join('|')); }, 5);").c_str(), "attr:d:restamp:null:1|connected:d", nullptr, "https://app.example/"));
+  }
   CHECK(async_is("class W extends HTMLElement { constructor() { super(); this.textContent = 'built'; } } customElements.define('x-w', W); var w = new W(); document.body.appendChild(w);"
                  "console.log(w.tagName, w.textContent, document.body.lastChild === w, w.isConnected, document.querySelector('x-w') === w);", "X-W built true true true", nullptr, "https://app.example/"));
   CHECK(async_is("var r = []; try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.define('x-once', class extends HTMLElement {});"
