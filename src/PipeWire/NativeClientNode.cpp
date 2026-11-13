@@ -355,6 +355,56 @@ uint32_t enum_video_formats(ConstByteView enum_format, uint32_t* out, uint32_t m
   return 0;
 }
 
+// The size a watcher takes, given its EnumFormat and its producer's size: the producer's when the EnumFormat allows it (it says no size, a range
+// that holds it, a list with it), else the EnumFormat's own (a fixed size, a list's first, the producer's clamped into a range).
+void watcher_size(ConstByteView enum_format, uint32_t pw, uint32_t ph, uint32_t* w, uint32_t* h) {
+  *w = pw;
+  *h = ph;
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return;
+  uint32_t key = 0, flags = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop)) {
+    if (key != kFormatVideoSize) continue;
+    auto rect = [](ConstByteView body, uint32_t* rw, uint32_t* rh) {
+      if (body.size() < 8) return false;
+      ByteReader r(body.first(8));
+      *rw = r.le32();
+      *rh = r.le32();
+      return *rw >= 1 && *rh >= 1 && *rw <= VideoFormat::kMaxSide && *rh <= VideoFormat::kMaxSide;
+    };
+    uint32_t a = 0, b = 0;
+    if (prop.type == pod::kRectangle) {
+      if (rect(prop.body, &a, &b)) *w = a, *h = b;
+      return;
+    }
+    if (prop.type != pod::kChoice || prop.body.size() < 24) return;
+    ByteReader hdr(prop.body.first(16));
+    const uint32_t kind = hdr.le32();
+    hdr.le32();
+    const uint32_t child_size = hdr.le32(), child_type = hdr.le32();
+    if (child_size != 8 || child_type != pod::kRectangle) return;
+    const uint64_t count = (prop.body.size() - 16) / 8;
+    uint32_t dw = 0, dh = 0;
+    if (!rect(prop.body.subview(16, 8), &dw, &dh)) return;
+    if (kind == pod::kChoiceNone) {
+      *w = dw, *h = dh;
+    } else if (kind == pod::kChoiceRange && count >= 3) {
+      uint32_t lw = 0, lh = 0, hw = 0, hh = 0;
+      if (!rect(prop.body.subview(24, 8), &lw, &lh) || !rect(prop.body.subview(32, 8), &hw, &hh)) return;
+      *w = pw < lw ? lw : pw > hw ? hw : pw;
+      *h = ph < lh ? lh : ph > hh ? hh : ph;
+    } else if (kind == pod::kChoiceEnum) {
+      for (uint64_t k = 1; k < count; ++k)
+        if (rect(prop.body.subview(16 + 8 * k, 8), &a, &b) && a == pw && b == ph) return;      // (the producer's size is one it lists)
+      *w = dw, *h = dh;
+    }
+    return;
+  }
+}
+
 // The media subtype an EnumFormat says (its first, for a Choice); 0 when it does not say.
 uint32_t enum_subtype(ConstByteView enum_format) {
   pod::Parser parser(enum_format);
@@ -774,6 +824,13 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
           p.video.format = wanted[k];
           break;
         }
+    }
+    // the size it takes: scaled to it when that is not the producer's (and the frames can be converted at all)
+    if (v.width && v.height && (!v.encoded() ? can_convert_video(v.format, v.format) : v.subtype == kSubtypeMjpg && p.video.subtype == VideoFormat::kSubtypeRaw)) {
+      uint32_t ww = 0, wh = 0;
+      watcher_size(p.enum_format.view(), v.width, v.height, &ww, &wh);
+      p.video.width = ww;
+      p.video.height = wh;
     }
     bool takes = listed == 0;
     for (uint32_t k = 0; k < listed; ++k) takes |= wanted[k] == v.format;

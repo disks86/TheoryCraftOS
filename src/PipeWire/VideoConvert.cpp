@@ -424,19 +424,79 @@ void from_rgba(const VideoFormat& f, ConstByteView rgba, ByteView out) {
     }
 }
 
+// Which source pixels one output pixel takes along one axis, and how much of each: on an axis that shrinks (or keeps its size) the ones it covers,
+// alike (an average); on one that grows the two nearest its centre, linearly (bilinear).
+struct AxisTaps {
+  uint32_t first = 0, count = 0;      // (box: count pixels from first; linear: first and first + 1 when count is 2)
+  uint32_t weight = 0;                // (linear: the second's share of 256)
+  bool linear = false;
+};
+AxisTaps axis_taps(uint32_t i, uint32_t source, uint32_t dest) {
+  AxisTaps t;
+  const uint64_t p0 = uint64_t{i} * source * 256 / dest, p1 = uint64_t{i + 1} * source * 256 / dest;      // (in 1/256 of a source pixel)
+  if (p1 - p0 >= 256) {
+    t.first = static_cast<uint32_t>(p0 / 256);
+    const uint32_t end = static_cast<uint32_t>((p1 + 255) / 256);
+    t.count = (end > source ? source : end) - t.first;
+    if (t.count == 0) t.count = 1;
+    return t;
+  }
+  const int64_t centre = static_cast<int64_t>((p0 + p1) / 2) - 128;
+  const uint64_t c = centre < 0 ? 0 : static_cast<uint64_t>(centre);
+  t.linear = true;
+  t.first = static_cast<uint32_t>(c / 256);
+  if (t.first >= source - 1) {
+    t.first = source - 1;
+    t.count = 1;
+    return t;
+  }
+  t.count = 2;
+  t.weight = static_cast<uint32_t>(c % 256);
+  return t;
+}
+
+// An RGBA frame of sw x sh as one of dw x dh, axis by axis (averaged where it shrinks, bilinear where it grows), in fixed point.
+void scale_rgba(ConstByteView in, uint32_t sw, uint32_t sh, ByteView out, uint32_t dw, uint32_t dh) {
+  for (uint32_t y = 0; y < dh; ++y) {
+    const AxisTaps ty = axis_taps(y, sh, dh);
+    for (uint32_t x = 0; x < dw; ++x) {
+      const AxisTaps tx = axis_taps(x, sw, dw);
+      uint64_t sum[4] = {0, 0, 0, 0}, total = 0;
+      for (uint32_t j = 0; j < ty.count; ++j) {
+        const uint64_t wy = ty.linear ? (j == 0 ? 256 - ty.weight : ty.weight) : 256;
+        for (uint32_t k = 0; k < tx.count; ++k) {
+          const uint64_t wx = tx.linear ? (k == 0 ? 256 - tx.weight : tx.weight) : 256;
+          const ConstByteView q = in.subview((uint64_t{ty.first + j} * sw + tx.first + k) * 4, 4);
+          for (uint64_t c = 0; c < 4; ++c) sum[c] += q[c] * wx * wy;
+          total += wx * wy;
+        }
+      }
+      ByteView o = out.subview((uint64_t{y} * dw + x) * 4, 4);
+      for (uint64_t c = 0; c < 4; ++c) o[c] = static_cast<uint8_t>(total ? (sum[c] + total / 2) / total : 0);
+    }
+  }
+}
+
 }  // namespace
 
 bool can_convert_video(uint32_t from, uint32_t to) { return known(from) && known(to); }
 
 bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat& to, ByteBuffer* out) {
   if (from.encoded() || to.encoded() || !from.valid() || !to.valid() || !can_convert_video(from.format, to.format)) return false;
-  if (from.width != to.width || from.height != to.height) return false;
   if (in.size() < from.frame_bytes()) return false;
   out->clear();
-  if (from.format == to.format) return out->append(in.first(from.frame_bytes()));
+  const bool same_size = from.width == to.width && from.height == to.height;
+  if (from.format == to.format && same_size) return out->append(in.first(from.frame_bytes()));
   ByteBuffer rgba(out->allocator());
   if (!rgba.put_zeros(uint64_t{from.width} * from.height * 4) || !out->put_zeros(to.frame_bytes())) return false;
   to_rgba(from, in, rgba.writable_view());
+  if (!same_size) {      // (another size: scaled as RGBA)
+    ByteBuffer scaled(out->allocator());
+    if (!scaled.put_zeros(uint64_t{to.width} * to.height * 4)) return false;
+    scale_rgba(rgba.view(), from.width, from.height, scaled.writable_view(), to.width, to.height);
+    from_rgba(to, scaled.view(), out->writable_view());
+    return true;
+  }
   from_rgba(to, rgba.view(), out->writable_view());
   return true;
 }
@@ -444,18 +504,21 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
 bool can_decode_video(const VideoFormat& from, uint32_t to) { return from.subtype == kSubtypeMjpg && can_convert_video(kBGRA, to); }
 
 bool decode_video(ConstByteView frame, const VideoFormat& to, hardware::JpegDecoder& decoder, List<uint32_t>* scratch, ByteBuffer* out) {
-  if (to.encoded() || !to.valid() || !decoder.decode(frame) || decoder.width() != to.width || decoder.height() != to.height) return false;
-  const uint64_t pixels = uint64_t{to.width} * to.height;
+  if (to.encoded() || !to.valid() || !decoder.decode(frame) || decoder.width() == 0 || decoder.height() == 0) return false;
+  VideoFormat bgra;
+  bgra.format = kBGRA;
+  bgra.width = decoder.width();
+  bgra.height = decoder.height();
+  if (!bgra.valid()) return false;
+  const uint64_t pixels = uint64_t{bgra.width} * bgra.height;
   if (scratch->count() < pixels) {
     if (!scratch->reserve(pixels)) return false;
     while (scratch->count() < pixels)
       if (!scratch->push_back(0)) return false;
   }
   ArrayView<uint32_t> words = scratch->view().first(pixels);
-  if (!decoder.output_bgra(words.data(), to.width)) return false;
-  VideoFormat bgra = to;
-  bgra.format = kBGRA;
-  return convert_video(bgra, words_as_bytes(ArrayView<const uint32_t>(words)), to, out);
+  if (!decoder.output_bgra(words.data(), bgra.width)) return false;
+  return convert_video(bgra, words_as_bytes(ArrayView<const uint32_t>(words)), to, out);      // (to its format and size)
 }
 
 }  // namespace pipewire

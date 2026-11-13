@@ -3184,7 +3184,7 @@ static void test_video_channel() {
     odd.width = 5;
     ByteBuffer o(A);
     CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size() - 1), i420, &o));      // (short)
-    CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o));         // (another size)
+    CHECK(convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o) && o.size() == 5 * 4 * 4);      // (another size: scaled)
     VideoFormat v210 = rgba;
     v210.format = 21;      // (v210: not carried)
     CHECK(!can_convert_video(21, 11) && !convert_video(v210, ConstByteView(source.data(), source.size()), rgba, &o));
@@ -3197,6 +3197,28 @@ static void test_video_channel() {
       ByteBuffer t(A), b3(A);
       CHECK(convert_video(rgba, ConstByteView(red.data(), red.size()), d, &t) && convert_video(d, t.view(), rgba, &b3));
       if (b3.size() == red.size()) CHECK(abs(int(b3.view()[0]) - 200) <= 6 && abs(int(b3.view()[1]) - 30) <= 6 && b3.view()[2] <= 16);
+    }
+    // scaling: a ramp of four columns, halved (pairs averaged), doubled (bilinear, the ends kept)
+    VideoFormat four = rgba, two = rgba, eight = rgba;
+    four.width = 4; four.height = 1; two.width = 2; two.height = 1; eight.width = 8; eight.height = 1;
+    std::vector<uint8_t> ramp = {0, 0, 0, 255, 100, 100, 100, 255, 200, 200, 200, 255, 240, 240, 240, 255};
+    ByteBuffer half(A), twice(A);
+    CHECK(convert_video(four, ConstByteView(ramp.data(), ramp.size()), two, &half) && half.size() == 8);
+    if (half.size() == 8) CHECK(half.view()[0] == 50 && half.view()[4] == 220 && half.view()[3] == 255);
+    CHECK(convert_video(four, ConstByteView(ramp.data(), ramp.size()), eight, &twice) && twice.size() == 32);
+    if (twice.size() == 32) { CHECK(twice.view()[0] == 0 && twice.view()[28] == 240 && twice.view()[8] > 0 && twice.view()[8] < 100); }
+    // random sizes both ways, random formats: never out of bounds, the frame the size asked
+    std::mt19937 srng(31);
+    const uint32_t fmts[] = {2, 4, 12, 15, 23, 29, 43, 52, 62, 79, 80};
+    for (int round = 0; round < 300; ++round) {
+      VideoFormat from = rgba, to = rgba;
+      from.width = 1 + srng() % 33; from.height = 1 + srng() % 17;
+      to.width = 1 + srng() % 33; to.height = 1 + srng() % 17;
+      from.format = fmts[srng() % 11]; to.format = fmts[srng() % 11];
+      std::vector<uint8_t> frame(from.frame_bytes());
+      for (uint8_t& v : frame) v = uint8_t(srng());
+      ByteBuffer r(A);
+      CHECK(convert_video(from, ConstByteView(frame.data(), frame.size()), to, &r) && r.size() == to.frame_bytes());
     }
     // red through NV12 comes back red
     std::vector<uint8_t> red(6 * 4 * 4);
@@ -3429,7 +3451,7 @@ static void enum_video_choice(pod::Builder& b, std::initializer_list<uint32_t> f
   b.choice_value32(*formats.begin());
   for (uint32_t f : formats) b.choice_value32(f);
   b.end(ch);
-  b.property(0x20003); b.rectangle(w, h);
+  if (w && h) { b.property(0x20003); b.rectangle(w, h); }      // (0: any size)
   b.property(0x20004); b.fraction(30, 1);
   b.end(o);
 }
@@ -3914,7 +3936,7 @@ static void test_client_node_media() {
     create_node(w, 4, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
     node_update(w, 4);
     set_active(w, 4, true);
-    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {23, 2}, 320, 240); port_info(b, 0, {}); });
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {23, 2}, 0, 0); port_info(b, 0, {}); });
     yw.absorb(w);
     CHECK(yw.ports[{0, 0}].format == ycp.format);
     w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
@@ -4099,6 +4121,39 @@ static void test_client_node_media() {
       CHECK(got.size() == 6 * 4 * 4);
       if (got.size() == 96) CHECK(got[0] == 255 && got[1] == 255 && got[2] == 255 && got[3] == 255 && got[5 * 4] == 0 && got[5 * 4 + 2] == 0 && got[23 * 4 + 3] == 255);
     }
+    // a watcher of one fixed size, half the camera's: offered that size, given each frame scaled (each pixel two by two averaged)
+    NodeView sw;
+    sw.id = 8;
+    create_node(w, 8, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
+    node_update(w, 8);
+    set_active(w, 8, true);
+    w.send(8, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 3, 2); port_info(b, 0, {}); });
+    sw.absorb(w);
+    {
+      uint32_t ow = 0, oh = 0;
+      pod::Parser fp(ConstByteView(sw.ports[{0, 0}].format.data(), sw.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20003 && v.type == pod::kRectangle) { ByteReader r(v.body); ow = r.le32(); oh = r.le32(); }
+      }
+      CHECK(ow == 3 && oh == 2);
+    }
+    w.send(8, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    sw.absorb(w);
+    CHECK(sw.starts == 1);
+    if (sw.starts && ycp.bufs.size() == 2) {
+      std::vector<uint8_t> y6(24), u3(6, 128), v3(6, 128);
+      for (size_t k = 0; k < 24; ++k) y6[k] = (k % 6) < 2 ? 235 : 16;      // (white in the first two columns: the first scaled column white)
+      put_u32(sw.activation->memory(), 0, 3);
+      produce(yc, 1, {y6, u3, v3}, {6, 3, 3});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(sw);
+      CHECK(got.size() == 3 * 2 * 4);
+      if (got.size() == 24) CHECK(got[0] == 255 && got[4] == 0 && got[12] == 255);
+    }
+    w.send(0, 7, [](pod::Builder& b) { b.int32(8); });
     w.send(0, 7, [](pod::Builder& b) { b.int32(6); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
