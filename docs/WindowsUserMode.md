@@ -346,6 +346,8 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
     is `NtUserCallTwoParam` codes `0x7C01` to `0x7C04` (TheoryCraftOS's own) and `NtUserInjectTouchInput`. Not done: pens as pointers, gestures
     (`WM_GESTURE`), pointer devices (`GetPointerDevices` lists none), `EnableMouseInPointer` (the mouse is never a pointer), coalescing, contact
     shapes (an 8-pixel finger, fixed pressure). Host test: `Win32kUserTest` (`test_redirection`); in QEMU: `user32test.c` (`test_touch`).
+  - *DPI scaling*: on a desktop at a whole scale (200 %, 300 %) win32k works in device pixels. DPI-aware programs see them (and 96 x scale DPI) and
+    are drawn sharp; unaware ones are virtualized to 96-dpi units and enlarged, as on Windows. See [Display.md](Display.md).
   - *Files dropped from the desktop*: a file dragged from the File Explorer (or a Wayland program's file let go) over a window that accepts files
     (`DragAcceptFiles`, `WS_EX_ACCEPTFILES`, it or the nearest ancestor under the pointer) is taken: let go, the window gets `WM_DROPFILES` with an
     HDROP that `DragQueryFile` / `DragQueryPoint` read and `DragFinish` frees. The file's name is the one Windows programs see

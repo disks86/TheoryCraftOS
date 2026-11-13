@@ -763,6 +763,7 @@ uint64_t earliest_timer(const Queue* q) {
 }
 
 bool write_msg(Call& call, uint64_t address, const Msg& m) {
+  const uint32_t k = caller_scale(call);      // (MSG.pt in the caller's coordinates: an unaware thread's 96-dpi units)
   uint8_t raw[48] = {};
   auto put = [&](uint32_t o, uint64_t v, uint32_t n) { for (uint32_t i = 0; i < n; ++i) raw[o + i] = uint8_t(v >> (8 * i)); };
   put(0, m.hwnd == 0 ? 0 : uint64_t(m.hwnd), 8);
@@ -770,8 +771,8 @@ bool write_msg(Call& call, uint64_t address, const Msg& m) {
   put(16, m.wparam, 8);
   put(24, m.lparam, 8);
   put(32, m.time, 4);
-  put(36, uint32_t(m.x), 4);
-  put(40, uint32_t(m.y), 4);
+  put(36, uint32_t(dpi_down(m.x, k)), 4);
+  put(40, uint32_t(dpi_down(m.y, k)), 4);
   return call.write(address, ConstByteView(raw, 48));
 }
 
@@ -1184,7 +1185,8 @@ uint64_t nt_translate_message(Call& call) { (void)call; return 0; }
 uint64_t nt_get_message_pos(Call& call) {
   Queue* q = queue_of(call, true);
   if (!q) return 0;
-  return (uint32_t(q->last_y) << 16) | (uint32_t(q->last_x) & 0xFFFF);
+  const uint32_t k = caller_scale(call);
+  return (uint32_t(dpi_down(q->last_y, k)) << 16) | (uint32_t(dpi_down(q->last_x, k)) & 0xFFFF);
 }
 
 // LPARAM NtUserSetMessageExtraInfo(LPARAM)

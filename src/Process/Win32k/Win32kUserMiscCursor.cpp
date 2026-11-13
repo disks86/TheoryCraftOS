@@ -330,6 +330,11 @@ uint64_t svc_get_cursor_info(Call& c) {
   }
   int32_t x = 0, y = 0;
   user::cursor_position(&x, &y);
+  {
+    const gdi::Rect p = user::rect_for_caller(c, gdi::Rect{x, y, x, y});      // (an unaware caller's 96-dpi units)
+    x = p.left;
+    y = p.top;
+  }
   uint8_t out[24] = {};
   out[0] = 24;
   for (int i = 0; i < 4; ++i) {

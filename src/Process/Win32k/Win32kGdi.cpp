@@ -524,6 +524,14 @@ Bitmap* window_surface_bitmap(uint32_t id) {
 
 void set_window_surface_sink(IWindowSurfaceSink* sink) { g_window_sink = sink; }
 
+CallerDpiHook g_caller_dpi = nullptr;
+void set_caller_dpi_hook(CallerDpiHook hook) { g_caller_dpi = hook; }
+void caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi) {
+  *scale = 1;
+  *dpi = 96;
+  if (g_caller_dpi) g_caller_dpi(call, scale, dpi);
+}
+
 ByteView window_surface_bytes(uint32_t id, uint32_t* width, uint32_t* height) {
   WindowSurface* s = find_surface(id);
   if (!s || !s->bitmap) return ByteView();

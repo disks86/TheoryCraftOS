@@ -438,4 +438,6 @@ Dc* dc_arg(Call& c, uint32_t handle);      // the DC of the calling process (set
 
 #define GDI_REGISTER(NAME, FN) ::process::win32k::register_handler(WindowsSyscallNumber::NtGdi##NAME, FN)
 
+void caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi);      // DPI virtualization of the calling thread (set_caller_dpi_hook; 1 and 96 without one)
+
 }  // namespace process::win32k::gdi

@@ -17,6 +17,7 @@
  */
 // Window creation and destruction, the tree, styles and longs, text, properties, and the NtUserCallHwnd / NtUserCallHwndParam multiplexers.
 #include "Process/Win32k/Win32kUserInternal.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 
 namespace process::win32k::user {
 
@@ -42,10 +43,11 @@ void fill_create_struct(Window* w, const Op& op, List<uint8_t>& out) {
   put64(raw, 8, w->instance);
   put64(raw, 16, (w->style & wn::WS_CHILD) ? w->id : w->menu);
   put64(raw, 24, w->parent && w->parent->parent ? uint64_t(w->parent->handle) : 0);
-  put32(raw, 32, uint32_t(w->bounds.bottom - w->bounds.top));
-  put32(raw, 36, uint32_t(w->bounds.right - w->bounds.left));
-  put32(raw, 40, uint32_t(w->bounds.top));
-  put32(raw, 44, uint32_t(w->bounds.left));
+  const Rect b = dpi_down(w->bounds, window_scale(w));      // (in the window's coordinates)
+  put32(raw, 32, uint32_t(b.bottom - b.top));
+  put32(raw, 36, uint32_t(b.right - b.left));
+  put32(raw, 40, uint32_t(b.top));
+  put32(raw, 44, uint32_t(b.left));
   put32(raw, 48, w->cs_style);
   put32(raw, 72, w->cs_ex_style);
   out.clear();
@@ -56,10 +58,11 @@ void fill_windowpos(const Window* w, uint32_t after, uint32_t flags, List<uint8_
   uint8_t raw[48] = {};
   put64(raw, 0, w->handle);
   put64(raw, 8, after);
-  put32(raw, 16, uint32_t(w->bounds.left));
-  put32(raw, 20, uint32_t(w->bounds.top));
-  put32(raw, 24, uint32_t(w->bounds.right - w->bounds.left));
-  put32(raw, 28, uint32_t(w->bounds.bottom - w->bounds.top));
+  const Rect b = dpi_down(w->bounds, window_scale(w));
+  put32(raw, 16, uint32_t(b.left));
+  put32(raw, 20, uint32_t(b.top));
+  put32(raw, 24, uint32_t(b.right - b.left));
+  put32(raw, 28, uint32_t(b.bottom - b.top));
   put32(raw, 32, flags);
   out.clear();
   for (uint8_t b : raw) out.push_back(b);
@@ -79,16 +82,18 @@ uint64_t create_step(Call& call, Op& op) {
     case 20: {      // an overlapped or sizing window is asked for its limits before WM_NCCREATE
       op.phase = 21;
       if (!has_proc) return create_step(call, op);
-      const Rect max = window_maximized_rect(w);
+      const uint32_t k = window_scale(w);      // (in the window's coordinates; an aware window's metrics at the system's dpi)
+      const uint32_t dpi = k > 1 ? 96 : 96 * device_scale();
+      const Rect max = dpi_down(window_maximized_rect(w), k);
       gdi::Rect none{0, 0, 0, 0};
       adjust_window_rect(&none, w->style, w->ex_style, false, 0);      // (the frame, as negative left and top)
       const bool plain = (w->style & (wn::WS_DLGFRAME | wn::WS_BORDER)) != 0;
       uint8_t raw[40] = {};
       put32(raw, 8, uint32_t(max.right - max.left)); put32(raw, 12, uint32_t(max.bottom - max.top));      // ptMaxSize
       put32(raw, 16, uint32_t(max.left)); put32(raw, 20, uint32_t(max.top));      // ptMaxPosition
-      put32(raw, 24, plain ? uint32_t(user_misc::system_metrics(34, 96)) : uint32_t(-2 * none.left));      // ptMinTrackSize
-      put32(raw, 28, plain ? uint32_t(user_misc::system_metrics(35, 96)) : uint32_t(-2 * none.top));
-      put32(raw, 32, uint32_t(user_misc::system_metrics(59, 96))); put32(raw, 36, uint32_t(user_misc::system_metrics(60, 96)));      // ptMaxTrackSize
+      put32(raw, 24, plain ? uint32_t(user_misc::system_metrics(34, dpi)) : uint32_t(-2 * none.left));      // ptMinTrackSize
+      put32(raw, 28, plain ? uint32_t(user_misc::system_metrics(35, dpi)) : uint32_t(-2 * none.top));
+      put32(raw, 32, uint32_t(user_misc::system_metrics(59, dpi))); put32(raw, 36, uint32_t(user_misc::system_metrics(60, dpi)));      // ptMaxTrackSize
       List<uint8_t> payload(S().alloc);
       for (uint8_t v : raw) payload.push_back(v);
       if (!queue_payload_upcall(call, &op, w, wn::WM_GETMINMAXINFO, 0, payload, 0xFFFF, 0, 0)) { op.payload.clear(); return create_step(call, op); }
@@ -99,7 +104,9 @@ uint64_t create_step(Call& call, Op& op) {
       if (op.payload.count() >= 40) {
         const uint8_t* p = op.payload.view().data();
         int32_t cx = w->bounds.right - w->bounds.left, cy = w->bounds.bottom - w->bounds.top;
-        const int32_t min_x = int32_t(get32(p, 24)), min_y = int32_t(get32(p, 28)), max_x = int32_t(get32(p, 32)), max_y = int32_t(get32(p, 36));
+        const uint32_t k = window_scale(w);
+        const int32_t min_x = dpi_up(int32_t(get32(p, 24)), k), min_y = dpi_up(int32_t(get32(p, 28)), k);
+        const int32_t max_x = dpi_up(int32_t(get32(p, 32)), k), max_y = dpi_up(int32_t(get32(p, 36)), k);
         if (max_x < cx) cx = max_x;
         if (max_y < cy) cy = max_y;
         if (cx < min_x) cx = min_x;
@@ -134,7 +141,11 @@ uint64_t create_step(Call& call, Op& op) {
       w->client = client;
       if (!has_proc) return create_step(call, op);
       uint8_t raw[104] = {};
-      auto wr = [&](uint32_t o, const Rect& r) { put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom)); };
+      const uint32_t k = window_scale(w);      // (in the window's coordinates)
+      auto wr = [&](uint32_t o, const Rect& r0) {
+        const Rect r = dpi_down(r0, k);
+        put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom));
+      };
       wr(0, w->bounds); wr(16, w->bounds); wr(32, client);      // rgrc[0] proposed window rect; the procedure answers the client rect there
       put64(raw, 48, 0);
       List<uint8_t> payload(S().alloc);
@@ -154,7 +165,8 @@ uint64_t create_step(Call& call, Op& op) {
       if (has_proc && op.payload.count() >= 16) {
         const uint8_t* p = op.payload.view().data();
         Rect r{int32_t(get32(p, 0)), int32_t(get32(p, 4)), int32_t(get32(p, 8)), int32_t(get32(p, 12))};
-        w->client = r;
+        const uint32_t k = window_scale(w);
+        if (!rect_equal(r, dpi_down(w->client, k))) w->client = dpi_up(r, k);      // (left as it was: the exact device rectangle stays)
       }
       if (!has_proc) return create_step(call, op);
       List<uint8_t> cs(S().alloc);
@@ -274,7 +286,8 @@ uint64_t nt_create_window_ex(Call& call) {
   w->unicode = !call.arg_bool(16);
   w->instance = call.arg(11);
   w->owner = owner;
-  w->dpi_context = 0;
+  w->dpi_context = user_misc::dpi_context_of(call.tid(), call.pid());
+  w->dpi_virtual = thread_unaware(call) ? 1 : 0;      // (DPI virtualization: the creating thread's awareness, as on Windows)
   if (style & wn::WS_CHILD) w->id = call.arg(10); else w->menu = call.arg(10);
   if (!(style & wn::WS_CHILD) && w->menu != 0 && !user_misc::attach_window_menu(w->handle, uint32_t(w->menu))) w->menu = 0;      // (not a menu: no menu)
   window_text_set(w, title.view());
@@ -288,6 +301,13 @@ uint64_t nt_create_window_ex(Call& call) {
   if (uint32_t(cy) == kCwUseDefault) cy = (style & wn::WS_CHILD) ? 0 : (sh * 3) / 4 - y;
   if (cx < 0) cx = 0;
   if (cy < 0) cy = 0;
+  {      // an unaware caller's 96-dpi units into device pixels (the defaults above are device pixels already)
+    const uint32_t k = caller_scale(call);
+    if (uint32_t(call.argi(5)) != kCwUseDefault) x = dpi_up(x, k);
+    if (uint32_t(call.argi(6)) != kCwUseDefault && uint32_t(call.argi(5)) != kCwUseDefault) y = dpi_up(y, k);
+    if (uint32_t(call.argi(7)) != kCwUseDefault) cx = dpi_up(cx, k);
+    if (uint32_t(call.argi(8)) != kCwUseDefault && uint32_t(call.argi(7)) != kCwUseDefault) cy = dpi_up(cy, k);
+  }
   w->bounds = Rect{x, y, int32_t(uint32_t(x) + uint32_t(cx)), int32_t(uint32_t(y) + uint32_t(cy))};
   // z-order: the top of its level (below the topmost windows unless it is one)
   if (parent->parent == nullptr || (w->ex_style & wn::WS_EX_TOPMOST) || true) {
@@ -881,8 +901,9 @@ uint64_t nt_set_window_display_affinity(Call& call) { Window* w = window_arg(cal
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // NtUserCallHwnd
 
+// GetDpiForWindow: an unaware window works at 96 dpi (DPI virtualization), an aware one at the monitor's.
 uint32_t window_dpi(Window* w) {
-  (void)w;
+  if (w && w->dpi_virtual) return 96;
   return user_misc::dpi_for_monitor(user_misc::monitor_from_point(0, 0, 1));
 }
 
@@ -976,14 +997,18 @@ uint64_t get_window_info(Call& call, Window* w, uint64_t address) {
   if (!call.read_u32(address, &size)) return call.fail(kErrorInvalidParameter);      // (Windows ignores cbSize)
   uint8_t raw[60] = {};
   put32(raw, 0, 60);
-  auto wr = [&](uint32_t o, const Rect& r) { put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom)); };
+  const uint32_t k = caller_scale(call);      // (in the caller's coordinates)
+  auto wr = [&](uint32_t o, const Rect& r0) {
+    const Rect r = dpi_down(r0, k);
+    put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom));
+  };
   wr(4, window_rect_screen(w));
   wr(20, client_rect_screen(w));
   put32(raw, 36, w->style);
   put32(raw, 40, w->ex_style);
   Queue* q = find_queue(w->thread);
   put32(raw, 44, q && q->input_state->active == w ? 1 : 0);
-  const Rect win = window_rect_screen(w), cl = client_rect_screen(w);
+  const Rect win = dpi_down(window_rect_screen(w), k), cl = dpi_down(client_rect_screen(w), k);
   put32(raw, 48, uint32_t(cl.left - win.left));
   put32(raw, 52, uint32_t(cl.top - win.top));
   raw[56] = uint8_t(w->cls ? w->cls->atom : 0);
@@ -1004,14 +1029,15 @@ uint64_t map_window_points(Call& call, Window* from, uint64_t params) {
   if (from && from != from->desktop->root) client_origin(from, &fx, &fy);
   if (to && to != to->desktop->root) client_origin(to, &tx, &ty);
   const int32_t dx = fx - tx, dy = fy - ty;
+  const uint32_t k = caller_scale(call);      // (the caller's points: an unaware one's 96-dpi units, through device pixels and back)
   for (uint32_t i = 0; i < count; ++i) {
     Point p;
     if (!read_point(call, points + 8ull * i, &p)) return call.fail(kErrorInvalidParameter);
-    p.x = int32_t(uint32_t(p.x) + uint32_t(dx));
-    p.y = int32_t(uint32_t(p.y) + uint32_t(dy));
+    p.x = dpi_down(int32_t(uint32_t(dpi_up(p.x, k)) + uint32_t(dx)), k);
+    p.y = dpi_down(int32_t(uint32_t(dpi_up(p.y, k)) + uint32_t(dy)), k);
     if (!write_point(call, points + 8ull * i, p)) return call.fail(kErrorInvalidParameter);
   }
-  return (uint64_t(uint16_t(dy)) << 16) | uint16_t(dx);
+  return (uint64_t(uint16_t(dpi_down(dy, k))) << 16) | uint16_t(dpi_down(dx, k));
 }
 
 uint64_t nt_call_hwnd_param(Call& call) {
@@ -1036,11 +1062,16 @@ uint64_t nt_call_hwnd_param(Call& call) {
       if (!read_point(call, param, &p)) return call.fail(kErrorInvalidParameter);
       int32_t ox, oy;
       if (w == w->desktop->root) ox = oy = 0; else client_origin(w, &ox, &oy);
+      const uint32_t k = caller_scale(call);
+      p.x = dpi_up(p.x, k);
+      p.y = dpi_up(p.y, k);
       if (code == kClientToScreen) { p.x = int32_t(uint32_t(p.x) + uint32_t(ox)); p.y = int32_t(uint32_t(p.y) + uint32_t(oy)); }
       else { p.x = int32_t(uint32_t(p.x) - uint32_t(ox)); p.y = int32_t(uint32_t(p.y) - uint32_t(oy)); }
+      p.x = dpi_down(p.x, k);
+      p.y = dpi_down(p.y, k);
       return write_point(call, param, p) ? 1 : call.fail(kErrorInvalidParameter);
     }
-    case kGetChildRect: return write_rect(call, param, w->bounds) ? 1 : call.fail(kErrorInvalidParameter);
+    case kGetChildRect: return write_rect(call, param, dpi_down(w->bounds, caller_scale(call))) ? 1 : call.fail(kErrorInvalidParameter);
     case kGetClassLongA: case kGetClassLongW: case kGetClassLongPtrA: case kGetClassLongPtrW: case kGetClassWord: {
       const uint32_t size = code == kGetClassWord ? 2 : (code == kGetClassLongA || code == kGetClassLongW) ? 4 : 8;
       uint64_t v = 0;
@@ -1056,8 +1087,13 @@ uint64_t nt_call_hwnd_param(Call& call) {
       uint64_t rect = 0;
       if (!call.read_u64(param, &rect)) return call.fail(kErrorInvalidParameter);
       Rect r;
-      if (code == kGetClientRect) r = Rect{0, 0, w->client.right - w->client.left, w->client.bottom - w->client.top};
-      else r = window_rect_screen(w);
+      const uint32_t k = caller_scale(call);      // (an unaware caller's client size is what its WM_SIZE said)
+      if (code == kGetClientRect) {
+        const Rect cl = dpi_down(w->client, k);
+        r = Rect{0, 0, cl.right - cl.left, cl.bottom - cl.top};
+      } else {
+        r = dpi_down(window_rect_screen(w), k);
+      }
       return write_rect(call, rect, r) ? 1 : call.fail(kErrorInvalidParameter);
     }
     case kGetWindowRelative: {
@@ -1075,7 +1111,7 @@ uint64_t nt_call_hwnd_param(Call& call) {
       Rect r;
       uint32_t flags = 0;
       if (!read_rect(call, param, &r) || !call.read_u32(param + 16, &flags)) return call.fail(kErrorInvalidParameter);
-      w->bounds = r;
+      w->bounds = dpi_up(r, caller_scale(call));
       compute_nc(w, &w->client);
       return 1;
     }

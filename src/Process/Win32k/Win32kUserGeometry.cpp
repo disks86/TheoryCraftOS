@@ -337,14 +337,16 @@ void read_windowpos_payload(const List<uint8_t>& p, uint32_t* after, int32_t* x,
   *flags = get32(d, 32);
 }
 
+// (the WINDOWPOS in the window's coordinates: an unaware window's are its 96-dpi units)
 void make_windowpos(const Window* w, uint32_t after, int32_t x, int32_t y, int32_t cx, int32_t cy, uint32_t flags, List<uint8_t>& out) {
+  const uint32_t k = window_scale(w);
   uint8_t raw[48] = {};
   put64(raw, 0, w->handle);
   put64(raw, 8, after);
-  put32(raw, 16, uint32_t(x));
-  put32(raw, 20, uint32_t(y));
-  put32(raw, 24, uint32_t(cx));
-  put32(raw, 28, uint32_t(cy));
+  put32(raw, 16, uint32_t(dpi_down(x, k)));
+  put32(raw, 20, uint32_t(dpi_down(y, k)));
+  put32(raw, 24, uint32_t(dpi_down(cx, k)));
+  put32(raw, 28, uint32_t(dpi_down(cy, k)));
   put32(raw, 32, flags);
   out.clear();
   for (uint8_t b : raw) out.push_back(b);
@@ -429,6 +431,16 @@ uint64_t swp_step(Call& call, Op& op) {
         const Rect cur = w->bounds;
         int32_t cur_cx = cur.right - cur.left, cur_cy = cur.bottom - cur.top;
         read_windowpos_payload(op.payload, &new_after, &nx, &ny, &ncx, &ncy, &new_flags);
+        {      // back in device pixels: a value the procedure left as it was keeps its exact device value
+          const uint32_t k = window_scale(w);
+          const int32_t px = (flags & wn::SWP_NOMOVE) ? cur.left : x, py = (flags & wn::SWP_NOMOVE) ? cur.top : y;
+          const int32_t pw = (flags & wn::SWP_NOSIZE) ? cur.right - cur.left : cx, ph = (flags & wn::SWP_NOSIZE) ? cur.bottom - cur.top : cy;
+          auto back = [&](int32_t got, int32_t sent) { return got == dpi_down(sent, k) ? sent : dpi_up(got, k); };
+          nx = back(nx, px);
+          ny = back(ny, py);
+          ncx = back(ncx, pw);
+          ncy = back(ncy, ph);
+        }
         if (flags & wn::SWP_NOMOVE) { nx = x; ny = y; }
         if (flags & wn::SWP_NOSIZE) { ncx = cx; ncy = cy; }
         (void)cur_cx; (void)cur_cy;
@@ -468,7 +480,11 @@ uint64_t swp_step(Call& call, Op& op) {
         if (w->wndproc != 0) {
           List<uint8_t> payload(S().alloc);
           uint8_t raw[104] = {};
-          auto wr = [&](uint32_t o, const Rect& r) { put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom)); };
+          const uint32_t k = window_scale(w);      // (in the window's coordinates)
+          auto wr = [&](uint32_t o, const Rect& r0) {
+            const Rect r = dpi_down(r0, k);
+            put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom));
+          };
           wr(0, nb); wr(16, old_bounds);
           Rect old_client = rect_offset(w->client, 0, 0);
           wr(32, old_client);
@@ -517,7 +533,9 @@ uint64_t swp_step(Call& call, Op& op) {
       w = w2;
       if ((op.a[6] & 2) && op.payload.count() >= 16) {
         const uint8_t* p = op.payload.view().data();
-        w->client = Rect{int32_t(get32(p, 0)), int32_t(get32(p, 4)), int32_t(get32(p, 8)), int32_t(get32(p, 12))};
+        const Rect got{int32_t(get32(p, 0)), int32_t(get32(p, 4)), int32_t(get32(p, 8)), int32_t(get32(p, 12))};
+        const uint32_t k = window_scale(w);
+        if (!rect_equal(got, dpi_down(w->client, k))) w->client = dpi_up(got, k);      // (left as it was: the exact device rectangle stays)
       }
       op.payload.clear();
       const bool now_visible = (w->style & wn::WS_VISIBLE) != 0;
@@ -575,7 +593,8 @@ uint64_t nt_set_window_pos(Call& call) {
   SwpArgs args;
   args.w = w;
   args.after = after;
-  args.x = call.argi(2); args.y = call.argi(3); args.cx = call.argi(4); args.cy = call.argi(5);
+  const uint32_t k = caller_scale(call);      // (DPI virtualization: an unaware caller's 96-dpi units)
+  args.x = dpi_up(call.argi(2), k); args.y = dpi_up(call.argi(3), k); args.cx = dpi_up(call.argi(4), k); args.cy = dpi_up(call.argi(5), k);
   args.flags = flags;
   return swp_op_begin(call, args, kNoShow, false, false);
 }
@@ -587,7 +606,8 @@ uint64_t nt_move_window(Call& call) {
   if (!w->parent) return call.fail(kErrorAccessDenied);
   SwpArgs args;
   args.w = w;
-  args.x = call.argi(1); args.y = call.argi(2); args.cx = call.argi(3); args.cy = call.argi(4);
+  const uint32_t k = caller_scale(call);
+  args.x = dpi_up(call.argi(1), k); args.y = dpi_up(call.argi(2), k); args.cx = dpi_up(call.argi(3), k); args.cy = dpi_up(call.argi(4), k);
   args.flags = wn::SWP_NOZORDER | wn::SWP_NOACTIVATE | (call.arg_bool(5) ? 0 : wn::SWP_NOREDRAW);
   return swp_op_begin(call, args, kNoShow, false, false);
 }
@@ -636,7 +656,8 @@ uint64_t nt_defer_window_pos(Call& call) {
   DeferPos::Item item;
   item.hwnd = w->handle;
   item.after = call.arg32(2);
-  item.x = call.argi(3); item.y = call.argi(4); item.cx = call.argi(5); item.cy = call.argi(6);
+  const uint32_t k = caller_scale(call);
+  item.x = dpi_up(call.argi(3), k); item.y = dpi_up(call.argi(4), k); item.cx = dpi_up(call.argi(5), k); item.cy = dpi_up(call.argi(6), k);
   item.flags = flags;
   for (DeferPos::Item& existing : d->items) if (existing.hwnd == item.hwnd) { existing = item; return d->handle; }
   if (!d->items.push_back(item)) return call.fail(kErrorNotEnoughMemory);
@@ -666,15 +687,16 @@ uint64_t nt_get_window_placement(Call& call) {
   if (!w) return 0;
   uint32_t length = 0;
   if (!call.read_u32(call.arg(1), &length) || length != 44) return call.fail(kErrorInvalidParameter);
+  const uint32_t k = caller_scale(call);
   uint8_t raw[44] = {};
   put32(raw, 0, 44);
   put32(raw, 4, w->placement.restore_maximized && (w->style & wn::WS_MINIMIZE) ? 2 : 0);      // WPF_RESTORETOMAXIMIZED
   put32(raw, 8, (w->style & wn::WS_MINIMIZE) ? wn::SW_SHOWMINIMIZED : (w->style & wn::WS_MAXIMIZE) ? wn::SW_SHOWMAXIMIZED : wn::SW_SHOWNORMAL);
-  put32(raw, 12, uint32_t(w->placement.min_x));
-  put32(raw, 16, uint32_t(w->placement.min_y));
-  put32(raw, 20, uint32_t(w->placement.max_x));
-  put32(raw, 24, uint32_t(w->placement.max_y));
-  Rect normal = (w->style & (wn::WS_MINIMIZE | wn::WS_MAXIMIZE)) && w->placement.has_normal ? w->placement.normal : w->bounds;
+  put32(raw, 12, uint32_t(dpi_down(w->placement.min_x, k)));
+  put32(raw, 16, uint32_t(dpi_down(w->placement.min_y, k)));
+  put32(raw, 20, uint32_t(dpi_down(w->placement.max_x, k)));
+  put32(raw, 24, uint32_t(dpi_down(w->placement.max_y, k)));
+  Rect normal = dpi_down((w->style & (wn::WS_MINIMIZE | wn::WS_MAXIMIZE)) && w->placement.has_normal ? w->placement.normal : w->bounds, k);
   put32(raw, 28, uint32_t(normal.left)); put32(raw, 32, uint32_t(normal.top)); put32(raw, 36, uint32_t(normal.right)); put32(raw, 40, uint32_t(normal.bottom));
   return call.write(call.arg(1), ConstByteView(raw, 44)) ? 1 : call.fail(kErrorInvalidParameter);
 }
@@ -687,10 +709,11 @@ uint64_t nt_set_window_placement(Call& call) {
   const uint32_t flags = get32(raw, 4), cmd = get32(raw, 8);
   if (cmd > wn::SW_FORCEMINIMIZE) return call.fail(kErrorInvalidShowwinCommand);
   if (!w->parent) return call.fail(kErrorAccessDenied);
-  if (flags & 1) { w->placement.min_x = int32_t(get32(raw, 12)); w->placement.min_y = int32_t(get32(raw, 16)); }
-  w->placement.max_x = int32_t(get32(raw, 20));
-  w->placement.max_y = int32_t(get32(raw, 24));
-  const Rect normal{int32_t(get32(raw, 28)), int32_t(get32(raw, 32)), int32_t(get32(raw, 36)), int32_t(get32(raw, 40))};
+  const uint32_t k = caller_scale(call);
+  if (flags & 1) { w->placement.min_x = dpi_up(int32_t(get32(raw, 12)), k); w->placement.min_y = dpi_up(int32_t(get32(raw, 16)), k); }
+  w->placement.max_x = dpi_up(int32_t(get32(raw, 20)), k);
+  w->placement.max_y = dpi_up(int32_t(get32(raw, 24)), k);
+  const Rect normal = dpi_up(Rect{int32_t(get32(raw, 28)), int32_t(get32(raw, 32)), int32_t(get32(raw, 36)), int32_t(get32(raw, 40))}, k);
   w->placement.normal = normal;
   w->placement.has_normal = true;
   w->placement.restore_maximized = (flags & 2) != 0;
@@ -710,9 +733,10 @@ uint64_t nt_set_window_placement(Call& call) {
 uint64_t nt_get_internal_window_pos(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
-  const Rect r = (w->placement.has_normal) ? w->placement.normal : w->bounds;
+  const uint32_t k = caller_scale(call);
+  const Rect r = dpi_down((w->placement.has_normal) ? w->placement.normal : w->bounds, k);
   if (call.arg(1) != 0 && !write_rect(call, call.arg(1), r)) return call.fail(kErrorInvalidParameter);
-  if (call.arg(2) != 0 && !write_point(call, call.arg(2), Point{w->placement.min_x, w->placement.min_y})) return call.fail(kErrorInvalidParameter);
+  if (call.arg(2) != 0 && !write_point(call, call.arg(2), Point{dpi_down(w->placement.min_x, k), dpi_down(w->placement.min_y, k)})) return call.fail(kErrorInvalidParameter);
   return (w->style & wn::WS_MINIMIZE) ? wn::SW_SHOWMINIMIZED : (w->style & wn::WS_MAXIMIZE) ? wn::SW_SHOWMAXIMIZED : wn::SW_SHOWNORMAL;
 }
 
@@ -740,18 +764,21 @@ Window* child_by_client_point(Window* parent, int32_t x, int32_t y, uint32_t fla
 uint64_t nt_child_window_from_point_ex(Call& call) {
   Window* parent = window_arg(call, 0);
   if (!parent) return 0;
-  Window* r = child_by_client_point(parent, call.argi(1), call.argi(2), call.arg32(3));
+  const uint32_t k = caller_scale(call);
+  Window* r = child_by_client_point(parent, dpi_up(call.argi(1), k), dpi_up(call.argi(2), k), call.arg32(3));
   return r ? r->handle : 0;
 }
 uint64_t nt_real_child_window_from_point(Call& call) {
   Window* parent = window_arg(call, 0);
   if (!parent) return 0;
-  Window* r = child_by_client_point(parent, call.argi(1), call.argi(2), 0);
+  const uint32_t k = caller_scale(call);
+  Window* r = child_by_client_point(parent, dpi_up(call.argi(1), k), dpi_up(call.argi(2), k), 0);
   return r ? r->handle : 0;
 }
 // HWND NtUserWindowFromPoint(LONG x, LONG y)
 uint64_t nt_window_from_point(Call& call) {
-  Window* w = window_at_point(call.argi(0), call.argi(1), true, thread_of(call));
+  const uint32_t k = caller_scale(call);
+  Window* w = window_at_point(dpi_up(call.argi(0), k), dpi_up(call.argi(1), k), true, thread_of(call));
   return w ? w->handle : 0;
 }
 

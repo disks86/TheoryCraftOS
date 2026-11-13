@@ -86,14 +86,29 @@ struct TopLevelInfo {
   uint32_t surface_id = 0, owner = 0;
   uint32_t icon = 0;         // the small icon to show: WM_SETICON's small or big one, else the class's
   uint64_t pid = 0;
+  bool dpi_aware = false;    // its surface is in device pixels (else in 96-dpi units: the device scale smaller)
 };
 bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
+// DPI virtualization (Win32kUserDpi.cpp): the desktop's device scale (device pixels per desktop unit, 1 .. 4); takes the lock. A change moves every
+// top-level so that it keeps its place in desktop units.
+void set_device_scale_from_desktop(uint32_t scale);
+// For the services outside the window manager: the factor the calling thread's coordinates are divided by (1 when DPI aware or unscaled), and a
+// device-pixel rectangle / point as the caller sees it.
+uint32_t caller_dpi_scale(Call& call);
+gdi::Rect rect_for_caller(Call& call, const gdi::Rect& r);
+inline int32_t dpi_down_value(int32_t v, uint32_t k) {      // device -> units (floor)
+  if (k <= 1) return v;
+  const int32_t d = static_cast<int32_t>(k);
+  return v >= 0 ? v / d : -((-v + d - 1) / d);
+}
+uint32_t device_scale_locked();
 void top_levels(List<uint32_t>* out);                                      // the visible redirected top-levels, topmost first
 // What the desktop's window does to its top-level: the user moved or sized it (window rectangle, screen coordinates), activated it, asked to close / minimize /
 // maximize / restore it (WM_SYSCOMMAND to the program, as a click on its own caption would).
 bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
-uint32_t top_level_surface_locked(uint32_t hwnd);                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
+uint32_t top_level_surface_locked(uint32_t hwnd);
+bool top_level_dpi_aware_locked(uint32_t hwnd);                               // its surface is in device pixels (HiDPI); the caller holds the lock                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
 bool command_top_level(uint32_t hwnd, uint32_t sc);
 // The cursor the desktop shows over the Windows programs' windows (takes the lock): hidden (ShowCursor's counter below 0, or a program set no cursor), else `cursor`
 // (a cursor handle for cursor_picture; 0 with `system_id` for one of the system's shapes: OCR_NORMAL 32512, OCR_IBEAM 32513 ...).

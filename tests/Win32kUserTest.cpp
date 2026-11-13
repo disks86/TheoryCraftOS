@@ -22,6 +22,7 @@
 #include <functional>
 #include <thread>
 #include "Win32kTestSupport.hpp"
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
@@ -1111,6 +1112,151 @@ void test_props_longs_text() {
 bool has(const List<uint32_t>& l, uint32_t v) { for (uint32_t x : l.view()) if (x == v) return true; return false; }
 bool has_repaint(const List<desktop::IWindowsSession::Repaint>& l, uint32_t w) { for (const auto& r : l.view()) if (r.window == w) return true; return false; }
 
+// DPI virtualization at scale 2 (Win32kUserDpi.cpp): win32k is in device pixels; an unaware program sees 96-dpi units everywhere (what it sets it reads
+// back, its surface is the units' size, its mouse messages and WM_SIZE are in units, it is told 96 dpi), an aware one device pixels (192 dpi, its
+// surface drawn 1:1 by draw_window_scaled); the desktop speaks units with both.
+void test_dpi_virtualization() {
+  Program prog(95), aware_prog(96);
+  Th t(prog, 95, kScratch);
+  Th a2(aware_prog, 96, kScratch);
+  std::vector<Call_> sizes;
+  auto logging = [&](Th& th, Call_& c) -> uint64_t {
+    if (c.msg == WM_SIZE || c.msg == WM_MOVE || c.msg == WM_MOUSEMOVE) sizes.push_back(c);
+    return def_proc(th, c);
+  };
+  t.proc = logging;
+  a2.proc = logging;
+  auto pump = [&](Th& th) {
+    Th::M m;
+    for (int i = 0; i < 64 && th.peek(&m); ++i) th.svc(N::NtUserDispatchMessage, {th.tmp(0xA00)});
+    for (int i = 0; i < 8; ++i) {
+      if (!th.peek(&m, 0, WM_PAINT, WM_PAINT)) break;
+      th.svc(N::NtUserDispatchMessage, {th.tmp(0xA00)});
+    }
+  };
+  DesktopBridge bridge;
+  bridge.attach(6, 19);
+  desktop::IWindowsSession::Monitor one[1];
+  one[0].rect = {0, 0, 1024, 768};
+  one[0].work = {0, 0, 1024, 740};
+  one[0].scale = 2;
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  CHECK(gdi::screen_width() == 2048 && gdi::screen_height() == 1536 && user_misc::system_dpi() == 192);
+  // the aware program says so (per-monitor v2)
+  CHECK(a2.svc32(N::NtUserSetProcessDpiAwarenessContext, {0x22, 0}) == 1);
+  CHECK(t.atom_class("DpiClass") >= 0xC000 && a2.atom_class("DpiClass") >= 0xC000);
+
+  // --- unaware: its own numbers back, units for the desktop, a units-sized surface
+  const uint32_t u = t.create("DpiClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 400, 300, 0, 0, "Unaware");
+  CHECK(u != 0);
+  pump(t);
+  Rc wr = t.window_rect(u), cr = t.client_rect(u);
+  CHECK(wr.l == 100 && wr.t == 100 && wr.r == 500 && wr.b == 400);
+  CHECK(cr.r == 388 && cr.b == 269);      // (the desktop's frame: 6 + 6 across, 19 + 6 + 6 down, in units)
+  {
+    user::Window* w = user::find_window(u);
+    CHECK(w && w->bounds.left == 200 && w->bounds.right == 1000 && w->dpi_virtual == 1);      // (device pixels inside)
+  }
+  desktop::WindowsWindowInfo info;
+  CHECK(bridge.window_info(u, &info, nullptr) && info.window.x == 100 && info.window.width == 400 && info.surface.x == 106 && info.surface.width == 388);
+  user::TopLevelInfo ti;
+  uint32_t sw = 0, sh = 0;
+  CHECK(user::top_level_info(u, &ti, nullptr) && !ti.dpi_aware && gdi::window_surface_size(ti.surface_id, &sw, &sh) && sw == 388 && sh == 269);
+  CHECK(t.svc32(N::NtUserCallHwnd, {u, 2 /* GetDpiForWindow */}) == 96);
+  CHECK(t.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9 /* GetSystemMetrics */}) == 1024);
+  // it draws in its units on its surface
+  {
+    const uint32_t dc = t.svc32(N::NtUserGetDC, {u});
+    const uint64_t brush = t.svc(N::NtGdiCreateSolidBrush, {0x0000FF, 0});
+    t.svc(N::NtGdiSelectBrush, {dc, brush});
+    CHECK(t.svc32(N::NtGdiPatBlt, {dc, 10, 10, 20, 20, 0xF00021}) == 1);
+    t.svc(N::NtUserReleaseDC, {dc});
+    uint32_t pw = 0, ph = 0;
+    const ArrayView<uint32_t> px = gdi::window_surface_pixels(ti.surface_id, &pw, &ph);
+    CHECK(pw == 388 && (px[10 * pw + 10] & 0xFFFFFF) == 0xFF0000 && (px[29 * pw + 29] & 0xFFFFFF) == 0xFF0000 && (px[30 * pw + 30] & 0xFFFFFF) != 0xFF0000);
+  }
+  {
+    std::vector<uint32_t> small(64 * 64, 0);
+    graphics::Surface ss;
+    ss.pixels = ArrayView<uint32_t>(small.data(), small.size());
+    ss.width = ss.height = ss.pitch = 64;
+    graphics::SoftwareRenderer2D r(ss);
+    uint32_t dw = 0, dh = 0;
+    CHECK(!bridge.draw_window_scaled(u, r, 0, 0, 2, &dw, &dh));      // (enlarged by the desktop)
+  }
+  // the desktop's mouse in units: its WM_MOUSEMOVE and MSG.pt in its units, GetCursorPos too
+  sizes.clear();
+  bridge.mouse_position(106 + 20, 125 + 15);
+  {
+    Th::M m;
+    bool got = false;
+    for (int i = 0; i < 16 && t.peek(&m); ++i)
+      if (m.message == WM_MOUSEMOVE && m.hwnd == u) {
+        got = true;
+        CHECK((m.lparam & 0xFFFF) == 20 && ((m.lparam >> 16) & 0xFFFF) == 15 && m.x == 126 && m.y == 140);
+      }
+    CHECK(got);
+    const uint64_t pt = t.tmp(0x800);
+    CHECK(t.svc32(N::NtUserGetCursorPos, {pt}) == 1 && t.mem().get32(pt) == 126 && t.mem().get32(pt + 4) == 140);
+    int32_t cx = 0, cy = 0;
+    bridge.cursor(&cx, &cy);
+    CHECK(cx == 126 && cy == 140);
+  }
+  // the desktop moves and sizes it: units both ways; WM_SIZE in units
+  sizes.clear();
+  bridge.move_window(u, desktop::WindowsRect{200, 150, 500, 350});
+  pump(t);
+  wr = t.window_rect(u);
+  CHECK(wr.l == 200 && wr.t == 150 && wr.r == 700 && wr.b == 500);
+  bool size_ok = false;
+  for (const Call_& c : sizes) if (c.msg == WM_SIZE && (c.lparam & 0xFFFF) == 488 && ((c.lparam >> 16) & 0xFFFF) == 319) size_ok = true;
+  CHECK(size_ok);
+  // the program moves itself: its numbers, twice as many device pixels
+  CHECK(t.svc32(N::NtUserSetWindowPos, {u, 0, 50, 60, 300, 200, 0x14}) == 1);
+  pump(t);
+  wr = t.window_rect(u);
+  CHECK(wr.l == 50 && wr.t == 60 && wr.r == 350 && wr.b == 260);
+  CHECK(bridge.window_info(u, &info, nullptr) && info.window.x == 50 && info.window.width == 300);
+
+  // --- aware: device pixels
+  const uint32_t v = a2.create("DpiClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 400, 200, 600, 400, 0, 0, "Aware");
+  CHECK(v != 0);
+  pump(a2);
+  wr = a2.window_rect(v);
+  CHECK(wr.l == 400 && wr.t == 200 && wr.r == 1000 && wr.b == 600);
+  CHECK(bridge.window_info(v, &info, nullptr) && info.window.x == 200 && info.window.width == 300 && info.surface.x == 206);
+  CHECK(user::top_level_info(v, &ti, nullptr) && ti.dpi_aware && gdi::window_surface_size(ti.surface_id, &sw, &sh) && sw == 600 - 24 && sh == 400 - 62);
+  CHECK(a2.svc32(N::NtUserCallHwnd, {v, 2}) == 192);
+  CHECK(a2.svc32(N::NtUserCallOneParam, {0, 9}) == 2048);
+  sizes.clear();
+  bridge.mouse_position(206 + 20, 225 + 15);      // (units: device (452, 480), the aware window's client (40, 230))
+  {
+    Th::M m;
+    bool got = false;
+    for (int i = 0; i < 16 && a2.peek(&m); ++i)
+      if (m.message == WM_MOUSEMOVE && m.hwnd == v) {      // (client origin: device (400 + 12, 200 + 50))
+        got = true;
+        CHECK((m.lparam & 0xFFFF) == 40 && ((m.lparam >> 16) & 0xFFFF) == 230 && m.x == 452 && m.y == 480);
+      }
+    CHECK(got);
+  }
+  {      // drawn 1:1 on the device
+    std::vector<uint32_t> target(2048 * 1536, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.pitch = 2048;
+    ts.height = 1536;
+    graphics::SoftwareRenderer2D device(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(bridge.draw_window_scaled(v, device, 412, 450, 2, &dw, &dh) && dw == (600 - 24) / 2 && dh == (400 - 62) / 2);
+  }
+  bridge.detach();
+  one[0].scale = 1;
+  user::set_device_scale_from_desktop(1);
+  user::reset_state();
+  gdi::shutdown();
+}
+
 void test_redirection() {
   Program prog(91);
   Th t(prog, 91, kScratch);
@@ -1519,5 +1665,6 @@ int main() {
   test_process_exit_and_bad_pointers();
   test_props_longs_text();
   test_redirection();
+  test_dpi_virtualization();
   return finish("Win32kUserTest");
 }

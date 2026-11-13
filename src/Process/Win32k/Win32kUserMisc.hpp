@@ -140,6 +140,9 @@ ProcessRecord* process_record(uint64_t pid);                 // made on first us
 ProcessRecord* find_process_record(uint64_t pid);
 ThreadRecord* thread_record(uint64_t tid, uint64_t pid);     // made on first use
 ThreadRecord* find_thread_record(uint64_t tid);
+// The DPI awareness a thread works with (its own context, else its process's): 0 unaware (also when never set), 1 system aware, 2 per-monitor aware.
+uint32_t dpi_awareness(uint64_t tid, uint64_t pid);
+uint32_t dpi_context_of(uint64_t tid, uint64_t pid);      // the NTUSER_DPI context it works with (0x6010, unaware, when none was set)
 uint32_t first_layout_of_system();
 void thread_forget(uint64_t tid);                            // the thread ended
 uint32_t set_thread_dpi_context(Call& call, uint32_t context);      // SetThreadDpiAwarenessContext: the previous context, 0 for an invalid one

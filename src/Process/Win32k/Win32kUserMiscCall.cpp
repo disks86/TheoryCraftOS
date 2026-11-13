@@ -83,7 +83,7 @@ uint64_t one_param(Call& c) {
     }
     case kGetIconParam: return icon_param(uint32_t(arg));
     case kGetMenuItemCount: return uint64_t(int64_t(menu_item_count(uint32_t(arg)))) & 0xFFFFFFFFu;
-    case kGetPrimaryMonitorRect: return c.write_struct(arg, primary_monitor_rect()) ? 1 : c.fail(kErrorNoAccess);
+    case kGetPrimaryMonitorRect: return c.write_struct(arg, user::rect_for_caller(c, primary_monitor_rect())) ? 1 : c.fail(kErrorNoAccess);
     case kGetSysColor: return system_color(uint32_t(arg));
     case kGetSysColorBrush:
     case kGetSysColorPen: {
@@ -101,7 +101,7 @@ uint64_t one_param(Call& c) {
       return slot;
     }
     case kGetSystemMetrics: return uint32_t(system_metrics(uint32_t(arg), thread_dpi(c)));
-    case kGetVirtualScreenRect1: return c.write_struct(arg, virtual_screen_rect()) ? 1 : c.fail(kErrorNoAccess);
+    case kGetVirtualScreenRect1: return c.write_struct(arg, user::rect_for_caller(c, virtual_screen_rect())) ? 1 : c.fail(kErrorNoAccess);
     case kSetKeyboardAutoRepeat: {
       const uint32_t previous = g_keyboard_auto_repeat;
       g_keyboard_auto_repeat = arg != 0 ? 1 : 0;
@@ -122,7 +122,8 @@ uint64_t two_param(Call& c) {
     case kMonitorFromRect: {
       Rect r;
       if (!c.read_struct(a, &r)) return c.fail(kErrorNoAccess);
-      return monitor_from_rect(r, uint32_t(b));
+      const int32_t k = int32_t(user::caller_dpi_scale(c));
+      return monitor_from_rect({r.left * k, r.top * k, r.right * k, r.bottom * k}, uint32_t(b));
     }
     case kSetIconParam: {
       uint64_t callback = 0, param = 0;      // struct free_icon_params { UINT64 callback; UINT64 param; }
@@ -138,7 +139,7 @@ uint64_t two_param(Call& c) {
       if (!user::adjust_window_rect(&r, u32(0), u32(4), u32(8) != 0, u32(12))) return c.fail(kErrorInvalidParameter);
       return c.write_struct(a, r) ? 1 : c.fail(kErrorNoAccess);
     }
-    case kGetVirtualScreenRect2: return c.write_struct(a, virtual_screen_rect()) ? 1 : c.fail(kErrorNoAccess);
+    case kGetVirtualScreenRect2: return c.write_struct(a, user::rect_for_caller(c, virtual_screen_rect())) ? 1 : c.fail(kErrorNoAccess);
     case kTcosTakeDrop: {
       const uint64_t size = user::take_drop(c.pid(), uint32_t(a), ByteView());
       if (size == 0) return c.fail(kErrorInvalidParameter);

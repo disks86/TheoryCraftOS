@@ -369,10 +369,12 @@ uint64_t spi(Call& c, uint32_t action, uint32_t ui, uint64_t pv, uint32_t dpi, b
     case 0x2F: {    // SPI_SETWORKAREA
       Rect r;
       if (pv == 0 || !c.read_struct(pv, &r)) return c.fail(kErrorNoAccess);
+      const int32_t k = int32_t(user::caller_dpi_scale(c));
+      r = {r.left * k, r.top * k, r.right * k, r.bottom * k};
       return set_monitor_work_area(r) ? 1 : c.fail(kErrorInvalidParameter);
     }
     case 0x30: {    // SPI_GETWORKAREA
-      const Rect r = monitor_rect(monitor_handle(), true);
+      const Rect r = user::rect_for_caller(c, monitor_rect(monitor_handle(), true));
       return pv != 0 && c.write_struct(pv, r) ? 1 : c.fail(kErrorNoAccess);
     }
     case 0x57: case 0x58: case 0x5B:      // SPI_SETCURSORS, SPI_SETICONS (reload from the registry: there is none), SPI_SETLANGTOGGLE
@@ -462,8 +464,12 @@ int32_t system_metrics(uint32_t index, uint32_t dpi) {
   SettingsState* s = st();
   if (!s) return 0;
   if (dpi == 0) dpi = 96;
-  const int32_t w = int32_t(gdi::screen_width()), h = int32_t(gdi::screen_height());
-  const Rect work = monitor_rect(monitor_handle(), true);
+  // (DPI virtualization: the screen is in device pixels; asked for 96 dpi on a scaled system - an unaware program - its sizes are the 96-dpi units)
+  const uint32_t sd = system_dpi();
+  const int32_t vk = dpi == 96 && sd > 96 ? int32_t(sd / 96) : 1;
+  const int32_t w = int32_t(gdi::screen_width()) / vk, h = int32_t(gdi::screen_height()) / vk;
+  Rect work = monitor_rect(monitor_handle(), true);
+  if (vk > 1) work = {work.left / vk, work.top / vk, work.right / vk, work.bottom / vk};
   const Metrics& m = s->metrics;
   const int32_t frame_total = 4 + 4;      // SM_CXSIZEFRAME + SM_CXPADDEDBORDER
   int32_t v = 0;

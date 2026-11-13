@@ -177,6 +177,8 @@ struct Window {
   uint32_t creating_stage = 0;   // nonzero while WM_NCCREATE/WM_CREATE run
   uint32_t cs_style = 0, cs_ex_style = 0;    // what CreateWindowEx was given (the CREATESTRUCT of WM_NCCREATE and WM_CREATE), the extended style with WS_EX_WINDOWEDGE decided
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
+  uint8_t dpi_virtual = 1;       // DPI virtualization (Win32kUserDpi.cpp): 0 the window works in device pixels (its thread was DPI aware), 1 in
+                                 // 96-dpi units (unaware: the device scale divides what it sees)
   bool touch_window = false;     // RegisterTouchWindow: touches come as WM_TOUCH (Win32kUserTouch.cpp)
   uint32_t touch_flags = 0;
 };
@@ -485,6 +487,34 @@ struct State {
   uint32_t caret_blink_ms = 530;
   uint32_t double_click_ms = 500;
 };
+
+// ---- DPI virtualization (Win32kUserDpi.cpp). win32k works in device pixels: the desktop's units times the device scale (1 .. 4, from the desktop's
+// monitors). A DPI-unaware thread, and the windows it made, see 96-dpi coordinates: every coordinate crossing to or from them is divided (floor) or
+// multiplied by the scale, so what such a program sets it reads back unchanged. Aware threads and their windows see device pixels. With scale 1 all of
+// it is the identity.
+uint32_t device_scale();
+Rect surface_rect_in_window_units(const Window* top);      // a redirected top-level's surface rectangle in its own coordinates (Win32kUserRedirect.cpp)
+void set_device_scale(uint32_t scale);
+uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (1 for an aware window, or with scale 1)
+uint32_t caller_scale(Call& call);              // the same for the calling thread
+bool thread_unaware(Call& call);
+inline int32_t dpi_down(int32_t v, uint32_t k) {      // device -> virtual (floor)
+  if (k <= 1) return v;
+  const int32_t d = static_cast<int32_t>(k);
+  return v >= 0 ? v / d : -((-v + d - 1) / d);
+}
+inline int32_t dpi_up(int32_t v, uint32_t k) {        // virtual -> device (saturating)
+  if (k <= 1) return v;
+  const int64_t r = int64_t{v} * k;
+  return r > INT32_MAX ? INT32_MAX : r < INT32_MIN ? INT32_MIN : static_cast<int32_t>(r);
+}
+inline Rect dpi_down(const Rect& r, uint32_t k) { return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.right, k), dpi_down(r.bottom, k)}; }
+inline Rect dpi_up(const Rect& r, uint32_t k) { return {dpi_up(r.left, k), dpi_up(r.top, k), dpi_up(r.right, k), dpi_up(r.bottom, k)}; }
+inline Rect dpi_cover(const Rect& r, uint32_t k) {      // device -> virtual, covering every device pixel of it (the far edges rounded up)
+  if (k <= 1) return r;
+  const int32_t d = static_cast<int32_t>(k);
+  return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.right + d - 1, k), dpi_down(r.bottom + d - 1, k)};
+}
 
 // ---- Accessors (Win32kUser.cpp).
 State& state();                                   // creates the state on first use (needs the system allocator)
