@@ -56,6 +56,10 @@ A Linux process also sees the Windows tree at `/mnt/c` (`kLinuxWindowsDrive`), a
 sockets (`src/Process/UnixSockets.hpp`) one kind of program makes are there for the other. `/mnt` itself stays a plain folder of `/Linux`;
 `c` is not listed in it.
 
+The user's files are there for it too, at `/mnt/desktop` (`kLinuxDesktopDrive`): `/mnt/desktop/Documents/a.txt` is `/Desktop/Documents/a.txt`, so a file
+the desktop hands a Linux program (dropped on its window, `src/Wayland/WaylandDragBridge.cpp`) is one it can open. `layout::linux_view_of()` and
+`layout::system_path_of_linux()` translate paths between the two views.
+
 Other volumes (USB sticks, network shares) are folders of `/` named by their label.
 
 ## Rules for new code
@@ -67,7 +71,7 @@ Other volumes (USB sticks, network shares) are folders of `/` named by their lab
 - Do not create new top-level folders in `/`. If something does not fit the table, extend the table (this file and `SystemLayout.hpp`)
   in the same change.
 - Windows and Linux processes get a view of their own root (`/Windows` as `C:\`, `/Linux` as `/`). Translate paths at the system-call
-  boundary; a process must not be able to name a path outside its root (a Linux process's `/mnt/c` is the only way into the other one).
+  boundary; a process must not be able to name a path outside its root (a Linux process's `/mnt/c` and `/mnt/desktop` are the only ways out of its own).
 - `/EFI` is a mount, not a folder of the primary partition. Do not create an `EFI` folder on the primary partition (it would be hidden by
   the mount).
 

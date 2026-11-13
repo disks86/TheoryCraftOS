@@ -137,7 +137,8 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       rtc_sources_(allocator),
       workers_(allocator),
       computed_cache_(allocator),
-      geometry_(allocator) {
+      geometry_(allocator),
+      hit_map_(allocator) {
   address_.assign(address);
   style_cache_media_ = media;
   hub_id_ = env_.page_hub().add_page();
@@ -870,6 +871,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   if (ok) resolve_scroll_target(out->tree);
   if (ok) fetch_css_images(out->list);
   if (ok) record_geometry(out->tree);
+  if (ok && !hit_map_.build(out->list)) note_error("elementFromPoint: out of memory keeping the hit map");
   lap(&phase_.paint);
   out->document = &doc_;
   out->viewport_width = media_.width;
@@ -938,7 +940,7 @@ bool Page::step_objects(double now_ms) {
   (void)moved;
   objects_.update(static_cast<uint64_t>(now_ms));
   deliver_object_events();
-  return objects_.take_dirty();
+  return objects_.has_changes();   // (not taken: the host takes them, to know where to draw again)
 }
 
 // --- After the page is up ------------------------------------------------------------------------------------------------------
@@ -1300,6 +1302,28 @@ int Page::node_clips(dom::Node* node) {
   if (!node || !geometry_ready_) return -1;
   const BoxRect* r = geometry_.find(node->serial);
   return r ? (r->clips ? 1 : 0) : -1;
+}
+
+bool Page::elements_at_point(double x, double y, List<dom::Node*>* out) {
+  out->clear();
+  if (!geometry_ready_ || !(x >= 0) || !(y >= 0) || x >= media_.width || y >= media_.height) return false;   // (NaN is outside too)
+  List<uint32_t> serials(allocator_);
+  if (!hit_map_.nodes_at(static_cast<int32_t>(x), static_cast<int32_t>(y) + scroll_y_, &serials)) return false;
+  auto add = [&](dom::Node* n) {
+    for (dom::Node* had : out->view())
+      if (had == n) return true;
+    return out->push_back(n);
+  };
+  for (const uint32_t serial : serials.view()) {
+    if (serial >> 24) continue;   // (a frame's own page: its iframe element answers here, from its own op further down)
+    dom::Node* n = doc_.by_serial(serial);
+    if (n && n->type == dom::NodeType::Text) n = n->parent;   // (a text answers for the element it is in)
+    if (!n || !n->is_element() || !dom::is_connected(n)) continue;   // (removed since the picture was painted)
+    if (!add(n)) return false;
+  }
+  if (dom::Node* root = doc_.document_element())   // (the root's box is the canvas: it has no op of its own, but is under every point of the viewport)
+    if (!add(root)) return false;
+  return true;
 }
 
 void Page::set_scroll(int32_t y) {

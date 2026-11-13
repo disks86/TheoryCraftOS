@@ -249,6 +249,26 @@ class IRenderer2D {
     return false;
   }
 
+  // Retained layers: pictures the renderer keeps from frame to frame, under a key the caller picks (unique to its content: a page view), so that content
+  // which changes in a small part (a video playing in a page) is not drawn whole every frame. begin_retained() starts drawing into the layer `key`
+  // covering `bounds` (target coordinates; drawing uses the same coordinates, with the clip stack of the layer alone), clipped to `update`: only that
+  // part is drawn again, the rest keeps what it had. When the layer is new to the renderer, or its size changed, or it had to be dropped (the renderer
+  // keeps a few, the least recently used goes first), its pixels are undefined: `*fresh` is then true and the clip is all of `bounds`, so the caller must
+  // draw everything. Nothing reaches the target until draw_retained() lays the layer's pixels, as they are (no blending: draw opaque content), at
+  // `bounds` inside the current clip. Layers do not nest (and are not begun inside a group or layer). begin_retained() returns false, with nothing
+  // started, when this renderer cannot (the default; the caller draws straight onto the target); end_retained() is called if and only if it returned
+  // true. draw_retained() returns false if the layer is not there with that size (draw it first).
+  virtual bool begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) {
+    (void)key, (void)bounds, (void)update;
+    *fresh = false;
+    return false;
+  }
+  virtual void end_retained() {}
+  virtual bool draw_retained(uint64_t key, const Rect2D& bounds) {
+    (void)key, (void)bounds;
+    return false;
+  }
+
   // Makes everything drawn so far visible.
   virtual void present() = 0;
   // Copies what has been drawn into the frame so far (before present()) into `out`: extent().width * height pixels, 0xAARRGGBB, row after row.

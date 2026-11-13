@@ -322,6 +322,9 @@ add_executable(BOOTX64
   src/FileSystem/FileSystemTypes.cpp
   src/FileSystem/Ram/RamFileSystem.cpp
   src/FileSystem/Mount/MountTable.cpp
+  src/FileSystem/Mount/GraftFileSystem.cpp
+  src/FileSystem/Squash/SquashFileSystem.cpp
+  src/FileSystem/Iso/IsoFileSystem.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/FileSystem/Befs/BefsFileSystem.cpp
   src/FileSystem/Ntfs/NtfsFileSystem.cpp
@@ -698,6 +701,7 @@ add_executable(BOOTX64
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/SpreadsheetGrid.cpp
   src/Gui/Controls/PageView.cpp
+  src/Gui/Controls/PageRasterizer.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
@@ -705,6 +709,10 @@ add_executable(BOOTX64
   src/Media/Image.cpp
   src/Media/ImageCodecs.cpp
   src/Media/Zlib.cpp
+  src/Media/Zstd.cpp
+  src/Media/Xz.cpp
+  src/Media/Lz4.cpp
+  src/Media/Lzo.cpp
   src/Media/Image/Png.cpp
   src/Media/Image/Jpeg.cpp
   src/Media/Image/Bmp.cpp
@@ -754,6 +762,7 @@ add_executable(BOOTX64
   src/Media/WebVtt.cpp
   src/Executable/ElfFile.cpp
   src/Executable/ExecutableKind.cpp
+  src/Executable/AppImage.cpp
   src/Executable/PeFile.cpp
   src/Process/Syscall.cpp
   src/Process/Process.cpp
@@ -799,6 +808,7 @@ add_executable(BOOTX64
   src/Wayland/Dxg/WaylandDxgImage.cpp
   src/Wayland/Media/WaylandClipboardPng.cpp
   src/Wayland/WaylandData.cpp
+  src/Wayland/WaylandDragBridge.cpp
   src/Wayland/WaylandDesktop.cpp
   src/Wayland/WaylandDmabuf.cpp
   src/Wayland/WaylandExtras.cpp
@@ -831,6 +841,8 @@ add_executable(BOOTX64
   src/Process/ProgramEnvironment.cpp
   src/Program/ProgramHost.cpp
   src/Program/ProgramRunner.cpp
+  src/Program/AppImageLaunch.cpp
+  src/Program/AppRunScript.cpp
   src/Program/EmulatedTask.cpp
   src/Emulation/GuestCpu.cpp
   src/Emulation/EmulatedProcess.cpp

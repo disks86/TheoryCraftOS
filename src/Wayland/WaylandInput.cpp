@@ -506,7 +506,7 @@ void Server::set_keyboard_focus(Surface* s) {
   }
   Surface* old_focus = keyboard_focus_;
   keyboard_focus_ = s;
-  text_input_focus(old_focus, s);      // (WaylandTextInput.cpp: leave and enter)
+  text_input_focus(old_focus, nullptr);      // (WaylandTextInput.cpp: leave now, enter once the keyboard has entered)
   last_mods_[0] = last_mods_[1] = ~0u;
   if (!s) return;
   Client* c = client_of(s->client);
@@ -521,6 +521,7 @@ void Server::set_keyboard_focus(Surface* s) {
   }
   for (uint32_t k : keyboards.view())
     if (Resource* r = c->objects.find(k)) keyboard_enter(*c, *r, k, *s);
+  text_input_focus(nullptr, s);      // (after wl_keyboard.enter: clients such as foot expect that order)
   last_mods_[0] = modifier_mask(false);
   last_mods_[1] = modifier_mask(true);
 }

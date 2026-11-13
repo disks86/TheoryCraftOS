@@ -198,11 +198,11 @@ bool ProcessFiles::fold_case(String* path, uint64_t prefix_size) const {
 }
 
 namespace {
-// The rest of `virtual_path` after /mnt/c ("" for /mnt/c itself, "/x" below it), or false if it is not in there.
-bool under_windows_mount(StringView virtual_path, StringView* rest) {
-  const StringView kWindowsDriveMount(filesystem::layout::kLinuxWindowsDrive);
-  if (virtual_path.size() < kWindowsDriveMount.size() || virtual_path.first(kWindowsDriveMount.size()) != kWindowsDriveMount) return false;
-  const StringView after = virtual_path.without_prefix(kWindowsDriveMount.size());
+// The rest of `virtual_path` after `mount` ("" for the mount itself, "/x" below it), or false if it is not in there.
+bool under_mount(StringView virtual_path, const char* mount, StringView* rest) {
+  const StringView root(mount);
+  if (virtual_path.size() < root.size() || virtual_path.first(root.size()) != root) return false;
+  const StringView after = virtual_path.without_prefix(root.size());
   if (!after.empty() && after[0] != '/') return false;      // ("/mnt/cdrom" is not)
   *rest = after;
   return true;
@@ -212,12 +212,14 @@ bool under_windows_mount(StringView virtual_path, StringView* rest) {
 bool ProcessFiles::host_path(StringView virtual_path, String* out) const {
   if (!fs_ || !allocator_) return false;
   out->clear();
-  StringView windows_rest;
-  if (style_ == PathStyle::Posix && under_windows_mount(virtual_path, &windows_rest)) {
+  StringView mount_rest;
+  if (style_ == PathStyle::Posix && under_mount(virtual_path, filesystem::layout::kLinuxWindowsDrive, &mount_rest)) {      // /mnt/c: the Windows tree
     const StringView windows_root(filesystem::layout::kWindows);
-    if (!out->assign(windows_root) || !out->append(windows_rest)) return false;
+    if (!out->assign(windows_root) || !out->append(mount_rest)) return false;
     return fold_case(out, windows_root.size());
   }
+  if (style_ == PathStyle::Posix && under_mount(virtual_path, filesystem::layout::kLinuxDesktopDrive, &mount_rest))      // /mnt/desktop: the user's files
+    return out->assign(StringView(filesystem::layout::kDesktop)) && out->append(mount_rest);
   if (!out->assign(root_prefix_)) return false;
   if (virtual_path == StringView("/")) return true;
   if (!out->append(virtual_path)) return false;

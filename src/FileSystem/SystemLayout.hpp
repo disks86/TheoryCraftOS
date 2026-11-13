@@ -103,6 +103,9 @@ inline constexpr const char* kLinuxRootApplications = "/Linux/root/.local/share/
 // Where a Linux process sees the Windows tree (/Windows, the C: drive), as under WSL: a path in the Linux process's own view, not one of the OS's file
 // system. Files (and unix sockets, see Process/UnixSockets.hpp) made there by one kind of program are the other's.
 inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
+// Where a Linux process sees the user's files (/Desktop with Documents, Downloads, ...), the same way: what the desktop hands a Linux program (a file
+// dropped on its window) is there for it to open.
+inline constexpr const char* kLinuxDesktopDrive = "/mnt/desktop";
 // The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
 inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
 inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
@@ -192,6 +195,40 @@ inline bool create_folders(filesystem::IFileSystem& fs) {
   for (const char* folder : kWindowsFolders) ok &= create_folder(fs, folder);
   for (const char* folder : kLinuxFolders) ok &= create_folder(fs, folder);
   return ok;
+}
+
+// A system path as a Linux process names it, into *out: /Linux/x is /x, /Windows/x is /mnt/c/x, /Desktop/x is /mnt/desktop/x. False for a path a Linux
+// process cannot see (/AppStore, /EFI, another volume) or on out-of-memory.
+inline bool linux_view_of(StringView system_path, String* out) {
+  struct Mount { const char* system; const char* seen; };
+  const Mount mounts[] = {{kWindows, kLinuxWindowsDrive}, {kDesktop, kLinuxDesktopDrive}, {kLinux, ""}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.system);
+    if (system_path.size() < root.size() || system_path.first(root.size()) != root) continue;
+    const StringView rest = system_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;      // ("/Linuxish" is not)
+    if (!out->assign(StringView(m.seen)) || !out->append(rest)) return false;
+    if (out->empty()) return out->push_back('/');
+    return true;
+  }
+  return false;
+}
+
+// The other way: what a Linux process names /x (/mnt/c/x, /mnt/desktop/x) on the system. False for a relative path or on out-of-memory. (Windows'
+// names are not folded to the case the files have: the caller opens them through the file system, which compares names as it does.)
+inline bool system_path_of_linux(StringView linux_path, String* out) {
+  if (linux_path.empty() || linux_path[0] != '/') return false;
+  struct Mount { const char* seen; const char* system; };
+  const Mount mounts[] = {{kLinuxWindowsDrive, kWindows}, {kLinuxDesktopDrive, kDesktop}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.seen);
+    if (linux_path.size() < root.size() || linux_path.first(root.size()) != root) continue;
+    const StringView rest = linux_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;
+    return out->assign(StringView(m.system)) && out->append(rest);
+  }
+  if (!out->assign(StringView(kLinux))) return false;
+  return linux_path == StringView("/") || out->append(linux_path);
 }
 
 // "/AppStore/<app>" or "/AppStore/<app>/<sub>" in *path (replacing what it held). `app` is one folder name ("Browser"); `sub` may be a

@@ -208,6 +208,11 @@ class Server final : public desktop::IWindowsSession {
   bool text_input(TextInputState* out) override;
   bool text_preedit(StringView text, uint32_t cursor) override;
   bool text_commit(StringView text) override;
+  bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) override;
+  bool desktop_drop() override;
+  void desktop_drag_end() override;
+  bool take_program_drop(String* text, int32_t* x, int32_t* y) override;
+  void program_drop_done(bool taken) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -656,7 +661,27 @@ class Server final : public desktop::IWindowsSession {
     uint32_t offer = 0;                     // the offer the focus's client was given
     int32_t lx = 0, ly = 0;
     bool dropped = false;                   // the drop happened; the source waits for the destination's finish
+    bool desktop = false;                   // the desktop's drag (desktop_drag): no client source, the data is desktop_drag_text_
   } drag_;
+  // The desktop's drag (WaylandDragBridge.cpp): what it carries, and as a file URI list when it is a file a Linux program can see (else empty).
+  String desktop_drag_text_, desktop_drag_uri_, desktop_drag_linux_;
+  // A client's drag let go over the desktop: its data is read from the source (a pipe, `job`), then handed to the desktop (take_program_drop).
+  struct ProgramDrop {
+    explicit ProgramDrop(allocators::IAllocator& allocator) : mime(allocator), text(allocator) {}
+    uint32_t job = 0;
+    uint8_t client = 0;
+    uint32_t source = 0;
+    String mime;
+    bool uri = false;              // the data is a text/uri-list
+    int32_t x = 0, y = 0;          // where it was let go
+    bool ready = false, taken = false;      // read (and given to the desktop)
+    String text;                   // the items, one per line (files as system paths)
+  } program_drop_;
+  void drag_at(int32_t x, int32_t y);      // the drag (a client's or the desktop's) is at (x, y) of the screen
+  bool drag_taken();                       // the surface under the drag accepted a type and an action
+  bool start_program_drop();               // a client's drag let go outside every surface: to the desktop (false: nothing it carries is for it)
+  void reset_program_drop();
+  void program_drop_read(ConstByteView data);      // the source's data came
   uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
   struct TouchContact {

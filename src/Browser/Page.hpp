@@ -39,6 +39,7 @@
 #include "Dom/Dom.hpp"
 #include "Dom/LegacyEncodings.hpp"
 #include "ObjectContainer/Dictionary.hpp"
+#include "Paint/HitTest.hpp"
 #include "Font/FontSet.hpp"
 #include "Script/Engine.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -185,6 +186,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool changed() const;
   // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
   bool take_visual_change() { return objects_.take_dirty(); }
+  // What changed on screen without the page changing: see PageObjects::take_changes (the serials of the elements whose picture alone changed).
+  uint32_t take_visual_changes(ArrayView<uint32_t> nodes) { return objects_.take_changes(nodes); }
 
   // The display changed (the window was resized, the colour scheme was switched): the page's numbers and its matchMedia() lists follow, and `resize`
   // fires. A style sheet's @media rules are read again by the next render().
@@ -314,6 +317,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void scroll_node_into_view(dom::Node* node) override;
   bool node_rect(dom::Node* node, double* rect8) override;
   int node_clips(dom::Node* node) override;
+  bool elements_at_point(double x, double y, List<dom::Node*>* out) override;
   bool fetch_classic_script(StringView address, String* text) override { return fetch_text_via_sw(address, "script", kMaxScriptBytes, text); }
   bool layout_ready() override { return geometry_ready_; }
   bool confirm(StringView text) override { return env_.confirm(text); }
@@ -532,6 +536,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   uint32_t computed_cache_focus_ = 0;
   static constexpr uint64_t kMaxComputedStyles = 32768;   // (YouTube reads the style of more than 4096 elements over and over: a smaller cache is cleared all the time)
   Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
+  paint::HitMap hit_map_;                    // what the last picture says is under each point (elementFromPoint)
   bool geometry_ready_ = false;
   font::FontSet* layout_fonts_ = nullptr;   // (set_layout_fonts)
   uint64_t geometry_version_ = 0;           // the document version geometry_ was recorded for

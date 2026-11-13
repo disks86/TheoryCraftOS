@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Program/ProgramRunner.hpp"
+#include "Program/AppImageLaunch.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Program/ProgramHost.hpp"
 #include "Emulation/GuestCpu.hpp"
@@ -137,7 +138,38 @@ Plan plan_for(const ProgramRun& run, ConstByteView image, String* message) {
 
 }  // namespace
 
+namespace {
+RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message);
+}  // namespace
+
+// An AppImage: its image is mounted for the program alone and what its AppRun starts is run instead (AppImageLaunch.hpp). The session (the mount) lives
+// as long as the program runs.
 RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* message) {
+  if (run.kind != exe::ExecutableKind::Elf || !run.files || appimage_type(*run.files, run.path) == exe::AppImageType::None) return run_loaded(run, exit_code, message);
+  *exit_code = 0;
+  allocators::IAllocator& allocator = *run.allocator;
+  process::prepare_program_folders(*run.files);      // (/Linux/tmp, where the image is mounted)
+  List<StringView> environment(allocator);
+  bool listed = true;
+  for (const StringView& entry : process::default_environment(process::SyscallAbi::Linux)) listed &= environment.push_back(entry);
+  for (const StringView& entry : run.extra_environment) listed &= environment.push_back(entry);
+  if (!listed) {
+    fail(message, "not enough memory to start the program");
+    return RunResult::CouldNotRun;
+  }
+  AppImageSession session(allocator);
+  if (!session.prepare(*run.files, run.path, run.working_directory, run.arguments, ArrayView<const StringView>(environment.view()), message)) return RunResult::CouldNotRun;
+  ProgramRun inner = run;
+  inner.files = &session.files();
+  inner.path = session.program_path();
+  inner.arguments = session.arguments();
+  inner.extra_environment = session.environment();
+  return run_loaded(inner, exit_code, message);
+}
+
+namespace {
+
+RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message) {
   *exit_code = 0;
   allocators::IAllocator& allocator = *run.allocator;
   static kernel::Mutex init_mutex;
@@ -347,6 +379,8 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   }
   return RunResult::Exited;
 }
+
+}  // namespace
 
 namespace {
 

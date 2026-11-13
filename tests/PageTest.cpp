@@ -202,6 +202,14 @@ struct FakeClip final : IVideoClip {
   bool muted = false, native_rate = false;   // (native_rate: this clip plays at other speeds itself)
   uint32_t serial = 1;
   int updates = 0;
+  bool counts_frames = false;   // reports frames_presented (the test moves it): the page is drawn again only for a new frame
+  uint64_t frames_presented = 0;
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
+    if (!counts_frames) return false;
+    *presented = frames_presented;
+    *dropped = 0;
+    return true;
+  }
   bool play() override { is_playing = true; return true; }
   void pause() override { is_playing = false; }
   void seek(int64_t us) override { position = us < 0 ? 0 : us > duration ? duration : us; ++serial; }
@@ -1625,7 +1633,10 @@ static void test_images() {
     page.step_objects(static_cast<double>(env.clock));
     page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
     const uint32_t first = target.at(2, 2);
+    uint32_t nodes[4];
+    page.take_visual_changes(ArrayView<uint32_t>(nodes, 4));   // (what loading changed)
     page.step_objects(static_cast<double>(env.clock + 150));
+    CHECK(page.take_visual_changes(ArrayView<uint32_t>(nodes, 4)) == 1 && nodes[0] == run->node);   // its next frame: the picture alone changed
     page.objects().paint_object(renderer, run->node, ObjectKind::Image, 0, 0, 8, 8, Rect2D{0, 0, 20, 20});
     CHECK(first != target.at(2, 2) && (first == 0xFFFF0000u || first == 0xFF0000FFu));
     double due;
@@ -2017,6 +2028,22 @@ static void test_video() {
     CHECK(env.last_clip->updates >= 2);
     double due;
     CHECK(page.next_timer(&due));   // (a playing video wants the next frame soon)
+    // what changed on screen while it plays: the video alone (where it is drawn again, not the page), and only when it showed a new frame
+    {
+      uint32_t nodes[16];
+      const ArrayView<uint32_t> into(nodes, 16);
+      page.take_visual_changes(into);   // (what loading changed)
+      env.last_clip->duration = 100000000;
+      env.last_clip->counts_frames = true;
+      env.last_clip->frames_presented = 5;
+      page.step_objects(static_cast<double>(env.clock + 600));
+      CHECK(page.take_visual_changes(into) == 1 && nodes[0] == run->node);
+      page.step_objects(static_cast<double>(env.clock + 700));   // (no new frame)
+      CHECK(page.take_visual_changes(into) == 0);
+      env.last_clip->frames_presented = 6;
+      CHECK(page.step_objects(static_cast<double>(env.clock + 800)));   // (step_objects says so, and leaves it to be taken)
+      CHECK(page.take_visual_changes(ArrayView<uint32_t>()) == PageObjects::kChangedEverything);   // (no room for the list: everything)
+    }
     // script control
     page.load("");
     (void)0;
@@ -4408,6 +4435,50 @@ static void test_navigation() {
                   "try { new IntersectionObserver(function () {}, { threshold: 2 }) } catch (e) { console.log(e.name) } try { new IntersectionObserver(function () {}, { rootMargin: '5' }) } catch (e) { console.log(e.name) } try { new IntersectionObserver(1) } catch (e) { console.log(e.name) }"
                   "try { o.observe(5) } catch (e) { console.log(e.name) } var t = document.getElementById('t'); o.observe(t); o.observe(t); console.log(o.takeRecords().length); o.disconnect()", {}) ==
             "true 10px 10px 10px 10px 1\n1% 2px 3px 2px\nRangeError\nSyntaxError\nTypeError\nTypeError\n0\n");
+    }
+    CHECK(a.live == 0);
+  }
+  // --- document.elementFromPoint / elementsFromPoint: what the last picture shows under a viewport point, as a click would find it
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 400;
+      media.height = 300;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      auto probe = [&](const std::string& script, int32_t scroll) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<body style='margin:0'><div id=sp style='height:2000px'></div>"
+                               "<div id=a style='position:absolute;left:0;top:0;width:100px;height:100px;background:red'><span id=s>hello</span></div>"
+                               "<div id=b style='position:absolute;left:50px;top:50px;width:100px;height:100px'></div>"
+                               "<div id=n style='position:absolute;left:200px;top:0;width:100px;height:100px'></div>"
+                               "<div id=pe style='position:absolute;left:200px;top:0;width:100px;height:100px;pointer-events:none'></div>"
+                               "<div id=v style='position:absolute;left:200px;top:0;width:50px;height:50px;visibility:hidden'></div>"
+                               "<div id=c style='position:absolute;left:0;top:150px;width:100px;height:50px;overflow:hidden'><div id=cin style='margin-top:30px;height:50px'></div></div>"
+                               "<div id=t style='position:absolute;left:0;top:400px;width:100px;height:100px;transform:translateX(200px)'></div>"
+                               "<script>var at = function (x, y) { var e = document.elementFromPoint(x, y); return e ? (e.id || e.tagName) : 'null' };"
+                               "var all = function (x, y) { return document.elementsFromPoint(x, y).map(function (e) { return e.id || e.tagName }).join(' ') };"
+                               "addEventListener('scroll', function () {") + script + "})</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        page.run_due_timers(1e12);
+        page.set_scroll(scroll);
+        page.run_due_timers(1e12);
+        return std::string(page.log().data(), page.log().size());
+      };
+      // the topmost box, front to back with the ancestors and the root last; text answers for its element
+      CHECK(probe("console.log(at(60, 60), at(20, 60), at(5, 5)); console.log(all(60, 60))", 1) == "b a s\nb a sp BODY HTML\n");
+      // pointer-events: none and visibility: hidden let the point through; a clip hides what sticks out of it; a transform moves what can be hit
+      CHECK(probe("console.log(at(210, 10), at(10, 160), at(10, 190), at(10, 205))", 1) == "n c cin sp\n");
+      // (scrolled: viewport y 0..99 is page y 400..499, where the translated box is; its untransformed place is not)
+      CHECK(probe("console.log(at(250, 50), at(50, 50))", 400) == "t sp\n");
+      // outside the viewport: null and []; an element removed since the picture was painted is not answered
+      CHECK(probe("console.log(at(-1, 5), at(5, 300), at(400, 5), at(NaN, 1), all(-5, -5).length); document.getElementById('b').remove(); console.log(at(60, 60))", 1) ==
+            "null null null null 0\na\n");
+      // only the root under an empty spot
+      CHECK(probe("console.log(all(350, 250))", 1) == "sp BODY HTML\n");
     }
     CHECK(a.live == 0);
   }
