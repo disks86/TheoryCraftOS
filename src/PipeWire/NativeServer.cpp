@@ -848,6 +848,9 @@ void NativeServer::tick() {
             if (p->buffers_sent && !p->renegotiate && watcher_share_changed(*p, *n->video)) p->renegotiate = n->renegotiate = true;
           }
       if (n->renegotiate) negotiate(*c, *n);
+      // (a producer's frame taken before it was drawn: shown once it is)
+      for (UniquePointer<ClientPort>& p : n->ports.view())
+        if (p->media == Media::Video && p->direction == 1 && p->share) check_pending(*n, *p);
       run_client_node(*n, now);
     }
   }

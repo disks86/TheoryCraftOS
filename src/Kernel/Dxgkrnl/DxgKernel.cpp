@@ -564,6 +564,7 @@ class ExportedAllocation {
   friend class Kernel;
   friend const ExportInfo& export_info(const ExportedAllocation& exported);
   friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+  friend bool export_idle(ExportedAllocation& exported);
   Kernel& kernel_;
   SharedPointer<Allocation> allocation_;
   Adapter& adapter_;
@@ -572,6 +573,12 @@ class ExportedAllocation {
 };
 
 const ExportInfo& export_info(const ExportedAllocation& exported) { return exported.info_; }
+
+bool export_idle(ExportedAllocation& exported) {
+  kernel::ScopedMutex g(exported.kernel_.lock_);
+  exported.adapter_.pump();
+  return !exported.adapter_.allocation_in_use(*exported.allocation_);
+}
 
 bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image) {
   kernel::ScopedMutex g(exported.kernel_.lock_);

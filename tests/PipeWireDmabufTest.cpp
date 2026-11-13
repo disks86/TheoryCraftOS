@@ -99,6 +99,8 @@ int main() {
   dxgk::Kernel k(A);
   CHECK(k.add_adapter(device, dxgk::AdapterConfig()) == 0);
   process::set_dxg_buffer_copier(&dxgk::copy_export);
+  process::set_dxg_buffer_idler(&dxgk::export_idle);
+  process::set_dxg_sync_ops(&dxgk::exported_sync_value, &dxgk::signal_exported_sync);
   {
     // a camera's frame: an image of 40 x 30 drawn by its process, exported (what /dev/dxg's export makes a dmabuf of)
     const dxgk::ProcessId pid = 7;
@@ -157,7 +159,9 @@ int main() {
       CHECK(proto.fds.size() == 1);
       if (proto.fds.size() == 1) {
         Fd& fd = proto.fds[0];
-        CHECK(fd->gpu() && fd->memory().size() == info.bytes);
+        CHECK(fd->gpu() && fd->memory().size() == info.bytes && fd->gpu_ready());      // (nothing queued on it: drawn)
+        uint64_t no_value = 0;
+        CHECK(!fd->timeline_value(&no_value) && !fd->timeline_signal(1));      // (an image is no timeline)
         // the image's pixels in the copy, rows `pitch` apart
         auto holds = [&](uint32_t frame) {
           const ByteView m = fd->memory();
@@ -226,6 +230,39 @@ int main() {
         }
         first = process::UnixInFlight();
         second = process::UnixInFlight();
+
+        // explicit sync: a fence of the camera's process, exported as a timeline (what /dev/dxg's export of a sync object makes) and passed in; the
+        // server reads its value and raises it (a release point), which the camera's process sees
+        dxgk::Handle fence = 0;
+        CHECK(dst::ok(k.create_sync(pid, dev, dxgk::SyncType::Fence, 3, 0, &fence)));
+        SharedPointer<dxgk::ExportedSync> exported_sync;
+        CHECK(dst::ok(k.export_sync(pid, fence, &exported_sync)) && exported_sync);
+        SharedPointer<process::OpenObject> sync_object = SharedPointer<process::OpenObject>::make(A, A);
+        UniquePointer<process::DxgSyncFile> sync_file = UniquePointer<process::DxgSyncFile>::make(A, exported_sync);
+        sync_object->gpu_sync = sync_file.get();
+        sync_object->file = util::move(sync_file);
+        sync_object->readable = true;
+        Queue<process::UnixInFlight> sync_rights(A);
+        process::UnixInFlight sync_entry;
+        sync_entry.kind = process::DescriptorKind::File;
+        sync_entry.object = sync_object;
+        sync_rights.enqueue(util::move(sync_entry));
+        sync.lock();
+        uint32_t sync_sent = 0;
+        const uint8_t one[1] = {7};
+        CHECK(sockets.send_locked(sock, ConstByteView(one, 1), nullptr, 9, &sync_rights, &sync_sent) == process::UnixStatus::Ok && sync_sent == 1);
+        sync.unlock();
+        for (int i = 0; i < 3; ++i) server.pump();
+        CHECK(proto.fds.size() == 2);
+        if (proto.fds.size() == 2) {
+          Fd& timeline = proto.fds[1];
+          uint64_t value = 0;
+          CHECK(!timeline->gpu() && timeline->timeline_value(&value) && value == 3);
+          CHECK(timeline->timeline_signal(5) && dxgk::exported_sync_value(*exported_sync) == 5);
+          CHECK(timeline->timeline_signal(4) && dxgk::exported_sync_value(*exported_sync) == 5);      // (a fence never goes down)
+        }
+        sync_object = SharedPointer<process::OpenObject>();
+        exported_sync = SharedPointer<dxgk::ExportedSync>();
         made = Fd();
         server.set_gpu_images(nullptr);      // (before the images' maker goes)
         sockets.release(sock2);
@@ -241,6 +278,8 @@ int main() {
     k.close_process(pid);
   }
   process::set_dxg_buffer_copier(nullptr);
+  process::set_dxg_buffer_idler(nullptr);
+  process::set_dxg_sync_ops(nullptr, nullptr);
   printf("PipeWireDmabufTest: %d checks, %d failed\n", g_checks, g_failed);
   return g_failed ? 1 : 0;
 }

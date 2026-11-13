@@ -84,6 +84,9 @@ struct VideoShare {
   uint64_t taken_at[kMaxBuffers] = {};   // (when: the oldest goes back first)
   uint64_t clock = 0;
   uint32_t latest = 0xFFFFFFFFu;         // the buffer of the newest frame (held for the watchers that have not had it)
+  uint32_t pending = 0xFFFFFFFFu;        // a frame taken that is not drawn yet (its acquire point not reached, the GPU still on it)
+  uint64_t acquire_point[kMaxBuffers] = {}, release_point[kMaxBuffers] = {};      // (explicit sync) each buffer's points when it was taken
+  bool promised[kMaxBuffers] = {};       // (explicit sync) its release point is to be signalled when it goes back
   uint32_t attached = 0;                 // watchers' ports given these buffers
   bool closed = false;                   // the producer let go of them (another format, other buffers, gone)
 };

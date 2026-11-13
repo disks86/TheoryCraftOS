@@ -86,6 +86,12 @@ class KernelDescriptor final : public Descriptor {
     if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
     return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), false);
   }
+  bool gpu_ready() override {
+    if (!entry_.object || !entry_.object->gpu_buffer) return true;
+    return entry_.object->gpu_buffer->gpu_idle();
+  }
+  bool timeline_value(uint64_t* out) override { return entry_.object && entry_.object->gpu_sync && entry_.object->gpu_sync->value(out); }
+  bool timeline_signal(uint64_t point) override { return entry_.object && entry_.object->gpu_sync && entry_.object->gpu_sync->signal(point); }
   bool sync_to_gpu() override {
     if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
     return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), true);

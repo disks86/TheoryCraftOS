@@ -201,6 +201,8 @@ void install_dxg() {
   linuxabi::set_dxg_sync_handlers(&dxg::linux_export_sync, &dxg::linux_import_sync);
   set_dxg_buffer_copier(&dxgk::copy_export);      // (mmap of a dmabuf: the CPU's copy, DxgBufferFile.hpp)
   set_dxg_buffer_describer(&dxg::describe_export);
+  set_dxg_buffer_idler(&dxgk::export_idle);      // (and the PipeWire server's: whether a frame is drawn, and the timelines of explicit sync)
+  set_dxg_sync_ops(&dxgk::exported_sync_value, &dxgk::signal_exported_sync);
 }
 
 }  // namespace process::win32k

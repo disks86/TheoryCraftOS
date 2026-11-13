@@ -24,6 +24,9 @@
 //                port_buffers);
 //   video-zerocopy  video-alloc with a watcher that takes memfds only: the server gives it the camera's own memfds (zero-copy), so each frame it
 //                sees must be in one of the camera's files (the same inode), whole and in order;
+//   video-sync   video-alloc with explicit sync, as PipeWire's video-src-sync example does it: the camera offers a layout of three blocks (its memfd and
+//                two SyncObj timelines - eventfds here, as in the example) that depends on SyncTimeline metadata, with the RELEASE feature; the server
+//                must give it that layout and the feature, and the watcher must see its frames whole and in order;
 //   video-yuv    the camera in NV12 with a data block a plane, the watcher with the planes one after another in one block; once the watcher has seen
 //                some frames the camera says it is I420 at another size now (pw_stream_update_params): both are negotiated again while streaming, and
 //                the watcher must see the I420 frames too;
@@ -43,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -72,6 +76,8 @@ struct data {
   struct spa_source* deadline;
   int alloc;
   int zerocopy;
+  int sync;
+  uint32_t sync_buffers, sync_feature;
   ino_t camera_inodes[16];
   uint32_t n_inodes, own_seen;
   uint32_t produced;
@@ -150,17 +156,34 @@ static void camera_param_changed(void* userdata, uint32_t id, const struct spa_p
   }
   uint8_t buffer[1024];
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
-  const struct spa_pod* params[2];
-  params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+  const struct spa_pod* params[4];
+  uint32_t n_params = 0;
+  if (d->sync) {      // (first the layout with the timelines, which depends on SyncTimeline metadata)
+    struct spa_pod_frame f;
+    spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
+    spa_pod_builder_add(&b, SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8), SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(3),
+                        SPA_PARAM_BUFFERS_size, SPA_POD_Int(size), SPA_PARAM_BUFFERS_stride, SPA_POD_Int(d->camera_stride),
+                        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd), 0);
+    spa_pod_builder_prop(&b, SPA_PARAM_BUFFERS_metaType, SPA_POD_PROP_FLAG_MANDATORY);
+    spa_pod_builder_int(&b, 1 << SPA_META_SyncTimeline);
+    params[n_params++] = spa_pod_builder_pop(&b, &f);
+    spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta);
+    spa_pod_builder_add(&b, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_SyncTimeline), SPA_PARAM_META_size,
+                        SPA_POD_Int(sizeof(struct spa_meta_sync_timeline)), 0);
+    spa_pod_builder_prop(&b, SPA_PARAM_META_features, SPA_POD_PROP_FLAG_DROP);
+    spa_pod_builder_int(&b, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE);
+    params[n_params++] = spa_pod_builder_pop(&b, &f);
+  }
+  params[n_params++] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
       SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
       SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(blocks),
       SPA_PARAM_BUFFERS_size, SPA_POD_Int(size),
       SPA_PARAM_BUFFERS_stride, SPA_POD_Int(d->camera_stride),
       SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(d->alloc ? (1 << SPA_DATA_MemFd) : ((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
-  params[1] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+  params[n_params++] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
       SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
       SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
-  pw_stream_update_params(d->camera, params, 2);
+  pw_stream_update_params(d->camera, params, n_params);
 }
 
 // (video-alloc) the camera's own buffers: a memfd each, mapped here
@@ -192,6 +215,19 @@ static void camera_add_buffer(void* userdata, struct pw_buffer* buffer) {
   sd->mapoffset = 0;
   sd->maxsize = (uint32_t)size;
   sd->data = mem;
+  // (video-sync) the timelines: two more blocks, SyncObj (eventfds standing in, as in PipeWire's example)
+  if (d->sync && buffer->buffer->n_datas >= 3 && spa_buffer_find_meta_data(buffer->buffer, SPA_META_SyncTimeline, sizeof(struct spa_meta_sync_timeline))) {
+    for (int k = 1; k <= 2; ++k) {
+      struct spa_data* t = &buffer->buffer->datas[k];
+      t->type = SPA_DATA_SyncObj;
+      t->flags = SPA_DATA_FLAG_READWRITE;
+      t->fd = eventfd(0, EFD_CLOEXEC);
+      t->mapoffset = 0;
+      t->maxsize = 0;
+    }
+    ++d->sync_buffers;
+    if (spa_buffer_has_meta_features(buffer->buffer, SPA_META_SyncTimeline, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE)) ++d->sync_feature;
+  }
 }
 
 static void camera_remove_buffer(void* userdata, struct pw_buffer* buffer) {
@@ -200,6 +236,8 @@ static void camera_remove_buffer(void* userdata, struct pw_buffer* buffer) {
   struct spa_data* sd = &buffer->buffer->datas[0];
   if (sd->data) munmap(sd->data, sd->maxsize);
   if (sd->fd >= 0) close((int)sd->fd);
+  for (uint32_t k = 1; d->sync && k < buffer->buffer->n_datas && k <= 2; ++k)
+    if (buffer->buffer->datas[k].type == SPA_DATA_SyncObj && buffer->buffer->datas[k].fd >= 0) close((int)buffer->buffer->datas[k].fd);
 }
 
 // (video-yuv) a frame's planes: luma row y = frame + y, chroma row y = frame * 3 + y
@@ -252,6 +290,14 @@ static void camera_process(void* userdata) {
     buf->datas[0].chunk->offset = 0;
     buf->datas[0].chunk->size = (uint32_t)(d->camera_stride * H);
     buf->datas[0].chunk->stride = d->camera_stride;
+    struct spa_meta_sync_timeline* stl = spa_buffer_find_meta_data(buf, SPA_META_SyncTimeline, sizeof *stl);
+    if (d->sync && stl && buf->n_datas >= 3) {      // (its points, the release not scheduled until the server promises it; the acquire "signalled")
+      SPA_FLAG_SET(stl->flags, SPA_META_SYNC_TIMELINE_UNSCHEDULED_RELEASE);
+      stl->acquire_point = frame;
+      stl->release_point = frame;
+      const uint64_t cmd = 1;
+      if (write((int)buf->datas[1].fd, &cmd, sizeof cmd) < 0) ++d->bad;
+    }
   }
   pw_stream_queue_buffer(d->camera, b);
 }
@@ -427,10 +473,12 @@ static void watcher_process(void* userdata) {
     pw_stream_queue_buffer(d->watcher, b);
   }
   if (d->seen >= WANT_FRAMES) {
-    char what[160];
-    snprintf(what, sizeof what, "(%u frames watched whole and in order, %u produced, %u bad; %s buffers%s)", d->seen, d->produced, d->bad,
-             d->alloc ? "the camera's own" : "the server's", d->zerocopy ? ", the watcher given them as they are" : "");
-    finish(d, d->bad == 0, what);
+    char what[300];
+    char sync_what[96] = "";
+    if (d->sync) snprintf(sync_what, sizeof sync_what, "; %u with timelines, %u with the RELEASE feature", d->sync_buffers, d->sync_feature);
+    snprintf(what, sizeof what, "(%u frames watched whole and in order, %u produced, %u bad; %s buffers%s%s)", d->seen, d->produced, d->bad,
+             d->alloc ? "the camera's own" : "the server's", d->zerocopy ? ", the watcher given them as they are" : "", sync_what);
+    finish(d, d->bad == 0 && (!d->sync || (d->sync_buffers > 0 && d->sync_feature == d->sync_buffers)), what);
   }
 }
 
@@ -779,7 +827,8 @@ int main(int argc, char** argv) {
   d.result = -1;
   d.mode = argc > 1 ? argv[1] : "video";
   d.zerocopy = strcmp(d.mode, "video-zerocopy") == 0;
-  d.alloc = strcmp(d.mode, "video-alloc") == 0 || d.zerocopy;
+  d.sync = strcmp(d.mode, "video-sync") == 0;
+  d.alloc = strcmp(d.mode, "video-alloc") == 0 || d.zerocopy || d.sync;
   d.yuv = strcmp(d.mode, "video-yuv") == 0;
   pw_init(&argc, &argv);
   d.loop = pw_main_loop_new(NULL);

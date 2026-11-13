@@ -90,7 +90,7 @@ class NativeServer final : public IProtocolServer {
   // A port of a client node (NativeClientNode.cpp): its formats, the metadata and buffers the server gave it, and where its data goes.
   struct ClientPort {
     static constexpr uint32_t kMaxMetas = 8;
-    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a), share_mems(a), gpu_images(a) {}
+    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a), share_mems(a), gpu_images(a), timelines(a) {}
     ~ClientPort() { leave_share(); }
     ClientPort(const ClientPort&) = delete;
     ClientPort& operator=(const ClientPort&) = delete;
@@ -104,6 +104,16 @@ class NativeServer final : public IProtocolServer {
     bool format_sent = false, buffers_sent = false, data_ready = false, wants_alloc = false;
     // what its Buffers and Meta params ask for (0: not said)
     uint32_t wanted_buffers = 0, wanted_blocks = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
+    // (an explicit-sync layout it offers besides: SPA_PARAM_BUFFERS_metaType SyncTimeline, two more blocks; used for a producer that allocates)
+    struct SyncLayout {
+      bool offered = false;
+      uint32_t buffers = 0, blocks = 0, size = 0, stride = 0, types = 0;
+    } sync_layout;
+    bool wants_sync_release = false;     // (its SyncTimeline Meta asks for the RELEASE feature)
+    // Explicit sync (a producer that allocates, with SPA_META_SyncTimeline and two SyncObj blocks a buffer after its data): its timelines, buffer i's
+    // acquire at 2 i and release at 2 i + 1.
+    bool sync = false;
+    List<Fd> timelines;
     struct Meta {
       uint32_t type = 0, size = 0, offset = 0;      // offset: in each buffer's part
     };
@@ -278,6 +288,14 @@ class NativeServer final : public IProtocolServer {
   void publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts, const VideoFrame* shared = nullptr);
   bool fill_input(ClientNode& n, ClientPort& p);
   bool fill_shared(ClientNode& n, ClientPort& p);      // (a watcher of shared buffers: the newest frame's buffer, no copy)
+  // (a producer whose buffers are shared) its frame in buffer `id`: taken when it is ready (its acquire point reached, or the GPU done with it), else
+  // held until it is (check_pending at each tick); a buffer handed back, its release point signalled.
+  bool consume_shared(ClientNode& n, ClientPort& p, int32_t status, uint32_t id);
+  bool frame_ready(ClientPort& p, uint32_t id);
+  void take_shared_frame(ClientNode& n, ClientPort& p, uint32_t id);
+  void check_pending(ClientNode& n, ClientPort& p);
+  uint32_t pick_back(ClientPort& p);      // (the oldest buffer taken that nobody holds; kIdInvalid: none)
+  void signal_release(ClientPort& p, uint32_t id);
   void share_buffers(ClientNode& n, ClientPort& p);    // (a producer that allocated: its buffers shared with the watchers that can take them)
   // (a watcher) whether it should be given other buffers: the shared ones it has went, or its producer's are shared now and it takes them as they are
   static bool watcher_share_changed(const ClientPort& p, VideoChannel& channel);

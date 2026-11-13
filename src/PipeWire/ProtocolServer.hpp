@@ -46,6 +46,18 @@ class Descriptor {
   virtual bool gpu() const { return false; }
   virtual bool sync_from_gpu() { return false; }
   virtual bool sync_to_gpu() { return false; }
+  // (a GPU image) whether the GPU is done drawing it, so it can be read or handed on as it is (true when not known).
+  virtual bool gpu_ready() { return true; }
+  // A timeline a client handed over (explicit sync: a DRM sync object's timeline, on this system an export of /dev/dxg's fences): its value now, and
+  // raising it to `point`. False when this is no such timeline.
+  virtual bool timeline_value(uint64_t* out) {
+    (void)out;
+    return false;
+  }
+  virtual bool timeline_signal(uint64_t point) {
+    (void)point;
+    return false;
+  }
 
  protected:
   Descriptor() = default;

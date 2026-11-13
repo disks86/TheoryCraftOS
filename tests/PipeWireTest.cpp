@@ -1831,10 +1831,26 @@ struct FakeGpuFd final : Descriptor {
     copy = image;
     return true;
   }
+  bool ready = true;      // (false: the GPU still draws it)
+  bool gpu_ready() override { return ready; }
   int to_gpu = 0;
   bool sync_to_gpu() override {
     ++to_gpu;
     image = copy;
+    return true;
+  }
+};
+// A timeline (a DRM sync object's, explicit sync): its value, and the points it was signalled to.
+struct FakeTimeline final : Descriptor {
+  uint64_t value = 0;
+  std::vector<uint64_t> signalled;
+  ByteView memory() override { return ByteView(); }
+  bool signal() override { return false; }
+  uint64_t take_signals() override { return 0; }
+  bool timeline_value(uint64_t* out) override { *out = value; return true; }
+  bool timeline_signal(uint64_t point) override {
+    signalled.push_back(point);
+    if (point > value) value = point;
     return true;
   }
 };
@@ -4786,6 +4802,277 @@ static void test_client_node_media() {
     w.take_with_fds();
     c.take_with_fds();
     maker.gpu = false;
+  }
+  // ---- explicit sync: a DMA-BUF camera that offers a SyncTimeline layout (three blocks: its image, its acquire and its release timelines) is given it,
+  // with the RELEASE feature it asks for; a frame whose acquire point is not reached is held (not shown, not dropped) until it is, the server promises
+  // the release (clears UNSCHEDULED_RELEASE) and signals each buffer's release point when it goes back. Without explicit sync, a DMA-BUF the GPU still
+  // draws is held the same way. A producer the server drives gets the buffers it shared back on the cycles it gives nothing.
+  {
+    auto sync_buffers = [&](NativeClient& cl, uint32_t node, const std::vector<Fd>& images, const std::vector<Fd>& acquire, const std::vector<Fd>& release) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(int32_t(images.size()));
+      for (size_t k = 0; k < images.size(); ++k) {
+        b.int32(3);
+        b.id(3); b.fd(int64_t(3 * k)); b.int32(9); b.int32(0); b.int32(512);
+        b.id(5); b.fd(int64_t(3 * k + 1)); b.int32(3); b.int32(0); b.int32(0);
+        b.id(5); b.fd(int64_t(3 * k + 2)); b.int32(3); b.int32(0); b.int32(0);
+      }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(node); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++cl.seq); msg.put32(uint32_t(3 * images.size()));
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (size_t k = 0; k < images.size(); ++k) { list.push_back(images[k]); list.push_back(acquire[k]); list.push_back(release[k]); }
+      server.receive_with_fds(cl.handle, msg.view(), list);
+    };
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    NodeView sc;
+    sc.id = 40;
+    create_node(c, 40, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "sync-camera"}});
+    node_update(c, 40);
+    set_active(c, 40, true);
+    c.send(40, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    sc.absorb(c);
+    c.send(40, 3, [](pod::Builder& b) {
+      b.int32(1); b.int32(0); b.int32(1); b.int32(4);
+      {      // the sync layout: 3 blocks, depending on SyncTimeline metadata
+        const uint64_t o = b.begin_object(0x40004, 5);
+        b.property(1); b.int32(3); b.property(2); b.int32(3); b.property(3); b.int32(512); b.property(4); b.int32(128);
+        b.property(6); { const uint64_t ch = b.begin_choice(4, pod::kInt); b.choice_value32(1u << 3); b.end(ch); }
+        b.property(7, 1u << 3); b.int32(1 << 9);
+        b.end(o);
+      }
+      buffers_param(b, 3, 512, 128, 1u << 3);      // (the plain one)
+      meta_param(b, 1, 32);
+      {
+        const uint64_t o = b.begin_object(0x40005, 6);
+        b.property(1); b.id(9); b.property(2); b.int32(24); b.property(3); b.int32(1);
+        b.end(o);
+      }
+      b.none();
+    });
+    sc.absorb(c);
+    NodeView::PortView& scp = sc.ports[{1, 0}];
+    CHECK(scp.use && scp.flags == 1 && scp.bufs.size() == 3);
+    bool layout = scp.bufs.size() == 3;
+    uint32_t sync_at = 0;
+    for (const NodeView::Buf& bf : scp.bufs) {
+      layout &= bf.datas.size() == 3 && bf.datas[1].type == (1u << 5) && bf.datas[2].type == (1u << 5);
+      bool timeline = false, feature = false;
+      uint32_t at = 0;
+      for (const auto& m : bf.metas) {
+        if (m.first == 9 && m.second == 24) { timeline = true; sync_at = at; }
+        feature |= m.first == ((9u << 16) | 1) && m.second == 0;
+        at += (m.second + 7) & ~7u;
+      }
+      layout &= timeline && feature;
+    }
+    CHECK(layout);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    std::vector<SharedPointer<FakeTimeline>> acq, rel;
+    std::vector<Fd> fi, fa, fr;
+    for (int k = 0; k < 3; ++k) {
+      img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+      acq.push_back(SharedPointer<FakeTimeline>::make(A));
+      rel.push_back(SharedPointer<FakeTimeline>::make(A));
+      fi.push_back(Fd(img.back())); fa.push_back(Fd(acq.back())); fr.push_back(Fd(rel.back()));
+    }
+    sync_buffers(c, 40, fi, fa, fr);
+    sc.absorb(c);
+    CHECK(sc.errors == 0 && sc.starts == 1);
+    NodeView sw;
+    sw.id = 41;
+    create_node(w, 41, {{"media.class", "Stream/Input/Video"}, {"target.object", "sync-camera"}});
+    node_update(w, 41);
+    set_active(w, 41, true);
+    w.send(41, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    sw.absorb(w);
+    w.send(41, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    sw.absorb(w);
+    CHECK(sw.starts == 1 && sw.ports[{0, 0}].bufs.size() == 3);
+    auto sframe = [&](uint32_t buffer, uint64_t point) {
+      ByteView part = sc.buffer(1, 0, buffer);
+      put_u32(part, sync_at, 1);      // UNSCHEDULED_RELEASE, as pw_stream's producer sets it
+      memcpy(part.data() + sync_at + 8, &point, 8);
+      memcpy(part.data() + sync_at + 16, &point, 8);
+      uint32_t chunk_at = 0;
+      for (const auto& m : scp.bufs[buffer].metas) chunk_at += (m.second + 7) & ~7u;
+      put_u32(part, chunk_at, 0); put_u32(part, chunk_at + 4, 512); put_u32(part, chunk_at + 8, 128);
+      put_u32(sc.io(1, 0), 0, 2); put_u32(sc.io(1, 0), 4, buffer);
+    };
+    // frame 0 at point 5, its timeline at 4: held, not shown; the release promised
+    acq[0]->value = 4;
+    put_u32(sw.activation->memory(), 0, 3);
+    sframe(0, 5);
+    tick();
+    tick(40);
+    CHECK(given(sw) == 0xFFFFFFFFu && u32_at(sc.buffer(1, 0, 0), sync_at) == 0 && u32_at(sc.io(1, 0), 4) == 0xFFFFFFFFu);
+    // drawn now: shown at the next tick
+    acq[0]->value = 5;
+    tick();
+    tick(40);
+    CHECK(given(sw) == 0);
+    // frames 1 and 2 (drawn already): buffer 0, recycled by the watcher, goes back with its release point signalled
+    put_u32(sw.io(0, 0), 0, 1); put_u32(sw.io(0, 0), 4, 0);
+    put_u32(sw.activation->memory(), 0, 3);
+    acq[1]->value = 6;
+    sframe(1, 6);
+    tick();
+    tick(40);
+    CHECK(given(sw) == 1 && rel[0]->signalled.empty());
+    put_u32(sw.io(0, 0), 0, 1); put_u32(sw.io(0, 0), 4, 1);
+    put_u32(sw.activation->memory(), 0, 3);
+    acq[2]->value = 7;
+    sframe(2, 7);
+    tick();
+    CHECK(u32_at(sc.io(1, 0), 4) == 0 && rel[0]->signalled.size() == 1 && rel[0]->signalled[0] == 5);
+    tick(40);
+    CHECK(given(sw) == 2);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(41); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(40); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+  }
+  {
+    // without explicit sync: a DMA-BUF the GPU still draws is held until it is drawn
+    NodeView rc;
+    rc.id = 42;
+    create_node(c, 42, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "busy-camera"}});
+    node_update(c, 42);
+    set_active(c, 42, true);
+    c.send(42, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    rc.absorb(c);
+    c.send(42, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    rc.absorb(c);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    for (int k = 0; k < 3; ++k) img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+    {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(3);
+      for (int k = 0; k < 3; ++k) { b.int32(1); b.id(3); b.fd(k); b.int32(9); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(42); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(3);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (auto& i : img) list.push_back(Fd(i));
+      server.receive_with_fds(c.handle, msg.view(), list);
+    }
+    rc.absorb(c);
+    NodeView rw;
+    rw.id = 43;
+    create_node(w, 43, {{"media.class", "Stream/Input/Video"}, {"target.object", "busy-camera"}});
+    node_update(w, 43);
+    set_active(w, 43, true);
+    w.send(43, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    rw.absorb(w);
+    w.send(43, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    rw.absorb(w);
+    CHECK(rc.starts == 1 && rw.starts == 1 && rw.ports[{0, 0}].bufs.size() == 3);
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    img[0]->ready = false;
+    ByteView part = rc.buffer(1, 0, 0);
+    put_u32(part, 32, 0); put_u32(part, 36, 512); put_u32(part, 40, 128);
+    put_u32(rc.io(1, 0), 0, 2); put_u32(rc.io(1, 0), 4, 0);
+    put_u32(rw.activation->memory(), 0, 3);
+    tick();
+    tick(40);
+    CHECK(given(rw) == 0xFFFFFFFFu && img[0]->syncs == 0);
+    img[0]->ready = true;
+    tick();
+    tick(40);
+    CHECK(given(rw) == 0);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(43); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(42); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+  }
+  {
+    // a camera the server drives, its memfds shared with a watcher that takes memfds only; the watcher goes holding two of them: the camera gets them
+    // back on the cycles it gives nothing (the io has room then)
+    NodeView dc;
+    dc.id = 44;
+    create_node(c, 44, {{"media.class", "Video/Source"}, {"node.name", "driven-camera"}});
+    node_update(c, 44);
+    set_active(c, 44, true);
+    c.send(44, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    dc.absorb(c);
+    c.send(44, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 2); meta_param(b, 1, 32); b.none(); });
+    dc.absorb(c);
+    std::vector<Fd> mem;
+    for (int k = 0; k < 3; ++k) mem.push_back(Fd::make_as<FakeFd>(A, 512, false));
+    {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(3);
+      for (int k = 0; k < 3; ++k) { b.int32(1); b.id(2); b.fd(k); b.int32(11); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(44); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(3);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& m : mem) list.push_back(m);
+      server.receive_with_fds(c.handle, msg.view(), list);
+    }
+    dc.absorb(c);
+    NodeView dw;
+    dw.id = 45;
+    create_node(w, 45, {{"media.class", "Stream/Input/Video"}, {"target.object", "driven-camera"}});
+    node_update(w, 45);
+    set_active(w, 45, true);
+    w.send(45, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    dw.absorb(w);
+    w.send(45, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 2); b.none(); });
+    dw.absorb(w);
+    CHECK(dc.starts == 1 && dw.starts == 1 && dw.ports[{0, 0}].bufs.size() == 3 && dw.mem_types[uint32_t(dw.ports[{0, 0}].bufs[0].datas[0].data)] == 2);
+    SharedPointer<VideoChannel> dch = g.video_of(dc.node);
+    VideoShare* sh = dch && dch->share() ? dch->share().get() : nullptr;
+    CHECK(sh && sh->attached == 1 && sh->data_type == 2);
+    auto dframe = [&](uint32_t buffer) {
+      ByteView part = dc.buffer(1, 0, buffer);
+      put_u32(part, 32, 0); put_u32(part, 36, 512); put_u32(part, 40, 128);
+      put_u32(dc.io(1, 0), 0, 2); put_u32(dc.io(1, 0), 4, buffer);
+    };
+    // frames 0 and 1, the watcher holding both (it recycles nothing)
+    for (uint32_t f = 0; f < 2; ++f) {
+      dframe(f);
+      put_u32(dw.io(0, 0), 0, 1); put_u32(dw.io(0, 0), 4, 0xFFFFFFFFu);
+      put_u32(dw.activation->memory(), 0, 3);
+      for (int t = 0; t < 10; ++t) {
+        put_u32(dc.activation->memory(), 0, 3);      // (its cycle finished: what it gave is taken)
+        tick(10);
+        if (u32_at(dc.io(1, 0), 0) != 2) break;
+      }
+    }
+    int held = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) held += sh->taken[i];
+    CHECK(held == 2);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(45); });
+    tick();
+    CHECK(sh && sh->attached == 0);
+    // cycles with nothing from the camera: one back each
+    std::vector<uint32_t> back;
+    for (int t = 0; t < 30 && back.size() < 2; ++t) {
+      put_u32(dc.io(1, 0), 0, 1); put_u32(dc.io(1, 0), 4, 0xFFFFFFFFu);
+      put_u32(dc.activation->memory(), 0, 3);
+      tick(10);
+      const uint32_t id = u32_at(dc.io(1, 0), 4);
+      if (id != 0xFFFFFFFFu) back.push_back(id);
+    }
+    held = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) held += sh->taken[i];
+    CHECK(back.size() == 2 && held == 0);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(44); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
   }
   // a port_buffers for a port that was not asked to allocate is refused
   {

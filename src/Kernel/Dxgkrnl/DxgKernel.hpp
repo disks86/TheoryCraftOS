@@ -107,6 +107,8 @@ const ExportInfo& export_info(const ExportedAllocation& exported);
 // queued on it is done first; false while some waits for a fence, or when the image cannot be read. (The CPU's copy of a mapped dmabuf, Process/DxgBufferFile.hpp:
 // what process::set_dxg_buffer_copier is given.)
 bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+// Whether the GPU is done with an export's image (no work queued on it is left): what it holds can be read now.
+bool export_idle(ExportedAllocation& exported);
 
 // A fence handed out of its process as a descriptor (a Linux DRM sync object's timeline: /dev/dxg's TCOS_DXG_IOCTL_EXPORT_SYNC, what a Wayland client passes in
 // wp_linux_drm_syncobj_manager_v1.import_timeline). It holds the fence on its own, any process can import it, and the kernel can read and raise its value
@@ -239,6 +241,7 @@ class Kernel {
  private:
   friend class ExportedAllocation;
   friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+  friend bool export_idle(ExportedAllocation& exported);
   friend class ExportedSync;
   friend uint64_t exported_sync_value(ExportedSync& exported);
   friend void signal_exported_sync(ExportedSync& exported, uint64_t point);
