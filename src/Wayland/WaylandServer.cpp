@@ -366,11 +366,11 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       g.i(m.x).i(m.y).i(m.w * 254 / 960).i(m.h * 254 / 960).i(0).string("TheoryCraftOS").string("Display").i(0);
       send(c, g);
       Event mode(object, 1);
-      mode.u(3).i(m.w).i(m.h).i(60000);      // current | preferred, 60 Hz
+      mode.u(3).i(m.w * static_cast<int32_t>(output_scale_)).i(m.h * static_cast<int32_t>(output_scale_)).i(60000);      // current | preferred, 60 Hz, in device pixels
       send(c, mode);
       if (version >= 2) {
         Event scale(object, 3);
-        scale.i(1);
+        scale.i(static_cast<int32_t>(output_scale_));      // (HiDPI: the desktop's device pixels per unit)
         send(c, scale);
       }
       if (version >= 4) {
@@ -462,7 +462,7 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         nr->surface = s;
         if (r.version >= 6) {      // (version 6: the scale and transform the client should draw with: the output's)
           Event scale(object, 2);
-          scale.i(1);
+          scale.i(static_cast<int32_t>(output_scale_));      // (HiDPI: the desktop's device scale)
           send(c, scale);
           Event transform(object, 3);
           transform.u(0);

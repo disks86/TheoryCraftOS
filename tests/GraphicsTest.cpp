@@ -23,6 +23,7 @@
 #include <string.h>
 #include <vector>
 #include "Utility/AllocatedView.hpp"
+#include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Raster2D.hpp"
@@ -2072,12 +2073,90 @@ static void test_mipmaps() {
   t.device.destroy_image(rgba);
 }
 
+// HiDPI (ScaledRenderer2D): a scene drawn through the decorator at scale k is the 1x scene with every pixel a k x k block (rectangles, outlines,
+// upright lines, text, images, masks, clips); the extent is the device's over k; pixel_scale and device() name the device; read_frame gives the 1x frame.
+static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskView& mask) {
+  r.set_blend(BlendMode::Replace);
+  r.clear(0xFF101010);
+  r.fill_rect({2, 3, 10, 6}, 0xFFFF0000);
+  r.draw_rect({14, 2, 9, 7}, 0xFF00FF00);
+  r.draw_line(1, 20, 30, 20, 0xFF0000FF);
+  r.draw_line(25, 10, 25, 30, 0xFFFFFF00);
+  r.put_pixel(31, 31, 0xFFFFFFFF);
+  r.draw_text(2, 22, "Hi \xC3\xA9", 0xFFFFFFFF);
+  r.draw_image(image, {1, 1, 4, 3}, 36, 4);
+  r.set_blend(BlendMode::Alpha);
+  r.draw_mask(mask, {0, 0, mask.width, mask.height}, 40, 20, 0xFF00FFFF);
+  r.set_clip({44, 0, 4, 40});
+  r.fill_rect({40, 0, 20, 40}, 0xFFFF00FF);
+  r.reset_clip();
+  CHECK(r.push_clip_rect({50, 30, 3, 3}));
+  r.fill_rect({48, 28, 10, 10}, 0xFF808080);
+  r.pop_clip();
+}
+static void test_scaled_2d() {
+  TestAllocator a;
+  Surface image = make_surface(a, 6, 5);
+  for (uint32_t i = 0; i < 30; ++i) image.pixels[i] = 0xFF000000u | (i * 0x080402u);
+  uint8_t coverage[3 * 4] = {255, 0, 255, 0, 255, 0, 255, 255, 255, 0, 0, 255};
+  MaskView mask;
+  mask.coverage = ConstByteView(coverage, sizeof coverage);
+  mask.width = 3;
+  mask.height = 4;
+  mask.pitch = 3;
+  constexpr uint32_t W = 64, H = 40;
+  Surface one = make_surface(a, W, H);
+  SoftwareRenderer2D r1(one, nullptr, &a);
+  draw_scaled_scene(r1, image, mask);
+  for (uint32_t k = 2; k <= 3; ++k) {
+    Surface big = make_surface(a, W * k, H * k);
+    SoftwareRenderer2D device(big, nullptr, &a);
+    ScaledRenderer2D scaled(a, device, k);
+    CHECK(scaled.extent().width == W && scaled.extent().height == H && scaled.pixel_scale() == k && &scaled.device() == &device);
+    draw_scaled_scene(scaled, image, mask);
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < H * k; ++y)
+      for (uint32_t x = 0; x < W * k; ++x)
+        if (px(big, x, y) != px(one, x / k, y / k)) ++wrong;
+    CHECK(wrong == 0);
+    if (wrong) printf("scale %u: %u pixels differ\n", k, wrong);
+    // read_frame: the logical frame
+    List<uint32_t> frame(a);
+    for (uint32_t i = 0; i < W * H; ++i) frame.push_back(0);
+    if (device.read_frame(ArrayView<uint32_t>()) || true) {
+      const bool read = scaled.read_frame(frame.view());
+      if (read) {
+        bool same = true;
+        for (uint32_t y = 0; y < H; ++y) for (uint32_t x = 0; x < W; ++x) same &= frame[y * W + x] == px(one, x, y);
+        CHECK(same);
+      }
+    }
+    // a transformed image and a group translate in device pixels
+    Matrix2D m = scaled.up(Matrix2D{1, 0, 0, 1, 3, 4});
+    CHECK(m.a == float(k) && m.e == float(3 * k) && m.f == float(4 * k));
+    Matrix2D g = scaled.conjugate(Matrix2D{2, 0, 0, 2, 1, 1});
+    CHECK(g.a == 2 && g.e == float(k) && g.f == float(k));
+    release_view(a, big.pixels);
+  }
+  // scale 1 is the device itself; a bad scale is clamped
+  SoftwareRenderer2D plain(one, nullptr, &a);
+  ScaledRenderer2D same(a, plain, 1);
+  CHECK(same.extent().width == W && same.pixel_scale() == 1);
+  ScaledRenderer2D clamped(a, plain, 99);
+  CHECK(clamped.scale() == ScaledRenderer2D::kMaxScale);
+  ScaledRenderer2D zero(a, plain, 0);
+  CHECK(zero.scale() == 1);
+  release_view(a, one.pixels);
+  release_view(a, image.pixels);
+}
+
 int main() {
   test_stencil();
   test_textures();
   test_mipmaps();
   test_math();
   test_2d();
+  test_scaled_2d();
   test_3d();
   test_device_2d();
   test_device_2d_large_image();

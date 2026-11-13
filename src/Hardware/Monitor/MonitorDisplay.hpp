@@ -41,7 +41,10 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
 
   // Sets where everything goes: the enabled monitors of `layout` (rectangle and scale) and where each one's pixels are on the surface
   // (`physical`, `count` entries, matched by the monitors' ids). False (nothing changes) if a monitor has no place on the surface or memory ran out.
-  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count);
+  // `render_scale` (HiDPI): the desktop's pictures are that many times the layout's size in each direction (the desktop draws at the largest whole
+  // scale of its monitors, SystemMonitors::render_scale): a monitor whose scale is render_scale x 100 % shows them 1:1, one at another scale resampled.
+  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_scale = 1);
+  uint32_t render_scale() const { return render_scale_; }
   // True when copying is not a plain pass-through (a scaled monitor or monitors not laid out like their pixels).
   bool scaling() const { return scaling_; }
 
@@ -70,7 +73,8 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
     int32_t lx = 0, ly = 0;                    // the monitor's rectangle on the desktop
     uint32_t lw = 0, lh = 0;
     uint32_t px = 0, py = 0, pw = 0, ph = 0;   // its pixels on the surface
-    uint32_t scale = 100;
+    uint32_t scale = 100;                      // percent of the layout; `unit` (100 x render scale) is what shows 1:1
+    uint32_t unit = 100;
     uint32_t* xmap = nullptr;                  // for each pixel column / row of the monitor, the column / row of the desktop (relative to lx / ly)
     uint32_t* ymap = nullptr;
   };
@@ -86,6 +90,7 @@ class MonitorDisplay final : public IGraphicsProcessingUnit {
   uint32_t row_capacity_ = 0;
   uint32_t width_ = 0, height_ = 0;
   bool scaling_ = false;
+  uint32_t render_scale_ = 1;
 };
 
 }  // namespace hardware

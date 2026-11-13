@@ -188,6 +188,8 @@ class Server final : public desktop::IWindowsSession {
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
+  // HiDPI: the window on a renderer in device pixels (`scale` per unit): a buffer the client made at that scale (wl_surface.set_buffer_scale) lands 1:1.
+  bool draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) override;
   void move_window(uint32_t window, const desktop::WindowsRect& rect) override;
   void activate_window(uint32_t window) override;
   void window_command(uint32_t window, Command command) override;
@@ -522,7 +524,7 @@ class Server final : public desktop::IWindowsSession {
   static void unviewported(const BufferInfo& b, const BufferMapping& m, float* w, float* h);
   static bool surface_to_buffer(const BufferInfo& b, const BufferMapping& m, float sx, float sy, float* bx, float* by);
   bool check_mapping(Client& c, Surface& s, const State& state);      // (commit: the scale and viewport rules; false: an error was posted)
-  void draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y);
+  void draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t scale = 1);      // (scale: device pixels per unit)
   void viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   // --- the other protocols (WaylandExtras.cpp): activation, cursor shapes, the primary selection, relative pointer and constraints, presentation time,
   // idle inhibitors, xdg-foreign; and the window manager's pings
@@ -557,7 +559,10 @@ class Server final : public desktop::IWindowsSession {
   Change* change_of(uint32_t window);
   void note_changed(Surface& s);
   void note_repaint(Surface& s, const Rect& dirty);
-  void draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done);
+  void draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done, uint32_t scale = 1);
+  bool draw_window_at(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height);
+  void announce_scale();      // the output scale changed: outputs, fractional scales and preferred buffer scales say so
+  uint32_t output_scale_ = 1;
 
   // --- input (WaylandInput.cpp)
   Surface* surface_at(int32_t x, int32_t y, int32_t* local_x, int32_t* local_y);

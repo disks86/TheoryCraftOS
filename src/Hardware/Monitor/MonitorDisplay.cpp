@@ -30,7 +30,8 @@ void MonitorDisplay::release() {
   count_ = 0;
 }
 
-bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count) {
+bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_scale) {
+  const uint32_t k = render_scale < 1 ? 1 : render_scale > 4 ? 4 : render_scale;
   Entry fresh[MonitorLayout::kMaxMonitors];
   uint32_t n = 0;
   uint64_t map_words = 0;
@@ -45,20 +46,21 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
       if (physical[k].connector == s.id) place = &physical[k];
     if (!place || n >= MonitorLayout::kMaxMonitors || place->width == 0 || place->height == 0) return false;
     Entry& e = fresh[n++];
-    e.lx = s.rect.x;
-    e.ly = s.rect.y;
-    e.lw = s.rect.width;
-    e.lh = s.rect.height;
+    e.lx = s.rect.x * static_cast<int32_t>(k);      // (in the desktop's pictures: the layout times the render scale)
+    e.ly = s.rect.y * static_cast<int32_t>(k);
+    e.lw = s.rect.width * k;
+    e.lh = s.rect.height * k;
+    e.unit = 100 * k;
     e.px = place->x;
     e.py = place->y;
     e.pw = place->width;
     e.ph = place->height;
     e.scale = s.scale_percent ? s.scale_percent : 100;
-    if (e.scale != 100 || e.lx != static_cast<int32_t>(e.px) || e.ly != static_cast<int32_t>(e.py) || e.lw != e.pw || e.lh != e.ph) scaling = true;
-    if (e.scale != 100) map_words += uint64_t{e.pw} + e.ph;
+    if (e.scale != e.unit || e.lx != static_cast<int32_t>(e.px) || e.ly != static_cast<int32_t>(e.py) || e.lw != e.pw || e.lh != e.ph) scaling = true;
+    if (e.scale != e.unit) map_words += uint64_t{e.pw} + e.ph;
     if (e.pw > widest) widest = e.pw;
-    if (s.rect.right() > right) right = s.rect.right();
-    if (s.rect.bottom() > bottom) bottom = s.rect.bottom();
+    if (e.lx + static_cast<int32_t>(e.lw) > right) right = e.lx + static_cast<int32_t>(e.lw);
+    if (e.ly + static_cast<int32_t>(e.lh) > bottom) bottom = e.ly + static_cast<int32_t>(e.lh);
   }
   if (n == 0) return false;
   uint32_t* maps = map_words ? static_cast<uint32_t*>(allocator_.allocate(map_words * sizeof(uint32_t))) : nullptr;
@@ -71,13 +73,15 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
   uint32_t* next = maps;
   for (uint32_t i = 0; i < n; ++i) {
     Entry& e = fresh[i];
-    if (e.scale == 100) continue;
+    if (e.scale == e.unit) continue;
     e.xmap = next;
     next += e.pw;
     e.ymap = next;
     next += e.ph;
-    for (uint32_t x = 0; x < e.pw; ++x) e.xmap[x] = static_cast<uint32_t>(uint64_t{x} * 100 / e.scale);   // (the column the pixel shows)
-    for (uint32_t y = 0; y < e.ph; ++y) e.ymap[y] = static_cast<uint32_t>(uint64_t{y} * 100 / e.scale);
+    for (uint32_t x = 0; x < e.pw; ++x) e.xmap[x] = static_cast<uint32_t>(uint64_t{x} * e.unit / e.scale);   // (the column the pixel shows)
+    for (uint32_t y = 0; y < e.ph; ++y) e.ymap[y] = static_cast<uint32_t>(uint64_t{y} * e.unit / e.scale);
+    for (uint32_t x = 0; x < e.pw; ++x) if (e.xmap[x] >= e.lw) e.xmap[x] = e.lw - 1;      // (never past the monitor's part of the picture)
+    for (uint32_t y = 0; y < e.ph; ++y) if (e.ymap[y] >= e.lh) e.ymap[y] = e.lh - 1;
   }
   release();
   maps_ = maps;
@@ -88,6 +92,7 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
   width_ = static_cast<uint32_t>(right);
   height_ = static_cast<uint32_t>(bottom);
   scaling_ = scaling;
+  render_scale_ = k;
   return true;
 }
 
@@ -99,15 +104,18 @@ void MonitorDisplay::blit(uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh, co
     const int64_t ix0 = x0 > e.lx ? x0 : e.lx, iy0 = y0 > e.ly ? y0 : e.ly;
     const int64_t ix1 = x1 < int64_t{e.lx} + e.lw ? x1 : int64_t{e.lx} + e.lw, iy1 = y1 < int64_t{e.ly} + e.lh ? y1 : int64_t{e.ly} + e.lh;
     if (ix1 <= ix0 || iy1 <= iy0) continue;
-    if (e.scale == 100) {   // one copy
+    if (e.scale == e.unit) {   // one copy
       gpu_.blit(e.px + static_cast<uint32_t>(ix0 - e.lx), e.py + static_cast<uint32_t>(iy0 - e.ly), static_cast<uint32_t>(ix1 - ix0), static_cast<uint32_t>(iy1 - iy0),
                 pixels + (iy0 - y0) * pitch + (ix0 - x0), pitch);
       continue;
     }
-    // Enlarged: the monitor's pixel columns / rows that show the desktop columns / rows of the rectangle (see update(): pixel p shows floor(p * 100 / scale)).
+    // Resampled: the monitor's pixel columns / rows that show the desktop columns / rows of the rectangle (see update(): pixel p shows floor(p * unit / scale)).
     const int64_t rx0 = ix0 - e.lx, rx1 = ix1 - e.lx, ry0 = iy0 - e.ly, ry1 = iy1 - e.ly;
-    int64_t pxa = (rx0 * e.scale + 99) / 100, pxb = (rx1 * e.scale + 99) / 100;
-    int64_t pya = (ry0 * e.scale + 99) / 100, pyb = (ry1 * e.scale + 99) / 100;
+    const int64_t u = e.unit;
+    int64_t pxa = (rx0 * e.scale + u - 1) / u, pxb = (rx1 * e.scale + u - 1) / u;
+    int64_t pya = (ry0 * e.scale + u - 1) / u, pyb = (ry1 * e.scale + u - 1) / u;
+    if (rx1 == int64_t{e.lw}) pxb = e.pw;      // (the last columns and rows, which update() points at the edge of the picture)
+    if (ry1 == int64_t{e.lh}) pyb = e.ph;
     if (pxb > e.pw) pxb = e.pw;
     if (pyb > e.ph) pyb = e.ph;
     if (pxb <= pxa || pyb <= pya) continue;
