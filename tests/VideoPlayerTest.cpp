@@ -27,6 +27,8 @@
 #include "Video/AviFile.hpp"
 #include "Video/AviWriter.hpp"
 #include "Video/VideoPlayer.hpp"
+#include "Media/ByteSource.hpp"
+#include <vector>
 
 using namespace hardware;
 using namespace video;
@@ -416,6 +418,85 @@ static void test_player_streams() {
   CHECK(a.live == 0);
 }
 
+// MPEG-4 Part 2 and H.263 in MP4, 3GP and AVI files (made with ffmpeg, see scripts/gen_mpeg4_decoder_streams.sh): every
+// picture, reached by seeking in any order, is the reference decode of its frame (an MPEG-4 stream with B planes: the pictures in display order).
+static std::vector<uint8_t> read_data(const char* name) {
+  char path[256];
+  snprintf(path, sizeof path, "tests/data/%s", name);
+  std::vector<uint8_t> bytes;
+  FILE* f = fopen(path, "rb");
+  if (!f) return bytes;
+  uint8_t chunk[4096];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+  fclose(f);
+  return bytes;
+}
+
+static void test_player_mpeg4_h263() {
+  struct Case {
+    const char* file;
+    const char* ref;
+    uint32_t w, h;
+  };
+  const Case cases[] = {{"player_mpeg4.mp4", "m4vdec_bframes.yuv", 96, 64}, {"player_mpeg4.avi", "m4vdec_bframes.yuv", 96, 64},
+                        {"player_h263.3gp", "player_h263.yuv", 128, 96},    {"player_h263.avi", "player_h263.yuv", 128, 96}};
+  for (const Case& c : cases) {
+    TestAllocator a;
+    {
+      const std::vector<uint8_t> file = read_data(c.file), ref = read_data(c.ref);
+      CHECK(!file.empty() && !ref.empty());
+      NoPci pci;
+      hardware::SystemVideoCodecs codecs(pci, a);
+      codecs.initialize();
+      FakeClock clock;
+      VideoPlayer player(clock, codecs, a);
+      media::MemoryByteSource source(ConstByteView(file.data(), file.size()));
+      const OpenResult opened = player.open_media(source);
+      CHECK(opened == OpenResult::Ok && player.frame_count() == 8 && player.frame_width() == c.w && player.frame_height() == c.h);
+      if (opened != OpenResult::Ok) {
+        printf("  %s: open result %d\n", c.file, static_cast<int>(opened));
+        continue;
+      }
+      const size_t frame_bytes = size_t{c.w} * c.h * 3 / 2;
+      VideoFrameBuffer expected(a);
+      CHECK(expected.allocate({c.w, c.h, PixelFormat::Bgra8888}));
+      const uint32_t order[] = {0, 3, 1, 7, 5, 2, 6, 4, 0};
+      const int64_t step = player.duration_us() / 8;
+      for (uint32_t f : order) {
+        player.seek(step * f + step / 2);
+        CHECK(player.current_frame() == f);
+        VideoFrame in;
+        in.format = {c.w, c.h, PixelFormat::I420};
+        const uint8_t* y = ref.data() + f * frame_bytes;
+        in.plane[0] = y;
+        in.plane[1] = y + c.w * c.h;
+        in.plane[2] = y + c.w * c.h * 5 / 4;
+        in.stride[0] = c.w;
+        in.stride[1] = in.stride[2] = c.w / 2;
+        in.limited_range = true;
+        CHECK(convert_frame(in, expected));
+        const VideoFrame want = expected.frame();
+        const graphics::Surface* got = player.picture();
+        int worst = 0;
+        for (uint32_t r = 0; got && r < c.h; ++r)
+          for (uint32_t x = 0; x < c.w; ++x) {
+            const uint32_t g = got->row(r)[x];
+            const uint8_t* e = want.plane[0] + r * want.stride[0] + x * 4;
+            for (int k = 0; k < 3; ++k) {
+              const int d = abs(static_cast<int>((g >> (8 * k)) & 0xFF) - e[k]);
+              if (d > worst) worst = d;
+            }
+          }
+        if (worst > 2) printf("  %s frame %u: difference %d\n", c.file, f, worst);
+        CHECK(got && worst <= 2);
+      }
+      player.close();
+    }
+    CHECK(a.live == 0);
+  }
+}
+
 int main() {
   test_avi_roundtrip();
   test_avi_keyframes();
@@ -423,6 +504,7 @@ int main() {
   test_player_formats();
   test_player_with_audio();
   test_player_streams();
+  test_player_mpeg4_h263();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video player tests passed\n");
   return 0;

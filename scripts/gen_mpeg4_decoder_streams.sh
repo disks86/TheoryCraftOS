@@ -49,7 +49,7 @@ h263 ip -g 8 -qscale:v 4
 h263 q  -g 4 -qscale:v 14
 # H.263 version 2 (PLUSPTYPE), custom size: unrestricted vectors (D), advanced intra coding (I) with modified quantisation (T), the deblocking filter (J),
 # slices (K), the alternative inter VLC (S)
-ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$(src 112x80)" -frames:v $n -c:v h263p -g 8 -qscale:v 5 -umv 1 -aiv 1 \
+ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$(src 112x80)" -frames:v $n -c:v h263p -threads 1 -g 8 -qscale:v 5 -umv 1 -aiv 1 \
   -flags +aic+loop -structured_slices 1 -ps 300 -f rawvideo "$out/h263dec_plus.h263"
 INFMT="-f h263" ref "$out/h263dec_plus.h263"
 # Advanced prediction (F: four vectors, overlapped motion compensation): version 1, and version 2 with D, I, K, S - checked against the encoder (see above)
@@ -66,4 +66,13 @@ ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$(src 128x96)" -fra
 # Data partitioning with reversible VLCs: no encoder writes them; a synthetic stream (scripts/gen_mpeg4_rvlc_stream.py), decoded by FFmpeg
 python3 scripts/gen_mpeg4_rvlc_stream.py > /dev/null
 ref "$out/m4vdec_rvlc.m4v"
+# The player's files (tests/VideoPlayerTest.cpp): the MPEG-4 stream with B planes remuxed into MP4 and AVI; H.263 encoded straight into 3GP and AVI (a remux of
+# the raw H.263 stream would mark every picture a key frame)
+ffmpeg -nostdin -hide_banner -loglevel error -y -r 25 -i "$out/m4vdec_bframes.m4v" -c copy "$out/player_mpeg4.mp4"
+ffmpeg -nostdin -hide_banner -loglevel error -y -r 25 -i "$out/m4vdec_bframes.m4v" -c copy -vtag XVID "$out/player_mpeg4.avi"
+for ext in 3gp avi; do
+  ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i "$(src 128x96)" -frames:v $n -c:v h263 -g 8 -qscale:v 4 "$out/player_h263.$ext"
+done
+ref "$out/player_h263.3gp"
+cmp -s "$out/player_h263.yuv" <(ffmpeg -nostdin -hide_banner -loglevel error -cpuflags 0 -flags bitexact -idct simple -threads 1 -i "$out/player_h263.avi" -f rawvideo -pix_fmt yuv420p -)
 ls -l $out/m4vdec_* $out/h263dec_* | awk '{print $5, $9}'

@@ -88,7 +88,8 @@ OpenResult VideoPlayer::finish_avi() {
   decoder_ = codecs_.create_decoder(config);
   if (!decoder_) return OpenResult::NoDecoder;
   // (Streams whose pictures come out in another order than their packets - B pictures - are read as a sequence.)
-  if ((info.codec == VideoCodec::H264 || info.codec == VideoCodec::Mpeg4) && !seq_build_avi()) {
+  // (So are those with predicted pictures, which need the pictures before them.)
+  if ((info.codec == VideoCodec::H264 || info.codec == VideoCodec::Mpeg4 || info.codec == VideoCodec::H263) && !seq_build_avi()) {
     release();
     return OpenResult::OutOfMemory;
   }
