@@ -39,6 +39,7 @@
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/VideoViewer.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/CalendarStore.hpp"
 #include "Desktop/Todo.hpp"
@@ -222,6 +223,10 @@ class Desktop {
   Notepad* open_text_editor(gui::TabFrame* into = nullptr);
   // Opens a calculator window: the first one is calculator() (when that is closed), further ones are made as needed and go away when closed.
   Calculator* open_calculator(gui::TabFrame* into = nullptr);
+  // The Video Viewer (its sources the kernel's: set_video_sources, which must outlive the desktop or be set back to null).
+  void open_video_viewer();
+  void set_video_sources(IVideoSources* sources) { video_viewer_.set_sources(sources); }
+  VideoViewer& video_viewer() { return video_viewer_; }
   Calculator& calculator() { return calculator_; }
   uint32_t calculator_count() const;
   // Opens a calendar window: the first one is calendar() (when that is closed), further ones are made as needed and go away when closed.
@@ -364,6 +369,7 @@ class Desktop {
   static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
   static void on_computer_manager(void* self, gui::Control&);
+  static void on_video_viewer(void* self, gui::Control&);
   static void tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers);
   static void tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y);
   static void on_explorer(void* self, gui::Control&);
@@ -429,6 +435,7 @@ class Desktop {
   PrintDialog print_dialog_;
   FileExplorer explorer_;
   ComputerManager computer_manager_;
+  VideoViewer video_viewer_;
   Win32Windows win32_windows_;
   Win32Windows x11_windows_;      // (the X server's windows: see set_x11_session)
   Win32Windows wayland_windows_;  // (the Wayland compositor's windows: see set_wayland_session)

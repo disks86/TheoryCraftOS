@@ -41,6 +41,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/VideoViewer.hpp"
 #include "Desktop/Todo.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/FileProperties.hpp"
@@ -2653,7 +2654,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 16);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 17);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, Paint, Media Player, Video Viewer, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -6681,6 +6682,78 @@ static void test_spreadsheet_app() {
   CHECK(a.live == 0);
 }
 
+// The Video Viewer: its list follows the sources, it watches the one picked (only while open), shows its pictures fitted, and says when the source
+// went or cannot be shown.
+static void test_video_viewer() {
+  TestAllocator a;
+  {
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    struct FakeSources final : desktop::IVideoSources {
+      std::vector<std::pair<uint32_t, std::string>> list = {{5, "Fake Webcam"}, {9, "Screen"}};
+      uint32_t watching = 0;
+      int watches = 0;
+      uint64_t frame = 0;
+      bool encoded = false;
+      uint32_t source_count() override { return uint32_t(list.size()); }
+      bool source(uint32_t index, uint32_t* id, String* name) override {
+        if (index >= list.size()) return false;
+        *id = list[index].first;
+        name->assign(StringView(list[index].second.c_str()));
+        return true;
+      }
+      bool watch(uint32_t id) override {
+        ++watches;
+        watching = id;
+        return id == 0 || id == 5 || id == 9;
+      }
+      bool latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* width, uint32_t* height, StringView* why) override {
+        *why = StringView();
+        if (encoded) { *why = "Encoded video (not shown)"; return false; }
+        if (!watching || frame <= *sequence) return false;
+        *sequence = frame;
+        const uint32_t w = watching == 5 ? 64 : 32, h = 16;
+        pixels->clear();
+        for (uint32_t i = 0; i < w * h; ++i) pixels->push_back(0xFF000000u | watching);
+        *width = w;
+        *height = h;
+        return true;
+      }
+    } sources;
+    d.set_video_sources(&sources);
+    CHECK(d.start_button().menu().item_count() == 17);
+    d.open_video_viewer();
+    desktop::VideoViewer& v = d.video_viewer();
+    CHECK(v.manager() && v.source_list().item_count() == 2 && v.source_list().selected_index() == 0 && sources.watching == 5);
+    sources.frame = 1;
+    d.pump(2000000);
+    CHECK(v.picture_width() == 64 && v.picture_height() == 16 && v.pictures() == 1 && v.status() == StringView("64 x 16"));
+    d.pump(2010000);
+    CHECK(v.pictures() == 1);      // (nothing new)
+    v.source_list().set_selected_index(1);
+    CHECK(sources.watching == 9);
+    sources.frame = 2;
+    d.pump(2020000);
+    CHECK(v.picture_width() == 32 && v.pictures() == 2);
+    sources.encoded = true;
+    d.pump(2030000);
+    CHECK(v.status() == StringView("Encoded video (not shown)"));
+    sources.encoded = false;
+    // the source watched goes: it says so and watches nothing
+    sources.list.pop_back();
+    d.pump(4000000);
+    CHECK(v.source_list().item_count() == 1 && v.status() == StringView("The source went"));
+    // closed: it watches nothing more
+    v.source_list().set_selected_index(0);
+    CHECK(sources.watching == 5);
+    v.close();
+    d.pump(4100000);
+    CHECK(!v.manager() && sources.watching == 0);
+    d.set_video_sources(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
 // The calculator: arithmetic from the keypad and the keyboard, and the same tab behavior as the other programs (Start menu, "+", dragging out and
 // between windows, session).
 static void test_calculator() {
@@ -8600,6 +8673,7 @@ static void test_web_browser_tabs() {
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
+  test_video_viewer();
   test_data_grid();
   test_window_rests();
   test_title_buttons();

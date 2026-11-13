@@ -496,6 +496,15 @@ SharedPointer<VideoChannel> Graph::video_of(uint32_t node_id) {
   return node && node->type == ObjectType::Node ? node->video : SharedPointer<VideoChannel>();
 }
 
+bool Graph::video_producers(List<uint32_t>* out) {
+  out->clear();
+  kernel::ScopedMutex guard(mutex_);
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node && o->role == NodeRole::VideoStream && o->direction_of_node == kDirectionOutput && o->video && !out->push_back(o->id))
+      return false;
+  return true;
+}
+
 uint32_t Graph::video_watchers(uint32_t producer) {
   kernel::ScopedMutex guard(mutex_);
   GraphObject* node = find_locked(producer);

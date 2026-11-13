@@ -37,6 +37,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
 #include "PipeWire/ScreenSource.hpp"
+#include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/VideoConvert.hpp"
 #include "PipeWire/Pod.hpp"
@@ -2385,6 +2386,63 @@ static void test_screen_source() {
   CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
 }
 
+// The kernel's own watcher (the Video Viewer's): the producers listed, one watched by a node of the kernel's (so a camera would start), its frames as
+// 0xAARRGGBB words, converted from YUV, encoded video and a producer that went said so.
+static void test_video_watcher() {
+  Graph g(A, nullptr);
+  CHECK(g.initialize());
+  ScreenSource screen(g, A);
+  CHECK(screen.start());
+  const uint32_t client = g.add_client(Origin::Native, 1, "native", "camera-app");
+  Properties props(A);
+  props.set("node.name", "app-camera");
+  props.set("media.class", "Video/Source");
+  SharedPointer<VideoChannel> cam;
+  const uint32_t camera = g.create_video_node(client, props, kDirectionOutput, &cam);
+  CHECK(camera && cam);
+  VideoWatcher w(g, A);
+  List<uint32_t> ids(A);
+  CHECK(w.producers(&ids) && ids.count() == 2 && ids[0] == screen.node() && ids[1] == camera);
+  String name(A);
+  CHECK(w.name_of(screen.node(), &name) && name.view() == StringView("Screen") && w.name_of(camera, &name) && name.view() == StringView("app-camera"));
+  CHECK(!w.watch(client) && w.watch(screen.node()) && g.video_watchers(screen.node()) == 1 && g.video_watchers(camera) == 0);
+  uint64_t seq = 0;
+  List<uint32_t> px(A);
+  uint32_t width = 0, height = 0;
+  StringView why;
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why.empty());      // (nothing yet)
+  ArrayView<uint32_t> f = screen.frame_wanted(4, 2, 1000000);
+  CHECK(f.size() == 8);
+  for (uint32_t i = 0; i < 8; ++i) f[i] = 0xFF102030u + i;
+  screen.frame_read(4, 2, 0);
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && width == 4 && height == 2 && px.count() == 8 && px[3] == 0xFF102033u && seq == 1);
+  CHECK(!w.latest(&seq, &px, &width, &height, &why));      // (not newer)
+  // the camera, in I420 (grey: Y 126 is mid grey)
+  CHECK(w.watch(camera) && g.video_watchers(screen.node()) == 0 && g.video_watchers(camera) == 1);
+  VideoFormat i420;
+  i420.format = 2; i420.width = 4; i420.height = 2;
+  cam->set_format(i420);
+  std::vector<uint8_t> yuv(8 + 2 + 2, 128);
+  for (int i = 0; i < 8; ++i) yuv[size_t(i)] = 126;
+  CHECK(cam->publish(ConstByteView(yuv.data(), 8), 4, 0) == false);      // (one plane is not enough)
+  const VideoPlaneData planes[3] = {{ConstByteView(yuv.data(), 8), 4}, {ConstByteView(yuv.data() + 8, 2), 2}, {ConstByteView(yuv.data() + 10, 2), 2}};
+  CHECK(cam->publish(ArrayView<const VideoPlaneData>(planes, 3), 0));
+  seq = 0;
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && px.count() == 8);
+  if (px.count() == 8) CHECK((px[0] >> 24) == 0xFF && abs(int((px[0] >> 16) & 0xFF) - 128) < 4 && abs(int(px[0] & 0xFF) - 128) < 4);
+  // encoded: said, not shown
+  VideoFormat mjpg;
+  mjpg.subtype = 0x20002;
+  cam->set_format(mjpg);
+  const uint8_t jpeg[4] = {0xFF, 0xD8, 0xFF, 0xD9};
+  CHECK(cam->publish(ConstByteView(jpeg, 4), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video (not shown)"));
+  // the producer goes
+  g.destroy_node(camera);
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("The source went"));
+  CHECK(w.watch(0) && w.watching() == 0);
+}
+
 // ---- the AF_UNIX transport -----------------------------------------------------------------------------------------------------------------------
 
 struct SystemSync final : process::ISystemSync {
@@ -4315,6 +4373,7 @@ int main() {
   test_windows_virtual_sink();
   test_camera_sources();
   test_screen_source();
+  test_video_watcher();
   test_record_convert();
   test_record();
   test_record_threads();

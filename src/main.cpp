@@ -32,6 +32,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
 #include "PipeWire/ScreenSource.hpp"
+#include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
@@ -2171,6 +2172,32 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       ~ScreenTapGuard() { w.set_frame_tap(nullptr); }      // (before the source goes)
     } screen_tap_guard{desktop.window()};
     if (screen_source.start()) desktop.window().set_frame_tap(&screen_tap);
+    // The desktop's Video Viewer watches the graph's video producers through the kernel's own watcher.
+    pipewire::VideoWatcher video_watcher(media_graph, shared_allocator);
+    struct ViewerSources final : desktop::IVideoSources {
+      pipewire::VideoWatcher& w;
+      allocators::IAllocator& a;
+      List<uint32_t> ids;
+      ViewerSources(pipewire::VideoWatcher& watcher, allocators::IAllocator& alloc) : w(watcher), a(alloc), ids(alloc) {}
+      uint32_t source_count() override {
+        w.producers(&ids);
+        return static_cast<uint32_t>(ids.count());
+      }
+      bool source(uint32_t index, uint32_t* id, String* name) override {
+        if (index >= ids.count()) return false;
+        *id = ids[index];
+        return w.name_of(ids[index], name);
+      }
+      bool watch(uint32_t id) override { return w.watch(id); }
+      bool latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* width, uint32_t* height, StringView* why) override {
+        return w.latest(sequence, pixels, width, height, why);
+      }
+    } viewer_sources(video_watcher, shared_allocator);
+    struct ViewerGuard {
+      desktop::Desktop& d;
+      ~ViewerGuard() { d.set_video_sources(nullptr); }      // (before the watcher goes)
+    } viewer_guard{desktop};
+    desktop.set_video_sources(&viewer_sources);
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);

@@ -48,6 +48,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       print_dialog_(allocator),
       explorer_(allocator),
       computer_manager_(allocator),
+      video_viewer_(allocator),
       win32_windows_(allocator),
       x11_windows_(allocator),
       wayland_windows_(allocator),
@@ -117,6 +118,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("To-Do", {&Desktop::on_todo, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
+  start_.menu().add_item("Video Viewer", {&Desktop::on_video_viewer, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
   start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});
   start_.menu().add_separator();
@@ -1095,6 +1097,16 @@ void Desktop::open_about() {
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
 
 void Desktop::on_computer_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_computer_manager(); }
+void Desktop::on_video_viewer(void* self, Control&) { static_cast<Desktop*>(self)->open_video_viewer(); }
+
+void Desktop::open_video_viewer() {
+  if (video_viewer_.manager()) {
+    video_viewer_.activate();
+  } else {
+    video_viewer_.update(now_us_);
+    windows_.add_window(&video_viewer_);
+  }
+}
 void Desktop::on_paint(void* self, Control&) { static_cast<Desktop*>(self)->open_paint(); }
 void Desktop::on_media_player(void* self, Control&) { static_cast<Desktop*>(self)->open_media_player(); }
 void Desktop::on_graphics_test(void* self, Control&) { static_cast<Desktop*>(self)->open_graphics_test(); }
@@ -1273,6 +1285,9 @@ void Desktop::pump(uint64_t uptime_us) {
     polled_quarter_ = quarter;
     if (bluetooth_properties_.manager()) bluetooth_properties_.update();
   }
+  // the Video Viewer shows the newest picture while it is open, and watches nothing once closed
+  if (video_viewer_.manager()) video_viewer_.update(uptime_us);
+  else video_viewer_.stop_watching();
   if (second != polled_second_) {
     polled_second_ = second;
     if (network_properties_.manager()) network_properties_.update();

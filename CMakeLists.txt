@@ -236,6 +236,7 @@ add_executable(BOOTX64
   src/PipeWire/VideoConvert.cpp
   src/PipeWire/CameraSource.cpp
   src/PipeWire/ScreenSource.cpp
+  src/PipeWire/VideoWatcher.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp
@@ -602,6 +603,7 @@ add_executable(BOOTX64
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
   src/Desktop/Calculator.cpp
+  src/Desktop/VideoViewer.cpp
   src/Desktop/Calendar.cpp
   src/Desktop/CalendarStore.cpp
   src/Desktop/Todo.cpp

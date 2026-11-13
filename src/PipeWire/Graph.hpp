@@ -190,6 +190,8 @@ class Graph {
   uint32_t create_video_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<VideoChannel>* channel);
   // How many watchers a video producer has (input video nodes linked to it).
   uint32_t video_watchers(uint32_t producer);
+  // The video producers there are now (output video nodes: the cameras, the screen, programs' cameras and screen shares), oldest first.
+  bool video_producers(List<uint32_t>* out);
   bool link_video(uint32_t node, SharedPointer<VideoChannel>* channel);
   SharedPointer<VideoChannel> video_of(uint32_t node);
 
