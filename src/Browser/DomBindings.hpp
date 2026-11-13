@@ -174,6 +174,9 @@ class IDomHost {
   // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
   // May be called on a worker thread, several at a time (asynchronous requests run in parallel).
   virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
+  // The text of a classic script that script put into the document (<script src> without crossorigin): fetched the way the parser fetches one, without
+  // CORS (a script of another site that sends no Access-Control-Allow-Origin still runs) and through the page's service worker. False if it failed.
+  virtual bool fetch_classic_script(StringView address, String* text) { (void)address; (void)text; return false; }
   // An answer that http_request() returned reaches the script (always on the script thread): what has to be done on that thread (Clear-Site-Data of storage).
   virtual void http_answered(const NetResponse& response) { (void)response; }
   // The origin of the page ("https://example.com", or "null" for a file or a page without an address).

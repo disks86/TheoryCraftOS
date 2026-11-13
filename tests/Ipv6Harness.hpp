@@ -100,6 +100,7 @@ struct DnsServer {
   std::string name;
   Ipv4Address a = kAnyAddress;
   Ipv6Address aaaa = kIpv6Any;
+  bool sinkhole = false;   // answer 0.0.0.0 and :: for the name, as an ad-blocking DNS server does for a blocked one
   uint32_t queries = 0, aaaa_queries = 0;
   DnsServer(INetworkStack& stack, const char* served) : socket(stack.udp_open(53)), name(served) {}
   std::vector<uint8_t> wire_name() const {
@@ -131,15 +132,16 @@ struct DnsServer {
       const bool known = n == 12 + wanted.size() + 4 && !memcmp(q + 12, wanted.data(), wanted.size());
       r[2] = 0x81;
       r[3] = known ? 0x80 : 0x83;
-      const bool has = type == 28 ? !aaaa.is_unspecified() : !a.is_unspecified();
+      const bool has = sinkhole || (type == 28 ? !aaaa.is_unspecified() : !a.is_unspecified());
       if (known && has) {
         r[7] = 1;
         const uint8_t head[] = {0xC0, 12, 0, (uint8_t)type, 0, 1, 0, 0, 0, 60, 0, (uint8_t)(type == 28 ? 16 : 4)};
         r.insert(r.end(), head, head + sizeof head);
         if (type == 28) {
-          r.insert(r.end(), aaaa.bytes, aaaa.bytes + 16);
+          const Ipv6Address six = sinkhole ? kIpv6Any : aaaa;
+          r.insert(r.end(), six.bytes, six.bytes + 16);
         } else {
-          const uint32_t v = a.value();
+          const uint32_t v = sinkhole ? 0 : a.value();
           const uint8_t b4[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
           r.insert(r.end(), b4, b4 + 4);
         }
