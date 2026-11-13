@@ -503,6 +503,7 @@ uint64_t swp_step(Call& call, Op& op) {
       }
       refresh_window_dcs(w);      // (device contexts held by the program follow the window)
       if (redirected(w)) sync_surface(w);      // (a redirected top-level's surface follows its size)
+      if (Window* t = top_level_of(w); t && redirected(t)) mixed_tree_changed(t);      // (mixed DPI children follow the tree: painted again where they are)
       notify_top_level(w);
       // paint bookkeeping: what the window covered or now covers must be redrawn (a redirected top-level that only moved needs nothing: the desktop composites it)
       const Rect new_screen = window_rect_screen(w);

@@ -27,6 +27,7 @@
 namespace process::win32k::user {
 
 namespace {
+State& S() { return state(); }
 uint32_t g_device_scale = 100;      // (percent)
 }  // namespace
 
@@ -93,6 +94,151 @@ void set_device_scale_from_desktop(uint32_t scale) {
     LockGuard g;
     post_message(hwnd, 0x112 /* WM_SYSCOMMAND */, kScTcosDpi, packed);
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Mixed DPI hosting. With SetThreadDpiHostingBehavior(DPI_HOSTING_BEHAVIOR_MIXED) a thread may put a child of one awareness into a window of another; as
+// on Windows, the system scales it on its own. Such a child (a "mixed child") gets a surface of its own in its coordinates, which its tree's DCs draw
+// on; whenever it or the top-level's surface under it changes, win32k scales its pixels into the top-level's surface (nearest sampling: up for an
+// unaware child of an aware window, down for the other way). With default hosting a child takes the awareness of the tree it is in.
+
+Window* dpi_drawing_root(Window* w) {
+  for (Window* x = w; x && x->parent; x = x->parent) {
+    if (x->dpi_mixed) return x;
+    if (!x->parent->parent) return x;      // (the top-level)
+  }
+  return w;
+}
+
+bool adopt_tree_awareness(Window* w, Window* parent, bool mixed_allowed) {
+  Window* root = dpi_drawing_root(parent);
+  if (!root) return true;
+  if (w->dpi_virtual == root->dpi_virtual) {
+    if (w->dpi_mixed) drop_mixed_surface(w);
+    w->dpi_mixed = false;
+    return true;
+  }
+  if (!mixed_allowed) {
+    if (w->parent) return false;      // (an existing window, SetParent: refused)
+    w->dpi_virtual = root->dpi_virtual;      // (a new child, not linked yet: it is of the tree's awareness)
+    w->dpi_context = root->dpi_context;
+    w->dpi_mixed = false;
+    return true;
+  }
+  w->dpi_mixed = true;
+  return true;
+}
+
+namespace {
+
+// A mixed child's surface rectangle: its window rectangle, in its own units.
+Rect mixed_rect_units(const Window* m) {
+  const Rect r = window_rect_screen(m);
+  const uint32_t k = window_scale(m);
+  return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.left, k) + graphics::device_to_units_up(r.right - r.left, k),
+          dpi_down(r.top, k) + graphics::device_to_units_up(r.bottom - r.top, k)};
+}
+
+template <typename F>
+void each_window_in(Window* w, F&& f) {
+  f(w);
+  for (Window* c = w->first_child; c; c = c->next) each_window_in(c, f);
+}
+
+// The part `area` (top-level surface coordinates) of mixed child m's pixels, scaled into the top-level's surface, inside what of m shows there.
+void composite_mixed(Window* m, Window* top, const Rect& area) {
+  if (!m->child_surface || !top->surface || !is_visible(m)) return;
+  uint32_t mw = 0, mh = 0, tw = 0, th = 0;
+  const ArrayView<uint32_t> src = gdi::window_surface_pixels(m->child_surface, &mw, &mh);
+  const ArrayView<uint32_t> dst = gdi::window_surface_pixels(top->surface, &tw, &th);
+  if (src.empty() || dst.empty()) return;
+  const uint32_t kt = window_scale(top), km = window_scale(m);
+  const Rect torigin = surface_rect_in_window_units(top);      // (the top-level's surface (0, 0), in its units on the screen)
+  const Rect mr = window_rect_screen(m);
+  List<Rect> shows(S().alloc);      // what of m shows, in the top-level's surface coordinates
+  if (!visible_region(m, false, false, true, &shows)) return;
+  for (const Rect& v0 : shows.view()) {
+    Rect v = rect_offset(dpi_cover(v0, kt), -torigin.left, -torigin.top);
+    v = rect_intersect(v, area);
+    v = rect_intersect(v, Rect{0, 0, int32_t(tw), int32_t(th)});
+    if (rect_empty(v)) continue;
+    for (int32_t y = v.top; y < v.bottom; ++y) {
+      const int32_t py = dpi_up(y + torigin.top, kt);      // (the device row of the top-level's pixel)
+      const int32_t sy = dpi_down(py - mr.top, km);
+      if (sy < 0 || sy >= int32_t(mh)) continue;
+      for (int32_t x = v.left; x < v.right; ++x) {
+        const int32_t px = dpi_up(x + torigin.left, kt);
+        const int32_t sx = dpi_down(px - mr.left, km);
+        if (sx < 0 || sx >= int32_t(mw)) continue;
+        dst[uint64_t(y) * tw + uint64_t(x)] = src[uint64_t(sy) * mw + uint64_t(sx)];
+      }
+    }
+  }
+}
+
+}  // namespace
+
+void sync_mixed_surface(Window* m) {
+  if (!m || !m->dpi_mixed) return;
+  Window* top = top_level_of(m);
+  if (!top || !redirected(top)) return;
+  const Rect r = mixed_rect_units(m);
+  const uint32_t w = uint32_t(r.right - r.left), h = uint32_t(r.bottom - r.top);
+  if (!is_visible(m) || w == 0 || h == 0) return;
+  if (m->child_surface == 0) {
+    m->child_surface = gdi::create_window_surface(m->handle, w, h);
+  } else {
+    uint32_t cw = 0, ch = 0;
+    if (gdi::window_surface_size(m->child_surface, &cw, &ch) && cw == w && ch == h) return;
+    gdi::resize_window_surface(m->child_surface, w, h);
+  }
+  each_window_in(m, [](Window* x) { refresh_window_dcs(x); });
+  each_window_in(m, [](Window* x) { if (is_visible(x)) { invalidate_window(x, nullptr, true); x->nc_paint_pending = true; } });
+}
+
+void drop_mixed_surface(Window* m) {
+  if (!m || m->child_surface == 0) return;
+  gdi::destroy_window_surface(m->child_surface);
+  m->child_surface = 0;
+  each_window_in(m, [](Window* x) { refresh_window_dcs(x); });
+}
+
+void mixed_tree_changed(Window* top) {
+  if (!top) return;
+  each_window_in(top, [](Window* x) {
+    if (x->dpi_mixed && is_visible(x)) {
+      sync_mixed_surface(x);
+      invalidate_window(x, nullptr, true);      // (it paints again, which puts it into the top-level's surface where it now is)
+    }
+  });
+}
+
+int32_t window_dpi_hosting(uint32_t hwnd) {
+  const Window* w = state_or_null() ? find_window(hwnd) : nullptr;
+  return w ? w->dpi_hosting : -1;
+}
+
+bool mixed_damage_locked(uint32_t window, const gdi::Rect& dirty, uint32_t* top_out, gdi::Rect* top_dirty) {
+  if (!state_or_null()) return false;
+  Window* w = find_window(window);
+  if (!w) return false;
+  if (w->dpi_mixed && w->child_surface) {      // the mixed child drew: its pixels into the top-level's surface
+    Window* top = top_level_of(w);
+    if (!top || !top->surface) return false;
+    const uint32_t kt = window_scale(top), km = window_scale(w);
+    const Rect torigin = surface_rect_in_window_units(top);
+    const Rect mr = window_rect_screen(w);
+    const Rect device{dpi_up(dirty.left, km) + mr.left, dpi_up(dirty.top, km) + mr.top, dpi_up(dirty.right, km) + mr.left, dpi_up(dirty.bottom, km) + mr.top};
+    const Rect area = rect_offset(dpi_cover(device, kt), -torigin.left, -torigin.top);
+    composite_mixed(w, top, area);
+    *top_out = top->handle;
+    *top_dirty = area;
+    return true;
+  }
+  if (w->parent && !w->parent->parent && w->surface) {      // the top-level drew: its mixed children go back over what it drew
+    each_window_in(w, [&](Window* x) { if (x != w && x->dpi_mixed) composite_mixed(x, w, dirty); });
+  }
+  return false;
 }
 
 }  // namespace process::win32k::user

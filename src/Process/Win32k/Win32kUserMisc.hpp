@@ -135,6 +135,7 @@ struct ThreadRecord {
   bool cursor_set = false;            // SetCursor was called since the pointer last came into one of the thread's windows (else the window's class cursor shows)
   uint32_t dpi_context = 0;           // SetThreadDpiAwarenessContext; 0 = follows the process
   bool mouse_in_pointer = false;
+  uint8_t dpi_hosting = 0;            // SetThreadDpiHostingBehavior: 0 default (children take their parent's DPI awareness), 1 mixed
 };
 ProcessRecord* process_record(uint64_t pid);                 // made on first use
 ProcessRecord* find_process_record(uint64_t pid);
@@ -142,7 +143,8 @@ ThreadRecord* thread_record(uint64_t tid, uint64_t pid);     // made on first us
 ThreadRecord* find_thread_record(uint64_t tid);
 // The DPI awareness a thread works with (its own context, else its process's): 0 unaware (also when never set), 1 system aware, 2 per-monitor aware.
 uint32_t dpi_awareness(uint64_t tid, uint64_t pid);
-uint32_t dpi_context_of(uint64_t tid, uint64_t pid);      // the NTUSER_DPI context it works with (0x6010, unaware, when none was set)
+uint32_t dpi_context_of(uint64_t tid, uint64_t pid);
+uint32_t dpi_hosting(uint64_t tid);                        // the thread's DPI hosting behavior (0 default, 1 mixed)      // the NTUSER_DPI context it works with (0x6010, unaware, when none was set)
 uint32_t first_layout_of_system();
 void thread_forget(uint64_t tid);                            // the thread ended
 uint32_t set_thread_dpi_context(Call& call, uint32_t context);      // SetThreadDpiAwarenessContext: the previous context, 0 for an invalid one

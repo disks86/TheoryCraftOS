@@ -497,6 +497,12 @@ EXPORT BOOL WINAPI InjectTouchInput(UINT32 count, const void *contacts) {
   if (!contacts) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return (NtUserInjectTouchInput(count, (ULONG_PTR)contacts) & 0xFFFFFFFFu) != 0;
 }
+/* DPI hosting behavior (mixed-mode DPI scaling): DPI_HOSTING_BEHAVIOR_INVALID -1, DEFAULT 0, MIXED 1. */
+#define TCOS_THREAD_DPI_HOSTING 0x7C05u
+#define TCOS_WINDOW_DPI_HOSTING 0x7C06u
+EXPORT int WINAPI SetThreadDpiHostingBehavior(int value) { return (int)(LONG)NtUserCallTwoParam(1, (ULONG_PTR)(LONG_PTR)value, TCOS_THREAD_DPI_HOSTING); }
+EXPORT int WINAPI GetThreadDpiHostingBehavior(void) { return (int)(LONG)NtUserCallTwoParam(0, 0, TCOS_THREAD_DPI_HOSTING); }
+EXPORT int WINAPI GetWindowDpiHostingBehavior(HANDLE hwnd) { return (int)(LONG)NtUserCallTwoParam((ULONG_PTR)hwnd, 0, TCOS_WINDOW_DPI_HOSTING); }
 /* WM_TOUCH (Windows 7's touch messages) */
 EXPORT BOOL WINAPI RegisterTouchWindow(HANDLE hwnd, ULONG flags) {
   if (!IsWindow(hwnd)) { SetLastError(ERROR_INVALID_WINDOW_HANDLE_); return FALSE; }

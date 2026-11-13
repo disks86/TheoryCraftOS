@@ -288,6 +288,8 @@ uint64_t nt_create_window_ex(Call& call) {
   w->owner = owner;
   w->dpi_context = user_misc::dpi_context_of(call.tid(), call.pid());
   w->dpi_virtual = thread_unaware(call) ? 1 : 0;      // (DPI virtualization: the creating thread's awareness, as on Windows)
+  w->dpi_hosting = uint8_t(user_misc::dpi_hosting(call.tid()));
+  if (as_child && parent && parent->parent) adopt_tree_awareness(w, parent, w->dpi_hosting == 1);      // (a child: the tree's awareness, unless mixed)
   if (style & wn::WS_CHILD) w->id = call.arg(10); else w->menu = call.arg(10);
   if (!(style & wn::WS_CHILD) && w->menu != 0 && !user_misc::attach_window_menu(w->handle, uint32_t(w->menu))) w->menu = 0;      // (not a menu: no menu)
   window_text_set(w, title.view());
@@ -468,6 +470,13 @@ uint64_t nt_set_parent(Call& call) {
     if (!x->owner && !x->parent) break;
   }
   if (parent == w || is_child_of(w, parent)) return call.fail(kErrorInvalidParameter);
+  // (DPI hosting: a child of another awareness than the tree it goes into only with mixed hosting; a top-level again keeps its own)
+  if ((w->style & wn::WS_CHILD) && parent->parent) {
+    if (!adopt_tree_awareness(w, parent, w->dpi_hosting == 1 || user_misc::dpi_hosting(call.tid()) == 1)) return call.fail(4317 /* ERROR_INVALID_OPERATION */);
+  } else if (w->dpi_mixed) {
+    drop_mixed_surface(w);
+    w->dpi_mixed = false;
+  }
   Queue* q = queue_of(call, true);
   (void)q;
   Op* op = op_begin(call, set_parent_step);

@@ -94,6 +94,11 @@ uint32_t dpi_context_of(uint64_t tid, uint64_t pid) {
   return context == 0 ? 0x6010u : context & ~0x80000000u;
 }
 
+uint32_t dpi_hosting(uint64_t tid) {
+  const ThreadRecord* t = find_thread_record(tid);
+  return t ? t->dpi_hosting : 0;
+}
+
 uint32_t thread_dpi(Call& call) {
   uint32_t context = 0;
   if (ThreadRecord* t = find_thread_record(call.tid())) context = t->dpi_context;

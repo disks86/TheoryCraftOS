@@ -180,6 +180,10 @@ struct Window {
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
   uint8_t dpi_virtual = 1;       // DPI virtualization (Win32kUserDpi.cpp): 0 the window works in device pixels (its thread was DPI aware), 1 in
                                  // 96-dpi units (unaware: the device scale divides what it sees)
+  bool dpi_mixed = false;        // mixed DPI hosting: a child of another awareness than the window it is in, scaled by win32k on its own (its tree
+                                 // draws on child_surface, in its coordinates, which win32k scales into the top-level's surface; Win32kUserDpi.cpp)
+  uint8_t dpi_hosting = 0;       // the hosting behavior of the thread that made it (GetWindowDpiHostingBehavior)
+  uint32_t child_surface = 0;
   bool touch_window = false;     // RegisterTouchWindow: touches come as WM_TOUCH (Win32kUserTouch.cpp)
   uint32_t touch_flags = 0;
 };
@@ -494,6 +498,14 @@ struct State {
 // multiplied by the scale, so what such a program sets it reads back unchanged. Aware threads and their windows see device pixels. With scale 1 all of
 // it is the identity.
 uint32_t device_scale();
+// Mixed DPI hosting (Win32kUserDpi.cpp). The window whose surface w's tree draws on: the nearest mixed child above (or at) w, else its top-level.
+Window* dpi_drawing_root(Window* w);
+// A child's awareness when it is made or moved under `parent`: with default hosting it takes the tree's; with mixed hosting it keeps its own and is a
+// mixed child when that differs. False when `mixed_allowed` is false and they differ (SetParent's refusal).
+bool adopt_tree_awareness(Window* w, Window* parent, bool mixed_allowed);
+void sync_mixed_surface(Window* m);                       // a mixed child's own surface follows its size (a no-op for other windows)
+void drop_mixed_surface(Window* m);
+void mixed_tree_changed(Window* top);                     // a window of the tree moved or changed: its mixed children are painted again
 Rect surface_rect_in_window_units(const Window* top);      // a redirected top-level's surface rectangle in its own coordinates (Win32kUserRedirect.cpp)
 void set_device_scale(uint32_t scale);
 uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (1 for an aware window, or with scale 1)

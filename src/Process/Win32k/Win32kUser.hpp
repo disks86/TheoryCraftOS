@@ -105,7 +105,12 @@ void top_levels(List<uint32_t>* out);                                      // th
 bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
 uint32_t top_level_surface_locked(uint32_t hwnd);
-bool top_level_dpi_aware_locked(uint32_t hwnd);                               // its surface is in device pixels (HiDPI); the caller holds the lock                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
+bool top_level_dpi_aware_locked(uint32_t hwnd);
+// Mixed DPI hosting (Win32kUserDpi.cpp): a window surface changed. When it is a mixed child's own surface, its pixels are scaled into its top-level's
+// surface and the top-level and the part of it that changed are given (true); when it is a top-level's, its mixed children are put back over it (false).
+// The caller holds the lock.
+bool mixed_damage_locked(uint32_t window, const gdi::Rect& dirty, uint32_t* top, gdi::Rect* top_dirty);
+int32_t window_dpi_hosting(uint32_t hwnd);      // GetWindowDpiHostingBehavior: 0 default, 1 mixed, -1 no such window                               // its surface is in device pixels (HiDPI); the caller holds the lock                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
 bool command_top_level(uint32_t hwnd, uint32_t sc);
 // The cursor the desktop shows over the Windows programs' windows (takes the lock): hidden (ShowCursor's counter below 0, or a program set no cursor), else `cursor`
 // (a cursor handle for cursor_picture; 0 with `system_id` for one of the system's shapes: OCR_NORMAL 32512, OCR_IBEAM 32513 ...).

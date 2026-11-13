@@ -151,7 +151,15 @@ void DesktopBridge::top_level_changed(uint32_t hwnd) {
   if (Pending* p = pending_slot(hwnd)) p->changed = true;
 }
 
-void DesktopBridge::surface_changed(uint32_t window, const gdi::Rect& dirty) {
+void DesktopBridge::surface_changed(uint32_t window0, const gdi::Rect& dirty0) {
+  uint32_t window = window0;
+  gdi::Rect dirty = dirty0;
+  uint32_t top = 0;
+  gdi::Rect top_dirty;
+  if (user::mixed_damage_locked(window0, dirty0, &top, &top_dirty)) {      // (a mixed DPI child's own surface: what changed is its top-level's)
+    window = top;
+    dirty = top_dirty;
+  }
   Pending* p = pending_slot(window);
   if (!p) return;
   if (!p->repaint) p->dirty = dirty;
