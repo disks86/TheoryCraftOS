@@ -829,11 +829,11 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
   return true;
 }
 
-bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoDecoders* decoders) {
+bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoCodecs* decoders) {
   return from.encoded() && can_decode_subtype(from.subtype, decoders) && can_convert_video(kBGRA, to);
 }
 
-bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoDecoders* decoders,
+bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoCodecs* decoders,
                   ByteBuffer* out, bool* failed) {
   *failed = false;
   if (to.encoded() || !to.valid()) {

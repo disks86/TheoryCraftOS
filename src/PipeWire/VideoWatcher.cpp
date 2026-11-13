@@ -83,11 +83,11 @@ bool VideoWatcher::latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* 
   ConstByteView bgra = frame->pixels.view();
   if (f.encoded()) {      // (decoded, its size the picture's)
     bool failed = false;
-    if (!can_decode_subtype(f.subtype, graph_.video_decoders())) {
+    if (!can_decode_subtype(f.subtype, graph_.video_codecs())) {
       *why = "Encoded video this computer cannot decode";
       return false;
     }
-    if (!decode_.decode(f.subtype, frame->pixels.view(), graph_.video_decoders(), &shown, &bgra, &failed)) {
+    if (!decode_.decode(f.subtype, frame->pixels.view(), graph_.video_codecs(), &shown, &bgra, &failed)) {
       if (failed) *why = "A picture that cannot be decoded";
       return false;
     }

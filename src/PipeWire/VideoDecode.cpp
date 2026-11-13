@@ -17,6 +17,7 @@
  */
 
 #include "PipeWire/VideoDecode.hpp"
+#include "PipeWire/VideoConvert.hpp"
 
 namespace pipewire {
 
@@ -42,14 +43,94 @@ bool codec_of_subtype(uint32_t subtype, hardware::VideoCodec* out) {
     case kSubtypeVc1: *out = hardware::VideoCodec::Vc1; return true;
     case kSubtypeVp8: *out = hardware::VideoCodec::Vp8; return true;
     case kSubtypeVp9: *out = hardware::VideoCodec::Vp9; return true;
+    case kSubtypeMpeg4: case kSubtypeXvid: *out = hardware::VideoCodec::Mpeg4; return true;      // (MPEG-4 Part 2: where a codec decodes it)
     default: return false;
   }
 }
 
-bool can_decode_subtype(uint32_t subtype, const IVideoDecoders* decoders) {
+bool can_decode_subtype(uint32_t subtype, const IVideoCodecs* decoders) {
   if (subtype == kSubtypeMjpg) return true;
   hardware::VideoCodec codec;
   return decoders && codec_of_subtype(subtype, &codec) && decoders->can_decode(codec);
+}
+
+bool can_encode_subtype(uint32_t subtype, const IVideoCodecs* codecs) {
+  hardware::VideoCodec codec;
+  if (subtype == kSubtypeMjpg) codec = hardware::VideoCodec::Mjpeg;
+  else if (!codec_of_subtype(subtype, &codec)) return false;
+  return codecs && codecs->can_encode(codec);
+}
+
+bool VideoDecodeSession::size(uint32_t* width, uint32_t* height) const {
+  if (width_ && height_) {
+    *width = width_;
+    *height = height_;
+    return true;
+  }
+  if (jpeg_ && jpeg_->width() && jpeg_->height()) {
+    *width = jpeg_->width();
+    *height = jpeg_->height();
+    return true;
+  }
+  if (!decoder_) return false;
+  const hardware::VideoFormat f = decoder_->output_format();
+  if (!f.valid()) return false;
+  *width = f.width;
+  *height = f.height;
+  return true;
+}
+
+bool picture_size(uint32_t subtype, ConstByteView frame, IVideoCodecs* codecs, allocators::IAllocator& allocator, uint32_t* width, uint32_t* height) {
+  VideoDecodeSession probe(allocator);
+  VideoFormat f;
+  ConstByteView pixels;
+  bool failed = false;
+  probe.decode(subtype, frame, codecs, &f, &pixels, &failed);
+  return probe.size(width, height) && *width >= 1 && *height >= 1 && *width <= VideoFormat::kMaxSide && *height <= VideoFormat::kMaxSide;
+}
+
+bool VideoEncodeSession::encode(const VideoFormat& from, ConstByteView frame, const VideoFormat& to, IVideoCodecs* codecs, ConstByteView* out) {
+  if (from.encoded() || !to.encoded() || !to.width || !to.height || !codecs) return false;
+  hardware::VideoCodec codec;
+  if (to.subtype == kSubtypeMjpg) codec = hardware::VideoCodec::Mjpeg;
+  else if (!codec_of_subtype(to.subtype, &codec)) return false;
+  if (!encoder_ || !(made_for_ == to)) {      // (a new encoder for another codec, size or rate: it starts with a keyframe)
+    hardware::EncoderConfig config;
+    config.codec = codec;
+    config.width = to.width;
+    config.height = to.height;
+    config.input = hardware::PixelFormat::Bgra8888;
+    config.fps_numerator = to.rate_num ? to.rate_num : 30;
+    config.fps_denominator = to.rate_den ? to.rate_den : 1;
+    config.quality = 85;
+    config.keyframe_interval = 30;      // (a keyframe a second or so: a watcher can start from one soon)
+    encoder_ = codecs->create_encoder(config);
+    made_for_ = to;
+    if (!encoder_) return false;
+  }
+  // the frame as BGRA at the watcher's size, then into the encoder
+  VideoFormat bgra;
+  bgra.format = 12;
+  bgra.width = to.width;
+  bgra.height = to.height;
+  if (!convert_video(from, frame, bgra, &bgra_)) return false;
+  hardware::VideoFrame picture;
+  picture.format = hardware::VideoFormat{to.width, to.height, hardware::PixelFormat::Bgra8888};
+  picture.plane[0] = bgra_.view().data();      // (the encoder's ABI: a plane by pointer, read during submit only)
+  picture.stride[0] = to.width * 4;
+  picture.pts_us = static_cast<int64_t>(frames_ * 1000000 * (to.rate_den ? to.rate_den : 1) / (to.rate_num ? to.rate_num : 30));
+  if (encoder_->submit(picture) != hardware::SubmitResult::Accepted) return false;
+  ++frames_;
+  hardware::VideoPacket packet;
+  bool got = false;
+  packet_.clear();
+  while (encoder_->receive(&packet)) {      // (the newest packet: one a frame from these encoders)
+    packet_.clear();
+    got = packet_.append(packet.data);
+  }
+  if (!got) return false;
+  *out = packet_.view();
+  return true;
 }
 
 bool VideoDecodeSession::take_picture(const hardware::VideoFrame& frame) {
@@ -67,7 +148,7 @@ bool VideoDecodeSession::take_picture(const hardware::VideoFrame& frame) {
   return true;
 }
 
-bool VideoDecodeSession::decode(uint32_t subtype, ConstByteView data, IVideoDecoders* decoders, VideoFormat* format, ConstByteView* pixels,
+bool VideoDecodeSession::decode(uint32_t subtype, ConstByteView data, IVideoCodecs* decoders, VideoFormat* format, ConstByteView* pixels,
                                 bool* failed) {
   *failed = false;
   if (subtype != subtype_) {      // (another codec: a new decoder)

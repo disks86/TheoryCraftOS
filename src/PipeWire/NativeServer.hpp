@@ -142,6 +142,7 @@ class NativeServer final : public IProtocolServer {
     VideoFormat source_video;      // (a watcher) its producer's format when it was negotiated: frames come in it, and are converted to `video` if it differs
     ByteBuffer converted;          // (a watcher) the last frame converted
     UniquePointer<VideoDecodeSession> decode;      // (a raw watcher of an encoded producer) its decoding, made at the first frame
+    UniquePointer<VideoEncodeSession> encode;      // (a watcher that takes compressed video, of a raw producer) its encoding
     // Zero-copy video. A producer that allocates (DMA-BUFs or memfds) shares its buffers (`share`, also its channel's); a watcher that takes that memory as
     // it is, in the producer's format, is given the producer's own descriptors (`share`: its buffer i is the producer's buffer i) and each frame's
     // buffer instead of a copy, and holds the buffers it has not recycled yet (`holds`).

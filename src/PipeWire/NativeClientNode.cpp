@@ -858,9 +858,17 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
     const uint32_t listed = v.encoded() ? 0 : enum_video_formats(p.enum_format.view(), wanted, 32);
     // (a raw watcher of an encoded producer of a known size whose frames can be decoded: offered raw, the frames decoded; the first format it lists
     // that can be made, else BGRx)
-    IVideoDecoders* decoders = graph_.video_decoders();
-    const bool decoded = v.encoded() && v.width && v.height && can_decode_subtype(v.subtype, decoders) &&
-                         enum_subtype(p.enum_format.view()) == VideoFormat::kSubtypeRaw;
+    IVideoCodecs* decoders = graph_.video_codecs();
+    const uint32_t watcher_subtype = enum_subtype(p.enum_format.view());
+    // (a compressed producer that did not say its size: what its first frame says - the watcher is negotiated once one came)
+    VideoFormat sized = v;
+    if (v.encoded() && (!v.width || !v.height) && watcher_subtype == VideoFormat::kSubtypeRaw && can_decode_subtype(v.subtype, decoders)) {
+      SharedPointer<VideoFrame> first = n.video->latest();
+      if (!first || first->pixels.size() == 0 || !picture_size(v.subtype, first->pixels.view(), decoders, allocator_, &sized.width, &sized.height))
+        return false;
+    }
+    const bool decoded = sized.encoded() && sized.width && sized.height && can_decode_subtype(v.subtype, decoders) &&
+                         watcher_subtype == VideoFormat::kSubtypeRaw;
     if (decoded) {
       const uint32_t raw_listed = enum_video_formats(p.enum_format.view(), wanted, 32);
       p.video.subtype = VideoFormat::kSubtypeRaw;
@@ -871,15 +879,26 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
           break;
         }
     }
+    // (a watcher that takes compressed video only, of a raw producer: given it encoded - Motion JPEG, H.264 - when the machine's codecs can)
+    const bool encoded_for_it = !v.encoded() && v.width && v.height && watcher_subtype != VideoFormat::kSubtypeRaw &&
+                                watcher_subtype != VideoFormat::kSubtypeDsp && can_encode_subtype(watcher_subtype, decoders);
+    if (encoded_for_it) {
+      p.video.subtype = watcher_subtype;
+      p.video.format = 0;
+      if (!p.video.rate_num) {
+        p.video.rate_num = 30;
+        p.video.rate_den = 1;
+      }
+    }
     // the size it takes: scaled to it when that is not the producer's (and the frames can be converted at all)
-    if (v.width && v.height && (!v.encoded() ? can_convert_video(v.format, v.format) : decoded)) {
+    if (sized.width && sized.height && (!v.encoded() ? can_convert_video(v.format, v.format) : decoded)) {
       uint32_t ww = 0, wh = 0;
-      watcher_size(p.enum_format.view(), v.width, v.height, &ww, &wh);
+      watcher_size(p.enum_format.view(), sized.width, sized.height, &ww, &wh);
       p.video.width = ww;
       p.video.height = wh;
     }
-    bool takes = listed == 0;
-    for (uint32_t k = 0; k < listed; ++k) takes |= wanted[k] == v.format;
+    bool takes = listed == 0 || encoded_for_it;
+    for (uint32_t k = 0; k < listed && !encoded_for_it; ++k) takes |= wanted[k] == v.format;
     for (uint32_t k = 0; k < listed && !takes; ++k)
       if (can_convert_video(v.format, wanted[k])) {
         p.video.format = wanted[k];
@@ -1649,7 +1668,8 @@ void NativeServer::renegotiate(Client& c, ClientNode& n) {
     p.buffers_sent = false;
     p.data_ready = false;
     p.wants_alloc = false;
-    p.decode = UniquePointer<VideoDecodeSession>();      // (a new stream: its decoder starts again)
+    p.decode = UniquePointer<VideoDecodeSession>();      // (a new stream: its decoder starts again, and its encoder)
+    p.encode = UniquePointer<VideoEncodeSession>();
     ByteBuffer format(allocator_);
     if (fixate_format(n, p, &format)) send_port_param(c, n, p, format.view());
     drop_port_buffers(c, p);
@@ -2020,8 +2040,16 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
         if (p.source_video.encoded()) {      // (encoded video to a raw watcher: decoded)
           if (!p.decode) p.decode = UniquePointer<VideoDecodeSession>::make(allocator_, allocator_);
           bool failed = false;
-          if (!p.decode || !decode_video(pixels, p.source_video, v, *p.decode, graph_.video_decoders(), &p.converted, &failed)) {
+          if (!p.decode || !decode_video(pixels, p.source_video, v, *p.decode, graph_.video_codecs(), &p.converted, &failed)) {
             p.video_seen = frame->sequence;      // (a frame that cannot be decoded is passed over; one the decoder holds back comes out later)
+            return false;
+          }
+        } else if (v.encoded()) {      // (raw video to a watcher that takes it compressed: encoded)
+          if (!p.encode) p.encode = UniquePointer<VideoEncodeSession>::make(allocator_, allocator_);
+          ConstByteView packet;
+          p.converted.clear();
+          if (!p.encode || !p.encode->encode(p.source_video, pixels, v, graph_.video_codecs(), &packet) || !p.converted.append(packet)) {
+            p.video_seen = frame->sequence;
             return false;
           }
         } else if (!convert_video(p.source_video, pixels, v, &p.converted)) {

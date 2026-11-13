@@ -2840,13 +2840,19 @@ static void test_format_fixtures() {
 }
 
 // The software codecs as the graph's decoders (what the kernel's SystemVideoCodecs is to it).
-struct SoftwareDecoders final : IVideoDecoders {
+struct SoftwareDecoders final : IVideoCodecs {
   hardware::SoftwareVideoCodec device{A};
   int made = 0;
   bool can_decode(hardware::VideoCodec codec) const override { return device.can_decode(codec); }
   UniquePointer<hardware::IVideoDecoder> create_decoder(const hardware::DecoderConfig& config) override {
     ++made;
     return device.create_decoder(config);
+  }
+  int encoders = 0;
+  bool can_encode(hardware::VideoCodec codec) const override { return device.can_encode(codec); }
+  UniquePointer<hardware::IVideoEncoder> create_encoder(const hardware::EncoderConfig& config) override {
+    ++encoders;
+    return device.create_encoder(config);
   }
 };
 
@@ -3190,7 +3196,7 @@ static void test_video_watcher() {
   CHECK(avc.size() == 3 && cam->publish(ConstByteView(avc[0].data(), avc[0].size()), 0, 0));
   CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video this computer cannot decode"));
   SoftwareDecoders decoders;
-  g.set_video_decoders(&decoders);
+  g.set_video_codecs(&decoders);
   uint32_t rw = 0, rh = 0;
   const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &rw, &rh);
   CHECK(want.size() == 3);
@@ -3202,7 +3208,7 @@ static void test_video_watcher() {
   }
   CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
   CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A picture that cannot be decoded"));
-  g.set_video_decoders(nullptr);
+  g.set_video_codecs(nullptr);
   // the producer goes
   g.destroy_node(camera);
   CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("The source went"));
@@ -5349,7 +5355,7 @@ static void test_client_node_media() {
       const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &aw, &ah);
       CHECK(avc.size() == 4 && want.size() == 4);
       for (int with = 0; with < 2; ++with) {
-        g.set_video_decoders(with ? &decoders : nullptr);
+        g.set_video_codecs(with ? &decoders : nullptr);
         NodeView hc;
         hc.id = 11;
         create_node(c, 11, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "h264-camera"}});
@@ -5413,7 +5419,144 @@ static void test_client_node_media() {
         w.send(0, 7, [](pod::Builder& b) { b.int32(9); });
         tick();
       }
-      g.set_video_decoders(nullptr);
+      g.set_video_codecs(nullptr);
+    }
+    // an H.264 camera that does not say its size: a raw watcher is negotiated once its first frame came, at the size the stream says (64 x 48); a raw
+    // camera (BGRA 32 x 16) and watchers that take Motion JPEG only and H.264 only: given its frames encoded, each decoding as close to the picture
+    {
+      SoftwareDecoders codecs;
+      g.set_video_codecs(&codecs);
+      const std::vector<std::vector<uint8_t>> avc = encode_h264(64, 48, 3, 30);
+      CHECK(avc.size() == 3);
+      NodeView uc;
+      uc.id = 12;
+      create_node(c, 12, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "unsized-h264"}});
+      node_update(c, 12);
+      set_active(c, 12, true);
+      c.send(12, 3, [](pod::Builder& b) {
+        b.int32(1); b.int32(0); b.int32(3); b.int32(1);
+        const uint64_t o = b.begin_object(0x40003, 3);
+        b.property(1); b.id(2); b.property(2); b.id(0x20001);
+        b.property(0x20004); b.fraction(30, 1);
+        b.end(o);
+        port_info(b, 0, {});
+      });
+      uc.absorb(c);
+      c.send(12, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 65536, 0, 0); b.none(); });
+      uc.absorb(c);
+      NodeView uw;
+      uw.id = 13;
+      create_node(w, 13, {{"media.class", "Stream/Input/Video"}, {"target.object", "unsized-h264"}});
+      node_update(w, 13);
+      set_active(w, 13, true);
+      w.send(13, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 0, 0); port_info(b, 0, {}); });
+      uw.absorb(w);
+      tick();
+      uw.absorb(w);
+      CHECK(uw.ports[{0, 0}].format.empty());      // (no frame yet: no size to say)
+      CHECK(uc.starts == 1);
+      if (uc.starts) {
+        ByteView part = uc.buffer(1, 0, 0);
+        const NodeView::Buf& bf = uc.ports[{1, 0}].bufs[0];
+        memcpy(part.data() + bf.data, avc[0].data(), avc[0].size());
+        put_u32(part, 0, 0); put_u32(part, 4, uint32_t(avc[0].size())); put_u32(part, 8, 0);
+        put_u32(uc.io(1, 0), 0, 2); put_u32(uc.io(1, 0), 4, 0);
+        tick();
+        tick();
+        uw.absorb(w);
+      }
+      VideoFormat offered;
+      {
+        pod::Parser fp(ConstByteView(uw.ports[{0, 0}].format.data(), uw.ports[{0, 0}].format.size()));
+        pod::Value fv; pod::ObjectReader o;
+        if (fp.next(&fv) && o.open(fv)) {
+          uint32_t key, fl; pod::Value v;
+          while (o.next(&key, &fl, &v)) {
+            if (key == 2) v.get_id(&offered.subtype);
+            if (key == 0x20001) v.get_id(&offered.format);
+            if (key == 0x20003 && v.body.size() >= 8) { memcpy(&offered.width, v.body.data(), 4); memcpy(&offered.height, v.body.data() + 4, 4); }
+          }
+        }
+      }
+      CHECK(offered.subtype == 1 && offered.format == 12 && offered.width == 64 && offered.height == 48);
+      c.send(0, 7, [](pod::Builder& b) { b.int32(12); });
+      w.send(0, 7, [](pod::Builder& b) { b.int32(13); });
+      tick();
+      // the raw camera and its compressed watchers
+      NodeView rc2;
+      rc2.id = 14;
+      create_node(c, 14, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "raw-for-encoders"}});
+      node_update(c, 14);
+      set_active(c, 14, true);
+      c.send(14, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 12, 32, 16); port_info(b, 0, {}); });
+      rc2.absorb(c);
+      c.send(14, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+      rc2.absorb(c);
+      CHECK(rc2.starts == 1);
+      const std::vector<uint32_t> picture = test_picture(32, 16, 0);
+      std::vector<uint8_t> bytes(picture.size() * 4);
+      memcpy(bytes.data(), picture.data(), bytes.size());
+      for (uint32_t subtype : {0x20002u, 0x20001u}) {
+        NodeView ew;
+        ew.id = 15;
+        create_node(w, 15, {{"media.class", "Stream/Input/Video"}, {"target.object", "raw-for-encoders"}});
+        node_update(w, 15);
+        set_active(w, 15, true);
+        w.send(15, 3, [subtype](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 32, 16, subtype); port_info(b, 0, {}); });
+        ew.absorb(w);
+        VideoFormat given_format;
+        {
+          pod::Parser fp(ConstByteView(ew.ports[{0, 0}].format.data(), ew.ports[{0, 0}].format.size()));
+          pod::Value fv; pod::ObjectReader o;
+          if (fp.next(&fv) && o.open(fv)) {
+            uint32_t key, fl; pod::Value v;
+            while (o.next(&key, &fl, &v)) {
+              if (key == 2) v.get_id(&given_format.subtype);
+              if (key == 0x20003 && v.body.size() >= 8) { memcpy(&given_format.width, v.body.data(), 4); memcpy(&given_format.height, v.body.data() + 4, 4); }
+            }
+          }
+        }
+        CHECK(given_format.subtype == subtype && given_format.width == 32 && given_format.height == 16);
+        w.send(15, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 262144, 0, 0); b.none(); });
+        ew.absorb(w);
+        CHECK(ew.starts == 1);
+        if (ew.starts && rc2.starts) {
+          ByteView part = rc2.buffer(1, 0, 0);
+          const NodeView::Buf& bf = rc2.ports[{1, 0}].bufs[0];
+          memcpy(part.data() + bf.data, bytes.data(), bytes.size());
+          put_u32(part, 0, 0); put_u32(part, 4, uint32_t(bytes.size())); put_u32(part, 8, 128);
+          put_u32(rc2.io(1, 0), 0, 2); put_u32(rc2.io(1, 0), 4, 0);
+          put_u32(ew.activation->memory(), 0, 3);
+          tick();
+          tick(40);
+          std::vector<uint8_t> got;
+          if (u32_at(ew.io(0, 0), 0) == 2) {
+            const uint32_t id = u32_at(ew.io(0, 0), 4);
+            ByteView epart = ew.buffer(0, 0, id);
+            uint32_t meta_bytes = 0;
+            for (const auto& m : ew.ports[{0, 0}].bufs[id].metas) meta_bytes += (m.second + 7) & ~7u;
+            const uint32_t size = u32_at(epart, meta_bytes + 4);
+            got.assign(epart.data() + ew.ports[{0, 0}].bufs[id].data, epart.data() + ew.ports[{0, 0}].bufs[id].data + size);
+          }
+          CHECK(!got.empty());
+          // decoded, close to the picture
+          uint32_t dw2 = 0, dh2 = 0;
+          const std::vector<std::vector<uint8_t>> pics =
+              reference_pictures(subtype == 0x20002 ? hardware::VideoCodec::Mjpeg : hardware::VideoCodec::H264, {got}, &dw2, &dh2);
+          CHECK(pics.size() == 1 && dw2 == 32 && dh2 == 16);
+          if (pics.size() == 1 && pics[0].size() == bytes.size()) {
+            uint64_t err = 0;
+            for (size_t k = 0; k < bytes.size(); ++k) if (k % 4 != 3) err += uint64_t(abs(int(pics[0][k]) - int(bytes[k])));
+            CHECK(err / (bytes.size() * 3 / 4) < 12);
+          }
+        }
+        w.send(0, 7, [](pod::Builder& b) { b.int32(15); });
+        tick();
+      }
+      CHECK(codecs.encoders == 2);
+      c.send(0, 7, [](pod::Builder& b) { b.int32(14); });
+      tick();
+      g.set_video_codecs(nullptr);
     }
     // a watcher that takes BGRA only, of the I420 camera: offered BGRA, given each frame converted (BT.601 limited: Y 16 black, 235 white)
     NodeView cw;

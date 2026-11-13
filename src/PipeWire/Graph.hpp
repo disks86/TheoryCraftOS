@@ -204,8 +204,8 @@ class Graph {
   void set_clock(uint64_t (*now_ns)()) { clock_.set(now_ns); }
   // Where watchers of encoded video get decoders for codecs other than Motion JPEG (the machine's video codecs); without, only Motion JPEG is
   // decoded. Set once, before the protocol servers run.
-  void set_video_decoders(IVideoDecoders* decoders) { __atomic_store_n(&decoders_, decoders, __ATOMIC_RELEASE); }
-  IVideoDecoders* video_decoders() const { return __atomic_load_n(&decoders_, __ATOMIC_ACQUIRE); }
+  void set_video_codecs(IVideoCodecs* decoders) { __atomic_store_n(&decoders_, decoders, __ATOMIC_RELEASE); }
+  IVideoCodecs* video_codecs() const { return __atomic_load_n(&decoders_, __ATOMIC_ACQUIRE); }
   // The virtual sinks there are now, oldest first; and whether a node is one.
   bool virtual_sinks(List<uint32_t>* out);
   bool is_virtual_sink(uint32_t node);
@@ -266,7 +266,7 @@ class Graph {
   allocators::IAllocator& allocator_;
   audio::AudioMixer* mixer_;
   FunctionClock clock_;
-  IVideoDecoders* decoders_ = nullptr;
+  IVideoCodecs* decoders_ = nullptr;
   audio::AudioCaptureHub* capture_;
   kernel::Mutex mutex_;
   List<UniquePointer<GraphObject>> objects_;      // in id order

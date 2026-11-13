@@ -148,12 +148,16 @@ program that records, of any kind, gets a record stream of it.
     offered its own (the fixed one, the list's first, the producer's clamped into the range). Each frame is converted and scaled
     (`VideoConvert.cpp`, through RGBA of 16 bits a component, so 10-, 12- and 16-bit formats keep their bits; BT.601 limited range worked out on
     samples scaled to 16 bits; averaged where it shrinks and bilinear where it grows), for every raw format:
-    packed RGB of 8, 16 and 10 bits a component, ARGB64, float RGBA and dsp video, planar and semi-planar YUV of 8, 10 and 12 bits (I420 ... P010,
-    NV16, NV24, NV61), packed YUV (YUY2, UYVY, YVYU, VYUY, AYUV, AYUV64) and grey. A raw watcher of an encoded producer of a known size is offered
+    every raw format spa/param/video/raw.h has: packed RGB of 8, 16 and 10 bits a component (r210 too) and the RGB8P palette, ARGB64, float RGBA
+    and dsp video, planar RGB (GBR, GBRA of 8, 10, 12 bits), planar and semi-planar YUV of 8, 10 and 12 bits in either byte order and with alpha
+    planes (I420 ... A444_10BE, YUV9, P010), the tiled NV12_64Z32, packed YUV (YUY2, UYVY, YVYU, VYUY, AYUV, AYUV64, v308, IYU2, IYU1, v210,
+    UYVP, v216) and grey; the layouts were checked against GStreamer's (tests/data/formats). A raw watcher of an encoded producer of a known size is offered
     raw when its frames can be decoded, and given each picture decoded (`VideoDecode.cpp`): Motion JPEG always (the JPEG decoder starts from the
     standard Huffman tables, which webcams' MJPEG leaves out); H.264 and H.265 (Annex B access units), MPEG-2, VC-1, VP8 and VP9 through decoder
     sessions of the machine's video codecs (`Graph::set_video_decoders`; main gives it `SystemVideoCodecs`), a picture a codec holds back coming out
-    with a later frame.
+    with a later frame. A compressed producer that does not say its size is given raw watchers once its first frame came (the size a decoder finds
+    in it). A watcher that takes only compressed video (Motion JPEG, H.264) of a raw producer is given its frames encoded by the machine's codecs
+    (`VideoEncodeSession`, `IVideoCodecs::create_encoder`: a keyframe about a second apart, the first frame one).
   - **DMA-BUF producers.** A producer that allocates its own buffers may give GPU images (`SPA_DATA_DmaBuf`) when they are exports of `/dev/dxg`:
     the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), a frame is copied out of the
     image before it is read when something needs the pixels, and a frame the GPU still draws is handed back unread.
@@ -417,9 +421,10 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   cycle and gets one back, so as many stay held as were (PipeWire's client-node has no reuse_buffer either; a producer the server drives gets them
   back on its idle cycles). The server's own DMA-BUFs are 32-bit RGB only (no YUV images: the Direct3D layer exports no planar formats) and are
   written by the CPU. Watchers are not given timelines (the server waits for the acquire point for them); a watcher's own release is not waited
-  for beyond its recycling the buffer. No tiled formats (NV12 tiles, v210) or modifiers other than linear. Encoded video is decoded only for a
-  producer whose EnumFormat gives a size (the watcher's Format needs one), and AV1, MPEG-4 Part 2 and H.263 are not decoded (SPA has no AV1
-  subtype; the others have no software decoder here); a raw producer is never encoded for an encoded watcher. `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
+  for beyond its recycling the buffer. Modifiers other than linear are passed on with shared buffers but not understood (a frame in a tiled GPU
+  layout would be read as if linear; /dev/dxg's exports are all linear). AV1 has no SPA subtype; MPEG-4 Part 2 (mpeg4, xvid) is decoded only where
+  a machine's codec does (the software one does not), H.263, DV and MPEG-TS not at all. Raw video is encoded only as Motion JPEG and H.264
+  (Baseline), the software codec's encoders. `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
   damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency. No `set_activation` peers (the server is every node's
   only peer), links made by clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
 - **Video sources and showing video.** The screen source has no cursor of its own and no damage metadata; when a program and the desktop both

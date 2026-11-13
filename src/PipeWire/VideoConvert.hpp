@@ -40,11 +40,11 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
 
 // Whether frames of `from` can be decoded and converted into raw `to`: encoded video VideoDecodeSession decodes (Motion JPEG always; the others when
 // `decoders` serves their codec) into any of the formats convert_video makes.
-bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoDecoders* decoders);
+bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoCodecs* decoders);
 // An encoded frame of `from`'s subtype as a raw frame of `to` (scaled when the picture is another size), with `session` (one per stream: it keeps the
 // decoder and its pictures). False when no picture came out: *failed says whether that is because the frame cannot be decoded (else the decoder is
 // holding it back, or memory ran out).
-bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoDecoders* decoders,
+bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoCodecs* decoders,
                   ByteBuffer* out, bool* failed);
 
 }  // namespace pipewire

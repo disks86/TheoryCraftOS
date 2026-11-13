@@ -19,7 +19,7 @@
 // The kernel watching the graph's video for itself (the desktop's Video Viewer): the producers there are, and one of them watched as a watcher
 // node of the kernel's ("tcos-video-viewer", linked to it as a program's video input would be, so a camera starts streaming), its newest frame
 // handed out as 0xAARRGGBB pixels (converted from the producer's format; encoded video decoded: Motion JPEG always, the other codecs when the graph has
-// decoders, Graph::set_video_decoders).
+// decoders, Graph::set_video_codecs).
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
