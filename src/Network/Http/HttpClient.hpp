@@ -84,6 +84,7 @@ enum class HttpError : uint8_t {
   Cancelled,
   OutOfMemory,
   WebSocketHandshake, // the server did not accept the WebSocket upgrade, or its answer broke the rules (the status, ws_handshake_status())
+  Blocked,           // the DNS server answered 0.0.0.0 / :: for the name (how ad-blocking DNS servers refuse a host): there is no server to connect to
 };
 const char* http_error_name(HttpError error);
 
@@ -207,6 +208,8 @@ class HttpClient {
 
   bool begin_connection();
   void fail(HttpError error);
+  // Why the connection failed: TLS once the TCP connection to the server was made, the network (Connect) before that.
+  HttpError socket_failure() const { return tls_socket_ && tls_socket_->reached_server() ? HttpError::Tls : HttpError::Connect; }
   void finish();
   void release_socket(bool graceful);
   void capture_tls();

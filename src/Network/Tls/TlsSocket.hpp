@@ -105,6 +105,8 @@ class TlsSocket final : public ITcpSocket {
 
   // TLS details
   bool handshake_complete() const { return state_ == St::Open || state_ == St::Closed; }
+  // The TCP connection to the server was made (the handshake started): a failure before that is the network's, not TLS's.
+  bool reached_server() const { return reached_server_; }
   TlsError error() const { return error_; }
   uint8_t alert_received() const { return alert_received_; }
   crypto::CertStatus certificate_status() const { return cert_status_; }
@@ -193,6 +195,7 @@ class TlsSocket final : public ITcpSocket {
   ByteBuffer handshake_data_;
   uint32_t handshake_pos_ = 0;   // bytes of handshake_data_ already processed
   bool pumping_ = false;
+  bool reached_server_ = false;
   network::ByteRing in_, out_;
   bool peer_closed_ = false, sent_close_ = false;
 };

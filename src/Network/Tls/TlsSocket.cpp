@@ -274,7 +274,10 @@ void TlsSocket::pump() {
   pumping_ = true;
   if (state_ == St::Connecting) {
     if (inner_->failed()) fail(TlsError::Transport, 0);
-    else if (inner_->is_connected()) start_handshake();
+    else if (inner_->is_connected()) {
+      reached_server_ = true;
+      start_handshake();
+    }
     else if (stack_.now_ms() - started_ms_ > config_.handshake_timeout_ms) fail(TlsError::Timeout, 0);
   }
   if (state_ != St::Connecting && state_ != St::Failed) {
