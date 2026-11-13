@@ -87,6 +87,14 @@ struct PlaneParams {
 };
 
 enum MvType : int { kMv16x16 = 0, kMv8x8 = 1, kMvField = 2 };
+enum BPartMode : int { kBBidirectional = 0, kBForward = 1, kBBackward = 2 };
+
+// H.263 B pictures (Annex O) and Improved PB-frames: a macroblock's own forward and backward vectors, for the prediction of its neighbours'.
+struct BVectors {
+  int16_t fw[2];
+  int16_t bw[2];
+  uint8_t has_fw, has_bw;
+};
 enum Direction : int { kForward = 1, kBackward = 2 };
 
 // A macroblock, parsed.
@@ -94,6 +102,12 @@ struct Mb {
   bool intra = false, skipped = false, ac_pred = false, field_dct = false;
   bool mcsel = false;            // predicted with the global motion of an S plane
   bool aic_left = false;         // H.263 advanced intra coding with ac_pred: predicted from the left (else from above)
+  // H.263 PB-frames (Annexes G and M): the B part of the macroblock.
+  int b_mode = 0;                // kBBidirectional (G: with the delta mvd), kBForward (M: the vector fw), kBBackward (M: PREC)
+  int mvd[2] = {};               // G: the delta vector MVD; M forward: the forward vector
+  int cbpb = 0;
+  int b_last[6] = {};
+  int16_t b_block[6][64];
   int cbp = 0;                   // bit 5: block 0, ..., bit 0: block 5
   int mv_type = kMv16x16;
   int dir = kForward;            // kForward | kBackward
@@ -131,6 +145,11 @@ class Core {
   bool decode_packet(ConstByteView data, int64_t pts);
   bool decode_mpeg4(ConstByteView data, int64_t pts);
   bool decode_h263(ConstByteView data, int64_t pts);
+  bool macroblock_h263_b(BitReader& br, Mb& mb);
+  bool h263_b_vector(BitReader& br, int dir, int* x, int* y);
+  void h263_direct(Mb& mb);
+  void reconstruct_b_part(Mb& mb);
+  int b_quant() const;
   bool decode_vop(ConstByteView body, int64_t pts);
   bool configure(int width, int height);
   bool begin_picture(int64_t pts);
@@ -144,7 +163,7 @@ class Core {
   bool macroblock_mpeg4(BitReader& br, Mb& mb);
   bool macroblock_h263(BitReader& br, Mb& mb);
   bool block_mpeg4(BitReader& br, Mb& mb, int n, bool coded, bool intra, bool use_dc_vlc);
-  bool block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra);
+  bool block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra, bool b_part = false);
   int read_vlc(BitReader& br, const Mem<uint16_t>& lut, int max_bits);
   bool read_motion(BitReader& br, int prediction, int fcode, int* value);
   void predict_motion(int block, int* px, int* py) const;
@@ -171,7 +190,7 @@ class Core {
   // --- Mpeg4Recon.cpp
   void reconstruct(Mb& mb);
   void conceal(int from, int to);
-  void motion(const Mb& mb, int dir, const Picture& ref, bool average);
+  void motion(const Mb& mb, int dir, const Picture& ref, bool average, bool truncate = false);
   void dequantize(Mb& mb, int n);
 
   allocators::IAllocator& allocator_;
@@ -221,6 +240,15 @@ class Core {
   Mem<uint16_t> lut_aic_;
   ShortHeader h263_;                     // the last H.263 picture header (a version 2 header may leave its modes out)
   bool have_h263_ = false;
+  // H.263 temporal references (8 bits, 10 with a custom picture clock): of the last picture header and of the two reference pictures.
+  int tr_last_ = -1;
+  int tr_anchor_[2] = {0, 0};
+  int trb_ = 1, trd_ = 1;                // the distances of the B part or B picture being decoded
+  int dbquant_ = 0;
+  int pb_mode_ = 0;                      // 0, 1 (Annex G), 2 (Annex M)
+  Picture* cur_b_ = nullptr;             // the B part of the PB-frame being decoded
+  int64_t pb_p_delay_us_ = 0;            // how much later the P part is shown than the B part
+  Mem<BVectors> bvec_;
   Mem<uint16_t> lut_intra_mcbpc_, lut_inter_mcbpc_, lut_cbpy_, lut_mv_, lut_dc_[2], lut_coef_[2], lut_btype_;
   uint8_t max_level_[2][2][64] = {};     // [intra / inter table][last][run]
   uint8_t max_run_[2][2][64] = {};       // [intra / inter table][last][level]

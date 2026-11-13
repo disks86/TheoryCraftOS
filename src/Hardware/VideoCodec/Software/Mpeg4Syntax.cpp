@@ -88,6 +88,12 @@ void clear_macroblock(Mb& mb) {
   for (auto& d : mb.field_select) d[0] = d[1] = 0;
   for (int& l : mb.last) l = -1;
   for (auto& b : mb.block) ArrayView<int16_t>(b).fill(0);
+  mb.aic_left = false;
+  mb.b_mode = kBBidirectional;
+  mb.mvd[0] = mb.mvd[1] = 0;
+  mb.cbpb = 0;
+  for (int& l : mb.b_last) l = -1;
+  for (auto& b : mb.b_block) ArrayView<int16_t>(b).fill(0);
 }
 
 constexpr uint16_t kResyncPrefix[8] = {0x7F00, 0x7E00, 0x7C00, 0x7800, 0x7000, 0x6000, 0x4000, 0x0000};
@@ -141,7 +147,7 @@ VideoFormat Core::output_format() const { return out_format_; }
 
 Picture* Core::find_free_picture() {
   for (Picture& p : pool_) {
-    if (p.in_use && &p != cur_ && &p != anchor_[0] && &p != anchor_[1] && &p != held_ && &p != returned_ && &p != awaiting_time_ && !p.output_pending)
+    if (p.in_use && &p != cur_ && &p != anchor_[0] && &p != anchor_[1] && &p != held_ && &p != returned_ && &p != awaiting_time_ && &p != cur_b_ && !p.output_pending)
       p.in_use = false;
   }
   for (Picture& p : pool_)
@@ -329,8 +335,10 @@ bool Core::decode_h263(ConstByteView data, int64_t pts) {
     vol_.low_delay = true;
     low_delay_ = true;
   }
+  // Version 2 streams may have B pictures (Annex O), which come after the reference picture shown after them: their reference pictures wait for the next.
+  if (h.plus) low_delay_ = false;
   PlaneParams p;
-  p.type = h.inter ? kPictureP : kPictureI;
+  p.type = h.b_picture ? kPictureB : h.inter ? kPictureP : kPictureI;
   p.short_header = true;
   p.quant = h.quant;
   p.continuous_presence = h.continuous_presence;
@@ -344,6 +352,22 @@ bool Core::decode_h263(ConstByteView data, int64_t pts) {
   p.aiv = h.alternative_inter_vlc;
   p.modified_quant = h.modified_quant;
   p.first_mb = static_cast<int>(h.first_mb);
+  // The temporal distances (G.4, O.5.2): in picture clock ticks, modulo the reference's range.
+  const int modulo = h.custom_pcf ? 1024 : 256;
+  auto distance = [&](int to, int from) { const int d = ((to - from) % modulo + modulo) % modulo; return d ? d : 1; };
+  const int tr = h.tr, tr_last = tr_last_;
+  tr_last_ = tr;
+  pb_mode_ = h.pb;
+  dbquant_ = h.dbquant;
+  if (h.pb) {
+    trd_ = tr_last < 0 ? h.trb + 1 : distance(tr, tr_last);
+    trb_ = h.trb;
+    pb_p_delay_us_ = static_cast<int64_t>(trd_ > trb_ ? trd_ - trb_ : 1) * h.tick_us;
+  } else if (h.b_picture) {
+    trb_ = distance(tr, tr_anchor_[0]);
+    trd_ = distance(tr_anchor_[1], tr_anchor_[0]);
+    if (!anchor_[0] || !anchor_[1]) return true;
+  }
   if (need_intra_ && p.type != kPictureI) return true;
   if (p.first_mb >= mb_count_) return false;
   pic_ = p;
@@ -351,6 +375,10 @@ bool Core::decode_h263(ConstByteView data, int64_t pts) {
   BitReader br(data);
   br.skip(static_cast<int>(h.header_bits));
   decode_macroblocks(br);
+  if (!h.b_picture) {
+    tr_anchor_[0] = tr_anchor_[1];
+    tr_anchor_[1] = tr;
+  }
   end_picture();
   return true;
 }
@@ -363,7 +391,8 @@ bool Core::configure(int width, int height) {
   const uint64_t count = static_cast<uint64_t>(mb_w) * static_cast<uint64_t>(mb_h);
   if (!mb_packet_.alloc(allocator_, count) || !mb_intra_.alloc(allocator_, count) || !mb_qscale_.alloc(allocator_, count) || !dc_[0].alloc(allocator_, count * 4) ||
       !dc_[1].alloc(allocator_, count) || !dc_[2].alloc(allocator_, count) || !ac_[0].alloc(allocator_, count * 4 * 16) || !ac_[1].alloc(allocator_, count * 16) ||
-      !ac_[2].alloc(allocator_, count * 16) || !partition_.alloc(allocator_, count)) {
+      !ac_[2].alloc(allocator_, count * 16) || !partition_.alloc(allocator_, count) ||
+      !bvec_.alloc(allocator_, count)) {
     mb_count_ = 0;
     width_ = height_ = 0;
     return false;
@@ -397,6 +426,29 @@ bool Core::begin_picture(int64_t pts) {
   p->type = pic_.type;
   p->pts = pts;
   cur_ = p;
+  cur_b_ = nullptr;
+  if (pic_.short_header && pb_mode_ && pic_.type == kPictureP) {
+    // A PB-frame: its B part is a picture of its own, shown before the P part.
+    Picture* b = find_free_picture();
+    if (!b) return false;
+    if (b->width != w || b->height != h || b->mbs.size() != static_cast<uint64_t>(mb_count_)) {
+      b->width = b->height = 0;
+      if (!b->plane[0].alloc(allocator_, static_cast<uint64_t>(w) * h) || !b->plane[1].alloc(allocator_, static_cast<uint64_t>(w / 2) * (h / 2)) ||
+          !b->plane[2].alloc(allocator_, static_cast<uint64_t>(w / 2) * (h / 2)) || !b->mbs.alloc(allocator_, static_cast<uint64_t>(mb_count_)))
+        return false;
+      b->width = w;
+      b->height = h;
+      b->stride[0] = w;
+      b->stride[1] = b->stride[2] = w / 2;
+    }
+    b->in_use = true;
+    b->output_pending = false;
+    b->type = kPictureB;
+    b->pts = pts;
+    p->pts = pts + pb_p_delay_us_;
+    cur_b_ = b;
+  }
+  if (pic_.short_header && (pb_mode_ || pic_.type == kPictureB)) ArrayView<BVectors>(bvec_.data(), bvec_.size()).fill(BVectors{});
   ArrayView<int32_t>(mb_packet_.data(), mb_packet_.size()).fill(-1);
   qscale_ = pic_.quant;
   packet_start_ = 0;
@@ -409,6 +461,12 @@ void Core::end_picture() {
   Picture* p = cur_;
   cur_ = nullptr;
   if (!p) return;
+  if (cur_b_) {   // a PB-frame's B part goes out after the picture before it and before its P part
+    if (held_) output_picture(held_);
+    held_ = nullptr;
+    output_picture(cur_b_);
+    cur_b_ = nullptr;
+  }
   const bool extra = pictures_in_packet_++ > 0;
   if (p->type == kPictureB) {
     if (extra && !awaiting_time_) awaiting_time_ = p;   // (packed: its time comes with the next packet)
@@ -603,7 +661,7 @@ void Core::decode_macroblocks(BitReader& br) {
         for (auto& f : d) f[0] = f[1] = 0;
     }
     Mb& mb = mb_;
-    bool ok = pic_.short_header ? macroblock_h263(br, mb) : macroblock_mpeg4(br, mb);
+    bool ok = pic_.short_header ? (pic_.type == kPictureB ? macroblock_h263_b(br, mb) : macroblock_h263(br, mb)) : macroblock_mpeg4(br, mb);
     if (ok && br.error()) ok = false;   // ran past the end of the plane
     if (!ok) {
       index = recover(br, index);
@@ -999,7 +1057,12 @@ void Core::record_macroblock(const Mb& mb) {
   info.field_select[0] = info.field_select[1] = 0;
   if (mb.intra || (mb.skipped && !mb.mcsel)) {
     info.flags = mb.intra ? kMbIntra : kMbSkipped;
-    for (auto& v : info.mv) v[0] = v[1] = 0;
+    // (In a PB-frame an intra macroblock's vector, used by its B part, predicts its neighbours' too: 6.1.1 rule 1.)
+    const bool keep = mb.intra && pic_.short_header && pb_mode_;
+    for (auto& v : info.mv) {
+      v[0] = static_cast<int16_t>(keep ? mb.mv[0][0][0] : 0);
+      v[1] = static_cast<int16_t>(keep ? mb.mv[0][0][1] : 0);
+    }
     return;
   }
   if (mb.mv_type == kMv8x8) {
@@ -1452,12 +1515,197 @@ bool Core::macroblock_h263(BitReader& br, Mb& mb) {
     mb.ac_pred = br.bit() != 0;   // INTRA_MODE: 0, 10 (from the left) or 11 (from above)
     if (mb.ac_pred) mb.aic_left = br.bit() != 0;
   }
+  const bool pb = pb_mode_ && pic_.type == kPictureP;
+  bool has_mvdb = false;
+  if (pb) {
+    // 5.3.3 MODB: Table 11 (Annex G: 0, 10 MVDB, 11 CBPB and MVDB) or Table M.1 (0 and 10: bidirectional, 110 and 1110: forward with MVDB, 11110 and
+    // 11111: backward; the second of each pair with CBPB).
+    bool has_cbpb = false;
+    if (pb_mode_ == 1) {
+      if (br.bit()) {
+        has_mvdb = true;
+        has_cbpb = br.bit() != 0;
+      }
+    } else {
+      int ones = 0;
+      while (ones < 5 && br.bit()) ++ones;
+      static const uint8_t kModes[6] = {kBBidirectional, kBBidirectional, kBForward, kBForward, kBBackward, kBBackward};
+      mb.b_mode = kModes[ones];
+      has_cbpb = ones == 1 || ones == 3 || ones == 5;
+      has_mvdb = ones == 2 || ones == 3;
+    }
+    if (has_cbpb) mb.cbpb = static_cast<int>(br.get(6));
+  }
   int cbpy = read_vlc(br, lut_cbpy_, kCbpyLen);
   if (cbpy < 0) return false;
   if (!mb.intra && (!pic_.aiv || (cbpc & 3) != 3)) cbpy ^= 15;   // (Annex S: not inverted when both chroma blocks are coded)
   mb.cbp = (cbpc & 3) | (cbpy << 2);
   if (cbpc & 8) h263_dquant(br);
   if (!mb.intra && !h263_vectors(br, mb, (cbpc & 16) != 0)) return false;
+  // In a PB-frame an intra macroblock carries a vector for its B part too (Annex M: in bidirectional mode only).
+  if (mb.intra && pb && (pb_mode_ == 1 || mb.b_mode == kBBidirectional)) {
+    if (!h263_vectors(br, mb, false)) return false;
+    mb.mv_type = kMv16x16;
+  }
+  if (has_mvdb) {
+    if (pb_mode_ == 1) {
+      // G.4: MVDB is coded against Pc = (TRB x MV) / TRD of the (first) P vector; what it adds to Pc is the delta MVD of every block.
+      for (int c = 0; c < 2; ++c) {
+        const int pc = trb_ * mb.mv[0][0][c] / trd_;
+        int v;
+        if (!h263_motion(br, pc, &v)) return false;
+        mb.mvd[c] = v - pc;
+      }
+    } else {
+      // M.2.2: the forward vector, predicted by the left macroblock's forward vector (or zero).
+      int px = 0, py = 0;
+      if (mb_x_ > 0 && same_packet(mb_x_ - 1, mb_y_)) {
+        const BVectors& left = bvec_[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_ - 1)];
+        if (left.has_fw) {
+          px = left.fw[0];
+          py = left.fw[1];
+        }
+      }
+      if (!h263_motion(br, px, &mb.mvd[0]) || !h263_motion(br, py, &mb.mvd[1])) return false;
+      if (pic_.umv_plus && mb.mvd[0] - px == 1 && mb.mvd[1] - py == 1) br.skip(1);
+    }
+  }
+  if (pb && pb_mode_ == 2 && mb.b_mode == kBForward) {
+    BVectors& own = bvec_[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+    own.fw[0] = static_cast<int16_t>(mb.mvd[0]);
+    own.fw[1] = static_cast<int16_t>(mb.mvd[1]);
+    own.has_fw = 1;
+  }
+  for (int i = 0; i < 6; ++i)
+    if (!block_h263(br, mb, i, (mb.cbp >> (5 - i)) & 1, mb.intra)) return false;
+  if (pb)
+    for (int i = 0; i < 6; ++i)
+      if (!block_h263(br, mb, i, (mb.cbpb >> (5 - i)) & 1, false, true)) return false;
+  return true;
+}
+
+// 5.1.23 Table 6: BQUANT, the quantiser of a PB-frame's B blocks.
+int Core::b_quant() const {
+  const int q = (5 + dbquant_) * qscale_ / 4;
+  return q > 31 ? 31 : q < 1 ? 1 : q;
+}
+
+// O.5.1: a vector of a B picture's macroblock, predicted from the neighbours' vectors of the same direction (those without one count as zero) with the
+// border rules of 6.1.1.
+bool Core::h263_b_vector(BitReader& br, int dir, int* x, int* y) {
+  static const int8_t kCandidates[3][2] = {{-1, 0}, {0, -1}, {1, -1}};
+  int v[3][2] = {};
+  bool valid[3] = {};
+  int count = 0;
+  for (int c = 0; c < 3; ++c) {
+    const int nx = mb_x_ + kCandidates[c][0], ny = mb_y_ + kCandidates[c][1];
+    if (!same_packet(nx, ny)) continue;
+    const BVectors& n = bvec_[static_cast<uint64_t>(ny * mb_w_ + nx)];
+    if (dir == 0 ? n.has_fw : n.has_bw) {
+      v[c][0] = dir == 0 ? n.fw[0] : n.bw[0];
+      v[c][1] = dir == 0 ? n.fw[1] : n.bw[1];
+    }
+    valid[c] = true;
+    ++count;
+  }
+  int px = 0, py = 0;
+  if (count == 1) {
+    for (int c = 0; c < 3; ++c)
+      if (valid[c]) {
+        px = v[c][0];
+        py = v[c][1];
+      }
+  } else if (count > 1) {
+    auto median = [](int a, int b, int c) { return a > b ? (b > c ? b : a > c ? c : a) : (a > c ? a : b > c ? c : b); };
+    px = median(v[0][0], v[1][0], v[2][0]);
+    py = median(v[0][1], v[1][1], v[2][1]);
+  }
+  if (!h263_motion(br, px, x) || !h263_motion(br, py, y)) return false;
+  if (pic_.umv_plus && *x - px == 1 && *y - py == 1) br.skip(1);
+  BVectors& own = bvec_[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+  if (dir == 0) {
+    own.fw[0] = static_cast<int16_t>(*x);
+    own.fw[1] = static_cast<int16_t>(*y);
+    own.has_fw = 1;
+  } else {
+    own.bw[0] = static_cast<int16_t>(*x);
+    own.bw[1] = static_cast<int16_t>(*y);
+    own.has_bw = 1;
+  }
+  return true;
+}
+
+// O.5.2 / G.4 with MVD = 0: the vectors of a direct-mode macroblock from the backward reference's colocated vectors (zero where it is intra).
+void Core::h263_direct(Mb& mb) {
+  const MbInfo& col = anchor_[1]->mbs[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+  const bool intra = (col.flags & kMbIntra) != 0;
+  mb.dir = kForward | kBackward;
+  mb.mv_type = (col.flags & kMb8x8) ? kMv8x8 : kMv16x16;
+  for (int i = 0; i < 4; ++i)
+    for (int c = 0; c < 2; ++c) {
+      const int v = intra ? 0 : col.mv[i][c];
+      mb.mv[0][i][c] = trb_ * v / trd_;
+      mb.mv[1][i][c] = (trb_ - trd_) * v / trd_;
+    }
+}
+
+// O.4: a macroblock of a B picture: COD, MBTYPE (Table O.1), [INTRA_MODE], CBPC (Table O.4) and CBPY, DQUANT, MVDFW, MVDBW.
+bool Core::macroblock_h263_b(BitReader& br, Mb& mb) {
+  clear_macroblock(mb);
+  if (br.bit()) {   // COD: direct, nothing coded
+    h263_direct(mb);
+    mb.skipped = false;
+    return true;
+  }
+  // Table O.1 as (code, length): direct, direct+Q, forward (no texture), forward, forward+Q, backward (no texture), backward, backward+Q, bi-dir (no texture),
+  // bi-dir, bi-dir+Q, intra, intra+Q, stuffing.
+  static const uint8_t kCode[14] = {3, 1, 4, 5, 6, 2, 3, 7, 4, 5, 1, 1, 1, 1};
+  static const uint8_t kLength[14] = {2, 4, 3, 3, 5, 3, 3, 5, 5, 5, 5, 6, 7, 9};
+  int type = -1;
+  do {
+    type = -1;
+    for (int t = 0; t < 14 && type < 0; ++t)
+      if (br.peek(kLength[t]) == kCode[t]) {
+        br.skip(kLength[t]);
+        type = t;
+      }
+    if (type < 0 || br.error()) return false;
+  } while (type == 13);
+  const bool coded = type == 0 || type == 1 || type == 3 || type == 4 || type == 6 || type == 7 || type == 9 || type == 10 || type == 11 || type == 12;
+  const bool quant = type == 1 || type == 4 || type == 7 || type == 10 || type == 12;
+  const bool forward = type >= 2 && type <= 4, backward = type >= 5 && type <= 7, bidirectional = type >= 8 && type <= 10;
+  mb.intra = type >= 11;
+  if (mb.intra && pic_.aic) {
+    mb.ac_pred = br.bit() != 0;
+    if (mb.ac_pred) mb.aic_left = br.bit() != 0;
+  }
+  if (coded) {
+    int cbpc;
+    if (!br.bit()) cbpc = 0;            // 0
+    else if (!br.bit()) cbpc = 1;       // 10
+    else cbpc = br.bit() ? 2 : 3;       // 111: 10, 110: 11
+    int cbpy = read_vlc(br, lut_cbpy_, kCbpyLen);
+    if (cbpy < 0) return false;
+    if (!mb.intra && (!pic_.aiv || cbpc != 3)) cbpy ^= 15;
+    mb.cbp = cbpc | (cbpy << 2);
+  }
+  if (quant) h263_dquant(br);
+  if (mb.intra) {
+    // (no vectors)
+  } else if (type <= 1) {
+    h263_direct(mb);
+  } else {
+    mb.mv_type = kMv16x16;
+    mb.dir = 0;
+    if (forward || bidirectional) {
+      if (!h263_b_vector(br, 0, &mb.mv[0][0][0], &mb.mv[0][0][1])) return false;
+      mb.dir |= kForward;
+    }
+    if (backward || bidirectional) {
+      if (!h263_b_vector(br, 1, &mb.mv[1][0][0], &mb.mv[1][0][1])) return false;
+      mb.dir |= kBackward;
+    }
+  }
   for (int i = 0; i < 6; ++i)
     if (!block_h263(br, mb, i, (mb.cbp >> (5 - i)) & 1, mb.intra)) return false;
   return true;
@@ -1641,8 +1889,8 @@ bool Core::block_mpeg4(BitReader& br, Mb& mb, int n, bool coded, bool intra, boo
 // by Annex T when it is -128). Under advanced intra coding (Annex I) an intra block's DC is among its coefficients, coded with Table I.2 and predicted with
 // its AC coefficients; under the alternative inter VLC (Annex S) an inter block that does not fit the inter table is read again with Table I.2. Inter
 // levels are dequantised as they are read; intra levels in Mpeg4Recon.cpp.
-bool Core::block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra) {
-  ArrayView<int16_t> block(mb.block[n]);
+bool Core::block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra, bool b_part) {
+  ArrayView<int16_t> block(b_part ? mb.b_block[n] : mb.block[n]);
   const bool aic = intra && pic_.aic;
   int start = 0, last_pos = -1;
   if (intra && !aic) {
@@ -1654,7 +1902,8 @@ bool Core::block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra) {
     last_pos = 0;
   }
   if (coded) {
-    const int q = n < 4 ? qscale_ : chroma_quant(qscale_);
+    const int base = b_part ? b_quant() : qscale_;
+    const int q = n < 4 ? base : chroma_quant(base);
     const int qmul = intra ? 1 : q * 2, qadd = intra ? 0 : (q - 1) | 1;
     const int scan_index = aic && mb.ac_pred ? (mb.aic_left ? 2 : 1) : 0;
     const ArrayView<const uint8_t> scan(scan_tables_[scan_index]);
@@ -1724,7 +1973,7 @@ bool Core::block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra) {
     h263_intra_prediction(mb, n);
     last_pos = 63;
   }
-  mb.last[n] = last_pos;
+  (b_part ? mb.b_last[n] : mb.last[n]) = last_pos;
   return true;
 }
 
