@@ -1497,7 +1497,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The monitors become the display: the surface is as big as all of them side by side, and when a monitor shows its picture at another size
   // (a resolution that is not what the desktop was drawn for, or a scale) the pictures go through MonitorDisplay. Applying again, after a change
   // in Display Settings or a hot plug, builds the renderer for the new size.
-  // HiDPI: with a monitor at a whole scale (200 %, 300 %) the desktop draws that many device pixels per unit (SystemMonitors::render_scale): the renderer is
+  // HiDPI: with a monitor at a scale (125 % .. 400 %) the desktop draws at it (SystemMonitors::render_percent): the renderer is
   // the device's one at that size under a ScaledRenderer2D, which the desktop keeps (its coordinates stay the layout's); programs that draw at the scale are
   // drawn 1:1 through it (IRenderer2D::device()).
   struct DisplayPipeline {
@@ -1510,20 +1510,20 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       if (!self->monitors->apply()) return nullptr;
       hardware::ScanoutPlacement placements[16];
       const uint32_t count = self->monitors->physical_placements(placements, 16);
-      const uint32_t k = self->monitors->render_scale();
+      const uint32_t k = self->monitors->render_percent();
       const bool compose = self->monitors->needs_compositing() && self->display->update(self->monitors->layout(), placements, count, k);
       self->graphics->set_display_override(compose ? self->display : nullptr);
       self->graphics->reset_renderer();
       graphics::IRenderer2D* device = self->graphics->renderer_2d();
       if (!device || !self->scaled) return device;
-      self->scaled->set_device(*device, compose ? k : 1);
+      self->scaled->set_device(*device, compose ? k : 100);
       return self->scaled;
     }
   };
   UniquePointer<hardware::MonitorDisplay> monitor_display = gpu ? UniquePointer<hardware::MonitorDisplay>::make(shared_allocator, *gpu, shared_allocator) : UniquePointer<hardware::MonitorDisplay>();
   UniquePointer<graphics::ScaledRenderer2D> scaled_renderer;
   if (graphics::IRenderer2D* first = gpu ? system_graphics.renderer_2d() : nullptr)
-    scaled_renderer = UniquePointer<graphics::ScaledRenderer2D>::make(shared_allocator, shared_allocator, *first, 1);
+    scaled_renderer = UniquePointer<graphics::ScaledRenderer2D>::make(shared_allocator, shared_allocator, *first, 100);
   DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get(), scaled_renderer.get()};
   if (gpu && monitor_display && (monitors.layout().count() > 1 || monitors.needs_compositing())) {
     if (DisplayPipeline::apply(&display_pipeline)) {
@@ -1535,7 +1535,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
   if (renderer && scaled_renderer) {      // (the desktop draws through the scaling renderer, so that a later change of scale keeps it)
     scaled_renderer->set_device(*renderer, monitor_display && monitor_display->width() != 0 && renderer->extent().width == monitor_display->width()
-                                               ? monitor_display->render_scale() : 1);
+                                               ? monitor_display->render_percent() : 100);
     renderer = scaled_renderer.get();
   }
   if (renderer) {

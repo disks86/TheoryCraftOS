@@ -74,7 +74,7 @@ class IWindowSurfaceSink {
 };
 void set_window_surface_sink(IWindowSurfaceSink* sink);
 // DPI virtualization (the window manager's, Win32kUserDpi.cpp): the factor the calling thread's coordinates are divided by and the dpi it works at.
-// Without a hook GDI answers 1 and 96.
+// Without a hook GDI answers 100 (percent: no scaling) and 96.
 using CallerDpiHook = void (*)(Call& call, uint32_t* scale, uint32_t* dpi);
 void set_caller_dpi_hook(CallerDpiHook hook);
 bool is_dc(uint32_t handle);

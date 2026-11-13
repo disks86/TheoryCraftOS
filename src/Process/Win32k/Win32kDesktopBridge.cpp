@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Graphics/DeviceScale.hpp"
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -90,15 +91,15 @@ void DesktopBridge::attach(int32_t frame_border, int32_t frame_title) {
   }
   frame_border_ = frame_border;
   frame_title_ = frame_title;
-  user::set_redirection(true, this, frame_border * static_cast<int32_t>(scale_), frame_title * static_cast<int32_t>(scale_));      // (takes the lock itself)
+  user::set_redirection(true, this, graphics::units_to_device(frame_border, scale_), graphics::units_to_device(frame_title, scale_));      // (takes the lock itself)
 }
 
 // win32k's screen is in device pixels: the desktop's units times its scale (DPI virtualization gives unaware programs the units back).
 void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) {
-  const uint32_t scale = monitors.size() > 0 && monitors[0].scale >= 1 && monitors[0].scale <= 4 ? monitors[0].scale : 1;
+  const uint32_t scale = monitors.size() > 0 ? graphics::clamp_scale_percent(monitors[0].scale_percent) : 100;
   const bool rescaled = scale != scale_;
   scale_ = scale;
-  if (rescaled && attached_) user::set_redirection(true, this, frame_border_ * static_cast<int32_t>(scale), frame_title_ * static_cast<int32_t>(scale));
+  if (rescaled && attached_) user::set_redirection(true, this, graphics::units_to_device(frame_border_, scale), graphics::units_to_device(frame_title_, scale));
   gdi::Rect rects[8], works[8];
   uint32_t n = 0;
   for (const Monitor& m : monitors) {
@@ -109,7 +110,7 @@ void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const
   }
   {
     user_misc::SystemLock lock;
-    const uint64_t w = uint64_t{width} * scale, h = uint64_t{height} * scale;
+    const uint64_t w = uint64_t(graphics::units_to_device(int32_t(width), scale)), h = uint64_t(graphics::units_to_device(int32_t(height), scale));
     if (w != gdi::screen_width() || h != gdi::screen_height()) gdi::set_screen_size(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     user_misc::set_monitors(ArrayView<const gdi::Rect>(rects, n), ArrayView<const gdi::Rect>(works, n));
   }
@@ -117,8 +118,8 @@ void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const
 }
 
 gdi::Rect DesktopBridge::up(const gdi::Rect& r) const {
-  const int32_t k = static_cast<int32_t>(scale_);
-  return {r.left * k, r.top * k, r.right * k, r.bottom * k};
+  auto u = [&](int32_t v) { return graphics::units_to_device(v, scale_); };
+  return {u(r.left), u(r.top), u(r.right), u(r.bottom)};
 }
 
 gdi::Rect DesktopBridge::down(const gdi::Rect& r) const {
@@ -266,8 +267,8 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
   s.pixels = pixels;
   s.width = s.pitch = w;
   s.height = h;
-  const bool device = scale_ > 1 && user::top_level_dpi_aware_locked(window);
-  const uint32_t uw = device ? w / scale_ : w, uh = device ? h / scale_ : h;
+  const bool device = scale_ > 100 && user::top_level_dpi_aware_locked(window);
+  const uint32_t uw = device ? uint32_t(graphics::device_to_units(int32_t(w), scale_)) : w, uh = device ? uint32_t(graphics::device_to_units(int32_t(h), scale_)) : h;
   renderer.set_blend(graphics::BlendMode::Replace);
   if (device) renderer.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
   else renderer.draw_image(s, {0, 0, w, h}, x, y);
@@ -279,7 +280,7 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
 
 bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) {
   user_misc::SystemLock lock;
-  if (scale != scale_ || scale < 2 || !user::top_level_dpi_aware_locked(window)) return false;      // (unaware: the desktop enlarges its units)
+  if (scale != scale_ || scale <= 100 || !user::top_level_dpi_aware_locked(window)) return false;      // (unaware: the desktop enlarges its units)
   const uint32_t id = user::top_level_surface_locked(window);
   if (id == 0) return false;
   uint32_t w = 0, h = 0;
@@ -292,8 +293,8 @@ bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& d
   device.set_blend(graphics::BlendMode::Replace);
   device.draw_image(s, {0, 0, w, h}, x, y);
   device.set_blend(graphics::BlendMode::Alpha);
-  *width = w / scale;
-  *height = h / scale;
+  *width = uint32_t(graphics::device_to_units(int32_t(w), scale));
+  *height = uint32_t(graphics::device_to_units(int32_t(h), scale));
   return true;
 }
 
@@ -318,8 +319,8 @@ void DesktopBridge::key(uint8_t hid_usage, bool pressed, uint8_t modifiers) {
   if (c != 0) user::inject_char(char32_t(static_cast<uint8_t>(c)));
 }
 
-void DesktopBridge::mouse_motion(int32_t dx, int32_t dy) { user::inject_mouse_motion(dx * static_cast<int32_t>(scale_), dy * static_cast<int32_t>(scale_)); }
-void DesktopBridge::mouse_position(int32_t x, int32_t y) { user::inject_mouse_move(x * static_cast<int32_t>(scale_), y * static_cast<int32_t>(scale_)); }
+void DesktopBridge::mouse_motion(int32_t dx, int32_t dy) { user::inject_mouse_motion(graphics::units_to_device(dx, scale_), graphics::units_to_device(dy, scale_)); }
+void DesktopBridge::mouse_position(int32_t x, int32_t y) { user::inject_mouse_move(graphics::units_to_device(x, scale_), graphics::units_to_device(y, scale_)); }
 void DesktopBridge::mouse_button(uint32_t button, bool down) { user::inject_mouse_button(button, down); }
 void DesktopBridge::mouse_wheel(int32_t notches) { user::inject_mouse_wheel(notches * 120, false); }      // (WHEEL_DELTA per notch)
 void DesktopBridge::cursor(int32_t* x, int32_t* y) {
@@ -343,7 +344,7 @@ bool DesktopBridge::cursor_picture(uint32_t cursor, uint32_t* system_id, List<ui
 }
 
 bool DesktopBridge::touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
-  return user::touch_input(window, static_cast<uint8_t>(phase), id, x * static_cast<int32_t>(scale_), y * static_cast<int32_t>(scale_));
+  return user::touch_input(window, static_cast<uint8_t>(phase), id, graphics::units_to_device(x, scale_), graphics::units_to_device(y, scale_));
 }
 
 bool DesktopBridge::desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) {
@@ -365,7 +366,7 @@ bool DesktopBridge::desktop_drag(uint32_t window, int32_t x, int32_t y, StringVi
     if (c == 0 || !drop_names_->append(c)) return false;      // (a NUL would end the name early)
   }
   if (!drop_names_->append(char16_t(0)) || !drop_names_->append(char16_t(0))) return false;
-  if (!user::drop_target(window, x * static_cast<int32_t>(scale_), y * static_cast<int32_t>(scale_), &drop_target_)) return false;
+  if (!user::drop_target(window, graphics::units_to_device(x, scale_), graphics::units_to_device(y, scale_), &drop_target_)) return false;
   drop_ok_ = true;
   return true;
 }

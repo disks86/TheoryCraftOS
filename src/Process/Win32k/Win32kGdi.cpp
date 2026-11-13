@@ -527,7 +527,7 @@ void set_window_surface_sink(IWindowSurfaceSink* sink) { g_window_sink = sink; }
 CallerDpiHook g_caller_dpi = nullptr;
 void set_caller_dpi_hook(CallerDpiHook hook) { g_caller_dpi = hook; }
 void caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi) {
-  *scale = 1;
+  *scale = 100;
   *dpi = 96;
   if (g_caller_dpi) g_caller_dpi(call, scale, dpi);
 }

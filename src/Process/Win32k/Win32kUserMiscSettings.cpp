@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Graphics/DeviceScale.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
 
 // SystemParametersInfo and its settings store (the defaults of Windows 10 at 96 dpi, independent of any registry: the store lives in memory and is shared by all processes),
@@ -369,8 +370,9 @@ uint64_t spi(Call& c, uint32_t action, uint32_t ui, uint64_t pv, uint32_t dpi, b
     case 0x2F: {    // SPI_SETWORKAREA
       Rect r;
       if (pv == 0 || !c.read_struct(pv, &r)) return c.fail(kErrorNoAccess);
-      const int32_t k = int32_t(user::caller_dpi_scale(c));
-      r = {r.left * k, r.top * k, r.right * k, r.bottom * k};
+      const uint32_t k = user::caller_dpi_scale(c);
+      auto u = [&](int32_t v) { return graphics::units_to_device(v, k); };
+      r = {u(r.left), u(r.top), u(r.right), u(r.bottom)};
       return set_monitor_work_area(r) ? 1 : c.fail(kErrorInvalidParameter);
     }
     case 0x30: {    // SPI_GETWORKAREA
@@ -466,10 +468,11 @@ int32_t system_metrics(uint32_t index, uint32_t dpi) {
   if (dpi == 0) dpi = 96;
   // (DPI virtualization: the screen is in device pixels; asked for 96 dpi on a scaled system - an unaware program - its sizes are the 96-dpi units)
   const uint32_t sd = system_dpi();
-  const int32_t vk = dpi == 96 && sd > 96 ? int32_t(sd / 96) : 1;
-  const int32_t w = int32_t(gdi::screen_width()) / vk, h = int32_t(gdi::screen_height()) / vk;
+  const uint32_t vp = dpi == 96 && sd > 96 ? sd * 100 / 96 : 100;      // (the scale in percent an unaware program's sizes are divided by)
+  auto d = [&](int32_t v) { return graphics::device_to_units(v, vp); };
+  const int32_t w = d(int32_t(gdi::screen_width())), h = d(int32_t(gdi::screen_height()));
   Rect work = monitor_rect(monitor_handle(), true);
-  if (vk > 1) work = {work.left / vk, work.top / vk, work.right / vk, work.bottom / vk};
+  work = {d(work.left), d(work.top), d(work.right), d(work.bottom)};
   const Metrics& m = s->metrics;
   const int32_t frame_total = 4 + 4;      // SM_CXSIZEFRAME + SM_CXPADDEDBORDER
   int32_t v = 0;

@@ -17,6 +17,7 @@
  */
 
 // Surfaces, regions, subsurfaces, shared-memory buffers, and the xdg shell (toplevels, popups, positioners) with the desktop as its window manager.
+#include "Graphics/DeviceScale.hpp"
 #include "Wayland/WaylandInternal.hpp"
 
 namespace wayland {
@@ -1487,22 +1488,24 @@ void Server::decoration_request(Client& c, uint32_t id, Resource& r, uint16_t op
 
 // ------------------------------------------------------------------ drawing
 
-// scale > 1 (HiDPI, draw_window_scaled): the renderer is in device pixels, `scale` per surface unit, and (x, y) is in them. A buffer made at that scale with
-// no transform or viewport is drawn 1:1 (a GPU buffer where it is); any other goes through draw_mapped, which enlarges it.
-void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done, uint32_t scale) {
-  const int32_t k = static_cast<int32_t>(scale);
+// (x, y) are the surface's place in units; `percent` the renderer's scale (HiDPI, draw_window_scaled: a renderer in device pixels; 100: the desktop's own).
+// A buffer made at the device's whole scale with no transform or viewport is drawn 1:1 where its units map to (a GPU buffer where it is); any other goes
+// through draw_mapped, which maps it onto the device (1:1 too for a fractional client's buffer through its viewport).
+void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t ux, int32_t uy, bool top, List<uint32_t>* done, uint32_t percent) {
+  const int32_t x = graphics::units_to_device(ux, percent), y = graphics::units_to_device(uy, percent);
   for (Surface* entry : s.stack.view()) {
     if (entry) {
-      if (entry->role == Role::Subsurface) draw_tree(*entry, renderer, x + entry->sub_x * k, y + entry->sub_y * k, false, done, scale);
+      if (entry->role == Role::Subsurface) draw_tree(*entry, renderer, ux + entry->sub_x, uy + entry->sub_y, false, done, percent);
       continue;
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
     if (s.feedback.count() && s.current.valid()) presented(s, true);      // (shown now: wp_presentation_feedback.presented)
-    const bool native = s.mapping.scale == k && s.mapping.transform == 0 && s.mapping.source[0] == -1 && s.mapping.destination[0] == -1;      // (1:1 on the device)
+    const bool native = percent % 100 == 0 && s.mapping.scale == int32_t(percent / 100) && s.mapping.transform == 0 && s.mapping.source[0] == -1 &&
+                        s.mapping.destination[0] == -1;      // (1:1 on the device)
     if (!native) {      // turned, scaled or cropped, or not at the device's scale: one affine map from the buffer to the screen (WaylandScale.cpp)
       renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
-      draw_mapped(s, renderer, x, y, scale);
+      draw_mapped(s, renderer, ux, uy, percent);
       continue;
     }
     if (GpuImage* image = s.current.image()) {      // a dmabuf: drawn where it is (see GpuImage::draw)

@@ -2075,7 +2075,7 @@ static void test_mipmaps() {
 
 // HiDPI (ScaledRenderer2D): a scene drawn through the decorator at scale k is the 1x scene with every pixel a k x k block (rectangles, outlines,
 // upright lines, text, images, masks, clips); the extent is the device's over k; pixel_scale and device() name the device; read_frame gives the 1x frame.
-static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskView& mask) {
+static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskView& mask, bool pictures = true) {
   r.set_blend(BlendMode::Replace);
   r.clear(0xFF101010);
   r.fill_rect({2, 3, 10, 6}, 0xFFFF0000);
@@ -2084,9 +2084,9 @@ static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskVi
   r.draw_line(25, 10, 25, 30, 0xFFFFFF00);
   r.put_pixel(31, 31, 0xFFFFFFFF);
   r.draw_text(2, 22, "Hi \xC3\xA9", 0xFFFFFFFF);
-  r.draw_image(image, {1, 1, 4, 3}, 36, 4);
+  if (pictures) r.draw_image(image, {1, 1, 4, 3}, 36, 4);
   r.set_blend(BlendMode::Alpha);
-  r.draw_mask(mask, {0, 0, mask.width, mask.height}, 40, 20, 0xFF00FFFF);
+  if (pictures) r.draw_mask(mask, {0, 0, mask.width, mask.height}, 40, 20, 0xFF00FFFF);
   r.set_clip({44, 0, 4, 40});
   r.fill_rect({40, 0, 20, 40}, 0xFFFF00FF);
   r.reset_clip();
@@ -2108,18 +2108,26 @@ static void test_scaled_2d() {
   Surface one = make_surface(a, W, H);
   SoftwareRenderer2D r1(one, nullptr, &a);
   draw_scaled_scene(r1, image, mask);
-  for (uint32_t k = 2; k <= 3; ++k) {
-    Surface big = make_surface(a, W * k, H * k);
+  Surface plain_one = make_surface(a, W, H);      // (the scene without pictures, for the fractional scales)
+  SoftwareRenderer2D rp(plain_one, nullptr, &a);
+  draw_scaled_scene(rp, image, mask, false);
+  for (uint32_t percent : {200u, 300u, 150u, 125u, 175u}) {
+    const bool whole = percent % 100 == 0;
+    const uint32_t DW = uint32_t(units_to_device(int32_t(W), percent)), DH = uint32_t(units_to_device(int32_t(H), percent));
+    Surface big = make_surface(a, DW, DH);
     SoftwareRenderer2D device(big, nullptr, &a);
-    ScaledRenderer2D scaled(a, device, k);
-    CHECK(scaled.extent().width == W && scaled.extent().height == H && scaled.pixel_scale() == k && &scaled.device() == &device);
-    draw_scaled_scene(scaled, image, mask);
+    ScaledRenderer2D scaled(a, device, percent);
+    CHECK(scaled.extent().width == W && scaled.extent().height == H && scaled.scale_percent() == percent && &scaled.device() == &device);
+    draw_scaled_scene(scaled, image, mask, whole);
+    const Surface& ref = whole ? one : plain_one;
     uint32_t wrong = 0;
-    for (uint32_t y = 0; y < H * k; ++y)
-      for (uint32_t x = 0; x < W * k; ++x)
-        if (px(big, x, y) != px(one, x / k, y / k)) ++wrong;
+    for (uint32_t y = 0; y < DH; ++y)
+      for (uint32_t x = 0; x < DW; ++x)      // (device pixel x shows unit floor(x * 100 / percent))
+        if (px(big, x, y) != px(ref, uint32_t(device_to_units(int32_t(x), percent)), uint32_t(device_to_units(int32_t(y), percent)))) ++wrong;
     CHECK(wrong == 0);
-    if (wrong) printf("scale %u: %u pixels differ\n", k, wrong);
+    if (wrong) printf("scale %u %%: %u pixels differ\n", percent, wrong);
+    const uint32_t k = percent / 100;
+    if (!whole) { release_view(a, big.pixels); continue; }
     // read_frame: the logical frame
     List<uint32_t> frame(a);
     for (uint32_t i = 0; i < W * H; ++i) frame.push_back(0);
@@ -2140,12 +2148,13 @@ static void test_scaled_2d() {
   }
   // scale 1 is the device itself; a bad scale is clamped
   SoftwareRenderer2D plain(one, nullptr, &a);
-  ScaledRenderer2D same(a, plain, 1);
-  CHECK(same.extent().width == W && same.pixel_scale() == 1);
-  ScaledRenderer2D clamped(a, plain, 99);
-  CHECK(clamped.scale() == ScaledRenderer2D::kMaxScale);
+  ScaledRenderer2D same(a, plain, 100);
+  CHECK(same.extent().width == W && same.scale_percent() == 100);
+  ScaledRenderer2D clamped(a, plain, 999);
+  CHECK(clamped.percent() == kMaxScalePercent);
   ScaledRenderer2D zero(a, plain, 0);
-  CHECK(zero.scale() == 1);
+  CHECK(zero.percent() == 100);
+  release_view(a, plain_one.pixels);
   release_view(a, one.pixels);
   release_view(a, image.pixels);
 }

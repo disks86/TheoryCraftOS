@@ -159,7 +159,7 @@ class Win32Windows {
   bool display_sent_ = false;
   gui::Rect2D sent_bounds_;
   uint32_t sent_reserve_serial_ = 0;      // the window manager's reserve_serial() when the monitors went (they go again when it changes)
-  uint32_t sent_scale_ = 1;               // the device scale the session was last told (HiDPI)
+  uint32_t sent_scale_ = 100;             // the device scale (percent) the session was last told (HiDPI)
   gui::Frame* last_active_ = nullptr;
   // A drag a program asked for (a custom title bar or border: IWindowsSession::take_drag): the frame follows the pointer until the left button is let go. Under the UI lock.
   Win32Window* drag_ = nullptr;

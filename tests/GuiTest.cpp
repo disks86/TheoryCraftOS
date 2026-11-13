@@ -1584,7 +1584,7 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     width = w;
     height = h;
     monitor_count = uint32_t(monitors.size());
-    if (monitors.size() > 0) work = monitors[0].work, scale = monitors[0].scale;
+    if (monitors.size() > 0) work = monitors[0].work, scale = monitors[0].scale_percent;
   }
   uint32_t scale = 0;
   // HiDPI: when `sharp`, the program draws at the device's scale (draw_window_scaled, in another colour); the calls are noted
@@ -1596,7 +1596,7 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     auto it = wins.find(w);
     if (it == wins.end()) return false;
     const desktop::WindowsRect& sr = it->second.info.surface;
-    device.fill_rect({x, y, sr.width * k, sr.height * k}, sharp_color);
+    device.fill_rect({x, y, sr.width * k / 100, sr.height * k / 100}, sharp_color);
     sharp_calls.push_back(std::to_string(w) + " " + std::to_string(x) + " " + std::to_string(y) + " " + std::to_string(k));
     *width_out = sr.width;
     *height_out = sr.height;
@@ -2247,7 +2247,7 @@ static void test_windows_hidpi() {
   TestAllocator a;
   {
     Screen screen(a, 1600, 1200);
-    graphics::ScaledRenderer2D scaled(a, screen.renderer, 2);
+    graphics::ScaledRenderer2D scaled(a, screen.renderer, 200);
     FakeKeyboard kb;
     FakeMouse mouse;
     FakeWindowsSession s(a);
@@ -2255,7 +2255,7 @@ static void test_windows_hidpi() {
     d.set_windows_session(&s);
     gui::WindowManager& wm = d.windows();
     d.step(0);
-    CHECK(s.scale == 2 && s.width == wm.bounds().width && wm.bounds().width <= 800);
+    CHECK(s.scale == 200 && s.width == wm.bounds().width && wm.bounds().width <= 800);
     const Point mo = wm.window_origin();
     s.add(7, true, {100, 80, 200, 150}, "Notepad", true);
     d.step(1000);
@@ -2273,7 +2273,7 @@ static void test_windows_hidpi() {
       h->invalidate();
     }
     d.step(2000);
-    CHECK(!s.sharp_calls.empty() && s.sharp_calls.back() == "7 " + std::to_string((mo.x + pic.x) * 2) + " " + std::to_string((mo.y + pic.y) * 2) + " 2");
+    CHECK(!s.sharp_calls.empty() && s.sharp_calls.back() == "7 " + std::to_string((mo.x + pic.x) * 2) + " " + std::to_string((mo.y + pic.y) * 2) + " 200");
     CHECK(screen.px((mo.x + 110) * 2, (mo.y + 110) * 2) == 0xFFAA5500u && screen.px((mo.x + pic.x) * 2, (mo.y + pic.y) * 2) == 0xFFAA5500u);
     CHECK(screen.px((mo.x + pic.x) * 2 - 1, (mo.y + pic.y) * 2 + 4) != 0xFFAA5500u);      // (the frame's border, outside the picture)
   }

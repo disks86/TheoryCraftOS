@@ -137,15 +137,13 @@ uint32_t SystemMonitors::physical_placements(ScanoutPlacement* out, uint32_t cap
   return count;
 }
 
-uint32_t SystemMonitors::render_scale() const {
-  uint32_t k = 1;
+uint32_t SystemMonitors::render_percent() const {
+  uint32_t p = 100;
   for (uint32_t i = 0; i < layout_.count(); ++i) {
     const MonitorSlot& s = layout_.at(i);
-    if (!s.enabled || s.scale_percent % 100 != 0) continue;
-    const uint32_t whole = s.scale_percent / 100;
-    if (whole > k) k = whole;
+    if (s.enabled && s.scale_percent > p) p = s.scale_percent;
   }
-  return k > 4 ? 4 : k;
+  return p > 400 ? 400 : p;
 }
 
 bool SystemMonitors::needs_compositing() const {

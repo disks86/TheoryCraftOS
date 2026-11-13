@@ -110,7 +110,7 @@ __attribute__((weak)) bool pointer_touch_info(uint64_t, uint32_t, ByteView) { re
 __attribute__((weak)) uint32_t touch_input_info(uint64_t, uint32_t, ByteView) { return 0; }
 __attribute__((weak)) bool close_touch_input(uint64_t, uint32_t) { return false; }
 __attribute__((weak)) uint64_t touch_window_state(uint32_t, uint32_t, uint32_t) { return 0; }
-__attribute__((weak)) uint32_t caller_dpi_scale(Call&) { return 1; }
+__attribute__((weak)) uint32_t caller_dpi_scale(Call&) { return 100; }
 __attribute__((weak)) gdi::Rect rect_for_caller(Call&, const gdi::Rect& r) { return r; }
 }  // namespace process::win32k::user
 

@@ -44,6 +44,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
+#include "Graphics/DeviceScale.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/LockedDevice.hpp"
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
@@ -4220,7 +4221,7 @@ static void test_mapping() {
     desktop::IWindowsSession::Monitor two[1];
     two[0].rect = {0, 0, 1024, 768};
     two[0].work = {0, 0, 1024, 740};
-    two[0].scale = 2;
+    two[0].scale_percent = 200;
     server.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(two, 1));
     CHECK(app.take(early, 2).i(0) == 2 && app.take(ef, 0).u(0) == 240);
     const uint32_t out = app.bind(app.reg, "wl_output");
@@ -4265,7 +4266,7 @@ static void test_mapping() {
       ts.height = 100;
       graphics::SoftwareRenderer2D r(ts);
       uint32_t dw = 0, dh = 0;
-      CHECK(server.draw_window_scaled(win, r, 10, 6, 2, &dw, &dh) && int32_t(dw) == W / buffer_scale && int32_t(dh) == H / buffer_scale);
+      CHECK(server.draw_window_scaled(win, r, 10, 6, 200, &dw, &dh) && int32_t(dw) == W / buffer_scale && int32_t(dh) == H / buffer_scale);
       uint32_t wrong = 0;
       for (int32_t y = 0; y < H * 2 / buffer_scale; ++y)
         for (int32_t x = 0; x < W * 2 / buffer_scale; ++x) {
@@ -4275,7 +4276,53 @@ static void test_mapping() {
       CHECK(wrong == 0);
       if (wrong) printf("   scale %d: %u device pixels wrong\n", buffer_scale, wrong);
       CHECK(target[size_t(5) * 200 + 10] == 0 && target[size_t(6) * 200 + 9] == 0);      // (nothing outside)
-      CHECK(!server.draw_window_scaled(win, r, 0, 0, 9, &dw, &dh));
+      CHECK(!server.draw_window_scaled(win, r, 0, 0, 900, &dw, &dh));
+    }
+    // 150 %: the output says 2 (the whole scale above), the fractional scale 180; a fractional client's buffer of 1.5 x its surface, through a
+    // viewport, lands 1:1 on the device
+    two[0].scale_percent = 150;
+    server.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(two, 1));
+    CHECK(app.take(early, 2).i(0) == 2 && app.take(ef, 0).u(0) == 180);
+    {
+      const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+      App::Window w = app.toplevel(true, "fractional");
+      const uint32_t viewport = app.new_id();
+      app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+      app.send(Msg(viewport, 2).i(40).i(20));      // set_destination: the surface is 40 x 20 units
+      constexpr int32_t W = 60, H = 30;      // (40 x 20 at 150 %)
+      App::Pool p = app.pool(size_t(W) * H * 4);
+      for (int32_t y = 0; y < H; ++y)
+        for (int32_t x = 0; x < W; ++x) {
+          const uint32_t v = pattern_px(uint32_t(x), uint32_t(y));
+          memcpy(p.memory->data() + (y * W + x) * 4, &v, 4);
+        }
+      const uint32_t b = app.buffer(p, 0, W, H, W * 4);
+      app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+      app.send(Msg(w.surface, 6));
+      uint32_t win = 0;
+      for (uint32_t id : listed(server)) {
+        desktop::WindowsWindowInfo info;
+        String title(A);
+        if (server.window_info(id, &info, &title) && title.view() == StringView("fractional")) win = id;
+      }
+      CHECK(win != 0);
+      if (win) {
+        std::vector<uint32_t> target(200 * 100, 0);
+        graphics::Surface ts;
+        ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+        ts.width = ts.pitch = 200;
+        ts.height = 100;
+        graphics::SoftwareRenderer2D r(ts);
+        uint32_t dw = 0, dh = 0;
+        const int32_t dx = graphics::units_to_device(7, 150), dy = graphics::units_to_device(4, 150);      // (units (7, 4))
+        CHECK(server.draw_window_scaled(win, r, dx, dy, 150, &dw, &dh) && dw == 40 && dh == 20);
+        uint32_t wrong = 0;
+        for (int32_t y = 0; y < H; ++y)
+          for (int32_t x = 0; x < W; ++x)
+            if (target[size_t(y + dy) * 200 + size_t(x + dx)] != pattern_px(uint32_t(x), uint32_t(y))) ++wrong;
+        CHECK(wrong == 0);
+        if (wrong) printf("   150 %%: %u device pixels wrong\n", wrong);
+      }
     }
     server.set_display(1024, 768, {});      // (back to 1 for what follows)
     CHECK(app.take(early, 2).i(0) == 1);
