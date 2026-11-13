@@ -51,7 +51,10 @@
 #include "Process/MemoryFile.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/UnixSockets.hpp"
+#include "Media/Image.hpp"
+#include "Media/ImageCodecs.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
+#include "Wayland/Media/WaylandClipboardPng.hpp"
 #include "Wayland/WaylandServer.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
 
@@ -2519,6 +2522,116 @@ static void test_clipboard() {
   free_made();
 }
 
+// Pictures through the selection: the clipboard's picture offered as image/png, a client's image/png decoded onto the clipboard; broken files change nothing.
+static void test_clipboard_images() {
+  kernel::Clipboard clipboard(A);
+  const uint32_t desk[6] = {0xFF112233u, 0x80445566u, 0xFF778899u, 0x00000000u, 0xFFFFFFFFu, 0xFF010203u};
+  CHECK(clipboard.set_image(desk, 3, 2));
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_clipboard(&clipboard);
+  {
+    DataApp a(server);
+    App::Window wa = a.toplevel(true, "A");
+    const uint32_t win_a = shown_window(server, a, wa, 0xFF0000FFu);
+    CHECK(win_a);
+    // without the codecs a picture is no selection (A, the new window, has the keyboard: it was told the selection is empty)
+    CHECK(a.selection() == 0);
+    // with them: the picture is offered as image/png (read at the next tick)
+    server.set_clipboard_images(&wayland::clipboard_to_png, &wayland::png_to_clipboard);
+    server.tick();
+    std::vector<std::string> types;
+    const uint32_t offer = a.selection(&types);
+    CHECK(offer != ~0u && offer != 0 && types.size() == 1 && types[0] == "image/png");
+    // a paste of it: the PNG file, the clipboard's pixels
+    std::vector<uint8_t> pipe_a;
+    Fd pa = Fd::make_as<TestMemory>(A, &pipe_a);
+    a.send(Msg(offer, 1).s("image/png"), {pa});
+    List<wayland::TransportRequest> requests(A);
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1 && requests[0].kind == wayland::TransportRequest::Kind::Write && requests[0].data);
+    if (requests.count() == 1 && requests[0].data) {
+      media::Image got(A);
+      CHECK(media::decode_png(requests[0].data->view(), &got) && got.width() == 3 && got.height() == 2);
+      if (got.width() == 3 && got.height() == 2) CHECK(std::equal(desk, desk + 6, got.frame(0).data()));
+    }
+    requests.clear();
+    // asking for text gets nothing (the clipboard holds a picture)
+    std::vector<uint8_t> pipe_t;
+    Fd pt = Fd::make_as<TestMemory>(A, &pipe_t);
+    a.send(Msg(offer, 1).s("text/plain"), {pt});
+    server.take_requests(&requests);
+    CHECK(requests.count() == 0);
+    // A copies a picture (image/png only): it is read and decoded onto the clipboard
+    media::Image pic(A);
+    CHECK(pic.create(2, 2));
+    const uint32_t mine[4] = {0xFFAA0000u, 0xFF00BB00u, 0xFF0000CCu, 0x7F102030u};
+    std::copy(mine, mine + 4, pic.frame(0).data());
+    pic.set_has_alpha(true);
+    ByteBuffer png(A);
+    CHECK(media::encode_png(pic, 6, &png));
+    const std::vector<uint8_t> good(png.view().data(), png.view().data() + png.size());
+    auto copy_from_a = [&](const std::vector<uint8_t>& bytes) {
+      const uint32_t src = a.source({"image/png"});
+      a.send(Msg(a.device, 1).u(src).u(0));
+      a.selection();
+      List<wayland::TransportRequest> rq(A);
+      server.take_requests(&rq);
+      CHECK(rq.count() == 1 && rq[0].kind == wayland::TransportRequest::Kind::MakePipe);
+      if (rq.count() != 1) return;
+      std::vector<uint8_t> pipe_w;
+      Fd pw = Fd::make_as<TestMemory>(A, &pipe_w);
+      server.pipe_ready(rq[0].job, pw);
+      Ev ev = a.take(src, 1);
+      CHECK(ev.object == src && ev.s(0) == "image/png");
+      server.pipe_read_done(rq[0].job, ConstByteView(bytes.data(), bytes.size()));
+    };
+    copy_from_a(good);
+    uint32_t w = 0, h = 0;
+    CHECK(clipboard.image_size(&w, &h) && w == 2 && h == 2);
+    uint32_t back[4] = {};
+    CHECK(clipboard.get_image(back, 4) && std::equal(mine, mine + 4, back));
+    const uint64_t seq = clipboard.sequence();
+    // broken files: truncated at every length and with flipped bits; the clipboard keeps the good picture (or takes one the decoder still reads)
+    for (size_t cut = 0; cut < good.size(); cut += 7) copy_from_a(std::vector<uint8_t>(good.begin(), good.begin() + cut));
+    CHECK(clipboard.image_size(&w, &h) && w == 2 && h == 2 && clipboard.get_image(back, 4) && std::equal(mine, mine + 4, back));
+    for (size_t bit = 0; bit < good.size() * 8; bit += 13) {
+      std::vector<uint8_t> flipped = good;
+      flipped[bit / 8] ^= uint8_t(1u << (bit % 8));
+      copy_from_a(flipped);
+    }
+    CHECK(clipboard.image_size(&w, &h) && w <= 4096 && h <= 4096);      // (whatever was taken is a picture the clipboard holds)
+    (void)seq;
+    // a source with text and a picture: the text is what the clipboard takes
+    const uint32_t both = a.source({"image/png", "text/plain"});
+    a.send(Msg(a.device, 1).u(both).u(0));
+    CHECK(a.selection() != ~0u);
+    server.take_requests(&requests);
+    CHECK(requests.count() == 1);
+    if (requests.count() == 1) {
+      std::vector<uint8_t> pipe_w;
+      Fd pw = Fd::make_as<TestMemory>(A, &pipe_w);
+      server.pipe_ready(requests[0].job, pw);
+      Ev ev = a.take(both, 1);
+      CHECK(ev.object == both && ev.s(0) == "text/plain");
+      const std::string t = "words";
+      server.pipe_read_done(requests[0].job, ConstByteView(reinterpret_cast<const uint8_t*>(t.data()), t.size()));
+      String text(A);
+      CHECK(clipboard.get_text(&text) && text.view() == StringView("words"));
+    }
+    requests.clear();
+    // the desktop copies a picture again: offered as image/png, A's source cancelled
+    CHECK(clipboard.set_image(desk, 3, 2));
+    server.tick();
+    CHECK(a.has(both, 2));
+    CHECK(a.selection(&types) != ~0u && types.size() == 1 && types[0] == "image/png");
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 static void test_drag_and_drop() {
   Server server(A);
   server.set_fd_maker(&make_test_fd, nullptr);
@@ -2983,6 +3096,7 @@ int main() {
   test_dxg_cpu_mapping();
   test_syncobj();
   test_clipboard();
+  test_clipboard_images();
   test_mapping();
   test_extras();
   test_drag_and_drop();

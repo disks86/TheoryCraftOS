@@ -42,6 +42,7 @@
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Kernel/Clipboard.hpp"
+#include "Wayland/Media/WaylandClipboardPng.hpp"
 #include "Wayland/WaylandServer.hpp"
 
 namespace {
@@ -157,7 +158,12 @@ int main(int argc, char** argv) {
   // the desktop's clipboard: TCOS_CLIPBOARD_TEXT seeds it; what it holds at the end is printed ("clipboard: ...")
   kernel::Clipboard clipboard(g_allocator);
   if (const char* seed = getenv("TCOS_CLIPBOARD_TEXT")) clipboard.set_text(seed);
+  if (getenv("TCOS_CLIPBOARD_IMAGE")) {      // a 3 x 2 picture: red, green, blue / half-transparent white, black, transparent
+    const uint32_t pixels[6] = {0xFFFF0000u, 0xFF00FF00u, 0xFF0000FFu, 0x80FFFFFFu, 0xFF000000u, 0x00000000u};
+    clipboard.set_image(pixels, 3, 2);
+  }
   const uint64_t clipboard_start = clipboard.sequence();
+  server.set_clipboard_images(&wayland::clipboard_to_png, &wayland::png_to_clipboard);      // (pictures as image/png)
   server.set_clipboard(&clipboard);
   struct Reading { uint32_t job; int fd; std::vector<uint8_t> data; };
   std::vector<Reading> readings;
@@ -354,6 +360,11 @@ int main(int argc, char** argv) {
   }
   String text(g_allocator);
   if (clipboard.sequence() != clipboard_start && clipboard.get_text(&text)) printf("clipboard: %s\n", text.c_str());
+  uint32_t iw = 0, ih = 0;
+  if (clipboard.sequence() != clipboard_start && clipboard.image_size(&iw, &ih)) {
+    std::vector<uint32_t> px(size_t(iw) * ih);
+    if (clipboard.get_image(px.data(), px.size())) printf("clipboard image: %ux%u first %08x last %08x\n", iw, ih, px.front(), px.back());
+  }
   server.set_clipboard(nullptr);
   close(listener);
   unlink(path.c_str());
