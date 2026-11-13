@@ -39,6 +39,7 @@ typedef struct WaveOut {
   HWAVEOUT self;
   WAVEFORMATEX format;
   DWORD frame;
+  UINT device;               /* the device number it was opened on (0: the speakers or the mapper; 1..: a virtual sink) */
   DWORD_PTR callback, instance;
   DWORD callback_kind;
   CRITICAL_SECTION lock;
@@ -57,10 +58,21 @@ typedef struct WaveOut {
 static WaveOut *g_waveouts[MAX_WAVEOUTS];
 static SRWLOCK g_waveouts_lock = SRWLOCK_INIT;
 
+/* The output devices: 0 the speakers, then the graph's virtual sinks (1 .. their count); none without an audio device. */
 static UINT wave_devices(void) {
-  ULONG64 n = 0;
-  return audio_call(TCOS_AUDIO_DEVICES, 0, 0, 0, 0, 0, 0, NULL, NULL, &n) == 0 && n ? WAVE_DEVICES : 0;
+  ULONG64 n = 0, virtuals = 0;
+  if (audio_call(TCOS_AUDIO_DEVICES, 0, 0, 0, 0, 0, 0, NULL, NULL, &n) != 0 || !n) return 0;
+  tcos_audio_virtual_sink(0, NULL, 0, &virtuals);
+  return WAVE_DEVICES + (UINT)(virtuals < TCOS_AUDIO_MAX_VIRTUAL ? virtuals : TCOS_AUDIO_MAX_VIRTUAL);
 }
+/* A device number's virtual sink (its node; 0: the speakers), and its name. */
+static ULONG64 wave_device_node(UINT id, char *name, int size) {
+  if (id == WAVE_MAPPER || id < WAVE_DEVICES) return 0;
+  ULONG64 count = 0;
+  return tcos_audio_virtual_sink(id - WAVE_DEVICES, name, size, &count);
+}
+/* (handles are 0x7A000000 and up: anything that low is a device number) */
+#define WAVE_HANDLE_BASE 0x10000u
 
 /* The open device behind a handle (NULL for one that is not open). */
 static WaveOut *wave_lookup(HWAVEOUT h) {
@@ -168,7 +180,9 @@ EXPORT MMRESULT WINAPI waveOutOpen(LPHWAVEOUT out, UINT id, LPCWAVEFORMATEX form
   if (out) *out = NULL;
   if (!format) return MMSYSERR_INVALPARAM;
   if (!wave_devices()) return id == WAVE_MAPPER ? MMSYSERR_NODRIVER : MMSYSERR_BADDEVICEID;
-  if (id != WAVE_MAPPER && id >= WAVE_DEVICES && !(flags & WAVE_MAPPED)) return MMSYSERR_BADDEVICEID;
+  if (id != WAVE_MAPPER && id >= wave_devices() && !(flags & WAVE_MAPPED)) return MMSYSERR_BADDEVICEID;
+  const ULONG64 target = (flags & WAVE_MAPPED) ? 0 : wave_device_node(id, NULL, 0);      /* (a virtual sink, or the speakers) */
+  if (id != WAVE_MAPPER && id >= WAVE_DEVICES && !(flags & WAVE_MAPPED) && !target) return MMSYSERR_BADDEVICEID;      /* (it went meanwhile) */
   const ULONG64 code = wave_format_code(format);
   if (!code) return WAVERR_BADFORMAT;
   if (flags & WAVE_FORMAT_QUERY) return MMSYSERR_NOERROR;
@@ -178,12 +192,13 @@ EXPORT MMRESULT WINAPI waveOutOpen(LPHWAVEOUT out, UINT id, LPCWAVEFORMATEX form
   char name[128];
   program_name(name, sizeof name);
   ULONG64 stream = 0;
-  LONG st = audio_call(TCOS_AUDIO_OPEN, 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream);
+  LONG st = audio_call(TCOS_AUDIO_OPEN, target, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream);
   if (st != 0) {
     HeapFree(GetProcessHeap(), 0, w);
     return st == (LONG)0xC000000D ? WAVERR_BADFORMAT : MMSYSERR_ALLOCATED;
   }
   w->stream = stream;
+  w->device = id == WAVE_MAPPER || (flags & WAVE_MAPPED) ? 0 : id;
   w->format = *format;
   w->format.cbSize = 0;
   w->frame = format->nBlockAlign;
@@ -347,12 +362,16 @@ EXPORT MMRESULT WINAPI waveOutGetPosition(HWAVEOUT h, LPMMTIME time, UINT size) 
 
 static MMRESULT wave_volume(HWAVEOUT h, DWORD *volume, BOOL set) {
   ULONG64 stream = 0;
-  if ((ULONG_PTR)h >= WAVE_DEVICES) {      /* a handle, not a device number: that stream's own volume */
+  if ((ULONG_PTR)h >= WAVE_HANDLE_BASE) {      /* a handle, not a device number: that stream's own volume */
     WaveOut *w = wave_lookup(h);
     if (!w) return MMSYSERR_INVALHANDLE;
     stream = w->stream;
-  } else if (!wave_devices()) {
+  } else if ((ULONG_PTR)h >= wave_devices()) {
     return MMSYSERR_BADDEVICEID;
+  } else if ((ULONG_PTR)h >= WAVE_DEVICES) {      /* a virtual sink's own (master) volume */
+    const ULONG64 node = wave_device_node((UINT)(ULONG_PTR)h, NULL, 0);
+    if (!node) return MMSYSERR_BADDEVICEID;
+    stream = TCOS_AUDIO_VIRTUAL_STREAM | node;
   }
   if (set) return audio_call(TCOS_AUDIO_SET_VOLUME, stream, *volume & 0xFFFF, *volume >> 16, 0, 0, 0, NULL, NULL, NULL) == 0 ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
   ULONG64 v = 0;
@@ -367,7 +386,7 @@ EXPORT MMRESULT WINAPI waveOutSetVolume(HWAVEOUT h, DWORD volume) { return wave_
 EXPORT MMRESULT WINAPI waveOutGetID(HWAVEOUT h, LPUINT id) {
   if (!wave_lookup(h)) return MMSYSERR_INVALHANDLE;
   if (!id) return MMSYSERR_INVALPARAM;
-  *id = 0;
+  *id = wave_lookup(h)->device;
   return MMSYSERR_NOERROR;
 }
 
@@ -378,7 +397,9 @@ EXPORT MMRESULT WINAPI waveOutSetPlaybackRate(HWAVEOUT h, DWORD v) { (void)v; re
 EXPORT MMRESULT WINAPI waveOutMessage(HWAVEOUT h, UINT message, DWORD_PTR a, DWORD_PTR b) { (void)h; (void)message; (void)a; (void)b; return MMSYSERR_NOTSUPPORTED; }
 
 static void fill_caps_name(WCHAR *w, CHAR *a, UINT id) {
+  char sink[MAXPNAMELEN];
   const char *name = id == WAVE_MAPPER ? "Microsoft Sound Mapper" : "TheoryCraftOS Audio";
+  if (id != WAVE_MAPPER && id >= WAVE_DEVICES && wave_device_node(id, sink, sizeof sink)) name = sink;      /* (a virtual sink: its description) */
   int i = 0;
   for (; name[i] && i < MAXPNAMELEN - 1; ++i) { if (w) w[i] = (WCHAR)name[i]; if (a) a[i] = name[i]; }
   if (w) w[i] = 0;
@@ -391,7 +412,8 @@ static void fill_caps_name(WCHAR *w, CHAR *a, UINT id) {
 EXPORT MMRESULT WINAPI waveOutGetDevCapsA(UINT_PTR id, LPWAVEOUTCAPSA caps, UINT size) {
   if (!caps || size < sizeof *caps) return MMSYSERR_INVALPARAM;
   if (!wave_devices()) return (UINT)id == WAVE_MAPPER ? MMSYSERR_NODRIVER : MMSYSERR_BADDEVICEID;
-  if ((UINT)id != WAVE_MAPPER && id >= WAVE_DEVICES) { WaveOut *w = wave_lookup((HWAVEOUT)id); if (!w) return MMSYSERR_BADDEVICEID; id = 0; }
+  if ((UINT)id != WAVE_MAPPER && id >= WAVE_HANDLE_BASE) { WaveOut *w = wave_lookup((HWAVEOUT)id); if (!w) return MMSYSERR_BADDEVICEID; id = w->device; }
+  else if ((UINT)id != WAVE_MAPPER && id >= wave_devices()) return MMSYSERR_BADDEVICEID;
   caps->wMid = MM_MICROSOFT;
   caps->wPid = (UINT)id == WAVE_MAPPER ? TCOS_PID_MAPPER : TCOS_PID_WAVEOUT;
   caps->vDriverVersion = 0x0100;
@@ -406,7 +428,8 @@ EXPORT MMRESULT WINAPI waveOutGetDevCapsA(UINT_PTR id, LPWAVEOUTCAPSA caps, UINT
 EXPORT MMRESULT WINAPI waveOutGetDevCapsW(UINT_PTR id, LPWAVEOUTCAPSW caps, UINT size) {
   if (!caps || size < sizeof *caps) return MMSYSERR_INVALPARAM;
   if (!wave_devices()) return (UINT)id == WAVE_MAPPER ? MMSYSERR_NODRIVER : MMSYSERR_BADDEVICEID;
-  if ((UINT)id != WAVE_MAPPER && id >= WAVE_DEVICES) { WaveOut *w = wave_lookup((HWAVEOUT)id); if (!w) return MMSYSERR_BADDEVICEID; id = 0; }
+  if ((UINT)id != WAVE_MAPPER && id >= WAVE_HANDLE_BASE) { WaveOut *w = wave_lookup((HWAVEOUT)id); if (!w) return MMSYSERR_BADDEVICEID; id = w->device; }
+  else if ((UINT)id != WAVE_MAPPER && id >= wave_devices()) return MMSYSERR_BADDEVICEID;
   caps->wMid = MM_MICROSOFT;
   caps->wPid = (UINT)id == WAVE_MAPPER ? TCOS_PID_MAPPER : TCOS_PID_WAVEOUT;
   caps->vDriverVersion = 0x0100;

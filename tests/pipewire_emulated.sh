@@ -50,7 +50,7 @@ x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/winmmtest.exe" tests/windows/
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/dsoundtest.exe" tests/windows/dsoundtest.c -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/recordtest.exe" tests/windows/recordtest.c -lwinmm -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/xaudio2test.exe" tests/windows/xaudio2test.c -L"$work/build/windows" -l:xaudio2_9.dll -lole32 -luuid
-x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/virtualsinktest.exe" tests/windows/virtualsinktest.c -lole32 -luuid
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/virtualsinktest.exe" tests/windows/virtualsinktest.c -lwinmm -ldsound -lole32 -luuid
 # the Linux program
 lld=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/gcc-ld/ld.lld 2>/dev/null | head -1 || true)
 case $arch in

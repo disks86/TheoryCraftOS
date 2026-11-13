@@ -19,11 +19,15 @@
 /* A PipeWire virtual sink (a null sink: the emulator makes "emu-null" with TCOS_EMU_NULL_SINK, as pw-cli create-node adapter would) from a Windows
  * program through WASAPI (mmdevapi.dll): it is a render endpoint of its own next to the speakers, found by its name; a client of it plays 600 Hz into
  * it, a loopback client of the same endpoint records what plays there (the 600 Hz, and not the emulator's native 300 Hz, which plays on the
- * speakers); its IAudioEndpointVolume is the sink's own volume, apart from the speakers'. Run by tests/pipewire_emulated.sh (nullsink). 24 kHz mono
+ * speakers); its IAudioEndpointVolume is the sink's own volume, apart from the speakers'. Then winmm (the sink is wave output device 1, named
+ * after it: 400 Hz queued on it) and DirectSound (DirectSoundEnumerate lists it: 500 Hz from a looping buffer of a device made for its GUID), each
+ * recorded back by the loopback client. Run by tests/pipewire_emulated.sh (nullsink). 24 kHz mono
  * 16-bit both ways (the emulator is slow; the kernel converts). Prints "virtualsinktest: N checks, M failed". */
 #define COBJMACROS
 #include <windows.h>
+#include <mmsystem.h>
 #include <initguid.h>
+#include <dsound.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <endpointvolume.h>
@@ -90,6 +94,50 @@ static IMMDevice *find_endpoint(IMMDeviceEnumerator *en, const WCHAR *name, UINT
   IMMDeviceCollection_Release(all);
   return found;
 }
+
+/* What plays in the sink for `frames` frames (after skipping the first `skip`), by a loopback client of its endpoint. */
+static int record_sink(IMMDevice *sink, short *out, int frames, int skip) {
+  IAudioClient *rec = NULL;
+  IAudioCaptureClient *cap = NULL;
+  WAVEFORMATEX f = {WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0};
+  if (IMMDevice_Activate(sink, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&rec) != S_OK || !rec) return 0;
+  int got = 0, seen = 0, rounds = 0;
+  if (IAudioClient_Initialize(rec, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, &f, NULL) == S_OK &&
+      IAudioClient_GetService(rec, &IID_IAudioCaptureClient, (void **)&cap) == S_OK && cap && IAudioClient_Start(rec) == S_OK) {
+    while (got < frames && rounds++ < 3000) {
+      UINT32 packet = 0;
+      while (got < frames && IAudioCaptureClient_GetNextPacketSize(cap, &packet) == S_OK && packet > 0) {
+        BYTE *data = NULL;
+        UINT32 n = 0;
+        DWORD flags = 0;
+        if (IAudioCaptureClient_GetBuffer(cap, &data, &n, &flags, NULL, NULL) != S_OK) break;
+        for (UINT32 i = 0; i < n; ++i, ++seen)
+          if (seen >= skip && got < frames) out[got++] = (flags & AUDCLNT_BUFFERFLAGS_SILENT) ? 0 : ((const short *)data)[i];
+        IAudioCaptureClient_ReleaseBuffer(cap, n);
+      }
+      Sleep(10);
+    }
+    IAudioClient_Stop(rec);
+  }
+  if (cap) IAudioCaptureClient_Release(cap);
+  IAudioClient_Release(rec);
+  return got;
+}
+
+/* (DirectSoundEnumerate's callback: the device whose description is the sink's) */
+static GUID g_sink_guid;
+static int g_sink_found, g_devices_listed;
+static BOOL CALLBACK find_ds_device(LPGUID guid, LPCSTR description, LPCSTR module, LPVOID context) {
+  (void)module; (void)context;
+  ++g_devices_listed;
+  if (guid && strcmp(description, "Emulated null sink") == 0) {
+    g_sink_guid = *guid;
+    g_sink_found = 1;
+  }
+  return TRUE;
+}
+
+static short g_wave[RATE * 2];
 
 int main(void) {
   CHECK(SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED)));
@@ -184,6 +232,63 @@ int main(void) {
   IAudioCaptureClient_Release(capture);
   IAudioClient_Release(player);
   IAudioClient_Release(recorder);
+
+  /* ---- winmm: the sink is device 1 */
+  {
+    CHECK(waveOutGetNumDevs() >= 2);
+    WAVEOUTCAPSA caps;
+    CHECK(waveOutGetDevCapsA(1, &caps, sizeof caps) == MMSYSERR_NOERROR && strcmp(caps.szPname, "Emulated null sink") == 0);
+    CHECK(waveOutGetDevCapsA(0, &caps, sizeof caps) == MMSYSERR_NOERROR && strcmp(caps.szPname, "Emulated null sink") != 0);
+    WAVEFORMATEX f = {WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0};
+    HWAVEOUT h = NULL;
+    CHECK(waveOutOpen(&h, 1, &f, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR && h);
+    UINT id = 99;
+    CHECK(h && waveOutGetID(h, &id) == MMSYSERR_NOERROR && id == 1);
+    if (h) {
+      for (int i = 0; i < RATE * 2; ++i) g_wave[i] = (short)(LEVEL * tcos(2.0 * 3.14159265358979323846 * 400.0 * i / RATE));
+      WAVEHDR hdr = {(LPSTR)g_wave, sizeof g_wave, 0, 0, 0, 0, NULL, 0};
+      CHECK(waveOutPrepareHeader(h, &hdr, sizeof hdr) == MMSYSERR_NOERROR && waveOutWrite(h, &hdr, sizeof hdr) == MMSYSERR_NOERROR);
+      const int n = record_sink(sink, g_recorded, RATE / 2, RATE * 3 / 10);
+      const double a400 = amplitude(g_recorded, n, 400.0);
+      printf("virtualsinktest: winmm device 1 into the null sink: 400 Hz %.0f\n", a400);
+      CHECK(n >= RATE / 2 && a400 > 3000 && a400 < 7000);
+      waveOutReset(h);
+      waveOutUnprepareHeader(h, &hdr, sizeof hdr);
+      CHECK(waveOutClose(h) == MMSYSERR_NOERROR);
+    }
+  }
+
+  /* ---- DirectSound: the sink is a device DirectSoundEnumerate lists */
+  {
+    CHECK(DirectSoundEnumerateA(find_ds_device, NULL) == DS_OK && g_devices_listed >= 3 && g_sink_found);
+    IDirectSound8 *ds = NULL;
+    CHECK(g_sink_found && DirectSoundCreate8(&g_sink_guid, &ds, NULL) == DS_OK && ds);
+    GUID back;
+    CHECK(GetDeviceID(&g_sink_guid, &back) == DS_OK && memcmp(&back, &g_sink_guid, sizeof back) == 0);
+    if (ds) {
+      CHECK(IDirectSound8_SetCooperativeLevel(ds, GetDesktopWindow(), DSSCL_PRIORITY) == DS_OK);
+      WAVEFORMATEX f = {WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0};
+      DSBUFFERDESC desc = {sizeof desc, DSBCAPS_GLOBALFOCUS, RATE, 0, &f, {0}};      /* (half a second, looping) */
+      IDirectSoundBuffer *buffer = NULL;
+      CHECK(IDirectSound8_CreateSoundBuffer(ds, &desc, &buffer, NULL) == DS_OK && buffer);
+      if (buffer) {
+        void *p1 = NULL, *p2 = NULL;
+        DWORD n1 = 0, n2 = 0;
+        if (IDirectSoundBuffer_Lock(buffer, 0, RATE, &p1, &n1, &p2, &n2, 0) == DS_OK) {
+          for (DWORD i = 0; i < n1 / 2; ++i) ((short *)p1)[i] = (short)(LEVEL * tcos(2.0 * 3.14159265358979323846 * 500.0 * i / RATE));
+          IDirectSoundBuffer_Unlock(buffer, p1, n1, p2, n2);
+        }
+        CHECK(IDirectSoundBuffer_Play(buffer, 0, 0, DSBPLAY_LOOPING) == DS_OK);
+        const int n = record_sink(sink, g_recorded, RATE / 2, RATE * 3 / 10);
+        const double a500 = amplitude(g_recorded, n, 500.0), a400 = amplitude(g_recorded, n, 400.0);
+        printf("virtualsinktest: DirectSound into the null sink: 500 Hz %.0f (400 Hz %.0f)\n", a500, a400);
+        CHECK(n >= RATE / 2 && a500 > 3000 && a500 < 7000 && a400 < 200);
+        IDirectSoundBuffer_Stop(buffer);
+        IDirectSoundBuffer_Release(buffer);
+      }
+      IDirectSound8_Release(ds);
+    }
+  }
 done:
   printf("virtualsinktest: %d checks, %d failed\n", checks, failed);
   return failed ? 1 : 0;
