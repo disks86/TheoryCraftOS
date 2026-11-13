@@ -72,6 +72,7 @@
 #include "WebGl/AccelConformance.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Desktop/AppMan/HttpNetwork.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -2286,6 +2287,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     } else {
       Entry(Level::Warning, "D-Bus").text("the buses could not start (no machine id)");
     }
+    desktop::appman::HttpNetwork appman_network(shared_allocator, &web_tls);      // the App Manager's downloads (AppImages from AppMan's catalog)
+    desktop.set_appman_network(&appman_network);
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
 #ifdef TCOS_AUTORUN
@@ -2339,6 +2342,56 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     };
     static AutoRun autorun{&shared_allocator, &explorer_files.file_system()};
     kernel::detach(kernel::spawn(&AutoRun::main, &autorun, "autorun"));
+#endif
+#ifdef TCOS_APPMAN_SELFTEST
+    // The build asked for the App Manager's whole path to be tried (tests/appman_qemu.sh): once the network is up, AppMan's catalog and the application
+    // TCOS_APPMAN_SELFTEST are fetched and installed with the kernel's HTTP client, and what happened goes to the debug console.
+    struct AppManSelfTest {
+      allocators::IAllocator* allocator;
+      filesystem::IFileSystem* files;
+      desktop::appman::HttpNetwork* network;
+      static void main(void* argument) {
+        AppManSelfTest& t = *static_cast<AppManSelfTest*>(argument);
+        String list(*t.allocator);
+        bool fetched = false;
+        for (uint32_t attempt = 0; attempt < 30 && !fetched; ++attempt) {      // (DHCP may take a while)
+          kernel::sleep_ms(2000);
+          fetched = t.network->fetch(desktop::appman::kCatalogUrl, desktop::appman::kMaxCatalogBytes, &list);
+        }
+        desktop::appman::Catalog catalog(*t.allocator);
+        console::puts("appman-selftest: catalog ");
+        console::puts(fetched && catalog.parse(list.view()) ? "ok, " : "FAILED, ");
+        console::put_dec(static_cast<int64_t>(catalog.count()));
+        console::puts(" applications (");
+        console::puts(t.network->last_error());
+        console::puts(")\n");
+        desktop::appman::Installer installer(*t.allocator, *t.files, *t.network);
+        desktop::appman::Progress progress;
+        String detail(*t.allocator);
+        const desktop::appman::Result r = installer.install(TCOS_APPMAN_SELFTEST, &progress, &detail);
+        console::puts("appman-selftest: install " TCOS_APPMAN_SELFTEST ": ");
+        console::puts(desktop::appman::result_name(r));
+        console::puts(" (");
+        console::puts(detail.view());
+        console::puts("; ");
+        console::puts(t.network->last_error());
+        console::puts("), ");
+        console::put_dec(static_cast<int64_t>(progress.done));
+        console::puts(" bytes\n");
+        List<desktop::InstalledApp> apps(*t.allocator);
+        if (desktop::find_installed_apps(*t.files, *t.allocator, &apps))
+          for (const desktop::InstalledApp& app : apps.view()) {
+            console::puts("appman-selftest: start menu: ");
+            console::puts(app.label.view());
+            console::puts(" -> ");
+            console::puts(app.program.view());
+            console::puts("\n");
+          }
+        console::puts(r == desktop::appman::Result::Ok ? "appman-selftest: PASSED\n" : "appman-selftest: FAILED\n");
+      }
+    };
+    static AppManSelfTest appman_selftest{&shared_allocator, &explorer_files.file_system(), &appman_network};
+    kernel::detach(kernel::spawn(&AppManSelfTest::main, &appman_selftest, "appman-selftest"));
 #endif
     explorer_files.set_notifier(on_storage_change, &desktop);
     EjectContext eject_context{&explorer_files, {}};

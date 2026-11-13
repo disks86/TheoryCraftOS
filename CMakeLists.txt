@@ -625,6 +625,10 @@ add_executable(BOOTX64
   src/Desktop/Calendar.cpp
   src/Desktop/CalendarStore.cpp
   src/Desktop/Todo.cpp
+  src/Desktop/AppManager.cpp
+  src/Desktop/AppMan/AppManCatalog.cpp
+  src/Desktop/AppMan/AppManInstaller.cpp
+  src/Desktop/AppMan/HttpNetwork.cpp
   src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
@@ -855,6 +859,7 @@ add_executable(BOOTX64
   src/Program/ProgramRunner.cpp
   src/Program/AppImageLaunch.cpp
   src/Program/AppRunScript.cpp
+  src/Program/ShellTools.cpp
   src/Program/EmulatedTask.cpp
   src/Emulation/GuestCpu.cpp
   src/Emulation/EmulatedProcess.cpp
@@ -1438,6 +1443,10 @@ if(TCOS_AMD_VEGAM)
 endif()
 # A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
 # what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).
+set(TCOS_APPMAN_SELFTEST "" CACHE STRING "An AppImage of AppMan's catalog for the kernel to install when it is up (tests/appman_qemu.sh)")
+if(TCOS_APPMAN_SELFTEST)
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_APPMAN_SELFTEST=\"${TCOS_APPMAN_SELFTEST}\"")
+endif()
 set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
 set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
 if(TCOS_AUTORUN)

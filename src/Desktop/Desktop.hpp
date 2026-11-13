@@ -44,6 +44,7 @@
 #include "Desktop/VideoViewer.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/CalendarStore.hpp"
+#include "Desktop/AppManager.hpp"
 #include "Desktop/Todo.hpp"
 #include "Desktop/TodoStore.hpp"
 #include "Desktop/Notepad.hpp"
@@ -100,7 +101,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar, kAppTodo };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar, kAppTodo, kAppAppManager };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -210,6 +211,9 @@ class Desktop {
   uint32_t database_query_count() const;
   // Where the web browser gets web pages from (nullptr: none, web addresses then say so). It must outlive the desktop.
   void set_page_loader(browser::IPageLoader* loader);
+  // How the App Manager reaches the network (main gives it the kernel's HTTP client, AppMan/HttpNetwork.hpp; nullptr: nothing can be installed). Must
+  // outlive the desktop.
+  void set_appman_network(appman::INetwork* network);
   browser::IPageLoader* page_loader() const { return page_loader_; }
   // Opens a web browser window: the first one is web_browser() (when that is closed), further ones are made as needed and go away when closed.
   WebBrowser* open_web_browser(gui::TabFrame* into = nullptr);
@@ -245,6 +249,9 @@ class Desktop {
   // Opens a to-do window: the first one is todo() (when that is closed), further ones are made as needed and go away when closed.
   Todo* open_todo(gui::TabFrame* into = nullptr);
   Todo& todo() { return todo_; }
+  // Opens the App Manager (the AppImage package manager; one window: a second call shows the one that is open).
+  AppManager* open_app_manager(gui::TabFrame* into = nullptr);
+  AppManager& app_manager() { return app_manager_; }
   uint32_t todo_count() const;
   // The to-do items, kept in /AppStore/Todo once set_file_system() has been called (before that, in memory only).
   TodoStore& todo_store() { return *todo_store_; }
@@ -369,6 +376,7 @@ class Desktop {
   static void on_calendar(void* self, gui::Control&);
   static void on_calendar_toast(void* self, gui::Control&);
   static void on_todo(void* self, gui::Control&);
+  static void on_app_manager(void* self, gui::Control&);
   static int64_t calendar_time(void* self);
   static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -490,6 +498,8 @@ class Desktop {
   Calendar calendar_;
   UniquePointer<TodoStore> todo_store_;   // (before the to-do windows, which show it)
   Todo todo_;
+  appman::INetwork* appman_network_ = nullptr;
+  AppManager app_manager_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"

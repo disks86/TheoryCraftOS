@@ -17,6 +17,7 @@
  */
 
 #include "Program/AppRunScript.hpp"
+#include "Program/ShellTools.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Move.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -31,7 +32,8 @@ namespace {
 constexpr uint64_t npos = StringView::npos;
 constexpr uint64_t kMaxScriptBytes = 1u << 20;
 constexpr uint32_t kMaxSteps = 200000, kMaxDepth = 24, kMaxLinkHops = 40;
-constexpr uint64_t kMaxCapture = 1u << 16;
+constexpr uint64_t kMaxCapture = 64ull << 20;      // what one command may write into a pipe or a $( ) (a web page, a JSON answer)
+constexpr uint64_t kMaxFetch = 32ull << 20;      // what curl may fetch
 constexpr int kNotFound = 127;
 
 enum class TokenKind : uint8_t { Word, Op, Newline, Redirect, End };
@@ -347,6 +349,10 @@ class Shell {
     String head(allocator_);
     if (!read_file(path, 4096, &head)) return kNotFound;
     if (head.view().starts_with("\x7F" "ELF")) {
+      if (no_launch_) {
+        halt(false);
+        return 0;
+      }
       if (!launch(path, argv)) halt(true);
       return 0;
     }
@@ -376,6 +382,20 @@ class Shell {
 
   bool out_of_memory() const { return out_of_memory_; }
   bool launched() const { return launched_; }
+
+  // For evaluate_script_variable: no program is ever started, curl goes through `network`.
+  void set_network(IScriptNetwork* network) { network_ = network; }
+  void forbid_launch() { no_launch_ = true; }
+  int run_program_text(StringView text) {
+    UniquePointer<Script> script = UniquePointer<Script>::make(allocator_, allocator_);
+    if (!script || !script->text.assign(text)) return fail_memory();
+    return run_text(util::move(script), true);
+  }
+  bool variable(StringView name, String* out) const {
+    const Var* var = find_var(name);
+    if (!var || !var->is_set) return false;
+    return out->assign(var->array ? (var->items.count() ? var->items.view()[0].view() : StringView()) : var->value.view());
+  }
 
  private:
   // ---------------------------------------------------------------- variables
@@ -637,15 +657,28 @@ class Shell {
       if (take) status = s;
     }
   }
+  // Each stage writes into a buffer of its own, which is the next stage's input; the last one's goes where the pipeline's output goes.
   int pipeline(Cursor& c, bool run) {
     bool negate = false;
     if (word_is(c, "!")) { negate = true; ++c.pos; }
-    int status = command(c, run);
-    while (op_is(c, "|") || op_is(c, "|&")) {
+    String* const outer = capture_;
+    const StringView outer_input = input_;
+    String stage(allocator_), previous(allocator_);
+    int status = 0;
+    for (;;) {
+      stage.clear();
+      capture_ = &stage;
+      status = command(c, run);
+      if (!op_is(c, "|") && !op_is(c, "|&")) break;
       ++c.pos;
       skip_newlines(c);
-      status = command(c, run);
+      previous = util::move(stage);
+      stage = String(allocator_);
+      input_ = previous.view();
     }
+    capture_ = outer;
+    input_ = outer_input;
+    output(stage.view());
     if (negate) status = status == 0 ? 1 : 0;
     if (run && !syntax_) last_status_ = status;
     return status;
@@ -972,7 +1005,7 @@ class Shell {
   }
 
   void output(StringView text) {
-    if (capture_ && capture_->size() < kMaxCapture) {
+    if (capture_ && text.size() <= kMaxCapture - capture_->size()) {
       if (!capture_->append(text)) out_of_memory_ = true;
     }
   }
@@ -1204,6 +1237,10 @@ class Shell {
       return 0;
     }
     if (name.equals("cat")) {
+      if (args.size() == 1 || (args.size() == 2 && arg(1).equals("-"))) {
+        output(input_);
+        return 0;
+      }
       for (uint64_t i = 1; i < args.size(); ++i) {
         String contents(allocator_);
         if (!read_file(arg(i), kMaxCapture, &contents)) return 1;
@@ -1236,16 +1273,61 @@ class Shell {
       return 0;
     }
     if (const Function* function = find_function(name)) return call(*function, args);
+    if (name.equals("curl") || name.equals("wget")) return fetch(name.equals("curl"), args);
+    {
+      // The text filters (ShellTools.hpp) over this command's input.
+      List<StringView> tool_args(allocator_);
+      for (uint64_t i = 1; i < args.size(); ++i)
+        if (!tool_args.push_back(arg(i))) return fail_memory();
+      String written(allocator_);
+      int status = 0;
+      if (shell_tools::run(allocator_, name, tool_args.view(), input_, &written, &status)) {
+        output(written.view());
+        return status;
+      }
+    }
 
     // Another program. One inside the AppImage is where the script hands over; anything else this shell does not have.
     String program(allocator_);
     if (!find_program(name, &program)) return fail_memory();
     if (program.empty()) return kNotFound;
-    if (inside_app(program.view()) && !capture_) {
+    if (inside_app(program.view()) && substitutions_ == 0) {
       for (String& assignment : assignments.view()) assign(assignment.view(), true);
       return run_file(program.view(), args, false);
     }
     return kNotFound;
+  }
+
+  // curl URL / wget -O- URL: the body, through the network the caller gave (none: as if the host could not be found, exit status 6 / 4).
+  int fetch(bool curl, ArrayView<String> args) {
+    StringView url;
+    bool to_stdout = curl;
+    for (uint64_t i = 1; i < args.size(); ++i) {
+      const StringView a = args[i].view();
+      if (curl && (a.equals("-A") || a.equals("-H") || a.equals("-u") || a.equals("-e") || a.equals("-m") || a.equals("--user-agent") || a.equals("--header") ||
+                   a.equals("--max-time") || a.equals("--retry") || a.equals("--connect-timeout") || a.equals("-x"))) {
+        ++i;
+        continue;
+      }
+      if (curl && (a.equals("-o") || a.equals("-O") || a.equals("--output") || a.equals("--remote-name"))) return kNotFound;      // (downloads to files: not here)
+      if (!curl && (a.equals("-O") || a.equals("--output-document"))) {
+        to_stdout = i + 1 < args.size() && args[i + 1].view().equals("-");
+        ++i;
+        continue;
+      }
+      if (!curl && (a.equals("-qO-") || a.equals("-O-") || a.equals("-qO") || a.equals("--output-document=-"))) {
+        to_stdout = !a.equals("-qO") || (i + 1 < args.size() && args[++i].view().equals("-"));
+        continue;
+      }
+      if (a.starts_with('-')) continue;
+      if (url.empty()) url = a;
+    }
+    if (url.empty() || !to_stdout) return kNotFound;
+    if (!network_) return curl ? 6 : 4;
+    String body(allocator_);
+    if (!network_->fetch(url, kMaxFetch, &body)) return curl ? 22 : 8;
+    output(body.view());
+    return 0;
   }
 
   bool assign_literal(StringView word, bool export_it) {
@@ -1804,7 +1886,9 @@ class Shell {
     String* saved_capture = capture_;
     const bool saved_halted = halted_;
     capture_ = result;
+    ++substitutions_;
     const int status = eval(commands);
+    --substitutions_;
     capture_ = saved_capture;
     if (launched_) return true;
     halted_ = saved_halted;
@@ -1865,7 +1949,10 @@ class Shell {
   List<String> positional_;
   String cwd_, trap_, appdir_;
   String* capture_ = nullptr;
-  uint32_t steps_ = 0, depth_ = 0;
+  StringView input_;      // what the command reads (the pipe before it; nothing at the start)
+  IScriptNetwork* network_ = nullptr;
+  bool no_launch_ = false;
+  uint32_t steps_ = 0, depth_ = 0, substitutions_ = 0;
   int last_substitution_ = 0;
   bool halted_ = false, launched_ = false, out_of_memory_ = false, syntax_ = false;
   bool breaking_ = false, continuing_ = false, returning_ = false;
@@ -1887,6 +1974,22 @@ AppRunResult evaluate_apprun(allocators::IAllocator& allocator, filesystem::IFil
   shell.run_file(entry, argv.view(), true);
   if (shell.out_of_memory()) return AppRunResult::OutOfMemory;
   return shell.launched() ? AppRunResult::Launch : AppRunResult::NoProgram;
+}
+
+}  // namespace desktop
+
+namespace desktop {
+
+bool evaluate_script_variable(allocators::IAllocator& allocator, filesystem::IFileSystem& files, StringView world_root, StringView script, StringView variable,
+                              ArrayView<const StringView> environment, IScriptNetwork* network, String* value) {
+  AppRunLaunch unused(allocator);
+  Shell shell(allocator, files, world_root, &unused);
+  if (!shell.init(ArrayView<const StringView>(), environment)) return false;
+  shell.set_network(network);
+  shell.forbid_launch();
+  shell.run_program_text(script);
+  if (shell.out_of_memory()) return false;
+  return shell.variable(variable, value);
 }
 
 }  // namespace desktop

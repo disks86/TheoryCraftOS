@@ -32,6 +32,11 @@ namespace desktop {
 // Is the file at `path` an AppImage (which type)? None if it cannot be read or is not one.
 exe::AppImageType appimage_type(filesystem::IFileSystem& files, StringView path);
 
+// The image inside the AppImage at `path` of `files`, mounted read only (SquashFS for type 2, ISO 9660 for type 1), with its root as the AppImage's AppDir.
+// False with *message saying why if the file is not an AppImage or its image cannot be read. The image reads from the file as long as it is kept.
+[[nodiscard]] bool open_appimage_image(allocators::IAllocator& allocator, filesystem::IFileSystem& files, StringView path, UniquePointer<filesystem::IFileSystem>* image,
+                                       String* message);
+
 // Running an AppImage the way its runtime would, without the runtime: its image - the SquashFS appended to a type 2 AppImage, or the ISO 9660 image
 // that a type 1 AppImage is - is mounted read only at /tmp/.mount_<name><id> of the Linux world, for this program alone (a GraftFileSystem over the
 // OS file system, whose links that point outside the image lead into the Linux world as on Linux), the variables the runtime sets are
