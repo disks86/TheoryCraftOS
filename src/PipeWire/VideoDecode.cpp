@@ -43,7 +43,8 @@ bool codec_of_subtype(uint32_t subtype, hardware::VideoCodec* out) {
     case kSubtypeVc1: *out = hardware::VideoCodec::Vc1; return true;
     case kSubtypeVp8: *out = hardware::VideoCodec::Vp8; return true;
     case kSubtypeVp9: *out = hardware::VideoCodec::Vp9; return true;
-    case kSubtypeMpeg4: case kSubtypeXvid: *out = hardware::VideoCodec::Mpeg4; return true;      // (MPEG-4 Part 2: where a codec decodes it)
+    case kSubtypeMpeg4: case kSubtypeXvid: *out = hardware::VideoCodec::Mpeg4; return true;      // (MPEG-4 Part 2)
+    case kSubtypeH263: *out = hardware::VideoCodec::H263; return true;
     default: return false;
   }
 }

@@ -87,7 +87,8 @@ OpenResult VideoPlayer::finish_avi() {
   config.raw_format = info.raw_format;
   decoder_ = codecs_.create_decoder(config);
   if (!decoder_) return OpenResult::NoDecoder;
-  if (info.codec == VideoCodec::H264 && !seq_build_avi()) {
+  // (Streams whose pictures come out in another order than their packets - B pictures - are read as a sequence.)
+  if ((info.codec == VideoCodec::H264 || info.codec == VideoCodec::Mpeg4) && !seq_build_avi()) {
     release();
     return OpenResult::OutOfMemory;
   }
@@ -584,7 +585,7 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
   return true;
 }
 
-// An MP4 / MOV file: its H.264, VP9 or AV1 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
+// An MP4 / MOV / 3GP file: its H.264, VP9, AV1, MPEG-4 Part 2 or H.263 video track read sample by sample, and its audio track (AAC or MP3) decoded as it plays.
 OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   kernel::ScopedMutex guard(mutex_);
   release();
@@ -595,16 +596,20 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::Unsupported;
   }
-  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333, vp08 = 0x76703038, vp09 = 0x76703039, av01 = 0x61763031;
+  const uint32_t avc1 = 0x61766331, avc3 = 0x61766333, vp08 = 0x76703038, vp09 = 0x76703039, av01 = 0x61763031, mp4v = 0x6D703476, s263 = 0x73323633,
+                 h263 = 0x68323633;
   const bool vp8 = track->codec == vp08;
   const bool vp9 = track->codec == vp09;   // (VP8, VP9 and AV1 streams describe themselves: no configuration record is needed)
   const bool av1 = track->codec == av01;
-  if (!vp8 && !vp9 && !av1 && ((track->codec != avc1 && track->codec != avc3) || track->config.empty())) {
+  // MPEG-4 Part 2 (object type 0x20 in the esds; its decoder specific info is the layer header) and H.263 (3GPP's s263).
+  const bool mpeg4 = track->codec == mp4v && (track->object_type == 0x20 || track->object_type == 0);
+  const bool is_h263 = track->codec == s263 || track->codec == h263;
+  if (!vp8 && !vp9 && !av1 && !mpeg4 && !is_h263 && ((track->codec != avc1 && track->codec != avc3) || track->config.empty())) {
     release();
     return OpenResult::NoDecoder;
   }
   DecoderConfig config;
-  config.codec = av1 ? VideoCodec::Av1 : vp9 ? VideoCodec::Vp9 : vp8 ? VideoCodec::Vp8 : VideoCodec::H264;
+  config.codec = av1 ? VideoCodec::Av1 : vp9 ? VideoCodec::Vp9 : vp8 ? VideoCodec::Vp8 : mpeg4 ? VideoCodec::Mpeg4 : is_h263 ? VideoCodec::H263 : VideoCodec::H264;
   config.width = track->width;
   config.height = track->height;
   config.output = PixelFormat::Bgra8888;
@@ -618,7 +623,7 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     release();
     return OpenResult::OutOfMemory;
   }
-  seq_one_to_one_ = config.codec != VideoCodec::H264;   // (VP8, VP9 and AV1 give a picture for a packet at once, or none for a hidden frame)
+  seq_one_to_one_ = config.codec != VideoCodec::H264 && config.codec != VideoCodec::Mpeg4;   // (VP8, VP9, AV1 and H.263 give a picture for a packet at once, or none)
   width_ = track->width;
   height_ = track->height;
   duration_us_ = seq_times_[seq_times_.count() - 1];

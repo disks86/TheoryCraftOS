@@ -92,6 +92,9 @@ bool AviFile::parse_headers(ConstByteView list) {
             } else if (tag_is_ignore_case(strl, cbody + 16, "xvid") || tag_is_ignore_case(strl, cbody + 16, "divx") || tag_is_ignore_case(strl, cbody + 16, "dx50") ||
                        tag_is_ignore_case(strl, cbody + 16, "fmp4") || tag_is_ignore_case(strl, cbody + 16, "mp4v")) {
               video_.codec = VideoCodec::Mpeg4;
+            } else if (tag_is_ignore_case(strl, cbody + 16, "h263") || tag_is_ignore_case(strl, cbody + 16, "s263") || tag_is_ignore_case(strl, cbody + 16, "u263") ||
+                       tag_is_ignore_case(strl, cbody + 16, "m263")) {
+              video_.codec = VideoCodec::H263;
             } else if (tag_is_ignore_case(strl, cbody + 16, "vp90")) {
               video_.codec = VideoCodec::Vp9;
             } else if (tag_is_ignore_case(strl, cbody + 16, "av01")) {

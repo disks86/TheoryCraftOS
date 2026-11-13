@@ -128,7 +128,15 @@ bool parse_vol(ConstByteView body, uint8_t profile_and_level, Vol* vol) {
   if (v.width == 0 || v.height == 0) return false;
   v.interlaced = b.u(1) != 0;
   v.obmc_disable = b.u(1) != 0;
-  if ((v.verid == 1 ? b.u(1) : b.u(2)) != 0) return false;   // sprite_enable: no sprites
+  const uint32_t sprite_enable = v.verid == 1 ? b.u(1) : b.u(2);
+  if (sprite_enable == 1 || sprite_enable == 3) return false;   // static sprites (and the reserved value)
+  if (sprite_enable == 2) {   // GMC
+    v.gmc = true;
+    v.warping_points = static_cast<uint8_t>(b.u(6));
+    if (v.warping_points > 3) return false;
+    v.warping_accuracy = static_cast<uint8_t>(b.u(2));
+    if (b.u(1)) return false;   // sprite_brightness_change
+  }
   if (b.u(1)) return false;                                  // not_8_bit
   v.quant_type_mpeg = b.u(1) != 0;
   for (uint32_t i = 0; i < 64; ++i) {
@@ -195,13 +203,42 @@ bool parse_vop_full(ConstByteView body, const Vol& vol, VopHeader* header) {
   b.marker();
   h.coded = b.u(1) != 0;
   if (!b.ok()) return false;
-  if (h.type == VopType::S) return false;
+  if (h.type == VopType::S && !vol.gmc) return false;
   if (h.coded) {
-    if (h.type == VopType::P) h.rounding_type = b.u(1) != 0;
+    if (h.type == VopType::P || h.type == VopType::S) h.rounding_type = b.u(1) != 0;
     h.intra_dc_vlc_thr = static_cast<uint8_t>(b.u(3));
     if (vol.interlaced) {
       h.top_field_first = b.u(1) != 0;
       h.alternate_vertical_scan = b.u(1) != 0;
+    }
+    if (h.type == VopType::S) {
+      // 6.2.5.4 sprite_trajectory(): per point dmv_length (Table B-33: 00, 010 ... 110, 1110, 11110, ...), then the value, and a marker after each.
+      for (uint32_t i = 0; i < vol.warping_points; ++i) {
+        for (int c = 0; c < 2; ++c) {
+          uint32_t length;
+          if (b.u(1) == 0) {
+            length = b.u(1) ? 1 : 0;   // 00 -> 0, 01x -> 1, 2 (below)
+            if (length == 1) length = b.u(1) ? 2 : 1;
+          } else {
+            const uint32_t two = b.u(2);   // 100 -> 3, 101 -> 4, 110 -> 5, 111.. -> 6 and more
+            if (two < 3) {
+              length = 3 + two;
+            } else {
+              length = 6;
+              while (b.u(1)) {
+                if (++length > 14 || !b.ok()) return false;
+              }
+            }
+          }
+          int32_t value = 0;
+          if (length) {
+            const uint32_t raw = b.u(length);
+            value = (raw >> (length - 1)) ? static_cast<int32_t>(raw) : static_cast<int32_t>(raw) - (1 << length) + 1;
+          }
+          h.sprite_trajectory[i][c] = value;
+          b.marker();
+        }
+      }
     }
     h.quant = static_cast<uint8_t>(b.u(5));   // quant_precision is 5 for 8-bit video
     if (h.quant == 0) return false;
@@ -228,9 +265,12 @@ bool parse_vop_header(ConstByteView body, const Vol& vol, VopHeader* header) { r
 
 bool is_short_header(ConstByteView data) { return data.size() >= 3 && data[0] == 0 && data[1] == 0 && (data[2] & 0xFC) == 0x80; }
 
-bool parse_short_header(ConstByteView data, ShortHeader* header) {
+bool parse_short_header(ConstByteView data, const ShortHeader* previous, ShortHeader* header) {
   // H.263 Table 1 / ISO/IEC 14496-2 Table 6-25: the source formats.
   static const uint16_t kFormats[6][2] = {{0, 0}, {128, 96}, {176, 144}, {352, 288}, {704, 576}, {1408, 1152}};
+  // H.263 Table 6: the address lengths of a slice's first macroblock.
+  static const uint32_t kMbaMax[6] = {47, 98, 395, 1583, 6335, 9215};
+  static const uint8_t kMbaLength[7] = {6, 7, 9, 11, 13, 14, 14};
   if (!is_short_header(data)) return false;
   Bits b(data);
   ShortHeader h;
@@ -238,19 +278,87 @@ bool parse_short_header(ConstByteView data, ShortHeader* header) {
   h.temporal_reference = static_cast<uint8_t>(b.u(8));
   if (b.u(1) != 1 || b.u(1) != 0) return false;   // PTYPE bit 1 (always 1) and 2 (always 0: distinguishes the header from H.261)
   b.u(3);                                          // split screen, document camera, freeze picture release
-  const uint32_t format = b.u(3);
-  if (format == 0 || format > 5) return false;     // forbidden, reserved, or the extended PTYPE of H.263 version 2
-  h.width = kFormats[format][0];
-  h.height = kFormats[format][1];
-  h.inter = b.u(1) != 0;
-  if (b.u(4) != 0) return false;                   // unrestricted motion vectors, syntax-based arithmetic coding, advanced prediction, PB frames
-  h.quant = static_cast<uint8_t>(b.u(5));
+  uint32_t format = b.u(3);
+  if (format == 0) return false;
+  if (format <= 5) {
+    h.width = kFormats[format][0];
+    h.height = kFormats[format][1];
+    h.inter = b.u(1) != 0;
+    h.long_vectors = b.u(1) != 0;
+    if (b.u(1)) return false;                      // syntax-based arithmetic coding
+    h.advanced_prediction = b.u(1) != 0;
+    if (b.u(1)) return false;                      // PB frames
+    h.quant = static_cast<uint8_t>(b.u(5));
+    h.continuous_presence = b.u(1) != 0;
+    if (h.continuous_presence) b.u(2);             // PSBI
+  } else {
+    // 5.1.4 PLUSPTYPE.
+    h.plus = true;
+    const uint32_t ufep = b.u(3);
+    if (ufep == 1) {
+      format = b.u(3);
+      h.custom_pcf = b.u(1) != 0;
+      h.umv_plus = b.u(1) != 0;
+      if (b.u(1)) return false;                    // SAC
+      h.advanced_prediction = b.u(1) != 0;
+      h.advanced_intra = b.u(1) != 0;
+      h.deblocking = b.u(1) != 0;
+      h.slice_structured = b.u(1) != 0;
+      if (b.u(1) || b.u(1)) return false;          // reference picture selection, independent segment decoding
+      h.alternative_inter_vlc = b.u(1) != 0;
+      h.modified_quant = b.u(1) != 0;
+      if (b.u(1) != 1 || b.u(3) != 0) return false;   // (start code emulation bit, reserved)
+      if (format == 0 || format == 7) return false;
+    } else if (ufep == 0 && previous && previous->plus) {
+      h = *previous;
+      h.plus = true;
+      format = 0;                                  // (the size is the previous one's)
+    } else {
+      return false;
+    }
+    const uint32_t type = b.u(3);                  // MPPTYPE
+    if (type > 1) return false;                    // I and P only
+    h.inter = type == 1;
+    if (b.u(1) || b.u(1)) return false;            // reference picture resampling, reduced resolution update
+    h.no_rounding = b.u(1) != 0;
+    if (b.u(2) != 0 || b.u(1) != 1) return false;  // reserved, start code emulation bit
+    h.continuous_presence = b.u(1) != 0;
+    if (h.continuous_presence) b.u(2);
+    if (ufep == 1) {
+      if (format == 6) {
+        // 5.1.5 CPFMT: aspect ratio, width / 4 - 1, a marker, height / 4.
+        const uint32_t par = b.u(4);
+        h.width = (b.u(9) + 1) * 4;
+        if (b.u(1) != 1) return false;
+        h.height = b.u(9) * 4;
+        if (par == 15) b.u(16);                    // the extended pixel aspect ratio
+        if (h.width == 0 || h.height == 0) return false;
+      } else {
+        h.width = kFormats[format][0];
+        h.height = kFormats[format][1];
+      }
+      if (h.custom_pcf) b.u(8);                    // 5.1.7 CPCFC: clock conversion code and divisor
+    }
+    if (h.custom_pcf) b.u(2);                      // ETR
+    if (ufep == 1) {
+      if (h.umv_plus && b.u(1) == 0) b.u(1);       // UUI
+      if (h.slice_structured && b.u(2) != 0) return false;   // SSS: rectangular or arbitrarily ordered slices
+    }
+    h.quant = static_cast<uint8_t>(b.u(5));
+  }
   if (h.quant == 0) return false;
-  h.continuous_presence = b.u(1) != 0;
-  if (h.continuous_presence) b.u(2);               // PSBI
   for (int spare = 0; b.u(1); ++spare) {           // PEI and PSPARE
     if (spare > 256 || !b.ok()) return false;
     b.u(8);
+  }
+  if (h.slice_structured) {
+    // The first slice's header: SEPB1, MBA, SEPB2.
+    const uint32_t mbs = ((h.width + 15) / 16) * ((h.height + 15) / 16);
+    int k = 0;
+    while (k < 6 && mbs - 1 > kMbaMax[k]) ++k;
+    if (b.u(1) != 1) return false;
+    h.first_mb = b.u(kMbaLength[k]);
+    if (b.u(1) != 1) return false;
   }
   if (!b.ok()) return false;
   h.header_bits = b.position();
@@ -279,7 +387,7 @@ bool parse_packet(ConstByteView data, const Vol* current, Packet* packet) {
       profile_and_level = body[0];
     } else if (code >= 0x20 && code <= 0x2F) {
       Vol v;
-      if (!parse_vol(body, profile_and_level, &v)) return false;
+      if (!parse_vol(body, profile_and_level, &v) || v.gmc) return false;   // (this parse takes no sprites at all)
       out.vol = v;
       out.has_vol = true;
       vol = &out.vol;

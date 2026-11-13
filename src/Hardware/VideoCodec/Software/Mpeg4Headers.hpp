@@ -53,6 +53,8 @@ struct Vol {
   uint8_t profile_and_level = 0;                    // from the visual object sequence header, 0 when there was none
   uint8_t object_type = 0;                          // video_object_type_indication (1 Simple, 17 Advanced Simple, ...)
   bool vol_control_parameters = false;              // the layer said whether it has B planes (low_delay) itself
+  bool gmc = false;                                 // sprite_enable = GMC: S planes with global motion compensation (parse_vol_header only)
+  uint8_t warping_points = 0, warping_accuracy = 0; // no_of_sprite_warping_points (0..3), sprite_warping_accuracy (0..3)
   uint8_t intra_matrix[64] = {};                    // scan order
   uint8_t non_intra_matrix[64] = {};
 };
@@ -75,17 +77,33 @@ struct VopHeader {
   bool top_field_first = false, alternate_vertical_scan = false;   // interlaced layers only
   uint8_t quant = 0;                                // vop_quant, 1..31
   uint8_t fcode_forward = 1, fcode_backward = 1;    // 1..7
+  int32_t sprite_trajectory[3][2] = {};             // S planes: the warping points' du, dv
   uint64_t header_bits = 0;                         // bits of the plane's body (after the start code) the header takes
 };
 
-// The picture header of an H.263 baseline stream (ITU-T H.263 5.1; the same as an MPEG-4 short video header): standard source formats only, no optional modes
-// (unrestricted vectors, arithmetic coding, advanced prediction, PB frames, PLUSPTYPE), which make the parse fail.
+// The picture header of an H.263 stream (ITU-T H.263 5.1; the baseline one is the same as an MPEG-4 short video header), version 1 or 2 (PLUSPTYPE). Taken:
+// the standard and custom source formats, I and P pictures, and Annexes D (unrestricted vectors), F (advanced prediction), I (advanced intra coding), J
+// (deblocking filter), K (slice structured, rectangular and arbitrary order slices excepted), S (alternative inter VLC) and T (modified quantisation).
+// Refused: arithmetic coding (E), PB and B pictures (G, M, O), reference picture selection (N), independent segments (R), reduced resolution (Q) and
+// reference picture resampling (P).
 struct ShortHeader {
   uint32_t width = 0, height = 0;
   uint8_t temporal_reference = 0;
   bool inter = false;                               // a P picture
   uint8_t quant = 0;                                // PQUANT, 1..31
   bool continuous_presence = false;                 // CPM: GOB headers carry a sub-bitstream indicator
+  bool plus = false;                                // version 2: PLUSPTYPE
+  bool long_vectors = false;                        // Annex D of version 1 (the PTYPE bit)
+  bool umv_plus = false;                            // Annex D of version 2 (vectors in UVLC)
+  bool advanced_prediction = false;                 // Annex F: four vectors per macroblock, overlapped block motion compensation
+  bool advanced_intra = false;                      // Annex I
+  bool deblocking = false;                          // Annex J
+  bool slice_structured = false;                    // Annex K
+  bool alternative_inter_vlc = false;               // Annex S
+  bool modified_quant = false;                      // Annex T
+  bool custom_pcf = false;                          // a custom picture clock: 2 more bits of temporal reference
+  bool no_rounding = false;                         // RTYPE (version 2 P pictures)
+  uint32_t first_mb = 0;                            // slice structured: the first slice's macroblock address
   uint64_t header_bits = 0;                         // bits from the picture start code to the first macroblock
 };
 
@@ -101,14 +119,17 @@ struct Packet {
 // read or `current` (null: none known, so a plane cannot be read). Fails on a header that is cut short or uses a tool listed above. A packet with neither is a failure.
 bool parse_packet(ConstByteView data, const Vol* current, Packet* packet);
 
-// One video object layer header: `body` is what follows its start code (00 00 01 2x). Fails as parse_packet does on a tool listed above.
+// One video object layer header: `body` is what follows its start code (00 00 01 2x). Fails as parse_packet does on a tool listed above, except that GMC
+// (global motion compensation sprites, without brightness change) is accepted.
 [[nodiscard]] bool parse_vol_header(ConstByteView body, uint8_t profile_and_level, Vol* vol);
-// One plane header: `body` is what follows the plane's start code (00 00 01 B6). Fails on a cut header, a bad marker, a zero quantiser or f_code, or a sprite plane.
+// One plane header: `body` is what follows the plane's start code (00 00 01 B6). Fails on a cut header, a bad marker, a zero quantiser or f_code, or an S plane
+// of a layer without GMC.
 [[nodiscard]] bool parse_vop_header(ConstByteView body, const Vol& vol, VopHeader* header);
 // Whether `data` starts with an H.263 picture start code (22 bits: 0000 0000 0000 0000 1000 00).
 bool is_short_header(ConstByteView data);
-// The H.263 picture header at the start of `data`.
-[[nodiscard]] bool parse_short_header(ConstByteView data, ShortHeader* header);
+// The H.263 picture header at the start of `data`. A version 2 header may leave out the picture format and the optional modes (UFEP = 0): they are then
+// those of `previous` (null: such a header fails).
+[[nodiscard]] bool parse_short_header(ConstByteView data, const ShortHeader* previous, ShortHeader* header);
 
 }  // namespace mpeg4
 }  // namespace hardware

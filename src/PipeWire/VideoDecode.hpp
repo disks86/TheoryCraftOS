@@ -35,7 +35,7 @@
 namespace pipewire {
 
 // SPA_MEDIA_SUBTYPE_* of the encoded video formats
-constexpr uint32_t kSubtypeH264 = 0x20001, kSubtypeMjpg = 0x20002, kSubtypeMpeg2 = 0x20007, kSubtypeMpeg4 = 0x20008, kSubtypeXvid = 0x20009,
+constexpr uint32_t kSubtypeH264 = 0x20001, kSubtypeMjpg = 0x20002, kSubtypeH263 = 0x20005, kSubtypeMpeg2 = 0x20007, kSubtypeMpeg4 = 0x20008, kSubtypeXvid = 0x20009,
                    kSubtypeVc1 = 0x2000a, kSubtypeVp8 = 0x2000b, kSubtypeVp9 = 0x2000c, kSubtypeH265 = 0x2000e;
 
 // Where decoder (and encoder) sessions come from: the machine's video codecs.
