@@ -35,8 +35,8 @@ namespace mpeg4 {
 using h264::Mem;
 using mpeg2::BitReader;   // reading past the end gives zeros and sets error()
 
-constexpr int kPoolSize = 8;        // the two anchors, the picture being decoded, the held anchor, the pictures waiting for output and the one returned
-constexpr int kOutputQueue = 3;
+constexpr int kPoolSize = 12;       // the two anchors, the picture being decoded, the held anchor, the pictures waiting for output, the one returned, one waiting for its time
+constexpr int kOutputQueue = 6;
 constexpr int kMaxMbWidth = 256, kMaxMbHeight = 256;   // 4096 x 4096
 
 enum PictureType : int { kPictureI = 0, kPictureP = 1, kPictureB = 2 };
@@ -74,6 +74,16 @@ struct PlaneParams {
   int dc_threshold = 99;
   bool alternate_scan = false, top_field_first = false;
   bool continuous_presence = false;   // H.263: GOB headers carry GSBI
+  // H.263 optional modes (see ShortHeader).
+  bool long_vectors = false, umv_plus = false, obmc = false, aic = false, deblocking = false, slices = false, aiv = false, modified_quant = false;
+  int first_mb = 0;
+  // An S plane (GMC; decoded as a P plane whose macroblocks may use the global motion, mcsel): the warp, as FFmpeg derives it from the trajectory.
+  bool gmc = false;
+  int warping_points = 0;             // the effective number: 1 is a translation
+  int accuracy = 0;                   // sprite_warping_accuracy
+  int sprite_offset[2][2] = {};       // [luma / chroma][x / y]
+  int sprite_delta[2][2] = {};
+  int sprite_shift[2] = {};
 };
 
 enum MvType : int { kMv16x16 = 0, kMv8x8 = 1, kMvField = 2 };
@@ -82,6 +92,8 @@ enum Direction : int { kForward = 1, kBackward = 2 };
 // A macroblock, parsed.
 struct Mb {
   bool intra = false, skipped = false, ac_pred = false, field_dct = false;
+  bool mcsel = false;            // predicted with the global motion of an S plane
+  bool aic_left = false;         // H.263 advanced intra coding with ac_pred: predicted from the left (else from above)
   int cbp = 0;                   // bit 5: block 0, ..., bit 0: block 5
   int mv_type = kMv16x16;
   int dir = kForward;            // kForward | kBackward
@@ -89,6 +101,14 @@ struct Mb {
   int field_select[2][2] = {};   // [direction][field]
   int last[6] = {};              // the last coefficient of each block in scan order, -1: no coefficients
   int16_t block[6][64];          // by position (row * 8 + column)
+};
+
+// A macroblock of a data-partitioned packet between its partitions: the modes, coded pattern, quantiser and intra DC differentials (the vectors go to the
+// picture's MbInfo directly).
+struct PartitionMb {
+  bool intra = false, skipped = false, four = false, ac_pred = false, dquant = false, use_dc_vlc = false, mcsel = false;
+  uint8_t cbpc = 0, cbp = 0, qscale = 1;
+  int16_t dc[6] = {};
 };
 
 class Core {
@@ -108,6 +128,7 @@ class Core {
  private:
   // --- Mpeg4Syntax.cpp
   bool build_vlcs();
+  bool decode_packet(ConstByteView data, int64_t pts);
   bool decode_mpeg4(ConstByteView data, int64_t pts);
   bool decode_h263(ConstByteView data, int64_t pts);
   bool decode_vop(ConstByteView body, int64_t pts);
@@ -117,6 +138,9 @@ class Core {
   void output_picture(Picture* p);
   Picture* find_free_picture();
   void decode_macroblocks(BitReader& br);
+  int recover(BitReader& br, int index);
+  bool partitioned_packet(BitReader& br, int start, int* count);
+  bool partition_dc(BitReader& br, PartitionMb& m);
   bool macroblock_mpeg4(BitReader& br, Mb& mb);
   bool macroblock_h263(BitReader& br, Mb& mb);
   bool block_mpeg4(BitReader& br, Mb& mb, int n, bool coded, bool intra, bool use_dc_vlc);
@@ -133,6 +157,17 @@ class Core {
   bool video_packet_header(BitReader& br, int* mb_index);
   bool gob_header(BitReader& br, int* mb_index);
   void record_macroblock(const Mb& mb);
+  bool setup_sprite(const VopHeader& h);
+  int chroma_quant(int q) const;
+  void h263_dquant(BitReader& br);
+  bool h263_motion(BitReader& br, int prediction, int* value);
+  bool h263_vectors(BitReader& br, Mb& mb, bool four);
+  void h263_intra_prediction(Mb& mb, int n);
+  void preview_next(const BitReader& br);
+  void overlapped_motion(const Picture& ref);
+  void deblock_macroblock(const Mb& mb);
+  int global_vector(int component) const;
+  void global_motion(const Picture& ref);
   // --- Mpeg4Recon.cpp
   void reconstruct(Mb& mb);
   void conceal(int from, int to);
@@ -157,6 +192,11 @@ class Core {
   int queue_count_ = 0;
   Picture* returned_ = nullptr;
   bool need_intra_ = true;
+  // A packed bitstream (DivX: an anchor and the B plane after it in one packet, then a placeholder packet): the B picture waits for the next packet and
+  // takes its time, so that each picture carries the time of the packet that stands for it, as an unpacked stream's would.
+  Picture* awaiting_time_ = nullptr;
+  bool placeholder_expected_ = false;
+  int pictures_in_packet_ = 0;
 
   // 6.3.5 / 7.6.9.5: the plane times (in ticks of the layer's time base) and the temporal distances of direct mode, kept as FFmpeg keeps them.
   int64_t time_base_ = 0, last_time_base_ = 0, time_ = 0, last_non_b_time_ = 0;
@@ -172,6 +212,15 @@ class Core {
   Mem<uint8_t> mb_intra_, mb_qscale_;
   Mem<int16_t> dc_[3], ac_[3];           // per block: the reconstructed DC, and the first row and column of quantised coefficients (16 per block)
 
+  Mem<PartitionMb> partition_;           // data partitioning: the macroblocks of the packet being decoded
+  bool dc_given_ = false;                // the texture of a partitioned intra macroblock: its DC differentials came in an earlier partition
+  int16_t given_dc_[6] = {};
+  bool rvlc_ = false;
+  bool xvid_idct_ = false;               // the stream is Xvid's (its user data says so): its IDCT, as FFmpeg picks it                    // the texture is coded with reversible codes
+  Mem<uint16_t> lut_rvlc_[2];
+  Mem<uint16_t> lut_aic_;
+  ShortHeader h263_;                     // the last H.263 picture header (a version 2 header may leave its modes out)
+  bool have_h263_ = false;
   Mem<uint16_t> lut_intra_mcbpc_, lut_inter_mcbpc_, lut_cbpy_, lut_mv_, lut_dc_[2], lut_coef_[2], lut_btype_;
   uint8_t max_level_[2][2][64] = {};     // [intra / inter table][last][run]
   uint8_t max_run_[2][2][64] = {};       // [intra / inter table][last][level]

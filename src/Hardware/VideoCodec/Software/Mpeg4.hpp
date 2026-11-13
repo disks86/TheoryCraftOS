@@ -17,15 +17,19 @@
  */
 
 
-// An MPEG-4 Part 2 video decoder on the CPU (ISO/IEC 14496-2), which also decodes H.263 baseline (ITU-T H.263, the MPEG-4 short video header): the Simple and
-// Advanced Simple profiles as DivX, Xvid and FFmpeg write them - I, P and B planes, the H.263 and the MPEG quantiser (with matrices), AC/DC prediction, four
-// motion vectors per macroblock, quarter-sample motion, unrestricted motion vectors, video packets (resync markers), packed bitstreams (several planes in one
-// packet), and interlaced video (field DCT, field motion vectors, field direct mode). Not covered: data partitioning and reversible VLCs, global motion compensation
-// (S planes), shapes, scalability, studio profiles, and the optional modes of H.263 (Annexes D to T). Pictures come out in display order, cropped, as I420.
+// An MPEG-4 Part 2 video decoder on the CPU (ISO/IEC 14496-2), which also decodes H.263 (ITU-T H.263, version 1 and 2; the baseline is the MPEG-4 short video
+// header): the Simple and Advanced Simple profiles as DivX, Xvid and FFmpeg write them - I, P, B and S (GMC) planes, the H.263 and the MPEG quantiser (with
+// matrices), AC/DC prediction, four motion vectors per macroblock, quarter-sample motion, unrestricted motion vectors, video packets (resync markers), data
+// partitioning with or without reversible VLCs, packed bitstreams (several planes in one packet), and interlaced video (field DCT, field motion vectors, field
+// direct mode); and H.263 with Annexes D (unrestricted vectors), F (advanced prediction: overlapped block motion compensation), I (advanced intra coding),
+// J (deblocking filter), K (slices), S (alternative inter VLC) and T (modified quantisation), at standard or custom sizes. Not covered: static sprites,
+// shapes, scalability, studio profiles, and H.263's PB and B pictures, arithmetic coding and reference picture selection or resampling. Pictures come out in
+// display order, cropped, as I420; each carries the time of the packet it came in (a packed bitstream's B picture: the time of the placeholder after it).
 //
-// The decoder follows FFmpeg's (which the encoders in use were tuned against) where the standard leaves room: the inverse transform is the integer "simple" IDCT
-// that FFmpeg uses (another decoder's IDCT - Xvid's, say - differs by a level here and there, which does not accumulate beyond a picture group), the edges of a
-// reference picture are its whole macroblocks, and the motion vector prediction, direct mode and quarter-sample filter round as FFmpeg does.
+// The decoder follows FFmpeg's (which the encoders in use were tuned against) where the standard leaves room: the inverse transform is the integer "simple"
+// IDCT that FFmpeg uses, and Xvid's own for Xvid streams (as FFmpeg picks it); the edges of a reference picture are its whole macroblocks; and the motion
+// vector prediction, direct mode, GMC warp and quarter-sample filter round as FFmpeg's do. One place it does not: H.263 advanced prediction, where FFmpeg's
+// decoder guesses the next macroblock's vectors from stale ones and drifts from its encoder; this decoder reads them, and matches the encoder.
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/VideoCodec/VideoTypes.hpp"

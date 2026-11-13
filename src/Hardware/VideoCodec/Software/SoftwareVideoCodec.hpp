@@ -30,7 +30,7 @@ namespace hardware {
 //   - H.265 / HEVC Main profile, 8-bit 4:2:0 (see H265.hpp),
 //   - MPEG-2 video, Main and High profile 4:2:0 (see Mpeg2.hpp),
 //   - VC-1 progressive Simple, Main and Advanced profile (see Vc1.hpp),
-//   - MPEG-4 Part 2 Simple and Advanced Simple profile (DivX, Xvid) and H.263 baseline (see Mpeg4.hpp),
+//   - MPEG-4 Part 2 Simple and Advanced Simple profile (DivX, Xvid) and H.263 version 1 and 2 (see Mpeg4.hpp),
 //   - VP8 of all four versions (see Vp8.hpp),
 //   - VP9 of all four profiles (see Vp9.hpp), and
 //   - AV1 of all three profiles (see Av1.hpp),
