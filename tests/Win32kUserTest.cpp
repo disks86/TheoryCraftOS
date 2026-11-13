@@ -1121,7 +1121,7 @@ void test_dpi_virtualization() {
   Th a2(aware_prog, 96, kScratch);
   std::vector<Call_> sizes;
   auto logging = [&](Th& th, Call_& c) -> uint64_t {
-    if (c.msg == WM_SIZE || c.msg == WM_MOVE || c.msg == WM_MOUSEMOVE) sizes.push_back(c);
+    if (c.msg == WM_SIZE || c.msg == WM_MOVE || c.msg == WM_MOUSEMOVE || c.msg == 0x2E0 /* WM_DPICHANGED */) sizes.push_back(c);
     return def_proc(th, c);
   };
   t.proc = logging;
@@ -1252,10 +1252,28 @@ void test_dpi_virtualization() {
   }
   // --- 150 %: the mapping rounds units up and device pixels down, so the unaware program still reads back what it set
   one[0].scale_percent = 150;
+  sizes.clear();
   bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
   pump(t);
   pump(a2);
+  pump(a2);
   CHECK(gdi::screen_width() == 1536 && user_misc::system_dpi() == 144);
+  // the per-monitor aware window heard WM_DPICHANGED (144 dpi, its place in units suggested), and DefWindowProc put it there; the unaware one did not
+  {
+    bool told = false;
+    for (const Call_& c : sizes)
+      if (c.msg == 0x2E0) {
+        CHECK(c.hwnd == v && c.wparam == (144u | 144u << 16) && rd(c.payload, 0) == 300 && rd(c.payload, 4) == 150 && rd(c.payload, 8) == 750 && rd(c.payload, 12) == 450);
+        told = true;
+      }
+    CHECK(told);
+    wr = a2.window_rect(v);
+    CHECK(wr.l == 300 && wr.t == 150 && wr.r == 750 && wr.b == 450);
+    CHECK(bridge.window_info(v, &info, nullptr) && info.window.x == 200 && info.window.y == 100 && info.window.width == 300 && info.window.height == 200);
+    CHECK(a2.svc32(N::NtUserCallHwnd, {v, 2}) == 144);
+    wr = t.window_rect(u);      // (unaware: the same units)
+    CHECK(wr.l == 50 && wr.t == 60 && wr.r == 350 && wr.b == 260);
+  }
   CHECK(t.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9}) == 1024);
   const uint32_t f = t.create("DpiClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 33, 47, 301, 199, 0, 0, "Fractional");
   CHECK(f != 0);

@@ -621,6 +621,10 @@ uint64_t swp_op_begin(Call& call, const SwpArgs& args, uint32_t show_cmd, bool w
 // WM_SYSCOMMAND of the kernel's desktop: the user moved or sized the window in the desktop's frame. lParam: x, y (signed) and width, height (unsigned), 16 bits each,
 // from the low end. DefWindowProc places the window with SetWindowPos in the program's own thread (WM_WINDOWPOSCHANGING / CHANGED, WM_MOVE, WM_SIZE as usual).
 constexpr uint32_t kScTcosPlace = 0xF1F0;
+// The desktop's scale changed (Win32kUserDpi.cpp): a per-monitor DPI aware window hears WM_DPICHANGED with this packed rectangle (device pixels) as the
+// suggested one; DefWindowProc sends it in the window's thread.
+constexpr uint32_t kScTcosDpi = 0xF1E0;
+constexpr uint32_t kWmDpiChanged = 0x02E0;
 uint64_t set_window_pos_op(Call& call, const SwpArgs& args, uint64_t final_result);
 void apply_zorder(Window* w, uint32_t after);
 Rect window_maximized_rect(Window* w);                   // where a maximized window goes

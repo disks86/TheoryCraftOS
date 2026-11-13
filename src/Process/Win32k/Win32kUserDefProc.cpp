@@ -17,6 +17,7 @@
  */
 // DefWindowProc: the default handling of window messages (NtUserMessageCall with NtUserDefWindowProc), and the notes (messages sent after a state change) it uses.
 #include "Process/Win32k/Win32kUserInternal.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 
 namespace process::win32k::user {
 
@@ -178,6 +179,21 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       op->result = 0;
       break;
     }
+    case kWmDpiChanged: {
+      // (as the program would: the window goes to the suggested rectangle, in the caller's coordinates)
+      Rect r;
+      if (lparam == 0 || !w->parent || !read_rect(call, lparam, &r)) break;
+      r = dpi_up(r, caller_scale(call));
+      op_continue(call, *op);
+      SwpArgs args;
+      args.w = w;
+      args.x = r.left;
+      args.y = r.top;
+      args.cx = r.right - r.left;
+      args.cy = r.bottom - r.top;
+      args.flags = wn::SWP_NOZORDER | wn::SWP_NOACTIVATE;
+      return swp_op_begin(call, args, kSwpNoShow, false, false);
+    }
     case wn::WM_NCHITTEST: {
       const uint32_t k = caller_scale(call);
       const int32_t x = dpi_up(int16_t(lparam & 0xFFFF), k), y = dpi_up(int16_t((lparam >> 16) & 0xFFFF), k);
@@ -248,6 +264,18 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
         // the user moves or sizes the window with the mouse: the desktop drags its frame (the program hears of it as the frame moves)
         const uint32_t edge = cmd == SC_MOVE ? kDragMove : uint32_t(wparam) & 0xF;
         if (edge >= 1 && edge <= kDragMove) drag_requested(top_level_of(w), edge);
+      } else if (cmd == kScTcosDpi && w->parent) {
+        // the desktop's scale changed: the program hears WM_DPICHANGED (the new dpi, and the rectangle that keeps its place, as a RECT it may change)
+        const uint64_t l = uint64_t(lparam);
+        const int32_t x = int16_t(uint16_t(l)), y = int16_t(uint16_t(l >> 16)), cx = int32_t(uint16_t(l >> 32)), cy = int32_t(uint16_t(l >> 48));
+        const uint32_t dpi = user_misc::system_dpi();
+        uint8_t raw[16];
+        const int32_t v[4] = {x, y, x + cx, y + cy};
+        for (uint32_t i = 0; i < 4; ++i)
+          for (uint32_t b = 0; b < 4; ++b) raw[4 * i + b] = uint8_t(uint32_t(v[i]) >> (8 * b));
+        List<uint8_t> payload(S().alloc);
+        for (uint8_t b : raw) payload.push_back(b);
+        if (queue_payload_upcall(call, op, w, kWmDpiChanged, uint64_t(dpi) | uint64_t(dpi) << 16, payload, 0xFFFF, 0, 0) || op->waiting_on) return kUpcallDue;
       } else if (cmd == kScTcosPlace && w->parent) {
         op_continue(call, *op);
         const uint64_t l = uint64_t(lparam);

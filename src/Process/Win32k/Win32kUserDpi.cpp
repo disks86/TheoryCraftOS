@@ -68,17 +68,30 @@ void set_device_scale_from_desktop(uint32_t scale) {
     if (d && d->root)
       for (Window* c = d->root->first_child; c; c = c->next) tops.push_back(c->handle);
   }
-  // each top-level keeps its place in desktop units: its device rectangle times after / before (through the program, as a move of the desktop's would)
+  // each top-level keeps its place in desktop units: its device rectangle times after / before. A per-monitor aware window is asked, as on Windows
+  // (WM_DPICHANGED with that rectangle suggested, DefWindowProc applying it when the program does not); any other is moved through the program, as a
+  // move of the desktop's would be (an unaware one's units stay what they were; a system-aware one keeps its device size, as Windows leaves it).
   for (uint32_t hwnd : tops.view()) {
     gdi::Rect r;
+    bool per_monitor = false;
     {
       LockGuard g;
       Window* w = find_window(hwnd);
       if (!w) continue;
       r = window_rect_screen(w);
+      per_monitor = !w->dpi_virtual && (w->dpi_context & 0x0F) == 2;
     }
     auto conv = [&](int32_t v) { return static_cast<int32_t>(int64_t{v} * after / before); };
-    move_top_level(hwnd, {conv(r.left), conv(r.top), conv(r.right), conv(r.bottom)});
+    const gdi::Rect to{conv(r.left), conv(r.top), conv(r.right), conv(r.bottom)};
+    if (!per_monitor) {
+      move_top_level(hwnd, to);
+      continue;
+    }
+    const int32_t cx = to.right - to.left, cy = to.bottom - to.top;
+    if (cx < 0 || cy < 0 || cx > 0xFFFF || cy > 0xFFFF || to.left < -32768 || to.left > 32767 || to.top < -32768 || to.top > 32767) continue;
+    const uint64_t packed = uint64_t(uint16_t(int16_t(to.left))) | uint64_t(uint16_t(int16_t(to.top))) << 16 | uint64_t(uint16_t(cx)) << 32 | uint64_t(uint16_t(cy)) << 48;
+    LockGuard g;
+    post_message(hwnd, 0x112 /* WM_SYSCOMMAND */, kScTcosDpi, packed);
   }
 }
 
