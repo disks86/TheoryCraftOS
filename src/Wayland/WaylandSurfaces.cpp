@@ -1487,18 +1487,22 @@ void Server::decoration_request(Client& c, uint32_t id, Resource& r, uint16_t op
 
 // ------------------------------------------------------------------ drawing
 
-void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done) {
+// scale > 1 (HiDPI, draw_window_scaled): the renderer is in device pixels, `scale` per surface unit, and (x, y) is in them. A buffer made at that scale with
+// no transform or viewport is drawn 1:1 (a GPU buffer where it is); any other goes through draw_mapped, which enlarges it.
+void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done, uint32_t scale) {
+  const int32_t k = static_cast<int32_t>(scale);
   for (Surface* entry : s.stack.view()) {
     if (entry) {
-      if (entry->role == Role::Subsurface) draw_tree(*entry, renderer, x + entry->sub_x, y + entry->sub_y, false, done);
+      if (entry->role == Role::Subsurface) draw_tree(*entry, renderer, x + entry->sub_x * k, y + entry->sub_y * k, false, done, scale);
       continue;
     }
     for (uint32_t cb : s.callbacks.view()) done->push_back(cb);
     s.callbacks.clear();
     if (s.feedback.count() && s.current.valid()) presented(s, true);      // (shown now: wp_presentation_feedback.presented)
-    if (!s.mapping.identity()) {      // turned, scaled or cropped: one affine map from the buffer to the screen (WaylandScale.cpp)
+    const bool native = s.mapping.scale == k && s.mapping.transform == 0 && s.mapping.source[0] == -1 && s.mapping.destination[0] == -1;      // (1:1 on the device)
+    if (!native) {      // turned, scaled or cropped, or not at the device's scale: one affine map from the buffer to the screen (WaylandScale.cpp)
       renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);
-      draw_mapped(s, renderer, x, y);
+      draw_mapped(s, renderer, x, y, scale);
       continue;
     }
     if (GpuImage* image = s.current.image()) {      // a dmabuf: drawn where it is (see GpuImage::draw)

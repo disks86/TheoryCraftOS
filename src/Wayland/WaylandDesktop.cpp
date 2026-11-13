@@ -47,6 +47,9 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       monitors_[0].rect = monitors_[0].work = monitors_[0].panel = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
       monitor_count_ = 1;
     }
+    const uint32_t scale = monitors.size() > 0 && monitors[0].scale >= 1 && monitors[0].scale <= 4 ? monitors[0].scale : 1;
+    const bool rescaled = scale != output_scale_;
+    output_scale_ = scale;
     // the outputs say so again; maximized and full-screen windows get the new size
     for (uint32_t i = 1; i < kMaxClients; ++i) {
       Client* c = clients_[i].get();
@@ -62,6 +65,7 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       }
       for (uint64_t k = 0; k < outputs.count(); ++k) announce(*c, outputs[k], Iface::Output, versions[k]);
     }
+    if (rescaled) announce_scale();
     arrange_layers();      // (panels follow their monitor)
     for (Surface* s : stack_.view())
       if (s->role == Role::Toplevel && (s->maximized || s->fullscreen)) {
@@ -163,6 +167,15 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
 }
 
 bool Server::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) {
+  return draw_window_at(window, renderer, x, y, 1, width, height);
+}
+
+bool Server::draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) {
+  if (scale < 1 || scale > 4) return false;
+  return draw_window_at(window, device, x, y, scale, width, height);
+}
+
+bool Server::draw_window_at(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) {
   {
     kernel::ScopedMutex lock(mutex_);
     poll_waiting();      // (commits whose acquire point the GPU reached meanwhile)
@@ -171,7 +184,7 @@ bool Server::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32
     List<uint32_t> done(allocator_);
     const int32_t gx = s->geometry_set ? s->geometry.x : 0, gy = s->geometry_set ? s->geometry.y : 0;
     draw_missed_ = false;
-    draw_tree(*s, renderer, x - gx, y - gy, true, &done);
+    draw_tree(*s, renderer, x - gx * static_cast<int32_t>(scale), y - gy * static_cast<int32_t>(scale), true, &done, scale);
     renderer.set_blend(graphics::BlendMode::Alpha);
     int32_t w = 0, h = 0;
     actual_size(*s, &w, &h);

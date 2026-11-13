@@ -19,7 +19,7 @@
 // How a buffer maps onto its surface: wl_surface.set_buffer_transform (the eight rotations and flips), set_buffer_scale, and wp_viewporter's crop
 // (set_source, in the transformed and scaled buffer's coordinates, 24.8) and size (set_destination). The surface's size follows from them (surface_size),
 // and the desktop draws the buffer through one affine map from the buffer to the screen (draw_mapped: IRenderer2D::draw_image_transformed, which a GPU
-// renderer does with its texture units). Also wp_fractional_scale_v1: the preferred scale is the output's, 1 (120 / 120): the desktop has no scale of its own.
+// renderer does with its texture units). Also wp_fractional_scale_v1: the preferred scale is the output's (the desktop's whole device scale, output_scale_, in 120ths).
 //
 // The transforms follow wl_output.transform as Weston maps surface points to buffer points (weston_transformed_coord): the client rotated its content by
 // the transform, the compositor undoes it. A buffer with a mapping that is not the identity is drawn from the CPU's view when it is a GPU buffer (read out
@@ -122,7 +122,27 @@ bool Server::check_mapping(Client& c, Surface& s, const State& state) {
   return true;
 }
 
-void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y) {
+// The output scale changed (Server::set_display): each client's outputs were announced again; its fractional scale objects get the preferred scale and
+// its surfaces of version 6 the preferred buffer scale, so a client draws at the desktop's density.
+void Server::announce_scale() {
+  for (Surface& s : surfaces_) {
+    Client* c = client_of(s.client);
+    if (!c) continue;
+    if (s.fractional_id != 0) {
+      Event e(s.fractional_id, 0);
+      e.u(120 * output_scale_);
+      send(*c, e);
+    }
+    Resource* r = c->objects.find(s.id);
+    if (r && r->version >= 6) {
+      Event e(s.id, 2);      // preferred_buffer_scale
+      e.i(static_cast<int32_t>(output_scale_));
+      send(*c, e);
+    }
+  }
+}
+
+void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t scale) {
   const BufferInfo& b = s.current;
   int32_t sw = 0, sh = 0;
   surface_size(b, s.mapping, &sw, &sh);
@@ -149,11 +169,12 @@ void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x,
   if (rr <= rx || rb <= ry) return;
   // m: a point of the rectangle (from its corner) to the screen: surface = inverse(buffer - p0), screen = surface + (x, y)
   const float ia = cy / det, ib = -ay / det, ic = -cx / det, id = ax / det;      // the inverse of [ax cx; ay cy]
+  const float k = float(scale);      // (device pixels per surface unit)
   graphics::Matrix2D m;
-  m.a = ia, m.b = ib, m.c = ic, m.d = id;
+  m.a = ia * k, m.b = ib * k, m.c = ic * k, m.d = id * k;
   const float ox = float(rx) - p0x, oy = float(ry) - p0y;
-  m.e = ia * ox + ic * oy + float(x);
-  m.f = ib * ox + id * oy + float(y);
+  m.e = (ia * ox + ic * oy) * k + float(x);
+  m.f = (ib * ox + id * oy) * k + float(y);
   // the picture: the client's memory, or the CPU's view of a GPU buffer
   graphics::Surface picture;
   List<uint32_t> gpu_pixels(allocator_);
@@ -176,13 +197,17 @@ void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x,
   }
   picture.width = uint32_t(b.width);
   picture.height = uint32_t(b.height);
-  const bool stretched = ax * ax + ay * ay != 1.0f || cx * cx + cy * cy != 1.0f;
+  // (1:1 on the target, or an exact whole enlargement of an upright buffer: no filtering)
+  const float sx2 = m.a * m.a + m.b * m.b, sy2 = m.c * m.c + m.d * m.d;
+  const bool whole = m.b == 0 && m.c == 0 && m.a >= 1 && m.d >= 1 && m.a == float(int32_t(m.a)) && m.d == float(int32_t(m.d));
+  const bool stretched = !(sx2 == 1.0f && sy2 == 1.0f) && !whole;
   const graphics::ImageFilter filter = stretched ? graphics::ImageFilter::Bilinear : graphics::ImageFilter::Nearest;
-  const bool clipped = renderer.push_clip_rect({x, y, uint32_t(sw), uint32_t(sh)});
+  const uint32_t cw = uint32_t(sw) * scale, ch = uint32_t(sh) * scale;
+  const bool clipped = renderer.push_clip_rect({x, y, cw, ch});
   if (!renderer.draw_image_transformed(picture, {rx, ry, uint32_t(rr - rx), uint32_t(rb - ry)}, m, filter)) {
     // a renderer that cannot: an upright crop is stretched; a turned or flipped picture is not drawn
     if (ay == 0 && cx == 0 && ax > 0 && cy > 0)
-      renderer.draw_image_scaled(picture, {minx, miny, maxx - minx, maxy - miny}, {x, y, uint32_t(sw), uint32_t(sh)}, filter);
+      renderer.draw_image_scaled(picture, {minx, miny, maxx - minx, maxy - miny}, {x, y, cw, ch}, filter);
   }
   if (clipped) renderer.pop_clip();
 }
@@ -216,8 +241,8 @@ void Server::viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opco
         s->viewport_id = object;
       } else {
         s->fractional_id = object;
-        Event e(object, 0);      // preferred_scale: the output's, 1 (in 120ths)
-        e.u(120);
+        Event e(object, 0);      // preferred_scale: the output's (in 120ths)
+        e.u(120 * output_scale_);
         send(c, e);
       }
       return;

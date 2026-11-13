@@ -79,8 +79,11 @@ class IWindowsSession {
   // at most 8). Done at the start and whenever the desktop's monitors change.
   // `work` leaves out the taskbar and what windows reserve (panels' exclusive zones: where maximized windows go); `panel_area` leaves out only the taskbar
   // (where panels themselves are anchored, so that one does not move away from the space it reserved). An empty panel_area is the same as `work`.
+  // `scale` (HiDPI): how many device pixels the desktop draws per unit of these coordinates (a whole number; the same for every monitor, since the desktop
+  // draws all of them at that density). A program that draws its pictures at that scale is shown sharp (draw_window_scaled); the coordinates stay these.
   struct Monitor {
     WindowsRect rect, work, panel_area;
+    uint32_t scale = 1;
   };
   virtual void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) = 0;
   // What changed since the last call (and forgets it): the windows whose state or place changed (shown, hidden, moved, sized, retitled, restyled, activated,
@@ -103,6 +106,13 @@ class IWindowsSession {
   // Draws the window's surface with its top left at (x, y) of `renderer` (the renderer's clip applies), from the kernel's memory as it is, and says its size.
   // False when there is none.
   virtual bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) = 0;
+  // HiDPI: draw_window on `device`, a renderer in device pixels, `scale` of them per unit, the window's top left at (x, y) of the device: what the program
+  // drew at that scale lands 1:1, the rest enlarged. Sizes are given in units as for draw_window. False when this session does not draw that way (the
+  // caller then uses draw_window on its scaled renderer, which enlarges everything).
+  virtual bool draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) {
+    (void)window, (void)device, (void)x, (void)y, (void)scale, (void)width, (void)height;
+    return false;
+  }
   // What the user did to the desktop's frame: the program is asked (it hears of it as it would on Windows) and the result comes back as a change.
   virtual void move_window(uint32_t window, const WindowsRect& rect) = 0;
   virtual void activate_window(uint32_t window) = 0;      // 0: none of the Windows programs' windows is active (a desktop window is)

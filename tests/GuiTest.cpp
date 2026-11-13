@@ -25,6 +25,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -1583,7 +1584,23 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     width = w;
     height = h;
     monitor_count = uint32_t(monitors.size());
-    if (monitors.size() > 0) work = monitors[0].work;
+    if (monitors.size() > 0) work = monitors[0].work, scale = monitors[0].scale;
+  }
+  uint32_t scale = 0;
+  // HiDPI: when `sharp`, the program draws at the device's scale (draw_window_scaled, in another colour); the calls are noted
+  bool sharp = false;
+  uint32_t sharp_color = 0xFFAA5500u;
+  std::vector<std::string> sharp_calls;
+  bool draw_window_scaled(uint32_t w, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t k, uint32_t* width_out, uint32_t* height_out) override {
+    if (!sharp) return false;
+    auto it = wins.find(w);
+    if (it == wins.end()) return false;
+    const desktop::WindowsRect& sr = it->second.info.surface;
+    device.fill_rect({x, y, sr.width * k, sr.height * k}, sharp_color);
+    sharp_calls.push_back(std::to_string(w) + " " + std::to_string(x) + " " + std::to_string(y) + " " + std::to_string(k));
+    *width_out = sr.width;
+    *height_out = sr.height;
+    return true;
   }
   uint32_t monitor_count = 0;
   uint32_t drag_window = 0, drag_edge = 0;
@@ -2224,6 +2241,44 @@ static void test_windows_touch() {
   CHECK(a.live == 0);
 }
 
+// HiDPI: a desktop drawing through a ScaledRenderer2D at 2 tells its programs' session scale 2; the session's window is drawn enlarged by draw_window, or
+// at device pixels by draw_window_scaled when the program draws at the scale (its picture's top left at twice the logical place).
+static void test_windows_hidpi() {
+  TestAllocator a;
+  {
+    Screen screen(a, 1600, 1200);
+    graphics::ScaledRenderer2D scaled(a, screen.renderer, 2);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeWindowsSession s(a);
+    desktop::Desktop d(a, scaled, &kb, &mouse);
+    d.set_windows_session(&s);
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    CHECK(s.scale == 2 && s.width == wm.bounds().width && wm.bounds().width <= 800);
+    const Point mo = wm.window_origin();
+    s.add(7, true, {100, 80, 200, 150}, "Notepad", true);
+    d.step(1000);
+    desktop::Win32Window* h = d.win32_windows().host(7);
+    gui::Rect2D pic;
+    CHECK(h && h->picture_area(&pic) && pic.x == 106 && pic.y == 105);
+    // enlarged: the logical pixel (mo + 110, mo + 110) is the device's 2x2 block there
+    CHECK(screen.px((mo.x + 110) * 2, (mo.y + 110) * 2) == 0xFF336699u && screen.px((mo.x + 110) * 2 + 1, (mo.y + 110) * 2 + 1) == 0xFF336699u);
+    CHECK(s.sharp_calls.empty());
+    // the program draws at the scale: drawn on the device, at twice the place
+    s.sharp = true;
+    s.changed(7);
+    {
+      gui::UiGuard lock(&wm);
+      h->invalidate();
+    }
+    d.step(2000);
+    CHECK(!s.sharp_calls.empty() && s.sharp_calls.back() == "7 " + std::to_string((mo.x + pic.x) * 2) + " " + std::to_string((mo.y + pic.y) * 2) + " 2");
+    CHECK(screen.px((mo.x + 110) * 2, (mo.y + 110) * 2) == 0xFFAA5500u && screen.px((mo.x + pic.x) * 2, (mo.y + pic.y) * 2) == 0xFFAA5500u);
+    CHECK(screen.px((mo.x + pic.x) * 2 - 1, (mo.y + pic.y) * 2 + 4) != 0xFFAA5500u);      // (the frame's border, outside the picture)
+  }
+}
+
 static void test_windows_screen() {
   TestAllocator a;
   {
@@ -2713,6 +2768,7 @@ int main() {
   test_switcher();
   test_desktop_toasts();
   test_windows_screen();
+  test_windows_hidpi();
   test_windows_touch();
   test_x11_frames();
   test_windows_more();

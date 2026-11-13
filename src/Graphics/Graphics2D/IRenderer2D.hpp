@@ -269,6 +269,12 @@ class IRenderer2D {
     return false;
   }
 
+  // HiDPI: how many device pixels one unit of this renderer's coordinates is (a ScaledRenderer2D's integer scale; 1 for the others), and the renderer
+  // that draws in those device pixels, with this one's clip and blend in force (itself, when the scale is 1). Pictures that were made at the device's
+  // resolution (a program that draws at the desktop's scale) are drawn there 1:1 instead of being enlarged.
+  virtual uint32_t pixel_scale() const { return 1; }
+  virtual IRenderer2D& device() { return *this; }
+
   // Makes everything drawn so far visible.
   virtual void present() = 0;
   // Copies what has been drawn into the frame so far (before present()) into `out`: extent().width * height pixels, 0xAARRGGBB, row after row.

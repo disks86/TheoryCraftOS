@@ -4209,6 +4209,77 @@ static void test_mapping() {
     uint32_t code = 9;
     CHECK(app.error(nullptr, &code) && code == 0);
   }
+  {      // HiDPI: a desktop at device scale 2. The output says scale 2 and a mode of twice the size; new and existing surfaces and fractional scale
+         // objects are told 2 (240); a buffer drawn at scale 2 lands 1:1 on the device, one at scale 1 enlarged (each pixel a 2x2 block)
+    App app(server);
+    const uint32_t fsm = app.bind(app.reg, "wp_fractional_scale_manager_v1");
+    const uint32_t early = app.surface();
+    const uint32_t ef = app.new_id();
+    app.send(Msg(fsm, 1).u(ef).u(early));
+    app.drop_events();
+    desktop::IWindowsSession::Monitor two[1];
+    two[0].rect = {0, 0, 1024, 768};
+    two[0].work = {0, 0, 1024, 740};
+    two[0].scale = 2;
+    server.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(two, 1));
+    CHECK(app.take(early, 2).i(0) == 2 && app.take(ef, 0).u(0) == 240);
+    const uint32_t out = app.bind(app.reg, "wl_output");
+    CHECK(app.take(out, 3).i(0) == 2);
+    Ev mode = app.take(out, 1);
+    CHECK(mode.i(1) == 2048 && mode.i(2) == 1536);
+    const uint32_t s2 = app.surface();
+    CHECK(app.take(s2, 2).i(0) == 2);
+    const uint32_t f2 = app.new_id();
+    app.send(Msg(fsm, 1).u(f2).u(s2));
+    CHECK(app.take(f2, 0).u(0) == 240);
+    for (int32_t buffer_scale : {2, 1}) {
+      App::Window w = app.toplevel(true, buffer_scale == 2 ? "sharp" : "enlarged");
+      constexpr int32_t W = 40, H = 20;
+      App::Pool p = app.pool(size_t(W) * H * 4);
+      for (int32_t y = 0; y < H; ++y)
+        for (int32_t x = 0; x < W; ++x) {
+          const uint32_t v = pattern_px(uint32_t(x), uint32_t(y));
+          memcpy(p.memory->data() + (y * W + x) * 4, &v, 4);
+        }
+      if (buffer_scale == 2) app.send(Msg(w.surface, 8).i(2));
+      const uint32_t b = app.buffer(p, 0, W, H, W * 4);
+      app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+      app.send(Msg(w.surface, 6));
+      std::vector<uint32_t> list = listed(server);
+      uint32_t win = 0;
+      for (uint32_t id : list) {
+        desktop::WindowsWindowInfo info;
+        String title(A);
+        if (server.window_info(id, &info, &title) && title.view() == StringView(buffer_scale == 2 ? "sharp" : "enlarged")) win = id;
+      }
+      CHECK(win != 0);
+      if (!win) continue;
+      desktop::WindowsWindowInfo info;
+      String title(A);
+      server.window_info(win, &info, &title);
+      CHECK(int32_t(info.surface.width) == W / buffer_scale && int32_t(info.surface.height) == H / buffer_scale);      // (units: the logical size)
+      std::vector<uint32_t> target(200 * 100, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+      ts.width = ts.pitch = 200;
+      ts.height = 100;
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window_scaled(win, r, 10, 6, 2, &dw, &dh) && int32_t(dw) == W / buffer_scale && int32_t(dh) == H / buffer_scale);
+      uint32_t wrong = 0;
+      for (int32_t y = 0; y < H * 2 / buffer_scale; ++y)
+        for (int32_t x = 0; x < W * 2 / buffer_scale; ++x) {
+          const uint32_t want = buffer_scale == 2 ? pattern_px(uint32_t(x), uint32_t(y)) : pattern_px(uint32_t(x / 2), uint32_t(y / 2));
+          if (target[size_t(y + 6) * 200 + size_t(x + 10)] != want) ++wrong;
+        }
+      CHECK(wrong == 0);
+      if (wrong) printf("   scale %d: %u device pixels wrong\n", buffer_scale, wrong);
+      CHECK(target[size_t(5) * 200 + 10] == 0 && target[size_t(6) * 200 + 9] == 0);      // (nothing outside)
+      CHECK(!server.draw_window_scaled(win, r, 0, 0, 9, &dw, &dh));
+    }
+    server.set_display(1024, 768, {});      // (back to 1 for what follows)
+    CHECK(app.take(early, 2).i(0) == 1);
+  }
   // the rules
   struct Rule {
     const char* what;
