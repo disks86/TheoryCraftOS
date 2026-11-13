@@ -32,7 +32,8 @@ namespace pipewire {
 // other with. The transport makes them (IDescriptorMaker) and passes them with the message they belong to (SCM_RIGHTS).
 class Descriptor {
  public:
-  // The memory's bytes (empty for an eventfd).
+  // The memory's bytes (empty for an eventfd). For memory a client handed over (its memfd), the bytes the file had when it came: a client that grows
+  // the file later is not seen growing.
   virtual ByteView memory() = 0;
   // An eventfd: adds one to its counter (wakes whoever waits on it).
   virtual bool signal() = 0;
@@ -75,6 +76,12 @@ class IProtocolServer {
   virtual bool take_output_with_fds(uint32_t client, ByteBuffer* out, List<Fd>* fds) {
     (void)fds;
     return take_output(client, out);
+  }
+  // For protocols that take descriptors: bytes that came from the connection and the descriptors that came with them (in the order they came; each
+  // arrives no later than the bytes of its message). A protocol that takes none sees only the bytes.
+  virtual void receive_with_fds(uint32_t client, ConstByteView bytes, List<Fd>& fds) {
+    fds.clear();
+    receive(client, bytes);
   }
   // The transport's maker of descriptors (none: the protocol offers nothing that needs them).
   virtual void set_descriptor_maker(IDescriptorMaker* maker) { (void)maker; }

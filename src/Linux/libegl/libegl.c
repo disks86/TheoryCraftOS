@@ -20,11 +20,24 @@
  * opengl32.dll gives Windows programs. Every GL command is encoded into the calling thread's command buffer by the generated entry points
  * (src/OpenGl/generated/GlEntries.inc) and runs in the kernel, reached with /dev/dxg's TCOS_DXG_IOCTL_GL (src/Process/DxgDevice.h) instead of NtTcosOpenGl.
  *
- * Displays: the Wayland platform (EGL_KHR_platform_wayland; also eglGetDisplay of a wl_display) and the surfaceless one (EGL_MESA_platform_surfaceless, and
- * EGL_DEFAULT_DISPLAY): pbuffers and no surface at all. A window surface is a wl_egl_window (libwayland-egl): eglSwapBuffers swaps the kernel's images, reads
- * the new front image straight into a wl_shm buffer (ARGB8888 or XRGB8888, one copy) and attaches, damages and commits it; with a swap interval of 1 it first
- * waits for the frame callback of the frame before. Each window surface keeps up to three buffers and its own event queue, so the program's own queue and
- * other threads never see its events. The wl_egl_window's resize takes effect at once when the surface is current on the calling thread, else at the next swap.
+ * Displays: the Wayland platform (EGL_KHR_platform_wayland; also eglGetDisplay of a wl_display), the GBM one (EGL_KHR_platform_gbm, EGL_MESA_platform_gbm;
+ * also eglGetDisplay of a gbm_device of libgbm.so.1, src/Linux/libgbm) and the surfaceless one (EGL_MESA_platform_surfaceless, and EGL_DEFAULT_DISPLAY):
+ * pbuffers and no surface at all.
+ *
+ * A Wayland window surface is a wl_egl_window (libwayland-egl): eglSwapBuffers swaps the kernel's images and copies the new front image into a buffer that it
+ * attaches, damages and commits; with a swap interval of 1 it first waits for the frame callback of the frame before. When the compositor has
+ * zwp_linux_dmabuf_v1 the buffers are GPU images (gbm buffer objects of /dev/dxg made wl_buffers with create_immed): the kernel copies the front image into
+ * the image itself (FRONT_TO_BUFFER, src/Process/WindowsOpenGl.hpp) and the compositor draws it in place. Otherwise (or with TCOS_EGL_SHM=1 in the environment)
+ * they are wl_shm buffers the front image is read straight into. Each window surface keeps up to three buffers and its own event queue, so the program's own
+ * queue and other threads never see its events. The wl_egl_window's resize takes effect at once when the surface is current on the calling thread, else at
+ * the next swap.
+ *
+ * A GBM window surface is a gbm_surface: each swap copies the front image into one of its buffers nobody holds (in the kernel, as above), which
+ * gbm_surface_lock_front_buffer then gives the program. With no free buffer the swap is EGL_BAD_ALLOC (the program must release one first).
+ *
+ * Images: EGL_KHR_image_base with EGL_EXT_image_dma_buf_import (one plane, linear, ARGB8888 / XRGB8888 / ABGR8888 / XBGR8888, a dmabuf of /dev/dxg or any
+ * mappable file) and glEGLImageTargetTexture2DOES (GL_OES_EGL_image). The texture takes the image's pixels when glEGLImageTargetTexture2DOES is called (a copy
+ * through the dmabuf's mapping): it does not follow later changes of the image, as a texture sharing its memory would.
  *
  * The library is installed as /usr/lib/libEGL.so.1; libGLESv2.so.2, libGL.so.1 and libOpenGL.so.0 are empty libraries that need it (build.sh), so a program
  * linked against any of them, or one that opens them with dlopen and looks commands up with dlsym, reaches the one copy of the state here. */
@@ -32,6 +45,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +54,8 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-egl-backend.h>
+#include <gbm.h>
+#include "../libgbm/tcos_gbm.h"
 
 #define GLAPI __attribute__((visibility("default")))
 #define APIENTRY
@@ -94,7 +110,11 @@ enum {
   EGL_LOSE_CONTEXT_ON_RESET = 0x31BF, EGL_GL_COLORSPACE = 0x309D,
   EGL_SYNC_PRIOR_COMMANDS_COMPLETE = 0x30F0, EGL_SYNC_STATUS = 0x30F1, EGL_SIGNALED = 0x30F2, EGL_UNSIGNALED = 0x30F3, EGL_TIMEOUT_EXPIRED = 0x30F5,
   EGL_CONDITION_SATISFIED = 0x30F6, EGL_SYNC_TYPE = 0x30F7, EGL_SYNC_CONDITION = 0x30F8, EGL_SYNC_FENCE = 0x30F9,
-  EGL_PLATFORM_WAYLAND_KHR = 0x31D8, EGL_PLATFORM_SURFACELESS_MESA = 0x31DD,
+  EGL_PLATFORM_GBM_KHR = 0x31D7, EGL_PLATFORM_WAYLAND_KHR = 0x31D8, EGL_PLATFORM_SURFACELESS_MESA = 0x31DD,
+  EGL_LINUX_DMA_BUF_EXT = 0x3270, EGL_LINUX_DRM_FOURCC_EXT = 0x3271, EGL_DMA_BUF_PLANE0_FD_EXT = 0x3272, EGL_DMA_BUF_PLANE0_OFFSET_EXT = 0x3273,
+  EGL_DMA_BUF_PLANE0_PITCH_EXT = 0x3274, EGL_DMA_BUF_PLANE1_FD_EXT = 0x3275, EGL_YUV_COLOR_SPACE_HINT_EXT = 0x327B, EGL_SAMPLE_RANGE_HINT_EXT = 0x327C,
+  EGL_YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT = 0x327D, EGL_YUV_CHROMA_VERTICAL_SITING_HINT_EXT = 0x327E, EGL_IMAGE_PRESERVED_KHR = 0x30D2,
+  EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT = 0x3443, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT = 0x3444,
 };
 enum { EGL_PBUFFER_BIT = 1, EGL_WINDOW_BIT = 4, EGL_OPENGL_ES_BIT = 1, EGL_OPENGL_ES2_BIT = 4, EGL_OPENGL_BIT = 8, EGL_OPENGL_ES3_BIT = 0x40 };
 enum { EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT = 1, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT = 2 };
@@ -110,7 +130,7 @@ typedef struct TcosGlRequest {
   uint32_t major, minor;
 } TcosGlRequest;
 typedef char TcosGlRequestSize[sizeof(TcosGlRequest) == 64 ? 1 : -1];
-enum { OP_CREATE = 1, OP_DELETE, OP_MAKE_CURRENT, OP_EXECUTE, OP_SWAP, OP_READ_FRONT, OP_SHARE_LISTS, OP_FLUSHED, OP_DESTROY_SURFACE };
+enum { OP_CREATE = 1, OP_DELETE, OP_MAKE_CURRENT, OP_EXECUTE, OP_SWAP, OP_READ_FRONT, OP_SHARE_LISTS, OP_FLUSHED, OP_DESTROY_SURFACE, OP_FRONT_TO_BUFFER };
 enum { SURFACE_DOUBLE = 1, SURFACE_DEPTH = 2, SURFACE_STENCIL = 4, SURFACE_ALPHA = 16 };
 enum { CREATE_CORE = 1, CREATE_FORWARD = 2, CREATE_DEBUG = 4, CREATE_ES = 8 };
 #define STATUS_RESOURCE_IN_USE ((int32_t)0xC0000708)
@@ -150,8 +170,10 @@ static const EglConfigInfo kConfigs[] = {
 enum { BUFFER_SLOTS = 3 };
 typedef struct ShmBuffer {
   struct wl_buffer *buffer;
-  void *data;
+  void *data;              /* a wl_shm buffer's mapping (null for a GPU buffer) */
   size_t bytes;
+  struct gbm_bo *bo;       /* a GPU buffer: its image */
+  int fd;                  /* ... and its dmabuf (-1: none) */
   uint32_t width, height;
   int busy;      /* attached and not yet released by the compositor */
 } ShmBuffer;
@@ -171,8 +193,11 @@ struct EglSurface {
   struct wl_surface *surface;      /* a wrapper of the window's wl_surface on `queue` */
   struct wl_shm *shm;              /* a wrapper of the display's wl_shm on `queue` */
   struct wl_callback *frame;       /* the frame callback of the last swap, until it is done */
+  struct wl_proxy *dmabuf;         /* a wrapper of the display's zwp_linux_dmabuf_v1 on `queue` (null: wl_shm buffers) */
   int dx, dy;                      /* to move the next buffer by (wl_egl_window_resize) */
   ShmBuffer slots[BUFFER_SLOTS];
+  /* a GBM window surface */
+  struct gbm_surface *gbm;
 };
 
 struct EglContext {
@@ -190,6 +215,7 @@ struct EglContext {
 struct EglDisplay {
   EglDisplay *next;
   EGLenum platform;
+  void *native;              /* what the program gave (a wl_display, a gbm_device or null) */
   struct wl_display *wl;
   pthread_mutex_t lock;      /* the lists and the Wayland objects below */
   int initialized;
@@ -197,6 +223,10 @@ struct EglDisplay {
   struct wl_registry *registry;
   struct wl_shm *shm;
   int has_argb, has_xrgb;
+  struct wl_proxy *dmabuf;              /* zwp_linux_dmabuf_v1 (version 2 or 3), when the compositor has it and the GPU buffers work */
+  uint32_t dmabuf_name, dmabuf_version;
+  struct gbm_device *buffers;           /* the device the GPU buffers of window surfaces are made on (a Wayland display's own) */
+  struct gbm_device *gbm;               /* the GBM platform's native display */
   EglSurface *surfaces;
   EglContext *contexts;
 };
@@ -294,12 +324,14 @@ static EglDisplay *ready_display(EGLDisplay handle) {
 static EGLDisplay get_display(EGLenum platform, void *native) {
   pthread_mutex_lock(&g_displays_lock);
   EglDisplay *d = g_displays;
-  while (d && !(d->platform == platform && d->wl == (struct wl_display *)native)) d = d->next;
+  while (d && !(d->platform == platform && d->native == native)) d = d->next;
   if (!d) {
     d = (EglDisplay *)calloc(1, sizeof(EglDisplay));
     if (d) {
       d->platform = platform;
-      d->wl = (struct wl_display *)native;
+      d->native = native;
+      if (platform == EGL_PLATFORM_WAYLAND_KHR) d->wl = (struct wl_display *)native;
+      if (platform == EGL_PLATFORM_GBM_KHR) d->gbm = (struct gbm_device *)native;
       pthread_mutex_init(&d->lock, NULL);
       d->next = g_displays;
       g_displays = d;
@@ -316,6 +348,7 @@ static int is_wayland_display(void *native) { return native && *(const struct wl
 
 EGLAPI EGLDisplay eglGetDisplay(void *native) {
   if (native == EGL_DEFAULT_DISPLAY) return get_display(EGL_PLATFORM_SURFACELESS_MESA, NULL);
+  if (tcos_gbm_is_device(native)) return get_display(EGL_PLATFORM_GBM_KHR, native);
   if (is_wayland_display(native)) return get_display(EGL_PLATFORM_WAYLAND_KHR, native);
   fail(EGL_BAD_PARAMETER);
   return EGL_NO_DISPLAY;
@@ -330,6 +363,10 @@ static EGLDisplay platform_display(EGLenum platform, void *native) {
     if (native) { fail(EGL_BAD_PARAMETER); return EGL_NO_DISPLAY; }
     return get_display(platform, NULL);
   }
+  if (platform == EGL_PLATFORM_GBM_KHR) {      /* (EGL_PLATFORM_GBM_MESA is the same number) */
+    if (!tcos_gbm_is_device(native)) { fail(EGL_BAD_PARAMETER); return EGL_NO_DISPLAY; }
+    return get_display(platform, native);
+  }
   fail(EGL_BAD_PARAMETER);
   return EGL_NO_DISPLAY;
 }
@@ -342,9 +379,30 @@ EGLAPI EGLDisplay eglGetPlatformDisplayEXT(EGLenum platform, void *native, const
   return platform_display(platform, native);
 }
 
+/* zwp_linux_dmabuf_v1 and zwp_linux_buffer_params_v1 (linux-dmabuf-unstable-v1.xml, as src/Linux/libvulkan/wayland.inc has them): the requests sent, and every
+ * event of versions 2 and 3 (libwayland reads an event by its signature even when nobody listens). */
+static const struct wl_interface kDmabufInterface, kParamsInterface;
+static const struct wl_interface *kParamsTypes[] = {&kParamsInterface};
+static const struct wl_interface *kNoTypes[] = {NULL, NULL, NULL, NULL, NULL, NULL};
+static const struct wl_interface *kImmedTypes[] = {&wl_buffer_interface, NULL, NULL, NULL, NULL};
+static const struct wl_message kDmabufRequests[] = {{"destroy", "", kNoTypes}, {"create_params", "n", kParamsTypes}};
+static const struct wl_message kDmabufEvents[] = {{"format", "u", kNoTypes}, {"modifier", "3uuu", kNoTypes}};
+static const struct wl_interface kDmabufInterface = {"zwp_linux_dmabuf_v1", 3, 2, kDmabufRequests, 2, kDmabufEvents};
+static const struct wl_message kParamsRequests[] = {
+    {"destroy", "", kNoTypes}, {"add", "huuuuu", kNoTypes}, {"create", "iiuu", kNoTypes}, {"create_immed", "2niiuu", kImmedTypes}};
+static const struct wl_message kParamsEvents[] = {{"created", "n", kImmedTypes}, {"failed", "", kNoTypes}};
+static const struct wl_interface kParamsInterface = {"zwp_linux_buffer_params_v1", 3, 4, kParamsRequests, 2, kParamsEvents};
+enum { DMABUF_DESTROY = 0, DMABUF_CREATE_PARAMS = 1, PARAMS_DESTROY = 0, PARAMS_ADD = 1, PARAMS_CREATE_IMMED = 3 };
+
+static int env_set(const char *name) {
+  const char *v = getenv(name);
+  return v && v[0] && strcmp(v, "0") != 0;
+}
+
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
   EglDisplay *d = (EglDisplay *)data;
   if (strcmp(interface, "wl_shm") == 0 && !d->shm) d->shm = (struct wl_shm *)wl_registry_bind(registry, name, &wl_shm_interface, 1);
+  if (strcmp(interface, kDmabufInterface.name) == 0 && version >= 2 && !d->dmabuf_name) d->dmabuf_name = name, d->dmabuf_version = version < 3 ? version : 3;      /* (create_immed is version 2) */
 }
 static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {}
 static const struct wl_registry_listener kRegistryListener = {registry_global, registry_global_remove};
@@ -368,11 +426,21 @@ static int connect_wayland(EglDisplay *d) {
   wl_registry_add_listener(d->registry, &kRegistryListener, d);
   if (wl_display_roundtrip_queue(d->wl, d->queue) < 0 || !d->shm) return 0;
   wl_shm_add_listener(d->shm, &kShmListener, d);
+  /* GPU buffers: the compositor's zwp_linux_dmabuf_v1 and a GBM device of /dev/dxg to make them on (else every window has wl_shm buffers) */
+  if (d->dmabuf_name && !env_set("TCOS_EGL_SHM") && g_dxg >= 0) {
+    d->buffers = gbm_create_device(g_dxg);
+    if (d->buffers) d->dmabuf = (struct wl_proxy *)wl_registry_bind(d->registry, d->dmabuf_name, &kDmabufInterface, d->dmabuf_version);
+  }
   if (wl_display_roundtrip_queue(d->wl, d->queue) < 0) return 0;
   return d->has_xrgb || d->has_argb;      /* (both are always there: wl_shm must offer them) */
 }
 
 static void disconnect_wayland(EglDisplay *d) {
+  if (d->dmabuf) wl_proxy_marshal_flags(d->dmabuf, DMABUF_DESTROY, NULL, d->dmabuf_version, WL_MARSHAL_FLAG_DESTROY);
+  if (d->buffers) gbm_device_destroy(d->buffers);
+  d->dmabuf = NULL;
+  d->buffers = NULL;
+  d->dmabuf_name = 0;
   if (d->shm) wl_shm_destroy(d->shm);
   if (d->registry) wl_registry_destroy(d->registry);
   if (d->queue) wl_event_queue_destroy(d->queue);
@@ -444,10 +512,11 @@ EGLAPI EGLBoolean eglTerminate(EGLDisplay handle) {
   return ok();
 }
 
-static const char kClientExtensions[] = "EGL_EXT_client_extensions EGL_EXT_platform_base EGL_KHR_platform_wayland EGL_EXT_platform_wayland EGL_MESA_platform_surfaceless "
-                                        "EGL_KHR_client_get_all_proc_addresses";
+static const char kClientExtensions[] = "EGL_EXT_client_extensions EGL_EXT_platform_base EGL_KHR_platform_wayland EGL_EXT_platform_wayland EGL_KHR_platform_gbm "
+                                        "EGL_MESA_platform_gbm EGL_MESA_platform_surfaceless EGL_KHR_client_get_all_proc_addresses";
 static const char kDisplayExtensions[] = "EGL_KHR_create_context EGL_KHR_create_context_no_error EGL_KHR_surfaceless_context EGL_KHR_no_config_context "
-                                         "EGL_KHR_get_all_proc_addresses EGL_KHR_swap_buffers_with_damage EGL_EXT_swap_buffers_with_damage EGL_KHR_fence_sync";
+                                         "EGL_KHR_get_all_proc_addresses EGL_KHR_swap_buffers_with_damage EGL_EXT_swap_buffers_with_damage EGL_KHR_fence_sync "
+                                         "EGL_KHR_image_base EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers";
 
 EGLAPI const char *eglQueryString(EGLDisplay handle, EGLint name) {
   if (handle == EGL_NO_DISPLAY) {
@@ -801,6 +870,10 @@ static EglSurface *find_surface(EglDisplay *d, EGLSurface handle) {
 static void free_slot(ShmBuffer *b) {
   if (b->buffer) wl_buffer_destroy(b->buffer);
   if (b->data) munmap(b->data, b->bytes);
+  if (b->bo) {
+    if (b->fd >= 0) close(b->fd);
+    gbm_bo_destroy(b->bo);
+  }
   memset(b, 0, sizeof(*b));
 }
 
@@ -813,6 +886,7 @@ static void free_surface(EglSurface *s) {
   if (s->window_surface) {
     for (int i = 0; i < BUFFER_SLOTS; ++i) free_slot(&s->slots[i]);
     if (s->frame) wl_callback_destroy(s->frame);
+    if (s->dmabuf) wl_proxy_wrapper_destroy(s->dmabuf);
     if (s->surface) wl_proxy_wrapper_destroy(s->surface);
     if (s->shm) wl_proxy_wrapper_destroy(s->shm);
     if (s->queue) wl_event_queue_destroy(s->queue);
@@ -895,14 +969,37 @@ static int window_attribs_ok(EGLint name, EGLint value) {
   }
 }
 
+/* A window surface of a gbm_surface (the GBM platform): its size is the gbm_surface's, fixed. Display not locked. */
+static EGLSurface create_gbm_surface(EglDisplay *d, const EglConfigInfo *cfg, void *native) {
+  uint32_t width = 0, height = 0, format = 0;
+  if (!tcos_gbm_surface_info(native, &width, &height, &format)) { fail(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
+  pthread_mutex_lock(&d->lock);
+  for (EglSurface *o = d->surfaces; o; o = o->next)
+    if (o->gbm == (struct gbm_surface *)native && !o->destroyed) {      /* (a gbm_surface has one EGL surface at a time) */
+      pthread_mutex_unlock(&d->lock);
+      fail(EGL_BAD_ALLOC);
+      return EGL_NO_SURFACE;
+    }
+  EglSurface *s = new_surface(d, cfg, 1);
+  if (s) {
+    s->gbm = (struct gbm_surface *)native;
+    s->width = (EGLint)width;
+    s->height = (EGLint)height;
+    s->next = d->surfaces;
+    d->surfaces = s;
+  }
+  pthread_mutex_unlock(&d->lock);
+  if (!s) { fail(EGL_BAD_ALLOC); return EGL_NO_SURFACE; }
+  ok();
+  return s;
+}
+
 static EGLSurface create_window_surface(EGLDisplay handle, EGLConfig config, void *native, const EGLint *ints, const EGLAttrib *attribs) {
   EglDisplay *d = ready_display(handle);
   if (!d) return EGL_NO_SURFACE;
   const EglConfigInfo *cfg = config_of(config);
   if (!cfg) { fail(EGL_BAD_CONFIG); return EGL_NO_SURFACE; }
-  if (d->platform != EGL_PLATFORM_WAYLAND_KHR) { fail(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
-  struct wl_egl_window *window = (struct wl_egl_window *)native;
-  if (!window || !window->surface) { fail(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
+  if (d->platform != EGL_PLATFORM_WAYLAND_KHR && d->platform != EGL_PLATFORM_GBM_KHR) { fail(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
   for (int i = 0;; i += 2) {
     const EGLint name = ints ? ints[i] : attribs ? (EGLint)attribs[i] : EGL_NONE;
     if (name == EGL_NONE) break;
@@ -910,6 +1007,9 @@ static EGLSurface create_window_surface(EGLDisplay handle, EGLConfig config, voi
     const int good = window_attribs_ok(name, value);
     if (good <= 0) { fail(good < 0 ? EGL_BAD_MATCH : EGL_BAD_ATTRIBUTE); return EGL_NO_SURFACE; }
   }
+  if (d->platform == EGL_PLATFORM_GBM_KHR) return create_gbm_surface(d, cfg, native);
+  struct wl_egl_window *window = (struct wl_egl_window *)native;
+  if (!window || !window->surface) { fail(EGL_BAD_NATIVE_WINDOW); return EGL_NO_SURFACE; }
   if (window->driver_private) { fail(EGL_BAD_ALLOC); return EGL_NO_SURFACE; }      /* (a window has one surface at a time) */
   pthread_mutex_lock(&d->lock);
   EglSurface *s = new_surface(d, cfg, 1);
@@ -919,10 +1019,12 @@ static EGLSurface create_window_surface(EGLDisplay handle, EGLConfig config, voi
     s->queue = wl_display_create_queue(d->wl);
     s->surface = s->queue ? (struct wl_surface *)wl_proxy_create_wrapper(window->surface) : NULL;
     s->shm = s->surface ? (struct wl_shm *)wl_proxy_create_wrapper(d->shm) : NULL;
-    good = s->shm != NULL;
+    s->dmabuf = s->shm && d->dmabuf ? (struct wl_proxy *)wl_proxy_create_wrapper(d->dmabuf) : NULL;
+    good = s->shm != NULL && (!d->dmabuf || s->dmabuf);
     if (good) {
       wl_proxy_set_queue((struct wl_proxy *)s->surface, s->queue);
       wl_proxy_set_queue((struct wl_proxy *)s->shm, s->queue);
+      if (s->dmabuf) wl_proxy_set_queue(s->dmabuf, s->queue);
       s->width = window->width > 0 ? window->width : 1;
       s->height = window->height > 0 ? window->height : 1;
       window->driver_private = s;
@@ -1108,7 +1210,7 @@ EGLAPI EGLBoolean eglMakeCurrent(EGLDisplay handle, EGLSurface draw, EGLSurface 
   if (!c) error = EGL_BAD_CONTEXT;
   else if ((draw && !ds) || (read && !rs)) error = EGL_BAD_SURFACE;
   else if (c->current && !pthread_equal(c->thread, pthread_self())) error = EGL_BAD_ACCESS;
-  else if (ds && ds->window_surface && !ds->native) error = EGL_BAD_NATIVE_WINDOW;
+  else if (ds && ds->window_surface && !ds->native && !ds->gbm) error = EGL_BAD_NATIVE_WINDOW;
   else if (c->config && ds && c->config != ds->config) error = EGL_BAD_MATCH;
   pthread_mutex_unlock(&d->lock);
   if (error) return fail(error);
@@ -1185,8 +1287,64 @@ static void frame_done(void *data, struct wl_callback *callback, uint32_t time) 
 }
 static const struct wl_callback_listener kFrameListener = {frame_done};
 
+/* A GPU buffer in slot `b`: an image of /dev/dxg (a gbm buffer object) made a wl_buffer with create_immed (one plane, offset 0, linear). 0 when the image could
+ * not be made (the surface then uses wl_shm buffers). */
+static int make_gpu_buffer(EglSurface *s, ShmBuffer *b, uint32_t width, uint32_t height) {
+  struct gbm_bo *bo = gbm_bo_create(s->display->buffers, width, height, s->config->fourcc, GBM_BO_USE_RENDERING);
+  if (!bo) return 0;
+  const int fd = gbm_bo_get_fd(bo);
+  if (fd < 0) {
+    gbm_bo_destroy(bo);
+    return 0;
+  }
+  const uint32_t version = wl_proxy_get_version(s->dmabuf);
+  struct wl_proxy *params = wl_proxy_marshal_flags(s->dmabuf, DMABUF_CREATE_PARAMS, &kParamsInterface, version, 0, NULL);
+  struct wl_buffer *buffer = NULL;
+  if (params) {
+    wl_proxy_marshal_flags(params, PARAMS_ADD, NULL, version, 0, fd, 0u, 0u, gbm_bo_get_stride(bo), 0u, 0u);
+    buffer = (struct wl_buffer *)wl_proxy_marshal_flags(params, PARAMS_CREATE_IMMED, &wl_buffer_interface, version, 0, NULL, (int32_t)width, (int32_t)height,
+                                                        s->config->fourcc, 0u);
+    wl_proxy_marshal_flags(params, PARAMS_DESTROY, NULL, version, WL_MARSHAL_FLAG_DESTROY);
+  }
+  if (!buffer) {
+    close(fd);
+    gbm_bo_destroy(bo);
+    return 0;
+  }
+  wl_buffer_add_listener(buffer, &kBufferListener, b);
+  b->buffer = buffer;
+  b->bo = bo;
+  b->fd = fd;
+  b->width = width;
+  b->height = height;
+  return 1;
+}
+
+/* A wl_shm buffer in slot `b`. */
+static int make_shm_buffer(EglSurface *s, ShmBuffer *b, uint32_t width, uint32_t height) {
+  const size_t bytes = (size_t)width * height * 4;
+  const int fd = memfd_create("egl-shm", MFD_CLOEXEC);
+  if (fd < 0) return 0;
+  if (ftruncate(fd, (off_t)bytes) != 0) { close(fd); return 0; }
+  void *data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (data == MAP_FAILED) { close(fd); return 0; }
+  struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, (int32_t)bytes);
+  close(fd);
+  if (!pool) { munmap(data, bytes); return 0; }
+  const uint32_t format = s->config->alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+  b->buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)width, (int32_t)height, (int32_t)(width * 4), format);
+  wl_shm_pool_destroy(pool);
+  if (!b->buffer) { munmap(data, bytes); return 0; }
+  wl_buffer_add_listener(b->buffer, &kBufferListener, b);
+  b->data = data;
+  b->bytes = bytes;
+  b->width = width;
+  b->height = height;
+  return 1;
+}
+
 /* A buffer of `width` x `height` that the compositor does not hold, made when there is none (waiting for one to be released when all three are held); null when the
- * connection failed or there is no memory. */
+ * connection failed or there is no memory. A GPU buffer when the surface has them; when one cannot be made, the surface goes over to wl_shm buffers. */
 static ShmBuffer *free_buffer(EglSurface *s, uint32_t width, uint32_t height) {
   for (;;) {
     ShmBuffer *same = NULL, *other = NULL, *empty = NULL;
@@ -1197,34 +1355,60 @@ static ShmBuffer *free_buffer(EglSurface *s, uint32_t width, uint32_t height) {
       if (b->width == width && b->height == height) { if (!same) same = b; }
       else if (!other) other = b;
     }
-    if (same) return same;
-    ShmBuffer *b = empty ? empty : other;
+    if (same && (!s->dmabuf || same->bo)) return same;
+    ShmBuffer *b = same ? same : empty ? empty : other;
     if (b) {
       free_slot(b);
       if (width > 16384 || height > 16384) return NULL;
-      const size_t bytes = (size_t)width * height * 4;
-      const int fd = memfd_create("egl-shm", MFD_CLOEXEC);
-      if (fd < 0) return NULL;
-      if (ftruncate(fd, (off_t)bytes) != 0) { close(fd); return NULL; }
-      void *data = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-      if (data == MAP_FAILED) { close(fd); return NULL; }
-      struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, (int32_t)bytes);
-      close(fd);
-      if (!pool) { munmap(data, bytes); return NULL; }
-      const uint32_t format = s->config->alpha ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
-      b->buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)width, (int32_t)height, (int32_t)(width * 4), format);
-      wl_shm_pool_destroy(pool);
-      if (!b->buffer) { munmap(data, bytes); return NULL; }
-      wl_buffer_add_listener(b->buffer, &kBufferListener, b);
-      b->data = data;
-      b->bytes = bytes;
-      b->width = width;
-      b->height = height;
-      return b;
+      if (s->dmabuf && make_gpu_buffer(s, b, width, height)) return b;
+      if (s->dmabuf) {      /* (no GPU image of this size or format: wl_shm from now on) */
+        wl_proxy_wrapper_destroy(s->dmabuf);
+        s->dmabuf = NULL;
+      }
+      return make_shm_buffer(s, b, width, height) ? b : NULL;
     }
     /* all held: wait for a release */
     if (wl_display_dispatch_queue(s->display->wl, s->queue) < 0) return NULL;
   }
+}
+
+/* The kernel copies the front image of the surface into the GPU image of dmabuf `fd` (FRONT_TO_BUFFER); 0 when it did. While the GPU still works on the image
+ * it is tried again for a while. */
+static int front_to_buffer(const EglSurface *s, int fd) {
+  for (int tries = 0; tries < 1000; ++tries) {
+    TcosGlRequest r;
+    memset(&r, 0, sizeof(r));
+    r.op = OP_FRONT_TO_BUFFER;
+    r.window = s->kernel_window;
+    r.data = (uint64_t)fd;
+    const int32_t st = gl_call(&r);
+    if (st >= 0) return 0;
+    if (st != STATUS_RESOURCE_IN_USE) return -1;
+    sched_yield();
+  }
+  return -1;
+}
+
+/* A swap of a GBM window surface: the new front image into a buffer of the gbm_surface nobody holds. */
+static EGLBoolean swap_gbm(EglSurface *s) {
+  TcosGlRequest r;
+  memset(&r, 0, sizeof(r));
+  r.op = OP_SWAP;
+  r.window = s->kernel_window;
+  r.width = (uint32_t)s->width;
+  r.height = (uint32_t)s->height;
+  if (gl_call(&r) < 0) return fail(EGL_BAD_SURFACE);
+  struct gbm_bo *bo = tcos_gbm_surface_take(s->gbm);
+  if (!bo) return fail(tcos_gbm_surface_info(s->gbm, NULL, NULL, NULL) ? EGL_BAD_ALLOC : EGL_BAD_NATIVE_WINDOW);      /* (every buffer held, or the gbm_surface is gone) */
+  const int fd = gbm_bo_get_fd(bo);
+  const int bad = fd < 0 || front_to_buffer(s, fd) != 0;
+  if (fd >= 0) close(fd);
+  if (bad) {
+    tcos_gbm_surface_untake(s->gbm, bo);
+    return fail(EGL_BAD_SURFACE);
+  }
+  tcos_gbm_surface_queue(s->gbm, bo);
+  return ok();
 }
 
 static EGLBoolean swap(EGLDisplay handle, EGLSurface surface, const EGLint *rects, EGLint count) {
@@ -1239,6 +1423,7 @@ static EGLBoolean swap(EGLDisplay handle, EGLSurface surface, const EGLint *rect
   if (count < 0 || (count > 0 && !rects)) return fail(EGL_BAD_PARAMETER);
   gl_stream_flush();
   if (!s->window_surface) return ok();      /* (a pbuffer has no back buffer to show) */
+  if (s->gbm) return swap_gbm(s);
   struct wl_egl_window *window = s->native;
   if (!window) return fail(EGL_BAD_NATIVE_WINDOW);
   /* the frame before must have been shown first (swap interval 1) */
@@ -1263,10 +1448,15 @@ static EGLBoolean swap(EGLDisplay handle, EGLSurface surface, const EGLint *rect
   s->height = new_height;
   ShmBuffer *b = free_buffer(s, width, height);
   if (!b) return fail(EGL_BAD_ALLOC);
-  /* the picture, top row first, B G R A bytes: ARGB8888 / XRGB8888 as wl_shm has them */
-  r.data = (uint64_t)(uintptr_t)b->data;
-  r.length = (uint32_t)b->bytes;
-  if (gl_call(&r) < 0) return fail(EGL_BAD_SURFACE);
+  if (b->bo) {
+    /* a GPU buffer: the kernel copies the picture into its image */
+    if (front_to_buffer(s, b->fd) != 0) return fail(EGL_BAD_SURFACE);
+  } else {
+    /* the picture, top row first, B G R A bytes: ARGB8888 / XRGB8888 as wl_shm has them */
+    r.data = (uint64_t)(uintptr_t)b->data;
+    r.length = (uint32_t)b->bytes;
+    if (gl_call(&r) < 0) return fail(EGL_BAD_SURFACE);
+  }
   const uint32_t version = wl_proxy_get_version((struct wl_proxy *)s->surface);
   if (version >= 5) {
     wl_surface_attach(s->surface, b->buffer, 0, 0);
@@ -1406,12 +1596,204 @@ EGLAPI EGLBoolean eglGetSyncAttribKHR(EGLDisplay handle, EGLSync sync, EGLint na
   return r;
 }
 
-/* Images (EGL 1.5): none can be made (no EGL_KHR_image_base); the functions are there for programs that link against them. */
-EGLAPI EGLImage eglCreateImage(EGLDisplay handle, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attribs) {
-  if (ready_display(handle)) fail(EGL_BAD_PARAMETER);
-  return EGL_NO_IMAGE;
+/* ---- Images (EGL 1.5, EGL_KHR_image_base): dmabufs (EGL_EXT_image_dma_buf_import) of one plane in an 8-bit RGB format, linear. An image holds a duplicate of
+ * the descriptor; glEGLImageTargetTexture2DOES copies its pixels into the bound texture through the dmabuf's mapping (between DMA_BUF_IOCTL_SYNC start and end). */
+#define DRM_FORMAT(a, b, c, d) ((uint32_t)(a) | ((uint32_t)(b) << 8) | ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+static const uint32_t kImageFormats[] = {DRM_FORMAT('A', 'R', '2', '4'), DRM_FORMAT('X', 'R', '2', '4'), DRM_FORMAT('A', 'B', '2', '4'), DRM_FORMAT('X', 'B', '2', '4')};
+#define DRM_MOD_LINEAR 0ull
+#define DRM_MOD_INVALID 0x00ffffffffffffffull
+
+typedef struct EglImage {
+  struct EglImage *next;
+  EglDisplay *display;
+  int fd;
+  uint32_t width, height, format, offset, pitch;
+} EglImage;
+static pthread_mutex_t g_images_lock = PTHREAD_MUTEX_INITIALIZER;
+static EglImage *g_images;
+
+static int image_format_ok(uint32_t format) {
+  for (size_t i = 0; i < sizeof(kImageFormats) / sizeof(kImageFormats[0]); ++i)
+    if (kImageFormats[i] == format) return 1;
+  return 0;
 }
-EGLAPI EGLBoolean eglDestroyImage(EGLDisplay handle, EGLImage image) { return ready_display(handle) ? fail(EGL_BAD_PARAMETER) : EGL_FALSE; }
+
+static EGLImage create_image(EGLDisplay handle, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLint *ints, const EGLAttrib *attribs) {
+  EglDisplay *d = ready_display(handle);
+  if (!d) return EGL_NO_IMAGE;
+  if (target != EGL_LINUX_DMA_BUF_EXT) { fail(EGL_BAD_PARAMETER); return EGL_NO_IMAGE; }
+  if (context != EGL_NO_CONTEXT || buffer) { fail(EGL_BAD_PARAMETER); return EGL_NO_IMAGE; }      /* (EGL_EXT_image_dma_buf_import: no context, no client buffer) */
+  int64_t width = -1, height = -1, format = -1, fd = -1, offset = 0, pitch = -1;
+  uint64_t modifier_lo = 0, modifier_hi = 0;
+  int has_modifier = 0;
+  for (int i = 0;; i += 2) {
+    const EGLint name = ints ? ints[i] : attribs ? (EGLint)attribs[i] : EGL_NONE;
+    if (name == EGL_NONE) break;
+    const int64_t value = ints ? ints[i + 1] : (int64_t)attribs[i + 1];
+    switch (name) {
+      case EGL_WIDTH: width = value; break;
+      case EGL_HEIGHT: height = value; break;
+      case EGL_LINUX_DRM_FOURCC_EXT: format = value; break;
+      case EGL_DMA_BUF_PLANE0_FD_EXT: fd = value; break;
+      case EGL_DMA_BUF_PLANE0_OFFSET_EXT: offset = value; break;
+      case EGL_DMA_BUF_PLANE0_PITCH_EXT: pitch = value; break;
+      case EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: modifier_lo = (uint32_t)value; has_modifier = 1; break;
+      case EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: modifier_hi = (uint32_t)value; has_modifier = 1; break;
+      case EGL_IMAGE_PRESERVED_KHR: case EGL_YUV_COLOR_SPACE_HINT_EXT: case EGL_SAMPLE_RANGE_HINT_EXT: case EGL_YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT:
+      case EGL_YUV_CHROMA_VERTICAL_SITING_HINT_EXT: break;
+      default:
+        if (name >= EGL_DMA_BUF_PLANE1_FD_EXT && name <= EGL_DMA_BUF_PLANE1_FD_EXT + 5) { fail(EGL_BAD_MATCH); return EGL_NO_IMAGE; }      /* (planes 1 and 2) */
+        fail(EGL_BAD_ATTRIBUTE);
+        return EGL_NO_IMAGE;
+    }
+  }
+  if (width < 0 || height < 0 || format < 0 || fd < 0 || pitch < 0) { fail(EGL_BAD_PARAMETER); return EGL_NO_IMAGE; }      /* (a required attribute is missing) */
+  const uint64_t modifier = modifier_hi << 32 | modifier_lo;
+  if (!image_format_ok((uint32_t)format) || (has_modifier && modifier != DRM_MOD_LINEAR && modifier != DRM_MOD_INVALID)) { fail(EGL_BAD_MATCH); return EGL_NO_IMAGE; }
+  if (width == 0 || height == 0 || width > 16384 || height > 16384 || offset < 0 || offset > 0xFFFFFFFFll || pitch > 0xFFFFFFFFll || pitch < width * 4) {
+    fail(EGL_BAD_ACCESS);
+    return EGL_NO_IMAGE;
+  }
+  /* the plane must be inside the descriptor's bytes */
+  const off_t end = lseek((int)fd, 0, SEEK_END);
+  if (end < 0 || (uint64_t)offset > (uint64_t)end || (uint64_t)pitch * (uint64_t)(height - 1) + (uint64_t)width * 4 > (uint64_t)end - (uint64_t)offset) {
+    fail(EGL_BAD_ACCESS);
+    return EGL_NO_IMAGE;
+  }
+  EglImage *image = (EglImage *)calloc(1, sizeof(EglImage));
+  const int dup_fd = image ? fcntl((int)fd, F_DUPFD_CLOEXEC, 0) : -1;
+  if (!image || dup_fd < 0) {
+    free(image);
+    fail(EGL_BAD_ALLOC);
+    return EGL_NO_IMAGE;
+  }
+  image->display = d;
+  image->fd = dup_fd;
+  image->width = (uint32_t)width;
+  image->height = (uint32_t)height;
+  image->format = (uint32_t)format;
+  image->offset = (uint32_t)offset;
+  image->pitch = (uint32_t)pitch;
+  pthread_mutex_lock(&g_images_lock);
+  image->next = g_images;
+  g_images = image;
+  pthread_mutex_unlock(&g_images_lock);
+  ok();
+  return image;
+}
+
+EGLAPI EGLImage eglCreateImage(EGLDisplay handle, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLAttrib *attribs) {
+  static const EGLAttrib none[] = {EGL_NONE};
+  return create_image(handle, context, target, buffer, NULL, attribs ? attribs : none);
+}
+EGLAPI EGLImage eglCreateImageKHR(EGLDisplay handle, EGLContext context, EGLenum target, EGLClientBuffer buffer, const EGLint *attribs) {
+  static const EGLint none[] = {EGL_NONE};
+  return create_image(handle, context, target, buffer, attribs ? attribs : none, NULL);
+}
+
+EGLAPI EGLBoolean eglDestroyImage(EGLDisplay handle, EGLImage image) {
+  EglDisplay *d = ready_display(handle);
+  if (!d) return EGL_FALSE;
+  pthread_mutex_lock(&g_images_lock);
+  EglImage **at = &g_images;
+  while (*at && !(*at == (EglImage *)image && (*at)->display == d)) at = &(*at)->next;
+  EglImage *found = *at;
+  if (found) *at = found->next;
+  pthread_mutex_unlock(&g_images_lock);
+  if (!found) return fail(EGL_BAD_PARAMETER);
+  close(found->fd);
+  free(found);
+  return ok();
+}
+EGLAPI EGLBoolean eglDestroyImageKHR(EGLDisplay handle, EGLImage image) { return eglDestroyImage(handle, image); }
+
+/* EGL_EXT_image_dma_buf_import_modifiers: the formats and the one layout (linear) */
+EGLAPI EGLBoolean eglQueryDmaBufFormatsEXT(EGLDisplay handle, EGLint max, EGLint *formats, EGLint *count) {
+  if (!ready_display(handle)) return EGL_FALSE;
+  const EGLint n = (EGLint)(sizeof(kImageFormats) / sizeof(kImageFormats[0]));
+  if (max < 0 || (max > 0 && !formats) || !count) return fail(EGL_BAD_PARAMETER);
+  if (max == 0) { *count = n; return ok(); }
+  EGLint i = 0;
+  for (; i < n && i < max; ++i) formats[i] = (EGLint)kImageFormats[i];
+  *count = i;
+  return ok();
+}
+EGLAPI EGLBoolean eglQueryDmaBufModifiersEXT(EGLDisplay handle, EGLint format, EGLint max, uint64_t *modifiers, EGLBoolean *external, EGLint *count) {
+  if (!ready_display(handle)) return EGL_FALSE;
+  if (!image_format_ok((uint32_t)format)) return fail(EGL_BAD_PARAMETER);
+  if (max < 0 || (max > 0 && !modifiers) || !count) return fail(EGL_BAD_PARAMETER);
+  if (max == 0) { *count = 1; return ok(); }
+  modifiers[0] = DRM_MOD_LINEAR;
+  if (external) external[0] = EGL_FALSE;
+  *count = 1;
+  return ok();
+}
+
+/* GL_OES_EGL_image: the image's pixels into the texture bound to `target` (level 0, RGBA); GL_INVALID_OPERATION (as the extension says) when it cannot be read. */
+enum { GL_TEXTURE_2D_ = 0x0DE1, GL_RGBA_ = 0x1908, GL_UNSIGNED_BYTE_ = 0x1401 };
+static int read_image(const EglImage *image, uint8_t *rgba) {
+  const off_t end = lseek(image->fd, 0, SEEK_END);
+  if (end <= 0) return 0;
+  uint8_t *map = (uint8_t *)mmap(NULL, (size_t)end, PROT_READ, MAP_SHARED, image->fd, 0);
+  if (map == MAP_FAILED) return 0;
+  uint64_t sync = 1;      /* DMA_BUF_SYNC_READ | START */
+  ioctl(image->fd, 0x40086200ul, &sync);      /* (DMA_BUF_IOCTL_SYNC; a file in memory has none, and needs none) */
+  const uint32_t f = image->format;
+  const int swap_rb = f == DRM_FORMAT('A', 'R', '2', '4') || f == DRM_FORMAT('X', 'R', '2', '4');      /* (B, G, R, A bytes) */
+  const int opaque = f == DRM_FORMAT('X', 'R', '2', '4') || f == DRM_FORMAT('X', 'B', '2', '4');
+  for (uint32_t y = 0; y < image->height; ++y) {
+    const uint8_t *src = map + image->offset + (size_t)y * image->pitch;
+    uint8_t *dst = rgba + (size_t)y * image->width * 4;
+    for (uint32_t x = 0; x < image->width; ++x, src += 4, dst += 4) {
+      dst[0] = swap_rb ? src[2] : src[0];
+      dst[1] = src[1];
+      dst[2] = swap_rb ? src[0] : src[2];
+      dst[3] = opaque ? 255 : src[3];
+    }
+  }
+  sync = 1 | 4;      /* READ | END */
+  ioctl(image->fd, 0x40086200ul, &sync);
+  munmap(map, (size_t)end);
+  return 1;
+}
+
+/* GL_INVALID_OPERATION in the current context: a query begun with name 0 is that error, and changes nothing else */
+static void gl_invalid_operation(void) { glBeginQuery(0x8C2F /* GL_ANY_SAMPLES_PASSED */, 0); }
+
+GLAPI void APIENTRY glEGLImageTargetTexture2DOES(GLenum target, void *handle) {
+  ThreadGl *t = thread_gl();
+  if (!t->context) return;
+  pthread_mutex_lock(&g_images_lock);
+  EglImage *image = g_images;
+  while (image && image != (EglImage *)handle) image = image->next;
+  EglImage copy;
+  int found = image != NULL;
+  int fd = -1;
+  if (found) {
+    copy = *image;
+    fd = fcntl(image->fd, F_DUPFD_CLOEXEC, 0);      /* (the image may be destroyed by another thread meanwhile) */
+  }
+  pthread_mutex_unlock(&g_images_lock);
+  if (!found || fd < 0 || target != GL_TEXTURE_2D_) {
+    if (fd >= 0) close(fd);
+    gl_invalid_operation();
+    return;
+  }
+  copy.fd = fd;
+  uint8_t *rgba = (uint8_t *)malloc((size_t)copy.width * copy.height * 4);
+  const int good = rgba && read_image(&copy, rgba);
+  close(fd);
+  if (!good) {
+    free(rgba);
+    gl_invalid_operation();
+    return;
+  }
+  glTexImage2D(target, 0, GL_RGBA_, (GLsizei)copy.width, (GLsizei)copy.height, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, rgba);
+  gl_stream_flush();      /* (the kernel reads the pixels before they are freed) */
+  free(rgba);
+}
+/* (no renderbuffers from images) */
+GLAPI void APIENTRY glEGLImageTargetRenderbufferStorageOES(GLenum target, void *handle) { gl_invalid_operation(); }
 
 /* ---- eglGetProcAddress: every command of the kernel's GL and every EGL function, by name (EGL_KHR_get_all_proc_addresses). */
 typedef struct { const char *name; EGLProc proc; } ProcEntry;
@@ -1432,6 +1814,8 @@ static const ProcEntry g_egl_procs[] = {
     EGL_PROC(eglQueryAPI), EGL_PROC(eglQueryContext), EGL_PROC(eglQueryString), EGL_PROC(eglQuerySurface), EGL_PROC(eglReleaseTexImage), EGL_PROC(eglReleaseThread),
     EGL_PROC(eglSurfaceAttrib), EGL_PROC(eglSwapBuffers), EGL_PROC(eglSwapBuffersWithDamageEXT), EGL_PROC(eglSwapBuffersWithDamageKHR), EGL_PROC(eglSwapInterval),
     EGL_PROC(eglTerminate), EGL_PROC(eglWaitClient), EGL_PROC(eglWaitGL), EGL_PROC(eglWaitNative), EGL_PROC(eglWaitSync),
+    EGL_PROC(eglCreateImageKHR), EGL_PROC(eglDestroyImageKHR), EGL_PROC(eglQueryDmaBufFormatsEXT), EGL_PROC(eglQueryDmaBufModifiersEXT),
+    EGL_PROC(glEGLImageTargetTexture2DOES), EGL_PROC(glEGLImageTargetRenderbufferStorageOES),
 };
 #undef EGL_PROC
 

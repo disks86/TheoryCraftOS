@@ -18,7 +18,8 @@
 
 // The kernel's IServiceLauncher: an activated service's program (a Linux program, Exec's first word a path in the Linux tree) runs with the kernel's
 // run_program() (Program/ProgramRunner.hpp) on a kernel thread of its own ("dbus-service"), from / of the Linux tree, with no input; what it prints goes
-// to the debug console. The thread lives as long as the program; the activator only looks at how it ended.
+// to the debug console. The thread lives as long as the program; the activator only looks at how it ended, and stop() ends it (as Ctrl+C would: through
+// its ProgramHost). The service file's User= is not used: the kernel has one user, and every service runs as it.
 #pragma once
 #include "DBus/Activation.hpp"
 #include "FileSystem/IFileSystem.hpp"
@@ -34,8 +35,9 @@ class ProgramActivator final : public IServiceLauncher {
   ProgramActivator(const ProgramActivator&) = delete;
   ProgramActivator& operator=(const ProgramActivator&) = delete;
 
-  uint64_t start(BusKind bus, StringView service_name, ArrayView<const StringView> argv, String* why) override;
+  uint64_t start(const ServiceStart& service, String* why) override;
   State poll(uint64_t handle, uint32_t* exit_code, String* why) override;
+  void stop(uint64_t handle) override;
   void forget(uint64_t handle) override;
 
   struct Run;

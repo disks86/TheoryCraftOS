@@ -31,6 +31,8 @@
 // clients, and for every playback stream a node (Stream/Output/Audio), its output ports and the links to the sink's input ports; with a capture hub also
 // a second device and the source node, and for every record stream a node, its input ports and the links from the source's output ports. The protocols show these
 // to their clients (pw-dump, pactl list ...). Each change bumps a serial; the protocols compare snapshots to tell their clients what came, went or changed.
+// MIDI and video are in it too: the MIDI bus (MidiBus.hpp) as the node tcos_midi.bridge with every program's MIDI node linked to it, and programs' video
+// producers and watchers (each producer's frames in a VideoChannel its watchers share); and the virtual sinks the native protocol's adapter factory makes.
 //
 // Thread safe. The graph's lock is never held while the mixer's is taken (the mixer is called before or after it).
 #pragma once
@@ -39,9 +41,12 @@
 #include "Audio/AudioMixer.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
+#include "PipeWire/MidiBus.hpp"
 #include "PipeWire/PlaybackStream.hpp"
 #include "PipeWire/Properties.hpp"
 #include "PipeWire/RecordStream.hpp"
+#include "PipeWire/VideoChannel.hpp"
+#include "PipeWire/VirtualSink.hpp"
 #include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -50,7 +55,9 @@ namespace pipewire {
 enum class ObjectType : uint8_t { Core, Client, Device, Node, Port, Link, Metadata, Factory, Module };
 // Which kind of program an object belongs to.
 enum class Origin : uint8_t { Kernel, Native, Linux, Windows };
-enum class NodeRole : uint8_t { None, Sink, Playback, Source, Capture };
+// (MidiBridge: the bus every MIDI port is linked to; MidiStream, VideoStream: a program's MIDI or video node; Virtual: a sink or source made with the
+// adapter factory, support.null-audio-sink; Linked: a program's audio stream that plays into or records from a Virtual node instead of the devices)
+enum class NodeRole : uint8_t { None, Sink, Playback, Source, Capture, MidiBridge, MidiStream, VideoStream, Virtual, Linked };
 
 // PipeWire's interface names ("PipeWire:Interface:Node") and the versions the graph speaks.
 const char* interface_name(ObjectType type);
@@ -83,6 +90,11 @@ struct GraphObject {
   SharedPointer<audio::CaptureStream> native_capture;      // a stream a native program opened on the capture hub
   uint32_t input_ports = 0, output_ports = 0;
   bool monitor = false;                              // a record node of the sink's monitor (what plays), not of the source
+  SharedPointer<VideoChannel> video;                 // a video node: what its producer shows (a watcher's is its producer's)
+  SharedPointer<MidiQueue> midi_in;                  // a MIDI node that listens: what it hears
+  SharedPointer<VirtualOutput> virtual_output;       // a virtual sink: its mixer (and a stream into or out of one: that sink's, kept while the stream is)
+  uint32_t target = 0;                               // a stream into or out of a virtual sink: the sink's node (0: the speakers or the microphone)
+  uint32_t direction_of_node = kDirectionOutput;     // a MIDI, video or linked node: which way it goes (output: it plays or shows)
   // a port
   uint32_t node = 0, direction = 0, channel = 0;     // channel: an SPA position
   // a link
@@ -130,11 +142,18 @@ class Graph {
   // ---- streams
   // A playback stream of `client` in `format`, its node and ports linked to the sink. 0 when there is no mixer, the format is not valid or the mixer is
   // full. *out is the stream the client writes to.
-  uint32_t create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out);
+  // `target`: a virtual sink's node to play into instead of the speakers (0: the speakers).
+  uint32_t create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out, uint32_t target = 0);
   // A record stream of `client` in `format`, its node and ports linked from the source (or, with `monitor`, from the sink's monitor ports: what the
   // mixer plays, before the master volume). 0 when there is no capture hub (no mixer for a monitor), the format is not valid or the hub (the mixer's
   // taps) is full. *out is the stream the client reads from.
-  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false);
+  // `target`: a virtual sink's node to record (its monitor: what plays into it) instead of the microphone.
+  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false,
+                         uint32_t target = 0);
+  // A filter (a pw_filter with float ports both ways: an effect): one node that plays `out_format` to the sink (its output ports) and records
+  // `in_format` from the source (its input ports linked from it); either may have 0 channels. Its media class is kept.
+  uint32_t create_filter(uint32_t client, const PcmFormat& out_format, const PcmFormat& in_format, const Properties& props,
+                         SharedPointer<PlaybackStream>* playback, SharedPointer<RecordStream>* record);
   // `drain`: what is queued still plays; else it stops now. (A record node just stops.)
   void destroy_node(uint32_t node, bool drain = false);
   bool update_node(uint32_t node, const Properties& props, Properties::Mode mode);
@@ -158,6 +177,34 @@ class Graph {
   uint32_t native_client_id() const { return native_client_; }
   uint32_t device_id() const { return device_; }
   uint32_t metadata_id() const { return metadata_; }
+  uint32_t midi_bridge_id() const { return midi_bridge_; }
+
+  // ---- MIDI: the bus (MidiBus.hpp) and the programs' MIDI nodes, each linked to the bridge (an output port to its input, its output to an input port).
+  MidiBus& midi_bus() { return midi_; }
+  // A MIDI node of `client`; with `direction` input its queue (*in) hears the bus. 0 when the graph is full.
+  uint32_t create_midi_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<MidiQueue>* in);
+
+  // ---- video: a producer's node makes a channel (*channel) that its watchers share; a watcher's node is linked to the producer `target` names (its
+  // node.name, object.serial or id), else to the first producer, and is given that producer's channel (null while there is no producer: link_video()
+  // tries again).
+  uint32_t create_video_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<VideoChannel>* channel);
+  // How many watchers a video producer has (input video nodes linked to it).
+  uint32_t video_watchers(uint32_t producer);
+  bool link_video(uint32_t node, SharedPointer<VideoChannel>* channel);
+  SharedPointer<VideoChannel> video_of(uint32_t node);
+
+  // ---- the adapter factory's virtual sinks and sources (support.null-audio-sink): a node with `channels` input ports and as many monitor (output)
+  // ports. A `linger`ing one stays when its client goes (it is the kernel's then).
+  static constexpr uint32_t kMaxVirtualSinks = 16;
+  uint32_t create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate);
+  // The clock virtual sinks play on (nanoseconds, monotonic); without one, no virtual sink can be made.
+  void set_clock(uint64_t (*now_ns)()) { clock_.set(now_ns); }
+  // The virtual sinks there are now, oldest first; and whether a node is one.
+  bool virtual_sinks(List<uint32_t>* out);
+  bool is_virtual_sink(uint32_t node);
+  void keep_node(uint32_t node);
+  // The node `target` names (target.object, node.target: a node.name, an object.serial or an id); 0 if none.
+  uint32_t find_node(StringView target);
 
   // Finds the mixer's streams that native programs opened (and the ones that ended), and follows the output device and master volume. Cheap when nothing
   // changed; the protocol servers call it every round.
@@ -193,16 +240,25 @@ class Graph {
   void remove_locked(uint32_t id);
   void remove_node_locked(uint32_t node, List<SharedPointer<PlaybackStream>>* stopped, bool drain);
   bool add_source_locked();
-  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor);
+  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor, uint32_t target = 0);
+  void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor, uint32_t target = 0);
+  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer = nullptr);
+  SharedPointer<VirtualOutput> virtual_output_locked(uint32_t node);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
   void sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live);
-  uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props);
+  uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, uint32_t target = 0);
   void set_default_metadata_locked();
   void sync_sink_locked(const char* device_name, uint8_t master, bool muted);
+  bool add_midi_bridge_locked();
+  GraphObject* add_media_node_locked(uint32_t client, NodeRole role, const Properties& props, const char* media_class, uint32_t direction);
+  bool add_port_locked(uint32_t client, uint32_t node, uint32_t index, uint32_t direction, StringView name, StringView dsp, uint32_t* id);
+  bool add_link_locked(uint32_t client, uint32_t out_node, uint32_t out_port, uint32_t in_node, uint32_t in_port);
+  uint32_t port_of_locked(uint32_t node, uint32_t direction, uint32_t index);
 
   allocators::IAllocator& allocator_;
   audio::AudioMixer* mixer_;
+  FunctionClock clock_;
   audio::AudioCaptureHub* capture_;
   kernel::Mutex mutex_;
   List<UniquePointer<GraphObject>> objects_;      // in id order
@@ -210,7 +266,9 @@ class Graph {
   uint32_t next_id_ = 0;
   uint64_t next_object_serial_ = 1;
   uint64_t serial_ = 1;
-  uint32_t native_client_ = 0, device_ = 0, sink_ = 0, metadata_ = 0;
+  uint32_t native_client_ = 0, device_ = 0, sink_ = 0, metadata_ = 0, midi_bridge_ = 0;
+  uint32_t midi_bridge_ports_[2] = {};      // its input (playback) and output (capture) ports
+  MidiBus midi_;
   uint32_t sink_ports_[2] = {};
   uint32_t monitor_ports_[2] = {};      // the sink's monitor_FL / monitor_FR
   uint32_t source_device_ = 0, source_ = 0;

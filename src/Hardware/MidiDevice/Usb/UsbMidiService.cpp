@@ -91,7 +91,8 @@ void UsbMidiService::drop_gone_devices() {
 // The live synthesizer plays while there is a keyboard to play it.
 void UsbMidiService::update_live_synth() {
   if (!live_) return;
-  bool input = false;
+  bool input = program_scans_ < kProgramScans;      // (a program played a moment ago: it may play again)
+  if (program_scans_ < kProgramScans) ++program_scans_;
   for (const auto& d : devices_) input = input || d->has_input();
   if (input && !live_->running()) live_->start();
   else if (!input && live_->running()) live_->stop();
@@ -147,8 +148,41 @@ void UsbMidiService::flush() {
 }
 
 // A key was pressed on a keyboard (called with the lock held): to a sound maker, else to the live synthesizer.
+void UsbMidiService::set_input_tap(midi::IMidiSink* tap) {
+  kernel::ScopedMutex lock(mutex_);
+  tap_ = tap;
+}
+
+// A program's note: to a sound maker, else to the software synthesizer (started for it).
+void UsbMidiService::play_program(uint8_t status, uint8_t data1, uint8_t data2) {
+  kernel::ScopedMutex lock(mutex_);
+  program_scans_ = 0;
+  if (midi::IMidiOutput* out = sound_maker()) {
+    out->send(status, data1, data2);
+    return;
+  }
+  if (!live_) return;
+  if (!live_->running()) live_->start();
+  live_->send(status, data1, data2);
+}
+
+void UsbMidiService::play_program_sysex(ConstByteView message) {
+  kernel::ScopedMutex lock(mutex_);
+  if (midi::IMidiOutput* out = sound_maker()) {
+    out->send_sysex(message);
+    return;
+  }
+  if (live_ && live_->running()) live_->send_sysex(message);      // (a reset to a synthesizer that is not playing changes nothing)
+}
+
+void UsbMidiService::send_sysex(ConstByteView message) {
+  kernel::ScopedMutex lock(mutex_);
+  if (midi::IMidiOutput* out = sound_maker()) out->send_sysex(message);
+}
+
 void UsbMidiService::route_input(uint8_t status, uint8_t data1, uint8_t data2) {
   ++routed_;
+  if (tap_) tap_->send(status, data1, data2);
   if (midi::IMidiOutput* out = sound_maker()) {
     out->send(status, data1, data2);
     return;

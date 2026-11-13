@@ -206,7 +206,9 @@ int main(void) {
   VkWaylandSurfaceCreateInfoKHR bad = wci;
   bad.surface = NULL;
   VkSurfaceKHR none = VK_NULL_HANDLE;
-  CHECK(vkCreateWaylandSurfaceKHR(instance, &bad, NULL, &none) == VK_ERROR_INITIALIZATION_FAILED);
+  if (!getenv("TCOS_VK_LOADER")) {
+    CHECK(vkCreateWaylandSurfaceKHR(instance, &bad, NULL, &none) == VK_ERROR_INITIALIZATION_FAILED);
+  }      /* (invalid usage: behind the Khronos loader, the loader's own surface object answers, not the driver) */
   VkBool32 supported = VK_FALSE;
   CHECK(vkGetPhysicalDeviceSurfaceSupportKHR(pd, 0, vk_surface, &supported) == VK_SUCCESS && supported);
 

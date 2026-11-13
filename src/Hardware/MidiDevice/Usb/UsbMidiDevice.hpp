@@ -59,6 +59,7 @@ class UsbMidiDevice final : public midi::IMidiOutput {
   // IMidiOutput
   bool available() const override { return model_.has_synth && has_output() && present(); }
   void send(uint8_t status, uint8_t data1, uint8_t data2) override;
+  void send_sysex(ConstByteView message) override;
   void reset() override;
   void flush() override;
 

@@ -19,6 +19,9 @@
 #   <out-dir>/<cpu>/libvulkan.a     for programs linked statically: clang --target=<cpu>-linux-gnu -static ... <out-dir>/<cpu>/libvulkan.a
 #   <out-dir>/<cpu>/libvulkan.so.1  for programs of a C library (glibc's ld.so loads it): it takes the Khronos loader's place, so a program built against the
 #                                   loader (-lvulkan) runs on it unchanged; it is installed in the Linux tree as /usr/lib/libvulkan.so.1
+#   <out-dir>/<cpu>/libvulkan_tcos.so and tcos_icd.<cpu>.json
+#                                   the same driver as an installable client driver of the Khronos loader (-DVK_ICD), for a system whose libvulkan.so.1 is the
+#                                   real loader: installed as /usr/lib/libvulkan_tcos.so with the manifest at /usr/share/vulkan/icd.d/tcos_icd.<cpu>.json
 # Usage: src/Linux/libvulkan/build.sh <out-dir> [x86_64|aarch64|riscv64|loongarch64 ...]   (default: x86_64)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -46,4 +49,11 @@ for cpu in "${cpus[@]}"; do
   "$CC" --target="$cpu-linux-gnu" "${extra[@]}" -std=gnu11 -O2 -ffreestanding -fno-stack-protector -fPIC -fvisibility=hidden -fno-asynchronous-unwind-tables -DVK_SHARED \
     -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
     -shared -nostdlib -fuse-ld=lld -Wl,-soname,libvulkan.so.1 -Wl,--hash-style=both -Wl,-z,now -o "$out/$cpu/libvulkan.so.1" "$here/libvulkan.c"
+  # the installable client driver: only the vk_icd* entry points exported, and -Bsymbolic so that the driver's own vk* references never bind to the loader's
+  # functions of the same names
+  "$CC" --target="$cpu-linux-gnu" "${extra[@]}" -std=gnu11 -O2 -ffreestanding -fno-stack-protector -fPIC -fvisibility=hidden -fno-asynchronous-unwind-tables -DVK_SHARED -DVK_ICD \
+    -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers -Wno-sign-compare \
+    -shared -nostdlib -fuse-ld=lld -Wl,-soname,libvulkan_tcos.so -Wl,-Bsymbolic -Wl,--hash-style=both -Wl,-z,now -o "$out/$cpu/libvulkan_tcos.so" "$here/libvulkan.c"
+  printf '{\n  "file_format_version": "1.0.1",\n  "ICD": {\n    "library_path": "/usr/lib/libvulkan_tcos.so",\n    "library_arch": "64",\n    "api_version": "1.0.0"\n  }\n}\n' \
+    > "$out/$cpu/tcos_icd.$cpu.json"
 done

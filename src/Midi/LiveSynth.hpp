@@ -41,6 +41,7 @@ class LiveSynth final : public IMidiSink {
   SoftwareSynth& synth() { return synth_; }
 
   void send(uint8_t status, uint8_t data1, uint8_t data2) override { synth_.send(status, data1, data2); }
+  void send_sysex(ConstByteView message) override { synth_.send_sysex(message); }
   void reset() override { synth_.reset(); }
 
  private:

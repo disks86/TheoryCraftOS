@@ -122,16 +122,22 @@ class PulseServer final : public IProtocolServer {
   void feed(Stream& s);
   void flow(Client& c, Stream& s);
 
-  void fill_sink(Client& c, pulse::TagWriter& w);
+  void fill_sink(Client& c, pulse::TagWriter& w, uint32_t sink);
   // The microphone's source, or (`monitor`) the sink's monitor source.
-  void fill_source(Client& c, pulse::TagWriter& w, bool monitor);
+  // `of_sink`: (a monitor) the sink whose monitor it is (0: the speakers')
+  void fill_source(Client& c, pulse::TagWriter& w, bool monitor, uint32_t of_sink = 0);
   void fill_source_output(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_sink_input(Client& c, pulse::TagWriter& w, const GraphObject& o);
   void fill_client(Client& c, pulse::TagWriter& w, const GraphObject& o);
   bool is_sink_name(StringView name) const;
   bool is_source_name(StringView name) const;
   // The source a request names (by name unless `null_name`, else by index): true if there is one, *monitor for the sink's monitor.
-  bool find_source(uint32_t index, StringView name, bool null_name, bool* monitor) const;
+  // `*of_sink`: (a monitor) the sink it is the monitor of (the speakers' or a virtual sink's node)
+  bool find_source(uint32_t index, StringView name, bool null_name, bool* monitor, uint32_t* of_sink = nullptr) const;
+  // The sink an index or a name says: the speakers' node, or a virtual sink's (the adapter factory's null sinks, named by their node.name); 0 for none.
+  uint32_t find_sink(uint32_t index, StringView name, bool null_name) const;
+  // A virtual sink of this node.name (0: none).
+  uint32_t virtual_sink_named(StringView name) const;
   void send_subscription_events(Client& c);
 
   Graph& graph_;

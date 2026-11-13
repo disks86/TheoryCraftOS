@@ -44,10 +44,12 @@ struct ProgramRun {
   // Run the program on the in-kernel emulator even when it is for this machine's own CPU (to compare the two, or to run it without the CPU's user mode). A program for
   // any other CPU is always emulated.
   bool force_emulation = false;
-  // More environment variables ("NAME=value") after the standard ones; one of the same name replaces the standard one. (D-Bus's starter variables for a
-  // service the bus starts.)
+  // More environment variables ("NAME=value") after the standard ones; one of the same name replaces the standard one, or one given before it here.
+  // (D-Bus's activation environment and starter variables for a service the bus starts.) At most kMaxEnvironment variables in all.
   ArrayView<const StringView> extra_environment;
 };
+
+static constexpr uint64_t kMaxEnvironment = 512;
 
 enum class RunResult : uint8_t {
   Exited,         // the program ended itself; *exit_code is its code

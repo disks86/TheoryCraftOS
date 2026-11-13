@@ -71,6 +71,16 @@ void UsbMidiDevice::send(uint8_t status, uint8_t data1, uint8_t data2) {
   if (batch_length_ + 4 > kBatchBytes) flush();
 }
 
+void UsbMidiDevice::send_sysex(ConstByteView message) {
+  if (!out_endpoint_) return;
+  encode_usb_midi_sysex(0, message, [&](const uint8_t* packet) {
+    if (batch_length_ + 4 > kBatchBytes) flush();
+    for (int i = 0; i < 4; ++i) batch_[batch_length_ + i] = packet[i];
+    batch_length_ += 4;
+  });
+  if (batch_length_ + 4 > kBatchBytes) flush();
+}
+
 void UsbMidiDevice::flush() {
   if (!out_endpoint_ || batch_length_ == 0) return;
   const uint32_t length = batch_length_;

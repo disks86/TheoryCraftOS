@@ -42,8 +42,10 @@ namespace {
 // its own goes each time), and the block the server reads and writes (kept, so memory() stays valid as long as the descriptor).
 class KernelDescriptor final : public Descriptor {
  public:
-  KernelDescriptor(SharedPointer<SocketServer::Graveyard> graveyard, process::UnixSocketManager& sockets, process::UnixInFlight entry, process::BlockRef block)
-      : graveyard_(util::move(graveyard)), sockets_(sockets), entry_(util::move(entry)), block_(util::move(block)) {}
+  // (`limit`: how much of the block is the file: all of it for memory the server made, the file's size for a client's memfd)
+  KernelDescriptor(SharedPointer<SocketServer::Graveyard> graveyard, process::UnixSocketManager& sockets, process::UnixInFlight entry, process::BlockRef block,
+                   uint64_t limit = ~0ull)
+      : graveyard_(util::move(graveyard)), sockets_(sockets), entry_(util::move(entry)), block_(util::move(block)), limit_(limit) {}
   ~KernelDescriptor() {
     if (entry_.token == 0) return;
     bool now = false;
@@ -56,7 +58,11 @@ class KernelDescriptor final : public Descriptor {
   KernelDescriptor(const KernelDescriptor&) = delete;
   KernelDescriptor& operator=(const KernelDescriptor&) = delete;
   const process::UnixInFlight& entry() const { return entry_; }
-  ByteView memory() override { return block_ ? block_.get()->bytes() : ByteView(); }
+  ByteView memory() override {
+    if (!block_) return ByteView();
+    const ByteView all = block_.get()->bytes();
+    return limit_ < all.size() ? all.first(limit_) : all;
+  }
   bool signal() override {
     if (!is_event()) return false;
     process::ISystemSync& sync = sockets_.sync();
@@ -81,6 +87,7 @@ class KernelDescriptor final : public Descriptor {
   process::UnixSocketManager& sockets_;
   process::UnixInFlight entry_;
   process::BlockRef block_;
+  uint64_t limit_;
 };
 
 // Every descriptor a protocol hands this transport was made by it (make_memory, make_event), so each is a KernelDescriptor.
@@ -123,6 +130,22 @@ Fd SocketServer::make_event() {
   entry.token = id;
   Fd fd = Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), process::BlockRef());
   if (!fd) sockets_.release(id);
+  return fd;
+}
+
+// A descriptor a client sent (the lock not held): its memory when it is a memfd (the bytes the file has now), else just the descriptor (an eventfd can be
+// signalled; anything else is held and let go).
+Fd SocketServer::adopt(process::UnixInFlight entry) {
+  process::BlockRef block;
+  uint64_t size = 0;
+  if (entry.kind == process::DescriptorKind::File && entry.object && entry.object->memory) block = entry.object->memory->block(&size);
+  const uint64_t token = entry.token;
+  const process::DescriptorKind kind = entry.kind;
+  Fd fd = Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), util::move(block), size);
+  if (!fd && token != 0) {      // (no memory for it: its use is let go here)
+    if (kind == process::DescriptorKind::UnixSocket) sockets_.release(uint32_t(token));
+    else process::descriptor_token_release(kind, token);
+  }
   return fd;
 }
 
@@ -179,6 +202,7 @@ void SocketServer::queue_fds(Connection& c, uint64_t at, const List<Fd>& fds) {
 void SocketServer::drop_rights(Connection& c) {
   for (UniquePointer<Connection::Batch>& b : c.batches.view()) release_entries(b->rights);
   c.batches.clear();
+  release_entries(c.arrived);
 }
 
 // What a connection is owed, as far as its socket takes it: up to the next bytes that carry descriptors, then those bytes with them (send_locked takes a
@@ -323,7 +347,7 @@ bool SocketServer::pump() {
     uint64_t taken = 0;
     while (!c.dead && taken < kMaxReadPerRound) {
       process::UnixSocketManager::Received got;
-      const UnixStatus st = sockets_.receive_locked(c.socket, chunk_.writable_view(), false, &got, nullptr);
+      const UnixStatus st = sockets_.receive_locked(c.socket, chunk_.writable_view(), false, &got, &c.arrived);
       if (st == UnixStatus::WouldBlock) break;
       if (st != UnixStatus::Ok || got.end_of_file) { c.dead = true; break; }
       if (got.got == 0) break;
@@ -351,8 +375,15 @@ bool SocketServer::pump() {
   }
   for (UniquePointer<Connection>& p : connections_.view()) {
     Connection& c = *p;
-    if (c.inbox.size() > 0) {
-      c.protocol->receive(c.client, c.inbox.view());
+    // the descriptors that came (made into the protocol's, outside the lock), then the bytes with them
+    process::UnixInFlight e;
+    List<Fd> fds(allocator_);
+    while (c.arrived.dequeue(&e)) {
+      Fd fd = adopt(util::move(e));
+      if (!fd || !fds.push_back(util::move(fd))) c.dead = true;
+    }
+    if (c.inbox.size() > 0 || fds.count() > 0) {
+      c.protocol->receive_with_fds(c.client, c.inbox.view(), fds);
       c.inbox.clear();
     }
   }

@@ -21,6 +21,7 @@
 // port, see Hardware/MidiDevice) that makes the sound itself.
 #pragma once
 #include <stdint.h>
+#include "Utility/ArrayView.hpp"
 
 namespace midi {
 
@@ -39,6 +40,8 @@ constexpr uint8_t kControllerVolume = 7, kControllerPan = 10, kControllerExpress
 class IMidiSink {
  public:
   virtual void send(uint8_t status, uint8_t data1, uint8_t data2) = 0;
+  // A whole system exclusive message, F0 to F7. A sink that cannot carry them leaves them out.
+  virtual void send_sysex(ConstByteView message) { (void)message; }
   // Silences everything and puts every channel back to its start values.
   virtual void reset() = 0;
   // Sends on what send() has collected (a USB device takes its messages in batches). A sink that sends at once does nothing.

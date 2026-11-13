@@ -141,11 +141,17 @@ void build_format_param(pod::Builder& b, uint32_t param_id, const PcmFormat& for
   b.end(f);
 }
 
-NativeServer::NativeServer(Graph& graph, allocators::IAllocator& allocator)
-    : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator) {}
+NativeServer::NativeServer(Graph& graph, allocators::IAllocator& allocator, uint64_t (*clock)())
+    : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator), clock_(clock), virtuals_(allocator) {
+  if (clock) {
+    graph_.midi_bus().set_clock(clock);
+    graph_.set_clock(clock);      // (virtual sinks play on it)
+  }
+}
 
 NativeServer::~NativeServer() {
   for (UniquePointer<Client>& c : clients_.view()) graph_.remove_client(c->graph_client);
+  for (UniquePointer<VirtualSink>& v : virtuals_.view()) graph_.destroy_node(v->node);
 }
 
 NativeServer::Client* NativeServer::find(uint32_t handle) {
@@ -197,6 +203,18 @@ void NativeServer::close_client(uint32_t handle) {
   for (uint64_t i = 0; i < clients_.count(); ++i)
     if (clients_[i]->handle == handle) {
       while (clients_[i]->nodes.count()) destroy_client_node(*clients_[i], clients_[i]->nodes[0]->resource);
+      // its virtual sinks go with it, unless they linger (object.linger): they are the kernel's then
+      for (uint64_t k = virtuals_.count(); k > 0; --k) {
+        VirtualSink& v = *virtuals_[k - 1];
+        if (v.owner != handle) continue;
+        if (v.linger) {
+          graph_.keep_node(v.node);
+          v.owner = 0;
+          v.resource = 0;
+        } else {
+          destroy_virtual(v.node);
+        }
+      }
       graph_.remove_client(clients_[i]->graph_client);
       clients_.remove_at(i);
       return;
@@ -227,6 +245,18 @@ bool NativeServer::take_output_with_fds(uint32_t handle, ByteBuffer* out, List<F
   return c->closing;
 }
 
+void NativeServer::receive_with_fds(uint32_t handle, ConstByteView bytes, List<Fd>& fds) {
+  Client* c = find(handle);
+  if (!c || c->closing) {
+    fds.clear();
+    return;
+  }
+  for (Fd& fd : fds)
+    if (c->in_fds.count() >= kMaxInFds || !c->in_fds.push_back(util::move(fd))) c->closing = true;
+  fds.clear();
+  receive(handle, bytes);
+}
+
 void NativeServer::receive(uint32_t handle, ConstByteView bytes) {
   Client* c = find(handle);
   if (!c || c->closing) return;
@@ -241,9 +271,15 @@ void NativeServer::receive(uint32_t handle, ConstByteView bytes) {
     const uint32_t id = h.le32(), word = h.le32(), seq = h.le32(), n_fds = h.le32();
     const uint32_t size = word & 0xFFFFFF, opcode = word >> 24;
     if (size > in.size() - at - kHeaderSize) break;      // the rest has not come yet
-    (void)n_fds;      // (no descriptors come over this transport: an fd argument refers to nothing)
+    // the message's descriptors: the next n_fds that came (an fd argument is an index into them; one that did not come refers to nothing)
+    c->message_in_fds.clear();
+    for (uint32_t k = 0; k < n_fds && c->in_fds.count(); ++k) {
+      c->message_in_fds.push_back(util::move(c->in_fds[0]));
+      c->in_fds.remove_at(0);
+    }
     c->message_seq = seq;
     dispatch(*c, id, opcode, in.subview(at + kHeaderSize, size));
+    c->message_in_fds.clear();
     at += kHeaderSize + size;
   }
   drop_front(c->inbox, at);
@@ -474,6 +510,11 @@ void NativeServer::send_params(Client& c, Resource& r, uint32_t seq, uint32_t pa
       return;
     }
     if (param_id != kParamProps && param_id != kParamEnumFormat && param_id != kParamFormat) return;
+    // (MIDI and video have no volume; a video node or port says its producer's format once it has one)
+    const bool media = o.role == NodeRole::MidiStream || o.role == NodeRole::MidiBridge || o.role == NodeRole::VideoStream;
+    if (param_id == kParamProps && media) return;
+    const VideoFormat video = o.role == NodeRole::VideoStream && o.video ? o.video->format() : VideoFormat();
+    if (o.role == NodeRole::VideoStream && !video.valid()) return;
     const uint64_t m = begin(c, r.id, kEvParam);
     pod::Builder b(c.outbox);
     const uint64_t f = b.begin_struct();
@@ -482,6 +523,8 @@ void NativeServer::send_params(Client& c, Resource& r, uint32_t seq, uint32_t pa
     b.int32(0);
     b.int32(1);
     if (param_id == kParamProps) build_props_param(b, volume, mute, format.channels, o.balance_left, o.balance_right);
+    else if (o.role == NodeRole::MidiStream || o.role == NodeRole::MidiBridge) build_control_format_param(b, param_id);
+    else if (o.role == NodeRole::VideoStream) build_video_format_param(b, param_id, video);
     else build_format_param(b, param_id, format);
     b.end(f);
     end(c, m);
@@ -533,7 +576,12 @@ void NativeServer::core_method(Client& c, uint32_t opcode, pod::Parser& args) {
         create_client_node(c, static_cast<uint32_t>(new_id), props);
         break;
       }
-      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP, "no such factory (play and record with pw_stream or the PulseAudio socket)");
+      if (factory == StringView("adapter") && type == StringView("PipeWire:Interface:Node")) {
+        create_adapter(c, static_cast<uint32_t>(new_id), static_cast<uint32_t>(version), props);
+        break;
+      }
+      send_error(c, static_cast<uint32_t>(new_id), c.message_seq, -kENOTSUP,
+                 "no such factory (client-node and adapter are served: play and record with pw_stream or the PulseAudio socket)");
       send_remove_id(c, static_cast<uint32_t>(new_id));
       break;
     }
@@ -543,6 +591,11 @@ void NativeServer::core_method(Client& c, uint32_t opcode, pod::Parser& args) {
       if (id <= 1) { protocol_error(c, static_cast<uint32_t>(id), kEINVAL, "cannot destroy the core or the client"); return; }
       if (Resource* r = resource(c, static_cast<uint32_t>(id))) {
         if (r->client_node) destroy_client_node(c, static_cast<uint32_t>(id));
+        for (UniquePointer<VirtualSink>& v : virtuals_.view())
+          if (v->owner == c.handle && v->resource == static_cast<uint32_t>(id)) {
+            destroy_virtual(v->node);
+            break;
+          }
         remove_resource(c, static_cast<uint32_t>(id));
         send_remove_id(c, static_cast<uint32_t>(id));
       }
@@ -772,18 +825,32 @@ void NativeServer::update(Client& c) {
 }
 
 void NativeServer::tick() {
+  ++ticks_;
   graph_.refresh();
-  // the client nodes' cycles first: they are the time-critical part
+  const uint64_t now = now_ns();
+  // the client nodes' cycles first: they are the time-critical part (and the ones still waiting for something, a video watcher for its producer)
   uint32_t running = 0;
   for (UniquePointer<Client>& c : clients_.view()) {
     if (c->closing) continue;
     for (UniquePointer<ClientNode>& n : c->nodes.view()) {
-      if (!n->started) continue;
+      if (!n->started) {
+        if (n->active && n->node) negotiate(*c, *n);
+        continue;
+      }
       ++running;
-      run_client_node(*n, 0);
+      // a watcher whose producer changed its format is negotiated again (as is a producer that said a new one)
+      if (n->video)
+        for (UniquePointer<ClientPort>& p : n->ports.view())
+          if (p->media == Media::Video && p->direction == 0 && p->format_sent && !p->renegotiate) {
+            const VideoFormat now_format = n->video->format();
+            if (now_format.valid() && !(now_format == p->video)) p->renegotiate = n->renegotiate = true;
+          }
+      if (n->renegotiate) negotiate(*c, *n);
+      run_client_node(*n, now);
     }
   }
   running_nodes_ = running;
+  midi_waiting_ = graph_.midi_bus().pump(now) != 0;      // (programs' MIDI whose time has come, to the synthesizer)
   for (UniquePointer<Client>& c : clients_.view()) {
     if (c->closing) continue;
     update(*c);

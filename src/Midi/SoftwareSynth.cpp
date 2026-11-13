@@ -215,6 +215,27 @@ void SoftwareSynth::reset() {
 
 // --- Messages -------------------------------------------------------------------------------------
 
+// (-1: any byte, the device id)
+template <uint64_t N>
+static bool sysex_is(ConstByteView m, const int16_t (&want)[N]) {
+  if (m.size() != N) return false;
+  for (uint64_t i = 0; i < N; ++i)
+    if (want[i] >= 0 && m[i] != want[i]) return false;
+  return true;
+}
+
+static bool is_reset_sysex(ConstByteView m) {
+  static const int16_t gm[] = {0xF0, 0x7E, -1, 0x09, 0x01, 0xF7};                               // GM System On
+  static const int16_t gm2[] = {0xF0, 0x7E, -1, 0x09, 0x03, 0xF7};                              // GM2 System On
+  static const int16_t gs[] = {0xF0, 0x41, -1, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7};   // GS Reset
+  static const int16_t xg[] = {0xF0, 0x43, -1, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7};               // XG System On
+  return sysex_is(m, gm) || sysex_is(m, gm2) || sysex_is(m, gs) || sysex_is(m, xg);
+}
+
+void SoftwareSynth::send_sysex(ConstByteView message) {
+  if (is_reset_sysex(message)) reset();
+}
+
 void SoftwareSynth::send(uint8_t status, uint8_t data1, uint8_t data2) {
   if (!tables_ || status < 0x80 || status >= 0xF0) return;
   kernel::ScopedMutex lock(mutex_);

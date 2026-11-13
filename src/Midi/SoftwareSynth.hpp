@@ -43,6 +43,8 @@ class SoftwareSynth final : public IMidiSink {
   bool initialize();
 
   void send(uint8_t status, uint8_t data1, uint8_t data2) override;
+  // System exclusive: the resets of General MIDI (GM System On, GM2), Roland GS and Yamaha XG put it back to its start values; others are left out.
+  void send_sysex(ConstByteView message) override;
   void reset() override;
   // Mixes `frames` stereo frames (interleaved left, right) into `out`, replacing what it held.
   void render(int16_t* out, uint32_t frames);

@@ -24,7 +24,9 @@
 // (receive); the compositor passes that descriptor on to the source's client (wl_data_source.send), which writes the data into it, or writes the clipboard's
 // text into it itself. The clipboard follows the selection both ways: a client's selection that has text is read at once (through a pipe the transport makes)
 // and put on the desktop's clipboard, and text the desktop's programs copy becomes the selection (types text/plain;charset=utf-8, text/plain, UTF8_STRING,
-// STRING, TEXT). The clipboard is read and written only outside the compositor's lock (its observer keeps the Windows clipboard the same and takes the system's
+// STRING, TEXT). Pictures too, as PNG files (image/png), when the server was given the codecs (set_clipboard_images): a client's selection with image/png
+// and no text is read and decoded onto the clipboard as its picture, and a picture the desktop copies becomes a selection of type image/png (encoded once,
+// when it is copied). The clipboard is read and written only outside the compositor's lock (its observer keeps the Windows clipboard the same and takes the system's
 // locks): tick() looks at it, pipe_read_done() writes it.
 //
 // A drag (start_drag, while a button is held) takes the pointer: the surface under it is entered (wl_data_device.enter with an offer of the source's types;
@@ -47,6 +49,7 @@ bool text_type(StringView t) {
   for (const char* d : kDesktopTypes) if (t == StringView(d)) return true;
   return t == StringView("text/plain;charset=UTF-8");
 }
+constexpr const char* kImageType = "image/png";
 
 }  // namespace
 
@@ -60,16 +63,40 @@ void Server::take_requests(List<TransportRequest>* out) {
   requests_.clear();
 }
 
+Server::DesktopData Server::read_clipboard(kernel::Clipboard& clipboard, String* text, SharedPointer<ByteBuffer>* png) {
+  if (clipboard.get_text(text)) return DesktopData::Text;
+  ClipboardToPng to_png = nullptr;
+  {
+    kernel::ScopedMutex lock(mutex_);
+    to_png = to_png_;
+  }
+  if (!to_png || !clipboard.has_image()) return DesktopData::None;
+  SharedPointer<ByteBuffer> made = SharedPointer<ByteBuffer>::make(allocator_, allocator_);
+  if (!made || !to_png(allocator_, clipboard, made.get()) || made->size() == 0) return DesktopData::None;
+  *png = util::move(made);
+  return DesktopData::Image;
+}
+
 void Server::set_clipboard(kernel::Clipboard* clipboard) {
   uint64_t seq = 0;
   String text(allocator_);
-  bool has = false;
-  if (clipboard) seq = clipboard->sequence(), has = clipboard->get_text(&text);      // (outside the lock: see above)
+  SharedPointer<ByteBuffer> png;
+  DesktopData kind = DesktopData::None;
+  if (clipboard) seq = clipboard->sequence(), kind = read_clipboard(*clipboard, &text, &png);      // (outside the lock: see above)
   kernel::ScopedMutex lock(mutex_);
   clipboard_ = clipboard;
   clipboard_seen_ = seq;
-  sel_desktop_ = has && sel_client_ == 0;
+  sel_desktop_ = kind != DesktopData::None && sel_client_ == 0;
+  desktop_kind_ = kind;
   desktop_text_ = util::move(text);
+  desktop_png_ = util::move(png);
+}
+
+void Server::set_clipboard_images(ClipboardToPng to_png, PngToClipboard from_png) {
+  kernel::ScopedMutex lock(mutex_);
+  to_png_ = to_png;
+  from_png_ = from_png;
+  clipboard_seen_ = ~uint64_t{0};      // (the next tick reads the clipboard again: a picture on it now becomes the selection)
 }
 
 void Server::tick() {
@@ -86,13 +113,16 @@ void Server::tick() {
     const uint64_t seq = clipboard->sequence();
     if (seq != seen) {
       String copied(allocator_);
-      const bool text = clipboard->get_text(&copied);
+      SharedPointer<ByteBuffer> png;
+      const DesktopData kind = read_clipboard(*clipboard, &copied, &png);
       kernel::ScopedMutex lock(mutex_);
       if (clipboard_ == clipboard && clipboard_seen_ == seen) {
         clipboard_seen_ = seq;
+        desktop_kind_ = kind;
         desktop_text_ = util::move(copied);
-        // text the desktop copied is the selection now (a client's earlier one is cancelled); anything else leaves no desktop selection
-        if (text) {
+        desktop_png_ = util::move(png);
+        // text or a picture the desktop copied is the selection now (a client's earlier one is cancelled); anything else leaves no desktop selection
+        if (kind != DesktopData::None) {
           if (DataSourceInfo* old = source_of(sel_client_, sel_source_); old && sel_client_) {
             (void)old;
             if (Client* oc = client_of(sel_client_)) send(*oc, Event(sel_source_, 2));      // cancelled
@@ -143,10 +173,16 @@ uint32_t Server::make_offer(Client& c, uint32_t device, uint8_t source_client, u
   made.u(id);
   send(c, made);
   if (source_id == 0) {
-    for (const char* t : kDesktopTypes) {
+    if (desktop_kind_ == DesktopData::Image) {
       Event e(id, 0);
-      e.string(StringView(t));
+      e.string(StringView(kImageType));
       send(c, e);
+    } else {
+      for (const char* t : kDesktopTypes) {
+        Event e(id, 0);
+        e.string(StringView(t));
+        send(c, e);
+      }
     }
   } else if (DataSourceInfo* src = source_of(source_client, source_id)) {
     for (const String& t : src->mimes.view()) {
@@ -184,19 +220,23 @@ void Server::set_selection(Client* c, uint32_t source) {
   sel_source_ = source;
   sel_desktop_ = false;
   fetch_job_ = 0;
-  if (source) fetch_selection_text();
+  if (source) fetch_selection();
   if (keyboard_focus_)
     if (Client* fc = client_of(keyboard_focus_->client)) send_selection(*fc);
 }
 
-// A client's selection with text goes to the desktop's clipboard: the transport makes a pipe; pipe_ready hands the source its end (send), pipe_read_done
-// what came.
-void Server::fetch_selection_text() {
+// A client's selection with text (else a PNG picture, when the server has the codecs) goes to the desktop's clipboard: the transport makes a pipe;
+// pipe_ready hands the source its end (send), pipe_read_done what came.
+void Server::fetch_selection() {
   DataSourceInfo* src = source_of(sel_client_, sel_source_);
   if (!clipboard_ || !src) return;
   const String* chosen = nullptr;
   for (const String& t : src->mimes.view())
     if (text_type(t.view()) && (!chosen || t.view() == StringView("text/plain;charset=utf-8"))) chosen = &t;
+  fetch_image_ = false;
+  if (!chosen && from_png_)
+    for (const String& t : src->mimes.view())
+      if (t.view() == StringView(kImageType)) chosen = &t, fetch_image_ = true;
   if (!chosen || !fetch_mime_.assign(chosen->view())) return;
   TransportRequest r;
   r.kind = TransportRequest::Kind::MakePipe;
@@ -219,14 +259,23 @@ void Server::pipe_ready(uint32_t job, Fd write_end) {
 
 void Server::pipe_read_done(uint32_t job, ConstByteView data) {
   kernel::Clipboard* clipboard = nullptr;
+  PngToClipboard from_png = nullptr;
+  bool image = false;
   {
     kernel::ScopedMutex lock(mutex_);
     if (job == 0 || job != fetch_job_) return;
     fetch_job_ = 0;
     clipboard = clipboard_;
+    image = fetch_image_;
+    from_png = from_png_;
   }
   if (!clipboard || data.size() == 0) return;
-  if (!clipboard->set_text(StringView(reinterpret_cast<const char*>(data.data()), data.size()))) return;      // (outside the lock: see above)
+  // (outside the lock: see above)
+  if (image) {
+    if (!from_png || !from_png(allocator_, *clipboard, data)) return;      // (not a picture: the clipboard keeps what it had)
+  } else if (!clipboard->set_text(StringView(reinterpret_cast<const char*>(data.data()), data.size()))) {
+    return;
+  }
   const uint64_t seq = clipboard->sequence();
   kernel::ScopedMutex lock(mutex_);
   if (clipboard_ == clipboard) clipboard_seen_ = seq;      // (the selection stays the client's: the change was ours)
@@ -357,14 +406,21 @@ void Server::data_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, 
           const StringView type = in.string();
           Fd fd = in.fd();
           if (!in.ok()) return;
-          if (o.source_id == 0 && !o.dnd) {      // the desktop's clipboard: its text, written by the transport
-            if (!sel_desktop_ || !text_type(type)) return;      // (the descriptor is let go: the client reads nothing)
+          if (o.source_id == 0 && !o.dnd) {      // the desktop's clipboard: its text or picture, written by the transport
+            const bool text = desktop_kind_ == DesktopData::Text && text_type(type);
+            const bool picture = desktop_kind_ == DesktopData::Image && type == StringView(kImageType);
+            if (!sel_desktop_ || (!text && !picture)) return;      // (the descriptor is let go: the client reads nothing)
             TransportRequest w;
             w.kind = TransportRequest::Kind::Write;
             w.job = next_job_++;
             w.fd = util::move(fd);
-            w.data = SharedPointer<ByteBuffer>::make(allocator_, allocator_);
-            if (!w.data || !w.data->append(desktop_text_.view().bytes())) return;
+            if (picture) {
+              w.data = desktop_png_;      // (the same bytes for every paste)
+              if (!w.data) return;
+            } else {
+              w.data = SharedPointer<ByteBuffer>::make(allocator_, allocator_);
+              if (!w.data || !w.data->append(desktop_text_.view().bytes())) return;
+            }
             request(util::move(w));
             return;
           }

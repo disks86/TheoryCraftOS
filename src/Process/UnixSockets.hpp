@@ -230,7 +230,7 @@ class UnixSocketManager {
     UnixName from;               // the sender's name (datagrams)
   };
   struct Socket {
-    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), data(allocator), records(allocator), rights(allocator), backlog(allocator), interest(allocator) {}
+    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), data(allocator), records(allocator), rights(allocator), interest(allocator), backlog(allocator) {}
     uint32_t id = 0;
     uint32_t references = 0;
     UnixType type = UnixType::Stream;

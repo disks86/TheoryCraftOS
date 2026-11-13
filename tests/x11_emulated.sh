@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 work=${TMPDIR:-/tmp}/tcos-x11emu
 mkdir -p "$work/obj" "$work/sys32"
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/X11/*.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp)
+         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/X11/*.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp
+         src/Graphics/Graphics2D/Software/*.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_X11"
 objs=()
 jobs=()

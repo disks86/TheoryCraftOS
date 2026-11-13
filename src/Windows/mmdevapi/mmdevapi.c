@@ -20,8 +20,9 @@
  * tcos_audio.h). In Windows the audio client lives in audioses.dll; programs only reach it through IMMDevice::Activate, so it is here.
  *
  *  - CLSID_MMDeviceEnumerator (DllGetClassObject; ole32 finds this library for it) enumerates one render endpoint, the graph's sink, while the kernel
- *    has an audio device, and one capture endpoint, the graph's source, while there is a microphone. Their property stores have the names, form
- *    factor, speakers and the engine's format (32-bit float stereo at 48 kHz).
+ *    has an audio device, one more render endpoint for each of the graph's virtual sinks (its null sinks: their clients play into them and their
+ *    loopback clients record them; their volume is the sink's own), and one capture endpoint, the graph's source, while there is a microphone. Their
+ *    property stores have the names, form factor, speakers and the engine's format (32-bit float stereo at 48 kHz).
  *  - IAudioClient/2/3 in shared mode: every initialized client is a stream of the graph in the client's own format (PCM 8/16/24/32-bit or float, any
  *    rate the graph takes: the kernel converts, as AUTOCONVERTPCM would), mixed there with the native, Linux and other Windows programs' sound. The
  *    client's buffer is a ring in this process; what the program releases goes to the kernel as fast as its stream takes it, the padding is what the
@@ -90,6 +91,8 @@ static const WCHAR kCaptureFriendlyName[] = L"Microphone (TheoryCraftOS)";
 static const WCHAR kCaptureDescription[] = L"Microphone";
 #define RENDER 0
 #define CAPTURE 1
+#define FIRST_VIRTUAL 2
+#define ENDPOINTS (FIRST_VIRTUAL + TCOS_AUDIO_MAX_VIRTUAL)
 
 static BOOL same_guid(const GUID *a, const GUID *b) {
   const BYTE *x = (const BYTE *)a, *y = (const BYTE *)b;
@@ -129,7 +132,70 @@ static WCHAR *task_string(const WCHAR *s) {
   return r;
 }
 static BOOL has_device(void) { return tcos_audio_devices() != 0; }
-static BOOL has_endpoint(int which) { return which == CAPTURE ? tcos_audio_input_devices() != 0 : has_device(); }
+
+/* The graph's virtual sinks (its null sinks: pw-cli create-node adapter ..., or PulseAudio's) as more render endpoints, FIRST_VIRTUAL onwards. A sink
+ * keeps its slot while it is there (refresh_virtual, when the endpoints are listed or looked up); a slot whose sink went is empty (node 0). */
+typedef struct {
+  ULONG64 node;
+  WCHAR name[96];
+  WCHAR id[72];
+  WCHAR guid[40];
+} VirtualSink;
+static VirtualSink g_virtual[TCOS_AUDIO_MAX_VIRTUAL];
+static SRWLOCK g_virtual_lock = SRWLOCK_INIT;
+static BOOL is_virtual(int which) { return which >= FIRST_VIRTUAL && which < ENDPOINTS; }
+static ULONG64 virtual_node(int which) {
+  if (!is_virtual(which)) return 0;
+  AcquireSRWLockShared(&g_virtual_lock);
+  const ULONG64 node = g_virtual[which - FIRST_VIRTUAL].node;
+  ReleaseSRWLockShared(&g_virtual_lock);
+  return node;
+}
+static void hex_tail(WCHAR *out, ULONG64 v, int digits) {
+  for (int k = digits - 1; k >= 0; --k, v >>= 4) out[k] = (WCHAR)("0123456789abcdef"[v & 0xF]);
+}
+static void refresh_virtual(void) {
+  ULONG64 nodes[TCOS_AUDIO_MAX_VIRTUAL] = {0};
+  char names[TCOS_AUDIO_MAX_VIRTUAL][96];
+  ULONG64 count = 0;
+  int found = 0;
+  for (ULONG64 k = 0; k < TCOS_AUDIO_MAX_VIRTUAL; ++k) {
+    names[found][0] = 0;
+    const ULONG64 node = tcos_audio_virtual_sink(k, names[found], sizeof names[found], &count);
+    if (!node) break;
+    nodes[found++] = node;
+  }
+  AcquireSRWLockExclusive(&g_virtual_lock);
+  /* (the slots of sinks that went are emptied; the sinks that came take free slots) */
+  for (int slot = 0; slot < TCOS_AUDIO_MAX_VIRTUAL; ++slot) {
+    BOOL still = FALSE;
+    for (int f = 0; f < found; ++f) still |= nodes[f] == g_virtual[slot].node;
+    if (!still) g_virtual[slot].node = 0;
+  }
+  for (int f = 0; f < found; ++f) {
+    int slot = -1;
+    for (int k = 0; k < TCOS_AUDIO_MAX_VIRTUAL && slot < 0; ++k) if (g_virtual[k].node == nodes[f]) slot = k;
+    for (int k = 0; k < TCOS_AUDIO_MAX_VIRTUAL && slot < 0; ++k) if (g_virtual[k].node == 0) slot = k;
+    if (slot < 0) continue;
+    VirtualSink *v = &g_virtual[slot];
+    v->node = nodes[f];
+    int n = 0;
+    for (const char *c = names[f]; *c && n < 95; ++c) v->name[n++] = (WCHAR)(unsigned char)*c;      /* (ASCII as it comes; more is shown as it is) */
+    v->name[n] = 0;
+    /* its id: the render endpoint's, with the node in the last part of the GUID */
+    const WCHAR guid[] = L"{5af3a3c2-6e1b-4b4e-8d2f-000000000000}";
+    copy(v->guid, guid, sizeof guid);
+    hex_tail(v->guid + 25, nodes[f], 12);
+    const WCHAR prefix[] = L"{0.0.0.00000000}.";
+    copy(v->id, prefix, sizeof prefix - sizeof(WCHAR));
+    copy(v->id + (sizeof prefix / sizeof(WCHAR) - 1), v->guid, sizeof v->guid);
+  }
+  ReleaseSRWLockExclusive(&g_virtual_lock);
+}
+static BOOL has_endpoint(int which) {
+  if (is_virtual(which)) return virtual_node(which) != 0 && has_device();
+  return which == CAPTURE ? tcos_audio_input_devices() != 0 : has_device();
+}
 
 /* The engine's format: 32-bit float stereo at 48 kHz. */
 static void mix_format(WAVEFORMATEXTENSIBLE *f) {
@@ -473,6 +539,7 @@ struct Client {
   CRITICAL_SECTION lock;
   BOOL capture;             /* a client of the capture endpoint, or a loopback client of the render endpoint: it records */
   BOOL loopback;            /* recording what plays (AUDCLNT_STREAMFLAGS_LOOPBACK on the render endpoint) */
+  ULONG64 target;           /* a virtual sink's node (its endpoint's client: it plays into the sink, or its loopback records the sink's monitor); 0 the speakers */
   BOOL initialized, started, in_get;
   DWORD flags;
   WAVEFORMATEX format;      /* (the plain part; the graph needs no more) */
@@ -687,7 +754,7 @@ static HRESULT WINAPI ac_initialize(IAudioClient3 *i, AUDCLNT_SHAREMODE mode, DW
   LONG st = 0;
   const BOOL have_memory = c->staging && c->ring;
   if (flags & AUDCLNT_STREAMFLAGS_LOOPBACK) c->capture = c->loopback = TRUE;      /* (a render endpoint's loopback client records what plays: the monitor) */
-  if (have_memory) c->stream = tcos_audio_open_from(format, c->capture, c->loopback, &st);
+  if (have_memory) c->stream = tcos_audio_open_to(format, c->capture, c->loopback, c->target, &st);
   c->packet = format->nSamplesPerSec / 100;
   if (c->packet < 1) c->packet = 1;
   if (c->packet > c->buffer_frames) c->packet = c->buffer_frames;
@@ -1141,6 +1208,7 @@ static HRESULT new_client(void **out, int which) {
   Client *c = (Client *)alloc(sizeof *c);
   if (!c) return E_OUTOFMEMORY;
   c->capture = which == CAPTURE;
+  c->target = virtual_node(which);
   c->capture_client.lpVtbl = (IAudioCaptureClientVtbl *)&kCaptureClientVtbl;
   c->client.lpVtbl = (IAudioClient3Vtbl *)&kClientVtbl;
   c->render.lpVtbl = (IAudioRenderClientVtbl *)&kRenderVtbl;
@@ -1160,16 +1228,22 @@ static HRESULT new_client(void **out, int which) {
 
 /* ---- the endpoints' volume (the graph's master volume, the microphone's master gain) and meter ------------------------------------------------- */
 
-static Listeners g_volume_callbacks[2] = {{SRWLOCK_INIT, {0}}, {SRWLOCK_INIT, {0}}};
+static Listeners g_volume_callbacks[ENDPOINTS] = {[0 ... ENDPOINTS - 1] = {SRWLOCK_INIT, {0}}};
 static void start_watcher(void);
 /* What the endpoints' master volumes were when last told (the watcher tells the callbacks when someone outside the process changes them). */
 static SRWLOCK g_seen_lock = SRWLOCK_INIT;
-static float g_seen_scalar[2] = {-1, -1};
-static BOOL g_seen_mute[2];
-static IAudioEndpointVolume g_endpoint_volume[2];
-static int volume_endpoint(IAudioEndpointVolume *i) { return i == &g_endpoint_volume[CAPTURE] ? CAPTURE : RENDER; }
-/* The stream number NtTcosAudio's volume calls take for an endpoint's master volume. */
-static ULONG64 master_stream(int which) { return which == CAPTURE ? TCOS_AUDIO_SOURCE_STREAM : 0; }
+static float g_seen_scalar[ENDPOINTS] = {[0 ... ENDPOINTS - 1] = -1};
+static BOOL g_seen_mute[ENDPOINTS];
+static IAudioEndpointVolume g_endpoint_volume[ENDPOINTS];
+static int volume_endpoint(IAudioEndpointVolume *i) {
+  for (int k = 0; k < ENDPOINTS; ++k) if (i == &g_endpoint_volume[k]) return k;
+  return RENDER;
+}
+/* The stream number NtTcosAudio's volume calls take for an endpoint's master volume (a virtual sink's: its node with TCOS_AUDIO_VIRTUAL_STREAM). */
+static ULONG64 master_stream(int which) {
+  if (is_virtual(which)) return TCOS_AUDIO_VIRTUAL_STREAM | virtual_node(which);
+  return which == CAPTURE ? TCOS_AUDIO_SOURCE_STREAM : 0;
+}
 
 /* The master volume as the scalar programs and the volume sliders use: the cube root of the amplitude (as PulseAudio and PipeWire show it). */
 static float cube_root(float x) {
@@ -1333,7 +1407,7 @@ static const IAudioEndpointVolumeVtbl kEndpointVolumeVtbl = {
   ev_query, ev_add_ref, ev_release, ev_register, ev_unregister, ev_get_channel_count, ev_set_level, ev_set_scalar, ev_get_level, ev_get_scalar,
   ev_set_channel_level, ev_set_channel_scalar, ev_get_channel_level, ev_get_channel_scalar, ev_set_mute, ev_get_mute, ev_get_step_info, ev_step_up,
   ev_step_down, ev_query_hardware, ev_get_range};
-static IAudioEndpointVolume g_endpoint_volume[2] = {{(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl}, {(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl}};
+static IAudioEndpointVolume g_endpoint_volume[ENDPOINTS] = {[0 ... ENDPOINTS - 1] = {(IAudioEndpointVolumeVtbl *)&kEndpointVolumeVtbl}};
 
 /* (IAudioMeterInformation: mingw's endpointvolume.h only declares it) */
 static const GUID kIidMeter = {0xC02216F6, 0x8C67, 0x4B5B, {0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64}};
@@ -1414,8 +1488,11 @@ static HRESULT activate(int which, REFIID riid, DWORD context, PROPVARIANT *para
   return E_NOINTERFACE;
 }
 
-static IPropertyStore g_properties[2];
-static int property_endpoint(IPropertyStore *i) { return i == &g_properties[CAPTURE] ? CAPTURE : RENDER; }
+static IPropertyStore g_properties[ENDPOINTS];
+static int property_endpoint(IPropertyStore *i) {
+  for (int k = 0; k < ENDPOINTS; ++k) if (i == &g_properties[k]) return k;
+  return RENDER;
+}
 static HRESULT WINAPI ps_query(IPropertyStore *i, REFIID riid, void **out) {
   if (!out) return E_POINTER;
   *out = NULL;
@@ -1444,10 +1521,24 @@ static HRESULT WINAPI ps_get_at(IPropertyStore *i, DWORD index, PROPERTYKEY *key
 }
 static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVARIANT *value) {
   if (!key || !value) return E_POINTER;
-  const BOOL capture = property_endpoint(i) == CAPTURE;
+  const int which = property_endpoint(i);
+  const BOOL capture = which == CAPTURE;
   zero(value, sizeof *value);
   const WCHAR *text = NULL;
-  if (same_key(key, &PKEY_Device_FriendlyName)) text = capture ? kCaptureFriendlyName : kFriendlyName;
+  WCHAR virtual_text[96];
+  if (is_virtual(which)) {
+    /* a virtual sink: its description, and its own GUID */
+    AcquireSRWLockShared(&g_virtual_lock);
+    const VirtualSink *v = &g_virtual[which - FIRST_VIRTUAL];
+    const WCHAR *from = same_key(key, &PKEY_AudioEndpoint_GUID) ? v->guid : v->name;
+    SIZE_T n = 0;
+    while (from[n] && n < 95) { virtual_text[n] = from[n]; ++n; }
+    virtual_text[n] = 0;
+    ReleaseSRWLockShared(&g_virtual_lock);
+    if (same_key(key, &PKEY_Device_FriendlyName) || same_key(key, &PKEY_AudioEndpoint_GUID)) text = virtual_text;
+    else if (same_key(key, &PKEY_Device_DeviceDesc)) text = L"Virtual sink";
+    else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = L"PipeWire null sink";
+  } else if (same_key(key, &PKEY_Device_FriendlyName)) text = capture ? kCaptureFriendlyName : kFriendlyName;
   else if (same_key(key, &PKEY_Device_DeviceDesc)) text = capture ? kCaptureDescription : kDeviceDescription;
   else if (same_key(key, &PKEY_DeviceInterface_FriendlyName)) text = kInterfaceName;
   else if (same_key(key, &PKEY_AudioEndpoint_GUID)) text = capture ? kCaptureGuidString : kEndpointGuidString;
@@ -1476,15 +1567,25 @@ static HRESULT WINAPI ps_get_value(IPropertyStore *i, REFPROPERTYKEY key, PROPVA
 static HRESULT WINAPI ps_set_value(IPropertyStore *i, REFPROPERTYKEY key, REFPROPVARIANT value) { (void)i; (void)key; (void)value; return STG_E_ACCESSDENIED; }
 static HRESULT WINAPI ps_commit(IPropertyStore *i) { (void)i; return S_OK; }
 static const IPropertyStoreVtbl kPropertyStoreVtbl = {ps_query, ps_add_ref, ps_release, ps_get_count, ps_get_at, ps_get_value, ps_set_value, ps_commit};
-static IPropertyStore g_properties[2] = {{(IPropertyStoreVtbl *)&kPropertyStoreVtbl}, {(IPropertyStoreVtbl *)&kPropertyStoreVtbl}};
+static IPropertyStore g_properties[ENDPOINTS] = {[0 ... ENDPOINTS - 1] = {(IPropertyStoreVtbl *)&kPropertyStoreVtbl}};
 
 typedef struct {
   IMMDevice device;
   IMMEndpoint endpoint;
 } Endpoint;
-static Endpoint g_endpoints[2];
-static int device_endpoint(IMMDevice *i) { return i == &g_endpoints[CAPTURE].device ? CAPTURE : RENDER; }
-static const WCHAR *endpoint_id(int which) { return which == CAPTURE ? kCaptureEndpointId : kEndpointId; }
+static Endpoint g_endpoints[ENDPOINTS];
+static int device_endpoint(IMMDevice *i) {
+  for (int k = 0; k < ENDPOINTS; ++k) if (i == &g_endpoints[k].device) return k;
+  return RENDER;
+}
+/* (a virtual sink's id is copied while its slot is looked at: the caller's buffer of 72) */
+static const WCHAR *endpoint_id_into(int which, WCHAR *buffer) {
+  if (!is_virtual(which)) return which == CAPTURE ? kCaptureEndpointId : kEndpointId;
+  AcquireSRWLockShared(&g_virtual_lock);
+  copy(buffer, g_virtual[which - FIRST_VIRTUAL].id, sizeof g_virtual[0].id);
+  ReleaseSRWLockShared(&g_virtual_lock);
+  return buffer;
+}
 
 static HRESULT WINAPI dv_query(IMMDevice *i, REFIID riid, void **out) {
   if (!out) return E_POINTER;
@@ -1509,7 +1610,8 @@ static HRESULT WINAPI dv_open_property_store(IMMDevice *i, DWORD access, IProper
 }
 static HRESULT WINAPI dv_get_id(IMMDevice *i, LPWSTR *id) {
   if (!id) return E_POINTER;
-  *id = task_string(endpoint_id(device_endpoint(i)));
+  WCHAR buffer[72];
+  *id = task_string(endpoint_id_into(device_endpoint(i), buffer));
   return *id ? S_OK : E_OUTOFMEMORY;
 }
 static HRESULT WINAPI dv_get_state(IMMDevice *i, DWORD *state) {
@@ -1519,7 +1621,10 @@ static HRESULT WINAPI dv_get_state(IMMDevice *i, DWORD *state) {
 }
 static const IMMDeviceVtbl kDeviceVtbl = {dv_query, dv_add_ref, dv_release, dv_activate, dv_open_property_store, dv_get_id, dv_get_state};
 
-static int endpoint_of(IMMEndpoint *i) { return i == &g_endpoints[CAPTURE].endpoint ? CAPTURE : RENDER; }
+static int endpoint_of(IMMEndpoint *i) {
+  for (int k = 0; k < ENDPOINTS; ++k) if (i == &g_endpoints[k].endpoint) return k;
+  return RENDER;
+}
 static HRESULT WINAPI ep_query(IMMEndpoint *i, REFIID riid, void **out) { return dv_query(&g_endpoints[endpoint_of(i)].device, riid, out); }
 static ULONG WINAPI ep_add_ref(IMMEndpoint *i) { (void)i; return 2; }
 static ULONG WINAPI ep_release(IMMEndpoint *i) { (void)i; return 1; }
@@ -1529,8 +1634,7 @@ static HRESULT WINAPI ep_get_data_flow(IMMEndpoint *i, EDataFlow *flow) {
   return S_OK;
 }
 static const IMMEndpointVtbl kEndpointVtbl = {ep_query, ep_add_ref, ep_release, ep_get_data_flow};
-static Endpoint g_endpoints[2] = {{{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}},
-                                  {{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}}};
+static Endpoint g_endpoints[ENDPOINTS] = {[0 ... ENDPOINTS - 1] = {{(IMMDeviceVtbl *)&kDeviceVtbl}, {(IMMEndpointVtbl *)&kEndpointVtbl}}};
 
 /* ---- the enumerator ----------------------------------------------------------------------------------------------------------------------------- */
 
@@ -1538,7 +1642,7 @@ typedef struct {
   IMMDeviceCollection iface;
   LONG refs;
   UINT count;
-  int items[2];
+  int items[ENDPOINTS];
 } Collection;
 
 static HRESULT WINAPI co_query(IMMDeviceCollection *i, REFIID riid, void **out) {
@@ -1589,10 +1693,17 @@ static HRESULT WINAPI en_enum(IMMDeviceEnumerator *i, EDataFlow flow, DWORD mask
   if (!c) return E_OUTOFMEMORY;
   c->iface.lpVtbl = (IMMDeviceCollectionVtbl *)&kCollectionVtbl;
   c->refs = 1;
-  for (int which = RENDER; which <= CAPTURE; ++which) {
-    if (flow != eAll && flow != (which == CAPTURE ? eCapture : eRender)) continue;
-    const DWORD state = has_endpoint(which) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
-    if (mask & state) c->items[c->count++] = which;
+  refresh_virtual();
+  /* the speakers, the virtual sinks (render endpoints too), the microphone */
+  static const int kOrder[] = {RENDER, -1, CAPTURE};
+  for (int o = 0; o < 3; ++o) {
+    const int first = kOrder[o] >= 0 ? kOrder[o] : FIRST_VIRTUAL, last = kOrder[o] >= 0 ? kOrder[o] : ENDPOINTS - 1;
+    for (int which = first; which <= last; ++which) {
+      if (flow != eAll && flow != (which == CAPTURE ? eCapture : eRender)) continue;
+      if (is_virtual(which) && !virtual_node(which)) continue;      /* (an empty slot) */
+      const DWORD state = has_endpoint(which) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_UNPLUGGED;
+      if ((mask & state) && c->count < ENDPOINTS) c->items[c->count++] = which;
+    }
   }
   *out = &c->iface;
   return S_OK;
@@ -1611,11 +1722,15 @@ static HRESULT WINAPI en_get_device(IMMDeviceEnumerator *i, LPCWSTR id, IMMDevic
   (void)i;
   if (!out || !id) return E_POINTER;
   *out = NULL;
-  for (int which = RENDER; which <= CAPTURE; ++which)
-    if (wide_equal_nocase(id, endpoint_id(which))) {
+  refresh_virtual();
+  for (int which = RENDER; which < ENDPOINTS; ++which) {
+    if (is_virtual(which) && !virtual_node(which)) continue;
+    WCHAR buffer[72];
+    if (wide_equal_nocase(id, endpoint_id_into(which, buffer))) {
       *out = &g_endpoints[which].device;
       return S_OK;
     }
+  }
   return E_NOTFOUND_;
 }
 /* ---- the watcher: what changes from outside the process ----------------------------------------------------------------------------------------- *
@@ -1624,12 +1739,13 @@ static HRESULT WINAPI en_get_device(IMMDeviceEnumerator *i, LPCWSTR id, IMMDevic
  * the callbacks what changed. */
 static Listeners g_notification_clients = {SRWLOCK_INIT, {0}};
 static volatile LONG g_watcher_started;
-static BOOL g_seen_present[2];
+static BOOL g_seen_present[ENDPOINTS];
 
 static void notify_device_change(int which, BOOL present) {
   IUnknown *items[MAX_LISTENERS];
   const int n = listeners_copy(&g_notification_clients, items);
-  const WCHAR *id = endpoint_id(which);
+  WCHAR buffer[72];
+  const WCHAR *id = endpoint_id_into(which, buffer);
   const EDataFlow flow = which == CAPTURE ? eCapture : eRender;
   for (int k = 0; k < n; ++k) {
     IMMNotificationClient *c = (IMMNotificationClient *)items[k];
@@ -1741,8 +1857,15 @@ EXPORT HRESULT WINAPI ActivateAudioInterfaceAsync(LPCWSTR device, REFIID iid, PR
   if (!o) return E_OUTOFMEMORY;
   o->iface.lpVtbl = (IActivateAudioInterfaceAsyncOperationVtbl *)&kOperationVtbl;
   o->refs = 2;      /* the caller's and the completion's */
-  const int which = wide_equal_nocase(device, kRenderInterface) || wide_equal_nocase(device, kEndpointId) ? RENDER
-                    : wide_equal_nocase(device, kCaptureInterface) || wide_equal_nocase(device, kCaptureEndpointId) ? CAPTURE : -1;
+  int which = wide_equal_nocase(device, kRenderInterface) || wide_equal_nocase(device, kEndpointId) ? RENDER
+              : wide_equal_nocase(device, kCaptureInterface) || wide_equal_nocase(device, kCaptureEndpointId) ? CAPTURE : -1;
+  if (which < 0) {      /* (a virtual sink's endpoint id) */
+    refresh_virtual();
+    for (int k = FIRST_VIRTUAL; k < ENDPOINTS && which < 0; ++k) {
+      WCHAR buffer[72];
+      if (virtual_node(k) && wide_equal_nocase(device, endpoint_id_into(k, buffer))) which = k;
+    }
+  }
   if (which >= 0) {
     void *object = NULL;
     o->result = activate(which, iid, CLSCTX_ALL, parameters, &object);

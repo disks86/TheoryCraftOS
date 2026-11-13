@@ -63,7 +63,8 @@ The behaviour follows the D-Bus Specification (0.43) and, where the specificatio
   connections are uid 0 without a process id. GetAdtAuditSessionData and GetConnectionSELinuxSecurityContext answer that there is none.
 - **Also:** GetId, Peer.Ping and Peer.GetMachineId, Introspect (the bus object at `/org/freedesktop/DBus` and its parents), Properties
   (`Features` = `HeaderFiltering`, `Interfaces` = `org.freedesktop.DBus.Monitoring`, both read only), ReloadConfig (nothing to reload),
-  UpdateActivationEnvironment (accepted on the session bus, `AccessDenied` on the system bus, like dbus-daemon).
+  UpdateActivationEnvironment (session bus: the variables go to the services started from then on; `AccessDenied` on the system bus, like
+  dbus-daemon; a name that is empty or has `=` is `InvalidArgs` and nothing of that call is set; at most 256 variables and 64 KiB).
 
 ### Activation
 
@@ -75,22 +76,38 @@ friends; the first folder that names a service wins). A file is
     Name=org.example.Service
     Exec=/usr/bin/example-service --flag "an argument"
 
-(`User=` and `SystemdService=` are read and ignored: there is one user and no systemd.) A message for a well-known name nobody owns, without the
+A message for a well-known name nobody owns, without the
 NO_AUTO_START flag, and StartServiceByName start the program; the messages wait in the bus (at most 1024 in all, 64 services starting at once) and go
 on, in order, once the program has taken the name. StartServiceByName answers 1 then, 2 for a name already owned. If the program ends first the
 callers get `Spawn.ChildExited` ("Process X exited with status N"), if it cannot run `Spawn.ExecFailed`, if its Exec line is broken
-`Spawn.FileInvalid`, and if it has not taken the name after 25 s (`set_activation_timeout_us`) `TimedOut`. The program gets `DBUS_STARTER_ADDRESS`
-and `DBUS_STARTER_BUS_TYPE` (libdbus' `DBUS_BUS_STARTER`, GDBus' `G_BUS_TYPE_STARTER`) on top of the usual environment, runs from `/` of the Linux
-tree with no input, and prints to the debug console. The files are read at boot, on ReloadConfig, and again when a name is asked for that no file
+`Spawn.FileInvalid`, and if it has not taken the name after 25 s (`set_activation_timeout_us`) `TimedOut`, and the program is stopped
+(`IServiceLauncher::stop`; dbus-daemon kills it too, so a late starter does not hold the name with nobody waiting; the kernel logs "D-Bus: stopped the
+service ..."). The program gets the usual environment, then UpdateActivationEnvironment's variables, then its unit's `Environment=` (below), then
+`DBUS_STARTER_ADDRESS` and `DBUS_STARTER_BUS_TYPE` (libdbus' `DBUS_BUS_STARTER`, GDBus' `G_BUS_TYPE_STARTER`); a later variable of a name replaces an
+earlier one. It runs from `/` of the Linux tree with no input, and prints to the debug console. The files are read at boot, on ReloadConfig, and again when a name is asked for that no file
 names (at most once a second), so a newly installed service is found without a reload.
+
+**SystemdService=, without systemd.** Distributions' service files often name a systemd unit and say `Exec=/bin/false`; dbus-daemon then asks
+systemd to start the unit. There is no systemd here, so the bus runs the unit itself: it looks for the unit in `/etc/systemd/system` then
+`/usr/lib/systemd/system` (session bus: the `user` folders; `layout::kSystemUnitsFolder` and friends), by its file name (a file system that follows
+symbolic links finds the `dbus-org.*` links of `systemctl enable`) or else by an `Alias=` in the `[Install]` group of a unit there. Its `[Service]`
+`ExecStart=` is the command (the first one; an empty assignment drops those before it; the `-`, `:`, `+`, `!`, `!!` and `@` prefixes are taken off,
+`@`'s argv[0] word dropped; lines continue after a trailing `\`, `%%` is `%`) and its `Environment=` assignments are added. A unit that is not there, a
+unit name with `/`, or an ExecStart that needs what is not expanded here (`$VARIABLES` without the `:` prefix, specifiers like `%i`, a path that is not
+absolute) is passed over and Exec is run, as dbus-daemon does when it runs without systemd. The rest of the unit (`Type=`, sandboxing, `User=`,
+dependencies, `NOTIFY_SOCKET`) is not used.
+
+`User=` is handed to the launcher; the kernel has one user, so every service runs as it.
 
 ### Reply timeouts
 
 A call that expects a reply and is not answered within 5 minutes (`Bus::kDefaultReplyTimeoutUs`, dbus-daemon's old default; `set_reply_timeout_us`,
 0 = never) is answered by the bus with `org.freedesktop.DBus.Error.NoReply` ("Did not receive a reply..."), and the callee's late reply is then an
-unrequested one (dropped on the system bus). The deadlines are kept in one queue in the order they were set (the timeout is the same for every call),
-so expiring costs nothing per call that was answered in time; stale entries are dropped when they outnumber the waiting calls. The clock is the
-transport's (`tick()`); a call made before the first tick is timed from it.
+unrequested one (dropped on the system bus). Each call is kept with the time it was made, in one queue in that order: whatever the timeout, that is
+the order of the deadlines, so a new timeout applies at once to the calls already waiting (a shorter one ends those past it at the next tick; calls
+made while the timeout was off are timed from when they were made once it is on again). Expiring costs nothing per call that was answered in time;
+stale entries are dropped when they outnumber the waiting calls. The clock is the transport's (`tick()`); a call made before the first tick is
+timed from it.
 
 ### Limits
 
@@ -121,17 +138,22 @@ system's lock (`ISystemSync`) and calls the buses with it let go; descriptors ar
 - `tests/dbus_interop.sh`: `tests/dbus/DBusHostServer.cpp` serves both buses on the host's sockets, and the host's dbus-send, dbus-monitor, busctl
   (sd-bus), gdbus, notify-send and `tests/dbus/fdclient.c` (libdbus, a pipe passed with UNIX_FD) are pointed at them. A third bus starts
   `tests/dbus/echoservice.c` on demand (fork and exec with the starter variables) and has short timeouts: auto-start from libdbus, sd-bus and GDBus,
-  StartServiceByName 1 then 2, ChildExited, ExecFailed, TimedOut, and NoReply from the bus for a call nobody answers (35 checks).
+  StartServiceByName 1 then 2, ChildExited, ExecFailed, TimedOut (and the program killed), UpdateActivationEnvironment from dbus-send and gdbus seen
+  by a service started later, a `SystemdService=` unit (found by `Alias=`, with its `Environment=`) run instead of `Exec=/bin/false`, and NoReply from
+  the bus for a call nobody answers (43 checks).
 - `tests/dbus_emulated.sh`: the host's real dbus-send, fdclient and gdbus, dynamically linked, run on the CPU emulator through the OS's Linux system calls
   against the kernel's buses (`EmulationRun -DTCOS_EMU_DBUS`); dbus-send also starts echoservice on demand, as a second emulated program
   (`TCOS_EMU_DBUS_SERVICES`).
 - QEMU (by hand, recipe in the project notes): a kernel that autoruns `/usr/bin/dbus-send ... org.tcos.Echo.Echo`, with echoservice, its libraries and
-  its service file on the primary disk: the kernel's launcher starts the service natively and the answer comes back.
+  its service file on the primary disk: the kernel's launcher starts the service natively and the answer comes back. A second run autoruns a small
+  libdbus client that sets an activation variable, starts a service through a user unit (the service sees the unit's variable, the bus's and the
+  starter's), and waits on a service that never takes its name (TimedOut after 25 s, and the kernel stops the program).
 
 ## Not done
 
-- Activation: no systemd activation (`SystemdService=` is ignored), `User=` ignored, the environment of UpdateActivationEnvironment is not passed to
-  the services, no inotify (a changed file is found on a miss or ReloadConfig), a service that hangs while starting is not killed after the timeout.
+- Activation: units run without systemd's machinery (no `Type=notify`/`NOTIFY_SOCKET`, sandboxing, `EnvironmentFile=`, `WorkingDirectory=`,
+  dependencies or restarts; no `$VARIABLE` or `%` specifier expansion); `User=` cannot be honoured (one user); no inotify (a changed file is found on
+  a miss or ReloadConfig); a program the kernel stops ends like Ctrl+C would end it (no SIGTERM first).
 - No policy beyond the defaults: everything may send to everything (there is one user); no `<policy>` configuration, no `send_destination` rules,
   no `AccessDenied` for ordinary calls on the system bus.
 - No TCP or nonce-tcp transports, no `ANONYMOUS` or `DBUS_COOKIE_SHA1` mechanisms (Windows clients of D-Bus that need them cannot connect).

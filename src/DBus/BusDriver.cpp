@@ -416,7 +416,27 @@ struct BusDriverCall {
     if (member == "UpdateActivationEnvironment") {
       if (!signature_is("a{ss}")) return;
       if (bus.kind() == BusKind::System) return error("org.freedesktop.DBus.Error.AccessDenied", "Cannot change activation environment on a system bus.");
-      return empty_reply();      // (accepted; the activated services get the standard environment and the starter variables only)
+      // a{ss}: (name, value) pairs, all checked before any is set (the body is valid: the bus checked it on the way in)
+      for (int pass = 0; pass < 2; ++pass) {
+        Reader r(call.body.view(), call.big_endian);
+        uint64_t end = 0;
+        if (!r.begin_array(8, &end)) return error("org.freedesktop.DBus.Error.InvalidArgs", "Invalid arguments");
+        while (r.position() < end) {
+          StringView name, value;
+          if (!r.align(8) || !r.string(&name) || !r.string(&value)) return error("org.freedesktop.DBus.Error.InvalidArgs", "Invalid arguments");
+          if (pass == 0) {
+            if (name.empty() || name.contains('=')) return error2("org.freedesktop.DBus.Error.InvalidArgs", "Not an environment variable name: \"", name, "\"");
+            continue;
+          }
+          switch (bus.set_activation_variable(name, value)) {
+            case Bus::EnvStatus::Ok: break;
+            case Bus::EnvStatus::Invalid: return error("org.freedesktop.DBus.Error.InvalidArgs", "Invalid arguments");
+            case Bus::EnvStatus::TooMany: return error("org.freedesktop.DBus.Error.LimitsExceeded", "The activation environment is full");
+            case Bus::EnvStatus::NoMemory: return error("org.freedesktop.DBus.Error.NoMemory", "Not enough memory");
+          }
+        }
+      }
+      return empty_reply();      // (the services started from now on get them)
     }
     if (member == "NameHasOwner") {
       if (!signature_is("s")) return;

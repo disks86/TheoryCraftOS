@@ -26,7 +26,7 @@ namespace {
 
 constexpr uint32_t kSuccess = 0, kAccessViolation = 0xC0000005u, kInvalidHandle = 0xC0000008u, kInvalidParameter = 0xC000000Du, kNoMemory = 0xC0000017u,
                    kDeviceNotConnected = 0xC000009Du, kTooManyOpened = 0xC000011Fu;
-enum : uint64_t { kOpen = 1, kClose, kWrite, kStatus, kFlush, kPause, kSetVolume, kGetVolume, kDevices, kSetMute, kOpenCapture, kRead };
+enum : uint64_t { kOpen = 1, kClose, kWrite, kStatus, kFlush, kPause, kSetVolume, kGetVolume, kDevices, kSetMute, kOpenCapture, kRead, kVirtualSinks };
 constexpr uint64_t kMaxRead = 1u << 20;
 constexpr uint32_t kWaveFormatPcm = 1, kWaveFormatFloat = 3;
 
@@ -120,17 +120,17 @@ void WindowsAudioService::process_exited(uint64_t pid) {
   if (client) graph_.remove_client(client);
 }
 
-uint32_t WindowsAudioService::open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream) {
-  return open_node(pid, format, name, false, false, stream);
+uint32_t WindowsAudioService::open(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, uint32_t target) {
+  return open_node(pid, format, name, false, false, stream, target);
 }
 
-uint32_t WindowsAudioService::open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, bool monitor) {
-  return open_node(pid, format, name, true, monitor, stream);
+uint32_t WindowsAudioService::open_capture(uint64_t pid, const PcmFormat& format, StringView name, uint32_t* stream, bool monitor, uint32_t target) {
+  return open_node(pid, format, name, true, monitor || target, stream, target);
 }
 
-uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, bool monitor, uint32_t* stream) {
+uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, StringView name, bool capture, bool monitor, uint32_t* stream, uint32_t target) {
   *stream = 0;
-  if (capture && !monitor ? !graph_.source_id() : !graph_.mixer()) return kDeviceNotConnected;
+  if (target ? !graph_.is_virtual_sink(target) : (capture && !monitor ? !graph_.source_id() : !graph_.mixer())) return kDeviceNotConnected;
   if (!format.valid()) return kInvalidParameter;
   kernel::ScopedMutex guard(mutex_);
   Owner* o = owner_locked(pid, true);
@@ -149,10 +149,10 @@ uint32_t WindowsAudioService::open_node(uint64_t pid, const PcmFormat& format, S
   uint32_t node = 0;
   if (capture) {
     SharedPointer<RecordStream> record;
-    node = graph_.create_record(o->client, format, props, &record, monitor);
+    node = graph_.create_record(o->client, format, props, &record, monitor, target);
   } else {
     SharedPointer<PlaybackStream> playback;
-    node = graph_.create_playback(o->client, format, props, &playback);
+    node = graph_.create_playback(o->client, format, props, &playback, target);
   }
   if (!node) return kTooManyOpened;
   if (!o->nodes.push_back(node)) {
@@ -210,6 +210,10 @@ uint32_t WindowsAudioService::volume_node(uint64_t pid, uint32_t stream, uint32_
   if (stream == kSourceStream) {
     *node = graph_.source_id();
     return *node ? kSuccess : kDeviceNotConnected;
+  }
+  if (stream & kVirtualSinkStream) {      // (a virtual sink's master volume: anyone's, as the speakers' is)
+    *node = stream & ~kVirtualSinkStream;
+    return graph_.is_virtual_sink(*node) ? kSuccess : kDeviceNotConnected;
   }
   *node = stream ? stream : graph_.sink_id();
   if (!stream) return kSuccess;
@@ -278,8 +282,15 @@ uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRe
       if (a[5] == 0) name_length = 0;
       if (name_length && !p.read_user(a[5], ByteView(name, name_length))) return kAccessViolation;
       uint32_t node = 0;
-      // (OPEN_CAPTURE with [1] = 1: the monitor, what the mixer plays)
-      const uint32_t st = open_node(pid, format, StringView(ConstByteView(name, name_length)), a[0] == kOpenCapture, a[0] == kOpenCapture && a[1] == 1, &node);
+      // OPEN [1]: a virtual sink to play into (0: the speakers); OPEN_CAPTURE [1]: 0 the microphone, 1 the monitor (what the mixer plays), else a virtual
+      // sink whose monitor to record
+      const bool capture = a[0] == kOpenCapture;
+      uint32_t target = 0;
+      if (capture ? a[1] > 1 : a[1] != 0) {
+        if (a[1] > 0xFFFFFFFFull || !graph_.is_virtual_sink(static_cast<uint32_t>(a[1]))) return kDeviceNotConnected;
+        target = static_cast<uint32_t>(a[1]);
+      }
+      const uint32_t st = open_node(pid, format, StringView(ConstByteView(name, name_length)), capture, capture && a[1] == 1, &node, target);
       if (st != kSuccess) return st;
       if (!put(7, node)) {
         close(pid, node, false);
@@ -380,6 +391,27 @@ uint32_t WindowsAudioService::call(process::Process& p, const process::SyscallRe
     }
     case kSetMute: return set_mute(pid, stream, a[2] != 0);
     case kDevices: return put(6, graph_.has_input() ? 1 : 0) && put(7, graph_.mixer() ? 1 : 0) ? kSuccess : kAccessViolation;
+    case kVirtualSinks: {
+      // [2] which (0 ..), [3] a buffer for its description (UTF-8), [4] its size (at most 255); [5] = its node, [6] = how many there are, [7] = the
+      // description's length
+      List<uint32_t> sinks(allocator_);
+      if (!graph_.virtual_sinks(&sinks)) return kNoMemory;
+      uint32_t node = 0;
+      uint8_t text[255];
+      uint64_t length = 0;
+      if (a[2] < sinks.count()) {
+        node = sinks[a[2]];
+        const uint64_t room = a[4] > sizeof text ? sizeof text : a[4];
+        graph_.visit(node, [&](const GraphObject& o) {
+          StringView d = o.props.get("node.description");
+          if (d.empty()) d = o.props.get("node.name");
+          length = d.size() < room ? d.size() : room;
+          for (uint64_t i = 0; i < length; ++i) text[i] = static_cast<uint8_t>(d[i]);
+        });
+        if (length && (a[3] == 0 || !p.write_user(a[3], ConstByteView(text, length)))) return kAccessViolation;
+      }
+      return put(5, node) && put(6, sinks.count()) && put(7, length) ? kSuccess : kAccessViolation;
+    }
     default: return kInvalidParameter;
   }
 }

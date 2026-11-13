@@ -59,6 +59,16 @@ bool linux_service(Process& process, uint32_t service, uint64_t params, uint32_t
   return true;
 }
 
+// What the image of an export is (DxgBufferFile::describe: the kernel's OpenGL drawing a Linux process's frames into a dmabuf).
+bool describe_export(const dxgk::ExportedAllocation& exported, DxgBufferImage* out) {
+  const dxgk::ExportInfo& info = dxgk::export_info(exported);
+  out->width = info.desc.width;
+  out->height = info.desc.height;
+  out->pitch = info.pitch;
+  out->format = uint32_t(info.desc.format);
+  return true;
+}
+
 // /dev/dxg's GPU images (TCOS_DXG_IOCTL_EXPORT / IMPORT, LinuxFiles.cpp): an export of one of the process's allocations, and a handle of the process for one, recorded
 // as the allocations it creates are (so that D3DKMTDestroyAllocation and the process's exit let go of it).
 bool linux_export(Process& process, uint32_t allocation, SharedPointer<dxgk::ExportedAllocation>* out, uint64_t* bytes, uint32_t* status) {
@@ -190,6 +200,7 @@ void install_dxg() {
   linuxabi::set_dxg_buffer_handlers(&dxg::linux_export, &dxg::linux_import);
   linuxabi::set_dxg_sync_handlers(&dxg::linux_export_sync, &dxg::linux_import_sync);
   set_dxg_buffer_copier(&dxgk::copy_export);      // (mmap of a dmabuf: the CPU's copy, DxgBufferFile.hpp)
+  set_dxg_buffer_describer(&dxg::describe_export);
 }
 
 }  // namespace process::win32k

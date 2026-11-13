@@ -52,6 +52,13 @@ namespace process {
 // image's memory (its rows, pitch apart) and of `bytes` are what is copied: the shorter of the two.
 using DxgBufferCopier = bool (*)(dxgk::ExportedAllocation& exported, ByteView bytes, bool to_image);
 void set_dxg_buffer_copier(DxgBufferCopier copier);
+// What the image of an export is (fixed when it was made): its size, bytes per row and the Direct3D layer's format number (dxgk::Format: 1 A8R8G8B8, 2 X8R8G8B8,
+// 3 A8B8G8R8, 4 X8B8G8R8, ...). Given at boot like the copier (set_dxg_buffer_describer); without one, describe() fails.
+struct DxgBufferImage {
+  uint32_t width = 0, height = 0, pitch = 0, format = 0;
+};
+using DxgBufferDescriber = bool (*)(const dxgk::ExportedAllocation& exported, DxgBufferImage* out);
+void set_dxg_buffer_describer(DxgBufferDescriber describer);
 
 class DxgBufferFile final : public filesystem::IFile {
  public:
@@ -73,6 +80,12 @@ class DxgBufferFile final : public filesystem::IFile {
   // Sends the copy to the image if a writable shared mapping of it is still there and the copy changed since it was last moved (the compositor, at a commit).
   // False when that did not work (the GPU still works on it).
   bool flush_cpu_writes();
+  // The image's size and format (false without a describer).
+  bool describe(DxgBufferImage* out) const;
+  // Copies `bytes` to the image (`to_image`) or the image to `bytes`, past the CPU's copy: the kernel's own producers and readers (the OpenGL of a Linux
+  // process drawing its frames into a dmabuf, TCOS_DXG_IOCTL_GL). The CPU's copy is left as it is (a mapping sees the new pixels after DMA_BUF_IOCTL_SYNC, as
+  // on Linux). False when the GPU still works on the image or there is no copier.
+  bool copy_image(ByteView bytes, bool to_image);
 
   // --- IFile (its size is the image's memory; reading, writing and resizing are not supported)
   uint64_t size() const override { return bytes_; }

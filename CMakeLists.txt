@@ -231,6 +231,9 @@ add_executable(BOOTX64
   src/PipeWire/Graph.cpp
   src/PipeWire/NativeServer.cpp
   src/PipeWire/NativeClientNode.cpp
+  src/PipeWire/MidiBus.cpp
+  src/PipeWire/VideoChannel.cpp
+  src/PipeWire/CameraSource.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp
@@ -787,6 +790,7 @@ add_executable(BOOTX64
   src/X11/X11Tables.cpp
   src/X11/X11Windows.cpp
   src/Wayland/Dxg/WaylandDxgImage.cpp
+  src/Wayland/Media/WaylandClipboardPng.cpp
   src/Wayland/WaylandData.cpp
   src/Wayland/WaylandDesktop.cpp
   src/Wayland/WaylandDmabuf.cpp

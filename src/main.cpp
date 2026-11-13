@@ -22,6 +22,7 @@
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "X11/X11SocketServer.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
+#include "Wayland/Media/WaylandClipboardPng.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
 #include "DBus/Bus.hpp"
 #include "DBus/MachineId.hpp"
@@ -29,6 +30,7 @@
 #include "DBus/ProgramActivator.hpp"
 #include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
+#include "PipeWire/CameraSource.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
@@ -2121,6 +2123,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // as a Windows or an X one. Linux programs reach it at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run/user/0/wayland-0 in the Linux tree).
     wayland::Server wayland_server(shared_allocator, [] { return hardware::uptime_us() / 1000; });
     desktop.set_wayland_session(&wayland_server);
+    wayland_server.set_clipboard_images(&wayland::clipboard_to_png, &wayland::png_to_clipboard);      // (pictures as image/png)
     wayland_server.set_clipboard(&clipboard);      // (copy and paste between Wayland programs and the desktop's)
     struct WaylandGuard { desktop::Desktop& d; ~WaylandGuard() { d.set_wayland_session(nullptr); } } wayland_guard{desktop};      // (the desktop lets go first)
     UniquePointer<wayland::SocketServer> wayland_sockets;
@@ -2136,9 +2139,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll, dsound.dll, WASAPI and NtTcosAudio. Recording goes the same ways
     // through the capture hub: the graph's source is the microphone it shares. (Gone before the mixer and the hub are.)
     pipewire::Graph media_graph(shared_allocator, mixer.get(), capture_hub.get());
-    pipewire::NativeServer pipewire_native(media_graph, shared_allocator);
+    pipewire::NativeServer pipewire_native(media_graph, shared_allocator, [] { return hardware::uptime_us() * 1000; });
+    // MIDI: what programs play sounds on the machine's synthesizer (a USB one, the MPU-401, else the software one); what keyboards play is heard by
+    // the programs that record MIDI. (Undone before the graph goes.)
+    media_graph.midi_bus().set_output(&usb_midi.program_output());
+    usb_midi.set_input_tap(&media_graph.midi_bus());
+    struct MidiGuard {
+      hardware::UsbMidiService& s;
+      pipewire::Graph& g;
+      ~MidiGuard() {
+        s.set_input_tap(nullptr);
+        g.midi_bus().set_output(nullptr);
+      }
+    } midi_guard{usb_midi, media_graph};
     pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
     pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);
+    // The cameras as video sources of the graph (a node each; a camera streams while a program watches it): updated from the loop below.
+    pipewire::CameraSources camera_sources(media_graph, shared_allocator);
+    uint64_t camera_sources_us = 0;
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);
@@ -2174,8 +2192,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       namespace layout = filesystem::layout;
       const StringView session_folders[] = {layout::kSessionServicesFolder, layout::kLocalSessionServicesFolder};
       const StringView system_folders[] = {layout::kSystemServicesFolder, layout::kLocalSystemServicesFolder};
-      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2));
-      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2));
+      const StringView session_units[] = {layout::kLocalUserUnitsFolder, layout::kUserUnitsFolder};
+      const StringView system_units[] = {layout::kLocalSystemUnitsFolder, layout::kSystemUnitsFolder};
+      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2), ArrayView<const StringView>(session_units, 2));
+      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2), ArrayView<const StringView>(system_units, 2));
     }
     UniquePointer<dbus::SocketServer> dbus_sockets;
     if (dbus_ids && dbus_notifications.start()) {
@@ -2678,6 +2698,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
       uint32_t tools_width, tools_height;
       if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
+      if (const uint64_t now_us = hardware::uptime_us(); now_us - camera_sources_us >= 20000) {
+        camera_sources_us = now_us;
+        pipewire::CameraSources::Camera list[pipewire::CameraSources::kMaxCameras];
+        uint32_t listed = 0;
+        for (uint32_t i = 0; i < cameras.count() && listed < pipewire::CameraSources::kMaxCameras; ++i)
+          if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
+        camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
+      }
       if (threaded) {
         desktop.pump(hardware::uptime_us());
       } else {

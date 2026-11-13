@@ -25,7 +25,8 @@
 // protocol lets kMaxPending bytes pile up unsent is dropped. Each round also ticks the protocols (graph changes, flow control), at least every
 // few milliseconds.
 //
-// Descriptors: the server is the protocols' IDescriptorMaker. Memory is a file in memory (memfd, Process/MemoryFile.hpp) the kernel reads and writes in
+// Descriptors: the server is the protocols' IDescriptorMaker; descriptors clients send (SCM_RIGHTS) go to the protocol with the bytes they came with
+// (receive_with_fds): a memfd as its memory, the bytes the file has when it comes (a client's own buffers for the native protocol's port_buffers). Memory is a file in memory (memfd, Process/MemoryFile.hpp) the kernel reads and writes in
 // place while the client maps it; an event is an eventfd (UnixType::Event in the socket manager). What a protocol hands out goes with SCM_RIGHTS on the
 // first bytes of the output it came with. Descriptors the protocols let go of are released by this thread (a graveyard), never under another lock.
 //
@@ -74,7 +75,7 @@ class SocketServer final : public IDescriptorMaker {
     IProtocolServer* protocol;
   };
   struct Connection {
-    explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), pending(allocator), batches(allocator) {}
+    explicit Connection(allocators::IAllocator& allocator) : inbox(allocator), pending(allocator), batches(allocator), arrived(allocator) {}
     uint32_t socket = 0, client = 0;
     IProtocolServer* protocol = nullptr;
     ByteBuffer inbox;
@@ -86,6 +87,7 @@ class SocketServer final : public IDescriptorMaker {
       Queue<process::UnixInFlight> rights;
     };
     List<UniquePointer<Batch>> batches;
+    Queue<process::UnixInFlight> arrived;      // descriptors the client sent (SCM_RIGHTS) that the protocol has not been given yet
     bool dead = false;
     bool closing = false;
   };
@@ -102,6 +104,7 @@ class SocketServer final : public IDescriptorMaker {
   void drop_rights(Connection& c);
   void drain_graveyard();
   void release_entries(Queue<process::UnixInFlight>& entries);
+  Fd adopt(process::UnixInFlight entry);
 
   process::UnixSocketManager& sockets_;
   allocators::IAllocator& allocator_;

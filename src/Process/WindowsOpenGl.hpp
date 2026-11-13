@@ -33,6 +33,11 @@
 //   7 SHARE_LISTS     share = the source, context = the one that takes its objects.
 //   8 FLUSHED         window: shows a single-buffered window after glFlush/glFinish (result as SWAP), result 2 when nothing was drawn since.
 //   9 DESTROY_SURFACE window: its images go; a context drawing to it is left with no drawable.
+//  10 FRONT_TO_BUFFER (Linux only) window, data = a dmabuf descriptor of /dev/dxg (TCOS_DXG_IOCTL_EXPORT) of an 8-bit four-channel image: the window's front
+//                     image is copied into the GPU image in the kernel (no copy through the program), its top row first; what does not fit is cut off, what the
+//                     front image does not cover is left as it was. width and height are written back (the front image's). STATUS_INVALID_HANDLE for a
+//                     descriptor that is no such image, STATUS_RESOURCE_IN_USE while the GPU still works on the image. (What EGL's swaps into GBM surfaces and
+//                     Wayland dmabufs use: src/Linux/libegl.)
 // The same request reaches the kernel from Linux programs through /dev/dxg (TCOS_DXG_IOCTL_GL, DxgDevice.h).
 // STATUS_INVALID_HANDLE for a context or window that is not there, STATUS_INVALID_DEVICE_STATE for EXECUTE without a current context, STATUS_NOT_SUPPORTED without OpenGL.
 #pragma once

@@ -34,11 +34,15 @@
 // (Spawn.ChildExited, Spawn.ExecFailed, TimedOut). The service files are read again on ReloadConfig, and when a name is asked for that no file names
 // (at most once a second). A name the kernel serves itself is always running (see LocalPeer below).
 //
+// A service whose file names a systemd unit (SystemdService=) is started from that unit's ExecStart= when the unit is in the bus's unit folders
+// (Activation.hpp); its programs get UpdateActivationEnvironment's variables (session bus only, as in dbus-daemon) and the unit's Environment=. A service
+// that has not taken its name by the activation timeout is stopped (IServiceLauncher::stop), as dbus-daemon kills it.
+//
 // Reply timeouts: a call that expects a reply and gets none within the reply timeout (set_reply_timeout_us(); default kDefaultReplyTimeoutUs, as
 // dbus-daemon's old default: today's dbus-daemon has none; 0 never) is answered by the bus with org.freedesktop.DBus.Error.NoReply, and a reply that
-// comes later is an unrequested one. The deadlines are kept in the order they were set, so the timeout is meant to be set once, before the bus is used
-// (a lower one set later applies to new calls only after the older ones expire). Time is the transport's clock as tick() gives it.
-// A service that has not taken its name by the activation timeout is not killed: the callers are told TimedOut, the program goes on (dbus-daemon kills it).
+// comes later is an unrequested one. Every call is timed from when it was made, so a new timeout applies at once to the calls already waiting too (a
+// shorter one ends those that are past it at the next tick; turning it off and on again times calls from when they were made). Time is the
+// transport's clock as tick() gives it.
 //
 // A connection that breaks the protocol (an invalid message, a message before Hello, a monitor that sends) is closed, as dbus-daemon does.
 //
@@ -131,13 +135,22 @@ class Bus {
   void tick(uint64_t now_us);
 
   // --- activation and timeouts
-  // Where service files are (folders of `files`, each with its *.service files) and what starts their programs. Reads them at once.
-  void set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders);
+  // Where service files are (folders of `files`, each with its *.service files), where systemd units are (for SystemdService=; the first folder that
+  // has a unit wins) and what starts their programs. Reads the service files at once.
+  void set_activation(IServiceLauncher* launcher, filesystem::IFileSystem* files, ArrayView<const StringView> folders,
+                      ArrayView<const StringView> unit_folders = ArrayView<const StringView>());
   // Reads the service files again; returns how many name a service.
   uint32_t reload_services();
   bool activatable(StringView name) const;
   uint32_t activations_running() const { return uint32_t(activations_.count()); }
   void set_reply_timeout_us(uint64_t timeout_us) { reply_timeout_us_ = timeout_us; }
+  // UpdateActivationEnvironment's variables ("NAME=value"), in the order they were first set.
+  ArrayView<const String> activation_environment() const { return activation_environment_.view(); }
+  static constexpr uint32_t kMaxActivationEnvironment = 256;
+  static constexpr uint64_t kMaxActivationEnvironmentBytes = 64 * 1024;
+  // Sets (or replaces) one: Invalid when the name is empty or has '=', TooMany past the limits.
+  enum class EnvStatus : uint8_t { Ok, Invalid, TooMany, NoMemory };
+  EnvStatus set_activation_variable(StringView name, StringView value);
   void set_activation_timeout_us(uint64_t timeout_us) { activation_timeout_us_ = timeout_us ? timeout_us : kActivationTimeoutUs; }
   uint32_t pending_calls() const { return uint32_t(pending_.count()); }
 
@@ -184,6 +197,7 @@ class Bus {
   // activation
   struct Activation;
   const ServiceFile* service_for(StringView name);
+  bool find_unit(StringView unit, ByteBuffer* text);
   Activation* activate(StringView name, Connection& asker, const Message& call);
   void finish_activations();
   void fail_activation(Activation& a, StringView error_name, StringView text);
@@ -217,17 +231,20 @@ class Bus {
   struct Expiry {
     uint64_t key = 0;
     uint32_t generation = 0;
-    uint64_t deadline_us = 0;     // 0: from the next tick on (the bus has no time yet)
+    uint64_t made_us = 0;         // when the call was made; 0: before the first tick (timed from it)
   };
-  Queue<Expiry> expiries_;        // in the order of their deadlines (the timeout is one for all); stale ones are skipped
+  Queue<Expiry> expiries_;        // in the order the calls were made, so of their deadlines whatever the timeout; stale ones are skipped
   uint32_t generation_ = 0;
-  uint32_t unset_deadlines_ = 0;      // expiries made before the first tick
+  bool unset_times_ = false;      // expiries made before the first tick
   uint64_t reply_timeout_us_ = kDefaultReplyTimeoutUs;
   uint64_t activation_timeout_us_ = kActivationTimeoutUs;
   uint64_t now_us_ = 0;
   IServiceLauncher* launcher_ = nullptr;
   filesystem::IFileSystem* service_files_ = nullptr;
   List<String> service_folders_;
+  List<String> unit_folders_;
+  List<String> activation_environment_;
+  uint64_t activation_environment_bytes_ = 0;
   List<UniquePointer<ServiceFile>> services_;
   uint64_t services_read_us_ = 0;
   List<UniquePointer<Activation>> activations_;

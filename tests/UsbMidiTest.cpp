@@ -124,6 +124,26 @@ static void test_packets() {
   CHECK(encode_usb_midi_packet(0, 0x91, 60, 100, p) && p[0] == 0x09 && p[1] == 0x91 && p[2] == 60 && p[3] == 100);
   CHECK(encode_usb_midi_packet(2, 0xC3, 5, 99, p) && p[0] == 0x2C && p[1] == 0xC3 && p[2] == 5 && p[3] == 0);   // program change: two bytes
   CHECK(encode_usb_midi_packet(0, 0xE0, 0xFF, 0xFF, p) && p[2] == 0x7F && p[3] == 0x7F);
+  // system exclusive: CIN 4 for each three bytes, the last packet CIN 5, 6 or 7 with one, two or three bytes; every length from 2 to 9 put back
+  for (uint32_t len = 2; len <= 9; ++len) {
+    uint8_t message[9];
+    message[0] = 0xF0;
+    for (uint32_t k = 1; k + 1 < len; ++k) message[k] = uint8_t(k);
+    message[len - 1] = 0xF7;
+    uint8_t back[16];
+    uint32_t back_len = 0, packets = 0;
+    bool good = true;
+    const uint32_t n = encode_usb_midi_sysex(3, ConstByteView(message, len), [&](const uint8_t* q) {
+      const uint8_t cin = q[0] & 0x0F;
+      good &= (q[0] >> 4) == 3;
+      const uint32_t count = cin == 4 ? 3 : cin - 4;
+      good &= cin >= 4 && cin <= 7 && (cin == 4) == (++packets < (len + 2) / 3);
+      for (uint32_t k = 0; k < count && back_len < 16; ++k) back[back_len++] = q[1 + k];
+    });
+    CHECK(good && n == (len + 2) / 3 && back_len == len && memcmp(back, message, len) == 0);
+  }
+  const uint8_t not_sysex[] = {0x90, 1, 2};
+  CHECK(encode_usb_midi_sysex(0, ConstByteView(not_sysex, 3), [](const uint8_t*) {}) == 0);
   CHECK(!encode_usb_midi_packet(0, 0xF8, 0, 0, p) && !encode_usb_midi_packet(0, 0x40, 0, 0, p));
   const uint8_t data[] = {0x09, 0x90, 64, 80,        // note on
                           0x04, 0xF0, 0x7E, 0x7F,    // system exclusive: skipped

@@ -157,6 +157,7 @@ static void load_adapters(Instance *in) {
   for (uint32_t i = 0; in->pd && i < n; ++i) {
     PhysDev *pd = &in->pd[in->npd];
     pd->h.magic = MAGIC_PHYS;
+    pd->h.dispatch = ICD_LOADER_MAGIC;
     pd->inst = in;
     pd->adapter = get32(infos + i * 20, 0);
     memcpy(&pd->luid, infos + i * 20 + 4, 8);
@@ -203,6 +204,7 @@ VKAPI VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo *ci, const
   Instance *in = vk_alloc(sizeof(Instance));
   if (!in) return VK_ERROR_OUT_OF_HOST_MEMORY;
   in->h.magic = MAGIC_INSTANCE;
+  in->h.dispatch = ICD_LOADER_MAGIC;
   in->api_version = VK_API_VERSION_1_0;
   load_adapters(in);
   *out = (VkInstance)in;
@@ -423,6 +425,7 @@ VKAPI VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physical, const VkDevi
   Device *d = vk_alloc(sizeof(Device));
   if (!d) return VK_ERROR_OUT_OF_HOST_MEMORY;
   d->h.magic = MAGIC_DEVICE;
+  d->h.dispatch = ICD_LOADER_MAGIC;
   d->pd = pd;
   uint8_t open[16];
   memset(open, 0, sizeof open);
@@ -466,6 +469,7 @@ VKAPI VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice physical, const VkDevi
     return VK_ERROR_OUT_OF_HOST_MEMORY;
   }
   d->queue->h.magic = MAGIC_QUEUE;
+  d->queue->h.dispatch = ICD_LOADER_MAGIC;
   d->queue->dev = d;
   *out = (VkDevice)d;
   return VK_SUCCESS;

@@ -53,6 +53,7 @@ class Mpu401Output final : public midi::IMidiOutput {
   uint16_t base() const { return base_; }
 
   void send(uint8_t status, uint8_t data1, uint8_t data2) override;
+  void send_sysex(ConstByteView message) override;
   void reset() override;
 
  private:

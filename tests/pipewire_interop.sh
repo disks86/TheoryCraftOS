@@ -16,8 +16,8 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
-         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Kernel/Sync.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
 g++ -fsanitize=address,undefined -pthread "$work"/obj/*.o -o "$work/pwhost"
@@ -45,7 +45,9 @@ ports = [o for o in d if o['type'] == 'PipeWire:Interface:Port']
 assert sink['info']['params']['Props'][0]['channelVolumes'] == [1.0, 1.0]
 assert sink['info']['params']['EnumFormat'][0]['format'] == 'S16LE'
 sink_ports = [p for p in ports if p['info']['props'].get('node.id') == sink['id']]
-assert len(sink_ports) == 4 and len(ports) == 6 and all(p['info']['params']['Format'] for p in ports)      # (playback and monitor ports, the source's two)
+assert len(sink_ports) == 4 and len(ports) == 8 and all(p['info']['params']['Format'] for p in ports)      # (playback and monitor ports, the source's two, the MIDI bridge's two)
+midi = [p for p in ports if p['info']['props'].get('format.dsp') == '8 bit raw midi']
+assert len(midi) == 2 and all(p['info']['params']['Format'][0]['mediaType'] == 'application' for p in midi)
 assert sum(1 for p in sink_ports if p['info']['props'].get('port.monitor') in (True, 'true')) == 2
 assert any(o['type'] == 'PipeWire:Interface:Metadata' and o['metadata'][0]['key'] == 'default.audio.sink' for o in d)
 \""
@@ -134,6 +136,65 @@ l880, r1320, l1320, r880 = mag(left, 880), mag(right, 1320), mag(left, 1320), ma
 print('   pw-record: left 880 Hz %.0f, right 1320 Hz %.0f' % (l880, r1320))
 assert 7200 < l880 < 8800 and 3600 < r1320 < 4400 and l1320 < 300 and r880 < 300
 PY"
+# MIDI, video, client-allocated buffers, drivers and the adapter factory, through the real libpipewire: tests/linux/pwmedia.c built against the host's
+# libpipewire (each mode checks itself), pw-midiplay (its notes reach the server's synthesizer: counted at the end), pw-cli create-node adapter (a
+# lingering virtual sink) and pw-play / pw-record aimed at it
+if pkg-config --exists libpipewire-0.3 && command -v pw-midiplay >/dev/null; then
+  gcc -O1 -g -Wall -Wextra -o "$work/pwmedia" tests/linux/pwmedia.c $(pkg-config --cflags --libs libpipewire-0.3) -lm
+  for mode in video video-alloc video-yuv midi filter adapter; do
+    check "pwmedia $mode" "timeout 30 '$work/pwmedia' $mode 2> '$work/pwmedia-$mode.log' | tee -a '$work/pwmedia.out' | grep -q 'pwmedia: $mode ok'"
+  done
+  python3 - "$work/song.mid" <<'PY'
+import struct, sys
+ev = b"".join(b"\x00" + bytes([0x90, 60 + i, 100]) + b"\x60" + bytes([0x80, 60 + i, 0]) for i in range(12)) + b"\x00\xff\x2f\x00"
+open(sys.argv[1], "wb").write(b"MThd" + struct.pack(">IHHH", 6, 0, 1, 480) + b"MTrk" + struct.pack(">I", len(ev)) + ev)
+PY
+  check "pw-midiplay" "timeout 20 pw-midiplay '$work/song.mid' 2> '$work/pw-midiplay.log'"
+  check "pw-cli create-node adapter (a lingering null sink)" "timeout 5 pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=cli-null media.class=Audio/Sink object.linger=true audio.position=[FL FR] }' > /dev/null && timeout 5 pw-cli ls Node | grep -q 'node.name = \"cli-null\"'"
+  python3 - "$work/tone500.wav" <<'PY'
+import math, struct, sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+w.writeframes(b"".join(struct.pack("<hh", int(8000 * math.sin(2 * math.pi * 500 * i / 48000)), int(8000 * math.sin(2 * math.pi * 500 * i / 48000))) for i in range(48000 * 2)))
+PY
+  rm -f "$work/from-null.wav"
+  (timeout -s INT 3 pw-record --target cli-null "$work/from-null.wav" 2> "$work/pw-record-null.log" || true) & recorder=$!
+  sleep 0.3
+  check "pw-play into the null sink" "timeout 10 pw-play --target cli-null '$work/tone500.wav' 2> '$work/pw-play-null.log'"
+  wait $recorder || true
+  check "pw-record from the null sink heard pw-play" "python3 - '$work/from-null.wav' <<'PY'
+import math, struct, sys, wave
+w = wave.open(sys.argv[1]); n, ch, r = w.getnframes(), w.getnchannels(), w.getframerate()
+d = struct.unpack('<%dh' % (n * ch), w.readframes(n)); best = 0
+for start in range(0, max(0, n - 4800), 2400):
+    s1 = s2 = 0.0; c = 2 * math.cos(2 * math.pi * 500 / r)
+    for i in range(start, start + 4800):
+        s0 = d[i * ch] + c * s1 - s2; s2 = s1; s1 = s0
+    best = max(best, math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
+print('   pw-record from cli-null: 500 Hz %.0f' % best)
+assert 7000 < best < 9000
+PY"
+  # the same sink through PulseAudio: listed with its monitor, played into with paplay --device, recorded with parecord from its monitor, its volume set
+  check "pactl list sinks shows the null sink" "pactl list short sinks | grep -q 'cli-null'"
+  check "pactl list sources shows its monitor" "pactl list short sources | grep -q 'cli-null.monitor'"
+  check "pactl set-sink-volume on the null sink" "pactl set-sink-volume cli-null 50% && pactl get-sink-volume cli-null | grep -q '50%' && pactl set-sink-volume cli-null 100%"
+  rm -f "$work/pa-from-null.raw"
+  (timeout -s INT 3 parecord --raw --device=cli-null.monitor --format=s16le --rate=48000 --channels=2 "$work/pa-from-null.raw" 2> "$work/parecord-null.log" || true) & recorder=$!
+  sleep 0.3
+  check "paplay into the null sink" "timeout 10 paplay --device=cli-null '$work/tone500.wav' 2> '$work/paplay-null.log'"
+  wait $recorder || true
+  check "parecord from the null sink's monitor heard paplay" "python3 - '$work/pa-from-null.raw' <<'PY'
+import math, struct, sys
+b = open(sys.argv[1], 'rb').read(); n = len(b) // 4
+d = struct.unpack('<%dh' % (2 * n), b[:4 * n]); best = 0
+for start in range(0, max(0, n - 4800), 2400):
+    s1 = s2 = 0.0; c = 2 * math.cos(2 * math.pi * 500 / 48000)
+    for i in range(start, start + 4800):
+        s0 = d[i * 2] + c * s1 - s2; s2 = s1; s1 = s0
+    best = max(best, math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
+print('   parecord from cli-null.monitor: 500 Hz %.0f' % best)
+assert 7000 < best < 9000
+PY"
+fi
 pkill -TERM -f "$work/pwhost $sock" || true
 for _ in $(seq 50); do pgrep -f "$work/pwhost $sock" >/dev/null || break; sleep 0.1; done
 check "the mixed output holds both tones" "python3 - '$work/out.wav' <<'PY'
@@ -155,5 +216,9 @@ for at in range(0, len(left) - 9600, 4800):
 print('   pw-play 330 Hz %.0f' % best)
 assert 6500 < best < 7500
 PY"
+if [ -f "$work/pwmedia" ]; then
+  check "the synthesizer heard pw-midiplay's 12 notes and pwmedia's 16" "grep -q 'midi: [0-9]* messages to the synthesizer, 28 note-ons' '$work/server.log'"
+  check "the synthesizer got pwmedia's system exclusive message whole" "grep -q 'midi: [0-9]* messages to the synthesizer, [0-9]* note-ons, 1 system exclusive' '$work/server.log'"
+fi
 grep -q "ERROR: AddressSanitizer\|runtime error" "$work/server.log" && { echo "FAIL sanitizer report in the server"; fail=1; }
 exit $fail

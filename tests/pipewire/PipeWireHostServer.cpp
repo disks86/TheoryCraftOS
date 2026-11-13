@@ -32,6 +32,7 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <atomic>
@@ -267,7 +268,20 @@ int main(int argc, char** argv) {
   if (!capture.initialize()) return 1;
   Graph graph(A, &mixer, &capture);
   if (!graph.initialize()) return 1;
-  NativeServer native(graph, A);
+  NativeServer native(graph, A, [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); });
+  // what programs play on MIDI: counted, and the notes listed at the end
+  struct CountingSynth final : midi::IMidiSink {
+    std::mutex m;
+    std::vector<uint32_t> notes;
+    uint32_t sysex = 0;
+    void send(uint8_t status, uint8_t d1, uint8_t d2) override { std::lock_guard<std::mutex> g(m); notes.push_back(uint32_t(status) << 16 | uint32_t(d1) << 8 | d2); }
+    void send_sysex(ConstByteView message) override {
+      std::lock_guard<std::mutex> g(m);
+      if (message.size() == 22 && message[0] == 0xF0 && message[1] == 0x7D) ++sysex;      // (pwmedia's: 20 bytes between F0 and F7)
+    }
+    void reset() override {}
+  } synth;
+  graph.midi_bus().set_output(&synth);
   HostMaker maker;
   native.set_descriptor_maker(&maker);
   PulseServer pulse(graph, A);
@@ -305,8 +319,31 @@ int main(int argc, char** argv) {
         }
     for (Conn& c : conns) {
       for (;;) {
-        const ssize_t n = recv(c.fd, chunk, sizeof chunk, 0);
-        if (n > 0) { c.protocol->receive(c.client, ConstByteView(chunk, uint64_t(n))); continue; }
+        // (with the descriptors that came: a client's memfd is mapped here, anything else is just held)
+        iovec v{chunk, sizeof chunk};
+        alignas(cmsghdr) uint8_t control[CMSG_SPACE(sizeof(int) * 64)];
+        msghdr m{};
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        m.msg_control = control;
+        m.msg_controllen = sizeof control;
+        const ssize_t n = recvmsg(c.fd, &m, MSG_CMSG_CLOEXEC);
+        List<Fd> in(A);
+        if (n >= 0)
+          for (cmsghdr* h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+            if (h->cmsg_level != SOL_SOCKET || h->cmsg_type != SCM_RIGHTS) continue;
+            const size_t count = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            for (size_t k = 0; k < count; ++k) {
+              int fd = -1;
+              memcpy(&fd, CMSG_DATA(h) + k * sizeof(int), sizeof fd);
+              struct stat st{};
+              void* map = MAP_FAILED;
+              if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+                map = mmap(nullptr, size_t(st.st_size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+              in.push_back(Fd::make_as<HostFd>(A, fd, map == MAP_FAILED ? nullptr : static_cast<uint8_t*>(map), map == MAP_FAILED ? 0 : uint64_t(st.st_size)));
+            }
+          }
+        if (n > 0 || in.count()) { c.protocol->receive_with_fds(c.client, ConstByteView(chunk, n > 0 ? uint64_t(n) : 0), in); if (n > 0) continue; }
         if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) c.closing = true;
         break;
       }
@@ -344,6 +381,13 @@ int main(int argc, char** argv) {
   }
   g_stop = true;
   mix.join();
+  {
+    std::lock_guard<std::mutex> g(synth.m);
+    uint32_t on = 0;
+    for (uint32_t n : synth.notes) on += (n >> 16 & 0xF0) == 0x90;
+    fprintf(stderr, "pipewire-host: midi: %zu messages to the synthesizer, %u note-ons, %u system exclusive\n", synth.notes.size(), on, synth.sysex);
+  }
+  graph.midi_bus().set_output(nullptr);
   for (Conn& c : conns) { c.protocol->close_client(c.client); close(c.fd); }
   {
     std::lock_guard<std::mutex> g(device.m);
