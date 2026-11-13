@@ -798,6 +798,7 @@ add_executable(BOOTX64
   src/Wayland/Dxg/WaylandDxgImage.cpp
   src/Wayland/Media/WaylandClipboardPng.cpp
   src/Wayland/WaylandData.cpp
+  src/Wayland/WaylandDragBridge.cpp
   src/Wayland/WaylandDesktop.cpp
   src/Wayland/WaylandDmabuf.cpp
   src/Wayland/WaylandExtras.cpp

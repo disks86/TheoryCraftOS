@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/DxgDevice.h"
 #include "Process/LinuxFiles.hpp"
@@ -127,6 +128,8 @@ static void populate(filesystem::IFileSystem& fs) {
   make_file(fs, "/Linux/etc/motd", "welcome\n");
   make_file(fs, "/Windows/hello.txt", "windows file");
   make_file(fs, "/secret.txt", "outside both trees");
+  CHECK(fs.create_directory("/Desktop") == Status::Ok && fs.create_directory("/Desktop/Documents") == Status::Ok);
+  make_file(fs, "/Desktop/Documents/note.txt", "user's note");
 }
 
 // Writes a program's memory image: a mapped page with its argument strings.
@@ -185,6 +188,26 @@ static void test_linux_files() {
   CHECK(sres(p.syscall(lin(2, rig.str("/../../../Windows/hello.txt"), 0))) == -2);    // nor into the other world
   CHECK(sres(p.syscall(lin(2, rig.str("/Windows/hello.txt"), 0))) == -2);             // "/Windows" inside Linux is /Linux/Windows
   CHECK(sres(p.syscall(lin(2, rig.str("/nothing/here"), 0))) == -2);
+  // the user's files at /mnt/desktop (as the Windows tree is at /mnt/c); "/mnt/desktopx" is not that
+  fd = sres(p.syscall(lin(2, rig.str("/mnt/desktop/Documents/note.txt"), 0)));
+  CHECK(fd >= 3 && p.syscall(lin(0, fd, buf, 64)) == 11 && rig.bytes(buf, 11) == "user's note");
+  if (fd >= 3) p.syscall(lin(3, fd));
+  CHECK(sres(p.syscall(lin(2, rig.str("/mnt/desktopx/Documents/note.txt"), 0))) == -2);
+  CHECK(sres(p.syscall(lin(2, rig.str("/mnt/desktop/../../../secret.txt"), 0))) == -2);
+  {      // the two views' paths
+    String v(A);
+    CHECK(filesystem::layout::linux_view_of("/Desktop/Documents/a b.txt", &v) && v.view() == StringView("/mnt/desktop/Documents/a b.txt"));
+    CHECK(filesystem::layout::linux_view_of("/Windows/Users", &v) && v.view() == StringView("/mnt/c/Users"));
+    CHECK(filesystem::layout::linux_view_of("/Linux/root/x", &v) && v.view() == StringView("/root/x"));
+    CHECK(filesystem::layout::linux_view_of("/Linux", &v) && v.view() == StringView("/"));
+    CHECK(!filesystem::layout::linux_view_of("/AppStore/Browser", &v) && !filesystem::layout::linux_view_of("/Linuxish/x", &v));
+    CHECK(filesystem::layout::system_path_of_linux("/mnt/desktop/Pictures/p.png", &v) && v.view() == StringView("/Desktop/Pictures/p.png"));
+    CHECK(filesystem::layout::system_path_of_linux("/mnt/c/Temp", &v) && v.view() == StringView("/Windows/Temp"));
+    CHECK(filesystem::layout::system_path_of_linux("/root/x", &v) && v.view() == StringView("/Linux/root/x"));
+    CHECK(filesystem::layout::system_path_of_linux("/", &v) && v.view() == StringView("/Linux"));
+    CHECK(filesystem::layout::system_path_of_linux("/mnt/cx", &v) && v.view() == StringView("/Linux/mnt/cx"));
+    CHECK(!filesystem::layout::system_path_of_linux("relative", &v));
+  }
   CHECK(sres(p.syscall(lin(2, 0xDEAD0000, 0))) == -14);
   CHECK(sres(p.syscall(lin(2, rig.str(std::string(5000, 'x')), 0))) == -36);
 

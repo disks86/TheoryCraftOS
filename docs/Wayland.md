@@ -174,6 +174,19 @@ transform stretches an upright crop and leaves a turned picture undrawn. A surfa
   of the source's types, followed and left; version 3's actions are negotiated (the destination's preference, else copy, move, ask) and told to
   both; a release over a destination that accepted a type drops (`drop`, `dnd_drop_performed`), the destination receives as for a paste and
   `finish`es (`dnd_finished`); anything else cancels. A drag without a source stays within its client.
+- **Drag and drop with the desktop** (`src/Wayland/WaylandDragBridge.cpp`, over `IWindowsSession::desktop_drag` / `desktop_drop` /
+  `desktop_drag_end` and `take_program_drop` / `program_drop_done`):
+  - *The desktop's drag into a client* (a File Explorer file, text). The GUI tells the control under a drag as it moves (`Control::tracks_drag`,
+    `on_drag_over`, `on_drag_leave`); a program's frame (`desktop::Win32Window`) passes that to its session, so the client is entered, followed and
+    left as for another client's drag, with an offer the compositor serves itself: `text/uri-list` for a file a Linux program can see
+    (`file:///mnt/desktop/...`, `file:///mnt/c/...`, `file:///...`, percent-encoded) and `text/plain` (its Linux path, else the text), copy only.
+    Let go over a client that accepted, it gets `drop` and reads the data (the transport writes it). The desktop's drag never reaches a program as
+    its mouse (Win32Windows keeps its input tap out of the way meanwhile).
+  - *A client's drag onto the desktop.* Let go outside every Wayland surface, a drag whose source offers `text/uri-list` or text is handed over:
+    `dnd_drop_performed`, the data read from the source through a pipe, file URIs made system paths (`layout::system_path_of_linux`; other URIs
+    and comments are dropped), and each item dropped on the desktop's window where the button was let go (`gui::Window::drop_at`, as if a
+    desktop drag had been released there). The source hears `dnd_finished` when something took one, `cancelled` otherwise.
+  - Linux programs see the user's files at `/mnt/desktop` ([FileSystemLayout.md](FileSystemLayout.md)), so a dropped file opens.
 - **Linux pipes.** Linux programs here had no `pipe()`; `pipe` and `pipe2` are now AF_UNIX stream pairs shut one way each (`O_CLOEXEC`,
   `O_NONBLOCK`), so they pass with `SCM_RIGHTS` like any socket. `fstat` calls them sockets, not FIFOs.
 
@@ -269,6 +282,7 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing); `slurp`'s full-screen overlay (layer shell) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
+| Drags with the desktop: a desktop file entered, followed, accepted, dropped and read as a percent-encoded URI and as its Linux path, text, a path Linux cannot see, refusals, Escape, a client's drag let go over the desktop read from its source (URIs to system paths, comments and other schemes left out), taken, not taken, nothing usable, the source going, fuzzed URI lists; the GUI's drag tracking and `drop_at`, a desktop drag over a program's frame through the desktop (never the program's mouse), a program's drop of two files on a desktop window, `/mnt/desktop` for Linux programs and the two views' paths | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest`, `ProcessFilesTest`; `tests/wayland_interop.sh` drops a desktop file on foot, which pastes `'/mnt/desktop/Documents/a b.txt'` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
 | Text input: enter and leave with the keyboard, enable / disable, the cursor rectangle on the screen, content type, preedit (shown and hidden), commit, the serial of `done`, a second client taking the focus, a text input made while its client has the keyboard, a destroyed focused surface, invalid surrounding text, about 1600 fuzzed sessions; the desktop's Unicode entry (é, an emoji with a digit taken back, Escape, another key, a surrogate, nothing typed, the window ceasing to take text, Ctrl+Shift+U passed on when nothing takes text) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
@@ -331,8 +345,10 @@ depends on itself:
   one gets every finger that lands on its surfaces). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
   desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
 - **Clipboard and drag and drop.** Text and PNG pictures reach the desktop's clipboard; other types (HTML, URIs, other image formats such as
-  `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
-  and Windows or X programs are not bridged. Selection and drag serials are not checked.
+  `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn. Drags with the desktop: the desktop's drag carries
+  one item and only copies; a drop on the desktop shows no feedback while the client's drag is over it (the desktop's windows are not asked until
+  it is let go), takes URIs and text only (no pictures or other types), and a drop is not offered to Windows or X programs (their sessions take no
+  drags yet). Selection and drag serials are not checked.
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.

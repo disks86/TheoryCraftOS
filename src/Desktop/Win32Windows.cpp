@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Win32Windows.hpp"
+#include "Gui/Window.hpp"
 #include "Gui/Painter.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -57,6 +58,23 @@ Win32Window::Win32Window(allocators::IAllocator& allocator, IWindowsSession& ses
 bool Win32Window::close_requested() {
   session_.window_command(window_, IWindowsSession::Command::Close);
   return false;
+}
+
+void Win32Window::on_drag_over(StringView text, int32_t x, int32_t y, const gui::Control*) {
+  const gui::Rect2D b = bounds();      // (the window manager's coordinates are the programs' screen)
+  drag_taken_ = session_.desktop_drag(window_, b.x + x, b.y + y, text);
+}
+
+void Win32Window::on_drag_leave() {
+  drag_taken_ = false;
+  session_.desktop_drag_end();
+}
+
+bool Win32Window::accepts_drop(StringView, int32_t, int32_t, const gui::Control*) const { return drag_taken_; }
+
+void Win32Window::on_drop(StringView, int32_t, int32_t, const gui::Control*) {
+  drag_taken_ = false;
+  if (!session_.desktop_drop()) session_.desktop_drag_end();
 }
 
 bool Win32Window::picture_area(gui::Rect2D* area) const {
@@ -252,6 +270,7 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     }
   }
   if (hosts_.count() > 0) follow_pointer(manager);
+  pump_program_drop(manager);
   if (changed_.count() > 0) {
     session_->windows(&order_);
     gui::UiGuard lock(&manager);
@@ -260,6 +279,36 @@ void Win32Windows::pump(gui::WindowManager& manager) {
   gui::UiGuard lock(&manager);
   for (const IWindowsSession::Repaint& r : repainted_.view())
     if (Win32Window* h = host(r.window)) h->view_.invalidate();
+}
+
+// A program's drag let go over the desktop: its items are dropped where it was let go, one per pump (a drop waits for its control's handler thread before
+// the next can go); the session hears whether any was taken once all have gone.
+void Win32Windows::pump_program_drop(gui::WindowManager& manager) {
+  if (!dropping_) {
+    if (!session_->take_program_drop(&drop_items_, &drop_x_, &drop_y_)) return;
+    dropping_ = true;
+    drop_next_ = 0;
+    drop_taken_ = false;
+  }
+  gui::Window* window = nullptr;
+  gui::Point origin;
+  {
+    gui::UiGuard lock(&manager);
+    window = manager.window();
+    origin = manager.window_origin();
+  }
+  const StringView all = drop_items_.view();
+  while (window && drop_next_ < all.size()) {
+    if (window->drop_pending()) return;      // (the next pump goes on)
+    uint64_t end = drop_next_;
+    while (end < all.size() && all[end] != '\n') ++end;
+    const StringView item = all.substr(drop_next_, end - drop_next_);
+    drop_next_ = end + 1;
+    if (!item.empty() && window->drop_at(origin.x + drop_x_, origin.y + drop_y_, item)) drop_taken_ = true;
+  }
+  dropping_ = false;
+  drop_items_.clear();
+  session_->program_drop_done(drop_taken_);
 }
 
 // The programs' order among their frames: their top window goes directly above the frame of theirs that is highest on the desktop (where the user or the program
@@ -608,6 +657,8 @@ void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int3
     gui::UiGuard lock(manager_);
     pointer_x_ = *x;
     pointer_y_ = *y;
+    // the desktop's own drag (a file from the File Explorer) is the desktop's: the programs hear of it through desktop_drag, never as their mouse
+    if (const gui::Window* w = manager_->window(); w && w->dragging() && !grabbed_) return;
     if (drag_) {      // the frame follows the pointer; the program hears of it as the frame moves, not as mouse input
       dragging = true;
       drag_to(*x, *y);

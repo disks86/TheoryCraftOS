@@ -3732,6 +3732,205 @@ static void test_clipboard_images() {
   free_made();
 }
 
+// The transport's side of a program drop: the pipe it makes for `job` (handed to the server), and the data the source wrote, read back.
+static uint32_t take_pipe_job(Server& server) {
+  List<wayland::TransportRequest> reqs(A);
+  server.take_requests(&reqs);
+  for (wayland::TransportRequest& r : reqs.view()) if (r.kind == wayland::TransportRequest::Kind::MakePipe) return r.job;
+  return 0;
+}
+static std::string take_write(Server& server) {
+  List<wayland::TransportRequest> reqs(A);
+  server.take_requests(&reqs);
+  for (wayland::TransportRequest& r : reqs.view())
+    if (r.kind == wayland::TransportRequest::Kind::Write && r.data) return std::string(reinterpret_cast<const char*>(r.data->view().data()), r.data->size());
+  return "<none>";
+}
+
+// Drags between Wayland clients and the desktop's windows (WaylandDragBridge.cpp).
+static void test_desktop_drag_bridge() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  DataApp app(server);
+  App::Window w = app.toplevel(false, "target");
+  const uint32_t win = shown_window(server, app, w, 0xFF0000FFu);
+  server.move_window(win, {100, 100, 100, 80});
+  app.drop_events();
+  auto offer_types = [&](uint32_t offer) {
+    std::vector<std::string> t;
+    for (const Ev& e : app.events) if (e.object == offer && e.opcode == 0) t.push_back(e.s(0));
+    return t;
+  };
+  // the desktop's file over the window: entered with a URI list and text, copy only
+  CHECK(!server.desktop_drag(win, 150, 130, "/Desktop/Documents/a b.txt"));
+  Ev enter = app.take(app.device, 1);
+  CHECK(enter.object == app.device && enter.u(1) == w.surface && enter.i(2) == 50 * 256 && enter.i(3) == 30 * 256);
+  const uint32_t offer = enter.u(4);
+  std::vector<std::string> types = offer_types(offer);
+  CHECK((types == std::vector<std::string>{"text/uri-list", "text/plain;charset=utf-8", "text/plain"}) && app.take(offer, 1).u(0) == 1);
+  // the client accepts the URI list: the desktop is told it would be taken; it moves
+  app.send(Msg(offer, 0).u(enter.u(0)).s("text/uri-list"));
+  app.send(Msg(offer, 4).u(1).u(1));
+  CHECK(app.take(offer, 2).u(0) == 1);
+  CHECK(server.desktop_drag(win, 152, 131, "/Desktop/Documents/a b.txt"));
+  Ev motion = app.take(app.device, 3);
+  CHECK(motion.object == app.device && motion.i(1) == 52 * 256);
+  // dropped: the client reads the URI (percent-encoded, as Linux sees it) and the text form (the Linux path), then finishes
+  CHECK(server.desktop_drop() && app.has(app.device, 4));
+  std::vector<uint8_t> pipe;
+  app.send(Msg(offer, 1).s("text/uri-list"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "file:///mnt/desktop/Documents/a%20b.txt\r\n");
+  app.send(Msg(offer, 1).s("text/plain"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "/mnt/desktop/Documents/a b.txt");
+  app.send(Msg(offer, 1).s("image/png"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "<none>");      // (not offered)
+  app.send(Msg(offer, 3));
+  CHECK(!app.closing);
+  // text, and a file Linux cannot see: text only, the system path as it is
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "hello world");
+  enter = app.take(app.device, 1);
+  types = offer_types(enter.u(4));
+  CHECK((types == std::vector<std::string>{"text/plain;charset=utf-8", "text/plain"}));
+  server.desktop_drag(0, 0, 0, StringView());      // (left the session's windows)
+  CHECK(app.has(app.device, 2));
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "/AppStore/Browser/cache.db");
+  enter = app.take(app.device, 1);
+  types = offer_types(enter.u(4));
+  CHECK(types.size() == 2);
+  app.send(Msg(enter.u(4), 0).u(enter.u(0)).s("text/plain"));
+  CHECK(server.desktop_drag(win, 151, 130, "/AppStore/Browser/cache.db") && server.desktop_drop());
+  app.send(Msg(enter.u(4), 1).s("text/plain"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "/AppStore/Browser/cache.db");
+  app.send(Msg(enter.u(4), 3));
+  // over the window without accepting: the drop is refused, the client left
+  app.drop_events();
+  CHECK(!server.desktop_drag(win, 150, 130, "/Linux/root/x") && !server.desktop_drop() && app.has(app.device, 2));
+  // a drag ended by the desktop (Escape): left
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "/Linux/root/x");
+  server.desktop_drag_end();
+  CHECK(app.has(app.device, 2) && !server.desktop_drop());
+  // a client drags its file onto the desktop: read from its source (URIs become system paths, one per line), dropped where it was let go
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src = app.source({"text/plain", "text/uri-list"}, 1);
+  app.send(Msg(app.device, 0).u(src).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  CHECK(app.has(src, 3));      // dnd_drop_performed
+  String items(A);
+  int32_t dx = 0, dy = 0;
+  CHECK(!server.take_program_drop(&items, &dx, &dy));      // (not read yet)
+  uint32_t job = take_pipe_job(server);
+  CHECK(job != 0);
+  std::vector<uint8_t> write_end;
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  Ev send_ev = app.take(src, 1);
+  CHECK(send_ev.object == src && send_ev.s(0) == "text/uri-list");
+  const std::string uris = "file:///mnt/desktop/Documents/a%20b.txt\r\n# a comment\r\nfile:///root/x.txt\r\nhttp://example.com/\r\nfile:///bad%2\r\nfile://localhost/mnt/c/Temp/t.txt\r\n";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(uris.data()), uris.size()));
+  CHECK(server.take_program_drop(&items, &dx, &dy) && dx == 700 && dy == 500);
+  CHECK(items.view() == StringView("/Desktop/Documents/a b.txt\n/Linux/root/x.txt\n/Windows/Temp/t.txt"));
+  CHECK(!server.take_program_drop(&items, &dx, &dy));      // (given once)
+  server.program_drop_done(true);
+  CHECK(app.has(src, 4) && !app.has(src, 2));      // dnd_finished
+  // nothing took it: cancelled
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src2 = app.source({"text/plain;charset=utf-8"}, 1);
+  app.send(Msg(app.device, 0).u(src2).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  CHECK(app.take(src2, 1).s(0) == "text/plain;charset=utf-8");
+  const std::string text = "two\nlines";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+  CHECK(server.take_program_drop(&items, &dx, &dy) && items.view() == StringView("two lines"));      // (text is one item)
+  server.program_drop_done(false);
+  CHECK(app.has(src2, 2));
+  // URIs that are no files: cancelled at once; a source with nothing for the desktop: cancelled at the release; the source going meanwhile
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src3 = app.source({"text/uri-list"}, 1);
+  app.send(Msg(app.device, 0).u(src3).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  const std::string web = "https://example.com/\r\n";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(web.data()), web.size()));
+  CHECK(app.has(src3, 2) && !server.take_program_drop(&items, &dx, &dy));
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src4 = app.source({"image/png"}, 1);
+  app.send(Msg(app.device, 0).u(src4).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  CHECK(app.has(src4, 2) && take_pipe_job(server) == 0);
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src5 = app.source({"text/plain"}, 1);
+  app.send(Msg(app.device, 0).u(src5).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  app.send(Msg(src5, 1));      // destroy
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+  CHECK(!server.take_program_drop(&items, &dx, &dy) && !app.closing);
+  // while a client's drag runs, the desktop's drag is not let in
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src6 = app.source({"text/plain"}, 1);
+  app.send(Msg(app.device, 0).u(src6).u(w.surface).u(0).u(0));
+  CHECK(!server.desktop_drag(win, 150, 130, "/Linux/x"));
+  server.mouse_button(1, false);
+  server.program_drop_done(false);
+  take_pipe_job(server);
+  CHECK(!app.closing);
+  // fuzzed URI lists: never a crash, every item a path of the system
+  std::mt19937 rng(8);
+  for (int round = 0; round < 400; ++round) {
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t s = app.source({"text/uri-list"}, 1);
+    app.send(Msg(app.device, 0).u(s).u(w.surface).u(0).u(0));
+    server.mouse_position(700, 500);
+    server.mouse_button(1, false);
+    job = take_pipe_job(server);
+    if (job == 0) { CHECK(false); break; }
+    server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+    std::string data = uris;
+    const int flips = 1 + int(rng() % 6);
+    for (int f = 0; f < flips; ++f) data[rng() % data.size()] ^= char(1u << (rng() % 8));
+    if (rng() % 3 == 0) data.resize(rng() % data.size());
+    server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    if (server.take_program_drop(&items, &dx, &dy)) {
+      bool rooted = true;
+      for (uint64_t at = 0; at < items.size();) {
+        uint64_t end = at;
+        while (end < items.size() && items.view()[end] != '\n') ++end;
+        const StringView item = items.view().substr(at, end - at);
+        if (item.empty() || item[0] != '/') rooted = false;
+        at = end + 1;
+      }
+      CHECK(rooted);
+      server.program_drop_done(round % 2 == 0);
+    }
+    app.drop_events();
+  }
+  CHECK(!app.closing);
+}
+
 static void test_drag_and_drop() {
   Server server(A);
   server.set_fd_maker(&make_test_fd, nullptr);
@@ -3781,7 +3980,24 @@ static void test_drag_and_drop() {
     a.send(Msg(a.device, 0).u(src2).u(wa.surface).u(0).u(0));
     server.mouse_position(600, 400);
     server.mouse_button(1, false);
-    CHECK(a.has(src2, 2));
+    CHECK(a.has(src2, 3));      // (let go over the desktop: handed to it, test_desktop_drag_bridge)
+    server.program_drop_done(false);
+    {
+      List<wayland::TransportRequest> reqs(A);
+      server.take_requests(&reqs);
+      for (wayland::TransportRequest& r : reqs.view()) {
+        if (r.kind != wayland::TransportRequest::Kind::MakePipe) continue;
+        std::vector<uint8_t> end;
+        server.pipe_ready(r.job, Fd::make_as<TestMemory>(A, &end));
+        const std::string t = "x";
+        server.pipe_read_done(r.job, ConstByteView(reinterpret_cast<const uint8_t*>(t.data()), t.size()));
+      }
+      String items(A);
+      int32_t dx = 0, dy = 0;
+      CHECK(server.take_program_drop(&items, &dx, &dy));
+      server.program_drop_done(false);
+    }
+    CHECK(a.has(src2, 2));      // nothing on the desktop took it: cancelled
     // a drag without a button held is cancelled at once
     const uint32_t src3 = a.source({"text/plain"});
     a.send(Msg(a.device, 0).u(src3).u(wa.surface).u(0).u(0));
@@ -4209,6 +4425,7 @@ int main() {
   test_mapping();
   test_extras();
   test_drag_and_drop();
+  test_desktop_drag_bridge();
   test_dxg_fences();
   test_dxg_threads();
   test_threads();

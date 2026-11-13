@@ -49,6 +49,19 @@ if command -v foot >/dev/null; then
   cat "$out/wayland-foot.log"
   grep -q 'mapped .* "' "$out/wayland-foot.log" || { echo "foot showed no window"; cat "$out/foot.client.log"; status=1; }
   grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-foot.log" && status=1
+  # the desktop drags a file of the user's onto foot (the harness's TCOS_DESKTOP_DRAG): foot takes the URI list and pastes the file's Linux path
+  echo "== desktop file dropped on foot"
+  TCOS_DESKTOP_DRAG="/Desktop/Documents/a b.txt" run_server wayland-footdrop 8 ""
+  : > "$out/footdrop.txt"
+  # (timeout --foreground: a background process group could not read the terminal)
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-footdrop timeout 7 foot -o main.font=monospace:size=11 \
+    sh -c "stty raw -echo; timeout --foreground 5 dd bs=1 count=64 of='$out/footdrop.txt' 2>/dev/null" < /dev/null > "$out/footdrop.client.log" 2>&1 || true
+  wait $server || true
+  grep -E "desktop drop|wrote" "$out/wayland-footdrop.log" || true
+  echo "foot pasted: $(cat "$out/footdrop.txt")"
+  [ "$(cat "$out/footdrop.txt")" = "'/mnt/desktop/Documents/a b.txt'" ] || { cat "$out/wayland-footdrop.log"; status=1; }
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-footdrop.log" && status=1
+  grep -q "ime::enter() event before" "$out/footdrop.client.log" && { echo "text input entered before the keyboard"; status=1; }
 fi
 if command -v wl-copy >/dev/null && command -v wl-paste >/dev/null; then
   echo "== wl-clipboard (copy and paste: the desktop's clipboard to a client, a client to another and to the desktop's clipboard)"

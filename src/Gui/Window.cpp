@@ -293,6 +293,7 @@ void Window::mouse_move(int32_t x, int32_t y) {
     a.x = x - origin.x;
     a.y = y - origin.y;
     captured_->on_mouse_move(a);
+    if (drag_source_) track_drag(x, y);
     mark_dirty();
     return;
   }
@@ -363,9 +364,54 @@ bool Window::begin_drag(Control* source, StringView text, StringView label) {
   return true;
 }
 
+void Window::track_drag(int32_t x, int32_t y) {
+  Point origin;
+  Control* over = nullptr;
+  for (Control* c = target_at(x, y, &origin); c; c = c->parent_)
+    if (c->tracks_drag() && c->effectively_enabled()) {
+      over = c;
+      break;
+    }
+  if (over != drag_over_) leave_drag(nullptr);
+  drag_over_ = over;
+  if (!over) return;
+  const Point o = over->window_origin();
+  over->on_drag_over(drag_text_.view(), x - o.x, y - o.y, drag_source_);
+}
+
+void Window::leave_drag(const Control* keep) {
+  Control* was = drag_over_;
+  drag_over_ = nullptr;
+  if (was && was != keep) was->on_drag_leave();
+}
+
+Control* Window::offer_drop(int32_t x, int32_t y, StringView text, const Control* source) {
+  Point origin;
+  for (Control* c = target_at(x, y, &origin); c; c = c->parent_) {
+    if (!c->effectively_enabled()) break;   // behind a modal window, say
+    const Point o = c->window_origin();
+    if (!c->accepts_drop(text, x - o.x, y - o.y, source)) continue;
+    if (!drop_text_.assign(text)) return nullptr;
+    drop_target_ = c;
+    drop_source_ = source;
+    drop_point_ = {x - o.x, y - o.y};
+    dispatch({&Window::run_drop, this}, *c);      // (at once without a handler thread: drop_target_ is cleared by then)
+    return c;
+  }
+  return nullptr;
+}
+
+bool Window::drop_at(int32_t x, int32_t y, StringView text) {
+  UiGuard lock(this);
+  if (text.empty() || drop_target_) return false;      // (one drop waits for the handler thread at a time)
+  mark_dirty();
+  return offer_drop(x, y, text, nullptr) != nullptr;
+}
+
 void Window::cancel_drag() {
   UiGuard lock(this);
   if (!drag_source_) return;
+  leave_drag(nullptr);
   Control* source = drag_source_;
   drag_source_ = nullptr;
   drag_text_.clear();
@@ -374,22 +420,12 @@ void Window::cancel_drag() {
 }
 
 void Window::finish_drag(int32_t x, int32_t y) {
+  track_drag(x, y);      // (where it is let go, for a control following it)
   Control* source = drag_source_;
   drag_source_ = nullptr;
-  Point origin;
-  bool dropped = false;
-  for (Control* c = target_at(x, y, &origin); c; c = c->parent_) {
-    if (!c->effectively_enabled()) break;   // behind a modal window, say
-    const Point o = c->window_origin();
-    if (!c->accepts_drop(drag_text_.view(), x - o.x, y - o.y, source)) continue;
-    if (!drop_text_.assign(drag_text_.view())) break;
-    drop_target_ = c;
-    drop_source_ = source;
-    drop_point_ = {x - o.x, y - o.y};
-    dispatch({&Window::run_drop, this}, *c);
-    dropped = true;
-    break;
-  }
+  const Control* taker = offer_drop(x, y, drag_text_.view(), source);
+  const bool dropped = taker != nullptr;
+  leave_drag(taker);      // (a control that took the drop ends it itself, in on_drop)
   drag_text_.clear();
   if (source) source->on_drag_ended(dropped, x, y);
 }
@@ -542,6 +578,7 @@ void Window::control_removed(Control* control) {
     drag_text_.clear();
   }
   if (drop_target_ && is_inside(control, drop_target_)) drop_target_ = nullptr;
+  if (drag_over_ && is_inside(control, drag_over_)) drag_over_ = nullptr;
   if (popup_owner_ && is_inside(control, popup_owner_)) close_popup();
 }
 
@@ -761,6 +798,7 @@ void Window::control_destroyed(Control* control) {
     drag_text_.clear();
   }
   if (drop_target_ == control || drop_source_ == control) drop_target_ = nullptr;
+  if (drag_over_ == control) drag_over_ = nullptr;
   if (popup_owner_ == control) popup_owner_ = nullptr;
   if (popup_ == control) popup_ = nullptr;
 }

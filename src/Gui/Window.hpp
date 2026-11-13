@@ -155,6 +155,10 @@ class Window final : public Control {
   bool dragging() const { return drag_source_ != nullptr; }
   StringView drag_text() const { return drag_text_.view(); }
   void cancel_drag();   // (the source is told, see Control::on_drag_ended)
+  // Drops `text` at (x, y) as if a drag of it had been released there, with no source (an item a program dragged out of its window): the controls under
+  // the point are asked accepts_drop() and the first that says yes gets on_drop(). False when none took it.
+  bool drop_at(int32_t x, int32_t y, StringView text);
+  bool drop_pending() const { return drop_target_ != nullptr; }      // a drop waits for the handler thread (drop_at would refuse another)
 
   // --- Focus. Tab / Shift+Tab move it through focusable controls in tree order.
   Control* focus() const { return focus_; }
@@ -223,6 +227,10 @@ class Window final : public Control {
   Control* drag_source_ = nullptr;
   String drag_text_, drag_label_;
   Control* drop_target_ = nullptr;   // the drop waiting for the handler thread
+  Control* drag_over_ = nullptr;     // the control following the drag (Control::tracks_drag)
+  void track_drag(int32_t x, int32_t y);
+  void leave_drag(const Control* keep);      // drag_over_ is told the drag left (unless it is `keep`)
+  Control* offer_drop(int32_t x, int32_t y, StringView text, const Control* source);      // the control that took it (null: none)
   const Control* drop_source_ = nullptr;
   String drop_text_;
   Point drop_point_;

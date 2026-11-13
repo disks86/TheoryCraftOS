@@ -158,7 +158,24 @@ class IWindowsSession {
   virtual bool text_commit(StringView text) {
     (void)text;
     return false;
-  }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
+  }
+  // Drag and drop with the desktop. The desktop's own drag (`text`: what it carries - a file's system path, such as the File Explorer drags, or text) over
+  // the session's window `window` at (x, y): desktop_drag says where it is now and answers whether the program there would take it if it were let go;
+  // window 0 means it left the session's windows. desktop_drop lets it go where it last was (true: the program takes it); desktop_drag_end ends it
+  // without a drop. By default no program takes anything.
+  virtual bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) {
+    (void)window, (void)x, (void)y, (void)text;
+    return false;
+  }
+  virtual bool desktop_drop() { return false; }
+  virtual void desktop_drag_end() {}
+  // A program's drag let go outside the session's windows, for the desktop to drop where it was let go (x, y; the screen's coordinates): what it
+  // carries, one item per line (files as system paths). The desktop says whether something took it with program_drop_done. False: none waits.
+  virtual bool take_program_drop(String* text, int32_t* x, int32_t* y) {
+    (void)text, (void)x, (void)y;
+    return false;
+  }
+  virtual void program_drop_done(bool taken) { (void)taken; }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
   virtual uint32_t capture_window() = 0;                                      // the window that captured the mouse (SetCapture), 0: none
