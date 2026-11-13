@@ -229,6 +229,17 @@ uint32_t SystemVideoCodecs::decode_codecs() const {
   return mask;
 }
 
+bool SystemVideoCodecs::accelerated_decode(VideoCodec codec, uint32_t width, uint32_t height) const {
+  for (const UniquePointer<IVideoCodecDevice>& d : devices_) {
+    const VideoCodecInfo& info = d->info();
+    if (!(info.decode_codecs & codec_mask(codec))) continue;
+    if (!info.accelerated && !(info.accelerated_decode_codecs & codec_mask(codec))) continue;
+    if ((info.max_width && width > info.max_width) || (info.max_height && height > info.max_height)) continue;
+    return true;
+  }
+  return false;
+}
+
 uint32_t SystemVideoCodecs::encode_codecs() const {
   uint32_t mask = 0;
   for (const UniquePointer<IVideoCodecDevice>& d : devices_) mask |= d->info().encode_codecs;

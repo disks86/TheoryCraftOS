@@ -6374,6 +6374,64 @@ static void test_window_switcher_menu() {
 }
 
 
+// The window menu of a frame: a right click on its title bar, Alt+Space; it does what the title bar's buttons do.
+static void test_frame_window_menu() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.open_paint();
+    d.open_explorer();
+    d.window().layout();
+    Window& w = d.window();
+    Frame* f = d.paint().host();
+    CHECK(f && f->manager());
+    if (!f) return;
+    auto title_point = [&]() {
+      const Point o = f->window_origin();
+      return Point{o.x + Frame::kBorder + 30, o.y + Frame::kBorder + 6};
+    };
+    Point p = title_point();
+    CHECK(f->part_at(p.x - f->window_origin().x, p.y - f->window_origin().y) == Frame::Part::TitleBar);
+    CHECK(f->window_menu() == nullptr);      // (made when first opened)
+    right_click(w, p.x, p.y);
+    CHECK(f->window_menu() && f->window_menu()->open());
+    if (!f->window_menu()) return;
+    ContextMenu& menu = *f->window_menu();
+    CHECK(!menu.find_item("Restore")->enabled() && menu.find_item("Minimize")->enabled() && menu.find_item("Maximize")->enabled() && menu.find_item("Close")->enabled());
+    CHECK(w.popup() && w.popup()->bounds().x == p.x && w.popup()->bounds().y == p.y);      // (where it was clicked)
+    w.close_popup();
+    CHECK(choose_context(w, menu, p.x, p.y, "Maximize") && f->state() == Frame::State::Maximized);
+    p = title_point();
+    right_click(w, p.x, p.y);
+    CHECK(menu.find_item("Restore")->enabled() && !menu.find_item("Maximize")->enabled());
+    w.close_popup();
+    CHECK(choose_context(w, menu, p.x, p.y, "Restore") && f->state() == Frame::State::Normal && d.windows().active() == f);
+    p = title_point();
+    CHECK(choose_context(w, menu, p.x, p.y, "Minimize") && f->state() == Frame::State::Minimized);
+    f->restore();
+    f->activate();
+    w.layout();
+    // the client area and a title bar button are not the title bar: no window menu there
+    p = title_point();
+    const Rect2D client = f->client_rect();
+    right_click(w, f->window_origin().x + client.x + 40, f->window_origin().y + client.y + static_cast<int32_t>(client.height) - 10);
+    CHECK(!menu.open());
+    w.close_popup();
+    // Alt+Space: the active window's, its first item highlighted
+    w.set_focus(f);
+    press(w, key::kSpace, hardware::modifier::kLeftAlt);
+    CHECK(menu.open());
+    press(w, key::kEscape);
+    CHECK(!menu.open());
+    // Close from the menu closes the window
+    p = title_point();
+    CHECK(choose_context(w, menu, p.x, p.y, "Close") && f->manager() == nullptr);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
 // --- Spreadsheet grid and application ------------------------------------------------------------------------
 
 struct FakeSheetView final : gui::ISheetView {
@@ -8730,6 +8788,7 @@ int main() {
   test_text_context_menus();
   test_application_context_menus();
   test_window_switcher_menu();
+  test_frame_window_menu();
   test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();

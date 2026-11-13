@@ -1525,6 +1525,13 @@ void PageObjects::video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&
   dirty_ = true;
 }
 
+void PageObjects::video_quality(uint32_t serial, uint64_t* presented, uint64_t* dropped) {
+  Lock lock(*this);
+  *presented = *dropped = 0;
+  VideoSlot* v = find_video(serial);
+  if (!v || !v->clip || !v->clip->frame_counts(presented, dropped)) *presented = *dropped = 0;
+}
+
 void PageObjects::video_state(uint32_t serial, VideoState* out) {
   Lock lock(*this);
   VideoSlot* v = find_video(serial);

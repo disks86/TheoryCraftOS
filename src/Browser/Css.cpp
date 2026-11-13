@@ -5183,6 +5183,8 @@ bool css_supports(StringView text) { return supports_condition(text); }
 void StyleSheet::clear() {
   ++generation_;
   pointer_state_ = false;
+  siblings_ = false;
+  has_ = false;
   scope_ = 0;
   pool_.clear();
   selectors_.clear();
@@ -5795,6 +5797,8 @@ bool StyleSheet::parse_rule_nested(StringView prelude, StringView body, uint32_t
 
 bool StyleSheet::parse_rule_flat(StringView prelude, StringView body) {
   if (prelude.contains(":hover") || prelude.contains(":active") || prelude.contains(":focus-within")) pointer_state_ = true;
+  if (prelude.contains("+") || prelude.contains("~")) siblings_ = true;   // (also an+b and [a~=b]: more often than needed is only slower)
+  if (prelude.contains(":has(")) has_ = true;
   const uint32_t rule = static_cast<uint32_t>(rules_.count());
   if (!add_declarations(body, rule)) return false;
   if (rules_[rule].declaration_count == 0) {
@@ -6400,14 +6404,6 @@ bool StyleSheet::keyframe_declaration(uint32_t rule, uint32_t index, uint32_t k,
   return false;
 }
 
-bool StyleSheet::uses_motion() const {
-  if (keyframes_.count() > 0) return true;
-  for (uint64_t i = 0; i < declarations_.count(); ++i) {
-    const uint16_t p = declarations_[i].property;
-    if (p == pTransition || p == pAnimation || (p >= pTransitionProperty && p <= pTransitionBehavior) || (p >= pAnimationName && p <= pAnimationPlayState)) return true;
-  }
-  return false;
-}
 
 void StyleSheet::apply_keyframe(uint32_t rule, uint32_t index, const Style& parent, Style* style) const {
   if (rule >= keyframes_.count() || index >= keyframes_[rule].stop_count) return;
@@ -6498,6 +6494,126 @@ uint32_t key_hash(uint8_t kind, StringView name) {
   return h;
 }
 }  // namespace
+
+namespace {
+bool motion_property(uint16_t p) { return p == pTransition || p == pAnimation || (p >= pTransitionProperty && p <= pTransitionBehavior) || (p >= pAnimationName && p <= pAnimationPlayState); }
+}  // namespace
+
+// Which rules declare a transition or an animation (asked after every change of the page: worked out once per generation of the rules).
+void StyleSheet::index_motion() const {
+  if (motion_generation_ == generation_ && motion_rules_.count() == rules_.count()) return;
+  motion_generation_ = generation_;
+  motion_rules_.clear();
+  motion_unkeyed_.clear();
+  motion_selectors_.clear();
+  motion_next_.clear();
+  motion_first_.clear();
+  bool any = keyframes_.count() > 0;
+  for (const Rule& r : rules_.view()) {
+    uint8_t motion = 0;
+    for (uint32_t k = 0; k < r.declaration_count && !motion; ++k) motion = motion_property(declarations_[r.first_declaration + k].property) ? 1 : 0;
+    any = any || motion;
+    if (!motion_rules_.push_back(motion)) break;
+  }
+  uses_motion_ = any ? 1 : 0;
+  for (uint32_t s = 0; s < selectors_.count(); ++s) {
+    const uint32_t rule = selectors_.tag(s);
+    if (rule >= motion_rules_.count() || !motion_rules_[rule] || selectors_.pseudo(s) != static_cast<uint8_t>(PseudoElement::None)) continue;
+    StringView name;
+    const uint8_t kind = selectors_.key(s, &name);
+    if (kind == 0) {
+      motion_unkeyed_.push_back(s);
+      continue;
+    }
+    const uint32_t hash = key_hash(kind, name);
+    const uint32_t* first = motion_first_.find(hash);
+    if (!motion_selectors_.push_back(s) || !motion_next_.push_back(first ? *first : ~0u)) break;
+    motion_first_.put(hash, static_cast<uint32_t>(motion_selectors_.count() - 1));
+  }
+}
+
+bool StyleSheet::uses_motion() const {
+  index_motion();
+  return uses_motion_ == 1;
+}
+
+bool StyleSheet::may_have_motion(const dom::Node* element) const {
+  index_motion();
+  if (uses_motion_ != 1) return false;
+  struct Visit {
+    const StyleSheet& sheet;
+    const dom::Node* element;
+    uint32_t element_scope, host_scope, slot_scope;
+    bool found;
+  } visit{*this, element, 0, 0, 0, false};
+  element_scopes(element, &visit.element_scope, &visit.host_scope, &visit.slot_scope);
+  if (indexed_generation_ != generation_ || indexed_count_ != selectors_.count()) build_index();
+  AncestorFilter ancestors;
+  const bool filtered = ancestor_keys_.count() == uint64_t{selectors_.count()} * kAncestorKeys;
+  if (filtered) ancestor_filter(element->parent, ancestors.bits);
+  auto matches = [&](uint32_t s) {
+    if (filtered)
+      for (uint32_t k = 0; k < kAncestorKeys; ++k) {
+        const uint32_t want = ancestor_keys_[uint64_t{s} * kAncestorKeys + k];
+        if (want == 0) break;
+        if (!ancestors.has(want)) return false;
+      }
+    return rule_applies(s, visit.element_scope, visit.host_scope, visit.slot_scope) && selectors_.matches(s, element, nullptr, true);
+  };
+  for (const uint32_t s : motion_unkeyed_.view())
+    if (matches(s)) return true;
+  auto keyed = [&](uint8_t kind, StringView name) {
+    const uint32_t* at = motion_first_.find(key_hash(kind, name));
+    for (uint32_t i = at ? *at : ~0u; i != ~0u; i = motion_next_[i])
+      if (matches(motion_selectors_[i])) return true;
+    return false;
+  };
+  StringView id;
+  if (dom::get_attribute(element, "id", &id) && !id.empty() && keyed(1, id)) return true;
+  StringView classes;
+  bool found = false;
+  if (dom::get_attribute(element, "class", &classes)) for_each_word(classes, [&](StringView word) { if (!found) found = keyed(2, word); });
+  return found || keyed(3, element->name.view());
+}
+
+// The Bloom filter of the ids, classes and tags of `node` and the elements above it. Kept for the nodes asked about while the document does not change (the
+// styles of a whole page ask about the same parents over and over, and hashing every ancestor's classes for every element was a tenth of YouTube's time).
+void StyleSheet::ancestor_filter(const dom::Node* node, uint32_t* bits) const {
+  for (uint32_t i = 0; i < kFilterWords; ++i) bits[i] = 0;
+  if (!node || !node->is_element()) return;
+  const uint64_t version = node->owner ? node->owner->version() : 0;
+  if (!filter_cache_) filter_cache_ = UniquePointer<FilterCache>::make(allocator_);
+  FilterSlot spare;   // (without a cache: every node goes through the one slot)
+  auto slot_of = [&](const dom::Node* n) -> FilterSlot& { return filter_cache_ ? filter_cache_->slots[(reinterpret_cast<uintptr_t>(n) >> 4) % kFilterSlots] : spare; };
+  // up to the nearest node whose filter is kept (or the top), then down, each adding its own keys to its parent's
+  const dom::Node* path[512];
+  uint32_t depth = 0;
+  const uint32_t* base = nullptr;
+  for (const dom::Node* a = node; a && a->is_element() && depth < 512; a = a->parent) {
+    const FilterSlot& slot = slot_of(a);
+    if (slot.node == a && slot.version == version) {
+      base = slot.bits;
+      break;
+    }
+    path[depth++] = a;
+  }
+  AncestorFilter f;
+  if (base)
+    for (uint32_t i = 0; i < kFilterWords; ++i) f.bits[i] = base[i];
+  for (uint32_t i = depth; i > 0; --i) {
+    const dom::Node* a = path[i - 1];
+    f.add(key_hash(3, a->name.view()) | 1);
+    StringView id;
+    if (dom::get_attribute(a, "id", &id) && !id.empty()) f.add(key_hash(1, id) | 1);
+    StringView names;
+    if (dom::get_attribute(a, "class", &names)) for_each_word(names, [&](StringView word) { f.add(key_hash(2, word) | 1); });
+    FilterSlot& slot = slot_of(a);
+    slot.node = a;
+    slot.version = version;
+    for (uint32_t w = 0; w < kFilterWords; ++w) slot.bits[w] = f.bits[w];
+  }
+  for (uint32_t i = 0; i < kFilterWords; ++i) bits[i] = f.bits[i];
+}
 
 void StyleSheet::build_index() const {
   const uint32_t n = selectors_.count();
@@ -6597,16 +6713,7 @@ void StyleSheet::for_candidates(const dom::Node* element, bool (*visit)(void*, u
   // they do not have is skipped.
   AncestorFilter ancestors;
   const bool filtered = ancestor_keys_.count() == uint64_t{selectors_.count()} * kAncestorKeys;
-  if (filtered) {
-    for (const dom::Node* a = element->parent; a && a->is_element(); a = a->parent) {
-      ancestors.add(key_hash(3, a->name.view()) | 1);
-      StringView id;
-      if (dom::get_attribute(a, "id", &id) && !id.empty()) ancestors.add(key_hash(1, id) | 1);
-      StringView names;
-      if (!dom::get_attribute(a, "class", &names)) continue;
-      for_each_word(names, [&](StringView word) { ancestors.add(key_hash(2, word) | 1); });
-    }
-  }
+  if (filtered) ancestor_filter(element->parent, ancestors.bits);
   auto may_match = [&](uint32_t s) {
     if (!filtered) return true;
     for (uint32_t k = 0; k < kAncestorKeys; ++k) {

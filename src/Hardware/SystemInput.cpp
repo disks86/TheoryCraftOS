@@ -29,6 +29,7 @@
 #include "Hardware/Mouse/VMware/VmwareMouse.hpp"
 #include "Hardware/VMware/Backdoor.hpp"
 #include "Hardware/Mouse/Virtio/VirtioMouse.hpp"
+#include "Hardware/Touch/Virtio/VirtioTouch.hpp"
 
 namespace hardware {
 
@@ -241,6 +242,18 @@ void SystemInput::find_virtio() {
       if (k->initialize()) { keyboards_.add(k); continue; }
       release_last();
     }
+    if (auto* t = make<VirtioTouch>(pci_, d, allocator_, st_)) {      // (a multitouch screen: a touch device, and a mouse until its touches are read)
+      VirtioTouch** slot = nullptr;
+      for (VirtioTouch*& v : virtio_touch_)
+        if (!v && !slot) slot = &v;
+      if (slot && t->initialize()) {
+        *slot = t;
+        touches_.add(t);
+        mice_.add(&t->pointer());
+        continue;
+      }
+      release_last();
+    }
     if (auto* m = make<VirtioMouse>(pci_, d, allocator_, st_)) {
       if (m->initialize()) mice_.add(m);
       else release_last();
@@ -286,6 +299,12 @@ void SystemInput::shutdown() {
   for (IInputDeviceSource*& s : sources_) {
     if (s) s->detach_all(sink);
     s = nullptr;
+  }
+  for (VirtioTouch*& t : virtio_touch_) {
+    if (!t) continue;
+    touches_.remove(t);
+    mice_.remove(&t->pointer());
+    t = nullptr;
   }
   for (uint64_t i = owned_.count(); i > 0; --i) owned_[i - 1]->shutdown();  // newest first
   owned_.clear();  // frees the devices

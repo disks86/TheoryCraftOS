@@ -313,6 +313,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   StringView referrer() override { return referrer_.view(); }
   void scroll_node_into_view(dom::Node* node) override;
   bool node_rect(dom::Node* node, double* rect8) override;
+  int node_clips(dom::Node* node) override;
   bool layout_ready() override { return geometry_ready_; }
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;
@@ -333,6 +334,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool computed_pseudo_style(const dom::Node* element, PseudoElement pseudo, Style* out) override;
   bool container_size(const dom::Node* element, StringView name, int32_t* width_px, int32_t* height_px) override;   // for @container rules
   const StyleSheet* computed_style_sheet() override { return &style_sheet(); }
+  bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) override { return env_.video_decode_accelerated(codec, width, height); }
   dom::Document* parse_document(StringView html) override;
   StorageArea& local_storage() override { return env_.local_storage_hub().area(storage_origin()); }
   StorageArea& session_storage() override { return env_.session_storage_hub().area(storage_origin()); }
@@ -374,7 +376,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool run_worker_script(StringView source, String* error);
   // Calls a global function of the built-in scripts (see DomBindings::call_hook); microtasks the call queued have run when it returns.
   bool call_global(StringView name, const DomBindings::HookArg* args, uint32_t count, String* result = nullptr);
-  // Runs the timers that are waiting without waiting for them to be due (at most `max`); true if any ran. has_timers(): is one waiting?
+  // Runs the timers that are waiting without waiting for them to be due (at most `max`; up to the last setTimeout, intervals alone are not run ahead); true if
+  // any could run. has_timers(): is one waiting?
   bool run_timers_ahead(uint32_t max);
   bool has_timers();
   // The bytes at `address` for the document (a script, style sheet, picture, frame: `destination` says which), asked of the service worker in charge of the page first.
@@ -512,12 +515,21 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool hidden_ = false;   // see set_visible()
   struct BoxRect {
     double x = 0, y = 0, width = 0, height = 0, content_width = 0, content_height = 0, padding_left = 0, padding_top = 0;
+    bool clips = false;   // overflow other than visible
   };
-  // The computed style of elements scripts asked for: getComputedStyle walks every ancestor, and each is a pass over all the rules. Good while the style sheet
-  // (so the document and the media) and the focus are as they were; keyed by node (the nodes of other documents have serials of their own).
-  Dictionary<const dom::Node*, Style> computed_cache_;
+  // The computed style of elements scripts asked for: getComputedStyle walks every ancestor, and each is a pass over all the rules. Kept while the style
+  // sheet's rules, the media and the focus are as they were, and until a change could have altered it: an entry is good while its epoch is the document's,
+  // the outermost node above it is the same (it was not taken out of the page), and no node on the way up was changed after it was worked out
+  // (dom::Node::style_stamp). Keyed by node (the nodes of other documents have serials of their own).
+  struct ComputedEntry {
+    Style style;
+    uint64_t stamp = 0, epoch = 0;
+    const dom::Node* top = nullptr;
+  };
+  Dictionary<const dom::Node*, ComputedEntry> computed_cache_;
+  void start_whole_styles();
   uint32_t computed_cache_focus_ = 0;
-  static constexpr uint64_t kMaxComputedStyles = 4096;
+  static constexpr uint64_t kMaxComputedStyles = 32768;   // (YouTube reads the style of more than 4096 elements over and over: a smaller cache is cleared all the time)
   Dictionary<uint32_t, BoxRect> geometry_;   // node serial -> its box on the page as the last picture laid it out
   bool geometry_ready_ = false;
   font::FontSet* layout_fonts_ = nullptr;   // (set_layout_fonts)

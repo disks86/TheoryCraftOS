@@ -79,6 +79,11 @@ class BrowserVideoClip final : public browser::IVideoClip {
     if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) return false;
     return player_.copy_picture(dest.data(), pitch, serial);
   }
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
+    *presented = player_.frames_presented();
+    *dropped = player_.frames_skipped();
+    return true;
+  }
 
  private:
   UniquePointer<ByteBuffer> data_;
@@ -1436,6 +1441,13 @@ UniquePointer<browser::IVideoClip> WebBrowser::Env::open_audio(UniquePointer<Byt
   auto clip = UniquePointer<BrowserAudioClip>::make(owner_.allocator(), owner_.allocator(), *owner_.mixer_, util::move(data));
   if (!clip || !clip->open()) return UniquePointer<browser::IVideoClip>();
   return clip;
+}
+
+bool WebBrowser::Env::video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) {
+  if (!owner_.codecs_) return false;
+  const hardware::VideoCodec which = codec.equals("h264") ? hardware::VideoCodec::H264 : codec.equals("hevc") ? hardware::VideoCodec::Hevc : codec.equals("vp8") ? hardware::VideoCodec::Vp8
+                                     : codec.equals("vp9") ? hardware::VideoCodec::Vp9 : codec.equals("av1") ? hardware::VideoCodec::Av1 : hardware::VideoCodec::Raw;
+  return which != hardware::VideoCodec::Raw && owner_.codecs_->accelerated_decode(which, width, height);
 }
 
 bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {

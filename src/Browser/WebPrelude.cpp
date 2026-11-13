@@ -1132,7 +1132,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
           if (!entry || typeof entry.contentType !== 'string') { reject(new TypeError("Failed to execute 'decodingInfo' on 'MediaCapabilities': The configuration dictionary has neither a video nor an audio member.")); return; }
           var ok = (config.type === 'media-source' || config.type === 'file') && __mse_supported(entry.contentType);
           if (ok && config.video && config.audio) ok = __mse_supported(config.audio.contentType);
-          var info = { supported: ok, smooth: ok, powerEfficient: false };
+          var how = ok && typeof g.__decode_info === 'function' ? __decode_info(entry.contentType, config.video ? +config.video.width || 0 : 0, config.video ? +config.video.height || 0 : 0, config.video ? +config.video.framerate || 30 : 30) : [ok, false];
+          var info = { supported: ok, smooth: ok && how[0], powerEfficient: ok && how[1] };
           var ks = config.keySystemConfiguration;
           if (ok && ks) {   // encrypted: only Clear Key, and the configuration has to be one it can do
             if (ks.keySystem !== CLEARKEY) { resolve({ supported: false, smooth: false, powerEfficient: false }); return; }
@@ -9973,15 +9974,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     };
     var marginText = function (m) { return m.map(function (x) { return x.v + (x.pct ? '%' : 'px'); }).join(' '); };
     var viewportBox = function () { return { l: g.scrollX, t: g.scrollY, r: g.scrollX + g.innerWidth, b: g.scrollY + g.innerHeight }; };
-    var clips = function (el, cache) {   // does the element cut off what sticks out of it (overflow other than visible)?
-      var c = cache.get(el);
-      if (c === undefined) {
-        var st = g.getComputedStyle(el);
-        c = st.overflowX !== 'visible' || st.overflowY !== 'visible';
-        cache.set(el, c);
-      }
-      return c;
-    };
+    var clips = function (el) { return __clips(el) === 1; };   // does the element's box cut off what sticks out of it (overflow other than visible)?
 
     function IntersectionObserverEntry(init) {
       if (!(this instanceof IntersectionObserverEntry)) throw new TypeError("Failed to construct 'IntersectionObserverEntry': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
@@ -10082,7 +10075,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
         for (var p = target.parentNode; p && hit; p = p.parentNode) {
           if (p === rootEl) { found = true; break; }
           if (p.nodeType !== 1 || p === document.documentElement || p === document.body && !rootEl) continue;
-          if (clips(p, cache)) { var pb = boxOf(p); hit = pb ? meet(hit, pb) : null; }
+          if (clips(p)) { var pb = boxOf(p); hit = pb ? meet(hit, pb) : null; }
         }
         if (!found) hit = null;
         if (hit) hit = meet(hit, root);
@@ -12056,7 +12049,13 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     M(g.HTMLMarqueeElement, 'stop', function () { });
     (function () {
       var ids = 0;
-      M(g.HTMLVideoElement, 'getVideoPlaybackQuality', function () { return { creationTime: g.performance.now(), totalVideoFrames: 0, droppedVideoFrames: 0, corruptedVideoFrames: 0, totalFrameDelay: 0 }; });
+      // (players watch the dropped frames to step down a quality the machine cannot decode in time)
+      M(g.HTMLVideoElement, 'getVideoPlaybackQuality', function () {
+        var q = typeof g.__video_quality === 'function' ? __video_quality(this) : [0, 0];
+        var o = Object.create(g.VideoPlaybackQuality ? g.VideoPlaybackQuality.prototype : Object.prototype);
+        o.creationTime = g.performance.now(); o.totalVideoFrames = q[0] + q[1]; o.droppedVideoFrames = q[1]; o.corruptedVideoFrames = 0; o.totalFrameDelay = 0;
+        return o;
+      });
       M(g.HTMLVideoElement, 'requestVideoFrameCallback', function (cb) {
         if (typeof cb !== 'function') throw new TypeError("Failed to execute 'requestVideoFrameCallback' on 'HTMLVideoElement': The provided callback is not a function.");
         return ++ids;
@@ -15067,7 +15066,8 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
   var listOf = function (text) { return splitTop(String(text || ''), ',').map(function (x) { return x.trim(); }).filter(function (x) { return x !== ''; }); };
   var millis = function (t) { var m = /^(-?[\d.]+(?:e-?\d+)?)(m?s)$/.exec(String(t).trim()); if (!m) return 0; return m[2] === 'ms' ? parseFloat(m[1]) : parseFloat(m[1]) * 1000; };
   var pick = function (list, i) { return list.length ? list[i % list.length] : ''; };
-  function motionState(el) { var st = states.get(el); if (!st) { st = { anims: {}, trans: {}, before: {} }; states.set(el, st); } return st; }
+  function motionState(el) { var st = states.get(el); if (!st) { st = { anims: {}, trans: {}, before: {} }; states.set(el, st); if (typeof g.__motion_track === 'function') __motion_track(el, true); } return st; }
+  var motionSince = [-1, -1, -1];   // (__motion_changed: the style clock, epoch and sheet generation the elements were last looked at)
   function queueCss(el, kind, type, name, elapsed) { cssQueue.push({ el: el, kind: kind, type: type, name: name, elapsed: elapsed }); schedule(); }
   function findKeyframes(name) {
     var found = null, sheets;
@@ -15194,8 +15194,11 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     Object.keys(st.before).forEach(function (p) { if (!params[p] && !st.trans[p]) delete st.before[p]; });
   }
   function updateMotion() {
-    var all = document.querySelectorAll('*'), seen = [];
-    for (var i = 0; i < all.length; i++) {
+    // only the elements whose style may have changed since the last look, and of those the ones with an animation or a transition or with state kept
+    var all = typeof g.__motion_changed === 'function' ? __motion_changed(motionSince[0], motionSince[1], motionSince[2]) : null, first = 3;
+    if (all) motionSince = [all[0], all[1], all[2]];
+    else { all = document.querySelectorAll('*'); first = 0; }
+    for (var i = first; i < all.length; i++) {
       var el = all[i], cs = origGCS.call(g, el), st = states.get(el);
       var hasAnim = cs.animationName !== 'none' && cs.animationName !== '', hasTrans = cs.transitionProperty !== 'none' && cs.transitionProperty !== '' && !(cs.transitionProperty === 'all' && /^0s(,\s*0s)*$/.test(cs.transitionDuration) && /^0s(,\s*0s)*$/.test(cs.transitionDelay));
       if (!st && !hasAnim && !hasTrans) continue;
@@ -15207,6 +15210,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
       if (el.isConnected) return;
       Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], true); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], true); });
       states.delete(el);
+      if (typeof g.__motion_track === 'function') __motion_track(el, false);
     });
   }
   function flushMotion() {
@@ -15215,7 +15219,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     if (v === lastStyleVersion) return;
     lastStyleVersion = v;
     if (!g.__motion_in_use()) {
-      if (states.size) { states.forEach(function (st) { Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], false); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], false); }); }); states.clear(); }
+      if (states.size) { states.forEach(function (st, el) { Object.keys(st.anims).forEach(function (n) { cancelCss(st.anims[n], false); }); Object.keys(st.trans).forEach(function (n) { cancelCss(st.trans[n], false); }); if (typeof g.__motion_track === 'function') __motion_track(el, false); }); states.clear(); }
       return;
     }
     updating = true;
@@ -15227,7 +15231,20 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     motionScheduled = true;
     g.requestAnimationFrame(function () { motionScheduled = false; flushMotion(); });
   };
-  var wrappedGCS = function (el, pseudo) { flushMotion(); return origGCS.apply(this, arguments); };
+  // getComputedStyle(el) brings el's transitions and animations up to date (a script that sets a value, reads the style and sets another expects a transition
+  // between them); the rest of the page's wait for the next frame (looking at every changed element on every read cost YouTube seconds).
+  function flushMotionOf(el) {
+    if (updating || !hasNative || !el || el.nodeType !== 1 || typeof g.__style_version !== 'function' || g.__style_version() === lastStyleVersion) return;
+    if (!g.__motion_in_use()) return;
+    var cs = origGCS.call(g, el), st = states.get(el);
+    var hasAnim = cs.animationName !== 'none' && cs.animationName !== '', hasTrans = cs.transitionProperty !== 'none' && cs.transitionProperty !== '' && !(cs.transitionProperty === 'all' && /^0s(,\s*0s)*$/.test(cs.transitionDuration) && /^0s(,\s*0s)*$/.test(cs.transitionDelay));
+    if (!st && !hasAnim && !hasTrans) return;
+    updating = true;
+    try { st = motionState(el); updateAnimations(el, st, cs); updateTransitions(el, st, cs); } finally { updating = false; }
+    if (live.length) { applyAll(); schedule(); }
+    g.__style_dirty();
+  }
+  var wrappedGCS = function (el, pseudo) { flushMotionOf(el); return origGCS.apply(this, arguments); };
   Object.defineProperty(wrappedGCS, 'name', { value: 'getComputedStyle' });
   def(g, 'getComputedStyle', wrappedGCS);
   var origElGet = EP.getAnimations, origDocGet = DP.getAnimations;

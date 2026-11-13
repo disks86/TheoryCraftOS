@@ -91,6 +91,9 @@ class IVideoClip {
   virtual uint8_t error() { return 0; }
   // Is it stopped for want of a key to decrypt what comes next (an encrypted stream, Encrypted Media Extensions)? "waitingforkey" is fired when it is.
   virtual bool waiting_for_key() { return false; }
+  // The pictures shown so far and the ones that were due but dropped because decoding fell behind (getVideoPlaybackQuality: players step down a quality
+  // when they see frames dropped); false if the clip does not count them.
+  virtual bool frame_counts(uint64_t* presented, uint64_t* dropped) { (void)presented; (void)dropped; return false; }
 
  protected:
   IVideoClip() = default;
@@ -106,6 +109,8 @@ class IObjectEnvironment {
   virtual UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
   // The same for a sound file: a clip whose width() and height() are 0 and that has no picture. Null if this machine cannot play it.
   virtual UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
+  // Does a video engine of this machine (not the CPU) decode `codec` ("h264", "hevc", "vp8", "vp9", "av1") at that size? (navigator.mediaCapabilities)
+  virtual bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) { (void)codec; (void)width; (void)height; return false; }
 
  protected:
   IObjectEnvironment() = default;
@@ -219,6 +224,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     uint8_t error_code = 0;      // MediaError.code, 0 for none
   };
   void video_state(uint32_t serial, VideoState* out);
+  // getVideoPlaybackQuality(): the pictures shown and the ones dropped so far (0 and 0 for a clip that does not count them).
+  void video_quality(uint32_t serial, uint64_t* presented, uint64_t* dropped);
   // False if there is nothing that could play (no source, or one that failed): play() then rejects with NotSupportedError.
   // (`audio` and `has_source` say what the element is and whether it names a file: they are known to the script before the page has been through sync().)
   bool video_play(uint32_t serial, bool audio, bool has_source);

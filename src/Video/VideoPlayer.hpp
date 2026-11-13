@@ -109,6 +109,8 @@ class VideoPlayer {
   const AviFile& file() const { return file_; }
   uint64_t frames_decoded() const { return decoded_; }
   uint64_t frames_skipped() const { return skipped_; }
+  // Pictures put on show (a decoded frame that was skipped because playing fell behind counts in frames_skipped() instead).
+  uint64_t frames_presented() const { return presented_; }
 
   void update();
   bool start_service();
@@ -195,7 +197,7 @@ class VideoPlayer {
   int64_t base_position_us_ = 0;
   uint64_t base_time_us_ = 0;
   int64_t paused_position_us_ = 0;
-  uint64_t decoded_ = 0, skipped_ = 0;
+  uint64_t decoded_ = 0, skipped_ = 0, presented_ = 0;
   kernel::Thread* service_ = nullptr;
   bool stop_ = false;
 };

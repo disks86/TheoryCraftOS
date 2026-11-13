@@ -263,6 +263,7 @@ class PageObjectEnv final : public IObjectEnvironment {
   bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override { return page_.sw_fetch_bytes(address, "image", limit, out); }
   UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override { return page_.environment().open_video(util::move(data)); }
   UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override { return page_.environment().open_audio(util::move(data)); }
+  bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) override { return page_.environment().video_decode_accelerated(codec, width, height); }
 
  private:
   Page& page_;
@@ -443,10 +444,12 @@ bool Page::call_global(StringView name, const DomBindings::HookArg* args, uint32
 
 bool Page::run_timers_ahead(uint32_t max) {
   if (!engine_) return false;
-  double due;
-  if (!engine_->next_timer(&due)) return false;
+  // Only as far as the last setTimeout: an interval (a poll of cookieStore, a heartbeat) never runs out, and running ahead to it would spin the worker and
+  // move its clock hours forward on every event.
+  double last;
+  if (!engine_->last_one_shot_timer(&last)) return false;
   String error(allocator_);
-  engine_->run_timers(max, &error);
+  engine_->run_timers_until(last, max, &error);
   if (!error.empty()) note_error(error.view());
   flush_errors();
   return true;
@@ -662,13 +665,11 @@ const StyleSheet& Page::style_sheet() {
         ":fullscreen { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important; width: 100% !important;"
         " height: 100% !important; max-width: none !important; max-height: none !important; margin: 0 !important; box-sizing: border-box !important; z-index: 2147483647 !important; }";
     if (!fullscreen_stack_.empty()) options.extra_css = StringView(kFullscreenCss);
-    computed_cache_.clear();
     // Scripts change the page all the time, and the style sheets almost never: when the <style> and <link> elements are as they were, so are the rules (the page
-    // changing is no reason to read megabytes of CSS again).
+    // changing is no reason to read megabytes of CSS again), and the computed styles kept for scripts stay until a change under them (computed_style).
     const uint64_t sources = style_sources_fingerprint(doc_, options);
-    if (style_cache_valid_ && style_cache_media_ == media_ && sources == style_sources_) {
-      style_cache_.reset_derived();
-    } else {
+    if (!(style_cache_valid_ && style_cache_media_ == media_ && sources == style_sources_)) {
+      computed_cache_.clear();
       style_cache_.clear();
       collect_style_sheets(doc_, options, &style_cache_);
       style_sources_ = sources;
@@ -678,7 +679,21 @@ const StyleSheet& Page::style_sheet() {
     style_cache_media_ = media_;
     style_cache_valid_ = true;
   }
+  if (style_cache_.derived_nearly_full()) {   // (the text the derived styles point to is let go: the kept ones go with it)
+    computed_cache_.clear();
+    style_cache_.reset_derived();
+  }
   return style_cache_;
+}
+
+// Before the styles of the whole document are worked out (boxes for a picture or for the geometry): the text and custom property scopes the derived styles
+// point to are let go when they are near their limit, so that they do not grow without end with every picture. (Not every time: the computed styles kept for
+// scripts point into them too and would go with them.)
+void Page::start_whole_styles() {
+  style_sheet();
+  if (!style_cache_.derived_nearly_full(true)) return;
+  computed_cache_.clear();
+  style_cache_.reset_derived();
 }
 
 Style derive_style(const Style& parent, const dom::Node* n, const StyleSheet& sheet);   // Renderer.cpp
@@ -727,11 +742,33 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
     computed_cache_.clear();
     computed_cache_focus_ = focus_;
   }
+  // Which kept styles are still good: the latest change on the way up from each element of the chain (through the nodes above the chain too: the document,
+  // a shadow root and its host), compared with when the style was worked out. With :has() any change anywhere may matter.
+  const bool siblings = sheet.uses_siblings();
+  uint64_t above = 0;   // the latest change above chain[depth - 1]
+  const dom::Node* top = depth ? chain[depth - 1] : element;
+  for (const dom::Node* n = depth ? chain[depth - 1]->parent : nullptr; n;) {
+    above = above > n->style_stamp ? above : n->style_stamp;
+    top = n;
+    if (n->parent) n = n->parent;
+    else n = n->shadow_host;
+  }
+  if (depth && siblings && chain[depth - 1]->parent && chain[depth - 1]->parent->child_attribute_stamp > above) above = chain[depth - 1]->parent->child_attribute_stamp;
+  uint64_t latest[512];   // latest[i]: the latest change at chain[i] or above
+  for (uint32_t i = depth; i > 0; --i) {
+    const dom::Node* n = chain[i - 1];
+    uint64_t t = i < depth ? latest[i] : above;
+    if (n->style_stamp > t) t = n->style_stamp;
+    if (siblings && i < depth && chain[i]->child_attribute_stamp > t) t = chain[i]->child_attribute_stamp;
+    latest[i - 1] = t;
+  }
+  const uint64_t epoch = doc_.style_epoch() + (sheet.uses_has() ? doc_.style_clock() << 20 : 0);
   Style s;
   uint32_t known = depth;   // chain[known..depth) is above the nearest ancestor whose style is kept: s starts as that one's
   for (uint32_t i = 0; i < depth; ++i) {
-    if (const Style* hit = computed_cache_.find(chain[i])) {
-      s = *hit;
+    if (const ComputedEntry* hit = computed_cache_.find(chain[i])) {
+      if (hit->epoch != epoch || hit->top != top || hit->stamp < latest[i]) continue;   // (stale: worked out again below, and replaced)
+      s = hit->style;
       known = i;
       break;
     }
@@ -755,7 +792,12 @@ bool Page::computed_style(const dom::Node* element, Style* out) {
       s.background = s.own_background_color;
       s.background_block = s.display != Display::Inline;
     }
-    computed_cache_.put(n, s);
+    ComputedEntry entry;
+    entry.style = s;
+    entry.stamp = doc_.style_clock();
+    entry.epoch = epoch;
+    entry.top = top;
+    computed_cache_.put(n, entry);
   }
   *out = s;
   return true;
@@ -799,7 +841,7 @@ bool Page::render_picture(PagePicture* out, font::FontSet& fonts) {
   sync_frames();
   objects_.set_now(env_.now_ms());
   objects_.sync(doc_, object_environment(), address_.view(), media_);
-  style_sheet();
+  start_whole_styles();
   style_cache_.set_viewport(media_.width, media_.height);
   lap(&phase_.styles);
   layout::BuildOptions build;
@@ -1199,6 +1241,7 @@ void Page::record_geometry(const layout::BoxTree& tree) {
       }
       r.padding_left = static_cast<double>(b.padding.left.to_px100()) / 100.0;
       r.padding_top = static_cast<double>(b.padding.top.to_px100()) / 100.0;
+      r.clips = b.style.overflow_x != Overflow::Visible || b.style.overflow_y != Overflow::Visible;
       geometry_.put(b.node, r);
     }
     for (uint64_t i = 0; i < b.children.count(); ++i) stack.push_back({b.children[i], x, y});
@@ -1212,7 +1255,7 @@ void Page::refresh_geometry(bool force) {
   const uint64_t started = env_.monotonic_us();
   if (!force && started != 0 && geometry_done_us_ != 0 && started - geometry_done_us_ < geometry_cost_us_ * 4) return;
   geometry_busy_ = true;
-  style_sheet();
+  start_whole_styles();
   style_cache_.set_viewport(media_.width, media_.height);
   layout::BuildOptions build;
   build.objects = &objects_;
@@ -1251,6 +1294,12 @@ bool Page::node_rect(dom::Node* node, double* rect8) {
   rect8[6] = r->padding_left;
   rect8[7] = r->padding_top;
   return true;
+}
+
+int Page::node_clips(dom::Node* node) {
+  if (!node || !geometry_ready_) return -1;
+  const BoxRect* r = geometry_.find(node->serial);
+  return r ? (r->clips ? 1 : 0) : -1;
 }
 
 void Page::set_scroll(int32_t y) {

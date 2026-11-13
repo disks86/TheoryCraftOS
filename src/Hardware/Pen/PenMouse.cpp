@@ -21,6 +21,7 @@
 namespace hardware {
 
 bool PenMouse::poll(MouseEvent* out) {
+  if (!__atomic_load_n(&enabled_, __ATOMIC_ACQUIRE)) return false;
   PenEvent e;
   while (pens_.poll(&e)) {
     uint8_t buttons = 0;

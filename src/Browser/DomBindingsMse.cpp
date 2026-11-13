@@ -71,6 +71,43 @@ NATIVE(mse_supported) {
   return true;
 }
 
+// __decode_info(contentType, width, height, framerate): [smooth, powerEfficient] for navigator.mediaCapabilities.decodingInfo(). A codec a video engine of
+// the machine decodes is both. One the CPU decodes is smooth up to the pixel rate its decoder keeps up with while the page goes on (measured: H.264 is the
+// cheapest here, AV1 the dearest) and never power efficient; players then pick a size, or a codec, this machine can play without dropping frames.
+NATIVE(decode_info) {
+  (void)self;
+  String type(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &type)) return false;
+  double width = 0, height = 0, rate = 30;
+  if (argc > 1 && args[1].is_number()) width = args[1].u.number;
+  if (argc > 2 && args[2].is_number()) height = args[2].u.number;
+  if (argc > 3 && args[3].is_number() && args[3].u.number > 0) rate = args[3].u.number;
+  const StringView t = type.view();
+  struct Family {
+    const char* tag;          // in the codecs parameter
+    const char* name;         // for the environment
+    double software_mpixels;  // pixels a second (millions) the CPU decoder is smooth for
+  };
+  static const Family kFamilies[] = {{"avc1", "h264", 40}, {"avc3", "h264", 40}, {"hev1", "hevc", 20}, {"hvc1", "hevc", 20}, {"vp09", "vp9", 22}, {"vp9", "vp9", 22},
+                                     {"vp8", "vp8", 22},   {"av01", "av1", 15}};
+  const Family* family = nullptr;
+  for (const Family& f : kFamilies)
+    if (!family && t.contains(f.tag)) family = &f;
+  JsObject* a = vm.new_array();
+  if (!family) {   // (sound, or a type without a codec named: what a SourceBuffer takes plays)
+    vm.array_push(a, bool_value(true));
+    vm.array_push(a, bool_value(!t.starts_with("video/")));
+  } else {
+    const uint32_t w = width > 0 && width < 65536 ? static_cast<uint32_t>(width) : 0, h = height > 0 && height < 65536 ? static_cast<uint32_t>(height) : 0;
+    const bool engine = impl(vm).host.video_decode_accelerated(StringView(family->name), w, h);
+    const double mpixels = static_cast<double>(w) * h * rate / 1e6;
+    vm.array_push(a, bool_value(engine || w == 0 || h == 0 || mpixels <= family->software_mpixels));
+    vm.array_push(a, bool_value(engine));
+  }
+  *result = Value::make_object(a);
+  return true;
+}
+
 NATIVE(mse_create) {
   (void)self;
   (void)args;
@@ -490,6 +527,7 @@ bool install_mse(DomBindings::Impl& c) {
   Vm& vm = c.vm;
   JsObject* g = vm.global();
   vm.define_native(g, "__mse_supported", mse_supported, 1);
+  vm.define_native(g, "__decode_info", decode_info, 4);
   vm.define_native(g, "__mse_create", mse_create, 0);
   vm.define_native(g, "__mse_drop", mse_drop, 1);
   vm.define_native(g, "__mse_register_url", mse_register_url, 2);
