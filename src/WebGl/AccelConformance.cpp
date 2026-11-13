@@ -213,6 +213,8 @@ constexpr Scene kScenes[] = {
        "  float t = 0.0; float r = v.g > 0.5 ? (t += 0.3) : (t -= 0.1); o = vec4(s, r + 0.2, t + 0.2, 1.0); }\n", 5, nullptr},
       {"a varying the vertex shader does not write", kHead "in vec2 pos; in vec4 col; out vec4 v; out vec4 w;\nvoid main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }\n",
        kHead "in vec4 v; in vec4 w; out vec4 o;\nvoid main(){ o = v * 0.5 + w + vec4(0.1); }\n", 5, nullptr},
+      {"&& and || that skip a right side with effects", kVs,
+       kFsHead "void main(){ float x = v.r; float y = v.g; if (x > 0.5 && ++y > 1.5) y += 0.1; bool b = x < 0.3 || (x += 0.2) > 0.9; o = vec4(x * 0.5, y * 0.4, b ? 0.7 : 0.2, 1.0); }\n", 5, nullptr},
 };
 #undef kFsHead
 #undef kHead
@@ -359,6 +361,13 @@ constexpr Scene kStageScenes[] = {
        kDesk "layout(vertices = 3) out;\nstruct S { vec4 c; float k[2]; };\nin vec4 v[]; out S ts[];\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; ts[gl_InvocationID].c = v[gl_InvocationID]; for (int i = 0; i < 2; ++i) ts[gl_InvocationID].k[i] = float(gl_InvocationID * 2 + i) * 0.1;\n"
        "  gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
        kDesk "layout(triangles, equal_spacing, ccw) in;\nstruct S { vec4 c; float k[2]; };\nin S ts[]; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec4 s = vec4(0.0); for (int i = 0; i < 3; ++i) s += (ts[i].c * 0.6 + vec4(ts[i].k[0], ts[i].k[1], 0.0, 0.0)) * c[i]; g = vec4(s.rgb, 1.0); }\n",
+       3, 6},
+      {"tessellation: levels and a patch vector written by each invocation", kDeskVs, kDeskFs, 0xE, nullptr, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nin vec4 v[]; out vec4 tv[]; patch out vec4 pc;\n"
+       "void main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; tv[gl_InvocationID] = v[gl_InvocationID]; if (gl_InvocationID == 0) pc = vec4(0.1, 0.2, 0.3, 0.4);\n"
+       "  barrier();\n"
+       "  pc[gl_InvocationID] = v[gl_InvocationID].g; gl_TessLevelOuter[gl_InvocationID] = float(gl_InvocationID + 2); if (gl_InvocationID == 1) gl_TessLevelInner[0] = 3.0; }\n",
+       kDesk "layout(triangles, equal_spacing, ccw) in;\nin vec4 tv[]; patch in vec4 pc; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; gl_Position.xy += vec2(c.x * c.y, c.y * c.z) * 0.4; g = (tv[0] * c.x + tv[1] * c.y + tv[2] * c.z) * 0.5 + pc * 0.5; g.a = 1.0; }\n",
        3, 6},
 };
 #undef kDeskFs
