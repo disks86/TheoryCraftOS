@@ -33,6 +33,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The kernel image's optimization level. It comes after the build type's own flags, so it decides: empty picks -O2 for
+# Release/RelWithDebInfo/MinSizeRel and -O1 otherwise (Debug, no build type; what the host tests use). -DTCOS_KERNEL_OPT=-O3 (or -Og...) overrides it.
+set(TCOS_KERNEL_OPT "" CACHE STRING "Kernel optimization flag (-O1, -O2, ...); empty: -O2 for release build types, -O1 otherwise")
+if(TCOS_KERNEL_OPT)
+  set(TCOS_KERNEL_OPT_FLAG ${TCOS_KERNEL_OPT})
+elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+  set(TCOS_KERNEL_OPT_FLAG -O2)
+else()
+  set(TCOS_KERNEL_OPT_FLAG -O1)
+endif()
+message(STATUS "Kernel optimization: ${TCOS_KERNEL_OPT_FLAG}")
+
 include(cmake/jit.cmake)
 
 if(TCOS_ARCH STREQUAL "aarch64")
@@ -1163,7 +1175,7 @@ set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE
   -ffreestanding -fno-stack-protector -mno-red-zone -fshort-wchar
-  -Wall -Wextra -g -O1
+  -Wall -Wextra -g ${TCOS_KERNEL_OPT_FLAG}
   $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
 )
 # (the one C source: vulkan-1.dll's SPIR-V translator, which the 3D test's Vulkan path carries; it is the DLL's code as it is)
