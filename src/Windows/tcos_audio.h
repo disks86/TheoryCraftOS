@@ -24,8 +24,10 @@
 __declspec(dllimport) LONG NTAPI NtTcosAudio(ULONG64 *arguments);
 
 enum { TCOS_AUDIO_OPEN = 1, TCOS_AUDIO_CLOSE, TCOS_AUDIO_WRITE, TCOS_AUDIO_STATUS, TCOS_AUDIO_FLUSH, TCOS_AUDIO_PAUSE, TCOS_AUDIO_SET_VOLUME,
-       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE, TCOS_AUDIO_OPEN_CAPTURE, TCOS_AUDIO_READ };
+       TCOS_AUDIO_GET_VOLUME, TCOS_AUDIO_DEVICES, TCOS_AUDIO_SET_MUTE, TCOS_AUDIO_OPEN_CAPTURE, TCOS_AUDIO_READ, TCOS_AUDIO_VIRTUAL_SINKS };
 #define TCOS_AUDIO_SOURCE_STREAM 0xFFFFFFFFull      /* (the volume calls' stream number for the microphone's master gain; 0 is the master volume) */
+#define TCOS_AUDIO_VIRTUAL_STREAM 0x80000000ull     /* (| a virtual sink's node: the volume calls' stream number for its master volume) */
+#define TCOS_AUDIO_MAX_VIRTUAL 16                   /* (virtual sinks the graph has at most) */
 #define TCOS_STATUS_INVALID_PARAMETER ((LONG)0xC000000D)
 
 /* One call: [0] operation, [1] stream, [2..6] parameters; *out5, *out6, *out7 (each may be NULL) get what the kernel wrote back. */
@@ -110,17 +112,30 @@ static inline void program_name(char *out, int size) {
   out[k] = 0;
 }
 
+/* The virtual sink number `which` (0, 1, ...): its node (0 past the last), its description in `text` (UTF-8, NUL-ended), and how many there are. */
+static inline ULONG64 tcos_audio_virtual_sink(ULONG64 which, char *text, int size, ULONG64 *count) {
+  ULONG64 node = 0, n = 0, length = 0;
+  if (audio_call(TCOS_AUDIO_VIRTUAL_SINKS, 0, which, (ULONG64)(ULONG_PTR)text, size > 1 ? (ULONG64)(size - 1) : 0, 0, 0, &node, &n, &length) != 0) node = n = length = 0;
+  if (text && size > 0) text[length < (ULONG64)size ? length : (ULONG64)size - 1] = 0;
+  if (count) *count = n;
+  return node;
+}
+
 /* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream of the microphone or (`monitor`)
- * of what the mixer plays; 0 when it cannot be opened. */
-static inline ULONG64 tcos_audio_open_from(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, LONG *status) {
+ * of what the mixer plays; with `target` (a virtual sink's node), into that sink or (capture) of its monitor. 0 when it cannot be opened. */
+static inline ULONG64 tcos_audio_open_to(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, ULONG64 target, LONG *status) {
   char name[128];
   program_name(name, sizeof name);
   ULONG64 stream = 0;
   const ULONG64 code = wave_format_code(format);
-  LONG st = code ? audio_call(capture ? TCOS_AUDIO_OPEN_CAPTURE : TCOS_AUDIO_OPEN, capture && monitor ? 1 : 0, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
+  const ULONG64 which = target ? target : capture && monitor ? 1 : 0;
+  LONG st = code ? audio_call(capture ? TCOS_AUDIO_OPEN_CAPTURE : TCOS_AUDIO_OPEN, which, code, format->nSamplesPerSec, format->nChannels, (ULONG64)(ULONG_PTR)name, lstrlenA(name), NULL, NULL, &stream)
                  : TCOS_STATUS_INVALID_PARAMETER;
   if (status) *status = st;
   return st == 0 ? stream : 0;
+}
+static inline ULONG64 tcos_audio_open_from(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, LONG *status) {
+  return tcos_audio_open_to(format, capture, monitor, 0, status);
 }
 static inline ULONG64 tcos_audio_open_kind(const WAVEFORMATEX *format, BOOL capture, LONG *status) { return tcos_audio_open_from(format, capture, FALSE, status); }
 static inline ULONG64 tcos_audio_open(const WAVEFORMATEX *format, LONG *status) { return tcos_audio_open_from(format, FALSE, FALSE, status); }

@@ -15,7 +15,7 @@
 # plays a MIDI file (all 12 notes must reach the server's synthesizer), and tests/linux/pwmedia.c (built against the host's libpipewire) runs each of its
 # modes: a driver camera and a watcher (video), the same with the camera's own memfd buffers (video-alloc), a pw_filter's MIDI heard by a pw_stream
 # (midi), and a virtual sink of the adapter factory played into by an audio driver and recorded from (adapter).
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|xaudio2|pwnode|libpipewire]   (the Linux program's CPU, default x86_64; which runs, default all).
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|xaudio2|pwnode|libpipewire]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,7 +26,7 @@ work=${TMPDIR:-/tmp}/tcos-pwemu-$(printf %s "$PWD" | cksum | cut -d" " -f1)
 mkdir -p "$work/obj" "$work/sys32"
 for tool in x86_64-w64-mingw32-gcc clang; do command -v "$tool" >/dev/null || { echo "skipped (no $tool)"; exit 0; }; done
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp)
+         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_AUDIO"
 objs=()
 jobs=()
@@ -50,6 +50,7 @@ x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/winmmtest.exe" tests/windows/
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/dsoundtest.exe" tests/windows/dsoundtest.c -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/recordtest.exe" tests/windows/recordtest.c -lwinmm -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/xaudio2test.exe" tests/windows/xaudio2test.c -L"$work/build/windows" -l:xaudio2_9.dll -lole32 -luuid
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/virtualsinktest.exe" tests/windows/virtualsinktest.c -lole32 -luuid
 # the Linux program
 lld=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/gcc-ld/ld.lld 2>/dev/null | head -1 || true)
 case $arch in
@@ -104,6 +105,11 @@ if [ "$which" = all ] || [ "$which" = record ]; then
   grep -q "recordtest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL recordtest"; fail=1; }
   grep -q "pulsetest: [0-9]* checks, 0 failed" "$work/run-record.out" || { echo "FAIL pulsetest (with recordtest)"; fail=1; }
   grep -q "faulted=0" "$work/run-record.out" && grep -q "second program: exit=0" "$work/run-record.out" || { echo "FAIL a program faulted or failed (record run)"; fail=1; }
+fi
+if [ "$which" = all ] || [ "$which" = nullsink ]; then
+  # a virtual sink (TCOS_EMU_NULL_SINK) from WASAPI: an endpoint of its own, played into and recorded by loopback, apart from the speakers' native 300 Hz
+  TCOS_EMU_NULL_SINK=1 TCOS_EMU_TONES=300 "$work/emurun" "$work/virtualsinktest.exe" "$work/sys32" | tee "$work/run-nullsink.out"
+  grep -q "virtualsinktest: [0-9]* checks, 0 failed" "$work/run-nullsink.out" && grep -q "faulted=0" "$work/run-nullsink.out" || { echo "FAIL virtualsinktest"; fail=1; }
 fi
 if [ "$which" = all ] || [ "$which" = xaudio2 ]; then
   TCOS_EMU_TONES=300,400,500,600 "$work/emurun" "$work/xaudio2test.exe" "$work/sys32" "$work/pulsetest-$arch" | tee "$work/run-xaudio2.out"

@@ -105,6 +105,10 @@ static void drain_mixer(audio::AudioMixer& mixer, FakeDevice& dev, int rounds = 
   }
 }
 
+// The clock the tests move by hand (nanoseconds).
+static std::atomic<uint64_t> g_now_ns{1000000000ull};
+static uint64_t test_clock() { return g_now_ns.load(); }
+
 static std::vector<uint8_t> s16_constant(uint32_t frames, uint32_t channels, int16_t value) {
   std::vector<uint8_t> b(frames * channels * 2);
   for (uint32_t i = 0; i < frames * channels; ++i) { b[2 * i] = uint8_t(value); b[2 * i + 1] = uint8_t(uint16_t(value) >> 8); }
@@ -2176,6 +2180,71 @@ static void test_windows_service() {
   CHECK(service.open(12, PcmFormat{SampleFormat::S16Le, 100, 2}, "x", &s2) != 0);
 }
 
+// A virtual sink from the Windows side: a stream plays into it (not the speakers), another records its monitor, its master volume is its own; and it can
+// go while they are open.
+static void test_windows_virtual_sink() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  CHECK(g.create_virtual_node(g.native_client_id(), Properties(A), 2, 48000) == 0);      // (no clock yet: none can be made)
+  g.set_clock(&test_clock);
+  Properties props(A);
+  props.set("node.name", "win-null");
+  props.set("node.description", "Windows null sink");
+  const uint32_t sink = g.create_virtual_node(g.native_client_id(), props, 2, 48000);
+  CHECK(sink && g.is_virtual_sink(sink) && !g.is_virtual_sink(g.sink_id()));
+  List<uint32_t> sinks(A);
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 1 && sinks[0] == sink);
+  WindowsAudioService service(g, A);
+  uint32_t out = 0, in = 0, wrong = 0, taken = 0, got = 0;
+  CHECK(service.open(20, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, g.sink_id()) != 0);      // (the speakers are not a virtual sink)
+  CHECK(service.open_capture(20, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &wrong, false, 12345) != 0);
+  CHECK(service.open(20, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, sink) == 0 && out);
+  CHECK(service.open_capture(20, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &in, false, sink) == 0 && in);
+  const uint32_t speakers_streams = mixer.stream_count();
+  CHECK(speakers_streams == 0);      // (into the sink's own mixer)
+  std::vector<uint8_t> tone = s16_constant(4800, 2, 6000);
+  CHECK(service.write(20, out, ConstByteView(tone.data(), tone.size()), &taken) == 0 && taken == tone.size());
+  std::vector<uint8_t> heard(48000 * 4);
+  uint64_t total = 0, loud = 0;
+  for (int i = 0; i < 40 && loud < 2000; ++i) {
+    g_now_ns += 5000000;
+    g.refresh();
+    CHECK(service.read(20, in, ByteView(heard.data(), heard.size()), &got) == 0);
+    for (uint32_t k = 0; k + 1 < got; k += 2) {
+      const int16_t v = int16_t(heard[k] | heard[k + 1] << 8);
+      loud += abs(v - 6000) < 40;
+    }
+    total += got;
+  }
+  CHECK(loud >= 2000);
+  dev.take();
+  mixer.pump();
+  std::vector<int16_t> speakers = dev.take();
+  bool silent = true;
+  for (int16_t v : speakers) silent &= v == 0;
+  CHECK(silent);      // (nothing of it on the speakers)
+  // its master volume: stream kVirtualSinkStream | its node
+  uint32_t left = 0, right = 0;
+  bool mute = true;
+  CHECK(service.set_volume(20, WindowsAudioService::kVirtualSinkStream | sink, 0x8000, 0x8000) == 0);
+  CHECK(service.get_volume(20, WindowsAudioService::kVirtualSinkStream | sink, &left, &right, &mute) == 0 && !mute && left > 0x7E00 && left < 0x8200);
+  CHECK(service.get_volume(20, WindowsAudioService::kVirtualSinkStream | g.sink_id(), &left, &right, &mute) != 0);
+  // the sink goes: its streams play and record nothing, and nothing breaks
+  g.destroy_node(sink);
+  CHECK(!g.is_virtual_sink(sink) && g.virtual_sinks(&sinks) && sinks.count() == 0);
+  for (int i = 0; i < 5; ++i) {
+    g_now_ns += 5000000;
+    g.refresh();
+    service.write(20, out, ConstByteView(tone.data(), tone.size()), &taken);
+    service.read(20, in, ByteView(heard.data(), heard.size()), &got);
+  }
+  service.process_exited(20);
+  CHECK(service.stream_count() == 0);
+}
+
 // ---- the AF_UNIX transport -----------------------------------------------------------------------------------------------------------------------
 
 struct SystemSync final : process::ISystemSync {
@@ -2456,8 +2525,6 @@ static void test_threads() {
 
 // ---- MIDI: the bus, its messages and UMP -------------------------------------------------------------------------------------------------------------
 
-static std::atomic<uint64_t> g_now_ns{1000000000ull};
-static uint64_t test_clock() { return g_now_ns.load(); }
 
 struct FakeMidiSink final : midi::IMidiSink {
   std::mutex m;
@@ -3778,13 +3845,14 @@ static void test_client_node_media() {
     adapter(c, 31, {{"factory.name", "api.alsa.pcm.sink"}});
     refused.absorb(c);
     CHECK(refused.errors == 1 && server.virtual_sinks() == 1);
-    const uint32_t playing_before = g.playback_count();
+    const uint32_t speakers_before = mixer.stream_count();
     ExportedNode into = export_node(c, 32, "Stream/Output/Audio", 1, nullptr, 0, 0, {{"target.object", "my-sink"}});
     ExportedNode from = export_node(c, 33, "Stream/Input/Audio", 0, nullptr, 0, 0, {{"target.object", "my-sink"}});
-    CHECK(into.ok && from.ok && g.playback_count() == playing_before);      // (not to the speakers)
-    bool linked = false;
-    g.visit(into.node, [&](const GraphObject& o) { linked = o.role == NodeRole::Linked && o.props.get("target.object") == StringView("my-sink"); });
-    CHECK(linked);
+    CHECK(into.ok && from.ok && mixer.stream_count() == speakers_before);      // (not to the speakers: to the sink's own mixer)
+    bool linked = false, recording = false;
+    g.visit(into.node, [&](const GraphObject& o) { linked = o.role == NodeRole::Playback && o.target == ns.node && o.props.get("target.object") == StringView("my-sink"); });
+    g.visit(from.node, [&](const GraphObject& o) { recording = o.role == NodeRole::Capture && o.target == ns.node && o.monitor; });
+    CHECK(linked && recording);
     if (into.ok && from.ok) {
       put_u32(into.activation->memory(), 0, 3);
       put_u32(from.activation->memory(), 0, 3);
@@ -3982,6 +4050,7 @@ int main() {
   test_native_protocol();
   test_pulse_protocol();
   test_windows_service();
+  test_windows_virtual_sink();
   test_record_convert();
   test_record();
   test_record_threads();

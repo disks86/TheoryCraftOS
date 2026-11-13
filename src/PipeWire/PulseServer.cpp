@@ -292,9 +292,41 @@ bool PulseServer::is_source_name(StringView name) const {
   return graph_.source_id() && name == StringView(kSourceName);
 }
 
-bool PulseServer::find_source(uint32_t index, StringView name, bool null_name, bool* monitor) const {
+uint32_t PulseServer::virtual_sink_named(StringView name) const {
+  const uint32_t node = graph_.find_node(name);
+  return node && graph_.is_virtual_sink(node) ? node : 0;
+}
+
+uint32_t PulseServer::find_sink(uint32_t index, StringView name, bool null_name) const {
+  if (!null_name && !name.empty()) {
+    if (is_sink_name(name)) return graph_.sink_id();
+    return virtual_sink_named(name);
+  }
+  if (index == graph_.sink_id() && index != 0) return index;
+  return index != pulse::kInvalidIndex && graph_.is_virtual_sink(index) ? index : 0;
+}
+
+bool PulseServer::find_source(uint32_t index, StringView name, bool null_name, bool* monitor, uint32_t* of_sink) const {
   const uint32_t source = graph_.source_id(), monitor_index = graph_.sink_id() | kMonitorFlag;
   const bool have_monitor = graph_.mixer() != nullptr;
+  uint32_t ignored = 0;
+  if (!of_sink) of_sink = &ignored;
+  *of_sink = graph_.sink_id();
+  // a virtual sink's monitor: "<name>.monitor", the sink's own name (as pipewire-pulse allows), or its index with the monitor flag
+  if (!null_name && !name.empty()) {
+    StringView base = name;
+    const StringView suffix(".monitor");
+    if (base.size() > suffix.size() && base.substr(base.size() - suffix.size()) == suffix) base = base.substr(0, base.size() - suffix.size());
+    if (const uint32_t v = virtual_sink_named(base)) {
+      *monitor = true;
+      *of_sink = v;
+      return true;
+    }
+  } else if (index != pulse::kInvalidIndex && (index & kMonitorFlag) && graph_.is_virtual_sink(index & ~kMonitorFlag)) {
+    *monitor = true;
+    *of_sink = index & ~kMonitorFlag;
+    return true;
+  }
   if (!null_name && !name.empty()) {
     if (name == StringView(kMonitorName) || name == StringView("@DEFAULT_MONITOR@")) {
       *monitor = true;
@@ -505,9 +537,10 @@ void PulseServer::command(Client& c, ConstByteView payload) {
     case kLookupSink: {
       StringView name;
       if (!t.string(&name)) return invalid();
-      if (!is_sink_name(name)) return send_error(c, tag, kErrNoEntity);
+      const uint32_t found = find_sink(pulse::kInvalidIndex, name, false);
+      if (!found) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
-      TagWriter(c.outbox).u32(sink);
+      TagWriter(c.outbox).u32(found);
       end_command(c, m);
       return;
     }
@@ -516,17 +549,22 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       StringView name;
       bool null_name = true;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!(index == sink || (!null_name && is_sink_name(name)))) return send_error(c, tag, kErrNoEntity);
+      const uint32_t found = find_sink(index, name, null_name);
+      if (!found) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
-      fill_sink(c, w);
+      fill_sink(c, w, found);
       end_command(c, m);
       return;
     }
     case kGetSinkInfoList: {
+      // the speakers, then the virtual sinks
+      List<uint32_t> virtuals(allocator_);
+      graph_.virtual_sinks(&virtuals);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
-      fill_sink(c, w);
+      fill_sink(c, w, sink);
+      for (uint32_t v : virtuals) fill_sink(c, w, v);
       end_command(c, m);
       return;
     }
@@ -563,32 +601,37 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       return;
     }
     case kGetSourceInfoList: {
+      // the microphone, the speakers' monitor, then the virtual sinks' monitors
+      List<uint32_t> virtuals(allocator_);
+      graph_.virtual_sinks(&virtuals);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
       if (source) fill_source(c, w, false);
       if (graph_.mixer()) fill_source(c, w, true);
+      for (uint32_t v : virtuals) fill_source(c, w, true, v);
       end_command(c, m);
       return;
     }
     case kGetSourceInfo: {
-      uint32_t index = 0;
+      uint32_t index = 0, of_sink = 0;
       StringView name;
       bool null_name = true, monitor = false;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!find_source(index, name, null_name, &monitor)) return send_error(c, tag, kErrNoEntity);
+      if (!find_source(index, name, null_name, &monitor, &of_sink)) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
-      fill_source(c, w, monitor);
+      fill_source(c, w, monitor, of_sink);
       end_command(c, m);
       return;
     }
     case kLookupSource: {
       StringView name;
       bool monitor = false;
+      uint32_t of_sink = 0;
       if (!t.string(&name)) return invalid();
-      if (name.empty() || !find_source(pulse::kInvalidIndex, name, false, &monitor)) return send_error(c, tag, kErrNoEntity);
+      if (name.empty() || !find_source(pulse::kInvalidIndex, name, false, &monitor, &of_sink)) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
-      TagWriter(c.outbox).u32(monitor ? sink | kMonitorFlag : source);
+      TagWriter(c.outbox).u32(monitor ? of_sink | kMonitorFlag : source);
       end_command(c, m);
       return;
     }
@@ -771,10 +814,11 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       StringView name;
       bool null_name = true;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!(index == sink || (!null_name && is_sink_name(name)))) return send_error(c, tag, kErrNoEntity);
+      const uint32_t which = find_sink(index, name, null_name);
+      if (!which) return send_error(c, tag, kErrNoEntity);
       float volume = 1.0f;
       bool mute = false;
-      graph_.get_volume(sink, &volume, &mute);
+      graph_.get_volume(which, &volume, &mute);
       if (cmd == kSetSinkVolume) {
         Cvolume v;
         if (!t.cvolume(&v) || v.channels == 0) return invalid();
@@ -782,7 +826,7 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       } else if (!t.boolean(&mute)) {
         return invalid();
       }
-      graph_.set_volume(sink, volume, mute);
+      graph_.set_volume(which, volume, mute);
       return send_simple_reply(c, tag);
     }
     case kSetSinkInputVolume: case kSetSinkInputMute: {
@@ -864,8 +908,10 @@ void PulseServer::create_playback(Client& c, uint32_t tag, TagReader& t) {
   if (!spec.valid()) return send_error(c, tag, kErrInvalid);
   if (map.channels == 0) map = default_map(spec.channels);
   if (map.channels != spec.channels) return send_error(c, tag, kErrInvalid);
-  if (sink_index != pulse::kInvalidIndex && sink_index != graph_.sink_id()) return send_error(c, tag, kErrNoEntity);
-  if (!sink_name.empty() && !is_sink_name(sink_name)) return send_error(c, tag, kErrNoEntity);
+  // the speakers, or a virtual sink the stream names
+  const uint32_t to_sink = sink_index == pulse::kInvalidIndex && sink_name.empty() ? graph_.sink_id() : find_sink(sink_index, sink_name, sink_name.empty());
+  if (!to_sink) return send_error(c, tag, kErrNoEntity);
+  const uint32_t target = to_sink == graph_.sink_id() ? 0 : to_sink;
   PcmFormat format;
   if (!to_pcm_format(spec, &format)) return send_error(c, tag, kErrNotSupported);
   if (c.streams.count() >= kMaxStreamsPerClient) return send_error(c, tag, kErrTooLarge);
@@ -874,7 +920,7 @@ void PulseServer::create_playback(Client& c, uint32_t tag, TagReader& t) {
   props.update(c.props, Properties::Mode::kMerge);
   props.set("client.api", "pipewire-pulse");
   SharedPointer<PlaybackStream> playback;
-  const uint32_t node = graph_.create_playback(c.graph_client, format, props, &playback);
+  const uint32_t node = graph_.create_playback(c.graph_client, format, props, &playback, target);
   if (!node) return send_error(c, tag, kErrTooLarge);
 
   UniquePointer<Stream> s = UniquePointer<Stream>::make(allocator_, allocator_);
@@ -918,8 +964,14 @@ void PulseServer::create_playback(Client& c, uint32_t tag, TagReader& t) {
   if (c.version >= 12) {
     w.sample_spec(spec);
     w.channel_map(map);
-    w.u32(graph_.sink_id());
-    w.string(kSinkName);
+    w.u32(to_sink);
+    if (target) {
+      bool named = false;
+      graph_.visit(target, [&](const GraphObject& o) { w.string(o.props.get("node.name")); named = true; });
+      if (!named) w.string_null();
+    } else {
+      w.string(kSinkName);
+    }
     w.boolean(false);
   }
   if (c.version >= 13) w.usec(uint64_t{s->tlength} / frame * 1000000 / spec.rate);
@@ -967,12 +1019,16 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
   if (map.channels == 0) map = default_map(spec.channels);
   if (map.channels != spec.channels) return send_error(c, tag, kErrInvalid);
   bool monitor = false;
-  if (!find_source(source_index == pulse::kInvalidIndex && source_name.empty() ? graph_.source_id() : source_index, source_name, source_name.empty(), &monitor)) {
+  uint32_t of_sink = 0;
+  if (!find_source(source_index == pulse::kInvalidIndex && source_name.empty() ? graph_.source_id() : source_index, source_name, source_name.empty(), &monitor,
+                   &of_sink)) {
     // (no source given and no microphone: the monitor)
     if (!(source_index == pulse::kInvalidIndex && source_name.empty() && graph_.mixer())) return send_error(c, tag, kErrNoEntity);
     monitor = true;
   }
-  const uint32_t source = monitor ? graph_.sink_id() | kMonitorFlag : graph_.source_id();
+  if (!monitor || !of_sink) of_sink = graph_.sink_id();
+  const uint32_t from_virtual = monitor && of_sink != graph_.sink_id() ? of_sink : 0;
+  const uint32_t source = monitor ? of_sink | kMonitorFlag : graph_.source_id();
   if (direct_on_input != pulse::kInvalidIndex && direct_on_input != 0) return send_error(c, tag, kErrNotSupported);      // (recording one stream's output)
   PcmFormat format;
   if (!to_pcm_format(spec, &format)) return send_error(c, tag, kErrNotSupported);
@@ -981,7 +1037,7 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
   props.update(c.props, Properties::Mode::kMerge);
   props.set("client.api", "pipewire-pulse");
   SharedPointer<RecordStream> record;
-  const uint32_t node = graph_.create_record(c.graph_client, format, props, &record, monitor);
+  const uint32_t node = graph_.create_record(c.graph_client, format, props, &record, monitor, from_virtual);
   if (!node) return send_error(c, tag, kErrTooLarge);
   UniquePointer<Stream> s = UniquePointer<Stream>::make(allocator_, allocator_);
   if (!s) {
@@ -1019,7 +1075,19 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
     w.sample_spec(spec);
     w.channel_map(map);
     w.u32(source);
-    w.string(monitor ? kMonitorName : kSourceName);
+    if (from_virtual) {
+      bool named = false;
+      graph_.visit(from_virtual, [&](const GraphObject& o) {
+        String monitor_name(allocator_);
+        monitor_name.append(o.props.get("node.name"));
+        monitor_name.append(".monitor");
+        w.string(monitor_name.view());
+        named = true;
+      });
+      if (!named) w.string_null();
+    } else {
+      w.string(monitor ? kMonitorName : kSourceName);
+    }
     w.boolean(false);
   }
   if (c.version >= 13) w.usec(kSourceLatencyUs);
@@ -1139,20 +1207,32 @@ void PulseServer::flow(Client& c, Stream& s) {
 
 // ---- introspection ---------------------------------------------------------------------------------------------------------------------------------
 
-void PulseServer::fill_sink(Client& c, TagWriter& w) {
-  graph_.visit(graph_.sink_id(), [&](const GraphObject& o) {
+void PulseServer::fill_sink(Client& c, TagWriter& w, uint32_t sink) {
+  graph_.visit(sink, [&](const GraphObject& o) {
+    // the speakers, or a virtual sink (its node.name, "<name>.monitor" its monitor)
+    const bool is_virtual = o.role == NodeRole::Virtual;
+    const uint32_t channels = is_virtual && o.format.channels == 1 ? 1 : 2;
+    String name(allocator_), monitor(allocator_);
+    if (is_virtual) {
+      name.append(o.props.get("node.name"));
+      monitor.append(o.props.get("node.name"));
+      monitor.append(".monitor");
+    } else {
+      name.append(kSinkName);
+      monitor.append(kMonitorName);
+    }
     w.u32(o.id);
-    w.string(kSinkName);
+    w.string(name.view());
     w.string(o.props.get("node.description"));
-    w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
-    w.channel_map(default_map(2));
+    w.sample_spec(SampleSpec{pulse::kS16Le, uint8_t(channels), is_virtual ? o.format.rate : hardware::kAudioSampleRate});
+    w.channel_map(default_map(channels));
     w.u32(pulse::kInvalidIndex);      // module
-    w.cvolume(flat_volume(2, linear_to_pulse_volume(o.volume)));
+    w.cvolume(flat_volume(channels, linear_to_pulse_volume(o.volume)));
     w.boolean(o.mute);
     w.u32(o.id | kMonitorFlag);       // monitor source
-    w.string(kMonitorName);
+    w.string(monitor.view());
     w.usec(kSinkLatencyUs);
-    w.string("tcos-mixer");
+    w.string(is_virtual ? "tcos-null-sink" : "tcos-mixer");
     w.u32(kSinkFlags);
     if (c.version >= 13) {
       w.proplist(o.props);
@@ -1182,7 +1262,7 @@ void PulseServer::fill_sink_input(Client& c, TagWriter& w, const GraphObject& o)
   w.string(o.props.get("media.name"));
   w.u32(pulse::kInvalidIndex);      // module
   w.u32(o.client ? o.client : pulse::kInvalidIndex);
-  w.u32(graph_.sink_id());
+  w.u32(o.target ? o.target : graph_.sink_id());      // (a virtual sink it plays into, else the speakers)
   w.sample_spec(spec);
   w.channel_map(default_map(spec.channels));
   Cvolume volume = flat_volume(spec.channels, linear_to_pulse_volume(o.volume));
@@ -1208,8 +1288,14 @@ void PulseServer::fill_sink_input(Client& c, TagWriter& w, const GraphObject& o)
   }
 }
 
-void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor) {
-  graph_.visit(monitor ? graph_.sink_id() : graph_.source_id(), [&](const GraphObject& o) {
+void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor, uint32_t of_sink) {
+  if (!of_sink) of_sink = graph_.sink_id();
+  graph_.visit(monitor ? of_sink : graph_.source_id(), [&](const GraphObject& o) {
+    const bool is_virtual = o.role == NodeRole::Virtual;
+    String sink_name(allocator_), monitor_name(allocator_);
+    sink_name.append(is_virtual ? o.props.get("node.name") : StringView(kSinkName));
+    monitor_name.append(sink_name.view());
+    monitor_name.append(".monitor");
     String description(allocator_);
     if (monitor) {
       description.append("Monitor of ");
@@ -1218,7 +1304,7 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor) {
       description.append(o.props.get("node.description"));
     }
     w.u32(monitor ? o.id | kMonitorFlag : o.id);
-    w.string(monitor ? kMonitorName : kSourceName);
+    w.string(monitor ? monitor_name.view() : StringView(kSourceName));
     w.string(description.view());
     w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
     w.channel_map(default_map(2));
@@ -1227,7 +1313,7 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor) {
     w.boolean(monitor ? false : o.mute);
     if (monitor) {
       w.u32(o.id);                    // monitor of sink
-      w.string(kSinkName);
+      w.string(sink_name.view());
     } else {
       w.u32(pulse::kInvalidIndex);    // a microphone: monitor of nothing
       w.string_null();
@@ -1240,7 +1326,7 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor) {
         Properties props(allocator_);
         props.set("device.class", "monitor");
         props.set("device.description", description.view());
-        props.set("node.name", kMonitorName);
+        props.set("node.name", monitor_name.view());
         props.set("media.class", "Audio/Source");
         w.proplist(props);
       } else {
@@ -1274,7 +1360,7 @@ void PulseServer::fill_source_output(Client& c, TagWriter& w, const GraphObject&
   w.string(o.props.get("media.name"));
   w.u32(pulse::kInvalidIndex);      // module
   w.u32(o.client ? o.client : pulse::kInvalidIndex);
-  w.u32(o.monitor ? graph_.sink_id() | kMonitorFlag : graph_.source_id());
+  w.u32(o.monitor ? (o.target ? o.target : graph_.sink_id()) | kMonitorFlag : graph_.source_id());
   w.sample_spec(spec);
   w.channel_map(default_map(spec.channels));
   w.usec(kSourceLatencyUs);
@@ -1307,7 +1393,7 @@ void PulseServer::send_subscription_events(Client& c) {
   auto facility_of = [&](const GraphEntry& e, uint32_t* out) {
     if (e.type == ObjectType::Client) *out = kClientFacility;
     else if (e.type != ObjectType::Node) return false;
-    else if (e.role == NodeRole::Sink) *out = kSink;
+    else if (e.role == NodeRole::Sink || e.role == NodeRole::Virtual) *out = kSink;      // (a virtual sink: a sink)
     else if (e.role == NodeRole::Source) *out = kSource;
     else if (e.role == NodeRole::Playback) *out = kSinkInput;
     else if (e.role == NodeRole::Capture) *out = kSourceOutput;

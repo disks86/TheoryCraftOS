@@ -165,22 +165,14 @@ class NativeServer final : public IProtocolServer {
     SharedPointer<MidiQueue> midi_in;
     SharedPointer<VideoChannel> video;
     uint32_t virtual_sink = 0;     // a virtual sink it plays into or records from (its graph node), 0: the devices
-    uint64_t virtual_cursor = 0;   // where in that sink's frames it plays or records next
     Properties props;
     List<UniquePointer<ClientPort>> ports;
     ByteBuffer scratch;            // a filter's float ports' frames, one port after another (played) or interleaved (recorded)
   };
-  // A sink or source the adapter factory made (support.null-audio-sink, NativeClientNode.cpp): what the streams that play into it mix to, on the server's
-  // clock, for the streams that record from it.
+  // A sink the adapter factory made (support.null-audio-sink, NativeClientNode.cpp): who made it. Its audio is the graph's (a mixer of its own:
+  // VirtualSink.hpp), so streams of every protocol play into it and record from it.
   struct VirtualSink {
-    static constexpr uint32_t kRingFrames = 1u << 16;      // (about 1.4 s at 48 kHz)
-    explicit VirtualSink(allocators::IAllocator& a) : ring(a) {}
     uint32_t node = 0, owner = 0, resource = 0;            // its graph node; the client that made it and its proxy (0 once it lingers alone)
-    uint32_t rate = 48000, channels = 2;
-    uint64_t start_ns = 0;
-    uint64_t now = 0;                                      // frames since it was made (the clock)
-    ByteBuffer ring;                                       // kRingFrames frames of F32
-    uint64_t cleared = 0;                                  // the ring holds frames from here - kRingFrames / 2 up to here + kRingFrames / 2
     bool linger = false;
   };
   struct Client {
@@ -241,7 +233,6 @@ class NativeServer final : public IProtocolServer {
   void create_adapter(Client& c, uint32_t new_id, uint32_t version, const Properties& props);
   VirtualSink* virtual_sink(uint32_t node);
   void destroy_virtual(uint32_t node);
-  void advance_virtual(VirtualSink& v, uint64_t now_ns);
   ClientPort* client_port(ClientNode& n, uint32_t direction, uint32_t port_id);
   void port_update(Client& c, ClientNode& n, uint32_t direction, uint32_t port_id, int32_t change_mask, pod::Parser& args, uint32_t n_params);
   void port_buffers(Client& c, ClientNode& n, pod::Parser& args);

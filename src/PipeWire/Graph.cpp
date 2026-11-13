@@ -497,15 +497,22 @@ SharedPointer<VideoChannel> Graph::video_of(uint32_t node_id) {
 }
 
 uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate) {
-  if (channels < 1 || channels > 2) return 0;
+  if (channels < 1 || channels > 2 || !clock_.set_up()) return 0;
+  // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; the node says the sink's own format)
+  SharedPointer<VirtualOutput> output = SharedPointer<VirtualOutput>::make(allocator_, allocator_, clock_);
+  if (!output || !output->initialize()) return 0;
   kernel::ScopedMutex guard(mutex_);
   GraphObject* c = find_locked(client);
   if (!c || c->type != ObjectType::Client) return 0;
+  uint32_t existing = 0;
+  for (const UniquePointer<GraphObject>& o : objects_.view()) existing += o->type == ObjectType::Node && o->role == NodeRole::Virtual;
+  if (existing >= kMaxVirtualSinks) return 0;
   GraphObject* node = add_media_node_locked(client, NodeRole::Virtual, props, "Audio/Sink", kDirectionInput);
   if (!node) return 0;
   const uint32_t id = node->id;
   node->format = PcmFormat{SampleFormat::F32Le, rate, channels};
   node->state = kNodeStateIdle;
+  node->virtual_output = output;
   node->props.set_uint("audio.channels", channels);
   node->props.set_uint("audio.rate", rate);
   node->props.set("audio.format", "F32LE");
@@ -545,46 +552,23 @@ void Graph::keep_node(uint32_t node_id) {
   touch_locked(*node);
 }
 
-uint32_t Graph::create_linked_stream(uint32_t client, const PcmFormat& format, const Properties& props, uint32_t direction, uint32_t peer) {
+SharedPointer<VirtualOutput> Graph::virtual_output_locked(uint32_t node_id) {
+  GraphObject* node = find_locked(node_id);
+  if (!node || node->type != ObjectType::Node || node->role != NodeRole::Virtual) return SharedPointer<VirtualOutput>();
+  return node->virtual_output;
+}
+
+bool Graph::virtual_sinks(List<uint32_t>* out) {
+  out->clear();
   kernel::ScopedMutex guard(mutex_);
-  GraphObject* c = find_locked(client);
-  GraphObject* target = find_locked(peer);
-  if (!c || c->type != ObjectType::Client || !target || target->role != NodeRole::Virtual || !format.valid()) return 0;
-  GraphObject* node = add_media_node_locked(client, NodeRole::Linked, props, direction == kDirectionOutput ? "Stream/Output/Audio" : "Stream/Input/Audio",
-                                            direction);
-  if (!node) return 0;
-  const uint32_t id = node->id;
-  node->format = format;
-  node->props.set("media.class", direction == kDirectionOutput ? "Stream/Output/Audio" : "Stream/Input/Audio");
-  node->props.set("target.object", target->props.get("node.name"));
-  node->props.set_uint("audio.channels", format.channels);
-  node->props.set_uint("audio.rate", format.rate);
-  node->props.set("audio.format", format.name());
-  const uint32_t channels = format.channels == 1 ? 1 : 2, peers = target->format.channels;
-  if (direction == kDirectionOutput) node->output_ports = channels;
-  else node->input_ports = channels;
-  bool ok = true;
-  for (uint32_t i = 0; i < channels && ok; ++i) {
-    const char* side = channels == 1 ? "MONO" : (i == 0 ? "FL" : "FR");
-    String name(allocator_);
-    name.append(direction == kDirectionOutput ? "output_" : "input_");
-    name.append(side);
-    uint32_t port = 0;
-    ok = add_port_locked(client, id, i, direction, name.view(), "32 bit float mono audio", &port);
-    // to the peer's matching side (mono to each side)
-    for (uint32_t s = 0; s < peers && ok; ++s) {
-      if (channels == 2 && peers == 2 && s != i) continue;
-      const uint32_t peer_port = port_of_locked(peer, direction == kDirectionOutput ? kDirectionInput : kDirectionOutput, s);
-      if (!peer_port) continue;
-      ok = direction == kDirectionOutput ? add_link_locked(client, id, port, peer, peer_port) : add_link_locked(client, peer, peer_port, id, port);
-    }
-  }
-  if (!ok) {
-    List<SharedPointer<PlaybackStream>> none(allocator_);
-    remove_node_locked(id, &none, false);
-    return 0;
-  }
-  return id;
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node && o->role == NodeRole::Virtual && !out->push_back(o->id)) return false;
+  return true;
+}
+
+bool Graph::is_virtual_sink(uint32_t node) {
+  kernel::ScopedMutex guard(mutex_);
+  return virtual_output_locked(node).get() != nullptr;
 }
 
 uint32_t Graph::find_node(StringView target) {
@@ -711,16 +695,24 @@ void Graph::name_stream_node_locked(GraphObject& node, uint32_t client, const Pc
   }
 }
 
-uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props) {
+uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, uint32_t target) {
+  GraphObject* sink = target ? find_locked(target) : nullptr;
+  if (target && (!sink || sink->role != NodeRole::Virtual)) return 0;
+  StringView sink_name = sink ? sink->props.get("node.name") : StringView(kSinkName);
+  String target_name(allocator_);
+  target_name.append(sink_name);
+  SharedPointer<VirtualOutput> keep = sink ? sink->virtual_output : SharedPointer<VirtualOutput>();
   GraphObject* node = add_locked(ObjectType::Node, client);
   if (!node) return 0;
   node->role = NodeRole::Playback;
   node->origin = origin;
   node->format = format;
   node->state = kNodeStateIdle;      // (refresh() tells it running once something is queued)
+  node->target = target;
+  node->virtual_output = keep;
   node->props.update(props, Properties::Mode::kReplace);
   node->props.set("media.class", "Stream/Output/Audio");
-  node->props.set("target.object", kSinkName);
+  node->props.set("target.object", target_name.view());
   name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
   // ports: mono, or front left and right (more channels are folded into two)
@@ -736,40 +728,48 @@ uint32_t Graph::add_stream_node_locked(uint32_t client, Origin origin, const Pcm
     // links to the sink: mono to both sides
     for (uint32_t s = 0; s < 2; ++s) {
       if (ports == 2 && s != i) continue;
+      const uint32_t to_node = target ? target : sink_;
+      const uint32_t to_port = target ? port_of_locked(target, kDirectionInput, s) : sink_ports_[s];
+      if (!to_port) continue;      // (a mono virtual sink has one side)
       GraphObject* link = add_locked(ObjectType::Link, client);
       if (!link) return node_id;
       link->output_node = node_id;
       link->output_port = port_id;
-      link->input_node = sink_;
-      link->input_port = sink_ports_[s];
+      link->input_node = to_node;
+      link->input_port = to_port;
       link->props.set_uint("link.output.node", node_id);
       link->props.set_uint("link.output.port", port_id);
-      link->props.set_uint("link.input.node", sink_);
-      link->props.set_uint("link.input.port", sink_ports_[s]);
+      link->props.set_uint("link.input.node", to_node);
+      link->props.set_uint("link.input.port", to_port);
       link->props.set("factory.name", "link-factory");
     }
   }
   return node_id;
 }
 
-uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out) {
+uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out, uint32_t target) {
   *out = SharedPointer<PlaybackStream>();
-  if (!mixer_ || !format.valid()) return 0;
+  if (!format.valid()) return 0;
+  SharedPointer<VirtualOutput> into;      // (a virtual sink's mixer, else the speakers')
   {
     kernel::ScopedMutex guard(mutex_);
     GraphObject* c = find_locked(client);
     if (!c || c->type != ObjectType::Client) return 0;
+    if (target && !(into = virtual_output_locked(target))) return 0;
   }
+  audio::AudioMixer* mixer = into ? &into->mixer() : mixer_;
+  if (!mixer) return 0;
   audio::StreamFormat sf;
   sf.sample_rate = format.rate;
   sf.channels = format.channels == 1 ? 1 : 2;
   sf.type = audio::SampleType::S16;
-  SharedPointer<audio::AudioStream> stream = mixer_->open_stream(sf, kStreamRingBytes);
+  SharedPointer<audio::AudioStream> stream = mixer->open_stream(sf, kStreamRingBytes);
   if (!stream) return 0;
   StringView label = props.get("application.name");
   if (label.empty()) label = props.get("media.name");
   stream->set_label(label);
-  SharedPointer<PlaybackStream> playback = SharedPointer<PlaybackStream>::make(allocator_, allocator_, format, stream, mixer_);
+  // (a virtual sink's stream does not ask its mixer whether it is played out: the sink may go before the stream)
+  SharedPointer<PlaybackStream> playback = SharedPointer<PlaybackStream>::make(allocator_, allocator_, format, stream, into ? nullptr : mixer_);
   if (!playback) {
     stream->close();
     return 0;
@@ -779,7 +779,7 @@ uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const 
     kernel::ScopedMutex guard(mutex_);
     Origin origin = Origin::Kernel;
     if (GraphObject* c = find_locked(client)) origin = c->origin;
-    id = add_stream_node_locked(client, origin, format, props);
+    id = add_stream_node_locked(client, origin, format, props, target);
     if (GraphObject* node = id ? find_locked(id) : nullptr) node->playback = playback;
   }
   if (!id) {
@@ -790,28 +790,35 @@ uint32_t Graph::create_playback(uint32_t client, const PcmFormat& format, const 
   return id;
 }
 
-uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor) {
+uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor, uint32_t target) {
+  GraphObject* from = target ? find_locked(target) : nullptr;
+  if (target && (!from || from->role != NodeRole::Virtual)) return 0;
+  String target_name(allocator_);
+  target_name.append(from ? from->props.get("node.name") : StringView(monitor ? kSinkName : kSourceName));
+  SharedPointer<VirtualOutput> keep = from ? from->virtual_output : SharedPointer<VirtualOutput>();
   GraphObject* node = add_locked(ObjectType::Node, client);
   if (!node) return 0;
   node->role = NodeRole::Capture;
-  node->monitor = monitor;
+  node->monitor = monitor || target;
+  node->target = target;
+  node->virtual_output = keep;
   node->origin = origin;
   node->format = format;
   node->state = kNodeStateRunning;
   node->props.update(props, Properties::Mode::kReplace);
   node->props.set("media.class", "Stream/Input/Audio");
-  node->props.set("target.object", monitor ? kSinkName : kSourceName);
+  node->props.set("target.object", target_name.view());
   if (monitor) node->props.set("stream.capture.sink", "true");
   name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
-  add_capture_ports_locked(*node, client, format, monitor);
+  add_capture_ports_locked(*node, client, format, monitor, target);
   return node_id;
 }
 
 // A node's input ports linked from the source (or the sink's monitor): mono, or front left and right (more channels are made from those two).
-void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, const PcmFormat& format, bool monitor) {
+void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, const PcmFormat& format, bool monitor, uint32_t target) {
   const uint32_t node_id = node_object.id;
-  const uint32_t from_node = monitor ? sink_ : source_;
+  const uint32_t from_node = target ? target : monitor ? sink_ : source_;
   const uint32_t* from_ports = monitor ? monitor_ports_ : source_ports_;
   const uint32_t ports = format.channels == 1 ? 1 : 2;
   node_object.input_ports = ports;
@@ -821,17 +828,19 @@ void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, 
     port->channel = ports == 1 ? kMono : (i == 0 ? kFL : kFR);
     set_port_props(*port, node_id, i, kDirectionInput, "input_", allocator_);
     const uint32_t port_id = port->id;
-    // links from the source: both sides into a mono port
+    // links from the source (or a virtual sink's monitor ports): both sides into a mono port
     for (uint32_t s = 0; s < 2; ++s) {
       if (ports == 2 && s != i) continue;
+      const uint32_t from_port = target ? port_of_locked(target, kDirectionOutput, s) : from_ports[s];
+      if (!from_port) continue;
       GraphObject* link = add_locked(ObjectType::Link, client);
       if (!link) return;
       link->output_node = from_node;
-      link->output_port = from_ports[s];
+      link->output_port = from_port;
       link->input_node = node_id;
       link->input_port = port_id;
       link->props.set_uint("link.output.node", from_node);
-      link->props.set_uint("link.output.port", from_ports[s]);
+      link->props.set_uint("link.output.port", from_port);
       link->props.set_uint("link.input.node", node_id);
       link->props.set_uint("link.input.port", port_id);
       link->props.set("factory.name", "link-factory");
@@ -839,8 +848,10 @@ void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, 
   }
 }
 
-SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor) {
-  if (monitor ? !mixer_ : (!capture_ || !source_)) return SharedPointer<RecordStream>();
+SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer) {
+  if (mixer) monitor = true;
+  else mixer = mixer_;
+  if (monitor ? !mixer : (!capture_ || !source_)) return SharedPointer<RecordStream>();
   if (!format.valid()) return SharedPointer<RecordStream>();
   audio::StreamFormat sf;
   sf.sample_rate = format.rate;
@@ -853,7 +864,7 @@ SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, b
   if (monitor) {
     // (a stream of its own that the mixer feeds what it mixes)
     capture = SharedPointer<audio::CaptureStream>::make(allocator_, allocator_, sf);
-    if (capture && (!capture->allocate(ring) || !mixer_->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
+    if (capture && (!capture->allocate(ring) || !mixer->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
   } else {
     capture = capture_->open_stream(sf, ring, true);      // (marked: refresh() must not take it for a native program's)
   }
@@ -863,21 +874,24 @@ SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, b
   return record;
 }
 
-uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor) {
+uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor,
+                              uint32_t target) {
   *out = SharedPointer<RecordStream>();
+  SharedPointer<VirtualOutput> from;
   {
     kernel::ScopedMutex guard(mutex_);
     GraphObject* c = find_locked(client);
     if (!c || c->type != ObjectType::Client) return 0;
+    if (target && !(from = virtual_output_locked(target))) return 0;
   }
-  SharedPointer<RecordStream> record = open_record_stream(format, monitor);
+  SharedPointer<RecordStream> record = open_record_stream(format, monitor, from ? &from->mixer() : nullptr);
   if (!record) return 0;
   uint32_t id = 0;
   {
     kernel::ScopedMutex guard(mutex_);
     Origin origin = Origin::Kernel;
     if (GraphObject* c = find_locked(client)) origin = c->origin;
-    id = add_record_node_locked(client, origin, format, props, monitor);
+    id = add_record_node_locked(client, origin, format, props, monitor, target);
     if (GraphObject* node = id ? find_locked(id) : nullptr) node->record = record;
   }
   if (!id) {
@@ -992,10 +1006,12 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
   if (!(volume >= 0.0f)) volume = 0.0f;
   if (volume > 1.5f) volume = 1.5f;
   bool sink = false, source = false;
+  SharedPointer<VirtualOutput> virtual_sink;
   {
     kernel::ScopedMutex guard(mutex_);
     GraphObject* node = find_locked(node_id);
     if (!node || node->type != ObjectType::Node) return false;
+    if (node->role == NodeRole::Virtual) virtual_sink = node->virtual_output;
     if ((node->role == NodeRole::Source || node->role == NodeRole::Capture) && volume > 1.0f) volume = 1.0f;      // (the hub only attenuates)
     node->volume = volume;
     node->mute = mute;
@@ -1021,6 +1037,10 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
       node->native->set_volume(to_device_volume(volume));
       node->native->set_muted(mute);
     }
+  }
+  if (virtual_sink) {      // (a virtual sink: its own mixer's master volume)
+    virtual_sink->mixer().set_master_volume(to_device_volume(volume > 1.0f ? 1.0f : volume));
+    virtual_sink->mixer().set_master_muted(mute);
   }
   if (sink && mixer_) {
     // (outside the graph's lock: the mixer takes its own)
@@ -1187,6 +1207,17 @@ void Graph::sync_source_locked(StringView device_name, uint8_t gain, bool muted)
 }
 
 void Graph::refresh() {
+  // the virtual sinks' mixers, as far as their clocks went (outside the graph's lock: the mixers take their streams')
+  {
+    SharedPointer<VirtualOutput> outputs[16];
+    uint32_t n = 0;
+    {
+      kernel::ScopedMutex guard(mutex_);
+      for (const UniquePointer<GraphObject>& o : objects_.view())
+        if (o->type == ObjectType::Node && o->role == NodeRole::Virtual && o->virtual_output && n < 16) outputs[n++] = o->virtual_output;
+    }
+    for (uint32_t i = 0; i < n; ++i) outputs[i]->pump();
+  }
   if (capture_ && source_) {
     const FixedString<64> name = capture_->source_name();
     const uint8_t gain = capture_->master_gain();

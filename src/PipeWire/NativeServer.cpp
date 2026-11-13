@@ -143,7 +143,10 @@ void build_format_param(pod::Builder& b, uint32_t param_id, const PcmFormat& for
 
 NativeServer::NativeServer(Graph& graph, allocators::IAllocator& allocator, uint64_t (*clock)())
     : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator), clock_(clock), virtuals_(allocator) {
-  if (clock) graph_.midi_bus().set_clock(clock);
+  if (clock) {
+    graph_.midi_bus().set_clock(clock);
+    graph_.set_clock(clock);      // (virtual sinks play on it)
+  }
 }
 
 NativeServer::~NativeServer() {

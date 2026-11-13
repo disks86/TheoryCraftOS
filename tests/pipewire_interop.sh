@@ -17,7 +17,7 @@ sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
 sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
-         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Kernel/Sync.cpp
+         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
 g++ -fsanitize=address,undefined -pthread "$work"/obj/*.o -o "$work/pwhost"
@@ -171,6 +171,27 @@ for start in range(0, max(0, n - 4800), 2400):
         s0 = d[i * ch] + c * s1 - s2; s2 = s1; s1 = s0
     best = max(best, math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
 print('   pw-record from cli-null: 500 Hz %.0f' % best)
+assert 7000 < best < 9000
+PY"
+  # the same sink through PulseAudio: listed with its monitor, played into with paplay --device, recorded with parecord from its monitor, its volume set
+  check "pactl list sinks shows the null sink" "pactl list short sinks | grep -q 'cli-null'"
+  check "pactl list sources shows its monitor" "pactl list short sources | grep -q 'cli-null.monitor'"
+  check "pactl set-sink-volume on the null sink" "pactl set-sink-volume cli-null 50% && pactl get-sink-volume cli-null | grep -q '50%' && pactl set-sink-volume cli-null 100%"
+  rm -f "$work/pa-from-null.raw"
+  (timeout -s INT 3 parecord --raw --device=cli-null.monitor --format=s16le --rate=48000 --channels=2 "$work/pa-from-null.raw" 2> "$work/parecord-null.log" || true) & recorder=$!
+  sleep 0.3
+  check "paplay into the null sink" "timeout 10 paplay --device=cli-null '$work/tone500.wav' 2> '$work/paplay-null.log'"
+  wait $recorder || true
+  check "parecord from the null sink's monitor heard paplay" "python3 - '$work/pa-from-null.raw' <<'PY'
+import math, struct, sys
+b = open(sys.argv[1], 'rb').read(); n = len(b) // 4
+d = struct.unpack('<%dh' % (2 * n), b[:4 * n]); best = 0
+for start in range(0, max(0, n - 4800), 2400):
+    s1 = s2 = 0.0; c = 2 * math.cos(2 * math.pi * 500 / 48000)
+    for i in range(start, start + 4800):
+        s0 = d[i * 2] + c * s1 - s2; s2 = s1; s1 = s0
+    best = max(best, math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
+print('   parecord from cli-null.monitor: 500 Hz %.0f' % best)
 assert 7000 < best < 9000
 PY"
 fi

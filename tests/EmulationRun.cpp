@@ -489,6 +489,15 @@ int main(int argc, char** argv) {
   pipewire::Graph graph(a, &mixer, &capture_hub);
   graph.initialize();
   pipewire::NativeServer pw_native(graph, a, [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); });
+  // TCOS_EMU_NULL_SINK: a virtual sink ("emu-null", "Emulated null sink") the program can find, play into and record (as pw-cli create-node adapter
+  // would make one)
+  if (getenv("TCOS_EMU_NULL_SINK")) {
+    pipewire::Properties null_props(a);
+    null_props.set("node.name", "emu-null");
+    null_props.set("node.description", "Emulated null sink");
+    null_props.set("factory.name", "support.null-audio-sink");
+    if (!graph.create_virtual_node(graph.native_client_id(), null_props, 2, 48000)) fprintf(stderr, "emurun: no virtual sink could be made\n");
+  }
   // what programs play on MIDI (the graph's bus): counted for the summary
   struct CountingSynth final : midi::IMidiSink {
     std::mutex m;

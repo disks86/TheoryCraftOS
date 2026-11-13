@@ -46,6 +46,7 @@
 #include "PipeWire/Properties.hpp"
 #include "PipeWire/RecordStream.hpp"
 #include "PipeWire/VideoChannel.hpp"
+#include "PipeWire/VirtualSink.hpp"
 #include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -91,6 +92,8 @@ struct GraphObject {
   bool monitor = false;                              // a record node of the sink's monitor (what plays), not of the source
   SharedPointer<VideoChannel> video;                 // a video node: what its producer shows (a watcher's is its producer's)
   SharedPointer<MidiQueue> midi_in;                  // a MIDI node that listens: what it hears
+  SharedPointer<VirtualOutput> virtual_output;       // a virtual sink: its mixer (and a stream into or out of one: that sink's, kept while the stream is)
+  uint32_t target = 0;                               // a stream into or out of a virtual sink: the sink's node (0: the speakers or the microphone)
   uint32_t direction_of_node = kDirectionOutput;     // a MIDI, video or linked node: which way it goes (output: it plays or shows)
   // a port
   uint32_t node = 0, direction = 0, channel = 0;     // channel: an SPA position
@@ -139,11 +142,14 @@ class Graph {
   // ---- streams
   // A playback stream of `client` in `format`, its node and ports linked to the sink. 0 when there is no mixer, the format is not valid or the mixer is
   // full. *out is the stream the client writes to.
-  uint32_t create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out);
+  // `target`: a virtual sink's node to play into instead of the speakers (0: the speakers).
+  uint32_t create_playback(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<PlaybackStream>* out, uint32_t target = 0);
   // A record stream of `client` in `format`, its node and ports linked from the source (or, with `monitor`, from the sink's monitor ports: what the
   // mixer plays, before the master volume). 0 when there is no capture hub (no mixer for a monitor), the format is not valid or the hub (the mixer's
   // taps) is full. *out is the stream the client reads from.
-  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false);
+  // `target`: a virtual sink's node to record (its monitor: what plays into it) instead of the microphone.
+  uint32_t create_record(uint32_t client, const PcmFormat& format, const Properties& props, SharedPointer<RecordStream>* out, bool monitor = false,
+                         uint32_t target = 0);
   // A filter (a pw_filter with float ports both ways: an effect): one node that plays `out_format` to the sink (its output ports) and records
   // `in_format` from the source (its input ports linked from it); either may have 0 channels. Its media class is kept.
   uint32_t create_filter(uint32_t client, const PcmFormat& out_format, const PcmFormat& in_format, const Properties& props,
@@ -187,10 +193,14 @@ class Graph {
 
   // ---- the adapter factory's virtual sinks and sources (support.null-audio-sink): a node with `channels` input ports and as many monitor (output)
   // ports. A `linger`ing one stays when its client goes (it is the kernel's then).
+  static constexpr uint32_t kMaxVirtualSinks = 16;
   uint32_t create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate);
+  // The clock virtual sinks play on (nanoseconds, monotonic); without one, no virtual sink can be made.
+  void set_clock(uint64_t (*now_ns)()) { clock_.set(now_ns); }
+  // The virtual sinks there are now, oldest first; and whether a node is one.
+  bool virtual_sinks(List<uint32_t>* out);
+  bool is_virtual_sink(uint32_t node);
   void keep_node(uint32_t node);
-  // A program's audio stream that plays into (`direction` output) or records from a Virtual node, linked to its ports.
-  uint32_t create_linked_stream(uint32_t client, const PcmFormat& format, const Properties& props, uint32_t direction, uint32_t peer);
   // The node `target` names (target.object, node.target: a node.name, an object.serial or an id); 0 if none.
   uint32_t find_node(StringView target);
 
@@ -228,13 +238,14 @@ class Graph {
   void remove_locked(uint32_t id);
   void remove_node_locked(uint32_t node, List<SharedPointer<PlaybackStream>>* stopped, bool drain);
   bool add_source_locked();
-  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor);
-  void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor);
-  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor);
+  uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor, uint32_t target = 0);
+  void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor, uint32_t target = 0);
+  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer = nullptr);
+  SharedPointer<VirtualOutput> virtual_output_locked(uint32_t node);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
   void sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live);
-  uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props);
+  uint32_t add_stream_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, uint32_t target = 0);
   void set_default_metadata_locked();
   void sync_sink_locked(const char* device_name, uint8_t master, bool muted);
   bool add_midi_bridge_locked();
@@ -245,6 +256,7 @@ class Graph {
 
   allocators::IAllocator& allocator_;
   audio::AudioMixer* mixer_;
+  FunctionClock clock_;
   audio::AudioCaptureHub* capture_;
   kernel::Mutex mutex_;
   List<UniquePointer<GraphObject>> objects_;      // in id order

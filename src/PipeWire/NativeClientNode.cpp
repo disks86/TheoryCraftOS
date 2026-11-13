@@ -477,16 +477,13 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
       // both ways (an effect): one node that records from the microphone and plays to the speakers
       n.node = graph_.create_filter(c.graph_client, PcmFormat{SampleFormat::F32Le, 48000, n.out_channels}, PcmFormat{SampleFormat::F32Le, 48000, n.in_channels},
                                     props, &n.playback, &n.record);
-    } else if (VirtualSink* v = named ? virtual_sink(named) : nullptr) {
-      n.format = PcmFormat{SampleFormat::F32Le, v->rate, v->channels};
-      n.virtual_sink = v->node;
-      advance_virtual(*v, now_ns());
-      n.virtual_cursor = v->now;
-      n.node = graph_.create_linked_stream(c.graph_client, n.format, props, n.direction, v->node);
-    } else if (n.direction == kDirectionOutput) {
-      n.node = graph_.create_playback(c.graph_client, n.format, props, &n.playback);
     } else {
-      n.node = graph_.create_record(c.graph_client, n.format, props, &n.record, props.get("stream.capture.sink") == StringView("true"));
+      // (a virtual sink: played into its mixer, or recorded from its monitor; the graph's streams convert the format)
+      n.virtual_sink = named && graph_.is_virtual_sink(named) ? named : 0;
+      if (n.direction == kDirectionOutput)
+        n.node = graph_.create_playback(c.graph_client, n.format, props, &n.playback, n.virtual_sink);
+      else
+        n.node = graph_.create_record(c.graph_client, n.format, props, &n.record, props.get("stream.capture.sink") == StringView("true"), n.virtual_sink);
     }
   } else if (media == Media::Midi) {
     n.node = graph_.create_midi_node(c.graph_client, props, n.direction, n.direction == kDirectionInput ? &n.midi_in : nullptr);
@@ -1367,24 +1364,9 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
     switch (p.media) {
       case Media::Audio: {
         // (one interleaved port: straight on; a filter's float ports are put together by the caller, through the scratch)
-        if (!n.raw || (n.virtual_sink && n.format.channels == 1)) {
+        if (!n.raw) {
           const uint32_t frame = n.frame();
-          if (n.virtual_sink) {
-            if (VirtualSink* v = virtual_sink(n.virtual_sink)) {
-              // mixed in at the stream's place in the sink's frames (it is kept within the ring's future half by cycle_due)
-              const ConstByteView pieces[2] = {a, b};
-              ByteView ring = v->ring.writable_view();
-              for (const ConstByteView& piece : pieces) {
-                const uint64_t frames = piece.size() / frame;
-                for (uint64_t f = 0; f < frames; ++f) {
-                  const uint64_t slot = ((n.virtual_cursor + f) % VirtualSink::kRingFrames) * frame;
-                  for (uint32_t ch = 0; ch < n.format.channels; ++ch)
-                    put_sample(ring, slot + 4ull * ch, sample_at(ring, slot + 4ull * ch) + sample_at(piece, f * frame + 4ull * ch));
-                }
-                n.virtual_cursor += frames;
-              }
-            }
-          } else if (n.playback) {
+          if (n.playback) {
             n.playback->write(a.first(a.size() - a.size() % frame));
             if (b.size()) n.playback->write(b.first(b.size() - b.size() % frame));
           }
@@ -1449,17 +1431,7 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       const uint32_t frame = n.frame();
       const uint64_t want = uint64_t{n.quantum} * frame;
       if (want > maxsize) return false;
-      if (n.virtual_sink) {
-        VirtualSink* v = virtual_sink(n.virtual_sink);
-        if (!v) return false;
-        ConstByteView ring = v->ring.view();
-        for (uint64_t f = 0; f < n.quantum; ++f) {
-          const uint64_t slot = ((n.virtual_cursor + f) % VirtualSink::kRingFrames) * frame;
-          data.subview(f * frame, frame).copy_from(ring.subview(slot, frame));
-        }
-        n.virtual_cursor += n.quantum;
-        got = static_cast<uint32_t>(want);
-      } else if (n.record) {
+      if (n.record) {
         got = n.record->read(data.first(want));
       }
       stride = static_cast<int32_t>(frame);
@@ -1568,21 +1540,10 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
 
 // ---- the cycle -----------------------------------------------------------------------------------------------------------------------------------
 
-// Whether a server-driven node's next cycle is due: playback to the speakers while the graph holds little, recording once a quantum is there, a virtual
-// sink's streams as its clock goes, MIDI and video on the server's clock (a watcher when there is a new frame).
+// Whether a server-driven node's next cycle is due: playback (to the speakers or a virtual sink's mixer) while the graph holds little, recording once a
+// quantum is there, MIDI and video on the server's clock (a watcher when there is a new frame).
 bool NativeServer::cycle_due(ClientNode& n, uint64_t now) {
   if (n.media == Media::Audio) {
-    if (n.virtual_sink) {
-      VirtualSink* v = virtual_sink(n.virtual_sink);
-      if (!v) return false;
-      advance_virtual(*v, now);
-      if (n.direction == kDirectionOutput) {
-        if (n.virtual_cursor < v->now) n.virtual_cursor = v->now;      // (it fell behind: it plays from now)
-        return n.virtual_cursor < v->now + 2ull * n.quantum;
-      }
-      if (n.virtual_cursor + VirtualSink::kRingFrames / 2 < v->now + n.quantum) n.virtual_cursor = v->now - n.quantum;      // (too far behind)
-      return n.virtual_cursor + n.quantum <= v->now;
-    }
     if (n.playback) {
       const uint64_t ahead = 2ull * n.quantum > kAheadFrames ? 2ull * n.quantum : kAheadFrames;
       return n.playback->waiting_bytes() < ahead * n.frame();
@@ -1640,8 +1601,8 @@ void NativeServer::run_client_node(ClientNode& n, uint64_t now) {
   ByteView a = n.activation->memory();
   // a filter's float ports: what its outputs played, put together (a channel each) for the speakers; what its inputs are to hear (the microphone),
   // taken apart (a channel each)
-  const bool filter_out = n.raw && n.media == Media::Audio && n.out_channels > 0 && !n.virtual_sink;
-  const bool filter_in = n.raw && n.media == Media::Audio && n.in_channels > 0 && !n.virtual_sink;
+  const bool filter_out = n.raw && n.media == Media::Audio && n.out_channels > 0;
+  const bool filter_in = n.raw && n.media == Media::Audio && n.in_channels > 0;
   auto play_ports = [&]() {
     if (!filter_out) return;
     ClientPort* sides[kMaxPorts] = {};
@@ -1737,21 +1698,6 @@ NativeServer::VirtualSink* NativeServer::virtual_sink(uint32_t node) {
   return nullptr;
 }
 
-// The sink's clock to `now_ns`: the frames that fall out of the past half of the ring are cleared for the future half (what streams mix into next).
-void NativeServer::advance_virtual(VirtualSink& v, uint64_t now) {
-  if (now < v.start_ns) return;
-  const uint64_t frames = (now - v.start_ns) / 1000 * v.rate / 1000000;
-  if (frames <= v.now) return;
-  v.now = frames;
-  const uint64_t frame = 4ull * v.channels;
-  const uint64_t until = v.now + VirtualSink::kRingFrames / 2;
-  uint64_t from = v.cleared;
-  if (until - from > VirtualSink::kRingFrames) from = until - VirtualSink::kRingFrames;
-  ByteView ring = v.ring.writable_view();
-  for (uint64_t f = from; f < until; ++f) ring.subview((f % VirtualSink::kRingFrames) * frame, frame).fill(0);
-  v.cleared = until;
-}
-
 void NativeServer::create_adapter(Client& c, uint32_t new_id, uint32_t version, const Properties& props) {
   auto refuse = [&](int32_t res, const char* why) {
     send_error(c, new_id, c.message_seq, -res, why);
@@ -1770,20 +1716,16 @@ void NativeServer::create_adapter(Client& c, uint32_t new_id, uint32_t version, 
   if (channels > kMaxChannels) channels = kMaxChannels;      // (wider ones are made stereo)
   uint32_t rate = parse_uint(props.get("audio.rate"), 48000);
   if (rate < kMinRate || rate > kMaxRate) rate = 48000;
-  UniquePointer<VirtualSink> v = UniquePointer<VirtualSink>::make(allocator_, allocator_);
-  if (!v || !v->ring.put_zeros(uint64_t{VirtualSink::kRingFrames} * 4 * channels)) return refuse(kENOMEM, "out of memory");
+  UniquePointer<VirtualSink> v = UniquePointer<VirtualSink>::make(allocator_);
+  if (!v) return refuse(kENOMEM, "out of memory");
   Properties node_props(allocator_);
   node_props.copy_from(props);
   if (!node_props.has("node.name")) node_props.set("node.name", "null-sink");
   const uint32_t node = graph_.create_virtual_node(c.graph_client, node_props, channels, rate);
-  if (!node) return refuse(kENOMEM, "the graph is full");
+  if (!node) return refuse(kENOMEM, "no virtual sink could be made (too many, out of memory, or the graph has no clock)");
   v->node = node;
   v->owner = c.handle;
   v->resource = new_id;
-  v->rate = rate;
-  v->channels = channels;
-  v->start_ns = now_ns();
-  v->cleared = VirtualSink::kRingFrames / 2;
   v->linger = props.get("object.linger") == StringView("true") || props.get("object.linger") == StringView("1");
   Resource r{new_id, ObjectType::Node, false, node, version ? version : 3, 0, {}};
   if (!add_resource(c, r) || !virtuals_.push_back(util::move(v))) {
