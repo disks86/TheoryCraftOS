@@ -35,7 +35,10 @@
 // sink_name, sink_properties, rate, channels and channel_map, as pipewire-pulse does; it stays until UNLOAD_MODULE, whoever loaded it), listed with
 // GET_MODULE_INFO(_LIST); and module-loopback (a source or a sink's monitor into a sink, latency_msec), module-remap-sink (a sink looped into its
 // master, left and right swapped when the channel maps say so) and module-combine-sink (a sink looped into each of its slaves), built on
-// Loopback.hpp and pumped from tick(); other modules are refused. Not served (an error answer): upload streams, samples, cards, extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
+// Loopback.hpp and pumped from tick(); module-virtual-sink (a remap sink in the same order), module-remap-source and module-virtual-source (a virtual
+// source hearing its master; virtual-source's uplink_sink a sink it hears too), module-echo-cancel (EchoCancelLoop: a sink into its master and a source
+// with that sink's audio cancelled out of the microphone), and module-always-sink and module-switch-on-connect (loaded once, nothing to do: the one sink
+// is always there and follows plugged-in devices); other modules are refused. Not served (an error answer): upload streams, samples, cards, extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
 // records what the mixer plays (OBS, "record what you hear").
 #pragma once
 #include <stdint.h>
@@ -142,12 +145,16 @@ class PulseServer final : public IProtocolServer {
   bool is_sink_name(StringView name) const;
   bool is_source_name(StringView name) const;
   // The source a request names (by name unless `null_name`, else by index): true if there is one, *monitor for the sink's monitor.
-  // `*of_sink`: (a monitor) the sink it is the monitor of (the speakers' or a virtual sink's node)
+  // `*of_sink`: (a monitor) the sink it is the monitor of (the speakers' or a virtual sink's node). A virtual source is recorded as a virtual
+  // sink's monitor is: *monitor set, *of_sink its node (Graph::is_virtual_source tells them apart).
   bool find_source(uint32_t index, StringView name, bool null_name, bool* monitor, uint32_t* of_sink = nullptr) const;
   // The sink an index or a name says: the speakers' node, or a virtual sink's (the adapter factory's null sinks, named by their node.name); 0 for none.
   uint32_t find_sink(uint32_t index, StringView name, bool null_name) const;
-  // A virtual sink of this node.name (0: none).
+  // A virtual sink (source) of this node.name (0: none).
   uint32_t virtual_sink_named(StringView name) const;
+  uint32_t virtual_source_named(StringView name) const;
+  // The index a source has to clients: a virtual source's node, a monitor's sink with kMonitorFlag, else the microphone's node.
+  uint32_t index_of_source(bool monitor, uint32_t of_sink) const;
   void send_subscription_events(Client& c);
 
   Graph& graph_;
@@ -171,11 +178,17 @@ class PulseServer final : public IProtocolServer {
   struct Module {
     explicit Module(allocators::IAllocator& a) : name(a), arguments(a), loops(a) {}
     uint32_t index = 0;
-    uint32_t node = 0;      // (module-null-sink, -remap-sink, -combine-sink: its sink; module-loopback: none)
+    // (module-null-sink, -remap-sink, -virtual-sink, -combine-sink: its sink; -remap-source, -virtual-source: its source; -echo-cancel: its
+    // source; module-loopback and the policy ones: none)
+    uint32_t node = 0;
+    uint32_t extra = 0;      // (module-echo-cancel: its sink; -virtual-source with uplink_sink: that sink)
     String name, arguments;
-    List<UniquePointer<Loopback>> loops;      // (module-loopback: one; -remap-sink: into its master; -combine-sink: one a slave)
+    List<UniquePointer<Loopback>> loops;      // (module-loopback: one; -remap-sink: into its master; -combine-sink: one a slave; -*-source: from its master)
+    UniquePointer<EchoCancelLoop> echo;       // (module-echo-cancel)
   };
-  uint32_t module_sink(const Properties& args, const char* default_name, StringView description, uint32_t* error);
+  // A virtual sink (`source`: source) of a module's arguments, the kernel's.
+  uint32_t module_node(const Properties& args, bool source, const char* default_name, uint32_t* error);
+  void destroy_module_nodes(Module& m);
   void prune_modules();      // (forgets the ones whose sink went another way: pw-cli destroy, ...)
   void fill_module(pulse::TagWriter& w, uint32_t version, const Module& m);
   List<UniquePointer<Module>> modules_;

@@ -2564,6 +2564,339 @@ static void test_loopback_modules() {
   CHECK(loop_nodes == 0);
 }
 
+// Virtual sources and the modules that make them: module-remap-source (the microphone, its sides swapped), module-virtual-source (with an
+// uplink_sink whose audio the source hears too), module-echo-cancel (what the speakers play taken out of what the microphone hears), and the policy
+// modules pipewire-pulse loads once (module-always-sink, module-switch-on-connect). Recorded through the graph, listed through the PulseAudio protocol.
+static void test_source_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  uint32_t error = 0;
+  auto load = [&](const char* args, const char* module) { return server.load_module(StringView(module), StringView(args), &error); };
+  const uint32_t client = g.add_client(Origin::Linux, 90, "protocol-pulse", "pipewire-pulse");
+  // records `node` (a virtual source) in 16-bit stereo for `ms`, the microphone saying (left, right) all along; returns the last half's mean per side
+  auto record_mean = [&](uint32_t node, int16_t left, int16_t right, uint32_t ms, double* l, double* r) {
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, node);
+    if (!rn || !rec) return false;
+    std::vector<int16_t> heard;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (uint32_t t = 0; t < ms; t += 5) {
+      mic.add(240, left, right);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    g.destroy_node(rn);
+    const size_t frames = heard.size() / 2;
+    if (frames < 1000) return false;
+    double sl = 0, sr = 0;
+    for (size_t i = frames / 2; i < frames; ++i) {
+      sl += heard[2 * i];
+      sr += heard[2 * i + 1];
+    }
+    *l = sl / double(frames - frames / 2);
+    *r = sr / double(frames - frames / 2);
+    return true;
+  };
+
+  // ---- module-remap-source: the microphone with its sides swapped
+  const uint32_t remap = load("source_name=swapped master=tcos_input.stereo channel_map=front-right,front-left", "module-remap-source");
+  CHECK(remap != 0 && error == 0);
+  List<uint32_t> sources(A), sinks(A);
+  CHECK(g.virtual_sources(&sources) && sources.count() == 1 && g.virtual_sinks(&sinks) && sinks.count() == 0);
+  const uint32_t swapped = sources.count() ? sources[0] : 0;
+  bool shape_ok = false;
+  g.visit(swapped, [&](const GraphObject& o) {
+    shape_ok = o.role == NodeRole::Virtual && o.virtual_source && o.props.get("media.class") == StringView("Audio/Source/Virtual") &&
+               o.props.get("node.description") == StringView("swapped Audio/Source source");
+  });
+  CHECK(shape_ok && g.is_virtual_source(swapped) && !g.is_virtual_sink(swapped) && g.is_virtual(swapped) && server.module_of(swapped) == remap);
+  uint32_t capture_ports = 0, input_ports = 0;
+  g.for_each([&](const GraphObject& o) {
+    if (o.type == ObjectType::Port && o.node == swapped) {
+      capture_ports += o.props.get("port.name").find("capture_") == 0;
+      input_ports += o.props.get("port.name").find("input_") == 0;
+    }
+  });
+  CHECK(capture_ports == 2 && input_ports == 2);      // (null-audio-sink's port names for a source)
+  double l = 0, r = 0;
+  CHECK(record_mean(swapped, 8000, 0, 1000, &l, &r));
+  if (!(r > 6000 && l < 300 && l > -300)) printf("remap-source: left %.0f right %.0f\n", l, r);
+  CHECK(r > 6000 && l < 300 && l > -300);
+  // the source's volume scales what records it (half the cubic PulseAudio volume: an eighth)
+  CHECK(g.set_volume(swapped, 0.125f, false));
+  CHECK(record_mean(swapped, 8000, 0, 1000, &l, &r));
+  CHECK(r > 500 && r < 1500);
+  CHECK(g.set_volume(swapped, 1.0f, true) && record_mean(swapped, 8000, 0, 600, &l, &r) && r == 0 && l == 0);      // (muted)
+  CHECK(g.set_volume(swapped, 1.0f, false));
+  // refused: a master that is not there, an argument the module does not take
+  CHECK(!load("source_name=x master=nowhere", "module-remap-source") && error == 5);
+  CHECK(!load("source_name=x latency_msec=5", "module-remap-source") && error == 3);
+
+  // ---- through the PulseAudio protocol: listed as a source of its own, looked up, its volume set, recorded
+  {
+    PulseClient c(server);
+    uint8_t cookie[256] = {};
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99;
+    uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(9, [](pulse::TagWriter& w) { Properties p(A); p.set("application.name", "pactl"); w.proplist(p); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(23, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); });      // GET_SOURCE_INFO
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t idx = 0, module = 0, monitor_of = 0; StringView name, desc, monitor_name; pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute = true;
+      bool null_monitor = false;
+      CHECK(rd.u32(&idx) && rd.string(&name) && rd.string(&desc) && rd.sample_spec(&ss) && rd.channel_map(&map) && rd.u32(&module) && rd.cvolume(&vol) &&
+            rd.boolean(&mute) && rd.u32(&monitor_of) && rd.string(&monitor_name, &null_monitor));
+      CHECK(idx == swapped && name == StringView("swapped") && desc == StringView("swapped Audio/Source source") && module == remap && !mute &&
+            monitor_of == 0xFFFFFFFFu && null_monitor);
+    }
+    // by its index too; LOOKUP_SOURCE gives the node itself (no monitor flag)
+    t = c.command(23, [&](pulse::TagWriter& w) { w.u32(swapped); w.string_null(); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(11, [](pulse::TagWriter& w) { w.string("swapped"); });      // LOOKUP_SOURCE
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t idx = 0;
+      CHECK(rd.u32(&idx) && idx == swapped);
+    }
+    // the source list: the microphone, the speakers' monitor, the virtual source
+    t = c.command(24, [](pulse::TagWriter&) {});
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      std::string text(body.begin(), body.end());
+      CHECK(text.find("tcos_input.stereo") != std::string::npos && text.find("tcos_output.stereo.monitor") != std::string::npos &&
+            text.find("swapped") != std::string::npos && text.find("swapped.monitor") == std::string::npos);
+    }
+    // SET_SOURCE_VOLUME by name: the node's volume (and so what records it)
+    t = c.command(38, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); pulse::Cvolume v; v.channels = 2; v.values[0] = v.values[1] = 0x8000; w.cvolume(v); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    float vol = 0; bool mute = true;
+    CHECK(g.get_volume(swapped, &vol, &mute) && vol > 0.1f && vol < 0.15f && !mute);
+    CHECK(g.set_volume(swapped, 1.0f, false));
+    // a sink lookup does not find it (it is not a sink)
+    t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    // a record stream on it names it as it is
+    t = c.command(5, [&](pulse::TagWriter& w) {
+      pulse::SampleSpec ss{pulse::kS16Le, 2, 48000};
+      w.sample_spec(ss);
+      pulse::ChannelMap map; map.channels = 2; map.positions[0] = 1; map.positions[1] = 2;
+      w.channel_map(map);
+      w.u32(0xFFFFFFFFu); w.string("swapped");      // source
+      w.u32(0xFFFFFFFFu); w.boolean(false);         // maxlength, corked
+      w.u32(0xFFFFFFFFu);                           // fragsize
+      for (int i = 0; i < 7; ++i) w.boolean(false);
+      w.boolean(false); w.boolean(false);
+      Properties p(A); p.set("media.name", "rec"); w.proplist(p);
+      w.u32(0xFFFFFFFFu);                           // direct on input
+      w.boolean(false); w.boolean(false);           // early requests, dont inhibit
+      w.boolean(false);                             // fail on suspend
+      w.u8(0);                                      // formats
+      pulse::Cvolume v; v.channels = 2; v.values[0] = v.values[1] = 0x10000; w.cvolume(v);
+      w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t channel = 0, node = 0, maxlength = 0, fragsize = 0, source_idx = 0; pulse::SampleSpec ss; pulse::ChannelMap map; StringView source_name;
+      CHECK(rd.u32(&channel) && rd.u32(&node) && rd.u32(&maxlength) && rd.u32(&fragsize) && rd.sample_spec(&ss) && rd.channel_map(&map) &&
+            rd.u32(&source_idx) && rd.string(&source_name));
+      CHECK(source_idx == swapped && source_name == StringView("swapped"));
+      bool records_source = false;
+      g.visit(node, [&](const GraphObject& o) { records_source = o.role == NodeRole::Capture && o.virtual_source && o.target == swapped && !o.props.has("stream.capture.sink"); });
+      CHECK(records_source);
+    }
+    server.close_client(c.handle);
+  }
+  CHECK(server.unload_module(remap) && !g.is_virtual(swapped));
+  uint32_t left_over = 0;
+  g.for_each([&](const GraphObject& o) { left_over += o.type == ObjectType::Node && o.props.get("node.name") == StringView("remap-source"); });
+  CHECK(left_over == 0);
+
+  // ---- module-virtual-source with an uplink sink: the microphone and what plays into the uplink both heard
+  const uint32_t vs = load("source_name=vsrc uplink_sink=up", "module-virtual-source");
+  CHECK(vs != 0);
+  const uint32_t vsrc = g.find_node("vsrc"), up = g.find_node("up");
+  CHECK(g.is_virtual_source(vsrc) && g.is_virtual_sink(up) && server.module_of(up) == vs && server.module_of(vsrc) == vs);
+  {
+    uint32_t out = 0, taken = 0;
+    CHECK(service.open(41, PcmFormat{SampleFormat::S16Le, 48000, 2}, "uplink.exe", &out, up) == 0);
+    std::vector<uint8_t> pcm(48000 * 4 * 2);
+    for (uint32_t i = 0; i < 96000; ++i) {
+      const int16_t v = 3000;
+      pcm[4 * i] = uint8_t(v); pcm[4 * i + 1] = uint8_t(uint16_t(v) >> 8); pcm[4 * i + 2] = 0; pcm[4 * i + 3] = 0;
+    }
+    uint64_t written = 0;
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, vsrc);
+    std::vector<int16_t> heard;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int t = 0; t < 300 && rn; ++t) {
+      if (written < pcm.size() && service.write(41, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      mic.add(240, 0, 2000);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(41);
+    if (rn) g.destroy_node(rn);
+    const size_t frames = heard.size() / 2;
+    double sl = 0, sr = 0;
+    for (size_t i = frames / 2; i < frames; ++i) { sl += heard[2 * i]; sr += heard[2 * i + 1]; }
+    const double ml = frames ? sl / double(frames - frames / 2) : 0, mr = frames ? sr / double(frames - frames / 2) : 0;
+    if (!(ml > 2000 && mr > 1400)) printf("virtual-source: left %.0f (uplink 3000) right %.0f (microphone 2000), %zu frames\n", ml, mr, frames);
+    CHECK(frames > 10000 && ml > 2000 && mr > 1400);
+  }
+  CHECK(server.unload_module(vs) && !g.is_virtual(vsrc) && !g.is_virtual(up));
+  // destroying the uplink another way takes the module (and its source) with it
+  const uint32_t vs2 = load("source_name=vsrc2 uplink_sink=up2", "module-virtual-source");
+  CHECK(vs2 != 0);
+  const uint32_t vsrc2 = g.find_node("vsrc2");
+  g.destroy_node(g.find_node("up2"));
+  CHECK(server.module_of(vsrc2) == vs2 && g.is_virtual(vsrc2));      // (module_of prunes nothing: the next load or list does)
+  CHECK(load("sink_name=probe", "module-null-sink") != 0 && !g.is_virtual(vsrc2));
+  CHECK(server.module_of(vsrc2) == pulse::kInvalidIndex);
+
+  // ---- policy modules: loaded once, nothing to do here
+  const uint32_t always = load("", "module-always-sink"), soc = load("ignore_virtual=true", "module-switch-on-connect");
+  CHECK(always && soc);
+  CHECK(!load("", "module-always-sink") && error == 4);
+  CHECK(!load("sink_name=x bogus=1", "module-always-sink") && error == 3);
+  CHECK(server.unload_module(always) && load("", "module-always-sink") != 0);
+  CHECK(server.unload_module(soc));
+}
+
+// module-echo-cancel: a far end played into echo-cancel-sink reaches the speakers, and the microphone hears it back (half as loud, a little late, as
+// a room would); what the echo-cancel source gives has that echo taken out. With aec_method=null it is the microphone as it is.
+static void test_echo_cancel_module() {
+  for (int null_method = 0; null_method < 2; ++null_method) {
+    FakeDevice dev;
+    audio::AudioMixer mixer(dev, A);
+    CHECK(mixer.initialize());
+    FakeMicrophone mic;
+    audio::AudioCaptureHub hub(mic, A);
+    CHECK(hub.initialize());
+    Graph g(A, &mixer, &hub);
+    CHECK(g.initialize());
+    g.set_clock(&test_clock);
+    PulseServer server(g, A);
+    WindowsAudioService service(g, A);
+    uint32_t error = 0;
+    const uint32_t module = server.load_module(StringView("module-echo-cancel"), StringView(null_method ? "aec_method=null channels=1" : "channels=1"), &error);
+    CHECK(module != 0 && error == 0);
+    const uint32_t sink = g.find_node("echo-cancel-sink"), source = g.find_node("echo-cancel-source");
+    CHECK(g.is_virtual_sink(sink) && g.is_virtual_source(source) && server.module_of(sink) == module && server.module_of(source) == module);
+    const uint32_t client = g.add_client(Origin::Linux, 91, "protocol-pulse", "pipewire-pulse");
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 1}, Properties(A), &rec, true, source);
+    uint32_t out = 0, taken = 0;
+    CHECK(rn && service.open(42, PcmFormat{SampleFormat::S16Le, 48000, 1}, "call.exe", &out, sink) == 0);
+    // the far end: noise in syllables (a voice on the other end of the call)
+    uint32_t seed = 77;
+    float gain = 0, target = 0;
+    uint32_t left = 0;
+    std::vector<uint8_t> far;
+    for (uint32_t i = 0; i < 48000 * 8; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      if (left == 0) { left = 3000 + (seed >> 20) % 9000; target = ((seed >> 12) & 7) == 0 ? 0.0f : 0.3f + float((seed >> 8) & 255) / 400.0f; }
+      --left;
+      gain += (target - gain) * 0.002f;
+      const int16_t v = int16_t(gain * 9000.0f * (float(seed >> 16) / 32768.0f - 1.0f));
+      far.push_back(uint8_t(v)); far.push_back(uint8_t(uint16_t(v) >> 8));
+    }
+    uint64_t written = 0;
+    std::vector<int16_t> room(48000 * 0, 0);      // (the speakers' sound on its way to the microphone)
+    room.assign(2 * 480, 0);                      // (10 ms of air and buffers before the first of it arrives)
+    double mic_energy = 0, out_energy = 0, speaker_energy = 0, talk_energy = 0, talk_out_energy = 0;
+    uint64_t mic_samples = 0, out_samples = 0, talk_at = 0;
+    std::vector<uint8_t> buf(48000 * 2);
+    const int ticks = 8000 / 5;
+    for (int t = 0; t < ticks; ++t) {
+      if (written < far.size() && service.write(42, out, ConstByteView(far.data() + written, far.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      mixer.pump();
+      dev.play_all();
+      for (int16_t s : dev.take()) room.push_back(s);
+      // the microphone hears what the speakers played, half as loud (both sides the same: the far end is mono)
+      const size_t frames = room.size() / 2;
+      // the second half measured: its first half the echo alone, its second half a near-end talker too (a 300 Hz voice: double talk)
+      const bool measure = t >= ticks / 2 && t < 3 * ticks / 4, talking = t >= 3 * ticks / 4;
+      for (size_t i = 0; i < frames; ++i) {
+        const int16_t echo = int16_t(room[2 * i] / 2);
+        const int16_t voice = talking ? int16_t(2500 * sin(2 * M_PI * 300 * double(talk_at++) / 48000)) : 0;
+        mic.add(1, int16_t(echo + voice), int16_t(echo + voice));
+        if (measure) { mic_energy += double(echo) * echo; ++mic_samples; }
+        if (measure) speaker_energy += double(room[2 * i]) * room[2 * i];
+        if (talking) talk_energy += double(voice) * voice;
+      }
+      room.erase(room.begin(), room.begin() + 2 * frames);
+      hub.pump();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      // (what comes out lags what went in by a block or two: the windows are a little behind, which the energies hardly notice)
+      if (t >= ticks / 2 + 4 && t < 3 * ticks / 4 + 4) {
+        out_samples += got / 2;
+        for (uint32_t k = 0; k + 1 < got; k += 2) { const double v = int16_t(buf[k] | buf[k + 1] << 8); out_energy += v * v; }
+      } else if (t >= 3 * ticks / 4 + 4) {
+        for (uint32_t k = 0; k + 1 < got; k += 2) { const double v = int16_t(buf[k] | buf[k + 1] << 8); talk_out_energy += v * v; }
+      }
+    }
+    const double erle = 10.0 * std::log10(mic_energy / (out_energy > 1 ? out_energy : 1));
+    printf("echo-cancel (%s): speakers %.3g, microphone %.3g (%llu samples), source %.3g (%llu): %.1f dB taken out\n", null_method ? "null" : "nlms",
+           speaker_energy, mic_energy, (unsigned long long)mic_samples, out_energy, (unsigned long long)out_samples, erle);
+    printf("   with a near-end talker: voice %.3g, source %.3g\n", talk_energy, talk_out_energy);
+    CHECK(speaker_energy > 1e9);      // (the far end reached the speakers)
+    if (null_method) {
+      CHECK(erle > -1.0 && erle < 1.0);
+    } else {
+      CHECK(erle > 10.0);
+      CHECK(out_samples > mic_samples * 9 / 10);      // (the source carried audio all along, not silence)
+      // the talker comes through whole while the far end goes on: about the voice's energy, not much of the echo's on top
+      CHECK(talk_out_energy > 0.6 * talk_energy && talk_out_energy < 0.6 * talk_energy + 0.5 * mic_energy + 0.4 * talk_energy);
+    }
+    service.process_exited(42);
+    g.destroy_node(rn);
+    CHECK(server.unload_module(module) && !g.is_virtual(sink) && !g.is_virtual(source));
+  }
+  // refused: a method there is not, a master that is not there
+  {
+    FakeDevice dev;
+    audio::AudioMixer mixer(dev, A);
+    CHECK(mixer.initialize());
+    Graph g(A, &mixer);
+    CHECK(g.initialize());
+    g.set_clock(&test_clock);
+    PulseServer server(g, A);
+    uint32_t error = 0;
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("aec_method=speex"), &error) && error == 19);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("sink_master=nowhere"), &error) && error == 5);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("source_master=nowhere"), &error) && error == 5);
+    List<uint32_t> virtuals(A);
+    CHECK(g.virtual_sinks(&virtuals) && virtuals.count() == 0 && g.virtual_sources(&virtuals) && virtuals.count() == 0);      // (nothing left made)
+    // without a microphone the default source is the speakers' monitor: allowed
+    const uint32_t m = server.load_module(StringView("module-echo-cancel"), StringView(""), &error);
+    CHECK(m != 0);
+  }
+}
+
 // A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
 // alike), a 16 kHz sink's carries a 1 kHz tone whole and loses a 20 kHz one (above what 16 kHz can hold), and a 48 kHz stereo one changes nothing.
 static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate) {
@@ -6113,41 +6446,52 @@ static void test_socket_fds_in() {
   CHECK(A.live.load() <= live_before + 4);
 }
 
+// PIPEWIRE_TEST_ONLY=test_a,test_b runs only those (a quicker loop while working on one part); unset, all of them.
+static bool wanted(const char* name) {
+  const char* only = getenv("PIPEWIRE_TEST_ONLY");
+  if (!only || !*only) return true;
+  const std::string list = std::string(",") + only + ",";
+  return list.find(std::string(",") + name + ",") != std::string::npos;
+}
+#define RUN(test) do { if (wanted(#test)) test(); } while (0)
+
 int main() {
-  test_pod();
-  test_tagstruct();
-  test_convert();
-  test_graph();
-  test_native_protocol();
-  test_pulse_protocol();
-  test_windows_service();
-  test_windows_virtual_sink();
-  test_virtual_sink_shape();
-  test_module_arguments();
-  test_pulse_modules();
-  test_loopback_modules();
-  test_camera_sources();
-  test_screen_source();
-  test_deep_conversion();
-  test_format_fixtures();
-  test_video_decode();
-  test_video_watcher();
-  test_record_convert();
-  test_record();
-  test_record_threads();
-  test_monitor();
-  test_native_capture();
-  test_balance();
-  test_client_node();
-  test_sockets();
-  test_socket_client_node();
-  test_threads();
-  test_midi_bus();
-  test_midi_threads();
-  test_midi_sysex_timing();
-  test_video_channel();
-  test_client_node_media();
-  test_socket_fds_in();
+  RUN(test_pod);
+  RUN(test_tagstruct);
+  RUN(test_convert);
+  RUN(test_graph);
+  RUN(test_native_protocol);
+  RUN(test_pulse_protocol);
+  RUN(test_windows_service);
+  RUN(test_windows_virtual_sink);
+  RUN(test_virtual_sink_shape);
+  RUN(test_module_arguments);
+  RUN(test_pulse_modules);
+  RUN(test_loopback_modules);
+  RUN(test_source_modules);
+  RUN(test_echo_cancel_module);
+  RUN(test_camera_sources);
+  RUN(test_screen_source);
+  RUN(test_deep_conversion);
+  RUN(test_format_fixtures);
+  RUN(test_video_decode);
+  RUN(test_video_watcher);
+  RUN(test_record_convert);
+  RUN(test_record);
+  RUN(test_record_threads);
+  RUN(test_monitor);
+  RUN(test_native_capture);
+  RUN(test_balance);
+  RUN(test_client_node);
+  RUN(test_sockets);
+  RUN(test_socket_client_node);
+  RUN(test_threads);
+  RUN(test_midi_bus);
+  RUN(test_midi_threads);
+  RUN(test_midi_sysex_timing);
+  RUN(test_video_channel);
+  RUN(test_client_node_media);
+  RUN(test_socket_fds_in);
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());
   return g_failed ? 1 : 0;
 }

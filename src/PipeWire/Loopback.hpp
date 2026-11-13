@@ -20,10 +20,12 @@
 // or a sink's monitor: what plays into the speakers or a virtual sink) and a playback stream into a sink (the speakers or a virtual sink), with what
 // was recorded moved across each time it is pumped, about `latency` of it kept queued in the playback. The modules built on it (PulseServer):
 // module-loopback itself, module-remap-sink (a virtual sink looped into its master, its channels swapped if the map says so) and module-combine-sink
-// (a virtual sink looped into each of its slaves). 16-bit stereo or mono at 48 kHz on both sides (the mixer's own). Not thread safe: pumped by its
-// owner's thread.
+// (a virtual sink looped into each of its slaves), module-remap-source and module-virtual-source (a source looped into a virtual source). 16-bit
+// stereo or mono at 48 kHz on both sides (the mixer's own). Not thread safe: pumped by its owner's thread.
+// EchoCancelLoop below is module-echo-cancel's: four streams around an EchoCanceller.
 #pragma once
 #include <stdint.h>
+#include "PipeWire/EchoCanceller.hpp"
 #include "PipeWire/Graph.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -64,6 +66,55 @@ class Loopback {
   uint64_t latency_bytes_ = 0;
   bool swap_ = false;
   uint64_t moved_ = 0;
+};
+
+// module-echo-cancel's plumbing: what plays into the echo-cancel sink goes on to its master sink (the speakers) and is the canceller's far end;
+// what the master source (the microphone) hears goes through the canceller into the echo-cancel source. The far and near ends are paired sample for
+// sample as they arrive (both run at the mixer's rate), the canceller finding the delay between them; while nothing plays into the sink (its monitor
+// delivers nothing then) the far end is silence. With `passthrough` (aec_method=null) the microphone goes through unchanged.
+class EchoCancelLoop {
+ public:
+  static constexpr uint32_t kLatencyMs = 50;            // (queued at most into the sink master and the echo-cancel source)
+  static constexpr uint32_t kIdleMs = 100;              // microphone heard with no far end before the far end is taken as silent
+
+  EchoCancelLoop(Graph& graph, allocators::IAllocator& allocator);
+  ~EchoCancelLoop() { close(); }
+  EchoCancelLoop(const EchoCancelLoop&) = delete;
+  EchoCancelLoop& operator=(const EchoCancelLoop&) = delete;
+
+  // `mic`: the source master; `master`: the sink master (0 the speakers); `sink` and `source`: the module's virtual sink and source; `channels`
+  // of the source (1 or 2: the cancelled mono in each).
+  [[nodiscard]] bool open(uint32_t client, Loopback::From mic, uint32_t master, uint32_t sink, uint32_t source, uint32_t channels, bool passthrough);
+  void close();
+  // Moves what arrived on; returns the microphone samples that went into the source.
+  uint64_t pump();
+  const EchoCanceller& canceller() const { return aec_; }
+  uint64_t far_samples() const { return far_samples_; }
+  uint64_t near_samples() const { return near_samples_; }
+
+ private:
+  Graph& graph_;
+  allocators::IAllocator& allocator_;
+  EchoCanceller aec_;
+  ByteBuffer scratch_;
+  SharedPointer<RecordStream> far_record_, mic_record_;
+  SharedPointer<PlaybackStream> far_play_, out_play_;
+  uint32_t far_record_node_ = 0, mic_record_node_ = 0, far_play_node_ = 0, out_play_node_ = 0;
+  uint32_t channels_ = 1;
+  bool passthrough_ = false;
+  // mono samples waiting to be paired, oldest first (a full ring drops its oldest)
+  struct Ring {
+    explicit Ring(allocators::IAllocator& a) : data(a) {}
+    List<float> data;
+    uint64_t head = 0, count = 0;
+    bool size(uint64_t capacity);
+    void push(float v);
+    float pop();
+    void clear() { head = count = 0; }
+  };
+  Ring far_ring_, mic_ring_;
+  uint64_t idle_samples_ = 0;            // microphone samples heard since the far end last delivered
+  uint64_t far_samples_ = 0, near_samples_ = 0;
 };
 
 }  // namespace pipewire

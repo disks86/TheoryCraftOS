@@ -248,6 +248,7 @@ add_executable(BOOTX64
   src/PipeWire/VideoConvert.cpp
   src/PipeWire/VideoDecode.cpp
   src/PipeWire/Loopback.cpp
+  src/PipeWire/EchoCanceller.cpp
   src/PipeWire/CameraSource.cpp
   src/PipeWire/ScreenSource.cpp
   src/PipeWire/VideoWatcher.cpp

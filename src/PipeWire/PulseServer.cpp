@@ -178,10 +178,7 @@ PulseServer::PulseServer(Graph& graph, allocators::IAllocator& allocator)
 
 PulseServer::~PulseServer() {
   for (UniquePointer<Client>& c : clients_.view()) graph_.remove_client(c->graph_client);
-  for (UniquePointer<Module>& m : modules_.view()) {
-    m->loops.clear();
-    if (m->node && graph_.is_virtual_sink(m->node)) graph_.destroy_node(m->node);
-  }
+  for (UniquePointer<Module>& m : modules_.view()) destroy_module_nodes(*m);
 }
 
 // ---- modules ----------------------------------------------------------------------------------------------------------------------------------------
@@ -230,14 +227,29 @@ bool parse_module_arguments(StringView text, Properties* out) {
   }
 }
 
+void PulseServer::destroy_module_nodes(Module& m) {
+  // its streams first (they record from and play into its nodes), then the nodes
+  m.loops.clear();
+  m.echo = UniquePointer<EchoCancelLoop>();
+  if (m.node && graph_.is_virtual(m.node)) graph_.destroy_node(m.node);
+  if (m.extra && graph_.is_virtual(m.extra)) graph_.destroy_node(m.extra);
+  m.node = m.extra = 0;
+}
+
 void PulseServer::prune_modules() {
-  for (uint64_t k = modules_.count(); k > 0; --k)
-    if (modules_[k - 1]->node && !graph_.is_virtual_sink(modules_[k - 1]->node)) modules_.remove_at(k - 1);      // (its sink went another way)
+  // (forgets the ones whose sink or source went another way; what is left of them goes with them)
+  for (uint64_t k = modules_.count(); k > 0; --k) {
+    Module& m = *modules_[k - 1];
+    if ((m.node && !graph_.is_virtual(m.node)) || (m.extra && !graph_.is_virtual(m.extra))) {
+      destroy_module_nodes(m);
+      modules_.remove_at(k - 1);
+    }
+  }
 }
 
 uint32_t PulseServer::module_of(uint32_t node) {
   for (const UniquePointer<Module>& m : modules_.view())
-    if (m->node == node) return m->index;
+    if (m->node == node || (m->extra && m->extra == node)) return m->index;
   return pulse::kInvalidIndex;
 }
 
@@ -276,12 +288,15 @@ bool all_known(const Properties& args, ArrayView<const char* const> valid) {
 }
 }  // namespace
 
-// A virtual sink of a module's arguments: sink_name (else `default_name`), sink_properties, channels (else the channel map's, else stereo; wider ones
-// stereo), rate; the description sink_properties' device.description, else `description`, else "<name> Audio/Sink sink" (pipewire-pulse's).
-uint32_t PulseServer::module_sink(const Properties& args, const char* default_name, StringView description, uint32_t* error) {
+// A virtual sink (source) of a module's arguments: sink_name (source_name; else `default_name`), sink_properties (source_properties), channels (else
+// the channel map's, else stereo; wider ones stereo), rate; the description the properties' device.description, else "<name> Audio/Sink sink"
+// ("<name> Audio/Source source", as pipewire-pulse names them).
+uint32_t PulseServer::module_node(const Properties& args, bool source, const char* default_name, uint32_t* error) {
   Properties props(allocator_);
-  props.set("node.name", args.has("sink_name") ? args.get("sink_name") : StringView(default_name));
-  if (args.has("sink_properties") && !parse_module_arguments(args.get("sink_properties"), &props)) {
+  const char* const name_key = source ? "source_name" : "sink_name";
+  const char* const props_key = source ? "source_properties" : "sink_properties";
+  props.set("node.name", args.has(name_key) && !args.get(name_key).empty() ? args.get(name_key) : StringView(default_name));
+  if (args.has(props_key) && !parse_module_arguments(args.get(props_key), &props)) {
     *error = kErrInvalid;
     return 0;
   }
@@ -299,16 +314,12 @@ uint32_t PulseServer::module_sink(const Properties& args, const char* default_na
   if (channels > 2) channels = 2;
   if (!props.has("node.description")) {
     String d(allocator_);
-    if (!description.empty()) {
-      d.append(description);
-    } else {
-      d.append(props.get("node.name"));
-      d.append(props.get("node.name").empty() ? "" : " ");
-      d.append("Audio/Sink sink");
-    }
+    d.append(props.get("node.name"));
+    d.append(props.get("node.name").empty() ? "" : " ");
+    d.append(source ? "Audio/Source source" : "Audio/Sink sink");
     props.set("node.description", d.view());
   }
-  props.set("media.class", "Audio/Sink");
+  props.set("media.class", source ? "Audio/Source/Virtual" : "Audio/Sink");
   props.set("factory.name", "support.null-audio-sink");
   const uint32_t node = graph_.create_virtual_node(graph_.native_client_id(), props, channels, rate);      // (the kernel's: it stays)
   if (!node) *error = kErrInvalid;
@@ -318,32 +329,66 @@ uint32_t PulseServer::module_sink(const Properties& args, const char* default_na
 uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_t* error) {
   *error = 0;
   prune_modules();
-  const bool null_sink = name == StringView("module-null-sink"), loopback = name == StringView("module-loopback");
-  const bool remap = name == StringView("module-remap-sink"), combine = name == StringView("module-combine-sink");
-  if (!null_sink && !loopback && !remap && !combine) {
-    *error = kErrNoEntity;      // (as pipewire-pulse answers a module it does not have)
-    return 0;
-  }
-  Properties args(allocator_);
-  if (!parse_module_arguments(arguments, &args)) {
-    *error = kErrInvalid;
-    return 0;
-  }
+  enum class Kind { NullSink, Loopback, RemapSink, VirtualSink, CombineSink, RemapSource, VirtualSource, EchoCancel, AlwaysSink, SwitchOnConnect };
+  // the modules there are, and the arguments each takes (pipewire-pulse's; a module refuses others)
   static const char* const kNullSink[] = {"sink_name", "sink_properties", "format", "rate", "channels", "channel_map"};
   static const char* const kLoopback[] = {"source", "sink", "latency_msec", "channels", "rate", "format", "channel_map", "remix", "source_dont_move",
                                           "sink_dont_move", "adjust_time", "max_latency_msec", "fast_adjust_threshold_msec", "sink_input_properties",
                                           "source_output_properties"};
-  static const char* const kRemap[] = {"sink_name", "master", "channels", "channel_map", "master_channel_map", "remix", "sink_properties", "format", "rate"};
+  static const char* const kRemapSink[] = {"sink_name", "master", "channels", "channel_map", "master_channel_map", "remix", "sink_properties", "format",
+                                           "rate", "resample_method"};
+  static const char* const kVirtualSink[] = {"sink_name", "sink_properties", "master", "channels", "channel_map", "use_volume_sharing",
+                                             "force_flat_volume"};
   static const char* const kCombine[] = {"sink_name", "slaves", "sink_properties", "channels", "channel_map", "rate", "format", "adjust_time",
                                          "resample_method"};
-  const bool known = null_sink ? all_known(args, ArrayView<const char* const>(kNullSink, sizeof kNullSink / sizeof kNullSink[0]))
-                     : loopback ? all_known(args, ArrayView<const char* const>(kLoopback, sizeof kLoopback / sizeof kLoopback[0]))
-                     : remap    ? all_known(args, ArrayView<const char* const>(kRemap, sizeof kRemap / sizeof kRemap[0]))
-                                : all_known(args, ArrayView<const char* const>(kCombine, sizeof kCombine / sizeof kCombine[0]));
-  if (!known) {
+  static const char* const kRemapSource[] = {"source_name", "source_properties", "master", "master_channel_map", "format", "rate", "channels",
+                                             "channel_map", "resample_method", "remix"};
+  static const char* const kVirtualSource[] = {"source_name", "source_properties", "master", "uplink_sink", "channels", "channel_map",
+                                               "use_volume_sharing", "force_flat_volume"};
+  static const char* const kEchoCancel[] = {"source_name", "source_properties", "source_master", "sink_name", "sink_properties", "sink_master", "rate",
+                                            "channels", "channel_map", "aec_method", "aec_args", "format", "adjust_time", "adjust_threshold",
+                                            "autoloaded", "save_aec", "use_volume_sharing", "use_master_format"};
+  static const char* const kAlwaysSink[] = {"sink_name"};
+  static const char* const kSwitchOnConnect[] = {"only_from_unavailable", "ignore_virtual", "blocklist"};
+  struct Entry {
+    const char* name;
+    Kind kind;
+    ArrayView<const char* const> args;
+    bool once;      // (loaded at most once, as pipewire-pulse's load_once)
+  };
+#define TCOS_ARGS(a) ArrayView<const char* const>(a, sizeof a / sizeof a[0])
+  const Entry kModules[] = {
+      {"module-null-sink", Kind::NullSink, TCOS_ARGS(kNullSink), false},
+      {"module-loopback", Kind::Loopback, TCOS_ARGS(kLoopback), false},
+      {"module-remap-sink", Kind::RemapSink, TCOS_ARGS(kRemapSink), false},
+      {"module-virtual-sink", Kind::VirtualSink, TCOS_ARGS(kVirtualSink), false},
+      {"module-combine-sink", Kind::CombineSink, TCOS_ARGS(kCombine), false},
+      {"module-remap-source", Kind::RemapSource, TCOS_ARGS(kRemapSource), false},
+      {"module-virtual-source", Kind::VirtualSource, TCOS_ARGS(kVirtualSource), false},
+      {"module-echo-cancel", Kind::EchoCancel, TCOS_ARGS(kEchoCancel), false},
+      {"module-always-sink", Kind::AlwaysSink, TCOS_ARGS(kAlwaysSink), true},
+      {"module-switch-on-connect", Kind::SwitchOnConnect, TCOS_ARGS(kSwitchOnConnect), true},
+  };
+#undef TCOS_ARGS
+  const Entry* entry = nullptr;
+  for (const Entry& e : kModules)
+    if (name == StringView(e.name)) entry = &e;
+  if (!entry) {
+    *error = kErrNoEntity;      // (as pipewire-pulse answers a module it does not have)
+    return 0;
+  }
+  const Kind kind = entry->kind;
+  Properties args(allocator_);
+  if (!parse_module_arguments(arguments, &args) || !all_known(args, entry->args)) {
     *error = kErrInvalid;
     return 0;
   }
+  if (entry->once)
+    for (const UniquePointer<Module>& m : modules_.view())
+      if (m->name.view() == name) {
+        *error = kErrExist;
+        return 0;
+      }
   if (modules_.count() >= kMaxModules) {
     *error = kErrTooLarge;
     return 0;
@@ -353,100 +398,161 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
     *error = kErrTooLarge;
     return 0;
   }
-  // a loopback of the kernel's from a source (or a sink's monitor) into a sink (0 the speakers)
+  // a failure after a node was made takes what was made with it
+  auto fail = [&](uint32_t e) {
+    destroy_module_nodes(*m);
+    *error = e;
+    return 0u;
+  };
+  // a loopback of the kernel's from a source (or a sink's monitor, or a virtual source) into a sink (0 the speakers, or a virtual node)
   auto add_loop = [&](Loopback::From from, uint32_t to, uint32_t channels, uint32_t latency_ms, bool swap, StringView what) {
     UniquePointer<Loopback> loop = UniquePointer<Loopback>::make(allocator_, graph_, allocator_);
-    if (!loop || !loop->open(graph_.native_client_id(), from, to, channels, latency_ms, swap, what) || !m->loops.push_back(util::move(loop))) {
-      *error = kErrInvalid;
-      return false;
-    }
-    return true;
+    return loop && loop->open(graph_.native_client_id(), from, to, channels, latency_ms, swap, what) && m->loops.push_back(util::move(loop));
   };
   // a sink by name (empty or @DEFAULT_SINK@: the speakers) as a loopback's target: 0 the speakers, a virtual sink's node; false when there is none
   auto sink_target = [&](StringView sink_name, uint32_t* to) {
-    const uint32_t found = find_sink(pulse::kInvalidIndex, sink_name, sink_name.empty());
+    const uint32_t found = find_sink(pulse::kInvalidIndex, sink_name.empty() ? StringView("@DEFAULT_SINK@") : sink_name, false);
     if (!found) return false;
     *to = found == graph_.sink_id() ? 0 : found;
     return true;
   };
-  if (null_sink) {
-    m->node = module_sink(args, "null-sink", StringView(), error);
-    if (!m->node) return 0;
-  } else if (loopback) {
-    // source (default: the default source) to sink (default: the speakers), latency_msec, mono or stereo
+  // a source by name (empty: the default source) as a loopback's origin
+  auto source_origin = [&](StringView source_name, Loopback::From* from) {
     bool monitor = false;
-    uint32_t of_sink = 0, to = 0, latency = Loopback::kDefaultLatencyMs, channels = 2;
-    const StringView source = args.get("source");
-    if (!find_source(pulse::kInvalidIndex, source, source.empty(), &monitor, &of_sink) || !sink_target(args.get("sink"), &to)) {
-      *error = kErrNoEntity;
-      return 0;
+    uint32_t of_sink = 0;
+    if (!find_source(pulse::kInvalidIndex, source_name.empty() ? StringView("@DEFAULT_SOURCE@") : source_name, false, &monitor, &of_sink)) return false;
+    *from = Loopback::From{monitor, monitor && of_sink != graph_.sink_id() ? of_sink : 0};
+    return true;
+  };
+  auto channels_of = [&](uint32_t node) {
+    uint32_t channels = 2;
+    graph_.visit(node, [&](const GraphObject& o) { channels = o.format.channels == 1 ? 1 : 2; });
+    return channels;
+  };
+  switch (kind) {
+    case Kind::NullSink:
+      m->node = module_node(args, false, "null-sink", error);
+      if (!m->node) return 0;
+      break;
+    case Kind::Loopback: {
+      // source (default: the default source) to sink (default: the speakers), latency_msec, mono or stereo
+      Loopback::From from;
+      uint32_t to = 0, latency = Loopback::kDefaultLatencyMs, channels = 2;
+      if (!source_origin(args.get("source"), &from) || !sink_target(args.get("sink"), &to)) return fail(kErrNoEntity);
+      if (args.has("latency_msec") && (!parse_number(args.get("latency_msec"), &latency) || latency == 0 || latency > Loopback::kMaxLatencyMs))
+        return fail(kErrInvalid);
+      if (args.has("channels") && (!parse_number(args.get("channels"), &channels) || channels == 0 || channels > pulse::kChannelsMax))
+        return fail(kErrInvalid);
+      if (channels > 2) channels = 2;
+      if (!add_loop(from, to, channels, latency, false, "loopback")) return fail(kErrInvalid);
+      break;
     }
-    if (args.has("latency_msec") && (!parse_number(args.get("latency_msec"), &latency) || latency == 0 || latency > Loopback::kMaxLatencyMs)) {
-      *error = kErrInvalid;
-      return 0;
+    case Kind::RemapSink: case Kind::VirtualSink: {
+      // a sink whose audio goes on into its master (remap-sink: its channels swapped when the maps say so)
+      uint32_t master = 0;
+      if (!sink_target(args.get("master"), &master)) return fail(kErrNoEntity);
+      m->node = module_node(args, false, kind == Kind::RemapSink ? "remapped" : "vsink", error);
+      if (!m->node) return 0;
+      const bool swap = kind == Kind::RemapSink && map_reversed(args.get("channel_map")) != map_reversed(args.get("master_channel_map"));
+      if (!add_loop(Loopback::From{true, m->node}, master, channels_of(m->node), 50, swap, kind == Kind::RemapSink ? "remap-sink" : "virtual-sink"))
+        return fail(kErrInvalid);
+      break;
     }
-    if (args.has("channels") && (!parse_number(args.get("channels"), &channels) || channels == 0 || channels > pulse::kChannelsMax)) {
-      *error = kErrInvalid;
-      return 0;
-    }
-    if (channels > 2) channels = 2;
-    const Loopback::From from{monitor, monitor && of_sink != graph_.sink_id() ? of_sink : 0};
-    if (!add_loop(from, to, channels, latency, false, "loopback")) return 0;
-  } else if (remap) {
-    // a sink whose audio goes on into its master (its channels swapped when the maps say so)
-    uint32_t master = 0;
-    if (!sink_target(args.get("master"), &master)) {
-      *error = kErrNoEntity;
-      return 0;
-    }
-    m->node = module_sink(args, "remapped", StringView(), error);
-    if (!m->node) return 0;
-    const bool swap = map_reversed(args.get("channel_map")) != map_reversed(args.get("master_channel_map"));
-    if (!add_loop(Loopback::From{true, m->node}, master, 2, 50, swap, "remap-sink")) {
-      graph_.destroy_node(m->node);
-      return 0;
-    }
-  } else {
-    // a sink whose audio goes on into each of its slaves (slaves: sink names separated by commas; none said: the speakers and every virtual sink)
-    List<uint32_t> targets(allocator_);
-    const StringView slaves = args.get("slaves");
-    if (slaves.empty()) {
-      targets.push_back(0);
-      List<uint32_t> virtuals(allocator_);
-      graph_.virtual_sinks(&virtuals);
-      for (uint32_t v : virtuals.view()) targets.push_back(v);
-    } else {
-      StringView rest = slaves;
-      while (!rest.empty()) {
-        const uint64_t comma = rest.find(',');
-        const StringView one = comma == StringView::npos ? rest : rest.first(comma);
-        rest = comma == StringView::npos ? StringView() : rest.substr(comma + 1);
-        uint32_t to = 0;
-        if (one.empty()) continue;
-        if (!sink_target(one, &to)) {
-          *error = kErrNoEntity;
-          return 0;
+    case Kind::CombineSink: {
+      // a sink whose audio goes on into each of its slaves (slaves: sink names separated by commas; none said: the speakers and every virtual sink)
+      List<uint32_t> targets(allocator_);
+      const StringView slaves = args.get("slaves");
+      if (slaves.empty()) {
+        targets.push_back(0);
+        List<uint32_t> virtuals(allocator_);
+        graph_.virtual_sinks(&virtuals);
+        for (uint32_t v : virtuals.view()) targets.push_back(v);
+      } else {
+        StringView rest = slaves;
+        while (!rest.empty()) {
+          const uint64_t comma = rest.find(',');
+          const StringView one = comma == StringView::npos ? rest : rest.first(comma);
+          rest = comma == StringView::npos ? StringView() : rest.substr(comma + 1);
+          uint32_t to = 0;
+          if (one.empty()) continue;
+          if (!sink_target(one, &to)) return fail(kErrNoEntity);
+          targets.push_back(to);
         }
-        targets.push_back(to);
       }
+      if (targets.empty() || targets.count() > 8) return fail(kErrInvalid);
+      m->node = module_node(args, false, "combined", error);
+      if (!m->node) return 0;
+      for (uint32_t to : targets.view())
+        if (!add_loop(Loopback::From{true, m->node}, to, 2, 50, false, "combine-sink")) return fail(kErrInvalid);
+      break;
     }
-    if (targets.empty() || targets.count() > 8) {
-      *error = kErrInvalid;
-      return 0;
-    }
-    m->node = module_sink(args, "combined", StringView(), error);
-    if (!m->node) return 0;
-    for (uint32_t to : targets.view())
-      if (!add_loop(Loopback::From{true, m->node}, to, 2, 50, false, "combine-sink")) {
-        m->loops.clear();
-        graph_.destroy_node(m->node);
-        return 0;
+    case Kind::RemapSource: case Kind::VirtualSource: {
+      // a source that hears its master (remap-source: its channels swapped when the maps say so); virtual-source's uplink_sink: a sink whose
+      // audio the source hears too (what plays into it is "sent up" through the source)
+      Loopback::From from;
+      if (!source_origin(args.get("master"), &from)) return fail(kErrNoEntity);
+      String default_name(allocator_);
+      if (kind == Kind::RemapSource) {
+        // (pulseaudio's default: "<master>.remapped")
+        default_name.append(args.get("master").empty() ? StringView("source") : args.get("master"));
+        default_name.append(".remapped");
+      } else {
+        default_name.append("vsource");
       }
+      m->node = module_node(args, true, default_name.c_str(), error);
+      if (!m->node) return 0;
+      const bool swap = kind == Kind::RemapSource && map_reversed(args.get("channel_map")) != map_reversed(args.get("master_channel_map"));
+      if (!add_loop(from, m->node, channels_of(m->node), 50, swap, kind == Kind::RemapSource ? "remap-source" : "virtual-source"))
+        return fail(kErrInvalid);
+      if (kind == Kind::VirtualSource && !args.get("uplink_sink").empty()) {
+        Properties uplink(allocator_);
+        uplink.set("sink_name", args.get("uplink_sink"));
+        if (args.has("channels")) uplink.set("channels", args.get("channels"));
+        m->extra = module_node(uplink, false, "uplink", error);
+        if (!m->extra) return fail(*error ? *error : kErrInvalid);
+        if (!add_loop(Loopback::From{true, m->extra}, m->node, channels_of(m->node), 50, false, "virtual-source uplink")) return fail(kErrInvalid);
+      }
+      break;
+    }
+    case Kind::EchoCancel: {
+      // a sink (into sink_master) and a source (source_master with the sink's audio taken out of it)
+      Loopback::From mic;
+      uint32_t master = 0;
+      if (!source_origin(args.get("source_master"), &mic) || !sink_target(args.get("sink_master"), &master)) return fail(kErrNoEntity);
+      const StringView method = args.get("aec_method");
+      if (!method.empty() && method != StringView("webrtc") && method != StringView("null") && method != StringView("nlms"))
+        return fail(kErrNotSupported);
+      Properties sink_args(allocator_), source_args(allocator_);
+      for (uint64_t k = 0; k < args.count(); ++k) {
+        const StringView key = args.at(k).key.view(), value = args.at(k).value.view();
+        if (key == StringView("sink_name") || key == StringView("sink_properties")) sink_args.set(key, value);
+        if (key == StringView("source_name") || key == StringView("source_properties")) source_args.set(key, value);
+        if (key == StringView("channels") || key == StringView("channel_map")) {
+          sink_args.set(key, value);
+          source_args.set(key, value);
+        }
+      }
+      m->extra = module_node(sink_args, false, "echo-cancel-sink", error);
+      if (!m->extra) return 0;
+      m->node = module_node(source_args, true, "echo-cancel-source", error);
+      if (!m->node) return fail(*error ? *error : kErrInvalid);
+      m->echo = UniquePointer<EchoCancelLoop>::make(allocator_, graph_, allocator_);
+      if (!m->echo || !m->echo->open(graph_.native_client_id(), mic, master, m->extra, m->node, channels_of(m->node), method == StringView("null")))
+        return fail(kErrInvalid);
+      break;
+    }
+    case Kind::AlwaysSink:
+      // (the speakers' sink is always there, mixer or not: there is never a moment without a sink to fall back to)
+    case Kind::SwitchOnConnect:
+      // (the one sink and source follow the hardware themselves: the mixer moves to a newly plugged device and the capture hub to a new
+      // microphone, so streams go there already; with ignore_virtual, its default, new virtual devices are not switched to either)
+      break;
   }
   m->index = next_module_++ | kModuleFlag;
-  const uint32_t index = m->index, node = m->node;
+  const uint32_t index = m->index;
   if (!modules_.push_back(util::move(m))) {
-    if (node) graph_.destroy_node(node);
+    // (the module could not be kept: what it made goes; m still holds it when push_back fails)
+    if (m) destroy_module_nodes(*m);
     *error = kErrTooLarge;
     return 0;
   }
@@ -457,9 +563,8 @@ bool PulseServer::unload_module(uint32_t index) {
   prune_modules();
   for (uint64_t k = 0; k < modules_.count(); ++k) {
     if (modules_[k]->index != index) continue;
-    const uint32_t node = modules_[k]->node;
-    modules_.remove_at(k);      // (its loopbacks close with it)
-    if (node) graph_.destroy_node(node);
+    destroy_module_nodes(*modules_[k]);
+    modules_.remove_at(k);
     return true;
   }
   return false;
@@ -475,7 +580,18 @@ void PulseServer::fill_module(TagWriter& w, uint32_t version, const Module& m) {
   } else {
     Properties props(allocator_);
     props.set("module.author", "TheoryCraftOS");
-    props.set("module.description", "A null sink (support.null-audio-sink)");
+    const StringView n = m.name.view();
+    props.set("module.description", n == StringView("module-null-sink")           ? "A null sink (support.null-audio-sink)"
+                                    : n == StringView("module-loopback")          ? "Loopback from source to sink"
+                                    : n == StringView("module-remap-sink")        ? "Remap sink channels"
+                                    : n == StringView("module-virtual-sink")      ? "Virtual sink"
+                                    : n == StringView("module-combine-sink")      ? "Combine multiple sinks into a single sink"
+                                    : n == StringView("module-remap-source")      ? "Remap source channels"
+                                    : n == StringView("module-virtual-source")    ? "Virtual source"
+                                    : n == StringView("module-echo-cancel")       ? "Acoustic echo canceller"
+                                    : n == StringView("module-always-sink")       ? "Always keeps at least one sink loaded"
+                                    : n == StringView("module-switch-on-connect") ? "Switch to new devices on connect"
+                                                                                  : "");
     w.proplist(props);
   }
 }
@@ -598,6 +714,17 @@ uint32_t PulseServer::virtual_sink_named(StringView name) const {
   return node && graph_.is_virtual_sink(node) ? node : 0;
 }
 
+uint32_t PulseServer::virtual_source_named(StringView name) const {
+  const uint32_t node = graph_.find_node(name);
+  return node && graph_.is_virtual_source(node) ? node : 0;
+}
+
+uint32_t PulseServer::index_of_source(bool monitor, uint32_t of_sink) const {
+  if (!monitor) return graph_.source_id();
+  if (!of_sink) of_sink = graph_.sink_id();
+  return graph_.is_virtual_source(of_sink) ? of_sink : of_sink | kMonitorFlag;
+}
+
 uint32_t PulseServer::find_sink(uint32_t index, StringView name, bool null_name) const {
   if (!null_name && !name.empty()) {
     if (is_sink_name(name)) return graph_.sink_id();
@@ -614,6 +741,17 @@ bool PulseServer::find_source(uint32_t index, StringView name, bool null_name, b
   if (!of_sink) of_sink = &ignored;
   *of_sink = graph_.sink_id();
   // a virtual sink's monitor: "<name>.monitor", the sink's own name (as pipewire-pulse allows), or its index with the monitor flag
+  // a virtual source: its node.name, or its index (recorded as a monitor of its node is)
+  if (const uint32_t v = !null_name && !name.empty() ? virtual_source_named(name) : 0) {
+    *monitor = true;
+    *of_sink = v;
+    return true;
+  }
+  if ((null_name || name.empty()) && index != pulse::kInvalidIndex && !(index & kMonitorFlag) && graph_.is_virtual_source(index)) {
+    *monitor = true;
+    *of_sink = index;
+    return true;
+  }
   if (!null_name && !name.empty()) {
     StringView base = name;
     const StringView suffix(".monitor");
@@ -902,14 +1040,16 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       return;
     }
     case kGetSourceInfoList: {
-      // the microphone, the speakers' monitor, then the virtual sinks' monitors
-      List<uint32_t> virtuals(allocator_);
+      // the microphone, the speakers' monitor, the virtual sinks' monitors, then the virtual sources
+      List<uint32_t> virtuals(allocator_), sources(allocator_);
       graph_.virtual_sinks(&virtuals);
+      graph_.virtual_sources(&sources);
       const uint64_t m = begin_command(c, kReply, tag);
       TagWriter w(c.outbox);
       if (source) fill_source(c, w, false);
       if (graph_.mixer()) fill_source(c, w, true);
       for (uint32_t v : virtuals) fill_source(c, w, true, v);
+      for (uint32_t v : sources) fill_source(c, w, true, v);
       end_command(c, m);
       return;
     }
@@ -932,7 +1072,7 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       if (!t.string(&name)) return invalid();
       if (name.empty() || !find_source(pulse::kInvalidIndex, name, false, &monitor, &of_sink)) return send_error(c, tag, kErrNoEntity);
       const uint64_t m = begin_command(c, kReply, tag);
-      TagWriter(c.outbox).u32(monitor ? of_sink | kMonitorFlag : source);
+      TagWriter(c.outbox).u32(index_of_source(monitor, of_sink));
       end_command(c, m);
       return;
     }
@@ -1103,11 +1243,14 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       StringView name;
       bool null_name = true, monitor = false;
       if (!t.u32(&index) || !t.string(&name, &null_name)) return invalid();
-      if (!find_source(index, name, null_name, &monitor)) return send_error(c, tag, kErrNoEntity);
-      if (monitor) return send_simple_reply(c, tag);      /* (the monitor has no volume of its own: it is what the sink plays) */
+      uint32_t of_sink = 0;
+      if (!find_source(index, name, null_name, &monitor, &of_sink)) return send_error(c, tag, kErrNoEntity);
+      const bool virtual_source = monitor && graph_.is_virtual_source(of_sink);
+      if (monitor && !virtual_source) return send_simple_reply(c, tag);      /* (the monitor has no volume of its own: it is what the sink plays) */
+      const uint32_t target = virtual_source ? of_sink : source;      // (a virtual source's volume is what its recorders hear it at)
       float volume = 1.0f;
       bool mute = false;
-      graph_.get_volume(source, &volume, &mute);
+      graph_.get_volume(target, &volume, &mute);
       if (cmd == kSetSourceVolume) {
         Cvolume v;
         if (!t.cvolume(&v) || v.channels == 0) return invalid();
@@ -1115,7 +1258,7 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       } else if (!t.boolean(&mute)) {
         return invalid();
       }
-      graph_.set_volume(source, volume, mute);
+      graph_.set_volume(target, volume, mute);
       return send_simple_reply(c, tag);
     }
     case kSetSourceOutputVolume: case kSetSourceOutputMute: {
@@ -1369,7 +1512,8 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
   }
   if (!monitor || !of_sink) of_sink = graph_.sink_id();
   const uint32_t from_virtual = monitor && of_sink != graph_.sink_id() ? of_sink : 0;
-  const uint32_t source = monitor ? of_sink | kMonitorFlag : graph_.source_id();
+  const bool from_virtual_source = from_virtual && graph_.is_virtual_source(from_virtual);
+  const uint32_t source = index_of_source(monitor, of_sink);
   if (direct_on_input != pulse::kInvalidIndex && direct_on_input != 0) return send_error(c, tag, kErrNotSupported);      // (recording one stream's output)
   PcmFormat format;
   if (!to_pcm_format(spec, &format)) return send_error(c, tag, kErrNotSupported);
@@ -1421,7 +1565,7 @@ void PulseServer::create_record(Client& c, uint32_t tag, TagReader& t) {
       graph_.visit(from_virtual, [&](const GraphObject& o) {
         String monitor_name(allocator_);
         monitor_name.append(o.props.get("node.name"));
-        monitor_name.append(".monitor");
+        if (!from_virtual_source) monitor_name.append(".monitor");      // (a virtual source is named as it is)
         w.string(monitor_name.view());
         named = true;
       });
@@ -1633,29 +1777,27 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor, uint32_t of
   if (!of_sink) of_sink = graph_.sink_id();
   graph_.visit(monitor ? of_sink : graph_.source_id(), [&](const GraphObject& o) {
     const bool is_virtual = o.role == NodeRole::Virtual;
+    // (a virtual source is shown as a source of its own: its name, its volume, a monitor of nothing)
+    const bool own = !monitor || (is_virtual && o.virtual_source);
     String sink_name(allocator_), monitor_name(allocator_);
     sink_name.append(is_virtual ? o.props.get("node.name") : StringView(kSinkName));
     monitor_name.append(sink_name.view());
     monitor_name.append(".monitor");
     String description(allocator_);
-    if (monitor) {
-      description.append("Monitor of ");
-      description.append(o.props.get("node.description"));
-    } else {
-      description.append(o.props.get("node.description"));
-    }
-    w.u32(monitor ? o.id | kMonitorFlag : o.id);
-    w.string(monitor ? monitor_name.view() : StringView(kSourceName));
+    if (!own) description.append("Monitor of ");
+    description.append(o.props.get("node.description"));
+    w.u32(own ? o.id : o.id | kMonitorFlag);
+    w.string(own ? (is_virtual ? o.props.get("node.name") : StringView(kSourceName)) : monitor_name.view());
     w.string(description.view());
     // (a virtual sink's monitor holds the sink's own rate and channels)
-    const bool shaped = monitor && is_virtual;
+    const bool shaped = monitor && is_virtual;      // (a virtual source the same)
     const uint8_t channels = shaped && o.format.channels == 1 ? 1 : 2;
     w.sample_spec(SampleSpec{pulse::kS16Le, channels, shaped ? o.format.rate : hardware::kAudioSampleRate});
     w.channel_map(default_map(channels));
     w.u32(shaped ? module_of(o.id) : pulse::kInvalidIndex);      // module
-    w.cvolume(flat_volume(channels, monitor ? pulse::kVolumeNorm : linear_to_pulse_volume(o.volume)));
-    w.boolean(monitor ? false : o.mute);
-    if (monitor) {
+    w.cvolume(flat_volume(channels, own ? linear_to_pulse_volume(o.volume) : pulse::kVolumeNorm));
+    w.boolean(own ? o.mute : false);
+    if (!own) {
       w.u32(o.id);                    // monitor of sink
       w.string(sink_name.view());
     } else {
@@ -1663,10 +1805,11 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor, uint32_t of
       w.string_null();
     }
     w.usec(kSourceLatencyUs);
-    w.string(monitor ? "tcos-mixer" : "tcos-capture");
-    w.u32(monitor ? 0x2u : kSinkFlags);      // (the monitor: latency only, no volume or hardware of its own)
+    w.string(is_virtual && o.virtual_source ? "tcos-null-source" : monitor ? "tcos-mixer" : "tcos-capture");
+    // (the monitor: latency only, no volume or hardware of its own; a virtual source: latency and a volume of its own, no hardware)
+    w.u32(is_virtual && o.virtual_source ? 0x2u | 0x20u : monitor ? 0x2u : kSinkFlags);
     if (c.version >= 13) {
-      if (monitor) {
+      if (!own) {
         Properties props(allocator_);
         props.set("device.class", "monitor");
         props.set("device.description", description.view());
@@ -1680,7 +1823,7 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor, uint32_t of
     }
     if (c.version >= 15) {
       w.volume(pulse::kVolumeNorm);
-      const uint32_t state = monitor ? (o.state == kNodeStateRunning ? kSinkStateRunning : kSinkStateIdle)
+      const uint32_t state = monitor || is_virtual ? (o.state == kNodeStateRunning ? kSinkStateRunning : kSinkStateIdle)
                                      : (o.state == kNodeStateRunning ? kSinkStateRunning : o.state == kNodeStateSuspended ? kSinkStateSuspended : kSinkStateIdle);
       w.u32(state);
       w.u32(pulse::kVolumeNorm + 1);
@@ -1704,7 +1847,8 @@ void PulseServer::fill_source_output(Client& c, TagWriter& w, const GraphObject&
   w.string(o.props.get("media.name"));
   w.u32(pulse::kInvalidIndex);      // module
   w.u32(o.client ? o.client : pulse::kInvalidIndex);
-  w.u32(o.monitor ? (o.target ? o.target : graph_.sink_id()) | kMonitorFlag : graph_.source_id());
+  // (inside the graph's lock: the node itself says whether it records a virtual source)
+  w.u32(!o.monitor ? graph_.source_id() : o.virtual_source ? o.target : (o.target ? o.target : graph_.sink_id()) | kMonitorFlag);
   w.sample_spec(spec);
   w.channel_map(default_map(spec.channels));
   w.usec(kSourceLatencyUs);
@@ -1737,7 +1881,8 @@ void PulseServer::send_subscription_events(Client& c) {
   auto facility_of = [&](const GraphEntry& e, uint32_t* out) {
     if (e.type == ObjectType::Client) *out = kClientFacility;
     else if (e.type != ObjectType::Node) return false;
-    else if (e.role == NodeRole::Sink || e.role == NodeRole::Virtual) *out = kSink;      // (a virtual sink: a sink)
+    else if (e.role == NodeRole::Virtual) *out = e.virtual_source ? kSource : kSink;      // (a virtual sink: a sink; a virtual source: a source)
+    else if (e.role == NodeRole::Sink) *out = kSink;
     else if (e.role == NodeRole::Source) *out = kSource;
     else if (e.role == NodeRole::Playback) *out = kSinkInput;
     else if (e.role == NodeRole::Capture) *out = kSourceOutput;
@@ -1773,8 +1918,10 @@ void PulseServer::send_subscription_events(Client& c) {
 
 void PulseServer::tick() {
   graph_.refresh();
-  for (UniquePointer<Module>& m : modules_.view())      // (the modules' loopbacks: what was recorded on to where it goes)
+  for (UniquePointer<Module>& m : modules_.view()) {      // (the modules' loopbacks: what was recorded on to where it goes)
     for (UniquePointer<Loopback>& loop : m->loops.view()) loop->pump();
+    if (m->echo) m->echo->pump();
+  }
   const bool changed = graph_.serial() != last_serial_;
   if (changed) {
     last_serial_ = graph_.serial();

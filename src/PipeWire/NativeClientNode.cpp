@@ -624,7 +624,7 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
                                     props, &n.playback, &n.record);
     } else {
       // (a virtual sink: played into its mixer, or recorded from its monitor; the graph's streams convert the format)
-      n.virtual_sink = named && graph_.is_virtual_sink(named) ? named : 0;
+      n.virtual_sink = named && graph_.is_virtual(named) ? named : 0;      // (a virtual sink or source)
       if (n.direction == kDirectionOutput)
         n.node = graph_.create_playback(c.graph_client, n.format, props, &n.playback, n.virtual_sink);
       else
