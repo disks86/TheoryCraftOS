@@ -195,6 +195,14 @@ print('   parecord from cli-null.monitor: 500 Hz %.0f' % best)
 assert 7000 < best < 9000
 PY"
 fi
+# pactl load-module module-null-sink: a sink of its arguments (mono at 16 kHz, its description), listed as a module, kept after pactl exits, gone again
+# with unload-module
+module=$(timeout 5 pactl load-module module-null-sink sink_name=pa-null rate=16000 channels=1 sink_properties=device.description=PaNull 2> "$work/load.log")
+check "pactl load-module module-null-sink" "[ -n '$module' ] && timeout 5 pactl list short sinks | grep 'pa-null' | grep -q 's16le 1ch 16000Hz'"
+check "pactl list modules shows it" "timeout 5 pactl list short modules | grep -q \"^$module	module-null-sink	sink_name=pa-null\""
+check "pactl list sinks names its module and description" "timeout 5 pactl list sinks | grep -A3 'Name: pa-null' | grep -q 'Description: PaNull' && timeout 5 pactl list sinks | grep -A6 'Name: pa-null' | grep -q \"Owner Module: $module\""
+check "pactl load-module refuses another module" "! timeout 5 pactl load-module module-loopback 2> /dev/null"
+check "pactl unload-module" "timeout 5 pactl unload-module $module && ! timeout 5 pactl list short sinks | grep -q 'pa-null'"
 pkill -TERM -f "$work/pwhost $sock" || true
 for _ in $(seq 50); do pgrep -f "$work/pwhost $sock" >/dev/null || break; sleep 0.1; done
 check "the mixed output holds both tones" "python3 - '$work/out.wav' <<'PY'

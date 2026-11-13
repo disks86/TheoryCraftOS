@@ -31,8 +31,9 @@
 // Recording (parecord, browsers' getUserMedia through libpulse, voice chat): record streams (create, delete, cork, flush, latency, buffer attributes,
 // name and property updates) read the graph's source - the capture hub's microphone - and the server sends what they record in packets on the stream's
 // channel, a fragment (fragsize) at a time; source and source-output queries, lists, volume and mute, LOOKUP_SOURCE, and their subscription events.
-// "pactl list source-outputs" shows the Windows programs that record as well. Not served (an error answer): upload streams, samples, modules, cards,
-// extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
+// "pactl list source-outputs" shows the Windows programs that record as well. Modules: module-null-sink (LOAD_MODULE makes a virtual sink with
+// sink_name, sink_properties, rate, channels and channel_map, as pipewire-pulse does; it stays until UNLOAD_MODULE, whoever loaded it), listed with
+// GET_MODULE_INFO(_LIST); other modules are refused. Not served (an error answer): upload streams, samples, cards, extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
 // records what the mixer plays (OBS, "record what you hear").
 #pragma once
 #include <stdint.h>
@@ -43,6 +44,12 @@
 #include "Utility/UniquePointer.hpp"
 
 namespace pipewire {
+
+// PulseAudio module arguments ("sink_name=x sink_properties='device.description=\"My sink\"'"): key=value pairs separated by white space, a value
+// in single or double quotes when it holds spaces, a backslash taking the next character as it is. Each pair is set in *out (PulseAudio key names
+// for properties - device.description, media.role, ... - become PipeWire's). False when the text is not such a list (a key without a value, a
+// quote not closed) or there are too many.
+bool parse_module_arguments(StringView text, Properties* out);
 
 class PulseServer final : public IProtocolServer {
  public:
@@ -146,6 +153,28 @@ class PulseServer final : public IProtocolServer {
   List<GraphEntry> snapshot_;
   uint64_t last_serial_ = 0;
   uint32_t next_handle_ = 1;
+
+  // ---- loaded modules (module-null-sink: a virtual sink each, the kernel's)
+ public:
+  static constexpr uint32_t kModuleFlag = 1u << 29;      // (module indexes, as pipewire-pulse numbers them)
+  static constexpr uint32_t kMaxModules = 16;
+  // What LOAD_MODULE does: the module's index, or 0 with *error a PulseAudio error.
+  uint32_t load_module(StringView name, StringView arguments, uint32_t* error);
+  bool unload_module(uint32_t index);
+  // The module that made `node` (kInvalidIndex: none).
+  uint32_t module_of(uint32_t node);
+
+ private:
+  struct Module {
+    explicit Module(allocators::IAllocator& a) : name(a), arguments(a) {}
+    uint32_t index = 0;
+    uint32_t node = 0;      // (module-null-sink: its sink)
+    String name, arguments;
+  };
+  void prune_modules();      // (forgets the ones whose sink went another way: pw-cli destroy, ...)
+  void fill_module(pulse::TagWriter& w, uint32_t version, const Module& m);
+  List<UniquePointer<Module>> modules_;
+  uint32_t next_module_ = 0;
 };
 
 // PulseAudio's volumes are cubic: (volume / PA_VOLUME_NORM)^3 is the linear factor PipeWire and the mixer use.

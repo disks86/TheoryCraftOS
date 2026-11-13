@@ -173,10 +173,186 @@ uint32_t linear_to_pulse_volume(float linear) {
   return v >= static_cast<float>(pulse::kVolumeMax) ? pulse::kVolumeMax : static_cast<uint32_t>(v);
 }
 
-PulseServer::PulseServer(Graph& graph, allocators::IAllocator& allocator) : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator) {}
+PulseServer::PulseServer(Graph& graph, allocators::IAllocator& allocator)
+    : graph_(graph), allocator_(allocator), clients_(allocator), snapshot_(allocator), modules_(allocator) {}
 
 PulseServer::~PulseServer() {
   for (UniquePointer<Client>& c : clients_.view()) graph_.remove_client(c->graph_client);
+  for (UniquePointer<Module>& m : modules_.view())
+    if (m->node && graph_.is_virtual_sink(m->node)) graph_.destroy_node(m->node);
+}
+
+// ---- modules ----------------------------------------------------------------------------------------------------------------------------------------
+
+bool parse_module_arguments(StringView text, Properties* out) {
+  // (PulseAudio's names for properties, as pipewire-pulse maps them)
+  static const char* const kKeyMap[][2] = {{"device.description", "node.description"}, {"device.bus_path", "device.bus-path"},
+                                           {"sysfs.path", "device.sysfs.path"}, {"device.form_factor", "device.form-factor"},
+                                           {"device.icon_name", "device.icon-name"}, {"device.intended_roles", "device.intended-roles"},
+                                           {"media.icon_name", "media.icon-name"}, {"application.icon_name", "application.icon-name"}};
+  uint64_t i = 0;
+  const uint64_t n = text.size();
+  auto space = [](char ch) { return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'; };
+  String key(out->allocator()), value(out->allocator());
+  while (true) {
+    while (i < n && space(text[i])) ++i;
+    if (i >= n) return true;
+    const uint64_t key_start = i;
+    while (i < n && text[i] != '=' && !space(text[i])) ++i;
+    if (i >= n || text[i] != '=' || i == key_start) return false;      // (a key without a value)
+    if (!key.assign(text.substr(key_start, i - key_start))) return false;
+    ++i;
+    char end = ' ';
+    if (i < n && (text[i] == '"' || text[i] == '\'')) end = text[i++];
+    value.clear();
+    bool closed = end == ' ';
+    while (i < n) {
+      char ch = text[i];
+      if (end == ' ' ? space(ch) : ch == end) {
+        closed = true;
+        ++i;
+        break;
+      }
+      if (ch == '\\') {
+        if (++i >= n) return false;
+        ch = text[i];
+      }
+      if (!value.append(StringView(&ch, 1))) return false;
+      ++i;
+    }
+    if (!closed) return false;      // (a quote not closed)
+    StringView k = key.view();
+    for (const auto& pair : kKeyMap)
+      if (k == StringView(pair[0])) k = StringView(pair[1]);
+    if (!out->set(k, value.view())) return false;
+  }
+}
+
+void PulseServer::prune_modules() {
+  for (uint64_t k = modules_.count(); k > 0; --k)
+    if (!graph_.is_virtual_sink(modules_[k - 1]->node)) modules_.remove_at(k - 1);
+}
+
+uint32_t PulseServer::module_of(uint32_t node) {
+  for (const UniquePointer<Module>& m : modules_.view())
+    if (m->node == node) return m->index;
+  return pulse::kInvalidIndex;
+}
+
+uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_t* error) {
+  *error = 0;
+  prune_modules();
+  if (name != StringView("module-null-sink")) {
+    *error = kErrNoEntity;      // (as pipewire-pulse answers a module it does not have)
+    return 0;
+  }
+  Properties args(allocator_);
+  if (!parse_module_arguments(arguments, &args)) {
+    *error = kErrInvalid;
+    return 0;
+  }
+  static const char* const kValid[] = {"sink_name", "sink_properties", "format", "rate", "channels", "channel_map"};
+  for (uint64_t k = 0; k < args.count(); ++k) {
+    bool known = false;
+    for (const char* v : kValid) known |= args.at(k).key.view() == StringView(v);
+    if (!known) {
+      *error = kErrInvalid;
+      return 0;
+    }
+  }
+  if (modules_.count() >= kMaxModules) {
+    *error = kErrTooLarge;
+    return 0;
+  }
+  Properties props(allocator_);
+  props.set("node.name", args.has("sink_name") ? args.get("sink_name") : StringView("null-sink"));
+  if (args.has("sink_properties") && !parse_module_arguments(args.get("sink_properties"), &props)) {
+    *error = kErrInvalid;
+    return 0;
+  }
+  // channels: given, else as many as the channel map names, else stereo (wider ones are made stereo, as the adapter makes them)
+  auto number = [](StringView text, uint32_t* out) {
+    uint64_t v = 0;
+    if (text.empty() || text.size() > 9) return false;
+    for (char ch : text) {
+      if (ch < '0' || ch > '9') return false;
+      v = v * 10 + uint64_t(ch - '0');
+    }
+    *out = uint32_t(v);
+    return true;
+  };
+  uint32_t channels = 0, rate = hardware::kAudioSampleRate;
+  if (args.has("channels") && (!number(args.get("channels"), &channels) || channels == 0 || channels > pulse::kChannelsMax)) {
+    *error = kErrInvalid;
+    return 0;
+  }
+  if (args.has("rate") && (!number(args.get("rate"), &rate) || rate < audio::StreamFormat::kMinRate || rate > audio::StreamFormat::kMaxRate)) {
+    *error = kErrInvalid;
+    return 0;
+  }
+  const StringView map = args.get("channel_map");
+  if (channels == 0 && !map.empty()) {
+    channels = map == StringView("mono") ? 1 : map == StringView("stereo") ? 2 : 1;
+    if (map != StringView("mono") && map != StringView("stereo"))
+      for (char ch : map) channels += ch == ',';
+  }
+  if (channels == 0) channels = 2;
+  if (channels > 2) channels = 2;
+  if (!props.has("node.description")) {      // ("<name> Audio/Sink sink", pipewire-pulse's)
+    String d(allocator_);
+    d.append(props.get("node.name"));
+    d.append(props.get("node.name").empty() ? "" : " ");
+    d.append("Audio/Sink sink");
+    props.set("node.description", d.view());
+  }
+  props.set("media.class", "Audio/Sink");
+  props.set("factory.name", "support.null-audio-sink");
+  UniquePointer<Module> m = UniquePointer<Module>::make(allocator_, allocator_);
+  if (!m || !m->name.assign(name) || !m->arguments.assign(arguments)) {
+    *error = kErrTooLarge;
+    return 0;
+  }
+  // (the kernel's: it stays when the program that loaded it goes)
+  m->node = graph_.create_virtual_node(graph_.native_client_id(), props, channels, rate);
+  if (!m->node) {
+    *error = kErrInvalid;
+    return 0;
+  }
+  m->index = next_module_++ | kModuleFlag;
+  const uint32_t index = m->index, node = m->node;
+  if (!modules_.push_back(util::move(m))) {
+    graph_.destroy_node(node);
+    *error = kErrTooLarge;
+    return 0;
+  }
+  return index;
+}
+
+bool PulseServer::unload_module(uint32_t index) {
+  prune_modules();
+  for (uint64_t k = 0; k < modules_.count(); ++k) {
+    if (modules_[k]->index != index) continue;
+    const uint32_t node = modules_[k]->node;
+    modules_.remove_at(k);
+    graph_.destroy_node(node);
+    return true;
+  }
+  return false;
+}
+
+void PulseServer::fill_module(TagWriter& w, uint32_t version, const Module& m) {
+  w.u32(m.index);
+  w.string(m.name.view());
+  w.string(m.arguments.view());
+  w.u32(pulse::kInvalidIndex);      // n_used
+  if (version < 15) {
+    w.boolean(false);      // auto unload
+  } else {
+    Properties props(allocator_);
+    props.set("module.author", "TheoryCraftOS");
+    props.set("module.description", "A null sink (support.null-audio-sink)");
+    w.proplist(props);
+  }
 }
 
 PulseServer::Client* PulseServer::find(uint32_t handle) {
@@ -663,9 +839,49 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       end_command(c, m);
       return;
     }
-    case kGetModuleInfoList: case kGetSampleInfoList: case kGetCardInfoList:
+    case kGetModuleInfoList: {
+      prune_modules();
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter w(c.outbox);
+      for (const UniquePointer<Module>& mod : modules_.view()) fill_module(w, c.version, *mod);
+      end_command(c, m);
+      return;
+    }
+    case kGetModuleInfo: {
+      uint32_t index = 0;
+      if (!t.u32(&index)) return invalid();
+      prune_modules();
+      for (const UniquePointer<Module>& mod : modules_.view()) {
+        if (mod->index != index) continue;
+        const uint64_t m = begin_command(c, kReply, tag);
+        TagWriter w(c.outbox);
+        fill_module(w, c.version, *mod);
+        end_command(c, m);
+        return;
+      }
+      return send_error(c, tag, kErrNoEntity);
+    }
+    case kLoadModule: {
+      StringView name, arguments;
+      bool null_name = false, null_args = false;
+      if (!t.string(&name, &null_name) || !t.string(&arguments, &null_args)) return invalid();
+      if (null_name) return send_error(c, tag, kErrInvalid);
+      uint32_t error = 0;
+      const uint32_t index = load_module(name, null_args ? StringView() : arguments, &error);
+      if (!index) return send_error(c, tag, error ? error : kErrInvalid);
+      const uint64_t m = begin_command(c, kReply, tag);
+      TagWriter(c.outbox).u32(index);
+      end_command(c, m);
+      return;
+    }
+    case kUnloadModule: {
+      uint32_t index = 0;
+      if (!t.u32(&index)) return invalid();
+      return unload_module(index) ? send_simple_reply(c, tag) : send_error(c, tag, kErrNoEntity);
+    }
+    case kGetSampleInfoList: case kGetCardInfoList:
       return send_simple_reply(c, tag);
-    case kGetModuleInfo: case kGetSampleInfo: case kGetCardInfo: case kPlaySample: case kRemoveSample:
+    case kGetSampleInfo: case kGetCardInfo: case kPlaySample: case kRemoveSample:
       return send_error(c, tag, kErrNoEntity);
     case kCreateRecordStream: create_record(c, tag, t); return;
     case kDeleteRecordStream: {
@@ -866,10 +1082,10 @@ void PulseServer::command(Client& c, ConstByteView payload) {
       return;
     }
     case kExtension: return send_error(c, tag, kErrNoExtension);
-    case kCreateUploadStream: case kLoadModule: case kUpdatePlaybackStreamSampleRate: case kUpdateRecordStreamSampleRate: case kMoveSinkInput:
+    case kCreateUploadStream: case kUpdatePlaybackStreamSampleRate: case kUpdateRecordStreamSampleRate: case kMoveSinkInput:
     case kMoveSourceOutput: case kSetSinkPort: case kSetSourcePort: case kSetCardProfile: case kSendObjectMessage:
       return send_error(c, tag, kErrNotSupported);
-    case kExit: case kKillClient: case kUnloadModule: return send_error(c, tag, kErrAccess);
+    case kExit: case kKillClient: return send_error(c, tag, kErrAccess);
     default: return send_error(c, tag, kErrCommand);
   }
 }
@@ -1226,7 +1442,7 @@ void PulseServer::fill_sink(Client& c, TagWriter& w, uint32_t sink) {
     w.string(o.props.get("node.description"));
     w.sample_spec(SampleSpec{pulse::kS16Le, uint8_t(channels), is_virtual ? o.format.rate : hardware::kAudioSampleRate});
     w.channel_map(default_map(channels));
-    w.u32(pulse::kInvalidIndex);      // module
+    w.u32(is_virtual ? module_of(o.id) : pulse::kInvalidIndex);      // module
     w.cvolume(flat_volume(channels, linear_to_pulse_volume(o.volume)));
     w.boolean(o.mute);
     w.u32(o.id | kMonitorFlag);       // monitor source
@@ -1306,10 +1522,13 @@ void PulseServer::fill_source(Client& c, TagWriter& w, bool monitor, uint32_t of
     w.u32(monitor ? o.id | kMonitorFlag : o.id);
     w.string(monitor ? monitor_name.view() : StringView(kSourceName));
     w.string(description.view());
-    w.sample_spec(SampleSpec{pulse::kS16Le, 2, hardware::kAudioSampleRate});
-    w.channel_map(default_map(2));
-    w.u32(pulse::kInvalidIndex);      // module
-    w.cvolume(flat_volume(2, monitor ? pulse::kVolumeNorm : linear_to_pulse_volume(o.volume)));
+    // (a virtual sink's monitor holds the sink's own rate and channels)
+    const bool shaped = monitor && is_virtual;
+    const uint8_t channels = shaped && o.format.channels == 1 ? 1 : 2;
+    w.sample_spec(SampleSpec{pulse::kS16Le, channels, shaped ? o.format.rate : hardware::kAudioSampleRate});
+    w.channel_map(default_map(channels));
+    w.u32(shaped ? module_of(o.id) : pulse::kInvalidIndex);      // module
+    w.cvolume(flat_volume(channels, monitor ? pulse::kVolumeNorm : linear_to_pulse_volume(o.volume)));
     w.boolean(monitor ? false : o.mute);
     if (monitor) {
       w.u32(o.id);                    // monitor of sink

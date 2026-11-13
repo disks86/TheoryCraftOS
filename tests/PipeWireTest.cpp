@@ -2280,6 +2280,164 @@ static void test_windows_virtual_sink() {
   CHECK(service.stream_count() == 0);
 }
 
+// PulseAudio module arguments: pairs, quotes, escapes, PulseAudio property names made PipeWire's; broken lists refused; cut and bit-flipped lists
+// parsed or refused, never read past.
+static void test_module_arguments() {
+  Properties p(A);
+  CHECK(parse_module_arguments("sink_name=a  rate=16000\tchannels='1'", &p) && p.get("sink_name") == StringView("a") && p.get("rate") == StringView("16000") &&
+        p.get("channels") == StringView("1"));
+  p.clear();
+  CHECK(parse_module_arguments("sink_properties='device.description=\"My Sink\" media.role=music'", &p) &&
+        p.get("sink_properties") == StringView("device.description=\"My Sink\" media.role=music"));
+  Properties q(A);
+  CHECK(parse_module_arguments(p.get("sink_properties"), &q) && q.get("node.description") == StringView("My Sink") && q.get("media.role") == StringView("music") &&
+        !q.has("device.description"));
+  p.clear();
+  CHECK(parse_module_arguments("x=\"a \\\" b\" y=c\\ d", &p) && p.get("x") == StringView("a \" b") && p.get("y") == StringView("c d"));
+  p.clear();
+  CHECK(parse_module_arguments("", &p) && p.count() == 0 && parse_module_arguments("   ", &p) && p.count() == 0);
+  CHECK(!parse_module_arguments("novalue", &p) && !parse_module_arguments("=x", &p) && !parse_module_arguments("a='open", &p) &&
+        !parse_module_arguments("a=x\\", &p));
+  CHECK(parse_module_arguments("a=", &p) && p.has("a") && p.get("a").empty());
+  const std::string text = "sink_name=n sink_properties='device.description=\"D\"' rate=8000 channel_map=front-left,front-right";
+  std::mt19937 rng(11);
+  for (size_t cut = 0; cut <= text.size(); ++cut) {
+    Properties t(A);
+    parse_module_arguments(StringView(text.data(), cut), &t);
+  }
+  for (int i = 0; i < 400; ++i) {
+    std::string bad = text;
+    for (int b = 0; b < 2; ++b) bad[rng() % bad.size()] ^= char(1u << (rng() % 8));
+    Properties t(A);
+    parse_module_arguments(StringView(bad.data(), bad.size()), &t);
+  }
+}
+
+// pactl load-module module-null-sink: a virtual sink of the arguments, its module index on it and its monitor, listed as a module, kept when the
+// program that loaded it goes, unloaded by another one; other modules and bad arguments refused; a sink destroyed another way leaves the list.
+static void test_pulse_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  auto connect = [&](PulseClient& c, uint32_t version) {
+    uint8_t cookie[256] = {};
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99;
+    uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(version); w.arbitrary(ConstByteView(cookie, 256)); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(9, [](pulse::TagWriter& w) { Properties p(A); p.set("application.name", "pactl"); w.proplist(p); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  };
+  auto load = [&](PulseClient& c, const char* name, const char* args, uint32_t* error) {
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99, index = 0;
+    *error = 0;
+    const uint32_t t = c.command(51, [&](pulse::TagWriter& w) { w.string(name); w.string(args); });
+    if (!find_reply(c.take(), t, &body, &cmd)) return 0u;
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    if (cmd == 0) { r.u32(error); return 0u; }
+    return r.u32(&index) && r.at_end() ? index : 0u;
+  };
+  PulseClient c(server);
+  connect(c, 35);
+  uint32_t error = 0;
+  const uint32_t index = load(c, "module-null-sink", "sink_name=mysink sink_properties='device.description=\"My Sink\"' channels=1 rate=16000", &error);
+  CHECK(index && (index & PulseServer::kModuleFlag) && error == 0);
+  // the sink: its name, description, format, module
+  std::vector<uint8_t> body;
+  uint32_t cmd = 99;
+  uint32_t t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("mysink"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  uint32_t sink = 0;
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&sink) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(name == StringView("mysink") && desc == StringView("My Sink") && ss.channels == 1 && ss.rate == 16000 && module == index && g.is_virtual_sink(sink));
+  }
+  // its monitor source: the sink's format, the same module
+  t = c.command(23, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("mysink.monitor"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&idx) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(name == StringView("mysink.monitor") && ss.channels == 1 && ss.rate == 16000 && module == index);
+  }
+  // a second one with defaults: "null-sink", stereo 48 kHz, pipewire-pulse's description
+  const uint32_t index2 = load(c, "module-null-sink", nullptr, &error);
+  CHECK(index2 && index2 != index);
+  t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("null-sink"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&idx) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(desc == StringView("null-sink Audio/Sink sink") && ss.channels == 2 && ss.rate == 48000 && module == index2);
+  }
+  // the module list (version 35: a property list), one by its index
+  t = c.command(26, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i1 = 0, used = 0, i2 = 0, used2 = 0; StringView n1, a1, n2, a2; Properties p1(A), p2(A); bool a2null = false;
+    CHECK(r.u32(&i1) && r.string(&n1) && r.string(&a1) && r.u32(&used) && r.proplist(&p1) && r.u32(&i2) && r.string(&n2) && r.string(&a2, &a2null) &&
+          r.u32(&used2) && r.proplist(&p2) && r.at_end());
+    CHECK(i1 == index && n1 == StringView("module-null-sink") && a1 == StringView("sink_name=mysink sink_properties='device.description=\"My Sink\"' channels=1 rate=16000") &&
+          used == 0xFFFFFFFFu && i2 == index2 && a2.empty());
+  }
+  t = c.command(25, [&](pulse::TagWriter& w) { w.u32(index2); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(25, [&](pulse::TagWriter& w) { w.u32(12345); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+  // refused: another module, an argument it does not take, a bad value, broken quoting
+  CHECK(!load(c, "module-loopback", "", &error) && error == 5);
+  CHECK(!load(c, "module-null-sink", "latency_msec=10", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "rate=fast", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "rate=100", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "channels=0", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "sink_properties='device.description=\"x", &error) && error == 3);
+  // channel_map gives the channels when channels is not given
+  const uint32_t index3 = load(c, "module-null-sink", "sink_name=m3 channel_map=mono", &error);
+  CHECK(index3);
+  // the program goes: the sinks stay (the kernel's); an old client (version 13) sees auto_unload, not a property list
+  server.close_client(c.handle);
+  CHECK(g.is_virtual_sink(sink));
+  PulseClient old(server);
+  connect(old, 13);
+  t = old.command(25, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i = 0, used = 0; StringView n, a; bool autounload = true;
+    CHECK(r.u32(&i) && r.string(&n) && r.string(&a) && r.u32(&used) && r.boolean(&autounload) && r.at_end() && !autounload);
+  }
+  // unloaded by another program: the sink goes; again: no such module
+  t = old.command(52, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2 && !g.is_virtual_sink(sink));
+  t = old.command(52, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 0);
+  // a module's sink destroyed another way (pw-cli destroy): the module leaves the list
+  List<uint32_t> sinks(A);
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 2);
+  g.destroy_node(sinks[0]);
+  t = old.command(26, [](pulse::TagWriter&) {});
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i = 0, used = 0; StringView n, a; bool autounload = true;
+    CHECK(r.u32(&i) && r.string(&n) && r.string(&a) && r.u32(&used) && r.boolean(&autounload) && r.at_end() && i == index3);
+  }
+  // no more than kMaxModules
+  uint32_t made = 0;
+  for (uint32_t k = 0; k < PulseServer::kMaxModules + 2; ++k) made += load(old, "module-null-sink", "", &error) != 0;
+  CHECK(made == PulseServer::kMaxModules - 1);
+}
+
 // A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
 // alike), a 16 kHz sink's carries a 1 kHz tone whole and loses a 20 kHz one (above what 16 kHz can hold), and a 48 kHz stereo one changes nothing.
 static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate) {
@@ -4958,6 +5116,8 @@ int main() {
   test_windows_service();
   test_windows_virtual_sink();
   test_virtual_sink_shape();
+  test_module_arguments();
+  test_pulse_modules();
   test_camera_sources();
   test_screen_source();
   test_video_decode();
