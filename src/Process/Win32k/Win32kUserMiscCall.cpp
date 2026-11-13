@@ -30,7 +30,10 @@ enum OneParam : uint32_t {
   kGetVirtualScreenRect1, kSetKeyboardAutoRepeat, kSetThreadDpiAwarenessContext, kD3dkmtOpenAdapter, kGetAsyncKeyboardState, kGetDeskPattern
 };
 enum TwoParam : uint32_t {
-  kGetDialogProc, kGetMenuInfo, kGetMonitorInfo, kGetSystemMetricsForDpi, kMonitorFromRect, kSetIconParam, kSetImeCompositionRect, kAdjustWindowRect, kGetVirtualScreenRect2, kAllocWinProc
+  kGetDialogProc, kGetMenuInfo, kGetMonitorInfo, kGetSystemMetricsForDpi, kMonitorFromRect, kSetIconParam, kSetImeCompositionRect, kAdjustWindowRect, kGetVirtualScreenRect2, kAllocWinProc,
+  // TheoryCraftOS's own (far from Wine's): user32 collects the files the desktop dropped (WM_DROPFILES with wParam a ticket, lParam user::kDropTicketMark).
+  // (ticket, 0) answers the DROPFILES block's size; (ticket, buffer of that size) fills it and the drop is gone.
+  kTcosTakeDrop = 0x7C00
 };
 
 }  // namespace
@@ -133,6 +136,18 @@ uint64_t two_param(Call& c) {
       return c.write_struct(a, r) ? 1 : c.fail(kErrorNoAccess);
     }
     case kGetVirtualScreenRect2: return c.write_struct(a, virtual_screen_rect()) ? 1 : c.fail(kErrorNoAccess);
+    case kTcosTakeDrop: {
+      const uint64_t size = user::take_drop(c.pid(), uint32_t(a), ByteView());
+      if (size == 0) return c.fail(kErrorInvalidParameter);
+      if (b == 0) return size;
+      allocators::IAllocator* alloc = c.allocator();
+      if (!alloc) return c.fail(kErrorNotEnoughMemory);
+      ByteBuffer block(*alloc);
+      if (!block.put_zeros(size)) return c.fail(kErrorNotEnoughMemory);
+      if (!c.write(b, block.view())) return c.fail(kErrorNoAccess);      // (the caller's buffer is writable: the drop is taken)
+      if (user::take_drop(c.pid(), uint32_t(a), block.writable_view()) != size || !c.write(b, block.view())) return c.fail(kErrorNoAccess);
+      return size;
+    }
     default: return c.fail(kErrorInvalidParameter);
   }
 }

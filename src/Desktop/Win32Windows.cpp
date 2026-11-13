@@ -70,7 +70,14 @@ void Win32Window::on_drag_leave() {
   session_.desktop_drag_end();
 }
 
-bool Win32Window::accepts_drop(StringView, int32_t, int32_t, const gui::Control*) const { return drag_taken_; }
+// A drop with no drag before it (an item another session's program let go over this window, gui::Window::drop_at) is offered to the session now.
+bool Win32Window::accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const {
+  if (drag_taken_ || source) return drag_taken_;
+  const gui::Rect2D b = bounds();
+  if (session_.desktop_drag(window_, b.x + x, b.y + y, text)) return true;
+  session_.desktop_drag_end();
+  return false;
+}
 
 void Win32Window::on_drop(StringView, int32_t, int32_t, const gui::Control*) {
   drag_taken_ = false;
@@ -270,6 +277,7 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     }
   }
   if (hosts_.count() > 0) follow_pointer(manager);
+  pump_program_drag(manager);
   pump_program_drop(manager);
   if (changed_.count() > 0) {
     session_->windows(&order_);
@@ -309,6 +317,41 @@ void Win32Windows::pump_program_drop(gui::WindowManager& manager) {
   dropping_ = false;
   drop_items_.clear();
   session_->program_drop_done(drop_taken_);
+}
+
+// A program's drag over the desktop, before it is let go: the desktop's window shows its first item at the pointer (with how many more there are) and says
+// whether it would take that one, which the program hears.
+void Win32Windows::pump_program_drag(gui::WindowManager& manager) {
+  int32_t x = 0, y = 0;
+  const bool over = !dropping_ && session_->program_drag(&drag_items_, &x, &y);
+  gui::Window* window = nullptr;
+  gui::Point origin;
+  {
+    gui::UiGuard lock(&manager);
+    window = manager.window();
+    origin = manager.window_origin();
+  }
+  if (!over || !window) {
+    if (drag_window_) drag_window_->outside_drag_end();
+    drag_window_ = nullptr;
+    return;
+  }
+  const StringView all = drag_items_.view();
+  uint64_t end = 0;
+  while (end < all.size() && all[end] != '\n') ++end;
+  const StringView first = all.first(end);
+  uint32_t more = 0;
+  for (uint64_t i = end; i < all.size(); ++i) if (all[i] == '\n') ++more;
+  drag_label_.clear();
+  if (more > 0) {
+    drag_label_.append(first.substr(first.rfind('/') + 1));
+    drag_label_.append(StringView(" (+"));
+    drag_label_.append_uint(more);
+    drag_label_.push_back(')');
+  }
+  if (drag_window_ && drag_window_ != window) drag_window_->outside_drag_end();
+  drag_window_ = window;
+  session_->program_drag_answer(window->outside_drag_at(origin.x + x, origin.y + y, first, drag_label_.view()));
 }
 
 // The programs' order among their frames: their top window goes directly above the frame of theirs that is highest on the desktop (where the user or the program

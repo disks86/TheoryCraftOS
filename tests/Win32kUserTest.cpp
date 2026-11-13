@@ -1234,6 +1234,70 @@ void test_redirection() {
   pump();
   CHECK(bridge.take_drag(&edge) == a && edge == 8);
 
+  // the desktop's file dragged over the window: taken only by a window that accepts files, dropped as WM_DROPFILES whose ticket user32 turns into the
+  // DROPFILES block (its Windows name: the user's files are under C:\Users\Public\Desktop)
+  {
+    pump();
+    const Rc ar = t.window_rect(a);
+    const int32_t px = ar.l + 150, py = ar.t + 100;
+    const Rc ac = t.client_rect(a);
+    (void)ac;
+    CHECK(!bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt"));      // (no WS_EX_ACCEPTFILES)
+    user::find_window(a)->ex_style |= 0x10;
+    CHECK(!bridge.desktop_drag(a, px, py, "some text"));
+    CHECK(!bridge.desktop_drag(a, px, py, "/Linux/root/x.txt"));               // (Windows programs cannot see it)
+    CHECK(!bridge.desktop_drag(b, px, py, "/Desktop/Documents/a b.txt"));      // (the point is not b's)
+    CHECK(!bridge.desktop_drag(a, ar.r + 5, py, "/Desktop/Documents/a b.txt"));
+    CHECK(bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt"));
+    bridge.desktop_drag_end();
+    CHECK(!bridge.desktop_drop());      // (ended: nothing to drop)
+    CHECK(bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt") && bridge.desktop_drop());
+    Th::M m;
+    CHECK(t.peek(&m, 0, 0x233, 0x233) && m.hwnd == a && m.lparam == user::kDropTicketMark && m.wparam != 0);
+    const uint64_t ticket = m.wparam;
+    const std::u16string name = u"C:\\Users\\Public\\Desktop\\Documents\\a b.txt";
+    const uint64_t size = t.svc(N::NtUserCallTwoParam, {ticket, 0, 0x7C00});
+    CHECK(size == 20 + (name.size() + 2) * 2);
+    const uint64_t block = t.tmp(0x1000);
+    CHECK(t.svc(N::NtUserCallTwoParam, {ticket, block, 0x7C00}) == size);
+    gdi::Rect client;
+    CHECK(user::window_client_screen_rect(a, &client));
+    CHECK(t.mem().get32(block) == 20 && int32_t(t.mem().get32(block + 4)) == px - client.left && int32_t(t.mem().get32(block + 8)) == py - client.top);
+    CHECK(t.mem().get32(block + 12) == 0 && t.mem().get32(block + 16) == 1);      // in the client area, wide names
+    bool same = true;
+    for (uint64_t i = 0; i < name.size(); ++i) same &= t.mem().get16(block + 20 + i * 2) == name[i];
+    CHECK(same && t.mem().get16(block + 20 + name.size() * 2) == 0 && t.mem().get16(block + 22 + name.size() * 2) == 0);
+    CHECK(t.svc(N::NtUserCallTwoParam, {ticket, 0, 0x7C00}) == 0);      // (taken once)
+    CHECK(t.svc(N::NtUserCallTwoParam, {12345, 0, 0x7C00}) == 0);
+    // a child that does not take files: its parent does; a disabled one: none
+    const uint32_t child = t.create("Redir", WS_CHILD | WS_VISIBLE, 10, 10, 100, 80, a, 0, "Child");
+    pump();
+    gdi::Rect cs;
+    CHECK(user::window_screen_rect(child, &cs));
+    user::DropTarget target;
+    CHECK(user::drop_target(a, cs.left + 5, cs.top + 5, &target) && target.hwnd == a);
+    user::find_window(child)->ex_style |= 0x10;
+    CHECK(user::drop_target(a, cs.left + 5, cs.top + 5, &target) && target.hwnd == child && target.x == 5 && target.y == 5 && !target.non_client);
+    user::find_window(a)->style |= 0x08000000u;      // WS_DISABLED
+    user::find_window(child)->ex_style &= ~0x10u;
+    CHECK(!user::drop_target(a, cs.left + 5, cs.top + 5, &target));
+    user::find_window(a)->style &= ~0x08000000u;
+    user::find_window(a)->ex_style &= ~0x10u;
+    // malformed name lists are refused
+    const char16_t bad[3] = {u'x', 0, u'y'};
+    CHECK(!user::drop_files(target, ArrayView<const char16_t>(bad, 3)) && !user::drop_files(target, ArrayView<const char16_t>(bad, 1)));
+    // many drops nobody takes: the oldest go, the table stays bounded
+    user::DropTarget at{a, 1, 1, false};
+    const char16_t one[4] = {u'C', u':', 0, 0};
+    for (int i = 0; i < 40; ++i) CHECK(user::drop_files(at, ArrayView<const char16_t>(one, 4)));
+    uint32_t live = 0;
+    for (user::DropRecord& r : user::state().drops) { (void)r; ++live; }
+    CHECK(live <= 16);
+    for (int i = 0; i < 64 && t.peek(&m, 0, 0x233, 0x233); ++i) {}
+    t.svc(N::NtUserDestroyWindow, {child});
+    pump();
+  }
+
   // the icon: WM_SETICON's, shown by the desktop
   const uint32_t icon = user_misc::create_cursor_icon(91, true);
   CHECK(icon != 0 && t.svc(N::NtUserMessageCall, {a, 0x80, 0, icon, 0, 0x2b1, 0}) == 0);      // WM_SETICON ICON_SMALL

@@ -159,6 +159,12 @@ class Window final : public Control {
   // the point are asked accepts_drop() and the first that says yes gets on_drop(). False when none took it.
   bool drop_at(int32_t x, int32_t y, StringView text);
   bool drop_pending() const { return drop_target_ != nullptr; }      // a drop waits for the handler thread (drop_at would refuse another)
+  // A drag with no source over the window (an item a program drags, before it is let go): shown at the pointer like the window's own drags (`label`, else
+  // the last part of the text), the control following drags under (x, y) is told (Control::on_drag_over), and the answer is whether a control there
+  // would take it (accepts_drop; nothing is dropped). outside_drag_end() ends it. Refused (false) while the window's own drag runs.
+  bool outside_drag_at(int32_t x, int32_t y, StringView text, StringView label = StringView());
+  void outside_drag_end();
+  bool outside_dragging() const { return outside_drag_; }
 
   // --- Focus. Tab / Shift+Tab move it through focusable controls in tree order.
   Control* focus() const { return focus_; }
@@ -228,6 +234,8 @@ class Window final : public Control {
   String drag_text_, drag_label_;
   Control* drop_target_ = nullptr;   // the drop waiting for the handler thread
   Control* drag_over_ = nullptr;     // the control following the drag (Control::tracks_drag)
+  bool outside_drag_ = false;        // a drag with no source is over the window (drag_text_ / drag_label_ are its)
+  bool outside_taken_ = false;       // and a control under the pointer would take it
   void track_drag(int32_t x, int32_t y);
   void leave_drag(const Control* keep);      // drag_over_ is told the drag left (unless it is `keep`)
   Control* offer_drop(int32_t x, int32_t y, StringView text, const Control* source);      // the control that took it (null: none)

@@ -213,6 +213,8 @@ class Server final : public desktop::IWindowsSession {
   void desktop_drag_end() override;
   bool take_program_drop(String* text, int32_t* x, int32_t* y) override;
   void program_drop_done(bool taken) override;
+  bool program_drag(String* text, int32_t* x, int32_t* y) override;
+  void program_drag_answer(bool would_take) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -677,6 +679,25 @@ class Server final : public desktop::IWindowsSession {
     bool ready = false, taken = false;      // read (and given to the desktop)
     String text;                   // the items, one per line (files as system paths)
   } program_drop_;
+  // A client's drag over the desktop (outside every surface) before it is let go: its data is read as soon as it gets there (`job`), so that the
+  // desktop can show it and say whether it would be taken (program_drag); a drop there then uses what was read.
+  struct ProgramDrag {
+    explicit ProgramDrag(allocators::IAllocator& allocator) : mime(allocator), text(allocator) {}
+    uint32_t job = 0;
+    uint8_t client = 0;
+    uint32_t source = 0;
+    String mime;
+    bool uri = false;
+    bool read = false;             // the data came (text holds the items; empty: nothing for the desktop)
+    bool over = false;             // the pointer is over the desktop now
+    int32_t x = 0, y = 0;
+    int8_t answer = -1;            // what the source was last told (-1: nothing, 0: not taken, 1: taken)
+    String text;
+  } program_drag_;
+  bool choose_drop_type(const DataSourceInfo& src, String* mime, bool* uri);      // what of a source's types the desktop reads (false: none)
+  bool drop_items(ConstByteView data, bool uri, String* out);                    // the data as the desktop's items (false: none)
+  void program_drag_at(int32_t x, int32_t y, bool over);      // a client's drag is (over: outside every surface) at (x, y)
+  void reset_program_drag();
   void drag_at(int32_t x, int32_t y);      // the drag (a client's or the desktop's) is at (x, y) of the screen
   bool drag_taken();                       // the surface under the drag accepted a type and an action
   bool start_program_drop();               // a client's drag let go outside every surface: to the desktop (false: nothing it carries is for it)

@@ -114,6 +114,9 @@ inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
 // Where a Linux process sees the user's files (/Desktop with Documents, Downloads, ...), the same way: what the desktop hands a Linux program (a file
 // dropped on its window) is there for it to open.
 inline constexpr const char* kLinuxDesktopDrive = "/mnt/desktop";
+// Where a Windows process sees the user's files: C:\Users\Public\Desktop is /Desktop (a path in the Windows process's view of C:, as ProcessFiles has
+// it, without the drive). The folder of that name in /Windows is hidden by it.
+inline constexpr const char* kWindowsDesktopFolder = "/Users/Public/Desktop";
 // The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
 inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
 inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
@@ -237,6 +240,54 @@ inline bool system_path_of_linux(StringView linux_path, String* out) {
   }
   if (!out->assign(StringView(kLinux))) return false;
   return linux_path == StringView("/") || out->append(linux_path);
+}
+
+namespace detail {
+inline bool same_letters(char a, char b) { return (a >= 'A' && a <= 'Z' ? char(a + 32) : a) == (b >= 'A' && b <= 'Z' ? char(b + 32) : b); }
+}  // namespace detail
+
+// A system path as a Windows process names it, into *out: /Windows/x is C:\x, /Desktop/x is C:\Users\Public\Desktop\x. False for a path a Windows
+// process cannot see (/Linux, /AppStore, another volume, the hidden /Windows/Users/Public/Desktop) or on out-of-memory.
+inline bool windows_view_of(StringView system_path, String* out) {
+  struct Mount { const char* system; const char* seen; };
+  const Mount mounts[] = {{kDesktop, kWindowsDesktopFolder}, {kWindows, ""}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.system);
+    if (system_path.size() < root.size() || system_path.first(root.size()) != root) continue;
+    const StringView rest = system_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;
+    if (m.seen[0] == 0) {      // under /Windows: not the folder the desktop's mount hides
+      const StringView hidden(kWindowsDesktopFolder);
+      if (rest.size() >= hidden.size()) {
+        bool same = true;
+        for (uint64_t i = 0; i < hidden.size() && same; ++i) same = detail::same_letters(rest[i], hidden[i]);
+        if (same && (rest.size() == hidden.size() || rest[hidden.size()] == '/')) return false;
+      }
+    }
+    if (!out->assign(StringView("C:"))) return false;
+    for (char c : StringView(m.seen)) if (!out->push_back(c == '/' ? '\\' : c)) return false;
+    for (char c : rest) if (!out->push_back(c == '/' ? '\\' : c)) return false;
+    if (out->size() == 2) return out->push_back('\\');
+    return true;
+  }
+  return false;
+}
+
+// The other way: what a Windows process names C:\x (or C:/x) on the system. False for another drive, a relative path or on out-of-memory. (Names keep
+// the case they are written in, as for system_path_of_linux.)
+inline bool system_path_of_windows(StringView windows_path, String* out) {
+  if (windows_path.size() < 3 || !detail::same_letters(windows_path[0], 'c') || windows_path[1] != ':' || (windows_path[2] != '\\' && windows_path[2] != '/'))
+    return false;
+  String rest(out->allocator());
+  for (char c : windows_path.without_prefix(2)) if (!rest.push_back(c == '\\' ? '/' : c)) return false;
+  StringView r = rest.view();
+  while (r.size() > 1 && r[r.size() - 1] == '/') r = r.first(r.size() - 1);
+  const StringView hidden(kWindowsDesktopFolder);
+  bool desktop = r.size() >= hidden.size() && (r.size() == hidden.size() || r[hidden.size()] == '/');
+  for (uint64_t i = 0; desktop && i < hidden.size(); ++i) desktop = detail::same_letters(r[i], hidden[i]);
+  if (desktop) return out->assign(StringView(kDesktop)) && out->append(r.without_prefix(hidden.size()));
+  if (!out->assign(StringView(kWindows))) return false;
+  return r == StringView("/") || out->append(r);
 }
 
 // "/AppStore/<app>" or "/AppStore/<app>/<sub>" in *path (replacing what it held). `app` is one folder name ("Browser"); `sub` may be a

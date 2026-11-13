@@ -60,6 +60,11 @@ The user's files are there for it too, at `/mnt/desktop` (`kLinuxDesktopDrive`):
 the desktop hands a Linux program (dropped on its window, `src/Wayland/WaylandDragBridge.cpp`) is one it can open. `layout::linux_view_of()` and
 `layout::system_path_of_linux()` translate paths between the two views.
 
+Windows processes see the user's files at `C:\Users\Public\Desktop` (`kWindowsDesktopFolder`), where Windows keeps the files every user's desktop
+shows: `C:\Users\Public\Desktop\Documents\a.txt` is `/Desktop/Documents/a.txt` (names compared without regard to case), so a file dropped on a
+Windows program's window is one it can open. It is a mount: the folder of that name in `/Windows` is hidden by it (a Linux process's
+`/mnt/c/Users/Public/Desktop` is `/Desktop` too). `layout::windows_view_of()` and `layout::system_path_of_windows()` translate paths.
+
 Other volumes (USB sticks, network shares) are folders of `/` named by their label.
 
 ## Rules for new code
@@ -71,7 +76,7 @@ Other volumes (USB sticks, network shares) are folders of `/` named by their lab
 - Do not create new top-level folders in `/`. If something does not fit the table, extend the table (this file and `SystemLayout.hpp`)
   in the same change.
 - Windows and Linux processes get a view of their own root (`/Windows` as `C:\`, `/Linux` as `/`). Translate paths at the system-call
-  boundary; a process must not be able to name a path outside its root (a Linux process's `/mnt/c` and `/mnt/desktop` are the only ways out of its own).
+  boundary; a process must not be able to name a path outside its root (a Linux process's `/mnt/c` and `/mnt/desktop` and a Windows process's `C:\Users\Public\Desktop` are the only ways out of their own).
 - `/EFI` is a mount, not a folder of the primary partition. Do not create an `EFI` folder on the primary partition (it would be hidden by
   the mount).
 

@@ -26,6 +26,7 @@
 #include "Desktop/WindowsSession.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace process::win32k {
 
@@ -62,6 +63,12 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   uint32_t capture_window() override;
   void pointer(Pointer* out) override;
   bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) override;
+  // The desktop's drag of a file over a program's window: taken by a window that accepts files (WS_EX_ACCEPTFILES) under the pointer, which gets
+  // WM_DROPFILES with the file's Windows name (filesystem::layout::windows_view_of: C:\..., the user's files under C:\Users\Public\Desktop) when it
+  // is let go. Text, and files Windows programs cannot see, are not taken.
+  bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) override;
+  bool desktop_drop() override;
+  void desktop_drag_end() override;
 
   // (with the system lock held)
   void top_level_changed(uint32_t hwnd) override;
@@ -82,6 +89,10 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   uint32_t pending_count_ = 0;
   bool overflow_ = false;
   uint32_t drag_window_ = 0, drag_edge_ = 0;      // (guarded by the system lock too)
+  // the desktop's drag (the desktop's input thread only): where it would be dropped, and the name (NUL-terminated, then a NUL)
+  user::DropTarget drop_target_;
+  bool drop_ok_ = false;
+  UniquePointer<WideString> drop_names_;
   bool attached_ = false;
 };
 

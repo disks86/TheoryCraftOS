@@ -29,6 +29,11 @@
 // (file URIs only, percent-decoded, through layout::system_path_of_linux), one per line, and the desktop drops them where the button was let go
 // (take_program_drop; Win32Windows drops each on the desktop window there). program_drop_done tells the source dnd_finished when something took it, else
 // cancelled. One such drop at a time.
+//
+// Before it is let go, a client's drag that leaves every surface is read the same way at once (program_drag_at), so that the desktop can show what it
+// carries under the pointer and ask its windows whether they would take it (program_drag; Win32Windows::pump_program_drag). Its answer
+// (program_drag_answer) goes to the source as target (the type read, or null) and action (copy, or none), as a client destination's accept would. Let go
+// over the desktop, the drop uses what was read, or the read still under way (no second read).
 #include "FileSystem/SystemLayout.hpp"
 #include "Wayland/WaylandInternal.hpp"
 
@@ -36,7 +41,8 @@ namespace wayland {
 
 namespace {
 
-constexpr uint64_t kMaxDropData = 1u << 20;      // (more than a megabyte of URIs or text is not a drop)
+constexpr uint64_t kMaxDropData = 1u << 20;
+constexpr uint32_t kCopy = 1;      // (wl_data_device_manager.dnd_action copy)      // (more than a megabyte of URIs or text is not a drop)
 
 bool unreserved(uint8_t c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '/';
@@ -170,40 +176,60 @@ void Server::reset_program_drop() {
   program_drop_.ready = program_drop_.taken = program_drop_.uri = false;
 }
 
+bool Server::choose_drop_type(const DataSourceInfo& src, String* mime, bool* uri) {
+  const String* chosen = nullptr;
+  *uri = false;
+  for (const String& t : src.mimes.view())
+    if (t.view() == StringView("text/uri-list")) chosen = &t, *uri = true;
+  if (!chosen)
+    for (const String& t : src.mimes.view())
+      if (text_type_of(t.view()) && (!chosen || t.view() == StringView("text/plain;charset=utf-8"))) chosen = &t;
+  return chosen && mime->assign(chosen->view());
+}
+
 bool Server::start_program_drop() {
-  if (!attached_ || program_drop_.job != 0) return false;
+  if (!attached_ || program_drop_.job != 0 || program_drop_.ready) return false;
   DataSourceInfo* src = source_of(drag_.client, drag_.source);
   if (!src) return false;
-  const String* chosen = nullptr;
+  ProgramDrag& g = program_drag_;
+  const bool reading = g.job != 0 && g.client == drag_.client && g.source == drag_.source;      // (the drag over the desktop asked for the data)
+  const bool read_already = reading && g.read;
+  if (read_already && g.text.empty()) return false;      // (nothing in it is for the desktop: cancelled)
   bool uri = false;
-  for (const String& t : src->mimes.view())
-    if (t.view() == StringView("text/uri-list")) chosen = &t, uri = true;
-  if (!chosen)
-    for (const String& t : src->mimes.view())
-      if (text_type_of(t.view()) && (!chosen || t.view() == StringView("text/plain;charset=utf-8"))) chosen = &t;
-  if (!chosen || !program_drop_.mime.assign(chosen->view())) return false;
+  if (!choose_drop_type(*src, &program_drop_.mime, &uri)) return false;
   program_drop_.client = drag_.client;
   program_drop_.source = drag_.source;
   program_drop_.uri = uri;
   program_drop_.x = pointer_x_;
   program_drop_.y = pointer_y_;
-  TransportRequest r;
-  r.kind = TransportRequest::Kind::MakePipe;
-  r.job = next_job_++;
-  program_drop_.job = r.job;
-  request(util::move(r));
+  if (read_already) {      // what the drag over the desktop read is the drop
+    if (!program_drop_.text.assign(g.text.view())) {
+      reset_program_drop();
+      return false;
+    }
+    program_drop_.job = g.job;      // (a job of its own: none is coming)
+    program_drop_.ready = true;
+  } else if (reading) {
+    program_drop_.job = g.job;      // (the read under way is the drop's: its pipe and data come to program_drop_ now)
+  } else {
+    TransportRequest r;
+    r.kind = TransportRequest::Kind::MakePipe;
+    r.job = next_job_++;
+    program_drop_.job = r.job;
+    request(util::move(r));
+  }
+  reset_program_drag();
   if (Client* sc = client_of(drag_.client)) send(*sc, Event(drag_.source, 3));      // dnd_drop_performed
   drag_ = Drag();      // (over for the compositor: the source waits for dnd_finished or cancelled, program_drop_done)
   pointer_moved(false);
   return true;
 }
 
-void Server::program_drop_read(ConstByteView data) {
-  ProgramDrop& p = program_drop_;
-  p.text.clear();
+bool Server::drop_items(ConstByteView data, bool uri, String* out) {
+  out->clear();
   const ConstByteView bytes = data.size() > kMaxDropData ? data.first(0) : data;
   const StringView all(reinterpret_cast<const char*>(bytes.data()), bytes.size());      // (bytes of text: a view of them as characters)
-  if (p.uri) {
+  if (uri) {
     for (uint64_t at = 0; at < all.size();) {
       uint64_t end = at;
       while (end < all.size() && all[end] != '\n') ++end;
@@ -216,22 +242,112 @@ void Server::program_drop_read(ConstByteView data) {
       bool clean = true;
       for (char ch : system.view()) if (ch == '\n') clean = false;      // (one item per line)
       if (!clean) continue;
-      if (!p.text.empty()) p.text.push_back('\n');
-      p.text.append(system.view());
+      if (!out->empty()) out->push_back('\n');
+      out->append(system.view());
     }
   } else {
     for (char ch : all) {      // text, as it is (a NUL ends it)
       if (ch == 0) break;
-      if (!p.text.push_back(ch == '\n' ? ' ' : ch)) break;      // (one item: lines joined)
+      if (!out->push_back(ch == '\n' ? ' ' : ch)) break;      // (one item: lines joined)
     }
   }
-  if (p.text.empty()) {      // nothing for the desktop: the source hears it was cancelled
+  return !out->empty();
+}
+
+void Server::program_drop_read(ConstByteView data) {
+  ProgramDrop& p = program_drop_;
+  if (!drop_items(data, p.uri, &p.text)) {      // nothing for the desktop: the source hears it was cancelled
     if (Client* c = client_of(p.client); c && source_of(p.client, p.source)) send(*c, Event(p.source, 2));
     reset_program_drop();
     wake_wanted_ = true;
     return;
   }
   p.ready = true;
+}
+
+// ------------------------------------------------------------------ a client's drag over the desktop
+
+void Server::reset_program_drag() {
+  ProgramDrag& g = program_drag_;
+  g.job = 0;
+  g.client = 0;
+  g.source = 0;
+  g.mime.clear();
+  g.text.clear();
+  g.uri = g.read = g.over = false;
+  g.answer = -1;
+}
+
+void Server::program_drag_at(int32_t x, int32_t y, bool over) {
+  ProgramDrag& g = program_drag_;
+  if (!drag_.active || drag_.desktop || drag_.source == 0 || !attached_) return;
+  const bool same = g.job != 0 && g.client == drag_.client && g.source == drag_.source;
+  if (!over) {
+    if (same && g.over && g.answer == 1)      // (it was the desktop's: a surface's accept decides now)
+      if (Client* sc = client_of(g.client); sc && source_of(g.client, g.source)) {
+        Event t(g.source, 0);      // target(null)
+        t.u(0);
+        send(*sc, t);
+      }
+    if (same) {
+      g.over = false;
+      g.answer = -1;
+    }
+    return;
+  }
+  if (!same) {      // first time over the desktop: read what it carries
+    reset_program_drag();
+    DataSourceInfo* src = source_of(drag_.client, drag_.source);
+    bool uri = false;
+    if (!src || !choose_drop_type(*src, &g.mime, &uri)) return;
+    g.client = drag_.client;
+    g.source = drag_.source;
+    g.uri = uri;
+    TransportRequest r;
+    r.kind = TransportRequest::Kind::MakePipe;
+    r.job = next_job_++;
+    g.job = r.job;
+    request(util::move(r));
+  }
+  g.over = true;
+  g.x = x;
+  g.y = y;
+}
+
+bool Server::program_drag(String* text, int32_t* x, int32_t* y) {
+  kernel::ScopedMutex lock(mutex_);
+  const ProgramDrag& g = program_drag_;
+  if (g.job == 0 || !g.over || !g.read || g.text.empty() || !drag_.active || drag_.client != g.client || drag_.source != g.source) return false;
+  if (!text->assign(g.text.view())) return false;
+  *x = g.x;
+  *y = g.y;
+  return true;
+}
+
+void Server::program_drag_answer(bool would_take) {
+  {
+    kernel::ScopedMutex lock(mutex_);
+    ProgramDrag& g = program_drag_;
+    if (g.job == 0 || !g.over || !drag_.active || drag_.client != g.client || drag_.source != g.source) return;
+    Client* sc = client_of(g.client);
+    DataSourceInfo* src = source_of(g.client, g.source);
+    if (!sc || !src) return;
+    const bool copies = src->actions == 0 || (src->actions & kCopy);      // (the desktop only copies)
+    const int8_t answer = would_take && copies ? 1 : 0;
+    if (answer == g.answer) return;
+    g.answer = answer;
+    Event t(g.source, 0);      // target(mime or null)
+    if (answer) t.string(g.mime.view());
+    else t.u(0);
+    send(*sc, t);
+    Resource* r = sc->objects.find(g.source);
+    if (r && r->version >= 3) {
+      Event a(g.source, 5);      // action
+      a.u(answer ? kCopy : 0);
+      send(*sc, a);
+    }
+  }
+  wake();
 }
 
 bool Server::take_program_drop(String* text, int32_t* x, int32_t* y) {

@@ -3887,6 +3887,93 @@ static void test_desktop_drag_bridge() {
   server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
   server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
   CHECK(!server.take_program_drop(&items, &dx, &dy) && !app.closing);
+  // a client's drag over the desktop before it is let go: read at once, shown to the desktop, whose answer the source hears as target and action
+  {
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sd = app.source({"text/uri-list", "text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(sd).u(w.surface).u(0).u(0));
+    CHECK(take_pipe_job(server) == 0 && !server.program_drag(&items, &dx, &dy));      // (over its own surface: not the desktop's)
+    server.mouse_position(600, 400);
+    const uint32_t dj = take_pipe_job(server);
+    CHECK(dj != 0 && !server.program_drag(&items, &dx, &dy));      // (asked for, not read yet)
+    server.pipe_ready(dj, Fd::make_as<TestMemory>(A, &write_end));
+    CHECK(app.take(sd, 1).s(0) == "text/uri-list");
+    const std::string one = "file:///mnt/desktop/Pictures/p.png\r\nfile:///etc/hosts\r\n";
+    server.pipe_read_done(dj, ConstByteView(reinterpret_cast<const uint8_t*>(one.data()), one.size()));
+    server.mouse_position(610, 405);
+    CHECK(server.program_drag(&items, &dx, &dy) && dx == 610 && dy == 405 && items.view() == StringView("/Desktop/Pictures/p.png\n/Linux/etc/hosts"));
+    app.drop_events();
+    server.program_drag_answer(true);
+    Ev target = app.take(sd, 0);
+    CHECK(target.object == sd && target.s(0) == "text/uri-list" && app.take(sd, 5).u(0) == 1);
+    app.drop_events();
+    server.program_drag_answer(true);
+    CHECK(!app.has(sd, 0) && !app.has(sd, 5));      // (told once)
+    server.program_drag_answer(false);
+    CHECK(app.has(sd, 0) && app.take(sd, 5).u(0) == 0);
+    server.program_drag_answer(true);
+    // back over its surface: not the desktop's any more (the source hears target null), and the desktop no longer sees it
+    app.drop_events();
+    server.mouse_position(150, 130);
+    CHECK(!server.program_drag(&items, &dx, &dy) && app.has(sd, 0));
+    server.program_drag_answer(true);      // (ignored: it is not over the desktop)
+    CHECK(!app.has(sd, 5));
+    // out again: what was read is kept (no second read); let go there, the drop is what was read, at once
+    server.mouse_position(620, 410);
+    CHECK(take_pipe_job(server) == 0 && server.program_drag(&items, &dx, &dy));
+    server.mouse_button(1, false);
+    CHECK(app.has(sd, 3) && take_pipe_job(server) == 0);
+    CHECK(server.take_program_drop(&items, &dx, &dy) && dx == 620 && items.view() == StringView("/Desktop/Pictures/p.png\n/Linux/etc/hosts"));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.program_drop_done(true);
+    CHECK(app.has(sd, 4));
+    // let go while the read is under way: the drop takes that read over
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t se = app.source({"text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(se).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t ej = take_pipe_job(server);
+    server.mouse_button(1, false);
+    CHECK(ej != 0 && app.has(se, 3) && take_pipe_job(server) == 0);
+    server.pipe_ready(ej, Fd::make_as<TestMemory>(A, &write_end));
+    CHECK(app.take(se, 1).s(0) == "text/plain");
+    const std::string word = "hello";
+    server.pipe_read_done(ej, ConstByteView(reinterpret_cast<const uint8_t*>(word.data()), word.size()));
+    CHECK(server.take_program_drop(&items, &dx, &dy) && items.view() == StringView("hello"));
+    server.program_drop_done(false);
+    CHECK(app.has(se, 2));
+    // what was read has nothing for the desktop: never shown, and let go there it is cancelled
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sf = app.source({"text/uri-list"}, 1);
+    app.send(Msg(app.device, 0).u(sf).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t fj = take_pipe_job(server);
+    server.pipe_ready(fj, Fd::make_as<TestMemory>(A, &write_end));
+    server.pipe_read_done(fj, ConstByteView(reinterpret_cast<const uint8_t*>(web.data()), web.size()));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.mouse_button(1, false);
+    CHECK(app.has(sf, 2) && !app.has(sf, 3) && !server.take_program_drop(&items, &dx, &dy));
+    // the source going while it is over the desktop: nothing left of it
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sg = app.source({"text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(sg).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t gj = take_pipe_job(server);
+    app.send(Msg(sg, 1));      // destroy
+    server.pipe_ready(gj, Fd::make_as<TestMemory>(A, &write_end));
+    server.pipe_read_done(gj, ConstByteView(reinterpret_cast<const uint8_t*>(word.data()), word.size()));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.program_drag_answer(true);
+    server.mouse_button(1, false);
+    CHECK(!server.take_program_drop(&items, &dx, &dy) && !app.closing);
+  }
   // while a client's drag runs, the desktop's drag is not let in
   server.mouse_position(150, 130);
   server.mouse_button(1, true);

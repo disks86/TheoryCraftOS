@@ -412,6 +412,72 @@ static void test_window_manager_hints() {
   CHECK(p.b.size() == 32 && p.b[0] == 0 && p.b[1] == 10);
 }
 
+// Docks and struts: a dock goes in the top band with no taskbar button and keeps the space its strut asks for (counted from the edge of the desktop's panel
+// area, so what the taskbar already covers is not kept twice); a partial strut whose range misses the monitor keeps nothing; a desktop window goes below
+// everything.
+static void test_struts() {
+  Server s(A);
+  s.attach(6, 19);
+  // two monitors side by side; the first has a 40-pixel taskbar along its bottom
+  const Server::Monitor monitors[2] = {{{0, 0, 1280, 800}, {0, 0, 1280, 760}, {0, 0, 1280, 760}}, {{1280, 0, 1024, 768}, {1280, 0, 1024, 768}, {}}};
+  s.set_display(2304, 800, ArrayView<const Server::Monitor>(monitors, 2));
+  Client c(s, true);
+  CHECK(c.setup());
+  const uint32_t type = c.intern("_NET_WM_WINDOW_TYPE"), dock = c.intern("_NET_WM_WINDOW_TYPE_DOCK"), backdrop = c.intern("_NET_WM_WINDOW_TYPE_DESKTOP");
+  const uint32_t strut = c.intern("_NET_WM_STRUT"), partial = c.intern("_NET_WM_STRUT_PARTIAL");
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  // a top panel on the first monitor
+  const uint32_t top = c.create_window(kRoot, 0, 0, 1280, 30, kStructure);
+  c.change_property(top, type, 4 /* ATOM */, 32, {dock});
+  c.change_property(top, partial, 6 /* CARDINAL */, 32, {0, 0, 30, 0, 0, 0, 0, 0, 0, 1279, 0, 0});
+  c.send(Request(true, 8).u32(top).done());
+  CHECK(s.window_info(top, &info, &title));
+  CHECK(info.layer == 1 && info.tool && !info.caption && info.reserve_edge == 2 && info.reserve == 30);
+  CHECK(info.window.x == 0 && info.window.y == 0 && info.window.width == 1280);
+  // a bottom dock 50 high along the taskbar's edge: only the 10 pixels past the taskbar are kept
+  const uint32_t bottom = c.create_window(kRoot, 0, 750, 1280, 50, kStructure);
+  c.change_property(bottom, type, 4, 32, {dock});
+  c.change_property(bottom, strut, 6, 32, {0, 0, 0, 50});
+  c.send(Request(true, 8).u32(bottom).done());
+  CHECK(s.window_info(bottom, &info, &title) && info.reserve_edge == 4 && info.reserve == 10);
+  // the strut changes: the desktop hears about it
+  List<uint32_t> changed(A);
+  List<desktop::IWindowsSession::Repaint> repainted(A);
+  s.take_changes(&changed, &repainted);
+  c.change_property(bottom, strut, 6, 32, {0, 0, 0, 0});
+  c.drain();
+  s.take_changes(&changed, &repainted);
+  bool saw = false;
+  for (uint32_t id : changed.view()) saw |= id == bottom;
+  CHECK(saw);
+  CHECK(s.window_info(bottom, &info, &title) && info.reserve_edge == 0 && info.reserve == 0);
+  // a left panel on the second monitor: its left edge is 1280 pixels from the screen's, so a strut of 1280 + 48 keeps 48
+  const uint32_t left = c.create_window(kRoot, 1280, 0, 48, 768, kStructure);
+  c.change_property(left, type, 4, 32, {dock});
+  c.change_property(left, partial, 6, 32, {1328, 0, 0, 0, 0, 767, 0, 0, 0, 0, 0, 0});
+  c.send(Request(true, 8).u32(left).done());
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 1 && info.reserve == 48);
+  // a partial strut whose range is off the monitor keeps nothing
+  c.change_property(left, partial, 6, 32, {1328, 0, 0, 0, 900, 1000, 0, 0, 0, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  // a short or wrongly typed strut is ignored, as is a huge one
+  c.change_property(left, partial, 6, 32, {1328, 0});
+  c.change_property(left, strut, 6, 32, {0xFFFFFFFFu, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  c.change_property(left, strut, 6, 8, {48, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  // a desktop window: the background band
+  const uint32_t desk = c.create_window(kRoot, 0, 0, 1280, 800, kStructure);
+  c.change_property(desk, type, 4, 32, {backdrop});
+  c.send(Request(true, 8).u32(desk).done());
+  CHECK(s.window_info(desk, &info, &title) && info.layer == -2 && info.tool && !info.caption && info.reserve_edge == 0);
+  // an ordinary window stays in the normal band, keeping nothing
+  const uint32_t plain = c.create_window(kRoot, 10, 10, 100, 100, kStructure);
+  c.send(Request(true, 8).u32(plain).done());
+  CHECK(s.window_info(plain, &info, &title) && info.layer == 0 && !info.tool && info.reserve_edge == 0);
+}
+
 static void test_drawing() {
   Server s(A);
   Client c(s, false);
@@ -951,6 +1017,7 @@ int main() {
   test_setup();
   test_windows_and_properties();
   test_window_manager_hints();
+  test_struts();
   test_drawing();
   test_input();
   test_errors();

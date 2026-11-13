@@ -107,6 +107,21 @@ bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, 
 // A GPU present into a window (a flip of a swapchain made for it): the picture (32-bit pixels, rows `pitch` bytes apart, B, G, R, A bytes or R, G, B, A when `rgba`)
 // goes into the window surface over the client area, stretched to it (nearest pixel) when the sizes differ. False when the window is not a redirected one (the caller shows it
 // on the display then). The caller holds the lock.
+// Files dropped by the desktop (WM_DROPFILES). drop_target: the window under the screen point (x, y) that takes files (WS_EX_ACCEPTFILES, it or the nearest
+// ancestor) inside the top-level `top_level`, with the point in its client coordinates; false when none does. drop_files: queues WM_DROPFILES there with
+// the names (Windows paths, each NUL-terminated, a NUL after the last); its wParam is a ticket and its lParam kDropTicketMark, which the program's
+// user32 turns into an HDROP when it takes the message (take_drop). Both take the lock.
+struct DropTarget {
+  uint32_t hwnd = 0;
+  int32_t x = 0, y = 0;
+  bool non_client = false;
+};
+inline constexpr uint64_t kDropTicketMark = 0x54434450;      // 'TCDP'
+bool drop_target(uint32_t top_level, int32_t x, int32_t y, DropTarget* out);
+bool drop_files(const DropTarget& target, ArrayView<const char16_t> names);
+// The DROPFILES block (x64: pFiles, pt, fNC, fWide, then the wide names) of process `pid`'s drop `ticket`: its size, and when `out` is not empty
+// (exactly that size), the block in it, after which the drop is gone. 0: no such drop (or `out` has the wrong size). The caller holds the lock.
+uint64_t take_drop(uint64_t pid, uint32_t ticket, ByteView out);
 bool window_redirected_locked(uint32_t hwnd);
 bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t width, uint32_t height, uint32_t pitch, bool rgba);                       // SC_CLOSE, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE
 

@@ -17,9 +17,12 @@
  */
 
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
+#include "Utility/ByteStream.hpp"
+#include "Utility/Utf16.hpp"
 
 namespace process::win32k {
 
@@ -288,5 +291,37 @@ void DesktopBridge::pointer(Pointer* out) {
 bool DesktopBridge::cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
   return user::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
 }
+
+bool DesktopBridge::desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) {
+  drop_ok_ = false;
+  if (window == 0 || text.empty() || text[0] != '/') return false;
+  allocators::IAllocator* a = system_allocator();
+  if (!a) return false;
+  if (!drop_names_) {
+    drop_names_ = UniquePointer<WideString>::make(*a, *a);
+    if (!drop_names_) return false;
+  }
+  String name(*a);
+  ByteBuffer units(*a);
+  if (!filesystem::layout::windows_view_of(text, &name) || !util::append_utf16le(&units, name.view())) return false;
+  drop_names_->clear();
+  ByteReader in(units.view());
+  while (in.remaining() >= 2) {
+    const char16_t c = char16_t(in.le16());
+    if (c == 0 || !drop_names_->append(c)) return false;      // (a NUL would end the name early)
+  }
+  if (!drop_names_->append(char16_t(0)) || !drop_names_->append(char16_t(0))) return false;
+  if (!user::drop_target(window, x, y, &drop_target_)) return false;
+  drop_ok_ = true;
+  return true;
+}
+
+bool DesktopBridge::desktop_drop() {
+  const bool ok = drop_ok_ && drop_names_ && user::drop_files(drop_target_, drop_names_->view());
+  drop_ok_ = false;
+  return ok;
+}
+
+void DesktopBridge::desktop_drag_end() { drop_ok_ = false; }
 
 }  // namespace process::win32k
