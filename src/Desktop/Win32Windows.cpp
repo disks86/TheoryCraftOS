@@ -442,8 +442,98 @@ void Win32Windows::tap_key(const hardware::KeyEvent& event, uint8_t modifiers) {
     grabbed_ = false;
     released_ = true;
   }
+  if (compose_key(event.usage, modifiers)) return;      // (taken by the input method: its release is not handed over either)
   slot = static_cast<uint8_t>(slot | bit);
   session_->key(event.usage, true, modifiers);
+}
+
+namespace {
+
+// The value of a hex digit key (letters a-f, the digit row, the keypad), or -1.
+int hex_of(uint8_t usage) {
+  if (usage >= 0x04 && usage <= 0x09) return 10 + (usage - 0x04);
+  if (usage >= 0x1E && usage <= 0x26) return 1 + (usage - 0x1E);
+  if (usage == 0x27 || usage == 0x62) return 0;
+  if (usage >= 0x59 && usage <= 0x61) return 1 + (usage - 0x59);
+  return -1;
+}
+
+// `code` in UTF-8 into `out` (4 bytes); its length, 0 for no character (a surrogate, past U+10FFFF, or a control character below U+0020).
+uint32_t utf8_of(uint32_t code, char (&out)[4]) {
+  if (code < 0x20 || code == 0x7F || (code >= 0xD800 && code <= 0xDFFF) || code > 0x10FFFF) return 0;
+  if (code < 0x80) { out[0] = static_cast<char>(code); return 1; }
+  if (code < 0x800) { out[0] = static_cast<char>(0xC0 | code >> 6); out[1] = static_cast<char>(0x80 | (code & 0x3F)); return 2; }
+  if (code < 0x10000) {
+    out[0] = static_cast<char>(0xE0 | code >> 12), out[1] = static_cast<char>(0x80 | ((code >> 6) & 0x3F)), out[2] = static_cast<char>(0x80 | (code & 0x3F));
+    return 3;
+  }
+  out[0] = static_cast<char>(0xF0 | code >> 18), out[1] = static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+  out[2] = static_cast<char>(0x80 | ((code >> 6) & 0x3F)), out[3] = static_cast<char>(0x80 | (code & 0x3F));
+  return 4;
+}
+
+}  // namespace
+
+// Unicode entry, as IBus and GTK have it: Ctrl+Shift+U starts it (when the window with the keyboard takes composed text), hex digits (up to six) make the
+// code point, shown by the program as "u1f600" being composed; Space or Enter puts the character in, Backspace takes a digit back, Escape (or any other
+// key, which then goes on to the program) gives up. Modifier keys always go on, so the program's idea of them stays right.
+bool Win32Windows::compose_key(uint8_t usage, uint8_t modifiers) {
+  using namespace hardware::modifier;
+  if (usage >= 0xE0 && usage <= 0xE7) return false;
+  IWindowsSession::TextInputState state;
+  if (!composing_) {
+    const bool ctrl = modifiers & kControl, shift = modifiers & kShift, alt = modifiers & (kLeftAlt | kRightAlt);
+    if (usage != 0x18 || !ctrl || !shift || alt) return false;      // (U)
+    if (!session_->text_input(&state) || !state.enabled) return false;
+    composing_ = true;
+    compose_window_ = state.window;
+    compose_code_ = 0;
+    compose_digits_ = 0;
+    if (!session_->text_preedit("u", 1)) composing_ = false;
+    return composing_;
+  }
+  // the window with the keyboard changed, or stopped taking text: the composing is over and the key is the program's
+  if (!session_->text_input(&state) || !state.enabled || state.window != compose_window_) {
+    composing_ = false;
+    return false;
+  }
+  auto show = [&]() {
+    char text[8] = {'u'};
+    uint32_t n = 1;
+    for (int shift = 4 * (compose_digits_ - 1); shift >= 0; shift -= 4) text[n++] = "0123456789abcdef"[(compose_code_ >> shift) & 15];
+    session_->text_preedit(StringView(text, n), n);
+  };
+  const int digit = hex_of(usage);
+  if (digit >= 0 && !(modifiers & (kControl | kLeftAlt | kRightAlt))) {
+    if (compose_digits_ < 6) {
+      compose_code_ = compose_code_ * 16 + static_cast<uint32_t>(digit);
+      ++compose_digits_;
+    }
+    show();
+    return true;
+  }
+  if (usage == 0x2A) {      // Backspace
+    if (compose_digits_ == 0) {
+      composing_ = false;
+      session_->text_preedit(StringView(), 0);
+    } else {
+      compose_code_ >>= 4;
+      --compose_digits_;
+      show();
+    }
+    return true;
+  }
+  if (usage == 0x2C || usage == 0x28 || usage == 0x58) {      // Space, Enter, keypad Enter
+    composing_ = false;
+    char utf8[4];
+    const uint32_t n = compose_digits_ > 0 ? utf8_of(compose_code_, utf8) : 0;
+    if (n > 0) session_->text_commit(StringView(utf8, n));
+    else session_->text_preedit(StringView(), 0);
+    return true;
+  }
+  composing_ = false;
+  session_->text_preedit(StringView(), 0);
+  return usage == 0x29;      // (Escape is taken; anything else goes on)
 }
 
 bool Win32Windows::tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y) {

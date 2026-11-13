@@ -806,6 +806,7 @@ add_executable(BOOTX64
   src/Wayland/WaylandServer.cpp
   src/Wayland/WaylandSocketServer.cpp
   src/Wayland/WaylandTablet.cpp
+  src/Wayland/WaylandTextInput.cpp
   src/Wayland/WaylandYuv.cpp
   src/Wayland/WaylandSurfaces.cpp
   src/Process/Sockets.cpp

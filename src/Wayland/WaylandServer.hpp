@@ -205,6 +205,9 @@ class Server final : public desktop::IWindowsSession {
   // The pen (zwp_tablet_v2): over a surface whose client has a tablet seat it is taken (proximity_in, then motion, pressure, tilt, down / up, buttons,
   // each report a frame; the surface keeps it while the tip touches); elsewhere refused (the desktop moves the pointer). Out of range: proximity_out.
   bool pen(const desktop::PenInput& input) override;
+  bool text_input(TextInputState* out) override;
+  bool text_preedit(StringView text, uint32_t cursor) override;
+  bool text_commit(StringView text) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -224,7 +227,8 @@ class Server final : public desktop::IWindowsSession {
     DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
     Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
     RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
-    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool, LayerShell, LayerSurface,
+    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool, LayerShell, LayerSurface, TextInputManager,
+    TextInput,
   };
   struct Surface;
   struct Client;
@@ -258,6 +262,23 @@ class Server final : public desktop::IWindowsSession {
     bool valid() const { return (memory || gpu || yuv) && width > 0; }
     uint32_t pitch() const { return yuv ? uint32_t(width) : uint32_t(stride / 4); }      // words between rows of buffer_pixels
     GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
+  };
+  // A zwp_text_input_v3: its double-buffered state, what the client last committed, the surface it was entered on.
+  struct TextInputInfo {
+    explicit TextInputInfo(allocators::IAllocator& allocator) : pending(allocator), current(allocator) {}
+    struct State {
+      explicit State(allocators::IAllocator& allocator) : surrounding(allocator) {}
+      bool enabled = false, enable_seen = false, surrounding_set = false, rect_set = false;
+      String surrounding;
+      int32_t cursor = 0, anchor = 0;
+      uint32_t hint = 0, purpose = 0;
+      Rect rect;      // the text cursor, surface coordinates
+    };
+    State pending, current;
+    bool enabled = false;
+    bool preedit_shown = false;
+    uint32_t commits = 0;      // (the serial of done)
+    uint32_t entered = 0;      // the surface it was entered on (0: none)
   };
   // A wl_data_source: what it offers.
   struct DataSourceInfo {
@@ -305,6 +326,7 @@ class Server final : public desktop::IWindowsSession {
     Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
     SharedPointer<DataSourceInfo> source;       // wl_data_source, zwp_primary_selection_source_v1
     SharedPointer<OfferInfo> offer;             // wl_data_offer, zwp_primary_selection_offer_v1
+    SharedPointer<TextInputInfo> text_input;    // zwp_text_input_v3
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
     uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
   };
@@ -655,6 +677,9 @@ class Server final : public desktop::IWindowsSession {
   void pen_leave();               // proximity_out (and up first, if the tip touched) to the client that has the pen
   void tablet_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
   void layer_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void text_input_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);      // (WaylandTextInput.cpp)
+  TextInputInfo* focused_text_input(Client** client, uint32_t* id);
+  void text_input_focus(Surface* old, Surface* now);
   // A layer surface's commit (from apply): checks, the first configure, mapping. False: a protocol error was posted.
   bool commit_layer(Client& c, Surface& s, bool had_buffer);
   // Places every layer surface again (anchors, margins, the others' exclusive zones) and asks those whose size changed for the new one.

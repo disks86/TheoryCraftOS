@@ -519,6 +519,13 @@ void Server::forget_surface(Surface& s) {
   if (drag_.origin == &s) end_drag(false);      // (its origin went: the drag is cancelled)
   if (pointer_focus_ == &s) pointer_focus_ = nullptr;
   if (keyboard_focus_ == &s) keyboard_focus_ = nullptr;
+  if (Client* c = client_of(s.client)) {      // (text inputs entered on it are entered on nothing now; no leave names a surface that is gone)
+    ObjectCursor cursor;
+    for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
+      const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
+      if (kv->value.iface == Iface::TextInput && kv->value.text_input && kv->value.text_input->entered == s.id) kv->value.text_input->entered = 0;
+    }
+  }
   if (cursor_surface_ == &s) cursor_surface_ = nullptr;
 }
 

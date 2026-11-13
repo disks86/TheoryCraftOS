@@ -2692,6 +2692,193 @@ static void test_layer_fuzz() {
   free_made();
 }
 
+// ------------------------------------------------------------------ zwp_text_input_v3
+
+static void test_text_input() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  desktop::IWindowsSession::TextInputState st;
+  CHECK(!server.text_input(&st) && !server.text_preedit("x", 1) && !server.text_commit("x"));
+  App app(server);
+  CHECK(app.globals["zwp_text_input_manager_v3"].second == 1);
+  const uint32_t mgr = app.bind(app.reg, "zwp_text_input_manager_v3");
+  const uint32_t keyboard = app.new_id();
+  app.send(Msg(app.seat, 1).u(keyboard));
+  const uint32_t ti = app.new_id();
+  app.send(Msg(mgr, 1).u(ti).u(app.seat));
+  CHECK(!app.has(ti, 0));      // (no focus yet: no enter)
+  App::Window w = app.toplevel(true, "editor");
+  app.show(w, 300, 200, 0xFFFFFFFFu);
+  const uint32_t win = listed(server)[0];
+  server.move_window(win, {100, 100, 308, 232});      // inside at (104, 128)
+  server.activate_window(win);
+  Ev enter = app.take(ti, 0);
+  CHECK(enter.object == ti && enter.u(0) == w.surface);
+  // entered but not enabled: the input method sees nothing
+  CHECK(!server.text_input(&st));
+  // enable with a cursor and a content type, committed
+  app.send(Msg(ti, 1));
+  app.send(Msg(ti, 6).i(30).i(40).i(2).i(16));
+  app.send(Msg(ti, 5).u(0x200).u(1));
+  app.send(Msg(ti, 3).s("hello").i(5).i(5));
+  CHECK(!server.text_input(&st));      // (not committed yet)
+  app.send(Msg(ti, 7));
+  CHECK(server.text_input(&st) && st.enabled && st.window == win && st.cursor.x == 104 + 30 && st.cursor.y == 128 + 40 && st.cursor.height == 16 &&
+        st.hint == 0x200 && st.purpose == 1);
+  // preedit and commit: each closed with done(the number of commits)
+  app.drop_events();
+  CHECK(server.text_preedit("u1f6", 4));
+  Ev pre = app.take(ti, 2);
+  CHECK(pre.object == ti && pre.s(0) == "u1f6" && pre.i(3) == 4 && pre.i(4) == 4);      // (the string takes words 0 to 2)
+  Ev done = app.take(ti, 5);
+  CHECK(done.object == ti && done.u(0) == 1);
+  CHECK(server.text_preedit("", 0));
+  pre = app.take(ti, 2);
+  CHECK(pre.object == ti && pre.u(0) == 0);      // (null: no preedit)
+  CHECK(server.text_commit("\xf0\x9f\x98\x80"));
+  Ev com = app.take(ti, 3);
+  CHECK(com.object == ti && com.s(0) == "\xf0\x9f\x98\x80" && app.take(ti, 5).u(0) == 1);
+  CHECK(!server.text_commit("\xf0\x9f"));      // (a cut character is not sent)
+  // a second commit: the serial follows
+  app.send(Msg(ti, 7));
+  app.drop_events();
+  CHECK(server.text_commit("a") && app.take(ti, 5).u(0) == 2);
+  // disabled: nothing takes text
+  app.send(Msg(ti, 2));
+  app.send(Msg(ti, 7));
+  CHECK(!server.text_input(&st) && !server.text_commit("a"));
+  // enabled again, then the focus goes to another client's window: leave; the other client's text input enters
+  app.send(Msg(ti, 1));
+  app.send(Msg(ti, 7));
+  App other(server);
+  const uint32_t mgr2 = other.bind(other.reg, "zwp_text_input_manager_v3");
+  const uint32_t ti2 = other.new_id();
+  other.send(Msg(mgr2, 1).u(ti2).u(other.seat));
+  App::Window w2 = other.toplevel(true, "other");
+  app.drop_events();
+  other.show(w2, 100, 100, 0xFF000000u);
+  CHECK(app.take(ti, 1).u(0) == w.surface);
+  CHECK(other.take(ti2, 0).u(0) == w2.surface);
+  CHECK(!server.text_input(&st));      // (the other one is not enabled)
+  other.send(Msg(ti2, 1));
+  other.send(Msg(ti2, 7));
+  CHECK(server.text_input(&st) && st.window != win);
+  CHECK(server.text_commit("b") && other.take(ti2, 3).s(0) == "b");
+  // a text input made while its client has the keyboard is entered at once
+  const uint32_t ti3 = other.new_id();
+  other.send(Msg(mgr2, 1).u(ti3).u(other.seat));
+  CHECK(other.take(ti3, 0).u(0) == w2.surface);
+  // the focused surface goes: its text inputs are entered on nothing (no leave naming a dead surface)
+  other.send(Msg(w2.toplevel, 0));
+  other.send(Msg(w2.xdg, 0));
+  other.send(Msg(w2.surface, 0));
+  CHECK(!server.text_input(&st) && !other.closing);
+  // errors: surrounding text cut in the middle of a character, a cursor past it; another seat object
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    const uint32_t t = bad.new_id();
+    bad.send(Msg(m, 1).u(t).u(bad.seat));
+    bad.send(Msg(t, 3).s("ab\xc3").i(0).i(0));
+    CHECK(bad.error() && bad.closing);
+  }
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    const uint32_t t = bad.new_id();
+    bad.send(Msg(m, 1).u(t).u(bad.seat));
+    bad.send(Msg(t, 3).s("ab").i(3).i(0));
+    CHECK(bad.error() && bad.closing);
+  }
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    bad.send(Msg(m, 1).u(bad.new_id()).u(bad.compositor));
+    CHECK(bad.error() && bad.closing);
+  }
+  CHECK(!app.closing && !other.closing);
+}
+
+// Bit flips over a session that enables text inputs, sets their state and is given text.
+static void test_text_input_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(24).s("zwp_text_input_manager_v3").u(1).u(5));
+  add(Msg(2, 0).u(4).s("wl_seat").u(8).u(6));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(7));
+  add(Msg(5, 1).u(8).u(6));                       // text input
+  add(Msg(3, 0).u(10));
+  add(Msg(4, 2).u(11).u(10));
+  add(Msg(11, 1).u(12));
+  add(Msg(10, 6));
+  add(Msg(11, 4).u(1));
+  add(Msg(7, 0).u(13).i(4096 * 16));
+  add(Msg(13, 0).u(14).i(0).i(32).i(32).i(128).u(1));
+  add(Msg(10, 1).u(14).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(8, 1));
+  add(Msg(8, 3).s("caf\xc3\xa9 au lait").i(5).i(2));
+  add(Msg(8, 4).u(0));
+  add(Msg(8, 5).u(0x1FF).u(4));
+  add(Msg(8, 6).i(3).i(4).i(1).i(12));
+  add(Msg(8, 7));
+  add(Msg(5, 1).u(15).u(6));
+  add(Msg(15, 2));
+  add(Msg(15, 7));
+  add(Msg(15, 0));
+  add(Msg(8, 2));
+  add(Msg(8, 7));
+  add(Msg(1, 0).u(16));
+  std::vector<uint8_t> pool(4096 * 16, 0x33);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &pool)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      desktop::IWindowsSession::TextInputState st;
+      if (server.text_input(&st)) {
+        server.text_preedit("u4", 2);
+        server.text_commit("\xe2\x82\xac");
+      }
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    for (uint32_t w : list.view()) server.activate_window(w);
+    server.close_client(c);
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(31);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   text input fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
 // ------------------------------------------------------------------ GPU buffers over the kernel's Direct3D layer (dxgk exports, Wayland/Dxg)
 
 namespace dst = dxgk::status;
@@ -4010,6 +4197,8 @@ int main() {
   test_yuv_fuzz();
   test_layer_shell();
   test_layer_fuzz();
+  test_text_input();
+  test_text_input_fuzz();
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();

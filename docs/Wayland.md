@@ -15,6 +15,7 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | AF_UNIX listener with SCM_RIGHTS, the compositor's kernel thread | `src/Wayland/WaylandSocketServer.{hpp,cpp}` |
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
 | YUV formats: their layouts and the conversion to RGB (`wl_shm` and dmabuf) | `src/Wayland/WaylandYuv.{hpp,cpp}` |
+| `zwp_text_input_v3`: composed text; the desktop's input method (Unicode entry) | `src/Wayland/WaylandTextInput.cpp`; `Win32Windows::compose_key` over `IWindowsSession::text_input` / `text_preedit` / `text_commit` |
 | `zwlr_layer_shell_v1`: panels, backgrounds, overlays | `src/Wayland/WaylandLayerShell.cpp`; the desktop's layers and reserved edges in `src/Gui/Windows/{Frame,WindowManager}` |
 | The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
 | Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
@@ -112,6 +113,19 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
 - **Checked:** another role or a buffer already there (`role`, `already_constructed`), the layer (`invalid_layer`, also for `set_layer`), the anchor
   bits, the keyboard mode (`on_demand` from version 4), a size of 0 without both anchors at commit (`invalid_size`), a buffer before the first configure
   (`invalid_surface_state`), `get_popup` of a popup that has a parent; an `xdg_popup` still without a parent at its first commit is `invalid_popup_parent`.
+
+## Text input (zwp_text_input_v3)
+
+`src/Wayland/WaylandTextInput.cpp`. A client enables a text input while one of its text fields has the focus, and says where the text cursor is, what
+surrounds it and what kind of text it wants (all double-buffered, applied at `commit`; `enable` resets what came before it). A text input is entered
+when its client's surface gets the keyboard and left when it loses it (a destroyed surface is simply forgotten: no `leave` names it). Surrounding
+text must be whole UTF-8, at most 4000 bytes, with the cursor and anchor inside it.
+
+The input method is the desktop's (`IWindowsSession::text_input`, `text_preedit`, `text_commit`, which any session may implement): **Unicode entry**
+as IBus and GTK have it. Ctrl+Shift+U, while the window with the keyboard has an enabled text input, starts it; hex digits (up to six) are shown by the
+program as `u1f600` being composed (`preedit_string`, the caret at its end); Space or Enter puts the character in (`commit_string`), Backspace takes a
+digit back, Escape gives up, any other key gives up and goes on to the program. The keys it takes never reach the program; modifier keys always do.
+Each batch ends with `done(serial)`, the serial being the number of commits the client made.
 
 ## Scale, transforms, viewports
 
@@ -257,6 +271,7 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
+| Text input: enter and leave with the keyboard, enable / disable, the cursor rectangle on the screen, content type, preedit (shown and hidden), commit, the serial of `done`, a second client taking the focus, a text input made while its client has the keyboard, a destroyed focused surface, invalid surrounding text, about 1600 fuzzed sessions; the desktop's Unicode entry (é, an emoji with a digit taken back, Escape, another key, a surrogate, nothing typed, the window ceasing to take text, Ctrl+Shift+U passed on when nothing takes text) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
 | Layer shell: a top panel keeping its height, a notification anchored with margins, a bar below the panel's zone, zone -1, a size change re-placing the others, the monitors' panel area, a maximized toplevel under the panel, `set_layer`, a destroyed panel freeing its zone, unmap and map again, the three keyboard modes, a popup of a layer surface, every protocol error, about 1600 fuzzed sessions; the window manager's bands and reserved edges (raising, restacking, a band change, Alt+Tab, maximize, several areas, too large a reservation) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
 | YUV: all 17 formats converted at five sizes with and without row padding against a floating-point BT.601 reference, every truncation (a plane one byte short, a stride shorter than its row, a missing plane, a short output) refused with nothing written, random samples; the `wl_shm` layouts; NV12 at an odd pool offset, YUYV, I420 and P010 through `wl_shm` (drawn, sampled, a later commit showing the new picture); NV12 in two descriptors and I420 in one through dmabuf; every refusal and error; about 1600 fuzzed sessions | `tests/run_host_tests.sh WaylandServerTest` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
@@ -307,7 +322,9 @@ depends on itself:
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL's frames are GPU buffers, but the kernel's GL copies each frame into the buffer's image with the CPU instead of drawing there (see the plan above).
   Not tried on a real GPU (only the software renderer and virgl).
-- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet). Layer shell: one output (the primary monitor; the output
+- **Protocols.** Text input: the only input method is Unicode entry (no on-screen keyboard, no IME for CJK, no emoji picker); surrounding text and the
+  content type are kept but not used; `delete_surrounding_text` is never sent; Windows and X programs get no composed text (only Wayland's text input
+  takes it). Not tried with a real toolkit's text field (GTK and foot bind the text input; nothing checks what they do with the text). Layer shell: one output (the primary monitor; the output
   argument is only checked), no `zwlr_layer_surface_v1.closed` (outputs never go away), version 5's `set_exclusive_edge` not offered, exclusive zones
   of one edge add up in no particular order (wlroots keeps the order of arrival), and the desktop's own taskbar is not one of the reserved edges (layer
   surfaces are placed above it). X windows' struts (`_NET_WM_STRUT`) and dock windows do not reserve edges yet. Touches have no shape or orientation events and no touch-to-pointer fallback inside a client that has a `wl_touch` (a client that binds

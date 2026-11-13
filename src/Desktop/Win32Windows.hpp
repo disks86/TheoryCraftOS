@@ -172,6 +172,12 @@ class Win32Windows {
   bool released_ = false;                  // Ctrl+Alt let a confined pointer go: nothing is handed over until the next click on a Windows window
   uint8_t buttons_ = 0;                    // the buttons held as the programs know them (hardware::mouse_button bits)
   uint8_t keys_down_[32] = {};             // the keys whose press was handed over (their release is too)
+  // The input method: Unicode entry (Ctrl+Shift+U, hex digits, Space or Enter), into a window that takes composed text (IWindowsSession::text_input).
+  // Returns true when it took the key (it then never reaches the program).
+  bool compose_key(uint8_t usage, uint8_t modifiers);
+  bool composing_ = false;
+  uint32_t compose_window_ = 0, compose_code_ = 0;
+  uint8_t compose_digits_ = 0;
 };
 
 }  // namespace desktop

@@ -29,7 +29,7 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 23;
+constexpr uint32_t kGlobalCount = 24;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 6}, {"zxdg_decoration_manager_v1", 1},
@@ -38,7 +38,7 @@ constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wp_viewporter", 1}, {"wp_fractional_scale_manager_v1", 1},
     {"xdg_activation_v1", 1}, {"wp_cursor_shape_manager_v1", 1}, {"zwp_primary_selection_device_manager_v1", 1}, {"zwp_relative_pointer_manager_v1", 1},
     {"zwp_pointer_constraints_v1", 1}, {"wp_presentation", 1}, {"zwp_idle_inhibit_manager_v1", 1}, {"zxdg_exporter_v2", 1}, {"zxdg_importer_v2", 1},
-    {"zwp_tablet_manager_v2", 1}, {"zwlr_layer_shell_v1", 4},
+    {"zwp_tablet_manager_v2", 1}, {"zwlr_layer_shell_v1", 4}, {"zwp_text_input_manager_v3", 1},
 };
 constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 
@@ -325,7 +325,7 @@ void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t versi
                                            Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager,
                                            Iface::Viewporter, Iface::FractionalScaleManager, Iface::Activation, Iface::CursorShapeManager,
                                            Iface::PrimaryManager, Iface::RelativePointerManager, Iface::PointerConstraints, Iface::Presentation,
-                                           Iface::IdleInhibitManager, Iface::Exporter, Iface::Importer, Iface::TabletManager, Iface::LayerShell};
+                                           Iface::IdleInhibitManager, Iface::Exporter, Iface::Importer, Iface::TabletManager, Iface::LayerShell, Iface::TextInputManager};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -525,6 +525,9 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
       return;
     case Iface::LayerShell: case Iface::LayerSurface:
       layer_request(c, id, r, opcode, in);
+      return;
+    case Iface::TextInputManager: case Iface::TextInput:
+      text_input_request(c, id, r, opcode, in);
       return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");

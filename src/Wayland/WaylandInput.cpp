@@ -504,7 +504,9 @@ void Server::set_keyboard_focus(Surface* s) {
       }
     }
   }
+  Surface* old_focus = keyboard_focus_;
   keyboard_focus_ = s;
+  text_input_focus(old_focus, s);      // (WaylandTextInput.cpp: leave and enter)
   last_mods_[0] = last_mods_[1] = ~0u;
   if (!s) return;
   Client* c = client_of(s->client);

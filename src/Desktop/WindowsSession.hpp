@@ -137,6 +137,27 @@ class IWindowsSession {
   virtual bool pen(const PenInput& input) {
     (void)input;
     return false;
+  }
+  // Text input, the input method's side. text_input says whether the window with the keyboard takes composed text (a text field of its has the focus and
+  // asked for it: Wayland's zwp_text_input_v3) and where its text cursor is. text_preedit shows `text` as being composed at that cursor (empty: none),
+  // with the caret `cursor` bytes into it; text_commit puts `text` in place of it. Both false when nothing takes text now. By default nothing does.
+  struct TextInputState {
+    bool enabled = false;
+    uint32_t window = 0;
+    WindowsRect cursor;                // in the screen's coordinates
+    uint32_t hint = 0, purpose = 0;    // (zwp_text_input_v3's content hint bits and purpose)
+  };
+  virtual bool text_input(TextInputState* out) {
+    *out = TextInputState();
+    return false;
+  }
+  virtual bool text_preedit(StringView text, uint32_t cursor) {
+    (void)text, (void)cursor;
+    return false;
+  }
+  virtual bool text_commit(StringView text) {
+    (void)text;
+    return false;
   }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is
   virtual bool cursor_confined() = 0;                                         // a program keeps the cursor in a rectangle (ClipCursor): the pointer stays with it
