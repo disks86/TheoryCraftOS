@@ -53,8 +53,14 @@ bool ScreenSource::watcher_came() {
   return came;
 }
 
+uint64_t ScreenSource::published() {
+  kernel::ScopedMutex guard(mutex_);
+  return published_;
+}
+
 ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, uint64_t now_us) {
   if (!channel_ || width == 0 || height == 0 || width > VideoFormat::kMaxSide || height > VideoFormat::kMaxSide || !watched()) return ArrayView<uint32_t>();
+  kernel::ScopedMutex guard(mutex_);
   if (last_us_ && now_us - last_us_ < 1000000ull / kFps) return ArrayView<uint32_t>();
   const uint64_t pixels = uint64_t{width} * height;
   if (frame_.count() < pixels) {
@@ -63,11 +69,16 @@ ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, 
       if (!frame_.push_back(0)) return ArrayView<uint32_t>();
   }
   last_us_ = now_us;
+  now_us_ = now_us;
+  filling_ = true;
   return frame_.view().first(pixels);
 }
 
 void ScreenSource::frame_read(uint32_t width, uint32_t height, int64_t pts_ns) {
+  kernel::ScopedMutex guard(mutex_);
+  filling_ = false;
   if (!channel_ || uint64_t{width} * height > frame_.count()) return;
+  sent_us_ = now_us_;
   if (width != width_ || height != height_) {
     VideoFormat f;
     f.format = kSpaBGRx;
@@ -81,6 +92,17 @@ void ScreenSource::frame_read(uint32_t width, uint32_t height, int64_t pts_ns) {
   }
   const ArrayView<const uint32_t> words = ArrayView<const uint32_t>(frame_.view()).first(uint64_t{width} * height);
   if (channel_->publish(words_as_bytes(words), width * 4, pts_ns)) ++published_;
+}
+
+bool ScreenSource::keep_alive(uint64_t now_us) {
+  if (!channel_ || !watched()) return false;
+  kernel::ScopedMutex guard(mutex_);
+  if (filling_ || !width_ || !height_ || now_us - sent_us_ < kKeepAliveUs) return false;
+  sent_us_ = now_us;
+  const ArrayView<const uint32_t> words = ArrayView<const uint32_t>(frame_.view()).first(uint64_t{width_} * height_);
+  if (!channel_->publish(words_as_bytes(words), width_ * 4, static_cast<int64_t>(now_us * 1000))) return false;
+  ++published_;
+  return true;
 }
 
 }  // namespace pipewire

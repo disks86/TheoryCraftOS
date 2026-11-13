@@ -2411,6 +2411,51 @@ static void test_screen_source() {
   screen.frame_read(16, 8, 78);
   CHECK(screen.published() == 2 && seen->format().width == 16 && seen->latest() && seen->latest()->pixels.size() == 512);
   CHECK(screen.frame_wanted(VideoFormat::kMaxSide + 1, 4, now + 300000).empty());
+  // a still screen: the last frame again once a second, never while one is being read
+  const uint64_t before = screen.published();
+  CHECK(!screen.keep_alive(now + 600000) && screen.published() == before);      // (0.5 s after the last)
+  CHECK(screen.keep_alive(now + 1200000) && screen.published() == before + 1 && seen->latest() && seen->latest()->pixels.size() == 512);
+  CHECK(!screen.keep_alive(now + 1300000));
+  ArrayView<uint32_t> filling = screen.frame_wanted(16, 8, now + 2300000);
+  CHECK(!filling.empty() && !screen.keep_alive(now + 2400000));      // (being read)
+  screen.frame_read(16, 8, 79);
+  CHECK(screen.published() == before + 2);
+  // the render thread and the loop at once: every frame that goes out is whole (all its pixels one value)
+  {
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> clock{now + 10000000};
+    std::thread render([&] {
+      for (uint32_t value = 1; value < 400; ++value) {
+        ArrayView<uint32_t> f2 = screen.frame_wanted(16, 8, clock.fetch_add(150000));
+        if (f2.empty()) continue;
+        for (uint32_t& p : f2) p = 0xFF000000u | value;
+        screen.frame_read(16, 8, 0);
+      }
+      stop = true;
+    });
+    std::thread loop([&] {
+      while (!stop.load()) {
+        screen.keep_alive(clock.fetch_add(400000));
+        std::this_thread::yield();
+      }
+    });
+    int torn = 0, frames = 0;
+    uint64_t last = seen->latest() ? seen->latest()->sequence : 0;      // (the frames before the threads were not filled in: not counted)
+    while (!stop.load()) {
+      SharedPointer<VideoFrame> fr = seen->latest();
+      if (fr && fr->sequence != last) {
+        last = fr->sequence;
+        ++frames;
+        const ConstByteView v = fr->pixels.view();
+        for (uint64_t k = 4; k < v.size(); k += 4) if (v[k] != v[0]) { ++torn; break; }
+      }
+      std::this_thread::yield();
+    }
+    render.join();
+    loop.join();
+    if (torn || !frames) printf("screen threads: %d frames, %d torn\n", frames, torn);
+    CHECK(torn == 0 && frames > 0);
+  }
   g.destroy_node(watcher);
   CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
 }

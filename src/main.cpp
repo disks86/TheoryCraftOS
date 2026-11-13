@@ -2747,6 +2747,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
         camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
         if (screen_source.watcher_came()) desktop.window().invalidate();      // (a frame for the new watcher, even of a still screen)
+        screen_source.keep_alive(now_us);      // (a still screen: its last frame again once a second)
       }
       if (threaded) {
         desktop.pump(hardware::uptime_us());

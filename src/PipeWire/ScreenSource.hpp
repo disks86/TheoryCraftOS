@@ -19,10 +19,12 @@
 // The screen in the kernel's PipeWire graph (Graph.hpp), for screen sharing and recording (what xdg-desktop-portal's ScreenCast hands programs on
 // Linux: OBS, a video call's "share screen"): a Video/Source node of the kernel's ("tcos-screen") whose frames are what the desktop draws, BGRx at
 // the screen's size, at most kFps a second and only while someone watches. The desktop's window gives it frames (gui::IFrameTap in main.cpp: the
-// renderer reads its frame back between drawing and presenting); frames come only when the desktop draws, so a watcher of a still screen gets the
-// last one again only when it changes (the caller makes the window draw once when a watcher comes).
+// renderer reads its frame back between drawing and presenting). Frames come when the desktop draws (the caller makes the window draw once when a
+// watcher comes); while the screen is still, the last one is sent again once a second (keep_alive), so a watcher always has a recent frame.
+// The render thread (frame_wanted, frame_read) and the kernel's loop (keep_alive) may call it at once.
 #pragma once
 #include <stdint.h>
+#include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 #include "PipeWire/Graph.hpp"
 
@@ -47,7 +49,10 @@ class ScreenSource {
   ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height, uint64_t now_us);
   // The frame is in that buffer: published (the channel's format follows the screen's size).
   void frame_read(uint32_t width, uint32_t height, int64_t pts_ns);
-  uint64_t published() const { return published_; }
+  // While watched: the last frame again when none was sent for kKeepAliveUs. Returns whether it sent one.
+  bool keep_alive(uint64_t now_us);
+  static constexpr uint64_t kKeepAliveUs = 1000000;
+  uint64_t published();
 
  private:
   Graph& graph_;
@@ -59,6 +64,10 @@ class ScreenSource {
   uint64_t last_us_ = 0;
   bool had_watchers_ = false;
   uint64_t published_ = 0;
+  kernel::Mutex mutex_;      // (the frame, its size and times: the render thread's and the loop's)
+  bool filling_ = false;     // the render thread is reading a frame into frame_ (between frame_wanted and frame_read)
+  uint64_t sent_us_ = 0;     // when a frame last went out
+  uint64_t now_us_ = 0;      // (the time of the frame being filled)
 };
 
 }  // namespace pipewire
