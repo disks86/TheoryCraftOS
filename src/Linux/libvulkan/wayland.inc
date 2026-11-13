@@ -226,7 +226,7 @@ static void wl_swapchain_free(WlSwapchain *w) {
   vk_free(w);
 }
 
-static VkResult vk_os_swapchain_made(Swapchain *sc) {
+static VkResult wl_swapchain_made(Swapchain *sc) {
   const WlSurface *ws = sc->surface->os;
   if (sc->n > 8) return VK_ERROR_INITIALIZATION_FAILED;
   WlSwapchain *w = vk_alloc(sizeof(WlSwapchain));
@@ -295,12 +295,12 @@ static VkResult vk_os_swapchain_made(Swapchain *sc) {
   return VK_SUCCESS;
 }
 
-static void vk_os_swapchain_gone(Swapchain *sc) {
+static void wl_swapchain_gone(Swapchain *sc) {
   if (sc->os) wl_swapchain_free(sc->os);
   sc->os = NULL;
 }
 
-static VkResult vk_os_acquire(Swapchain *sc, uint64_t timeout, uint32_t *index) {
+static VkResult wl_acquire(Swapchain *sc, uint64_t timeout, uint32_t *index) {
   WlSwapchain *w = sc->os;
   if (g_wl.dispatch_queue_pending(w->display, w->queue) < 0) w->lost = true;      /* (releases that arrived since) */
   for (;;) {
@@ -319,7 +319,7 @@ static VkResult vk_os_acquire(Swapchain *sc, uint64_t timeout, uint32_t *index) 
   }
 }
 
-static VkResult vk_os_present(Swapchain *sc, uint32_t index) {
+static VkResult wl_present(Swapchain *sc, uint32_t index) {
   WlSwapchain *w = sc->os;
   WlSlot *slot = &w->slot[index];
   while (!w->lost && w->frame)      /* FIFO: the previous frame has been shown first */

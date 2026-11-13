@@ -2,7 +2,7 @@
  *
  * - shown by the kernel: a swapchain image is an allocation the kernel can show (flip), into its window's client area when the surface names a window of the desktop (the
  *   kernel copies it into the window's surface), else on the display. VK_KHR_win32_surface on Windows, VK_EXT_headless_surface on Linux.
- * - shown by a compositor (VK_KHR_wayland_surface on Linux): the platform's surface has `os` set, its swapchain images are shareable allocations (made like an image with
+ * - shown by someone else (VK_KHR_wayland_surface, VK_KHR_xcb_surface and VK_KHR_xlib_surface on Linux): the platform's surface has `os` set, its swapchain images are shareable allocations (made like an image with
  *   VkExternalMemoryImageCreateInfo), and the platform hands them to the compositor (vk_os.h: vk_os_swapchain_made / gone, vk_os_acquire, vk_os_present).
  *
  * Making a surface is the platform's: it fills in a Surface (make_surface), and says how big its window is (vk_os_surface_extent). */
@@ -58,8 +58,11 @@ VKAPI VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDe
   Surface *s = (Surface *)surface;
   memset(c, 0, sizeof *c);
   uint32_t w = 0, h = 0;
-  if (compositor_surface(s)) w = h = 0xFFFFFFFFu;      /* (the swapchain says how big the surface is: a Wayland window takes the size of its buffers) */
-  else if (!vk_os_surface_extent(s, &w, &h) || w == 0 || h == 0) w = 640, h = 480;
+  if (compositor_surface(s)) {
+    if (!vk_os_surface_extent(s, &w, &h) || w == 0 || h == 0) w = h = 0xFFFFFFFFu;      /* (an X window has a size; a Wayland window takes the size of its buffers) */
+  } else if (!vk_os_surface_extent(s, &w, &h) || w == 0 || h == 0) {
+    w = 640, h = 480;
+  }
   uint32_t dim = pd->caps.max_texture_dimension ? pd->caps.max_texture_dimension : 4096;
   c->minImageCount = 2, c->maxImageCount = 8;
   c->currentExtent.width = w, c->currentExtent.height = h;

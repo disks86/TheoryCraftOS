@@ -98,15 +98,20 @@ transform stretches an upright crop and leaves a turned picture undrawn. A surfa
 
 ## Copy and paste, drag and drop
 
-- **The selection** is a client's `wl_data_source` or the desktop's clipboard text. The client with the keyboard is offered it (`wl_data_offer` with
+- **The selection** is a client's `wl_data_source` or the desktop's clipboard (its text, or its picture). The client with the keyboard is offered it (`wl_data_offer` with
   its types, then `wl_data_device.selection`) when the keyboard comes to it and whenever the selection changes. A paste (`wl_data_offer.receive` with
-  a pipe) is passed on to the source's client as it is (`wl_data_source.send` with the same descriptor), or, for the desktop's text, the transport
-  writes the text into the pipe and closes it.
+  a pipe) is passed on to the source's client as it is (`wl_data_source.send` with the same descriptor), or, for the desktop's text or picture, the
+  transport writes it into the pipe and closes it.
 - **The desktop's clipboard follows** (`kernel::Clipboard`, `Server::set_clipboard`). A client's selection with text (`text/plain;charset=utf-8`,
   `text/plain`, `UTF8_STRING`, `STRING`, `TEXT`) is read at once through a pipe the transport makes (`TransportRequest`, up to 16 MiB) and put on
   the clipboard, so Windows and desktop programs paste it; text the desktop's programs copy becomes the selection (the client's source is
   cancelled). The clipboard is touched only outside the compositor's lock (its observer keeps the Windows clipboard the same and takes the system's
   locks): `tick()`, which the transport calls each round, looks at it.
+- **Pictures** go as PNG files (`image/png`) when the server has the codecs (`Server::set_clipboard_images`: `src/Wayland/Media/WaylandClipboardPng.cpp`
+  over `src/Media`'s PNG codec, given by `main.cpp`, so the compositor itself builds without the media code). A picture the desktop copies is encoded
+  once (RGBA when some pixel is not opaque, else RGB) and offered as the one type `image/png`; every paste gets the same bytes. A client's selection
+  with `image/png` and no text type is read like text and decoded onto the clipboard as its picture (an animation's first frame); a file the decoder
+  refuses changes nothing. Text wins over a picture when a source offers both.
 - **Descriptors pass through.** A descriptor a client sends that the compositor does not read itself (a pipe's end) is kept with its use of its token
   and sent on unchanged; one the compositor lets go of is released by the transport's thread (`SocketServer::Graveyard`), never under the
   compositor's lock.
@@ -189,10 +194,10 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | What | How |
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
-| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard) | `tests/wayland_interop.sh` |
+| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
-| Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
+| Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
@@ -245,8 +250,8 @@ depends on itself:
   panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
   sessions no tablet or touch input). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
   desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
-- **Clipboard and drag and drop.** Only text reaches the desktop's clipboard (pictures and other types stay between Wayland clients); the
-  desktop's pictures are not offered. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
+- **Clipboard and drag and drop.** Text and PNG pictures reach the desktop's clipboard; other types (HTML, URIs, other image formats such as
+  `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
   and Windows or X programs are not bridged. Selection and drag serials are not checked.
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's

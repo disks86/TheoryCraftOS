@@ -50,5 +50,25 @@ grep -q "faulted=0" "$out" || fail=1
 # the window, framed, showing the last frame (purple, 0xFF8040C0, within a step of rounding)
 grep -Eq 'framed window "Linux Vulkan swapchain" pixel ff(7f|80)(3f|40)(bf|c0)' "$out" || { echo "the window did not reach the desktop with its last frame"; fail=1; }
 grep -Eq "wayland-desktop: [1-9][0-9]* draws on the device, [1-9][0-9]* on the CPU" "$out" || { echo "the desktop did not draw the swapchain's images both ways"; fail=1; }
+
+# the same program through the Khronos loader (the development machine's libvulkan.so.1) with this driver as its installable client driver: libvulkan_tcos.so
+# and its manifest at the system's paths, which the loader finds by itself
+if [ -e /usr/lib/libvulkan.so.1 ]; then
+  loader=$(readlink -f /usr/lib/libvulkan.so.1)
+  lfiles=$( { ldd "$work/vkswapchain" | awk '/=>/ { if ($3 ~ /^\// && $1 != "libvulkan.so.1") print $3 } /^\t\// { print $1 }'
+              ldd "$loader" | awk '/=>/ { if ($3 ~ /^\//) print $3 }'
+              readelf -l "$work/vkswapchain" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'; } | sort -u | paste -sd:)
+  lfiles="$lfiles:$loader=/usr/lib/libvulkan.so.1:$work/lib/x86_64/libvulkan_tcos.so=/usr/lib/libvulkan_tcos.so"
+  lfiles="$lfiles:$work/lib/x86_64/tcos_icd.x86_64.json=/usr/share/vulkan/icd.d/tcos_icd.x86_64.json"
+  echo "== vkswapchain through the Khronos loader ($(basename "$loader")) and libvulkan_tcos.so"
+  out=$work/vkswapchain-loader.out
+  TCOS_EMU_ENV=TCOS_VK_LOADER=1 TCOS_EMU_LINUX_FILES=$lfiles "$emu/emurun" "$work/vkswapchain" | tee "$out"
+  grep -q "vk-swapchain: [0-9]* checks, 0 failed" "$out" || fail=1
+  grep -q "faulted=0" "$out" || fail=1
+  grep -Eq 'framed window "Linux Vulkan swapchain" pixel ff(7f|80)(3f|40)(bf|c0)' "$out" || { echo "the window did not reach the desktop through the loader"; fail=1; }
+  grep -Eq "wayland-desktop: [1-9][0-9]* draws on the device, [1-9][0-9]* on the CPU" "$out" || { echo "the desktop did not draw the swapchain's images (loader)"; fail=1; }
+else
+  echo "(no Khronos loader on this machine: the installable client driver was not tried)"
+fi
 [ $fail -eq 0 ] && echo "linux vulkan wayland emulated: all passed" || echo "linux vulkan wayland emulated: FAILED"
 exit $fail
