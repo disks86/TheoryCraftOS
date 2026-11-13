@@ -109,6 +109,18 @@ static void drain_mixer(audio::AudioMixer& mixer, FakeDevice& dev, int rounds = 
   }
 }
 
+// A file of the tests' data (empty when it is not there).
+static std::vector<uint8_t> read_test_file(const char* path) {
+  std::vector<uint8_t> out;
+  if (FILE* f = fopen(path, "rb")) {
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.insert(out.end(), buf, buf + n);
+    fclose(f);
+  }
+  return out;
+}
+
 // The clock the tests move by hand (nanoseconds).
 static std::atomic<uint64_t> g_now_ns{1000000000ull};
 static uint64_t test_clock() { return g_now_ns.load(); }
@@ -2447,12 +2459,20 @@ static void test_video_watcher() {
   seq = 0;
   CHECK(w.latest(&seq, &px, &width, &height, &why) && px.count() == 8);
   if (px.count() == 8) CHECK((px[0] >> 24) == 0xFF && abs(int((px[0] >> 16) & 0xFF) - 128) < 4 && abs(int(px[0] & 0xFF) - 128) < 4);
-  // encoded: said, not shown
+  // Motion JPEG: decoded (a real file, 64 x 48); a broken one said; other encoded video said, not shown
   VideoFormat mjpg;
   mjpg.subtype = 0x20002;
   cam->set_format(mjpg);
-  const uint8_t jpeg[4] = {0xFF, 0xD8, 0xFF, 0xD9};
-  CHECK(cam->publish(ConstByteView(jpeg, 4), 0, 0));
+  const std::vector<uint8_t> jpeg = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+  CHECK(jpeg.size() > 100 && cam->publish(ConstByteView(jpeg.data(), jpeg.size()), 0, 0));
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && width == 64 && height == 48 && px.count() == 64 * 48 && (px[0] >> 24) == 0xFF);
+  const uint8_t broken[4] = {0xFF, 0xD8, 0xFF, 0xD9};
+  CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A Motion JPEG picture that cannot be decoded"));
+  VideoFormat h264;
+  h264.subtype = 0x20001;
+  cam->set_format(h264);
+  CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
   CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video (not shown)"));
   // the producer goes
   g.destroy_node(camera);
@@ -3999,6 +4019,41 @@ static void test_client_node_media() {
       tick(40);
       CHECK(watched(mw) == jpeg);
     }
+    // a real Motion JPEG camera (64 x 48) and a watcher that takes raw BGRA only: offered BGRA, given each picture decoded
+    NodeView rc;
+    rc.id = 10;
+    create_node(c, 10, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "real-mjpeg"}});
+    node_update(c, 10);
+    set_active(c, 10, true);
+    c.send(10, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 64, 48, 0x20002); port_info(b, 0, {}); });
+    rc.absorb(c);
+    c.send(10, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 8192, 0, 0); b.none(); });
+    rc.absorb(c);
+    NodeView rw;
+    rw.id = 7;
+    create_node(w, 7, {{"media.class", "Stream/Input/Video"}, {"target.object", "real-mjpeg"}});
+    node_update(w, 7);
+    set_active(w, 7, true);
+    w.send(7, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 64, 48); port_info(b, 0, {}); });
+    rw.absorb(w);
+    w.send(7, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    rw.absorb(w);
+    CHECK(rc.starts == 1 && rw.starts == 1 && rw.ports[{0, 0}].bufs.size() == 2);
+    const std::vector<uint8_t> real = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+    if (rc.starts && rw.starts && real.size() > 100) {
+      put_u32(rw.activation->memory(), 0, 3);
+      produce(rc, 0, {real}, {0});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(rw);
+      CHECK(got.size() == 64 * 48 * 4 && got[3] == 0xFF);
+      hardware::JpegDecoder dec(A);
+      std::vector<uint32_t> want(64 * 48);
+      CHECK(dec.decode(ConstByteView(real.data(), real.size())) && dec.output_bgra(want.data(), 64));
+      if (got.size() == 64 * 48 * 4) CHECK(memcmp(got.data(), want.data(), got.size()) == 0);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(10); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(7); });
     // a watcher that takes BGRA only, of the I420 camera: offered BGRA, given each frame converted (BT.601 limited: Y 16 black, 235 white)
     NodeView cw;
     cw.id = 6;

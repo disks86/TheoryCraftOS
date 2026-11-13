@@ -224,6 +224,36 @@ static void test_convert() {
   CHECK(a.live == 0);
 }
 
+// Motion JPEG as webcams send it, without DHT segments: the decoder takes the standard tables (T.81 Annex K) and gets the same picture as from the file
+// with them (tests/data/mjpeg_standard_tables.jpg: ffmpeg -c:v mjpeg -huffman default).
+static void test_jpeg_without_huffman_tables() {
+  TestAllocator a;
+  std::vector<uint8_t> file;
+  if (FILE* f = fopen("tests/data/mjpeg_standard_tables.jpg", "rb")) {
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) file.insert(file.end(), buf, buf + n);
+    fclose(f);
+  }
+  CHECK(file.size() > 100);
+  std::vector<uint8_t> stripped(file.begin(), file.begin() + 2);
+  size_t at = 2, dropped = 0;
+  while (at + 4 <= file.size()) {      // (the segments up to the scan, the DHTs left out; the scan and what follows as they are)
+    const uint8_t marker = file[at + 1];
+    const size_t length = size_t(file[at + 2]) << 8 | file[at + 3];
+    if (marker == 0xDA) { stripped.insert(stripped.end(), file.begin() + long(at), file.end()); break; }
+    if (marker == 0xC4) ++dropped;
+    else stripped.insert(stripped.end(), file.begin() + long(at), file.begin() + long(at + 2 + length));
+    at += 2 + length;
+  }
+  CHECK(dropped >= 1);
+  JpegDecoder with(a), without(a);
+  CHECK(with.decode(ConstByteView(file.data(), file.size())) && without.decode(ConstByteView(stripped.data(), stripped.size())));
+  CHECK(with.width() == 64 && with.height() == 48 && without.width() == 64 && without.height() == 48);
+  std::vector<uint32_t> p1(64 * 48), p2(64 * 48);
+  CHECK(with.output_bgra(p1.data(), 64) && without.output_bgra(p2.data(), 64) && p1 == p2);
+}
+
 static void test_jpeg_decode_reference() {
   TestAllocator a;
   {
@@ -1932,6 +1962,7 @@ int main() {
   test_formats();
   test_convert();
   test_jpeg_decode_reference();
+  test_jpeg_without_huffman_tables();
   test_jpeg_roundtrip();
   test_jpeg_robustness();
   test_sessions();

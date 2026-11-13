@@ -18,10 +18,11 @@
 
 // The kernel watching the graph's video for itself (the desktop's Video Viewer): the producers there are, and one of them watched as a watcher
 // node of the kernel's ("tcos-video-viewer", linked to it as a program's video input would be, so a camera starts streaming), its newest frame
-// handed out as 0xAARRGGBB pixels (converted from the producer's format; encoded video is not decoded).
+// handed out as 0xAARRGGBB pixels (converted from the producer's format; Motion JPEG decoded, other encoded video not).
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
+#include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "PipeWire/Graph.hpp"
 #include "Utility/String.hpp"
 
@@ -50,6 +51,7 @@ class VideoWatcher {
   uint32_t producer_ = 0, node_ = 0;
   SharedPointer<VideoChannel> channel_;
   ByteBuffer converted_;
+  UniquePointer<hardware::JpegDecoder> jpeg_;      // (Motion JPEG: made at the first such frame)
 };
 
 }  // namespace pipewire

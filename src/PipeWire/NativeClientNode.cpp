@@ -355,6 +355,22 @@ uint32_t enum_video_formats(ConstByteView enum_format, uint32_t* out, uint32_t m
   return 0;
 }
 
+// The media subtype an EnumFormat says (its first, for a Choice); 0 when it does not say.
+uint32_t enum_subtype(ConstByteView enum_format) {
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return 0;
+  uint32_t key = 0, flags = 0, subtype = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop))
+    if (key == kFormatMediaSubtype) {
+      id_or_default(prop, &subtype);
+      return subtype;
+    }
+  return 0;
+}
+
 // The period of a video port's frames (its frame rate), 1 ms .. 1 s; 40 ms when it says none.
 uint64_t frame_period_ns(const VideoFormat& v) {
   if (v.rate_num == 0 || v.rate_den == 0) return 40000000ull;
@@ -748,6 +764,17 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
     p.video = v;
     uint32_t wanted[32];
     const uint32_t listed = v.encoded() ? 0 : enum_video_formats(p.enum_format.view(), wanted, 32);
+    // (a raw watcher of a Motion JPEG producer of a known size: offered raw, the frames decoded; the first format it lists that can be made, else BGRx)
+    if (v.subtype == kSubtypeMjpg && v.width && v.height && enum_subtype(p.enum_format.view()) == VideoFormat::kSubtypeRaw) {
+      const uint32_t raw_listed = enum_video_formats(p.enum_format.view(), wanted, 32);
+      p.video.subtype = VideoFormat::kSubtypeRaw;
+      p.video.format = 8;
+      for (uint32_t k = 0; k < raw_listed; ++k)
+        if (can_decode_video(v, wanted[k])) {
+          p.video.format = wanted[k];
+          break;
+        }
+    }
     bool takes = listed == 0;
     for (uint32_t k = 0; k < listed; ++k) takes |= wanted[k] == v.format;
     for (uint32_t k = 0; k < listed && !takes; ++k)
@@ -1555,7 +1582,15 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       // (in the watcher's format: converted when that is not the producer's)
       ConstByteView pixels = frame->pixels.view();
       if (!(v == p.source_video)) {
-        if (!convert_video(p.source_video, pixels, v, &p.converted)) return false;
+        if (p.source_video.encoded()) {      // (Motion JPEG to a raw watcher: decoded)
+          if (!p.jpeg) p.jpeg = UniquePointer<hardware::JpegDecoder>::make(allocator_, allocator_);
+          if (!p.jpeg || !decode_video(pixels, v, *p.jpeg, &p.jpeg_words, &p.converted)) {
+            p.video_seen = frame->sequence;      // (a frame that cannot be decoded is passed over)
+            return false;
+          }
+        } else if (!convert_video(p.source_video, pixels, v, &p.converted)) {
+          return false;
+        }
         pixels = p.converted.view();
       }
       if (v.encoded()) {

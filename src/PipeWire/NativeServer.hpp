@@ -44,6 +44,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/MidiBus.hpp"
 #include "PipeWire/Pod.hpp"
+#include "Hardware/VideoCodec/Software/Jpeg.hpp"
 #include "PipeWire/VideoChannel.hpp"
 #include "PipeWire/ProtocolServer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -89,7 +90,7 @@ class NativeServer final : public IProtocolServer {
   // A port of a client node (NativeClientNode.cpp): its formats, the metadata and buffers the server gave it, and where its data goes.
   struct ClientPort {
     static constexpr uint32_t kMaxMetas = 8;
-    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a) {}
+    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a), jpeg_words(a) {}
     uint32_t direction = 0, id = 0;
     uint32_t index = 0;            // its place in the node's io area (8 bytes each)
     uint64_t flags = 0;            // SPA_PORT_FLAG_* from its info
@@ -127,6 +128,8 @@ class NativeServer final : public IProtocolServer {
     UmpDecoder ump_in;             // (a UMP output) its system exclusive pieces put together
     VideoFormat source_video;      // (a watcher) its producer's format when it was negotiated: frames come in it, and are converted to `video` if it differs
     ByteBuffer converted;          // (a watcher) the last frame converted
+    UniquePointer<hardware::JpegDecoder> jpeg;      // (a raw watcher of a Motion JPEG producer) its decoder, made at the first frame
+    List<uint32_t> jpeg_words;     // (its picture as 0xAARRGGBB, before the conversion)
   };
  private:
   struct Resource {

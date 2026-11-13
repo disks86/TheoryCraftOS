@@ -77,6 +77,23 @@ bool VideoWatcher::latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* 
   if (!frame || frame->sequence <= *sequence) return false;
   *sequence = frame->sequence;
   const VideoFormat& f = frame->format;
+  if (f.subtype == kSubtypeMjpg) {      // (Motion JPEG: decoded, its size the picture's)
+    if (!jpeg_) jpeg_ = UniquePointer<hardware::JpegDecoder>::make(allocator_, allocator_);
+    if (!jpeg_ || !jpeg_->decode(frame->pixels.view())) {
+      *why = "A Motion JPEG picture that cannot be decoded";
+      return false;
+    }
+    const uint32_t w = jpeg_->width(), h = jpeg_->height();
+    const uint64_t n = uint64_t{w} * h;
+    if (!pixels->reserve(n)) return false;
+    while (pixels->count() < n)
+      if (!pixels->push_back(0)) return false;
+    while (pixels->count() > n) pixels->remove_at(pixels->count() - 1);
+    if (!jpeg_->output_bgra(pixels->view().data(), w)) return false;
+    *width = w;
+    *height = h;
+    return true;
+  }
   if (f.encoded()) {
     *why = "Encoded video (not shown)";
     return false;

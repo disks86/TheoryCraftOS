@@ -241,4 +241,21 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
   return true;
 }
 
+bool can_decode_video(const VideoFormat& from, uint32_t to) { return from.subtype == kSubtypeMjpg && can_convert_video(kBGRA, to); }
+
+bool decode_video(ConstByteView frame, const VideoFormat& to, hardware::JpegDecoder& decoder, List<uint32_t>* scratch, ByteBuffer* out) {
+  if (to.encoded() || !to.valid() || !decoder.decode(frame) || decoder.width() != to.width || decoder.height() != to.height) return false;
+  const uint64_t pixels = uint64_t{to.width} * to.height;
+  if (scratch->count() < pixels) {
+    if (!scratch->reserve(pixels)) return false;
+    while (scratch->count() < pixels)
+      if (!scratch->push_back(0)) return false;
+  }
+  ArrayView<uint32_t> words = scratch->view().first(pixels);
+  if (!decoder.output_bgra(words.data(), to.width)) return false;
+  VideoFormat bgra = to;
+  bgra.format = kBGRA;
+  return convert_video(bgra, words_as_bytes(ArrayView<const uint32_t>(words)), to, out);
+}
+
 }  // namespace pipewire
