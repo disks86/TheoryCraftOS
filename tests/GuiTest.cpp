@@ -1664,6 +1664,26 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     return true;
   }
   void mouse_wheel(int32_t notches) override { note("wheel", notches, 0); }
+  // text input: window `text_window` takes composed text while text_on
+  bool text_on = false;
+  uint32_t text_window = 0;
+  bool text_input(TextInputState* out) override {
+    *out = TextInputState();
+    if (!text_on) return false;
+    out->enabled = true;
+    out->window = text_window;
+    return true;
+  }
+  bool text_preedit(StringView t, uint32_t cursor) override {
+    if (!text_on) return false;
+    log.push_back("preedit '" + std::string(t.data() ? t.data() : "", t.size()) + "' " + std::to_string(cursor));
+    return true;
+  }
+  bool text_commit(StringView t) override {
+    if (!text_on) return false;
+    log.push_back("commit '" + std::string(t.data(), t.size()) + "'");
+    return true;
+  }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
   uint32_t capture_window() override { return 0; }
@@ -1673,6 +1693,195 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     cy = cy < 120 ? 120 : cy > 140 ? 140 : cy;
   }
 };
+
+// Layers (Frame::Layer): bands of the stack that raising never crosses, and edges windows reserve out of the work areas.
+static void test_windows_layers() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  Theme theme;
+  Window w(a, screen.renderer, theme, {800, 600});
+  WindowManager mgr(a);
+  mgr.set_dock(DockStyle::Fill);
+  w.add(&mgr);
+  w.layout();
+  Frame back(a), normal1(a), normal2(a), panel(a), overlay(a);
+  back.set_layer(Frame::Layer::Background);
+  back.set_decorated(false);
+  back.set_activatable(false);
+  back.set_bounds({0, 0, 800, 600});
+  normal1.set_bounds({50, 50, 300, 200});
+  normal2.set_bounds({100, 80, 300, 200});
+  panel.set_layer(Frame::Layer::Top);
+  panel.set_decorated(false);
+  panel.set_activatable(false);
+  panel.set_bounds({0, 0, 800, 30});
+  overlay.set_layer(Frame::Layer::Overlay);
+  overlay.set_decorated(false);
+  overlay.set_bounds({300, 200, 200, 100});
+  // added in a muddled order: the bands hold whatever came last
+  CHECK(mgr.add_window(&panel) && mgr.add_window(&normal1) && mgr.add_window(&back) && mgr.add_window(&overlay) && mgr.add_window(&normal2));
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.stacking_index(&normal1) == 1 && mgr.stacking_index(&normal2) == 2 && mgr.stacking_index(&panel) == 3 &&
+        mgr.stacking_index(&overlay) == 4);
+  CHECK(mgr.active() == &normal2);
+  // raising a normal window keeps it under the panel; a click on the background does not bring it up
+  mgr.activate(&normal1);
+  CHECK(mgr.stacking_index(&normal1) == 2 && mgr.stacking_index(&panel) == 3);
+  click(w, 700, 500);
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.active() == &normal1);
+  CHECK(w.hit_test(400, 10) == &panel && w.hit_test(400, 250) == &overlay);
+  // a program's own order (place_next_to) cannot take a window out of its band
+  mgr.place_next_to(&normal2, &overlay, true);
+  CHECK(mgr.stacking_index(&normal2) <= 2 && mgr.stacking_index(&panel) == 3 && mgr.stacking_index(&overlay) == 4);
+  // moving to another band re-sorts
+  normal2.set_layer(Frame::Layer::Overlay);
+  CHECK(mgr.stacking_index(&normal2) >= 3 && mgr.stacking_index(&panel) == 2);
+  normal2.set_layer(Frame::Layer::Normal);
+  CHECK(mgr.stacking_index(&panel) == 3);
+  // layered windows are placed where they are said to be: not kept inside, not cycled
+  panel.set_bounds({0, -5, 800, 30});
+  w.layout();
+  CHECK(panel.bounds().y == -5);
+  panel.set_bounds({0, 0, 800, 30});
+  for (int i = 0; i < 4; ++i) {
+    mgr.cycle(true);
+    CHECK(mgr.active() == &normal1 || mgr.active() == &normal2);
+  }
+  // reserving: the top panel keeps 30 pixels; maximized windows and the areas leave it out
+  const uint32_t serial = mgr.reserve_serial();
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 600);
+  panel.set_reserve(Frame::Edge::Top, 30);
+  CHECK(mgr.reserve_serial() != serial);
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 570 && mgr.full_area(0).y == 0 && mgr.full_area(0).height == 600);
+  mgr.maximize(&normal1);
+  CHECK(normal1.bounds().y == 30 && normal1.bounds().height == 570);
+  // a second reservation on another edge, then the panel hidden: the space comes back and the maximized window follows
+  Frame dock(a);
+  dock.set_layer(Frame::Layer::Bottom);
+  dock.set_decorated(false);
+  dock.set_bounds({0, 560, 800, 40});
+  dock.set_reserve(Frame::Edge::Bottom, 40);
+  CHECK(mgr.add_window(&dock));
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 530 && normal1.bounds().height == 530);
+  CHECK(mgr.stacking_index(&dock) == 1);      // (above the background, below the normal windows)
+  mgr.remove_window(&panel);
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 560 && normal1.bounds().y == 0 && normal1.bounds().height == 560);
+  mgr.minimize(&dock);
+  CHECK(mgr.area(0).height == 600);
+  mgr.activate(&dock);
+  CHECK(mgr.area(0).height == 560);
+  // several areas: a reservation counts only on the area it is on
+  const Rect2D areas[2] = {{0, 0, 400, 600}, {400, 0, 400, 600}};
+  mgr.set_areas(areas, 2);
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 560);      // (the dock spans both)
+  dock.set_bounds({0, 560, 400, 40});
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 600);
+  // more than the area: a pixel is left
+  dock.set_reserve(Frame::Edge::Bottom, 5000);
+  CHECK(mgr.area(0).height == 1 && mgr.area(0).y == 0);
+  dock.set_reserve(Frame::Edge::None, 0);
+  CHECK(mgr.area(0).height == 600);
+  mgr.remove_window(&dock);
+  mgr.remove_window(&back);
+  mgr.remove_window(&overlay);
+  mgr.remove_window(&normal1);
+  mgr.remove_window(&normal2);
+}
+
+// The input method (Desktop/Win32Windows.cpp): Unicode entry into a window that takes composed text. Ctrl+Shift+U, hex digits, Space puts the character in;
+// Backspace takes a digit back, Escape gives up; the keys it takes never reach the program; without a window taking text, the keys are the program's.
+static void test_windows_text_input() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  FakeKeyboard kb;
+  FakeMouse mouse;
+  FakeWindowsSession s(a);
+  desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+  d.set_windows_session(&s);
+  d.step(0);
+  s.add(7, true, {100, 80, 200, 150}, "Editor", true);
+  d.step(1000);
+  auto press = [&](uint8_t usage) { kb.push(usage, true); kb.push(usage, false); };
+  auto unicode = [&]() {
+    kb.mods = hardware::modifier::kLeftControl | hardware::modifier::kLeftShift;
+    kb.push(key::kLeftControl, true);
+    kb.push(key::kLeftShift, true);
+    press(key::kA + 20);      // U
+    kb.push(key::kLeftShift, false);
+    kb.push(key::kLeftControl, false);
+    kb.mods = 0;
+  };
+  auto events = [&](const char* prefix) {
+    std::vector<std::string> out;
+    for (const std::string& e : s.log) if (e.rfind(prefix, 0) == 0) out.push_back(e);
+    return out;
+  };
+  auto keys_of = [&](int usage) {
+    int n = 0;
+    for (const std::string& e : s.log) if (e.rfind("key " + std::to_string(usage) + " ", 0) == 0) ++n;
+    return n;
+  };
+  // no window takes text: Ctrl+Shift+U is an ordinary key for the program
+  s.log.clear();
+  unicode();
+  d.step(2000);
+  CHECK(keys_of(key::kA + 20) == 2 && events("preedit").empty());
+  // U+00E9: "u", "ue", "ue9", then Space commits "é"; none of those keys reach the program, the modifiers do
+  s.text_on = true;
+  s.text_window = 7;
+  s.log.clear();
+  unicode();
+  press(key::kA + 4);      // e
+  press(key::k1 + 8);      // 9
+  press(key::kSpace);
+  d.step(3000);
+  std::vector<std::string> pre = events("preedit"), com = events("commit");
+  CHECK(pre.size() == 3 && pre[0] == "preedit 'u' 1" && pre[1] == "preedit 'ue' 2" && pre[2] == "preedit 'ue9' 3");
+  CHECK(com.size() == 1 && com[0] == "commit '\xc3\xa9'");
+  CHECK(keys_of(key::kA + 20) == 0 && keys_of(key::kA + 4) == 0 && keys_of(key::kSpace) == 0 && keys_of(key::kLeftControl) == 2);
+  // an emoji (U+1F600), with a digit taken back
+  s.log.clear();
+  unicode();
+  for (uint8_t k : {uint8_t(key::k1), uint8_t(key::kA + 5), uint8_t(key::k1 + 5), uint8_t(key::k1 + 6), uint8_t(key::kBackspace), uint8_t(0x27), uint8_t(0x27)})
+    press(k);      // 1 f 6 7 <- 0 0
+  press(key::kEnter);
+  d.step(4000);
+  com = events("commit");
+  CHECK(com.size() == 1 && com[0] == "commit '\xf0\x9f\x98\x80'");
+  CHECK(keys_of(key::kEnter) == 0 && keys_of(key::kBackspace) == 0);
+  // Escape gives up (and is taken); another key gives up and goes on to the program
+  s.log.clear();
+  unicode();
+  press(key::kA + 1);
+  press(key::kEscape);
+  press(key::kA + 1);      // b, typed now
+  d.step(5000);
+  pre = events("preedit");
+  CHECK(events("commit").empty() && !pre.empty() && pre.back() == "preedit '' 0" && keys_of(key::kEscape) == 0 && keys_of(key::kA + 1) == 2);
+  s.log.clear();
+  unicode();
+  press(key::kA + 2);      // c
+  press(key::kA + 22);     // w: not a hex digit
+  d.step(6000);
+  CHECK(events("commit").empty() && keys_of(key::kA + 22) == 2 && events("preedit").back() == "preedit '' 0");
+  // a code point that is no character (a surrogate) is not put in; nothing typed is not either
+  s.log.clear();
+  unicode();
+  for (uint8_t k : {uint8_t(key::kA + 3), uint8_t(key::k1 + 7), uint8_t(0x27), uint8_t(0x27)}) press(k);      // d800
+  press(key::kSpace);
+  unicode();
+  press(key::kSpace);
+  d.step(7000);
+  CHECK(events("commit").empty());
+  // the window stops taking text while composing: the next key is the program's
+  s.log.clear();
+  unicode();
+  press(key::k1);
+  d.step(8000);
+  s.text_on = false;
+  press(key::k1 + 1);
+  d.step(9000);
+  CHECK(keys_of(key::k1 + 1) == 2 && keys_of(key::k1) == 0);
+}
 
 // Touches over a program's window: a session that takes them gets the contact (with the window and the programs' coordinates) to its end; one that does
 // not has the pointer moved and pressed for it; the devices stop emulating a mouse once the desktop reads them.
@@ -2238,6 +2447,8 @@ int main() {
   test_desktop_monitors();
   test_clock();
   test_windows();
+  test_windows_layers();
+  test_windows_text_input();
   test_modal_and_dialog();
   test_notice_dialog();
   test_switcher();

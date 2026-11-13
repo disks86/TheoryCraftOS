@@ -40,12 +40,92 @@ uint32_t WindowManager::stacking_index(const Frame* frame) const {
 
 // --- Areas --------------------------------------------------------------------------------------------
 
-Rect2D WindowManager::area(uint32_t index) const {
+Rect2D WindowManager::full_area(uint32_t index) const {
   if (index < areas_.count()) return areas_[index];
   return {0, 0, bounds_.width, bounds_.height};
 }
 
-Rect2D WindowManager::area_of_rect(const Rect2D& r) const {
+Rect2D WindowManager::area(uint32_t index) const { return without_reserved(full_area(index)); }
+
+// Each window that reserves an edge and overlaps the area takes that much off it, from that edge (several on one edge: the largest). The area keeps at
+// least a pixel each way.
+Rect2D WindowManager::without_reserved(const Rect2D& a) const {
+  uint32_t inset[5] = {0, 0, 0, 0, 0};      // by Frame::Edge
+  for (uint32_t i = 0; i < child_count(); ++i) {
+    const Frame* f = as_frame(child(i));
+    if (f->reserve_edge_ == Frame::Edge::None || f->reserve_size_ == 0 || !f->visible() || f->state_ == Frame::State::Minimized) continue;
+    const Rect2D b = f->bounds();
+    const bool overlap = int64_t{b.x} < int64_t{a.x} + a.width && int64_t{a.x} < int64_t{b.x} + b.width && int64_t{b.y} < int64_t{a.y} + a.height &&
+                         int64_t{a.y} < int64_t{b.y} + b.height;
+    if (!overlap) continue;
+    uint32_t& k = inset[static_cast<uint8_t>(f->reserve_edge_)];
+    if (f->reserve_size_ > k) k = f->reserve_size_;
+  }
+  const uint32_t l = inset[1], t = inset[2], r = inset[3], b = inset[4];
+  Rect2D out = a;
+  const uint64_t across = uint64_t{l} + r, down = uint64_t{t} + b;
+  if (across + 1 > a.width || down + 1 > a.height) {      // (more than the area: kept at a pixel, from the left or top edge's side)
+    out.x = a.x + static_cast<int32_t>(l < a.width ? l : a.width - 1);
+    out.y = a.y + static_cast<int32_t>(t < a.height ? t : a.height - 1);
+    out.width = across + 1 > a.width ? 1 : a.width - static_cast<uint32_t>(across);
+    out.height = down + 1 > a.height ? 1 : a.height - static_cast<uint32_t>(down);
+    if (a.width == 0) out.width = 0, out.x = a.x;
+    if (a.height == 0) out.height = 0, out.y = a.y;
+    return out;
+  }
+  out.x = a.x + static_cast<int32_t>(l);
+  out.y = a.y + static_cast<int32_t>(t);
+  out.width = a.width - static_cast<uint32_t>(across);
+  out.height = a.height - static_cast<uint32_t>(down);
+  return out;
+}
+
+void WindowManager::reserves_changed() {
+  ++reserve_serial_;
+  layout();      // maximized, docked and tiled windows follow
+  invalidate();
+}
+
+// --- Layers -------------------------------------------------------------------------------------------
+
+void WindowManager::raise_in_layer(Frame* frame) {
+  // directly below the lowest window of a higher layer, else on top
+  for (uint32_t i = 0; i < child_count(); ++i) {
+    Frame* f = as_frame(child(i));
+    if (f != frame && f->layer_ > frame->layer_) {
+      move_child_next_to(frame, f, false);
+      return;
+    }
+  }
+  move_child_to_front(frame);
+}
+
+void WindowManager::sort_layers() {
+  bool sorted = true;
+  for (uint32_t i = 1; i < child_count() && sorted; ++i)
+    if (as_frame(child(i - 1))->layer_ > as_frame(child(i))->layer_) sorted = false;
+  if (sorted) return;
+  // stable: band by band from the bottom, each window to the front in the order it had
+  constexpr uint32_t kMax = 256;
+  Frame* stack[kMax];
+  const uint32_t count = child_count() < kMax ? child_count() : kMax;
+  for (uint32_t i = 0; i < count; ++i) stack[i] = as_frame(child(i));
+  for (int layer = -2; layer <= 2; ++layer)
+    for (uint32_t i = 0; i < count; ++i)
+      if (static_cast<int>(stack[i]->layer_) == layer) move_child_to_front(stack[i]);
+  invalidate();
+}
+
+bool WindowManager::place_next_to(Frame* frame, Frame* anchor, bool above) {
+  UiGuard lock(this);
+  const bool moved = move_child_next_to(frame, anchor, above);
+  sort_layers();
+  return moved;
+}
+
+Rect2D WindowManager::area_of_rect(const Rect2D& r) const { return without_reserved(raw_area_of_rect(r)); }
+
+Rect2D WindowManager::raw_area_of_rect(const Rect2D& r) const {
   if (areas_.count() == 0) return {0, 0, bounds_.width, bounds_.height};
   int64_t best = -1;
   uint64_t best_overlap = 0;
@@ -80,9 +160,9 @@ Rect2D WindowManager::area_of_rect(const Rect2D& r) const {
 Rect2D WindowManager::area_for(const Frame* frame) const { return area_of_rect(frame->bounds()); }
 
 Rect2D WindowManager::dialog_area() const {
-  if (areas_.count() == 0) return {0, 0, bounds_.width, bounds_.height};
+  if (areas_.count() == 0) return without_reserved({0, 0, bounds_.width, bounds_.height});
   if (active_ && !active_->modal()) return area_for(active_);
-  return areas_[0];
+  return without_reserved(areas_[0]);
 }
 
 void WindowManager::set_areas(const Rect2D* areas, uint32_t count) {
@@ -95,6 +175,7 @@ void WindowManager::set_areas(const Rect2D* areas, uint32_t count) {
 
 void WindowManager::keep_inside(Frame* frame) {
   if (bounds_.width == 0 || bounds_.height == 0) return;  // not laid out yet
+  if (frame->layer_ != Frame::Layer::Normal) return;      // (placed where its program says)
   Rect2D b = frame->bounds();
   const Rect2D a = area_for(frame);
   const int32_t left = a.x, top = a.y, right = a.x + static_cast<int32_t>(a.width), bottom = a.y + static_cast<int32_t>(a.height);
@@ -122,9 +203,10 @@ bool WindowManager::add_window(Frame* frame, bool modal) {
   keep_inside(frame);
   if (frame->activatable()) activate(frame);
   else {
-    move_child_to_front(frame);
+    raise_in_layer(frame);
     refresh();
   }
+  if (frame->reserve_edge_ != Frame::Edge::None) reserves_changed();
   return true;
 }
 
@@ -144,11 +226,13 @@ bool WindowManager::remove_window(Frame* frame) {
   frame->set_enabled(true);
   frame->pressed_ = frame->dragging_ = Frame::Part::None;
   if (frame->state_ == Frame::State::Maximized || frame->docked_ != Frame::Dock::None) frame->set_bounds(frame->restore_bounds_);
+  const bool reserved = frame->reserve_edge_ != Frame::Edge::None;
   frame->docked_ = Frame::Dock::None;
   frame->state_ = Frame::State::Normal;
   frame->set_visible(true);
   if (active_ == frame) active_ = nullptr;
   refresh();
+  if (reserved) reserves_changed();
   return true;
 }
 
@@ -177,7 +261,7 @@ void WindowManager::refresh() {
   Frame* modal = nullptr;
   for (uint32_t i = child_count(); i > 0 && !modal; --i)
     if (as_frame(child(i - 1))->modal()) modal = as_frame(child(i - 1));
-  if (modal) move_child_to_front(modal);
+  if (modal) raise_in_layer(modal);
   for (uint32_t i = 0; i < child_count(); ++i) {
     Frame* f = as_frame(child(i));
     const bool usable = !modal || f == modal;
@@ -196,26 +280,33 @@ void WindowManager::activate(Frame* frame) {
   if (frame->state_ == Frame::State::Minimized) {
     frame->state_ = frame->before_minimize_;
     frame->set_visible(true);
+    if (frame->reserve_edge_ != Frame::Edge::None) reserves_changed();
   }
-  move_child_to_front(frame);
+  raise_in_layer(frame);
   if (frame->activatable()) active_ = frame;
   refresh();
 }
 
 void WindowManager::cycle(bool forward) {
   UiGuard lock(this);
-  const uint32_t count = child_count();
-  if (count < 2 || has_modal()) return;
+  if (has_modal()) return;
+  // (only the normal band: panels, backgrounds and overlays are not cycled through)
+  constexpr uint32_t kMax = 64;
+  Frame* stack[kMax];
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < child_count(); ++i) {
+    Frame* f = as_frame(child(i));
+    if (f->layer_ != Frame::Layer::Normal) continue;
+    if (count == kMax) return;
+    stack[count++] = f;
+  }
+  if (count < 2) return;
   if (forward) {
-    activate(as_frame(child(0)));
+    activate(stack[0]);
     return;
   }
   // Each window but the front one comes to the front in turn, bottom first: the old front window ends at the bottom, the one that was
   // directly behind it is in front now. (Minimized windows are passed over, unless it is the one to come out in front.)
-  constexpr uint32_t kMax = 64;
-  Frame* stack[kMax];
-  if (count > kMax) return;
-  for (uint32_t i = 0; i < count; ++i) stack[i] = as_frame(child(i));
   for (uint32_t i = 0; i + 1 < count; ++i)
     if (stack[i]->state() != Frame::State::Minimized || i + 2 == count) activate(stack[i]);
 }
@@ -227,6 +318,7 @@ void WindowManager::minimize(Frame* frame) {
   frame->state_ = Frame::State::Minimized;
   frame->set_visible(false);
   if (active_ == frame) active_ = nullptr;
+  if (frame->reserve_edge_ != Frame::Edge::None) reserves_changed();
   refresh();
 }
 
@@ -294,7 +386,7 @@ void WindowManager::tile(Frame* origin) {
   uint32_t n = 0;
   for (uint32_t i = child_count(); i > 0 && n < 4; --i) {
     Frame* f = as_frame(child(i - 1));
-    if (f->state() == Frame::State::Minimized || !f->visible() || !f->dock_enabled()) continue;
+    if (f->state() == Frame::State::Minimized || !f->visible() || !f->dock_enabled() || f->layer_ != Frame::Layer::Normal) continue;
     if (!same_rect(area_for(f), where)) continue;
     picked[n++] = f;
   }
