@@ -803,6 +803,9 @@ void Server::send_event_request(Client& c, bool propagate, WireReader& r) {
     if (!target) return;
   }
   if (!target) return;
+  // drag and drop with the desktop: messages to the root (a client's drag over the desktop) and to the server's own window (X11DragAndDrop.cpp)
+  if (code == event::kClientMessage && xdnd_client_message(*target, p)) return;
+  if (code == event::kSelectionNotify && xdnd_selection_notify(*target, p)) return;
   // a message to the root that only a window manager would act on: this server is it
   if (code == event::kClientMessage && target == root_ && (event_mask & (mask::kSubstructureRedirect | mask::kSubstructureNotify))) {
     uint32_t data[5];
@@ -1140,6 +1143,7 @@ void Server::dispatch(Client& c, uint8_t opcode, uint8_t data, WireReader& r, ui
         error(c, error::kAtom, selection, 24);
         return;
       }
+      if (xdnd_convert(c, *w, selection, target, property, time)) return;      // (the desktop's drag: the server owns XdndSelection)
       const SelectionOwner* owner = nullptr;
       for (const SelectionOwner& s : selection_owners_.view()) if (s.selection == selection && s.window != 0) owner = &s;
       Packet p;

@@ -35,6 +35,8 @@
 // (program_drag_answer) goes to the source as target (the type read, or null) and action (copy, or none), as a client destination's accept would. Let go
 // over the desktop, the drop uses what was read, or the read still under way (no second read).
 #include "FileSystem/SystemLayout.hpp"
+#include "Desktop/DropItems.hpp"
+#include "Utility/FileUri.hpp"
 #include "Wayland/WaylandInternal.hpp"
 
 namespace wayland {
@@ -44,57 +46,10 @@ namespace {
 constexpr uint64_t kMaxDropData = 1u << 20;
 constexpr uint32_t kCopy = 1;      // (wl_data_device_manager.dnd_action copy)      // (more than a megabyte of URIs or text is not a drop)
 
-bool unreserved(uint8_t c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' || c == '/';
-}
-
 // A text type a source may offer (as WaylandData.cpp takes them for the selection).
 bool text_type_of(StringView t) {
   return t == StringView("text/plain;charset=utf-8") || t == StringView("text/plain;charset=UTF-8") || t == StringView("text/plain") ||
          t == StringView("UTF8_STRING") || t == StringView("STRING") || t == StringView("TEXT");
-}
-
-int hex_value(uint8_t c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
-// file://<path> with every byte but the unreserved ones (and '/') percent-encoded, then CR LF (RFC 2483).
-bool file_uri(StringView path, String* out) {
-  static constexpr char kHex[] = "0123456789ABCDEF";
-  if (!out->assign(StringView("file://"))) return false;
-  for (const uint8_t c : path.bytes()) {
-    if (unreserved(c)) {
-      if (!out->push_back(static_cast<char>(c))) return false;
-    } else if (!out->push_back('%') || !out->push_back(kHex[c >> 4]) || !out->push_back(kHex[c & 15])) {
-      return false;
-    }
-  }
-  return out->append(StringView("\r\n"));
-}
-
-// The path of a file URI (file:///x or file://localhost/x), percent-decoded, into *out; false for another scheme or host, a bad escape or a NUL.
-bool path_of_uri(StringView uri, String* out) {
-  StringView rest;
-  if (uri.size() >= 8 && uri.first(8) == StringView("file:///")) rest = uri.without_prefix(7);
-  else if (uri.size() >= 17 && uri.first(17) == StringView("file://localhost/")) rest = uri.without_prefix(16);
-  else return false;
-  out->clear();
-  const ConstByteView b = rest.bytes();
-  for (uint64_t i = 0; i < b.size(); ++i) {
-    uint8_t c = b[i];
-    if (c == '%') {
-      if (b.size() - i < 3) return false;
-      const int hi = hex_value(b[i + 1]), lo = hex_value(b[i + 2]);
-      if (hi < 0 || lo < 0) return false;
-      c = static_cast<uint8_t>(hi * 16 + lo);
-      i += 2;
-    }
-    if (c == 0 || !out->push_back(static_cast<char>(c))) return false;
-  }
-  return !out->empty();
 }
 
 }  // namespace
@@ -118,7 +73,7 @@ bool Server::desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text
         const StringView t = text.size() > kMaxDropData ? text.first(0) : text;
         desktop_drag_text_.append(t);
         if (!t.empty() && t[0] == '/' && filesystem::layout::linux_view_of(t, &desktop_drag_linux_)) {      // a file a Linux program can open
-          if (!file_uri(desktop_drag_linux_.view(), &desktop_drag_uri_)) desktop_drag_uri_.clear();
+          if (!util::file_uri(desktop_drag_linux_.view(), &desktop_drag_uri_)) desktop_drag_uri_.clear();
         } else {
           desktop_drag_linux_.clear();
         }
@@ -226,32 +181,8 @@ bool Server::start_program_drop() {
 }
 
 bool Server::drop_items(ConstByteView data, bool uri, String* out) {
-  out->clear();
   const ConstByteView bytes = data.size() > kMaxDropData ? data.first(0) : data;
-  const StringView all(reinterpret_cast<const char*>(bytes.data()), bytes.size());      // (bytes of text: a view of them as characters)
-  if (uri) {
-    for (uint64_t at = 0; at < all.size();) {
-      uint64_t end = at;
-      while (end < all.size() && all[end] != '\n') ++end;
-      StringView line = all.substr(at, end - at);
-      at = end + 1;
-      if (!line.empty() && line[line.size() - 1] == '\r') line = line.first(line.size() - 1);
-      if (line.empty() || line[0] == '#') continue;      // (RFC 2483 comments)
-      String path(allocator_), system(allocator_);
-      if (!path_of_uri(line, &path) || !filesystem::layout::system_path_of_linux(path.view(), &system)) continue;
-      bool clean = true;
-      for (char ch : system.view()) if (ch == '\n') clean = false;      // (one item per line)
-      if (!clean) continue;
-      if (!out->empty()) out->push_back('\n');
-      out->append(system.view());
-    }
-  } else {
-    for (char ch : all) {      // text, as it is (a NUL ends it)
-      if (ch == 0) break;
-      if (!out->push_back(ch == '\n' ? ' ' : ch)) break;      // (one item: lines joined)
-    }
-  }
-  return !out->empty();
+  return desktop::drop_items_of(bytes, uri, out);
 }
 
 void Server::program_drop_read(ConstByteView data) {
