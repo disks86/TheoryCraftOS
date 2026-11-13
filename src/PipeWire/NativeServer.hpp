@@ -89,7 +89,7 @@ class NativeServer final : public IProtocolServer {
   // A port of a client node (NativeClientNode.cpp): its formats, the metadata and buffers the server gave it, and where its data goes.
   struct ClientPort {
     static constexpr uint32_t kMaxMetas = 8;
-    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a) {}
+    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a) {}
     uint32_t direction = 0, id = 0;
     uint32_t index = 0;            // its place in the node's io area (8 bytes each)
     uint64_t flags = 0;            // SPA_PORT_FLAG_* from its info
@@ -124,6 +124,8 @@ class NativeServer final : public IProtocolServer {
     uint64_t seq = 0;              // the SPA_META_Header seq the server writes next
     uint64_t video_seen = 0;       // (a watcher) the producer's last frame given
     UmpDecoder ump_in;             // (a UMP output) its system exclusive pieces put together
+    VideoFormat source_video;      // (a watcher) its producer's format when it was negotiated: frames come in it, and are converted to `video` if it differs
+    ByteBuffer converted;          // (a watcher) the last frame converted
   };
  private:
   struct Resource {

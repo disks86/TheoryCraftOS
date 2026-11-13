@@ -29,9 +29,10 @@
 
 namespace pipewire {
 
-// One plane of a raw frame: its rows of row_bytes; a plane after the first in one block has the first's stride divided by stride_divisor (rounded up).
+// One plane of a raw frame: its rows of row_bytes; a plane after the first in one block has the first's stride times stride_num / stride_den
+// (rounded up).
 struct VideoPlane {
-  uint32_t row_bytes = 0, rows = 0, stride_divisor = 1;
+  uint32_t row_bytes = 0, rows = 0, stride_num = 1, stride_den = 1;
 };
 
 // A video format as PipeWire says it (spa/param/video/raw.h, spa/param/format.h): raw (the SPA format id, the size, the frame rate) or encoded (the
@@ -39,13 +40,13 @@ struct VideoPlane {
 struct VideoFormat {
   static constexpr uint32_t kMaxSide = 8192;
   static constexpr uint32_t kMaxPlanes = 4;
-  static constexpr uint32_t kSubtypeRaw = 1;
+  static constexpr uint32_t kSubtypeRaw = 1, kSubtypeDsp = 2;      // (dsp: PipeWire's float video, "32 bit float RGBA video", laid out as RGBA_F32)
   static constexpr uint64_t kMaxEncodedFrame = 16u << 20;
   uint32_t subtype = kSubtypeRaw;      // SPA_MEDIA_SUBTYPE_raw, or an encoded one (SPA_MEDIA_SUBTYPE_h264 ...)
-  uint32_t format = 0;          // (raw) SPA_VIDEO_FORMAT_*: packed RGB, packed and planar YUV, grey (see planes())
+  uint32_t format = 0;          // (raw) SPA_VIDEO_FORMAT_*: packed RGB (8, 10 and 16 bits, float), packed and planar YUV (8, 10, 12 bits), grey
   uint32_t width = 0, height = 0;      // (encoded: may be 0, unknown)
   uint32_t rate_num = 0, rate_den = 1;
-  bool encoded() const { return subtype != kSubtypeRaw; }
+  bool encoded() const { return subtype != kSubtypeRaw && subtype != kSubtypeDsp; }
   // (raw) How many planes and what each is (0 planes: not a format this server carries).
   uint32_t planes() const;
   VideoPlane plane(uint32_t index) const;

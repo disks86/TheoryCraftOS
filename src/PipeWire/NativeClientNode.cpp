@@ -43,6 +43,7 @@
 // The records the server and the client share are PipeWire 1.x's layouts (pw_node_activation, spa_io_position/clock, spa_io_buffers, spa_chunk,
 // spa_meta_*): their offsets are in the constants below, checked against libpipewire 1.6.9's headers.
 #include "PipeWire/NativeServer.hpp"
+#include "PipeWire/VideoConvert.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace pipewire {
@@ -288,6 +289,7 @@ VideoFormat video_of(const pod::Value& format) {
     if (key == kFormatVideoSize) pair_or_default(v, pod::kRectangle, &out.width, &out.height);
     if (key == kFormatVideoFramerate) pair_or_default(v, pod::kFraction, &out.rate_num, &out.rate_den);
   }
+  if (out.subtype == VideoFormat::kSubtypeDsp && out.format == 0) out.format = 79;      // (SPA_VIDEO_FORMAT_DSP_F32: what dsp video is)
   return out;
 }
 
@@ -310,14 +312,47 @@ uint32_t class_direction(StringView media_class, uint32_t fallback) {
 uint32_t plane_stride(const VideoFormat& v, uint32_t index, uint32_t stride0) {
   const VideoPlane pl = v.plane(index);
   if (index == 0) return stride0 > pl.row_bytes ? stride0 : pl.row_bytes;
-  const uint32_t scaled = (stride0 + pl.stride_divisor - 1) / pl.stride_divisor;
-  return scaled > pl.row_bytes ? scaled : pl.row_bytes;
+  const uint64_t scaled = (uint64_t{stride0} * pl.stride_num + pl.stride_den - 1) / pl.stride_den;
+  return scaled > pl.row_bytes ? static_cast<uint32_t>(scaled > 0xFFFFFFFFu ? 0xFFFFFFFFu : scaled) : pl.row_bytes;
 }
 // The bytes of a raw frame's planes at these strides (the first's `stride0`), one after another.
 uint64_t planes_bytes(const VideoFormat& v, uint32_t stride0, uint32_t first, uint32_t count) {
   uint64_t total = 0;
   for (uint32_t i = first; i < first + count && i < v.planes(); ++i) total += uint64_t{plane_stride(v, i, stride0)} * v.plane(i).rows;
   return total;
+}
+
+// The video formats an EnumFormat accepts (its format property: an Id, or a Choice of Ids, the default first); how many (0: it does not say).
+uint32_t enum_video_formats(ConstByteView enum_format, uint32_t* out, uint32_t most) {
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return 0;
+  uint32_t key = 0, flags = 0, n = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop)) {
+    if (key != kFormatVideoFormat) continue;
+    if (prop.type == pod::kId) {
+      uint32_t id = 0;
+      if (prop.get_id(&id) && most) out[n++] = id;
+      return n;
+    }
+    if (prop.type != pod::kChoice || prop.body.size() < 16) return 0;
+    ByteReader h(prop.body.first(16));
+    h.le32();
+    h.le32();
+    const uint32_t child_size = h.le32(), child_type = h.le32();
+    if (child_size != 4 || child_type != pod::kId) return 0;
+    for (uint64_t at = 16; prop.body.size() - at >= 4 && n < most; at += 4) {
+      ByteReader r(prop.body.subview(at, 4));
+      const uint32_t id = r.le32();
+      bool seen = false;
+      for (uint32_t k = 0; k < n; ++k) seen |= out[k] == id;
+      if (!seen) out[n++] = id;
+    }
+    return n;
+  }
+  return 0;
 }
 
 // The period of a video port's frames (its frame rate), 1 ms .. 1 s; 40 ms when it says none.
@@ -708,8 +743,19 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
     if (!n.video) return false;
     const VideoFormat v = n.video->format();
     if (!v.valid()) return false;
+    // the producer's format, or (when the watcher cannot take it) the first one it lists that the producer's frames can be converted to
+    p.source_video = v;
     p.video = v;
-    build_video_format_param(b, kParamFormat, v);
+    uint32_t wanted[32];
+    const uint32_t listed = v.encoded() ? 0 : enum_video_formats(p.enum_format.view(), wanted, 32);
+    bool takes = listed == 0;
+    for (uint32_t k = 0; k < listed; ++k) takes |= wanted[k] == v.format;
+    for (uint32_t k = 0; k < listed && !takes; ++k)
+      if (can_convert_video(v.format, wanted[k])) {
+        p.video.format = wanted[k];
+        takes = true;
+      }
+    build_video_format_param(b, kParamFormat, p.video);
     return b.ok();
   }
   if (p.enum_format.size() == 0) return false;
@@ -1487,12 +1533,18 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       // the producer's newest frame: encoded, its bytes; raw, a plane in each block (or one after another in the first), rows at the port's stride
       if (!n.video) return false;
       SharedPointer<VideoFrame> frame = n.video->latest();
-      if (!frame || frame->sequence <= p.video_seen || !(frame->format == p.video)) return false;
+      if (!frame || frame->sequence <= p.video_seen || !(frame->format == p.source_video)) return false;
       const VideoFormat& v = p.video;
+      // (in the watcher's format: converted when that is not the producer's)
+      ConstByteView pixels = frame->pixels.view();
+      if (!(v == p.source_video)) {
+        if (!convert_video(p.source_video, pixels, v, &p.converted)) return false;
+        pixels = p.converted.view();
+      }
       if (v.encoded()) {
-        if (frame->pixels.size() > maxsize) return false;
-        data.first(frame->pixels.size()).copy_from(frame->pixels.view());
-        got = static_cast<uint32_t>(frame->pixels.size());
+        if (pixels.size() > maxsize) return false;
+        data.first(pixels.size()).copy_from(pixels);
+        got = static_cast<uint32_t>(pixels.size());
         p.video_seen = frame->sequence;
         break;
       }
@@ -1509,7 +1561,7 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
         ByteView out = separate ? buffer_data(p, id, &block_size, i) : data;
         if (separate) at = 0;
         if (block_size < bytes || out.size() < at + bytes) return false;
-        const ConstByteView src = frame->pixels.view().subview(v.plane_offset(i), uint64_t{pl.row_bytes} * pl.rows);
+        const ConstByteView src = pixels.subview(v.plane_offset(i), uint64_t{pl.row_bytes} * pl.rows);
         for (uint32_t y = 0; y < pl.rows; ++y)
           out.subview(at + uint64_t{y} * st, pl.row_bytes).copy_from(src.subview(uint64_t{y} * pl.row_bytes, pl.row_bytes));
         if (separate && i > 0) {

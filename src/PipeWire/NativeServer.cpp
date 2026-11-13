@@ -843,7 +843,7 @@ void NativeServer::tick() {
         for (UniquePointer<ClientPort>& p : n->ports.view())
           if (p->media == Media::Video && p->direction == 0 && p->format_sent && !p->renegotiate) {
             const VideoFormat now_format = n->video->format();
-            if (now_format.valid() && !(now_format == p->video)) p->renegotiate = n->renegotiate = true;
+            if (now_format.valid() && !(now_format == p->source_video)) p->renegotiate = n->renegotiate = true;
           }
       if (n->renegotiate) negotiate(*c, *n);
       run_client_node(*n, now);

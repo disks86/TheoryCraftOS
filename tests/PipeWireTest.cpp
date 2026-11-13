@@ -37,6 +37,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
 #include "PipeWire/NativeServer.hpp"
+#include "PipeWire/VideoConvert.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/RecordStream.hpp"
@@ -2946,7 +2947,7 @@ static void test_video_channel() {
   VideoFormat yuv;
   yuv.width = 5; yuv.height = 3;
   yuv.format = 2;      // I420
-  CHECK(yuv.valid() && yuv.planes() == 3 && yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 2 && yuv.plane(2).stride_divisor == 2 &&
+  CHECK(yuv.valid() && yuv.planes() == 3 && yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 2 && yuv.plane(2).stride_den == 2 &&
         yuv.frame_bytes() == 15 + 6 + 6 && yuv.plane_offset(2) == 21 && yuv.plane(3).rows == 0);
   yuv.format = 23;     // NV12
   CHECK(yuv.planes() == 2 && yuv.plane(1).row_bytes == 6 && yuv.plane(1).rows == 2 && yuv.frame_bytes() == 15 + 12);
@@ -2955,7 +2956,7 @@ static void test_video_channel() {
   yuv.format = 18;     // Y42B
   CHECK(yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 3);
   yuv.format = 17;     // Y41B
-  CHECK(yuv.plane(1).row_bytes == 2 && yuv.plane(1).stride_divisor == 4);
+  CHECK(yuv.plane(1).row_bytes == 2 && yuv.plane(1).stride_den == 4);
   yuv.format = 20;     // Y444
   CHECK(yuv.frame_bytes() == 45);
   yuv.format = 25;     // GRAY8
@@ -3007,6 +3008,64 @@ static void test_video_channel() {
     for (VideoPlaneData& d : pl) d = VideoPlaneData{ConstByteView(junk.data(), rng() % junk.size()), uint32_t(rng() % 200)};
     const bool ok = ch2.publish(ArrayView<const VideoPlaneData>(pl, 1 + rng() % 4), 0);
     if (ok) CHECK(ch2.latest() && ch2.latest()->pixels.size() == ff.frame_bytes());
+  }
+  // the 10- and 12-bit, 4:2:2/4:4:4 semi-planar and other formats' planes
+  VideoFormat hb;
+  hb.width = 5; hb.height = 3;
+  hb.format = 43;      // I420_10LE
+  CHECK(hb.planes() == 3 && hb.plane(0).row_bytes == 10 && hb.plane(1).row_bytes == 6 && hb.plane(1).rows == 2 && hb.frame_bytes() == 30 + 12 + 12);
+  hb.format = 62;      // P010_10LE
+  CHECK(hb.planes() == 2 && hb.plane(1).row_bytes == 12 && hb.frame_bytes() == 30 + 24);
+  hb.format = 52;      // NV24: chroma rows twice the luma's, stride too
+  CHECK(hb.plane(1).row_bytes == 10 && hb.plane(1).rows == 3 && hb.plane(1).stride_num == 2);
+  hb.format = 51;      // NV16
+  CHECK(hb.plane(1).row_bytes == 6 && hb.plane(1).rows == 3);
+  hb.format = 80;      // xRGB_210LE
+  CHECK(hb.frame_bytes() == 60);
+  hb.format = 79; hb.subtype = VideoFormat::kSubtypeDsp;      // dsp float video
+  CHECK(hb.valid() && !hb.encoded() && hb.frame_bytes() == 5 * 3 * 16);
+  hb.format = 12;
+  CHECK(!hb.valid());      // (dsp is RGBA_F32 only)
+  // conversion: every pair of the 8-bit formats round-trips a grey ramp and pure colours closely
+  const uint32_t convertible[] = {2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 23, 24, 25};
+  VideoFormat rgba;
+  rgba.format = 11; rgba.width = 6; rgba.height = 4;
+  std::vector<uint8_t> source(6 * 4 * 4);
+  for (uint32_t i = 0; i < 24; ++i) {
+    const uint8_t v = uint8_t(40 + (i % 6) * 30);      // (a grey per column: survives 4:2:0 too)
+    source[4 * i] = source[4 * i + 1] = source[4 * i + 2] = v;
+    source[4 * i + 3] = 255;
+  }
+  for (uint32_t to : convertible) {
+    VideoFormat mid = rgba;
+    mid.format = to;
+    ByteBuffer there(A), back(A);
+    CHECK(can_convert_video(11, to) && convert_video(rgba, ConstByteView(source.data(), source.size()), mid, &there) && there.size() == mid.frame_bytes());
+    CHECK(convert_video(mid, there.view(), rgba, &back) && back.size() == source.size());
+    int worst = 0;
+    for (size_t k = 0; k < source.size() && back.size() == source.size(); ++k)
+      if (k % 4 != 3) worst = std::max(worst, abs(int(back.view()[k]) - int(source[k])));
+    if (worst > 4) printf("conversion through format %u: off by %d\n", to, worst);
+    CHECK(worst <= 4);
+  }
+  {
+    VideoFormat i420 = rgba, odd = rgba;
+    i420.format = 2;
+    odd.width = 5;
+    ByteBuffer o(A);
+    CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size() - 1), i420, &o));      // (short)
+    CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o));         // (another size)
+    VideoFormat p010 = rgba;
+    p010.format = 62;
+    CHECK(!can_convert_video(62, 11) && !convert_video(p010, ConstByteView(source.data(), source.size()), rgba, &o));
+    // red through NV12 comes back red
+    std::vector<uint8_t> red(6 * 4 * 4);
+    for (uint32_t i = 0; i < 24; ++i) { red[4 * i] = 200; red[4 * i + 1] = 0; red[4 * i + 2] = 0; red[4 * i + 3] = 255; }
+    VideoFormat nv12 = rgba;
+    nv12.format = 23;
+    ByteBuffer t(A), b2(A);
+    CHECK(convert_video(rgba, ConstByteView(red.data(), red.size()), nv12, &t) && convert_video(nv12, t.view(), rgba, &b2));
+    if (b2.size() == red.size()) CHECK(abs(int(b2.view()[0]) - 200) <= 6 && b2.view()[1] <= 6 && b2.view()[2] <= 6);
   }
   ch.close();
   CHECK(ch.closed() && !ch.publish(ConstByteView(rows.data(), rows.size()), 300, 0) && ch.frames() == 1);
@@ -3217,6 +3276,19 @@ static void enum_video_fixed(pod::Builder& b, uint32_t format, uint32_t w, uint3
   const uint64_t o = b.begin_object(0x40003, 3);
   b.property(1); b.id(2); b.property(2); b.id(subtype);
   if (subtype == 1) { b.property(0x20001); b.id(format); }
+  b.property(0x20003); b.rectangle(w, h);
+  b.property(0x20004); b.fraction(30, 1);
+  b.end(o);
+}
+// A video EnumFormat of a Choice of raw formats (the first the default) at one size.
+static void enum_video_choice(pod::Builder& b, std::initializer_list<uint32_t> formats, uint32_t w, uint32_t h) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(2); b.property(2); b.id(1);
+  b.property(0x20001);
+  const uint64_t ch = b.begin_choice(3, pod::kId);
+  b.choice_value32(*formats.begin());
+  for (uint32_t f : formats) b.choice_value32(f);
+  b.end(ch);
   b.property(0x20003); b.rectangle(w, h);
   b.property(0x20004); b.fraction(30, 1);
   b.end(o);
@@ -3653,7 +3725,7 @@ static void test_client_node_media() {
     create_node(w, 4, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
     node_update(w, 4);
     set_active(w, 4, true);
-    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 320, 240, true); port_info(b, 0, {}); });
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {23, 2}, 320, 240); port_info(b, 0, {}); });
     yw.absorb(w);
     CHECK(yw.ports[{0, 0}].format == ycp.format);
     w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
@@ -3770,6 +3842,40 @@ static void test_client_node_media() {
       tick(40);
       CHECK(watched(mw) == jpeg);
     }
+    // a watcher that takes BGRA only, of the I420 camera: offered BGRA, given each frame converted (BT.601 limited: Y 16 black, 235 white)
+    NodeView cw;
+    cw.id = 6;
+    create_node(w, 6, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
+    node_update(w, 6);
+    set_active(w, 6, true);
+    w.send(6, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 6, 4); port_info(b, 0, {}); });
+    cw.absorb(w);
+    {
+      VideoFormat offered;
+      pod::Parser fp(ConstByteView(cw.ports[{0, 0}].format.data(), cw.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20001) v.get_id(&offered.format);
+      }
+      CHECK(offered.format == 12);
+    }
+    w.send(6, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    cw.absorb(w);
+    CHECK(cw.starts == 1 && cw.ports[{0, 0}].bufs.size() == 2);
+    if (cw.starts && ycp.bufs.size() == 2) {
+      // white on the left half, black on the right, no colour
+      std::vector<uint8_t> y6(24), u3(6, 128), v3(6, 128);
+      for (size_t k = 0; k < 24; ++k) y6[k] = (k % 6) < 3 ? 235 : 16;
+      put_u32(cw.activation->memory(), 0, 3);
+      produce(yc, 0, {y6, u3, v3}, {6, 3, 3});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(cw);
+      CHECK(got.size() == 6 * 4 * 4);
+      if (got.size() == 96) CHECK(got[0] == 255 && got[1] == 255 && got[2] == 255 && got[3] == 255 && got[5 * 4] == 0 && got[5 * 4 + 2] == 0 && got[23 * 4 + 3] == 255);
+    }
+    w.send(0, 7, [](pod::Builder& b) { b.int32(6); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
     w.send(0, 7, [](pod::Builder& b) { b.int32(4); });
