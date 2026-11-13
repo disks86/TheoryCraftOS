@@ -183,9 +183,36 @@ void refresh_window_dcs(Window* w) {
   }
 }
 
+bool dc_screen_offset_locked(Call& call, uint32_t dc, int32_t* dx, int32_t* dy) {
+  if (!state_or_null()) return false;
+  for (WinDc& d : S().dcs) {
+    if (d.dc != dc) continue;
+    Window* w = find_window(d.hwnd);
+    Window* top = w ? top_level_of(w) : nullptr;
+    if (!top || !redirected(top)) return false;      // (drawing on the screen itself: its coordinates are the screen's)
+    const uint32_t kc = caller_scale(call);
+    Window* mixed = dpi_drawing_root(w);
+    if (mixed && mixed != top && mixed->dpi_mixed) {      // a mixed DPI child's own surface, in its units
+      const Rect mr = window_rect_screen(mixed);
+      *dx = dpi_down(mr.left, kc);
+      *dy = dpi_down(mr.top, kc);
+      return true;
+    }
+    const uint32_t kt = window_scale(top);
+    const Rect s = surface_rect_in_window_units(top);      // (screen coordinates in the top-level's units)
+    *dx = dpi_down(dpi_up(s.left, kt), kc);
+    *dy = dpi_down(dpi_up(s.top, kt), kc);
+    return true;
+  }
+  return false;
+}
+
 namespace {
 
+// GetDC(NULL): the whole screen - for a DPI unaware caller on a scaled screen, a shadow of it in the caller's units (what it draws goes on to the screen, scaled up).
 uint32_t screen_dc(Call& call) {
+  const uint32_t k = caller_scale(call);
+  if (k > 100) return gdi::create_screen_shadow_dc(call.pid(), k);
   const Rect all{0, 0, int32_t(gdi::screen_width()), int32_t(gdi::screen_height())};
   return gdi::create_screen_dc(call.pid(), 0, 0, ArrayView<const Rect>(&all, 1));
 }
@@ -224,20 +251,22 @@ uint64_t nt_get_dc_ex(Call& call) {
   return dc;
 }
 
-// INT NtUserReleaseDC(HWND, HDC)
+// INT NtUserReleaseDC(HWND, HDC) - or NtUserReleaseDC(HDC), as this system's user32 calls it (the window is not needed: a DC knows its window)
 uint64_t nt_release_dc(Call& call) {
   State& s = S();
-  const uint32_t dc = call.arg32(1);
+  uint32_t dc = call.arg32(1);
+  uint32_t hwnd = call.arg32(0);
+  if (!gdi::is_dc(dc) && gdi::is_dc(call.arg32(0))) { dc = call.arg32(0); hwnd = 0; }
   for (WinDc& d : s.dcs) {
     if (d.dc != dc) continue;
     if (d.pid != call.pid()) return 0;
-    if (call.arg(0) != 0 && d.hwnd != call.arg32(0)) return 0;
+    if (hwnd != 0 && d.hwnd != hwnd) return 0;
     const bool ok = gdi::delete_dc(dc);
     s.dcs.erase(&d);
     return ok ? 1 : 0;
   }
   // a DC of the whole screen (GetDC(NULL)) is not tracked here
-  if (call.arg(0) == 0 && gdi::is_dc(dc)) return gdi::delete_dc(dc) ? 1 : 0;
+  if (hwnd == 0 && gdi::is_screen_dc(dc) && gdi::dc_owner(dc) == call.pid()) return gdi::delete_dc(dc) ? 1 : 0;
   return 0;
 }
 

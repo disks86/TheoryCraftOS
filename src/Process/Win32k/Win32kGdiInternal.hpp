@@ -148,6 +148,7 @@ struct Bitmap : Object {
   uint32_t attributes = 0;
   bool is_screen = false;      // the screen surface (not in the handle table)
   uint32_t window_surface = 0; // the surface of this top-level window (not in the handle table; changes go to the window surface sink)
+  uint32_t shadow_scale = 0;   // a shadow of the screen at this percent scale (a DPI unaware program's screen DC): drawing on it goes on to the screen, scaled up
   uint32_t dib_usage = 0;
   uint32_t clr_important = 0;
   uint32_t x_ppm = 0, y_ppm = 0;
@@ -216,6 +217,7 @@ struct Dc : Object {
   int32_t origin_x = 0, origin_y = 0;  // screen DC: where device (0,0) lies on the screen
   List<Rect> surface_clip;             // screen DC: where drawing is allowed (screen coordinates)
   uint32_t surface = 0;                // screen DC of a window with a window surface: that surface (origin and clip are then the surface's coordinates)
+  bool owns_surface = false;           // the surface is this DC's own (a screen shadow): destroyed with it
   Point cur_pos;
   Path path;
   Rect bounds;
@@ -439,5 +441,6 @@ Dc* dc_arg(Call& c, uint32_t handle);      // the DC of the calling process (set
 #define GDI_REGISTER(NAME, FN) ::process::win32k::register_handler(WindowsSyscallNumber::NtGdi##NAME, FN)
 
 void caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi);      // DPI virtualization of the calling thread (set_caller_dpi_hook; 1 and 96 without one)
+bool dc_screen_offset(Call& call, uint32_t dc, int32_t* dx, int32_t* dy);      // (set_dc_screen_offset_hook; false without one)
 
 }  // namespace process::win32k::gdi

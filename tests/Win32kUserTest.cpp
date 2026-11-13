@@ -1175,6 +1175,34 @@ void test_dpi_virtualization() {
     const ArrayView<uint32_t> px = gdi::window_surface_pixels(ti.surface_id, &pw, &ph);
     CHECK(pw == 388 && (px[10 * pw + 10] & 0xFFFFFF) == 0xFF0000 && (px[29 * pw + 29] & 0xFFFFFF) == 0xFF0000 && (px[30 * pw + 30] & 0xFFFFFF) != 0xFF0000);
   }
+  // its system region (GetRandomRgn SYSRGN) in screen coordinates of its units: the client area at (106, 125), 388 x 269
+  {
+    const uint32_t dc = t.svc32(N::NtUserGetDC, {u});
+    const uint32_t rgn = t.svc32(N::NtGdiCreateRectRgn, {0, 0, 1, 1});
+    CHECK(t.svc32(N::NtGdiGetRandomRgn, {dc, rgn, 5}) == 1);
+    const uint64_t box = t.tmp(0x800);
+    CHECK(t.svc32(N::NtGdiGetRgnBox, {rgn, box}) != 0);
+    CHECK(int32_t(t.mem().get32(box)) == 106 && int32_t(t.mem().get32(box + 4)) == 125 && int32_t(t.mem().get32(box + 8)) == 106 + 388 &&
+          int32_t(t.mem().get32(box + 12)) == 125 + 269);
+    t.svc(N::NtUserReleaseDC, {u, dc});
+  }
+  // the screen DC (GetDC(NULL)) is in its units too: a 1024 x 768 shadow of the screen, what it draws going on to the screen twice as large
+  {
+    const uint32_t dc = t.svc32(N::NtUserGetDC, {0});
+    CHECK(dc != 0);
+    const uint64_t brush = t.svc(N::NtGdiCreateSolidBrush, {0x00FF00, 0});
+    t.svc(N::NtGdiSelectBrush, {dc, brush});
+    CHECK(t.svc32(N::NtGdiPatBlt, {dc, 1000, 700, 24, 68, 0xF00021}) == 1);      // (the bottom-right corner, only there in units)
+    CHECK(t.svc32(N::NtGdiGetPixel, {dc, 1023, 767}) == 0x00FF00);
+    const ConstByteView screen = gdi::screen_pixels();
+    auto at = [&](int32_t x, int32_t y) { const uint64_t o = (uint64_t(y) * 2048 + uint64_t(x)) * 4; return uint32_t(screen[o]) | uint32_t(screen[o + 1]) << 8 | uint32_t(screen[o + 2]) << 16; };
+    CHECK(at(2000, 1400) == 0x00FF00 && at(2047, 1535) == 0x00FF00 && at(1999, 1400) != 0x00FF00 && at(2000, 1399) != 0x00FF00);
+    const uint32_t rgn = t.svc32(N::NtGdiCreateRectRgn, {0, 0, 1, 1});
+    const uint64_t box = t.tmp(0x800);
+    CHECK(t.svc32(N::NtGdiGetRandomRgn, {dc, rgn, 5}) == 1 && t.svc32(N::NtGdiGetRgnBox, {rgn, box}) != 0);
+    CHECK(t.mem().get32(box + 8) == 1024 && t.mem().get32(box + 12) == 768);
+    CHECK(t.svc32(N::NtUserReleaseDC, {0, dc}) == 1 && !gdi::is_dc(dc));
+  }
   {
     std::vector<uint32_t> small(64 * 64, 0);
     graphics::Surface ss;

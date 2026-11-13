@@ -50,6 +50,9 @@ void set_screen_sink(IScreenSink* sink);
 // array means "nowhere" (everything is clipped). Returns the HDC (0 on failure). The DC belongs to process `pid` (gone when it ends).
 // `surface`: a window surface (below) the DC draws on instead of the screen; origin and clip are then in the surface's coordinates.
 uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);
+// A screen DC for a DPI unaware program (scale > 100 percent): it draws on a shadow of the screen in the program's units (sized device_to_units of the screen,
+// filled with what the screen shows when it is made), and what it draws goes on to the screen scaled up as it is drawn. The shadow goes with the DC. 0: no memory.
+uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale);
 bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);
 
 // --- Window surfaces: the backing store of a top-level window that the kernel's desktop composites (the window and its children draw there through their DCs; the desktop
@@ -77,8 +80,13 @@ void set_window_surface_sink(IWindowSurfaceSink* sink);
 // Without a hook GDI answers 100 (percent: no scaling) and 96.
 using CallerDpiHook = void (*)(Call& call, uint32_t* scale, uint32_t* dpi);
 void set_caller_dpi_hook(CallerDpiHook hook);
+// Where a DC's surface lies on the screen, in the calling thread's coordinates (GetRandomRgn's SYSRGN is in screen coordinates): the window manager
+// adds (dx, dy) to the DC's surface coordinates. False (the default): the DC's coordinates are the screen's.
+using DcScreenOffsetHook = bool (*)(Call& call, uint32_t dc, int32_t* dx, int32_t* dy);
+void set_dc_screen_offset_hook(DcScreenOffsetHook hook);
 bool is_dc(uint32_t handle);
 bool is_screen_dc(uint32_t handle);      // a DC of the screen or of a window (not a memory DC, not a printer's)
+uint64_t dc_owner(uint32_t handle);      // the process a DC belongs to (0: not a DC)
 bool delete_dc(uint32_t dc);      // ReleaseDC / EndPaint: the DC goes (any objects selected into it stay)
 
 // --- Regions as lists of rectangles (HRGN <-> window update regions, window shapes).
