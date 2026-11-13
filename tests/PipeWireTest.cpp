@@ -3155,7 +3155,8 @@ static void test_video_channel() {
   hb.format = 12;
   CHECK(!hb.valid());      // (dsp is RGBA_F32 only)
   // conversion: every pair of the 8-bit formats round-trips a grey ramp and pure colours closely
-  const uint32_t convertible[] = {2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 23, 24, 25};
+  const uint32_t convertible[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24, 25, 26, 27, 29, 30, 31, 32, 39, 40, 43, 45, 47,
+                                  51, 52, 60, 62, 64, 73, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87};
   VideoFormat rgba;
   rgba.format = 11; rgba.width = 6; rgba.height = 4;
   std::vector<uint8_t> source(6 * 4 * 4);
@@ -3173,8 +3174,9 @@ static void test_video_channel() {
     int worst = 0;
     for (size_t k = 0; k < source.size() && back.size() == source.size(); ++k)
       if (k % 4 != 3) worst = std::max(worst, abs(int(back.view()[k]) - int(source[k])));
-    if (worst > 4) printf("conversion through format %u: off by %d\n", to, worst);
-    CHECK(worst <= 4);
+    const int allowed = to >= 29 && to <= 32 ? 9 : 4;      // (5 bits a component: steps of 8)
+    if (worst > allowed) printf("conversion through format %u: off by %d\n", to, worst);
+    CHECK(worst <= allowed);
   }
   {
     VideoFormat i420 = rgba, odd = rgba;
@@ -3183,9 +3185,19 @@ static void test_video_channel() {
     ByteBuffer o(A);
     CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size() - 1), i420, &o));      // (short)
     CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o));         // (another size)
-    VideoFormat p010 = rgba;
-    p010.format = 62;
-    CHECK(!can_convert_video(62, 11) && !convert_video(p010, ConstByteView(source.data(), source.size()), rgba, &o));
+    VideoFormat v210 = rgba;
+    v210.format = 21;      // (v210: not carried)
+    CHECK(!can_convert_video(21, 11) && !convert_video(v210, ConstByteView(source.data(), source.size()), rgba, &o));
+    // a deep format keeps colour through it: red through P010 and through float RGBA
+    for (uint32_t deep : {62u, 79u, 85u}) {
+      std::vector<uint8_t> red(6 * 4 * 4);
+      for (uint32_t i = 0; i < 24; ++i) { red[4 * i] = 200; red[4 * i + 1] = 30; red[4 * i + 2] = 10; red[4 * i + 3] = 255; }
+      VideoFormat d = rgba;
+      d.format = deep;
+      ByteBuffer t(A), b3(A);
+      CHECK(convert_video(rgba, ConstByteView(red.data(), red.size()), d, &t) && convert_video(d, t.view(), rgba, &b3));
+      if (b3.size() == red.size()) CHECK(abs(int(b3.view()[0]) - 200) <= 6 && abs(int(b3.view()[1]) - 30) <= 6 && b3.view()[2] <= 16);
+    }
     // red through NV12 comes back red
     std::vector<uint8_t> red(6 * 4 * 4);
     for (uint32_t i = 0; i < 24; ++i) { red[4 * i] = 200; red[4 * i + 1] = 0; red[4 * i + 2] = 0; red[4 * i + 3] = 255; }
