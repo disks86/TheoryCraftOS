@@ -1415,6 +1415,39 @@ static void test_modules() {
   CHECK(a.live == 0);
 }
 
+// A classic <script src> that script puts into the document is fetched like the parser's: in no-cors mode, so another site's script that sends no
+// Access-Control-Allow-Origin still runs (YouTube loads Google's BotGuard interpreter from www.google.com that way, and waits for it before it opens a
+// video). With a crossorigin attribute the CORS rules apply; a script that cannot be fetched fires error.
+static void test_inserted_classic_scripts() {
+  TestAllocator a;
+  {
+    FakeEnvironment env(a);
+    const char* bg = "window.bg = 'ran'; console.log('bg.js');";
+    for (const char* address : {"https://cdn.other/bg.js", "https://cdn.other/bg.js?cors"}) {
+      env.files[address] = bg;   // (what the parser's way of fetching gets)
+      env.net.answers[std::string("GET ") + address] = {200, "Content-Type: text/javascript\r\n", bg};   // (and fetch/XMLHttpRequest: no Access-Control-Allow-Origin)
+    }
+    env.files["https://app.example/dir/same.js"] = "console.log('same.js');";
+    env.net.answers["GET https://app.example/dir/same.js"] = {200, "Content-Type: text/javascript\r\n", "console.log('same.js');"};
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/dir/page.html", media, true);
+    page.load("<html><head></head><body><script>"
+              "function add(src, cors, name) { var s = document.createElement('script'); s.src = src; if (cors) s.setAttribute('crossorigin', 'anonymous');"
+              "  s.onload = function () { console.log(name, 'load', window.bg); }; s.onerror = function () { console.log(name, 'error'); }; document.head.appendChild(s); }"
+              "add('https://cdn.other/bg.js', false, 'cross');"
+              "add('https://cdn.other/bg.js?cors', true, 'cors');"
+              "add('same.js', false, 'same');"
+              "add('https://cdn.other/missing.js', false, 'missing');"
+              "</script></body></html>");
+    for (int round = 0; round < 8; ++round) page.run_due_timers(1e18);   // (an inserted script is fetched and run from a timer)
+    const std::string log(page.log().data(), page.log().size());
+    const char* expected = "bg.js\ncross load ran\ncors error\nsame.js\nsame load ran\nmissing error\n";
+    if (log != expected) printf("   inserted scripts logged: %s\n", log.c_str());
+    CHECK(log == expected);
+  }
+  CHECK(a.live == 0);
+}
+
 // --- Pictures, videos and canvases --------------------------------------------------------------------------------------------------
 
 static std::string make_picture(TestAllocator& a, uint32_t w, uint32_t h, uint32_t color, media::ImageFormat format = media::ImageFormat::Png) {
@@ -7169,6 +7202,7 @@ int main(int argc, char** argv) {
   }
   if (getenv("ONLY_MODULES")) {   // (just the ES module tests)
     test_modules();
+    test_inserted_classic_scripts();
     printf(g_failed ? "%d check(s) failed\n" : "module tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -7218,6 +7252,7 @@ int main(int argc, char** argv) {
   test_external_and_errors();
   test_document_encoding();
   test_modules();
+  test_inserted_classic_scripts();
   test_images();
   test_picture_paint();
   test_canvas_scripts();
