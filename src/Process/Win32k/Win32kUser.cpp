@@ -466,6 +466,7 @@ void destroy_window_now(Window* w) {
   // children have gone already (destroy_window_tree); what refers to the window now goes
   w->destroying = true;
   if (is_top_level(w)) { drop_surface(w); notify_top_level(w); }      // (the desktop's window goes)
+  drop_mixed_surface(w);
   focus_window_gone(w);
   kill_timers_of_window(handle);
   drop_hotkeys_of_window(handle);

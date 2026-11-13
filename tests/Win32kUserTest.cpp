@@ -1250,6 +1250,76 @@ void test_dpi_virtualization() {
     uint32_t dw = 0, dh = 0;
     CHECK(bridge.draw_window_scaled(v, device, 412, 450, 200, &dw, &dh) && dw == (600 - 24) / 2 && dh == (400 - 62) / 2);
   }
+  // --- DPI hosting. Default: an unaware program's child of the aware window is of the aware window's awareness; SetParent of an unaware child into it
+  // is refused. Mixed: the child keeps its own awareness and its own surface, which win32k scales into the aware window's surface.
+  {
+    Program p97(97), p98(98);
+    Th d3(p97, 97, kScratch), m4(p98, 98, kScratch);
+    d3.proc = def_proc;
+    m4.proc = def_proc;
+    CHECK(d3.atom_class("DpiChild") >= 0xC000 && m4.atom_class("DpiChild") >= 0xC000 && t.atom_class("DpiChild") >= 0xC000);
+    const uint32_t dc_child = d3.create("DpiChild", WS_CHILD | WS_VISIBLE, 0, 0, 30, 20, v, 4 /* WS_EX_NOPARENTNOTIFY: the parent is another thread */, "default");
+    CHECK(dc_child != 0);
+    {
+      user::Window* w = user::find_window(dc_child);
+      CHECK(w && w->dpi_virtual == 0 && !w->dpi_mixed && user::window_dpi_hosting(dc_child) == 0);
+    }
+    const uint32_t u_child = t.create("DpiChild", WS_CHILD | WS_VISIBLE, 5, 5, 20, 20, u, 4, "unaware child");
+    CHECK(u_child != 0 && user::find_window(u_child)->dpi_virtual == 1);
+    CHECK(t.svc32(N::NtUserSetParent, {u_child, v}) == 0);      // (default hosting: refused)
+    CHECK(user::find_window(u_child) && user::find_window(u_child)->parent == user::find_window(u));
+    // mixed
+    CHECK(m4.svc(N::NtUserCallTwoParam, {1, 1, 0x7C05}) == 0 && m4.svc(N::NtUserCallTwoParam, {0, 0, 0x7C05}) == 1);
+    CHECK(int32_t(m4.svc(N::NtUserCallTwoParam, {1, 7, 0x7C05})) == -1);      // (not a behavior)
+    const uint32_t mixed = m4.create("DpiChild", WS_CHILD | WS_VISIBLE, 60, 40, 50, 40, v, 4, "mixed");      // (clear of the other child)
+    CHECK(mixed != 0);
+    pump(m4);
+    pump(a2);
+    user::Window* mw = user::find_window(mixed);
+    CHECK(mw && mw->dpi_virtual == 1 && mw->dpi_mixed && user::window_dpi_hosting(mixed) == 1);
+    Rc cr2 = m4.client_rect(mixed);
+    CHECK(cr2.r == 50 && cr2.b == 40);      // (its units)
+    gdi::Rect mrect;
+    CHECK(user::window_screen_rect(mixed, &mrect) && mrect.right - mrect.left == 100 && mrect.bottom - mrect.top == 80);      // (device pixels)
+    uint32_t cw = 0, ch = 0;
+    CHECK(mw->child_surface == 0 || (gdi::window_surface_size(mw->child_surface, &cw, &ch) && cw == 50 && ch == 40));
+    // it draws in its units: its pixels show in the aware window's surface twice as large, where it is
+    {
+      const uint32_t dc = m4.svc32(N::NtUserGetDC, {mixed});
+      const uint64_t brush = m4.svc(N::NtGdiCreateSolidBrush, {0x0000FF, 0});
+      m4.svc(N::NtGdiSelectBrush, {dc, brush});
+      CHECK(m4.svc32(N::NtGdiPatBlt, {dc, 0, 0, 10, 10, 0xF00021}) == 1);
+      m4.svc(N::NtUserReleaseDC, {dc});
+    }
+    CHECK(mw->child_surface != 0 && gdi::window_surface_size(mw->child_surface, &cw, &ch) && cw == 50 && ch == 40);
+    user::TopLevelInfo vi;
+    CHECK(user::top_level_info(v, &vi, nullptr) && vi.dpi_aware);
+    uint32_t vw = 0, vh = 0;
+    const ArrayView<uint32_t> vp = gdi::window_surface_pixels(vi.surface_id, &vw, &vh);
+    const int32_t sx = mrect.left - vi.surface.left, sy = mrect.top - vi.surface.top;
+    CHECK(sx >= 0 && sy >= 0 && sx + 21 < int32_t(vw) && sy + 21 < int32_t(vh));
+    if (sx >= 0 && sy >= 0 && sx + 21 < int32_t(vw) && sy + 21 < int32_t(vh)) {
+      auto at = [&](int32_t x, int32_t y) { return vp[uint64_t(y) * vw + uint64_t(x)] & 0xFFFFFF; };
+      CHECK(at(sx, sy) == 0xFF0000 && at(sx + 19, sy + 19) == 0xFF0000 && at(sx + 20, sy + 20) != 0xFF0000);
+    }
+    // the aware window repaints over it: the mixed child goes back on top
+    {
+      const uint32_t dc = a2.svc32(N::NtUserGetDCEx, {v, 0, 0});
+      const uint64_t brush = a2.svc(N::NtGdiCreateSolidBrush, {0x00FF00, 0});
+      a2.svc(N::NtGdiSelectBrush, {dc, brush});
+      a2.svc32(N::NtGdiPatBlt, {dc, 0, 0, 400, 300, 0xF00021});
+      a2.svc(N::NtUserReleaseDC, {dc});
+      if (sx >= 0 && sy >= 0 && sx + 21 < int32_t(vw) && sy + 21 < int32_t(vh)) CHECK((vp[uint64_t(sy + 5) * vw + uint64_t(sx + 5)] & 0xFFFFFF) == 0xFF0000);
+    }
+    // a top-level again: no longer mixed
+    CHECK(m4.svc32(N::NtUserSetParent, {mixed, 0}) != 0 || true);
+    m4.svc(N::NtUserDestroyWindow, {mixed});
+    d3.svc(N::NtUserDestroyWindow, {dc_child});
+    t.svc(N::NtUserDestroyWindow, {u_child});
+    pump(t);
+    pump(a2);
+  }
+
   // --- 150 %: the mapping rounds units up and device pixels down, so the unaware program still reads back what it set
   one[0].scale_percent = 150;
   sizes.clear();

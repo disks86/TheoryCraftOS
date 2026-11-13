@@ -91,6 +91,23 @@ bool make_dc_geometry(Window* w, const WinDc& d, int32_t* ox, int32_t* oy, List<
   else client_origin(w, ox, oy);
   if (!visible_region(w, !d.window_dc, d.clip_children, d.clip_siblings, clip)) return false;
   Window* top = top_level_of(w);
+  Window* mixed = top && redirected(top) ? dpi_drawing_root(w) : nullptr;
+  if (mixed && mixed != top && mixed->dpi_mixed) {      // (a mixed DPI child's tree draws on that child's own surface, in its units)
+    if (mixed->child_surface == 0) sync_mixed_surface(mixed);
+    if (mixed->child_surface == 0) { clip->clear(); return true; }
+    const uint32_t k = window_scale(mixed);
+    const Rect mr = window_rect_screen(mixed);
+    *ox = dpi_down(*ox - mr.left, k);
+    *oy = dpi_down(*oy - mr.top, k);
+    List<Rect> inside(S().alloc);
+    for (const Rect& r : *clip) {
+      const Rect i = rect_intersect(r, mr);
+      if (!rect_empty(i)) inside.push_back(dpi_cover(rect_offset(i, -mr.left, -mr.top), k));
+    }
+    region_copy(*clip, inside);
+    *surface = mixed->child_surface;
+    return true;
+  }
   if (top && redirected(top)) {
     if (top->surface == 0) sync_surface(top);
     if (top->surface == 0) { clip->clear(); return true; }      // (no surface yet - hidden or no memory: the DC draws nowhere)

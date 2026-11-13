@@ -52,6 +52,15 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
       so rounding never moves a window.
   - **Its surface:** the window surface is in its units (the device scale smaller), and so are its DCs, update regions, `BeginPaint` and GPU
     presents. The desktop enlarges the surface, as Windows' DWM does.
+- **Child windows** follow Windows' DPI hosting behaviour (`Set/GetThreadDpiHostingBehavior`, `GetWindowDpiHostingBehavior`):
+  - **Default hosting:** a new child takes the awareness of the window tree it is put in, and `SetParent` of a child into a tree of another
+    awareness fails with `ERROR_INVALID_OPERATION`.
+  - **Mixed hosting:** a thread that asked for it keeps its own awareness for its children. A child of another awareness than its tree is a mixed
+    child, scaled on its own:
+    - Its tree draws on a surface of the child's own, in the child's coordinates.
+    - Whenever that surface, or the top-level's under it, changes, win32k scales its pixels into the top-level's surface where the child shows
+      (nearest sampling: an unaware child of an aware window is enlarged, an aware child of an unaware window shrunk).
+    - Its messages and calls are in its own coordinates.
 - **A scale change** keeps every top-level window where it was in units:
   - A per-monitor-aware window gets `WM_DPICHANGED`, with the new DPI in both halves of wParam and lParam pointing at the suggested rectangle (its old
     one at the new scale), as on Windows. A program that leaves it to DefWindowProc is moved there, which Windows' DefWindowProc does not do. The
@@ -69,7 +78,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 - Windows DPI virtualization (above) has these gaps:
   - Only per-monitor-aware windows hear `WM_DPICHANGED`. A system-aware one keeps its device size when the scale changes (Windows would enlarge
     its picture instead).
-  - Mixed-awareness window trees (a child of another awareness than its top-level) are not handled.
+  - A mixed DPI child's GPU presents (swapchains made for it) go to the top-level's surface unscaled, and its window region is not applied to its
+    scaled pixels.
   - The screen DC (`GetDC(NULL)`) and `GetRandomRgn` stay in device pixels for every caller.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
@@ -85,5 +95,5 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
 | The desktop at scale 2: the session told 2, a window enlarged, then drawn on the device at twice its place when the program draws at the scale | `tests/run_host_tests.sh GuiTest` (`test_windows_hidpi`) |
 | Wayland at 200 % and 150 % (`wl_output.scale` 2, fractional 180, a fractional client's viewported buffer drawn 1:1) | `tests/run_host_tests.sh WaylandServerTest` (`test_mapping`) |
-| Windows DPI virtualization at 200 % and 150 %, and the change from one to the other (`WM_DPICHANGED` with 144 dpi and the suggested rectangle, applied by DefWindowProc; the unaware window's units unchanged). An unaware program: its rectangles, client size, surface size and drawing, mouse lParam and `MSG.pt`, `GetCursorPos`, DPI and screen metrics, and moves both from the desktop (`WM_SIZE` in units) and from the program. An aware program: device-pixel rectangles, 192 dpi, its mouse, and its surface drawn 1:1. The desktop in units both ways | `tests/run_host_tests.sh Win32kUserTest` (`test_dpi_virtualization`) |
+| Windows DPI virtualization at 200 % and 150 %, the change from one to the other (`WM_DPICHANGED` with 144 dpi and the suggested rectangle, applied by DefWindowProc; the unaware window's units unchanged), and DPI hosting (a default-hosting child takes the aware tree's awareness, `SetParent` across awarenesses refused, a mixed-hosting unaware child of an aware window drawn on its own surface and scaled into the window's, put back over what the window paints). An unaware program: its rectangles, client size, surface size and drawing, mouse lParam and `MSG.pt`, `GetCursorPos`, DPI and screen metrics, and moves both from the desktop (`WM_SIZE` in units) and from the program. An aware program: device-pixel rectangles, 192 dpi, its mouse, and its surface drawn 1:1. The desktop in units both ways | `tests/run_host_tests.sh Win32kUserTest` (`test_dpi_virtualization`) |
 | No regression at scale 1 in a real run: `tests/windows/user32test.c` in QEMU | `scripts/winetest.sh user32 tcos` |

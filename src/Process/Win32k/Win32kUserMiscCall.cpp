@@ -37,7 +37,9 @@ enum TwoParam : uint32_t {
   kTcosTakeDrop = 0x7C00,
   // Touches (Win32kUserTouch.cpp): (pointer id, POINTER_TOUCH_INFO of 144 bytes) fills it; (WM_TOUCH handle, 0) answers how many TOUCHINPUTs it has,
   // (handle, 48 bytes) fills them; (handle, 0) closes it; (window, op | flags << 2): RegisterTouchWindow (op 1), UnregisterTouchWindow (0), IsTouchWindow (2).
-  kTcosPointerTouchInfo = 0x7C01, kTcosTouchInputInfo = 0x7C02, kTcosCloseTouchInput = 0x7C03, kTcosTouchWindow = 0x7C04
+  kTcosPointerTouchInfo = 0x7C01, kTcosTouchInputInfo = 0x7C02, kTcosCloseTouchInput = 0x7C03, kTcosTouchWindow = 0x7C04,
+  // DPI hosting behavior: (op, value) for the calling thread (op 0 get, 1 set: the previous one, or -1 for a value that is not one); (window, 0): the window's.
+  kTcosThreadDpiHosting = 0x7C05, kTcosWindowDpiHosting = 0x7C06
 };
 
 }  // namespace
@@ -166,6 +168,20 @@ uint64_t two_param(Call& c) {
       return c.write(b, ConstByteView(input, sizeof input)) ? 1 : c.fail(kErrorNoAccess);
     }
     case kTcosCloseTouchInput: return user::close_touch_input(c.pid(), uint32_t(a)) ? 1 : c.fail(kErrorInvalidHandle);
+    case kTcosThreadDpiHosting: {
+      ThreadRecord* t = thread_record(c.tid(), c.pid());
+      if (!t) return uint64_t(int64_t(-1));
+      const uint32_t previous = t->dpi_hosting;
+      if (a == 1) {
+        if (b > 1) return uint64_t(int64_t(-1));      // DPI_HOSTING_BEHAVIOR_INVALID
+        t->dpi_hosting = uint8_t(b);
+      }
+      return previous;
+    }
+    case kTcosWindowDpiHosting: {
+      const int32_t hosting = user::window_dpi_hosting(uint32_t(a));
+      return hosting < 0 ? c.fail(kErrorInvalidWindowHandle, uint64_t(int64_t(-1))) : uint64_t(hosting);
+    }
     case kTcosTouchWindow: {
       if (!user::is_window(uint32_t(a))) return c.fail(kErrorInvalidWindowHandle);
       return user::touch_window_state(uint32_t(a), uint32_t(b & 3), uint32_t(b >> 2));
