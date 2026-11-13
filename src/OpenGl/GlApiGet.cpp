@@ -42,7 +42,7 @@ bool real_extension(const char* e) { return StringView(e) != StringView("GL_ARB_
 // What an OpenGL ES context (EGL) reports: the ES names of what the engine does beyond ES 3.0's core.
 const char* const kEsExtensions[] = {
     "GL_OES_element_index_uint", "GL_OES_texture_npot", "GL_OES_rgb8_rgba8", "GL_OES_depth24", "GL_OES_packed_depth_stencil", "GL_OES_depth_texture", "GL_OES_standard_derivatives",
-    "GL_OES_vertex_array_object", "GL_EXT_read_format_bgra", "GL_EXT_unpack_subimage", "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax", "GL_EXT_texture_compression_s3tc"};
+    "GL_OES_vertex_array_object", "GL_EXT_read_format_bgra", "GL_EXT_unpack_subimage", "GL_EXT_texture_filter_anisotropic", "GL_EXT_blend_minmax", "GL_EXT_texture_compression_s3tc", "GL_OES_EGL_image"};
 ArrayView<const char* const> extensions_of(bool es) {
   return es ? ArrayView<const char* const>(kEsExtensions, sizeof(kEsExtensions) / sizeof(kEsExtensions[0]))
             : ArrayView<const char* const>(kExtensions, sizeof(kExtensions) / sizeof(kExtensions[0]));

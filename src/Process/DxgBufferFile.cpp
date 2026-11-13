@@ -24,9 +24,18 @@ namespace process {
 
 namespace {
 DxgBufferCopier g_copier = nullptr;      // set once at boot (install_dxg), before any process runs
+DxgBufferDescriber g_describer = nullptr;
 }
 
 void set_dxg_buffer_copier(DxgBufferCopier copier) { g_copier = copier; }
+void set_dxg_buffer_describer(DxgBufferDescriber describer) { g_describer = describer; }
+
+bool DxgBufferFile::describe(DxgBufferImage* out) const { return g_describer && exported_ && g_describer(*exported_, out); }
+
+bool DxgBufferFile::copy_image(ByteView bytes, bool to_image) {
+  kernel::ScopedMutex hold(lock_);      // (one copy at a time into or out of the image, as for the CPU's copy)
+  return g_copier && exported_ && g_copier(*exported_, bytes, to_image);
+}
 
 DxgBufferFile::DxgBufferFile(allocators::IAllocator& allocator, SharedPointer<dxgk::ExportedAllocation> exported, uint64_t bytes)
     : allocator_(allocator), exported_(util::move(exported)), bytes_(bytes) {}

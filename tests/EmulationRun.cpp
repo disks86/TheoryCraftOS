@@ -38,7 +38,9 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #ifdef TCOS_EMU_X11
+#include <map>
 #include <set>
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Process/UnixSockets.hpp"
 #include "X11/X11SocketServer.hpp"
 #endif
@@ -87,14 +89,17 @@ struct EmuLauncher final : dbus::IServiceLauncher {
   struct Child {
     std::atomic<int> state{0};      // 0 running, 1 exited, 2 could not run
     std::atomic<uint32_t> code{0};
+    std::atomic<bool>* stop = nullptr;      // (its run control's)
   };
-  std::function<bool(const std::vector<std::string>&, Child&)> run;
+  std::function<bool(const std::vector<std::string>&, const std::vector<std::string>&, Child&)> run;
   std::vector<std::unique_ptr<Child>> children;
-  uint64_t start(dbus::BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
-    std::vector<std::string> args;
-    for (const StringView& a : argv) args.push_back(std::string(a.data(), a.size()));
+  uint64_t start(const dbus::ServiceStart& service, String* why) override {
+    const StringView name = service.name;
+    std::vector<std::string> args, env;
+    for (const StringView& a : service.argv) args.push_back(std::string(a.data(), a.size()));
+    for (const StringView& e : service.environment) env.push_back(std::string(e.data(), e.size()));
     children.push_back(std::make_unique<Child>());
-    if (!run || !run(args, *children.back())) {
+    if (!run || !run(args, env, *children.back())) {
       children.pop_back();
       why->assign("cannot load the program");
       return 0;
@@ -106,6 +111,9 @@ struct EmuLauncher final : dbus::IServiceLauncher {
     const Child& c = *children[handle - 1];
     *code = c.code;
     return c.state == 0 ? State::Running : c.state == 1 ? State::Exited : State::CouldNotRun;
+  }
+  void stop(uint64_t handle) override {
+    if (children[handle - 1]->stop) *children[handle - 1]->stop = true;
   }
   void forget(uint64_t) override {}
 };
@@ -410,8 +418,12 @@ int main(int argc, char** argv) {
   x11::SocketServer x11_sockets(x11_server, *process::system_unix_sockets(), a);
   if (!x11_sockets.listen(0, &fs)) printf("x11: could not listen\n");
   std::atomic<bool> x11_stop{false};
-  std::set<std::string> x11_titles;
+  std::map<std::string, uint32_t> x11_titles;      // (and the pixel at (20, 20) of the window's client area as the stand-in desktop last drew it)
   std::thread x11_thread([&] {
+    std::vector<uint32_t> canvas(512 * 512);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(canvas.data(), canvas.size());
+    target.width = target.height = target.pitch = 512;
     while (!x11_stop) {
       while (x11_sockets.pump()) {}
       x11_sockets.wait(2'000'000);
@@ -420,7 +432,11 @@ int main(int argc, char** argv) {
       for (uint32_t w : windows.view()) {
         desktop::WindowsWindowInfo info;
         String title(a);
-        if (x11_server.window_info(w, &info, &title) && info.visible && info.caption) x11_titles.insert(std::string(title.c_str()));
+        if (!x11_server.window_info(w, &info, &title) || !info.visible || !info.caption) continue;
+        graphics::SoftwareRenderer2D renderer(target);
+        uint32_t dw = 0, dh = 0;
+        const bool drawn = x11_server.draw_window(w, renderer, 0, 0, &dw, &dh) && dw > 20 && dh > 20;
+        x11_titles[std::string(title.c_str())] = drawn ? canvas[20 * 512 + 20] : 0;
       }
     }
   });
@@ -606,7 +622,7 @@ int main(int argc, char** argv) {
   std::vector<std::unique_ptr<Ctl>> service_controls;
   std::vector<std::thread> service_threads;
   std::vector<std::vector<uint8_t>> service_images;
-  dbus_launcher.run = [&](const std::vector<std::string>& args, EmuLauncher::Child& child) {
+  dbus_launcher.run = [&](const std::vector<std::string>& args, const std::vector<std::string>& env, EmuLauncher::Child& child) {
     const std::string path = std::string(filesystem::layout::kLinux) + args[0];
     UniquePointer<filesystem::IFile> file;
     if (fs.open_file(StringView(path.c_str()), filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) {
@@ -625,8 +641,17 @@ int main(int argc, char** argv) {
     for (const std::string& x : args) sargs.push_back(StringView(x.data(), x.size()));
     const ConstByteView bytes(image.data(), image.size());
     for (const StringView& e : process::default_environment(process::abi_for_executable(exe::identify_executable(bytes.at_most(exe::kIdentifyBytes))))) senv.push_back(e);
-    senv.push_back("DBUS_STARTER_ADDRESS=unix:path=/run/user/0/bus");
-    senv.push_back("DBUS_STARTER_BUS_TYPE=session");
+    std::vector<std::string> extra = env;      // (the bus's and the unit's variables, then the starter ones: a later one of a name replaces the earlier)
+    extra.push_back("DBUS_STARTER_ADDRESS=unix:path=/run/user/0/bus");
+    extra.push_back("DBUS_STARTER_BUS_TYPE=session");
+    for (const std::string& e : extra) {
+      const StringView entry(e.data(), e.size());
+      const uint64_t eq = entry.find('=');
+      bool replaced = false;
+      for (StringView& old : senv)
+        if (!replaced && eq != StringView::npos && old.starts_with(entry.first(eq + 1))) { old = entry; replaced = true; }
+      if (!replaced) senv.push_back(entry);
+    }
     if (program->load(bytes, ArrayView<const StringView>(sargs.data(), sargs.size()), ArrayView<const StringView>(senv.data(), senv.size()), ConstByteView(rnd, 16)) !=
         process::LoadStatus::Ok) {
       printf("dbus service: load failed (%.*s)\n", int(program->load_detail().size()), program->load_detail().data());
@@ -636,6 +661,7 @@ int main(int argc, char** argv) {
     service_programs.push_back(std::move(program));
     service_controls.push_back(std::make_unique<Ctl>());
     Ctl* ctl_s = service_controls.back().get();
+    child.stop = &ctl_s->stop;
     service_threads.emplace_back([&a, raw, ctl_s, &child] {
       auto cpu_s = create_guest_cpu(raw->start().arch, a);
       Sync sync_s; Threads th_s;
@@ -750,7 +776,7 @@ int main(int argc, char** argv) {
 #ifdef TCOS_EMU_X11
   x11_stop = true;
   x11_thread.join();
-  for (const std::string& t : x11_titles) printf("x11-desktop: framed window \"%s\"\n", t.c_str());
+  for (const auto& t : x11_titles) printf("x11-desktop: framed window \"%s\" pixel %08x\n", t.first.c_str(), t.second);
 #endif
 #ifdef TCOS_EMU_WAYLAND
   wl_stop = true;
@@ -763,6 +789,10 @@ int main(int argc, char** argv) {
   wl_server.set_clipboard(nullptr);
 #ifdef TCOS_EMU_DMABUF
   printf("wayland-desktop: %d draws on the device, %d on the CPU\n", wl_gpu_draws.load(), wl_cpu_draws.load());
+  {
+    const wayland::DxgImageDraws images = wayland::dxg_image_draws();
+    printf("wayland-desktop: GPU buffers drawn %llu times in place, %llu from the CPU\n", (unsigned long long)images.in_place, (unsigned long long)images.from_cpu);
+  }
   // (a dmabuf the program still has open holds an export of the kernel, which goes before the program: its descriptors are closed first)
   if (process::Process* proc = p.process())
     for (uint64_t fd = 0; fd < process::ProcessFiles::kMaxDescriptors; ++fd) proc->files().close(fd);

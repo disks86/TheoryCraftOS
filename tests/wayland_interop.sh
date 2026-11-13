@@ -15,7 +15,7 @@ for p in stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unsta
   wayland-scanner client-header "$protocols/$p.xml" "$out/$(basename $p)-client-protocol.h"
   wayland-scanner private-code "$protocols/$p.xml" "$out/$(basename $p)-protocol.c"
 done
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Wayland/WaylandScale.cpp src/Wayland/WaylandExtras.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Math/FloatMath.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Wayland/WaylandScale.cpp src/Wayland/WaylandExtras.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Wayland/Media/WaylandClipboardPng.cpp src/Media/Image/Png.cpp src/Media/Image.cpp src/Media/Zlib.cpp src/Math/FloatMath.cpp \
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp -o "$out/WaylandHostServer"
 gcc -O1 -g -Wall -I "$out" tests/wayland/wl_client.c "$out/xdg-shell-protocol.c" "$out/xdg-decoration-unstable-v1-protocol.c" -lwayland-client -lxkbcommon \
   -o "$out/wl_client"
@@ -65,6 +65,42 @@ if command -v wl-copy >/dev/null && command -v wl-paste >/dev/null; then
   grep "clipboard:" "$out/wayland-clip.log" || true
   grep -q "clipboard: copied by wl-copy" "$out/wayland-clip.log" || { echo "the desktop's clipboard did not get wl-copy's text"; status=1; }
   grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-clip.log" && { cat "$out/wayland-clip.log"; status=1; }
+  echo "== wl-clipboard pictures (image/png: the desktop's picture to a client, a client's picture to the desktop's clipboard)"
+  TCOS_CLIPBOARD_IMAGE=1 run_server wayland-clipimg 12 ""
+  types=$(XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clipimg timeout 5 wl-paste --list-types 2>"$out/clipimg.list.log" || true)
+  echo "offered: $types"
+  [ "$types" = "image/png" ] || status=1
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clipimg timeout 5 wl-paste --type image/png > "$out/pasted.png" 2>"$out/clipimg.paste.log" || true
+  python3 - "$out/pasted.png" <<'PY' || status=1
+import struct, sys, zlib
+data = open(sys.argv[1], 'rb').read()
+assert data[:8] == b'\x89PNG\r\n\x1a\n', 'not a PNG'
+w, h, depth, ctype = struct.unpack('>IIBB', data[16:26])
+pos, idat = 8, b''
+while pos < len(data):
+    n, kind = struct.unpack('>I4s', data[pos:pos + 8]); idat += data[pos + 8:pos + 8 + n] if kind == b'IDAT' else b''; pos += 12 + n
+raw, bpp, rows, prev = zlib.decompress(idat), 4 if ctype == 6 else 3, [], bytearray(w * (4 if ctype == 6 else 3))
+for y in range(h):
+    f, line = raw[y * (w * bpp + 1)], bytearray(raw[y * (w * bpp + 1) + 1:(y + 1) * (w * bpp + 1)])
+    for i in range(len(line)):
+        a, b, c = (line[i - bpp] if i >= bpp else 0), prev[i], (prev[i - bpp] if i >= bpp else 0)
+        p = a + b - c; pr = a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else (b if abs(p - b) <= abs(p - c) else c)
+        line[i] = (line[i] + [0, a, b, (a + b) // 2, pr][f]) & 255
+    rows.append(line); prev = line
+print('pasted picture', w, 'x', h, 'colour type', ctype, 'first', bytes(rows[0][:4]).hex(), 'pixel 3', bytes(rows[1][:4]).hex())
+assert (w, h, ctype) == (3, 2, 6) and bytes(rows[0][:4]) == b'\xff\x00\x00\xff' and bytes(rows[1][:4]) == b'\xff\xff\xff\x80'
+PY
+  python3 -c 'import struct,zlib,sys
+def chunk(k, d): return struct.pack(">I", len(d)) + k + d + struct.pack(">I", zlib.crc32(k + d) & 0xffffffff)
+rows = b"".join(b"\x00" + b"".join(bytes([10 * x, 20 * y, 30, 255]) for x in range(5)) for y in range(3))
+sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 5, 3, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))' > "$out/copied.png"
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-clipimg timeout 8 wl-copy --type image/png < "$out/copied.png" 2>"$out/clipimg.copy.log" || true
+  sleep 0.5
+  kill $server; wait $server || true
+  grep "clipboard image:" "$out/wayland-clipimg.log" || true
+  # (5 x 3, first pixel R 0 G 0 B 30, last R 40 G 40 B 30)
+  grep -q "clipboard image: 5x3 first ff00001e last ff28281e" "$out/wayland-clipimg.log" || { echo "the desktop's clipboard did not get wl-copy's picture"; status=1; }
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-clipimg.log" && { cat "$out/wayland-clipimg.log"; status=1; }
 fi
 [ $status -eq 0 ] && echo "wayland interop: all passed" || echo "wayland interop: FAILED"
 exit $status

@@ -22,6 +22,7 @@
 #include "Process/Win32k/Win32kDesktopBridge.hpp"
 #include "X11/X11SocketServer.hpp"
 #include "Wayland/Dxg/WaylandDxgImage.hpp"
+#include "Wayland/Media/WaylandClipboardPng.hpp"
 #include "Wayland/WaylandSocketServer.hpp"
 #include "DBus/Bus.hpp"
 #include "DBus/MachineId.hpp"
@@ -2122,6 +2123,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // as a Windows or an X one. Linux programs reach it at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (/run/user/0/wayland-0 in the Linux tree).
     wayland::Server wayland_server(shared_allocator, [] { return hardware::uptime_us() / 1000; });
     desktop.set_wayland_session(&wayland_server);
+    wayland_server.set_clipboard_images(&wayland::clipboard_to_png, &wayland::png_to_clipboard);      // (pictures as image/png)
     wayland_server.set_clipboard(&clipboard);      // (copy and paste between Wayland programs and the desktop's)
     struct WaylandGuard { desktop::Desktop& d; ~WaylandGuard() { d.set_wayland_session(nullptr); } } wayland_guard{desktop};      // (the desktop lets go first)
     UniquePointer<wayland::SocketServer> wayland_sockets;
@@ -2190,8 +2192,10 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       namespace layout = filesystem::layout;
       const StringView session_folders[] = {layout::kSessionServicesFolder, layout::kLocalSessionServicesFolder};
       const StringView system_folders[] = {layout::kSystemServicesFolder, layout::kLocalSystemServicesFolder};
-      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2));
-      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2));
+      const StringView session_units[] = {layout::kLocalUserUnitsFolder, layout::kUserUnitsFolder};
+      const StringView system_units[] = {layout::kLocalSystemUnitsFolder, layout::kSystemUnitsFolder};
+      session_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(session_folders, 2), ArrayView<const StringView>(session_units, 2));
+      system_bus.set_activation(&dbus_activator, &explorer_files.file_system(), ArrayView<const StringView>(system_folders, 2), ArrayView<const StringView>(system_units, 2));
     }
     UniquePointer<dbus::SocketServer> dbus_sockets;
     if (dbus_ids && dbus_notifications.start()) {

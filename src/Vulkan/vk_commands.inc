@@ -100,6 +100,7 @@ VKAPI VkResult VKAPI_CALL vkAllocateCommandBuffers(VkDevice device, const VkComm
       return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     cb->h.magic = MAGIC_CMD;
+    cb->h.dispatch = ICD_LOADER_MAGIC;
     cb->dev = (Device *)device;
     cb->pool = p;
     out[i] = (VkCommandBuffer)cb;

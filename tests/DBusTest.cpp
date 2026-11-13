@@ -1517,25 +1517,68 @@ static void test_service_files() {
   }
   CHECK(accepted > 0);
   for (size_t len = 0; len < good.size(); ++len) parse_service_file(StringView(good.data(), len), &f);
+
+  // systemd units: ExecStart and Environment of [Service]
+  UnitService u(A);
+  const std::string unit =
+      "[Unit]\nDescription=x\nExecStart=/not/this/group\n\n[Service]\n# comment\n; another\nType=dbus\nBusName=org.example.Svc\n"
+      "ExecStart=-@/usr/lib/svc svc-name --level \"a b\" \\\n  --more 100%%\nEnvironment=\"A=1 2\" B=x\nEnvironment=B=y C=%%z\n[Install]\nAlias=dbus-org.example.Svc.service other.service\n";
+  CHECK(parse_unit_service(A, StringView(unit.c_str()), &u));
+  CHECK(u.argv.count() == 5 && u.argv[0] == "/usr/lib/svc" && u.argv[1] == "--level" && u.argv[2] == "a b" && u.argv[3] == "--more" && u.argv[4] == "100%");
+  CHECK(u.environment.count() == 3 && u.environment[0] == "A=1 2" && u.environment[1] == "B=y" && u.environment[2] == "C=%z");
+  CHECK(unit_has_alias(StringView(unit.c_str()), "dbus-org.example.Svc.service") && unit_has_alias(StringView(unit.c_str()), "other.service"));
+  CHECK(!unit_has_alias(StringView(unit.c_str()), "svc.service") && !unit_has_alias("[Service]\nAlias=svc.service\n", "svc.service"));
+  // an empty ExecStart= drops what came before; the first command counts; what this cannot expand is not used
+  CHECK(parse_unit_service(A, "[Service]\nExecStart=/a\nExecStart=\nExecStart=/b x\nExecStart=/c\n", &u) && u.argv.count() == 2 && u.argv[0] == "/b");
+  CHECK(!parse_unit_service(A, "[Service]\nExecStart=/a $HOME\n", &u) && u.argv.count() == 0);
+  CHECK(parse_unit_service(A, "[Service]\nExecStart=:/a $HOME\n", &u) && u.argv.count() == 2 && u.argv[1] == "$HOME");
+  CHECK(!parse_unit_service(A, "[Service]\nExecStart=/a %i\n", &u));
+  CHECK(!parse_unit_service(A, "[Service]\nExecStart=relative\n", &u) && !parse_unit_service(A, "[Service]\nType=simple\n", &u));
+  CHECK(!parse_unit_service(A, "[Service]\nExecStart=@/a\n", &u) && !parse_unit_service(A, "[Service]\nExecStart=/a 'open\n", &u));
+  CHECK(parse_unit_service(A, "[Service]\nExecStart=/a \\", &u) && u.argv.count() == 1);      // (a continuation at the very end)
+  CHECK(parse_unit_service(A, "[Service]\nEnvironment=X=1\nEnvironment=\nEnvironment=Y=2 =bad noequals\nExecStart=/a\n", &u) && u.environment.count() == 1 &&
+        u.environment[0] == "Y=2");
+  // garbage, truncation and bit flips: never a crash
+  int units = 0;
+  for (size_t bit = 0; bit < unit.size() * 8; ++bit) {
+    std::string t = unit;
+    t[bit / 8] = char(t[bit / 8] ^ (1 << (bit % 8)));
+    units += parse_unit_service(A, StringView(t.data(), t.size()), &u);
+    unit_has_alias(StringView(t.data(), t.size()), "dbus-org.example.Svc.service");
+  }
+  CHECK(units > 0);
+  for (size_t len = 0; len < unit.size(); ++len) {
+    parse_unit_service(A, StringView(unit.data(), len), &u);
+    unit_has_alias(StringView(unit.data(), len), "other.service");
+  }
 }
 
 struct FakeLauncher final : IServiceLauncher {
   struct Run {
     std::string name;
     std::vector<std::string> argv;
+    std::vector<std::string> env;
+    std::string user;
     State state = State::Running;
     uint32_t code = 0;
-    bool forgotten = false;
+    bool forgotten = false, stopped = false;
   };
   std::vector<Run> runs;      // handle = index + 1
   bool refuse = false;
-  uint64_t start(BusKind, StringView name, ArrayView<const StringView> argv, String* why) override {
+  uint64_t start(const ServiceStart& service, String* why) override {
     if (refuse) { why->assign("refused"); return 0; }
     Run r;
-    r.name = str(name);
-    for (const StringView& a : argv) r.argv.push_back(str(a));
+    r.name = str(service.name);
+    for (const StringView& a : service.argv) r.argv.push_back(str(a));
+    for (const StringView& e : service.environment) r.env.push_back(str(e));
+    r.user = str(service.user);
     runs.push_back(r);
     return runs.size();
+  }
+  void stop(uint64_t handle) override {
+    runs[handle - 1].stopped = true;
+    runs[handle - 1].state = State::Exited;      // (killed)
+    runs[handle - 1].code = 137;
   }
   State poll(uint64_t handle, uint32_t* code, String* why) override {
     *code = runs[handle - 1].code;
@@ -1620,6 +1663,8 @@ static void test_activation() {
   CHECK(!caller.reply(s5));
   bus.tick(3600000);
   CHECK(caller.error_of(s5) == "org.freedesktop.DBus.Error.TimedOut" && bus.activations_running() == 0);
+  CHECK(launcher.runs.back().stopped && launcher.runs.back().forgotten);      // (the program is ended, as dbus-daemon kills it)
+  CHECK(!launcher.runs[0].stopped && !launcher.runs[1].stopped);
   // one connection may not fill the queue for everyone; NO_AUTO_START does not wait for a service that is starting
   {
     bus.set_activation_timeout_us(1000000);
@@ -1665,6 +1710,81 @@ static void test_activation() {
   CHECK(p.error_of(p.call("org.example.Svc", "/", "a.b", "M")) == "org.freedesktop.DBus.Error.ServiceUnknown");
 }
 
+// SystemdService= without systemd: the unit's command runs; UpdateActivationEnvironment's variables and the unit's go to the program.
+static void test_unit_activation() {
+  filesystem::RamFileSystem fs(A);
+  for (const char* d : {"/svc", "/etc-units", "/lib-units"}) CHECK(fs.create_directory(d) == filesystem::Status::Ok);
+  write_file(fs, "/svc/org.example.Unit.service", "[D-BUS Service]\nName=org.example.Unit\nExec=/bin/false\nUser=root\nSystemdService=dbus-org.example.Unit.service\n");
+  write_file(fs, "/svc/org.example.Direct.service", "[D-BUS Service]\nName=org.example.Direct\nExec=/bin/false\nSystemdService=direct.service\n");
+  write_file(fs, "/svc/org.example.NoUnit.service", "[D-BUS Service]\nName=org.example.NoUnit\nExec=/usr/bin/fallback --x\nSystemdService=missing.service\n");
+  write_file(fs, "/svc/org.example.Vars.service", "[D-BUS Service]\nName=org.example.Vars\nExec=/usr/bin/plain\nSystemdService=vars.service\n");
+  write_file(fs, "/svc/org.example.Escape.service", "[D-BUS Service]\nName=org.example.Escape\nExec=/usr/bin/plain\nSystemdService=../svc/x.service\n");
+  // found by its Alias= (no link to it), the administrator's copy of a unit before the package's
+  write_file(fs, "/lib-units/example-unitd.service", "[Service]\nExecStart=/usr/lib/example-unitd --bus\nEnvironment=FROM_UNIT=1 SHARED=unit\n[Install]\nAlias=dbus-org.example.Unit.service\n");
+  write_file(fs, "/lib-units/direct.service", "[Service]\nExecStart=/usr/lib/packaged\n");
+  write_file(fs, "/etc-units/direct.service", "[Service]\nExecStart=/usr/lib/local-copy\n");
+  write_file(fs, "/lib-units/vars.service", "[Service]\nExecStart=/usr/lib/vars $FOO\n");
+  write_file(fs, "/lib-units/x.service", "[Service]\nExecStart=/usr/lib/escaped\n");
+  Bus bus(A, BusKind::Session, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+  FakeLauncher launcher;
+  const StringView folders[] = {"/svc"};
+  const StringView units[] = {"/etc-units", "/lib-units"};
+  bus.set_activation(&launcher, &fs, ArrayView<const StringView>(folders, 1), ArrayView<const StringView>(units, 2));
+  bus.tick(1000000);
+  Client caller(bus);
+  caller.hello();
+  // the activation environment: set, replaced, refused names; the system bus refuses it all
+  const auto update = [&](Client& c, std::vector<std::pair<std::string, std::string>> vars) {
+    return c.bus_call("UpdateActivationEnvironment", "a{ss}", [vars](Writer& w) {
+      Writer::ArrayMark m = w.begin_array(8);
+      for (const auto& v : vars) {
+        w.begin_struct();
+        w.string(StringView(v.first.c_str()));
+        w.string(StringView(v.second.c_str()));
+      }
+      w.end_array(m);
+    });
+  };
+  CHECK(caller.reply(update(caller, {{"DISPLAY", ":0"}, {"SHARED", "bus"}, {"XDG_CURRENT_DESKTOP", "Tcos"}}))->type == kMethodReturn);
+  CHECK(caller.reply(update(caller, {{"DISPLAY", ":1"}}))->type == kMethodReturn);
+  CHECK(caller.error_of(update(caller, {{"GOOD", "1"}, {"BAD=NAME", "x"}})) == "org.freedesktop.DBus.Error.InvalidArgs");
+  CHECK(caller.error_of(update(caller, {{"", "x"}})) == "org.freedesktop.DBus.Error.InvalidArgs");
+  CHECK(bus.activation_environment().size() == 3 && bus.activation_environment()[0] == "DISPLAY=:1");      // (nothing of the refused call was set)
+  {
+    std::vector<std::pair<std::string, std::string>> many;
+    for (uint32_t i = 0; i < Bus::kMaxActivationEnvironment; ++i) many.push_back({"V" + std::to_string(i), "x"});
+    CHECK(caller.error_of(update(caller, many)) == "org.freedesktop.DBus.Error.LimitsExceeded");
+    CHECK(bus.activation_environment().size() == Bus::kMaxActivationEnvironment);      // (set up to the limit)
+    CHECK(caller.error_of(update(caller, {{"V0", std::string(Bus::kMaxActivationEnvironmentBytes, 'y')}})) == "org.freedesktop.DBus.Error.LimitsExceeded");
+    CHECK(caller.reply(update(caller, {{"V0", "short"}}))->type == kMethodReturn);      // (replacing one still works when full)
+  }
+  {
+    Bus system(A, BusKind::System, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
+    Client s(system);
+    s.hello();
+    CHECK(s.error_of(update(s, {{"A", "1"}})) == "org.freedesktop.DBus.Error.AccessDenied" && system.activation_environment().size() == 0);
+  }
+  // by alias: the unit's command, the bus's variables then the unit's (a name in both: the unit's comes later and wins), User= handed on
+  caller.call("org.example.Unit", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == 1 && launcher.runs[0].argv == (std::vector<std::string>{"/usr/lib/example-unitd", "--bus"}) && launcher.runs[0].user == "root");
+  const std::vector<std::string>& env = launcher.runs[0].env;
+  CHECK(env.size() == Bus::kMaxActivationEnvironment + 2 && env[0] == "DISPLAY=:1" && env[1] == "SHARED=bus" && env[env.size() - 2] == "FROM_UNIT=1" &&
+        env.back() == "SHARED=unit");
+  // by name, /etc first; a unit that is missing, or that needs what is not expanded, or a name that leaves the folder: Exec
+  caller.call("org.example.Direct", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == 2 && launcher.runs[1].argv == (std::vector<std::string>{"/usr/lib/local-copy"}) && launcher.runs[1].user.empty());
+  caller.call("org.example.NoUnit", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == 3 && launcher.runs[2].argv == (std::vector<std::string>{"/usr/bin/fallback", "--x"}));
+  caller.call("org.example.Vars", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == 4 && launcher.runs[3].argv == (std::vector<std::string>{"/usr/bin/plain"}));
+  caller.call("org.example.Escape", "/", "a.b", "M");
+  CHECK(launcher.runs.size() == 5 && launcher.runs[4].argv == (std::vector<std::string>{"/usr/bin/plain"}));
+  // (the programs end: the activations are over)
+  for (auto& r : launcher.runs) { r.state = IServiceLauncher::State::Exited; r.code = 1; }
+  bus.tick(1100000);
+  CHECK(bus.activations_running() == 0);
+}
+
 static void test_reply_timeouts() {
   Bus bus(A, BusKind::System, "0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210");
   bus.set_reply_timeout_us(1000000);
@@ -1701,6 +1821,25 @@ static void test_reply_timeouts() {
   const uint32_t forever = caller.call(callee.unique.c_str(), "/", "a.b", "Forever");
   bus.tick(900000000);
   CHECK(!caller.reply(forever) && bus.pending_calls() == 1);
+  // turned on again: the call is timed from when it was made, so it is over at once
+  bus.set_reply_timeout_us(1000000);
+  bus.tick(900000001);
+  CHECK(caller.error_of(forever) == "org.freedesktop.DBus.Error.NoReply" && bus.pending_calls() == 0);
+  // a timeout changed while calls wait applies to them too: longer, then shorter
+  caller.clear();
+  const uint32_t a1 = caller.call(callee.unique.c_str(), "/", "a.b", "A");
+  bus.tick(900500000);
+  const uint32_t a2 = caller.call(callee.unique.c_str(), "/", "a.b", "B");
+  bus.set_reply_timeout_us(10000000);
+  bus.tick(902000000);
+  CHECK(!caller.reply(a1) && !caller.reply(a2));
+  bus.set_reply_timeout_us(1200000);
+  bus.tick(902000001);      // (a1 is 2 s old, a2 1.5 s: both past the shorter timeout)
+  CHECK(caller.error_of(a1) == "org.freedesktop.DBus.Error.NoReply" && caller.error_of(a2) == "org.freedesktop.DBus.Error.NoReply");
+  const uint32_t a3 = caller.call(callee.unique.c_str(), "/", "a.b", "C");
+  bus.set_reply_timeout_us(60000000);
+  bus.tick(903300000);
+  CHECK(!caller.reply(a3) && bus.pending_calls() == 1);
 }
 
 int main() {
@@ -1718,6 +1857,7 @@ int main() {
   test_notifications();
   test_service_files();
   test_activation();
+  test_unit_activation();
   test_reply_timeouts();
   test_transport_threads();
   test_transport_churn();

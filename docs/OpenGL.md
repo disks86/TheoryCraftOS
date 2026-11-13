@@ -61,38 +61,70 @@ the one copy of the state in `libEGL.so.1`.
 - **Transport.** The 64-byte request of `NtTcosOpenGl` (`src/Process/WindowsOpenGl.hpp`) goes to the kernel with `/dev/dxg`'s `TCOS_DXG_IOCTL_GL`
   (`src/Process/DxgDevice.h`); `opengl::gl_request` serves both. For a Linux process, memory handed to the program (strings, mapped buffers) comes from its mmap
   area (`linuxabi::map_user_memory`) and the kernel never shows a window: SWAP answers 0 and the library reads the picture itself. `DESTROY_SURFACE` (9) is new
-  (eglDestroySurface; WGL never needed it).
+  (eglDestroySurface; WGL never needed it), and so is `FRONT_TO_BUFFER` (10, Linux only): the window's front image is copied in the kernel into the GPU image of a
+  dmabuf of `/dev/dxg` (`process::DxgBufferFile::copy_image`, which calls the Direct3D layer's `copy_export`), in that image's channel order and rows, with no
+  copy through the program. It is how frames reach GBM surfaces and Wayland GPU buffers.
 - **OpenGL ES.** A context made with the ES flag (8) reports `OpenGL ES 3.0` / `OpenGL ES GLSL ES 3.00`, 3.0 for `GL_MAJOR_VERSION`/`GL_MINOR_VERSION` and a list of
   `GL_OES_*`/`GL_EXT_*` extensions; its shaders are always GLSL ES (one without `#version` is 1.00, not desktop 1.10). Otherwise it is the compatibility context, which
   allows what ES allows (client arrays with the default vertex array). ES 2.0 and 3.0 are given (a 3.0 context for both), not 1.x or 3.1+.
 - **Desktop OpenGL** through EGL (`EGL_OPENGL_API`): up to 3.3, core (the default from 3.2, as EGL says) or compatibility.
 - **Displays.** Wayland (`EGL_KHR_platform_wayland`, `EGL_EXT_platform_wayland`, and `eglGetDisplay` of a `wl_display`, recognised by its interface pointer as Mesa
-  does) and surfaceless (`EGL_MESA_platform_surfaceless`, and `EGL_DEFAULT_DISPLAY`): pbuffers and contexts without a surface (`EGL_KHR_surfaceless_context`). Six
+  does), GBM (`EGL_KHR_platform_gbm`, `EGL_MESA_platform_gbm`, and `eglGetDisplay` of a `gbm_device` of our `libgbm.so.1`) and surfaceless (`EGL_MESA_platform_surfaceless`, and `EGL_DEFAULT_DISPLAY`): pbuffers and contexts without a surface (`EGL_KHR_surfaceless_context`). Six
   configs: RGBA8 or RGB8 (`'AR24'` / `'XR24'` as the native visual), with depth 24 + stencil 8, depth 24, or neither, each for windows and pbuffers and every API.
   An `eglChooseConfig` that does not name a renderable type matches every config (EGL's default, ES 1.x, would match none).
 - **Window surfaces** are `wl_egl_window`s (libwayland-egl): the library takes `driver_private` and the resize and destroy callbacks. `eglSwapBuffers` swaps the
-  kernel's images, reads the new front image (top row first, B G R A) straight into a `wl_shm` buffer (`ARGB8888`, or `XRGB8888` for a config without alpha; one copy)
-  and attaches, damages (`damage_buffer` from version 4; the rectangles of `EGL_KHR/EXT_swap_buffers_with_damage` flipped to the buffer's rows) and commits it. With
+  kernel's images and puts the new front image into a buffer that it attaches, damages (`damage_buffer` from version 4; the rectangles of `EGL_KHR/EXT_swap_buffers_with_damage` flipped to the buffer's rows) and commits it. With
   a swap interval of 1 (the default) a swap first waits for the frame callback of the one before; 0 does not wait. Each window surface keeps up to three buffers and
   its own event queue and wrappers of the `wl_surface` and `wl_shm`, so the program's queues never see its events and two threads swapping two windows never share
   one. `wl_egl_window_resize` takes effect at once when the surface is current on the calling thread (the kernel's images are remade), else at the next swap; its
   `dx`/`dy` move the next buffer (`wl_surface.offset` from version 5).
+  - *GPU buffers* when the compositor has `zwp_linux_dmabuf_v1` (version 2 or 3 is bound): each buffer is a gbm buffer object of the display's own GBM device on
+    `/dev/dxg`, made a `wl_buffer` with `create_immed` (`'AR24'` or `'XR24'`, linear, one plane at offset 0), and a swap is `FRONT_TO_BUFFER` into it: the kernel
+    copies the frame into the GPU image, and the compositor draws that image in place (on virgl, on the GPU). A GPU image that cannot be made sends the surface over
+    to `wl_shm` for good.
+  - *`wl_shm` buffers* otherwise, or with `TCOS_EGL_SHM=1` in the environment: the front image (top row first, B G R A) is read straight into the buffer
+    (`ARGB8888`, or `XRGB8888` for a config without alpha; one copy through the program, and the compositor's).
+- **GBM window surfaces** are `gbm_surface`s: one EGL surface each, of the `gbm_surface`'s fixed size. A swap copies the frame (`FRONT_TO_BUFFER`) into one of its
+  buffers that nobody holds (`tcos_gbm_surface_take`, `src/Linux/libgbm/tcos_gbm.h`: the private functions libEGL uses), which `gbm_surface_lock_front_buffer`
+  then gives the program. With all three buffers held (locked, or queued and not yet locked) the swap is `EGL_BAD_ALLOC`; locking the newest frame lets go of
+  older queued ones.
+- **Images** (`EGL_KHR_image_base`, `EGL_EXT_image_dma_buf_import`, `EGL_EXT_image_dma_buf_import_modifiers`, `GL_OES_EGL_image`). `eglCreateImage(KHR)` takes
+  `EGL_LINUX_DMA_BUF_EXT` with one plane: `'AR24'`, `'XR24'`, `'AB24'` or `'XB24'`, linear (or no modifier), a pitch of at least the width's bytes, the plane inside
+  the descriptor's bytes (checked with `lseek`), no context. The image holds a duplicate of the descriptor. `glEGLImageTargetTexture2DOES` maps it (between
+  `DMA_BUF_IOCTL_SYNC` start and end), converts it to RGBA and gives it to the bound 2D texture with `glTexImage2D`: a copy made at that call, so later changes of
+  the image are not seen until it is called again. An unknown image is `GL_INVALID_OPERATION`. `eglQueryDmaBufFormatsEXT` lists the four formats,
+  `eglQueryDmaBufModifiersEXT` the linear layout only.
 - **Objects.** Handles are pointers checked against their display's lists, so a stale or made-up one is an EGL error. A context or surface destroyed while current
   goes when it is released (EGL's "marked for deletion"); `eglTerminate` marks everything. A context current on another thread is `EGL_BAD_ACCESS` (the kernel's
   `STATUS_RESOURCE_IN_USE`). Each thread's command buffer is allocated on first use (only a pointer is in thread-local storage, as a library opened with `dlopen`
   must keep it small) and goes, with what it had current, when the thread ends.
 - **Fences** (EGL 1.5, `EGL_KHR_fence_sync`): every command has run when the call that sent it returns, so a fence is signalled when it is made.
+- **libgbm.** `src/Linux/libgbm/libgbm.c` (`/usr/lib/libgbm.so.1`, built by its `build.sh`, which libEGL's runs first; the same ABI as Mesa's `gbm.h`) is the
+  Generic Buffer Manager over the Direct3D layer: `gbm_create_device` on a descriptor of `/dev/dxg` (other descriptors fail: the system has no `/dev/dri`) makes a
+  D3DKMT device on the first adapter. A buffer object is a shareable allocation (texture, render target) exported once as a dmabuf
+  (`TCOS_DXG_IOCTL_EXPORT`), in `ARGB8888`, `XRGB8888`, `ABGR8888` or `XBGR8888` (also the old `GBM_BO_FORMAT_*` numbers), linear, one plane, up to 4096 x 4096.
+  `gbm_bo_get_fd` duplicates the dmabuf, `gbm_bo_get_handle` is the allocation handle, `gbm_bo_import` takes a dmabuf of `/dev/dxg` (`GBM_BO_IMPORT_FD`, or
+  `_FD_MODIFIER` with one plane at offset 0) whose size, format (an alpha channel the format ignores is fine) and stride must be the image's. `gbm_bo_map` maps the
+  dmabuf (the kernel's CPU copy of the image) between `DMA_BUF_IOCTL_SYNC` start and end, so CPU writes reach the image at `gbm_bo_unmap`; `gbm_bo_write` is a map,
+  a copy and an unmap. No cursors, protected memory, tiled modifiers, YUV or several planes, and no `wl_buffer` or `EGLImage` imports.
 - **Test.** `tests/linux_egl_wayland_emulated.sh` runs `tests/linux/eglwayland.c` (86 checks: strings, configs and their order, ES 2.0/3.0 yes and 1.x/3.1 no, a
   window surface on a decorated xdg-shell toplevel, GLSL ES 1.00 and 3.00 programs read back, swaps with interval 1 and 0 and with damage, a resize, a fence, a pbuffer
   with a shared context, a second thread refused the busy context and drawing with its own, `dlopen`/`dlsym` of `libGLESv2.so.2` and `libGL.so.1`, a desktop 3.3 core
   context, `eglGetProcAddress`) on the kernel's CPU emulator with the compositor and the kernel's GL (`-DTCOS_EMU_GL`); the window must reach the stand-in desktop with
-  the last frame's colour. `tests/run_host_tests.sh OpenGlTest` covers ES contexts and surface destruction in the service. On the real kernel in QEMU (the program
+  the last frame's colour, and its frames must have been GPU buffers the desktop drew in place. It runs it again with `TCOS_EGL_SHM=1` (`wl_shm` buffers, none
+  GPU), then `tests/linux/eglgbm.c` (91 checks: the GBM device and buffer objects - formats, modifiers, mapping, `gbm_bo_write`, imports and their checks, user data -
+  EGL on a `gbm_surface` with the frame's colour read through `gbm_bo_map` and the swap that has no free buffer, and dmabuf EGL images of a picture the CPU wrote and
+  of one the GPU drew, read back through a framebuffer object, with the attribute checks). `tests/run_host_tests.sh OpenGlTest` covers ES contexts and surface destruction in the service. On the real kernel in QEMU (the program
   as the autorun, with `hold` as its argument to keep the window four seconds) it passed its 86 checks with standard VGA (the CPU renderer) and on virgl (its draws
-  on the GPU), and the framed window showed the last frame. (It needed `clock_nanosleep`, Linux system call 230, which glibc's `nanosleep` makes: added.)
-- **Not done.** No GLX (X11 programs), GBM, `EGL_KHR_image_base` / dmabuf import or export (`EGL_EXT_image_dma_buf_import`, `EGL_MESA_image_dma_buf_export`), buffer age,
-  `EGL_EXT_present_opaque`, sRGB window surfaces, multisampled configs, OpenGL ES 1.x or 3.1+, a read surface other than the draw surface (the context reads where it
-  draws), or binding pbuffers to textures. Frames go through `wl_shm` (one CPU copy into the buffer, and the compositor's), not a GPU buffer, even when the kernel's GL
-  drew on the 3D hardware. Only x86-64 (the development machine has no other C library), and not yet tried with GTK or Qt inside the OS.
+  on the GPU), and the framed window showed the last frame. (It needed `clock_nanosleep`, Linux system call 230, which glibc's `nanosleep` makes: added.) With the
+  GPU buffers, the same: 86 on VGA (the desktop drew the window's 19 GPU buffers from their CPU view, the VGA path) and on virgl (19 drawn in place, none from
+  the CPU), and `eglgbm` passed its 91 on both.
+- **Not done.** No GLX (X11 programs), dmabuf export (`EGL_MESA_image_dma_buf_export`), images of anything but dmabufs (textures, renderbuffers:
+  `EGL_KHR_gl_texture_2D_image`), `GL_OES_EGL_image_external` (`samplerExternalOES`), YUV or multi-plane images, buffer age, `EGL_EXT_present_opaque`, sRGB window
+  surfaces, multisampled configs, OpenGL ES 1.x or 3.1+, a read surface other than the draw surface (the context reads where it draws), or binding pbuffers to
+  textures. The kernel's GL does not draw into a GPU buffer itself: its frame is read from its own images and copied into the buffer's image by the CPU (one copy
+  in the kernel, none through the program; on virgl a read back from the GPU and an upload). An EGL image is a copy made when it is bound to a texture, not
+  the texture's memory. Only x86-64 (the development machine has no other C library), and not yet tried with GTK, Qt or a KMS program inside the OS.
 
 ## The 3D hardware
 

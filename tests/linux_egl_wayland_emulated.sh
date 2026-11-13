@@ -17,7 +17,9 @@
 #
 # EGL and OpenGL ES on Wayland: tests/linux/eglwayland.c, a glibc program with libwayland-client, libwayland-egl and an xdg-shell toplevel, draws with OpenGL
 # ES 2.0 and 3.0 (and makes a desktop OpenGL 3.3 context) through libEGL.so.1 / libGLESv2.so.2 of src/Linux/libegl (installed at /usr/lib of the Linux tree, where
-# Mesa's would be), over the kernel's OpenGL reached through /dev/dxg; its window surface's frames reach the kernel's compositor as wl_shm buffers. It runs on
+# Mesa's would be), over the kernel's OpenGL reached through /dev/dxg; its window surface's frames reach the kernel's compositor as GPU buffers (dmabufs of /dev/dxg
+# made with libgbm.so.1, the kernel copying each frame into its image). Then tests/linux/eglgbm.c checks libgbm.so.1, EGL on a gbm_surface and EGL images of
+# dmabufs. They run on
 # the kernel's CPU emulator (tests/EmulationRun.cpp with -DTCOS_EMU_DXG -DTCOS_EMU_WAYLAND -DTCOS_EMU_GL: the Direct3D layer, the compositor and a stand-in
 # desktop that draws the windows, and the kernel's OpenGL). The program must pass its checks and its window reach the desktop with the last frame's colour.
 # Usage: tests/linux_egl_wayland_emulated.sh   (x86-64 only: the development machine has no AArch64 or RISC-V C library). Needs gcc, libwayland-client,
@@ -49,11 +51,12 @@ for p in stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unsta
   wayland-scanner private-code "/usr/share/wayland-protocols/$p.xml" "$work/$(basename $p)-protocol.c"
 done
 gcc -O1 -g -Wall -I "$work" -o "$work/eglwayland" tests/linux/eglwayland.c "$work/xdg-shell-protocol.c" "$work/xdg-decoration-unstable-v1-protocol.c" \
-  "$work/lib/libEGL.so.1" "$work/lib/libGLESv2.so.2" -lwayland-egl -lwayland-client -ldl -lpthread
+  -Wl,-rpath-link,"$work/lib" "$work/lib/libEGL.so.1" "$work/lib/libGLESv2.so.2" -lwayland-egl -lwayland-client -ldl -lpthread
+gcc -O1 -g -Wall -Wl,-rpath-link,"$work/lib" -o "$work/eglgbm" tests/linux/eglgbm.c "$work/lib/libEGL.so.1" "$work/lib/libGLESv2.so.2" "$work/lib/libgbm.so.1"
 
 # the program's interpreter and libraries at their own paths, these EGL and GL libraries at the system's
-ours="libEGL.so.1 libGLESv2.so.2 libGL.so.1 libOpenGL.so.0"
-files=$( { LD_LIBRARY_PATH=$work/lib ldd "$work/eglwayland" | awk -v ours="$ours" '/=>/ { if ($3 ~ /^\// && index(" " ours " ", " " $1 " ") == 0) print $3 } /^\t\// { print $1 }'
+ours="libEGL.so.1 libGLESv2.so.2 libGL.so.1 libOpenGL.so.0 libgbm.so.1"
+files=$( { LD_LIBRARY_PATH=$work/lib ldd "$work/eglwayland" "$work/eglgbm" | awk -v ours="$ours" '/=>/ { if ($3 ~ /^\// && index(" " ours " ", " " $1 " ") == 0) print $3 } /^\t\// { print $1 }'
            readelf -l "$work/eglwayland" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p'; } | sort -u | paste -sd:)
 for l in $ours; do files="$files:$work/lib/$l=/usr/lib/$l"; done
 fail=0
@@ -64,5 +67,21 @@ grep -q "egl-wayland: [0-9]* checks, 0 failed" "$out" || fail=1
 grep -q "faulted=0" "$out" || fail=1
 # the window, framed, showing the last frame (purple, 0xFF8040C0, within a step of rounding)
 grep -Eq 'framed window "Linux EGL window" pixel ff(7f|80)(3f|40)(bf|c0)' "$out" || { echo "the window did not reach the desktop with its last frame"; fail=1; }
+# the window's frames were GPU buffers (zwp_linux_dmabuf_v1) the desktop drew in place
+grep -Eq 'wayland-desktop: GPU buffers drawn [1-9][0-9]* times in place' "$out" || { echo "no frame was drawn from a GPU buffer"; fail=1; }
+
+echo "== eglwayland with wl_shm buffers (TCOS_EGL_SHM=1)"
+out=$work/eglwayland-shm.out
+TCOS_EMU_ENV=TCOS_EGL_SHM=1 TCOS_EMU_LINUX_FILES=$files "$work/emurun" "$work/eglwayland" | tee "$out"
+grep -q "egl-wayland: [0-9]* checks, 0 failed" "$out" || fail=1
+grep -q "faulted=0" "$out" || fail=1
+grep -Eq 'framed window "Linux EGL window" pixel ff(7f|80)(3f|40)(bf|c0)' "$out" || { echo "the window did not reach the desktop with its last frame (wl_shm)"; fail=1; }
+grep -q 'GPU buffers drawn 0 times in place, 0 from the CPU' "$out" || { echo "TCOS_EGL_SHM=1 still sent GPU buffers"; fail=1; }
+
+echo "== eglgbm (glibc, libgbm.so.1, libEGL.so.1, libGLESv2.so.2)"
+out=$work/eglgbm.out
+TCOS_EMU_LINUX_FILES=$files "$work/emurun" "$work/eglgbm" | tee "$out"
+grep -q "egl-gbm: [0-9]* checks, 0 failed" "$out" || fail=1
+grep -q "faulted=0" "$out" || fail=1
 [ $fail -eq 0 ] && echo "linux egl wayland emulated: all passed" || echo "linux egl wayland emulated: FAILED"
 exit $fail

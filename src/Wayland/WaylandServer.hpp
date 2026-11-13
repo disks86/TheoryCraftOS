@@ -150,6 +150,12 @@ class Server final : public desktop::IWindowsSession {
   void set_fd_maker(MakeFd make, void* context);
   // The desktop's clipboard, bridged to the Wayland selection (null: none). It must outlive the server.
   void set_clipboard(kernel::Clipboard* clipboard);
+  // Pictures on the clipboard as PNG files (image/png), both ways: the clipboard's picture encoded (false: none, or it could not be), and a PNG file put
+  // on the clipboard as its picture (false: not a picture). Given by main.cpp (Wayland/Media: the kernel's image codecs), so that the compositor does not
+  // depend on them; without them only text is bridged. They are called outside the server's lock.
+  using ClipboardToPng = bool (*)(allocators::IAllocator& allocator, kernel::Clipboard& clipboard, ByteBuffer* png);
+  using PngToClipboard = bool (*)(allocators::IAllocator& allocator, kernel::Clipboard& clipboard, ConstByteView png);
+  void set_clipboard_images(ClipboardToPng to_png, PngToClipboard from_png);
   // --- what the transport does for the server (see TransportRequest)
   void take_requests(List<TransportRequest>* out);
   void pipe_ready(uint32_t job, Fd write_end);
@@ -403,7 +409,6 @@ class Server final : public desktop::IWindowsSession {
   DataSourceInfo* source_of(uint8_t client, uint32_t source);
   void source_gone(Client& c, uint32_t source);
   void poll_clipboard();
-  void fetch_selection_text();
   void start_drag(Client& c, uint32_t source, Surface* origin);
   void drag_moved();
   void drag_focus(Surface* s, int32_t lx, int32_t ly);
@@ -561,7 +566,16 @@ class Server final : public desktop::IWindowsSession {
   uint8_t sel_sent_client_ = 0;             // the client the selection was last offered to (the keyboard focus's)
   uint32_t fetch_job_ = 0;                  // the clipboard's copy of a client's selection being read (0: none)
   String fetch_mime_;
+  bool fetch_image_ = false;                // ... it is image/png (decoded onto the clipboard as a picture)
+  enum class DesktopData : uint8_t { None, Text, Image };
+  DesktopData desktop_kind_ = DesktopData::None;      // what the clipboard holds that the selection offers, as tick() last read it
   String desktop_text_;                     // the clipboard's text, as tick() last read it (what a paste of the desktop's selection gets)
+  SharedPointer<ByteBuffer> desktop_png_;   // ... or its picture as a PNG file (shared with the transport's writes of it)
+  ClipboardToPng to_png_ = nullptr;
+  PngToClipboard from_png_ = nullptr;
+  // What the clipboard holds now (outside the lock): its text, or its picture encoded.
+  DesktopData read_clipboard(kernel::Clipboard& clipboard, String* text, SharedPointer<ByteBuffer>* png);
+  void fetch_selection();
   List<TransportRequest> requests_;
   uint32_t next_job_ = 1;
   // a drag (wl_data_device.start_drag)

@@ -30,14 +30,22 @@ service org.tcos.Echo "$work/echoservice org.tcos.Echo 20"
 service org.tcos.Echo2 "$work/echoservice 'org.tcos.Echo2' 20"
 service org.tcos.False "/bin/false"
 service org.tcos.Missing "$work/no-such-program"
-service org.tcos.Slow "/bin/sleep 30"
+service org.tcos.Slow "/bin/sleep 31.5"
+service org.tcos.Env "$work/echoservice org.tcos.Env 20"
+# without systemd: the unit's ExecStart runs (found by its Alias=), not the Exec=/bin/false that distributions write; one with no unit runs its Exec
+mkdir -p "$work/units"
+rm -f "$work/units"/*.service
+printf '[D-BUS Service]\nName=org.tcos.Unit\nExec=/bin/false\nUser=root\nSystemdService=dbus-org.tcos.Unit.service\n' > "$work/services/org.tcos.Unit.service"
+printf '[D-BUS Service]\nName=org.tcos.NoUnit\nExec=/bin/false\nSystemdService=dbus-org.tcos.NoUnit.service\n' > "$work/services/org.tcos.NoUnit.service"
+printf '[Unit]\nDescription=test\n[Service]\nType=dbus\nBusName=org.tcos.Unit\nExecStart=%s org.tcos.Unit 20\nEnvironment=FROM_UNIT=unit-env\n[Install]\nAlias=dbus-org.tcos.Unit.service\n' \
+  "$work/echoservice" > "$work/units/tcos-unitd.service"
 
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 "$work/dbushost" "$sock/session" session 120 > "$work/session.out" 2> "$work/session.err" & session_pid=$!
 "$work/dbushost" "$sock/system" system 120 > "$work/system.out" 2> "$work/system.err" & system_pid=$!
 # a third bus starts services on demand, with short timeouts: 1.5 s for a reply, 2 s for a service to take its name
-"$work/dbushost" "$sock/act" session 120 --services "$work/services" --reply-timeout-ms 1500 --activation-timeout-ms 2000 > "$work/act.out" 2> "$work/act.err" & act_pid=$!
+"$work/dbushost" "$sock/act" session 120 --services "$work/services" --units "$work/units" --reply-timeout-ms 1500 --activation-timeout-ms 2000 > "$work/act.out" 2> "$work/act.err" & act_pid=$!
 for _ in $(seq 50); do [ -S "$sock/session" ] && [ -S "$sock/system" ] && [ -S "$sock/act" ] && break; sleep 0.1; done
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$sock/session DBUS_SYSTEM_BUS_ADDRESS=unix:path=$sock/system
 T="timeout 5"
@@ -103,13 +111,23 @@ check "busctl lists the activatable names" "$A busctl --user list --activatable 
 check "a service that exits: Spawn.ChildExited" "{ $A dbus-send --session --print-reply --dest=org.tcos.False /x org.tcos.X.Y 2>&1 || true; } | grep -q 'Spawn.ChildExited'"
 check "a program that is not there: Spawn.ExecFailed" "{ $A dbus-send --session --print-reply --dest=org.tcos.Missing /x org.tcos.X.Y 2>&1 || true; } | grep -q 'Spawn.ExecFailed'"
 check "a service that never takes its name: TimedOut" "{ $A dbus-send --session --print-reply --dest=org.tcos.Slow /x org.tcos.X.Y 2>&1 || true; } | grep -q 'org.freedesktop.DBus.Error.TimedOut'"
+sleep 0.3
+stopped=$(sed -n 's/^activate: stopped //p' "$work/act.out" | head -1)
+check "... and its program is stopped" "[ -n '$stopped' ] && { [ ! -d /proc/$stopped ] || grep -q '^State:.*Z' /proc/$stopped/status; }"
+check "UpdateActivationEnvironment (dbus-send)" "$A dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.UpdateActivationEnvironment dict:string:string:TCOS_FROM_BUS,set-by-update > /dev/null"
+check "UpdateActivationEnvironment (gdbus)" "$A gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.UpdateActivationEnvironment \"{'TCOS_GDBUS': 'g', 'TCOS_FROM_BUS': 'replaced'}\" > /dev/null"
+check "a service started later has them" "$A dbus-send --session --print-reply --dest=org.tcos.Env /org/tcos/Echo org.tcos.Echo.Getenv string:TCOS_FROM_BUS | grep -q 'string \"replaced\"' && $A dbus-send --session --print-reply --dest=org.tcos.Env /org/tcos/Echo org.tcos.Echo.Getenv string:TCOS_GDBUS | grep -q 'string \"g\"'"
+check "... and still the starter variables" "$A dbus-send --session --print-reply --dest=org.tcos.Env /org/tcos/Echo org.tcos.Echo.Getenv string:DBUS_STARTER_BUS_TYPE | grep -q 'string \"session\"'"
+check "a SystemdService= unit runs without systemd" "$A dbus-send --session --print-reply --dest=org.tcos.Unit /org/tcos/Echo org.tcos.Echo.Echo string:from-the-unit | grep -q 'string \"from-the-unit\"' && grep -q 'activate: org.tcos.Unit -> $work/echoservice' $work/act.out"
+check "... with the unit's Environment= and the bus's" "$A dbus-send --session --print-reply --dest=org.tcos.Unit /org/tcos/Echo org.tcos.Echo.Getenv string:FROM_UNIT | grep -q 'string \"unit-env\"' && $A dbus-send --session --print-reply --dest=org.tcos.Unit /org/tcos/Echo org.tcos.Echo.Getenv string:TCOS_GDBUS | grep -q 'string \"g\"'"
+check "no unit: Exec=/bin/false fails as without systemd" "{ $A dbus-send --session --print-reply --dest=org.tcos.NoUnit /x org.tcos.X.Y 2>&1 || true; } | grep -q 'Spawn.ChildExited'"
 check "sd-bus StartUnit-free activation (busctl call)" "$A busctl --user call org.tcos.Echo2 /org/tcos/Echo org.tcos.Echo Echo s via-busctl | grep -q 'via-busctl'"
 # reply timeout: the bus answers a call nobody answers after 1.5 s (the client would wait 20 s)
 start=$(date +%s%N)
 $A dbus-send --session --print-reply --reply-timeout=20000 --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Hang > "$work/hang.out" 2>&1 || true
 elapsed=$(( ($(date +%s%N) - start) / 1000000 ))
 check "an unanswered call gets NoReply from the bus (${elapsed} ms)" "grep -q 'org.freedesktop.DBus.Error.NoReply' $work/hang.out && [ $elapsed -ge 1000 ] && [ $elapsed -lt 6000 ]"
-$A dbus-send --session --print-reply --dest=org.tcos.Echo /org/tcos/Echo org.tcos.Echo.Quit > /dev/null 2>&1 || true
+for n in Echo Env Unit; do $A dbus-send --session --print-reply --dest=org.tcos.$n /org/tcos/Echo org.tcos.Echo.Quit > /dev/null 2>&1 || true; done
 check "no sanitizer report" "! grep -q 'ERROR: AddressSanitizer\|runtime error' $work/session.err $work/system.err $work/act.err"
 [ $fail -eq 0 ] && echo "dbus interop: all passed" || echo "dbus interop: FAILED"
 exit $fail
