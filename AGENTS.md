@@ -25,6 +25,18 @@ Write new code so that memory errors cannot happen, not so that they are unlikel
 - Keep every `reinterpret_cast` in one small helper with a comment saying why it is safe (alignment, lifetime), and don't scatter casts through logic code.
 - New decoders and parsers need truncation and bit-flip cases in their host tests. Run them with `tests/run_host_tests.sh <TestName>`, which builds with ASan and UBSan, and fix any sanitizer report.
 
+## Error handling
+
+Report errors through return values, not exceptions, wherever the requirements allow it:
+
+- Return a `bool`, a status or error enum, an `Optional<T>` (`Utility/Optional.hpp`) or a small result struct, and have the caller
+  check it. Mark such functions `[[nodiscard]]` so an ignored failure is a compiler warning.
+- Kernel-mode code must never throw. The kernel is built with `-fno-exceptions` and has no unwinder, so `throw`, `try`/`catch` and
+  anything that relies on them (library calls that throw, a throwing `operator new`) are not allowed there. Handle the failure, pass it
+  up, or, if the state is unrecoverable, panic.
+- Use exceptions only in user-mode code where a requirement demands them, such as an emulated ABI or third-party code whose contract is
+  defined in terms of them. Keep them inside that boundary and turn them into return values before they reach kernel code.
+
 ## Concurrent data structures
 
 Shared state touched by more than one core, thread or interrupt handler goes in one of these, not in a bare container, a hand-rolled
