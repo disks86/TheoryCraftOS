@@ -188,6 +188,8 @@ class Graph {
   // node.name, object.serial or id), else to the first producer, and is given that producer's channel (null while there is no producer: link_video()
   // tries again).
   uint32_t create_video_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<VideoChannel>* channel);
+  // How many watchers a video producer has (input video nodes linked to it).
+  uint32_t video_watchers(uint32_t producer);
   bool link_video(uint32_t node, SharedPointer<VideoChannel>* channel);
   SharedPointer<VideoChannel> video_of(uint32_t node);
 

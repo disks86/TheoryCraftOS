@@ -29,6 +29,7 @@
 #include "DBus/ProgramActivator.hpp"
 #include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
+#include "PipeWire/CameraSource.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
@@ -2151,6 +2152,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     } midi_guard{usb_midi, media_graph};
     pipewire::PulseServer pipewire_pulse(media_graph, shared_allocator);
     pipewire::WindowsAudioService windows_audio(media_graph, shared_allocator);
+    // The cameras as video sources of the graph (a node each; a camera streams while a program watches it): updated from the loop below.
+    pipewire::CameraSources camera_sources(media_graph, shared_allocator);
+    uint64_t camera_sources_us = 0;
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);
@@ -2690,6 +2694,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
 #endif
       uint32_t tools_width, tools_height;
       if (vmware_tools.take_resolution(&tools_width, &tools_height)) on_vbox_display_request(&vbox_display, tools_width, tools_height);
+      if (const uint64_t now_us = hardware::uptime_us(); now_us - camera_sources_us >= 20000) {
+        camera_sources_us = now_us;
+        pipewire::CameraSources::Camera list[pipewire::CameraSources::kMaxCameras];
+        uint32_t listed = 0;
+        for (uint32_t i = 0; i < cameras.count() && listed < pipewire::CameraSources::kMaxCameras; ++i)
+          if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
+        camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
+      }
       if (threaded) {
         desktop.pump(hardware::uptime_us());
       } else {

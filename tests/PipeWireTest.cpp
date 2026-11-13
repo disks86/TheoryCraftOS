@@ -35,6 +35,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "PipeWire/Graph.hpp"
+#include "PipeWire/CameraSource.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
@@ -2245,6 +2246,111 @@ static void test_windows_virtual_sink() {
   CHECK(service.stream_count() == 0);
 }
 
+// ---- the cameras as video sources -------------------------------------------------------------------------------------------------------------------
+
+struct FakeCamera final : hardware::ICamera {
+  bool there = true, on = false;
+  uint32_t starts = 0, stops = 0, frame = 0;
+  const char* name() const override { return "Fake Webcam"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool present() const override { return there; }
+  uint32_t mode_count() const override { return 2; }
+  bool mode(uint32_t index, hardware::CameraMode* out) const override {
+    if (index > 1) return false;
+    *out = index == 0 ? hardware::CameraMode{320, 240, 15, hardware::VideoCodec::Raw} : hardware::CameraMode{640, 480, 30, hardware::VideoCodec::Raw};
+    return true;
+  }
+  bool start_mode(uint32_t) override { return start(640, 480, 30); }
+  bool start(uint32_t, uint32_t, uint32_t) override {
+    if (!there) return false;
+    on = true;
+    ++starts;
+    return true;
+  }
+  void stop() override { if (on) ++stops; on = false; }
+  bool streaming() const override { return on; }
+  hardware::VideoFormat frame_format() const override {
+    hardware::VideoFormat f;
+    if (on) { f.width = 640; f.height = 480; }
+    return f;
+  }
+  bool limited_range() const override { return true; }
+  void pump() override {}
+  // a picture: luma = the picture's number, chroma = 100 + it
+  bool read_frame(const hardware::VideoFrameBuffer& out) override {
+    if (!on || out.format().pixel_format != hardware::PixelFormat::I420) return false;
+    ++frame;
+    out.plane(0).fill(uint8_t(frame));
+    out.plane(1).fill(uint8_t(100 + frame));
+    out.plane(2).fill(uint8_t(150 + frame));
+    return true;
+  }
+  hardware::CameraStatistics statistics() const override { return {}; }
+};
+
+static void test_camera_sources() {
+  Graph g(A, nullptr);
+  CHECK(g.initialize());
+  CameraSources sources(g, A);
+  SharedPointer<FakeCamera> cam = SharedPointer<FakeCamera>::make(A);
+  SharedPointer<hardware::ICamera> as_camera = SharedPointer<hardware::ICamera>(cam);
+  CameraSources::Camera list[1] = {{7, as_camera}};
+  uint64_t now = 1000000;
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now);
+  const uint32_t node = sources.node_of(7);
+  CHECK(sources.count() == 1 && node && g.find_node("tcos-camera-7") == node && !sources.streaming(7) && cam->starts == 0);
+  bool described = false;
+  g.visit(node, [&](const GraphObject& o) {
+    described = o.props.get("media.class") == StringView("Video/Source") && o.props.get("node.description") == StringView("Fake Webcam") && o.client == g.native_client_id();
+  });
+  CHECK(described);
+  // nobody watches: it stays off
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 20000);
+  CHECK(!sources.streaming(7) && cam->starts == 0);
+  // a watcher (a program's video input aimed at it): it starts, its pictures go out as I420 640 x 480
+  const uint32_t client = g.add_client(Origin::Native, 1, "native", "test");
+  Properties wprops(A);
+  wprops.set("target.object", "tcos-camera-7");
+  SharedPointer<VideoChannel> watched;
+  const uint32_t watcher = g.create_video_node(client, wprops, kDirectionInput, &watched);
+  CHECK(watcher && watched && g.video_watchers(node) == 1);
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 20000);
+  CHECK(sources.streaming(7) && cam->starts == 1 && sources.published(7) == 1);
+  if (watched) {
+    const VideoFormat f = watched->format();
+    CHECK(f.format == 2 && f.width == 640 && f.height == 480 && f.rate_num == 30);
+    SharedPointer<VideoFrame> fr = watched->latest();
+    CHECK(fr && fr->pixels.size() == 640 * 480 * 3 / 2);
+    if (fr) CHECK(fr->pixels.view()[0] == 1 && fr->pixels.view()[640 * 480] == 101 && fr->pixels.view()[640 * 480 + 320 * 240] == 151);
+  }
+  for (int i = 0; i < 5; ++i) sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 20000);
+  CHECK(sources.published(7) == 6 && watched && watched->frames() == 6);
+  // the watcher goes: it keeps streaming a while, then stops
+  g.destroy_node(watcher);
+  CHECK(g.video_watchers(node) == 0);
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 500000);
+  CHECK(sources.streaming(7));
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 2000000);
+  CHECK(!sources.streaming(7) && cam->stops == 1);
+  // a second watcher starts it again; then the camera is pulled out: its node goes, the watcher sees the channel closed
+  SharedPointer<VideoChannel> again;
+  const uint32_t second = g.create_video_node(client, wprops, kDirectionInput, &again);
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 20000);
+  CHECK(second && sources.streaming(7) && cam->starts == 2);
+  cam->there = false;
+  sources.update(ArrayView<const CameraSources::Camera>(list, 1), now += 20000);
+  CHECK(sources.count() == 0 && g.find_node("tcos-camera-7") == 0 && again && again->closed() && cam->stops == 2);
+  // a camera that comes back (a new one) is a new node; one gone from the list goes too
+  SharedPointer<FakeCamera> cam2 = SharedPointer<FakeCamera>::make(A);
+  CameraSources::Camera list2[1] = {{8, SharedPointer<hardware::ICamera>(cam2)}};
+  sources.update(ArrayView<const CameraSources::Camera>(list2, 1), now += 20000);
+  CHECK(sources.count() == 1 && sources.node_of(8) && g.find_node("tcos-camera-8"));
+  sources.update(ArrayView<const CameraSources::Camera>(), now += 20000);
+  CHECK(sources.count() == 0 && g.find_node("tcos-camera-8") == 0);
+  g.destroy_node(second);
+}
+
 // ---- the AF_UNIX transport -----------------------------------------------------------------------------------------------------------------------
 
 struct SystemSync final : process::ISystemSync {
@@ -4051,6 +4157,7 @@ int main() {
   test_pulse_protocol();
   test_windows_service();
   test_windows_virtual_sink();
+  test_camera_sources();
   test_record_convert();
   test_record();
   test_record_threads();

@@ -233,6 +233,7 @@ add_executable(BOOTX64
   src/PipeWire/NativeClientNode.cpp
   src/PipeWire/MidiBus.cpp
   src/PipeWire/VideoChannel.cpp
+  src/PipeWire/CameraSource.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp

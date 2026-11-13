@@ -496,6 +496,16 @@ SharedPointer<VideoChannel> Graph::video_of(uint32_t node_id) {
   return node && node->type == ObjectType::Node ? node->video : SharedPointer<VideoChannel>();
 }
 
+uint32_t Graph::video_watchers(uint32_t producer) {
+  kernel::ScopedMutex guard(mutex_);
+  GraphObject* node = find_locked(producer);
+  if (!node || node->type != ObjectType::Node || node->role != NodeRole::VideoStream || !node->video) return 0;
+  uint32_t n = 0;
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    n += o->type == ObjectType::Node && o->role == NodeRole::VideoStream && o->direction_of_node == kDirectionInput && o->video.get() == node->video.get();
+  return n;
+}
+
 uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate) {
   if (channels < 1 || channels > 2 || !clock_.set_up()) return 0;
   // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; the node says the sink's own format)
