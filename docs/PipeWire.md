@@ -40,6 +40,7 @@ program that records, of any kind, gets a record stream of it.
 | The acoustic echo canceller (bulk delay estimate, partitioned frequency-domain NLMS, foreground/background filters; high pass, residual echo and noise suppression, comfort noise, gain control) | `EchoCanceller.{hpp,cpp}` |
 | Remembered stream volumes (module-stream-restore and its extension), kept in `/AppStore/PipeWire/stream-restore.bin` | `StreamRestore.{hpp,cpp}` |
 | Audio over the network: RTP, SAP and SDP; module-rtp-send and -recv | `Rtp.{hpp,cpp}`, `StackRtpNetwork.hpp` (the kernel's network stacks) |
+| Raw PCM through named pipes: module-pipe-sink and -source (`PipeSink`, `PipeSource`, the `IPipeFiles` interface) | `Pipe.{hpp,cpp}`, `KernelPipeFiles.hpp` (the kernel's Linux FIFOs, [NamedPipes.md](NamedPipes.md)) |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
 | eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
@@ -269,7 +270,17 @@ and are not remembered. `module-rtp-send` (source - the speakers' monitor by def
 224.0.0.56, port 46000, mtu 1280, stream_name) records a source and sends RTP, announced by SAP every 5 s on the stream's own address (as PulseAudio
 does) and withdrawn when it goes; `module-rtp-recv` (sink, sap_address 224.0.0.56, latency_msec 500) plays every announced L16/PCMU/PCMA stream
 into a sink (late and repeated packets dropped, up to 64 lost ones made silence, a stream not announced for 20 s dropped). Both need the network
-(`PulseServer::set_rtp_network`; the kernel's is `StackRtpNetwork`, the first interface with an address). Record
+(`PulseServer::set_rtp_network`; the kernel's is `StackRtpNetwork`, the first interface with an address). `module-pipe-sink` (file
+`/tmp/music.output`, sink_name `fifo_output`, sink_properties, format s16le - PulseAudio's names: u8, s16le/be, s24le/be, s24-32le, s32le/be,
+float32le/be, alaw, ulaw -, rate 48000, channels 2 (one or two), channel_map) makes a virtual sink and writes its monitor as raw PCM into the named
+pipe, made when it is missing; `module-pipe-source` (file `/tmp/music.input`, source_name `fifo_input`, ...) makes a virtual source
+(`Audio/Source/Virtual`) fed from one. The path is a Linux program's: the kernel's pipes are Linux FIFOs ([NamedPipes.md](NamedPipes.md)), so
+`cat /tmp/music.output` in a Linux program reads the sink. As PulseAudio, the module opens its pipe for reading and writing at once: it never waits for
+a partner, a program comes and goes as it likes, and the FIFO stays when the module is unloaded. The sink writes whole frames in pieces of at most 4096
+bytes (each in whole or not at all); what does not fit (nobody reading) is dropped, and the pipe keeps up to 64 KiB of older audio for a reader that
+starts late. The source keeps 100 ms queued in the virtual source and reads no further, so a writer waits in the pipe at the source's pace; mono is
+played as stereo. Both need `PulseServer::set_pipe_files` (the kernel's is `KernelPipeFiles`; refused with PA_ERR_NOTSUPPORTED without one; a pipe
+that cannot be made is PA_ERR_IO). Record
 streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
 server sends what they record on their channel a fragment at a time (`fragsize`, 50 ms by default, 5 to 250 ms), and stops sending to a client that
 does not read (the hub's ring drops the oldest audio instead). Source and source-output info and lists, their volume and mute (SET_SOURCE_OUTPUT_VOLUME
@@ -388,7 +399,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   "a reboot": a new server reading the entries back and writing on the way out; the file cut at every length and 4000 bit flips), and RTP (packets
   with contributing sources, extensions and padding, payload types, SDP both ways and PulseAudio's own, SAP both ways, cut and bit-flipped;
   module-rtp-send to module-rtp-recv over an in-memory network: a tone through, a tenth of the packets lost, the sender's deletion taking the
-  receiver's stream, mu-law at 8 kHz, every socket closed and group left). `EchoCancellerTest` checks the canceller alone on synthetic rooms (speech-like far ends through a
+  receiver's stream, mu-law at 8 kHz, every socket closed and group left), the pipe modules over in-memory pipes (`test_pipe_modules`: a tone
+  through the pipe sink on each side, float32 mono at 44.1 kHz, a full pipe dropping whole frames only and the module going on, refused formats,
+  channel counts, rates, paths and arguments, nothing left behind; the pipe source playing a constant written in pieces that cut frames in two, not
+  reading past its latency while nobody records, mono heard on both sides at full level) and over the kernel's real FIFOs
+  (`test_pipe_kernel_fifos`: `KernelPipeFiles` making `/Linux/tmp/...`, another end reading the sink's tone and writing what the source plays). `EchoCancellerTest` checks the canceller alone on synthetic rooms (speech-like far ends through a
   delay and reflections): a 42 ms echo (over 20 dB taken out), a 250 ms one (the bulk delay found within 25 ms, over 18 dB), double talk (the near
   talker kept, the echo still cancelled, the filter not pulled away), an echo path that changes, a far end that never plays (the microphone passed
   as it is), NaNs, infinities, huge values and bit flips (output finite, still converging after), blocks of the wrong size, the high pass (a DC
@@ -433,8 +448,10 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   (`tests/pipewire/pulse_restore.c`, built against the host's libpulse) must test, write, read and delete entries, a new stream must start at its
   remembered volume and a slider move must be remembered. GStreamer must receive module-rtp-send's stream (`udpsrc ! rtpL16depay`, the tone at full
   level) and its SAP announcement must hold PulseAudio's SDP; module-rtp-recv, given a SAP announcement, must play GStreamer's `rtpL16pay` stream
-  into its sink.
-- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|nullsource|xaudio2|pwnode|libpipewire]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
+  into its sink. `pactl load-module module-pipe-sink` must make its FIFO (the host's, `mkfifo`) and sink, `cat` must read paplay's tone from the
+  FIFO (left only), and the FIFO must stay after unload; for `module-pipe-source`, what `cat` writes into its FIFO must be what parecord records
+  from the source; a FIFO in a folder that is not there is refused.
+- `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|nullsource|xaudio2|pwnode|libpipewire|pipe]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
   Linux program and the native stream, and all four tones must be in the mix at once (the DLLs are also put in the RAM disk's System32, since ole32
@@ -455,7 +472,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
   The fifth run is `tests/linux/pwnodetest.c` (no C library) next to `winmmtest`: the `pw_stream` side of client-node through the OS's own system
   calls (SCM_RIGHTS, `mmap(MAP_SHARED)` of the passed memfds, `ppoll` and `read`/`write` on the eventfds), 4 s of 500 Hz, then half a second of
-  the microphone on an input node, each side's tone checked; the mix must hold 300, 400 and 500 Hz at once. The sixth run (`libpipewire`, x86-64,
+  the microphone on an input node, each side's tone checked; the mix must hold 300, 400 and 500 Hz at once. The `pipe` run (`TCOS_EMU_PIPE`) loads
+  module-pipe-sink and -source over the kernel's Linux FIFOs and runs `tests/linux/fifotest.c` (no C library) alone: its own FIFO (mkfifo, stat,
+  `ENXIO`, read/write/ppoll, the end of the file, `POLLHUP`, unlink), then half a second read from `/tmp/music.output` (the emulator plays 440 Hz into
+  the pipe sink: about 440 zero crossings) and a second of a 600 Hz triangle written into `/tmp/music.input`, which the emulator must hear from the
+  pipe source (passes on x86-64, AArch64 and RISC-V). The sixth run (`libpipewire`, x86-64,
   when the machine has `pw-cat`) runs the host's real `pw-cat` with its libraries, SPA plugins (`libspa-support`, `libspa-audioconvert`, ...),
   modules (`protocol-native`, `client-node`, `adapter`, ...) and `client.conf` copied into the Linux tree: `pw-play` of a 500 Hz WAV must be in
   the mix with the native stream, and `pw-record -n 24000` must write a WAV (copied out with `TCOS_EMU_SAVE`) that holds 880 Hz on the left and
@@ -496,11 +517,12 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   present, the program's frames win until it has been quiet for 250 ms (the display shows whichever presented last). The Video Viewer shows one
   source at a time.
 - **The adapter's other factories.** Only `support.null-audio-sink` (and PulseAudio's `module-null-sink`, -loopback, -remap-sink, -virtual-sink,
-  -combine-sink, -remap-source, -virtual-source, -echo-cancel, -always-sink, -switch-on-connect, -stream-restore, -rtp-send and -rtp-recv); no
-  `module-ladspa-sink`/`-source` (it loads native plugin libraries into the server, which here is the kernel), no pipe modules (Linux programs have no
-  FIFO files yet), no tunnel modules (they need a PulseAudio client of their own over TCP, and the server listens on its AF_UNIX socket only: no
+  -combine-sink, -remap-source, -virtual-source, -echo-cancel, -always-sink, -switch-on-connect, -stream-restore, -rtp-send, -rtp-recv,
+  -pipe-sink and -pipe-source); no `module-ladspa-sink`/`-source` (it loads native plugin libraries into the server, which here is the kernel), no tunnel modules (they need a PulseAudio client of their own over TCP, and the server listens on its AF_UNIX socket only: no
   `module-native-protocol-tcp`), no ROC, RAOP, zeroconf, `module-device-restore` or `module-x11-bell`. Stream restore keeps the device an entry names
-  but does not move streams to it. RTP is IPv4 only, without Opus or RTCP (no clock drift correction: a sender faster than the speakers has packets
+  but does not move streams to it. The pipe modules take one or two channels only (every virtual node here is mono or stereo), and the pipe sink writes
+  nothing while nothing plays into it (its monitor is silent then, not a stream of zeros as PulseAudio's sink renders); `use_system_clock_for_timing`
+  is taken and ignored. RTP is IPv4 only, without Opus or RTCP (no clock drift correction: a sender faster than the speakers has packets
   dropped past twice the latency). The echo canceller works in mono (a stereo echo-cancel source carries the same in both); its suppressor is a
   spectral one, not webrtc's (it costs some of a near talker during double talk: about 2 dB in the tests). A remap sink or source only exchanges left
   and right

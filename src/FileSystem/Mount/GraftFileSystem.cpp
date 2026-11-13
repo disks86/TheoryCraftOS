@@ -294,6 +294,16 @@ Status GraftFileSystem::set_metadata(StringView path, const MetadataChange& chan
   return graft_.set_metadata(rest, change);
 }
 
+Status GraftFileSystem::create_special(StringView path, SpecialNode kind) {
+  TCOS_GRAFT_ROUTE(path, false)
+  switch (where(routed_, &rest)) {
+    case Where::Base: return base_.create_special(routed_, kind);
+    case Where::MountPoint: return Status::AlreadyExists;
+    case Where::Graft: return graft_.create_special(rest, kind);
+  }
+  return Status::NotFound;
+}
+
 Status GraftFileSystem::create_hard_link(StringView existing, StringView link) {
   String a_storage(allocator_), b_storage(allocator_);
   StringView a_path, b_path;

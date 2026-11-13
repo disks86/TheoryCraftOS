@@ -251,6 +251,7 @@ add_executable(BOOTX64
   src/PipeWire/EchoCanceller.cpp
   src/PipeWire/StreamRestore.cpp
   src/PipeWire/Rtp.cpp
+  src/PipeWire/Pipe.cpp
   src/PipeWire/CameraSource.cpp
   src/PipeWire/ScreenSource.cpp
   src/PipeWire/VideoWatcher.cpp
@@ -817,6 +818,7 @@ add_executable(BOOTX64
   src/Process/WindowsSockets.cpp
   src/Process/WindowsUnixSockets.cpp
   src/Process/UnixSockets.cpp
+  src/Process/Fifo.cpp
   src/Process/MemoryFile.cpp
   src/Process/DxgBufferFile.cpp
   src/X11/X11DragAndDrop.cpp

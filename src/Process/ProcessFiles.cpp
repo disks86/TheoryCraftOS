@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/ProcessFiles.hpp"
+#include "Process/UnixSockets.hpp"
 #include "Process/Objects.hpp"
 #include "FileSystem/SystemLayout.hpp"
 
@@ -571,6 +572,7 @@ Status ProcessFiles::remove(StringView virtual_path) {
   if (virtual_path == StringView("/")) return Status::Busy;      // the root of the program's tree stays
   const Status status = fs_->remove(path.view());
   if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_forget(virtual_path); objects->security_forget(virtual_path); objects->link_forget(virtual_path); }
+  if (status == Status::Ok) if (UnixSocketManager* fifos = system_unix_sockets()) fifos->fifo_path_gone(path.view());      // (a FIFO's name: Fifo.hpp)
   return status;
 }
 
@@ -588,6 +590,7 @@ Status ProcessFiles::rename(StringView from, StringView to) {
   if (from == StringView("/")) return Status::Busy;
   const Status status = fs_->rename(a.view(), b.view());
   if (status == Status::Ok) if (ObjectManager* objects = system_objects()) { objects->file_times_move(from, to); objects->security_move(from, to); objects->link_forget(from); }
+  if (status == Status::Ok) if (UnixSocketManager* fifos = system_unix_sockets()) fifos->fifo_path_moved(a.view(), b.view());
   return status;
 }
 

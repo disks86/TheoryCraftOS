@@ -16,7 +16,7 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/VideoConvert.cpp src/PipeWire/VideoDecode.cpp src/PipeWire/Loopback.cpp src/PipeWire/EchoCanceller.cpp src/PipeWire/StreamRestore.cpp src/PipeWire/Rtp.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/VideoConvert.cpp src/PipeWire/VideoDecode.cpp src/PipeWire/Loopback.cpp src/PipeWire/EchoCanceller.cpp src/PipeWire/StreamRestore.cpp src/PipeWire/Rtp.cpp src/PipeWire/Pipe.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
          src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
@@ -310,6 +310,33 @@ else
   echo "skip pa_ext_stream_restore (no libpulse to build against)"
 fi
 check "pactl unload-module module-stream-restore" "timeout 5 pactl unload-module '$restore' && ! timeout 5 pactl list short modules | grep -q 'module-stream-restore'"
+# module-pipe-sink and module-pipe-source with the host's FIFOs: pactl loads them, `cat` reads what paplay plays into the pipe sink (raw s16le 48 kHz
+# stereo), and what is written into the pipe source's FIFO is what parecord records from it
+python3 - "$work/tone600.wav" "$work/tone800.raw" <<'PY'
+import math, struct, sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+w.writeframes(b"".join(struct.pack("<hh", int(8000 * math.sin(2 * math.pi * 600 * i / 48000)), 0) for i in range(48000)))
+open(sys.argv[2], "wb").write(b"".join(struct.pack("<hh", 0, int(8000 * math.sin(2 * math.pi * 800 * i / 48000))) for i in range(48000 * 3)))
+PY
+rm -f "$work/pipe-sink.fifo" "$work/pipe-source.fifo" "$work/pipe-sink.raw" "$work/pipe-source.raw"
+pipesink=$(timeout 5 pactl load-module module-pipe-sink file="$work/pipe-sink.fifo" sink_name=pipe-out 2> /dev/null)
+check "pactl load-module module-pipe-sink makes its FIFO and sink" "[ -n '$pipesink' ] && [ -p '$work/pipe-sink.fifo' ] && timeout 5 pactl list short sinks | grep -q 'pipe-out'"
+check "pactl list modules names module-pipe-sink" "timeout 5 pactl list short modules | grep -q 'module-pipe-sink'"
+(timeout 3 cat "$work/pipe-sink.fifo" > "$work/pipe-sink.raw" || true) & reader=$!
+sleep 0.3
+timeout 10 paplay --device=pipe-out "$work/tone600.wav" 2> /dev/null || true
+wait $reader || true
+check "cat read module-pipe-sink's tone from the FIFO" "heard '$work/pipe-sink.raw' 600 0 3000 && ! heard '$work/pipe-sink.raw' 600 1 300 > /dev/null 2>&1"
+check "pactl unload-module module-pipe-sink (the FIFO stays, as PulseAudio leaves it)" "timeout 5 pactl unload-module '$pipesink' && ! timeout 5 pactl list short sinks | grep -q 'pipe-out' && [ -p '$work/pipe-sink.fifo' ]"
+pipesource=$(timeout 5 pactl load-module module-pipe-source file="$work/pipe-source.fifo" source_name=pipe-in 2> /dev/null)
+check "pactl load-module module-pipe-source makes its FIFO and an Audio/Source/Virtual" "[ -n '$pipesource' ] && [ -p '$work/pipe-source.fifo' ] && timeout 5 pactl list short sources | grep -q 'pipe-in' && timeout 5 pw-cli ls Node | grep -q 'Audio/Source/Virtual'"
+(timeout -s INT 2.5 parecord --raw --device=pipe-in --format=s16le --rate=48000 --channels=2 "$work/pipe-source.raw" 2> /dev/null || true) & rec=$!
+sleep 0.3
+timeout 5 sh -c "cat '$work/tone800.raw' > '$work/pipe-source.fifo'" || true
+wait $rec || true
+check "parecord heard what was written into module-pipe-source's FIFO" "heard '$work/pipe-source.raw' 800 1 3000"
+check "pactl unload-module module-pipe-source" "timeout 5 pactl unload-module '$pipesource' && ! timeout 5 pactl list short sources | grep -q 'pipe-in'"
+check "module-pipe-sink refuses a FIFO in a folder that is not there" "! timeout 5 pactl load-module module-pipe-sink file='$work/no/such/dir/x' 2> /dev/null"
 # module-rtp-send to GStreamer (udpsrc ! rtpL16depay): the tone played into lb-a arrives, announced by SAP (PulseAudio's SDP, on the stream's own
 # address); module-rtp-recv from GStreamer (rtpL16pay ! udpsink) announced by a SAP packet of our making: the tone comes out of lb-b's monitor
 if command -v gst-launch-1.0 > /dev/null; then

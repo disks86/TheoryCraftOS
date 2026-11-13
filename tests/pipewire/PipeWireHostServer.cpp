@@ -42,6 +42,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include "PipeWire/Graph.hpp"
@@ -314,6 +315,32 @@ struct HostRtpNetwork final : IRtpNetwork {
   network::Ipv4Address local_address() override { return network::Ipv4Address::make(127, 0, 0, 1); }
 };
 
+// module-pipe-sink's and -source's pipes: the host's own FIFOs (made with mkfifo when missing, opened O_RDWR | O_NONBLOCK as PulseAudio opens them).
+struct HostPipeFiles final : IPipeFiles {
+  struct File final : IPipeFile {
+    int fd = -1;
+    explicit File(int f) : fd(f) {}
+    ~File() { if (fd >= 0) ::close(fd); }
+    uint32_t write(ConstByteView data) override {
+      const ssize_t n = ::write(fd, data.data(), data.size());
+      return n > 0 ? uint32_t(n) : 0;
+    }
+    uint32_t read(ByteView out) override {
+      const ssize_t n = ::read(fd, out.data(), out.size());
+      return n > 0 ? uint32_t(n) : 0;
+    }
+  };
+  UniquePointer<IPipeFile> open(StringView path) override {
+    const std::string name(path.data(), path.size());
+    struct stat st{};
+    if (::stat(name.c_str(), &st) != 0 && (errno != ENOENT || mkfifo(name.c_str(), 0644) != 0)) return UniquePointer<IPipeFile>();
+    if (::stat(name.c_str(), &st) != 0 || !S_ISFIFO(st.st_mode)) return UniquePointer<IPipeFile>();
+    const int fd = ::open(name.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return UniquePointer<IPipeFile>();
+    return UniquePointer<IPipeFile>::make_as<File>(A, fd);
+  }
+};
+
 int main(int argc, char** argv) {
   if (argc < 4) {
     fprintf(stderr, "usage: %s <native socket> <pulse socket> <out.wav> [seconds]\n", argv[0]);
@@ -350,6 +377,8 @@ int main(int argc, char** argv) {
   PulseServer pulse(graph, A);
   HostRtpNetwork rtp_network;
   pulse.set_rtp_network(&rtp_network);
+  HostPipeFiles pipe_files;
+  pulse.set_pipe_files(&pipe_files);
   // (module-stream-restore is not loaded here as the kernel loads it at start-up: it would carry one check's volumes into the next; the interop
   // script loads it for its own check)
   const int listeners[2] = {listen_on(argv[1]), listen_on(argv[2])};

@@ -74,7 +74,7 @@ constexpr uint32_t kFlagImmutable = 0x00000010, kFlagAppend = 0x00000020, kFlagI
 
 // Directory entries: inode(4) rec_len(2) name_len(1) file_type(1) name.
 constexpr uint32_t kDirHeader = 8;
-constexpr uint8_t kFtUnknown = 0, kFtRegular = 1, kFtDirectory = 2, kFtSymlink = 7;
+constexpr uint8_t kFtUnknown = 0, kFtRegular = 1, kFtDirectory = 2, kFtCharDevice = 3, kFtBlockDevice = 4, kFtFifo = 5, kFtSocket = 6, kFtSymlink = 7;
 
 constexpr uint32_t kXattrMagic = 0xEA020000;
 constexpr uint32_t kXattrRefcount = 4, kXattrChecksum = 0x10;

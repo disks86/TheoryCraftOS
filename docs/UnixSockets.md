@@ -1,5 +1,7 @@
 # Unix sockets (AF_UNIX)
 
+(Named pipes - FIFOs - live in the same manager: see [NamedPipes.md](NamedPipes.md).)
+
 TheoryCraftOS has one set of AF_UNIX sockets for the whole system, shared by Linux and Windows programs. A Windows server and a Linux client (or
 the other way round) talk over one connection exactly as two programs of the same kind would: Linux programs use the usual socket system calls,
 Windows programs use `ws2_32.dll` with `<afunix.h>`, and both reach the same sockets under the same names.

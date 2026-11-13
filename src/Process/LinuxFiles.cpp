@@ -19,8 +19,10 @@
 #include "Process/LinuxFiles.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/DxgDevice.h"
+#include "Process/Fifo.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
+#include "Process/UnixSockets.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace process::linuxabi {
@@ -145,7 +147,7 @@ void put(ByteView out, uint64_t at, uint64_t value, uint32_t bytes) {
   for (uint32_t i = 0; i < bytes; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
 }
 
-constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000, kSIfSock = 0140000;
+constexpr uint32_t kSIfDir = 040000, kSIfReg = 0100000, kSIfChr = 020000, kSIfSock = 0140000, kSIfIfo = 010000, kSIfBlk = 060000, kSIfMt = 0170000;
 
 struct Meta {
   uint32_t mode = 0;
@@ -161,6 +163,13 @@ Meta meta_of(const DirectoryEntry& e, StringView path) {
   m.ino = fnv(path);
   m.modified = e.modified;
   m.created = e.created ? e.created : e.modified;
+  switch (e.special) {      // (a node of a file system that keeps Unix node types: ext)
+    case filesystem::SpecialNode::Fifo: m.mode = kSIfIfo | 0644; m.size = 0; break;
+    case filesystem::SpecialNode::Socket: m.mode = kSIfSock | 0755; m.size = 0; break;
+    case filesystem::SpecialNode::CharDevice: m.mode = kSIfChr | 0644; m.size = 0; break;
+    case filesystem::SpecialNode::BlockDevice: m.mode = kSIfBlk | 0644; m.size = 0; break;
+    case filesystem::SpecialNode::None: break;
+  }
   return m;
 }
 Meta device_meta(uint32_t mode, uint64_t ino) {
@@ -188,11 +197,13 @@ uint64_t write_stat(Process& p, UserArch arch, const Meta& m, uint64_t address) 
   return p.write_user(address, ConstByteView(buffer, x86 ? 144 : 128)) ? 0 : error(kEfault);
 }
 
-// A file bound to a unix socket is a socket to stat().
-void mark_socket(Process& p, StringView virtual_path, Meta* m) {
-  if ((m->mode & 0170000) != kSIfReg) return;
+// A file bound to a unix socket is a socket to stat(), one remembered as a FIFO (Fifo.hpp: a file system without FIFO nodes) a FIFO.
+void mark_socket(Process& p, StringView virtual_path, const DirectoryEntry& entry, Meta* m) {
+  if ((m->mode & kSIfMt) != kSIfReg) return;
   String host(p.files().allocator());
-  if (p.files().host_path_of(virtual_path, &host) && is_socket_file(host.view())) { m->mode = kSIfSock | 0755; m->size = 0; }
+  if (!p.files().host_path_of(virtual_path, &host)) return;
+  if (is_socket_file(host.view())) { m->mode = kSIfSock | 0755; m->size = 0; }
+  else if (is_fifo_node(host.view(), entry)) { m->mode = kSIfIfo | 0644; m->size = 0; }
 }
 
 // What a descriptor looks like to fstat. 0 and the metadata, or -errno.
@@ -209,7 +220,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
       *m = device_meta(kSIfChr | 0666, 10);
       m->rdev = TCOS_DXG_DEVICE_NUMBER;
       return 0;
-    case DescriptorKind::UnixSocket: *m = device_meta(kSIfSock | 0777, p.files().token(fd)); return 0;
+    case DescriptorKind::UnixSocket: *m = device_meta((is_pipe_descriptor(p, fd) ? kSIfIfo | 0600 : kSIfSock | 0777), p.files().token(fd)); return 0;
     default: break;
   }
   OpenObject* object = p.files().object(fd);
@@ -241,8 +252,20 @@ uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
     files.set_close_on_exec(static_cast<uint64_t>(fd), cloexec);
     return static_cast<uint64_t>(fd);
   }
-  OpenFlags f;
   const uint64_t access = flags & kOAccMode;
+  {
+    // A named pipe: an end of its pipe (Fifo.hpp), not a file.
+    DirectoryEntry entry;
+    String host(files.allocator());
+    if (files.stat(virtual_path.view(), &entry) == Status::Ok && entry.type == NodeType::File && files.host_path_of(virtual_path.view(), &host) &&
+        is_fifo_node(host.view(), entry)) {
+      if ((flags & kOCreat) && (flags & kOExcl)) return error(kEexist);
+      if (flags & (arch == UserArch::AArch64 ? 0x4000u : 0x10000u)) return error(kEnotdir);
+      if (access == kOAccMode) return error(kEinval);
+      return fifo_open(p, host.view(), access != kOWrite, access != 0, (flags & kONonBlock) != 0, cloexec);
+    }
+  }
+  OpenFlags f;
   f.read = access != kOWrite;
   f.write = access == kOWrite || access == kORdWr;
   f.create = flags & kOCreat;
@@ -434,7 +457,7 @@ uint64_t sys_statat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   const Status status = files.stat(virtual_path.view(), &entry);
   if (status != Status::Ok) return errno_of(status);
   Meta meta = meta_of(entry, virtual_path.view());
-  mark_socket(p, virtual_path.view(), &meta);
+  mark_socket(p, virtual_path.view(), entry, &meta);
   return write_stat(p, arch, meta, buffer);
 }
 
@@ -459,7 +482,7 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
       const Status status = files.stat(virtual_path.view(), &entry);
       if (status != Status::Ok) return errno_of(status);
       m = meta_of(entry, virtual_path.view());
-      mark_socket(p, virtual_path.view(), &m);
+      mark_socket(p, virtual_path.view(), entry, &m);
     }
   }
   uint8_t out[256] = {};
@@ -476,6 +499,18 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
   put(v, 112, m.modified, 8);       // stx_mtime
   return p.write_user(buffer, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
 }
+
+namespace {
+// A listed name the manager remembers as a FIFO (a file system without FIFO nodes)?
+bool fifo_listed(Process& p, const OpenObject& directory, const DirectoryEntry& entry) {
+  if (entry.type != NodeType::File) return false;
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m || !m->has_fifo_marks()) return false;
+  String path(p.files().allocator()), host(p.files().allocator());
+  if (!path.assign(directory.path.view()) || (!path.view().ends_with('/') && !path.append("/")) || !path.append(entry.name.view())) return false;
+  return p.files().host_path_of(path.view(), &host) && is_fifo_node(host.view(), entry);
+}
+}  // namespace
 
 uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   ProcessFiles& files = p.files();
@@ -502,6 +537,13 @@ uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count
     put(v, 8, ++object.directory_index, 8);        // d_off: where the next call resumes
     put(v, 16, length, 2);                         // d_reclen
     v[18] = entry.type == NodeType::Directory ? 4 : 8;      // DT_DIR / DT_REG
+    switch (entry.special) {
+      case filesystem::SpecialNode::Fifo: v[18] = 1; break;           // DT_FIFO
+      case filesystem::SpecialNode::Socket: v[18] = 12; break;        // DT_SOCK
+      case filesystem::SpecialNode::CharDevice: v[18] = 2; break;     // DT_CHR
+      case filesystem::SpecialNode::BlockDevice: v[18] = 6; break;    // DT_BLK
+      case filesystem::SpecialNode::None: if (fifo_listed(p, object, entry)) v[18] = 1; break;
+    }
     for (uint64_t i = 0; i < name.size(); ++i) v[19 + i] = static_cast<uint8_t>(name[i]);
     if (!p.write_user(buffer + used, ConstByteView(record, length))) return used ? used : error(kEfault);
     used += length;
@@ -517,6 +559,34 @@ uint64_t sys_mkdirat(Process& p, uint64_t dirfd, uint64_t path) {
   if (r < 0) return error(-r);
   if (virtual_path.view() == StringView("/") || files.device_at(virtual_path.view()) != DescriptorKind::Closed) return error(kEexist);
   return errno_of_or_zero(files.make_directory(virtual_path.view()));
+}
+
+// mknodat(dirfd, path, mode, dev) / mknod(path, mode, dev); mkfifo() is mknodat with S_IFIFO. A FIFO is a real node where the file system has them, else an
+// empty file remembered as one (Fifo.hpp); a regular file (type 0 or S_IFREG) is made empty; a socket's node is made where the file system has those (else
+// EPERM, as are devices: no device numbers here). The permission bits are not kept (no file modes yet).
+uint64_t sys_mknodat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t device) {
+  (void)device;
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return error(kEnoent);
+  String virtual_path(files.allocator());
+  const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
+  if (r < 0) return error(-r);
+  if (virtual_path.view() == StringView("/") || files.device_at(virtual_path.view()) != DescriptorKind::Closed) return error(kEexist);
+  const uint32_t type = uint32_t(mode) & kSIfMt;
+  if (type != 0 && type != kSIfReg && type != kSIfIfo && type != kSIfSock && type != kSIfChr && type != kSIfBlk) return error(kEinval);
+  if (type == kSIfChr || type == kSIfBlk) return error(kEperm);
+  DirectoryEntry entry;
+  if (files.stat(virtual_path.view(), &entry) == Status::Ok) return error(kEexist);
+  String host(files.allocator());
+  filesystem::IFileSystem* fs = files.file_system();
+  if (!fs || !files.host_path_of(virtual_path.view(), &host)) return error(kEnomem);
+  if (type == kSIfIfo) return errno_of_or_zero(make_fifo_node(*fs, host.view()));
+  if (type == kSIfSock) {
+    const Status made = fs->create_special(host.view(), filesystem::SpecialNode::Socket);
+    return made == Status::Unsupported ? error(kEperm) : errno_of_or_zero(made);
+  }
+  UniquePointer<filesystem::IFile> file;      // (a regular file: made empty)
+  return errno_of_or_zero(fs->open_file(host.view(), filesystem::OpenMode::CreateOrOpen, &file));
 }
 
 uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags) {
@@ -717,7 +787,10 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
     case 1: return files.close_on_exec(fd) ? 1 : 0;      // F_GETFD: FD_CLOEXEC
     case 2: files.set_close_on_exec(fd, argument & 1); return 0;
     case 3: {      // F_GETFL
-      if (files.kind(fd) == DescriptorKind::UnixSocket) return kORdWr | (socket_non_blocking(p, fd) ? kONonBlock : 0);
+      if (files.kind(fd) == DescriptorKind::UnixSocket) {
+        const int fifo = fifo_access_mode(p, fd);
+        return (fifo < 0 ? kORdWr : uint64_t(fifo)) | (socket_non_blocking(p, fd) ? kONonBlock : 0);
+      }
       OpenObject* object = files.object(fd);
       if (!object) return files.kind(fd) == DescriptorKind::ConsoleInput ? 0 : kORdWr;
       return (object->readable && object->writable ? kORdWr : object->writable ? kOWrite : 0) | (object->append ? kOAppend : 0);
@@ -725,6 +798,11 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
     case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
       if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
       return 0;
+    case 1031:     // F_SETPIPE_SZ / F_GETPIPE_SZ: a pipe's buffer is always kFifoBytes
+    case 1032:
+      if (!is_pipe_descriptor(p, fd)) return error(kEbadf);
+      if (command == 1031 && argument > UnixSocketManager::kFifoBytes) return error(kEperm);
+      return UnixSocketManager::kFifoBytes;
     case 1033:     // F_ADD_SEALS / F_GET_SEALS: files in memory (memfd_create) only
     case 1034: {
       OpenObject* object = files.object(fd);

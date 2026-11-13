@@ -46,6 +46,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/Loopback.hpp"
 #include "PipeWire/ProtocolServer.hpp"
+#include "PipeWire/Pipe.hpp"
 #include "PipeWire/Rtp.hpp"
 #include "PipeWire/StreamRestore.hpp"
 #include "PipeWire/Tagstruct.hpp"
@@ -175,6 +176,8 @@ class PulseServer final : public IProtocolServer {
   void set_stream_restore_storage(IStreamRestoreStorage* storage) { restore_storage_ = storage; }
   // The network module-rtp-send and -recv use (null: they are refused). Set before they are loaded.
   void set_rtp_network(IRtpNetwork* network) { rtp_network_ = network; }
+  // The named pipes module-pipe-sink and -source use (null: they are refused). Set before they are loaded.
+  void set_pipe_files(IPipeFiles* files) { pipe_files_ = files; }
   StreamRestore* stream_restore() { return restore_.get(); }
   // What LOAD_MODULE does: the module's index, or 0 with *error a PulseAudio error.
   uint32_t load_module(StringView name, StringView arguments, uint32_t* error);
@@ -186,7 +189,7 @@ class PulseServer final : public IProtocolServer {
   struct Module {
     explicit Module(allocators::IAllocator& a) : name(a), arguments(a), loops(a) {}
     uint32_t index = 0;
-    // (module-null-sink, -remap-sink, -virtual-sink, -combine-sink: its sink; -remap-source, -virtual-source: its source; -echo-cancel: its
+    // (module-null-sink, -remap-sink, -virtual-sink, -combine-sink, -pipe-sink: its sink; -pipe-source too: its source; -remap-source, -virtual-source: its source; -echo-cancel: its
     // source; module-loopback and the policy ones: none)
     uint32_t node = 0;
     uint32_t extra = 0;      // (module-echo-cancel: its sink; -virtual-source with uplink_sink: that sink)
@@ -195,6 +198,8 @@ class PulseServer final : public IProtocolServer {
     UniquePointer<EchoCancelLoop> echo;       // (module-echo-cancel)
     UniquePointer<RtpSender> rtp_send;        // (module-rtp-send)
     UniquePointer<RtpReceiver> rtp_recv;      // (module-rtp-recv)
+    UniquePointer<PipeSink> pipe_sink;        // (module-pipe-sink)
+    UniquePointer<PipeSource> pipe_source;    // (module-pipe-source)
   };
   // A virtual sink (`source`: source) of a module's arguments, the kernel's.
   uint32_t module_node(const Properties& args, bool source, const char* default_name, uint32_t* error);
@@ -206,6 +211,7 @@ class PulseServer final : public IProtocolServer {
   // module-stream-restore (while it is loaded): the remembered volumes, its module index, and its extension
   IStreamRestoreStorage* restore_storage_ = nullptr;
   IRtpNetwork* rtp_network_ = nullptr;
+  IPipeFiles* pipe_files_ = nullptr;
   uint32_t rtp_seed_ = 0x9E3779B9u;
   UniquePointer<StreamRestore> restore_;
   uint32_t restore_module_ = 0;

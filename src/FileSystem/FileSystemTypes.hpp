@@ -91,6 +91,10 @@ constexpr CivilTime civil_from_unix(uint64_t seconds) {
 
 enum class NodeType : uint8_t { File, Directory, Symlink };
 
+// A node that holds no data of its own, as Unix file systems keep them (ext's inode types): a named pipe (FIFO), a socket's name, a device. Such a node
+// reports NodeType::File with size 0 and this set; only file systems that store Unix node types make or report one (IFileSystem::create_special).
+enum class SpecialNode : uint8_t { None, Fifo, Socket, CharDevice, BlockDevice };
+
 // How IFileSystem::open_file() treats the path.
 enum class OpenMode : uint8_t {
   Read,            // existing file, read only
@@ -117,6 +121,7 @@ struct DirectoryEntry {
   // 0 for both when it does not (the layer above then makes an index of the path and counts one link).
   uint64_t file_id = 0;
   uint32_t link_count = 0;
+  SpecialNode special = SpecialNode::None;  // not plain data (see SpecialNode); None for every node of a file system without such types
 };
 
 // What SetFileAttributes / SetFileTime change besides the contents; a field is only looked at when its `set_` flag is.

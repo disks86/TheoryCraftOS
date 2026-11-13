@@ -40,6 +40,7 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
 uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);
 uint64_t sys_mkdirat(Process& p, uint64_t dirfd, uint64_t path);
 uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags);
+uint64_t sys_mknodat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t device);      // (mknod(path, mode, dev): at AT_FDCWD)
 uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path);
 uint64_t sys_getcwd(Process& p, uint64_t buffer, uint64_t size);
 uint64_t sys_chdir(Process& p, uint64_t path);

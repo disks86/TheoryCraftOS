@@ -85,6 +85,7 @@ class ExtFileSystem final : public IFileSystem {
   Status open_directory(StringView path, UniquePointer<IDirectory>* directory) override;
   Status stat(StringView path, DirectoryEntry* entry) override;
   Status create_directory(StringView path) override;
+  Status create_special(StringView path, SpecialNode kind) override;
   Status remove(StringView path) override;
   Status rename(StringView from, StringView to) override;
   Status flush() override;
@@ -108,6 +109,16 @@ class ExtFileSystem final : public IFileSystem {
     bool is_directory() const { return (mode() & ext::kModeTypeMask) == ext::kModeDirectory; }
     bool is_regular() const { return (mode() & ext::kModeTypeMask) == ext::kModeRegular; }
     bool is_symlink() const { return (mode() & ext::kModeTypeMask) == ext::kModeLink; }
+    // A FIFO, socket or device node (no data of its own): what it is, None for the others.
+    SpecialNode special() const {
+      switch (mode() & ext::kModeTypeMask) {
+        case ext::kModeFifo: return SpecialNode::Fifo;
+        case ext::kModeSocket: return SpecialNode::Socket;
+        case ext::kModeChar: return SpecialNode::CharDevice;
+        case ext::kModeBlock: return SpecialNode::BlockDevice;
+        default: return SpecialNode::None;
+      }
+    }
     uint64_t size() const {
       const uint64_t low = ext::rd32(bytes(), ext::kInSizeLo);
       return is_regular() || is_directory() ? low | (uint64_t{ext::rd32(bytes(), ext::kInSizeHi)} << 32) : low;
@@ -277,7 +288,8 @@ class ExtFileSystem final : public IFileSystem {
   bool is_open(uint32_t number) const;
 
   // Namespace.
-  Status create_node(StringView path, bool directory, uint32_t* number);
+  Status create_node(StringView path, bool directory, uint32_t* number) { return create_node_mode(path, directory ? 040755 : 0100644, number); }
+  Status create_node_mode(StringView path, uint16_t mode, uint32_t* number);      // (a directory, a regular file or a special node, by the mode's type)
   Status init_inode(Inode* inode, uint16_t mode, uint32_t links);
   Status delete_inode(Inode* inode);
   uint8_t entry_type(uint16_t mode) const;

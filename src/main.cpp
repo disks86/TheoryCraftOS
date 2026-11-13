@@ -36,6 +36,7 @@
 #include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
+#include "PipeWire/KernelPipeFiles.hpp"
 #include "PipeWire/StackRtpNetwork.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "PipeWire/WindowsAudioService.hpp"
@@ -2194,6 +2195,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     pipewire_pulse.set_stream_restore_storage(&stream_restore_file);
     pipewire::StackRtpNetwork rtp_network;      // (module-rtp-send and -recv over the system's network stacks)
     pipewire_pulse.set_rtp_network(&rtp_network);
+    pipewire::KernelPipeFiles pipe_files(shared_allocator, explorer_files.file_system());      // (module-pipe-sink and -source: Linux FIFOs)
+    pipewire_pulse.set_pipe_files(&pipe_files);
     {
       uint32_t restore_error = 0;
       if (!pipewire_pulse.load_module(StringView("module-stream-restore"), StringView(), &restore_error))

@@ -30,6 +30,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <map>
+#include <memory>
+#include <algorithm>
 #include <mutex>
 #include <random>
 #include <string>
@@ -46,6 +48,7 @@
 #include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
+#include "PipeWire/KernelPipeFiles.hpp"
 #include "PipeWire/RecordStream.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "Process/MemoryFile.hpp"
@@ -6985,6 +6988,310 @@ static void test_socket_fds_in() {
   CHECK(A.live.load() <= live_before + 4);
 }
 
+// ---- module-pipe-sink and module-pipe-source --------------------------------------------------------------------------------------------------------------
+
+// Named pipes in memory: a buffer each (64 KiB, as Linux's), shared by every open of one path, writes of up to 4096 bytes whole or not at all.
+struct FakePipes final : IPipeFiles {
+  struct Pipe {
+    std::deque<uint8_t> bytes;
+    size_t capacity = 65536;
+    int opens = 0;
+  };
+  std::map<std::string, std::shared_ptr<Pipe>> pipes;
+  struct File final : IPipeFile {
+    std::shared_ptr<Pipe> pipe;
+    explicit File(std::shared_ptr<Pipe> p) : pipe(std::move(p)) { ++pipe->opens; }
+    ~File() { --pipe->opens; }
+    uint32_t write(ConstByteView data) override {
+      const size_t room = pipe->capacity - pipe->bytes.size();
+      size_t n = data.size() < room ? data.size() : room;
+      if (data.size() <= kAtomicBytes && n < data.size()) n = 0;
+      for (size_t i = 0; i < n; ++i) pipe->bytes.push_back(data[i]);
+      return uint32_t(n);
+    }
+    uint32_t read(ByteView out) override {
+      size_t n = 0;
+      for (; n < out.size() && !pipe->bytes.empty(); ++n) { out[n] = pipe->bytes.front(); pipe->bytes.pop_front(); }
+      return uint32_t(n);
+    }
+  };
+  UniquePointer<IPipeFile> open(StringView path) override {
+    const std::string name(path.data(), path.size());
+    if (name.find("/missing/") != std::string::npos) return UniquePointer<IPipeFile>();
+    std::shared_ptr<Pipe>& p = pipes[name];
+    if (!p) p = std::make_shared<Pipe>();
+    return UniquePointer<IPipeFile>::make_as<File>(A, p);
+  }
+  // Takes everything the pipe holds.
+  std::vector<uint8_t> drain(const std::string& name) {
+    std::vector<uint8_t> out;
+    if (!pipes.count(name)) return out;
+    out.assign(pipes[name]->bytes.begin(), pipes[name]->bytes.end());
+    pipes[name]->bytes.clear();
+    return out;
+  }
+  void put(const std::string& name, const std::vector<uint8_t>& data) {
+    std::shared_ptr<Pipe>& p = pipes[name];
+    if (!p) p = std::make_shared<Pipe>();
+    p->bytes.insert(p->bytes.end(), data.begin(), data.end());
+  }
+};
+
+// The kernel's virtual node of this node.name (0: none).
+static uint32_t virtual_named(Graph& g, const char* name) {
+  uint32_t found = 0;
+  g.for_each([&](const GraphObject& o) { if (o.type == ObjectType::Node && o.role == NodeRole::Virtual && o.props.get("node.name") == StringView(name)) found = o.id; });
+  return found;
+}
+
+static std::vector<int16_t> s16_of(const std::vector<uint8_t>& b) {
+  std::vector<int16_t> out;
+  for (size_t i = 0; i + 1 < b.size(); i += 2) out.push_back(int16_t(b[i] | b[i + 1] << 8));
+  return out;
+}
+
+static void test_pipe_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  FakePipes pipes;
+  uint32_t error = 0;
+  auto load = [&](const char* args, const char* module) { return server.load_module(StringView(module), StringView(args), &error); };
+  CHECK(!load("", "module-pipe-sink") && error == 19);      // (no pipes to use)
+  server.set_pipe_files(&pipes);
+  // plays `left`/`right` Hz into `into` for `ms` (5 ms ticks), taking what the pipe `pipe` gets
+  auto play = [&](uint32_t into, double left, double right, uint32_t ms, const std::string& pipe, bool drain = true) {
+    uint32_t out = 0, taken = 0;
+    std::vector<uint8_t> got;
+    if (service.open(41, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, into) != 0) return got;
+    std::vector<uint8_t> pcm(48 * 4 * ms);
+    for (uint32_t i = 0; i < 48 * ms; ++i) {
+      const int16_t l = int16_t(8192 * sin(2 * M_PI * left * i / 48000)), r = int16_t(8192 * sin(2 * M_PI * right * i / 48000));
+      pcm[4 * i] = uint8_t(l); pcm[4 * i + 1] = uint8_t(uint16_t(l) >> 8); pcm[4 * i + 2] = uint8_t(r); pcm[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    uint64_t written = 0;
+    for (uint32_t t = 0; t < ms; t += 5) {
+      if (written < pcm.size() && service.write(41, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      if (drain) { const std::vector<uint8_t> piece = pipes.drain(pipe); got.insert(got.end(), piece.begin(), piece.end()); }
+    }
+    service.process_exited(41);
+    return got;
+  };
+
+  // ---- module-pipe-sink: defaults (fifo_output, /tmp/music.output, s16le 48 kHz stereo)
+  const uint32_t sink_module = load("", "module-pipe-sink");
+  CHECK(sink_module != 0 && error == 0 && pipes.pipes.count("/tmp/music.output") && pipes.pipes["/tmp/music.output"]->opens == 1);
+  const uint32_t fifo_output = virtual_named(g, "fifo_output");
+  bool shape = false;
+  g.visit(fifo_output, [&](const GraphObject& o) { shape = o.props.get("media.class") == StringView("Audio/Sink") && o.format.channels == 2; });
+  CHECK(fifo_output != 0 && shape && server.module_of(fifo_output) == sink_module);
+  std::vector<uint8_t> raw = play(fifo_output, 500, 700, 1000, "/tmp/music.output");
+  CHECK(raw.size() % 4 == 0 && raw.size() > 48000 * 4 / 2);
+  std::vector<int16_t> heard = s16_of(raw);
+  if (heard.size() > 2 * 9600) heard.erase(heard.begin(), heard.begin() + 2 * 9600);
+  const double l = tone_level(heard, 2, 0, 500, 48000), r = tone_level(heard, 2, 1, 700, 48000), cross = tone_level(heard, 2, 0, 700, 48000);
+  if (!(l > 0.2 && r > 0.2 && cross < 0.02)) printf("pipe-sink: left %.3f right %.3f cross %.3f (%zu bytes)\n", l, r, cross, raw.size());
+  CHECK(l > 0.2 && r > 0.2 && cross < 0.02);
+  // nobody reading: the pipe fills to its size, the rest is dropped, and the module goes on
+  std::vector<uint8_t> none = play(fifo_output, 500, 700, 2000, "/tmp/music.output", false);
+  CHECK(pipes.pipes["/tmp/music.output"]->bytes.size() > 60000 && pipes.pipes["/tmp/music.output"]->bytes.size() <= 65536);
+  CHECK(pipes.pipes["/tmp/music.output"]->bytes.size() % 4 == 0);      // (whole frames only)
+  pipes.drain("/tmp/music.output");
+  raw = play(fifo_output, 300, 300, 500, "/tmp/music.output");
+  CHECK(raw.size() > 48000 * 4 / 4);
+  CHECK(server.unload_module(sink_module) && !g.is_virtual_sink(fifo_output) && pipes.pipes["/tmp/music.output"]->opens == 0);
+  // another format, rate and channel count, a name and a file of its own
+  const uint32_t f32 = load("file=/tmp/f32.pcm sink_name=floaty format=float32le rate=44100 channels=1", "module-pipe-sink");
+  CHECK(f32 != 0);
+  const uint32_t floaty = virtual_named(g, "floaty");
+  raw = play(floaty, 440, 440, 1000, "/tmp/f32.pcm");
+  CHECK(raw.size() % 4 == 0 && raw.size() > 44100 * 4 / 2);
+  std::vector<int16_t> mono;
+  for (size_t i = 0; i + 3 < raw.size(); i += 4) {
+    float v;
+    memcpy(&v, &raw[i], 4);
+    mono.push_back(int16_t(v * 32767));
+  }
+  if (mono.size() > 8820) mono.erase(mono.begin(), mono.begin() + 8820);
+  const double level = tone_level(mono, 1, 0, 440, 44100);
+  if (!(level > 0.2)) printf("pipe-sink float32 mono 44.1k: %.3f (%zu samples)\n", level, mono.size());
+  CHECK(level > 0.2);
+  CHECK(server.unload_module(f32));
+  // refused: an unknown format, too many channels, a bad rate, a pipe that cannot be made, an argument it does not take
+  CHECK(!load("format=s20le", "module-pipe-sink") && error == 19);
+  CHECK(!load("channels=6", "module-pipe-sink") && error == 19);
+  CHECK(!load("channel_map=front-left,front-right,rear-left", "module-pipe-sink") && error == 19);
+  CHECK(!load("rate=0", "module-pipe-sink") && error == 3);
+  CHECK(!load("file=/missing/x", "module-pipe-sink") && error == 25);
+  CHECK(!load("bogus=1", "module-pipe-sink") && error == 3);
+  List<uint32_t> nodes(A);
+  CHECK(g.virtual_sinks(&nodes) && nodes.count() == 0);      // (nothing left behind by the refused ones)
+
+  // ---- module-pipe-source: what a program writes into the pipe is what records the source hear
+  const uint32_t source_module = load("source_name=piped", "module-pipe-source");
+  CHECK(source_module != 0 && pipes.pipes.count("/tmp/music.input"));
+  uint32_t piped = virtual_named(g, "piped");
+  shape = false;
+  g.visit(piped, [&](const GraphObject& o) { shape = o.props.get("media.class") == StringView("Audio/Source/Virtual"); });
+  CHECK(piped != 0 && shape && g.is_virtual_source(piped) && server.module_of(piped) == source_module);
+  const uint32_t client = g.add_client(Origin::Linux, 91, "protocol-pulse", "pipewire-pulse");
+  // writes (left, right) as `format` into the pipe in odd-sized pieces as the source is recorded for `ms`; the last half's means
+  auto through = [&](const std::string& pipe, uint32_t channels, int16_t left, int16_t right, uint32_t ms, double* ml, double* mr) {
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, piped);
+    if (!rn || !rec) return false;
+    std::vector<uint8_t> frames;
+    for (uint32_t i = 0; i < 48 * ms; ++i) {
+      frames.push_back(uint8_t(left)); frames.push_back(uint8_t(uint16_t(left) >> 8));
+      if (channels == 2) { frames.push_back(uint8_t(right)); frames.push_back(uint8_t(uint16_t(right) >> 8)); }
+    }
+    std::vector<int16_t> got;
+    std::vector<uint8_t> buf(48000 * 4);
+    size_t fed = 0;
+    for (uint32_t t = 0; t < ms; t += 5) {
+      const size_t piece = std::min(frames.size() - fed, size_t(48 * 5 * 2 * channels + 3));      // (5 ms and a bit: frames cut in two)
+      pipes.put(pipe, std::vector<uint8_t>(frames.begin() + fed, frames.begin() + fed + piece));
+      fed += piece;
+      mic.add(240, 0, 0);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t n = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < n; k += 2) got.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    g.destroy_node(rn);
+    const size_t count = got.size() / 2;
+    if (count < 1000) return false;
+    double sl = 0, sr = 0;
+    for (size_t i = count / 2; i < count; ++i) { sl += got[2 * i]; sr += got[2 * i + 1]; }
+    *ml = sl / double(count - count / 2);
+    *mr = sr / double(count - count / 2);
+    return true;
+  };
+  double ml = 0, mr = 0;
+  CHECK(through("/tmp/music.input", 2, 8000, -4000, 1000, &ml, &mr));
+  if (!(ml > 7500 && ml < 8500 && mr < -3500 && mr > -4500)) printf("pipe-source: left %.0f right %.0f\n", ml, mr);
+  CHECK(ml > 7500 && ml < 8500 && mr < -3500 && mr > -4500);
+  // nobody recording: it reads no further than its latency, the rest waits in the pipe
+  pipes.drain("/tmp/music.input");
+  pipes.put("/tmp/music.input", std::vector<uint8_t>(48000 * 4, 0x10));
+  for (int i = 0; i < 20; ++i) { g_now_ns += 5000000; server.tick(); }
+  CHECK(pipes.pipes["/tmp/music.input"]->bytes.size() > 48000 * 4 / 2);
+  pipes.drain("/tmp/music.input");
+  CHECK(server.unload_module(source_module) && !g.is_virtual_source(piped) && pipes.pipes["/tmp/music.input"]->opens == 0);
+  // mono in: both sides, not 3 dB down
+  const uint32_t mono_module = load("source_name=piped file=/tmp/mono.in channels=1", "module-pipe-source");
+  CHECK(mono_module != 0);
+  piped = virtual_named(g, "piped");
+  CHECK(piped != 0);
+  ml = mr = 0;
+  CHECK(through("/tmp/mono.in", 1, 6000, 0, 1000, &ml, &mr));
+  if (!(ml > 5600 && ml < 6400 && mr > 5600 && mr < 6400)) printf("pipe-source mono: left %.0f right %.0f\n", ml, mr);
+  CHECK(ml > 5600 && ml < 6400 && mr > 5600 && mr < 6400);
+  CHECK(server.unload_module(mono_module));
+  CHECK(!load("format=nope", "module-pipe-source") && error == 19);
+  CHECK(!load("file=/missing/y", "module-pipe-source") && error == 25);
+}
+
+// The same modules over the kernel's Linux FIFOs (src/Process/Fifo.hpp through KernelPipeFiles): the pipe is made at /Linux/tmp/..., and another end of it
+// (what a Linux program's open() gets) reads what the sink writes and writes what the source plays.
+static void test_pipe_kernel_fifos() {
+  SystemSync sync;
+  process::UnixSocketManager sockets(sync, A);
+  process::set_system_unix_sockets(&sockets);
+  {
+    filesystem::RamFileSystem fs(A);
+    CHECK(fs.create_directory("/Linux") == filesystem::Status::Ok && fs.create_directory("/Linux/tmp") == filesystem::Status::Ok);
+    FakeDevice dev;
+    audio::AudioMixer mixer(dev, A);
+    CHECK(mixer.initialize());
+    FakeMicrophone mic;
+    audio::AudioCaptureHub hub(mic, A);
+    CHECK(hub.initialize());
+    Graph g(A, &mixer, &hub);
+    CHECK(g.initialize());
+    g.set_clock(&test_clock);
+    PulseServer server(g, A);
+    WindowsAudioService service(g, A);
+    KernelPipeFiles files(A, fs);
+    server.set_pipe_files(&files);
+    uint32_t error = 0;
+    CHECK(!files.open("/nowhere/x"));
+    const uint32_t sink_module = server.load_module("module-pipe-sink", "file=/tmp/out.fifo sink_name=k", &error);
+    CHECK(sink_module != 0);
+    filesystem::DirectoryEntry entry;
+    CHECK(fs.stat("/Linux/tmp/out.fifo", &entry) == filesystem::Status::Ok && process::is_fifo_node("/Linux/tmp/out.fifo", entry));
+    UniquePointer<process::KernelFifo> reader;      // (the program's end)
+    CHECK(process::KernelFifo::open(A, fs, "/Linux/tmp/out.fifo", false, &reader) == filesystem::Status::Ok && reader);
+    uint32_t out = 0, taken = 0;
+    CHECK(service.open(42, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, virtual_named(g, "k")) == 0);
+    std::vector<uint8_t> pcm(48000 * 4);
+    for (uint32_t i = 0; i < 48000; ++i) {
+      const int16_t v = int16_t(8192 * sin(2 * M_PI * 600 * i / 48000));
+      pcm[4 * i] = pcm[4 * i + 2] = uint8_t(v);
+      pcm[4 * i + 1] = pcm[4 * i + 3] = uint8_t(uint16_t(v) >> 8);
+    }
+    std::vector<uint8_t> got, buf(65536);
+    uint64_t written = 0;
+    for (int t = 0; t < 200; ++t) {
+      if (written < pcm.size() && service.write(42, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t n = reader->read(ByteView(buf.data(), buf.size()));
+      got.insert(got.end(), buf.begin(), buf.begin() + n);
+    }
+    service.process_exited(42);
+    std::vector<int16_t> heard = s16_of(got);
+    if (heard.size() > 2 * 9600) heard.erase(heard.begin(), heard.begin() + 2 * 9600);
+    const double level = tone_level(heard, 2, 1, 600, 48000);
+    if (!(level > 0.2)) printf("pipe-sink through a kernel FIFO: %.3f (%zu bytes)\n", level, got.size());
+    CHECK(got.size() % 4 == 0 && level > 0.2);
+    CHECK(server.unload_module(sink_module));
+    reader = UniquePointer<process::KernelFifo>();
+    // the source: a writer's end puts a constant in, a record of the source hears it
+    const uint32_t source_module = server.load_module("module-pipe-source", "file=/tmp/in.fifo source_name=ks", &error);
+    CHECK(source_module != 0);
+    UniquePointer<process::KernelFifo> writer;
+    CHECK(process::KernelFifo::open(A, fs, "/Linux/tmp/in.fifo", false, &writer) == filesystem::Status::Ok && writer);
+    const uint32_t client = g.add_client(Origin::Linux, 92, "protocol-pulse", "pipewire-pulse");
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, virtual_named(g, "ks"));
+    CHECK(rn && rec);
+    std::vector<uint8_t> frame = {0x40, 0x1F, 0x40, 0x1F};      // (8000, 8000)
+    std::vector<uint8_t> piece;
+    for (int i = 0; i < 240; ++i) piece.insert(piece.end(), frame.begin(), frame.end());
+    std::vector<int16_t> recorded;
+    for (int t = 0; t < 200 && rec; ++t) {
+      (void)writer->write(ConstByteView(piece.data(), piece.size()));
+      mic.add(240, 0, 0);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t n = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < n; k += 2) recorded.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    double mean = 0;
+    for (size_t i = recorded.size() / 2; i < recorded.size(); ++i) mean += recorded[i];
+    mean /= std::max<size_t>(1, recorded.size() - recorded.size() / 2);
+    if (!(mean > 7500 && mean < 8500)) printf("pipe-source through a kernel FIFO: mean %.0f (%zu samples)\n", mean, recorded.size());
+    CHECK(recorded.size() > 48000 && mean > 7500 && mean < 8500);
+    if (rn) g.destroy_node(rn);
+    writer = UniquePointer<process::KernelFifo>();
+    CHECK(server.unload_module(source_module));
+  }
+  process::set_system_unix_sockets(nullptr);
+}
+
 // PIPEWIRE_TEST_ONLY=test_a,test_b runs only those (a quicker loop while working on one part); unset, all of them.
 static bool wanted(const char* name) {
   const char* only = getenv("PIPEWIRE_TEST_ONLY");
@@ -7012,6 +7319,8 @@ int main() {
   RUN(test_stream_restore);
   RUN(test_rtp_codings);
   RUN(test_rtp_modules);
+  RUN(test_pipe_modules);
+  RUN(test_pipe_kernel_fifos);
   RUN(test_camera_sources);
   RUN(test_screen_source);
   RUN(test_deep_conversion);

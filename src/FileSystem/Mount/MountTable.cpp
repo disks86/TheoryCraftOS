@@ -383,6 +383,17 @@ Status MountTable::set_metadata(StringView path, const MetadataChange& change) {
   return entry->volume->file_system().set_metadata(rest, change);
 }
 
+Status MountTable::create_special(StringView path, SpecialNode kind) {
+  SharedPointer<Entry> entry;
+  StringView rest;
+  bool root;
+  const Status resolved = resolve(path, &entry, &rest, &root);
+  if (resolved != Status::Ok) return resolved;
+  if (root || rest.equals("/")) return Status::AlreadyExists;      // (a volume's own root)
+  if (!entry->usable()) return Status::NoMedia;
+  return entry->volume->file_system().create_special(rest, kind);
+}
+
 Status MountTable::rename(StringView from, StringView to) {
   SharedPointer<Entry> a, b;
   StringView rest_a, rest_b;

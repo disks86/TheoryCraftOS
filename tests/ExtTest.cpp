@@ -1365,6 +1365,68 @@ static void test_discard(const Variant& v, uint32_t device_block, uint64_t lead)
   if (again.fs) CHECK(discard_test::check_all(*again.fs, files, "after a remount"));
 }
 
+// FIFOs and the other special nodes: one made by mke2fs -d from a host FIFO is reported as one (stat, listing) and cannot be opened for data; one made by
+// create_special is a real FIFO inode to e2fsck and debugfs, and can be renamed and removed.
+static void test_special(const Variant& v) {
+  const std::string dir = g_work + "/special";
+  sh("rm -rf '" + dir + "'; mkdir -p '" + dir + "/sub'");
+  sh("mkfifo '" + dir + "/host.fifo'");
+  spit(dir + "/plain", make_data(100, 3));
+  Mounted mt;
+  CHECK_STATUS(mt.mount(make_image(v, dir), v.block_size, true), Status::Ok);
+  if (!mt.fs) return;
+  IFileSystem& fs = *mt.fs;
+  DirectoryEntry e;
+  CHECK_STATUS(fs.stat("/host.fifo", &e), Status::Ok);
+  CHECK(e.special == SpecialNode::Fifo && e.type == NodeType::File && e.size == 0);
+  CHECK_STATUS(fs.stat("/plain", &e), Status::Ok);
+  CHECK(e.special == SpecialNode::None && e.size == 100);
+  std::map<std::string, DirectoryEntry> entries;
+  list_dir(fs, "/", &entries);
+  CHECK(entries.count("host.fifo") && entries["host.fifo"].special == SpecialNode::Fifo);
+  UniquePointer<IFile> f;
+  CHECK_STATUS(fs.open_file("/host.fifo", OpenMode::Read, &f), Status::Unsupported);
+  CHECK_STATUS(fs.open_file("/host.fifo", OpenMode::ReadWrite, &f), Status::Unsupported);
+  CHECK_STATUS(fs.open_file("/host.fifo", OpenMode::CreateTruncate, &f), Status::Unsupported);
+  // made here
+  CHECK_STATUS(fs.create_special("/sub/made.fifo", SpecialNode::Fifo), Status::Ok);
+  CHECK_STATUS(fs.create_special("/sub/made.fifo", SpecialNode::Fifo), Status::AlreadyExists);
+  CHECK_STATUS(fs.create_special("/plain", SpecialNode::Fifo), Status::AlreadyExists);
+  CHECK_STATUS(fs.create_special("/missing/x", SpecialNode::Fifo), Status::NotFound);
+  CHECK_STATUS(fs.create_special("/sub/none", SpecialNode::None), Status::InvalidArgument);
+  CHECK_STATUS(fs.create_special("/sub/made.sock", SpecialNode::Socket), Status::Ok);
+  CHECK_STATUS(fs.stat("/sub/made.fifo", &e), Status::Ok);
+  CHECK(e.special == SpecialNode::Fifo && e.size == 0);
+  CHECK_STATUS(fs.stat("/sub/made.sock", &e), Status::Ok);
+  CHECK(e.special == SpecialNode::Socket);
+  CHECK_STATUS(fs.flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
+  {
+    const std::string img = g_work + "/special.img", out = g_work + "/debugfs.log";
+    spit(img, mt.image());
+    sh("debugfs -R 'stat /sub/made.fifo' '" + img + "' > '" + out + "' 2>&1");
+    Bytes text = slurp(out);
+    const std::string log(text.begin(), text.end());
+    CHECK(log.find("Type: FIFO") != std::string::npos);
+    sh("debugfs -R 'ls -l /sub' '" + img + "' > '" + out + "' 2>&1");
+    text = slurp(out);
+    const std::string listing(text.begin(), text.end());
+    CHECK(listing.find("10644") != std::string::npos);       // (the FIFO's mode, as ls -l of debugfs prints it)
+    CHECK(listing.find("140644") != std::string::npos);      // (the socket's)
+  }
+  CHECK_STATUS(fs.rename("/sub/made.fifo", "/moved.fifo"), Status::Ok);
+  CHECK_STATUS(fs.stat("/moved.fifo", &e), Status::Ok);
+  CHECK(e.special == SpecialNode::Fifo);
+  CHECK_STATUS(fs.stat("/sub/made.fifo", &e), Status::NotFound);
+  CHECK_STATUS(fs.remove("/moved.fifo"), Status::Ok);
+  CHECK_STATUS(fs.remove("/host.fifo"), Status::Ok);
+  CHECK_STATUS(fs.remove("/sub/made.sock"), Status::Ok);
+  CHECK_STATUS(fs.remove("/sub"), Status::Ok);
+  CHECK_STATUS(fs.stat("/moved.fifo", &e), Status::NotFound);
+  CHECK_STATUS(fs.flush(), Status::Ok);
+  CHECK_FSCK(mt.image());
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   g_verbose = getenv("EXT_VERBOSE") != nullptr;
@@ -1403,6 +1465,7 @@ int main(int argc, char** argv) {
     for (size_t i : {0, 1, 3}) test_unwritten(ext4[i]);
   }
   if (want("handles")) test_handles();
+  if (want("fifo")) for (size_t i : {size_t{0}, size_t{3}, size_t{5}, size_t{7}, size_t{9}}) test_special(variants[i]);
   if (want("times")) for (size_t i : {size_t{0}, size_t{2}, size_t{7}, size_t{8}, size_t{10}}) test_timestamps(variants[i]);
   if (want("mount")) { test_mount_rules(); test_mount_rules_ext4(); }
   if (want("discard")) {

@@ -29,7 +29,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <set>
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Process/Fifo.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
@@ -1139,6 +1141,394 @@ static void test_churn() {
   for (std::thread& th : threads) th.join();
 }
 
+// --- named pipes (FIFOs) ----------------------------------------------------------------------------------------------------------------------------------------
+
+enum : uint64_t { kMknod = 133, kMknodat = 259, kRename = 82, kGetdents64 = 217, kPipe2 = 293, kOpenat = 257, kPread = 17 };
+constexpr uint64_t kORdOnly = 0, kOWrOnly = 1, kORdWr = 2, kONonBlock = 0x800, kOCreat = 0x40, kOExcl = 0x80, kODirectory = 0x10000;
+constexpr uint32_t kSIfIfo = 010000, kSIfReg = 0100000, kSIfMt = 0170000;
+constexpr int64_t kEnxio = 6, kEnotdir = 20, kEspipe = 29;
+
+// A RAM file system that also keeps Unix node types, as ext does (IFileSystem::create_special): the Linux layer makes real FIFO nodes on it instead of
+// remembering plain files.
+struct SpecialFs final : filesystem::IFileSystem {
+  filesystem::RamFileSystem ram{A};
+  std::set<std::string> fifos;
+  std::mutex m;
+  static std::string key(StringView p) { return std::string(p.data(), p.size()); }
+  filesystem::FileSystemInfo info() const override { return ram.info(); }
+  Status open_file(StringView path, filesystem::OpenMode mode, UniquePointer<filesystem::IFile>* file) override {
+    { std::lock_guard<std::mutex> g(m); if (fifos.count(key(path))) return Status::Unsupported; }
+    return ram.open_file(path, mode, file);
+  }
+  struct Listing final : filesystem::IDirectory {
+    SpecialFs& fs;
+    std::string path;
+    UniquePointer<filesystem::IDirectory> inner;
+    Listing(SpecialFs& f, std::string p, UniquePointer<filesystem::IDirectory> d) : fs(f), path(std::move(p)), inner(static_cast<UniquePointer<filesystem::IDirectory>&&>(d)) {}
+    Status next(filesystem::DirectoryEntry* e) override {
+      const Status s = inner->next(e);
+      std::lock_guard<std::mutex> g(fs.m);
+      if (s == Status::Ok && fs.fifos.count(path + "/" + std::string(e->name.view().data(), e->name.view().size()))) e->special = filesystem::SpecialNode::Fifo;
+      return s;
+    }
+    void rewind() override { inner->rewind(); }
+  };
+  Status open_directory(StringView path, UniquePointer<filesystem::IDirectory>* d) override {
+    UniquePointer<filesystem::IDirectory> inner;
+    const Status s = ram.open_directory(path, &inner);
+    if (s != Status::Ok) return s;
+    *d = UniquePointer<filesystem::IDirectory>::make_as<Listing>(A, *this, key(path), static_cast<UniquePointer<filesystem::IDirectory>&&>(inner));
+    return Status::Ok;
+  }
+  Status stat(StringView path, filesystem::DirectoryEntry* e) override {
+    const Status s = ram.stat(path, e);
+    std::lock_guard<std::mutex> g(m);
+    if (s == Status::Ok && fifos.count(key(path))) e->special = filesystem::SpecialNode::Fifo;
+    return s;
+  }
+  Status create_directory(StringView path) override { return ram.create_directory(path); }
+  Status remove(StringView path) override {
+    const Status s = ram.remove(path);
+    std::lock_guard<std::mutex> g(m);
+    if (s == Status::Ok) fifos.erase(key(path));
+    return s;
+  }
+  Status rename(StringView from, StringView to) override {
+    const Status s = ram.rename(from, to);
+    std::lock_guard<std::mutex> g(m);
+    if (s == Status::Ok && fifos.erase(key(from))) fifos.insert(key(to));
+    return s;
+  }
+  Status flush() override { return Status::Ok; }
+  Status create_special(StringView path, filesystem::SpecialNode kind) override {
+    if (kind != filesystem::SpecialNode::Fifo) return Status::Unsupported;
+    UniquePointer<filesystem::IFile> f;
+    filesystem::DirectoryEntry e;
+    if (ram.stat(path, &e) == Status::Ok) return Status::AlreadyExists;
+    const Status s = ram.open_file(path, filesystem::OpenMode::CreateOrOpen, &f);
+    std::lock_guard<std::mutex> g(m);
+    if (s == Status::Ok) fifos.insert(key(path));
+    return s;
+  }
+};
+
+static uint32_t stat_mode(Proc& l, const std::string& path, int64_t* result) {
+  const uint64_t buf = l.alloc(144);
+  *result = l.sys(kStat, l.text(path), buf);
+  return l.memory.get32(buf + 24);
+}
+static uint32_t fstat_mode(Proc& l, int64_t fd) {
+  const uint64_t buf = l.alloc(144);
+  return l.sys(kFstat, fd, buf) == 0 ? l.memory.get32(buf + 24) : 0;
+}
+static uint32_t poll_one(Proc& l, int64_t fd, uint16_t events, uint64_t ms = 0) {
+  const uint64_t fds = l.alloc(8);
+  l.memory.put32(fds, uint32_t(fd)); l.memory.put32(fds + 4, events);
+  return l.sys(kPoll, fds, 1, ms) == 1 ? (l.memory.get32(fds + 4) >> 16) : 0;
+}
+static std::string lread(Proc& l, int64_t fd, uint64_t n, int64_t* result) {
+  const uint64_t at = l.alloc(n ? n : 1);
+  *result = l.sys(kRead, fd, at, n);
+  return *result > 0 ? l.memory.str(at, size_t(*result)) : std::string();
+}
+
+// The calls one at a time: mknod's types, POSIX's open rules without waiting, EOF, EPIPE, POLLHUP/POLLERR, PIPE_BUF, the pipe's size, unlink and rename
+// while open, getdents, readv/writev, fcntl, pipe2's fstat. `fs` is a plain RAM file system (FIFOs remembered by name) or one with FIFO nodes.
+static void run_linux_fifo(filesystem::IFileSystem& fs, bool real_nodes) {
+  Proc l(180, SyscallAbi::Linux, &fs);
+  int64_t r = 0;
+  CHECK(l.sys(kMknod, l.text("/tmp/f"), kSIfIfo | 0644, 0) == 0);
+  CHECK(l.sys(kMknod, l.text("/tmp/f"), kSIfIfo | 0644, 0) == -kEexist);
+  CHECK(l.sys(kMknod, l.text("/nope/f"), kSIfIfo | 0644, 0) == -kEnoent);
+  CHECK(l.sys(kMknodat, uint64_t(-100), l.text("/tmp/c"), 020644, 0x0501) == -kEperm);      // (a character device)
+  CHECK(l.sys(kMknodat, uint64_t(-100), l.text("/tmp/d"), 040755, 0) == -kEinval);
+  CHECK(l.sys(kMknodat, uint64_t(-100), l.text("/tmp/regular"), 0644, 0) == 0);            // (type 0: a regular file)
+  CHECK((stat_mode(l, "/tmp/regular", &r) & kSIfMt) == kSIfReg && r == 0);
+  CHECK((stat_mode(l, "/tmp/f", &r) & kSIfMt) == kSIfIfo && r == 0);
+  filesystem::DirectoryEntry entry;
+  CHECK(fs.stat("/Linux/tmp/f", &entry) == Status::Ok && (entry.special == filesystem::SpecialNode::Fifo) == real_nodes);
+  // every mode's type bits: only the five allowed ones are taken (a sweep in place of bit flips: the call parses nothing else)
+  for (uint32_t type = 0; type < 16; ++type) {
+    const std::string name = "/tmp/m" + std::to_string(type);
+    const int64_t got = l.sys(kMknod, l.text(name), (type << 12) | 0644, 0);
+    const bool ok_type = type == 0 || type == 010 || type == 01;
+    CHECK(ok_type ? got == 0 : got < 0);
+    if (got == 0) CHECK(l.sys(kUnlink, l.text(name)) == 0);
+  }
+  // writing only, not waiting, nobody reading: ENXIO
+  CHECK(l.sys(kOpen, l.text("/tmp/f"), kOWrOnly | kONonBlock) == -kEnxio);
+  CHECK(l.sys(kOpen, l.text("/tmp/f"), kOCreat | kOExcl | kORdWr) == -kEexist);
+  CHECK(l.sys(kOpen, l.text("/tmp/f"), kODirectory | kORdOnly | kONonBlock) == -kEnotdir);
+  const int64_t rd = l.sys(kOpen, l.text("/tmp/f"), kORdOnly | kONonBlock);
+  CHECK(rd >= 3);
+  CHECK((fstat_mode(l, rd) & kSIfMt) == kSIfIfo);
+  CHECK(l.sys(kFcntl, rd, 3) == int64_t(kORdOnly | kONonBlock));
+  CHECK(l.sys(kFcntl, rd, 1032) == 65536);
+  CHECK(poll_one(l, rd, 1 | 4) == 0);      // (no writer ever: neither POLLIN nor POLLHUP)
+  CHECK(lread(l, rd, 16, &r).empty() && r == 0);      // (no writer: the end of the file)
+  const int64_t wr = l.sys(kOpen, l.text("/tmp/f"), kOWrOnly | kONonBlock);
+  CHECK(wr >= 3);
+  CHECK(l.sys(kFcntl, wr, 3) == int64_t(kOWrOnly | kONonBlock));
+  CHECK(lread(l, rd, 16, &r).empty() && r == -kEagain);      // (a writer now: nothing yet)
+  CHECK(poll_one(l, wr, 4) == 4);
+  CHECK(l.sys(kWrite, wr, l.data("hello"), 5) == 5);
+  CHECK(poll_one(l, rd, 1) == 1);
+  const uint64_t n = l.alloc(4);
+  CHECK(l.sys(kIoctl, rd, 0x541B, n) == 0 && l.memory.get32(n) == 5);
+  CHECK(l.sys(kRead, wr, l.alloc(4), 4) == -kEbadf && l.sys(kWrite, rd, l.data("x"), 1) == -kEbadf);
+  CHECK(lread(l, rd, 3, &r) == "hel" && lread(l, rd, 16, &r) == "lo");
+  CHECK(l.sys(kPread, rd, l.alloc(4), 4, 0) == -kEspipe);
+  // the pipe's size: 64 KiB, then EAGAIN; a write of up to PIPE_BUF goes in whole or not at all
+  const std::string big(65536 + 100, 'b');
+  CHECK(l.sys(kWrite, wr, l.data(big), big.size()) == 65536);
+  CHECK(l.sys(kWrite, wr, l.data("x"), 1) == -kEagain);
+  CHECK(poll_one(l, wr, 4) == 0);
+  CHECK(lread(l, rd, 65536, &r).size() == 65536);
+  CHECK(l.sys(kWrite, wr, l.data(std::string(65536 - 4095, 'c')), 65536 - 4095) == 65536 - 4095);      // (4095 bytes of room left)
+  CHECK(l.sys(kWrite, wr, l.data(std::string(4096, 'd')), 4096) == -kEagain);
+  CHECK(l.sys(kWrite, wr, l.data(std::string(4095, 'd')), 4095) == 4095);
+  CHECK(lread(l, rd, 65536, &r) == std::string(65536 - 4095, 'c') + std::string(4095, 'd'));
+  // readv / writev
+  {
+    const uint64_t iov = l.alloc(32), a = l.data("ab"), b = l.data("cde");
+    l.memory.put64(iov, a); l.memory.put64(iov + 8, 2); l.memory.put64(iov + 16, b); l.memory.put64(iov + 24, 3);
+    CHECK(l.sys(kWritev, wr, iov, 2) == 5);
+    const uint64_t x = l.alloc(4), y = l.alloc(8);
+    l.memory.put64(iov, x); l.memory.put64(iov + 8, 4); l.memory.put64(iov + 16, y); l.memory.put64(iov + 24, 8);
+    CHECK(l.sys(kReadv, rd, iov, 2) == 5 && l.memory.str(x, 4) == "abcd" && l.memory.str(y, 1) == "e");
+    CHECK(l.sys(kReadv, rd, iov, 2) == -kEagain);
+  }
+  // the writer goes: POLLHUP for the reader, the end of the file
+  CHECK(l.sys(kWrite, wr, l.data("tail"), 4) == 4);
+  CHECK(l.sys(kClose, wr) == 0);
+  CHECK(poll_one(l, rd, 1) == (1 | 0x10));
+  CHECK(lread(l, rd, 16, &r) == "tail" && lread(l, rd, 16, &r).empty() && r == 0);
+  CHECK(poll_one(l, rd, 1) == 0x10);
+  // the reader goes: EPIPE and POLLERR for a writer
+  const int64_t w2 = l.sys(kOpen, l.text("/tmp/f"), kOWrOnly | kONonBlock);
+  CHECK(w2 >= 3);
+  CHECK(l.sys(kClose, rd) == 0);
+  CHECK(l.sys(kWrite, w2, l.data("x"), 1) == -kEpipe);
+  CHECK((poll_one(l, w2, 4) & 8) == 8);
+  CHECK(l.sys(kClose, w2) == 0);
+  // reading and writing at once: never waits; what was left goes with the last end
+  const int64_t both = l.sys(kOpen, l.text("/tmp/f"), kORdWr);
+  CHECK(both >= 3 && l.sys(kFcntl, both, 3) == int64_t(kORdWr));
+  CHECK(l.sys(kWrite, both, l.data("left"), 4) == 4);
+  CHECK(l.sys(kClose, both) == 0);
+  const int64_t again = l.sys(kOpen, l.text("/tmp/f"), kORdWr | kONonBlock);
+  CHECK(lread(l, again, 16, &r).empty() && r == -kEagain);
+  // unlinked while open: the open end keeps its pipe; a FIFO made again at the name has a new one
+  CHECK(l.sys(kWrite, again, l.data("old"), 3) == 3);
+  CHECK(l.sys(kUnlink, l.text("/tmp/f")) == 0);
+  CHECK(stat_mode(l, "/tmp/f", &r) == 0 || r == -kEnoent);
+  CHECK(r == -kEnoent);
+  CHECK(l.sys(kMknod, l.text("/tmp/f"), kSIfIfo | 0600, 0) == 0);
+  const int64_t fresh = l.sys(kOpen, l.text("/tmp/f"), kORdWr | kONonBlock);
+  CHECK(lread(l, fresh, 16, &r).empty() && r == -kEagain);
+  CHECK(lread(l, again, 16, &r) == "old");
+  CHECK(l.sys(kClose, fresh) == 0 && l.sys(kClose, again) == 0);
+  // renamed while open: a new open of the new name gets the same pipe
+  const int64_t held = l.sys(kOpen, l.text("/tmp/f"), kORdWr | kONonBlock);
+  CHECK(l.sys(kWrite, held, l.data("moved"), 5) == 5);
+  CHECK(l.sys(kRename, l.text("/tmp/f"), l.text("/tmp/g")) == 0);
+  CHECK((stat_mode(l, "/tmp/g", &r) & kSIfMt) == kSIfIfo && r == 0);
+  const int64_t by_new_name = l.sys(kOpen, l.text("/tmp/g"), kORdOnly | kONonBlock);
+  CHECK(lread(l, by_new_name, 16, &r) == "moved");
+  CHECK(l.sys(kClose, by_new_name) == 0 && l.sys(kClose, held) == 0);
+  // getdents: DT_FIFO
+  {
+    const int64_t dir = l.sys(kOpen, l.text("/tmp"), kODirectory);
+    const uint64_t buf = l.alloc(4096);
+    const int64_t got = l.sys(kGetdents64, dir, buf, 4096);
+    bool seen = false;
+    for (int64_t at = 0; at < got;) {
+      const uint16_t length = uint16_t(l.memory.get32(buf + at + 16) & 0xFFFF);
+      if (length == 0) break;
+      if (std::string(reinterpret_cast<const char*>(l.memory.at(buf + at + 19))) == "g") seen = l.memory.at(buf + at + 18)[0] == 1;
+      at += length;
+    }
+    CHECK(seen);
+    CHECK(l.sys(kClose, dir) == 0);
+  }
+  // epoll sees a FIFO like a socket
+  {
+    const int64_t ep = l.sys(kEpollCreate1, 0), end = l.sys(kOpen, l.text("/tmp/g"), kORdWr | kONonBlock);
+    const uint64_t ev = l.alloc(12), out = l.alloc(12 * 4);
+    l.memory.put32(ev, 1); l.memory.put64(ev + 4, 42);
+    CHECK(l.sys(kEpollCtl, ep, 1, end, ev) == 0);
+    CHECK(l.sys(kEpollWait, ep, out, 4, 0) == 0);
+    CHECK(l.sys(kWrite, end, l.data("e"), 1) == 1);
+    CHECK(l.sys(kEpollWait, ep, out, 4, 0) == 1 && l.memory.get64(out + 4) == 42);
+    CHECK(l.sys(kClose, end) == 0 && l.sys(kClose, ep) == 0);
+  }
+  // a kernel end (what module-pipe-sink/-source hold) and a program's end of one FIFO
+  {
+    UniquePointer<KernelFifo> k;
+    CHECK(KernelFifo::open(A, fs, "/Linux/tmp/g", false, &k) == Status::Ok && k);
+    CHECK(KernelFifo::open(A, fs, "/Linux/tmp/regular", false, &k) == Status::InvalidArgument && !k);
+    CHECK(KernelFifo::open(A, fs, "/Linux/tmp/none", false, &k) == Status::NotFound);
+    CHECK(KernelFifo::open(A, fs, "/Linux/tmp/made", true, &k) == Status::Ok && k);
+    CHECK((stat_mode(l, "/tmp/made", &r) & kSIfMt) == kSIfIfo);
+    const int64_t prog = l.sys(kOpen, l.text("/tmp/made"), kOWrOnly | kONonBlock);      // (the kernel's end reads: no ENXIO)
+    CHECK(prog >= 3);
+    CHECK(l.sys(kWrite, prog, l.data("to kernel"), 9) == 9);
+    uint8_t got[32];
+    CHECK(k->queued() == 9 && k->read(ByteView(got, sizeof got)) == 9 && memcmp(got, "to kernel", 9) == 0);
+    CHECK(k->read(ByteView(got, sizeof got)) == 0);
+    CHECK(l.sys(kClose, prog) == 0);
+    CHECK(k->read(ByteView(got, sizeof got)) == 0);      // (it writes too: no end of the file for it)
+    const int64_t reader = l.sys(kOpen, l.text("/tmp/made"), kORdOnly);      // (does not wait: the kernel's end writes)
+    CHECK(reader >= 3);
+    CHECK(k->write(ConstByteView(reinterpret_cast<const uint8_t*>("from kernel"), 11)) == 11);
+    CHECK(lread(l, reader, 32, &r) == "from kernel");
+    k = UniquePointer<KernelFifo>();
+    CHECK(lread(l, reader, 32, &r).empty() && r == 0);      // (the kernel's end gone: no writer left)
+    CHECK(l.sys(kClose, reader) == 0);
+  }
+  // pipe2's ends are pipes to fstat too
+  {
+    const uint64_t fds = l.alloc(8);
+    CHECK(l.sys(kPipe2, fds, 0) == 0);
+    const int64_t a = l.memory.get32(fds), b = l.memory.get32(fds + 4);
+    CHECK((fstat_mode(l, a) & kSIfMt) == kSIfIfo && (fstat_mode(l, b) & kSIfMt) == kSIfIfo && l.sys(kFcntl, a, 1032) == 65536);
+    CHECK(l.sys(kClose, a) == 0 && l.sys(kClose, b) == 0);
+  }
+  for (const char* name : {"/tmp/g", "/tmp/made", "/tmp/regular"}) CHECK(l.sys(kUnlink, l.text(name)) == 0);
+  CHECK(stat_mode(l, "/tmp/g", &r) == 0 || r == -kEnoent);
+}
+
+static void test_linux_fifo() {
+  {
+    System sys;
+    run_linux_fifo(sys.fs, false);
+    CHECK(!sys.sockets.has_fifo_marks());      // (every name it made was unlinked)
+  }
+  {
+    System sys;
+    SpecialFs special;
+    populate(special.ram);
+    run_linux_fifo(special, true);
+    CHECK(!sys.sockets.has_fifo_marks() && special.fifos.empty());
+  }
+  // the names of a file system without FIFO nodes, as directories are renamed and removed under them
+  System sys;
+  CHECK(sys.sockets.fifo_mark("/a/b/one") == UnixStatus::Ok && sys.sockets.fifo_mark("/a/b/one") == UnixStatus::Ok);
+  CHECK(sys.sockets.fifo_mark("/a/bc") == UnixStatus::Ok && sys.sockets.fifo_mark("") == UnixStatus::Invalid);
+  sys.sockets.fifo_path_moved("/a/b", "/z");
+  CHECK(sys.sockets.fifo_marked("/z/one") && !sys.sockets.fifo_marked("/a/b/one") && sys.sockets.fifo_marked("/a/bc"));
+  sys.sockets.fifo_path_gone("/z");
+  CHECK(!sys.sockets.fifo_marked("/z/one") && sys.sockets.fifo_marked("/a/bc"));
+  sys.sockets.fifo_path_moved("/q", "/a/bc");      // (renamed over: forgotten)
+  CHECK(!sys.sockets.fifo_marked("/a/bc") && !sys.sockets.has_fifo_marks());
+  for (uint32_t i = 0; i < UnixSocketManager::kMaxFifoPaths; ++i) CHECK(sys.sockets.fifo_mark(("/n" + std::to_string(i)).c_str()) == UnixStatus::Ok);
+  CHECK(sys.sockets.fifo_mark("/one-too-many") == UnixStatus::NoMemory);
+  sys.sockets.fifo_path_gone("/");
+  CHECK(!sys.sockets.has_fifo_marks());
+}
+
+// Blocking: an open() for reading waits for a writer and one for writing for a reader (in either order, from two processes), a read waits for data and a
+// write for room; several writers' PIPE_BUF-sized records come out whole; 1 MiB goes through the 64 KiB pipe in order.
+static void test_fifo_threads() {
+  System sys;
+  Proc a(190, SyscallAbi::Linux, &sys.fs), b(191, SyscallAbi::Linux, &sys.fs);
+  CHECK(a.sys(kMknod, a.text("/tmp/t"), kSIfIfo | 0644, 0) == 0);
+  for (int order = 0; order < 2; ++order) {
+    std::atomic<int64_t> opened{-1};
+    std::thread waiter([&] { opened = order == 0 ? a.sys(kOpen, a.text("/tmp/t"), kORdOnly) : a.sys(kOpen, a.text("/tmp/t"), kOWrOnly); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(opened.load() == -1);      // (still waiting for its partner)
+    const int64_t mine = order == 0 ? b.sys(kOpen, b.text("/tmp/t"), kOWrOnly) : b.sys(kOpen, b.text("/tmp/t"), kORdOnly);
+    waiter.join();
+    CHECK(mine >= 3 && opened.load() >= 3);
+    const int64_t reader = order == 0 ? opened.load() : mine, writer = order == 0 ? mine : opened.load();
+    Proc& rp = order == 0 ? a : b;
+    Proc& wp = order == 0 ? b : a;
+    // a read waits for the write
+    std::atomic<bool> got{false};
+    std::thread r([&] {
+      int64_t n = 0;
+      CHECK(lread(rp, reader, 16, &n) == "wake");
+      got = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(!got.load());
+    CHECK(wp.sys(kWrite, writer, wp.data("wake"), 4) == 4);
+    r.join();
+    CHECK(rp.sys(kClose, reader) == 0 && wp.sys(kClose, writer) == 0);
+  }
+  // A writer that came and went while a reader waited still ends the reader's wait (Linux: the writer count changed).
+  {
+    std::atomic<int64_t> opened{-1};
+    std::thread waiter([&] { opened = a.sys(kOpen, a.text("/tmp/t"), kORdOnly); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    // (a writer that does not wait needs a reader: the waiting reader counts already)
+    const int64_t w = b.sys(kOpen, b.text("/tmp/t"), kOWrOnly | kONonBlock);
+    CHECK(w >= 3 && b.sys(kClose, w) == 0);
+    waiter.join();
+    CHECK(opened.load() >= 3);
+    int64_t n = 0;
+    CHECK(lread(a, opened.load(), 4, &n).empty() && n == 0);
+    CHECK(a.sys(kClose, opened.load()) == 0);
+  }
+  // 4 writers x 64 records of 4096 bytes (each all one letter), one reader: every record whole, all of them there
+  {
+    std::atomic<int64_t> reader_fd{-1};
+    std::thread opener([&] { reader_fd = a.sys(kOpen, a.text("/tmp/t"), kORdOnly); });
+    std::vector<std::thread> writers;
+    std::vector<int64_t> wfds(4);
+    for (int w = 0; w < 4; ++w) wfds[w] = b.sys(kOpen, b.text("/tmp/t"), kOWrOnly);
+    opener.join();
+    for (int w = 0; w < 4; ++w)
+      writers.emplace_back([&, w] {
+        for (int i = 0; i < 64; ++i) CHECK(b.sys(kWrite, wfds[w], b.data(std::string(4096, char('A' + w))), 4096) == 4096);
+        CHECK(b.sys(kClose, wfds[w]) == 0);
+      });
+    std::string all;
+    for (;;) {
+      int64_t n = 0;
+      const std::string piece = lread(a, reader_fd.load(), 10000, &n);
+      if (n <= 0) { CHECK(n == 0); break; }
+      all += piece;
+    }
+    for (std::thread& t : writers) t.join();
+    CHECK(all.size() == 4u * 64 * 4096);
+    int counts[4] = {};
+    bool whole = all.size() % 4096 == 0;
+    for (size_t at = 0; whole && at < all.size(); at += 4096) {
+      const char c = all[at];
+      whole = c >= 'A' && c <= 'D' && all.compare(at, 4096, std::string(4096, c)) == 0;
+      if (whole) ++counts[c - 'A'];
+    }
+    CHECK(whole && counts[0] == 64 && counts[1] == 64 && counts[2] == 64 && counts[3] == 64);
+    CHECK(a.sys(kClose, reader_fd.load()) == 0);
+  }
+  // 1 MiB in one write(), read back in order by another process's thread
+  {
+    std::string data(1 << 20, 0);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = char(i * 7 + (i >> 11));
+    std::atomic<int64_t> rfd{-1};
+    std::thread opener([&] { rfd = a.sys(kOpen, a.text("/tmp/t"), kORdOnly); });
+    const int64_t w = b.sys(kOpen, b.text("/tmp/t"), kOWrOnly);
+    opener.join();
+    std::string got;
+    std::thread reader([&] {
+      for (;;) {
+        int64_t n = 0;
+        const std::string piece = lread(a, rfd.load(), 3000, &n);
+        if (n <= 0) break;
+        got += piece;
+      }
+    });
+    CHECK(b.sys(kWrite, w, b.data(data), data.size()) == int64_t(data.size()));
+    CHECK(b.sys(kClose, w) == 0);
+    reader.join();
+    CHECK(got == data);
+    CHECK(a.sys(kClose, rfd.load()) == 0);
+  }
+  CHECK(a.sys(kUnlink, a.text("/tmp/t")) == 0);
+}
+
 int main() {
   const int before = A.live.load();
   printf("-- codec\n"); fflush(stdout); test_codec();
@@ -1151,6 +1541,8 @@ int main() {
   printf("-- linux_timerfd\n"); fflush(stdout); test_linux_timerfd();
   printf("-- linux_epoll\n"); fflush(stdout); test_linux_epoll();
   printf("-- linux_pi_futex\n"); fflush(stdout); test_linux_pi_futex();
+  printf("-- linux_fifo\n"); fflush(stdout); test_linux_fifo();
+  printf("-- fifo_threads\n"); fflush(stdout); test_fifo_threads();
   printf("-- windows\n"); fflush(stdout); test_windows();
   printf("-- cross_world\n"); fflush(stdout); test_cross_world();
   printf("-- threads\n"); fflush(stdout); test_threads();

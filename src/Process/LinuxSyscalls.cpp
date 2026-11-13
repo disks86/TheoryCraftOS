@@ -37,7 +37,7 @@ constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
 enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, ClockGetres, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, ClockNanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Time, Getppid, Madvise,
-  Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
+  Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Mknod, Mknodat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
   EpollCtl, EpollWait, EpollPwait, EpollPwait2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
@@ -63,7 +63,7 @@ constexpr NumberEntry kNumbers[] = {
     {28, 233, Call::Madvise},
     {2, kAbsent, Call::Open},      {4, kAbsent, Call::Stat},    {6, kAbsent, Call::Lstat},    {17, 67, Call::Pread},
     {18, 68, Call::Pwrite},        {19, 65, Call::Readv},       {217, 61, Call::Getdents64},  {83, kAbsent, Call::Mkdir},
-    {258, 34, Call::Mkdirat},      {84, kAbsent, Call::Rmdir},  {87, kAbsent, Call::Unlink},  {263, 35, Call::Unlinkat},
+    {258, 34, Call::Mkdirat},      {133, kAbsent, Call::Mknod}, {259, 33, Call::Mknodat},      {84, kAbsent, Call::Rmdir},  {87, kAbsent, Call::Unlink},  {263, 35, Call::Unlinkat},
     {82, kAbsent, Call::Rename},   {264, 38, Call::Renameat},   {316, 276, Call::Renameat2},  {79, 17, Call::Getcwd},
     {80, 49, Call::Chdir},         {81, 50, Call::Fchdir},      {21, kAbsent, Call::Access},  {269, 48, Call::Faccessat},
     {439, 439, Call::Faccessat},   {76, 45, Call::Truncate},    {77, 46, Call::Ftruncate},    {74, 82, Call::Fsync},
@@ -365,6 +365,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Getdents64: return linuxabi::sys_getdents64(process, a[0], a[1], a[2]);
       case Call::Mkdir: return linuxabi::sys_mkdirat(process, kAtFdCwd, a[0]);
       case Call::Mkdirat: return linuxabi::sys_mkdirat(process, a[0], a[1]);
+      case Call::Mknod: return linuxabi::sys_mknodat(process, kAtFdCwd, a[0], a[1], a[2]);
+      case Call::Mknodat: return linuxabi::sys_mknodat(process, a[0], a[1], a[2], a[3]);
       case Call::Rmdir: return linuxabi::sys_unlinkat(process, kAtFdCwd, a[0], 0x200);
       case Call::Unlink: return linuxabi::sys_unlinkat(process, kAtFdCwd, a[0], 0);
       case Call::Unlinkat: return linuxabi::sys_unlinkat(process, a[0], a[1], a[2]);

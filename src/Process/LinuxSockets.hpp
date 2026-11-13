@@ -29,6 +29,13 @@ namespace process::linuxabi {
 uint64_t sys_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol);
 uint64_t sys_socketpair(Process& p, uint64_t domain, uint64_t type, uint64_t protocol, uint64_t pair);
 uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags);
+// open() of a named pipe (Fifo.hpp) at `host_path`: a new end, reading and/or writing, waiting for a partner as POSIX says unless `non_blocking`.
+// The descriptor, or -errno (ENXIO: writing only, not waiting, and no reader; EINTR: the wait was cut short).
+uint64_t fifo_open(Process& p, StringView host_path, bool reading, bool writing, bool non_blocking, bool close_on_exec);
+// fstat(): a pipe's end (a FIFO's, or pipe2's)?
+bool is_pipe_descriptor(Process& p, uint64_t fd);
+// F_GETFL's access mode of a FIFO's end (0 O_RDONLY, 1 O_WRONLY, 2 O_RDWR); -1 for anything else.
+int fifo_access_mode(Process& p, uint64_t fd);
 uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags);      // (eventfd(initial) is eventfd2(initial, 0))
 uint64_t sys_timerfd_create(Process& p, uint64_t clock, uint64_t flags);
 uint64_t sys_timerfd_settime(Process& p, uint64_t fd, uint64_t flags, uint64_t value, uint64_t old);

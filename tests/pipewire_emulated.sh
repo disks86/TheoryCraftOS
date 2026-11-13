@@ -15,7 +15,10 @@
 # plays a MIDI file (all 12 notes must reach the server's synthesizer), and tests/linux/pwmedia.c (built against the host's libpipewire) runs each of its
 # modes: a driver camera and a watcher (video), the same with the camera's own memfd buffers (video-alloc), a pw_filter's MIDI heard by a pw_stream
 # (midi), and a virtual sink of the adapter factory played into by an audio driver and recorded from (adapter).
-# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|nullsource|xaudio2|pwnode|libpipewire]   (the Linux program's CPU, default x86_64; which runs, default all).
+# A pipe run (TCOS_EMU_PIPE) loads module-pipe-sink and module-pipe-source over the kernel's Linux FIFOs: tests/linux/fifotest.c makes, opens, reads and
+# writes a FIFO of its own (mkfifo, POSIX open rules, EOF, POLLHUP), reads the 440 Hz the emulator plays into the pipe sink from /tmp/music.output, and
+# writes a 600 Hz triangle into /tmp/music.input that the emulator must hear from the pipe source.
+# Usage: tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|nullsource|xaudio2|pwnode|libpipewire|pipe]   (the Linux program's CPU, default x86_64; which runs, default all).
 # Needs mingw, clang and rust's ld.lld.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -65,6 +68,8 @@ clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestand
   -Wall -Wextra -o "$work/pulsetest-$arch" tests/linux/pulsetest.c
 clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables "${linker[@]}" \
   -Wall -Wextra -o "$work/pwnodetest-$arch" tests/linux/pwnodetest.c
+clang --target="$arch-linux-gnu" "${extra[@]}" -O1 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -fno-asynchronous-unwind-tables "${linker[@]}" \
+  -Wall -Wextra -o "$work/fifotest-$arch" tests/linux/fifotest.c
 
 fail=0
 if [ "$which" = all ] || [ "$which" = winmm ]; then
@@ -131,6 +136,18 @@ assert m, "no audio summary"
 t300, t400, t500, t600, t700, together = map(int, m.groups())
 ok = 2200 < t300 < 2800 and 2400 < t400 < 3200 and 1800 < t500 < 2400 and 2400 < t600 < 3300 and together > 1500
 print("ok   the mix holds XAudio2's tones with the others" if ok else "FAIL the mix: %s" % m.group(0))
+sys.exit(0 if ok else 1)
+PY
+fi
+if [ "$which" = all ] || [ "$which" = pipe ]; then
+  TCOS_EMU_PIPE=1 "$work/emurun" "$work/fifotest-$arch" "$work/sys32" | tee "$work/run-pipe.out"
+  grep -q "fifotest: [0-9]* checks, 0 failed" "$work/run-pipe.out" || { echo "FAIL fifotest"; fail=1; }
+  grep -q "exit=0 faulted=0" "$work/run-pipe.out" || { echo "FAIL fifotest faulted or failed"; fail=1; }
+  python3 - "$work/run-pipe.out" <<'PY' || fail=1
+import re, sys
+m = re.search(r"pipe: source heard 600 Hz (\d+)", open(sys.argv[1]).read())
+ok = m and int(m.group(1)) > 2000      # (a triangle of 8000: its fundamental 6485, measured as half of that)
+print("ok   the pipe source played what fifotest wrote into its FIFO" if ok else "FAIL the pipe source: %s" % (m.group(0) if m else "no summary"))
 sys.exit(0 if ok else 1)
 PY
 fi

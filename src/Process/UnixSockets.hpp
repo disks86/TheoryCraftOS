@@ -58,7 +58,10 @@ enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      //
                                 Event = 0x40,        // eventfd: a counter
                                 Timer = 0x41,        // timerfd: expirations of a deadline (the Linux layer advances it from the process's clocks)
                                 Epoll = 0x42,        // epoll: an interest list (the Linux layer evaluates it)
-                                Signal = 0x43 };     // signalfd: no signal is routed to it (never ready)
+                                Signal = 0x43,       // signalfd: no signal is routed to it (never ready)
+                                // Named pipes (FIFOs, see below): the pipe itself, which no descriptor holds, and one open() of it.
+                                Fifo = 0x44,
+                                FifoEnd = 0x45 };
 inline bool unix_type_is_socket(UnixType t) { return uint8_t(t) < 0x40; }
 
 // One descriptor an epoll instance watches: the descriptor number in the process that added it and what was there (kind, socket id), so that a
@@ -92,6 +95,7 @@ enum class UnixStatus : uint8_t {
   MessageTooBig,        // EMSGSIZE
   NotSupported,         // EOPNOTSUPP
   NotPermitted,         // EPERM (a datagram to a socket connected to someone else)
+  NoPartner,            // ENXIO: a FIFO opened for writing without waiting, and nobody has it open for reading
 };
 
 // A descriptor carried by a message (SCM_RIGHTS): what a descriptor table slot holds, plus the use of its token that the message keeps (descriptor_token_add).
@@ -110,6 +114,16 @@ struct UnixReadiness {
   bool error = false;          // SO_ERROR would report something
 };
 
+// Named pipes (FIFOs, mkfifo/mknod S_IFIFO). The node is a name in the file system (on ext2/3/4 a real FIFO inode; on file systems without Unix node
+// types an empty file that this manager remembers as a FIFO, see fifo_mark), and the pipe behind it lives here while someone has it open: a Fifo object
+// keyed by the host path (the same key path-bound sockets use), with its buffer of kFifoBytes and the counts of readers and writers. Each open() is a
+// FifoEnd, the descriptor's token like a socket's, so that read/write/poll/epoll/dup/SCM_RIGHTS/fork treat it as they treat sockets. POSIX semantics:
+//   - an end opened for reading only waits (fifo_open_done_locked) until a writer has opened it, unless it does not block; one for writing only waits for
+//     a reader, and without waiting fails with NoPartner (ENXIO) when there is none; one for both never waits;
+//   - a read takes what is there; with nothing there it is the end of the file (0) when no writer is left, else it waits;
+//   - a write of up to kPipeAtomic bytes goes in whole or waits; a bigger one may go in part; Broken (EPIPE) when no reader is left;
+//   - the last end gone, the pipe and whatever it held go too. Unlinking or renaming the name while it is open leaves the open ends on their pipe: a new
+//     open of the new name gets the moved pipe, a FIFO made again at the old name a new one (fifo_path_gone/moved).
 class UnixSocketManager {
  public:
   static constexpr uint32_t kCapacity = 4096;            // sockets at once, in the whole system
@@ -142,6 +156,35 @@ class UnixSocketManager {
   UnixStatus create_epoll(uint64_t owner_pid, uint32_t* id);
   UnixStatus create_signal(uint64_t owner_pid, uint32_t* id);
   static constexpr uint32_t kMaxEpollEntries = 4096;
+
+  // --- named pipes (see above)
+  static constexpr uint32_t kFifoBytes = 64 * 1024;      // a pipe's buffer (Linux's default pipe size, F_GETPIPE_SZ)
+  static constexpr uint32_t kPipeAtomic = 4096;          // PIPE_BUF: writes up to this size are not split up
+  static constexpr uint32_t kMaxFifoPaths = 4096;        // FIFO names remembered for file systems without FIFO nodes
+  // A new end of the pipe of the FIFO at `host_path` (the pipe made if nobody has it open). One use, for the caller's descriptor. NoPartner: writing only,
+  // `non_blocking`, and no reader.
+  UnixStatus fifo_open_locked(StringView host_path, bool reading, bool writing, bool non_blocking, uint64_t owner_pid, uint32_t* end);
+  // Whether open() of this end may return: false while a reading-only end waits for a writer (or a writing-only one for a reader) to have opened it.
+  bool fifo_open_done_locked(uint32_t end) const;
+  // read(): Ok with *got bytes, Ok with *got 0 at the end of the file, WouldBlock; BadSocket for an end not opened for reading.
+  UnixStatus fifo_read_locked(uint32_t end, ByteView buffer, uint32_t* got);
+  // write(): Ok with *wrote bytes (all of a write of up to kPipeAtomic, else at least one), WouldBlock, Broken; BadSocket for an end not opened for
+  // writing.
+  UnixStatus fifo_write_locked(uint32_t end, ConstByteView data, uint32_t* wrote);
+  bool is_fifo_end_locked(uint32_t id) const;
+  // A pipe's end, named (a FIFO) or not (pipe2's ends, marked with mark_pipe_locked): what fstat() reports as S_IFIFO.
+  bool is_pipe_locked(uint32_t id) const;
+  void mark_pipe_locked(uint32_t id);
+  // Whether a FIFO end is opened for reading/writing (false for anything else).
+  bool fifo_end_mode_locked(uint32_t id, bool* reading, bool* writing) const;
+  // The FIFO names of file systems that keep no FIFO node (these take the lock themselves). fifo_mark: `host_path` is now a FIFO (NoMemory when kMaxFifoPaths
+  // are kept). fifo_path_gone: the name (or a folder above it) was removed: forgotten, and its pipe is no longer found by name. fifo_path_moved: renamed
+  // (a folder above it too).
+  UnixStatus fifo_mark(StringView host_path);
+  bool fifo_marked(StringView host_path);
+  bool has_fifo_marks();
+  void fifo_path_gone(StringView host_path);
+  void fifo_path_moved(StringView from, StringView to);
 
   // --- operations (the lock held). `pid` is the calling process's id.
   bool exists_locked(uint32_t id) const { return at(id) != nullptr; }
@@ -230,7 +273,7 @@ class UnixSocketManager {
     UnixName from;               // the sender's name (datagrams)
   };
   struct Socket {
-    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), data(allocator), records(allocator), rights(allocator), interest(allocator), backlog(allocator) {}
+    explicit Socket(allocators::IAllocator& allocator) : host_path(allocator), interest(allocator), data(allocator), records(allocator), rights(allocator), backlog(allocator) {}
     uint32_t id = 0;
     uint32_t references = 0;
     UnixType type = UnixType::Stream;
@@ -252,6 +295,13 @@ class UnixSocketManager {
     uint32_t timer_clock = 0;
     uint64_t timer_deadline = 0, timer_interval = 0;
     List<UnixEpollEntry> interest;
+    // A pipe (Fifo): its ends' counts and how many ends ever opened it each way. An end (FifoEnd, its pipe in `peer`): which way it was opened, and the
+    // pipe's counts of openers when it was opened (Linux's f_pipe: a reader hears POLLHUP only once a writer has come and gone since).
+    uint32_t readers = 0, writers = 0;
+    uint64_t reader_opens = 0, writer_opens = 0;
+    bool fifo_read = false, fifo_write = false;
+    bool pipe_end = false;               // (one of pipe2's ends)
+    uint64_t seen_reader_opens = 0, seen_writer_opens = 0;
     uint64_t receive_timeout = ~uint64_t{0}, send_timeout = ~uint64_t{0};
     // The receive queue: bytes [data_head, data.size()) of `data`, split into records; the descriptors they carry, in order.
     ByteBuffer data;
@@ -271,6 +321,10 @@ class UnixSocketManager {
   bool enqueue_locked(Socket& receiver, ConstByteView data, Queue<UnixInFlight>* rights, uint64_t sender_pid, const UnixName& from, bool merge);
   void consume_locked(Socket& s, uint64_t bytes);
   bool reading_ended(const Socket& s) const;
+  void compact_locked(Socket& r, uint64_t adding);
+  Socket* fifo_of(const Socket& end) const;
+  Socket* find_fifo_locked(StringView host_path) const;
+  void fifo_end_gone_locked(Socket& end);
 
   ISystemSync& sync_;
   allocators::IAllocator& allocator_;
@@ -279,6 +333,7 @@ class UnixSocketManager {
   uint32_t next_free_ = 0;                // where the search for a free slot starts
   uint32_t autobind_counter_ = 0;
   Queue<UnixInFlight> dropped_;
+  List<String> fifo_paths_{allocator_};      // (fifo_mark's names)
 };
 
 // The system's AF_UNIX sockets: made on first use from the system objects' lock and allocator (null until those exist).

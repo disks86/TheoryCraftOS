@@ -72,7 +72,9 @@
 #include "FileSystem/SystemLayout.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/NativeServer.hpp"
+#include "PipeWire/KernelPipeFiles.hpp"
 #include "PipeWire/PulseServer.hpp"
+#include "PipeWire/RecordStream.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "PipeWire/WindowsAudioService.hpp"
 #include "Process/UnixSockets.hpp"
@@ -539,6 +541,30 @@ int main(int argc, char** argv) {
                               StringView("source_name=emu-vsrc source_properties='device.description=\"Emulated virtual source\"' channel_map=front-right,front-left"), &error))
       fprintf(stderr, "emurun: no virtual source could be made (%u)\n", error);
   }
+  // TCOS_EMU_PIPE: module-pipe-sink (/tmp/music.output, sink emu-pipe) and module-pipe-source (/tmp/music.input, source emu-pipe-in) over the kernel's
+  // Linux FIFOs; a native stream plays 440 Hz into the sink, and what the source plays is recorded for the summary (tests/linux/fifotest.c reads one and
+  // writes the other)
+  pipewire::KernelPipeFiles pipe_files(a, fs);
+  pw_pulse.set_pipe_files(&pipe_files);
+  const bool emu_pipe = getenv("TCOS_EMU_PIPE") != nullptr;
+  uint32_t pipe_sink = 0, pipe_source = 0;
+  if (emu_pipe) {
+    uint32_t error = 0;
+    if (!pw_pulse.load_module(StringView("module-pipe-sink"), StringView("file=/tmp/music.output sink_name=emu-pipe"), &error) ||
+        !pw_pulse.load_module(StringView("module-pipe-source"), StringView("file=/tmp/music.input source_name=emu-pipe-in"), &error))
+      fprintf(stderr, "emurun: the pipe modules did not load (%u)\n", error);
+    graph.for_each([&](const pipewire::GraphObject& o) {
+      if (o.type != pipewire::ObjectType::Node || o.role != pipewire::NodeRole::Virtual) return;
+      if (o.props.get("node.name") == StringView("emu-pipe")) pipe_sink = o.id;
+      if (o.props.get("node.name") == StringView("emu-pipe-in")) pipe_source = o.id;
+    });
+  }
+  SharedPointer<pipewire::PlaybackStream> pipe_play;
+  SharedPointer<pipewire::RecordStream> pipe_record;
+  if (pipe_sink) graph.create_playback(graph.native_client_id(), pipewire::PcmFormat{pipewire::SampleFormat::S16Le, 48000, 2}, pipewire::Properties(a), &pipe_play, pipe_sink);
+  if (pipe_source) graph.create_record(graph.native_client_id(), pipewire::PcmFormat{pipewire::SampleFormat::S16Le, 48000, 2}, pipewire::Properties(a), &pipe_record, true, pipe_source);
+  std::vector<int16_t> pipe_heard;
+  std::mutex pipe_mutex;
   pipewire::WindowsAudioService windows_audio(graph, a);
   pipewire::install_windows_audio(windows_audio);
   pipewire::SocketServer pw_sockets(*process::system_unix_sockets(), a);
@@ -550,6 +576,28 @@ int main(int argc, char** argv) {
       mixer.pump();
       capture_hub.pump();
       for (int i = 0; i < 4 && pw_sockets.pump(); ++i) {}
+      if (emu_pipe) {
+        pw_pulse.tick();      // (the pipe modules' pumps, also while no client is connected)
+        if (pipe_play) {      // (440 Hz into the pipe sink, kept 100 ms ahead)
+          static uint64_t frame = 0;
+          std::vector<uint8_t> pcm(960 * 4);
+          while (pipe_play->waiting_bytes() < 19200) {
+            for (uint32_t i = 0; i < 960; ++i) {
+              const int16_t v = int16_t(6000.0 * sin(2 * M_PI * 440.0 * double(frame + i) / 48000.0));
+              pcm[4 * i] = pcm[4 * i + 2] = uint8_t(v);
+              pcm[4 * i + 1] = pcm[4 * i + 3] = uint8_t(uint16_t(v) >> 8);
+            }
+            if (pipe_play->write(ConstByteView(pcm.data(), pcm.size())) == 0) break;
+            frame += 960;
+          }
+        }
+        if (pipe_record) {
+          std::vector<uint8_t> got(19200);
+          const uint32_t n = pipe_record->read(ByteView(got.data(), got.size()));
+          std::lock_guard<std::mutex> g(pipe_mutex);
+          for (uint32_t k = 0; k + 1 < n; k += 2) pipe_heard.push_back(int16_t(got[k] | got[k + 1] << 8));
+        }
+      }
       const uint32_t n = graph.playback_count();
       if (n > most_streams) most_streams = n;
       pw_sockets.wait(2'000'000);
@@ -773,6 +821,14 @@ int main(int argc, char** argv) {
       best_together = std::max(best_together, all);
     }
     printf("audio: tones 300:%.0f 400:%.0f 500:%.0f 600:%.0f 700:%.0f; together %.0f\n", best_tone[0], best_tone[1], best_tone[2], best_tone[3], best_tone[4], best_together);
+  }
+  if (emu_pipe) {
+    std::lock_guard<std::mutex> g(pipe_mutex);
+    double best = 0;
+    for (size_t at = 0; at + 4800 <= pipe_heard.size() / 2; at += 2400) best = std::max(best, tone(pipe_heard, at, 4800, 600));
+    printf("pipe: source heard 600 Hz %.0f (%zu frames)\n", best, pipe_heard.size() / 2);
+    pipe_play = SharedPointer<pipewire::PlaybackStream>();
+    pipe_record = SharedPointer<pipewire::RecordStream>();
   }
   {
     std::lock_guard<std::mutex> g(midi_synth.m);

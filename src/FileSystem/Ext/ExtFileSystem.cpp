@@ -843,6 +843,9 @@ Status ExtFileSystem::describe(const Inode& inode, StringView name, DirectoryEnt
   } else if (inode.is_regular() || inode.is_symlink()) {
     result.type = NodeType::File;
     result.size = inode.size();
+  } else if (inode.special() != SpecialNode::None) {      // (a FIFO, socket or device: a name without data)
+    result.type = NodeType::File;
+    result.special = inode.special();
   } else {
     return Status::NotFound;
   }
@@ -876,7 +879,7 @@ Status ExtFileSystem::resolve(StringView path, Resolved* result) {
     s = read_inode(number, &inode);
     if (s != Status::Ok) return s;
     if (inode.mode() == 0 || inode.links() == 0) return Status::NotFound;  // an entry whose inode is free
-    if (!inode.is_directory() && !inode.is_regular() && !inode.is_symlink()) return Status::NotFound;
+    if (!inode.is_directory() && !inode.is_regular() && !inode.is_symlink() && inode.special() == SpecialNode::None) return Status::NotFound;
     Resolved next;
     next.parent = current.number;
     next.number = number;
@@ -972,6 +975,7 @@ Status ExtFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IF
     if (s != Status::Ok) return s;
     if (write && inode_immutable(inode)) return Status::ReadOnly;
     if (write && !inode.is_regular()) return Status::Unsupported;
+    if (inode.special() != SpecialNode::None) return Status::Unsupported;      // (a FIFO or device has no data to read: the layer above opens it as what it is)
   }
   UniquePointer<IFile> handle = UniquePointer<IFile>::make_as<File>(allocator_, *this, number, write);
   if (!handle) return Status::OutOfMemory;

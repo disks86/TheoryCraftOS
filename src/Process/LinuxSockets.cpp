@@ -27,7 +27,7 @@ namespace {
 constexpr int64_t kEnoent = 2, kEintr = 4, kEbadf = 9, kEagain = 11, kEnomem = 12, kEfault = 14, kEinval = 22, kEnfile = 23, kEmfile = 24, kEnotty = 25,
                   kEpipe = 32, kEnametoolong = 36, kEnotsock = 88, kEdestaddrreq = 89, kEmsgsize = 90, kEprototype = 91, kEnoprotoopt = 92,
                   kEprotonosupport = 93, kEsocktnosupport = 94, kEopnotsupp = 95, kEafnosupport = 97, kEaddrinuse = 98, kEconnreset = 104, kEisconn = 106,
-                  kEnotconn = 107, kEconnrefused = 111, kEperm = 1, kEtoomanyrefs = 109;
+                  kEnotconn = 107, kEconnrefused = 111, kEperm = 1, kEtoomanyrefs = 109, kEnxio = 6;
 constexpr uint64_t kSockNonBlock = 0x800, kSockCloexec = 0x80000;
 constexpr uint64_t kMsgPeek = 0x2, kMsgCtrunc = 0x8, kMsgTrunc = 0x20, kMsgDontwait = 0x40, kMsgWaitall = 0x100, kMsgWaitforone = 0x10000,
                    kMsgCmsgCloexec = 0x40000000;
@@ -60,6 +60,7 @@ int64_t errno_of(UnixStatus s) {
     case UnixStatus::MessageTooBig: return -kEmsgsize;
     case UnixStatus::NotSupported: return -kEopnotsupp;
     case UnixStatus::NotPermitted: return -kEperm;
+    case UnixStatus::NoPartner: return -kEnxio;
   }
   return -kEinval;
 }
@@ -671,7 +672,7 @@ uint64_t sys_socketpair(Process& p, uint64_t domain, uint64_t type, uint64_t pro
 
 // pipe2(fds, flags) / pipe(fds): a one-way pipe, made as a connected AF_UNIX stream pair whose first end only reads and second only writes (each shut
 // the other way), so that it can be passed with SCM_RIGHTS like any socket - what Wayland's clipboard and drag and drop hand around. O_CLOEXEC and
-// O_NONBLOCK are SOCK_CLOEXEC and SOCK_NONBLOCK's values; O_DIRECT (packet mode) is refused. (fstat says a socket, not a FIFO.)
+// O_NONBLOCK are SOCK_CLOEXEC and SOCK_NONBLOCK's values; O_DIRECT (packet mode) is refused. (fstat says S_IFIFO, as for a named pipe.)
 uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags) {
   if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
   if (fds == 0) return error(kEfault);
@@ -683,6 +684,8 @@ uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags) {
     Hold hold(*m);
     m->shutdown_locked(a, false, true);      // (the read end sends nothing)
     m->shutdown_locked(b, true, false);      // (the write end receives nothing)
+    m->mark_pipe_locked(a);                  // (fstat: S_IFIFO)
+    m->mark_pipe_locked(b);
   }
   const uint64_t fr = give_fd(p, *m, a, flags & kSockCloexec, flags & kSockNonBlock);
   if (int64_t(fr) < 0) { m->release(b); return fr; }
@@ -1370,12 +1373,104 @@ uint64_t event_write(Process& p, const Sock& s, uint64_t buffer, uint64_t count)
 
 }  // namespace
 
+// --- named pipes (FIFOs): an open() of the node, and read/write of its ends ---------------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint64_t kFifoChunk = UnixSocketManager::kFifoBytes;
+
+// read(): what the pipe has, up to `count` (waits while it is empty and a writer is left, unless the end does not block).
+uint64_t fifo_read(Process& p, const Sock& s, uint64_t buffer, uint64_t count) {
+  if (count == 0) return 0;
+  ByteBuffer chunk(s.m->allocator());
+  if (!chunk.put_zeros(count < kFifoChunk ? count : kFifoChunk)) return error(kEnomem);
+  uint32_t got = 0;
+  const int64_t r = run_blocking(p, s, false, false, [&] { return s.m->fifo_read_locked(s.id, chunk.writable_view(), &got); });
+  if (r < 0) return error(-r);
+  if (got != 0 && !p.write_user(buffer, chunk.view().first(got))) return error(kEfault);      // (the bytes are gone if the buffer is bad, as on Linux)
+  return got;
+}
+
+// write(): all of it, in pieces of the pipe's size, waiting for room (an end that does not block stops at the first piece without room). The bytes that
+// went in, or -errno when none did (EPIPE without a reader).
+int64_t fifo_write_view(Process& p, const Sock& s, ConstByteView data) {
+  uint64_t done = 0;
+  while (done < data.size()) {
+    uint32_t wrote = 0;
+    const ConstByteView rest = data.subview(done, data.size() - done);
+    const int64_t r = run_blocking(p, s, true, false, [&] { return s.m->fifo_write_locked(s.id, rest, &wrote); });
+    if (r < 0) return done ? int64_t(done) : r;
+    done += wrote;
+  }
+  return int64_t(done);
+}
+
+uint64_t fifo_write(Process& p, const Sock& s, uint64_t buffer, uint64_t count) {
+  if (count > kMaxIoBytes) count = kMaxIoBytes;
+  ByteBuffer chunk(s.m->allocator());
+  uint64_t done = 0;
+  while (done < count) {
+    const uint64_t n = count - done < kFifoChunk ? count - done : kFifoChunk;
+    chunk.clear();
+    if (!chunk.put_zeros(n)) return done ? done : error(kEnomem);
+    if (!p.read_user(buffer + done, chunk.writable_view())) return done ? done : error(kEfault);
+    const int64_t r = fifo_write_view(p, s, chunk.view());
+    if (r < 0) return done ? done : error(-r);
+    done += uint64_t(r);
+    if (uint64_t(r) < n) break;      // (it stopped: no room without waiting, or the reader went)
+  }
+  return done;
+}
+
+}  // namespace
+
+uint64_t fifo_open(Process& p, StringView host_path, bool reading, bool writing, bool non_blocking, bool close_on_exec) {
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t end = 0;
+  {
+    Hold hold(*m);
+    if (const UnixStatus st = m->fifo_open_locked(host_path, reading, writing, non_blocking, p.id(), &end); st != UnixStatus::Ok) return result_of(st);
+  }
+  if (!non_blocking) {      // (POSIX: a reader waits for a writer, a writer for a reader)
+    const uint32_t waited = unix_wait(p, *m, ~uint64_t{0}, [&] { return m->fifo_open_done_locked(end); });
+    if (waited != 0) {
+      m->release(end);
+      return error(kEintr);
+    }
+  }
+  const int64_t slot = p.files().open_token(DescriptorKind::UnixSocket, end);
+  if (slot < 0) {
+    m->release(end);
+    return error(kEmfile);
+  }
+  p.files().set_close_on_exec(uint64_t(slot), close_on_exec);
+  return uint64_t(slot);
+}
+
+int fifo_access_mode(Process& p, uint64_t fd) {
+  Sock s;
+  if (socket_of(p, fd, &s) < 0) return -1;
+  Hold hold(*s.m);
+  bool reading = false, writing = false;
+  if (!s.m->fifo_end_mode_locked(s.id, &reading, &writing)) return -1;
+  return reading && writing ? 2 : writing ? 1 : 0;
+}
+
+bool is_pipe_descriptor(Process& p, uint64_t fd) {
+  Sock s;
+  if (socket_of(p, fd, &s) < 0) return false;
+  Hold hold(*s.m);
+  return s.m->is_pipe_locked(s.id);
+}
+
 uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   Sock s;
   if (socket_of(p, fd, &s) == 0) {
     switch (type_of(s)) {
       case UnixType::Event: return event_read(p, s, buffer, count);
       case UnixType::Timer: return timer_read(p, s, buffer, count);
+      case UnixType::FifoEnd: return fifo_read(p, s, buffer, count > kMaxIoBytes ? kMaxIoBytes : count);
       case UnixType::Epoll: return error(kEinval);
       case UnixType::Signal: {      // (never readable: waits for ever, or EAGAIN)
         if (count < 128) return error(kEinval);
@@ -1397,6 +1492,7 @@ uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) 
   if (socket_of(p, fd, &s) == 0) {
     const UnixType type = type_of(s);
     if (type == UnixType::Event) return event_write(p, s, buffer, count);
+    if (type == UnixType::FifoEnd) return fifo_write(p, s, buffer, count);
     if (!unix_type_is_socket(type)) return error(kEinval);
   }
   return sys_sendto(p, fd, buffer, count, 0, 0, 0);
@@ -1408,6 +1504,47 @@ uint64_t socket_vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count,
   ByteBuffer raw(s.m->allocator());
   uint64_t total = 0;
   if (const int64_t r = read_iovecs(p, iov, count, &raw, &total); r < 0) return error(r == -kEmsgsize ? kEinval : -r);
+  if (type_of(s) == UnixType::FifoEnd) {
+    // A pipe. readv: one read (what is there, up to the pipe's size) spread over the pieces. writev: a small one (up to PIPE_BUF) gathered and written whole,
+    // a bigger one piece by piece, stopping at a short one.
+    if (!write || total <= UnixSocketManager::kPipeAtomic) {
+      const uint64_t want = total < kFifoChunk ? total : kFifoChunk;
+      ByteBuffer joined(s.m->allocator());
+      if (!joined.put_zeros(want)) return error(kEnomem);
+      ByteReader in(raw.view());
+      uint64_t got = 0;
+      if (write) {
+        for (uint64_t i = 0, at = 0; i < count; ++i) {
+          const uint64_t base = in.le64(), length = in.le64();
+          if (length && !p.read_user(base, joined.writable_view().subview(at, length))) return error(kEfault);
+          at += length;
+        }
+        const int64_t r = fifo_write_view(p, s, joined.view());
+        return r < 0 ? error(-r) : uint64_t(r);
+      }
+      uint32_t read = 0;
+      const int64_t r = want == 0 ? 0 : run_blocking(p, s, false, false, [&] { return s.m->fifo_read_locked(s.id, joined.writable_view(), &read); });
+      if (r < 0) return error(-r);
+      for (uint64_t i = 0; i < count && got < read; ++i) {
+        const uint64_t base = in.le64(), length = in.le64();
+        const uint64_t n = length < read - got ? length : read - got;
+        if (n && !p.write_user(base, joined.view().subview(got, n))) return got ? got : error(kEfault);
+        got += n;
+      }
+      return got;
+    }
+    ByteReader in(raw.view());
+    uint64_t done = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+      const uint64_t base = in.le64(), length = in.le64();
+      if (length == 0) continue;
+      const uint64_t r = fifo_write(p, s, base, length);
+      if (int64_t(r) < 0) return done ? done : r;
+      done += r;
+      if (r < length) break;
+    }
+    return done;
+  }
   if (write) {
     const int64_t r = send_core(p, s, raw.view(), total, nullptr, 0, nullptr);
     return r < 0 ? error(-r) : uint64_t(r);

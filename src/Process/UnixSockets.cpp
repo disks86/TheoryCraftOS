@@ -239,6 +239,7 @@ void UnixSocketManager::release(uint32_t id) {
 void UnixSocketManager::release_locked(uint32_t id) {
   Socket* s = at(id);
   if (!s || --s->references != 0) return;
+  if (s->type == UnixType::FifoEnd) fifo_end_gone_locked(*s);      // (its pipe loses a reader or writer, and the use the end had of it)
   // Connections that were never accepted: their clients see the connection reset.
   uint32_t pending = 0;
   while (s->backlog.dequeue(&pending)) {
@@ -405,15 +406,19 @@ bool UnixSocketManager::room_for(const Socket& receiver, uint64_t bytes, bool wh
   return !whole || bytes <= kBufferBytes - queued;
 }
 
-bool UnixSocketManager::enqueue_locked(Socket& r, ConstByteView data, Queue<UnixInFlight>* rights, uint64_t sender_pid, const UnixName& from, bool merge) {
-  // The bytes go after what is queued; the part already read is dropped first when it is most of the buffer (so the buffer does not grow without end).
-  if (r.data_head != 0 && (r.data_head >= r.data.size() / 2 || r.data.size() + data.size() > kBufferBytes * 2)) {
+// The bytes go after what is queued; the part already read is dropped first when it is most of the buffer (so the buffer does not grow without end).
+void UnixSocketManager::compact_locked(Socket& r, uint64_t adding) {
+  if (r.data_head != 0 && (r.data_head >= r.data.size() / 2 || r.data.size() > kBufferBytes * 2 - adding)) {
     const uint64_t keep = r.queued();
     ByteView all = r.data.writable_view();
     all.first(keep).copy_from(ConstByteView(all.subview(r.data_head, keep)));      // (memmove: the ranges may overlap)
     r.data.truncate(keep);
     r.data_head = 0;
   }
+}
+
+bool UnixSocketManager::enqueue_locked(Socket& r, ConstByteView data, Queue<UnixInFlight>* rights, uint64_t sender_pid, const UnixName& from, bool merge) {
+  compact_locked(r, data.size() < kBufferBytes ? data.size() : kBufferBytes);
   const uint32_t carried = rights ? uint32_t(rights->count()) : 0;
   if (carried != 0 && !r.rights.reserve(r.rights.count() + carried)) return false;      // (room first: once queued, an entry must not be lost)
   Record* last = r.records.back();
@@ -601,6 +606,19 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
     r.readable = s->counter > 0;      // (as of the last timer_advance_locked)
     return r;
   }
+  if (s->type == UnixType::FifoEnd) {      // (Linux's pipe_poll)
+    const Socket* pipe = fifo_of(*s);
+    if (!pipe) { r.error = r.hangup = true; return r; }
+    if (s->fifo_read) {
+      r.readable = pipe->queued() != 0;
+      r.hangup = pipe->writers == 0 && pipe->writer_opens != s->seen_writer_opens;      // (a writer came and went since it was opened)
+    }
+    if (s->fifo_write) {
+      r.writable = kFifoBytes - pipe->queued() >= kPipeAtomic;
+      r.error = pipe->readers == 0;
+    }
+    return r;
+  }
   if (!unix_type_is_socket(s->type)) return r;      // (an epoll instance is evaluated by the Linux layer; a signalfd never fires)
   r.error = s->pending_error != UnixStatus::Ok;
   if (s->state == State::Listening) {
@@ -629,6 +647,10 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
 
 uint32_t UnixSocketManager::readable_bytes_locked(uint32_t id) const {
   const Socket* s = at(id);
+  if (s && s->type == UnixType::FifoEnd) {
+    const Socket* pipe = fifo_of(*s);
+    return pipe && s->fifo_read ? uint32_t(pipe->queued()) : 0;
+  }
   if (!s || s->records.count() == 0) return 0;
   if (is_message_type(s->type)) return s->records.front()->bytes;
   return uint32_t(s->queued());
@@ -677,6 +699,192 @@ uint64_t UnixSocketManager::timeout_locked(uint32_t id, bool sending) const {
 }
 void UnixSocketManager::set_timeout_locked(uint32_t id, bool sending, uint64_t ns) {
   if (Socket* s = at(id)) (sending ? s->send_timeout : s->receive_timeout) = ns == 0 ? ~uint64_t{0} : ns;
+}
+
+// --- named pipes ---------------------------------------------------------------------------------------------------------------------------------------------
+
+UnixSocketManager::Socket* UnixSocketManager::fifo_of(const Socket& end) const {
+  Socket* pipe = end.type == UnixType::FifoEnd ? at(end.peer) : nullptr;
+  return pipe && pipe->type == UnixType::Fifo ? pipe : nullptr;
+}
+
+UnixSocketManager::Socket* UnixSocketManager::find_fifo_locked(StringView host_path) const {
+  if (host_path.empty()) return nullptr;
+  for (const UniquePointer<Socket>& slot : slots_) {
+    Socket* s = slot.get();
+    if (s && s->type == UnixType::Fifo && s->host_path.view() == host_path) return s;
+  }
+  return nullptr;
+}
+
+UnixStatus UnixSocketManager::fifo_open_locked(StringView host_path, bool reading, bool writing, bool non_blocking, uint64_t owner_pid, uint32_t* end) {
+  *end = 0;
+  if (host_path.empty() || (!reading && !writing)) return UnixStatus::Invalid;
+  Socket* pipe = find_fifo_locked(host_path);
+  if (writing && !reading && non_blocking && (!pipe || pipe->readers == 0)) return UnixStatus::NoPartner;
+  bool made = false;
+  if (!pipe) {
+    uint32_t id = 0;
+    if (const UnixStatus st = make_locked(UnixType::Fifo, owner_pid, &id); st != UnixStatus::Ok) return st;
+    pipe = at(id);
+    if (!pipe->host_path.assign(host_path)) { release_locked(id); return UnixStatus::NoMemory; }
+    made = true;      // (its one use is the new end's)
+  }
+  uint32_t id = 0;
+  if (const UnixStatus st = make_locked(UnixType::FifoEnd, owner_pid, &id); st != UnixStatus::Ok) {
+    if (made) release_locked(pipe->id);
+    return st;
+  }
+  Socket* e = at(id);
+  if (!made) ++pipe->references;
+  e->peer = pipe->id;
+  e->fifo_read = reading;
+  e->fifo_write = writing;
+  e->non_blocking = non_blocking;
+  if (reading) { ++pipe->readers; ++pipe->reader_opens; }
+  if (writing) { ++pipe->writers; ++pipe->writer_opens; }
+  e->seen_reader_opens = pipe->reader_opens;
+  e->seen_writer_opens = pipe->writer_opens;
+  *end = id;
+  sync_.notify_all();      // (an open() waiting for this one)
+  return UnixStatus::Ok;
+}
+
+bool UnixSocketManager::fifo_open_done_locked(uint32_t end) const {
+  const Socket* e = at(end);
+  const Socket* pipe = e ? fifo_of(*e) : nullptr;
+  if (!pipe || (e->fifo_read && e->fifo_write)) return true;
+  if (e->fifo_read) return pipe->writers != 0 || pipe->writer_opens != e->seen_writer_opens;      // (a writer that came and went meanwhile counts)
+  return pipe->readers != 0 || pipe->reader_opens != e->seen_reader_opens;
+}
+
+void UnixSocketManager::fifo_end_gone_locked(Socket& end) {
+  Socket* pipe = fifo_of(end);
+  end.peer = 0;
+  if (!pipe) return;
+  if (end.fifo_read && pipe->readers) --pipe->readers;
+  if (end.fifo_write && pipe->writers) --pipe->writers;
+  sync_.notify_all();      // (readers see the end of the file, writers EPIPE)
+  release_locked(pipe->id);
+}
+
+UnixStatus UnixSocketManager::fifo_read_locked(uint32_t id, ByteView buffer, uint32_t* got) {
+  *got = 0;
+  Socket* e = at(id);
+  if (!e || e->type != UnixType::FifoEnd || !e->fifo_read) return UnixStatus::BadSocket;
+  Socket* pipe = fifo_of(*e);
+  if (!pipe) return UnixStatus::BadSocket;
+  if (buffer.empty()) return UnixStatus::Ok;
+  const uint64_t queued = pipe->queued();
+  if (queued == 0) return pipe->writers == 0 ? UnixStatus::Ok : UnixStatus::WouldBlock;      // (no writer left: the end of the file)
+  const uint64_t n = queued < buffer.size() ? queued : buffer.size();
+  buffer.first(n).copy_from(pipe->data.view().subview(pipe->data_head, n));
+  consume_locked(*pipe, n);
+  *got = uint32_t(n);
+  sync_.notify_all();      // (room for a waiting writer)
+  return UnixStatus::Ok;
+}
+
+UnixStatus UnixSocketManager::fifo_write_locked(uint32_t id, ConstByteView data, uint32_t* wrote) {
+  *wrote = 0;
+  Socket* e = at(id);
+  if (!e || e->type != UnixType::FifoEnd || !e->fifo_write) return UnixStatus::BadSocket;
+  Socket* pipe = fifo_of(*e);
+  if (!pipe) return UnixStatus::BadSocket;
+  if (data.empty()) return UnixStatus::Ok;
+  if (pipe->readers == 0) return UnixStatus::Broken;
+  const uint64_t room = kFifoBytes - pipe->queued();
+  uint64_t n = data.size() < room ? data.size() : room;
+  if (data.size() <= kPipeAtomic && n < data.size()) return UnixStatus::WouldBlock;      // (a small write goes in whole or not at all)
+  if (n == 0) return UnixStatus::WouldBlock;
+  compact_locked(*pipe, n);
+  if (!pipe->data.append(data.first(n))) return UnixStatus::NoMemory;
+  *wrote = uint32_t(n);
+  sync_.notify_all();      // (a waiting reader)
+  return UnixStatus::Ok;
+}
+
+bool UnixSocketManager::is_fifo_end_locked(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && s->type == UnixType::FifoEnd;
+}
+
+bool UnixSocketManager::is_pipe_locked(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && (s->type == UnixType::FifoEnd || s->pipe_end);
+}
+
+void UnixSocketManager::mark_pipe_locked(uint32_t id) {
+  if (Socket* s = at(id)) s->pipe_end = true;
+}
+
+bool UnixSocketManager::fifo_end_mode_locked(uint32_t id, bool* reading, bool* writing) const {
+  const Socket* s = at(id);
+  if (!s || s->type != UnixType::FifoEnd) return false;
+  *reading = s->fifo_read;
+  *writing = s->fifo_write;
+  return true;
+}
+
+namespace {
+// `path` is `prefix` or below it (a folder that was removed or moved).
+bool at_or_below(StringView path, StringView prefix) {
+  if (prefix.empty() || !path.starts_with(prefix)) return false;
+  return path.size() == prefix.size() || path[prefix.size()] == '/' || prefix[prefix.size() - 1] == '/';
+}
+}  // namespace
+
+UnixStatus UnixSocketManager::fifo_mark(StringView host_path) {
+  if (host_path.empty()) return UnixStatus::Invalid;
+  Hold hold(sync_);
+  for (const String& known : fifo_paths_.view())
+    if (known.view() == host_path) return UnixStatus::Ok;
+  if (fifo_paths_.count() >= kMaxFifoPaths) return UnixStatus::NoMemory;
+  String name(allocator_);
+  if (!name.assign(host_path) || !fifo_paths_.push_back(static_cast<String&&>(name))) return UnixStatus::NoMemory;
+  return UnixStatus::Ok;
+}
+
+bool UnixSocketManager::fifo_marked(StringView host_path) {
+  Hold hold(sync_);
+  for (const String& known : fifo_paths_.view())
+    if (known.view() == host_path) return true;
+  return false;
+}
+
+bool UnixSocketManager::has_fifo_marks() {
+  Hold hold(sync_);
+  return fifo_paths_.count() != 0;
+}
+
+void UnixSocketManager::fifo_path_gone(StringView host_path) {
+  Hold hold(sync_);
+  for (uint64_t i = fifo_paths_.count(); i > 0; --i)
+    if (at_or_below(fifo_paths_[i - 1].view(), host_path)) fifo_paths_.remove_at(i - 1);
+  for (UniquePointer<Socket>& slot : slots_)      // (open ends keep their pipe; a new FIFO of that name gets a pipe of its own)
+    if (slot && slot->type == UnixType::Fifo && at_or_below(slot->host_path.view(), host_path)) slot->host_path.clear();
+}
+
+void UnixSocketManager::fifo_path_moved(StringView from, StringView to) {
+  if (from.empty() || to.empty()) return;
+  Hold hold(sync_);
+  auto renamed = [&](String& name) {
+    if (!at_or_below(name.view(), from)) return true;
+    String moved(allocator_);
+    if (!moved.assign(to) || !moved.append(name.view().substr(from.size()))) return false;
+    name = static_cast<String&&>(moved);
+    return true;
+  };
+  for (uint64_t i = fifo_paths_.count(); i > 0; --i) {
+    if (at_or_below(fifo_paths_[i - 1].view(), to)) fifo_paths_.remove_at(i - 1);      // (what was at the new name was replaced)
+  }
+  for (uint64_t i = fifo_paths_.count(); i > 0; --i)
+    if (!renamed(fifo_paths_[i - 1])) fifo_paths_.remove_at(i - 1);      // (no memory for the new name: it is forgotten, a plain file again)
+  for (UniquePointer<Socket>& slot : slots_) {
+    if (!slot || slot->type != UnixType::Fifo) continue;
+    if (at_or_below(slot->host_path.view(), to)) slot->host_path.clear();      // (replaced: its open ends keep it, nobody finds it by name)
+    else if (!renamed(slot->host_path)) slot->host_path.clear();
+  }
 }
 
 // --- the system's one manager -------------------------------------------------------------------------------------------------------------------------------

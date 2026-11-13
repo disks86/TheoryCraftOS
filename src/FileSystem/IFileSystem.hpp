@@ -87,6 +87,9 @@ class IFileSystem {
     (void)link; (void)target; (void)target_is_directory;
     return Status::Unsupported;
   }
+  // A node of a special kind (mknod, mkfifo): `kind` must not be None. The parent must exist; AlreadyExists if the name is taken. Unsupported by a file
+  // system that keeps no Unix node types (FAT, NTFS, RAM: the layer above keeps FIFOs itself, see src/Process/UnixSockets.hpp).
+  virtual Status create_special(StringView path, SpecialNode kind) { (void)path; (void)kind; return Status::Unsupported; }
   // The raw target of a symbolic link, without following it. InvalidArgument if `path` exists but is not itself a symbolic link.
   virtual Status read_symbolic_link(StringView path, String* target, bool* target_is_directory) {
     (void)path; (void)target; (void)target_is_directory;

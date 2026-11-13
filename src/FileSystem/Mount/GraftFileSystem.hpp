@@ -56,6 +56,7 @@ class GraftFileSystem final : public IFileSystem {
   Status send_discards() override { return base_.send_discards(); }
   Status trim(StringView path, uint64_t* discarded_bytes) override;
   Status set_metadata(StringView path, const MetadataChange& change) override;
+  Status create_special(StringView path, SpecialNode kind) override;
   Status create_hard_link(StringView existing, StringView link) override;
   Status create_symbolic_link(StringView link, StringView target, bool target_is_directory) override;
   Status read_symbolic_link(StringView path, String* target, bool* target_is_directory) override;

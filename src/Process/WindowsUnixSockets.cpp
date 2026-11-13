@@ -143,6 +143,7 @@ uint32_t unix_ntstatus(UnixStatus s) {
     case UnixStatus::MessageTooBig: return 0xC0000206u;         // STATUS_INVALID_BUFFER_SIZE -> WSAEMSGSIZE
     case UnixStatus::NotSupported: return kNotImplemented;      // (WSAEOPNOTSUPP)
     case UnixStatus::NotPermitted: return 0xC0000022u;          // STATUS_ACCESS_DENIED -> WSAEACCES
+    case UnixStatus::NoPartner: return 0xC00000ACu;             // STATUS_PIPE_NOT_AVAILABLE (a FIFO's: not reached from Windows)
   }
   return kInvalidParameter;
 }

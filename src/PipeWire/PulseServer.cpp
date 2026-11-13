@@ -52,7 +52,7 @@ enum : uint32_t {
 // pulse/def.h errors
 enum : uint32_t {
   kErrAccess = 1, kErrCommand = 2, kErrInvalid = 3, kErrExist = 4, kErrNoEntity = 5, kErrProtocol = 7, kErrVersion = 17, kErrTooLarge = 18,
-  kErrNotSupported = 19, kErrNoExtension = 21,
+  kErrNotSupported = 19, kErrNoExtension = 21, kErrIo = 25,
 };
 
 constexpr uint32_t kTagNone = 0xFFFFFFFFu;
@@ -234,6 +234,8 @@ void PulseServer::destroy_module_nodes(Module& m) {
   m.echo = UniquePointer<EchoCancelLoop>();
   m.rtp_send = UniquePointer<RtpSender>();
   m.rtp_recv = UniquePointer<RtpReceiver>();
+  m.pipe_sink = UniquePointer<PipeSink>();
+  m.pipe_source = UniquePointer<PipeSource>();
   if (m.node && graph_.is_virtual(m.node)) graph_.destroy_node(m.node);
   if (m.extra && graph_.is_virtual(m.extra)) graph_.destroy_node(m.extra);
   m.node = m.extra = 0;
@@ -333,7 +335,7 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
   *error = 0;
   prune_modules();
   enum class Kind { NullSink, Loopback, RemapSink, VirtualSink, CombineSink, RemapSource, VirtualSource, EchoCancel, AlwaysSink, SwitchOnConnect,
-                    StreamRestoreModule, RtpSend, RtpRecv };
+                    StreamRestoreModule, RtpSend, RtpRecv, PipeSink, PipeSource };
   // the modules there are, and the arguments each takes (pipewire-pulse's; a module refuses others)
   static const char* const kNullSink[] = {"sink_name", "sink_properties", "format", "rate", "channels", "channel_map"};
   static const char* const kLoopback[] = {"source", "sink", "latency_msec", "channels", "rate", "format", "channel_map", "remix", "source_dont_move",
@@ -357,6 +359,9 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
   static const char* const kRtpSend[] = {"source", "format", "channels", "rate", "destination_ip", "source_ip", "port", "mtu", "loop", "ttl",
                                          "inhibit_auto_suspend", "stream_name", "enable_opus"};
   static const char* const kRtpRecv[] = {"sink", "sap_address", "latency_msec"};
+  static const char* const kPipeSink[] = {"file", "sink_name", "sink_properties", "format", "rate", "channels", "channel_map",
+                                          "use_system_clock_for_timing"};
+  static const char* const kPipeSource[] = {"file", "source_name", "source_properties", "format", "rate", "channels", "channel_map"};
   static const char* const kStreamRestore[] = {"restore_device", "restore_volume", "restore_muted", "on_hotplug", "on_rescue", "fallback_table"};
   struct Entry {
     const char* name;
@@ -379,6 +384,8 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
       {"module-stream-restore", Kind::StreamRestoreModule, TCOS_ARGS(kStreamRestore), true},
       {"module-rtp-send", Kind::RtpSend, TCOS_ARGS(kRtpSend), false},
       {"module-rtp-recv", Kind::RtpRecv, TCOS_ARGS(kRtpRecv), false},
+      {"module-pipe-sink", Kind::PipeSink, TCOS_ARGS(kPipeSink), false},
+      {"module-pipe-source", Kind::PipeSource, TCOS_ARGS(kPipeSource), false},
   };
 #undef TCOS_ARGS
   const Entry* entry = nullptr;
@@ -621,6 +628,47 @@ uint32_t PulseServer::load_module(StringView name, StringView arguments, uint32_
       if (!m->rtp_recv || !m->rtp_recv->open(graph_.native_client_id(), to, sap, latency)) return fail(kErrInvalid);
       break;
     }
+    case Kind::PipeSink: case Kind::PipeSource: {
+      // a virtual sink whose audio goes into the named pipe `file` (default /tmp/music.output), or a virtual source fed from one (/tmp/music.input),
+      // made when missing; raw PCM in `format` (default s16le), rate (48000) and channels (2: at most two, as every virtual node here)
+      if (!pipe_files_) return fail(kErrNotSupported);
+      const bool sink = kind == Kind::PipeSink;
+      PcmFormat format{SampleFormat::S16Le, hardware::kAudioSampleRate, 2};
+      if (args.has("format") && !pulse_format_named(args.get("format"), &format.format)) return fail(kErrNotSupported);
+      if (args.has("rate") && (!parse_number(args.get("rate"), &format.rate) || format.rate < audio::StreamFormat::kMinRate ||
+                               format.rate > audio::StreamFormat::kMaxRate))
+        return fail(kErrInvalid);
+      uint32_t channels = 0;
+      if (args.has("channels") && (!parse_number(args.get("channels"), &channels) || channels == 0 || channels > pulse::kChannelsMax))
+        return fail(kErrInvalid);
+      if (channels == 0) channels = map_channels(args.get("channel_map"));
+      if (channels > 2) return fail(kErrNotSupported);
+      if (channels) format.channels = channels;
+      const StringView file = args.get("file").empty() ? StringView(sink ? "/tmp/music.output" : "/tmp/music.input") : args.get("file");
+      UniquePointer<IPipeFile> pipe = pipe_files_->open(file);
+      if (!pipe) return fail(kErrIo);
+      Properties node_args(allocator_);
+      for (uint64_t k = 0; k < args.count(); ++k) {
+        const StringView key = args.at(k).key.view();
+        if (key != StringView("file") && key != StringView("format") && key != StringView("use_system_clock_for_timing"))
+          node_args.set(key, args.at(k).value.view());
+      }
+      if (!node_args.has("channels")) {
+        String n(allocator_);
+        n.append_uint(format.channels);
+        node_args.set("channels", n.view());
+      }
+      m->node = module_node(node_args, !sink, sink ? "fifo_output" : "fifo_input", error);
+      if (!m->node) return 0;
+      if (sink) {
+        m->pipe_sink = UniquePointer<pipewire::PipeSink>::make(allocator_, graph_, allocator_);
+        if (!m->pipe_sink || !m->pipe_sink->open(graph_.native_client_id(), m->node, format, util::move(pipe))) return fail(kErrInvalid);
+      } else {
+        m->pipe_source = UniquePointer<pipewire::PipeSource>::make(allocator_, graph_, allocator_);
+        if (!m->pipe_source || !m->pipe_source->open(graph_.native_client_id(), m->node, format, util::move(pipe))) return fail(kErrInvalid);
+      }
+      break;
+    }
     case Kind::StreamRestoreModule:
       // the remembered volumes, from the storage; streams get them from the next tick
       restore_ = UniquePointer<StreamRestore>::make(allocator_, graph_, allocator_, restore_storage_);
@@ -790,6 +838,8 @@ void PulseServer::fill_module(TagWriter& w, uint32_t version, const Module& m) {
                                     : n == StringView("module-stream-restore")    ? "Automatically restore the volume/mute/device state of streams"
                                     : n == StringView("module-rtp-send")          ? "Read data from source and send it to the network"
                                     : n == StringView("module-rtp-recv")          ? "Receive data from a network via RTP/SAP/SDP"
+                                    : n == StringView("module-pipe-sink")         ? "Pipe sink"
+                                    : n == StringView("module-pipe-source")       ? "Pipe source"
                                                                                   : "");
     w.proplist(props);
   }
@@ -2122,6 +2172,8 @@ void PulseServer::tick() {
     if (m->echo) m->echo->pump();
     if (m->rtp_send) m->rtp_send->pump(graph_.now_ns());
     if (m->rtp_recv) m->rtp_recv->pump(graph_.now_ns());
+    if (m->pipe_sink) m->pipe_sink->pump();
+    if (m->pipe_source) m->pipe_source->pump();
   }
   if (restore_ && restore_->tick(graph_.now_ns())) send_restore_events();
   const bool changed = graph_.serial() != last_serial_;

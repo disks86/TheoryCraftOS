@@ -579,6 +579,10 @@ uint8_t ExtFileSystem::entry_type(uint16_t mode) const {
   switch (mode & kModeTypeMask) {
     case kModeDirectory: return kFtDirectory;
     case kModeLink: return kFtSymlink;
+    case kModeFifo: return kFtFifo;
+    case kModeSocket: return kFtSocket;
+    case kModeChar: return kFtCharDevice;
+    case kModeBlock: return kFtBlockDevice;
     default: return kFtRegular;
   }
 }
@@ -815,7 +819,8 @@ Status ExtFileSystem::init_inode(Inode* inode, uint16_t mode, uint32_t links) {
   return Status::Ok;
 }
 
-Status ExtFileSystem::create_node(StringView path, bool directory, uint32_t* number) {
+Status ExtFileSystem::create_node_mode(StringView path, uint16_t mode, uint32_t* number) {
+  const bool directory = (mode & kModeTypeMask) == kModeDirectory;
   Status s = begin_write();
   if (s != Status::Ok) return s;
   Resolved parent;
@@ -837,7 +842,7 @@ Status ExtFileSystem::create_node(StringView path, bool directory, uint32_t* num
   if (s != Status::Ok) return s;
   Inode node;
   node.number = ino;
-  init_inode(&node, directory ? 040755 : 0100644, directory ? 2 : 1);
+  init_inode(&node, mode, directory ? 2 : 1);
   if (directory) {
     Mapping mapping[1];
     uint32_t mapped = 0;
@@ -885,6 +890,22 @@ Status ExtFileSystem::create_directory(StringView path) {
   if (!writable_) return Status::ReadOnly;
   uint32_t number = 0;
   return create_node(path, true, &number);
+}
+
+// A FIFO, socket or device node: an inode of that type with no blocks (a device's number, which i_block would hold, is 0: none is made here).
+Status ExtFileSystem::create_special(StringView path, SpecialNode kind) {
+  uint16_t type = 0;
+  switch (kind) {
+    case SpecialNode::Fifo: type = kModeFifo; break;
+    case SpecialNode::Socket: type = kModeSocket; break;
+    case SpecialNode::CharDevice: type = kModeChar; break;
+    case SpecialNode::BlockDevice: type = kModeBlock; break;
+    case SpecialNode::None: return Status::InvalidArgument;
+  }
+  kernel::ScopedRecursiveMutex lock(mutex_);
+  if (!writable_) return Status::ReadOnly;
+  uint32_t number = 0;
+  return create_node_mode(path, static_cast<uint16_t>(type | 0644), &number);
 }
 
 Status ExtFileSystem::remove(StringView path) {
