@@ -185,6 +185,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool changed() const;
   // Did something visible change that is not in the tree (a canvas drawn on, a video frame)? Then the view only needs painting again.
   bool take_visual_change() { return objects_.take_dirty(); }
+  // What changed on screen without the page changing: see PageObjects::take_changes (the serials of the elements whose picture alone changed).
+  uint32_t take_visual_changes(ArrayView<uint32_t> nodes) { return objects_.take_changes(nodes); }
 
   // The display changed (the window was resized, the colour scheme was switched): the page's numbers and its matchMedia() lists follow, and `resize`
   // fires. A style sheet's @media rules are read again by the next render().

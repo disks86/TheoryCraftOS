@@ -938,7 +938,7 @@ bool Page::step_objects(double now_ms) {
   (void)moved;
   objects_.update(static_cast<uint64_t>(now_ms));
   deliver_object_events();
-  return objects_.take_dirty();
+  return objects_.has_changes();   // (not taken: the host takes them, to know where to draw again)
 }
 
 // --- After the page is up ------------------------------------------------------------------------------------------------------

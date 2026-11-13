@@ -28,6 +28,7 @@
 #include "Font/FontSet.hpp"
 #include "Paint/HitTest.hpp"
 #include "Gui/Control.hpp"
+#include "Gui/Controls/PageRasterizer.hpp"
 #include "Gui/Controls/ScrollBar.hpp"
 #include "Utility/UniquePointer.hpp"
 
@@ -90,6 +91,19 @@ class PageView : public Control {
   void set_object_painter(browser::IObjectPainter* painter) {
     UiGuard lock(this);
     objects_ = painter;
+    raster_.set_object_painter(painter);   // (waits for a drawing in progress: the old painter is not used once this returns)
+    ++content_version_;
+    invalidate();
+  }
+  // What the object painter draws changed. invalidate_objects(): only the pictures of these elements (the serials of their Object entries in the
+  // picture: a video's new frame), so only where they are is drawn again; invalidate_page(): anything (a picture loaded), the whole page is drawn again.
+  // The page is drawn on a thread of its own (PageRasterizer: a page that takes long to draw holds up nothing else; without threads it is drawn while
+  // the window paints) and kept between frames as a picture of its own (where the renderer can: IRenderer2D::begin_retained), so a video playing in a
+  // big page costs its own rectangle each frame, not the page.
+  void invalidate_objects(ArrayView<const uint32_t> nodes);
+  void invalidate_page() {
+    UiGuard lock(this);
+    ++content_version_;
     invalidate();
   }
   uint8_t clicked_object() const { return clicked_object_; }
@@ -141,8 +155,28 @@ class PageView : public Control {
   void set_hover_node(uint32_t link_node);
   bool hit(int32_t x, int32_t y, paint::HitResult* result) const;   // the picture's thing at a point of this control
   static void scroll_changed(void* self, Control&);
+  // The page into the retained layer: all of `layer` (frame coordinates) when `full`, else where the changed objects are; false if the renderer
+  // keeps no layers (then paint() draws the page straight onto the frame).
+  bool update_layer(graphics::IRenderer2D& r, const graphics::Rect2D& layer, int32_t left, int32_t top, uint32_t paper, bool full);
+  // The page from the drawing thread: asks for a drawing when something changed, and lays what it finished on the frame. False if there is no
+  // drawing thread (then the page is drawn here).
+  bool paint_from_thread(graphics::IRenderer2D& r, const graphics::Rect2D& layer, uint32_t paper);
+  static void raster_ready(void* self);
 
-  UniquePointer<browser::PagePicture> picture_;
+  SharedPointer<browser::PagePicture> picture_;   // (shared with the drawing thread, which may still be drawing the one before)
+  // The retained layer: its key (unique to this view), the content it holds (content_version_ and scroll_y_ when drawn), and the objects that changed since.
+  uint64_t layer_key_ = 0;
+  uint64_t content_version_ = 1, drawn_version_ = 0;
+  int32_t drawn_scroll_ = 0;
+  static constexpr uint32_t kMaxChangedObjects = 16;
+  uint32_t changed_objects_[kMaxChangedObjects] = {};
+  uint32_t changed_object_count_ = 0;
+  // The drawing thread and what was last asked of it.
+  PageRasterizer raster_;
+  bool raster_tried_ = false, layers_unsupported_ = false;
+  uint64_t asked_version_ = 0;
+  int32_t asked_scroll_ = 0;
+  uint32_t asked_w_ = 0, asked_h_ = 0;
   UniquePointer<font::FontSet> fonts_;   // the painter's fonts (made with the first picture): the page was measured with another set, on another thread
   bool picture_mode_ = false;
   int32_t scroll_y_ = 0, viewport_w_ = 1, viewport_h_ = 1, notified_w_ = 0, notified_h_ = 0;

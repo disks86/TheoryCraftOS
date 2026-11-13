@@ -183,8 +183,10 @@ DeviceRenderer2D::~DeviceRenderer2D() {
   release_view(allocator_, atlas_table_);
   while (group_depth_) {
     if (groups_[--group_depth_].mask && groups_[group_depth_].mask_slot < 0) device_.destroy_image(groups_[group_depth_].mask);
-    if (groups_[group_depth_].image) device_.destroy_image(groups_[group_depth_].image);
+    if (groups_[group_depth_].image && !groups_[group_depth_].retained) device_.destroy_image(groups_[group_depth_].image);
   }
+  for (RetainedEntry& e : retained_)
+    if (e.image) device_.destroy_image(e.image);
   for (MaskEntry& e : mask_cache_)
     if (e.image) device_.destroy_image(e.image);
   if (filter_shadow_) device_.destroy_pipeline(filter_shadow_);
@@ -1329,13 +1331,113 @@ bool DeviceRenderer2D::open_group(const Rect2D& bounds, bool detached) {
   return true;
 }
 
+// --- Retained layers -------------------------------------------------------------------------------------------------------------------
+
+DeviceRenderer2D::RetainedEntry* DeviceRenderer2D::find_retained(uint64_t key) {
+  for (RetainedEntry& e : retained_)
+    if (e.image && e.key == key) return &e;
+  return nullptr;
+}
+
+// A retained layer is an offscreen group whose image is kept: drawing goes into it as into a group (detached: its clip is its bounds, then `update`),
+// and end_retained() closes it without laying it anywhere.
+bool DeviceRenderer2D::begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) {
+  *fresh = false;
+  if (!valid_ || !groups_ok_ || in_retained_ || group_depth_ != 0 || layer_depth_ != 0 || opacity_ != 1.0f || clip_depth_ + 2 > kMaxClipDepth) return false;
+  if (!bounds.width || !bounds.height || uint64_t{bounds.width} * bounds.height > kMaxRetainedPixels) return false;
+  if (!submit_pending()) return false;   // (what was drawn so far goes to the frame first)
+  RetainedEntry* e = find_retained(key);
+  if (e && (e->width != bounds.width || e->height != bounds.height)) {   // a new size: made again
+    device_.destroy_image(e->image);
+    e->image = nullptr;
+  }
+  if (!e || !e->image) {
+    if (!e) {   // a free entry, or the least recently used one goes
+      for (RetainedEntry& r : retained_)
+        if (!r.image) {
+          e = &r;
+          break;
+        }
+      if (!e) {
+        e = &retained_[0];
+        for (RetainedEntry& r : retained_)
+          if (r.used < e->used) e = &r;
+        device_.destroy_image(e->image);
+        e->image = nullptr;
+      }
+    }
+    IImage* image = device_.create_image({{bounds.width, bounds.height}, Format::B8G8R8A8Unorm, kImageColorAttachment | kImageSampled});
+    if (!image) return false;
+    commands_->begin();
+    RenderPassBegin pass;   // (transparent black until it is drawn)
+    pass.color = image;
+    pass.clear_color_value = Vec4{0, 0, 0, 0};
+    commands_->begin_render_pass(pass);
+    commands_->end_render_pass();
+    if (!commands_->end() || !device_.submit(commands_)) {
+      device_.destroy_image(image);
+      return false;
+    }
+    e->key = key;
+    e->image = image;
+    e->width = bounds.width;
+    e->height = bounds.height;
+    *fresh = true;
+  }
+  e->used = ++retained_clock_;
+  Group& g = groups_[group_depth_++];
+  g = Group();
+  g.image = e->image;
+  g.bounds = bounds;
+  g.clip_depth = clip_depth_;
+  g.clip_overflow = clip_overflow_;
+  g.opacity = opacity_;
+  g.detached = true;
+  g.prev_detach = detach_index_;
+  g.retained = true;
+  clip_stack_[clip_depth_++] = bounds;
+  detach_index_ = clip_depth_ - 1;
+  clip_overflow_ = 0;
+  clip_stack_[clip_depth_++] = *fresh ? bounds : raster::intersect(update, bounds);
+  in_retained_ = true;
+  apply_clip();
+  return true;
+}
+
+void DeviceRenderer2D::end_retained() {
+  if (!in_retained_) return;
+  unwind_masks();   // (clips left open inside it end with it)
+  while (group_depth_ > 1) finish_group(Matrix2D(), 255, ImageFilter::Nearest);   // (groups left open inside it too)
+  submit_pending();   // its shapes into its image
+  const Group g = groups_[--group_depth_];
+  clip_depth_ = g.clip_depth;
+  clip_overflow_ = g.clip_overflow;
+  detach_index_ = g.prev_detach;
+  opacity_ = g.opacity;
+  in_retained_ = false;
+  apply_clip();
+}
+
+bool DeviceRenderer2D::draw_retained(uint64_t key, const Rect2D& bounds) {
+  if (!valid_ || in_retained_ || opacity_ != 1.0f) return false;
+  RetainedEntry* e = find_retained(key);
+  if (!e || e->width != bounds.width || e->height != bounds.height) return false;
+  e->used = ++retained_clock_;
+  if (raster::intersect(bounds, clip_).width == 0) return true;
+  const float x0 = static_cast<float>(bounds.x), y0 = static_cast<float>(bounds.y);
+  const float x1 = x0 + static_cast<float>(bounds.width), y1 = y0 + static_cast<float>(bounds.height);
+  const float xs[4] = {x0, x1, x1, x0}, ys[4] = {y0, y0, y1, y1};
+  const float scale = 1.0f;   // (its colours are premultiplied, as a group's: the composite pipeline lays it on)
+  return draw_textured_corners(*e->image, xs, ys, 0.0f, 0.0f, 1.0f, 1.0f, Filter::Nearest, &scale);
+}
+
 void DeviceRenderer2D::unwind_masks() {
   while (group_depth_ && groups_[group_depth_ - 1].mask) finish_group(Matrix2D(), 255, ImageFilter::Nearest);
 }
 
 bool DeviceRenderer2D::end_group(const Matrix2D& m, uint8_t opacity, ImageFilter filter) {
   unwind_masks();   // (clips left open inside the group end with it)
-  if (!group_depth_) return false;
+  if (!group_depth_ || groups_[group_depth_ - 1].retained) return false;   // (a retained layer ends with end_retained())
   return finish_group(m, opacity, filter);
 }
 
