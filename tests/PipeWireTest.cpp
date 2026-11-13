@@ -2763,6 +2763,82 @@ static void test_screen_source() {
 
 // ---- encoded video ----------------------------------------------------------------------------------------------------------------------------------
 
+// The layouts against GStreamer's (tests/data/formats, made by make_format_fixtures.sh): a 48 x 32 picture as its videoconvert wrote it in each of the
+// formats added for the rest of raw.h - 10-bit packed (v210, UYVP), v216, packed 4:4:4 and 4:1:1, YUV9, the tiled NV12, big-endian and alpha planar
+// YUV, planar RGB, r210, the palette - is the size the server says, and reads back as the picture it was made from (luma, and chroma where it is not
+// subsampled; RGB); the RGB ones the server writes are GStreamer's bytes.
+static void test_format_fixtures() {
+  struct Fixture { const char* name; uint32_t id; bool rgb, full_chroma; };
+  const Fixture fixtures[] = {
+      {"v210", 21, false, false}, {"v216", 22, false, false}, {"UYVP", 33, false, false}, {"IYU1", 38, false, false}, {"IYU2", 63, false, true},
+      {"v308", 28, false, true}, {"NV12_64Z32", 53, false, false}, {"YUV9", 36, false, false}, {"YVU9", 37, false, false}, {"A420", 34, false, false},
+      {"I420_10BE", 42, false, false}, {"I422_10BE", 44, false, false}, {"Y444_10BE", 46, false, true}, {"I420_12BE", 72, false, false},
+      {"I422_12LE", 75, false, false}, {"I422_12BE", 74, false, false}, {"Y444_12LE", 77, false, true}, {"Y444_12BE", 76, false, true},
+      {"P010_10BE", 61, false, false}, {"A420_10LE", 55, false, false}, {"A420_10BE", 54, false, false}, {"A422_10LE", 57, false, false},
+      {"A422_10BE", 56, false, false}, {"A444_10LE", 59, false, true}, {"A444_10BE", 58, false, true},
+      {"r210", 41, true, true}, {"RGB8P", 35, true, true}, {"GBR", 48, true, true}, {"GBR_10LE", 50, true, true}, {"GBR_10BE", 49, true, true},
+      {"GBR_12LE", 69, true, true}, {"GBR_12BE", 68, true, true}, {"GBRA", 65, true, true}, {"GBRA_10LE", 67, true, true},
+      {"GBRA_10BE", 66, true, true}, {"GBRA_12LE", 71, true, true}, {"GBRA_12BE", 70, true, true}};
+  const std::vector<uint8_t> y444 = read_test_file("tests/data/formats/src_y444.raw"), rgba = read_test_file("tests/data/formats/src_rgba.raw");
+  CHECK(y444.size() == 48 * 32 * 3 && rgba.size() == 48 * 32 * 4);
+  if (y444.size() != 48 * 32 * 3 || rgba.size() != 48 * 32 * 4) return;
+  VideoFormat to_y444, to_rgba;
+  to_y444.format = 20; to_y444.width = 48; to_y444.height = 32;
+  to_rgba.format = 11; to_rgba.width = 48; to_rgba.height = 32;
+  for (const Fixture& fx : fixtures) {
+    const std::vector<uint8_t> bytes = read_test_file((std::string("tests/data/formats/") + fx.name + ".raw").c_str());
+    VideoFormat f;
+    f.format = fx.id; f.width = 48; f.height = 32;
+    if (bytes.size() != f.frame_bytes()) printf("fixture %s: %zu bytes, the server says %llu\n", fx.name, bytes.size(), (unsigned long long)f.frame_bytes());
+    CHECK(bytes.size() == f.frame_bytes());
+    if (bytes.size() != f.frame_bytes()) continue;
+    ByteBuffer out(A);
+    CHECK(convert_video(f, ConstByteView(bytes.data(), bytes.size()), fx.rgb ? to_rgba : to_y444, &out));
+    int worst = 0, worst_chroma = 0;
+    if (fx.id == 35) {      // (the palette: each pixel what its index says, GStreamer's own quantizing aside: native-endian 0xAARRGGBB words)
+      for (size_t k = 0; k < 48 * 32 && out.size() == rgba.size(); ++k) {
+        const uint8_t* entry = bytes.data() + 48 * 32 + 4 * size_t(bytes[k]);
+        const uint8_t want[3] = {entry[2], entry[1], entry[0]};
+        for (size_t c = 0; c < 3; ++c) worst = std::max(worst, abs(int(out.view()[4 * k + c]) - int(want[c])));
+      }
+    } else if (fx.rgb) {
+      for (size_t k = 0; k < rgba.size() && out.size() == rgba.size(); ++k)
+        if (k % 4 != 3) worst = std::max(worst, abs(int(out.view()[k]) - int(rgba[k])));
+    } else {
+      for (size_t k = 0; k < 48 * 32 && out.size() == y444.size(); ++k) {
+        worst = std::max(worst, abs(int(out.view()[k]) - int(y444[k])));
+        if (fx.full_chroma)
+          for (size_t c = 1; c < 3; ++c) worst_chroma = std::max(worst_chroma, abs(int(out.view()[c * 48 * 32 + k]) - int(y444[c * 48 * 32 + k])));
+      }
+    }
+    const int allowed = fx.id == 35 ? 0 : 2;      // (the palette: exact; else the RGB pivot's rounding)
+    if (worst > allowed || worst_chroma > 2) printf("fixture %s: off by %d (chroma %d)\n", fx.name, worst, worst_chroma);
+    CHECK(worst <= allowed && worst_chroma <= 2);
+    // the RGB ones written: GStreamer's bytes (a sample at most one off)
+    if (fx.rgb && fx.id != 35) {
+      ByteBuffer mine(A);
+      CHECK(convert_video(to_rgba, ConstByteView(rgba.data(), rgba.size()), f, &mine) && mine.size() == bytes.size());
+      int diff = 0;
+      const bool sixteen = !(fx.id == 48 || fx.id == 65 || fx.id == 41);
+      const bool be = fx.id == 49 || fx.id == 68 || fx.id == 66 || fx.id == 70;
+      for (size_t k = 0; k + (sixteen ? 1 : 0) < bytes.size() && mine.size() == bytes.size(); k += sixteen ? 2 : 1) {
+        if (fx.id == 41) {      // (r210: a big-endian word of three fields)
+          if (k % 4) continue;
+          const uint32_t a = uint32_t(bytes[k]) << 24 | uint32_t(bytes[k + 1]) << 16 | uint32_t(bytes[k + 2]) << 8 | bytes[k + 3];
+          const uint32_t b = uint32_t(mine.view()[k]) << 24 | uint32_t(mine.view()[k + 1]) << 16 | uint32_t(mine.view()[k + 2]) << 8 | mine.view()[k + 3];
+          for (int sh = 0; sh < 30; sh += 10) diff = std::max(diff, abs(int((a >> sh) & 0x3FF) - int((b >> sh) & 0x3FF)));
+          continue;
+        }
+        const int a = sixteen ? (be ? bytes[k] << 8 | bytes[k + 1] : bytes[k] | bytes[k + 1] << 8) : bytes[k];
+        const int b = sixteen ? (be ? mine.view()[k] << 8 | mine.view()[k + 1] : mine.view()[k] | mine.view()[k + 1] << 8) : mine.view()[k];
+        diff = std::max(diff, abs(a - b));
+      }
+      if (diff > 1) printf("fixture %s written: off by %d\n", fx.name, diff);
+      CHECK(diff <= 1);
+    }
+  }
+}
+
 // The software codecs as the graph's decoders (what the kernel's SystemVideoCodecs is to it).
 struct SoftwareDecoders final : IVideoDecoders {
   hardware::SoftwareVideoCodec device{A};
@@ -3718,8 +3794,10 @@ static void test_video_channel() {
   VideoFormat bad = f;
   bad.format = 1;      // (SPA_VIDEO_FORMAT_ENCODED is not a raw format)
   CHECK(!bad.valid());
-  bad.format = 21;     // (v210: not carried)
+  bad.format = 90;     // (no such format)
   CHECK(!bad.valid());
+  bad.format = 21;     // (v210: carried, six pixels in sixteen bytes)
+  CHECK(bad.valid() && bad.planes() == 1 && bad.plane(0).row_bytes == ((f.width + 5) / 6) * 16);
   bad = f; bad.width = 9000;
   CHECK(!bad.valid());
   bad = f; bad.subtype = 0x2000D;      // (bayer)
@@ -3778,11 +3856,13 @@ static void test_video_channel() {
   // random planes against random formats: never a crash, a frame only when every plane fits
   std::mt19937 rng(21);
   std::vector<uint8_t> junk(4096, 0x5A);
-  const uint32_t formats[] = {2, 3, 4, 5, 6, 7, 15, 17, 18, 19, 20, 23, 24, 25, 26, 29, 32};
-  for (int round = 0; round < 2000; ++round) {
+  uint32_t formats[88];
+  uint32_t n_raw = 0;
+  for (uint32_t id = 2; id < 88; ++id) formats[n_raw++] = id;      // (every raw format)
+  for (int round = 0; round < 4000; ++round) {
     VideoChannel ch2(A);
     VideoFormat ff;
-    ff.format = formats[rng() % (sizeof formats / sizeof formats[0])];
+    ff.format = formats[rng() % n_raw];
     ff.width = 1 + rng() % 40; ff.height = 1 + rng() % 20;
     ch2.set_format(ff);
     VideoPlaneData pl[4];
@@ -3808,8 +3888,9 @@ static void test_video_channel() {
   hb.format = 12;
   CHECK(!hb.valid());      // (dsp is RGBA_F32 only)
   // conversion: every pair of the 8-bit formats round-trips a grey ramp and pure colours closely
-  const uint32_t convertible[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24, 25, 26, 27, 29, 30, 31, 32, 39, 40, 43, 45, 47,
-                                  51, 52, 60, 62, 64, 73, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87};
+  const uint32_t convertible[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                                  33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                                  63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87};      // (every raw one)
   VideoFormat rgba;
   rgba.format = 11; rgba.width = 6; rgba.height = 4;
   std::vector<uint8_t> source(6 * 4 * 4);
@@ -3827,7 +3908,7 @@ static void test_video_channel() {
     int worst = 0;
     for (size_t k = 0; k < source.size() && back.size() == source.size(); ++k)
       if (k % 4 != 3) worst = std::max(worst, abs(int(back.view()[k]) - int(source[k])));
-    const int allowed = to >= 29 && to <= 32 ? 9 : 4;      // (5 bits a component: steps of 8)
+    const int allowed = to == 35 ? 26 : to >= 29 && to <= 32 ? 9 : 4;      // (5 bits a component: steps of 8; the palette's cube: steps of 51)
     if (worst > allowed) printf("conversion through format %u: off by %d\n", to, worst);
     CHECK(worst <= allowed);
   }
@@ -3838,9 +3919,7 @@ static void test_video_channel() {
     ByteBuffer o(A);
     CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size() - 1), i420, &o));      // (short)
     CHECK(convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o) && o.size() == 5 * 4 * 4);      // (another size: scaled)
-    VideoFormat v210 = rgba;
-    v210.format = 21;      // (v210: not carried)
-    CHECK(!can_convert_video(21, 11) && !convert_video(v210, ConstByteView(source.data(), source.size()), rgba, &o));
+    CHECK(!can_convert_video(1, 11) && !can_convert_video(11, 90) && can_convert_video(21, 53));      // (ENCODED and no such format: not raw)
     // a deep format keeps colour through it: red through P010 and through float RGBA
     for (uint32_t deep : {62u, 79u, 85u}) {
       std::vector<uint8_t> red(6 * 4 * 4);
@@ -3862,12 +3941,12 @@ static void test_video_channel() {
     if (twice.size() == 32) { CHECK(twice.view()[0] == 0 && twice.view()[28] == 240 && twice.view()[8] > 0 && twice.view()[8] < 100); }
     // random sizes both ways, random formats: never out of bounds, the frame the size asked
     std::mt19937 srng(31);
-    const uint32_t fmts[] = {2, 4, 12, 15, 23, 29, 43, 52, 62, 79, 80};
-    for (int round = 0; round < 300; ++round) {
+    const size_t n_formats = sizeof convertible / sizeof convertible[0];
+    for (int round = 0; round < 1500; ++round) {      // (every raw format, odd sizes: v210's groups of six, IYU1's four, tiles past the edge)
       VideoFormat from = rgba, to = rgba;
-      from.width = 1 + srng() % 33; from.height = 1 + srng() % 17;
-      to.width = 1 + srng() % 33; to.height = 1 + srng() % 17;
-      from.format = fmts[srng() % 11]; to.format = fmts[srng() % 11];
+      from.width = 1 + srng() % 33; from.height = 1 + srng() % 37;
+      to.width = 1 + srng() % 33; to.height = 1 + srng() % 37;
+      from.format = convertible[srng() % n_formats]; to.format = convertible[srng() % n_formats];
       std::vector<uint8_t> frame(from.frame_bytes());
       for (uint8_t& v : frame) v = uint8_t(srng());
       ByteBuffer r(A);
@@ -5813,6 +5892,7 @@ int main() {
   test_camera_sources();
   test_screen_source();
   test_deep_conversion();
+  test_format_fixtures();
   test_video_decode();
   test_video_watcher();
   test_record_convert();
