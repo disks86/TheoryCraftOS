@@ -1,0 +1,85 @@
+# AppImages
+
+A Linux AppImage (`Something.AppImage`) runs like any other Linux program: start it from a terminal or open it from the desktop. The OS
+does what the AppImage's own runtime would do, without running the runtime. It does not need FUSE, a `/dev/fuse` or a setuid helper.
+
+## What happens
+
+`desktop::run_program` (src/Program/ProgramRunner.cpp) looks at every ELF it is asked to run. If the ELF carries the AppImage mark
+(`AI` and the type in bytes 8..10 of its identification), the runner hands it to `AppImageSession` (src/Program/AppImageLaunch.hpp):
+
+1. **Find the image.** For type 2, the SquashFS image starts where the runtime ELF ends. That is the end of its section header table or of
+   its last section, whichever is later (`exe::appimage_payload_offset`, src/Executable/AppImage.hpp). Type 1 (ISO 9660) is refused with a
+   message.
+2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash) reads the image straight from the AppImage file. A `GraftFileSystem`
+   (src/FileSystem/Mount) places it at `/tmp/.mount_<first six characters of the name><id>` of the Linux world, the way the runtime names its
+   mount point. The graft is the program's own view of the OS file system, so nothing else sees the mount and nothing is left behind. It
+   lasts as long as the program runs.
+3. **Set the runtime's variables:** `APPDIR` (the mount point), `APPIMAGE` and `ARGV0` (the AppImage's path: inside the Linux world if it
+   is there, otherwise the OS path), `OWD` (the starting folder).
+4. **Work out what `AppRun` starts** (`evaluate_apprun`, src/Program/AppRunScript.hpp).
+   - An ELF `AppRun`, or a link to one, is the program itself.
+   - A shell-script `AppRun` (electron-builder, linuxdeploy, most hand-made AppImages) is interpreted by a small built-in shell. The Linux
+     layer has no fork or exec, so real bash could neither run the command substitutions these scripts use nor hand over to the program.
+     - The built-in shell covers variables, exports, arrays, parameter expansion, quoting, globbing, `if`/`while`/`for`, functions,
+       `trap … EXIT`, `source`, `eval` and `test`/`[[ ]]`.
+     - In `$( )` it supports dirname, basename, readlink -f, realpath, pwd, echo, printf, uname and id.
+     - The script hands over through `exec prog …`, or by running a program that lies inside the image. That program is the result, with
+       every exported variable. If that program is itself a script, it is interpreted in turn.
+     - Any other command fails with status 127 and the script carries on, as a shell would.
+   - If `AppRun` leads nowhere, the program named on the `Exec=` line of the root `.desktop` entry is started instead. It is looked for in
+     `usr/bin`, the root, `bin` and `usr/sbin`, and gets the variables AppImageKit's `AppRun` binary would set (`PATH`, `LD_LIBRARY_PATH`,
+     `XDG_DATA_DIRS`, …).
+5. **Electron apps** (a `chrome-sandbox` next to the program) get `--no-sandbox`. Chromium's sandbox needs user namespaces or a setuid
+   helper, and this OS has neither.
+
+The program then runs as any dynamically linked Linux program (see LinuxDynamicPrograms.md): its interpreter and system libraries
+(glibc, `ld-linux-x86-64.so.2`) come from `/Linux` as usual, and the libraries the AppImage bundles come from the mount through
+`LD_LIBRARY_PATH` or the program's RPATH.
+
+## SquashFS
+
+All SquashFS 4.0 features mksquashfs writes are read:
+
+- every compressor: gzip, LZMA, LZO, XZ (with BCJ filters), LZ4 and Zstandard. The decoders are in src/Media (`Zlib`, `Xz`, `Lzo`, `Lz4`,
+  `Zstd`);
+- basic and extended inodes, holes, fragments, large directories, hard links;
+- symbolic links, followed in every component.
+
+Extended attributes and the export table are ignored. Decompressed metadata and data blocks are cached (32 and 8 blocks). Decompression
+runs outside the cache lock.
+
+## Tests
+
+- `tests/run_host_tests.sh AppImageTest` builds with ASan and UBSan and covers:
+  - SquashFS images the test writes itself with the reference compressor libraries (zlib, libzstd, liblzma, liblz4, liblzo2, each used when
+    pkg-config finds it): 4 KiB and 128 KiB blocks, with and without fragments, holes and extended inodes, and stored uncompressed;
+  - truncated and bit-flipped images;
+  - 8 threads reading at once;
+  - the AppImage header parser, including 32-bit, big-endian and damaged headers;
+  - the graft;
+  - AppRun scripts in the style of electron-builder and linuxdeploy, hand-written launchers and fuzzed scripts;
+  - an end-to-end `AppImageSession` on a RAM file system.
+- `ZstdTest` and `XzLz4Test` test the decoders against the zstd, xz and lz4 command-line tools and liblzo2.
+- `tests/appimage_qemu.sh` packs `tests/linux/appimagetest.c` (static) with a bash-style `AppRun` into `/Desktop/Downloads/Hello.AppImage`.
+  The kernel autoruns it under QEMU (its own build folder, `build-appimage-qemu`). It passes 13 checks on the real kernel: the mount,
+  the variables, AppRun's export, the arguments, a 1 MB file over many blocks, a listing, a link, and refusing writes.
+- `tests/appimage_interop.sh <file.AppImage>[:pattern] ...` checks the reader against real AppImages. It extracts each one with its own
+  runtime (`--appimage-extract`), compares every file, folder and link, then prints what AppRun would start. `AppImageTest --dump` and
+  `--apprun` do the two halves without running the AppImage.
+
+## What is not done
+
+- **Type 1 AppImages** (ISO 9660) are refused.
+- **Absolute symbolic links inside the image** resolve from the image's root, not from the Linux world's root. A link such as
+  `usr/share/zoneinfo -> /usr/share/zoneinfo` therefore finds nothing.
+- **AppRun scripts get no real process.** A script that needs a real external command to decide what to start (`sed`, `grep`, `awk` for
+  something that matters) may pick the wrong program. `case` blocks are skipped, and `$(( ))` arithmetic and `${X:offset}` are not
+  supported (the command that uses them is skipped).
+- **No `execve` or `fork` in the Linux layer.** A program that starts helper processes (Electron's zygote and renderers, for example)
+  still fails at that point.
+- **`/proc/self/exe`** is not answered, so glibc's `$ORIGIN` falls back to `LD_ORIGIN_PATH`, which is not set. AppRun normally sets
+  `LD_LIBRARY_PATH`, which covers the usual case.
+- **No desktop integration:** no menu entries or icons from the image's desktop file, and no AppImageUpdate.
+- **Only a small static test program has run in the OS.** Real desktop AppImages (Electron, GTK) have not been started in QEMU yet;
+  they also need glibc and the system libraries in `/Linux` (see LinuxDynamicPrograms.md).
