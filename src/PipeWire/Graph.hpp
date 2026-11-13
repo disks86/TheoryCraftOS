@@ -249,7 +249,7 @@ class Graph {
   bool add_source_locked();
   uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor, uint32_t target = 0);
   void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor, uint32_t target = 0);
-  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer = nullptr);
+  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, VirtualOutput* sink = nullptr);
   SharedPointer<VirtualOutput> virtual_output_locked(uint32_t node);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);

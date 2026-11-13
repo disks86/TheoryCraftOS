@@ -516,9 +516,9 @@ uint32_t Graph::video_watchers(uint32_t producer) {
 }
 
 uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate) {
-  if (channels < 1 || channels > 2 || !clock_.set_up()) return 0;
-  // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; the node says the sink's own format)
-  SharedPointer<VirtualOutput> output = SharedPointer<VirtualOutput>::make(allocator_, allocator_, clock_);
+  if (channels < 1 || channels > 2 || rate < audio::StreamFormat::kMinRate || rate > audio::StreamFormat::kMaxRate || !clock_.set_up()) return 0;
+  // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; its monitor is made the sink's own format)
+  SharedPointer<VirtualOutput> output = SharedPointer<VirtualOutput>::make(allocator_, allocator_, clock_, rate, channels);
   if (!output || !output->initialize()) return 0;
   kernel::ScopedMutex guard(mutex_);
   GraphObject* c = find_locked(client);
@@ -867,9 +867,9 @@ void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, 
   }
 }
 
-SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer) {
-  if (mixer) monitor = true;
-  else mixer = mixer_;
+SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor, VirtualOutput* sink) {
+  audio::AudioMixer* mixer = sink ? &sink->mixer() : mixer_;
+  if (sink) monitor = true;
   if (monitor ? !mixer : (!capture_ || !source_)) return SharedPointer<RecordStream>();
   if (!format.valid()) return SharedPointer<RecordStream>();
   audio::StreamFormat sf;
@@ -882,8 +882,10 @@ SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, b
   SharedPointer<audio::CaptureStream> capture;
   if (monitor) {
     // (a stream of its own that the mixer feeds what it mixes)
+    // (a virtual sink's: made the sink's own format on the way)
     capture = SharedPointer<audio::CaptureStream>::make(allocator_, allocator_, sf);
-    if (capture && (!capture->allocate(ring) || !mixer->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
+    if (capture && ((sink && !capture->set_shape(sink->shape())) || !capture->allocate(ring) || !mixer->add_tap(capture)))
+      capture = SharedPointer<audio::CaptureStream>();
   } else {
     capture = capture_->open_stream(sf, ring, true);      // (marked: refresh() must not take it for a native program's)
   }
@@ -903,7 +905,7 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     if (!c || c->type != ObjectType::Client) return 0;
     if (target && !(from = virtual_output_locked(target))) return 0;
   }
-  SharedPointer<RecordStream> record = open_record_stream(format, monitor, from ? &from->mixer() : nullptr);
+  SharedPointer<RecordStream> record = open_record_stream(format, monitor, from.get());
   if (!record) return 0;
   uint32_t id = 0;
   {

@@ -2280,6 +2280,80 @@ static void test_windows_virtual_sink() {
   CHECK(service.stream_count() == 0);
 }
 
+// A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
+// alike), a 16 kHz sink's carries a 1 kHz tone whole and loses a 20 kHz one (above what 16 kHz can hold), and a 48 kHz stereo one changes nothing.
+static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate) {
+  const size_t n = s.size() / channels;
+  if (n == 0) return 0;
+  double re = 0, im = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const double a = 2 * M_PI * hz * double(i) / rate;
+    re += s[i * channels + channel] * cos(a);
+    im += s[i * channels + channel] * sin(a);
+  }
+  return 2 * sqrt(re * re + im * im) / double(n) / 32768.0;
+}
+
+static void test_virtual_sink_shape() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  CHECK(g.create_virtual_node(g.native_client_id(), Properties(A), 2, 1000) == 0);      // (a rate no sink has)
+  WindowsAudioService service(g, A);
+  // plays `left` Hz on the left and `right` Hz on the right (0: silence), each at a quarter of full scale, into `sink`; what its monitor holds, read
+  // in stereo at 48 kHz, after the first tenth of a second
+  auto through = [&](uint32_t sink, double left, double right) {
+    uint32_t out = 0, in = 0, taken = 0, got = 0;
+    std::vector<int16_t> heard;
+    if (service.open(30, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, sink) != 0 ||
+        service.open_capture(30, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &in, false, sink) != 0)
+      return heard;
+    std::vector<uint8_t> pcm(48000 * 4);
+    for (uint32_t i = 0; i < 48000; ++i) {
+      const int16_t l = left ? int16_t(8192 * sin(2 * M_PI * left * i / 48000)) : 0, r = right ? int16_t(8192 * sin(2 * M_PI * right * i / 48000)) : 0;
+      pcm[4 * i] = uint8_t(l); pcm[4 * i + 1] = uint8_t(uint16_t(l) >> 8); pcm[4 * i + 2] = uint8_t(r); pcm[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    uint64_t written = 0;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int i = 0; i < 200 && heard.size() < 2 * 24000; ++i) {
+      if (written < pcm.size() && service.write(30, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      g.refresh();
+      if (service.read(30, in, ByteView(buf.data(), buf.size()), &got) == 0)
+        for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(30);
+    if (heard.size() > 2 * 4800) heard.erase(heard.begin(), heard.begin() + 2 * 4800);
+    return heard;
+  };
+  Properties props(A);
+  props.set("node.name", "mono-null");
+  const uint32_t mono = g.create_virtual_node(g.native_client_id(), props, 1, 48000);
+  props.set("node.name", "narrow-null");
+  const uint32_t narrow = g.create_virtual_node(g.native_client_id(), props, 2, 16000);
+  props.set("node.name", "plain-null");
+  const uint32_t plain = g.create_virtual_node(g.native_client_id(), props, 2, 48000);
+  CHECK(mono && narrow && plain);
+  // mono: 1 kHz on the left only comes out at half on both sides
+  std::vector<int16_t> m = through(mono, 1000, 0);
+  CHECK(m.size() >= 2 * 9600);
+  const double ml = tone_level(m, 2, 0, 1000, 48000), mr = tone_level(m, 2, 1, 1000, 48000);
+  CHECK(ml > 0.115 && ml < 0.135 && mr > 0.115 && mr < 0.135);
+  // the plain one: as played, left only
+  std::vector<int16_t> p = through(plain, 1000, 0);
+  const double pl = tone_level(p, 2, 0, 1000, 48000), pr = tone_level(p, 2, 1, 1000, 48000);
+  CHECK(p.size() >= 2 * 9600 && pl > 0.24 && pl < 0.26 && pr < 0.005);
+  // 16 kHz: 1 kHz kept, 20 kHz gone (from 0.25 to under a tenth of it)
+  std::vector<int16_t> n = through(narrow, 1000, 20000);
+  const double low = tone_level(n, 2, 0, 1000, 48000), high = tone_level(n, 2, 1, 20000, 48000);
+  CHECK(n.size() >= 2 * 9600 && low > 0.22 && low < 0.26 && high < 0.025);
+  std::vector<int16_t> pw = through(plain, 0, 20000);
+  CHECK(tone_level(pw, 2, 1, 20000, 48000) > 0.2);      // (the 48 kHz sink keeps it)
+}
+
 // ---- the cameras as video sources -------------------------------------------------------------------------------------------------------------------
 
 struct FakeCamera final : hardware::ICamera {
@@ -4883,6 +4957,7 @@ int main() {
   test_pulse_protocol();
   test_windows_service();
   test_windows_virtual_sink();
+  test_virtual_sink_shape();
   test_camera_sources();
   test_screen_source();
   test_video_decode();
