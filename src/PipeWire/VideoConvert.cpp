@@ -501,24 +501,25 @@ bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat&
   return true;
 }
 
-bool can_decode_video(const VideoFormat& from, uint32_t to) { return from.subtype == kSubtypeMjpg && can_convert_video(kBGRA, to); }
+bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoDecoders* decoders) {
+  return from.encoded() && can_decode_subtype(from.subtype, decoders) && can_convert_video(kBGRA, to);
+}
 
-bool decode_video(ConstByteView frame, const VideoFormat& to, hardware::JpegDecoder& decoder, List<uint32_t>* scratch, ByteBuffer* out) {
-  if (to.encoded() || !to.valid() || !decoder.decode(frame) || decoder.width() == 0 || decoder.height() == 0) return false;
-  VideoFormat bgra;
-  bgra.format = kBGRA;
-  bgra.width = decoder.width();
-  bgra.height = decoder.height();
-  if (!bgra.valid()) return false;
-  const uint64_t pixels = uint64_t{bgra.width} * bgra.height;
-  if (scratch->count() < pixels) {
-    if (!scratch->reserve(pixels)) return false;
-    while (scratch->count() < pixels)
-      if (!scratch->push_back(0)) return false;
+bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoDecoders* decoders,
+                  ByteBuffer* out, bool* failed) {
+  *failed = false;
+  if (to.encoded() || !to.valid()) {
+    *failed = true;
+    return false;
   }
-  ArrayView<uint32_t> words = scratch->view().first(pixels);
-  if (!decoder.output_bgra(words.data(), bgra.width)) return false;
-  return convert_video(bgra, words_as_bytes(ArrayView<const uint32_t>(words)), to, out);      // (to its format and size)
+  VideoFormat picture;
+  ConstByteView pixels;
+  if (!session.decode(from.subtype, frame, decoders, &picture, &pixels, failed)) return false;
+  if (!convert_video(picture, pixels, to, out)) {      // (to its format and size)
+    *failed = true;
+    return false;
+  }
+  return true;
 }
 
 }  // namespace pipewire

@@ -814,19 +814,23 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
     p.video = v;
     uint32_t wanted[32];
     const uint32_t listed = v.encoded() ? 0 : enum_video_formats(p.enum_format.view(), wanted, 32);
-    // (a raw watcher of a Motion JPEG producer of a known size: offered raw, the frames decoded; the first format it lists that can be made, else BGRx)
-    if (v.subtype == kSubtypeMjpg && v.width && v.height && enum_subtype(p.enum_format.view()) == VideoFormat::kSubtypeRaw) {
+    // (a raw watcher of an encoded producer of a known size whose frames can be decoded: offered raw, the frames decoded; the first format it lists
+    // that can be made, else BGRx)
+    IVideoDecoders* decoders = graph_.video_decoders();
+    const bool decoded = v.encoded() && v.width && v.height && can_decode_subtype(v.subtype, decoders) &&
+                         enum_subtype(p.enum_format.view()) == VideoFormat::kSubtypeRaw;
+    if (decoded) {
       const uint32_t raw_listed = enum_video_formats(p.enum_format.view(), wanted, 32);
       p.video.subtype = VideoFormat::kSubtypeRaw;
       p.video.format = 8;
       for (uint32_t k = 0; k < raw_listed; ++k)
-        if (can_decode_video(v, wanted[k])) {
+        if (can_decode_video(v, wanted[k], decoders)) {
           p.video.format = wanted[k];
           break;
         }
     }
     // the size it takes: scaled to it when that is not the producer's (and the frames can be converted at all)
-    if (v.width && v.height && (!v.encoded() ? can_convert_video(v.format, v.format) : v.subtype == kSubtypeMjpg && p.video.subtype == VideoFormat::kSubtypeRaw)) {
+    if (v.width && v.height && (!v.encoded() ? can_convert_video(v.format, v.format) : decoded)) {
       uint32_t ww = 0, wh = 0;
       watcher_size(p.enum_format.view(), v.width, v.height, &ww, &wh);
       p.video.width = ww;
@@ -1403,6 +1407,7 @@ void NativeServer::renegotiate(Client& c, ClientNode& n) {
     p.buffers_sent = false;
     p.data_ready = false;
     p.wants_alloc = false;
+    p.decode = UniquePointer<VideoDecodeSession>();      // (a new stream: its decoder starts again)
     ByteBuffer format(allocator_);
     if (fixate_format(n, p, &format)) send_port_param(c, n, p, format.view());
     drop_port_buffers(c, p);
@@ -1639,10 +1644,11 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       // (in the watcher's format: converted when that is not the producer's)
       ConstByteView pixels = frame->pixels.view();
       if (!(v == p.source_video)) {
-        if (p.source_video.encoded()) {      // (Motion JPEG to a raw watcher: decoded)
-          if (!p.jpeg) p.jpeg = UniquePointer<hardware::JpegDecoder>::make(allocator_, allocator_);
-          if (!p.jpeg || !decode_video(pixels, v, *p.jpeg, &p.jpeg_words, &p.converted)) {
-            p.video_seen = frame->sequence;      // (a frame that cannot be decoded is passed over)
+        if (p.source_video.encoded()) {      // (encoded video to a raw watcher: decoded)
+          if (!p.decode) p.decode = UniquePointer<VideoDecodeSession>::make(allocator_, allocator_);
+          bool failed = false;
+          if (!p.decode || !decode_video(pixels, p.source_video, v, *p.decode, graph_.video_decoders(), &p.converted, &failed)) {
+            p.video_seen = frame->sequence;      // (a frame that cannot be decoded is passed over; one the decoder holds back comes out later)
             return false;
           }
         } else if (!convert_video(p.source_video, pixels, v, &p.converted)) {

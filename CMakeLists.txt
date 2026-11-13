@@ -234,6 +234,7 @@ add_executable(BOOTX64
   src/PipeWire/MidiBus.cpp
   src/PipeWire/VideoChannel.cpp
   src/PipeWire/VideoConvert.cpp
+  src/PipeWire/VideoDecode.cpp
   src/PipeWire/CameraSource.cpp
   src/PipeWire/ScreenSource.cpp
   src/PipeWire/VideoWatcher.cpp

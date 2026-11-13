@@ -2144,6 +2144,14 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll, dsound.dll, WASAPI and NtTcosAudio. Recording goes the same ways
     // through the capture hub: the graph's source is the microphone it shares. (Gone before the mixer and the hub are.)
     pipewire::Graph media_graph(shared_allocator, mixer.get(), capture_hub.get());
+    // Encoded video (H.264, VP9, ...) that a raw watcher takes, or the Video Viewer shows, is decoded by sessions of the machine's video codecs.
+    struct GraphVideoDecoders final : pipewire::IVideoDecoders {
+      hardware::SystemVideoCodecs& codecs;
+      explicit GraphVideoDecoders(hardware::SystemVideoCodecs& c) : codecs(c) {}
+      bool can_decode(hardware::VideoCodec codec) const override { return (codecs.decode_codecs() & hardware::codec_mask(codec)) != 0; }
+      UniquePointer<hardware::IVideoDecoder> create_decoder(const hardware::DecoderConfig& config) override { return codecs.create_decoder(config); }
+    } graph_video_decoders(video_codecs);
+    media_graph.set_video_decoders(&graph_video_decoders);
     pipewire::NativeServer pipewire_native(media_graph, shared_allocator, [] { return hardware::uptime_us() * 1000; });
     // MIDI: what programs play sounds on the machine's synthesizer (a USB one, the MPU-401, else the software one); what keyboards play is heard by
     // the programs that record MIDI. (Undone before the graph goes.)

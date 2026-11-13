@@ -18,7 +18,7 @@
 
 // The Video Viewer: what a video source of the system shows (the cameras, the screen, a program's camera or screen share: every PipeWire video
 // producer), picked from a list, the picture fitted to the window. It watches only the source it shows and only while it is open (so a camera
-// streams only then); Motion JPEG is decoded. The sources come from an IVideoSources the kernel gives the desktop (src/PipeWire over the graph).
+// streams only then); encoded video is decoded (Motion JPEG, and H.264, H.265, MPEG-2, VC-1, VP8 and VP9 through the machine's video codecs). The sources come from an IVideoSources the kernel gives the desktop (src/PipeWire over the graph).
 #pragma once
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/ImageView.hpp"

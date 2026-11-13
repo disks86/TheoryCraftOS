@@ -40,6 +40,8 @@
 #include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/VideoConvert.hpp"
+#include "PipeWire/VideoDecode.hpp"
+#include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/RecordStream.hpp"
@@ -2460,6 +2462,192 @@ static void test_screen_source() {
   CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
 }
 
+// ---- encoded video ----------------------------------------------------------------------------------------------------------------------------------
+
+// The software codecs as the graph's decoders (what the kernel's SystemVideoCodecs is to it).
+struct SoftwareDecoders final : IVideoDecoders {
+  hardware::SoftwareVideoCodec device{A};
+  int made = 0;
+  bool can_decode(hardware::VideoCodec codec) const override { return device.can_decode(codec); }
+  UniquePointer<hardware::IVideoDecoder> create_decoder(const hardware::DecoderConfig& config) override {
+    ++made;
+    return device.create_decoder(config);
+  }
+};
+
+// A moving test picture (0xAARRGGBB).
+static std::vector<uint32_t> test_picture(uint32_t w, uint32_t h, uint32_t frame) {
+  std::vector<uint32_t> px(size_t(w) * h);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint32_t r = (x * 255 / (w - 1) + frame * 8) & 0xFF, g = y * 255 / (h - 1), b = ((x / 8 + y / 8 + frame) & 1) ? 200 : 40;
+      px[size_t(y) * w + x] = 0xFF000000u | r << 16 | g << 8 | b;
+    }
+  return px;
+}
+
+// `count` pictures as H.264 access units (Annex B), from the software encoder.
+static std::vector<std::vector<uint8_t>> encode_h264(uint32_t w, uint32_t h, uint32_t count, uint32_t keyframe_interval) {
+  std::vector<std::vector<uint8_t>> out;
+  hardware::SoftwareVideoCodec device(A);
+  hardware::EncoderConfig ec;
+  ec.codec = hardware::VideoCodec::H264;
+  ec.width = w;
+  ec.height = h;
+  ec.input = hardware::PixelFormat::Bgra8888;
+  ec.quality = 90;
+  ec.keyframe_interval = keyframe_interval;
+  UniquePointer<hardware::IVideoEncoder> enc = device.create_encoder(ec);
+  if (!enc) return out;
+  for (uint32_t i = 0; i < count; ++i) {
+    std::vector<uint32_t> px = test_picture(w, h, i);
+    hardware::VideoFrame f;
+    f.format = {w, h, hardware::PixelFormat::Bgra8888};
+    f.plane[0] = words_as_bytes(ArrayView<const uint32_t>(px.data(), px.size())).data();
+    f.stride[0] = w * 4;
+    f.pts_us = int64_t(i) * 33333;
+    if (enc->submit(f) != hardware::SubmitResult::Accepted) return {};
+    hardware::VideoPacket pkt;
+    while (enc->receive(&pkt)) out.emplace_back(pkt.data.data(), pkt.data.data() + pkt.data.size());
+  }
+  enc->flush();
+  hardware::VideoPacket pkt;
+  while (enc->receive(&pkt)) out.emplace_back(pkt.data.data(), pkt.data.data() + pkt.data.size());
+  return out;
+}
+
+// The frames of an IVF file (VP8, VP9).
+static std::vector<std::vector<uint8_t>> ivf_frames(const std::vector<uint8_t>& file) {
+  std::vector<std::vector<uint8_t>> out;
+  if (file.size() < 32 || memcmp(file.data(), "DKIF", 4) != 0) return out;
+  const size_t header = size_t(file[6]) | size_t(file[7]) << 8;
+  for (size_t at = header; at + 12 <= file.size();) {
+    const size_t n = size_t(file[at]) | size_t(file[at + 1]) << 8 | size_t(file[at + 2]) << 16 | size_t(file[at + 3]) << 24;
+    at += 12;
+    if (n > file.size() - at) break;
+    out.emplace_back(file.begin() + long(at), file.begin() + long(at + n));
+    at += n;
+  }
+  return out;
+}
+
+// The pictures a decoder of the software codecs gives for `packets`, in order, as BGRA bytes (what the graph's decoding must match).
+static std::vector<std::vector<uint8_t>> reference_pictures(hardware::VideoCodec codec, const std::vector<std::vector<uint8_t>>& packets, uint32_t* w,
+                                                             uint32_t* h) {
+  std::vector<std::vector<uint8_t>> out;
+  hardware::SoftwareVideoCodec device(A);
+  hardware::DecoderConfig config;
+  config.codec = codec;
+  config.output = hardware::PixelFormat::Bgra8888;
+  UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+  if (!dec) return out;
+  auto take = [&] {
+    hardware::VideoFrame f;
+    while (dec->receive(&f)) {
+      *w = f.format.width;
+      *h = f.format.height;
+      std::vector<uint8_t> px(size_t(f.format.width) * f.format.height * 4);
+      for (uint32_t y = 0; y < f.format.height; ++y) memcpy(px.data() + size_t(y) * f.format.width * 4, f.plane[0] + size_t(y) * f.stride[0], f.format.width * 4u);
+      out.push_back(std::move(px));
+    }
+  };
+  int64_t pts = 0;
+  for (const std::vector<uint8_t>& p : packets) {
+    hardware::VideoPacket pkt;
+    pkt.data = ConstByteView(p.data(), p.size());
+    pkt.pts_us = pts;
+    pkt.keyframe = false;
+    pts += 33333;
+    while (dec->submit(pkt) == hardware::SubmitResult::Full) take();
+    take();
+  }
+  return out;
+}
+
+// VideoDecodeSession: H.264 (from the encoder) and VP8 (a file) decoded as a decoder of the codecs would, the codec switched in the middle; without
+// decoders only Motion JPEG; truncated and bit-flipped frames are refused or decoded, never read past; decode_video to another format and size.
+static void test_video_decode() {
+  SoftwareDecoders decoders;
+  CHECK(can_decode_subtype(kSubtypeMjpg, nullptr) && !can_decode_subtype(kSubtypeH264, nullptr) && can_decode_subtype(kSubtypeH264, &decoders) &&
+        can_decode_subtype(kSubtypeVp9, &decoders) && can_decode_subtype(kSubtypeH265, &decoders) && !can_decode_subtype(0x20003, &decoders) &&
+        !can_decode_subtype(VideoFormat::kSubtypeRaw, &decoders));
+  hardware::VideoCodec codec;
+  CHECK(codec_of_subtype(kSubtypeVc1, &codec) && codec == hardware::VideoCodec::Vc1 && !codec_of_subtype(kSubtypeMjpg, &codec));
+  const std::vector<std::vector<uint8_t>> h264 = encode_h264(64, 48, 8, 4);
+  CHECK(h264.size() == 8);
+  uint32_t rw = 0, rh = 0;
+  const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, h264, &rw, &rh);
+  CHECK(want.size() == 8 && rw == 64 && rh == 48);
+  VideoDecodeSession session(A);
+  VideoFormat f;
+  ConstByteView px;
+  bool failed = false;
+  CHECK(!session.decode(kSubtypeH264, ConstByteView(h264[0].data(), h264[0].size()), nullptr, &f, &px, &failed) && failed);      // (no decoders)
+  session.reset();
+  size_t matched = 0;
+  for (size_t i = 0; i < h264.size(); ++i) {
+    const bool got = session.decode(kSubtypeH264, ConstByteView(h264[i].data(), h264[i].size()), &decoders, &f, &px, &failed);
+    CHECK(got && !failed && f.format == 12 && f.width == 64 && f.height == 48 && px.size() == 64 * 48 * 4);
+    if (got && i < want.size() && px.size() == want[i].size() && memcmp(px.data(), want[i].data(), px.size()) == 0) ++matched;
+    if (got && px.size() == 64 * 48 * 4) {      // (close to the picture encoded)
+      const std::vector<uint32_t> src = test_picture(64, 48, uint32_t(i));
+      uint64_t err = 0;
+      for (size_t k = 0; k < src.size(); ++k)
+        for (int c = 0; c < 3; ++c) err += uint64_t(abs(int((src[k] >> (8 * c)) & 0xFF) - int(px[4 * k + size_t(c)])));
+      CHECK(err / (src.size() * 3) < 12);
+    }
+  }
+  CHECK(matched == h264.size() && decoders.made == 1);
+  // VP8 from a file, then H.264 again (each switch a new decoder)
+  const std::vector<std::vector<uint8_t>> vp8 = ivf_frames(read_test_file("tests/data/vp8_inter.ivf"));
+  CHECK(vp8.size() >= 4);
+  const std::vector<std::vector<uint8_t>> want8 = reference_pictures(hardware::VideoCodec::Vp8, vp8, &rw, &rh);
+  CHECK(want8.size() == vp8.size());
+  matched = 0;
+  for (size_t i = 0; i < vp8.size(); ++i)
+    if (session.decode(kSubtypeVp8, ConstByteView(vp8[i].data(), vp8[i].size()), &decoders, &f, &px, &failed) && i < want8.size() &&
+        f.width == rw && f.height == rh && px.size() == want8[i].size() && memcmp(px.data(), want8[i].data(), px.size()) == 0)
+      ++matched;
+  CHECK(matched == vp8.size() && decoders.made == 2);
+  CHECK(session.decode(kSubtypeH264, ConstByteView(h264[0].data(), h264[0].size()), &decoders, &f, &px, &failed) && f.width == 64 && decoders.made == 3);
+  // Motion JPEG through the same session
+  const std::vector<uint8_t> jpeg = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+  CHECK(session.decode(kSubtypeMjpg, ConstByteView(jpeg.data(), jpeg.size()), nullptr, &f, &px, &failed) && f.width == 64 && f.height == 48 &&
+        px.size() == 64 * 48 * 4);
+  // to NV12 at half size: decoded, then converted and scaled
+  ByteBuffer out(A);
+  VideoFormat from;
+  from.subtype = kSubtypeH264;
+  VideoFormat nv12;
+  nv12.format = 23; nv12.width = 32; nv12.height = 24;
+  VideoDecodeSession s2(A);
+  CHECK(decode_video(ConstByteView(h264[0].data(), h264[0].size()), from, nv12, s2, &decoders, &out, &failed) && out.size() == nv12.frame_bytes());
+  CHECK(can_decode_video(from, 23, &decoders) && !can_decode_video(from, 23, nullptr));
+  VideoFormat enc_to = nv12;
+  enc_to.subtype = kSubtypeH264;
+  CHECK(!decode_video(ConstByteView(h264[1].data(), h264[1].size()), from, enc_to, s2, &decoders, &out, &failed) && failed);
+  // truncations and bit flips of a keyframe and of the frames after it: refused or decoded, never past the frame's bytes (ASan)
+  std::mt19937 rng(7);
+  for (int round = 0; round < 2; ++round) {
+    const std::vector<std::vector<uint8_t>>& stream = round == 0 ? h264 : vp8;
+    const uint32_t subtype = round == 0 ? kSubtypeH264 : kSubtypeVp8;
+    for (size_t cut = 0; cut < stream[0].size(); cut += 1 + stream[0].size() / 40) {
+      VideoDecodeSession t(A);
+      std::vector<uint8_t> part(stream[0].begin(), stream[0].begin() + long(cut));
+      t.decode(subtype, ConstByteView(part.data(), part.size()), &decoders, &f, &px, &failed);
+      for (size_t k = 1; k < 3 && k < stream.size(); ++k) t.decode(subtype, ConstByteView(stream[k].data(), stream[k].size()), &decoders, &f, &px, &failed);
+    }
+    for (int flip = 0; flip < 60; ++flip) {
+      VideoDecodeSession t(A);
+      for (size_t k = 0; k < 3 && k < stream.size(); ++k) {
+        std::vector<uint8_t> bad = stream[k];
+        for (int b = 0; b < 3; ++b) bad[rng() % bad.size()] ^= uint8_t(1u << (rng() % 8));
+        if (t.decode(subtype, ConstByteView(bad.data(), bad.size()), &decoders, &f, &px, &failed)) CHECK(f.valid() && px.size() == uint64_t{f.width} * f.height * 4);
+      }
+    }
+  }
+}
+
 // The kernel's own watcher (the Video Viewer's): the producers listed, one watched by a node of the kernel's (so a camera would start), its frames as
 // 0xAARRGGBB words, converted from YUV, encoded video and a producer that went said so.
 static void test_video_watcher() {
@@ -2513,12 +2701,28 @@ static void test_video_watcher() {
   CHECK(w.latest(&seq, &px, &width, &height, &why) && width == 64 && height == 48 && px.count() == 64 * 48 && (px[0] >> 24) == 0xFF);
   const uint8_t broken[4] = {0xFF, 0xD8, 0xFF, 0xD9};
   CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
-  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A Motion JPEG picture that cannot be decoded"));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A picture that cannot be decoded"));
+  // H.264: said, not shown, while the graph has no decoders; decoded once it has (each picture as a decoder of the codecs gives it)
   VideoFormat h264;
   h264.subtype = 0x20001;
   cam->set_format(h264);
+  const std::vector<std::vector<uint8_t>> avc = encode_h264(32, 16, 3, 30);
+  CHECK(avc.size() == 3 && cam->publish(ConstByteView(avc[0].data(), avc[0].size()), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video this computer cannot decode"));
+  SoftwareDecoders decoders;
+  g.set_video_decoders(&decoders);
+  uint32_t rw = 0, rh = 0;
+  const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &rw, &rh);
+  CHECK(want.size() == 3);
+  for (size_t i = 0; i < avc.size(); ++i) {
+    CHECK(cam->publish(ConstByteView(avc[i].data(), avc[i].size()), 0, 0));
+    const bool shown = w.latest(&seq, &px, &width, &height, &why);
+    CHECK(shown && width == 32 && height == 16 && px.count() == 32 * 16);
+    if (shown && i < want.size() && px.count() == 32 * 16) CHECK(memcmp(px.view().data(), want[i].data(), want[i].size()) == 0);
+  }
   CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
-  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video (not shown)"));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A picture that cannot be decoded"));
+  g.set_video_decoders(nullptr);
   // the producer goes
   g.destroy_node(camera);
   CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("The source went"));
@@ -4133,6 +4337,81 @@ static void test_client_node_media() {
     }
     c.send(0, 7, [](pod::Builder& b) { b.int32(10); });
     w.send(0, 7, [](pod::Builder& b) { b.int32(7); });
+    // an H.264 camera (64 x 48) and a watcher that takes raw BGRA only: not offered raw while the graph has no decoders (it is given the H.264);
+    // with them, offered BGRA and given each picture decoded (what a decoder of the codecs gives), at the size it asks for
+    {
+      SoftwareDecoders decoders;
+      const std::vector<std::vector<uint8_t>> avc = encode_h264(64, 48, 4, 30);
+      uint32_t aw = 0, ah = 0;
+      const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &aw, &ah);
+      CHECK(avc.size() == 4 && want.size() == 4);
+      for (int with = 0; with < 2; ++with) {
+        g.set_video_decoders(with ? &decoders : nullptr);
+        NodeView hc;
+        hc.id = 11;
+        create_node(c, 11, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "h264-camera"}});
+        node_update(c, 11);
+        set_active(c, 11, true);
+        c.send(11, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 64, 48, 0x20001); port_info(b, 0, {}); });
+        hc.absorb(c);
+        c.send(11, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 65536, 0, 0); b.none(); });
+        hc.absorb(c);
+        NodeView hw;
+        hw.id = 9;
+        create_node(w, 9, {{"media.class", "Stream/Input/Video"}, {"target.object", "h264-camera"}});
+        node_update(w, 9);
+        set_active(w, 9, true);
+        w.send(9, 3, [with](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, with ? 32 : 0, with ? 24 : 0); port_info(b, 0, {}); });
+        hw.absorb(w);
+        VideoFormat offered;
+        {
+          pod::Parser fp(ConstByteView(hw.ports[{0, 0}].format.data(), hw.ports[{0, 0}].format.size()));
+          pod::Value fv; pod::ObjectReader o;
+          if (fp.next(&fv) && o.open(fv)) {
+            uint32_t key, fl; pod::Value v;
+            while (o.next(&key, &fl, &v)) {
+              if (key == 2) v.get_id(&offered.subtype);
+              if (key == 0x20001) v.get_id(&offered.format);
+              if (key == 0x20003 && v.body.size() >= 8) { memcpy(&offered.width, v.body.data(), 4); memcpy(&offered.height, v.body.data() + 4, 4); }
+            }
+          }
+        }
+        if (!with) {
+          CHECK(offered.subtype == 0x20001);      // (as the producer sends it)
+        } else {
+          CHECK(offered.subtype == VideoFormat::kSubtypeRaw && offered.format == 12 && offered.width == 32 && offered.height == 24);
+          w.send(9, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+          hw.absorb(w);
+          CHECK(hc.starts == 1 && hw.starts == 1);
+          if (hc.starts && hw.starts) {
+            for (size_t i = 0; i < avc.size(); ++i) {
+              put_u32(hw.activation->memory(), 0, 3);
+              produce(hc, 0, {avc[i]}, {0});
+              tick();
+              tick(40);
+              const std::vector<uint8_t> got = watched(hw);
+              CHECK(got.size() == 32 * 24 * 4);
+              if (got.size() == 32 * 24 * 4 && i < want.size()) {      // (the reference picture halved: each pixel the average of its 2 x 2)
+                int worst = 0;
+                for (uint32_t y = 0; y < 24; ++y)
+                  for (uint32_t x = 0; x < 32; ++x)
+                    for (int ch = 0; ch < 3; ++ch) {
+                      int sum = 0;
+                      for (uint32_t dy = 0; dy < 2; ++dy)
+                        for (uint32_t dx = 0; dx < 2; ++dx) sum += want[i][((2 * y + dy) * 64 + 2 * x + dx) * 4 + uint32_t(ch)];
+                      worst = std::max(worst, abs((sum + 2) / 4 - int(got[(y * 32 + x) * 4 + uint32_t(ch)])));
+                    }
+                CHECK(worst <= 1);
+              }
+            }
+          }
+        }
+        c.send(0, 7, [](pod::Builder& b) { b.int32(11); });
+        w.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+        tick();
+      }
+      g.set_video_decoders(nullptr);
+    }
     // a watcher that takes BGRA only, of the I420 camera: offered BGRA, given each frame converted (BT.601 limited: Y 16 black, 235 white)
     NodeView cw;
     cw.id = 6;
@@ -4606,6 +4885,7 @@ int main() {
   test_windows_virtual_sink();
   test_camera_sources();
   test_screen_source();
+  test_video_decode();
   test_video_watcher();
   test_record_convert();
   test_record();

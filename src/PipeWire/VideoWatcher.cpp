@@ -41,6 +41,7 @@ bool VideoWatcher::watch(uint32_t producer) {
   if (node_) graph_.destroy_node(node_);
   node_ = producer_ = 0;
   channel_ = SharedPointer<VideoChannel>();
+  decode_.reset();
   if (!producer) return true;
   // its object.serial names it for the link (a node.name may be shared by several programs' nodes)
   String target(allocator_);
@@ -77,29 +78,19 @@ bool VideoWatcher::latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* 
   if (!frame || frame->sequence <= *sequence) return false;
   *sequence = frame->sequence;
   const VideoFormat& f = frame->format;
-  if (f.subtype == kSubtypeMjpg) {      // (Motion JPEG: decoded, its size the picture's)
-    if (!jpeg_) jpeg_ = UniquePointer<hardware::JpegDecoder>::make(allocator_, allocator_);
-    if (!jpeg_ || !jpeg_->decode(frame->pixels.view())) {
-      *why = "A Motion JPEG picture that cannot be decoded";
+  VideoFormat shown = f;
+  ConstByteView bgra = frame->pixels.view();
+  if (f.encoded()) {      // (decoded, its size the picture's)
+    bool failed = false;
+    if (!can_decode_subtype(f.subtype, graph_.video_decoders())) {
+      *why = "Encoded video this computer cannot decode";
       return false;
     }
-    const uint32_t w = jpeg_->width(), h = jpeg_->height();
-    const uint64_t n = uint64_t{w} * h;
-    if (!pixels->reserve(n)) return false;
-    while (pixels->count() < n)
-      if (!pixels->push_back(0)) return false;
-    while (pixels->count() > n) pixels->remove_at(pixels->count() - 1);
-    if (!jpeg_->output_bgra(pixels->view().data(), w)) return false;
-    *width = w;
-    *height = h;
-    return true;
-  }
-  if (f.encoded()) {
-    *why = "Encoded video (not shown)";
-    return false;
-  }
-  ConstByteView bgra = frame->pixels.view();
-  if (f.format != kSpaBGRA && f.format != kSpaBGRx) {
+    if (!decode_.decode(f.subtype, frame->pixels.view(), graph_.video_decoders(), &shown, &bgra, &failed)) {
+      if (failed) *why = "A picture that cannot be decoded";
+      return false;
+    }
+  } else if (f.format != kSpaBGRA && f.format != kSpaBGRx) {
     VideoFormat to = f;
     to.format = kSpaBGRA;
     if (!convert_video(f, frame->pixels.view(), to, &converted_)) {
@@ -107,16 +98,17 @@ bool VideoWatcher::latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* 
       return false;
     }
     bgra = converted_.view();
+    shown = to;
   }
-  const uint64_t n = uint64_t{f.width} * f.height;
+  const uint64_t n = uint64_t{shown.width} * shown.height;
   if (bgra.size() < n * 4 || !pixels->reserve(n)) return false;
   pixels->clear();
   for (uint64_t i = 0; i < n; ++i) {
-    const uint32_t a = f.format == kSpaBGRx ? 0xFFu : bgra[4 * i + 3];
+    const uint32_t a = shown.format == kSpaBGRx ? 0xFFu : bgra[4 * i + 3];
     if (!pixels->push_back(a << 24 | uint32_t(bgra[4 * i + 2]) << 16 | uint32_t(bgra[4 * i + 1]) << 8 | bgra[4 * i])) return false;
   }
-  *width = f.width;
-  *height = f.height;
+  *width = shown.width;
+  *height = shown.height;
   return true;
 }
 

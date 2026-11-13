@@ -25,9 +25,8 @@
 // after another.
 #pragma once
 #include <stdint.h>
-#include "Hardware/VideoCodec/Software/Jpeg.hpp"
-#include "ObjectContainer/List.hpp"
 #include "PipeWire/VideoChannel.hpp"
+#include "PipeWire/VideoDecode.hpp"
 #include "Utility/ByteBuffer.hpp"
 
 namespace pipewire {
@@ -38,11 +37,13 @@ bool can_convert_video(uint32_t from, uint32_t to);
 // bilinear when enlarging). False when the formats cannot be converted, `in` is short, or there is no memory.
 bool convert_video(const VideoFormat& from, ConstByteView in, const VideoFormat& to, ByteBuffer* out);
 
-constexpr uint32_t kSubtypeMjpg = 0x20002;      // SPA_MEDIA_SUBTYPE_mjpg
-// Whether frames of `from` can be decoded and converted into raw `to`: Motion JPEG into any of the formats convert_video makes.
-bool can_decode_video(const VideoFormat& from, uint32_t to);
-// A Motion JPEG frame (webcams': its Huffman tables may be left out) as a raw frame of `to` (scaled when the picture is another size), with
-// `decoder` (one per stream: it keeps its memory) and `scratch` for the picture's 0xAARRGGBB words. False when it cannot be decoded.
-bool decode_video(ConstByteView frame, const VideoFormat& to, hardware::JpegDecoder& decoder, List<uint32_t>* scratch, ByteBuffer* out);
+// Whether frames of `from` can be decoded and converted into raw `to`: encoded video VideoDecodeSession decodes (Motion JPEG always; the others when
+// `decoders` serves their codec) into any of the formats convert_video makes.
+bool can_decode_video(const VideoFormat& from, uint32_t to, const IVideoDecoders* decoders);
+// An encoded frame of `from`'s subtype as a raw frame of `to` (scaled when the picture is another size), with `session` (one per stream: it keeps the
+// decoder and its pictures). False when no picture came out: *failed says whether that is because the frame cannot be decoded (else the decoder is
+// holding it back, or memory ran out).
+bool decode_video(ConstByteView frame, const VideoFormat& from, const VideoFormat& to, VideoDecodeSession& session, IVideoDecoders* decoders,
+                  ByteBuffer* out, bool* failed);
 
 }  // namespace pipewire
