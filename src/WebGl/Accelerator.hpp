@@ -51,6 +51,7 @@ struct AccelLimits {
   bool clip_distances = false;  // AccelState::clip_mask: the CLIPDIST outputs of the last stage cut the primitives
   bool float_textures = false;  // create_texture_float (what a depth texture is sent as)
   uint32_t control_varyings = 0;  // tessellation: the registers per control point from the control to the evaluation stage (0: `varyings`)
+  bool color_upload = false;      // write_color
 };
 
 // The stages of a program between the vertex and the fragment shader (create_program_stages), as TGSI text, and what the device must know of them. The numbers are the
@@ -150,6 +151,13 @@ class IAccelerator {
   virtual bool draw(uint32_t target, uint32_t program, const AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) = 0;
   // Copies the color image to `rgba` (width * height * 4 bytes: R, G, B, A of each pixel), the rows in the order the GL window has them - the bottom row first.
   virtual bool read_color(uint32_t target, ByteView rgba) = 0;
+  // The other way: the color image becomes `rgba` (as read_color gives it, the bottom row first), its depth is left as it is. False if the device cannot (the default):
+  // the context then keeps drawing on the CPU until the next clear.
+  virtual bool write_color(uint32_t target, ConstByteView rgba) {
+    (void)target;
+    (void)rgba;
+    return false;
+  }
 
  protected:
   ~IAccelerator() = default;

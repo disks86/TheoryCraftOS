@@ -42,7 +42,7 @@ inline bool tgsi_if(const std::string& op) { return op == "IF" || op == "UIF"; }
 class TgsiMachine {
  public:
   static constexpr int kRegs = 64, kVertices = 32;
-  float temp[1024][4] = {}, in[kRegs][4] = {}, out[kRegs][4] = {}, cst[4100][4] = {}, imm[256][4] = {}, sv[8][4] = {};   // (sv: VERTEXID, INSTANCEID ...)
+  float temp[8192][4] = {}, in[kRegs][4] = {}, out[kRegs][4] = {}, cst[4100][4] = {}, imm[256][4] = {}, sv[8][4] = {};   // (sv: VERTEXID, INSTANCEID ...)
   // The geometry and tessellation stages: inputs per vertex (IN[v][r]), a control shader's outputs per control point (OUT[v][r]), and a geometry shader's
   // emitted vertices (all its OUT registers at each EMIT; `cut` says a primitive ended before the vertex).
   float in2[kVertices][kRegs][4] = {}, out2[kVertices][kRegs][4] = {};
@@ -259,6 +259,11 @@ class TgsiMachine {
     }
     if (inner.rfind("ADDR[0].x+", 0) == 0) r->relative = true, r->index = atoi(inner.c_str() + 10);
     else r->index = atoi(inner.c_str());
+    if (rb + 1 < s.size() && s[rb + 1] == '(') {      // an array's id: TEMP[ADDR[0].x+5](1)
+      const size_t close = s.find(')', rb + 1);
+      if (close == std::string::npos) return false;
+      rb = close;
+    }
     if (rb + 1 < s.size()) {
       if (s[rb + 1] != '.') return false;
       r->swz = s.substr(rb + 2);
@@ -275,7 +280,7 @@ class TgsiMachine {
       if (r.file == "OUT") return out2[r.dim][index];
       return nullptr;
     }
-    if (r.file == "TEMP") return index >= 0 && index < 1024 ? temp[index] : nullptr;
+    if (r.file == "TEMP") return index >= 0 && index < 8192 ? temp[index] : nullptr;
     if (r.file == "IN") return index >= 0 && index < kRegs ? in[index] : nullptr;
     if (r.file == "SV") return index >= 0 && index < 8 ? sv[index] : nullptr;
     if (r.file == "OUT") return index >= 0 && index < kRegs ? out[index] : nullptr;

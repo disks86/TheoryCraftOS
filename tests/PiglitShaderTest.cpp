@@ -29,9 +29,11 @@
 #include <sanitizer/asan_interface.h>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 #include "OpenGl/GlApi.hpp"
+#include "TgsiAccel.hpp"
 #include "OpenGl/GlSurface.hpp"
 #include "OpenGl/GlClient.h"
 #include "OpenGl/generated/GlEnums.inc"
@@ -745,7 +747,7 @@ void collect(const std::string& dir, std::vector<std::string>* out) {
 // each draw is still offered to it: a draw it would have taken ends as "the device picture is out of date", any other reason is what keeps it off the 3D hardware.
 struct SurveyAccel final : webgl::IAccelerator {
   const char* name() const override { return "survey"; }
-  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true, true, true, true, true, 30}; }
+  webgl::AccelLimits limits() const override { return webgl::AccelLimits{256, 16, 14, 16, true, true, true, true, true, true, 30, true}; }
   uint32_t create_program(const char*, const char*, uint32_t, uint32_t, uint32_t) override { return ++programs; }
   uint32_t create_program_stages(const char*, const char*, uint32_t, uint32_t, uint32_t, const webgl::AccelStages&) override { return ++programs; }
   void destroy_program(uint32_t) override {}
@@ -761,10 +763,14 @@ struct SurveyAccel final : webgl::IAccelerator {
   uint32_t programs = 0;
 };
 
+// --accel-machine: the draws go to the reference device of tests/TgsiAccel.hpp (the translated TGSI run by tests/TgsiMachine.hpp), so the results are what a device
+// that runs the translator's TGSI would draw; a draw the translator or the context refuses still goes to the CPU. A test that passes on the CPU but not here is a
+// translation bug ("differs from the CPU" lists them). Slow (the machine reads the shader text for every pixel): use --filter.
+
 int main(int argc, char** argv) {
-  if (argc < 2) { printf("usage: %s <piglit dir> [--update-xfail] [--filter s] [--verbose] [--trace]\n", argv[0]); return 2; }
+  if (argc < 2) { printf("usage: %s <piglit dir> [--update-xfail] [--filter s] [--verbose] [--trace] [--accel-survey] [--accel-machine]\n", argv[0]); return 2; }
   const std::string root = argv[1];
-  bool update = false, verbose = false, trace = false, survey = false;
+  bool update = false, verbose = false, trace = false, survey = false, machine = false;
   std::string filter;
   for (int i = 2; i < argc; ++i) {
     if (!strcmp(argv[i], "--update-xfail")) update = true;
@@ -772,7 +778,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--trace")) trace = true;
     else if (!strcmp(argv[i], "--filter") && i + 1 < argc) filter = argv[++i];
     else if (!strcmp(argv[i], "--accel-survey")) survey = true;
+    else if (!strcmp(argv[i], "--accel-machine")) machine = true;
   }
+  int machine_tests = 0, machine_all_gpu = 0;
   SurveyAccel survey_accel;
   if (survey) webgl::set_accelerator(&survey_accel);
   std::map<std::string, int> draw_reasons;
@@ -811,6 +819,11 @@ int main(int argc, char** argv) {
     if (trace) { fprintf(stderr, "running %s\n", rel.c_str()); fflush(stderr); }
     Outcome o;
     {
+      std::unique_ptr<webgl::TgsiAccel> machine_accel;      // (a new device for each test: its programs, textures and targets are the test's)
+      if (machine) {
+        machine_accel = std::make_unique<webgl::TgsiAccel>();
+        webgl::set_accelerator(machine_accel.get());
+      }
       Runner r;
       if (extensions.empty()) { const char* e = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS)); extensions = e ? e : ""; }
       std::string why;
@@ -828,7 +841,16 @@ int main(int argc, char** argv) {
         ++survey_tests;
         if (all) ++survey_all_gpu;
       }
+      if (machine && o.kind != Outcome::Skip) {
+        const webgl::GlContext::HardwareStats& st = r.api.hardware_stats();
+        ++machine_tests;
+        if (st.gpu_draws > 0 && st.cpu_draws == 0) ++machine_all_gpu;
+        for (const auto& reason : st.reasons)
+          if (reason.why && getenv("SURVEY_REASON") && strstr(reason.why, getenv("SURVEY_REASON"))) printf("  machine: %s: %s\n", rel.c_str(), reason.why);
+        if (o.kind != Outcome::Pass && !xfail.count(rel) && st.gpu_draws > 0) printf("  differs from the CPU: %s (%llu device draws)\n", rel.c_str(), static_cast<unsigned long long>(st.gpu_draws));
+      }
     }
+    if (machine) webgl::set_accelerator(nullptr);
     if (o.kind == Outcome::Skip) { ++skip[suite]; ++skip_reasons[o.why]; continue; }
     if (o.kind == Outcome::Pass) {
       ++pass[suite];
@@ -849,6 +871,7 @@ int main(int argc, char** argv) {
     tp += pass[s]; tf += fail[s]; ts += skip[s];
   }
   printf("piglit shader_test: %d passed, %d failed (%d not in the xfail list), %d skipped, %d xfail entries now pass\n", tp, tf, unexpected, ts, fixed);
+  if (machine) printf("reference device: %d of %d tests drew only on it\n", machine_all_gpu, machine_tests);
   if (survey) {
     std::vector<std::pair<int, std::string>> top;
     for (auto& r : draw_reasons) top.push_back({r.second, r.first});

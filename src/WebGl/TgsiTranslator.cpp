@@ -23,9 +23,13 @@ namespace {
 
 using namespace shader;
 
-constexpr uint32_t kMaxTemps = 1024;
+constexpr uint32_t kMaxTemps = 8192;
 constexpr uint32_t kMaxImms = 256;
 constexpr uint32_t kMaxArray = 128;       // elements of a local array (indexed by a variable through a chain of selects; the items chosen from are on the heap)
+// An array of plain values (not structures, arrays or samplers) of at least kIndexedArray elements is a TGSI array instead: its elements' temporaries are one range
+// declared DCL TEMP[a..b], ARRAY(n), and an index the shader computes reads or writes it through the address register. It may then have up to kMaxIndexedArray elements.
+constexpr uint32_t kIndexedArray = 32;
+constexpr uint32_t kMaxIndexedArray = 2048;
 constexpr uint32_t kMaxCallDepth = 16;    // inlined calls inside each other
 // Node::flags of the first index of a per-vertex array of arrays read as a whole (v[i] of `in float v[][2]`: Glsl.cpp vertex_index), its index i * inner
 constexpr uint8_t kPartialIndex = 0x80;
@@ -52,9 +56,12 @@ struct Val {
   bool is_int = false;   // an integer constant (ival), usable as a constant index; to_float() makes it a value
   int32_t ival = 0;
   uint8_t kind = 0;    // 1: a structure (WGSL): its members are members_[first ...], of the structure type `sid`; 4: an array, elements elems_[first ...] (count)
+                       // 5: a sampler, the uniform slot that holds its texture unit in ival (-1: not bound yet); its kind in sdim, sshadow, sfloat
   uint16_t first = 0, sid = 0;
   uint8_t num = kNumFloat;
   uint16_t count = 0;
+  uint8_t sdim = 0;
+  bool sshadow = false, sfloat = false;
 };
 
 // A variable: one temporary per column.
@@ -66,7 +73,23 @@ struct Var {
   uint16_t first = 0, sid = 0;
   uint8_t num = kNumFloat;
   uint16_t count = 0;       // an array of `count` elements: elems_[first ...]
+  // A sampler (a parameter, an element of a sampler array, ...): no temporaries, only which uniform slot holds its texture unit. Samplers are bound when the shader
+  // is translated (the calls are inlined, and GLSL indexes sampler arrays only by constants), so a sampler is always one known uniform.
+  bool sampler = false;
+  int32_t sslot = -1;
+  uint8_t sdim = 0;
+  bool sshadow = false, sfloat = false;
 };
+
+// A sampler value of type `t` (or of its elements) read from uniform slot `slot`.
+static void sampler_val(const Type& t, int32_t slot, Val* out) {
+  *out = Val();
+  out->kind = 5;
+  out->ival = slot;
+  out->sdim = t.dim;
+  out->sshadow = t.shadow;
+  out->sfloat = t.texel == Base::Float;
+}
 
 // A place that can be assigned to: channels of temporaries.
 struct LV {
@@ -77,6 +100,11 @@ struct LV {
   bool agg = false;   // a whole structure: members_[first ...]
   uint16_t first = 0, sid = 0;
   uint16_t count = 0;   // a whole array: elems_[first ...]
+};
+
+// A TGSI array of temporaries (kIndexedArray): TEMP[first .. first + count - 1], declared ARRAY(its index in the list + 1).
+struct TempArray {
+  uint16_t first = 0, count = 0;
 };
 
 struct Imm {
@@ -237,12 +265,13 @@ class Gen {
   Gen(Shared& sh, const Module& m, uint8_t stage, int32_t entry = -1, const Boundary* in = nullptr, const Boundary* out = nullptr, bool last = true)
       : body(sh.out->vs.allocator()), sh_(sh), m_(m), stage_(stage), fs_(stage == kStFragment), vs_(stage == kStVertex), entry_(entry), in_(in), out_(out), last_(last),
         stage_vars_(sh.out->vs.allocator()), locals_(sh.out->vs.allocator()), elems_(sh.out->vs.allocator()), globals_(sh.out->vs.allocator()), imms_(sh.out->vs.allocator()),
-        ubase_(sh.out->vs.allocator()), members_(sh.out->vs.allocator()) {}
+        ubase_(sh.out->vs.allocator()), members_(sh.out->vs.allocator()), tarrays_(sh.out->vs.allocator()) {}
 
   String body;
   uint32_t ntemp() const { return ntemp_; }
   uint32_t instructions() const { return inst_; }
   const List<Imm>& imms() const { return imms_; }
+  const List<TempArray>& temp_arrays() const { return tarrays_; }
 
   // Translates main() and writes the outputs of the stage.
   bool run();
@@ -358,6 +387,15 @@ class Gen {
     return (t.base == Base::Bool || t.base == Base::Int || t.base == Base::Uint) && t.cols == 1;
   }
   static void val_of(const Var& v, Val* out) {
+    if (v.sampler) {
+      *out = Val();
+      out->kind = 5;
+      out->ival = v.sslot;
+      out->sdim = v.sdim;
+      out->sshadow = v.sshadow;
+      out->sfloat = v.sfloat;
+      return;
+    }
     if (v.is_struct || v.count) {
       *out = Val();
       out->kind = v.count ? 4 : 1;
@@ -388,11 +426,27 @@ class Gen {
   }
   bool make_var(const Type& t, Var* v) {
     if (t.array) {      // (each element a variable of its own: a value, or a structure)
-      if (t.array > kMaxArray || t.base == Base::Sampler) return fail("an array the device cannot hold");
       const Type et = t.element();
-      if (!is_float_type(et) && et.base != Base::Struct) return fail("an array the device cannot hold");
+      const bool indexed = t.array >= kIndexedArray && is_float_type(et) && !et.array;      // (a TGSI array: see kIndexedArray)
+      if (t.array > (indexed ? kMaxIndexedArray : kMaxArray)) return fail("an array the device cannot hold");
+      if (!is_float_type(et) && et.base != Base::Struct && et.base != Base::Sampler) return fail("an array the device cannot hold");
       const uint64_t first = elems_.count();
       if (first + t.array > 0xFFFF) return fail("too many variables");
+      if (indexed) {      // (the elements' temporaries one after another: make_var of a plain value takes only its own)
+        TempArray ta;
+        ta.first = static_cast<uint16_t>(ntemp_);
+        for (uint32_t i = 0; i < t.array; ++i) {
+          Var e;
+          if (!make_var(et, &e) || !elems_.push_back(e)) return fail("too many variables");
+        }
+        ta.count = static_cast<uint16_t>(ntemp_ - ta.first);
+        if (ta.count != t.array * et.cols || !tarrays_.push_back(ta)) return fail("an array the device cannot hold");
+        *v = Var();
+        v->valid = true;
+        v->first = static_cast<uint16_t>(first);
+        v->count = static_cast<uint16_t>(t.array);
+        return true;
+      }
       // (the elements' places first: an element that is a structure with an array makes elements of its own, which must come after these)
       for (uint32_t i = 0; i < t.array; ++i)
         if (!elems_.push_back(Var())) return fail("too many variables");
@@ -417,6 +471,14 @@ class Gen {
       v->sid = sv.sid;
       return true;
     }
+    if (t.base == Base::Sampler) {      // (bound by what is assigned to it: a parameter's argument)
+      *v = Var();
+      v->valid = v->sampler = true;
+      v->sdim = t.dim;
+      v->sshadow = t.shadow;
+      v->sfloat = t.texel == Base::Float;
+      return true;
+    }
     if (!is_float_type(t)) return fail("a variable of a type the device cannot hold");
     v->valid = true;
     v->rows = t.rows;
@@ -435,6 +497,11 @@ class Gen {
   bool attribute_at(uint32_t key, uint32_t comps, uint32_t* index);
   bool alloc_const(uint32_t slot, uint32_t rows, uint32_t cols, uint32_t elems, uint32_t* row, uint8_t convert = kTgsiAsIs);
   bool uniform_struct(uint32_t slot, const Type& t, Val* out);
+  bool sampler_array(const Type& t, uint32_t slot, Var* out);
+  bool indexed_swizzle_store(const Node& n, const Val& v, bool* done);
+  bool temp_array_of(uint16_t first, uint16_t count, uint32_t* id, uint16_t* base, uint8_t* cols, uint8_t* rows);
+  bool array_address(const Val& index, uint32_t count, uint8_t cols);
+  bool indexed_read(uint32_t id, uint16_t base, uint8_t cols, uint8_t rows, uint32_t count, const Val& index, Val* out);
   bool make_struct(const Type& t, Val* out);
   bool find_field(uint32_t sid, const Node& n, uint32_t* index);
   bool lv_from_val(const Val& v, LV* out);
@@ -483,6 +550,13 @@ class Gen {
   static constexpr uint32_t kMaxPlaces = 64;
   bool places(int32_t id, List<Place>* out);   // (lists, not arrays: the kernel's stack is small)
   bool has_dynamic_index(int32_t id) const;
+  bool has_effects(int32_t id) const;
+  // a call of a function without a value
+  bool void_call(int32_t id) const {
+    if (id < 0 || static_cast<uint64_t>(id) >= m_.nodes.count()) return false;
+    const Node& n = m_.nodes[static_cast<uint64_t>(id)];
+    return n.kind == NodeKind::Call && n.ival >= 0 && static_cast<uint64_t>(n.ival) < m_.functions.count() && m_.functions[static_cast<uint64_t>(n.ival)]->ret.base == Base::Void;
+  }
   bool lv_element(const LV& base, uint32_t e, LV* out);
   // A uniform structure's member, its CONST rows taken when it is first read (uniform_struct).
   bool resolve_member(uint64_t at) {
@@ -496,6 +570,7 @@ class Gen {
     return true;
   }
   bool flag_test(uint16_t flag, bool when_set);
+  bool continue_stmt();
   bool convert(const Val& in, uint8_t num, Val* out);
   bool atan2_of(const Val& y, const Val& x, Val* out);
   bool frag_input(bool face, Val* out);
@@ -536,6 +611,7 @@ class Gen {
   int32_t primitive_in = -1;                 // a geometry shader's gl_PrimitiveIDIn input
   bool clip_out = false;                     // the stage writes CLIPDIST[0], CLIPDIST[1] after its varyings
   bool depth_out = false;                    // a fragment shader writes gl_FragDepth (OUT[1], POSITION: its z)
+  uint32_t samplers_used = 0;                // the program's samplers this stage reads: SAMP[0 .. samplers_used - 1] (TgsiProgram::samplers is the program's)
   bool uses_addr = false;                    // ARL (a uniform array indexed by a variable)
   static constexpr uint32_t kMaxSystemValues = 4;
   const char* sv_names[kMaxSystemValues] = {};   // SV[i]'s semantic
@@ -595,6 +671,7 @@ class Gen {
   List<Imm> imms_;
   List<UniformBase> ubase_;
   List<Val> members_;
+  List<TempArray> tarrays_;      // (in the order of their temporaries)
   Val ret_;
   bool have_ret_ = false;
 };
@@ -642,7 +719,7 @@ bool Gen::uniform_arrays() {
     if (nd.kind != NodeKind::Global || indexed[i] || nd.ival < 0 || static_cast<uint64_t>(nd.ival) >= m_.globals.count()) continue;
     const uint64_t gi = static_cast<uint64_t>(nd.ival);
     const Global& g = *m_.globals[gi];
-    if (g.kind != GlobalKind::Uniform || !g.type.array || gi >= globals_.count() || globals_[gi].valid) continue;
+    if (g.kind != GlobalKind::Uniform || !g.type.array || g.type.base == Base::Sampler || gi >= globals_.count() || globals_[gi].valid) continue;
     Var v;
     if (!make_var(g.type, &v)) return false;
     const Type et = g.type.element();
@@ -751,6 +828,14 @@ bool Gen::uniform_struct(uint32_t slot, const Type& t, Val* out) {
     Val mv;
     if (ft.base == Base::Struct && ft.array == 0) {
       if (!uniform_struct(fslot, ft, &mv)) return false;
+    } else if (ft.base == Base::Sampler) {      // a sampler member, or an array of them: the uniform slots of their texture units
+      if (!ft.array) {
+        sampler_val(ft, static_cast<int32_t>(fslot), &mv);
+      } else {
+        Var av;
+        if (!sampler_array(ft, fslot, &av)) return false;
+        val_of(av, &mv);
+      }
     } else if (ft.array) {      // an array member: copied into variables (so that a variable can index it)
       const Type et = ft.element();
       if (!is_float_type(et) || ft.array > kMaxArray) return fail("a uniform member the device cannot take");
@@ -784,6 +869,74 @@ bool Gen::uniform_struct(uint32_t slot, const Type& t, Val* out) {
   return true;
 }
 
+// Whether the array elems_[first .. first + count - 1] is a TGSI array (kIndexedArray): its id, first temporary and the shape of its elements.
+bool Gen::temp_array_of(uint16_t first, uint16_t count, uint32_t* id, uint16_t* base, uint8_t* cols, uint8_t* rows) {
+  if (!count || static_cast<uint64_t>(first) + count > elems_.count()) return false;
+  const Var& e0 = elems_[first];
+  if (e0.sampler || e0.is_struct || e0.count) return false;
+  for (uint64_t i = 0; i < tarrays_.count(); ++i)
+    if (tarrays_[i].first == e0.temp[0] && tarrays_[i].count == uint32_t{count} * e0.cols) {
+      *id = static_cast<uint32_t>(i + 1);
+      *base = e0.temp[0];
+      *cols = e0.cols;
+      *rows = e0.rows;
+      return true;
+    }
+  return false;
+}
+
+// ADDR[0].x = the index clamped to [0, count - 1] (as the CPU does) times the columns of an element: the first temporary of that element, from the array's start.
+bool Gen::array_address(const Val& index, uint32_t count, uint8_t cols) {
+  Val ci, scaled;
+  if (!clamp_index(index, count, &ci)) return false;
+  scaled = ci;
+  if (cols > 1) {
+    Oper m;
+    Val mv;
+    if (!scalar_imm(static_cast<float>(cols), &m)) return false;
+    mv.c[0] = m;
+    if (!elementwise("MUL", ci, mv, &scaled)) return false;
+  }
+  uses_addr = true;
+  begin_inst("ARL");
+  body.append(" ADDR[0].x, ");
+  put_oper(component(scaled.c[0], 0));
+  end_inst();
+  return true;
+}
+
+// array[index] of a TGSI array, the index computed by the shader: one indirect read per column.
+bool Gen::indexed_read(uint32_t id, uint16_t base, uint8_t cols, uint8_t rows, uint32_t count, const Val& index, Val* out) {
+  if (!array_address(index, count, cols)) return false;
+  *out = Val();
+  out->rows = rows;
+  out->cols = cols;
+  for (uint32_t c = 0; c < cols; ++c) {
+    uint16_t t;
+    if (!new_temp(&t)) return false;
+    begin_inst("MOV");
+    body.append(" TEMP[");
+    body.append_uint(t);
+    body.append("].");
+    body.append(mask_of(rows));
+    body.append(", TEMP[ADDR[0].x+");
+    body.append_uint(base + c);
+    body.append("](");
+    body.append_uint(id);
+    body.append(")");
+    end_inst();
+    out->c[c] = filled('T', t, rows);
+  }
+  return true;
+}
+
+// A uniform array of samplers: element e's texture unit is in uniform slot `slot` + e.
+bool Gen::sampler_array(const Type& t, uint32_t slot, Var* out) {
+  if (!make_var(t, out)) return false;
+  for (uint32_t e = 0; e < out->count; ++e) elems_[static_cast<uint64_t>(out->first) + e].sslot = static_cast<int32_t>(slot + e);
+  return true;
+}
+
 bool Gen::make_struct(const Type& t, Val* out) {
   const StructDef* sd = m_.struct_of(t);
   if (!sd || t.array || sd->fields.count() > 16) return fail("a structure the device cannot hold");
@@ -800,6 +953,8 @@ bool Gen::make_struct(const Type& t, Val* out) {
       Var av;
       if (!make_var(ft, &av)) return false;
       val_of(av, &mv);
+    } else if (ft.base == Base::Sampler) {
+      sampler_val(ft, -1, &mv);      // (bound when the structure is assigned)
     } else {
       if (!is_float_type(ft) || !new_val(ft.rows, ft.cols, &mv)) return fail("a member of a type the device cannot hold");
     }
@@ -953,6 +1108,16 @@ bool Gen::global_val(uint64_t gi, Val* out) {
       if (g.storage) return fail("a storage buffer");
       [[fallthrough]];
     case GlobalKind::Uniform: {
+      if (g.type.base == Base::Sampler) {
+        if (!g.type.array) {
+          sampler_val(g.type, static_cast<int32_t>(g.slot), out);
+          return true;
+        }
+        Var& cached = globals_[gi];
+        if (!cached.valid && !sampler_array(g.type, g.slot, &cached)) return false;
+        val_of(cached, out);
+        return true;
+      }
       if (g.type.array) {      // (copied into a variable at the start, when the shader reads it as a whole: see uniform_arrays())
         if (gi >= globals_.count() || !globals_[gi].valid) return fail("a uniform array used as a whole");
         val_of(globals_[gi], out);
@@ -982,7 +1147,7 @@ bool Gen::global_val(uint64_t gi, Val* out) {
     }
     case GlobalKind::In: {
       if (g.builtin != kBvNone) return fail("a built-in input");
-      const bool fs_struct = fs_ && g.type.element().base == Base::Struct;      // (a structure varying: copied at the start, below)
+      const bool fs_struct = !vs_ && g.type.element().base == Base::Struct;      // (a structure varying: copied at the start - run() for the fragment stage, stage_start())
       if (g.type.base == Base::Bool || (!is_float_type(g.type.element()) && !fs_struct) || (vs_ && (g.type.cols != 1 || g.type.array))) return fail("an input of a type the device cannot take");
       out->rows = g.type.rows;
       out->cols = 1;
@@ -1003,8 +1168,18 @@ bool Gen::global_val(uint64_t gi, Val* out) {
         return true;
       }
       const IoLink* l = in_ ? in_->by_in(static_cast<int32_t>(gi)) : nullptr;
-      if (!l) return fail("a varying the vertex shader does not write");
-      if (l->flat != g.flat) return fail("a varying the device cannot take");
+      if (!l && !(g.type.array || g.type.base == Base::Struct)) {      // a varying no stage before writes: zero, as the CPU's vertices start
+        Oper zero;
+        if (!scalar_imm(0.0f, &zero)) return false;
+        out->cols = g.type.cols;
+        out->rows = g.type.rows;
+        out->is_int = false;
+        out->kind = 0;
+        out->num = num_of(g.type.base);
+        for (uint32_t c = 0; c < g.type.cols; ++c) out->c[c] = zero;
+        return true;
+      }
+      if (l && l->flat != g.flat) return fail("a varying the device cannot take");
       if (g.type.array || g.type.base == Base::Struct) {      // (copied into variables at the start: see run())
         Var v;
         if (!global_var(gi, &v)) return false;
@@ -1135,6 +1310,11 @@ bool Gen::store(const LV& l, const Val& v_in) {
   if (l.count || v.kind == 4) {      // a whole array: element by element
     if (!l.count || v.kind != 4 || v.count != l.count) return fail("assignment of arrays of other sizes");
     for (uint32_t e = 0; e < l.count; ++e) {
+      if (elems_[static_cast<uint64_t>(v.first) + e].sampler) {      // (a sampler: which uniform it is)
+        if (!elems_[static_cast<uint64_t>(l.first) + e].sampler) return fail("assignment of a sampler");
+        elems_[static_cast<uint64_t>(l.first) + e].sslot = elems_[static_cast<uint64_t>(v.first) + e].sslot;
+        continue;
+      }
       LV el;
       Val ev;
       lv_of(elems_[static_cast<uint64_t>(l.first) + e], &el);
@@ -1150,6 +1330,11 @@ bool Gen::store(const LV& l, const Val& v_in) {
       LV ml;
       if (!resolve_member(static_cast<uint64_t>(v.first) + i)) return false;
       const Val mv = members_[static_cast<uint64_t>(v.first) + i];
+      if (mv.kind == 5) {      // (a sampler member: which uniform it is)
+        if (members_[static_cast<uint64_t>(l.first) + i].kind != 5) return fail("assignment of a sampler");
+        members_[static_cast<uint64_t>(l.first) + i] = mv;
+        continue;
+      }
       if (!lv_from_val(members_[static_cast<uint64_t>(l.first) + i], &ml) || !store(ml, mv)) return false;
     }
     return true;
@@ -1500,7 +1685,7 @@ bool Gen::construct(const Node& n, Val* out) {
   if (t.base == Base::Void && t.array == 0) t.base = Base::Float;   // WGSL vec3(1.0, 2.0, 3.0): the element type is the arguments'
   if (t.array && t.base != Base::Void) {      // float[3](a, b, c): a new array variable, element by element
     if (t.array == 0xFFFFFFFFu) t.array = static_cast<uint32_t>(n.count);
-    if (t.array != static_cast<uint32_t>(n.count) || t.array > kMaxArray) return fail("an array constructor the device cannot take");
+    if (t.array != static_cast<uint32_t>(n.count)) return fail("an array constructor the device cannot take");      // (how large: make_var's limits)
     Var v;
     if (!make_var(t, &v)) return false;
     for (int32_t i = 0; i < n.count; ++i) {
@@ -2204,6 +2389,33 @@ bool Gen::eval(int32_t id, Val* out) {
     case NodeKind::Call: return call(n, out);
     case NodeKind::Ternary: {
       Val c, x, y;
+      if (has_effects(n.b) || has_effects(n.c)) {      // only the side taken runs (a call, an assignment): IF c ... ELSE ... ENDIF
+        if (!eval(n.a, &c) || !to_float(c)) return false;
+        if (c.kind || c.cols != 1 || c.rows != 1) return fail("a condition that is not a scalar");
+        const bool value = !void_call(n.b);      // (b ? f() : g() of functions without a value: a statement)
+        Val res;
+        begin_inst("IF");
+        body.push_back(' ');
+        put_oper(component(c.c[0], 0));
+        end_inst();
+        if (!eval(n.b, &x) || !to_float(x)) return false;
+        if (value) {
+          if (x.kind || !new_val(x.rows, x.cols, &res)) return fail("a conditional of other shapes");
+          res.num = x.num;
+          for (uint32_t k = 0; k < x.cols; ++k) inst_rows("MOV", res.c[k].idx, x.rows, &x.c[k]);
+        }
+        begin_inst("ELSE");
+        end_inst();
+        if (!eval(n.c, &y) || !to_float(y)) return false;
+        if (value) {
+          if (y.kind || y.cols != x.cols || y.rows != x.rows) return fail("a conditional of other shapes");
+          for (uint32_t k = 0; k < y.cols; ++k) inst_rows("MOV", res.c[k].idx, y.rows, &y.c[k]);
+        }
+        begin_inst("ENDIF");
+        end_inst();
+        *out = value ? res : Val();
+        return true;
+      }
       if (!eval(n.a, &c) || !eval(n.b, &x) || !eval(n.c, &y)) return false;
       if (!to_float(c) || !to_float(x) || !to_float(y)) return false;
       if (c.rows != 1 || c.cols != 1 || c.kind || x.kind || y.kind || x.cols != y.cols || x.rows != y.rows) return fail("a conditional of other shapes");
@@ -2262,7 +2474,7 @@ bool Gen::eval(int32_t id, Val* out) {
       if (n.a >= 0 && m_.nodes[static_cast<uint64_t>(n.a)].kind == NodeKind::Global) {
         const int32_t gi = m_.nodes[static_cast<uint64_t>(n.a)].ival;
         if (gi >= 0 && static_cast<uint64_t>(gi) < m_.globals.count() && m_.globals[static_cast<uint64_t>(gi)]->type.array &&
-            m_.globals[static_cast<uint64_t>(gi)]->kind == GlobalKind::Uniform) {
+            m_.globals[static_cast<uint64_t>(gi)]->kind == GlobalKind::Uniform && m_.globals[static_cast<uint64_t>(gi)]->type.base != Base::Sampler) {
           // a uniform array: its rows in CONST, by a constant index or through the address register (the index clamped to the array, as the CPU does)
           const Global& g = *m_.globals[static_cast<uint64_t>(gi)];
           if (g.type.base == Base::Struct) {      // of structures: each element's members have rows of their own (uniform_struct)
@@ -2342,6 +2554,15 @@ bool Gen::eval(int32_t id, Val* out) {
             if (input_vertices() * inner < count) count = input_vertices() * inner;
           }
         }
+        uint32_t id;
+        uint16_t tbase;
+        uint8_t tcols, trows;
+        if (count && temp_array_of(b.first, b.count, &id, &tbase, &tcols, &trows)) {
+          if (!indexed_read(id, tbase, tcols, trows, count, iv, out)) return false;
+          out->num = elems_[b.first].num;
+          return true;
+        }
+        if (count > kMaxArray) return fail("an index the device cannot take");
         List<Val> items(body.allocator());
         if (!count || !items.reserve(count)) return fail("an empty array");
         for (uint32_t e = 0; e < count; ++e) {
@@ -2349,6 +2570,7 @@ bool Gen::eval(int32_t id, Val* out) {
           val_of(elems_[static_cast<uint64_t>(b.first) + e], &item);
           if (!items.push_back(item)) return fail("out of memory");
         }
+        if (items[0].kind == 5) return fail("a sampler chosen by a variable index");
         if (items[0].kind) {      // (structures, arrays: the copy's type from what the elements are)
           Type et = n.type;
           if (items[0].kind == 1) {
@@ -2432,14 +2654,38 @@ bool Gen::eval(int32_t id, Val* out) {
     }
     case NodeKind::Builtin: return builtin(n, out);
     case NodeKind::TexCall: return tex_call(n, out);
-    default: return fail("an expression the device cannot take");
+    case NodeKind::Length: {      // a.length(): the array's elements, a matrix's columns or a vector's components, as the CPU (which evaluates `a` too)
+      if (n.a >= 0 && m_.nodes[static_cast<uint64_t>(n.a)].kind == NodeKind::Global) {      // (a global array: its size, without reading it - a varying no stage writes, say)
+        const int32_t gi = m_.nodes[static_cast<uint64_t>(n.a)].ival;
+        if (gi >= 0 && static_cast<uint64_t>(gi) < m_.globals.count() && m_.globals[static_cast<uint64_t>(gi)]->type.array &&
+            m_.globals[static_cast<uint64_t>(gi)]->type.array != kRuntimeArray && !m_.globals[static_cast<uint64_t>(gi)]->per_vertex) {
+          *out = Val();
+          out->is_int = true;
+          out->num = kNumInt;
+          out->ival = static_cast<int32_t>(m_.globals[static_cast<uint64_t>(gi)]->type.array);
+          return true;
+        }
+      }
+      Val b;
+      if (!eval(n.a, &b)) return false;
+      if (b.kind != 0 && b.kind != 4) return fail("a length the device cannot take");
+      *out = Val();
+      out->is_int = true;
+      out->num = kNumInt;
+      out->ival = b.kind == 4 ? b.count : (b.cols > 1 ? b.cols : b.rows);
+      return true;
+    }
+    default:
+#ifdef TGSI_FAIL_TRACE
+      fprintf(stderr, "  expression node kind %d op %d\n", static_cast<int>(n.kind), static_cast<int>(n.op));
+#endif
+      return fail("an expression the device cannot take");
   }
 }
 
 // texture2D(sampler, coord) / texture(sampler, coord) in a fragment shader: a 2D float sampler uniform and a vec2 coordinate. The device has no mipmaps, so the
 // implicit level of detail does not matter (the context only takes the draw when the bound textures have none).
 bool Gen::tex_call(const Node& n, Val* out) {
-  if (!fs_) return fail("a texture lookup in a vertex shader");
   const bool wgsl = n.flags == 1;
   const bool legacy = !wgsl && (n.flags & 2) != 0;      // shadow1D / shadow2D: a vec4 by GL_DEPTH_TEXTURE_MODE
   // The device's textures have no mipmaps (GlContext::hw_texture: one level, one filter): a level, bias or gradients choose nothing, so those lookups are plain ones;
@@ -2447,7 +2693,8 @@ bool Gen::tex_call(const Node& n, Val* out) {
   const TexOp top = static_cast<TexOp>(n.op);
   const bool proj = top == TexOp::Proj || top == TexOp::ProjBias || top == TexOp::ProjLod;
   const bool plain = top == TexOp::Sample || top == TexOp::Bias || top == TexOp::Lod || top == TexOp::Grad || proj;
-  if ((!wgsl && (n.flags & ~2u)) || !plain || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
+  const bool size_query = !wgsl && top == TexOp::Size;      // textureSize(s, 0): row 1 of the sampler's rows (see TgsiSampler)
+  if ((!wgsl && (n.flags & ~2u)) || (!plain && !size_query) || static_cast<uint64_t>(n.first) + 3 > m_.kids.count()) return fail("a texture lookup the device cannot take");
   if (!wgsl && (n.count < 9 || static_cast<uint64_t>(n.first) + 9 > m_.kids.count() || m_.kids[static_cast<uint64_t>(n.first) + 7] >= 0 || m_.kids[static_cast<uint64_t>(n.first) + 8] >= 0))
     return fail("a texture lookup with an offset");
   if (wgsl && top != TexOp::Sample) return fail("a texture lookup the device cannot take");
@@ -2461,39 +2708,58 @@ bool Gen::tex_call(const Node& n, Val* out) {
   };
   const Global* g = nullptr;
   const Global* s = nullptr;   // WGSL: the sampler binding
-  if (!global_of(sampler_id, &g)) return false;
+  Val sv;      // GLSL: the sampler, from a uniform, a parameter, a structure member or an array element
   if (wgsl) {
+    if (!global_of(sampler_id, &g)) return false;
     // textureSample(texture, sampler, coords): both are bindings, whose handles the draw reads from the bound groups
     if (!global_of(m_.kids[static_cast<uint64_t>(n.first) + 1], &s)) return false;
     if (g->kind != GlobalKind::Handle || g->type.base != Base::Texture || g->type.array || g->type.dim != kDim2D || g->type.shadow || g->type.texel != Base::Float ||
         s->kind != GlobalKind::Handle || s->type.base != Base::SamplerState || s->type.array)
       return fail("a texture the device cannot take");
-  } else if (g->kind != GlobalKind::Uniform || g->type.base != Base::Sampler || g->type.array || g->type.texel != Base::Float ||
-             (g->type.dim != kDim2D && g->type.dim != kDim1D && g->type.dim != kDimRect)) {
+  } else if (!eval(sampler_id, &sv) || sv.kind != 5 || sv.ival < 0 || !sv.sfloat || (sv.sdim != kDim2D && sv.sdim != kDim1D && sv.sdim != kDimRect)) {
     return fail("a sampler the device cannot take");
   }
-  const uint8_t dim = wgsl ? kDim2D : g->type.dim;
-  const bool shadow = !wgsl && g->type.shadow;
+  const uint32_t slot = wgsl ? g->slot : static_cast<uint32_t>(sv.ival);
+  const uint8_t dim = wgsl ? kDim2D : sv.sdim;
+  const bool shadow = !wgsl && sv.sshadow;
+  if (size_query) {      // (level 0 only: the size of another level is that of the image the texture has there, which the device does not know)
+    const int32_t lod = static_cast<uint64_t>(n.first) + 4 < m_.kids.count() ? m_.kids[static_cast<uint64_t>(n.first) + 4] : -1;
+    if (lod >= 0) {
+      bool constant;
+      int32_t k;
+      Val iv;
+      if (!index_of(lod, &constant, &k, &iv)) return false;
+      if (!constant || k != 0) return fail("the size of a level the device cannot take");
+    }
+  }
   if (legacy && !shadow) return fail("a texture lookup the device cannot take");
   TgsiProgram& p = *sh_.out;
   const uint32_t sampler_slot = wgsl ? s->slot : 0;
   uint32_t index = 0;
-  while (index < p.samplers.count() && !(p.samplers[index].slot == g->slot && p.samplers[index].sampler_slot == sampler_slot && p.samplers[index].wgsl == wgsl)) ++index;
+  while (index < p.samplers.count() && !(p.samplers[index].slot == slot && p.samplers[index].sampler_slot == sampler_slot && p.samplers[index].wgsl == wgsl)) ++index;
   if (index == p.samplers.count()) {
     if (index >= sh_.limits.samplers) return fail("too many samplers");
-    TgsiSampler ts{g->slot, sampler_slot, wgsl};
+    TgsiSampler ts{slot, sampler_slot, wgsl};
     ts.dim = dim;
     ts.shadow = shadow;
-    if (shadow || dim == kDimRect) {      // (its rows: see TgsiSampler)
-      if (p.const_rows + 4 > sh_.limits.const_rows) return fail("too many uniforms");
-      ts.params = static_cast<int32_t>(p.const_rows);
-      for (uint32_t r = 0; r < 4; ++r)
-        if (!p.constants.push_back(TgsiConstant{kTgsiSamplerParams, static_cast<uint16_t>(p.const_rows + r), 4, index * 4 + r})) return fail("out of memory");
-      p.const_rows += 4;
-    }
     if (!p.samplers.push_back(ts)) return fail("out of memory");
   }
+  if ((shadow || dim == kDimRect || size_query) && p.samplers[index].params < 0) {      // (its rows: see TgsiSampler; a sampler first used another way gets them now)
+    if (p.const_rows + 4 > sh_.limits.const_rows) return fail("too many uniforms");
+    p.samplers[index].params = static_cast<int32_t>(p.const_rows);
+    for (uint32_t r = 0; r < 4; ++r)
+      if (!p.constants.push_back(TgsiConstant{kTgsiSamplerParams, static_cast<uint16_t>(p.const_rows + r), 4, index * 4 + r})) return fail("out of memory");
+    p.const_rows += 4;
+  }
+  if (index + 1 > samplers_used) samplers_used = index + 1;      // (the stage declares SAMP[0 .. samplers_used - 1])
   const TgsiSampler ts = p.samplers[index];
+  if (size_query) {      // ivec2(w, h) (int for 1D), from the size row: exact float-encoded integers
+    *out = Val();
+    out->rows = dim == kDim1D ? 1 : 2;
+    out->num = kNumInt;
+    out->c[0] = filled('C', static_cast<uint16_t>(ts.params + 1), out->rows);
+    return true;
+  }
   Val coord;
   if (!eval(coord_id, &coord) || !to_float(coord)) return false;
   if (coord.kind || coord.cols != 1) return fail("a texture coordinate the device cannot take");
@@ -2536,12 +2802,16 @@ bool Gen::tex_call(const Node& n, Val* out) {
     const Oper uvo = filled('T', uv, 2);
     inst("MUL", uv, "xy", &uvo, &inv);
   }
+  // (a stage but the fragment one has no derivatives for an implicit level: TXL of level 0, the only one the device's textures have)
+  Oper zero_level;
+  if (!fs_ && !scalar_imm(0.0f, &zero_level)) return false;
   const auto tex = [&](uint16_t dst, uint16_t at) {
-    begin_inst("TEX");
+    if (!fs_) inst("MOV", at, "zw", &zero_level);
+    begin_inst(fs_ ? "TEX" : "TXL");
     body.append(" TEMP[");
     body.append_uint(dst);
     body.append("].xyzw, ");
-    put_oper(filled('T', at, 2));
+    put_oper(filled('T', at, fs_ ? 2 : 4));
     body.append(", SAMP[");
     body.append_uint(index);
     body.append("], 2D");
@@ -2918,6 +3188,11 @@ bool Gen::places(int32_t id, List<Place>* out) {
 bool Gen::assign_to(int32_t target, const Val& v) {
   if (target < 0) return fail("missing expression");
   const Node& n = m_.nodes[static_cast<uint64_t>(target)];
+  if (n.kind == NodeKind::Field && n.a >= 0 && m_.nodes[static_cast<uint64_t>(n.a)].kind == NodeKind::Index && !is_control_output(m_.nodes[static_cast<uint64_t>(n.a)].a)) {
+    bool done = false;      // a[i].xz = v of a TGSI array (kIndexedArray): one indirect write of those channels
+    if (!indexed_swizzle_store(n, v, &done)) return false;
+    if (done) return true;
+  }
   if ((n.kind == NodeKind::Field || (n.kind == NodeKind::Index && !is_control_output(n.a))) && has_dynamic_index(n.a)) {      // inside an element chosen by a variable (a[i].x, a[i].b[2])
     List<Place> ps(body.allocator());
     if (!places(target, &ps)) return false;
@@ -2954,9 +3229,88 @@ bool Gen::assign_to(int32_t target, const Val& v) {
   return lvalue(target, &l) && store(l, v);
 }
 
+// a[i].xz = v, where a is a TGSI array of vectors and i is computed by the shader: *done when written that way (otherwise nothing is written, and the caller
+// writes it as any other assignment).
+bool Gen::indexed_swizzle_store(const Node& n, const Val& v_in, bool* done) {
+  *done = false;
+  const Node& ix = m_.nodes[static_cast<uint64_t>(n.a)];
+  bool constant;
+  int32_t k;
+  Val iv;
+  uint32_t idx[4], count;
+  if (ix.a < 0) return true;
+  // (only a variable array: lvalue() of anything else may emit code, and the generic path is then taken anyway)
+  const NodeKind ak = m_.nodes[static_cast<uint64_t>(ix.a)].kind;
+  if (ak != NodeKind::Local && ak != NodeKind::Global) return true;
+  if (ak == NodeKind::Global) {
+    const int32_t gi = m_.nodes[static_cast<uint64_t>(ix.a)].ival;
+    if (gi < 0 || static_cast<uint64_t>(gi) >= m_.globals.count() || m_.globals[static_cast<uint64_t>(gi)]->kind != GlobalKind::Private) return true;
+  }
+  LV base;
+  if (!lvalue(ix.a, &base)) return false;
+  uint32_t id;
+  uint16_t tbase;
+  uint8_t tcols, trows;
+  if (!base.count || !temp_array_of(base.first, base.count, &id, &tbase, &tcols, &trows) || tcols != 1) return true;
+  if (!index_of(ix.b, &constant, &k, &iv)) return false;      // (only now: the index may have side effects, and the generic path evaluates it otherwise)
+  if (constant) return true;      // (the generic path: a constant index emits nothing, so it is not evaluated twice)
+  if (!swizzle_indices(n, idx, &count)) return false;
+  Val v = v_in;
+  if (!to_float(v)) return false;
+  if (v.kind || v.cols != 1 || v.rows != count) return fail("assignment of another shape");
+  Oper src = v.c[0];
+  bool used[4] = {false, false, false, false};
+  for (uint32_t j = 0; j < count; ++j) {
+    if (idx[j] >= trows || used[idx[j]]) return fail("swizzle out of range");
+    src.swz[idx[j]] = v.c[0].swz[j];
+    used[idx[j]] = true;
+  }
+  char mask[5];
+  uint32_t m = 0;
+  for (uint32_t c = 0; c < 4; ++c)
+    if (used[c]) mask[m++] = "xyzw"[c];
+  mask[m] = 0;
+  if (!array_address(iv, base.count, 1)) return false;
+  begin_inst("MOV");
+  body.append(" TEMP[ADDR[0].x+");
+  body.append_uint(tbase);
+  body.append("](");
+  body.append_uint(id);
+  body.append(").");
+  body.append(mask);
+  body.append(", ");
+  put_oper(src);
+  end_inst();
+  *done = true;
+  return true;
+}
+
 // base[index] = v for an index the shader computes: each element (of an array, a matrix's columns, a vector's channels) takes v where the index is its own.
-bool Gen::store_by_index(const LV& base, const Val& index, const Val& v) {
+bool Gen::store_by_index(const LV& base, const Val& index, const Val& v_in) {
   const uint32_t count = base.count ? base.count : (base.cols > 1 ? base.cols : base.n);
+  uint32_t id;
+  uint16_t tbase;
+  uint8_t tcols, trows;
+  if (base.count && temp_array_of(base.first, base.count, &id, &tbase, &tcols, &trows)) {      // a TGSI array: one indirect write per column
+    Val v = v_in;
+    if (!to_float(v)) return false;
+    if (v.kind || v.cols != tcols || v.rows != trows) return fail("assignment of another shape");
+    if (!array_address(index, count, tcols)) return false;
+    for (uint32_t c = 0; c < tcols; ++c) {
+      begin_inst("MOV");
+      body.append(" TEMP[ADDR[0].x+");
+      body.append_uint(tbase + c);
+      body.append("](");
+      body.append_uint(id);
+      body.append(").");
+      body.append(mask_of(trows));
+      body.append(", ");
+      put_oper(v.c[c]);
+      end_inst();
+    }
+    return true;
+  }
+  const Val& v = v_in;
   if (count < 1 || count > kMaxArray) return fail("an index the device cannot take");
   Val ci;
   if (!clamp_index(index, count, &ci)) return false;
@@ -2996,6 +3350,15 @@ bool Gen::element_of(const Var& array, int32_t index_node, Val* out) {
     val_of(elems_[static_cast<uint64_t>(array.first) + static_cast<uint32_t>(k)], out);
     return true;
   }
+  uint32_t id;
+  uint16_t tbase;
+  uint8_t tcols, trows;
+  if (temp_array_of(array.first, array.count, &id, &tbase, &tcols, &trows)) {
+    if (!indexed_read(id, tbase, tcols, trows, array.count, iv, out)) return false;
+    out->num = elems_[array.first].num;
+    return true;
+  }
+  if (array.count > kMaxArray) return fail("an index the device cannot take");
   List<Val> items(body.allocator());
   for (uint32_t e = 0; e < array.count; ++e) {
     Val item;
@@ -3004,6 +3367,29 @@ bool Gen::element_of(const Var& array, int32_t index_node, Val* out) {
     if (!items.push_back(item)) return fail("out of memory");
   }
   return select(iv, items.view(), out);
+}
+
+// Whether evaluating the expression may change anything (an assignment, ++ or --, a call), conservatively: an expression of a kind not known here may.
+bool Gen::has_effects(int32_t id) const {
+  if (id < 0 || static_cast<uint64_t>(id) >= m_.nodes.count()) return false;
+  const Node& n = m_.nodes[static_cast<uint64_t>(id)];
+  auto kids = [&]() {
+    for (int32_t i = 0; i < n.count; ++i) {
+      const uint64_t at = static_cast<uint64_t>(n.first) + static_cast<uint32_t>(i);
+      if (at >= m_.kids.count()) return true;
+      if (has_effects(m_.kids[at])) return true;
+    }
+    return false;
+  };
+  switch (n.kind) {
+    case NodeKind::Const: case NodeKind::Local: case NodeKind::Global: case NodeKind::Zero: return false;
+    case NodeKind::Unary: case NodeKind::Field: case NodeKind::Swizzle: case NodeKind::Cast: case NodeKind::Bitcast: case NodeKind::Length: return has_effects(n.a);
+    case NodeKind::Binary: case NodeKind::Logical: case NodeKind::Index: case NodeKind::Comma: return has_effects(n.a) || has_effects(n.b);
+    case NodeKind::Ternary: return has_effects(n.a) || has_effects(n.b) || has_effects(n.c);
+    case NodeKind::Construct: case NodeKind::TexCall: return kids();
+    case NodeKind::Builtin: return n.type.base == Base::Void || kids();      // (a built-in without a value is a statement: EmitVertex, barrier ...)
+    default: return true;
+  }
 }
 
 // IF flag (when_set) or IF !flag: the flags are 0 / 1 in .x.
@@ -3078,11 +3464,35 @@ uint32_t Gen::exits(int32_t id, bool in_loop) const {
 
 // switch (sel) { case ...: ... }: a loop run once, so that break leaves it. A case's body runs once it or a case before it (GLSL falls through) matched; default
 // matches when no case does.
+// continue: of the loop around (CONT, or its flag when the loop has one: see loop()). Inside a switch (a loop of its own) it sets the switch's flag and leaves the
+// switch; after the switch, a set flag is the continue of the loop around it (switch_stmt).
+bool Gen::continue_stmt() {
+  FnCtx& f = fns_[nfns_ - 1];
+  if (!f.loops || !nloops_) return fail("continue outside a loop");
+  const LoopCtx& top = loops_[nloops_ - 1];
+  if (top.is_switch && !top.use_flag) return fail("continue outside a loop");
+  if (top.use_flag) {
+    Oper one;
+    if (!scalar_imm(1.0f, &one)) return false;
+    inst("MOV", top.flag, "x", &one);
+    if (top.is_switch) {
+      begin_inst("BRK");
+      end_inst();
+    }
+  } else {
+    begin_inst("CONT");
+    end_inst();
+  }
+  return true;
+}
+
 bool Gen::switch_stmt(const Node& n) {
   FnCtx& f = fns_[nfns_ - 1];
   if (nloops_ >= sizeof loops_ / sizeof loops_[0]) return fail("loops nested too deep");
+  bool continues = false;      // (a continue of the loop around, from a case)
   for (int32_t i = 0; i < n.count; ++i)
-    if (exits(m_.nodes[static_cast<uint64_t>(m_.kids[static_cast<uint64_t>(n.first + i)])].d, true) & kExitContinue) return fail("continue inside a switch");
+    if (exits(m_.nodes[static_cast<uint64_t>(m_.kids[static_cast<uint64_t>(n.first + i)])].d, true) & kExitContinue) continues = true;
+  if (continues && f.loops == 0) return fail("continue outside a loop");
   Val sel;
   if (!eval(n.a, &sel) || !to_float(sel)) return false;
   if (sel.kind || sel.cols != 1 || sel.rows != 1) return fail("a switch on a value that is not a scalar");
@@ -3112,10 +3522,15 @@ bool Gen::switch_stmt(const Node& n) {
   uint16_t matched;
   if (!new_temp(&matched)) return false;
   inst("MOV", matched, "x", &zero);
-  begin_inst("BGNLOOP");
-  end_inst();
   LoopCtx lc;
   lc.is_switch = true;
+  lc.use_flag = continues;
+  if (continues) {
+    if (!new_temp(&lc.flag)) return false;
+    inst("MOV", lc.flag, "x", &zero);
+  }
+  begin_inst("BGNLOOP");
+  end_inst();
   loops_[nloops_++] = lc;
   ++f.loops;
   bool ok = true;
@@ -3151,6 +3566,11 @@ bool Gen::switch_stmt(const Node& n) {
   end_inst();
   begin_inst("ENDLOOP");
   end_inst();
+  if (continues) {      // a case continued: the continue of the loop around, here
+    if (!flag_test(lc.flag, true) || !continue_stmt()) return false;
+    begin_inst("ENDIF");
+    end_inst();
+  }
   return true;
 }
 
@@ -3272,8 +3692,12 @@ bool Gen::call(const Node& n, Val* out) {
   for (uint32_t i = 0; i < np; ++i) {
     Var pv;
     if (!make_var(F.params[i].type, &pv)) return false;
+    if (pv.sampler) {      // a sampler parameter: the argument's uniform
+      if (args[i].kind != 5) return fail("a sampler argument the device cannot take");
+      pv.sslot = args[i].ival;
+    }
     locals_[base + i] = pv;
-    if (F.params[i].dir == 1) continue;
+    if (F.params[i].dir == 1 || pv.sampler) continue;
     LV l;
     lv_of(pv, &l);
     if (!store(l, args[i])) return false;
@@ -3391,17 +3815,7 @@ bool Gen::stmt(int32_t id, bool tail) {
       begin_inst("BRK");
       end_inst();
       return true;
-    case NodeKind::Continue:
-      if (!f.loops || !nloops_ || loops_[nloops_ - 1].is_switch) return fail("continue outside a loop");
-      if (loops_[nloops_ - 1].use_flag) {
-        Oper one;
-        if (!scalar_imm(1.0f, &one)) return false;
-        inst("MOV", loops_[nloops_ - 1].flag, "x", &one);
-      } else {
-        begin_inst("CONT");
-        end_inst();
-      }
-      return true;
+    case NodeKind::Continue: return continue_stmt();
     case NodeKind::Return:
       if (f.wgsl_entry) {      // (an entry point's result is the outputs: one return, at the end)
         if (!tail || (n.a >= 0 && have_ret_)) return fail("an early return");
@@ -3598,13 +4012,19 @@ bool Gen::run() {
       const Global& g = *m_.globals[gi];
       if (g.kind != GlobalKind::In || !(g.type.array || g.type.base == Base::Struct) || !g.referenced || g.builtin != kBvNone) continue;
       const IoLink* l = in_ ? in_->by_in(static_cast<int32_t>(gi)) : nullptr;
-      if (!l) return fail("a varying the vertex shader does not write");
       Var v;
       Val val;
       List<Column> cols(body.allocator());
       if (!global_var(gi, &v)) return false;
       val_of(v, &val);
-      if (!columns_of(val, &cols) || cols.count() != l->columns) return fail("a varying the device cannot take");
+      if (!columns_of(val, &cols)) return fail("a varying the device cannot take");
+      if (!l) {      // (no stage before writes it: zero, as the CPU's vertices start)
+        Oper zero;
+        if (!scalar_imm(0.0f, &zero)) return false;
+        for (const Column& col : cols) inst_rows("MOV", col.temp, col.rows, &zero);
+        continue;
+      }
+      if (cols.count() != l->columns) return fail("a varying the device cannot take");
       for (uint32_t k = 0; k < cols.count(); ++k) {
         const Spot sp = spot_of(*l, k);
         const Oper in = at_channel('I', static_cast<uint16_t>(sp.reg), sp.chan, cols[k].rows);
@@ -3639,7 +4059,12 @@ bool Gen::run() {
     out_mov(0, "xyzw", filled('T', c.temp[0], 4));
     return true;
   }
-  return fail("no color output");
+  // no color output: OUT[0] is zero, and the draw writes none of it (TgsiProgram::no_color)
+  Oper zero;
+  if (!scalar_imm(0.0f, &zero)) return false;
+  out_mov(0, "xyzw", zero);
+  sh_.out->no_color = true;
+  return true;
 }
 
 // --- geometry and tessellation stages ------------------------------------------------------------------------------------------------------------------------
@@ -3728,13 +4153,18 @@ bool Gen::stage_start() {
       const uint32_t per = g.inner ? g.inner : 1;      // (an array of arrays: each vertex's elements, one group of registers each)
       for (uint32_t vtx = 0; vtx < nv; ++vtx) {
         for (uint32_t e = 0; e < per && vtx * per + e < v.count; ++e) {
-          const Var& el = elems_[static_cast<uint64_t>(v.first) + vtx * per + e];
-          if (el.count || el.is_struct) return fail("a per-vertex input the device cannot take");
-          for (uint32_t c = 0; c < el.cols; ++c) {
-            const Spot sp = position ? Spot{0, 0} : spot_of(*l, e * el.cols + c);
-            const Oper src = at_channel('I', 0, sp.chan, el.rows);
+          // (each column of the element - of each member, each element of a member, of a structure - from the vertex's registers in turn)
+          Val ev;
+          List<Column> cols(body.allocator());
+          val_of(elems_[static_cast<uint64_t>(v.first) + vtx * per + e], &ev);
+          if (!columns_of(ev, &cols) || (position && cols.count() != 1)) return fail("a per-vertex input the device cannot take");
+          const uint32_t per_element = static_cast<uint32_t>(cols.count());
+          if (!position && (e + 1) * per_element > l->columns) return fail("a per-vertex input the device cannot take");
+          for (uint32_t k = 0; k < per_element; ++k) {
+            const Spot sp = position ? Spot{0, 0} : spot_of(*l, e * per_element + k);
+            const Oper src = at_channel('I', 0, sp.chan, cols[k].rows);
             char swz[5] = {"xyzw"[src.swz[0]], "xyzw"[src.swz[1]], "xyzw"[src.swz[2]], "xyzw"[src.swz[3]], 0};
-            in2d(el.temp[c], mask_of(el.rows), vtx, position ? 0 : 1 + sp.reg, swz);
+            in2d(cols[k].temp, mask_of(cols[k].rows), vtx, position ? 0 : 1 + sp.reg, swz);
           }
         }
       }
@@ -3988,9 +4418,13 @@ bool Gen::write_vertex_outputs() {
     val_of(v, &val);
     if (!columns_of(val, &cols)) return false;
     if (cols.count() != l.columns) return fail("a varying the device cannot take");
+    // (one the shader never writes is zero, as the CPU's: final_boundary)
+    const bool unwritten = !m_.globals[static_cast<uint64_t>(l.out_gi)]->referenced;
+    Oper zero;
+    if (unwritten && !scalar_imm(0.0f, &zero)) return false;
     for (uint32_t k = 0; k < cols.count(); ++k) {
       const Spot sp = spot_of(l, k);
-      out_mov(1 + sp.reg, mask_at(sp.chan, cols[k].rows), to_channel(filled('T', cols[k].temp, cols[k].rows), sp.chan), l.saturate);
+      out_mov(1 + sp.reg, mask_at(sp.chan, cols[k].rows), unwritten ? zero : to_channel(filled('T', cols[k].temp, cols[k].rows), sp.chan), l.saturate);
     }
   }
   return true;
@@ -4078,13 +4512,14 @@ bool Gen::control_end() {
       if (l.patch || l.out_gi < 0) continue;
       const Var& own = stage_vars_[static_cast<uint64_t>(l.out_gi)].own;
       if (!own.valid) continue;      // (never written)
-      uint32_t k = 0;
-      for (uint32_t e = 0; e < (own.count ? own.count : 1u); ++e) {
-        const Var& el = own.count ? elems_[static_cast<uint64_t>(own.first) + e] : own;
-        for (uint32_t c = 0; c < el.cols; ++c) {
-          const Spot sp = spot_of(l, k++);
-          out2d(cp, 1 + sp.reg, el.rows, el.temp[c], sp.chan);
-        }
+      // its columns in register order (of each element, each member of a structure)
+      Val ov;
+      List<Column> cols(body.allocator());
+      val_of(own, &ov);
+      if (!columns_of(ov, &cols) || cols.count() > l.columns) return fail("a varying the device cannot take");
+      for (uint32_t k = 0; k < cols.count(); ++k) {
+        const Spot sp = spot_of(l, k);
+        out2d(cp, 1 + sp.reg, cols[k].rows, cols[k].temp, sp.chan);
       }
     }
     begin_inst("ENDIF");
@@ -4096,11 +4531,11 @@ bool Gen::control_end() {
     Var v;
     if (!global_var(static_cast<uint64_t>(l.out_gi), &v) || !flag_test(static_cast<uint16_t>(stage_vars_[static_cast<uint64_t>(l.out_gi)].flag), true)) return false;
     uint32_t reg = patch_out + l.base;
-    const uint32_t elements = v.count ? v.count : 1;
-    for (uint32_t e = 0; e < elements; ++e) {
-      const Var& el = v.count ? elems_[static_cast<uint64_t>(v.first) + e] : v;
-      for (uint32_t c = 0; c < el.cols; ++c) out_mov(reg++, mask_of(el.rows), filled('T', el.temp[c], el.rows));
-    }
+    Val pv;
+    List<Column> cols(body.allocator());
+    val_of(v, &pv);
+    if (!columns_of(pv, &cols)) return fail("a patch output the device cannot take");
+    for (const Column& col : cols) out_mov(reg++, mask_of(col.rows), filled('T', col.temp, col.rows));
     begin_inst("ENDIF");
     end_inst();
   }
@@ -4129,6 +4564,34 @@ void write_header_decl(String& s, const char* kind, uint32_t count) {
     s.append_uint(count - 1);
   }
   s.append("]\n");
+}
+
+// DCL TEMP for `count` temporaries: the TGSI arrays (kIndexedArray) as ranges of their own, DCL TEMP[a..b], ARRAY(n), and the others around them.
+void write_temps(String& s, uint32_t count, const List<TempArray>& arrays) {
+  uint32_t at = 0;
+  auto plain = [&](uint32_t end) {
+    if (end <= at) return;
+    s.append("DCL TEMP[");
+    s.append_uint(at);
+    if (end - at > 1) {
+      s.append("..");
+      s.append_uint(end - 1);
+    }
+    s.append("]\n");
+  };
+  for (uint64_t i = 0; i < arrays.count(); ++i) {
+    const TempArray& a = arrays[i];
+    plain(a.first);
+    s.append("DCL TEMP[");
+    s.append_uint(a.first);
+    s.append("..");
+    s.append_uint(uint32_t{a.first} + a.count - 1);
+    s.append("], ARRAY(");
+    s.append_uint(i + 1);
+    s.append(")\n");
+    at = uint32_t{a.first} + a.count;
+  }
+  plain(count);
 }
 
 // DCL file[index], semantic[semantic_index] (semantic_index < 0: none); `per_vertex`: file[][index], an array with an element per vertex.
@@ -4260,17 +4723,18 @@ bool assemble(String& out, const Gen& g, const Shared& sh, uint32_t attributes, 
     out.append(g.sv_names[i]);
     out.push_back('\n');
   }
-  if (fragment)
-    for (uint32_t i = 0; i < samplers; ++i) {
-      out.append("DCL SAMP[");
-      out.append_uint(i);
-      out.append("]\nDCL SVIEW[");
-      out.append_uint(i);
-      out.append("], 2D, FLOAT\n");
-    }
+  // (the fragment stage declares every sampler of the program, as it always did; another stage those it reads)
+  const uint32_t declared_samplers = fragment ? (samplers > g.samplers_used ? samplers : g.samplers_used) : g.samplers_used;
+  for (uint32_t i = 0; i < declared_samplers; ++i) {
+    out.append("DCL SAMP[");
+    out.append_uint(i);
+    out.append("]\nDCL SVIEW[");
+    out.append_uint(i);
+    out.append("], 2D, FLOAT\n");
+  }
   write_header_decl(out, "CONST", const_rows);
   if (g.uses_addr) out.append("DCL ADDR[0]\n");
-  write_header_decl(out, "TEMP", g.ntemp());
+  write_temps(out, g.ntemp(), g.temp_arrays());
   for (uint64_t i = 0; i < g.imms().count(); ++i) {
     out.append("IMM[");
     out.append_uint(i);
@@ -4302,6 +4766,7 @@ bool translate_wgsl_to_tgsi(allocators::IAllocator& a, const Module& vs, int32_t
   out->const_rows = 0;
   out->varyings = 0;
   out->uses_frag_coord = false;
+  out->no_color = false;
   Shared sh(out, ArrayView<const TgsiLink>(), limits);
   bool ok = vs.language == Language::Wgsl && fs.language == Language::Wgsl && vs_fn >= 0 && fs_fn >= 0;
   if (!ok) sh.why = "not a WGSL pipeline";
@@ -4356,6 +4821,9 @@ uint32_t varying_registers(const Module& m, const Type& t, uint32_t depth) {
 }
 
 bool refuse(Shared& sh, const char* why) {
+#ifdef TGSI_FAIL_TRACE
+  if (!sh.why) TGSI_FAIL_TRACE(why, 99);      // (99: an interface between stages)
+#endif
   if (!sh.why) sh.why = why;
   return false;
 }
@@ -4392,7 +4860,8 @@ bool final_boundary(Shared& sh, const Module& last, const Module& fs, Boundary& 
     const Global& g = *last.globals[static_cast<uint64_t>(l.out_gi)];
     const uint32_t regs = varying_registers(last, g.type, 0);
     if (!regs || g.type.array > 32) return refuse(sh, "a varying the device cannot take");
-    if (g.flat != link.flat && !(link.flat && g.type.base != Base::Float)) return refuse(sh, "a varying the device cannot take");
+    // (a flat link of a smooth output: an integer, or one the stage never writes, which the CPU links flat and zero - write_vertex_outputs writes the zero)
+    if (g.flat != link.flat && !(link.flat && (g.type.base != Base::Float || !g.referenced))) return refuse(sh, "a varying the device cannot take");
     l.base = b.registers;
     l.regs = l.columns = regs;
     const Type et = g.type.element();
@@ -4453,9 +4922,11 @@ bool stage_boundary(Shared& sh, const Module& producer, bool producer_is_control
     } else {
       if (!cg.per_vertex || (producer_is_control && !pg.per_vertex)) return refuse(sh, "an input the device cannot take");
       const Type et = cg.type.element();
-      if (!varying_value(et)) return refuse(sh, "a varying the device cannot take");
-      l.regs = l.columns = et.cols * (cg.inner ? cg.inner : 1);
-      l.rows = static_cast<uint8_t>(et.rows <= 2 ? et.rows : 0);
+      // (a structure per vertex: its registers in member order, not packed - see stage_start)
+      const uint32_t each = et.base == Base::Struct ? varying_registers(consumer, et, 0) : (varying_value(et) ? et.cols : 0);
+      if (!each) return refuse(sh, "a varying the device cannot take");
+      l.regs = l.columns = each * (cg.inner ? cg.inner : 1);
+      l.rows = static_cast<uint8_t>(et.base != Base::Struct && et.rows <= 2 ? et.rows : 0);
       l.base = b.registers;
       b.registers += l.regs;
     }
@@ -4592,6 +5063,7 @@ bool translate_program_to_tgsi(allocators::IAllocator& a, const Module& vs, cons
   out->const_rows = 0;
   out->varyings = 0;
   out->uses_frag_coord = false;
+  out->no_color = false;
   Shared sh(out, links, limits);
   sh.stages = stages;
   bool ok = vs.stage == Stage::Vertex && fs.stage == Stage::Fragment && links.size() <= Shared::kMaxLinks;
