@@ -107,6 +107,9 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
   if (!op) return call.fail(kErrorNotEnoughMemory);
   op->result = 0;
   switch (msg) {
+    case 0x240: case 0x245: case 0x246: case 0x247:      // WM_TOUCH, WM_POINTERUPDATE / DOWN / UP: the first finger becomes the mouse
+      promote_touch(call.pid(), msg, wparam, lparam);
+      break;
     case wn::WM_SETTEXT: {
       WideString text(S().alloc);
       if (lparam != 0 && !read_text(call, w, lparam, &text)) { op->result = 0; break; }

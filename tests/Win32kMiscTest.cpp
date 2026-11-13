@@ -99,6 +99,17 @@ __attribute__((weak)) bool adjust_window_rect(gdi::Rect* rect, uint32_t style, u
   rect->bottom += 8;
   return true;
 }
+// (the window manager's parts the misc services call but these tests do not reach: no window is redirected, no drop or touch waits)
+__attribute__((weak)) bool window_redirected_locked(uint32_t) { return false; }
+__attribute__((weak)) bool present_to_window_locked(uint32_t, ConstByteView, uint32_t, uint32_t, uint32_t, bool) { return false; }
+__attribute__((weak)) uint64_t take_drop(uint64_t, uint32_t, ByteView) { return 0; }
+__attribute__((weak)) uint32_t top_level_at(int32_t, int32_t) { return 0; }
+__attribute__((weak)) bool touch_input_locked(uint32_t, uint8_t, uint32_t, int32_t, int32_t) { return false; }
+__attribute__((weak)) bool touch_available() { return false; }
+__attribute__((weak)) bool pointer_touch_info(uint64_t, uint32_t, ByteView) { return false; }
+__attribute__((weak)) uint32_t touch_input_info(uint64_t, uint32_t, ByteView) { return 0; }
+__attribute__((weak)) bool close_touch_input(uint64_t, uint32_t) { return false; }
+__attribute__((weak)) uint64_t touch_window_state(uint32_t, uint32_t, uint32_t) { return 0; }
 }  // namespace process::win32k::user
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------

@@ -292,6 +292,10 @@ bool DesktopBridge::cursor_picture(uint32_t cursor, uint32_t* system_id, List<ui
   return user::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
 }
 
+bool DesktopBridge::touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
+  return user::touch_input(window, static_cast<uint8_t>(phase), id, x, y);
+}
+
 bool DesktopBridge::desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) {
   drop_ok_ = false;
   if (window == 0 || text.empty() || text[0] != '/') return false;

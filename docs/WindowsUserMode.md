@@ -335,6 +335,17 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
     pick by overlap or nearness, `GetMonitorInfo` answers each (`\\.\DISPLAY<n>`, the primary flagged), `EnumDisplayMonitors` calls back for each, and a window
     maximizes to the work area of the monitor it is mostly on.
   - *Vulkan sizes*: a swapchain image of another size than the client area is stretched over it (nearest pixel), as DWM does.
+  - *Touch*: a finger the desktop's touchscreen puts on a Windows program's window (or one a program injects with `InitializeTouchInjection` /
+    `InjectTouchInput`) is taken by the window under it for as long as it is down (`src/Process/Win32k/Win32kUserTouch.cpp`). It gets the Windows 8
+    pointer messages: `WM_POINTERENTER`, `WM_POINTERDOWN`, `WM_POINTERUPDATE`, `WM_POINTERUP` (with `POINTER_FLAG_CANCELED` when the desktop
+    cancels it) and `WM_POINTERLEAVE`, wParam the pointer id (from 2) and flags, lParam the screen point. `GetPointerType`, `GetPointerInfo`,
+    `GetPointerTouchInfo` and the frame and history forms (one entry) read the rest. A window that called `RegisterTouchWindow` (it or an ancestor)
+    gets `WM_TOUCH` instead, one `TOUCHINPUT` per message (`GetTouchInputInfo`, `CloseTouchInputHandle`). The first finger (none other down) that a
+    program leaves to DefWindowProc becomes the mouse, moving the cursor and pressing the left button, so programs that know nothing of touch are
+    clicked as before. `SM_DIGITIZER` reports an integrated multi-touch screen (and `SM_MAXIMUMTOUCHES` 10) once a finger has come. The kernel half
+    is `NtUserCallTwoParam` codes `0x7C01` to `0x7C04` (TheoryCraftOS's own) and `NtUserInjectTouchInput`. Not done: pens as pointers, gestures
+    (`WM_GESTURE`), pointer devices (`GetPointerDevices` lists none), `EnableMouseInPointer` (the mouse is never a pointer), coalescing, contact
+    shapes (an 8-pixel finger, fixed pressure). Host test: `Win32kUserTest` (`test_redirection`); in QEMU: `user32test.c` (`test_touch`).
   - *Files dropped from the desktop*: a file dragged from the File Explorer (or a Wayland program's file let go) over a window that accepts files
     (`DragAcceptFiles`, `WS_EX_ACCEPTFILES`, it or the nearest ancestor under the pointer) is taken: let go, the window gets `WM_DROPFILES` with an
     HDROP that `DragQueryFile` / `DragQueryPoint` read and `DragFinish` frees. The file's name is the one Windows programs see

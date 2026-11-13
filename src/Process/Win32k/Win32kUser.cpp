@@ -137,7 +137,7 @@ bool region_copy(List<Rect>& to, const List<Rect>& from) {
 
 State::State(allocators::IAllocator& a)
     : alloc(a), windows(a), hooks(a), win_events(a), defers(a), stations(a), desktops(a), object_handles(a), classes(a), atoms(a), queues(a), input_states(a), upcalls(a),
-      ops(a), timers(a), hotkeys(a), processes(a), dcs(a), thread_desktops(a), drops(a) {}
+      ops(a), timers(a), hotkeys(a), processes(a), dcs(a), thread_desktops(a), drops(a), touches(a), touch_inputs(a) {}
 
 State* state_or_null() { return g_state.get(); }
 
