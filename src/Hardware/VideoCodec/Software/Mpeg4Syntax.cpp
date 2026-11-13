@@ -1,0 +1,1093 @@
+/*
+ * TheoryCraftOS - a minimal UEFI x86_64 operating system.
+ * Copyright (C) 2026 Christopher Schaefer
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published
+ * by the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+
+// MPEG-4 Part 2 and H.263 decoding, part 1: packets, planes, video packets and groups of blocks, macroblocks and blocks, and the predictions made while parsing
+// (DC and AC coefficients, motion vectors, direct mode). ISO/IEC 14496-2 clauses 6 and 7, ITU-T H.263 clause 5. Reconstruction is in Mpeg4Recon.cpp.
+#include "Hardware/VideoCodec/Software/Mpeg4Core.hpp"
+
+namespace hardware {
+
+Mpeg4Decoder::~Mpeg4Decoder() = default;
+
+bool Mpeg4Decoder::decode(ConstByteView data, int64_t pts_us) {
+  if (!core_) core_ = UniquePointer<mpeg4::Core>::make(allocator_, allocator_);
+  return core_ && core_->decode(data, pts_us);
+}
+bool Mpeg4Decoder::receive(VideoFrame* frame) { return core_ && core_->receive(frame); }
+void Mpeg4Decoder::flush() {
+  if (core_) core_->flush();
+}
+void Mpeg4Decoder::reset() {
+  if (core_) core_->reset();
+}
+VideoFormat Mpeg4Decoder::output_format() const { return core_ ? core_->output_format() : VideoFormat(); }
+bool Mpeg4Decoder::ready() const { return core_ && core_->ready(); }
+
+namespace mpeg4 {
+
+namespace {
+#include "Hardware/VideoCodec/Software/Mpeg4Tables.inc"
+
+constexpr int kMcbpcLen = 9, kCbpyLen = 6, kMvLen = 12, kDcLumaLen = 11, kDcChromaLen = 12, kCoefficientLen = 12, kBTypeLen = 4;   // the longest code of each table
+constexpr int kEscape = 102;
+constexpr int kStuffingIntra = 8, kStuffingInter = 20;
+constexpr int8_t kDquant[4] = {-1, -2, 1, 2};
+
+// A lookup table indexed by the next `max_bits` bits: (symbol << 5) | length, 0 for a bit pattern that starts no code.
+bool make_lut(allocators::IAllocator& a, Mem<uint16_t>* lut, ArrayView<const uint16_t> codes, ArrayView<const uint8_t> bits, int max_bits) {
+  if (!lut->alloc(a, uint64_t{1} << max_bits)) return false;
+  ArrayView<uint16_t> table(lut->data(), lut->size());
+  for (uint64_t sym = 0; sym < codes.size() && sym < bits.size(); ++sym) {
+    const int len = bits[sym];
+    if (len == 0 || len > max_bits) continue;
+    const uint32_t first = static_cast<uint32_t>(codes[sym]) << (max_bits - len);
+    for (uint32_t i = 0; i < (1u << (max_bits - len)); ++i) table[first + i] = static_cast<uint16_t>((sym << 5) | static_cast<uint64_t>(len));
+  }
+  return true;
+}
+
+int clamp_int(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// 7.4.3.2 Table 7-1: the DC scaler of luma and chroma blocks.
+int luma_dc_scale(int q) { return q < 5 ? 8 : q < 9 ? 2 * q : q < 25 ? q + 8 : 2 * q - 16; }
+int chroma_dc_scale(int q) { return q < 5 ? 8 : q < 25 ? (q + 13) / 2 : q - 6; }
+
+int rounded_div(int a, int b) { return (a >= 0 ? a + (b >> 1) : a - (b >> 1)) / b; }
+
+// The value of `bits` bits as a two's complement number.
+int sign_extend(uint32_t value, int bits) {
+  const uint32_t sign = 1u << (bits - 1);
+  value &= (sign << 1) - 1;
+  return static_cast<int>(value ^ sign) - static_cast<int>(sign);
+}
+
+// 6.3.5: the resync marker after the stuffing at a byte boundary, as 16 bits from a position `n` bits into a byte: a zero, ones to the boundary, then zeros.
+constexpr uint16_t kResyncPrefix[8] = {0x7F00, 0x7E00, 0x7C00, 0x7800, 0x7000, 0x6000, 0x4000, 0x0000};
+}  // namespace
+
+Core::Core(allocators::IAllocator& allocator) : allocator_(allocator) {
+  for (int i = 0; i < 64; ++i) {
+    scan_tables_[0][i] = kZigzag[i];
+    scan_tables_[2][i] = kAlternateVertical[i];
+    const int v = kAlternateVertical[i];
+    scan_tables_[1][i] = static_cast<uint8_t>((v & 7) * 8 + (v >> 3));   // the alternate horizontal scan: the transpose
+  }
+  const CoefficientTable* tables[2] = {&kIntraCoefficients, &kInterCoefficients};
+  for (int t = 0; t < 2; ++t) {
+    const CoefficientTable& table = *tables[t];
+    for (int i = 0; i < kEscape; ++i) {
+      const int last = i >= table.last_start ? 1 : 0, run = table.run[i], level = table.level[i];
+      if (level > max_level_[t][last][run]) max_level_[t][last][run] = static_cast<uint8_t>(level);
+      if (run > max_run_[t][last][level]) max_run_[t][last][level] = static_cast<uint8_t>(run);
+    }
+  }
+}
+
+bool Core::build_vlcs() {
+  if (vlcs_ready_) return true;
+  if (!make_lut(allocator_, &lut_intra_mcbpc_, kIntraMcbpcCode, kIntraMcbpcBits, kMcbpcLen) ||
+      !make_lut(allocator_, &lut_inter_mcbpc_, kInterMcbpcCode, kInterMcbpcBits, kMcbpcLen) || !make_lut(allocator_, &lut_cbpy_, kCbpyCode, kCbpyBits, kCbpyLen) ||
+      !make_lut(allocator_, &lut_mv_, kMvCode, kMvBits, kMvLen) || !make_lut(allocator_, &lut_dc_[0], kDcLumaCode, kDcLumaBits, kDcLumaLen) ||
+      !make_lut(allocator_, &lut_dc_[1], kDcChromaCode, kDcChromaBits, kDcChromaLen) ||
+      !make_lut(allocator_, &lut_coef_[0], kIntraCoefficients.code, kIntraCoefficients.bits, kCoefficientLen) ||
+      !make_lut(allocator_, &lut_coef_[1], kInterCoefficients.code, kInterCoefficients.bits, kCoefficientLen) ||
+      !make_lut(allocator_, &lut_btype_, kBTypeCode, kBTypeBits, kBTypeLen))
+    return false;
+  vlcs_ready_ = true;
+  return true;
+}
+
+int Core::read_vlc(BitReader& br, const Mem<uint16_t>& lut, int max_bits) {
+  const uint16_t entry = ArrayView<const uint16_t>(lut.data(), lut.size())[br.peek(max_bits)];
+  if (entry == 0) return -1;
+  br.skip(entry & 31);
+  return entry >> 5;
+}
+
+// ---- the output ---------------------------------------------------------------------------------------------------------------------
+
+VideoFormat Core::output_format() const { return out_format_; }
+
+Picture* Core::find_free_picture() {
+  for (Picture& p : pool_) {
+    if (p.in_use && &p != cur_ && &p != anchor_[0] && &p != anchor_[1] && &p != held_ && &p != returned_ && !p.output_pending) p.in_use = false;
+  }
+  for (Picture& p : pool_)
+    if (!p.in_use) return &p;
+  return nullptr;
+}
+
+void Core::output_picture(Picture* p) {
+  if (!p || p->output_pending) return;
+  if (queue_count_ >= kOutputQueue) {
+    // The caller does not take pictures: the oldest one is lost.
+    queue_[0]->output_pending = false;
+    for (int i = 1; i < queue_count_; ++i) queue_[i - 1] = queue_[i];
+    --queue_count_;
+  }
+  p->output_pending = true;
+  queue_[queue_count_++] = p;
+}
+
+bool Core::receive(VideoFrame* frame) {
+  if (queue_count_ == 0) return false;
+  Picture* p = queue_[0];
+  for (int i = 1; i < queue_count_; ++i) queue_[i - 1] = queue_[i];
+  --queue_count_;
+  p->output_pending = false;
+  returned_ = p;
+  frame->format = out_format_;
+  for (int c = 0; c < 3; ++c) {
+    frame->plane[c] = p->plane[c].data();
+    frame->stride[c] = static_cast<uint32_t>(p->stride[c]);
+  }
+  frame->pts_us = p->pts;
+  frame->keyframe = p->type == kPictureI;
+  frame->limited_range = true;
+  return true;
+}
+
+void Core::flush() {
+  if (held_) output_picture(held_);
+  held_ = nullptr;
+}
+
+void Core::reset() {
+  cur_ = nullptr;
+  anchor_[0] = anchor_[1] = nullptr;
+  held_ = nullptr;
+  returned_ = nullptr;
+  for (int i = 0; i < queue_count_; ++i) queue_[i]->output_pending = false;
+  queue_count_ = 0;
+  for (Picture& p : pool_) p.in_use = false;
+  need_intra_ = true;
+}
+
+// ---- packets and planes ---------------------------------------------------------------------------------------------------------------
+
+bool Core::decode(ConstByteView data, int64_t pts_us) {
+  if (!build_vlcs()) return false;
+  // An H.263 picture starts with its picture start code; an MPEG-4 packet with a start code (00 00 01), perhaps after some zero bytes.
+  uint64_t first = 0;
+  while (first < data.size() && data[first] == 0 && !is_short_header(data.subview(first))) ++first;
+  if (first < data.size() && is_short_header(data.subview(first))) return decode_h263(data.subview(first), pts_us);
+  return decode_mpeg4(data, pts_us);
+}
+
+bool Core::decode_mpeg4(ConstByteView data, int64_t pts) {
+  const uint64_t n = data.size();
+  auto next_start = [&](uint64_t from) {
+    for (uint64_t i = from; i + 3 < n; ++i)
+      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) return i;
+    return n;
+  };
+  bool used = false;
+  uint64_t at = next_start(0);
+  while (at < n) {
+    const uint8_t code = data[at + 3];
+    const uint64_t begin = at + 4, end = next_start(begin);
+    const ConstByteView body = data.subview(begin, end - begin);
+    if (code == 0xB0) {
+      if (body.size() >= 1) profile_and_level_ = body[0];
+    } else if (code >= 0x20 && code <= 0x2F) {
+      Vol v;
+      // (Data partitioning, with or without reversible codes, is not decoded: such a layer is refused whole.)
+      if (parse_vol_header(body, profile_and_level_, &v) && !v.data_partitioned && configure(static_cast<int>(v.width), static_cast<int>(v.height))) {
+        if (!have_vol_ || short_header_) low_delay_ = v.low_delay;
+        vol_ = v;
+        for (int i = 0; i < 64; ++i) {
+          intra_matrix_[kZigzag[i]] = v.intra_matrix[i];
+          inter_matrix_[kZigzag[i]] = v.non_intra_matrix[i];
+        }
+        have_vol_ = true;
+        short_header_ = false;
+        used = true;
+      }
+    } else if (code == 0xB6) {
+      if (have_vol_ && !short_header_ && decode_vop(body, pts)) used = true;
+    }
+    at = end;
+  }
+  return used;
+}
+
+bool Core::decode_vop(ConstByteView body, int64_t pts) {
+  VopHeader h;
+  if (!parse_vop_header(body, vol_, &h)) return false;
+  // The plane's time and the distances of direct mode, as FFmpeg computes them (decode_vop_header); the times move on even for a plane that is not coded.
+  const int64_t resolution = vol_.time_increment_resolution;
+  if (h.type != VopType::B) {
+    last_time_base_ = time_base_;
+    time_base_ += h.modulo_time_base;
+    time_ = time_base_ * resolution + h.time_increment;
+    pp_time_ = time_ - last_non_b_time_;
+    last_non_b_time_ = time_;
+  } else {
+    time_ = (last_time_base_ + h.modulo_time_base) * resolution + h.time_increment;
+    pb_time_ = pp_time_ - (last_non_b_time_ - time_);
+    if (pp_time_ <= pb_time_ || pp_time_ <= pp_time_ - pb_time_ || pp_time_ <= 0) return true;   // out of order (after a seek): FFmpeg skips the plane
+    if (t_frame_ == 0) t_frame_ = pb_time_;
+    if (t_frame_ == 0) t_frame_ = 1;
+    auto rdiv = [](int64_t a, int64_t b) { return (a >= 0 ? a + (b >> 1) : a - (b >> 1)) / b; };
+    pp_field_time_ = (rdiv(last_non_b_time_, t_frame_) - rdiv(last_non_b_time_ - pp_time_, t_frame_)) * 2;
+    pb_field_time_ = (rdiv(time_, t_frame_) - rdiv(last_non_b_time_ - pp_time_, t_frame_)) * 2;
+    if (pp_field_time_ <= pb_field_time_ || pb_field_time_ <= 1) {
+      pb_field_time_ = 2;
+      pp_field_time_ = 4;
+      if (vol_.interlaced) return true;
+    }
+  }
+  if (!h.coded) return true;   // "repeat the previous picture": nothing new comes out (as with FFmpeg)
+  PlaneParams p;
+  p.type = static_cast<int>(h.type);
+  p.quant = h.quant;
+  p.fcode_forward = h.fcode_forward;
+  p.fcode_backward = h.fcode_backward;
+  p.no_rounding = h.rounding_type;
+  p.dc_threshold = kIntraDcThreshold[h.intra_dc_vlc_thr & 7];
+  p.alternate_scan = h.alternate_vertical_scan;
+  p.top_field_first = h.top_field_first;
+  if (p.type == kPictureB) {
+    low_delay_ = false;   // the layer said otherwise, wrongly
+    if (!anchor_[0] || !anchor_[1]) return true;
+  }
+  if (need_intra_ && p.type != kPictureI) return true;
+  pic_ = p;
+  if (!begin_picture(pts)) return false;
+  BitReader br(body);
+  br.skip(static_cast<int>(h.header_bits));
+  decode_macroblocks(br);
+  end_picture();
+  return true;
+}
+
+bool Core::decode_h263(ConstByteView data, int64_t pts) {
+  ShortHeader h;
+  if (!parse_short_header(data, &h)) return false;
+  if (!configure(static_cast<int>(h.width), static_cast<int>(h.height))) return false;
+  if (!short_header_) {
+    short_header_ = true;
+    have_vol_ = false;
+    vol_ = Vol();
+    vol_.width = h.width;
+    vol_.height = h.height;
+    vol_.low_delay = true;
+    low_delay_ = true;
+  }
+  PlaneParams p;
+  p.type = h.inter ? kPictureP : kPictureI;
+  p.short_header = true;
+  p.quant = h.quant;
+  p.continuous_presence = h.continuous_presence;
+  if (need_intra_ && p.type != kPictureI) return true;
+  pic_ = p;
+  if (!begin_picture(pts)) return false;
+  BitReader br(data);
+  br.skip(static_cast<int>(h.header_bits));
+  decode_macroblocks(br);
+  end_picture();
+  return true;
+}
+
+bool Core::configure(int width, int height) {
+  if (width <= 0 || height <= 0) return false;
+  const int mb_w = (width + 15) / 16, mb_h = (height + 15) / 16;
+  if (mb_w > kMaxMbWidth || mb_h > kMaxMbHeight) return false;
+  if (width == width_ && height == height_ && mb_count_ > 0) return true;
+  const uint64_t count = static_cast<uint64_t>(mb_w) * static_cast<uint64_t>(mb_h);
+  if (!mb_packet_.alloc(allocator_, count) || !mb_intra_.alloc(allocator_, count) || !mb_qscale_.alloc(allocator_, count) || !dc_[0].alloc(allocator_, count * 4) ||
+      !dc_[1].alloc(allocator_, count) || !dc_[2].alloc(allocator_, count) || !ac_[0].alloc(allocator_, count * 4 * 16) || !ac_[1].alloc(allocator_, count * 16) ||
+      !ac_[2].alloc(allocator_, count * 16)) {
+    mb_count_ = 0;
+    width_ = height_ = 0;
+    return false;
+  }
+  width_ = width;
+  height_ = height;
+  mb_w_ = mb_w;
+  mb_h_ = mb_h;
+  mb_count_ = mb_w * mb_h;
+  out_format_ = VideoFormat{static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::I420};
+  reset();
+  return true;
+}
+
+bool Core::begin_picture(int64_t pts) {
+  Picture* p = find_free_picture();
+  if (!p) return false;
+  const int w = mb_w_ * 16, h = mb_h_ * 16;
+  if (p->width != w || p->height != h || p->mbs.size() != static_cast<uint64_t>(mb_count_)) {
+    p->width = p->height = 0;
+    if (!p->plane[0].alloc(allocator_, static_cast<uint64_t>(w) * h) || !p->plane[1].alloc(allocator_, static_cast<uint64_t>(w / 2) * (h / 2)) ||
+        !p->plane[2].alloc(allocator_, static_cast<uint64_t>(w / 2) * (h / 2)) || !p->mbs.alloc(allocator_, static_cast<uint64_t>(mb_count_)))
+      return false;
+    p->width = w;
+    p->height = h;
+    p->stride[0] = w;
+    p->stride[1] = p->stride[2] = w / 2;
+  }
+  p->in_use = true;
+  p->output_pending = false;
+  p->type = pic_.type;
+  p->pts = pts;
+  cur_ = p;
+  ArrayView<int32_t>(mb_packet_.data(), mb_packet_.size()).fill(-1);
+  qscale_ = pic_.quant;
+  packet_start_ = 0;
+  for (auto& d : last_mv_)
+    for (auto& f : d) f[0] = f[1] = 0;
+  return true;
+}
+
+void Core::end_picture() {
+  Picture* p = cur_;
+  cur_ = nullptr;
+  if (!p) return;
+  if (p->type == kPictureB) {
+    output_picture(p);
+    return;
+  }
+  anchor_[0] = anchor_[1];
+  anchor_[1] = p;
+  need_intra_ = false;
+  if (low_delay_) {
+    if (held_) output_picture(held_);
+    held_ = nullptr;
+    output_picture(p);
+  } else {
+    if (held_) output_picture(held_);
+    held_ = p;
+  }
+}
+
+// ---- video packets and groups of blocks ---------------------------------------------------------------------------------------------
+
+int Core::resync_prefix_length() const {
+  if (pic_.type == kPictureI) return 16;
+  if (pic_.type == kPictureP) return pic_.fcode_forward + 15;
+  int f = pic_.fcode_forward > pic_.fcode_backward ? pic_.fcode_forward : pic_.fcode_backward;
+  return (f > 2 ? f : 2) + 15;
+}
+
+// After a macroblock: 0 when another one follows, 1 when a resync marker (after its stuffing) does, -1 when the plane ends here (only stuffing is left). As FFmpeg's
+// mpeg4_is_resync, macroblock stuffing in front of it is consumed.
+int Core::check_resync(BitReader& br) {
+  const int type_bits = pic_.type == kPictureI ? 1 : 2;   // the length of the stuffing code after 8 zero bits: I 9 bits, P 10 (with not_coded)
+  uint32_t v = br.peek(16);
+  while (v <= 0xFF && pic_.type != kPictureB && (v >> (8 - type_bits)) == 1 && br.bits_left() > 16) {
+    br.skip(8 + type_bits);
+    v = br.peek(16);
+  }
+  const uint64_t pos = br.position();
+  if (br.bits_left() <= 8) {
+    const uint32_t w = (v >> 8) | (0x7Fu >> (7 - (pos & 7)));
+    if (w == 0x7F) return -1;
+    return 0;
+  }
+  if (v != kResyncPrefix[pos & 7]) return 0;
+  BitReader look = br;
+  look.skip(1);
+  look.align();
+  int len = 0;
+  while (len < 32 && !look.bit()) ++len;
+  return len >= resync_prefix_length() ? 1 : 0;
+}
+
+// 6.2.5.2 video_packet_header(), at the resync marker (byte aligned). The fields repeated after header_extension_code are skipped, as FFmpeg skips them.
+bool Core::video_packet_header(BitReader& br, int* mb_index) {
+  if (br.bits_left() < 20) return false;
+  int len = 0;
+  while (len < 32 && !br.bit()) ++len;
+  if (len != resync_prefix_length()) return false;
+  int mb_bits = 1;
+  while ((1 << mb_bits) < mb_count_) ++mb_bits;
+  const int mb_num = static_cast<int>(br.get(mb_bits));
+  if (mb_num <= 0 || mb_num >= mb_count_) return false;
+  const int q = static_cast<int>(br.get(5));
+  if (q) qscale_ = q;
+  if (br.bit()) {   // header_extension_code
+    for (int i = 0; br.bit(); ++i)
+      if (i > 4096 || br.error()) return false;
+    br.skip(1);
+    br.skip(static_cast<int>(vol_.time_increment_bits));
+    br.skip(1);
+    br.skip(2);   // vop_coding_type
+    br.skip(3);   // intra_dc_vlc_thr
+    if (pic_.type != kPictureI) br.skip(3);
+    if (pic_.type == kPictureB) br.skip(3);
+  }
+  if (br.error()) return false;
+  *mb_index = mb_num;
+  return true;
+}
+
+// H.263 5.2: a group of blocks header (GBSC after stuffing, GN, [GSBI], GFID, GQUANT). False for anything else, a picture start code among them.
+bool Core::gob_header(BitReader& br, int* mb_index) {
+  if (br.peek(16) != 0) return false;
+  br.skip(16);
+  int zeros = 0;
+  while (zeros < 16 && !br.bit()) ++zeros;
+  if (zeros >= 16 || br.error()) return false;
+  const int gn = static_cast<int>(br.get(5));
+  if (gn == 0 || gn == 31) return false;   // a picture start code or the end of the sequence
+  if (pic_.continuous_presence) br.skip(2);
+  br.skip(2);   // GFID
+  const int q = static_cast<int>(br.get(5));
+  if (q == 0 || br.error()) return false;
+  const int rows = height_ <= 400 ? 1 : height_ <= 800 ? 2 : 4;
+  const int first = gn * rows * mb_w_;
+  if (first >= mb_count_) return false;
+  qscale_ = q;
+  *mb_index = first;
+  return true;
+}
+
+// ---- the macroblock loop ---------------------------------------------------------------------------------------------------------------
+
+void Core::decode_macroblocks(BitReader& br) {
+  int index = 0;
+  packet_start_ = 0;
+  while (index < mb_count_) {
+    mb_x_ = index % mb_w_;
+    mb_y_ = index / mb_w_;
+    if (pic_.type == kPictureB && mb_x_ == 0) {
+      for (auto& d : last_mv_)
+        for (auto& f : d) f[0] = f[1] = 0;
+    }
+    Mb& mb = mb_;
+    bool ok = pic_.short_header ? macroblock_h263(br, mb) : macroblock_mpeg4(br, mb);
+    if (ok && br.error()) ok = false;   // ran past the end of the plane
+    if (!ok) {
+      // Damage: the rest of the video packet is concealed, and decoding goes on at the next resync marker (or group of blocks) that can be found.
+      int next = -1;
+      br.align();
+      while (br.bits_left() > 24) {
+        if (br.peek(16) == 0) {
+          BitReader at = br;
+          int n = -1;
+          if ((pic_.short_header ? gob_header(at, &n) : video_packet_header(at, &n)) && n >= index) {
+            next = n;
+            br = at;
+            break;
+          }
+        }
+        br.skip(8);
+      }
+      conceal(index, next < 0 ? mb_count_ : next);
+      if (next < 0) return;
+      index = next;
+      packet_start_ = next;
+      for (auto& d : last_mv_)
+        for (auto& f : d) f[0] = f[1] = 0;
+      continue;
+    }
+    mb_packet_[static_cast<uint64_t>(index)] = packet_start_;
+    mb_intra_[static_cast<uint64_t>(index)] = mb.intra ? 1 : 0;
+    mb_qscale_[static_cast<uint64_t>(index)] = static_cast<uint8_t>(qscale_);
+    record_macroblock(mb);
+    reconstruct(mb);
+    ++index;
+    if (index >= mb_count_) break;
+    int next = index;
+    if (pic_.short_header) {
+      if (br.bits_left() < 16) {
+        if (br.peek(static_cast<int>(br.bits_left() < 1 ? 1 : br.bits_left())) == 0) {
+          conceal(index, mb_count_);
+          return;
+        }
+        continue;
+      }
+      if (br.peek(16) != 0) continue;
+      if (!gob_header(br, &next) || next < index) {
+        conceal(index, mb_count_);
+        return;
+      }
+    } else {
+      const int r = check_resync(br);
+      if (r == 0) continue;
+      if (r < 0) {
+        conceal(index, mb_count_);
+        return;
+      }
+      br.skip(1);
+      br.align();
+      if (!video_packet_header(br, &next) || next < index) {
+        conceal(index, mb_count_);
+        return;
+      }
+      for (auto& d : last_mv_)
+        for (auto& f : d) f[0] = f[1] = 0;
+    }
+    if (next > index) conceal(index, next);
+    index = next;
+    packet_start_ = next;
+  }
+}
+
+// What a later plane needs of this macroblock: its vectors for prediction (this plane) and for direct mode (a B plane after it).
+void Core::record_macroblock(const Mb& mb) {
+  if (pic_.type == kPictureB) return;
+  MbInfo& info = cur_->mbs[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+  info.flags = 0;
+  info.field_select[0] = info.field_select[1] = 0;
+  if (mb.intra || mb.skipped) {
+    info.flags = mb.intra ? kMbIntra : kMbSkipped;
+    for (auto& v : info.mv) v[0] = v[1] = 0;
+    return;
+  }
+  if (mb.mv_type == kMv8x8) {
+    info.flags = kMb8x8;
+    for (int i = 0; i < 4; ++i) {
+      info.mv[i][0] = static_cast<int16_t>(mb.mv[0][i][0]);
+      info.mv[i][1] = static_cast<int16_t>(mb.mv[0][i][1]);
+    }
+    return;
+  }
+  int x = mb.mv[0][0][0], y = mb.mv[0][0][1];
+  if (mb.mv_type == kMvField) {
+    info.flags = kMbInterlaced;
+    x = mb.mv[0][0][0] + mb.mv[0][1][0];
+    x = (x >> 1) | (x & 1);
+    y = mb.mv[0][0][1] + mb.mv[0][1][1];
+    for (int i = 0; i < 2; ++i) {
+      info.field_select[i] = static_cast<uint8_t>(mb.field_select[0][i]);
+      info.field_mv[i][0] = static_cast<int16_t>(mb.mv[0][i][0]);
+      info.field_mv[i][1] = static_cast<int16_t>(mb.mv[0][i][1]);
+    }
+  }
+  for (auto& v : info.mv) {
+    v[0] = static_cast<int16_t>(x);
+    v[1] = static_cast<int16_t>(y);
+  }
+}
+
+// ---- predictions ---------------------------------------------------------------------------------------------------------------------------
+
+// Whether a macroblock is in the plane and in the video packet being decoded (decoded already): a neighbour that can be predicted from.
+bool Core::same_packet(int mb_x, int mb_y) const {
+  if (mb_x < 0 || mb_y < 0 || mb_x >= mb_w_ || mb_y >= mb_h_) return false;
+  return mb_packet_[static_cast<uint64_t>(mb_y * mb_w_ + mb_x)] == packet_start_;
+}
+
+// 7.6.5: the motion vector predictor of a block of a P plane (block 0 for a whole macroblock), the median of the vectors to the left, above and above right, those
+// outside the plane or the video packet left out.
+void Core::predict_motion(int block, int* px, int* py) const {
+  // [block][candidate]: macroblock offset (x, y) and block of the candidate.
+  static const int8_t kCandidates[4][3][3] = {
+      {{-1, 0, 1}, {0, -1, 2}, {1, -1, 2}}, {{0, 0, 0}, {0, -1, 3}, {1, -1, 2}}, {{-1, 0, 3}, {0, 0, 0}, {0, 0, 1}}, {{0, 0, 2}, {0, 0, 1}, {0, 0, 0}}};
+  int v[3][2] = {};
+  bool valid[3] = {};
+  int count = 0;
+  for (int c = 0; c < 3; ++c) {
+    const int x = mb_x_ + kCandidates[block][c][0], y = mb_y_ + kCandidates[block][c][1], b = kCandidates[block][c][2];
+    const bool inside = (x == mb_x_ && y == mb_y_) || same_packet(x, y);
+    if (!inside) continue;
+    const MbInfo& info = cur_->mbs[static_cast<uint64_t>(y * mb_w_ + x)];
+    v[c][0] = info.mv[b][0];
+    v[c][1] = info.mv[b][1];
+    valid[c] = true;
+    ++count;
+  }
+  if (count == 0) {
+    *px = *py = 0;
+    return;
+  }
+  if (count == 1) {
+    for (int c = 0; c < 3; ++c)
+      if (valid[c]) {
+        *px = v[c][0];
+        *py = v[c][1];
+      }
+    return;
+  }
+  auto median = [](int a, int b, int c) { return a > b ? (b > c ? b : a > c ? c : a) : (a > c ? a : b > c ? c : b); };
+  *px = median(v[0][0], v[1][0], v[2][0]);
+  *py = median(v[0][1], v[1][1], v[2][1]);
+}
+
+// 6.3.6.3 / H.263 5.3.7: a motion vector component from its difference and predictor, wrapped into the range of the f_code.
+bool Core::read_motion(BitReader& br, int prediction, int fcode, int* value) {
+  const int code = read_vlc(br, lut_mv_, kMvLen);
+  if (code < 0) return false;
+  if (code == 0) {
+    *value = prediction;
+    return true;
+  }
+  const bool negative = br.bit() != 0;
+  const int shift = fcode - 1;
+  int v = code;
+  if (shift) {
+    v = ((v - 1) << shift) | static_cast<int>(br.get(shift));
+    ++v;
+  }
+  if (negative) v = -v;
+  *value = sign_extend(static_cast<uint32_t>(v + prediction), 5 + fcode);
+  return true;
+}
+
+// 7.4.3.1: the DC predictor of intra block `n` (0..3 luma, 4 and 5 chroma) and its direction (0: from the left, 1: from above); the reconstructed DC is kept
+// for the blocks after it. A neighbour that is not an intra block of the same video packet counts as 1024.
+int Core::predict_dc(int n, int level, int* direction) {
+  const int scale = pic_.short_header ? 8 : n < 4 ? luma_dc_scale(qscale_) : chroma_dc_scale(qscale_);
+  const int comp = n < 4 ? 0 : n - 3;
+  const int stride = comp == 0 ? mb_w_ * 2 : mb_w_;
+  const int bx = comp == 0 ? mb_x_ * 2 + (n & 1) : mb_x_, by = comp == 0 ? mb_y_ * 2 + (n >> 1) : mb_y_;
+  ArrayView<int16_t> dc(dc_[comp].data(), dc_[comp].size());
+  auto value = [&](int x, int y) -> int {
+    const int mx = comp == 0 ? x >> 1 : x, my = comp == 0 ? y >> 1 : y;
+    if (x < 0 || y < 0) return 1024;
+    const bool own = mx == mb_x_ && my == mb_y_;
+    if (!own && (!same_packet(mx, my) || !mb_intra_[static_cast<uint64_t>(my * mb_w_ + mx)])) return 1024;
+    return dc[static_cast<uint64_t>(y * stride + x)];
+  };
+  const int a = value(bx - 1, by), b = value(bx - 1, by - 1), c = value(bx, by - 1);
+  int pred;
+  if ((a - b < 0 ? b - a : a - b) < (b - c < 0 ? c - b : b - c)) {
+    pred = c;
+    *direction = 1;
+  } else {
+    pred = a;
+    *direction = 0;
+  }
+  pred = (pred + (scale >> 1)) / scale;
+  level += pred;
+  int stored = level * scale;
+  if (stored & ~2047) stored = stored < 0 ? 0 : 2047;
+  dc[static_cast<uint64_t>(by * stride + bx)] = static_cast<int16_t>(stored);
+  return level;
+}
+
+// 7.4.3.3: AC prediction of the first row or column of intra block `n` from the block above or to the left (scaled to this macroblock's quantiser), and the
+// copy of this block's first row and column for the blocks after it.
+void Core::predict_ac(Mb& mb, int n, int direction) {
+  const int comp = n < 4 ? 0 : n - 3;
+  const int stride = comp == 0 ? mb_w_ * 2 : mb_w_;
+  const int bx = comp == 0 ? mb_x_ * 2 + (n & 1) : mb_x_, by = comp == 0 ? mb_y_ * 2 + (n >> 1) : mb_y_;
+  ArrayView<int16_t> ac(ac_[comp].data(), ac_[comp].size());
+  ArrayView<int16_t> block(mb.block[n]);
+  if (mb.ac_pred) {
+    const int x = direction == 0 ? bx - 1 : bx, y = direction == 0 ? by : by - 1;
+    if (x >= 0 && y >= 0) {
+      const int mx = comp == 0 ? x >> 1 : x, my = comp == 0 ? y >> 1 : y;
+      const bool own = mx == mb_x_ && my == mb_y_;
+      const uint64_t neighbour_mb = static_cast<uint64_t>(my * mb_w_ + mx);
+      if (own || (same_packet(mx, my) && mb_intra_[neighbour_mb])) {
+        const int q = own ? qscale_ : mb_qscale_[neighbour_mb];
+        const ArrayView<int16_t> from = ac.subview(static_cast<uint64_t>(y * stride + x) * 16, 16);
+        for (int i = 1; i < 8; ++i) {
+          const int v = direction == 0 ? from[static_cast<uint64_t>(i)] : from[static_cast<uint64_t>(8 + i)];
+          const int add = q == qscale_ ? v : rounded_div(v * q, qscale_);
+          const uint64_t at = direction == 0 ? static_cast<uint64_t>(i * 8) : static_cast<uint64_t>(i);
+          block[at] = static_cast<int16_t>(block[at] + add);
+        }
+      }
+    }
+  }
+  const ArrayView<int16_t> to = ac.subview(static_cast<uint64_t>(by * stride + bx) * 16, 16);
+  for (int i = 1; i < 8; ++i) {
+    to[static_cast<uint64_t>(i)] = block[static_cast<uint64_t>(i * 8)];
+    to[static_cast<uint64_t>(8 + i)] = block[static_cast<uint64_t>(i)];
+  }
+}
+
+// 7.6.9.5: the vectors of a direct-mode macroblock of a B plane from the colocated macroblock of the backward reference, scaled by the temporal distances, plus
+// the delta (mx, my). Rounded and laid out as FFmpeg's ff_mpeg4_set_direct_mv does.
+void Core::set_direct(Mb& mb, int mx, int my) {
+  const MbInfo& col = anchor_[1]->mbs[static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_)];
+  mb.dir = kForward | kBackward;
+  if (col.flags & kMbInterlaced) {
+    mb.mv_type = kMvField;
+    for (int i = 0; i < 2; ++i) {
+      const int field_select = col.field_select[i];
+      mb.field_select[0][i] = field_select;
+      mb.field_select[1][i] = i;
+      int pp, pb;
+      if (pic_.top_field_first) {
+        pp = static_cast<uint16_t>(pp_field_time_ - field_select + i);
+        pb = static_cast<uint16_t>(pb_field_time_ - field_select + i);
+      } else {
+        pp = static_cast<uint16_t>(pp_field_time_ + field_select - i);
+        pb = static_cast<uint16_t>(pb_field_time_ + field_select - i);
+      }
+      if (pp == 0) pp = 1;
+      const int px = col.field_mv[i][0], py = col.field_mv[i][1];
+      mb.mv[0][i][0] = px * pb / pp + mx;
+      mb.mv[0][i][1] = py * pb / pp + my;
+      mb.mv[1][i][0] = mx ? mb.mv[0][i][0] - px : px * (pb - pp) / pp;
+      mb.mv[1][i][1] = my ? mb.mv[0][i][1] - py : py * (pb - pp) / pp;
+    }
+    return;
+  }
+  int pp = static_cast<uint16_t>(pp_time_), pb = static_cast<uint16_t>(pb_time_);
+  if (pp == 0) pp = 1;
+  const int blocks = (col.flags & kMb8x8) ? 4 : 1;
+  for (int i = 0; i < blocks; ++i) {
+    const int px = col.mv[i][0], py = col.mv[i][1];
+    mb.mv[0][i][0] = px * pb / pp + mx;
+    mb.mv[0][i][1] = py * pb / pp + my;
+    mb.mv[1][i][0] = mx ? mb.mv[0][i][0] - px : px * (pb - pp) / pp;
+    mb.mv[1][i][1] = my ? mb.mv[0][i][1] - py : py * (pb - pp) / pp;
+  }
+  if (blocks == 1) {
+    for (int d = 0; d < 2; ++d)
+      for (int i = 1; i < 4; ++i) {
+        mb.mv[d][i][0] = mb.mv[d][0][0];
+        mb.mv[d][i][1] = mb.mv[d][0][1];
+      }
+  }
+  // With quarter-sample motion FFmpeg (and the encoders made against it) predicts a 16x16 direct macroblock as four 8x8 blocks.
+  mb.mv_type = (blocks == 4 || vol_.quarter_sample) ? kMv8x8 : kMv16x16;
+}
+
+// ---- macroblocks --------------------------------------------------------------------------------------------------------------------------
+
+namespace {
+void clear_macroblock(Mb& mb) {
+  mb.intra = mb.skipped = mb.ac_pred = mb.field_dct = false;
+  mb.cbp = 0;
+  mb.mv_type = kMv16x16;
+  mb.dir = kForward;
+  for (auto& d : mb.mv)
+    for (auto& v : d) v[0] = v[1] = 0;
+  for (auto& d : mb.field_select) d[0] = d[1] = 0;
+  for (int& l : mb.last) l = -1;
+  for (auto& b : mb.block) ArrayView<int16_t>(b).fill(0);
+}
+}  // namespace
+
+// 6.2.6 macroblock() for I, P and B planes (no data partitioning, no sprites).
+bool Core::macroblock_mpeg4(BitReader& br, Mb& mb) {
+  clear_macroblock(mb);
+  const uint64_t index = static_cast<uint64_t>(mb_y_ * mb_w_ + mb_x_);
+  int cbpc = 0;
+  if (pic_.type == kPictureB) {
+    // A macroblock that was not coded in the backward reference is not coded here either: a copy of the forward reference.
+    if (anchor_[1]->mbs[index].flags & kMbSkipped) {
+      mb.skipped = true;
+      return true;
+    }
+    bool direct = false;
+    int cbp = 0;
+    const bool modb1 = br.bit() != 0;
+    bool field = false;
+    if (modb1) {
+      direct = true;
+    } else {
+      const bool modb2 = br.bit() != 0;
+      const int type = read_vlc(br, lut_btype_, kBTypeLen);
+      if (type < 0) return false;
+      direct = type == 0;
+      mb.dir = type == 1 ? (kForward | kBackward) : type == 2 ? kBackward : type == 3 ? kForward : (kForward | kBackward);
+      if (!modb2) cbp = static_cast<int>(br.get(6));
+      if (!direct && cbp && br.bit()) qscale_ = clamp_int(qscale_ + (br.bit() ? 2 : -2), 1, 31);   // dbquant
+      if (vol_.interlaced) {
+        if (cbp) mb.field_dct = br.bit() != 0;
+        if (!direct && br.bit()) {
+          field = true;
+          if (mb.dir & kForward) {
+            mb.field_select[0][0] = br.bit();
+            mb.field_select[0][1] = br.bit();
+          }
+          if (mb.dir & kBackward) {
+            mb.field_select[1][0] = br.bit();
+            mb.field_select[1][1] = br.bit();
+          }
+        }
+      }
+      if (!direct) {
+        const int fcode[2] = {pic_.fcode_forward, pic_.fcode_backward};
+        mb.mv_type = field ? kMvField : kMv16x16;
+        for (int d = 0; d < 2; ++d) {
+          if (!(mb.dir & (1 << d))) continue;
+          if (!field) {
+            int mx, my;
+            if (!read_motion(br, last_mv_[d][0][0], fcode[d], &mx) || !read_motion(br, last_mv_[d][0][1], fcode[d], &my)) return false;
+            mb.mv[d][0][0] = mx;
+            mb.mv[d][0][1] = my;
+            last_mv_[d][0][0] = last_mv_[d][1][0] = mx;
+            last_mv_[d][0][1] = last_mv_[d][1][1] = my;
+          } else {
+            for (int i = 0; i < 2; ++i) {
+              int mx, my;
+              if (!read_motion(br, last_mv_[d][i][0], fcode[d], &mx) || !read_motion(br, last_mv_[d][i][1] / 2, fcode[d], &my)) return false;
+              mb.mv[d][i][0] = mx;
+              mb.mv[d][i][1] = my;
+              last_mv_[d][i][0] = mx;
+              last_mv_[d][i][1] = my * 2;
+            }
+          }
+        }
+      }
+    }
+    if (direct) {
+      int mx = 0, my = 0;
+      if (!modb1 && (!read_motion(br, 0, 1, &mx) || !read_motion(br, 0, 1, &my))) return false;
+      set_direct(mb, mx, my);
+    }
+    mb.cbp = cbp;
+    for (int i = 0; i < 6; ++i)
+      if (!block_mpeg4(br, mb, i, (cbp >> (5 - i)) & 1, false, false)) return false;
+    return true;
+  }
+
+  if (pic_.type == kPictureP) {
+    for (;;) {
+      if (br.bit()) {   // not_coded
+        mb.skipped = true;
+        return true;
+      }
+      cbpc = read_vlc(br, lut_inter_mcbpc_, kMcbpcLen);
+      if (cbpc < 0) return false;
+      if (cbpc != kStuffingInter) break;
+      if (br.error()) return false;
+    }
+    mb.intra = (cbpc & 4) != 0;
+    if (!mb.intra) {
+      const int cbpy = read_vlc(br, lut_cbpy_, kCbpyLen);
+      if (cbpy < 0) return false;
+      mb.cbp = (cbpc & 3) | ((cbpy ^ 15) << 2);
+      if (cbpc & 8) qscale_ = clamp_int(qscale_ + kDquant[br.get(2)], 1, 31);
+      if (vol_.interlaced && mb.cbp) mb.field_dct = br.bit() != 0;
+      MbInfo& info = cur_->mbs[index];
+      if ((cbpc & 16) == 0) {
+        int px, py;
+        if (vol_.interlaced && br.bit()) {
+          mb.mv_type = kMvField;
+          mb.field_select[0][0] = br.bit();
+          mb.field_select[0][1] = br.bit();
+          predict_motion(0, &px, &py);
+          for (int i = 0; i < 2; ++i) {
+            if (!read_motion(br, px, pic_.fcode_forward, &mb.mv[0][i][0]) || !read_motion(br, py / 2, pic_.fcode_forward, &mb.mv[0][i][1])) return false;
+          }
+        } else {
+          predict_motion(0, &px, &py);
+          if (!read_motion(br, px, pic_.fcode_forward, &mb.mv[0][0][0]) || !read_motion(br, py, pic_.fcode_forward, &mb.mv[0][0][1])) return false;
+        }
+      } else {
+        mb.mv_type = kMv8x8;
+        for (int i = 0; i < 4; ++i) {
+          int px, py;
+          predict_motion(i, &px, &py);
+          if (!read_motion(br, px, pic_.fcode_forward, &mb.mv[0][i][0]) || !read_motion(br, py, pic_.fcode_forward, &mb.mv[0][i][1])) return false;
+          info.mv[i][0] = static_cast<int16_t>(mb.mv[0][i][0]);
+          info.mv[i][1] = static_cast<int16_t>(mb.mv[0][i][1]);
+        }
+      }
+      for (int i = 0; i < 6; ++i)
+        if (!block_mpeg4(br, mb, i, (mb.cbp >> (5 - i)) & 1, false, false)) return false;
+      return true;
+    }
+  } else {
+    do {
+      cbpc = read_vlc(br, lut_intra_mcbpc_, kMcbpcLen);
+      if (cbpc < 0 || br.error()) return false;
+    } while (cbpc == kStuffingIntra);
+    mb.intra = true;
+    cbpc = (cbpc & 3) | ((cbpc & 4) << 1);   // the dquant flag where an inter mcbpc has it
+  }
+  // An intra macroblock (of an I or a P plane).
+  mb.ac_pred = br.bit() != 0;
+  const int cbpy = read_vlc(br, lut_cbpy_, kCbpyLen);
+  if (cbpy < 0) return false;
+  mb.cbp = (cbpc & 3) | (cbpy << 2);
+  const bool use_dc_vlc = qscale_ < pic_.dc_threshold;   // (the quantiser before this macroblock's dquant)
+  if (cbpc & 8) qscale_ = clamp_int(qscale_ + kDquant[br.get(2)], 1, 31);
+  if (vol_.interlaced) mb.field_dct = br.bit() != 0;
+  for (int i = 0; i < 6; ++i)
+    if (!block_mpeg4(br, mb, i, (mb.cbp >> (5 - i)) & 1, true, use_dc_vlc)) return false;
+  return true;
+}
+
+// H.263 5.3: a macroblock of an I or a P picture of the baseline (no optional modes).
+bool Core::macroblock_h263(BitReader& br, Mb& mb) {
+  clear_macroblock(mb);
+  int cbpc;
+  if (pic_.type == kPictureP) {
+    for (;;) {
+      if (br.bit()) {   // COD
+        mb.skipped = true;
+        return true;
+      }
+      cbpc = read_vlc(br, lut_inter_mcbpc_, kMcbpcLen);
+      if (cbpc < 0) return false;
+      if (cbpc != kStuffingInter) break;
+      if (br.error()) return false;
+    }
+    if (cbpc & 16) return false;   // INTER4V needs advanced prediction (Annex F)
+  } else {
+    do {
+      cbpc = read_vlc(br, lut_intra_mcbpc_, kMcbpcLen);
+      if (cbpc < 0 || br.error()) return false;
+    } while (cbpc == kStuffingIntra);
+    cbpc = 4 | (cbpc & 3) | ((cbpc & 4) << 1);
+  }
+  mb.intra = (cbpc & 4) != 0;
+  int cbpy = read_vlc(br, lut_cbpy_, kCbpyLen);
+  if (cbpy < 0) return false;
+  if (!mb.intra) cbpy ^= 15;
+  mb.cbp = (cbpc & 3) | (cbpy << 2);
+  if (cbpc & 8) qscale_ = clamp_int(qscale_ + kDquant[br.get(2)], 1, 31);
+  if (!mb.intra) {
+    int px, py;
+    predict_motion(0, &px, &py);
+    if (!read_motion(br, px, 1, &mb.mv[0][0][0]) || !read_motion(br, py, 1, &mb.mv[0][0][1])) return false;
+  }
+  for (int i = 0; i < 6; ++i)
+    if (!block_h263(br, mb, i, (mb.cbp >> (5 - i)) & 1, mb.intra)) return false;
+  return true;
+}
+
+// ---- blocks --------------------------------------------------------------------------------------------------------------------------------
+
+// 6.2.8 block(): the coefficients of block `n` of an MPEG-4 macroblock, in scan order into position order. Intra blocks get their DC and AC predictions here
+// (their levels stay quantised: Mpeg4Recon.cpp dequantises them); the levels of inter blocks under the H.263 quantiser are dequantised as they are read, as
+// FFmpeg does (which matters for the clipping of the third escape).
+bool Core::block_mpeg4(BitReader& br, Mb& mb, int n, bool coded, bool intra, bool use_dc_vlc) {
+  ArrayView<int16_t> block(mb.block[n]);
+  int pos = 0, direction = 0, last_pos = -1;
+  int dc_level = 0;
+  if (intra) {
+    if (use_dc_vlc) {
+      const int size = n < 4 ? read_vlc(br, lut_dc_[0], kDcLumaLen) : read_vlc(br, lut_dc_[1], kDcChromaLen);
+      if (size < 0) return false;
+      if (size > 0) {
+        const uint32_t v = br.get(size);
+        dc_level = (v >> (size - 1)) ? static_cast<int>(v) : static_cast<int>(v) - (1 << size) + 1;
+        if (size > 8) br.skip(1);   // marker_bit
+      }
+      pos = 1;
+      last_pos = 0;
+    }
+    // The direction of the prediction picks the scan; it does not depend on this block's DC. (This stores a provisional DC, replaced below.)
+    predict_dc(n, 0, &direction);
+  }
+  if (coded) {
+    const int table = intra ? 0 : 1;
+    const CoefficientTable& t = intra ? kIntraCoefficients : kInterCoefficients;
+    const int scan_index = pic_.alternate_scan ? 2 : (intra && mb.ac_pred) ? (direction == 0 ? 2 : 1) : 0;
+    const ArrayView<const uint8_t> scan(scan_tables_[scan_index]);
+    const bool h263_quant = !intra && !vol_.quant_type_mpeg;
+    const int qmul = h263_quant ? qscale_ * 2 : 1, qadd = h263_quant ? (qscale_ - 1) | 1 : 0;
+    for (;;) {
+      int sym = read_vlc(br, lut_coef_[table], kCoefficientLen);
+      if (sym < 0) return false;
+      int run, level, last;
+      if (sym == kEscape) {
+        if (!br.bit()) {   // type 1: the level is beyond the table's for this run
+          sym = read_vlc(br, lut_coef_[table], kCoefficientLen);
+          if (sym < 0 || sym == kEscape) return false;
+          last = sym >= t.last_start ? 1 : 0;
+          run = t.run[sym];
+          level = t.level[sym] + max_level_[table][last][run];
+          if (br.bit()) level = -level;
+          level = level > 0 ? level * qmul + qadd : level * qmul - qadd;
+        } else if (!br.bit()) {   // type 2: the run is beyond the table's for this level
+          sym = read_vlc(br, lut_coef_[table], kCoefficientLen);
+          if (sym < 0 || sym == kEscape) return false;
+          last = sym >= t.last_start ? 1 : 0;
+          level = t.level[sym];
+          run = t.run[sym] + max_run_[table][last][level] + 1;
+          if (br.bit()) level = -level;
+          level = level > 0 ? level * qmul + qadd : level * qmul - qadd;
+        } else {   // type 3: fixed length
+          last = br.bit();
+          run = static_cast<int>(br.get(6));
+          if (!br.bit()) return false;   // marker_bit
+          level = sign_extend(br.get(12), 12);
+          if (!br.bit()) return false;   // marker_bit
+          if (level == 0) return false;
+          level = level > 0 ? level * qmul + qadd : level * qmul - qadd;
+          if (level > 2047) level = 2047;
+          if (level < -2048) level = -2048;
+        }
+      } else {
+        last = sym >= t.last_start ? 1 : 0;
+        run = t.run[sym];
+        level = t.level[sym];
+        if (br.bit()) level = -level;
+        level = level > 0 ? level * qmul + qadd : level * qmul - qadd;
+      }
+      pos += run;
+      if (pos > 63) return false;
+      block[scan[static_cast<uint64_t>(pos)]] = static_cast<int16_t>(level);
+      last_pos = pos;
+      ++pos;
+      if (last) break;
+      if (pos > 63 || br.error()) return false;
+    }
+  }
+  if (intra) {
+    const int level = use_dc_vlc ? dc_level : block[0];
+    int dir = 0;
+    block[0] = static_cast<int16_t>(predict_dc(n, level, &dir));
+    predict_ac(mb, n, direction);
+    if (last_pos < 0) last_pos = 0;
+    if (mb.ac_pred) last_pos = 63;
+  }
+  mb.last[n] = last_pos;
+  return true;
+}
+
+// H.263 5.4: a block: INTRADC (intra blocks), then the coefficients with the H.263 table; escapes are fixed length (LAST, RUN, an 8-bit LEVEL). Inter levels are
+// dequantised as they are read; intra levels in Mpeg4Recon.cpp.
+bool Core::block_h263(BitReader& br, Mb& mb, int n, bool coded, bool intra) {
+  ArrayView<int16_t> block(mb.block[n]);
+  int pos = 0, last_pos = -1;
+  if (intra) {
+    int dc = static_cast<int>(br.get(8));
+    if ((dc & 0x7F) == 0) return false;   // 0 and 128 are not used
+    if (dc == 255) dc = 128;
+    block[0] = static_cast<int16_t>(dc);
+    pos = 1;
+    last_pos = 0;
+  }
+  if (coded) {
+    const int qmul = intra ? 1 : qscale_ * 2, qadd = intra ? 0 : (qscale_ - 1) | 1;
+    const ArrayView<const uint8_t> scan(scan_tables_[0]);
+    for (;;) {
+      const int sym = read_vlc(br, lut_coef_[1], kCoefficientLen);
+      if (sym < 0) return false;
+      int run, level, last;
+      if (sym == kEscape) {
+        last = br.bit();
+        run = static_cast<int>(br.get(6));
+        level = sign_extend(br.get(8), 8);
+        if (level == 0 || level == -128) return false;
+      } else {
+        last = sym >= kInterCoefficients.last_start ? 1 : 0;
+        run = kInterCoefficients.run[sym];
+        level = kInterCoefficients.level[sym];
+        if (br.bit()) level = -level;
+      }
+      level = level > 0 ? level * qmul + qadd : level * qmul - qadd;
+      pos += run;
+      if (pos > 63) return false;
+      block[scan[static_cast<uint64_t>(pos)]] = static_cast<int16_t>(level);
+      last_pos = pos;
+      ++pos;
+      if (last) break;
+      if (pos > 63 || br.error()) return false;
+    }
+  }
+  mb.last[n] = last_pos;
+  return true;
+}
+
+}  // namespace mpeg4
+}  // namespace hardware

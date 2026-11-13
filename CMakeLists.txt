@@ -1134,6 +1134,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/Mpeg2Slice.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Recon.cpp
   src/Hardware/VideoCodec/Software/Mpeg4Headers.cpp
+  src/Hardware/VideoCodec/Software/Mpeg4Syntax.cpp
+  src/Hardware/VideoCodec/Software/Mpeg4Recon.cpp
   src/Hardware/VideoCodec/Software/Vc1Syntax.cpp
   src/Hardware/VideoCodec/Software/Vc1Block.cpp
   src/Hardware/VideoCodec/Software/Vc1Recon.cpp
