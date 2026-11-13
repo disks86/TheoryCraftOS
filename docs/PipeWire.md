@@ -30,6 +30,9 @@ program that records, of any kind, gets a record stream of it.
 | MIDI: the bus every program's MIDI port is on (to the synthesizer, from keyboards), raw MIDI and UMP | `MidiBus.{hpp,cpp}` |
 | Video: what a producer shows, for its watchers and the kernel (packed and planar YUV, RGB, grey, encoded) | `VideoChannel.{hpp,cpp}` |
 | The machine's cameras as Video/Source nodes of the kernel | `CameraSource.{hpp,cpp}` |
+| The screen as a Video/Source node (screen sharing) | `ScreenSource.{hpp,cpp}`, `gui::IFrameTap` (`src/Gui/Window.hpp`) |
+| Video conversion for watchers | `VideoConvert.{hpp,cpp}` |
+| The kernel's own watcher (the desktop's Video Viewer) | `VideoWatcher.{hpp,cpp}`, `src/Desktop/VideoViewer.{hpp,cpp}` |
 | A virtual sink's audio: a mixer of its own over a silent device on the graph's clock | `VirtualSink.hpp` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
@@ -120,7 +123,8 @@ program that records, of any kind, gets a record stream of it.
     the server ticks every millisecond while some wait). A MIDI input is given a Sequence of what the bus brought whose time has come, each at its
     place in the cycle before (the distances between messages kept): UMP for a port with `control.ump` (`32 bit raw UMP`; sysex in Data Message
     pieces), else raw MIDI. System exclusive reaches a USB synthesizer (USB-MIDI CIN 4..7 packets) and the MPU-401 whole; the software
-    synthesizer takes the GM, GM2, GS and XG resets. The bus sends programs' notes to the synthesizer (in the kernel: a USB synthesizer or the MPU-401 when there is one, else the
+    synthesizer takes the GM, GM2, GS and XG resets; a USB keyboard's system exclusive messages are put back together from its packets and reach
+    the programs' inputs (and a sound maker). The bus sends programs' notes to the synthesizer (in the kernel: a USB synthesizer or the MPU-401 when there is one, else the
     software synthesizer through the mixer, which keeps running a few seconds after a program's last note) and to every other program's MIDI
     input; keyboards' keys go to the programs' inputs too. The graph shows the bus as the node `tcos_midi.bridge` (`Midi/Bridge`), each program's
     MIDI node linked to it.
@@ -129,6 +133,20 @@ program that records, of any kind, gets a record stream of it.
     BGR15), packed YUV (YUY2, UYVY, YVYU, AYUV), planar YUV (I420, YV12, Y41B, Y42B, Y444, NV12, NV21) and grey (GRAY8, GRAY16); up to 8192 on a side.
     Encoded video (H.264, MJPEG, VP8, VP9, H.265 and the other video subtypes but Bayer) is carried as whole frames of any length (16 MiB at most).
     The kernel can take a channel's frames too (`Graph::video_of`).
+  - **The screen.** `ScreenSource.cpp`: a Video/Source node of the kernel's (`tcos-screen`) whose frames are what the desktop draws, BGRx at the
+    screen's size, at most 10 a second and only while watched: the renderer reads its frame back between drawing and presenting
+    (`IRenderer2D::read_frame`: the software renderer's surface, the device renderer's back image) and the desktop's window hands it to its
+    `gui::IFrameTap`; a new watcher makes the desktop draw once. For OBS, video calls' screen sharing, `pw-record`-style recorders.
+  - **Conversion for watchers.** A watcher whose EnumFormat does not list its producer's format is offered the first format it lists that the
+    frames can be converted to, and each frame is converted (`VideoConvert.cpp`: the 8-bit packed RGB, I420, YV12, NV12, NV21, YUY2, UYVY, YVYU and
+    GRAY8, through RGBA, BT.601 limited range). Also carried: 10- and 12-bit planar YUV, P010, NV16/NV24/NV61, VYUY, 10-bit and 64-bit packed RGB,
+    float RGBA and dsp video.
+  - **DMA-BUF producers.** A producer that allocates its own buffers may give GPU images (`SPA_DATA_DmaBuf`) when they are exports of `/dev/dxg`:
+    the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), each frame is copied out of the
+    image before it is read, and a frame the GPU still draws is handed back unread.
+  - **The Video Viewer.** A Start menu app of the desktop (`src/Desktop/VideoViewer.cpp`) lists the graph's video producers, watches the one
+    picked (through `VideoWatcher.cpp`, a watcher node of the kernel's, so a camera streams while it is shown) and shows its newest picture fitted
+    to the window, converted to RGB; it says when a source went or is encoded.
   - **The kernel's cameras.** Every camera `SystemCameras` finds is a Video/Source node of the kernel's (`CameraSource.cpp`: `tcos-camera-<id>`,
     described by the camera's name) that programs watch as any producer. It streams only while watched: started at 640 x 480, 30 frames a second
     (or the camera's nearest mode) when its first watcher comes, stopped two seconds after the last one went; its newest picture goes out as I420.
@@ -148,7 +166,8 @@ program that records, of any kind, gets a record stream of it.
   PulseAudio lists it with its monitor (`<name>.monitor`), plays into it (`paplay --device=<name>`), records it (`parecord
   --device=<name>.monitor`, or the sink's own name), sets its volume (its mixer's master volume) and reports it in subscriptions; Windows programs
   find it as a WASAPI render endpoint of its own (NtTcosAudio `VIRTUAL_SINKS`; `OPEN`/`OPEN_CAPTURE` with its node; its endpoint volume is its
-  own; loopback on it records it). With `object.linger=true` it stays when its client goes (it is the kernel's then); `Core destroy` of its proxy
+  own; loopback on it records it), as a winmm wave output device after the speakers (named after it; its device volume is its own) and as a
+  DirectSound device (`DirectSoundEnumerate`, its GUID the speakers' with its node in the last bytes, as its endpoint id). With `object.linger=true` it stays when its client goes (it is the kernel's then); `Core destroy` of its proxy
   removes it, and its streams make and hear silence. Other SPA factories (`api.alsa.pcm.sink`, `audiotestsrc`, ...) are refused with `-ENOTSUP`: no
   SPA plugin runs in the kernel.
 
@@ -266,6 +285,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   filter (two inputs from the microphone, two outputs to the speakers, one node) and a 5.1 filter folded to stereo; a virtual sink from the
   Windows service (into it, its monitor, its volume, the sink going while streams are open); and the camera sources with a fake camera (a node
   each, started by a watcher, its I420 pictures, stopped two seconds after the last watcher, pulled out).
+  Then: the 10/12-bit and other new formats' planes, conversion between every pair of the 8-bit formats (a grey ramp and red round trips, short
+  and resized frames refused), a BGRA-only watcher of an I420 camera given converted frames; the screen source (only while watched, 10 a second,
+  BGRx words, the size changing); the kernel's watcher (listing, watching, YUV converted, encoded and gone said); a DMA-BUF camera (copied out of
+  the image, a busy frame handed back unread). `GuiTest` checks the window's frame tap, `GuiViewsTest` the Video Viewer with fake sources, and
+  `UsbMidiTest` keyboards' system exclusive (every length, pieces across calls, broken, too long, 3000 random packets).
 - `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
   from another thread, passing it with SCM_RIGHTS).
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl`, `paplay` and `parecord` against
@@ -288,7 +312,8 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   per checkout (`/tmp/tcos-pwemu-<checksum of the path>`), so another worktree's objects and DLLs are never taken for this one's. The `nullsink`
   run makes a virtual sink in the emulator (`TCOS_EMU_NULL_SINK`) and runs `tests/windows/virtualsinktest.c`: WASAPI must list it as a render
   endpoint of its own (found by its name, its id found again, its volume apart from the speakers'), and a loopback client on it must record the
-  600 Hz another client plays into it and none of the speakers' native 300 Hz. The fourth run is
+  600 Hz another client plays into it and none of the speakers' native 300 Hz; then winmm's device 1 (400 Hz) and a DirectSound device made for
+  its enumerated GUID (500 Hz) must be heard there too. The fourth run is
   `tests/windows/xaudio2test.c`: a source voice into the mastering voice and one through a submix (400 and 600 Hz in the mix with the others),
   callbacks, loops, operation sets, matrices, the frequency ratio, MS-ADPCM through a volume meter, the FX objects and X3DAudio. (Its mastering
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
@@ -319,15 +344,17 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   loop; `module-rt` finds no RTKit or session bus and runs without realtime priority (as it does on Linux without them).
 - **client-node limits.** An adapter's audio is mono or stereo at its port (a wider stream is downmixed by the adapter in the program); a filter's
   float ports are channels in the usual order (`audio.channel` is not read), and an effect's input is the microphone (not another stream).
-  No DMA-BUFs (a DMA-BUF producer is refused), no DSP float video, no 10-bit or tiled formats (P010, NV12 tiles, v210), no video modifiers; a
-  watcher is always offered its producer's format (no conversion between formats or sizes). `SPA_META_Busy` is honoured but never set by the
-  server; cursor, bitmap and damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency; keyboards' system exclusive
-  is not passed on (USB-MIDI input reads channel messages only). No `set_activation` peers (the server is every node's only peer), links made by
-  clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
-- **Video sources and showing video.** The kernel's cameras are video sources; the screen is not (the desktop's renderers have no read-back of a
-  whole frame, so there is no screen-casting source), and the desktop does not show a channel's frames yet.
+  DMA-BUFs are taken only from producers that allocate (`port_buffers`) and only as exports of `/dev/dxg` (each frame copied out of the image:
+  no zero-copy, and the server never hands out DMA-BUFs); the transport's dmabuf path is checked with a fake GPU descriptor, not yet with a real
+  export. No tiled formats (NV12 tiles, v210) or modifiers; conversion for watchers covers the 8-bit formats only (not 10/12-bit, float or packed
+  10-bit RGB) and never scales (a watcher gets its producer's size). `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
+  damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency. No `set_activation` peers (the server is every node's
+  only peer), links made by clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
+- **Video sources and showing video.** The screen source sends frames only when the desktop draws (a still screen is sent once, when a watcher
+  comes) and does not include the 3D test's or Wayland/Win32 GPU images drawn outside the window's renderer. The Video Viewer shows raw video only
+  (encoded video such as MJPEG is not decoded) and shows one source at a time.
 - **The adapter's other factories.** Only `support.null-audio-sink`; `pactl load-module module-null-sink` is not served (make one with `pw-cli`).
-  A virtual sink's mixer is 48 kHz stereo whatever its node says; winmm and DirectSound devices do not list virtual sinks (WASAPI does).
+  A virtual sink's mixer is 48 kHz stereo whatever its node says.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).
