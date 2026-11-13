@@ -183,6 +183,7 @@ class Server final : public desktop::IWindowsSession {
   void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) override;
   void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) override;
   uint32_t take_drag(uint32_t* edge) override;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override;
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
@@ -592,6 +593,8 @@ class Server final : public desktop::IWindowsSession {
   } drag_;
   uint32_t waiting_count_ = 0;              // surfaces with a commit waiting for its acquire point                // (draw_window: a GPU picture of the tree could not be drawn)
   uint32_t drag_window_ = 0, drag_edge_ = 0;
+  uint32_t menu_window_ = 0;                // a toplevel's show_window_menu, until the desktop takes it
+  int32_t menu_x_ = 0, menu_y_ = 0;
   uint32_t active_window_ = 0;
   // input
   int32_t pointer_x_ = 0, pointer_y_ = 0;

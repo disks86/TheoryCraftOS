@@ -206,6 +206,15 @@ void Win32Windows::pump(gui::WindowManager& manager) {
       drag_from_ = h->bounds();
     }
   }      // (the windows shown before: all of them)
+  int32_t menu_x = 0, menu_y = 0;
+  if (const uint32_t window = session_->take_window_menu(&menu_x, &menu_y)) {      // (a program that draws its own title bar asks for the window menu)
+    gui::UiGuard lock(&manager);
+    Win32Window* h = host(window);
+    if (h && h->manager() == &manager) {
+      const gui::Rect2D client = h->view().bounds();
+      h->show_window_menu(client.x + menu_x, client.y + menu_y);
+    }
+  }
   {
     gui::UiGuard lock(&manager);
     follow_frames(manager);      // (first: what the user did since the last pump is asked of the programs before their older reports are applied)

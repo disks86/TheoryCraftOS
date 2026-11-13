@@ -76,7 +76,7 @@ enum WellKnown : uint32_t {
   kNetWmWindowTypeNotification, kNetWmWindowTypeCombo, kNetWmWindowTypeDnd, kNetWmWindowTypeSplash, kNetWmWindowTypeDock, kNetWmWindowTypeDesktop,
   kNetWmIcon, kNetWmPid, kNetFrameExtents, kNetRequestFrameExtents, kNetCloseWindow, kNetWmMoveresize, kNetMoveresizeWindow, kMotifWmHints,
   kNetWmAllowedActions, kNetWmActionMove, kNetWmActionResize, kNetWmActionMinimize, kNetWmActionMaximizeHorz, kNetWmActionMaximizeVert,
-  kNetWmActionClose, kNetWmActionFullscreen, kNetWmPing, kLastWellKnown
+  kNetWmActionClose, kNetWmActionFullscreen, kNetWmPing, kGtkShowWindowMenu, kLastWellKnown
 };
 
 constexpr const char* kWellKnownNames[] = {
@@ -89,7 +89,8 @@ constexpr const char* kWellKnownNames[] = {
     "_NET_WM_WINDOW_TYPE_COMBO", "_NET_WM_WINDOW_TYPE_DND", "_NET_WM_WINDOW_TYPE_SPLASH", "_NET_WM_WINDOW_TYPE_DOCK", "_NET_WM_WINDOW_TYPE_DESKTOP",
     "_NET_WM_ICON", "_NET_WM_PID", "_NET_FRAME_EXTENTS", "_NET_REQUEST_FRAME_EXTENTS", "_NET_CLOSE_WINDOW", "_NET_WM_MOVERESIZE",
     "_NET_MOVERESIZE_WINDOW", "_MOTIF_WM_HINTS", "_NET_WM_ALLOWED_ACTIONS", "_NET_WM_ACTION_MOVE", "_NET_WM_ACTION_RESIZE", "_NET_WM_ACTION_MINIMIZE",
-    "_NET_WM_ACTION_MAXIMIZE_HORZ", "_NET_WM_ACTION_MAXIMIZE_VERT", "_NET_WM_ACTION_CLOSE", "_NET_WM_ACTION_FULLSCREEN", "_NET_WM_PING"};
+    "_NET_WM_ACTION_MAXIMIZE_HORZ", "_NET_WM_ACTION_MAXIMIZE_VERT", "_NET_WM_ACTION_CLOSE", "_NET_WM_ACTION_FULLSCREEN", "_NET_WM_PING",
+    "_GTK_SHOW_WINDOW_MENU"};
 static_assert(sizeof kWellKnownNames / sizeof kWellKnownNames[0] == kLastWellKnown - kWmProtocols, "one name per well-known atom");
 
 constexpr uint32_t kMaxChanges = 256;
@@ -506,6 +507,7 @@ void Server::destroy_tree(Window& w) {
   if (keyboard_grab_.window == w.id) keyboard_grab_ = Grab();
   for (SelectionOwner& s : selection_owners_.view()) if (s.window == w.id) s.window = 0;
   if (drag_window_ == w.id) drag_window_ = 0;
+  if (menu_window_ == w.id) menu_window_ = 0;
   if (pointer_window_ == w.id) pointer_window_ = w.parent ? w.parent->id : kRootWindow;
   resources_.remove(w.id);
   windows_.erase(&w);
@@ -984,6 +986,13 @@ void Server::window_manager_message(uint32_t window, uint32_t type, const uint32
       send_configure_notify(*top);
       return;
     }
+    case kGtkShowWindowMenu:      // (GTK's title bar, drawn by the program: device, x and y on the root) the desktop opens the frame's window menu there
+      if (!top || !top->mapped) return;
+      menu_window_ = top->id;
+      menu_x_ = static_cast<int32_t>(data[1]) - top->x;
+      menu_y_ = static_cast<int32_t>(data[2]) - top->y;
+      if (pointer_grab_.active && pointer_grab_.implicit) pointer_grab_ = Grab();      // (the button that opened it is the desktop's now)
+      return;
     case kNetRequestFrameExtents:
       if (w) {
         int32_t l = 0, t = 0, r = 0, b = 0;
@@ -1055,6 +1064,15 @@ void Server::take_changes(List<uint32_t>* changed, List<Repaint>* repainted) {
   }
   changes_.clear();
   changes_overflow_ = false;
+}
+
+uint32_t Server::take_window_menu(int32_t* x, int32_t* y) {
+  kernel::ScopedMutex lock(mutex_);
+  const uint32_t w = menu_window_;
+  *x = menu_x_;
+  *y = menu_y_;
+  menu_window_ = 0;
+  return w;
 }
 
 uint32_t Server::take_drag(uint32_t* edge) {

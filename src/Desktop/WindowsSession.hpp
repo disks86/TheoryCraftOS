@@ -70,6 +70,9 @@ class IWindowsSession {
   // A program asked for its window to be moved (edge 9) or sized (edge 1 .. 8: left, right, top, top left, top right, bottom, bottom left, bottom right) by the
   // user with the mouse (a custom title bar or border): the window, and forgets it; 0 when none.
   virtual uint32_t take_drag(uint32_t* edge) = 0;
+  // A program asked for its window's window menu (Wayland's xdg_toplevel.show_window_menu: a client that draws its own title bar) at (x, y) of the window's
+  // client area since the last call: that window (0: none asked). The desktop opens the frame's menu there.
+  virtual uint32_t take_window_menu(int32_t* x, int32_t* y) { (void)x, (void)y; return 0; }
   // The visible top-level windows, bottom of the stack first.
   virtual void windows(List<uint32_t>* out) = 0;
   // False when the window is gone.

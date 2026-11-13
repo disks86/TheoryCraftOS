@@ -41,7 +41,9 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   client-side shadow is outside the frame and is neither drawn nor hit.
 - **Decorations.** A client that asks for an `zxdg_toplevel_decoration_v1` always gets `server_side`: the desktop draws its frame, like a Win32
   window's. A client that does not ask (GTK) draws its own and moves or sizes itself with `xdg_toplevel.move` / `resize`, which become the
-  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does.
+  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does; its right click on that title bar sends
+  `xdg_toplevel.show_window_menu`, and the desktop opens the frame's window menu there (`take_window_menu`: Restore, Minimize, Maximize, Close, the
+  menu every frame has on its title bar and on Alt+Space).
 - **Configure.** The first commit gets a configure with size 0 x 0 (the client chooses), `configure_bounds` (the work area inside a frame) and
   `wm_capabilities` (maximize, fullscreen, minimize). The user sizing the frame sends a configure with the new size; until the client commits after
   acknowledging it, the desktop is told the asked-for size and paints what the buffer does not cover black, as for a Win32 window that has not caught
@@ -256,7 +258,7 @@ depends on itself:
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.
-- **Window manager.** `show_window_menu` does nothing (the desktop has no window menu to open). A popup's `reactive` flag and parent size are
+- **Window manager.** The window menu has no Move or Size items (the desktop moves windows by their title bar only). A popup's `reactive` flag and parent size are
   ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.

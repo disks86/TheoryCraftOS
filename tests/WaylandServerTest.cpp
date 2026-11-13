@@ -589,6 +589,12 @@ static void test_toplevel() {
   app.send(Msg(w.toplevel, 6).u(app.seat).u(1).u(10));      // bottom right
   CHECK(server.take_drag(&edge) == win && edge == 8);
   CHECK(server.take_drag(&edge) == 0);
+  // the window menu the client asks for (a right click on its own title bar): the desktop opens it where the client said (of its window geometry)
+  int32_t mx = 0, my = 0;
+  CHECK(server.take_window_menu(&mx, &my) == 0);
+  app.send(Msg(w.toplevel, 4).u(app.seat).u(1).i(37).i(12));
+  CHECK(server.take_window_menu(&mx, &my) == win && mx == 37 && my == 12);
+  CHECK(server.take_window_menu(&mx, &my) == 0);
   // the close button: the client is asked
   server.window_command(win, desktop::IWindowsSession::Command::Close);
   CHECK(app.has(w.toplevel, 1));

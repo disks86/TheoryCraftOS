@@ -376,6 +376,29 @@ static void test_window_manager_hints() {
   c.send(ev.done());
   uint32_t edge = 0;
   CHECK(s.take_drag(&edge) == dialog && edge == 9);
+  // _GTK_SHOW_WINDOW_MENU (GTK's own title bar): the desktop opens the window menu there, in the window's coordinates; it is in _NET_SUPPORTED
+  const uint32_t show_menu = c.intern("_GTK_SHOW_WINDOW_MENU");
+  {
+    c.drain();
+    c.send(Request(true, 20, 0).u32(kRoot).u32(c.intern("_NET_SUPPORTED")).u32(0).u32(0).u32(1000).done());
+    Packet sp = c.reply();
+    bool listed = false;
+    for (uint32_t i = 0; sp.b.size() >= 32 && i < sp.u32(16) && 32 + 4 * i + 4 <= sp.b.size(); ++i) listed |= sp.u32(32 + 4 * i) == show_menu;
+    CHECK(listed);
+  }
+  {
+    desktop::WindowsWindowInfo di;
+    String dt(A);
+    CHECK(s.window_info(dialog, &di, &dt));
+    int32_t mx = 0, my = 0;
+    CHECK(s.take_window_menu(&mx, &my) == 0);
+    Request m(true, 25, 0);
+    m.u32(kRoot).u32((1u << 19) | (1u << 20));
+    m.u8(33).u8(32).u16(0).u32(dialog).u32(show_menu).u32(2).u32(uint32_t(di.surface.x + 25)).u32(uint32_t(di.surface.y + 9)).u32(0).u32(0);
+    c.send(m.done());
+    CHECK(s.take_window_menu(&mx, &my) == dialog && mx == 25 && my == 9);
+    if (mx != 25 || my != 9) printf("menu at %d,%d\n", mx, my);
+  }
   // _NET_WM_STATE add maximized (EWMH client message)
   const uint32_t state = c.intern("_NET_WM_STATE"), vert = c.intern("_NET_WM_STATE_MAXIMIZED_VERT"), horz = c.intern("_NET_WM_STATE_MAXIMIZED_HORZ");
   Request st(true, 25, 0);

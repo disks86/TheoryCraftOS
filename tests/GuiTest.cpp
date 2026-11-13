@@ -26,6 +26,7 @@
 #include <map>
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -1438,6 +1439,9 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   uint32_t monitor_count = 0;
   uint32_t drag_window = 0, drag_edge = 0;
   uint32_t take_drag(uint32_t* edge) override { const uint32_t w = drag_window; *edge = drag_edge; drag_window = drag_edge = 0; return w; }
+  uint32_t menu_window = 0;
+  int32_t menu_x = 0, menu_y = 0;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override { const uint32_t w = menu_window; *x = menu_x; *y = menu_y; menu_window = 0; return w; }
   Pointer ptr;
   void pointer(Pointer* out) override { *out = ptr; }
   // cursor 50: a 2 x 2 picture; icon 60: a 16 x 16 red one; anything else a system shape
@@ -1735,6 +1739,24 @@ static void test_windows_more() {
     CHECK(h8->bounds().x == 330 && h8->bounds().width == 240 && h8->bounds().height == 160);
     mouse.move(0, 0, 0);
     d.step(13000);
+
+    // the window menu the program asks for (its own title bar): the frame's, where it asked (client coordinates); Minimize there minimizes the window
+    CHECK(h8->window_menu() == nullptr || !h8->window_menu()->open());
+    s.menu_window = 8;
+    s.menu_x = 15;
+    s.menu_y = 4;
+    d.step(13100);
+    CHECK(h8->window_menu() && h8->window_menu()->open());
+    if (h8->window_menu() && d.window().popup()) {
+      const gui::Rect2D pop = d.window().popup()->bounds();
+      const gui::Point client = h8->view().window_origin();
+      CHECK(pop.x == client.x + 15 && pop.y == client.y + 4);
+      CHECK(!h8->window_menu()->find_item("Restore")->enabled() && h8->window_menu()->find_item("Close")->enabled());
+      d.window().close_popup();
+    }
+    s.menu_window = 99;      // (no such window: nothing opens)
+    d.step(13200);
+    CHECK(!d.window().popup());
 
     // the cursor the program shows over its windows
     CHECK(h8->picture_area(&pic));
