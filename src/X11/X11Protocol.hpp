@@ -71,6 +71,8 @@ constexpr uint32_t kAtom = 4, kCardinal = 6, kString = 31, kWindow = 33, kWmHint
 
 // The keyboard: keycode = USB HID usage + 8 (the evdev convention is the same offset over different numbers; clients read the map, not the numbers).
 constexpr uint8_t kMinKeycode = 8, kMaxKeycode = 255;
+// The XInputExtension (X11Input2.cpp): its major opcode and the bases of its (XI 1) events and errors, as QueryExtension gives them.
+constexpr uint8_t kXInputOpcode = 131, kXInputFirstEvent = 64, kXInputFirstError = 129;
 constexpr uint32_t kKeysymsPerKeycode = 2;
 // The keysyms of a keycode (US layout): the plain one and the shifted one; false for a keycode with no key.
 bool keysyms_of_keycode(uint8_t keycode, uint32_t* plain, uint32_t* shifted);

@@ -29,6 +29,7 @@
 #include "Network/Http/HttpClient.hpp"
 #include "NetworkHarness.hpp"
 #include "Ipv6Harness.hpp"
+#include "TlsDeterministic.hpp"
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -97,6 +98,7 @@ struct ScriptSocket final : ITcpSocket {
   std::string sent, answer;
   size_t pos = 0, piece = 1 << 20;
   bool connected = false, refuse = false, answered = false, never_answer = false, keep_open = false;
+  bool speaks_first = false;   // the server talks as soon as the connection is made, without waiting for a request (an SSH server does)
   const uint64_t* polls = nullptr;   // when set, only one piece is handed out for each poll of the stack
   uint64_t served_at = ~uint64_t{0};
   uint16_t port = 0;
@@ -112,6 +114,11 @@ struct ScriptSocket final : ITcpSocket {
   }
   void maybe_answer() {
     if (answered || never_answer) return;
+    if (speaks_first && connected) {
+      answered = true;
+      answer = (*server)(sent);
+      return;
+    }
     const size_t end = sent.find("\r\n\r\n");
     if (end == std::string::npos) return;
     size_t want = end + 4;
@@ -178,7 +185,7 @@ struct ScriptStack final : INetworkStack {
   std::function<std::string(const std::string&)> server;
   std::vector<std::string> requests;
   size_t piece = 1 << 20;
-  bool refuse = false, never_answer = false, keep_open = false;
+  bool refuse = false, never_answer = false, keep_open = false, speaks_first = false;
   mutable uint64_t ms = 1000;
   uint64_t polls = 0;
   bool one_per_poll = false;
@@ -208,6 +215,7 @@ struct ScriptStack final : INetworkStack {
     s->refuse = refuse;
     s->never_answer = never_answer;
     s->keep_open = keep_open;
+    s->speaks_first = speaks_first;
     if (one_per_poll) s->polls = &polls;
     ++sockets;
     return SharedPointer<ITcpSocket>(s);
@@ -376,6 +384,23 @@ static void test_errors_and_limits() {
     // connections that go wrong
     stack.refuse = true;
     CHECK(!fetch(stack, http, HttpMethod::Get, "http://example.com/") && fails_with(HttpError::Connect));
+    {
+      // https: a connection that is never made fails as Connect (the network), one where the server answers but not in TLS as Tls
+      SeededEntropy entropy(7);
+      crypto::DrbgRandom rng(entropy);
+      CHECK(rng.initialize());
+      TlsConfig tls;
+      tls.random = &rng;
+      tls.verify_certificates = false;
+      HttpClient secure(stack, a);
+      secure.set_tls(&tls);
+      CHECK(!fetch(stack, secure, HttpMethod::Get, "https://example.com/") && secure.state() == HttpState::Failed && secure.error() == HttpError::Connect);
+      stack.refuse = false;
+      stack.server = [](const std::string&) { return std::string("SSH-2.0-OpenSSH\r\n\r\n"); };
+      stack.speaks_first = true;
+      CHECK(!fetch(stack, secure, HttpMethod::Get, "https://example.com/") && secure.state() == HttpState::Failed && secure.error() == HttpError::Tls);
+      stack.speaks_first = false;
+    }
     stack.refuse = false;
     stack.never_answer = true;
     http.set_timeouts(15000, 2000);
@@ -638,6 +663,16 @@ static void test_dual_stack() {
     CHECK(other.start(HttpMethod::Get, "http://[2001:db8:1::ff:fe00:2]:81/"));
     d.lan.run_until([&] { d.serve(); other.poll(); return !other.busy(); }, 20000);
     CHECK(other.state() == HttpState::Failed && other.error() == HttpError::Connect);
+  }
+  {
+    // a DNS server that blocks the name answers 0.0.0.0 and :: (ad blockers do): no connection is tried, and the request fails as Blocked
+    DualStack d;
+    d.dns.name = "ads.example.com";
+    d.dns.sinkhole = true;
+    HttpClient http(d.lan.a, d.lan.alloc);
+    CHECK(!d.fetch(http, "http://ads.example.com/") && http.state() == HttpState::Failed && http.error() == HttpError::Blocked);
+    CHECK(d.served == 0 && d.dns.queries >= 1);
+    CHECK(strcmp(http_error_name(HttpError::Blocked), "blocked by the network's DNS server (it answered 0.0.0.0)") == 0);
   }
 }
 

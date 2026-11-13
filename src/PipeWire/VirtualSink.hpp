@@ -17,7 +17,7 @@
  */
 
 // A virtual sink's audio (the adapter factory's support.null-audio-sink, Graph::create_virtual_node): a mixer of its own over a silent device that
-// plays at the real rate on the graph's clock. Streams of any protocol (PipeWire, PulseAudio, Windows) play into it as they would into the speakers,
+// plays at the real rate on the graph's clock (the speakers' 48 kHz stereo; the sink's own rate and channels shape what its monitor hears). Streams of any protocol (PipeWire, PulseAudio, Windows) play into it as they would into the speakers,
 // mixed and paced the same way, and what records from it (its monitor) is a tap of that mixer. The graph pumps it (Graph::refresh).
 #pragma once
 #include <stdint.h>
@@ -47,18 +47,27 @@ class FunctionClock final : public hardware::IClock {
 
 class VirtualOutput {
  public:
-  VirtualOutput(allocators::IAllocator& allocator, const hardware::IClock& clock) : device_(clock, allocator), mixer_(device_, allocator) {}
+  // `rate` and `channels` are the sink's own: its mixer works at the speakers' 48 kHz stereo, and what records from it (its monitor) is made that
+  // format first (shape()), so a mono sink is heard mono and a low-rate one without what its rate cannot carry.
+  VirtualOutput(allocators::IAllocator& allocator, const hardware::IClock& clock, uint32_t rate = hardware::kAudioSampleRate, uint32_t channels = 2)
+      : device_(clock, allocator), mixer_(device_, allocator) {
+    shape_.sample_rate = rate;
+    shape_.channels = channels == 1 ? 1 : 2;
+    shape_.type = audio::SampleType::S16;
+  }
   VirtualOutput(const VirtualOutput&) = delete;
   VirtualOutput& operator=(const VirtualOutput&) = delete;
   ~VirtualOutput() { device_.shutdown(); }
   bool initialize() { return device_.initialize() && mixer_.initialize(); }
   audio::AudioMixer& mixer() { return mixer_; }
+  const audio::StreamFormat& shape() const { return shape_; }
   // Mixes what its streams gave into its device as far as the device has played (the clock moved on).
   void pump() { mixer_.pump(); }
 
  private:
   hardware::SoftwareAudioDevice device_;
   audio::AudioMixer mixer_;
+  audio::StreamFormat shape_;
 };
 
 }  // namespace pipewire

@@ -57,7 +57,7 @@ target_compile_options(BOOTRISCV64 PRIVATE
   -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany -mno-relax -fPIE
   -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-threadsafe-statics
   -fshort-wchar -fno-omit-frame-pointer
-  -Wall -Wextra -g -O1
+  -Wall -Wextra -g ${TCOS_KERNEL_OPT_FLAG}
 )
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 # ld.lld produces the ELF, scripts/elf2efi.py rewrites it as the PE32+ file the firmware loads.

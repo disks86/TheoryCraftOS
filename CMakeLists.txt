@@ -33,6 +33,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The kernel image's optimization level. It comes after the build type's own flags, so it decides: empty picks -O2 for
+# Release/RelWithDebInfo/MinSizeRel and -O1 otherwise (Debug, no build type; what the host tests use). -DTCOS_KERNEL_OPT=-O3 (or -Og...) overrides it.
+set(TCOS_KERNEL_OPT "" CACHE STRING "Kernel optimization flag (-O1, -O2, ...); empty: -O2 for release build types, -O1 otherwise")
+if(TCOS_KERNEL_OPT)
+  set(TCOS_KERNEL_OPT_FLAG ${TCOS_KERNEL_OPT})
+elseif(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+  set(TCOS_KERNEL_OPT_FLAG -O2)
+else()
+  set(TCOS_KERNEL_OPT_FLAG -O1)
+endif()
+message(STATUS "Kernel optimization: ${TCOS_KERNEL_OPT_FLAG}")
+
 include(cmake/jit.cmake)
 
 if(TCOS_ARCH STREQUAL "aarch64")
@@ -233,7 +245,13 @@ add_executable(BOOTX64
   src/PipeWire/NativeClientNode.cpp
   src/PipeWire/MidiBus.cpp
   src/PipeWire/VideoChannel.cpp
+  src/PipeWire/VideoConvert.cpp
+  src/PipeWire/VideoDecode.cpp
+  src/PipeWire/Loopback.cpp
+  src/PipeWire/EchoCanceller.cpp
   src/PipeWire/CameraSource.cpp
+  src/PipeWire/ScreenSource.cpp
+  src/PipeWire/VideoWatcher.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp
@@ -317,6 +335,9 @@ add_executable(BOOTX64
   src/FileSystem/FileSystemTypes.cpp
   src/FileSystem/Ram/RamFileSystem.cpp
   src/FileSystem/Mount/MountTable.cpp
+  src/FileSystem/Mount/GraftFileSystem.cpp
+  src/FileSystem/Squash/SquashFileSystem.cpp
+  src/FileSystem/Iso/IsoFileSystem.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/FileSystem/Befs/BefsFileSystem.cpp
   src/FileSystem/Ntfs/NtfsFileSystem.cpp
@@ -592,6 +613,7 @@ add_executable(BOOTX64
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
+  src/Desktop/InstalledApps.cpp
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
   src/Desktop/DisplaySettings.cpp
@@ -600,9 +622,14 @@ add_executable(BOOTX64
   src/Desktop/Shell.cpp
   src/Desktop/Terminal.cpp
   src/Desktop/Calculator.cpp
+  src/Desktop/VideoViewer.cpp
   src/Desktop/Calendar.cpp
   src/Desktop/CalendarStore.cpp
   src/Desktop/Todo.cpp
+  src/Desktop/AppManager.cpp
+  src/Desktop/AppMan/AppManCatalog.cpp
+  src/Desktop/AppMan/AppManInstaller.cpp
+  src/Desktop/AppMan/HttpNetwork.cpp
   src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
@@ -691,6 +718,7 @@ add_executable(BOOTX64
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/SpreadsheetGrid.cpp
   src/Gui/Controls/PageView.cpp
+  src/Gui/Controls/PageRasterizer.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
@@ -698,6 +726,10 @@ add_executable(BOOTX64
   src/Media/Image.cpp
   src/Media/ImageCodecs.cpp
   src/Media/Zlib.cpp
+  src/Media/Zstd.cpp
+  src/Media/Xz.cpp
+  src/Media/Lz4.cpp
+  src/Media/Lzo.cpp
   src/Media/Image/Png.cpp
   src/Media/Image/Jpeg.cpp
   src/Media/Image/Bmp.cpp
@@ -747,6 +779,7 @@ add_executable(BOOTX64
   src/Media/WebVtt.cpp
   src/Executable/ElfFile.cpp
   src/Executable/ExecutableKind.cpp
+  src/Executable/AppImage.cpp
   src/Executable/PeFile.cpp
   src/Process/Syscall.cpp
   src/Process/Process.cpp
@@ -783,8 +816,10 @@ add_executable(BOOTX64
   src/Process/UnixSockets.cpp
   src/Process/MemoryFile.cpp
   src/Process/DxgBufferFile.cpp
+  src/X11/X11DragAndDrop.cpp
   src/X11/X11Drawing.cpp
   src/X11/X11Input.cpp
+  src/X11/X11Input2.cpp
   src/X11/X11Requests.cpp
   src/X11/X11SocketServer.cpp
   src/X11/X11Tables.cpp
@@ -792,14 +827,19 @@ add_executable(BOOTX64
   src/Wayland/Dxg/WaylandDxgImage.cpp
   src/Wayland/Media/WaylandClipboardPng.cpp
   src/Wayland/WaylandData.cpp
+  src/Wayland/WaylandDragBridge.cpp
   src/Wayland/WaylandDesktop.cpp
   src/Wayland/WaylandDmabuf.cpp
   src/Wayland/WaylandExtras.cpp
   src/Wayland/WaylandInput.cpp
   src/Wayland/WaylandKeymap.cpp
+  src/Wayland/WaylandLayerShell.cpp
   src/Wayland/WaylandScale.cpp
   src/Wayland/WaylandServer.cpp
   src/Wayland/WaylandSocketServer.cpp
+  src/Wayland/WaylandTablet.cpp
+  src/Wayland/WaylandTextInput.cpp
+  src/Wayland/WaylandYuv.cpp
   src/Wayland/WaylandSurfaces.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp
@@ -820,6 +860,9 @@ add_executable(BOOTX64
   src/Process/ProgramEnvironment.cpp
   src/Program/ProgramHost.cpp
   src/Program/ProgramRunner.cpp
+  src/Program/AppImageLaunch.cpp
+  src/Program/AppRunScript.cpp
+  src/Program/ShellTools.cpp
   src/Program/EmulatedTask.cpp
   src/Emulation/GuestCpu.cpp
   src/Emulation/EmulatedProcess.cpp
@@ -943,6 +986,10 @@ add_executable(BOOTX64
   src/Hardware/Pen/CompositePen.cpp
   src/Hardware/Pen/PenMouse.cpp
   src/Hardware/Pen/I2c/I2cHidPen.cpp
+  src/Hardware/Touch/CompositeTouch.cpp
+  src/Hardware/Touch/LinuxMultitouch.cpp
+  src/Hardware/Touch/TouchTracker.cpp
+  src/Hardware/Touch/Virtio/VirtioTouch.cpp
   src/Hardware/Sensor/SensorHub.cpp
   src/Hardware/Sensor/HidSensor.cpp
   src/Hardware/Sensor/AcpiAmbientLight.cpp
@@ -1090,6 +1137,8 @@ add_executable(BOOTX64
   src/Hardware/VideoCodec/Software/Mpeg2Slice.cpp
   src/Hardware/VideoCodec/Software/Mpeg2Recon.cpp
   src/Hardware/VideoCodec/Software/Mpeg4Headers.cpp
+  src/Hardware/VideoCodec/Software/Mpeg4Syntax.cpp
+  src/Hardware/VideoCodec/Software/Mpeg4Recon.cpp
   src/Hardware/VideoCodec/Software/Vc1Syntax.cpp
   src/Hardware/VideoCodec/Software/Vc1Block.cpp
   src/Hardware/VideoCodec/Software/Vc1Recon.cpp
@@ -1136,7 +1185,7 @@ set_target_properties(BOOTX64 PROPERTIES SUFFIX ".efi")
 
 target_compile_options(BOOTX64 PRIVATE
   -ffreestanding -fno-stack-protector -mno-red-zone -fshort-wchar
-  -Wall -Wextra -g -O1
+  -Wall -Wextra -g ${TCOS_KERNEL_OPT_FLAG}
   $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
 )
 # (the one C source: vulkan-1.dll's SPIR-V translator, which the 3D test's Vulkan path carries; it is the DLL's code as it is)
@@ -1399,6 +1448,10 @@ if(TCOS_AMD_VEGAM)
 endif()
 # A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
 # what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).
+set(TCOS_APPMAN_SELFTEST "" CACHE STRING "An AppImage of AppMan's catalog for the kernel to install when it is up (tests/appman_qemu.sh)")
+if(TCOS_APPMAN_SELFTEST)
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_APPMAN_SELFTEST=\"${TCOS_APPMAN_SELFTEST}\"")
+endif()
 set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
 set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
 if(TCOS_AUTORUN)

@@ -123,7 +123,12 @@ class IDomHost {
   // the width and height of its content box (0 for an inline box that is not replaced) and the padding at its left and top. False
   // if it has no box (display: none, not in the document) or nothing was laid out yet; layout_ready() says whether anything was.
   virtual bool node_rect(dom::Node* node, double* rect8) { (void)node; (void)rect8; return false; }
+  // Does the element's box (the last picture's) cut off what sticks out of it (overflow other than visible)? -1 if it has no box there.
+  virtual int node_clips(dom::Node* node) { (void)node; return -1; }
   virtual bool layout_ready() { return false; }
+  // document.elementsFromPoint(): the elements under viewport position (x, y), in CSS pixels, as the last picture painted them, front to back, each once (what
+  // pointer-events: none or a clip hides is left out; the root element is last). False if the point is outside the viewport or nothing was painted yet.
+  [[nodiscard]] virtual bool elements_at_point(double x, double y, List<dom::Node*>* out) { (void)x; (void)y; (void)out; return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
@@ -153,6 +158,8 @@ class IDomHost {
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,
   // box-shadow, transform ...). nullptr if the host has none.
   virtual const StyleSheet* computed_style_sheet() { return nullptr; }
+  // See IObjectEnvironment::video_decode_accelerated.
+  virtual bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) { (void)codec; (void)width; (void)height; return false; }
   // A new document made from html text (DOMParser); owned by the host. nullptr if memory ran out.
   virtual dom::Document* parse_document(StringView html) = 0;
   // The Web Storage of the page's origin. After a change that is visible (a new value, a removed key, a cleared area) the other pages of the origin are told.
@@ -170,6 +177,9 @@ class IDomHost {
   // fetch() and XMLHttpRequest: sends a request (cookies, redirects and the cross-origin rules included; see Fetcher.hpp). False (with response->error) if it failed.
   // May be called on a worker thread, several at a time (asynchronous requests run in parallel).
   virtual bool http_request(const FetchOptions& options, NetResponse* response) = 0;
+  // The text of a classic script that script put into the document (<script src> without crossorigin): fetched the way the parser fetches one, without
+  // CORS (a script of another site that sends no Access-Control-Allow-Origin still runs) and through the page's service worker. False if it failed.
+  virtual bool fetch_classic_script(StringView address, String* text) { (void)address; (void)text; return false; }
   // An answer that http_request() returned reaches the script (always on the script thread): what has to be done on that thread (Clear-Site-Data of storage).
   virtual void http_answered(const NetResponse& response) { (void)response; }
   // The origin of the page ("https://example.com", or "null" for a file or a page without an address).

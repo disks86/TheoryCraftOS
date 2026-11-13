@@ -63,8 +63,9 @@ class UsbMidiDevice final : public midi::IMidiOutput {
   void reset() override;
   void flush() override;
 
-  // Hands out the messages that have arrived from the device (all its cables): calls receiver for each; returns how many. Never waits.
-  uint32_t poll_input(UsbMidiReceiver receiver, void* context);
+  // Hands out the messages that have arrived from the device (all its cables): calls receiver for each, and sysex_receiver (if given) for each
+  // whole system exclusive message; returns how many. Never waits.
+  uint32_t poll_input(UsbMidiReceiver receiver, void* context, UsbMidiSysexReceiver sysex_receiver = nullptr);
 
  private:
   void read_name(const UsbDeviceDescriptor& descriptor);
@@ -76,6 +77,7 @@ class UsbMidiDevice final : public midi::IMidiOutput {
   uint32_t generation_ = 0;
   uint8_t out_endpoint_ = 0;
   bool input_running_ = false;
+  UsbMidiSysexReader sysex_{allocator_};      // (its system exclusive messages span polls)
   ByteView batch_;             // memory the controller can reach
   uint32_t batch_length_ = 0;
   char name_[64] = "USB MIDI";

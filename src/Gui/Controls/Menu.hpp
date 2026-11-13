@@ -77,12 +77,19 @@ class Menu {
   // The returned item stays valid for the life of the menu: set `enabled`/`checked` on it any time.
   MenuItem* add_item(StringView text, Handler on_click = {}, StringView shortcut = {});
   MenuItem* add_separator();
+  // The same, put before the item at `index` (at the end if `index` is past it). Change a menu only while it is not shown.
+  MenuItem* insert_item(uint32_t index, StringView text, Handler on_click = {});
+  MenuItem* insert_separator(uint32_t index);
+  // Takes the item out of the menu and frees it; false if it is not one of this menu's. Only while the menu is not shown.
+  bool remove_item(MenuItem* item);
+  // Where the item is in the menu; -1 if it is not in it.
+  int32_t index_of(const MenuItem* item) const;
   uint32_t item_count() const { return static_cast<uint32_t>(items_.count()); }
   MenuItem* item(uint32_t index) const { return index < items_.count() ? items_[index] : nullptr; }
 
  private:
   friend class MenuBar;
-  MenuItem* add(StringView text, StringView shortcut, bool separator, Handler on_click);
+  MenuItem* add(uint64_t index, StringView text, StringView shortcut, bool separator, Handler on_click);
 
   allocators::IAllocator& allocator_;
   const Control* owner_;

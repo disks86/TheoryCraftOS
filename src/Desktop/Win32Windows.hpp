@@ -80,6 +80,12 @@ class Win32Window : public gui::Frame {
 
  protected:
   bool close_requested() override;      // the program is asked (SC_CLOSE); it destroys the window if it agrees
+  // The desktop's drags over the program's window go to the session (IWindowsSession::desktop_drag), which tells the program.
+  bool tracks_drag() const override { return true; }
+  void on_drag_over(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
+  void on_drag_leave() override;
+  bool accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const override;
+  void on_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
 
  private:
   friend class Win32Windows;
@@ -93,6 +99,7 @@ class Win32Window : public gui::Frame {
   State sent_state_ = State::Normal;    // the state last asked of the program
   uint32_t state_hold_ = 0;             // pumps left during which the program's older state does not undo the user's
   bool known_active_ = false;
+  bool drag_taken_ = false;             // the program under the desktop's drag would take it (the last desktop_drag said so)
   uint32_t icon_ = 0;                   // the icon handle the frame shows
 };
 
@@ -100,7 +107,7 @@ class Win32Windows {
  public:
   static constexpr uint32_t kHoldPumps = 30;
 
-  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator) {}
+  explicit Win32Windows(allocators::IAllocator& allocator) : allocator_(allocator), hosts_(allocator), changed_(allocator), repainted_(allocator), order_(allocator), pointer_pixels_(allocator), touches_(allocator), drop_items_(allocator), drag_items_(allocator), drag_label_(allocator) {}
   ~Win32Windows();
   // Null: none (the frames are taken down).
   void set_session(IWindowsSession* session, gui::WindowManager* manager);
@@ -114,6 +121,11 @@ class Win32Windows {
   // The input taps (see gui::InputPump::set_taps), forwarded by the desktop. `x`, `y`: where the pointer is about to be (desktop window coordinates).
   void tap_key(const hardware::KeyEvent& event, uint8_t modifiers);
   void tap_mouse(const hardware::MouseEvent& event, int32_t* x, int32_t* y);
+  // A touch event at (x, y), window coordinates: true when the session took it (a contact it took at Down, or a Down over one of its windows that it
+  // takes, whose frame is then activated as a click would). Not under the UI lock.
+  bool tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y);
+  // A pen event at (x, y), window coordinates: true when the session took it (the pen stays the session's until it leaves the range). Not under the UI lock.
+  bool tap_pen(const hardware::PenEvent& event, int32_t x, int32_t y);
 
   uint32_t count() const { return static_cast<uint32_t>(hosts_.count()); }
   // The cursor the programs show (pump() keeps it; read under the UI lock).
@@ -146,6 +158,7 @@ class Win32Windows {
   uint32_t monitor_count_ = 0;
   bool display_sent_ = false;
   gui::Rect2D sent_bounds_;
+  uint32_t sent_reserve_serial_ = 0;      // the window manager's reserve_serial() when the monitors went (they go again when it changes)
   gui::Frame* last_active_ = nullptr;
   // A drag a program asked for (a custom title bar or border: IWindowsSession::take_drag): the frame follows the pointer until the left button is let go. Under the UI lock.
   Win32Window* drag_ = nullptr;
@@ -161,9 +174,26 @@ class Win32Windows {
   void follow_pointer(gui::WindowManager& manager);      // (not under the UI lock)      // the window manager's active frame as last seen (a change since is the user's)
   // input (the input pump's thread)
   bool grabbed_ = false;                   // the pointer is the Windows programs'
+  List<uint32_t> touches_;                 // the contacts the session took (until they lift)
+  bool pen_taken_ = false;                 // the session has the pen (until it leaves the range)
   bool released_ = false;                  // Ctrl+Alt let a confined pointer go: nothing is handed over until the next click on a Windows window
   uint8_t buttons_ = 0;                    // the buttons held as the programs know them (hardware::mouse_button bits)
   uint8_t keys_down_[32] = {};             // the keys whose press was handed over (their release is too)
+  // The input method: Unicode entry (Ctrl+Shift+U, hex digits, Space or Enter), into a window that takes composed text (IWindowsSession::text_input).
+  // Returns true when it took the key (it then never reaches the program).
+  bool compose_key(uint8_t usage, uint8_t modifiers);
+  // A program's drag dropped on the desktop (IWindowsSession::take_program_drop): its items, the next to drop, where.
+  void pump_program_drop(gui::WindowManager& manager);
+  void pump_program_drag(gui::WindowManager& manager);      // a program's drag over the desktop: shown, and the program told whether it would be taken
+  gui::Window* drag_window_ = nullptr;                       // the window showing it (null: none)
+  String drag_items_, drag_label_;
+  bool dropping_ = false, drop_taken_ = false;
+  String drop_items_;
+  uint64_t drop_next_ = 0;
+  int32_t drop_x_ = 0, drop_y_ = 0;
+  bool composing_ = false;
+  uint32_t compose_window_ = 0, compose_code_ = 0;
+  uint8_t compose_digits_ = 0;
 };
 
 }  // namespace desktop

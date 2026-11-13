@@ -41,7 +41,10 @@
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/VideoViewer.hpp"
+#include "Desktop/AppManager.hpp"
 #include "Desktop/Todo.hpp"
+#include "SquashWriter.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/FileProperties.hpp"
 #include "Desktop/Notepad.hpp"
@@ -62,6 +65,7 @@
 #include "Desktop/ComputerManager.hpp"
 #include "Gui/Controls/TextEditor.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/DrawingCanvas.hpp"
@@ -2323,6 +2327,91 @@ static void test_wireless_menu() {
 }
 
 
+// --- Installed applications in the Start menu ----------------------------------------------------------------------------------
+
+static void write_bytes(filesystem::IFileSystem& fs, const char* path, ConstByteView data) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  if (file) CHECK(file->write(0, data, &written) == filesystem::Status::Ok && written == data.size());
+}
+
+static int32_t menu_index(const gui::Menu& menu, const char* text) {
+  for (uint32_t i = 0; i < menu.item_count(); ++i)
+    if (menu.item(i)->text.view().equals(text)) return static_cast<int32_t>(i);
+  return -1;
+}
+
+// The Windows and Linux applications installed on the disk are in the Start menu as "Name (Windows)" and "Name (Linux)", after the
+// desktop's own programs and before About; the list follows the disk each time the menu opens, and choosing one opens a terminal that runs it.
+static void test_start_menu_installed_apps() {
+  namespace layout = filesystem::layout;
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem ram(a);
+    for (const char* f : layout::kFolders) ram.create_directory(f);
+    for (const char* f : layout::kWindowsFolders) ram.create_directory(f);
+    for (const char* f : layout::kLinuxFolders) ram.create_directory(f);
+    for (const char* f : {"/Windows/ProgramData/Microsoft/Windows", "/Windows/ProgramData/Microsoft/Windows/Start Menu", layout::kWindowsStartMenuPrograms,
+                          "/Windows/Program Files/Google", "/Windows/Program Files/Google/Chrome", "/Windows/Program Files/Google/Chrome/Application",
+                          layout::kLinuxApplications})
+      ram.create_directory(f);
+    uint8_t pe[0x48] = {'M', 'Z'};
+    pe[0x3C] = 0x40; pe[0x40] = 'P'; pe[0x41] = 'E';
+    write_bytes(ram, "/Windows/Program Files/Google/Chrome/Application/chrome.exe", ConstByteView(pe, sizeof pe));
+    // A shortcut with a relative path only (ANSI): from ...\Start Menu\Programs up to C:\ and down to Chrome.
+    const char* relative = "..\\..\\..\\..\\..\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    std::vector<uint8_t> lnk(0x4C, 0);
+    const uint8_t clsid[16] = {0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
+    lnk[0] = 0x4C;
+    memcpy(&lnk[4], clsid, 16);
+    lnk[20] = 0x08;   // HasRelativePath
+    lnk.push_back(uint8_t(strlen(relative)));
+    lnk.push_back(0);
+    lnk.insert(lnk.end(), relative, relative + strlen(relative));
+    for (int i = 0; i < 4; ++i) lnk.push_back(0);
+    write_bytes(ram, "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk", ConstByteView(lnk.data(), lnk.size()));
+    uint8_t elf[64] = {0x7F, 'E', 'L', 'F', 2, 1, 1};
+    write_bytes(ram, "/Linux/usr/bin/firefox", ConstByteView(elf, sizeof elf));
+    make_file(ram, "/Linux/usr/share/applications/firefox.desktop", "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %u\n");
+
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    gui::MenuButton& start = d.start_button();
+    gui::Menu& menu = start.menu();
+    const uint32_t before = menu.item_count();
+    CHECK(menu_index(menu, "Firefox (Linux)") < 0);
+    d.set_file_system(&ram);
+    const int32_t firefox = menu_index(menu, "Firefox (Linux)"), chrome = menu_index(menu, "Google Chrome (Windows)");
+    const int32_t about = menu_index(menu, "About TheoryCraftOS..."), test3d = menu_index(menu, "3D Test");
+    CHECK(menu.item_count() == before + 3);
+    CHECK(firefox == test3d + 2 && menu.item(static_cast<uint32_t>(test3d + 1))->separator && chrome == firefox + 1 && about == chrome + 1);
+
+    // Uninstalled: gone the next time the menu opens. Nothing changes while it is open.
+    CHECK(ram.remove("/Linux/usr/share/applications/firefox.desktop") == filesystem::Status::Ok);
+    start.toggle_menu();
+    CHECK(menu_index(menu, "Firefox (Linux)") < 0 && menu_index(menu, "Google Chrome (Windows)") == test3d + 2 && menu.item_count() == before + 2);
+    start.toggle_menu();
+
+    // Choosing Chrome opens a terminal in its folder, which runs it (no program launcher here: the terminal says it cannot run it yet).
+    CHECK(!d.terminal().manager());
+    start.activate(menu.item(static_cast<uint32_t>(menu_index(menu, "Google Chrome (Windows)"))));
+    CHECK(d.terminal().manager() != nullptr);
+    CHECK(d.terminal().shell().cwd().equals("/Windows/Program Files/Google/Chrome/Application"));
+    bool ran = false;
+    for (uint32_t i = 0; i < d.terminal().view().line_count(); ++i)
+      if (d.terminal().view().line(i).find(StringView("\"/Windows/Program Files/Google/Chrome/Application/chrome.exe\"")) != StringView::npos) ran = true;
+    CHECK(ran);
+
+    // Everything uninstalled: the separator goes too.
+    CHECK(ram.remove("/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk") == filesystem::Status::Ok);
+    start.toggle_menu();
+    start.toggle_menu();
+    CHECK(menu.item_count() == before && menu_index(menu, "Google Chrome (Windows)") < 0);
+  }
+  CHECK(a.live == 0);
+}
+
 // --- The Bluetooth window ------------------------------------------------------------------------------------
 
 struct FakeBluetoothDetails final : desktop::IBluetoothDetails {
@@ -2653,7 +2742,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 16);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, Paint, Media Player, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 18);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, App Manager, Paint, Media Player, Video Viewer, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -6373,6 +6462,64 @@ static void test_window_switcher_menu() {
 }
 
 
+// The window menu of a frame: a right click on its title bar, Alt+Space; it does what the title bar's buttons do.
+static void test_frame_window_menu() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.open_paint();
+    d.open_explorer();
+    d.window().layout();
+    Window& w = d.window();
+    Frame* f = d.paint().host();
+    CHECK(f && f->manager());
+    if (!f) return;
+    auto title_point = [&]() {
+      const Point o = f->window_origin();
+      return Point{o.x + Frame::kBorder + 30, o.y + Frame::kBorder + 6};
+    };
+    Point p = title_point();
+    CHECK(f->part_at(p.x - f->window_origin().x, p.y - f->window_origin().y) == Frame::Part::TitleBar);
+    CHECK(f->window_menu() == nullptr);      // (made when first opened)
+    right_click(w, p.x, p.y);
+    CHECK(f->window_menu() && f->window_menu()->open());
+    if (!f->window_menu()) return;
+    ContextMenu& menu = *f->window_menu();
+    CHECK(!menu.find_item("Restore")->enabled() && menu.find_item("Minimize")->enabled() && menu.find_item("Maximize")->enabled() && menu.find_item("Close")->enabled());
+    CHECK(w.popup() && w.popup()->bounds().x == p.x && w.popup()->bounds().y == p.y);      // (where it was clicked)
+    w.close_popup();
+    CHECK(choose_context(w, menu, p.x, p.y, "Maximize") && f->state() == Frame::State::Maximized);
+    p = title_point();
+    right_click(w, p.x, p.y);
+    CHECK(menu.find_item("Restore")->enabled() && !menu.find_item("Maximize")->enabled());
+    w.close_popup();
+    CHECK(choose_context(w, menu, p.x, p.y, "Restore") && f->state() == Frame::State::Normal && d.windows().active() == f);
+    p = title_point();
+    CHECK(choose_context(w, menu, p.x, p.y, "Minimize") && f->state() == Frame::State::Minimized);
+    f->restore();
+    f->activate();
+    w.layout();
+    // the client area and a title bar button are not the title bar: no window menu there
+    p = title_point();
+    const Rect2D client = f->client_rect();
+    right_click(w, f->window_origin().x + client.x + 40, f->window_origin().y + client.y + static_cast<int32_t>(client.height) - 10);
+    CHECK(!menu.open());
+    w.close_popup();
+    // Alt+Space: the active window's, its first item highlighted
+    w.set_focus(f);
+    press(w, key::kSpace, hardware::modifier::kLeftAlt);
+    CHECK(menu.open());
+    press(w, key::kEscape);
+    CHECK(!menu.open());
+    // Close from the menu closes the window
+    p = title_point();
+    CHECK(choose_context(w, menu, p.x, p.y, "Close") && f->manager() == nullptr);
+    w.render();
+  }
+  CHECK(a.live == 0);
+}
+
 // --- Spreadsheet grid and application ------------------------------------------------------------------------
 
 struct FakeSheetView final : gui::ISheetView {
@@ -6677,6 +6824,78 @@ static void test_spreadsheet_app() {
     w.render();
     mgr.remove_window(&sp);
     w.set_clipboard(nullptr);
+  }
+  CHECK(a.live == 0);
+}
+
+// The Video Viewer: its list follows the sources, it watches the one picked (only while open), shows its pictures fitted, and says when the source
+// went or cannot be shown.
+static void test_video_viewer() {
+  TestAllocator a;
+  {
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    struct FakeSources final : desktop::IVideoSources {
+      std::vector<std::pair<uint32_t, std::string>> list = {{5, "Fake Webcam"}, {9, "Screen"}};
+      uint32_t watching = 0;
+      int watches = 0;
+      uint64_t frame = 0;
+      bool encoded = false;
+      uint32_t source_count() override { return uint32_t(list.size()); }
+      bool source(uint32_t index, uint32_t* id, String* name) override {
+        if (index >= list.size()) return false;
+        *id = list[index].first;
+        name->assign(StringView(list[index].second.c_str()));
+        return true;
+      }
+      bool watch(uint32_t id) override {
+        ++watches;
+        watching = id;
+        return id == 0 || id == 5 || id == 9;
+      }
+      bool latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* width, uint32_t* height, StringView* why) override {
+        *why = StringView();
+        if (encoded) { *why = "Encoded video (not shown)"; return false; }
+        if (!watching || frame <= *sequence) return false;
+        *sequence = frame;
+        const uint32_t w = watching == 5 ? 64 : 32, h = 16;
+        pixels->clear();
+        for (uint32_t i = 0; i < w * h; ++i) pixels->push_back(0xFF000000u | watching);
+        *width = w;
+        *height = h;
+        return true;
+      }
+    } sources;
+    d.set_video_sources(&sources);
+    CHECK(d.start_button().menu().item_count() == 18);
+    d.open_video_viewer();
+    desktop::VideoViewer& v = d.video_viewer();
+    CHECK(v.manager() && v.source_list().item_count() == 2 && v.source_list().selected_index() == 0 && sources.watching == 5);
+    sources.frame = 1;
+    d.pump(2000000);
+    CHECK(v.picture_width() == 64 && v.picture_height() == 16 && v.pictures() == 1 && v.status() == StringView("64 x 16"));
+    d.pump(2010000);
+    CHECK(v.pictures() == 1);      // (nothing new)
+    v.source_list().set_selected_index(1);
+    CHECK(sources.watching == 9);
+    sources.frame = 2;
+    d.pump(2020000);
+    CHECK(v.picture_width() == 32 && v.pictures() == 2);
+    sources.encoded = true;
+    d.pump(2030000);
+    CHECK(v.status() == StringView("Encoded video (not shown)"));
+    sources.encoded = false;
+    // the source watched goes: it says so and watches nothing
+    sources.list.pop_back();
+    d.pump(4000000);
+    CHECK(v.source_list().item_count() == 1 && v.status() == StringView("The source went"));
+    // closed: it watches nothing more
+    v.source_list().set_selected_index(0);
+    CHECK(sources.watching == 5);
+    v.close();
+    d.pump(4100000);
+    CHECK(!v.manager() && sources.watching == 0);
+    d.set_video_sources(nullptr);
   }
   CHECK(a.live == 0);
 }
@@ -8394,6 +8613,18 @@ static void test_web_navigation() {
     CHECK(d.web_browser_count() == before);
     // (a window the user opened is not closed by its page)
     CHECK(b->navigate("http://closer.test/now") && b->address().equals("http://closer.test/now") && d.web_browser_count() == before);
+
+    // Closing the window lets the page go (its scripts stop, and its videos and sounds with them): the desktop keeps its first browser to open again,
+    // and that one starts on the welcome page with no history
+    CHECK(b->navigate("http://one.test/") && b->can_go_back());
+    host->close();
+    CHECK(!b->manager() && b->address().empty() && !b->can_go_back() && b->address_box().text().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
+    d.step(1000000);
+    CHECK(d.open_web_browser() == b && b->manager() && b->address().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
+    // (a tab closed on its own is told too)
+    CHECK(b->navigate("http://one.test/") && run_contains(*b, "Page "));
+    static_cast<gui::TabFrame*>(b->host())->close_tab(b);
+    CHECK(!b->manager() && b->address().empty() && run_contains(*b, "TheoryCraftOS Web Browser"));
   }
   CHECK(a.live == 0);
 }
@@ -8597,9 +8828,108 @@ static void test_web_browser_tabs() {
   CHECK(a.live == 0);
 }
 
+// The App Manager in the desktop, over a stand-in network: the catalog fetched (and kept), searched, an AppImage installed (Start menu entry and all),
+// shown as installed, updated, removed.
+struct FakeAppNetwork final : desktop::appman::INetwork {
+  std::map<std::string, std::string> pages, files;
+  bool fetch(StringView url, uint64_t max_bytes, String* body) override {
+    auto it = pages.find(std::string(url.data(), url.size()));
+    return it != pages.end() && it->second.size() <= max_bytes && body->assign(StringView(it->second.data(), it->second.size()));
+  }
+  bool download(StringView url, Sink sink, void* context, uint64_t* total) override {
+    auto it = files.find(std::string(url.data(), url.size()));
+    if (it == files.end()) return false;
+    *total = it->second.size();
+    for (size_t at = 0; at < it->second.size(); at += 8192)
+      if (!sink(context, ConstByteView(reinterpret_cast<const uint8_t*>(it->second.data() + at), std::min<size_t>(8192, it->second.size() - at)))) return false;
+    return true;
+  }
+};
+
+static void test_app_manager() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    FakeAppNetwork net;
+    const std::string bullet = "\xE2\x97\x86 ";
+    net.pages[std::string(desktop::appman::kCatalogUrl.data(), desktop::appman::kCatalogUrl.size())] =
+        bullet + "notes : Take notes in Markdown. #itsdesktopapp\n" + bullet + "paint-x : A painting program. #itsdesktopapp\n" + bullet + "termtool : For the terminal. #itscliapp\n";
+    const std::string scripts(desktop::appman::kScriptsUrl.data(), desktop::appman::kScriptsUrl.size());
+    net.pages[scripts + "notes"] = "#!/bin/sh\nAPP=notes\nversion=$(curl -Ls https://example.org/notes/releases | grep -o 'https://[^\"]*AppImage' | head -1)\n";
+    net.pages["https://example.org/notes/releases"] = "<a href=\"https://example.org/notes/Notes-1.0-x86_64.AppImage\">";
+    squash_writer::WriterOptions o;
+    o.compression = squash_writer::first_available() ? squash_writer::first_available() : uint16_t(squash_writer::kGzip);
+    o.store_only = squash_writer::first_available() == 0;
+    squash_writer::Tree t;
+    t.add("/AppRun", squash_writer::TNode::File, "\x7F" "ELF notes");
+    t.add("/notes.desktop", squash_writer::TNode::File, "[Desktop Entry]\nName=Notes\nExec=AppRun %F\nIcon=notes\nType=Application\n");
+    t.add("/.DirIcon", squash_writer::TNode::File, "\x89PNG notes icon");
+    net.files["https://example.org/notes/Notes-1.0-x86_64.AppImage"] = squash_writer::fake_runtime(true, false, 2, true) + squash_writer::write_squash(t, o);
+
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_appman_network(&net);
+    d.set_file_system(&fs);
+    desktop::AppManager* m = d.open_app_manager();
+    CHECK(m && m == &d.app_manager() && d.open_app_manager() == m);      // (one window)
+    if (!m) return;
+    // The catalog came in (the jobs run at once here: no threads), and is kept for next time.
+    CHECK(m->catalog_count() == 3 && m->list().item_count() == 3 && !m->busy());
+    CHECK(m->status().contains("3 of 3"));
+    filesystem::DirectoryEntry e;
+    CHECK(fs.stat(filesystem::layout::kAppManCatalog, &e) == filesystem::Status::Ok && e.size > 0);
+    String cell(a), name(a);
+    CHECK(m->list().item_text(0, 0, &cell) && cell.view().equals("notes"));
+    // Searching.
+    m->set_query("paint");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("paint-x"));
+    m->set_query("TERMINAL");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("termtool"));
+    m->set_query("");
+    CHECK(m->list().item_count() == 3);
+    // Nothing chosen: nothing to do.
+    CHECK(!m->install_button().enabled() && !m->install_selected());
+    // Install.
+    m->select_row(0);
+    CHECK(m->install_button().enabled() && !m->remove_button().enabled() && m->details().contains("Take notes"));
+    CHECK(m->install_selected());
+    CHECK(!m->busy() && m->status().contains("is installed"));
+    CHECK(m->progress_bar().percent() == 100);
+    CHECK(m->list().item_text(0, 2, &cell) && cell.view().equals("Installed"));
+    CHECK(!m->install_button().enabled() && m->remove_button().enabled() && m->update_button().enabled() && m->details().contains("installed from"));
+    CHECK(fs.stat("/Linux/opt/notes/notes", &e) == filesystem::Status::Ok && fs.stat("/Linux/usr/local/share/applications/notes-AM.desktop", &e) == filesystem::Status::Ok);
+    List<desktop::InstalledApp> apps(a);
+    bool listed = false;
+    if (desktop::find_installed_apps(fs, a, &apps))
+      for (const desktop::InstalledApp& app : apps.view()) listed |= app.label.view().equals("Notes (Linux)") && app.program.view().equals("/Linux/opt/notes/notes");
+    CHECK(listed);
+    // Installed only.
+    m->set_filter(desktop::AppManager::kShowInstalled);
+    CHECK(m->list().item_count() == 1 && m->status().contains("1 AppImage installed"));
+    m->select_row(0);
+    CHECK(m->update_selected() && m->status().contains("up to date"));
+    // Remove.
+    CHECK(m->remove_selected() && m->status().contains("is removed") && m->list().item_count() == 0);
+    CHECK(fs.stat("/Linux/opt/notes", &e) == filesystem::Status::NotFound);
+    m->set_filter(desktop::AppManager::kShowAll);
+    // A failure says why.
+    m->select_row(1);      // paint-x: AppMan has no script of it here
+    CHECK(m->install_selected() && m->status().contains("no install script"));
+    // Without a network nothing is offered.
+    desktop::AppManager lone(a);
+    lone.set_services(&fs, nullptr);
+    CHECK(lone.catalog_count() == 3);      // (the kept copy)
+    lone.select_row(0);
+    CHECK(!lone.install_button().enabled() && !lone.refresh_button().enabled() && !lone.install_selected());
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
+  test_start_menu_installed_apps();
+  test_video_viewer();
   test_data_grid();
   test_window_rests();
   test_title_buttons();
@@ -8656,6 +8986,7 @@ int main() {
   test_text_context_menus();
   test_application_context_menus();
   test_window_switcher_menu();
+  test_frame_window_menu();
   test_select_all_keys();
   test_breadcrumb_bar();
   test_file_explorer();
@@ -8682,6 +9013,7 @@ int main() {
   test_explorer_copy_paste_properties();
   test_calculator_session();
   test_todo();
+  test_app_manager();
   test_calendar();
   test_calendar_recurrence();
   test_calendar_floating_and_occurrences();

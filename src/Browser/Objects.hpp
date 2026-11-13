@@ -91,6 +91,9 @@ class IVideoClip {
   virtual uint8_t error() { return 0; }
   // Is it stopped for want of a key to decrypt what comes next (an encrypted stream, Encrypted Media Extensions)? "waitingforkey" is fired when it is.
   virtual bool waiting_for_key() { return false; }
+  // The pictures shown so far and the ones that were due but dropped because decoding fell behind (getVideoPlaybackQuality: players step down a quality
+  // when they see frames dropped); false if the clip does not count them.
+  virtual bool frame_counts(uint64_t* presented, uint64_t* dropped) { (void)presented; (void)dropped; return false; }
 
  protected:
   IVideoClip() = default;
@@ -106,6 +109,8 @@ class IObjectEnvironment {
   virtual UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
   // The same for a sound file: a clip whose width() and height() are 0 and that has no picture. Null if this machine cannot play it.
   virtual UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) { (void)data; return UniquePointer<IVideoClip>(); }
+  // Does a video engine of this machine (not the CPU) decode `codec` ("h264", "hevc", "vp8", "vp9", "av1") at that size? (navigator.mediaCapabilities)
+  virtual bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) { (void)codec; (void)width; (void)height; return false; }
 
  protected:
   IObjectEnvironment() = default;
@@ -153,6 +158,16 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   bool animating();
   // Did something visible change since the last call (a canvas drawn, a video frame, an animation frame)?
   bool take_dirty();
+  // The same, told more exactly: 0 if nothing changed; kChangedEverything if the page has to be drawn again (a picture loaded, a canvas drawn,
+  // more elements changed than `nodes` holds ...); else the number of elements whose picture alone changed (a video's frame, an animated
+  // picture's), their serials in `nodes`: only where those are drawn needs drawing again. Clears what it reports, as take_dirty() does.
+  static constexpr uint32_t kChangedEverything = 0xFFFFFFFFu;
+  uint32_t take_changes(ArrayView<uint32_t> nodes);
+  // Whether take_changes() would report something (without taking it).
+  bool has_changes() {
+    Lock lock(*this);
+    return dirty_ || changed_count_ != 0;
+  }
   void mark_dirty() {
     Lock lock(*this);
     dirty_ = true;
@@ -219,6 +234,8 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     uint8_t error_code = 0;      // MediaError.code, 0 for none
   };
   void video_state(uint32_t serial, VideoState* out);
+  // getVideoPlaybackQuality(): the pictures shown and the ones dropped so far (0 and 0 for a clip that does not count them).
+  void video_quality(uint32_t serial, uint64_t* presented, uint64_t* dropped);
   // False if there is nothing that could play (no source, or one that failed): play() then rejects with NotSupportedError.
   // (`audio` and `has_source` say what the element is and whether it names a file: they are known to the script before the page has been through sync().)
   bool video_play(uint32_t serial, bool audio, bool has_source);
@@ -291,6 +308,7 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
     uint32_t mse_source = 0;     // the MediaSource it plays (its address is a blob: one made from one)
     MseClip* mse_clip = nullptr;   // (the clip, when it is that kind)
     uint32_t keys = 0;           // the MediaKeys it decrypts with (EmeHub number), 0 for none
+    uint64_t presented = ~uint64_t{0};   // the clip's frames shown at the last update() (a new one: the element is drawn again)
     bool waiting_key_sent = false;
     uint8_t last_ready = 0;      // (a clip that is fed while it plays) what readyState was at the last update, and what has been announced
     bool loaded_data = false, waiting_sent = false;
@@ -391,7 +409,13 @@ class PageObjects final : public IObjectSource, public IObjectPainter {
   uint64_t canvas_pixels_ = 0, now_ms_ = 0;
   uint32_t fetched_images_ = 0;
   uint64_t image_pixels_ = 0;   // the decoded pixels of the pictures kept (frames counted): a page of many photos stays under kMaxTotalImagePixels
-  bool dirty_ = false, accelerated_ = false;
+  bool dirty_ = false, accelerated_ = false;   // (dirty_: everything is to be drawn again)
+  // The elements whose picture alone changed since take_changes() (a video frame): only where they are is drawn again. A full list is everything.
+  static constexpr uint32_t kMaxChanged = 16;
+  uint32_t changed_[kMaxChanged] = {};
+  uint32_t changed_count_ = 0;
+  void mark_changed(uint32_t serial);   // (under the lock)
+  bool draw_frame_on_gpu(graphics::IRenderer2D& r, const ImageSource& src, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip);
 };
 
 }  // namespace browser

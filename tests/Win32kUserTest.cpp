@@ -1234,6 +1234,163 @@ void test_redirection() {
   pump();
   CHECK(bridge.take_drag(&edge) == a && edge == 8);
 
+  // the desktop's file dragged over the window: taken only by a window that accepts files, dropped as WM_DROPFILES whose ticket user32 turns into the
+  // DROPFILES block (its Windows name: the user's files are under C:\Users\Public\Desktop)
+  {
+    pump();
+    const Rc ar = t.window_rect(a);
+    const int32_t px = ar.l + 150, py = ar.t + 100;
+    const Rc ac = t.client_rect(a);
+    (void)ac;
+    CHECK(!bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt"));      // (no WS_EX_ACCEPTFILES)
+    user::find_window(a)->ex_style |= 0x10;
+    CHECK(!bridge.desktop_drag(a, px, py, "some text"));
+    CHECK(!bridge.desktop_drag(a, px, py, "/Linux/root/x.txt"));               // (Windows programs cannot see it)
+    CHECK(!bridge.desktop_drag(b, px, py, "/Desktop/Documents/a b.txt"));      // (the point is not b's)
+    CHECK(!bridge.desktop_drag(a, ar.r + 5, py, "/Desktop/Documents/a b.txt"));
+    CHECK(bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt"));
+    bridge.desktop_drag_end();
+    CHECK(!bridge.desktop_drop());      // (ended: nothing to drop)
+    CHECK(bridge.desktop_drag(a, px, py, "/Desktop/Documents/a b.txt") && bridge.desktop_drop());
+    Th::M m;
+    CHECK(t.peek(&m, 0, 0x233, 0x233) && m.hwnd == a && m.lparam == user::kDropTicketMark && m.wparam != 0);
+    const uint64_t ticket = m.wparam;
+    const std::u16string name = u"C:\\Users\\Public\\Desktop\\Documents\\a b.txt";
+    const uint64_t size = t.svc(N::NtUserCallTwoParam, {ticket, 0, 0x7C00});
+    CHECK(size == 20 + (name.size() + 2) * 2);
+    const uint64_t block = t.tmp(0x1000);
+    CHECK(t.svc(N::NtUserCallTwoParam, {ticket, block, 0x7C00}) == size);
+    gdi::Rect client;
+    CHECK(user::window_client_screen_rect(a, &client));
+    CHECK(t.mem().get32(block) == 20 && int32_t(t.mem().get32(block + 4)) == px - client.left && int32_t(t.mem().get32(block + 8)) == py - client.top);
+    CHECK(t.mem().get32(block + 12) == 0 && t.mem().get32(block + 16) == 1);      // in the client area, wide names
+    bool same = true;
+    for (uint64_t i = 0; i < name.size(); ++i) same &= t.mem().get16(block + 20 + i * 2) == name[i];
+    CHECK(same && t.mem().get16(block + 20 + name.size() * 2) == 0 && t.mem().get16(block + 22 + name.size() * 2) == 0);
+    CHECK(t.svc(N::NtUserCallTwoParam, {ticket, 0, 0x7C00}) == 0);      // (taken once)
+    CHECK(t.svc(N::NtUserCallTwoParam, {12345, 0, 0x7C00}) == 0);
+    // a child that does not take files: its parent does; a disabled one: none
+    const uint32_t child = t.create("Redir", WS_CHILD | WS_VISIBLE, 10, 10, 100, 80, a, 0, "Child");
+    pump();
+    gdi::Rect cs;
+    CHECK(user::window_screen_rect(child, &cs));
+    user::DropTarget target;
+    CHECK(user::drop_target(a, cs.left + 5, cs.top + 5, &target) && target.hwnd == a);
+    user::find_window(child)->ex_style |= 0x10;
+    CHECK(user::drop_target(a, cs.left + 5, cs.top + 5, &target) && target.hwnd == child && target.x == 5 && target.y == 5 && !target.non_client);
+    user::find_window(a)->style |= 0x08000000u;      // WS_DISABLED
+    user::find_window(child)->ex_style &= ~0x10u;
+    CHECK(!user::drop_target(a, cs.left + 5, cs.top + 5, &target));
+    user::find_window(a)->style &= ~0x08000000u;
+    user::find_window(a)->ex_style &= ~0x10u;
+    // malformed name lists are refused
+    const char16_t bad[3] = {u'x', 0, u'y'};
+    CHECK(!user::drop_files(target, ArrayView<const char16_t>(bad, 3)) && !user::drop_files(target, ArrayView<const char16_t>(bad, 1)));
+    // many drops nobody takes: the oldest go, the table stays bounded
+    user::DropTarget at{a, 1, 1, false};
+    const char16_t one[4] = {u'C', u':', 0, 0};
+    for (int i = 0; i < 40; ++i) CHECK(user::drop_files(at, ArrayView<const char16_t>(one, 4)));
+    uint32_t live = 0;
+    for (user::DropRecord& r : user::state().drops) { (void)r; ++live; }
+    CHECK(live <= 16);
+    for (int i = 0; i < 64 && t.peek(&m, 0, 0x233, 0x233); ++i) {}
+    t.svc(N::NtUserDestroyWindow, {child});
+    pump();
+  }
+
+  // touches: the window under a finger gets pointer messages (WM_TOUCH when it registered for touch); the first finger left to DefWindowProc is the mouse
+  {
+    pump();
+    const Rc ar = t.window_rect(a);
+    const int32_t px = ar.l + 150, py = ar.t + 100;
+    Th::M m;
+    auto pointer_messages = [&]() {
+      std::vector<Th::M> got;
+      for (int i = 0; i < 16 && t.peek(&m, 0, 0x240, 0x24A); ++i) got.push_back(m);
+      return got;
+    };
+    CHECK(!bridge.touch(hardware::TouchPhase::Down, 1, a, ar.r + 50, py));      // (not over the window)
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 1, a, px, py));
+    std::vector<Th::M> got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x249 && got[1].message == 0x246 && got[1].hwnd == a);
+    if (got.size() < 2) return;
+    const uint32_t id = uint32_t(got[1].wparam & 0xFFFF);
+    const uint32_t mflags = uint32_t(got[1].wparam >> 16);
+    CHECK(id >= 2 && (mflags & 0x1) && (mflags & 0x4) && (mflags & 0x2000));      // new, in contact, primary
+    CHECK(int16_t(got[1].lparam & 0xFFFF) == px && int16_t((got[1].lparam >> 16) & 0xFFFF) == py);
+    const uint64_t info = t.tmp(0x1400);
+    CHECK(t.svc(N::NtUserCallTwoParam, {id, info, 0x7C01}) == 1);
+    CHECK(t.mem().get32(info) == 2 && t.mem().get32(info + 4) == id && t.mem().get64(info + 24) == a && int32_t(t.mem().get32(info + 32)) == px &&
+          int32_t(t.mem().get32(info + 36)) == py && (t.mem().get32(info + 12) & 0x10000) && t.mem().get32(info + 88) == 1);
+    CHECK(t.svc(N::NtUserCallTwoParam, {999, info, 0x7C01}) == 0);
+    CHECK(user_misc::system_metrics(94, 96) == 0xC1 && user_misc::system_metrics(95, 96) == 10);
+    // left to DefWindowProc: the cursor goes there and the left button goes down
+    t.svc(N::NtUserMessageCall, {a, 0x246, got[1].wparam, got[1].lparam, 0, 0x29e, 0});
+    int32_t cx = 0, cy = 0;
+    user::cursor_position(&cx, &cy);
+    CHECK(cx == px && cy == py && t.peek(&m, 0, 0x201, 0x201));      // WM_LBUTTONDOWN
+    // a second finger: its own pointer, not primary, never the mouse
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 2, a, px + 40, py));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && uint32_t(got[1].wparam & 0xFFFF) != id && !((got[1].wparam >> 16) & 0x2000));
+    if (got.size() == 2) t.svc(N::NtUserMessageCall, {a, 0x246, got[1].wparam, got[1].lparam, 0, 0x29e, 0});
+    CHECK(!t.peek(&m, 0, 0x201, 0x201));
+    CHECK(bridge.touch(hardware::TouchPhase::Cancel, 2, a, px + 40, py));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x247 && ((got[0].wparam >> 16) & 0x8000) && got[1].message == 0x24A);      // up (cancelled), leave
+    // the first moves and goes up: update, up, leave; the mouse follows and lets go
+    CHECK(bridge.touch(hardware::TouchPhase::Motion, 1, a, px + 10, py + 5));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x245 && int16_t(got[0].lparam & 0xFFFF) == px + 10);
+    if (got.size() == 1) t.svc(N::NtUserMessageCall, {a, 0x245, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+    user::cursor_position(&cx, &cy);
+    CHECK(cx == px + 10 && cy == py + 5);
+    CHECK(bridge.touch(hardware::TouchPhase::Up, 1, a, px + 10, py + 5));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x247 && got[1].message == 0x24A);
+    if (got.size() == 2) t.svc(N::NtUserMessageCall, {a, 0x247, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+    CHECK(t.peek(&m, 0, 0x202, 0x202));      // WM_LBUTTONUP
+    CHECK(t.svc(N::NtUserCallTwoParam, {id, info, 0x7C01}) == 1 && (t.mem().get32(info + 12) & 0x40000));      // (still readable after its up)
+    CHECK(!bridge.touch(hardware::TouchPhase::Motion, 1, a, px, py));      // (gone)
+    // a touch window (RegisterTouchWindow): WM_TOUCH with one TOUCHINPUT, read until its handle is closed (DefWindowProc closes it)
+    CHECK(t.svc(N::NtUserCallTwoParam, {a, 1 | (3 << 2), 0x7C04}) == 1 && t.svc(N::NtUserCallTwoParam, {a, 2, 0x7C04}) == 4);
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 3, a, px, py));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x240 && got[0].wparam == 1 && got[0].lparam != 0);
+    if (got.size() == 1) {
+      const uint64_t handle = got[0].lparam;
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C02}) == 1);
+      const uint64_t input = t.tmp(0x1500);
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, input, 0x7C02}) == 1);
+      CHECK(int32_t(t.mem().get32(input)) == px * 100 && int32_t(t.mem().get32(input + 4)) == py * 100 && (t.mem().get32(input + 20) & 0x2) &&
+            (t.mem().get32(input + 20) & 0x10));      // down, primary
+      t.svc(N::NtUserMessageCall, {a, 0x240, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C02}) == 0 && t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C03}) == 0);      // (closed)
+      CHECK(t.peek(&m, 0, 0x201, 0x201));
+    }
+    CHECK(bridge.touch(hardware::TouchPhase::Up, 3, a, px, py));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x240);
+    if (got.size() == 1) {
+      CHECK(t.svc(N::NtUserCallTwoParam, {got[0].lparam, 0, 0x7C03}) == 1);      // closed by the program
+      CHECK(t.svc(N::NtUserCallTwoParam, {got[0].lparam, 0, 0x7C03}) == 0);
+    }
+    CHECK(t.svc(N::NtUserCallTwoParam, {a, 0, 0x7C04}) == 1 && t.svc(N::NtUserCallTwoParam, {a, 2, 0x7C04}) == 0);
+    // many fingers nobody lifts: bounded tables; inputs nobody closes: bounded
+    t.svc(N::NtUserCallTwoParam, {a, 1, 0x7C04});
+    for (uint32_t i = 0; i < 300; ++i) {
+      bridge.touch(hardware::TouchPhase::Down, 100 + i, a, px, py);
+      bridge.touch(hardware::TouchPhase::Up, 100 + i, a, px, py);
+      for (int k = 0; k < 4 && t.peek(&m, 0, 0x240, 0x24A); ++k) {}
+    }
+    uint32_t inputs = 0, contacts = 0;
+    for (user::TouchInputRecord& r : user::state().touch_inputs) { (void)r; ++inputs; }
+    for (user::TouchContact& c : user::state().touches) { (void)c; ++contacts; }
+    CHECK(inputs <= 257 && contacts <= 9);
+    t.svc(N::NtUserCallTwoParam, {a, 0, 0x7C04});
+    pump();
+  }
+
   // the icon: WM_SETICON's, shown by the desktop
   const uint32_t icon = user_misc::create_cursor_icon(91, true);
   CHECK(icon != 0 && t.svc(N::NtUserMessageCall, {a, 0x80, 0, icon, 0, 0x2b1, 0}) == 0);      // WM_SETICON ICON_SMALL

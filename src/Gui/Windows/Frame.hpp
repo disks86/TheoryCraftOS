@@ -29,15 +29,20 @@
 // half of the desktop area - the left or right half, or the upper or lower one - and pressing the one of the edge the window is docked at
 // puts it back. A sixth button tiles all the windows (up to four, the topmost ones) into a grid, a quarter of the area each. They are drawn for windows that can be maximized and resized. Moving or resizing a docked window frees it; maximizing it
 // and restoring that brings back the size it had before it was docked.
+// The window menu (Restore, Minimize, Maximize, Close, as the taskbar button's menu has them) opens on a right click on the title bar, on Alt+Space, and when a
+// program of another windowing system asks for it (show_window_menu: a Wayland client's xdg_toplevel.show_window_menu, which draws its own title bar).
 #pragma once
 #include "Gui/Control.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace gui {
 
 class WindowManager;
 class TabFrame;
+class ContextMenu;
+class MenuItem;
 
 class Frame : public Control {
  public:
@@ -50,6 +55,7 @@ class Frame : public Control {
                               DockLeft, DockRight, DockTop, DockBottom, Tile };
 
   explicit Frame(allocators::IAllocator& allocator) : Control(allocator), title_(allocator), icon_(allocator) {}
+  ~Frame();
 
   void set_title(StringView title) {
     UiGuard lock(this);
@@ -84,6 +90,18 @@ class Frame : public Control {
   bool activatable() const { return activatable_; }
   // The client area is wholly painted by its controls (a picture that covers it): the frame does not fill it first.
   void set_opaque_client(bool opaque) { UiGuard lock(this); opaque_client_ = opaque; invalidate(); }
+  // The band of the stack the window lives in: the manager keeps every window of a lower layer below every window of a higher one, whatever is raised.
+  // Normal is the desktop's and the programs' windows; the others are panels, backgrounds, docks and overlays (a Wayland layer surface, a Windows program's
+  // topmost window). A window of another layer is placed where its program says: the manager does not keep it inside an area, maximize, dock, tile or cycle it.
+  enum class Layer : int8_t { Background = -2, Bottom = -1, Normal = 0, Top = 1, Overlay = 2 };
+  void set_layer(Layer layer);
+  Layer layer() const { return layer_; }
+  // Space the window keeps for itself along an edge of the area it is on (a panel's exclusive zone): the manager's areas leave out `size` pixels from that
+  // edge while the window is shown, so maximized windows and new ones stay clear of it. Edge None (or size 0): nothing kept.
+  enum class Edge : uint8_t { None, Left, Top, Right, Bottom };
+  void set_reserve(Edge edge, uint32_t size);
+  Edge reserve_edge() const { return reserve_edge_; }
+  uint32_t reserve_size() const { return reserve_size_; }
   // Whether the taskbar (and Alt+Tab) list the window.
   void set_in_taskbar(bool in_taskbar) { UiGuard lock(this); in_taskbar_ = in_taskbar; }
   bool in_taskbar() const { return in_taskbar_ && !modal_; }
@@ -128,6 +146,11 @@ class Frame : public Control {
   // The tile button: the windows are arranged in a grid (see WindowManager::tile()); pressed again by a tiled window, they all go back.
   void tile();
 
+  // Opens the window menu at (x, y), frame coordinates (from_keyboard: its first item highlighted). False when it cannot (the frame is in no window, is a
+  // tab, or a menu is open already). The menu is made the first time.
+  bool show_window_menu(int32_t x, int32_t y, bool from_keyboard = false);
+  ContextMenu* window_menu() const { return window_menu_.get(); }      // (tests: null until it was first opened)
+
   // Where a point (frame coordinates) lies: a button, the title bar, a border, the client area.
   Part part_at(int32_t x, int32_t y) const;
   Rect2D button_rect(Part button) const;
@@ -147,7 +170,8 @@ class Frame : public Control {
   virtual void manager_changed() {}
   // Asked before close() closes the window: false keeps it open (a Windows program's window asks the program, which destroys it if it agrees).
   virtual bool close_requested() { return true; }
-  // Told when the window manager closes the frame (after it was taken out): a tabbed window closes its tabs.
+  // Told when the window manager closes the frame (after it was taken out), or its tabbed window closes it as a tab: a tabbed window closes its tabs,
+  // a program lets go of what it was doing (a page stops its sounds and scripts).
   virtual void window_closed(Window* /*window*/) {}
   // A tab changed its title / the host is asked to...
   virtual void tab_title_changed(Frame* /*tab*/) {}
@@ -159,6 +183,11 @@ class Frame : public Control {
   friend class WindowManager;
   friend class TabFrame;
   void host_changed_title();
+  static void menu_opening(void* self, Control&);
+  static void menu_restore(void* self, Control&);
+  static void menu_minimize(void* self, Control&);
+  static void menu_maximize(void* self, Control&);
+  static void menu_close(void* self, Control&);
 
   bool button_enabled(Part button) const;
   void draw_button(Painter& painter, Part button);
@@ -175,6 +204,9 @@ class Frame : public Control {
   bool can_minimize_ = true, can_maximize_ = true, can_close_ = true, resizable_ = true;
   bool escape_closes_ = false;
   bool decorated_ = true, activatable_ = true, in_taskbar_ = true, opaque_client_ = false;
+  Layer layer_ = Layer::Normal;
+  Edge reserve_edge_ = Edge::None;
+  uint32_t reserve_size_ = 0;
   Dock docked_ = Dock::None;
   uint8_t tile_slot_ = 0, tile_count_ = 0;   // the place in the grid while docked_ is Tile
   TabFrame* host_ = nullptr;
@@ -188,6 +220,9 @@ class Frame : public Control {
   Part dragging_ = Part::None;  // TitleBar (moving) or a border (resizing)
   int32_t grab_x_ = 0, grab_y_ = 0;
   Rect2D grab_bounds_;
+  // The window menu (made when first opened).
+  UniquePointer<ContextMenu> window_menu_;
+  MenuItem *restore_item_ = nullptr, *minimize_item_ = nullptr, *maximize_item_ = nullptr, *close_item_ = nullptr;
 };
 
 }  // namespace gui

@@ -31,6 +31,9 @@
 #include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
+#include "PipeWire/ScreenSource.hpp"
+#include "PipeWire/DxgGpuImages.hpp"
+#include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
@@ -69,6 +72,7 @@
 #include "WebGl/AccelConformance.hpp"
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
+#include "Desktop/AppMan/HttpNetwork.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -1386,6 +1390,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   hardware::SensorHub sensors;
   input.mice().add(&pen_mouse);
   i2c_hid.set_pens(&pens);
+  i2c_hid.set_touches(&input.touches());
   i2c_hid.set_sensors(&sensors);
   if (paging_ok && i2c_acpi_tables.initialize()) {
     const uint32_t started = i2c_hid.start(i2c_acpi_tables, input.mice());
@@ -1520,6 +1525,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
+    desktop.set_touch(&input.touches());      // (touchscreens: virtio-multitouch and the I2C ones)
+    desktop.set_pens(&pens, &pen_mouse);       // (the pen mouse stops: the desktop moves the pointer with pens nobody takes)
     desktop.window().show_cursor(input.mice().count() > 0);
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);
@@ -2139,6 +2146,17 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // (PulseAudio's, as pipewire-pulse serves it), Windows programs through winmm.dll, dsound.dll, WASAPI and NtTcosAudio. Recording goes the same ways
     // through the capture hub: the graph's source is the microphone it shares. (Gone before the mixer and the hub are.)
     pipewire::Graph media_graph(shared_allocator, mixer.get(), capture_hub.get());
+    // Encoded video (H.264, VP9, ...) that a raw watcher takes, or the Video Viewer shows, is decoded by sessions of the machine's video codecs; raw
+    // video a watcher takes compressed (Motion JPEG, H.264) is encoded by them.
+    struct GraphVideoCodecs final : pipewire::IVideoCodecs {
+      hardware::SystemVideoCodecs& codecs;
+      explicit GraphVideoCodecs(hardware::SystemVideoCodecs& c) : codecs(c) {}
+      bool can_decode(hardware::VideoCodec codec) const override { return (codecs.decode_codecs() & hardware::codec_mask(codec)) != 0; }
+      UniquePointer<hardware::IVideoDecoder> create_decoder(const hardware::DecoderConfig& config) override { return codecs.create_decoder(config); }
+      bool can_encode(hardware::VideoCodec codec) const override { return (codecs.encode_codecs() & hardware::codec_mask(codec)) != 0; }
+      UniquePointer<hardware::IVideoEncoder> create_encoder(const hardware::EncoderConfig& config) override { return codecs.create_encoder(config); }
+    } graph_video_codecs(video_codecs);
+    media_graph.set_video_codecs(&graph_video_codecs);
     pipewire::NativeServer pipewire_native(media_graph, shared_allocator, [] { return hardware::uptime_us() * 1000; });
     // MIDI: what programs play sounds on the machine's synthesizer (a USB one, the MPU-401, else the software one); what keyboards play is heard by
     // the programs that record MIDI. (Undone before the graph goes.)
@@ -2157,12 +2175,72 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // The cameras as video sources of the graph (a node each; a camera streams while a program watches it): updated from the loop below.
     pipewire::CameraSources camera_sources(media_graph, shared_allocator);
     uint64_t camera_sources_us = 0;
+    // The screen as a video source too (screen sharing): the desktop's window hands it a copy of what it draws while a program watches.
+    pipewire::ScreenSource screen_source(media_graph, shared_allocator);
+    struct ScreenTap final : gui::IFrameTap {
+      pipewire::ScreenSource& s;
+      explicit ScreenTap(pipewire::ScreenSource& source) : s(source) {}
+      ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) override { return s.frame_wanted(width, height, hardware::uptime_us()); }
+      void frame_read(uint32_t width, uint32_t height) override { s.frame_read(width, height, static_cast<int64_t>(hardware::uptime_us() * 1000)); }
+    } screen_tap(screen_source);
+    struct ScreenTapGuard {
+      gui::Window& w;
+      ~ScreenTapGuard() { w.set_frame_tap(nullptr); }      // (before the source goes)
+    } screen_tap_guard{desktop.window()};
+    // ... and what programs present straight to the display (the Direct3D kernel's presents: the 3D test, a full-screen Direct3D program), which the
+    // desktop's frames do not hold.
+    struct PresentTap final : dxgk::IPresentTap {
+      pipewire::ScreenSource& s;
+      explicit PresentTap(pipewire::ScreenSource& source) : s(source) {}
+      ArrayView<uint32_t> present_wanted(uint32_t width, uint32_t height) override {
+        return s.frame_wanted(width, height, hardware::uptime_us(), pipewire::ScreenOrigin::Program);
+      }
+      void present_read(uint32_t width, uint32_t height) override { s.frame_read(width, height, static_cast<int64_t>(hardware::uptime_us() * 1000)); }
+    } present_tap(screen_source);
+    struct PresentTapGuard {
+      dxgk::Kernel& k;
+      ~PresentTapGuard() { k.set_present_tap(nullptr); }      // (before the source goes)
+    } present_tap_guard{dxg_kernel};
+    if (screen_source.start()) {
+      desktop.window().set_frame_tap(&screen_tap);
+      dxg_kernel.set_present_tap(&present_tap);
+    }
+    // The desktop's Video Viewer watches the graph's video producers through the kernel's own watcher.
+    pipewire::VideoWatcher video_watcher(media_graph, shared_allocator);
+    struct ViewerSources final : desktop::IVideoSources {
+      pipewire::VideoWatcher& w;
+      allocators::IAllocator& a;
+      List<uint32_t> ids;
+      ViewerSources(pipewire::VideoWatcher& watcher, allocators::IAllocator& alloc) : w(watcher), a(alloc), ids(alloc) {}
+      uint32_t source_count() override {
+        w.producers(&ids);
+        return static_cast<uint32_t>(ids.count());
+      }
+      bool source(uint32_t index, uint32_t* id, String* name) override {
+        if (index >= ids.count()) return false;
+        *id = ids[index];
+        return w.name_of(ids[index], name);
+      }
+      bool watch(uint32_t id) override { return w.watch(id); }
+      bool latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* width, uint32_t* height, StringView* why) override {
+        return w.latest(sequence, pixels, width, height, why);
+      }
+    } viewer_sources(video_watcher, shared_allocator);
+    struct ViewerGuard {
+      desktop::Desktop& d;
+      ~ViewerGuard() { d.set_video_sources(nullptr); }      // (before the watcher goes)
+    } viewer_guard{desktop};
+    desktop.set_video_sources(&viewer_sources);
+    // The GPU images the PipeWire server hands watchers that take DMA-BUFs only (exports of the Direct3D layer's first adapter). Declared before the
+    // transport, which holds descriptors of them until it goes.
+    pipewire::DxgGpuImages pipewire_gpu_images(dxg_kernel, shared_allocator);
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);
       process::win32k::register_process_exit_hook([](uint64_t pid) { pipewire::windows_audio_process_exited(pid); });
       if (process::UnixSocketManager* sockets = process::system_unix_sockets())
         pipewire_sockets = UniquePointer<pipewire::SocketServer>::make(shared_allocator, *sockets, shared_allocator);
+      if (pipewire_sockets && dxg_kernel.adapter_count() > 0) pipewire_sockets->set_gpu_images(&pipewire_gpu_images);
       if (pipewire_sockets && pipewire::listen_standard_sockets(*pipewire_sockets, pipewire_native, pipewire_pulse, &explorer_files.file_system(), shared_allocator) &&
           pipewire_sockets->start())
         Entry(Level::Ok, "PipeWire").text("graph running; listening at ").text(filesystem::layout::kLinuxRuntimeFolder).text("/pipewire-0 and /pulse/native");
@@ -2209,6 +2287,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     } else {
       Entry(Level::Warning, "D-Bus").text("the buses could not start (no machine id)");
     }
+    desktop::appman::HttpNetwork appman_network(shared_allocator, &web_tls);      // the App Manager's downloads (AppImages from AppMan's catalog)
+    desktop.set_appman_network(&appman_network);
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
 #ifdef TCOS_AUTORUN
@@ -2262,6 +2342,56 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     };
     static AutoRun autorun{&shared_allocator, &explorer_files.file_system()};
     kernel::detach(kernel::spawn(&AutoRun::main, &autorun, "autorun"));
+#endif
+#ifdef TCOS_APPMAN_SELFTEST
+    // The build asked for the App Manager's whole path to be tried (tests/appman_qemu.sh): once the network is up, AppMan's catalog and the application
+    // TCOS_APPMAN_SELFTEST are fetched and installed with the kernel's HTTP client, and what happened goes to the debug console.
+    struct AppManSelfTest {
+      allocators::IAllocator* allocator;
+      filesystem::IFileSystem* files;
+      desktop::appman::HttpNetwork* network;
+      static void main(void* argument) {
+        AppManSelfTest& t = *static_cast<AppManSelfTest*>(argument);
+        String list(*t.allocator);
+        bool fetched = false;
+        for (uint32_t attempt = 0; attempt < 30 && !fetched; ++attempt) {      // (DHCP may take a while)
+          kernel::sleep_ms(2000);
+          fetched = t.network->fetch(desktop::appman::kCatalogUrl, desktop::appman::kMaxCatalogBytes, &list);
+        }
+        desktop::appman::Catalog catalog(*t.allocator);
+        console::puts("appman-selftest: catalog ");
+        console::puts(fetched && catalog.parse(list.view()) ? "ok, " : "FAILED, ");
+        console::put_dec(static_cast<int64_t>(catalog.count()));
+        console::puts(" applications (");
+        console::puts(t.network->last_error());
+        console::puts(")\n");
+        desktop::appman::Installer installer(*t.allocator, *t.files, *t.network);
+        desktop::appman::Progress progress;
+        String detail(*t.allocator);
+        const desktop::appman::Result r = installer.install(TCOS_APPMAN_SELFTEST, &progress, &detail);
+        console::puts("appman-selftest: install " TCOS_APPMAN_SELFTEST ": ");
+        console::puts(desktop::appman::result_name(r));
+        console::puts(" (");
+        console::puts(detail.view());
+        console::puts("; ");
+        console::puts(t.network->last_error());
+        console::puts("), ");
+        console::put_dec(static_cast<int64_t>(progress.done));
+        console::puts(" bytes\n");
+        List<desktop::InstalledApp> apps(*t.allocator);
+        if (desktop::find_installed_apps(*t.files, *t.allocator, &apps))
+          for (const desktop::InstalledApp& app : apps.view()) {
+            console::puts("appman-selftest: start menu: ");
+            console::puts(app.label.view());
+            console::puts(" -> ");
+            console::puts(app.program.view());
+            console::puts("\n");
+          }
+        console::puts(r == desktop::appman::Result::Ok ? "appman-selftest: PASSED\n" : "appman-selftest: FAILED\n");
+      }
+    };
+    static AppManSelfTest appman_selftest{&shared_allocator, &explorer_files.file_system(), &appman_network};
+    kernel::detach(kernel::spawn(&AppManSelfTest::main, &appman_selftest, "appman-selftest"));
 #endif
     explorer_files.set_notifier(on_storage_change, &desktop);
     EjectContext eject_context{&explorer_files, {}};
@@ -2705,6 +2835,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         for (uint32_t i = 0; i < cameras.count() && listed < pipewire::CameraSources::kMaxCameras; ++i)
           if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
         camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
+        if (screen_source.watcher_came()) desktop.window().invalidate();      // (a frame for the new watcher, even of a still screen)
+        if (screen_source.desktop_returned(now_us)) desktop.window().invalidate();      // (a program stopped presenting: the desktop again)
+        screen_source.keep_alive(now_us);      // (a still screen: its last frame again once a second)
       }
       if (threaded) {
         desktop.pump(hardware::uptime_us());

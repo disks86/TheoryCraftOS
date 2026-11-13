@@ -79,6 +79,11 @@ class BrowserVideoClip final : public browser::IVideoClip {
     if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) return false;
     return player_.copy_picture(dest.data(), pitch, serial);
   }
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
+    *presented = player_.frames_presented();
+    *dropped = player_.frames_skipped();
+    return true;
+  }
 
  private:
   UniquePointer<ByteBuffer> data_;
@@ -314,12 +319,39 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   add(&page_);   // Fill goes last
   update_buttons();
   update_title(StringView());
+  gone_handler_ = {&WebBrowser::on_window_gone, this};
+  show_welcome();
+}
 
-  Fetched welcome(allocator);
+void WebBrowser::show_welcome() {
+  Fetched welcome(allocator());
   welcome.body.append(ConstByteView(reinterpret_cast<const uint8_t*>(kWelcome), sizeof kWelcome - 1));
   welcome.type.assign("text/html");
   show(welcome);
   say("Type an address and press Enter.");
+}
+
+// The window (or the tab) was closed. The first browser of the desktop is kept to be opened again, so its page would go on playing its videos and sounds
+// and running its scripts unseen: the page is let go of on the handler thread (where the page lives), and the window starts afresh next time.
+void WebBrowser::window_closed(gui::Window*) { queue(gone_handler_, *this, true); }
+
+void WebBrowser::on_window_gone(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  {
+    UiGuard lock(b);
+    b->request_ = Request::None;
+    b->want_go_ = b->want_post_ = b->want_close_ = b->defer_reload_ = false;
+    b->defer_history_ = 0;
+    b->defer_opens_.clear();
+    b->defer_open_targets_.clear();
+    b->defer_open_types_.clear();
+    b->defer_open_bodies_.clear();
+    b->leave_confirmed_ = false;
+    b->history_.clear();
+    b->current_.clear();
+    b->referrer_.clear();
+  }
+  b->show_welcome();   // (unloads the page: pagehide and unload run, its media players and sounds are closed)
 }
 
 bool WebBrowser::RtcRandom::fill(ByteView out) { return browser::system_random(out); }
@@ -1062,9 +1094,11 @@ void WebBrowser::settle() {
   }
   if (!live_) return;
   canvas_accelerated_ = live_->objects().accelerated();
-  if (live_->take_visual_change()) {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again)
-    UiGuard lock(&page_);
-    page_.invalidate();
+  {   // (a canvas was drawn on, a video has a new picture: only the view needs painting again - for a video's frame, only where the video is)
+    uint32_t nodes[16];
+    const uint32_t changed = live_->take_visual_changes(ArrayView<uint32_t>(nodes, 16));
+    if (changed == browser::PageObjects::kChangedEverything) page_.invalidate_page();
+    else if (changed != 0) page_.invalidate_objects(ArrayView<const uint32_t>(nodes, changed));
   }
   update_key_capture();
   const uint64_t now_ms = __atomic_load_n(&uptime_ms_, __ATOMIC_ACQUIRE);
@@ -1436,6 +1470,13 @@ UniquePointer<browser::IVideoClip> WebBrowser::Env::open_audio(UniquePointer<Byt
   auto clip = UniquePointer<BrowserAudioClip>::make(owner_.allocator(), owner_.allocator(), *owner_.mixer_, util::move(data));
   if (!clip || !clip->open()) return UniquePointer<browser::IVideoClip>();
   return clip;
+}
+
+bool WebBrowser::Env::video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) {
+  if (!owner_.codecs_) return false;
+  const hardware::VideoCodec which = codec.equals("h264") ? hardware::VideoCodec::H264 : codec.equals("hevc") ? hardware::VideoCodec::Hevc : codec.equals("vp8") ? hardware::VideoCodec::Vp8
+                                     : codec.equals("vp9") ? hardware::VideoCodec::Vp9 : codec.equals("av1") ? hardware::VideoCodec::Av1 : hardware::VideoCodec::Raw;
+  return which != hardware::VideoCodec::Raw && owner_.codecs_->accelerated_decode(which, width, height);
 }
 
 bool WebBrowser::Env::fetch_text(StringView address, uint64_t limit, String* text) {

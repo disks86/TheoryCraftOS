@@ -287,6 +287,76 @@ void Server::mouse_wheel(int32_t notches) {
   wake();
 }
 
+// ------------------------------------------------------------------ wl_touch
+
+bool Server::touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
+  (void)window;
+  {
+    kernel::ScopedMutex lock(mutex_);
+    const uint32_t touch_id = id & 0x7FFFFFFFu;
+    // the client's wl_touch objects get `opcode` (filled by `fill` for each), then a frame
+    auto send_all = [&](Client& c, uint16_t opcode, auto fill) {
+      ObjectCursor cursor;
+      List<uint32_t> objects(allocator_);
+      for (bool more = c.objects.first(&cursor); more; more = c.objects.next(&cursor)) {
+        const KeyValue<uint32_t, Resource>* kv = c.objects.element(cursor);
+        if (kv->value.iface == Iface::Touch) objects.push_back(kv->key);
+      }
+      for (uint32_t object : objects.view()) {
+        Event e(object, opcode);
+        fill(e);
+        send(c, e);
+        send(c, Event(object, 3));      // frame
+      }
+    };
+    if (phase == hardware::TouchPhase::Down) {
+      int32_t lx = 0, ly = 0;
+      Surface* s = surface_at(x, y, &lx, &ly);
+      Client* c = s ? client_of(s->client) : nullptr;
+      if (!c) return false;
+      bool has_touch = false;
+      ObjectCursor cursor;
+      for (bool more = c->objects.first(&cursor); more && !has_touch; more = c->objects.next(&cursor)) has_touch = c->objects.element(cursor)->value.iface == Iface::Touch;
+      if (!has_touch) return false;      // (the client reads no touches: the desktop moves the pointer with this finger)
+      TouchContact t;
+      t.id = id;
+      t.client = s->client;
+      t.surface = s->id;
+      t.origin_x = x - lx;
+      t.origin_y = y - ly;
+      if (!touches_.push_back(t)) return false;
+      const uint32_t serial = next_serial(), time = now(), surface = s->id;
+      send_all(*c, 0, [&](Event& e) { e.u(serial).u(time).u(surface).i(static_cast<int32_t>(touch_id)).fixed(lx).fixed(ly); });      // down
+    } else {
+      uint64_t i = 0;
+      while (i < touches_.count() && touches_[i].id != id) ++i;
+      if (i == touches_.count()) return false;
+      const TouchContact t = touches_[i];
+      Client* c = client_of(t.client);
+      if (phase != hardware::TouchPhase::Motion) touches_.remove_at(i);
+      if (c) {
+        const uint32_t time = now();
+        if (phase == hardware::TouchPhase::Motion) {
+          send_all(*c, 2, [&](Event& e) { e.u(time).i(static_cast<int32_t>(touch_id)).fixed(x - t.origin_x).fixed(y - t.origin_y); });      // motion
+        } else if (phase == hardware::TouchPhase::Up) {
+          const uint32_t serial = next_serial();
+          send_all(*c, 1, [&](Event& e) { e.u(serial).u(time).i(static_cast<int32_t>(touch_id)); });      // up
+        } else {      // cancel: every touch of the client's (the protocol cancels them all)
+          ObjectCursor cursor;
+          for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
+            const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
+            if (kv->value.iface == Iface::Touch) send(*c, Event(kv->key, 4));
+          }
+          for (uint64_t k = touches_.count(); k > 0; --k)
+            if (touches_[k - 1].client == t.client) touches_.remove_at(k - 1);
+        }
+      }
+    }
+  }
+  wake();
+  return true;
+}
+
 void Server::mouse_left() {
   {
     kernel::ScopedMutex lock(mutex_);
@@ -335,7 +405,7 @@ bool Server::cursor_picture(uint32_t handle, uint32_t* system_id, List<uint32_t>
   const BufferInfo& b = cursor_surface_->current;
   if (b.width > 256 || b.height > 256) return false;
   ArrayView<uint32_t> pixels = buffer_pixels(b);
-  uint64_t row = uint64_t(b.stride / 4);
+  uint64_t row = uint64_t(b.pitch());
   // a GPU cursor is read out first (as 0xAARRGGBB, rows of its width)
   List<uint32_t> gpu_pixels(allocator_);
   GpuImage* image = b.image();
@@ -434,7 +504,9 @@ void Server::set_keyboard_focus(Surface* s) {
       }
     }
   }
+  Surface* old_focus = keyboard_focus_;
   keyboard_focus_ = s;
+  text_input_focus(old_focus, nullptr);      // (WaylandTextInput.cpp: leave now, enter once the keyboard has entered)
   last_mods_[0] = last_mods_[1] = ~0u;
   if (!s) return;
   Client* c = client_of(s->client);
@@ -449,6 +521,7 @@ void Server::set_keyboard_focus(Surface* s) {
   }
   for (uint32_t k : keyboards.view())
     if (Resource* r = c->objects.find(k)) keyboard_enter(*c, *r, k, *s);
+  text_input_focus(nullptr, s);      // (after wl_keyboard.enter: clients such as foot expect that order)
   last_mods_[0] = modifier_mask(false);
   last_mods_[1] = modifier_mask(true);
 }

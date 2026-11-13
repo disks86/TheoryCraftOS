@@ -17,6 +17,7 @@
  */
 
 #include "Process/Win32k/Win32kUserInternal.hpp"
+#include "Utility/ByteStream.hpp"
 
 // Redirection: the kernel's desktop shows every visible top-level window as one of its own windows. A redirected top-level draws (with its whole tree) on a window
 // surface of its own, which the desktop copies into its picture as it is; screen coordinates are the desktop's. The desktop draws the caption and frame of a window that
@@ -276,6 +277,88 @@ bool command_top_level(uint32_t hwnd, uint32_t sc) {
   Window* w = find_window(hwnd);
   if (!on_desktop(w)) return false;
   return post_message(hwnd, 0x112 /* WM_SYSCOMMAND */, sc, 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// Files dropped by the desktop
+
+namespace {
+constexpr uint32_t kWsExAcceptFiles = 0x10, kWmDropFiles = 0x233;
+constexpr uint32_t kMaxDrops = 16;                // (drops nobody collected: the oldest goes)
+constexpr uint64_t kMaxDropChars = 1u << 20;
+constexpr uint32_t kDropFilesHeader = 20;         // sizeof(DROPFILES) on x64: DWORD pFiles; POINT pt; BOOL fNC; BOOL fWide
+}  // namespace
+
+bool drop_target(uint32_t top_level, int32_t x, int32_t y, DropTarget* out) {
+  LockGuard g;
+  *out = DropTarget();
+  if (!state_or_null()) return false;
+  Window* top = find_window(top_level);
+  if (!on_desktop(top) || !is_visible(top)) return false;
+  Window* w = window_at_point(x, y, true, 0);
+  if (!w || top_level_of(w) != top) return false;
+  while (w && !(w->ex_style & kWsExAcceptFiles) && w != top) w = w->parent;
+  if (!w || !(w->ex_style & kWsExAcceptFiles) || (w->style & wn::WS_DISABLED)) return false;
+  const Rect c = client_rect_screen(w);
+  out->hwnd = w->handle;
+  out->x = x - c.left;
+  out->y = y - c.top;
+  out->non_client = !rect_contains(c, x, y);
+  return true;
+}
+
+bool drop_files(const DropTarget& target, ArrayView<const char16_t> names) {
+  LockGuard g;
+  if (!state_or_null() || names.size() < 2 || names.size() > kMaxDropChars || names[names.size() - 1] != 0 || names[names.size() - 2] != 0) return false;
+  State& s = S();
+  Window* w = find_window(target.hwnd);
+  if (!w) return false;
+  uint32_t count = 0;
+  DropRecord* oldest = nullptr;
+  for (DropRecord& r : s.drops) {
+    ++count;
+    if (!oldest || r.ticket < oldest->ticket) oldest = &r;
+  }
+  if (count >= kMaxDrops && oldest) s.drops.erase(oldest);
+  DropRecord* r = s.drops.emplace(s.alloc);
+  if (!r) return false;
+  if (!r->names.reserve(names.size())) {
+    s.drops.erase(r);
+    return false;
+  }
+  for (char16_t c : names) r->names.push_back(c);
+  r->ticket = s.next_drop++;
+  if (s.next_drop == 0) s.next_drop = 1;
+  r->pid = w->pid;
+  r->x = target.x;
+  r->y = target.y;
+  r->non_client = target.non_client;
+  if (!post_message(target.hwnd, kWmDropFiles, r->ticket, kDropTicketMark)) {
+    s.drops.erase(r);
+    return false;
+  }
+  return true;
+}
+
+uint64_t take_drop(uint64_t pid, uint32_t ticket, ByteView out) {
+  State* s = state_or_null();
+  if (!s) return 0;
+  for (DropRecord& r : s->drops) {
+    if (r.ticket != ticket || r.pid != pid) continue;
+    const uint64_t size = kDropFilesHeader + r.names.count() * 2;
+    if (out.empty()) return size;
+    if (out.size() != size) return 0;
+    ByteWriter wr(out);
+    wr.le32(kDropFilesHeader);
+    wr.le32(uint32_t(r.x));
+    wr.le32(uint32_t(r.y));
+    wr.le32(r.non_client ? 1 : 0);
+    wr.le32(1);      // fWide
+    for (char16_t c : r.names.view()) wr.le16(c);
+    s->drops.erase(&r);
+    return size;
+  }
+  return 0;
 }
 
 }  // namespace process::win32k::user

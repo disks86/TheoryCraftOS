@@ -198,11 +198,16 @@ bool ProcessFiles::fold_case(String* path, uint64_t prefix_size) const {
 }
 
 namespace {
-// The rest of `virtual_path` after /mnt/c ("" for /mnt/c itself, "/x" below it), or false if it is not in there.
-bool under_windows_mount(StringView virtual_path, StringView* rest) {
-  const StringView kWindowsDriveMount(filesystem::layout::kLinuxWindowsDrive);
-  if (virtual_path.size() < kWindowsDriveMount.size() || virtual_path.first(kWindowsDriveMount.size()) != kWindowsDriveMount) return false;
-  const StringView after = virtual_path.without_prefix(kWindowsDriveMount.size());
+// The rest of `virtual_path` after `mount` ("" for the mount itself, "/x" below it), or false if it is not in there.
+bool under_mount(StringView virtual_path, const char* mount, StringView* rest, bool any_case = false) {
+  const StringView root(mount);
+  if (virtual_path.size() < root.size()) return false;
+  if (any_case) {      // (Windows names: letters of either case)
+    if (!equal_ignoring_case(virtual_path.first(root.size()), root)) return false;
+  } else if (virtual_path.first(root.size()) != root) {
+    return false;
+  }
+  const StringView after = virtual_path.without_prefix(root.size());
   if (!after.empty() && after[0] != '/') return false;      // ("/mnt/cdrom" is not)
   *rest = after;
   return true;
@@ -212,12 +217,24 @@ bool under_windows_mount(StringView virtual_path, StringView* rest) {
 bool ProcessFiles::host_path(StringView virtual_path, String* out) const {
   if (!fs_ || !allocator_) return false;
   out->clear();
-  StringView windows_rest;
-  if (style_ == PathStyle::Posix && under_windows_mount(virtual_path, &windows_rest)) {
+  StringView mount_rest;
+  if (style_ == PathStyle::Posix && under_mount(virtual_path, filesystem::layout::kLinuxWindowsDrive, &mount_rest)) {      // /mnt/c: the Windows tree
+    StringView desktop_rest;
+    if (under_mount(mount_rest, filesystem::layout::kWindowsDesktopFolder, &desktop_rest, true)) {      // (its Users/Public/Desktop: the user's files)
+      const StringView desktop_root(filesystem::layout::kDesktop);
+      return out->assign(desktop_root) && out->append(desktop_rest) && fold_case(out, desktop_root.size());
+    }
     const StringView windows_root(filesystem::layout::kWindows);
-    if (!out->assign(windows_root) || !out->append(windows_rest)) return false;
+    if (!out->assign(windows_root) || !out->append(mount_rest)) return false;
     return fold_case(out, windows_root.size());
   }
+  if (style_ == PathStyle::Windows && root_prefix_ == StringView(filesystem::layout::kWindows) &&
+      under_mount(virtual_path, filesystem::layout::kWindowsDesktopFolder, &mount_rest, true)) {      // C:\Users\Public\Desktop: the user's files
+    const StringView desktop_root(filesystem::layout::kDesktop);
+    return out->assign(desktop_root) && out->append(mount_rest) && fold_case(out, desktop_root.size());
+  }
+  if (style_ == PathStyle::Posix && under_mount(virtual_path, filesystem::layout::kLinuxDesktopDrive, &mount_rest))      // /mnt/desktop: the user's files
+    return out->assign(StringView(filesystem::layout::kDesktop)) && out->append(mount_rest);
   if (!out->assign(root_prefix_)) return false;
   if (virtual_path == StringView("/")) return true;
   if (!out->append(virtual_path)) return false;
@@ -229,6 +246,10 @@ bool ProcessFiles::canonical_path(StringView virtual_path, String* out, uint32_t
   if (!host_path(virtual_path, &host)) return false;
   const StringView whole = host.view();
   if (whole.size() < root_prefix_.size()) return false;
+  // a path in a mount (/mnt/c, /mnt/desktop, C:\Users\Public\Desktop) is not under the root: it is named as it was asked for (host_path matched its
+  // names' case already)
+  if (!equal_ignoring_case(whole.first(root_prefix_.size()), root_prefix_) || (whole.size() > root_prefix_.size() && whole[root_prefix_.size()] != '/'))
+    return out->assign(virtual_path);
   String walked(*allocator_);
   if (!walked.assign(root_prefix_)) return false;
   uint64_t at = root_prefix_.size();

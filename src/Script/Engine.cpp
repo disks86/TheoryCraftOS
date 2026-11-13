@@ -902,6 +902,12 @@ uint32_t Engine::run_timers(uint32_t max, String* error) {
   return failed;
 }
 
+uint32_t Engine::run_timers_until(double last_ms, uint32_t max, String* error) {
+  uint32_t failed = 0;
+  on_big_stack([&] { failed = run_timers_here(last_ms, true, max, error); });
+  return failed;
+}
+
 uint32_t Engine::run_due_timers(double now_ms, uint32_t max, String* error) {
   uint32_t failed = 0;
   on_big_stack([&] { failed = run_timers_here(now_ms, false, max, error); });
@@ -918,6 +924,21 @@ bool Engine::next_timer(double* due_ms) {
     JsObject* e = list->items[i].as_object();
     if (e->length < 4 || !e->items[1].is_number()) continue;
     if (!any || e->items[1].u.number < *due_ms) *due_ms = e->items[1].u.number;
+    any = true;
+  }
+  return any;
+}
+
+bool Engine::last_one_shot_timer(double* due_ms) {
+  Value list_value;
+  if (!vm_.get_named(Value::make_object(vm_.global()), "__timers", &list_value) || !list_value.is_object()) return false;
+  JsObject* list = list_value.as_object();
+  bool any = false;
+  for (uint32_t i = 0; i < list->length; ++i) {
+    if (!list->items[i].is_object()) continue;
+    JsObject* e = list->items[i].as_object();
+    if (e->length < 4 || !e->items[1].is_number() || (e->items[3].is_number() && e->items[3].u.number >= 0)) continue;   // (an interval never runs out)
+    if (!any || e->items[1].u.number > *due_ms) *due_ms = e->items[1].u.number;
     any = true;
   }
   return any;
@@ -941,7 +962,7 @@ uint32_t Engine::run_timers_here(double now_ms, bool ahead, uint32_t max, String
         best_due = e->items[1].u.number;
       }
     }
-    if (best < 0 || (!ahead && best_due > now_ms)) break;
+    if (best < 0 || best_due > now_ms) break;   // (ahead: now_ms is how far the clock may be moved)
     JsObject* entry = list->items[best].as_object();
     const Value fn = entry->items[0];
     const double interval = entry->items[3].is_number() ? entry->items[3].u.number : -1;

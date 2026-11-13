@@ -19,6 +19,7 @@
 #include "PipeWire/SocketServer.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "Kernel/Sync.hpp"
+#include "Process/DxgBufferFile.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Process.hpp"
 
@@ -44,8 +45,16 @@ class KernelDescriptor final : public Descriptor {
  public:
   // (`limit`: how much of the block is the file: all of it for memory the server made, the file's size for a client's memfd)
   KernelDescriptor(SharedPointer<SocketServer::Graveyard> graveyard, process::UnixSocketManager& sockets, process::UnixInFlight entry, process::BlockRef block,
-                   uint64_t limit = ~0ull)
-      : graveyard_(util::move(graveyard)), sockets_(sockets), entry_(util::move(entry)), block_(util::move(block)), limit_(limit) {}
+                   uint64_t limit = ~0ull, allocators::IAllocator* gpu_copy_allocator = nullptr)
+      : graveyard_(util::move(graveyard)), sockets_(sockets), entry_(util::move(entry)), block_(util::move(block)), limit_(limit) {
+    // (a dmabuf: the server's copy of its pixels, the image's size (at most kMaxGpuCopy))
+    if (gpu_copy_allocator && entry_.object && entry_.object->gpu_buffer) {
+      const uint64_t size = entry_.object->gpu_buffer->size();
+      gpu_copy_ = UniquePointer<ByteBuffer>::make(*gpu_copy_allocator, *gpu_copy_allocator);
+      if (gpu_copy_ && (size > kMaxGpuCopy || !gpu_copy_->put_zeros(size))) gpu_copy_ = UniquePointer<ByteBuffer>();
+    }
+  }
+  static constexpr uint64_t kMaxGpuCopy = 64u << 20;
   ~KernelDescriptor() {
     if (entry_.token == 0) return;
     bool now = false;
@@ -59,6 +68,7 @@ class KernelDescriptor final : public Descriptor {
   KernelDescriptor& operator=(const KernelDescriptor&) = delete;
   const process::UnixInFlight& entry() const { return entry_; }
   ByteView memory() override {
+    if (gpu_copy_) return gpu_copy_->writable_view();
     if (!block_) return ByteView();
     const ByteView all = block_.get()->bytes();
     return limit_ < all.size() ? all.first(limit_) : all;
@@ -70,6 +80,21 @@ class KernelDescriptor final : public Descriptor {
     const UnixStatus st = sockets_.event_add_locked(uint32_t(entry_.token), 1);
     sync.unlock();
     return st == UnixStatus::Ok || st == UnixStatus::WouldBlock;      // (a counter that is full has been signalled)
+  }
+  bool gpu() const override { return gpu_copy_.get() != nullptr; }
+  bool sync_from_gpu() override {
+    if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
+    return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), false);
+  }
+  bool gpu_ready() override {
+    if (!entry_.object || !entry_.object->gpu_buffer) return true;
+    return entry_.object->gpu_buffer->gpu_idle();
+  }
+  bool timeline_value(uint64_t* out) override { return entry_.object && entry_.object->gpu_sync && entry_.object->gpu_sync->value(out); }
+  bool timeline_signal(uint64_t point) override { return entry_.object && entry_.object->gpu_sync && entry_.object->gpu_sync->signal(point); }
+  bool sync_to_gpu() override {
+    if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
+    return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), true);
   }
   uint64_t take_signals() override {
     if (!is_event()) return 0;
@@ -88,6 +113,7 @@ class KernelDescriptor final : public Descriptor {
   process::UnixInFlight entry_;
   process::BlockRef block_;
   uint64_t limit_;
+  UniquePointer<ByteBuffer> gpu_copy_;      // (a dmabuf) the CPU's copy of its pixels
 };
 
 // Every descriptor a protocol hands this transport was made by it (make_memory, make_event), so each is a KernelDescriptor.
@@ -116,6 +142,19 @@ Fd SocketServer::make_memory(uint64_t size, StringView name) {
   return Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), util::move(block));
 }
 
+Fd SocketServer::make_gpu_image(uint32_t width, uint32_t height, uint32_t* stride) {
+  *stride = 0;
+  if (!gpu_images_ || width == 0 || height == 0) return Fd();
+  process::UnixInFlight entry;
+  uint32_t pitch = 0;
+  if (!gpu_images_->make(width, height, &entry, &pitch)) return Fd();
+  if (entry.kind != process::DescriptorKind::File || !entry.object || !entry.object->gpu_buffer || pitch < uint64_t{width} * 4) return Fd();
+  Fd fd = adopt(util::move(entry));      // (a GPU image: its CPU copy, written and then synced to the image)
+  if (!fd || !fd->gpu() || fd->memory().size() < uint64_t{pitch} * height) return Fd();
+  *stride = pitch;
+  return fd;
+}
+
 Fd SocketServer::make_event() {
   uint32_t id = 0;
   if (sockets_.create_event(0, 0, false, &id) != UnixStatus::Ok) return Fd();
@@ -141,7 +180,8 @@ Fd SocketServer::adopt(process::UnixInFlight entry) {
   if (entry.kind == process::DescriptorKind::File && entry.object && entry.object->memory) block = entry.object->memory->block(&size);
   const uint64_t token = entry.token;
   const process::DescriptorKind kind = entry.kind;
-  Fd fd = Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), util::move(block), size);
+  const bool gpu = entry.kind == process::DescriptorKind::File && entry.object && entry.object->gpu_buffer;
+  Fd fd = Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), util::move(block), size, gpu ? &allocator_ : nullptr);
   if (!fd && token != 0) {      // (no memory for it: its use is let go here)
     if (kind == process::DescriptorKind::UnixSocket) sockets_.release(uint32_t(token));
     else process::descriptor_token_release(kind, token);

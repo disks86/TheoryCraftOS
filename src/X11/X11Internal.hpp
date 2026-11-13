@@ -26,6 +26,7 @@ struct Server::Client {
   explicit Client(allocators::IAllocator& allocator) : in(allocator), out(allocator) {}
   uint8_t index = 0;
   bool setup_done = false, big = false, closing = false, big_requests = false;
+  uint16_t xi_version = 0;      // the XInput version it agreed to (major << 8 | minor), 0: none yet
   uint16_t sequence = 0;
   uint64_t pid = 0;
   ByteBuffer in;       // bytes of a request not complete yet

@@ -95,10 +95,51 @@ bool encode_usb_midi_packet(uint8_t cable, uint8_t status, uint8_t data1, uint8_
   return true;
 }
 
-uint32_t decode_usb_midi_packets(ConstByteView data, UsbMidiReceiver receiver, void* context) {
+bool UsbMidiSysexReader::feed(const uint8_t packet[4], ConstByteView* out) {
+  const uint8_t cin = packet[0] & 0x0F;
+  if (cin < 0x4 || cin > 0x7) {      // (another kind of packet: a message being put together is broken)
+    building_ = false;
+    return false;
+  }
+  const uint32_t count = cin == 0x4 ? 3 : cin - 0x4;
+  for (uint32_t k = 0; k < count; ++k) {
+    const uint8_t b = packet[1 + k];
+    if (b == 0xF0) {      // (a start: a new message, whatever came before)
+      bytes_.clear();
+      building_ = true;
+      too_long_ = false;
+    } else if (!building_) {
+      return false;      // (not in a message: a single-byte system common packet with CIN 5, or a piece without its start)
+    } else if (b != 0xF7 && b >= 0x80) {
+      building_ = false;      // (a status byte inside: broken)
+      return false;
+    }
+    if (bytes_.size() >= kMaxBytes) too_long_ = true;
+    else if (!too_long_ && !bytes_.append(ConstByteView(&packet[1 + k], 1))) too_long_ = true;
+    if (b == 0xF7) {
+      building_ = false;
+      if (too_long_) return false;
+      *out = bytes_.view();
+      return k + 1 == count;      // (the end byte ends the packet too, as CIN 5..7 say)
+    }
+  }
+  if (cin != 0x4) building_ = false;      // (an end packet without F7: broken)
+  return false;
+}
+
+uint32_t decode_usb_midi_packets(ConstByteView data, UsbMidiReceiver receiver, void* context, UsbMidiSysexReader* sysex, UsbMidiSysexReceiver sysex_receiver) {
   uint32_t count = 0;
   for (uint64_t at = 0; at + 4 <= data.size(); at += 4) {
     const uint8_t cin = data[at] & 0x0F;
+    if (sysex) {
+      const uint8_t packet[4] = {data[at], data[at + 1], data[at + 2], data[at + 3]};
+      ConstByteView message;
+      if (sysex->feed(packet, &message)) {
+        if (sysex_receiver) sysex_receiver(context, message);
+        ++count;
+        continue;
+      }
+    }
     if (cin < 0x8 || cin > 0xE) continue;   // not a channel message
     const uint8_t status = data[at + 1];
     if ((status >> 4) != cin) continue;      // the packet contradicts itself

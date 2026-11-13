@@ -19,6 +19,8 @@
 // The desktop shell: a full-screen root window holding the desktop surface - where the window manager
 // stacks application windows - and a taskbar along the bottom with the Start button (its menu opens
 // upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "To-Do", "Paint", "Media Player", "3D Test",
+// then the Windows and Linux applications installed on the system as "Name (Windows)" / "Name (Linux)" (InstalledApps.hpp: their Start menu
+// shortcuts and desktop entries, looked for again each time the menu opens; one starts in a new Terminal window),
 // and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
@@ -39,8 +41,10 @@
 #include "Desktop/Graphics3DTest.hpp"
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
+#include "Desktop/VideoViewer.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/CalendarStore.hpp"
+#include "Desktop/AppManager.hpp"
 #include "Desktop/Todo.hpp"
 #include "Desktop/TodoStore.hpp"
 #include "Desktop/Notepad.hpp"
@@ -55,6 +59,7 @@
 #include "Desktop/SessionStore.hpp"
 #include "Desktop/Spreadsheet.hpp"
 #include "Desktop/Paint.hpp"
+#include "Desktop/InstalledApps.hpp"
 #include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
@@ -75,6 +80,7 @@
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
 #include "Hardware/Backlight/IBacklight.hpp"
+#include "Hardware/Pen/PenMouse.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
@@ -95,7 +101,7 @@ class Desktop {
  public:
   static constexpr int32_t kTaskbarHeight = 32;
   // What gui::Frame::app_kind() says about a program's windows.
-  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar, kAppTodo };
+  enum AppKind : uint8_t { kAppNone, kAppExplorer, kAppEditor, kAppPaint, kAppTerminal, kAppMedia, kAppSheet, kAppDatabase, kAppBrowser, kAppCalculator, kAppCalendar, kAppTodo, kAppAppManager };
 
   // The devices may be null (a machine without a mouse still shows the desktop).
   Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, hardware::IKeyboard* keyboard,
@@ -205,6 +211,9 @@ class Desktop {
   uint32_t database_query_count() const;
   // Where the web browser gets web pages from (nullptr: none, web addresses then say so). It must outlive the desktop.
   void set_page_loader(browser::IPageLoader* loader);
+  // How the App Manager reaches the network (main gives it the kernel's HTTP client, AppMan/HttpNetwork.hpp; nullptr: nothing can be installed). Must
+  // outlive the desktop.
+  void set_appman_network(appman::INetwork* network);
   browser::IPageLoader* page_loader() const { return page_loader_; }
   // Opens a web browser window: the first one is web_browser() (when that is closed), further ones are made as needed and go away when closed.
   WebBrowser* open_web_browser(gui::TabFrame* into = nullptr);
@@ -222,6 +231,10 @@ class Desktop {
   Notepad* open_text_editor(gui::TabFrame* into = nullptr);
   // Opens a calculator window: the first one is calculator() (when that is closed), further ones are made as needed and go away when closed.
   Calculator* open_calculator(gui::TabFrame* into = nullptr);
+  // The Video Viewer (its sources the kernel's: set_video_sources, which must outlive the desktop or be set back to null).
+  void open_video_viewer();
+  void set_video_sources(IVideoSources* sources) { video_viewer_.set_sources(sources); }
+  VideoViewer& video_viewer() { return video_viewer_; }
   Calculator& calculator() { return calculator_; }
   uint32_t calculator_count() const;
   // Opens a calendar window: the first one is calendar() (when that is closed), further ones are made as needed and go away when closed.
@@ -236,6 +249,9 @@ class Desktop {
   // Opens a to-do window: the first one is todo() (when that is closed), further ones are made as needed and go away when closed.
   Todo* open_todo(gui::TabFrame* into = nullptr);
   Todo& todo() { return todo_; }
+  // Opens the App Manager (the AppImage package manager; one window: a second call shows the one that is open).
+  AppManager* open_app_manager(gui::TabFrame* into = nullptr);
+  AppManager& app_manager() { return app_manager_; }
   uint32_t todo_count() const;
   // The to-do items, kept in /AppStore/Todo once set_file_system() has been called (before that, in memory only).
   TodoStore& todo_store() { return *todo_store_; }
@@ -250,6 +266,12 @@ class Desktop {
   Win32Windows& x11_windows() { return x11_windows_; }
   // The Wayland programs' windows and input (the kernel's compositor, src/Wayland/WaylandServer.hpp): the same frames and handling again. Null: none.
   void set_wayland_session(IWindowsSession* session) { wayland_windows_.set_session(session, &windows_); }
+  // The touchscreens: touches go to the programs' windows that take them (Wayland clients), the others move the pointer (the first finger the left button).
+  // Call before the input runs; the devices stop emulating a mouse themselves.
+  void set_touch(hardware::ITouch* touch);
+  // The pens: a pen over a program's window that reads pens (a Wayland client with a tablet seat) goes to it, else it moves the pointer. `emulation`, if
+  // given, is the mouse made of the same pens (hardware::PenMouse), which is turned off: the desktop does that itself. Call before the input runs.
+  void set_pens(hardware::IPen* pens, hardware::PenMouse* emulation);
   Win32Windows& wayland_windows() { return wayland_windows_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
@@ -354,6 +376,7 @@ class Desktop {
   static void on_calendar(void* self, gui::Control&);
   static void on_calendar_toast(void* self, gui::Control&);
   static void on_todo(void* self, gui::Control&);
+  static void on_app_manager(void* self, gui::Control&);
   static int64_t calendar_time(void* self);
   static void on_explorer_properties(void* self, gui::Control&);
   static void on_new_terminal(void* self, gui::Control&);
@@ -364,8 +387,11 @@ class Desktop {
   static void on_copy_finished(void* self, gui::Control&);
   static void on_extra_closed(void* self, gui::Control&);
   static void on_computer_manager(void* self, gui::Control&);
+  static void on_video_viewer(void* self, gui::Control&);
   static void tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers);
   static void tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y);
+  static bool tap_touch(void* self, const hardware::TouchEvent& event, int32_t x, int32_t y);
+  static bool tap_pen(void* self, const hardware::PenEvent& event, int32_t x, int32_t y);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);
@@ -377,6 +403,25 @@ class Desktop {
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
+
+  // --- the installed Windows and Linux applications in the Start menu
+  // One per application listed since the desktop started. An entry is never freed or reused while the desktop lives (an application that
+  // goes away only loses its menu item), so a click on it that is still queued when the menu changes finds valid memory and does nothing.
+  struct InstalledEntry {
+    InstalledEntry(allocators::IAllocator& allocator, Desktop* owner) : desktop(owner), app(allocator) {}
+    Desktop* desktop;
+    InstalledApp app;
+    gui::MenuItem* item = nullptr;   // nullptr while it is not in the menu
+  };
+  // Looks for the installed applications on a thread of its own (again once it is done, if asked while it runs).
+  void request_app_scan();
+  // Puts the last scan into the menu, if there is one and the menu is closed. Under the window lock.
+  void apply_scanned_apps();
+  static void scan_apps_work(void* self);
+  static void on_apps_scanned(void* self, gui::Control&);
+  static void on_start_opening(void* self, gui::Control&);
+  static void on_start_closed(void* self, gui::Control&);
+  static void on_installed_app(void* self, gui::Control&);   // self: the InstalledEntry
 
   // Windows beyond the first of their kind (the members below): made when asked for, destroyed from pump() once they are closed.
   template <class T>
@@ -429,6 +474,7 @@ class Desktop {
   PrintDialog print_dialog_;
   FileExplorer explorer_;
   ComputerManager computer_manager_;
+  VideoViewer video_viewer_;
   Win32Windows win32_windows_;
   Win32Windows x11_windows_;      // (the X server's windows: see set_x11_session)
   Win32Windows wayland_windows_;  // (the Wayland compositor's windows: see set_wayland_session)
@@ -452,6 +498,8 @@ class Desktop {
   Calendar calendar_;
   UniquePointer<TodoStore> todo_store_;   // (before the to-do windows, which show it)
   Todo todo_;
+  appman::INetwork* appman_network_ = nullptr;
+  AppManager app_manager_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;
   gui::MessageDialog display_confirm_dialog_;   // "keep these display settings?"
@@ -491,6 +539,13 @@ class Desktop {
   List<UniquePointer<Calendar>> extra_calendars_;
   List<UniquePointer<Todo>> extra_todos_;
   List<UniquePointer<gui::TabFrame>> hosts_;   // the tabbed windows
+  List<UniquePointer<InstalledEntry>> installed_apps_;
+  List<InstalledEntry*> listed_apps_;        // the ones in the menu now, in menu order
+  List<InstalledApp> scanned_apps_;          // what the last scan found, until it is in the menu (only the scan thread touches it while one runs)
+  filesystem::IFileSystem* scan_fs_ = nullptr;
+  gui::MenuItem* about_item_ = nullptr;      // the installed applications go just before it,
+  gui::MenuItem* apps_separator_ = nullptr;  // after a separator of their own
+  bool scan_running_ = false, scan_again_ = false, scan_ready_ = false;
   bool reap_needed_ = false;
   hardware::SystemMonitors* monitors_ = nullptr;
   DisplayChanger changer_ = nullptr;

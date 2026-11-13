@@ -137,7 +137,7 @@ struct Client {
     p.big = big;
     if (out.size() < 32) return p;
     size_t size = 32;
-    if (out[0] == 1) {
+    if (out[0] == 1 || (out[0] & 0x7F) == 35) {      // (a reply, or a GenericEvent: longer than 32 bytes)
       Packet h{std::vector<uint8_t>(out.begin(), out.begin() + 8), big};
       size += size_t(h.u32(4)) * 4;
     }
@@ -376,6 +376,29 @@ static void test_window_manager_hints() {
   c.send(ev.done());
   uint32_t edge = 0;
   CHECK(s.take_drag(&edge) == dialog && edge == 9);
+  // _GTK_SHOW_WINDOW_MENU (GTK's own title bar): the desktop opens the window menu there, in the window's coordinates; it is in _NET_SUPPORTED
+  const uint32_t show_menu = c.intern("_GTK_SHOW_WINDOW_MENU");
+  {
+    c.drain();
+    c.send(Request(true, 20, 0).u32(kRoot).u32(c.intern("_NET_SUPPORTED")).u32(0).u32(0).u32(1000).done());
+    Packet sp = c.reply();
+    bool listed = false;
+    for (uint32_t i = 0; sp.b.size() >= 32 && i < sp.u32(16) && 32 + 4 * i + 4 <= sp.b.size(); ++i) listed |= sp.u32(32 + 4 * i) == show_menu;
+    CHECK(listed);
+  }
+  {
+    desktop::WindowsWindowInfo di;
+    String dt(A);
+    CHECK(s.window_info(dialog, &di, &dt));
+    int32_t mx = 0, my = 0;
+    CHECK(s.take_window_menu(&mx, &my) == 0);
+    Request m(true, 25, 0);
+    m.u32(kRoot).u32((1u << 19) | (1u << 20));
+    m.u8(33).u8(32).u16(0).u32(dialog).u32(show_menu).u32(2).u32(uint32_t(di.surface.x + 25)).u32(uint32_t(di.surface.y + 9)).u32(0).u32(0);
+    c.send(m.done());
+    CHECK(s.take_window_menu(&mx, &my) == dialog && mx == 25 && my == 9);
+    if (mx != 25 || my != 9) printf("menu at %d,%d\n", mx, my);
+  }
   // _NET_WM_STATE add maximized (EWMH client message)
   const uint32_t state = c.intern("_NET_WM_STATE"), vert = c.intern("_NET_WM_STATE_MAXIMIZED_VERT"), horz = c.intern("_NET_WM_STATE_MAXIMIZED_HORZ");
   Request st(true, 25, 0);
@@ -387,6 +410,398 @@ static void test_window_manager_hints() {
   c.send(Request(true, 2).u32(kRoot).u32(0x800).u32(1u << 20).done());
   Packet p = c.reply();
   CHECK(p.b.size() == 32 && p.b[0] == 0 && p.b[1] == 10);
+}
+
+// Docks and struts: a dock goes in the top band with no taskbar button and keeps the space its strut asks for (counted from the edge of the desktop's panel
+// area, so what the taskbar already covers is not kept twice); a partial strut whose range misses the monitor keeps nothing; a desktop window goes below
+// everything.
+static void test_struts() {
+  Server s(A);
+  s.attach(6, 19);
+  // two monitors side by side; the first has a 40-pixel taskbar along its bottom
+  const Server::Monitor monitors[2] = {{{0, 0, 1280, 800}, {0, 0, 1280, 760}, {0, 0, 1280, 760}}, {{1280, 0, 1024, 768}, {1280, 0, 1024, 768}, {}}};
+  s.set_display(2304, 800, ArrayView<const Server::Monitor>(monitors, 2));
+  Client c(s, true);
+  CHECK(c.setup());
+  const uint32_t type = c.intern("_NET_WM_WINDOW_TYPE"), dock = c.intern("_NET_WM_WINDOW_TYPE_DOCK"), backdrop = c.intern("_NET_WM_WINDOW_TYPE_DESKTOP");
+  const uint32_t strut = c.intern("_NET_WM_STRUT"), partial = c.intern("_NET_WM_STRUT_PARTIAL");
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  // a top panel on the first monitor
+  const uint32_t top = c.create_window(kRoot, 0, 0, 1280, 30, kStructure);
+  c.change_property(top, type, 4 /* ATOM */, 32, {dock});
+  c.change_property(top, partial, 6 /* CARDINAL */, 32, {0, 0, 30, 0, 0, 0, 0, 0, 0, 1279, 0, 0});
+  c.send(Request(true, 8).u32(top).done());
+  CHECK(s.window_info(top, &info, &title));
+  CHECK(info.layer == 1 && info.tool && !info.caption && info.reserve_edge == 2 && info.reserve == 30);
+  CHECK(info.window.x == 0 && info.window.y == 0 && info.window.width == 1280);
+  // a bottom dock 50 high along the taskbar's edge: only the 10 pixels past the taskbar are kept
+  const uint32_t bottom = c.create_window(kRoot, 0, 750, 1280, 50, kStructure);
+  c.change_property(bottom, type, 4, 32, {dock});
+  c.change_property(bottom, strut, 6, 32, {0, 0, 0, 50});
+  c.send(Request(true, 8).u32(bottom).done());
+  CHECK(s.window_info(bottom, &info, &title) && info.reserve_edge == 4 && info.reserve == 10);
+  // the strut changes: the desktop hears about it
+  List<uint32_t> changed(A);
+  List<desktop::IWindowsSession::Repaint> repainted(A);
+  s.take_changes(&changed, &repainted);
+  c.change_property(bottom, strut, 6, 32, {0, 0, 0, 0});
+  c.drain();
+  s.take_changes(&changed, &repainted);
+  bool saw = false;
+  for (uint32_t id : changed.view()) saw |= id == bottom;
+  CHECK(saw);
+  CHECK(s.window_info(bottom, &info, &title) && info.reserve_edge == 0 && info.reserve == 0);
+  // a left panel on the second monitor: its left edge is 1280 pixels from the screen's, so a strut of 1280 + 48 keeps 48
+  const uint32_t left = c.create_window(kRoot, 1280, 0, 48, 768, kStructure);
+  c.change_property(left, type, 4, 32, {dock});
+  c.change_property(left, partial, 6, 32, {1328, 0, 0, 0, 0, 767, 0, 0, 0, 0, 0, 0});
+  c.send(Request(true, 8).u32(left).done());
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 1 && info.reserve == 48);
+  // a partial strut whose range is off the monitor keeps nothing
+  c.change_property(left, partial, 6, 32, {1328, 0, 0, 0, 900, 1000, 0, 0, 0, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  // a short or wrongly typed strut is ignored, as is a huge one
+  c.change_property(left, partial, 6, 32, {1328, 0});
+  c.change_property(left, strut, 6, 32, {0xFFFFFFFFu, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  c.change_property(left, strut, 6, 8, {48, 0, 0, 0});
+  CHECK(s.window_info(left, &info, &title) && info.reserve_edge == 0);
+  // a desktop window: the background band
+  const uint32_t desk = c.create_window(kRoot, 0, 0, 1280, 800, kStructure);
+  c.change_property(desk, type, 4, 32, {backdrop});
+  c.send(Request(true, 8).u32(desk).done());
+  CHECK(s.window_info(desk, &info, &title) && info.layer == -2 && info.tool && !info.caption && info.reserve_edge == 0);
+  // an ordinary window stays in the normal band, keeping nothing
+  const uint32_t plain = c.create_window(kRoot, 10, 10, 100, 100, kStructure);
+  c.send(Request(true, 8).u32(plain).done());
+  CHECK(s.window_info(plain, &info, &title) && info.layer == 0 && !info.tool && info.reserve_edge == 0);
+}
+
+// XDND with the desktop (X11DragAndDrop.cpp): the desktop's file dragged onto a client that has XdndAware, and a client's drag let go over the desktop.
+// All the client's events of one type (ClientMessages of one message type when `message` is not 0), in order; the others are dropped.
+static std::vector<Packet> events_of(Client& c, uint8_t code, uint32_t message = 0) {
+  std::vector<Packet> out;
+  for (;;) {
+    Packet p = c.next_packet();
+    if (p.b.empty()) return out;
+    if ((p.b[0] & 0x7F) == code && (message == 0 || p.u32(8) == message)) out.push_back(p);
+  }
+}
+static void client_message(Client& c, uint32_t destination, uint32_t window, uint32_t type, std::vector<uint32_t> data) {
+  data.resize(5, 0);
+  Request r(c.big, 25, 0);
+  r.u32(destination).u32(0).u8(33).u8(32).u16(0).u32(window).u32(type);
+  for (uint32_t d : data) r.u32(d);
+  c.send(r.done());
+}
+static std::string property_text(Client& c, uint32_t window, uint32_t property) {
+  c.drain();
+  c.send(Request(c.big, 20, 0).u32(window).u32(property).u32(0).u32(0).u32(100000).done());
+  Packet p = c.reply();
+  if (p.b.size() < 32 || p.b[0] != 1) return "<error>";
+  const uint32_t n = p.u32(16) * (p.b[1] / 8);      // (the length is in units of the format)
+  if (p.b.size() < 32 + size_t(n)) return "<short>";
+  return std::string(p.b.begin() + 32, p.b.begin() + 32 + n);
+}
+
+static void test_xdnd() {
+  Server s(A);
+  s.attach(6, 19);
+  const Server::Monitor monitors[1] = {{{0, 0, 1024, 768}, {0, 0, 1024, 728}, {0, 0, 1024, 728}}};
+  s.set_display(1024, 768, ArrayView<const Server::Monitor>(monitors, 1));
+  Client c(s, false);
+  CHECK(c.setup());
+  const uint32_t aware = c.intern("XdndAware"), enter = c.intern("XdndEnter"), position = c.intern("XdndPosition"), status = c.intern("XdndStatus");
+  const uint32_t leave = c.intern("XdndLeave"), drop = c.intern("XdndDrop"), finished = c.intern("XdndFinished"), selection = c.intern("XdndSelection");
+  const uint32_t copy = c.intern("XdndActionCopy"), type_list = c.intern("XdndTypeList"), uri_list = c.intern("text/uri-list");
+  const uint32_t utf8 = c.intern("UTF8_STRING"), targets = c.intern("TARGETS"), mine = c.intern("MY_DROP");
+  // the root says it takes drops (the desktop's)
+  CHECK(property_text(c, kRoot, aware).size() == 4);
+  const uint32_t w = c.create_window(kRoot, 100, 100, 300, 200, kStructure);
+  c.change_property(w, 68 /* WM_TRANSIENT_FOR: none */, 33, 32, {});
+  c.send(Request(false, 8).u32(w).done());
+  c.drain();
+  // --- the desktop's drag into the client
+  CHECK(!s.desktop_drag(w, 150, 120, "/Desktop/Documents/a b.txt"));      // (no XdndAware: nothing sent)
+  CHECK(events_of(c, 33).empty());
+  c.change_property(w, aware, 4 /* ATOM */, 32, {5});
+  c.drain();
+  CHECK(!s.desktop_drag(w, 150, 120, "/Desktop/Documents/a b.txt"));
+  std::vector<Packet> got = events_of(c, 33);
+  CHECK(got.size() == 2 && got[0].u32(8) == enter && got[1].u32(8) == position);
+  if (got.size() < 2) return;
+  const uint32_t source = got[0].u32(12);
+  CHECK(got[0].u32(4) == w && (got[0].u32(16) >> 24) == 5 && (got[0].u32(16) & 1) && got[0].u32(20) == uri_list);
+  CHECK(got[1].u32(12) == source && got[1].u32(20) == ((150u << 16) | 120u) && got[1].u32(28) == copy);
+  CHECK(property_text(c, source, type_list).size() == 16);      // (four types)
+  // the next position waits for the status
+  CHECK(!s.desktop_drag(w, 160, 125, "/Desktop/Documents/a b.txt"));
+  CHECK(events_of(c, 33).empty());
+  client_message(c, source, source, status, {w, 1 | 2, 0, 0, copy});
+  got = events_of(c, 33, position);
+  CHECK(got.size() == 1 && got[0].u32(20) == ((160u << 16) | 125u));
+  CHECK(s.desktop_drag(w, 160, 125, "/Desktop/Documents/a b.txt"));      // (accepted)
+  client_message(c, source, source, status, {w, 1, 0, 0, copy});
+  // dropped: the client asks for the data, which the server writes itself
+  CHECK(s.desktop_drop());
+  CHECK(events_of(c, 33, drop).size() == 1);
+  auto convert = [&](uint32_t target) {
+    c.send(Request(false, 24).u32(w).u32(selection).u32(target).u32(mine).u32(0).done());
+    std::vector<Packet> n = events_of(c, 31);
+    if (n.size() != 1 || n[0].u32(20) != mine) return std::string("<refused>");
+    return property_text(c, w, mine);
+  };
+  CHECK(convert(uri_list) == "file:///mnt/desktop/Documents/a%20b.txt\r\n");
+  CHECK(convert(utf8) == "/mnt/desktop/Documents/a b.txt");
+  CHECK(convert(targets).size() == 20);
+  CHECK(convert(c.intern("image/png")) == "<refused>");
+  client_message(c, source, source, finished, {w, 1, copy});
+  CHECK(convert(utf8) == "<refused>");      // (over: the server no longer owns XdndSelection)
+  // text: no URI list; ended by the desktop: left
+  CHECK(!s.desktop_drag(w, 150, 120, "hello"));
+  got = events_of(c, 33, enter);
+  CHECK(got.size() == 1 && !(got[0].u32(16) & 1) && got[0].u32(20) != uri_list);
+  s.desktop_drag_end();
+  CHECK(events_of(c, 33, leave).size() == 1);
+  // not accepted: the drop is refused, the client left
+  CHECK(!s.desktop_drag(w, 150, 120, "/Linux/x"));
+  c.drain();
+  CHECK(!s.desktop_drop());
+  CHECK(!s.desktop_drag(0, 0, 0, StringView()));
+  c.drain();
+
+  // --- the client's drag over the desktop
+  auto own = [&]() { c.send(Request(false, 22).u32(w).u32(selection).u32(0).done()); };
+  auto serve = [&](const std::string& data) {      // the SelectionRequest the server sent, answered
+    std::vector<Packet> req = events_of(c, 30);
+    if (req.size() != 1) return false;
+    const uint32_t requestor = req[0].u32(12), target = req[0].u32(20), property = req[0].u32(24);
+    c.change_string(requestor, property, target, data);
+    Request n(false, 25, 0);
+    n.u32(requestor).u32(0).u8(31).u8(0).u16(0).u32(0).u32(requestor).u32(selection).u32(target).u32(property).u32(0).u32(0);
+    c.send(n.done());
+    return true;
+  };
+  own();
+  client_message(c, kRoot, kRoot, enter, {w, 5u << 24, uri_list, 0, 0});
+  CHECK(serve("file:///mnt/desktop/Documents/a%20b.txt\r\nfile:///etc/hosts\r\n"));
+  String items(A);
+  int32_t x = 0, y = 0;
+  CHECK(!s.program_drag(&items, &x, &y) || true);
+  client_message(c, kRoot, kRoot, position, {w, 0, (600u << 16) | 400u, 0, copy});
+  got = events_of(c, 33, status);
+  CHECK(!got.empty() && got.back().u32(4) == w && got.back().u32(12) == kRoot && !(got.back().u32(16) & 1));      // (the desktop has not said yet)
+  CHECK(s.program_drag(&items, &x, &y) && x == 600 && y == 400 && items.view() == StringView("/Desktop/Documents/a b.txt\n/Linux/etc/hosts"));
+  s.program_drag_answer(true);
+  got = events_of(c, 33, status);
+  CHECK(got.size() == 1 && (got[0].u32(16) & 1) && got[0].u32(28) == copy);
+  s.program_drag_answer(true);
+  CHECK(events_of(c, 33, status).empty());      // (told once)
+  client_message(c, kRoot, kRoot, drop, {w, 0, 0});
+  CHECK(!s.program_drag(&items, &x, &y));
+  CHECK(s.take_program_drop(&items, &x, &y) && x == 600 && items.view() == StringView("/Desktop/Documents/a b.txt\n/Linux/etc/hosts"));
+  CHECK(!s.take_program_drop(&items, &x, &y));
+  s.program_drop_done(true);
+  got = events_of(c, 33, finished);
+  CHECK(got.size() == 1 && got[0].u32(12) == kRoot && got[0].u32(16) == 1 && got[0].u32(20) == copy);
+  // more than three types (XdndTypeList), text; let go before the data came; not taken
+  c.change_property(w, type_list, 4, 32, {c.intern("image/png"), c.intern("text/html"), c.intern("text/x-moz-url"), utf8});
+  client_message(c, kRoot, kRoot, enter, {w, (5u << 24) | 1, 0, 0, 0});
+  client_message(c, kRoot, kRoot, position, {w, 0, (10u << 16) | 20u, 0, copy});
+  client_message(c, kRoot, kRoot, drop, {w, 0, 0});
+  CHECK(!s.take_program_drop(&items, &x, &y));      // (not read yet)
+  CHECK(serve("two\nlines"));
+  CHECK(s.take_program_drop(&items, &x, &y) && items.view() == StringView("two lines") && x == 10 && y == 20);
+  s.program_drop_done(false);
+  got = events_of(c, 33, finished);
+  CHECK(got.size() == 1 && got[0].u32(16) == 0);
+  // nothing the desktop takes: never accepted, a drop finishes refused; a leave ends it
+  client_message(c, kRoot, kRoot, enter, {w, 5u << 24, c.intern("image/png"), 0, 0});
+  CHECK(events_of(c, 30).empty());
+  client_message(c, kRoot, kRoot, drop, {w, 0, 0});
+  got = events_of(c, 33, finished);
+  CHECK(got.size() == 1 && got[0].u32(16) == 0);
+  client_message(c, kRoot, kRoot, enter, {w, 5u << 24, uri_list, 0, 0});
+  CHECK(serve("https://example.com/\r\n"));
+  CHECK(!s.program_drag(&items, &x, &y));      // (no files in it)
+  client_message(c, kRoot, kRoot, leave, {w});
+  client_message(c, kRoot, kRoot, drop, {w, 0, 0});      // (after the leave: not this drag any more)
+  CHECK(!s.take_program_drop(&items, &x, &y));
+  // a refused conversion; the client going in the middle of its drag
+  client_message(c, kRoot, kRoot, enter, {w, 5u << 24, utf8, 0, 0});
+  {
+    std::vector<Packet> req = events_of(c, 30);
+    CHECK(req.size() == 1);
+    if (!req.empty()) {
+      Request n(false, 25, 0);
+      n.u32(req[0].u32(12)).u32(0).u8(31).u8(0).u16(0).u32(0).u32(req[0].u32(12)).u32(selection).u32(req[0].u32(20)).u32(0).u32(0).u32(0);
+      c.send(n.done());
+    }
+  }
+  CHECK(!s.program_drag(&items, &x, &y));
+  // fuzzed XDND messages to the root and the server's window: never a crash
+  std::mt19937 rng(11);
+  const uint32_t kinds[] = {enter, position, status, leave, drop, finished};
+  for (int i = 0; i < 2000; ++i) {
+    const uint32_t to = (rng() & 1) ? kRoot : source;
+    std::vector<uint32_t> d = {(rng() & 3) ? w : uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), uint32_t(rng() & 7) ? uri_list : uint32_t(rng()), uint32_t(rng())};
+    client_message(c, to, to, kinds[rng() % 6], d);
+    if ((rng() & 15) == 0) s.program_drag_answer(rng() & 1);
+    if ((rng() & 15) == 0) s.desktop_drag(w, int32_t(rng() % 1024), int32_t(rng() % 768), "/Desktop/x");
+    if ((rng() & 31) == 0) s.desktop_drop();
+    if ((rng() & 31) == 0 && s.take_program_drop(&items, &x, &y)) s.program_drop_done(rng() & 1);
+    if ((rng() & 63) == 0) serve("file:///x\r\n");
+    c.drain();
+  }
+  // a second client's drag torn down when it goes
+  Client d2(s, false);
+  CHECK(d2.setup());
+  const uint32_t w2 = d2.create_window(kRoot, 0, 0, 50, 50, 0);
+  d2.send(Request(false, 22).u32(w2).u32(selection).u32(0).done());
+  client_message(d2, kRoot, kRoot, enter, {w2, 5u << 24, utf8, 0, 0});
+  s.close_client(d2.id);
+  CHECK(!s.program_drag(&items, &x, &y) && !s.take_program_drop(&items, &x, &y));
+}
+
+// XInput 2.2 touches (X11Input2.cpp): the version handshake, the devices, selections, and a finger delivered as TouchBegin / Update / End to the window
+// that selected them (and refused where none did), in both byte orders.
+static void xi_touch_session(bool big) {
+  Server s(A);
+  s.attach(6, 19);
+  const Server::Monitor monitors[1] = {{{0, 0, 1024, 768}, {0, 0, 1024, 728}, {0, 0, 1024, 728}}};
+  s.set_display(1024, 768, ArrayView<const Server::Monitor>(monitors, 1));
+  Client c(s, big);
+  CHECK(c.setup());
+  // QueryExtension and ListExtensions
+  c.send(Request(big, 98).u16(15).u16(0).str("XInputExtension").done());
+  Packet p = c.reply();
+  CHECK(p.b.size() >= 32 && p.b[8] == 1);
+  const uint8_t xi = p.b.size() >= 32 ? p.b[9] : 0;
+  CHECK(xi >= 128);
+  c.send(Request(big, 99).done());
+  p = c.reply();
+  CHECK(p.b.size() > 32 && p.b[1] == 2 && std::string(p.b.begin() + 32, p.b.end()).find("XInputExtension") != std::string::npos);
+  // GetExtensionVersion (XI 1) and XIQueryVersion
+  c.send(Request(big, xi, 1).u16(15).u16(0).str("XInputExtension").done());
+  p = c.reply();
+  CHECK(p.b.size() == 32 && p.b[1] == 1 && p.u16(8) == 2 && p.u16(10) == 2 && p.b[12] == 1);
+  c.send(Request(big, xi, 47).u16(2).u16(4).done());
+  p = c.reply();
+  CHECK(p.b.size() == 32 && p.b[1] == 47 && p.u16(8) == 2 && p.u16(10) == 2);
+  c.send(Request(big, xi, 47).u16(1).u16(5).done());
+  p = c.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 2);      // (BadValue: XI 1 is not XI2)
+  // XIQueryDevice: three devices, the touchscreen a slave of the pointer with a direct touch class
+  c.send(Request(big, xi, 48).u16(0).u16(0).done());
+  p = c.reply();
+  CHECK(p.b.size() > 32 && p.u16(8) == 3);
+  bool touch_class = false;
+  {
+    size_t at = 32;
+    for (uint16_t d = 0; d < 3 && at + 12 <= p.b.size(); ++d) {
+      const uint16_t id = p.u16(at), use = p.u16(at + 2), classes = p.u16(at + 6), name = p.u16(at + 8);
+      at += 12 + ((name + 3) & ~3u);
+      for (uint16_t k = 0; k < classes && at + 4 <= p.b.size(); ++k) {
+        const uint16_t type = p.u16(at), words = p.u16(at + 2);
+        if (id == 4 && use == 3 && type == 8 && p.b[at + 6] == 1 && p.b[at + 7] == 10) touch_class = true;
+        at += size_t(words) * 4;
+        if (words == 0) break;
+      }
+    }
+    CHECK(at == p.b.size());
+  }
+  CHECK(touch_class);
+  c.send(Request(big, xi, 48).u16(9).u16(0).done());
+  CHECK(c.reply().b[0] == 0);
+  // a window with a child; touches selected on the parent for all master devices
+  const uint32_t w = c.create_window(kRoot, 100, 100, 300, 200, kStructure);
+  const uint32_t child = c.create_window(w, 20, 30, 100, 80, 0);
+  c.send(Request(big, 8).u32(w).done());
+  c.send(Request(big, 8).u32(child).done());
+  c.drain();
+  const uint32_t touch_bits = (1u << 18) | (1u << 19) | (1u << 20);
+  auto select = [&](Client& who, uint32_t window, uint16_t device, uint32_t bits) {
+    who.send(Request(big, xi, 46).u32(window).u16(1).u16(0).u16(device).u16(1).u8(uint8_t(bits)).u8(uint8_t(bits >> 8)).u8(uint8_t(bits >> 16))
+                 .u8(uint8_t(bits >> 24)).done());
+  };
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(s.window_info(w, &info, &title));
+  const int32_t cx = info.surface.x + 40, cy = info.surface.y + 50;      // (on the child)
+  CHECK(!s.touch(hardware::TouchPhase::Down, 7, w, cx, cy));      // (nothing selected: the desktop's pointer)
+  select(c, w, 0, 1u << 18);
+  p = c.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 2);      // (TouchBegin without the other two: BadValue)
+  select(c, w, 1, touch_bits);
+  c.send(Request(big, xi, 60).u32(w).done());
+  p = c.reply();
+  CHECK(p.b.size() == 40 && p.u16(8) == 1 && p.u16(32) == 1 && p.u16(34) == 1 && p.b[36] == 0 && p.b[37] == 0 && p.b[38] == 0x1C && p.b[39] == 0);
+  // the finger: TouchBegin, TouchUpdate, TouchEnd to w, coordinates in it, its own touch id
+  CHECK(s.touch(hardware::TouchPhase::Down, 7, w, cx, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.b[1] == xi && p.u32(4) == 12 && p.u16(8) == 18 && p.u16(10) == 2 && p.u32(24) == w && p.u32(20) == kRoot);
+  if (p.b.size() < 80) return;
+  const uint32_t touch_id = p.u32(16);
+  CHECK(touch_id != 0 && p.u32(32) == uint32_t(cx) * 65536 && p.u32(40) == uint32_t(cx - info.surface.x) * 65536 && p.u32(44) == uint32_t(cy - info.surface.y) * 65536);
+  CHECK(p.u16(52) == 4);      // sourceid: the touchscreen
+  CHECK(s.touch(hardware::TouchPhase::Motion, 7, 0, cx + 5, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 19 && p.u32(16) == touch_id && p.u32(32) == uint32_t(cx + 5) * 65536);
+  // a second finger at the same time: its own id
+  CHECK(s.touch(hardware::TouchPhase::Down, 8, w, cx + 50, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 18 && p.u32(16) != touch_id);
+  CHECK(s.touch(hardware::TouchPhase::Cancel, 8, 0, cx + 50, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 20);
+  CHECK(s.touch(hardware::TouchPhase::Up, 7, 0, cx + 5, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 20 && p.u32(16) == touch_id);
+  CHECK(!s.touch(hardware::TouchPhase::Motion, 7, 0, cx, cy));      // (ended)
+  CHECK(!s.touch(hardware::TouchPhase::Down, 9, w, 5, 5));          // (not over a window that selected)
+  // another client may not select touches of the same device on that window; on its own window it may, and the deepest window wins
+  Client c2(s, !big);
+  CHECK(c2.setup());
+  c2.send(Request(!big, xi, 47).u16(2).u16(2).done());
+  c2.reply();
+  c2.send(Request(!big, xi, 46).u32(w).u16(1).u16(0).u16(1).u16(1).u8(0).u8(0).u8(0x1C).u8(0).done());
+  p = c2.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 10);      // BadAccess
+  c2.send(Request(!big, xi, 46).u32(child).u16(1).u16(0).u16(0).u16(1).u8(0).u8(0).u8(0x1C).u8(0).done());
+  c2.drain();
+  CHECK(s.touch(hardware::TouchPhase::Down, 10, w, cx, cy));
+  p = c2.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 18 && p.u32(24) == child);
+  CHECK(c.event(35).b.empty());
+  // the client going with its finger down: the rest of it is nobody's
+  c2.send(Request(!big, xi, 60).u32(child).done());
+  c2.reply();
+  s.close_client(c2.id);
+  c2.id = 0;
+  CHECK(!s.touch(hardware::TouchPhase::Motion, 10, 0, cx, cy) || true);
+  CHECK(s.touch(hardware::TouchPhase::Down, 11, w, cx, cy));      // (its selection on the child went: w's again)
+  CHECK(c.event(35).b.size() == 80);
+  s.touch(hardware::TouchPhase::Up, 11, 0, cx, cy);
+  // deselecting (an empty mask) stops it
+  select(c, w, 1, 0);
+  c.drain();
+  CHECK(!s.touch(hardware::TouchPhase::Down, 12, w, cx, cy));
+  // malformed XI requests: errors, never a crash
+  std::mt19937 rng(big ? 5 : 6);
+  for (int i = 0; i < 3000; ++i) {
+    Request r(big, xi, uint8_t(rng() % 64));
+    const int n = int(rng() % 24);
+    for (int k = 0; k < n; ++k) r.u8(uint8_t(rng()));
+    c.send(r.done());
+    if ((i & 63) == 0) c.drain();
+  }
+  c.drain();
+  CHECK(!c.closing);
+}
+static void test_xinput2() {
+  xi_touch_session(false);
+  xi_touch_session(true);
 }
 
 static void test_drawing() {
@@ -928,6 +1343,9 @@ int main() {
   test_setup();
   test_windows_and_properties();
   test_window_manager_hints();
+  test_struts();
+  test_xdnd();
+  test_xinput2();
   test_drawing();
   test_input();
   test_errors();

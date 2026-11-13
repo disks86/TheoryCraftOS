@@ -20,10 +20,14 @@
 // layer made with /dev/dxg, Process/DxgBufferFile.hpp). The desktop draws one in place (draw_tree), so a client that renders on the GPU shows its frames with
 // no copy through the CPU.
 //
-// What is taken: one plane (every format offered has one), offset 0 and the image's own row pitch, the linear layout (DRM_FORMAT_MOD_LINEAR, or
-// DRM_FORMAT_MOD_INVALID: "the driver's choice", which here is linear), no flags (y-inverted and interlaced pictures are refused), and a size no larger than the
-// image. The four formats are ARGB8888, XRGB8888, ABGR8888 and XBGR8888: the format says whether the alpha counts; the order of the channels is the image's own
-// (the Direct3D layer knows it), so a client's swizzle never shows.
+// What is taken: one plane, offset 0 and the image's own row pitch, the linear layout (DRM_FORMAT_MOD_LINEAR, or DRM_FORMAT_MOD_INVALID: "the driver's
+// choice", which here is linear), no flags (y-inverted and interlaced pictures are refused), and a size no larger than the image. The four formats are
+// ARGB8888, XRGB8888, ABGR8888 and XBGR8888: the format says whether the alpha counts; the order of the channels is the image's own (the Direct3D layer knows
+// it), so a client's swizzle never shows.
+//
+// YUV (WaylandYuv.hpp: NV12, P010, YUV420, YUYV and the rest): two or three planes (one for the packed formats), each a file in memory (a memfd, or anything
+// else the client can map: not a GPU image), linear, at any offset and stride that hold the plane. The planes are read and converted to RGB on the CPU at each
+// commit of the buffer (the Direct3D layer has no YUV images to draw in place).
 //
 // Feedback (version 4): one tranche, the four formats, linear, on the main device: /dev/dxg's number (Process/DxgDevice.h), the one device a client makes its
 // buffers on here. The format table is a sealed file in memory of 16-byte entries (format, padding, modifier), the same for every client. Surface feedback is
@@ -55,16 +59,27 @@ bool shm_format_of(uint32_t drm, uint32_t* shm) {
 }
 
 constexpr uint32_t kMaxPlanes = 4;      // (what the protocol allows)
-constexpr uint32_t kTableFormats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
+constexpr uint32_t kRgbFormats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
+constexpr uint32_t kMaxTableFormats = 32;
+
+// Every format importable: the RGB ones, then YUV. Returns how many went to `out`.
+uint32_t table_formats(uint32_t (&out)[kMaxTableFormats]) {
+  uint32_t n = 0;
+  for (uint32_t f : kRgbFormats) out[n++] = f;
+  for (uint32_t f : yuv_formats()) if (n < kMaxTableFormats) out[n++] = f;
+  return n;
+}
 
 }  // namespace
 
 Fd Server::format_table_fd() {
   if (format_table_ || !make_fd_) return format_table_;
-  uint8_t table[sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 16] = {};
+  uint32_t formats[kMaxTableFormats];
+  const uint32_t count = table_formats(formats);
+  uint8_t table[kMaxTableFormats * 16] = {};
   ByteWriter out{ByteView(table, sizeof(table))};
-  for (uint32_t f : kTableFormats) out.le32(f), out.le32(0), out.le64(kDrmModLinear);
-  format_table_ = make_fd_(make_fd_context_, ConstByteView(table, sizeof(table)));
+  for (uint32_t i = 0; i < count; ++i) out.le32(formats[i]), out.le32(0), out.le64(kDrmModLinear);
+  format_table_ = make_fd_(make_fd_context_, ConstByteView(table, uint64_t{count} * 16));
   return format_table_;
 }
 
@@ -77,11 +92,13 @@ void Server::send_dmabuf_feedback(Client& c, uint32_t feedback) {
   uint8_t device[8];
   ByteWriter dev{ByteView(device, sizeof(device))};
   dev.le64(TCOS_DXG_DEVICE_NUMBER);      // (dev_t in the host's byte order: little-endian on every CPU here)
-  uint8_t indices[sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 2];
+  uint32_t all[kMaxTableFormats];
+  const uint32_t count = table_formats(all);
+  uint8_t indices[kMaxTableFormats * 2];
   ByteWriter idx{ByteView(indices, sizeof(indices))};
-  for (uint16_t i = 0; i < sizeof(kTableFormats) / sizeof(kTableFormats[0]); ++i) idx.le16(i);
+  for (uint16_t i = 0; i < count; ++i) idx.le16(i);
   Event t(feedback, 1);      // format_table(fd, size)
-  t.fd(table).u(uint32_t(sizeof(kTableFormats) / sizeof(kTableFormats[0]) * 16));
+  t.fd(table).u(count * 16);
   send(c, t);
   Event main(feedback, 2);      // main_device
   main.array(ConstByteView(device, sizeof(device)));
@@ -90,7 +107,7 @@ void Server::send_dmabuf_feedback(Client& c, uint32_t feedback) {
   target.array(ConstByteView(device, sizeof(device)));
   send(c, target);
   Event formats(feedback, 5);      // tranche_formats
-  formats.array(ConstByteView(indices, sizeof(indices)));
+  formats.array(ConstByteView(indices, uint64_t{count} * 2));
   send(c, formats);
   Event flags(feedback, 6);      // tranche_flags: none (not scanout)
   flags.u(0);
@@ -108,12 +125,14 @@ bool Server::make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, 
     return false;
   }
   p.used = true;
-  if (!p.plane) {
+  if (!p.planes[0]) {
     post_error(c, params_id, kParamsIncomplete, "plane 0 is missing");
     return false;
   }
   uint32_t shm_format = 0;
-  if (!shm_format_of(format, &shm_format)) {
+  YuvFormat yuv;
+  const bool is_yuv = yuv_format(format, &yuv);
+  if (!is_yuv && !shm_format_of(format, &shm_format)) {
     post_error(c, params_id, kParamsInvalidFormat, "unsupported format");
     return false;
   }
@@ -121,16 +140,24 @@ bool Server::make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, 
     post_error(c, params_id, kParamsInvalidDimensions, "invalid size");
     return false;
   }
+  const uint32_t planes = is_yuv ? yuv.planes : 1;
+  for (uint32_t i = 0; i < kMaxPlanes; ++i) {
+    if (bool(p.planes[i]) != (i < planes)) {
+      post_error(c, params_id, kParamsIncomplete, i < planes ? "a plane is missing" : "too many planes for the format");
+      return false;
+    }
+  }
+  if (is_yuv) return make_yuv_dmabuf(c, params_id, p, yuv, width, height, flags, immediate, out);
   // what is not a protocol error but cannot be shown: a descriptor that is no GPU image, another layout, flags
-  GpuImage* image = p.plane->gpu();
-  const bool layout_ok = p.modifier == kDrmModLinear || p.modifier == kDrmModInvalid;
+  GpuImage* image = p.planes[0]->gpu();
+  const bool layout_ok = p.modifiers[0] == kDrmModLinear || p.modifiers[0] == kDrmModInvalid;
   bool fits = false;
   if (image) {
-    if (uint64_t{p.offset} + uint64_t{p.stride} * uint64_t(height) > uint64_t{image->pitch()} * image->height()) {      // (32-bit values: no overflow)
+    if (uint64_t{p.offsets[0]} + uint64_t{p.strides[0]} * uint64_t(height) > uint64_t{image->pitch()} * image->height()) {      // (32-bit values: no overflow)
       post_error(c, params_id, kParamsOutOfBounds, "the plane is out of the buffer's bounds");
       return false;
     }
-    fits = uint32_t(width) <= image->width() && uint32_t(height) <= image->height() && p.offset == 0 && p.stride == image->pitch();
+    fits = uint32_t(width) <= image->width() && uint32_t(height) <= image->height() && p.offsets[0] == 0 && p.strides[0] == image->pitch();
   }
   if (!image || !layout_ok || !fits || flags != 0) {
     if (immediate) {
@@ -140,11 +167,68 @@ bool Server::make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, 
     }
     return false;
   }
-  out->gpu = p.plane;
+  out->gpu = p.planes[0];
   out->width = width;
   out->height = height;
-  out->stride = int32_t(p.stride);
+  out->stride = int32_t(p.strides[0]);
   out->format = shm_format;
+  return true;
+}
+
+// A YUV dmabuf (make_dmabuf_buffer checked the format, the size and that exactly its planes were added). Each plane must be memory the server can map, big
+// enough for its rows from its offset (else out_of_bounds), in the linear layout, with a stride no shorter than its row; a plane that is a GPU image or no
+// memory at all cannot be imported (failed / invalid_wl_buffer).
+bool Server::make_yuv_dmabuf(Client& c, uint32_t params_id, DmabufParams& p, const YuvFormat& f, int32_t width, int32_t height, uint32_t flags, bool immediate,
+                             BufferInfo* out) {
+  bool importable = flags == 0;
+  for (uint32_t i = 0; i < f.planes && importable; ++i) {
+    const bool layout_ok = p.modifiers[i] == kDrmModLinear || p.modifiers[i] == kDrmModInvalid;
+    if (!layout_ok || p.modifiers[i] != p.modifiers[0] || p.planes[i]->gpu() || p.strides[i] < f.row_bytes(i, uint32_t(width))) importable = false;
+  }
+  if (importable) {
+    // how much of each descriptor the planes cover (one map per descriptor: a later map of the same one may move the earlier view)
+    for (uint32_t i = 0; i < f.planes; ++i) {
+      uint64_t need = 0;
+      bool first = true;
+      for (uint32_t j = 0; j < f.planes; ++j) {
+        if (p.planes[j].get() != p.planes[i].get()) continue;
+        if (j < i) first = false;
+        const uint64_t end = uint64_t{p.offsets[j]} + f.plane_bytes(j, uint32_t(width), uint32_t(height), p.strides[j]);      // (below 2^62)
+        if (end > need) need = end;
+      }
+      if (!first) continue;
+      if (p.planes[i]->map(1).size() == 0) {      // no memory at all: not something this server reads
+        importable = false;
+        break;
+      }
+      if (p.planes[i]->map(need).size() < need) {
+        post_error(c, params_id, kParamsOutOfBounds, "a plane is out of the buffer's bounds");
+        return false;
+      }
+    }
+  }
+  SharedPointer<YuvPicture> picture = importable ? SharedPointer<YuvPicture>::make(allocator_, allocator_) : SharedPointer<YuvPicture>();
+  if (importable && !picture) {
+    post_error(c, kDisplayId, kErrorNoMemory, "out of memory");
+    return false;
+  }
+  if (!importable) {
+    if (immediate) post_error(c, params_id, kParamsInvalidWlBuffer, "the buffer cannot be imported");
+    else send(c, Event(params_id, 1));      // failed
+    return false;
+  }
+  picture->format = f;
+  picture->dmabuf = true;
+  for (uint32_t i = 0; i < f.planes; ++i) {
+    picture->planes[i] = p.planes[i];
+    picture->offsets[i] = p.offsets[i];
+    picture->strides[i] = p.strides[i];
+  }
+  out->yuv = util::move(picture);
+  out->width = width;
+  out->height = height;
+  out->stride = int32_t(p.strides[0]);
+  out->format = f.code;
   return true;
 }
 
@@ -199,18 +283,22 @@ void Server::dmabuf_request(Client& c, uint32_t id, Resource& r, uint16_t opcode
         post_error(c, id, kParamsAlreadyUsed, "the params were used already");
         return;
       }
-      if (plane >= kMaxPlanes || plane != 0) {      // (every format offered has one plane)
+      if (plane >= kMaxPlanes) {
         post_error(c, id, kParamsPlaneIdx, "plane index out of bounds");
         return;
       }
-      if (p.plane) {
+      if (p.planes[plane]) {
         post_error(c, id, kParamsPlaneSet, "the plane was set already");
         return;
       }
-      p.plane = util::move(fd);
-      p.offset = offset;
-      p.stride = stride;
-      p.modifier = uint64_t{hi} << 32 | lo;
+      if (!fd) {
+        post_error(c, id, kParamsIncomplete, "no descriptor");
+        return;
+      }
+      p.planes[plane] = util::move(fd);
+      p.offsets[plane] = offset;
+      p.strides[plane] = stride;
+      p.modifiers[plane] = uint64_t{hi} << 32 | lo;
       return;
     }
     case 2:        // create(width, height, format, flags): the answer is created(new wl_buffer) or failed
@@ -298,7 +386,7 @@ bool Server::check_sync_points(Client& c, Surface& s) {
     post_error(c, s.syncobj_id, kSyncobjNoReleasePoint, "a buffer without a release point");
     return false;
   }
-  if (!p.buffer.gpu) {
+  if (!p.buffer.gpu && !(p.buffer.yuv && p.buffer.yuv->dmabuf)) {
     post_error(c, s.syncobj_id, kSyncobjUnsupportedBuffer, "explicit sync needs a dmabuf");
     return false;
   }

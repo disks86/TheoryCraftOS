@@ -843,9 +843,14 @@ void NativeServer::tick() {
         for (UniquePointer<ClientPort>& p : n->ports.view())
           if (p->media == Media::Video && p->direction == 0 && p->format_sent && !p->renegotiate) {
             const VideoFormat now_format = n->video->format();
-            if (now_format.valid() && !(now_format == p->video)) p->renegotiate = n->renegotiate = true;
+            if (now_format.valid() && !(now_format == p->source_video)) p->renegotiate = n->renegotiate = true;
+            // (shared buffers: let go of by the producer, or newly shared and of a kind this watcher takes as it is: given the producer's own)
+            if (p->buffers_sent && !p->renegotiate && watcher_share_changed(*p, *n->video)) p->renegotiate = n->renegotiate = true;
           }
       if (n->renegotiate) negotiate(*c, *n);
+      // (a producer's frame taken before it was drawn: shown once it is)
+      for (UniquePointer<ClientPort>& p : n->ports.view())
+        if (p->media == Media::Video && p->direction == 1 && p->share) check_pending(*n, *p);
       run_client_node(*n, now);
     }
   }

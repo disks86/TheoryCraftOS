@@ -1149,15 +1149,17 @@ static void run_case(Fault fault) {
         CHECK(card.vc1_interlaced_decodes == before + (vc1i_on ? int(kVc1SelfTestPictures) : 0));
       }
       synthetic_interlaced(engine, card, vc1i_on);
-      // MPEG-4 sessions are the engine's when its test passed; when it did not there is no CPU to fall back on. While the engine serves one, a second has nothing either.
+      // MPEG-4 sessions are the engine's when its test passed, the CPU's (the software decoder) when it did not; while the engine serves one, a second is the CPU's.
       {
         DecoderConfig mpeg4_config = h264_config();
         mpeg4_config.codec = VideoCodec::Mpeg4;
         const int before = card.mpeg4_decodes;
         const int problems_before = card.problems;
         UniquePointer<IVideoDecoder> first = engine.create_decoder(mpeg4_config);
-        CHECK(static_cast<bool>(first) == mpeg4_on);
-        CHECK(!engine.create_decoder(mpeg4_config));   // (busy, or not served at all)
+        CHECK(static_cast<bool>(first));
+        UniquePointer<IVideoDecoder> second = engine.create_decoder(mpeg4_config);   // (the engine is busy, or not serving MPEG-4: the CPU's)
+        CHECK(static_cast<bool>(second) && run_mpeg4_stream(*second, mpeg4) && card.mpeg4_decodes == before);
+        if (!mpeg4_on) CHECK(first && run_mpeg4_stream(*first, mpeg4) && card.mpeg4_decodes == before);
         if (mpeg4_on) {
           CHECK(run_mpeg4_stream(*first, mpeg4));
           CHECK(card.mpeg4_decodes == before + int(kMpeg4SelfTestPictures));

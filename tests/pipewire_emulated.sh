@@ -26,7 +26,7 @@ work=${TMPDIR:-/tmp}/tcos-pwemu-$(printf %s "$PWD" | cksum | cut -d" " -f1)
 mkdir -p "$work/obj" "$work/sys32"
 for tool in x86_64-w64-mingw32-gcc clang; do command -v "$tool" >/dev/null || { echo "skipped (no $tool)"; exit 0; }; done
 sources=(tests/EmulationRun.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp
-         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp)
+         src/Kernel/Sync.cpp tests/KernelStubs.cpp src/PipeWire/*.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp)
 flags="-std=c++20 -O1 -pthread -I src -w -DTCOS_EMU_AUDIO"
 objs=()
 jobs=()
@@ -50,7 +50,7 @@ x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/winmmtest.exe" tests/windows/
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/dsoundtest.exe" tests/windows/dsoundtest.c -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/recordtest.exe" tests/windows/recordtest.c -lwinmm -ldsound -lole32 -luuid
 x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/xaudio2test.exe" tests/windows/xaudio2test.c -L"$work/build/windows" -l:xaudio2_9.dll -lole32 -luuid
-x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/virtualsinktest.exe" tests/windows/virtualsinktest.c -lole32 -luuid
+x86_64-w64-mingw32-gcc -O1 -Wall -Wextra -o "$work/virtualsinktest.exe" tests/windows/virtualsinktest.c -lwinmm -ldsound -lole32 -luuid
 # the Linux program
 lld=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/gcc-ld/ld.lld 2>/dev/null | head -1 || true)
 case $arch in
@@ -219,7 +219,7 @@ PY
     grep -q "\[exit=0 faulted=0" "$work/run-pwmidi.out" && grep -q "midi: 24 messages to the synthesizer, 12 note-ons" "$work/run-pwmidi.out" &&
       echo "ok   pw-cat --midi (libpipewire) played its 12 notes on the synthesizer" || { echo "FAIL pw-cat --midi"; fail=1; }
     if [ $have_pwmedia -eq 1 ]; then
-      for mode in video video-alloc video-yuv midi filter adapter; do
+      for mode in video video-alloc video-zerocopy video-sync video-yuv midi filter adapter; do
         TCOS_EMU_ARGS="$mode" TCOS_EMU_LINUX_FILES="$files" "$work/emurun" "$work/pwmedia" "$work/sys32" > "$work/run-pwmedia-$mode.out" 2>&1 || true
         grep -E "^pwmedia:|exit=" "$work/run-pwmedia-$mode.out"
         grep -q "pwmedia: $mode ok" "$work/run-pwmedia-$mode.out" && grep -q "\[exit=0 faulted=0" "$work/run-pwmedia-$mode.out" || { echo "FAIL pwmedia $mode"; fail=1; }

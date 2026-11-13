@@ -15,7 +15,7 @@ for p in stable/xdg-shell/xdg-shell unstable/xdg-decoration/xdg-decoration-unsta
   wayland-scanner client-header "$protocols/$p.xml" "$out/$(basename $p)-client-protocol.h"
   wayland-scanner private-code "$protocols/$p.xml" "$out/$(basename $p)-protocol.c"
 done
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp src/Wayland/WaylandDesktop.cpp src/Wayland/WaylandInput.cpp src/Wayland/WaylandKeymap.cpp src/Wayland/WaylandServer.cpp src/Wayland/WaylandSurfaces.cpp src/Wayland/WaylandDmabuf.cpp src/Wayland/WaylandData.cpp src/Wayland/WaylandScale.cpp src/Wayland/WaylandExtras.cpp src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Wayland/Media/WaylandClipboardPng.cpp src/Media/Image/Png.cpp src/Media/Image.cpp src/Media/Zlib.cpp src/Math/FloatMath.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/wayland/WaylandHostServer.cpp $(ls src/Wayland/*.cpp | grep -v WaylandSocketServer) src/Kernel/Sync.cpp src/Kernel/Clipboard.cpp src/Wayland/Media/WaylandClipboardPng.cpp src/Media/Image/Png.cpp src/Media/Image.cpp src/Media/Zlib.cpp src/Math/FloatMath.cpp \
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp -o "$out/WaylandHostServer"
 gcc -O1 -g -Wall -I "$out" tests/wayland/wl_client.c "$out/xdg-shell-protocol.c" "$out/xdg-decoration-unstable-v1-protocol.c" -lwayland-client -lxkbcommon \
   -o "$out/wl_client"
@@ -49,6 +49,19 @@ if command -v foot >/dev/null; then
   cat "$out/wayland-foot.log"
   grep -q 'mapped .* "' "$out/wayland-foot.log" || { echo "foot showed no window"; cat "$out/foot.client.log"; status=1; }
   grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-foot.log" && status=1
+  # the desktop drags a file of the user's onto foot (the harness's TCOS_DESKTOP_DRAG): foot takes the URI list and pastes the file's Linux path
+  echo "== desktop file dropped on foot"
+  TCOS_DESKTOP_DRAG="/Desktop/Documents/a b.txt" run_server wayland-footdrop 8 ""
+  : > "$out/footdrop.txt"
+  # (timeout --foreground: a background process group could not read the terminal)
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-footdrop timeout 7 foot -o main.font=monospace:size=11 \
+    sh -c "stty raw -echo; timeout --foreground 5 dd bs=1 count=64 of='$out/footdrop.txt' 2>/dev/null" < /dev/null > "$out/footdrop.client.log" 2>&1 || true
+  wait $server || true
+  grep -E "desktop drop|wrote" "$out/wayland-footdrop.log" || true
+  echo "foot pasted: $(cat "$out/footdrop.txt")"
+  [ "$(cat "$out/footdrop.txt")" = "'/mnt/desktop/Documents/a b.txt'" ] || { cat "$out/wayland-footdrop.log"; status=1; }
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-footdrop.log" && status=1
+  grep -q "ime::enter() event before" "$out/footdrop.client.log" && { echo "text input entered before the keyboard"; status=1; }
 fi
 if command -v wl-copy >/dev/null && command -v wl-paste >/dev/null; then
   echo "== wl-clipboard (copy and paste: the desktop's clipboard to a client, a client to another and to the desktop's clipboard)"
@@ -101,6 +114,53 @@ sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBB
   # (5 x 3, first pixel R 0 G 0 B 30, last R 40 G 40 B 30)
   grep -q "clipboard image: 5x3 first ff00001e last ff28281e" "$out/wayland-clipimg.log" || { echo "the desktop's clipboard did not get wl-copy's picture"; status=1; }
   grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-clipimg.log" && { cat "$out/wayland-clipimg.log"; status=1; }
+fi
+if command -v gst-launch-1.0 >/dev/null && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
+  # YUV through wl_shm: GStreamer's colour bars in NV12, I420 and YUY2 (the planes in the pool as the compositor expects them), drawn by the desktop.
+  # (drop-allocation: waylandsink copies each frame into a wl_shm buffer of its own. When videotestsrc draws into waylandsink's pool instead, GStreamer 1.28
+  # writes NV12 and I420 rows 512 bytes apart but declares stride 320 to wl_shm - its pool's alignment never reaches the wl_buffer.)
+  for format in NV12 I420 YUY2; do
+    echo "== gstreamer waylandsink $format"
+    run_server wayland-gst-$format 6 "$out/gst-$format.ppm"
+    XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-gst-$format timeout 5 gst-launch-1.0 -q videotestsrc pattern=smpte75 num-buffers=90 \
+      ! video/x-raw,format=$format,width=320,height=240,framerate=30/1 ! identity drop-allocation=true ! waylandsink > "$out/gst-$format.client.log" 2>&1 || true
+    wait $server || true
+    python3 - "$out/gst-$format.ppm" <<'PY' || { cat "$out/gst-$format.client.log" "$out/wayland-gst-$format.log"; status=1; }
+import sys
+data = open(sys.argv[1], 'rb').read()
+parts = data.split(b'\n', 3)
+w, h = map(int, parts[1].split()); px = parts[3]
+def at(x, y): i = (y * w + x) * 3; return tuple(px[i:i + 3])
+# the 75% bars, left to right: white, yellow, cyan, green, magenta, red, blue (each 320 / 7 wide), sampled in the middle of the top part
+want = [(191, 191, 191), (191, 191, 0), (0, 191, 191), (0, 191, 0), (191, 0, 191), (191, 0, 0), (0, 0, 191)]
+got = [at(int((k + 0.5) * 320 / 7), 60) for k in range(7)]
+print('picture', w, 'x', h, 'bars', got)
+assert w >= 320 and h >= 240, 'no window of the video'
+assert all(abs(a - b) <= 6 for g, e in zip(got, want) for a, b in zip(g, e)), 'wrong colours'
+PY
+    grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-gst-$format.log" && { cat "$out/wayland-gst-$format.log"; status=1; }
+  done
+fi
+if command -v slurp >/dev/null; then
+  # a layer-shell client: slurp's overlay (zwlr_layer_shell_v1, overlay layer, all four anchors, zone -1, the keyboard taken) over the whole monitor
+  echo "== slurp (layer shell)"
+  run_server wayland-slurp 9 "$out/slurp.ppm"      # (slurp's first start may take seconds: fontconfig)
+  XDG_RUNTIME_DIR=$runtime WAYLAND_DISPLAY=wayland-slurp timeout 8 slurp -b 20304080 < /dev/null > "$out/slurp.client.log" 2>&1 || true      # (slurp reads boxes from a stdin that is no terminal)
+  wait $server || true
+  cat "$out/wayland-slurp.log"
+  grep -q 'mapped .* "selection" 1280x768' "$out/wayland-slurp.log" || { echo "slurp showed no full-screen overlay"; cat "$out/slurp.client.log"; status=1; }
+  python3 - "$out/slurp.ppm" <<'PY' || status=1
+import sys
+data = open(sys.argv[1], 'rb').read()
+parts = data.split(b'\n', 3)
+w, h = map(int, parts[1].split()); px = parts[3]
+i = (400 * w + 600) * 3
+got = tuple(px[i:i + 3])
+print('slurp overlay pixel', got)
+# (cairo's premultiplied 0x20304080: half of each channel)
+assert all(abs(a - b) <= 2 for a, b in zip(got, (16, 24, 32))), 'wrong colour'
+PY
+  grep -q "ERROR: AddressSanitizer\|runtime error" "$out/wayland-slurp.log" && { cat "$out/wayland-slurp.log"; status=1; }
 fi
 [ $status -eq 0 ] && echo "wayland interop: all passed" || echo "wayland interop: FAILED"
 exit $status

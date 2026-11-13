@@ -247,6 +247,34 @@ uint64_t svc_initialize_touch_injection(Call& c) {
   return 1;
 }
 
+// BOOL NtUserInjectTouchInput(UINT32 count, const POINTER_TOUCH_INFO* contacts): each contact (pointerInfo.pointerId the injector's 0 .. max - 1,
+// pointerFlags DOWN / UPDATE / UP / CANCELED, ptPixelLocation on the screen) goes through the touch path the desktop's fingers take
+// (user::touch_input_locked), over the top-level under its point at DOWN. The process must have called InitializeTouchInjection.
+uint64_t svc_inject_touch_input(Call& c) {
+  const uint32_t count = c.arg32(0);
+  const uint64_t contacts = c.arg(1);
+  ProcessRecord* p = find_process_record(c.pid());
+  if (!p || !p->touch_injection) return c.fail(kErrorAccessDenied);
+  if (count == 0 || count > p->touch_max_contacts) return c.fail(kErrorInvalidParameter);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint8_t raw[144];
+    if (!c.read(contacts + uint64_t(i) * sizeof raw, ByteView(raw, sizeof raw))) return c.fail(kErrorNoAccess);
+    auto u32 = [&](uint32_t o) { return uint32_t(raw[o]) | uint32_t(raw[o + 1]) << 8 | uint32_t(raw[o + 2]) << 16 | uint32_t(raw[o + 3]) << 24; };
+    const uint32_t type = u32(0), pointer_id = u32(4), flags = u32(12);
+    const int32_t x = int32_t(u32(32)), y = int32_t(u32(36));
+    if (type != 2 || pointer_id >= p->touch_max_contacts) return c.fail(kErrorInvalidParameter);
+    const uint32_t id = 0x80000000u | uint32_t(c.pid() & 0x7FFFFFu) << 8 | pointer_id;      // (apart from the desktop's own contact ids)
+    uint8_t phase;
+    if (flags & 0x10000) phase = 0;                       // POINTER_FLAG_DOWN
+    else if (flags & 0x40000) phase = (flags & 0x8000) ? 3 : 2;      // UP (CANCELED)
+    else if (flags & 0x20000) phase = 1;                  // UPDATE
+    else return c.fail(kErrorInvalidParameter);
+    const uint32_t top = phase == 0 ? user::top_level_at(x, y) : 0;
+    if (!user::touch_input_locked(top, phase, id, x, y)) return c.fail(kErrorInvalidParameter);
+  }
+  return 1;
+}
+
 uint64_t svc_get_pointer_devices(Call& c) {
   if (c.arg(0) == 0) return c.fail(kErrorInvalidParameter);
   return c.write_u32(c.arg(0), 0) ? 1 : c.fail(kErrorNoAccess);      // no touch or pen devices: the mouse is not a pointer device unless it is enabled as one
@@ -348,6 +376,7 @@ void install_input() {
   register_handler(N::NtUserEnableMouseInPointerForThread, svc_enable_mouse_in_pointer_for_thread);
   register_handler(N::NtUserInitializeTouchInjection, svc_initialize_touch_injection);
   register_handler(N::NtUserGetPointerDevices, svc_get_pointer_devices);
+  register_handler(N::NtUserInjectTouchInput, svc_inject_touch_input);
 }
 
 }  // namespace process::win32k::user_misc

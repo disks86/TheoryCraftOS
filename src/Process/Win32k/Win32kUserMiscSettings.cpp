@@ -531,7 +531,9 @@ int32_t system_metrics(uint32_t index, uint32_t dpi) {
     case 92: v = m.padded_border; break;    // SM_CXPADDEDBORDER
     case 0x1000: return 0;                  // SM_REMOTESESSION
     case 0x2002: return 1;                  // SM_CARETBLINKINGENABLED
-    case 41: case 42: case 44: case 64: case 65: case 66: case 73: case 74: case 86: case 87: case 88: case 89: case 94: case 95:
+    case 94: return user::touch_available() ? 0xC1 : 0;      // SM_DIGITIZER: NID_INTEGRATED_TOUCH | NID_MULTI_INPUT | NID_READY once a finger came
+    case 95: return user::touch_available() ? 10 : 0;        // SM_MAXIMUMTOUCHES
+    case 41: case 42: case 44: case 64: case 65: case 66: case 73: case 74: case 86: case 87: case 88: case 89:
     case 0x2000: case 0x2001: case 0x2003: case 0x2004: return 0;      // pen windows, DBCS, secure, mid-east, slow machine, tablet PC, media center, starter, server R2, digitizer, touches, ...
     case 24: case 25: case 26: case 27: return 0;      // (reserved)
     default: return 0;

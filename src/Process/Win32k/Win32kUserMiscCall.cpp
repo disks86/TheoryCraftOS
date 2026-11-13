@@ -30,7 +30,13 @@ enum OneParam : uint32_t {
   kGetVirtualScreenRect1, kSetKeyboardAutoRepeat, kSetThreadDpiAwarenessContext, kD3dkmtOpenAdapter, kGetAsyncKeyboardState, kGetDeskPattern
 };
 enum TwoParam : uint32_t {
-  kGetDialogProc, kGetMenuInfo, kGetMonitorInfo, kGetSystemMetricsForDpi, kMonitorFromRect, kSetIconParam, kSetImeCompositionRect, kAdjustWindowRect, kGetVirtualScreenRect2, kAllocWinProc
+  kGetDialogProc, kGetMenuInfo, kGetMonitorInfo, kGetSystemMetricsForDpi, kMonitorFromRect, kSetIconParam, kSetImeCompositionRect, kAdjustWindowRect, kGetVirtualScreenRect2, kAllocWinProc,
+  // TheoryCraftOS's own (far from Wine's): user32 collects the files the desktop dropped (WM_DROPFILES with wParam a ticket, lParam user::kDropTicketMark).
+  // (ticket, 0) answers the DROPFILES block's size; (ticket, buffer of that size) fills it and the drop is gone.
+  kTcosTakeDrop = 0x7C00,
+  // Touches (Win32kUserTouch.cpp): (pointer id, POINTER_TOUCH_INFO of 144 bytes) fills it; (WM_TOUCH handle, 0) answers how many TOUCHINPUTs it has,
+  // (handle, 48 bytes) fills them; (handle, 0) closes it; (window, op | flags << 2): RegisterTouchWindow (op 1), UnregisterTouchWindow (0), IsTouchWindow (2).
+  kTcosPointerTouchInfo = 0x7C01, kTcosTouchInputInfo = 0x7C02, kTcosCloseTouchInput = 0x7C03, kTcosTouchWindow = 0x7C04
 };
 
 }  // namespace
@@ -133,6 +139,34 @@ uint64_t two_param(Call& c) {
       return c.write_struct(a, r) ? 1 : c.fail(kErrorNoAccess);
     }
     case kGetVirtualScreenRect2: return c.write_struct(a, virtual_screen_rect()) ? 1 : c.fail(kErrorNoAccess);
+    case kTcosTakeDrop: {
+      const uint64_t size = user::take_drop(c.pid(), uint32_t(a), ByteView());
+      if (size == 0) return c.fail(kErrorInvalidParameter);
+      if (b == 0) return size;
+      allocators::IAllocator* alloc = c.allocator();
+      if (!alloc) return c.fail(kErrorNotEnoughMemory);
+      ByteBuffer block(*alloc);
+      if (!block.put_zeros(size)) return c.fail(kErrorNotEnoughMemory);
+      if (!c.write(b, block.view())) return c.fail(kErrorNoAccess);      // (the caller's buffer is writable: the drop is taken)
+      if (user::take_drop(c.pid(), uint32_t(a), block.writable_view()) != size || !c.write(b, block.view())) return c.fail(kErrorNoAccess);
+      return size;
+    }
+    case kTcosPointerTouchInfo: {
+      uint8_t info[144];
+      if (!user::pointer_touch_info(c.pid(), uint32_t(a), ByteView(info, sizeof info))) return c.fail(kErrorInvalidParameter);
+      return c.write(b, ConstByteView(info, sizeof info)) ? 1 : c.fail(kErrorNoAccess);
+    }
+    case kTcosTouchInputInfo: {
+      if (b == 0) return user::touch_input_info(c.pid(), uint32_t(a), ByteView());
+      uint8_t input[48];
+      if (user::touch_input_info(c.pid(), uint32_t(a), ByteView(input, sizeof input)) != 1) return c.fail(kErrorInvalidHandle);
+      return c.write(b, ConstByteView(input, sizeof input)) ? 1 : c.fail(kErrorNoAccess);
+    }
+    case kTcosCloseTouchInput: return user::close_touch_input(c.pid(), uint32_t(a)) ? 1 : c.fail(kErrorInvalidHandle);
+    case kTcosTouchWindow: {
+      if (!user::is_window(uint32_t(a))) return c.fail(kErrorInvalidWindowHandle);
+      return user::touch_window_state(uint32_t(a), uint32_t(b & 3), uint32_t(b >> 2));
+    }
     default: return c.fail(kErrorInvalidParameter);
   }
 }

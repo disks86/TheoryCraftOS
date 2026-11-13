@@ -144,8 +144,15 @@ uint32_t Kernel::add_adapter(graphics::IGraphicsDevice& device, const AdapterCon
   Luid luid = config.luid;
   if (luid.low == 0 && luid.high == 0) luid.low = next_luid_++;
   UniquePointer<Adapter> a = UniquePointer<Adapter>::make(allocator_, allocator_, device, config, index, luid);
+  if (a) a->set_present_tap(present_tap_);
   if (!a || !adapters_.push_back(util::move(a))) return kInvalidIndex;
   return index;
+}
+
+void Kernel::set_present_tap(IPresentTap* tap) {
+  kernel::ScopedMutex g(lock_);
+  present_tap_ = tap;
+  for (UniquePointer<Adapter>& a : adapters_.view()) a->set_present_tap(tap);
 }
 
 uint32_t Kernel::adapter_count() {
@@ -557,6 +564,7 @@ class ExportedAllocation {
   friend class Kernel;
   friend const ExportInfo& export_info(const ExportedAllocation& exported);
   friend bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image);
+  friend bool export_idle(ExportedAllocation& exported);
   Kernel& kernel_;
   SharedPointer<Allocation> allocation_;
   Adapter& adapter_;
@@ -565,6 +573,12 @@ class ExportedAllocation {
 };
 
 const ExportInfo& export_info(const ExportedAllocation& exported) { return exported.info_; }
+
+bool export_idle(ExportedAllocation& exported) {
+  kernel::ScopedMutex g(exported.kernel_.lock_);
+  exported.adapter_.pump();
+  return !exported.adapter_.allocation_in_use(*exported.allocation_);
+}
 
 bool copy_export(ExportedAllocation& exported, ByteView bytes, bool to_image) {
   kernel::ScopedMutex g(exported.kernel_.lock_);

@@ -122,6 +122,7 @@ struct Device {
   Buffer *primary;
   WAVEFORMATEX primary_format;
   ULONG64 stream;            /* the graph's stream, opened when something first plays */
+  ULONG64 target;            /* a virtual sink it plays into (its node, from the device GUID it was made for); 0: the speakers */
   ULONG64 produced;          /* output frames mixed (given to the kernel, or waiting in pending) */
   ULONG64 sent_bytes;        /* bytes the kernel took */
   ULONG64 played;            /* output frames the device has played, at the last tick */
@@ -459,7 +460,7 @@ static void rewind_locked(Device *d) {
 static BOOL open_stream_locked(Device *d) {
   if (d->stream) return TRUE;
   WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, OUT_RATE, OUT_RATE * 4, 4, 16, 0};
-  d->stream = tcos_audio_open(&f, NULL);
+  d->stream = tcos_audio_open_to(&f, FALSE, FALSE, d->target, NULL);
   d->produced = d->sent_bytes = d->played = 0;
   d->pending_frames = d->pending_offset = 0;
   return d->stream != 0;
@@ -1410,8 +1411,11 @@ static HRESULT WINAPI d_set_speaker_config(IDirectSound8 *i, DWORD config) {
 static HRESULT WINAPI d_initialize(IDirectSound8 *i, LPCGUID guid) {
   Device *d = from_device(i);
   if (d->initialized) return DSERR_ALREADYINITIALIZED;
-  if (!playback_guid(guid)) return DSERR_NODRIVER;
+  /* the speakers, or a virtual sink by its GUID (DirectSoundEnumerate lists them) */
+  const ULONG64 target = playback_guid(guid) ? 0 : tcos_audio_virtual_node(guid);
+  if (!playback_guid(guid) && !target) return DSERR_NODRIVER;
   if (!tcos_audio_devices()) return DSERR_NODRIVER;
+  d->target = target;
   d->thread = CreateThread(NULL, 0, mixer_thread, d, 0, NULL);
   if (!d->thread) return DSERR_OUTOFMEMORY;
   d->initialized = TRUE;
@@ -1459,11 +1463,34 @@ static const char kDescriptionA[] = "Speakers (TheoryCraftOS)";
 static const char kPrimaryA[] = "Primary Sound Driver";
 static const char kModuleA[] = "{0.0.0.00000000}.{5af3a3c2-6e1b-4b4e-8d2f-1c0a7e5d9b30}";
 
+/* The virtual sink number `which`: its GUID, description and module (its WASAPI endpoint id); FALSE past the last. */
+static BOOL virtual_device(ULONG64 which, GUID *guid, char *description, int size, char *module) {
+  ULONG64 count = 0;
+  const ULONG64 node = tcos_audio_virtual_sink(which, description, size, &count);
+  if (!node) return FALSE;
+  tcos_audio_virtual_guid(node, guid);
+  static const char hex[] = "0123456789abcdef";
+  const char prefix[] = "{0.0.0.00000000}.{5af3a3c2-6e1b-4b4e-8d2f-";
+  int k = 0;
+  for (; prefix[k]; ++k) module[k] = prefix[k];
+  for (int d = 11; d >= 0; --d) module[k++] = hex[(node >> (4 * d)) & 0xF];
+  module[k++] = '}';
+  module[k] = 0;
+  return TRUE;
+}
+
 EXPORT HRESULT WINAPI DirectSoundEnumerateA(LPDSENUMCALLBACKA callback, LPVOID context) {
   if (!callback) return DSERR_INVALIDPARAM;
   if (!tcos_audio_devices()) return DS_OK;
   if (!callback(NULL, kPrimaryA, "", context)) return DS_OK;
-  callback((LPGUID)&kDeviceGuid, kDescriptionA, kModuleA, context);
+  if (!callback((LPGUID)&kDeviceGuid, kDescriptionA, kModuleA, context)) return DS_OK;
+  /* the graph's virtual sinks, a device each */
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    GUID guid;
+    char description[96], module[80];
+    if (!virtual_device(i, &guid, description, sizeof description, module)) break;
+    if (!callback(&guid, description, module, context)) break;
+  }
   return DS_OK;
 }
 EXPORT HRESULT WINAPI DirectSoundEnumerateW(LPDSENUMCALLBACKW callback, LPVOID context) {
@@ -1474,7 +1501,19 @@ EXPORT HRESULT WINAPI DirectSoundEnumerateW(LPDSENUMCALLBACKW callback, LPVOID c
   for (SIZE_T k = 0; k < sizeof kDescriptionA; ++k) description[k] = (WCHAR)kDescriptionA[k];
   for (SIZE_T k = 0; k < sizeof kModuleA; ++k) module[k] = (WCHAR)kModuleA[k];
   if (!callback(NULL, primary, empty, context)) return DS_OK;
-  callback((LPGUID)&kDeviceGuid, description, module, context);
+  if (!callback((LPGUID)&kDeviceGuid, description, module, context)) return DS_OK;
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    GUID guid;
+    char da[96], ma[80];
+    WCHAR dw[96], mw[80];
+    if (!virtual_device(i, &guid, da, sizeof da, ma)) break;
+    int k = 0;
+    for (; da[k] && k < 95; ++k) dw[k] = (WCHAR)(unsigned char)da[k];
+    dw[k] = 0;
+    for (k = 0; ma[k] && k < 79; ++k) mw[k] = (WCHAR)ma[k];
+    mw[k] = 0;
+    if (!callback(&guid, dw, mw, context)) break;
+  }
   return DS_OK;
 }
 
@@ -1485,6 +1524,10 @@ EXPORT HRESULT WINAPI GetDeviceID(LPCGUID source, LPGUID dest) {
   if (playback_guid(source) && !same_guid(source, &kGuidNull)) {
     if (!tcos_audio_devices()) return DSERR_NODRIVER;
     *dest = kDeviceGuid;
+    return DS_OK;
+  }
+  if (tcos_audio_virtual_node(source)) {      /* (a virtual sink's GUID is its own id) */
+    *dest = *source;
     return DS_OK;
   }
   if (capture_guid(source) && !same_guid(source, &kGuidNull)) {

@@ -56,8 +56,12 @@ class Engine {
   uint32_t run_timers(uint32_t max, String* error);
   // Runs the timers that are due at `now_ms` of the host's clock (an interval that comes round again waits for the next call). Returns how many threw.
   uint32_t run_due_timers(double now_ms, uint32_t max, String* error);
+  // Like run_timers, but the clock is moved no further than `last_ms` (the timers due after it wait).
+  uint32_t run_timers_until(double last_ms, uint32_t max, String* error);
   // When the first timer waiting is due (host clock milliseconds); false if there is none.
   bool next_timer(double* due_ms);
+  // When the last setTimeout (not interval) waiting is due; false if only intervals, or nothing, wait.
+  bool last_one_shot_timer(double* due_ms);
   uint32_t fire_event(StringView type, String* error);
 
  private:

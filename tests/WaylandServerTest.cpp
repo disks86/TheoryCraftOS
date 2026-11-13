@@ -25,6 +25,7 @@
 // the image's device and from the CPU's view, an image outliving its process, client threads exporting while the desktop draws.
 // Run: tests/run_host_tests.sh WaylandServerTest
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -35,6 +36,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -430,10 +432,10 @@ static void test_registry() {
     const uint32_t shm = c.bind(r, "wl_shm");
     int formats = 0;
     for (const Ev& e : c.events) if (e.object == shm && e.opcode == 0) ++formats;
-    CHECK(formats == 4);
+    CHECK(formats == 4 + 17);      // (RGB, then the YUV formats)
     const uint32_t seat = c.bind(r, "wl_seat");
     Ev caps = c.take(seat, 0);
-    CHECK(caps.object == seat && caps.u(0) == 3);
+    CHECK(caps.object == seat && caps.u(0) == 7);      // (pointer, keyboard, touch)
     CHECK(c.take(seat, 1).s(0) == "seat0");
     const uint32_t output = c.bind(r, "wl_output");
     Ev mode = c.take(output, 1);
@@ -589,6 +591,12 @@ static void test_toplevel() {
   app.send(Msg(w.toplevel, 6).u(app.seat).u(1).u(10));      // bottom right
   CHECK(server.take_drag(&edge) == win && edge == 8);
   CHECK(server.take_drag(&edge) == 0);
+  // the window menu the client asks for (a right click on its own title bar): the desktop opens it where the client said (of its window geometry)
+  int32_t mx = 0, my = 0;
+  CHECK(server.take_window_menu(&mx, &my) == 0);
+  app.send(Msg(w.toplevel, 4).u(app.seat).u(1).i(37).i(12));
+  CHECK(server.take_window_menu(&mx, &my) == win && mx == 37 && my == 12);
+  CHECK(server.take_window_menu(&mx, &my) == 0);
   // the close button: the client is asked
   server.window_command(win, desktop::IWindowsSession::Command::Close);
   CHECK(app.has(w.toplevel, 1));
@@ -733,11 +741,14 @@ static void test_popups() {
   CHECK(listed(server).size() == 1);
   // the keyboard is back with the window
   CHECK(app.take(keyboard, 1).u(1) == w.surface);
-  // a popup without a parent is an error
+  // a popup without a parent is an error at its first commit (another protocol may give it one before: zwlr_layer_surface_v1.get_popup)
   const uint32_t s3 = app.surface(), x3 = app.new_id();
   app.send(Msg(app.wm, 2).u(x3).u(s3));
   app.send(Msg(x3, 2).u(app.new_id()).u(0).u(pos));
-  CHECK(app.error() && app.closing);
+  CHECK(!app.closing);
+  app.send(Msg(s3, 6));
+  uint32_t eo = 0, ec = 0;
+  CHECK(app.error(&eo, &ec) && eo == app.wm && ec == 3 && app.closing);
 }
 
 // ------------------------------------------------------------------ subsurfaces
@@ -797,6 +808,147 @@ static void test_subsurfaces() {
 }
 
 // ------------------------------------------------------------------ the seat
+
+// Touches: a finger over a client with a wl_touch goes to it (down, motion, up, each with a frame, coordinates of the surface it went down on), over a
+// client without one it is refused (the desktop moves the pointer), cancel, and a client that goes away loses its contacts.
+// Pens (zwp_tablet_v2): a tablet seat is told of a tablet and a pen and an eraser tool; the pen over a client with a tablet seat comes into proximity of
+// its surface (motion, pressure, tilt, frame), the tip is down / up, the barrel buttons are BTN_STYLUS; while the tip touches the surface keeps the pen;
+// over a client without a tablet seat it is refused; out of range, proximity_out.
+static void test_pen() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1000, 800, {});
+  App a(server), b(server);
+  App::Window wa = a.toplevel(false, "a"), wb = b.toplevel(false, "b");
+  a.show(wa, 300, 300, 0xFF111111u);
+  b.show(wb, 300, 300, 0xFF222222u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  server.move_window(list[0], {0, 0, 300, 300});
+  server.move_window(list[1], {400, 0, 300, 300});
+  const uint32_t manager = a.bind(a.reg, "zwp_tablet_manager_v2");
+  const uint32_t tseat = a.new_id();
+  a.send(Msg(manager, 0).u(tseat).u(a.seat));
+  // the tablet and its two tools, each described and done
+  Ev tablet_added = a.take(tseat, 0);
+  const uint32_t tablet = tablet_added.u(0);
+  CHECK(tablet >= 0xFF000000u && a.take(tablet, 0).s(0) == "TheoryCraftOS pen" && a.has(tablet, 3));
+  Ev t1 = a.take(tseat, 1), t2 = a.take(tseat, 1);
+  const uint32_t pen = t1.u(0), eraser = t2.u(0);
+  CHECK(pen && eraser && pen != eraser);
+  CHECK(a.take(pen, 0).u(0) == 0x140 && a.take(eraser, 0).u(0) == 0x141 && a.has(pen, 4) && a.has(eraser, 4));
+  a.drop_events();
+  // hovering over a: proximity_in (serial, tablet, surface), motion, pressure 0, tilt, frame
+  desktop::PenInput p;
+  p.in_range = true;
+  p.x = 30, p.y = 40;
+  p.tilt_x = 10, p.tilt_y = -5;
+  CHECK(server.pen(p));
+  Ev in = a.take(pen, 6);
+  CHECK(in.object == pen && in.u(1) == tablet && in.u(2) == wa.surface);
+  Ev motion = a.take(pen, 10);
+  CHECK(motion.i(0) == 30 * 256 && motion.i(1) == 40 * 256);
+  CHECK(a.take(pen, 11).u(0) == 0);
+  Ev tilt = a.take(pen, 13);
+  CHECK(tilt.i(0) == 10 * 256 && tilt.i(1) == -5 * 256);
+  CHECK(a.has(pen, 18));
+  // the tip touches with pressure; the barrel button
+  p.tip = true;
+  p.pressure = 40000;
+  p.buttons = hardware::pen_button::kBarrel;
+  a.drop_events();
+  CHECK(server.pen(p));
+  CHECK(a.has(pen, 8) && a.take(pen, 11).u(0) == 40000);
+  Ev button = a.take(pen, 17);
+  CHECK(button.u(1) == 0x14B && button.u(2) == 1);
+  // dragged over b while touching: still a's surface, in a's coordinates
+  a.drop_events();
+  p.x = 450;
+  CHECK(server.pen(p));
+  Ev drag = a.take(pen, 10);
+  CHECK(drag.object == pen && drag.i(0) == 450 * 256);
+  CHECK(!a.has(pen, 7));
+  // lifted over b: up, then (b reads no pens) refused, and a hears proximity_out
+  a.drop_events();
+  p.tip = false;
+  p.buttons = 0;
+  p.pressure = 0;
+  CHECK(!server.pen(p));
+  CHECK(a.has(pen, 7));
+  // back over a, then out of range: proximity_out
+  p.x = 50;
+  CHECK(server.pen(p));
+  a.drop_events();
+  p.in_range = false;
+  CHECK(server.pen(p));
+  CHECK(a.has(pen, 7));
+  CHECK(!server.pen(p));      // (already out)
+  // the eraser end: the eraser tool
+  p.in_range = true;
+  p.inverted = true;
+  a.drop_events();
+  CHECK(server.pen(p));
+  CHECK(a.take(eraser, 6).u(2) == wa.surface && !a.has(pen, 6));
+  // nowhere: refused (and the eraser leaves)
+  p.x = 900, p.y = 700;
+  a.drop_events();
+  CHECK(!server.pen(p));
+  CHECK(a.has(eraser, 7));
+  free_made();
+}
+
+static void test_touch() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1000, 800, {});
+  App a(server), b(server);
+  App::Window wa = a.toplevel(false, "a"), wb = b.toplevel(false, "b");
+  a.show(wa, 300, 300, 0xFF111111u);
+  b.show(wb, 300, 300, 0xFF222222u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  server.move_window(list[0], {0, 0, 300, 300});
+  server.move_window(list[1], {400, 0, 300, 300});
+  const uint32_t ta = a.new_id();
+  a.send(Msg(a.seat, 2).u(ta));      // get_touch: only a reads touches
+  a.drop_events();
+  b.drop_events();
+  // a finger on a: taken, down with a's surface and the place in it
+  CHECK(server.touch(hardware::TouchPhase::Down, 5, list[0], 30, 40));
+  Ev down = a.take(ta, 0);
+  CHECK(down.object == ta && down.u(2) == wa.surface && down.i(3) == 5 && down.i(4) == 30 * 256 && down.i(5) == 40 * 256);
+  CHECK(a.has(ta, 3));      // frame
+  // it moves out of a's window: still a's, in a's coordinates
+  CHECK(server.touch(hardware::TouchPhase::Motion, 5, 0, 350, 45));
+  Ev motion = a.take(ta, 2);
+  CHECK(motion.object == ta && motion.i(1) == 5 && motion.i(2) == 350 * 256 && motion.i(3) == 45 * 256);
+  // a second finger on b: b has no wl_touch, refused (and b hears nothing)
+  CHECK(!server.touch(hardware::TouchPhase::Down, 6, list[1], 420, 10));
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 6, 0, 421, 10));      // (and its motion is nobody's)
+  // up: a's touch ends
+  CHECK(server.touch(hardware::TouchPhase::Up, 5, 0, 350, 45));
+  Ev up = a.take(ta, 1);
+  CHECK(up.object == ta && up.i(2) == 5);
+  CHECK(!server.touch(hardware::TouchPhase::Up, 5, 0, 350, 45));      // (no longer anyone's)
+  // nowhere: refused
+  CHECK(!server.touch(hardware::TouchPhase::Down, 7, 0, 900, 700));
+  // cancel: a hears cancel, and its contacts are gone
+  CHECK(server.touch(hardware::TouchPhase::Down, 8, list[0], 10, 10));
+  CHECK(server.touch(hardware::TouchPhase::Down, 9, list[0], 20, 20));
+  a.drop_events();
+  CHECK(server.touch(hardware::TouchPhase::Cancel, 8, 0, 10, 10));
+  CHECK(a.has(ta, 4));
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 9, 0, 21, 20));      // (the protocol cancels all of a's)
+  // a client that goes away mid-touch: its contacts are nobody's
+  CHECK(server.touch(hardware::TouchPhase::Down, 10, list[0], 10, 10));
+  server.close_client(a.number);
+  a.number = 0;
+  CHECK(!server.touch(hardware::TouchPhase::Motion, 10, 0, 11, 10));
+  free_made();
+}
+
 
 static void test_seat() {
   Server server(A);
@@ -1472,6 +1624,7 @@ struct FakeGpu final : wayland::Memory, wayland::GpuImage {
 };
 
 constexpr uint32_t kAR24 = 0x34325241, kXR24 = 0x34325258, kAB24 = 0x34324241, kXB24 = 0x34324258;
+constexpr size_t kOffered = 4 + 17;      // (the RGB formats and the YUV ones: WaylandYuv.hpp)
 
 // zwp_linux_buffer_params_v1 helpers: params, add plane 0 (fd), create_immed / create.
 struct DmabufApp : App {
@@ -1528,11 +1681,11 @@ static void test_dmabuf() {
     const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
     std::vector<uint32_t> formats;
     for (const Ev& e : c.events) if (e.object == d3 && e.opcode == 1 && e.u(1) == 0 && e.u(2) == 0) formats.push_back(e.u(0));
-    CHECK(formats.size() == 4 && c.count(d3, 0) == 0);
+    CHECK(formats.size() == kOffered && c.count(d3, 0) == 0);
     CHECK(std::find(formats.begin(), formats.end(), kAR24) != formats.end() && std::find(formats.begin(), formats.end(), kXB24) != formats.end());
     c.drop_events();
     const uint32_t d2 = c.bind(r, "zwp_linux_dmabuf_v1", 2);
-    CHECK(c.count(d2, 0) == 4 && c.count(d2, 1) == 0);
+    CHECK(c.count(d2, 0) == int(kOffered) && c.count(d2, 1) == 0);
     // version 4: no format events; feedback objects say it all (the format table as a sealed file, /dev/dxg as the device, one tranche)
     c.drop_events();
     const uint32_t d4 = c.bind(r, "zwp_linux_dmabuf_v1", 4);
@@ -1544,7 +1697,7 @@ static void test_dmabuf() {
     for (const Ev& e : c.events) if (e.object == fb) order.push_back(e.opcode);
     CHECK((order == std::vector<uint16_t>{1, 2, 4, 5, 6, 3, 0}));
     Ev table = c.take(fb, 1);
-    CHECK(table.u(0) == 64 && c.fds.size() == fds_before + 1);
+    CHECK(table.u(0) == kOffered * 16 && c.fds.size() == fds_before + 1);
     if (c.fds.size() == fds_before + 1) {
       ByteView t = c.fds.back()->map(64);
       CHECK(t.size() >= 64);
@@ -1560,7 +1713,7 @@ static void test_dmabuf() {
     Ev main_device = c.take(fb, 2);
     CHECK(main_device.u(0) == 8 && main_device.u(1) == ((10u << 8) | 243u) && main_device.u(2) == 0);
     Ev tranche = c.take(fb, 5);
-    CHECK(tranche.u(0) == 8 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
+    CHECK(tranche.u(0) == kOffered * 2 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
     c.send(Msg(fb, 0));      // destroy
     CHECK(c.take(1, 1).u(0) == fb);
     // per-surface feedback: the same
@@ -1684,10 +1837,10 @@ static void test_dmabuf() {
     std::function<void(DmabufApp&)> run;
   };
   const Case cases[] = {
-      {"plane 1", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(1).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
+      {"plane 4", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(4).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
       {"plane set twice", 2, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.send(Msg(p, 1).u(0).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
       {"no plane", 3, [](DmabufApp& a) { const uint32_t p = a.params(Fd(), 0, 0); a.immed(p, 16, 16); }},
-      {"format", 4, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16, 0x3231564Eu /* NV12 */); }},
+      {"format", 4, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16, 0x12345678u /* no such format */); }},
       {"size", 5, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 0, 16); }},
       {"bounds", 6, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 1024, 64), 16, 16); }},
       {"used", 0, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.immed(p, 16, 16); a.immed(p, 16, 16); }},
@@ -1775,6 +1928,953 @@ static void test_dmabuf_fuzz() {
     run(v, 1 + rng() % 100);
   }
   printf("   dmabuf fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ YUV buffers (WaylandYuv.hpp): wl_shm and dmabuf, converted at commit
+
+constexpr uint32_t kNV12 = 0x3231564E, kYU12 = 0x32315559, kYUYV = 0x56595559, kP010 = 0x30313050;
+
+// BT.601 limited range in floating point: the reference the integer converter must stay within 2 of.
+static uint32_t ref_rgb(int y, int u, int v) {
+  const double c = 1.164383 * (y - 16);
+  auto clamp = [](double d) { return uint32_t(d < 0 ? 0 : d > 255 ? 255 : d + 0.5); };
+  const uint32_t r = clamp(c + 1.596027 * (v - 128)), g = clamp(c - 0.391762 * (u - 128) - 0.812968 * (v - 128)), b = clamp(c + 2.017232 * (u - 128));
+  return 0xFF000000u | r << 16 | g << 8 | b;
+}
+static bool near_rgb(uint32_t a, uint32_t b) {
+  for (int shift = 0; shift < 32; shift += 8) {
+    const int d = int((a >> shift) & 0xFF) - int((b >> shift) & 0xFF);
+    if (d > 2 || d < -2) return false;
+  }
+  return true;
+}
+static uint8_t sy(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 37 + y * 11) % 220); }
+static uint8_t su(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 53 + y * 29) % 225); }
+static uint8_t sv(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 17 + y * 71) % 225); }
+static uint32_t expected_px(const wayland::YuvFormat& f, uint32_t x, uint32_t y) {
+  const uint32_t cx = x / f.hsub, cy = f.planes == 1 ? y : y / f.vsub;
+  return ref_rgb(sy(x, y), su(cx, cy), sv(cx, cy));
+}
+// Writes the test picture into planes at `at[p]` of `out` with `strides[p]`.
+static void write_yuv(const wayland::YuvFormat& f, uint32_t w, uint32_t h, uint8_t* const at[3], const uint32_t strides[3]) {
+  for (uint32_t y = 0; y < h; ++y) {
+    uint8_t* row = at[0] + size_t(y) * strides[0];
+    if (f.planes == 1) {
+      for (uint32_t p = 0; p < (w + 1) / 2; ++p) {
+        const uint8_t y0 = sy(2 * p, y), y1 = sy(2 * p + 1, y), c0 = f.swapped ? sv(p, y) : su(p, y), c1 = f.swapped ? su(p, y) : sv(p, y);
+        uint8_t* q = row + p * 4;
+        if (f.luma_first) q[0] = y0, q[1] = c0, q[2] = y1, q[3] = c1;
+        else q[0] = c0, q[1] = y0, q[2] = c1, q[3] = y1;
+      }
+      continue;
+    }
+    for (uint32_t x = 0; x < w; ++x) {
+      if (f.sample == 2) row[x * 2] = 0x3F, row[x * 2 + 1] = sy(x, y);      // (the low bits are noise the converter must drop)
+      else row[x] = sy(x, y);
+    }
+  }
+  if (f.planes == 1) return;
+  const uint32_t cw = (w + f.hsub - 1) / f.hsub, ch = (h + f.vsub - 1) / f.vsub;
+  for (uint32_t y = 0; y < ch; ++y)
+    for (uint32_t x = 0; x < cw; ++x) {
+      const uint8_t u = su(x, y), v = sv(x, y);
+      if (f.planes == 2) {
+        uint8_t* q = at[1] + size_t(y) * strides[1] + size_t(x) * 2 * f.sample;
+        const uint8_t c0 = f.swapped ? v : u, c1 = f.swapped ? u : v;
+        if (f.sample == 2) q[0] = 0, q[1] = c0, q[2] = 0xC0, q[3] = c1;
+        else q[0] = c0, q[1] = c1;
+      } else {
+        at[1][size_t(y) * strides[1] + x] = f.swapped ? v : u;
+        at[2][size_t(y) * strides[2] + x] = f.swapped ? u : v;
+      }
+    }
+}
+
+static void test_yuv_convert() {
+  int formats = 0, pictures = 0;
+  CHECK(wayland::yuv_formats().size() == 17);
+  wayland::YuvFormat none;
+  CHECK(!wayland::yuv_format(kXR24, &none) && !wayland::yuv_format(0, &none));
+  CHECK(ref_rgb(16, 128, 128) == 0xFF000000u && ref_rgb(235, 128, 128) == 0xFFFFFFFFu);
+  for (uint32_t code : wayland::yuv_formats()) {
+    wayland::YuvFormat f;
+    CHECK(wayland::yuv_format(code, &f) && f.code == code && f.planes >= 1 && f.planes <= 3);
+    ++formats;
+    const uint32_t sizes[][2] = {{1, 1}, {2, 2}, {5, 3}, {16, 8}, {7, 1}};
+    for (const auto& sz : sizes) {
+      const uint32_t w = sz[0], h = sz[1];
+      for (uint32_t pad : {0u, 3u}) {
+        std::vector<std::vector<uint8_t>> mem(f.planes);
+        uint32_t strides[3] = {};
+        uint8_t* at[3] = {};
+        wayland::YuvPlane planes[3];
+        for (uint32_t p = 0; p < f.planes; ++p) {
+          strides[p] = uint32_t(f.row_bytes(p, w)) + pad;
+          mem[p].assign(f.plane_bytes(p, w, h, strides[p]), 0x77);
+          at[p] = mem[p].data();
+        }
+        write_yuv(f, w, h, at, strides);
+        for (uint32_t p = 0; p < f.planes; ++p) planes[p].bytes = ConstByteView(mem[p].data(), mem[p].size()), planes[p].stride = strides[p];
+        std::vector<uint32_t> out(size_t(w) * h, 0x12345678u);
+        CHECK(wayland::yuv_to_xrgb(f, w, h, ArrayView<const wayland::YuvPlane>(planes, f.planes), ArrayView<uint32_t>(out.data(), out.size())));
+        bool all = true;
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x) if (!near_rgb(out[size_t(y) * w + x], expected_px(f, x, y))) all = false;
+        if (!all) printf("   yuv %08x %ux%u pad %u: wrong colours\n", code, w, h, pad);
+        CHECK(all);
+        ++pictures;
+        // truncation: every plane one byte short, a stride shorter than its row, too few planes, too small an output - false, nothing written
+        auto refused = [&](ArrayView<const wayland::YuvPlane> pl, size_t out_size) {
+          std::vector<uint32_t> o(out_size, 0xABCDEF01u);
+          const bool r = wayland::yuv_to_xrgb(f, w, h, pl, ArrayView<uint32_t>(o.data(), o.size()));
+          for (uint32_t v : o) if (v != 0xABCDEF01u) return false;
+          return !r;
+        };
+        for (uint32_t p = 0; p < f.planes; ++p) {
+          wayland::YuvPlane cut[3] = {planes[0], planes[1], planes[2]};
+          cut[p].bytes = cut[p].bytes.first(cut[p].bytes.size() - 1);
+          CHECK(refused(ArrayView<const wayland::YuvPlane>(cut, f.planes), out.size()));
+          wayland::YuvPlane narrow[3] = {planes[0], planes[1], planes[2]};
+          narrow[p].stride = uint32_t(f.row_bytes(p, w)) - 1;
+          CHECK(refused(ArrayView<const wayland::YuvPlane>(narrow, f.planes), out.size()));
+        }
+        CHECK(refused(ArrayView<const wayland::YuvPlane>(planes, f.planes - 1), out.size()));
+        CHECK(refused(ArrayView<const wayland::YuvPlane>(planes, f.planes), out.size() - 1));
+      }
+    }
+  }
+  // bit flips in the samples only change colours (every byte value is a sample)
+  wayland::YuvFormat nv12;
+  CHECK(wayland::yuv_format(kNV12, &nv12));
+  std::mt19937 rng(5);
+  for (int round = 0; round < 200; ++round) {
+    std::vector<uint8_t> y(64 * 16), uv(64 * 8);
+    for (auto& b : y) b = uint8_t(rng());
+    for (auto& b : uv) b = uint8_t(rng());
+    wayland::YuvPlane pl[2] = {{ConstByteView(y.data(), y.size()), 64}, {ConstByteView(uv.data(), uv.size()), 64}};
+    std::vector<uint32_t> out(64 * 16);
+    CHECK(wayland::yuv_to_xrgb(nv12, 64, 16, ArrayView<const wayland::YuvPlane>(pl, 2), ArrayView<uint32_t>(out.data(), out.size())));
+    for (uint32_t v : out) if ((v >> 24) != 0xFF) { CHECK(false); break; }
+  }
+  // the wl_shm layouts (Weston's rule)
+  uint64_t off[3], bytes = 0;
+  uint32_t st[3];
+  CHECK(wayland::yuv_shm_layout(nv12, 5, 3, 6, off, st, &bytes) && off[1] == 18 && st[1] == 6 && bytes == 30);
+  wayland::YuvFormat i420;
+  CHECK(wayland::yuv_format(kYU12, &i420));
+  CHECK(wayland::yuv_shm_layout(i420, 6, 4, 6, off, st, &bytes) && off[1] == 24 && off[2] == 30 && st[1] == 3 && st[2] == 3 && bytes == 36);
+  CHECK(!wayland::yuv_shm_layout(i420, 5, 4, 5, off, st, &bytes));      // (an odd stride cannot be halved)
+  printf("   yuv: %d formats, %d pictures\n", formats, pictures);
+}
+
+static uint32_t new_window(Server& server, const std::vector<uint32_t>& before) {
+  for (uint32_t win : listed(server))
+    if (std::find(before.begin(), before.end(), win) == before.end()) return win;
+  return 0;
+}
+
+static void test_yuv_buffers() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_dmabuf(true);
+  // wl_shm: an NV12 picture at an odd offset in the pool, the planes one after another
+  {
+    App app(server);
+    std::vector<uint32_t> before = listed(server);
+    App::Window w = app.toplevel(true, "nv12");
+    wayland::YuvFormat f;
+    CHECK(wayland::yuv_format(kNV12, &f));
+    const uint32_t W = 33, H = 17, stride = 36, offset = 6;
+    uint64_t off[3], bytes = 0;
+    uint32_t st[3];
+    CHECK(wayland::yuv_shm_layout(f, W, H, stride, off, st, &bytes));
+    App::Pool p = app.pool(size_t(offset + bytes));
+    uint8_t* at[3] = {p.memory->data() + offset + off[0], p.memory->data() + offset + off[1], nullptr};
+    write_yuv(f, W, H, at, st);
+    const uint32_t b = app.buffer(p, int32_t(offset), int32_t(W), int32_t(H), int32_t(stride), kNV12);
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 6));
+    CHECK(!app.closing && !app.error());
+    const uint32_t win = new_window(server, before);
+    CHECK(win != 0);
+    bool all = true;
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(f, x, y))) all = false;
+    CHECK(all);
+    // drawn like any buffer
+    std::vector<uint32_t> target(64 * 64, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    graphics::SoftwareRenderer2D renderer(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(server.draw_window(win, renderer, 0, 0, &dw, &dh));
+    int matching = 0;
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) if (near_rgb(target[size_t(y) * 64 + x], expected_px(f, x, y))) ++matching;
+    CHECK(matching > int(W * H / 2));
+    // the picture is the one of the last commit: a change of the memory shows at the next commit, not before
+    const uint32_t old = server.window_pixel(win, 0, 0);
+    for (uint32_t y = 0; y < H; ++y) memset(at[0] + size_t(y) * stride, 235, W);
+    for (uint32_t y = 0; y < (H + 1) / 2; ++y) memset(at[1] + size_t(y) * st[1], 128, W + 1);
+    CHECK(server.window_pixel(win, 0, 0) == old);
+    app.send(Msg(w.surface, 2).i(0).i(0).i(int32_t(W)).i(int32_t(H)));
+    app.send(Msg(w.surface, 6));
+    CHECK(server.window_pixel(win, 0, 0) == 0xFFFFFFFFu && server.window_pixel(win, int32_t(W - 1), int32_t(H - 1)) == 0xFFFFFFFFu);
+    // YUYV and I420 (odd sizes) from the same pool kind
+    for (uint32_t code : {kYUYV, kYU12, kP010}) {
+      wayland::YuvFormat g;
+      CHECK(wayland::yuv_format(code, &g));
+      const uint32_t gw = 9, gh = 5, gstride = code == kYUYV ? 20 : code == kP010 ? 20 : 10;      // (P010: the chroma rows, 5 pairs of 16-bit samples, need 20)
+      CHECK(wayland::yuv_shm_layout(g, gw, gh, gstride, off, st, &bytes));
+      App::Pool q = app.pool(size_t(bytes));
+      uint8_t* gat[3] = {q.memory->data() + off[0], q.memory->data() + off[1], q.memory->data() + off[2]};
+      write_yuv(g, gw, gh, gat, st);
+      const uint32_t gb = app.buffer(q, 0, int32_t(gw), int32_t(gh), int32_t(gstride), code);
+      app.send(Msg(w.surface, 1).u(gb).i(0).i(0));
+      app.send(Msg(w.surface, 6));
+      CHECK(!app.closing);
+      bool good = true;
+      for (uint32_t y = 0; y < gh; ++y)
+        for (uint32_t x = 0; x < gw; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(g, x, y))) good = false;
+      if (!good) printf("   shm %08x: wrong colours\n", code);
+      CHECK(good);
+    }
+  }
+  // wl_shm errors: a stride shorter than a row, an odd stride for I420, a picture past the pool
+  {
+    struct Bad { uint32_t format; int32_t offset, w, h, stride; size_t pool; };
+    const Bad bad[] = {{kNV12, 0, 8, 4, 7, 4096}, {kYU12, 0, 8, 4, 9, 4096}, {kNV12, 0, 8, 4, 8, 47}, {kNV12, 2, 8, 4, 8, 48}, {kYUYV, 0, 8, 4, 15, 4096},
+                       {kNV12, -4, 8, 4, 8, 4096}, {kNV12, 0, 0, 4, 8, 4096}, {kYU12, 0, 7, 4, 7, 4096}};
+    for (const Bad& k : bad) {
+      App app(server, false);
+      App::Pool p = app.pool(k.pool);
+      app.buffer(p, k.offset, k.w, k.h, k.stride, k.format);
+      uint32_t object = 0, code = 99;
+      CHECK(app.error(&object, &code) && object == p.id && code == 1);
+    }
+    App ok(server, false);      // (exactly the size the planes need is fine)
+    App::Pool p = ok.pool(48);
+    ok.buffer(p, 0, 8, 4, 8, kNV12);
+    CHECK(ok.roundtrip() && !ok.error());
+  }
+  // dmabuf: NV12 in two descriptors, I420 in one at offsets, and what is refused
+  {
+    std::vector<std::unique_ptr<std::vector<uint8_t>>> keep;      // (outlives the client, whose buffers point into it)
+    DmabufApp app(server);
+    std::vector<uint32_t> before = listed(server);
+    App::Window w = app.toplevel(true, "dmabuf yuv");
+    uint32_t win = 0;      // (listed once it has a buffer)
+    auto memory = [&](size_t n) {
+      keep.push_back(std::make_unique<std::vector<uint8_t>>(n, 0));
+      return keep.back().get();
+    };
+    auto add = [&](uint32_t params, uint32_t plane, Fd fd, uint32_t offset, uint32_t stride, uint64_t modifier = 0) {
+      app.send(Msg(params, 1).u(plane).u(offset).u(stride).u(uint32_t(modifier >> 32)).u(uint32_t(modifier)), {fd});
+    };
+    auto shows = [&](const wayland::YuvFormat& f, uint32_t W, uint32_t H) {
+      for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(f, x, y))) return false;
+      return true;
+    };
+    wayland::YuvFormat nv12, i420;
+    CHECK(wayland::yuv_format(kNV12, &nv12) && wayland::yuv_format(kYU12, &i420));
+    {
+      const uint32_t W = 20, H = 10;
+      auto* y = memory(64 * H + 100);
+      auto* uv = memory(32 * 5 + 16);
+      uint8_t* at[3] = {y->data() + 100, uv->data() + 16, nullptr};
+      const uint32_t strides[3] = {64, 32, 0};
+      write_yuv(nv12, W, H, at, strides);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      add(params, 0, Fd::make_as<TestMemory>(A, y), 100, 64);
+      add(params, 1, Fd::make_as<TestMemory>(A, uv), 16, 32);
+      const uint32_t b = app.immed(params, int32_t(W), int32_t(H), kNV12);
+      app.commit(w, b, int32_t(W), int32_t(H));
+      win = new_window(server, before);
+      CHECK(win != 0 && !app.closing && !app.error() && shows(nv12, W, H));
+    }
+    {
+      const uint32_t W = 11, H = 7, S0 = 12, S1 = 8;
+      auto* all = memory(S0 * H + 2 * S1 * 4 + 40);
+      uint8_t* at[3] = {all->data(), all->data() + S0 * H + 8, all->data() + S0 * H + 8 + S1 * 4};
+      const uint32_t strides[3] = {S0, S1, S1};
+      write_yuv(i420, W, H, at, strides);
+      Fd one = Fd::make_as<TestMemory>(A, all);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      add(params, 0, one, 0, S0);
+      add(params, 1, one, S0 * H + 8, S1);
+      add(params, 2, one, S0 * H + 8 + S1 * 4, S1);
+      const uint32_t b = app.immed(params, int32_t(W), int32_t(H), kYU12);
+      app.commit(w, b, int32_t(W), int32_t(H));
+      CHECK(!app.closing && !app.error() && shows(i420, W, H));
+    }
+    {      // `create` of what cannot be imported answers failed: a GPU image plane, a stride shorter than a row, mixed modifiers, no memory
+      auto* m = memory(4096);
+      for (int k = 0; k < 4; ++k) {
+        const uint32_t params = app.new_id();
+        app.send(Msg(app.dmabuf, 1).u(params));
+        Fd y = k == 0 ? Fd::make_as<FakeGpu>(A, 16u, 16u, 0u) : Fd::make_as<TestMemory>(A, m);
+        if (k == 3) static_cast<TestMemory&>(*y).not_memory = true;
+        add(params, 0, y, 0, k == 1 ? 15 : 16);
+        add(params, 1, Fd::make_as<TestMemory>(A, m), 1024, 16, k == 2 ? 0x00FFFFFFFFFFFFFFull : 0);
+        app.send(Msg(params, 2).i(16).i(16).u(kNV12).u(0));
+        CHECK(app.take(params, 1).object == params && !app.closing);
+      }
+    }
+  }
+  // dmabuf protocol errors: a missing plane, too many planes for RGB, a plane past its descriptor, a plane index past 3
+  {
+    struct Case { int kind; uint32_t code; };
+    const Case cases[] = {{0, 3}, {1, 3}, {2, 6}, {3, 1}};
+    for (const Case& k : cases) {
+      DmabufApp app(server);
+      std::vector<uint8_t> small(100), big(4096);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      auto add = [&](uint32_t plane, std::vector<uint8_t>* v, uint32_t offset, uint32_t stride) {
+        app.send(Msg(params, 1).u(plane).u(offset).u(stride).u(0).u(0), {Fd::make_as<TestMemory>(A, v)});
+      };
+      if (k.kind == 0) add(0, &big, 0, 16);
+      if (k.kind == 1) add(0, &big, 0, 64), add(1, &big, 1024, 64);
+      if (k.kind == 2) add(0, &big, 0, 16), add(1, &small, 0, 16);
+      if (k.kind == 3) add(4, &big, 0, 16);
+      if (k.kind != 3) app.immed(params, 16, 16, k.kind == 1 ? kXR24 : kNV12);
+      uint32_t object = 0, code = 99;
+      CHECK(app.error(&object, &code) && object == params && code == k.code);
+    }
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Byte flips over a session that makes NV12 buffers through wl_shm and dmabuf.
+static void test_yuv_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  server.set_dmabuf(true);
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(9).s("zwp_linux_dmabuf_v1").u(3).u(5));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(6));
+  add(Msg(3, 0).u(10));
+  add(Msg(4, 2).u(11).u(10));
+  add(Msg(11, 1).u(12));
+  add(Msg(10, 6));
+  add(Msg(11, 4).u(1));
+  add(Msg(6, 0).u(13).i(4096));                                  // pool (descriptor 0)
+  add(Msg(13, 0).u(14).i(2).i(30).i(20).i(32).u(kNV12));        // NV12 buffer at offset 2
+  add(Msg(10, 1).u(14).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(5, 1).u(15));
+  add(Msg(15, 1).u(0).u(0).u(32).u(0).u(0));                     // (descriptor 1)
+  add(Msg(15, 1).u(1).u(640).u(32).u(0).u(0));                   // (descriptor 2)
+  add(Msg(15, 3).u(16).i(30).i(20).u(kNV12).u(0));
+  add(Msg(10, 1).u(16).i(0).i(0));
+  add(Msg(10, 2).i(0).i(0).i(30).i(20));
+  add(Msg(10, 6));
+  add(Msg(13, 2).i(8192));                                       // pool grows
+  add(Msg(14, 0));
+  add(Msg(1, 0).u(17));
+  std::vector<uint8_t> m0(8192, 0x80), m1(4096, 0x40), m2(4096, 0xC0);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &m0), Fd::make_as<TestMemory>(A, &m1), Fd::make_as<TestMemory>(A, &m2)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      server.window_pixel(w, 1, 1);
+      server.window_pixel(w, 29, 19);
+    }
+    server.close_client(c);
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(1234);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   yuv fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ zwlr_layer_shell_v1
+
+struct LayerApp : App {
+  uint32_t shell = 0;
+  explicit LayerApp(Server& s, uint32_t version = 4) : App(s) {
+    shell = bind(reg, "zwlr_layer_shell_v1", version);
+    drop_events();
+  }
+  struct Layer {
+    uint32_t surface = 0, layer = 0, serial = 0;
+    int32_t cw = 0, ch = 0;
+  };
+  // get_layer_surface, the state, the initial commit; the configure taken and acknowledged
+  Layer make(uint32_t band, uint32_t anchor, uint32_t w, uint32_t h, int32_t zone = 0, std::array<int32_t, 4> margin = {0, 0, 0, 0}, uint32_t keyboard = 0,
+             const std::string& name = "panel") {
+    Layer l;
+    l.surface = surface();
+    l.layer = new_id();
+    send(Msg(shell, 0).u(l.layer).u(l.surface).u(0).u(band).s(name));
+    send(Msg(l.layer, 1).u(anchor));
+    send(Msg(l.layer, 0).u(w).u(h));
+    send(Msg(l.layer, 2).i(zone));
+    send(Msg(l.layer, 3).i(margin[0]).i(margin[1]).i(margin[2]).i(margin[3]));
+    if (keyboard) send(Msg(l.layer, 4).u(keyboard));
+    send(Msg(l.surface, 6));
+    configured(l);
+    return l;
+  }
+  bool configured(Layer& l) {
+    Ev c = take(l.layer, 0);
+    if (c.object == 0) return false;
+    l.serial = c.u(0);
+    l.cw = c.i(1);
+    l.ch = c.i(2);
+    send(Msg(l.layer, 6).u(l.serial));
+    return true;
+  }
+  void draw(Layer& l, int32_t w, int32_t h, uint32_t color) {
+    Pool p = pool(size_t(w) * h * 4);
+    fill(p, 0, w, h, w * 4, color);
+    const uint32_t b = buffer(p, 0, w, h, w * 4);
+    send(Msg(l.surface, 1).u(b).i(0).i(0));
+    send(Msg(l.surface, 2).i(0).i(0).i(w).i(h));
+    send(Msg(l.surface, 6));
+  }
+};
+
+static bool info_of(Server& server, uint32_t window, desktop::WindowsWindowInfo* info) {
+  String title(A);
+  return server.window_info(window, info, &title);
+}
+
+static void test_layer_shell() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  constexpr uint32_t T = 1, B = 2, L = 4, R = 8;
+  {
+    LayerApp app(server);
+    CHECK(app.globals["zwlr_layer_shell_v1"].second == 4);
+    // a top panel across the screen, 30 high, keeping its height
+    LayerApp::Layer panel = app.make(2, T | L | R, 0, 30, 30);
+    CHECK(panel.cw == 1024 && panel.ch == 30 && listed(server).empty());
+    app.draw(panel, 1024, 30, 0xFF203040u);
+    CHECK(!app.closing && listed(server).size() == 1);
+    const uint32_t pwin = listed(server)[0];
+    desktop::WindowsWindowInfo info;
+    CHECK(info_of(server, pwin, &info) && info.visible && !info.caption && info.tool && info.popup && !info.owned && info.layer == 1);
+    CHECK(info.reserve_edge == 2 && info.reserve == 30 && info.window.x == 0 && info.window.y == 0 && info.window.width == 1024 && info.window.height == 30);
+    CHECK(server.window_pixel(pwin, 5, 5) == 0xFF203040u);
+    // a notification at the bottom right with margins (zone 0: inside what the panel leaves)
+    LayerApp::Layer note = app.make(3, B | R, 200, 100, 0, {0, 10, 12, 0}, 0, "notifications");
+    CHECK(note.cw == 200 && note.ch == 100);
+    app.draw(note, 200, 100, 0xFFFFFF00u);
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 2);
+    const uint32_t nwin = list.size() == 2 ? list[1] : 0;
+    String title(A);
+    CHECK(server.window_info(nwin, &info, &title) && info.layer == 2 && info.window.x == 1024 - 10 - 200 && info.window.y == 768 - 12 - 100 && info.reserve == 0);
+    CHECK(title.view() == StringView("notifications"));
+    // anchored to the top only: below the panel's zone, centred across
+    LayerApp::Layer bar = app.make(1, T, 100, 50, 0, {4, 0, 0, 0});
+    app.draw(bar, 100, 50, 0xFF00FF00u);
+    list = listed(server);
+    const uint32_t bwin = list.size() == 3 ? list[2] : 0;
+    CHECK(info_of(server, bwin, &info) && info.layer == -1 && info.window.x == (1024 - 100) / 2 && info.window.y == 30 + 4);
+    // zone -1 ignores the panel: at the very top
+    LayerApp::Layer over = app.make(3, T, 64, 64, -1);
+    app.draw(over, 64, 64, 0xFF0000FFu);
+    list = listed(server);
+    const uint32_t owin = list.size() == 4 ? list[3] : 0;
+    CHECK(info_of(server, owin, &info) && info.window.y == 0);
+    // the client changes the panel's size: a new configure; the bar below follows
+    app.send(Msg(panel.layer, 0).u(0).u(40));
+    app.send(Msg(panel.layer, 2).i(40));
+    app.send(Msg(panel.surface, 6));
+    CHECK(app.configured(panel) && panel.cw == 1024 && panel.ch == 40);
+    app.draw(panel, 1024, 40, 0xFF203040u);
+    CHECK(info_of(server, pwin, &info) && info.reserve == 40 && info.window.height == 40);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 40 + 4);
+    // the monitors: anchored to the panel area (the taskbar left out), zones not counted twice
+    desktop::IWindowsSession::Monitor m;
+    m.rect = {0, 0, 1024, 768};
+    m.work = {0, 40, 1024, 688};      // (what the desktop says once it knows the reservation)
+    m.panel_area = {0, 0, 1024, 728};
+    server.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+    CHECK(info_of(server, pwin, &info) && info.window.y == 0);
+    CHECK(info_of(server, nwin, &info) && info.window.y == 728 - 12 - 100);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 44);
+    CHECK(!app.has(panel.layer, 0));      // (the same size: no configure)
+    // a maximized toplevel gets the work area
+    App::Window win = app.toplevel(true, "max");
+    app.show(win, 200, 100, 0xFF808080u);
+    app.drop_events();
+    app.send(Msg(win.toplevel, 9));      // set_maximized
+    Ev mc = app.take(win.toplevel, 0);
+    CHECK(mc.object == win.toplevel && mc.i(1) == 688 - 24 - 4 - 4);      // (inside the frame: border, title)
+    // set_layer (2): to the overlay band
+    app.send(Msg(bar.layer, 8).u(3));
+    app.send(Msg(bar.surface, 6));
+    CHECK(info_of(server, bwin, &info) && info.layer == 2);
+    // destroying the panel frees its zone: the bar goes up
+    app.send(Msg(panel.layer, 7));
+    CHECK(!info_of(server, pwin, &info) || !info.visible);
+    CHECK(info_of(server, bwin, &info) && info.window.y == 4);
+    app.send(Msg(panel.surface, 0));
+    // a null buffer unmaps; a new initial commit starts over
+    app.send(Msg(note.surface, 1).u(0).i(0).i(0));
+    app.send(Msg(note.surface, 6));
+    CHECK(info_of(server, nwin, &info) == false || !info.visible);
+    app.send(Msg(note.surface, 6));
+    CHECK(app.configured(note) && note.cw == 200);
+    app.draw(note, 200, 100, 0xFFFFFF00u);
+    CHECK(info_of(server, nwin, &info) && info.visible);
+    CHECK(!app.closing);
+  }
+  // keyboard: exclusive takes it when mapped; on_demand when the desktop activates it; none never
+  {
+    LayerApp app(server);
+    const uint32_t keyboard = app.new_id();
+    app.send(Msg(app.seat, 1).u(keyboard));
+    app.drop_events();
+    std::vector<uint32_t> before = listed(server);
+    LayerApp::Layer lock = app.make(3, T | B | L | R, 0, 0, -1, {0, 0, 0, 0}, 1, "lock");
+    CHECK(lock.cw == 1024 && lock.ch == 728);      // (the panel area the last block's monitors gave)
+    app.draw(lock, lock.cw, lock.ch, 0xFF000000u);
+    Ev enter = app.take(keyboard, 1);
+    CHECK(enter.object == keyboard && enter.u(1) == lock.surface);
+    const uint32_t lwin = new_window(server, before);
+    desktop::WindowsWindowInfo info;
+    CHECK(info_of(server, lwin, &info) && info.active && !info.popup);
+    app.send(Msg(lock.layer, 7));
+    app.drop_events();
+    before = listed(server);
+    LayerApp::Layer menu = app.make(2, T | L, 300, 400, 0, {0, 0, 0, 0}, 2, "launcher");
+    app.draw(menu, 300, 400, 0xFF112233u);
+    CHECK(!app.has(keyboard, 1));
+    const uint32_t mwin = new_window(server, before);
+    server.activate_window(mwin);
+    Ev e2 = app.take(keyboard, 1);
+    CHECK(e2.object == keyboard && e2.u(1) == menu.surface);
+    before = listed(server);
+    LayerApp::Layer quiet = app.make(2, B, 100, 20);
+    app.draw(quiet, 100, 20, 0xFF445566u);
+    const uint32_t qwin = new_window(server, before);
+    server.activate_window(qwin);
+    CHECK(!app.has(keyboard, 1) && info_of(server, qwin, &info) && !info.active && info.popup);
+    // a popup of a layer surface: made without a parent, given this one; in the same band
+    const uint32_t pos = app.new_id();
+    app.send(Msg(app.wm, 1).u(pos));
+    app.send(Msg(pos, 1).i(120).i(80));
+    app.send(Msg(pos, 2).i(10).i(10).i(20).i(20));
+    const uint32_t ps = app.surface(), pxdg = app.new_id(), popup = app.new_id();
+    app.send(Msg(app.wm, 2).u(pxdg).u(ps));
+    app.send(Msg(pxdg, 2).u(popup).u(0).u(pos));
+    app.send(Msg(menu.layer, 5).u(popup));
+    app.send(Msg(ps, 6));
+    Ev pc = app.take(popup, 0);
+    CHECK(pc.object == popup && !app.closing);
+    Ev px = app.take(pxdg, 0);
+    app.send(Msg(pxdg, 4).u(px.u(0)));
+    before = listed(server);
+    App::Window pw;
+    pw.surface = ps;
+    app.show(pw, 120, 80, 0xFF00FFFFu);
+    const uint32_t popwin = new_window(server, before);
+    CHECK(info_of(server, popwin, &info) && info.popup && info.layer == 1 && info.window.x == pc.i(0) && info.window.y == pc.i(1));
+    CHECK(!app.closing);
+  }
+  // errors
+  struct Case {
+    const char* what;
+    bool on_shell;      // the error is the shell's (else the layer surface's)
+    uint32_t code;
+    std::function<void(LayerApp&, uint32_t layer, uint32_t surface)> run;
+  };
+  const Case cases[] = {
+      {"another role", true, 0, [](LayerApp& a, uint32_t, uint32_t) { App::Window w = a.toplevel(); a.send(Msg(a.shell, 0).u(a.new_id()).u(w.surface).u(0).u(2).s("x")); }},
+      {"a buffer already", true, 2, [](LayerApp& a, uint32_t, uint32_t) {
+         const uint32_t s = a.surface();
+         App::Pool p = a.pool(64);
+         a.send(Msg(s, 1).u(a.buffer(p, 0, 4, 4, 16)).i(0).i(0));
+         a.send(Msg(a.shell, 0).u(a.new_id()).u(s).u(0).u(2).s("x"));
+       }},
+      {"layer 4", true, 1, [](LayerApp& a, uint32_t, uint32_t) { a.send(Msg(a.shell, 0).u(a.new_id()).u(a.surface()).u(0).u(4).s("x")); }},
+      {"not an output", true, 0, [](LayerApp& a, uint32_t, uint32_t) { a.send(Msg(a.shell, 0).u(a.new_id()).u(a.surface()).u(a.compositor).u(2).s("x")); }},
+      {"anchor 16", false, 2, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 1).u(16)); }},
+      {"keyboard 3", false, 3, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 4).u(3)); }},
+      {"width 0 unanchored", false, 1, [](LayerApp& a, uint32_t l, uint32_t s) { a.send(Msg(l, 0).u(0).u(10)); a.send(Msg(l, 1).u(1)); a.send(Msg(s, 6)); }},
+      {"height 0 unanchored", false, 1, [](LayerApp& a, uint32_t l, uint32_t s) { a.send(Msg(l, 0).u(10).u(0)); a.send(Msg(l, 1).u(4 | 8)); a.send(Msg(s, 6)); }},
+      {"buffer before configure", false, 0, [](LayerApp& a, uint32_t l, uint32_t s) {
+         a.send(Msg(l, 0).u(4).u(4));
+         App::Pool p = a.pool(64);
+         a.send(Msg(s, 1).u(a.buffer(p, 0, 4, 4, 16)).i(0).i(0));
+         a.send(Msg(s, 6));
+       }},
+      {"set_layer 4", false, 1, [](LayerApp& a, uint32_t l, uint32_t) { a.send(Msg(l, 8).u(4)); }},
+      {"popup with a parent", false, 0, [](LayerApp& a, uint32_t l, uint32_t) {
+         App::Window w = a.toplevel();
+         const uint32_t pos = a.new_id();
+         a.send(Msg(a.wm, 1).u(pos));
+         a.send(Msg(pos, 1).i(10).i(10));
+         a.send(Msg(pos, 2).i(0).i(0).i(1).i(1));
+         const uint32_t ps = a.surface(), pxdg = a.new_id(), popup = a.new_id();
+         a.send(Msg(a.wm, 2).u(pxdg).u(ps));
+         a.send(Msg(pxdg, 2).u(popup).u(w.xdg).u(pos));
+         a.send(Msg(l, 5).u(popup));
+       }},
+      {"popup without a parent", false, 99, [](LayerApp& a, uint32_t, uint32_t) {
+         const uint32_t pos = a.new_id();
+         a.send(Msg(a.wm, 1).u(pos));
+         a.send(Msg(pos, 1).i(10).i(10));
+         a.send(Msg(pos, 2).i(0).i(0).i(1).i(1));
+         const uint32_t ps = a.surface(), pxdg = a.new_id(), popup = a.new_id();
+         a.send(Msg(a.wm, 2).u(pxdg).u(ps));
+         a.send(Msg(pxdg, 2).u(popup).u(0).u(pos));
+         a.send(Msg(ps, 6));
+       }},
+  };
+  for (const Case& k : cases) {
+    LayerApp app(server);
+    const uint32_t s = app.surface(), l = app.new_id();
+    app.send(Msg(app.shell, 0).u(l).u(s).u(0).u(2).s("errors"));
+    k.run(app, l, s);
+    uint32_t object = 0, code = 0;
+    const bool err = app.error(&object, &code);
+    const uint32_t want_object = k.code == 99 ? app.wm : k.on_shell ? app.shell : l;
+    const uint32_t want_code = k.code == 99 ? 3 : k.code;
+    if (!err || object != want_object || code != want_code) printf("   layer error case '%s': error %d on %u code %u\n", k.what, err, object, code);
+    CHECK(err && object == want_object && code == want_code && app.closing);
+  }
+  {      // version 3: no on_demand; set_layer from 2 on
+    LayerApp app(server, 3);
+    const uint32_t s = app.surface(), l = app.new_id();
+    app.send(Msg(app.shell, 0).u(l).u(s).u(0).u(2).s("v3"));
+    app.send(Msg(l, 4).u(2));
+    uint32_t object = 0, code = 0;
+    CHECK(app.error(&object, &code) && object == l && code == 3);
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Bit flips over a session that makes panels, a popup of one and changes them.
+static void test_layer_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(23).s("zwlr_layer_shell_v1").u(4).u(5));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(6));
+  add(Msg(3, 0).u(10));
+  add(Msg(5, 0).u(11).u(10).u(0).u(2).s("panel"));
+  add(Msg(11, 1).u(1 | 4 | 8));
+  add(Msg(11, 0).u(0).u(30));
+  add(Msg(11, 2).i(30));
+  add(Msg(11, 3).i(2).i(3).i(4).i(5));
+  add(Msg(11, 4).u(2));
+  add(Msg(10, 6));
+  add(Msg(11, 6).u(1));
+  add(Msg(6, 0).u(12).i(4096 * 32));
+  add(Msg(12, 0).u(13).i(0).i(64).i(30).i(256).u(1));
+  add(Msg(10, 1).u(13).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(4, 1).u(14));                                   // positioner
+  add(Msg(14, 1).i(50).i(40));
+  add(Msg(14, 2).i(0).i(0).i(10).i(10));
+  add(Msg(3, 0).u(15));
+  add(Msg(4, 2).u(16).u(15));
+  add(Msg(16, 2).u(17).u(0).u(14));                       // popup, no parent
+  add(Msg(11, 5).u(17));                                  // get_popup
+  add(Msg(15, 6));
+  add(Msg(11, 8).u(3));
+  add(Msg(11, 0).u(100).u(0));
+  add(Msg(11, 1).u(2 | 4));
+  add(Msg(10, 6));
+  add(Msg(11, 7));
+  add(Msg(10, 0));
+  add(Msg(1, 0).u(18));
+  std::vector<uint8_t> pool(4096 * 32, 0x55);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &pool)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      desktop::WindowsWindowInfo info;
+      info_of(server, w, &info);
+      server.activate_window(w);
+      server.window_pixel(w, 1, 1);
+    }
+    desktop::IWindowsSession::Monitor m;
+    m.rect = {0, 0, 800, 600};
+    m.work = {0, 30, 800, 540};
+    m.panel_area = {0, 0, 800, 570};
+    server.set_display(800, 600, ArrayView<const desktop::IWindowsSession::Monitor>(&m, 1));
+    server.close_client(c);
+    server.set_display(800, 600, {});
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(77);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   layer fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ zwp_text_input_v3
+
+static void test_text_input() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  desktop::IWindowsSession::TextInputState st;
+  CHECK(!server.text_input(&st) && !server.text_preedit("x", 1) && !server.text_commit("x"));
+  App app(server);
+  CHECK(app.globals["zwp_text_input_manager_v3"].second == 1);
+  const uint32_t mgr = app.bind(app.reg, "zwp_text_input_manager_v3");
+  const uint32_t keyboard = app.new_id();
+  app.send(Msg(app.seat, 1).u(keyboard));
+  const uint32_t ti = app.new_id();
+  app.send(Msg(mgr, 1).u(ti).u(app.seat));
+  CHECK(!app.has(ti, 0));      // (no focus yet: no enter)
+  App::Window w = app.toplevel(true, "editor");
+  app.show(w, 300, 200, 0xFFFFFFFFu);
+  const uint32_t win = listed(server)[0];
+  server.move_window(win, {100, 100, 308, 232});      // inside at (104, 128)
+  server.activate_window(win);
+  Ev enter = app.take(ti, 0);
+  CHECK(enter.object == ti && enter.u(0) == w.surface);
+  // entered but not enabled: the input method sees nothing
+  CHECK(!server.text_input(&st));
+  // enable with a cursor and a content type, committed
+  app.send(Msg(ti, 1));
+  app.send(Msg(ti, 6).i(30).i(40).i(2).i(16));
+  app.send(Msg(ti, 5).u(0x200).u(1));
+  app.send(Msg(ti, 3).s("hello").i(5).i(5));
+  CHECK(!server.text_input(&st));      // (not committed yet)
+  app.send(Msg(ti, 7));
+  CHECK(server.text_input(&st) && st.enabled && st.window == win && st.cursor.x == 104 + 30 && st.cursor.y == 128 + 40 && st.cursor.height == 16 &&
+        st.hint == 0x200 && st.purpose == 1);
+  // preedit and commit: each closed with done(the number of commits)
+  app.drop_events();
+  CHECK(server.text_preedit("u1f6", 4));
+  Ev pre = app.take(ti, 2);
+  CHECK(pre.object == ti && pre.s(0) == "u1f6" && pre.i(3) == 4 && pre.i(4) == 4);      // (the string takes words 0 to 2)
+  Ev done = app.take(ti, 5);
+  CHECK(done.object == ti && done.u(0) == 1);
+  CHECK(server.text_preedit("", 0));
+  pre = app.take(ti, 2);
+  CHECK(pre.object == ti && pre.u(0) == 0);      // (null: no preedit)
+  CHECK(server.text_commit("\xf0\x9f\x98\x80"));
+  Ev com = app.take(ti, 3);
+  CHECK(com.object == ti && com.s(0) == "\xf0\x9f\x98\x80" && app.take(ti, 5).u(0) == 1);
+  CHECK(!server.text_commit("\xf0\x9f"));      // (a cut character is not sent)
+  // a second commit: the serial follows
+  app.send(Msg(ti, 7));
+  app.drop_events();
+  CHECK(server.text_commit("a") && app.take(ti, 5).u(0) == 2);
+  // disabled: nothing takes text
+  app.send(Msg(ti, 2));
+  app.send(Msg(ti, 7));
+  CHECK(!server.text_input(&st) && !server.text_commit("a"));
+  // enabled again, then the focus goes to another client's window: leave; the other client's text input enters
+  app.send(Msg(ti, 1));
+  app.send(Msg(ti, 7));
+  App other(server);
+  const uint32_t mgr2 = other.bind(other.reg, "zwp_text_input_manager_v3");
+  const uint32_t ti2 = other.new_id();
+  other.send(Msg(mgr2, 1).u(ti2).u(other.seat));
+  App::Window w2 = other.toplevel(true, "other");
+  app.drop_events();
+  other.show(w2, 100, 100, 0xFF000000u);
+  CHECK(app.take(ti, 1).u(0) == w.surface);
+  CHECK(other.take(ti2, 0).u(0) == w2.surface);
+  CHECK(!server.text_input(&st));      // (the other one is not enabled)
+  other.send(Msg(ti2, 1));
+  other.send(Msg(ti2, 7));
+  CHECK(server.text_input(&st) && st.window != win);
+  CHECK(server.text_commit("b") && other.take(ti2, 3).s(0) == "b");
+  // a text input made while its client has the keyboard is entered at once
+  const uint32_t ti3 = other.new_id();
+  other.send(Msg(mgr2, 1).u(ti3).u(other.seat));
+  CHECK(other.take(ti3, 0).u(0) == w2.surface);
+  // the focused surface goes: its text inputs are entered on nothing (no leave naming a dead surface)
+  other.send(Msg(w2.toplevel, 0));
+  other.send(Msg(w2.xdg, 0));
+  other.send(Msg(w2.surface, 0));
+  CHECK(!server.text_input(&st) && !other.closing);
+  // errors: surrounding text cut in the middle of a character, a cursor past it; another seat object
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    const uint32_t t = bad.new_id();
+    bad.send(Msg(m, 1).u(t).u(bad.seat));
+    bad.send(Msg(t, 3).s("ab\xc3").i(0).i(0));
+    CHECK(bad.error() && bad.closing);
+  }
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    const uint32_t t = bad.new_id();
+    bad.send(Msg(m, 1).u(t).u(bad.seat));
+    bad.send(Msg(t, 3).s("ab").i(3).i(0));
+    CHECK(bad.error() && bad.closing);
+  }
+  {
+    App bad(server);
+    const uint32_t m = bad.bind(bad.reg, "zwp_text_input_manager_v3");
+    bad.send(Msg(m, 1).u(bad.new_id()).u(bad.compositor));
+    CHECK(bad.error() && bad.closing);
+  }
+  CHECK(!app.closing && !other.closing);
+}
+
+// Bit flips over a session that enables text inputs, sets their state and is given text.
+static void test_text_input_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(24).s("zwp_text_input_manager_v3").u(1).u(5));
+  add(Msg(2, 0).u(4).s("wl_seat").u(8).u(6));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(7));
+  add(Msg(5, 1).u(8).u(6));                       // text input
+  add(Msg(3, 0).u(10));
+  add(Msg(4, 2).u(11).u(10));
+  add(Msg(11, 1).u(12));
+  add(Msg(10, 6));
+  add(Msg(11, 4).u(1));
+  add(Msg(7, 0).u(13).i(4096 * 16));
+  add(Msg(13, 0).u(14).i(0).i(32).i(32).i(128).u(1));
+  add(Msg(10, 1).u(14).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(8, 1));
+  add(Msg(8, 3).s("caf\xc3\xa9 au lait").i(5).i(2));
+  add(Msg(8, 4).u(0));
+  add(Msg(8, 5).u(0x1FF).u(4));
+  add(Msg(8, 6).i(3).i(4).i(1).i(12));
+  add(Msg(8, 7));
+  add(Msg(5, 1).u(15).u(6));
+  add(Msg(15, 2));
+  add(Msg(15, 7));
+  add(Msg(15, 0));
+  add(Msg(8, 2));
+  add(Msg(8, 7));
+  add(Msg(1, 0).u(16));
+  std::vector<uint8_t> pool(4096 * 16, 0x33);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &pool)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      desktop::IWindowsSession::TextInputState st;
+      if (server.text_input(&st)) {
+        server.text_preedit("u4", 2);
+        server.text_commit("\xe2\x82\xac");
+      }
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    for (uint32_t w : list.view()) server.activate_window(w);
+    server.close_client(c);
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(31);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   text input fuzz: %d sessions\n", sessions);
   CHECK(server.client_count() == 0);
   free_made();
 }
@@ -2632,6 +3732,292 @@ static void test_clipboard_images() {
   free_made();
 }
 
+// The transport's side of a program drop: the pipe it makes for `job` (handed to the server), and the data the source wrote, read back.
+static uint32_t take_pipe_job(Server& server) {
+  List<wayland::TransportRequest> reqs(A);
+  server.take_requests(&reqs);
+  for (wayland::TransportRequest& r : reqs.view()) if (r.kind == wayland::TransportRequest::Kind::MakePipe) return r.job;
+  return 0;
+}
+static std::string take_write(Server& server) {
+  List<wayland::TransportRequest> reqs(A);
+  server.take_requests(&reqs);
+  for (wayland::TransportRequest& r : reqs.view())
+    if (r.kind == wayland::TransportRequest::Kind::Write && r.data) return std::string(reinterpret_cast<const char*>(r.data->view().data()), r.data->size());
+  return "<none>";
+}
+
+// Drags between Wayland clients and the desktop's windows (WaylandDragBridge.cpp).
+static void test_desktop_drag_bridge() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  DataApp app(server);
+  App::Window w = app.toplevel(false, "target");
+  const uint32_t win = shown_window(server, app, w, 0xFF0000FFu);
+  server.move_window(win, {100, 100, 100, 80});
+  app.drop_events();
+  auto offer_types = [&](uint32_t offer) {
+    std::vector<std::string> t;
+    for (const Ev& e : app.events) if (e.object == offer && e.opcode == 0) t.push_back(e.s(0));
+    return t;
+  };
+  // the desktop's file over the window: entered with a URI list and text, copy only
+  CHECK(!server.desktop_drag(win, 150, 130, "/Desktop/Documents/a b.txt"));
+  Ev enter = app.take(app.device, 1);
+  CHECK(enter.object == app.device && enter.u(1) == w.surface && enter.i(2) == 50 * 256 && enter.i(3) == 30 * 256);
+  const uint32_t offer = enter.u(4);
+  std::vector<std::string> types = offer_types(offer);
+  CHECK((types == std::vector<std::string>{"text/uri-list", "text/plain;charset=utf-8", "text/plain"}) && app.take(offer, 1).u(0) == 1);
+  // the client accepts the URI list: the desktop is told it would be taken; it moves
+  app.send(Msg(offer, 0).u(enter.u(0)).s("text/uri-list"));
+  app.send(Msg(offer, 4).u(1).u(1));
+  CHECK(app.take(offer, 2).u(0) == 1);
+  CHECK(server.desktop_drag(win, 152, 131, "/Desktop/Documents/a b.txt"));
+  Ev motion = app.take(app.device, 3);
+  CHECK(motion.object == app.device && motion.i(1) == 52 * 256);
+  // dropped: the client reads the URI (percent-encoded, as Linux sees it) and the text form (the Linux path), then finishes
+  CHECK(server.desktop_drop() && app.has(app.device, 4));
+  std::vector<uint8_t> pipe;
+  app.send(Msg(offer, 1).s("text/uri-list"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "file:///mnt/desktop/Documents/a%20b.txt\r\n");
+  app.send(Msg(offer, 1).s("text/plain"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "/mnt/desktop/Documents/a b.txt");
+  app.send(Msg(offer, 1).s("image/png"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "<none>");      // (not offered)
+  app.send(Msg(offer, 3));
+  CHECK(!app.closing);
+  // text, and a file Linux cannot see: text only, the system path as it is
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "hello world");
+  enter = app.take(app.device, 1);
+  types = offer_types(enter.u(4));
+  CHECK((types == std::vector<std::string>{"text/plain;charset=utf-8", "text/plain"}));
+  server.desktop_drag(0, 0, 0, StringView());      // (left the session's windows)
+  CHECK(app.has(app.device, 2));
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "/AppStore/Browser/cache.db");
+  enter = app.take(app.device, 1);
+  types = offer_types(enter.u(4));
+  CHECK(types.size() == 2);
+  app.send(Msg(enter.u(4), 0).u(enter.u(0)).s("text/plain"));
+  CHECK(server.desktop_drag(win, 151, 130, "/AppStore/Browser/cache.db") && server.desktop_drop());
+  app.send(Msg(enter.u(4), 1).s("text/plain"), {Fd::make_as<TestMemory>(A, &pipe)});
+  CHECK(take_write(server) == "/AppStore/Browser/cache.db");
+  app.send(Msg(enter.u(4), 3));
+  // over the window without accepting: the drop is refused, the client left
+  app.drop_events();
+  CHECK(!server.desktop_drag(win, 150, 130, "/Linux/root/x") && !server.desktop_drop() && app.has(app.device, 2));
+  // a drag ended by the desktop (Escape): left
+  app.drop_events();
+  server.desktop_drag(win, 150, 130, "/Linux/root/x");
+  server.desktop_drag_end();
+  CHECK(app.has(app.device, 2) && !server.desktop_drop());
+  // a client drags its file onto the desktop: read from its source (URIs become system paths, one per line), dropped where it was let go
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src = app.source({"text/plain", "text/uri-list"}, 1);
+  app.send(Msg(app.device, 0).u(src).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  CHECK(app.has(src, 3));      // dnd_drop_performed
+  String items(A);
+  int32_t dx = 0, dy = 0;
+  CHECK(!server.take_program_drop(&items, &dx, &dy));      // (not read yet)
+  uint32_t job = take_pipe_job(server);
+  CHECK(job != 0);
+  std::vector<uint8_t> write_end;
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  Ev send_ev = app.take(src, 1);
+  CHECK(send_ev.object == src && send_ev.s(0) == "text/uri-list");
+  const std::string uris = "file:///mnt/desktop/Documents/a%20b.txt\r\n# a comment\r\nfile:///root/x.txt\r\nhttp://example.com/\r\nfile:///bad%2\r\nfile://localhost/mnt/c/Temp/t.txt\r\n";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(uris.data()), uris.size()));
+  CHECK(server.take_program_drop(&items, &dx, &dy) && dx == 700 && dy == 500);
+  CHECK(items.view() == StringView("/Desktop/Documents/a b.txt\n/Linux/root/x.txt\n/Windows/Temp/t.txt"));
+  CHECK(!server.take_program_drop(&items, &dx, &dy));      // (given once)
+  server.program_drop_done(true);
+  CHECK(app.has(src, 4) && !app.has(src, 2));      // dnd_finished
+  // nothing took it: cancelled
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src2 = app.source({"text/plain;charset=utf-8"}, 1);
+  app.send(Msg(app.device, 0).u(src2).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  CHECK(app.take(src2, 1).s(0) == "text/plain;charset=utf-8");
+  const std::string text = "two\nlines";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+  CHECK(server.take_program_drop(&items, &dx, &dy) && items.view() == StringView("two lines"));      // (text is one item)
+  server.program_drop_done(false);
+  CHECK(app.has(src2, 2));
+  // URIs that are no files: cancelled at once; a source with nothing for the desktop: cancelled at the release; the source going meanwhile
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src3 = app.source({"text/uri-list"}, 1);
+  app.send(Msg(app.device, 0).u(src3).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  const std::string web = "https://example.com/\r\n";
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(web.data()), web.size()));
+  CHECK(app.has(src3, 2) && !server.take_program_drop(&items, &dx, &dy));
+  app.drop_events();
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src4 = app.source({"image/png"}, 1);
+  app.send(Msg(app.device, 0).u(src4).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  CHECK(app.has(src4, 2) && take_pipe_job(server) == 0);
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src5 = app.source({"text/plain"}, 1);
+  app.send(Msg(app.device, 0).u(src5).u(w.surface).u(0).u(0));
+  server.mouse_position(700, 500);
+  server.mouse_button(1, false);
+  job = take_pipe_job(server);
+  app.send(Msg(src5, 1));      // destroy
+  server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+  server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+  CHECK(!server.take_program_drop(&items, &dx, &dy) && !app.closing);
+  // a client's drag over the desktop before it is let go: read at once, shown to the desktop, whose answer the source hears as target and action
+  {
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sd = app.source({"text/uri-list", "text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(sd).u(w.surface).u(0).u(0));
+    CHECK(take_pipe_job(server) == 0 && !server.program_drag(&items, &dx, &dy));      // (over its own surface: not the desktop's)
+    server.mouse_position(600, 400);
+    const uint32_t dj = take_pipe_job(server);
+    CHECK(dj != 0 && !server.program_drag(&items, &dx, &dy));      // (asked for, not read yet)
+    server.pipe_ready(dj, Fd::make_as<TestMemory>(A, &write_end));
+    CHECK(app.take(sd, 1).s(0) == "text/uri-list");
+    const std::string one = "file:///mnt/desktop/Pictures/p.png\r\nfile:///etc/hosts\r\n";
+    server.pipe_read_done(dj, ConstByteView(reinterpret_cast<const uint8_t*>(one.data()), one.size()));
+    server.mouse_position(610, 405);
+    CHECK(server.program_drag(&items, &dx, &dy) && dx == 610 && dy == 405 && items.view() == StringView("/Desktop/Pictures/p.png\n/Linux/etc/hosts"));
+    app.drop_events();
+    server.program_drag_answer(true);
+    Ev target = app.take(sd, 0);
+    CHECK(target.object == sd && target.s(0) == "text/uri-list" && app.take(sd, 5).u(0) == 1);
+    app.drop_events();
+    server.program_drag_answer(true);
+    CHECK(!app.has(sd, 0) && !app.has(sd, 5));      // (told once)
+    server.program_drag_answer(false);
+    CHECK(app.has(sd, 0) && app.take(sd, 5).u(0) == 0);
+    server.program_drag_answer(true);
+    // back over its surface: not the desktop's any more (the source hears target null), and the desktop no longer sees it
+    app.drop_events();
+    server.mouse_position(150, 130);
+    CHECK(!server.program_drag(&items, &dx, &dy) && app.has(sd, 0));
+    server.program_drag_answer(true);      // (ignored: it is not over the desktop)
+    CHECK(!app.has(sd, 5));
+    // out again: what was read is kept (no second read); let go there, the drop is what was read, at once
+    server.mouse_position(620, 410);
+    CHECK(take_pipe_job(server) == 0 && server.program_drag(&items, &dx, &dy));
+    server.mouse_button(1, false);
+    CHECK(app.has(sd, 3) && take_pipe_job(server) == 0);
+    CHECK(server.take_program_drop(&items, &dx, &dy) && dx == 620 && items.view() == StringView("/Desktop/Pictures/p.png\n/Linux/etc/hosts"));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.program_drop_done(true);
+    CHECK(app.has(sd, 4));
+    // let go while the read is under way: the drop takes that read over
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t se = app.source({"text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(se).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t ej = take_pipe_job(server);
+    server.mouse_button(1, false);
+    CHECK(ej != 0 && app.has(se, 3) && take_pipe_job(server) == 0);
+    server.pipe_ready(ej, Fd::make_as<TestMemory>(A, &write_end));
+    CHECK(app.take(se, 1).s(0) == "text/plain");
+    const std::string word = "hello";
+    server.pipe_read_done(ej, ConstByteView(reinterpret_cast<const uint8_t*>(word.data()), word.size()));
+    CHECK(server.take_program_drop(&items, &dx, &dy) && items.view() == StringView("hello"));
+    server.program_drop_done(false);
+    CHECK(app.has(se, 2));
+    // what was read has nothing for the desktop: never shown, and let go there it is cancelled
+    app.drop_events();
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sf = app.source({"text/uri-list"}, 1);
+    app.send(Msg(app.device, 0).u(sf).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t fj = take_pipe_job(server);
+    server.pipe_ready(fj, Fd::make_as<TestMemory>(A, &write_end));
+    server.pipe_read_done(fj, ConstByteView(reinterpret_cast<const uint8_t*>(web.data()), web.size()));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.mouse_button(1, false);
+    CHECK(app.has(sf, 2) && !app.has(sf, 3) && !server.take_program_drop(&items, &dx, &dy));
+    // the source going while it is over the desktop: nothing left of it
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t sg = app.source({"text/plain"}, 1);
+    app.send(Msg(app.device, 0).u(sg).u(w.surface).u(0).u(0));
+    server.mouse_position(600, 400);
+    const uint32_t gj = take_pipe_job(server);
+    app.send(Msg(sg, 1));      // destroy
+    server.pipe_ready(gj, Fd::make_as<TestMemory>(A, &write_end));
+    server.pipe_read_done(gj, ConstByteView(reinterpret_cast<const uint8_t*>(word.data()), word.size()));
+    CHECK(!server.program_drag(&items, &dx, &dy));
+    server.program_drag_answer(true);
+    server.mouse_button(1, false);
+    CHECK(!server.take_program_drop(&items, &dx, &dy) && !app.closing);
+  }
+  // while a client's drag runs, the desktop's drag is not let in
+  server.mouse_position(150, 130);
+  server.mouse_button(1, true);
+  const uint32_t src6 = app.source({"text/plain"}, 1);
+  app.send(Msg(app.device, 0).u(src6).u(w.surface).u(0).u(0));
+  CHECK(!server.desktop_drag(win, 150, 130, "/Linux/x"));
+  server.mouse_button(1, false);
+  server.program_drop_done(false);
+  take_pipe_job(server);
+  CHECK(!app.closing);
+  // fuzzed URI lists: never a crash, every item a path of the system
+  std::mt19937 rng(8);
+  for (int round = 0; round < 400; ++round) {
+    server.mouse_position(150, 130);
+    server.mouse_button(1, true);
+    const uint32_t s = app.source({"text/uri-list"}, 1);
+    app.send(Msg(app.device, 0).u(s).u(w.surface).u(0).u(0));
+    server.mouse_position(700, 500);
+    server.mouse_button(1, false);
+    job = take_pipe_job(server);
+    if (job == 0) { CHECK(false); break; }
+    server.pipe_ready(job, Fd::make_as<TestMemory>(A, &write_end));
+    std::string data = uris;
+    const int flips = 1 + int(rng() % 6);
+    for (int f = 0; f < flips; ++f) data[rng() % data.size()] ^= char(1u << (rng() % 8));
+    if (rng() % 3 == 0) data.resize(rng() % data.size());
+    server.pipe_read_done(job, ConstByteView(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
+    if (server.take_program_drop(&items, &dx, &dy)) {
+      bool rooted = true;
+      for (uint64_t at = 0; at < items.size();) {
+        uint64_t end = at;
+        while (end < items.size() && items.view()[end] != '\n') ++end;
+        const StringView item = items.view().substr(at, end - at);
+        if (item.empty() || item[0] != '/') rooted = false;
+        at = end + 1;
+      }
+      CHECK(rooted);
+      server.program_drop_done(round % 2 == 0);
+    }
+    app.drop_events();
+  }
+  CHECK(!app.closing);
+}
+
 static void test_drag_and_drop() {
   Server server(A);
   server.set_fd_maker(&make_test_fd, nullptr);
@@ -2681,7 +4067,24 @@ static void test_drag_and_drop() {
     a.send(Msg(a.device, 0).u(src2).u(wa.surface).u(0).u(0));
     server.mouse_position(600, 400);
     server.mouse_button(1, false);
-    CHECK(a.has(src2, 2));
+    CHECK(a.has(src2, 3));      // (let go over the desktop: handed to it, test_desktop_drag_bridge)
+    server.program_drop_done(false);
+    {
+      List<wayland::TransportRequest> reqs(A);
+      server.take_requests(&reqs);
+      for (wayland::TransportRequest& r : reqs.view()) {
+        if (r.kind != wayland::TransportRequest::Kind::MakePipe) continue;
+        std::vector<uint8_t> end;
+        server.pipe_ready(r.job, Fd::make_as<TestMemory>(A, &end));
+        const std::string t = "x";
+        server.pipe_read_done(r.job, ConstByteView(reinterpret_cast<const uint8_t*>(t.data()), t.size()));
+      }
+      String items(A);
+      int32_t dx = 0, dy = 0;
+      CHECK(server.take_program_drop(&items, &dx, &dy));
+      server.program_drop_done(false);
+    }
+    CHECK(a.has(src2, 2));      // nothing on the desktop took it: cancelled
     // a drag without a button held is cancelled at once
     const uint32_t src3 = a.source({"text/plain"});
     a.send(Msg(a.device, 0).u(src3).u(wa.surface).u(0).u(0));
@@ -3086,10 +4489,19 @@ int main() {
   test_popups();
   test_subsurfaces();
   test_seat();
+  test_touch();
+  test_pen();
   test_errors();
   test_fuzz();
   test_dmabuf();
   test_dmabuf_fuzz();
+  test_yuv_convert();
+  test_yuv_buffers();
+  test_yuv_fuzz();
+  test_layer_shell();
+  test_layer_fuzz();
+  test_text_input();
+  test_text_input_fuzz();
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();
@@ -3100,6 +4512,7 @@ int main() {
   test_mapping();
   test_extras();
   test_drag_and_drop();
+  test_desktop_drag_bridge();
   test_dxg_fences();
   test_dxg_threads();
   test_threads();

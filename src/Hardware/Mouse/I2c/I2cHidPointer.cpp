@@ -239,7 +239,31 @@ void I2cHidPointer::frame(const Contact* contacts, uint32_t count, bool button, 
   else touchscreen_frame(active, n);
 }
 
+bool I2cHidPointer::poll_touch(TouchEvent* out) {
+  pump();      // (reads what the device has, outside the lock it takes itself)
+  kernel::ScopedMutex guard(mutex_);
+  return touches_.pop(out);
+}
+
+void I2cHidPointer::set_pointer_emulation(bool on) {
+  kernel::ScopedMutex guard(mutex_);
+  emulation_ = on;
+}
+
 void I2cHidPointer::touchscreen_frame(const Contact* active, uint32_t n) {
+  // the touch events: each contact, its position clamped to the logical range
+  TouchTracker::Contact touching[kMaxContacts];
+  for (uint32_t i = 0; i < n && i < kMaxContacts; ++i) {
+    int32_t cx = active[i].x - min_x_, cy = active[i].y - min_y_;
+    cx = cx < 0 ? 0 : static_cast<uint32_t>(cx) > range_x_ ? static_cast<int32_t>(range_x_) : cx;
+    cy = cy < 0 ? 0 : static_cast<uint32_t>(cy) > range_y_ ? static_cast<int32_t>(range_y_) : cy;
+    touching[i] = {active[i].id, static_cast<uint32_t>(cx), static_cast<uint32_t>(cy)};
+  }
+  touches_.frame(ArrayView<const TouchTracker::Contact>(touching, n < kMaxContacts ? n : kMaxContacts), range_x_, range_y_);
+  if (!emulation_) {      // (someone reads the touches and moves the pointer itself)
+    touch_down_ = false;
+    return;
+  }
   if (n == 0) {
     if (touch_down_) push(0, 0, 0, 0, true, touch_x_, touch_y_);
     touch_down_ = false;

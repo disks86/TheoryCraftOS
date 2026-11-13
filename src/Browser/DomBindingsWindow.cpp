@@ -484,6 +484,26 @@ NATIVE(node_page_rect) {
   return true;
 }
 
+NATIVE(node_clips_native) {   // (IntersectionObserver: does an ancestor's box cut its targets off? From the boxes, not the style: no style is worked out)
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  *result = num_value(n ? impl(vm).host.node_clips(n) : -1);
+  return true;
+}
+
+// __classic_script_source(address): the text of a classic script element's src, fetched without CORS like the parser's scripts; null if it failed.
+NATIVE(classic_script_source) {
+  (void)self;
+  String address(vm.allocator()), text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &address)) return false;
+  if (!impl(vm).host.fetch_classic_script(address.view(), &text)) {
+    *result = Value::make_null();
+    return true;
+  }
+  *result = str_value(vm, text.view());
+  return true;
+}
+
 NATIVE(layout_ready_native) {
   (void)self; (void)args; (void)argc;
   *result = bool_value(impl(vm).host.layout_ready());
@@ -1220,6 +1240,8 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_native(g, "__pip_element", pip_element, 0);
   vm.define_native(g, "__set_hidden", set_hidden, 1);
   vm.define_native(g, "__rect", node_page_rect, 1);
+  vm.define_native(g, "__clips", node_clips_native, 1);
+  vm.define_native(g, "__classic_script_source", classic_script_source, 1);
   vm.define_native(g, "__layout_ready", layout_ready_native, 0);
   vm.define_native(g, "__history_entries", history_entries, 0);
   vm.define_native(g, "__nav_state", nav_state, 1);

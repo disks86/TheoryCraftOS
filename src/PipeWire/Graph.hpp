@@ -46,6 +46,7 @@
 #include "PipeWire/Properties.hpp"
 #include "PipeWire/RecordStream.hpp"
 #include "PipeWire/VideoChannel.hpp"
+#include "PipeWire/VideoDecode.hpp"
 #include "PipeWire/VirtualSink.hpp"
 #include "Utility/SharedPointer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -93,6 +94,7 @@ struct GraphObject {
   SharedPointer<VideoChannel> video;                 // a video node: what its producer shows (a watcher's is its producer's)
   SharedPointer<MidiQueue> midi_in;                  // a MIDI node that listens: what it hears
   SharedPointer<VirtualOutput> virtual_output;       // a virtual sink: its mixer (and a stream into or out of one: that sink's, kept while the stream is)
+  bool virtual_source = false;                       // a virtual node that is a source (Audio/Source/Virtual); a record node: it records one
   uint32_t target = 0;                               // a stream into or out of a virtual sink: the sink's node (0: the speakers or the microphone)
   uint32_t direction_of_node = kDirectionOutput;     // a MIDI, video or linked node: which way it goes (output: it plays or shows)
   // a port
@@ -109,6 +111,7 @@ struct GraphEntry {
   ObjectType type;
   uint64_t changed;
   NodeRole role = NodeRole::None;
+  bool virtual_source = false;      // (a Virtual node that is a source)
 };
 
 class Graph {
@@ -190,18 +193,29 @@ class Graph {
   uint32_t create_video_node(uint32_t client, const Properties& props, uint32_t direction, SharedPointer<VideoChannel>* channel);
   // How many watchers a video producer has (input video nodes linked to it).
   uint32_t video_watchers(uint32_t producer);
+  // The video producers there are now (output video nodes: the cameras, the screen, programs' cameras and screen shares), oldest first.
+  bool video_producers(List<uint32_t>* out);
   bool link_video(uint32_t node, SharedPointer<VideoChannel>* channel);
   SharedPointer<VideoChannel> video_of(uint32_t node);
 
   // ---- the adapter factory's virtual sinks and sources (support.null-audio-sink): a node with `channels` input ports and as many monitor (output)
-  // ports. A `linger`ing one stays when its client goes (it is the kernel's then).
-  static constexpr uint32_t kMaxVirtualSinks = 16;
+  // ports. A `linger`ing one stays when its client goes (it is the kernel's then). With media.class Audio/Source/Virtual (or any Audio/Source class)
+  // it is a virtual source instead: the same mixer, its ports input_FL.. and capture_FL.., what plays into it (a module's loop, a stream that names
+  // it) heard by what records from it; its volume scales what its recorders hear.
+  static constexpr uint32_t kMaxVirtualSinks = 16;      // (sinks and sources together)
   uint32_t create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate);
   // The clock virtual sinks play on (nanoseconds, monotonic); without one, no virtual sink can be made.
   void set_clock(uint64_t (*now_ns)()) { clock_.set(now_ns); }
-  // The virtual sinks there are now, oldest first; and whether a node is one.
+  // Where watchers of encoded video get decoders for codecs other than Motion JPEG (the machine's video codecs); without, only Motion JPEG is
+  // decoded. Set once, before the protocol servers run.
+  void set_video_codecs(IVideoCodecs* decoders) { __atomic_store_n(&decoders_, decoders, __ATOMIC_RELEASE); }
+  IVideoCodecs* video_codecs() const { return __atomic_load_n(&decoders_, __ATOMIC_ACQUIRE); }
+  // The virtual sinks (sources) there are now, oldest first; and whether a node is one. is_virtual: either.
   bool virtual_sinks(List<uint32_t>* out);
+  bool virtual_sources(List<uint32_t>* out);
   bool is_virtual_sink(uint32_t node);
+  bool is_virtual_source(uint32_t node);
+  bool is_virtual(uint32_t node);
   void keep_node(uint32_t node);
   // The node `target` names (target.object, node.target: a node.name, an object.serial or an id); 0 if none.
   uint32_t find_node(StringView target);
@@ -242,8 +256,9 @@ class Graph {
   bool add_source_locked();
   uint32_t add_record_node_locked(uint32_t client, Origin origin, const PcmFormat& format, const Properties& props, bool monitor, uint32_t target = 0);
   void add_capture_ports_locked(GraphObject& node, uint32_t client, const PcmFormat& format, bool monitor, uint32_t target = 0);
-  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer = nullptr);
+  SharedPointer<RecordStream> open_record_stream(const PcmFormat& format, bool monitor, VirtualOutput* sink = nullptr);
   SharedPointer<VirtualOutput> virtual_output_locked(uint32_t node);
+  void apply_record_gain_locked(GraphObject& record);
   void name_stream_node_locked(GraphObject& node, uint32_t client, const PcmFormat& format);
   void sync_source_locked(StringView device_name, uint8_t gain, bool muted);
   void sync_native_capture_locked(const List<SharedPointer<audio::CaptureStream>>& live);
@@ -259,6 +274,7 @@ class Graph {
   allocators::IAllocator& allocator_;
   audio::AudioMixer* mixer_;
   FunctionClock clock_;
+  IVideoCodecs* decoders_ = nullptr;
   audio::AudioCaptureHub* capture_;
   kernel::Mutex mutex_;
   List<UniquePointer<GraphObject>> objects_;      // in id order

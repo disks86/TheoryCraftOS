@@ -63,6 +63,14 @@ inline constexpr const char* kCalendarDatabase = "/AppStore/Calendar/calendar.db
 // The to-do application's items (the "Todo" application's folder in the AppStore).
 inline constexpr const char* kTodoDatabase = "/AppStore/Todo/todo.db";
 
+// The App Manager (the AppImage package manager, src/Desktop/AppMan): its copy of the AppMan catalog (the "AppMan" application's folder in the AppStore).
+// The programs it installs live in the Linux world, laid out as AppMan ("am") lays them out: /opt/<app>/ (the AppImage, its version and remove files,
+// icons/<app>), a desktop entry in /usr/local/share/applications/<app>-AM.desktop and a link in /usr/local/bin.
+inline constexpr const char* kAppManFolder = "/AppStore/AppMan";
+inline constexpr const char* kAppManCatalog = "/AppStore/AppMan/stats-appimages";
+inline constexpr const char* kLinuxOpt = "/Linux/opt";
+inline constexpr const char* kLinuxLocalBin = "/Linux/usr/local/bin";
+
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
 
@@ -84,6 +92,10 @@ inline constexpr const char* kWindowsUsers = "/Windows/Users";
 inline constexpr const char* kWindowsDirectory = "/Windows/Windows";
 inline constexpr const char* kWindowsSystem32 = "/Windows/Windows/System32";
 inline constexpr const char* kWindowsSysWow64 = "/Windows/Windows/SysWOW64";
+// Where installed Windows programs put their Start menu shortcuts (.lnk): for every user (C:\ProgramData\...) and, under each folder of
+// kWindowsUsers, for one user (kWindowsUserStartMenuPrograms is relative to the user's folder). The desktop's Start menu lists them.
+inline constexpr const char* kWindowsStartMenuPrograms = "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs";
+inline constexpr const char* kWindowsUserStartMenuPrograms = "AppData/Roaming/Microsoft/Windows/Start Menu/Programs";
 
 // What a Linux process sees as /bin, /etc, /home, /tmp and /usr/bin.
 inline constexpr const char* kLinuxBin = "/Linux/bin";
@@ -91,9 +103,20 @@ inline constexpr const char* kLinuxEtc = "/Linux/etc";
 inline constexpr const char* kLinuxHome = "/Linux/home";
 inline constexpr const char* kLinuxTmp = "/Linux/tmp";
 inline constexpr const char* kLinuxUsrBin = "/Linux/usr/bin";
+inline constexpr const char* kLinuxRootHome = "/Linux/root";   // root's home folder (Linux programs run as root)
+// Where installed Linux programs put their desktop entries (.desktop files, the freedesktop.org menu): the desktop's Start menu lists them.
+inline constexpr const char* kLinuxApplications = "/Linux/usr/share/applications";
+inline constexpr const char* kLinuxLocalApplications = "/Linux/usr/local/share/applications";
+inline constexpr const char* kLinuxRootApplications = "/Linux/root/.local/share/applications";
 // Where a Linux process sees the Windows tree (/Windows, the C: drive), as under WSL: a path in the Linux process's own view, not one of the OS's file
 // system. Files (and unix sockets, see Process/UnixSockets.hpp) made there by one kind of program are the other's.
 inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";
+// Where a Linux process sees the user's files (/Desktop with Documents, Downloads, ...), the same way: what the desktop hands a Linux program (a file
+// dropped on its window) is there for it to open.
+inline constexpr const char* kLinuxDesktopDrive = "/mnt/desktop";
+// Where a Windows process sees the user's files: C:\Users\Public\Desktop is /Desktop (a path in the Windows process's view of C:, as ProcessFiles has
+// it, without the drive). The folder of that name in /Windows is hidden by it.
+inline constexpr const char* kWindowsDesktopFolder = "/Users/Public/Desktop";
 // The X server's sockets (src/X11/X11SocketServer.hpp): /tmp/.X11-unix/X<display> as Linux programs see it, and where that is on the system's file system.
 inline constexpr const char* kLinuxX11SocketFolder = "/tmp/.X11-unix";
 inline constexpr const char* kX11SocketFolder = "/Linux/tmp/.X11-unix";
@@ -183,6 +206,88 @@ inline bool create_folders(filesystem::IFileSystem& fs) {
   for (const char* folder : kWindowsFolders) ok &= create_folder(fs, folder);
   for (const char* folder : kLinuxFolders) ok &= create_folder(fs, folder);
   return ok;
+}
+
+// A system path as a Linux process names it, into *out: /Linux/x is /x, /Windows/x is /mnt/c/x, /Desktop/x is /mnt/desktop/x. False for a path a Linux
+// process cannot see (/AppStore, /EFI, another volume) or on out-of-memory.
+inline bool linux_view_of(StringView system_path, String* out) {
+  struct Mount { const char* system; const char* seen; };
+  const Mount mounts[] = {{kWindows, kLinuxWindowsDrive}, {kDesktop, kLinuxDesktopDrive}, {kLinux, ""}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.system);
+    if (system_path.size() < root.size() || system_path.first(root.size()) != root) continue;
+    const StringView rest = system_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;      // ("/Linuxish" is not)
+    if (!out->assign(StringView(m.seen)) || !out->append(rest)) return false;
+    if (out->empty()) return out->push_back('/');
+    return true;
+  }
+  return false;
+}
+
+// The other way: what a Linux process names /x (/mnt/c/x, /mnt/desktop/x) on the system. False for a relative path or on out-of-memory. (Windows'
+// names are not folded to the case the files have: the caller opens them through the file system, which compares names as it does.)
+inline bool system_path_of_linux(StringView linux_path, String* out) {
+  if (linux_path.empty() || linux_path[0] != '/') return false;
+  struct Mount { const char* seen; const char* system; };
+  const Mount mounts[] = {{kLinuxWindowsDrive, kWindows}, {kLinuxDesktopDrive, kDesktop}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.seen);
+    if (linux_path.size() < root.size() || linux_path.first(root.size()) != root) continue;
+    const StringView rest = linux_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;
+    return out->assign(StringView(m.system)) && out->append(rest);
+  }
+  if (!out->assign(StringView(kLinux))) return false;
+  return linux_path == StringView("/") || out->append(linux_path);
+}
+
+namespace detail {
+inline bool same_letters(char a, char b) { return (a >= 'A' && a <= 'Z' ? char(a + 32) : a) == (b >= 'A' && b <= 'Z' ? char(b + 32) : b); }
+}  // namespace detail
+
+// A system path as a Windows process names it, into *out: /Windows/x is C:\x, /Desktop/x is C:\Users\Public\Desktop\x. False for a path a Windows
+// process cannot see (/Linux, /AppStore, another volume, the hidden /Windows/Users/Public/Desktop) or on out-of-memory.
+inline bool windows_view_of(StringView system_path, String* out) {
+  struct Mount { const char* system; const char* seen; };
+  const Mount mounts[] = {{kDesktop, kWindowsDesktopFolder}, {kWindows, ""}};
+  for (const Mount& m : mounts) {
+    const StringView root(m.system);
+    if (system_path.size() < root.size() || system_path.first(root.size()) != root) continue;
+    const StringView rest = system_path.without_prefix(root.size());
+    if (!rest.empty() && rest[0] != '/') continue;
+    if (m.seen[0] == 0) {      // under /Windows: not the folder the desktop's mount hides
+      const StringView hidden(kWindowsDesktopFolder);
+      if (rest.size() >= hidden.size()) {
+        bool same = true;
+        for (uint64_t i = 0; i < hidden.size() && same; ++i) same = detail::same_letters(rest[i], hidden[i]);
+        if (same && (rest.size() == hidden.size() || rest[hidden.size()] == '/')) return false;
+      }
+    }
+    if (!out->assign(StringView("C:"))) return false;
+    for (char c : StringView(m.seen)) if (!out->push_back(c == '/' ? '\\' : c)) return false;
+    for (char c : rest) if (!out->push_back(c == '/' ? '\\' : c)) return false;
+    if (out->size() == 2) return out->push_back('\\');
+    return true;
+  }
+  return false;
+}
+
+// The other way: what a Windows process names C:\x (or C:/x) on the system. False for another drive, a relative path or on out-of-memory. (Names keep
+// the case they are written in, as for system_path_of_linux.)
+inline bool system_path_of_windows(StringView windows_path, String* out) {
+  if (windows_path.size() < 3 || !detail::same_letters(windows_path[0], 'c') || windows_path[1] != ':' || (windows_path[2] != '\\' && windows_path[2] != '/'))
+    return false;
+  String rest(out->allocator());
+  for (char c : windows_path.without_prefix(2)) if (!rest.push_back(c == '\\' ? '/' : c)) return false;
+  StringView r = rest.view();
+  while (r.size() > 1 && r[r.size() - 1] == '/') r = r.first(r.size() - 1);
+  const StringView hidden(kWindowsDesktopFolder);
+  bool desktop = r.size() >= hidden.size() && (r.size() == hidden.size() || r[hidden.size()] == '/');
+  for (uint64_t i = 0; desktop && i < hidden.size(); ++i) desktop = detail::same_letters(r[i], hidden[i]);
+  if (desktop) return out->assign(StringView(kDesktop)) && out->append(r.without_prefix(hidden.size()));
+  if (!out->assign(StringView(kWindows))) return false;
+  return r == StringView("/") || out->append(r);
 }
 
 // "/AppStore/<app>" or "/AppStore/<app>/<sub>" in *path (replacing what it held). `app` is one folder name ("Browser"); `sub` may be a

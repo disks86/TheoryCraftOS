@@ -52,6 +52,13 @@ namespace process {
 // image's memory (its rows, pitch apart) and of `bytes` are what is copied: the shorter of the two.
 using DxgBufferCopier = bool (*)(dxgk::ExportedAllocation& exported, ByteView bytes, bool to_image);
 void set_dxg_buffer_copier(DxgBufferCopier copier);
+// Whether the GPU is done with an export (dxgk::export_idle); a timeline's value and its raising (dxgk::exported_sync_value, signal_exported_sync). Set
+// with the copier, at boot.
+using DxgBufferIdler = bool (*)(dxgk::ExportedAllocation& exported);
+void set_dxg_buffer_idler(DxgBufferIdler idler);
+using DxgSyncReader = uint64_t (*)(dxgk::ExportedSync& exported);
+using DxgSyncSignaller = void (*)(dxgk::ExportedSync& exported, uint64_t point);
+void set_dxg_sync_ops(DxgSyncReader reader, DxgSyncSignaller signaller);
 // What the image of an export is (fixed when it was made): its size, bytes per row and the Direct3D layer's format number (dxgk::Format: 1 A8R8G8B8, 2 X8R8G8B8,
 // 3 A8B8G8R8, 4 X8B8G8R8, ...). Given at boot like the copier (set_dxg_buffer_describer); without one, describe() fails.
 struct DxgBufferImage {
@@ -86,6 +93,8 @@ class DxgBufferFile final : public filesystem::IFile {
   // process drawing its frames into a dmabuf, TCOS_DXG_IOCTL_GL). The CPU's copy is left as it is (a mapping sees the new pixels after DMA_BUF_IOCTL_SYNC, as
   // on Linux). False when the GPU still works on the image or there is no copier.
   bool copy_image(ByteView bytes, bool to_image);
+  // Whether the GPU is done with the image (true without an idler: not known, taken as done).
+  bool gpu_idle();
 
   // --- IFile (its size is the image's memory; reading, writing and resizing are not supported)
   uint64_t size() const override { return bytes_; }
@@ -122,6 +131,9 @@ class DxgSyncFile final : public filesystem::IFile {
   DxgSyncFile(const DxgSyncFile&) = delete;
   DxgSyncFile& operator=(const DxgSyncFile&) = delete;
   const SharedPointer<dxgk::ExportedSync>& exported() const { return exported_; }
+  // The timeline's value now, and raising it to `point` (false without the ops: set_dxg_sync_ops).
+  bool value(uint64_t* out);
+  bool signal(uint64_t point);
 
   uint64_t size() const override { return 0; }
   filesystem::Status read(uint64_t, ByteView, uint64_t* transferred) override {

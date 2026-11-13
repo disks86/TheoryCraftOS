@@ -177,6 +177,8 @@ struct Window {
   uint32_t creating_stage = 0;   // nonzero while WM_NCCREATE/WM_CREATE run
   uint32_t cs_style = 0, cs_ex_style = 0;    // what CreateWindowEx was given (the CREATESTRUCT of WM_NCCREATE and WM_CREATE), the extended style with WS_EX_WINDOWEDGE decided
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
+  bool touch_window = false;     // RegisterTouchWindow: touches come as WM_TOUCH (Win32kUserTouch.cpp)
+  uint32_t touch_flags = 0;
 };
 
 // ---- Window stations and desktops.
@@ -403,6 +405,34 @@ class HandleTable {
   List<uint64_t> free_;
 };
 
+// ---- Files the desktop dropped on a window (WM_DROPFILES), until the program's user32 collects them (take_drop).
+struct DropRecord {
+  explicit DropRecord(allocators::IAllocator& a) : names(a) {}
+  uint32_t ticket = 0;
+  uint64_t pid = 0;
+  int32_t x = 0, y = 0;          // the point, in the target's client coordinates
+  bool non_client = false;       // it is outside the client area
+  List<char16_t> names;          // each name ends with a NUL; one more NUL ends the list
+};
+
+// ---- Touches (Win32kUserTouch.cpp): a finger the desktop handed to the Windows programs, and the WM_TOUCH inputs until their handle is closed.
+struct TouchContact {
+  uint32_t desktop_id = 0, pointer_id = 0;
+  uint32_t hwnd = 0;             // where its messages go (the window it went down on, or the touch window above it)
+  uint64_t pid = 0;
+  int32_t x = 0, y = 0;          // screen coordinates
+  uint32_t flags = 0;            // the POINTER_FLAGS of its last message
+  uint32_t frame = 0, time = 0;
+  bool primary = false, touch_api = false, ended = false, promoted_down = false;
+};
+struct TouchInputRecord {
+  uint32_t handle = 0;
+  uint64_t pid = 0;
+  uint32_t pointer_id = 0;
+  int32_t x = 0, y = 0;
+  uint32_t flags = 0, time = 0;  // TOUCHEVENTF_*
+};
+
 // ---- The whole state.
 struct State {
   explicit State(allocators::IAllocator& a);
@@ -425,6 +455,12 @@ struct State {
   Hive<ProcessInfo> processes;
   Hive<WinDc> dcs;
   List<ThreadDesktop> thread_desktops;
+  Hive<DropRecord> drops;
+  uint32_t next_drop = 1;
+  Hive<TouchContact> touches;
+  Hive<TouchInputRecord> touch_inputs;
+  uint32_t next_pointer_id = 2, next_touch_frame = 1, next_touch_input = 1;
+  bool touch_seen = false;
   Class* desktop_class = nullptr;
   Class* message_class = nullptr;
   uint32_t next_atom = 0xC000;

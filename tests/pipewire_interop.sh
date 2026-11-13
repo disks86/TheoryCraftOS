@@ -16,8 +16,8 @@ work=${TMPDIR:-/tmp}/tcos-pwinterop
 sock=$(mktemp -d /tmp/tcos-pw.XXXXXX)
 mkdir -p "$work/obj"
 trap 'pkill -TERM -f "$work/pwhost $sock" 2>/dev/null || true; rm -rf "$sock"' EXIT
-sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
-         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
+sources=(tests/pipewire/PipeWireHostServer.cpp src/PipeWire/Graph.cpp src/PipeWire/NativeServer.cpp src/PipeWire/NativeClientNode.cpp src/PipeWire/MidiBus.cpp src/PipeWire/VideoChannel.cpp src/PipeWire/VideoConvert.cpp src/PipeWire/VideoDecode.cpp src/PipeWire/Loopback.cpp src/PipeWire/EchoCanceller.cpp src/PipeWire/PlaybackStream.cpp src/PipeWire/RecordStream.cpp src/PipeWire/Pod.cpp
+         src/PipeWire/PulseServer.cpp src/PipeWire/Tagstruct.cpp src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/CaptureStream.cpp src/Audio/AudioCaptureHub.cpp src/Hardware/AudioDevice/CaptureRing.cpp src/Hardware/VideoCodec/Software/JpegDecoder.cpp src/Hardware/VideoCodec/ColorConvert.cpp src/Hardware/VideoCodec/VideoFrameBuffer.cpp src/Hardware/VideoCodec/VideoTypes.cpp src/Hardware/AudioDevice/PlaybackRing.cpp src/Hardware/AudioDevice/Software/SoftwareAudioDevice.cpp src/Hardware/AudioDevice/Software/SoftwareAudioCapture.cpp src/Kernel/Sync.cpp
          tests/KernelStubs.cpp)
 printf '%s\n' "${sources[@]}" | xargs -P "$(nproc)" -I{} sh -c 'g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -w -c "{}" -o "'"$work"'/obj/$(echo "{}" | tr / _).o"'
 g++ -fsanitize=address,undefined -pthread "$work"/obj/*.o -o "$work/pwhost"
@@ -141,7 +141,7 @@ PY"
 # lingering virtual sink) and pw-play / pw-record aimed at it
 if pkg-config --exists libpipewire-0.3 && command -v pw-midiplay >/dev/null; then
   gcc -O1 -g -Wall -Wextra -o "$work/pwmedia" tests/linux/pwmedia.c $(pkg-config --cflags --libs libpipewire-0.3) -lm
-  for mode in video video-alloc video-yuv midi filter adapter; do
+  for mode in video video-alloc video-zerocopy video-sync video-yuv midi filter adapter; do
     check "pwmedia $mode" "timeout 30 '$work/pwmedia' $mode 2> '$work/pwmedia-$mode.log' | tee -a '$work/pwmedia.out' | grep -q 'pwmedia: $mode ok'"
   done
   python3 - "$work/song.mid" <<'PY'
@@ -195,6 +195,109 @@ print('   parecord from cli-null.monitor: 500 Hz %.0f' % best)
 assert 7000 < best < 9000
 PY"
 fi
+# pactl load-module module-null-sink: a sink of its arguments (mono at 16 kHz, its description), listed as a module, kept after pactl exits, gone again
+# with unload-module
+module=$(timeout 5 pactl load-module module-null-sink sink_name=pa-null rate=16000 channels=1 sink_properties=device.description=PaNull 2> "$work/load.log")
+check "pactl load-module module-null-sink" "[ -n '$module' ] && timeout 5 pactl list short sinks | grep 'pa-null' | grep -q 's16le 1ch 16000Hz'"
+check "pactl list modules shows it" "timeout 5 pactl list short modules | grep -q \"^$module	module-null-sink	sink_name=pa-null\""
+check "pactl list sinks names its module and description" "timeout 5 pactl list sinks | grep -A3 'Name: pa-null' | grep -q 'Description: PaNull' && timeout 5 pactl list sinks | grep -A6 'Name: pa-null' | grep -q \"Owner Module: $module\""
+check "pactl load-module refuses another module" "! timeout 5 pactl load-module module-ladspa-sink 2> /dev/null"
+check "pactl unload-module" "timeout 5 pactl unload-module $module && ! timeout 5 pactl list short sinks | grep -q 'pa-null'"
+# module-loopback, -remap-sink, -combine-sink: paplay into one sink, parecord another's monitor; the tone must come through (the remapped sink's left
+# on its master's right)
+python3 - "$work/left700.wav" <<'PY'
+import math, struct, sys, wave
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(48000)
+w.writeframes(b"".join(struct.pack("<hh", int(8000 * math.sin(2 * math.pi * 700 * i / 48000)), 0) for i in range(48000 * 2)))
+PY
+heard() {      # heard <raw s16 stereo file> <Hz> <channel 0|1> <least> : the tone's level on that channel, at least <least>
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import math, struct, sys
+b = open(sys.argv[1], 'rb').read(); n = len(b) // 4; hz = float(sys.argv[2]); ch = int(sys.argv[3]); least = float(sys.argv[4])
+d = struct.unpack('<%dh' % (2 * n), b[:4 * n]); best = 0
+for start in range(0, max(0, n - 4800), 2400):
+    s1 = s2 = 0.0; c = 2 * math.cos(2 * math.pi * hz / 48000)
+    for i in range(start, start + 4800):
+        s0 = d[i * 2 + ch] + c * s1 - s2; s2 = s1; s1 = s0
+    best = max(best, math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
+print('   %s: %.0f Hz on channel %d: %.0f' % (sys.argv[1].split('/')[-1], hz, ch, best))
+assert best >= least
+PY
+}
+record_while() {      # record_while <monitor> <file> <sink> <wav> : parecord the monitor while paplay plays the wav into the sink
+  rm -f "$2"
+  (timeout -s INT 3 parecord --raw --device="$1" --format=s16le --rate=48000 --channels=2 "$2" 2> /dev/null || true) & local rec=$!
+  sleep 0.3
+  timeout 10 paplay --device="$3" "$4" 2> /dev/null
+  wait $rec || true
+}
+timeout 5 pactl load-module module-null-sink sink_name=lb-a > /dev/null
+timeout 5 pactl load-module module-null-sink sink_name=lb-b > /dev/null
+loop=$(timeout 5 pactl load-module module-loopback source=lb-a.monitor sink=lb-b latency_msec=60 2> /dev/null)
+check "pactl load-module module-loopback" "[ -n '$loop' ] && timeout 5 pactl list short modules | grep -q \"^$loop	module-loopback\""
+record_while lb-b.monitor "$work/loop.raw" lb-a "$work/tone500.wav"
+check "the loopback carried paplay from one sink to another" "heard '$work/loop.raw' 500 0 3000"
+timeout 5 pactl unload-module "$loop"
+remap=$(timeout 5 pactl load-module module-remap-sink sink_name=lb-swap master=lb-b channel_map=front-right,front-left 2> /dev/null)
+check "pactl load-module module-remap-sink" "[ -n '$remap' ] && timeout 5 pactl list short sinks | grep -q 'lb-swap'"
+record_while lb-b.monitor "$work/remap.raw" lb-swap "$work/left700.wav"
+check "the remapped sink's left came out on its master's right" "heard '$work/remap.raw' 700 1 3000 && ! heard '$work/remap.raw' 700 0 500 > /dev/null 2>&1"
+timeout 5 pactl unload-module "$remap"
+combine=$(timeout 5 pactl load-module module-combine-sink sink_name=lb-both slaves=lb-a,lb-b 2> /dev/null)
+check "pactl load-module module-combine-sink" "[ -n '$combine' ] && timeout 5 pactl list short sinks | grep -q 'lb-both'"
+record_while lb-a.monitor "$work/combine.raw" lb-both "$work/tone500.wav"
+check "the combined sink was heard in a slave" "heard '$work/combine.raw' 500 0 3000"
+timeout 5 pactl unload-module "$combine"
+check "the modules went with unload-module" "! timeout 5 pactl list short sinks | grep -q 'lb-swap\|lb-both' && ! timeout 5 pactl list short modules | grep -q 'module-loopback\|module-remap-sink\|module-combine-sink'"
+# module-remap-source, -virtual-source (with an uplink sink) and -echo-cancel: sources of their own (no ".monitor"), recorded by parecord
+rsrc=$(timeout 5 pactl load-module module-remap-source source_name=pa-rsrc master=lb-a.monitor channel_map=front-right,front-left 2> /dev/null)
+check "pactl load-module module-remap-source" "[ -n '$rsrc' ] && timeout 5 pactl list short sources | grep -q 'pa-rsrc' && ! timeout 5 pactl list short sources | grep -q 'pa-rsrc.monitor'"
+record_while pa-rsrc "$work/rsrc.raw" lb-a "$work/left700.wav"
+check "the remapped source's right holds its master's left" "heard '$work/rsrc.raw' 700 1 3000 && ! heard '$work/rsrc.raw' 700 0 500 > /dev/null 2>&1"
+timeout 5 pactl unload-module "$rsrc"
+vsrc=$(timeout 5 pactl load-module module-virtual-source source_name=pa-vsrc master=lb-b.monitor uplink_sink=pa-up 2> /dev/null)
+check "pactl load-module module-virtual-source" "[ -n '$vsrc' ] && timeout 5 pactl list short sources | grep -q 'pa-vsrc' && timeout 5 pactl list short sinks | grep -q 'pa-up'"
+record_while pa-vsrc "$work/vsrc.raw" pa-up "$work/tone500.wav"
+check "the virtual source heard its uplink sink" "heard '$work/vsrc.raw' 500 0 3000"
+timeout 5 pactl unload-module "$vsrc"
+aec=$(timeout 5 pactl load-module module-echo-cancel source_master=lb-b.monitor sink_master=lb-b 2> /dev/null)
+check "pactl load-module module-echo-cancel" "[ -n '$aec' ] && timeout 5 pactl list short sources | grep -q 'echo-cancel-source' && timeout 5 pactl list short sinks | grep -q 'echo-cancel-sink'"
+record_while lb-b.monitor "$work/aec-far.raw" echo-cancel-sink "$work/left700.wav"
+check "what plays into echo-cancel-sink reaches its sink master" "heard '$work/aec-far.raw' 700 0 3000"
+# (the "microphone" is the sink master's monitor: it hears the far end exactly, which the canceller takes out, and a 500 Hz "local voice" played
+# straight into the sink master, which it must keep)
+rm -f "$work/aec-near.raw"
+(timeout -s INT 3 parecord --raw --device=echo-cancel-source --format=s16le --rate=48000 --channels=2 "$work/aec-near.raw" 2> /dev/null || true) & aec_rec=$!
+sleep 0.3
+timeout 10 paplay --device=lb-b "$work/tone500.wav" 2> /dev/null & aec_voice=$!
+timeout 10 paplay --device=echo-cancel-sink "$work/left700.wav" 2> /dev/null
+wait $aec_voice || true
+wait $aec_rec || true
+check "the echo-cancel source keeps the local voice and has the far end taken out" "python3 - '$work/aec-near.raw' <<'PY'
+import math, struct, sys
+b = open(sys.argv[1], 'rb').read(); n = len(b) // 4; d = struct.unpack('<%dh' % (2 * n), b[:4 * n]); left = d[0::2]
+def levels(hz):
+    c = 2 * math.cos(2 * math.pi * hz / 48000); out = []
+    for start in range(0, max(0, n - 4800), 4800):
+        s1 = s2 = 0.0
+        for v in left[start:start + 4800]:
+            s0 = v + c * s1 - s2; s2 = s1; s1 = s0
+        out.append(math.sqrt(max(0, s1 * s1 + s2 * s2 - c * s1 * s2)) * 2 / 4800)
+    return out
+far, voice = levels(700), levels(500)
+print('   echo-cancel source per 100 ms, far end 700 Hz:', ' '.join('%.0f' % l for l in far))
+print('   local voice 500 Hz:', ' '.join('%.0f' % l for l in voice))
+late_far, late_voice = far[len(far) // 2:], voice[len(voice) // 2:]
+assert len(late_far) >= 4 and max(late_far) < 400, late_far
+assert max(late_voice) > 2000, late_voice
+PY"
+timeout 5 pactl unload-module "$aec"
+if command -v pw-cli > /dev/null; then
+  check "pw-cli create-node adapter media.class=Audio/Source/Virtual: a source to pactl" "timeout 5 pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=cli-vsrc media.class=Audio/Source/Virtual object.linger=true audio.position=[FL FR] }' > /dev/null && timeout 5 pactl list short sources | grep -q 'cli-vsrc' && ! timeout 5 pactl list short sinks | grep -q 'cli-vsrc'"
+fi
+always=$(timeout 5 pactl load-module module-always-sink 2> /dev/null)
+check "pactl load-module module-always-sink, once" "[ -n '$always' ] && ! timeout 5 pactl load-module module-always-sink 2> /dev/null && timeout 5 pactl unload-module '$always'"
+check "the source modules went with unload-module" "! timeout 5 pactl list short sources | grep -q 'pa-rsrc\|pa-vsrc\|echo-cancel' && ! timeout 5 pactl list short sinks | grep -q 'pa-up\|echo-cancel'"
 pkill -TERM -f "$work/pwhost $sock" || true
 for _ in $(seq 50); do pgrep -f "$work/pwhost $sock" >/dev/null || break; sleep 0.1; done
 check "the mixed output holds both tones" "python3 - '$work/out.wav' <<'PY'

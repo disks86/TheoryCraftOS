@@ -121,6 +121,27 @@ static inline ULONG64 tcos_audio_virtual_sink(ULONG64 which, char *text, int siz
   return node;
 }
 
+/* A virtual sink's device GUID (DirectSound's, and the last part of its WASAPI endpoint id): the speakers' {5af3a3c2-6e1b-4b4e-8d2f-...} with the
+ * sink's node in its last six bytes. tcos_audio_virtual_node gives the node back (0 when the GUID is not one of these). */
+static inline void tcos_audio_virtual_guid(ULONG64 node, GUID *out) {
+  const GUID base = {0x5AF3A3C2, 0x6E1B, 0x4B4E, {0x8D, 0x2F, 0, 0, 0, 0, 0, 0}};
+  *out = base;
+  for (int k = 0; k < 6; ++k) out->Data4[2 + k] = (BYTE)(node >> (8 * (5 - k)));
+}
+static inline ULONG64 tcos_audio_virtual_node(const GUID *g) {
+  if (!g || g->Data1 != 0x5AF3A3C2 || g->Data2 != 0x6E1B || g->Data3 != 0x4B4E || g->Data4[0] != 0x8D || g->Data4[1] != 0x2F) return 0;
+  ULONG64 node = 0;
+  for (int k = 0; k < 6; ++k) node = node << 8 | g->Data4[2 + k];
+  /* (only a virtual sink there is now: the speakers' own GUID has other bytes there) */
+  for (ULONG64 i = 0; i < TCOS_AUDIO_MAX_VIRTUAL; ++i) {
+    ULONG64 count = 0;
+    const ULONG64 n = tcos_audio_virtual_sink(i, NULL, 0, &count);
+    if (!n) break;
+    if (n == node) return node;
+  }
+  return 0;
+}
+
 /* Opens a stream of the graph for `format` (see wave_format_code), a playback stream or (`capture`) a record stream of the microphone or (`monitor`)
  * of what the mixer plays; with `target` (a virtual sink's node), into that sink or (capture) of its monitor. 0 when it cannot be opened. */
 static inline ULONG64 tcos_audio_open_to(const WAVEFORMATEX *format, BOOL capture, BOOL monitor, ULONG64 target, LONG *status) {

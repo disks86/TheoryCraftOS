@@ -128,7 +128,7 @@ void marker_text(uint8_t type, bool ordered, int64_t number, String* out) {
   out->append(". ");
 }
 
-class Builder {
+class Builder final : public browser::IContainerSizes {
  public:
   Builder(dom::Document& doc, const browser::StyleSheet& sheet, const BuildOptions& options, BoxTree* tree) : doc_(doc), sheet_(sheet), options_(options), tree_(*tree) {}
 
@@ -140,13 +140,74 @@ class Builder {
     const BoxId root = tree_.create(BoxKind::Root, 0, root_style);
     if (root == kNoBox) return false;
     tree_.box(root).establishes_bfc = true;
+    outer_sizes_ = sheet_.swap_container_sizes(this);
     build_node(html, root_style, root, 1);
+    sheet_.swap_container_sizes(outer_sizes_);
     if (failed_) return false;
     finalize(root);
     return !failed_;
   }
 
+  // @container: the nearest container among the boxes the builder is in (the flat tree: a shadow host, a slot), from their styles; the page's own answer for an
+  // element that is not the one being styled or one of those (asking the page would work out every ancestor's style again, for every element).
+  bool container_size(const dom::Node* element, StringView name, int32_t* width_px, int32_t* height_px) override {
+    // (the element being styled is not open yet; a pseudo-element's element is, and it is the pseudo-element's container when it is one)
+    const bool pseudo_of_open = open_count_ > 0 && open_[open_count_ - 1].node == element && !overflowed_;
+    if (element != styling_ && !pseudo_of_open) return outer_sizes_ && outer_sizes_->container_size(element, name, width_px, height_px);
+    for (uint32_t i = open_count_; i > 0; --i) {
+      const Style& s = *open_[i - 1].style;
+      if (s.container_type == 0) continue;
+      if (!name.empty()) {
+        bool named = false;
+        const StringView names = sheet_.text(s.container_name);
+        uint64_t at = 0;
+        while (at < names.size()) {
+          while (at < names.size() && names[at] == ' ') ++at;
+          const uint64_t start = at;
+          while (at < names.size() && names[at] != ' ') ++at;
+          if (at > start && names.substr(start, at - start).equals(name)) named = true;
+        }
+        if (!named) continue;
+      }
+      if (s.width.kind == Length::Px && !s.width.has_percent()) *width_px = s.width.px100 / 100;
+      if (s.height.kind == Length::Px && !s.height.has_percent()) *height_px = s.height.px100 / 100;
+      return true;
+    }
+    return false;
+  }
+
  private:
+  // The elements whose boxes are being built, outermost first (deeper ones than kMaxOpen are not kept: their containers are looked up by the page).
+  static constexpr uint32_t kMaxOpen = 256;
+  struct Open {
+    const dom::Node* node;
+    const Style* style;
+  };
+  Open open_[kMaxOpen];
+  uint32_t open_count_ = 0;
+  const dom::Node* styling_ = nullptr;   // the element derive_style is working on
+  browser::IContainerSizes* outer_sizes_ = nullptr;
+  struct OpenScope {   // (n is open for as long as this lives)
+    OpenScope(Builder& b, const dom::Node* n, const Style* s) : b_(b), pushed_(b.open_count_ < kMaxOpen) {
+      if (pushed_) b_.open_[b_.open_count_++] = Open{n, s};
+      else b_.overflowed_ = true;
+    }
+    ~OpenScope() {
+      if (pushed_) --b_.open_count_;
+    }
+    Builder& b_;
+    bool pushed_;
+  };
+  bool overflowed_ = false;
+
+  Style derive(const Style& parent_style, const dom::Node* n) {
+    const dom::Node* was = styling_;
+    styling_ = overflowed_ ? nullptr : n;   // (with ancestors missing from the list, the page answers)
+    Style s = browser::derive_style(parent_style, n, sheet_);
+    styling_ = was;
+    return s;
+  }
+
   allocators::IAllocator& allocator() const { return tree_.allocator(); }
 
   // The nodes an element shows as its children: a shadow host shows its shadow tree, a slot the nodes assigned to it (or its own children).
@@ -183,9 +244,10 @@ class Builder {
       return;
     }
     if (!n->is_element() || makes_no_box(n)) return;
-    Style s = browser::derive_style(parent_style, n, sheet_);
+    Style s = derive(parent_style, n);
     if (s.display == Display::None) return;
     apply_table_presentation(n, parent_style, sheet_, &s);   // (<table>, <tr>, <td> ... are table boxes: TableFixup.cpp)
+    OpenScope open(*this, n, &s);
     if (s.contents) {   // display: contents: no box of its own, its children are the parent's
       build_children(n, s, parent, depth);
       return;

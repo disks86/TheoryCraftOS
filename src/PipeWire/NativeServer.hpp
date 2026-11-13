@@ -44,6 +44,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/MidiBus.hpp"
 #include "PipeWire/Pod.hpp"
+#include "PipeWire/VideoDecode.hpp"
 #include "PipeWire/VideoChannel.hpp"
 #include "PipeWire/ProtocolServer.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -89,7 +90,10 @@ class NativeServer final : public IProtocolServer {
   // A port of a client node (NativeClientNode.cpp): its formats, the metadata and buffers the server gave it, and where its data goes.
   struct ClientPort {
     static constexpr uint32_t kMaxMetas = 8;
-    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a) {}
+    explicit ClientPort(allocators::IAllocator& a) : enum_format(a), client_data(a), ump_in(a), converted(a), share_mems(a), gpu_images(a), timelines(a) {}
+    ~ClientPort() { leave_share(); }
+    ClientPort(const ClientPort&) = delete;
+    ClientPort& operator=(const ClientPort&) = delete;
     uint32_t direction = 0, id = 0;
     uint32_t index = 0;            // its place in the node's io area (8 bytes each)
     uint64_t flags = 0;            // SPA_PORT_FLAG_* from its info
@@ -100,6 +104,16 @@ class NativeServer final : public IProtocolServer {
     bool format_sent = false, buffers_sent = false, data_ready = false, wants_alloc = false;
     // what its Buffers and Meta params ask for (0: not said)
     uint32_t wanted_buffers = 0, wanted_blocks = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
+    // (an explicit-sync layout it offers besides: SPA_PARAM_BUFFERS_metaType SyncTimeline, two more blocks; used for a producer that allocates)
+    struct SyncLayout {
+      bool offered = false;
+      uint32_t buffers = 0, blocks = 0, size = 0, stride = 0, types = 0;
+    } sync_layout;
+    bool wants_sync_release = false;     // (its SyncTimeline Meta asks for the RELEASE feature)
+    // Explicit sync (a producer that allocates, with SPA_META_SyncTimeline and two SyncObj blocks a buffer after its data): its timelines, buffer i's
+    // acquire at 2 i and release at 2 i + 1.
+    bool sync = false;
+    List<Fd> timelines;
     struct Meta {
       uint32_t type = 0, size = 0, offset = 0;      // offset: in each buffer's part
     };
@@ -117,13 +131,42 @@ class NativeServer final : public IProtocolServer {
     bool alloc = false;            // the client allocates the data (port_use_buffers ALLOC, answered with port_buffers)
     struct ClientData {
       Fd fd;
-      uint32_t mapoffset = 0, maxsize = 0;
+      uint32_t mapoffset = 0, maxsize = 0, flags = 0;
+      bool gpu = false;            // a dmabuf: fd's memory is the server's copy, filled from the image before each frame is read
     };
     List<ClientData> client_data;  // (alloc) each buffer's data blocks, as port_buffers gave them (buffer i's block k at i * blocks + k)
     uint32_t next_buffer = 0;
     uint64_t seq = 0;              // the SPA_META_Header seq the server writes next
     uint64_t video_seen = 0;       // (a watcher) the producer's last frame given
     UmpDecoder ump_in;             // (a UMP output) its system exclusive pieces put together
+    VideoFormat source_video;      // (a watcher) its producer's format when it was negotiated: frames come in it, and are converted to `video` if it differs
+    ByteBuffer converted;          // (a watcher) the last frame converted
+    UniquePointer<VideoDecodeSession> decode;      // (a raw watcher of an encoded producer) its decoding, made at the first frame
+    UniquePointer<VideoEncodeSession> encode;      // (a watcher that takes compressed video, of a raw producer) its encoding
+    // Zero-copy video. A producer that allocates (DMA-BUFs or memfds) shares its buffers (`share`, also its channel's); a watcher that takes that memory as
+    // it is, in the producer's format, is given the producer's own descriptors (`share`: its buffer i is the producer's buffer i) and each frame's
+    // buffer instead of a copy, and holds the buffers it has not recycled yet (`holds`).
+    SharedPointer<VideoShare> share;
+    bool holds[VideoShare::kMaxBuffers] = {};
+    List<uint32_t> share_mems;     // (a watcher) the mem ids its producer's descriptors were added as (or its GPU images')
+    // (a watcher that takes DMA-BUFs only, of a producer whose buffers it cannot share) GPU images the server made, one a buffer, written each frame
+    List<Fd> gpu_images;
+    uint32_t gpu_stride = 0;
+    // A watcher lets go of what it holds of its producer's buffers; a producer's buffers are no longer shared.
+    void leave_share() {
+      if (!share) return;
+      if (direction == 0) {
+        for (uint32_t i = 0; i < VideoShare::kMaxBuffers; ++i)
+          if (holds[i]) {
+            holds[i] = false;
+            if (share->users[i]) --share->users[i];
+          }
+        if (share->attached) --share->attached;
+      } else {
+        share->closed = true;
+      }
+      share = SharedPointer<VideoShare>();
+    }
   };
  private:
   struct Resource {
@@ -243,8 +286,23 @@ class NativeServer final : public IProtocolServer {
   void send_driver_position(Client& c, ClientNode& n);
   void maybe_start(Client& c, ClientNode& n);
   bool consume_output(ClientNode& n, ClientPort& p);
-  void publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts);
+  void publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts, const VideoFrame* shared = nullptr);
   bool fill_input(ClientNode& n, ClientPort& p);
+  bool fill_shared(ClientNode& n, ClientPort& p);      // (a watcher of shared buffers: the newest frame's buffer, no copy)
+  // (a producer whose buffers are shared) its frame in buffer `id`: taken when it is ready (its acquire point reached, or the GPU done with it), else
+  // held until it is (check_pending at each tick); a buffer handed back, its release point signalled.
+  bool consume_shared(ClientNode& n, ClientPort& p, int32_t status, uint32_t id);
+  bool frame_ready(ClientPort& p, uint32_t id);
+  void take_shared_frame(ClientNode& n, ClientPort& p, uint32_t id);
+  void check_pending(ClientNode& n, ClientPort& p);
+  uint32_t pick_back(ClientPort& p);      // (the oldest buffer taken that nobody holds; kIdInvalid: none)
+  void signal_release(ClientPort& p, uint32_t id);
+  void share_buffers(ClientNode& n, ClientPort& p);    // (a producer that allocated: its buffers shared with the watchers that can take them)
+  // (a watcher) whether it should be given other buffers: the shared ones it has went, or its producer's are shared now and it takes them as they are
+  static bool watcher_share_changed(const ClientPort& p, VideoChannel& channel);
+  static bool takes_share(const ClientPort& p, const VideoShare& share);
+  bool send_shared_buffers(Client& c, ClientNode& n, ClientPort& p, const SharedPointer<VideoShare>& share);
+  bool send_gpu_buffers(Client& c, ClientNode& n, ClientPort& p);
   ByteView buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize, uint32_t block = 0);
   ByteView buffer_chunk(ClientPort& p, uint32_t id, uint32_t block = 0);
   void drop_port_buffers(Client& c, ClientPort& p);
@@ -258,7 +316,8 @@ class NativeServer final : public IProtocolServer {
   void client_node_method(Client& c, Resource& r, uint32_t opcode, pod::Parser& args);
   void destroy_client_node(Client& c, uint32_t resource);
   bool make_graph_node(Client& c, ClientNode& n);
-  void send_add_mem(Client& c, uint32_t mem_id, const Fd& fd);
+  // (type: SPA_DATA_MemFd or DmaBuf; flags: PW_MEMBLOCK_FLAG_READABLE 1, WRITABLE 2)
+  void send_add_mem(Client& c, uint32_t mem_id, const Fd& fd, uint32_t type = 2, uint32_t flags = 3);
   void send_port_config(Client& c, ClientNode& n);
   void set_quantum(ClientNode& n);
   void send_command(Client& c, ClientNode& n, uint32_t command);

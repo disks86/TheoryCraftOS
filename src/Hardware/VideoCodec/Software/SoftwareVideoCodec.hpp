@@ -30,6 +30,7 @@ namespace hardware {
 //   - H.265 / HEVC Main profile, 8-bit 4:2:0 (see H265.hpp),
 //   - MPEG-2 video, Main and High profile 4:2:0 (see Mpeg2.hpp),
 //   - VC-1 progressive Simple, Main and Advanced profile (see Vc1.hpp),
+//   - MPEG-4 Part 2 Simple and Advanced Simple profile (DivX, Xvid) and H.263 version 1 and 2 (see Mpeg4.hpp),
 //   - VP8 of all four versions (see Vp8.hpp),
 //   - VP9 of all four profiles (see Vp9.hpp), and
 //   - AV1 of all three profiles (see Av1.hpp),
@@ -43,7 +44,8 @@ class SoftwareVideoCodec : public IVideoCodecDevice {
     info_.hardware_engine = hardware_engine;
     info_.accelerated = false;
     info_.encode_codecs = codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264);
-    info_.decode_codecs = info_.encode_codecs | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1);
+    info_.decode_codecs = info_.encode_codecs | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) |
+                         codec_mask(VideoCodec::Mpeg4) | codec_mask(VideoCodec::H263);
     info_.max_width = info_.max_height = VideoFormat::kMaxDimension;
   }
 

@@ -14,6 +14,9 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | HID usage to evdev codes, the xkb keymap | `src/Wayland/WaylandKeymap.cpp` |
 | AF_UNIX listener with SCM_RIGHTS, the compositor's kernel thread | `src/Wayland/WaylandSocketServer.{hpp,cpp}` |
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
+| YUV formats: their layouts and the conversion to RGB (`wl_shm` and dmabuf) | `src/Wayland/WaylandYuv.{hpp,cpp}` |
+| `zwp_text_input_v3`: composed text; the desktop's input method (Unicode entry) | `src/Wayland/WaylandTextInput.cpp`; `Win32Windows::compose_key` over `IWindowsSession::text_input` / `text_preedit` / `text_commit` |
+| `zwlr_layer_shell_v1`: panels, backgrounds, overlays | `src/Wayland/WaylandLayerShell.cpp`; the desktop's layers and reserved edges in `src/Gui/Windows/{Frame,WindowManager}` |
 | The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
 | Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
 | Activation, cursor shapes, primary selection, relative pointer and constraints, presentation time, idle inhibit, xdg-foreign, pings | `src/Wayland/WaylandExtras.cpp` |
@@ -41,7 +44,9 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   client-side shadow is outside the frame and is neither drawn nor hit.
 - **Decorations.** A client that asks for an `zxdg_toplevel_decoration_v1` always gets `server_side`: the desktop draws its frame, like a Win32
   window's. A client that does not ask (GTK) draws its own and moves or sizes itself with `xdg_toplevel.move` / `resize`, which become the
-  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does.
+  desktop's drag of the frame (`take_drag`), as a Win32 program's custom title bar does; its right click on that title bar sends
+  `xdg_toplevel.show_window_menu`, and the desktop opens the frame's window menu there (`take_window_menu`: Restore, Minimize, Maximize, Close, the
+  menu every frame has on its title bar and on Alt+Space).
 - **Configure.** The first commit gets a configure with size 0 x 0 (the client chooses), `configure_bounds` (the work area inside a frame) and
   `wm_capabilities` (maximize, fullscreen, minimize). The user sizing the frame sends a configure with the new size; until the client commits after
   acknowledging it, the desktop is told the asked-for size and paints what the buffer does not cover black, as for a Win32 window that has not caught
@@ -86,6 +91,42 @@ not one of its own, so the compositor can send `wl_pointer.leave`.
   seconds is shown as not responding (its windows' titles end in "(Not Responding)", as on Windows) until it does. `xdg_wm_base` is version 6, so
   a minimized toplevel is configured `suspended`.
 
+## Layer shell (panels, backgrounds, overlays)
+
+`zwlr_layer_shell_v1` version 4 (`src/Wayland/WaylandLayerShell.cpp`): bars, docks, wallpapers, notifications, launchers and lock-screen-like overlays.
+
+- **The desktop's layers.** A layer surface is a desktop window in a band of the stack (`gui::Frame::Layer`, `WindowsWindowInfo::layer`): background
+  and bottom under the normal windows, top and overlay over them. The window manager keeps the bands whatever is raised or restacked (a click, a
+  program's own order, activation); windows outside the normal band are placed where their program says (not kept inside an area, never maximized,
+  docked, tiled or cycled with Alt+Tab), have no frame and no taskbar button. Windows programs' topmost windows (`WS_EX_TOPMOST`) and X windows with
+  `_NET_WM_STATE_ABOVE` now go in the top band the same way. Popups of a layer surface (`get_popup`, an `xdg_popup` made without a parent) are in its band.
+- **Placement.** From the anchors (top, bottom, left, right), the size (0 along an axis anchored at both ends: as long as the anchors span) and the
+  margins, inside the monitor's panel area: the work area with the taskbar left out but not what windows reserve (`Monitor::panel_area`), so a panel
+  never moves away from the space it keeps. A configure goes whenever the size the anchors give changes (the monitors, other surfaces' zones).
+- **Exclusive zones.** A surface anchored to one edge (or to one edge and both of its neighbours) with a positive zone keeps zone + that edge's margin
+  (`WindowsWindowInfo::reserve`). The window manager leaves reserved edges out of its areas (`WindowManager::area`, `without_reserved`), so the
+  desktop's own windows, and every session's work area (`Monitor::work`, sent again when a reservation changes), stay clear: maximized Wayland,
+  Windows and X windows go below a top panel. Among the layer surfaces, zone 0 places a surface inside what the others keep, a positive zone or -1
+  in all of the panel area.
+- **Keyboard.** `none`: never activated (clicks reach it, keys do not); `on_demand`: activated when clicked, like a window; `exclusive`: activated
+  when mapped in the top or overlay band.
+- **Checked:** another role or a buffer already there (`role`, `already_constructed`), the layer (`invalid_layer`, also for `set_layer`), the anchor
+  bits, the keyboard mode (`on_demand` from version 4), a size of 0 without both anchors at commit (`invalid_size`), a buffer before the first configure
+  (`invalid_surface_state`), `get_popup` of a popup that has a parent; an `xdg_popup` still without a parent at its first commit is `invalid_popup_parent`.
+
+## Text input (zwp_text_input_v3)
+
+`src/Wayland/WaylandTextInput.cpp`. A client enables a text input while one of its text fields has the focus, and says where the text cursor is, what
+surrounds it and what kind of text it wants (all double-buffered, applied at `commit`; `enable` resets what came before it). A text input is entered
+when its client's surface gets the keyboard and left when it loses it (a destroyed surface is simply forgotten: no `leave` names it). Surrounding
+text must be whole UTF-8, at most 4000 bytes, with the cursor and anchor inside it.
+
+The input method is the desktop's (`IWindowsSession::text_input`, `text_preedit`, `text_commit`, which any session may implement): **Unicode entry**
+as IBus and GTK have it. Ctrl+Shift+U, while the window with the keyboard has an enabled text input, starts it; hex digits (up to six) are shown by the
+program as `u1f600` being composed (`preedit_string`, the caret at its end); Space or Enter puts the character in (`commit_string`), Backspace takes a
+digit back, Escape gives up, any other key gives up and goes on to the program. The keys it takes never reach the program; modifier keys always do.
+Each batch ends with `done(serial)`, the serial being the number of commits the client made.
+
 ## Scale, transforms, viewports
 
 The desktop has no scale of its own, so the output's scale is 1 (`wl_output.scale`, `wl_surface.preferred_buffer_scale` and `preferred_buffer_transform`
@@ -98,6 +139,20 @@ transform stretches an upright crop and leaves a turned picture undrawn. A surfa
 
 ## Copy and paste, drag and drop
 
+- **Touch** (`wl_touch`; the seat says pointer, keyboard and touch). The desktop reads the touchscreens (`hardware::ITouch`: QEMU's
+  virtio-multitouch, `src/Hardware/Touch/Virtio`, and I2C-HID touchscreens) and offers each finger that lands on a Wayland window to the compositor
+  (`IWindowsSession::touch`). A client with a `wl_touch` gets it: `down` (with the surface under the finger and its place in it), then `motion`
+  (in that surface's coordinates, wherever the finger goes) and `up`, each followed by `frame`; a cancelled contact is `cancel` (all of the client's).
+  A finger over a client without a `wl_touch` is refused, and the desktop moves the pointer with it instead (the first such finger is the left
+  button), as it does over its own windows and Win32 and X windows.
+- **Pens** (`zwp_tablet_manager_v2` version 1, `src/Wayland/WaylandTablet.cpp`). A client's tablet seat is told of one tablet ("TheoryCraftOS pen")
+  and two tools, the pen and its eraser, each with pressure and tilt. The desktop hands the compositor the pens (`hardware::IPen`, through
+  `IWindowsSession::pen`); over a surface of a client with a tablet seat the tool of the end near the screen comes into proximity of that surface
+  (`proximity_in`), then each report is `motion`, `pressure` (0 to 65535), `tilt`, `down` / `up` as the tip touches or lifts, `button` for the barrel
+  buttons (`BTN_STYLUS`, `BTN_STYLUS2`) and a `frame`. While the tip touches, the surface keeps the pen wherever it goes; otherwise it follows the
+  surface under it (`proximity_out` from the old one). Over a client without a tablet seat, or nowhere, the pen is refused and the desktop moves the
+  pointer with it (`hardware::PenMouse`'s rules, done by the input pump since the desktop reads the pens itself). No pads, rings, strips or dials, no
+  hardware serials or ids, no distance, rotation, slider or wheel, and a tool's `set_cursor` is ignored (the desktop draws its own pointer).
 - **The selection** is a client's `wl_data_source` or the desktop's clipboard (its text, or its picture). The client with the keyboard is offered it (`wl_data_offer` with
   its types, then `wl_data_device.selection`) when the keyboard comes to it and whenever the selection changes. A paste (`wl_data_offer.receive` with
   a pipe) is passed on to the source's client as it is (`wl_data_source.send` with the same descriptor), or, for the desktop's text or picture, the
@@ -119,6 +174,25 @@ transform stretches an upright crop and leaves a turned picture undrawn. A surfa
   of the source's types, followed and left; version 3's actions are negotiated (the destination's preference, else copy, move, ask) and told to
   both; a release over a destination that accepted a type drops (`drop`, `dnd_drop_performed`), the destination receives as for a paste and
   `finish`es (`dnd_finished`); anything else cancels. A drag without a source stays within its client.
+- **Drag and drop with the desktop** (`src/Wayland/WaylandDragBridge.cpp`, over `IWindowsSession::desktop_drag` / `desktop_drop` /
+  `desktop_drag_end` and `take_program_drop` / `program_drop_done`):
+  - *The desktop's drag into a client* (a File Explorer file, text). The GUI tells the control under a drag as it moves (`Control::tracks_drag`,
+    `on_drag_over`, `on_drag_leave`); a program's frame (`desktop::Win32Window`) passes that to its session, so the client is entered, followed and
+    left as for another client's drag, with an offer the compositor serves itself: `text/uri-list` for a file a Linux program can see
+    (`file:///mnt/desktop/...`, `file:///mnt/c/...`, `file:///...`, percent-encoded) and `text/plain` (its Linux path, else the text), copy only.
+    Let go over a client that accepted, it gets `drop` and reads the data (the transport writes it). The desktop's drag never reaches a program as
+    its mouse (Win32Windows keeps its input tap out of the way meanwhile).
+  - *A client's drag onto the desktop.* Let go outside every Wayland surface, a drag whose source offers `text/uri-list` or text is handed over:
+    `dnd_drop_performed`, the data read from the source through a pipe, file URIs made system paths (`layout::system_path_of_linux`; other URIs
+    and comments are dropped), and each item dropped on the desktop's window where the button was let go (`gui::Window::drop_at`, as if a
+    desktop drag had been released there). The source hears `dnd_finished` when something took one, `cancelled` otherwise.
+  - *Feedback before the drop.* As soon as a client's drag leaves every surface its data is read the same way, so the desktop knows what it
+    carries while it is still held (`IWindowsSession::program_drag`). The desktop's window shows the first item at the pointer like its own drags
+    (with "(+N)" for more), greyed when nothing there would take it (`gui::Window::outside_drag_at`: the controls under the pointer are asked
+    `accepts_drop`, a control that follows drags hears `on_drag_over`); its answer (`program_drag_answer`) reaches the source as `target` (the type
+    read, or null) and `action` (copy, or none), so the program's pointer can show it. Back over a surface, that surface's accept decides again.
+    Let go over the desktop, the drop is what was read, or the read still under way, so the source is asked for its data once.
+  - Linux programs see the user's files at `/mnt/desktop` ([FileSystemLayout.md](FileSystemLayout.md)), so a dropped file opens.
 - **Linux pipes.** Linux programs here had no `pipe()`; `pipe` and `pipe2` are now AF_UNIX stream pairs shut one way each (`O_CLOEXEC`,
   `O_NONBLOCK`), so they pass with `SCM_RIGHTS` like any socket. `fstat` calls them sockets, not FIFOs.
 
@@ -162,6 +236,23 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
 - **Locking.** UI lock, then the compositor, then the Direct3D layer (which never calls out holding its lock). `Wayland/Dxg` is the only part that knows the
   Direct3D layer; the transport is given its maker (`SocketServer::set_gpu_images`, main.cpp), which also turns the global on.
 
+## YUV buffers
+
+Video players hand over their decoded pictures as they are, in YUV. Seventeen YUV formats are offered both as `wl_shm` formats and dmabuf formats (the
+same four-character codes): semi-planar NV12, NV21, NV16, NV61, NV24, NV42 and P010 (16-bit samples, the value in the top ten bits), planar YUV420
+(I420), YVU420 (YV12), YUV422, YVU422, YUV444, YVU444, and packed YUYV, YVYU, UYVY, VYUY.
+
+- **`wl_shm`.** The buffer names its first plane (offset, stride); the others follow it in the pool as Weston lays them out: a semi-planar chroma plane at
+  `offset + stride * height` with the same stride (twice it for 4:4:4), a planar format's U and V planes one after another with `stride / hsub` (so the
+  stride must divide). Any offset and stride alignment: the planes are read byte by byte. The size check covers every plane; odd sizes round the chroma up.
+- **dmabuf.** Two or three planes (one for the packed formats), exactly as many as the format has (`incomplete` otherwise; an RGB format with a second
+  plane too). Each plane is memory the server can map (a memfd), at any offset and stride that holds it (`out_of_bounds` otherwise), linear, all with one
+  modifier. A plane that is a GPU image of the Direct3D layer, or no memory at all, cannot be imported (`failed` / `invalid_wl_buffer`): the Direct3D layer
+  has no YUV images. Explicit sync works for them as for the GPU buffers. The feedback's format table and the version 3 modifier events list them too.
+- **Drawing.** At each commit that attaches or damages a YUV buffer, its picture is converted to RGB words on the CPU (`yuv_to_xrgb`: BT.601, limited
+  range, chroma repeated over the pixels it covers) into memory of the buffer's own; that is what the desktop draws, scales, turns, samples for
+  `window_pixel` and takes as a cursor. A client's writes after the commit do not show until the next commit.
+
 ## Files in memory
 
 Wayland shares pictures through file descriptors, so the Linux layer now has `memfd_create` (with `MFD_CLOEXEC` and `MFD_ALLOW_SEALING`),
@@ -194,11 +285,15 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | What | How |
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
-| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`) | `tests/wayland_interop.sh` |
+| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing); `slurp`'s full-screen overlay (layer shell) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
+| Drags with the desktop: a desktop file entered, followed, accepted, dropped and read as a percent-encoded URI and as its Linux path, text, a path Linux cannot see, refusals, Escape, a client's drag let go over the desktop read from its source (URIs to system paths, comments and other schemes left out), taken, not taken, nothing usable, the source going, fuzzed URI lists; the GUI's drag tracking and `drop_at`, a desktop drag over a program's frame through the desktop (never the program's mouse), a program's drop of two files on a desktop window, a program's drag over the desktop before the drop (read once, shown, the answer as target and action, back over a surface, let go before the read ended, nothing usable, the source going; the window's `outside_drag_at`), `/mnt/desktop` for Linux programs and the two views' paths | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest`, `ProcessFilesTest`; `tests/wayland_interop.sh` drops a desktop file on foot, which pastes `'/mnt/desktop/Documents/a b.txt'` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
+| Text input: enter and leave with the keyboard, enable / disable, the cursor rectangle on the screen, content type, preedit (shown and hidden), commit, the serial of `done`, a second client taking the focus, a text input made while its client has the keyboard, a destroyed focused surface, invalid surrounding text, about 1600 fuzzed sessions; the desktop's Unicode entry (é, an emoji with a digit taken back, Escape, another key, a surrogate, nothing typed, the window ceasing to take text, Ctrl+Shift+U passed on when nothing takes text) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
+| Layer shell: a top panel keeping its height, a notification anchored with margins, a bar below the panel's zone, zone -1, a size change re-placing the others, the monitors' panel area, a maximized toplevel under the panel, `set_layer`, a destroyed panel freeing its zone, unmap and map again, the three keyboard modes, a popup of a layer surface, every protocol error, about 1600 fuzzed sessions; the window manager's bands and reserved edges (raising, restacking, a band change, Alt+Tab, maximize, several areas, too large a reservation) in `GuiTest` | `tests/run_host_tests.sh WaylandServerTest`, `GuiTest` |
+| YUV: all 17 formats converted at five sizes with and without row padding against a floating-point BT.601 reference, every truncation (a plane one byte short, a stride shorter than its row, a missing plane, a short output) refused with nothing written, random samples; the `wl_shm` layouts; NV12 at an odd pool offset, YUYV, I420 and P010 through `wl_shm` (drawn, sampled, a later commit showing the new picture); NV12 in two descriptors and I420 in one through dmabuf; every refusal and error; about 1600 fuzzed sessions | `tests/run_host_tests.sh WaylandServerTest` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
 
@@ -234,29 +329,36 @@ depends on itself:
    `zwp_linux_dmabuf_v1`, `wl_shm` buffers. `libgbm.so.1` of `src/Linux/libgbm` makes buffer objects over the Direct3D layer, and EGL also draws into its
    `gbm_surface`s and makes images of dmabufs (`EGL_EXT_image_dma_buf_import`). `tests/linux_egl_wayland_emulated.sh` runs a glibc + libwayland-egl + xdg-shell
    program and a GBM program through them. Still to do: the kernel's GL drawing into the GPU buffer itself (now its frame is copied there by the CPU).
-4. **YUV and several planes** (video players' direct output): the Direct3D layer needs NV12 / P010 formats (with planes at offsets of one allocation), the
-   protocol handling more than plane 0, and the desktop's renderers a YUV-to-RGB draw (a shader on the device renderer, the existing conversion code of
-   `src/Hardware/VideoCodec` on the CPU).
+4. **YUV and several planes: done for memory** ([YUV buffers](#yuv-buffers)): `wl_shm` and dmabuf planes in memfds, converted on the CPU at commit.
+   Still to do: YUV images in the Direct3D layer (NV12 / P010 with planes at offsets of one allocation) and a YUV-to-RGB draw on the device renderer, so that a
+   hardware decoder's frames show with no copy.
 
 ## Not done
 
-- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
-  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
+- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). GPU images take only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
+  pitch (no sub-rectangles of an image, no y-inverted pictures); YUV dmabufs must be files in memory and are converted on the CPU at each commit (one
+  copy, BT.601 limited range only: there is no `wp_color_representation` to say otherwise). Implicit sync is the GPU's queue: the desktop draws what the image holds
   once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL's frames are GPU buffers, but the kernel's GL copies each frame into the buffer's image with the CPU instead of drawing there (see the plan above).
   Not tried on a real GPU (only the software renderer and virgl).
-- **Protocols.** No text input (`zwp_text_input_v3`: the system has no input method yet), layer shell (`zwlr_layer_shell_v1`: the desktop owns its
-  panels and background, and its window list has no layers below normal windows), tablets (`zwp_tablet_v2`) or `wl_touch` events (the desktop hands
-  sessions no tablet or touch input). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
+- **Protocols.** Text input: the only input method is Unicode entry (no on-screen keyboard, no IME for CJK, no emoji picker); surrounding text and the
+  content type are kept but not used; `delete_surrounding_text` is never sent; Windows and X programs get no composed text (only Wayland's text input
+  takes it). Not tried with a real toolkit's text field (GTK and foot bind the text input; nothing checks what they do with the text). Layer shell: one output (the primary monitor; the output
+  argument is only checked), no `zwlr_layer_surface_v1.closed` (outputs never go away), version 5's `set_exclusive_edge` not offered, exclusive zones
+  of one edge add up in no particular order (wlroots keeps the order of arrival), and the desktop's own taskbar is not one of the reserved edges (layer
+  surfaces are placed above it). X windows' struts reserve edges too (see [X11.md](X11.md)). Touches have no shape or orientation events and no touch-to-pointer fallback inside a client that has a `wl_touch` (a client that binds
+  one gets every finger that lands on its surfaces). Idle inhibitors are only counted: the desktop has no idle blanking to hold off. Presentation times are the
   desktop's draw, not the display's scan-out, and the refresh is taken to be 60 Hz.
 - **Clipboard and drag and drop.** Text and PNG pictures reach the desktop's clipboard; other types (HTML, URIs, other image formats such as
-  `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn; drags to and from the desktop's own windows (the File Explorer's files)
-  and Windows or X programs are not bridged. Selection and drag serials are not checked.
+  `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn. Drags with the desktop: the desktop's drag carries
+  one item and only copies; a client's drag over the desktop is shown and answered from its first item only, and
+  takes URIs and text only (no pictures or other types). Windows programs take dropped files (`WM_DROPFILES`, see
+  [WindowsUserMode.md](WindowsUserMode.md)), X programs take them through XDND (see [X11.md](X11.md)). Selection and drag serials are not checked.
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.
-- **Window manager.** `show_window_menu` does nothing (the desktop has no window menu to open). A popup's `reactive` flag and parent size are
+- **Window manager.** The window menu has no Move or Size items (the desktop moves windows by their title bar only). A popup's `reactive` flag and parent size are
   ignored. Activation tokens are not tied to the serial of an input event (any client can get one).
 - **Shared memory semantics.** A file in memory that grows past its block moves (see above). A pool may be mapped past its file's size but within
   its block, where Linux would fault.

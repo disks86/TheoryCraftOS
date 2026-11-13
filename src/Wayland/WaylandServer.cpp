@@ -29,7 +29,7 @@ struct GlobalInfo {
 };
 
 // The globals, by name (1-based). The interface of each is the matching Iface.
-constexpr uint32_t kGlobalCount = 21;
+constexpr uint32_t kGlobalCount = 24;
 constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wl_compositor", 6}, {"wl_subcompositor", 1}, {"wl_shm", 2}, {"wl_seat", 8},
     {"wl_output", 4}, {"wl_data_device_manager", 3}, {"xdg_wm_base", 6}, {"zxdg_decoration_manager_v1", 1},
@@ -38,14 +38,15 @@ constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"wp_viewporter", 1}, {"wp_fractional_scale_manager_v1", 1},
     {"xdg_activation_v1", 1}, {"wp_cursor_shape_manager_v1", 1}, {"zwp_primary_selection_device_manager_v1", 1}, {"zwp_relative_pointer_manager_v1", 1},
     {"zwp_pointer_constraints_v1", 1}, {"wp_presentation", 1}, {"zwp_idle_inhibit_manager_v1", 1}, {"zxdg_exporter_v2", 1}, {"zxdg_importer_v2", 1},
+    {"zwp_tablet_manager_v2", 1}, {"zwlr_layer_shell_v1", 4}, {"zwp_text_input_manager_v3", 1},
 };
 constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
 
 }  // namespace
 
 Server::Server(allocators::IAllocator& allocator, Clock clock)
-    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator) {
-  monitors_[0] = {{0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}, {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)}};
+    : allocator_(allocator), clock_(clock), surfaces_(allocator), stack_(allocator), changes_(allocator), constraints_(allocator), tokens_(allocator), exports_(allocator), fetch_mime_(allocator), desktop_text_(allocator), requests_(allocator), touches_(allocator), desktop_drag_text_(allocator), desktop_drag_uri_(allocator), desktop_drag_linux_(allocator), program_drop_(allocator), program_drag_(allocator) {
+  monitors_[0].rect = monitors_[0].work = monitors_[0].panel = {0, 0, static_cast<int32_t>(screen_w_), static_cast<int32_t>(screen_h_)};
 }
 
 Server::~Server() {
@@ -169,6 +170,8 @@ void Server::close_client(uint32_t client) {
     const uint8_t number = c->number;
     if (drag_.client == number) drag_.source = 0, end_drag(false);
     for (uint64_t i = constraints_.count(); i-- > 0;) if (constraints_[i].client == number) constraints_.remove_at(i);
+    for (uint64_t i = touches_.count(); i-- > 0;) if (touches_[i].client == number) touches_.remove_at(i);      // (its fingers: nobody's now)
+    if (pen_.client == number) pen_ = PenFocus();      // (and the pen)
     if (psel_client_ == number) psel_client_ = 0, psel_source_ = 0;
     if (psel_sent_client_ == number) psel_sent_client_ = 0;
     if (sel_sent_client_ == number) sel_sent_client_ = 0;
@@ -322,7 +325,7 @@ void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t versi
                                            Iface::Output, Iface::DataDeviceManager, Iface::WmBase, Iface::DecorationManager, Iface::LinuxDmabuf, Iface::SyncobjManager,
                                            Iface::Viewporter, Iface::FractionalScaleManager, Iface::Activation, Iface::CursorShapeManager,
                                            Iface::PrimaryManager, Iface::RelativePointerManager, Iface::PointerConstraints, Iface::Presentation,
-                                           Iface::IdleInhibitManager, Iface::Exporter, Iface::Importer};
+                                           Iface::IdleInhibitManager, Iface::Exporter, Iface::Importer, Iface::TabletManager, Iface::LayerShell, Iface::TextInputManager};
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
@@ -338,11 +341,16 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
         e.u(f);
         send(c, e);
       }
+      for (uint32_t f : yuv_formats()) {      // (the planes one after another in the pool: yuv_shm_layout)
+        Event e(object, 0);
+        e.u(f);
+        send(c, e);
+      }
       return;
     }
     case Iface::Seat: {
       Event caps(object, 0);
-      caps.u(3);      // pointer | keyboard
+      caps.u(7);      // pointer | keyboard | touch (fingers go to a client that has a wl_touch, else they move the pointer)
       send(c, caps);
       if (version >= 2) {
         Event n(object, 1);
@@ -386,12 +394,14 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       // the formats, all linear: format events before version 3, modifier events in 3; from 4 on the client asks for feedback instead
       if (version >= 4) return;
       const uint32_t formats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
-      for (uint32_t f : formats) {
+      auto offer = [&](uint32_t f) {
         Event e(object, version >= 3 ? 1 : 0);
         e.u(f);
         if (version >= 3) e.u(uint32_t(kDrmModLinear >> 32)).u(uint32_t(kDrmModLinear));
         send(c, e);
-      }
+      };
+      for (uint32_t f : formats) offer(f);
+      for (uint32_t f : yuv_formats()) offer(f);
       return;
     }
     default: return;
@@ -509,6 +519,15 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
     case Iface::PointerConstraints: case Iface::LockedPointer: case Iface::ConfinedPointer: case Iface::Presentation: case Iface::PresentationFeedback:
     case Iface::IdleInhibitManager: case Iface::IdleInhibitor: case Iface::Exporter: case Iface::Exported: case Iface::Importer: case Iface::Imported:
       extras_request(c, id, r, opcode, in);
+      return;
+    case Iface::TabletManager: case Iface::TabletSeat: case Iface::Tablet: case Iface::TabletTool:
+      tablet_request(c, id, r, opcode, in);
+      return;
+    case Iface::LayerShell: case Iface::LayerSurface:
+      layer_request(c, id, r, opcode, in);
+      return;
+    case Iface::TextInputManager: case Iface::TextInput:
+      text_input_request(c, id, r, opcode, in);
       return;
     case Iface::Callback:
       post_error(c, id, kErrorInvalidMethod, "wl_callback has no requests");

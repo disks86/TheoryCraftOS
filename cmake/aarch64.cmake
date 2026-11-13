@@ -75,7 +75,7 @@ target_compile_options(BOOTAA64 PRIVATE
   ${TCOS_AARCH64_INCLUDES}
   -ffreestanding -fno-exceptions -fno-rtti -fno-stack-protector -fno-threadsafe-statics
   -fshort-wchar -mgeneral-regs-only -mno-outline-atomics -fno-omit-frame-pointer
-  -Wall -Wextra -g -O1
+  -Wall -Wextra -g ${TCOS_KERNEL_OPT_FLAG}
 )
 # clang does not drive lld for PE here: link with lld-link directly.
 set(CMAKE_CXX_LINK_EXECUTABLE "${LLD_LINK} /machine:arm64 /subsystem:efi_application /entry:efi_main /nodefaultlib /filealign:512 /base:0x400000 /dynamicbase <OBJECTS> /out:<TARGET>")

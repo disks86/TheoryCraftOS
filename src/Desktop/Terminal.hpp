@@ -58,6 +58,9 @@ class Terminal : public gui::Frame, private IProgramSink {
   bool change_directory(StringView path);
   // Runs a command line as if it had been typed: it is echoed with the prompt, then run.
   void run(StringView line);
+  // Goes to `folder` (when not empty) and runs `line` there, later, on this window's own handler lane: a program it starts holds up this
+  // terminal only, not the caller (the Start menu). A second call before the first has run replaces it. False if memory ran out.
+  [[nodiscard]] bool start_command(StringView folder, StringView line);
   // Writes the output to `path`. False (with a notice) if that fails.
   bool save_output(StringView path);
   void ask_save_output();
@@ -73,6 +76,7 @@ class Terminal : public gui::Frame, private IProgramSink {
 
  private:
   static void on_new(void* self, gui::Control&);
+  static void on_start_command(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
   static void on_close(void* self, gui::Control&);
   static void on_copy_all(void* self, gui::Control&);
@@ -120,6 +124,7 @@ class Terminal : public gui::Frame, private IProgramSink {
   gui::NoticeDialog* notices_ = nullptr;
   gui::Handler new_terminal_, open_path_;
   String opened_path_;
+  String pending_folder_, pending_line_;     // what start_command() runs next
 };
 
 }  // namespace desktop

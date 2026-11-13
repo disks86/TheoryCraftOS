@@ -69,6 +69,8 @@ SoftwareRenderer2D::~SoftwareRenderer2D() {
   for (uint32_t i = 0; i < clip_depth_; ++i) release_clip_entry(clips_[i]);
   for (uint32_t i = 0; i < layer_depth_; ++i)
     if (layers_[i].real && allocator_) release_view(*allocator_, layers_[i].surface.pixels);
+  for (RetainedEntry& e : retained_)
+    if (allocator_ && !e.surface.pixels.empty()) release_view(*allocator_, e.surface.pixels);
 }
 
 void SoftwareRenderer2D::update_clip() {
@@ -645,6 +647,101 @@ void SoftwareRenderer2D::pop_layer() {
   if (allocator_) release_view(*allocator_, l.surface.pixels);
 }
 
+// ---- Retained layers -------------------------------------------------------------------------------------
+
+SoftwareRenderer2D::RetainedEntry* SoftwareRenderer2D::find_retained(uint64_t key) {
+  for (RetainedEntry& e : retained_)
+    if (!e.surface.pixels.empty() && e.key == key) return &e;
+  return nullptr;
+}
+
+// Drawing goes to the layer's own surface, placed at `bounds` (as a layer's is), with a clip of its own: `update`, inside the bounds.
+bool SoftwareRenderer2D::begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) {
+  *fresh = false;
+  if (!allocator_ || in_retained_ || layer_depth_ != 0 || layer_overflow_ != 0 || !cur_.valid()) return false;
+  if (rect_empty(bounds) || uint64_t{bounds.width} * bounds.height > kMaxRetainedPixels) return false;
+  RetainedEntry* e = find_retained(key);
+  if (e && (e->surface.width != bounds.width || e->surface.height != bounds.height || e->surface.format != cur_.format)) {   // a new size: made again
+    release_view(*allocator_, e->surface.pixels);
+    e->surface = Surface();
+  }
+  if (!e || e->surface.pixels.empty()) {
+    if (!e) {   // a free entry, or the least recently used one goes
+      for (RetainedEntry& r : retained_)
+        if (r.surface.pixels.empty()) {
+          e = &r;
+          break;
+        }
+      if (!e) {
+        e = &retained_[0];
+        for (RetainedEntry& r : retained_)
+          if (r.used < e->used) e = &r;
+        release_view(*allocator_, e->surface.pixels);
+        e->surface = Surface();
+      }
+    }
+    const ArrayView<uint32_t> pixels = allocate_view<uint32_t>(*allocator_, uint64_t{bounds.width} * bounds.height);
+    if (pixels.empty()) return false;
+    pixels.fill(0);
+    e->key = key;
+    e->surface.pixels = pixels;
+    e->surface.width = e->surface.pitch = bounds.width;
+    e->surface.height = bounds.height;
+    e->surface.format = cur_.format;
+    *fresh = true;
+  }
+  e->used = ++retained_clock_;
+  retained_saved_ = LayerEntry();
+  retained_saved_.saved_surface = cur_;
+  retained_saved_.saved_ox = ox_, retained_saved_.saved_oy = oy_;
+  retained_saved_.saved_base_clip = base_clip_;
+  retained_saved_.saved_floor = clip_floor_, retained_saved_.saved_overflow = clip_overflow_;
+  cur_ = e->surface;
+  ox_ = bounds.x, oy_ = bounds.y;
+  base_clip_ = *fresh ? bounds : intersect(update, bounds);
+  clip_floor_ = clip_depth_;
+  clip_overflow_ = 0;
+  in_retained_ = true;
+  update_clip();
+  return true;
+}
+
+void SoftwareRenderer2D::end_retained() {
+  if (!in_retained_) return;
+  while (layer_depth_ || layer_overflow_) pop_layer();   // (layers left open inside it end with it)
+  while (clip_depth_ > clip_floor_) release_clip_entry(clips_[--clip_depth_]);
+  base_clip_ = retained_saved_.saved_base_clip;
+  clip_floor_ = retained_saved_.saved_floor, clip_overflow_ = retained_saved_.saved_overflow;
+  cur_ = retained_saved_.saved_surface;
+  ox_ = retained_saved_.saved_ox, oy_ = retained_saved_.saved_oy;
+  in_retained_ = false;
+  update_clip();
+}
+
+bool SoftwareRenderer2D::draw_retained(uint64_t key, const Rect2D& bounds) {
+  if (in_retained_ || !cur_.valid()) return false;
+  RetainedEntry* e = find_retained(key);
+  if (!e || e->surface.width != bounds.width || e->surface.height != bounds.height || e->surface.format != cur_.format) return false;
+  e->used = ++retained_clock_;
+  const Surface& layer = e->surface;
+  const Rect2D area = intersect(bounds, clip_);
+  for (uint32_t j = 0; j < area.height; ++j) {
+    const int32_t y = area.y + static_cast<int32_t>(j);
+    const ArrayView<const uint32_t> src = ArrayView<const uint32_t>(layer.row(static_cast<uint32_t>(int64_t{y} - bounds.y)), layer.width)
+                                              .subview(static_cast<uint64_t>(int64_t{area.x} - bounds.x), area.width);
+    const ArrayView<uint32_t> dst = row_span(y, area.x, area.x + static_cast<int32_t>(area.width));
+    if (mask_.empty()) {
+      dst.copy_from(src);   // (the same format: the pixels as they are)
+      continue;
+    }
+    const BlendMode saved = blend_;   // under a mask clip: through its coverage (store_px applies it)
+    blend_ = BlendMode::Alpha;
+    for (uint32_t i = 0; i < area.width; ++i) store_px(dst[i], area.x + static_cast<int32_t>(i), y, layer.decode(src[i]));
+    blend_ = saved;
+  }
+  return true;
+}
+
 // ---- Scroll blit -----------------------------------------------------------------------------------------
 
 bool SoftwareRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) {
@@ -672,6 +769,13 @@ void SoftwareRenderer2D::present() {
     display_->blit(0, 0, target_.width, target_.height, target_.pixels.data(), target_.pitch);
     display_->present();
   }
+}
+
+bool SoftwareRenderer2D::read_frame(ArrayView<uint32_t> out) {
+  const uint32_t w = target_.width, h = target_.height;
+  if (target_.pixels.empty() || !target_.valid() || out.size() < uint64_t{w} * h) return false;
+  for (uint32_t y = 0; y < h; ++y) out.subview(uint64_t{y} * w, w).copy_from(ArrayView<const uint32_t>(target_.pixels).subview(uint64_t{y} * target_.pitch, w));
+  return true;
 }
 
 }  // namespace graphics

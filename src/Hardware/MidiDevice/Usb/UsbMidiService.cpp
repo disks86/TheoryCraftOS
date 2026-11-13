@@ -190,6 +190,14 @@ void UsbMidiService::route_input(uint8_t status, uint8_t data1, uint8_t data2) {
   if (live_ && live_->running()) live_->send(status, data1, data2);
 }
 
+// A keyboard's system exclusive message (called with the lock held): to the tap (the programs), and on to a sound maker.
+void UsbMidiService::on_sysex(void* self, ConstByteView message) {
+  UsbMidiService& s = *static_cast<UsbMidiService*>(self);
+  ++s.routed_;
+  if (s.tap_) s.tap_->send_sysex(message);
+  if (midi::IMidiOutput* out = s.sound_maker()) out->send_sysex(message);
+}
+
 void UsbMidiService::on_message(void* self, uint8_t status, uint8_t data1, uint8_t data2) {
   static_cast<UsbMidiService*>(self)->route_input(status, data1, data2);
 }
@@ -205,7 +213,7 @@ void UsbMidiService::step(bool scan) {
     update_live_synth();
   }
   for (const auto& d : devices_)
-    if (d->has_input()) d->poll_input(&UsbMidiService::on_message, this);
+    if (d->has_input()) d->poll_input(&UsbMidiService::on_message, this, &UsbMidiService::on_sysex);
   if (midi::IMidiOutput* out = sound_maker()) out->flush();
   if (live_ && live_->running() && !kernel::running()) live_->update();   // (without threads the player is fed here)
 }

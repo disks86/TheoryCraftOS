@@ -168,6 +168,12 @@ class Control {
   // Called on the control a drag started in when the button was released (dropped: some control took it) or Escape cancelled it (x and y are -1).
   // (x, y) is the pointer in window coordinates. Runs on the input thread under the UI lock.
   virtual void on_drag_ended(bool /*dropped*/, int32_t /*x*/, int32_t /*y*/) {}
+  // A control that wants to follow a drag over it (a program's window, which tells its program as the pointer moves) says tracks_drag(); the window then
+  // calls on_drag_over() as the pointer moves over it (or anything inside it) with the drag, and on_drag_leave() when the pointer goes elsewhere, the drag
+  // is cancelled, or it was dropped on another control. The nearest such control around the one under the pointer is the one told. Input thread, UI lock.
+  virtual bool tracks_drag() const { return false; }
+  virtual void on_drag_over(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) {}
+  virtual void on_drag_leave() {}
 
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);

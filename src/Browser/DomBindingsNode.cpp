@@ -523,6 +523,17 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
       IS("scrollWidth") || IS("scrollHeight") || IS("scrollLeft") || IS("scrollTop")) {
     double box[8];
     *out = num_value(0);
+    // The root element's client area is the viewport (CSSOM View; in quirks mode the body's is), whatever the size of its box: pages size things to the window by
+    // document.documentElement.clientHeight (YouTube's player was made 240 pixels tall, the height of <html>'s box). Its scroll size is at least the viewport.
+    const bool viewport_element = element && n == (c.doc.quirks_mode ? c.doc.body() : c.doc.document_element());
+    if (viewport_element && (IS("clientWidth") || IS("clientHeight") || IS("scrollWidth") || IS("scrollHeight"))) {
+      const MediaEnvironment& view = c.host.media();
+      const bool width = IS("clientWidth") || IS("scrollWidth");
+      double size = width ? view.width : view.height;
+      if ((IS("scrollWidth") || IS("scrollHeight")) && c.host.node_rect(n, box) && (width ? box[2] : box[3]) > size) size = width ? box[2] : box[3];
+      *out = num_value(static_cast<double>(static_cast<int64_t>(size + 0.5)));
+      return true;
+    }
     if (element && (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") || IS("scrollWidth") || IS("scrollHeight")) && c.host.node_rect(n, box)) {
       const bool width = IS("offsetWidth") || IS("clientWidth") || IS("scrollWidth");
       const double size = width ? box[2] : box[3];
@@ -1299,6 +1310,32 @@ NATIVE(el_empty_list) {
   return true;
 }
 
+// document.elementFromPoint(x, y) / elementsFromPoint(x, y): what the last picture shows under a viewport position, front to back (null / [] outside the viewport)
+bool elements_at(Vm& vm, const Value* args, uint32_t argc, List<dom::Node*>* found) {
+  double x = 0, y = 0;
+  if (!vm.to_number(arg_at(args, argc, 0), &x) || !vm.to_number(arg_at(args, argc, 1), &y)) return false;
+  if (!impl(vm).host.elements_at_point(x, y, found)) found->clear();
+  return true;
+}
+
+NATIVE(doc_element_from_point) {
+  (void)self;
+  List<dom::Node*> found(vm.allocator());
+  if (!elements_at(vm, args, argc, &found)) return false;
+  *result = found.count() > 0 ? node_value(impl(vm), found[0]) : Value::make_null();
+  return true;
+}
+
+NATIVE(doc_elements_from_point) {
+  (void)self;
+  List<dom::Node*> found(vm.allocator());
+  if (!elements_at(vm, args, argc, &found)) return false;
+  JsObject* out = vm.new_array();
+  for (dom::Node* n : found.view()) vm.array_push(out, node_value(impl(vm), n));
+  *result = Value::make_object(out);
+  return true;
+}
+
 NATIVE(el_true) {
   *result = bool_value(true);
   return true;
@@ -1811,7 +1848,7 @@ NATIVE(set_animated_style) {
     return true;
   }
   n->animated.assign(text.view());
-  n->owner->touch_animated();
+  n->owner->touch_animated(n);
   *result = Value();
   return true;
 }
@@ -1838,6 +1875,92 @@ NATIVE(motion_in_use) {
     if (n->is_element() && dom::get_attribute(n, "style", &style)) used = style.contains("transition") || style.contains("animation");
   }
   *result = Value::make_bool(used);
+  return true;
+}
+
+// A list of CSS times as written, all zero ("0s", "0s, 0s" ...): a transition of this duration and delay does nothing.
+static bool all_zero_seconds(StringView text) {
+  if (text.empty()) return true;
+  uint64_t at = 0;
+  while (true) {
+    if (at + 2 > text.size() || text[at] != '0' || text[at + 1] != 's') return false;
+    at += 2;
+    if (at == text.size()) return true;
+    if (text[at] != ',') return false;
+    ++at;
+    while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n')) ++at;
+  }
+}
+
+// __motion_changed(clock, epoch, generation): what the built-in script for CSS transitions and animations has to look at again. The elements of the document
+// (in tree order, as querySelectorAll('*') has them) whose style may have changed since the document's style clock and epoch and the style sheet's generation
+// it was given, that declare an animation or a transition (or that the script keeps state for). [clock, epoch, generation, element ...]; -1s for "everything".
+// (Looking at every element after every change, as the script did, read some 10 million computed properties a minute on YouTube.)
+NATIVE(motion_changed) {
+  (void)self;
+  DomBindings::Impl& c = impl(vm);
+  double since[3] = {-1, -1, -1};
+  for (uint32_t i = 0; i < 3 && i < argc; ++i)
+    if (args[i].is_number()) since[i] = args[i].u.number;
+  const StyleSheet* sheet = c.host.computed_style_sheet();
+  const double clock = static_cast<double>(c.doc.style_clock()), epoch = static_cast<double>(c.doc.style_epoch()), generation = sheet ? static_cast<double>(sheet->generation()) : 0;
+  const bool siblings = sheet && sheet->uses_siblings();
+  const bool everything = since[0] < 0 || since[1] != epoch || since[2] != generation || (sheet && sheet->uses_has() && since[0] != clock);
+  const uint64_t after = since[0] < 0 ? 0 : static_cast<uint64_t>(since[0]);
+  List<dom::Node*> found(vm.allocator());
+  struct Step {
+    dom::Node* node;
+    uint64_t latest, latest_match;   // the latest change at the node's parent or above (any; one that can change what matches)
+  };
+  List<Step> stack(vm.allocator());
+  if (dom::Node* html = c.doc.document_element()) stack.push_back({html, c.doc.root()->style_stamp, c.doc.root()->match_stamp});
+  while (stack.count() > 0) {
+    const Step step = stack[stack.count() - 1];
+    stack.remove_at(stack.count() - 1);
+    dom::Node* n = step.node;
+    uint64_t latest = step.latest > n->style_stamp ? step.latest : n->style_stamp;
+    uint64_t latest_match = step.latest_match > n->match_stamp ? step.latest_match : n->match_stamp;
+    if (siblings && n->parent && n->parent->child_attribute_stamp > latest) latest = n->parent->child_attribute_stamp;
+    if (siblings && n->parent && n->parent->child_attribute_stamp > latest_match) latest_match = n->parent->child_attribute_stamp;
+    if (everything || latest > after) {
+      Style s;
+      bool motion = n->motion_tracked;
+      // (the full style only for an element a rule or its style attribute could give a transition or an animation; which rules can is looked at again only when
+      // something that changes what matches has changed: a new inline style on an ancestor does not)
+      if (!motion && sheet && (everything || latest_match >= n->motion_checked)) {
+        n->motion_rules = sheet->may_have_motion(n);
+        n->motion_checked = static_cast<uint64_t>(clock) + 1;
+      }
+      StringView inline_style;
+      const bool may = !motion && sheet && (n->motion_rules || (dom::get_attribute(n, "style", &inline_style) && (inline_style.contains("transition") || inline_style.contains("animation"))));
+      if (may && c.host.computed_style(n, &s)) {
+        const StringView name = sheet->text(s.animation_name);
+        const StringView property = sheet->text(s.transition_property);
+        const bool animation = !name.empty() && !name.equals("none");
+        const bool transition = !property.equals("none") && !((property.empty() || property.equals("all")) && all_zero_seconds(sheet->text(s.transition_duration)) && all_zero_seconds(sheet->text(s.transition_delay)));
+        motion = animation || transition;
+      }
+      if (motion && !found.push_back(n)) break;
+    }
+    // (the children go on the stack last first, so that they come off in tree order)
+    for (dom::Node* k = n->last_child; k; k = k->prev)
+      if (k->is_element() && !stack.push_back({k, latest, latest_match})) break;
+  }
+  JsObject* out = vm.new_array();
+  vm.array_push(out, Value::make_number(clock));
+  vm.array_push(out, Value::make_number(epoch));
+  vm.array_push(out, Value::make_number(generation));
+  for (dom::Node* n : found.view()) vm.array_push(out, node_value(c, n));
+  *result = Value::make_object(out);
+  return true;
+}
+
+// __motion_track(element, on): the built-in script keeps state for the element (it is looked at again when its style may have changed, even without motion).
+NATIVE(motion_track) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  if (n && n->is_element()) n->motion_tracked = argc > 1 && args[1].is_bool() && args[1].u.boolean;
+  *result = Value();
   return true;
 }
 
@@ -1883,6 +2006,8 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(g, "__set_animated_style", set_animated_style, 2);
   vm.define_native(g, "__style_version", style_version, 0);
   vm.define_native(g, "__motion_in_use", motion_in_use, 0);
+  vm.define_native(g, "__motion_changed", motion_changed, 3);
+  vm.define_native(g, "__motion_track", motion_track, 2);
   c.doc.set_change_hook(style_change_hook, &c);
   vm.set_construct_hook(construct_element, &c);
   c.doc.set_insert_hook(script_inserted_hook, &c);
@@ -1973,7 +2098,8 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(dp, "open", do_nothing, 0);
   vm.define_native(dp, "close", do_nothing, 0);
   vm.define_native(dp, "hasFocus", doc_has_focus, 0);
-  vm.define_native(dp, "elementFromPoint", el_empty_list, 2);
+  vm.define_native(dp, "elementFromPoint", doc_element_from_point, 2);
+  vm.define_native(dp, "elementsFromPoint", doc_elements_from_point, 2);
   vm.define_native(c.fragment_proto, "getElementById", doc_get_by_id, 1);
 
   // the constructors pages use for instanceof and constants

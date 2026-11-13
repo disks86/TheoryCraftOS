@@ -19,8 +19,25 @@
 #include "Gui/RenderLoop.hpp"
 #include "Kernel/Delay.hpp"
 #include "Kernel/Thread.hpp"
+#include "console.hpp"
 
 namespace gui {
+
+namespace {
+// Frames that keep the screen from following the input: every kReportPeriodUs, if a frame took longer than kSlowFrameUs, one line on the debug console.
+constexpr uint64_t kReportPeriodUs = 5000000, kSlowFrameUs = 50000;
+
+void put_number(char* line, uint32_t* at, uint32_t size, uint64_t v) {
+  char digits[20];
+  uint32_t n = 0;
+  do { digits[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v && n < sizeof digits);
+  while (n && *at + 1 < size) line[(*at)++] = digits[--n];
+}
+
+void put_text(char* line, uint32_t* at, uint32_t size, const char* text) {
+  for (; *text && *at + 1 < size; ++text) line[(*at)++] = *text;
+}
+}  // namespace
 
 // Maximum time in microseconds the render loop may spend in render() before it is considered stuck
 static constexpr uint64_t kRenderTimeoutUs = 500000;  // 500ms
@@ -53,6 +70,7 @@ void RenderLoop::thread_main(void* loop) { static_cast<RenderLoop*>(loop)->run()
 void RenderLoop::run() {
   uint64_t last_frame_us = hardware::uptime_us();
   uint64_t last_render_time_us = 0;
+  uint64_t period_start_us = last_frame_us, period_frames = 0, period_slow = 0, period_max_us = 0, period_total_us = 0;
   
   while (!__atomic_load_n(&stop_, __ATOMIC_ACQUIRE)) {
     if (window_.dirty()) {  // (a window starts dirty: the first frame needs no signal)
@@ -80,10 +98,28 @@ void RenderLoop::run() {
       
       __atomic_fetch_add(&frames_, 1, __ATOMIC_ACQ_REL);
       
-      // watchdog: log slow frames for diagnostics
-      if (render_time > kRenderTimeoutUs) {
-        // Render took too long - in a real implementation, this would log to the
-        // diagnostic_ callback if available. For now, we just continue.
+      // slow frames are reported (rate-limited): a frame that takes long keeps every window from following its input
+      ++period_frames;
+      period_total_us += render_time;
+      if (render_time > period_max_us) period_max_us = render_time;
+      if (render_time > kSlowFrameUs) ++period_slow;
+      if (hardware::uptime_us() - period_start_us >= kReportPeriodUs) {
+        if (period_slow) {
+          char line[160];
+          uint32_t at = 0;
+          put_text(line, &at, sizeof line, "gui: ");
+          put_number(line, &at, sizeof line, period_frames);
+          put_text(line, &at, sizeof line, " frames in 5 s, ");
+          put_number(line, &at, sizeof line, period_slow);
+          put_text(line, &at, sizeof line, " slow; average ");
+          put_number(line, &at, sizeof line, period_total_us / period_frames / 1000);
+          put_text(line, &at, sizeof line, " ms, slowest ");
+          put_number(line, &at, sizeof line, period_max_us / 1000);
+          put_text(line, &at, sizeof line, " ms\n");
+          console::debug_puts(StringView(line, at));
+        }
+        period_start_us = hardware::uptime_us();
+        period_frames = period_slow = period_max_us = period_total_us = 0;
       }
       
       // (an animation that asked for a frame time is given the rest of it: no faster than the display shows, and the CPU is free in between)

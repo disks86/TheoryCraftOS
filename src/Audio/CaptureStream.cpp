@@ -22,9 +22,17 @@ namespace audio {
 
 using namespace hardware;
 
+bool CaptureStream::set_shape(const StreamFormat& shape) {
+  StreamFormat device;
+  if (!shape_converter_.configure(device, shape)) return false;
+  shape_ = shape;
+  shaped_ = !shape.is_native();
+  return true;
+}
+
 bool CaptureStream::allocate(uint32_t ring_bytes) {
   StreamFormat device;  // the defaults are the device's format
-  if (!converter_.configure(device, format_)) return false;
+  if (!converter_.configure(shaped_ ? shape_ : device, format_)) return false;
   const uint32_t frame = format_.frame_size();
   return ring_.allocate(allocator_, ring_bytes - ring_bytes % frame, frame);
 }
@@ -68,12 +76,7 @@ AudioCaptureStatistics CaptureStream::statistics() {
   return stats;
 }
 
-void CaptureStream::deliver(ConstByteView pcm) {
-  kernel::ScopedMutex guard(mutex_);
-  if (format_.is_native()) {
-    ring_.push(pcm);
-    return;
-  }
+void CaptureStream::push_converted(ConstByteView pcm) {
   uint8_t converted[2048];
   uint32_t taken = 0;
   while (taken < pcm.size()) {
@@ -83,6 +86,27 @@ void CaptureStream::deliver(ConstByteView pcm) {
     ring_.push(ConstByteView(converted).first(made));
     taken += used;
   }
+}
+
+void CaptureStream::deliver(ConstByteView pcm) {
+  kernel::ScopedMutex guard(mutex_);
+  if (shaped_) {      // (to the shape first, then on to the stream's format)
+    uint8_t shaped[2048];
+    uint32_t taken = 0;
+    while (taken < pcm.size()) {
+      uint32_t used = 0;
+      const uint32_t made = shape_converter_.convert(pcm.dropped(taken), ByteView(shaped), &used);
+      if (made == 0 && used == 0) break;
+      push_converted(ConstByteView(shaped).first(made));
+      taken += used;
+    }
+    return;
+  }
+  if (format_.is_native()) {
+    ring_.push(pcm);
+    return;
+  }
+  push_converted(pcm);
 }
 
 }  // namespace audio

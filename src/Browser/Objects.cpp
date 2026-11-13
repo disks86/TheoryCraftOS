@@ -379,9 +379,34 @@ int64_t PageObjects::mse_playhead(uint32_t source) {
 
 bool PageObjects::take_dirty() {
   Lock lock(*this);
-  const bool d = dirty_;
+  const bool d = dirty_ || changed_count_ != 0;
   dirty_ = false;
+  changed_count_ = 0;
   return d;
+}
+
+void PageObjects::mark_changed(uint32_t serial) {
+  if (dirty_) return;   // (everything is drawn anyway)
+  for (uint32_t i = 0; i < changed_count_; ++i)
+    if (changed_[i] == serial) return;
+  if (serial == 0 || changed_count_ == kMaxChanged) {
+    dirty_ = true;
+    return;
+  }
+  changed_[changed_count_++] = serial;
+}
+
+uint32_t PageObjects::take_changes(ArrayView<uint32_t> nodes) {
+  Lock lock(*this);
+  uint32_t result = 0;
+  if (dirty_ || changed_count_ > nodes.size()) result = kChangedEverything;
+  else {
+    for (uint32_t i = 0; i < changed_count_; ++i) nodes[i] = changed_[i];
+    result = changed_count_;
+  }
+  dirty_ = false;
+  changed_count_ = 0;
+  return result;
 }
 
 // --- Choosing and loading a picture --------------------------------------------------------------------------------------------
@@ -1060,7 +1085,7 @@ void PageObjects::update(uint64_t now_ms) {
     ImageSlot& s = *images_[i];
     if (s.state != 1 || s.cache < 0) continue;
     const CachedImage& c = *cache_[static_cast<uint64_t>(s.cache)];
-    if (c.image.frame_count() > 1 && image_frame(c) != s.scaled.frame) dirty_ = true;
+    if (c.image.frame_count() > 1 && image_frame(c) != s.scaled.frame) mark_changed(s.serial);
   }
   for (uint64_t i = 0; i < videos_.count(); ++i) {
     VideoSlot& v = *videos_[i];
@@ -1070,7 +1095,7 @@ void PageObjects::update(uint64_t now_ms) {
       v.seeking = false;
       queue(v.serial, "seeked");
       queue(v.serial, "timeupdate");
-      dirty_ = true;
+      mark_changed(v.serial);
     }
     if (v.dash && !v.dash->ended() && v.dash->error() == 0) v.dash->tick(v.clip->position_us());
     if (v.dash && v.dash->quality_epoch() != v.dash_epoch) {
@@ -1093,7 +1118,7 @@ void PageObjects::update(uint64_t now_ms) {
       if (signature != v.active_signature) {
         v.active_signature = signature;
         queue(v.serial, "__tt");
-        dirty_ = true;
+        mark_changed(v.serial);
       }
     }
     if (v.clip->dynamic()) {
@@ -1110,7 +1135,10 @@ void PageObjects::update(uint64_t now_ms) {
     if (playing) {
       const int64_t at = v.clip->position_us();
       if (at > v.played_end_us) v.played_end_us = at;
-      dirty_ = true;
+      // (drawn again when it shows a new frame; a clip that does not count its frames, every time)
+      uint64_t presented = 0, dropped = 0;
+      if (!v.clip->frame_counts(&presented, &dropped) || presented != v.presented) mark_changed(v.serial);
+      v.presented = presented;
       if (now_ms >= v.last_timeupdate_ms + 250) {
         v.last_timeupdate_ms = now_ms;
         queue(v.serial, "timeupdate");
@@ -1266,6 +1294,37 @@ void PageObjects::draw_cues(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, i
   }
 }
 
+// A video frame fitted into w x h at (x, y), scaled by the GPU's texture unit: the frame goes up at its own size, not scaled by the CPU first (a frame
+// is new every time, so a scaled copy would not be drawn twice). False if the renderer cannot (the caller scales it).
+bool PageObjects::draw_frame_on_gpu(graphics::IRenderer2D& r, const ImageSource& src, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip) {
+  if (!src.valid() || src.width == 0 || src.height == 0) return false;
+  uint32_t dw = w, dh = static_cast<uint32_t>(uint64_t{src.height} * w / src.width);
+  if (dh > h) {
+    dh = h;
+    dw = static_cast<uint32_t>(uint64_t{src.width} * h / src.height);
+  }
+  if (dw == 0 || dh == 0) return true;
+  graphics::Surface s;
+  // (the surface type is mutable; drawing from it only reads)
+  s.pixels = ArrayView<uint32_t>(const_cast<uint32_t*>(src.pixels.data()), src.pixels.size());
+  s.width = src.width;
+  s.height = src.height;
+  s.pitch = src.pitch;
+  graphics::Matrix2D m;
+  m.a = static_cast<float>(dw) / static_cast<float>(src.width);
+  m.d = static_cast<float>(dh) / static_cast<float>(src.height);
+  m.e = static_cast<float>(x + static_cast<int32_t>((w - dw) / 2));
+  m.f = static_cast<float>(y + static_cast<int32_t>((h - dh) / 2));
+  if (!r.push_clip_rect(clip)) {
+    r.pop_clip();
+    return false;
+  }
+  r.set_blend(graphics::BlendMode::Alpha);
+  const bool ok = r.draw_image_transformed(s, {0, 0, src.width, src.height}, m, graphics::ImageFilter::Bilinear);
+  r.pop_clip();
+  return ok;
+}
+
 void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, int32_t y, uint32_t w, uint32_t h, const Rect2D& clip, bool pip_view) {
   r.set_blend(graphics::BlendMode::Alpha);
   const int64_t vx0 = x > clip.x ? x : clip.x, vy0 = y > clip.y ? y : clip.y;
@@ -1303,7 +1362,7 @@ void PageObjects::draw_video(graphics::IRenderer2D& r, VideoSlot& v, int32_t x, 
       src.width = cw;
       src.height = v.clip->height();
       src.pitch = cw;
-      fit_draw(v.scaled, src, v.picture_serial);
+      if (!(r.accelerated() && draw_frame_on_gpu(r, src, x, y, w, h, clip))) fit_draw(v.scaled, src, v.picture_serial);
       drawn = true;
     }
   }
@@ -1523,6 +1582,13 @@ void PageObjects::video_set_cues(uint32_t serial, List<UniquePointer<TrackCue>>&
     if (!v->cues.push_back(util::move(cues[i]))) break;
   v->active_signature = 0;   // (the next update() says which are active: script asks for that when it sets them)
   dirty_ = true;
+}
+
+void PageObjects::video_quality(uint32_t serial, uint64_t* presented, uint64_t* dropped) {
+  Lock lock(*this);
+  *presented = *dropped = 0;
+  VideoSlot* v = find_video(serial);
+  if (!v || !v->clip || !v->clip->frame_counts(presented, dropped)) *presented = *dropped = 0;
 }
 
 void PageObjects::video_state(uint32_t serial, VideoState* out) {

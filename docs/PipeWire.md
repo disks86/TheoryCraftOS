@@ -30,7 +30,14 @@ program that records, of any kind, gets a record stream of it.
 | MIDI: the bus every program's MIDI port is on (to the synthesizer, from keyboards), raw MIDI and UMP | `MidiBus.{hpp,cpp}` |
 | Video: what a producer shows, for its watchers and the kernel (packed and planar YUV, RGB, grey, encoded) | `VideoChannel.{hpp,cpp}` |
 | The machine's cameras as Video/Source nodes of the kernel | `CameraSource.{hpp,cpp}` |
+| The screen as a Video/Source node (screen sharing) | `ScreenSource.{hpp,cpp}`, `gui::IFrameTap` (`src/Gui/Window.hpp`), `dxgk::IPresentTap` (`src/Kernel/Dxgkrnl/Adapter.hpp`) |
+| Video conversion for watchers | `VideoConvert.{hpp,cpp}` |
+| The server's GPU images for DMA-BUF watchers (exports of the Direct3D layer) | `DxgGpuImages.hpp`, `IGpuImages` (`SocketServer.hpp`) |
+| Decoding encoded video for raw watchers and the viewer (Motion JPEG itself, the other codecs through `IVideoDecoders`) | `VideoDecode.{hpp,cpp}` |
+| The kernel's own watcher (the desktop's Video Viewer) | `VideoWatcher.{hpp,cpp}`, `src/Desktop/VideoViewer.{hpp,cpp}` |
 | A virtual sink's audio: a mixer of its own over a silent device on the graph's clock | `VirtualSink.hpp` |
+| Audio from a source (or a sink's monitor) into a sink or a virtual source: PulseAudio's loopback, remap/virtual sink and source, combine-sink modules; module-echo-cancel's streams | `Loopback.{hpp,cpp}` |
+| The acoustic echo canceller (bulk delay estimate, partitioned frequency-domain NLMS, foreground/background filters) | `EchoCanceller.{hpp,cpp}` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
 | eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
@@ -120,7 +127,8 @@ program that records, of any kind, gets a record stream of it.
     the server ticks every millisecond while some wait). A MIDI input is given a Sequence of what the bus brought whose time has come, each at its
     place in the cycle before (the distances between messages kept): UMP for a port with `control.ump` (`32 bit raw UMP`; sysex in Data Message
     pieces), else raw MIDI. System exclusive reaches a USB synthesizer (USB-MIDI CIN 4..7 packets) and the MPU-401 whole; the software
-    synthesizer takes the GM, GM2, GS and XG resets. The bus sends programs' notes to the synthesizer (in the kernel: a USB synthesizer or the MPU-401 when there is one, else the
+    synthesizer takes the GM, GM2, GS and XG resets; a USB keyboard's system exclusive messages are put back together from its packets and reach
+    the programs' inputs (and a sound maker). The bus sends programs' notes to the synthesizer (in the kernel: a USB synthesizer or the MPU-401 when there is one, else the
     software synthesizer through the mixer, which keeps running a few seconds after a program's last note) and to every other program's MIDI
     input; keyboards' keys go to the programs' inputs too. The graph shows the bus as the node `tcos_midi.bridge` (`Midi/Bridge`), each program's
     MIDI node linked to it.
@@ -129,6 +137,60 @@ program that records, of any kind, gets a record stream of it.
     BGR15), packed YUV (YUY2, UYVY, YVYU, AYUV), planar YUV (I420, YV12, Y41B, Y42B, Y444, NV12, NV21) and grey (GRAY8, GRAY16); up to 8192 on a side.
     Encoded video (H.264, MJPEG, VP8, VP9, H.265 and the other video subtypes but Bayer) is carried as whole frames of any length (16 MiB at most).
     The kernel can take a channel's frames too (`Graph::video_of`).
+  - **The screen.** `ScreenSource.cpp`: a Video/Source node of the kernel's (`tcos-screen`) whose frames are what the desktop draws, BGRx at the
+    screen's size, at most 10 a second and only while watched: the renderer reads its frame back between drawing and presenting
+    (`IRenderer2D::read_frame`: the software renderer's surface, the device renderer's back image) and the desktop's window hands it to its
+    `gui::IFrameTap`; a new watcher makes the desktop draw once, and while the screen is still its last frame is sent again once a second. A
+    program that presents straight to the display (the Direct3D kernel's present: a full-screen Direct3D program, the conformance scenes) gives
+    frames too, through `dxgk::IPresentTap` (the shown image read back after the present): while it presents, the desktop's frames are passed over,
+    and 250 ms after its last present the desktop is drawn again. (The desktop's 3D test window is in the desktop's frames: its cube is composed into
+    them.) For OBS, video calls' screen sharing, `pw-record`-style recorders.
+  - **Conversion and scaling for watchers.** A watcher whose EnumFormat does not list its producer's format is offered the first format it lists
+    that the frames can be converted to; one that cannot take its producer's size (a fixed size, a list without it, a range it is outside) is
+    offered its own (the fixed one, the list's first, the producer's clamped into the range). Each frame is converted and scaled
+    (`VideoConvert.cpp`, through RGBA of 16 bits a component, so 10-, 12- and 16-bit formats keep their bits; BT.601 limited range worked out on
+    samples scaled to 16 bits; averaged where it shrinks and bilinear where it grows), for every raw format:
+    every raw format spa/param/video/raw.h has: packed RGB of 8, 16 and 10 bits a component (r210 too) and the RGB8P palette, ARGB64, float RGBA
+    and dsp video, planar RGB (GBR, GBRA of 8, 10, 12 bits), planar and semi-planar YUV of 8, 10 and 12 bits in either byte order and with alpha
+    planes (I420 ... A444_10BE, YUV9, P010), the tiled NV12_64Z32, packed YUV (YUY2, UYVY, YVYU, VYUY, AYUV, AYUV64, v308, IYU2, IYU1, v210,
+    UYVP, v216) and grey; the layouts were checked against GStreamer's (tests/data/formats). A raw watcher of an encoded producer of a known size is offered
+    raw when its frames can be decoded, and given each picture decoded (`VideoDecode.cpp`): Motion JPEG always (the JPEG decoder starts from the
+    standard Huffman tables, which webcams' MJPEG leaves out); H.264 and H.265 (Annex B access units), MPEG-2, VC-1, VP8 and VP9 through decoder
+    sessions of the machine's video codecs (`Graph::set_video_decoders`; main gives it `SystemVideoCodecs`), a picture a codec holds back coming out
+    with a later frame. A compressed producer that does not say its size is given raw watchers once its first frame came (the size a decoder finds
+    in it). A watcher that takes only compressed video (Motion JPEG, H.264) of a raw producer is given its frames encoded by the machine's codecs
+    (`VideoEncodeSession`, `IVideoCodecs::create_encoder`: a keyframe about a second apart, the first frame one).
+  - **DMA-BUF producers.** A producer that allocates its own buffers may give GPU images (`SPA_DATA_DmaBuf`) when they are exports of `/dev/dxg`:
+    the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), a frame is copied out of the
+    image before it is read when something needs the pixels, and a frame the GPU still draws is handed back unread.
+  - **Zero-copy.** A producer that allocates (DMA-BUFs or memfds, all of one kind) shares its buffers (`VideoShare`, carried by its channel and its
+    frames). A watcher that takes them as they are - the producer's format and size, and its Buffers' `dataType` names that memory (or, saying no
+    types, its EnumFormat names a modifier and they are DMA-BUFs) - is given the producer's own descriptors (`add_mem` of type DmaBuf or MemFd, the
+    data `MemId`s, read-only) and each cycle the buffer of the newest frame, its chunks and header written in the watcher's own part of it: nothing
+    is copied. The producer's buffer is held while a watcher may read it (given and not yet recycled through its io, or the newest frame) and an
+    older one nobody holds goes back to the producer instead (one a cycle: the io's room). When every watcher of the producer takes its buffers so,
+    no copy is made at all (the channel's frame has no pixels); a watcher in memory, a converting one or the kernel's own makes the server copy again.
+    A watcher already running is negotiated again when its producer's buffers become shareable to it, or stop being shared. A frame is taken only
+    once it is drawn: with explicit sync, once its acquire point is reached; without, once the GPU is done with its DMA-BUFs (`Descriptor::gpu_ready`,
+    `dxgk::export_idle`). One that is not is held (shown at a later tick, not dropped; a newer one in the meantime passes it over), so a watcher
+    given a shared DMA-BUF never sees a frame half drawn and needs no fence of its own. On a cycle where a producer the server drives gives nothing,
+    a buffer it shared that nobody holds goes back to it (the io has room then).
+  - **Explicit sync.** A video producer that allocates and offers a layout depending on `SPA_META_SyncTimeline` (`SPA_PARAM_BUFFERS_metaType`; its
+    data blocks and two SyncObj blocks a buffer: its acquire and release timelines, as PipeWire's video-src-sync does) is given that layout - the
+    plain one it offers after it is kept for when the server cannot - and the RELEASE feature meta when its SyncTimeline Meta asks for it. Its
+    timelines are read and raised through the descriptors (`timeline_value`, `timeline_signal`: the /dev/dxg fences a Linux program exports as DRM
+    sync objects, `DxgSyncFile`). The server clears `UNSCHEDULED_RELEASE` (its promise) when it can raise the release timeline, and raises it to the
+    frame's release point when the buffer goes back; timelines it cannot read (an eventfd standing in) are not promised, and the frame is taken as the
+    GPU allows.
+  - **The server's DMA-BUFs.** A watcher that takes DMA-BUFs only (or names a modifier in its EnumFormat) of a producer whose buffers it cannot
+    share is given GPU images of the server's, one a buffer (`IDescriptorMaker::make_gpu_image`: the transport's `IGpuImages`, which main makes
+    with `DxgGpuImages` over the Direct3D layer's first adapter - exports of `/dev/dxg`, so a client imports them as any DMA-BUF of the system).
+    They are 32-bit RGB (BGRx or BGRA, chosen when the watcher lists one); each frame is written into the image's CPU copy at its pitch and then
+    into the image (`sync_to_gpu`). The Format names the modifier (linear, 0) when the watcher's EnumFormat named one.
+  - **The Video Viewer.** A Start menu app of the desktop (`src/Desktop/VideoViewer.cpp`) lists the graph's video producers, watches the one
+    picked (through `VideoWatcher.cpp`, a watcher node of the kernel's, so a camera streams while it is shown) and shows its newest picture fitted
+    to the window, converted to RGB (encoded video decoded as for a raw watcher); it says when a source went, cannot be decoded here, or sent a
+    picture that cannot be decoded.
   - **The kernel's cameras.** Every camera `SystemCameras` finds is a Video/Source node of the kernel's (`CameraSource.cpp`: `tcos-camera-<id>`,
     described by the camera's name) that programs watch as any producer. It streams only while watched: started at 640 x 480, 30 frames a second
     (or the camera's nearest mode) when its first watcher comes, stopped two seconds after the last one went; its newest picture goes out as I420.
@@ -144,11 +206,13 @@ program that records, of any kind, gets a record stream of it.
   as many monitor ports (`audio.channels` or `audio.position`, mono or stereo; `audio.rate`, default 48 kHz), bound to the client's proxy, at most
   16 of them. Its audio is a mixer of its own (`VirtualSink.hpp`: an `AudioMixer` over the silent `SoftwareAudioDevice`, which plays at the real
   rate on the graph's clock; `Graph::refresh` pumps it), so streams of every protocol play into it as into the speakers and what records from it
-  is a tap of that mixer (`Graph::create_playback`/`create_record` with the sink as target). PipeWire streams name it with `target.object`;
+  is a tap of that mixer, made the sink's own rate and channels on the way (`CaptureStream::set_shape`: a mono sink's monitor holds both sides
+  averaged, a 16 kHz one loses what 16 kHz cannot carry; the mixer itself works at the speakers' 48 kHz stereo) (`Graph::create_playback`/`create_record` with the sink as target). PipeWire streams name it with `target.object`;
   PulseAudio lists it with its monitor (`<name>.monitor`), plays into it (`paplay --device=<name>`), records it (`parecord
   --device=<name>.monitor`, or the sink's own name), sets its volume (its mixer's master volume) and reports it in subscriptions; Windows programs
   find it as a WASAPI render endpoint of its own (NtTcosAudio `VIRTUAL_SINKS`; `OPEN`/`OPEN_CAPTURE` with its node; its endpoint volume is its
-  own; loopback on it records it). With `object.linger=true` it stays when its client goes (it is the kernel's then); `Core destroy` of its proxy
+  own; loopback on it records it), as a winmm wave output device after the speakers (named after it; its device volume is its own) and as a
+  DirectSound device (`DirectSoundEnumerate`, its GUID the speakers' with its node in the last bytes, as its endpoint id). With `object.linger=true` it stays when its client goes (it is the kernel's then); `Core destroy` of its proxy
   removes it, and its streams make and hear silence. Other SPA factories (`api.alsa.pcm.sink`, `audiotestsrc`, ...) are refused with `-ENOTSUP`: no
   SPA plugin runs in the kernel.
 
@@ -173,7 +237,25 @@ program that records, of any kind, gets a record stream of it.
 **PulseAudio** (protocol 35 and older): AUTH (no shared memory is offered, so libpulse sends the audio in the packets), SET_CLIENT_NAME, playback
 streams (create, delete, drain, cork, flush, trigger, prebuf, latency, buffer attributes, name and property updates) with REQUEST, STARTED and
 PLAYBACK_STREAM_KILLED, server/sink/sink-input/client info and lists, sink and sink-input volume and mute, kill-sink-input, SUBSCRIBE and its events,
-STAT, LOOKUP_SINK. Record streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
+STAT, LOOKUP_SINK, LOAD_MODULE / UNLOAD_MODULE / GET_MODULE_INFO(_LIST) for `module-null-sink` (`pactl load-module module-null-sink
+sink_name=... sink_properties=... rate=... channels=... channel_map=...`: a virtual sink as pipewire-pulse makes one, the kernel's, so it stays
+after pactl exits until it is unloaded; module indexes carry pipewire-pulse's 1 << 29 flag; the sink and its monitor name their module, and the
+monitor reports the sink's own format; other modules answer `PA_ERR_NOENTITY`, arguments the module does not take `PA_ERR_INVALID`), and
+`module-loopback` (source - a source or a sink's monitor - to sink, latency_msec, mono or stereo), `module-remap-sink` (a sink looped into its master,
+left and right exchanged when channel_map and master_channel_map disagree) and `module-combine-sink` (a sink looped into each of its slaves, or the
+speakers and every virtual sink), built on `Loopback.cpp`: a record and a playback stream of the kernel's, what was recorded moved across at each tick
+with about the latency queued (a backlog beyond twice that dropped, the newest kept); a loopback of a sink's monitor into that sink is refused.
+`module-virtual-sink` is a remap sink that keeps the channel order. Sources: `module-remap-source` (a virtual source hearing its master, left and
+right exchanged when the maps disagree; default name `<master>.remapped`), `module-virtual-source` (`vsource`; with `uplink_sink=` also a virtual sink
+whose audio the source hears) and `module-echo-cancel` (`echo-cancel-sink` played on into `sink_master`, `echo-cancel-source` the `source_master` with
+the sink's audio taken out by `EchoCanceller.cpp`; `aec_method` webrtc, the default, or nlms both mean that canceller, null passes the microphone
+through, others are refused with `PA_ERR_NOTSUPPORTED`). A virtual source is a graph node of media class `Audio/Source/Virtual` (ports `input_*` and
+`capture_*`, as null-audio-sink names them; the native protocol's adapter makes one too): it lists as a source of its own (its node.name, no monitor
+of anything, its own volume and mute, which scale what records it), is found by name or by its node id (LOOKUP_SOURCE gives the id itself), and
+record streams on it name it as it is. `module-always-sink` and `module-switch-on-connect` load (once each) and do nothing more: there is always the
+speakers' sink, and the mixer and capture hub already follow plugged-in devices. An empty `master`, `source_master`, `sink_master`, `source` or `sink`
+means the default one. A module whose node goes another way (pw-cli destroy) goes with all it made. Record
+streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
 server sends what they record on their channel a fragment at a time (`fragsize`, 50 ms by default, 5 to 250 ms), and stops sending to a client that
 does not read (the hub's ring drops the oldest audio instead). Source and source-output info and lists, their volume and mute (SET_SOURCE_OUTPUT_VOLUME
 is command 98: the numbers from 98 on were one off before), kill-source-output, LOOKUP_SOURCE, the default source in the server info, source and
@@ -266,6 +348,42 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   filter (two inputs from the microphone, two outputs to the speakers, one node) and a 5.1 filter folded to stereo; a virtual sink from the
   Windows service (into it, its monitor, its volume, the sink going while streams are open); and the camera sources with a fake camera (a node
   each, started by a watcher, its I420 pictures, stopped two seconds after the last watcher, pulled out).
+  Then: the 10/12-bit and other new formats' planes, conversion between every pair of the 8-bit formats (a grey ramp and red round trips, short
+  and resized frames refused), a BGRA-only watcher of an I420 camera given converted frames; the screen source (only while watched, 10 a second,
+  BGRx words, the size changing); the kernel's watcher (listing, watching, YUV converted, encoded and gone said); a DMA-BUF camera (copied out of
+  the image, a busy frame handed back unread). `GuiTest` checks the window's frame tap, `GuiViewsTest` the Video Viewer with fake sources, and
+  `UsbMidiTest` keyboards' system exclusive (every length, pieces across calls, broken, too long, 3000 random packets). Also: every raw format's
+  round trip and 300 random format and size pairs, scaling (halved and doubled ramps, a watcher of a fixed smaller size), Motion JPEG decoded for a
+  raw watcher and the viewer (a real file), the still screen's keep-alive (with the render thread and the loop at once). Then: H.264 (from the
+  software encoder) and VP8 (a file) decoded picture for picture as a decoder of the software codecs gives them, the codec switched, truncated
+  and bit-flipped frames; an H.264 camera given decoded and halved to a raw watcher, not offered raw without decoders; the viewer showing H.264;
+  deep conversion (a 10-bit luma ramp of every value exact or within one and all distinct, 16-bit RGB through float, GRAY16 and 10-bit RGB exactly,
+  deep YUV frames made again through each other); a mono and a 16 kHz virtual sink's monitor (both sides averaged; a 1 kHz tone kept, 20 kHz
+  lost) against a plain one; module arguments (quotes, escapes, PulseAudio property names, truncation and bit flips) and `module-null-sink` over
+  the protocol (load, list, info for old and new clients, kept after the client goes, unload, refused modules and arguments, a sink destroyed
+  another way); module-loopback, -remap-sink and -combine-sink over null sinks (a tone carried, left made right, both slaves hearing, a loop into its
+  own sink and missing sinks refused, their nodes gone when unloaded); module-remap-source (the microphone's left heard on the right, ports
+  named as a source's, the source's volume and mute scaling and silencing what records it, listed, looked up, its volume set and recorded over the
+  protocol, never found as a sink), module-virtual-source with an uplink sink (the microphone and the uplink both heard; the uplink destroyed takes
+  the module), the policy modules (loaded once), and module-echo-cancel end to end (a far end into echo-cancel-sink reaching the speakers, the
+  microphone hearing it back, more than 10 dB of it gone from echo-cancel-source; with aec_method=null the microphone as it was; unknown methods and
+  missing masters refused, nothing left behind). `EchoCancellerTest` checks the canceller alone on synthetic rooms (speech-like far ends through a
+  delay and reflections): a 42 ms echo (over 20 dB taken out), a 250 ms one (the bulk delay found within 25 ms, over 18 dB), double talk (the near
+  talker kept, the echo still cancelled, the filter not pulled away), an echo path that changes, a far end that never plays (the microphone passed
+  as it is), NaNs, infinities, huge values and bit flips (output finite, still converging after), and blocks of the wrong size; the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
+  tap (flips and blits handed over, not when unwanted or refused, adapters added after it). Zero-copy: a DMA-BUF camera of three buffers and a
+  DMA-BUF watcher (given the camera's very descriptors as DMA-BUFs, read-only; each frame's buffer, nothing read from the images and no pixels in
+  the channel; the camera's buffer held until the watcher recycled it, the oldest free one going back; a watcher that did not run let go of the
+  buffer it never took), a memory watcher joining (the server copies again, from the image), a watcher naming a modifier (its Format says linear;
+  given the camera's DMA-BUFs without saying types), watchers going (holds let go); a DMA-BUF-only watcher of a camera in memory given GPU images
+  (each frame written into one at its pitch and synced), and one in NV12 given none. Explicit sync: a camera offering a SyncTimeline layout given
+  it (three blocks a buffer, SyncObj types, the RELEASE feature meta), a frame whose acquire point is not reached held until it is, the promise
+  made (flag cleared), the release point signalled when its buffer goes back; a DMA-BUF the GPU still draws held until drawn; a camera the server
+  drives given back the buffers a watcher held when it went, on its idle cycles. `PipeWireDmabufTest` also sends a received DMA-BUF on to a
+  second connection (the very export arrives) and makes a GPU image with `DxgGpuImages` whose pixels the client that receives it finds; the export
+  is drawn (`gpu_ready`), and a fence exported as a timeline is read and raised through its descriptor (never lowered). `VideoCodecTest` decodes a
+  JPEG without its DHT segments as with them, and `tests/run_host_tests.sh PipeWireDmabufTest` passes a real export of the Direct3D layer through
+  the transport (SCM_RIGHTS) and checks its copy follows the image.
 - `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
   from another thread, passing it with SCM_RIGHTS).
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl`, `paplay` and `parecord` against
@@ -273,11 +391,21 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   `paplay` at once; the mixed output must hold both tones at the right levels; `parecord` must record each side's tone; the source's and a source
   output's volume set through `pactl` must read back. The host's real `pw-play` and `pw-record` (libpipewire 1.x) go through client-node (the
   host server's maker makes real memfds and eventfds): the mix must hold `pw-play`'s tone, and `pw-record` must record each side's tone.
-  `tests/linux/pwmedia.c`, built against the host's libpipewire, runs its six modes (below); `pw-midiplay` plays a MIDI file (the server's
+  `tests/linux/pwmedia.c`, built against the host's libpipewire, runs its seven modes (below; `video-zerocopy`: the watcher's frames must be in the
+  camera's own memfds, the same inodes; `video-sync`: the camera must be given the explicit-sync layout and the RELEASE feature); `pw-midiplay` plays a MIDI file (the server's
   synthesizer must get all its notes, and pwmedia's system exclusive message whole); `pw-cli create-node adapter` makes a lingering null sink that
   `pw-cli ls` lists, `pw-play --target` plays into and `pw-record --target` records from (the recording must hold the tone at full level); then
   PulseAudio reaches the same sink: `pactl` lists it and its monitor and sets its volume, `paplay --device=cli-null` plays into it and `parecord
-  --device=cli-null.monitor` must record the tone.
+  --device=cli-null.monitor` must record the tone. `pactl load-module module-null-sink sink_name=pa-null rate=16000 channels=1` must make a mono
+  16 kHz sink that `pactl list short modules` and `pactl list sinks` (its description and owner module) show, `pactl load-module module-loopback`
+  must fail, and `pactl unload-module` must take the sink away. Then paplay into one null sink while parecord records another: through
+  `module-loopback` the tone must arrive, through `module-remap-sink` (channel_map reversed) a left-only tone must come out on the right, through
+  `module-combine-sink` a slave must hear it, and unloading must take the modules and their sinks away. `module-remap-source` must list as a
+  source of its own (no `.monitor`) and parecord of it must hear its master's left on the right; `module-virtual-source` with `uplink_sink` must hear
+  what paplay plays into the uplink; `module-echo-cancel` (its master source the master sink's monitor: a perfect echo) must pass the far end on to
+  the sink master and leave less than a twentieth of it in echo-cancel-source after the first second, while a tone played straight into the sink
+  master (a local voice) comes through; `module-always-sink` loads once; `pw-cli
+  create-node adapter` with `media.class=Audio/Source/Virtual` must list as a source to pactl, not a sink.
 - `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|xaudio2|pwnode|libpipewire]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
@@ -288,7 +416,8 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   per checkout (`/tmp/tcos-pwemu-<checksum of the path>`), so another worktree's objects and DLLs are never taken for this one's. The `nullsink`
   run makes a virtual sink in the emulator (`TCOS_EMU_NULL_SINK`) and runs `tests/windows/virtualsinktest.c`: WASAPI must list it as a render
   endpoint of its own (found by its name, its id found again, its volume apart from the speakers'), and a loopback client on it must record the
-  600 Hz another client plays into it and none of the speakers' native 300 Hz. The fourth run is
+  600 Hz another client plays into it and none of the speakers' native 300 Hz; then winmm's device 1 (400 Hz) and a DirectSound device made for
+  its enumerated GUID (500 Hz) must be heard there too. The fourth run is
   `tests/windows/xaudio2test.c`: a source voice into the mastering voice and one through a submix (400 and 600 Hz in the mix with the others),
   callbacks, loops, operation sets, matrices, the frequency ratio, MS-ADPCM through a volume meter, the FX objects and X3DAudio. (Its mastering
   voice is 24 kHz mono: the emulator runs about 14 million instructions a second, and a 48 kHz stereo graph of float voices would not keep up.)
@@ -300,7 +429,7 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   the mix with the native stream, and `pw-record -n 24000` must write a WAV (copied out with `TCOS_EMU_SAVE`) that holds 880 Hz on the left and
   1320 Hz on the right. Then `pw-cat --midi` plays a 12-note MIDI file (all 12 must reach the emulator's synthesizer), and `tests/linux/pwmedia.c`
   runs each mode: `video` (a driver camera, `PW_STREAM_FLAG_DRIVER` with `SPA_META_Header`, and a watcher in one program: 15 frames seen whole and in
-  order), `video-alloc` (the same with `PW_STREAM_FLAG_ALLOC_BUFFERS`: the camera's own memfds), `video-yuv` (NV12 with a block a plane, then the
+  order), `video-alloc` (the same with `PW_STREAM_FLAG_ALLOC_BUFFERS`: the camera's own memfds), `video-zerocopy` (video-alloc with a watcher taking memfds only: given the camera's own, the same inodes), `video-sync` (video-alloc with explicit sync: the three-block layout and the RELEASE feature), `video-yuv` (NV12 with a block a plane, then the
   camera says I420 at another size while streaming: both are negotiated again and the watcher must see whole frames of each), `midi` (a
   `pw_filter` MIDI output's 16 notes, the note-offs half way through the cycle, and a 22-byte system exclusive message heard by a `pw_stream` MIDI
   input whole, its controls in order and some past the cycle's start), `filter` (an `Audio/Filter` with two float inputs and two outputs: its
@@ -319,15 +448,29 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   loop; `module-rt` finds no RTKit or session bus and runs without realtime priority (as it does on Linux without them).
 - **client-node limits.** An adapter's audio is mono or stereo at its port (a wider stream is downmixed by the adapter in the program); a filter's
   float ports are channels in the usual order (`audio.channel` is not read), and an effect's input is the microphone (not another stream).
-  No DMA-BUFs (a DMA-BUF producer is refused), no DSP float video, no 10-bit or tiled formats (P010, NV12 tiles, v210), no video modifiers; a
-  watcher is always offered its producer's format (no conversion between formats or sizes). `SPA_META_Busy` is honoured but never set by the
-  server; cursor, bitmap and damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency; keyboards' system exclusive
-  is not passed on (USB-MIDI input reads channel messages only). No `set_activation` peers (the server is every node's only peer), links made by
-  clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
-- **Video sources and showing video.** The kernel's cameras are video sources; the screen is not (the desktop's renderers have no read-back of a
-  whole frame, so there is no screen-casting source), and the desktop does not show a channel's frames yet.
-- **The adapter's other factories.** Only `support.null-audio-sink`; `pactl load-module module-null-sink` is not served (make one with `pw-cli`).
-  A virtual sink's mixer is 48 kHz stereo whatever its node says; winmm and DirectSound devices do not list virtual sinks (WASAPI does).
+  DMA-BUFs are taken only from producers that allocate (`port_buffers`) and only as exports of `/dev/dxg`. Zero-copy needs the watcher to take
+  the producer's very format and size (a converting or scaling watcher gets a copy); a producer that shares buffers with a slow watcher that holds
+  many of them runs short of buffers (frames are dropped, nothing breaks); after the watchers go, a producer that drives itself gives a buffer each
+  cycle and gets one back, so as many stay held as were (PipeWire's client-node has no reuse_buffer either; a producer the server drives gets them
+  back on its idle cycles). The server's own DMA-BUFs are 32-bit RGB only (no YUV images: the Direct3D layer exports no planar formats) and are
+  written by the CPU. Watchers are not given timelines (the server waits for the acquire point for them); a watcher's own release is not waited
+  for beyond its recycling the buffer. Modifiers other than linear are passed on with shared buffers but not understood (a frame in a tiled GPU
+  layout would be read as if linear; /dev/dxg's exports are all linear). AV1 has no SPA subtype; MPEG-4 Part 2 (mpeg4, xvid) is decoded only where
+  a machine's codec does (the software one does not), H.263, DV and MPEG-TS not at all. Raw video is encoded only as Motion JPEG and H.264
+  (Baseline), the software codec's encoders. `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
+  damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency. No `set_activation` peers (the server is every node's
+  only peer), links made by clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
+- **Video sources and showing video.** The screen source has no cursor of its own and no damage metadata; when a program and the desktop both
+  present, the program's frames win until it has been quiet for 250 ms (the display shows whichever presented last). The Video Viewer shows one
+  source at a time.
+- **The adapter's other factories.** Only `support.null-audio-sink` (and PulseAudio's `module-null-sink`, -loopback, -remap-sink, -virtual-sink,
+  -combine-sink, -remap-source, -virtual-source, -echo-cancel, -always-sink and -switch-on-connect); no `module-ladspa-sink`/`-source`, pipe, RTP,
+  ROC, RAOP, tunnel, zeroconf or `module-x11-bell` modules, and no `module-stream-restore`/`device-restore` (volumes are not remembered). The echo
+  canceller has no residual echo suppressor, noise suppression, gain control or comfort noise (webrtc's extras), works in mono (a stereo
+  echo-cancel source carries the same in both), its echo tail is 85 ms after the bulk delay it finds (up to half a second), and `aec_args` is accepted
+  but not read. Windows programs do not see virtual sources as capture devices. A remap sink or source only exchanges left and right
+  (no other channel orders or remixing); loopbacks are stereo or mono at 48 kHz, and their latency is not adjusted to drift. A virtual sink's mixer works at 48 kHz stereo: streams into it are mixed there and its
+  monitor is made the sink's own format, so what the sink's rate and channels cannot carry is lost, but it is not mixed at that rate.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,
   `set-default-source` to another device do nothing).

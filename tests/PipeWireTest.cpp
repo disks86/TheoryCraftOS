@@ -36,7 +36,12 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
+#include "PipeWire/ScreenSource.hpp"
+#include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
+#include "PipeWire/VideoConvert.hpp"
+#include "PipeWire/VideoDecode.hpp"
+#include "Hardware/VideoCodec/Software/SoftwareVideoCodec.hpp"
 #include "PipeWire/Pod.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/RecordStream.hpp"
@@ -104,6 +109,18 @@ static void drain_mixer(audio::AudioMixer& mixer, FakeDevice& dev, int rounds = 
     mixer.pump();
     dev.play_all();
   }
+}
+
+// A file of the tests' data (empty when it is not there).
+static std::vector<uint8_t> read_test_file(const char* path) {
+  std::vector<uint8_t> out;
+  if (FILE* f = fopen(path, "rb")) {
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.insert(out.end(), buf, buf + n);
+    fclose(f);
+  }
+  return out;
 }
 
 // The clock the tests move by hand (nanoseconds).
@@ -1798,9 +1815,59 @@ struct FakeFd final : Descriptor {
   bool signal() override { if (!event) return false; ++counter; return true; }
   uint64_t take_signals() override { return counter.exchange(0); }
 };
+// A dmabuf: a GPU image whose pixels the server copies out (sync_from_gpu) into memory(); `busy` as the GPU still drawing.
+struct FakeGpuFd final : Descriptor {
+  std::vector<uint8_t> image, copy;
+  bool busy = false;
+  int syncs = 0;
+  explicit FakeGpuFd(uint64_t n) : image(n, 0), copy(n, 0) {}
+  ByteView memory() override { return ByteView(copy.data(), copy.size()); }
+  bool signal() override { return false; }
+  uint64_t take_signals() override { return 0; }
+  bool gpu() const override { return true; }
+  bool sync_from_gpu() override {
+    ++syncs;
+    if (busy) return false;
+    copy = image;
+    return true;
+  }
+  bool ready = true;      // (false: the GPU still draws it)
+  bool gpu_ready() override { return ready; }
+  int to_gpu = 0;
+  bool sync_to_gpu() override {
+    ++to_gpu;
+    image = copy;
+    return true;
+  }
+};
+// A timeline (a DRM sync object's, explicit sync): its value, and the points it was signalled to.
+struct FakeTimeline final : Descriptor {
+  uint64_t value = 0;
+  std::vector<uint64_t> signalled;
+  ByteView memory() override { return ByteView(); }
+  bool signal() override { return false; }
+  uint64_t take_signals() override { return 0; }
+  bool timeline_value(uint64_t* out) override { *out = value; return true; }
+  bool timeline_signal(uint64_t point) override {
+    signalled.push_back(point);
+    if (point > value) value = point;
+    return true;
+  }
+};
 struct FakeMaker final : IDescriptorMaker {
-  int made = 0;
-  bool fail = false;
+  int made = 0, images = 0;
+  bool fail = false, gpu = false;      // (gpu: GPU images can be made, 4 bytes a pixel, rows of width * 4 + 64)
+  std::vector<SharedPointer<FakeGpuFd>> made_images;
+  bool gpu_images() const override { return gpu; }
+  Fd make_gpu_image(uint32_t w, uint32_t h, uint32_t* stride) override {
+    *stride = 0;
+    if (!gpu || fail) return Fd();
+    *stride = w * 4 + 64;
+    ++images;
+    SharedPointer<FakeGpuFd> f = SharedPointer<FakeGpuFd>::make(A, uint64_t(*stride) * h);
+    made_images.push_back(f);
+    return Fd(f);
+  }
   Fd make_memory(uint64_t size, StringView) override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, size, false); }
   Fd make_event() override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, 0, true); }
 };
@@ -2246,6 +2313,664 @@ static void test_windows_virtual_sink() {
   CHECK(service.stream_count() == 0);
 }
 
+// PulseAudio module arguments: pairs, quotes, escapes, PulseAudio property names made PipeWire's; broken lists refused; cut and bit-flipped lists
+// parsed or refused, never read past.
+static void test_module_arguments() {
+  Properties p(A);
+  CHECK(parse_module_arguments("sink_name=a  rate=16000\tchannels='1'", &p) && p.get("sink_name") == StringView("a") && p.get("rate") == StringView("16000") &&
+        p.get("channels") == StringView("1"));
+  p.clear();
+  CHECK(parse_module_arguments("sink_properties='device.description=\"My Sink\" media.role=music'", &p) &&
+        p.get("sink_properties") == StringView("device.description=\"My Sink\" media.role=music"));
+  Properties q(A);
+  CHECK(parse_module_arguments(p.get("sink_properties"), &q) && q.get("node.description") == StringView("My Sink") && q.get("media.role") == StringView("music") &&
+        !q.has("device.description"));
+  p.clear();
+  CHECK(parse_module_arguments("x=\"a \\\" b\" y=c\\ d", &p) && p.get("x") == StringView("a \" b") && p.get("y") == StringView("c d"));
+  p.clear();
+  CHECK(parse_module_arguments("", &p) && p.count() == 0 && parse_module_arguments("   ", &p) && p.count() == 0);
+  CHECK(!parse_module_arguments("novalue", &p) && !parse_module_arguments("=x", &p) && !parse_module_arguments("a='open", &p) &&
+        !parse_module_arguments("a=x\\", &p));
+  CHECK(parse_module_arguments("a=", &p) && p.has("a") && p.get("a").empty());
+  const std::string text = "sink_name=n sink_properties='device.description=\"D\"' rate=8000 channel_map=front-left,front-right";
+  std::mt19937 rng(11);
+  for (size_t cut = 0; cut <= text.size(); ++cut) {
+    Properties t(A);
+    parse_module_arguments(StringView(text.data(), cut), &t);
+  }
+  for (int i = 0; i < 400; ++i) {
+    std::string bad = text;
+    for (int b = 0; b < 2; ++b) bad[rng() % bad.size()] ^= char(1u << (rng() % 8));
+    Properties t(A);
+    parse_module_arguments(StringView(bad.data(), bad.size()), &t);
+  }
+}
+
+// pactl load-module module-null-sink: a virtual sink of the arguments, its module index on it and its monitor, listed as a module, kept when the
+// program that loaded it goes, unloaded by another one; other modules and bad arguments refused; a sink destroyed another way leaves the list.
+static void test_pulse_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  auto connect = [&](PulseClient& c, uint32_t version) {
+    uint8_t cookie[256] = {};
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99;
+    uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(version); w.arbitrary(ConstByteView(cookie, 256)); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(9, [](pulse::TagWriter& w) { Properties p(A); p.set("application.name", "pactl"); w.proplist(p); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  };
+  auto load = [&](PulseClient& c, const char* name, const char* args, uint32_t* error) {
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99, index = 0;
+    *error = 0;
+    const uint32_t t = c.command(51, [&](pulse::TagWriter& w) { w.string(name); w.string(args); });
+    if (!find_reply(c.take(), t, &body, &cmd)) return 0u;
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    if (cmd == 0) { r.u32(error); return 0u; }
+    return r.u32(&index) && r.at_end() ? index : 0u;
+  };
+  PulseClient c(server);
+  connect(c, 35);
+  uint32_t error = 0;
+  const uint32_t index = load(c, "module-null-sink", "sink_name=mysink sink_properties='device.description=\"My Sink\"' channels=1 rate=16000", &error);
+  CHECK(index && (index & PulseServer::kModuleFlag) && error == 0);
+  // the sink: its name, description, format, module
+  std::vector<uint8_t> body;
+  uint32_t cmd = 99;
+  uint32_t t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("mysink"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  uint32_t sink = 0;
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&sink) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(name == StringView("mysink") && desc == StringView("My Sink") && ss.channels == 1 && ss.rate == 16000 && module == index && g.is_virtual_sink(sink));
+  }
+  // its monitor source: the sink's format, the same module
+  t = c.command(23, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("mysink.monitor"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&idx) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(name == StringView("mysink.monitor") && ss.channels == 1 && ss.rate == 16000 && module == index);
+  }
+  // a second one with defaults: "null-sink", stereo 48 kHz, pipewire-pulse's description
+  const uint32_t index2 = load(c, "module-null-sink", nullptr, &error);
+  CHECK(index2 && index2 != index);
+  t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("null-sink"); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t idx = 0, module = 0; StringView name, desc; pulse::SampleSpec ss; pulse::ChannelMap map;
+    CHECK(r.u32(&idx) && r.string(&name) && r.string(&desc) && r.sample_spec(&ss) && r.channel_map(&map) && r.u32(&module));
+    CHECK(desc == StringView("null-sink Audio/Sink sink") && ss.channels == 2 && ss.rate == 48000 && module == index2);
+  }
+  // the module list (version 35: a property list), one by its index
+  t = c.command(26, [](pulse::TagWriter&) {});
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i1 = 0, used = 0, i2 = 0, used2 = 0; StringView n1, a1, n2, a2; Properties p1(A), p2(A); bool a2null = false;
+    CHECK(r.u32(&i1) && r.string(&n1) && r.string(&a1) && r.u32(&used) && r.proplist(&p1) && r.u32(&i2) && r.string(&n2) && r.string(&a2, &a2null) &&
+          r.u32(&used2) && r.proplist(&p2) && r.at_end());
+    CHECK(i1 == index && n1 == StringView("module-null-sink") && a1 == StringView("sink_name=mysink sink_properties='device.description=\"My Sink\"' channels=1 rate=16000") &&
+          used == 0xFFFFFFFFu && i2 == index2 && a2.empty());
+  }
+  t = c.command(25, [&](pulse::TagWriter& w) { w.u32(index2); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+  t = c.command(25, [&](pulse::TagWriter& w) { w.u32(12345); });
+  CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+  // refused: another module, an argument it does not take, a bad value, broken quoting
+  CHECK(!load(c, "module-ladspa-sink", "", &error) && error == 5);
+  CHECK(!load(c, "module-null-sink", "latency_msec=10", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "rate=fast", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "rate=100", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "channels=0", &error) && error == 3);
+  CHECK(!load(c, "module-null-sink", "sink_properties='device.description=\"x", &error) && error == 3);
+  // channel_map gives the channels when channels is not given
+  const uint32_t index3 = load(c, "module-null-sink", "sink_name=m3 channel_map=mono", &error);
+  CHECK(index3);
+  // the program goes: the sinks stay (the kernel's); an old client (version 13) sees auto_unload, not a property list
+  server.close_client(c.handle);
+  CHECK(g.is_virtual_sink(sink));
+  PulseClient old(server);
+  connect(old, 13);
+  t = old.command(25, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i = 0, used = 0; StringView n, a; bool autounload = true;
+    CHECK(r.u32(&i) && r.string(&n) && r.string(&a) && r.u32(&used) && r.boolean(&autounload) && r.at_end() && !autounload);
+  }
+  // unloaded by another program: the sink goes; again: no such module
+  t = old.command(52, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2 && !g.is_virtual_sink(sink));
+  t = old.command(52, [&](pulse::TagWriter& w) { w.u32(index); });
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 0);
+  // a module's sink destroyed another way (pw-cli destroy): the module leaves the list
+  List<uint32_t> sinks(A);
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 2);
+  g.destroy_node(sinks[0]);
+  t = old.command(26, [](pulse::TagWriter&) {});
+  CHECK(find_reply(old.take(), t, &body, &cmd) && cmd == 2);
+  {
+    pulse::TagReader r(ConstByteView(body.data(), body.size()));
+    uint32_t i = 0, used = 0; StringView n, a; bool autounload = true;
+    CHECK(r.u32(&i) && r.string(&n) && r.string(&a) && r.u32(&used) && r.boolean(&autounload) && r.at_end() && i == index3);
+  }
+  // no more than kMaxModules
+  uint32_t made = 0;
+  for (uint32_t k = 0; k < PulseServer::kMaxModules + 2; ++k) made += load(old, "module-null-sink", "", &error) != 0;
+  CHECK(made == PulseServer::kMaxModules - 1);
+}
+
+// module-loopback, module-remap-sink and module-combine-sink over null sinks: a tone played into one sink is heard in another sink's monitor through a
+// loopback, a remapped sink's left comes out on its master's right, a combined sink is heard in each of its slaves; a loopback of a sink's monitor into
+// that sink is refused; unloaded, their nodes go.
+static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate);
+static void test_loopback_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  uint32_t error = 0;
+  auto load = [&](const char* args, const char* module) { return server.load_module(StringView(module), StringView(args), &error); };
+  CHECK(load("sink_name=a", "module-null-sink") && load("sink_name=b", "module-null-sink"));
+  List<uint32_t> sinks(A);
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 2);
+  const uint32_t a = sinks.count() == 2 ? sinks[0] : 0, b = sinks.count() == 2 ? sinks[1] : 0;
+  // plays `left` Hz on the left (and `right` on the right) into `into`, ticks the server, and returns what `from`'s monitor held after the first 0.2 s
+  auto run = [&](uint32_t into, uint32_t from, double left, double right) {
+    uint32_t out = 0, in = 0, taken = 0, got = 0;
+    std::vector<int16_t> heard;
+    if (service.open(40, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, into) != 0 ||
+        service.open_capture(40, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &in, false, from) != 0)
+      return heard;
+    std::vector<uint8_t> pcm(48000 * 4 * 2);
+    for (uint32_t i = 0; i < 96000; ++i) {
+      const int16_t l = left ? int16_t(8192 * sin(2 * M_PI * left * i / 48000)) : 0, r = right ? int16_t(8192 * sin(2 * M_PI * right * i / 48000)) : 0;
+      pcm[4 * i] = uint8_t(l); pcm[4 * i + 1] = uint8_t(uint16_t(l) >> 8); pcm[4 * i + 2] = uint8_t(r); pcm[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    uint64_t written = 0;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int i = 0; i < 400 && heard.size() < 2 * 48000; ++i) {
+      if (written < pcm.size() && service.write(40, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      if (service.read(40, in, ByteView(buf.data(), buf.size()), &got) == 0)
+        for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(40);
+    if (heard.size() > 2 * 9600) heard.erase(heard.begin(), heard.begin() + 2 * 9600);
+    return heard;
+  };
+  // without the loopback: nothing of a in b
+  std::vector<int16_t> none = run(a, b, 500, 500);
+  CHECK(tone_level(none, 2, 0, 500, 48000) < 0.01);      // (b's mixer has nothing to mix: its monitor hears nothing at all)
+  const uint32_t loop = load("source=a.monitor sink=b latency_msec=100", "module-loopback");
+  CHECK(loop != 0);
+  std::vector<int16_t> through = run(a, b, 500, 0);
+  const double l = tone_level(through, 2, 0, 500, 48000), r = tone_level(through, 2, 1, 500, 48000);
+  if (l < 0.2) printf("loopback: left %.3f right %.3f (%zu samples)\n", l, r, through.size());
+  CHECK(through.size() > 2 * 9600 && l > 0.2 && r < 0.01);
+  CHECK(server.unload_module(loop));
+  std::vector<int16_t> after = run(a, b, 500, 500);
+  CHECK(tone_level(after, 2, 0, 500, 48000) < 0.01);
+  // refused: into the sink it records, a sink or source that is not there, a latency out of range
+  CHECK(!load("source=a.monitor sink=a", "module-loopback") && error == 3);
+  CHECK(!load("source=nowhere.monitor sink=b", "module-loopback") && error == 5);
+  CHECK(!load("source=a.monitor sink=nowhere", "module-loopback") && error == 5);
+  CHECK(!load("source=a.monitor sink=b latency_msec=0", "module-loopback") && error == 3);
+  // remap: left into the remapped sink comes out on b's right
+  const uint32_t rm = load("sink_name=swapped master=b channel_map=front-right,front-left", "module-remap-sink");
+  CHECK(rm != 0);
+  sinks.clear();
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 3);
+  const uint32_t swapped = sinks.count() == 3 ? sinks[2] : 0;
+  CHECK(server.module_of(swapped) == rm);
+  std::vector<int16_t> sw = run(swapped, b, 700, 0);
+  const double sl = tone_level(sw, 2, 0, 700, 48000), sr = tone_level(sw, 2, 1, 700, 48000);
+  CHECK(sw.size() > 2 * 9600 && sr > 0.2 && sl < 0.01);
+  CHECK(server.unload_module(rm) && !g.is_virtual_sink(swapped));
+  // combine: one sink heard in both a and b
+  const uint32_t cb = load("sink_name=both slaves=a,b", "module-combine-sink");
+  CHECK(cb != 0);
+  sinks.clear();
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 3);
+  const uint32_t both = sinks.count() == 3 ? sinks[2] : 0;
+  std::vector<int16_t> in_a = run(both, a, 900, 900), in_b = run(both, b, 900, 900);
+  CHECK(tone_level(in_a, 2, 0, 900, 48000) > 0.2 && tone_level(in_b, 2, 1, 900, 48000) > 0.2);
+  CHECK(!load("sink_name=x slaves=a,nowhere", "module-combine-sink") && error == 5);
+  CHECK(server.unload_module(cb) && !g.is_virtual_sink(both));
+  // a module's loopbacks are nodes of the kernel's (they show, as pipewire-pulse's do)
+  const uint32_t again = load("source=a.monitor sink=b", "module-loopback");
+  uint32_t loop_nodes = 0;
+  g.for_each([&](const GraphObject& o) { loop_nodes += o.type == ObjectType::Node && o.props.get("node.name") == StringView("loopback"); });
+  CHECK(again && loop_nodes == 2);
+  CHECK(server.unload_module(again));
+  loop_nodes = 0;
+  g.for_each([&](const GraphObject& o) { loop_nodes += o.type == ObjectType::Node && o.props.get("node.name") == StringView("loopback"); });
+  CHECK(loop_nodes == 0);
+}
+
+// Virtual sources and the modules that make them: module-remap-source (the microphone, its sides swapped), module-virtual-source (with an
+// uplink_sink whose audio the source hears too), module-echo-cancel (what the speakers play taken out of what the microphone hears), and the policy
+// modules pipewire-pulse loads once (module-always-sink, module-switch-on-connect). Recorded through the graph, listed through the PulseAudio protocol.
+static void test_source_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  FakeMicrophone mic;
+  audio::AudioCaptureHub hub(mic, A);
+  CHECK(hub.initialize());
+  Graph g(A, &mixer, &hub);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  uint32_t error = 0;
+  auto load = [&](const char* args, const char* module) { return server.load_module(StringView(module), StringView(args), &error); };
+  const uint32_t client = g.add_client(Origin::Linux, 90, "protocol-pulse", "pipewire-pulse");
+  // records `node` (a virtual source) in 16-bit stereo for `ms`, the microphone saying (left, right) all along; returns the last half's mean per side
+  auto record_mean = [&](uint32_t node, int16_t left, int16_t right, uint32_t ms, double* l, double* r) {
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, node);
+    if (!rn || !rec) return false;
+    std::vector<int16_t> heard;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (uint32_t t = 0; t < ms; t += 5) {
+      mic.add(240, left, right);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    g.destroy_node(rn);
+    const size_t frames = heard.size() / 2;
+    if (frames < 1000) return false;
+    double sl = 0, sr = 0;
+    for (size_t i = frames / 2; i < frames; ++i) {
+      sl += heard[2 * i];
+      sr += heard[2 * i + 1];
+    }
+    *l = sl / double(frames - frames / 2);
+    *r = sr / double(frames - frames / 2);
+    return true;
+  };
+
+  // ---- module-remap-source: the microphone with its sides swapped
+  const uint32_t remap = load("source_name=swapped master=tcos_input.stereo channel_map=front-right,front-left", "module-remap-source");
+  CHECK(remap != 0 && error == 0);
+  List<uint32_t> sources(A), sinks(A);
+  CHECK(g.virtual_sources(&sources) && sources.count() == 1 && g.virtual_sinks(&sinks) && sinks.count() == 0);
+  const uint32_t swapped = sources.count() ? sources[0] : 0;
+  bool shape_ok = false;
+  g.visit(swapped, [&](const GraphObject& o) {
+    shape_ok = o.role == NodeRole::Virtual && o.virtual_source && o.props.get("media.class") == StringView("Audio/Source/Virtual") &&
+               o.props.get("node.description") == StringView("swapped Audio/Source source");
+  });
+  CHECK(shape_ok && g.is_virtual_source(swapped) && !g.is_virtual_sink(swapped) && g.is_virtual(swapped) && server.module_of(swapped) == remap);
+  uint32_t capture_ports = 0, input_ports = 0;
+  g.for_each([&](const GraphObject& o) {
+    if (o.type == ObjectType::Port && o.node == swapped) {
+      capture_ports += o.props.get("port.name").find("capture_") == 0;
+      input_ports += o.props.get("port.name").find("input_") == 0;
+    }
+  });
+  CHECK(capture_ports == 2 && input_ports == 2);      // (null-audio-sink's port names for a source)
+  double l = 0, r = 0;
+  CHECK(record_mean(swapped, 8000, 0, 1000, &l, &r));
+  if (!(r > 6000 && l < 300 && l > -300)) printf("remap-source: left %.0f right %.0f\n", l, r);
+  CHECK(r > 6000 && l < 300 && l > -300);
+  // the source's volume scales what records it (half the cubic PulseAudio volume: an eighth)
+  CHECK(g.set_volume(swapped, 0.125f, false));
+  CHECK(record_mean(swapped, 8000, 0, 1000, &l, &r));
+  CHECK(r > 500 && r < 1500);
+  CHECK(g.set_volume(swapped, 1.0f, true) && record_mean(swapped, 8000, 0, 600, &l, &r) && r == 0 && l == 0);      // (muted)
+  CHECK(g.set_volume(swapped, 1.0f, false));
+  // refused: a master that is not there, an argument the module does not take
+  CHECK(!load("source_name=x master=nowhere", "module-remap-source") && error == 5);
+  CHECK(!load("source_name=x latency_msec=5", "module-remap-source") && error == 3);
+
+  // ---- through the PulseAudio protocol: listed as a source of its own, looked up, its volume set, recorded
+  {
+    PulseClient c(server);
+    uint8_t cookie[256] = {};
+    std::vector<uint8_t> body;
+    uint32_t cmd = 99;
+    uint32_t t = c.command(8, [&](pulse::TagWriter& w) { w.u32(35); w.arbitrary(ConstByteView(cookie, 256)); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(9, [](pulse::TagWriter& w) { Properties p(A); p.set("application.name", "pactl"); w.proplist(p); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(23, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); });      // GET_SOURCE_INFO
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t idx = 0, module = 0, monitor_of = 0; StringView name, desc, monitor_name; pulse::SampleSpec ss; pulse::ChannelMap map; pulse::Cvolume vol; bool mute = true;
+      bool null_monitor = false;
+      CHECK(rd.u32(&idx) && rd.string(&name) && rd.string(&desc) && rd.sample_spec(&ss) && rd.channel_map(&map) && rd.u32(&module) && rd.cvolume(&vol) &&
+            rd.boolean(&mute) && rd.u32(&monitor_of) && rd.string(&monitor_name, &null_monitor));
+      CHECK(idx == swapped && name == StringView("swapped") && desc == StringView("swapped Audio/Source source") && module == remap && !mute &&
+            monitor_of == 0xFFFFFFFFu && null_monitor);
+    }
+    // by its index too; LOOKUP_SOURCE gives the node itself (no monitor flag)
+    t = c.command(23, [&](pulse::TagWriter& w) { w.u32(swapped); w.string_null(); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    t = c.command(11, [](pulse::TagWriter& w) { w.string("swapped"); });      // LOOKUP_SOURCE
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t idx = 0;
+      CHECK(rd.u32(&idx) && idx == swapped);
+    }
+    // the source list: the microphone, the speakers' monitor, the virtual source
+    t = c.command(24, [](pulse::TagWriter&) {});
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      std::string text(body.begin(), body.end());
+      CHECK(text.find("tcos_input.stereo") != std::string::npos && text.find("tcos_output.stereo.monitor") != std::string::npos &&
+            text.find("swapped") != std::string::npos && text.find("swapped.monitor") == std::string::npos);
+    }
+    // SET_SOURCE_VOLUME by name: the node's volume (and so what records it)
+    t = c.command(38, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); pulse::Cvolume v; v.channels = 2; v.values[0] = v.values[1] = 0x8000; w.cvolume(v); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    float vol = 0; bool mute = true;
+    CHECK(g.get_volume(swapped, &vol, &mute) && vol > 0.1f && vol < 0.15f && !mute);
+    CHECK(g.set_volume(swapped, 1.0f, false));
+    // a sink lookup does not find it (it is not a sink)
+    t = c.command(21, [](pulse::TagWriter& w) { w.u32(0xFFFFFFFFu); w.string("swapped"); });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
+    // a record stream on it names it as it is
+    t = c.command(5, [&](pulse::TagWriter& w) {
+      pulse::SampleSpec ss{pulse::kS16Le, 2, 48000};
+      w.sample_spec(ss);
+      pulse::ChannelMap map; map.channels = 2; map.positions[0] = 1; map.positions[1] = 2;
+      w.channel_map(map);
+      w.u32(0xFFFFFFFFu); w.string("swapped");      // source
+      w.u32(0xFFFFFFFFu); w.boolean(false);         // maxlength, corked
+      w.u32(0xFFFFFFFFu);                           // fragsize
+      for (int i = 0; i < 7; ++i) w.boolean(false);
+      w.boolean(false); w.boolean(false);
+      Properties p(A); p.set("media.name", "rec"); w.proplist(p);
+      w.u32(0xFFFFFFFFu);                           // direct on input
+      w.boolean(false); w.boolean(false);           // early requests, dont inhibit
+      w.boolean(false);                             // fail on suspend
+      w.u8(0);                                      // formats
+      pulse::Cvolume v; v.channels = 2; v.values[0] = v.values[1] = 0x10000; w.cvolume(v);
+      w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false); w.boolean(false);
+    });
+    CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 2);
+    {
+      pulse::TagReader rd(ConstByteView(body.data(), body.size()));
+      uint32_t channel = 0, node = 0, maxlength = 0, fragsize = 0, source_idx = 0; pulse::SampleSpec ss; pulse::ChannelMap map; StringView source_name;
+      CHECK(rd.u32(&channel) && rd.u32(&node) && rd.u32(&maxlength) && rd.u32(&fragsize) && rd.sample_spec(&ss) && rd.channel_map(&map) &&
+            rd.u32(&source_idx) && rd.string(&source_name));
+      CHECK(source_idx == swapped && source_name == StringView("swapped"));
+      bool records_source = false;
+      g.visit(node, [&](const GraphObject& o) { records_source = o.role == NodeRole::Capture && o.virtual_source && o.target == swapped && !o.props.has("stream.capture.sink"); });
+      CHECK(records_source);
+    }
+    server.close_client(c.handle);
+  }
+  CHECK(server.unload_module(remap) && !g.is_virtual(swapped));
+  uint32_t left_over = 0;
+  g.for_each([&](const GraphObject& o) { left_over += o.type == ObjectType::Node && o.props.get("node.name") == StringView("remap-source"); });
+  CHECK(left_over == 0);
+
+  // ---- module-virtual-source with an uplink sink: the microphone and what plays into the uplink both heard
+  const uint32_t vs = load("source_name=vsrc uplink_sink=up", "module-virtual-source");
+  CHECK(vs != 0);
+  const uint32_t vsrc = g.find_node("vsrc"), up = g.find_node("up");
+  CHECK(g.is_virtual_source(vsrc) && g.is_virtual_sink(up) && server.module_of(up) == vs && server.module_of(vsrc) == vs);
+  {
+    uint32_t out = 0, taken = 0;
+    CHECK(service.open(41, PcmFormat{SampleFormat::S16Le, 48000, 2}, "uplink.exe", &out, up) == 0);
+    std::vector<uint8_t> pcm(48000 * 4 * 2);
+    for (uint32_t i = 0; i < 96000; ++i) {
+      const int16_t v = 3000;
+      pcm[4 * i] = uint8_t(v); pcm[4 * i + 1] = uint8_t(uint16_t(v) >> 8); pcm[4 * i + 2] = 0; pcm[4 * i + 3] = 0;
+    }
+    uint64_t written = 0;
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 2}, Properties(A), &rec, true, vsrc);
+    std::vector<int16_t> heard;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int t = 0; t < 300 && rn; ++t) {
+      if (written < pcm.size() && service.write(41, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      mic.add(240, 0, 2000);
+      hub.pump();
+      g_now_ns += 5000000;
+      server.tick();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(41);
+    if (rn) g.destroy_node(rn);
+    const size_t frames = heard.size() / 2;
+    double sl = 0, sr = 0;
+    for (size_t i = frames / 2; i < frames; ++i) { sl += heard[2 * i]; sr += heard[2 * i + 1]; }
+    const double ml = frames ? sl / double(frames - frames / 2) : 0, mr = frames ? sr / double(frames - frames / 2) : 0;
+    if (!(ml > 2000 && mr > 1400)) printf("virtual-source: left %.0f (uplink 3000) right %.0f (microphone 2000), %zu frames\n", ml, mr, frames);
+    CHECK(frames > 10000 && ml > 2000 && mr > 1400);
+  }
+  CHECK(server.unload_module(vs) && !g.is_virtual(vsrc) && !g.is_virtual(up));
+  // destroying the uplink another way takes the module (and its source) with it
+  const uint32_t vs2 = load("source_name=vsrc2 uplink_sink=up2", "module-virtual-source");
+  CHECK(vs2 != 0);
+  const uint32_t vsrc2 = g.find_node("vsrc2");
+  g.destroy_node(g.find_node("up2"));
+  CHECK(server.module_of(vsrc2) == vs2 && g.is_virtual(vsrc2));      // (module_of prunes nothing: the next load or list does)
+  CHECK(load("sink_name=probe", "module-null-sink") != 0 && !g.is_virtual(vsrc2));
+  CHECK(server.module_of(vsrc2) == pulse::kInvalidIndex);
+
+  // ---- policy modules: loaded once, nothing to do here
+  const uint32_t always = load("", "module-always-sink"), soc = load("ignore_virtual=true", "module-switch-on-connect");
+  CHECK(always && soc);
+  CHECK(!load("", "module-always-sink") && error == 4);
+  CHECK(!load("sink_name=x bogus=1", "module-always-sink") && error == 3);
+  CHECK(server.unload_module(always) && load("", "module-always-sink") != 0);
+  CHECK(server.unload_module(soc));
+}
+
+// module-echo-cancel: a far end played into echo-cancel-sink reaches the speakers, and the microphone hears it back (half as loud, a little late, as
+// a room would); what the echo-cancel source gives has that echo taken out. With aec_method=null it is the microphone as it is.
+static void test_echo_cancel_module() {
+  for (int null_method = 0; null_method < 2; ++null_method) {
+    FakeDevice dev;
+    audio::AudioMixer mixer(dev, A);
+    CHECK(mixer.initialize());
+    FakeMicrophone mic;
+    audio::AudioCaptureHub hub(mic, A);
+    CHECK(hub.initialize());
+    Graph g(A, &mixer, &hub);
+    CHECK(g.initialize());
+    g.set_clock(&test_clock);
+    PulseServer server(g, A);
+    WindowsAudioService service(g, A);
+    uint32_t error = 0;
+    const uint32_t module = server.load_module(StringView("module-echo-cancel"), StringView(null_method ? "aec_method=null channels=1" : "channels=1"), &error);
+    CHECK(module != 0 && error == 0);
+    const uint32_t sink = g.find_node("echo-cancel-sink"), source = g.find_node("echo-cancel-source");
+    CHECK(g.is_virtual_sink(sink) && g.is_virtual_source(source) && server.module_of(sink) == module && server.module_of(source) == module);
+    const uint32_t client = g.add_client(Origin::Linux, 91, "protocol-pulse", "pipewire-pulse");
+    SharedPointer<RecordStream> rec;
+    const uint32_t rn = g.create_record(client, PcmFormat{SampleFormat::S16Le, 48000, 1}, Properties(A), &rec, true, source);
+    uint32_t out = 0, taken = 0;
+    CHECK(rn && service.open(42, PcmFormat{SampleFormat::S16Le, 48000, 1}, "call.exe", &out, sink) == 0);
+    // the far end: noise in syllables (a voice on the other end of the call)
+    uint32_t seed = 77;
+    float gain = 0, target = 0;
+    uint32_t left = 0;
+    std::vector<uint8_t> far;
+    for (uint32_t i = 0; i < 48000 * 8; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      if (left == 0) { left = 3000 + (seed >> 20) % 9000; target = ((seed >> 12) & 7) == 0 ? 0.0f : 0.3f + float((seed >> 8) & 255) / 400.0f; }
+      --left;
+      gain += (target - gain) * 0.002f;
+      const int16_t v = int16_t(gain * 9000.0f * (float(seed >> 16) / 32768.0f - 1.0f));
+      far.push_back(uint8_t(v)); far.push_back(uint8_t(uint16_t(v) >> 8));
+    }
+    uint64_t written = 0;
+    std::vector<int16_t> room(48000 * 0, 0);      // (the speakers' sound on its way to the microphone)
+    room.assign(2 * 480, 0);                      // (10 ms of air and buffers before the first of it arrives)
+    double mic_energy = 0, out_energy = 0, speaker_energy = 0, talk_energy = 0, talk_out_energy = 0;
+    uint64_t mic_samples = 0, out_samples = 0, talk_at = 0;
+    std::vector<uint8_t> buf(48000 * 2);
+    const int ticks = 8000 / 5;
+    for (int t = 0; t < ticks; ++t) {
+      if (written < far.size() && service.write(42, out, ConstByteView(far.data() + written, far.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      mixer.pump();
+      dev.play_all();
+      for (int16_t s : dev.take()) room.push_back(s);
+      // the microphone hears what the speakers played, half as loud (both sides the same: the far end is mono)
+      const size_t frames = room.size() / 2;
+      // the second half measured: its first half the echo alone, its second half a near-end talker too (a 300 Hz voice: double talk)
+      const bool measure = t >= ticks / 2 && t < 3 * ticks / 4, talking = t >= 3 * ticks / 4;
+      for (size_t i = 0; i < frames; ++i) {
+        const int16_t echo = int16_t(room[2 * i] / 2);
+        const int16_t voice = talking ? int16_t(2500 * sin(2 * M_PI * 300 * double(talk_at++) / 48000)) : 0;
+        mic.add(1, int16_t(echo + voice), int16_t(echo + voice));
+        if (measure) { mic_energy += double(echo) * echo; ++mic_samples; }
+        if (measure) speaker_energy += double(room[2 * i]) * room[2 * i];
+        if (talking) talk_energy += double(voice) * voice;
+      }
+      room.erase(room.begin(), room.begin() + 2 * frames);
+      hub.pump();
+      const uint32_t got = rec->read(ByteView(buf.data(), buf.size()));
+      // (what comes out lags what went in by a block or two: the windows are a little behind, which the energies hardly notice)
+      if (t >= ticks / 2 + 4 && t < 3 * ticks / 4 + 4) {
+        out_samples += got / 2;
+        for (uint32_t k = 0; k + 1 < got; k += 2) { const double v = int16_t(buf[k] | buf[k + 1] << 8); out_energy += v * v; }
+      } else if (t >= 3 * ticks / 4 + 4) {
+        for (uint32_t k = 0; k + 1 < got; k += 2) { const double v = int16_t(buf[k] | buf[k + 1] << 8); talk_out_energy += v * v; }
+      }
+    }
+    const double erle = 10.0 * std::log10(mic_energy / (out_energy > 1 ? out_energy : 1));
+    printf("echo-cancel (%s): speakers %.3g, microphone %.3g (%llu samples), source %.3g (%llu): %.1f dB taken out\n", null_method ? "null" : "nlms",
+           speaker_energy, mic_energy, (unsigned long long)mic_samples, out_energy, (unsigned long long)out_samples, erle);
+    printf("   with a near-end talker: voice %.3g, source %.3g\n", talk_energy, talk_out_energy);
+    CHECK(speaker_energy > 1e9);      // (the far end reached the speakers)
+    if (null_method) {
+      CHECK(erle > -1.0 && erle < 1.0);
+    } else {
+      CHECK(erle > 10.0);
+      CHECK(out_samples > mic_samples * 9 / 10);      // (the source carried audio all along, not silence)
+      // the talker comes through whole while the far end goes on: about the voice's energy, not much of the echo's on top
+      CHECK(talk_out_energy > 0.6 * talk_energy && talk_out_energy < 0.6 * talk_energy + 0.5 * mic_energy + 0.4 * talk_energy);
+    }
+    service.process_exited(42);
+    g.destroy_node(rn);
+    CHECK(server.unload_module(module) && !g.is_virtual(sink) && !g.is_virtual(source));
+  }
+  // refused: a method there is not, a master that is not there
+  {
+    FakeDevice dev;
+    audio::AudioMixer mixer(dev, A);
+    CHECK(mixer.initialize());
+    Graph g(A, &mixer);
+    CHECK(g.initialize());
+    g.set_clock(&test_clock);
+    PulseServer server(g, A);
+    uint32_t error = 0;
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("aec_method=speex"), &error) && error == 19);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("sink_master=nowhere"), &error) && error == 5);
+    CHECK(!server.load_module(StringView("module-echo-cancel"), StringView("source_master=nowhere"), &error) && error == 5);
+    List<uint32_t> virtuals(A);
+    CHECK(g.virtual_sinks(&virtuals) && virtuals.count() == 0 && g.virtual_sources(&virtuals) && virtuals.count() == 0);      // (nothing left made)
+    // without a microphone the default source is the speakers' monitor: allowed
+    const uint32_t m = server.load_module(StringView("module-echo-cancel"), StringView(""), &error);
+    CHECK(m != 0);
+  }
+}
+
+// A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
+// alike), a 16 kHz sink's carries a 1 kHz tone whole and loses a 20 kHz one (above what 16 kHz can hold), and a 48 kHz stereo one changes nothing.
+static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate) {
+  const size_t n = s.size() / channels;
+  if (n == 0) return 0;
+  double re = 0, im = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const double a = 2 * M_PI * hz * double(i) / rate;
+    re += s[i * channels + channel] * cos(a);
+    im += s[i * channels + channel] * sin(a);
+  }
+  return 2 * sqrt(re * re + im * im) / double(n) / 32768.0;
+}
+
+static void test_virtual_sink_shape() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  CHECK(g.create_virtual_node(g.native_client_id(), Properties(A), 2, 1000) == 0);      // (a rate no sink has)
+  WindowsAudioService service(g, A);
+  // plays `left` Hz on the left and `right` Hz on the right (0: silence), each at a quarter of full scale, into `sink`; what its monitor holds, read
+  // in stereo at 48 kHz, after the first tenth of a second
+  auto through = [&](uint32_t sink, double left, double right) {
+    uint32_t out = 0, in = 0, taken = 0, got = 0;
+    std::vector<int16_t> heard;
+    if (service.open(30, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, sink) != 0 ||
+        service.open_capture(30, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &in, false, sink) != 0)
+      return heard;
+    std::vector<uint8_t> pcm(48000 * 4);
+    for (uint32_t i = 0; i < 48000; ++i) {
+      const int16_t l = left ? int16_t(8192 * sin(2 * M_PI * left * i / 48000)) : 0, r = right ? int16_t(8192 * sin(2 * M_PI * right * i / 48000)) : 0;
+      pcm[4 * i] = uint8_t(l); pcm[4 * i + 1] = uint8_t(uint16_t(l) >> 8); pcm[4 * i + 2] = uint8_t(r); pcm[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    uint64_t written = 0;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int i = 0; i < 200 && heard.size() < 2 * 24000; ++i) {
+      if (written < pcm.size() && service.write(30, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      g.refresh();
+      if (service.read(30, in, ByteView(buf.data(), buf.size()), &got) == 0)
+        for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(30);
+    if (heard.size() > 2 * 4800) heard.erase(heard.begin(), heard.begin() + 2 * 4800);
+    return heard;
+  };
+  Properties props(A);
+  props.set("node.name", "mono-null");
+  const uint32_t mono = g.create_virtual_node(g.native_client_id(), props, 1, 48000);
+  props.set("node.name", "narrow-null");
+  const uint32_t narrow = g.create_virtual_node(g.native_client_id(), props, 2, 16000);
+  props.set("node.name", "plain-null");
+  const uint32_t plain = g.create_virtual_node(g.native_client_id(), props, 2, 48000);
+  CHECK(mono && narrow && plain);
+  // mono: 1 kHz on the left only comes out at half on both sides
+  std::vector<int16_t> m = through(mono, 1000, 0);
+  CHECK(m.size() >= 2 * 9600);
+  const double ml = tone_level(m, 2, 0, 1000, 48000), mr = tone_level(m, 2, 1, 1000, 48000);
+  CHECK(ml > 0.115 && ml < 0.135 && mr > 0.115 && mr < 0.135);
+  // the plain one: as played, left only
+  std::vector<int16_t> p = through(plain, 1000, 0);
+  const double pl = tone_level(p, 2, 0, 1000, 48000), pr = tone_level(p, 2, 1, 1000, 48000);
+  CHECK(p.size() >= 2 * 9600 && pl > 0.24 && pl < 0.26 && pr < 0.005);
+  // 16 kHz: 1 kHz kept, 20 kHz gone (from 0.25 to under a tenth of it)
+  std::vector<int16_t> n = through(narrow, 1000, 20000);
+  const double low = tone_level(n, 2, 0, 1000, 48000), high = tone_level(n, 2, 1, 20000, 48000);
+  CHECK(n.size() >= 2 * 9600 && low > 0.22 && low < 0.26 && high < 0.025);
+  std::vector<int16_t> pw = through(plain, 0, 20000);
+  CHECK(tone_level(pw, 2, 1, 20000, 48000) > 0.2);      // (the 48 kHz sink keeps it)
+}
+
 // ---- the cameras as video sources -------------------------------------------------------------------------------------------------------------------
 
 struct FakeCamera final : hardware::ICamera {
@@ -2349,6 +3074,571 @@ static void test_camera_sources() {
   sources.update(ArrayView<const CameraSources::Camera>(), now += 20000);
   CHECK(sources.count() == 0 && g.find_node("tcos-camera-8") == 0);
   g.destroy_node(second);
+}
+
+// The screen as a video source: frames only while watched, at most kFps a second, published as BGRx at the screen's size (which may change).
+static void test_screen_source() {
+  Graph g(A, nullptr);
+  CHECK(g.initialize());
+  ScreenSource screen(g, A);
+  CHECK(screen.start() && screen.node() && g.find_node("tcos-screen") == screen.node());
+  uint64_t now = 1000000;
+  CHECK(screen.frame_wanted(8, 4, now).empty() && !screen.watched() && !screen.watcher_came());      // (nobody watches)
+  const uint32_t client = g.add_client(Origin::Native, 1, "native", "test");
+  Properties props(A);
+  props.set("target.object", "tcos-screen");
+  SharedPointer<VideoChannel> seen;
+  const uint32_t watcher = g.create_video_node(client, props, kDirectionInput, &seen);
+  CHECK(watcher && seen && screen.watched() && screen.watcher_came() && !screen.watcher_came());
+  ArrayView<uint32_t> frame = screen.frame_wanted(8, 4, now);
+  CHECK(frame.size() == 32);
+  for (uint32_t i = 0; i < frame.size(); ++i) frame[i] = 0xFF000000u | (i << 16) | (i << 8) | i;
+  screen.frame_read(8, 4, 77);
+  CHECK(screen.published() == 1 && seen->format().format == 8 && seen->format().width == 8 && seen->format().height == 4);
+  SharedPointer<VideoFrame> f = seen->latest();
+  CHECK(f && f->pixels.size() == 128 && f->pts == 77);
+  if (f) CHECK(f->pixels.view()[4 * 5] == 5 && f->pixels.view()[4 * 5 + 2] == 5 && f->pixels.view()[4 * 5 + 3] == 0xFF);      // (B, G, R, A)
+  CHECK(screen.frame_wanted(8, 4, now + 50000).empty());      // (too soon: 10 a second at most)
+  ArrayView<uint32_t> bigger = screen.frame_wanted(16, 8, now + 100000);
+  CHECK(bigger.size() == 128);
+  screen.frame_read(16, 8, 78);
+  CHECK(screen.published() == 2 && seen->format().width == 16 && seen->latest() && seen->latest()->pixels.size() == 512);
+  CHECK(screen.frame_wanted(VideoFormat::kMaxSide + 1, 4, now + 300000).empty());
+  // a still screen: the last frame again once a second, never while one is being read
+  const uint64_t before = screen.published();
+  CHECK(!screen.keep_alive(now + 600000) && screen.published() == before);      // (0.5 s after the last)
+  CHECK(screen.keep_alive(now + 1200000) && screen.published() == before + 1 && seen->latest() && seen->latest()->pixels.size() == 512);
+  CHECK(!screen.keep_alive(now + 1300000));
+  ArrayView<uint32_t> filling = screen.frame_wanted(16, 8, now + 2300000);
+  CHECK(!filling.empty() && !screen.keep_alive(now + 2400000));      // (being read)
+  screen.frame_read(16, 8, 79);
+  CHECK(screen.published() == before + 2);
+  // the render thread and the loop at once: every frame that goes out is whole (all its pixels one value)
+  {
+    // (the last frame before them made whole: keep_alive may send it again before the render thread's first)
+    ArrayView<uint32_t> first = screen.frame_wanted(16, 8, now + 9000000);
+    CHECK(first.size() == 128);
+    for (uint32_t& px : first) px = 0xFF000000u;
+    screen.frame_read(16, 8, 0);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> clock{now + 10000000};
+    std::thread render([&] {
+      for (uint32_t value = 1; value < 400; ++value) {
+        ArrayView<uint32_t> f2 = screen.frame_wanted(16, 8, clock.fetch_add(150000));
+        if (f2.empty()) continue;
+        for (uint32_t& p : f2) p = 0xFF000000u | value;
+        screen.frame_read(16, 8, 0);
+      }
+      stop = true;
+    });
+    std::thread loop([&] {
+      while (!stop.load()) {
+        screen.keep_alive(clock.fetch_add(400000));
+        std::this_thread::yield();
+      }
+    });
+    int torn = 0, frames = 0;
+    uint64_t last = seen->latest() ? seen->latest()->sequence : 0;      // (the frames before the threads were not filled in: not counted)
+    while (!stop.load()) {
+      SharedPointer<VideoFrame> fr = seen->latest();
+      if (fr && fr->sequence != last) {
+        last = fr->sequence;
+        ++frames;
+        const ConstByteView v = fr->pixels.view();
+        for (uint64_t k = 4; k < v.size(); k += 4) if (v[k] != v[0]) { ++torn; break; }
+      }
+      std::this_thread::yield();
+    }
+    render.join();
+    loop.join();
+    if (torn || !frames) printf("screen threads: %d frames, %d torn\n", frames, torn);
+    CHECK(torn == 0 && frames > 0);
+  }
+  // a program presenting to the display: its frames go out, the desktop's are passed over while it presents; once it stopped for kProgramHoldUs,
+  // desktop_returned() says so once and the desktop's frames go out again
+  {
+    uint64_t t = now + 100000000;
+    ArrayView<uint32_t> p1 = screen.frame_wanted(6, 4, t, ScreenOrigin::Program);
+    CHECK(p1.size() == 24);
+    for (uint32_t& p : p1) p = 0xFF3D3D3Du;
+    screen.frame_read(6, 4, 1);
+    CHECK(seen->format().width == 6 && seen->latest() && seen->latest()->pixels.view()[0] == 0x3D);
+    CHECK(screen.frame_wanted(16, 8, t + 150000).empty());      // (the desktop, while the program presents)
+    CHECK(screen.frame_wanted(6, 4, t + 160000, ScreenOrigin::Program).size() == 24);
+    screen.frame_read(6, 4, 2);
+    CHECK(!screen.desktop_returned(t + 300000));      // (140 ms since its last present)
+    CHECK(screen.frame_wanted(16, 8, t + 300000).empty());
+    CHECK(screen.desktop_returned(t + 160000 + ScreenSource::kProgramHoldUs) && !screen.desktop_returned(t + 900000));
+    ArrayView<uint32_t> d1 = screen.frame_wanted(16, 8, t + 1000000);
+    CHECK(d1.size() == 128);
+    screen.frame_read(16, 8, 3);
+    CHECK(seen->format().width == 16);
+    // a read back that failed (0 x 0): nothing published, the next frame wanted again
+    const uint64_t before_lost = screen.published();
+    ArrayView<uint32_t> lost = screen.frame_wanted(16, 8, t + 2000000);
+    CHECK(!lost.empty() && screen.frame_wanted(16, 8, t + 2150000).empty());      // (being read)
+    screen.frame_read(0, 0, 4);
+    CHECK(screen.published() == before_lost && seen->format().width == 16 && screen.frame_wanted(16, 8, t + 2300000).size() == 128);
+    screen.frame_read(16, 8, 5);
+  }
+  g.destroy_node(watcher);
+  CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
+  const uint64_t t2 = now + 200000000;
+  CHECK(screen.frame_wanted(8, 4, t2, ScreenOrigin::Program).empty() && !screen.desktop_returned(t2 + 1000) && screen.desktop_returned(t2 + ScreenSource::kProgramHoldUs));
+}
+
+// ---- encoded video ----------------------------------------------------------------------------------------------------------------------------------
+
+// The layouts against GStreamer's (tests/data/formats, made by make_format_fixtures.sh): a 48 x 32 picture as its videoconvert wrote it in each of the
+// formats added for the rest of raw.h - 10-bit packed (v210, UYVP), v216, packed 4:4:4 and 4:1:1, YUV9, the tiled NV12, big-endian and alpha planar
+// YUV, planar RGB, r210, the palette - is the size the server says, and reads back as the picture it was made from (luma, and chroma where it is not
+// subsampled; RGB); the RGB ones the server writes are GStreamer's bytes.
+static void test_format_fixtures() {
+  struct Fixture { const char* name; uint32_t id; bool rgb, full_chroma; };
+  const Fixture fixtures[] = {
+      {"v210", 21, false, false}, {"v216", 22, false, false}, {"UYVP", 33, false, false}, {"IYU1", 38, false, false}, {"IYU2", 63, false, true},
+      {"v308", 28, false, true}, {"NV12_64Z32", 53, false, false}, {"YUV9", 36, false, false}, {"YVU9", 37, false, false}, {"A420", 34, false, false},
+      {"I420_10BE", 42, false, false}, {"I422_10BE", 44, false, false}, {"Y444_10BE", 46, false, true}, {"I420_12BE", 72, false, false},
+      {"I422_12LE", 75, false, false}, {"I422_12BE", 74, false, false}, {"Y444_12LE", 77, false, true}, {"Y444_12BE", 76, false, true},
+      {"P010_10BE", 61, false, false}, {"A420_10LE", 55, false, false}, {"A420_10BE", 54, false, false}, {"A422_10LE", 57, false, false},
+      {"A422_10BE", 56, false, false}, {"A444_10LE", 59, false, true}, {"A444_10BE", 58, false, true},
+      {"r210", 41, true, true}, {"RGB8P", 35, true, true}, {"GBR", 48, true, true}, {"GBR_10LE", 50, true, true}, {"GBR_10BE", 49, true, true},
+      {"GBR_12LE", 69, true, true}, {"GBR_12BE", 68, true, true}, {"GBRA", 65, true, true}, {"GBRA_10LE", 67, true, true},
+      {"GBRA_10BE", 66, true, true}, {"GBRA_12LE", 71, true, true}, {"GBRA_12BE", 70, true, true}};
+  const std::vector<uint8_t> y444 = read_test_file("tests/data/formats/src_y444.raw"), rgba = read_test_file("tests/data/formats/src_rgba.raw");
+  CHECK(y444.size() == 48 * 32 * 3 && rgba.size() == 48 * 32 * 4);
+  if (y444.size() != 48 * 32 * 3 || rgba.size() != 48 * 32 * 4) return;
+  VideoFormat to_y444, to_rgba;
+  to_y444.format = 20; to_y444.width = 48; to_y444.height = 32;
+  to_rgba.format = 11; to_rgba.width = 48; to_rgba.height = 32;
+  for (const Fixture& fx : fixtures) {
+    const std::vector<uint8_t> bytes = read_test_file((std::string("tests/data/formats/") + fx.name + ".raw").c_str());
+    VideoFormat f;
+    f.format = fx.id; f.width = 48; f.height = 32;
+    if (bytes.size() != f.frame_bytes()) printf("fixture %s: %zu bytes, the server says %llu\n", fx.name, bytes.size(), (unsigned long long)f.frame_bytes());
+    CHECK(bytes.size() == f.frame_bytes());
+    if (bytes.size() != f.frame_bytes()) continue;
+    ByteBuffer out(A);
+    CHECK(convert_video(f, ConstByteView(bytes.data(), bytes.size()), fx.rgb ? to_rgba : to_y444, &out));
+    int worst = 0, worst_chroma = 0;
+    if (fx.id == 35) {      // (the palette: each pixel what its index says, GStreamer's own quantizing aside: native-endian 0xAARRGGBB words)
+      for (size_t k = 0; k < 48 * 32 && out.size() == rgba.size(); ++k) {
+        const uint8_t* entry = bytes.data() + 48 * 32 + 4 * size_t(bytes[k]);
+        const uint8_t want[3] = {entry[2], entry[1], entry[0]};
+        for (size_t c = 0; c < 3; ++c) worst = std::max(worst, abs(int(out.view()[4 * k + c]) - int(want[c])));
+      }
+    } else if (fx.rgb) {
+      for (size_t k = 0; k < rgba.size() && out.size() == rgba.size(); ++k)
+        if (k % 4 != 3) worst = std::max(worst, abs(int(out.view()[k]) - int(rgba[k])));
+    } else {
+      for (size_t k = 0; k < 48 * 32 && out.size() == y444.size(); ++k) {
+        worst = std::max(worst, abs(int(out.view()[k]) - int(y444[k])));
+        if (fx.full_chroma)
+          for (size_t c = 1; c < 3; ++c) worst_chroma = std::max(worst_chroma, abs(int(out.view()[c * 48 * 32 + k]) - int(y444[c * 48 * 32 + k])));
+      }
+    }
+    const int allowed = fx.id == 35 ? 0 : 2;      // (the palette: exact; else the RGB pivot's rounding)
+    if (worst > allowed || worst_chroma > 2) printf("fixture %s: off by %d (chroma %d)\n", fx.name, worst, worst_chroma);
+    CHECK(worst <= allowed && worst_chroma <= 2);
+    // the RGB ones written: GStreamer's bytes (a sample at most one off)
+    if (fx.rgb && fx.id != 35) {
+      ByteBuffer mine(A);
+      CHECK(convert_video(to_rgba, ConstByteView(rgba.data(), rgba.size()), f, &mine) && mine.size() == bytes.size());
+      int diff = 0;
+      const bool sixteen = !(fx.id == 48 || fx.id == 65 || fx.id == 41);
+      const bool be = fx.id == 49 || fx.id == 68 || fx.id == 66 || fx.id == 70;
+      for (size_t k = 0; k + (sixteen ? 1 : 0) < bytes.size() && mine.size() == bytes.size(); k += sixteen ? 2 : 1) {
+        if (fx.id == 41) {      // (r210: a big-endian word of three fields)
+          if (k % 4) continue;
+          const uint32_t a = uint32_t(bytes[k]) << 24 | uint32_t(bytes[k + 1]) << 16 | uint32_t(bytes[k + 2]) << 8 | bytes[k + 3];
+          const uint32_t b = uint32_t(mine.view()[k]) << 24 | uint32_t(mine.view()[k + 1]) << 16 | uint32_t(mine.view()[k + 2]) << 8 | mine.view()[k + 3];
+          for (int sh = 0; sh < 30; sh += 10) diff = std::max(diff, abs(int((a >> sh) & 0x3FF) - int((b >> sh) & 0x3FF)));
+          continue;
+        }
+        const int a = sixteen ? (be ? bytes[k] << 8 | bytes[k + 1] : bytes[k] | bytes[k + 1] << 8) : bytes[k];
+        const int b = sixteen ? (be ? mine.view()[k] << 8 | mine.view()[k + 1] : mine.view()[k] | mine.view()[k + 1] << 8) : mine.view()[k];
+        diff = std::max(diff, abs(a - b));
+      }
+      if (diff > 1) printf("fixture %s written: off by %d\n", fx.name, diff);
+      CHECK(diff <= 1);
+    }
+  }
+}
+
+// The software codecs as the graph's decoders (what the kernel's SystemVideoCodecs is to it).
+struct SoftwareDecoders final : IVideoCodecs {
+  hardware::SoftwareVideoCodec device{A};
+  int made = 0;
+  bool can_decode(hardware::VideoCodec codec) const override { return device.can_decode(codec); }
+  UniquePointer<hardware::IVideoDecoder> create_decoder(const hardware::DecoderConfig& config) override {
+    ++made;
+    return device.create_decoder(config);
+  }
+  int encoders = 0;
+  bool can_encode(hardware::VideoCodec codec) const override { return device.can_encode(codec); }
+  UniquePointer<hardware::IVideoEncoder> create_encoder(const hardware::EncoderConfig& config) override {
+    ++encoders;
+    return device.create_encoder(config);
+  }
+};
+
+// A moving test picture (0xAARRGGBB).
+static std::vector<uint32_t> test_picture(uint32_t w, uint32_t h, uint32_t frame) {
+  std::vector<uint32_t> px(size_t(w) * h);
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint32_t r = (x * 255 / (w - 1) + frame * 8) & 0xFF, g = y * 255 / (h - 1), b = ((x / 8 + y / 8 + frame) & 1) ? 200 : 40;
+      px[size_t(y) * w + x] = 0xFF000000u | r << 16 | g << 8 | b;
+    }
+  return px;
+}
+
+// `count` pictures as H.264 access units (Annex B), from the software encoder.
+static std::vector<std::vector<uint8_t>> encode_h264(uint32_t w, uint32_t h, uint32_t count, uint32_t keyframe_interval) {
+  std::vector<std::vector<uint8_t>> out;
+  hardware::SoftwareVideoCodec device(A);
+  hardware::EncoderConfig ec;
+  ec.codec = hardware::VideoCodec::H264;
+  ec.width = w;
+  ec.height = h;
+  ec.input = hardware::PixelFormat::Bgra8888;
+  ec.quality = 90;
+  ec.keyframe_interval = keyframe_interval;
+  UniquePointer<hardware::IVideoEncoder> enc = device.create_encoder(ec);
+  if (!enc) return out;
+  for (uint32_t i = 0; i < count; ++i) {
+    std::vector<uint32_t> px = test_picture(w, h, i);
+    hardware::VideoFrame f;
+    f.format = {w, h, hardware::PixelFormat::Bgra8888};
+    f.plane[0] = words_as_bytes(ArrayView<const uint32_t>(px.data(), px.size())).data();
+    f.stride[0] = w * 4;
+    f.pts_us = int64_t(i) * 33333;
+    if (enc->submit(f) != hardware::SubmitResult::Accepted) return {};
+    hardware::VideoPacket pkt;
+    while (enc->receive(&pkt)) out.emplace_back(pkt.data.data(), pkt.data.data() + pkt.data.size());
+  }
+  enc->flush();
+  hardware::VideoPacket pkt;
+  while (enc->receive(&pkt)) out.emplace_back(pkt.data.data(), pkt.data.data() + pkt.data.size());
+  return out;
+}
+
+// The frames of an IVF file (VP8, VP9).
+static std::vector<std::vector<uint8_t>> ivf_frames(const std::vector<uint8_t>& file) {
+  std::vector<std::vector<uint8_t>> out;
+  if (file.size() < 32 || memcmp(file.data(), "DKIF", 4) != 0) return out;
+  const size_t header = size_t(file[6]) | size_t(file[7]) << 8;
+  for (size_t at = header; at + 12 <= file.size();) {
+    const size_t n = size_t(file[at]) | size_t(file[at + 1]) << 8 | size_t(file[at + 2]) << 16 | size_t(file[at + 3]) << 24;
+    at += 12;
+    if (n > file.size() - at) break;
+    out.emplace_back(file.begin() + long(at), file.begin() + long(at + n));
+    at += n;
+  }
+  return out;
+}
+
+// The pictures a decoder of the software codecs gives for `packets`, in order, as BGRA bytes (what the graph's decoding must match).
+static std::vector<std::vector<uint8_t>> reference_pictures(hardware::VideoCodec codec, const std::vector<std::vector<uint8_t>>& packets, uint32_t* w,
+                                                             uint32_t* h) {
+  std::vector<std::vector<uint8_t>> out;
+  hardware::SoftwareVideoCodec device(A);
+  hardware::DecoderConfig config;
+  config.codec = codec;
+  config.output = hardware::PixelFormat::Bgra8888;
+  UniquePointer<hardware::IVideoDecoder> dec = device.create_decoder(config);
+  if (!dec) return out;
+  auto take = [&] {
+    hardware::VideoFrame f;
+    while (dec->receive(&f)) {
+      *w = f.format.width;
+      *h = f.format.height;
+      std::vector<uint8_t> px(size_t(f.format.width) * f.format.height * 4);
+      for (uint32_t y = 0; y < f.format.height; ++y) memcpy(px.data() + size_t(y) * f.format.width * 4, f.plane[0] + size_t(y) * f.stride[0], f.format.width * 4u);
+      out.push_back(std::move(px));
+    }
+  };
+  int64_t pts = 0;
+  for (const std::vector<uint8_t>& p : packets) {
+    hardware::VideoPacket pkt;
+    pkt.data = ConstByteView(p.data(), p.size());
+    pkt.pts_us = pts;
+    pkt.keyframe = false;
+    pts += 33333;
+    while (dec->submit(pkt) == hardware::SubmitResult::Full) take();
+    take();
+  }
+  return out;
+}
+
+// Deep formats keep their bits through the conversion (16 bits a component): a 10-bit luma ramp of every value from black to white comes back exact
+// (or within one), every value still its own; 16-bit RGB through float and back within one; grey and 10-bit RGB through 16-bit RGB exactly; frames
+// made from 16-bit RGB come out the same when made again through another deep format.
+static std::vector<uint8_t> le16_bytes(const std::vector<uint16_t>& v) {
+  std::vector<uint8_t> b(v.size() * 2);
+  for (size_t i = 0; i < v.size(); ++i) { b[2 * i] = uint8_t(v[i]); b[2 * i + 1] = uint8_t(v[i] >> 8); }
+  return b;
+}
+static std::vector<uint16_t> le16_words(ConstByteView b) {
+  std::vector<uint16_t> v(b.size() / 2);
+  for (size_t i = 0; i < v.size(); ++i) v[i] = uint16_t(b[2 * i] | b[2 * i + 1] << 8);
+  return v;
+}
+static bool convert_bytes(uint32_t from, uint32_t to, uint32_t w, uint32_t h, const std::vector<uint8_t>& in, std::vector<uint8_t>* out) {
+  VideoFormat a, b;
+  a.format = from; a.width = w; a.height = h;
+  b.format = to; b.width = w; b.height = h;
+  ByteBuffer o(A);
+  if (!convert_video(a, ConstByteView(in.data(), in.size()), b, &o) || o.size() != b.frame_bytes()) return false;
+  out->assign(o.view().data(), o.view().data() + o.size());
+  return true;
+}
+
+static void test_deep_conversion() {
+  // Y444_10LE: luma 64 .. 940 (black .. white), chroma neutral (512); to ARGB64 and back
+  const uint32_t n = 940 - 64 + 1, w = 877, h = 1;
+  CHECK(n == w);
+  std::vector<uint16_t> y444(size_t(w) * h * 3);
+  for (uint32_t i = 0; i < w; ++i) {
+    y444[i] = uint16_t(64 + i);
+    y444[w + i] = 512;
+    y444[2 * w + i] = 512;
+  }
+  std::vector<uint8_t> rgb64, back;
+  CHECK(convert_bytes(47, 39, w, h, le16_bytes(y444), &rgb64) && convert_bytes(39, 47, w, h, rgb64, &back));
+  const std::vector<uint16_t> again = le16_words(ConstByteView(back.data(), back.size()));
+  int worst = 0, distinct = 0;
+  for (uint32_t i = 0; i < w && again.size() == y444.size(); ++i) {
+    worst = std::max(worst, abs(int(again[i]) - int(y444[i])));
+    worst = std::max(worst, abs(int(again[w + i]) - 512));
+    worst = std::max(worst, abs(int(again[2 * w + i]) - 512));
+    distinct += i == 0 || again[i] != again[i - 1];
+  }
+  CHECK(again.size() == y444.size() && worst <= 1 && distinct == int(w));
+  // black and white land on the ends of 16-bit RGB
+  const std::vector<uint16_t> argb = le16_words(ConstByteView(rgb64.data(), rgb64.size()));
+  CHECK(argb.size() == size_t(w) * 4 && argb[1] == 0 && argb[2] == 0 && argb[(w - 1) * 4 + 1] == 65535 && argb[(w - 1) * 4 + 3] == 65535 && argb[0] == 65535);
+  // 16-bit RGB of random values through RGBA_F32 and back: within one
+  std::mt19937 rng(5);
+  const uint32_t rw = 32, rh = 8;
+  std::vector<uint16_t> random(size_t(rw) * rh * 4);
+  for (uint16_t& v : random) v = uint16_t(rng());
+  std::vector<uint8_t> f32, from_f32;
+  CHECK(convert_bytes(39, 79, rw, rh, le16_bytes(random), &f32) && convert_bytes(79, 39, rw, rh, f32, &from_f32));
+  const std::vector<uint16_t> rf = le16_words(ConstByteView(from_f32.data(), from_f32.size()));
+  worst = 0;
+  for (size_t i = 0; i < random.size() && rf.size() == random.size(); ++i) worst = std::max(worst, abs(int(rf[i]) - int(random[i])));
+  CHECK(rf.size() == random.size() && worst <= 1);
+  // GRAY16 through ARGB64: exact
+  std::vector<uint16_t> grey16(size_t(rw) * rh);
+  for (uint16_t& v : grey16) v = uint16_t(rng());
+  std::vector<uint8_t> g64, gback;
+  CHECK(convert_bytes(27, 39, rw, rh, le16_bytes(grey16), &g64) && convert_bytes(39, 27, rw, rh, g64, &gback));
+  CHECK(le16_words(ConstByteView(gback.data(), gback.size())) == grey16);
+  // xRGB_210LE through ARGB64: exact
+  std::vector<uint8_t> rgb10(size_t(rw) * rh * 4), r64, rback;
+  for (size_t i = 0; i < rgb10.size(); i += 4) {
+    const uint32_t word = 0xC0000000u | (rng() & 0x3FFFFFFFu);
+    for (int k = 0; k < 4; ++k) rgb10[i + size_t(k)] = uint8_t(word >> (8 * k));
+  }
+  CHECK(convert_bytes(80, 39, rw, rh, rgb10, &r64) && convert_bytes(39, 80, rw, rh, r64, &rback) && rback == rgb10);
+  // a deep frame (10-bit 4:4:4: luma varying, chroma a little off neutral and the same over each 4 x 4 block, so every format can hold it and it stays
+  // in gamut) made each deep format, then made again through another: the same within one (12-bit: within four, a 10-bit source's steps)
+  std::vector<uint16_t> blocky(size_t(rw) * rh * 3);
+  for (uint32_t y = 0; y < rh; ++y)
+    for (uint32_t x = 0; x < rw; ++x) {
+      const size_t i = size_t(y) * rw + x;
+      blocky[i] = uint16_t(200 + (x * 37 + y * 11 + rng() % 7) % 600);
+      const uint32_t block = (y / 4) * 8 + x / 4;
+      blocky[size_t(rw) * rh + i] = uint16_t(512 - 50 + (block * 13) % 100);
+      blocky[2 * size_t(rw) * rh + i] = uint16_t(512 - 50 + (block * 29) % 100);
+    }
+  const uint32_t deep[] = {43, 45, 47, 62, 73, 40};
+  for (uint32_t format : deep) {
+    std::vector<uint8_t> a1;
+    CHECK(convert_bytes(47, format, rw, rh, le16_bytes(blocky), &a1));
+    for (uint32_t other : deep) {
+      std::vector<uint8_t> mid, a2;
+      if (!convert_bytes(format, other, rw, rh, a1, &mid) || !convert_bytes(other, format, rw, rh, mid, &a2)) {
+        CHECK(false);
+        continue;
+      }
+      const std::vector<uint16_t> x1 = le16_words(ConstByteView(a1.data(), a1.size())), x2 = le16_words(ConstByteView(a2.data(), a2.size()));
+      int diff = 0;
+      for (size_t i = 0; i < x1.size() && x2.size() == x1.size(); ++i) {
+        const int a = format == 62 ? x1[i] >> 6 : x1[i], b = format == 62 ? x2[i] >> 6 : x2[i];
+        diff = std::max(diff, abs(a - b));
+      }
+      const int allowed = format == 40 ? 64 : format == 73 ? 4 : 1;      // (AYUV64: 16-bit samples of a 10-bit source; I420_12LE: 12-bit)
+      if (diff > allowed) printf("deep %u via %u: %d\n", format, other, diff);
+      CHECK(x2.size() == x1.size() && diff <= allowed);
+    }
+  }
+}
+
+// VideoDecodeSession: H.264 (from the encoder) and VP8 (a file) decoded as a decoder of the codecs would, the codec switched in the middle; without
+// decoders only Motion JPEG; truncated and bit-flipped frames are refused or decoded, never read past; decode_video to another format and size.
+static void test_video_decode() {
+  SoftwareDecoders decoders;
+  CHECK(can_decode_subtype(kSubtypeMjpg, nullptr) && !can_decode_subtype(kSubtypeH264, nullptr) && can_decode_subtype(kSubtypeH264, &decoders) &&
+        can_decode_subtype(kSubtypeVp9, &decoders) && can_decode_subtype(kSubtypeH265, &decoders) && !can_decode_subtype(0x20003, &decoders) &&
+        !can_decode_subtype(VideoFormat::kSubtypeRaw, &decoders));
+  hardware::VideoCodec codec;
+  CHECK(codec_of_subtype(kSubtypeVc1, &codec) && codec == hardware::VideoCodec::Vc1 && !codec_of_subtype(kSubtypeMjpg, &codec));
+  const std::vector<std::vector<uint8_t>> h264 = encode_h264(64, 48, 8, 4);
+  CHECK(h264.size() == 8);
+  uint32_t rw = 0, rh = 0;
+  const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, h264, &rw, &rh);
+  CHECK(want.size() == 8 && rw == 64 && rh == 48);
+  VideoDecodeSession session(A);
+  VideoFormat f;
+  ConstByteView px;
+  bool failed = false;
+  CHECK(!session.decode(kSubtypeH264, ConstByteView(h264[0].data(), h264[0].size()), nullptr, &f, &px, &failed) && failed);      // (no decoders)
+  session.reset();
+  size_t matched = 0;
+  for (size_t i = 0; i < h264.size(); ++i) {
+    const bool got = session.decode(kSubtypeH264, ConstByteView(h264[i].data(), h264[i].size()), &decoders, &f, &px, &failed);
+    CHECK(got && !failed && f.format == 12 && f.width == 64 && f.height == 48 && px.size() == 64 * 48 * 4);
+    if (got && i < want.size() && px.size() == want[i].size() && memcmp(px.data(), want[i].data(), px.size()) == 0) ++matched;
+    if (got && px.size() == 64 * 48 * 4) {      // (close to the picture encoded)
+      const std::vector<uint32_t> src = test_picture(64, 48, uint32_t(i));
+      uint64_t err = 0;
+      for (size_t k = 0; k < src.size(); ++k)
+        for (int c = 0; c < 3; ++c) err += uint64_t(abs(int((src[k] >> (8 * c)) & 0xFF) - int(px[4 * k + size_t(c)])));
+      CHECK(err / (src.size() * 3) < 12);
+    }
+  }
+  CHECK(matched == h264.size() && decoders.made == 1);
+  // VP8 from a file, then H.264 again (each switch a new decoder)
+  const std::vector<std::vector<uint8_t>> vp8 = ivf_frames(read_test_file("tests/data/vp8_inter.ivf"));
+  CHECK(vp8.size() >= 4);
+  const std::vector<std::vector<uint8_t>> want8 = reference_pictures(hardware::VideoCodec::Vp8, vp8, &rw, &rh);
+  CHECK(want8.size() == vp8.size());
+  matched = 0;
+  for (size_t i = 0; i < vp8.size(); ++i)
+    if (session.decode(kSubtypeVp8, ConstByteView(vp8[i].data(), vp8[i].size()), &decoders, &f, &px, &failed) && i < want8.size() &&
+        f.width == rw && f.height == rh && px.size() == want8[i].size() && memcmp(px.data(), want8[i].data(), px.size()) == 0)
+      ++matched;
+  CHECK(matched == vp8.size() && decoders.made == 2);
+  CHECK(session.decode(kSubtypeH264, ConstByteView(h264[0].data(), h264[0].size()), &decoders, &f, &px, &failed) && f.width == 64 && decoders.made == 3);
+  // Motion JPEG through the same session
+  const std::vector<uint8_t> jpeg = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+  CHECK(session.decode(kSubtypeMjpg, ConstByteView(jpeg.data(), jpeg.size()), nullptr, &f, &px, &failed) && f.width == 64 && f.height == 48 &&
+        px.size() == 64 * 48 * 4);
+  // to NV12 at half size: decoded, then converted and scaled
+  ByteBuffer out(A);
+  VideoFormat from;
+  from.subtype = kSubtypeH264;
+  VideoFormat nv12;
+  nv12.format = 23; nv12.width = 32; nv12.height = 24;
+  VideoDecodeSession s2(A);
+  CHECK(decode_video(ConstByteView(h264[0].data(), h264[0].size()), from, nv12, s2, &decoders, &out, &failed) && out.size() == nv12.frame_bytes());
+  CHECK(can_decode_video(from, 23, &decoders) && !can_decode_video(from, 23, nullptr));
+  VideoFormat enc_to = nv12;
+  enc_to.subtype = kSubtypeH264;
+  CHECK(!decode_video(ConstByteView(h264[1].data(), h264[1].size()), from, enc_to, s2, &decoders, &out, &failed) && failed);
+  // truncations and bit flips of a keyframe and of the frames after it: refused or decoded, never past the frame's bytes (ASan)
+  std::mt19937 rng(7);
+  for (int round = 0; round < 2; ++round) {
+    const std::vector<std::vector<uint8_t>>& stream = round == 0 ? h264 : vp8;
+    const uint32_t subtype = round == 0 ? kSubtypeH264 : kSubtypeVp8;
+    for (size_t cut = 0; cut < stream[0].size(); cut += 1 + stream[0].size() / 40) {
+      VideoDecodeSession t(A);
+      std::vector<uint8_t> part(stream[0].begin(), stream[0].begin() + long(cut));
+      t.decode(subtype, ConstByteView(part.data(), part.size()), &decoders, &f, &px, &failed);
+      for (size_t k = 1; k < 3 && k < stream.size(); ++k) t.decode(subtype, ConstByteView(stream[k].data(), stream[k].size()), &decoders, &f, &px, &failed);
+    }
+    for (int flip = 0; flip < 60; ++flip) {
+      VideoDecodeSession t(A);
+      for (size_t k = 0; k < 3 && k < stream.size(); ++k) {
+        std::vector<uint8_t> bad = stream[k];
+        for (int b = 0; b < 3; ++b) bad[rng() % bad.size()] ^= uint8_t(1u << (rng() % 8));
+        if (t.decode(subtype, ConstByteView(bad.data(), bad.size()), &decoders, &f, &px, &failed)) CHECK(f.valid() && px.size() == uint64_t{f.width} * f.height * 4);
+      }
+    }
+  }
+}
+
+// The kernel's own watcher (the Video Viewer's): the producers listed, one watched by a node of the kernel's (so a camera would start), its frames as
+// 0xAARRGGBB words, converted from YUV, encoded video and a producer that went said so.
+static void test_video_watcher() {
+  Graph g(A, nullptr);
+  CHECK(g.initialize());
+  ScreenSource screen(g, A);
+  CHECK(screen.start());
+  const uint32_t client = g.add_client(Origin::Native, 1, "native", "camera-app");
+  Properties props(A);
+  props.set("node.name", "app-camera");
+  props.set("media.class", "Video/Source");
+  SharedPointer<VideoChannel> cam;
+  const uint32_t camera = g.create_video_node(client, props, kDirectionOutput, &cam);
+  CHECK(camera && cam);
+  VideoWatcher w(g, A);
+  List<uint32_t> ids(A);
+  CHECK(w.producers(&ids) && ids.count() == 2 && ids[0] == screen.node() && ids[1] == camera);
+  String name(A);
+  CHECK(w.name_of(screen.node(), &name) && name.view() == StringView("Screen") && w.name_of(camera, &name) && name.view() == StringView("app-camera"));
+  CHECK(!w.watch(client) && w.watch(screen.node()) && g.video_watchers(screen.node()) == 1 && g.video_watchers(camera) == 0);
+  uint64_t seq = 0;
+  List<uint32_t> px(A);
+  uint32_t width = 0, height = 0;
+  StringView why;
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why.empty());      // (nothing yet)
+  ArrayView<uint32_t> f = screen.frame_wanted(4, 2, 1000000);
+  CHECK(f.size() == 8);
+  for (uint32_t i = 0; i < 8; ++i) f[i] = 0xFF102030u + i;
+  screen.frame_read(4, 2, 0);
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && width == 4 && height == 2 && px.count() == 8 && px[3] == 0xFF102033u && seq == 1);
+  CHECK(!w.latest(&seq, &px, &width, &height, &why));      // (not newer)
+  // the camera, in I420 (grey: Y 126 is mid grey)
+  CHECK(w.watch(camera) && g.video_watchers(screen.node()) == 0 && g.video_watchers(camera) == 1);
+  VideoFormat i420;
+  i420.format = 2; i420.width = 4; i420.height = 2;
+  cam->set_format(i420);
+  std::vector<uint8_t> yuv(8 + 2 + 2, 128);
+  for (int i = 0; i < 8; ++i) yuv[size_t(i)] = 126;
+  CHECK(cam->publish(ConstByteView(yuv.data(), 8), 4, 0) == false);      // (one plane is not enough)
+  const VideoPlaneData planes[3] = {{ConstByteView(yuv.data(), 8), 4}, {ConstByteView(yuv.data() + 8, 2), 2}, {ConstByteView(yuv.data() + 10, 2), 2}};
+  CHECK(cam->publish(ArrayView<const VideoPlaneData>(planes, 3), 0));
+  seq = 0;
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && px.count() == 8);
+  if (px.count() == 8) CHECK((px[0] >> 24) == 0xFF && abs(int((px[0] >> 16) & 0xFF) - 128) < 4 && abs(int(px[0] & 0xFF) - 128) < 4);
+  // Motion JPEG: decoded (a real file, 64 x 48); a broken one said; other encoded video said, not shown
+  VideoFormat mjpg;
+  mjpg.subtype = 0x20002;
+  cam->set_format(mjpg);
+  const std::vector<uint8_t> jpeg = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+  CHECK(jpeg.size() > 100 && cam->publish(ConstByteView(jpeg.data(), jpeg.size()), 0, 0));
+  CHECK(w.latest(&seq, &px, &width, &height, &why) && width == 64 && height == 48 && px.count() == 64 * 48 && (px[0] >> 24) == 0xFF);
+  const uint8_t broken[4] = {0xFF, 0xD8, 0xFF, 0xD9};
+  CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A picture that cannot be decoded"));
+  // H.264: said, not shown, while the graph has no decoders; decoded once it has (each picture as a decoder of the codecs gives it)
+  VideoFormat h264;
+  h264.subtype = 0x20001;
+  cam->set_format(h264);
+  const std::vector<std::vector<uint8_t>> avc = encode_h264(32, 16, 3, 30);
+  CHECK(avc.size() == 3 && cam->publish(ConstByteView(avc[0].data(), avc[0].size()), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("Encoded video this computer cannot decode"));
+  SoftwareDecoders decoders;
+  g.set_video_codecs(&decoders);
+  uint32_t rw = 0, rh = 0;
+  const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &rw, &rh);
+  CHECK(want.size() == 3);
+  for (size_t i = 0; i < avc.size(); ++i) {
+    CHECK(cam->publish(ConstByteView(avc[i].data(), avc[i].size()), 0, 0));
+    const bool shown = w.latest(&seq, &px, &width, &height, &why);
+    CHECK(shown && width == 32 && height == 16 && px.count() == 32 * 16);
+    if (shown && i < want.size() && px.count() == 32 * 16) CHECK(memcmp(px.view().data(), want[i].data(), want[i].size()) == 0);
+  }
+  CHECK(cam->publish(ConstByteView(broken, 4), 0, 0));
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("A picture that cannot be decoded"));
+  g.set_video_codecs(nullptr);
+  // the producer goes
+  g.destroy_node(camera);
+  CHECK(!w.latest(&seq, &px, &width, &height, &why) && why == StringView("The source went"));
+  CHECK(w.watch(0) && w.watching() == 0);
 }
 
 // ---- the AF_UNIX transport -----------------------------------------------------------------------------------------------------------------------
@@ -2936,8 +4226,10 @@ static void test_video_channel() {
   VideoFormat bad = f;
   bad.format = 1;      // (SPA_VIDEO_FORMAT_ENCODED is not a raw format)
   CHECK(!bad.valid());
-  bad.format = 21;     // (v210: not carried)
+  bad.format = 90;     // (no such format)
   CHECK(!bad.valid());
+  bad.format = 21;     // (v210: carried, six pixels in sixteen bytes)
+  CHECK(bad.valid() && bad.planes() == 1 && bad.plane(0).row_bytes == ((f.width + 5) / 6) * 16);
   bad = f; bad.width = 9000;
   CHECK(!bad.valid());
   bad = f; bad.subtype = 0x2000D;      // (bayer)
@@ -2946,7 +4238,7 @@ static void test_video_channel() {
   VideoFormat yuv;
   yuv.width = 5; yuv.height = 3;
   yuv.format = 2;      // I420
-  CHECK(yuv.valid() && yuv.planes() == 3 && yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 2 && yuv.plane(2).stride_divisor == 2 &&
+  CHECK(yuv.valid() && yuv.planes() == 3 && yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 2 && yuv.plane(2).stride_den == 2 &&
         yuv.frame_bytes() == 15 + 6 + 6 && yuv.plane_offset(2) == 21 && yuv.plane(3).rows == 0);
   yuv.format = 23;     // NV12
   CHECK(yuv.planes() == 2 && yuv.plane(1).row_bytes == 6 && yuv.plane(1).rows == 2 && yuv.frame_bytes() == 15 + 12);
@@ -2955,7 +4247,7 @@ static void test_video_channel() {
   yuv.format = 18;     // Y42B
   CHECK(yuv.plane(1).row_bytes == 3 && yuv.plane(1).rows == 3);
   yuv.format = 17;     // Y41B
-  CHECK(yuv.plane(1).row_bytes == 2 && yuv.plane(1).stride_divisor == 4);
+  CHECK(yuv.plane(1).row_bytes == 2 && yuv.plane(1).stride_den == 4);
   yuv.format = 20;     // Y444
   CHECK(yuv.frame_bytes() == 45);
   yuv.format = 25;     // GRAY8
@@ -2996,17 +4288,110 @@ static void test_video_channel() {
   // random planes against random formats: never a crash, a frame only when every plane fits
   std::mt19937 rng(21);
   std::vector<uint8_t> junk(4096, 0x5A);
-  const uint32_t formats[] = {2, 3, 4, 5, 6, 7, 15, 17, 18, 19, 20, 23, 24, 25, 26, 29, 32};
-  for (int round = 0; round < 2000; ++round) {
+  uint32_t formats[88];
+  uint32_t n_raw = 0;
+  for (uint32_t id = 2; id < 88; ++id) formats[n_raw++] = id;      // (every raw format)
+  for (int round = 0; round < 4000; ++round) {
     VideoChannel ch2(A);
     VideoFormat ff;
-    ff.format = formats[rng() % (sizeof formats / sizeof formats[0])];
+    ff.format = formats[rng() % n_raw];
     ff.width = 1 + rng() % 40; ff.height = 1 + rng() % 20;
     ch2.set_format(ff);
     VideoPlaneData pl[4];
     for (VideoPlaneData& d : pl) d = VideoPlaneData{ConstByteView(junk.data(), rng() % junk.size()), uint32_t(rng() % 200)};
     const bool ok = ch2.publish(ArrayView<const VideoPlaneData>(pl, 1 + rng() % 4), 0);
     if (ok) CHECK(ch2.latest() && ch2.latest()->pixels.size() == ff.frame_bytes());
+  }
+  // the 10- and 12-bit, 4:2:2/4:4:4 semi-planar and other formats' planes
+  VideoFormat hb;
+  hb.width = 5; hb.height = 3;
+  hb.format = 43;      // I420_10LE
+  CHECK(hb.planes() == 3 && hb.plane(0).row_bytes == 10 && hb.plane(1).row_bytes == 6 && hb.plane(1).rows == 2 && hb.frame_bytes() == 30 + 12 + 12);
+  hb.format = 62;      // P010_10LE
+  CHECK(hb.planes() == 2 && hb.plane(1).row_bytes == 12 && hb.frame_bytes() == 30 + 24);
+  hb.format = 52;      // NV24: chroma rows twice the luma's, stride too
+  CHECK(hb.plane(1).row_bytes == 10 && hb.plane(1).rows == 3 && hb.plane(1).stride_num == 2);
+  hb.format = 51;      // NV16
+  CHECK(hb.plane(1).row_bytes == 6 && hb.plane(1).rows == 3);
+  hb.format = 80;      // xRGB_210LE
+  CHECK(hb.frame_bytes() == 60);
+  hb.format = 79; hb.subtype = VideoFormat::kSubtypeDsp;      // dsp float video
+  CHECK(hb.valid() && !hb.encoded() && hb.frame_bytes() == 5 * 3 * 16);
+  hb.format = 12;
+  CHECK(!hb.valid());      // (dsp is RGBA_F32 only)
+  // conversion: every pair of the 8-bit formats round-trips a grey ramp and pure colours closely
+  const uint32_t convertible[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                                  33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                                  63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87};      // (every raw one)
+  VideoFormat rgba;
+  rgba.format = 11; rgba.width = 6; rgba.height = 4;
+  std::vector<uint8_t> source(6 * 4 * 4);
+  for (uint32_t i = 0; i < 24; ++i) {
+    const uint8_t v = uint8_t(40 + (i % 6) * 30);      // (a grey per column: survives 4:2:0 too)
+    source[4 * i] = source[4 * i + 1] = source[4 * i + 2] = v;
+    source[4 * i + 3] = 255;
+  }
+  for (uint32_t to : convertible) {
+    VideoFormat mid = rgba;
+    mid.format = to;
+    ByteBuffer there(A), back(A);
+    CHECK(can_convert_video(11, to) && convert_video(rgba, ConstByteView(source.data(), source.size()), mid, &there) && there.size() == mid.frame_bytes());
+    CHECK(convert_video(mid, there.view(), rgba, &back) && back.size() == source.size());
+    int worst = 0;
+    for (size_t k = 0; k < source.size() && back.size() == source.size(); ++k)
+      if (k % 4 != 3) worst = std::max(worst, abs(int(back.view()[k]) - int(source[k])));
+    const int allowed = to == 35 ? 26 : to >= 29 && to <= 32 ? 9 : 4;      // (5 bits a component: steps of 8; the palette's cube: steps of 51)
+    if (worst > allowed) printf("conversion through format %u: off by %d\n", to, worst);
+    CHECK(worst <= allowed);
+  }
+  {
+    VideoFormat i420 = rgba, odd = rgba;
+    i420.format = 2;
+    odd.width = 5;
+    ByteBuffer o(A);
+    CHECK(!convert_video(rgba, ConstByteView(source.data(), source.size() - 1), i420, &o));      // (short)
+    CHECK(convert_video(rgba, ConstByteView(source.data(), source.size()), odd, &o) && o.size() == 5 * 4 * 4);      // (another size: scaled)
+    CHECK(!can_convert_video(1, 11) && !can_convert_video(11, 90) && can_convert_video(21, 53));      // (ENCODED and no such format: not raw)
+    // a deep format keeps colour through it: red through P010 and through float RGBA
+    for (uint32_t deep : {62u, 79u, 85u}) {
+      std::vector<uint8_t> red(6 * 4 * 4);
+      for (uint32_t i = 0; i < 24; ++i) { red[4 * i] = 200; red[4 * i + 1] = 30; red[4 * i + 2] = 10; red[4 * i + 3] = 255; }
+      VideoFormat d = rgba;
+      d.format = deep;
+      ByteBuffer t(A), b3(A);
+      CHECK(convert_video(rgba, ConstByteView(red.data(), red.size()), d, &t) && convert_video(d, t.view(), rgba, &b3));
+      if (b3.size() == red.size()) CHECK(abs(int(b3.view()[0]) - 200) <= 6 && abs(int(b3.view()[1]) - 30) <= 6 && b3.view()[2] <= 16);
+    }
+    // scaling: a ramp of four columns, halved (pairs averaged), doubled (bilinear, the ends kept)
+    VideoFormat four = rgba, two = rgba, eight = rgba;
+    four.width = 4; four.height = 1; two.width = 2; two.height = 1; eight.width = 8; eight.height = 1;
+    std::vector<uint8_t> ramp = {0, 0, 0, 255, 100, 100, 100, 255, 200, 200, 200, 255, 240, 240, 240, 255};
+    ByteBuffer half(A), twice(A);
+    CHECK(convert_video(four, ConstByteView(ramp.data(), ramp.size()), two, &half) && half.size() == 8);
+    if (half.size() == 8) CHECK(half.view()[0] == 50 && half.view()[4] == 220 && half.view()[3] == 255);
+    CHECK(convert_video(four, ConstByteView(ramp.data(), ramp.size()), eight, &twice) && twice.size() == 32);
+    if (twice.size() == 32) { CHECK(twice.view()[0] == 0 && twice.view()[28] == 240 && twice.view()[8] > 0 && twice.view()[8] < 100); }
+    // random sizes both ways, random formats: never out of bounds, the frame the size asked
+    std::mt19937 srng(31);
+    const size_t n_formats = sizeof convertible / sizeof convertible[0];
+    for (int round = 0; round < 1500; ++round) {      // (every raw format, odd sizes: v210's groups of six, IYU1's four, tiles past the edge)
+      VideoFormat from = rgba, to = rgba;
+      from.width = 1 + srng() % 33; from.height = 1 + srng() % 37;
+      to.width = 1 + srng() % 33; to.height = 1 + srng() % 37;
+      from.format = convertible[srng() % n_formats]; to.format = convertible[srng() % n_formats];
+      std::vector<uint8_t> frame(from.frame_bytes());
+      for (uint8_t& v : frame) v = uint8_t(srng());
+      ByteBuffer r(A);
+      CHECK(convert_video(from, ConstByteView(frame.data(), frame.size()), to, &r) && r.size() == to.frame_bytes());
+    }
+    // red through NV12 comes back red
+    std::vector<uint8_t> red(6 * 4 * 4);
+    for (uint32_t i = 0; i < 24; ++i) { red[4 * i] = 200; red[4 * i + 1] = 0; red[4 * i + 2] = 0; red[4 * i + 3] = 255; }
+    VideoFormat nv12 = rgba;
+    nv12.format = 23;
+    ByteBuffer t(A), b2(A);
+    CHECK(convert_video(rgba, ConstByteView(red.data(), red.size()), nv12, &t) && convert_video(nv12, t.view(), rgba, &b2));
+    if (b2.size() == red.size()) CHECK(abs(int(b2.view()[0]) - 200) <= 6 && b2.view()[1] <= 6 && b2.view()[2] <= 6);
   }
   ch.close();
   CHECK(ch.closed() && !ch.publish(ConstByteView(rows.data(), rows.size()), 300, 0) && ch.frames() == 1);
@@ -3055,6 +4440,7 @@ struct NodeView {
   std::vector<uint32_t> removed;      // (remove_mem)
   uint32_t id = 0, node = 0, activation_mem = 0;
   std::map<uint32_t, Fd> mems;
+  std::map<uint32_t, uint32_t> mem_types;      // (add_mem's type: 2 memfd, 3 DMA-BUF)
   Fd activation, wake;
   int config_mode = -1;
   bool config_format = false;
@@ -3072,7 +4458,7 @@ struct NodeView {
       if (m.id == 0 && m.opcode == 6) {
         int32_t mem = 0; uint32_t type = 0; int64_t fd = -1; pod::Value v;
         p.int32(&mem); p.id(&type); p.next(&v); v.get_fd(&fd);
-        if (fd >= 0 && size_t(fd) < own.size()) mems[uint32_t(mem)] = own[size_t(fd)];
+        if (fd >= 0 && size_t(fd) < own.size()) { mems[uint32_t(mem)] = own[size_t(fd)]; mem_types[uint32_t(mem)] = type; }
       }
       if (m.id == 0 && m.opcode == 7) { int32_t mem = 0; if (p.int32(&mem)) removed.push_back(uint32_t(mem)); }
       if (m.id == 0 && m.opcode == 3) {      // error
@@ -3218,6 +4604,19 @@ static void enum_video_fixed(pod::Builder& b, uint32_t format, uint32_t w, uint3
   b.property(1); b.id(2); b.property(2); b.id(subtype);
   if (subtype == 1) { b.property(0x20001); b.id(format); }
   b.property(0x20003); b.rectangle(w, h);
+  b.property(0x20004); b.fraction(30, 1);
+  b.end(o);
+}
+// A video EnumFormat of a Choice of raw formats (the first the default) at one size.
+static void enum_video_choice(pod::Builder& b, std::initializer_list<uint32_t> formats, uint32_t w, uint32_t h) {
+  const uint64_t o = b.begin_object(0x40003, 3);
+  b.property(1); b.id(2); b.property(2); b.id(1);
+  b.property(0x20001);
+  const uint64_t ch = b.begin_choice(3, pod::kId);
+  b.choice_value32(*formats.begin());
+  for (uint32_t f : formats) b.choice_value32(f);
+  b.end(ch);
+  if (w && h) { b.property(0x20003); b.rectangle(w, h); }      // (0: any size)
   b.property(0x20004); b.fraction(30, 1);
   b.end(o);
 }
@@ -3618,6 +5017,574 @@ static void test_client_node_media() {
     SharedPointer<VideoFrame> fr = ch ? ch->latest() : SharedPointer<VideoFrame>();
     CHECK(fr && fr->format.width == 32 && fr->pixels.view()[0] == 0x40 && fr->pixels.view()[3 * 128 + 127] == 0x43);
   }
+  // DMA-BUFs: a camera whose buffers are GPU images; each frame is copied out of the image before it is read, and one the GPU still draws is not taken
+  {
+    NodeView vd;
+    vd.id = 9;
+    create_node(c, 9, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "gpu-camera"}});
+    node_update(c, 9);
+    set_active(c, 9, true);
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    vd.absorb(c);
+    c.send(9, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    vd.absorb(c);
+    NodeView::PortView& vdp = vd.ports[{1, 0}];
+    CHECK(vdp.use && vdp.flags == 1 && vdp.bufs.size() == 2 && vdp.bufs[0].dtype == (1u << 3));
+    SharedPointer<FakeGpuFd> g0 = SharedPointer<FakeGpuFd>::make(A, 512), g1 = SharedPointer<FakeGpuFd>::make(A, 512);
+    auto send_gpu_buffers = [&](std::vector<Fd> fds, int32_t type) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(2);
+      for (int k = 0; k < 2; ++k) { b.int32(1); b.id(uint32_t(type)); b.fd(k); b.int32(3); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(9); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(2);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& fd : fds) list.push_back(fd);
+      server.receive_with_fds(c.handle, msg.view(), list);
+    };
+    send_gpu_buffers({Fd(g0), Fd(g1)}, 3);
+    vd.absorb(c);
+    CHECK(vd.errors == 0 && vd.starts == 1);
+    if (vd.starts) {
+      for (uint32_t y = 0; y < 4; ++y) memset(g1->image.data() + y * 128, int(0x60 + y), 128);
+      ByteView part1 = vd.buffer(1, 0, 1);
+      put_u32(part1, 32, 0); put_u32(part1, 36, 512); put_u32(part1, 40, 128);
+      g1->busy = true;      // (still being drawn: not taken, handed back)
+      put_u32(vd.io(1, 0), 0, 2); put_u32(vd.io(1, 0), 4, 1);
+      tick();
+      SharedPointer<VideoChannel> ch = g.video_of(vd.node);
+      CHECK(ch && ch->frames() == 0 && g1->syncs == 1 && u32_at(vd.io(1, 0), 0) == 1);
+      g1->busy = false;
+      put_u32(vd.io(1, 0), 0, 2); put_u32(vd.io(1, 0), 4, 1);
+      tick();
+      SharedPointer<VideoFrame> fr = ch ? ch->latest() : SharedPointer<VideoFrame>();
+      CHECK(g1->syncs == 2 && fr && fr->pixels.view()[0] == 0x60 && fr->pixels.view()[3 * 128 + 127] == 0x63);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+    c.take_with_fds();
+  }
+  // ---- zero-copy: a DMA-BUF camera of three buffers and a watcher that takes DMA-BUFs. The watcher is given the camera's own descriptors (the same
+  // images, as DMA-BUFs) and each frame's buffer, nothing copied; the camera's buffer is held while the watcher may read it and handed back once the
+  // watcher recycled it (or was given a newer one instead). A watcher in memory makes the server copy again (only then); one whose EnumFormat names a
+  // modifier is told it. Gone, the watchers let go and the camera has its buffers back.
+  {
+    auto send_buffers = [&](NativeClient& cl, uint32_t node, std::vector<Fd> fds, int32_t type, int32_t size) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(int32_t(fds.size()));
+      for (size_t k = 0; k < fds.size(); ++k) { b.int32(1); b.id(uint32_t(type)); b.fd(int64_t(k)); b.int32(9); b.int32(0); b.int32(size); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(node); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++cl.seq); msg.put32(uint32_t(fds.size()));
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& fd : fds) list.push_back(fd);
+      server.receive_with_fds(cl.handle, msg.view(), list);
+    };
+    NodeView zc;
+    zc.id = 30;
+    create_node(c, 30, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "zc-camera"}});
+    node_update(c, 30);
+    set_active(c, 30, true);
+    c.send(30, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    zc.absorb(c);
+    c.send(30, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    zc.absorb(c);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    for (int k = 0; k < 3; ++k) img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+    send_buffers(c, 30, {Fd(img[0]), Fd(img[1]), Fd(img[2])}, 3, 512);
+    zc.absorb(c);
+    CHECK(zc.errors == 0 && zc.starts == 1 && zc.ports[{1, 0}].bufs.size() == 3);
+    SharedPointer<VideoChannel> zch = g.video_of(zc.node);
+    CHECK(zch && zch->share() && zch->share()->n_buffers == 3 && zch->share()->data_type == 3);
+    // the watcher: DMA-BUFs only
+    NodeView zw;
+    zw.id = 31;
+    create_node(w, 31, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 31);
+    set_active(w, 31, true);
+    w.send(31, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    zw.absorb(w);
+    w.send(31, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 0, 0, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    zw.absorb(w);
+    NodeView::PortView& zwp = zw.ports[{0, 0}];
+    CHECK(zw.errors == 0 && zw.starts == 1 && zwp.bufs.size() == 3);      // (as many as the camera has: each is one of its)
+    bool same = zwp.bufs.size() == 3;
+    for (size_t i = 0; i < zwp.bufs.size() && i < 3; ++i) {
+      const NodeView::Data& d = zwp.bufs[i].datas[0];
+      same &= d.type == 4 && zw.mem_types[uint32_t(d.data)] == 3 && zw.mems[uint32_t(d.data)].get() == img[i].get() && d.maxsize == 512 && (d.flags & 2) == 0;
+    }
+    CHECK(same && zch->share()->attached == 1);
+    // the camera's frames: given as they are (nothing read from the images, no pixels in the channel)
+    auto frame = [&](uint32_t buffer, uint32_t size) {
+      ByteView part = zc.buffer(1, 0, buffer);
+      put_u32(part, 32, 0); put_u32(part, 36, size); put_u32(part, 40, 128);
+      put_u32(zc.io(1, 0), 0, 2); put_u32(zc.io(1, 0), 4, buffer);
+    };
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(0, 512);
+    tick();
+    tick(40);
+    CHECK(img[0]->syncs == 0 && zch->latest() && zch->latest()->pixels.size() == 0 && zch->latest()->share_buffer == 0);
+    CHECK(u32_at(zc.io(1, 0), 0) == 1 && u32_at(zc.io(1, 0), 4) == 0xFFFFFFFFu);      // (nothing handed back: buffer 0 is held for the watcher)
+    CHECK(given(zw) == 0 && u32_at(zw.buffer(0, 0, 0), 36) == 512 && u32_at(zw.buffer(0, 0, 0), 40) == 128);
+    // the watcher read it and recycles it; frame 1: buffer 0 is still the watcher's when the camera's cycle runs, so nothing goes back yet
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 0);
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(1, 500);
+    tick();
+    tick(40);
+    CHECK(given(zw) == 1 && u32_at(zw.buffer(0, 0, 1), 36) == 500 && zch->share()->users[0] == 0 && zch->share()->users[1] == 1);
+    // frame 2: buffer 0 (recycled, the oldest taken) goes back
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 1);
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(2, 512);
+    tick();
+    CHECK(u32_at(zc.io(1, 0), 4) == 0);
+    tick(40);
+    CHECK(given(zw) == 2);
+    // the watcher does not run: frame 0 replaces 2 in its io (2 was never taken: let go), and 1 goes back to the camera
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(0, 512);
+    tick();
+    CHECK(u32_at(zc.io(1, 0), 4) == 1);
+    tick(40);
+    CHECK(given(zw) == 0 && zch->share()->users[2] == 0 && zch->share()->users[0] == 1);
+    // a watcher in memory: the server copies again (from the image), and only now
+    NodeView mw2;
+    mw2.id = 32;
+    create_node(w, 32, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 32);
+    set_active(w, 32, true);
+    w.send(32, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    mw2.absorb(w);
+    w.send(32, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mw2.absorb(w);
+    CHECK(mw2.starts == 1 && mw2.ports[{0, 0}].bufs.size() == 2 && mw2.ports[{0, 0}].bufs[0].dtype == 1 && zch->share()->attached == 1);
+    for (uint32_t y = 0; y < 4; ++y) memset(img[1]->image.data() + y * 128, int(0x70 + y), 128);
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 0);
+    put_u32(zw.activation->memory(), 0, 3);
+    put_u32(mw2.activation->memory(), 0, 3);
+    frame(1, 512);
+    tick();
+    tick(40);
+    CHECK(img[1]->syncs == 1 && zch->latest() && zch->latest()->pixels.size() == 512 && zch->latest()->share_buffer == 1);
+    CHECK(given(zw) == 1);
+    if (u32_at(mw2.io(0, 0), 0) == 2) {
+      const uint32_t id = u32_at(mw2.io(0, 0), 4);
+      ByteView part = mw2.buffer(0, 0, id);
+      CHECK(part[uint64_t(mw2.ports[{0, 0}].bufs[id].data)] == 0x70 && part[uint64_t(mw2.ports[{0, 0}].bufs[id].data) + 3 * 128 + 127] == 0x73);
+    } else {
+      CHECK(false);
+    }
+    w.send(0, 7, [](pod::Builder& b) { b.int32(32); });
+    tick();
+    // a watcher that names a modifier: its Format says the camera's (linear: 0)
+    NodeView mz;
+    mz.id = 33;
+    create_node(w, 33, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 33);
+    set_active(w, 33, true);
+    w.send(33, 3, [](pod::Builder& b) {
+      b.int32(0); b.int32(0); b.int32(3); b.int32(1);
+      const uint64_t o = b.begin_object(0x40003, 3);
+      b.property(1); b.id(2); b.property(2); b.id(1);
+      b.property(0x20001); b.id(12);
+      b.property(0x20002, 1u << 3); b.int64(0);
+      b.property(0x20003); b.rectangle(32, 4);
+      b.end(o);
+      port_info(b, 0, {});
+    });
+    mz.absorb(w);
+    {
+      bool modifier = false;
+      int64_t value = -1;
+      pod::Parser fp(ConstByteView(mz.ports[{0, 0}].format.data(), mz.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20002) { modifier = v.get_long(&value); }
+      }
+      CHECK(modifier && value == 0);
+    }
+    w.send(33, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mz.absorb(w);
+    CHECK(mz.starts == 1 && mz.ports[{0, 0}].bufs.size() == 3 && mz.mem_types[uint32_t(mz.ports[{0, 0}].bufs[0].datas[0].data)] == 3 &&
+          zch->share()->attached == 2);      // (no types said, a modifier named: DMA-BUFs, the camera's)
+    w.send(0, 7, [](pod::Builder& b) { b.int32(33); });
+    tick();
+    CHECK(zch->share()->attached == 1);
+    // the first watcher goes: what it held is let go, and the camera has its buffers back one a cycle
+    w.send(0, 7, [](pod::Builder& b) { b.int32(31); });
+    tick();
+    VideoShare* sh = zch->share().get();
+    CHECK(sh && sh->attached == 0 && sh->users[0] == 0 && sh->users[1] == 0 && sh->users[2] == 0);
+    // (one goes back each cycle - the io has room for one - so the camera always has one to draw into, and those held never grow)
+    int before = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) before += sh->taken[i];
+    bool back_each = true;
+    const uint32_t order[3] = {2, 0, 1};
+    for (uint32_t b2 : order) {
+      if (sh && sh->taken[b2]) continue;
+      frame(b2, 512);
+      tick();
+      back_each &= u32_at(zc.io(1, 0), 4) != 0xFFFFFFFFu;
+    }
+    int after = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) after += sh->taken[i];
+    CHECK(back_each && after <= before && before <= 2);
+    w.take_with_fds();
+    c.send(0, 7, [](pod::Builder& b) { b.int32(30); });
+    tick();
+    CHECK(!zch->share() || zch->share()->closed);
+    c.take_with_fds();
+  }
+  // ---- a watcher that takes DMA-BUFs only, of a camera in the server's memory: given GPU images of the server's (32-bit RGB), each frame written into
+  // one; one of a format no GPU image holds gets no buffers
+  {
+    maker.gpu = true;
+    NodeView mc2;
+    mc2.id = 34;
+    create_node(c, 34, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "mem-camera"}});
+    node_update(c, 34);
+    set_active(c, 34, true);
+    c.send(34, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 8, 2); port_info(b, 0, {}); });
+    mc2.absorb(c);
+    c.send(34, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mc2.absorb(c);
+    CHECK(mc2.starts == 1 && mc2.ports[{1, 0}].bufs.size() == 2);
+    NodeView gw;
+    gw.id = 35;
+    create_node(w, 35, {{"media.class", "Stream/Input/Video"}, {"target.object", "mem-camera"}});
+    node_update(w, 35);
+    set_active(w, 35, true);
+    w.send(35, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 8, 2); port_info(b, 0, {}); });
+    gw.absorb(w);
+    w.send(35, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 3, 0, 0, 1u << 3); b.none(); });
+    gw.absorb(w);
+    NodeView::PortView& gwp = gw.ports[{0, 0}];
+    CHECK(gw.starts == 1 && gwp.bufs.size() == 3 && maker.images == 3);
+    bool images = gwp.bufs.size() == 3;
+    for (size_t i = 0; i < gwp.bufs.size() && i < maker.made_images.size(); ++i)
+      images &= gwp.bufs[i].datas[0].type == 4 && gw.mem_types[uint32_t(gwp.bufs[i].datas[0].data)] == 3 &&
+                gw.mems[uint32_t(gwp.bufs[i].datas[0].data)].get() == maker.made_images[i].get() && gwp.bufs[i].datas[0].maxsize == int32_t((8 * 4 + 64) * 2);
+    CHECK(images);
+    std::vector<uint8_t> px(8 * 4 * 2);
+    for (size_t k = 0; k < px.size(); ++k) px[k] = uint8_t(k);
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    {      // (the camera's frame in its buffer 0)
+      ByteView part = mc2.buffer(1, 0, 0);
+      const NodeView::Buf& bf = mc2.ports[{1, 0}].bufs[0];
+      memcpy(part.data() + bf.data, px.data(), px.size());
+      put_u32(part, 0, 0); put_u32(part, 4, uint32_t(px.size())); put_u32(part, 8, 32);
+      put_u32(mc2.io(1, 0), 0, 2); put_u32(mc2.io(1, 0), 4, 0);
+    }
+    put_u32(gw.activation->memory(), 0, 3);
+    tick();
+    tick(40);
+    CHECK(given(gw) < 3);
+    if (given(gw) < 3) {
+      FakeGpuFd& im = *maker.made_images[given(gw)];
+      ByteView chunk = gw.buffer(0, 0, given(gw));
+      uint32_t meta_bytes = 0;
+      for (const auto& m : gwp.bufs[given(gw)].metas) meta_bytes += (m.second + 7) & ~7u;
+      CHECK(im.to_gpu == 1 && im.image[0] == 0 && im.image[31] == 31 && im.image[96] == 32 && im.image[96 + 31] == 63 && u32_at(chunk, meta_bytes + 8) == 96);
+    }
+    // NV12 only, DMA-BUFs only: no GPU image holds it
+    NodeView nw;
+    nw.id = 36;
+    create_node(w, 36, {{"media.class", "Stream/Input/Video"}, {"target.object", "mem-camera"}});
+    node_update(w, 36);
+    set_active(w, 36, true);
+    w.send(36, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 23, 8, 2); port_info(b, 0, {}); });
+    nw.absorb(w);
+    w.send(36, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    nw.absorb(w);
+    CHECK(nw.starts == 0 && !nw.ports[{0, 0}].use);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(35); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(36); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(34); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+    maker.gpu = false;
+  }
+  // ---- explicit sync: a DMA-BUF camera that offers a SyncTimeline layout (three blocks: its image, its acquire and its release timelines) is given it,
+  // with the RELEASE feature it asks for; a frame whose acquire point is not reached is held (not shown, not dropped) until it is, the server promises
+  // the release (clears UNSCHEDULED_RELEASE) and signals each buffer's release point when it goes back. Without explicit sync, a DMA-BUF the GPU still
+  // draws is held the same way. A producer the server drives gets the buffers it shared back on the cycles it gives nothing.
+  {
+    auto sync_buffers = [&](NativeClient& cl, uint32_t node, const std::vector<Fd>& images, const std::vector<Fd>& acquire, const std::vector<Fd>& release) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(int32_t(images.size()));
+      for (size_t k = 0; k < images.size(); ++k) {
+        b.int32(3);
+        b.id(3); b.fd(int64_t(3 * k)); b.int32(9); b.int32(0); b.int32(512);
+        b.id(5); b.fd(int64_t(3 * k + 1)); b.int32(3); b.int32(0); b.int32(0);
+        b.id(5); b.fd(int64_t(3 * k + 2)); b.int32(3); b.int32(0); b.int32(0);
+      }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(node); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++cl.seq); msg.put32(uint32_t(3 * images.size()));
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (size_t k = 0; k < images.size(); ++k) { list.push_back(images[k]); list.push_back(acquire[k]); list.push_back(release[k]); }
+      server.receive_with_fds(cl.handle, msg.view(), list);
+    };
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    NodeView sc;
+    sc.id = 40;
+    create_node(c, 40, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "sync-camera"}});
+    node_update(c, 40);
+    set_active(c, 40, true);
+    c.send(40, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    sc.absorb(c);
+    c.send(40, 3, [](pod::Builder& b) {
+      b.int32(1); b.int32(0); b.int32(1); b.int32(4);
+      {      // the sync layout: 3 blocks, depending on SyncTimeline metadata
+        const uint64_t o = b.begin_object(0x40004, 5);
+        b.property(1); b.int32(3); b.property(2); b.int32(3); b.property(3); b.int32(512); b.property(4); b.int32(128);
+        b.property(6); { const uint64_t ch = b.begin_choice(4, pod::kInt); b.choice_value32(1u << 3); b.end(ch); }
+        b.property(7, 1u << 3); b.int32(1 << 9);
+        b.end(o);
+      }
+      buffers_param(b, 3, 512, 128, 1u << 3);      // (the plain one)
+      meta_param(b, 1, 32);
+      {
+        const uint64_t o = b.begin_object(0x40005, 6);
+        b.property(1); b.id(9); b.property(2); b.int32(24); b.property(3); b.int32(1);
+        b.end(o);
+      }
+      b.none();
+    });
+    sc.absorb(c);
+    NodeView::PortView& scp = sc.ports[{1, 0}];
+    CHECK(scp.use && scp.flags == 1 && scp.bufs.size() == 3);
+    bool layout = scp.bufs.size() == 3;
+    uint32_t sync_at = 0;
+    for (const NodeView::Buf& bf : scp.bufs) {
+      layout &= bf.datas.size() == 3 && bf.datas[1].type == (1u << 5) && bf.datas[2].type == (1u << 5);
+      bool timeline = false, feature = false;
+      uint32_t at = 0;
+      for (const auto& m : bf.metas) {
+        if (m.first == 9 && m.second == 24) { timeline = true; sync_at = at; }
+        feature |= m.first == ((9u << 16) | 1) && m.second == 0;
+        at += (m.second + 7) & ~7u;
+      }
+      layout &= timeline && feature;
+    }
+    CHECK(layout);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    std::vector<SharedPointer<FakeTimeline>> acq, rel;
+    std::vector<Fd> fi, fa, fr;
+    for (int k = 0; k < 3; ++k) {
+      img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+      acq.push_back(SharedPointer<FakeTimeline>::make(A));
+      rel.push_back(SharedPointer<FakeTimeline>::make(A));
+      fi.push_back(Fd(img.back())); fa.push_back(Fd(acq.back())); fr.push_back(Fd(rel.back()));
+    }
+    sync_buffers(c, 40, fi, fa, fr);
+    sc.absorb(c);
+    CHECK(sc.errors == 0 && sc.starts == 1);
+    NodeView sw;
+    sw.id = 41;
+    create_node(w, 41, {{"media.class", "Stream/Input/Video"}, {"target.object", "sync-camera"}});
+    node_update(w, 41);
+    set_active(w, 41, true);
+    w.send(41, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    sw.absorb(w);
+    w.send(41, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    sw.absorb(w);
+    CHECK(sw.starts == 1 && sw.ports[{0, 0}].bufs.size() == 3);
+    auto sframe = [&](uint32_t buffer, uint64_t point) {
+      ByteView part = sc.buffer(1, 0, buffer);
+      put_u32(part, sync_at, 1);      // UNSCHEDULED_RELEASE, as pw_stream's producer sets it
+      memcpy(part.data() + sync_at + 8, &point, 8);
+      memcpy(part.data() + sync_at + 16, &point, 8);
+      uint32_t chunk_at = 0;
+      for (const auto& m : scp.bufs[buffer].metas) chunk_at += (m.second + 7) & ~7u;
+      put_u32(part, chunk_at, 0); put_u32(part, chunk_at + 4, 512); put_u32(part, chunk_at + 8, 128);
+      put_u32(sc.io(1, 0), 0, 2); put_u32(sc.io(1, 0), 4, buffer);
+    };
+    // frame 0 at point 5, its timeline at 4: held, not shown; the release promised
+    acq[0]->value = 4;
+    put_u32(sw.activation->memory(), 0, 3);
+    sframe(0, 5);
+    tick();
+    tick(40);
+    CHECK(given(sw) == 0xFFFFFFFFu && u32_at(sc.buffer(1, 0, 0), sync_at) == 0 && u32_at(sc.io(1, 0), 4) == 0xFFFFFFFFu);
+    // drawn now: shown at the next tick
+    acq[0]->value = 5;
+    tick();
+    tick(40);
+    CHECK(given(sw) == 0);
+    // frames 1 and 2 (drawn already): buffer 0, recycled by the watcher, goes back with its release point signalled
+    put_u32(sw.io(0, 0), 0, 1); put_u32(sw.io(0, 0), 4, 0);
+    put_u32(sw.activation->memory(), 0, 3);
+    acq[1]->value = 6;
+    sframe(1, 6);
+    tick();
+    tick(40);
+    CHECK(given(sw) == 1 && rel[0]->signalled.empty());
+    put_u32(sw.io(0, 0), 0, 1); put_u32(sw.io(0, 0), 4, 1);
+    put_u32(sw.activation->memory(), 0, 3);
+    acq[2]->value = 7;
+    sframe(2, 7);
+    tick();
+    CHECK(u32_at(sc.io(1, 0), 4) == 0 && rel[0]->signalled.size() == 1 && rel[0]->signalled[0] == 5);
+    tick(40);
+    CHECK(given(sw) == 2);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(41); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(40); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+  }
+  {
+    // without explicit sync: a DMA-BUF the GPU still draws is held until it is drawn
+    NodeView rc;
+    rc.id = 42;
+    create_node(c, 42, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "busy-camera"}});
+    node_update(c, 42);
+    set_active(c, 42, true);
+    c.send(42, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    rc.absorb(c);
+    c.send(42, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    rc.absorb(c);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    for (int k = 0; k < 3; ++k) img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+    {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(3);
+      for (int k = 0; k < 3; ++k) { b.int32(1); b.id(3); b.fd(k); b.int32(9); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(42); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(3);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (auto& i : img) list.push_back(Fd(i));
+      server.receive_with_fds(c.handle, msg.view(), list);
+    }
+    rc.absorb(c);
+    NodeView rw;
+    rw.id = 43;
+    create_node(w, 43, {{"media.class", "Stream/Input/Video"}, {"target.object", "busy-camera"}});
+    node_update(w, 43);
+    set_active(w, 43, true);
+    w.send(43, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    rw.absorb(w);
+    w.send(43, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    rw.absorb(w);
+    CHECK(rc.starts == 1 && rw.starts == 1 && rw.ports[{0, 0}].bufs.size() == 3);
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    img[0]->ready = false;
+    ByteView part = rc.buffer(1, 0, 0);
+    put_u32(part, 32, 0); put_u32(part, 36, 512); put_u32(part, 40, 128);
+    put_u32(rc.io(1, 0), 0, 2); put_u32(rc.io(1, 0), 4, 0);
+    put_u32(rw.activation->memory(), 0, 3);
+    tick();
+    tick(40);
+    CHECK(given(rw) == 0xFFFFFFFFu && img[0]->syncs == 0);
+    img[0]->ready = true;
+    tick();
+    tick(40);
+    CHECK(given(rw) == 0);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(43); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(42); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+  }
+  {
+    // a camera the server drives, its memfds shared with a watcher that takes memfds only; the watcher goes holding two of them: the camera gets them
+    // back on the cycles it gives nothing (the io has room then)
+    NodeView dc;
+    dc.id = 44;
+    create_node(c, 44, {{"media.class", "Video/Source"}, {"node.name", "driven-camera"}});
+    node_update(c, 44);
+    set_active(c, 44, true);
+    c.send(44, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    dc.absorb(c);
+    c.send(44, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 2); meta_param(b, 1, 32); b.none(); });
+    dc.absorb(c);
+    std::vector<Fd> mem;
+    for (int k = 0; k < 3; ++k) mem.push_back(Fd::make_as<FakeFd>(A, 512, false));
+    {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(3);
+      for (int k = 0; k < 3; ++k) { b.int32(1); b.id(2); b.fd(k); b.int32(11); b.int32(0); b.int32(512); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(44); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++c.seq); msg.put32(3);
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& m : mem) list.push_back(m);
+      server.receive_with_fds(c.handle, msg.view(), list);
+    }
+    dc.absorb(c);
+    NodeView dw;
+    dw.id = 45;
+    create_node(w, 45, {{"media.class", "Stream/Input/Video"}, {"target.object", "driven-camera"}});
+    node_update(w, 45);
+    set_active(w, 45, true);
+    w.send(45, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    dw.absorb(w);
+    w.send(45, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 2); b.none(); });
+    dw.absorb(w);
+    CHECK(dc.starts == 1 && dw.starts == 1 && dw.ports[{0, 0}].bufs.size() == 3 && dw.mem_types[uint32_t(dw.ports[{0, 0}].bufs[0].datas[0].data)] == 2);
+    SharedPointer<VideoChannel> dch = g.video_of(dc.node);
+    VideoShare* sh = dch && dch->share() ? dch->share().get() : nullptr;
+    CHECK(sh && sh->attached == 1 && sh->data_type == 2);
+    auto dframe = [&](uint32_t buffer) {
+      ByteView part = dc.buffer(1, 0, buffer);
+      put_u32(part, 32, 0); put_u32(part, 36, 512); put_u32(part, 40, 128);
+      put_u32(dc.io(1, 0), 0, 2); put_u32(dc.io(1, 0), 4, buffer);
+    };
+    // frames 0 and 1, the watcher holding both (it recycles nothing)
+    for (uint32_t f = 0; f < 2; ++f) {
+      dframe(f);
+      put_u32(dw.io(0, 0), 0, 1); put_u32(dw.io(0, 0), 4, 0xFFFFFFFFu);
+      put_u32(dw.activation->memory(), 0, 3);
+      for (int t = 0; t < 10; ++t) {
+        put_u32(dc.activation->memory(), 0, 3);      // (its cycle finished: what it gave is taken)
+        tick(10);
+        if (u32_at(dc.io(1, 0), 0) != 2) break;
+      }
+    }
+    int held = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) held += sh->taken[i];
+    CHECK(held == 2);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(45); });
+    tick();
+    CHECK(sh && sh->attached == 0);
+    // cycles with nothing from the camera: one back each
+    std::vector<uint32_t> back;
+    for (int t = 0; t < 30 && back.size() < 2; ++t) {
+      put_u32(dc.io(1, 0), 0, 1); put_u32(dc.io(1, 0), 4, 0xFFFFFFFFu);
+      put_u32(dc.activation->memory(), 0, 3);
+      tick(10);
+      const uint32_t id = u32_at(dc.io(1, 0), 4);
+      if (id != 0xFFFFFFFFu) back.push_back(id);
+    }
+    held = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) held += sh->taken[i];
+    CHECK(back.size() == 2 && held == 0);
+    c.send(0, 7, [](pod::Builder& b) { b.int32(44); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+  }
   // a port_buffers for a port that was not asked to allocate is refused
   {
     ByteBuffer body(A);
@@ -3653,7 +5620,7 @@ static void test_client_node_media() {
     create_node(w, 4, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
     node_update(w, 4);
     set_active(w, 4, true);
-    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 320, 240, true); port_info(b, 0, {}); });
+    w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {23, 2}, 0, 0); port_info(b, 0, {}); });
     yw.absorb(w);
     CHECK(yw.ports[{0, 0}].format == ycp.format);
     w.send(4, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
@@ -3770,6 +5737,320 @@ static void test_client_node_media() {
       tick(40);
       CHECK(watched(mw) == jpeg);
     }
+    // a real Motion JPEG camera (64 x 48) and a watcher that takes raw BGRA only: offered BGRA, given each picture decoded
+    NodeView rc;
+    rc.id = 10;
+    create_node(c, 10, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "real-mjpeg"}});
+    node_update(c, 10);
+    set_active(c, 10, true);
+    c.send(10, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 64, 48, 0x20002); port_info(b, 0, {}); });
+    rc.absorb(c);
+    c.send(10, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 8192, 0, 0); b.none(); });
+    rc.absorb(c);
+    NodeView rw;
+    rw.id = 7;
+    create_node(w, 7, {{"media.class", "Stream/Input/Video"}, {"target.object", "real-mjpeg"}});
+    node_update(w, 7);
+    set_active(w, 7, true);
+    w.send(7, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 64, 48); port_info(b, 0, {}); });
+    rw.absorb(w);
+    w.send(7, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    rw.absorb(w);
+    CHECK(rc.starts == 1 && rw.starts == 1 && rw.ports[{0, 0}].bufs.size() == 2);
+    const std::vector<uint8_t> real = read_test_file("tests/data/mjpeg_standard_tables.jpg");
+    if (rc.starts && rw.starts && real.size() > 100) {
+      put_u32(rw.activation->memory(), 0, 3);
+      produce(rc, 0, {real}, {0});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(rw);
+      CHECK(got.size() == 64 * 48 * 4 && got[3] == 0xFF);
+      hardware::JpegDecoder dec(A);
+      std::vector<uint32_t> want(64 * 48);
+      CHECK(dec.decode(ConstByteView(real.data(), real.size())) && dec.output_bgra(want.data(), 64));
+      if (got.size() == 64 * 48 * 4) CHECK(memcmp(got.data(), want.data(), got.size()) == 0);
+    }
+    c.send(0, 7, [](pod::Builder& b) { b.int32(10); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(7); });
+    // an H.264 camera (64 x 48) and a watcher that takes raw BGRA only: not offered raw while the graph has no decoders (it is given the H.264);
+    // with them, offered BGRA and given each picture decoded (what a decoder of the codecs gives), at the size it asks for
+    {
+      SoftwareDecoders decoders;
+      const std::vector<std::vector<uint8_t>> avc = encode_h264(64, 48, 4, 30);
+      uint32_t aw = 0, ah = 0;
+      const std::vector<std::vector<uint8_t>> want = reference_pictures(hardware::VideoCodec::H264, avc, &aw, &ah);
+      CHECK(avc.size() == 4 && want.size() == 4);
+      for (int with = 0; with < 2; ++with) {
+        g.set_video_codecs(with ? &decoders : nullptr);
+        NodeView hc;
+        hc.id = 11;
+        create_node(c, 11, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "h264-camera"}});
+        node_update(c, 11);
+        set_active(c, 11, true);
+        c.send(11, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 64, 48, 0x20001); port_info(b, 0, {}); });
+        hc.absorb(c);
+        c.send(11, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 65536, 0, 0); b.none(); });
+        hc.absorb(c);
+        NodeView hw;
+        hw.id = 9;
+        create_node(w, 9, {{"media.class", "Stream/Input/Video"}, {"target.object", "h264-camera"}});
+        node_update(w, 9);
+        set_active(w, 9, true);
+        w.send(9, 3, [with](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, with ? 32 : 0, with ? 24 : 0); port_info(b, 0, {}); });
+        hw.absorb(w);
+        VideoFormat offered;
+        {
+          pod::Parser fp(ConstByteView(hw.ports[{0, 0}].format.data(), hw.ports[{0, 0}].format.size()));
+          pod::Value fv; pod::ObjectReader o;
+          if (fp.next(&fv) && o.open(fv)) {
+            uint32_t key, fl; pod::Value v;
+            while (o.next(&key, &fl, &v)) {
+              if (key == 2) v.get_id(&offered.subtype);
+              if (key == 0x20001) v.get_id(&offered.format);
+              if (key == 0x20003 && v.body.size() >= 8) { memcpy(&offered.width, v.body.data(), 4); memcpy(&offered.height, v.body.data() + 4, 4); }
+            }
+          }
+        }
+        if (!with) {
+          CHECK(offered.subtype == 0x20001);      // (as the producer sends it)
+        } else {
+          CHECK(offered.subtype == VideoFormat::kSubtypeRaw && offered.format == 12 && offered.width == 32 && offered.height == 24);
+          w.send(9, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+          hw.absorb(w);
+          CHECK(hc.starts == 1 && hw.starts == 1);
+          if (hc.starts && hw.starts) {
+            for (size_t i = 0; i < avc.size(); ++i) {
+              put_u32(hw.activation->memory(), 0, 3);
+              produce(hc, 0, {avc[i]}, {0});
+              tick();
+              tick(40);
+              const std::vector<uint8_t> got = watched(hw);
+              CHECK(got.size() == 32 * 24 * 4);
+              if (got.size() == 32 * 24 * 4 && i < want.size()) {      // (the reference picture halved: each pixel the average of its 2 x 2)
+                int worst = 0;
+                for (uint32_t y = 0; y < 24; ++y)
+                  for (uint32_t x = 0; x < 32; ++x)
+                    for (int ch = 0; ch < 3; ++ch) {
+                      int sum = 0;
+                      for (uint32_t dy = 0; dy < 2; ++dy)
+                        for (uint32_t dx = 0; dx < 2; ++dx) sum += want[i][((2 * y + dy) * 64 + 2 * x + dx) * 4 + uint32_t(ch)];
+                      worst = std::max(worst, abs((sum + 2) / 4 - int(got[(y * 32 + x) * 4 + uint32_t(ch)])));
+                    }
+                CHECK(worst <= 1);
+              }
+            }
+          }
+        }
+        c.send(0, 7, [](pod::Builder& b) { b.int32(11); });
+        w.send(0, 7, [](pod::Builder& b) { b.int32(9); });
+        tick();
+      }
+      g.set_video_codecs(nullptr);
+    }
+    // an H.264 camera that does not say its size: a raw watcher is negotiated once its first frame came, at the size the stream says (64 x 48); a raw
+    // camera (BGRA 32 x 16) and watchers that take Motion JPEG only and H.264 only: given its frames encoded, each decoding as close to the picture
+    {
+      SoftwareDecoders codecs;
+      g.set_video_codecs(&codecs);
+      const std::vector<std::vector<uint8_t>> avc = encode_h264(64, 48, 3, 30);
+      CHECK(avc.size() == 3);
+      NodeView uc;
+      uc.id = 12;
+      create_node(c, 12, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "unsized-h264"}});
+      node_update(c, 12);
+      set_active(c, 12, true);
+      c.send(12, 3, [](pod::Builder& b) {
+        b.int32(1); b.int32(0); b.int32(3); b.int32(1);
+        const uint64_t o = b.begin_object(0x40003, 3);
+        b.property(1); b.id(2); b.property(2); b.id(0x20001);
+        b.property(0x20004); b.fraction(30, 1);
+        b.end(o);
+        port_info(b, 0, {});
+      });
+      uc.absorb(c);
+      c.send(12, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 65536, 0, 0); b.none(); });
+      uc.absorb(c);
+      NodeView uw;
+      uw.id = 13;
+      create_node(w, 13, {{"media.class", "Stream/Input/Video"}, {"target.object", "unsized-h264"}});
+      node_update(w, 13);
+      set_active(w, 13, true);
+      w.send(13, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 0, 0); port_info(b, 0, {}); });
+      uw.absorb(w);
+      tick();
+      uw.absorb(w);
+      CHECK(uw.ports[{0, 0}].format.empty());      // (no frame yet: no size to say)
+      CHECK(uc.starts == 1);
+      if (uc.starts) {
+        ByteView part = uc.buffer(1, 0, 0);
+        const NodeView::Buf& bf = uc.ports[{1, 0}].bufs[0];
+        memcpy(part.data() + bf.data, avc[0].data(), avc[0].size());
+        put_u32(part, 0, 0); put_u32(part, 4, uint32_t(avc[0].size())); put_u32(part, 8, 0);
+        put_u32(uc.io(1, 0), 0, 2); put_u32(uc.io(1, 0), 4, 0);
+        tick();
+        tick();
+        uw.absorb(w);
+      }
+      VideoFormat offered;
+      {
+        pod::Parser fp(ConstByteView(uw.ports[{0, 0}].format.data(), uw.ports[{0, 0}].format.size()));
+        pod::Value fv; pod::ObjectReader o;
+        if (fp.next(&fv) && o.open(fv)) {
+          uint32_t key, fl; pod::Value v;
+          while (o.next(&key, &fl, &v)) {
+            if (key == 2) v.get_id(&offered.subtype);
+            if (key == 0x20001) v.get_id(&offered.format);
+            if (key == 0x20003 && v.body.size() >= 8) { memcpy(&offered.width, v.body.data(), 4); memcpy(&offered.height, v.body.data() + 4, 4); }
+          }
+        }
+      }
+      CHECK(offered.subtype == 1 && offered.format == 12 && offered.width == 64 && offered.height == 48);
+      c.send(0, 7, [](pod::Builder& b) { b.int32(12); });
+      w.send(0, 7, [](pod::Builder& b) { b.int32(13); });
+      tick();
+      // the raw camera and its compressed watchers
+      NodeView rc2;
+      rc2.id = 14;
+      create_node(c, 14, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "raw-for-encoders"}});
+      node_update(c, 14);
+      set_active(c, 14, true);
+      c.send(14, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 12, 32, 16); port_info(b, 0, {}); });
+      rc2.absorb(c);
+      c.send(14, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+      rc2.absorb(c);
+      CHECK(rc2.starts == 1);
+      const std::vector<uint32_t> picture = test_picture(32, 16, 0);
+      std::vector<uint8_t> bytes(picture.size() * 4);
+      memcpy(bytes.data(), picture.data(), bytes.size());
+      for (uint32_t subtype : {0x20002u, 0x20001u}) {
+        NodeView ew;
+        ew.id = 15;
+        create_node(w, 15, {{"media.class", "Stream/Input/Video"}, {"target.object", "raw-for-encoders"}});
+        node_update(w, 15);
+        set_active(w, 15, true);
+        w.send(15, 3, [subtype](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 0, 32, 16, subtype); port_info(b, 0, {}); });
+        ew.absorb(w);
+        VideoFormat given_format;
+        {
+          pod::Parser fp(ConstByteView(ew.ports[{0, 0}].format.data(), ew.ports[{0, 0}].format.size()));
+          pod::Value fv; pod::ObjectReader o;
+          if (fp.next(&fv) && o.open(fv)) {
+            uint32_t key, fl; pod::Value v;
+            while (o.next(&key, &fl, &v)) {
+              if (key == 2) v.get_id(&given_format.subtype);
+              if (key == 0x20003 && v.body.size() >= 8) { memcpy(&given_format.width, v.body.data(), 4); memcpy(&given_format.height, v.body.data() + 4, 4); }
+            }
+          }
+        }
+        CHECK(given_format.subtype == subtype && given_format.width == 32 && given_format.height == 16);
+        w.send(15, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 262144, 0, 0); b.none(); });
+        ew.absorb(w);
+        CHECK(ew.starts == 1);
+        if (ew.starts && rc2.starts) {
+          ByteView part = rc2.buffer(1, 0, 0);
+          const NodeView::Buf& bf = rc2.ports[{1, 0}].bufs[0];
+          memcpy(part.data() + bf.data, bytes.data(), bytes.size());
+          put_u32(part, 0, 0); put_u32(part, 4, uint32_t(bytes.size())); put_u32(part, 8, 128);
+          put_u32(rc2.io(1, 0), 0, 2); put_u32(rc2.io(1, 0), 4, 0);
+          put_u32(ew.activation->memory(), 0, 3);
+          tick();
+          tick(40);
+          std::vector<uint8_t> got;
+          if (u32_at(ew.io(0, 0), 0) == 2) {
+            const uint32_t id = u32_at(ew.io(0, 0), 4);
+            ByteView epart = ew.buffer(0, 0, id);
+            uint32_t meta_bytes = 0;
+            for (const auto& m : ew.ports[{0, 0}].bufs[id].metas) meta_bytes += (m.second + 7) & ~7u;
+            const uint32_t size = u32_at(epart, meta_bytes + 4);
+            got.assign(epart.data() + ew.ports[{0, 0}].bufs[id].data, epart.data() + ew.ports[{0, 0}].bufs[id].data + size);
+          }
+          CHECK(!got.empty());
+          // decoded, close to the picture
+          uint32_t dw2 = 0, dh2 = 0;
+          const std::vector<std::vector<uint8_t>> pics =
+              reference_pictures(subtype == 0x20002 ? hardware::VideoCodec::Mjpeg : hardware::VideoCodec::H264, {got}, &dw2, &dh2);
+          CHECK(pics.size() == 1 && dw2 == 32 && dh2 == 16);
+          if (pics.size() == 1 && pics[0].size() == bytes.size()) {
+            uint64_t err = 0;
+            for (size_t k = 0; k < bytes.size(); ++k) if (k % 4 != 3) err += uint64_t(abs(int(pics[0][k]) - int(bytes[k])));
+            CHECK(err / (bytes.size() * 3 / 4) < 12);
+          }
+        }
+        w.send(0, 7, [](pod::Builder& b) { b.int32(15); });
+        tick();
+      }
+      CHECK(codecs.encoders == 2);
+      c.send(0, 7, [](pod::Builder& b) { b.int32(14); });
+      tick();
+      g.set_video_codecs(nullptr);
+    }
+    // a watcher that takes BGRA only, of the I420 camera: offered BGRA, given each frame converted (BT.601 limited: Y 16 black, 235 white)
+    NodeView cw;
+    cw.id = 6;
+    create_node(w, 6, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
+    node_update(w, 6);
+    set_active(w, 6, true);
+    w.send(6, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 6, 4); port_info(b, 0, {}); });
+    cw.absorb(w);
+    {
+      VideoFormat offered;
+      pod::Parser fp(ConstByteView(cw.ports[{0, 0}].format.data(), cw.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20001) v.get_id(&offered.format);
+      }
+      CHECK(offered.format == 12);
+    }
+    w.send(6, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    cw.absorb(w);
+    CHECK(cw.starts == 1 && cw.ports[{0, 0}].bufs.size() == 2);
+    if (cw.starts && ycp.bufs.size() == 2) {
+      // white on the left half, black on the right, no colour
+      std::vector<uint8_t> y6(24), u3(6, 128), v3(6, 128);
+      for (size_t k = 0; k < 24; ++k) y6[k] = (k % 6) < 3 ? 235 : 16;
+      put_u32(cw.activation->memory(), 0, 3);
+      produce(yc, 0, {y6, u3, v3}, {6, 3, 3});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(cw);
+      CHECK(got.size() == 6 * 4 * 4);
+      if (got.size() == 96) CHECK(got[0] == 255 && got[1] == 255 && got[2] == 255 && got[3] == 255 && got[5 * 4] == 0 && got[5 * 4 + 2] == 0 && got[23 * 4 + 3] == 255);
+    }
+    // a watcher of one fixed size, half the camera's: offered that size, given each frame scaled (each pixel two by two averaged)
+    NodeView sw;
+    sw.id = 8;
+    create_node(w, 8, {{"media.class", "Stream/Input/Video"}, {"target.object", "yuv-camera"}});
+    node_update(w, 8);
+    set_active(w, 8, true);
+    w.send(8, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_choice(b, {12}, 3, 2); port_info(b, 0, {}); });
+    sw.absorb(w);
+    {
+      uint32_t ow = 0, oh = 0;
+      pod::Parser fp(ConstByteView(sw.ports[{0, 0}].format.data(), sw.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20003 && v.type == pod::kRectangle) { ByteReader r(v.body); ow = r.le32(); oh = r.le32(); }
+      }
+      CHECK(ow == 3 && oh == 2);
+    }
+    w.send(8, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    sw.absorb(w);
+    CHECK(sw.starts == 1);
+    if (sw.starts && ycp.bufs.size() == 2) {
+      std::vector<uint8_t> y6(24), u3(6, 128), v3(6, 128);
+      for (size_t k = 0; k < 24; ++k) y6[k] = (k % 6) < 2 ? 235 : 16;      // (white in the first two columns: the first scaled column white)
+      put_u32(sw.activation->memory(), 0, 3);
+      produce(yc, 1, {y6, u3, v3}, {6, 3, 3});
+      tick();
+      tick(40);
+      const std::vector<uint8_t> got = watched(sw);
+      CHECK(got.size() == 3 * 2 * 4);
+      if (got.size() == 24) CHECK(got[0] == 255 && got[4] == 0 && got[12] == 255);
+    }
+    w.send(0, 7, [](pod::Builder& b) { b.int32(8); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(6); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(7); });
     c.send(0, 7, [](pod::Builder& b) { b.int32(8); });
     w.send(0, 7, [](pod::Builder& b) { b.int32(4); });
@@ -4165,32 +6446,52 @@ static void test_socket_fds_in() {
   CHECK(A.live.load() <= live_before + 4);
 }
 
+// PIPEWIRE_TEST_ONLY=test_a,test_b runs only those (a quicker loop while working on one part); unset, all of them.
+static bool wanted(const char* name) {
+  const char* only = getenv("PIPEWIRE_TEST_ONLY");
+  if (!only || !*only) return true;
+  const std::string list = std::string(",") + only + ",";
+  return list.find(std::string(",") + name + ",") != std::string::npos;
+}
+#define RUN(test) do { if (wanted(#test)) test(); } while (0)
+
 int main() {
-  test_pod();
-  test_tagstruct();
-  test_convert();
-  test_graph();
-  test_native_protocol();
-  test_pulse_protocol();
-  test_windows_service();
-  test_windows_virtual_sink();
-  test_camera_sources();
-  test_record_convert();
-  test_record();
-  test_record_threads();
-  test_monitor();
-  test_native_capture();
-  test_balance();
-  test_client_node();
-  test_sockets();
-  test_socket_client_node();
-  test_threads();
-  test_midi_bus();
-  test_midi_threads();
-  test_midi_sysex_timing();
-  test_video_channel();
-  test_client_node_media();
-  test_socket_fds_in();
+  RUN(test_pod);
+  RUN(test_tagstruct);
+  RUN(test_convert);
+  RUN(test_graph);
+  RUN(test_native_protocol);
+  RUN(test_pulse_protocol);
+  RUN(test_windows_service);
+  RUN(test_windows_virtual_sink);
+  RUN(test_virtual_sink_shape);
+  RUN(test_module_arguments);
+  RUN(test_pulse_modules);
+  RUN(test_loopback_modules);
+  RUN(test_source_modules);
+  RUN(test_echo_cancel_module);
+  RUN(test_camera_sources);
+  RUN(test_screen_source);
+  RUN(test_deep_conversion);
+  RUN(test_format_fixtures);
+  RUN(test_video_decode);
+  RUN(test_video_watcher);
+  RUN(test_record_convert);
+  RUN(test_record);
+  RUN(test_record_threads);
+  RUN(test_monitor);
+  RUN(test_native_capture);
+  RUN(test_balance);
+  RUN(test_client_node);
+  RUN(test_sockets);
+  RUN(test_socket_client_node);
+  RUN(test_threads);
+  RUN(test_midi_bus);
+  RUN(test_midi_threads);
+  RUN(test_midi_sysex_timing);
+  RUN(test_video_channel);
+  RUN(test_client_node_media);
+  RUN(test_socket_fds_in);
   printf("PipeWireTest: %d checks, %d failed\n", g_checks.load(), g_failed.load());
   return g_failed ? 1 : 0;
 }

@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Win32Windows.hpp"
+#include "Gui/Window.hpp"
 #include "Gui/Painter.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -57,6 +58,30 @@ Win32Window::Win32Window(allocators::IAllocator& allocator, IWindowsSession& ses
 bool Win32Window::close_requested() {
   session_.window_command(window_, IWindowsSession::Command::Close);
   return false;
+}
+
+void Win32Window::on_drag_over(StringView text, int32_t x, int32_t y, const gui::Control*) {
+  const gui::Rect2D b = bounds();      // (the window manager's coordinates are the programs' screen)
+  drag_taken_ = session_.desktop_drag(window_, b.x + x, b.y + y, text);
+}
+
+void Win32Window::on_drag_leave() {
+  drag_taken_ = false;
+  session_.desktop_drag_end();
+}
+
+// A drop with no drag before it (an item another session's program let go over this window, gui::Window::drop_at) is offered to the session now.
+bool Win32Window::accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const {
+  if (drag_taken_ || source) return drag_taken_;
+  const gui::Rect2D b = bounds();
+  if (session_.desktop_drag(window_, b.x + x, b.y + y, text)) return true;
+  session_.desktop_drag_end();
+  return false;
+}
+
+void Win32Window::on_drop(StringView, int32_t, int32_t, const gui::Control*) {
+  drag_taken_ = false;
+  if (!session_.desktop_drop()) session_.desktop_drag_end();
 }
 
 bool Win32Window::picture_area(gui::Rect2D* area) const {
@@ -175,16 +200,18 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     gui::UiGuard lock(&manager);
     bounds = manager.bounds();
     if (bounds.width == 0 || bounds.height == 0) return;
-    send = !display_sent_ || !same(bounds, sent_bounds_);
+    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_;
     if (send) {
       const gui::Point o = manager.window_origin();
-      if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0))};
+      if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0)), windows_rect(manager.full_area(0))};
       for (uint32_t i = 0; i < monitor_count_; ++i) {
         const gui::Rect2D r = regions_[i], a = areas_[i];      // (desktop window coordinates; the window manager's area are a shift of them)
-        monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, {a.x - o.x, a.y - o.y, a.width, a.height}};
+        const gui::Rect2D full = {a.x - o.x, a.y - o.y, a.width, a.height};
+        monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, windows_rect(manager.without_reserved(full)), windows_rect(full)};
       }
       display_sent_ = true;
       sent_bounds_ = bounds;
+      sent_reserve_serial_ = manager.reserve_serial();
     }
   }
   if (first) {
@@ -206,6 +233,15 @@ void Win32Windows::pump(gui::WindowManager& manager) {
       drag_from_ = h->bounds();
     }
   }      // (the windows shown before: all of them)
+  int32_t menu_x = 0, menu_y = 0;
+  if (const uint32_t window = session_->take_window_menu(&menu_x, &menu_y)) {      // (a program that draws its own title bar asks for the window menu)
+    gui::UiGuard lock(&manager);
+    Win32Window* h = host(window);
+    if (h && h->manager() == &manager) {
+      const gui::Rect2D client = h->view().bounds();
+      h->show_window_menu(client.x + menu_x, client.y + menu_y);
+    }
+  }
   {
     gui::UiGuard lock(&manager);
     follow_frames(manager);      // (first: what the user did since the last pump is asked of the programs before their older reports are applied)
@@ -241,6 +277,8 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     }
   }
   if (hosts_.count() > 0) follow_pointer(manager);
+  pump_program_drag(manager);
+  pump_program_drop(manager);
   if (changed_.count() > 0) {
     session_->windows(&order_);
     gui::UiGuard lock(&manager);
@@ -249,6 +287,71 @@ void Win32Windows::pump(gui::WindowManager& manager) {
   gui::UiGuard lock(&manager);
   for (const IWindowsSession::Repaint& r : repainted_.view())
     if (Win32Window* h = host(r.window)) h->view_.invalidate();
+}
+
+// A program's drag let go over the desktop: its items are dropped where it was let go, one per pump (a drop waits for its control's handler thread before
+// the next can go); the session hears whether any was taken once all have gone.
+void Win32Windows::pump_program_drop(gui::WindowManager& manager) {
+  if (!dropping_) {
+    if (!session_->take_program_drop(&drop_items_, &drop_x_, &drop_y_)) return;
+    dropping_ = true;
+    drop_next_ = 0;
+    drop_taken_ = false;
+  }
+  gui::Window* window = nullptr;
+  gui::Point origin;
+  {
+    gui::UiGuard lock(&manager);
+    window = manager.window();
+    origin = manager.window_origin();
+  }
+  const StringView all = drop_items_.view();
+  while (window && drop_next_ < all.size()) {
+    if (window->drop_pending()) return;      // (the next pump goes on)
+    uint64_t end = drop_next_;
+    while (end < all.size() && all[end] != '\n') ++end;
+    const StringView item = all.substr(drop_next_, end - drop_next_);
+    drop_next_ = end + 1;
+    if (!item.empty() && window->drop_at(origin.x + drop_x_, origin.y + drop_y_, item)) drop_taken_ = true;
+  }
+  dropping_ = false;
+  drop_items_.clear();
+  session_->program_drop_done(drop_taken_);
+}
+
+// A program's drag over the desktop, before it is let go: the desktop's window shows its first item at the pointer (with how many more there are) and says
+// whether it would take that one, which the program hears.
+void Win32Windows::pump_program_drag(gui::WindowManager& manager) {
+  int32_t x = 0, y = 0;
+  const bool over = !dropping_ && session_->program_drag(&drag_items_, &x, &y);
+  gui::Window* window = nullptr;
+  gui::Point origin;
+  {
+    gui::UiGuard lock(&manager);
+    window = manager.window();
+    origin = manager.window_origin();
+  }
+  if (!over || !window) {
+    if (drag_window_) drag_window_->outside_drag_end();
+    drag_window_ = nullptr;
+    return;
+  }
+  const StringView all = drag_items_.view();
+  uint64_t end = 0;
+  while (end < all.size() && all[end] != '\n') ++end;
+  const StringView first = all.first(end);
+  uint32_t more = 0;
+  for (uint64_t i = end; i < all.size(); ++i) if (all[i] == '\n') ++more;
+  drag_label_.clear();
+  if (more > 0) {
+    drag_label_.append(first.substr(first.rfind('/') + 1));
+    drag_label_.append(StringView(" (+"));
+    drag_label_.append_uint(more);
+    drag_label_.push_back(')');
+  }
+  if (drag_window_ && drag_window_ != window) drag_window_->outside_drag_end();
+  drag_window_ = window;
+  session_->program_drag_answer(window->outside_drag_at(origin.x + x, origin.y + y, first, drag_label_.view()));
 }
 
 // The programs' order among their frames: their top window goes directly above the frame of theirs that is highest on the desktop (where the user or the program
@@ -300,6 +403,9 @@ void Win32Windows::apply(gui::WindowManager& manager, uint32_t window, const Win
   h->set_minimize_enabled(info.minimize_box);
   h->set_maximize_enabled(info.maximize_box);
   h->set_in_taskbar(!info.popup && !info.tool && !info.owned);
+  using Layer = gui::Frame::Layer;
+  const int8_t layer = info.layer != 0 ? info.layer : info.topmost ? int8_t(1) : int8_t(0);
+  const Layer want_layer = layer <= -2 ? Layer::Background : layer == -1 ? Layer::Bottom : layer == 0 ? Layer::Normal : layer == 1 ? Layer::Top : Layer::Overlay;
   const gui::Rect2D r = gui_rect(info.window);
   const State want = info.minimized ? State::Minimized : info.maximized ? State::Maximized : State::Normal;
   if (fresh) {
@@ -311,6 +417,8 @@ void Win32Windows::apply(gui::WindowManager& manager, uint32_t window, const Win
     }
     h->known_ = h->sent_ = h->bounds();
   }
+  h->set_layer(want_layer);
+  h->set_reserve(info.reserve_edge <= 4 ? static_cast<gui::Frame::Edge>(info.reserve_edge) : gui::Frame::Edge::None, info.reserve);
   h->set_activatable(!info.popup);
   // the state: a minimized frame comes back to what it was before (which may be maximized), then goes where the program is (unless the user just changed it and
   // the program has not caught up)
@@ -426,8 +534,160 @@ void Win32Windows::tap_key(const hardware::KeyEvent& event, uint8_t modifiers) {
     grabbed_ = false;
     released_ = true;
   }
+  if (compose_key(event.usage, modifiers)) return;      // (taken by the input method: its release is not handed over either)
   slot = static_cast<uint8_t>(slot | bit);
   session_->key(event.usage, true, modifiers);
+}
+
+namespace {
+
+// The value of a hex digit key (letters a-f, the digit row, the keypad), or -1.
+int hex_of(uint8_t usage) {
+  if (usage >= 0x04 && usage <= 0x09) return 10 + (usage - 0x04);
+  if (usage >= 0x1E && usage <= 0x26) return 1 + (usage - 0x1E);
+  if (usage == 0x27 || usage == 0x62) return 0;
+  if (usage >= 0x59 && usage <= 0x61) return 1 + (usage - 0x59);
+  return -1;
+}
+
+// `code` in UTF-8 into `out` (4 bytes); its length, 0 for no character (a surrogate, past U+10FFFF, or a control character below U+0020).
+uint32_t utf8_of(uint32_t code, char (&out)[4]) {
+  if (code < 0x20 || code == 0x7F || (code >= 0xD800 && code <= 0xDFFF) || code > 0x10FFFF) return 0;
+  if (code < 0x80) { out[0] = static_cast<char>(code); return 1; }
+  if (code < 0x800) { out[0] = static_cast<char>(0xC0 | code >> 6); out[1] = static_cast<char>(0x80 | (code & 0x3F)); return 2; }
+  if (code < 0x10000) {
+    out[0] = static_cast<char>(0xE0 | code >> 12), out[1] = static_cast<char>(0x80 | ((code >> 6) & 0x3F)), out[2] = static_cast<char>(0x80 | (code & 0x3F));
+    return 3;
+  }
+  out[0] = static_cast<char>(0xF0 | code >> 18), out[1] = static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+  out[2] = static_cast<char>(0x80 | ((code >> 6) & 0x3F)), out[3] = static_cast<char>(0x80 | (code & 0x3F));
+  return 4;
+}
+
+}  // namespace
+
+// Unicode entry, as IBus and GTK have it: Ctrl+Shift+U starts it (when the window with the keyboard takes composed text), hex digits (up to six) make the
+// code point, shown by the program as "u1f600" being composed; Space or Enter puts the character in, Backspace takes a digit back, Escape (or any other
+// key, which then goes on to the program) gives up. Modifier keys always go on, so the program's idea of them stays right.
+bool Win32Windows::compose_key(uint8_t usage, uint8_t modifiers) {
+  using namespace hardware::modifier;
+  if (usage >= 0xE0 && usage <= 0xE7) return false;
+  IWindowsSession::TextInputState state;
+  if (!composing_) {
+    const bool ctrl = modifiers & kControl, shift = modifiers & kShift, alt = modifiers & (kLeftAlt | kRightAlt);
+    if (usage != 0x18 || !ctrl || !shift || alt) return false;      // (U)
+    if (!session_->text_input(&state) || !state.enabled) return false;
+    composing_ = true;
+    compose_window_ = state.window;
+    compose_code_ = 0;
+    compose_digits_ = 0;
+    if (!session_->text_preedit("u", 1)) composing_ = false;
+    return composing_;
+  }
+  // the window with the keyboard changed, or stopped taking text: the composing is over and the key is the program's
+  if (!session_->text_input(&state) || !state.enabled || state.window != compose_window_) {
+    composing_ = false;
+    return false;
+  }
+  auto show = [&]() {
+    char text[8] = {'u'};
+    uint32_t n = 1;
+    for (int shift = 4 * (compose_digits_ - 1); shift >= 0; shift -= 4) text[n++] = "0123456789abcdef"[(compose_code_ >> shift) & 15];
+    session_->text_preedit(StringView(text, n), n);
+  };
+  const int digit = hex_of(usage);
+  if (digit >= 0 && !(modifiers & (kControl | kLeftAlt | kRightAlt))) {
+    if (compose_digits_ < 6) {
+      compose_code_ = compose_code_ * 16 + static_cast<uint32_t>(digit);
+      ++compose_digits_;
+    }
+    show();
+    return true;
+  }
+  if (usage == 0x2A) {      // Backspace
+    if (compose_digits_ == 0) {
+      composing_ = false;
+      session_->text_preedit(StringView(), 0);
+    } else {
+      compose_code_ >>= 4;
+      --compose_digits_;
+      show();
+    }
+    return true;
+  }
+  if (usage == 0x2C || usage == 0x28 || usage == 0x58) {      // Space, Enter, keypad Enter
+    composing_ = false;
+    char utf8[4];
+    const uint32_t n = compose_digits_ > 0 ? utf8_of(compose_code_, utf8) : 0;
+    if (n > 0) session_->text_commit(StringView(utf8, n));
+    else session_->text_preedit(StringView(), 0);
+    return true;
+  }
+  composing_ = false;
+  session_->text_preedit(StringView(), 0);
+  return usage == 0x29;      // (Escape is taken; anything else goes on)
+}
+
+bool Win32Windows::tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y) {
+  if (!session_ || !manager_ || !attached_) return false;
+  gui::Point origin;
+  Win32Window* over = nullptr;
+  {
+    gui::UiGuard lock(manager_);
+    origin = manager_->window_origin();
+    if (event.phase == hardware::TouchPhase::Down) {
+      gui::Rect2D area;
+      over = host_under(*manager_, x - origin.x, y - origin.y, &area);
+    }
+  }
+  const int32_t sx = x - origin.x, sy = y - origin.y;      // (the programs' screen = the window manager's area)
+  if (event.phase == hardware::TouchPhase::Down) {
+    if (!over || !session_->touch(event.phase, event.id, over->window(), sx, sy)) return false;
+    touches_.push_back(event.id);
+    gui::UiGuard lock(manager_);
+    if (host(over->window()) == over) over->activate();      // (a touch on a window brings it forward, as a click does)
+    return true;
+  }
+  for (uint64_t i = 0; i < touches_.count(); ++i) {
+    if (touches_[i] != event.id) continue;
+    session_->touch(event.phase, event.id, 0, sx, sy);
+    if (event.phase == hardware::TouchPhase::Up || event.phase == hardware::TouchPhase::Cancel) touches_.remove_at(i);
+    return true;
+  }
+  return false;
+}
+
+bool Win32Windows::tap_pen(const hardware::PenEvent& event, int32_t x, int32_t y) {
+  if (!session_ || !manager_ || !attached_) return false;
+  gui::Point origin;
+  Win32Window* over = nullptr;
+  {
+    gui::UiGuard lock(manager_);
+    origin = manager_->window_origin();
+    gui::Rect2D area;
+    over = host_under(*manager_, x - origin.x, y - origin.y, &area);
+  }
+  if (!pen_taken_ && (!over || !event.in_range)) return false;
+  PenInput p;
+  p.in_range = event.in_range;
+  p.tip = event.tip;
+  p.inverted = event.inverted;
+  p.buttons = event.buttons;
+  p.window = over ? over->window() : 0;
+  p.x = x - origin.x;
+  p.y = y - origin.y;
+  p.pressure = event.max_pressure ? static_cast<uint16_t>(uint64_t{event.pressure > event.max_pressure ? event.max_pressure : event.pressure} * 65535u / event.max_pressure)
+                                  : (event.tip ? 65535 : 0);
+  p.tilt_x = event.tilt_x;
+  p.tilt_y = event.tilt_y;
+  const bool was = pen_taken_;
+  const bool taken = session_->pen(p);
+  pen_taken_ = taken && event.in_range;
+  if (taken && !was && event.tip && over) {      // (the tip touching a window brings it forward, as a click does)
+    gui::UiGuard lock(manager_);
+    if (host(over->window()) == over) over->activate();
+  }
+  return taken || was;
 }
 
 void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int32_t* y) {
@@ -440,6 +700,8 @@ void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int3
     gui::UiGuard lock(manager_);
     pointer_x_ = *x;
     pointer_y_ = *y;
+    // the desktop's own drag (a file from the File Explorer) is the desktop's: the programs hear of it through desktop_drag, never as their mouse
+    if (const gui::Window* w = manager_->window(); w && w->dragging() && !grabbed_) return;
     if (drag_) {      // the frame follows the pointer; the program hears of it as the frame moves, not as mouse input
       dragging = true;
       drag_to(*x, *y);

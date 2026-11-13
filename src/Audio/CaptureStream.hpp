@@ -48,6 +48,9 @@ class CaptureStream final : public IAudioTap {
 
   // False if the format is not valid or memory ran out. `ring_bytes` is the size of the ring in the stream's format.
   bool allocate(uint32_t ring_bytes = kDefaultRingBytes);
+  // Before allocate(): the audio is made `shape` first, then the stream's format (a virtual sink's monitor holds the sink's own audio: a mono sink's
+  // both sides averaged, a 16 kHz one nothing above 8 kHz, whatever rate and channels the program reads at). False if it is not a valid format.
+  bool set_shape(const StreamFormat& shape);
   const StreamFormat& format() const { return format_; }
 
   // Copies out the oldest whole frames, scaled by the stream's gain; returns the bytes copied.
@@ -84,9 +87,14 @@ class CaptureStream final : public IAudioTap {
   void deliver(ConstByteView pcm) override;
 
  private:
+  void push_converted(ConstByteView pcm);      // (from the device format, or the shape, into the ring)
+
   allocators::IAllocator& allocator_;
   StreamFormat format_;
-  FormatConverter converter_;  // from the device format to format_
+  FormatConverter converter_;  // from the device format (or shape_) to format_
+  FormatConverter shape_converter_;  // (shaped: from the device format to shape_)
+  StreamFormat shape_;
+  bool shaped_ = false;
   hardware::CaptureRing ring_;
   kernel::Mutex mutex_;
   uint8_t gain_ = hardware::kAudioMaxVolume;

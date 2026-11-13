@@ -813,10 +813,32 @@ EXPORT BOOL WINAPI PostThreadMessageW(DWORD thread, UINT message, ULONG_PTR wpar
 EXPORT BOOL WINAPI PostThreadMessageA(DWORD thread, UINT message, ULONG_PTR wparam, LONG_PTR lparam) { return PostThreadMessageW(thread, message, is_char_message(message) ? char_to_wide(wparam) : wparam, lparam); }
 EXPORT void WINAPI PostQuitMessage(int code) { NtUserPostQuitMessage((ULONG_PTR)(LONG_PTR)code); }
 EXPORT BOOL WINAPI ReplyMessage(LONG_PTR result) { return (NtUserReplyMessage((ULONG_PTR)result) & 0xFFFFFFFFu) != 0; }
+/* Files the desktop dropped on a window: win32k queues WM_DROPFILES with a ticket (wParam) and its mark (lParam); taken from the queue, the message
+ * gets the HDROP the program expects (a DROPFILES block in GlobalAlloc memory, freed by DragFinish), filled by the kernel (NtUserCallTwoParam
+ * TCOS_TAKE_DROP: the size, then the block). Looked at without being removed, the message has no HDROP yet (wParam 0). */
+#define TCOS_DROP_TICKET_MARK 0x54434450u
+#define TCOS_TAKE_DROP 0x7C00u
+static void collect_drop(MSG_ *msg, BOOL removed) {
+  if (msg->message != 0x233 /* WM_DROPFILES */ || (ULONG_PTR)msg->lparam != TCOS_DROP_TICKET_MARK) return;
+  const ULONG_PTR ticket = msg->wparam;
+  msg->wparam = 0;
+  msg->lparam = 0;
+  if (!removed) return;
+  const ULONG_PTR size = NtUserCallTwoParam(ticket, 0, TCOS_TAKE_DROP);
+  if (size == 0 || size > (1u << 22)) return;
+  HANDLE drop = GlobalAlloc(0x42 /* GMEM_MOVEABLE | GMEM_ZEROINIT */, size);
+  void *block = drop ? GlobalLock(drop) : NULL;
+  if (!block) { if (drop) GlobalFree(drop); return; }
+  const ULONG_PTR filled = NtUserCallTwoParam(ticket, (ULONG_PTR)block, TCOS_TAKE_DROP);
+  GlobalUnlock(drop);
+  if (filled != size) { GlobalFree(drop); return; }
+  msg->wparam = (ULONG_PTR)drop;
+}
 EXPORT int WINAPI GetMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last) {
   if (!msg) { SetLastError(ERROR_INVALID_PARAMETER); return -1; }
   for (;;) {
     const int r = (int)(LONG)NtUserGetMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last);
+    if (r > 0) collect_drop(msg, TRUE);
     if (r <= 0 || !(g_hook_count[WH_KEYBOARD + 1] | g_hook_count[WH_MOUSE + 1] | g_hook_count[WH_GETMESSAGE + 1]) || hook_filter_message(msg, TRUE)) return r;
   }
 }
@@ -825,6 +847,7 @@ EXPORT BOOL WINAPI PeekMessageW(MSG_ *msg, HANDLE hwnd, UINT first, UINT last, U
   if (!msg) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   for (;;) {
     if (!(NtUserPeekMessage((ULONG_PTR)msg, (ULONG_PTR)hwnd, first, last, flags) & 0xFFFFFFFFu)) return FALSE;
+    collect_drop(msg, (flags & 1 /* PM_REMOVE */) != 0);
     if (!(g_hook_count[WH_KEYBOARD + 1] | g_hook_count[WH_MOUSE + 1] | g_hook_count[WH_GETMESSAGE + 1]) || hook_filter_message(msg, (flags & 1 /* PM_REMOVE */) != 0)) return TRUE;
   }
 }

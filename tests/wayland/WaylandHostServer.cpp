@@ -128,11 +128,24 @@ void dump(wayland::Server& server, const char* path, bool quiet) {
            info.surface.width, info.surface.height, info.caption ? " decorated" : "", info.popup ? " popup" : "", info.maximized ? " maximized" : "");
   }
   if (total_w == 0) total_w = 1;
+  // each window as the desktop draws it (its subsurfaces too)
+  std::vector<std::vector<uint32_t>> pictures;
+  for (const Shot& s : shots) {
+    pictures.emplace_back(size_t(s.w) * s.h, 0x808080u);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(pictures.back().data(), pictures.back().size());
+    target.width = target.pitch = s.w;
+    target.height = s.h;
+    graphics::SoftwareRenderer2D renderer(target);
+    uint32_t w = 0, h = 0;
+    server.draw_window(s.id, renderer, 0, 0, &w, &h);
+  }
   fprintf(f, "P6\n%u %u\n255\n", total_w, max_h);
   for (uint32_t y = 0; y < max_h; ++y) {
-    for (const Shot& s : shots) {
+    for (size_t k = 0; k < shots.size(); ++k) {
+      const Shot& s = shots[k];
       for (uint32_t x = 0; x < s.w + 4; ++x) {
-        const uint32_t v = x < s.w && y < s.h ? server.window_pixel(s.id, int32_t(x), int32_t(y)) : 0x808080u;
+        const uint32_t v = x < s.w && y < s.h ? pictures[k][size_t(y) * s.w + x] : 0x808080u;
         const uint8_t rgb[3] = {uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
         fwrite(rgb, 1, 3, f);
       }
@@ -192,6 +205,9 @@ int main(int argc, char** argv) {
   std::set<uint32_t> seen;
   uint64_t next_draw = 0, next_dump = 0;
   struct Script { uint32_t window = 0; int step = 0; uint64_t at = 0; } script;
+  // TCOS_DESKTOP_DRAG=<system path>: the desktop drags that file onto the first window a second after it shows, moves over it, then lets it go
+  const char* desktop_drag = getenv("TCOS_DESKTOP_DRAG");
+  Script drag_script;
   while (!g_stop && now_ms() < end) {
     std::vector<pollfd> fds;
     fds.push_back({listener, POLLIN, 0});
@@ -249,6 +265,7 @@ int main(int argc, char** argv) {
           const int flags = fcntl(fd, F_GETFL);
           fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
           if (write(fd, r.data->view().data(), r.data->size()) != ssize_t(r.data->size())) printf("clipboard write failed\n");
+          else if (getenv("TCOS_DESKTOP_DRAG")) printf("wrote %zu bytes for a client: %.*s\n", size_t(r.data->size()), int(r.data->size()), reinterpret_cast<const char*>(r.data->view().data()));
         }
       }
     }
@@ -281,6 +298,7 @@ int main(int argc, char** argv) {
           fflush(stdout);
           if (!info.popup) server.activate_window(id);
           if (title.view() == StringView("wl_client") && script.window == 0) { script.window = id; script.at = now_ms() + 100; }
+          if (desktop_drag && drag_script.window == 0 && !info.popup) { drag_script.window = id; drag_script.at = now_ms() + 1000; }
         }
         graphics::SoftwareRenderer2D renderer(target);
         uint32_t w = 0, h = 0;
@@ -290,6 +308,22 @@ int main(int argc, char** argv) {
       if (argc > 4 && windows.count() > 0 && now_ms() >= next_dump) {
         next_dump = now_ms() + 250;
         dump(server, argv[4], true);
+      }
+      if (drag_script.window && now_ms() >= drag_script.at && drag_script.step < 4) {
+        desktop::WindowsWindowInfo info;
+        String title(g_allocator);
+        if (server.window_info(drag_script.window, &info, &title)) {
+          const int32_t cx = info.surface.x + int32_t(info.surface.width / 2), cy = info.surface.y + int32_t(info.surface.height / 2);
+          if (drag_script.step < 3) {
+            const bool taken = server.desktop_drag(drag_script.window, cx + drag_script.step, cy, StringView(desktop_drag));
+            printf("desktop drag over %u: %s\n", drag_script.window, taken ? "taken" : "not taken");
+          } else {
+            printf("desktop drop: %s\n", server.desktop_drop() ? "dropped" : "refused");
+          }
+          fflush(stdout);
+        }
+        ++drag_script.step;
+        drag_script.at = now_ms() + 200;
       }
       if (script.window && now_ms() >= script.at && script.step < 8) {
         desktop::WindowsWindowInfo info;

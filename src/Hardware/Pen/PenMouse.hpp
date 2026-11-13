@@ -18,7 +18,8 @@
 
 // The pen as a pointer: an absolute mouse made from the events of a CompositePen, added to the system's mice so that every program that knows a mouse works with the pen. Hovering
 // moves the pointer, the tip touching is the left button, the barrel button the right one, the eraser end touching the middle one. When the pen leaves the range the buttons are
-// let go. Only changes are reported (a pen sends a report for every scan, mostly the same).
+// let go. Only changes are reported (a pen sends a report for every scan, mostly the same). Disabled (set_enabled(false): the desktop reads the pens itself and
+// moves the pointer for the windows that do not take them), it reports nothing and leaves the pens' events to that reader.
 #pragma once
 #include "Hardware/Mouse/IMouse.hpp"
 #include "Hardware/Pen/CompositePen.hpp"
@@ -33,6 +34,7 @@ class PenMouse final : public IMouse {
   void shutdown() override {}
   bool poll(MouseEvent* out) override;
   bool is_absolute() const override { return true; }
+  void set_enabled(bool on) { __atomic_store_n(&enabled_, on, __ATOMIC_RELEASE); }
   uint32_t max_x() const override { return max_x_; }
   uint32_t max_y() const override { return max_y_; }
 
@@ -41,6 +43,7 @@ class PenMouse final : public IMouse {
   uint32_t max_x_ = 0, max_y_ = 0, x_ = 0, y_ = 0;
   uint8_t buttons_ = 0;
   bool in_range_ = false;
+  bool enabled_ = true;
 };
 
 }  // namespace hardware

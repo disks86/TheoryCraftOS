@@ -22,7 +22,7 @@
 // desktop::IWindowsSession the Windows programs' windows use (Win32Windows.hpp), so an X window and a Win32 window get the same frame, title bar, buttons,
 // taskbar button and Alt+Tab place, and are moved, sized, minimized, maximized, activated and closed the same way. The server is an ICCCM / EWMH window
 // manager on the inside: a top-level's requested position is its frame's (NorthWest gravity), its title comes from _NET_WM_NAME or WM_NAME, WM_DELETE_WINDOW
-// closes it politely, _MOTIF_WM_HINTS without decorations and override-redirect windows get no frame, _NET_WM_MOVERESIZE starts a drag of the frame, and
+// closes it politely, _MOTIF_WM_HINTS without decorations and override-redirect windows get no frame, _NET_WM_MOVERESIZE starts a drag of the frame, _GTK_SHOW_WINDOW_MENU opens its window menu, and
 // _NET_WM_STATE / WM_CHANGE_STATE maximize and minimize it. Other window managers cannot run (selecting SubstructureRedirect on the root is BadAccess).
 //
 // Pictures. Every top-level window has one picture of its inside (32-bit 0xAARRGGBB pixels); its subwindows draw into the part of it that they cover,
@@ -126,6 +126,7 @@ class Server final : public desktop::IWindowsSession {
   void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) override;
   void take_changes(List<uint32_t>* changed, List<Repaint>* repainted) override;
   uint32_t take_drag(uint32_t* edge) override;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override;
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
@@ -142,6 +143,17 @@ class Server final : public desktop::IWindowsSession {
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
+  // Drag and drop with the desktop (XDND, X11DragAndDrop.cpp)
+  bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) override;
+  bool desktop_drop() override;
+  void desktop_drag_end() override;
+  bool take_program_drop(String* text, int32_t* x, int32_t* y) override;
+  void program_drop_done(bool taken) override;
+  bool program_drag(String* text, int32_t* x, int32_t* y) override;
+  void program_drag_answer(bool would_take) override;
+  // A finger: taken (XInput 2.2 TouchBegin / TouchUpdate / TouchEnd, X11Input2.cpp) when a window under it selected touch events; else the desktop
+  // moves the pointer with it.
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override;
 
   // Tests: the pixel of a top-level's picture (0 when outside or none).
   uint32_t picture_pixel(uint32_t window, int32_t x, int32_t y);
@@ -174,8 +186,13 @@ class Server final : public desktop::IWindowsSession {
     uint8_t client = 0;
     uint32_t mask = 0;
   };
+  struct XiSelection {      // XISelectEvents: a client's XI2 event mask (the first 32 events) for one device on a window
+    uint8_t client = 0;
+    uint16_t device = 0;
+    uint32_t mask = 0;
+  };
   struct Window {
-    explicit Window(allocators::IAllocator& allocator) : children(allocator), selections(allocator), properties(allocator) {}
+    explicit Window(allocators::IAllocator& allocator) : children(allocator), selections(allocator), properties(allocator), xi(allocator) {}
     uint32_t id = 0;
     uint8_t owner = 0;
     Window* parent = nullptr;
@@ -198,6 +215,7 @@ class Server final : public desktop::IWindowsSession {
     bool placed = false, iconic = false, maximized = false, fullscreen = false, above = false;
     Rect restore;                           // the inside before it was maximized
     uint32_t icon = 0;                      // the icon handle the desktop is given (0: none)
+    List<XiSelection> xi;                   // XInput 2 selections (X11Input2.cpp)
   };
   struct Gc {
     uint32_t id = 0;
@@ -299,6 +317,7 @@ class Server final : public desktop::IWindowsSession {
   bool decorated(Window& top);
   bool property32(Window& w, uint32_t atom, uint32_t index, uint32_t* out);
   uint32_t window_type(Window& w);
+  void strut(Window& w, uint8_t* edge, uint32_t* size);
   Rect work_area_for(Window& top);
   void set_maximized(Window& top, bool on);
   void set_fullscreen(Window& top, bool on);
@@ -312,6 +331,25 @@ class Server final : public desktop::IWindowsSession {
   void send_client_message(Window& w, uint32_t type, uint32_t d0, uint32_t d1);
   bool has_protocol(Window& w, uint32_t protocol);
   uint32_t intern(StringView name);       // (never fails for the server's own names: they fit)
+
+  // --- XInput 2 (X11Input2.cpp)
+  void xinput_request(Client& c, uint8_t minor, WireReader& r);
+  void xi_client_gone(uint8_t client);
+
+  // --- drag and drop (X11DragAndDrop.cpp)
+  void xdnd_setup();                                                          // the atoms, the root's XdndAware
+  bool xdnd_client_message(Window& target, const Packet& p);                  // an XDND message to the root or the source window: handled (true)
+  bool xdnd_selection_notify(Window& target, const Packet& p);                // the answer to the server's own request for a client's drag data
+  bool xdnd_convert(Client& c, Window& requestor, uint32_t selection, uint32_t target, uint32_t property, uint32_t time);      // ConvertSelection of the server's drag
+  void xdnd_client_gone(uint8_t client);
+  void send_client_message5(Window& w, uint32_t type, const uint32_t (&data)[5]);
+  void out_drag_position();
+  void out_drag_leave();
+  void out_drag_reset();
+  void in_drag_reset();
+  void in_drag_status();
+  void in_drag_finish(bool taken);
+  void in_drag_read(ConstByteView data);
   StringView atom_name(uint32_t atom) const;
   uint32_t now();
 
@@ -372,7 +410,7 @@ class Server final : public desktop::IWindowsSession {
   // the screen and the desktop
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
-    Rect rect, work;
+    Rect rect, work, panel;      // panel: the work area without what windows reserve (where panels are placed)
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 0;
@@ -381,6 +419,8 @@ class Server final : public desktop::IWindowsSession {
   List<Change> changes_;
   bool changes_overflow_ = false;
   uint32_t drag_window_ = 0, drag_edge_ = 0;
+  uint32_t menu_window_ = 0;      // _GTK_SHOW_WINDOW_MENU of a top-level, until the desktop takes it
+  int32_t menu_x_ = 0, menu_y_ = 0;
   uint32_t place_counter_ = 0;
   uint32_t next_icon_ = 0x80000001u;
   // focus and input
@@ -395,6 +435,38 @@ class Server final : public desktop::IWindowsSession {
   Grab pointer_grab_, keyboard_grab_;
   uint32_t last_time_ = 0;
   uint64_t fake_clock_ = 0;
+  // XInput 2 touches the desktop handed the server (its contact id, the XI touch id, the window and client that own it)
+  struct XiTouchSlot {
+    bool live = false;
+    uint32_t desktop_id = 0, touch_id = 0, window = 0;
+    uint8_t client = 0;
+    uint16_t device = 0;
+  };
+  static constexpr uint32_t kMaxXiTouches = 16;
+  XiTouchSlot xi_touches_[kMaxXiTouches];
+  uint32_t next_xi_touch_ = 1;
+  void xi_touch_event(uint16_t type, const XiTouchSlot& t, int32_t x, int32_t y);
+  // drag and drop (XDND): its atoms
+  struct XdndAtoms {
+    uint32_t aware = 0, enter = 0, position = 0, status = 0, leave = 0, drop = 0, finished = 0, selection = 0, action_copy = 0, type_list = 0;
+    uint32_t uri_list = 0, text_plain = 0, text_utf8 = 0, targets = 0, data = 0, incr = 0, utf8 = 0;
+  } xa_;
+  // the desktop's drag into a client (the server is the source; its window is wm_check_)
+  struct OutDrag {
+    bool active = false, accepted = false, waiting = false, pending = false, dropped = false;
+    uint32_t target = 0, version = 0;
+    int32_t x = 0, y = 0;
+  } out_drag_;
+  String out_text_, out_uri_, out_linux_;
+  // a client's drag over the desktop (the root is its target)
+  struct InDrag {
+    bool active = false, uri = false, asked = false, read = false, dropped = false, ready = false, given = false;
+    uint8_t client = 0;
+    uint32_t source = 0, version = 0, type = 0;
+    int32_t x = 0, y = 0;
+    int8_t answer = -1;           // the desktop's last answer (-1 none)
+  } in_drag_;
+  String in_text_;
 };
 
 }  // namespace x11

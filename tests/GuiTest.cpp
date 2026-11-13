@@ -26,6 +26,7 @@
 #include <map>
 #include <vector>
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -561,6 +562,155 @@ struct FakeMouse final : hardware::IMouse {
   void move(int32_t dx, int32_t dy, uint8_t buttons) { events[tail++] = {dx, dy, 0, buttons, false, 0, 0, 0, 0}; }
   void at(uint32_t x, uint32_t y, uint8_t buttons) { events[tail++] = {0, 0, 0, buttons, true, x, y, 32767, 32767}; }
 };
+
+// A touchscreen whose range is the screen's pixels (max 799 x 599), so a contact lands on the pixel it names.
+struct FakeTouch final : hardware::ITouch {
+  std::vector<hardware::TouchEvent> events;
+  bool emulation = true;
+  const char* name() const override { return "fake touch"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool poll(hardware::TouchEvent* out) override {
+    if (events.empty()) return false;
+    *out = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  void set_pointer_emulation(bool on) override { emulation = on; }
+  void put(hardware::TouchPhase phase, uint32_t id, uint32_t x, uint32_t y, uint32_t mx = 799, uint32_t my = 599) {
+    hardware::TouchEvent e;
+    e.phase = phase, e.id = id, e.x = x, e.y = y, e.max_x = mx, e.max_y = my;
+    events.push_back(e);
+  }
+};
+
+// A pen whose range is the screen's pixels.
+struct FakePen final : hardware::IPen {
+  std::vector<hardware::PenEvent> events;
+  const char* name() const override { return "fake pen"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool poll(hardware::PenEvent* out) override {
+    if (events.empty()) return false;
+    *out = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  uint32_t max_x() const override { return 799; }
+  uint32_t max_y() const override { return 599; }
+  uint16_t max_pressure() const override { return 1000; }
+  bool has_tilt() const override { return true; }
+  void put(bool in_range, bool tip, uint32_t x, uint32_t y, uint8_t buttons = 0, uint16_t pressure = 0, uint32_t mx = 799, uint32_t my = 599) {
+    hardware::PenEvent e;
+    e.in_range = in_range, e.tip = tip, e.x = x, e.y = y, e.buttons = buttons, e.pressure = pressure, e.max_pressure = 1000, e.max_x = mx, e.max_y = my;
+    events.push_back(e);
+  }
+};
+
+// Pens in the input pump: offered to the tap first; one it does not take is the pointer (the tip the left button, the barrel the right one).
+struct PenTapLog {
+  int calls = 0;
+  bool take = false;
+  static bool tap(void* self, const hardware::PenEvent&, int32_t, int32_t) {
+    auto* l = static_cast<PenTapLog*>(self);
+    ++l->calls;
+    return l->take;
+  }
+};
+
+static void test_input_pump_pen() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    Button b(a);
+    b.set_bounds({10, 10, 60, 30});
+    w.add(&b);
+    w.layout();
+    Counter clicks;
+    b.on_click(clicks.handler());
+    FakePen pen;
+    PenTapLog log;
+    InputPump pump(w, nullptr, nullptr);
+    pump.set_pen(&pen, &PenTapLog::tap, &log);
+    // hovering moves the pointer; the tip on the button and lifted clicks it
+    pen.put(true, false, 150, 80, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 150 && pump.cursor().y == 80 && clicks.count == 0);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pen.put(true, true, 20, 20, 0, 500, 199, 99);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && log.calls == 4);
+    // the same report again: nothing for the pointer (no move, no click)
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1);
+    // taken by a program: the pointer does not move
+    log.take = true;
+    pen.put(true, true, 100, 50, 0, 500, 199, 99);
+    pen.put(true, false, 100, 50, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 20 && clicks.count == 1);
+  }
+  CHECK(a.live == 0);
+}
+
+// Touches in the input pump: the tap is asked first; a contact it does not take is the left button where it is (one at a time).
+struct TouchTapLog {
+  std::vector<std::string> calls;
+  uint32_t take_id = 999;
+  static bool tap(void* self, const hardware::TouchEvent& e, int32_t x, int32_t y) {
+    auto* l = static_cast<TouchTapLog*>(self);
+    l->calls.push_back(std::to_string(int(e.phase)) + " " + std::to_string(e.id) + " " + std::to_string(x) + " " + std::to_string(y));
+    return e.id == l->take_id;
+  }
+};
+
+static void test_input_pump_touch() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    Button b(a);
+    b.set_bounds({10, 10, 60, 30});
+    w.add(&b);
+    w.layout();
+    Counter clicks;
+    b.on_click(clicks.handler());
+    FakeTouch touch;
+    TouchTapLog log;
+    InputPump pump(w, nullptr, nullptr);
+    pump.set_touch(&touch, &TouchTapLog::tap, &log);
+    // a finger on the button, lifted: a click there; the tap was asked each time, in window coordinates
+    touch.put(hardware::TouchPhase::Down, 1, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 1, 20, 20, 199, 99);
+    CHECK(pump.pump() == 2);
+    CHECK(clicks.count == 1 && pump.cursor().x == 20 && pump.cursor().y == 20);
+    CHECK(log.calls.size() == 2 && log.calls[0] == "0 1 20 20" && log.calls[1] == "2 1 20 20");
+    // a second finger while the first is down: not the button (only the first finger is)
+    touch.put(hardware::TouchPhase::Down, 2, 150, 80, 199, 99);
+    touch.put(hardware::TouchPhase::Down, 3, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 3, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 2, 150, 80, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && pump.cursor().x == 150);
+    // a finger the tap takes: no pointer at all
+    log.take_id = 4;
+    touch.put(hardware::TouchPhase::Down, 4, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Up, 4, 20, 20, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && pump.cursor().x == 150);
+    // cancel lets the button go where the finger was (a mouse has no cancel: for the button it is a release, so a click)
+    touch.put(hardware::TouchPhase::Down, 5, 20, 20, 199, 99);
+    touch.put(hardware::TouchPhase::Cancel, 5, 20, 20, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 2);
+  }
+  CHECK(a.live == 0);
+}
 
 static void test_input_pump() {
   TestAllocator a;
@@ -1438,6 +1588,9 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   uint32_t monitor_count = 0;
   uint32_t drag_window = 0, drag_edge = 0;
   uint32_t take_drag(uint32_t* edge) override { const uint32_t w = drag_window; *edge = drag_edge; drag_window = drag_edge = 0; return w; }
+  uint32_t menu_window = 0;
+  int32_t menu_x = 0, menu_y = 0;
+  uint32_t take_window_menu(int32_t* x, int32_t* y) override { const uint32_t w = menu_window; *x = menu_x; *y = menu_y; menu_window = 0; return w; }
   Pointer ptr;
   void pointer(Pointer* out) override { *out = ptr; }
   // cursor 50: a 2 x 2 picture; icon 60: a 16 x 16 red one; anything else a system shape
@@ -1498,7 +1651,69 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   void mouse_motion(int32_t dx, int32_t dy) override { note("motion", dx, dy); cx += dx; cy += dy; clamp(); }
   void mouse_position(int32_t x, int32_t y) override { note("position", x, y); cx = x; cy = y; clamp(); }
   void mouse_button(uint32_t button, bool down) override { note("button", int32_t(button), down); }
+  bool take_touches = false, take_pens = false;
+  bool pen(const desktop::PenInput& p) override {
+    if (!take_pens) return false;
+    log.push_back("pen " + std::to_string(p.in_range) + " " + std::to_string(p.tip) + " " + std::to_string(p.window) + " " + std::to_string(p.x) + " " +
+                  std::to_string(p.y) + " " + std::to_string(p.pressure));
+    return true;
+  }
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override {
+    if (phase == hardware::TouchPhase::Down && !take_touches) return false;
+    log.push_back("touch " + std::to_string(int(phase)) + " " + std::to_string(id) + " " + std::to_string(window) + " " + std::to_string(x) + " " + std::to_string(y));
+    return true;
+  }
   void mouse_wheel(int32_t notches) override { note("wheel", notches, 0); }
+  // text input: window `text_window` takes composed text while text_on
+  bool text_on = false;
+  uint32_t text_window = 0;
+  bool text_input(TextInputState* out) override {
+    *out = TextInputState();
+    if (!text_on) return false;
+    out->enabled = true;
+    out->window = text_window;
+    return true;
+  }
+  bool text_preedit(StringView t, uint32_t cursor) override {
+    if (!text_on) return false;
+    log.push_back("preedit '" + std::string(t.data() ? t.data() : "", t.size()) + "' " + std::to_string(cursor));
+    return true;
+  }
+  bool text_commit(StringView t) override {
+    if (!text_on) return false;
+    log.push_back("commit '" + std::string(t.data(), t.size()) + "'");
+    return true;
+  }
+  // drags with the desktop: the program takes the desktop's drag while take_drags; program_drop is a drag a program let go over the desktop
+  bool take_drags = false;
+  std::string program_drop;
+  int32_t program_x = 0, program_y = 0;
+  bool desktop_drag(uint32_t w, int32_t x, int32_t y, StringView t) override {
+    log.push_back("ddrag " + std::to_string(w) + " " + std::to_string(x) + " " + std::to_string(y) + " " + std::string(t.data() ? t.data() : "", t.size()));
+    return take_drags && w != 0;
+  }
+  bool desktop_drop() override { log.push_back("ddrop"); return take_drags; }
+  void desktop_drag_end() override { log.push_back("dend"); }
+  bool take_program_drop(String* text, int32_t* x, int32_t* y) override {
+    if (program_drop.empty()) return false;
+    text->assign(StringView(program_drop.c_str()));
+    *x = program_x;
+    *y = program_y;
+    program_drop.clear();
+    return true;
+  }
+  void program_drop_done(bool taken) override { log.push_back(std::string("program_drop_done ") + (taken ? "1" : "0")); }
+  // program_drag: a program's drag over the desktop (not let go yet)
+  std::string program_drag_items;
+  int32_t drag_x = 0, drag_y = 0;
+  bool program_drag(String* text, int32_t* x, int32_t* y) override {
+    if (program_drag_items.empty()) return false;
+    text->assign(StringView(program_drag_items.c_str()));
+    *x = drag_x;
+    *y = drag_y;
+    return true;
+  }
+  void program_drag_answer(bool would_take) override { log.push_back(std::string("answer ") + (would_take ? "1" : "0")); }
   void cursor(int32_t* x, int32_t* y) override { *x = cx; *y = cy; }
   bool cursor_confined() override { return confined; }
   uint32_t capture_window() override { return 0; }
@@ -1508,6 +1723,506 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
     cy = cy < 120 ? 120 : cy > 140 ? 140 : cy;
   }
 };
+
+// Layers (Frame::Layer): bands of the stack that raising never crosses, and edges windows reserve out of the work areas.
+static void test_windows_layers() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  Theme theme;
+  Window w(a, screen.renderer, theme, {800, 600});
+  WindowManager mgr(a);
+  mgr.set_dock(DockStyle::Fill);
+  w.add(&mgr);
+  w.layout();
+  Frame back(a), normal1(a), normal2(a), panel(a), overlay(a);
+  back.set_layer(Frame::Layer::Background);
+  back.set_decorated(false);
+  back.set_activatable(false);
+  back.set_bounds({0, 0, 800, 600});
+  normal1.set_bounds({50, 50, 300, 200});
+  normal2.set_bounds({100, 80, 300, 200});
+  panel.set_layer(Frame::Layer::Top);
+  panel.set_decorated(false);
+  panel.set_activatable(false);
+  panel.set_bounds({0, 0, 800, 30});
+  overlay.set_layer(Frame::Layer::Overlay);
+  overlay.set_decorated(false);
+  overlay.set_bounds({300, 200, 200, 100});
+  // added in a muddled order: the bands hold whatever came last
+  CHECK(mgr.add_window(&panel) && mgr.add_window(&normal1) && mgr.add_window(&back) && mgr.add_window(&overlay) && mgr.add_window(&normal2));
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.stacking_index(&normal1) == 1 && mgr.stacking_index(&normal2) == 2 && mgr.stacking_index(&panel) == 3 &&
+        mgr.stacking_index(&overlay) == 4);
+  CHECK(mgr.active() == &normal2);
+  // raising a normal window keeps it under the panel; a click on the background does not bring it up
+  mgr.activate(&normal1);
+  CHECK(mgr.stacking_index(&normal1) == 2 && mgr.stacking_index(&panel) == 3);
+  click(w, 700, 500);
+  CHECK(mgr.stacking_index(&back) == 0 && mgr.active() == &normal1);
+  CHECK(w.hit_test(400, 10) == &panel && w.hit_test(400, 250) == &overlay);
+  // a program's own order (place_next_to) cannot take a window out of its band
+  mgr.place_next_to(&normal2, &overlay, true);
+  CHECK(mgr.stacking_index(&normal2) <= 2 && mgr.stacking_index(&panel) == 3 && mgr.stacking_index(&overlay) == 4);
+  // moving to another band re-sorts
+  normal2.set_layer(Frame::Layer::Overlay);
+  CHECK(mgr.stacking_index(&normal2) >= 3 && mgr.stacking_index(&panel) == 2);
+  normal2.set_layer(Frame::Layer::Normal);
+  CHECK(mgr.stacking_index(&panel) == 3);
+  // layered windows are placed where they are said to be: not kept inside, not cycled
+  panel.set_bounds({0, -5, 800, 30});
+  w.layout();
+  CHECK(panel.bounds().y == -5);
+  panel.set_bounds({0, 0, 800, 30});
+  for (int i = 0; i < 4; ++i) {
+    mgr.cycle(true);
+    CHECK(mgr.active() == &normal1 || mgr.active() == &normal2);
+  }
+  // reserving: the top panel keeps 30 pixels; maximized windows and the areas leave it out
+  const uint32_t serial = mgr.reserve_serial();
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 600);
+  panel.set_reserve(Frame::Edge::Top, 30);
+  CHECK(mgr.reserve_serial() != serial);
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 570 && mgr.full_area(0).y == 0 && mgr.full_area(0).height == 600);
+  mgr.maximize(&normal1);
+  CHECK(normal1.bounds().y == 30 && normal1.bounds().height == 570);
+  // a second reservation on another edge, then the panel hidden: the space comes back and the maximized window follows
+  Frame dock(a);
+  dock.set_layer(Frame::Layer::Bottom);
+  dock.set_decorated(false);
+  dock.set_bounds({0, 560, 800, 40});
+  dock.set_reserve(Frame::Edge::Bottom, 40);
+  CHECK(mgr.add_window(&dock));
+  CHECK(mgr.area(0).y == 30 && mgr.area(0).height == 530 && normal1.bounds().height == 530);
+  CHECK(mgr.stacking_index(&dock) == 1);      // (above the background, below the normal windows)
+  mgr.remove_window(&panel);
+  CHECK(mgr.area(0).y == 0 && mgr.area(0).height == 560 && normal1.bounds().y == 0 && normal1.bounds().height == 560);
+  mgr.minimize(&dock);
+  CHECK(mgr.area(0).height == 600);
+  mgr.activate(&dock);
+  CHECK(mgr.area(0).height == 560);
+  // several areas: a reservation counts only on the area it is on
+  const Rect2D areas[2] = {{0, 0, 400, 600}, {400, 0, 400, 600}};
+  mgr.set_areas(areas, 2);
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 560);      // (the dock spans both)
+  dock.set_bounds({0, 560, 400, 40});
+  CHECK(mgr.area(0).height == 560 && mgr.area(1).height == 600);
+  // more than the area: a pixel is left
+  dock.set_reserve(Frame::Edge::Bottom, 5000);
+  CHECK(mgr.area(0).height == 1 && mgr.area(0).y == 0);
+  dock.set_reserve(Frame::Edge::None, 0);
+  CHECK(mgr.area(0).height == 600);
+  mgr.remove_window(&dock);
+  mgr.remove_window(&back);
+  mgr.remove_window(&overlay);
+  mgr.remove_window(&normal1);
+  mgr.remove_window(&normal2);
+}
+
+// The input method (Desktop/Win32Windows.cpp): Unicode entry into a window that takes composed text. Ctrl+Shift+U, hex digits, Space puts the character in;
+// Backspace takes a digit back, Escape gives up; the keys it takes never reach the program; without a window taking text, the keys are the program's.
+static void test_windows_text_input() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  FakeKeyboard kb;
+  FakeMouse mouse;
+  FakeWindowsSession s(a);
+  desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+  d.set_windows_session(&s);
+  d.step(0);
+  s.add(7, true, {100, 80, 200, 150}, "Editor", true);
+  d.step(1000);
+  auto press = [&](uint8_t usage) { kb.push(usage, true); kb.push(usage, false); };
+  auto unicode = [&]() {
+    kb.mods = hardware::modifier::kLeftControl | hardware::modifier::kLeftShift;
+    kb.push(key::kLeftControl, true);
+    kb.push(key::kLeftShift, true);
+    press(key::kA + 20);      // U
+    kb.push(key::kLeftShift, false);
+    kb.push(key::kLeftControl, false);
+    kb.mods = 0;
+  };
+  auto events = [&](const char* prefix) {
+    std::vector<std::string> out;
+    for (const std::string& e : s.log) if (e.rfind(prefix, 0) == 0) out.push_back(e);
+    return out;
+  };
+  auto keys_of = [&](int usage) {
+    int n = 0;
+    for (const std::string& e : s.log) if (e.rfind("key " + std::to_string(usage) + " ", 0) == 0) ++n;
+    return n;
+  };
+  // no window takes text: Ctrl+Shift+U is an ordinary key for the program
+  s.log.clear();
+  unicode();
+  d.step(2000);
+  CHECK(keys_of(key::kA + 20) == 2 && events("preedit").empty());
+  // U+00E9: "u", "ue", "ue9", then Space commits "é"; none of those keys reach the program, the modifiers do
+  s.text_on = true;
+  s.text_window = 7;
+  s.log.clear();
+  unicode();
+  press(key::kA + 4);      // e
+  press(key::k1 + 8);      // 9
+  press(key::kSpace);
+  d.step(3000);
+  std::vector<std::string> pre = events("preedit"), com = events("commit");
+  CHECK(pre.size() == 3 && pre[0] == "preedit 'u' 1" && pre[1] == "preedit 'ue' 2" && pre[2] == "preedit 'ue9' 3");
+  CHECK(com.size() == 1 && com[0] == "commit '\xc3\xa9'");
+  CHECK(keys_of(key::kA + 20) == 0 && keys_of(key::kA + 4) == 0 && keys_of(key::kSpace) == 0 && keys_of(key::kLeftControl) == 2);
+  // an emoji (U+1F600), with a digit taken back
+  s.log.clear();
+  unicode();
+  for (uint8_t k : {uint8_t(key::k1), uint8_t(key::kA + 5), uint8_t(key::k1 + 5), uint8_t(key::k1 + 6), uint8_t(key::kBackspace), uint8_t(0x27), uint8_t(0x27)})
+    press(k);      // 1 f 6 7 <- 0 0
+  press(key::kEnter);
+  d.step(4000);
+  com = events("commit");
+  CHECK(com.size() == 1 && com[0] == "commit '\xf0\x9f\x98\x80'");
+  CHECK(keys_of(key::kEnter) == 0 && keys_of(key::kBackspace) == 0);
+  // Escape gives up (and is taken); another key gives up and goes on to the program
+  s.log.clear();
+  unicode();
+  press(key::kA + 1);
+  press(key::kEscape);
+  press(key::kA + 1);      // b, typed now
+  d.step(5000);
+  pre = events("preedit");
+  CHECK(events("commit").empty() && !pre.empty() && pre.back() == "preedit '' 0" && keys_of(key::kEscape) == 0 && keys_of(key::kA + 1) == 2);
+  s.log.clear();
+  unicode();
+  press(key::kA + 2);      // c
+  press(key::kA + 22);     // w: not a hex digit
+  d.step(6000);
+  CHECK(events("commit").empty() && keys_of(key::kA + 22) == 2 && events("preedit").back() == "preedit '' 0");
+  // a code point that is no character (a surrogate) is not put in; nothing typed is not either
+  s.log.clear();
+  unicode();
+  for (uint8_t k : {uint8_t(key::kA + 3), uint8_t(key::k1 + 7), uint8_t(0x27), uint8_t(0x27)}) press(k);      // d800
+  press(key::kSpace);
+  unicode();
+  press(key::kSpace);
+  d.step(7000);
+  CHECK(events("commit").empty());
+  // the window stops taking text while composing: the next key is the program's
+  s.log.clear();
+  unicode();
+  press(key::k1);
+  d.step(8000);
+  s.text_on = false;
+  press(key::k1 + 1);
+  d.step(9000);
+  CHECK(keys_of(key::k1 + 1) == 2 && keys_of(key::k1) == 0);
+}
+
+// Drag and drop: a control that starts a drag when the mouse moves with the button down, one that follows drags over it, and one that takes drops.
+struct DragSourceControl final : Control {
+  explicit DragSourceControl(allocators::IAllocator& a, const char* t) : Control(a), text(t) {}
+  const char* text;
+  bool down = false;
+  int ended = 0;
+  void on_mouse_down(const MouseArgs&) override { down = true; }
+  void on_mouse_up(const MouseArgs&) override { down = false; }
+  void on_mouse_move(const MouseArgs&) override { if (down && window() && !window()->dragging()) window()->begin_drag(this, StringView(text)); }
+  void on_drag_ended(bool, int32_t, int32_t) override { ++ended; }
+};
+struct DragTracker final : Control {
+  DragTracker(allocators::IAllocator& a, std::vector<std::string>* l, bool track) : Control(a), log(l), track(track) {}
+  std::vector<std::string>* log;
+  bool track, accept = false;
+  bool tracks_drag() const override { return track; }
+  void on_drag_over(StringView t, int32_t x, int32_t y, const Control*) override {
+    log->push_back("over " + std::string(t.data(), t.size()) + " " + std::to_string(x) + " " + std::to_string(y));
+  }
+  void on_drag_leave() override { log->push_back("leave"); }
+  bool accepts_drop(StringView, int32_t, int32_t, const Control*) const override { return accept; }
+  void on_drop(StringView t, int32_t, int32_t, const Control* source) override {
+    log->push_back("drop " + std::string(t.data(), t.size()) + (source ? " from a control" : " from nowhere"));
+  }
+};
+
+static void test_drag_tracking() {
+  TestAllocator a;
+  Screen screen(a, 400, 300);
+  Theme theme;
+  Window w(a, screen.renderer, theme, {400, 300});
+  std::vector<std::string> log;
+  DragSourceControl source(a, "/Desktop/a.txt");
+  DragTracker tracker(a, &log, true), other(a, &log, false);
+  source.set_bounds({0, 0, 100, 100});
+  tracker.set_bounds({200, 0, 100, 100});
+  other.set_bounds({200, 150, 100, 100});
+  w.add(&source);
+  w.add(&tracker);
+  w.add(&other);
+  w.layout();
+  // over the tracker it hears where; away it hears it left; back, released over it while it takes drops: dropped, no leave
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  CHECK(w.dragging());
+  w.mouse_move(250, 40);
+  w.mouse_move(260, 45);
+  w.mouse_move(250, 200);
+  CHECK((log == std::vector<std::string>{"over /Desktop/a.txt 50 40", "over /Desktop/a.txt 60 45", "leave"}));
+  log.clear();
+  tracker.accept = true;
+  w.mouse_move(210, 10);
+  w.mouse_button(210, 10, MouseButton::Left, false);      // (no handler thread: the drop runs at once)
+  CHECK((log == std::vector<std::string>{"over /Desktop/a.txt 10 10", "over /Desktop/a.txt 10 10", "drop /Desktop/a.txt from a control"}));
+  CHECK(source.ended == 1 && !w.dragging());
+  // released over it while it does not take it: it hears the drag left
+  log.clear();
+  tracker.accept = false;
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  w.mouse_move(210, 10);
+  w.mouse_button(210, 10, MouseButton::Left, false);
+  CHECK(!log.empty() && log.back() == "leave");
+  // Escape cancels: left too
+  log.clear();
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  w.mouse_move(210, 10);
+  KeyArgs esc;
+  esc.usage = hardware::key::kEscape;
+  w.key(esc);
+  CHECK(!w.dragging() && !log.empty() && log.back() == "leave");
+  w.mouse_button(210, 10, MouseButton::Left, false);
+  // drop_at: a drop with no drag and no source, to whoever takes it
+  log.clear();
+  tracker.accept = true;
+  CHECK(w.drop_at(250, 50, "/Linux/root/x.txt"));
+  CHECK(!log.empty() && log.back() == "drop /Linux/root/x.txt from nowhere" && !w.drop_pending());
+  CHECK(!w.drop_at(250, 200, "x") && !w.drop_at(250, 50, StringView()));      // (nobody there takes drops; nothing to drop)
+  // outside_drag_at: a drag with no source shown over the window; the answer is whether the control there would take it, nothing is dropped
+  log.clear();
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt") && w.outside_dragging());
+  CHECK((log == std::vector<std::string>{"over /Desktop/b.txt 50 50"}));
+  tracker.accept = false;
+  CHECK(!w.outside_drag_at(260, 50, "/Desktop/b.txt"));
+  CHECK(!w.outside_drag_at(250, 200, "/Desktop/b.txt") && !log.empty() && log.back() == "leave");      // (over a control that does not follow drags)
+  tracker.accept = true;
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt", "b.txt (+1)"));
+  log.clear();
+  w.outside_drag_end();
+  CHECK(!w.outside_dragging() && (log == std::vector<std::string>{"leave"}));
+  CHECK(!w.outside_drag_at(250, 50, StringView()));
+  // the window's own drag wins over one from outside, which is refused while it runs
+  CHECK(w.outside_drag_at(250, 50, "/Desktop/b.txt"));
+  w.mouse_button(50, 50, MouseButton::Left, true);
+  w.mouse_move(55, 50);
+  CHECK(w.dragging() && !w.outside_dragging() && !w.outside_drag_at(250, 50, "/Desktop/b.txt"));
+  w.mouse_button(250, 50, MouseButton::Left, false);
+}
+
+// The desktop's drags over a program's window go to its session (desktop_drag / desktop_drop), never to the program as mouse input; a program's drag let
+// go over the desktop is dropped, item by item, on the desktop's window under it.
+static void test_windows_drag_bridge() {
+  TestAllocator a;
+  Screen screen(a, 800, 600);
+  FakeKeyboard kb;
+  FakeMouse mouse;
+  FakeWindowsSession s(a);
+  desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+  d.set_windows_session(&s);
+  gui::WindowManager& wm = d.windows();
+  d.step(0);
+  const Point mo = wm.window_origin();
+  s.add(7, false, {400, 100, 200, 150}, "Program", true);
+  std::vector<std::string> log;
+  Frame from(a), to(a);
+  DragSourceControl source(a, "/Desktop/Documents/a.txt");
+  DragTracker sink(a, &log, false);
+  sink.accept = true;
+  source.set_dock(DockStyle::Fill);
+  sink.set_dock(DockStyle::Fill);
+  from.add(&source);
+  to.add(&sink);
+  from.set_bounds({20, 20, 200, 150});
+  to.set_bounds({20, 300, 200, 150});
+  CHECK(wm.add_window(&from) && wm.add_window(&to));
+  d.step(1000);
+  // (absolute pointer positions: the screen's pixels in 0..32767)
+  auto at = [&](int32_t x, int32_t y, uint8_t buttons) { mouse.at(uint32_t((mo.x + x) * 32768 / 800), uint32_t((mo.y + y) * 32768 / 600), buttons); };
+  mouse.absolute = true;
+  s.take_drags = true;
+  s.log.clear();
+  const Rect2D sb = source.bounds();
+  const Point sp = source.window_origin();
+  const int32_t sx = sp.x - mo.x + int32_t(sb.width) / 2, sy = sp.y - mo.y + int32_t(sb.height) / 2;
+  at(sx, sy, 0);
+  at(sx, sy, hardware::mouse_button::kLeft);
+  at(sx + 12, sy + 3, hardware::mouse_button::kLeft);
+  at(500, 170, hardware::mouse_button::kLeft);
+  at(505, 172, hardware::mouse_button::kLeft);
+  at(505, 172, 0);
+  for (int i = 0; i < 6; ++i) d.step(2000 + i * 20);
+  std::vector<std::string> drags;
+  bool buttons = false;
+  for (const std::string& e : s.log) {
+    if (e.rfind("ddrag", 0) == 0 || e == "ddrop" || e == "dend") drags.push_back(e);
+    if (e.rfind("button", 0) == 0) buttons = true;
+  }
+  CHECK(drags.size() >= 2 && drags[0].rfind("ddrag 7 ", 0) == 0 && drags[0].find(" /Desktop/Documents/a.txt") != std::string::npos);
+  CHECK(!drags.empty() && drags.back() == "ddrop");
+  CHECK(!buttons);      // (the program never saw the desktop's drag as its mouse)
+  // the program does not take it: the drag over it ends unused
+  s.take_drags = false;
+  s.log.clear();
+  mouse.head = mouse.tail = 0;
+  at(sx, sy, 0);
+  at(sx, sy, hardware::mouse_button::kLeft);
+  at(sx + 12, sy + 3, hardware::mouse_button::kLeft);
+  at(500, 170, hardware::mouse_button::kLeft);
+  at(500, 170, 0);
+  for (int i = 0; i < 6; ++i) d.step(3000 + i * 20);
+  bool ended = false, dropped = false;
+  for (const std::string& e : s.log) ended |= e == "dend", dropped |= e == "ddrop";
+  CHECK(ended && !dropped);
+  // a program's drag let go over the desktop's window: each item dropped there; the session told something took it
+  const Point tp = sink.window_origin();
+  s.program_drop = "/Desktop/Documents/a b.txt\n/Linux/root/x.txt";
+  s.program_x = tp.x - mo.x + 30;
+  s.program_y = tp.y - mo.y + 30;
+  s.log.clear();
+  for (int i = 0; i < 8; ++i) d.step(4000 + i * 20);
+  CHECK((log == std::vector<std::string>{"drop /Desktop/Documents/a b.txt from nowhere", "drop /Linux/root/x.txt from nowhere"}));
+  bool done = false;
+  for (const std::string& e : s.log) done |= e == "program_drop_done 1";
+  CHECK(done);
+  // over nothing that takes it: told so
+  s.program_drop = "/x";
+  s.program_x = 700;
+  s.program_y = 500;
+  s.log.clear();
+  for (int i = 0; i < 4; ++i) d.step(5000 + i * 20);
+  done = false;
+  for (const std::string& e : s.log) done |= e == "program_drop_done 0";
+  CHECK(done);
+  // a program's drop on another program's window: that program's session is asked then (no drag went before it) and takes it
+  s.take_drags = true;
+  s.program_drop = "/Desktop/Documents/c.txt";
+  s.program_x = 450;
+  s.program_y = 160;
+  s.log.clear();
+  log.clear();
+  for (int i = 0; i < 4; ++i) d.step(5500 + i * 20);
+  {
+    bool asked = false, dropped_there = false, told = false;
+    for (const std::string& e : s.log) {
+      asked |= e.rfind("ddrag 7 ", 0) == 0 && e.find("/Desktop/Documents/c.txt") != std::string::npos;
+      dropped_there |= e == "ddrop";
+      told |= e == "program_drop_done 1";
+    }
+    CHECK(asked && dropped_there && told && log.empty());
+  }
+  s.take_drags = false;
+  // a program's drag over the desktop before it is let go: shown on the desktop's window, and the program hears whether what is under it would take it
+  gui::Window* dw = wm.window();
+  s.program_drag_items = "/Desktop/Documents/a b.txt\n/Linux/root/x.txt";
+  s.drag_x = tp.x - mo.x + 30;
+  s.drag_y = tp.y - mo.y + 30;
+  s.log.clear();
+  log.clear();
+  for (int i = 0; i < 2; ++i) d.step(6000 + i * 20);
+  CHECK(dw && dw->outside_dragging());
+  CHECK(!s.log.empty() && s.log.back() == "answer 1");
+  bool dropped_early = false;
+  for (const std::string& e : log) dropped_early |= e.rfind("drop", 0) == 0;
+  CHECK(!dropped_early);
+  s.drag_x = 700;
+  s.drag_y = 500;
+  s.log.clear();
+  d.step(6100);
+  CHECK(!s.log.empty() && s.log.back() == "answer 0" && dw->outside_dragging());
+  s.program_drag_items.clear();
+  d.step(6200);
+  CHECK(!dw->outside_dragging());
+  wm.remove_window(&from);
+  wm.remove_window(&to);
+}
+
+// Touches over a program's window: a session that takes them gets the contact (with the window and the programs' coordinates) to its end; one that does
+// not has the pointer moved and pressed for it; the devices stop emulating a mouse once the desktop reads them.
+static void test_windows_touch() {
+  TestAllocator a;
+  {
+    Screen screen(a, 800, 600);
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeTouch touch;
+    FakeWindowsSession s(a);
+    desktop::Desktop d(a, screen.renderer, &kb, &mouse);
+    d.set_windows_session(&s);
+    d.set_touch(&touch);
+    CHECK(!touch.emulation);
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    const Point mo = wm.window_origin();
+    s.add(7, true, {100, 80, 200, 150}, "Notepad", true);
+    d.step(1000);
+    s.log.clear();
+    // taken: Down names window 7, Motion and Up follow (also outside the window)
+    s.take_touches = true;
+    touch.put(hardware::TouchPhase::Down, 1, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Motion, 1, uint32_t(mo.x + 500), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Up, 1, uint32_t(mo.x + 500), uint32_t(mo.y + 120));
+    d.step(2000);
+    std::vector<std::string> touches;
+    for (const std::string& e : s.log) if (e.rfind("touch", 0) == 0) touches.push_back(e);
+    CHECK(touches.size() == 3 && touches[0] == "touch 0 1 7 150 120" && touches[1] == "touch 1 1 0 500 120" && touches[2] == "touch 2 1 0 500 120");
+    bool pointer = false;
+    for (const std::string& e : s.log) pointer |= e.rfind("button", 0) == 0;
+    CHECK(!pointer);      // (no pointer emulation for a taken contact)
+    s.log.clear();
+    // refused: the pointer goes there and presses, as a mouse would
+    s.take_touches = false;
+    touch.put(hardware::TouchPhase::Down, 2, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    touch.put(hardware::TouchPhase::Up, 2, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    d.step(3000);
+    bool pressed = false, released = false;
+    for (const std::string& e : s.log) {
+      pressed |= e == "button 1 1";
+      released |= e == "button 1 0";
+    }
+    CHECK(pressed && released && d.pointer().x == mo.x + 150 && d.pointer().y == mo.y + 120);
+    // on the desktop (no program's window): the desktop's pointer, the session not asked
+    s.log.clear();
+    s.take_touches = true;
+    touch.put(hardware::TouchPhase::Down, 3, uint32_t(mo.x + 600), uint32_t(mo.y + 400));
+    touch.put(hardware::TouchPhase::Up, 3, uint32_t(mo.x + 600), uint32_t(mo.y + 400));
+    d.step(4000);
+    bool asked = false;
+    for (const std::string& e : s.log) asked |= e.rfind("touch", 0) == 0;
+    CHECK(!asked && d.pointer().x == mo.x + 600);
+
+    // pens: the pen mouse stops once the desktop reads the pens; a session that takes the pen gets it (the pressure scaled to 65535) until it leaves the
+    // range; one that does not has the pointer moved by it
+    FakePen pens;
+    hardware::CompositePen all_pens;
+    all_pens.add(&pens);
+    hardware::PenMouse pen_mouse(all_pens);
+    d.set_pens(&all_pens, &pen_mouse);
+    hardware::MouseEvent nothing;
+    pens.put(true, false, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    CHECK(!pen_mouse.poll(&nothing) && pens.events.size() == 1);      // (disabled: it leaves the pen's events alone)
+    s.log.clear();
+    s.take_pens = true;
+    pens.put(true, true, uint32_t(mo.x + 150), uint32_t(mo.y + 120), 0, 500);
+    pens.put(true, true, uint32_t(mo.x + 600), uint32_t(mo.y + 120), 0, 1000);      // (outside the window, still the session's)
+    pens.put(false, false, uint32_t(mo.x + 600), uint32_t(mo.y + 120));
+    d.step(5000);
+    std::vector<std::string> pen_log;
+    for (const std::string& e : s.log) if (e.rfind("pen", 0) == 0) pen_log.push_back(e);
+    CHECK(pen_log.size() == 4 && pen_log[0] == "pen 1 0 7 150 120 0" && pen_log[1] == "pen 1 1 7 150 120 32767" && pen_log[2] == "pen 1 1 0 600 120 65535" &&
+          pen_log[3] == "pen 0 0 0 600 120 0");
+    CHECK(d.pointer().x == mo.x + 600);      // (the pointer did not follow the pen)
+    s.take_pens = false;
+    pens.put(true, false, uint32_t(mo.x + 160), uint32_t(mo.y + 130));
+    d.step(6000);
+    CHECK(d.pointer().x == mo.x + 160 && d.pointer().y == mo.y + 130);
+    d.set_windows_session(nullptr);
+  }
+  CHECK(a.live == 0);
+}
 
 static void test_windows_screen() {
   TestAllocator a;
@@ -1736,6 +2451,24 @@ static void test_windows_more() {
     mouse.move(0, 0, 0);
     d.step(13000);
 
+    // the window menu the program asks for (its own title bar): the frame's, where it asked (client coordinates); Minimize there minimizes the window
+    CHECK(h8->window_menu() == nullptr || !h8->window_menu()->open());
+    s.menu_window = 8;
+    s.menu_x = 15;
+    s.menu_y = 4;
+    d.step(13100);
+    CHECK(h8->window_menu() && h8->window_menu()->open());
+    if (h8->window_menu() && d.window().popup()) {
+      const gui::Rect2D pop = d.window().popup()->bounds();
+      const gui::Point client = h8->view().window_origin();
+      CHECK(pop.x == client.x + 15 && pop.y == client.y + 4);
+      CHECK(!h8->window_menu()->find_item("Restore")->enabled() && h8->window_menu()->find_item("Close")->enabled());
+      d.window().close_popup();
+    }
+    s.menu_window = 99;      // (no such window: nothing opens)
+    d.step(13200);
+    CHECK(!d.window().popup());
+
     // the cursor the program shows over its windows
     CHECK(h8->picture_area(&pic));
     const desktop::Win32WindowView& view = h8->view();
@@ -1916,7 +2649,46 @@ static void test_x11_frames() {
   CHECK(a.live == 0);
 }
 
+// A window's frame tap: it is asked for each frame, and given exactly what was drawn (before present), only when it wants it.
+static void test_frame_tap() {
+  TestAllocator a;
+  Theme theme;
+  Screen screen(a, 64, 32);
+  Window w(a, screen.renderer, theme, {64, 32});
+  Panel fill(a);
+  fill.set_dock(DockStyle::Fill);
+  w.add(&fill);
+  struct Tap final : IFrameTap {
+    std::vector<uint32_t> buffer;
+    bool want = true;
+    int asked = 0, read = 0;
+    uint32_t w = 0, h = 0;
+    ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) override {
+      ++asked;
+      if (!want) return ArrayView<uint32_t>();
+      buffer.assign(size_t(width) * height, 0xDEADBEEF);
+      return ArrayView<uint32_t>(buffer.data(), buffer.size());
+    }
+    void frame_read(uint32_t width, uint32_t height) override { ++read; w = width; h = height; }
+  } tap;
+  w.set_frame_tap(&tap);
+  w.render();
+  CHECK(tap.asked == 1 && tap.read == 1 && tap.w == 64 && tap.h == 32);
+  bool same = tap.buffer.size() == 64 * 32;
+  for (uint32_t y = 0; y < 32 && same; ++y)
+    for (uint32_t x = 0; x < 64 && same; ++x) same = tap.buffer[size_t(y) * 64 + x] == screen.px(int32_t(x), int32_t(y));
+  CHECK(same);
+  tap.want = false;
+  w.invalidate();
+  w.render();
+  CHECK(tap.asked == 2 && tap.read == 1);
+  w.set_frame_tap(nullptr);
+  w.render();
+  CHECK(tap.asked == 2);
+}
+
 int main() {
+  test_frame_tap();
   test_dock_layout();
   test_uniform_panel();
   test_button_and_focus();
@@ -1925,16 +2697,23 @@ int main() {
   test_menu();
   test_rendering();
   test_input_pump();
+  test_input_pump_touch();
+  test_input_pump_pen();
   test_select_all_from_keyboard();
   test_desktop();
   test_desktop_monitors();
   test_clock();
   test_windows();
+  test_windows_layers();
+  test_windows_text_input();
+  test_drag_tracking();
+  test_windows_drag_bridge();
   test_modal_and_dialog();
   test_notice_dialog();
   test_switcher();
   test_desktop_toasts();
   test_windows_screen();
+  test_windows_touch();
   test_x11_frames();
   test_windows_more();
   test_font_unicode();

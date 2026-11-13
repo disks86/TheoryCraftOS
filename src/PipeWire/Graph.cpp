@@ -496,6 +496,15 @@ SharedPointer<VideoChannel> Graph::video_of(uint32_t node_id) {
   return node && node->type == ObjectType::Node ? node->video : SharedPointer<VideoChannel>();
 }
 
+bool Graph::video_producers(List<uint32_t>* out) {
+  out->clear();
+  kernel::ScopedMutex guard(mutex_);
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node && o->role == NodeRole::VideoStream && o->direction_of_node == kDirectionOutput && o->video && !out->push_back(o->id))
+      return false;
+  return true;
+}
+
 uint32_t Graph::video_watchers(uint32_t producer) {
   kernel::ScopedMutex guard(mutex_);
   GraphObject* node = find_locked(producer);
@@ -507,9 +516,9 @@ uint32_t Graph::video_watchers(uint32_t producer) {
 }
 
 uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, uint32_t channels, uint32_t rate) {
-  if (channels < 1 || channels > 2 || !clock_.set_up()) return 0;
-  // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; the node says the sink's own format)
-  SharedPointer<VirtualOutput> output = SharedPointer<VirtualOutput>::make(allocator_, allocator_, clock_);
+  if (channels < 1 || channels > 2 || rate < audio::StreamFormat::kMinRate || rate > audio::StreamFormat::kMaxRate || !clock_.set_up()) return 0;
+  // its mixer, over a silent device on the graph's clock (the mixer works at the speakers' 48 kHz stereo; its monitor is made the sink's own format)
+  SharedPointer<VirtualOutput> output = SharedPointer<VirtualOutput>::make(allocator_, allocator_, clock_, rate, channels);
   if (!output || !output->initialize()) return 0;
   kernel::ScopedMutex guard(mutex_);
   GraphObject* c = find_locked(client);
@@ -520,6 +529,9 @@ uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, ui
   GraphObject* node = add_media_node_locked(client, NodeRole::Virtual, props, "Audio/Sink", kDirectionInput);
   if (!node) return 0;
   const uint32_t id = node->id;
+  const StringView media_class = node->props.get("media.class");
+  const StringView source_class("Audio/Source");
+  node->virtual_source = media_class.size() >= source_class.size() && media_class.first(source_class.size()) == source_class;
   node->format = PcmFormat{SampleFormat::F32Le, rate, channels};
   node->state = kNodeStateIdle;
   node->virtual_output = output;
@@ -535,9 +547,9 @@ uint32_t Graph::create_virtual_node(uint32_t client, const Properties& props, ui
   for (uint32_t i = 0; i < channels && ok; ++i) {
     const char* side = channels == 1 ? "MONO" : (i == 0 ? "FL" : "FR");
     String in(allocator_), out(allocator_);
-    in.append("playback_");
+    in.append(node->virtual_source ? "input_" : "playback_");      // (as null-audio-sink names a source's ports)
     in.append(side);
-    out.append("monitor_");
+    out.append(node->virtual_source ? "capture_" : "monitor_");
     out.append(side);
     ok = add_port_locked(client, id, i, kDirectionInput, in.view(), "32 bit float mono audio", nullptr) &&
          add_port_locked(client, id, i, kDirectionOutput, out.view(), "32 bit float mono audio", nullptr);
@@ -572,13 +584,47 @@ bool Graph::virtual_sinks(List<uint32_t>* out) {
   out->clear();
   kernel::ScopedMutex guard(mutex_);
   for (const UniquePointer<GraphObject>& o : objects_.view())
-    if (o->type == ObjectType::Node && o->role == NodeRole::Virtual && !out->push_back(o->id)) return false;
+    if (o->type == ObjectType::Node && o->role == NodeRole::Virtual && !o->virtual_source && !out->push_back(o->id)) return false;
+  return true;
+}
+
+bool Graph::virtual_sources(List<uint32_t>* out) {
+  out->clear();
+  kernel::ScopedMutex guard(mutex_);
+  for (const UniquePointer<GraphObject>& o : objects_.view())
+    if (o->type == ObjectType::Node && o->role == NodeRole::Virtual && o->virtual_source && !out->push_back(o->id)) return false;
   return true;
 }
 
 bool Graph::is_virtual_sink(uint32_t node) {
   kernel::ScopedMutex guard(mutex_);
+  const GraphObject* o = find_locked(node);
+  return o && o->type == ObjectType::Node && o->role == NodeRole::Virtual && !o->virtual_source && o->virtual_output;
+}
+
+bool Graph::is_virtual_source(uint32_t node) {
+  kernel::ScopedMutex guard(mutex_);
+  const GraphObject* o = find_locked(node);
+  return o && o->type == ObjectType::Node && o->role == NodeRole::Virtual && o->virtual_source && o->virtual_output;
+}
+
+bool Graph::is_virtual(uint32_t node) {
+  kernel::ScopedMutex guard(mutex_);
   return virtual_output_locked(node).get() != nullptr;
+}
+
+void Graph::apply_record_gain_locked(GraphObject& record) {
+  // a record stream's own volume, times its virtual source's when it records one
+  if (!record.record) return;
+  float volume = record.volume;
+  bool mute = record.mute;
+  if (record.target)
+    if (const GraphObject* from = find_locked(record.target); from && from->role == NodeRole::Virtual && from->virtual_source) {
+      volume *= from->volume > 1.0f ? 1.0f : from->volume;
+      mute = mute || from->mute;
+    }
+  record.record->capture().set_gain(to_device_volume(volume));
+  record.record->capture().set_muted(mute);
 }
 
 uint32_t Graph::find_node(StringView target) {
@@ -613,7 +659,7 @@ bool Graph::snapshot(List<GraphEntry>* out) {
   kernel::ScopedMutex guard(mutex_);
   if (!out->reserve(objects_.count())) return false;
   for (const UniquePointer<GraphObject>& o : objects_.view())
-    if (!out->push_back(GraphEntry{o->id, o->type, o->changed, o->role})) return false;
+    if (!out->push_back(GraphEntry{o->id, o->type, o->changed, o->role, o->virtual_source})) return false;
   return true;
 }
 
@@ -810,6 +856,7 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
   if (!node) return 0;
   node->role = NodeRole::Capture;
   node->monitor = monitor || target;
+  node->virtual_source = from && from->virtual_source;      // (it records a virtual source)
   node->target = target;
   node->virtual_output = keep;
   node->origin = origin;
@@ -818,7 +865,7 @@ uint32_t Graph::add_record_node_locked(uint32_t client, Origin origin, const Pcm
   node->props.update(props, Properties::Mode::kReplace);
   node->props.set("media.class", "Stream/Input/Audio");
   node->props.set("target.object", target_name.view());
-  if (monitor) node->props.set("stream.capture.sink", "true");
+  if (monitor && !(from && from->virtual_source)) node->props.set("stream.capture.sink", "true");      // (a virtual source is recorded, not monitored)
   name_stream_node_locked(*node, client, format);
   const uint32_t node_id = node->id;
   add_capture_ports_locked(*node, client, format, monitor, target);
@@ -858,9 +905,9 @@ void Graph::add_capture_ports_locked(GraphObject& node_object, uint32_t client, 
   }
 }
 
-SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor, audio::AudioMixer* mixer) {
-  if (mixer) monitor = true;
-  else mixer = mixer_;
+SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, bool monitor, VirtualOutput* sink) {
+  audio::AudioMixer* mixer = sink ? &sink->mixer() : mixer_;
+  if (sink) monitor = true;
   if (monitor ? !mixer : (!capture_ || !source_)) return SharedPointer<RecordStream>();
   if (!format.valid()) return SharedPointer<RecordStream>();
   audio::StreamFormat sf;
@@ -873,8 +920,10 @@ SharedPointer<RecordStream> Graph::open_record_stream(const PcmFormat& format, b
   SharedPointer<audio::CaptureStream> capture;
   if (monitor) {
     // (a stream of its own that the mixer feeds what it mixes)
+    // (a virtual sink's: made the sink's own format on the way)
     capture = SharedPointer<audio::CaptureStream>::make(allocator_, allocator_, sf);
-    if (capture && (!capture->allocate(ring) || !mixer->add_tap(capture))) capture = SharedPointer<audio::CaptureStream>();
+    if (capture && ((sink && !capture->set_shape(sink->shape())) || !capture->allocate(ring) || !mixer->add_tap(capture)))
+      capture = SharedPointer<audio::CaptureStream>();
   } else {
     capture = capture_->open_stream(sf, ring, true);      // (marked: refresh() must not take it for a native program's)
   }
@@ -894,7 +943,7 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     if (!c || c->type != ObjectType::Client) return 0;
     if (target && !(from = virtual_output_locked(target))) return 0;
   }
-  SharedPointer<RecordStream> record = open_record_stream(format, monitor, from ? &from->mixer() : nullptr);
+  SharedPointer<RecordStream> record = open_record_stream(format, monitor, from.get());
   if (!record) return 0;
   uint32_t id = 0;
   {
@@ -902,7 +951,10 @@ uint32_t Graph::create_record(uint32_t client, const PcmFormat& format, const Pr
     Origin origin = Origin::Kernel;
     if (GraphObject* c = find_locked(client)) origin = c->origin;
     id = add_record_node_locked(client, origin, format, props, monitor, target);
-    if (GraphObject* node = id ? find_locked(id) : nullptr) node->record = record;
+    if (GraphObject* node = id ? find_locked(id) : nullptr) {
+      node->record = record;
+      if (target) apply_record_gain_locked(*node);      // (a virtual source's volume)
+    }
   }
   if (!id) {
     record->close();
@@ -1035,8 +1087,12 @@ bool Graph::set_volume(uint32_t node_id, float volume, bool mute) {
       source_gain_ = to_device_volume(volume);
       source_muted_ = mute;
     } else if (node->record) {
-      node->record->capture().set_gain(to_device_volume(volume));
-      node->record->capture().set_muted(mute);
+      apply_record_gain_locked(*node);
+    } else if (node->role == NodeRole::Virtual && node->virtual_source) {
+      // (a virtual source: what records from it hears it at its volume)
+      for (UniquePointer<GraphObject>& o : objects_.view())
+        if (o->type == ObjectType::Node && o->role == NodeRole::Capture && o->target == node_id) apply_record_gain_locked(*o);
+      virtual_sink = SharedPointer<VirtualOutput>();      // (its mixer's master is left: the source's volume is the recorders')
     } else if (node->native_capture) {
       node->native_capture->set_gain(to_device_volume(volume));
       node->native_capture->set_muted(mute);

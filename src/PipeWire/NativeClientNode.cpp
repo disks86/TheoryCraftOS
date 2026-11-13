@@ -43,6 +43,7 @@
 // The records the server and the client share are PipeWire 1.x's layouts (pw_node_activation, spa_io_position/clock, spa_io_buffers, spa_chunk,
 // spa_meta_*): their offsets are in the constants below, checked against libpipewire 1.6.9's headers.
 #include "PipeWire/NativeServer.hpp"
+#include "PipeWire/VideoConvert.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace pipewire {
@@ -60,18 +61,25 @@ constexpr uint32_t kPortUpdateParams = 1, kPortUpdateInfo = 2;
 constexpr uint32_t kParamEnumFormat = 3, kParamFormat = 4, kParamPortConfig = 11;
 constexpr uint32_t kObjectFormat = 0x40003, kObjectBuffers = 0x40004, kObjectMeta = 0x40005, kObjectPortConfig = 0x40008;
 constexpr uint32_t kFormatMediaType = 1, kFormatMediaSubtype = 2, kFormatAudioRate = 0x10003, kFormatAudioChannels = 0x10004;
-constexpr uint32_t kFormatVideoFormat = 0x20001, kFormatVideoSize = 0x20003, kFormatVideoFramerate = 0x20004;
+constexpr uint32_t kFormatVideoFormat = 0x20001, kFormatVideoModifier = 0x20002, kFormatVideoSize = 0x20003, kFormatVideoFramerate = 0x20004;
+constexpr uint32_t kPropMandatory = 1u << 3;      // SPA_POD_PROP_FLAG_MANDATORY
+constexpr uint32_t kSpaBGRx = 8, kSpaBGRA = 12;      // (SPA_VIDEO_FORMAT_*: what a GPU image of the server holds)
 constexpr uint32_t kMediaAudio = 1, kMediaVideo = 2, kMediaApplication = 6, kSubtypeRaw = 1, kSubtypeDsp = 2, kSubtypeControl = 0x60001;
 constexpr uint32_t kPortConfigDirection = 1, kPortConfigMode = 2, kPortConfigMonitor = 3, kPortConfigControl = 4, kPortConfigFormat = 5;
 constexpr uint32_t kModePassthrough = 1, kModeConvert = 2;
 constexpr uint32_t kCommandNode = 0x30002, kCommandPause = 1, kCommandStart = 2;
 constexpr uint32_t kIoBuffers = 1, kIoClock = 3, kIoPosition = 7;
 constexpr uint32_t kIoClockSize = 160, kIoPositionSize = 1688;
-constexpr uint32_t kDataMemPtr = 1, kDataMemFd = 2, kDataMemId = 4, kDataReadWrite = 1 | 2;
+constexpr uint32_t kDataMemPtr = 1, kDataMemFd = 2, kDataDmaBuf = 3, kDataMemId = 4, kDataReadWrite = 1 | 2;
 constexpr uint32_t kMemReadWrite = 1 | 2;
-constexpr uint32_t kBuffersBuffers = 1, kBuffersBlocks = 2, kBuffersSize = 3, kBuffersStride = 4, kBuffersDataType = 6;
-constexpr uint32_t kMetaParamType = 1, kMetaParamSize = 2;
-constexpr uint32_t kMetaHeader = 1, kMetaBusy = 7;
+constexpr uint32_t kDataFlagReadable = 1, kDataFlagWritable = 2;      // SPA_DATA_FLAG_*
+constexpr uint32_t kBuffersBuffers = 1, kBuffersBlocks = 2, kBuffersSize = 3, kBuffersStride = 4, kBuffersDataType = 6, kBuffersMetaType = 7;
+constexpr uint32_t kMetaParamType = 1, kMetaParamSize = 2, kMetaParamFeatures = 3;
+constexpr uint32_t kMetaHeader = 1, kMetaBusy = 7, kMetaSyncTimeline = 9;
+constexpr uint32_t kSyncTimelineRelease = 1;      // SPA_META_FEATURE_SYNC_TIMELINE_RELEASE
+constexpr uint32_t kMetaSyncReleaseFeature = kMetaSyncTimeline << 16 | kSyncTimelineRelease;      // (SPA_META_TYPE_FEATURES: a meta of no size)
+constexpr uint32_t kSyncUnscheduledRelease = 1;   // SPA_META_SYNC_TIMELINE_UNSCHEDULED_RELEASE
+constexpr uint32_t kDataSyncObj = 5;              // SPA_DATA_SyncObj
 constexpr uint32_t kControlMidi = 2, kControlUmp = 4;
 constexpr uint64_t kPortCanAlloc = 1u << 2;
 constexpr int32_t kStatusNeedData = 1, kStatusHaveData = 2;
@@ -207,6 +215,23 @@ bool id_or_default(const pod::Value& v, uint32_t* out) {
   return v.type == pod::kChoice && a.open(v) && a.child_type() == pod::kId && a.get32(0, out);
 }
 
+// A Long property, or a Choice of Longs' default.
+bool long_or_default(const pod::Value& v, uint64_t* out) {
+  int64_t l = 0;
+  if (v.get_long(&l)) {
+    *out = static_cast<uint64_t>(l);
+    return true;
+  }
+  if (v.type != pod::kChoice || v.body.size() < 24) return false;
+  ByteReader h(v.body.first(24));
+  h.le32();
+  h.le32();
+  const uint32_t child_size = h.le32(), child_type = h.le32();
+  if (child_size != 8 || child_type != pod::kLong) return false;
+  *out = h.le64();
+  return true;
+}
+
 // A Rectangle or Fraction (two u32), or a Choice of them's default. (A Choice's body: u32 kind, u32 flags, the child's header, the values.)
 bool pair_or_default(const pod::Value& v, uint32_t type, uint32_t* a, uint32_t* b) {
   ConstByteView body = v.body;
@@ -287,7 +312,9 @@ VideoFormat video_of(const pod::Value& format) {
     if (key == kFormatVideoFormat) id_or_default(v, &out.format);
     if (key == kFormatVideoSize) pair_or_default(v, pod::kRectangle, &out.width, &out.height);
     if (key == kFormatVideoFramerate) pair_or_default(v, pod::kFraction, &out.rate_num, &out.rate_den);
+    if (key == kFormatVideoModifier) out.has_modifier = long_or_default(v, &out.modifier);
   }
+  if (out.subtype == VideoFormat::kSubtypeDsp && out.format == 0) out.format = 79;      // (SPA_VIDEO_FORMAT_DSP_F32: what dsp video is)
   return out;
 }
 
@@ -310,14 +337,126 @@ uint32_t class_direction(StringView media_class, uint32_t fallback) {
 uint32_t plane_stride(const VideoFormat& v, uint32_t index, uint32_t stride0) {
   const VideoPlane pl = v.plane(index);
   if (index == 0) return stride0 > pl.row_bytes ? stride0 : pl.row_bytes;
-  const uint32_t scaled = (stride0 + pl.stride_divisor - 1) / pl.stride_divisor;
-  return scaled > pl.row_bytes ? scaled : pl.row_bytes;
+  const uint64_t scaled = (uint64_t{stride0} * pl.stride_num + pl.stride_den - 1) / pl.stride_den;
+  return scaled > pl.row_bytes ? static_cast<uint32_t>(scaled > 0xFFFFFFFFu ? 0xFFFFFFFFu : scaled) : pl.row_bytes;
 }
 // The bytes of a raw frame's planes at these strides (the first's `stride0`), one after another.
 uint64_t planes_bytes(const VideoFormat& v, uint32_t stride0, uint32_t first, uint32_t count) {
   uint64_t total = 0;
   for (uint32_t i = first; i < first + count && i < v.planes(); ++i) total += uint64_t{plane_stride(v, i, stride0)} * v.plane(i).rows;
   return total;
+}
+
+// Whether an EnumFormat names a DRM modifier (the watcher can take DMA-BUFs).
+bool enum_has_modifier(ConstByteView enum_format) {
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return false;
+  uint32_t key = 0, flags = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop))
+    if (key == kFormatVideoModifier) return true;
+  return false;
+}
+
+// The video formats an EnumFormat accepts (its format property: an Id, or a Choice of Ids, the default first); how many (0: it does not say).
+uint32_t enum_video_formats(ConstByteView enum_format, uint32_t* out, uint32_t most) {
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return 0;
+  uint32_t key = 0, flags = 0, n = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop)) {
+    if (key != kFormatVideoFormat) continue;
+    if (prop.type == pod::kId) {
+      uint32_t id = 0;
+      if (prop.get_id(&id) && most) out[n++] = id;
+      return n;
+    }
+    if (prop.type != pod::kChoice || prop.body.size() < 16) return 0;
+    ByteReader h(prop.body.first(16));
+    h.le32();
+    h.le32();
+    const uint32_t child_size = h.le32(), child_type = h.le32();
+    if (child_size != 4 || child_type != pod::kId) return 0;
+    for (uint64_t at = 16; prop.body.size() - at >= 4 && n < most; at += 4) {
+      ByteReader r(prop.body.subview(at, 4));
+      const uint32_t id = r.le32();
+      bool seen = false;
+      for (uint32_t k = 0; k < n; ++k) seen |= out[k] == id;
+      if (!seen) out[n++] = id;
+    }
+    return n;
+  }
+  return 0;
+}
+
+// The size a watcher takes, given its EnumFormat and its producer's size: the producer's when the EnumFormat allows it (it says no size, a range
+// that holds it, a list with it), else the EnumFormat's own (a fixed size, a list's first, the producer's clamped into a range).
+void watcher_size(ConstByteView enum_format, uint32_t pw, uint32_t ph, uint32_t* w, uint32_t* h) {
+  *w = pw;
+  *h = ph;
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return;
+  uint32_t key = 0, flags = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop)) {
+    if (key != kFormatVideoSize) continue;
+    auto rect = [](ConstByteView body, uint32_t* rw, uint32_t* rh) {
+      if (body.size() < 8) return false;
+      ByteReader r(body.first(8));
+      *rw = r.le32();
+      *rh = r.le32();
+      return *rw >= 1 && *rh >= 1 && *rw <= VideoFormat::kMaxSide && *rh <= VideoFormat::kMaxSide;
+    };
+    uint32_t a = 0, b = 0;
+    if (prop.type == pod::kRectangle) {
+      if (rect(prop.body, &a, &b)) *w = a, *h = b;
+      return;
+    }
+    if (prop.type != pod::kChoice || prop.body.size() < 24) return;
+    ByteReader hdr(prop.body.first(16));
+    const uint32_t kind = hdr.le32();
+    hdr.le32();
+    const uint32_t child_size = hdr.le32(), child_type = hdr.le32();
+    if (child_size != 8 || child_type != pod::kRectangle) return;
+    const uint64_t count = (prop.body.size() - 16) / 8;
+    uint32_t dw = 0, dh = 0;
+    if (!rect(prop.body.subview(16, 8), &dw, &dh)) return;
+    if (kind == pod::kChoiceNone) {
+      *w = dw, *h = dh;
+    } else if (kind == pod::kChoiceRange && count >= 3) {
+      uint32_t lw = 0, lh = 0, hw = 0, hh = 0;
+      if (!rect(prop.body.subview(24, 8), &lw, &lh) || !rect(prop.body.subview(32, 8), &hw, &hh)) return;
+      *w = pw < lw ? lw : pw > hw ? hw : pw;
+      *h = ph < lh ? lh : ph > hh ? hh : ph;
+    } else if (kind == pod::kChoiceEnum) {
+      for (uint64_t k = 1; k < count; ++k)
+        if (rect(prop.body.subview(16 + 8 * k, 8), &a, &b) && a == pw && b == ph) return;      // (the producer's size is one it lists)
+      *w = dw, *h = dh;
+    }
+    return;
+  }
+}
+
+// The media subtype an EnumFormat says (its first, for a Choice); 0 when it does not say.
+uint32_t enum_subtype(ConstByteView enum_format) {
+  pod::Parser parser(enum_format);
+  pod::Value v;
+  pod::ObjectReader o;
+  if (!parser.next(&v) || !o.open(v)) return 0;
+  uint32_t key = 0, flags = 0, subtype = 0;
+  pod::Value prop;
+  while (o.next(&key, &flags, &prop))
+    if (key == kFormatMediaSubtype) {
+      id_or_default(prop, &subtype);
+      return subtype;
+    }
+  return 0;
 }
 
 // The period of a video port's frames (its frame rate), 1 ms .. 1 s; 40 ms when it says none.
@@ -384,6 +523,10 @@ void build_video_format_param(pod::Builder& b, uint32_t param_id, const VideoFor
   if (!v.encoded()) {
     b.property(kFormatVideoFormat);
     b.id(v.format);
+    if (v.has_modifier) {      // (DMA-BUF frames: their layout)
+      b.property(kFormatVideoModifier, kPropMandatory);
+      b.int64(static_cast<int64_t>(v.modifier));
+    }
   }
   if (v.width && v.height) {
     b.property(kFormatVideoSize);
@@ -424,14 +567,14 @@ NativeServer::ClientPort* NativeServer::client_port(ClientNode& n, uint32_t dire
   return nullptr;
 }
 
-void NativeServer::send_add_mem(Client& c, uint32_t mem_id, const Fd& fd) {
+void NativeServer::send_add_mem(Client& c, uint32_t mem_id, const Fd& fd, uint32_t type, uint32_t flags) {
   const uint64_t m = begin(c, 0, kCoreEvAddMem);
   pod::Builder b(c.outbox);
   const uint64_t f = b.begin_struct();
   b.int32(static_cast<int32_t>(mem_id));
-  b.id(kDataMemFd);
+  b.id(type);
   b.fd(add_fd(c, fd));
-  b.int32(static_cast<int32_t>(kMemReadWrite));
+  b.int32(static_cast<int32_t>(flags));
   b.end(f);
   end(c, m);
 }
@@ -481,7 +624,7 @@ bool NativeServer::make_graph_node(Client& c, ClientNode& n) {
                                     props, &n.playback, &n.record);
     } else {
       // (a virtual sink: played into its mixer, or recorded from its monitor; the graph's streams convert the format)
-      n.virtual_sink = named && graph_.is_virtual_sink(named) ? named : 0;
+      n.virtual_sink = named && graph_.is_virtual(named) ? named : 0;      // (a virtual sink or source)
       if (n.direction == kDirectionOutput)
         n.node = graph_.create_playback(c.graph_client, n.format, props, &n.playback, n.virtual_sink);
       else
@@ -708,8 +851,82 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
     if (!n.video) return false;
     const VideoFormat v = n.video->format();
     if (!v.valid()) return false;
+    // the producer's format, or (when the watcher cannot take it) the first one it lists that the producer's frames can be converted to
+    p.source_video = v;
     p.video = v;
-    build_video_format_param(b, kParamFormat, v);
+    uint32_t wanted[32];
+    const uint32_t listed = v.encoded() ? 0 : enum_video_formats(p.enum_format.view(), wanted, 32);
+    // (a raw watcher of an encoded producer of a known size whose frames can be decoded: offered raw, the frames decoded; the first format it lists
+    // that can be made, else BGRx)
+    IVideoCodecs* decoders = graph_.video_codecs();
+    const uint32_t watcher_subtype = enum_subtype(p.enum_format.view());
+    // (a compressed producer that did not say its size: what its first frame says - the watcher is negotiated once one came)
+    VideoFormat sized = v;
+    if (v.encoded() && (!v.width || !v.height) && watcher_subtype == VideoFormat::kSubtypeRaw && can_decode_subtype(v.subtype, decoders)) {
+      SharedPointer<VideoFrame> first = n.video->latest();
+      if (!first || first->pixels.size() == 0 || !picture_size(v.subtype, first->pixels.view(), decoders, allocator_, &sized.width, &sized.height))
+        return false;
+    }
+    const bool decoded = sized.encoded() && sized.width && sized.height && can_decode_subtype(v.subtype, decoders) &&
+                         watcher_subtype == VideoFormat::kSubtypeRaw;
+    if (decoded) {
+      const uint32_t raw_listed = enum_video_formats(p.enum_format.view(), wanted, 32);
+      p.video.subtype = VideoFormat::kSubtypeRaw;
+      p.video.format = 8;
+      for (uint32_t k = 0; k < raw_listed; ++k)
+        if (can_decode_video(v, wanted[k], decoders)) {
+          p.video.format = wanted[k];
+          break;
+        }
+    }
+    // (a watcher that takes compressed video only, of a raw producer: given it encoded - Motion JPEG, H.264 - when the machine's codecs can)
+    const bool encoded_for_it = !v.encoded() && v.width && v.height && watcher_subtype != VideoFormat::kSubtypeRaw &&
+                                watcher_subtype != VideoFormat::kSubtypeDsp && can_encode_subtype(watcher_subtype, decoders);
+    if (encoded_for_it) {
+      p.video.subtype = watcher_subtype;
+      p.video.format = 0;
+      if (!p.video.rate_num) {
+        p.video.rate_num = 30;
+        p.video.rate_den = 1;
+      }
+    }
+    // the size it takes: scaled to it when that is not the producer's (and the frames can be converted at all)
+    if (sized.width && sized.height && (!v.encoded() ? can_convert_video(v.format, v.format) : decoded)) {
+      uint32_t ww = 0, wh = 0;
+      watcher_size(p.enum_format.view(), sized.width, sized.height, &ww, &wh);
+      p.video.width = ww;
+      p.video.height = wh;
+    }
+    bool takes = listed == 0 || encoded_for_it;
+    for (uint32_t k = 0; k < listed && !encoded_for_it; ++k) takes |= wanted[k] == v.format;
+    for (uint32_t k = 0; k < listed && !takes; ++k)
+      if (can_convert_video(v.format, wanted[k])) {
+        p.video.format = wanted[k];
+        takes = true;
+      }
+    // DMA-BUFs, for a watcher whose EnumFormat names a modifier (it can take them): the producer's own when they can be shared with it (DMA-BUFs in its
+    // very format and size), else GPU images of the server's when it can make them - 32-bit RGB (BGRx, BGRA), chosen when the watcher lists one. The
+    // Format then says the modifier (linear for the server's images). Otherwise the frames go in memory and the Format says none.
+    p.video.has_modifier = false;
+    p.video.modifier = 0;
+    if (enum_has_modifier(p.enum_format.view())) {
+      SharedPointer<VideoShare> share = n.video->share();
+      if (share && !share->closed && share->data_type == kDataDmaBuf && p.video == v) {
+        p.video.has_modifier = true;
+        p.video.modifier = v.has_modifier ? v.modifier : 0;
+      } else if (maker_ && maker_->gpu_images() && (!v.encoded() || decoded)) {
+        uint32_t all[32];
+        const uint32_t count = enum_video_formats(p.enum_format.view(), all, 32);
+        bool rgb = p.video.format == kSpaBGRx || p.video.format == kSpaBGRA;
+        for (uint32_t k = 0; k < count && !rgb; ++k)
+          if ((all[k] == kSpaBGRx || all[k] == kSpaBGRA) && (decoded ? can_decode_video(v, all[k], decoders) : can_convert_video(v.format, all[k]))) {
+            p.video.format = all[k];
+            rgb = true;
+          }
+        p.video.has_modifier = rgb;
+      }
+    }
+    build_video_format_param(b, kParamFormat, p.video);
     return b.ok();
   }
   if (p.enum_format.size() == 0) return false;
@@ -729,6 +946,24 @@ bool NativeServer::fixate_format(ClientNode& n, ClientPort& p, ByteBuffer* out) 
 // A port's buffers: as many as it asks for (2 .. 16), each in its own part of one memfd: its metadata, the chunk, then the data (as big as it asks, at
 // least a quantum of the largest for audio; at most 1 MiB, 64 MiB for video), unless the client allocates the data itself.
 bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
+  // explicit sync: a video producer that allocates, offers a layout for it and asks for SyncTimeline metadata gets that layout - its data blocks and two
+  // SyncObj blocks a buffer (its acquire and release timelines) - and the RELEASE feature when it asks (the server signals each release point)
+  p.sync = false;
+  p.timelines.clear();
+  bool sync_meta = false;
+  for (uint32_t k = 0; k < p.n_metas; ++k) sync_meta |= p.metas[k].type == kMetaSyncTimeline && p.metas[k].size >= 24;
+  if (p.media == Media::Video && p.direction == kDirectionOutput && (p.flags & kPortCanAlloc) && p.sync_layout.offered && p.sync_layout.blocks >= 3 &&
+      sync_meta) {
+    p.sync = true;
+    p.wanted_buffers = p.sync_layout.buffers;
+    p.wanted_blocks = p.sync_layout.blocks - 2;
+    p.wanted_size = p.sync_layout.size;
+    p.wanted_stride = p.sync_layout.stride;
+    p.wanted_types = p.sync_layout.types;
+    bool has_feature = false;
+    for (uint32_t k = 0; k < p.n_metas; ++k) has_feature |= p.metas[k].type == kMetaSyncReleaseFeature;
+    if (p.wants_sync_release && !has_feature && p.n_metas < ClientPort::kMaxMetas) p.metas[p.n_metas++] = ClientPort::Meta{kMetaSyncReleaseFeature, 0, 0};
+  }
   p.blocks = 1;
   p.n_buffers = p.wanted_buffers >= 1 && p.wanted_buffers <= kMaxBuffers ? (p.wanted_buffers < 2 ? 2 : p.wanted_buffers) : kBuffers;
   uint32_t data = 0;
@@ -771,7 +1006,41 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
   const uint32_t types = p.wanted_types;
   p.alloc = (p.flags & kPortCanAlloc) && p.direction == kDirectionOutput;
   p.data_type = types == 0 || (types & (1u << kDataMemPtr)) ? kDataMemPtr : kDataMemId;
-  if (!p.alloc && types != 0 && !(types & ((1u << kDataMemPtr) | (1u << kDataMemFd)))) return false;      // (only DMA-BUFs: none here)
+  p.leave_share();
+  p.share_mems.clear();
+  p.gpu_images.clear();
+  p.gpu_stride = 0;
+  // A watcher of video may be given other memory than the server's: its producer's own buffers when they are shared and it takes them as they are (the
+  // producer's format and size; their memory a type it takes: zero-copy), else the server's GPU images when it takes DMA-BUFs only or was offered them.
+  SharedPointer<VideoShare> share;
+  bool gpu = false;
+  if (p.media == Media::Video && p.direction == kDirectionInput && n.video) {
+    auto takes = [&](uint32_t type) { return types ? (types & (1u << type)) != 0 : type == kDataDmaBuf && p.video.has_modifier; };
+    SharedPointer<VideoShare> s = n.video->share();
+    if (s && takes_share(p, *s)) share = s;
+    const bool dmabuf_only = types != 0 && !(types & ((1u << kDataMemPtr) | (1u << kDataMemFd))) && (types & (1u << kDataDmaBuf));
+    if (!share && (dmabuf_only || (p.video.has_modifier && takes(kDataDmaBuf)))) {
+      // (one image a buffer, 32-bit RGB at the watcher's size)
+      if ((p.video.format != kSpaBGRx && p.video.format != kSpaBGRA) || p.video.encoded() || !maker_) return false;
+      for (uint32_t i = 0; i < p.n_buffers; ++i) {
+        uint32_t stride = 0;
+        Fd image = maker_->make_gpu_image(p.video.width, p.video.height, &stride);
+        if (!image || (p.gpu_stride && stride != p.gpu_stride) || !p.gpu_images.push_back(util::move(image))) {
+          p.gpu_images.clear();
+          return false;
+        }
+        p.gpu_stride = stride;
+      }
+      p.wanted_stride = p.gpu_stride;
+      gpu = true;
+    }
+  }
+  if (share) {
+    p.n_buffers = share->n_buffers;
+    p.blocks = share->blocks;
+  }
+  if (gpu) p.blocks = 1;
+  if (!p.alloc && !share && !gpu && types != 0 && !(types & ((1u << kDataMemPtr) | (1u << kDataMemFd)))) return false;      // (only DMA-BUFs: none here)
   uint32_t at = 0;
   for (uint32_t i = 0; i < p.n_metas; ++i) {
     p.metas[i].offset = at;
@@ -779,10 +1048,11 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
   }
   p.chunk_offset = at;
   at += 16 * p.blocks;
-  if (p.alloc) {
+  if (p.alloc || share || gpu) {      // (no data of the server's: the client's, the producer's, or the GPU images)
     p.data_offset = 0;
     p.data_size = 0;
     p.buffer_stride = round_up(at, 64);
+    if (!p.alloc) p.data_type = kDataMemId;
   } else {
     // (each block's data page-aligned when it goes by memfd)
     p.data_offset = p.data_type == kDataMemId ? round_up(at, kPage) : round_up(at, 64);
@@ -796,6 +1066,13 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
   if (!p.buffers || p.buffers->memory().size() < total) return false;
   p.buffers_mem = new_mem_id(c);
   send_add_mem(c, p.buffers_mem, p.buffers);
+  // (the producer's descriptors, or the GPU images: each block's memory of its own, readable)
+  const uint64_t extra = share ? share->fds.count() : p.gpu_images.count();
+  for (uint64_t i = 0; i < extra; ++i) {
+    const uint32_t mem = new_mem_id(c);
+    send_add_mem(c, mem, share ? share->fds[i] : p.gpu_images[i], share ? share->data_type : kDataDmaBuf, 1);
+    if (!p.share_mems.push_back(mem)) return false;
+  }
   // the port's one link: mix 0 (its peer: the speakers, the microphone, a virtual sink, the MIDI bridge or the node itself)
   uint32_t peer = n.node;
   if (n.media == Media::Audio) peer = n.virtual_sink ? n.virtual_sink : (n.direction == kDirectionOutput ? graph_.sink_id() : graph_.source_id());
@@ -831,8 +1108,16 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
         b.id(p.metas[k].type);
         b.int32(static_cast<int32_t>(p.metas[k].size));
       }
-      b.int32(static_cast<int32_t>(p.blocks));      // datas
-      for (uint32_t k = 0; k < p.blocks; ++k) {
+      b.int32(static_cast<int32_t>(p.blocks + (p.sync ? 2 : 0)));      // datas (and, explicit sync, the two timelines)
+      for (uint32_t k = 0; k < p.blocks + (p.sync ? 2u : 0u); ++k) {
+        if (k >= p.blocks) {      // (a SyncObj the client puts its timeline in)
+          b.id(1u << kDataSyncObj);
+          b.int32(0);
+          b.int32(0);
+          b.int32(0);
+          b.int32(0);
+          continue;
+        }
         const uint32_t data_at = p.data_offset + k * p.data_size;
         if (p.alloc) {
           // (the data is the client's: the types it may use, as PipeWire says them for an allocating port)
@@ -841,6 +1126,19 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
           b.int32(0);
           b.int32(0);
           b.int32(0);
+        } else if (share) {
+          const uint64_t index = uint64_t{i} * p.blocks + k;
+          b.id(kDataMemId);
+          b.int32(static_cast<int32_t>(p.share_mems[index]));      // (the producer's memory, as it gave it)
+          b.int32(static_cast<int32_t>((share->flags[index] | kDataFlagReadable) & ~kDataFlagWritable));      // (the watcher only reads it)
+          b.int32(static_cast<int32_t>(share->mapoffsets[index]));
+          b.int32(static_cast<int32_t>(share->maxsizes[index]));
+        } else if (gpu) {
+          b.id(kDataMemId);
+          b.int32(static_cast<int32_t>(p.share_mems[i]));
+          b.int32(static_cast<int32_t>(kDataFlagReadable));
+          b.int32(0);
+          b.int32(static_cast<int32_t>(uint64_t{p.gpu_stride} * p.video.height));
         } else if (p.data_type == kDataMemPtr) {
           b.id(kDataMemPtr);
           b.int32(static_cast<int32_t>(data_at));      // (MemPtr: the offset in the buffer's part)
@@ -884,6 +1182,10 @@ bool NativeServer::send_port_buffers(Client& c, ClientNode& n, ClientPort& p) {
   p.buffers_sent = true;
   p.data_ready = !p.alloc;
   p.client_data.clear();
+  if (share) {      // (the watcher holds nothing of them yet)
+    p.share = share;
+    ++share->attached;
+  }
   return true;
 }
 
@@ -939,9 +1241,10 @@ void NativeServer::maybe_start(Client& c, ClientNode& n) {
 void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uint32_t port_id, int32_t change_mask, pod::Parser& args, uint32_t n_params) {
   ClientPort* p = client_port(n, direction, port_id);
   // the params (each kind replaces what the port said of it before)
-  bool has_enum = false, has_buffers = false, has_meta = false;
+  bool has_enum = false, has_buffers = false, has_meta = false, wants_release = false;
   ByteBuffer enum_format(allocator_);
   uint32_t wanted_buffers = 0, wanted_blocks = 0, wanted_size = 0, wanted_stride = 0, wanted_types = 0;
+  ClientPort::SyncLayout sync_layout;
   ClientPort::Meta metas[ClientPort::kMaxMetas];
   uint32_t n_metas = 0;
   for (uint32_t i = 0; i < n_params; ++i) {
@@ -951,27 +1254,41 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
     if (!o.open(v)) continue;
     if (o.object_type() == kObjectFormat && o.object_id() == kParamEnumFormat && !has_enum) {
       has_enum = enum_format.append(v.whole);
-    } else if (o.object_type() == kObjectBuffers && !has_buffers) {
-      // how many buffers, how big their data and its stride, which memory (each a choice: its default; the data types a mask)
-      has_buffers = true;
-      uint32_t key = 0, flags = 0;
+    } else if (o.object_type() == kObjectBuffers) {
+      // how many buffers, how big their data and its stride, which memory (each a choice: its default; the data types a mask). A layout that
+      // depends on SyncTimeline metadata (explicit sync) is kept apart: the first other one is the port's usual layout.
+      uint32_t key = 0, flags = 0, b_buffers = 0, b_blocks = 0, b_size = 0, b_stride = 0, b_types = 0, b_meta = 0;
       pod::Value prop;
       while (o.next(&key, &flags, &prop)) {
         uint32_t value = 0;
-        if (key == kBuffersBuffers && int_or_default(prop, &value)) wanted_buffers = value;
-        if (key == kBuffersBlocks && int_or_default(prop, &value)) wanted_blocks = value;
-        if (key == kBuffersSize && int_or_default(prop, &value)) wanted_size = value;
-        if (key == kBuffersStride && int_or_default(prop, &value)) wanted_stride = value;
-        if (key == kBuffersDataType && int_or_default(prop, &value)) wanted_types = value;
+        if (key == kBuffersBuffers && int_or_default(prop, &value)) b_buffers = value;
+        if (key == kBuffersBlocks && int_or_default(prop, &value)) b_blocks = value;
+        if (key == kBuffersSize && int_or_default(prop, &value)) b_size = value;
+        if (key == kBuffersStride && int_or_default(prop, &value)) b_stride = value;
+        if (key == kBuffersDataType && int_or_default(prop, &value)) b_types = value;
+        if (key == kBuffersMetaType && int_or_default(prop, &value)) b_meta = value;
+      }
+      if (b_meta & (1u << kMetaSyncTimeline)) {
+        if (!sync_layout.offered) sync_layout = ClientPort::SyncLayout{true, b_buffers, b_blocks, b_size, b_stride, b_types};
+      } else if (!has_buffers) {
+        has_buffers = true;
+        wanted_buffers = b_buffers;
+        wanted_blocks = b_blocks;
+        wanted_size = b_size;
+        wanted_stride = b_stride;
+        wanted_types = b_types;
       }
     } else if (o.object_type() == kObjectMeta) {
       has_meta = true;
       uint32_t key = 0, flags = 0, type = 0, size = 0;
       pod::Value prop;
+      uint32_t features = 0;
       while (o.next(&key, &flags, &prop)) {
         if (key == kMetaParamType) id_or_default(prop, &type);
         if (key == kMetaParamSize) int_or_default(prop, &size);
+        if (key == kMetaParamFeatures) int_or_default(prop, &features);
       }
+      if (type == kMetaSyncTimeline && (features & kSyncTimelineRelease)) wants_release = true;
       bool known = false;
       for (uint32_t k = 0; k < n_metas; ++k) known |= metas[k].type == type;
       if (type != 0 && size != 0 && size <= kMaxMetaSize && !known && n_metas < ClientPort::kMaxMetas) metas[n_metas++] = ClientPort::Meta{type, size, 0};
@@ -1054,6 +1371,15 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
       p->wanted_stride = wanted_stride;
       p->wanted_types = wanted_types;
     }
+    if (has_buffers || sync_layout.offered) p->sync_layout = sync_layout;
+    if (!has_buffers && sync_layout.offered) {      // (only a sync layout: its data blocks are the usual layout too)
+      p->wanted_buffers = sync_layout.buffers;
+      p->wanted_blocks = sync_layout.blocks > 2 ? sync_layout.blocks - 2 : 1;
+      p->wanted_size = sync_layout.size;
+      p->wanted_stride = sync_layout.stride;
+      p->wanted_types = sync_layout.types;
+    }
+    if (has_meta) p->wants_sync_release = wants_release;
     if (has_meta || has_buffers) {
       p->n_metas = n_metas;
       for (uint32_t k = 0; k < n_metas; ++k) p->metas[k] = metas[k];
@@ -1080,9 +1406,13 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
     return;
   }
   List<ClientPort::ClientData> datas(allocator_);
+  List<Fd> timelines(allocator_);
   for (int32_t i = 0; i < count; ++i) {
     int32_t n_datas = 0;
-    if (!args.int32(&n_datas) || n_datas < int32_t(p->blocks) || n_datas > 4) { protocol_error(c, n.resource, kEINVAL, "invalid port_buffers"); return; }
+    if (!args.int32(&n_datas) || n_datas < int32_t(p->blocks) || n_datas > int32_t(VideoFormat::kMaxPlanes + 2)) {
+      protocol_error(c, n.resource, kEINVAL, "invalid port_buffers");
+      return;
+    }
     for (int32_t k = 0; k < n_datas; ++k) {
       uint32_t type = 0;
       int32_t flags = 0, mapoffset = 0, maxsize = 0;
@@ -1092,13 +1422,21 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
         protocol_error(c, n.resource, kEINVAL, "invalid port_buffers");
         return;
       }
-      if (uint32_t(k) >= p->blocks) continue;      // (the blocks the server asked for are used)
-      if (type != kDataMemFd) { protocol_error(c, n.resource, kENOTSUP, "only memfd buffers can be shared with the server"); return; }
+      if (uint32_t(k) >= p->blocks) {      // (the blocks the server asked for are used; explicit sync: the two after them are its timelines)
+        if (p->sync && uint32_t(k) < p->blocks + 2 && type == kDataSyncObj && index >= 0 && uint64_t(index) < c.message_in_fds.count())
+          timelines.push_back(c.message_in_fds[uint64_t(index)]);
+        continue;
+      }
+      if (type != kDataMemFd && type != kDataDmaBuf) { protocol_error(c, n.resource, kENOTSUP, "only memfd and DMA-BUF buffers can be shared with the server"); return; }
       if (index < 0 || uint64_t(index) >= c.message_in_fds.count()) { protocol_error(c, n.resource, kEINVAL, "port_buffers without its descriptor"); return; }
       ClientPort::ClientData d;
       d.fd = c.message_in_fds[uint64_t(index)];
+      // (a DMA-BUF must be a GPU image the server can read: on this system an export of /dev/dxg)
+      if (type == kDataDmaBuf && (!d.fd || !d.fd->gpu())) { protocol_error(c, n.resource, kENOTSUP, "a DMA-BUF the server cannot read (not an export of /dev/dxg)"); return; }
+      d.gpu = type == kDataDmaBuf;
       d.mapoffset = static_cast<uint32_t>(mapoffset);
       d.maxsize = static_cast<uint32_t>(maxsize);
+      d.flags = static_cast<uint32_t>(flags);
       const uint64_t size = d.fd ? d.fd->memory().size() : 0;
       if (mapoffset < 0 || maxsize <= 0 || uint64_t(uint32_t(maxsize)) > size || uint64_t(uint32_t(mapoffset)) > size - uint32_t(maxsize)) {
         protocol_error(c, n.resource, kEINVAL, "a buffer outside its memfd");
@@ -1109,9 +1447,51 @@ void NativeServer::port_buffers(Client& c, ClientNode& n, pod::Parser& args) {
   }
   p->client_data.clear();
   for (ClientPort::ClientData& d : datas) p->client_data.push_back(util::move(d));
+  // (explicit sync only with both timelines of every buffer; without them the producer is not promised releases)
+  p->timelines.clear();
+  if (p->sync && timelines.count() == 2ull * uint32_t(count))
+    for (Fd& t : timelines) p->timelines.push_back(util::move(t));
+  else
+    p->sync = false;
   p->data_size = p->client_data.count() ? p->client_data[0].maxsize : 0;
   p->data_ready = p->client_data.count() == uint64_t{p->n_buffers} * p->blocks;
+  if (p->media == Media::Video && p->direction == kDirectionOutput) share_buffers(n, *p);
   maybe_start(c, n);
+}
+
+bool NativeServer::takes_share(const ClientPort& p, const VideoShare& share) {
+  if (share.closed || !(p.video == p.source_video) || share.n_buffers < 1 || share.n_buffers > VideoShare::kMaxBuffers || share.blocks < 1 ||
+      share.blocks > VideoFormat::kMaxPlanes)
+    return false;
+  return p.wanted_types ? (p.wanted_types & (1u << share.data_type)) != 0 : share.data_type == kDataDmaBuf && p.video.has_modifier;
+}
+
+bool NativeServer::watcher_share_changed(const ClientPort& p, VideoChannel& channel) {
+  SharedPointer<VideoShare> now = channel.share();
+  if (p.share) return p.share->closed || now.get() != p.share.get();
+  return now && takes_share(p, *now);
+}
+
+// A video producer's own buffers (DMA-BUFs or memfds it allocated, all of one kind): shared through its channel with the watchers that can take them as
+// they are (they are negotiated again to be given them).
+void NativeServer::share_buffers(ClientNode& n, ClientPort& p) {
+  p.leave_share();
+  if (!n.video) return;
+  n.video->set_share(SharedPointer<VideoShare>());
+  if (!p.alloc || !p.data_ready || p.n_buffers == 0 || p.n_buffers > VideoShare::kMaxBuffers || p.blocks > VideoFormat::kMaxPlanes) return;
+  uint32_t gpu = 0;
+  for (const ClientPort::ClientData& d : p.client_data.view()) gpu += d.gpu;
+  if (gpu != 0 && gpu != p.client_data.count()) return;      // (DMA-BUFs and memfds mixed: not shared)
+  SharedPointer<VideoShare> share = SharedPointer<VideoShare>::make(allocator_, allocator_);
+  if (!share) return;
+  share->n_buffers = p.n_buffers;
+  share->blocks = p.blocks;
+  share->data_type = gpu ? kDataDmaBuf : kDataMemFd;
+  for (const ClientPort::ClientData& d : p.client_data.view())
+    if (!share->fds.push_back(d.fd) || !share->mapoffsets.push_back(d.mapoffset) || !share->maxsizes.push_back(d.maxsize) || !share->flags.push_back(d.flags))
+      return;
+  p.share = share;
+  n.video->set_share(util::move(share));
 }
 
 void NativeServer::client_node_method(Client& c, Resource& r, uint32_t opcode, pod::Parser& args) {
@@ -1216,6 +1596,12 @@ ByteView NativeServer::buffer_data(ClientPort& p, uint32_t id, uint32_t* maxsize
     *maxsize = static_cast<uint32_t>(data.size());
     return data;
   }
+  if (!p.gpu_images.empty()) {      // (the GPU image's CPU copy: written, then synced to the image)
+    if (block != 0 || id >= p.gpu_images.count() || !p.gpu_images[id]) return ByteView();
+    ByteView data = part(p.gpu_images[id]->memory(), 0, uint64_t{p.gpu_stride} * p.video.height);
+    *maxsize = static_cast<uint32_t>(data.size());
+    return data;
+  }
   ByteView data = part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.data_offset + uint64_t{block} * p.data_size, p.data_size);
   *maxsize = static_cast<uint32_t>(data.size());
   return data;
@@ -1247,6 +1633,18 @@ void NativeServer::drop_port_buffers(Client& c, ClientPort& p) {
     end(c, m);
     c.free_mem_ids.push_back(p.buffers_mem);
   }
+  for (uint32_t mem : p.share_mems.view()) {      // (the producer's descriptors or the GPU images it was given)
+    const uint64_t m = begin(c, 0, kCoreEvRemoveMem);
+    pod::Builder b(c.outbox);
+    const uint64_t f = b.begin_struct();
+    b.int32(static_cast<int32_t>(mem));
+    b.end(f);
+    end(c, m);
+    c.free_mem_ids.push_back(mem);
+  }
+  p.share_mems.clear();
+  p.gpu_images.clear();
+  p.leave_share();      // (a producer's buffers are not shared any more; a watcher holds none of them)
   p.buffers = Fd();
   p.client_data.clear();
   p.n_buffers = 0;
@@ -1270,6 +1668,8 @@ void NativeServer::renegotiate(Client& c, ClientNode& n) {
     p.buffers_sent = false;
     p.data_ready = false;
     p.wants_alloc = false;
+    p.decode = UniquePointer<VideoDecodeSession>();      // (a new stream: its decoder starts again, and its encoder)
+    p.encode = UniquePointer<VideoEncodeSession>();
     ByteBuffer format(allocator_);
     if (fixate_format(n, p, &format)) send_port_param(c, n, p, format.view());
     drop_port_buffers(c, p);
@@ -1305,10 +1705,11 @@ static int64_t header_pts(ByteView buffers, uint64_t base, const NativeServer::C
 
 // A producer's frame to its video channel: encoded, the first block's bytes; raw, a plane in each block (the port has one a plane), else the planes one
 // after another in the first (`first`: its chunk's bytes, `stride0`: its chunk's stride).
-void NativeServer::publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts) {
+void NativeServer::publish_video(ClientNode& n, ClientPort& p, uint32_t id, ConstByteView first, int32_t stride0, int64_t pts, const VideoFrame* shared) {
   const VideoFormat& v = p.video;
   if (v.encoded()) {
-    n.video->publish(first, 0, pts);
+    const VideoPlaneData one{first, 0};
+    n.video->publish(ArrayView<const VideoPlaneData>(&one, 1), pts, shared);
     return;
   }
   const uint32_t planes = v.planes();
@@ -1338,7 +1739,7 @@ void NativeServer::publish_video(ClientNode& n, ClientPort& p, uint32_t id, Cons
       at += uint64_t{st} * v.plane(i).rows;
     }
   }
-  n.video->publish(ArrayView<const VideoPlaneData>(data, planes), pts);
+  n.video->publish(ArrayView<const VideoPlaneData>(data, planes), pts, shared);
 }
 
 // What an output port produced this cycle (the buffer its io names with HAVE_DATA): to where the node's data goes; the buffer is handed back. False
@@ -1347,13 +1748,36 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
   ByteView io = part(n.io->memory(), 8ull * p.index, 8);
   const int32_t status = load<int32_t>(io, 0);
   const uint32_t id = load<uint32_t>(io, 4);
+  const bool shared = p.media == Media::Video && p.alloc && p.share && !p.share->closed;
   if (!(status & kStatusHaveData) || id >= p.n_buffers) {
     if (!n.driving) {
-      store<uint32_t>(io, 4, kIdInvalid);      // (nothing came: nothing to hand back, or the producer would get a buffer twice)
+      // (nothing came: nothing to hand back, or the producer would get a buffer twice - unless buffers it shared are held still and one of them is
+      // free now: the io has room for it this cycle)
+      const uint32_t back = shared ? pick_back(p) : kIdInvalid;
+      store<uint32_t>(io, 4, back);
       store<int32_t>(io, 0, kStatusNeedData);
+      if (back != kIdInvalid) {
+        p.share->taken[back] = false;
+        signal_release(p, back);
+      }
     }
     return false;
   }
+  if (shared) return consume_shared(n, p, status, id);
+  // (a DMA-BUF's pixels: brought into the server's copy first; a frame the GPU is still drawing is not taken)
+  if (p.alloc)
+    for (uint32_t k = 0; k < p.blocks; ++k) {
+      const uint64_t index = uint64_t{id} * p.blocks + k;
+      if (index < p.client_data.count() && p.client_data[index].gpu && !p.client_data[index].fd->sync_from_gpu()) {
+        if (!n.driving) {
+          store<uint32_t>(io, 4, id);      // (handed back unread)
+          store<int32_t>(io, 0, kStatusNeedData);
+        } else {
+          exchange_if<int32_t>(io, 0, status, kStatusNeedData);
+        }
+        return false;
+      }
+    }
   uint32_t maxsize = 0;
   ByteView data = buffer_data(p, id, &maxsize);
   const uint64_t base = uint64_t{id} * p.buffer_stride;
@@ -1410,10 +1834,130 @@ bool NativeServer::consume_output(ClientNode& n, ClientPort& p) {
   return true;
 }
 
+// ---- a producer whose buffers are shared ------------------------------------------------------------------------------------------------------------
+
+// Whether the frame in buffer `id` is drawn: its acquire point reached (explicit sync, when its timeline can be read), else the GPU done with each of its
+// DMA-BUFs.
+bool NativeServer::frame_ready(ClientPort& p, uint32_t id) {
+  VideoShare& s = *p.share;
+  if (p.sync && p.timelines.count() > 2ull * id + 1 && id < VideoShare::kMaxBuffers) {
+    uint64_t value = 0;
+    if (p.timelines[2ull * id]->timeline_value(&value)) return value >= s.acquire_point[id];
+  }
+  for (uint32_t k = 0; k < p.blocks; ++k) {
+    const uint64_t index = uint64_t{id} * p.blocks + k;
+    if (index < p.client_data.count() && p.client_data[index].gpu && !p.client_data[index].fd->gpu_ready()) return false;
+  }
+  return true;
+}
+
+uint32_t NativeServer::pick_back(ClientPort& p) {
+  VideoShare& s = *p.share;
+  uint32_t back = kIdInvalid;
+  for (uint32_t i = 0; i < s.n_buffers && i < VideoShare::kMaxBuffers; ++i)
+    if (s.taken[i] && (i != s.latest || !s.attached) && i != s.pending && s.users[i] == 0 && (back == kIdInvalid || s.taken_at[i] < s.taken_at[back]))
+      back = i;      // (the newest frame's is kept only while some watcher may still want it)
+  return back;
+}
+
+void NativeServer::signal_release(ClientPort& p, uint32_t id) {
+  VideoShare& s = *p.share;
+  if (id >= VideoShare::kMaxBuffers || !s.promised[id]) return;
+  s.promised[id] = false;
+  if (p.timelines.count() > 2ull * id + 1) p.timelines[2ull * id + 1]->timeline_signal(s.release_point[id]);
+}
+
+// A drawn frame to the channel: as it is, in the shared buffer, for the watchers given that (and with a copy when some watcher needs one: the kernel's,
+// one converting, one in its own memory); its buffer held for the watchers.
+void NativeServer::take_shared_frame(ClientNode& n, ClientPort& p, uint32_t id) {
+  VideoShare& s = *p.share;
+  if (!n.video || !p.video.valid()) return;
+  const bool copy = !s.attached || graph_.video_watchers(n.node) > s.attached;
+  if (copy)
+    for (uint32_t k = 0; k < p.blocks; ++k) {
+      const uint64_t index = uint64_t{id} * p.blocks + k;
+      if (index < p.client_data.count() && p.client_data[index].gpu && !p.client_data[index].fd->sync_from_gpu()) return;
+    }
+  uint32_t maxsize = 0;
+  ByteView data = buffer_data(p, id, &maxsize);
+  ByteView chunk = buffer_chunk(p, id);
+  if (chunk.empty()) return;
+  const uint32_t offset = load<uint32_t>(chunk, 0), size = load<uint32_t>(chunk, 4);
+  const int32_t stride = load<int32_t>(chunk, 8);
+  SharedPointer<VideoFrame> frame = SharedPointer<VideoFrame>::make(allocator_, allocator_);
+  if (!frame) return;
+  frame->share = p.share;
+  frame->share_buffer = id;
+  frame->pts = header_pts(p.buffers->memory(), uint64_t{id} * p.buffer_stride, p);
+  for (uint32_t k = 0; k < p.blocks && k < VideoFormat::kMaxPlanes; ++k) {
+    ByteView ck = buffer_chunk(p, id, k);
+    if (ck.empty()) break;
+    frame->chunks[k] = VideoShareChunk{load<uint32_t>(ck, 0), load<uint32_t>(ck, 4), load<int32_t>(ck, 8)};
+  }
+  if (copy) {
+    if (maxsize == 0 || offset >= maxsize || size > maxsize - offset) return;      // (a frame does not wrap)
+    publish_video(n, p, id, ConstByteView(data).subview(offset, size), stride, frame->pts, frame.get());
+  } else if (!n.video->publish_shared(util::move(frame))) {
+    return;
+  }
+  s.latest = s.attached ? id : kIdInvalid;
+}
+
+bool NativeServer::consume_shared(ClientNode& n, ClientPort& p, int32_t status, uint32_t id) {
+  ByteView io = part(n.io->memory(), 8ull * p.index, 8);
+  VideoShare& s = *p.share;
+  if (id >= VideoShare::kMaxBuffers) return false;
+  // (explicit sync: the frame's points; the server promises the release - clears UNSCHEDULED_RELEASE - when it can signal that timeline)
+  s.promised[id] = false;
+  if (p.sync)
+    for (uint32_t k = 0; k < p.n_metas; ++k) {
+      if (p.metas[k].type != kMetaSyncTimeline || p.metas[k].size < 24) continue;
+      ByteView m = part(p.buffers->memory(), uint64_t{id} * p.buffer_stride + p.metas[k].offset, 24);
+      if (m.empty()) break;
+      s.acquire_point[id] = load<uint64_t>(m, 8);
+      s.release_point[id] = load<uint64_t>(m, 16);
+      uint64_t now = 0;
+      if (p.timelines.count() > 2ull * id + 1 && p.timelines[2ull * id + 1]->timeline_value(&now)) {
+        store<uint32_t>(m, 0, load<uint32_t>(m, 0) & ~kSyncUnscheduledRelease);
+        s.promised[id] = true;
+      }
+      break;
+    }
+  s.taken[id] = true;
+  s.taken_at[id] = ++s.clock;
+  if (s.pending == id) s.pending = kIdInvalid;
+  if (frame_ready(p, id)) take_shared_frame(n, p, id);
+  else s.pending = id;      // (shown once it is drawn: check_pending; a pending one before it is passed over)
+  // what goes back: the oldest buffer taken that nobody holds (this one when nothing else is held and it was taken at once)
+  const uint32_t back = pick_back(p);
+  if (n.driving) {
+    // (its own cycle may be running: handed back only if the io still says what it gave)
+    const uint64_t was = uint64_t{uint32_t(status)} | uint64_t{id} << 32, now = uint64_t{uint32_t(kStatusNeedData)} | uint64_t{back} << 32;
+    if (!exchange_if<uint64_t>(io, 0, was, now)) return true;
+  } else {
+    store<uint32_t>(io, 4, back);
+    store<int32_t>(io, 0, kStatusNeedData);
+  }
+  if (back != kIdInvalid) {
+    s.taken[back] = false;
+    signal_release(p, back);
+  }
+  return true;
+}
+
+void NativeServer::check_pending(ClientNode& n, ClientPort& p) {
+  if (!p.share || p.share->closed || p.share->pending == kIdInvalid) return;
+  const uint32_t id = p.share->pending;
+  if (!frame_ready(p, id)) return;
+  p.share->pending = kIdInvalid;
+  take_shared_frame(n, p, id);
+}
+
 // Fills an input port's next free buffer with what it is to hear or see this cycle, and says so in its io (HAVE_DATA). False when there is nothing.
 bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
   ByteView io = part(n.io->memory(), 8ull * p.index, 8);
   if (n.driving && load<int32_t>(io, 0) == kStatusHaveData) return false;      // (its cycle has not taken the last one yet)
+  if (p.media == Media::Video && p.share) return fill_shared(n, p);
   uint32_t id = kIdInvalid;
   for (uint32_t tries = 0; tries < p.n_buffers; ++tries) {
     const uint32_t candidate = p.next_buffer;
@@ -1487,12 +2031,36 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
       // the producer's newest frame: encoded, its bytes; raw, a plane in each block (or one after another in the first), rows at the port's stride
       if (!n.video) return false;
       SharedPointer<VideoFrame> frame = n.video->latest();
-      if (!frame || frame->sequence <= p.video_seen || !(frame->format == p.video)) return false;
+      if (!frame || frame->sequence <= p.video_seen || !(frame->format == p.source_video)) return false;
+      if (frame->pixels.size() == 0) return false;      // (only in its producer's shared buffers: the next one is copied for this watcher too)
       const VideoFormat& v = p.video;
+      // (in the watcher's format: converted when that is not the producer's)
+      ConstByteView pixels = frame->pixels.view();
+      if (!(v == p.source_video)) {
+        if (p.source_video.encoded()) {      // (encoded video to a raw watcher: decoded)
+          if (!p.decode) p.decode = UniquePointer<VideoDecodeSession>::make(allocator_, allocator_);
+          bool failed = false;
+          if (!p.decode || !decode_video(pixels, p.source_video, v, *p.decode, graph_.video_codecs(), &p.converted, &failed)) {
+            p.video_seen = frame->sequence;      // (a frame that cannot be decoded is passed over; one the decoder holds back comes out later)
+            return false;
+          }
+        } else if (v.encoded()) {      // (raw video to a watcher that takes it compressed: encoded)
+          if (!p.encode) p.encode = UniquePointer<VideoEncodeSession>::make(allocator_, allocator_);
+          ConstByteView packet;
+          p.converted.clear();
+          if (!p.encode || !p.encode->encode(p.source_video, pixels, v, graph_.video_codecs(), &packet) || !p.converted.append(packet)) {
+            p.video_seen = frame->sequence;
+            return false;
+          }
+        } else if (!convert_video(p.source_video, pixels, v, &p.converted)) {
+          return false;
+        }
+        pixels = p.converted.view();
+      }
       if (v.encoded()) {
-        if (frame->pixels.size() > maxsize) return false;
-        data.first(frame->pixels.size()).copy_from(frame->pixels.view());
-        got = static_cast<uint32_t>(frame->pixels.size());
+        if (pixels.size() > maxsize) return false;
+        data.first(pixels.size()).copy_from(pixels);
+        got = static_cast<uint32_t>(pixels.size());
         p.video_seen = frame->sequence;
         break;
       }
@@ -1509,7 +2077,7 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
         ByteView out = separate ? buffer_data(p, id, &block_size, i) : data;
         if (separate) at = 0;
         if (block_size < bytes || out.size() < at + bytes) return false;
-        const ConstByteView src = frame->pixels.view().subview(v.plane_offset(i), uint64_t{pl.row_bytes} * pl.rows);
+        const ConstByteView src = pixels.subview(v.plane_offset(i), uint64_t{pl.row_bytes} * pl.rows);
         for (uint32_t y = 0; y < pl.rows; ++y)
           out.subview(at + uint64_t{y} * st, pl.row_bytes).copy_from(src.subview(uint64_t{y} * pl.row_bytes, pl.row_bytes));
         if (separate && i > 0) {
@@ -1525,6 +2093,7 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
         }
         at += bytes;
       }
+      if (!p.gpu_images.empty() && !p.gpu_images[id]->sync_to_gpu()) return false;      // (a GPU image: the frame into it)
       p.video_seen = frame->sequence;
       break;
     }
@@ -1541,6 +2110,48 @@ bool NativeServer::fill_input(ClientNode& n, ClientPort& p) {
   return got > 0 || p.media == Media::Midi;
 }
 
+// A watcher given its producer's own buffers: the buffer it recycled (its io: NEED_DATA with that id) let go, then the newest frame's buffer given - its
+// chunks and header written in the watcher's own part of it - with no copy. False when no new frame came.
+bool NativeServer::fill_shared(ClientNode& n, ClientPort& p) {
+  ByteView io = part(n.io->memory(), 8ull * p.index, 8);
+  VideoShare& share = *p.share;
+  const int32_t status = load<int32_t>(io, 0);
+  const uint32_t back = load<uint32_t>(io, 4);
+  auto release = [&](uint32_t id) {
+    if (id >= share.n_buffers || id >= VideoShare::kMaxBuffers || !p.holds[id]) return;
+    p.holds[id] = false;
+    if (share.users[id]) --share.users[id];
+  };
+  if (status != kStatusHaveData && back != kIdInvalid) {
+    release(back);
+    store<uint32_t>(io, 4, kIdInvalid);
+  }
+  if (share.closed || !n.video) return false;      // (it is given other buffers at the next tick)
+  SharedPointer<VideoFrame> frame = n.video->latest();
+  if (!frame || frame->sequence <= p.video_seen || frame->share.get() != &share || frame->share_buffer >= share.n_buffers ||
+      frame->share_buffer >= VideoShare::kMaxBuffers)
+    return false;
+  if (status == kStatusHaveData) release(back);      // (the last one given was never taken: this one instead)
+  const uint32_t id = frame->share_buffer;
+  for (uint32_t k = 0; k < p.blocks && k < VideoFormat::kMaxPlanes; ++k) {
+    ByteView chunk = buffer_chunk(p, id, k);
+    if (chunk.empty()) return false;
+    store<uint32_t>(chunk, 0, frame->chunks[k].offset);
+    store<uint32_t>(chunk, 4, frame->chunks[k].size);
+    store<int32_t>(chunk, 8, frame->chunks[k].stride);
+    store<int32_t>(chunk, 12, 0);
+  }
+  write_header_meta(p, id, frame->pts);
+  if (!p.holds[id]) {
+    p.holds[id] = true;
+    ++share.users[id];
+  }
+  p.video_seen = frame->sequence;
+  store<uint32_t>(io, 4, id);
+  store<int32_t>(io, 0, kStatusHaveData);
+  return true;
+}
+
 // ---- the cycle -----------------------------------------------------------------------------------------------------------------------------------
 
 // Whether a server-driven node's next cycle is due: playback (to the speakers or a virtual sink's mixer) while the graph holds little, recording once a
@@ -1549,6 +2160,8 @@ bool NativeServer::cycle_due(ClientNode& n, uint64_t now) {
   if (n.media == Media::Audio) {
     if (n.playback) {
       const uint64_t ahead = 2ull * n.quantum > kAheadFrames ? 2ull * n.quantum : kAheadFrames;
+      // (an effect also records: due once a quantum is recorded too, so that its inputs are never given less than a cycle)
+      if (n.record && n.in_channels && n.record->available_bytes() < uint64_t{n.quantum} * 4 * n.in_channels) return false;
       return n.playback->waiting_bytes() < ahead * n.frame();
     }
     if (n.record) return n.record->available_bytes() >= uint64_t{n.quantum} * n.frame();

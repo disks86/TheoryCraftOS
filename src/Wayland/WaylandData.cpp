@@ -33,7 +33,9 @@
 // a drag without a source only within its client), followed (motion) and left; the destination accepts a type and says the actions it takes (version 3:
 // copy, move, ask; the source's and the destination's preference choose one, told to both with action). Releasing the button over a destination that accepted
 // drops (drop, dnd_drop_performed); the destination receives the data as for a paste and says finish (dnd_finished). Anything else cancels the source.
-// The drag's icon surface is not drawn. Drags from or to the desktop's own windows (files of the File Explorer) are not bridged.
+// The drag's icon surface is not drawn. Drags between clients and the desktop's own windows (files of the File Explorer) are bridged by
+// WaylandDragBridge.cpp: the desktop's drag is a drag without a client source whose offers the compositor serves itself, and a client's drag let go
+// outside every surface is read and dropped on the desktop.
 #include "Wayland/WaylandInternal.hpp"
 
 namespace wayland {
@@ -172,7 +174,24 @@ uint32_t Server::make_offer(Client& c, uint32_t device, uint8_t source_client, u
   Event made(device, 0);      // data_offer(new id)
   made.u(id);
   send(c, made);
-  if (source_id == 0) {
+  if (source_id == 0 && dnd) {      // the desktop's drag: a file as a URI list (when a Linux program can see it) and as text
+    if (!desktop_drag_uri_.empty()) {
+      Event e(id, 0);
+      e.string(StringView("text/uri-list"));
+      send(c, e);
+    }
+    const char* const kDragTypes[2] = {"text/plain;charset=utf-8", "text/plain"};
+    for (const char* t : kDragTypes) {
+      Event e(id, 0);
+      e.string(StringView(t));
+      send(c, e);
+    }
+    if (version >= 3) {
+      Event a(id, 1);      // source_actions: copy (the desktop's drops copy)
+      a.u(kActionCopy);
+      send(c, a);
+    }
+  } else if (source_id == 0) {
     if (desktop_kind_ == DesktopData::Image) {
       Event e(id, 0);
       e.string(StringView(kImageType));
@@ -248,6 +267,22 @@ void Server::fetch_selection() {
 void Server::pipe_ready(uint32_t job, Fd write_end) {
   {
     kernel::ScopedMutex lock(mutex_);
+    if (job != 0 && job == program_drop_.job) {      // a drag let go over the desktop: its source writes the data
+      Client* c = client_of(program_drop_.client);
+      if (!c || !source_of(program_drop_.client, program_drop_.source)) return;
+      Event e(program_drop_.source, 1);      // send(mime, fd)
+      e.string(program_drop_.mime.view()).fd(write_end);
+      send(*c, e);
+      return;
+    }
+    if (job != 0 && job == program_drag_.job && !program_drag_.read) {      // a drag over the desktop: the same, before it is let go
+      Client* c = client_of(program_drag_.client);
+      if (!c || !source_of(program_drag_.client, program_drag_.source)) return;
+      Event e(program_drag_.source, 1);      // send(mime, fd)
+      e.string(program_drag_.mime.view()).fd(write_end);
+      send(*c, e);
+      return;
+    }
     if (job == 0 || job != fetch_job_ || !source_of(sel_client_, sel_source_)) return;      // (the selection changed meanwhile: the pipe is closed unused)
     Client* c = client_of(sel_client_);
     Event e(sel_source_, 1);      // send(mime, fd)
@@ -263,6 +298,15 @@ void Server::pipe_read_done(uint32_t job, ConstByteView data) {
   bool image = false;
   {
     kernel::ScopedMutex lock(mutex_);
+    if (job != 0 && job == program_drop_.job) {
+      program_drop_read(data);      // (WaylandDragBridge.cpp)
+      return;
+    }
+    if (job != 0 && job == program_drag_.job && !program_drag_.read) {
+      program_drag_.read = true;
+      drop_items(data, program_drag_.uri, &program_drag_.text);      // (empty: nothing for the desktop; the drag is not shown there)
+      return;
+    }
     if (job == 0 || job != fetch_job_) return;
     fetch_job_ = 0;
     clipboard = clipboard_;
@@ -293,6 +337,8 @@ void Server::source_gone(Client& c, uint32_t source) {
     drag_.source = 0;      // (nothing to tell it any more)
     end_drag(false);
   }
+  if (program_drop_.job != 0 && program_drop_.client == c.number && program_drop_.source == source) reset_program_drop();
+  if (program_drag_.job != 0 && program_drag_.client == c.number && program_drag_.source == source) reset_program_drag();
 }
 
 // ------------------------------------------------------------------ requests
@@ -392,7 +438,7 @@ void Server::data_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, 
           bool present = false;
           const StringView type = in.string(&present);
           if (!in.ok()) return;
-          if (!o.dnd || drag_.offer != id || drag_.client == 0) return;
+          if (!o.dnd || drag_.offer != id || (drag_.client == 0 && !drag_.desktop)) return;
           o.accepted = present;
           if (Client* sc = client_of(o.source_client); sc && source_of(o.source_client, o.source_id)) {
             Event e(o.source_id, 0);      // target(mime or null)
@@ -406,6 +452,20 @@ void Server::data_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, 
           const StringView type = in.string();
           Fd fd = in.fd();
           if (!in.ok()) return;
+          if (o.source_id == 0 && o.dnd) {      // the desktop's drag: what it carries, written by the transport
+            if (!drag_.desktop || drag_.offer != id) return;
+            const bool uri = type == StringView("text/uri-list") && !desktop_drag_uri_.empty();
+            if (!uri && !text_type(type)) return;
+            TransportRequest w;
+            w.kind = TransportRequest::Kind::Write;
+            w.job = next_job_++;
+            w.fd = util::move(fd);
+            w.data = SharedPointer<ByteBuffer>::make(allocator_, allocator_);
+            const StringView what = uri ? desktop_drag_uri_.view() : !desktop_drag_linux_.empty() ? desktop_drag_linux_.view() : desktop_drag_text_.view();
+            if (!w.data || !w.data->append(what.bytes())) return;
+            request(util::move(w));
+            return;
+          }
           if (o.source_id == 0 && !o.dnd) {      // the desktop's clipboard: its text or picture, written by the transport
             const bool text = desktop_kind_ == DesktopData::Text && text_type(type);
             const bool picture = desktop_kind_ == DesktopData::Image && type == StringView(kImageType);
@@ -502,6 +562,7 @@ void Server::start_drag(Client& c, uint32_t source, Surface* origin) {
   }
   Surface* icon = drag_.icon;
   drag_ = Drag();
+  reset_program_drag();
   drag_.active = true;
   drag_.client = c.number;
   drag_.source = source;
@@ -511,10 +572,13 @@ void Server::start_drag(Client& c, uint32_t source, Surface* origin) {
   drag_moved();
 }
 
-void Server::drag_moved() {
+void Server::drag_moved() { drag_at(pointer_x_, pointer_y_); }
+
+void Server::drag_at(int32_t x, int32_t y) {
   int32_t lx = 0, ly = 0;
-  Surface* under = surface_at(pointer_x_, pointer_y_, &lx, &ly);
-  if (under && drag_.source == 0 && under->client != drag_.client) under = nullptr;      // (a drag without data stays in its client)
+  Surface* under = surface_at(x, y, &lx, &ly);
+  if (under && drag_.source == 0 && !drag_.desktop && under->client != drag_.client) under = nullptr;      // (a drag without data stays in its client)
+  program_drag_at(x, y, under == nullptr);      // (a client's drag over the desktop: WaylandDragBridge.cpp)
   if (under != drag_.focus) {
     drag_focus(under, lx, ly);
     return;
@@ -558,7 +622,7 @@ void Server::drag_focus(Surface* s, int32_t lx, int32_t ly) {
   devices_of(*c, &devices);
   const uint32_t serial = next_serial();
   for (uint32_t d : devices.view()) {
-    const uint32_t offer = drag_.source ? make_offer(*c, d, drag_.client, drag_.source, true) : 0;
+    const uint32_t offer = drag_.desktop ? make_offer(*c, d, 0, 0, true) : drag_.source ? make_offer(*c, d, drag_.client, drag_.source, true) : 0;
     if (offer) drag_.offer = offer;
     Event e(d, 1);      // enter(serial, surface, x, y, offer)
     e.u(serial).u(s->id).fixed(lx).fixed(ly).u(offer);
@@ -566,11 +630,16 @@ void Server::drag_focus(Surface* s, int32_t lx, int32_t ly) {
   }
 }
 
-void Server::drag_button_released() {
+bool Server::drag_taken() {
   Client* fc = drag_.focus ? client_of(drag_.focus->client) : nullptr;
   Resource* offer = fc && drag_.offer ? fc->objects.find(drag_.offer) : nullptr;
-  const bool accepted = offer && offer->iface == Iface::DataOffer && offer->offer && offer->offer->accepted && drag_action(*offer->offer) != 0;
-  if (!accepted) {
+  return offer && offer->iface == Iface::DataOffer && offer->offer && offer->offer->accepted && drag_action(*offer->offer) != 0;
+}
+
+void Server::drag_button_released() {
+  Client* fc = drag_.focus ? client_of(drag_.focus->client) : nullptr;
+  if (!drag_taken()) {
+    if (!drag_.focus && start_program_drop()) return;      // (let go over the desktop: WaylandDragBridge.cpp)
     end_drag(false);
     return;
   }
@@ -594,6 +663,7 @@ void Server::end_drag(bool dropped) {
   if (Client* sc = client_of(drag_.client); sc && source_of(drag_.client, drag_.source)) send(*sc, Event(drag_.source, 2));      // cancelled
   const bool was_active = drag_.active;
   drag_ = Drag();
+  reset_program_drag();
   if (was_active) pointer_moved(false);
 }
 

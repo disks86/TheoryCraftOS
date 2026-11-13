@@ -545,6 +545,19 @@ NATIVE(el_can_play_type) {
   return true;
 }
 
+// __video_quality(video): [pictures shown, pictures dropped] so far (getVideoPlaybackQuality).
+NATIVE(video_quality_native) {
+  (void)self;
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  uint64_t presented = 0, dropped = 0;
+  if (n && n->is_element()) objs(vm).video_quality(n->serial, &presented, &dropped);
+  JsObject* a = vm.new_array();
+  vm.array_push(a, num_value(static_cast<double>(presented)));
+  vm.array_push(a, num_value(static_cast<double>(dropped)));
+  *result = Value::make_object(a);
+  return true;
+}
+
 NATIVE(el_decode) {   // img.decode(): the picture is fetched when the page is drawn; nothing to wait for here
   (void)args;
   (void)argc;
@@ -1963,6 +1976,7 @@ bool install_media(DomBindings::Impl& c) {
   Vm& vm = c.vm;
   JsObject* g = vm.global();
   JsObject* ep = c.element_proto;
+  vm.define_native(g, "__video_quality", video_quality_native, 1);
   vm.define_native(ep, "play", el_play, 0);
   vm.define_native(ep, "pause", el_pause, 0);
   vm.define_native(ep, "load", el_load, 0);

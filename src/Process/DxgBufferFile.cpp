@@ -25,6 +25,29 @@ namespace process {
 namespace {
 DxgBufferCopier g_copier = nullptr;      // set once at boot (install_dxg), before any process runs
 DxgBufferDescriber g_describer = nullptr;
+DxgBufferIdler g_idler = nullptr;
+DxgSyncReader g_sync_reader = nullptr;
+DxgSyncSignaller g_sync_signaller = nullptr;
+}
+
+void set_dxg_buffer_idler(DxgBufferIdler idler) { g_idler = idler; }
+void set_dxg_sync_ops(DxgSyncReader reader, DxgSyncSignaller signaller) {
+  g_sync_reader = reader;
+  g_sync_signaller = signaller;
+}
+
+bool DxgBufferFile::gpu_idle() { return !g_idler || !exported_ || g_idler(*exported_); }
+
+bool DxgSyncFile::value(uint64_t* out) {
+  if (!g_sync_reader || !exported_) return false;
+  *out = g_sync_reader(*exported_);
+  return true;
+}
+
+bool DxgSyncFile::signal(uint64_t point) {
+  if (!g_sync_signaller || !exported_) return false;
+  g_sync_signaller(*exported_, point);
+  return true;
 }
 
 void set_dxg_buffer_copier(DxgBufferCopier copier) { g_copier = copier; }

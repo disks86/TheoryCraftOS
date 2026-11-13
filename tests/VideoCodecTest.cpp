@@ -17,7 +17,7 @@
  */
 
 // Host-side tests for the video codec layer: frame formats, colour conversion, the baseline JPEG decoder and
-// encoder, the software codec sessions (MJPEG and raw) and the device list.
+// encoder, the software codec sessions (MJPEG and raw), the device list, and the software decoders of VP8, VP9, AV1, MPEG-4 Part 2 and H.263.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +37,7 @@
 #include "Hardware/VideoCodec/Intel/IntelMediaVideoEngine.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaMediaEngineHw.hpp"
 #include "Hardware/VideoCodec/NVIDIA/NvidiaVideoEngine.hpp"
+#include <string>
 #include <vector>
 #include "Utility/Crc32.hpp"
 
@@ -222,6 +223,36 @@ static void test_convert() {
     CHECK(!convert_to_bgra(one.frame(), padded, 1));
   }
   CHECK(a.live == 0);
+}
+
+// Motion JPEG as webcams send it, without DHT segments: the decoder takes the standard tables (T.81 Annex K) and gets the same picture as from the file
+// with them (tests/data/mjpeg_standard_tables.jpg: ffmpeg -c:v mjpeg -huffman default).
+static void test_jpeg_without_huffman_tables() {
+  TestAllocator a;
+  std::vector<uint8_t> file;
+  if (FILE* f = fopen("tests/data/mjpeg_standard_tables.jpg", "rb")) {
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) file.insert(file.end(), buf, buf + n);
+    fclose(f);
+  }
+  CHECK(file.size() > 100);
+  std::vector<uint8_t> stripped(file.begin(), file.begin() + 2);
+  size_t at = 2, dropped = 0;
+  while (at + 4 <= file.size()) {      // (the segments up to the scan, the DHTs left out; the scan and what follows as they are)
+    const uint8_t marker = file[at + 1];
+    const size_t length = size_t(file[at + 2]) << 8 | file[at + 3];
+    if (marker == 0xDA) { stripped.insert(stripped.end(), file.begin() + long(at), file.end()); break; }
+    if (marker == 0xC4) ++dropped;
+    else stripped.insert(stripped.end(), file.begin() + long(at), file.begin() + long(at + 2 + length));
+    at += 2 + length;
+  }
+  CHECK(dropped >= 1);
+  JpegDecoder with(a), without(a);
+  CHECK(with.decode(ConstByteView(file.data(), file.size())) && without.decode(ConstByteView(stripped.data(), stripped.size())));
+  CHECK(with.width() == 64 && with.height() == 48 && without.width() == 64 && without.height() == 48);
+  std::vector<uint32_t> p1(64 * 48), p2(64 * 48);
+  CHECK(with.output_bgra(p1.data(), 64) && without.output_bgra(p2.data(), 64) && p1 == p2);
 }
 
 static void test_jpeg_decode_reference() {
@@ -487,7 +518,7 @@ static void test_system_list() {
     CHECK(!system.at(1)->info().hardware_engine && strcmp(system.at(1)->name(), "Software video codec") == 0);
     CHECK(system.at(1)->engine_summary()[0] == 0 && strstr(system.at(0)->engine_summary(), "chip ID not read"));   // no mapper: nothing was read
     CHECK(system.at(2) == nullptr);
-    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1)));
+    CHECK(system.decode_codecs() == (codec_mask(VideoCodec::Raw) | codec_mask(VideoCodec::Mjpeg) | codec_mask(VideoCodec::H264) | codec_mask(VideoCodec::Hevc) | codec_mask(VideoCodec::Vp8) | codec_mask(VideoCodec::Vp9) | codec_mask(VideoCodec::Av1) | codec_mask(VideoCodec::Mpeg2) | codec_mask(VideoCodec::Vc1) | codec_mask(VideoCodec::Mpeg4) | codec_mask(VideoCodec::H263)));
     DecoderConfig dc;
     dc.codec = VideoCodec::Mjpeg;
     CHECK(system.create_decoder(dc));
@@ -1928,10 +1959,305 @@ static void test_amd_media_engine() {
   CHECK(navi31.initialize() && navi31.info().hardware_engine && !navi31.info().accelerated);
 }
 
+// ---- MPEG-4 Part 2 and H.263 ----
+// The streams of scripts/gen_mpeg4_decoder_streams.sh (FFmpeg's mpeg4 and h263 encoders, libxvid) decode to the pictures FFmpeg's decoder makes of them (its C code,
+// simple IDCT, one thread): the same pictures in the same order, each sample within a level or two (the decoder follows FFmpeg's arithmetic, so in practice they are
+// equal). Damaged streams (cut short, bits flipped) must not fault, hang or leak.
+
+static std::vector<uint8_t> read_data_file(const char* name) {
+  char path[256];
+  snprintf(path, sizeof path, "tests/data/%s", name);
+  std::vector<uint8_t> bytes;
+  FILE* f = fopen(path, "rb");
+  if (!f) return bytes;
+  uint8_t chunk[4096];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) bytes.insert(bytes.end(), chunk, chunk + n);
+  fclose(f);
+  return bytes;
+}
+
+// Splits a stream into packets as a container would hold them: an MPEG-4 stream into planes (the headers before a plane go with it), an H.263 stream at its
+// picture start codes.
+static std::vector<std::pair<size_t, size_t>> split_mpeg4(const std::vector<uint8_t>& d) {
+  std::vector<std::pair<size_t, size_t>> units;
+  const bool h263 = d.size() > 3 && d[0] == 0 && d[1] == 0 && (d[2] & 0xFC) == 0x80;
+  size_t begin = 0;
+  bool seen_plane = false;
+  for (size_t i = 0; i + 3 < d.size(); ++i) {
+    if (h263) {
+      if (i > begin && d[i] == 0 && d[i + 1] == 0 && (d[i + 2] & 0xFC) == 0x80) {
+        units.push_back({begin, i});
+        begin = i;
+      }
+      continue;
+    }
+    if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+      if (seen_plane) {
+        units.push_back({begin, i});
+        begin = i;
+        seen_plane = false;
+      }
+      if (d[i + 3] == 0xB6) seen_plane = true;
+      i += 2;
+    }
+  }
+  units.push_back({begin, d.size()});
+  return units;
+}
+
+struct Mpeg4Run {
+  int frames = 0;
+  int max_diff = 0;
+  bool decoded_all = true;
+  std::vector<int64_t> pts;          // of the pictures, in the order they came out
+  std::vector<double> psnr;          // of each picture's luma against `ref` (when given)
+};
+
+// Decodes `stream` in packets of `group` units (more than one: a packed bitstream) and compares the pictures with `ref` (when given).
+static Mpeg4Run mpeg4_run(TestAllocator& a, VideoCodec codec, const std::vector<uint8_t>& stream, const std::vector<uint8_t>* ref, uint32_t w, uint32_t h,
+                          size_t group = 1, ConstByteView codec_config = ConstByteView(),
+                          const std::vector<std::vector<uint8_t>>* packets = nullptr) {
+  Mpeg4Run run;
+  SoftwareVideoCodec sw(a);
+  DecoderConfig dc;
+  dc.codec = codec;
+  dc.output = PixelFormat::I420;
+  dc.codec_config = codec_config;
+  UniquePointer<IVideoDecoder> dec = sw.create_decoder(dc);
+  if (!dec) {
+    run.decoded_all = false;
+    return run;
+  }
+  const size_t frame_bytes = size_t{w} * h + 2 * size_t{(w + 1) / 2} * ((h + 1) / 2);
+  auto drain = [&]() {
+    VideoFrame f;
+    while (dec->receive(&f)) {
+      run.pts.push_back(f.pts_us);
+      if (ref && f.format.width == w && f.format.height == h && (run.frames + 1) * frame_bytes <= ref->size()) {
+        const uint8_t* r = ref->data() + run.frames * frame_bytes;
+        double se = 0;
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x) {
+            const double d = double(f.plane[0][y * f.stride[0] + x]) - r[y * w + x];
+            se += d * d;
+          }
+        run.psnr.push_back(se == 0 ? 99.0 : 10.0 * log10(255.0 * 255.0 * w * h / se));
+        for (int c = 0; c < 3; ++c) {
+          const uint32_t pw = c ? (w + 1) / 2 : w, ph = c ? (h + 1) / 2 : h;
+          for (uint32_t y = 0; y < ph; ++y)
+            for (uint32_t x = 0; x < pw; ++x) {
+              const int d = abs(f.plane[c][y * f.stride[c] + x] - r[y * pw + x]);
+              if (d > run.max_diff) run.max_diff = d;
+            }
+          r += size_t{pw} * ph;
+        }
+      } else if (ref) {
+        run.max_diff = 255;
+      }
+      ++run.frames;
+    }
+  };
+  const std::vector<std::pair<size_t, size_t>> units = split_mpeg4(stream);
+  if (packets) {
+    for (size_t k = 0; k < packets->size(); ++k) {
+      VideoPacket packet;
+      packet.data = ConstByteView((*packets)[k].data(), (*packets)[k].size());
+      packet.pts_us = static_cast<int64_t>(k) * 40000;
+      drain();
+      if (dec->submit(packet) != SubmitResult::Accepted) run.decoded_all = false;
+    }
+    dec->flush();
+    drain();
+    return run;
+  }
+  for (size_t u = 0; u < units.size(); u += group) {
+    const size_t end = units[u + group - 1 < units.size() ? u + group - 1 : units.size() - 1].second;
+    VideoPacket packet;
+    packet.data = ConstByteView(stream.data() + units[u].first, end - units[u].first);
+    packet.pts_us = static_cast<int64_t>(u) * 40000;
+    drain();
+    if (dec->submit(packet) != SubmitResult::Accepted) run.decoded_all = false;
+  }
+  dec->flush();
+  drain();
+  return run;
+}
+
+static void test_mpeg4() {
+  struct Case {
+    const char* name;
+    VideoCodec codec;
+    uint32_t w, h;
+    int frames;
+  };
+  const Case cases[] = {{"m4vdec_packets.m4v", VideoCodec::Mpeg4, 96, 64, 8},     {"m4vdec_bframes.m4v", VideoCodec::Mpeg4, 96, 64, 8},
+                        {"m4vdec_qpel.m4v", VideoCodec::Mpeg4, 96, 64, 8},        {"m4vdec_interlaced.m4v", VideoCodec::Mpeg4, 96, 64, 8},
+                        {"m4vdec_oddsize.m4v", VideoCodec::Mpeg4, 90, 54, 8},     {"m4vdec_xvid.m4v", VideoCodec::Mpeg4, 96, 64, 7},
+                        {"h263dec_ip.h263", VideoCodec::H263, 128, 96, 8},        {"h263dec_q.h263", VideoCodec::H263, 128, 96, 8},
+                        {"h263dec_ip.h263", VideoCodec::Mpeg4, 128, 96, 8},       // (an MPEG-4 decoder takes the short header too)
+                        {"m4vdec_partitioned.m4v", VideoCodec::Mpeg4, 96, 64, 8}, {"m4vdec_gmc.m4v", VideoCodec::Mpeg4, 128, 96, 7},
+                        {"h263dec_plus.h263", VideoCodec::H263, 112, 80, 8},      {"m4vdec_rvlc.m4v", VideoCodec::Mpeg4, 48, 32, 4},
+                        // (PB-frames, Improved PB-frames and B pictures: streams and pictures from scripts/gen_h263_bframe_streams.py's model of the Recommendation)
+                        {"h263dec_pb.h263", VideoCodec::H263, 128, 96, 9},        {"h263dec_ipb.h263", VideoCodec::H263, 128, 96, 9},
+                        {"h263dec_b.h263", VideoCodec::H263, 128, 96, 5}};
+  TestAllocator a;
+  for (const Case& c : cases) {
+    const std::vector<uint8_t> stream = read_data_file(c.name);
+    char ref_name[128];
+    snprintf(ref_name, sizeof ref_name, "%.*s.yuv", static_cast<int>(strrchr(c.name, '.') - c.name), c.name);
+    const std::vector<uint8_t> ref = read_data_file(ref_name);
+    CHECK(!stream.empty() && !ref.empty());
+    if (stream.empty() || ref.empty()) continue;
+    const Mpeg4Run run = mpeg4_run(a, c.codec, stream, &ref, c.w, c.h);
+    if (run.frames != c.frames || run.max_diff > 2 || !run.decoded_all) printf("  %s: %d frames, max difference %d\n", c.name, run.frames, run.max_diff);
+    CHECK(run.decoded_all && run.frames == c.frames && run.max_diff <= 2);
+  }
+  // A packed bitstream (DivX's: an anchor and the B plane after it in one packet), and the layer header given as the codec configuration (as in an MP4 file).
+  {
+    const std::vector<uint8_t> stream = read_data_file("m4vdec_bframes.m4v"), ref = read_data_file("m4vdec_bframes.yuv");
+    const Mpeg4Run packed = mpeg4_run(a, VideoCodec::Mpeg4, stream, &ref, 96, 64, 2);
+    CHECK(packed.frames == 8 && packed.max_diff <= 2);
+    size_t vol_end = 0;
+    for (size_t i = 0; i + 3 < stream.size(); ++i)
+      if (stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 && stream[i + 3] == 0xB6) {
+        vol_end = i;
+        break;
+      }
+    CHECK(vol_end > 0);
+    const Mpeg4Run configured = mpeg4_run(a, VideoCodec::Mpeg4, stream, &ref, 96, 64, 1, ConstByteView(stream.data(), vol_end));
+    CHECK(configured.frames == 8 && configured.max_diff <= 2);
+    // DivX's packed bitstream in an AVI file: an anchor and the B plane after it in one packet, then a placeholder (a plane that is not coded) where the B
+    // plane was. Each picture carries the time of the packet that stands for it: the same times as the unpacked stream's.
+    std::vector<std::vector<uint8_t>> packets;
+    const std::vector<std::pair<size_t, size_t>> units = split_mpeg4(stream);
+    const uint8_t nvop[] = {0, 0, 1, 0xB6, 0x50, 0x4F};   // P, modulo_time_base 0, marker, 5-bit increment 0 (25 Hz), marker, vop_coded 0, stuffing
+    for (size_t u = 0; u < units.size(); ++u) {
+      size_t vop = units[u].first;
+      while (vop + 4 < units[u].second && !(stream[vop] == 0 && stream[vop + 1] == 0 && stream[vop + 2] == 1 && stream[vop + 3] == 0xB6)) ++vop;
+      const bool anchor = vop + 4 < units[u].second && (stream[vop + 4] >> 6) != 2;
+      if (anchor && u + 1 < units.size()) {
+        size_t next = units[u + 1].first;
+        while (next + 4 < units[u + 1].second && !(stream[next] == 0 && stream[next + 1] == 0 && stream[next + 2] == 1 && stream[next + 3] == 0xB6)) ++next;
+        if (next + 4 < units[u + 1].second && (stream[next + 4] >> 6) == 2) {   // a B plane follows: pack it
+          packets.emplace_back(stream.begin() + static_cast<long>(units[u].first), stream.begin() + static_cast<long>(units[u + 1].second));
+          packets.emplace_back(nvop, nvop + sizeof nvop);
+          ++u;
+          continue;
+        }
+      }
+      packets.emplace_back(stream.begin() + static_cast<long>(units[u].first), stream.begin() + static_cast<long>(units[u].second));
+    }
+    const Mpeg4Run avi = mpeg4_run(a, VideoCodec::Mpeg4, stream, &ref, 96, 64, 1, ConstByteView(), &packets);
+    const Mpeg4Run unpacked = mpeg4_run(a, VideoCodec::Mpeg4, stream, &ref, 96, 64);
+    CHECK(avi.frames == 8 && avi.max_diff <= 2 && avi.pts == unpacked.pts && packets.size() == units.size());
+    CHECK(unpacked.pts.size() == 8 && unpacked.pts[1] == 2 * 40000);   // (display order: I, then the B planes, decoded after the P)
+    // A configuration that is not a layer header is refused.
+    SoftwareVideoCodec sw(a);
+    DecoderConfig dc;
+    dc.codec = VideoCodec::Mpeg4;
+    const uint8_t junk[] = {0, 0, 1, 0x20, 0, 0, 0};
+    dc.codec_config = ConstByteView(junk, sizeof junk);
+    CHECK(!sw.create_decoder(dc));
+  }
+  CHECK(a.live == 0);
+}
+
+// H.263 advanced prediction (overlapped block motion compensation) is checked against the encoder's reconstruction: the PSNR of each picture against the
+// source must be the one FFmpeg's encoder reported (FFmpeg's decoder drifts here; see scripts/gen_mpeg4_decoder_streams.sh).
+static void test_h263_obmc() {
+  TestAllocator a;
+  const std::vector<uint8_t> source = read_data_file("h263dec_obmc.src.yuv");
+  CHECK(!source.empty());
+  for (const char* name : {"h263dec_obmc", "h263dec_obmcplus"}) {
+    char path[64];
+    snprintf(path, sizeof path, "%s.h263", name);
+    const std::vector<uint8_t> stream = read_data_file(path);
+    snprintf(path, sizeof path, "%s.psnr", name);
+    const std::vector<uint8_t> text = read_data_file(path);
+    std::vector<double> expected;
+    std::string number;
+    for (uint8_t c : text) {
+      if (c == '\n') {
+        if (!number.empty()) expected.push_back(atof(number.c_str()));
+        number.clear();
+      } else {
+        number.push_back(static_cast<char>(c));
+      }
+    }
+    CHECK(!stream.empty() && expected.size() == 8);
+    const Mpeg4Run run = mpeg4_run(a, VideoCodec::H263, stream, &source, 128, 96);
+    bool same = run.psnr.size() == expected.size();
+    for (size_t k = 0; same && k < expected.size(); ++k) same = fabs(run.psnr[k] - expected[k]) < 0.006;
+    if (!same) {
+      printf("  %s: PSNR", name);
+      for (double v : run.psnr) printf(" %.2f", v);
+      printf("\n");
+    }
+    CHECK(run.decoded_all && run.frames == 8 && same);
+  }
+  CHECK(a.live == 0);
+}
+
+// Cut-short and bit-flipped streams: every packet of a stream cut at many points, and copies of the whole stream with bits flipped, decode without a fault (the
+// sanitizers watch) and leave nothing allocated.
+static void test_mpeg4_robustness() {
+  TestAllocator a;
+  const char* names[] = {"m4vdec_packets.m4v", "m4vdec_bframes.m4v",     "m4vdec_qpel.m4v",   "m4vdec_interlaced.m4v", "m4vdec_xvid.m4v",
+                         "m4vdec_partitioned.m4v", "m4vdec_gmc.m4v", "m4vdec_rvlc.m4v", "h263dec_ip.h263", "h263dec_plus.h263",     "h263dec_obmcplus.h263", "h263dec_pb.h263", "h263dec_ipb.h263", "h263dec_b.h263"};
+  uint32_t seed = 12345;
+  auto random = [&seed]() {
+    seed = seed * 1103515245u + 12345u;
+    return seed >> 8;
+  };
+  for (const char* name : names) {
+    const std::vector<uint8_t> stream = read_data_file(name);
+    if (stream.empty()) continue;
+    const VideoCodec codec = strstr(name, "h263") ? VideoCodec::H263 : VideoCodec::Mpeg4;
+    // Truncation: the stream cut at every 97th byte (the last packet is partial), and every packet cut short in turn.
+    for (size_t cut = 0; cut < stream.size(); cut += 97) {
+      const std::vector<uint8_t> part(stream.begin(), stream.begin() + static_cast<long>(cut));
+      const Mpeg4Run run = mpeg4_run(a, codec, part, nullptr, 0, 0);
+      CHECK(run.frames <= 10);
+    }
+    const std::vector<std::pair<size_t, size_t>> units = split_mpeg4(stream);
+    for (size_t u = 0; u < units.size(); ++u) {
+      std::vector<uint8_t> damaged;
+      for (size_t k = 0; k < units.size(); ++k) {
+        const size_t len = units[k].second - units[k].first;
+        const size_t keep = k == u ? len / 3 : len;
+        damaged.insert(damaged.end(), stream.begin() + static_cast<long>(units[k].first), stream.begin() + static_cast<long>(units[k].first + keep));
+      }
+      const Mpeg4Run run = mpeg4_run(a, codec, damaged, nullptr, 0, 0);
+      CHECK(run.frames <= 9);
+    }
+    // Bit flips: 1, 4 and 32 random bits of the whole stream.
+    for (int trial = 0; trial < 60; ++trial) {
+      std::vector<uint8_t> damaged = stream;
+      const int flips = trial % 3 == 0 ? 1 : trial % 3 == 1 ? 4 : 32;
+      for (int f = 0; f < flips; ++f) {
+        const uint32_t bit = random() % static_cast<uint32_t>(damaged.size() * 8);
+        damaged[bit / 8] = static_cast<uint8_t>(damaged[bit / 8] ^ (1u << (bit % 8)));
+      }
+      const Mpeg4Run run = mpeg4_run(a, codec, damaged, nullptr, 0, 0);
+      CHECK(run.frames <= 40);
+    }
+    // Random bytes after a valid layer header.
+    for (int trial = 0; trial < 20; ++trial) {
+      std::vector<uint8_t> damaged = stream;
+      const size_t from = damaged.size() / 4 + random() % (damaged.size() / 2);
+      for (size_t i = from; i < damaged.size() && i < from + 200; ++i) damaged[i] = static_cast<uint8_t>(random());
+      (void)mpeg4_run(a, codec, damaged, nullptr, 0, 0);
+    }
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   test_formats();
   test_convert();
   test_jpeg_decode_reference();
+  test_jpeg_without_huffman_tables();
   test_jpeg_roundtrip();
   test_jpeg_robustness();
   test_sessions();
@@ -1957,6 +2283,9 @@ int main() {
   test_av1_robustness();
   test_vp8();
   test_vp8_robustness();
+  test_mpeg4();
+  test_h263_obmc();
+  test_mpeg4_robustness();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("video codec tests passed\n");
   return 0;

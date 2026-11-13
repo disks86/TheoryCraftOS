@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Windows/Frame.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Windows/TabFrame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
@@ -44,6 +45,26 @@ void Frame::run_closed_handler(Window* window) {
   if (!closed) return;
   if (window) window->dispatch(closed, *this);
   else closed(*this);
+}
+
+void Frame::set_layer(Layer layer) {
+  UiGuard lock(this);
+  if (layer == layer_) return;
+  layer_ = layer;
+  if (WindowManager* m = manager_) {
+    m->sort_layers();
+    if (reserve_edge_ != Edge::None && reserve_size_ > 0) m->reserves_changed();
+  }
+}
+
+void Frame::set_reserve(Edge edge, uint32_t size) {
+  UiGuard lock(this);
+  if (size == 0) edge = Edge::None;
+  if (edge == Edge::None) size = 0;
+  if (edge == reserve_edge_ && size == reserve_size_) return;
+  reserve_edge_ = edge;
+  reserve_size_ = size;
+  if (WindowManager* m = manager_) m->reserves_changed();
 }
 
 bool Frame::fullscreen() const { return host_ ? host_->fullscreen_ : fullscreen_; }
@@ -293,7 +314,52 @@ void Frame::paint(Painter& painter) {
   draw_button(painter, Part::Close);
 }
 
+Frame::~Frame() = default;
+
+bool Frame::show_window_menu(int32_t x, int32_t y, bool from_keyboard) {
+  UiGuard lock(this);
+  Window* w = window();
+  if (!w || host_) return false;
+  if (!window_menu_) {
+    window_menu_ = UniquePointer<ContextMenu>::make(allocator(), allocator());
+    if (!window_menu_) return false;
+    restore_item_ = window_menu_->add_item("Restore", {&Frame::menu_restore, this});
+    minimize_item_ = window_menu_->add_item("Minimize", {&Frame::menu_minimize, this});
+    maximize_item_ = window_menu_->add_item("Maximize", {&Frame::menu_maximize, this});
+    window_menu_->add_separator();
+    close_item_ = window_menu_->add_item("Close", {&Frame::menu_close, this}, "Alt+F4");
+    window_menu_->on_opening(Handler::immediate(&Frame::menu_opening, this));
+  }
+  const Point o = window_origin();
+  return window_menu_->show(*w, o.x + x, o.y + y, from_keyboard);
+}
+
+void Frame::menu_opening(void* self, Control&) {
+  auto* f = static_cast<Frame*>(self);
+  const State s = f->state();
+  f->restore_item_->set_enabled(s != State::Normal);
+  f->minimize_item_->set_enabled(f->can_minimize_ && s != State::Minimized);
+  f->maximize_item_->set_enabled(f->can_maximize_ && s != State::Maximized);
+  f->close_item_->set_enabled(f->can_close_);
+}
+void Frame::menu_restore(void* self, Control&) {
+  auto* f = static_cast<Frame*>(self);
+  f->restore();
+  f->activate();
+}
+void Frame::menu_minimize(void* self, Control&) { static_cast<Frame*>(self)->minimize(); }
+void Frame::menu_maximize(void* self, Control&) {
+  auto* f = static_cast<Frame*>(self);
+  f->maximize();
+  f->activate();
+}
+void Frame::menu_close(void* self, Control&) { static_cast<Frame*>(self)->close(); }
+
 void Frame::on_mouse_down(const MouseArgs& args) {
+  if (args.button == MouseButton::Right) {      // the title bar's right click: the window menu where it was clicked
+    if (decorated_ && !fullscreen_ && part_at(args.x, args.y) == Part::TitleBar) show_window_menu(args.x, args.y);
+    return;
+  }
   if (args.button != MouseButton::Left) return;
   const Part part = part_at(args.x, args.y);
   const Point o = window_origin();
@@ -384,6 +450,10 @@ bool Frame::on_key(const KeyArgs& args) {
     close();
     return true;
   }
+  // Alt+Space: the window menu below the title bar's left end
+  if (args.usage == hardware::key::kSpace && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) &&
+      !(args.modifiers & (hardware::modifier::kLeftControl | hardware::modifier::kRightControl)) && !host_)
+    return show_window_menu(kBorder, kBorder + kTitleHeight, true);
   return false;
 }
 
