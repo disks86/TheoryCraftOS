@@ -143,6 +143,14 @@ class Server final : public desktop::IWindowsSession {
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
+  // Drag and drop with the desktop (XDND, X11DragAndDrop.cpp)
+  bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) override;
+  bool desktop_drop() override;
+  void desktop_drag_end() override;
+  bool take_program_drop(String* text, int32_t* x, int32_t* y) override;
+  void program_drop_done(bool taken) override;
+  bool program_drag(String* text, int32_t* x, int32_t* y) override;
+  void program_drag_answer(bool would_take) override;
 
   // Tests: the pixel of a top-level's picture (0 when outside or none).
   uint32_t picture_pixel(uint32_t window, int32_t x, int32_t y);
@@ -314,6 +322,21 @@ class Server final : public desktop::IWindowsSession {
   void send_client_message(Window& w, uint32_t type, uint32_t d0, uint32_t d1);
   bool has_protocol(Window& w, uint32_t protocol);
   uint32_t intern(StringView name);       // (never fails for the server's own names: they fit)
+
+  // --- drag and drop (X11DragAndDrop.cpp)
+  void xdnd_setup();                                                          // the atoms, the root's XdndAware
+  bool xdnd_client_message(Window& target, const Packet& p);                  // an XDND message to the root or the source window: handled (true)
+  bool xdnd_selection_notify(Window& target, const Packet& p);                // the answer to the server's own request for a client's drag data
+  bool xdnd_convert(Client& c, Window& requestor, uint32_t selection, uint32_t target, uint32_t property, uint32_t time);      // ConvertSelection of the server's drag
+  void xdnd_client_gone(uint8_t client);
+  void send_client_message5(Window& w, uint32_t type, const uint32_t (&data)[5]);
+  void out_drag_position();
+  void out_drag_leave();
+  void out_drag_reset();
+  void in_drag_reset();
+  void in_drag_status();
+  void in_drag_finish(bool taken);
+  void in_drag_read(ConstByteView data);
   StringView atom_name(uint32_t atom) const;
   uint32_t now();
 
@@ -399,6 +422,27 @@ class Server final : public desktop::IWindowsSession {
   Grab pointer_grab_, keyboard_grab_;
   uint32_t last_time_ = 0;
   uint64_t fake_clock_ = 0;
+  // drag and drop (XDND): its atoms
+  struct XdndAtoms {
+    uint32_t aware = 0, enter = 0, position = 0, status = 0, leave = 0, drop = 0, finished = 0, selection = 0, action_copy = 0, type_list = 0;
+    uint32_t uri_list = 0, text_plain = 0, text_utf8 = 0, targets = 0, data = 0, incr = 0, utf8 = 0;
+  } xa_;
+  // the desktop's drag into a client (the server is the source; its window is wm_check_)
+  struct OutDrag {
+    bool active = false, accepted = false, waiting = false, pending = false, dropped = false;
+    uint32_t target = 0, version = 0;
+    int32_t x = 0, y = 0;
+  } out_drag_;
+  String out_text_, out_uri_, out_linux_;
+  // a client's drag over the desktop (the root is its target)
+  struct InDrag {
+    bool active = false, uri = false, asked = false, read = false, dropped = false, ready = false, given = false;
+    uint8_t client = 0;
+    uint32_t source = 0, version = 0, type = 0;
+    int32_t x = 0, y = 0;
+    int8_t answer = -1;           // the desktop's last answer (-1 none)
+  } in_drag_;
+  String in_text_;
 };
 
 }  // namespace x11

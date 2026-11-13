@@ -354,7 +354,7 @@ depends on itself:
   `image/jpeg`) stay between Wayland clients, and the desktop's pictures are offered only as `image/png`. A drag's icon surface is not drawn. Drags with the desktop: the desktop's drag carries
   one item and only copies; a client's drag over the desktop is shown and answered from its first item only, and
   takes URIs and text only (no pictures or other types). Windows programs take dropped files (`WM_DROPFILES`, see
-  [WindowsUserMode.md](WindowsUserMode.md)), X programs take nothing (no XDND yet). Selection and drag serials are not checked.
+  [WindowsUserMode.md](WindowsUserMode.md)), X programs take them through XDND (see [X11.md](X11.md)). Selection and drag serials are not checked.
 - **Scale.** The output's scale is 1 because the desktop has none: a HiDPI desktop would need the compositor's logical coordinates apart from its
   pixels (input, configure, geometry). There is one `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's
   mapping is ignored.

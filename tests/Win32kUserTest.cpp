@@ -1298,6 +1298,99 @@ void test_redirection() {
     pump();
   }
 
+  // touches: the window under a finger gets pointer messages (WM_TOUCH when it registered for touch); the first finger left to DefWindowProc is the mouse
+  {
+    pump();
+    const Rc ar = t.window_rect(a);
+    const int32_t px = ar.l + 150, py = ar.t + 100;
+    Th::M m;
+    auto pointer_messages = [&]() {
+      std::vector<Th::M> got;
+      for (int i = 0; i < 16 && t.peek(&m, 0, 0x240, 0x24A); ++i) got.push_back(m);
+      return got;
+    };
+    CHECK(!bridge.touch(hardware::TouchPhase::Down, 1, a, ar.r + 50, py));      // (not over the window)
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 1, a, px, py));
+    std::vector<Th::M> got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x249 && got[1].message == 0x246 && got[1].hwnd == a);
+    if (got.size() < 2) return;
+    const uint32_t id = uint32_t(got[1].wparam & 0xFFFF);
+    const uint32_t mflags = uint32_t(got[1].wparam >> 16);
+    CHECK(id >= 2 && (mflags & 0x1) && (mflags & 0x4) && (mflags & 0x2000));      // new, in contact, primary
+    CHECK(int16_t(got[1].lparam & 0xFFFF) == px && int16_t((got[1].lparam >> 16) & 0xFFFF) == py);
+    const uint64_t info = t.tmp(0x1400);
+    CHECK(t.svc(N::NtUserCallTwoParam, {id, info, 0x7C01}) == 1);
+    CHECK(t.mem().get32(info) == 2 && t.mem().get32(info + 4) == id && t.mem().get64(info + 24) == a && int32_t(t.mem().get32(info + 32)) == px &&
+          int32_t(t.mem().get32(info + 36)) == py && (t.mem().get32(info + 12) & 0x10000) && t.mem().get32(info + 88) == 1);
+    CHECK(t.svc(N::NtUserCallTwoParam, {999, info, 0x7C01}) == 0);
+    CHECK(user_misc::system_metrics(94, 96) == 0xC1 && user_misc::system_metrics(95, 96) == 10);
+    // left to DefWindowProc: the cursor goes there and the left button goes down
+    t.svc(N::NtUserMessageCall, {a, 0x246, got[1].wparam, got[1].lparam, 0, 0x29e, 0});
+    int32_t cx = 0, cy = 0;
+    user::cursor_position(&cx, &cy);
+    CHECK(cx == px && cy == py && t.peek(&m, 0, 0x201, 0x201));      // WM_LBUTTONDOWN
+    // a second finger: its own pointer, not primary, never the mouse
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 2, a, px + 40, py));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && uint32_t(got[1].wparam & 0xFFFF) != id && !((got[1].wparam >> 16) & 0x2000));
+    if (got.size() == 2) t.svc(N::NtUserMessageCall, {a, 0x246, got[1].wparam, got[1].lparam, 0, 0x29e, 0});
+    CHECK(!t.peek(&m, 0, 0x201, 0x201));
+    CHECK(bridge.touch(hardware::TouchPhase::Cancel, 2, a, px + 40, py));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x247 && ((got[0].wparam >> 16) & 0x8000) && got[1].message == 0x24A);      // up (cancelled), leave
+    // the first moves and goes up: update, up, leave; the mouse follows and lets go
+    CHECK(bridge.touch(hardware::TouchPhase::Motion, 1, a, px + 10, py + 5));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x245 && int16_t(got[0].lparam & 0xFFFF) == px + 10);
+    if (got.size() == 1) t.svc(N::NtUserMessageCall, {a, 0x245, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+    user::cursor_position(&cx, &cy);
+    CHECK(cx == px + 10 && cy == py + 5);
+    CHECK(bridge.touch(hardware::TouchPhase::Up, 1, a, px + 10, py + 5));
+    got = pointer_messages();
+    CHECK(got.size() == 2 && got[0].message == 0x247 && got[1].message == 0x24A);
+    if (got.size() == 2) t.svc(N::NtUserMessageCall, {a, 0x247, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+    CHECK(t.peek(&m, 0, 0x202, 0x202));      // WM_LBUTTONUP
+    CHECK(t.svc(N::NtUserCallTwoParam, {id, info, 0x7C01}) == 1 && (t.mem().get32(info + 12) & 0x40000));      // (still readable after its up)
+    CHECK(!bridge.touch(hardware::TouchPhase::Motion, 1, a, px, py));      // (gone)
+    // a touch window (RegisterTouchWindow): WM_TOUCH with one TOUCHINPUT, read until its handle is closed (DefWindowProc closes it)
+    CHECK(t.svc(N::NtUserCallTwoParam, {a, 1 | (3 << 2), 0x7C04}) == 1 && t.svc(N::NtUserCallTwoParam, {a, 2, 0x7C04}) == 4);
+    CHECK(bridge.touch(hardware::TouchPhase::Down, 3, a, px, py));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x240 && got[0].wparam == 1 && got[0].lparam != 0);
+    if (got.size() == 1) {
+      const uint64_t handle = got[0].lparam;
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C02}) == 1);
+      const uint64_t input = t.tmp(0x1500);
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, input, 0x7C02}) == 1);
+      CHECK(int32_t(t.mem().get32(input)) == px * 100 && int32_t(t.mem().get32(input + 4)) == py * 100 && (t.mem().get32(input + 20) & 0x2) &&
+            (t.mem().get32(input + 20) & 0x10));      // down, primary
+      t.svc(N::NtUserMessageCall, {a, 0x240, got[0].wparam, got[0].lparam, 0, 0x29e, 0});
+      CHECK(t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C02}) == 0 && t.svc(N::NtUserCallTwoParam, {handle, 0, 0x7C03}) == 0);      // (closed)
+      CHECK(t.peek(&m, 0, 0x201, 0x201));
+    }
+    CHECK(bridge.touch(hardware::TouchPhase::Up, 3, a, px, py));
+    got = pointer_messages();
+    CHECK(got.size() == 1 && got[0].message == 0x240);
+    if (got.size() == 1) {
+      CHECK(t.svc(N::NtUserCallTwoParam, {got[0].lparam, 0, 0x7C03}) == 1);      // closed by the program
+      CHECK(t.svc(N::NtUserCallTwoParam, {got[0].lparam, 0, 0x7C03}) == 0);
+    }
+    CHECK(t.svc(N::NtUserCallTwoParam, {a, 0, 0x7C04}) == 1 && t.svc(N::NtUserCallTwoParam, {a, 2, 0x7C04}) == 0);
+    // many fingers nobody lifts: bounded tables; inputs nobody closes: bounded
+    t.svc(N::NtUserCallTwoParam, {a, 1, 0x7C04});
+    for (uint32_t i = 0; i < 300; ++i) {
+      bridge.touch(hardware::TouchPhase::Down, 100 + i, a, px, py);
+      bridge.touch(hardware::TouchPhase::Up, 100 + i, a, px, py);
+      for (int k = 0; k < 4 && t.peek(&m, 0, 0x240, 0x24A); ++k) {}
+    }
+    uint32_t inputs = 0, contacts = 0;
+    for (user::TouchInputRecord& r : user::state().touch_inputs) { (void)r; ++inputs; }
+    for (user::TouchContact& c : user::state().touches) { (void)c; ++contacts; }
+    CHECK(inputs <= 257 && contacts <= 9);
+    t.svc(N::NtUserCallTwoParam, {a, 0, 0x7C04});
+    pump();
+  }
+
   // the icon: WM_SETICON's, shown by the desktop
   const uint32_t icon = user_misc::create_cursor_icon(91, true);
   CHECK(icon != 0 && t.svc(N::NtUserMessageCall, {a, 0x80, 0, icon, 0, 0x2b1, 0}) == 0);      // WM_SETICON ICON_SMALL

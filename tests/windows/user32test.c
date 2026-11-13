@@ -19,6 +19,7 @@
 /* The window system of user32.dll over win32k: classes, window creation with its messages (window procedures run in this process through the upcalls of win32u.dll), the tree,
  * styles, text, properties, posted and sent messages, the message loop, timers, enumeration, show/hide and placement. Prints "Test failed" per wrong answer (scripts/winetest.sh
  * counts them), exit code = failures. Build: tests/windows/build.sh. Run: copy the exe to build/winetests/user32_tcos.exe and scripts/winetest.sh user32 tcos. */
+#define _WIN32_WINNT 0x0A00      /* (touch injection and pointer messages) */
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
@@ -920,6 +921,103 @@ static void test_mdi(HINSTANCE instance) {
   UnregisterClassA("TcosMdiFrame", instance);
 }
 
+/* ---- touches ----------------------------------------------------------------------------------------------------------------------------------------------------
+ * Injected fingers (InjectTouchInput, the path the desktop's touchscreen takes): pointer messages with their touch information, the first finger left to
+ * DefWindowProc clicking as the mouse, and WM_TOUCH for a window registered for touch. */
+static int g_ptr_down, g_ptr_update, g_ptr_up, g_ptr_x, g_ptr_y, g_ptr_type_ok, g_lbutton_down, g_lbutton_up, g_touch_msgs, g_touch_down, g_touch_x;
+static int g_handle_pointers;
+static LRESULT CALLBACK touch_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+  switch (message) {
+    case WM_POINTERDOWN: case WM_POINTERUPDATE: case WM_POINTERUP: {
+      const UINT32 id = GET_POINTERID_WPARAM(wparam);
+      POINTER_TOUCH_INFO info;
+      POINTER_INPUT_TYPE type = 0;
+      if (GetPointerType(id, &type) && type == PT_TOUCH && GetPointerTouchInfo(id, &info) && info.pointerInfo.pointerId == id &&
+          info.pointerInfo.hwndTarget == hwnd && IS_POINTER_PRIMARY_WPARAM(wparam))
+        ++g_ptr_type_ok;
+      g_ptr_x = info.pointerInfo.ptPixelLocation.x;
+      g_ptr_y = info.pointerInfo.ptPixelLocation.y;
+      if (message == WM_POINTERDOWN) ++g_ptr_down;
+      else if (message == WM_POINTERUPDATE) ++g_ptr_update;
+      else ++g_ptr_up;
+      if (g_handle_pointers) return 0;
+      break;      /* (left to DefWindowProc: the mouse's turn) */
+    }
+    case WM_LBUTTONDOWN: ++g_lbutton_down; return 0;
+    case WM_LBUTTONUP: ++g_lbutton_up; return 0;
+    case WM_TOUCH: {
+      TOUCHINPUT in[4];
+      const UINT n = LOWORD(wparam);
+      ++g_touch_msgs;
+      if (n >= 1 && n <= 4 && GetTouchInputInfo((HTOUCHINPUT)lparam, n, in, sizeof(TOUCHINPUT))) {
+        if (in[0].dwFlags & TOUCHEVENTF_DOWN) ++g_touch_down;
+        g_touch_x = in[0].x;
+      }
+      CloseTouchInputHandle((HTOUCHINPUT)lparam);
+      return 0;
+    }
+  }
+  return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+static void inject(int x, int y, POINTER_FLAGS flags) {
+  POINTER_TOUCH_INFO c;
+  memset(&c, 0, sizeof c);
+  c.pointerInfo.pointerType = PT_TOUCH;
+  c.pointerInfo.pointerId = 0;
+  c.pointerInfo.ptPixelLocation.x = x;
+  c.pointerInfo.ptPixelLocation.y = y;
+  c.pointerInfo.pointerFlags = flags;
+  CHECK(InjectTouchInput(1, &c));
+}
+static void pump_for(int ms) { DWORD end = GetTickCount() + (DWORD)ms; while ((int)(end - GetTickCount()) > 0) { pump(); Sleep(5); } }
+static void test_touch(HINSTANCE instance) {
+  WNDCLASSA wc;
+  memset(&wc, 0, sizeof wc);
+  wc.lpfnWndProc = touch_proc; wc.hInstance = instance; wc.lpszClassName = "TcosTouch";
+  CHECK(RegisterClassA(&wc) != 0);
+  HWND w = CreateWindowExA(WS_EX_TOPMOST, "TcosTouch", "touch", WS_POPUP | WS_VISIBLE, 200, 150, 300, 200, NULL, NULL, instance, NULL);
+  CHECK(w != NULL);
+  SetForegroundWindow(w);
+  pump_for(100);
+  const POINTER_INPUT_TYPE none = 0;
+  POINTER_INPUT_TYPE type = none;
+  CHECK(!GetPointerType(77, &type));
+  CHECK(!InjectTouchInput(0, NULL));
+  CHECK(InitializeTouchInjection(4, TOUCH_FEEDBACK_NONE));
+  /* handled pointer messages: down, update, up with their information; no mouse */
+  g_handle_pointers = 1;
+  inject(300, 250, POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+  pump_for(50);
+  CHECK(g_ptr_down == 1 && g_ptr_x == 300 && g_ptr_y == 250);
+  inject(310, 255, POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+  pump_for(50);
+  CHECK(g_ptr_update == 1 && g_ptr_x == 310);
+  inject(310, 255, POINTER_FLAG_UP);
+  pump_for(50);
+  CHECK(g_ptr_up == 1 && g_ptr_type_ok == 3 && g_lbutton_down == 0);
+  CHECK(GetSystemMetrics(SM_DIGITIZER) & NID_READY);
+  /* left to DefWindowProc: the window is clicked */
+  g_handle_pointers = 0;
+  inject(320, 260, POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+  pump_for(80);
+  inject(320, 260, POINTER_FLAG_UP);
+  pump_for(80);
+  CHECK(g_ptr_down == 2 && g_lbutton_down == 1 && g_lbutton_up == 1);
+  /* registered for touch: WM_TOUCH (x in hundredths of a pixel) */
+  CHECK(RegisterTouchWindow(w, 0));
+  ULONG flags = 1;
+  CHECK(IsTouchWindow(w, &flags) && flags == 0);
+  inject(330, 270, POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT);
+  pump_for(50);
+  inject(330, 270, POINTER_FLAG_UP);
+  pump_for(50);
+  CHECK(g_touch_msgs == 2 && g_touch_down == 1 && g_touch_x == 33000 && g_ptr_down == 2);
+  CHECK(UnregisterTouchWindow(w) && !IsTouchWindow(w, NULL));
+  CHECK(!CloseTouchInputHandle((HTOUCHINPUT)12345));
+  DestroyWindow(w);
+  pump();
+}
+
 int main(void) {
   HINSTANCE instance = GetModuleHandleA(NULL);
   WNDCLASSA wc;
@@ -1055,6 +1153,7 @@ int main(void) {
   test_menus(instance);
   test_scrolling(instance);
   test_mdi(instance);
+  test_touch(instance);
 
   /* the system metrics are the window manager's */
   CHECK(GetSystemMetrics(SM_CXSCREEN) > 0 && GetSystemMetrics(SM_CYSCREEN) > 0 && GetSystemMetrics(SM_CYCAPTION) > 0);

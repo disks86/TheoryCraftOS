@@ -118,6 +118,9 @@ int main(int argc, char** argv) {
   printf("listening on @/tmp/.X11-unix/X%d\n", display);
   fflush(stdout);
   std::vector<Connection> connections;
+  const bool xdnd = getenv("TCOS_XDND") != nullptr;
+  bool desktop_dropped = false;
+  uint32_t drag_steps = 0;
   const uint64_t end = now_ms() + seconds * 1000;
   std::vector<uint8_t> buffer(256 * 1024);
   while (!g_stop && now_ms() < end) {
@@ -160,6 +163,31 @@ int main(int argc, char** argv) {
       close(connections[i].fd);
       server.close_client(connections[i].client);
       connections.erase(connections.begin() + long(i));
+    }
+    if (xdnd) {      // TCOS_XDND: the desktop's part of tests/x11/xdnd_client.c (its file dragged onto "xdnd-target"; the client's file taken)
+      List<uint32_t> windows(g_allocator);
+      server.windows(&windows);
+      for (uint32_t id : windows.view()) {
+        desktop::WindowsWindowInfo info;
+        String title(g_allocator);
+        if (desktop_dropped || !server.window_info(id, &info, &title) || title.view() != StringView("xdnd-target")) continue;
+        if (server.desktop_drag(id, info.surface.x + 10 + int32_t(drag_steps % 5), info.surface.y + 10, "/Desktop/Documents/a b.txt") && drag_steps > 3) {
+          desktop_dropped = server.desktop_drop();
+          printf("desktop drop: %s\n", desktop_dropped ? "taken" : "refused");
+        }
+        ++drag_steps;
+      }
+      String items(g_allocator);
+      int32_t x = 0, y = 0;
+      if (server.program_drag(&items, &x, &y)) {
+        printf("program drag over the desktop at %d,%d: %s\n", x, y, items.c_str());
+        server.program_drag_answer(true);
+      }
+      if (server.take_program_drop(&items, &x, &y)) {
+        printf("program drop at %d,%d: %s\n", x, y, items.c_str());
+        server.program_drop_done(true);
+      }
+      fflush(stdout);
     }
   }
   if (argc > 3) dump(server, argv[3]);

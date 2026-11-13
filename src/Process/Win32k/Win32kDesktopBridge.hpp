@@ -66,6 +66,8 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   // The desktop's drag of a file over a program's window: taken by a window that accepts files (WS_EX_ACCEPTFILES) under the pointer, which gets
   // WM_DROPFILES with the file's Windows name (filesystem::layout::windows_view_of: C:\..., the user's files under C:\Users\Public\Desktop) when it
   // is let go. Text, and files Windows programs cannot see, are not taken.
+  // A finger over a program's window: taken by the window under it (WM_POINTER*, or WM_TOUCH; Win32kUserTouch.cpp).
+  bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override;
   bool desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) override;
   bool desktop_drop() override;
   void desktop_drag_end() override;
