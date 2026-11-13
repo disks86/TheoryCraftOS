@@ -709,7 +709,7 @@ static void effect_process(void* userdata, struct spa_io_position* position) {
     char what[200];
     snprintf(what, sizeof what, "(its inputs heard left 880 Hz %.3f, right 1320 Hz %.3f, left 1320 Hz %.3f over %u cycles; its outputs played it back)", l880, r1320,
              l1320, d->fx_cycles);
-    finish(d, l880 > 0.1 && r1320 > 0.05 && l1320 < 0.02, what);
+    finish(d, l880 > 0.2 && r1320 > 0.1 && l1320 < 0.02, what);      // (8000 and 4000 of 32768: 0.244 and 0.122)
   }
 }
 

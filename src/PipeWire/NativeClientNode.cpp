@@ -1601,6 +1601,8 @@ bool NativeServer::cycle_due(ClientNode& n, uint64_t now) {
   if (n.media == Media::Audio) {
     if (n.playback) {
       const uint64_t ahead = 2ull * n.quantum > kAheadFrames ? 2ull * n.quantum : kAheadFrames;
+      // (an effect also records: due once a quantum is recorded too, so that its inputs are never given less than a cycle)
+      if (n.record && n.in_channels && n.record->available_bytes() < uint64_t{n.quantum} * 4 * n.in_channels) return false;
       return n.playback->waiting_bytes() < ahead * n.frame();
     }
     if (n.record) return n.record->available_bytes() >= uint64_t{n.quantum} * n.frame();
