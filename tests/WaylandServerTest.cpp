@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -430,7 +431,7 @@ static void test_registry() {
     const uint32_t shm = c.bind(r, "wl_shm");
     int formats = 0;
     for (const Ev& e : c.events) if (e.object == shm && e.opcode == 0) ++formats;
-    CHECK(formats == 4);
+    CHECK(formats == 4 + 17);      // (RGB, then the YUV formats)
     const uint32_t seat = c.bind(r, "wl_seat");
     Ev caps = c.take(seat, 0);
     CHECK(caps.object == seat && caps.u(0) == 7);      // (pointer, keyboard, touch)
@@ -1619,6 +1620,7 @@ struct FakeGpu final : wayland::Memory, wayland::GpuImage {
 };
 
 constexpr uint32_t kAR24 = 0x34325241, kXR24 = 0x34325258, kAB24 = 0x34324241, kXB24 = 0x34324258;
+constexpr size_t kOffered = 4 + 17;      // (the RGB formats and the YUV ones: WaylandYuv.hpp)
 
 // zwp_linux_buffer_params_v1 helpers: params, add plane 0 (fd), create_immed / create.
 struct DmabufApp : App {
@@ -1675,11 +1677,11 @@ static void test_dmabuf() {
     const uint32_t d3 = c.bind(r, "zwp_linux_dmabuf_v1", 3);
     std::vector<uint32_t> formats;
     for (const Ev& e : c.events) if (e.object == d3 && e.opcode == 1 && e.u(1) == 0 && e.u(2) == 0) formats.push_back(e.u(0));
-    CHECK(formats.size() == 4 && c.count(d3, 0) == 0);
+    CHECK(formats.size() == kOffered && c.count(d3, 0) == 0);
     CHECK(std::find(formats.begin(), formats.end(), kAR24) != formats.end() && std::find(formats.begin(), formats.end(), kXB24) != formats.end());
     c.drop_events();
     const uint32_t d2 = c.bind(r, "zwp_linux_dmabuf_v1", 2);
-    CHECK(c.count(d2, 0) == 4 && c.count(d2, 1) == 0);
+    CHECK(c.count(d2, 0) == int(kOffered) && c.count(d2, 1) == 0);
     // version 4: no format events; feedback objects say it all (the format table as a sealed file, /dev/dxg as the device, one tranche)
     c.drop_events();
     const uint32_t d4 = c.bind(r, "zwp_linux_dmabuf_v1", 4);
@@ -1691,7 +1693,7 @@ static void test_dmabuf() {
     for (const Ev& e : c.events) if (e.object == fb) order.push_back(e.opcode);
     CHECK((order == std::vector<uint16_t>{1, 2, 4, 5, 6, 3, 0}));
     Ev table = c.take(fb, 1);
-    CHECK(table.u(0) == 64 && c.fds.size() == fds_before + 1);
+    CHECK(table.u(0) == kOffered * 16 && c.fds.size() == fds_before + 1);
     if (c.fds.size() == fds_before + 1) {
       ByteView t = c.fds.back()->map(64);
       CHECK(t.size() >= 64);
@@ -1707,7 +1709,7 @@ static void test_dmabuf() {
     Ev main_device = c.take(fb, 2);
     CHECK(main_device.u(0) == 8 && main_device.u(1) == ((10u << 8) | 243u) && main_device.u(2) == 0);
     Ev tranche = c.take(fb, 5);
-    CHECK(tranche.u(0) == 8 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
+    CHECK(tranche.u(0) == kOffered * 2 && tranche.u(1) == 0x00010000u && tranche.u(2) == 0x00030002u);
     c.send(Msg(fb, 0));      // destroy
     CHECK(c.take(1, 1).u(0) == fb);
     // per-surface feedback: the same
@@ -1831,10 +1833,10 @@ static void test_dmabuf() {
     std::function<void(DmabufApp&)> run;
   };
   const Case cases[] = {
-      {"plane 1", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(1).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
+      {"plane 4", 1, [](DmabufApp& a) { const uint32_t p = a.new_id(); a.send(Msg(a.dmabuf, 1).u(p)); a.send(Msg(p, 1).u(4).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
       {"plane set twice", 2, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.send(Msg(p, 1).u(0).u(0).u(64).u(0).u(0), {Fd::make_as<FakeGpu>(A, 16u, 16u, 0u)}); }},
       {"no plane", 3, [](DmabufApp& a) { const uint32_t p = a.params(Fd(), 0, 0); a.immed(p, 16, 16); }},
-      {"format", 4, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16, 0x3231564Eu /* NV12 */); }},
+      {"format", 4, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 16, 16, 0x12345678u /* no such format */); }},
       {"size", 5, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64), 0, 16); }},
       {"bounds", 6, [](DmabufApp& a) { a.immed(a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 1024, 64), 16, 16); }},
       {"used", 0, [](DmabufApp& a) { const uint32_t p = a.params(Fd::make_as<FakeGpu>(A, 16u, 16u, 0u), 0, 64); a.immed(p, 16, 16); a.immed(p, 16, 16); }},
@@ -1922,6 +1924,407 @@ static void test_dmabuf_fuzz() {
     run(v, 1 + rng() % 100);
   }
   printf("   dmabuf fuzz: %d sessions\n", sessions);
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// ------------------------------------------------------------------ YUV buffers (WaylandYuv.hpp): wl_shm and dmabuf, converted at commit
+
+constexpr uint32_t kNV12 = 0x3231564E, kYU12 = 0x32315559, kYUYV = 0x56595559, kP010 = 0x30313050;
+
+// BT.601 limited range in floating point: the reference the integer converter must stay within 2 of.
+static uint32_t ref_rgb(int y, int u, int v) {
+  const double c = 1.164383 * (y - 16);
+  auto clamp = [](double d) { return uint32_t(d < 0 ? 0 : d > 255 ? 255 : d + 0.5); };
+  const uint32_t r = clamp(c + 1.596027 * (v - 128)), g = clamp(c - 0.391762 * (u - 128) - 0.812968 * (v - 128)), b = clamp(c + 2.017232 * (u - 128));
+  return 0xFF000000u | r << 16 | g << 8 | b;
+}
+static bool near_rgb(uint32_t a, uint32_t b) {
+  for (int shift = 0; shift < 32; shift += 8) {
+    const int d = int((a >> shift) & 0xFF) - int((b >> shift) & 0xFF);
+    if (d > 2 || d < -2) return false;
+  }
+  return true;
+}
+static uint8_t sy(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 37 + y * 11) % 220); }
+static uint8_t su(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 53 + y * 29) % 225); }
+static uint8_t sv(uint32_t x, uint32_t y) { return uint8_t(16 + (x * 17 + y * 71) % 225); }
+static uint32_t expected_px(const wayland::YuvFormat& f, uint32_t x, uint32_t y) {
+  const uint32_t cx = x / f.hsub, cy = f.planes == 1 ? y : y / f.vsub;
+  return ref_rgb(sy(x, y), su(cx, cy), sv(cx, cy));
+}
+// Writes the test picture into planes at `at[p]` of `out` with `strides[p]`.
+static void write_yuv(const wayland::YuvFormat& f, uint32_t w, uint32_t h, uint8_t* const at[3], const uint32_t strides[3]) {
+  for (uint32_t y = 0; y < h; ++y) {
+    uint8_t* row = at[0] + size_t(y) * strides[0];
+    if (f.planes == 1) {
+      for (uint32_t p = 0; p < (w + 1) / 2; ++p) {
+        const uint8_t y0 = sy(2 * p, y), y1 = sy(2 * p + 1, y), c0 = f.swapped ? sv(p, y) : su(p, y), c1 = f.swapped ? su(p, y) : sv(p, y);
+        uint8_t* q = row + p * 4;
+        if (f.luma_first) q[0] = y0, q[1] = c0, q[2] = y1, q[3] = c1;
+        else q[0] = c0, q[1] = y0, q[2] = c1, q[3] = y1;
+      }
+      continue;
+    }
+    for (uint32_t x = 0; x < w; ++x) {
+      if (f.sample == 2) row[x * 2] = 0x3F, row[x * 2 + 1] = sy(x, y);      // (the low bits are noise the converter must drop)
+      else row[x] = sy(x, y);
+    }
+  }
+  if (f.planes == 1) return;
+  const uint32_t cw = (w + f.hsub - 1) / f.hsub, ch = (h + f.vsub - 1) / f.vsub;
+  for (uint32_t y = 0; y < ch; ++y)
+    for (uint32_t x = 0; x < cw; ++x) {
+      const uint8_t u = su(x, y), v = sv(x, y);
+      if (f.planes == 2) {
+        uint8_t* q = at[1] + size_t(y) * strides[1] + size_t(x) * 2 * f.sample;
+        const uint8_t c0 = f.swapped ? v : u, c1 = f.swapped ? u : v;
+        if (f.sample == 2) q[0] = 0, q[1] = c0, q[2] = 0xC0, q[3] = c1;
+        else q[0] = c0, q[1] = c1;
+      } else {
+        at[1][size_t(y) * strides[1] + x] = f.swapped ? v : u;
+        at[2][size_t(y) * strides[2] + x] = f.swapped ? u : v;
+      }
+    }
+}
+
+static void test_yuv_convert() {
+  int formats = 0, pictures = 0;
+  CHECK(wayland::yuv_formats().size() == 17);
+  wayland::YuvFormat none;
+  CHECK(!wayland::yuv_format(kXR24, &none) && !wayland::yuv_format(0, &none));
+  CHECK(ref_rgb(16, 128, 128) == 0xFF000000u && ref_rgb(235, 128, 128) == 0xFFFFFFFFu);
+  for (uint32_t code : wayland::yuv_formats()) {
+    wayland::YuvFormat f;
+    CHECK(wayland::yuv_format(code, &f) && f.code == code && f.planes >= 1 && f.planes <= 3);
+    ++formats;
+    const uint32_t sizes[][2] = {{1, 1}, {2, 2}, {5, 3}, {16, 8}, {7, 1}};
+    for (const auto& sz : sizes) {
+      const uint32_t w = sz[0], h = sz[1];
+      for (uint32_t pad : {0u, 3u}) {
+        std::vector<std::vector<uint8_t>> mem(f.planes);
+        uint32_t strides[3] = {};
+        uint8_t* at[3] = {};
+        wayland::YuvPlane planes[3];
+        for (uint32_t p = 0; p < f.planes; ++p) {
+          strides[p] = uint32_t(f.row_bytes(p, w)) + pad;
+          mem[p].assign(f.plane_bytes(p, w, h, strides[p]), 0x77);
+          at[p] = mem[p].data();
+        }
+        write_yuv(f, w, h, at, strides);
+        for (uint32_t p = 0; p < f.planes; ++p) planes[p].bytes = ConstByteView(mem[p].data(), mem[p].size()), planes[p].stride = strides[p];
+        std::vector<uint32_t> out(size_t(w) * h, 0x12345678u);
+        CHECK(wayland::yuv_to_xrgb(f, w, h, ArrayView<const wayland::YuvPlane>(planes, f.planes), ArrayView<uint32_t>(out.data(), out.size())));
+        bool all = true;
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x) if (!near_rgb(out[size_t(y) * w + x], expected_px(f, x, y))) all = false;
+        if (!all) printf("   yuv %08x %ux%u pad %u: wrong colours\n", code, w, h, pad);
+        CHECK(all);
+        ++pictures;
+        // truncation: every plane one byte short, a stride shorter than its row, too few planes, too small an output - false, nothing written
+        auto refused = [&](ArrayView<const wayland::YuvPlane> pl, size_t out_size) {
+          std::vector<uint32_t> o(out_size, 0xABCDEF01u);
+          const bool r = wayland::yuv_to_xrgb(f, w, h, pl, ArrayView<uint32_t>(o.data(), o.size()));
+          for (uint32_t v : o) if (v != 0xABCDEF01u) return false;
+          return !r;
+        };
+        for (uint32_t p = 0; p < f.planes; ++p) {
+          wayland::YuvPlane cut[3] = {planes[0], planes[1], planes[2]};
+          cut[p].bytes = cut[p].bytes.first(cut[p].bytes.size() - 1);
+          CHECK(refused(ArrayView<const wayland::YuvPlane>(cut, f.planes), out.size()));
+          wayland::YuvPlane narrow[3] = {planes[0], planes[1], planes[2]};
+          narrow[p].stride = uint32_t(f.row_bytes(p, w)) - 1;
+          CHECK(refused(ArrayView<const wayland::YuvPlane>(narrow, f.planes), out.size()));
+        }
+        CHECK(refused(ArrayView<const wayland::YuvPlane>(planes, f.planes - 1), out.size()));
+        CHECK(refused(ArrayView<const wayland::YuvPlane>(planes, f.planes), out.size() - 1));
+      }
+    }
+  }
+  // bit flips in the samples only change colours (every byte value is a sample)
+  wayland::YuvFormat nv12;
+  CHECK(wayland::yuv_format(kNV12, &nv12));
+  std::mt19937 rng(5);
+  for (int round = 0; round < 200; ++round) {
+    std::vector<uint8_t> y(64 * 16), uv(64 * 8);
+    for (auto& b : y) b = uint8_t(rng());
+    for (auto& b : uv) b = uint8_t(rng());
+    wayland::YuvPlane pl[2] = {{ConstByteView(y.data(), y.size()), 64}, {ConstByteView(uv.data(), uv.size()), 64}};
+    std::vector<uint32_t> out(64 * 16);
+    CHECK(wayland::yuv_to_xrgb(nv12, 64, 16, ArrayView<const wayland::YuvPlane>(pl, 2), ArrayView<uint32_t>(out.data(), out.size())));
+    for (uint32_t v : out) if ((v >> 24) != 0xFF) { CHECK(false); break; }
+  }
+  // the wl_shm layouts (Weston's rule)
+  uint64_t off[3], bytes = 0;
+  uint32_t st[3];
+  CHECK(wayland::yuv_shm_layout(nv12, 5, 3, 6, off, st, &bytes) && off[1] == 18 && st[1] == 6 && bytes == 30);
+  wayland::YuvFormat i420;
+  CHECK(wayland::yuv_format(kYU12, &i420));
+  CHECK(wayland::yuv_shm_layout(i420, 6, 4, 6, off, st, &bytes) && off[1] == 24 && off[2] == 30 && st[1] == 3 && st[2] == 3 && bytes == 36);
+  CHECK(!wayland::yuv_shm_layout(i420, 5, 4, 5, off, st, &bytes));      // (an odd stride cannot be halved)
+  printf("   yuv: %d formats, %d pictures\n", formats, pictures);
+}
+
+static uint32_t new_window(Server& server, const std::vector<uint32_t>& before) {
+  for (uint32_t win : listed(server))
+    if (std::find(before.begin(), before.end(), win) == before.end()) return win;
+  return 0;
+}
+
+static void test_yuv_buffers() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(1024, 768, {});
+  server.set_dmabuf(true);
+  // wl_shm: an NV12 picture at an odd offset in the pool, the planes one after another
+  {
+    App app(server);
+    std::vector<uint32_t> before = listed(server);
+    App::Window w = app.toplevel(true, "nv12");
+    wayland::YuvFormat f;
+    CHECK(wayland::yuv_format(kNV12, &f));
+    const uint32_t W = 33, H = 17, stride = 36, offset = 6;
+    uint64_t off[3], bytes = 0;
+    uint32_t st[3];
+    CHECK(wayland::yuv_shm_layout(f, W, H, stride, off, st, &bytes));
+    App::Pool p = app.pool(size_t(offset + bytes));
+    uint8_t* at[3] = {p.memory->data() + offset + off[0], p.memory->data() + offset + off[1], nullptr};
+    write_yuv(f, W, H, at, st);
+    const uint32_t b = app.buffer(p, int32_t(offset), int32_t(W), int32_t(H), int32_t(stride), kNV12);
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 6));
+    CHECK(!app.closing && !app.error());
+    const uint32_t win = new_window(server, before);
+    CHECK(win != 0);
+    bool all = true;
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(f, x, y))) all = false;
+    CHECK(all);
+    // drawn like any buffer
+    std::vector<uint32_t> target(64 * 64, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    graphics::SoftwareRenderer2D renderer(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(server.draw_window(win, renderer, 0, 0, &dw, &dh));
+    int matching = 0;
+    for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x) if (near_rgb(target[size_t(y) * 64 + x], expected_px(f, x, y))) ++matching;
+    CHECK(matching > int(W * H / 2));
+    // the picture is the one of the last commit: a change of the memory shows at the next commit, not before
+    const uint32_t old = server.window_pixel(win, 0, 0);
+    for (uint32_t y = 0; y < H; ++y) memset(at[0] + size_t(y) * stride, 235, W);
+    for (uint32_t y = 0; y < (H + 1) / 2; ++y) memset(at[1] + size_t(y) * st[1], 128, W + 1);
+    CHECK(server.window_pixel(win, 0, 0) == old);
+    app.send(Msg(w.surface, 2).i(0).i(0).i(int32_t(W)).i(int32_t(H)));
+    app.send(Msg(w.surface, 6));
+    CHECK(server.window_pixel(win, 0, 0) == 0xFFFFFFFFu && server.window_pixel(win, int32_t(W - 1), int32_t(H - 1)) == 0xFFFFFFFFu);
+    // YUYV and I420 (odd sizes) from the same pool kind
+    for (uint32_t code : {kYUYV, kYU12, kP010}) {
+      wayland::YuvFormat g;
+      CHECK(wayland::yuv_format(code, &g));
+      const uint32_t gw = 9, gh = 5, gstride = code == kYUYV ? 20 : code == kP010 ? 20 : 10;      // (P010: the chroma rows, 5 pairs of 16-bit samples, need 20)
+      CHECK(wayland::yuv_shm_layout(g, gw, gh, gstride, off, st, &bytes));
+      App::Pool q = app.pool(size_t(bytes));
+      uint8_t* gat[3] = {q.memory->data() + off[0], q.memory->data() + off[1], q.memory->data() + off[2]};
+      write_yuv(g, gw, gh, gat, st);
+      const uint32_t gb = app.buffer(q, 0, int32_t(gw), int32_t(gh), int32_t(gstride), code);
+      app.send(Msg(w.surface, 1).u(gb).i(0).i(0));
+      app.send(Msg(w.surface, 6));
+      CHECK(!app.closing);
+      bool good = true;
+      for (uint32_t y = 0; y < gh; ++y)
+        for (uint32_t x = 0; x < gw; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(g, x, y))) good = false;
+      if (!good) printf("   shm %08x: wrong colours\n", code);
+      CHECK(good);
+    }
+  }
+  // wl_shm errors: a stride shorter than a row, an odd stride for I420, a picture past the pool
+  {
+    struct Bad { uint32_t format; int32_t offset, w, h, stride; size_t pool; };
+    const Bad bad[] = {{kNV12, 0, 8, 4, 7, 4096}, {kYU12, 0, 8, 4, 9, 4096}, {kNV12, 0, 8, 4, 8, 47}, {kNV12, 2, 8, 4, 8, 48}, {kYUYV, 0, 8, 4, 15, 4096},
+                       {kNV12, -4, 8, 4, 8, 4096}, {kNV12, 0, 0, 4, 8, 4096}, {kYU12, 0, 7, 4, 7, 4096}};
+    for (const Bad& k : bad) {
+      App app(server, false);
+      App::Pool p = app.pool(k.pool);
+      app.buffer(p, k.offset, k.w, k.h, k.stride, k.format);
+      uint32_t object = 0, code = 99;
+      CHECK(app.error(&object, &code) && object == p.id && code == 1);
+    }
+    App ok(server, false);      // (exactly the size the planes need is fine)
+    App::Pool p = ok.pool(48);
+    ok.buffer(p, 0, 8, 4, 8, kNV12);
+    CHECK(ok.roundtrip() && !ok.error());
+  }
+  // dmabuf: NV12 in two descriptors, I420 in one at offsets, and what is refused
+  {
+    std::vector<std::unique_ptr<std::vector<uint8_t>>> keep;      // (outlives the client, whose buffers point into it)
+    DmabufApp app(server);
+    std::vector<uint32_t> before = listed(server);
+    App::Window w = app.toplevel(true, "dmabuf yuv");
+    uint32_t win = 0;      // (listed once it has a buffer)
+    auto memory = [&](size_t n) {
+      keep.push_back(std::make_unique<std::vector<uint8_t>>(n, 0));
+      return keep.back().get();
+    };
+    auto add = [&](uint32_t params, uint32_t plane, Fd fd, uint32_t offset, uint32_t stride, uint64_t modifier = 0) {
+      app.send(Msg(params, 1).u(plane).u(offset).u(stride).u(uint32_t(modifier >> 32)).u(uint32_t(modifier)), {fd});
+    };
+    auto shows = [&](const wayland::YuvFormat& f, uint32_t W, uint32_t H) {
+      for (uint32_t y = 0; y < H; ++y)
+        for (uint32_t x = 0; x < W; ++x) if (!near_rgb(server.window_pixel(win, int32_t(x), int32_t(y)), expected_px(f, x, y))) return false;
+      return true;
+    };
+    wayland::YuvFormat nv12, i420;
+    CHECK(wayland::yuv_format(kNV12, &nv12) && wayland::yuv_format(kYU12, &i420));
+    {
+      const uint32_t W = 20, H = 10;
+      auto* y = memory(64 * H + 100);
+      auto* uv = memory(32 * 5 + 16);
+      uint8_t* at[3] = {y->data() + 100, uv->data() + 16, nullptr};
+      const uint32_t strides[3] = {64, 32, 0};
+      write_yuv(nv12, W, H, at, strides);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      add(params, 0, Fd::make_as<TestMemory>(A, y), 100, 64);
+      add(params, 1, Fd::make_as<TestMemory>(A, uv), 16, 32);
+      const uint32_t b = app.immed(params, int32_t(W), int32_t(H), kNV12);
+      app.commit(w, b, int32_t(W), int32_t(H));
+      win = new_window(server, before);
+      CHECK(win != 0 && !app.closing && !app.error() && shows(nv12, W, H));
+    }
+    {
+      const uint32_t W = 11, H = 7, S0 = 12, S1 = 8;
+      auto* all = memory(S0 * H + 2 * S1 * 4 + 40);
+      uint8_t* at[3] = {all->data(), all->data() + S0 * H + 8, all->data() + S0 * H + 8 + S1 * 4};
+      const uint32_t strides[3] = {S0, S1, S1};
+      write_yuv(i420, W, H, at, strides);
+      Fd one = Fd::make_as<TestMemory>(A, all);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      add(params, 0, one, 0, S0);
+      add(params, 1, one, S0 * H + 8, S1);
+      add(params, 2, one, S0 * H + 8 + S1 * 4, S1);
+      const uint32_t b = app.immed(params, int32_t(W), int32_t(H), kYU12);
+      app.commit(w, b, int32_t(W), int32_t(H));
+      CHECK(!app.closing && !app.error() && shows(i420, W, H));
+    }
+    {      // `create` of what cannot be imported answers failed: a GPU image plane, a stride shorter than a row, mixed modifiers, no memory
+      auto* m = memory(4096);
+      for (int k = 0; k < 4; ++k) {
+        const uint32_t params = app.new_id();
+        app.send(Msg(app.dmabuf, 1).u(params));
+        Fd y = k == 0 ? Fd::make_as<FakeGpu>(A, 16u, 16u, 0u) : Fd::make_as<TestMemory>(A, m);
+        if (k == 3) static_cast<TestMemory&>(*y).not_memory = true;
+        add(params, 0, y, 0, k == 1 ? 15 : 16);
+        add(params, 1, Fd::make_as<TestMemory>(A, m), 1024, 16, k == 2 ? 0x00FFFFFFFFFFFFFFull : 0);
+        app.send(Msg(params, 2).i(16).i(16).u(kNV12).u(0));
+        CHECK(app.take(params, 1).object == params && !app.closing);
+      }
+    }
+  }
+  // dmabuf protocol errors: a missing plane, too many planes for RGB, a plane past its descriptor, a plane index past 3
+  {
+    struct Case { int kind; uint32_t code; };
+    const Case cases[] = {{0, 3}, {1, 3}, {2, 6}, {3, 1}};
+    for (const Case& k : cases) {
+      DmabufApp app(server);
+      std::vector<uint8_t> small(100), big(4096);
+      const uint32_t params = app.new_id();
+      app.send(Msg(app.dmabuf, 1).u(params));
+      auto add = [&](uint32_t plane, std::vector<uint8_t>* v, uint32_t offset, uint32_t stride) {
+        app.send(Msg(params, 1).u(plane).u(offset).u(stride).u(0).u(0), {Fd::make_as<TestMemory>(A, v)});
+      };
+      if (k.kind == 0) add(0, &big, 0, 16);
+      if (k.kind == 1) add(0, &big, 0, 64), add(1, &big, 1024, 64);
+      if (k.kind == 2) add(0, &big, 0, 16), add(1, &small, 0, 16);
+      if (k.kind == 3) add(4, &big, 0, 16);
+      if (k.kind != 3) app.immed(params, 16, 16, k.kind == 1 ? kXR24 : kNV12);
+      uint32_t object = 0, code = 99;
+      CHECK(app.error(&object, &code) && object == params && code == k.code);
+    }
+  }
+  CHECK(server.client_count() == 0);
+  free_made();
+}
+
+// Byte flips over a session that makes NV12 buffers through wl_shm and dmabuf.
+static void test_yuv_fuzz() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.attach(4, 24);
+  server.set_display(800, 600, {});
+  server.set_dmabuf(true);
+  std::vector<uint8_t> all;
+  auto add = [&](Msg m) { std::vector<uint8_t> v = m.done(); all.insert(all.end(), v.begin(), v.end()); };
+  add(Msg(1, 1).u(2));
+  add(Msg(2, 0).u(1).s("wl_compositor").u(6).u(3));
+  add(Msg(2, 0).u(7).s("xdg_wm_base").u(5).u(4));
+  add(Msg(2, 0).u(9).s("zwp_linux_dmabuf_v1").u(3).u(5));
+  add(Msg(2, 0).u(3).s("wl_shm").u(1).u(6));
+  add(Msg(3, 0).u(10));
+  add(Msg(4, 2).u(11).u(10));
+  add(Msg(11, 1).u(12));
+  add(Msg(10, 6));
+  add(Msg(11, 4).u(1));
+  add(Msg(6, 0).u(13).i(4096));                                  // pool (descriptor 0)
+  add(Msg(13, 0).u(14).i(2).i(30).i(20).i(32).u(kNV12));        // NV12 buffer at offset 2
+  add(Msg(10, 1).u(14).i(0).i(0));
+  add(Msg(10, 6));
+  add(Msg(5, 1).u(15));
+  add(Msg(15, 1).u(0).u(0).u(32).u(0).u(0));                     // (descriptor 1)
+  add(Msg(15, 1).u(1).u(640).u(32).u(0).u(0));                   // (descriptor 2)
+  add(Msg(15, 3).u(16).i(30).i(20).u(kNV12).u(0));
+  add(Msg(10, 1).u(16).i(0).i(0));
+  add(Msg(10, 2).i(0).i(0).i(30).i(20));
+  add(Msg(10, 6));
+  add(Msg(13, 2).i(8192));                                       // pool grows
+  add(Msg(14, 0));
+  add(Msg(1, 0).u(17));
+  std::vector<uint8_t> m0(8192, 0x80), m1(4096, 0x40), m2(4096, 0xC0);
+  int sessions = 0;
+  auto run = [&](const std::vector<uint8_t>& bytes, size_t chunk) {
+    const uint32_t c = server.open_client(1);
+    if (!c) { ++g_failed; return; }
+    ++sessions;
+    std::vector<Fd> fds = {Fd::make_as<TestMemory>(A, &m0), Fd::make_as<TestMemory>(A, &m1), Fd::make_as<TestMemory>(A, &m2)};
+    server.receive(c, ConstByteView(), ArrayView<Fd>(fds.data(), fds.size()));
+    for (size_t at = 0; at < bytes.size();) {
+      const size_t n = std::min(chunk, bytes.size() - at);
+      server.receive(c, ConstByteView(bytes.data() + at, n), ArrayView<Fd>());
+      at += n;
+      ByteBuffer out(A);
+      List<Fd> fo(A);
+      if (server.take_output(c, &out, &fo)) break;
+    }
+    List<uint32_t> list(A);
+    server.windows(&list);
+    std::vector<uint32_t> target(64 * 64);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.height = ts.pitch = 64;
+    for (uint32_t w : list.view()) {
+      graphics::SoftwareRenderer2D renderer(ts);
+      uint32_t dw, dh;
+      server.draw_window(w, renderer, 0, 0, &dw, &dh);
+      server.window_pixel(w, 1, 1);
+      server.window_pixel(w, 29, 19);
+    }
+    server.close_client(c);
+  };
+  run(all, all.size());
+  for (size_t chunk = 1; chunk <= 16; ++chunk) run(all, chunk);
+  for (size_t cut = 0; cut < all.size(); cut += 4) run(std::vector<uint8_t>(all.begin(), all.begin() + long(cut)), 4096);
+  std::mt19937 rng(1234);
+  for (int round = 0; round < 1500; ++round) {
+    std::vector<uint8_t> v = all;
+    const int flips = 1 + int(rng() % 4);
+    for (int f = 0; f < flips; ++f) v[rng() % v.size()] ^= uint8_t(1u << (rng() % 8));
+    run(v, 1 + rng() % 100);
+  }
+  printf("   yuv fuzz: %d sessions\n", sessions);
   CHECK(server.client_count() == 0);
   free_made();
 }
@@ -3239,6 +3642,9 @@ int main() {
   test_fuzz();
   test_dmabuf();
   test_dmabuf_fuzz();
+  test_yuv_convert();
+  test_yuv_buffers();
+  test_yuv_fuzz();
   test_socket_transport();
   test_dxg_exports();
   test_dxg_compositor();

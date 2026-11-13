@@ -14,6 +14,7 @@ button and Alt+Tab place, and the user moves, sizes, minimizes, maximizes, activ
 | HID usage to evdev codes, the xkb keymap | `src/Wayland/WaylandKeymap.cpp` |
 | AF_UNIX listener with SCM_RIGHTS, the compositor's kernel thread | `src/Wayland/WaylandSocketServer.{hpp,cpp}` |
 | `zwp_linux_dmabuf_v1`: GPU buffers | `src/Wayland/WaylandDmabuf.cpp` |
+| YUV formats: their layouts and the conversion to RGB (`wl_shm` and dmabuf) | `src/Wayland/WaylandYuv.{hpp,cpp}` |
 | The selection, the desktop's clipboard, drag and drop | `src/Wayland/WaylandData.cpp` |
 | Buffer scale and transform, `wp_viewporter`, `wp_fractional_scale_v1` | `src/Wayland/WaylandScale.cpp` |
 | Activation, cursor shapes, primary selection, relative pointer and constraints, presentation time, idle inhibit, xdg-foreign, pings | `src/Wayland/WaylandExtras.cpp` |
@@ -178,6 +179,23 @@ through `/dev/dxg` (`TCOS_DXG_IOCTL_EXPORT`, [win32k/Dxg.md](win32k/Dxg.md)), wh
 - **Locking.** UI lock, then the compositor, then the Direct3D layer (which never calls out holding its lock). `Wayland/Dxg` is the only part that knows the
   Direct3D layer; the transport is given its maker (`SocketServer::set_gpu_images`, main.cpp), which also turns the global on.
 
+## YUV buffers
+
+Video players hand over their decoded pictures as they are, in YUV. Seventeen YUV formats are offered both as `wl_shm` formats and dmabuf formats (the
+same four-character codes): semi-planar NV12, NV21, NV16, NV61, NV24, NV42 and P010 (16-bit samples, the value in the top ten bits), planar YUV420
+(I420), YVU420 (YV12), YUV422, YVU422, YUV444, YVU444, and packed YUYV, YVYU, UYVY, VYUY.
+
+- **`wl_shm`.** The buffer names its first plane (offset, stride); the others follow it in the pool as Weston lays them out: a semi-planar chroma plane at
+  `offset + stride * height` with the same stride (twice it for 4:4:4), a planar format's U and V planes one after another with `stride / hsub` (so the
+  stride must divide). Any offset and stride alignment: the planes are read byte by byte. The size check covers every plane; odd sizes round the chroma up.
+- **dmabuf.** Two or three planes (one for the packed formats), exactly as many as the format has (`incomplete` otherwise; an RGB format with a second
+  plane too). Each plane is memory the server can map (a memfd), at any offset and stride that holds it (`out_of_bounds` otherwise), linear, all with one
+  modifier. A plane that is a GPU image of the Direct3D layer, or no memory at all, cannot be imported (`failed` / `invalid_wl_buffer`): the Direct3D layer
+  has no YUV images. Explicit sync works for them as for the GPU buffers. The feedback's format table and the version 3 modifier events list them too.
+- **Drawing.** At each commit that attaches or damages a YUV buffer, its picture is converted to RGB words on the CPU (`yuv_to_xrgb`: BT.601, limited
+  range, chroma repeated over the pixels it covers) into memory of the buffer's own; that is what the desktop draws, scales, turns, samples for
+  `window_pixel` and takes as a cursor. A client's writes after the commit do not show until the next commit.
+
 ## Files in memory
 
 Wayland shares pictures through file descriptors, so the Linux layer now has `memfd_create` (with `MFD_CLOEXEC` and `MFD_ALLOW_SEALING`),
@@ -210,11 +228,12 @@ through a flag set under the system lock. A `MemoryFile` has its own small mutex
 | What | How |
 | --- | --- |
 | Files in memory (including readers on four threads while the file grows and shrinks); registry and globals; toplevels with the desktop (configure, ack, map, move, size, maximize, minimize, fullscreen, close, decorations, unmap); window geometry; popups and positioners; subsurfaces; drawing from the client's memory; frame callbacks; the seat; 21 kinds of protocol error; truncated, chunked, bit-flipped and random-word streams (about 4000 sessions); the AF_UNIX transport with `SCM_RIGHTS`; 8 client threads plus a desktop thread | `tests/run_host_tests.sh WaylandServerTest` |
-| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`) | `tests/wayland_interop.sh` |
+| Real libwayland-client + libxkbcommon client (`tests/wayland/wl_client.c`, 31 checks, also four at once), `foot`; `wl-copy` / `wl-paste` (the desktop's clipboard pasted, a copy pasted by another client and landing on the desktop's clipboard; a picture both ways as `image/png`); GStreamer's `waylandsink` showing colour bars in NV12, I420 and YUY2 through `wl_shm` (each bar's colour checked in the desktop's drawing) | `tests/wayland_interop.sh` |
 | Activation (a token spent once), cursor shapes, relative motion, a persistent lock (and its coming back), a one-shot confinement, primary selection between clients, presentation feedback presented and discarded, idle inhibitors, xdg-foreign parents (and their going), pings and "(Not Responding)", the suspended state | `tests/run_host_tests.sh WaylandServerTest` |
 | Buffer transforms (all eight), scale, viewport crop and stretch, a turned GPU buffer, fractional scale, every rule of `wp_viewport` and the scale | `tests/run_host_tests.sh WaylandServerTest` |
 | Copy and paste with the desktop's clipboard and between clients (offers, types, descriptors passed on, the clipboard both ways, cancelling; pictures as `image/png` both ways with truncated and bit-flipped files), drag and drop (enter, motion, accept, actions, drop, finish, cancelling, errors) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program (x86-64, AArch64, RISC-V) through the OS's own system calls on the CPU emulator: memfd, mmap, fallocate, seals, SCM_RIGHTS both ways; `pipe2`, the desktop's text pasted, its own selection read into the desktop's clipboard and pasted back into itself through its own pipe (46 checks) | `tests/wayland_emulated.sh` |
+| YUV: all 17 formats converted at five sizes with and without row padding against a floating-point BT.601 reference, every truncation (a plane one byte short, a stride shorter than its row, a missing plane, a short output) refused with nothing written, random samples; the `wl_shm` layouts; NV12 at an odd pool offset, YUYV, I420 and P010 through `wl_shm` (drawn, sampled, a later commit showing the new picture); NV12 in two descriptors and I420 in one through dmabuf; every refusal and error; about 1600 fuzzed sessions | `tests/run_host_tests.sh WaylandServerTest` |
 | `zwp_linux_dmabuf_v1` with a stand-in GPU image (formats and modifiers, `create` / `created` / `failed`, `create_immed`, server ids, release, a picture still being drawn, every protocol error, about 1600 fuzzed sessions); GPU buffers over the real Direct3D layer: export and import rules, the kernel's reads, an export outliving its allocation and its process, a dmabuf over the AF_UNIX transport drawn in place on its device (pixel for pixel), on the CPU and on another device, four client threads exporting and repainting while the desktop draws (also under ThreadSanitizer) | `tests/run_host_tests.sh WaylandServerTest` |
 | A Linux program renders with Vulkan (`libvulkan.a`), exports the image (`vkGetMemoryFdKHR`), shows it through the compositor frame after frame, imports it again, checks `/dev/dxg`'s refusals (88 checks); the desktop draws it in place on the device and from the CPU (x86-64, AArch64, RISC-V on the CPU emulator) | `tests/wayland_dmabuf_emulated.sh` |
 
@@ -250,14 +269,15 @@ depends on itself:
    `zwp_linux_dmabuf_v1`, `wl_shm` buffers. `libgbm.so.1` of `src/Linux/libgbm` makes buffer objects over the Direct3D layer, and EGL also draws into its
    `gbm_surface`s and makes images of dmabufs (`EGL_EXT_image_dma_buf_import`). `tests/linux_egl_wayland_emulated.sh` runs a glibc + libwayland-egl + xdg-shell
    program and a GBM program through them. Still to do: the kernel's GL drawing into the GPU buffer itself (now its frame is copied there by the CPU).
-4. **YUV and several planes** (video players' direct output): the Direct3D layer needs NV12 / P010 formats (with planes at offsets of one allocation), the
-   protocol handling more than plane 0, and the desktop's renderers a YUV-to-RGB draw (a shader on the device renderer, the existing conversion code of
-   `src/Hardware/VideoCodec` on the CPU).
+4. **YUV and several planes: done for memory** ([YUV buffers](#yuv-buffers)): `wl_shm` and dmabuf planes in memfds, converted on the CPU at commit.
+   Still to do: YUV images in the Direct3D layer (NV12 / P010 with planes at offsets of one allocation) and a YUV-to-RGB draw on the device renderer, so that a
+   hardware decoder's frames show with no copy.
 
 ## Not done
 
-- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). Only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
-  pitch (no YUV video planes, no sub-rectangles of an image, no y-inverted pictures). Implicit sync is the GPU's queue: the desktop draws what the image holds
+- **GPU buffers.** No `wl_drm`. Feedback never changes (one GPU; no scanout tranche, since the desktop always composites). GPU images take only single-plane 8-bit RGB formats, linear, offset 0 and the image's own
+  pitch (no sub-rectangles of an image, no y-inverted pictures); YUV dmabufs must be files in memory and are converted on the CPU at each commit (one
+  copy, BT.601 limited range only: there is no `wp_color_representation` to say otherwise). Implicit sync is the GPU's queue: the desktop draws what the image holds
   once the work queued on it is done. A release point is signalled when the compositor lets the buffer go, which for the device renderer is when the draw
   was submitted, not when the GPU finished it. A dmabuf's `mmap` is a CPU copy, not the image itself: coherent at `DMA_BUF_IOCTL_SYNC` and (for
   writes) at each commit, so a client that writes with the CPU and renders on the GPU into the same image between two syncs sees one or the other. EGL's frames are GPU buffers, but the kernel's GL copies each frame into the buffer's image with the CPU instead of drawing there (see the plan above).

@@ -269,7 +269,7 @@ uint32_t Server::window_pixel(uint32_t window, int32_t x, int32_t y) {
     return image->read({bx, by, 1, 1}, ArrayView<uint32_t>(&pixel, 1)) ? pixel : 0;
   }
   ArrayView<uint32_t> pixels = buffer_pixels(s->current);
-  const uint64_t at = uint64_t(by) * uint64_t(s->current.stride / 4) + uint64_t(bx);
+  const uint64_t at = uint64_t(by) * uint64_t(s->current.pitch()) + uint64_t(bx);
   return at < pixels.size() ? pixels[at] : 0;
 }
 

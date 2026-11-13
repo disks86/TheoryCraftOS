@@ -57,6 +57,7 @@
 #include "Utility/SharedPointer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
+#include "Wayland/WaylandYuv.hpp"
 
 namespace wayland {
 
@@ -233,15 +234,29 @@ class Server final : public desktop::IWindowsSession {
     ByteView bytes;
     uint64_t size = 0;
   };
+  // A YUV buffer (WaylandYuv.hpp): where its planes are, and its picture converted at its last commit (rows of `width` words 0xFFRRGGBB), which is what is
+  // drawn. Shared by every copy of the buffer's BufferInfo.
+  struct YuvPicture {
+    explicit YuvPicture(allocators::IAllocator& allocator) : rgb(allocator) {}
+    YuvFormat format;
+    SharedPointer<PoolMemory> pool;      // wl_shm: the pool (the planes at offsets in it)
+    Fd planes[3];                        // dmabuf: each plane's descriptor (files in memory; several planes may share one)
+    uint64_t offsets[3] = {0, 0, 0};
+    uint32_t strides[3] = {0, 0, 0};
+    bool dmabuf = false;
+    List<uint32_t> rgb;
+  };
   struct BufferInfo {
     SharedPointer<PoolMemory> memory;      // a wl_shm buffer's pool
     Fd gpu;                                // a dmabuf's plane: its descriptor's gpu() is the picture (the top left width x height of it)
     Fd release_timeline;                   // explicit sync: signalled at release_point when the compositor is done with this use of the buffer
     uint64_t release_point = 0;
     int32_t offset = 0, width = 0, height = 0, stride = 0;
-    uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one)
+    uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one; a YUV format's code is the same in both)
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
-    bool valid() const { return (memory || gpu) && width > 0; }
+    SharedPointer<YuvPicture> yuv;         // a YUV buffer (wl_shm or dmabuf): memory and gpu are null
+    bool valid() const { return (memory || gpu || yuv) && width > 0; }
+    uint32_t pitch() const { return yuv ? uint32_t(width) : uint32_t(stride / 4); }      // words between rows of buffer_pixels
     GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
   };
   // A wl_data_source: what it offers.
@@ -259,11 +274,11 @@ class Server final : public desktop::IWindowsSession {
     uint32_t actions = 0, preferred = 0;      // the destination's (set_actions)
     bool accepted = false;                    // a drag's destination accepted a type
   };
-  // A zwp_linux_buffer_params_v1: the plane added so far (one: every format offered has one plane).
+  // A zwp_linux_buffer_params_v1: the planes added so far (one for the RGB formats, up to three for YUV).
   struct DmabufParams {
-    Fd plane;
-    uint32_t offset = 0, stride = 0;
-    uint64_t modifier = 0;
+    Fd planes[4];
+    uint32_t offsets[4] = {0, 0, 0, 0}, strides[4] = {0, 0, 0, 0};
+    uint64_t modifiers[4] = {0, 0, 0, 0};
     bool used = false;      // create or create_immed was called
   };
   struct RegionRects {
@@ -437,6 +452,10 @@ class Server final : public desktop::IWindowsSession {
   void send_dmabuf_feedback(Client& c, uint32_t feedback);
   Fd format_table_fd();
   bool make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, int32_t width, int32_t height, uint32_t format, uint32_t flags, bool immediate, BufferInfo* out);
+  bool make_yuv_dmabuf(Client& c, uint32_t params_id, DmabufParams& p, const YuvFormat& f, int32_t width, int32_t height, uint32_t flags, bool immediate,
+                       BufferInfo* out);
+  // Converts a YUV buffer's picture as it is now into its rgb words (at a commit of it). Black when its memory cannot be read.
+  void convert_yuv(BufferInfo& b);
   void commit(Client& c, Surface& s);
   void apply(Client& c, Surface& s, State& state);
   bool synchronized(const Surface& s) const;

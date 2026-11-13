@@ -149,15 +149,64 @@ Rect Server::work_area_for(const Surface& s) const {
   return monitors_[0].work;
 }
 
-// The pixels of a buffer, row by row (stride / 4 words apart). The pool's memory starts on a page and create_buffer made sure the offset and the stride are
-// multiples of 4, so the words are aligned; the bytes stay mapped as long as `b.memory` (shared with the pool) lives.
+// The pixels of a buffer, row by row (b.pitch() words apart). The pool's memory starts on a page and create_buffer made sure the offset and the stride are
+// multiples of 4, so the words are aligned; the bytes stay mapped as long as `b.memory` (shared with the pool) lives. A YUV buffer's are its converted
+// picture (empty until its first commit converted it).
 ArrayView<uint32_t> Server::buffer_pixels(const BufferInfo& b) {
   if (!b.valid()) return ArrayView<uint32_t>();
+  if (b.yuv) return b.yuv->rgb.count() == uint64_t(b.width) * uint64_t(b.height) ? b.yuv->rgb.view() : ArrayView<uint32_t>();
+  if (!b.memory) return ArrayView<uint32_t>();
   const uint64_t bytes = uint64_t(b.stride) * uint64_t(b.height - 1) + uint64_t(b.width) * 4;
   ByteView all = b.memory->bytes;
   if (uint64_t(b.offset) > all.size() || bytes > all.size() - uint64_t(b.offset)) return ArrayView<uint32_t>();
   ByteView mine = all.subview(uint64_t(b.offset), bytes);
   return ArrayView<uint32_t>(reinterpret_cast<uint32_t*>(mine.data()), (bytes + 3) / 4);
+}
+
+void Server::convert_yuv(BufferInfo& b) {
+  if (!b.yuv || b.width <= 0 || b.height <= 0) return;
+  YuvPicture& y = *b.yuv;
+  const uint64_t count = uint64_t(b.width) * uint64_t(b.height);
+  if (y.rgb.count() != count) {
+    y.rgb.clear();
+    if (!y.rgb.reserve(count)) return;      // (nothing drawn: buffer_pixels is empty)
+    for (uint64_t i = 0; i < count; ++i) y.rgb.push_back(0xFF000000u);
+  }
+  const YuvFormat& f = y.format;
+  YuvPlane planes[3];
+  bool ok = true;
+  if (!y.dmabuf) {
+    const ByteView all = y.pool ? y.pool->bytes : ByteView();
+    for (uint32_t i = 0; i < f.planes && ok; ++i) {
+      const uint64_t need = f.plane_bytes(i, uint32_t(b.width), uint32_t(b.height), y.strides[i]);
+      ByteView mine;
+      ok = all.try_subview(y.offsets[i], need, &mine);
+      planes[i].bytes = mine;
+      planes[i].stride = y.strides[i];
+    }
+  } else {
+    // one map per descriptor, as big as every plane in it needs (make_yuv_dmabuf checked that it is)
+    ByteView views[3];
+    for (uint32_t i = 0; i < f.planes && ok; ++i) {
+      uint32_t owner = i;
+      for (uint32_t j = 0; j < i; ++j) if (y.planes[j].get() == y.planes[i].get()) { owner = j; break; }
+      if (owner == i) {
+        uint64_t need = 0;
+        for (uint32_t j = i; j < f.planes; ++j) {
+          if (y.planes[j].get() != y.planes[i].get()) continue;
+          const uint64_t end = y.offsets[j] + f.plane_bytes(j, uint32_t(b.width), uint32_t(b.height), y.strides[j]);
+          if (end > need) need = end;
+        }
+        views[i] = y.planes[i]->map(need);
+      }
+      ByteView mine;
+      ok = views[owner].try_subview(y.offsets[i], f.plane_bytes(i, uint32_t(b.width), uint32_t(b.height), y.strides[i]), &mine);
+      planes[i].bytes = mine;
+      planes[i].stride = y.strides[i];
+    }
+  }
+  if (!ok || !yuv_to_xrgb(f, uint32_t(b.width), uint32_t(b.height), ArrayView<const YuvPlane>(planes, f.planes), y.rgb.view()))
+    for (uint32_t& w : y.rgb.view()) w = 0xFF000000u;
 }
 
 Server::Change* Server::change_of(uint32_t window) {
@@ -354,6 +403,8 @@ void Server::apply(Client& c, Surface& s, State& state) {
   if (!s.mapping.identity() || !before_mapping.identity()) full = true;
   // a GPU picture the client may have written through a CPU mapping: those writes reach the image now (GpuImage::committed)
   if ((state.attached || state.damaged) && s.current.image()) s.current.image()->committed();
+  // a YUV picture is converted now, as the client has it at this commit (what is drawn until the next one)
+  if ((state.attached || state.damaged) && s.current.yuv) convert_yuv(s.current);
   if (state.input_set) s.input = state.input;
   if (state.geometry_set) {
     if (!s.geometry_set || s.geometry.x != state.geometry.x || s.geometry.y != state.geometry.y) full = true;
@@ -676,6 +727,43 @@ void Server::shm_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, R
       const int32_t offset = in.i(), width = in.i(), height = in.i(), stride = in.i();
       const uint32_t format = in.u();
       if (!in.ok() || !r.pool) return;
+      YuvFormat yuv;
+      if (yuv_format(format, &yuv)) {      // planes one after another from `offset` (yuv_shm_layout); any alignment: they are read byte by byte
+        uint64_t offsets[3], bytes = 0;
+        uint32_t strides[3];
+        if (width <= 0 || height <= 0 || width > kMaxSize || height > kMaxSize || offset < 0 || stride <= 0 ||
+            uint64_t(stride) < yuv.row_bytes(0, uint32_t(width)) || !yuv_shm_layout(yuv, uint32_t(width), uint32_t(height), uint32_t(stride), offsets, strides, &bytes)) {
+          post_error(c, id, kShmInvalidStride, "invalid buffer layout");
+          return;
+        }
+        for (uint32_t i = 1; i < yuv.planes; ++i) {
+          if (strides[i] < yuv.row_bytes(i, uint32_t(width))) {
+            post_error(c, id, kShmInvalidStride, "the stride is too short for the chroma rows");
+            return;
+          }
+        }
+        if (bytes > r.pool->size || uint64_t(offset) > r.pool->size - bytes) {
+          post_error(c, id, kShmInvalidStride, "the buffer does not fit the pool");
+          return;
+        }
+        SharedPointer<YuvPicture> picture = SharedPointer<YuvPicture>::make(allocator_, allocator_);
+        if (!picture) {
+          post_error(c, kDisplayId, kErrorNoMemory, "out of memory");
+          return;
+        }
+        picture->format = yuv;
+        picture->pool = r.pool;
+        for (uint32_t i = 0; i < 3; ++i) picture->offsets[i] = uint64_t(offset) + offsets[i], picture->strides[i] = strides[i];
+        Resource* nr = new_object(c, object, Iface::Buffer, 1, id);
+        if (!nr) return;
+        nr->buffer.yuv = util::move(picture);
+        nr->buffer.offset = offset;
+        nr->buffer.width = width;
+        nr->buffer.height = height;
+        nr->buffer.stride = stride;
+        nr->buffer.format = format;
+        return;
+      }
       if (!valid_format(format)) {
         post_error(c, id, kShmInvalidFormat, "unsupported format");
         return;
@@ -1400,7 +1488,7 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, i
     picture.pixels = pixels;
     picture.width = static_cast<uint32_t>(s.current.width);
     picture.height = static_cast<uint32_t>(s.current.height);
-    picture.pitch = static_cast<uint32_t>(s.current.stride / 4);
+    picture.pitch = s.current.pitch();
     picture.format = s.current.format == kFormatAbgr8888 || s.current.format == kFormatXbgr8888 ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
     // (the window's own picture covers its frame's inside; what is drawn over it blends unless it has no alpha)
     renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);

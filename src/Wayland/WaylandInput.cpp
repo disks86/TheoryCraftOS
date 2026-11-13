@@ -405,7 +405,7 @@ bool Server::cursor_picture(uint32_t handle, uint32_t* system_id, List<uint32_t>
   const BufferInfo& b = cursor_surface_->current;
   if (b.width > 256 || b.height > 256) return false;
   ArrayView<uint32_t> pixels = buffer_pixels(b);
-  uint64_t row = uint64_t(b.stride / 4);
+  uint64_t row = uint64_t(b.pitch());
   // a GPU cursor is read out first (as 0xAARRGGBB, rows of its width)
   List<uint32_t> gpu_pixels(allocator_);
   GpuImage* image = b.image();

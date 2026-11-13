@@ -341,6 +341,11 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
         e.u(f);
         send(c, e);
       }
+      for (uint32_t f : yuv_formats()) {      // (the planes one after another in the pool: yuv_shm_layout)
+        Event e(object, 0);
+        e.u(f);
+        send(c, e);
+      }
       return;
     }
     case Iface::Seat: {
@@ -389,12 +394,14 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       // the formats, all linear: format events before version 3, modifier events in 3; from 4 on the client asks for feedback instead
       if (version >= 4) return;
       const uint32_t formats[4] = {kDrmArgb8888, kDrmXrgb8888, kDrmAbgr8888, kDrmXbgr8888};
-      for (uint32_t f : formats) {
+      auto offer = [&](uint32_t f) {
         Event e(object, version >= 3 ? 1 : 0);
         e.u(f);
         if (version >= 3) e.u(uint32_t(kDrmModLinear >> 32)).u(uint32_t(kDrmModLinear));
         send(c, e);
-      }
+      };
+      for (uint32_t f : formats) offer(f);
+      for (uint32_t f : yuv_formats()) offer(f);
       return;
     }
     default: return;
