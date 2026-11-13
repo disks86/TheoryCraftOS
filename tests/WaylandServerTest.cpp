@@ -806,6 +806,93 @@ static void test_subsurfaces() {
 
 // Touches: a finger over a client with a wl_touch goes to it (down, motion, up, each with a frame, coordinates of the surface it went down on), over a
 // client without one it is refused (the desktop moves the pointer), cancel, and a client that goes away loses its contacts.
+// Pens (zwp_tablet_v2): a tablet seat is told of a tablet and a pen and an eraser tool; the pen over a client with a tablet seat comes into proximity of
+// its surface (motion, pressure, tilt, frame), the tip is down / up, the barrel buttons are BTN_STYLUS; while the tip touches the surface keeps the pen;
+// over a client without a tablet seat it is refused; out of range, proximity_out.
+static void test_pen() {
+  Server server(A);
+  server.set_fd_maker(&make_test_fd, nullptr);
+  server.set_display(1000, 800, {});
+  App a(server), b(server);
+  App::Window wa = a.toplevel(false, "a"), wb = b.toplevel(false, "b");
+  a.show(wa, 300, 300, 0xFF111111u);
+  b.show(wb, 300, 300, 0xFF222222u);
+  std::vector<uint32_t> list = listed(server);
+  CHECK(list.size() == 2);
+  if (list.size() != 2) return;
+  server.move_window(list[0], {0, 0, 300, 300});
+  server.move_window(list[1], {400, 0, 300, 300});
+  const uint32_t manager = a.bind(a.reg, "zwp_tablet_manager_v2");
+  const uint32_t tseat = a.new_id();
+  a.send(Msg(manager, 0).u(tseat).u(a.seat));
+  // the tablet and its two tools, each described and done
+  Ev tablet_added = a.take(tseat, 0);
+  const uint32_t tablet = tablet_added.u(0);
+  CHECK(tablet >= 0xFF000000u && a.take(tablet, 0).s(0) == "TheoryCraftOS pen" && a.has(tablet, 3));
+  Ev t1 = a.take(tseat, 1), t2 = a.take(tseat, 1);
+  const uint32_t pen = t1.u(0), eraser = t2.u(0);
+  CHECK(pen && eraser && pen != eraser);
+  CHECK(a.take(pen, 0).u(0) == 0x140 && a.take(eraser, 0).u(0) == 0x141 && a.has(pen, 4) && a.has(eraser, 4));
+  a.drop_events();
+  // hovering over a: proximity_in (serial, tablet, surface), motion, pressure 0, tilt, frame
+  desktop::PenInput p;
+  p.in_range = true;
+  p.x = 30, p.y = 40;
+  p.tilt_x = 10, p.tilt_y = -5;
+  CHECK(server.pen(p));
+  Ev in = a.take(pen, 6);
+  CHECK(in.object == pen && in.u(1) == tablet && in.u(2) == wa.surface);
+  Ev motion = a.take(pen, 10);
+  CHECK(motion.i(0) == 30 * 256 && motion.i(1) == 40 * 256);
+  CHECK(a.take(pen, 11).u(0) == 0);
+  Ev tilt = a.take(pen, 13);
+  CHECK(tilt.i(0) == 10 * 256 && tilt.i(1) == -5 * 256);
+  CHECK(a.has(pen, 18));
+  // the tip touches with pressure; the barrel button
+  p.tip = true;
+  p.pressure = 40000;
+  p.buttons = hardware::pen_button::kBarrel;
+  a.drop_events();
+  CHECK(server.pen(p));
+  CHECK(a.has(pen, 8) && a.take(pen, 11).u(0) == 40000);
+  Ev button = a.take(pen, 17);
+  CHECK(button.u(1) == 0x14B && button.u(2) == 1);
+  // dragged over b while touching: still a's surface, in a's coordinates
+  a.drop_events();
+  p.x = 450;
+  CHECK(server.pen(p));
+  Ev drag = a.take(pen, 10);
+  CHECK(drag.object == pen && drag.i(0) == 450 * 256);
+  CHECK(!a.has(pen, 7));
+  // lifted over b: up, then (b reads no pens) refused, and a hears proximity_out
+  a.drop_events();
+  p.tip = false;
+  p.buttons = 0;
+  p.pressure = 0;
+  CHECK(!server.pen(p));
+  CHECK(a.has(pen, 7));
+  // back over a, then out of range: proximity_out
+  p.x = 50;
+  CHECK(server.pen(p));
+  a.drop_events();
+  p.in_range = false;
+  CHECK(server.pen(p));
+  CHECK(a.has(pen, 7));
+  CHECK(!server.pen(p));      // (already out)
+  // the eraser end: the eraser tool
+  p.in_range = true;
+  p.inverted = true;
+  a.drop_events();
+  CHECK(server.pen(p));
+  CHECK(a.take(eraser, 6).u(2) == wa.surface && !a.has(pen, 6));
+  // nowhere: refused (and the eraser leaves)
+  p.x = 900, p.y = 700;
+  a.drop_events();
+  CHECK(!server.pen(p));
+  CHECK(a.has(eraser, 7));
+  free_made();
+}
+
 static void test_touch() {
   Server server(A);
   server.set_fd_maker(&make_test_fd, nullptr);
@@ -3147,6 +3234,7 @@ int main() {
   test_subsurfaces();
   test_seat();
   test_touch();
+  test_pen();
   test_errors();
   test_fuzz();
   test_dmabuf();

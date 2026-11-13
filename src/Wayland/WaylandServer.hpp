@@ -201,6 +201,9 @@ class Server final : public desktop::IWindowsSession {
   // Touches (wl_touch): a Down over a surface whose client has a wl_touch is taken (down, then the contact's motion and up go to that client, each with
   // a frame); else refused (the desktop moves the pointer with it). Cancel: the client is told its touches are cancelled.
   bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override;
+  // The pen (zwp_tablet_v2): over a surface whose client has a tablet seat it is taken (proximity_in, then motion, pressure, tilt, down / up, buttons,
+  // each report a frame; the surface keeps it while the tip touches); elsewhere refused (the desktop moves the pointer). Out of range: proximity_out.
+  bool pen(const desktop::PenInput& input) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -220,7 +223,7 @@ class Server final : public desktop::IWindowsSession {
     DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
     Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
     RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
-    Importer, Imported,
+    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool,
   };
   struct Surface;
   struct Client;
@@ -288,6 +291,7 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<DataSourceInfo> source;       // wl_data_source, zwp_primary_selection_source_v1
     SharedPointer<OfferInfo> offer;             // wl_data_offer, zwp_primary_selection_offer_v1
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
+    uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
   struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
@@ -603,6 +607,17 @@ class Server final : public desktop::IWindowsSession {
     int32_t origin_x = 0, origin_y = 0;      // where that surface's (0, 0) was on the screen at the time
   };
   List<TouchContact> touches_;    // the contacts clients took, until they lift
+  struct PenFocus {
+    uint8_t client = 0;           // 0: the pen is in nobody's proximity
+    uint32_t surface = 0, tool = 0;
+    bool eraser = false, tip = false;
+    uint8_t buttons = 0;
+    int32_t origin_x = 0, origin_y = 0;
+  };
+  PenFocus pen_;
+  void pen_leave();               // proximity_out (and up first, if the tip touched) to the client that has the pen
+  void tablet_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void announce_tablet(Client& c, uint32_t seat_id, Resource& seat);
   uint32_t menu_window_ = 0;                // a toplevel's show_window_menu, until the desktop takes it
   int32_t menu_x_ = 0, menu_y_ = 0;
   uint32_t active_window_ = 0;

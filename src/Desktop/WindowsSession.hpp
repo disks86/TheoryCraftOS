@@ -24,6 +24,7 @@
 #pragma once
 #include <stdint.h>
 #include "Graphics/Graphics2D/IRenderer2D.hpp"
+#include "Hardware/Pen/IPen.hpp"
 #include "Hardware/Touch/ITouch.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
@@ -46,6 +47,18 @@ struct WindowsWindowInfo {
   uint32_t icon = 0;                     // the icon to show (a handle cursor_picture takes), 0: none
   WindowsRect window;                    // the whole window = the desktop's frame
   WindowsRect surface;                   // the program's picture inside it
+};
+
+// A pen as the desktop hands it to a session: hovering (in range) or touching (tip), which end (inverted: the eraser), its barrel buttons
+// (hardware::pen_button bits), where it is in the programs' screen coordinates, the session's window it is over (0: none of the session's), the pressure
+// (0 .. 65535; a pen without pressure: 65535 while the tip touches) and the tilt in degrees (0 when the pen does not say).
+struct PenInput {
+  bool in_range = false, tip = false, inverted = false;
+  uint8_t buttons = 0;
+  uint32_t window = 0;
+  int32_t x = 0, y = 0;
+  uint16_t pressure = 0;
+  int16_t tilt_x = 0, tilt_y = 0;
 };
 
 class IWindowsSession {
@@ -108,6 +121,12 @@ class IWindowsSession {
   // they are; one refused moves the pointer instead (the desktop emulates a mouse with it). By default none is taken.
   virtual bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
     (void)phase, (void)id, (void)window, (void)x, (void)y;
+    return false;
+  }
+  // The pen: true when the session takes it (a program that reads pens: Wayland's zwp_tablet_v2). A session that took it keeps getting its events until
+  // it goes out of range (one with in_range false ends it); one that does not take it has the pointer moved by it instead. By default none is taken.
+  virtual bool pen(const PenInput& input) {
+    (void)input;
     return false;
   }                                                // the pointer went to a window that is not one of the programs' (nothing holds it)
   virtual void cursor(int32_t* x, int32_t* y) = 0;                            // where the Windows cursor is

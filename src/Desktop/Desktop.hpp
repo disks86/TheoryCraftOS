@@ -75,6 +75,7 @@
 #include "Gui/Windows/WindowManager.hpp"
 #include "Gui/Windows/WindowSwitcher.hpp"
 #include "Hardware/Backlight/IBacklight.hpp"
+#include "Hardware/Pen/PenMouse.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 namespace desktop {
@@ -253,6 +254,9 @@ class Desktop {
   // The touchscreens: touches go to the programs' windows that take them (Wayland clients), the others move the pointer (the first finger the left button).
   // Call before the input runs; the devices stop emulating a mouse themselves.
   void set_touch(hardware::ITouch* touch);
+  // The pens: a pen over a program's window that reads pens (a Wayland client with a tablet seat) goes to it, else it moves the pointer. `emulation`, if
+  // given, is the mouse made of the same pens (hardware::PenMouse), which is turned off: the desktop does that itself. Call before the input runs.
+  void set_pens(hardware::IPen* pens, hardware::PenMouse* emulation);
   Win32Windows& wayland_windows() { return wayland_windows_; }
   // The machine's figures for the computer manager (nullptr: none). It must outlive the desktop.
   void set_system_monitor(ISystemMonitor* monitor) { computer_manager_.set_monitor(monitor); }
@@ -370,6 +374,7 @@ class Desktop {
   static void tap_key(void* self, const hardware::KeyEvent& event, uint8_t modifiers);
   static void tap_mouse(void* self, const hardware::MouseEvent& event, int32_t* x, int32_t* y);
   static bool tap_touch(void* self, const hardware::TouchEvent& event, int32_t x, int32_t y);
+  static bool tap_pen(void* self, const hardware::PenEvent& event, int32_t x, int32_t y);
   static void on_explorer(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_display_settings(void* self, gui::Control&);

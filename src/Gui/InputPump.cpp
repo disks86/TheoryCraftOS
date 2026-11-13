@@ -131,6 +131,42 @@ uint32_t InputPump::pump() {
     deliver(e);
     if (!down) emulating_ = false;
   }
+  hardware::PenEvent p;
+  while (pen_ && pen_->poll(&p)) {
+    ++events;
+    const int32_t max_x = static_cast<int32_t>(window_.bounds().width) - 1, max_y = static_cast<int32_t>(window_.bounds().height) - 1;
+    int32_t x = p.max_x ? static_cast<int32_t>(static_cast<uint64_t>(p.x) * (max_x + 1) / (uint64_t{p.max_x} + 1)) : x_;
+    int32_t y = p.max_y ? static_cast<int32_t>(static_cast<uint64_t>(p.y) * (max_y + 1) / (uint64_t{p.max_y} + 1)) : y_;
+    x = x < 0 ? 0 : x > max_x ? max_x : x;
+    y = y < 0 ? 0 : y > max_y ? max_y : y;
+    uint8_t buttons = 0;
+    uint32_t px = pen_x_, py = pen_y_;
+    bool in_range = p.in_range;
+    if (pen_tap_ && pen_tap_(pen_context_, p, x, y)) {
+      in_range = false;      // (a program's window has it: the pointer lets go of what the pen held)
+    } else if (p.in_range) {
+      px = p.x;
+      py = p.y;
+      pen_max_x_ = p.max_x;
+      pen_max_y_ = p.max_y;
+      if (p.tip && !p.inverted) buttons |= hardware::mouse_button::kLeft;
+      if (p.tip && p.inverted) buttons |= hardware::mouse_button::kMiddle;
+      if (p.buttons & (hardware::pen_button::kBarrel | hardware::pen_button::kSecondary)) buttons |= hardware::mouse_button::kRight;
+    }
+    if (in_range == pen_in_range_ && buttons == pen_buttons_ && px == pen_x_ && py == pen_y_) continue;      // (nothing changed for the pointer)
+    pen_in_range_ = in_range;
+    pen_buttons_ = buttons;
+    pen_x_ = px;
+    pen_y_ = py;
+    hardware::MouseEvent m{};
+    m.absolute = true;
+    m.x = px;
+    m.y = py;
+    m.max_x = pen_max_x_;
+    m.max_y = pen_max_y_;
+    m.buttons = buttons;
+    deliver(m);
+  }
   return events;
 }
 

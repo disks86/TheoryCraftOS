@@ -584,6 +584,79 @@ struct FakeTouch final : hardware::ITouch {
   }
 };
 
+// A pen whose range is the screen's pixels.
+struct FakePen final : hardware::IPen {
+  std::vector<hardware::PenEvent> events;
+  const char* name() const override { return "fake pen"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  bool poll(hardware::PenEvent* out) override {
+    if (events.empty()) return false;
+    *out = events.front();
+    events.erase(events.begin());
+    return true;
+  }
+  uint32_t max_x() const override { return 799; }
+  uint32_t max_y() const override { return 599; }
+  uint16_t max_pressure() const override { return 1000; }
+  bool has_tilt() const override { return true; }
+  void put(bool in_range, bool tip, uint32_t x, uint32_t y, uint8_t buttons = 0, uint16_t pressure = 0, uint32_t mx = 799, uint32_t my = 599) {
+    hardware::PenEvent e;
+    e.in_range = in_range, e.tip = tip, e.x = x, e.y = y, e.buttons = buttons, e.pressure = pressure, e.max_pressure = 1000, e.max_x = mx, e.max_y = my;
+    events.push_back(e);
+  }
+};
+
+// Pens in the input pump: offered to the tap first; one it does not take is the pointer (the tip the left button, the barrel the right one).
+struct PenTapLog {
+  int calls = 0;
+  bool take = false;
+  static bool tap(void* self, const hardware::PenEvent&, int32_t, int32_t) {
+    auto* l = static_cast<PenTapLog*>(self);
+    ++l->calls;
+    return l->take;
+  }
+};
+
+static void test_input_pump_pen() {
+  TestAllocator a;
+  Theme theme;
+  {
+    Screen screen(a, 200, 100);
+    Window w(a, screen.renderer, theme, {200, 100});
+    Button b(a);
+    b.set_bounds({10, 10, 60, 30});
+    w.add(&b);
+    w.layout();
+    Counter clicks;
+    b.on_click(clicks.handler());
+    FakePen pen;
+    PenTapLog log;
+    InputPump pump(w, nullptr, nullptr);
+    pump.set_pen(&pen, &PenTapLog::tap, &log);
+    // hovering moves the pointer; the tip on the button and lifted clicks it
+    pen.put(true, false, 150, 80, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 150 && pump.cursor().y == 80 && clicks.count == 0);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pen.put(true, true, 20, 20, 0, 500, 199, 99);
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1 && log.calls == 4);
+    // the same report again: nothing for the pointer (no move, no click)
+    pen.put(true, false, 20, 20, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(clicks.count == 1);
+    // taken by a program: the pointer does not move
+    log.take = true;
+    pen.put(true, true, 100, 50, 0, 500, 199, 99);
+    pen.put(true, false, 100, 50, 0, 0, 199, 99);
+    pump.pump();
+    CHECK(pump.cursor().x == 20 && clicks.count == 1);
+  }
+  CHECK(a.live == 0);
+}
+
 // Touches in the input pump: the tap is asked first; a contact it does not take is the left button where it is (one at a time).
 struct TouchTapLog {
   std::vector<std::string> calls;
@@ -1578,7 +1651,13 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   void mouse_motion(int32_t dx, int32_t dy) override { note("motion", dx, dy); cx += dx; cy += dy; clamp(); }
   void mouse_position(int32_t x, int32_t y) override { note("position", x, y); cx = x; cy = y; clamp(); }
   void mouse_button(uint32_t button, bool down) override { note("button", int32_t(button), down); }
-  bool take_touches = false;
+  bool take_touches = false, take_pens = false;
+  bool pen(const desktop::PenInput& p) override {
+    if (!take_pens) return false;
+    log.push_back("pen " + std::to_string(p.in_range) + " " + std::to_string(p.tip) + " " + std::to_string(p.window) + " " + std::to_string(p.x) + " " +
+                  std::to_string(p.y) + " " + std::to_string(p.pressure));
+    return true;
+  }
   bool touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) override {
     if (phase == hardware::TouchPhase::Down && !take_touches) return false;
     log.push_back("touch " + std::to_string(int(phase)) + " " + std::to_string(id) + " " + std::to_string(window) + " " + std::to_string(x) + " " + std::to_string(y));
@@ -1648,6 +1727,32 @@ static void test_windows_touch() {
     bool asked = false;
     for (const std::string& e : s.log) asked |= e.rfind("touch", 0) == 0;
     CHECK(!asked && d.pointer().x == mo.x + 600);
+
+    // pens: the pen mouse stops once the desktop reads the pens; a session that takes the pen gets it (the pressure scaled to 65535) until it leaves the
+    // range; one that does not has the pointer moved by it
+    FakePen pens;
+    hardware::CompositePen all_pens;
+    all_pens.add(&pens);
+    hardware::PenMouse pen_mouse(all_pens);
+    d.set_pens(&all_pens, &pen_mouse);
+    hardware::MouseEvent nothing;
+    pens.put(true, false, uint32_t(mo.x + 150), uint32_t(mo.y + 120));
+    CHECK(!pen_mouse.poll(&nothing) && pens.events.size() == 1);      // (disabled: it leaves the pen's events alone)
+    s.log.clear();
+    s.take_pens = true;
+    pens.put(true, true, uint32_t(mo.x + 150), uint32_t(mo.y + 120), 0, 500);
+    pens.put(true, true, uint32_t(mo.x + 600), uint32_t(mo.y + 120), 0, 1000);      // (outside the window, still the session's)
+    pens.put(false, false, uint32_t(mo.x + 600), uint32_t(mo.y + 120));
+    d.step(5000);
+    std::vector<std::string> pen_log;
+    for (const std::string& e : s.log) if (e.rfind("pen", 0) == 0) pen_log.push_back(e);
+    CHECK(pen_log.size() == 4 && pen_log[0] == "pen 1 0 7 150 120 0" && pen_log[1] == "pen 1 1 7 150 120 32767" && pen_log[2] == "pen 1 1 0 600 120 65535" &&
+          pen_log[3] == "pen 0 0 0 600 120 0");
+    CHECK(d.pointer().x == mo.x + 600);      // (the pointer did not follow the pen)
+    s.take_pens = false;
+    pens.put(true, false, uint32_t(mo.x + 160), uint32_t(mo.y + 130));
+    d.step(6000);
+    CHECK(d.pointer().x == mo.x + 160 && d.pointer().y == mo.y + 130);
     d.set_windows_session(nullptr);
   }
   CHECK(a.live == 0);
@@ -2088,6 +2193,7 @@ int main() {
   test_rendering();
   test_input_pump();
   test_input_pump_touch();
+  test_input_pump_pen();
   test_select_all_from_keyboard();
   test_desktop();
   test_desktop_monitors();

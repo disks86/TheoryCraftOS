@@ -117,6 +117,8 @@ class Win32Windows {
   // A touch event at (x, y), window coordinates: true when the session took it (a contact it took at Down, or a Down over one of its windows that it
   // takes, whose frame is then activated as a click would). Not under the UI lock.
   bool tap_touch(const hardware::TouchEvent& event, int32_t x, int32_t y);
+  // A pen event at (x, y), window coordinates: true when the session took it (the pen stays the session's until it leaves the range). Not under the UI lock.
+  bool tap_pen(const hardware::PenEvent& event, int32_t x, int32_t y);
 
   uint32_t count() const { return static_cast<uint32_t>(hosts_.count()); }
   // The cursor the programs show (pump() keeps it; read under the UI lock).
@@ -165,6 +167,7 @@ class Win32Windows {
   // input (the input pump's thread)
   bool grabbed_ = false;                   // the pointer is the Windows programs'
   List<uint32_t> touches_;                 // the contacts the session took (until they lift)
+  bool pen_taken_ = false;                 // the session has the pen (until it leaves the range)
   bool released_ = false;                  // Ctrl+Alt let a confined pointer go: nothing is handed over until the next click on a Windows window
   uint8_t buttons_ = 0;                    // the buttons held as the programs know them (hardware::mouse_button bits)
   uint8_t keys_down_[32] = {};             // the keys whose press was handed over (their release is too)

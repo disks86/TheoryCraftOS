@@ -1521,6 +1521,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
     desktop::Desktop desktop(shared_allocator, *renderer, &input.keyboard(), &input.mouse());
     desktop.set_touch(&input.touches());      // (touchscreens: virtio-multitouch and the I2C ones)
+    desktop.set_pens(&pens, &pen_mouse);       // (the pen mouse stops: the desktop moves the pointer with pens nobody takes)
     desktop.window().show_cursor(input.mice().count() > 0);
     InputHotplugContext input_hotplug{&input, &desktop};
     input.set_notifier(on_input_change, &input_hotplug);

@@ -468,6 +468,39 @@ bool Win32Windows::tap_touch(const hardware::TouchEvent& event, int32_t x, int32
   return false;
 }
 
+bool Win32Windows::tap_pen(const hardware::PenEvent& event, int32_t x, int32_t y) {
+  if (!session_ || !manager_ || !attached_) return false;
+  gui::Point origin;
+  Win32Window* over = nullptr;
+  {
+    gui::UiGuard lock(manager_);
+    origin = manager_->window_origin();
+    gui::Rect2D area;
+    over = host_under(*manager_, x - origin.x, y - origin.y, &area);
+  }
+  if (!pen_taken_ && (!over || !event.in_range)) return false;
+  PenInput p;
+  p.in_range = event.in_range;
+  p.tip = event.tip;
+  p.inverted = event.inverted;
+  p.buttons = event.buttons;
+  p.window = over ? over->window() : 0;
+  p.x = x - origin.x;
+  p.y = y - origin.y;
+  p.pressure = event.max_pressure ? static_cast<uint16_t>(uint64_t{event.pressure > event.max_pressure ? event.max_pressure : event.pressure} * 65535u / event.max_pressure)
+                                  : (event.tip ? 65535 : 0);
+  p.tilt_x = event.tilt_x;
+  p.tilt_y = event.tilt_y;
+  const bool was = pen_taken_;
+  const bool taken = session_->pen(p);
+  pen_taken_ = taken && event.in_range;
+  if (taken && !was && event.tip && over) {      // (the tip touching a window brings it forward, as a click does)
+    gui::UiGuard lock(manager_);
+    if (host(over->window()) == over) over->activate();
+  }
+  return taken || was;
+}
+
 void Win32Windows::tap_mouse(const hardware::MouseEvent& event, int32_t* x, int32_t* y) {
   if (!session_ || !manager_ || !attached_) return;
   gui::Point origin;

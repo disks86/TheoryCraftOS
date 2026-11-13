@@ -799,6 +799,7 @@ add_executable(BOOTX64
   src/Wayland/WaylandScale.cpp
   src/Wayland/WaylandServer.cpp
   src/Wayland/WaylandSocketServer.cpp
+  src/Wayland/WaylandTablet.cpp
   src/Wayland/WaylandSurfaces.cpp
   src/Process/Sockets.cpp
   src/Process/WindowsMailslots.cpp

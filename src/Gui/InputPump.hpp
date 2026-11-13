@@ -26,6 +26,7 @@
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/IKeyboard.hpp"
 #include "Hardware/Mouse/IMouse.hpp"
+#include "Hardware/Pen/IPen.hpp"
 #include "Hardware/Touch/ITouch.hpp"
 
 namespace gui {
@@ -64,6 +65,14 @@ class InputPump {
     touch_tap_ = tap;
     touch_context_ = context;
   }
+  // The pens (null: none), and the tap offered each pen event first (true: a program's window took it). Events it does not take move the pointer as
+  // hardware::PenMouse would (hovering moves it, the tip is the left button - the eraser end's the middle one - and a barrel button the right one).
+  using PenTap = bool (*)(void* context, const hardware::PenEvent& event, int32_t x, int32_t y);
+  void set_pen(hardware::IPen* pen, PenTap tap, void* context) {
+    pen_ = pen;
+    pen_tap_ = tap;
+    pen_context_ = context;
+  }
   // Delivers everything the devices have right now; returns how many events there were.
   uint32_t pump();
   Point cursor() const { return {x_, y_}; }
@@ -89,6 +98,12 @@ class InputPump {
   void* touch_context_ = nullptr;
   bool emulating_ = false;       // a contact nobody took is the left button
   uint32_t emulated_id_ = 0;
+  hardware::IPen* pen_ = nullptr;
+  PenTap pen_tap_ = nullptr;
+  void* pen_context_ = nullptr;
+  bool pen_in_range_ = false;    // the pen as the pointer (what was last delivered for it)
+  uint8_t pen_buttons_ = 0;
+  uint32_t pen_x_ = 0, pen_y_ = 0, pen_max_x_ = 0, pen_max_y_ = 0;
 };
 
 }  // namespace gui
