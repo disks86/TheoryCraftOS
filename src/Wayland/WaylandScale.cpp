@@ -171,7 +171,7 @@ void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t x,
   } else {
     picture.pixels = buffer_pixels(b);
     if (picture.pixels.size() == 0) return;
-    picture.pitch = uint32_t(b.stride / 4);
+    picture.pitch = b.pitch();
     picture.format = b.format == kFormatAbgr8888 || b.format == kFormatXbgr8888 ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   }
   picture.width = uint32_t(b.width);

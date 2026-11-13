@@ -84,6 +84,10 @@ inline constexpr const char* kWindowsUsers = "/Windows/Users";
 inline constexpr const char* kWindowsDirectory = "/Windows/Windows";
 inline constexpr const char* kWindowsSystem32 = "/Windows/Windows/System32";
 inline constexpr const char* kWindowsSysWow64 = "/Windows/Windows/SysWOW64";
+// Where installed Windows programs put their Start menu shortcuts (.lnk): for every user (C:\ProgramData\...) and, under each folder of
+// kWindowsUsers, for one user (kWindowsUserStartMenuPrograms is relative to the user's folder). The desktop's Start menu lists them.
+inline constexpr const char* kWindowsStartMenuPrograms = "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs";
+inline constexpr const char* kWindowsUserStartMenuPrograms = "AppData/Roaming/Microsoft/Windows/Start Menu/Programs";
 
 // What a Linux process sees as /bin, /etc, /home, /tmp and /usr/bin.
 inline constexpr const char* kLinuxBin = "/Linux/bin";
@@ -91,6 +95,11 @@ inline constexpr const char* kLinuxEtc = "/Linux/etc";
 inline constexpr const char* kLinuxHome = "/Linux/home";
 inline constexpr const char* kLinuxTmp = "/Linux/tmp";
 inline constexpr const char* kLinuxUsrBin = "/Linux/usr/bin";
+inline constexpr const char* kLinuxRootHome = "/Linux/root";   // root's home folder (Linux programs run as root)
+// Where installed Linux programs put their desktop entries (.desktop files, the freedesktop.org menu): the desktop's Start menu lists them.
+inline constexpr const char* kLinuxApplications = "/Linux/usr/share/applications";
+inline constexpr const char* kLinuxLocalApplications = "/Linux/usr/local/share/applications";
+inline constexpr const char* kLinuxRootApplications = "/Linux/root/.local/share/applications";
 // Where a Linux process sees the Windows tree (/Windows, the C: drive), as under WSL: a path in the Linux process's own view, not one of the OS's file
 // system. Files (and unix sockets, see Process/UnixSockets.hpp) made there by one kind of program are the other's.
 inline constexpr const char* kLinuxWindowsDrive = "/mnt/c";

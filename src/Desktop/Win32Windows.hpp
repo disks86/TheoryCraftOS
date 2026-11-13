@@ -151,6 +151,7 @@ class Win32Windows {
   uint32_t monitor_count_ = 0;
   bool display_sent_ = false;
   gui::Rect2D sent_bounds_;
+  uint32_t sent_reserve_serial_ = 0;      // the window manager's reserve_serial() when the monitors went (they go again when it changes)
   gui::Frame* last_active_ = nullptr;
   // A drag a program asked for (a custom title bar or border: IWindowsSession::take_drag): the frame follows the pointer until the left button is let go. Under the UI lock.
   Win32Window* drag_ = nullptr;
@@ -171,6 +172,12 @@ class Win32Windows {
   bool released_ = false;                  // Ctrl+Alt let a confined pointer go: nothing is handed over until the next click on a Windows window
   uint8_t buttons_ = 0;                    // the buttons held as the programs know them (hardware::mouse_button bits)
   uint8_t keys_down_[32] = {};             // the keys whose press was handed over (their release is too)
+  // The input method: Unicode entry (Ctrl+Shift+U, hex digits, Space or Enter), into a window that takes composed text (IWindowsSession::text_input).
+  // Returns true when it took the key (it then never reaches the program).
+  bool compose_key(uint8_t usage, uint8_t modifiers);
+  bool composing_ = false;
+  uint32_t compose_window_ = 0, compose_code_ = 0;
+  uint8_t compose_digits_ = 0;
 };
 
 }  // namespace desktop

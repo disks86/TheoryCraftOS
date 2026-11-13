@@ -53,6 +53,7 @@ const char* http_error_name(HttpError error) {
     case HttpError::Cancelled: return "cancelled";
     case HttpError::OutOfMemory: return "out of memory";
     case HttpError::WebSocketHandshake: return "WebSocket upgrade refused";
+    case HttpError::Blocked: return "blocked by the network's DNS server (it answered 0.0.0.0)";
   }
   return "";
 }
@@ -443,23 +444,26 @@ bool HttpClient::open_tcp() {
 // kResolutionDelayMs for the AAAA one. False while waiting (or after failing the request).
 bool HttpClient::resolution_done(uint64_t now) {
   const DnsStatus four = dns_ ? dns_->status() : DnsStatus::NotFound, six = dns6_ ? dns6_->status() : DnsStatus::NotFound;
-  if (four == DnsStatus::Resolved && six == DnsStatus::Pending) {
+  // (an answer of 0.0.0.0 or :: is no address: ad-blocking DNS servers answer that for the hosts they block, and connecting to it reaches nothing)
+  const bool four_usable = four == DnsStatus::Resolved && !dns_->ip_address().is_unspecified();
+  const bool six_usable = six == DnsStatus::Resolved && !dns6_->ip_address().is_unspecified();
+  if (four_usable && six == DnsStatus::Pending) {
     if (dns_answered_ms_ == 0) dns_answered_ms_ = now;
     if (now - dns_answered_ms_ < kResolutionDelayMs) return false;
-  } else if (six != DnsStatus::Resolved && (four == DnsStatus::Pending || six == DnsStatus::Pending)) {
+  } else if (!six_usable && (four == DnsStatus::Pending || six == DnsStatus::Pending)) {
     if (now > deadline_ms_) fail(HttpError::Timeout);
     return false;
   }
-  if (six == DnsStatus::Resolved) {
+  if (six_usable) {
     address_ = dns6_->ip_address();
-    has_fallback_ = four == DnsStatus::Resolved;
+    has_fallback_ = four_usable;
     if (has_fallback_) fallback_address_ = dns_->ip_address();
     // (an A answer still on its way is not waited for: if IPv6 fails, the request fails, as with only an AAAA record)
-  } else if (four == DnsStatus::Resolved) {
+  } else if (four_usable) {
     address_ = dns_->ip_address();
     has_fallback_ = false;
   } else {
-    fail(HttpError::Resolve);
+    fail(four == DnsStatus::Resolved || six == DnsStatus::Resolved ? HttpError::Blocked : HttpError::Resolve);
     return false;
   }
   dns_ = dns6_ = SharedPointer<IDnsQuery>();
@@ -485,7 +489,7 @@ void HttpClient::poll_connecting(uint64_t now) {
     racer_ = SharedPointer<ITcpSocket>();
     racer_tls_ = nullptr;
   }
-  if (socket_->failed()) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
+  if (socket_->failed()) return fail(socket_failure());
   if (now > deadline_ms_) return fail(HttpError::Timeout);
   if (!socket_->is_connected()) return;
   if (racer_) {
@@ -693,7 +697,7 @@ void HttpClient::poll() {
     poll_connecting(now);
     if (state_ != HttpState::Sending) return;
   }
-  if (socket_->failed() && state_ != HttpState::ReceivingBody) return fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
+  if (socket_->failed() && state_ != HttpState::ReceivingBody) return fail(socket_failure());
   if (state_ == HttpState::Sending) {
     const bool with_body = method_ == HttpMethod::Post || method_ == HttpMethod::Put || method_ == HttpMethod::Patch;
     while (sent_ < request_total_) {
@@ -730,7 +734,7 @@ bool HttpClient::pump_receive() {
     return false;
   }
   if (socket_->failed()) {
-    fail(tls_socket_ ? HttpError::Tls : HttpError::Connect);
+    fail(socket_failure());
     return false;
   }
   return true;

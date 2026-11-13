@@ -57,6 +57,7 @@
 #include "Utility/SharedPointer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/UniquePointer.hpp"
+#include "Wayland/WaylandYuv.hpp"
 
 namespace wayland {
 
@@ -204,6 +205,9 @@ class Server final : public desktop::IWindowsSession {
   // The pen (zwp_tablet_v2): over a surface whose client has a tablet seat it is taken (proximity_in, then motion, pressure, tilt, down / up, buttons,
   // each report a frame; the surface keeps it while the tip touches); elsewhere refused (the desktop moves the pointer). Out of range: proximity_out.
   bool pen(const desktop::PenInput& input) override;
+  bool text_input(TextInputState* out) override;
+  bool text_preedit(StringView text, uint32_t cursor) override;
+  bool text_commit(StringView text) override;
   void cursor(int32_t* x, int32_t* y) override;
   bool cursor_confined() override;
   uint32_t capture_window() override;
@@ -223,7 +227,8 @@ class Server final : public desktop::IWindowsSession {
     DataDeviceManager, DataSource, DataDevice, WmBase, Positioner, XdgSurface, Toplevel, Popup, DecorationManager, Decoration, LinuxDmabuf, BufferParams, DmabufFeedback, SyncobjManager, SyncobjTimeline, SyncobjSurface, DataOffer, Viewporter, Viewport, FractionalScaleManager, FractionalScale,
     Activation, ActivationToken, CursorShapeManager, CursorShapeDevice, PrimaryManager, PrimarySource, PrimaryDevice, PrimaryOffer, RelativePointerManager,
     RelativePointer, PointerConstraints, LockedPointer, ConfinedPointer, Presentation, PresentationFeedback, IdleInhibitManager, IdleInhibitor, Exporter, Exported,
-    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool,
+    Importer, Imported, TabletManager, TabletSeat, Tablet, TabletTool, LayerShell, LayerSurface, TextInputManager,
+    TextInput,
   };
   struct Surface;
   struct Client;
@@ -233,16 +238,47 @@ class Server final : public desktop::IWindowsSession {
     ByteView bytes;
     uint64_t size = 0;
   };
+  // A YUV buffer (WaylandYuv.hpp): where its planes are, and its picture converted at its last commit (rows of `width` words 0xFFRRGGBB), which is what is
+  // drawn. Shared by every copy of the buffer's BufferInfo.
+  struct YuvPicture {
+    explicit YuvPicture(allocators::IAllocator& allocator) : rgb(allocator) {}
+    YuvFormat format;
+    SharedPointer<PoolMemory> pool;      // wl_shm: the pool (the planes at offsets in it)
+    Fd planes[3];                        // dmabuf: each plane's descriptor (files in memory; several planes may share one)
+    uint64_t offsets[3] = {0, 0, 0};
+    uint32_t strides[3] = {0, 0, 0};
+    bool dmabuf = false;
+    List<uint32_t> rgb;
+  };
   struct BufferInfo {
     SharedPointer<PoolMemory> memory;      // a wl_shm buffer's pool
     Fd gpu;                                // a dmabuf's plane: its descriptor's gpu() is the picture (the top left width x height of it)
     Fd release_timeline;                   // explicit sync: signalled at release_point when the compositor is done with this use of the buffer
     uint64_t release_point = 0;
     int32_t offset = 0, width = 0, height = 0, stride = 0;
-    uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one)
+    uint32_t format = 0;      // a wl_shm format code (a dmabuf's DRM code becomes the wl_shm one; a YUV format's code is the same in both)
     uint32_t id = 0;      // the wl_buffer (0: none, or it is gone)
-    bool valid() const { return (memory || gpu) && width > 0; }
+    SharedPointer<YuvPicture> yuv;         // a YUV buffer (wl_shm or dmabuf): memory and gpu are null
+    bool valid() const { return (memory || gpu || yuv) && width > 0; }
+    uint32_t pitch() const { return yuv ? uint32_t(width) : uint32_t(stride / 4); }      // words between rows of buffer_pixels
     GpuImage* image() const { return gpu ? gpu->gpu() : nullptr; }
+  };
+  // A zwp_text_input_v3: its double-buffered state, what the client last committed, the surface it was entered on.
+  struct TextInputInfo {
+    explicit TextInputInfo(allocators::IAllocator& allocator) : pending(allocator), current(allocator) {}
+    struct State {
+      explicit State(allocators::IAllocator& allocator) : surrounding(allocator) {}
+      bool enabled = false, enable_seen = false, surrounding_set = false, rect_set = false;
+      String surrounding;
+      int32_t cursor = 0, anchor = 0;
+      uint32_t hint = 0, purpose = 0;
+      Rect rect;      // the text cursor, surface coordinates
+    };
+    State pending, current;
+    bool enabled = false;
+    bool preedit_shown = false;
+    uint32_t commits = 0;      // (the serial of done)
+    uint32_t entered = 0;      // the surface it was entered on (0: none)
   };
   // A wl_data_source: what it offers.
   struct DataSourceInfo {
@@ -259,11 +295,11 @@ class Server final : public desktop::IWindowsSession {
     uint32_t actions = 0, preferred = 0;      // the destination's (set_actions)
     bool accepted = false;                    // a drag's destination accepted a type
   };
-  // A zwp_linux_buffer_params_v1: the plane added so far (one: every format offered has one plane).
+  // A zwp_linux_buffer_params_v1: the planes added so far (one for the RGB formats, up to three for YUV).
   struct DmabufParams {
-    Fd plane;
-    uint32_t offset = 0, stride = 0;
-    uint64_t modifier = 0;
+    Fd planes[4];
+    uint32_t offsets[4] = {0, 0, 0, 0}, strides[4] = {0, 0, 0, 0};
+    uint64_t modifiers[4] = {0, 0, 0, 0};
     bool used = false;      // create or create_immed was called
   };
   struct RegionRects {
@@ -290,10 +326,24 @@ class Server final : public desktop::IWindowsSession {
     Fd timeline;                                // wp_linux_drm_syncobj_timeline_v1
     SharedPointer<DataSourceInfo> source;       // wl_data_source, zwp_primary_selection_source_v1
     SharedPointer<OfferInfo> offer;             // wl_data_offer, zwp_primary_selection_offer_v1
+    SharedPointer<TextInputInfo> text_input;    // zwp_text_input_v3
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
     uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
   };
-  enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor };
+  enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor, Layer };
+  // A layer surface's double-buffered state (zwlr_layer_surface_v1).
+  struct LayerConfig {
+    uint32_t width = 0, height = 0;          // (0: as wide / high as the anchors make it)
+    uint32_t anchor = 0;                     // 1 top, 2 bottom, 4 left, 8 right
+    int32_t zone = 0;                        // the exclusive zone (-1: ignores the others' zones)
+    int32_t margin[4] = {0, 0, 0, 0};        // top, right, bottom, left
+    uint32_t keyboard = 0;                   // 0 none, 1 exclusive, 2 on demand
+    uint32_t layer = 0;                      // 0 background, 1 bottom, 2 top, 3 overlay
+    bool operator==(const LayerConfig& o) const {
+      return width == o.width && height == o.height && anchor == o.anchor && zone == o.zone && margin[0] == o.margin[0] && margin[1] == o.margin[1] &&
+             margin[2] == o.margin[2] && margin[3] == o.margin[3] && keyboard == o.keyboard && layer == o.layer;
+    }
+  };
   struct SyncPoint {      // wp_linux_drm_syncobj_surface_v1: a timeline and a point on it
     Fd timeline;
     uint64_t point = 0;
@@ -366,6 +416,11 @@ class Server final : public desktop::IWindowsSession {
     Positioner positioner;
     Rect placement;                             // relative to the parent's window geometry
     bool grab = false;
+    // a layer surface (WaylandLayerShell.cpp): its state, the size the last configure asked for, the edge it keeps (Frame::Edge numbers) and how much
+    LayerConfig layer_pending, layer_current;
+    int32_t layer_w = 0, layer_h = 0;
+    uint8_t reserve_edge = 0;
+    uint32_t reserve = 0;
   };
   struct Change {
     uint32_t window = 0;
@@ -437,6 +492,10 @@ class Server final : public desktop::IWindowsSession {
   void send_dmabuf_feedback(Client& c, uint32_t feedback);
   Fd format_table_fd();
   bool make_dmabuf_buffer(Client& c, uint32_t params_id, DmabufParams& p, int32_t width, int32_t height, uint32_t format, uint32_t flags, bool immediate, BufferInfo* out);
+  bool make_yuv_dmabuf(Client& c, uint32_t params_id, DmabufParams& p, const YuvFormat& f, int32_t width, int32_t height, uint32_t flags, bool immediate,
+                       BufferInfo* out);
+  // Converts a YUV buffer's picture as it is now into its rgb words (at a commit of it). Black when its memory cannot be read.
+  void convert_yuv(BufferInfo& b);
   void commit(Client& c, Surface& s);
   void apply(Client& c, Surface& s, State& state);
   bool synchronized(const Surface& s) const;
@@ -529,7 +588,7 @@ class Server final : public desktop::IWindowsSession {
   // the screen and the desktop
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
-    Rect rect, work;
+    Rect rect, work, panel;      // (panel: where layer surfaces anchor - the work area before the windows' reservations)
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 1;
@@ -617,6 +676,14 @@ class Server final : public desktop::IWindowsSession {
   PenFocus pen_;
   void pen_leave();               // proximity_out (and up first, if the tip touched) to the client that has the pen
   void tablet_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void layer_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);
+  void text_input_request(Client& c, uint32_t id, Resource& r, uint16_t opcode, Reader& in);      // (WaylandTextInput.cpp)
+  TextInputInfo* focused_text_input(Client** client, uint32_t* id);
+  void text_input_focus(Surface* old, Surface* now);
+  // A layer surface's commit (from apply): checks, the first configure, mapping. False: a protocol error was posted.
+  bool commit_layer(Client& c, Surface& s, bool had_buffer);
+  // Places every layer surface again (anchors, margins, the others' exclusive zones) and asks those whose size changed for the new one.
+  void arrange_layers();
   void announce_tablet(Client& c, uint32_t seat_id, Resource& seat);
   uint32_t menu_window_ = 0;                // a toplevel's show_window_menu, until the desktop takes it
   int32_t menu_x_ = 0, menu_y_ = 0;

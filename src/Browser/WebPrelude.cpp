@@ -11366,9 +11366,14 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
     if (kind === 'classic') {
       if (!hasSrc) { runClassic(el, text); return; }
       var address = parse(src, baseAddress());
+      var cors = el.hasAttribute('crossorigin');   // (without the attribute a classic script is fetched in no-cors mode: another site's script runs without Access-Control-Allow-Origin)
       later(function () {
         var body;
-        try { body = address ? sourceOf(address.href) : null; } catch (e) { body = null; }
+        try {
+          if (!address) body = null;
+          else if (!cors && /^https?:$/.test(address.protocol) && typeof __classic_script_source === 'function') body = __classic_script_source(address.href);
+          else body = sourceOf(address.href);
+        } catch (e) { body = null; }
         if (body === null) { fire(el, 'error'); return; }
         runClassic(el, body);
         fire(el, 'load');

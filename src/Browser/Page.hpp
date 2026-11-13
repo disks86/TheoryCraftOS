@@ -314,6 +314,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void scroll_node_into_view(dom::Node* node) override;
   bool node_rect(dom::Node* node, double* rect8) override;
   int node_clips(dom::Node* node) override;
+  bool fetch_classic_script(StringView address, String* text) override { return fetch_text_via_sw(address, "script", kMaxScriptBytes, text); }
   bool layout_ready() override { return geometry_ready_; }
   bool confirm(StringView text) override { return env_.confirm(text); }
   void scroll_to(int32_t y) override;

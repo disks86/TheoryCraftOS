@@ -26,7 +26,10 @@
 // area, and dialogs open in the area of the active window (or the primary one).
 //
 // Modal windows: while one is open every other window is disabled (ignores input, drawn inactive,
-// skipped by Tab), and the modal stays on top.
+// skipped by Tab), and the modal stays on top (of its layer).
+//
+// Layers (Frame::Layer): the stack is in bands, background, bottom, normal, top, overlay; raising a window brings it to the front of its own band. A window
+// that reserves an edge (Frame::set_reserve: a panel) shrinks the areas it is on by that much, so area(), area_for() and dialog_area() leave it out.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Windows/Frame.hpp"
@@ -56,8 +59,14 @@ class WindowManager : public Control {
   // The work areas (in the manager's coordinates), the primary's first. Windows are moved to fit; nothing is lost when the list changes.
   void set_areas(const Rect2D* areas, uint32_t count);
   uint32_t area_count() const { return static_cast<uint32_t>(areas_.count()); }
-  // The area `index` (the whole manager if none are set).
+  // The area `index` (the whole manager if none are set), less what windows reserve on it.
   Rect2D area(uint32_t index) const;
+  // The area `index` as set, with nothing left out (where panels that reserve space are placed).
+  Rect2D full_area(uint32_t index) const;
+  // `r` (an area in the manager's coordinates) less what windows reserve on it.
+  Rect2D without_reserved(const Rect2D& r) const;
+  // Counts changes of what windows reserve (a reserving window shown, hidden, moved to another layer or edge): whoever passes the areas on looks again.
+  uint32_t reserve_serial() const { return reserve_serial_; }
   // The area that most of the window is on (or is nearest to).
   Rect2D area_for(const Frame* frame) const;
   // Where dialogs go: the area of the active window, else the primary area.
@@ -74,8 +83,8 @@ class WindowManager : public Control {
   uint32_t window_count() const { return static_cast<uint32_t>(order_.count()); }
   Frame* window_at(uint32_t creation_index) const { return creation_index < order_.count() ? order_[creation_index] : nullptr; }
   bool has_modal() const;
-  // Moves a window directly above or below another one in the stack (a program's own stacking order among its windows).
-  bool place_next_to(Frame* frame, Frame* anchor, bool above) { return move_child_next_to(frame, anchor, above); }
+  // Moves a window directly above or below another one in the stack (a program's own stacking order among its windows); the layers still hold.
+  bool place_next_to(Frame* frame, Frame* anchor, bool above);
   // The stacking order: 0 = bottom.
   uint32_t stacking_index(const Frame* frame) const;
 
@@ -83,6 +92,11 @@ class WindowManager : public Control {
   void on_descendant_pressed(Control* child) override;
 
  private:
+  friend class Frame;
+  void raise_in_layer(Frame* frame);    // to the front of its band
+  void sort_layers();                   // puts every window in its band again (stable), if one is out of it
+  void reserves_changed();              // a window's layer or reserve changed: areas again
+  Rect2D raw_area_of_rect(const Rect2D& r) const;
   void refresh();                 // enabled flags, active window, focus scope after any change
   Frame* top_usable() const;      // the topmost visible, enabled window
   void keep_inside(Frame* frame);
@@ -93,6 +107,7 @@ class WindowManager : public Control {
   List<Frame*> order_;  // creation order
   List<Rect2D> areas_;
   Frame* active_ = nullptr;
+  uint32_t reserve_serial_ = 0;
 };
 
 }  // namespace gui

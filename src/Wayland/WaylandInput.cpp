@@ -405,7 +405,7 @@ bool Server::cursor_picture(uint32_t handle, uint32_t* system_id, List<uint32_t>
   const BufferInfo& b = cursor_surface_->current;
   if (b.width > 256 || b.height > 256) return false;
   ArrayView<uint32_t> pixels = buffer_pixels(b);
-  uint64_t row = uint64_t(b.stride / 4);
+  uint64_t row = uint64_t(b.pitch());
   // a GPU cursor is read out first (as 0xAARRGGBB, rows of its width)
   List<uint32_t> gpu_pixels(allocator_);
   GpuImage* image = b.image();
@@ -504,7 +504,9 @@ void Server::set_keyboard_focus(Surface* s) {
       }
     }
   }
+  Surface* old_focus = keyboard_focus_;
   keyboard_focus_ = s;
+  text_input_focus(old_focus, s);      // (WaylandTextInput.cpp: leave and enter)
   last_mods_[0] = last_mods_[1] = ~0u;
   if (!s) return;
   Client* c = client_of(s->client);

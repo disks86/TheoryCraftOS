@@ -128,11 +128,24 @@ void dump(wayland::Server& server, const char* path, bool quiet) {
            info.surface.width, info.surface.height, info.caption ? " decorated" : "", info.popup ? " popup" : "", info.maximized ? " maximized" : "");
   }
   if (total_w == 0) total_w = 1;
+  // each window as the desktop draws it (its subsurfaces too)
+  std::vector<std::vector<uint32_t>> pictures;
+  for (const Shot& s : shots) {
+    pictures.emplace_back(size_t(s.w) * s.h, 0x808080u);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(pictures.back().data(), pictures.back().size());
+    target.width = target.pitch = s.w;
+    target.height = s.h;
+    graphics::SoftwareRenderer2D renderer(target);
+    uint32_t w = 0, h = 0;
+    server.draw_window(s.id, renderer, 0, 0, &w, &h);
+  }
   fprintf(f, "P6\n%u %u\n255\n", total_w, max_h);
   for (uint32_t y = 0; y < max_h; ++y) {
-    for (const Shot& s : shots) {
+    for (size_t k = 0; k < shots.size(); ++k) {
+      const Shot& s = shots[k];
       for (uint32_t x = 0; x < s.w + 4; ++x) {
-        const uint32_t v = x < s.w && y < s.h ? server.window_pixel(s.id, int32_t(x), int32_t(y)) : 0x808080u;
+        const uint32_t v = x < s.w && y < s.h ? pictures[k][size_t(y) * s.w + x] : 0x808080u;
         const uint8_t rgb[3] = {uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
         fwrite(rgb, 1, 3, f);
       }
