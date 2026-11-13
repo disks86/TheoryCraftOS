@@ -36,6 +36,20 @@ struct AdapterConfig {
   hardware::IGraphicsProcessingUnit* display = nullptr;   // the screen this adapter drives (mode setting); optional
 };
 
+// Who takes a copy of what is presented to the display (screen sharing: PipeWire's screen source sees a program that presents straight to the
+// screen, as the desktop's frames do not hold it). Called with the kernel's lock held, right after a present showed the image: it must be quick and
+// must not call into the kernel.
+class IPresentTap {
+ public:
+  // Whether it wants this frame (width x height pixels): a buffer for it, at least width * height (empty: not this one).
+  virtual ArrayView<uint32_t> present_wanted(uint32_t width, uint32_t height) = 0;
+  // The frame is in that buffer (0xAARRGGBB, row after row).
+  virtual void present_read(uint32_t width, uint32_t height) = 0;
+
+ protected:
+  ~IPresentTap() = default;
+};
+
 class Adapter {
  public:
   static constexpr uint32_t kMaxQueuedSubmissions = 4096;
@@ -79,6 +93,8 @@ class Adapter {
   // Is the allocation named by a submission waiting in some queue?
   bool allocation_in_use(const Allocation& a) const;
   bool context_idle(const ContextObject& context) const { return context.queue.count() == 0; }
+  // (Kernel::set_present_tap)
+  void set_present_tap(IPresentTap* tap) { __atomic_store_n(&present_tap_, tap, __ATOMIC_RELEASE); }
 
  private:
   class StreamRunner;
@@ -99,6 +115,7 @@ class Adapter {
   VidMm vidmm_;                                      // (declared before the contexts: the allocations the queues hold go first)
   List<SharedPointer<ContextObject>> contexts_;
   uint32_t next_[3] = {0, 0, 0};                     // per priority: where the round robin goes on
+  IPresentTap* present_tap_ = nullptr;
 };
 
 }  // namespace dxgk

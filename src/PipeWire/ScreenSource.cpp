@@ -58,9 +58,17 @@ uint64_t ScreenSource::published() {
   return published_;
 }
 
-ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, uint64_t now_us) {
-  if (!channel_ || width == 0 || height == 0 || width > VideoFormat::kMaxSide || height > VideoFormat::kMaxSide || !watched()) return ArrayView<uint32_t>();
+ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, uint64_t now_us, ScreenOrigin origin) {
+  if (!channel_ || width == 0 || height == 0 || width > VideoFormat::kMaxSide || height > VideoFormat::kMaxSide) return ArrayView<uint32_t>();
+  const bool seen = watched();
   kernel::ScopedMutex guard(mutex_);
+  if (origin == ScreenOrigin::Program) {      // (the screen shows the program's image now, watched or not)
+    program_us_ = now_us;
+    program_showing_ = true;
+  } else if (program_showing_ && now_us - program_us_ < kProgramHoldUs) {
+    return ArrayView<uint32_t>();
+  }
+  if (!seen || (filling_ && now_us - now_us_ < kKeepAliveUs)) return ArrayView<uint32_t>();      // (a fill whose read never came is given up)
   if (last_us_ && now_us - last_us_ < 1000000ull / kFps) return ArrayView<uint32_t>();
   const uint64_t pixels = uint64_t{width} * height;
   if (frame_.count() < pixels) {
@@ -94,10 +102,17 @@ void ScreenSource::frame_read(uint32_t width, uint32_t height, int64_t pts_ns) {
   if (channel_->publish(words_as_bytes(words), width * 4, pts_ns)) ++published_;
 }
 
+bool ScreenSource::desktop_returned(uint64_t now_us) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!program_showing_ || now_us - program_us_ < kProgramHoldUs) return false;
+  program_showing_ = false;
+  return true;
+}
+
 bool ScreenSource::keep_alive(uint64_t now_us) {
   if (!channel_ || !watched()) return false;
   kernel::ScopedMutex guard(mutex_);
-  if (filling_ || !width_ || !height_ || now_us - sent_us_ < kKeepAliveUs) return false;
+  if ((filling_ && now_us - now_us_ < kKeepAliveUs) || !width_ || !height_ || now_us - sent_us_ < kKeepAliveUs) return false;
   sent_us_ = now_us;
   const ArrayView<const uint32_t> words = ArrayView<const uint32_t>(frame_.view()).first(uint64_t{width_} * height_);
   if (!channel_->publish(words_as_bytes(words), width_ * 4, static_cast<int64_t>(now_us * 1000))) return false;

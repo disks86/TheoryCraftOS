@@ -905,6 +905,80 @@ void test_present() {
   CHECK(e.screen.presents == 3 && e.screen.at(0, 0) == 0xFF0000);
 }
 
+// The present tap: each present that showed an image hands it over when the tap wants it (as the display shows it), none when it does not, none for
+// a refused present; it follows adapters added later; taken away, nothing more.
+struct RecordingTap final : IPresentTap {
+  std::vector<uint32_t> buffer;
+  std::vector<uint32_t> last;
+  uint32_t width = 0, height = 0, asked = 0, read = 0;
+  bool want = true;
+  ArrayView<uint32_t> present_wanted(uint32_t w, uint32_t h) override {
+    ++asked;
+    if (!want) return ArrayView<uint32_t>();
+    buffer.assign(size_t(w) * h, 0);
+    return ArrayView<uint32_t>(buffer.data(), buffer.size());
+  }
+  void present_read(uint32_t w, uint32_t h) override {
+    ++read;
+    width = w;
+    height = h;
+    last = buffer;
+  }
+};
+
+void test_present_tap() {
+  Env e;
+  RecordingTap tap;
+  e.kernel.set_present_tap(&tap);
+  Handle back = e.alloc(kTarget | kAllocPresent, Format::A8R8G8B8, 8, 6), plain = e.alloc(kTarget, Format::A8R8G8B8, 8, 6);
+  CHECK(e.clear(back, {0, 0, 1, 1}) == status::kSuccess);
+  PresentArgs flip;
+  flip.source = back;
+  CHECK(e.kernel.present(kPid, e.ctx, flip) == status::kSuccess && tap.asked == 1 && tap.read == 1 && tap.width == 8 && tap.height == 6);
+  CHECK(tap.last.size() == 48 && (tap.last[0] & 0xFFFFFF) == 0x0000FF && (tap.last[47] & 0xFFFFFF) == 0x0000FF);
+  // a blit present: the shown image (the destination) with the region copied in
+  CHECK(e.clear(plain, {1, 0, 0, 1}) == status::kSuccess);
+  PresentArgs blit;
+  blit.source = plain;
+  blit.destination = back;
+  blit.source_rect = {0, 0, 2, 2};
+  CHECK(e.kernel.present(kPid, e.ctx, blit) == status::kSuccess && tap.read == 2 && tap.last.size() == 48);
+  CHECK((tap.last[0] & 0xFFFFFF) == 0xFF0000 && (tap.last[9] & 0xFFFFFF) == 0xFF0000 && (tap.last[2] & 0xFFFFFF) == 0x0000FF);
+  // not wanted: asked, not read; refused presents: not even asked
+  tap.want = false;
+  CHECK(e.kernel.present(kPid, e.ctx, flip) == status::kSuccess && tap.asked == 3 && tap.read == 2);
+  PresentArgs bad;
+  bad.source = plain;
+  CHECK(e.kernel.present(kPid, e.ctx, bad) == status::kInvalidParameter && tap.asked == 3);
+  // taken away: nothing
+  tap.want = true;
+  e.kernel.set_present_tap(nullptr);
+  CHECK(e.kernel.present(kPid, e.ctx, flip) == status::kSuccess && tap.asked == 3);
+  // a kernel whose tap is set before its adapter: the adapter has it
+  HostAllocator a;
+  FakeScreen screen(4, 4);
+  graphics::SoftwareDevice device(a, &screen);
+  Kernel k(a);
+  RecordingTap early;
+  k.set_present_tap(&early);
+  AdapterConfig c;
+  c.display = &screen;
+  CHECK(k.add_adapter(device, c) == 0);
+  Handle adapter = 0, dev = 0, ctx = 0, img = 0;
+  CHECK(k.open_process(kPid) == status::kSuccess && k.open_adapter_from_index(kPid, 0, &adapter) == status::kSuccess && k.create_device(kPid, adapter, &dev) == status::kSuccess &&
+        k.create_context(kPid, dev, ContextPriority::Normal, &ctx) == status::kSuccess);
+  AllocationDesc d;
+  d.flags = kTarget | kAllocPresent;
+  d.format = Format::A8R8G8B8;
+  d.width = 4, d.height = 4;
+  CHECK(k.create_allocation(kPid, dev, d, &img) == status::kSuccess);
+  PresentArgs f2;
+  f2.source = img;
+  CHECK(k.present(kPid, ctx, f2) == status::kSuccess && early.read == 1 && early.width == 4);
+  k.set_present_tap(nullptr);
+  k.close_process(kPid);
+}
+
 void test_sharing_and_teardown() {
   HostAllocator a;
   FakeScreen screen(4, 4);
@@ -7841,6 +7915,7 @@ int main() {
   test_fences_and_scheduler();
   test_residency();
   test_present();
+  test_present_tap();
   test_sharing_and_teardown();
   test_teardown_with_work_queued();
   test_escape();

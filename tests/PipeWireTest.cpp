@@ -2690,8 +2690,35 @@ static void test_screen_source() {
     if (torn || !frames) printf("screen threads: %d frames, %d torn\n", frames, torn);
     CHECK(torn == 0 && frames > 0);
   }
+  // a program presenting to the display: its frames go out, the desktop's are passed over while it presents; once it stopped for kProgramHoldUs,
+  // desktop_returned() says so once and the desktop's frames go out again
+  {
+    uint64_t t = now + 100000000;
+    ArrayView<uint32_t> p1 = screen.frame_wanted(6, 4, t, ScreenOrigin::Program);
+    CHECK(p1.size() == 24);
+    for (uint32_t& p : p1) p = 0xFF3D3D3Du;
+    screen.frame_read(6, 4, 1);
+    CHECK(seen->format().width == 6 && seen->latest() && seen->latest()->pixels.view()[0] == 0x3D);
+    CHECK(screen.frame_wanted(16, 8, t + 150000).empty());      // (the desktop, while the program presents)
+    CHECK(screen.frame_wanted(6, 4, t + 160000, ScreenOrigin::Program).size() == 24);
+    screen.frame_read(6, 4, 2);
+    CHECK(!screen.desktop_returned(t + 300000));      // (140 ms since its last present)
+    CHECK(screen.frame_wanted(16, 8, t + 300000).empty());
+    CHECK(screen.desktop_returned(t + 160000 + ScreenSource::kProgramHoldUs) && !screen.desktop_returned(t + 900000));
+    ArrayView<uint32_t> d1 = screen.frame_wanted(16, 8, t + 1000000);
+    CHECK(d1.size() == 128);
+    screen.frame_read(16, 8, 3);
+    CHECK(seen->format().width == 16);
+    // a fill that never got its read (the read back failed) is given up after a second
+    ArrayView<uint32_t> lost = screen.frame_wanted(16, 8, t + 2000000);
+    CHECK(!lost.empty());
+    CHECK(screen.frame_wanted(16, 8, t + 2200000).empty() && screen.frame_wanted(16, 8, t + 2000000 + ScreenSource::kKeepAliveUs).size() == 128);
+    screen.frame_read(16, 8, 4);
+  }
   g.destroy_node(watcher);
   CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
+  const uint64_t t2 = now + 200000000;
+  CHECK(screen.frame_wanted(8, 4, t2, ScreenOrigin::Program).empty() && !screen.desktop_returned(t2 + 1000) && screen.desktop_returned(t2 + ScreenSource::kProgramHoldUs));
 }
 
 // ---- encoded video ----------------------------------------------------------------------------------------------------------------------------------

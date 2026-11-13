@@ -135,6 +135,8 @@ class Kernel {
   uint32_t add_adapter(graphics::IGraphicsDevice& device, const AdapterConfig& config);
   uint32_t adapter_count();
   Adapter* adapter(uint32_t index);   // (diagnostics and tests)
+  // Who sees what every adapter presents to the display (nullptr: no one). It must outlive the kernel, or be taken away first.
+  void set_present_tap(IPresentTap* tap);
 
   // --- Processes. A process is opened before its first call; closing it destroys everything it still holds.
   NtStatus open_process(ProcessId pid);
@@ -257,6 +259,7 @@ class Kernel {
   uint32_t next_luid_ = 1, next_token_ = 0x1000;
   // (declared in the order the parts must be destroyed in, last to first: the processes and tokens hold references into the adapters)
   List<UniquePointer<Adapter>> adapters_;
+  IPresentTap* present_tap_ = nullptr;
   List<UniquePointer<ShareToken>> tokens_;
   List<UniquePointer<Process>> processes_;
 };

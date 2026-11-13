@@ -2182,7 +2182,24 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       gui::Window& w;
       ~ScreenTapGuard() { w.set_frame_tap(nullptr); }      // (before the source goes)
     } screen_tap_guard{desktop.window()};
-    if (screen_source.start()) desktop.window().set_frame_tap(&screen_tap);
+    // ... and what programs present straight to the display (the Direct3D kernel's presents: the 3D test, a full-screen Direct3D program), which the
+    // desktop's frames do not hold.
+    struct PresentTap final : dxgk::IPresentTap {
+      pipewire::ScreenSource& s;
+      explicit PresentTap(pipewire::ScreenSource& source) : s(source) {}
+      ArrayView<uint32_t> present_wanted(uint32_t width, uint32_t height) override {
+        return s.frame_wanted(width, height, hardware::uptime_us(), pipewire::ScreenOrigin::Program);
+      }
+      void present_read(uint32_t width, uint32_t height) override { s.frame_read(width, height, static_cast<int64_t>(hardware::uptime_us() * 1000)); }
+    } present_tap(screen_source);
+    struct PresentTapGuard {
+      dxgk::Kernel& k;
+      ~PresentTapGuard() { k.set_present_tap(nullptr); }      // (before the source goes)
+    } present_tap_guard{dxg_kernel};
+    if (screen_source.start()) {
+      desktop.window().set_frame_tap(&screen_tap);
+      dxg_kernel.set_present_tap(&present_tap);
+    }
     // The desktop's Video Viewer watches the graph's video producers through the kernel's own watcher.
     pipewire::VideoWatcher video_watcher(media_graph, shared_allocator);
     struct ViewerSources final : desktop::IVideoSources {
@@ -2758,6 +2775,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
         camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
         if (screen_source.watcher_came()) desktop.window().invalidate();      // (a frame for the new watcher, even of a still screen)
+        if (screen_source.desktop_returned(now_us)) desktop.window().invalidate();      // (a program stopped presenting: the desktop again)
         screen_source.keep_alive(now_us);      // (a still screen: its last frame again once a second)
       }
       if (threaded) {

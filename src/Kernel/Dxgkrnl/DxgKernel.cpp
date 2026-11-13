@@ -144,8 +144,15 @@ uint32_t Kernel::add_adapter(graphics::IGraphicsDevice& device, const AdapterCon
   Luid luid = config.luid;
   if (luid.low == 0 && luid.high == 0) luid.low = next_luid_++;
   UniquePointer<Adapter> a = UniquePointer<Adapter>::make(allocator_, allocator_, device, config, index, luid);
+  if (a) a->set_present_tap(present_tap_);
   if (!a || !adapters_.push_back(util::move(a))) return kInvalidIndex;
   return index;
+}
+
+void Kernel::set_present_tap(IPresentTap* tap) {
+  kernel::ScopedMutex g(lock_);
+  present_tap_ = tap;
+  for (UniquePointer<Adapter>& a : adapters_.view()) a->set_present_tap(tap);
 }
 
 uint32_t Kernel::adapter_count() {
