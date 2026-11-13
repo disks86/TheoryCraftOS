@@ -63,6 +63,14 @@ inline constexpr const char* kCalendarDatabase = "/AppStore/Calendar/calendar.db
 // The to-do application's items (the "Todo" application's folder in the AppStore).
 inline constexpr const char* kTodoDatabase = "/AppStore/Todo/todo.db";
 
+// The App Manager (the AppImage package manager, src/Desktop/AppMan): its copy of the AppMan catalog (the "AppMan" application's folder in the AppStore).
+// The programs it installs live in the Linux world, laid out as AppMan ("am") lays them out: /opt/<app>/ (the AppImage, its version and remove files,
+// icons/<app>), a desktop entry in /usr/local/share/applications/<app>-AM.desktop and a link in /usr/local/bin.
+inline constexpr const char* kAppManFolder = "/AppStore/AppMan";
+inline constexpr const char* kAppManCatalog = "/AppStore/AppMan/stats-appimages";
+inline constexpr const char* kLinuxOpt = "/Linux/opt";
+inline constexpr const char* kLinuxLocalBin = "/Linux/usr/local/bin";
+
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";
 

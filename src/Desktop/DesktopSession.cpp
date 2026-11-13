@@ -38,6 +38,7 @@ const KindName kKinds[] = {
     {Desktop::kAppCalculator, "calculator"},
     {Desktop::kAppCalendar, "calendar"},
     {Desktop::kAppTodo, "todo"},
+    {Desktop::kAppAppManager, "appman"},
 };
 
 const char* kind_name(uint8_t kind) {
@@ -271,6 +272,7 @@ Frame* Desktop::open_app(uint8_t app, TabFrame* into, StringView path) {
     case kAppCalculator: return open_calculator(into);
     case kAppCalendar: return open_calendar(into);
     case kAppTodo: return open_todo(into);
+    case kAppAppManager: return open_app_manager(into);
     case kAppMedia:   // (the file is not played again: the window just comes back)
       open_media_player(into);
       return &media_player_;

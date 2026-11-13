@@ -42,7 +42,9 @@
 #include "Desktop/MediaPlayer.hpp"
 #include "Desktop/Calculator.hpp"
 #include "Desktop/VideoViewer.hpp"
+#include "Desktop/AppManager.hpp"
 #include "Desktop/Todo.hpp"
+#include "SquashWriter.hpp"
 #include "Desktop/Calendar.hpp"
 #include "Desktop/FileProperties.hpp"
 #include "Desktop/Notepad.hpp"
@@ -2740,7 +2742,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 17);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, Paint, Media Player, Video Viewer, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 18);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, App Manager, Paint, Media Player, Video Viewer, 3D Test, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -6865,7 +6867,7 @@ static void test_video_viewer() {
       }
     } sources;
     d.set_video_sources(&sources);
-    CHECK(d.start_button().menu().item_count() == 17);
+    CHECK(d.start_button().menu().item_count() == 18);
     d.open_video_viewer();
     desktop::VideoViewer& v = d.video_viewer();
     CHECK(v.manager() && v.source_list().item_count() == 2 && v.source_list().selected_index() == 0 && sources.watching == 5);
@@ -8814,6 +8816,103 @@ static void test_web_browser_tabs() {
   CHECK(a.live == 0);
 }
 
+// The App Manager in the desktop, over a stand-in network: the catalog fetched (and kept), searched, an AppImage installed (Start menu entry and all),
+// shown as installed, updated, removed.
+struct FakeAppNetwork final : desktop::appman::INetwork {
+  std::map<std::string, std::string> pages, files;
+  bool fetch(StringView url, uint64_t max_bytes, String* body) override {
+    auto it = pages.find(std::string(url.data(), url.size()));
+    return it != pages.end() && it->second.size() <= max_bytes && body->assign(StringView(it->second.data(), it->second.size()));
+  }
+  bool download(StringView url, Sink sink, void* context, uint64_t* total) override {
+    auto it = files.find(std::string(url.data(), url.size()));
+    if (it == files.end()) return false;
+    *total = it->second.size();
+    for (size_t at = 0; at < it->second.size(); at += 8192)
+      if (!sink(context, ConstByteView(reinterpret_cast<const uint8_t*>(it->second.data() + at), std::min<size_t>(8192, it->second.size() - at)))) return false;
+    return true;
+  }
+};
+
+static void test_app_manager() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    FakeAppNetwork net;
+    const std::string bullet = "\xE2\x97\x86 ";
+    net.pages[std::string(desktop::appman::kCatalogUrl.data(), desktop::appman::kCatalogUrl.size())] =
+        bullet + "notes : Take notes in Markdown. #itsdesktopapp\n" + bullet + "paint-x : A painting program. #itsdesktopapp\n" + bullet + "termtool : For the terminal. #itscliapp\n";
+    const std::string scripts(desktop::appman::kScriptsUrl.data(), desktop::appman::kScriptsUrl.size());
+    net.pages[scripts + "notes"] = "#!/bin/sh\nAPP=notes\nversion=$(curl -Ls https://example.org/notes/releases | grep -o 'https://[^\"]*AppImage' | head -1)\n";
+    net.pages["https://example.org/notes/releases"] = "<a href=\"https://example.org/notes/Notes-1.0-x86_64.AppImage\">";
+    squash_writer::WriterOptions o;
+    o.compression = squash_writer::first_available() ? squash_writer::first_available() : uint16_t(squash_writer::kGzip);
+    o.store_only = squash_writer::first_available() == 0;
+    squash_writer::Tree t;
+    t.add("/AppRun", squash_writer::TNode::File, "\x7F" "ELF notes");
+    t.add("/notes.desktop", squash_writer::TNode::File, "[Desktop Entry]\nName=Notes\nExec=AppRun %F\nIcon=notes\nType=Application\n");
+    t.add("/.DirIcon", squash_writer::TNode::File, "\x89PNG notes icon");
+    net.files["https://example.org/notes/Notes-1.0-x86_64.AppImage"] = squash_writer::fake_runtime(true, false, 2, true) + squash_writer::write_squash(t, o);
+
+    Screen screen(a, 1000, 700);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_appman_network(&net);
+    d.set_file_system(&fs);
+    desktop::AppManager* m = d.open_app_manager();
+    CHECK(m && m == &d.app_manager() && d.open_app_manager() == m);      // (one window)
+    if (!m) return;
+    // The catalog came in (the jobs run at once here: no threads), and is kept for next time.
+    CHECK(m->catalog_count() == 3 && m->list().item_count() == 3 && !m->busy());
+    CHECK(m->status().contains("3 of 3"));
+    filesystem::DirectoryEntry e;
+    CHECK(fs.stat(filesystem::layout::kAppManCatalog, &e) == filesystem::Status::Ok && e.size > 0);
+    String cell(a), name(a);
+    CHECK(m->list().item_text(0, 0, &cell) && cell.view().equals("notes"));
+    // Searching.
+    m->set_query("paint");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("paint-x"));
+    m->set_query("TERMINAL");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("termtool"));
+    m->set_query("");
+    CHECK(m->list().item_count() == 3);
+    // Nothing chosen: nothing to do.
+    CHECK(!m->install_button().enabled() && !m->install_selected());
+    // Install.
+    m->select_row(0);
+    CHECK(m->install_button().enabled() && !m->remove_button().enabled() && m->details().contains("Take notes"));
+    CHECK(m->install_selected());
+    CHECK(!m->busy() && m->status().contains("is installed"));
+    CHECK(m->progress_bar().percent() == 100);
+    CHECK(m->list().item_text(0, 2, &cell) && cell.view().equals("Installed"));
+    CHECK(!m->install_button().enabled() && m->remove_button().enabled() && m->update_button().enabled() && m->details().contains("installed from"));
+    CHECK(fs.stat("/Linux/opt/notes/notes", &e) == filesystem::Status::Ok && fs.stat("/Linux/usr/local/share/applications/notes-AM.desktop", &e) == filesystem::Status::Ok);
+    List<desktop::InstalledApp> apps(a);
+    bool listed = false;
+    if (desktop::find_installed_apps(fs, a, &apps))
+      for (const desktop::InstalledApp& app : apps.view()) listed |= app.label.view().equals("Notes (Linux)") && app.program.view().equals("/Linux/opt/notes/notes");
+    CHECK(listed);
+    // Installed only.
+    m->set_filter(desktop::AppManager::kShowInstalled);
+    CHECK(m->list().item_count() == 1 && m->status().contains("1 AppImage installed"));
+    m->select_row(0);
+    CHECK(m->update_selected() && m->status().contains("up to date"));
+    // Remove.
+    CHECK(m->remove_selected() && m->status().contains("is removed") && m->list().item_count() == 0);
+    CHECK(fs.stat("/Linux/opt/notes", &e) == filesystem::Status::NotFound);
+    m->set_filter(desktop::AppManager::kShowAll);
+    // A failure says why.
+    m->select_row(1);      // paint-x: AppMan has no script of it here
+    CHECK(m->install_selected() && m->status().contains("no install script"));
+    // Without a network nothing is offered.
+    desktop::AppManager lone(a);
+    lone.set_services(&fs, nullptr);
+    CHECK(lone.catalog_count() == 3);      // (the kept copy)
+    lone.select_row(0);
+    CHECK(!lone.install_button().enabled() && !lone.refresh_button().enabled() && !lone.install_selected());
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the report of the checks that failed before it
   test_scroll_bar();
@@ -8902,6 +9001,7 @@ int main() {
   test_explorer_copy_paste_properties();
   test_calculator_session();
   test_todo();
+  test_app_manager();
   test_calendar();
   test_calendar_recurrence();
   test_calendar_floating_and_occurrences();

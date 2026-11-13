@@ -71,6 +71,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       calendar_(allocator),
       todo_store_(UniquePointer<TodoStore>::make(allocator, allocator, nullptr)),
       todo_(allocator),
+      app_manager_(allocator),
       file_properties_(allocator),
       media_player_(allocator),
       graphics_test_(allocator),
@@ -119,6 +120,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Calculator", {&Desktop::on_calculator, this});
   start_.menu().add_item("Calendar", {&Desktop::on_calendar, this});
   start_.menu().add_item("To-Do", {&Desktop::on_todo, this});
+  start_.menu().add_item("App Manager", {&Desktop::on_app_manager, this});
   start_.menu().add_item("Paint", {&Desktop::on_paint, this});
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("Video Viewer", {&Desktop::on_video_viewer, this});
@@ -175,6 +177,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   setup_calculator(calculator_);
   setup_calendar(calendar_);
   setup_todo(todo_);
+  app_manager_.set_app_kind(kAppAppManager);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
 
@@ -356,6 +359,7 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   });
   media_player_.set_file_system(fs);
   file_dialog_.set_file_system(fs);
+  app_manager_.set_services(fs, appman_network_);      // (the programs it installs go in /Linux of this file system)
   request_app_scan();   // the installed applications of this filesystem, for the Start menu
 }
 
@@ -693,6 +697,7 @@ void Desktop::on_new_tab(void* self, Control& sender) {
     case kAppCalculator: d->open_calculator(host); break;
     case kAppCalendar: d->open_calendar(host); break;
     case kAppTodo: d->open_todo(host); break;
+    case kAppAppManager: d->open_app_manager(host); break;
     case kAppMedia: d->open_media_player(host); break;
     default: d->open_explorer(host); break;
   }
@@ -856,6 +861,25 @@ uint32_t Desktop::todo_count() const {
 }
 
 void Desktop::on_todo(void* self, Control&) { static_cast<Desktop*>(self)->open_todo(); }
+
+AppManager* Desktop::open_app_manager(TabFrame* into) {
+  AppManager* opened = nullptr;
+  window_.locked([&] {
+    if (app_manager_.manager()) {      // (already open: one window installs at a time)
+      opened = &app_manager_;
+      return;
+    }
+    if (place(&app_manager_, into)) opened = &app_manager_;
+  });
+  return opened;
+}
+
+void Desktop::on_app_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_app_manager(); }
+
+void Desktop::set_appman_network(appman::INetwork* network) {
+  appman_network_ = network;
+  app_manager_.set_services(fs_, network);
+}
 
 void Desktop::on_calendar(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }
 void Desktop::on_calendar_toast(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }

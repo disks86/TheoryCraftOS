@@ -15,8 +15,8 @@ libs=""
 for lib in zlib:ZLIB libzstd:ZSTD liblzma:LZMA liblz4:LZ4 lzo2:LZO; do
   if pkg-config --exists "${lib%%:*}" 2>/dev/null; then libs="$libs -DTCOS_HAVE_${lib##*:} $(pkg-config --cflags --libs "${lib%%:*}")"; fi
 done
-g++ $flags -I src -w tests/AppImageTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
-    src/FileSystem/Squash/*.cpp src/FileSystem/Iso/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Executable/AppImage.cpp src/Program/AppRunScript.cpp src/Program/AppImageLaunch.cpp \
+g++ $flags -I src -I tests -w tests/AppImageTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
+    src/FileSystem/Squash/*.cpp src/FileSystem/Iso/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Executable/AppImage.cpp src/Program/AppRunScript.cpp src/Program/ShellTools.cpp src/Regex/Regex.cpp src/Program/AppImageLaunch.cpp \
     src/Process/ProgramEnvironment.cpp src/Media/Zlib.cpp src/Media/Zstd.cpp src/Media/Xz.cpp src/Media/Lz4.cpp src/Media/Lzo.cpp src/Crypto/Crypto.cpp $libs -o "$out/AppImageTest"
 
 status=0

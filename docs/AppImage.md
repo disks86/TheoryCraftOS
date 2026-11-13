@@ -106,6 +106,6 @@ Files of several extents are read as one. Interleaved files, zisofs2 and sparse 
   still fails at that point.
 - **`/proc/self/exe`** is not answered, so glibc's `$ORIGIN` falls back to `LD_ORIGIN_PATH`, which is not set. AppRun normally sets
   `LD_LIBRARY_PATH`, which covers the usual case.
-- **No desktop integration:** no menu entries or icons from the image's desktop file, and no AppImageUpdate.
+- **Desktop integration only through the App Manager** (AppManager.md): an AppImage started from a file gets no menu entry; there is no AppImageUpdate.
 - **Only a small static test program has run in the OS.** Real desktop AppImages (Electron, GTK) have not been started in QEMU yet;
   they also need glibc and the system libraries in `/Linux` (see LinuxDynamicPrograms.md).
