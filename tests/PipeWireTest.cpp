@@ -3453,6 +3453,23 @@ static void test_client_node_media() {
       for (int k = 0; k < 5; ++k) CHECK(std::abs((times[size_t(k)] - times[0]) / 1e6 - want[k]) < 1.5);
     }
     if (listener_sysex.size() == 2) CHECK(listener_sysex[0] == long_bytes);
+    {
+      // a Sequence whose body is not a multiple of 8, its last control's padding past the end: read up to there, no further
+      ByteBuffer bad(A);
+      bad.put32(27); bad.put32(pod::kSequence); bad.put32(0); bad.put32(0);
+      bad.put32(0); bad.put32(2); bad.put32(3); bad.put32(pod::kBytes);
+      const uint8_t note[3] = {0x90, 50, 1};
+      bad.append(ConstByteView(note, 3));
+      const size_t before = synth.got.size();
+      for (int i = 0; i < 60 && u32_at(mo.activation->memory(), 0) != 1; ++i) tick(1);
+      ByteView b2 = mo.buffer(1, 0, 1);
+      put_bytes(b2, uint32_t(mo.ports[{1, 0}].bufs[1].data), bad.view().data(), bad.size());
+      put_u32(b2, 0, 0); put_u32(b2, 4, uint32_t(bad.size()));
+      put_u32(mo.io(1, 0), 0, 2); put_u32(mo.io(1, 0), 4, 1);
+      put_u32(mo.activation->memory(), 0, 3);
+      tick();
+      CHECK(synth.got.size() == before + 1);
+    }
   }
   c.send(0, 7, [](pod::Builder& b) { b.int32(3); });
   c.send(0, 7, [](pod::Builder& b) { b.int32(4); });

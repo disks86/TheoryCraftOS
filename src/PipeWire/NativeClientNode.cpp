@@ -367,7 +367,9 @@ void parse_sequence(ConstByteView pod_bytes, UmpDecoder& ump, allocators::IAlloc
         i += uint64_t{n} * 4;
       }
     }
-    at += 16 + ((uint64_t{value_size} + 7) & ~uint64_t{7});
+    const uint64_t step = 16 + ((uint64_t{value_size} + 7) & ~uint64_t{7});
+    if (step > body.size() - at) return;      // (the last control's padding may run past a body whose size is not a multiple of 8)
+    at += step;
   }
 }
 
@@ -1043,7 +1045,8 @@ void NativeServer::port_update(Client& c, ClientNode& n, uint32_t direction, uin
       }
     }
   }
-  if ((change_mask & kPortUpdateParams) && p->format_sent && !p->renegotiate) {
+  // (what it wants of its buffers is taken only before they are made: the server's layout must stay the one the program was sent)
+  if ((change_mask & kPortUpdateParams) && p->format_sent && !p->renegotiate && !p->buffers_sent) {
     if (has_buffers) {
       p->wanted_buffers = wanted_buffers;
       p->wanted_blocks = wanted_blocks;
