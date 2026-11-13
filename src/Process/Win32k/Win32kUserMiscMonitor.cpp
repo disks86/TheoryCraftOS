@@ -434,7 +434,7 @@ bool get_monitor_info(Call& c, uint32_t monitor, uint64_t info) {
   if (size != 40 && size != 104) { c.set_last_error(kErrorInvalidParameter); return false; }
   uint8_t out[104] = {};
   put32(out, 0, size);
-  const Rect m = monitor_rect(monitor, false), w = monitor_rect(monitor, true);
+  const Rect m = user::rect_for_caller(c, monitor_rect(monitor, false)), w = user::rect_for_caller(c, monitor_rect(monitor, true));
   const int32_t v[8] = {m.left, m.top, m.right, m.bottom, w.left, w.top, w.right, w.bottom};
   for (uint32_t i = 0; i < 8; ++i) put32(out, 4 + 4 * i, uint32_t(v[i]));
   put32(out, 36, index_of(monitor) == 0 ? 1 : 0);      // MONITORINFOF_PRIMARY

@@ -21,6 +21,8 @@
 #include "Process/Process.hpp"
 #include "Utility/ArrayView.hpp"
 
+namespace process::win32k { class Call; }
+
 // What the other win32k modules (and the kernel) use of the GDI module (Win32kGdi*.cpp). The GDI module implements everything declared here; it may add more below the
 // marked line. Everything is guarded by the system lock (the callers are handlers that hold it), except where noted.
 namespace process::win32k::gdi {
@@ -71,6 +73,10 @@ class IWindowSurfaceSink {
   ~IWindowSurfaceSink() = default;
 };
 void set_window_surface_sink(IWindowSurfaceSink* sink);
+// DPI virtualization (the window manager's, Win32kUserDpi.cpp): the factor the calling thread's coordinates are divided by and the dpi it works at.
+// Without a hook GDI answers 1 and 96.
+using CallerDpiHook = void (*)(Call& call, uint32_t* scale, uint32_t* dpi);
+void set_caller_dpi_hook(CallerDpiHook hook);
 bool is_dc(uint32_t handle);
 bool is_screen_dc(uint32_t handle);      // a DC of the screen or of a window (not a memory DC, not a printer's)
 bool delete_dc(uint32_t dc);      // ReleaseDC / EndPaint: the DC goes (any objects selected into it stay)

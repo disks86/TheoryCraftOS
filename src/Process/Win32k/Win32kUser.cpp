@@ -17,6 +17,7 @@
  */
 // The window manager's core: its state, the window tree, regions of rectangles, atoms, and what the other win32k modules call (Win32kUser.hpp).
 #include "Process/Win32k/Win32kUserInternal.hpp"
+#include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Utility/UniquePointer.hpp"
 
 namespace process::win32k::user {
@@ -576,7 +577,15 @@ void on_process_exit_hook(uint64_t pid) {
   if ((s.foreground_thread & 0xFFFFF) == pid) s.foreground_thread = 0;
 }
 
+namespace {
+void gdi_caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi) {      // (what GDI's device caps answer an unaware or aware caller)
+  *scale = caller_scale(call);
+  *dpi = user_misc::thread_dpi(call);
+}
+}  // namespace
+
 void install_user_services() {
+  gdi::set_caller_dpi_hook(&gdi_caller_dpi);
   register_class_services();
   register_window_services();
   register_geometry_services();

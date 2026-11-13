@@ -261,7 +261,8 @@ uint64_t svc_inject_touch_input(Call& c) {
     if (!c.read(contacts + uint64_t(i) * sizeof raw, ByteView(raw, sizeof raw))) return c.fail(kErrorNoAccess);
     auto u32 = [&](uint32_t o) { return uint32_t(raw[o]) | uint32_t(raw[o + 1]) << 8 | uint32_t(raw[o + 2]) << 16 | uint32_t(raw[o + 3]) << 24; };
     const uint32_t type = u32(0), pointer_id = u32(4), flags = u32(12);
-    const int32_t x = int32_t(u32(32)), y = int32_t(u32(36));
+    const int32_t k = int32_t(user::caller_dpi_scale(c));      // (an unaware caller's 96-dpi units)
+    const int32_t x = int32_t(u32(32)) * k, y = int32_t(u32(36)) * k;
     if (type != 2 || pointer_id >= p->touch_max_contacts) return c.fail(kErrorInvalidParameter);
     const uint32_t id = 0x80000000u | uint32_t(c.pid() & 0x7FFFFFu) << 8 | pointer_id;      // (apart from the desktop's own contact ids)
     uint8_t phase;

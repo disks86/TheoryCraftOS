@@ -721,16 +721,18 @@ uint64_t NtGdiRectVisible(Call& c) {
 
 // ---- Device capabilities.
 
-int32_t device_cap(Dc& dc, int32_t cap) {
+// (scale, dpi: the caller's DPI virtualization - the screen is in device pixels, an unaware caller sees it the scale smaller at 96 dpi)
+int32_t device_cap(Dc& dc, int32_t cap, uint32_t scale = 1, uint32_t dpi = 96) {
   Bitmap* bm = nullptr;
   Surface s = dc_surface(dc, &bm);
-  const int32_t w = s.valid() && dc.memory ? s.width : int32_t(screen_width()), h = s.valid() && dc.memory ? s.height : int32_t(screen_height());
+  const int32_t sw = int32_t(screen_width() / scale), sh = int32_t(screen_height() / scale);
+  const int32_t w = s.valid() && dc.memory ? s.width : sw, h = s.valid() && dc.memory ? s.height : sh;
   const uint32_t bpp = s.valid() ? s.bpp : 32;
   switch (cap) {
     case 0: return 0x0400;
     case 2: return dc.printer ? 2 : 1;
-    case 4: return w * 254 / 960;
-    case 6: return h * 254 / 960;
+    case 4: return w * 254 / int32_t(dpi * 10);
+    case 6: return h * 254 / int32_t(dpi * 10);
     case 8: return w;
     case 10: return h;
     case 12: return int32_t(bpp >= 24 ? 32 : bpp);
@@ -747,13 +749,13 @@ int32_t device_cap(Dc& dc, int32_t cap) {
     case 40: case 42: return 36;
     case 44: return 51;
     case 45: return 0x37;
-    case 88: case 90: return 96;
+    case 88: case 90: return int32_t(dpi);      // LOGPIXELSX / Y
     case 104: return bpp == 8 ? 256 : 0;
     case 106: return bpp == 8 ? 20 : 0;
     case 108: return bpp >= 24 ? 24 : int32_t(bpp);
     case 116: return 60;
-    case 117: return int32_t(screen_height());
-    case 118: return int32_t(screen_width());
+    case 117: return sh;
+    case 118: return sw;
     default: return 0;
   }
 }
@@ -761,7 +763,9 @@ int32_t device_cap(Dc& dc, int32_t cap) {
 uint64_t NtGdiGetDeviceCaps(Call& c) {
   Dc* dc = dc_arg(c, c.arg32(0));
   if (!dc) return 0;
-  return ret_i32(device_cap(*dc, c.argi(1)));
+  uint32_t scale = 1, dpi = 96;
+  caller_dpi(c, &scale, &dpi);
+  return ret_i32(device_cap(*dc, c.argi(1), scale, dpi));
 }
 
 uint64_t NtGdiSetSizeDevice(Call& c) { return dc_arg(c, c.arg32(0)) ? 1 : 0; }

@@ -482,10 +482,12 @@ uint64_t nt_set_keyboard_state(Call& call) {
 
 uint64_t nt_get_cursor_pos(Call& call) {
   init_cursor();
-  return write_point(call, call.arg(0), Point{S().cursor_x, S().cursor_y}) ? 1 : call.fail(kErrorNoaccess);
+  const uint32_t k = caller_scale(call);      // (DPI virtualization: an unaware caller's 96-dpi units)
+  return write_point(call, call.arg(0), Point{dpi_down(S().cursor_x, k), dpi_down(S().cursor_y, k)}) ? 1 : call.fail(kErrorNoaccess);
 }
 uint64_t nt_set_cursor_pos(Call& call) {
-  set_cursor_pos_locked(call.argi(0), call.argi(1));
+  const uint32_t k = caller_scale(call);
+  set_cursor_pos_locked(dpi_up(call.argi(0), k), dpi_up(call.argi(1), k));
   return 1;
 }
 uint64_t nt_clip_cursor(Call& call) {
@@ -494,7 +496,7 @@ uint64_t nt_clip_cursor(Call& call) {
   Rect r;
   if (!read_rect(call, call.arg(0), &r)) return call.fail(kErrorNoaccess);
   if (rect_empty(r)) return call.fail(kErrorInvalidParameter);
-  s.clip_cursor = r;
+  s.clip_cursor = dpi_up(r, caller_scale(call));
   s.clip_cursor_set = 1;
   init_cursor();
   set_cursor_pos_locked(s.cursor_x, s.cursor_y);
@@ -502,7 +504,7 @@ uint64_t nt_clip_cursor(Call& call) {
 }
 uint64_t nt_get_clip_cursor(Call& call) {
   State& s = S();
-  Rect r = s.clip_cursor_set ? s.clip_cursor : Rect{0, 0, int32_t(gdi::screen_width()), int32_t(gdi::screen_height())};
+  Rect r = dpi_down(s.clip_cursor_set ? s.clip_cursor : Rect{0, 0, int32_t(gdi::screen_width()), int32_t(gdi::screen_height())}, caller_scale(call));
   return write_rect(call, call.arg(0), r) ? 1 : call.fail(kErrorNoaccess);
 }
 
@@ -762,15 +764,17 @@ Window* window_under_cursor(uint32_t* hit) {
 
 namespace {
 
+// (the points in the window's own coordinates: an unaware window's are its 96-dpi units, see Win32kUserDpi.cpp)
 void deliver_mouse(Window* w, uint32_t hit, uint32_t client_message, uint64_t client_wparam) {
   if (!legacy_wanted(w, kRawTypeMouse)) return;
+  const uint32_t k = window_scale(w);
   if (hit == wn::HTCLIENT) {
     int32_t ox, oy;
     client_origin(w, &ox, &oy);
-    post_input(w, client_message, client_wparam, make_lparam(S().cursor_x - ox, S().cursor_y - oy));
+    post_input(w, client_message, client_wparam, make_lparam(dpi_down(S().cursor_x - ox, k), dpi_down(S().cursor_y - oy, k)));
   } else {
     const uint32_t nc = client_message - wn::WM_MOUSEMOVE + wn::WM_NCMOUSEMOVE;
-    post_input(w, nc, hit, make_lparam(S().cursor_x, S().cursor_y));
+    post_input(w, nc, hit, make_lparam(dpi_down(S().cursor_x, k), dpi_down(S().cursor_y, k)));
   }
 }
 
@@ -889,7 +893,8 @@ void wheel_legacy_locked(int32_t delta, bool horizontal) {
   if (!w) { uint32_t hit; w = mouse_target(s.cursor_x, s.cursor_y, &hit); }
   if (!w || !legacy_wanted(w, kRawTypeMouse)) return;
   const uint64_t wparam = (uint64_t(uint16_t(delta)) << 16) | key_flags();
-  post_input(w, horizontal ? wn::WM_MOUSEHWHEEL : wn::WM_MOUSEWHEEL, wparam, make_lparam(s.cursor_x, s.cursor_y));
+  const uint32_t k = window_scale(w);
+  post_input(w, horizontal ? wn::WM_MOUSEHWHEEL : wn::WM_MOUSEWHEEL, wparam, make_lparam(dpi_down(s.cursor_x, k), dpi_down(s.cursor_y, k)));
 }
 
 }  // namespace

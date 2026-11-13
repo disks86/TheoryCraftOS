@@ -113,7 +113,8 @@ void deliver(TouchContact& c, uint8_t phase) {
     if (!post_message(c.hwnd, kWmTouch, 1, r->handle)) s.touch_inputs.erase(r);
     return;
   }
-  const uint64_t lp = point_lparam(c.x, c.y);
+  const uint32_t k = window_scale(find_window(c.hwnd));      // (an unaware window's points are its 96-dpi units)
+  const uint64_t lp = point_lparam(dpi_down(c.x, k), dpi_down(c.y, k));
   auto post = [&](uint32_t message, uint32_t flags) {
     if (message != kWmPointerLeave && message != kWmPointerEnter) c.flags = flags;      // (GetPointerInfo answers for the down, update or up)
     post_message(c.hwnd, message, uint64_t(c.pointer_id) | uint64_t(flags & 0xFFFF) << 16, lp);
@@ -190,19 +191,21 @@ bool pointer_touch_info(uint64_t pid, uint32_t pointer_id, ByteView out) {
   if (!c) return false;
   out.fill(0);
   ByteWriter w(out);
-  const int32_t hx = int32_t(int64_t{c->x} * 2540 / 96), hy = int32_t(int64_t{c->y} * 2540 / 96);      // (HIMETRIC at 96 dpi)
+  const uint32_t k = window_scale(find_window(c->hwnd));      // (an unaware window's points are its 96-dpi units)
+  const int32_t px = dpi_down(c->x, k), py = dpi_down(c->y, k);
+  const int32_t hx = int32_t(int64_t{px} * 2540 / 96), hy = int32_t(int64_t{py} * 2540 / 96);      // (HIMETRIC at 96 dpi)
   w.le32(kPtTouch);
   w.le32(c->pointer_id);
   w.le32(c->frame);
   w.le32(c->flags);
   w.le64(kTouchDevice);
   w.le64(c->hwnd);
-  w.le32(uint32_t(c->x));
-  w.le32(uint32_t(c->y));
+  w.le32(uint32_t(px));
+  w.le32(uint32_t(py));
   w.le32(uint32_t(hx));
   w.le32(uint32_t(hy));
-  w.le32(uint32_t(c->x));
-  w.le32(uint32_t(c->y));
+  w.le32(uint32_t(px));
+  w.le32(uint32_t(py));
   w.le32(uint32_t(hx));
   w.le32(uint32_t(hy));
   w.le32(c->time);
@@ -215,10 +218,10 @@ bool pointer_touch_info(uint64_t pid, uint32_t pointer_id, ByteView out) {
   w.le32(0);      // touchFlags (TOUCH_FLAG_NONE)
   w.le32(0x4);    // touchMask: TOUCH_MASK_PRESSURE
   for (int i = 0; i < 2; ++i) {      // rcContact, rcContactRaw: a finger of 8 pixels
-    w.le32(uint32_t(c->x - 4));
-    w.le32(uint32_t(c->y - 4));
-    w.le32(uint32_t(c->x + 4));
-    w.le32(uint32_t(c->y + 4));
+    w.le32(uint32_t(px - 4));
+    w.le32(uint32_t(py - 4));
+    w.le32(uint32_t(px + 4));
+    w.le32(uint32_t(py + 4));
   }
   w.le32(0);      // orientation
   w.le32((c->flags & kInContact) ? 512 : 0);      // pressure (0 .. 1024)
@@ -233,8 +236,10 @@ uint32_t touch_input_info(uint64_t pid, uint32_t handle, ByteView out) {
     if (out.empty()) return 1;
     if (out.size() != 48) return 0;
     ByteWriter w(out);
-    w.le32(uint32_t(r.x * 100));
-    w.le32(uint32_t(r.y * 100));
+    const TouchContact* c = contact_of_pointer(pid, r.pointer_id);
+    const uint32_t k = c ? window_scale(find_window(c->hwnd)) : 1;
+    w.le32(uint32_t(dpi_down(r.x, k) * 100));
+    w.le32(uint32_t(dpi_down(r.y, k) * 100));
     w.le64(kTouchDevice);
     w.le32(r.pointer_id);
     w.le32(r.flags);
@@ -302,8 +307,10 @@ void promote_touch(uint64_t pid, uint32_t message, uint64_t wparam, uint64_t lpa
     close_touch_input(pid, uint32_t(lparam));      // (DefWindowProc closes the handle, as on Windows)
   } else if (message == kWmPointerDown || message == kWmPointerUpdate || message == kWmPointerUp) {
     pointer_id = uint32_t(wparam & 0xFFFF);
-    x = int16_t(lparam & 0xFFFF);
-    y = int16_t((lparam >> 16) & 0xFFFF);
+    const TouchContact* c = contact_of_pointer(pid, pointer_id);
+    const uint32_t k = c ? window_scale(find_window(c->hwnd)) : 1;      // (the program's point back in device pixels)
+    x = dpi_up(int16_t(lparam & 0xFFFF), k);
+    y = dpi_up(int16_t((lparam >> 16) & 0xFFFF), k);
     down = message == kWmPointerDown;
     up = message == kWmPointerUp;
   } else {

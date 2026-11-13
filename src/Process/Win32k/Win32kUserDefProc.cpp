@@ -163,6 +163,8 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       if (lparam == 0) break;
       Rect r;
       if (!read_rect(call, lparam, &r)) break;
+      const uint32_t k = caller_scale(call);      // (the program's rectangle: an unaware one's in 96-dpi units)
+      r = dpi_up(r, k);
       Window probe(S().alloc);
       probe.style = w->style;
       probe.ex_style = w->ex_style;
@@ -171,13 +173,14 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       probe.parent = w->parent;
       Rect c;
       compute_nc(&probe, &c);
-      write_rect(call, lparam, c);
+      write_rect(call, lparam, dpi_down(c, k));
       probe.parent = nullptr;
       op->result = 0;
       break;
     }
     case wn::WM_NCHITTEST: {
-      const int32_t x = int16_t(lparam & 0xFFFF), y = int16_t((lparam >> 16) & 0xFFFF);
+      const uint32_t k = caller_scale(call);
+      const int32_t x = dpi_up(int16_t(lparam & 0xFFFF), k), y = dpi_up(int16_t((lparam >> 16) & 0xFFFF), k);
       op->result = hit_test(w, x, y);
       break;
     }
@@ -185,13 +188,15 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       uint8_t pos[48];
       if (lparam == 0 || !call.read(lparam, ByteView(pos, 48))) break;
       const uint32_t flags = get32(pos, 32);
+      const uint32_t k = window_scale(w);      // (WM_MOVE and WM_SIZE in the window's coordinates)
       if (!(flags & wn::SWP_NOMOVE) || (flags & wn::SWP_FRAMECHANGED)) {
-        int32_t px = w->client.left, py = w->client.top;
+        int32_t px = dpi_down(w->client.left, k), py = dpi_down(w->client.top, k);
         add_note(*op, hwnd, wn::WM_MOVE, 0, (uint32_t(py) << 16) | (uint32_t(px) & 0xFFFF));
       }
       if (!(flags & wn::SWP_NOSIZE) || (flags & wn::SWP_FRAMECHANGED)) {
         const uint32_t kind = (w->style & wn::WS_MINIMIZE) ? SIZE_MINIMIZED : (w->style & wn::WS_MAXIMIZE) ? SIZE_MAXIMIZED : SIZE_RESTORED;
-        const uint32_t cw = uint32_t(w->client.right - w->client.left), ch = uint32_t(w->client.bottom - w->client.top);
+        const Rect cl = dpi_down(w->client, k);
+        const uint32_t cw = uint32_t(cl.right - cl.left), ch = uint32_t(cl.bottom - cl.top);
         if (kind == SIZE_MINIMIZED) add_note(*op, hwnd, wn::WM_SIZE, kind, 0);
         else add_note(*op, hwnd, wn::WM_SIZE, kind, (ch << 16) | (cw & 0xFFFF));
       }

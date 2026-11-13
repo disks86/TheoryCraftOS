@@ -73,9 +73,19 @@ Rect surface_rect_screen(const Window* top) {
   return r;
 }
 
+// The window's surface: the part of it inside the desktop's frame, in device pixels for a DPI-aware window, in its 96-dpi units (the device scale smaller,
+// rounded up) for an unaware one (the desktop enlarges it).
+Rect surface_rect_in_window_units(const Window* top) {
+  const Rect r = surface_rect_screen(top);
+  const uint32_t k = window_scale(top);
+  if (k <= 1) return r;
+  const int32_t d = static_cast<int32_t>(k);
+  return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.left, k) + (r.right - r.left + d - 1) / d, dpi_down(r.top, k) + (r.bottom - r.top + d - 1) / d};
+}
+
 void sync_surface(Window* top) {
   if (!redirected(top)) return;
-  const Rect r = surface_rect_screen(top);
+  const Rect r = surface_rect_in_window_units(top);
   const uint32_t w = uint32_t(r.right - r.left), h = uint32_t(r.bottom - r.top);
   if (!is_visible(top) || w == 0 || h == 0) return;      // (the surface stays, at its last size, while hidden or minimized)
   if (top->surface == 0) {
@@ -126,6 +136,7 @@ bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title) {
   Window* w = find_window(hwnd);
   if (!on_desktop(w) || w->destroying) return false;
   out->exists = true;
+  out->dpi_aware = !w->dpi_virtual;
   out->visible = is_visible(w);
   out->minimized = (w->style & wn::WS_MINIMIZE) != 0;
   out->maximized = (w->style & wn::WS_MAXIMIZE) != 0;
@@ -212,6 +223,11 @@ bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, 
   return user_misc::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
 }
 
+bool top_level_dpi_aware_locked(uint32_t hwnd) {
+  Window* w = state_or_null() ? find_window(hwnd) : nullptr;
+  return w && !w->dpi_virtual;
+}
+
 uint32_t top_level_surface_locked(uint32_t hwnd) {
   if (!state_or_null()) return 0;
   const Window* w = find_window(hwnd);
@@ -238,8 +254,9 @@ bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t widt
   const ByteView surface = gdi::window_surface_bytes(top->surface, &sw, &sh);
   if (surface.empty()) return true;
   // the client area in surface coordinates (clipped to the surface); the picture is stretched over it (nearest pixel), or copied a row at a time when the sizes agree
-  const Rect origin = surface_rect_screen(top);
-  const Rect client = client_rect_screen(w);
+  const uint32_t k = window_scale(top);      // (an unaware window's surface is in its units)
+  const Rect origin = surface_rect_in_window_units(top);
+  const Rect client = dpi_down(client_rect_screen(w), k);
   const int64_t cw = int64_t{client.right} - client.left, ch = int64_t{client.bottom} - client.top;
   const int64_t cx = int64_t{client.left} - origin.left, cy = int64_t{client.top} - origin.top;
   if (cw <= 0 || ch <= 0 || width == 0 || height == 0 || pitch < uint64_t{width} * 4) return true;
@@ -301,8 +318,8 @@ bool drop_target(uint32_t top_level, int32_t x, int32_t y, DropTarget* out) {
   if (!w || !(w->ex_style & kWsExAcceptFiles) || (w->style & wn::WS_DISABLED)) return false;
   const Rect c = client_rect_screen(w);
   out->hwnd = w->handle;
-  out->x = x - c.left;
-  out->y = y - c.top;
+  out->x = dpi_down(x - c.left, window_scale(w));      // (DROPFILES.pt in the window's coordinates)
+  out->y = dpi_down(y - c.top, window_scale(w));
   out->non_client = !rect_contains(c, x, y);
   return true;
 }

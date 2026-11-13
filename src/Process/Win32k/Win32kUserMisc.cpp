@@ -80,6 +80,20 @@ void set_system_dpi(uint32_t dpi) {
   if (Records* r = lazy_state(g_records)) r->dpi = dpi < 48 ? 48 : dpi > 960 ? 960 : dpi;
 }
 
+uint32_t dpi_awareness(uint64_t tid, uint64_t pid) {
+  uint32_t context = 0;
+  if (ThreadRecord* t = find_thread_record(tid)) context = t->dpi_context;
+  if (context == 0) if (ProcessRecord* p = find_process_record(pid)) context = p->dpi_context;
+  return context & 0x0F;
+}
+
+uint32_t dpi_context_of(uint64_t tid, uint64_t pid) {
+  uint32_t context = 0;
+  if (ThreadRecord* t = find_thread_record(tid)) context = t->dpi_context;
+  if (context == 0) if (ProcessRecord* p = find_process_record(pid)) context = p->dpi_context;
+  return context == 0 ? 0x6010u : context & ~0x80000000u;
+}
+
 uint32_t thread_dpi(Call& call) {
   uint32_t context = 0;
   if (ThreadRecord* t = find_thread_record(call.tid())) context = t->dpi_context;

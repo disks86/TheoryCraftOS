@@ -63,6 +63,8 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   uint32_t capture_window() override;
   void pointer(Pointer* out) override;
   bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) override;
+  // HiDPI: a DPI-aware program's window (its surface in device pixels) is drawn 1:1; an unaware one's is left to the desktop to enlarge.
+  bool draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) override;
   // The desktop's drag of a file over a program's window: taken by a window that accepts files (WS_EX_ACCEPTFILES) under the pointer, which gets
   // WM_DROPFILES with the file's Windows name (filesystem::layout::windows_view_of: C:\..., the user's files under C:\Users\Public\Desktop) when it
   // is let go. Text, and files Windows programs cannot see, are not taken.
@@ -85,7 +87,9 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   };
   static constexpr uint32_t kMaxPending = 128;
   Pending* pending_slot(uint32_t window);
-  static bool fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out);      // (lock held) the window's entry, a new one, or null when the table is full (overflow_ is then set)
+  bool fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out) const;
+  gdi::Rect up(const gdi::Rect& r) const;        // desktop units -> win32k's device pixels
+  gdi::Rect down(const gdi::Rect& r) const;      // and back (floor)      // (lock held) the window's entry, a new one, or null when the table is full (overflow_ is then set)
 
   Pending pending_[kMaxPending];
   uint32_t pending_count_ = 0;
@@ -96,6 +100,9 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   bool drop_ok_ = false;
   UniquePointer<WideString> drop_names_;
   bool attached_ = false;
+  // HiDPI (DPI virtualization): device pixels per desktop unit, and the desktop's frame in units (win32k gets it in device pixels)
+  uint32_t scale_ = 1;
+  int32_t frame_border_ = 0, frame_title_ = 0;
 };
 
 }  // namespace process::win32k
