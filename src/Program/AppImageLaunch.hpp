@@ -22,7 +22,6 @@
 #include "Executable/AppImage.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "FileSystem/Mount/GraftFileSystem.hpp"
-#include "FileSystem/Squash/SquashFileSystem.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Program/AppRunScript.hpp"
 #include "Utility/String.hpp"
@@ -33,8 +32,9 @@ namespace desktop {
 // Is the file at `path` an AppImage (which type)? None if it cannot be read or is not one.
 exe::AppImageType appimage_type(filesystem::IFileSystem& files, StringView path);
 
-// Running an AppImage the way its runtime would, without the runtime: the SquashFS image appended to the file is mounted read only at
-// /tmp/.mount_<name><id> of the Linux world, for this program alone (a GraftFileSystem over the OS file system), the variables the runtime sets are
+// Running an AppImage the way its runtime would, without the runtime: its image - the SquashFS appended to a type 2 AppImage, or the ISO 9660 image
+// that a type 1 AppImage is - is mounted read only at /tmp/.mount_<name><id> of the Linux world, for this program alone (a GraftFileSystem over the
+// OS file system, whose links that point outside the image lead into the Linux world as on Linux), the variables the runtime sets are
 // set (APPIMAGE, APPDIR, ARGV0, OWD), and the AppRun at the image's root is worked out (AppRunScript.hpp) to the program it starts. If AppRun leads
 // nowhere, the program of the image's desktop entry is started instead, with the environment the classic AppRun binary would give it.
 // An Electron program (chrome-sandbox next to it) is given --no-sandbox: this OS has no user namespaces nor a setuid helper for Chromium's sandbox.
@@ -65,7 +65,7 @@ class AppImageSession {
   bool desktop_entry_fallback(StringView appdir, ArrayView<const StringView> arguments, ArrayView<const StringView> environment);
 
   allocators::IAllocator& allocator_;
-  UniquePointer<filesystem::SquashFileSystem> image_;
+  UniquePointer<filesystem::IFileSystem> image_;
   UniquePointer<filesystem::GraftFileSystem> graft_;
   String mount_, program_;
   AppRunLaunch launch_;

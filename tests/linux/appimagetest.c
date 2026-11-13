@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
   const char* libpath = getenv("LD_LIBRARY_PATH");
   char path[4096];
   check(appdir && strncmp(appdir, "/tmp/.mount_Hello", 17) == 0, "APPDIR is /tmp/.mount_Hello...");
-  check(appimage && strcmp(appimage, "/Desktop/Downloads/Hello.AppImage") == 0, "APPIMAGE names the file");
+  check(appimage && strncmp(appimage, "/Desktop/Downloads/Hello", 24) == 0 && strstr(appimage, ".AppImage"), "APPIMAGE names the file");
   check(getenv("ARGV0") && getenv("OWD"), "ARGV0 and OWD are set");
   check(greeting && strcmp(greeting, "hello from AppRun") == 0, "AppRun's export arrived");
   check(libpath && appdir && strncmp(libpath, appdir, strlen(appdir)) == 0, "LD_LIBRARY_PATH starts in the image");
@@ -74,11 +74,16 @@ int main(int argc, char** argv) {
   struct dirent* e;
   while (d && (e = readdir(d))) entries += strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0;
   if (d) closedir(d);
-  check(entries == 3, "the image's folder lists its 3 entries");
+  check(entries == 4, "the image's folder lists its 4 entries");
 
   snprintf(path, sizeof(path), "%s/usr/share/hello/link.txt", appdir);
   f = fopen(path, "r");
   check(f && fgets(line, sizeof(line), f) && strcmp(line, "data inside the image\n") == 0, "a symbolic link in the image is followed");
+  if (f) fclose(f);
+
+  snprintf(path, sizeof(path), "%s/usr/share/hello/outside", appdir);
+  f = fopen(path, "r");
+  check(f && fgets(line, sizeof(line), f) && strcmp(line, "from the Linux world\n") == 0, "an absolute link in the image leads into the Linux world");
   if (f) fclose(f);
 
   snprintf(path, sizeof(path), "%s/usr/share/hello/new", appdir);

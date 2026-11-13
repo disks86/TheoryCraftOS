@@ -25,7 +25,7 @@ namespace exe {
 
 // An AppImage is an ELF program (the "runtime") with a filesystem image appended to it. The runtime marks itself with "AI" and the type in
 // bytes 8..10 of the ELF identification (the padding the ELF standard leaves unused):
-//   type 1: the image is ISO 9660 (the old format, rare today);
+//   type 1: the whole file is an ISO 9660 image (the old format, rare today), the runtime in its 32 KiB system area;
 //   type 2: the image is SquashFS, starting right after the runtime ELF (after its section header table or last section, whichever ends last).
 // The runtime would mount the image and run the AppRun at its root; this OS mounts it itself (Program/AppImageLaunch.hpp) and never runs the runtime.
 enum class AppImageType : uint8_t { None, Type1, Type2 };

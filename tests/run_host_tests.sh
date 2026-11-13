@@ -470,7 +470,7 @@ for t in "${WANTED[@]}"; do
         if pkg-config --exists "${lib%%:*}" 2>/dev/null; then appimage_libs="$appimage_libs -DTCOS_HAVE_${lib##*:} $(pkg-config --cflags --libs "${lib%%:*}")"; fi
       done
       build_and_run AppImageTest tests/AppImageTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp \
-                    src/FileSystem/Squash/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Executable/AppImage.cpp src/Program/AppRunScript.cpp src/Program/AppImageLaunch.cpp \
+                    src/FileSystem/Squash/*.cpp src/FileSystem/Iso/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Executable/AppImage.cpp src/Program/AppRunScript.cpp src/Program/AppImageLaunch.cpp \
                     src/Process/ProgramEnvironment.cpp src/Media/Zlib.cpp src/Media/Zstd.cpp src/Media/Xz.cpp src/Media/Lz4.cpp src/Media/Lzo.cpp src/Crypto/Crypto.cpp $appimage_libs ;;
     ExtTest) build_and_run ExtTest tests/ExtTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
                src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ext/*.cpp src/FileSystem/DiscardBatch.cpp ;;

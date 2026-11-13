@@ -71,6 +71,7 @@ class SquashFileSystem final : public IFileSystem {
     return Status::ReadOnly;
   }
   Status read_symbolic_link(StringView path, String* target, bool* target_is_directory) override;
+  Status resolve_exit(StringView path, bool follow_last, String* exit) override;
 
   squash::Compression compression() const { return compression_; }
   uint32_t block_size() const { return block_size_; }
@@ -80,6 +81,7 @@ class SquashFileSystem final : public IFileSystem {
   class File;
   class Directory;
   class MetaReader;
+  struct WalkOps;
 
   enum class Kind : uint8_t { Directory, File, Symlink, Other };
   // An inode as far as this driver needs it.
@@ -113,7 +115,6 @@ class SquashFileSystem final : public IFileSystem {
     ByteBuffer data;
   };
   static constexpr uint32_t kMetaCacheEntries = 32, kDataCacheEntries = 8;
-  static constexpr uint32_t kMaxLinkHops = 40;
   static constexpr uint32_t kMaxTarget = 4096;
 
   Status load();
@@ -129,8 +130,8 @@ class SquashFileSystem final : public IFileSystem {
   // Finds `name` in a directory; NotFound if it is not there.
   Status lookup(const Inode& directory, StringView name, Inode* found);
   Status read_target(const Inode& link, String* target);
-  // Resolves an absolute path, following symbolic links (the last component too if `follow_last`).
-  Status resolve(StringView path, bool follow_last, Inode* inode);
+  // Resolves an absolute path, following symbolic links (the last component too if `follow_last`). With `exit`, see resolve_exit().
+  Status resolve(StringView path, bool follow_last, Inode* inode, String* exit = nullptr);
   Status fill_entry(const Inode& inode, StringView name, StringView parent_path, DirectoryEntry* entry);
   Status fragment(uint32_t index, Fragment* out) const;
 
