@@ -17,6 +17,7 @@
  */
 #include "Process/Win32k/Win32kUserMisc.hpp"
 #include "Process/Win32k/Win32kGdi.hpp"
+#include "Graphics/DeviceScale.hpp"
 #include <new>
 #include "Process/AddressSpace.hpp"
 #include "Process/Win32k/Win32kGdiInternal.hpp"
@@ -240,7 +241,11 @@ bool destroy_object(uint32_t handle) {
   Object* o = find_object(handle);
   if (!o) return false;
   State& st = *state_ptr();
-  if (o->type == kObjDc) dc_release_selection(*static_cast<Dc*>(o));
+  if (o->type == kObjDc) {
+    Dc& d = *static_cast<Dc*>(o);
+    dc_release_selection(d);
+    if (d.owns_surface) { const uint32_t sid = d.surface; d.owns_surface = false; d.surface = 0; destroy_window_surface(sid); }
+  }
   if (o->type == kObjBitmap) release_dib_memory(*static_cast<Bitmap*>(o));
   Slot& s = st.slots[handle & 0xFFFF];
   s.obj.reset();
@@ -434,6 +439,7 @@ ConstByteView screen_pixels() {
   return screen_bitmap().data.view();
 }
 
+
 void set_screen_sink(IScreenSink* sink) { g_screen_sink = sink; }
 
 // ---- Window surfaces
@@ -525,6 +531,12 @@ Bitmap* window_surface_bitmap(uint32_t id) {
 void set_window_surface_sink(IWindowSurfaceSink* sink) { g_window_sink = sink; }
 
 CallerDpiHook g_caller_dpi = nullptr;
+DcScreenOffsetHook g_dc_screen_offset = nullptr;
+void set_dc_screen_offset_hook(DcScreenOffsetHook hook) { g_dc_screen_offset = hook; }
+bool dc_screen_offset(Call& call, uint32_t dc, int32_t* dx, int32_t* dy) {
+  *dx = *dy = 0;
+  return g_dc_screen_offset && g_dc_screen_offset(call, dc, dx, dy);
+}
 void set_caller_dpi_hook(CallerDpiHook hook) { g_caller_dpi = hook; }
 void caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi) {
   *scale = 100;
@@ -545,7 +557,33 @@ void window_surface_damaged(uint32_t id, const Rect& dirty) {
   if (s && s->bitmap) window_surface_changed(*s->bitmap, dirty);
 }
 
+// What a DPI unaware program drew on its shadow of the screen goes on to the screen, each shadow pixel over the device pixels it stands for (units_to_device mapping).
+void shadow_to_screen(const Bitmap& b, const Rect& dirty) {
+  const uint32_t k = b.shadow_scale;
+  const Rect r = rect_and(dirty, Rect{0, 0, b.width, b.height});
+  if (rect_empty(r) || !state()) return;
+  Bitmap& screen = screen_bitmap();
+  Surface dst = surface_of(screen);
+  const ConstByteView src = b.data.view();      // (32 bpp, rows b.stride bytes apart)
+  const Rect device = rect_and(Rect{graphics::units_to_device(r.left, k), graphics::units_to_device(r.top, k), graphics::units_to_device(r.right, k),
+                                    graphics::units_to_device(r.bottom, k)}, Rect{0, 0, screen.width, screen.height});
+  if (rect_empty(device)) return;
+  for (int32_t y = device.top; y < device.bottom; ++y) {
+    const int32_t sy = graphics::device_to_units(y, k);
+    if (sy < r.top || sy >= r.bottom) continue;
+    for (int32_t x = device.left; x < device.right; ++x) {
+      const int32_t sx = graphics::device_to_units(x, k);
+      if (sx < r.left || sx >= r.right) continue;
+      const uint64_t at = uint64_t(sy) * b.stride + uint64_t(sx) * 4;
+      if (at + 4 > src.size()) continue;
+      dst.put_raw32(x, y, uint32_t(src[at]) | uint32_t(src[at + 1]) << 8 | uint32_t(src[at + 2]) << 16 | uint32_t(src[at + 3]) << 24);
+    }
+  }
+  sink_changed(device);
+}
+
 void window_surface_changed(const Bitmap& b, const Rect& dirty) {
+  if (b.shadow_scale) { shadow_to_screen(b, dirty); return; }
   if (!g_window_sink || b.window_surface == 0) return;
   const Rect r = rect_and(dirty, Rect{0, 0, b.width, b.height});
   if (!rect_empty(r)) g_window_sink->surface_changed(b.window_surface, r);
@@ -562,6 +600,35 @@ uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, Arra
   return dc->handle;
 }
 
+uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale) {
+  State* st = state();
+  if (!st || scale <= 100) return 0;
+  Bitmap& screen = screen_bitmap();
+  const int32_t w = graphics::device_to_units(screen.width, scale), h = graphics::device_to_units(screen.height, scale);
+  if (w <= 0 || h <= 0) return 0;
+  const uint32_t id = create_window_surface(0, uint32_t(w), uint32_t(h));
+  if (id == 0) return 0;
+  Bitmap* b = window_surface_bitmap(id);
+  if (!b) { destroy_window_surface(id); return 0; }
+  b->shadow_scale = scale;
+  // what is on the screen now, a pixel of the shadow taken from the top-left device pixel it stands for
+  Surface dst = surface_of(*b);
+  const Surface src = surface_of(screen);
+  for (int32_t y = 0; y < h; ++y) {
+    const int32_t sy = graphics::units_to_device(y, scale);
+    for (int32_t x = 0; x < w; ++x) {
+      const int32_t sx = graphics::units_to_device(x, scale);
+      if (sx < screen.width && sy < screen.height) dst.put_raw32(x, y, src.get_raw32(sx, sy));
+    }
+  }
+  const Rect all{0, 0, w, h};
+  const uint32_t dc = create_screen_dc(pid, 0, 0, ArrayView<const Rect>(&all, 1), id);
+  Dc* d = dc ? find_dc(dc) : nullptr;
+  if (!d) { destroy_window_surface(id); return 0; }
+  d->owns_surface = true;
+  return dc;
+}
+
 bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface) {
   Dc* d = find_dc(dc);
   if (!d || !d->screen) return false;
@@ -574,6 +641,10 @@ bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView
 }
 
 bool is_dc(uint32_t handle) { return find_dc(handle) != nullptr; }
+uint64_t dc_owner(uint32_t handle) {
+  const Dc* d = find_dc(handle);
+  return d ? d->pid : 0;
+}
 bool is_screen_dc(uint32_t handle) {
   const Dc* d = find_dc(handle);
   return d && d->screen;

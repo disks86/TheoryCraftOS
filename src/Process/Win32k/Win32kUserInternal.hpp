@@ -572,6 +572,8 @@ void invalidate_window(Window* w, const Rect* client_rect_or_null, bool erase);
 void validate_window(Window* w, const Rect* client_rect_or_null);
 void release_window_dcs(uint32_t hwnd);
 void refresh_window_dcs(Window* w);
+// GetRandomRgn's SYSRGN is in screen coordinates: where the surface a window's DC draws on lies on the screen, in the caller's units (false: not a window DC on a surface).
+bool dc_screen_offset_locked(Call& call, uint32_t dc, int32_t* dx, int32_t* dy);
 // Redirection (set_redirection): top-levels draw on window surfaces of their own and the desktop composites them; they do not clip or repaint one another, and a
 // top-level with a caption has the frame of the desktop's windows around it (frame_border on the sides and the bottom, frame_border + frame_title at the top), which the
 // desktop draws. The settings live outside State: the desktop makes them before the window manager's state exists.

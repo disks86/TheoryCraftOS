@@ -66,6 +66,10 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
     one at the new scale), as on Windows. A program that leaves it to DefWindowProc is moved there, which Windows' DefWindowProc does not do. The
     desktop's thread posts a private `WM_SYSCOMMAND` (`kScTcosDpi`), and the window's own thread sends the message.
   - Other windows are moved through the program as a desktop move would be. An unaware window's units stay the same.
+- **The screen DC.** For an unaware program on a scaled screen, `GetDC(NULL)` gives a shadow of the screen in the program's units, filled with what the
+  screen shows when the DC is made. Whatever the program draws on it goes straight on to the screen, scaled up (each unit pixel over the device pixels it
+  stands for). The shadow goes away with the DC.
+- **`GetRandomRgn` (`SYSRGN`)** is in screen coordinates, in the caller's units, for a window that draws on a window surface as well as for the screen.
 - Messages a program posts or sends itself keep the coordinates it put in them. The `WM_SYSCOMMAND` the desktop uses to place a window carries
   device pixels, which go back to the kernel unread.
 
@@ -80,7 +84,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
     its picture instead).
   - A mixed DPI child's GPU presents (swapchains made for it) go to the top-level's surface unscaled, and its window region is not applied to its
     scaled pixels.
-  - The screen DC (`GetDC(NULL)`) and `GetRandomRgn` stay in device pixels for every caller.
+  - An unaware program's screen DC shows the screen as it was when the DC was made. Reading it later (`BitBlt` from it) does not see what has
+    changed since.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
 - X programs are not told the density (`Xft.dpi`): they are enlarged.

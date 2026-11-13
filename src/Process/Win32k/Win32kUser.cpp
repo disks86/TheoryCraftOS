@@ -583,10 +583,14 @@ void gdi_caller_dpi(Call& call, uint32_t* scale, uint32_t* dpi) {      // (what 
   *scale = caller_scale(call);
   *dpi = user_misc::thread_dpi(call);
 }
+bool gdi_dc_screen_offset(Call& call, uint32_t dc, int32_t* dx, int32_t* dy) {      // (called from a GDI call: the system lock is held)
+  return dc_screen_offset_locked(call, dc, dx, dy);
+}
 }  // namespace
 
 void install_user_services() {
   gdi::set_caller_dpi_hook(&gdi_caller_dpi);
+  gdi::set_dc_screen_offset_hook(&gdi_dc_screen_offset);
   register_class_services();
   register_window_services();
   register_geometry_services();

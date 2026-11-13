@@ -482,10 +482,11 @@ uint64_t NtGdiGetRandomRgn(Call& c) {
     else if (dc->s.has_clip) rgn_assign(out, dc->s.clip.view());
     else if (dc->s.has_meta) rgn_assign(out, dc->s.meta.view());
     else return 0;
-  } else if (code == 5) {
+  } else if (code == 5) {      // SYSRGN: in screen coordinates (the caller's: a window DC's surface placed where it is on the screen)
     if (!s.valid()) return 0;
     if (!dc_effective_clip(*dc, s, &out)) return 0;
-    if (!dc->screen) rgn_offset(out, 0, 0);
+    int32_t dx = 0, dy = 0;
+    if (dc_screen_offset(c, c.arg32(0), &dx, &dy)) rgn_offset(out, dx, dy);
   } else return 0;
   return ret_bool(rgn_assign(dst->rects, out.view()));
 }
