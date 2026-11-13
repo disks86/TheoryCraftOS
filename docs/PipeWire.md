@@ -136,17 +136,20 @@ program that records, of any kind, gets a record stream of it.
   - **The screen.** `ScreenSource.cpp`: a Video/Source node of the kernel's (`tcos-screen`) whose frames are what the desktop draws, BGRx at the
     screen's size, at most 10 a second and only while watched: the renderer reads its frame back between drawing and presenting
     (`IRenderer2D::read_frame`: the software renderer's surface, the device renderer's back image) and the desktop's window hands it to its
-    `gui::IFrameTap`; a new watcher makes the desktop draw once. For OBS, video calls' screen sharing, `pw-record`-style recorders.
-  - **Conversion for watchers.** A watcher whose EnumFormat does not list its producer's format is offered the first format it lists that the
-    frames can be converted to, and each frame is converted (`VideoConvert.cpp`: the 8-bit packed RGB, I420, YV12, NV12, NV21, YUY2, UYVY, YVYU and
-    GRAY8, through RGBA, BT.601 limited range). Also carried: 10- and 12-bit planar YUV, P010, NV16/NV24/NV61, VYUY, 10-bit and 64-bit packed RGB,
-    float RGBA and dsp video.
+    `gui::IFrameTap`; a new watcher makes the desktop draw once, and while the screen is still its last frame is sent again once a second. For OBS, video calls' screen sharing, `pw-record`-style recorders.
+  - **Conversion and scaling for watchers.** A watcher whose EnumFormat does not list its producer's format is offered the first format it lists
+    that the frames can be converted to; one that cannot take its producer's size (a fixed size, a list without it, a range it is outside) is
+    offered its own (the fixed one, the list's first, the producer's clamped into the range). Each frame is converted and scaled
+    (`VideoConvert.cpp`, through 8-bit RGBA, BT.601 limited range, averaged where it shrinks and bilinear where it grows), for every raw format:
+    packed RGB of 8, 16 and 10 bits a component, ARGB64, float RGBA and dsp video, planar and semi-planar YUV of 8, 10 and 12 bits (I420 ... P010,
+    NV16, NV24, NV61), packed YUV (YUY2, UYVY, YVYU, VYUY, AYUV, AYUV64) and grey. A raw watcher of a Motion JPEG producer is offered raw and
+    given each picture decoded (the JPEG decoder starts from the standard Huffman tables, which webcams' MJPEG leaves out).
   - **DMA-BUF producers.** A producer that allocates its own buffers may give GPU images (`SPA_DATA_DmaBuf`) when they are exports of `/dev/dxg`:
     the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), each frame is copied out of the
     image before it is read, and a frame the GPU still draws is handed back unread.
   - **The Video Viewer.** A Start menu app of the desktop (`src/Desktop/VideoViewer.cpp`) lists the graph's video producers, watches the one
     picked (through `VideoWatcher.cpp`, a watcher node of the kernel's, so a camera streams while it is shown) and shows its newest picture fitted
-    to the window, converted to RGB; it says when a source went or is encoded.
+    to the window, converted to RGB (Motion JPEG decoded); it says when a source went or is of another encoding.
   - **The kernel's cameras.** Every camera `SystemCameras` finds is a Video/Source node of the kernel's (`CameraSource.cpp`: `tcos-camera-<id>`,
     described by the camera's name) that programs watch as any producer. It streams only while watched: started at 640 x 480, 30 frames a second
     (or the camera's nearest mode) when its first watcher comes, stopped two seconds after the last one went; its newest picture goes out as I420.
@@ -289,7 +292,11 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   and resized frames refused), a BGRA-only watcher of an I420 camera given converted frames; the screen source (only while watched, 10 a second,
   BGRx words, the size changing); the kernel's watcher (listing, watching, YUV converted, encoded and gone said); a DMA-BUF camera (copied out of
   the image, a busy frame handed back unread). `GuiTest` checks the window's frame tap, `GuiViewsTest` the Video Viewer with fake sources, and
-  `UsbMidiTest` keyboards' system exclusive (every length, pieces across calls, broken, too long, 3000 random packets).
+  `UsbMidiTest` keyboards' system exclusive (every length, pieces across calls, broken, too long, 3000 random packets). Also: every raw format's
+  round trip and 300 random format and size pairs, scaling (halved and doubled ramps, a watcher of a fixed smaller size), Motion JPEG decoded for a
+  raw watcher and the viewer (a real file), the still screen's keep-alive (with the render thread and the loop at once). `VideoCodecTest` decodes a
+  JPEG without its DHT segments as with them, and `tests/run_host_tests.sh PipeWireDmabufTest` passes a real export of the Direct3D layer through
+  the transport (SCM_RIGHTS) and checks its copy follows the image.
 - `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
   from another thread, passing it with SCM_RIGHTS).
 - `tests/pipewire_interop.sh`: the host's real `pw-dump`, `pw-cli`, `wpctl`, `pactl`, `paplay` and `parecord` against
@@ -345,14 +352,12 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
 - **client-node limits.** An adapter's audio is mono or stereo at its port (a wider stream is downmixed by the adapter in the program); a filter's
   float ports are channels in the usual order (`audio.channel` is not read), and an effect's input is the microphone (not another stream).
   DMA-BUFs are taken only from producers that allocate (`port_buffers`) and only as exports of `/dev/dxg` (each frame copied out of the image:
-  no zero-copy, and the server never hands out DMA-BUFs); the transport's dmabuf path is checked with a fake GPU descriptor, not yet with a real
-  export. No tiled formats (NV12 tiles, v210) or modifiers; conversion for watchers covers the 8-bit formats only (not 10/12-bit, float or packed
-  10-bit RGB) and never scales (a watcher gets its producer's size). `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
+  no zero-copy, and the server never hands out DMA-BUFs). No tiled formats (NV12 tiles, v210) or modifiers; conversion goes through 8-bit RGBA
+  (deep formats lose their low bits) and only Motion JPEG of the encoded formats is decoded. `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
   damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency. No `set_activation` peers (the server is every node's
   only peer), links made by clients (`link-factory`), latency or tag params passed on; audio streams are not negotiated again after Start.
-- **Video sources and showing video.** The screen source sends frames only when the desktop draws (a still screen is sent once, when a watcher
-  comes) and does not include the 3D test's or Wayland/Win32 GPU images drawn outside the window's renderer. The Video Viewer shows raw video only
-  (encoded video such as MJPEG is not decoded) and shows one source at a time.
+- **Video sources and showing video.** The screen source is what the desktop's window draws (the 3D test, which presents to the display itself, is
+  not in it). The Video Viewer shows raw video and Motion JPEG (not H.264 or other encoded video), one source at a time.
 - **The adapter's other factories.** Only `support.null-audio-sink`; `pactl load-module module-null-sink` is not served (make one with `pw-cli`).
   A virtual sink's mixer is 48 kHz stereo whatever its node says.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
