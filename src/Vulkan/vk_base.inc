@@ -85,9 +85,10 @@ enum {
 #define MAGIC_CMD 0x56434D44u
 
 typedef struct Hdr {
-  void *dispatch;   /* (the loader's slot: nothing uses it here) */
+  void *dispatch;   /* the loader's slot: ICD_LOADER_MAGIC when made, which the Khronos loader replaces with its dispatch table (an installable client driver); nothing here reads it */
   uint32_t magic;
 } Hdr;
+#define ICD_LOADER_MAGIC ((void *)(uintptr_t)0x01CDC0DEu)
 
 struct Instance;
 typedef struct PhysDev {

@@ -28,14 +28,23 @@
  * It needs no C library: it is built freestanding, as libvulkan.a for programs linked statically and as libvulkan.so.1 (-DVK_SHARED) for programs of a C library,
  * in place of the Khronos loader (the program loads this driver by the loader's name and calls it directly). memcpy, memmove, memset and memcmp are weak, so a
  * C library's own win in a static program; the shared library has none and uses the C library's. The program calls the vk* functions directly
- * or through vkGetInstanceProcAddr. */
+ * or through vkGetInstanceProcAddr.
+ *
+ * Built with -DVK_ICD as well (libvulkan_tcos.so with the manifest tcos_icd.<cpu>.json, build.sh): an installable client driver of the Khronos loader, for
+ * systems that keep the real loader as /usr/lib/libvulkan.so.1. Then only the loader's entry points are exported (vk_icdNegotiateLoaderICDInterfaceVersion,
+ * vk_icdGetInstanceProcAddr, vk_icdGetPhysicalDeviceProcAddr: interface version 5), every vk* function is internal (found by name), and each dispatchable
+ * object starts with the loader's magic word, which the loader replaces with its dispatch table (vk_base.inc's Hdr). */
 #include "../../Vulkan/khronos/vulkan/vulkan_core.h"
 struct wl_display;
 struct wl_surface;
 #include "../../Vulkan/khronos/vulkan/vulkan_wayland.h"
 
 #define VK_OS_NAME "libvulkan"
+#if defined(VK_ICD)
+#define VK_OS_EXPORT __attribute__((visibility("hidden")))      /* (the loader finds them by name: vk_icdGetInstanceProcAddr below) */
+#else
 #define VK_OS_EXPORT __attribute__((visibility("default")))
+#endif
 #define VK_OS_INSTANCE_EXTENSIONS {VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_SPEC_VERSION}, \
                                   {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
 #define VK_OS_PROCS(X) X(vkCreateHeadlessSurfaceEXT) X(vkGetMemoryFdKHR) X(vkGetMemoryFdPropertiesKHR) X(vkCreateWaylandSurfaceKHR) \
@@ -301,3 +310,25 @@ static bool vk_os_surface_extent(const Surface *s, uint32_t *w, uint32_t *h) {
 }
 
 #include "wayland.inc"
+
+/* ---- the Khronos loader's interface (-DVK_ICD) ------------------------------------------------------------------------------------------------------------------------ */
+#if defined(VK_ICD)
+#define ICD_EXPORT __attribute__((visibility("default")))
+/* Interface version 5: the loader creates the surfaces through the driver (3), asks it for physical-device functions it does not know (4) and lets it report a
+ * Vulkan version above 1.0 (5; this driver reports 1.0). */
+ICD_EXPORT VkResult VKAPI_CALL vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
+  if (!version) return VK_ERROR_INCOMPATIBLE_DRIVER;
+  if (*version < 2) return VK_ERROR_INCOMPATIBLE_DRIVER;      /* (versions 0 and 1 need the WSI objects of the loader's own layout) */
+  if (*version > 5) *version = 5;
+  return VK_SUCCESS;
+}
+ICD_EXPORT PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name) { return vkGetInstanceProcAddr(instance, name); }
+/* Only functions that take a physical device (the loader asks for those of extensions it does not know). */
+ICD_EXPORT PFN_vkVoidFunction VKAPI_CALL vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char *name) {
+  static const char prefix[] = "vkGetPhysicalDevice";
+  if (!name) return NULL;
+  for (uint32_t i = 0; i + 1 < sizeof prefix; ++i)
+    if (name[i] != prefix[i]) return NULL;
+  return vkGetInstanceProcAddr(instance, name);
+}
+#endif
