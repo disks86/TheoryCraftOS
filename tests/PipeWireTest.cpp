@@ -1831,10 +1831,27 @@ struct FakeGpuFd final : Descriptor {
     copy = image;
     return true;
   }
+  int to_gpu = 0;
+  bool sync_to_gpu() override {
+    ++to_gpu;
+    image = copy;
+    return true;
+  }
 };
 struct FakeMaker final : IDescriptorMaker {
-  int made = 0;
-  bool fail = false;
+  int made = 0, images = 0;
+  bool fail = false, gpu = false;      // (gpu: GPU images can be made, 4 bytes a pixel, rows of width * 4 + 64)
+  std::vector<SharedPointer<FakeGpuFd>> made_images;
+  bool gpu_images() const override { return gpu; }
+  Fd make_gpu_image(uint32_t w, uint32_t h, uint32_t* stride) override {
+    *stride = 0;
+    if (!gpu || fail) return Fd();
+    *stride = w * 4 + 64;
+    ++images;
+    SharedPointer<FakeGpuFd> f = SharedPointer<FakeGpuFd>::make(A, uint64_t(*stride) * h);
+    made_images.push_back(f);
+    return Fd(f);
+  }
   Fd make_memory(uint64_t size, StringView) override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, size, false); }
   Fd make_event() override { ++made; return fail ? Fd() : Fd::make_as<FakeFd>(A, 0, true); }
 };
@@ -2656,6 +2673,11 @@ static void test_screen_source() {
   CHECK(screen.published() == before + 2);
   // the render thread and the loop at once: every frame that goes out is whole (all its pixels one value)
   {
+    // (the last frame before them made whole: keep_alive may send it again before the render thread's first)
+    ArrayView<uint32_t> first = screen.frame_wanted(16, 8, now + 9000000);
+    CHECK(first.size() == 128);
+    for (uint32_t& px : first) px = 0xFF000000u;
+    screen.frame_read(16, 8, 0);
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> clock{now + 10000000};
     std::thread render([&] {
@@ -2709,11 +2731,13 @@ static void test_screen_source() {
     CHECK(d1.size() == 128);
     screen.frame_read(16, 8, 3);
     CHECK(seen->format().width == 16);
-    // a fill that never got its read (the read back failed) is given up after a second
+    // a read back that failed (0 x 0): nothing published, the next frame wanted again
+    const uint64_t before_lost = screen.published();
     ArrayView<uint32_t> lost = screen.frame_wanted(16, 8, t + 2000000);
-    CHECK(!lost.empty());
-    CHECK(screen.frame_wanted(16, 8, t + 2200000).empty() && screen.frame_wanted(16, 8, t + 2000000 + ScreenSource::kKeepAliveUs).size() == 128);
-    screen.frame_read(16, 8, 4);
+    CHECK(!lost.empty() && screen.frame_wanted(16, 8, t + 2150000).empty());      // (being read)
+    screen.frame_read(0, 0, 4);
+    CHECK(screen.published() == before_lost && seen->format().width == 16 && screen.frame_wanted(16, 8, t + 2300000).size() == 128);
+    screen.frame_read(16, 8, 5);
   }
   g.destroy_node(watcher);
   CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
@@ -3889,6 +3913,7 @@ struct NodeView {
   std::vector<uint32_t> removed;      // (remove_mem)
   uint32_t id = 0, node = 0, activation_mem = 0;
   std::map<uint32_t, Fd> mems;
+  std::map<uint32_t, uint32_t> mem_types;      // (add_mem's type: 2 memfd, 3 DMA-BUF)
   Fd activation, wake;
   int config_mode = -1;
   bool config_format = false;
@@ -3906,7 +3931,7 @@ struct NodeView {
       if (m.id == 0 && m.opcode == 6) {
         int32_t mem = 0; uint32_t type = 0; int64_t fd = -1; pod::Value v;
         p.int32(&mem); p.id(&type); p.next(&v); v.get_fd(&fd);
-        if (fd >= 0 && size_t(fd) < own.size()) mems[uint32_t(mem)] = own[size_t(fd)];
+        if (fd >= 0 && size_t(fd) < own.size()) { mems[uint32_t(mem)] = own[size_t(fd)]; mem_types[uint32_t(mem)] = type; }
       }
       if (m.id == 0 && m.opcode == 7) { int32_t mem = 0; if (p.int32(&mem)) removed.push_back(uint32_t(mem)); }
       if (m.id == 0 && m.opcode == 3) {      // error
@@ -4513,6 +4538,254 @@ static void test_client_node_media() {
     }
     c.send(0, 7, [](pod::Builder& b) { b.int32(9); });
     c.take_with_fds();
+  }
+  // ---- zero-copy: a DMA-BUF camera of three buffers and a watcher that takes DMA-BUFs. The watcher is given the camera's own descriptors (the same
+  // images, as DMA-BUFs) and each frame's buffer, nothing copied; the camera's buffer is held while the watcher may read it and handed back once the
+  // watcher recycled it (or was given a newer one instead). A watcher in memory makes the server copy again (only then); one whose EnumFormat names a
+  // modifier is told it. Gone, the watchers let go and the camera has its buffers back.
+  {
+    auto send_buffers = [&](NativeClient& cl, uint32_t node, std::vector<Fd> fds, int32_t type, int32_t size) {
+      ByteBuffer body(A);
+      pod::Builder b(body);
+      const uint64_t f = b.begin_struct();
+      b.int32(1); b.int32(0); b.int32(-1); b.int32(int32_t(fds.size()));
+      for (size_t k = 0; k < fds.size(); ++k) { b.int32(1); b.id(uint32_t(type)); b.fd(int64_t(k)); b.int32(9); b.int32(0); b.int32(size); }
+      b.end(f);
+      ByteBuffer msg(A);
+      msg.put32(node); msg.put32(6u << 24 | uint32_t(body.size())); msg.put32(++cl.seq); msg.put32(uint32_t(fds.size()));
+      msg.append(body.view());
+      List<Fd> list(A);
+      for (Fd& fd : fds) list.push_back(fd);
+      server.receive_with_fds(cl.handle, msg.view(), list);
+    };
+    NodeView zc;
+    zc.id = 30;
+    create_node(c, 30, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "zc-camera"}});
+    node_update(c, 30);
+    set_active(c, 30, true);
+    c.send(30, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 1u << 2, {}); });
+    zc.absorb(c);
+    c.send(30, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 3, 512, 128, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    zc.absorb(c);
+    std::vector<SharedPointer<FakeGpuFd>> img;
+    for (int k = 0; k < 3; ++k) img.push_back(SharedPointer<FakeGpuFd>::make(A, 512));
+    send_buffers(c, 30, {Fd(img[0]), Fd(img[1]), Fd(img[2])}, 3, 512);
+    zc.absorb(c);
+    CHECK(zc.errors == 0 && zc.starts == 1 && zc.ports[{1, 0}].bufs.size() == 3);
+    SharedPointer<VideoChannel> zch = g.video_of(zc.node);
+    CHECK(zch && zch->share() && zch->share()->n_buffers == 3 && zch->share()->data_type == 3);
+    // the watcher: DMA-BUFs only
+    NodeView zw;
+    zw.id = 31;
+    create_node(w, 31, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 31);
+    set_active(w, 31, true);
+    w.send(31, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    zw.absorb(w);
+    w.send(31, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(2); buffers_param(b, 2, 0, 0, 1u << 3); meta_param(b, 1, 32); b.none(); });
+    zw.absorb(w);
+    NodeView::PortView& zwp = zw.ports[{0, 0}];
+    CHECK(zw.errors == 0 && zw.starts == 1 && zwp.bufs.size() == 3);      // (as many as the camera has: each is one of its)
+    bool same = zwp.bufs.size() == 3;
+    for (size_t i = 0; i < zwp.bufs.size() && i < 3; ++i) {
+      const NodeView::Data& d = zwp.bufs[i].datas[0];
+      same &= d.type == 4 && zw.mem_types[uint32_t(d.data)] == 3 && zw.mems[uint32_t(d.data)].get() == img[i].get() && d.maxsize == 512 && (d.flags & 2) == 0;
+    }
+    CHECK(same && zch->share()->attached == 1);
+    // the camera's frames: given as they are (nothing read from the images, no pixels in the channel)
+    auto frame = [&](uint32_t buffer, uint32_t size) {
+      ByteView part = zc.buffer(1, 0, buffer);
+      put_u32(part, 32, 0); put_u32(part, 36, size); put_u32(part, 40, 128);
+      put_u32(zc.io(1, 0), 0, 2); put_u32(zc.io(1, 0), 4, buffer);
+    };
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(0, 512);
+    tick();
+    tick(40);
+    CHECK(img[0]->syncs == 0 && zch->latest() && zch->latest()->pixels.size() == 0 && zch->latest()->share_buffer == 0);
+    CHECK(u32_at(zc.io(1, 0), 0) == 1 && u32_at(zc.io(1, 0), 4) == 0xFFFFFFFFu);      // (nothing handed back: buffer 0 is held for the watcher)
+    CHECK(given(zw) == 0 && u32_at(zw.buffer(0, 0, 0), 36) == 512 && u32_at(zw.buffer(0, 0, 0), 40) == 128);
+    // the watcher read it and recycles it; frame 1: buffer 0 is still the watcher's when the camera's cycle runs, so nothing goes back yet
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 0);
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(1, 500);
+    tick();
+    tick(40);
+    CHECK(given(zw) == 1 && u32_at(zw.buffer(0, 0, 1), 36) == 500 && zch->share()->users[0] == 0 && zch->share()->users[1] == 1);
+    // frame 2: buffer 0 (recycled, the oldest taken) goes back
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 1);
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(2, 512);
+    tick();
+    CHECK(u32_at(zc.io(1, 0), 4) == 0);
+    tick(40);
+    CHECK(given(zw) == 2);
+    // the watcher does not run: frame 0 replaces 2 in its io (2 was never taken: let go), and 1 goes back to the camera
+    put_u32(zw.activation->memory(), 0, 3);
+    frame(0, 512);
+    tick();
+    CHECK(u32_at(zc.io(1, 0), 4) == 1);
+    tick(40);
+    CHECK(given(zw) == 0 && zch->share()->users[2] == 0 && zch->share()->users[0] == 1);
+    // a watcher in memory: the server copies again (from the image), and only now
+    NodeView mw2;
+    mw2.id = 32;
+    create_node(w, 32, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 32);
+    set_active(w, 32, true);
+    w.send(32, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 32, 4); port_info(b, 0, {}); });
+    mw2.absorb(w);
+    w.send(32, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mw2.absorb(w);
+    CHECK(mw2.starts == 1 && mw2.ports[{0, 0}].bufs.size() == 2 && mw2.ports[{0, 0}].bufs[0].dtype == 1 && zch->share()->attached == 1);
+    for (uint32_t y = 0; y < 4; ++y) memset(img[1]->image.data() + y * 128, int(0x70 + y), 128);
+    put_u32(zw.io(0, 0), 0, 1); put_u32(zw.io(0, 0), 4, 0);
+    put_u32(zw.activation->memory(), 0, 3);
+    put_u32(mw2.activation->memory(), 0, 3);
+    frame(1, 512);
+    tick();
+    tick(40);
+    CHECK(img[1]->syncs == 1 && zch->latest() && zch->latest()->pixels.size() == 512 && zch->latest()->share_buffer == 1);
+    CHECK(given(zw) == 1);
+    if (u32_at(mw2.io(0, 0), 0) == 2) {
+      const uint32_t id = u32_at(mw2.io(0, 0), 4);
+      ByteView part = mw2.buffer(0, 0, id);
+      CHECK(part[uint64_t(mw2.ports[{0, 0}].bufs[id].data)] == 0x70 && part[uint64_t(mw2.ports[{0, 0}].bufs[id].data) + 3 * 128 + 127] == 0x73);
+    } else {
+      CHECK(false);
+    }
+    w.send(0, 7, [](pod::Builder& b) { b.int32(32); });
+    tick();
+    // a watcher that names a modifier: its Format says the camera's (linear: 0)
+    NodeView mz;
+    mz.id = 33;
+    create_node(w, 33, {{"media.class", "Stream/Input/Video"}, {"target.object", "zc-camera"}});
+    node_update(w, 33);
+    set_active(w, 33, true);
+    w.send(33, 3, [](pod::Builder& b) {
+      b.int32(0); b.int32(0); b.int32(3); b.int32(1);
+      const uint64_t o = b.begin_object(0x40003, 3);
+      b.property(1); b.id(2); b.property(2); b.id(1);
+      b.property(0x20001); b.id(12);
+      b.property(0x20002, 1u << 3); b.int64(0);
+      b.property(0x20003); b.rectangle(32, 4);
+      b.end(o);
+      port_info(b, 0, {});
+    });
+    mz.absorb(w);
+    {
+      bool modifier = false;
+      int64_t value = -1;
+      pod::Parser fp(ConstByteView(mz.ports[{0, 0}].format.data(), mz.ports[{0, 0}].format.size()));
+      pod::Value fv; pod::ObjectReader o;
+      if (fp.next(&fv) && o.open(fv)) {
+        uint32_t key, fl; pod::Value v;
+        while (o.next(&key, &fl, &v)) if (key == 0x20002) { modifier = v.get_long(&value); }
+      }
+      CHECK(modifier && value == 0);
+    }
+    w.send(33, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mz.absorb(w);
+    CHECK(mz.starts == 1 && mz.ports[{0, 0}].bufs.size() == 3 && mz.mem_types[uint32_t(mz.ports[{0, 0}].bufs[0].datas[0].data)] == 3 &&
+          zch->share()->attached == 2);      // (no types said, a modifier named: DMA-BUFs, the camera's)
+    w.send(0, 7, [](pod::Builder& b) { b.int32(33); });
+    tick();
+    CHECK(zch->share()->attached == 1);
+    // the first watcher goes: what it held is let go, and the camera has its buffers back one a cycle
+    w.send(0, 7, [](pod::Builder& b) { b.int32(31); });
+    tick();
+    VideoShare* sh = zch->share().get();
+    CHECK(sh && sh->attached == 0 && sh->users[0] == 0 && sh->users[1] == 0 && sh->users[2] == 0);
+    // (one goes back each cycle - the io has room for one - so the camera always has one to draw into, and those held never grow)
+    int before = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) before += sh->taken[i];
+    bool back_each = true;
+    const uint32_t order[3] = {2, 0, 1};
+    for (uint32_t b2 : order) {
+      if (sh && sh->taken[b2]) continue;
+      frame(b2, 512);
+      tick();
+      back_each &= u32_at(zc.io(1, 0), 4) != 0xFFFFFFFFu;
+    }
+    int after = 0;
+    for (uint32_t i = 0; i < 3 && sh; ++i) after += sh->taken[i];
+    CHECK(back_each && after <= before && before <= 2);
+    w.take_with_fds();
+    c.send(0, 7, [](pod::Builder& b) { b.int32(30); });
+    tick();
+    CHECK(!zch->share() || zch->share()->closed);
+    c.take_with_fds();
+  }
+  // ---- a watcher that takes DMA-BUFs only, of a camera in the server's memory: given GPU images of the server's (32-bit RGB), each frame written into
+  // one; one of a format no GPU image holds gets no buffers
+  {
+    maker.gpu = true;
+    NodeView mc2;
+    mc2.id = 34;
+    create_node(c, 34, {{"media.class", "Video/Source"}, {"node.driver", "true"}, {"node.name", "mem-camera"}});
+    node_update(c, 34);
+    set_active(c, 34, true);
+    c.send(34, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 8, 2); port_info(b, 0, {}); });
+    mc2.absorb(c);
+    c.send(34, 3, [](pod::Builder& b) { b.int32(1); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 0); b.none(); });
+    mc2.absorb(c);
+    CHECK(mc2.starts == 1 && mc2.ports[{1, 0}].bufs.size() == 2);
+    NodeView gw;
+    gw.id = 35;
+    create_node(w, 35, {{"media.class", "Stream/Input/Video"}, {"target.object", "mem-camera"}});
+    node_update(w, 35);
+    set_active(w, 35, true);
+    w.send(35, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video(b, 8, 2); port_info(b, 0, {}); });
+    gw.absorb(w);
+    w.send(35, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 3, 0, 0, 1u << 3); b.none(); });
+    gw.absorb(w);
+    NodeView::PortView& gwp = gw.ports[{0, 0}];
+    CHECK(gw.starts == 1 && gwp.bufs.size() == 3 && maker.images == 3);
+    bool images = gwp.bufs.size() == 3;
+    for (size_t i = 0; i < gwp.bufs.size() && i < maker.made_images.size(); ++i)
+      images &= gwp.bufs[i].datas[0].type == 4 && gw.mem_types[uint32_t(gwp.bufs[i].datas[0].data)] == 3 &&
+                gw.mems[uint32_t(gwp.bufs[i].datas[0].data)].get() == maker.made_images[i].get() && gwp.bufs[i].datas[0].maxsize == int32_t((8 * 4 + 64) * 2);
+    CHECK(images);
+    std::vector<uint8_t> px(8 * 4 * 2);
+    for (size_t k = 0; k < px.size(); ++k) px[k] = uint8_t(k);
+    auto given = [&](NodeView& v) -> uint32_t { return u32_at(v.io(0, 0), 0) == 2 ? u32_at(v.io(0, 0), 4) : 0xFFFFFFFFu; };
+    {      // (the camera's frame in its buffer 0)
+      ByteView part = mc2.buffer(1, 0, 0);
+      const NodeView::Buf& bf = mc2.ports[{1, 0}].bufs[0];
+      memcpy(part.data() + bf.data, px.data(), px.size());
+      put_u32(part, 0, 0); put_u32(part, 4, uint32_t(px.size())); put_u32(part, 8, 32);
+      put_u32(mc2.io(1, 0), 0, 2); put_u32(mc2.io(1, 0), 4, 0);
+    }
+    put_u32(gw.activation->memory(), 0, 3);
+    tick();
+    tick(40);
+    CHECK(given(gw) < 3);
+    if (given(gw) < 3) {
+      FakeGpuFd& im = *maker.made_images[given(gw)];
+      ByteView chunk = gw.buffer(0, 0, given(gw));
+      uint32_t meta_bytes = 0;
+      for (const auto& m : gwp.bufs[given(gw)].metas) meta_bytes += (m.second + 7) & ~7u;
+      CHECK(im.to_gpu == 1 && im.image[0] == 0 && im.image[31] == 31 && im.image[96] == 32 && im.image[96 + 31] == 63 && u32_at(chunk, meta_bytes + 8) == 96);
+    }
+    // NV12 only, DMA-BUFs only: no GPU image holds it
+    NodeView nw;
+    nw.id = 36;
+    create_node(w, 36, {{"media.class", "Stream/Input/Video"}, {"target.object", "mem-camera"}});
+    node_update(w, 36);
+    set_active(w, 36, true);
+    w.send(36, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(3); b.int32(1); enum_video_fixed(b, 23, 8, 2); port_info(b, 0, {}); });
+    nw.absorb(w);
+    w.send(36, 3, [](pod::Builder& b) { b.int32(0); b.int32(0); b.int32(1); b.int32(1); buffers_param(b, 2, 0, 0, 1u << 3); b.none(); });
+    nw.absorb(w);
+    CHECK(nw.starts == 0 && !nw.ports[{0, 0}].use);
+    w.send(0, 7, [](pod::Builder& b) { b.int32(35); });
+    w.send(0, 7, [](pod::Builder& b) { b.int32(36); });
+    c.send(0, 7, [](pod::Builder& b) { b.int32(34); });
+    tick();
+    w.take_with_fds();
+    c.take_with_fds();
+    maker.gpu = false;
   }
   // a port_buffers for a port that was not asked to allocate is refused
   {

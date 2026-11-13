@@ -28,6 +28,7 @@
 #include <vector>
 #include "Graphics/Graphics3D/Software/SoftwareDevice.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
+#include "PipeWire/DxgGpuImages.hpp"
 #include "PipeWire/SocketServer.hpp"
 #include "Process/DxgBufferFile.hpp"
 #include "Process/ProcessFiles.hpp"
@@ -65,11 +66,20 @@ struct SystemSync final : process::ISystemSync {
 };
 thread_local std::unique_lock<std::mutex>* SystemSync::mine = nullptr;
 
-// What the server is given (the bytes and the descriptors).
+// What the server is given (the bytes and the descriptors), and descriptors it sends on (`to_send`, to connection `send_to`, with one byte).
 struct CaptureProtocol final : IProtocolServer {
   std::vector<uint8_t> bytes;
   std::vector<Fd> fds;
-  uint32_t open_client(uint64_t) override { return 1; }
+  std::vector<Fd> to_send;
+  uint32_t send_to = 0, clients = 0;
+  uint32_t open_client(uint64_t) override { return ++clients; }
+  bool take_output_with_fds(uint32_t client, ByteBuffer* out, List<Fd>* out_fds) override {
+    if (client != send_to || to_send.empty()) return false;
+    out->put8(0x42);
+    for (Fd& f : to_send) out_fds->push_back(f);
+    to_send.clear();
+    return false;
+  }
   void receive(uint32_t, ConstByteView b) override { bytes.insert(bytes.end(), b.data(), b.data() + b.size()); }
   void receive_with_fds(uint32_t client, ConstByteView b, List<Fd>& in) override {
     receive(client, b);
@@ -163,6 +173,63 @@ int main() {
         CHECK(fd->sync_from_gpu() && holds(0));
         CHECK(paint(3));       // the camera draws its next frame: the copy follows at the next sync
         CHECK(holds(0) && fd->sync_from_gpu() && holds(3));
+
+        // zero-copy: the same DMA-BUF sent on to another client (a watcher given the camera's own buffer) is the very export, not a copy; and an image of
+        // the server's own (a watcher that takes DMA-BUFs only) holds what the server wrote into it, for the client that is given it
+        DxgGpuImages images(k, A);
+        CHECK(!server.gpu_images());
+        uint32_t none_stride = 7;
+        CHECK(!server.make_gpu_image(16, 8, &none_stride) && none_stride == 0);
+        server.set_gpu_images(&images);
+        uint32_t stride = 0;
+        Fd made = server.make_gpu_image(16, 8, &stride);
+        CHECK(made && made->gpu() && stride >= 64 && made->memory().size() >= uint64_t(stride) * 8);
+        if (made) {
+          for (uint32_t y = 0; y < 8; ++y)
+            for (uint32_t x = 0; x < 16; ++x) {
+              const uint32_t p = pattern(x, y, 9);
+              memcpy(made->memory().data() + uint64_t(y) * stride + uint64_t(x) * 4, &p, 4);
+            }
+          CHECK(made->sync_to_gpu());
+        }
+        uint32_t sock2 = 0;
+        CHECK(sockets.create(process::UnixType::Stream, 9, &sock2) == process::UnixStatus::Ok);
+        sync.lock();
+        CHECK(sockets.connect_locked(sock2, process::UnixName::from(process::UnixName::Kind::Abstract, StringView("/run/user/0/dmabuf-test").bytes()), StringView(), 9) ==
+              process::UnixStatus::Ok);
+        sync.unlock();
+        for (int i = 0; i < 2; ++i) server.pump();
+        proto.send_to = proto.clients;
+        proto.to_send = {fd, made};
+        for (int i = 0; i < 3; ++i) server.pump();
+        Queue<process::UnixInFlight> got(A);
+        uint8_t byte[8] = {};
+        process::UnixSocketManager::Received rec;
+        sync.lock();
+        CHECK(sockets.receive_locked(sock2, ByteView(byte, sizeof byte), false, &rec, &got) == process::UnixStatus::Ok && rec.got == 1 && byte[0] == 0x42);
+        sync.unlock();
+        process::UnixInFlight first, second;
+        CHECK(got.dequeue(&first) && got.dequeue(&second));
+        CHECK(first.kind == process::DescriptorKind::File && first.object && first.object->gpu_buffer == object->gpu_buffer);      // (the camera's own)
+        CHECK(second.kind == process::DescriptorKind::File && second.object && second.object->gpu_buffer);
+        if (second.object && second.object->gpu_buffer) {
+          std::vector<uint8_t> back(size_t(stride) * 8, 0);
+          CHECK(second.object->gpu_buffer->copy_image(ByteView(back.data(), back.size()), false));
+          bool image = true;
+          for (uint32_t y = 0; y < 8; ++y)
+            for (uint32_t x = 0; x < 16; ++x) {
+              uint32_t p = 0;
+              memcpy(&p, back.data() + uint64_t(y) * stride + uint64_t(x) * 4, 4);
+              image &= p == pattern(x, y, 9);
+            }
+          CHECK(image);
+        }
+        first = process::UnixInFlight();
+        second = process::UnixInFlight();
+        made = Fd();
+        server.set_gpu_images(nullptr);      // (before the images' maker goes)
+        sockets.release(sock2);
+        for (int i = 0; i < 3; ++i) server.pump();
       }
       proto.fds.clear();
       sockets.release(sock);

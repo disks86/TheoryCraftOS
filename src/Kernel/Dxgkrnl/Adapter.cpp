@@ -1724,8 +1724,10 @@ NtStatus Adapter::execute_present(Submission& s) {
   if (st == status::kSuccess && tap && shown.image()) {
     const graphics::Extent2D e = shown.image()->extent();
     ArrayView<uint32_t> into = tap->present_wanted(e.width, e.height);
-    if (!into.empty() && into.size() >= uint64_t{e.width} * e.height && shown.image()->read_pixels(into.first(uint64_t{e.width} * e.height)))
-      tap->present_read(e.width, e.height);
+    if (!into.empty()) {      // (0 x 0: it could not be read)
+      const bool read = into.size() >= uint64_t{e.width} * e.height && shown.image()->read_pixels(into.first(uint64_t{e.width} * e.height));
+      tap->present_read(read ? e.width : 0, read ? e.height : 0);
+    }
   }
   vidmm_.unpin(shown);
   vidmm_.unpin(source);

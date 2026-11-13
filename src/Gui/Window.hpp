@@ -40,7 +40,7 @@ class IFrameTap {
  public:
   // Whether it wants this frame (width x height pixels): a buffer for it, at least width * height (empty: not this one).
   virtual ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) = 0;
-  // The frame is in that buffer (0xAARRGGBB, row after row).
+  // The frame is in that buffer (0xAARRGGBB, row after row); 0 x 0 when it could not be read. Follows every frame_wanted() that gave a buffer.
   virtual void frame_read(uint32_t width, uint32_t height) = 0;
 
  protected:

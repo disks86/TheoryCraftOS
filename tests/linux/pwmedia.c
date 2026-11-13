@@ -22,6 +22,8 @@
 //                (pw_stream video input, target.object the camera) in one program: the watcher must see the camera's frames whole and in order;
 //   video-alloc  the same with the camera allocating its own buffers (PW_STREAM_FLAG_ALLOC_BUFFERS: memfds it makes, given to the server with
 //                port_buffers);
+//   video-zerocopy  video-alloc with a watcher that takes memfds only: the server gives it the camera's own memfds (zero-copy), so each frame it
+//                sees must be in one of the camera's files (the same inode), whole and in order;
 //   video-yuv    the camera in NV12 with a data block a plane, the watcher with the planes one after another in one block; once the watcher has seen
 //                some frames the camera says it is I420 at another size now (pw_stream_update_params): both are negotiated again while streaming, and
 //                the watcher must see the I420 frames too;
@@ -41,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <pipewire/filter.h>
@@ -68,6 +71,9 @@ struct data {
   struct spa_source* timer;
   struct spa_source* deadline;
   int alloc;
+  int zerocopy;
+  ino_t camera_inodes[16];
+  uint32_t n_inodes, own_seen;
   uint32_t produced;
   uint32_t seen, bad, last_frame;
   int camera_stride;
@@ -178,6 +184,8 @@ static void camera_add_buffer(void* userdata, struct pw_buffer* buffer) {
     close(fd);
     return;
   }
+  struct stat st;
+  if (fstat(fd, &st) == 0 && d->n_inodes < 16) d->camera_inodes[d->n_inodes++] = st.st_ino;
   sd->type = SPA_DATA_MemFd;
   sd->flags = SPA_DATA_FLAG_READWRITE | SPA_DATA_FLAG_MAPPABLE;
   sd->fd = fd;
@@ -324,10 +332,15 @@ static void watcher_param_changed(void* userdata, uint32_t id, const struct spa_
   uint8_t buffer[1024];
   struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
   const struct spa_pod* params[2];
-  params[0] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-      SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 8),
-      SPA_PARAM_BUFFERS_size, SPA_POD_Int(W * 4 * H),
-      SPA_PARAM_BUFFERS_stride, SPA_POD_Int(W * 4));
+  params[0] = d->zerocopy ? spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                                   SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 8),
+                                   SPA_PARAM_BUFFERS_size, SPA_POD_Int(W * 4 * H),
+                                   SPA_PARAM_BUFFERS_stride, SPA_POD_Int(W * 4),
+                                   SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_MemFd))
+                             : spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+                                   SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(3, 2, 8),
+                                   SPA_PARAM_BUFFERS_size, SPA_POD_Int(W * 4 * H),
+                                   SPA_PARAM_BUFFERS_stride, SPA_POD_Int(W * 4));
   params[1] = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
       SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
       SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
@@ -400,6 +413,14 @@ static void watcher_process(void* userdata) {
         ++d->seen;
         d->last_frame = frame;
       }
+      if (d->zerocopy) {      // (in one of the camera's own memfds?)
+        struct stat st;
+        int own = 0;
+        if (buf->datas[0].type == SPA_DATA_MemFd && buf->datas[0].fd >= 0 && fstat((int)buf->datas[0].fd, &st) == 0)
+          for (uint32_t k = 0; k < d->n_inodes; ++k) own |= d->camera_inodes[k] == st.st_ino;
+        if (own) ++d->own_seen;
+        else ++d->bad;
+      }
       struct spa_meta_header* h = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof *h);
       (void)h;
     }
@@ -407,8 +428,8 @@ static void watcher_process(void* userdata) {
   }
   if (d->seen >= WANT_FRAMES) {
     char what[160];
-    snprintf(what, sizeof what, "(%u frames watched whole and in order, %u produced, %u bad; %s buffers)", d->seen, d->produced, d->bad,
-             d->alloc ? "the camera's own" : "the server's");
+    snprintf(what, sizeof what, "(%u frames watched whole and in order, %u produced, %u bad; %s buffers%s)", d->seen, d->produced, d->bad,
+             d->alloc ? "the camera's own" : "the server's", d->zerocopy ? ", the watcher given them as they are" : "");
     finish(d, d->bad == 0, what);
   }
 }
@@ -757,7 +778,8 @@ int main(int argc, char** argv) {
   memset(&d, 0, sizeof d);
   d.result = -1;
   d.mode = argc > 1 ? argv[1] : "video";
-  d.alloc = strcmp(d.mode, "video-alloc") == 0;
+  d.zerocopy = strcmp(d.mode, "video-zerocopy") == 0;
+  d.alloc = strcmp(d.mode, "video-alloc") == 0 || d.zerocopy;
   d.yuv = strcmp(d.mode, "video-yuv") == 0;
   pw_init(&argc, &argv);
   d.loop = pw_main_loop_new(NULL);

@@ -131,7 +131,10 @@ void Window::render() {
     if (tap_) {
       const graphics::Extent2D e = r->extent();
       ArrayView<uint32_t> into = tap_->frame_wanted(e.width, e.height);
-      if (!into.empty() && into.size() >= uint64_t{e.width} * e.height && r->read_frame(into)) tap_->frame_read(e.width, e.height);
+      if (!into.empty()) {      // (0 x 0: it could not be read)
+        const bool read = into.size() >= uint64_t{e.width} * e.height && r->read_frame(into);
+        tap_->frame_read(read ? e.width : 0, read ? e.height : 0);
+      }
     }
   }
   r->present();

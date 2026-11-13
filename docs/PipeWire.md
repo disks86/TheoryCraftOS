@@ -32,6 +32,7 @@ program that records, of any kind, gets a record stream of it.
 | The machine's cameras as Video/Source nodes of the kernel | `CameraSource.{hpp,cpp}` |
 | The screen as a Video/Source node (screen sharing) | `ScreenSource.{hpp,cpp}`, `gui::IFrameTap` (`src/Gui/Window.hpp`), `dxgk::IPresentTap` (`src/Kernel/Dxgkrnl/Adapter.hpp`) |
 | Video conversion for watchers | `VideoConvert.{hpp,cpp}` |
+| The server's GPU images for DMA-BUF watchers (exports of the Direct3D layer) | `DxgGpuImages.hpp`, `IGpuImages` (`SocketServer.hpp`) |
 | Decoding encoded video for raw watchers and the viewer (Motion JPEG itself, the other codecs through `IVideoDecoders`) | `VideoDecode.{hpp,cpp}` |
 | The kernel's own watcher (the desktop's Video Viewer) | `VideoWatcher.{hpp,cpp}`, `src/Desktop/VideoViewer.{hpp,cpp}` |
 | A virtual sink's audio: a mixer of its own over a silent device on the graph's clock | `VirtualSink.hpp` |
@@ -154,8 +155,21 @@ program that records, of any kind, gets a record stream of it.
     sessions of the machine's video codecs (`Graph::set_video_decoders`; main gives it `SystemVideoCodecs`), a picture a codec holds back coming out
     with a later frame.
   - **DMA-BUF producers.** A producer that allocates its own buffers may give GPU images (`SPA_DATA_DmaBuf`) when they are exports of `/dev/dxg`:
-    the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), each frame is copied out of the
-    image before it is read, and a frame the GPU still draws is handed back unread.
+    the transport wraps one as a CPU copy (`Descriptor::gpu`, `sync_from_gpu` through `DxgBufferFile::copy_image`), a frame is copied out of the
+    image before it is read when something needs the pixels, and a frame the GPU still draws is handed back unread.
+  - **Zero-copy.** A producer that allocates (DMA-BUFs or memfds, all of one kind) shares its buffers (`VideoShare`, carried by its channel and its
+    frames). A watcher that takes them as they are - the producer's format and size, and its Buffers' `dataType` names that memory (or, saying no
+    types, its EnumFormat names a modifier and they are DMA-BUFs) - is given the producer's own descriptors (`add_mem` of type DmaBuf or MemFd, the
+    data `MemId`s, read-only) and each cycle the buffer of the newest frame, its chunks and header written in the watcher's own part of it: nothing
+    is copied. The producer's buffer is held while a watcher may read it (given and not yet recycled through its io, or the newest frame) and an
+    older one nobody holds goes back to the producer instead (one a cycle: the io's room). When every watcher of the producer takes its buffers so,
+    no copy is made at all (the channel's frame has no pixels); a watcher in memory, a converting one or the kernel's own makes the server copy again.
+    A watcher already running is negotiated again when its producer's buffers become shareable to it, or stop being shared.
+  - **The server's DMA-BUFs.** A watcher that takes DMA-BUFs only (or names a modifier in its EnumFormat) of a producer whose buffers it cannot
+    share is given GPU images of the server's, one a buffer (`IDescriptorMaker::make_gpu_image`: the transport's `IGpuImages`, which main makes
+    with `DxgGpuImages` over the Direct3D layer's first adapter - exports of `/dev/dxg`, so a client imports them as any DMA-BUF of the system).
+    They are 32-bit RGB (BGRx or BGRA, chosen when the watcher lists one); each frame is written into the image's CPU copy at its pitch and then
+    into the image (`sync_to_gpu`). The Format names the modifier (linear, 0) when the watcher's EnumFormat named one.
   - **The Video Viewer.** A Start menu app of the desktop (`src/Desktop/VideoViewer.cpp`) lists the graph's video producers, watches the one
     picked (through `VideoWatcher.cpp`, a watcher node of the kernel's, so a camera streams while it is shown) and shows its newest picture fitted
     to the window, converted to RGB (encoded video decoded as for a raw watcher); it says when a source went, cannot be decoded here, or sent a
@@ -316,7 +330,13 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   lost) against a plain one; module arguments (quotes, escapes, PulseAudio property names, truncation and bit flips) and `module-null-sink` over
   the protocol (load, list, info for old and new clients, kept after the client goes, unload, refused modules and arguments, a sink destroyed
   another way); the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
-  tap (flips and blits handed over, not when unwanted or refused, adapters added after it). `VideoCodecTest` decodes a
+  tap (flips and blits handed over, not when unwanted or refused, adapters added after it). Zero-copy: a DMA-BUF camera of three buffers and a
+  DMA-BUF watcher (given the camera's very descriptors as DMA-BUFs, read-only; each frame's buffer, nothing read from the images and no pixels in
+  the channel; the camera's buffer held until the watcher recycled it, the oldest free one going back; a watcher that did not run let go of the
+  buffer it never took), a memory watcher joining (the server copies again, from the image), a watcher naming a modifier (its Format says linear;
+  given the camera's DMA-BUFs without saying types), watchers going (holds let go); a DMA-BUF-only watcher of a camera in memory given GPU images
+  (each frame written into one at its pitch and synced), and one in NV12 given none. `PipeWireDmabufTest` also sends a received DMA-BUF on to a
+  second connection (the very export arrives) and makes a GPU image with `DxgGpuImages` whose pixels the client that receives it finds. `VideoCodecTest` decodes a
   JPEG without its DHT segments as with them, and `tests/run_host_tests.sh PipeWireDmabufTest` passes a real export of the Direct3D layer through
   the transport (SCM_RIGHTS) and checks its copy follows the image.
 - `tests/run_host_tests.sh UnixSocketTest`: eventfd too (the counter, `EFD_SEMAPHORE`, `EFD_NONBLOCK`, the limit, `poll()`, a blocked read woken
@@ -326,7 +346,8 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   `paplay` at once; the mixed output must hold both tones at the right levels; `parecord` must record each side's tone; the source's and a source
   output's volume set through `pactl` must read back. The host's real `pw-play` and `pw-record` (libpipewire 1.x) go through client-node (the
   host server's maker makes real memfds and eventfds): the mix must hold `pw-play`'s tone, and `pw-record` must record each side's tone.
-  `tests/linux/pwmedia.c`, built against the host's libpipewire, runs its six modes (below); `pw-midiplay` plays a MIDI file (the server's
+  `tests/linux/pwmedia.c`, built against the host's libpipewire, runs its seven modes (below; `video-zerocopy`: the watcher's frames must be in the
+  camera's own memfds, the same inodes); `pw-midiplay` plays a MIDI file (the server's
   synthesizer must get all its notes, and pwmedia's system exclusive message whole); `pw-cli create-node adapter` makes a lingering null sink that
   `pw-cli ls` lists, `pw-play --target` plays into and `pw-record --target` records from (the recording must hold the tone at full level); then
   PulseAudio reaches the same sink: `pactl` lists it and its monitor and sets its volume, `paplay --device=cli-null` plays into it and `parecord
@@ -356,7 +377,7 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   the mix with the native stream, and `pw-record -n 24000` must write a WAV (copied out with `TCOS_EMU_SAVE`) that holds 880 Hz on the left and
   1320 Hz on the right. Then `pw-cat --midi` plays a 12-note MIDI file (all 12 must reach the emulator's synthesizer), and `tests/linux/pwmedia.c`
   runs each mode: `video` (a driver camera, `PW_STREAM_FLAG_DRIVER` with `SPA_META_Header`, and a watcher in one program: 15 frames seen whole and in
-  order), `video-alloc` (the same with `PW_STREAM_FLAG_ALLOC_BUFFERS`: the camera's own memfds), `video-yuv` (NV12 with a block a plane, then the
+  order), `video-alloc` (the same with `PW_STREAM_FLAG_ALLOC_BUFFERS`: the camera's own memfds), `video-zerocopy` (video-alloc with a watcher taking memfds only: given the camera's own, the same inodes), `video-yuv` (NV12 with a block a plane, then the
   camera says I420 at another size while streaming: both are negotiated again and the watcher must see whole frames of each), `midi` (a
   `pw_filter` MIDI output's 16 notes, the note-offs half way through the cycle, and a 22-byte system exclusive message heard by a `pw_stream` MIDI
   input whole, its controls in order and some past the cycle's start), `filter` (an `Audio/Filter` with two float inputs and two outputs: its
@@ -375,8 +396,12 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   loop; `module-rt` finds no RTKit or session bus and runs without realtime priority (as it does on Linux without them).
 - **client-node limits.** An adapter's audio is mono or stereo at its port (a wider stream is downmixed by the adapter in the program); a filter's
   float ports are channels in the usual order (`audio.channel` is not read), and an effect's input is the microphone (not another stream).
-  DMA-BUFs are taken only from producers that allocate (`port_buffers`) and only as exports of `/dev/dxg` (each frame copied out of the image:
-  no zero-copy, and the server never hands out DMA-BUFs). No tiled formats (NV12 tiles, v210) or modifiers. Encoded video is decoded only for a
+  DMA-BUFs are taken only from producers that allocate (`port_buffers`) and only as exports of `/dev/dxg`. Zero-copy needs the watcher to take
+  the producer's very format and size (a converting or scaling watcher gets a copy); a producer that shares buffers with a slow watcher that holds
+  many of them runs short of buffers (frames are dropped, nothing breaks); the buffers held stay held after the watchers go (one goes back each
+  cycle, one comes in). The server's own DMA-BUFs are 32-bit RGB only (no YUV images: the Direct3D layer exports no planar formats) and are
+  written by the CPU; no implicit fences are passed with a shared DMA-BUF (a watcher that imports one reads what is there). No tiled formats (NV12
+  tiles, v210) or modifiers other than linear. Encoded video is decoded only for a
   producer whose EnumFormat gives a size (the watcher's Format needs one), and AV1, MPEG-4 Part 2 and H.263 are not decoded (SPA has no AV1
   subtype; the others have no software decoder here); a raw producer is never encoded for an encoded watcher. `SPA_META_Busy` is honoured but never set by the server; cursor, bitmap and
   damage metadata are carried, not read. MIDI's sub-cycle timing costs a cycle of latency. No `set_activation` peers (the server is every node's

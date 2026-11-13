@@ -68,7 +68,7 @@ ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, 
   } else if (program_showing_ && now_us - program_us_ < kProgramHoldUs) {
     return ArrayView<uint32_t>();
   }
-  if (!seen || (filling_ && now_us - now_us_ < kKeepAliveUs)) return ArrayView<uint32_t>();      // (a fill whose read never came is given up)
+  if (!seen || filling_) return ArrayView<uint32_t>();
   if (last_us_ && now_us - last_us_ < 1000000ull / kFps) return ArrayView<uint32_t>();
   const uint64_t pixels = uint64_t{width} * height;
   if (frame_.count() < pixels) {
@@ -85,7 +85,7 @@ ArrayView<uint32_t> ScreenSource::frame_wanted(uint32_t width, uint32_t height, 
 void ScreenSource::frame_read(uint32_t width, uint32_t height, int64_t pts_ns) {
   kernel::ScopedMutex guard(mutex_);
   filling_ = false;
-  if (!channel_ || uint64_t{width} * height > frame_.count()) return;
+  if (!channel_ || width == 0 || height == 0 || uint64_t{width} * height > frame_.count()) return;      // (0 x 0: the read failed)
   sent_us_ = now_us_;
   if (width != width_ || height != height_) {
     VideoFormat f;
@@ -112,7 +112,7 @@ bool ScreenSource::desktop_returned(uint64_t now_us) {
 bool ScreenSource::keep_alive(uint64_t now_us) {
   if (!channel_ || !watched()) return false;
   kernel::ScopedMutex guard(mutex_);
-  if ((filling_ && now_us - now_us_ < kKeepAliveUs) || !width_ || !height_ || now_us - sent_us_ < kKeepAliveUs) return false;
+  if (filling_ || !width_ || !height_ || now_us - sent_us_ < kKeepAliveUs) return false;
   sent_us_ = now_us;
   const ArrayView<const uint32_t> words = ArrayView<const uint32_t>(frame_.view()).first(uint64_t{width_} * height_);
   if (!channel_->publish(words_as_bytes(words), width_ * 4, static_cast<int64_t>(now_us * 1000))) return false;

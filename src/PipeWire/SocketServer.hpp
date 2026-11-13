@@ -43,6 +43,17 @@
 
 namespace pipewire {
 
+// Where the transport's GPU images come from (make_gpu_image): on this system exports of /dev/dxg the kernel's Direct3D layer makes (main.cpp), as an open
+// file a descriptor can be passed of (its gpu_buffer the export). Called on the transport's thread.
+class IGpuImages {
+ public:
+  // An image of width x height, 4 bytes a pixel (B, G, R, A), as an entry to pass; *stride its bytes from row to row. False when it cannot be made.
+  virtual bool make(uint32_t width, uint32_t height, process::UnixInFlight* out, uint32_t* stride) = 0;
+
+ protected:
+  ~IGpuImages() = default;
+};
+
 class SocketServer final : public IDescriptorMaker {
  public:
   static constexpr uint32_t kMaxListeners = 8;
@@ -67,6 +78,10 @@ class SocketServer final : public IDescriptorMaker {
   // --- IDescriptorMaker
   Fd make_memory(uint64_t size, StringView name) override;
   Fd make_event() override;
+  Fd make_gpu_image(uint32_t width, uint32_t height, uint32_t* stride) override;
+  bool gpu_images() const override { return gpu_images_ != nullptr; }
+  // Where GPU images come from (null: none can be made). Set before the thread starts; it must outlive the transport.
+  void set_gpu_images(IGpuImages* images) { gpu_images_ = images; }
   struct Graveyard;
 
  private:
@@ -108,6 +123,7 @@ class SocketServer final : public IDescriptorMaker {
 
   process::UnixSocketManager& sockets_;
   allocators::IAllocator& allocator_;
+  IGpuImages* gpu_images_ = nullptr;
   Listener listeners_[kMaxListeners] = {};
   uint32_t listener_count_ = 0;
   IProtocolServer* protocols_[kMaxListeners] = {};

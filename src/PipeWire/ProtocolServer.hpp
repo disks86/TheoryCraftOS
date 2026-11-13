@@ -41,8 +41,11 @@ class Descriptor {
   virtual uint64_t take_signals() = 0;
   // A GPU image a client handed over (a dmabuf: on this system an export of /dev/dxg): memory() is the server's copy of its pixels, which
   // sync_from_gpu() fills from the image (false when the GPU still works on it, or it cannot be read).
+  // A GPU image the server made (IDescriptorMaker::make_gpu_image) is written the other way: memory() filled, then sync_to_gpu() copies it into the
+  // image (false when it cannot be written).
   virtual bool gpu() const { return false; }
   virtual bool sync_from_gpu() { return false; }
+  virtual bool sync_to_gpu() { return false; }
 
  protected:
   Descriptor() = default;
@@ -56,6 +59,15 @@ class IDescriptorMaker {
   virtual Fd make_memory(uint64_t size, StringView name) = 0;
   // An eventfd (non-blocking, counter 0).
   virtual Fd make_event() = 0;
+  // A GPU image of width x height, 4 bytes a pixel (B, G, R, A in memory: SPA's BGRA / BGRx), handed to clients as a DMA-BUF; *stride becomes the bytes
+  // from one row to the next. Empty when there is no GPU to make it on (the default) or it cannot be made.
+  virtual bool gpu_images() const { return false; }
+  virtual Fd make_gpu_image(uint32_t width, uint32_t height, uint32_t* stride) {
+    (void)width;
+    (void)height;
+    *stride = 0;
+    return Fd();
+  }
 
  protected:
   IDescriptorMaker() = default;

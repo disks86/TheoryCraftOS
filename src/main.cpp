@@ -32,6 +32,7 @@
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
 #include "PipeWire/ScreenSource.hpp"
+#include "PipeWire/DxgGpuImages.hpp"
 #include "PipeWire/VideoWatcher.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
@@ -2226,12 +2227,16 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       ~ViewerGuard() { d.set_video_sources(nullptr); }      // (before the watcher goes)
     } viewer_guard{desktop};
     desktop.set_video_sources(&viewer_sources);
+    // The GPU images the PipeWire server hands watchers that take DMA-BUFs only (exports of the Direct3D layer's first adapter). Declared before the
+    // transport, which holds descriptors of them until it goes.
+    pipewire::DxgGpuImages pipewire_gpu_images(dxg_kernel, shared_allocator);
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);
       process::win32k::register_process_exit_hook([](uint64_t pid) { pipewire::windows_audio_process_exited(pid); });
       if (process::UnixSocketManager* sockets = process::system_unix_sockets())
         pipewire_sockets = UniquePointer<pipewire::SocketServer>::make(shared_allocator, *sockets, shared_allocator);
+      if (pipewire_sockets && dxg_kernel.adapter_count() > 0) pipewire_sockets->set_gpu_images(&pipewire_gpu_images);
       if (pipewire_sockets && pipewire::listen_standard_sockets(*pipewire_sockets, pipewire_native, pipewire_pulse, &explorer_files.file_system(), shared_allocator) &&
           pipewire_sockets->start())
         Entry(Level::Ok, "PipeWire").text("graph running; listening at ").text(filesystem::layout::kLinuxRuntimeFolder).text("/pipewire-0 and /pulse/native");

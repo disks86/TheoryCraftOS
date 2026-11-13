@@ -55,7 +55,8 @@ class ScreenSource {
   ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height, uint64_t now_us, ScreenOrigin origin = ScreenOrigin::Desktop);
   // True once when a program that presented to the display has stopped (kProgramHoldUs without a present): the desktop shows again.
   bool desktop_returned(uint64_t now_us);
-  // The frame is in that buffer: published (the channel's format follows the screen's size).
+  // The frame is in that buffer: published (the channel's format follows the screen's size). 0 x 0: it could not be read (nothing is published;
+  // a buffer is handed out again). Every frame_wanted() that gave a buffer must be followed by one.
   void frame_read(uint32_t width, uint32_t height, int64_t pts_ns);
   // While watched: the last frame again when none was sent for kKeepAliveUs. Returns whether it sent one.
   bool keep_alive(uint64_t now_us);

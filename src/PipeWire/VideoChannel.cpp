@@ -107,7 +107,7 @@ VideoFormat VideoChannel::format() {
   return format_;
 }
 
-bool VideoChannel::publish(ArrayView<const VideoPlaneData> planes, int64_t pts) {
+bool VideoChannel::publish(ArrayView<const VideoPlaneData> planes, int64_t pts, const VideoFrame* shared) {
   VideoFormat format;
   uint64_t sequence = 0;
   {
@@ -140,11 +140,38 @@ bool VideoChannel::publish(ArrayView<const VideoPlaneData> planes, int64_t pts) 
   frame->format = format;
   frame->sequence = sequence;
   frame->pts = pts;
+  if (shared) {
+    frame->share = shared->share;
+    frame->share_buffer = shared->share_buffer;
+    for (uint32_t i = 0; i < VideoFormat::kMaxPlanes; ++i) frame->chunks[i] = shared->chunks[i];
+  }
   kernel::ScopedMutex guard(mutex_);
   if (closed_ || !(format_ == format)) return false;      // (closed or changed meanwhile: this frame is of no use)
   frames_ = sequence;
   latest_ = util::move(frame);
   return true;
+}
+
+bool VideoChannel::publish_shared(SharedPointer<VideoFrame> frame) {
+  if (!frame || !frame->share) return false;
+  kernel::ScopedMutex guard(mutex_);
+  if (closed_ || !format_.valid()) return false;
+  frame->format = format_;
+  frame->pixels.clear();
+  frame->sequence = frames_ + 1;
+  frames_ = frame->sequence;
+  latest_ = util::move(frame);
+  return true;
+}
+
+void VideoChannel::set_share(SharedPointer<VideoShare> share) {
+  kernel::ScopedMutex guard(mutex_);
+  share_ = util::move(share);
+}
+
+SharedPointer<VideoShare> VideoChannel::share() {
+  kernel::ScopedMutex guard(mutex_);
+  return share_;
 }
 
 SharedPointer<VideoFrame> VideoChannel::latest() {
@@ -160,6 +187,7 @@ uint64_t VideoChannel::frames() {
 void VideoChannel::close() {
   kernel::ScopedMutex guard(mutex_);
   closed_ = true;
+  share_ = SharedPointer<VideoShare>();
 }
 
 bool VideoChannel::closed() {

@@ -86,6 +86,10 @@ class KernelDescriptor final : public Descriptor {
     if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
     return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), false);
   }
+  bool sync_to_gpu() override {
+    if (!gpu_copy_ || !entry_.object || !entry_.object->gpu_buffer) return false;
+    return entry_.object->gpu_buffer->copy_image(gpu_copy_->writable_view(), true);
+  }
   uint64_t take_signals() override {
     if (!is_event()) return 0;
     uint64_t value = 0;
@@ -130,6 +134,19 @@ Fd SocketServer::make_memory(uint64_t size, StringView name) {
   entry.kind = process::DescriptorKind::File;
   entry.object = util::move(object);
   return Fd::make_as<KernelDescriptor>(allocator_, graveyard_, sockets_, util::move(entry), util::move(block));
+}
+
+Fd SocketServer::make_gpu_image(uint32_t width, uint32_t height, uint32_t* stride) {
+  *stride = 0;
+  if (!gpu_images_ || width == 0 || height == 0) return Fd();
+  process::UnixInFlight entry;
+  uint32_t pitch = 0;
+  if (!gpu_images_->make(width, height, &entry, &pitch)) return Fd();
+  if (entry.kind != process::DescriptorKind::File || !entry.object || !entry.object->gpu_buffer || pitch < uint64_t{width} * 4) return Fd();
+  Fd fd = adopt(util::move(entry));      // (a GPU image: its CPU copy, written and then synced to the image)
+  if (!fd || !fd->gpu() || fd->memory().size() < uint64_t{pitch} * height) return Fd();
+  *stride = pitch;
+  return fd;
 }
 
 Fd SocketServer::make_event() {

@@ -76,6 +76,7 @@ bool VideoWatcher::latest(uint64_t* sequence, List<uint32_t>* pixels, uint32_t* 
   }
   SharedPointer<VideoFrame> frame = channel_->latest();
   if (!frame || frame->sequence <= *sequence) return false;
+  if (frame->pixels.size() == 0) return false;      // (only in its producer's shared buffers: the frames copied for this watcher come next)
   *sequence = frame->sequence;
   const VideoFormat& f = frame->format;
   VideoFormat shown = f;
