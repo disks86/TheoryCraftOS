@@ -119,6 +119,8 @@ int main(int argc, char** argv) {
   fflush(stdout);
   std::vector<Connection> connections;
   const bool xdnd = getenv("TCOS_XDND") != nullptr;
+  const bool xi2 = getenv("TCOS_XI2") != nullptr;
+  uint32_t touch_step = 0;
   bool desktop_dropped = false;
   uint32_t drag_steps = 0;
   const uint64_t end = now_ms() + seconds * 1000;
@@ -163,6 +165,28 @@ int main(int argc, char** argv) {
       close(connections[i].fd);
       server.close_client(connections[i].client);
       connections.erase(connections.begin() + long(i));
+    }
+    if (xi2 && touch_step < 40) {      // TCOS_XI2: the desktop's touchscreen for tests/x11/xi2_client.c (a finger on "xi2-target" at (30, 40) of it)
+      List<uint32_t> windows(g_allocator);
+      server.windows(&windows);
+      for (uint32_t id : windows.view()) {
+        desktop::WindowsWindowInfo info;
+        String title(g_allocator);
+        if (!server.window_info(id, &info, &title) || title.view() != StringView("xi2-target") || !info.visible) continue;
+        const int32_t x = info.surface.x + 30, y = info.surface.y + 40;
+        if (touch_step == 0) {
+          if (!server.touch(hardware::TouchPhase::Down, 1, id, x, y)) continue;      // (not selected yet: next time)
+          printf("touch down taken\n");
+        } else if (touch_step < 4) {
+          server.touch(hardware::TouchPhase::Motion, 1, 0, x + int32_t(touch_step), y);
+        } else if (touch_step == 4) {
+          server.touch(hardware::TouchPhase::Up, 1, 0, x + 3, y);
+          touch_step = 40;
+          break;
+        }
+        ++touch_step;
+      }
+      fflush(stdout);
     }
     if (xdnd) {      // TCOS_XDND: the desktop's part of tests/x11/xdnd_client.c (its file dragged onto "xdnd-target"; the client's file taken)
       List<uint32_t> windows(g_allocator);

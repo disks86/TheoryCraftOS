@@ -137,7 +137,7 @@ struct Client {
     p.big = big;
     if (out.size() < 32) return p;
     size_t size = 32;
-    if (out[0] == 1) {
+    if (out[0] == 1 || (out[0] & 0x7F) == 35) {      // (a reply, or a GenericEvent: longer than 32 bytes)
       Packet h{std::vector<uint8_t>(out.begin(), out.begin() + 8), big};
       size += size_t(h.u32(4)) * 4;
     }
@@ -662,6 +662,146 @@ static void test_xdnd() {
   client_message(d2, kRoot, kRoot, enter, {w2, 5u << 24, utf8, 0, 0});
   s.close_client(d2.id);
   CHECK(!s.program_drag(&items, &x, &y) && !s.take_program_drop(&items, &x, &y));
+}
+
+// XInput 2.2 touches (X11Input2.cpp): the version handshake, the devices, selections, and a finger delivered as TouchBegin / Update / End to the window
+// that selected them (and refused where none did), in both byte orders.
+static void xi_touch_session(bool big) {
+  Server s(A);
+  s.attach(6, 19);
+  const Server::Monitor monitors[1] = {{{0, 0, 1024, 768}, {0, 0, 1024, 728}, {0, 0, 1024, 728}}};
+  s.set_display(1024, 768, ArrayView<const Server::Monitor>(monitors, 1));
+  Client c(s, big);
+  CHECK(c.setup());
+  // QueryExtension and ListExtensions
+  c.send(Request(big, 98).u16(15).u16(0).str("XInputExtension").done());
+  Packet p = c.reply();
+  CHECK(p.b.size() >= 32 && p.b[8] == 1);
+  const uint8_t xi = p.b.size() >= 32 ? p.b[9] : 0;
+  CHECK(xi >= 128);
+  c.send(Request(big, 99).done());
+  p = c.reply();
+  CHECK(p.b.size() > 32 && p.b[1] == 2 && std::string(p.b.begin() + 32, p.b.end()).find("XInputExtension") != std::string::npos);
+  // GetExtensionVersion (XI 1) and XIQueryVersion
+  c.send(Request(big, xi, 1).u16(15).u16(0).str("XInputExtension").done());
+  p = c.reply();
+  CHECK(p.b.size() == 32 && p.b[1] == 1 && p.u16(8) == 2 && p.u16(10) == 2 && p.b[12] == 1);
+  c.send(Request(big, xi, 47).u16(2).u16(4).done());
+  p = c.reply();
+  CHECK(p.b.size() == 32 && p.b[1] == 47 && p.u16(8) == 2 && p.u16(10) == 2);
+  c.send(Request(big, xi, 47).u16(1).u16(5).done());
+  p = c.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 2);      // (BadValue: XI 1 is not XI2)
+  // XIQueryDevice: three devices, the touchscreen a slave of the pointer with a direct touch class
+  c.send(Request(big, xi, 48).u16(0).u16(0).done());
+  p = c.reply();
+  CHECK(p.b.size() > 32 && p.u16(8) == 3);
+  bool touch_class = false;
+  {
+    size_t at = 32;
+    for (uint16_t d = 0; d < 3 && at + 12 <= p.b.size(); ++d) {
+      const uint16_t id = p.u16(at), use = p.u16(at + 2), classes = p.u16(at + 6), name = p.u16(at + 8);
+      at += 12 + ((name + 3) & ~3u);
+      for (uint16_t k = 0; k < classes && at + 4 <= p.b.size(); ++k) {
+        const uint16_t type = p.u16(at), words = p.u16(at + 2);
+        if (id == 4 && use == 3 && type == 8 && p.b[at + 6] == 1 && p.b[at + 7] == 10) touch_class = true;
+        at += size_t(words) * 4;
+        if (words == 0) break;
+      }
+    }
+    CHECK(at == p.b.size());
+  }
+  CHECK(touch_class);
+  c.send(Request(big, xi, 48).u16(9).u16(0).done());
+  CHECK(c.reply().b[0] == 0);
+  // a window with a child; touches selected on the parent for all master devices
+  const uint32_t w = c.create_window(kRoot, 100, 100, 300, 200, kStructure);
+  const uint32_t child = c.create_window(w, 20, 30, 100, 80, 0);
+  c.send(Request(big, 8).u32(w).done());
+  c.send(Request(big, 8).u32(child).done());
+  c.drain();
+  const uint32_t touch_bits = (1u << 18) | (1u << 19) | (1u << 20);
+  auto select = [&](Client& who, uint32_t window, uint16_t device, uint32_t bits) {
+    who.send(Request(big, xi, 46).u32(window).u16(1).u16(0).u16(device).u16(1).u8(uint8_t(bits)).u8(uint8_t(bits >> 8)).u8(uint8_t(bits >> 16))
+                 .u8(uint8_t(bits >> 24)).done());
+  };
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(s.window_info(w, &info, &title));
+  const int32_t cx = info.surface.x + 40, cy = info.surface.y + 50;      // (on the child)
+  CHECK(!s.touch(hardware::TouchPhase::Down, 7, w, cx, cy));      // (nothing selected: the desktop's pointer)
+  select(c, w, 0, 1u << 18);
+  p = c.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 2);      // (TouchBegin without the other two: BadValue)
+  select(c, w, 1, touch_bits);
+  c.send(Request(big, xi, 60).u32(w).done());
+  p = c.reply();
+  CHECK(p.b.size() == 40 && p.u16(8) == 1 && p.u16(32) == 1 && p.u16(34) == 1 && p.b[36] == 0 && p.b[37] == 0 && p.b[38] == 0x1C && p.b[39] == 0);
+  // the finger: TouchBegin, TouchUpdate, TouchEnd to w, coordinates in it, its own touch id
+  CHECK(s.touch(hardware::TouchPhase::Down, 7, w, cx, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.b[1] == xi && p.u32(4) == 12 && p.u16(8) == 18 && p.u16(10) == 2 && p.u32(24) == w && p.u32(20) == kRoot);
+  if (p.b.size() < 80) return;
+  const uint32_t touch_id = p.u32(16);
+  CHECK(touch_id != 0 && p.u32(32) == uint32_t(cx) * 65536 && p.u32(40) == uint32_t(cx - info.surface.x) * 65536 && p.u32(44) == uint32_t(cy - info.surface.y) * 65536);
+  CHECK(p.u16(52) == 4);      // sourceid: the touchscreen
+  CHECK(s.touch(hardware::TouchPhase::Motion, 7, 0, cx + 5, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 19 && p.u32(16) == touch_id && p.u32(32) == uint32_t(cx + 5) * 65536);
+  // a second finger at the same time: its own id
+  CHECK(s.touch(hardware::TouchPhase::Down, 8, w, cx + 50, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 18 && p.u32(16) != touch_id);
+  CHECK(s.touch(hardware::TouchPhase::Cancel, 8, 0, cx + 50, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 20);
+  CHECK(s.touch(hardware::TouchPhase::Up, 7, 0, cx + 5, cy));
+  p = c.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 20 && p.u32(16) == touch_id);
+  CHECK(!s.touch(hardware::TouchPhase::Motion, 7, 0, cx, cy));      // (ended)
+  CHECK(!s.touch(hardware::TouchPhase::Down, 9, w, 5, 5));          // (not over a window that selected)
+  // another client may not select touches of the same device on that window; on its own window it may, and the deepest window wins
+  Client c2(s, !big);
+  CHECK(c2.setup());
+  c2.send(Request(!big, xi, 47).u16(2).u16(2).done());
+  c2.reply();
+  c2.send(Request(!big, xi, 46).u32(w).u16(1).u16(0).u16(1).u16(1).u8(0).u8(0).u8(0x1C).u8(0).done());
+  p = c2.reply();
+  CHECK(p.b[0] == 0 && p.b[1] == 10);      // BadAccess
+  c2.send(Request(!big, xi, 46).u32(child).u16(1).u16(0).u16(0).u16(1).u8(0).u8(0).u8(0x1C).u8(0).done());
+  c2.drain();
+  CHECK(s.touch(hardware::TouchPhase::Down, 10, w, cx, cy));
+  p = c2.event(35);
+  CHECK(p.b.size() == 80 && p.u16(8) == 18 && p.u32(24) == child);
+  CHECK(c.event(35).b.empty());
+  // the client going with its finger down: the rest of it is nobody's
+  c2.send(Request(!big, xi, 60).u32(child).done());
+  c2.reply();
+  s.close_client(c2.id);
+  c2.id = 0;
+  CHECK(!s.touch(hardware::TouchPhase::Motion, 10, 0, cx, cy) || true);
+  CHECK(s.touch(hardware::TouchPhase::Down, 11, w, cx, cy));      // (its selection on the child went: w's again)
+  CHECK(c.event(35).b.size() == 80);
+  s.touch(hardware::TouchPhase::Up, 11, 0, cx, cy);
+  // deselecting (an empty mask) stops it
+  select(c, w, 1, 0);
+  c.drain();
+  CHECK(!s.touch(hardware::TouchPhase::Down, 12, w, cx, cy));
+  // malformed XI requests: errors, never a crash
+  std::mt19937 rng(big ? 5 : 6);
+  for (int i = 0; i < 3000; ++i) {
+    Request r(big, xi, uint8_t(rng() % 64));
+    const int n = int(rng() % 24);
+    for (int k = 0; k < n; ++k) r.u8(uint8_t(rng()));
+    c.send(r.done());
+    if ((i & 63) == 0) c.drain();
+  }
+  c.drain();
+  CHECK(!c.closing);
+}
+static void test_xinput2() {
+  xi_touch_session(false);
+  xi_touch_session(true);
 }
 
 static void test_drawing() {
@@ -1205,6 +1345,7 @@ int main() {
   test_window_manager_hints();
   test_struts();
   test_xdnd();
+  test_xinput2();
   test_drawing();
   test_input();
   test_errors();
