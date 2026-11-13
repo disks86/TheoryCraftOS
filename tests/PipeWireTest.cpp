@@ -2428,7 +2428,7 @@ static void test_pulse_modules() {
   t = c.command(25, [&](pulse::TagWriter& w) { w.u32(12345); });
   CHECK(find_reply(c.take(), t, &body, &cmd) && cmd == 0);
   // refused: another module, an argument it does not take, a bad value, broken quoting
-  CHECK(!load(c, "module-loopback", "", &error) && error == 5);
+  CHECK(!load(c, "module-ladspa-sink", "", &error) && error == 5);
   CHECK(!load(c, "module-null-sink", "latency_msec=10", &error) && error == 3);
   CHECK(!load(c, "module-null-sink", "rate=fast", &error) && error == 3);
   CHECK(!load(c, "module-null-sink", "rate=100", &error) && error == 3);
@@ -2469,6 +2469,99 @@ static void test_pulse_modules() {
   uint32_t made = 0;
   for (uint32_t k = 0; k < PulseServer::kMaxModules + 2; ++k) made += load(old, "module-null-sink", "", &error) != 0;
   CHECK(made == PulseServer::kMaxModules - 1);
+}
+
+// module-loopback, module-remap-sink and module-combine-sink over null sinks: a tone played into one sink is heard in another sink's monitor through a
+// loopback, a remapped sink's left comes out on its master's right, a combined sink is heard in each of its slaves; a loopback of a sink's monitor into
+// that sink is refused; unloaded, their nodes go.
+static double tone_level(const std::vector<int16_t>& s, uint32_t channels, uint32_t channel, double hz, uint32_t rate);
+static void test_loopback_modules() {
+  FakeDevice dev;
+  audio::AudioMixer mixer(dev, A);
+  CHECK(mixer.initialize());
+  Graph g(A, &mixer);
+  CHECK(g.initialize());
+  g.set_clock(&test_clock);
+  PulseServer server(g, A);
+  WindowsAudioService service(g, A);
+  uint32_t error = 0;
+  auto load = [&](const char* args, const char* module) { return server.load_module(StringView(module), StringView(args), &error); };
+  CHECK(load("sink_name=a", "module-null-sink") && load("sink_name=b", "module-null-sink"));
+  List<uint32_t> sinks(A);
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 2);
+  const uint32_t a = sinks.count() == 2 ? sinks[0] : 0, b = sinks.count() == 2 ? sinks[1] : 0;
+  // plays `left` Hz on the left (and `right` on the right) into `into`, ticks the server, and returns what `from`'s monitor held after the first 0.2 s
+  auto run = [&](uint32_t into, uint32_t from, double left, double right) {
+    uint32_t out = 0, in = 0, taken = 0, got = 0;
+    std::vector<int16_t> heard;
+    if (service.open(40, PcmFormat{SampleFormat::S16Le, 48000, 2}, "player.exe", &out, into) != 0 ||
+        service.open_capture(40, PcmFormat{SampleFormat::S16Le, 48000, 2}, "rec.exe", &in, false, from) != 0)
+      return heard;
+    std::vector<uint8_t> pcm(48000 * 4 * 2);
+    for (uint32_t i = 0; i < 96000; ++i) {
+      const int16_t l = left ? int16_t(8192 * sin(2 * M_PI * left * i / 48000)) : 0, r = right ? int16_t(8192 * sin(2 * M_PI * right * i / 48000)) : 0;
+      pcm[4 * i] = uint8_t(l); pcm[4 * i + 1] = uint8_t(uint16_t(l) >> 8); pcm[4 * i + 2] = uint8_t(r); pcm[4 * i + 3] = uint8_t(uint16_t(r) >> 8);
+    }
+    uint64_t written = 0;
+    std::vector<uint8_t> buf(48000 * 4);
+    for (int i = 0; i < 400 && heard.size() < 2 * 48000; ++i) {
+      if (written < pcm.size() && service.write(40, out, ConstByteView(pcm.data() + written, pcm.size() - written), &taken) == 0) written += taken;
+      g_now_ns += 5000000;
+      server.tick();
+      if (service.read(40, in, ByteView(buf.data(), buf.size()), &got) == 0)
+        for (uint32_t k = 0; k + 1 < got; k += 2) heard.push_back(int16_t(buf[k] | buf[k + 1] << 8));
+    }
+    service.process_exited(40);
+    if (heard.size() > 2 * 9600) heard.erase(heard.begin(), heard.begin() + 2 * 9600);
+    return heard;
+  };
+  // without the loopback: nothing of a in b
+  std::vector<int16_t> none = run(a, b, 500, 500);
+  CHECK(tone_level(none, 2, 0, 500, 48000) < 0.01);      // (b's mixer has nothing to mix: its monitor hears nothing at all)
+  const uint32_t loop = load("source=a.monitor sink=b latency_msec=100", "module-loopback");
+  CHECK(loop != 0);
+  std::vector<int16_t> through = run(a, b, 500, 0);
+  const double l = tone_level(through, 2, 0, 500, 48000), r = tone_level(through, 2, 1, 500, 48000);
+  if (l < 0.2) printf("loopback: left %.3f right %.3f (%zu samples)\n", l, r, through.size());
+  CHECK(through.size() > 2 * 9600 && l > 0.2 && r < 0.01);
+  CHECK(server.unload_module(loop));
+  std::vector<int16_t> after = run(a, b, 500, 500);
+  CHECK(tone_level(after, 2, 0, 500, 48000) < 0.01);
+  // refused: into the sink it records, a sink or source that is not there, a latency out of range
+  CHECK(!load("source=a.monitor sink=a", "module-loopback") && error == 3);
+  CHECK(!load("source=nowhere.monitor sink=b", "module-loopback") && error == 5);
+  CHECK(!load("source=a.monitor sink=nowhere", "module-loopback") && error == 5);
+  CHECK(!load("source=a.monitor sink=b latency_msec=0", "module-loopback") && error == 3);
+  // remap: left into the remapped sink comes out on b's right
+  const uint32_t rm = load("sink_name=swapped master=b channel_map=front-right,front-left", "module-remap-sink");
+  CHECK(rm != 0);
+  sinks.clear();
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 3);
+  const uint32_t swapped = sinks.count() == 3 ? sinks[2] : 0;
+  CHECK(server.module_of(swapped) == rm);
+  std::vector<int16_t> sw = run(swapped, b, 700, 0);
+  const double sl = tone_level(sw, 2, 0, 700, 48000), sr = tone_level(sw, 2, 1, 700, 48000);
+  CHECK(sw.size() > 2 * 9600 && sr > 0.2 && sl < 0.01);
+  CHECK(server.unload_module(rm) && !g.is_virtual_sink(swapped));
+  // combine: one sink heard in both a and b
+  const uint32_t cb = load("sink_name=both slaves=a,b", "module-combine-sink");
+  CHECK(cb != 0);
+  sinks.clear();
+  CHECK(g.virtual_sinks(&sinks) && sinks.count() == 3);
+  const uint32_t both = sinks.count() == 3 ? sinks[2] : 0;
+  std::vector<int16_t> in_a = run(both, a, 900, 900), in_b = run(both, b, 900, 900);
+  CHECK(tone_level(in_a, 2, 0, 900, 48000) > 0.2 && tone_level(in_b, 2, 1, 900, 48000) > 0.2);
+  CHECK(!load("sink_name=x slaves=a,nowhere", "module-combine-sink") && error == 5);
+  CHECK(server.unload_module(cb) && !g.is_virtual_sink(both));
+  // a module's loopbacks are nodes of the kernel's (they show, as pipewire-pulse's do)
+  const uint32_t again = load("source=a.monitor sink=b", "module-loopback");
+  uint32_t loop_nodes = 0;
+  g.for_each([&](const GraphObject& o) { loop_nodes += o.type == ObjectType::Node && o.props.get("node.name") == StringView("loopback"); });
+  CHECK(again && loop_nodes == 2);
+  CHECK(server.unload_module(again));
+  loop_nodes = 0;
+  g.for_each([&](const GraphObject& o) { loop_nodes += o.type == ObjectType::Node && o.props.get("node.name") == StringView("loopback"); });
+  CHECK(loop_nodes == 0);
 }
 
 // A virtual sink's own rate and channels shape what its monitor hears: a mono sink's monitor has both sides averaged (read in stereo, both sides
@@ -6032,6 +6125,7 @@ int main() {
   test_virtual_sink_shape();
   test_module_arguments();
   test_pulse_modules();
+  test_loopback_modules();
   test_camera_sources();
   test_screen_source();
   test_deep_conversion();

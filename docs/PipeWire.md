@@ -36,6 +36,7 @@ program that records, of any kind, gets a record stream of it.
 | Decoding encoded video for raw watchers and the viewer (Motion JPEG itself, the other codecs through `IVideoDecoders`) | `VideoDecode.{hpp,cpp}` |
 | The kernel's own watcher (the desktop's Video Viewer) | `VideoWatcher.{hpp,cpp}`, `src/Desktop/VideoViewer.{hpp,cpp}` |
 | A virtual sink's audio: a mixer of its own over a silent device on the graph's clock | `VirtualSink.hpp` |
+| Audio from a source (or a sink's monitor) into a sink: PulseAudio's loopback, remap-sink and combine-sink modules | `Loopback.{hpp,cpp}` |
 | PulseAudio's native protocol | `PulseServer.{hpp,cpp}` |
 | AF_UNIX listeners and the `pipewire` kernel thread; the memfds and eventfds handed to clients (`IDescriptorMaker`) | `SocketServer.{hpp,cpp}`, `ProtocolServer.hpp` |
 | eventfd, timerfd, epoll and signalfd for Linux programs: descriptors of the AF_UNIX manager (`UnixType::Event`, `Timer`, `Epoll`, `Signal`) | `src/Process/UnixSockets.{hpp,cpp}`, `LinuxSockets.cpp` |
@@ -238,7 +239,12 @@ PLAYBACK_STREAM_KILLED, server/sink/sink-input/client info and lists, sink and s
 STAT, LOOKUP_SINK, LOAD_MODULE / UNLOAD_MODULE / GET_MODULE_INFO(_LIST) for `module-null-sink` (`pactl load-module module-null-sink
 sink_name=... sink_properties=... rate=... channels=... channel_map=...`: a virtual sink as pipewire-pulse makes one, the kernel's, so it stays
 after pactl exits until it is unloaded; module indexes carry pipewire-pulse's 1 << 29 flag; the sink and its monitor name their module, and the
-monitor reports the sink's own format; other modules answer `PA_ERR_NOENTITY`, arguments the module does not take `PA_ERR_INVALID`). Record streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
+monitor reports the sink's own format; other modules answer `PA_ERR_NOENTITY`, arguments the module does not take `PA_ERR_INVALID`), and
+`module-loopback` (source - a source or a sink's monitor - to sink, latency_msec, mono or stereo), `module-remap-sink` (a sink looped into its master,
+left and right exchanged when channel_map and master_channel_map disagree) and `module-combine-sink` (a sink looped into each of its slaves, or the
+speakers and every virtual sink), built on `Loopback.cpp`: a record and a playback stream of the kernel's, what was recorded moved across at each tick
+with about the latency queued (a backlog beyond twice that dropped, the newest kept); a loopback of a sink's monitor into that sink is refused. Record
+streams (create, delete, cork, flush, latency, buffer attributes, name and property updates, RECORD_STREAM_KILLED): the
 server sends what they record on their channel a fragment at a time (`fragsize`, 50 ms by default, 5 to 250 ms), and stops sending to a client that
 does not read (the hub's ring drops the oldest audio instead). Source and source-output info and lists, their volume and mute (SET_SOURCE_OUTPUT_VOLUME
 is command 98: the numbers from 98 on were one off before), kill-source-output, LOOKUP_SOURCE, the default source in the server info, source and
@@ -344,7 +350,8 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   deep YUV frames made again through each other); a mono and a 16 kHz virtual sink's monitor (both sides averaged; a 1 kHz tone kept, 20 kHz
   lost) against a plain one; module arguments (quotes, escapes, PulseAudio property names, truncation and bit flips) and `module-null-sink` over
   the protocol (load, list, info for old and new clients, kept after the client goes, unload, refused modules and arguments, a sink destroyed
-  another way); the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
+  another way); module-loopback, -remap-sink and -combine-sink over null sinks (a tone carried, left made right, both slaves hearing, a loop into its
+  own sink and missing sinks refused, their nodes gone when unloaded); the screen source taking a program's presents over the desktop's frames and giving them back. `DxgkrnlTest` checks the present
   tap (flips and blits handed over, not when unwanted or refused, adapters added after it). Zero-copy: a DMA-BUF camera of three buffers and a
   DMA-BUF watcher (given the camera's very descriptors as DMA-BUFs, read-only; each frame's buffer, nothing read from the images and no pixels in
   the channel; the camera's buffer held until the watcher recycled it, the oldest free one going back; a watcher that did not run let go of the
@@ -372,7 +379,9 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
   PulseAudio reaches the same sink: `pactl` lists it and its monitor and sets its volume, `paplay --device=cli-null` plays into it and `parecord
   --device=cli-null.monitor` must record the tone. `pactl load-module module-null-sink sink_name=pa-null rate=16000 channels=1` must make a mono
   16 kHz sink that `pactl list short modules` and `pactl list sinks` (its description and owner module) show, `pactl load-module module-loopback`
-  must fail, and `pactl unload-module` must take the sink away.
+  must fail, and `pactl unload-module` must take the sink away. Then paplay into one null sink while parecord records another: through
+  `module-loopback` the tone must arrive, through `module-remap-sink` (channel_map reversed) a left-only tone must come out on the right, through
+  `module-combine-sink` a slave must hear it, and unloading must take the modules and their sinks away.
 - `tests/pipewire_emulated.sh [x86_64|aarch64|riscv64] [all|winmm|dsound|record|nullsink|xaudio2|pwnode|libpipewire]`: on the kernel's CPU emulator, `tests/windows/winmmtest.c` (with the
   OS's own DLLs) and `tests/linux/pulsetest.c` (no C library) play at the same time as a native stream; the mix must hold all three tones at once.
   The second run is `tests/windows/dsoundtest.c`: a DirectSound loop (600 Hz) and a WASAPI event-driven client (700 Hz) from one program, with the
@@ -430,8 +439,9 @@ Doppler, LPF and reverb levels, the inter-aural delay) is in the same DLL, as in
 - **Video sources and showing video.** The screen source has no cursor of its own and no damage metadata; when a program and the desktop both
   present, the program's frames win until it has been quiet for 250 ms (the display shows whichever presented last). The Video Viewer shows one
   source at a time.
-- **The adapter's other factories.** Only `support.null-audio-sink` (and PulseAudio's `module-null-sink`, which makes one); no other PulseAudio
-  modules (`module-loopback`, `module-remap-sink`, ...). A virtual sink's mixer works at 48 kHz stereo: streams into it are mixed there and its
+- **The adapter's other factories.** Only `support.null-audio-sink` (and PulseAudio's `module-null-sink`, -loopback, -remap-sink and -combine-sink);
+  no `module-remap-source`, `module-echo-cancel`, `module-ladspa-sink` or the tunnel and network modules. A remap sink only exchanges left and right
+  (no other channel orders or remixing); loopbacks are stereo or mono at 48 kHz, and their latency is not adjusted to drift. A virtual sink's mixer works at 48 kHz stereo: streams into it are mixed there and its
   monitor is made the sink's own format, so what the sink's rate and channels cannot carry is lost, but it is not mixed at that rate.
 - **Recording one stream.** PulseAudio's `direct_on_input` (what pavucontrol's per-stream level meters use) is refused; the monitor holds the whole mix.
 - **More than one source.** The graph follows the hub's one microphone, as the sink follows the mixer's one output (`move-source-output`,

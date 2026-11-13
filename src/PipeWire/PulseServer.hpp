@@ -33,12 +33,15 @@
 // channel, a fragment (fragsize) at a time; source and source-output queries, lists, volume and mute, LOOKUP_SOURCE, and their subscription events.
 // "pactl list source-outputs" shows the Windows programs that record as well. Modules: module-null-sink (LOAD_MODULE makes a virtual sink with
 // sink_name, sink_properties, rate, channels and channel_map, as pipewire-pulse does; it stays until UNLOAD_MODULE, whoever loaded it), listed with
-// GET_MODULE_INFO(_LIST); other modules are refused. Not served (an error answer): upload streams, samples, cards, extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
+// GET_MODULE_INFO(_LIST); and module-loopback (a source or a sink's monitor into a sink, latency_msec), module-remap-sink (a sink looped into its
+// master, left and right swapped when the channel maps say so) and module-combine-sink (a sink looped into each of its slaves), built on
+// Loopback.hpp and pumped from tick(); other modules are refused. Not served (an error answer): upload streams, samples, cards, extensions. The sink's monitor (tcos_output.stereo.monitor, index sink | 1 << 24 as pipewire-pulse numbers it) is a source too: recording it
 // records what the mixer plays (OBS, "record what you hear").
 #pragma once
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
 #include "PipeWire/Graph.hpp"
+#include "PipeWire/Loopback.hpp"
 #include "PipeWire/ProtocolServer.hpp"
 #include "PipeWire/Tagstruct.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -166,11 +169,13 @@ class PulseServer final : public IProtocolServer {
 
  private:
   struct Module {
-    explicit Module(allocators::IAllocator& a) : name(a), arguments(a) {}
+    explicit Module(allocators::IAllocator& a) : name(a), arguments(a), loops(a) {}
     uint32_t index = 0;
-    uint32_t node = 0;      // (module-null-sink: its sink)
+    uint32_t node = 0;      // (module-null-sink, -remap-sink, -combine-sink: its sink; module-loopback: none)
     String name, arguments;
+    List<UniquePointer<Loopback>> loops;      // (module-loopback: one; -remap-sink: into its master; -combine-sink: one a slave)
   };
+  uint32_t module_sink(const Properties& args, const char* default_name, StringView description, uint32_t* error);
   void prune_modules();      // (forgets the ones whose sink went another way: pw-cli destroy, ...)
   void fill_module(pulse::TagWriter& w, uint32_t version, const Module& m);
   List<UniquePointer<Module>> modules_;
