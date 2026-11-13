@@ -17,6 +17,7 @@
  */
 
 // The compositor's core: connections, the wire, objects, the registry and its globals, protocol errors.
+#include "Graphics/DeviceScale.hpp"
 #include "Wayland/WaylandInternal.hpp"
 
 namespace wayland {
@@ -366,11 +367,11 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       g.i(m.x).i(m.y).i(m.w * 254 / 960).i(m.h * 254 / 960).i(0).string("TheoryCraftOS").string("Display").i(0);
       send(c, g);
       Event mode(object, 1);
-      mode.u(3).i(m.w * static_cast<int32_t>(output_scale_)).i(m.h * static_cast<int32_t>(output_scale_)).i(60000);      // current | preferred, 60 Hz, in device pixels
+      mode.u(3).i(graphics::units_to_device(m.w, output_scale_)).i(graphics::units_to_device(m.h, output_scale_)).i(60000);      // current | preferred, 60 Hz, in device pixels
       send(c, mode);
       if (version >= 2) {
         Event scale(object, 3);
-        scale.i(static_cast<int32_t>(output_scale_));      // (HiDPI: the desktop's device pixels per unit)
+        scale.i(static_cast<int32_t>(output_whole_scale()));      // (HiDPI: the whole scale at or above the desktop's; fractional clients ask wp_fractional_scale)
         send(c, scale);
       }
       if (version >= 4) {
@@ -462,7 +463,7 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
         nr->surface = s;
         if (r.version >= 6) {      // (version 6: the scale and transform the client should draw with: the output's)
           Event scale(object, 2);
-          scale.i(static_cast<int32_t>(output_scale_));      // (HiDPI: the desktop's device scale)
+          scale.i(static_cast<int32_t>(output_whole_scale()));      // (HiDPI: the desktop's device scale, rounded up)
           send(c, scale);
           Event transform(object, 3);
           transform.u(0);

@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Graphics/DeviceScale.hpp"
 #include "Process/Win32k/Win32kGdiInternal.hpp"
 
 // Device contexts: creation and state, the Get/Set families, coordinate mapping, world transforms, clipping, device capabilities.
@@ -722,10 +723,10 @@ uint64_t NtGdiRectVisible(Call& c) {
 // ---- Device capabilities.
 
 // (scale, dpi: the caller's DPI virtualization - the screen is in device pixels, an unaware caller sees it the scale smaller at 96 dpi)
-int32_t device_cap(Dc& dc, int32_t cap, uint32_t scale = 1, uint32_t dpi = 96) {
+int32_t device_cap(Dc& dc, int32_t cap, uint32_t scale = 100, uint32_t dpi = 96) {
   Bitmap* bm = nullptr;
   Surface s = dc_surface(dc, &bm);
-  const int32_t sw = int32_t(screen_width() / scale), sh = int32_t(screen_height() / scale);
+  const int32_t sw = graphics::device_to_units(int32_t(screen_width()), scale), sh = graphics::device_to_units(int32_t(screen_height()), scale);
   const int32_t w = s.valid() && dc.memory ? s.width : sw, h = s.valid() && dc.memory ? s.height : sh;
   const uint32_t bpp = s.valid() ? s.bpp : 32;
   switch (cap) {
@@ -763,7 +764,7 @@ int32_t device_cap(Dc& dc, int32_t cap, uint32_t scale = 1, uint32_t dpi = 96) {
 uint64_t NtGdiGetDeviceCaps(Call& c) {
   Dc* dc = dc_arg(c, c.arg32(0));
   if (!dc) return 0;
-  uint32_t scale = 1, dpi = 96;
+  uint32_t scale = 100, dpi = 96;
   caller_dpi(c, &scale, &dpi);
   return ret_i32(device_cap(*dc, c.argi(1), scale, dpi));
 }

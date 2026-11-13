@@ -15,6 +15,7 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+#include "Graphics/DeviceScale.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
 
 // NtUserCallNoParam, NtUserCallOneParam and NtUserCallTwoParam: the multiplexers of the services that need no more than two arguments. The codes are the ones of Wine's
@@ -122,8 +123,9 @@ uint64_t two_param(Call& c) {
     case kMonitorFromRect: {
       Rect r;
       if (!c.read_struct(a, &r)) return c.fail(kErrorNoAccess);
-      const int32_t k = int32_t(user::caller_dpi_scale(c));
-      return monitor_from_rect({r.left * k, r.top * k, r.right * k, r.bottom * k}, uint32_t(b));
+      const uint32_t k = user::caller_dpi_scale(c);
+      auto u = [&](int32_t v) { return graphics::units_to_device(v, k); };
+      return monitor_from_rect({u(r.left), u(r.top), u(r.right), u(r.bottom)}, uint32_t(b));
     }
     case kSetIconParam: {
       uint64_t callback = 0, param = 0;      // struct free_icon_params { UINT64 callback; UINT64 param; }

@@ -101,7 +101,7 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   UniquePointer<WideString> drop_names_;
   bool attached_ = false;
   // HiDPI (DPI virtualization): device pixels per desktop unit, and the desktop's frame in units (win32k gets it in device pixels)
-  uint32_t scale_ = 1;
+  uint32_t scale_ = 100;      // (percent)
   int32_t frame_border_ = 0, frame_title_ = 0;
 };
 

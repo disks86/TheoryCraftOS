@@ -129,12 +129,16 @@ Each batch ends with `done(serial)`, the serial being the number of commits the 
 
 ## Scale, transforms, viewports
 
-The output's scale is the desktop's device scale (HiDPI, see [Display.md](Display.md)): 1, or 2 / 3 / 4 when a monitor is set to that whole scale, which
-makes the desktop draw that many device pixels per unit. It is said by `wl_output.scale` (and a mode of the device size), `wl_surface.preferred_buffer_scale`
-for version 6 surfaces (with `preferred_buffer_transform` normal) and `wp_fractional_scale_v1.preferred_scale` (scale x 120), again to every client when it
-changes. All coordinates stay the desktop's units (input, configure, geometry); only drawing changes: the desktop draws a window on its device renderer
-(`draw_window_scaled`), where a buffer made at the device scale with no transform or viewport lands 1:1 (sharp; a GPU buffer where it is), and any
-other through the affine map below, enlarged by the device scale (a whole enlargement of an upright buffer is not filtered). What a client asks of its buffer is honoured: `set_buffer_transform` (the eight
+The output's scale is the desktop's device scale (HiDPI, see [Display.md](Display.md)): 100 % or the scale a monitor is set to (125 % .. 400 %).
+- **How it is said:** `wp_fractional_scale_v1.preferred_scale` gives it exactly (percent x 120 / 100: 180 at 150 %). `wl_output.scale` and
+  `wl_surface.preferred_buffer_scale` (for version 6 surfaces, with `preferred_buffer_transform` normal) give the whole scale at or above it (2 at
+  150 %). `wl_output`'s mode is the device size. All of it is sent again to every client when the scale changes.
+- **Coordinates** stay the desktop's units (input, configure, geometry). Only drawing changes: the desktop draws a window on its device renderer
+  (`draw_window_scaled`). There, these land 1:1 and are sharp:
+  - a buffer made at a whole device scale, with no transform or viewport (a GPU buffer where it is);
+  - a fractional client's buffer at the exact scale, through its viewport.
+- **Any other buffer** goes through the affine map below, onto the device (a whole enlargement of an upright buffer is not filtered; factors within
+  rounding of a whole number are snapped). What a client asks of its buffer is honoured: `set_buffer_transform` (the eight
 rotations and flips, as Weston maps them), `set_buffer_scale` (1 .. 16; a version 6 surface whose buffer is not a multiple is `invalid_size`) and
 `wp_viewport` (a crop in 24.8 and a destination size, with the protocol's `bad_value`, `bad_size`, `out_of_buffer`, `no_surface`). They decide the
 surface's size (input, the window's size, configure), and the desktop draws the buffer through one affine map (`IRenderer2D::draw_image_transformed`, done
@@ -359,8 +363,8 @@ depends on itself:
   one item and only copies; a client's drag over the desktop is shown and answered from its first item only, and
   takes URIs and text only (no pictures or other types). Windows programs take dropped files (`WM_DROPFILES`, see
   [WindowsUserMode.md](WindowsUserMode.md)), X programs take them through XDND (see [X11.md](X11.md)). Selection and drag serials are not checked.
-- **Scale.** Whole scales only: a monitor at 125 / 150 / 175 % is still drawn at the logical size and stretched, and the preferred scale is never
-  fractional. One scale for every monitor (the largest whole one: a 100 % monitor beside a 200 % one is shown the 2x picture halved). There is one
+- **Scale.** One scale for every monitor (the largest: a 100 % monitor beside a 200 % one is shown the 2x picture halved). A client that does not use
+  `wp_fractional_scale_v1` draws at the whole scale above a fractional one and is resampled (filtered). There is one
   `wl_output` (the primary monitor), and surfaces only get `enter` for it. A cursor surface's mapping is ignored (it is enlarged like the desktop's own).
 - **Window manager.** The window menu has no Move or Size items (the desktop moves windows by their title bar only). A popup's `reactive` flag and parent size are
   ignored. Activation tokens are not tied to the serial of an input event (any client can get one).

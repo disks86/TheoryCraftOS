@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #pragma once
+#include "Graphics/DeviceScale.hpp"
 #include <stdint.h>
 #include "ObjectContainer/List.hpp"
 #include "Process/Win32k/Win32k.hpp"
@@ -89,18 +90,14 @@ struct TopLevelInfo {
   bool dpi_aware = false;    // its surface is in device pixels (else in 96-dpi units: the device scale smaller)
 };
 bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
-// DPI virtualization (Win32kUserDpi.cpp): the desktop's device scale (device pixels per desktop unit, 1 .. 4); takes the lock. A change moves every
+// DPI virtualization (Win32kUserDpi.cpp): the desktop's device scale (percent, 100 .. 400); takes the lock. A change moves every
 // top-level so that it keeps its place in desktop units.
 void set_device_scale_from_desktop(uint32_t scale);
 // For the services outside the window manager: the factor the calling thread's coordinates are divided by (1 when DPI aware or unscaled), and a
 // device-pixel rectangle / point as the caller sees it.
 uint32_t caller_dpi_scale(Call& call);
 gdi::Rect rect_for_caller(Call& call, const gdi::Rect& r);
-inline int32_t dpi_down_value(int32_t v, uint32_t k) {      // device -> units (floor)
-  if (k <= 1) return v;
-  const int32_t d = static_cast<int32_t>(k);
-  return v >= 0 ? v / d : -((-v + d - 1) / d);
-}
+inline int32_t dpi_down_value(int32_t v, uint32_t k) { return graphics::device_to_units(v, k); }      // device -> units (floor; k in percent)
 uint32_t device_scale_locked();
 void top_levels(List<uint32_t>* out);                                      // the visible redirected top-levels, topmost first
 // What the desktop's window does to its top-level: the user moved or sized it (window rectangle, screen coordinates), activated it, asked to close / minimize /

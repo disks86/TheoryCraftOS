@@ -1139,7 +1139,7 @@ void test_dpi_virtualization() {
   desktop::IWindowsSession::Monitor one[1];
   one[0].rect = {0, 0, 1024, 768};
   one[0].work = {0, 0, 1024, 740};
-  one[0].scale = 2;
+  one[0].scale_percent = 200;
   bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
   CHECK(gdi::screen_width() == 2048 && gdi::screen_height() == 1536 && user_misc::system_dpi() == 192);
   // the aware program says so (per-monitor v2)
@@ -1182,7 +1182,7 @@ void test_dpi_virtualization() {
     ss.width = ss.height = ss.pitch = 64;
     graphics::SoftwareRenderer2D r(ss);
     uint32_t dw = 0, dh = 0;
-    CHECK(!bridge.draw_window_scaled(u, r, 0, 0, 2, &dw, &dh));      // (enlarged by the desktop)
+    CHECK(!bridge.draw_window_scaled(u, r, 0, 0, 200, &dw, &dh));      // (enlarged by the desktop)
   }
   // the desktop's mouse in units: its WM_MOUSEMOVE and MSG.pt in its units, GetCursorPos too
   sizes.clear();
@@ -1248,11 +1248,47 @@ void test_dpi_virtualization() {
     ts.height = 1536;
     graphics::SoftwareRenderer2D device(ts);
     uint32_t dw = 0, dh = 0;
-    CHECK(bridge.draw_window_scaled(v, device, 412, 450, 2, &dw, &dh) && dw == (600 - 24) / 2 && dh == (400 - 62) / 2);
+    CHECK(bridge.draw_window_scaled(v, device, 412, 450, 200, &dw, &dh) && dw == (600 - 24) / 2 && dh == (400 - 62) / 2);
+  }
+  // --- 150 %: the mapping rounds units up and device pixels down, so the unaware program still reads back what it set
+  one[0].scale_percent = 150;
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  pump(t);
+  pump(a2);
+  CHECK(gdi::screen_width() == 1536 && user_misc::system_dpi() == 144);
+  CHECK(t.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9}) == 1024);
+  const uint32_t f = t.create("DpiClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 33, 47, 301, 199, 0, 0, "Fractional");
+  CHECK(f != 0);
+  pump(t);
+  wr = t.window_rect(f);
+  CHECK(wr.l == 33 && wr.t == 47 && wr.r == 334 && wr.b == 246);
+  {
+    user::Window* w = user::find_window(f);
+    CHECK(w && w->bounds.left == 50 && w->bounds.top == 71 && w->bounds.right == 50 + 452);      // (ceil(33 x 1.5), ceil(47 x 1.5), and the width ceil(301 x 1.5))
+  }
+  CHECK(t.svc32(N::NtUserSetWindowPos, {f, 0, 7, 9, 251, 151, 0x14}) == 1);
+  pump(t);
+  wr = t.window_rect(f);
+  CHECK(wr.l == 7 && wr.t == 9 && wr.r == 258 && wr.b == 160);
+  CHECK(bridge.window_info(f, &info, nullptr) && info.window.x == 7 && info.window.y == 9 && info.window.width == 251);
+  CHECK(user::top_level_info(f, &ti, nullptr) && gdi::window_surface_size(ti.surface_id, &sw, &sh));
+  cr = t.client_rect(f);
+  CHECK(int32_t(sw) >= cr.r && int32_t(sw) <= cr.r + 1);      // (its surface covers its client area in its units)
+  bridge.mouse_position(info.surface.x + 10, info.surface.y + 12);
+  {
+    Th::M m;
+    bool got = false;
+    for (int i = 0; i < 16 && t.peek(&m); ++i)
+      if (m.message == WM_MOUSEMOVE && m.hwnd == f) {
+        got = true;
+        const int32_t lx = int16_t(m.lparam & 0xFFFF), ly = int16_t((m.lparam >> 16) & 0xFFFF);
+        CHECK(lx >= 9 && lx <= 10 && ly >= 11 && ly <= 12);      // (a unit, give or take the rounding of the client origin)
+      }
+    CHECK(got);
   }
   bridge.detach();
-  one[0].scale = 1;
-  user::set_device_scale_from_desktop(1);
+  one[0].scale_percent = 100;
+  user::set_device_scale_from_desktop(100);
   user::reset_state();
   gdi::shutdown();
 }

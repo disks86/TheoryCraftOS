@@ -83,7 +83,7 @@ uint64_t create_step(Call& call, Op& op) {
       op.phase = 21;
       if (!has_proc) return create_step(call, op);
       const uint32_t k = window_scale(w);      // (in the window's coordinates; an aware window's metrics at the system's dpi)
-      const uint32_t dpi = k > 1 ? 96 : 96 * device_scale();
+      const uint32_t dpi = k > 100 ? 96 : 96 * device_scale() / 100;
       const Rect max = dpi_down(window_maximized_rect(w), k);
       gdi::Rect none{0, 0, 0, 0};
       adjust_window_rect(&none, w->style, w->ex_style, false, 0);      // (the frame, as negative left and top)

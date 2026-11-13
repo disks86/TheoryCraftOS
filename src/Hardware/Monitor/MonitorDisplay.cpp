@@ -17,6 +17,7 @@
  */
 
 #include "Hardware/Monitor/MonitorDisplay.hpp"
+#include "Graphics/DeviceScale.hpp"
 
 namespace hardware {
 
@@ -30,8 +31,8 @@ void MonitorDisplay::release() {
   count_ = 0;
 }
 
-bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_scale) {
-  const uint32_t k = render_scale < 1 ? 1 : render_scale > 4 ? 4 : render_scale;
+bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, uint32_t render_percent) {
+  const uint32_t k = graphics::clamp_scale_percent(render_percent);
   Entry fresh[MonitorLayout::kMaxMonitors];
   uint32_t n = 0;
   uint64_t map_words = 0;
@@ -46,11 +47,11 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
       if (physical[k].connector == s.id) place = &physical[k];
     if (!place || n >= MonitorLayout::kMaxMonitors || place->width == 0 || place->height == 0) return false;
     Entry& e = fresh[n++];
-    e.lx = s.rect.x * static_cast<int32_t>(k);      // (in the desktop's pictures: the layout times the render scale)
-    e.ly = s.rect.y * static_cast<int32_t>(k);
-    e.lw = s.rect.width * k;
-    e.lh = s.rect.height * k;
-    e.unit = 100 * k;
+    e.lx = graphics::units_to_device(s.rect.x, k);      // (in the desktop's pictures: the layout at the render scale, mapped by its edges)
+    e.ly = graphics::units_to_device(s.rect.y, k);
+    e.lw = graphics::units_span_to_device(s.rect.x, s.rect.width, k);
+    e.lh = graphics::units_span_to_device(s.rect.y, s.rect.height, k);
+    e.unit = k;
     e.px = place->x;
     e.py = place->y;
     e.pw = place->width;
@@ -92,7 +93,7 @@ bool MonitorDisplay::update(const MonitorLayout& layout, const ScanoutPlacement*
   width_ = static_cast<uint32_t>(right);
   height_ = static_cast<uint32_t>(bottom);
   scaling_ = scaling;
-  render_scale_ = k;
+  render_percent_ = k;
   return true;
 }
 

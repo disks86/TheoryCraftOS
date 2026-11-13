@@ -27,21 +27,21 @@
 namespace process::win32k::user {
 
 namespace {
-uint32_t g_device_scale = 1;
+uint32_t g_device_scale = 100;      // (percent)
 }  // namespace
 
 uint32_t device_scale() { return g_device_scale; }
 
 void set_device_scale(uint32_t scale) {
-  g_device_scale = scale < 1 ? 1 : scale > 4 ? 4 : scale;
-  user_misc::set_system_dpi(96 * g_device_scale);
+  g_device_scale = graphics::clamp_scale_percent(scale);
+  user_misc::set_system_dpi(96 * g_device_scale / 100);
 }
 
-uint32_t window_scale(const Window* w) { return w && w->dpi_virtual ? g_device_scale : 1; }
+uint32_t window_scale(const Window* w) { return w && w->dpi_virtual ? g_device_scale : 100; }
 
 bool thread_unaware(Call& call) { return user_misc::dpi_awareness(call.tid(), call.pid()) == 0; }
 
-uint32_t caller_scale(Call& call) { return g_device_scale > 1 && thread_unaware(call) ? g_device_scale : 1; }
+uint32_t caller_scale(Call& call) { return g_device_scale > 100 && thread_unaware(call) ? g_device_scale : 100; }
 uint32_t caller_dpi_scale(Call& call) { return caller_scale(call); }
 gdi::Rect rect_for_caller(Call& call, const gdi::Rect& r) { return dpi_down(r, caller_scale(call)); }
 
@@ -57,7 +57,7 @@ uint32_t device_scale_locked() { return g_device_scale; }
 
 void set_device_scale_from_desktop(uint32_t scale) {
   List<uint32_t> tops(*system_allocator());
-  uint32_t before = 1, after = 1;
+  uint32_t before = 100, after = 100;
   {
     LockGuard g;
     before = g_device_scale;

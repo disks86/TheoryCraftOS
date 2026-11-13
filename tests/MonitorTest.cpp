@@ -403,7 +403,7 @@ static void test_monitor_display() {
     // HiDPI: the desktop drawn at twice the layout (render scale 2). A 200 % monitor shows it 1:1, one copy; a 100 % monitor beside it every other
     // pixel; a 300 % one at 3/2.
     CHECK(scaled.set_mode(0, 800, 400, 200));
-    CHECK(zoom.update(scaled, one, 1, 2) && !zoom.scaling() && zoom.render_scale() == 2 && zoom.width() == 800 && zoom.height() == 400);
+    CHECK(zoom.update(scaled, one, 1, 200) && !zoom.scaling() && zoom.render_percent() == 200 && zoom.width() == 800 && zoom.height() == 400);
     std::vector<uint32_t> sharp = desktop_picture(800, 400);
     gpu2.blits = 0;
     zoom.blit(0, 0, 800, 400, sharp.data(), 800);
@@ -415,7 +415,7 @@ static void test_monitor_display() {
     gpu3.w = 1200;
     gpu3.h = 400;
     MonitorDisplay both(gpu3, a);
-    CHECK(both.update(mixed, two, 2, 2) && both.scaling() && both.width() == 1600 && both.height() == 600);
+    CHECK(both.update(mixed, two, 2, 200) && both.scaling() && both.width() == 1600 && both.height() == 600);
     std::vector<uint32_t> wide = desktop_picture(1600, 600);
     both.blit(0, 0, 1600, 600, wide.data(), 1600);
     CHECK(gpu3.screen[size_t{3} * 1200 + 5] == pixel_of(5, 3));                          // A: 1:1
@@ -426,10 +426,17 @@ static void test_monitor_display() {
     both.blit(820, 40, 4, 2, wide.data() + 40 * 1600 + 820, 1600);
     CHECK(gpu3.screen[size_t{20} * 1200 + 810] == pixel_of(820, 40) && gpu3.screen[size_t{20} * 1200 + 811] == pixel_of(822, 40) && gpu3.screen[size_t{20} * 1200 + 812] == 0);
     CHECK(scaled.set_mode(0, 800, 400, 300) && scaled.at(0).rect.width == 266);
-    CHECK(zoom.update(scaled, one, 1, 2) && zoom.scaling() && zoom.width() == 532);
+    CHECK(zoom.update(scaled, one, 1, 200) && zoom.scaling() && zoom.width() == 532);
     std::vector<uint32_t> third = desktop_picture(532, 266);
     zoom.blit(0, 0, 532, 266, third.data(), 532);
     CHECK(gpu2.screen[0] == pixel_of(0, 0) && gpu2.screen[3] == pixel_of(2, 0) && gpu2.screen[799] == pixel_of(531, 0));
+    // fractional: 150 % drawn at 150 % (800x400 pixels, a layout of 533x266 units): one copy, 1:1
+    CHECK(scaled.set_mode(0, 800, 400, 150) && scaled.at(0).rect.width == 533);
+    CHECK(zoom.update(scaled, one, 1, 150) && zoom.width() == 800 && zoom.height() == 399);      // (266 units are 399 rows: the last row of the 400 stays as it was)
+    std::vector<uint32_t> native = desktop_picture(800, 399);
+    gpu2.blits = 0;
+    zoom.blit(0, 0, 800, 399, native.data(), 800);
+    CHECK(gpu2.blits == 1 && gpu2.screen[1] == pixel_of(1, 0) && gpu2.screen[size_t{398} * 800 + 799] == pixel_of(799, 398));
   }
   CHECK(a.live == 0);
 }
@@ -443,7 +450,7 @@ static void test_system_monitors() {
     m.initialize();
     CHECK(m.count() == 1 && strcmp(m.monitor(0).name(), "Display") == 0 && m.layout().count() == 1 && m.layout().bounds() == MonitorRect({0, 0, 1024, 768}));
     CHECK(!m.multi_display() && m.apply() && m.desktop_width() == 1024 && m.desktop_height() == 768);
-    CHECK(m.render_scale() == 1);
+    CHECK(m.render_percent() == 100);
     SystemMonitors none(nullptr, a);
     none.initialize();
     CHECK(none.count() == 0 && none.layout().count() == 0);

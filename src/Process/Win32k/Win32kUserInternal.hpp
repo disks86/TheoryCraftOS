@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #pragma once
+#include "Graphics/DeviceScale.hpp"
 // The window manager's private state and the functions its source files share (see docs/win32k/User.md). Everything here is guarded by the system lock.
 #include <stdint.h>
 #include "ObjectContainer/Hive.hpp"
@@ -488,8 +489,8 @@ struct State {
   uint32_t double_click_ms = 500;
 };
 
-// ---- DPI virtualization (Win32kUserDpi.cpp). win32k works in device pixels: the desktop's units times the device scale (1 .. 4, from the desktop's
-// monitors). A DPI-unaware thread, and the windows it made, see 96-dpi coordinates: every coordinate crossing to or from them is divided (floor) or
+// ---- DPI virtualization (Win32kUserDpi.cpp). win32k works in device pixels: the desktop's units at the device scale (a percentage, 100 .. 400, from the
+// desktop's monitors). A DPI-unaware thread, and the windows it made, see 96-dpi coordinates: every coordinate crossing to or from them is divided (floor) or
 // multiplied by the scale, so what such a program sets it reads back unchanged. Aware threads and their windows see device pixels. With scale 1 all of
 // it is the identity.
 uint32_t device_scale();
@@ -498,22 +499,14 @@ void set_device_scale(uint32_t scale);
 uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (1 for an aware window, or with scale 1)
 uint32_t caller_scale(Call& call);              // the same for the calling thread
 bool thread_unaware(Call& call);
-inline int32_t dpi_down(int32_t v, uint32_t k) {      // device -> virtual (floor)
-  if (k <= 1) return v;
-  const int32_t d = static_cast<int32_t>(k);
-  return v >= 0 ? v / d : -((-v + d - 1) / d);
-}
-inline int32_t dpi_up(int32_t v, uint32_t k) {        // virtual -> device (saturating)
-  if (k <= 1) return v;
-  const int64_t r = int64_t{v} * k;
-  return r > INT32_MAX ? INT32_MAX : r < INT32_MIN ? INT32_MIN : static_cast<int32_t>(r);
-}
+// (k: the scale in percent, 100 = none; Graphics/DeviceScale.hpp's mapping, so that the desktop and win32k agree to the pixel)
+inline int32_t dpi_down(int32_t v, uint32_t k) { return graphics::device_to_units(v, k); }      // device -> virtual (floor)
+inline int32_t dpi_up(int32_t v, uint32_t k) { return graphics::units_to_device(v, k); }        // virtual -> device (ceil, saturating)
 inline Rect dpi_down(const Rect& r, uint32_t k) { return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.right, k), dpi_down(r.bottom, k)}; }
 inline Rect dpi_up(const Rect& r, uint32_t k) { return {dpi_up(r.left, k), dpi_up(r.top, k), dpi_up(r.right, k), dpi_up(r.bottom, k)}; }
 inline Rect dpi_cover(const Rect& r, uint32_t k) {      // device -> virtual, covering every device pixel of it (the far edges rounded up)
-  if (k <= 1) return r;
-  const int32_t d = static_cast<int32_t>(k);
-  return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.right + d - 1, k), dpi_down(r.bottom + d - 1, k)};
+  if (k <= 100) return r;
+  return {dpi_down(r.left, k), dpi_down(r.top, k), graphics::device_to_units_up(r.right, k), graphics::device_to_units_up(r.bottom, k)};
 }
 
 // ---- Accessors (Win32kUser.cpp).

@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Win32Windows.hpp"
+#include "Graphics/DeviceScale.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Painter.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -38,8 +39,8 @@ WindowsRect windows_rect(const gui::Rect2D& r) { return {r.x, r.y, r.width, r.he
 void Win32WindowView::paint(gui::Painter& painter) {
   uint32_t w = 0, h = 0;
   graphics::IRenderer2D& r = painter.renderer();
-  const uint32_t k = r.pixel_scale();
-  const bool sharp = k > 1 && session_.draw_window_scaled(window_, r.device(), painter.origin_x() * static_cast<int32_t>(k), painter.origin_y() * static_cast<int32_t>(k), k, &w, &h);
+  const uint32_t k = r.scale_percent();
+  const bool sharp = k > 100 && session_.draw_window_scaled(window_, r.device(), graphics::units_to_device(painter.origin_x(), k), graphics::units_to_device(painter.origin_y(), k), k, &w, &h);
   if (!sharp && !session_.draw_window(window_, r, painter.origin_x(), painter.origin_y(), &w, &h)) w = h = 0;
   // what the surface does not cover yet (the frame was sized and the program has not caught up): black
   if (bounds_.width > w) painter.fill({static_cast<int32_t>(w), 0, bounds_.width - w, bounds_.height}, 0xFF000000u);
@@ -199,12 +200,12 @@ void Win32Windows::pump(gui::WindowManager& manager) {
   uint32_t monitor_count = 0;
   gui::Rect2D bounds;
   bool send = false;
-  uint32_t scale = 1;
+  uint32_t scale = 100;
   {
     gui::UiGuard lock(&manager);
     bounds = manager.bounds();
     if (bounds.width == 0 || bounds.height == 0) return;
-    scale = manager.window() ? manager.window()->pixel_scale() : 1;
+    scale = manager.window() ? manager.window()->scale_percent() : 100;
     send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_;
     if (send) {
       const gui::Point o = manager.window_origin();
@@ -214,7 +215,7 @@ void Win32Windows::pump(gui::WindowManager& manager) {
         const gui::Rect2D full = {a.x - o.x, a.y - o.y, a.width, a.height};
         monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, windows_rect(manager.without_reserved(full)), windows_rect(full)};
       }
-      for (uint32_t i = 0; i < monitor_count; ++i) monitors[i].scale = scale;
+      for (uint32_t i = 0; i < monitor_count; ++i) monitors[i].scale_percent = scale;
       sent_scale_ = scale;
       display_sent_ = true;
       sent_bounds_ = bounds;

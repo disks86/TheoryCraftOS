@@ -99,10 +99,7 @@ bool make_dc_geometry(Window* w, const WinDc& d, int32_t* ox, int32_t* oy, List<
     *ox = dpi_down(*ox, k) - s.left;
     *oy = dpi_down(*oy, k) - s.top;
     for (Rect& r : *clip) {
-      if (k > 1) {      // (covering what it covered: the far edges rounded up)
-        const int32_t d = static_cast<int32_t>(k);
-        r = {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.right + d - 1, k), dpi_down(r.bottom + d - 1, k)};
-      }
+      r = dpi_cover(r, k);      // (covering what it covered: the far edges rounded up)
       r = rect_offset(r, -s.left, -s.top);
     }
     *surface = top->surface;
@@ -316,7 +313,7 @@ uint64_t invalidate_impl(Call& call, bool is_rgn, bool validate) {
   } else if (!rects_from_args(call, 1, kNoArg, &rects, &whole)) return 0;
   {      // (an unaware caller's 96-dpi units into device pixels)
     const uint32_t k = caller_scale(call);
-    if (k > 1) for (Rect& r : rects) r = dpi_up(r, k);
+    if (k > 100) for (Rect& r : rects) r = dpi_up(r, k);
   }
   const bool erase = !validate && call.arg_bool(2);
   auto apply = [&](Window* w) {
@@ -354,7 +351,7 @@ Upcall* queue_erase(Call& call, Op* op, Window* w, uint32_t* dc_out) {
   region_copy(area, w->update);
   {      // (the DC is in the window's coordinates)
     const uint32_t k = window_scale(w);
-    if (k > 1) for (Rect& r : area) r = dpi_cover(r, k);
+    if (k > 100) for (Rect& r : area) r = dpi_cover(r, k);
   }
   const uint32_t dc = create_window_dc(call, w, false, (w->style & wn::WS_CLIPCHILDREN) != 0, (w->style & wn::WS_CLIPSIBLINGS) != 0, &area, false);
   *dc_out = dc;
@@ -406,7 +403,7 @@ uint64_t nt_get_update_rgn(Call& call) {
     const uint32_t k = caller_scale(call);
     List<Rect> rects(S().alloc);
     region_copy(rects, w->update);
-    if (k > 1) for (Rect& r : rects) r = dpi_cover(r, k);
+    if (k > 100) for (Rect& r : rects) r = dpi_cover(r, k);
     if (!gdi::replace_region(call.arg32(1), rects.view())) return 0;
   }
   const uint64_t type = w->update.count() == 0 ? 1 : w->update.count() == 1 ? 2 : 3;
@@ -441,7 +438,7 @@ uint64_t begin_paint_step(Call& call, Op& op) {
     region_copy(area, w->update);
     {      // (the DC is in the window's coordinates)
       const uint32_t k = window_scale(w);
-      if (k > 1) for (Rect& r : area) r = dpi_cover(r, k);
+      if (k > 100) for (Rect& r : area) r = dpi_cover(r, k);
     }
     const uint32_t dc = create_window_dc(call, w, false, (w->style & wn::WS_CLIPCHILDREN) != 0, (w->style & wn::WS_CLIPSIBLINGS) != 0, &area, false);
     if (dc == 0) return 0;
@@ -561,7 +558,7 @@ uint64_t nt_redraw_window(Call& call) {
   } else whole = true;
   {
     const uint32_t k = caller_scale(call);
-    if (k > 1) for (Rect& r : rects) r = dpi_up(r, k);
+    if (k > 100) for (Rect& r : rects) r = dpi_up(r, k);
   }
   const bool children = (flags & wn::RDW_ALLCHILDREN) != 0;
   List<uint32_t> targets(S().alloc);

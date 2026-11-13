@@ -57,7 +57,7 @@ class Window final : public Control {
   // Draws from now on with `renderer` (whose extent becomes the window's size): for a screen that changed its size. Nothing may be rendering
   // meanwhile (stop the RenderLoop first), and the old renderer may be destroyed afterwards. The controls are laid out again.
   void set_renderer(graphics::IRenderer2D& renderer);
-  uint32_t pixel_scale() const { return renderer_ ? renderer_->pixel_scale() : 1; }      // device pixels per unit (HiDPI)
+  uint32_t scale_percent() const { return renderer_ ? renderer_->scale_percent() : 100; }      // the device's scale (HiDPI)
   // The title bar is drawn when the title is not empty.
   void set_title(StringView title);
   static constexpr int32_t kTitleHeight = 20;
