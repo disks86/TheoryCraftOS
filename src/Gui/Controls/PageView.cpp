@@ -30,7 +30,8 @@ constexpr uint8_t kPageUp = 0x4B, kPageDown = 0x4E, kHome = 0x4A, kEnd = 0x4D, k
 }  // namespace
 
 PageView::PageView(allocators::IAllocator& allocator)
-    : Control(allocator), layout_(allocator), scroll_bar_(allocator, Orientation::Vertical), clicked_link_(allocator), hovered_link_(allocator) {
+    : Control(allocator), layout_(allocator), scroll_bar_(allocator, Orientation::Vertical), clicked_link_(allocator), hovered_link_(allocator),
+      raster_(allocator) {
   scroll_bar_.on_value_changed(Handler::immediate(&PageView::scroll_changed, this));
   add(&scroll_bar_);
   static uint64_t next_layer_key = 0;
@@ -53,11 +54,13 @@ void PageView::invalidate_objects(ArrayView<const uint32_t> nodes) {
   invalidate();
 }
 
-PageView::~PageView() {}
+PageView::~PageView() { raster_.stop(); }
+
+void PageView::raster_ready(void* self) { static_cast<PageView*>(self)->invalidate(); }   // (on the drawing thread: invalidate only flags the window)
 
 void PageView::set_picture(UniquePointer<browser::PagePicture> picture, bool keep_scroll) {
   UiGuard lock(this);
-  picture_ = util::move(picture);
+  picture_ = SharedPointer<browser::PagePicture>::from(util::move(picture));
   ++content_version_;
   changed_object_count_ = 0;
   document_ = UniquePointer<browser::HtmlDocument>();
@@ -414,57 +417,11 @@ static bool is_dark(uint32_t color) {
   return (r * 299 + g * 587 + b * 114) / 1000 < 128;
 }
 
-// Where the objects named by changed_objects_ are drawn, in frame coordinates, inside `layer`: the union of their rectangles (an object under a transform
-// or a filter counts with the bounds of the outermost one, which is where it can show). False if none of them is in the picture.
-bool PageView::changed_objects_area(int32_t left, int32_t top, const graphics::Rect2D& layer, graphics::Rect2D* area) const {
-  const paint::DisplayList& list = picture_->list;
-  int64_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
-  bool any = false;
-  uint32_t nesting = 0;   // open transforms and filters
-  paint::IRect outer;     // the outermost one's bounds
-  for (uint64_t i = 0; i < list.count(); ++i) {
-    const paint::Op& op = list.op(i);
-    if (op.kind == paint::OpKind::PushTransform || op.kind == paint::OpKind::PushFilter) {
-      if (nesting++ == 0) outer = op.rect;
-      continue;
-    }
-    if (op.kind == paint::OpKind::PopTransform || op.kind == paint::OpKind::PopFilter) {
-      if (nesting) --nesting;
-      continue;
-    }
-    if (op.kind != paint::OpKind::Object) continue;
-    bool wanted = false;
-    for (uint32_t c = 0; c < changed_object_count_ && !wanted; ++c) wanted = changed_objects_[c] == op.node;
-    if (!wanted) continue;
-    const paint::IRect& rect = nesting ? outer : op.rect;
-    if (rect.empty()) continue;
-    const int64_t x0 = int64_t{left} + rect.x, y0 = int64_t{top} - scroll_y_ + rect.y;
-    const int64_t x1 = x0 + rect.width, y1 = y0 + rect.height;
-    if (!any) ax0 = x0, ay0 = y0, ax1 = x1, ay1 = y1;
-    else {
-      if (x0 < ax0) ax0 = x0;
-      if (y0 < ay0) ay0 = y0;
-      if (x1 > ax1) ax1 = x1;
-      if (y1 > ay1) ay1 = y1;
-    }
-    any = true;
-  }
-  if (!any) return false;
-  // (inside the layer, so the numbers fit)
-  const int64_t lx1 = int64_t{layer.x} + layer.width, ly1 = int64_t{layer.y} + layer.height;
-  if (ax0 < layer.x) ax0 = layer.x;
-  if (ay0 < layer.y) ay0 = layer.y;
-  if (ax1 > lx1) ax1 = lx1;
-  if (ay1 > ly1) ay1 = ly1;
-  if (ax1 <= ax0 || ay1 <= ay0) return false;
-  *area = {static_cast<int32_t>(ax0), static_cast<int32_t>(ay0), static_cast<uint32_t>(ax1 - ax0), static_cast<uint32_t>(ay1 - ay0)};
-  return true;
-}
-
 bool PageView::update_layer(graphics::IRenderer2D& r, const graphics::Rect2D& layer, int32_t left, int32_t top, uint32_t paper, bool full) {
   graphics::Rect2D area = layer;
   if (!full) {
-    const bool any = changed_object_count_ != 0 && changed_objects_area(left, top, layer, &area);
+    const bool any = changed_object_count_ != 0 &&
+                     changed_objects_area(picture_->list, ArrayView<const uint32_t>(changed_objects_, changed_object_count_), left, top - scroll_y_, layer, &area);
     changed_object_count_ = 0;
     if (!any) return true;   // (nothing to draw again: the layer as it is)
   }
@@ -482,6 +439,56 @@ bool PageView::update_layer(graphics::IRenderer2D& r, const graphics::Rect2D& la
     changed_object_count_ = 0;
   }
   return true;
+}
+
+bool PageView::paint_from_thread(graphics::IRenderer2D& r, const graphics::Rect2D& layer, uint32_t paper) {
+  if (!raster_.running()) {
+    if (raster_tried_) return false;
+    raster_tried_ = true;
+    raster_.set_object_painter(objects_);
+    if (!raster_.start(&PageView::raster_ready, this)) return false;
+  }
+  // a drawing when something changed: a new picture, a scroll, a new size, or objects whose pictures changed
+  if (asked_version_ != content_version_ || asked_scroll_ != scroll_y_ || asked_w_ != layer.width || asked_h_ != layer.height || changed_object_count_) {
+    raster_.request(picture_, content_version_, scroll_y_, layer.width, layer.height, paper, ArrayView<const uint32_t>(changed_objects_, changed_object_count_));
+    asked_version_ = content_version_;
+    asked_scroll_ = scroll_y_;
+    asked_w_ = layer.width;
+    asked_h_ = layer.height;
+    changed_object_count_ = 0;
+  }
+  // What it finished goes into the retained layer (only the part that changed); the layer is laid on the frame. A renderer that keeps no layers gets
+  // the whole finished picture every frame.
+  auto upload = [&](const graphics::Surface& front, const graphics::Rect2D& damage) {
+    if (front.width != layer.width || front.height != layer.height) return;   // (a drawing of the old size: the new one follows)
+    const graphics::Rect2D whole{0, 0, front.width, front.height};
+    graphics::Rect2D source = damage;
+    if (!layers_unsupported_) {
+      bool fresh = false;
+      if (r.begin_retained(layer_key_, layer, {layer.x + damage.x, layer.y + damage.y, damage.width, damage.height}, &fresh)) {
+        if (fresh) source = whole;
+        r.set_blend(graphics::BlendMode::Replace);
+        r.draw_image(front, source, layer.x + source.x, layer.y + source.y);
+        r.set_blend(graphics::BlendMode::Alpha);
+        r.end_retained();
+        return;
+      }
+      layers_unsupported_ = true;
+    }
+    r.set_blend(graphics::BlendMode::Replace);
+    r.draw_image(front, whole, layer.x, layer.y);
+    r.set_blend(graphics::BlendMode::Alpha);
+  };
+  if (layers_unsupported_) {
+    raster_.take(true, upload);
+    return true;
+  }
+  raster_.take(false, upload);
+  if (!layers_unsupported_ && !r.draw_retained(layer_key_, layer)) {   // (the layer was dropped, or the renderer is new: the whole finished picture again)
+    raster_.take(true, upload);
+    if (!layers_unsupported_) r.draw_retained(layer_key_, layer);
+  }
+  return true;   // (until the first drawing is finished the page is its paper)
 }
 
 void PageView::paint(Painter& painter) {
@@ -506,6 +513,7 @@ void PageView::paint(Painter& painter) {
     graphics::IRenderer2D& r = painter.renderer();
     const graphics::Rect2D layer{left, top, static_cast<uint32_t>(usable), bounds_.height};
     const uint32_t opaque_paper = paper | 0xFF000000u;   // (the layer is laid on as it is: it must be opaque)
+    if (paint_from_thread(r, layer, opaque_paper)) return;
     const bool full = drawn_version_ != content_version_ || drawn_scroll_ != scroll_y_;
     bool laid = false;
     if (update_layer(r, layer, left, top, opaque_paper, full)) {

@@ -695,6 +695,7 @@ add_executable(BOOTX64
   src/Gui/Controls/BreadcrumbBar.cpp
   src/Gui/Controls/SpreadsheetGrid.cpp
   src/Gui/Controls/PageView.cpp
+  src/Gui/Controls/PageRasterizer.cpp
   src/Gui/Controls/TextEditor.cpp
   src/Gui/Controls/ImageView.cpp
   src/Gui/Controls/AudioPlayerControl.cpp
