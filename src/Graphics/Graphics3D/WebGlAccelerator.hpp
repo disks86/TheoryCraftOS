@@ -53,6 +53,7 @@ class WebGlAccelerator final : public webgl::IAccelerator {
   bool clear(uint32_t target, bool color, const float rgba[4], bool depth, float depth_value) override;
   bool draw(uint32_t target, uint32_t program, const webgl::AccelState& state, ConstByteView vertices, uint32_t vertex_count, ConstByteView constants) override;
   bool read_color(uint32_t target, ByteView rgba) override;
+  bool write_color(uint32_t target, ConstByteView rgba) override;
 
  private:
   // A pipeline of a program for one state: the pipeline state of an AccelState packed into a key.

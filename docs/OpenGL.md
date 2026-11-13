@@ -50,6 +50,10 @@ What it reports: `GL_VERSION` "3.3.0 Compatibility Profile", `GL_SHADING_LANGUAG
   contexts, a 3.3 core context, swaps) and Wine's `opengl32` test (`tests/windows/wine/opengl32`, 4111 checks, 299 failing when written).
   Build the program into `build/winetests/opengl32_own.exe` (`x86_64-w64-mingw32-gcc -O1 -o build/winetests/opengl32_own.exe tests/windows/opengltest.c -lopengl32 -lgdi32 -luser32`)
   and run `scripts/winetest.sh opengl32 own opengl` from a short path (a symlink to the checkout, with `build` a symlink to a build directory configured from it).
+- piglit's `.shader_test` files (`PiglitShaderTest`, fetched by `tests/fetch_piglit.sh`; run it from the checkout so it finds `tests/data/piglit/shader_test.xfail`).
+  `--accel-survey` counts the draws the 3D hardware would take (the CPU still draws). `--accel-machine` draws on the reference device of `tests/TgsiAccel.hpp`:
+  the translated TGSI run by `tests/TgsiMachine.hpp`, so a test that passes on the CPU and not there ("differs from the CPU") is a translation bug. It is slow
+  (the machine reads the shader text for every pixel), so use `--filter`.
 
 ## Linux: EGL and OpenGL ES
 
@@ -126,8 +130,9 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   (`in vec4 v[][2]`, a block member array, `gl_in[].gl_ClipDistance`) put each vertex's elements in consecutive registers; the front end's flat index
   `i * inner + j` is decomposed again for a control stage's own point (`x[gl_InvocationID][j]`, `j` a variable too). `gl_in[].X` of any other built-in or
   compatibility varying (`gl_ClipVertex`, `gl_FrontColor`, `gl_TexCoord[]`: `tcos_*`) is the stage before's `X`. A per-vertex input holds only the vertices of
-  the primitive or patch (a control stage's `gl_in[]` is `gl_MaxPatchVertices` long). Refused and left to the CPU: vertex streams; `gl_ViewportIndex`; structure
-  varyings between the extra stages; flat varyings with `GL_FIRST_VERTEX_CONVENTION`.
+  the primitive or patch (a control stage's `gl_in[]` is `gl_MaxPatchVertices` long). Structures per vertex or per control point (`out S s;` into a geometry
+  stage, `out S ts[]` of a control stage) take a register per column of each member, unpacked. Refused and left to the CPU: vertex streams; `gl_ViewportIndex`;
+  flat varyings with `GL_FIRST_VERTEX_CONVENTION`.
 - Varying packing: when a boundary's links take more registers than the device has, the links of scalars and vec2 share registers (four scalars or two vec2 to
   one, `IoLink::pack`, `spot_of`), written and read at their channels. Between the control and the evaluation stage the device has more room
   (`DeviceLimits::control_varyings`, 30 on a GL 4 virgl host). Structure varyings to the fragment shader take a register per column of each member.
@@ -136,17 +141,32 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   device's integers (F2I / F2U and back; exact while the values stay below 2^24, as all the translation's integers), `~` of a signed integer is `-x - 1`. A
   uniform array the shader uses whole (passed to a function, compared, copied) is copied into a variable at the start; the item lists that index by a variable
   are on the heap, so arrays of up to 128 elements are taken.
-- `src/WebGl/AccelConformance.cpp` has 58 scenes that draw a picture with the accelerator and without, 20 of them desktop GL with geometry and tessellation
+- Arrays of 32 plain values or more (not structures or samplers) are TGSI arrays: their temporaries are one range declared `DCL TEMP[a..b], ARRAY(n)`
+  (`kIndexedArray`, `write_temps`), and an index the shader computes is clamped as the CPU clamps it and goes through the address register
+  (`TEMP[ADDR[0].x+a](n)`, one MOV per column, also for `a[i].xz = ...`), so they may have up to 2048 elements. virgl makes each range an array of its own,
+  so the other temporaries stay registers.
+- Samplers are values the translation follows: a sampler parameter, a member of a uniform structure (also nested, also passed whole to a function), an
+  element of a sampler array (by a constant index, as GLSL wants) are all one uniform slot, known when the shader is translated (`Val` kind 5, `Var::sampler`).
+  Texture lookups work in every stage; the stages but the fragment one use `TXL` of level 0, and each stage declares the samplers it reads (the textures
+  are bound to every stage the pipeline has). `textureSize(s, 0)` is the size row of the sampler's constant rows (another level's size is the CPU's).
+- `continue` inside a `switch`: a flag of the switch, set before it leaves the switch, and after the switch a continue of the loop around. A conditional
+  whose sides have effects (calls, assignments, `++`) runs only the side it takes (IF / ELSE), also with sides of no value (`b ? f() : g();`).
+  `.length()` is the array's size. A fragment shader without a colour output draws with every channel masked (the CPU writes none). A varying that no
+  stage before writes reads zero, as the CPU's vertices start (and an output that is declared but never written is written as zero, the flat link the
+  CPU makes of it).
+- `src/WebGl/AccelConformance.cpp` has 65 scenes that draw a picture with the accelerator and without, 22 of them desktop GL with geometry and tessellation
   stages (two invocations and `gl_PrimitiveIDIn`, adjacency, points made quads, triangles and quads at equal and odd spacing, patch varyings, an evaluation stage
   alone, tessellation and geometry together, outputs read across `barrier()`, clip distances and planes, no attributes, legacy shadow lookups, a rectangle texture,
-  arrays per vertex and per control point, packed control-point arrays, `gl_ClipVertex` through `gl_in[]`), plus a uniform block, shadow samplers, structures,
-  derivatives, `gl_FragDepth`, `gl_VertexID`, bitwise operators, whole uniform arrays, structure varyings and packed varyings in GLSL ES. The kernel runs them at
-  boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 58 match on virgl), and
+  arrays per vertex and per control point, packed control-point arrays, `gl_ClipVertex` through `gl_in[]`, structures per vertex and per control point), plus a
+  uniform block, shadow samplers, structures, derivatives, `gl_FragDepth`, `gl_VertexID`, bitwise operators, whole uniform arrays, structure varyings, packed
+  varyings, samplers as parameters and members, TGSI arrays, a vertex-stage lookup with `textureSize`, `continue` in a switch and an unwritten varying in GLSL
+  ES. The kernel runs them at boot on the machine's GPU ("OpenGL: ...: as the CPU renderer"; all 65 match on virgl), and
   `tests/GlAccelTest.cpp` runs them on a TGSI interpreter (`tests/TgsiMachine.hpp`, shared with DxgkrnlTest, with per-vertex registers and EMIT; the test's
   device runs the tessellator of `Software/Tessellator.hpp`). `PiglitShaderTest --accel-survey` counts which piglit draws the hardware would take and why the others not (`SURVEY_REASON=text` lists
-  the tests): 1002 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
-  barriers, uniform blocks and clip planes, 825 before shadow samplers and structures, 923 before derivatives, arrays per vertex and packing); most of the draws
-  left are the variable-indexing stress tests of 31 vec3 / vec4 per vertex, more than any of virgl's stages take.
+  the tests): 1044 of 1223 tests draw only on the device (222 before the translator work, 709 before the geometry and tessellation stages, 755 before
+  barriers, uniform blocks and clip planes, 825 before shadow samplers and structures, 923 before derivatives, arrays per vertex and packing, 1002 before
+  samplers as values, TGSI arrays, lookups in every stage and the colour upload); most of the draws left are the variable-indexing stress tests of 31 vec3 /
+  vec4 per vertex, more than any of virgl's stages take, then `gl_PrimitiveID` in a fragment shader, point sizes and shifts past 23 bits.
 - Shadow samplers (`sampler1DShadow`, `sampler2DShadow`, `sampler2DRectShadow`; `texture`, `textureProj`, legacy `shadow1D` / `shadow2D` and their `Proj`
   forms): the depth texture goes to the device as a float texture with the depth in R (`IAccelerator::create_texture_float`, virgl's R32G32B32A32Float), read
   with nearest filtering, and the comparison is the shader's: three weights (reference below, equal to, above the depth) from the compare function, and with
@@ -167,7 +187,9 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   wide lines, point sizes, two-sided colour, gl_PrimitiveID in a fragment shader, vertex streams, queries, transform feedback, framebuffer objects,
   instancing, mipmapped or non-RGBA8 textures, constant blend colours ...) keeps the draw on the CPU.
 - The picture stays on the device between draws. A clear of the whole window is done there only, and the CPU's depth and stencil clears wait until the CPU needs
-  them (`hw_fast_clear`, `hw_apply_pending_clears`). The picture comes back to the window's image when something reads it: a swap or a front-buffer read
+  them (`hw_fast_clear`, `hw_apply_pending_clears`). After the CPU drew (a draw the device could not take, or the first frame without a clear), the next draw
+  the device can take writes the CPU's picture up to it first (`IAccelerator::write_color`, `AccelLimits::color_upload`, `hw_upload`) and goes on there; the depth
+  stays behind, so draws with the depth test are the CPU's until a clear of the depth on the device (`hw_depth_stale_`, "the device depth is out of date"). The picture comes back to the window's image when something reads it: a swap or a front-buffer read
   (`GlService::sync_hardware`), `glReadPixels`, a draw the device cannot take. A swap keeps the device target for the next frame, which starts again at its clear.
 - `GL_RENDERER` names the device. Each context counts its draws on the GPU and on the CPU, with why each refused one was refused (`GlContext::HardwareStats`); when
   a context goes, the kernel logs it ("OpenGL: process N: 1 draws on the GPU, 9 on the CPU; 5 because of ...").

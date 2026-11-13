@@ -1396,7 +1396,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
               states[unit] = sampler_state(samplers[unit]);   // (created straight away, so it exists before the stream that uses it)
               if (!states[unit]) return false;
             }
-            for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment}) {
+            // (and to the geometry, control and evaluation stages the pipeline has: a texture read there, by the same numbers)
+            for (const uint32_t stage : {virgl::kShaderVertex, virgl::kShaderFragment, virgl::kShaderGeometry, virgl::kShaderTessControl, virgl::kShaderTessEval}) {
+              if ((stage == virgl::kShaderGeometry && !pipeline->geometry_shader()) || (stage == virgl::kShaderTessControl && !pipeline->hull_shader()) ||
+                  (stage == virgl::kShaderTessEval && !pipeline->domain_shader()))
+                continue;
               stream.command(virgl::kSetSamplerViews, 0, 2 + unit_count);
               stream.put(stage);
               stream.put(0);
