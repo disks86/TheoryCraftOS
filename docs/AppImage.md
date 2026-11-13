@@ -9,12 +9,19 @@ does what the AppImage's own runtime would do, without running the runtime. It d
 (`AI` and the type in bytes 8..10 of its identification), the runner hands it to `AppImageSession` (src/Program/AppImageLaunch.hpp):
 
 1. **Find the image.** For type 2, the SquashFS image starts where the runtime ELF ends. That is the end of its section header table or of
-   its last section, whichever is later (`exe::appimage_payload_offset`, src/Executable/AppImage.hpp). Type 1 (ISO 9660) is refused with a
-   message.
-2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash) reads the image straight from the AppImage file. A `GraftFileSystem`
+   its last section, whichever is later (`exe::appimage_payload_offset`, src/Executable/AppImage.hpp). A type 1 AppImage *is* an ISO 9660
+   image, with the runtime in the 32 KiB system area that ISO 9660 leaves free, so its image starts at byte 0.
+2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash) or, for type 1, `IsoFileSystem` (src/FileSystem/Iso) reads the image straight
+   from the AppImage file. A `GraftFileSystem`
    (src/FileSystem/Mount) places it at `/tmp/.mount_<first six characters of the name><id>` of the Linux world, the way the runtime names its
    mount point. The graft is the program's own view of the OS file system, so nothing else sees the mount and nothing is left behind. It
    lasts as long as the program runs.
+
+   Links that point out of the image work as they do through a Linux mount. An absolute target means that path in the Linux world, so
+   `usr/share/zoneinfo -> /usr/share/zoneinfo` reaches `/Linux/usr/share/zoneinfo`. A `..` above the image's root climbs into
+   `/tmp`, next to the mount point. The image's reader resolves the path through its own links (src/FileSystem/LinkWalk.hpp) and reports where
+   it leaves the image (`IFileSystem::resolve_exit`). The graft carries on from there, and may come back into the image. A path may make at
+   most 8 such jumps; one that bounces forever fails with TooManyLinks.
 3. **Set the runtime's variables:** `APPDIR` (the mount point), `APPIMAGE` and `ARGV0` (the AppImage's path: inside the Linux world if it
    is there, otherwise the OS path), `OWD` (the starting folder).
 4. **Work out what `AppRun` starts** (`evaluate_apprun`, src/Program/AppRunScript.hpp).
@@ -49,6 +56,17 @@ All SquashFS 4.0 features mksquashfs writes are read:
 Extended attributes and the export table are ignored. Decompressed metadata and data blocks are cached (32 and 8 blocks). Decompression
 runs outside the cache lock.
 
+## ISO 9660
+
+`IsoFileSystem` reads the most capable tree an image has:
+
+- **Rock Ridge:** POSIX names, modes, symbolic links, continuation areas, and the deep folders mkisofs relocates (CL/RE). Files compressed
+  with zisofs (zlib blocks of 32, 64 or 128 KiB) are decompressed, keeping one block per open file.
+- **Joliet** otherwise: UCS-2 names, turned into UTF-8.
+- **Plain names** otherwise: without `;1`, in lower case, as Linux shows them.
+
+Files of several extents are read as one. Interleaved files, zisofs2 and sparse (SF) files are refused with Unsupported.
+
 ## Tests
 
 - `tests/run_host_tests.sh AppImageTest` builds with ASan and UBSan and covers:
@@ -59,20 +77,28 @@ runs outside the cache lock.
   - the AppImage header parser, including 32-bit, big-endian and damaged headers;
   - the graft;
   - AppRun scripts in the style of electron-builder and linuxdeploy, hand-written launchers and fuzzed scripts;
-  - an end-to-end `AppImageSession` on a RAM file system.
+  - an end-to-end `AppImageSession` on a RAM file system;
+  - ISO images made by `genisoimage` (Rock Ridge with relocated deep folders, Rock Ridge + Joliet, Joliet only, plain) and `xorriso`
+    (Rock Ridge + Joliet, and zisofs with 32, 64 and 128 KiB blocks), plus truncated and bit-flipped ones and 8 threads on one shared
+    compressed file. Each tool is used when it is installed;
+  - a type 1 `AppImageSession` (an xorriso image with the runtime written over its system area);
+  - links leaving a SquashFS image through the graft: absolute targets, `..` above the root, out and back in, a loop between the two,
+    listings, `stat` and `readlink` of such links.
 - `ZstdTest` and `XzLz4Test` test the decoders against the zstd, xz and lz4 command-line tools and liblzo2.
-- `tests/appimage_qemu.sh` packs `tests/linux/appimagetest.c` (static) with a bash-style `AppRun` into `/Desktop/Downloads/Hello.AppImage`.
-  The kernel autoruns it under QEMU (its own build folder, `build-appimage-qemu`). It passes 13 checks on the real kernel: the mount,
-  the variables, AppRun's export, the arguments, a 1 MB file over many blocks, a listing, a link, and refusing writes.
+- `tests/appimage_qemu.sh` packs `tests/linux/appimagetest.c` (static) with a bash-style `AppRun` twice: as a type 2 AppImage
+  (`/Desktop/Downloads/Hello.AppImage`) and as a type 1 (`Hello1.AppImage`, ISO 9660 from xorriso). The kernel autoruns each in a QEMU boot
+  of its own (its own build folder, `build-appimage-qemu`). Both pass 14 checks on the real kernel: the mount, the variables, AppRun's
+  export, the arguments, a 1 MB file over many blocks, a listing, a link, an absolute link into `/Linux/etc`, and refusing writes.
 - `tests/appimage_interop.sh <file.AppImage>[:pattern] ...` checks the reader against real AppImages. It extracts each one with its own
   runtime (`--appimage-extract`), compares every file, folder and link, then prints what AppRun would start. `AppImageTest --dump` and
   `--apprun` do the two halves without running the AppImage.
 
 ## What is not done
 
-- **Type 1 AppImages** (ISO 9660) are refused.
-- **Absolute symbolic links inside the image** resolve from the image's root, not from the Linux world's root. A link such as
-  `usr/share/zoneinfo -> /usr/share/zoneinfo` therefore finds nothing.
+- **Type 1 AppImages have not been tried on a real one.** None is installed on the development machine, so the tests use images that
+  xorriso makes, with a stand-in runtime.
+- **Links in the base back into the mount.** A link elsewhere in `/Linux` whose target lies inside `/tmp/.mount_…` is not followed into
+  the image, because the OS file system resolves it before the graft sees it.
 - **AppRun scripts get no real process.** A script that needs a real external command to decide what to start (`sed`, `grep`, `awk` for
   something that matters) may pick the wrong program. `case` blocks are skipped, and `$(( ))` arithmetic and `${X:offset}` are not
   supported (the command that uses them is skipped).

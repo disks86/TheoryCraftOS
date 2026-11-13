@@ -323,6 +323,7 @@ add_executable(BOOTX64
   src/FileSystem/Mount/MountTable.cpp
   src/FileSystem/Mount/GraftFileSystem.cpp
   src/FileSystem/Squash/SquashFileSystem.cpp
+  src/FileSystem/Iso/IsoFileSystem.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/FileSystem/Befs/BefsFileSystem.cpp
   src/FileSystem/Ntfs/NtfsFileSystem.cpp

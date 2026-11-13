@@ -17,6 +17,7 @@
  */
 
 #include "FileSystem/Squash/SquashFileSystem.hpp"
+#include "FileSystem/LinkWalk.hpp"
 #include "Media/Lz4.hpp"
 #include "Media/Lzo.hpp"
 #include "Media/Xz.hpp"
@@ -47,33 +48,6 @@ uint64_t le64_at(ConstByteView bytes, uint64_t at) {
 // The bytes of a char buffer, to read names and link targets into. Safe: char and uint8_t have the same size, alignment and representation, and the
 // view covers only the `size` chars the caller owns.
 ByteView char_bytes(char* text, uint64_t size) { return ByteView(reinterpret_cast<uint8_t*>(text), size); }
-
-// The next component of `path` at or after *pos ("" when there are none left), moving *pos past it.
-StringView next_component(StringView path, uint64_t* pos) {
-  while (*pos < path.size() && path[*pos] == '/') ++*pos;
-  const uint64_t start = *pos;
-  while (*pos < path.size() && path[*pos] != '/') ++*pos;
-  return path.substr(start, *pos - start);
-}
-
-// Does anything other than "." follow *pos?
-bool more_components(StringView path, uint64_t pos) {
-  for (;;) {
-    const StringView part = next_component(path, &pos);
-    if (part.empty()) return false;
-    if (!part.equals(".")) return true;
-  }
-}
-
-StringView last_component(StringView path) {
-  StringView last;
-  uint64_t pos = 0;
-  for (;;) {
-    const StringView part = next_component(path, &pos);
-    if (part.empty()) return last;
-    last = part;
-  }
-}
 
 }  // namespace
 
@@ -611,50 +585,24 @@ Status SquashFileSystem::lookup(const Inode& directory, StringView name, Inode* 
   return Status::NotFound;
 }
 
-Status SquashFileSystem::resolve(StringView path, bool follow_last, Inode* inode) {
-  // An ordinary path may not climb; a link's target may.
-  for (uint64_t pos = 0;;) {
-    const StringView part = next_component(path, &pos);
-    if (part.empty()) break;
-    if (part.equals("..") || part.size() > kMaxNameLength) return Status::InvalidPath;
-  }
+struct SquashFileSystem::WalkOps {
+  SquashFileSystem& fs;
+  Status lookup(const Inode& directory, StringView name, Inode* child) { return fs.lookup(directory, name, child); }
+  bool is_directory(const Inode& inode) const { return inode.kind == Kind::Directory; }
+  bool is_link(const Inode& inode) const { return inode.kind == Kind::Symlink; }
+  Status target(const Inode& link, String* text) { return fs.read_target(link, text); }
+};
+
+Status SquashFileSystem::resolve(StringView path, bool follow_last, Inode* inode, String* exit) {
   Inode root;
   if (const Status s = read_inode(root_ref_, &root); s != Status::Ok) return s;
-  List<Inode> stack(allocator_);
-  if (!stack.push_back(root)) return Status::OutOfMemory;
-  String pending(allocator_), spliced(allocator_), target(allocator_);
-  if (!pending.assign(path)) return Status::OutOfMemory;
-  uint32_t hops = 0;
-  for (uint64_t pos = 0;;) {
-    const StringView part = next_component(pending.view(), &pos);
-    if (part.empty()) break;
-    if (part.equals(".")) continue;
-    if (part.equals("..")) {
-      if (stack.count() > 1) stack.remove_at(stack.count() - 1);
-      continue;
-    }
-    if (part.size() > kMaxNameLength) return Status::InvalidPath;
-    const Inode& current = stack.view().back();
-    if (current.kind != Kind::Directory) return Status::NotADirectory;
-    Inode child;
-    if (const Status s = lookup(current, part, &child); s != Status::Ok) return s;
-    const bool more = more_components(pending.view(), pos);
-    if (child.kind == Kind::Symlink && (more || follow_last)) {
-      if (++hops > kMaxLinkHops) return Status::TooManyLinks;
-      if (const Status s = read_target(child, &target); s != Status::Ok) return s;
-      if (!spliced.assign(target.view()) || !spliced.push_back('/') || !spliced.append(pending.view().substr(pos))) return Status::OutOfMemory;
-      if (target.view().starts_with('/')) {
-        while (stack.count() > 1) stack.remove_at(stack.count() - 1);
-      }
-      pending = util::move(spliced);
-      spliced = String(allocator_);
-      pos = 0;
-      continue;
-    }
-    if (!stack.push_back(child)) return Status::OutOfMemory;
-  }
-  *inode = stack.view().back();
-  return Status::Ok;
+  WalkOps ops{*this};
+  return walk_path(allocator_, path, follow_last, root, ops, inode, exit);
+}
+
+Status SquashFileSystem::resolve_exit(StringView path, bool follow_last, String* exit) {
+  Inode inode;
+  return resolve(path, follow_last, &inode, exit);
 }
 
 Status SquashFileSystem::fill_entry(const Inode& inode, StringView name, StringView parent_path, DirectoryEntry* entry) {
@@ -692,7 +640,7 @@ Status SquashFileSystem::stat(StringView path, DirectoryEntry* entry) {
   if (is_link) {
     if (const Status s = resolve(path, true, &inode); s != Status::Ok) return s;
   }
-  if (const Status s = fill_entry(inode, last_component(path), StringView(), entry); s != Status::Ok) return s;
+  if (const Status s = fill_entry(inode, link_walk::last_component(path), StringView(), entry); s != Status::Ok) return s;
   entry->is_symlink = is_link;
   return Status::Ok;
 }

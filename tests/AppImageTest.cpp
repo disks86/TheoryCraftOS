@@ -25,6 +25,7 @@
 //   AppImageTest --dump <AppImage>     lists the image (for tests/appimage_interop.sh, which compares with the runtime's own --appimage-extract)
 //   AppImageTest --apprun <AppImage> [args...]   prints what its AppRun would start
 //   AppImageTest --make <out.AppImage> <folder>  packs a folder into a type 2 AppImage (a stand-in runtime and a SquashFS image; for tests/appimage_qemu.sh)
+//   AppImageTest --make1 <out.AppImage> <folder> the same as a type 1 AppImage (an ISO 9660 image from xorriso, the stand-in runtime in its system area)
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,10 +38,12 @@
 #include <memory>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 #include "Executable/AppImage.hpp"
+#include "FileSystem/Iso/IsoFileSystem.hpp"
 #include "FileSystem/Mount/GraftFileSystem.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "FileSystem/Squash/SquashFileSystem.hpp"
@@ -1401,6 +1404,454 @@ static void test_session() {
   CHECK(a.live == 0);
 }
 
+// ------------------------------------------------------------------ ISO 9660 (type 1 AppImages), made by genisoimage and xorriso
+static std::string g_iso_dir;
+
+static bool tool(const char* name) {
+  return system((std::string("command -v ") + name + " >/dev/null 2>&1").c_str()) == 0;
+}
+static std::string slurp(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return "";
+  std::string data;
+  char buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.append(buf, n);
+  fclose(f);
+  return data;
+}
+static void spit(const std::string& path, const std::string& data) {
+  system(("mkdir -p \"$(dirname '" + path + "')\"").c_str());
+  FILE* f = fopen(path.c_str(), "wb");
+  if (f) { fwrite(data.data(), 1, data.size(), f); fclose(f); }
+}
+
+// The tree the ISO tests put on their images (paths below the folder), what each is.
+static std::map<std::string, Expect> iso_tree(const std::string& root, bool long_names) {
+  std::map<std::string, Expect> e;
+  auto file = [&](const std::string& path, const std::string& data) { spit(root + path, data); e[path] = {'f', data}; };
+  auto link = [&](const std::string& path, const std::string& target) {
+    system(("mkdir -p \"$(dirname '" + root + path + "')\"").c_str());
+    symlink(target.c_str(), (root + path).c_str());
+    e[path] = {'l', target};
+  };
+  file("/readme.txt", "hello from an ISO\n");
+  file("/empty", "");
+  file("/big.bin", pattern_bytes(300000, 11, false));
+  file("/text.dat", pattern_bytes(200000, 12, true));
+  std::string zeros(262144 + 5, '\0');
+  zeros[100] = 'x';
+  file("/mostly-zeros", zeros);
+  file("/usr/bin/tool", std::string(kElf) + pattern_bytes(70000, 13, false));
+  file("/usr/lib/libz.so.1.2", pattern_bytes(50000, 14, true));
+  link("/usr/lib/libz.so.1", "libz.so.1.2");
+  link("/usr/lib/libz.so", "libz.so.1");
+  link("/AppRun", "usr/bin/tool");
+  link("/up", "usr/../usr/lib");
+  link("/abs", "/usr/bin");
+  link("/dangling", "no/such/file");
+  link("/loop", "loop");
+  std::string deep = "";
+  for (int i = 0; i < 11; ++i) deep += "/d" + std::to_string(i);
+  file(deep + "/leaf.txt", "eleven folders down\n");
+  if (long_names) {
+    file("/" + std::string(200, 'L') + ".txt", "long name");
+    file("/Mixed Case & Spaces.TXT", "mixed");
+    file("/\xc3\xa9t\xc3\xa9.txt", "utf-8 name");
+  }
+  for (int i = 0; i < 150; ++i) file("/many/entry-" + std::to_string(i) + ".txt", std::to_string(i));
+  spit(root + "/emptydir/.keep", "");
+  system(("rm -f '" + root + "/emptydir/.keep'").c_str());
+  return e;
+}
+
+static void check_iso(IsoFileSystem& fs, const std::map<std::string, Expect>& expect, bool links) {
+  for (auto& [path, e] : expect) {
+    if (e.kind == 'f') {
+      Status s;
+      const std::string got = read_all(fs, path, &s);
+      if (s != Status::Ok || got != e.data) { printf("  %s: %s, %zu of %zu bytes\n", path.c_str(), status_name(s), got.size(), e.data.size()); CHECK(false); }
+      DirectoryEntry entry;
+      CHECK_STATUS(fs.stat(StringView(path.c_str()), &entry), Status::Ok);
+      CHECK(entry.type == NodeType::File && entry.size == e.data.size());
+    } else if (e.kind == 'l' && links) {
+      TestAllocator a;
+      String target(a);
+      bool is_dir = false;
+      CHECK_STATUS(fs.read_symbolic_link(StringView(path.c_str()), &target, &is_dir), Status::Ok);
+      if (sv(target.view()) != e.data) { printf("  link %s -> '%s', want '%s'\n", path.c_str(), sv(target.view()).c_str(), e.data.c_str()); CHECK(false); }
+    }
+  }
+  // Random pieces of the big files (and of the compressed ones, across zisofs blocks).
+  for (const char* name : {"/big.bin", "/text.dat", "/mostly-zeros", "/mostly_zeros"}) {
+    if (!expect.count(name)) continue;
+    const char* path = name;
+    const std::string& want = expect.at(path).data;
+    UniquePointer<IFile> f;
+    CHECK_STATUS(fs.open_file(path, OpenMode::Read, &f), Status::Ok);
+    if (!f) continue;
+    std::mt19937 rng(3);
+    for (int i = 0; i < 100; ++i) {
+      const uint64_t off = rng() % (want.size() + 3), len = rng() % 70000;
+      std::string buf(len, '\0');
+      uint64_t got = 0;
+      CHECK_STATUS(f->read(off, ByteView(reinterpret_cast<uint8_t*>(buf.data()), len), &got), Status::Ok);
+      const uint64_t n = off >= want.size() ? 0 : std::min<uint64_t>(len, want.size() - off);
+      CHECK(got == n && (n == 0 || memcmp(buf.data(), want.data() + off, n) == 0));
+    }
+  }
+  Status s;
+  DirectoryEntry entry;
+  if (links) {
+    CHECK(read_all(fs, "/usr/lib/libz.so", &s) == expect.at("/usr/lib/libz.so.1.2").data);
+    CHECK(read_all(fs, "/AppRun", &s) == expect.at("/usr/bin/tool").data);
+    CHECK(read_all(fs, "/up/libz.so.1", &s) == expect.at("/usr/lib/libz.so.1.2").data);
+    CHECK(read_all(fs, "/abs/tool", &s) == expect.at("/usr/bin/tool").data);
+    read_all(fs, "/dangling", &s);
+    CHECK(s == Status::NotFound);
+    read_all(fs, "/loop", &s);
+    CHECK(s == Status::TooManyLinks);
+    CHECK_STATUS(fs.stat("/AppRun", &entry), Status::Ok);
+    CHECK(entry.is_symlink && entry.type == NodeType::File);
+    TestAllocator a;
+    String exit(a);
+    CHECK_STATUS(fs.resolve_exit("/abs/tool", true, &exit), Status::Ok);
+    CHECK(exit.view().equals("/usr/bin/tool"));
+    CHECK_STATUS(fs.resolve_exit("/usr/lib/libz.so", true, &exit), Status::Ok);
+    CHECK(exit.empty());
+  }
+  CHECK_STATUS(fs.stat("/d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10", &entry), Status::Ok);
+  CHECK(entry.type == NodeType::Directory);
+  CHECK_STATUS(fs.stat("/nothing", &entry), Status::NotFound);
+  CHECK_STATUS(fs.stat("/readme.txt/x", &entry), Status::NotADirectory);
+  CHECK_STATUS(fs.stat("/usr/../readme.txt", &entry), Status::InvalidPath);
+  UniquePointer<IFile> f;
+  CHECK_STATUS(fs.open_file("/readme.txt", OpenMode::ReadWrite, &f), Status::ReadOnly);
+  CHECK_STATUS(fs.open_file("/usr", OpenMode::Read, &f), Status::IsADirectory);
+  CHECK_STATUS(fs.create_directory("/new"), Status::ReadOnly);
+  // Listings: the root holds what the tree put there (and, with relocation, nothing extra but rr_moved).
+  std::set<std::string> want_root, got_root;
+  for (auto& [path, e] : expect)
+    if (path.find('/', 1) == std::string::npos) want_root.insert(path.substr(1));
+  for (const char* d : {"usr", "d0", "many", "emptydir"}) want_root.insert(d);
+  UniquePointer<IDirectory> dir;
+  CHECK_STATUS(fs.open_directory("/", &dir), Status::Ok);
+  DirectoryEntry e;
+  while (dir && dir->next(&e) == Status::Ok) {
+    const std::string name = sv(e.name.view());
+    if (name == "rr_moved") continue;
+    got_root.insert(name);
+    if (name == "AppRun" && links) CHECK(e.is_symlink && e.type == NodeType::File && e.size == expect.at("/usr/bin/tool").data.size());
+    if (name == "abs" && links) CHECK(e.type == NodeType::Directory);
+  }
+  if (!links)      // (without Rock Ridge there are no links to list)
+    for (auto& [path, ex] : expect) if (ex.kind == 'l') want_root.erase(path.substr(1));
+  if (got_root != want_root) {
+    printf("  root listing differs:");
+    for (auto& n : got_root) if (!want_root.count(n)) printf(" +%s", n.c_str());
+    for (auto& n : want_root) if (!got_root.count(n)) printf(" -%s", n.c_str());
+    printf("\n");
+    CHECK(false);
+  }
+  CHECK_STATUS(fs.open_directory("/many", &dir), Status::Ok);
+  int many = 0;
+  while (dir && dir->next(&e) == Status::Ok) ++many;
+  CHECK(many == 150);
+  CHECK_STATUS(fs.open_directory("/emptydir", &dir), Status::Ok);
+  CHECK(dir && dir->next(&e) == Status::EndOfDirectory);
+}
+
+// A path as plain ISO 9660 names it (what genisoimage makes of it, shown in lower case): only a-z 0-9 _ and one dot in a file's name.
+static std::string plain_iso_name(const std::string& path, bool is_file) {
+  std::string out;
+  size_t start = 0;
+  while (start < path.size()) {
+    size_t end = path.find('/', start + 1);
+    if (end == std::string::npos) end = path.size();
+    std::string part = path.substr(start + 1, end - start - 1);
+    const bool last = end == path.size();
+    const size_t dot = last && is_file ? part.rfind('.') : std::string::npos;
+    for (size_t i = 0; i < part.size(); ++i) {
+      char& c = part[i];
+      if (c >= 'A' && c <= 'Z') c = char(c + 32);
+      const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || (c == '.' && i == dot);
+      if (!ok) c = '_';
+    }
+    out += "/" + part;
+    start = end;
+  }
+  return out;
+}
+
+struct IsoImage {
+  const char* what;
+  std::string command;      // %s: the output, %d: the folder
+  IsoFileSystem::Tree tree;
+  bool long_names, links;
+};
+
+static std::string make_iso(const std::string& command, const std::string& folder, const std::string& out) {
+  std::string c = command;
+  for (size_t at; (at = c.find("%s")) != std::string::npos;) c.replace(at, 2, "'" + out + "'");
+  for (size_t at; (at = c.find("%d")) != std::string::npos;) c.replace(at, 2, "'" + folder + "'");
+  if (system((c + " >/dev/null 2>&1").c_str()) != 0) return "";
+  return slurp(out);
+}
+
+static void test_iso() {
+  const bool genisoimage = tool("genisoimage"), xorriso = tool("xorriso");
+  if (!genisoimage && !xorriso) { printf("  (no genisoimage or xorriso: skipped)\n"); return; }
+  char templ[] = "/tmp/tcos-iso-XXXXXX";
+  const char* base = getenv("TMPDIR");
+  std::string dir_template = std::string(base ? base : "/tmp") + "/tcos-iso-XXXXXX";
+  std::vector<char> buf(dir_template.begin(), dir_template.end());
+  buf.push_back('\0');
+  g_iso_dir = mkdtemp(buf.data()) ? buf.data() : "";
+  (void)templ;
+  if (g_iso_dir.empty()) { CHECK(false); return; }
+  const std::string folder_long = g_iso_dir + "/tree", folder_short = g_iso_dir + "/short";
+  const auto expect_long = iso_tree(folder_long, true);
+  const auto expect_short = iso_tree(folder_short, false);
+  std::vector<IsoImage> images;
+  if (genisoimage) {
+    images.push_back({"genisoimage -R (Rock Ridge, deep folders relocated)", "genisoimage -quiet -R -o %s %d", IsoFileSystem::Tree::RockRidge, true, true});
+    images.push_back({"genisoimage -R -J", "genisoimage -quiet -R -J -joliet-long -o %s %d", IsoFileSystem::Tree::RockRidge, true, true});
+    images.push_back({"genisoimage -J (Joliet only)", "genisoimage -quiet -J -joliet-long -D -o %s %d", IsoFileSystem::Tree::Joliet, false, false});
+    images.push_back({"genisoimage plain", "genisoimage -quiet -l -D -o %s %d", IsoFileSystem::Tree::Plain, false, false});
+  }
+  if (xorriso) {
+    images.push_back({"xorriso -as mkisofs -R -J", "xorriso -as mkisofs -R -J -o %s %d", IsoFileSystem::Tree::RockRidge, true, true});
+    for (const char* bs : {"32k", "64k", "128k"})
+      images.push_back({"xorriso zisofs", std::string("xorriso -outdev %s -map %d / -zisofs level=6:block_size=") + bs + " -set_filter_r --zisofs / -- -commit",
+                        IsoFileSystem::Tree::RockRidge, true, true});
+  }
+  int n = 0;
+  for (const IsoImage& image : images) {
+    const std::string out = g_iso_dir + "/image" + std::to_string(n++) + ".iso";
+    const auto& expect = image.long_names ? expect_long : expect_short;
+    const std::string bytes = make_iso(image.command, image.long_names ? folder_long : folder_short, out);
+    if (bytes.empty()) { printf("  could not make: %s\n", image.what); CHECK(false); continue; }
+    TestAllocator a;
+    {
+      UniquePointer<IsoFileSystem> fs;
+      const Status s = IsoFileSystem::mount(a, UniquePointer<MemoryFile>::make(a, shared(bytes)), 0, &fs);
+      CHECK_STATUS(s, Status::Ok);
+      if (fs) {
+        if (fs->tree() != image.tree) { printf("  %s: wrong tree\n", image.what); CHECK(false); }
+        std::map<std::string, Expect> files;
+        for (auto& [path, e] : expect) {
+          if (!image.links && e.kind == 'l') continue;      // Joliet and plain names have no links (genisoimage leaves them out)
+          files[image.tree == IsoFileSystem::Tree::Plain ? plain_iso_name(path, e.kind == 'f') : path] = e;
+        }
+        check_iso(*fs, files, image.links);
+      }
+    }
+    CHECK(a.live == 0);
+    printf("  %s: checked\n", image.what);
+  }
+}
+
+static void test_iso_damage_and_threads() {
+  if (g_iso_dir.empty() || !tool("xorriso")) return;
+  const std::string bytes = slurp(g_iso_dir + "/image" + std::to_string(tool("genisoimage") ? 5 : 1) + ".iso");      // a zisofs image
+  if (bytes.empty()) return;
+  TestAllocator a;
+  int mounted = 0;
+  for (uint64_t n = 0; n < bytes.size(); n += n < 40000 ? 509 : 4999) {
+    UniquePointer<IsoFileSystem> fs;
+    if (IsoFileSystem::mount(a, UniquePointer<MemoryFile>::make(a, shared(bytes.substr(0, n))), 0, &fs) == Status::Ok) {
+      ++mounted;
+      int budget = 300;
+      walk(*fs, "/", 0, &budget);
+    }
+  }
+  std::mt19937 rng(21);
+  for (int round = 0; round < 1500; ++round) {
+    std::string bad = bytes;
+    for (int k = 0; k < 1 + round % 4; ++k) {
+      const uint64_t at = round < 300 ? 32768 + rng() % 4096 : rng() % bad.size();      // the volume descriptors get a share
+      bad[at] = char(uint8_t(bad[at]) ^ (1u << (rng() % 8)));
+    }
+    UniquePointer<IsoFileSystem> fs;
+    if (IsoFileSystem::mount(a, UniquePointer<MemoryFile>::make(a, shared(bad)), 0, &fs) == Status::Ok) {
+      ++mounted;
+      int budget = 300;
+      walk(*fs, "/", 0, &budget);
+    }
+  }
+  CHECK(mounted > 0);
+  // Several threads on one image, and on one shared open file (its block cache).
+  {
+    UniquePointer<IsoFileSystem> fs;
+    CHECK_STATUS(IsoFileSystem::mount(a, UniquePointer<MemoryFile>::make(a, shared(bytes)), 0, &fs), Status::Ok);
+    const std::string big = pattern_bytes(300000, 11, false), text = pattern_bytes(200000, 12, true);
+    UniquePointer<IFile> shared_file;
+    if (fs) CHECK_STATUS(fs->open_file("/text.dat", OpenMode::Read, &shared_file), Status::Ok);
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; fs && shared_file && t < 8; ++t) {
+      threads.emplace_back([&, t] {
+        std::mt19937 r(t);
+        for (int i = 0; i < 300; ++i) {
+          const bool use_shared = i % 2;
+          const std::string& want = use_shared ? text : big;
+          UniquePointer<IFile> own;
+          IFile* f = shared_file.get();
+          if (!use_shared) {
+            if (fs->open_file("/big.bin", OpenMode::Read, &own) != Status::Ok) { ++bad; continue; }
+            f = own.get();
+          }
+          const uint64_t off = r() % want.size(), len = 1 + r() % 50000;
+          std::string out(len, '\0');
+          uint64_t got = 0;
+          if (f->read(off, ByteView(reinterpret_cast<uint8_t*>(out.data()), len), &got) != Status::Ok || got != std::min<uint64_t>(len, want.size() - off) ||
+              memcmp(out.data(), want.data() + off, got) != 0)
+            ++bad;
+        }
+      });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(bad == 0);
+  }
+  CHECK(a.live == 0);
+  printf("  damage: %d damaged images mounted and walked\n", mounted);
+}
+
+// A type 1 AppImage: an ISO 9660 image with the runtime in its first 32 KiB.
+static void test_type1_session() {
+  if (g_iso_dir.empty() || !tool("xorriso")) return;
+  const std::string folder = g_iso_dir + "/type1";
+  spit(folder + "/AppRun", "#!/bin/sh\nHERE=\"$(dirname \"$(readlink -f \"${0}\")\")\"\nexport OLD=yes\nexec \"$HERE/usr/bin/old-app\" \"$@\"\n");
+  spit(folder + "/usr/bin/old-app", std::string(kElf) + pattern_bytes(9000, 3, true));
+  symlink("/usr/lib/libsystem.so", (folder + "/usr/bin/libsystem.so").c_str());
+  std::string iso = make_iso("xorriso -as mkisofs -R -o %s %d", folder, g_iso_dir + "/type1.iso");
+  if (iso.empty()) { CHECK(false); return; }
+  std::string runtime = fake_runtime(true, false, 1, false);
+  runtime.resize(32768, '\0');
+  iso.replace(0, 32768, runtime);
+  TestAllocator a;
+  {
+    RamFileSystem os(a);
+    put_file(os, "/Desktop/Downloads/Old.AppImage", iso);
+    put_file(os, "/Linux/usr/lib/libsystem.so", "the system's library");
+    (void)os.create_directory("/Linux/tmp");
+    CHECK(desktop::appimage_type(os, "/Desktop/Downloads/Old.AppImage") == exe::AppImageType::Type1);
+    desktop::AppImageSession session(a);
+    String message(a);
+    const StringView env[] = {"PATH=/usr/bin"};
+    const StringView args[] = {"x"};
+    const bool ok = session.prepare(os, "/Desktop/Downloads/Old.AppImage", "/", ArrayView<const StringView>(args), ArrayView<const StringView>(env), &message);
+    if (!ok) printf("  type 1: %s\n", sv(message.view()).c_str());
+    CHECK(ok);
+    if (ok) {
+      CHECK(sv(session.program_path()) == "/Linux" + sv(session.mount_point()) + "/usr/bin/old-app");
+      std::vector<std::string> got;
+      for (StringView v : session.arguments()) got.push_back(sv(v));
+      CHECK((got == std::vector<std::string>{"x"}));
+      bool old = false;
+      for (StringView v : session.environment()) old |= v.equals("OLD=yes");
+      CHECK(old);
+      Status s;
+      CHECK(read_all(session.files(), sv(session.program_path()), &s).size() == 4 + 9000 + 3);
+      // The absolute link in the image leads to the Linux world's file.
+      CHECK(read_all(session.files(), "/Linux" + sv(session.mount_point()) + "/usr/bin/libsystem.so", &s) == "the system's library");
+    }
+    put_file(os, "/Desktop/Downloads/NotIso.AppImage", fake_runtime(true, false, 1, false) + std::string(70000, 'z'));
+    desktop::AppImageSession bad(a);
+    CHECK(!bad.prepare(os, "/Desktop/Downloads/NotIso.AppImage", "/", ArrayView<const StringView>(), ArrayView<const StringView>(env), &message));
+    CHECK(message.view().contains("ISO 9660"));
+  }
+  CHECK(a.live == 0);
+}
+
+// ------------------------------------------------------------------ links that leave the image
+static void test_escaping_links() {
+  WriterOptions o;
+  o.compression = first_available() ? first_available() : uint16_t(kGzip);
+  o.store_only = first_available() == 0;
+  Tree t;
+  t.add("/zone", TNode::Link, "/usr/share/zoneinfo");
+  t.add("/etc/hosts", TNode::Link, "/etc/hosts");
+  t.add("/sibling", TNode::Link, "../sibling");
+  t.add("/deep/up", TNode::Link, "../../sibling/file");
+  t.add("/inner", TNode::File, "inside");
+  t.add("/self", TNode::Link, "/tmp/.mount_x/inner");                // out and back in
+  t.add("/selfdir", TNode::Link, "/tmp/.mount_x");
+  t.add("/bounce", TNode::Link, "/tmp/.mount_x/bounce");             // out and back in, forever
+  t.add("/root", TNode::Link, "/");
+  t.add("/usr/lib/libfoo.so", TNode::Link, "/usr/lib/x86_64-linux-gnu/libfoo.so.2");
+  const std::string image = write_squash(t, o);
+  TestAllocator a;
+  {
+    UniquePointer<SquashFileSystem> squash;
+    CHECK_STATUS(mount(a, shared(image), 0, &squash), Status::Ok);
+    if (!squash) return;
+    String exit(a);
+    CHECK_STATUS(squash->resolve_exit("/zone/UTC", true, &exit), Status::Ok);
+    CHECK(exit.view().equals("/usr/share/zoneinfo/UTC"));
+    CHECK_STATUS(squash->resolve_exit("/zone", false, &exit), Status::Ok);
+    CHECK(exit.empty());
+    CHECK_STATUS(squash->resolve_exit("/zone", true, &exit), Status::Ok);
+    CHECK(exit.view().equals("/usr/share/zoneinfo"));
+    CHECK_STATUS(squash->resolve_exit("/deep/up", true, &exit), Status::Ok);
+    CHECK(exit.view().equals("../sibling/file"));
+    CHECK_STATUS(squash->resolve_exit("/inner", true, &exit), Status::Ok);
+    CHECK(exit.empty());
+    CHECK_STATUS(squash->resolve_exit("/missing/x", true, &exit), Status::NotFound);
+
+    RamFileSystem base(a);
+    put_file(base, "/Linux/usr/share/zoneinfo/UTC", "TZif utc");
+    put_file(base, "/Linux/etc/hosts", "127.0.0.1 localhost\n");
+    put_file(base, "/Linux/tmp/sibling/file", "next to the mount");
+    put_file(base, "/Linux/usr/lib/x86_64-linux-gnu/libfoo.so.2", "system libfoo");
+    put_file(base, "/Linux/rootfile", "at the top");
+    GraftFileSystem graft(a, base, *squash);
+    CHECK(graft.set_mount_point("/Linux/tmp/.mount_x"));
+    CHECK(!graft.set_link_root("/Windows"));
+    CHECK(graft.set_link_root("/Linux"));
+    const std::string m = "/Linux/tmp/.mount_x";
+    Status s;
+    CHECK(read_all(graft, m + "/zone/UTC", &s) == "TZif utc");
+    CHECK(read_all(graft, m + "/etc/hosts", &s) == "127.0.0.1 localhost\n");
+    CHECK(read_all(graft, m + "/sibling/file", &s) == "next to the mount");
+    CHECK(read_all(graft, m + "/deep/up", &s) == "next to the mount");
+    CHECK(read_all(graft, m + "/self", &s) == "inside");
+    CHECK(read_all(graft, m + "/selfdir/inner", &s) == "inside");
+    CHECK(read_all(graft, m + "/root/rootfile", &s) == "at the top");
+    CHECK(read_all(graft, m + "/usr/lib/libfoo.so", &s) == "system libfoo");
+    read_all(graft, m + "/bounce", &s);
+    CHECK(s == Status::TooManyLinks);
+    DirectoryEntry e;
+    CHECK_STATUS(graft.stat(StringView((m + "/zone").c_str()), &e), Status::Ok);
+    CHECK(e.type == NodeType::Directory && e.is_symlink && e.name.view().equals("zone"));
+    CHECK_STATUS(graft.stat(StringView((m + "/zone/UTC").c_str()), &e), Status::Ok);
+    CHECK(e.type == NodeType::File && e.size == 8 && !e.is_symlink && e.name.view().equals("UTC"));
+    String target(a);
+    bool is_dir = false;
+    CHECK_STATUS(graft.read_symbolic_link(StringView((m + "/zone").c_str()), &target, &is_dir), Status::Ok);
+    CHECK(target.view().equals("/usr/share/zoneinfo") && is_dir);
+    UniquePointer<IDirectory> d;
+    CHECK_STATUS(graft.open_directory(StringView((m + "/zone").c_str()), &d), Status::Ok);
+    std::vector<std::string> names;
+    while (d && d->next(&e) == Status::Ok) names.push_back(sv(e.name.view()));
+    CHECK((names == std::vector<std::string>{"UTC"}));
+    CHECK_STATUS(graft.open_directory(StringView(m.c_str()), &d), Status::Ok);
+    std::map<std::string, DirectoryEntry> listed;
+    while (d && d->next(&e) == Status::Ok) listed[sv(e.name.view())] = e;
+    CHECK(listed["zone"].type == NodeType::Directory && listed["zone"].is_symlink);
+    CHECK(listed["sibling"].type == NodeType::Directory);
+    CHECK(listed["bounce"].type == NodeType::File);      // (leads nowhere)
+    // Without a link root the old behaviour: links stay in the image.
+    GraftFileSystem closed(a, base, *squash);
+    CHECK(closed.set_mount_point("/Linux/tmp/.mount_x"));
+    read_all(closed, m + "/zone/UTC", &s);
+    CHECK(s == Status::NotFound);
+    // The AppRun shell's readlink -f agrees.
+    put_file(base, "/Linux/tmp/.mount_t/unused", "");
+  }
+  CHECK(a.live == 0);
+}
+
 // ------------------------------------------------------------------ real AppImages (tests/appimage_interop.sh)
 static uint64_t fnv(const std::string& s) {
   uint64_t h = 1469598103934665603ull;
@@ -1493,6 +1944,21 @@ static void add_folder(Tree& tree, const std::string& host, const std::string& i
   closedir(d);
 }
 
+static int make_type1(const char* out, const char* folder) {
+  std::string iso = make_iso("xorriso -as mkisofs -R -o %s %d", folder, std::string(out) + ".iso");
+  if (iso.empty()) { fprintf(stderr, "xorriso failed\n"); return 2; }
+  remove((std::string(out) + ".iso").c_str());
+  std::string runtime = fake_runtime(true, false, 1, false);
+  runtime.resize(32768, '\0');
+  iso.replace(0, 32768, runtime);
+  FILE* f = fopen(out, "wb");
+  if (!f || fwrite(iso.data(), 1, iso.size(), f) != iso.size()) { fprintf(stderr, "cannot write %s\n", out); return 2; }
+  fclose(f);
+  chmod(out, 0755);
+  printf("%s: %zu bytes, type 1\n", out, iso.size());
+  return 0;
+}
+
 static int make_appimage(const char* out, const char* folder) {
   Tree tree;
   add_folder(tree, folder, "");
@@ -1511,6 +1977,7 @@ static int make_appimage(const char* out, const char* folder) {
 
 int main(int argc, char** argv) {
   if (argc == 4 && std::string(argv[1]) == "--make") return make_appimage(argv[2], argv[3]);
+  if (argc == 4 && std::string(argv[1]) == "--make1") return make_type1(argv[2], argv[3]);
   if (argc >= 3 && (std::string(argv[1]) == "--dump" || std::string(argv[1]) == "--apprun")) return real_appimage(argc, argv);
   printf("squashfs images\n");
   test_images();
@@ -1526,6 +1993,14 @@ int main(int argc, char** argv) {
   test_apprun();
   printf("session\n");
   test_session();
+  printf("ISO 9660\n");
+  test_iso();
+  test_iso_damage_and_threads();
+  printf("type 1 AppImage\n");
+  test_type1_session();
+  printf("links out of the image\n");
+  test_escaping_links();
+  if (!g_iso_dir.empty() && !g_failed) system(("rm -rf '" + g_iso_dir + "'").c_str());
   printf(g_failed ? "AppImageTest: %d of %d checks FAILED\n" : "AppImageTest: all %d checks passed\n", g_failed ? int(g_failed) : g_checks, g_checks);
   return g_failed ? 1 : 0;
 }

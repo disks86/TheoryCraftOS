@@ -17,6 +17,8 @@
  */
 
 #include "Program/AppImageLaunch.hpp"
+#include "FileSystem/Iso/IsoFileSystem.hpp"
+#include "FileSystem/Squash/SquashFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "Process/ProgramEnvironment.hpp"
 #include "Utility/Move.hpp"
@@ -71,15 +73,23 @@ bool AppImageSession::prepare(filesystem::IFileSystem& files, StringView path, S
   };
   UniquePointer<filesystem::IFile> file;
   if (files.open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return fail("cannot open the AppImage");
-  uint64_t offset = 0;
-  if (!exe::appimage_payload_offset(*file, &offset)) {
-    uint8_t head[16];
-    uint64_t got = 0;
-    if (file->read(0, ByteView(head), &got) == filesystem::Status::Ok && got == sizeof(head) && exe::identify_appimage(ConstByteView(head)) == exe::AppImageType::Type1)
-      return fail("this is a type 1 AppImage (an ISO 9660 image), an old format this OS cannot open; type 2 AppImages are supported");
-    return fail("the AppImage is damaged: no SquashFS image follows its runtime");
+  uint8_t head[16];
+  uint64_t got = 0;
+  if (file->read(0, ByteView(head), &got) != filesystem::Status::Ok || got != sizeof(head)) return fail("cannot read the AppImage");
+  filesystem::Status mounted = filesystem::Status::Corrupt;
+  if (exe::identify_appimage(ConstByteView(head)) == exe::AppImageType::Type1) {
+    // Type 1: the whole file is an ISO 9660 image, the runtime in its system area.
+    if (!filesystem::IsoFileSystem::looks_like_iso(*file, 0)) return fail("the AppImage is damaged: a type 1 AppImage must be an ISO 9660 image");
+    UniquePointer<filesystem::IsoFileSystem> iso;
+    mounted = filesystem::IsoFileSystem::mount(allocator_, util::move(file), 0, &iso);
+    image_ = util::move(iso);
+  } else {
+    uint64_t offset = 0;
+    if (!exe::appimage_payload_offset(*file, &offset)) return fail("the AppImage is damaged: no SquashFS image follows its runtime");
+    UniquePointer<filesystem::SquashFileSystem> squash;
+    mounted = filesystem::SquashFileSystem::mount(allocator_, util::move(file), offset, &squash);
+    image_ = util::move(squash);
   }
-  const filesystem::Status mounted = filesystem::SquashFileSystem::mount(allocator_, util::move(file), offset, &image_);
   if (mounted == filesystem::Status::OutOfMemory) return fail("not enough memory to open the AppImage");
   if (mounted != filesystem::Status::Ok) return fail("the AppImage's image cannot be read (it is damaged, or of a kind this OS does not know)");
 
@@ -98,7 +108,7 @@ bool AppImageSession::prepare(filesystem::IFileSystem& files, StringView path, S
   String host_mount(allocator_);
   if (!host_mount.assign(kWorldRoot) || !host_mount.append(mount_.view())) return fail("not enough memory");
   graft_ = UniquePointer<filesystem::GraftFileSystem>::make(allocator_, allocator_, files, *image_);
-  if (!graft_ || !graft_->set_mount_point(host_mount.view())) return fail("not enough memory");
+  if (!graft_ || !graft_->set_mount_point(host_mount.view()) || !graft_->set_link_root(kWorldRoot)) return fail("not enough memory");
 
   // The runtime's variables, then whatever the caller had.
   String appimage(allocator_), owd(allocator_), argv0(allocator_), appdir(allocator_), pwd(allocator_);

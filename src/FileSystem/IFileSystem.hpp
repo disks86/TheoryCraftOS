@@ -92,6 +92,15 @@ class IFileSystem {
     (void)path; (void)target; (void)target_is_directory;
     return Status::Unsupported;
   }
+  // For a file system mounted inside another one's tree (GraftFileSystem): does `path` leave this file system through a symbolic link that points
+  // outside it - an absolute target, or ".." above the root (the last component is followed only with `follow_last`)? Ok with *exit empty if it
+  // does not (or this file system has no links); otherwise *exit is where the path goes on: "/abs/target/rest" from the root of the tree this file
+  // system is mounted in, or "../rest" from its own root (the mount point). Any other status is what stat() would answer for the path.
+  virtual Status resolve_exit(StringView path, bool follow_last, String* exit) {
+    (void)path; (void)follow_last;
+    exit->clear();
+    return Status::Ok;
+  }
 
  protected:
   constexpr IFileSystem() = default;
