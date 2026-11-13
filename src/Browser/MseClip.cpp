@@ -36,17 +36,39 @@ MseClip::Child* MseClip::child_of(uint32_t buffer, uint8_t part) {
   return nullptr;
 }
 
+void MseClip::retire(Child& c) {
+  uint64_t presented = 0, dropped = 0;
+  if (c.clip && c.video && c.clip->frame_counts(&presented, &dropped)) {
+    presented_before_ += presented;
+    dropped_before_ += dropped;
+  }
+  c.clip.reset();
+}
+
+bool MseClip::frame_counts(uint64_t* presented, uint64_t* dropped) {
+  *presented = presented_before_;
+  *dropped = dropped_before_;
+  for (uint32_t i = 0; i < kMaxChildren; ++i) {
+    uint64_t p = 0, d = 0;
+    if (used_[i] && children_[i].clip && children_[i].video && children_[i].clip->frame_counts(&p, &d)) {
+      *presented += p;
+      *dropped += d;
+    }
+  }
+  return true;
+}
+
 void MseClip::drop(Child* c) {
   for (uint32_t i = 0; i < kMaxChildren; ++i) {
     if (&children_[i] != c) continue;
-    children_[i].clip.reset();
+    retire(children_[i]);
     used_[i] = false;
   }
 }
 
 void MseClip::drop_all() {
   for (uint32_t i = 0; i < kMaxChildren; ++i) {
-    children_[i].clip.reset();
+    retire(children_[i]);
     used_[i] = false;
   }
 }
@@ -185,6 +207,7 @@ bool MseClip::open_child(media::MseBuffer& buffer, uint8_t part, const media::Ms
     hub_.end_of_stream(source_, 3);
     return false;
   }
+  retire(*into);
   into->clip = util::move(clip);
   into->buffer = buffer.id();
   into->part = part;
@@ -291,11 +314,26 @@ void MseClip::update() {
           uint8_t missing[16];
           have_plan = buffer.plan_for(position_, &plan, keys_, missing) == media::MsePlan::Ok;
           if (!have_plan || buffer.changed_since(c->epoch, position_, c->end)) rebuild = true;
-          else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack && (c->end - position_ < kRefillAhead || master_stopped)) rebuild = true;
-          else {
+          else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack) {
+            // More data follows the file: it is written out once the playhead comes near the file's end. Until then what was appended is not marked as seen,
+            // so the next update looks again (a page that appends everything at once and then waits would otherwise stop at the end of the first file).
+            if (c->end - position_ < kRefillAhead || master_stopped) rebuild = true;
+          } else {
             c->appended = buffer.appended();
             c->epoch = buffer.epoch();
             c->key_epoch = keys_ ? keys_->key_epoch() : 0;
+          }
+        }
+        if (!rebuild && (master_stopped || position_ >= c->end - 30000)) {
+          // The file has played to its end, and nothing new was appended: what follows may be data that was there all along but not in the file (a new
+          // initialization segment starts another file: YouTube repeats it in every answer). The playhead goes on at the file's end.
+          uint8_t missing[16];
+          media::MseSnapshotPlan next;
+          if (buffer.plan_for(c->end, &next, keys_, missing) == media::MsePlan::Ok && next.end_us > c->end + kStartSlack) {
+            plan = next;
+            have_plan = true;
+            rebuild = true;
+            if (position_ < c->end) position_ = c->end;
           }
         }
       } else {

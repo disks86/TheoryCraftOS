@@ -69,6 +69,15 @@ struct Node {
   uint16_t caret = 0xFFFF, anchor = 0xFFFF;   // a text control: where the caret is and the other end of the selection (0xFFFF: at the end)
   uint8_t form_state = 0;    // elements: what the user (or a script) changed in a form control, and whether it is focused (FormState bits, Form.hpp)
   uint8_t ui_state = 0;      // elements: kUiHover while the pointer is over it (or a descendant), kUiActive while it is pressed
+  // The document's style clock (Document::style_clock) when a change was made that may alter the computed style of this node and of everything under it (an
+  // attribute of an element; the children of an element, fragment or the document; the text of a child), and when an attribute of one of its children changed
+  // (selectors with + or ~ read the siblings).
+  uint64_t style_stamp = 0, child_attribute_stamp = 0;
+  // The same for changes that can change which selectors match (all of the above but the style attribute and animated styles: those change values only).
+  uint64_t match_stamp = 0;
+  bool motion_tracked = false;   // elements: the built-in script for CSS transitions and animations keeps state for it (see __motion_changed)
+  bool motion_rules = false;     // elements: a rule may give it a transition or an animation (StyleSheet::may_have_motion), as of motion_checked
+  uint64_t motion_checked = 0;
 
   bool is_element() const { return type == NodeType::Element; }
   bool is_text() const { return type == NodeType::Text; }
@@ -132,14 +141,52 @@ class Document {
 
   // Changes through the functions below bump this.
   uint64_t version() const { return version_; }
+  // A change somewhere: anything's style may have changed.
   void touch() {
     ++version_;
+    ++style_epoch_;
     if (change_hook_) change_hook_(change_context_);
   }
+  // A change at `node` (the tree functions below say where): the computed styles that may have changed are those of `node` and what is under it (with
+  // `attribute`, also its parent's other children, for sibling selectors). See Node::style_stamp.
+  // `values_only`: the change cannot change which selectors match (the style attribute).
+  void touch_at(Node* node, bool attribute, bool values_only = false) {
+    ++version_;
+    ++style_clock_;
+    if (node) {
+      node->style_stamp = style_clock_;
+      if (!values_only) node->match_stamp = style_clock_;
+      if (attribute && !values_only && node->parent) node->parent->child_attribute_stamp = style_clock_;
+    } else {
+      ++style_epoch_;
+    }
+    if (change_hook_) change_hook_(change_context_);
+  }
+  // A change of the attribute `name` of `element`: touch_at(element, true), unless the attribute filter says no style can depend on it (then only the version
+  // moves: the layout may still read it).
+  void touch_attribute(Node* element, StringView name) {
+    if (attribute_filter_ && !attribute_filter_(attribute_filter_context_, name)) {
+      ++version_;
+      if (change_hook_) change_hook_(change_context_);
+      return;
+    }
+    touch_at(element, true, name.equals("style"));
+  }
+  // Says whether a style may depend on an attribute of that name (the page sets it from its style sheet; without one every attribute counts).
+  void set_attribute_filter(bool (*filter)(void*, StringView), void* context) {
+    attribute_filter_ = filter;
+    attribute_filter_context_ = context;
+  }
+  // The style clock (moves with every touch_at) and the epoch (moves with every change that does not say where it was: every style may have changed).
+  uint64_t style_clock() const { return style_clock_; }
+  uint64_t style_epoch() const { return style_epoch_; }
   // A change that running animations made to the style (they do not count as a change of the page for what starts new animations and transitions).
-  void touch_animated() {
+  void touch_animated(Node* node = nullptr) {
     ++version_;
     ++animation_touches_;
+    ++style_clock_;
+    if (node) node->style_stamp = style_clock_;
+    else ++style_epoch_;
   }
   uint64_t style_version() const { return version_ - animation_touches_; }
   // Called by touch(): the page changed (a script sees it as "the style may have changed").
@@ -181,6 +228,9 @@ class Document {
   Node* root_ = nullptr;
   List<Node*> nodes_;
   uint64_t version_ = 1;
+  uint64_t style_clock_ = 0, style_epoch_ = 0;
+  bool (*attribute_filter_)(void*, StringView) = nullptr;
+  void* attribute_filter_context_ = nullptr;
   uint64_t animation_touches_ = 0;
   void (*change_hook_)(void*) = nullptr;
   void* change_context_ = nullptr;

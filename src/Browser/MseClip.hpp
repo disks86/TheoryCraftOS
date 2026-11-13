@@ -56,6 +56,7 @@ class MseClip final : public IVideoClip {
   uint32_t seekable(ArrayView<double> pairs) override;
   uint8_t error() override { return error_; }
   bool waiting_for_key() override { return need_key_; }
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override;
   // The keys to decrypt with (null: none; encrypted content then waits).
   void set_keys(const media::IMseKeys* keys) { keys_ = keys; }
 
@@ -73,6 +74,8 @@ class MseClip final : public IVideoClip {
   static constexpr uint32_t kMaxChildren = media::MseHub::kMaxBuffersPerSource * 2;
 
   Child* child_of(uint32_t buffer, uint8_t part);
+  void retire(Child& c);   // (its clip goes: what it showed and dropped is kept in the totals)
+  uint64_t presented_before_ = 0, dropped_before_ = 0;
   void drop(Child* c);
   void drop_all();
   bool open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into);

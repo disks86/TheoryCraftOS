@@ -208,6 +208,7 @@ class WebBrowser : public gui::Frame {
     void prefetch(StringView address) override;
     UniquePointer<browser::IVideoClip> open_video(UniquePointer<ByteBuffer> data) override;
     UniquePointer<browser::IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override;
+    bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) override;
     void navigate(StringView address, bool replace) override;
     void navigate_post(StringView address, StringView content_type, StringView body) override;
     bool clipboard_get(String* text) override;

@@ -23,11 +23,13 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <map>
 #include <algorithm>
 #include <time.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +55,98 @@
 #include "Paint/DisplayPainter.hpp"
 
 using namespace browser;
+
+#ifdef PROBE_REAL_MEDIA
+// (the probe's own build only: tests/run_host_tests.sh does not link the players) Videos of a probed page are decoded for real by the kernel's video::VideoPlayer
+// and its software codecs, on a clock that is the page's clock, so a page's player sees time pass as in the browser and the decoders' cost shows in a profile.
+#include "Hardware/VideoCodec/SystemVideoCodecs.hpp"
+#include "Hardware/Bus/Pci/IPciBus.hpp"
+#include "Media/ByteSource.hpp"
+#include "Video/VideoPlayer.hpp"
+namespace probe_media {
+uint64_t* page_clock_ms = nullptr;   // (FakeEnvironment::clock)
+uint64_t decoded_frames = 0, decode_us = 0, copies = 0, copy_failures = 0;
+struct PageClock final : hardware::IClock {
+  const char* name() const override { return "page clock"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint64_t now_us() const override { return page_clock_ms ? *page_clock_ms * 1000 : 0; }
+};
+struct NoPci final : hardware::IPciBus {
+  const char* name() const override { return "no pci"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t device_count() const override { return 0; }
+  bool pci_device(uint32_t, hardware::PciDeviceInfo*) const override { return false; }
+  uint32_t read32(hardware::PciAddress, uint16_t) const override { return 0; }
+  void write32(hardware::PciAddress, uint16_t, uint32_t) const override {}
+  uint64_t memory_bar(hardware::PciAddress, uint8_t) const override { return 0; }
+  uint16_t find_capability(hardware::PciAddress, uint8_t) const override { return 0; }
+};
+PageClock clock;
+NoPci pci;
+hardware::SystemVideoCodecs* codecs = nullptr;
+class Clip final : public IVideoClip {
+ public:
+  Clip(allocators::IAllocator& a, UniquePointer<ByteBuffer> data) : data_(static_cast<UniquePointer<ByteBuffer>&&>(data)), source_(data_->view()), player_(clock, *codecs, a) {}
+  bool open() { return player_.open_media(source_) == video::OpenResult::Ok; }
+  bool play() override { return player_.play(); }
+  void pause() override { player_.pause(); }
+  void seek(int64_t us) override { player_.seek(us); }
+  void set_looping(bool l) override { player_.set_looping(l); }
+  void set_volume(double, bool) override {}
+  bool playing() override { return player_.playing(); }
+  int64_t position_us() override { return player_.position_us(); }
+  int64_t duration_us() override { return player_.duration_us(); }
+  uint32_t width() override { return player_.frame_width(); }
+  uint32_t height() override { return player_.frame_height(); }
+  void update() override {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    const uint32_t before = player_.picture_serial();
+    player_.update();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    decode_us += static_cast<uint64_t>((t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000);
+    if (player_.picture_serial() != before) ++decoded_frames;
+  }
+  bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) override {
+    if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) { ++copy_failures; return false; }
+    const bool ok = player_.copy_picture(dest.data(), pitch, serial);
+    ++(ok ? copies : copy_failures);
+    return ok;
+  }
+  bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
+    *presented = player_.frames_presented();
+    *dropped = player_.frames_skipped();
+    return true;
+  }
+ private:
+  UniquePointer<ByteBuffer> data_;
+  media::MemoryByteSource source_;
+  video::VideoPlayer player_;
+};
+// A sound: not played (no mixer), its position follows the page clock while it plays.
+class Sound final : public IVideoClip {
+ public:
+  bool play() override { if (!playing_) { playing_ = true; started_ = now(); } return true; }
+  void pause() override { if (playing_) { base_ = position_us(); playing_ = false; } }
+  void seek(int64_t us) override { base_ = us; started_ = now(); }
+  void set_looping(bool) override {}
+  void set_volume(double, bool) override {}
+  bool playing() override { return playing_; }
+  int64_t position_us() override { return playing_ ? base_ + (now() - started_) : base_; }
+  int64_t duration_us() override { return -1; }
+  uint32_t width() override { return 0; }
+  uint32_t height() override { return 0; }
+  void update() override {}
+  bool copy_picture(ArrayView<uint32_t>, uint32_t, uint32_t*) override { return false; }
+ private:
+  static int64_t now() { return static_cast<int64_t>(clock.now_us()); }
+  bool playing_ = false;
+  int64_t base_ = 0, started_ = 0;
+};
+}  // namespace probe_media
+#endif
 
 static int g_failed = 0;
 #define CHECK(...) do { if (!(__VA_ARGS__)) { printf("FAILED line %d: %s\n", __LINE__, #__VA_ARGS__); ++g_failed; } } while (0)
@@ -157,6 +251,16 @@ static const char kWptReporter[] = R"JS(
 }());
 )JS";
 
+static std::string probe_read_all(const std::string& path) {
+  std::string s;
+  if (FILE* f = fopen(path.c_str(), "rb")) {
+    char chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) s.append(chunk, n);
+    fclose(f);
+  }
+  return s;
+}
+
 // PROBE_LIVE=host: a file the probe's directory lacks is fetched once from https://<host>/ with curl and kept there (a big site loads its chunks on demand).
 static void probe_mirror(const std::string& rel, const std::string& path) {
   const char* host = getenv("PROBE_LIVE");
@@ -218,9 +322,10 @@ constexpr int kDepth = 48, kMax = 400000;
 void* g_frames[kMax][kDepth];
 int g_depths[kMax];
 volatile int g_count = 0;
+volatile bool g_on = true;   // (PROBE_PROFILE_FROM / PROBE_PROFILE_TO: seconds of page time in the PROBE_BROWSER loop that are sampled)
 void on_tick(int) {
   const int at = g_count;
-  if (at >= kMax) return;
+  if (at >= kMax || !g_on) return;
   g_depths[at] = backtrace(g_frames[at], kDepth);
   g_count = at + 1;
 }
@@ -234,6 +339,21 @@ void start() {
 void report() {
   itimerval off{};
   setitimer(ITIMER_PROF, &off, nullptr);
+  if (const char* dump = getenv("PROBE_PROFILE_DUMP")) {   // (every sample's frames as offsets in the probe binary, one sample a line, innermost first: for addr2line)
+    if (FILE* f = fopen(dump, "w")) {
+      Dl_info self_info;
+      dladdr(reinterpret_cast<void*>(&report), &self_info);
+      for (int i = 0; i < g_count; ++i) {
+        for (int k = 2; k < g_depths[i]; ++k) {
+          Dl_info info;
+          if (dladdr(g_frames[i][k], &info) && info.dli_fbase == self_info.dli_fbase) fprintf(f, "%lx ", static_cast<unsigned long>(static_cast<char*>(g_frames[i][k]) - static_cast<char*>(info.dli_fbase) - 1));
+          else fprintf(f, "x ");
+        }
+        fprintf(f, "\n");
+      }
+      fclose(f);
+    }
+  }
   std::map<void*, std::string> names;
   auto name_of = [&](void* a) -> const std::string& {
     auto it = names.find(a);
@@ -388,6 +508,35 @@ struct FakeNet final : IPageLoader {
           }
       }
     }
+    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && key.find("POST https://") == 0 && key.find(".googlevideo.com/") != std::string::npos) {
+      // (PROBE: the video player's streaming requests (SABR: a protobuf body, a UMP answer) go to the live server; the address is bound to this machine's IP)
+      const std::string address = key.substr(5);
+      if (address.find('\'') == std::string::npos) {
+        const std::string dir = getenv("PROBE_ROOT"), body_file = dir + "/_gv_body", out_file = dir + "/_gv_answer", head_file = dir + "/_gv_head";
+        if (FILE* f = fopen(body_file.c_str(), "wb")) { fwrite(request.body.data(), 1, request.body.size(), f); fclose(f); }
+        remove(out_file.c_str());
+        const std::string cmd = "curl -s -m 60 -A 'Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)' -H 'Origin: https://www.youtube.com' -H 'Referer: https://www.youtube.com/' -H 'Content-Type: application/x-protobuf' --data-binary @'" + body_file + "' -D '" + head_file + "' -o '" + out_file + "' '" + address + "'";
+        const int status = system(cmd.c_str());
+        std::string head = probe_read_all(head_file), body = probe_read_all(out_file);
+        uint32_t code = 0;
+        if (head.compare(0, 5, "HTTP/") == 0) code = static_cast<uint32_t>(atoi(head.c_str() + head.find(' ') + 1));
+        printf("probe live POST googlevideo: curl %d, status %u, %zu bytes in, %zu bytes out\n", status, code, request.body.size(), body.size());
+        if (status == 0 && code) {
+          a.status = code;
+          a.headers.clear();
+          for (size_t at = head.find('\n') + 1; at < head.size();) {   // (the server's headers, minus the framing ones curl undid)
+            size_t end = head.find('\n', at);
+            if (end == std::string::npos) end = head.size();
+            const std::string line = head.substr(at, end - at);
+            at = end + 1;
+            if (line.size() <= 1 || strncasecmp(line.c_str(), "transfer-encoding:", 18) == 0 || strncasecmp(line.c_str(), "content-length:", 15) == 0 || strncasecmp(line.c_str(), "content-encoding:", 17) == 0 || strncasecmp(line.c_str(), "access-control-", 15) == 0) continue;
+            a.headers += line + "\n";
+          }
+          a.headers += "Access-Control-Allow-Origin: https://app.example\r\nAccess-Control-Allow-Credentials: true\r\n";
+          a.body = body;
+        }
+      }
+    }
     if (request.headers.contains("If-None-Match")) {   // a revalidation: the answer "<key>#304" if the test has one
       auto not_modified = answers.find(key + "#304");
       if (not_modified != answers.end()) a = not_modified->second;
@@ -501,6 +650,26 @@ struct FakeEnvironment final : IPageEnvironment {
   std::string last_video_data, last_audio_data;   // what the last clip was opened on
   UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override {
     ++opened_video;
+#ifdef PROBE_REAL_MEDIA
+    if (getenv("PROBE_HTML") && data) {
+      if (getenv("PROBE_SAVE_SNAPSHOTS")) {   // (each file the page's MSE data became: PROBE_ROOT/_snapshot<n>)
+        char name[64];
+        snprintf(name, sizeof name, "/_snapshot%d", opened_video);
+        if (FILE* f = fopen((std::string(getenv("PROBE_ROOT")) + name).c_str(), "wb")) { fwrite(data->view().data(), 1, data->size(), f); fclose(f); }
+      }
+      probe_media::page_clock_ms = &clock;
+      if (!probe_media::codecs) {
+        static hardware::SystemVideoCodecs codecs(probe_media::pci, *allocator_for_clips);
+        codecs.initialize();
+        probe_media::codecs = &codecs;
+      }
+      auto clip = UniquePointer<probe_media::Clip>::make(*allocator_for_clips, *allocator_for_clips, static_cast<UniquePointer<ByteBuffer>&&>(data));
+      const bool ok = clip && clip->open();
+      printf("probe: video clip opened %d (%u x %u, %lld us)\n", ok ? 1 : 0, ok ? clip->width() : 0, ok ? clip->height() : 0, ok ? static_cast<long long>(clip->duration_us()) : 0LL);
+      if (!ok) return UniquePointer<IVideoClip>();
+      return UniquePointer<IVideoClip>(static_cast<UniquePointer<probe_media::Clip>&&>(clip));
+    }
+#endif
     if (data) last_video_data.assign(reinterpret_cast<const char*>(data->view().data()), data->size());
     if (!can_play_video) return UniquePointer<IVideoClip>();
     auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
@@ -510,6 +679,12 @@ struct FakeEnvironment final : IPageEnvironment {
   }
   UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override {
     ++opened_audio;
+#ifdef PROBE_REAL_MEDIA
+    if (getenv("PROBE_HTML")) {
+      probe_media::page_clock_ms = &clock;
+      return UniquePointer<IVideoClip>(UniquePointer<probe_media::Sound>::make(*allocator_for_clips));
+    }
+#endif
     if (data) last_audio_data.assign(reinterpret_cast<const char*>(data->view().data()), data->size());
     if (!can_play_video) return UniquePointer<IVideoClip>();
     auto clip = UniquePointer<FakeClip>::make(*allocator_for_clips);
@@ -814,6 +989,28 @@ static void test_style() {
            "console.log(d.transitionProperty, d.transitionDuration, d.animationName, d.animationIterationCount, d.getPropertyValue('animation-play-state'));"
            "q.className = 'u'; console.log(d.transitionDuration, d.getPropertyValue('transition-property'))",
            "opacity 2s ease-in 1s spin 1s | all 0s none 1 running | 3s all"));
+  // the computed styles kept between reads follow every kind of change: an ancestor's class and style attribute, a sibling's class (+ and ~), a child added
+  // (:empty, :first-child, :has()), text, an element taken out of the page and put back elsewhere, a <style> that changes
+  CHECK(js("<style>.red p{color:red} .a + p{font-weight:700} .a ~ span{font-style:italic} p:first-child{margin-top:5px} div:empty{display:none} section:has(.m) b{color:blue} #o b{color:green}</style>"
+           "<div id=d><p id=p>x</p><p id=q>y</p><span id=i>z</span></div><div id=e></div><section id=s><b id=b>b</b></section><div id=o></div>",
+           "var $ = function (id) { return document.getElementById(id) }, c = function (id, prop) { return getComputedStyle($(id))[prop] };"
+           "var r = [c('p', 'color'), c('q', 'fontWeight'), c('i', 'fontStyle'), c('q', 'marginTop'), c('e', 'display'), c('b', 'color')];"
+           "$('d').className = 'red'; r.push(c('p', 'color'), c('q', 'color'));"
+           "$('d').style.color = 'rgb(1, 2, 3)'; r.push(c('i', 'color'));"
+           "$('p').className = 'a'; r.push(c('q', 'fontWeight'), c('i', 'fontStyle'));"
+           "$('d').insertBefore(document.createElement('p'), $('p')); r.push(c('p', 'marginTop'));"
+           "$('e').textContent = 't'; r.push(c('e', 'display'));"
+           "var m = document.createElement('u'); m.className = 'm'; $('s').appendChild(m); r.push(c('b', 'color'));"
+           "var B = $('b'); $('o').appendChild(B); r.push(c('b', 'color'));"
+           "B.remove(); r.push(getComputedStyle(B).color !== 'rgb(0, 128, 0)');"
+           "document.querySelector('style').textContent += ' span{color:rgb(9, 9, 9)}'; $('d').style.color = ''; r.push(c('i', 'color'));"
+           "console.log(r.join(' '))",
+           "rgb(0, 0, 0) 400 normal 16px none rgb(0, 0, 0) rgb(255, 0, 0) rgb(255, 0, 0) rgb(1, 2, 3) 700 italic 16px block rgb(0, 0, 255) rgb(0, 128, 0) true rgb(9, 9, 9)"));
+  // the root element's client size is the viewport's (YouTube sizes its player by document.documentElement.clientHeight), however short the page is
+  // (in quirks mode, a page without a doctype, the body's is)
+  CHECK(is("<!doctype html><html><body><p>short</p><script>var d = document.documentElement; console.log(d.clientWidth, d.clientHeight, d.scrollHeight >= innerHeight, document.body.clientHeight < innerHeight)</script></body></html>",
+           "640 480 true true"));
+  CHECK(js("<p>short</p>", "console.log(document.body.clientWidth, document.body.clientHeight, document.documentElement.clientHeight < innerHeight)", "640 480 true"));
   // long strings built a piece at a time share a buffer: the branches of one prefix and the old values stay as they were, and the hash of an appended string is the one
   // of the same text made another way (a property key)
   CHECK(js("<p>x</p>",
@@ -2305,6 +2502,40 @@ static void test_mse() {
     CHECK(first_wait != std::string::npos && again.find("playing", first_wait) != std::string::npos);
   }
   CHECK(a.live == 0);
+  {   // the initialization segment again in the middle (YouTube sends it with every answer), all appended before playing: the first file ends where the second
+      // initialization segment begins, and playing goes on into the next file without anything new being appended (it used to wait there for ever)
+    FakeEnvironment env(a);
+    mse_serve(env, "mse_muxed.mp4");
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    std::string html = std::string("<html><body><video id=v width=96 height=64></video><button id=b></button><button id=e></button><script>") + kLoad + "var v = document.getElementById('v');" + watch +
+        "var ms = new MediaSource(), sb, parts;"
+        "load(['mse_muxed.mp4'], function (u8) {"
+        "  parts = [u8.slice(0, 18485), u8.slice(0, 1250), u8.slice(18485)];"   // (the first fragment; the initialization segment again; the second fragment)
+        "  ms.addEventListener('sourceopen', function() {"
+        "    sb = ms.addSourceBuffer(" + type + ");"
+        "    sb.addEventListener('updateend', function() { if (parts.length) sb.appendBuffer(parts.shift()); else if (ms.readyState === 'open') ms.endOfStream() });"
+        "    sb.appendBuffer(parts.shift());"
+        "  });"
+        "  v.src = URL.createObjectURL(ms);"
+        "});"
+        "v.addEventListener('ended', function() { console.log('ENDED ' + ev.join() + ' ' + v.currentTime.toFixed(2)) });"
+        "document.getElementById('b').onclick = function() { v.play() };"
+        "document.getElementById('e').onclick = function() { console.log('STATE ' + ev.join() + ' ' + v.currentTime.toFixed(2) + ' ' + v.readyState + ' ' + sb.buffered.end(0).toFixed(2)) };"
+        "</script></body></html>";
+    page.load(StringView(html.data(), html.size()));
+    HtmlDocument doc(a);
+    page.render(&doc);
+    mse_pump(page, env, 16, &doc);
+    click(page, "b");
+    mse_pump(page, env, 30, &doc);
+    click(page, "e");
+    const std::string out = page_log(page);
+    CHECK(out.find("ENDED ") != std::string::npos && out.find(" 2.08") != std::string::npos);
+    CHECK(env.opened_video >= 2);   // (a file for each initialization segment)
+    if (out.find("ENDED ") == std::string::npos) printf("  generation boundary: %s\n", out.c_str());
+  }
+  CHECK(a.live == 0);
   {   // seeking inside the data, remove(), the buffers
     FakeEnvironment env(a);
     mse_serve(env, "mse_muxed.mp4");
@@ -3534,7 +3765,7 @@ static std::string run_async(const char* script, const char* address, const std:
       double due;
       if (!page.next_timer(&due)) break;
       if (getenv("TRACE")) printf("round %d due %.0f clock %llu\n", i, due, (unsigned long long)env.clock);
-      if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+      if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
       page.run_due_timers(env.clock);
     }
     out = std::string(page.log().data(), page.log().size());
@@ -3637,6 +3868,15 @@ static void test_headers() {
 }
 
 static void test_blob_text() {
+  // navigator.mediaCapabilities: without a video engine (this test's environment has none) a size the CPU decodes in time is smooth, a bigger one is not, AV1
+  // costs the most; nothing is power efficient; sound is both. getVideoPlaybackQuality() counts what the clip shows (an element with no clip: nothing).
+  CHECK(async_is("var mc = navigator.mediaCapabilities, v = function (type, w, h) { return mc.decodingInfo({ type: 'media-source', video: { contentType: type, width: w, height: h, bitrate: 1e6, framerate: 30 } }) };"
+                 "Promise.all([v('video/mp4; codecs=\"avc1.4d401f\"', 1280, 720), v('video/mp4; codecs=\"avc1.640028\"', 1920, 1080), v('video/webm; codecs=\"vp9\"', 854, 480), v('video/webm; codecs=\"vp9\"', 1280, 720),"
+                 "  v('video/mp4; codecs=\"av01.0.04M.08\"', 854, 480), v('video/mp4; codecs=\"av01.0.12M.08\"', 3840, 2160), v('video/ogg; codecs=\"theora\"', 640, 360),"
+                 "  mc.decodingInfo({ type: 'media-source', audio: { contentType: 'audio/webm; codecs=\"opus\"', channels: '2', bitrate: 128000, samplerate: 48000 } })])"
+                 ".then(function (all) { console.log(all.map(function (i) { return [i.supported, i.smooth, i.powerEfficient].map(Number).join('') }).join(' ')) });"
+                 "var q = document.createElement('video').getVideoPlaybackQuality(); console.log(q.totalVideoFrames, q.droppedVideoFrames, q.corruptedVideoFrames, typeof q.creationTime);",
+                 "0 0 0 number | 110 100 110 100 110 100 000 111"));
   CHECK(async_is("var b = new Blob(['ab', new Blob(['cd']), new Uint8Array([101, 102])], { type: 'Text/Plain' }); console.log(b.size, b.type, b instanceof Blob); b.text().then(function (t) { console.log(t) }); b.slice(1, 4, 'x/y').text().then(function (t) { console.log(t) });"
                   "b.slice(-2).text().then(function (t) { console.log(t) }); b.arrayBuffer().then(function (u) { console.log(u.length, u[0]) });", "6 text/plain true | abcdef | bcd | ef | 6 97"));
   CHECK(async_is("var f = new File(['hello'], 'a.txt', { type: 'text/plain', lastModified: 5 }); console.log(f.name, f.size, f.type, f.lastModified, f instanceof Blob, f instanceof File); try { new File(['x']) } catch (e) { console.log(e.name) }", "a.txt 5 text/plain 5 true true | TypeError"));
@@ -3924,7 +4164,7 @@ static std::string nav_run(const char* script, const char* address, const std::f
         pump();
         double due;
         if (!page.next_timer(&due)) break;
-        if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+        if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
         page.run_due_timers(env.clock);
       }
       pump();
@@ -4289,7 +4529,7 @@ static std::string clip_run(const char* body, const char* head_script, const std
       for (int i = 0; i < 100; ++i) {
         double due;
         if (!page.next_timer(&due) || (!all && due > env.clock)) break;
-        if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+        if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
         page.run_due_timers(env.clock);
       }
     };
@@ -4878,7 +5118,7 @@ static void test_text_tracks() {
       for (int i = 0; i < rounds; ++i) {
         double due;
         if (page.next_timer(&due)) {
-          if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+          if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
           page.run_due_timers(env.clock);
         }
         page.render(&doc);
@@ -5518,8 +5758,11 @@ static void serve(FakeEnvironment& env, const char* path, const char* type, cons
 static void settle_page(Page& page, FakeEnvironment& env, int rounds = 600) {
   for (int i = 0; i < rounds; ++i) {
     double due;
-    if (!page.next_timer(&due)) break;
-    if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+    if (!page.next_timer(&due)) {
+      if (getenv("PROBE_HTML")) printf("settle: no timer after %d rounds (clock %llu)\n", i, static_cast<unsigned long long>(env.clock));
+      break;
+    }
+    if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
     page.run_due_timers(env.clock);
   }
 }
@@ -5739,6 +5982,18 @@ static void test_service_workers() {
        "", [v2](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", v2); }}},
       "v1 || updatefound installing update true found=1 installing=installing waiting=installed active=activated installing=null still v1 now waiting=null active=activated v2 same script: installing=null",
       [v1](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", v1); }));
+
+  // a worker with an interval (YouTube's listens to cookieStore, which polls): events are run to their end without running the interval ahead (it used to tick
+  // some 25000 times for every fetch and move the worker's clock hours on)
+  const std::string ticking = "var ticks = 0, born = Date.now(); setInterval(function () { ticks++; }, 250);"
+                              "self.addEventListener('activate', function (e) { e.waitUntil(clients.claim()); });"
+                              "self.addEventListener('fetch', function (e) { if (new URL(e.request.url).pathname === '/ticks') e.respondWith(new Promise(function (r) { setTimeout(function () { r(new Response(ticks + ' ' + (Date.now() - born < 60000))); }, 10); })); });";
+  CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
+      "navigator.serviceWorker.register('/sw.js').then(function () { return navigator.serviceWorker.ready; }).then(function () { return wait(20); }).then(function () { return fetch('/ticks'); })"
+      ".then(function (r) { return r.text(); }).then(function (t) { var n = +t.split(' ')[0]; log((n < 40) + ' ' + t.split(' ')[1]); return fetch('/ticks'); })"
+      ".then(function (r) { return r.text(); }).then(function (t) { var n = +t.split(' ')[0]; log((n < 40) + ' ' + t.split(' ')[1]); done(); }).catch(fail);"}},
+      "true true true true",
+      [ticking](FakeEnvironment& env) { serve(env, "/sw.js", "application/javascript", ticking); }));
 
   // what register() refuses
   CHECK(visits_are({{"https://app.example/dir/page.html", std::string(kSwPrelude) +
@@ -6700,7 +6955,7 @@ static int run_real_wpt(const char* root, const char* file) {
       page.load_frames_all();   // (what the desktop does when it draws: frames that were pointed somewhere load, and tell the page)
       double due;
       if (!page.next_timer(&due)) break;
-      if (due > env.clock) env.clock = static_cast<uint64_t>(due);
+      if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));   // (up: a timer due at 1198.6 ms is not due at 1198)
       page.run_due_timers(env.clock);
       if (!env.console_lines.empty() && env.console_lines.back().compare(0, 7, "WPTDONE") == 0) break;
     }
@@ -6718,6 +6973,7 @@ int main(int argc, char** argv) {
   if (const char* real = getenv("WPT_REAL_FILE")) return run_real_wpt(getenv("WPT_ROOT") ? getenv("WPT_ROOT") : ".", real);
   if (const char* html_file = getenv("PROBE_HTML")) {   // loads a saved page as the document at https://app.example/ (PROBE_ROOT serves its files) and prints the log
     if (getenv("PROBE_PROFILE")) probe_profile::start();
+    if (getenv("PROBE_PROFILE_FROM")) probe_profile::g_on = false;
     if (getenv("PROBE_VERIFY_GC")) {   // (every minor collection checks that no store missed Vm::barrier: slow)
       script::Vm::verify_generations = true;
       script::Vm::generation_error = [](const char* what) {
@@ -6755,8 +7011,85 @@ int main(int argc, char** argv) {
         printf("first draw %d: %.*s\n", ok0 ? 1 : 0, static_cast<int>(t.size()), t.view().data());
         fflush(stdout);
       }
+      if (getenv("PROBE_BROWSER")) {   // what the desktop's browser does: timers, then the videos and pictures step, then a new picture when the page changed (10 a second at most)
+        font::FontSet loop_fonts(a);
+        loop_fonts.add_bundled_fonts();
+        const int rounds = getenv("PROBE_SETTLE") ? atoi(getenv("PROBE_SETTLE")) : 20000;
+        const uint64_t until = env.clock + static_cast<uint64_t>(atof(getenv("PROBE_BROWSER")) * 1000);   // (seconds of page time)
+        uint64_t last_draw = 0;
+        uint32_t draws = 0;
+        // PROBE_REALTIME=1: the page's clock is this machine's (a slow frame delays the next, as in the browser), moved forward only over idle time
+        const bool realtime = getenv("PROBE_REALTIME") != nullptr;
+        auto wall_ms = []() { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u; };
+        const uint64_t wall_start = wall_ms(), clock_start = env.clock;
+        uint64_t skipped = 0;
+        for (int i = 0; i < rounds && env.clock < until; ++i) {
+          double due;
+          if (!page.next_timer(&due)) due = static_cast<double>(env.clock + 33);
+          if (due > static_cast<double>(env.clock + 33)) due = static_cast<double>(env.clock + 33);   // (a frame at least every 33 ms, as a playing video wants)
+          if (realtime) {
+            const uint64_t now = clock_start + (wall_ms() - wall_start) + skipped;
+            if (due > now) skipped += static_cast<uint64_t>(ceil(due)) - now;   // (nothing to do until then: no need to wait for it)
+            env.clock = clock_start + (wall_ms() - wall_start) + skipped;
+          } else if (due > env.clock) env.clock = static_cast<uint64_t>(ceil(due));
+          if (getenv("PROBE_PROFILE_FROM")) {
+            const double t = static_cast<double>(env.clock - 1700000000000ull) / 1000;
+            probe_profile::g_on = t >= atof(getenv("PROBE_PROFILE_FROM")) && (!getenv("PROBE_PROFILE_TO") || t < atof(getenv("PROBE_PROFILE_TO")));
+          }
+          if (const char* resize = getenv("PROBE_RESIZE_AT")) {   // (PROBE_RESIZE_AT=<ms>:<width>x<height>: the browser window changes size then)
+            uint64_t at = 0;
+            uint32_t w = 0, h = 0;
+            if (sscanf(resize, "%llu:%ux%u", reinterpret_cast<unsigned long long*>(&at), &w, &h) == 3 && env.clock - clock_start >= at) {
+              media.width = w;
+              media.height = h;
+              page.set_media(media);
+              printf("probe: resized to %u x %u at +%llu ms\n", w, h, static_cast<unsigned long long>(env.clock - clock_start));
+              unsetenv("PROBE_RESIZE_AT");
+            }
+          }
+          page.run_due_timers(env.clock);
+          page.step_objects(static_cast<double>(env.clock));
+          if (env.clock / 5000 != (env.clock - 1) / 5000 || i == 0) {   // (every 5 s of page time: how much CPU those 5 s took)
+            static double last_cpu = 0;
+            struct rusage ru;
+            getrusage(RUSAGE_SELF, &ru);
+            const double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+            printf("browser loop: page +%llu ms, cpu %.2f s since the last line, %u draws\n", static_cast<unsigned long long>(env.clock - 1700000000000ull), cpu - last_cpu, draws);
+            fflush(stdout);
+            last_cpu = cpu;
+          }
+          const char* png_at = getenv("PROBE_PNG_AT");   // (PROBE_PNG_AT=<ms of page time>: the page then, painted with its videos, to PROBE_PNG)
+          const bool snap = png_at && env.clock - clock_start >= static_cast<uint64_t>(atoll(png_at)) && getenv("PROBE_PNG");
+          if ((page.changed() && env.clock >= last_draw + 100) || snap) {
+            PagePicture pic(a);
+            const bool drew = page.render_picture(&pic, loop_fonts);
+            last_draw = env.clock;
+            ++draws;
+            if (snap && drew) {
+              const int32_t w = static_cast<int32_t>(media.width), h = static_cast<int32_t>(media.height);
+              media::Image image(a);
+              image.create(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+              graphics::Surface surface = image.surface(0);
+              graphics::SoftwareRenderer2D renderer(surface, nullptr, &a);
+              renderer.set_blend(graphics::BlendMode::Replace);
+              renderer.fill_rect(graphics::Rect2D{0, 0, w, h}, pic.list.background() ? pic.list.background() : 0xFFFFFFFFu);
+              paint::DisplayPainter painter(a, loop_fonts, &page.objects());
+              painter.paint(renderer, pic.list, 0, 0, graphics::Rect2D{0, 0, w, h});
+              ByteBuffer png(a);
+              if (media::encode_png(image, 6, &png))
+                if (FILE* f = fopen(getenv("PROBE_PNG"), "wb")) { fwrite(png.view().data(), 1, png.view().size(), f); fclose(f); }
+              printf("probe: painted the page at +%llu ms to %s\n", static_cast<unsigned long long>(env.clock - clock_start), getenv("PROBE_PNG"));
+              unsetenv("PROBE_PNG_AT");
+            }
+          }
+        }
+#ifdef PROBE_REAL_MEDIA
+        printf("probe media: %llu pictures decoded in %.2f s, %llu copied, %llu copies refused\n", (unsigned long long)probe_media::decoded_frames, probe_media::decode_us / 1e6, (unsigned long long)probe_media::copies, (unsigned long long)probe_media::copy_failures);
+#endif
+        printf("browser loop: %u draws, clock +%llu ms\n", draws, static_cast<unsigned long long>(env.clock - 1700000000000ull));
+      } else
       settle_page(page, env, getenv("PROBE_SETTLE") ? atoi(getenv("PROBE_SETTLE")) : 20000);
-      { String t(a); page.timing_summary(&t); printf("timing after timers: %.*s\n", static_cast<int>(t.size()), t.view().data()); }
+      { String t(a); page.timing_summary(&t); printf("timing after timers (clock %llu): %.*s\n", static_cast<unsigned long long>(env.clock), static_cast<int>(t.size()), t.view().data()); }
       if (getenv("PROBE_RENDER")) {
         struct rusage before;
         getrusage(RUSAGE_SELF, &before);

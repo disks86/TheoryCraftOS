@@ -123,6 +123,8 @@ class IDomHost {
   // the width and height of its content box (0 for an inline box that is not replaced) and the padding at its left and top. False
   // if it has no box (display: none, not in the document) or nothing was laid out yet; layout_ready() says whether anything was.
   virtual bool node_rect(dom::Node* node, double* rect8) { (void)node; (void)rect8; return false; }
+  // Does the element's box (the last picture's) cut off what sticks out of it (overflow other than visible)? -1 if it has no box there.
+  virtual int node_clips(dom::Node* node) { (void)node; return -1; }
   virtual bool layout_ready() { return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
@@ -153,6 +155,8 @@ class IDomHost {
   // The style sheet that computed_style() worked against: what the TextRefs of a Style point into, and the readers for list valued properties (font-family,
   // box-shadow, transform ...). nullptr if the host has none.
   virtual const StyleSheet* computed_style_sheet() { return nullptr; }
+  // See IObjectEnvironment::video_decode_accelerated.
+  virtual bool video_decode_accelerated(StringView codec, uint32_t width, uint32_t height) { (void)codec; (void)width; (void)height; return false; }
   // A new document made from html text (DOMParser); owned by the host. nullptr if memory ran out.
   virtual dom::Document* parse_document(StringView html) = 0;
   // The Web Storage of the page's origin. After a change that is visible (a new value, a removed key, a cleared area) the other pages of the origin are told.

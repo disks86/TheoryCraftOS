@@ -146,8 +146,17 @@ void Document::inserted(Node* node) {
 
 namespace {
 
+// A change of the children of `n` (an element, fragment or the document), or of the text of `n` (a text or comment node: its parent's style is what may change,
+// by :empty).
 void touch(Node* n) {
-  if (n && n->owner) n->owner->touch();
+  if (!n || !n->owner) return;
+  Node* at = n->type == NodeType::Text || n->type == NodeType::Comment ? n->parent : n;
+  n->owner->touch_at(at, false);
+}
+
+// A change of the attribute `name` of the element `e`.
+void touch_attribute(Node* e, StringView name) {
+  if (e && e->owner) e->owner->touch_attribute(e, name);
 }
 
 void unlink(Node* node) {
@@ -228,7 +237,7 @@ bool is_connected(const Node* node) {
 
 void detach(Node* node) {
   if (!node->parent) return;
-  touch(node);
+  touch(node->parent);
   unlink(node);
 }
 
@@ -527,7 +536,7 @@ DomError set_attribute(Node* e, StringView name, StringView value) {
     if (!a.value.assign(value) || !e->attrs.push_back(util::move(a))) return DomError::OutOfMemory;
     record_attribute(e, name, nullptr);
   }
-  touch(e);
+  touch_attribute(e, name);
   return DomError::None;
 }
 
@@ -538,7 +547,7 @@ bool remove_attribute(Node* e, StringView name) {
   old.assign(e->attrs[static_cast<uint64_t>(i)].value.view());
   e->attrs.remove_at(static_cast<uint64_t>(i));
   record_attribute(e, name, &old);
-  touch(e);
+  touch_attribute(e, name);
   return true;
 }
 

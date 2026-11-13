@@ -74,6 +74,8 @@ class SystemVideoCodecs {
   IVideoCodecDevice* at(uint32_t index) const { return index < devices_.count() ? devices_[index].get() : nullptr; }
   // Codecs some device decodes / encodes.
   uint32_t decode_codecs() const;
+  // Does a device decode `codec` on a video engine (not the CPU), at that size (0: any)?
+  bool accelerated_decode(VideoCodec codec, uint32_t width, uint32_t height) const;
   uint32_t encode_codecs() const;
 
   UniquePointer<IVideoDecoder> create_decoder(const DecoderConfig& config);

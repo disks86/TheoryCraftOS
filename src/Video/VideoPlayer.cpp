@@ -141,6 +141,7 @@ bool VideoPlayer::decode_frame(uint32_t index) {
     current_frame_ = index;
     ++decoded_;
     ++serial_;
+    ++presented_;
     return true;
   }
   if (image_mode_) {
@@ -150,6 +151,7 @@ bool VideoPlayer::decode_frame(uint32_t index) {
     current_frame_ = index;
     ++decoded_;
     ++serial_;
+    ++presented_;
     return true;
   }
   VideoPacket packet;
@@ -181,6 +183,7 @@ bool VideoPlayer::show_decoded(const VideoFrame& frame) {
   }
   if (!convert_to_bgra(frame, reinterpret_cast<uint32_t*>(display_.plane(0).data()), width_)) return false;
   ++serial_;
+  ++presented_;
   return true;
 }
 

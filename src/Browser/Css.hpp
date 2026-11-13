@@ -47,7 +47,9 @@
 #pragma once
 #include "Browser/Media.hpp"
 #include "Dom/Selector.hpp"
+#include "ObjectContainer/Dictionary.hpp"
 #include "ObjectContainer/List.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
 
@@ -192,7 +194,7 @@ struct TextRef {
   bool empty() const { return length == 0; }
 };
 
-constexpr uint32_t kMaxCustomScopes = 20000;
+constexpr uint32_t kMaxCustomScopes = 400000;   // (20 bytes each: a whole YouTube page makes some 18000 per picture, and the styles kept for scripts point into them)
 
 // What the text of an element looks like and the box it makes. Children start from their parent's style (see inherit()).
 // What border_color holds for `transparent` (0 means the text colour; no real colour has an alpha of 0).
@@ -630,7 +632,8 @@ class StyleSheet {
   explicit StyleSheet(allocators::IAllocator& allocator)
       : allocator_(allocator), pool_(allocator), selectors_(allocator), key_table_(allocator), keyed_(allocator), unkeyed_(allocator), ancestor_keys_(allocator), declarations_(allocator), rules_(allocator), scopes_(allocator), kept_(allocator),
         imports_(allocator), font_faces_(allocator), unicode_ranges_(allocator), keyframes_(allocator), stops_(allocator), registrations_(allocator), layers_(allocator),
-        layer_rank_(allocator), containers_(allocator) {}
+        layer_rank_(allocator), containers_(allocator), motion_rules_(allocator), motion_unkeyed_(allocator), motion_selectors_(allocator), motion_next_(allocator),
+        motion_first_(allocator) {}
   StyleSheet(const StyleSheet&) = delete;
   StyleSheet& operator=(const StyleSheet&) = delete;
 
@@ -649,6 +652,20 @@ class StyleSheet {
   uint32_t rule_count() const { return static_cast<uint32_t>(rules_.count()); }
   // Does a rule depend on the pointer (:hover, :active, :focus-within)? Then the page is drawn again when the pointer moves on to another element.
   bool uses_pointer_state() const { return pointer_state_; }
+  // Does a rule look at siblings (+, ~) or at what is inside or after an element (:has)? A change to one element can then change the style of elements that
+  // are not under it (Page's computed style cache looks at these).
+  bool uses_siblings() const { return siblings_; }
+  // Changes when the rules are read again (clear()): every element's style may then be different.
+  uint64_t generation() const { return generation_; }
+  bool uses_has() const { return has_; }
+  // Is the text and custom property space of the derived styles (keep_text, scopes) close to its limit? Then reset_derived() is due (the styles worked out so
+  // far point into it and must be worked out again).
+  // `whole`: before the styles of a whole document are worked out (they need more room than a few elements do).
+  bool derived_nearly_full(bool whole = false) const {
+    return whole ? kept_.count() > 25000 || scopes_.count() > kMaxCustomScopes - 100000 : kept_.count() > 45000 || scopes_.count() > kMaxCustomScopes - 5000;
+  }
+  uint64_t derived_text_count() const { return kept_.count(); }
+  uint64_t derived_scope_count() const { return scopes_.count(); }
 
   // Applies what the sheet says about the element to `style` (which starts as the parent's inherited style with the defaults of the element's kind), then
   // `inline_style` (the style attribute) on top. `parent` is the parent's style: what the keyword `inherit` copies and the font size that em means. With a
@@ -697,6 +714,9 @@ class StyleSheet {
   bool font_face(uint32_t index, FontFace* out) const;
   // Does any rule declare a transition or an animation (or is there an @keyframes)?
   bool uses_motion() const;
+  // Could a rule give the element a transition or an animation? Only the rules that declare one are matched (what the element ends up with is the cascade's to
+  // say): false means it has none from the sheet.
+  bool may_have_motion(const dom::Node* element) const;
   uint32_t keyframes_count() const { return static_cast<uint32_t>(keyframes_.count()); }
   StringView keyframes_name(uint32_t rule) const;
   bool find_keyframes(StringView name, uint32_t* rule) const;   // the last @keyframes of that name
@@ -713,6 +733,12 @@ class StyleSheet {
   // The environment's colour scheme preference (light-dark() and color-scheme: normal follow it); parse() takes it from the MediaEnvironment.
   void set_dark(bool dark) { dark_ = dark; }
   void set_container_sizes(IContainerSizes* sizes) { container_sizes_ = sizes; }
+  // Another answerer for a while (the box builder knows the styles of the boxes it is in); returns the one there was, to be put back.
+  IContainerSizes* swap_container_sizes(IContainerSizes* sizes) const {
+    IContainerSizes* was = container_sizes_;
+    container_sizes_ = sizes;
+    return was;
+  }
 
  private:
   struct Declaration {
@@ -803,6 +829,26 @@ class StyleSheet {
 
   allocators::IAllocator& allocator_;
   bool pointer_state_ = false;
+  bool siblings_ = false, has_ = false;
+  // (for_candidates) the ancestor Bloom filters of nodes asked about lately, direct-mapped by node, good for one document version (see ancestor_filter)
+  static constexpr uint32_t kFilterWords = 64, kFilterSlots = 512;
+  struct FilterSlot {
+    const dom::Node* node = nullptr;
+    uint64_t version = 0;
+    uint32_t bits[kFilterWords];
+  };
+  struct FilterCache {
+    FilterSlot slots[kFilterSlots];
+  };
+  mutable UniquePointer<FilterCache> filter_cache_;   // (made the first time it is needed: a sheet on the stack does not carry it)
+  void ancestor_filter(const dom::Node* node, uint32_t* bits) const;
+  mutable List<uint8_t> motion_rules_;   // (may_have_motion) 1 for a rule that declares a transition or an animation; made again for each generation
+  // (may_have_motion) the selectors of those rules: the ones without a key, and the others by the hash of their key (a chain through motion_next_)
+  mutable List<uint32_t> motion_unkeyed_, motion_selectors_, motion_next_;
+  mutable Dictionary<uint32_t, uint32_t> motion_first_;
+  mutable uint64_t motion_generation_ = ~uint64_t{0};
+  mutable int8_t uses_motion_ = -1;   // (uses_motion, for motion_generation_)
+  void index_motion() const;
   uint32_t scope_ = 0;
   bool rule_applies(uint32_t selector, uint32_t element_scope, uint32_t host_scope, uint32_t slot_scope = 0) const;
   String pool_;
@@ -850,7 +896,7 @@ class StyleSheet {
   List<Layer> layers_;
   List<uint32_t> layer_rank_;          // per layer: its place in the order (from 1)
   List<Container> containers_;
-  IContainerSizes* container_sizes_ = nullptr;
+  mutable IContainerSizes* container_sizes_ = nullptr;
   mutable uint32_t text_index_[1024] = {};   // keep_text(): the latest kept text by hash (index + 1)
   friend struct CssRead;
 };
