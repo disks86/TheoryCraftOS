@@ -64,6 +64,28 @@ void upload_2x2(GlContext& gl, uint32_t tex, const uint8_t (&texels)[16]) {
   gl.tex_image(0x0DE1, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(texels, sizeof texels), true, false);
 }
 
+// two 2 x 2 textures, on units 0 and 1 (nearest), and the samplers of the "samplers ..." scene on them
+void two_units(GlContext& gl, uint32_t p) {
+  const uint8_t a[16] = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+  const uint8_t b[16] = {40, 80, 120, 255, 200, 160, 120, 255, 10, 220, 30, 255, 90, 90, 250, 255};
+  for (uint32_t unit = 0; unit < 2; ++unit) {
+    const uint32_t tex = gl.create_texture();
+    gl.active_texture(0x84C0 + unit);
+    gl.bind_texture(0x0DE1, tex);
+    gl.tex_image(0x0DE1, 0, 0x1908, 2, 2, 1, 0, 0x1908, 0x1401, ConstByteView(unit ? b : a, 16), true, false);
+    gl.tex_parameter(0x0DE1, 0x2801, 0x2600);
+    gl.tex_parameter(0x0DE1, 0x2800, 0x2600);
+  }
+  gl.active_texture(0x84C0);
+  const uint32_t zero = 0, one = 1;
+  const float half = 0.5f;
+  if (gl.get_uniform_location(p, "u_ts[0]") >= 0) gl.uniform(gl.get_uniform_location(p, "u_ts[0]"), 'i', 1, 1, 1, &zero);
+  if (gl.get_uniform_location(p, "u_ts[1]") >= 0) gl.uniform(gl.get_uniform_location(p, "u_ts[1]"), 'i', 1, 1, 1, &one);
+  if (gl.get_uniform_location(p, "u_st.s") >= 0) gl.uniform(gl.get_uniform_location(p, "u_st.s"), 'i', 1, 1, 1, &one);
+  if (gl.get_uniform_location(p, "u_st.k") >= 0) set_floats(gl, p, "u_st.k", 1, 1, 1, &half);
+  if (gl.get_uniform_location(p, "u_t") >= 0) gl.uniform(gl.get_uniform_location(p, "u_t"), 'i', 1, 1, 1, &one);
+}
+
 constexpr Scene kScenes[] = {
       {"for loop with break and continue", kVs, kFsHead "void main(){ float s = 0.0; for (int i = 0; i < 8; ++i) { if (i == 2) continue; if (i == 6) break; s += v.r * float(i) * 0.05; } o = vec4(s, v.g, v.b, 1.0); }\n", 5, nullptr},
       {"while and do loops", kVs, kFsHead "void main(){ float s = 0.0; int i = 0; while (true) { s += 0.1 * v.g; i++; if (i >= 4) break; } int j = 0; do { s += 0.05; j += 1; } while (j < 3); o = vec4(s, float(i) * 0.1, float(j) * 0.1, 1.0); }\n", 5, nullptr},
@@ -177,6 +199,20 @@ constexpr Scene kScenes[] = {
        }},
       {"gl_FragData", "attribute vec2 pos; attribute vec4 col; varying vec4 v; void main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }",
        "precision mediump float; varying vec4 v; void main(){ gl_FragData[0] = v.bgra; }", 5, nullptr},
+      {"samplers as parameters, in a structure and in an array", kVs,
+       kFsHead "uniform sampler2D u_ts[2]; struct T { float k; sampler2D s; }; uniform T u_st;\nvec4 look(sampler2D s, vec2 c) { return texture(s, c); }\nvec4 twice(T t, vec2 c) { return look(t.s, c) * t.k; }\n"
+       "void main(){ o = look(u_ts[1], v.rg) * 0.5 + twice(u_st, v.gr) * 0.5 + look(u_ts[0], v.rb) * 0.25; }\n", 5, two_units},
+      {"large local arrays by a variable (TGSI arrays)", kVs,
+       kFsHead "void main(){ float a[64]; for (int i = 0; i < 64; ++i) a[i] = float(i) / 64.0 * v.r; int j = int(v.g * 63.0); a[j] = 0.9; vec4 b[40]; for (int i = 0; i < 40; ++i) b[i] = vec4(float(i) / 40.0, v.b, 0.5, 1.0);\n"
+       "  int m = int(v.b * 39.0); b[m].y = 0.2; b[m + 0].zw = vec2(0.1, 0.3); o = vec4(a[j], a[(j + 5) % 64], b[j % 40].y, b[(j + 3) % 40].x) * 0.5 + b[m] * 0.5; }\n", 5, nullptr},
+      {"a lookup in the vertex shader, textureSize and length()",
+       kHead "in vec2 pos; in vec4 col; in float k; out vec4 v; out float vk; uniform sampler2D u_t;\nvoid main(){ v = textureLod(u_t, col.rg, 0.0) * 0.5 + col * 0.5; vk = k; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kFsHead "uniform sampler2D u_t;\nvoid main(){ float a[3]; a[0] = v.r; a[1] = v.g; a[2] = v.b; ivec2 s = textureSize(u_t, 0); o = vec4(a[2], a[1], float(s.x + s.y + a.length()) / 10.0, 1.0); }\n", 5, two_units},
+      {"continue inside a switch, and a conditional that runs one side", kVs,
+       kFsHead "void main(){ float s = 0.0; for (int i = 0; i < 6; ++i) { switch (i % 3) { case 0: s += 0.1 * v.r; continue; case 1: s += 0.05; break; default: break; } s += 0.02; }\n"
+       "  float t = 0.0; float r = v.g > 0.5 ? (t += 0.3) : (t -= 0.1); o = vec4(s, r + 0.2, t + 0.2, 1.0); }\n", 5, nullptr},
+      {"a varying the vertex shader does not write", kHead "in vec2 pos; in vec4 col; out vec4 v; out vec4 w;\nvoid main(){ v = col; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kHead "in vec4 v; in vec4 w; out vec4 o;\nvoid main(){ o = v * 0.5 + w + vec4(0.1); }\n", 5, nullptr},
 };
 #undef kFsHead
 #undef kHead
@@ -314,6 +350,15 @@ constexpr Scene kStageScenes[] = {
        "  for (int i = 0; i < 15; ++i) var[gl_InvocationID].m2[i] = v[gl_InvocationID].ba * float(15 - i) * 0.06; var[gl_InvocationID].m1[u_n] = vec2(0.9, 0.1);\n"
        "  gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
        kDesk "layout(triangles, equal_spacing, ccw) in;\nin block { vec2 m1[16]; vec2 m2[15]; } var[]; uniform int u_n; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec2 s = vec2(0.0); for (int i = 0; i < 3; ++i) s += (var[i].m1[u_n] * 0.5 + var[i].m1[15] * 0.3 + var[i].m2[u_n + 3]) * c[i]; g = vec4(s, var[2].m2[14].y, 1.0); }\n",
+       3, 6},
+      {"geometry: a structure per vertex",
+       kDesk "struct S { vec4 c; mat2 m; float k[2]; };\nin vec2 pos; in vec4 col; in float k; out S s;\nvoid main(){ s.c = col; s.m = mat2(col.rg, col.ba * 0.5); s.k[0] = k * 0.2; s.k[1] = col.r * 0.5; gl_Position = vec4(pos, 0.0, 1.0); }\n",
+       kDeskFs, 4, nullptr, true,
+       kDesk "layout(triangles) in; layout(triangle_strip, max_vertices = 3) out;\nstruct S { vec4 c; mat2 m; float k[2]; };\nin S s[]; out vec4 g;\nvoid main(){ for (int i = 0; i < 3; ++i) { gl_Position = gl_in[i].gl_Position; g = s[i].c * 0.5 + vec4(s[i].m[1], s[i].m[0].y, s[i].k[0]) * 0.3 + vec4(s[(i + 1) % 3].k[1] * 0.2); EmitVertex(); } }\n"},
+      {"tessellation: a structure with an array per control point", kDeskVs, kDeskFs, 0xE, nullptr, true, nullptr,
+       kDesk "layout(vertices = 3) out;\nstruct S { vec4 c; float k[2]; };\nin vec4 v[]; out S ts[];\nvoid main(){ gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; ts[gl_InvocationID].c = v[gl_InvocationID]; for (int i = 0; i < 2; ++i) ts[gl_InvocationID].k[i] = float(gl_InvocationID * 2 + i) * 0.1;\n"
+       "  gl_TessLevelOuter[0] = 2.0; gl_TessLevelOuter[1] = 2.0; gl_TessLevelOuter[2] = 2.0; gl_TessLevelInner[0] = 2.0; }\n",
+       kDesk "layout(triangles, equal_spacing, ccw) in;\nstruct S { vec4 c; float k[2]; };\nin S ts[]; out vec4 g;\nvoid main(){ vec3 c = gl_TessCoord; gl_Position = gl_in[0].gl_Position * c.x + gl_in[1].gl_Position * c.y + gl_in[2].gl_Position * c.z; vec4 s = vec4(0.0); for (int i = 0; i < 3; ++i) s += (ts[i].c * 0.6 + vec4(ts[i].k[0], ts[i].k[1], 0.0, 0.0)) * c[i]; g = vec4(s.rgb, 1.0); }\n",
        3, 6},
 };
 #undef kDeskFs

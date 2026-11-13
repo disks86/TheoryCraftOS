@@ -69,6 +69,7 @@ webgl::AccelLimits WebGlAccelerator::limits() const {
   l.clip_distances = (info.features & kFeatureClipDistances) != 0;
   l.float_textures = (info.features & kFeatureFloatFormats) != 0;
   l.control_varyings = info.limits.control_varyings;
+  l.color_upload = true;      // (write_color: an image write the device may still refuse, and the context then stays on the CPU)
   return l;
 }
 
@@ -424,6 +425,22 @@ bool WebGlAccelerator::draw(uint32_t handle, uint32_t program, const webgl::Acce
   if (state.custom_blend && !(info.features & kFeatureBlendState)) return false;
   if (state.clip_mask && !(info.features & kFeatureClipDistances)) return false;
   return run_pass(*t, false, Vec4(), false, 1.0f, p, &state, vertices, vertex_count, constants);
+}
+
+// The inverse of read_color: the same rows, the pixels as 0xAARRGGBB.
+bool WebGlAccelerator::write_color(uint32_t handle, ConstByteView rgba) {
+  kernel::ScopedMutex guard(lock_);
+  Target* t = target_at(handle);
+  if (!t) return false;
+  const uint64_t pixels = uint64_t{t->width} * t->height;
+  if (rgba.size() != pixels * 4) return false;
+  ArrayView<uint32_t> scratch = allocate_view<uint32_t>(allocator_, pixels);
+  if (scratch.empty()) return false;
+  for (uint64_t i = 0; i < pixels; ++i)
+    scratch[i] = (uint32_t{rgba[i * 4 + 3]} << 24) | (uint32_t{rgba[i * 4]} << 16) | (uint32_t{rgba[i * 4 + 1]} << 8) | rgba[i * 4 + 2];
+  const bool ok = t->color->write_pixels(scratch);
+  release_view(allocator_, scratch);
+  return ok;
 }
 
 bool WebGlAccelerator::read_color(uint32_t handle, ByteView rgba) {

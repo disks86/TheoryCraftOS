@@ -150,6 +150,16 @@ void GlContext::hw_sync() {
   all_dirty_ = true;
 }
 
+// The CPU's picture becomes the device's (its colour; the depth stays behind: hw_depth_stale_), so draws can go on there after the CPU drew.
+bool GlContext::hw_upload(IAccelerator* acc) {
+  hw_apply_pending_clears();
+  if (!hw_target(acc) || dcolor_->px.size() != uint64_t{hw_w_} * hw_h_ * 4 || !acc->write_color(hw_target_, dcolor_->px.view())) return false;
+  hw_valid_ = true;
+  hw_ahead_ = false;
+  hw_depth_stale_ = ddepth_->defined();
+  return true;
+}
+
 bool GlContext::hw_target(IAccelerator* acc) {
   if (hw_owner_ != acc) hw_drop();
   if (hw_target_) return true;
@@ -185,6 +195,7 @@ bool GlContext::hw_fast_clear(uint32_t mask) {
   hw_valid_ = true;
   hw_ahead_ = true;
   all_dirty_ = true;
+  if (clear_depth) hw_depth_stale_ = false;
   if (depth_asked) {
     hw_pending_depth_ = true;
     hw_pending_depth_value_ = d;
@@ -241,8 +252,10 @@ void GlContext::hw_after_clear(uint32_t mask, bool whole) {
   const bool depth_asked = (mask & 0x100) != 0 && dmask_;
   const bool clear_depth = depth && (depth_asked || !hw_valid_);
   const float d = depth_asked ? (clear_depth_ < 0 ? 0 : (clear_depth_ > 1 ? 1 : clear_depth_)) : 1.0f;
+  const bool was_valid = hw_valid_;
   hw_valid_ = acc->clear(hw_target_, true, rgba, clear_depth, d);
   hw_ahead_ = false;   // def_color_ was just cleared to the same color
+  if (clear_depth || !was_valid) hw_depth_stale_ = false;      // (a new picture: its depth is the clear's, as above)
 }
 
 bool GlContext::hw_program(ProgramObj& p, IAccelerator& acc) {
@@ -422,8 +435,11 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
   }
   if (!hw_program(p, *acc) || !p.tgsi) return no(p.accel_why ? p.accel_why : "the shaders");
   if (!hw_target(acc)) return no("no device target");
-  if (!hw_valid_) return no("the device picture is out of date");
+  // A device picture that is out of date is written up from the CPU's before the draw (hw_upload), but not its depth: a draw with the depth test then stays here.
+  if (depth_test && (!hw_valid_ || hw_depth_stale_)) return no(hw_valid_ ? "the device depth is out of date" : "the device picture is out of date");
+  if (!hw_valid_ && !acc->limits().color_upload) return no("the device picture is out of date");
   const TgsiProgram& t = *p.tgsi;
+  if (t.no_color && !custom) return no("a fragment shader without a color output");      // (its draws mask every channel: the device's colour mask)
   if (t.uses_frag_coord && target.ss != 1) return no("gl_FragCoord on an antialiased drawing buffer");
 
   // the attributes of the translated shader, in the order of its IN[] registers
@@ -652,9 +668,10 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
     st.dst_alpha = factors[3];
     st.op_rgb = ops[0];
     st.op_alpha = ops[1];
-    st.color_mask = color_mask;
+    st.color_mask = t.no_color ? 0 : color_mask;
     st.depth_compare = static_cast<uint8_t>(dfunc_ >= 0x0200 && dfunc_ <= 0x0207 ? dfunc_ - 0x0200 : 3);
   }
+  if (!hw_valid_ && !hw_upload(acc)) return no("the device picture is out of date");
   if (!acc->draw(hw_target_, p.accel_program, st, vertices.view(), static_cast<uint32_t>(tris.count()), constants.view())) {
     hw_valid_ = false;   // the device may have drawn part of it: the caller reads the picture back and goes on on the CPU
     return no("the device failed the draw");
