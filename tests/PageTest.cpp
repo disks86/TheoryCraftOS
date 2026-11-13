@@ -4438,6 +4438,50 @@ static void test_navigation() {
     }
     CHECK(a.live == 0);
   }
+  // --- document.elementFromPoint / elementsFromPoint: what the last picture shows under a viewport point, as a click would find it
+  {
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 400;
+      media.height = 300;
+      font::FontSet fonts(a);
+      fonts.add_bundled_fonts();
+      auto probe = [&](const std::string& script, int32_t scroll) {
+        Page page(a, env, "https://app.example/", media, true);
+        page.load((std::string("<body style='margin:0'><div id=sp style='height:2000px'></div>"
+                               "<div id=a style='position:absolute;left:0;top:0;width:100px;height:100px;background:red'><span id=s>hello</span></div>"
+                               "<div id=b style='position:absolute;left:50px;top:50px;width:100px;height:100px'></div>"
+                               "<div id=n style='position:absolute;left:200px;top:0;width:100px;height:100px'></div>"
+                               "<div id=pe style='position:absolute;left:200px;top:0;width:100px;height:100px;pointer-events:none'></div>"
+                               "<div id=v style='position:absolute;left:200px;top:0;width:50px;height:50px;visibility:hidden'></div>"
+                               "<div id=c style='position:absolute;left:0;top:150px;width:100px;height:50px;overflow:hidden'><div id=cin style='margin-top:30px;height:50px'></div></div>"
+                               "<div id=t style='position:absolute;left:0;top:400px;width:100px;height:100px;transform:translateX(200px)'></div>"
+                               "<script>var at = function (x, y) { var e = document.elementFromPoint(x, y); return e ? (e.id || e.tagName) : 'null' };"
+                               "var all = function (x, y) { return document.elementsFromPoint(x, y).map(function (e) { return e.id || e.tagName }).join(' ') };"
+                               "addEventListener('scroll', function () {") + script + "})</script>").c_str());
+        PagePicture picture(a);
+        CHECK(page.render_picture(&picture, fonts));
+        page.run_due_timers(1e12);
+        page.set_scroll(scroll);
+        page.run_due_timers(1e12);
+        return std::string(page.log().data(), page.log().size());
+      };
+      // the topmost box, front to back with the ancestors and the root last; text answers for its element
+      CHECK(probe("console.log(at(60, 60), at(20, 60), at(5, 5)); console.log(all(60, 60))", 1) == "b a s\nb a sp BODY HTML\n");
+      // pointer-events: none and visibility: hidden let the point through; a clip hides what sticks out of it; a transform moves what can be hit
+      CHECK(probe("console.log(at(210, 10), at(10, 160), at(10, 190), at(10, 205))", 1) == "n c cin sp\n");
+      // (scrolled: viewport y 0..99 is page y 400..499, where the translated box is; its untransformed place is not)
+      CHECK(probe("console.log(at(250, 50), at(50, 50))", 400) == "t sp\n");
+      // outside the viewport: null and []; an element removed since the picture was painted is not answered
+      CHECK(probe("console.log(at(-1, 5), at(5, 300), at(400, 5), at(NaN, 1), all(-5, -5).length); document.getElementById('b').remove(); console.log(at(60, 60))", 1) ==
+            "null null null null 0\na\n");
+      // only the root under an empty spot
+      CHECK(probe("console.log(all(350, 250))", 1) == "sp BODY HTML\n");
+    }
+    CHECK(a.live == 0);
+  }
   // --- ResizeObserver
   {
     TestAllocator a;
