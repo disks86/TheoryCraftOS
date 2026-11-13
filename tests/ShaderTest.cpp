@@ -98,6 +98,17 @@ static void test_glsl_basics() {
   CHECK(c[0] == 20 && near_f(c[1], 0.7853982f) && near_f(c[2], 2.7182817f) && near_f(c[3], 2.3025851f));
   CHECK(run_frag(a, "#version 300 es\nprecision highp float; out vec4 o; void main() { uvec2 u = uvec2(3u, 4u); o = vec4(float(u.x * u.y), float(bitCount(255u)), float(int(-7) >> 1), 0.0); }", c));
   CHECK(c[0] == 12 && c[1] == 8 && c[2] == -4);
+  // assignments through a swizzle of a swizzle, and through an index of a swizzle (by a constant, by a variable, clamped)
+  CHECK(run_frag(a, "void main() { vec4 v = vec4(0.0); v.xzy.z = 1.0; v.wzyx.xy = vec2(2.0, 3.0); gl_FragColor = v; }", c));
+  CHECK(c[0] == 0 && c[1] == 1 && c[2] == 3 && c[3] == 2);
+  CHECK(run_frag(a, "void main() { vec4 v = vec4(1.0, 0.0, 0.0, 1.0); int i = 2; v.wzyx[i] = 5.0; v.wzyx[3] = 7.0; v.zy[9] = 4.0; gl_FragColor = v; }", c));
+  CHECK(c[0] == 7 && c[1] == 4 && c[2] == 0 && c[3] == 1);
+  // an array constructor of more than 16 elements
+  std::string src = "uniform int k; const float t[40] = float[](";
+  for (int i = 0; i < 40; ++i) src += std::to_string(i) + (i < 39 ? ".0, " : ".0);\n");
+  src += "void main() { gl_FragColor = vec4(t[k], t[39], t[17], 0.0); }";
+  CHECK(run_frag(a, src.c_str(), c));
+  CHECK(c[0] == 0 && c[1] == 39 && c[2] == 17);
 }
 
 // Runs a WGSL function by name with no arguments and returns its (up to 4) result lanes as floats or ints.

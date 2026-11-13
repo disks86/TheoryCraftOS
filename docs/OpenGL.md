@@ -139,8 +139,10 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
 - The program's shaders become TGSI once (`translate_to_tgsi`, with the device's `AccelLimits`: virgl takes 256 constant rows, 16 attributes, 14 varyings and 16
   textures), including the generated fixed-function ones. The vertices are assembled on the CPU (the draw's modes, restart index and base vertex) and sent as one list.
 - What the translator takes: loops (`for`, `while`, `do`, with break and continue), `switch`, user functions (inlined at each call, in / out / inout parameters,
-  returns anywhere: a flag the statements after a return or continue are guarded by), integers and booleans (kept as float values, exact below 2^24; integer
-  division truncates; shifts become multiplications), local arrays and uniform arrays indexed by variables (a chain of selects, and the address register),
+  returns anywhere: a flag the statements after a return or continue are guarded by), integers and booleans (kept as float values, exact up to 2^24; integer
+  division truncates; shifts become multiplications; a shader with an integer constant beyond 2^24 is refused, and a draw whose integer uniforms or inputs go
+  beyond it is the CPU's, since neither would wrap or compare as GLSL says), `&&` and `||` whose right side has effects (an assignment, `++`, a call) run it only
+  under an IF on the left side, local arrays and uniform arrays indexed by variables (a chain of selects, and the address register),
   matrix and array varyings (a register per column), flat varyings (the last vertex, as virgl's rasterizer does; GL_FIRST_VERTEX_CONVENTION rotates the
   primitives), `gl_FragCoord`, `gl_FrontFacing`, `gl_FragData[0]`, discard, initialised globals, the trigonometric, hyperbolic, comparison and matrix built-ins
   (`inverse` and `determinant` of 2 x 2 and 3 x 3), texture lookups with a level, bias, gradients or projection (the device's textures have one level), and
@@ -150,9 +152,11 @@ draw is offered to the device and runs on the CPU rasterizer when the device can
   they index like any array. Varyings between stages are GENERIC registers matched by name (`gl_in[].x` is the stage before's `x`, or the control stage's
   `gl_out[].x`), per-patch ones PATCH registers. The last stage before the rasterizer converts the position to the device's clip space. `EmitVertex()` writes the
   outputs and EMITs, `EndPrimitive()` is ENDPRIM. A control shader keeps its own control point's outputs in variables and writes them at the end, the control point
-  chosen by a test of the invocation number for each (a register's vertex cannot be a variable). It writes its patch outputs and levels only if it wrote them,
-  by a flag. `barrier()` puts all of that out first and then waits (TGSI BARRIER), so what an invocation reads of another's control point after it
-  (`gl_out[j].x`, `x[j]`) is in that point's output register, chosen by `j`; a patch output it reads is its own value when it wrote one, else the register.
+  chosen by a test of the invocation number for each (a register's vertex cannot be a variable). Its patch outputs and levels start each component as a marker value
+  (`kUnwrittenBits`, a finite float) and it puts out only the components it changed, so invocations that write different levels or components
+  (`gl_TessLevelOuter[gl_InvocationID] = ...`, `v[gl_InvocationID] = ...`) do not overwrite each other's. `barrier()` puts all of that out first, marks the patch
+  outputs unwritten again and then waits (TGSI BARRIER), so what an invocation reads of another's control point after it
+  (`gl_out[j].x`, `x[j]`) is in that point's output register, chosen by `j`; a patch output component it reads is its own value when it wrote one, else the register.
   Outputs the evaluation stage does not read get registers too, and other invocations' positions are read from a copy in a GENERIC register (virgl does not give
   back another invocation's POSITION output). When the evaluation shader reads the levels, they also go to it as two PATCH registers, because virgl cannot
   take TESSOUTER / TESSINNER as inputs. An evaluation stage without a control shader gets a generated one that passes the vertices on, with the default levels

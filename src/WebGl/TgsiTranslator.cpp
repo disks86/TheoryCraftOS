@@ -38,6 +38,12 @@ const char* const kChan[4] = {"x", "y", "z", "w"};
 // What the floats of a value hold. Integers and booleans live in float registers as their values (exact below 2^24, which is what shaders count and index
 // with): the arithmetic is the float arithmetic, a division of integers is truncated, and a boolean is 0.0 or 1.0.
 enum : uint8_t { kNumFloat = 0, kNumInt = 1, kNumUint = 2, kNumBool = 3 };
+// Whether an integer (the bits of an int, or of a uint) is one of those exact values: a larger one would not wrap or compare as GLSL says, so the shader is the CPU's.
+bool exact_int(int32_t bits, bool is_unsigned) {
+  constexpr uint32_t kExact = 1u << 24;
+  if (is_unsigned) return static_cast<uint32_t>(bits) <= kExact;
+  return bits >= -static_cast<int32_t>(kExact) && bits <= static_cast<int32_t>(kExact);
+}
 uint8_t num_of(Base b) { return b == Base::Int ? kNumInt : (b == Base::Uint ? kNumUint : (b == Base::Bool ? kNumBool : kNumFloat)); }
 
 // A TGSI source operand: a register file and index, a swizzle, and a negate flag. 'T' temporary, 'I' input, 'C' constant, 'M' immediate.
@@ -588,6 +594,9 @@ class Gen {
   bool write_vertex_outputs();           // the position and the varyings of a stage that puts out vertices (vertex, evaluation, geometry at EmitVertex)
   bool write_clip_distances();           // ... and its clip distances (TgsiStages::clip)
   bool control_end();                    // a control stage's outputs (at the end, and at each barrier())
+  bool mark_unwritten();                 // ... and its patch outputs made unwritten again (at the start and after each barrier())
+  bool unwritten_test(uint16_t temp, uint32_t rows, uint16_t* t);
+  bool put_written(uint32_t reg, uint32_t chan, uint16_t temp, uint32_t comp);   // t = 1 where a component of temp was written
   bool control_read(const Node& index, Val* out);   // another invocation's output, as the last barrier() left it
   bool patch_read(uint64_t gi, Val* out);           // a control stage's patch output or level
   bool system_value(const char* semantic, bool integer, uint32_t rows, const Var& v);
@@ -635,7 +644,7 @@ class Gen {
   // (`flag`), and whether the global is a system value or input made ready at the start (`ready`).
   struct StageVar {
     Var own;
-    int32_t flag = -1;
+    bool patch = false;   // a control stage's patch output (or level): its components that hold kUnwritten were not written by this invocation (control_end)
     bool ready = false;
   };
   List<StageVar> stage_vars_;
@@ -1012,6 +1021,7 @@ bool Gen::lv_from_val(const Val& v, LV* out) {
 // An integer constant as a value in a register (an immediate); the value keeps saying it is an integer.
 bool Gen::to_float(Val& v) {
   if (!v.is_int) return true;
+  if (!exact_int(v.ival, v.num == kNumUint)) return fail("an integer the device cannot hold exactly");
   Oper o;
   const float f = v.num == kNumUint ? static_cast<float>(static_cast<uint32_t>(v.ival)) : static_cast<float>(v.ival);
   if (!scalar_imm(f, &o)) return false;
@@ -1253,8 +1263,10 @@ bool Gen::const_val(const Node& n, Val* out) {
       if (t.base == Base::Bool) {
         v[r] = bits ? 1.0f : 0.0f;
       } else if (t.base == Base::Int) {
+        if (!exact_int(static_cast<int32_t>(bits), false)) return fail("an integer the device cannot hold exactly");
         v[r] = static_cast<float>(static_cast<int32_t>(bits));
       } else if (t.base == Base::Uint) {
+        if (!exact_int(static_cast<int32_t>(bits), true)) return fail("an integer the device cannot hold exactly");
         v[r] = static_cast<float>(bits);
       } else {
         __builtin_memcpy(&v[r], &bits, 4);
@@ -1376,10 +1388,8 @@ bool Gen::lvalue(int32_t id, LV* out) {
       if ((g.kind != GlobalKind::Out && g.kind != GlobalKind::Private && g.kind != GlobalKind::Builtin) || g.is_read_only) return fail("assignment to an input or uniform");
       if (stage_ == kStControl && g.kind == GlobalKind::Out && g.patch) {      // a patch output: put out at the end if this invocation wrote it (control_end)
         const uint64_t gi = static_cast<uint64_t>(n.ival);
-        Oper one;
         Var v;
-        if (gi >= stage_vars_.count() || stage_vars_[gi].flag < 0 || !scalar_imm(1.0f, &one) || !global_var(gi, &v)) return fail("a patch output the device cannot take");
-        inst("MOV", static_cast<uint16_t>(stage_vars_[gi].flag), "x", &one);
+        if (gi >= stage_vars_.count() || !stage_vars_[gi].patch || !global_var(gi, &v)) return fail("a patch output the device cannot take");
         lv_of(v, out);
         return true;
       }
@@ -1828,7 +1838,7 @@ bool Gen::builtin(const Node& n, Val* out) {
     case BuiltinFn::Barrier:
       // (a control stage's invocations put out what they wrote, then wait for each other: what they read of each other after it is in the output registers)
       if (stage_ != kStControl) return fail("barrier()");
-      if (!control_end()) return false;
+      if (!control_end() || !mark_unwritten()) return false;      // (what it wrote is in the output registers now, which the reads take)
       begin_inst("BARRIER");
       end_inst();
       *out = Val();
@@ -2336,8 +2346,31 @@ bool Gen::eval(int32_t id, Val* out) {
       Val a, b;
       return eval(n.a, &a) && eval(n.b, &b) && binary(n.op, a, b, out);
     }
-    case NodeKind::Logical: {      // (both sides are evaluated: they have no effects the device would see twice)
+    case NodeKind::Logical: {      // (both sides are evaluated when the right one has no effects)
       Val a, b;
+      if (n.op != Op::LogXor && has_effects(n.b)) {      // a && ++x: the right side runs only when the left one does not decide - IF a (ELSE) ... ENDIF
+        if (!eval(n.a, &a) || !to_float(a)) return false;
+        if (a.rows != 1 || a.cols != 1 || a.kind) return fail("a logical operator on vectors");
+        Val res;
+        if (!new_val(1, 1, &res)) return false;
+        res.num = kNumBool;
+        inst_rows("MOV", res.c[0].idx, 1, &a.c[0]);
+        begin_inst("IF");
+        body.push_back(' ');
+        put_oper(component(a.c[0], 0));
+        end_inst();
+        if (n.op == Op::LogOr) {      // (true: the result is the left side's)
+          begin_inst("ELSE");
+          end_inst();
+        }
+        if (!eval(n.b, &b) || !to_float(b)) return false;
+        if (b.rows != 1 || b.cols != 1 || b.kind) return fail("a logical operator on vectors");
+        inst_rows("MOV", res.c[0].idx, 1, &b.c[0]);
+        begin_inst("ENDIF");
+        end_inst();
+        *out = res;
+        return true;
+      }
       if (!eval(n.a, &a) || !eval(n.b, &b) || !to_float(a) || !to_float(b)) return false;
       if (a.rows != 1 || a.cols != 1 || b.rows != 1 || b.cols != 1 || a.kind || b.kind) return fail("a logical operator on vectors");
       if (!elementwise(n.op == Op::LogAnd ? "MUL" : (n.op == Op::LogOr ? "MAX" : "SNE"), a, b, out)) return false;
@@ -4239,16 +4272,11 @@ bool Gen::stage_start() {
     stage_vars_[static_cast<uint64_t>(pv)].ready = true;
   }
   if (stage_ == kStControl) {
-    Oper zero;
-    if (!scalar_imm(0.0f, &zero)) return false;
     for (uint64_t gi = 0; gi < m_.globals.count(); ++gi) {
       const Global& g = *m_.globals[gi];
-      if (g.kind != GlobalKind::Out || !g.patch || !g.referenced) continue;
-      uint16_t t;
-      if (!new_temp(&t)) return false;
-      inst("MOV", t, "x", &zero);
-      stage_vars_[gi].flag = t;
+      if (g.kind == GlobalKind::Out && g.patch && g.referenced) stage_vars_[gi].patch = true;
     }
+    if (!mark_unwritten()) return false;
   }
   return true;
 }
@@ -4348,7 +4376,7 @@ bool Gen::control_read(const Node& index, Val* out) {
 // A control stage's patch output or tessellation level read: its own value when it wrote one, else the output register (what an invocation put out at a barrier()).
 bool Gen::patch_read(uint64_t gi, Val* out) {
   const Global& g = *m_.globals[gi];
-  if (gi >= stage_vars_.count() || stage_vars_[gi].flag < 0 || !out_) return fail("a patch output the device cannot take");
+  if (gi >= stage_vars_.count() || !stage_vars_[gi].patch || !out_) return fail("a patch output the device cannot take");
   const StringView name = g.name.view();
   const bool outer = name.equals("gl_TessLevelOuter"), inner = name.equals("gl_TessLevelInner");
   const uint32_t patch_out = 1 + out_->registers;
@@ -4363,8 +4391,6 @@ bool Gen::patch_read(uint64_t gi, Val* out) {
   }
   Var var, copy;
   if (!global_var(gi, &var) || !make_var(g.type, &copy)) return false;
-  Oper flag = component(filled('T', static_cast<uint16_t>(stage_vars_[gi].flag), 1), 0);
-  flag.neg = true;
   const uint32_t elements = var.count ? var.count : 1;
   for (uint32_t e = 0; e < elements; ++e) {
     const Var& el = var.count ? elems_[static_cast<uint64_t>(var.first) + e] : var;
@@ -4374,7 +4400,11 @@ bool Gen::patch_read(uint64_t gi, Val* out) {
       if (outer || inner)      // (a level: a component of TESSOUTER / TESSINNER)
         for (uint8_t& k : src.swz) k = static_cast<uint8_t>(e & 3);
       const Oper own = filled('T', el.temp[c], el.rows);
-      inst_rows("CMP", cl.temp[c], el.rows, &flag, &own, &src);
+      uint16_t w;
+      if (!unwritten_test(el.temp[c], el.rows, &w)) return false;
+      Oper written = filled('T', w, el.rows);
+      written.neg = true;
+      inst_rows("CMP", cl.temp[c], el.rows, &written, &own, &src);      // (each component: its own where it wrote it)
     }
   }
   val_of(copy, out);
@@ -4527,29 +4557,74 @@ bool Gen::control_end() {
   }
   const uint32_t patch_out = 1 + out_->registers;
   for (const IoLink& l : out_->links) {
-    if (!l.patch || l.out_gi < 0 || stage_vars_[static_cast<uint64_t>(l.out_gi)].flag < 0) continue;
+    if (!l.patch || l.out_gi < 0 || !stage_vars_[static_cast<uint64_t>(l.out_gi)].patch) continue;
     Var v;
-    if (!global_var(static_cast<uint64_t>(l.out_gi), &v) || !flag_test(static_cast<uint16_t>(stage_vars_[static_cast<uint64_t>(l.out_gi)].flag), true)) return false;
+    if (!global_var(static_cast<uint64_t>(l.out_gi), &v)) return false;
     uint32_t reg = patch_out + l.base;
     Val pv;
     List<Column> cols(body.allocator());
     val_of(v, &pv);
     if (!columns_of(pv, &cols)) return fail("a patch output the device cannot take");
-    for (const Column& col : cols) out_mov(reg++, mask_of(col.rows), filled('T', col.temp, col.rows));
-    begin_inst("ENDIF");
-    end_inst();
+    for (const Column& col : cols) {
+      for (uint32_t r = 0; r < col.rows; ++r)
+        if (!put_written(reg, r, col.temp, r)) return false;
+      ++reg;
+    }
   }
   for (uint32_t lv = 0; lv < 2; ++lv) {
     const int32_t gi = m_.find_global(StringView(lv ? "gl_TessLevelInner" : "gl_TessLevelOuter"));
-    if (gi < 0 || stage_vars_[static_cast<uint64_t>(gi)].flag < 0) continue;
+    if (gi < 0 || !stage_vars_[static_cast<uint64_t>(gi)].patch) continue;
     Var v;
-    if (!global_var(static_cast<uint64_t>(gi), &v) || !v.count || !flag_test(static_cast<uint16_t>(stage_vars_[static_cast<uint64_t>(gi)].flag), true)) return false;
+    if (!global_var(static_cast<uint64_t>(gi), &v) || !v.count) return false;
     for (uint32_t e = 0; e < v.count && e < 4; ++e) {
-      out_mov(patch_out + out_->patch_registers + lv, kChan[e], filled('T', elems_[static_cast<uint64_t>(v.first) + e].temp[0], 1));
-      if (out_->levels) out_mov(patch_out + out_->patch_registers + 2 + lv, kChan[e], filled('T', elems_[static_cast<uint64_t>(v.first) + e].temp[0], 1));
+      const uint16_t temp = elems_[static_cast<uint64_t>(v.first) + e].temp[0];
+      if (!put_written(patch_out + out_->patch_registers + lv, e, temp, 0)) return false;
+      if (out_->levels && !put_written(patch_out + out_->patch_registers + 2 + lv, e, temp, 0)) return false;
     }
-    begin_inst("ENDIF");
-    end_inst();
+  }
+  return true;
+}
+
+// The value a control stage's patch output component holds until the invocation writes it: a finite float no shader computes in practice (a NaN could be made a
+// different NaN by a move). Each component the invocation wrote is put out on its own, so invocations that write different elements (gl_TessLevelOuter[id] = ...)
+// or components of one patch output do not overwrite each other's.
+constexpr uint32_t kUnwrittenBits = 0xFF7EDCBAu;
+
+bool Gen::unwritten_test(uint16_t temp, uint32_t rows, uint16_t* t) {
+  Oper mark;
+  if (!scalar_imm(__builtin_bit_cast(float, kUnwrittenBits), &mark) || !new_temp(t)) return false;
+  const Oper src = filled('T', temp, rows), m = component(mark, 0);
+  inst_rows("SNE", *t, rows, &src, &m);
+  return true;
+}
+
+// OUT[reg].chan = TEMP[temp].comp, if this invocation wrote it.
+bool Gen::put_written(uint32_t reg, uint32_t chan, uint16_t temp, uint32_t comp) {
+  uint16_t t;
+  if (!unwritten_test(temp, 4, &t)) return false;
+  begin_inst("IF");
+  body.push_back(' ');
+  put_oper(component(filled('T', t, 4), comp));
+  end_inst();
+  out_mov(reg, kChan[chan & 3], component(filled('T', temp, 4), comp));
+  begin_inst("ENDIF");
+  end_inst();
+  return true;
+}
+
+bool Gen::mark_unwritten() {
+  Oper mark;
+  if (!scalar_imm(__builtin_bit_cast(float, kUnwrittenBits), &mark)) return false;
+  const Oper m = component(mark, 0);
+  for (uint64_t gi = 0; gi < stage_vars_.count(); ++gi) {
+    if (!stage_vars_[gi].patch) continue;
+    Var v;
+    if (!global_var(gi, &v)) return false;
+    Val pv;
+    List<Column> cols(body.allocator());
+    val_of(v, &pv);
+    if (!columns_of(pv, &cols)) return fail("a patch output the device cannot take");
+    for (const Column& col : cols) inst_rows("MOV", col.temp, col.rows, &m);
   }
   return true;
 }

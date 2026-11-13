@@ -33,6 +33,11 @@ namespace webgl {
 namespace {
 inline float u2f(uint32_t u) { return __builtin_bit_cast(float, u); }
 inline uint32_t f2u(float f) { return __builtin_bit_cast(uint32_t, f); }
+
+// The device keeps integers as float values (TgsiTranslator.cpp): every integer of magnitude up to 2^24 is exact. A uniform or input beyond that would not compare or
+// wrap as GLSL says, so such a draw is the CPU's.
+constexpr uint32_t kExactInt = 1u << 24;
+inline bool exact_int(int32_t v) { return v >= -static_cast<int32_t>(kExactInt) && v <= static_cast<int32_t>(kExactInt); }
 constexpr uint32_t kMaxAccelVertices = 3u << 20;   // vertices of one draw the accelerated path assembles (more run on the CPU)
 }  // namespace
 
@@ -571,6 +576,8 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
           read_vertex_attrib(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
         } else {      // an integer input: read as the CPU reads it (integers), sent as their float values
           read_vertex_attrib_int(at, b->data.view().data() + at.offset + uint64_t{index} * stride, lanes);
+          for (uint32_t l : lanes)
+            if (t.attributes[k].convert == kTgsiFromUint ? l > kExactInt : !exact_int(static_cast<int32_t>(l))) return no("an integer the device cannot hold exactly");
           for (uint32_t& l : lanes) l = f2u(t.attributes[k].convert == kTgsiFromUint ? static_cast<float>(l) : static_cast<float>(static_cast<int32_t>(l)));
         }
       } else if (t.attributes[k].convert != kTgsiAsIs) {
@@ -606,10 +613,16 @@ bool GlContext::hw_draw_inner(ProgramObj& p, const Target& target, uint32_t mode
       for (uint32_t i = 0; i < c.comps && i < 4; ++i) {
         if (c.slot + i >= shared.count()) continue;
         const uint32_t bits = shared[c.slot + i];
-        // (the device keeps integers and booleans as float values)
+        // (the device keeps integers and booleans as float values, exact up to 2^24: a larger integer draws on the CPU, which wraps as GLSL says)
         switch (c.convert) {
-          case kTgsiFromInt: lanes[i] = f2u(static_cast<float>(static_cast<int32_t>(bits))); break;
-          case kTgsiFromUint: lanes[i] = f2u(static_cast<float>(bits)); break;
+          case kTgsiFromInt:
+            if (!exact_int(static_cast<int32_t>(bits))) return no("an integer the device cannot hold exactly");
+            lanes[i] = f2u(static_cast<float>(static_cast<int32_t>(bits)));
+            break;
+          case kTgsiFromUint:
+            if (bits > kExactInt) return no("an integer the device cannot hold exactly");
+            lanes[i] = f2u(static_cast<float>(bits));
+            break;
           case kTgsiFromBool: lanes[i] = f2u(bits ? 1.0f : 0.0f); break;
           default: lanes[i] = bits; break;
         }
