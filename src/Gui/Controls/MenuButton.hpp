@@ -36,13 +36,17 @@ class MenuButton : public Control, public MenuHost {
   // Adds a search box to the bottom of the menu that filters its items as you type (see MenuPopup::set_searchable).
   void set_searchable(bool searchable) { UiGuard lock(this); popup_.set_searchable(searchable); }
   bool open() const { return open_; }
+  // Fired just before the menu opens (a handler that runs at once may still change the items) and after it has closed. Items may be
+  // changed safely only while the menu is closed: from the closed handler, or after checking open() under the window lock.
+  void on_opening(Handler handler) { UiGuard lock(this); opening_ = handler; }
+  void on_closed(Handler handler) { UiGuard lock(this); closed_ = handler; }
   // Opens the menu, or closes it if it is open (the keyboard shortcut of the desktop's Start button).
   void toggle_menu() { if (open_) close_menu(); else open_menu(); }
 
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
-  void on_popup_closed(Control*) override { open_ = false; invalidate(); }
+  void on_popup_closed(Control*) override;
   bool on_key(const KeyArgs& args) override;
 
   void switch_menu(int32_t) override {}
@@ -59,6 +63,7 @@ class MenuButton : public Control, public MenuHost {
   Menu menu_;
   MenuPopup popup_;
   Direction direction_ = Direction::Down;
+  Handler opening_, closed_;
   bool open_ = false;
 };
 

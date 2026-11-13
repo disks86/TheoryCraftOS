@@ -596,6 +596,7 @@ add_executable(BOOTX64
   src/Graphics/SystemGraphics.cpp
   src/BootLog.cpp
   src/Desktop/Desktop.cpp
+  src/Desktop/InstalledApps.cpp
   src/Desktop/DesktopSurface.cpp
   src/Desktop/FileExplorer.cpp
   src/Desktop/DisplaySettings.cpp

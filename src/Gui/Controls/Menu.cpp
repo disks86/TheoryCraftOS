@@ -37,25 +37,47 @@ Menu::~Menu() {
   for (uint64_t i = 0; i < items_.count(); ++i) destroy(allocator_, items_[i]);
 }
 
-MenuItem* Menu::add(StringView text, StringView shortcut, bool separator, Handler on_click) {
+MenuItem* Menu::add(uint64_t index, StringView text, StringView shortcut, bool separator, Handler on_click) {
   void* memory = allocator_.allocate(sizeof(MenuItem));
   if (!memory) return nullptr;
   UiGuard lock(owner_);
   MenuItem* item = new (memory) MenuItem(allocator_, owner_);
   item->separator = separator;
   item->on_click = on_click;
-  if (!item->text.assign(text) || !item->shortcut.assign(shortcut) || !items_.push_back(item)) {
+  if (index > items_.count()) index = items_.count();
+  if (!item->text.assign(text) || !item->shortcut.assign(shortcut) || !items_.insert(index, item)) {
     destroy(allocator_, item);
     return nullptr;
   }
+  if (owner_) owner_->invalidate();
   return item;
 }
 
 MenuItem* Menu::add_item(StringView text, Handler on_click, StringView shortcut) {
-  return add(text, shortcut, false, on_click);
+  return add(items_.count(), text, shortcut, false, on_click);
 }
 
-MenuItem* Menu::add_separator() { return add(StringView(), StringView(), true, {}); }
+MenuItem* Menu::add_separator() { return add(items_.count(), StringView(), StringView(), true, {}); }
+
+MenuItem* Menu::insert_item(uint32_t index, StringView text, Handler on_click) { return add(index, text, StringView(), false, on_click); }
+
+MenuItem* Menu::insert_separator(uint32_t index) { return add(index, StringView(), StringView(), true, {}); }
+
+int32_t Menu::index_of(const MenuItem* item) const {
+  UiGuard lock(owner_);
+  for (uint64_t i = 0; i < items_.count(); ++i)
+    if (items_[i] == item) return static_cast<int32_t>(i);
+  return -1;
+}
+
+bool Menu::remove_item(MenuItem* item) {
+  UiGuard lock(owner_);
+  const int32_t index = index_of(item);
+  if (index < 0 || !items_.remove_at(static_cast<uint64_t>(index))) return false;
+  destroy(allocator_, item);
+  if (owner_) owner_->invalidate();
+  return true;
+}
 
 // --- MenuPopup -----------------------------------------------------------------
 

@@ -30,7 +30,7 @@ using filesystem::NodeType;
 using filesystem::OpenMode;
 using filesystem::Status;
 
-Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), shell_(allocator), opened_path_(allocator) {
+Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), shell_(allocator), opened_path_(allocator), pending_folder_(allocator), pending_line_(allocator) {
   set_title("Terminal");
   set_bounds({100, 80, 600, 380});
   set_padding(Insets::all(4));
@@ -123,6 +123,29 @@ void Terminal::run(StringView line) {
   view_.write(text.view());
   shell_.execute(line);
   refresh_prompt();
+}
+
+bool Terminal::start_command(StringView folder, StringView line) {
+  {
+    UiGuard lock(this);
+    if (!pending_folder_.assign(folder) || !pending_line_.assign(line)) return false;
+  }
+  fire({&Terminal::on_start_command, this});
+  return true;
+}
+
+void Terminal::on_start_command(void* self, Control&) {
+  auto* t = static_cast<Terminal*>(self);
+  String folder(t->allocator()), line(t->allocator());
+  {
+    UiGuard lock(t);
+    if (!folder.assign(t->pending_folder_.view()) || !line.assign(t->pending_line_.view())) return;
+    t->pending_folder_.clear();
+    t->pending_line_.clear();
+  }
+  if (line.empty()) return;
+  if (!folder.empty()) (void)t->change_directory(folder.view());   // (a folder that is gone is reported in the output; the program still runs)
+  t->run(line.view());
 }
 
 bool Terminal::change_directory(StringView path) {

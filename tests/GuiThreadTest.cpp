@@ -31,6 +31,8 @@
 #include <thread>
 #include <vector>
 #include "Desktop/Desktop.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DropDown.hpp"
@@ -576,6 +578,85 @@ static void test_desktop_threads() {
   CHECK(a.live == 0);
 }
 
+// The Start menu's installed applications are looked for on a thread of their own while the desktop runs: opening and closing the menu
+// over and over while applications come and go leaves it listing what is on the disk, and choosing one starts it in a terminal.
+static void put_file(filesystem::IFileSystem& fs, const char* path, ConstByteView data) {
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  CHECK(fs.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok);
+  if (file) CHECK(file->write(0, data, &written) == filesystem::Status::Ok && written == data.size());
+}
+
+static int32_t start_item(desktop::Desktop& d, const char* text) {
+  int32_t found = -1;
+  d.window().locked([&] {
+    const gui::Menu& menu = d.start_button().menu();
+    for (uint32_t i = 0; i < menu.item_count(); ++i)
+      if (menu.item(i)->text.view().equals(text)) found = static_cast<int32_t>(i);
+  });
+  return found;
+}
+
+static void test_desktop_installed_apps_threads() {
+  namespace layout = filesystem::layout;
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem ram(a);
+    for (const char* f : layout::kFolders) ram.create_directory(f);
+    for (const char* f : layout::kLinuxFolders) ram.create_directory(f);
+    ram.create_directory(layout::kLinuxApplications);
+    const uint8_t elf[64] = {0x7F, 'E', 'L', 'F', 2, 1, 1};
+    put_file(ram, "/Linux/usr/bin/firefox", ConstByteView(elf, sizeof elf));
+    const char* entry = "[Desktop Entry]\nType=Application\nName=Firefox\nExec=firefox %u\n";
+    const char* other = "[Desktop Entry]\nType=Application\nName=Other\nExec=firefox --other\n";
+    put_file(ram, "/Linux/usr/share/applications/firefox.desktop", ConstByteView(reinterpret_cast<const uint8_t*>(entry), strlen(entry)));
+
+    Screen screen(a, 1024, 768);
+    desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
+    d.set_file_system(&ram);
+    CHECK(d.start());
+    CHECK(wait_until(d, 3000000, [](desktop::Desktop& x) { return start_item(x, "Firefox (Linux)") >= 0; }));
+    // Applications come and go while the menu is opened and closed (each opening looks again).
+    std::atomic<bool> stop{false};
+    std::thread installer([&] {
+      for (int i = 0; !stop.load(); ++i) {
+        if (i % 2 == 0) put_file(ram, "/Linux/usr/share/applications/other.desktop", ConstByteView(reinterpret_cast<const uint8_t*>(other), strlen(other)));
+        else ram.remove("/Linux/usr/share/applications/other.desktop");
+        sleep_ms(1);
+      }
+    });
+    for (int i = 0; i < 60; ++i) {
+      d.start_button().toggle_menu();
+      d.pump(1000000 + i * 20000);
+      sleep_ms(2);
+    }
+    stop = true;
+    installer.join();
+    put_file(ram, "/Linux/usr/share/applications/other.desktop", ConstByteView(reinterpret_cast<const uint8_t*>(other), strlen(other)));
+    d.window().locked([&] { if (d.start_button().open()) d.start_button().toggle_menu(); });
+    d.start_button().toggle_menu();   // open: looks again
+    d.start_button().toggle_menu();   // close: what it found goes in
+    CHECK(wait_until(d, 3000000, [](desktop::Desktop& x) { return start_item(x, "Other (Linux)") >= 0 && start_item(x, "Firefox (Linux)") >= 0; }));
+    CHECK(start_item(d, "Firefox (Linux)") + 1 == start_item(d, "Other (Linux)"));
+    // Choosing one opens a terminal on its own lane, which runs it.
+    gui::MenuItem* item = nullptr;
+    d.window().locked([&] { item = d.start_button().menu().item(static_cast<uint32_t>(start_item(d, "Firefox (Linux)"))); });
+    d.start_button().activate(item);
+    CHECK(wait_until(d, 3000000, [](desktop::Desktop& x) {
+      bool ran = false;
+      x.window().locked([&] {
+        for (uint32_t i = 0; i < x.terminal().view().line_count(); ++i)
+          if (x.terminal().view().line(i).find(StringView("/Linux/usr/bin/firefox")) != StringView::npos) ran = true;
+      });
+      return ran;
+    }));
+    CHECK(d.window().wait_for_handlers(2000000));
+    d.stop();
+    CHECK(d.window().wait_for_background(2000000));
+  }
+  CHECK(a.live == 0);
+}
+
 int main(int argc, char** argv) {
   const bool only_desktop = argc > 1 && strcmp(argv[1], "desktop") == 0;
   if (!only_desktop) {
@@ -587,6 +668,7 @@ int main(int argc, char** argv) {
     test_destroying_controls();
   }
   test_desktop_threads();
+  test_desktop_installed_apps_threads();
   if (g_failed) { printf("%d checks failed\n", g_failed.load()); return 1; }
   printf("gui threads: all checks passed\n");
   return 0;
