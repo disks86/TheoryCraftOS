@@ -38,7 +38,9 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #ifdef TCOS_EMU_X11
+#include <map>
 #include <set>
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Process/UnixSockets.hpp"
 #include "X11/X11SocketServer.hpp"
 #endif
@@ -410,8 +412,12 @@ int main(int argc, char** argv) {
   x11::SocketServer x11_sockets(x11_server, *process::system_unix_sockets(), a);
   if (!x11_sockets.listen(0, &fs)) printf("x11: could not listen\n");
   std::atomic<bool> x11_stop{false};
-  std::set<std::string> x11_titles;
+  std::map<std::string, uint32_t> x11_titles;      // (and the pixel at (20, 20) of the window's client area as the stand-in desktop last drew it)
   std::thread x11_thread([&] {
+    std::vector<uint32_t> canvas(512 * 512);
+    graphics::Surface target;
+    target.pixels = ArrayView<uint32_t>(canvas.data(), canvas.size());
+    target.width = target.height = target.pitch = 512;
     while (!x11_stop) {
       while (x11_sockets.pump()) {}
       x11_sockets.wait(2'000'000);
@@ -420,7 +426,11 @@ int main(int argc, char** argv) {
       for (uint32_t w : windows.view()) {
         desktop::WindowsWindowInfo info;
         String title(a);
-        if (x11_server.window_info(w, &info, &title) && info.visible && info.caption) x11_titles.insert(std::string(title.c_str()));
+        if (!x11_server.window_info(w, &info, &title) || !info.visible || !info.caption) continue;
+        graphics::SoftwareRenderer2D renderer(target);
+        uint32_t dw = 0, dh = 0;
+        const bool drawn = x11_server.draw_window(w, renderer, 0, 0, &dw, &dh) && dw > 20 && dh > 20;
+        x11_titles[std::string(title.c_str())] = drawn ? canvas[20 * 512 + 20] : 0;
       }
     }
   });
@@ -720,7 +730,7 @@ int main(int argc, char** argv) {
 #ifdef TCOS_EMU_X11
   x11_stop = true;
   x11_thread.join();
-  for (const std::string& t : x11_titles) printf("x11-desktop: framed window \"%s\"\n", t.c_str());
+  for (const auto& t : x11_titles) printf("x11-desktop: framed window \"%s\" pixel %08x\n", t.first.c_str(), t.second);
 #endif
 #ifdef TCOS_EMU_WAYLAND
   wl_stop = true;
