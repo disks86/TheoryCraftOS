@@ -335,6 +335,14 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
     pick by overlap or nearness, `GetMonitorInfo` answers each (`\\.\DISPLAY<n>`, the primary flagged), `EnumDisplayMonitors` calls back for each, and a window
     maximizes to the work area of the monitor it is mostly on.
   - *Vulkan sizes*: a swapchain image of another size than the client area is stretched over it (nearest pixel), as DWM does.
+  - *Files dropped from the desktop*: a file dragged from the File Explorer (or a Wayland program's file let go) over a window that accepts files
+    (`DragAcceptFiles`, `WS_EX_ACCEPTFILES`, it or the nearest ancestor under the pointer) is taken: let go, the window gets `WM_DROPFILES` with an
+    HDROP that `DragQueryFile` / `DragQueryPoint` read and `DragFinish` frees. The file's name is the one Windows programs see
+    (`layout::windows_view_of`: `C:\...`, the user's files under `C:\Users\Public\Desktop`). win32k queues the message with a ticket
+    (`user::drop_files`, wParam the ticket, lParam `kDropTicketMark`); user32's `GetMessage` / `PeekMessage(PM_REMOVE)` turn it into the
+    `DROPFILES` block in `GlobalAlloc` memory (`NtUserCallTwoParam` code `0x7C00`, TheoryCraftOS's own: the size, then the block), so the HDROP
+    lives in the program's heap as on Windows. Text is not dropped (no OLE `IDropTarget` yet), nor files Windows programs cannot see (`/Linux`,
+    `/AppStore`). Host tests: `Win32kUserTest` (`test_redirection`), `GuiTest` (`test_windows_drag_bridge`), `ProcessFilesTest`.
   - Checked in QEMU with `tests/windows/windowstest.c` (accented title and icon in the title bar and taskbar, I-beam and hand cursors, the owned window coming along when
     its owner is raised over the Terminal, a captionless window dragged by its own bar) and `vkwindowtest.c` maximized (the stretched picture fills the window).
     Host tests: `Win32kUserTest` (`test_redirection`: stacking, owner, drag requests, icon, UTF-8 title, cursors, custom cursor picture, stretched present, two

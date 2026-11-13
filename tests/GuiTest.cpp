@@ -2097,6 +2097,24 @@ static void test_windows_drag_bridge() {
   done = false;
   for (const std::string& e : s.log) done |= e == "program_drop_done 0";
   CHECK(done);
+  // a program's drop on another program's window: that program's session is asked then (no drag went before it) and takes it
+  s.take_drags = true;
+  s.program_drop = "/Desktop/Documents/c.txt";
+  s.program_x = 450;
+  s.program_y = 160;
+  s.log.clear();
+  log.clear();
+  for (int i = 0; i < 4; ++i) d.step(5500 + i * 20);
+  {
+    bool asked = false, dropped_there = false, told = false;
+    for (const std::string& e : s.log) {
+      asked |= e.rfind("ddrag 7 ", 0) == 0 && e.find("/Desktop/Documents/c.txt") != std::string::npos;
+      dropped_there |= e == "ddrop";
+      told |= e == "program_drop_done 1";
+    }
+    CHECK(asked && dropped_there && told && log.empty());
+  }
+  s.take_drags = false;
   // a program's drag over the desktop before it is let go: shown on the desktop's window, and the program hears whether what is under it would take it
   gui::Window* dw = wm.window();
   s.program_drag_items = "/Desktop/Documents/a b.txt\n/Linux/root/x.txt";

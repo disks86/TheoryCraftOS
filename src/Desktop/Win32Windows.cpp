@@ -70,7 +70,14 @@ void Win32Window::on_drag_leave() {
   session_.desktop_drag_end();
 }
 
-bool Win32Window::accepts_drop(StringView, int32_t, int32_t, const gui::Control*) const { return drag_taken_; }
+// A drop with no drag before it (an item another session's program let go over this window, gui::Window::drop_at) is offered to the session now.
+bool Win32Window::accepts_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) const {
+  if (drag_taken_ || source) return drag_taken_;
+  const gui::Rect2D b = bounds();
+  if (session_.desktop_drag(window_, b.x + x, b.y + y, text)) return true;
+  session_.desktop_drag_end();
+  return false;
+}
 
 void Win32Window::on_drop(StringView, int32_t, int32_t, const gui::Control*) {
   drag_taken_ = false;

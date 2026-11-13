@@ -403,6 +403,16 @@ class HandleTable {
   List<uint64_t> free_;
 };
 
+// ---- Files the desktop dropped on a window (WM_DROPFILES), until the program's user32 collects them (take_drop).
+struct DropRecord {
+  explicit DropRecord(allocators::IAllocator& a) : names(a) {}
+  uint32_t ticket = 0;
+  uint64_t pid = 0;
+  int32_t x = 0, y = 0;          // the point, in the target's client coordinates
+  bool non_client = false;       // it is outside the client area
+  List<char16_t> names;          // each name ends with a NUL; one more NUL ends the list
+};
+
 // ---- The whole state.
 struct State {
   explicit State(allocators::IAllocator& a);
@@ -425,6 +435,8 @@ struct State {
   Hive<ProcessInfo> processes;
   Hive<WinDc> dcs;
   List<ThreadDesktop> thread_desktops;
+  Hive<DropRecord> drops;
+  uint32_t next_drop = 1;
   Class* desktop_class = nullptr;
   Class* message_class = nullptr;
   uint32_t next_atom = 0xC000;
