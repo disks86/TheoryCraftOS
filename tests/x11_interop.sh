@@ -8,11 +8,13 @@ display=${1:-87}
 out=${TMPDIR:-/tmp}/tcos-x11-interop
 mkdir -p "$out"
 if [ ! -f /usr/include/X11/Xlib.h ]; then echo "skipped (no libX11 headers)"; exit 0; fi
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/x11/X11HostServer.cpp src/X11/X11DragAndDrop.cpp src/X11/X11Drawing.cpp src/X11/X11Input.cpp src/X11/X11Requests.cpp \
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src tests/x11/X11HostServer.cpp src/X11/X11DragAndDrop.cpp src/X11/X11Drawing.cpp src/X11/X11Input.cpp src/X11/X11Input2.cpp src/X11/X11Requests.cpp \
   src/X11/X11Tables.cpp src/X11/X11Windows.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp tests/KernelStubs.cpp \
   -o "$out/X11HostServer"
 gcc -O1 -g -Wall tests/x11/xlib_client.c -lX11 -o "$out/xlib_client"
 gcc -O1 -g -Wall tests/x11/xdnd_client.c -lX11 -o "$out/xdnd_client"
+have_xi=0
+if [ -f /usr/include/X11/extensions/XInput2.h ]; then gcc -O1 -g -Wall tests/x11/xi2_client.c -lXi -lX11 -o "$out/xi2_client" && have_xi=1; fi
 
 "$out/X11HostServer" "$display" 60 "$out/windows.ppm" > "$out/server.log" 2>&1 &
 server=$!
@@ -46,5 +48,18 @@ wait "$xserver" || true
 grep "desktop drop\|program drop" "$out/xdnd-server.log" || true
 grep -q "program drop at 700,450: /Desktop/Documents/b.txt" "$out/xdnd-server.log" || { echo "the desktop did not get the client's file"; status=1; }
 if grep -q "ERROR: AddressSanitizer\|runtime error" "$out/xdnd-server.log"; then cat "$out/xdnd-server.log"; status=1; fi
+# XInput 2.2 touches through libXi: a server of its own that plays the touchscreen (TCOS_XI2)
+if [ $have_xi -eq 1 ]; then
+  echo "== xi2_client"
+  TCOS_XI2=1 "$out/X11HostServer" "$((display + 2))" 30 > "$out/xi2-server.log" 2>&1 &
+  iserver=$!
+  for _ in $(seq 50); do grep -q listening "$out/xi2-server.log" 2>/dev/null && break; sleep 0.1; done
+  DISPLAY=:$((display + 2)) XAUTHORITY=/dev/null "$out/xi2_client" || status=1
+  kill "$iserver" 2>/dev/null || true
+  wait "$iserver" || true
+  if grep -q "ERROR: AddressSanitizer\|runtime error" "$out/xi2-server.log"; then cat "$out/xi2-server.log"; status=1; fi
+else
+  echo "== xi2_client skipped (no libXi headers)"
+fi
 [ $status -eq 0 ] && echo "x11 interop: all passed" || echo "x11 interop: FAILED"
 exit $status

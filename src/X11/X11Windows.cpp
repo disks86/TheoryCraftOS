@@ -258,6 +258,7 @@ void Server::close_client(uint32_t client) {
 void Server::free_client_resources(uint8_t client) {
   release_grabs_of(client);
   xdnd_client_gone(client);
+  xi_client_gone(client);
   for (uint64_t i = 0; i < selection_owners_.count();) {
     if (selection_owners_[i].client == client) selection_owners_.remove_at(i);
     else ++i;

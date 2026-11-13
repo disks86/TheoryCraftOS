@@ -818,6 +818,7 @@ add_executable(BOOTX64
   src/X11/X11DragAndDrop.cpp
   src/X11/X11Drawing.cpp
   src/X11/X11Input.cpp
+  src/X11/X11Input2.cpp
   src/X11/X11Requests.cpp
   src/X11/X11SocketServer.cpp
   src/X11/X11Tables.cpp
