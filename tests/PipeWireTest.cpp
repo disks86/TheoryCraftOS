@@ -36,6 +36,7 @@
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
+#include "PipeWire/ScreenSource.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/VideoConvert.hpp"
 #include "PipeWire/Pod.hpp"
@@ -2352,6 +2353,38 @@ static void test_camera_sources() {
   g.destroy_node(second);
 }
 
+// The screen as a video source: frames only while watched, at most kFps a second, published as BGRx at the screen's size (which may change).
+static void test_screen_source() {
+  Graph g(A, nullptr);
+  CHECK(g.initialize());
+  ScreenSource screen(g, A);
+  CHECK(screen.start() && screen.node() && g.find_node("tcos-screen") == screen.node());
+  uint64_t now = 1000000;
+  CHECK(screen.frame_wanted(8, 4, now).empty() && !screen.watched() && !screen.watcher_came());      // (nobody watches)
+  const uint32_t client = g.add_client(Origin::Native, 1, "native", "test");
+  Properties props(A);
+  props.set("target.object", "tcos-screen");
+  SharedPointer<VideoChannel> seen;
+  const uint32_t watcher = g.create_video_node(client, props, kDirectionInput, &seen);
+  CHECK(watcher && seen && screen.watched() && screen.watcher_came() && !screen.watcher_came());
+  ArrayView<uint32_t> frame = screen.frame_wanted(8, 4, now);
+  CHECK(frame.size() == 32);
+  for (uint32_t i = 0; i < frame.size(); ++i) frame[i] = 0xFF000000u | (i << 16) | (i << 8) | i;
+  screen.frame_read(8, 4, 77);
+  CHECK(screen.published() == 1 && seen->format().format == 8 && seen->format().width == 8 && seen->format().height == 4);
+  SharedPointer<VideoFrame> f = seen->latest();
+  CHECK(f && f->pixels.size() == 128 && f->pts == 77);
+  if (f) CHECK(f->pixels.view()[4 * 5] == 5 && f->pixels.view()[4 * 5 + 2] == 5 && f->pixels.view()[4 * 5 + 3] == 0xFF);      // (B, G, R, A)
+  CHECK(screen.frame_wanted(8, 4, now + 50000).empty());      // (too soon: 10 a second at most)
+  ArrayView<uint32_t> bigger = screen.frame_wanted(16, 8, now + 100000);
+  CHECK(bigger.size() == 128);
+  screen.frame_read(16, 8, 78);
+  CHECK(screen.published() == 2 && seen->format().width == 16 && seen->latest() && seen->latest()->pixels.size() == 512);
+  CHECK(screen.frame_wanted(VideoFormat::kMaxSide + 1, 4, now + 300000).empty());
+  g.destroy_node(watcher);
+  CHECK(!screen.watched() && screen.frame_wanted(8, 4, now + 400000).empty());
+}
+
 // ---- the AF_UNIX transport -----------------------------------------------------------------------------------------------------------------------
 
 struct SystemSync final : process::ISystemSync {
@@ -4281,6 +4314,7 @@ int main() {
   test_windows_service();
   test_windows_virtual_sink();
   test_camera_sources();
+  test_screen_source();
   test_record_convert();
   test_record();
   test_record_threads();

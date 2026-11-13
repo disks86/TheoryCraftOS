@@ -674,4 +674,11 @@ void SoftwareRenderer2D::present() {
   }
 }
 
+bool SoftwareRenderer2D::read_frame(ArrayView<uint32_t> out) {
+  const uint32_t w = target_.width, h = target_.height;
+  if (target_.pixels.empty() || !target_.valid() || out.size() < uint64_t{w} * h) return false;
+  for (uint32_t y = 0; y < h; ++y) out.subview(uint64_t{y} * w, w).copy_from(ArrayView<const uint32_t>(target_.pixels).subview(uint64_t{y} * target_.pitch, w));
+  return true;
+}
+
 }  // namespace graphics

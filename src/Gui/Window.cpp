@@ -125,7 +125,21 @@ void Window::render() {
   // Presenting needs no access to the controls: the UI may change while the frame goes out.
   // Present on the same renderer we painted (captured under the lock above).
   r->reset_clip();
+  {
+    // a copy for the frame tap (screen sharing), when it wants this one
+    kernel::ScopedMutex guard(tap_mutex_);
+    if (tap_) {
+      const graphics::Extent2D e = r->extent();
+      ArrayView<uint32_t> into = tap_->frame_wanted(e.width, e.height);
+      if (!into.empty() && into.size() >= uint64_t{e.width} * e.height && r->read_frame(into)) tap_->frame_read(e.width, e.height);
+    }
+  }
   r->present();
+}
+
+void Window::set_frame_tap(IFrameTap* tap) {
+  kernel::ScopedMutex guard(tap_mutex_);
+  tap_ = tap;
 }
 
 void Window::draw_pointer(Painter& painter, CursorShape shape, const Control* under) {

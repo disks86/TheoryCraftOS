@@ -163,6 +163,11 @@ ConstByteView bytes_of(const T& object) {
   return ConstByteView(reinterpret_cast<const uint8_t*>(&object), sizeof(T));
 }
 
+// 32-bit words as their bytes (in memory order). Safe: bytes may alias any object, and a byte has no alignment to keep.
+inline ConstByteView words_as_bytes(ArrayView<const uint32_t> words) {
+  return ConstByteView(reinterpret_cast<const uint8_t*>(words.data()), words.size() * 4);
+}
+
 // The characters of a NUL-terminated string (without the NUL) as bytes. The
 // string must really be terminated; the view is only as long as its text.
 inline ConstByteView text_bytes(const char* text) {

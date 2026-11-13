@@ -235,6 +235,7 @@ add_executable(BOOTX64
   src/PipeWire/VideoChannel.cpp
   src/PipeWire/VideoConvert.cpp
   src/PipeWire/CameraSource.cpp
+  src/PipeWire/ScreenSource.cpp
   src/PipeWire/PlaybackStream.cpp
   src/PipeWire/RecordStream.cpp
   src/PipeWire/Pod.cpp

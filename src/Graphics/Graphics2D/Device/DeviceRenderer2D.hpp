@@ -122,6 +122,7 @@ class DeviceRenderer2D final : public IRenderer2D {
 
   // Draws what is batched, then copies the image to `out` (extent.width * extent.height, 0xAARRGGBB).
   bool read_pixels(ArrayView<uint32_t> out);
+  bool read_frame(ArrayView<uint32_t> out) override { return read_pixels(out); }
 
  private:
   static constexpr uint32_t kMaxVertices = 6 * 4096;

@@ -73,6 +73,7 @@ class SoftwareRenderer2D final : public IRenderer2D {
   void pop_layer() override;
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   void present() override;
+  bool read_frame(ArrayView<uint32_t> out) override;
 
   const Surface& target() const { return target_; }
 

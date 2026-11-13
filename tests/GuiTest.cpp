@@ -1916,7 +1916,46 @@ static void test_x11_frames() {
   CHECK(a.live == 0);
 }
 
+// A window's frame tap: it is asked for each frame, and given exactly what was drawn (before present), only when it wants it.
+static void test_frame_tap() {
+  TestAllocator a;
+  Theme theme;
+  Screen screen(a, 64, 32);
+  Window w(a, screen.renderer, theme, {64, 32});
+  Panel fill(a);
+  fill.set_dock(DockStyle::Fill);
+  w.add(&fill);
+  struct Tap final : IFrameTap {
+    std::vector<uint32_t> buffer;
+    bool want = true;
+    int asked = 0, read = 0;
+    uint32_t w = 0, h = 0;
+    ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) override {
+      ++asked;
+      if (!want) return ArrayView<uint32_t>();
+      buffer.assign(size_t(width) * height, 0xDEADBEEF);
+      return ArrayView<uint32_t>(buffer.data(), buffer.size());
+    }
+    void frame_read(uint32_t width, uint32_t height) override { ++read; w = width; h = height; }
+  } tap;
+  w.set_frame_tap(&tap);
+  w.render();
+  CHECK(tap.asked == 1 && tap.read == 1 && tap.w == 64 && tap.h == 32);
+  bool same = tap.buffer.size() == 64 * 32;
+  for (uint32_t y = 0; y < 32 && same; ++y)
+    for (uint32_t x = 0; x < 64 && same; ++x) same = tap.buffer[size_t(y) * 64 + x] == screen.px(int32_t(x), int32_t(y));
+  CHECK(same);
+  tap.want = false;
+  w.invalidate();
+  w.render();
+  CHECK(tap.asked == 2 && tap.read == 1);
+  w.set_frame_tap(nullptr);
+  w.render();
+  CHECK(tap.asked == 2);
+}
+
 int main() {
+  test_frame_tap();
   test_dock_layout();
   test_uniform_panel();
   test_button_and_focus();

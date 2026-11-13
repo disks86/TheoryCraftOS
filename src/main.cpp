@@ -31,6 +31,7 @@
 #include "DBus/SocketServer.hpp"
 #include "PipeWire/Graph.hpp"
 #include "PipeWire/CameraSource.hpp"
+#include "PipeWire/ScreenSource.hpp"
 #include "PipeWire/NativeServer.hpp"
 #include "PipeWire/PulseServer.hpp"
 #include "PipeWire/SocketServer.hpp"
@@ -2157,6 +2158,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     // The cameras as video sources of the graph (a node each; a camera streams while a program watches it): updated from the loop below.
     pipewire::CameraSources camera_sources(media_graph, shared_allocator);
     uint64_t camera_sources_us = 0;
+    // The screen as a video source too (screen sharing): the desktop's window hands it a copy of what it draws while a program watches.
+    pipewire::ScreenSource screen_source(media_graph, shared_allocator);
+    struct ScreenTap final : gui::IFrameTap {
+      pipewire::ScreenSource& s;
+      explicit ScreenTap(pipewire::ScreenSource& source) : s(source) {}
+      ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) override { return s.frame_wanted(width, height, hardware::uptime_us()); }
+      void frame_read(uint32_t width, uint32_t height) override { s.frame_read(width, height, static_cast<int64_t>(hardware::uptime_us() * 1000)); }
+    } screen_tap(screen_source);
+    struct ScreenTapGuard {
+      gui::Window& w;
+      ~ScreenTapGuard() { w.set_frame_tap(nullptr); }      // (before the source goes)
+    } screen_tap_guard{desktop.window()};
+    if (screen_source.start()) desktop.window().set_frame_tap(&screen_tap);
     UniquePointer<pipewire::SocketServer> pipewire_sockets;
     if (media_graph.initialize()) {
       pipewire::install_windows_audio(windows_audio);
@@ -2705,6 +2719,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         for (uint32_t i = 0; i < cameras.count() && listed < pipewire::CameraSources::kMaxCameras; ++i)
           if (SharedPointer<hardware::ICamera> c = cameras.share(i)) list[listed++] = pipewire::CameraSources::Camera{cameras.id(i), util::move(c)};
         camera_sources.update(ArrayView<const pipewire::CameraSources::Camera>(list, listed), now_us);
+        if (screen_source.watcher_came()) desktop.window().invalidate();      // (a frame for the new watcher, even of a still screen)
       }
       if (threaded) {
         desktop.pump(hardware::uptime_us());

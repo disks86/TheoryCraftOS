@@ -251,6 +251,9 @@ class IRenderer2D {
 
   // Makes everything drawn so far visible.
   virtual void present() = 0;
+  // Copies what has been drawn into the frame so far (before present()) into `out`: extent().width * height pixels, 0xAARRGGBB, row after row.
+  // False when this renderer cannot read its frame back (and `out` is left as it was). For screen sharing: slow on a device, use sparingly.
+  virtual bool read_frame(ArrayView<uint32_t> out) { (void)out; return false; }
 
  protected:
   constexpr IRenderer2D() = default;

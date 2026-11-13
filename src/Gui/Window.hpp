@@ -34,6 +34,19 @@
 
 namespace gui {
 
+// Who takes a copy of the frames a window draws (screen sharing: PipeWire's screen source). Called on the render thread, between drawing a frame
+// and presenting it.
+class IFrameTap {
+ public:
+  // Whether it wants this frame (width x height pixels): a buffer for it, at least width * height (empty: not this one).
+  virtual ArrayView<uint32_t> frame_wanted(uint32_t width, uint32_t height) = 0;
+  // The frame is in that buffer (0xAARRGGBB, row after row).
+  virtual void frame_read(uint32_t width, uint32_t height) = 0;
+
+ protected:
+  ~IFrameTap() = default;
+};
+
 class Window final : public Control {
  public:
   Window(allocators::IAllocator& allocator, graphics::IRenderer2D& renderer, const Theme& theme,
@@ -54,6 +67,9 @@ class Window final : public Control {
   // Lays out, draws everything (children, popup, cursor) and presents. Clears dirty(). The tree is locked
   // only while it is drawn, not while the finished frame is presented. Call from one thread at a time.
   void render();
+  // Frames to `tap` too (null: to nobody); when this returns, the old tap is no longer called. Frames are drawn only when something changed, so
+  // a tap that needs one now invalidates the window.
+  void set_frame_tap(IFrameTap* tap);
   bool dirty() const { return __atomic_load_n(&dirty_, __ATOMIC_ACQUIRE); }
   // The clock of the window, in microseconds of uptime (any origin): makes carets blink. Call often, from any thread (Desktop::pump does). When a
   // control that shows a caret has the focus (or is the popup) and the caret's phase changed since the last call, the window is marked dirty.
@@ -224,6 +240,8 @@ class Window final : public Control {
   kernel::Event frame_event_{true};  // auto-reset: set when the window becomes dirty
   // The handler queue.
   kernel::Mutex queue_mutex_;
+  kernel::Mutex tap_mutex_;       // (the tap is called and changed under it)
+  IFrameTap* tap_ = nullptr;
   kernel::Semaphore queue_signal_{0};
   List<Pending> pending_;
   Worker workers_[kMaxHandlerThreads];
