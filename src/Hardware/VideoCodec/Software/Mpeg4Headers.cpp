@@ -60,6 +60,7 @@ class Bits {
     return !bad_marker_;
   }
   bool ok() const { return !overrun_ && !bad_marker_; }
+  uint64_t position() const { return pos_; }
 
  private:
   ConstByteView data_;
@@ -83,6 +84,7 @@ bool parse_vol(ConstByteView body, uint8_t profile_and_level, Vol* vol) {
   b.u(1);   // random_accessible_vol
   const uint32_t object_type = b.u(8);
   if (studio_object_type(static_cast<uint8_t>(object_type))) return false;
+  v.object_type = static_cast<uint8_t>(object_type);
   if (b.u(1)) {   // is_object_layer_identifier
     v.is_object_layer_identifier = true;
     v.verid = static_cast<uint8_t>(b.u(4));
@@ -93,6 +95,7 @@ bool parse_vol(ConstByteView body, uint8_t profile_and_level, Vol* vol) {
     b.u(8);
   }
   if (b.u(1)) {   // vol_control_parameters
+    v.vol_control_parameters = true;
     if (b.u(2) != 1) return false;   // chroma_format: 4:2:0 only
     v.low_delay = b.u(1) != 0;
     if (b.u(1)) {   // vbv_parameters
@@ -180,7 +183,80 @@ bool parse_vop(ConstByteView body, const Vol& vol, Vop* vop) {
   return true;
 }
 
+bool parse_vop_full(ConstByteView body, const Vol& vol, VopHeader* header) {
+  Bits b(body);
+  VopHeader h;
+  h.type = static_cast<VopType>(b.u(2));
+  while (b.bit()) {
+    if (++h.modulo_time_base > 4096 || !b.ok()) return false;
+  }
+  b.marker();
+  h.time_increment = b.u(vol.time_increment_bits);
+  b.marker();
+  h.coded = b.u(1) != 0;
+  if (!b.ok()) return false;
+  if (h.type == VopType::S) return false;
+  if (h.coded) {
+    if (h.type == VopType::P) h.rounding_type = b.u(1) != 0;
+    h.intra_dc_vlc_thr = static_cast<uint8_t>(b.u(3));
+    if (vol.interlaced) {
+      h.top_field_first = b.u(1) != 0;
+      h.alternate_vertical_scan = b.u(1) != 0;
+    }
+    h.quant = static_cast<uint8_t>(b.u(5));   // quant_precision is 5 for 8-bit video
+    if (h.quant == 0) return false;
+    if (h.type != VopType::I) {
+      h.fcode_forward = static_cast<uint8_t>(b.u(3));
+      if (h.fcode_forward == 0) return false;
+    }
+    if (h.type == VopType::B) {
+      h.fcode_backward = static_cast<uint8_t>(b.u(3));
+      if (h.fcode_backward == 0) return false;
+    }
+    if (!b.ok()) return false;
+  }
+  h.header_bits = b.position();
+  *header = h;
+  return true;
+}
+
 }  // namespace
+
+bool parse_vol_header(ConstByteView body, uint8_t profile_and_level, Vol* vol) { return parse_vol(body, profile_and_level, vol); }
+
+bool parse_vop_header(ConstByteView body, const Vol& vol, VopHeader* header) { return parse_vop_full(body, vol, header); }
+
+bool is_short_header(ConstByteView data) { return data.size() >= 3 && data[0] == 0 && data[1] == 0 && (data[2] & 0xFC) == 0x80; }
+
+bool parse_short_header(ConstByteView data, ShortHeader* header) {
+  // H.263 Table 1 / ISO/IEC 14496-2 Table 6-25: the source formats.
+  static const uint16_t kFormats[6][2] = {{0, 0}, {128, 96}, {176, 144}, {352, 288}, {704, 576}, {1408, 1152}};
+  if (!is_short_header(data)) return false;
+  Bits b(data);
+  ShortHeader h;
+  b.u(22);   // the picture start code
+  h.temporal_reference = static_cast<uint8_t>(b.u(8));
+  if (b.u(1) != 1 || b.u(1) != 0) return false;   // PTYPE bit 1 (always 1) and 2 (always 0: distinguishes the header from H.261)
+  b.u(3);                                          // split screen, document camera, freeze picture release
+  const uint32_t format = b.u(3);
+  if (format == 0 || format > 5) return false;     // forbidden, reserved, or the extended PTYPE of H.263 version 2
+  h.width = kFormats[format][0];
+  h.height = kFormats[format][1];
+  h.inter = b.u(1) != 0;
+  if (b.u(4) != 0) return false;                   // unrestricted motion vectors, syntax-based arithmetic coding, advanced prediction, PB frames
+  h.quant = static_cast<uint8_t>(b.u(5));
+  if (h.quant == 0) return false;
+  h.continuous_presence = b.u(1) != 0;
+  if (h.continuous_presence) b.u(2);               // PSBI
+  for (int spare = 0; b.u(1); ++spare) {           // PEI and PSPARE
+    if (spare > 256 || !b.ok()) return false;
+    b.u(8);
+  }
+  if (!b.ok()) return false;
+  h.header_bits = b.position();
+  *header = h;
+  return true;
+}
 
 bool parse_packet(ConstByteView data, const Vol* current, Packet* packet) {
   Packet out;
