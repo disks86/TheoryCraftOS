@@ -103,14 +103,14 @@ void UsbMidiDevice::reset() {
   flush();
 }
 
-uint32_t UsbMidiDevice::poll_input(UsbMidiReceiver receiver, void* context) {
+uint32_t UsbMidiDevice::poll_input(UsbMidiReceiver receiver, void* context, UsbMidiSysexReceiver sysex_receiver) {
   if (!input_running_) return 0;
   uint32_t total = 0;
   for (int round = 0; round < 8; ++round) {   // (a device that talks without a pause does not keep the caller from other work)
     uint8_t buffer[512];
     uint16_t length = 0;
     if (!host_.poll_interrupt_in(port_, model_.in_endpoint, ByteView(buffer), &length) || length == 0) break;
-    total += decode_usb_midi_packets(ConstByteView(buffer, length), receiver, context);
+    total += decode_usb_midi_packets(ConstByteView(buffer, length), receiver, context, sysex_receiver ? &sysex_ : nullptr, sysex_receiver);
   }
   return total;
 }

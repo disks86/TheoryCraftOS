@@ -116,7 +116,9 @@ static void test_descriptors() {
 struct Collected {
   struct Message { uint8_t status, d1, d2; };
   std::vector<Message> messages;
+  std::vector<std::vector<uint8_t>> sysex;
   static void fn(void* c, uint8_t s, uint8_t a, uint8_t b) { static_cast<Collected*>(c)->messages.push_back({s, a, b}); }
+  static void sx(void* c, ConstByteView m) { static_cast<Collected*>(c)->sysex.emplace_back(m.data(), m.data() + m.size()); }
 };
 
 static void test_packets() {
@@ -156,6 +158,47 @@ static void test_packets() {
   CHECK(decode_usb_midi_packets(ConstByteView(data, sizeof data), &Collected::fn, &got) == 3);
   CHECK(got.messages.size() == 3 && got.messages[0].status == 0x90 && got.messages[0].d1 == 64 && got.messages[0].d2 == 80);
   CHECK(got.messages[1].status == 0xB1 && got.messages[1].d2 == 90 && got.messages[2].status == 0xEF && got.messages[2].d2 == 0x40);
+  // system exclusive put back together: every length from 2 to 12 through the encoder, split across calls, channel messages around them
+  TestAllocator sa;
+  for (uint32_t len = 2; len <= 12; ++len) {
+    std::vector<uint8_t> message(len);
+    message.front() = 0xF0;
+    for (uint32_t k = 1; k + 1 < len; ++k) message[k] = uint8_t(k * 3);
+    message.back() = 0xF7;
+    std::vector<uint8_t> packets = {0x09, 0x90, 1, 2};
+    encode_usb_midi_sysex(0, ConstByteView(message.data(), len), [&](const uint8_t* q) { packets.insert(packets.end(), q, q + 4); });
+    packets.insert(packets.end(), {0x08, 0x80, 1, 0});
+    UsbMidiSysexReader reader(sa);
+    Collected c;
+    uint32_t total = 0;
+    for (size_t at = 0; at < packets.size(); at += 4) total += decode_usb_midi_packets(ConstByteView(packets.data() + at, 4), &Collected::fn, &c, &reader, &Collected::sx);
+    CHECK(total == 3 && c.messages.size() == 2 && c.sysex.size() == 1 && !reader.building());
+    if (c.sysex.size() == 1) CHECK(c.sysex[0] == message);
+  }
+  {
+    UsbMidiSysexReader reader(sa);
+    Collected c;
+    // a continuation without a start, a start broken by a note, a single-byte system common message (CIN 5, F6): no sysex
+    const uint8_t broken[] = {0x04, 1, 2, 3, 0x06, 4, 0xF7, 0, 0x04, 0xF0, 1, 2, 0x09, 0x90, 1, 2, 0x06, 3, 0xF7, 0, 0x05, 0xF6, 0, 0};
+    decode_usb_midi_packets(ConstByteView(broken, sizeof broken), &Collected::fn, &c, &reader, &Collected::sx);
+    CHECK(c.sysex.empty() && c.messages.size() == 1);
+    // too long: dropped whole, and the next one comes through
+    std::vector<uint8_t> big = {0x04, 0xF0, 1, 1};
+    for (uint32_t k = 0; k < UsbMidiSysexReader::kMaxBytes / 3 + 2; ++k) big.insert(big.end(), {0x04, 5, 5, 5});
+    big.insert(big.end(), {0x05, 0xF7, 0, 0, 0x06, 0xF0, 0xF7, 0});
+    decode_usb_midi_packets(ConstByteView(big.data(), big.size()), &Collected::fn, &c, &reader, &Collected::sx);
+    CHECK(c.sysex.size() == 1 && c.sysex[0] == std::vector<uint8_t>({0xF0, 0xF7}));
+    // random packets: no crash; what comes out is F0 .. F7
+    uint32_t seed = 3;
+    for (int round = 0; round < 3000; ++round) {
+      uint8_t q[16];
+      for (uint8_t& b : q) { seed = seed * 1103515245 + 12345; b = uint8_t(seed >> 16); }
+      for (int k = 0; k < 4; ++k) q[k * 4] = uint8_t(0x04 + (q[k * 4] & 3));
+      Collected r;
+      decode_usb_midi_packets(ConstByteView(q, 16), &Collected::fn, &r, &reader, &Collected::sx);
+      for (const auto& m : r.sysex) CHECK(m.size() >= 2 && m.front() == 0xF0 && m.back() == 0xF7);
+    }
+  }
 }
 
 // --- A fake host controller ---------------------------------------------------------------------------
@@ -263,6 +306,12 @@ static void test_device() {
     Collected got;
     CHECK(keyboard->poll_input(&Collected::fn, &got) == 3 && got.messages.size() == 3 && got.messages[1].d1 == 64 && got.messages[2].status == 0x80);
     CHECK(keyboard->poll_input(&Collected::fn, &got) == 0);   // nothing: returns at once
+    // a keyboard's system exclusive message, split over two transfers
+    host.key({0x04, 0xF0, 0x43, 0x10});
+    host.key({0x06, 0x01, 0xF7, 0x00});
+    Collected sx;
+    CHECK(keyboard->poll_input(&Collected::fn, &sx, &Collected::sx) == 1 && sx.sysex.size() == 1);
+    if (sx.sysex.size() == 1) CHECK(sx.sysex[0] == std::vector<uint8_t>({0xF0, 0x43, 0x10, 0x01, 0xF7}));
 
     // Output is batched and goes out on flush, or when the batch is full.
     keyboard->send(0x90, 60, 100);

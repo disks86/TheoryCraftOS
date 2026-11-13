@@ -100,6 +100,7 @@ class UsbMidiService final : public midi::IMidiOutput {
   static constexpr uint32_t kProgramScans = 25;      // (scans the software synthesizer keeps running after a program's last note: about 5 s)
   static void thread_main(void* self);
   static void on_message(void* self, uint8_t status, uint8_t data1, uint8_t data2);
+  static void on_sysex(void* self, ConstByteView message);
   void scan_devices();
   void drop_gone_devices();
   void update_live_synth();

@@ -24,6 +24,7 @@
 #pragma once
 #include <stdint.h>
 #include "Utility/ArrayView.hpp"
+#include "Utility/ByteBuffer.hpp"
 
 namespace hardware {
 
@@ -65,9 +66,27 @@ uint32_t encode_usb_midi_sysex(uint8_t cable, ConstByteView message, F&& put) {
   return packets;
 }
 
+// A device's system exclusive messages put back together from its packets (CIN 4: three bytes that start or go on with one; 5, 6, 7: the last one,
+// two or three bytes; a packet of another kind in the middle of one breaks it). At most kMaxBytes (F0 and F7 counted); a longer one is dropped.
+class UsbMidiSysexReader {
+ public:
+  static constexpr uint32_t kMaxBytes = 65536;
+  explicit UsbMidiSysexReader(allocators::IAllocator& allocator) : bytes_(allocator) {}
+  // One packet. True when it ended a message: *out is its bytes, F0 to F7 (good until the next call).
+  bool feed(const uint8_t packet[4], ConstByteView* out);
+  bool building() const { return building_; }
+
+ private:
+  ByteBuffer bytes_;
+  bool building_ = false, too_long_ = false;
+};
+using UsbMidiSysexReceiver = void (*)(void* context, ConstByteView message);
+
 // Calls receiver(context, status, data1, data2) for each channel message in the 4-byte packets of `data` (a trailing partial packet is ignored).
 // Packets of other kinds - system exclusive, system messages, clock - are skipped. Returns how many messages there were.
 using UsbMidiReceiver = void (*)(void* context, uint8_t status, uint8_t data1, uint8_t data2);
-uint32_t decode_usb_midi_packets(ConstByteView data, UsbMidiReceiver receiver, void* context);
+// With `sysex` (one per device: messages span calls), system exclusive messages go to sysex_receiver(context, message) too, counted as messages.
+uint32_t decode_usb_midi_packets(ConstByteView data, UsbMidiReceiver receiver, void* context, UsbMidiSysexReader* sysex = nullptr,
+                                 UsbMidiSysexReceiver sysex_receiver = nullptr);
 
 }  // namespace hardware
