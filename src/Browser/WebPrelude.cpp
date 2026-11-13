@@ -5547,7 +5547,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   // The window left fullscreen by itself (Escape): the events follow, as for exitFullscreen().
   hide(g, '__fs_left', function (node) { setTimeout(function () { fsFire(node || g.document, 'fullscreenchange'); }, 0); });
   hide(g, '__fs_fire', function (node) { setTimeout(function () { fsFire(node, 'fullscreenchange'); }, 0); });
-  method(DP, 'elementsFromPoint', function () { return []; });
   // (document.execCommand() is in the clipboard section below)
   method(DP, 'startViewTransition', function (callback) {
     var done = Promise.resolve().then(function () { return typeof callback === 'function' ? callback() : undefined; });

@@ -21,6 +21,7 @@
 #pragma once
 #include "Dom/Dom.hpp"
 #include "Paint/DisplayList.hpp"
+#include "ObjectContainer/List.hpp"
 
 namespace paint {
 
@@ -36,5 +37,36 @@ struct HitResult {
 // Looks for what is at page position (x, y). `doc` finds the element a text belongs to and the link around it (nullptr: neither is looked for).
 // False if there is nothing there.
 bool hit_test(const DisplayList& list, const dom::Document* doc, int32_t x, int32_t y, HitResult* out);
+
+// What document.elementFromPoint() looks through: the part of a display list hit testing needs (the clips, the transforms and the ops elements answer for, in
+// paint order), kept after the list itself has gone to the window. A few dozen bytes per op instead of the whole list.
+class HitMap {
+ public:
+  explicit HitMap(allocators::IAllocator& allocator) : allocator_(allocator), entries_(allocator), transforms_(allocator), shapes_(allocator) {}
+  HitMap(const HitMap&) = delete;
+  HitMap& operator=(const HitMap&) = delete;
+
+  // Keeps what `list` says about hits (what was there before is dropped). False if memory ran out: the map is then empty.
+  [[nodiscard]] bool build(const DisplayList& list);
+  void clear();
+  bool empty() const { return entries_.count() == 0; }
+
+  // The serials of the nodes whose ops are under page position (x, y), front to back (each once; a text answers with the serial of its text node, which the
+  // caller maps to its element). Clips and transforms are honoured as for hit_test(). False if memory ran out.
+  [[nodiscard]] bool nodes_at(int32_t x, int32_t y, List<uint32_t>* out) const;
+
+ private:
+  struct Entry {
+    OpKind kind = OpKind::Hit;
+    IRect rect;
+    uint32_t node = 0;
+    uint32_t data = 0;   // PushTransform: an index into transforms_; PushClipPath: into shapes_
+  };
+  friend struct HitMapSource;
+  allocators::IAllocator& allocator_;
+  List<Entry> entries_;
+  List<Affine> transforms_;
+  List<ClipShape> shapes_;
+};
 
 }  // namespace paint

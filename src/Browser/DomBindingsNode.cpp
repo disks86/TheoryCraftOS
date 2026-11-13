@@ -1310,6 +1310,32 @@ NATIVE(el_empty_list) {
   return true;
 }
 
+// document.elementFromPoint(x, y) / elementsFromPoint(x, y): what the last picture shows under a viewport position, front to back (null / [] outside the viewport)
+bool elements_at(Vm& vm, const Value* args, uint32_t argc, List<dom::Node*>* found) {
+  double x = 0, y = 0;
+  if (!vm.to_number(arg_at(args, argc, 0), &x) || !vm.to_number(arg_at(args, argc, 1), &y)) return false;
+  if (!impl(vm).host.elements_at_point(x, y, found)) found->clear();
+  return true;
+}
+
+NATIVE(doc_element_from_point) {
+  (void)self;
+  List<dom::Node*> found(vm.allocator());
+  if (!elements_at(vm, args, argc, &found)) return false;
+  *result = found.count() > 0 ? node_value(impl(vm), found[0]) : Value::make_null();
+  return true;
+}
+
+NATIVE(doc_elements_from_point) {
+  (void)self;
+  List<dom::Node*> found(vm.allocator());
+  if (!elements_at(vm, args, argc, &found)) return false;
+  JsObject* out = vm.new_array();
+  for (dom::Node* n : found.view()) vm.array_push(out, node_value(impl(vm), n));
+  *result = Value::make_object(out);
+  return true;
+}
+
 NATIVE(el_true) {
   *result = bool_value(true);
   return true;
@@ -2072,7 +2098,8 @@ bool install_nodes(DomBindings::Impl& c) {
   vm.define_native(dp, "open", do_nothing, 0);
   vm.define_native(dp, "close", do_nothing, 0);
   vm.define_native(dp, "hasFocus", doc_has_focus, 0);
-  vm.define_native(dp, "elementFromPoint", el_empty_list, 2);
+  vm.define_native(dp, "elementFromPoint", doc_element_from_point, 2);
+  vm.define_native(dp, "elementsFromPoint", doc_elements_from_point, 2);
   vm.define_native(c.fragment_proto, "getElementById", doc_get_by_id, 1);
 
   // the constructors pages use for instanceof and constants

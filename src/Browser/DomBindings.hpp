@@ -126,6 +126,9 @@ class IDomHost {
   // Does the element's box (the last picture's) cut off what sticks out of it (overflow other than visible)? -1 if it has no box there.
   virtual int node_clips(dom::Node* node) { (void)node; return -1; }
   virtual bool layout_ready() { return false; }
+  // document.elementsFromPoint(): the elements under viewport position (x, y), in CSS pixels, as the last picture painted them, front to back, each once (what
+  // pointer-events: none or a clip hides is left out; the root element is last). False if the point is outside the viewport or nothing was painted yet.
+  [[nodiscard]] virtual bool elements_at_point(double x, double y, List<dom::Node*>* out) { (void)x; (void)y; (void)out; return false; }
   virtual void alert(StringView text) = 0;
   virtual bool confirm(StringView text) = 0;
   virtual void scroll_to(int32_t y) = 0;   // scrollTo(): the vertical position in CSS pixels
