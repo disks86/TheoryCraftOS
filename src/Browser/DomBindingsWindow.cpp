@@ -1153,9 +1153,7 @@ void update_metrics(DomBindings::Impl& c) {
   if (vm.get_named(Value::make_object(g), "screen", &screen) && screen.is_object()) {
     const int sw = env.screen_width > 0 ? env.screen_width : env.width, sh = env.screen_height > 0 ? env.screen_height : env.height;
     // (once the page library is up the screen's values are in a record its getters read - WebPrelude.cpp: lift)
-    JsObject* target = screen.as_object();
-    Value values;
-    if (vm.mark_get(target, vm.intern("__values"), &values) && values.is_object()) target = values.as_object();
+    JsObject* target = values_of(vm, screen.as_object());
     vm.define_named(target, "width", num_value(sw));
     vm.define_named(target, "height", num_value(sh));
     vm.define_named(target, "availWidth", num_value(sw));
@@ -1416,7 +1414,7 @@ bool install_window(DomBindings::Impl& c) {
 
 void DomBindings::set_ready_state(StringView state) {
   Impl& c = *impl_;
-  vm_.define_named(wrap(c.doc.root()), "readyState", bind::str_value(vm_, state), script::kWritable);
+  vm_.define_named(bind::values_of(vm_, wrap(c.doc.root())), "readyState", bind::str_value(vm_, state), script::kWritable);
 }
 
 void DomBindings::set_hidden(bool hidden) { impl_->page_hidden = hidden; }

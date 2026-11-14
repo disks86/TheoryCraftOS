@@ -3271,6 +3271,37 @@ static void test_reference_surface() {
                  "</script></body></html>") ==
         "0 0 false false string true 0 function | function undefined true | TypeError Illegal invocation | onchange,effectiveType,rtt,downlink,saveData,constructor false null 4g | "
         "Date function Date() { [native code] }");
+  // the history, the performance object and the document have nothing of their own either (an event handler somebody set is); the location has everything
+  CHECK(run_page("<html><body><script>var N = function (o) { return Object.getOwnPropertyNames(o) };"
+                 "console.log(N(history).length, N(performance).length, N(document).length, N(location).slice(0, 4).join(), N(Location.prototype).join(), document.readyState, history.scrollRestoration, typeof performance.timeOrigin, document.onclick);"
+                 "history.scrollRestoration = 'manual'; document.designMode = 'on'; document.onclick = function () { console.log('clicked', N(document).join()) }; document.body.click();"
+                 "console.log(history.scrollRestoration, document.designMode, typeof document.implementation.createHTMLDocument, location.valueOf() === location, location.pathname);"
+                 "try { Object.defineProperty(location, 'href', { get: function () { return 'x' } }) } catch (e) { console.log(e.name) }"
+                 "addEventListener('load', function () { console.log(document.readyState) })</script></body></html>") ==
+        "0 0 0 ancestorOrigins,href,origin,protocol constructor loading auto number null | clicked onclick | manual on function true /dir/page.html | TypeError | complete");
+  // a function lists its length and name first, then its prototype
+  CHECK(run_page("<html><body><script>var N = function (f) { return Object.getOwnPropertyNames(f).slice(0, 4).join('/') };"
+                 "console.log(N(Math.max), N(Event), N(document.createElement).indexOf('length/name'), N(Object.getOwnPropertyDescriptor(Document.prototype, 'body').get).indexOf('length/name'))</script></body></html>") ==
+        "length/name length/name/prototype/NONE 0 0");
+  // members are on the prototype of the interface that declares them: an <img> has no play or getContext, querySelector is not Node's
+  CHECK(run_page("<html><body><p id=p>a<b>b</b></p><form id=f><input id=i value=v></form><script>var E = function (t) { return document.createElement(t) }, own = function (C, n) { return C.prototype.hasOwnProperty(n) };"
+                 "var img = E('img'), t = document.getElementById('p').firstChild;"
+                 "console.log('play' in img, 'getContext' in img, 'submit' in img, 'select' in img, 'showModal' in img, 'ontouchstart' in img, typeof img.decode, typeof img.focus, typeof img.querySelector, typeof img.remove);"
+                 "console.log(typeof E('video').play, typeof E('audio').canPlayType, typeof E('canvas').getContext, typeof E('form').submit, typeof E('input').select, typeof E('dialog').showModal, typeof E('select').checkValidity,"
+                 "typeof E('textarea').setSelectionRange, typeof E('button').setCustomValidity);"
+                 "console.log(own(Node, 'querySelector'), own(Element, 'querySelector'), own(Document, 'querySelector'), own(DocumentFragment, 'querySelector'), own(Element, 'focus'), own(HTMLElement, 'focus'), own(SVGElement, 'focus'),"
+                 "own(CharacterData, 'remove'), 'querySelector' in t, typeof document.querySelector, typeof document.getElementsByName, typeof document.createDocumentFragment().append);"
+                 "t.remove(); document.getElementById('i').select(); console.log(document.getElementById('p').textContent, document.querySelectorAll('b').length, document.getElementsByClassName('x').length,"
+                 "document.getElementById('f').checkValidity(), E('canvas').getContext('2d') !== null)</script></body></html>") ==
+        "false false false false false false function function function function | function function function function function function function function function | "
+        "false true true true false true true true false function function function | b 1 0 true true");
+  // what an object of another window has of its own is asked of that window (not: what it has or inherits)
+  CHECK(run_page("<html><body><iframe id=f srcdoc=\"<script>var mine = { a: 1 }; Object.defineProperty(mine, 'h', { value: 2 }); Object.defineProperty(mine, 'g', { get: function () { return 7 }, enumerable: true });</script>\"></iframe><script>"
+                 "addEventListener('load', function () { var w = document.getElementById('f').contentWindow, m = w.mine, h = Object.prototype.hasOwnProperty;"
+                 "var D = function (o, k) { var d = Object.getOwnPropertyDescriptor(o, k); return d ? ('value' in d ? 'v' + d.value : 'g' + typeof d.get) + (d.enumerable ? 'e' : '') + (d.writable ? 'w' : '') : 'none' };"
+                 "console.log(h.call(m, 'a'), h.call(m, 'toString'), h.call(m, 'h'), D(m, 'a'), D(m, 'h'), D(m, 'g'), D(m, 'toString'), m.g, Object.keys(m).join(), h.call(w.navigator, 'webdriver'),"
+                 "w.Object.prototype.hasOwnProperty.call(navigator, 'webdriver'), h.call(w, 'mine'), JSON.stringify(m)) })</script></body></html>") ==
+        "true false true v1ew v2 gfunctione none 7 a,g false false true {\"a\":1,\"g\":7}");
   {   // the screen is the display, not the page area, and follows a change of either
     TestAllocator a;
     {

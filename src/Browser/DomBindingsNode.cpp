@@ -1518,7 +1518,7 @@ bool write_impl(Vm& vm, const Value* args, uint32_t argc, bool newline) {
   JsString* ready = vm.intern("readyState");
   Value doc_value = node_value(c, c.doc.root());
   bool loading = true;
-  if (vm.get_plain(doc_value.as_object(), ready, &state) && state.is_string()) loading = state.as_string()->view().equals("loading");
+  if (vm.get_plain(values_of(vm, doc_value.as_object()), ready, &state) && state.is_string()) loading = state.as_string()->view().equals("loading");
   if (loading) {
     if (vm.host()) vm.host()->document_write(text.view(), false);
     return true;

@@ -1959,7 +1959,7 @@ bool Vm::get_own(JsObject* o, JsString* key, Value* out) {
       *out = Value::make_number(o->okind == ObjKind::Function ? o->code->expected_args : o->okind == ObjKind::Native ? o->position : 0);
       return true;
     }
-    if (key == prototype_ && o->okind == ObjKind::Function && !o->code->is_arrow) {   // made when first looked at
+    if (key == prototype_ && makes_prototype(o)) {   // made when first looked at
       JsObject* proto = new_plain();
       if (o->code->is_generator) {   // the objects a generator function makes inherit from the generator prototype
         Value generator_proto;
@@ -2449,7 +2449,26 @@ JsObject* Vm::own_names(JsObject* o) {
   JsObject* names = own_keys(o);
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
   push_property_keys(names, o, false);
-  return names;
+  if (o->okind != ObjKind::Function && o->okind != ObjKind::Native && o->okind != ObjKind::Bound) return names;
+  // a function: its length and name (and prototype, if it has or would get one) come first, whether or not they have been looked at yet
+  bool prototype = makes_prototype(o);
+  for (uint32_t i = 0; i < o->prop_count; ++i)
+    if (o->props[i].key == prototype_) prototype = true;
+  JsObject* ordered = new_array(names->length + 3);
+  if (!ordered) return names;
+  array_push(ordered, Value::make_string(length_));
+  array_push(ordered, Value::make_string(name_));
+  if (prototype) array_push(ordered, Value::make_string(prototype_));
+  for (uint32_t i = 0; i < names->length; ++i) {
+    const Value& v = names->items[i];
+    if (v.is_string() && (v.as_string() == length_ || v.as_string() == name_ || v.as_string() == prototype_)) continue;
+    array_push(ordered, v);
+  }
+  return ordered;
+}
+
+bool Vm::makes_prototype(const JsObject* f) const {
+  return f->okind == ObjKind::Function && !f->code->is_arrow && !(f->code->is_async && !f->code->is_generator);
 }
 
 bool Vm::mark_get(JsObject* o, JsString* key, Value* out) {

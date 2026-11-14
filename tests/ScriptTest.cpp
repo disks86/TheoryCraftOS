@@ -1261,6 +1261,10 @@ static void test_regexp_symbol_methods() {
 // derived from it, a prototype and its instances, Function.prototype and every function), a proxy is a key of its own and its traps are not asked, and a
 // frozen object can be a key. (The table of objects a window hands to other windows is a Map: with Function.prototype in it every function was the same key.)
 static void test_collection_keys() {
+  // the own names of a function: length and name first, then prototype for the kinds that have one
+  CHECK(is("var N = function (f) { return Object.getOwnPropertyNames(f).join('/') }; async function af() {} class A { static s() {} } var p = function (a, b) {}; p.extra = 1;"
+           "[N(p), N(() => 1), N(af), N(A), N(p.bind(null)), N(Math.max), N(function* () {}), 'prototype' in af, 'prototype' in p, af.hasOwnProperty('length'), Reflect.ownKeys(p).join('/')].join(' ')",
+           "length/name/prototype/extra length/name length/name length/name/prototype/s length/name length/name length/name/prototype false true true length/name/prototype/extra"));
   // a listing mark: what Object.getOwnPropertyNames gives for the object, whatever it has (a copy each time)
   CHECK(is("var o = { a: 1, b: 2 }; __mark_set(o, '__listing', ['x', 'y']); var n = Object.getOwnPropertyNames(o); n.push('z');"
            "[n.join(), Object.getOwnPropertyNames(o).join(), Object.keys(o).join(), 'x' in o, Object.getOwnPropertyNames({ c: 3 }).join()].join('|')", "x,y,z|x,y|a,b|false|c"));
