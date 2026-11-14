@@ -79,6 +79,7 @@ class MountTable final : public IFileSystem {
   uint32_t changes() const { return __atomic_load_n(&changes_, __ATOMIC_ACQUIRE); }
 
   FileSystemInfo info() const override;
+  FileSystemInfo info_at(StringView path) const override;
   Status open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) override;
   Status open_directory(StringView path, UniquePointer<IDirectory>* directory) override;
   Status stat(StringView path, DirectoryEntry* entry) override;

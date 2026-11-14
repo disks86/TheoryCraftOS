@@ -46,6 +46,7 @@ class GraftFileSystem final : public IFileSystem {
   StringView mount_point() const { return at_.view(); }
 
   FileSystemInfo info() const override { return base_.info(); }
+  FileSystemInfo info_at(StringView path) const override;
   Status open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) override;
   Status open_directory(StringView path, UniquePointer<IDirectory>* directory) override;
   Status stat(StringView path, DirectoryEntry* entry) override;

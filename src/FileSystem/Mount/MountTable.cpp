@@ -281,6 +281,14 @@ FileSystemInfo MountTable::info() const {
   return info;
 }
 
+FileSystemInfo MountTable::info_at(StringView path) const {
+  SharedPointer<Entry> entry;
+  StringView rest;
+  bool root = false;
+  if (resolve(path, &entry, &rest, &root) != Status::Ok || root || !entry || !entry->usable()) return info();
+  return entry->volume->file_system().info_at(rest);
+}
+
 Status MountTable::open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) {
   SharedPointer<Entry> entry;
   StringView rest;

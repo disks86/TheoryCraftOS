@@ -212,6 +212,9 @@ static void test_mount_root_volume() {
     boot.reset();
     CHECK(!table.has_root() && table.info().read_only);
     CHECK(!table.set_root("Nothing") && table.set_root("data") && table.has_root() && !table.info().read_only);
+    // The volume a path is on (statfs): the table itself is "mounts", a path inside is its volume's file system.
+    CHECK(table.info().type_name.view().equals("mounts") && table.info_at("/notes.txt").type_name.view().equals("ramfs") &&
+          table.info_at("/EFI/docs/a.txt").type_name.view().equals("ramfs") && table.info_at("/../x").type_name.view().equals("mounts"));
     std::vector<std::string> root = list(table, "/");
     CHECK(root.size() == 3 && has(root, "docs") && has(root, "notes.txt") && has(root, "EFI") && !has(root, "DATA"));
     CHECK(read_text(table, "/notes.txt") == "notes" && read_text(table, "/docs/a.txt") == "data" && read_text(table, "/EFI/docs/a.txt") == "boot");

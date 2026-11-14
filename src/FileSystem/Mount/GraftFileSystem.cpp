@@ -188,6 +188,13 @@ bool GraftFileSystem::is_parent(StringView path) const {
   if (const Status r_ = route(path, follow, &routed_storage_, &routed_); r_ != Status::Ok) return r_; \
   StringView rest;
 
+FileSystemInfo GraftFileSystem::info_at(StringView path) const {
+  String storage(allocator_);
+  StringView routed, rest;
+  if (route(path, true, &storage, &routed) != Status::Ok) return base_.info();
+  return where(routed, &rest) == Where::Graft ? graft_.info_at(rest) : base_.info_at(routed);
+}
+
 Status GraftFileSystem::open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) {
   TCOS_GRAFT_ROUTE(path, true)
   switch (where(routed_, &rest)) {

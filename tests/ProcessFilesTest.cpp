@@ -17,7 +17,12 @@
  */
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -1044,6 +1049,114 @@ static int fake_shell(allocators::IAllocator&, filesystem::IFileSystem& files, S
   return 1;
 }
 
+// A real lock for the test with two threads (the others poll and never block).
+struct MutexSync final : ISystemSync {
+  std::mutex m;
+  std::condition_variable cv;
+  void lock() override { m.lock(); }
+  void unlock() override { m.unlock(); }
+  bool wait(uint64_t) override { std::unique_lock<std::mutex> hold(m, std::adopt_lock); cv.wait_for(hold, std::chrono::milliseconds(1)); hold.release(); return true; }
+  void notify_all() override { cv.notify_all(); }
+};
+
+// statfs / fstatfs (137, 138), link / linkat (86, 265) and flock (73): what Qt's QStorageInfo, QSaveFile and QLockFile call.
+static void test_linux_statfs_link_flock() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  static MutexSync sync;      // (static: as NoWaitSync below)
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  {
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    auto open = [&](Rig& r, const char* path, uint64_t flags = 2) { return sres(r.process->syscall(lin(2, r.str(path), flags))); };
+
+    // --- statfs: the 120-byte struct, the RAM file system's number, 4096-byte blocks, room to write, names of 255 bytes
+    const uint64_t sf = rig.alloc(128);
+    CHECK(rig.space.write_privileged(sf + 120, ConstByteView(reinterpret_cast<const uint8_t*>("GUARDGRD"), 8)));
+    const int64_t motd = open(rig, "/etc/motd");
+    CHECK(motd >= 3);
+    CHECK(p.syscall(lin(138, motd, sf)) == 0);
+    CHECK(rig.u64(sf) == 0x858458F6u && rig.u64(sf + 8) == 4096 && rig.u64(sf + 16) > 0 && rig.u64(sf + 24) > 0 && rig.u64(sf + 32) == rig.u64(sf + 24));
+    CHECK(rig.u64(sf + 64) == 255 && rig.u64(sf + 72) == 4096 && rig.u64(sf + 80) == 0);
+    CHECK(rig.bytes(sf + 120, 8) == "GUARDGRD");                                        // nothing past the struct
+    CHECK(p.syscall(lin(137, rig.str("/etc"), sf)) == 0 && rig.u64(sf) == 0x858458F6u);
+    CHECK(p.syscall(lin(137, rig.str("/dev/null"), sf)) == 0 && rig.u64(sf) == 0x01021994u);
+    CHECK(p.syscall(lin(138, 1, sf)) == 0 && rig.u64(sf) == 0x1CD1u);                  // the console
+    CHECK(sres(p.syscall(lin(137, rig.str("/nothing"), sf))) == -2);
+    CHECK(sres(p.syscall(lin(137, 0xDEAD0000, sf))) == -14);
+    CHECK(sres(p.syscall(lin(138, motd, 0xDEAD0000))) == -14);
+    CHECK(sres(p.syscall(lin(138, motd, 0x10000 + 0x20000 - 60))) == -14);              // a struct that runs off the mapping
+    CHECK(sres(p.syscall(lin(138, 999, sf))) == -9 && sres(p.syscall(lin(138, ~uint64_t{0}, sf))) == -9);
+
+    // --- link: a second name for the same file
+    const uint64_t buf = rig.alloc(64);
+    CHECK(p.syscall(lin(86, rig.str("/etc/motd"), rig.str("/tmp/motd2"))) == 0);
+    CHECK(read_file(fs, "/Linux/tmp/motd2") == "welcome\n");
+    CHECK(p.syscall(lin(1, motd, rig.str("WELCOME"), 7)) == 7 && read_file(fs, "/Linux/tmp/motd2") == "WELCOME\n");      // one file, two names
+    CHECK(sres(p.syscall(lin(86, rig.str("/etc/motd"), rig.str("/tmp/motd2")))) == -17);  // EEXIST
+    CHECK(sres(p.syscall(lin(86, rig.str("/etc"), rig.str("/tmp/etc2")))) == -1);          // EPERM: a directory
+    CHECK(sres(p.syscall(lin(86, rig.str("/nothing"), rig.str("/tmp/x")))) == -2);
+    CHECK(sres(p.syscall(lin(86, rig.str("/etc/motd"), rig.str("/nothing/x")))) == -2);
+    CHECK(sres(p.syscall(lin(86, rig.str("/dev/null"), rig.str("/tmp/null")))) == -18);    // EXDEV
+    CHECK(sres(p.syscall(lin(86, 0xDEAD0000, rig.str("/tmp/x")))) == -14 && sres(p.syscall(lin(86, rig.str("/etc/motd"), 0xDEAD0000))) == -14);
+    CHECK(sres(p.syscall(lin(86, rig.str("/../secret.txt"), rig.str("/tmp/secret")))) == -2);      // nothing outside the tree
+    const int64_t tmp = open(rig, "/tmp", 0x10000), etc = open(rig, "/etc", 0x10000);
+    CHECK(tmp >= 3 && etc >= 3);
+    CHECK(p.syscall(lin(265, etc, rig.str("motd"), tmp, rig.str("motd3"), 0)) == 0 && read_file(fs, "/Linux/tmp/motd3") == "WELCOME\n");
+    CHECK(sres(p.syscall(lin(265, motd, rig.str("motd"), tmp, rig.str("motd4"), 0))) == -20);      // ENOTDIR: a file as dirfd
+    CHECK(sres(p.syscall(lin(265, etc, rig.str("motd"), tmp, rig.str("motd4"), 0x800))) == -22);   // an unknown flag
+    CHECK(p.syscall(lin(265, motd, rig.str(""), tmp, rig.str("motd4"), 0x1000)) == 0 && read_file(fs, "/Linux/tmp/motd4") == "WELCOME\n");      // AT_EMPTY_PATH
+    CHECK(sres(p.syscall(lin(265, etc, rig.str(""), tmp, rig.str("etc5"), 0x1000))) == -1);
+    CHECK(sres(p.syscall(lin(265, 1, rig.str(""), tmp, rig.str("console"), 0x1000))) == -18);
+    CHECK(sres(p.syscall(lin(265, 999, rig.str(""), tmp, rig.str("none"), 0x1000))) == -9);
+    const std::string by_fd = "/proc/self/fd/" + std::to_string(motd);
+    CHECK(p.syscall(lin(265, kAtFdCwd, rig.str(by_fd), kAtFdCwd, rig.str("/tmp/motd5"), 0x400)) == 0 && read_file(fs, "/Linux/tmp/motd5") == "WELCOME\n");
+    CHECK(sres(p.syscall(lin(265, kAtFdCwd, rig.str("/proc/self/fd/1"), kAtFdCwd, rig.str("/tmp/pts"), 0x400))) == -18 ||
+          sres(p.syscall(lin(265, kAtFdCwd, rig.str("/proc/self/fd/1"), kAtFdCwd, rig.str("/tmp/pts"), 0x400))) == -2);
+    CHECK(p.syscall(lin(3, motd)) == 0);
+    CHECK(p.syscall(lin(87, rig.str("/etc/motd"))) == 0 && read_file(fs, "/Linux/tmp/motd2") == "WELCOME\n");      // the other names keep the file
+    (void)buf;
+
+    // --- flock: per open file, for the whole system
+    const int64_t a = open(rig, "/tmp/motd2"), b = open(rig, "/tmp/motd2");
+    CHECK(a >= 3 && b >= 3);
+    auto flock = [](Rig& r, int64_t fd, uint64_t op) { return sres(r.process->syscall(lin(73, uint64_t(fd), op))); };
+    constexpr uint64_t SH = 1, EX = 2, NB = 4, UN = 8;
+    CHECK(flock(rig, a, EX) == 0);
+    CHECK(flock(rig, b, EX | NB) == -11 && flock(rig, b, SH | NB) == -11);
+    const int64_t a2 = sres(p.syscall(lin(32, a)));
+    CHECK(a2 >= 3 && flock(rig, a2, EX | NB) == 0 && flock(rig, a, EX) == 0);         // the duplicate is the same open file; asking again is fine
+    CHECK(flock(rig, a, SH) == 0 && flock(rig, b, SH | NB) == 0);                      // down to shared: others may share
+    CHECK(flock(rig, a, EX | NB) == -11 && flock(rig, b, EX | NB) == -11);             // neither can go up while the other shares
+    CHECK(flock(rig, b, UN) == 0 && flock(rig, b, UN) == 0);                           // (unlocking what is not locked is fine)
+    CHECK(flock(rig, a, EX | NB) == 0 && flock(rig, b, SH | NB) == -11);
+    {      // another process sees the lock
+      Rig other(SyscallAbi::Linux, fs);
+      const int64_t c = open(other, "/tmp/motd2");
+      CHECK(c >= 3 && flock(other, c, EX | NB) == -11);
+      const int64_t elsewhere = open(other, "/tmp/motd3");                             // (another name: locks go by name here)
+      CHECK(elsewhere >= 3 && flock(other, elsewhere, EX | NB) == 0);
+      // a waiting flock gets the lock when the holder lets go
+      std::atomic<int> got{1};
+      std::thread waiter([&] { got = int(flock(other, c, EX)); });
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+      CHECK(got == 1);
+      CHECK(flock(rig, a, UN) == 0);
+      waiter.join();
+      CHECK(got == 0 && flock(rig, a, SH | NB) == -11);
+    }      // ... and its locks go with it
+    CHECK(flock(rig, a, EX | NB) == 0);
+    CHECK(p.syscall(lin(3, a)) == 0 && flock(rig, b, EX | NB) == -11);                 // the duplicate still holds it
+    CHECK(p.syscall(lin(3, a2)) == 0 && flock(rig, b, EX | NB) == 0);                  // gone with the last descriptor
+    CHECK(flock(rig, b, 0) == -22 && flock(rig, b, SH | EX) == -22 && flock(rig, b, 16) == -22 && flock(rig, b, NB) == -22);
+    CHECK(flock(rig, 999, EX) == -9 && flock(rig, 1, EX) == 0 && flock(rig, tmp, SH) == 0);
+    for (uint64_t op = 0; op < 64; ++op) flock(rig, b, op | NB);                       // every operation value: nothing to trip over
+  }
+  set_system_objects(nullptr);
+}
+
 static void test_linux_execve() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
@@ -1216,6 +1329,7 @@ int main() {
   test_linux_files();
   test_linux_links_and_proc();
   test_linux_execve();
+  test_linux_statfs_link_flock();
   test_dxg_device();
   test_windows_files();
   test_change_notifications();

@@ -42,7 +42,7 @@ enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Ge
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
   EpollCtl, EpollWait, EpollPwait, EpollPwait2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
-  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate, Execve, Execveat };
+  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate, Execve, Execveat, Statfs, Fstatfs, Link, Linkat, Flock };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -89,6 +89,9 @@ constexpr NumberEntry kNumbers[] = {
     {23, kAbsent, Call::Select},   {270, 72, Call::Pselect6},
     // files in memory (MemoryFile.hpp): what Wayland clients share their pictures through
     {319, 279, Call::MemfdCreate}, {285, 47, Call::Fallocate},
+    // the volume of a file, hard links, whole-file locks (what Qt's QStorageInfo, QSaveFile and QLockFile use)
+    {137, 43, Call::Statfs},       {138, 44, Call::Fstatfs},    {86, kAbsent, Call::Link},   {265, 37, Call::Linkat},
+    {73, 32, Call::Flock},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -385,6 +388,11 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Truncate: return linuxabi::sys_truncate(process, a[0], a[1]);
       case Call::Ftruncate: return linuxabi::sys_ftruncate(process, a[0], a[1]);
       case Call::Fsync: return linuxabi::sys_fsync(process, a[0]);
+      case Call::Statfs: return linuxabi::sys_statfs(process, a[0], a[1]);
+      case Call::Fstatfs: return linuxabi::sys_fstatfs(process, a[0], a[1]);
+      case Call::Link: return linuxabi::sys_linkat(process, kAtFdCwd, a[0], kAtFdCwd, a[1], 0);
+      case Call::Linkat: return linuxabi::sys_linkat(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Flock: return linuxabi::sys_flock(process, a[0], a[1]);
       case Call::Dup: return linuxabi::sys_dup(process, a[0]);
       case Call::Dup2: return linuxabi::sys_dup3(process, a[0], a[1], ~uint64_t{0});
       case Call::Dup3: return linuxabi::sys_dup3(process, a[0], a[1], a[2]);

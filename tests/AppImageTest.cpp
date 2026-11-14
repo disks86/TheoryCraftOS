@@ -603,6 +603,7 @@ static void test_graft() {
     CHECK(!graft.set_mount_point("relative"));
     CHECK(!graft.set_mount_point("/"));
     CHECK(graft.set_mount_point("/Linux/tmp/.mount_x"));
+    CHECK(graft.info_at("/Linux/tmp/.mount_x/AppRun").type_name.view().equals("ramfs") && graft.info_at("/Linux/tmp/other").type_name.view().equals("ramfs"));
     Status s;
     CHECK(read_all(graft, "/Linux/tmp/.mount_x/AppRun", &s) == "run");
     CHECK(read_all(graft, "/Linux//tmp/./.mount_x//usr/bin/app", &s) == "app");

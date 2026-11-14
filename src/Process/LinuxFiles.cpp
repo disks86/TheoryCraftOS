@@ -34,7 +34,7 @@ using filesystem::DirectoryEntry;
 using filesystem::NodeType;
 using filesystem::Status;
 
-constexpr int64_t kEperm = 1, kEnoent = 2, kEio = 5, kEbadf = 9, kEnomem = 12, kEacces = 13, kEfault = 14, kEbusy = 16, kEexist = 17, kEnodev = 19, kEnotdir = 20,
+constexpr int64_t kEperm = 1, kEnoent = 2, kEintr = 4, kEio = 5, kEagain = 11, kExdev = 18, kEnolck = 37, kEbadf = 9, kEnomem = 12, kEacces = 13, kEfault = 14, kEbusy = 16, kEexist = 17, kEnodev = 19, kEnotdir = 20,
                   kEisdir = 21, kEinval = 22, kEmfile = 24, kEnotty = 25, kEfbig = 27, kEnospc = 28, kEspipe = 29, kErofs = 30, kErange = 34, kEnametoolong = 36,
                   kEnosys = 38, kEnotempty = 39, kEopnotsupp = 95, kEloop = 40;
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
@@ -881,6 +881,160 @@ uint64_t sys_fsync(Process& p, uint64_t fd) {
   if (files.kind(fd) == DescriptorKind::Closed) return error(kEbadf);
   if (files.kind(fd) != DescriptorKind::File) return 0;
   return errno_of_or_zero(files.flush(*files.object(fd)));
+}
+
+namespace {
+// Linux's numbers for the kinds of file system (statfs.f_type); what has no number of its own is given ramfs's.
+constexpr uint64_t kMagicRamfs = 0x858458F6u, kMagicTmpfs = 0x01021994u, kMagicExt = 0xEF53u, kMagicMsdos = 0x4D44u, kMagicNtfs = 0x5346544Eu, kMagicIso = 0x9660u,
+                   kMagicSquash = 0x73717368u, kMagicBefs = 0x42465331u, kMagicDevpts = 0x1CD1u, kMagicPipefs = 0x50495045u, kMagicSockfs = 0x534F434Bu;
+constexpr uint64_t kStatfsBytes = 120, kStatfsBlock = 4096;
+
+uint64_t magic_of(StringView type) {
+  if (type.starts_with("ext")) return kMagicExt;
+  if (type.starts_with("FAT")) return kMagicMsdos;
+  if (type.equals("NTFS")) return kMagicNtfs;
+  if (type.equals("iso9660")) return kMagicIso;
+  if (type.equals("squashfs") || type.equals("dwarfs")) return kMagicSquash;
+  if (type.equals("BeFS")) return kMagicBefs;
+  return kMagicRamfs;
+}
+
+// struct statfs: f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree (8 bytes each), f_fsid (8), f_namelen, f_frsize, f_flags, 32 spare bytes.
+// A volume without a limit (a RAM file system) is shown as 64 GiB, all free, so that a program that asks whether there is room is told yes.
+uint64_t write_statfs(Process& p, uint64_t magic, const filesystem::FileSystemInfo* info, uint64_t buffer) {
+  uint8_t raw[kStatfsBytes] = {};
+  ByteView out(raw, sizeof(raw));
+  uint64_t blocks = 0, free_blocks = 0;
+  if (info) {
+    const bool unbounded = info->total_bytes == 0 && !info->read_only;
+    blocks = unbounded ? (uint64_t{64} << 30) / kStatfsBlock : info->total_bytes / kStatfsBlock;
+    // free_bytes 0 on a volume that can be written is "not counted" (a big FAT is not scanned for it): shown as all free rather than as a full disk, which would
+    // make programs refuse to save; a write on a disk that is full still fails with ENOSPC.
+    const bool unknown = !info->read_only && info->free_bytes == 0;
+    free_blocks = unbounded || unknown ? blocks : info->free_bytes / kStatfsBlock;
+    if (free_blocks > blocks) free_blocks = blocks;
+  }
+  put(out, 0, magic, 8);
+  put(out, 8, kStatfsBlock, 8);
+  put(out, 16, blocks, 8);
+  put(out, 24, free_blocks, 8);
+  put(out, 32, free_blocks, 8);
+  put(out, 64, 255, 8);                 // f_namelen
+  put(out, 72, kStatfsBlock, 8);        // f_frsize
+  put(out, 80, info && info->read_only ? 1 : 0, 8);      // f_flags: ST_RDONLY
+  return p.write_user(buffer, ConstByteView(raw, sizeof(raw))) ? 0 : error(kEfault);
+}
+
+uint64_t statfs_of_path(Process& p, StringView virtual_path, uint64_t buffer) {
+  ProcessFiles& files = p.files();
+  String host(files.allocator());
+  if (!files.attached() || !files.host_path_of(virtual_path, &host)) return error(kEnoent);
+  const filesystem::FileSystemInfo info = files.file_system()->info_at(host.view());
+  return write_statfs(p, magic_of(info.type_name.view()), &info, buffer);
+}
+}  // namespace
+
+uint64_t sys_statfs(Process& p, uint64_t path, uint64_t buffer) {
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return error(kEnoent);
+  String virtual_path(files.allocator());
+  const int64_t r = resolve_at(p, kAtFdCwd, path, false, &virtual_path);
+  if (r < 0) return error(-r);
+  if (files.device_at(virtual_path.view()) != DescriptorKind::Closed) return write_statfs(p, kMagicTmpfs, nullptr, buffer);      // (/dev)
+  DirectoryEntry entry;
+  const Status status = files.stat(virtual_path.view(), &entry);
+  if (status != Status::Ok) return errno_of(status);
+  return statfs_of_path(p, virtual_path.view(), buffer);
+}
+
+uint64_t sys_fstatfs(Process& p, uint64_t fd, uint64_t buffer) {
+  ProcessFiles& files = p.files();
+  switch (files.kind(fd)) {
+    case DescriptorKind::Closed: return error(kEbadf);
+    case DescriptorKind::ConsoleInput:
+    case DescriptorKind::ConsoleOutput:
+    case DescriptorKind::ConsoleError: return write_statfs(p, kMagicDevpts, nullptr, buffer);
+    case DescriptorKind::UnixSocket: return write_statfs(p, is_pipe_descriptor(p, fd) ? kMagicPipefs : kMagicSockfs, nullptr, buffer);
+    case DescriptorKind::File:
+    case DescriptorKind::Directory: {
+      const OpenObject* object = files.object(fd);
+      if (object && !object->memory && !object->gpu_buffer && !object->gpu_sync && !object->path.empty()) return statfs_of_path(p, object->path.view(), buffer);
+      break;
+    }
+    default: break;
+  }
+  return write_statfs(p, kMagicTmpfs, nullptr, buffer);      // (a device, a file in memory, an event or timer descriptor)
+}
+
+uint64_t sys_linkat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags) {
+  constexpr uint64_t kAtSymlinkFollow = 0x400;
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return error(kEnoent);
+  if (flags & ~(kAtSymlinkFollow | kAtEmptyPath)) return error(kEinval);
+  String from(files.allocator()), to(files.allocator());
+  uint8_t first = 1;
+  if ((flags & kAtEmptyPath) && p.read_user(old_path, ByteView(&first, 1)) && first == 0) {      // the file of the descriptor itself
+    if (files.kind(old_dirfd) == DescriptorKind::Closed) return error(kEbadf);
+    const OpenObject* object = files.object(old_dirfd);
+    if (files.kind(old_dirfd) == DescriptorKind::Directory) return error(kEperm);
+    if (files.kind(old_dirfd) != DescriptorKind::File || !object || object->memory || object->gpu_buffer || object->gpu_sync || object->path.empty()) return error(kExdev);
+    if (!from.assign(object->path.view())) return error(kEnomem);
+  } else {
+    const int64_t r = resolve_raw(p, old_dirfd, old_path, false, &from);
+    if (r < 0) return error(-r);
+    String target(files.allocator());
+    const int64_t proc = (flags & kAtSymlinkFollow) ? proc_self_link(p, from.view(), &target) : 0;      // (/proc/self/fd/<n>: how a program names a descriptor's file)
+    if (proc < 0) return error(-proc);
+    if (proc > 0) {
+      if (target.empty() || target.view()[0] != '/') return error(kExdev);      // (a pipe, a socket: nothing a name can be made for)
+      if (!from.assign(target.view())) return error(kEnomem);
+    } else if (follow_proc_self(p, &from) < 0) {
+      return error(kEnoent);
+    }
+  }
+  const int64_t r = resolve_at(p, new_dirfd, new_path, false, &to);
+  if (r < 0) return error(-r);
+  if (files.device_at(from.view()) != DescriptorKind::Closed) return error(kExdev);
+  DirectoryEntry source, existing;
+  const Status found = files.stat(from.view(), &source);
+  if (found != Status::Ok) return errno_of(found);
+  if (source.type == NodeType::Directory) return error(kEperm);
+  if (files.stat(to.view(), &existing) == Status::Ok || files.stat_link(to.view(), &existing) == Status::Ok) return error(kEexist);
+  const Status made = files.create_hard_link(from.view(), to.view());
+  if (made == Status::Unsupported) return error(kEperm);      // (what Linux answers on a file system without hard links; programs then copy or rename)
+  return errno_of_or_zero(made);
+}
+
+uint64_t sys_flock(Process& p, uint64_t fd, uint64_t operation) {
+  constexpr uint64_t kLockSh = 1, kLockEx = 2, kLockNb = 4, kLockUn = 8;
+  ProcessFiles& files = p.files();
+  if (files.kind(fd) == DescriptorKind::Closed) return error(kEbadf);
+  const uint64_t what = operation & ~kLockNb;
+  if (what != kLockSh && what != kLockEx && what != kLockUn) return error(kEinval);
+  // (Not held while it waits: an open file gives its locks up when its last descriptor is closed, which is told by nothing else holding it. Looked up again instead.)
+  const OpenObject* const object = files.object(fd);
+  ObjectManager* objects = system_objects();
+  String path(files.allocator());
+  // What has no name in the file system (a console, a pipe, a file in memory) can only be reached through this open file: its lock is always its own.
+  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->memory && !object->gpu_buffer &&
+                     !object->gpu_sync && !object->path.empty();
+  if (!named || !objects || !files.host_path_of(object->path.view(), &path)) return 0;
+  if (what == kLockUn) {
+    objects->unlock_range(path.view(), object, 0, ObjectManager::kWholeFile);
+    return 0;
+  }
+  ISystemSync& sync = objects->sync();
+  for (;;) {
+    sync.lock();
+    const ObjectManager::LockResult result = objects->lock_whole_locked(path.view(), object, what == kLockEx);
+    sync.unlock();
+    if (result == ObjectManager::LockResult::Granted) return 0;
+    if (result == ObjectManager::LockResult::Full) return error(kEnolck);
+    if (operation & kLockNb) return error(kEagain);
+    if (p.exited() || (p.runtime() && p.runtime()->interrupted())) return error(kEintr);
+    p.block_sleep(2000000);      // (looked at again every 2 ms: a lock that is waited for is rare, and the wait must end when the program is stopped)
+    if (files.object(fd) != object) return error(kEbadf);      // another thread closed the descriptor meanwhile
+  }
 }
 
 uint64_t sys_dup(Process& p, uint64_t fd) {
