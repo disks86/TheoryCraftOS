@@ -121,6 +121,7 @@ class ScaledRenderer2D final : public IRenderer2D {
   // The mapped geometry (public for whoever draws on the device itself).
   Rect2D up(const Rect2D& r) const;
   int32_t up_x(int32_t v) const { return units_to_device(v, percent_); }
+  int32_t edge(int32_t v, bool vertical) const;      // a unit edge on the device: units_to_device, the far edge of the layout stretched to the device's
   Vec2 up(Vec2 v) const { return {v.x * factor(), v.y * factor()}; }
   CornerRadii up(const CornerRadii& r) const;
   Matrix2D up(const Matrix2D& m) const;          // logical target coordinates -> device: scale after m

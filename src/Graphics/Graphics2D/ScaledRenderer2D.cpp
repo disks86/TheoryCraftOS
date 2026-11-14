@@ -26,9 +26,25 @@ Extent2D ScaledRenderer2D::extent() const {
   return {static_cast<uint32_t>(device_to_units(static_cast<int32_t>(e.width), percent_)), static_cast<uint32_t>(device_to_units(static_cast<int32_t>(e.height), percent_))};
 }
 
+// A device whose size is not a whole number of units (400 rows at 150 % are 266 units, which map back to 399 rows) has pixels past the last unit's
+// edge: the layout's far edge, and everything beyond it, moves by that slack, so what reaches the edge of the screen covers it.
+int32_t ScaledRenderer2D::edge(int32_t v, bool vertical) const {
+  const int32_t d = units_to_device(v, percent_);
+  const Extent2D e = device_->extent();
+  const int32_t device_size = static_cast<int32_t>(vertical ? e.height : e.width);
+  const int32_t units = device_to_units(device_size, percent_);
+  if (v < units) return d;
+  const int32_t slack = device_size - units_to_device(units, percent_);
+  return slack > 0 && d <= INT32_MAX - slack ? d + slack : d;
+}
+
 Rect2D ScaledRenderer2D::up(const Rect2D& r) const {
   if (percent_ == 100) return r;
-  return {units_to_device(r.x, percent_), units_to_device(r.y, percent_), units_span_to_device(r.x, r.width, percent_), units_span_to_device(r.y, r.height, percent_)};
+  const int64_t right = int64_t{r.x} + r.width, bottom = int64_t{r.y} + r.height;
+  if (right > INT32_MAX || bottom > INT32_MAX)
+    return {units_to_device(r.x, percent_), units_to_device(r.y, percent_), units_span_to_device(r.x, r.width, percent_), units_span_to_device(r.y, r.height, percent_)};
+  const int32_t x0 = edge(r.x, false), y0 = edge(r.y, true), x1 = edge(int32_t(right), false), y1 = edge(int32_t(bottom), true);
+  return {x0, y0, static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
 }
 
 CornerRadii ScaledRenderer2D::up(const CornerRadii& r) const {
