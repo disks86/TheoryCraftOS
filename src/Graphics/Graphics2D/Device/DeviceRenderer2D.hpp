@@ -54,7 +54,8 @@ namespace graphics {
 // under a layer's opacity, costs a rectangle per run of equal pixels.
 class DeviceRenderer2D final : public IRenderer2D {
  public:
-  DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent);
+  // `sampled_target`: the frames can be sampled too (frame_image laid down by another renderer on the device), not only presented.
+  DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent, bool sampled_target = false);
   ~DeviceRenderer2D();
   DeviceRenderer2D(const DeviceRenderer2D&) = delete;
   DeviceRenderer2D& operator=(const DeviceRenderer2D&) = delete;
@@ -126,6 +127,13 @@ class DeviceRenderer2D final : public IRenderer2D {
 
   // Draws what is batched, then copies the image to `out` (extent.width * extent.height, 0xAARRGGBB).
   bool read_pixels(ArrayView<uint32_t> out);
+  // The image drawn so far (what has been recorded is submitted), for another renderer on the same device to lay down (draw_device_image) instead
+  // of presenting it: a monitor's picture composed with the others'. Null when the renderer is not valid. Drawing goes on into the same image.
+  IImage* frame_image() {
+    if (!valid_ || !submit_pending()) return nullptr;
+    reset_sheet();      // (the frame is done, as after present: the next one starts a fresh mask sheet)
+    return images_[back_];
+  }
   bool read_frame(ArrayView<uint32_t> out) override { return read_pixels(out); }
 
  private:

@@ -26,6 +26,7 @@
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/CellTextFace.hpp"
 #include "Graphics/Graphics2D/MultiScaleRenderer2D.hpp"
+#include "Hardware/Monitor/MonitorRenderers.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Raster2D.hpp"
@@ -2157,6 +2158,58 @@ static void test_multi_scale() {
   for (Surface* s : {&image, &ref2, &ref1, &left, &right}) release_view(a, s->pixels);
 }
 
+// Monitors at different scales on a GPU (the software 3D device stands in): each monitor drawn by a device renderer of its own pixels, the pictures
+// laid at their places in a display-sized one on the device. A 200 % monitor (800x400 pixels) and a 100 % one (400x300) beside it on a 1200x400
+// display: a rectangle across the seam lands on each at its density.
+struct FakeDisplay final : hardware::IGraphicsProcessingUnit {
+  uint32_t w = 1200, h = 400;
+  const char* name() const override { return "fake display"; }
+  bool initialize() override { return true; }
+  void shutdown() override {}
+  uint32_t mode_count() const override { return 0; }
+  bool mode_info(uint32_t, hardware::DisplayMode*) const override { return false; }
+  uint32_t current_mode() const override { return 0; }
+  bool set_mode(uint32_t) override { return false; }
+  uint32_t width() const override { return w; }
+  uint32_t height() const override { return h; }
+  void put_pixel(uint32_t, uint32_t, uint32_t) override {}
+  void fill_rect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+  void copy_rect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+  void clear(uint32_t) override {}
+  void blit(uint32_t, uint32_t, uint32_t, uint32_t, const uint32_t*, uint32_t) override { ++blits; }
+  uint32_t glyph_width() const override { return 8; }
+  uint32_t glyph_height() const override { return 16; }
+  void draw_char(uint32_t, uint32_t, char, uint32_t, uint32_t) override {}
+  void draw_text(uint32_t, uint32_t, const char*, uint32_t, uint32_t) override {}
+  uint32_t blits = 0;
+};
+
+static void test_monitor_renderers_gpu() {
+  TestAllocator a;
+  {
+    SoftwareDevice device{a, nullptr};
+    FakeDisplay display;
+    hardware::MonitorLayout mixed(a);
+    CHECK(mixed.add(0, 800, 400) && mixed.set_mode(0, 800, 400, 200) && mixed.add(1, 400, 300));
+    const hardware::ScanoutPlacement places[2] = {{0, 0, 0, 800, 400}, {1, 800, 0, 400, 300}};
+    hardware::MonitorRenderers views(display, a);
+    CHECK(views.update(mixed, places, 2, nullptr, &device) && views.on_gpu() && views.view_count() == 2);
+    IRenderer2D& r = views.renderer();
+    r.clear(0xFF000000u);
+    r.fill_rect({390, 10, 20, 5}, 0xFFFF0000u);
+    CHECK(views.compose());
+    std::vector<uint32_t> out(1200 * 400, 0);
+    CHECK(views.read_composed(ArrayView<uint32_t>(out.data(), out.size())));
+    auto at = [&](uint32_t x, uint32_t y) { return out[size_t{y} * 1200 + x] & 0xFFFFFF; };
+    CHECK(at(780, 20) == 0xFF0000 && at(799, 29) == 0xFF0000 && at(779, 20) == 0 && at(780, 30) == 0);      // A: doubled
+    CHECK(at(800, 10) == 0xFF0000 && at(809, 14) == 0xFF0000 && at(810, 10) == 0 && at(800, 15) == 0);      // B: 1:1
+    r.present();
+    CHECK(display.blits == 0);      // (nothing through the CPU)
+    // without a device: the CPU's way
+    CHECK(views.update(mixed, places, 2, nullptr, nullptr) && !views.on_gpu());
+  }
+}
+
 // A device that is not a whole number of units: 400 pixels at 150 % are 266 units, which map to 399. The layout's far edge reaches the device's, so
 // filling the whole layout covers every pixel; inside, the mapping is as it was.
 static void test_scaled_far_edge() {
@@ -2296,6 +2349,7 @@ int main() {
   test_cell_text_face();
   test_scaled_far_edge();
   test_multi_scale();
+  test_monitor_renderers_gpu();
   test_3d();
   test_device_2d();
   test_device_2d_large_image();

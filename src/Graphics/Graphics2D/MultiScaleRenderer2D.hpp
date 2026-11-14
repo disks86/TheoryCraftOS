@@ -32,6 +32,16 @@
 
 namespace graphics {
 
+// Who shows the views' pictures, when presenting each view on its own is not the way (they are composed on a GPU first): present() calls it.
+class IViewPresenter {
+ public:
+  virtual void present_views() = 0;
+
+ protected:
+  IViewPresenter() = default;
+  ~IViewPresenter() = default;
+};
+
 class MultiScaleRenderer2D final : public IRenderer2D {
  public:
   static constexpr uint32_t kMaxViews = 16;
@@ -44,6 +54,7 @@ class MultiScaleRenderer2D final : public IRenderer2D {
   // The views (each a renderer in the layout's units that draws one device: device_view(0) says where) and the layout's size in units.
   bool set_views(ArrayView<IRenderer2D* const> views, Extent2D layout);
   uint32_t view_count() const { return count_; }
+  void set_presenter(IViewPresenter* presenter) { presenter_ = presenter; }      // (null: each view presents, then the display)
 
   const char* name() const override { return "per-monitor scales"; }
   bool accelerated() const override { return false; }
@@ -108,6 +119,7 @@ class MultiScaleRenderer2D final : public IRenderer2D {
   ArrayView<IRenderer2D* const> views() const { return ArrayView<IRenderer2D* const>(views_, count_); }
 
   hardware::IGraphicsProcessingUnit* display_;
+  IViewPresenter* presenter_ = nullptr;
   IRenderer2D* views_[kMaxViews] = {};
   uint32_t count_ = 0;
   Extent2D extent_;
