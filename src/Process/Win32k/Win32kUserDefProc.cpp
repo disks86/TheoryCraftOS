@@ -164,7 +164,7 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       if (lparam == 0) break;
       Rect r;
       if (!read_rect(call, lparam, &r)) break;
-      const uint32_t k = caller_scale(call);      // (the program's rectangle: an unaware one's in 96-dpi units)
+      const uint32_t k = caller_scale_for(call, w);      // (the program's rectangle: an unaware one's in 96-dpi units)
       r = dpi_up(r, k);
       Window probe(S().alloc);
       probe.style = w->style;
@@ -183,7 +183,7 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       // (as the program would: the window goes to the suggested rectangle, in the caller's coordinates)
       Rect r;
       if (lparam == 0 || !w->parent || !read_rect(call, lparam, &r)) break;
-      r = dpi_up(r, caller_scale(call));
+      r = dpi_up(r, caller_scale_for(call, w));
       op_continue(call, *op);
       SwpArgs args;
       args.w = w;
@@ -195,7 +195,7 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
       return swp_op_begin(call, args, kSwpNoShow, false, false);
     }
     case wn::WM_NCHITTEST: {
-      const uint32_t k = caller_scale(call);
+      const uint32_t k = caller_scale_for(call, w);
       const int32_t x = dpi_up(int16_t(lparam & 0xFFFF), k), y = dpi_up(int16_t((lparam >> 16) & 0xFFFF), k);
       op->result = hit_test(w, x, y);
       break;

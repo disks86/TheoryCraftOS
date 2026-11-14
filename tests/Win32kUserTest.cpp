@@ -1719,6 +1719,20 @@ void test_per_monitor_dpi() {
     CHECK(x && x->bounds.left == 1800 && x->bounds.right - x->bounds.left == 200);      // (B's pixels)
   }
   CHECK(bridge.window_info(uw, &info, nullptr) && info.window.x == 1000 && info.window.width == 200);
+  // a second window of the same program, on A: each window reads back at its own size, in its own monitor's coordinates
+  const uint32_t uw2 = u.create("PmClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 50, 50, 200, 150, 0, 0, "Second");      // (B's coordinates: its program's)
+  CHECK(uw2 != 0);
+  pump(u);
+  bridge.take_changes(&changed, &repainted);
+  pump(u);
+  {
+    user::Window* x = user::find_window(uw2);
+    CHECK(x && user::monitor_scale_of(x) == 200 && x->bounds.right - x->bounds.left == 400);      // (on A, enlarged to keep its size)
+  }
+  wr = u.window_rect(uw2);
+  CHECK(wr.r - wr.l == 200 && wr.b - wr.t == 150);
+  wr = u.window_rect(uw);
+  CHECK(wr.r - wr.l == 200 && wr.b - wr.t == 150);
 
   // the cursor: units in, the monitor's pixels inside, units back
   bridge.mouse_position(1000, 100);

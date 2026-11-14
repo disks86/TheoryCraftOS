@@ -517,6 +517,7 @@ uint32_t window_working_dpi(const Window* w);
 uint32_t monitor_scale_of(const Window* w);     // the scale of the monitor its top-level is on (the system's when the monitors share one)   // the DPI a window's coordinates are at: 96 unaware, its system DPI system aware, the device's otherwise
 uint32_t dpi_kind(const Window* w);             // windows of the same kind work in the same coordinates: unaware, system aware at a DPI, or device pixels
 uint32_t caller_scale(Call& call);              // the same for the calling thread
+uint32_t caller_scale_for(Call& call, const Window* w);      // the calling thread's, for a call about window w (on w's monitor)
 bool thread_unaware(Call& call);
 // (k: the scale in percent, 100 = none; Graphics/DeviceScale.hpp's mapping, so that the desktop and win32k agree to the pixel)
 inline int32_t dpi_down(int32_t v, uint32_t k) { return graphics::device_to_units(v, k); }      // device -> virtual (floor)

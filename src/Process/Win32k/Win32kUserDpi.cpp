@@ -90,6 +90,15 @@ uint32_t caller_monitor_scale(Call& call) {
 }
 }  // namespace
 
+// A call about one window (its rectangle, its client area, its update region, points through it): an unaware or system-aware caller's coordinates
+// are that window's monitor's, so a program with windows on monitors at different scales sees each window at its own.
+uint32_t caller_scale_for(Call& call, const Window* w) {
+  if (!w || !w->parent) return caller_scale(call);
+  if (thread_unaware(call)) return monitor_scale_of(w);
+  const uint32_t context = user_misc::dpi_context_of(call.tid(), call.pid());
+  return (context & 0x0F) == 1 ? system_aware_scale_at(context, monitor_scale_of(w)) : 100;
+}
+
 uint32_t caller_scale(Call& call) {
   if (thread_unaware(call)) return caller_monitor_scale(call);
   const uint32_t context = user_misc::dpi_context_of(call.tid(), call.pid());
