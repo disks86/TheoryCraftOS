@@ -42,6 +42,8 @@ constexpr GlobalInfo kGlobals[kGlobalCount] = {
     {"zwp_tablet_manager_v2", 1}, {"zwlr_layer_shell_v1", 4}, {"zwp_text_input_manager_v3", 1},
 };
 constexpr uint32_t kDmabufGlobal = 9, kSyncobjGlobal = 10;
+constexpr uint32_t kOutputGlobal = 5;            // wl_output of the primary monitor
+constexpr uint32_t kMoreOutputs = 1000;          // wl_output of monitor i (1 .. 7) is global kMoreOutputs + i
 
 }  // namespace
 
@@ -317,6 +319,18 @@ void Server::destroy_object(Client& c, uint32_t id) {
 // ------------------------------------------------------------------ the registry
 
 void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t version, uint32_t id) {
+  if (name > kMoreOutputs && name < kMoreOutputs + 8) {      // another monitor's wl_output
+    const uint32_t index = name - kMoreOutputs;
+    if (index >= monitor_count_ || interface != StringView("wl_output") || version == 0 || version > kGlobals[kOutputGlobal - 1].version) {
+      post_error(c, kDisplayId, kErrorInvalidObject, "invalid global");
+      return;
+    }
+    Resource* nr = new_object(c, id, Iface::Output, version, kDisplayId);
+    if (!nr) return;
+    nr->output = static_cast<uint8_t>(index);
+    announce(c, id, Iface::Output, version);
+    return;
+  }
   const uint32_t most = name == kDmabufGlobal && !make_fd_ ? 3 : name >= 1 && name <= kGlobalCount ? kGlobals[name - 1].version : 0;
   if (name == 0 || name > kGlobalCount || ((name == kDmabufGlobal || name == kSyncobjGlobal) && !dmabuf_) || interface != StringView(kGlobals[name - 1].name) || version == 0 || version > most) {
     post_error(c, kDisplayId, kErrorInvalidObject, "invalid global");
@@ -330,6 +344,34 @@ void Server::bind(Client& c, uint32_t name, StringView interface, uint32_t versi
   const Iface iface = kIfaces[name - 1];
   if (!new_object(c, id, iface, version, kDisplayId)) return;
   announce(c, id, iface, version);
+}
+
+void Server::list_outputs() {
+  const uint32_t now = monitor_count_ < 8 ? monitor_count_ : 8;
+  if (now == outputs_listed_) return;
+  for (uint32_t i = 1; i < kMaxClients; ++i) {
+    Client* c = clients_[i].get();
+    if (!c) continue;
+    List<uint32_t> registries(allocator_);
+    ObjectCursor cursor;
+    for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
+      const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
+      if (kv->value.iface == Iface::Registry) registries.push_back(kv->key);
+    }
+    for (uint32_t r : registries.view()) {
+      for (uint32_t m = outputs_listed_; m < now; ++m) {      // came
+        Event e(r, 0);
+        e.u(kMoreOutputs + m).string("wl_output").u(kGlobals[kOutputGlobal - 1].version);
+        send(*c, e);
+      }
+      for (uint32_t m = now; m < outputs_listed_; ++m) {      // went
+        Event e(r, 1);
+        e.u(kMoreOutputs + m);
+        send(*c, e);
+      }
+    }
+  }
+  outputs_listed_ = now;
 }
 
 // What a freshly bound global tells its client first.
@@ -360,23 +402,27 @@ void Server::announce(Client& c, uint32_t object, Iface iface, uint32_t version)
       }
       return;
     }
-    case Iface::Output: {
-      const Rect m = monitors_[0].rect;
+    case Iface::Output: {      // (each monitor's: its place, its pixels, its whole scale)
+      const Resource* self = c.objects.find(object);
+      const uint32_t index = self && self->output < monitor_count_ ? self->output : 0;
+      const Rect m = monitors_[index].rect;
+      const uint32_t k = monitors_[index].scale;
       Event g(object, 0);
       // x, y, physical size in mm (96 dpi), subpixel unknown, make, model, transform normal
       g.i(m.x).i(m.y).i(m.w * 254 / 960).i(m.h * 254 / 960).i(0).string("TheoryCraftOS").string("Display").i(0);
       send(c, g);
       Event mode(object, 1);
-      mode.u(3).i(graphics::units_to_device(m.w, output_scale_)).i(graphics::units_to_device(m.h, output_scale_)).i(60000);      // current | preferred, 60 Hz, in device pixels
+      mode.u(3).i(graphics::units_to_device(m.w, k)).i(graphics::units_to_device(m.h, k)).i(60000);      // current | preferred, 60 Hz, in the monitor's pixels
       send(c, mode);
       if (version >= 2) {
         Event scale(object, 3);
-        scale.i(static_cast<int32_t>(output_whole_scale()));      // (HiDPI: the whole scale at or above the desktop's; fractional clients ask wp_fractional_scale)
+        scale.i(static_cast<int32_t>((k + 99) / 100));      // (HiDPI: the whole scale at or above the monitor's; fractional clients ask wp_fractional_scale)
         send(c, scale);
       }
       if (version >= 4) {
         Event n(object, 4);
-        n.string("OUT-1");
+        char name[8] = {'O', 'U', 'T', '-', static_cast<char>('1' + index), 0};
+        n.string(name);
         send(c, n);
         Event d(object, 5);
         d.string("TheoryCraftOS desktop");
@@ -429,6 +475,11 @@ void Server::dispatch(Client& c, uint32_t id, Resource& r, uint16_t opcode, Read
           if ((g + 1 == kDmabufGlobal || g + 1 == kSyncobjGlobal) && !dmabuf_) continue;
           Event e(registry, 0);
           e.u(g + 1).string(kGlobals[g].name).u(g + 1 == kDmabufGlobal && !make_fd_ ? 3 : kGlobals[g].version);
+          send(c, e);
+        }
+        for (uint32_t i = 1; i < monitor_count_ && i < 8; ++i) {      // the other monitors' outputs
+          Event e(registry, 0);
+          e.u(kMoreOutputs + i).string("wl_output").u(kGlobals[kOutputGlobal - 1].version);
           send(c, e);
         }
       } else {

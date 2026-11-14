@@ -4400,6 +4400,37 @@ static void test_mapping() {
     app.drop_events();
     server.move_window(win, {120, 110, info.window.width, info.window.height});      // (on the same monitor: nothing said)
     CHECK(!app.has(f, 0) && !app.has(w.surface, 2));
+    // a wl_output per monitor: the second monitor's global (it came after the registry was made), each output its monitor's place, pixels, whole
+    // scale and name; the window enters the output of the monitor it is on and leaves it for the other's
+    const uint32_t reg2 = app.new_id();      // (a registry made now lists both outputs)
+    app.send(Msg(1, 1).u(reg2));
+    CHECK(app.roundtrip());
+    bool listed_b = false;
+    for (Ev& e : app.events) listed_b |= e.object == reg2 && e.opcode == 0 && e.u(0) == 1001 && e.s(1) == "wl_output";
+    CHECK(listed_b);
+    const uint32_t out_a = app.bind(app.reg, "wl_output", 4);      // (the primary's: the fixed global)
+    const uint32_t out_b = app.new_id();
+    app.send(Msg(app.reg, 0).u(1001).s("wl_output").u(4).u(out_b));
+    CHECK(app.take(out_a, 3).i(0) == 2 && app.take(out_b, 3).i(0) == 1);
+    Ev mode_a = app.take(out_a, 1), mode_b = app.take(out_b, 1);
+    CHECK(mode_a.i(1) == 1600 && mode_a.i(2) == 1200 && mode_b.i(1) == 800 && mode_b.i(2) == 600);
+    CHECK(app.take(out_a, 4).s(0) == "OUT-1" && app.take(out_b, 4).s(0) == "OUT-2");
+    Ev geometry_b = app.take(out_b, 0);
+    CHECK(geometry_b.i(0) == 800 && geometry_b.i(1) == 0);
+    app.drop_events();
+    server.move_window(win, {900, 100, info.window.width, info.window.height});
+    Ev left = app.take(w.surface, 1), entered = app.take(w.surface, 0);
+    CHECK(left.u(0) == out_a && entered.u(0) == out_b);
+    app.drop_events();
+    // the second monitor goes: its global is removed
+    server.set_display(1024, 768, {});
+    Ev removed = app.take(app.reg, 1);
+    CHECK(removed.object == app.reg && removed.u(0) == 1001);
+    // and comes back: the registries hear of it
+    app.drop_events();
+    server.set_display(1600, 600, ArrayView<const desktop::IWindowsSession::Monitor>(mixed, 2));
+    Ev added = app.take(app.reg, 0);
+    CHECK(added.object == app.reg && added.u(0) == 1001 && added.s(1) == "wl_output");
     server.set_display(1024, 768, {});
   }
   // the rules

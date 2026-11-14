@@ -42,6 +42,9 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
     the monitor its window is on (the centre of its toplevel's window geometry; popups and subsurfaces follow their window): the fractional
     `preferred_scale` and `wl_surface.preferred_buffer_scale` are sent when that changes (shown, moved by the desktop to another monitor, the
     monitors changed), so a GTK 4 or Qt 6 window draws at 100 % on a 100 % monitor and at 200 % on a 200 % one.
+  - Wayland has a `wl_output` per monitor: the primary's is the fixed global, the others' are globals 1001 .. 1007, added to and removed from the
+    registries (`global`, `global_remove`) as monitors come and go. Each says its monitor's place, pixels, whole scale and name (`OUT-1`, ...), and
+    a shown window enters the output of the monitor it is on (`wl_surface.enter`) and leaves it when it goes to another.
   - `IRenderer2D::device_views()` / `device_view()` list the views (a `DeviceView`: its units renderer, its device, scale and origin). Program windows
     are drawn on each: 1:1 on the device whose scale is the program's (`draw_window_scaled`), and through that view's units on the others (a picture
     made at 200 % is filtered down for a 100 % monitor).
@@ -139,7 +142,6 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 
 - Monitors at different scales:
   - X programs are not told per monitor (one screen, one `Xft.dpi`: the largest scale); their pictures are filtered down on smaller monitors.
-  - Wayland has one `wl_output` (its scale the largest), so `wl_surface.enter` names no monitor.
   - Windows: an unaware or system-aware thread's coordinates follow the monitor of its first top-level there, so one program with windows on two
     monitors of different scales sees one of them in the other's coordinates. Messages between programs are not converted.
 - With monitors at different scales the desktop is drawn on the CPU (a software renderer per monitor), as the monitor compositor's path was.
@@ -162,7 +164,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | Windows and X on a 400 x 400 device at 150 % (266 units): the screen and root 400 x 400, a maximized window 400 device pixels across (less X's frame), 266 units for the desktop | `tests/run_host_tests.sh Win32kUserTest` (`test_device_edge`), `X11ServerTest` (`test_hidpi`) |
 | Monitors at different scales (`test_multi_scale`): a layout half at 200 %, half at 100 % (origin at unit 32): each view's pixels equal one renderer at its scale for the whole layout; device views, read-back, declined copies and retained layers; matrices with an origin | `tests/run_host_tests.sh GraphicsTest` |
 | `MonitorRenderers` (`test_monitor_renderers`): a 200 % and a 100 % monitor on one device, a rectangle across the seam on each at its density and place, the frame read back, a refused update keeping the views | `tests/run_host_tests.sh MonitorTest` |
-| Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor | `tests/run_host_tests.sh WaylandServerTest` |
+| Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor; an output per monitor (listed, its mode, scale and name), the window leaving one and entering the other, the global removed and added again | `tests/run_host_tests.sh WaylandServerTest` |
 | The desktop on a 200 % and a 100 % monitor (`test_windows_mixed_scales`): a program window across the seam drawn 1:1 on the 200 % device and through units on the 100 % one | `tests/run_host_tests.sh GuiTest` |
 | Windows on a 200 % and a 100 % monitor (`test_per_monitor_dpi`): the screen 2400 x 1200, each monitor's DPI; a per-monitor aware window moved by the desktop to the 100 % monitor hears 96 dpi and keeps its rectangle, moved back by itself hears 192 at twice the size; its surface 1:1 on the 200 % device only; an unaware window keeps its size in its coordinates on both; the cursor both ways | `tests/run_host_tests.sh Win32kUserTest` |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |

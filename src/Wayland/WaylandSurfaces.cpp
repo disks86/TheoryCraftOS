@@ -1167,17 +1167,7 @@ void Server::map_window(Surface& s) {
   int32_t w = 0, h = 0;
   shown_size(s, &w, &h);
   note_repaint(s, {0, 0, max32(w, 1), max32(h, 1)});
-  if (Client* c = client_of(s.client)) {      // the surface is on the output now
-    ObjectCursor cursor;
-    for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
-      const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
-      if (kv->value.iface != Iface::Output) continue;
-      Event e(s.id, 0);
-      e.u(kv->key);
-      send(*c, e);
-    }
-  }
-  announce_scale();      // (its monitor's scale, if it differs from what it was told)
+  announce_scale();      // (it enters its monitor's outputs; its monitor's scale, if it differs from what it was told)
   if (s.role == Role::Popup && s.grab) set_keyboard_focus(&s);
   // A new window takes the activation and the keyboard, as a program's window does when it is first shown on the desktop (which takes the activation
   // from what the session reports, so a window nobody activates would never get keys until it is clicked).
@@ -1188,6 +1178,7 @@ void Server::map_window(Surface& s) {
 void Server::unmap(Surface& s) {
   if (!s.mapped) return;
   s.mapped = false;
+  s.entered = -1;      // (shown again: it enters its monitor's outputs again)
   for (uint64_t i = 0; i < stack_.count(); ++i)
     if (stack_[i] == &s) { stack_.remove_at(i); break; }
   note_changed(s);

@@ -338,6 +338,7 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<TextInputInfo> text_input;    // zwp_text_input_v3
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
     uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
+    uint8_t output = 0;                         // wl_output: the monitor (an index of monitors_) it is
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor, Layer };
   // A layer surface's double-buffered state (zwlr_layer_surface_v1).
@@ -423,6 +424,7 @@ class Server final : public desktop::IWindowsSession {
     // a popup
     Surface* popup_parent = nullptr;            // the xdg surface it belongs to
     uint32_t told_scale = 0;                    // the scale (percent) it was last told to draw at (0: not yet)
+    int32_t entered = -1;                       // the monitor whose wl_outputs it entered (-1: none)
     Positioner positioner;
     Rect placement;                             // relative to the parent's window geometry
     bool grab = false;
@@ -568,6 +570,9 @@ class Server final : public desktop::IWindowsSession {
   bool draw_window_at(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t percent, uint32_t* width, uint32_t* height);
   void announce_scale();      // every surface is told the scale of its window's monitor when it changed (fractional and preferred buffer scales)
   uint32_t scale_for(const Surface& s) const;      // the scale of the monitor its window (its root: the toplevel or layer surface) is on
+  uint32_t monitor_index_for(const Surface& s) const;
+  void list_outputs();      // the monitors changed: registries hear of the outputs that came (wl_registry.global) and went (global_remove)
+  uint32_t outputs_listed_ = 1;      // monitors whose wl_output the registries were told of
   void tell_scale(Surface& s);
   uint32_t output_scale_ = 100;      // (percent: the desktop's device scale)
   uint32_t output_whole_scale() const { return (output_scale_ + 99) / 100; }      // wl_output.scale, the preferred buffer scale: the whole scale at or above it
