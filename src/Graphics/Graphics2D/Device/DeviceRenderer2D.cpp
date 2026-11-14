@@ -23,7 +23,7 @@
 
 namespace graphics {
 
-DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent)
+DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocator& allocator, Extent2D extent, bool sampled_target)
     : device_(device), allocator_(allocator), extent_(extent) {
   clip_ = base_clip_ = {0, 0, extent.width, extent.height};
   vs_ = device.create_shader_module(colored_vertex_shader());
@@ -152,7 +152,7 @@ DeviceRenderer2D::DeviceRenderer2D(IGraphicsDevice& device, allocators::IAllocat
       atlas_table_ = allocate_view<AtlasEntry>(allocator, kAtlasTable);
     }
   }
-  for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent});
+  for (IImage*& image : images_) image = device.create_image({extent, Format::B8G8R8A8Unorm, kImageColorAttachment | kImagePresent | (sampled_target ? kImageSampled : 0u)});
   commands_ = device.create_command_buffer();
   valid_ = blended_ && opaque_ && vertices_ && images_[0] && images_[1] && commands_;
   if (valid_) {

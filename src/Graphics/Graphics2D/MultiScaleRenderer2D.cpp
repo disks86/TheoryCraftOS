@@ -168,6 +168,10 @@ bool MultiScaleRenderer2D::device_view(uint32_t index, DeviceView* out) {
 }
 
 void MultiScaleRenderer2D::present() {
+  if (presenter_) {
+    presenter_->present_views();
+    return;
+  }
   for (IRenderer2D* v : views()) v->present();
   if (display_) display_->present();
 }

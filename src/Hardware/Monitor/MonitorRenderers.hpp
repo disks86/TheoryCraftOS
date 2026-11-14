@@ -23,6 +23,7 @@
 // resampled for the other monitors) when the enabled monitors' scales differ.
 #pragma once
 #include "Allocators/IAllocator.hpp"
+#include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/MultiScaleRenderer2D.hpp"
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
@@ -34,7 +35,9 @@
 
 namespace hardware {
 
-class MonitorRenderers {
+// With a GPU device (update's `device`), every monitor is drawn by a DeviceRenderer2D of its own pixels instead, and presenting lays each monitor's
+// image at its place in one picture of the display's size on that device (draw_device_image: the pixels stay on the GPU), which is presented once.
+class MonitorRenderers final : private graphics::IViewPresenter {
  public:
   MonitorRenderers(IGraphicsProcessingUnit& gpu, allocators::IAllocator& allocator) : gpu_(gpu), allocator_(allocator), outputs_(allocator), multi_(allocator, &gpu) {}
   ~MonitorRenderers() = default;
@@ -45,7 +48,12 @@ class MonitorRenderers {
   static bool mixed_scales(const MonitorLayout& layout);
   // Builds a view for every enabled monitor (matched to `physical` by id). False, with the old views kept, when a monitor has no place on the
   // device, a place runs off it, or memory ran out. `text`: the face the views draw text with at a scale (CellTextFace; null: the 8x16 font enlarged).
-  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, graphics::ICellTextFace* text = nullptr);
+  bool update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, graphics::ICellTextFace* text = nullptr,
+              graphics::IGraphicsDevice* device = nullptr);
+  bool on_gpu() const { return compositor_.get() != nullptr; }
+  // On a GPU: lays every monitor's picture at its place in the display-sized one (what present does before presenting it). Tests read it back.
+  bool compose();
+  bool read_composed(ArrayView<uint32_t> out) { return compositor_ && compositor_->read_pixels(out); }
   // What the desktop draws on: the layout's units, every monitor at its own scale. Valid while this object lives (rebuilt by update, kept by address).
   graphics::IRenderer2D& renderer() { return multi_; }
   uint32_t view_count() const { return multi_.view_count(); }
@@ -84,13 +92,18 @@ class MonitorRenderers {
     List<uint32_t> pixels;
     UniquePointer<Placed> placed;
     UniquePointer<graphics::SoftwareRenderer2D> software;
+    UniquePointer<graphics::DeviceRenderer2D> gpu;      // (on a GPU: the monitor's picture there)
+    uint32_t x = 0, y = 0, w = 0, h = 0;                // its place on the display
     UniquePointer<graphics::ScaledRenderer2D> scaled;
   };
+  void present_views() override;
 
   IGraphicsProcessingUnit& gpu_;
   allocators::IAllocator& allocator_;
   List<UniquePointer<Output>> outputs_;
   graphics::MultiScaleRenderer2D multi_;
+  graphics::IGraphicsDevice* device_ = nullptr;
+  UniquePointer<graphics::DeviceRenderer2D> compositor_;      // (on a GPU: the display-sized picture the monitors' are laid in)
 };
 
 }  // namespace hardware

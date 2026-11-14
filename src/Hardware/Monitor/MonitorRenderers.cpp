@@ -47,7 +47,14 @@ bool MonitorRenderers::mixed_scales(const MonitorLayout& layout) {
   return false;
 }
 
-bool MonitorRenderers::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, graphics::ICellTextFace* text) {
+bool MonitorRenderers::update(const MonitorLayout& layout, const ScanoutPlacement* physical, uint32_t count, graphics::ICellTextFace* text,
+                              graphics::IGraphicsDevice* device) {
+  // on a GPU: the display-sized picture first (no device, or one that cannot make it: the monitors are drawn on the CPU)
+  UniquePointer<graphics::DeviceRenderer2D> compositor;
+  if (device) {
+    compositor = UniquePointer<graphics::DeviceRenderer2D>::make(allocator_, *device, allocator_, graphics::Extent2D{gpu_.width(), gpu_.height()});
+    if (compositor && !compositor->valid()) compositor.reset();
+  }
   List<UniquePointer<Output>> fresh(allocator_);
   graphics::IRenderer2D* views[graphics::MultiScaleRenderer2D::kMaxViews];
   uint32_t n = 0;
@@ -60,17 +67,30 @@ bool MonitorRenderers::update(const MonitorLayout& layout, const ScanoutPlacemen
     if (!place || place->width == 0 || place->height == 0 || n >= graphics::MultiScaleRenderer2D::kMaxViews) return false;
     if (place->x > gpu_.width() || place->width > gpu_.width() - place->x || place->y > gpu_.height() || place->height > gpu_.height() - place->y) return false;
     UniquePointer<Output> out = UniquePointer<Output>::make(allocator_, allocator_);
-    if (!out || !out->pixels.reserve(uint64_t{place->width} * place->height)) return false;
-    for (uint64_t p = 0; p < uint64_t{place->width} * place->height; ++p) out->pixels.push_back(0xFF000000u);
-    out->placed = UniquePointer<Placed>::make(allocator_, gpu_, place->x, place->y, place->width, place->height);
-    graphics::Surface surface;
-    surface.pixels = out->pixels.view();
-    surface.width = surface.pitch = place->width;
-    surface.height = place->height;
-    if (!out->placed) return false;
-    out->software = UniquePointer<graphics::SoftwareRenderer2D>::make(allocator_, surface, out->placed.get(), &allocator_);
-    if (!out->software) return false;
-    out->scaled = UniquePointer<graphics::ScaledRenderer2D>::make(allocator_, allocator_, *out->software, s.scale_percent ? s.scale_percent : 100);
+    if (!out) return false;
+    out->x = place->x;
+    out->y = place->y;
+    out->w = place->width;
+    out->h = place->height;
+    graphics::IRenderer2D* target = nullptr;
+    if (compositor) {      // the monitor's picture on the GPU
+      out->gpu = UniquePointer<graphics::DeviceRenderer2D>::make(allocator_, *device, allocator_, graphics::Extent2D{place->width, place->height}, true);
+      if (!out->gpu || !out->gpu->valid()) return false;
+      target = out->gpu.get();
+    } else {      // on the CPU, presented into its place on the display
+      if (!out->pixels.reserve(uint64_t{place->width} * place->height)) return false;
+      for (uint64_t p = 0; p < uint64_t{place->width} * place->height; ++p) out->pixels.push_back(0xFF000000u);
+      out->placed = UniquePointer<Placed>::make(allocator_, gpu_, place->x, place->y, place->width, place->height);
+      graphics::Surface surface;
+      surface.pixels = out->pixels.view();
+      surface.width = surface.pitch = place->width;
+      surface.height = place->height;
+      if (!out->placed) return false;
+      out->software = UniquePointer<graphics::SoftwareRenderer2D>::make(allocator_, surface, out->placed.get(), &allocator_);
+      if (!out->software) return false;
+      target = out->software.get();
+    }
+    out->scaled = UniquePointer<graphics::ScaledRenderer2D>::make(allocator_, allocator_, *target, s.scale_percent ? s.scale_percent : 100);
     if (!out->scaled) return false;
     out->scaled->set_origin(s.rect.x, s.rect.y);
     out->scaled->set_text_face(text);
@@ -84,7 +104,27 @@ bool MonitorRenderers::update(const MonitorLayout& layout, const ScanoutPlacemen
   if (!multi_.set_views(ArrayView<graphics::IRenderer2D* const>(views, n), graphics::Extent2D{uint32_t(right), uint32_t(bottom)})) return false;
   outputs_.clear();
   for (UniquePointer<Output>& out : fresh.view()) outputs_.push_back(static_cast<UniquePointer<Output>&&>(out));
+  compositor_ = static_cast<UniquePointer<graphics::DeviceRenderer2D>&&>(compositor);
+  device_ = compositor_ ? device : nullptr;
+  multi_.set_presenter(compositor_ ? this : nullptr);
   return true;
+}
+
+// On a GPU: each monitor's picture laid at its place in the display-sized one (pixels copied as they are), which is presented.
+bool MonitorRenderers::compose() {
+  if (!compositor_ || !device_) return false;
+  bool all = true;
+  compositor_->set_blend(graphics::BlendMode::Replace);
+  for (const UniquePointer<Output>& out : outputs_.view()) {
+    graphics::IImage* image = out->gpu ? out->gpu->frame_image() : nullptr;
+    all = image && compositor_->draw_device_image(*device_, *image, graphics::Rect2D{0, 0, out->w, out->h}, int32_t(out->x), int32_t(out->y)) && all;
+  }
+  compositor_->set_blend(graphics::BlendMode::Alpha);
+  return all;
+}
+
+void MonitorRenderers::present_views() {
+  if (compose() || compositor_) compositor_->present();
 }
 
 }  // namespace hardware

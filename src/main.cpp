@@ -1521,7 +1521,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       const uint32_t k = self->monitors->render_percent();
       self->per_monitor = false;
       if (self->views && self->scaled && hardware::MonitorRenderers::mixed_scales(self->monitors->layout()) &&
-          self->views->update(self->monitors->layout(), placements, count, self->text)) {
+          self->views->update(self->monitors->layout(), placements, count, self->text,
+                              self->graphics->render_node().accelerated() ? self->graphics->render_node().gpu_device() : nullptr)) {      // (on the GPU when there is one)
         self->graphics->set_display_override(nullptr);
         self->graphics->reset_renderer();      // (the device is drawn by the views now)
         self->scaled->set_device(self->views->renderer(), 100);
