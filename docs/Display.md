@@ -17,6 +17,9 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
   - **The desktop's own drawing** goes through it. Rectangles, lines, shapes and the 8x16 font's pixels are mapped by their edges, so what touches still
     touches. At a whole scale a unit is exactly k x k pixels; at 150 % units alternate between one and two pixels. Images and masks are sampled nearest
     at a whole scale and filtered at a fractional one. What is drawn at the device's resolution is sharp.
+  - **GPU images.** A picture that lives on the graphics device (`draw_device_image`, e.g. a Wayland dmabuf or a shared 3D frame made at 1x) is
+    enlarged on the device by its edges (`draw_device_image_scaled`: nearest at a whole scale, filtered at a fractional one), not read back
+    through the CPU.
   - **Text.** The kernel gives the scaling renderer a text face (`graphics::CellTextFace`, `ScaledRenderer2D::set_text_face`). Each character of the
     desktop's text is then drawn with the bundled "TCOS Mono" (Liberation Mono; "TCOS Fallback" for what it lacks) at the device's resolution,
     anti-aliased and sized to fill its 8 x 16-unit cell on the device, so the layout is the same. Box drawing and block characters (U+2500..U+259F) stay
@@ -94,13 +97,13 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
 - X programs are not told the density (`Xft.dpi`): they are enlarged.
-- A GPU device image (`draw_device_image`) cannot be enlarged by the scaling renderer: callers draw it from the CPU's view.
 
 ## Tests
 
 | What | How |
 | --- | --- |
 | The scaling renderer: a scene at 200 % and 300 % equal to the 1x scene enlarged pixel for pixel (rectangles, outlines, lines, text, images, masks, clips); at 125, 150 and 175 % every device pixel the unit it maps back to (pictures left out); extent, device, read-back, matrices | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_2d`) |
+| A shared 3D frame drawn through the scaling renderer at 200 %: on the device, each pixel 2 x 2, equal to the read-back picture | `tests/run_host_tests.sh CubeRendererTest` (`test_shared`) |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |

@@ -29,6 +29,7 @@
 #include "Desktop/CubeSpirv.hpp"
 #include "Desktop/GlCubeRenderer.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
+#include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics3D/BuiltinShaders.hpp"
 #include "Graphics/Graphics3D/CubeMesh.hpp"
@@ -308,6 +309,26 @@ static void test_shared(TestAllocator& a) {
   printf("   shared frame: %llu of %u pixels differ from the read-back picture\n", static_cast<unsigned long long>(differing), W * H);
   CHECK(differing == 0);
   CHECK(composed[0] == 0xFF303030 && composed[uint64_t{70} * (W + 40) + 100] != 0xFF303030);   // (the margin is untouched, the cube is there)
+
+  // A desktop at 200 % shows it enlarged where it is, on the device: each pixel of the frame two by two
+  {
+    CHECK(r.acquire_target(&lent_device, &lent_image));
+    graphics::DeviceRenderer2D big(device, a, {2 * W, 2 * H});
+    graphics::ScaledRenderer2D scaled(a, big, 200);
+    CHECK(scaled.draw_device_image(*lent_device, *lent_image, {0, 0, W, H}, 0, 0));
+    graphics::DeviceRenderer2D foreign_big(other, a, {2 * W, 2 * H});
+    graphics::ScaledRenderer2D foreign_scaled(a, foreign_big, 200);
+    CHECK(!foreign_scaled.draw_device_image(*lent_device, *lent_image, {0, 0, W, H}, 0, 0));      // (still only on its own device)
+    r.release_target();
+    ArrayView<uint32_t> enlarged = allocate_view<uint32_t>(a, uint64_t{2 * W} * (2 * H));
+    CHECK(big.read_pixels(enlarged));
+    uint64_t wrong = 0;
+    for (uint32_t y = 0; y < 2 * H; ++y)
+      for (uint32_t x = 0; x < 2 * W; ++x) wrong += enlarged[uint64_t{y} * (2 * W) + x] != pixel(r, x / 2, y / 2);
+    printf("   shared frame at 200 %%: %llu of %u pixels differ\n", static_cast<unsigned long long>(wrong), 4 * W * H);
+    CHECK(wrong == 0);
+    release_view(a, enlarged);
+  }
   release_view(a, composed);
 
   CHECK(r.render(1.0f, true, &times, false));   // back in the renderer's hands
