@@ -4363,6 +4363,45 @@ static void test_mapping() {
     server.set_display(1024, 768, {});      // (back to 1 for what follows)
     CHECK(app.take(early, 2).i(0) == 1);
   }
+  {      // monitors at different scales: A at 200 % (units 0..800), B at 100 % (800..1600), the device scale 200. A window is told the scale of the
+         // monitor it is on (fractional 240 / buffer scale 2 on A), and again when the desktop moves it to the other (120 / 1), and back
+    App app(server);
+    const uint32_t fsm = app.bind(app.reg, "wp_fractional_scale_manager_v1");
+    desktop::IWindowsSession::Monitor mixed[2];
+    mixed[0].rect = {0, 0, 800, 600};
+    mixed[0].work = {0, 0, 800, 570};
+    mixed[0].scale_percent = 200;
+    mixed[1].rect = {800, 0, 800, 600};
+    mixed[1].work = {800, 0, 800, 600};
+    mixed[1].scale_percent = 200;
+    mixed[1].monitor_scale = 100;
+    server.set_display(1600, 600, ArrayView<const desktop::IWindowsSession::Monitor>(mixed, 2));
+    App::Window w = app.toplevel(true, "mover");
+    const uint32_t f = app.new_id();
+    app.send(Msg(fsm, 1).u(f).u(w.surface));
+    app.show(w, 40, 20, 0xFF00FF00u);
+    uint32_t win = 0;
+    for (uint32_t id : listed(server)) {
+      desktop::WindowsWindowInfo info;
+      String title(A);
+      if (server.window_info(id, &info, &title) && title.view() == StringView("mover")) win = id;
+    }
+    CHECK(win != 0);
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win, &info, &title) && info.surface.x < 800);      // (placed on the primary monitor, A)
+    CHECK(app.take(f, 0).u(0) == 240);
+    app.drop_events();
+    server.move_window(win, {900, 100, info.window.width, info.window.height});
+    CHECK(app.take(f, 0).u(0) == 120 && app.take(w.surface, 2).i(0) == 1);
+    app.drop_events();
+    server.move_window(win, {100, 100, info.window.width, info.window.height});
+    CHECK(app.take(f, 0).u(0) == 240 && app.take(w.surface, 2).i(0) == 2);
+    app.drop_events();
+    server.move_window(win, {120, 110, info.window.width, info.window.height});      // (on the same monitor: nothing said)
+    CHECK(!app.has(f, 0) && !app.has(w.surface, 2));
+    server.set_display(1024, 768, {});
+  }
   // the rules
   struct Rule {
     const char* what;

@@ -422,6 +422,7 @@ class Server final : public desktop::IWindowsSession {
     Rect restore;
     // a popup
     Surface* popup_parent = nullptr;            // the xdg surface it belongs to
+    uint32_t told_scale = 0;                    // the scale (percent) it was last told to draw at (0: not yet)
     Positioner positioner;
     Rect placement;                             // relative to the parent's window geometry
     bool grab = false;
@@ -565,7 +566,9 @@ class Server final : public desktop::IWindowsSession {
   void note_repaint(Surface& s, const Rect& dirty);
   void draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done, uint32_t percent = 100);      // (x, y in units)
   bool draw_window_at(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t percent, uint32_t* width, uint32_t* height);
-  void announce_scale();      // the output scale changed: outputs, fractional scales and preferred buffer scales say so
+  void announce_scale();      // every surface is told the scale of its window's monitor when it changed (fractional and preferred buffer scales)
+  uint32_t scale_for(const Surface& s) const;      // the scale of the monitor its window (its root: the toplevel or layer surface) is on
+  void tell_scale(Surface& s);
   uint32_t output_scale_ = 100;      // (percent: the desktop's device scale)
   uint32_t output_whole_scale() const { return (output_scale_ + 99) / 100; }      // wl_output.scale, the preferred buffer scale: the whole scale at or above it
 
@@ -606,6 +609,7 @@ class Server final : public desktop::IWindowsSession {
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
     Rect rect, work, panel;      // (panel: where layer surfaces anchor - the work area before the windows' reservations)
+    uint32_t scale = 100;        // the monitor's own scale (percent): what a surface on it is asked to draw at
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 1;
