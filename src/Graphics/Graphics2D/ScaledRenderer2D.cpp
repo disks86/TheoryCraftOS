@@ -94,7 +94,9 @@ void ScaledRenderer2D::draw_image(const Surface& source, const Rect2D& source_re
 void ScaledRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_t color) {
   if (percent_ == 100) { device_->draw_text(x, y, text, color); return; }
   if (!text) return;
-  for (char32_t c = hardware::utf8_next(text); c != 0; c = hardware::utf8_next(text), x += static_cast<int32_t>(hardware::Font8x16::kWidth)) {
+  constexpr int32_t kCellW = static_cast<int32_t>(hardware::Font8x16::kWidth), kCellH = static_cast<int32_t>(hardware::Font8x16::kHeight);
+  for (char32_t c = hardware::utf8_next(text); c != 0; c = hardware::utf8_next(text), x += kCellW) {
+    if (text_face_ && text_face_->draw_cell(*device_, c, up(Rect2D{x, y, uint32_t(kCellW), uint32_t(kCellH)}), color)) continue;
     uint8_t glyph[hardware::Font8x16::kHeight];
     hardware::Font8x16::glyph_of(c, glyph);
     for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) {

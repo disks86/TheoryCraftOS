@@ -18,7 +18,7 @@
 
 // HiDPI: a renderer in logical coordinates (units) over one in device pixels, `percent` / 100 device pixels per unit (100 .. 400, Graphics/DeviceScale.hpp's
 // mapping). Everything drawn is enlarged: rectangles, lines and shapes by their edges (so what touches still touches; at a whole scale every unit is
-// exactly scale x scale pixels), the 8x16 font as its pixels' rectangles, masks by nearest sampling, images by nearest sampling at a whole scale and
+// exactly scale x scale pixels), the 8x16 font as its pixels' rectangles (or, given a text face, each character drawn at the device's resolution), masks by nearest sampling, images by nearest sampling at a whole scale and
 // filtered at a fractional one. A picture of the desktop at 100 % looks the same, only sharper where something was drawn at the device's
 // resolution (scale_percent() and device() let such a picture be drawn 1:1). The extent is the device's in units. At 100 every call goes straight through.
 // The device renderer may be swapped (a new display mode) with set_device; the object stays, so whoever holds it keeps holding it.
@@ -29,6 +29,17 @@
 #include "ObjectContainer/List.hpp"
 
 namespace graphics {
+
+// Draws one character of the 8x16 grid at the device's resolution (CellTextFace): `cell` is its cell in device pixels. False when it has no glyph for
+// it (the 8x16 font's pixels are drawn instead).
+class ICellTextFace {
+ public:
+  virtual bool draw_cell(IRenderer2D& device, char32_t c, const Rect2D& cell, uint32_t color) = 0;
+
+ protected:
+  ICellTextFace() = default;
+  ~ICellTextFace() = default;
+};
 
 class ScaledRenderer2D final : public IRenderer2D {
  public:
@@ -42,6 +53,8 @@ class ScaledRenderer2D final : public IRenderer2D {
     percent_ = clamp_scale_percent(percent);
   }
   uint32_t percent() const { return percent_; }
+  // Text (draw_text) at a scale drawn with this face at the device's resolution rather than the 8x16 font enlarged; null: enlarged.
+  void set_text_face(ICellTextFace* face) { text_face_ = face; }
 
   const char* name() const override { return device_->name(); }
   bool accelerated() const override { return device_->accelerated(); }
@@ -121,6 +134,7 @@ class ScaledRenderer2D final : public IRenderer2D {
 
   IRenderer2D* device_ = nullptr;
   uint32_t percent_ = 100;
+  ICellTextFace* text_face_ = nullptr;
   List<uint8_t> scratch_;
   List<uint32_t> frame_;
 };

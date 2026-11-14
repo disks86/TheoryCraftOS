@@ -572,7 +572,7 @@ for t in "${WANTED[@]}"; do
                           src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Dhcp/*.cpp src/Network/Dns/*.cpp ;;
     Graphics3DExtensionsTest) build_and_run Graphics3DExtensionsTest tests/Graphics3DExtensionsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Graphics/Graphics2D/Software/*.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
     GraphicsTest) build_and_run GraphicsTest tests/GraphicsTest.cpp tests/KernelStubs.cpp src/Math/FloatMath.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp \
-                    src/Graphics/Graphics2D/ScaledRenderer2D.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
+                    src/Graphics/Graphics2D/ScaledRenderer2D.cpp src/Graphics/Graphics2D/CellTextFace.cpp src/Font/*.cpp src/Media/Zlib.cpp src/Graphics/Graphics2D/Software/*.cpp src/Graphics/Graphics2D/Device/*.cpp src/Graphics/Graphics3D/BuiltinShaders.cpp src/Graphics/Graphics3D/Software/*.cpp ;;
     CubeRendererTest) spirv_host
                       build_and_run CubeRendererTest tests/CubeRendererTest.cpp "$spirv_object" tests/KernelStubs.cpp src/Kernel/Sync.cpp src/Math/FloatMath.cpp src/Kernel/Dxgkrnl/*.cpp src/Desktop/CubeRenderer.cpp \
                         src/Desktop/CubeSpirv.cpp src/Desktop/GlCubeRenderer.cpp $gl_kernel src/WebGl/*.cpp \
