@@ -61,6 +61,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
     - Whenever that surface, or the top-level's under it, changes, win32k scales its pixels into the top-level's surface where the child shows
       (nearest sampling: an unaware child of an aware window is enlarged, an aware child of an unaware window shrunk).
     - Its messages and calls are in its own coordinates.
+    - GPU presents to it (or to a window in its tree) go on its own surface, in its units, and are scaled like its drawing. Its window region, in its
+      units, shapes the scaled pixels.
 - **A scale change** keeps every top-level window where it was in units:
   - A per-monitor-aware window gets `WM_DPICHANGED`, with the new DPI in both halves of wParam and lParam pointing at the suggested rectangle (its old
     one at the new scale), as on Windows. A program that leaves it to DefWindowProc is moved there, which Windows' DefWindowProc does not do. The
@@ -84,8 +86,6 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
   undrawn.
 - Windows DPI virtualization (above) has these gaps:
   - When the scale shrinks below a system-aware program's DPI, its windows stay in device pixels (too large). Windows would shrink their picture.
-  - A mixed DPI child's GPU presents (swapchains made for it) go to the top-level's surface unscaled, and its window region is not applied to its
-    scaled pixels.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
 - X programs are not told the density (`Xft.dpi`): they are enlarged.
