@@ -1198,6 +1198,24 @@ set_source_files_properties(src/Desktop/CubeSpirvTranslator.c PROPERTIES COMPILE
 # Keep frame pointers so gdb backtraces work.
 target_compile_options(BOOTX64 PRIVATE -fno-omit-frame-pointer)
 
+# The software media codecs are inner loops over samples and pixels, written with bounds-checked views: at -O1 (a Debug kernel) none of those accessors
+# is inlined and a video decodes several times slower than it plays. They are always built at -O2 or more (a source file's options come after the
+# target's, so this decides). -DTCOS_CODEC_OPT=-O1 puts them back for stepping through one in a debugger.
+set(TCOS_CODEC_OPT "" CACHE STRING "Optimization flag of the software media codecs; empty: -O2, or the kernel's level if that is higher")
+if(TCOS_CODEC_OPT)
+  set(TCOS_CODEC_OPT_FLAG ${TCOS_CODEC_OPT})
+elseif(TCOS_KERNEL_OPT_FLAG MATCHES "^-O[3-9]$|^-Ofast$")
+  set(TCOS_CODEC_OPT_FLAG ${TCOS_KERNEL_OPT_FLAG})
+else()
+  set(TCOS_CODEC_OPT_FLAG -O2)
+endif()
+file(GLOB TCOS_CODEC_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/Software/*.cpp ${CMAKE_SOURCE_DIR}/src/Hardware/VideoCodec/ColorConvert.cpp
+  ${CMAKE_SOURCE_DIR}/src/Media/Audio/*.cpp ${CMAKE_SOURCE_DIR}/src/Media/AudioCodecs.cpp ${CMAKE_SOURCE_DIR}/src/Media/Image/*.cpp
+  ${CMAKE_SOURCE_DIR}/src/Media/ImageCodecs.cpp ${CMAKE_SOURCE_DIR}/src/Audio/Resampler.cpp)
+set_source_files_properties(${TCOS_CODEC_SOURCES} PROPERTIES COMPILE_OPTIONS "${TCOS_CODEC_OPT_FLAG}")
+message(STATUS "Media codec optimization: ${TCOS_CODEC_OPT_FLAG}")
+
 option(TCOS_USERMODE_DEMO "Run two small programs in ring 3 at boot (x86-64)" OFF)
 option(TCOS_USERMODE_DEMO_PAIR "With TCOS_USERMODE_DEMO_PROGRAM: also run it twice at the same time, as \"server\" and \"client\"" OFF)
 if(TCOS_USERMODE_DEMO)

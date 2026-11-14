@@ -189,7 +189,10 @@ bool MseClip::copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* s
   return false;
 }
 
-bool MseClip::open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into) {
+// Puts a file of what `plan` covers under `into`. `extend`: the file `into` plays is an earlier snapshot of the same data (more was appended after it), so
+// its player is first asked to carry on with the new one; a new player would decode again from the key frame before the playhead, which stops the
+// picture for as long as that takes (seconds of video, with key frames 5 s apart).
+bool MseClip::open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into, bool extend) {
   if (!env_) {
     fail(4);
     return false;
@@ -200,6 +203,16 @@ bool MseClip::open_child(media::MseBuffer& buffer, uint8_t part, const media::Ms
   if (!bytes || !buffer.snapshot(&p, bytes.get())) {
     fail(3);
     return false;
+  }
+  if (extend && into->clip && into->video && p.has_video && into->buffer == buffer.id() && into->part == part && into->generation == p.generation &&
+      into->clip->extend(&bytes, p.base_us - into->base)) {
+    into->base = p.base_us;
+    into->start = p.start_us;
+    into->end = p.end_us;
+    into->epoch = buffer.epoch();
+    into->appended = buffer.appended();
+    into->key_epoch = keys_ ? keys_->key_epoch() : 0;
+    return true;
   }
   UniquePointer<IVideoClip> clip = p.has_video ? env_->open_video(util::move(bytes)) : env_->open_audio(util::move(bytes));
   if (!clip) {   // (this machine cannot decode what the page appended)
@@ -306,7 +319,7 @@ void MseClip::update() {
       const uint8_t part = split ? static_cast<uint8_t>(part_index + 1) : 0;
       Child* c = child_of(buffer.id(), part);
       media::MseSnapshotPlan plan;
-      bool have_plan = false, rebuild = false;
+      bool have_plan = false, rebuild = false, extend = false;
       if (c && c->clip) {
         if (position_ < c->start - kStartSlack || position_ > c->end) {
           rebuild = true;   // the playhead has left the file
@@ -317,7 +330,7 @@ void MseClip::update() {
           else if (plan.generation == c->generation && plan.end_us > c->end + kStartSlack) {
             // More data follows the file: it is written out once the playhead comes near the file's end. Until then what was appended is not marked as seen,
             // so the next update looks again (a page that appends everything at once and then waits would otherwise stop at the end of the first file).
-            if (c->end - position_ < kRefillAhead || master_stopped) rebuild = true;
+            if (c->end - position_ < kRefillAhead || master_stopped) rebuild = extend = true;
           } else {
             c->appended = buffer.appended();
             c->epoch = buffer.epoch();
@@ -371,7 +384,7 @@ void MseClip::update() {
           all = false;
           continue;
         }
-        if (!open_child(buffer, part, plan, c)) {
+        if (!open_child(buffer, part, plan, c, extend)) {
           drop(c);
           return;
         }

@@ -147,7 +147,7 @@ bool VideoPlayerControl::update_picture() {
     new_size = true;
   }
   uint32_t serial = 0;
-  if (!player_.copy_picture(pixels_.data(), w, &serial)) return false;
+  if (!player_.copy_picture(pixels_, w, &serial)) return false;
   if (new_size) view_.set_image(&surface_);
   else if (serial != shown_serial_) view_.image_changed();
   shown_serial_ = serial;

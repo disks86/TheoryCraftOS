@@ -94,6 +94,11 @@ class IVideoClip {
   // The pictures shown so far and the ones that were due but dropped because decoding fell behind (getVideoPlaybackQuality: players step down a quality
   // when they see frames dropped); false if the clip does not count them.
   virtual bool frame_counts(uint64_t* presented, uint64_t* dropped) { (void)presented; (void)dropped; return false; }
+  // For a clip opened on a file that is a snapshot of a stream still being received: carries on with `data`, a later snapshot of the same stream (it may
+  // begin later, at a picture that needs no earlier one, and usually ends later; its time 0 is `shift_us` after the old file's), with no break in what is
+  // shown - nothing is decoded again. True if it did, and `data` was taken; false (with `data` untouched and the clip as it was) if this clip cannot, or
+  // the new file does not go on from where the clip is: the caller then opens a new clip on it.
+  virtual bool extend(UniquePointer<ByteBuffer>* data, int64_t shift_us) { (void)data; (void)shift_us; return false; }
 
  protected:
   IVideoClip() = default;

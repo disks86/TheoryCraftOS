@@ -6592,7 +6592,10 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   var ttf = Object.create(TrustedTypePolicyFactory.prototype), policies = {};
   method(TrustedTypePolicyFactory.prototype, 'createPolicy', function (name, rules) {
     name = String(name);
-    if (policies[name] && name !== 'default') throw typeErr("execute 'createPolicy' on 'TrustedTypePolicyFactory'", "Policy with name \"" + name + "\" already exists.");
+    // (a name may be used again: only a page whose Content Security Policy lists its policy names without 'allow-duplicates' is refused that, and this browser
+    // enforces no trusted-types directive. Google's attestation and ad scripts make their "bg" and "ad" policies once per load of the script. The default
+    // policy is the one that can only be made once.)
+    if (policies[name] && name === 'default') throw typeErr("execute 'createPolicy' on 'TrustedTypePolicyFactory'", "Policy with name \"" + name + "\" already exists.");
     var p = Object.create(TrustedTypePolicy.prototype);
     Object.defineProperty(p, 'name', { value: name, enumerable: true });
     var make = function (C, key) {

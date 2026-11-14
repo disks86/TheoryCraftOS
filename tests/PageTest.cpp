@@ -111,7 +111,7 @@ class Clip final : public IVideoClip {
   }
   bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) override {
     if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) { ++copy_failures; return false; }
-    const bool ok = player_.copy_picture(dest.data(), pitch, serial);
+    const bool ok = player_.copy_picture(dest, pitch, serial);
     ++(ok ? copies : copy_failures);
     return ok;
   }
@@ -4811,6 +4811,12 @@ static void test_messaging() {
   }
   CHECK(async_is("class W extends HTMLElement { constructor() { super(); this.textContent = 'built'; } } customElements.define('x-w', W); var w = new W(); document.body.appendChild(w);"
                  "console.log(w.tagName, w.textContent, document.body.lastChild === w, w.isConnected, document.querySelector('x-w') === w);", "X-W built true true true", nullptr, "https://app.example/"));
+  // Trusted Types: a policy name may be used again (no Content Security Policy forbids it here: Google's attestation and ad scripts make "bg" and "ad" once
+  // per load of the script); only the default policy can be made once.
+  CHECK(async_is("var a = trustedTypes.createPolicy('bg', { createScript: function (s) { return s; } }), b = trustedTypes.createPolicy('bg', { createScript: function (s) { return s + '!'; } });"
+                 "var r = [a.name, String(b.createScript('x')), String(a.createScript('x')), a !== b]; trustedTypes.createPolicy('default', {});"
+                 "try { trustedTypes.createPolicy('default', {}); r.push('made twice'); } catch (e) { r.push(e.name); } console.log(r.join());",
+                 "bg,x!,x,true,TypeError", nullptr, "https://app.example/"));
   CHECK(async_is("var r = []; try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.define('x-once', class extends HTMLElement {});"
                  "try { customElements.define('x-once', class extends HTMLElement {}); } catch (e) { r.push(e.name); } customElements.whenDefined('x-soon').then(function (c) { r.push(typeof c); console.log(r.join()); });"
                  "customElements.define('x-soon', class extends HTMLElement {});", "SyntaxError,NotSupportedError,function", nullptr, "https://app.example/"));
