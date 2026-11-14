@@ -22,6 +22,7 @@
 #include <initializer_list>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -338,6 +339,142 @@ static void test_snapshot_plays() {
     CHECK(v.snapshot(&plan, &vf));
     Mp4File mp4(a);
     CHECK(mp4.open(vf.view()) && mp4.track_count() == 1 && mp4.find(Mp4TrackKind::Video) && !mp4.find(Mp4TrackKind::Audio));
+  }
+  CHECK(a.live == 0);
+}
+
+// Where the second movie fragment of a fragmented MP4 file starts (the file up to there is the initialization segment and the first fragment).
+static uint64_t second_fragment(ConstByteView file) {
+  uint64_t at = 0;
+  int fragments = 0;
+  ConstByteView head;
+  while (file.try_subview(at, 8, &head)) {
+    const uint64_t size = (uint64_t{head[0]} << 24) | (uint64_t{head[1]} << 16) | (uint64_t{head[2]} << 8) | head[3];
+    if (head[4] == 'm' && head[5] == 'o' && head[6] == 'o' && head[7] == 'f' && ++fragments == 2) return at;
+    if (size < 8 || size > file.size() - at) break;
+    at += size;
+  }
+  return 0;
+}
+
+static bool same_picture(video::VideoPlayer& a, video::VideoPlayer& b) {
+  const uint32_t w = a.frame_width(), h = a.frame_height();
+  if (w == 0 || h == 0 || w != b.frame_width() || h != b.frame_height()) return false;
+  std::vector<uint32_t> pa(uint64_t{w} * h), pb(uint64_t{w} * h);
+  uint32_t sa = 0, sb = 0;
+  if (!a.copy_picture(ArrayView<uint32_t>(pa.data(), pa.size()), w, &sa) || !b.copy_picture(ArrayView<uint32_t>(pb.data(), pb.size()), w, &sb)) return false;
+  return pa == pb;
+}
+
+// A player on a snapshot of a stream carries on with a later snapshot (more data at the end; or cut at a later key frame) without decoding anything
+// again, and shows what a player opened afresh on the later snapshot shows.
+static void test_snapshot_continues() {
+  TestAllocator a;
+  File video("tests/data/mse_video.mp4");
+  if (!video.ok()) return;
+  const uint64_t cut = second_fragment(video.view());
+  CHECK(cut > 0);
+  if (cut == 0) return;
+  {
+    NoPci pci;
+    hardware::SystemVideoCodecs codecs(pci, a);
+    codecs.initialize();
+    MseBuffer b(a, MseFormat::Mp4, 1);
+    CHECK(b.append(video.view().first(cut), 0) == MseAppend::Ok);
+    MseSnapshotPlan first;
+    ByteBuffer file1(a), file2(a), file3(a);
+    CHECK(b.plan(500000, &first) && b.snapshot(&first, &file1));
+    CHECK(near(static_cast<double>(first.end_us) / 1e6, 1.08, 0.001));
+    // (the player reads copies that are freed as soon as it has gone on to the next file, as the browser frees them: a use of an old file is then a
+    // use of freed memory, which the address sanitizer reports)
+    std::vector<uint8_t> held1(file1.view().data(), file1.view().data() + file1.size()), held2;
+    media::MemoryByteSource source1(ConstByteView(held1.data(), held1.size())), source2, source3;
+    FakeClock clock;
+    video::VideoPlayer player(clock, codecs, a);
+    CHECK(player.open_media(source1) == video::OpenResult::Ok && player.play());
+    clock.now = 600000;
+    player.update();
+    const uint64_t decoded_before = player.frames_decoded();
+    const uint32_t frame_before = player.current_frame();
+    CHECK(frame_before >= 12 && frame_before <= 14 && near(static_cast<double>(player.duration_us()) / 1e6, 1.08, 0.05));   // (the first picture is at 0.08 s of the file)
+
+    // the second second arrives: a file of both
+    CHECK(b.append(video.view().subview(cut), 600000) == MseAppend::Ok);
+    MseSnapshotPlan both;
+    CHECK(b.plan(600000 + first.start_us, &both) && both.start_us == first.start_us && both.generation == first.generation && b.snapshot(&both, &file2));
+    held2.assign(file2.view().data(), file2.view().data() + file2.size());
+    source2.reset(ConstByteView(held2.data(), held2.size()));
+    CHECK(player.continue_media(source2, both.base_us - first.base_us));
+    std::vector<uint8_t>().swap(held1);
+    CHECK(player.playing() && player.frames_decoded() == decoded_before && player.current_frame() == frame_before);
+    CHECK(near(static_cast<double>(player.duration_us()) / 1e6, 2.08, 0.05) && player.position_us() == 600000);
+    clock.now = 1500000;
+    player.update();
+    CHECK(player.frames_decoded() > decoded_before && player.frames_decoded() <= 42);   // (went on from frame 15: nothing twice)
+    {
+      FakeClock still;
+      video::VideoPlayer fresh(still, codecs, a);
+      CHECK(fresh.open_media(file2.view()) == video::OpenResult::Ok);
+      fresh.seek(1500000);
+      CHECK(fresh.current_frame() == player.current_frame() && same_picture(player, fresh));
+    }
+
+    // the playhead is in the second second: a file that begins at its key frame
+    MseSnapshotPlan late;
+    CHECK(b.plan(1500000 + first.start_us, &late) && late.start_us > first.start_us + 900000 && b.snapshot(&late, &file3));
+    source3.reset(file3.view());
+    const uint64_t decoded_middle = player.frames_decoded();
+    const int64_t element_before = player.position_us() + both.base_us;
+    CHECK(player.continue_media(source3, late.base_us - both.base_us));
+    std::vector<uint8_t>().swap(held2);
+    CHECK(player.frames_decoded() == decoded_middle && player.position_us() + late.base_us == element_before);
+    CHECK(near(static_cast<double>(player.duration_us()) / 1e6, 1.08, 0.05));
+    clock.now = 1800000;
+    player.update();
+    CHECK(player.frames_decoded() > decoded_middle && player.frames_decoded() <= decoded_middle + 9);
+    {
+      FakeClock still;
+      video::VideoPlayer fresh(still, codecs, a);
+      CHECK(fresh.open_media(file3.view()) == video::OpenResult::Ok);
+      fresh.seek(player.position_us());
+      CHECK(fresh.current_frame() == player.current_frame() && same_picture(player, fresh));
+    }
+    player.seek(100000);   // (back to the file's start: the decoder starts again, with the configuration it kept)
+    CHECK(player.current_frame() <= 3 && player.picture() != nullptr);
+
+    // refused, with the player as it was: a file that begins after where the player is; another stream; something that is no MP4 file
+    {
+      FakeClock early_clock;
+      video::VideoPlayer early(early_clock, codecs, a);
+      media::MemoryByteSource early1(file2.view()), early3(file3.view()), other, junk;
+      CHECK(early.open_media(early1) == video::OpenResult::Ok && early.play());
+      early_clock.now = 400000;
+      early.update();
+      const uint32_t at = early.current_frame();
+      CHECK(!early.continue_media(early3, late.base_us - both.base_us) && early.current_frame() == at && early.playing());
+      File vp9("tests/data/mse_vp9.webm");   // (pictures of the same size at the same times, in another codec)
+      ByteBuffer other_file(a);
+      MseBuffer m(a, MseFormat::Webm, 2);
+      MseSnapshotPlan other_plan;
+      CHECK(vp9.ok() && m.append(vp9.view(), 0) == MseAppend::Ok && m.plan(500000, &other_plan) && m.snapshot(&other_plan, &other_file));
+      other.reset(other_file.view());
+      CHECK(!early.continue_media(other, 0));
+      const uint8_t noise[64] = {1, 2, 3};
+      junk.reset(ConstByteView(noise, sizeof noise));
+      CHECK(!early.continue_media(junk, 0));
+      for (uint64_t keep = file2.size() / 8; keep < file2.size(); keep += file2.size() / 8) {   // (a file cut short: refused or taken, never read past its end)
+        media::MemoryByteSource part(file2.view().first(keep));
+        video::VideoPlayer p(early_clock, codecs, a);
+        media::MemoryByteSource whole(file1.view());
+        CHECK(p.open_media(whole) == video::OpenResult::Ok && p.play());
+        p.continue_media(part, both.base_us - first.base_us);
+        early_clock.now += 700000;
+        p.update();
+      }
+      early_clock.now = 900000;
+      early.update();
+      CHECK(early.current_frame() > at);
+    }
   }
   CHECK(a.live == 0);
 }
@@ -945,6 +1082,7 @@ int main() {
   test_mp4_stream();
   test_mpeg_and_adts();
   test_snapshot_plays();
+  test_snapshot_continues();
   test_processing();
   test_damaged_input();
   test_keys();

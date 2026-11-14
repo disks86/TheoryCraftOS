@@ -38,14 +38,21 @@ void VideoPlayer::release() {
   audio_player_.reset();  // before the sound it plays
   audio_stream_.reset();
   decoder_.reset();
+  codec_config_.clear();
   seq_clear();
-  mp4_.clear();
+  mp4_a_.clear();
+  mp4_b_.clear();
+  mp4_ = &mp4_a_;
   mp4_track_ = nullptr;
   webm_.clear();
   webm_track_ = nullptr;
   webm_origin_us_ = 0;
   source_ = nullptr;
   packet_.clear();
+  {
+    kernel::ScopedMutex picture(picture_mutex_);   // (a copy_picture() in flight ends first; the next finds nothing to copy)
+    picture_ready_ = false;
+  }
   images_.clear();
   frame_starts_.clear();
   image_mode_ = false;
@@ -60,6 +67,7 @@ void VideoPlayer::release() {
   current_frame_ = 0;
   paused_position_us_ = 0;
   ++serial_;
+  publish_clock();
 }
 
 void VideoPlayer::close() {
@@ -107,6 +115,7 @@ OpenResult VideoPlayer::finish_avi() {
 
   open_audio();
   state_ = VideoState::Stopped;
+  publish_clock();
   return OpenResult::Ok;
 }
 
@@ -138,8 +147,12 @@ bool VideoPlayer::decode_frame(uint32_t index) {
     if (source_->read(y4m_first_ + uint64_t{index} * y4m_step_, ByteView(packet_.writable_view().data() + at, y4m_frame_bytes_)) != y4m_frame_bytes_) return false;
     if (!media::decode_y4m(packet_.view(), &y4m_frame_) || y4m_frame_.frame_count() != 1) return false;
     ArrayView<uint32_t> pixels = y4m_frame_.frame(0);
-    if (pixels.size() * 4 != display_.plane(0).size()) return false;
-    __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+    {
+      kernel::ScopedMutex picture(picture_mutex_);
+      if (pixels.size() * 4 != display_.plane(0).size()) return false;
+      __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+      picture_ready_ = true;
+    }
     current_frame_ = index;
     ++decoded_;
     ++serial_;
@@ -149,7 +162,12 @@ bool VideoPlayer::decode_frame(uint32_t index) {
   if (image_mode_) {
     ArrayView<uint32_t> pixels = images_.frame(index);
     if (pixels.empty()) return false;
-    __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+    {
+      kernel::ScopedMutex picture(picture_mutex_);
+      if (pixels.size() * 4 != display_.plane(0).size()) return false;
+      __builtin_memcpy(display_.plane(0).data(), pixels.data(), pixels.size() * 4);
+      picture_ready_ = true;
+    }
     current_frame_ = index;
     ++decoded_;
     ++serial_;
@@ -174,6 +192,7 @@ bool VideoPlayer::decode_frame(uint32_t index) {
 // Makes a decoded picture the one on show.
 bool VideoPlayer::show_decoded(const VideoFrame& frame) {
   const VideoFormat& f = frame.format;
+  kernel::ScopedMutex picture(picture_mutex_);   // (the pixels change: copy_picture() waits for the whole picture)
   if (f.width != width_ || f.height != height_ || !display_.valid() || display_.format().width != f.width || display_.format().height != f.height) {
     if (!display_.allocate({f.width, f.height, PixelFormat::Bgra8888})) return false;
     width_ = f.width;
@@ -184,6 +203,7 @@ bool VideoPlayer::show_decoded(const VideoFrame& frame) {
     surface_.pitch = f.width;
   }
   if (!convert_to_bgra(frame, reinterpret_cast<uint32_t*>(display_.plane(0).data()), width_)) return false;
+  picture_ready_ = true;
   ++serial_;
   ++presented_;
   return true;
@@ -245,6 +265,7 @@ void VideoPlayer::seq_clear() {
   seq_sync_.clear();
   seq_fed_ = seq_next_rank_ = 0;
   seq_started_ = false;
+  seq_flushed_ = false;
   seq_one_to_one_ = false;
 }
 
@@ -261,7 +282,7 @@ bool VideoPlayer::seq_packet(uint32_t decode_index, VideoPacket* packet) const {
   }
   if (seq_source_ != SeqSource::Mp4 || !mp4_track_ || !source_) return false;
   packet_.clear();
-  if (!mp4_.read_sample(*source_, *mp4_track_, decode_index, &packet_) || packet_.size() == 0) return false;
+  if (!mp4_->read_sample(*source_, *mp4_track_, decode_index, &packet_) || packet_.size() == 0) return false;
   packet->data = packet_.view();
   packet->pts_us = 0;
   packet->keyframe = seq_sync_[decode_index] != 0;
@@ -379,6 +400,7 @@ bool VideoPlayer::seq_show(uint32_t target) {
     seq_fed_ = seq_dec_of_rank_[rank];
     seq_next_rank_ = rank;
     seq_started_ = true;
+    seq_flushed_ = false;
   }
   VideoFrame frame;
   bool shown = false;
@@ -392,6 +414,7 @@ bool VideoPlayer::seq_show(uint32_t target) {
       }
       if (seq_fed_ >= n) {
         decoder_->flush();
+        seq_flushed_ = true;
         if (!decoder_->receive(&frame)) break;
       } else {
         VideoPacket packet;
@@ -418,7 +441,10 @@ bool VideoPlayer::seq_show(uint32_t target) {
 
 // Takes the Y4M/GIF/APNG frames in images_ as the video: a picture surface, and when each frame starts.
 OpenResult VideoPlayer::open_images() {
-  if (images_.empty() || !display_.allocate({images_.width(), images_.height(), PixelFormat::Bgra8888})) return OpenResult::OutOfMemory;
+  {
+    kernel::ScopedMutex picture(picture_mutex_);
+    if (images_.empty() || !display_.allocate({images_.width(), images_.height(), PixelFormat::Bgra8888})) return OpenResult::OutOfMemory;
+  }
   int64_t at = 0;
   for (uint32_t i = 0; i < images_.frame_count(); ++i) {
     if (!frame_starts_.push_back(at)) return OpenResult::OutOfMemory;
@@ -438,6 +464,7 @@ OpenResult VideoPlayer::open_images() {
   if (!decode_frame(0)) return OpenResult::OutOfMemory;
   have_picture_ = true;
   state_ = VideoState::Stopped;
+  publish_clock();
   return OpenResult::Ok;
 }
 
@@ -561,7 +588,12 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
   y4m_rate_num_ = num;
   y4m_rate_den_ = den;
   source_ = &source;
-  if (!display_.allocate({static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::Bgra8888})) {
+  bool allocated;
+  {
+    kernel::ScopedMutex picture(picture_mutex_);
+    allocated = display_.allocate({static_cast<uint32_t>(width), static_cast<uint32_t>(height), PixelFormat::Bgra8888});
+  }
+  if (!allocated) {
     release();
     *result = OpenResult::OutOfMemory;
     return true;
@@ -582,6 +614,7 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
   }
   have_picture_ = true;
   state_ = VideoState::Stopped;
+  publish_clock();
   *result = OpenResult::Ok;
   return true;
 }
@@ -590,9 +623,9 @@ bool VideoPlayer::open_y4m_stream(media::IByteSource& source, OpenResult* result
 OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   kernel::ScopedMutex guard(mutex_);
   release();
-  if (!mp4_.open(source)) return OpenResult::Unsupported;
+  if (!mp4_->open(source)) return OpenResult::Unsupported;
   source_ = &source;
-  const media::Mp4Track* track = mp4_.find(media::Mp4TrackKind::Video);
+  const media::Mp4Track* track = mp4_->find(media::Mp4TrackKind::Video);
   if (!track) {
     release();
     return OpenResult::Unsupported;
@@ -614,7 +647,12 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
   config.width = track->width;
   config.height = track->height;
   config.output = PixelFormat::Bgra8888;
-  config.codec_config = track->config;
+  codec_config_.clear();
+  if (!codec_config_.append(track->config)) {
+    release();
+    return OpenResult::OutOfMemory;
+  }
+  config.codec_config = codec_config_.view();
   decoder_ = codecs_.create_decoder(config);
   if (!decoder_) {
     release();
@@ -640,6 +678,7 @@ OpenResult VideoPlayer::open_mp4(media::IByteSource& source) {
     if (audio_stream_) start_audio(audio_stream_.get());
   }
   state_ = VideoState::Stopped;
+  publish_clock();
   return OpenResult::Ok;
 }
 
@@ -688,6 +727,7 @@ OpenResult VideoPlayer::open_webm(media::IByteSource& source) {
     if (audio_stream_) start_audio(audio_stream_.get());
   }
   state_ = VideoState::Stopped;
+  publish_clock();
   return OpenResult::Ok;
 }
 
@@ -714,17 +754,98 @@ int64_t VideoPlayer::position_locked() {
   return position < 0 ? 0 : position > duration_us_ ? duration_us_ : position;
 }
 
+// What position_us() answers from while a service thread plays (called with mutex_ held, after anything that moves the position or changes the state).
+void VideoPlayer::publish_clock() {
+  Published now;
+  now.state = state_;
+  now.position_us = position_locked();
+  now.duration_us = duration_us_;
+  now.time_us = clock_.now_us();
+  now.width = width_;
+  now.height = height_;
+  now.decoded = decoded_;
+  now.skipped = skipped_;
+  now.presented = presented_;
+  kernel::ScopedMutex guard(clock_mutex_);
+  published_ = now;
+}
+
 int64_t VideoPlayer::position_us() {
+  if (service_running()) {
+    // The service thread holds mutex_ for as long as a frame takes to decode: the answer comes from what it published (at most one update() old),
+    // carried forward by the clock.
+    const Published c = published();
+    if (c.state != VideoState::Playing) return c.position_us;
+    const int64_t position = c.position_us + static_cast<int64_t>(clock_.now_us() - c.time_us);
+    return position < 0 ? 0 : position > c.duration_us ? c.duration_us : position;
+  }
   kernel::ScopedMutex guard(mutex_);
   return position_locked();
 }
 
-bool VideoPlayer::copy_picture(uint32_t* dest, uint32_t pitch, uint32_t* serial) {
-  kernel::ScopedMutex guard(mutex_);
-  if (state_ == VideoState::Empty || !display_.valid() || pitch < width_ || !dest) return false;
-  for (uint32_t y = 0; y < height_; ++y)
-    __builtin_memcpy(dest + uint64_t{y} * pitch, display_.plane(0).data() + uint64_t{y} * width_ * 4, uint64_t{width_} * 4);
+bool VideoPlayer::copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) {
+  kernel::ScopedMutex guard(picture_mutex_);
+  if (!picture_ready_ || !display_.valid()) return false;
+  const uint32_t width = display_.format().width, height = display_.format().height;
+  if (width == 0 || height == 0 || pitch < width || dest.size() / pitch < height) return false;
+  const ArrayView<const uint32_t> pixels(reinterpret_cast<const uint32_t*>(display_.plane(0).data()), uint64_t{width} * height);   // (a BGRA plane: 4-byte pixels, allocated aligned)
+  for (uint32_t y = 0; y < height; ++y) dest.subview(uint64_t{y} * pitch, width).copy_from(pixels.subview(uint64_t{y} * width, width));
   *serial = serial_;
+  return true;
+}
+
+// The new file must hold the samples of the old one from some sync sample on (and more after them, usually): the same stream, cut at another place.
+// Decode indices and display positions then only shift, and the decoder is where it was.
+bool VideoPlayer::continue_media(media::IByteSource& source, int64_t shift_us) {
+  kernel::ScopedMutex guard(mutex_);
+  if (state_ == VideoState::Empty || seq_source_ != SeqSource::Mp4 || !mp4_track_ || !decoder_ || !seq_started_ || audio_stream_) return false;
+  if (seq_flushed_ && !seq_one_to_one_) return false;   // (a decoder that reorders gave its last pictures early: it cannot go on from there)
+  media::Mp4File* next = mp4_ == &mp4_a_ ? &mp4_b_ : &mp4_a_;
+  next->clear();
+  const auto refuse = [&]() {
+    next->clear();
+    return false;
+  };
+  if (!next->open(source)) return refuse();
+  const media::Mp4Track* track = next->find(media::Mp4TrackKind::Video);
+  const media::Mp4Track& old = *mp4_track_;
+  if (!track || track->sample_count == 0 || track->timescale == 0 || track->codec != old.codec || track->width != old.width || track->height != old.height ||
+      track->config.size() != old.config.size() || !track->config.equals(old.config))
+    return refuse();
+  if (!(track->sync.empty() || track->sync[0])) return refuse();
+  // The display position (of the old file) the new file's first sample is: the one with its time.
+  const int64_t first_us = (track->dts[0] + (track->cts_offsets.empty() ? 0 : track->cts_offsets[0]) - track->skip) * 1000000 / track->timescale + shift_us;
+  const uint32_t old_count = static_cast<uint32_t>(seq_dec_of_rank_.count());
+  uint32_t rank = frame_at_time(first_us + 2);   // (the times were rounded down to microseconds, each file's by itself)
+  if (rank >= old_count || seq_times_[rank] > first_us + 2 || seq_times_[rank] < first_us - 2) return refuse();
+  const uint32_t decode = seq_dec_of_rank_[rank];
+  // It is a sync sample there, with nothing before it shown after it and nothing after it shown before it; and the samples from it on are the new file's.
+  if (!seq_sync_[decode] || rank != decode || seq_fed_ < decode || seq_next_rank_ < rank || current_frame_ < rank) return refuse();
+  const uint32_t kept = old_count - decode;
+  if (track->sample_count < kept) return refuse();
+  for (uint32_t i = decode; i < old_count; ++i)
+    if (seq_rank_of_dec_[i] < rank || old.sizes[i] != track->sizes[i - decode]) return refuse();
+  const uint32_t fed = seq_fed_ - decode, next_rank = seq_next_rank_ - rank, current = current_frame_ - rank;
+  const bool one_to_one = seq_one_to_one_, flushed = seq_flushed_;
+  seq_clear();
+  if (!seq_build_mp4(*track)) {   // (out of memory: nothing is left to play)
+    release();
+    return false;
+  }
+  mp4_->clear();
+  mp4_ = next;
+  source_ = &source;
+  seq_fed_ = fed;
+  seq_next_rank_ = next_rank;
+  seq_started_ = true;
+  seq_one_to_one_ = one_to_one;
+  seq_flushed_ = flushed;
+  current_frame_ = current;
+  duration_us_ = seq_times_[seq_times_.count() - 1];
+  base_position_us_ -= shift_us;
+  paused_position_us_ -= shift_us;
+  if (paused_position_us_ < 0) paused_position_us_ = 0;
+  publish_clock();
   return true;
 }
 
@@ -740,6 +861,7 @@ bool VideoPlayer::play() {
   state_ = VideoState::Playing;
   rebase(paused_position_us_);
   if (audio_player_) audio_player_->play();
+  publish_clock();
   return true;
 }
 
@@ -749,6 +871,7 @@ void VideoPlayer::pause() {
   paused_position_us_ = position_locked();
   state_ = VideoState::Paused;
   if (audio_player_) audio_player_->pause();
+  publish_clock();
 }
 
 void VideoPlayer::seek(int64_t time_us) {
@@ -760,6 +883,7 @@ void VideoPlayer::seek(int64_t time_us) {
   paused_position_us_ = time_us;
   rebase(time_us);
   if (audio_player_) audio_player_->seek(static_cast<uint64_t>(time_us) * audio_player_->sample_rate() / 1000000);
+  publish_clock();
 }
 
 void VideoPlayer::stop() {
@@ -770,6 +894,7 @@ void VideoPlayer::stop() {
   show_frame(0);
   paused_position_us_ = 0;
   rebase(0);
+  publish_clock();
 }
 
 void VideoPlayer::set_looping(bool looping) {
@@ -780,7 +905,10 @@ void VideoPlayer::set_looping(bool looping) {
 
 void VideoPlayer::update() {
   kernel::ScopedMutex guard(mutex_);
-  if (state_ != VideoState::Playing) return;
+  if (state_ != VideoState::Playing) {
+    publish_clock();   // (whatever was opened, closed or changed since is known to the other threads by now at the latest)
+    return;
+  }
   if (audio_player_) audio_player_->update();
   const int64_t position = position_locked();
   const uint32_t target = frame_at_time(position);
@@ -793,18 +921,25 @@ void VideoPlayer::update() {
         audio_player_->seek(0);
         audio_player_->play();
       }
+      publish_clock();
       return;
     }
     state_ = VideoState::Stopped;  // the end: the last picture stays up
     paused_position_us_ = duration_us_;
     if (audio_player_) audio_player_->stop();
   }
+  publish_clock();
 }
 
 bool VideoPlayer::start_service() {
   if (service_) return true;
   stop_ = false;
+  {
+    kernel::ScopedMutex guard(mutex_);
+    publish_clock();
+  }
   service_ = kernel::spawn(service_main, this, "video");
+  __atomic_store_n(&service_running_, service_ != nullptr, __ATOMIC_RELEASE);
   return service_ != nullptr;
 }
 
@@ -813,6 +948,7 @@ void VideoPlayer::stop_service() {
   __atomic_store_n(&stop_, true, __ATOMIC_RELEASE);
   kernel::join(service_);
   service_ = nullptr;
+  __atomic_store_n(&service_running_, false, __ATOMIC_RELEASE);
 }
 
 void VideoPlayer::service_main(void* self) {

@@ -1122,7 +1122,44 @@ static void test_jit_scripts() {
   }
 }
 
+// Functions with many names and many constants: the compiler answers those from hash indexes (FuncState::latest, Compiler::constant_string) instead of
+// searching its lists, and the rules of shadowing have to come out the same as in a small function.
+static void test_large_scopes() {
+  std::string vars, sum, strings;
+  for (int i = 0; i < 300; ++i) {
+    vars += "var v" + std::to_string(i) + " = " + std::to_string(i) + ";";
+    sum += (i ? " + v" : "v") + std::to_string(i);
+    strings += (i ? " + o['k" : "o['k") + std::to_string(i % 150) + "']";   // (each name twice: the second use finds the constant of the first)
+  }
+  const auto in_big = [&](const std::string& body) { return "(function () {" + vars + body + "})()"; };
+  CHECK(is(in_big("return " + sum + ";").c_str(), "44850"));
+  // a later binding of a name hides the earlier one, and shows it again when its block ends
+  CHECK(is(in_big("var r = []; { let v7 = 'block'; r.push(v7); { let v7 = 'inner'; r.push(v7); } r.push(v7); } r.push(v7); return r.join();").c_str(), "block,inner,block,7"));
+  CHECK(is(in_big("var r = []; for (let v3 = 0; v3 < 2; v3++) { let v4 = 'x' + v3; r.push(v4); } r.push(v3, v4); return r.join();").c_str(), "x0,x1,3,4"));
+  CHECK(is(in_big("try { throw 'thrown'; } catch (v9) { var seen = v9; } return seen + v9;").c_str(), "thrown9"));
+  // a var declared again is the same variable; a function declaration takes the name; a let declared twice in one block is an error
+  CHECK(is(in_big("var v5; var v5 = v5 + 1; function v6() { return 'f'; } return v5 + typeof v6;").c_str(), "6number"));
+  CHECK(eval(in_big("{ let a = 1; let a = 2; }").c_str()).find("ERR: SyntaxError: Identifier has already been declared") == 0);
+  CHECK(eval(in_big("{ let v15 = 1; let v15 = 2; }").c_str()).find("ERR: SyntaxError: Identifier has already been declared") == 0);
+  CHECK(is(in_big("{ let v15 = 1; } { let v15 = 2; } let fresh = 'lexical'; return v15 + fresh;").c_str(), "15lexical"));
+  CHECK(is(in_big("{ let a = 1; { let a = 2; } return a; }").c_str(), "1"));
+  // inner functions see the names (through the index of the outer function), their own parameters and variables first
+  CHECK(is(in_big("function f(v1, extra) { var v2 = 'own'; return v0 + v1 + v2 + v299 + extra; } return f('p', '!');").c_str(), "0pown299!"));
+  CHECK(is(in_big("var f = function () { return function () { return v150 + v151; }; }; v150 = 1000; return f()();").c_str(), "1151"));
+  // `arguments` is bound at the front of the function when it is first used (the bindings after it move), a named function expression's own name too
+  CHECK(is(in_big("var first = v8; var n = arguments.length; return first + v8 + n + v298;").c_str(), "314"));
+  CHECK(is(("(function self(a) {" + vars + "return typeof self + arguments[0] + v10 + a; })('z')").c_str(), "functionz10z"));
+  // with and eval look names up in an object first, then in the function
+  CHECK(is(in_big("var o = { v11: 'object' }; with (o) { var w = v11 + v12; } return w + v11;").c_str(), "object1211"));
+  CHECK(is(in_big("eval('var fresh = v13 + 1; v14 = 99;'); return fresh + v14;").c_str(), "113"));
+  // many string constants in one function
+  CHECK(is(("(function () { var o = {}; for (var i = 0; i < 150; i++) o['k' + i] = i; return " + strings + "; })()").c_str(), "22350"));
+  // a global program with many names
+  CHECK(is((vars + "let gl = v20; { let gl = v21; } gl + v299").c_str(), "319"));
+}
+
 static void run_all() {
+  test_large_scopes();
   test_expressions();
   test_variables_and_functions();
   test_control_flow();
