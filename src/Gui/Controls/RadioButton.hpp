@@ -74,9 +74,11 @@ class RadioButton : public Control {
   void on_mouse_move(const MouseArgs& args) override;
   void on_mouse_up(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
+  void access_activate(uint32_t label) override;
 
  protected:
   Size default_size() const override { return {kCircle + kGap + Painter::text_width(text_.view()) + 4, 20}; }
+  StringView access_text() const override { return text_.view(); }
 
  private:
   friend class RadioGroup;

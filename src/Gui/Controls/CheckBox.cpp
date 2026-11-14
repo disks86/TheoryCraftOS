@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Controls/CheckBox.hpp"
+#include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace gui {
@@ -27,6 +28,11 @@ void CheckBox::set_checked(bool checked) {
   checked_ = checked;
   invalidate();
   fire(changed_);
+}
+
+void CheckBox::access_activate(uint32_t) {
+  if (Window* w = window()) w->set_focus(this);
+  toggle();
 }
 
 void CheckBox::paint(Painter& painter) {
@@ -46,6 +52,7 @@ void CheckBox::paint(Painter& painter) {
   const int32_t text_x = kBox + kGap;
   const int32_t text_y = (h - Painter::kGlyphHeight) / 2;
   painter.text(text_x, text_y, text_.view(), enabled() ? t.text : t.disabled_text);
+  painter.underline(text_x, text_y, text_.view(), access_index(0), enabled() ? t.text : t.disabled_text);
   if (focused() && text_.size() > 0)
     painter.focus_frame({text_x - 2, text_y - 2, static_cast<uint32_t>(Painter::text_width(text_.view()) + 4), static_cast<uint32_t>(Painter::kGlyphHeight + 4)});
   else if (focused())

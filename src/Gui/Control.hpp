@@ -175,6 +175,25 @@ class Control {
   virtual void on_drag_over(StringView /*text*/, int32_t /*x*/, int32_t /*y*/, const Control* /*source*/) {}
   virtual void on_drag_leave() {}
 
+  // --- Access keys (see AccessKey.hpp). A control with a text label has one: the frame it is in hands the letters out (Frame::assign_access_keys),
+  // the control underlines the letter it was given, and Alt+letter runs access_activate(). Most controls have one label (access_text());
+  // a menu bar has one per title and overrides the indexed functions.
+  virtual uint32_t access_label_count() const { return access_text().empty() ? 0 : 1; }
+  virtual StringView access_label(uint32_t /*label*/) const { return access_text(); }
+  // The letter the label asks for (0: whatever the rule gives it).
+  virtual char access_key_wanted(uint32_t /*label*/) const { return access_wanted_; }
+  // Where in the label the underlined letter is (-1: the label has no access key).
+  virtual void set_access_index(uint32_t /*label*/, int32_t index) { access_index_ = static_cast<int16_t>(index); }
+  virtual int32_t access_index(uint32_t /*label*/) const { return access_index_; }
+  // What Alt+letter does: a button is pressed, a check box toggled, a label moves the focus to the control after it.
+  virtual void access_activate(uint32_t /*label*/) {}
+  // Asks for a letter of the label instead of the automatic one (0: automatic again).
+  void set_access_key(char key) { UiGuard lock(this); access_wanted_ = key; invalidate(); }
+  // Alt+`letter` (lower case) was pressed while this control, or one inside it, has the focus: true if it was used (a frame looks for the label).
+  virtual bool on_access_key(char /*letter*/) { return false; }
+  // F10: opens the first menu of a menu bar. True if this control did.
+  virtual bool enter_menu() { return false; }
+
   // The deepest visible control under (x, y) (this control's coordinates), or nullptr.
   Control* hit_test(int32_t x, int32_t y);
   // True for a control the pointer passes through (a tooltip): hit_test() never returns it, only the controls inside it.
@@ -193,6 +212,8 @@ class Control {
   void fire(const Handler& handler);
 
   virtual Size default_size() const { return {0, 0}; }
+  // The label that carries this control's access key (empty: it has none).
+  virtual StringView access_text() const { return StringView(); }
   // Moves `child` to the end of the child list: painted last (on top) and hit first.
   bool move_child_to_front(Control* child);
   // Moves `child` directly above (painted after) or below `anchor`, another child. False if either is not a child.
@@ -219,6 +240,8 @@ class Control {
   Size size_;
   Insets padding_;
   bool visible_ = true, enabled_ = true, hovered_ = false, focused_ = false;
+  char access_wanted_ = 0;
+  int16_t access_index_ = -1;
 };
 
 }  // namespace gui

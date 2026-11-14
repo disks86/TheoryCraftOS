@@ -56,8 +56,10 @@ class Painter {
   // The same for an image that lives on a graphics device (see IRenderer2D::draw_device_image); false, and nothing drawn, if the renderer cannot take it where it is.
   bool device_image(graphics::IGraphicsDevice& owner, graphics::IImage& image, const Rect2D& source_rect, int32_t x, int32_t y);
   void text(int32_t x, int32_t y, StringView text, uint32_t color);
-  // Centered in `r`, both ways.
-  void text_centered(const Rect2D& r, StringView text, uint32_t color);
+  // Centered in `r`, both ways. `access_index` (a byte offset into the text, -1: none) is the letter to underline as the access key.
+  void text_centered(const Rect2D& r, StringView text, uint32_t color, int32_t access_index = -1);
+  // The line under the access key of a text drawn at (x, y): the character at byte offset `index` (nothing if it is outside the text).
+  void underline(int32_t x, int32_t y, StringView text, int32_t index, uint32_t color);
   // A dotted-looking focus frame.
   void focus_frame(const Rect2D& r);
 

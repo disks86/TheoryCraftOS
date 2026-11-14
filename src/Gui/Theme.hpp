@@ -38,6 +38,13 @@ struct Theme {
   uint32_t title_text = 0xFFFFFFFF;
   uint32_t inactive_title = 0xFF808080;
   uint32_t inactive_title_text = 0xFFC0C0C0;
+  // The badge of a message, by its kind, each with the colour of the symbol on it. The symbol tells the kinds apart; the colour only adds to it.
+  uint32_t information = 0xFF1565C0;
+  uint32_t information_text = 0xFFFFFFFF;
+  uint32_t warning = 0xFFF9C02D;
+  uint32_t warning_text = 0xFF000000;
+  uint32_t error = 0xFFC62828;
+  uint32_t error_text = 0xFFFFFFFF;
 };
 
 }  // namespace gui

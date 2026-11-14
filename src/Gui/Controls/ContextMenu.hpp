@@ -32,7 +32,8 @@ namespace gui {
 
 class ContextMenu : public Control, public MenuHost {
  public:
-  explicit ContextMenu(allocators::IAllocator& allocator) : Control(allocator), menu_(allocator, this), popup_(allocator, *this) {}
+  // (A context menu does not show the shortcut keys of its items: those belong in the menu bar.)
+  explicit ContextMenu(allocators::IAllocator& allocator) : Control(allocator), menu_(allocator, this), popup_(allocator, *this) { popup_.set_show_shortcuts(false); }
 
   // The items; the returned item stays valid for the life of the menu (set `enabled` / `checked` on it any time).
   MenuItem* add_item(StringView text, Handler on_click = {}, StringView shortcut = {}) { return menu_.add_item(text, on_click, shortcut); }

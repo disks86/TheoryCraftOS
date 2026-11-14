@@ -79,6 +79,24 @@ bool Menu::remove_item(MenuItem* item) {
   return true;
 }
 
+void Menu::assign_access_keys() {
+  UiGuard lock(owner_);
+  AccessKeys keys;
+  for (MenuItem* item : items_.view()) item->access_index = AccessKeys::kNone;
+  for (MenuItem* item : items_.view())   // the letters that were asked for first
+    if (!item->separator && item->access_key) item->access_index = keys.claim(item->text.view(), item->access_key);
+  for (MenuItem* item : items_.view())
+    if (!item->separator && item->access_index == AccessKeys::kNone) item->access_index = keys.pick(item->text.view());
+}
+
+MenuItem* Menu::item_for_access_key(char letter) const {
+  const char wanted = AccessKeys::fold(letter);
+  if (!wanted) return nullptr;
+  for (MenuItem* item : items_.view())
+    if (!item->separator && item->enabled() && AccessKeys::key_of(item->text.view(), item->access_index) == wanted) return item;
+  return nullptr;
+}
+
 // --- MenuPopup -----------------------------------------------------------------
 
 namespace {
@@ -106,7 +124,7 @@ Size MenuPopup::default_size() const {
   for (uint32_t i = 0; menu_ && i < menu_->item_count(); ++i) {  // the size of the whole menu: it does not shrink while filtered
     const MenuItem* it = menu_->item(i);
     height += row_height(i);
-    const int32_t t = Painter::text_width(it->text.view()), s = Painter::text_width(it->shortcut.view());
+    const int32_t t = Painter::text_width(it->text.view()), s = show_shortcuts_ ? Painter::text_width(it->shortcut.view()) : 0;
     if (t > text) text = t;
     if (s > shortcut) shortcut = s;
   }
@@ -161,7 +179,8 @@ void MenuPopup::paint(Painter& painter) {
       painter.line(10, top + 12, 15, top + 6, color);
     }
     painter.text(22, ty, it->text.view(), color);
-    if (!it->shortcut.empty()) painter.text(w - 10 - Painter::text_width(it->shortcut.view()), ty, it->shortcut.view(), color);
+    if (!searchable_) painter.underline(22, ty, it->text.view(), it->access_index, color);
+    if (show_shortcuts_ && !it->shortcut.empty()) painter.text(w - 10 - Painter::text_width(it->shortcut.view()), ty, it->shortcut.view(), color);
   }
   if (searchable_) {
     const int32_t w = static_cast<int32_t>(bounds_.width), top = static_cast<int32_t>(bounds_.height) - kSearchHeight;
@@ -266,6 +285,9 @@ bool MenuPopup::on_key(const KeyArgs& args) {
       host_.close_menu();
       break;
     default:
+      // the access key of an item runs it
+      if (!searchable_ && menu_ && !(args.modifiers & modifier::kControl) && args.usage >= key::kA && args.usage < key::kA + 26)
+        if (MenuItem* item = menu_->item_for_access_key(static_cast<char>('a' + (args.usage - key::kA)))) host_.activate(item);
       break;
   }
   return true;
@@ -325,7 +347,7 @@ void MenuBar::paint(Painter& painter) {
     const bool lit = i == open_;
     if (lit) painter.fill(r, t.selection);
     else if (i == hot_ && open_ < 0) painter.bevel(r, false);
-    painter.text_centered(r, menus_[static_cast<uint64_t>(i)]->title(), lit ? t.selection_text : t.text);
+    painter.text_centered(r, menus_[static_cast<uint64_t>(i)]->title(), lit ? t.selection_text : t.text, menus_[static_cast<uint64_t>(i)]->title_access_index_);
   }
 }
 
@@ -352,6 +374,20 @@ void MenuBar::switch_menu(int32_t direction) {
   if (n == 0 || open_ < 0) return;
   open_menu((open_ + direction + n) % n);
   popup_.highlight_first();
+}
+
+void MenuBar::access_activate(uint32_t label) {
+  UiGuard lock(this);
+  if (label >= menus_.count()) return;
+  open_menu(static_cast<int32_t>(label));
+  if (open_ == static_cast<int32_t>(label)) popup_.highlight_first();
+}
+
+bool MenuBar::enter_menu() {
+  UiGuard lock(this);
+  if (menus_.count() == 0 || !window() || !effectively_enabled()) return false;
+  access_activate(0);
+  return open_ == 0;
 }
 
 void MenuBar::activate(MenuItem* item) {

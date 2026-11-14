@@ -31,6 +31,8 @@ constexpr uint32_t kTabStop = static_cast<uint32_t>(TextEditor::kTabWidth);
 TextEditor::TextEditor(allocators::IAllocator& allocator)
     : Control(allocator),
       context_(allocator),
+      undo_(allocator),
+      redo_(allocator),
       text_(allocator),
       clipboard_(allocator),
       scratch_(allocator),
@@ -52,6 +54,8 @@ TextEditor::TextEditor(allocators::IAllocator& allocator)
 void TextEditor::opening(void* self, Control&) {
   auto* e = static_cast<TextEditor*>(self);
   if (!e->cut_item_) {
+    e->undo_item_ = e->context_.add_item("Undo", {&TextEditor::run_undo, e}, "Ctrl+Z");
+    e->context_.add_separator();
     e->cut_item_ = e->context_.add_item("Cut", {&TextEditor::run_cut, e}, "Ctrl+X");
     e->copy_item_ = e->context_.add_item("Copy", {&TextEditor::run_copy, e}, "Ctrl+C");
     e->paste_item_ = e->context_.add_item("Paste", {&TextEditor::run_paste, e}, "Ctrl+V");
@@ -61,6 +65,7 @@ void TextEditor::opening(void* self, Control&) {
   }
   kernel::Clipboard* clipboard = e->clipboard();
   const bool can_paste = clipboard ? clipboard->has_text() : !e->clipboard_.empty();
+  e->undo_item_->set_enabled(e->can_undo() && !e->read_only_);
   e->cut_item_->set_enabled(e->has_selection() && !e->read_only_);
   e->copy_item_->set_enabled(e->has_selection());
   e->paste_item_->set_enabled(can_paste && !e->read_only_);
@@ -68,6 +73,7 @@ void TextEditor::opening(void* self, Control&) {
   e->select_item_->set_enabled(!e->text_.empty());
 }
 
+void TextEditor::run_undo(void* self, Control&) { static_cast<TextEditor*>(self)->undo(); }
 void TextEditor::run_cut(void* self, Control&) { static_cast<TextEditor*>(self)->cut_selection(); }
 void TextEditor::run_copy(void* self, Control&) { static_cast<TextEditor*>(self)->copy_selection(); }
 void TextEditor::run_paste(void* self, Control&) { static_cast<TextEditor*>(self)->paste(); }
@@ -170,6 +176,9 @@ bool TextEditor::set_text(StringView text) {
   wanted_column_ = -1;
   top_line_ = left_column_ = 0;
   modified_ = false;
+  undo_.clear();
+  redo_.clear();
+  last_edit_ = Edit::None;
   rebuild_lines();
   update_scroll_bars();
   invalidate();
@@ -185,8 +194,15 @@ bool TextEditor::replace(uint32_t from, uint32_t to, StringView with) {
   if (!next.reserve(text_.size() - (to - from) + with.size()) || !next.append(text_.view().first(from)) || !next.append(with) ||
       !next.append(text_.view().without_prefix(to)))
     return false;
+  // What Undo goes back to: the text before this change, unless the change carries on a run of typing (or of erasing) where the last one stopped.
+  const Edit kind = with.size() == 1 && from == to && with[0] != '\n' ? Edit::Typing : with.empty() && to - from == 1 ? Edit::Erasing : Edit::Other;
+  const bool joins = kind != Edit::Other && kind == last_edit_ && caret_ == last_edit_caret_ && anchor_ == caret_ && undo_.count() > 0;
+  if (!joins) (void)remember(&undo_);   // (out of memory: the change is still made, it just cannot be taken back)
+  redo_.clear();
   text_ = util::move(next);
   caret_ = anchor_ = from + static_cast<uint32_t>(with.size());
+  last_edit_ = kind;
+  last_edit_caret_ = caret_;
   wanted_column_ = -1;
   modified_ = true;
   rebuild_lines();
@@ -195,6 +211,60 @@ bool TextEditor::replace(uint32_t from, uint32_t to, StringView with) {
   fire(changed_);
   fire(moved_);
   return true;
+}
+
+bool TextEditor::remember(List<Snapshot>* history) {
+  Snapshot now(allocator());
+  if (!now.text.assign(text_.view())) return false;
+  now.caret = caret_;
+  now.anchor = anchor_;
+  now.modified = modified_;
+  if (!history->push_back(util::move(now))) return false;
+  trim(history);
+  return true;
+}
+
+// Forgets the oldest changes while there are too many of them or they hold too much text. One is always kept.
+void TextEditor::trim(List<Snapshot>* history) {
+  uint64_t bytes = 0;
+  for (const Snapshot& s : history->view()) bytes += s.text.size();
+  while (history->count() > 1 && (history->count() > kMaxUndoSteps || bytes > kMaxUndoBytes)) {
+    bytes -= (*history)[0].text.size();
+    history->remove_at(0);
+  }
+}
+
+// Puts back the newest state of `from`, after remembering the present one in `to` (undo: from the undo history to the redo history; redo: the other way).
+bool TextEditor::swap_with(List<Snapshot>* from, List<Snapshot>* to) {
+  UiGuard lock(this);
+  if (read_only_ || from->count() == 0 || !remember(to)) return false;
+  Snapshot& back = (*from)[from->count() - 1];
+  text_ = util::move(back.text);
+  caret_ = back.caret;
+  anchor_ = back.anchor;
+  modified_ = back.modified;
+  from->remove_at(from->count() - 1);
+  last_edit_ = Edit::None;
+  wanted_column_ = -1;
+  rebuild_lines();
+  ensure_caret_visible();
+  invalidate();
+  fire(changed_);
+  fire(moved_);
+  return true;
+}
+
+bool TextEditor::undo() { return swap_with(&undo_, &redo_); }
+bool TextEditor::redo() { return swap_with(&redo_, &undo_); }
+
+// The text as it is now is what the file holds: every other state in the history differs from the file.
+void TextEditor::mark_saved() {
+  UiGuard lock(this);
+  modified_ = false;
+  for (Snapshot& s : undo_.view()) s.modified = true;
+  for (Snapshot& s : redo_.view()) s.modified = true;
+  last_edit_ = Edit::None;
+  fire(moved_);
 }
 
 bool TextEditor::insert_text(StringView text) {
@@ -428,6 +498,13 @@ bool TextEditor::on_key(const KeyArgs& args) {
       case 0x49:  // Ctrl+Insert
         copy_selection();
         return true;
+      case key::kA + 25:  // Z (with Shift: redo)
+        if (shift) redo();
+        else undo();
+        return true;
+      case key::kA + 24:  // Y
+        redo();
+        return true;
       default:
         break;
     }
@@ -487,7 +564,7 @@ bool TextEditor::on_key(const KeyArgs& args) {
       break;
   }
   const char c = args.character;
-  if (c >= 32 && c < 127 && !ctrl) {
+  if (c >= 32 && c < 127 && !ctrl && !(args.modifiers & (modifier::kLeftAlt | modifier::kRightAlt))) {   // (Alt+letter is an access key, not typing)
     replace(selection_start(), selection_end(), StringView(&c, 1));
     return true;
   }

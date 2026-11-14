@@ -23,7 +23,8 @@
 namespace gui {
 
 // A push button: pressed with the left mouse button (the click happens when it is released over the
-// button) or with Space/Enter while it has the focus.
+// button) or with Space/Enter while it has the focus, or with Alt and its access key (the underlined letter: see AccessKey.hpp; OK and Cancel have
+// none, Enter and Escape are their keys). The default button of a dialog (set_default) has a heavier outline: it is the one Enter presses.
 class Button : public Control {
  public:
   explicit Button(allocators::IAllocator& allocator) : Control(allocator), text_(allocator) {}
@@ -36,6 +37,10 @@ class Button : public Control {
     if (enabled()) fire(click_);
   }
 
+  // Marks the button as the one Enter presses in its dialog (drawn with a heavier outline). The dialog still does the pressing.
+  void set_default(bool is_default) { UiGuard lock(this); default_ = is_default; invalidate(); }
+  bool is_default() const { return default_; }
+
   bool focusable() const override { return true; }
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
@@ -43,9 +48,13 @@ class Button : public Control {
   void on_mouse_up(const MouseArgs& args) override;
   void on_mouse_leave() override {}
   bool on_key(const KeyArgs& args) override;
+  void access_activate(uint32_t label) override;
 
  protected:
   Size default_size() const override { return {Painter::text_width(text_.view()) + 24, 24}; }
+  StringView access_text() const override {
+    return text_.view().equals("OK") || text_.view().equals("Cancel") ? StringView() : text_.view();
+  }
 
  private:
   bool inside(const MouseArgs& a) const { return contains({0, 0, bounds_.width, bounds_.height}, a.x, a.y); }
@@ -54,6 +63,7 @@ class Button : public Control {
   Handler click_;
   bool held_ = false;     // the left button went down on us and is still down
   bool pressed_ = false;  // held_ and the pointer is over us
+  bool default_ = false;
 };
 
 }  // namespace gui

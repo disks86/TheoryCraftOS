@@ -1086,17 +1086,17 @@ static void test_notice_dialog() {
     CHECK(!NoticeDialog::post(nullptr, &mgr, NoticeKind::Error, "x") && !NoticeDialog::post(&notice, nullptr, NoticeKind::Error, "x"));
     CHECK(NoticeDialog::post(&notice, &mgr, NoticeKind::Error, "Cannot open /a: not found") && notice.showing() && notice.modal() && mgr.has_modal());
     w.layout();
-    CHECK(notice.title().equals("Error") && notice.kind() == NoticeKind::Error && notice.line_label(0).text().equals("Cannot open /a: not found"));
+    CHECK(notice.title().equals(doc.title()) && !notice.title().empty() && notice.kind() == NoticeKind::Error && notice.line_label(0).text().equals("Cannot open /a: not found"));
     CHECK(!notice.minimize_enabled() && !notice.maximize_enabled() && !doc.enabled() && w.focus() == &notice.ok_button());
     // A second notice while it is open replaces the text.
     CHECK(notice.show(mgr, NoticeKind::Warning, "Be careful") && mgr.window_count() == 2);
-    CHECK(notice.title().equals("Warning") && notice.line_label(0).text().equals("Be careful"));
+    CHECK(notice.title().equals(doc.title()) && notice.line_label(0).text().equals("Be careful"));
     w.render();
     // OK dismisses it and re-enables what was under it.
     click_center(w, notice.ok_button());
     CHECK(!notice.showing() && dismissed.calls == 1 && !mgr.has_modal() && doc.enabled());
     // Enter and Escape dismiss it too.
-    CHECK(notice.show(mgr, NoticeKind::Information, "Done") && notice.title().equals("Information"));
+    CHECK(notice.show(mgr, NoticeKind::Information, "Done", "Printer") && notice.title().equals("Printer"));
     press(w, key::kEnter);
     CHECK(!notice.showing() && dismissed.calls == 2);
     CHECK(notice.show(mgr, NoticeKind::Error, "Again"));
