@@ -42,6 +42,7 @@ struct MonitorState {
   bool work_set = false;
   uint32_t registry_width = 0, registry_height = 0;
   Rect rects[kMaxMonitors], works[kMaxMonitors];
+  uint32_t scales[kMaxMonitors] = {};      // each monitor's scale (percent; 0: the system's): monitors at different scales
   uint32_t count = 0;
 };
 MonitorState g_monitor;
@@ -362,14 +363,15 @@ Rect virtual_screen_rect() {
   return u;
 }
 
-bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works) {
-  if (rects.size() != works.size() || rects.size() > kMaxMonitors) return false;
+bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works, ArrayView<const uint32_t> scales) {
+  if (rects.size() != works.size() || rects.size() > kMaxMonitors || (scales.size() != 0 && scales.size() != rects.size())) return false;
   for (uint64_t i = 0; i < rects.size(); ++i)
     if (rects[i].left >= rects[i].right || rects[i].top >= rects[i].bottom || overlap(rects[i], works[i]) == 0) return false;
   g_monitor.count = uint32_t(rects.size());
   for (uint64_t i = 0; i < rects.size(); ++i) {
     g_monitor.rects[i] = rects[i];
     g_monitor.works[i] = works[i];
+    g_monitor.scales[i] = scales.size() != 0 ? scales[i] : 0;
   }
   g_monitor.work_set = false;
   return true;
@@ -413,7 +415,17 @@ uint32_t monitor_from_rect(const Rect& rect, uint32_t flags) {
 
 uint32_t monitor_from_point(int32_t x, int32_t y, uint32_t flags) { return monitor_from_rect(Rect{x, y, x, y}, flags); }
 
-uint32_t dpi_for_monitor(uint32_t monitor) { return is_monitor(monitor) ? system_dpi() : 0; }
+uint32_t dpi_for_monitor(uint32_t monitor) {
+  if (!is_monitor(monitor)) return 0;
+  const uint32_t k = g_monitor.count ? g_monitor.scales[index_of(monitor)] : 0;
+  return k != 0 ? 96 * k / 100 : system_dpi();      // (monitors at different scales: its own)
+}
+
+uint32_t monitor_scale_at(int32_t x, int32_t y) {
+  if (!g_monitor.count) return 0;
+  const uint32_t m = monitor_from_point(x, y, 2 /* MONITOR_DEFAULTTONEAREST */);
+  return is_monitor(m) ? g_monitor.scales[index_of(m)] : 0;
+}
 
 Rect monitor_rect(uint32_t monitor, bool work_area) {
   if (!is_monitor(monitor)) return Rect{};

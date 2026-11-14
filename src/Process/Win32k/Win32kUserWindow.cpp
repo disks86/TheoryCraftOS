@@ -913,7 +913,7 @@ uint64_t nt_set_window_display_affinity(Call& call) { Window* w = window_arg(cal
 // GetDpiForWindow: an unaware window works at 96 dpi (DPI virtualization), a system-aware one at the system DPI it started at, a per-monitor aware one
 // at the monitor's.
 uint32_t window_dpi(Window* w) {
-  if (w && (w->dpi_virtual || (w->dpi_context & 0x0F) == 1)) return window_working_dpi(w);
+  if (w) return window_working_dpi(w);      // (per-monitor aware: the monitor it is on)
   return user_misc::dpi_for_monitor(user_misc::monitor_from_point(0, 0, 1));
 }
 

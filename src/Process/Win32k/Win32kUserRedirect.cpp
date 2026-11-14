@@ -57,16 +57,27 @@ RedirectConfig g_redirect;
 
 RedirectConfig& redirect_config() { return g_redirect; }
 
+void frame_of(const Window* top, int32_t* border, int32_t* title) {
+  if (top && top->monitor_scale != 0 && g_redirect.border_units != 0) {
+    *border = graphics::units_to_device(g_redirect.border_units, top->monitor_scale);
+    *title = graphics::units_to_device(g_redirect.border_units + g_redirect.title_units, top->monitor_scale) - *border;
+    return;
+  }
+  *border = g_redirect.frame_border;
+  *title = g_redirect.frame_title;
+}
+
 bool redirected(const Window* w) { return g_redirect.on && state_or_null() && on_desktop(w); }
 
 Rect surface_rect_screen(const Window* top) {
   Rect r = window_rect_screen(top);
   if (has_frame(top) && !(top->style & wn::WS_MINIMIZE)) {
-    const RedirectConfig& s = g_redirect;
-    r.left += s.frame_border;
-    r.right -= s.frame_border;
-    r.top += s.frame_border + s.frame_title;
-    r.bottom -= s.frame_border;
+    int32_t border = 0, title = 0;
+    frame_of(top, &border, &title);
+    r.left += border;
+    r.right -= border;
+    r.top += border + title;
+    r.bottom -= border;
   }
   if (r.right < r.left) r.right = r.left;
   if (r.bottom < r.top) r.bottom = r.top;
@@ -119,13 +130,15 @@ void drag_requested(const Window* top, uint32_t edge) {
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // The desktop's side
 
-void set_redirection(bool on, IWindowObserver* observer, int32_t frame_border, int32_t frame_title) {
+void set_redirection(bool on, IWindowObserver* observer, int32_t frame_border, int32_t frame_title, int32_t border_units, int32_t title_units) {
   LockGuard g;
   g_redirect.on = on;
   g_redirect.observer = on ? observer : nullptr;
   if (on) {
     g_redirect.frame_border = frame_border;
     g_redirect.frame_title = frame_title;
+    g_redirect.border_units = border_units;
+    g_redirect.title_units = title_units;
   }
 }
 
@@ -137,6 +150,7 @@ bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title) {
   if (!on_desktop(w) || w->destroying) return false;
   out->exists = true;
   out->surface_scale = window_scale(w);
+  out->monitor_scale = monitor_scale_of(w);
   out->dpi_aware = out->surface_scale == 100;
   out->visible = is_visible(w);
   out->minimized = (w->style & wn::WS_MINIMIZE) != 0;
@@ -222,6 +236,11 @@ void pointer_cursor(PointerCursor* out) {
 bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, uint32_t* width, uint32_t* height, int32_t* hot_x, int32_t* hot_y) {
   LockGuard g;
   return user_misc::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
+}
+
+uint32_t top_level_monitor_scale_locked(uint32_t hwnd) {
+  Window* w = state_or_null() ? find_window(hwnd) : nullptr;
+  return w ? monitor_scale_of(w) : device_scale_locked();
 }
 
 uint32_t top_level_surface_scale_locked(uint32_t hwnd) {

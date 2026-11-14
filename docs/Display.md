@@ -63,6 +63,24 @@ Clients are told the density through the root's `RESOURCE_MANAGER`: `Xft.dpi` (9
 client's own lines there stay. When the scale changes, each top-level keeps its place in units (its device rectangle times the change; a maximized or
 full-screen one fills its area again), clients hear `ConfigureNotify`, and `Xft.dpi` is updated.
 
+## Windows programs on monitors at different scales
+
+As on Windows, win32k's screen is then each monitor's own pixels (`DesktopBridge`'s monitor table): a monitor's top left is its place in units at
+the device scale, its size its units at its own scale. So a 200 % monitor A (units 0..800) and a 100 % monitor B beside it (units 800..1600) are
+pixels 0..1600 and 1600..2400. The bridge maps rectangles through the monitor at their centre and points through the monitor they are on (one
+scale for all monitors: exactly the mapping below). The system DPI is the primary monitor's; `GetDpiForMonitor` gives each monitor's.
+
+- A top-level follows the scale of the monitor its centre is on (`Window::monitor_scale`, `refresh_monitor_scale`, after every change the desktop
+  takes): its frame is the desktop's at that scale, and its DPI kind decides its coordinates there - an unaware window is scaled by the monitor, a
+  system-aware one by the monitor against its system DPI, a per-monitor aware one works in the monitor's pixels.
+- Moved by the desktop (a frame dragged to the other monitor), the window's units are kept, so its pixels are already the new monitor's: a
+  per-monitor aware window hears `WM_DPICHANGED` with the new DPI and the rectangle it has. Moved by the program (`SetWindowPos` in its pixels),
+  a per-monitor aware one is asked to take the new DPI at the new density (`WM_DPICHANGED` with its size times new / old, which DefWindowProc
+  applies) and any other is resized so that its size in its own coordinates stays, as Windows does.
+- An unaware or system-aware thread's coordinates (its calls, as `caller_scale`) follow the monitor of its window.
+- The desktop draws a window's surface 1:1 on the monitor whose scale is its pixels per unit there (`draw_window_scaled`), resampled on the others.
+- When the monitors change, every top-level goes back to where it was in units.
+
 ## Windows programs: DPI virtualization
 
 win32k works in device pixels (`src/Process/Win32k/Win32kUserDpi.cpp`). `DesktopBridge` multiplies what the desktop gives it by the device scale:
@@ -119,9 +137,11 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 
 ## Not done
 
-- Monitors at different scales: Windows and X programs are not told per monitor. They draw at the largest scale (Windows' DPI, the X server's
-  density), and their pictures are filtered down on the monitors at smaller scales. Per-monitor-aware Windows programs get no `WM_DPICHANGED` when
-  a window moves to another monitor. Wayland has one `wl_output` (its scale the largest), so `wl_surface.enter` names no monitor.
+- Monitors at different scales:
+  - X programs are not told per monitor (one screen, one `Xft.dpi`: the largest scale); their pictures are filtered down on smaller monitors.
+  - Wayland has one `wl_output` (its scale the largest), so `wl_surface.enter` names no monitor.
+  - Windows: an unaware or system-aware thread's coordinates follow the monitor of its first top-level there, so one program with windows on two
+    monitors of different scales sees one of them in the other's coordinates. Messages between programs are not converted.
 - With monitors at different scales the desktop is drawn on the CPU (a software renderer per monitor), as the monitor compositor's path was.
 - A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is 266 units for Wayland clients too: their logical
   coordinates are the protocol's, so a maximized one's buffer ends a device row short of the edge, where the desktop's background shows.
@@ -144,6 +164,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | `MonitorRenderers` (`test_monitor_renderers`): a 200 % and a 100 % monitor on one device, a rectangle across the seam on each at its density and place, the frame read back, a refused update keeping the views | `tests/run_host_tests.sh MonitorTest` |
 | Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor | `tests/run_host_tests.sh WaylandServerTest` |
 | The desktop on a 200 % and a 100 % monitor (`test_windows_mixed_scales`): a program window across the seam drawn 1:1 on the 200 % device and through units on the 100 % one | `tests/run_host_tests.sh GuiTest` |
+| Windows on a 200 % and a 100 % monitor (`test_per_monitor_dpi`): the screen 2400 x 1200, each monitor's DPI; a per-monitor aware window moved by the desktop to the 100 % monitor hears 96 dpi and keeps its rectangle, moved back by itself hears 192 at twice the size; its surface 1:1 on the 200 % device only; an unaware window keeps its size in its coordinates on both; the cursor both ways | `tests/run_host_tests.sh Win32kUserTest` |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |

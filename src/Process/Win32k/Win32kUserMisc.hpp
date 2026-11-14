@@ -195,7 +195,9 @@ Rect primary_monitor_rect();
 Rect virtual_screen_rect();
 bool set_monitor_work_area(const Rect& rect);
 // The monitors the kernel's desktop shows the programs on: their rectangles and work areas in screen coordinates, the primary first (at most 8). False for a bad list.
-bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works);
+bool set_monitors(ArrayView<const Rect> rects, ArrayView<const Rect> works, ArrayView<const uint32_t> scales = ArrayView<const uint32_t>());
+// Monitors at different scales: the scale (percent) of the monitor at or nearest the screen point, 0 when the monitors have no scales of their own.
+uint32_t monitor_scale_at(int32_t x, int32_t y);
 int32_t menu_item_count(uint32_t menu);                       // -1 for a handle that is not a menu
 bool get_menu_info(Call& call, uint32_t menu, uint64_t info);
 bool get_monitor_info(Call& call, uint32_t monitor, uint64_t info);

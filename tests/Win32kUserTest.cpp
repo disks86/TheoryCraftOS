@@ -1621,6 +1621,121 @@ void test_device_edge() {
   gdi::shutdown();
 }
 
+// Monitors at different scales: A at 200 % (units 0..800, the primary) and B at 100 % (units 800..1600). win32k's screen is each monitor's pixels
+// (A 0..1600, B 1600..2400); a window's DPI follows the monitor it is on.
+void test_per_monitor_dpi() {
+  Program aware_prog(102), unaware_prog(103);
+  Th a(aware_prog, 102, kScratch);
+  Th u(unaware_prog, 103, kScratch);
+  std::vector<Call_> heard;
+  auto logging = [&](Th& th, Call_& c) -> uint64_t {
+    if (c.msg == 0x2E0 /* WM_DPICHANGED */) heard.push_back(c);
+    return def_proc(th, c);
+  };
+  a.proc = logging;
+  u.proc = logging;
+  auto pump = [&](Th& th) {
+    Th::M m;
+    for (int i = 0; i < 64 && th.peek(&m); ++i) th.svc(N::NtUserDispatchMessage, {th.tmp(0xA00)});
+  };
+  DesktopBridge bridge;
+  bridge.attach(6, 19);
+  desktop::IWindowsSession::Monitor two[2];
+  two[0].rect = {0, 0, 800, 600};
+  two[0].work = {0, 0, 800, 600};
+  two[0].scale_percent = 200;
+  two[1].rect = {800, 0, 800, 600};
+  two[1].work = {800, 0, 800, 600};
+  two[1].scale_percent = 200;
+  two[1].monitor_scale = 100;
+  bridge.set_display(1600, 600, ArrayView<const desktop::IWindowsSession::Monitor>(two, 2));
+  CHECK(gdi::screen_width() == 2400 && gdi::screen_height() == 1200 && user_misc::system_dpi() == 192);
+  CHECK(user_misc::monitor_scale_at(100, 100) == 200 && user_misc::monitor_scale_at(1700, 100) == 100);
+  CHECK(user_misc::dpi_for_monitor(user_misc::monitor_from_point(1700, 100, 2)) == 96 && user_misc::dpi_for_monitor(user_misc::monitor_from_point(100, 100, 2)) == 192);
+  CHECK(a.svc32(N::NtUserSetProcessDpiAwarenessContext, {0x22, 0}) == 1);
+  CHECK(a.atom_class("PmClass") >= 0xC000 && u.atom_class("PmClass") >= 0xC000);
+
+  // a per-monitor aware window on A: 192 dpi
+  const uint32_t pm = a.create("PmClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 200, 600, 400, 0, 0, "Aware");
+  CHECK(pm != 0);
+  pump(a);
+  List<uint32_t> changed(*system_allocator());
+  List<desktop::IWindowsSession::Repaint> repainted(*system_allocator());
+  bridge.take_changes(&changed, &repainted);
+  CHECK(a.svc32(N::NtUserCallHwnd, {pm, 2 /* GetDpiForWindow */}) == 192);
+  // the desktop moves it to B: its frame's units there, at B's pixels; it hears WM_DPICHANGED with 96 dpi and keeps that rectangle
+  heard.clear();
+  bridge.move_window(pm, {900, 100, 300, 200});
+  pump(a);
+  bridge.take_changes(&changed, &repainted);
+  pump(a);
+  Rc wr = a.window_rect(pm);
+  CHECK(wr.l == 1700 && wr.t == 100 && wr.r == 2000 && wr.b == 300);
+  CHECK(heard.size() == 1 && heard.size() > 0 && (heard[0].wparam & 0xFFFF) == 96);
+  CHECK(a.svc32(N::NtUserCallHwnd, {pm, 2}) == 96);
+  desktop::WindowsWindowInfo info;
+  CHECK(bridge.window_info(pm, &info, nullptr) && info.window.x == 900 && info.window.width == 300 && info.window.height == 200);
+  // it moves itself back to A (its pixels, the size it had on B): it is asked to take 192 dpi at twice the size, and DefWindowProc does
+  heard.clear();
+  CHECK(a.svc32(N::NtUserSetWindowPos, {pm, 0, 100, 100, 300, 200, 0x14}) == 1);
+  pump(a);
+  bridge.take_changes(&changed, &repainted);
+  pump(a);
+  wr = a.window_rect(pm);
+  CHECK(wr.l == 100 && wr.t == 100 && wr.r == 700 && wr.b == 500);
+  CHECK(heard.size() == 1 && heard.size() > 0 && (heard[0].wparam & 0xFFFF) == 192);
+  CHECK(a.svc32(N::NtUserCallHwnd, {pm, 2}) == 192);
+  // its surface is A's pixels: on A's device 1:1, not on B's
+  {
+    std::vector<uint32_t> big(1600 * 1200, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(big.data(), big.size());
+    ts.width = ts.pitch = 1600;
+    ts.height = 1200;
+    graphics::SoftwareRenderer2D device(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(bridge.draw_window_scaled(pm, device, 0, 0, 200, &dw, &dh) && !bridge.draw_window_scaled(pm, device, 0, 0, 100, &dw, &dh));
+  }
+
+  // an unaware window keeps its size in its coordinates on either monitor (Windows enlarges it on A, not on B)
+  const uint32_t uw = u.create("PmClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 50, 50, 200, 150, 0, 0, "Unaware");
+  CHECK(uw != 0);
+  pump(u);
+  bridge.take_changes(&changed, &repainted);
+  wr = u.window_rect(uw);
+  CHECK(wr.r - wr.l == 200 && wr.b - wr.t == 150);
+  {
+    user::Window* x = user::find_window(uw);
+    CHECK(x && x->bounds.right - x->bounds.left == 400);      // (A's pixels)
+  }
+  bridge.move_window(uw, {1000, 50, 200, 150});
+  pump(u);
+  bridge.take_changes(&changed, &repainted);
+  pump(u);
+  wr = u.window_rect(uw);
+  CHECK(wr.r - wr.l == 200 && wr.b - wr.t == 150);
+  {
+    user::Window* x = user::find_window(uw);
+    CHECK(x && x->bounds.left == 1800 && x->bounds.right - x->bounds.left == 200);      // (B's pixels)
+  }
+  CHECK(bridge.window_info(uw, &info, nullptr) && info.window.x == 1000 && info.window.width == 200);
+
+  // the cursor: units in, the monitor's pixels inside, units back
+  bridge.mouse_position(1000, 100);
+  int32_t cx = 0, cy = 0;
+  user::cursor_position(&cx, &cy);
+  CHECK(cx == 1800 && cy == 100);
+  bridge.cursor(&cx, &cy);
+  CHECK(cx == 1000 && cy == 100);
+  bridge.mouse_position(400, 300);
+  user::cursor_position(&cx, &cy);
+  CHECK(cx == 800 && cy == 600);
+  bridge.detach();
+  user::set_device_scale_from_desktop(100);
+  user::reset_state();
+  gdi::shutdown();
+}
+
 void test_redirection() {
   Program prog(91);
   Th t(prog, 91, kScratch);
@@ -2032,5 +2147,6 @@ int main() {
   test_dpi_virtualization();
   test_system_aware_scale_change();
   test_device_edge();
+  test_per_monitor_dpi();
   return finish("Win32kUserTest");
 }
