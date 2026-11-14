@@ -77,7 +77,7 @@ class IWindowObserver {
   IWindowObserver() = default;
   ~IWindowObserver() = default;
 };
-void set_redirection(bool on, IWindowObserver* observer, int32_t frame_border, int32_t frame_title);
+void set_redirection(bool on, IWindowObserver* observer, int32_t frame_border, int32_t frame_title, int32_t border_units = 0, int32_t title_units = 0);
 struct TopLevelInfo {
   bool exists = false, visible = false, minimized = false, maximized = false, active = false;
   bool caption = false, sizable = false, minimize_box = false, maximize_box = false, tool = false, topmost = false;
@@ -88,6 +88,7 @@ struct TopLevelInfo {
   uint32_t icon = 0;         // the small icon to show: WM_SETICON's small or big one, else the class's
   uint64_t pid = 0;
   bool dpi_aware = false;    // its surface is in device pixels (surface_scale 100)
+  uint32_t monitor_scale = 100;      // the density (percent of the desktop's units) of win32k's pixels where the window is: its monitor's scale
   uint32_t surface_scale = 100;      // device pixels per surface pixel, in percent: the device scale for an unaware window, the ratio for a system-aware one
                                      // after the scale grew, 100 for one in device pixels
 };
@@ -95,6 +96,9 @@ bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
 // DPI virtualization (Win32kUserDpi.cpp): the desktop's device scale (percent, 100 .. 400); takes the lock. A change moves every
 // top-level so that it keeps its place in desktop units.
 void set_device_scale_from_desktop(uint32_t scale);
+// Monitors at different scales: a top-level that went somewhere follows the scale of the monitor it is on now (see Win32kUserDpi.cpp). Takes the lock.
+void refresh_monitor_scale(uint32_t hwnd, bool placed);
+void set_system_scale(uint32_t scale);      // the system's scale (the primary monitor's), moving nothing; takes the lock
 // For the services outside the window manager: the factor the calling thread's coordinates are divided by (1 when DPI aware or unscaled), and a
 // device-pixel rectangle / point as the caller sees it.
 uint32_t caller_dpi_scale(Call& call);
@@ -107,7 +111,8 @@ void top_levels(List<uint32_t>* out);                                      // th
 bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
 uint32_t top_level_surface_locked(uint32_t hwnd);
-uint32_t top_level_surface_scale_locked(uint32_t hwnd);      // device pixels per surface pixel, in percent (100: the surface is in device pixels)
+uint32_t top_level_surface_scale_locked(uint32_t hwnd);
+uint32_t top_level_monitor_scale_locked(uint32_t hwnd);      // the scale of the monitor it is on (the system's when the monitors share one)      // device pixels per surface pixel, in percent (100: the surface is in device pixels)
 // Mixed DPI hosting (Win32kUserDpi.cpp): a window surface changed. When it is a mixed child's own surface, its pixels are scaled into its top-level's
 // surface and the top-level and the part of it that changed are given (true); when it is a top-level's, its mixed children are put back over it (false).
 // The caller holds the lock.

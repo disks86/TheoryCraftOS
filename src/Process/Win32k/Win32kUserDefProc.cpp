@@ -268,7 +268,7 @@ uint64_t def_window_proc_entry(Call& call, uint32_t hwnd, uint32_t msg, uint64_t
         // the desktop's scale changed: the program hears WM_DPICHANGED (the new dpi, and the rectangle that keeps its place, as a RECT it may change)
         const uint64_t l = uint64_t(lparam);
         const int32_t x = int16_t(uint16_t(l)), y = int16_t(uint16_t(l >> 16)), cx = int32_t(uint16_t(l >> 32)), cy = int32_t(uint16_t(l >> 48));
-        const uint32_t dpi = user_misc::system_dpi();
+        const uint32_t dpi = window_working_dpi(w);      // (its monitor's)
         uint8_t raw[16];
         const int32_t v[4] = {x, y, x + cx, y + cy};
         for (uint32_t i = 0; i < 4; ++i)

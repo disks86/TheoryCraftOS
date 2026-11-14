@@ -42,6 +42,21 @@ void set_device_scale(uint32_t scale) {
 // A system-aware context carries the system DPI of when it was set (normalize_context): the program keeps working at that DPI, as on Windows. When the
 // device scale has changed since, its coordinates are virtualized by the ratio, as an unaware program's are by the scale: enlarged when the scale grew,
 // shrunk when it fell (a ratio under 100: its units are finer than device pixels).
+namespace {
+uint32_t system_aware_scale_at(uint32_t context, uint32_t monitor_scale) {
+  if ((context & 0x0F) != 1) return 100;
+  const uint32_t dpi = (context >> 8) & 0x1FF;
+  if (dpi == 0) return 100;
+  const uint32_t k = 96 * monitor_scale / dpi;
+  return k < kMinWindowScale ? kMinWindowScale : k > graphics::kMaxScalePercent ? graphics::kMaxScalePercent : k;
+}
+}  // namespace
+
+uint32_t monitor_scale_of(const Window* w) {
+  const Window* top = w ? top_level_of(const_cast<Window*>(w)) : nullptr;      // (only read)
+  return top && top->monitor_scale != 0 ? top->monitor_scale : g_device_scale;
+}
+
 uint32_t system_aware_scale(uint32_t context) {
   if ((context & 0x0F) != 1) return 100;
   const uint32_t dpi = (context >> 8) & 0x1FF;
@@ -50,22 +65,41 @@ uint32_t system_aware_scale(uint32_t context) {
   return k < kMinWindowScale ? kMinWindowScale : k > graphics::kMaxScalePercent ? graphics::kMaxScalePercent : k;
 }
 
+// Monitors at different scales: win32k's screen is each monitor's own pixels, so a window's coordinates follow the monitor it is on - an unaware
+// window is scaled by that monitor, a system-aware one by that monitor against its system DPI, a per-monitor aware one works in its pixels.
 uint32_t window_scale(const Window* w) {
   if (!w) return 100;
-  return w->dpi_virtual ? g_device_scale : system_aware_scale(w->dpi_context);
+  const uint32_t k = monitor_scale_of(w);
+  if (w->dpi_virtual) return k;
+  return system_aware_scale_at(w->dpi_context, k);
 }
 
 bool thread_unaware(Call& call) { return user_misc::dpi_awareness(call.tid(), call.pid()) == 0; }
 
+namespace {
+// Monitors at different scales: the scale of the monitor the calling thread's window is on (its first top-level on a monitor of another scale than
+// the system's), which an unaware or system-aware thread's coordinates follow; the system's when the monitors share one or it has none.
+uint32_t caller_monitor_scale(Call& call) {
+  if (!state_or_null()) return g_device_scale;
+  const Desktop* d = default_desktop();
+  if (!d || !d->root) return g_device_scale;
+  const uint64_t me = thread_of(call);
+  for (const Window* c = d->root->first_child; c; c = c->next)
+    if (c->thread == me && c->monitor_scale != 0) return c->monitor_scale;
+  return g_device_scale;
+}
+}  // namespace
+
 uint32_t caller_scale(Call& call) {
-  if (thread_unaware(call)) return g_device_scale;
-  return system_aware_scale(user_misc::dpi_context_of(call.tid(), call.pid()));
+  if (thread_unaware(call)) return caller_monitor_scale(call);
+  const uint32_t context = user_misc::dpi_context_of(call.tid(), call.pid());
+  return (context & 0x0F) == 1 ? system_aware_scale_at(context, caller_monitor_scale(call)) : 100;
 }
 
 uint32_t window_working_dpi(const Window* w) {
   if (!w || w->dpi_virtual) return 96;
   if ((w->dpi_context & 0x0F) == 1 && ((w->dpi_context >> 8) & 0x1FF) != 0) return (w->dpi_context >> 8) & 0x1FF;
-  return 96 * g_device_scale / 100;
+  return 96 * monitor_scale_of(w) / 100;      // (per-monitor aware: its monitor's)
 }
 
 uint32_t dpi_kind(const Window* w) {
@@ -84,6 +118,49 @@ struct LockGuard {
 }  // namespace
 
 uint32_t device_scale_locked() { return g_device_scale; }
+
+// A top-level went somewhere (the desktop tells after a change): when the monitor it is on has another scale than the one its DPI follows, a
+// per-monitor aware window is asked to take the new DPI (WM_DPICHANGED, its rectangle at the new density suggested, as on Windows), and any other
+// keeps its size in its own coordinates (its pixels on the screen change with the monitor's density, as Windows enlarges or shrinks it).
+// `placed`: the desktop put it there (its frame's units through the new monitor: its pixels are that monitor's already), so its size stays and a
+// per-monitor aware window is only told the new DPI, with the rectangle it has.
+void refresh_monitor_scale(uint32_t hwnd, bool placed) {
+  gdi::Rect to;
+  bool per_monitor = false, move = false;
+  {
+    LockGuard g;
+    if (!state_or_null()) return;
+    Window* w = find_window(hwnd);
+    if (!w || !w->parent || w->parent->parent || (w->style & wn::WS_MINIMIZE)) return;
+    const gdi::Rect r = window_rect_screen(w);
+    uint32_t k = user_misc::monitor_scale_at(r.left + (r.right - r.left) / 2, r.top + (r.bottom - r.top) / 2);
+    if (k == 0) k = g_device_scale;      // (the monitors share one scale)
+    const uint32_t before = w->monitor_scale != 0 ? w->monitor_scale : g_device_scale;
+    if (k == before) {
+      w->monitor_scale = k == g_device_scale ? 0 : static_cast<uint16_t>(k);
+      return;
+    }
+    per_monitor = !w->dpi_virtual && (w->dpi_context & 0x0F) == 2;
+    w->monitor_scale = static_cast<uint16_t>(k);
+    // the rectangle at the new density: its top left kept, its size times new / old
+    const int64_t cx = placed ? int64_t(r.right - r.left) : int64_t(r.right - r.left) * k / before;
+    const int64_t cy = placed ? int64_t(r.bottom - r.top) : int64_t(r.bottom - r.top) * k / before;
+    to = {r.left, r.top, static_cast<int32_t>(r.left + cx), static_cast<int32_t>(r.top + cy)};
+    move = !placed;
+    if (per_monitor) {
+      if (cx < 0 || cy < 0 || cx > 0xFFFF || cy > 0xFFFF || r.left < -32768 || r.left > 32767 || r.top < -32768 || r.top > 32767) return;
+      const uint64_t packed = uint64_t(uint16_t(int16_t(r.left))) | uint64_t(uint16_t(int16_t(r.top))) << 16 | uint64_t(uint16_t(cx)) << 32 | uint64_t(uint16_t(cy)) << 48;
+      post_message(hwnd, 0x112 /* WM_SYSCOMMAND */, kScTcosDpi, packed);
+      return;
+    }
+  }
+  if (move) move_top_level(hwnd, to);
+}
+
+void set_system_scale(uint32_t scale) {
+  LockGuard g;
+  set_device_scale(scale);
+}
 
 void set_device_scale_from_desktop(uint32_t scale) {
   List<uint32_t> tops(*system_allocator());

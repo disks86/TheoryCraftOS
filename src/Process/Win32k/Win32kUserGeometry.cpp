@@ -36,13 +36,15 @@ uint64_t get64(const uint8_t* raw, uint32_t o) { return uint64_t(get32(raw, o)) 
 struct Margins { int32_t left = 0, top = 0, right = 0, bottom = 0; };
 
 // How far the window rectangle reaches past the client rectangle for a style (AdjustWindowRectEx; the algorithm of Windows NT with the metrics of Windows 10).
-Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true) {
+Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true, const Window* top = nullptr) {
   Margins m;
   if (redirect_config().on && (style & wn::WS_CAPTION) == wn::WS_CAPTION && !(style & wn::WS_CHILD)) {
-    // the kernel's desktop draws the frame of a top-level with a caption: its sizes (a menu bar and a client edge are still the window's own)
-    const RedirectConfig& s = redirect_config();
-    m.left = m.right = m.bottom = s.frame_border;
-    m.top = s.frame_border + s.frame_title;
+    // the kernel's desktop draws the frame of a top-level with a caption: its sizes (a menu bar and a client edge are still the window's own);
+    // a top-level on a monitor at another scale has it at that monitor's
+    int32_t border = 0, title = 0;
+    frame_of(top, &border, &title);
+    m.left = m.right = m.bottom = border;
+    m.top = border + title;
     (void)padded;
     if (has_menu) m.top += user_misc::system_metrics(SM_CYMENU, dpi);
     if (ex_style & wn::WS_EX_CLIENTEDGE) {
@@ -100,7 +102,7 @@ void compute_nc(Window* w, Rect* client_out) {
   if (w->parent == nullptr) { *client_out = w->bounds; return; }
   const uint32_t dpi = window_dpi_of(w);
   const bool menu = w->menu != 0 && !(w->style & wn::WS_CHILD);
-  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi, false);      // (programs are not DPI aware here: no padded border)
+  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi, false, w);      // (programs are not DPI aware here: no padded border)
   Rect c = w->bounds;
   c.left = int32_t(uint32_t(c.left) + uint32_t(m.left));
   c.top = int32_t(uint32_t(c.top) + uint32_t(m.top));

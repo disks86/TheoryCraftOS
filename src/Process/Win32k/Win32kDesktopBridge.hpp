@@ -88,8 +88,23 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   static constexpr uint32_t kMaxPending = 128;
   Pending* pending_slot(uint32_t window);
   bool fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out) const;
-  gdi::Rect up(const gdi::Rect& r) const;        // desktop units -> win32k's device pixels (the area's far edge at the device's: edge_up)
+  // win32k's screen is each monitor's own pixels (a physical virtual screen, as on Windows): a monitor's top left is its place in units at the
+  // device scale, its size its units at its own scale. One scale for all: the units at that scale, the area's far edge at the device's.
+  struct Mon {
+    gdi::Rect units;      // its rectangle in the desktop's units
+    uint32_t scale = 100;
+    int32_t ox = 0, oy = 0;      // its top left in win32k's pixels
+    gdi::Rect pixels;            // its rectangle there
+  };
+  int32_t mon_at_units(int32_t x, int32_t y) const;      // the monitor at (or nearest) a point, -1 when none were given
+  int32_t mon_at_pixels(int32_t x, int32_t y) const;
+  int32_t px(int32_t v, const Mon* m, bool vertical) const;      // a unit coordinate in win32k's pixels through monitor m (null: one scale)
+  int32_t ux(int32_t v, const Mon* m, bool vertical) const;      // and back (floor)
+  const Mon* mon(int32_t index) const { return index >= 0 ? &mons_[index] : nullptr; }
+  gdi::Rect up(const gdi::Rect& r) const;        // desktop units -> win32k's pixels (through the monitor at the rectangle's centre)
   gdi::Rect down(const gdi::Rect& r) const;      // and back (floor)
+  void up_point(int32_t x, int32_t y, int32_t* ox, int32_t* oy) const;
+  void down_point(int32_t x, int32_t y, int32_t* ox, int32_t* oy) const;
   int32_t edge_up(int32_t v, bool vertical) const;      // a unit edge in device pixels: past the last unit, moved by the device's spare pixels
 
   Pending pending_[kMaxPending];
@@ -106,6 +121,18 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   int32_t area_w_ = 0, area_h_ = 0;      // the desktop's area in units, and the device pixels past its last unit's edge (a fractional scale)
   int32_t spare_x_ = 0, spare_y_ = 0;
   int32_t frame_border_ = 0, frame_title_ = 0;
+  Mon mons_[8];
+  uint32_t mon_count_ = 0;
+  // where the desktop last put windows (win32k's pixels): a window still there moved to another monitor keeps its size (refresh_monitor_scale)
+  struct Placement {
+    uint32_t hwnd = 0;
+    gdi::Rect rect;
+  };
+  Placement placed_[32];
+  uint32_t placed_next_ = 0;
+  void note_placed(uint32_t hwnd, const gdi::Rect& r);
+  bool was_placed(uint32_t hwnd, const gdi::Rect& r) const;
+  bool mixed_ = false;      // the monitors' scales differ
 };
 
 }  // namespace process::win32k
