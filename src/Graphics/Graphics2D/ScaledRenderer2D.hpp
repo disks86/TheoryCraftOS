@@ -52,6 +52,12 @@ class ScaledRenderer2D final : public IRenderer2D {
     device_ = &device;
     percent_ = clamp_scale_percent(percent);
   }
+  // Where the device's top left is in this renderer's units (a monitor's place in the desktop's layout, when each monitor has a renderer of its own):
+  // unit (x, y) is device pixel units_to_device(x - origin_x), ... . 0, 0 by default.
+  void set_origin(int32_t x, int32_t y) {
+    origin_x_ = x;
+    origin_y_ = y;
+  }
   uint32_t percent() const { return percent_; }
   // Text (draw_text) at a scale drawn with this face at the device's resolution rather than the 8x16 font enlarged; null: enlarged.
   void set_text_face(ICellTextFace* face) { text_face_ = face; }
@@ -89,7 +95,9 @@ class ScaledRenderer2D final : public IRenderer2D {
   bool begin_filter_group(const Rect2D& bounds) override { return device_->begin_filter_group(up(bounds)); }
   bool group_blur(float sigma) override { return device_->group_blur(sigma * factor()); }
   bool group_color(const ColorTransform& t) override { return device_->group_color(t); }
-  bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) override { return device_->group_drop_shadow(up_x(dx), up_x(dy), sigma * factor(), color); }
+  bool group_drop_shadow(int32_t dx, int32_t dy, float sigma, uint32_t color) override {      // (a distance: no origin)
+    return device_->group_drop_shadow(units_to_device(dx, percent_), units_to_device(dy, percent_), sigma * factor(), color);
+  }
   bool group_cut_out(const Rect2D& rect, const CornerRadii& radii) override { return device_->group_cut_out(up(rect), up(radii)); }
   void fill_linear_gradient(const Rect2D& rect, Vec2 from, Vec2 to, ArrayView<const GradientStop> stops) override {
     device_->fill_linear_gradient(up(rect), up(from), up(to), stops);
@@ -116,26 +124,36 @@ class ScaledRenderer2D final : public IRenderer2D {
   bool draw_retained(uint64_t key, const Rect2D& bounds) override { return device_->draw_retained(key, up(bounds)); }
   uint32_t scale_percent() const override { return static_cast<uint32_t>(uint64_t{percent_} * device_->scale_percent() / 100); }
   IRenderer2D& device() override { return device_->device(); }
+  uint32_t device_views() override { return identity() ? device_->device_views() : 1; }
+  bool device_view(uint32_t index, DeviceView* out) override {
+    if (identity()) return device_->device_view(index, out);
+    if (index != 0) return false;
+    *out = DeviceView{this, &device_->device(), scale_percent(), origin_x_, origin_y_};
+    return true;
+  }
   void present() override { device_->present(); }
   bool read_frame(ArrayView<uint32_t> out) override;      // (the device's frame, the pixel at each unit's top left)
 
   // The mapped geometry (public for whoever draws on the device itself).
   Rect2D up(const Rect2D& r) const;
-  int32_t up_x(int32_t v) const { return units_to_device(v, percent_); }
+  int32_t up_x(int32_t v) const { return units_to_device(v - origin_x_, percent_); }      // (a point: from the origin)
+  int32_t up_y(int32_t v) const { return units_to_device(v - origin_y_, percent_); }
   int32_t edge(int32_t v, bool vertical) const;      // a unit edge on the device: units_to_device, the far edge of the layout stretched to the device's
-  Vec2 up(Vec2 v) const { return {v.x * factor(), v.y * factor()}; }
+  Vec2 up(Vec2 v) const { return {(v.x - float(origin_x_)) * factor(), (v.y - float(origin_y_)) * factor()}; }
   CornerRadii up(const CornerRadii& r) const;
   Matrix2D up(const Matrix2D& m) const;          // logical target coordinates -> device: scale after m
   Matrix2D conjugate(const Matrix2D& m) const;   // a map of the logical plane as a map of the device plane
 
  private:
   float factor() const { return float(percent_) / 100.0f; }
+  bool identity() const { return percent_ == 100 && origin_x_ == 0 && origin_y_ == 0; }
   bool whole() const { return percent_ % 100 == 0; }
   // `source_rect` of `mask` enlarged into scratch_ to (out_w x out_h) by nearest sampling; false when there is nothing to draw or no memory.
   bool enlarge(const MaskView& mask, const Rect2D& source_rect, uint32_t out_w, uint32_t out_h, MaskView* out);
 
   IRenderer2D* device_ = nullptr;
   uint32_t percent_ = 100;
+  int32_t origin_x_ = 0, origin_y_ = 0;
   ICellTextFace* text_face_ = nullptr;
   List<uint8_t> scratch_;
   List<uint32_t> frame_;

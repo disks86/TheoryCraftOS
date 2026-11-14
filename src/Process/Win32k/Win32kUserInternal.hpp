@@ -180,6 +180,8 @@ struct Window {
   uint32_t destroy_stage = 0;    // 1: WM_DESTROY sent, 2: WM_NCDESTROY sent
   uint8_t dpi_virtual = 1;       // DPI virtualization (Win32kUserDpi.cpp): 0 the window works in device pixels (its thread was DPI aware), 1 in
                                  // 96-dpi units (unaware: the device scale divides what it sees)
+  uint16_t monitor_scale = 0;    // a top-level on monitors at different scales: the scale (percent) of the monitor it is on, which its DPI follows
+                                 // (refresh_monitor_scale); 0: the system's (one scale for all monitors)
   bool dpi_mixed = false;        // mixed DPI hosting: a child of another awareness than the window it is in, scaled by win32k on its own (its tree
                                  // draws on child_surface, in its coordinates, which win32k scales into the top-level's surface; Win32kUserDpi.cpp)
   uint8_t dpi_hosting = 0;       // the hosting behavior of the thread that made it (GetWindowDpiHostingBehavior)
@@ -511,9 +513,11 @@ Rect surface_rect_in_window_units(const Window* top);      // a redirected top-l
 void set_device_scale(uint32_t scale);
 uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (100 percent for an aware window, or with scale 100)
 uint32_t system_aware_scale(uint32_t context);  // a system-aware context's: the device scale over the scale of the system DPI it was set at (100 otherwise)
-uint32_t window_working_dpi(const Window* w);   // the DPI a window's coordinates are at: 96 unaware, its system DPI system aware, the device's otherwise
+uint32_t window_working_dpi(const Window* w);
+uint32_t monitor_scale_of(const Window* w);     // the scale of the monitor its top-level is on (the system's when the monitors share one)   // the DPI a window's coordinates are at: 96 unaware, its system DPI system aware, the device's otherwise
 uint32_t dpi_kind(const Window* w);             // windows of the same kind work in the same coordinates: unaware, system aware at a DPI, or device pixels
 uint32_t caller_scale(Call& call);              // the same for the calling thread
+uint32_t caller_scale_for(Call& call, const Window* w);      // the calling thread's, for a call about window w (on w's monitor)
 bool thread_unaware(Call& call);
 // (k: the scale in percent, 100 = none; Graphics/DeviceScale.hpp's mapping, so that the desktop and win32k agree to the pixel)
 inline int32_t dpi_down(int32_t v, uint32_t k) { return graphics::device_to_units(v, k); }      // device -> virtual (floor)
@@ -583,10 +587,12 @@ bool dc_screen_offset_locked(Call& call, uint32_t dc, int32_t* dx, int32_t* dy);
 // desktop draws. The settings live outside State: the desktop makes them before the window manager's state exists.
 struct RedirectConfig {
   bool on = false;
-  int32_t frame_border = 6, frame_title = 18;
+  int32_t frame_border = 6, frame_title = 18;      // (device pixels at the system's scale)
+  int32_t border_units = 0, title_units = 0;       // (the desktop's units: a top-level on a monitor at another scale has its frame at that scale)
   IWindowObserver* observer = nullptr;
 };
 RedirectConfig& redirect_config();
+void frame_of(const Window* top, int32_t* border, int32_t* title);      // the desktop's frame around this top-level, in win32k's pixels where it is
 constexpr uint32_t kDragMove = 9;      // drag_requested: a move (1 .. 8 are the WMSZ_ edges of a size)
 void drag_requested(const Window* top, uint32_t edge);
 // The surface of a top-level and where it lies on the screen; a top-level's surface follows its size; the observer hears of it.

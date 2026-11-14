@@ -85,10 +85,13 @@ class IWindowsSession {
   // `device_width` x `device_height`: the whole area (width x height) in device pixels, the same for every monitor; 0 when it is units_to_device of it.
   // A device that is not a whole number of units at the scale (400 rows at 150 % are 266 units, which map to 399) has pixels past the last unit: a
   // window system in device pixels puts the area's far edge (and so its monitors' and work areas' edges there) at the device's.
+  // `monitor_scale`: this monitor's own scale when the monitors' scales differ (each is drawn at its own: a program can draw its windows on it at that
+  // density); 0 when it is `scale_percent`.
   struct Monitor {
     WindowsRect rect, work, panel_area;
     uint32_t scale_percent = 100;
     uint32_t device_width = 0, device_height = 0;
+    uint32_t monitor_scale = 0;
   };
   virtual void set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) = 0;
   // What changed since the last call (and forgets it): the windows whose state or place changed (shown, hidden, moved, sized, retitled, restyled, activated,

@@ -118,6 +118,11 @@ struct ChildSpec {
   uint64_t inherit_list[kMaxInheritList] = {};
   bool copy_std[3] = {};                 // the parent's handle for this standard device is duplicated into the child at the same number (with its flags), inheriting or not
   StartupSpec startup;                   // the STARTUPINFO of the parent and the console of the child
+  // A Linux program started by execve: its exact arguments (argv[0] included; when empty, the image path and the words of the command line are), the path
+  // /proc/self/exe shows, and the parent's descriptors that are not close-on-exec at the same numbers (the standard ones too) instead of the Windows rules.
+  ArrayView<const StringView> arguments;
+  StringView executable_path;
+  bool linux_exec = false;
 };
 
 // What a process needs to run more than one thread: supplied by whoever runs the program (the kernel). Without one a process has a single thread. The process has
@@ -157,6 +162,8 @@ class IProcessRuntime {
   virtual uint32_t spawn_process(const ChildSpec& spec) { (void)spec; return 0xC0000002u; }
   virtual bool terminate_process(uint64_t pid, uint32_t code) { (void)pid; (void)code; return false; }
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
+  // A process this one started (spawn_process): has it ended, and with which code? False if it is not one of this process's children.
+  virtual bool query_child(uint64_t pid, bool* exited, uint32_t* code) { (void)pid; (void)exited; (void)code; return false; }
   // A program made suspended whose first thread has not been resumed yet (it has run nothing).
   virtual bool process_not_started(uint64_t pid) { (void)pid; return false; }
   // The machine: how many cores threads can run on, and the memory.

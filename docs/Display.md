@@ -27,9 +27,29 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
     desktop's text is then drawn with the bundled "TCOS Mono" (Liberation Mono; "TCOS Fallback" for what it lacks) at the device's resolution,
     anti-aliased and sized to fill its 8 x 16-unit cell on the device, so the layout is the same. Box drawing and block characters (U+2500..U+259F) stay
     the 8x16 font's pixels, which join from cell to cell. Without a face (the renderer's default) text is the 8x16 font enlarged.
-- **Monitors.** `MonitorDisplay` maps the device-scale picture onto each monitor (by the same mapping):
-  - A monitor at the device scale gets a 1:1 copy.
-  - One at another scale is resampled (nearest), e.g. a 100 % monitor beside a 200 % one shows every other pixel.
+- **Monitors at one scale.** `MonitorDisplay` maps the device-scale picture onto each monitor (by the same mapping): a 1:1 copy each.
+- **Monitors at different scales** are each drawn at their own (`hardware::MonitorRenderers`, chosen by `DisplayPipeline` in `main.cpp` when the
+  enabled monitors' scales differ):
+  - Every monitor has a view: a renderer of its own pixels under a `ScaledRenderer2D` at the monitor's scale whose origin (`set_origin`) is the
+    monitor's place in the layout. With an accelerated 3D device the renderer is a `DeviceRenderer2D` (its frames sampleable), and presenting
+    lays each monitor's frame at its place in a display-sized `DeviceRenderer2D` (`draw_device_image`: the pixels stay on the GPU), which is
+    presented once. Without one, it is a software renderer presented into its place on the display device.
+  - The desktop draws once, in the layout's units, through `graphics::MultiScaleRenderer2D`, which hands every call to each view; each view clips to
+    its own pixels. So a 100 % monitor beside a 200 % one gets the desktop drawn at 100 %, and the 200 % one at 200 %, text included (each view has
+    the text face), instead of one picture resampled.
+  - Results are true only when every view did the thing (a group a view could not begin is closed again on the others). Retained layers and
+    `copy_rect` are declined there, so callers draw instead.
+  - Sessions are told each monitor's own scale (`IWindowsSession::Monitor::monitor_scale`, from the view that shows the monitor:
+    `gui::Window::scale_at`; told again when a monitor's scale or place changes). The Wayland compositor asks each surface to draw at the scale of
+    the monitor its window is on (the centre of its toplevel's window geometry; popups and subsurfaces follow their window): the fractional
+    `preferred_scale` and `wl_surface.preferred_buffer_scale` are sent when that changes (shown, moved by the desktop to another monitor, the
+    monitors changed), so a GTK 4 or Qt 6 window draws at 100 % on a 100 % monitor and at 200 % on a 200 % one.
+  - Wayland has a `wl_output` per monitor: the primary's is the fixed global, the others' are globals 1001 .. 1007, added to and removed from the
+    registries (`global`, `global_remove`) as monitors come and go. Each says its monitor's place, pixels, whole scale and name (`OUT-1`, ...), and
+    a shown window enters the output of the monitor it is on (`wl_surface.enter`) and leaves it when it goes to another.
+  - `IRenderer2D::device_views()` / `device_view()` list the views (a `DeviceView`: its units renderer, its device, scale and origin). Program windows
+    are drawn on each: 1:1 on the device whose scale is the program's (`draw_window_scaled`), and through that view's units on the others (a picture
+    made at 200 % is filtered down for a 100 % monitor).
 - **Programs.** Sessions are told the device scale (`IWindowsSession::Monitor::scale_percent`). A window is drawn with `draw_window_scaled` on the device
   renderer (`IRenderer2D::device()`, `scale_percent()`) when its session can: the Wayland compositor draws a buffer made at that scale 1:1 and announces the scale
   (`wl_output.scale`, `preferred_buffer_scale`, fractional `preferred_scale`; see [Wayland.md](Wayland.md)). Windows programs are DPI-virtualized as
@@ -47,6 +67,27 @@ around a window (`_NET_FRAME_EXTENTS` says so). Pictures go on the device 1:1 (`
 Clients are told the density through the root's `RESOURCE_MANAGER`: `Xft.dpi` (96 x the scale / 100) and `Xcursor.size` (24 x the scale / 100). A
 client's own lines there stay. When the scale changes, each top-level keeps its place in units (its device rectangle times the change; a maximized or
 full-screen one fills its area again), clients hear `ConfigureNotify`, and `Xft.dpi` is updated.
+
+## Windows programs on monitors at different scales
+
+As on Windows, win32k's screen is then each monitor's own pixels (`DesktopBridge`'s monitor table): a monitor's top left is its place in units at
+the device scale, its size its units at its own scale. So a 200 % monitor A (units 0..800) and a 100 % monitor B beside it (units 800..1600) are
+pixels 0..1600 and 1600..2400. The bridge maps rectangles through the monitor at their centre and points through the monitor they are on (one
+scale for all monitors: exactly the mapping below). The system DPI is the primary monitor's; `GetDpiForMonitor` gives each monitor's.
+
+- A top-level follows the scale of the monitor its centre is on (`Window::monitor_scale`, `refresh_monitor_scale`, after every change the desktop
+  takes): its frame is the desktop's at that scale, and its DPI kind decides its coordinates there - an unaware window is scaled by the monitor, a
+  system-aware one by the monitor against its system DPI, a per-monitor aware one works in the monitor's pixels.
+- Moved by the desktop (a frame dragged to the other monitor), the window's units are kept, so its pixels are already the new monitor's: a
+  per-monitor aware window hears `WM_DPICHANGED` with the new DPI and the rectangle it has. Moved by the program (`SetWindowPos` in its pixels),
+  a per-monitor aware one is asked to take the new DPI at the new density (`WM_DPICHANGED` with its size times new / old, which DefWindowProc
+  applies) and any other is resized so that its size in its own coordinates stays, as Windows does.
+- An unaware or system-aware thread's coordinates follow the monitor of the window a call is about (`caller_scale_for`: its rectangle, placement,
+  client area, update region, `SetWindowPos`, DefWindowProc's), so a program with windows on two monitors sees each at its own scale; calls about
+  no window use the monitor of its first top-level (`caller_scale`). A new top-level takes the scale of the monitor it lands on, sized there so it
+  keeps the size the program asked for.
+- The desktop draws a window's surface 1:1 on the monitor whose scale is its pixels per unit there (`draw_window_scaled`), resampled on the others.
+- When the monitors change, every top-level goes back to where it was in units.
 
 ## Windows programs: DPI virtualization
 
@@ -104,7 +145,13 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 
 ## Not done
 
-- One device scale for all monitors (the largest); no per-monitor density.
+- Monitors at different scales:
+  - X programs are not told per monitor (one screen, one `Xft.dpi`: the largest scale); their pictures are filtered down on smaller monitors.
+  - Windows: calls about no window in particular (the cursor, `ClipCursor`, `MSG.pt`, `WindowFromPoint`, mapping points) from an unaware or
+    system-aware thread with windows on monitors of different scales use the monitor of its first top-level there. Messages between programs
+    are not converted.
+- With monitors at different scales on a GPU, each monitor's picture is laid into the display-sized one with a textured draw every frame (one
+  extra pass over every monitor's pixels on the GPU), and this path has only been run on the software 3D device, not on real hardware or virgl.
 - A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is 266 units for Wayland clients too: their logical
   coordinates are the protocol's, so a maximized one's buffer ends a device row short of the edge, where the desktop's background shows.
 - Windows DPI virtualization (above) has these gaps:
@@ -122,6 +169,12 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | A shared 3D frame drawn through the scaling renderer at 200 %: on the device, each pixel 2 x 2, equal to the read-back picture | `tests/run_host_tests.sh CubeRendererTest` (`test_shared`) |
 | X at 200 %: the root and windows in device pixels, `Xft.dpi` 192 and `Xcursor.size` 48, window rectangles and frame moves in units both ways, the pointer, the picture 1:1 on the device and shrunk to units, back to 100 % (the place kept, `ConfigureNotify`, 96 dpi), a client's own resources kept | `tests/run_host_tests.sh X11ServerTest` (`test_hidpi`) |
 | Windows and X on a 400 x 400 device at 150 % (266 units): the screen and root 400 x 400, a maximized window 400 device pixels across (less X's frame), 266 units for the desktop | `tests/run_host_tests.sh Win32kUserTest` (`test_device_edge`), `X11ServerTest` (`test_hidpi`) |
+| Monitors at different scales (`test_multi_scale`): a layout half at 200 %, half at 100 % (origin at unit 32): each view's pixels equal one renderer at its scale for the whole layout; device views, read-back, declined copies and retained layers; matrices with an origin | `tests/run_host_tests.sh GraphicsTest` |
+| `MonitorRenderers` on a GPU (`test_monitor_renderers_gpu`, the software 3D device standing in): a 200 % and a 100 % monitor drawn by device renderers and composed on the device, a rectangle across the seam at each one's density, nothing blitted through the CPU | `tests/run_host_tests.sh GraphicsTest` |
+| `MonitorRenderers` (`test_monitor_renderers`): a 200 % and a 100 % monitor on one device, a rectangle across the seam on each at its density and place, the frame read back, a refused update keeping the views | `tests/run_host_tests.sh MonitorTest` |
+| Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor; an output per monitor (listed, its mode, scale and name), the window leaving one and entering the other, the global removed and added again | `tests/run_host_tests.sh WaylandServerTest` |
+| The desktop on a 200 % and a 100 % monitor (`test_windows_mixed_scales`): a program window across the seam drawn 1:1 on the 200 % device and through units on the 100 % one | `tests/run_host_tests.sh GuiTest` |
+| Windows on a 200 % and a 100 % monitor (`test_per_monitor_dpi`): the screen 2400 x 1200, each monitor's DPI; a per-monitor aware window moved by the desktop to the 100 % monitor hears 96 dpi and keeps its rectangle, moved back by itself hears 192 at twice the size; its surface 1:1 on the 200 % device only; an unaware window keeps its size in its coordinates on both; a second window of the same program made on the other monitor, each read back at its own size; the cursor both ways | `tests/run_host_tests.sh Win32kUserTest` |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |

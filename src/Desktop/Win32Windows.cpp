@@ -39,9 +39,21 @@ WindowsRect windows_rect(const gui::Rect2D& r) { return {r.x, r.y, r.width, r.he
 void Win32WindowView::paint(gui::Painter& painter) {
   uint32_t w = 0, h = 0;
   graphics::IRenderer2D& r = painter.renderer();
-  const uint32_t k = r.scale_percent();
-  const bool sharp = k > 100 && session_.draw_window_scaled(window_, r.device(), graphics::units_to_device(painter.origin_x(), k), graphics::units_to_device(painter.origin_y(), k), k, &w, &h);
-  if (!sharp && !session_.draw_window(window_, r, painter.origin_x(), painter.origin_y(), &w, &h)) w = h = 0;
+  // on every device the desktop draws on (one, or each monitor at its own scale): 1:1 where the program draws at that device's scale, else through
+  // that device's units (enlarged or shrunk for it)
+  const uint32_t views = r.device_views();
+  bool drawn = false;
+  for (uint32_t i = 0; i < views; ++i) {
+    graphics::DeviceView v;
+    if (!r.device_view(i, &v)) continue;
+    uint32_t vw = 0, vh = 0;
+    const int32_t ox = painter.origin_x() - v.origin_x, oy = painter.origin_y() - v.origin_y;
+    const bool sharp = v.percent > 100 && session_.draw_window_scaled(window_, *v.device, graphics::units_to_device(ox, v.percent), graphics::units_to_device(oy, v.percent), v.percent, &vw, &vh);
+    if (!sharp && !session_.draw_window(window_, *v.units, painter.origin_x(), painter.origin_y(), &vw, &vh)) continue;
+    if (!drawn || vw < w) w = vw;      // (what every device got: the rest is filled below)
+    if (!drawn || vh < h) h = vh;
+    drawn = true;
+  }
   // what the surface does not cover yet (the frame was sized and the program has not caught up): black
   if (bounds_.width > w) painter.fill({static_cast<int32_t>(w), 0, bounds_.width - w, bounds_.height}, 0xFF000000u);
   if (bounds_.height > h) painter.fill({0, static_cast<int32_t>(h), w < bounds_.width ? w : bounds_.width, bounds_.height - h}, 0xFF000000u);
@@ -220,7 +232,9 @@ void Win32Windows::pump(gui::WindowManager& manager) {
       device_w = span(at.x, bounds.width, whole.width, device.width);
       device_h = span(at.y, bounds.height, whole.height, device.height);
     }
-    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_;
+    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_ ||
+           (manager.window() && manager.window()->views_signature() != sent_views_);
+    if (manager.window()) sent_views_ = manager.window()->views_signature();
     if (send) {
       const gui::Point o = manager.window_origin();
       if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0)), windows_rect(manager.full_area(0))};
@@ -233,6 +247,9 @@ void Win32Windows::pump(gui::WindowManager& manager) {
         monitors[i].scale_percent = scale;
         monitors[i].device_width = device_w;
         monitors[i].device_height = device_h;
+        // each monitor's own scale, when they differ (the device that shows the monitor's top left: window coordinates are the area's plus its origin)
+        const uint32_t own = manager.window() ? manager.window()->scale_at(monitors[i].rect.x + o.x, monitors[i].rect.y + o.y) : 0;
+        monitors[i].monitor_scale = own != 0 && own != scale ? own : 0;
       }
       sent_scale_ = scale;
       display_sent_ = true;

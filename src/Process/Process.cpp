@@ -62,6 +62,10 @@ bool is_object_kind(DescriptorKind k) { return k == DescriptorKind::Event || k =
 }  // namespace
 
 Process::~Process() {
+  // Its open files are closed as a program would close them: the locks and the share of a file that belong to an open file go with it (they are kept by the open
+  // file's address, which the next one made may get), and a file marked delete-on-close is removed.
+  for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot)
+    if (files_.kind(slot) == DescriptorKind::File || files_.kind(slot) == DescriptorKind::Directory) files_.close(slot);
   if (ObjectManager* objects = system_objects()) {
     for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
       if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));

@@ -155,15 +155,35 @@ Rect Server::work_area_for(const Surface& s) const {
 // The pixels of a buffer, row by row (b.pitch() words apart). The pool's memory starts on a page and create_buffer made sure the offset and the stride are
 // multiples of 4, so the words are aligned; the bytes stay mapped as long as `b.memory` (shared with the pool) lives. A YUV buffer's are its converted
 // picture (empty until its first commit converted it).
+// The view covers whole rows (stride * height) when the pool holds them, which is what a graphics::Surface of that pitch needs to count as valid; the
+// last row's padding need not exist in the pool, and then the view ends at the last pixel (see drawable_pixels).
 ArrayView<uint32_t> Server::buffer_pixels(const BufferInfo& b) {
   if (!b.valid()) return ArrayView<uint32_t>();
   if (b.yuv) return b.yuv->rgb.count() == uint64_t(b.width) * uint64_t(b.height) ? b.yuv->rgb.view() : ArrayView<uint32_t>();
   if (!b.memory) return ArrayView<uint32_t>();
-  const uint64_t bytes = uint64_t(b.stride) * uint64_t(b.height - 1) + uint64_t(b.width) * 4;
+  const uint64_t needed = uint64_t(b.stride) * uint64_t(b.height - 1) + uint64_t(b.width) * 4, whole = uint64_t(b.stride) * uint64_t(b.height);
   ByteView all = b.memory->bytes;
-  if (uint64_t(b.offset) > all.size() || bytes > all.size() - uint64_t(b.offset)) return ArrayView<uint32_t>();
+  if (uint64_t(b.offset) > all.size() || needed > all.size() - uint64_t(b.offset)) return ArrayView<uint32_t>();
+  const uint64_t bytes = whole <= all.size() - uint64_t(b.offset) ? whole : needed;
   ByteView mine = all.subview(uint64_t(b.offset), bytes);
   return ArrayView<uint32_t>(reinterpret_cast<uint32_t*>(mine.data()), (bytes + 3) / 4);
+}
+
+bool Server::drawable_pixels(const BufferInfo& b, List<uint32_t>* tight, ArrayView<uint32_t>* pixels, uint32_t* pitch) {
+  *pixels = buffer_pixels(b);
+  *pitch = b.pitch();
+  if (pixels->size() == 0) return false;
+  if (pixels->size() >= uint64_t(*pitch) * uint64_t(b.height)) return true;
+  // The last row's padding lies past the pool's end: a copy of the rows without their padding (rare: clients allocate whole rows).
+  const uint64_t width = uint64_t(b.width), height = uint64_t(b.height);
+  tight->clear();
+  if (!tight->reserve(width * height)) return false;
+  for (uint64_t y = 0; y < height; ++y)
+    for (uint64_t x = 0; x < width; ++x)
+      if (!tight->push_back((*pixels)[y * *pitch + x])) return false;
+  *pixels = tight->view();
+  *pitch = uint32_t(width);
+  return true;
 }
 
 void Server::convert_yuv(BufferInfo& b) {
@@ -1147,16 +1167,7 @@ void Server::map_window(Surface& s) {
   int32_t w = 0, h = 0;
   shown_size(s, &w, &h);
   note_repaint(s, {0, 0, max32(w, 1), max32(h, 1)});
-  if (Client* c = client_of(s.client)) {      // the surface is on the output now
-    ObjectCursor cursor;
-    for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
-      const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
-      if (kv->value.iface != Iface::Output) continue;
-      Event e(s.id, 0);
-      e.u(kv->key);
-      send(*c, e);
-    }
-  }
+  announce_scale();      // (it enters its monitor's outputs; its monitor's scale, if it differs from what it was told)
   if (s.role == Role::Popup && s.grab) set_keyboard_focus(&s);
   // A new window takes the activation and the keyboard, as a program's window does when it is first shown on the desktop (which takes the activation
   // from what the session reports, so a window nobody activates would never get keys until it is clicked).
@@ -1167,6 +1178,7 @@ void Server::map_window(Surface& s) {
 void Server::unmap(Surface& s) {
   if (!s.mapped) return;
   s.mapped = false;
+  s.entered = -1;      // (shown again: it enters its monitor's outputs again)
   for (uint64_t i = 0; i < stack_.count(); ++i)
     if (stack_[i] == &s) { stack_.remove_at(i); break; }
   note_changed(s);
@@ -1513,13 +1525,15 @@ void Server::draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t ux, 
       if (!image->draw(renderer, {0, 0, static_cast<uint32_t>(s.current.width), static_cast<uint32_t>(s.current.height)}, x, y)) draw_missed_ = true;
       continue;
     }
-    ArrayView<uint32_t> pixels = buffer_pixels(s.current);
-    if (pixels.size() == 0) continue;
+    List<uint32_t> tight(allocator_);
+    ArrayView<uint32_t> pixels;
+    uint32_t pitch = 0;
+    if (!drawable_pixels(s.current, &tight, &pixels, &pitch)) continue;
     graphics::Surface picture;
     picture.pixels = pixels;
     picture.width = static_cast<uint32_t>(s.current.width);
     picture.height = static_cast<uint32_t>(s.current.height);
-    picture.pitch = s.current.pitch();
+    picture.pitch = pitch;
     picture.format = s.current.format == kFormatAbgr8888 || s.current.format == kFormatXbgr8888 ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
     // (the window's own picture covers its frame's inside; what is drawn over it blends unless it has no alpha)
     renderer.set_blend(top || !has_alpha(s.current.format) ? graphics::BlendMode::Replace : graphics::BlendMode::Alpha);

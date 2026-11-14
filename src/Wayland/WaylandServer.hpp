@@ -338,6 +338,7 @@ class Server final : public desktop::IWindowsSession {
     SharedPointer<TextInputInfo> text_input;    // zwp_text_input_v3
     SharedPointer<String> text;                 // xdg_activation_token_v1's token (once committed), zxdg_exported_v2's / zxdg_imported_v2's handle
     uint32_t tablet = 0, pen_tool = 0, eraser_tool = 0;      // zwp_tablet_seat_v2: the tablet and tools the server made for it
+    uint8_t output = 0;                         // wl_output: the monitor (an index of monitors_) it is
   };
   enum class Role : uint8_t { None, Toplevel, Popup, Subsurface, Cursor, Layer };
   // A layer surface's double-buffered state (zwlr_layer_surface_v1).
@@ -422,6 +423,8 @@ class Server final : public desktop::IWindowsSession {
     Rect restore;
     // a popup
     Surface* popup_parent = nullptr;            // the xdg surface it belongs to
+    uint32_t told_scale = 0;                    // the scale (percent) it was last told to draw at (0: not yet)
+    int32_t entered = -1;                       // the monitor whose wl_outputs it entered (-1: none)
     Positioner positioner;
     Rect placement;                             // relative to the parent's window geometry
     bool grab = false;
@@ -542,6 +545,10 @@ class Server final : public desktop::IWindowsSession {
   void forget_exports(Surface& s);
   void actual_size(const Surface& s, int32_t* w, int32_t* h) const;
   static ArrayView<uint32_t> buffer_pixels(const BufferInfo& b);
+  // What the renderer draws a wl_shm or YUV buffer from: its pixels and the words between rows, a graphics::Surface of `height` rows of that pitch being
+  // valid only if every row is there in full. When the last row's padding is missing from the pool, the rows are copied into *tight. False if there is
+  // nothing to draw.
+  bool drawable_pixels(const BufferInfo& b, List<uint32_t>* tight, ArrayView<uint32_t>* pixels, uint32_t* pitch);
   void copy_region(Client& c, uint32_t region, SharedPointer<RegionRects>* out, uint32_t from);
   void dismiss_popup(Surface& s);
   void release_buffer(Client& c, const BufferInfo& b);
@@ -561,7 +568,12 @@ class Server final : public desktop::IWindowsSession {
   void note_repaint(Surface& s, const Rect& dirty);
   void draw_tree(Surface& s, graphics::IRenderer2D& renderer, int32_t x, int32_t y, bool top, List<uint32_t>* done, uint32_t percent = 100);      // (x, y in units)
   bool draw_window_at(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t percent, uint32_t* width, uint32_t* height);
-  void announce_scale();      // the output scale changed: outputs, fractional scales and preferred buffer scales say so
+  void announce_scale();      // every surface is told the scale of its window's monitor when it changed (fractional and preferred buffer scales)
+  uint32_t scale_for(const Surface& s) const;      // the scale of the monitor its window (its root: the toplevel or layer surface) is on
+  uint32_t monitor_index_for(const Surface& s) const;
+  void list_outputs();      // the monitors changed: registries hear of the outputs that came (wl_registry.global) and went (global_remove)
+  uint32_t outputs_listed_ = 1;      // monitors whose wl_output the registries were told of
+  void tell_scale(Surface& s);
   uint32_t output_scale_ = 100;      // (percent: the desktop's device scale)
   uint32_t output_whole_scale() const { return (output_scale_ + 99) / 100; }      // wl_output.scale, the preferred buffer scale: the whole scale at or above it
 
@@ -602,6 +614,7 @@ class Server final : public desktop::IWindowsSession {
   uint32_t screen_w_ = 1024, screen_h_ = 768;
   struct WorkArea {
     Rect rect, work, panel;      // (panel: where layer surfaces anchor - the work area before the windows' reservations)
+    uint32_t scale = 100;        // the monitor's own scale (percent): what a surface on it is asked to draw at
   };
   WorkArea monitors_[8];
   uint32_t monitor_count_ = 1;

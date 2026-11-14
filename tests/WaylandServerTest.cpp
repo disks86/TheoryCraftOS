@@ -4175,6 +4175,42 @@ static void test_mapping() {
     if (plain) CHECK(drawn == got);
     CHECK(target[100 * 100 - 1] == 0);      // (nothing outside the surface)
   }
+  for (int short_pool = 0; short_pool < 2; ++short_pool) {      // Qt's raster windows: XRGB8888 rows padded past the width, a viewport destination of
+                                                                  // the buffer's own size, offset(0, 0) before each attach; and a pool that ends at the last pixel
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, "qt-like");
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    app.send(Msg(viewport, 2).i(BW).i(BH));
+    constexpr int32_t kStride = (BW + 4) * 4;
+    App::Pool p = app.pool(short_pool ? size_t(kStride) * (BH - 1) + BW * 4 : size_t(kStride) * BH);
+    for (int32_t y = 0; y < BH; ++y)
+      for (int32_t x = 0; x < BW + 4 && (y < BH - 1 || x < BW || !short_pool); ++x) {
+        const uint32_t v = x < BW ? pattern_px(uint32_t(x), uint32_t(y)) : 0u;
+        memcpy(p.memory->data() + y * kStride + x * 4, &v, 4);
+      }
+    const uint32_t b = app.buffer(p, 0, BW, BH, kStride, 1 /* XRGB8888 */);
+    app.send(Msg(w.surface, 10).i(0).i(0));      // offset (version 5)
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 9).i(0).i(0).i(BW).i(BH));      // damage_buffer
+    app.send(Msg(w.surface, 6));
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1 && !app.closing);
+    if (list.size() == 1) {
+      CHECK(server.window_pixel(list[0], 7, 9) == pattern_px(7, 9));
+      std::vector<uint32_t> target(100 * 100, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+      ts.width = ts.height = ts.pitch = 100;
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && dw == uint32_t(BW) && dh == uint32_t(BH));
+      if (target[9 * 100 + 7] != pattern_px(7, 9) || target[19 * 100 + 39] != pattern_px(39, 19))
+        printf("   qt-like (short pool %d): drawn %08x %08x\n", short_pool, target[9 * 100 + 7], target[19 * 100 + 39]);
+      CHECK(target[9 * 100 + 7] == pattern_px(7, 9) && target[19 * 100 + 39] == pattern_px(39, 19));
+    }
+  }
   {      // a GPU buffer turned: read through its image
     DmabufApp app(server);
     App::Window w = app.toplevel(true, "gpu turned");
@@ -4326,6 +4362,76 @@ static void test_mapping() {
     }
     server.set_display(1024, 768, {});      // (back to 1 for what follows)
     CHECK(app.take(early, 2).i(0) == 1);
+  }
+  {      // monitors at different scales: A at 200 % (units 0..800), B at 100 % (800..1600), the device scale 200. A window is told the scale of the
+         // monitor it is on (fractional 240 / buffer scale 2 on A), and again when the desktop moves it to the other (120 / 1), and back
+    App app(server);
+    const uint32_t fsm = app.bind(app.reg, "wp_fractional_scale_manager_v1");
+    desktop::IWindowsSession::Monitor mixed[2];
+    mixed[0].rect = {0, 0, 800, 600};
+    mixed[0].work = {0, 0, 800, 570};
+    mixed[0].scale_percent = 200;
+    mixed[1].rect = {800, 0, 800, 600};
+    mixed[1].work = {800, 0, 800, 600};
+    mixed[1].scale_percent = 200;
+    mixed[1].monitor_scale = 100;
+    server.set_display(1600, 600, ArrayView<const desktop::IWindowsSession::Monitor>(mixed, 2));
+    App::Window w = app.toplevel(true, "mover");
+    const uint32_t f = app.new_id();
+    app.send(Msg(fsm, 1).u(f).u(w.surface));
+    app.show(w, 40, 20, 0xFF00FF00u);
+    uint32_t win = 0;
+    for (uint32_t id : listed(server)) {
+      desktop::WindowsWindowInfo info;
+      String title(A);
+      if (server.window_info(id, &info, &title) && title.view() == StringView("mover")) win = id;
+    }
+    CHECK(win != 0);
+    desktop::WindowsWindowInfo info;
+    String title(A);
+    CHECK(server.window_info(win, &info, &title) && info.surface.x < 800);      // (placed on the primary monitor, A)
+    CHECK(app.take(f, 0).u(0) == 240);
+    app.drop_events();
+    server.move_window(win, {900, 100, info.window.width, info.window.height});
+    CHECK(app.take(f, 0).u(0) == 120 && app.take(w.surface, 2).i(0) == 1);
+    app.drop_events();
+    server.move_window(win, {100, 100, info.window.width, info.window.height});
+    CHECK(app.take(f, 0).u(0) == 240 && app.take(w.surface, 2).i(0) == 2);
+    app.drop_events();
+    server.move_window(win, {120, 110, info.window.width, info.window.height});      // (on the same monitor: nothing said)
+    CHECK(!app.has(f, 0) && !app.has(w.surface, 2));
+    // a wl_output per monitor: the second monitor's global (it came after the registry was made), each output its monitor's place, pixels, whole
+    // scale and name; the window enters the output of the monitor it is on and leaves it for the other's
+    const uint32_t reg2 = app.new_id();      // (a registry made now lists both outputs)
+    app.send(Msg(1, 1).u(reg2));
+    CHECK(app.roundtrip());
+    bool listed_b = false;
+    for (Ev& e : app.events) listed_b |= e.object == reg2 && e.opcode == 0 && e.u(0) == 1001 && e.s(1) == "wl_output";
+    CHECK(listed_b);
+    const uint32_t out_a = app.bind(app.reg, "wl_output", 4);      // (the primary's: the fixed global)
+    const uint32_t out_b = app.new_id();
+    app.send(Msg(app.reg, 0).u(1001).s("wl_output").u(4).u(out_b));
+    CHECK(app.take(out_a, 3).i(0) == 2 && app.take(out_b, 3).i(0) == 1);
+    Ev mode_a = app.take(out_a, 1), mode_b = app.take(out_b, 1);
+    CHECK(mode_a.i(1) == 1600 && mode_a.i(2) == 1200 && mode_b.i(1) == 800 && mode_b.i(2) == 600);
+    CHECK(app.take(out_a, 4).s(0) == "OUT-1" && app.take(out_b, 4).s(0) == "OUT-2");
+    Ev geometry_b = app.take(out_b, 0);
+    CHECK(geometry_b.i(0) == 800 && geometry_b.i(1) == 0);
+    app.drop_events();
+    server.move_window(win, {900, 100, info.window.width, info.window.height});
+    Ev left = app.take(w.surface, 1), entered = app.take(w.surface, 0);
+    CHECK(left.u(0) == out_a && entered.u(0) == out_b);
+    app.drop_events();
+    // the second monitor goes: its global is removed
+    server.set_display(1024, 768, {});
+    Ev removed = app.take(app.reg, 1);
+    CHECK(removed.object == app.reg && removed.u(0) == 1001);
+    // and comes back: the registries hear of it
+    app.drop_events();
+    server.set_display(1600, 600, ArrayView<const desktop::IWindowsSession::Monitor>(mixed, 2));
+    Ev added = app.take(app.reg, 0);
+    CHECK(added.object == app.reg && added.u(0) == 1001 && added.s(1) == "wl_output");
+    server.set_display(1024, 768, {});
   }
   // the rules
   struct Rule {

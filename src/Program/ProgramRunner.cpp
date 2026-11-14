@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Program/ProgramRunner.hpp"
+#include "Font/FontFiles.hpp"
 #include "Program/AppImageLaunch.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Program/ProgramHost.hpp"
@@ -140,6 +141,9 @@ Plan plan_for(const ProgramRun& run, ConstByteView image, String* message) {
 
 namespace {
 RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message);
+// The OS's own fonts as files where Linux programs' fontconfig looks (/usr/share/fonts of the Linux tree): Qt, GTK and the like have no other way to
+// find a font, and draw every letter as a box without one.
+constexpr StringView kLinuxFonts = "/Linux/usr/share/fonts/TheoryCraftOS";
 }  // namespace
 
 // An AppImage: its image is mounted for the program alone and what its AppRun starts is run instead (AppImageLaunch.hpp). The session (the mount) lives
@@ -149,6 +153,7 @@ RunResult run_program(const ProgramRun& run, uint32_t* exit_code, String* messag
   *exit_code = 0;
   allocators::IAllocator& allocator = *run.allocator;
   process::prepare_program_folders(*run.files);      // (/Linux/tmp, where the image is mounted)
+  (void)font::write_bundled_fonts(allocator, *run.files, kLinuxFonts);      // (best effort: without them text is drawn as boxes)
   List<StringView> environment(allocator);
   bool listed = true;
   for (const StringView& entry : process::default_environment(process::SyscallAbi::Linux)) listed &= environment.push_back(entry);
@@ -180,6 +185,7 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
     return RunResult::CouldNotRun;
   }
   process::prepare_program_folders(*run.files);      // (best effort: without a writable root volume the program just has no files)
+  if (abi == process::SyscallAbi::Linux) (void)font::write_bundled_fonts(allocator, *run.files, kLinuxFonts);      // (the same)
 
   ByteBuffer image(allocator);
   if (!read_program(*run.files, run.path, &image, message)) return RunResult::CouldNotRun;

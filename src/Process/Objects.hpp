@@ -246,6 +246,10 @@ class ObjectManager {
   LockResult lock_range_locked(StringView path, const void* owner, uint64_t offset, uint64_t length, bool exclusive);      // (the lock must be held)
   bool unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length);
   void unlock_all(const void* owner);      // the open file is gone
+  // flock(): the one lock an open file has on the whole of a file, shared or exclusive. Asking again changes the kind it has (granted only if no other open file's lock
+  // stands in the way; the one it has stays until then). Taken off with unlock_range(path, owner, 0, kWholeFile), or with the open file. (The lock must be held.)
+  static constexpr uint64_t kWholeFile = ~uint64_t{0};
+  LockResult lock_whole_locked(StringView path, const void* owner, bool exclusive);
 
   // --- sharing of files (the access an open file has and the access it lets others have): a new open fails with a sharing violation if the access it wants is not shared by an
   // open file of the same path, or if it shares less than the access an open file already has. `access` and `share` use ShareBits. Opens that want none of the three (attribute
@@ -554,6 +558,7 @@ class ObjectManager {
   ObjectTable objects_;
   Pipe* pipes_ = nullptr;      // kMaxPipes of them, made when the first pipe is
   struct RangeLock;
+  bool lock_table_locked(StringView path);
   RangeLock* locks_ = nullptr;      // kMaxLocks of them, made with the first
   struct ShareEntry;
   ShareEntry* shares_ = nullptr;      // kMaxShares of them, made with the first

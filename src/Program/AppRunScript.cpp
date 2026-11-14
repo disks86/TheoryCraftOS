@@ -429,6 +429,40 @@ class Shell {
     }
   }
 
+  // What a subshell ($( ) and ( )) may change without the shell around it seeing it: the variables, the positional parameters and the current folder.
+  // (`$(set -- "$APPDIR"/*.desktop; echo "${1##*/}")`, which sharun's hooks use, must leave "$@" as it was.)
+  struct Snapshot {
+    explicit Snapshot(allocators::IAllocator& allocator) : vars(allocator), positional(allocator), cwd(allocator) {}
+    List<UniquePointer<Var>> vars;
+    List<String> positional;
+    String cwd;
+  };
+  bool take_snapshot(Snapshot* snapshot) {
+    for (const UniquePointer<Var>& var : vars_.view()) {
+      UniquePointer<Var> copy = UniquePointer<Var>::make(allocator_, allocator_);
+      if (!copy || !copy->name.assign(var->name.view()) || !copy->value.assign(var->value.view())) return false;
+      for (const String& item : var->items.view()) {
+        String text(allocator_);
+        if (!text.assign(item.view()) || !copy->items.push_back(util::move(text))) return false;
+      }
+      copy->array = var->array;
+      copy->exported = var->exported;
+      copy->is_set = var->is_set;
+      if (!snapshot->vars.push_back(util::move(copy))) return false;
+    }
+    for (const String& arg : positional_.view()) {
+      String copy(allocator_);
+      if (!copy.assign(arg.view()) || !snapshot->positional.push_back(util::move(copy))) return false;
+    }
+    return snapshot->cwd.assign(cwd_.view());
+  }
+  bool restore_snapshot(Snapshot& snapshot) {
+    vars_.clear();
+    for (UniquePointer<Var>& var : snapshot.vars.view())
+      if (!vars_.push_back(util::move(var))) return false;
+    return restore(snapshot.positional) && cwd_.assign(snapshot.cwd.view());
+  }
+
   // The positional parameters back as they were (List cannot be assigned).
   bool restore(List<String>& saved) {
     positional_.clear();
@@ -711,9 +745,12 @@ class Shell {
         if (op_is(ahead, ")")) return function_definition(c, run);
       }
     }
-    if (op_is(c, "(")) {      // a subshell: run in this shell (nothing here can tell the difference that matters)
+    if (op_is(c, "(")) {      // a subshell: what it changes stays in it
       ++c.pos;
+      Snapshot snapshot(allocator_);
+      if (run && !take_snapshot(&snapshot)) return fail_memory();
       const int status = list(c, run);
+      if (run && !launched_ && !restore_snapshot(snapshot)) return fail_memory();
       if (op_is(c, ")")) ++c.pos;
       else syntax_ = true;
       skip_redirects(c);
@@ -1886,11 +1923,14 @@ class Shell {
     String* saved_capture = capture_;
     const bool saved_halted = halted_;
     capture_ = result;
+    Snapshot snapshot(allocator_);      // (a subshell: what it changes stays in it)
+    if (!take_snapshot(&snapshot)) { fail_memory(); return false; }
     ++substitutions_;
     const int status = eval(commands);
     --substitutions_;
     capture_ = saved_capture;
     if (launched_) return true;
+    if (!restore_snapshot(snapshot)) { fail_memory(); return false; }
     halted_ = saved_halted;
     last_substitution_ = status;
     while (result->size() && (*result)[result->size() - 1] == '\n') result->truncate(result->size() - 1);

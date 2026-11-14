@@ -310,6 +310,20 @@ uint64_t nt_create_window_ex(Call& call) {
     if (uint32_t(call.argi(7)) != kCwUseDefault) cx = dpi_up(cx, k);
     if (uint32_t(call.argi(8)) != kCwUseDefault && uint32_t(call.argi(7)) != kCwUseDefault) cy = dpi_up(cy, k);
   }
+  // monitors at different scales: a top-level takes the scale of the monitor it lands on; made in its program's coordinates at another scale, it is
+  // sized at that monitor's so that it keeps the size the program asked for (as when it moves there later)
+  if (parent->parent == nullptr) {
+    const uint32_t kc = caller_scale(call);
+    const uint32_t km = user_misc::monitor_scale_at(int32_t(int64_t{x} + cx / 2), int32_t(int64_t{y} + cy / 2));
+    if (km != 0) {
+      w->monitor_scale = static_cast<uint16_t>(km == device_scale() ? 0 : km);
+      const uint32_t kw = window_scale(w);      // (what its coordinates are on that monitor)
+      if (kw != kc && kc != 0) {
+        cx = int32_t(int64_t{cx} * kw / kc);
+        cy = int32_t(int64_t{cy} * kw / kc);
+      }
+    }
+  }
   w->bounds = Rect{x, y, int32_t(uint32_t(x) + uint32_t(cx)), int32_t(uint32_t(y) + uint32_t(cy))};
   // z-order: the top of its level (below the topmost windows unless it is one)
   if (parent->parent == nullptr || (w->ex_style & wn::WS_EX_TOPMOST) || true) {
@@ -913,7 +927,7 @@ uint64_t nt_set_window_display_affinity(Call& call) { Window* w = window_arg(cal
 // GetDpiForWindow: an unaware window works at 96 dpi (DPI virtualization), a system-aware one at the system DPI it started at, a per-monitor aware one
 // at the monitor's.
 uint32_t window_dpi(Window* w) {
-  if (w && (w->dpi_virtual || (w->dpi_context & 0x0F) == 1)) return window_working_dpi(w);
+  if (w) return window_working_dpi(w);      // (per-monitor aware: the monitor it is on)
   return user_misc::dpi_for_monitor(user_misc::monitor_from_point(0, 0, 1));
 }
 
@@ -1007,7 +1021,7 @@ uint64_t get_window_info(Call& call, Window* w, uint64_t address) {
   if (!call.read_u32(address, &size)) return call.fail(kErrorInvalidParameter);      // (Windows ignores cbSize)
   uint8_t raw[60] = {};
   put32(raw, 0, 60);
-  const uint32_t k = caller_scale(call);      // (in the caller's coordinates)
+  const uint32_t k = caller_scale_for(call, w);      // (in the caller's coordinates)
   auto wr = [&](uint32_t o, const Rect& r0) {
     const Rect r = dpi_down(r0, k);
     put32(raw, o, uint32_t(r.left)); put32(raw, o + 4, uint32_t(r.top)); put32(raw, o + 8, uint32_t(r.right)); put32(raw, o + 12, uint32_t(r.bottom));
@@ -1072,7 +1086,7 @@ uint64_t nt_call_hwnd_param(Call& call) {
       if (!read_point(call, param, &p)) return call.fail(kErrorInvalidParameter);
       int32_t ox, oy;
       if (w == w->desktop->root) ox = oy = 0; else client_origin(w, &ox, &oy);
-      const uint32_t k = caller_scale(call);
+      const uint32_t k = caller_scale_for(call, w);
       p.x = dpi_up(p.x, k);
       p.y = dpi_up(p.y, k);
       if (code == kClientToScreen) { p.x = int32_t(uint32_t(p.x) + uint32_t(ox)); p.y = int32_t(uint32_t(p.y) + uint32_t(oy)); }
@@ -1081,7 +1095,7 @@ uint64_t nt_call_hwnd_param(Call& call) {
       p.y = dpi_down(p.y, k);
       return write_point(call, param, p) ? 1 : call.fail(kErrorInvalidParameter);
     }
-    case kGetChildRect: return write_rect(call, param, dpi_down(w->bounds, caller_scale(call))) ? 1 : call.fail(kErrorInvalidParameter);
+    case kGetChildRect: return write_rect(call, param, dpi_down(w->bounds, caller_scale_for(call, w))) ? 1 : call.fail(kErrorInvalidParameter);
     case kGetClassLongA: case kGetClassLongW: case kGetClassLongPtrA: case kGetClassLongPtrW: case kGetClassWord: {
       const uint32_t size = code == kGetClassWord ? 2 : (code == kGetClassLongA || code == kGetClassLongW) ? 4 : 8;
       uint64_t v = 0;
@@ -1097,7 +1111,7 @@ uint64_t nt_call_hwnd_param(Call& call) {
       uint64_t rect = 0;
       if (!call.read_u64(param, &rect)) return call.fail(kErrorInvalidParameter);
       Rect r;
-      const uint32_t k = caller_scale(call);      // (an unaware caller's client size is what its WM_SIZE said)
+      const uint32_t k = caller_scale_for(call, w);      // (an unaware caller's client size is what its WM_SIZE said)
       if (code == kGetClientRect) {
         const Rect cl = dpi_down(w->client, k);
         r = Rect{0, 0, cl.right - cl.left, cl.bottom - cl.top};
@@ -1121,7 +1135,7 @@ uint64_t nt_call_hwnd_param(Call& call) {
       Rect r;
       uint32_t flags = 0;
       if (!read_rect(call, param, &r) || !call.read_u32(param + 16, &flags)) return call.fail(kErrorInvalidParameter);
-      w->bounds = dpi_up(r, caller_scale(call));
+      w->bounds = dpi_up(r, caller_scale_for(call, w));
       compute_nc(w, &w->client);
       return 1;
     }

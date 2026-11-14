@@ -58,7 +58,34 @@ class Window final : public Control {
   // meanwhile (stop the RenderLoop first), and the old renderer may be destroyed afterwards. The controls are laid out again.
   void set_renderer(graphics::IRenderer2D& renderer);
   uint32_t scale_percent() const { return renderer_ ? renderer_->scale_percent() : 100; }      // the device's scale (HiDPI)
-  graphics::Extent2D device_extent() const { return renderer_ ? renderer_->device().extent() : graphics::Extent2D{}; }      // its size in device pixels
+  // What the devices are (their scales and places, as one number): changes when a monitor's scale or place does.
+  uint64_t views_signature() const {
+    if (!renderer_) return 0;
+    const uint32_t n = renderer_->device_views();
+    uint64_t sig = n;
+    for (uint32_t i = 0; i < n; ++i) {
+      graphics::DeviceView v;
+      if (!renderer_->device_view(i, &v)) continue;
+      sig = sig * 1000003u + v.percent;
+      sig = sig * 1000003u + static_cast<uint32_t>(v.origin_x);
+      sig = sig * 1000003u + static_cast<uint32_t>(v.origin_y);
+    }
+    return sig;
+  }
+  // The scale of the device that shows the point (x, y) of the window (several devices at different scales: each monitor's), 0 when none does.
+  uint32_t scale_at(int32_t x, int32_t y) const {
+    if (!renderer_) return 0;
+    const uint32_t n = renderer_->device_views();
+    for (uint32_t i = 0; i < n; ++i) {
+      graphics::DeviceView v;
+      if (!renderer_->device_view(i, &v) || !v.units) continue;
+      const graphics::Extent2D e = v.units->extent();
+      if (x >= v.origin_x && y >= v.origin_y && int64_t{x} < int64_t{v.origin_x} + e.width && int64_t{y} < int64_t{v.origin_y} + e.height) return v.percent;
+    }
+    return 0;
+  }
+  // its size in device pixels; nothing (0 x 0) when it is drawn on several devices at different scales
+  graphics::Extent2D device_extent() const { return renderer_ && renderer_->device_views() == 1 ? renderer_->device().extent() : graphics::Extent2D{}; }
   // The title bar is drawn when the title is not empty.
   void set_title(StringView title);
   static constexpr int32_t kTitleHeight = 20;

@@ -36,13 +36,15 @@ uint64_t get64(const uint8_t* raw, uint32_t o) { return uint64_t(get32(raw, o)) 
 struct Margins { int32_t left = 0, top = 0, right = 0, bottom = 0; };
 
 // How far the window rectangle reaches past the client rectangle for a style (AdjustWindowRectEx; the algorithm of Windows NT with the metrics of Windows 10).
-Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true) {
+Margins nc_margins(uint32_t style, uint32_t ex_style, bool has_menu, uint32_t dpi, bool padded = true, const Window* top = nullptr) {
   Margins m;
   if (redirect_config().on && (style & wn::WS_CAPTION) == wn::WS_CAPTION && !(style & wn::WS_CHILD)) {
-    // the kernel's desktop draws the frame of a top-level with a caption: its sizes (a menu bar and a client edge are still the window's own)
-    const RedirectConfig& s = redirect_config();
-    m.left = m.right = m.bottom = s.frame_border;
-    m.top = s.frame_border + s.frame_title;
+    // the kernel's desktop draws the frame of a top-level with a caption: its sizes (a menu bar and a client edge are still the window's own);
+    // a top-level on a monitor at another scale has it at that monitor's
+    int32_t border = 0, title = 0;
+    frame_of(top, &border, &title);
+    m.left = m.right = m.bottom = border;
+    m.top = border + title;
     (void)padded;
     if (has_menu) m.top += user_misc::system_metrics(SM_CYMENU, dpi);
     if (ex_style & wn::WS_EX_CLIENTEDGE) {
@@ -100,7 +102,7 @@ void compute_nc(Window* w, Rect* client_out) {
   if (w->parent == nullptr) { *client_out = w->bounds; return; }
   const uint32_t dpi = window_dpi_of(w);
   const bool menu = w->menu != 0 && !(w->style & wn::WS_CHILD);
-  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi, false);      // (programs are not DPI aware here: no padded border)
+  const Margins m = (w->style & wn::WS_MINIMIZE) ? Margins() : nc_margins(w->style, w->ex_style, menu, dpi, false, w);      // (programs are not DPI aware here: no padded border)
   Rect c = w->bounds;
   c.left = int32_t(uint32_t(c.left) + uint32_t(m.left));
   c.top = int32_t(uint32_t(c.top) + uint32_t(m.top));
@@ -594,7 +596,7 @@ uint64_t nt_set_window_pos(Call& call) {
   SwpArgs args;
   args.w = w;
   args.after = after;
-  const uint32_t k = caller_scale(call);      // (DPI virtualization: an unaware caller's 96-dpi units)
+  const uint32_t k = caller_scale_for(call, w);      // (DPI virtualization: an unaware caller's 96-dpi units)
   args.x = dpi_up(call.argi(2), k); args.y = dpi_up(call.argi(3), k); args.cx = dpi_up(call.argi(4), k); args.cy = dpi_up(call.argi(5), k);
   args.flags = flags;
   return swp_op_begin(call, args, kNoShow, false, false);
@@ -607,7 +609,7 @@ uint64_t nt_move_window(Call& call) {
   if (!w->parent) return call.fail(kErrorAccessDenied);
   SwpArgs args;
   args.w = w;
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   args.x = dpi_up(call.argi(1), k); args.y = dpi_up(call.argi(2), k); args.cx = dpi_up(call.argi(3), k); args.cy = dpi_up(call.argi(4), k);
   args.flags = wn::SWP_NOZORDER | wn::SWP_NOACTIVATE | (call.arg_bool(5) ? 0 : wn::SWP_NOREDRAW);
   return swp_op_begin(call, args, kNoShow, false, false);
@@ -657,7 +659,7 @@ uint64_t nt_defer_window_pos(Call& call) {
   DeferPos::Item item;
   item.hwnd = w->handle;
   item.after = call.arg32(2);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   item.x = dpi_up(call.argi(3), k); item.y = dpi_up(call.argi(4), k); item.cx = dpi_up(call.argi(5), k); item.cy = dpi_up(call.argi(6), k);
   item.flags = flags;
   for (DeferPos::Item& existing : d->items) if (existing.hwnd == item.hwnd) { existing = item; return d->handle; }
@@ -688,7 +690,7 @@ uint64_t nt_get_window_placement(Call& call) {
   if (!w) return 0;
   uint32_t length = 0;
   if (!call.read_u32(call.arg(1), &length) || length != 44) return call.fail(kErrorInvalidParameter);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   uint8_t raw[44] = {};
   put32(raw, 0, 44);
   put32(raw, 4, w->placement.restore_maximized && (w->style & wn::WS_MINIMIZE) ? 2 : 0);      // WPF_RESTORETOMAXIMIZED
@@ -710,7 +712,7 @@ uint64_t nt_set_window_placement(Call& call) {
   const uint32_t flags = get32(raw, 4), cmd = get32(raw, 8);
   if (cmd > wn::SW_FORCEMINIMIZE) return call.fail(kErrorInvalidShowwinCommand);
   if (!w->parent) return call.fail(kErrorAccessDenied);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   if (flags & 1) { w->placement.min_x = dpi_up(int32_t(get32(raw, 12)), k); w->placement.min_y = dpi_up(int32_t(get32(raw, 16)), k); }
   w->placement.max_x = dpi_up(int32_t(get32(raw, 20)), k);
   w->placement.max_y = dpi_up(int32_t(get32(raw, 24)), k);
@@ -734,7 +736,7 @@ uint64_t nt_set_window_placement(Call& call) {
 uint64_t nt_get_internal_window_pos(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   const Rect r = dpi_down((w->placement.has_normal) ? w->placement.normal : w->bounds, k);
   if (call.arg(1) != 0 && !write_rect(call, call.arg(1), r)) return call.fail(kErrorInvalidParameter);
   if (call.arg(2) != 0 && !write_point(call, call.arg(2), Point{dpi_down(w->placement.min_x, k), dpi_down(w->placement.min_y, k)})) return call.fail(kErrorInvalidParameter);

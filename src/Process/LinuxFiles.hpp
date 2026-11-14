@@ -49,10 +49,21 @@ uint64_t sys_faccessat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode)
 uint64_t sys_truncate(Process& p, uint64_t path, uint64_t length);
 uint64_t sys_ftruncate(Process& p, uint64_t fd, uint64_t length);
 uint64_t sys_fsync(Process& p, uint64_t fd);
+// statfs(path, buf) and fstatfs(fd, buf): the volume a file is on (its kind, its size and what is free of it), as the 120-byte struct statfs of the 64-bit ABIs.
+uint64_t sys_statfs(Process& p, uint64_t path, uint64_t buffer);
+uint64_t sys_fstatfs(Process& p, uint64_t fd, uint64_t buffer);
+// linkat(olddirfd, oldpath, newdirfd, newpath, flags): another name for a file (link(old, new): both at AT_FDCWD, no flags). EPERM on a file system without hard links.
+uint64_t sys_linkat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags);
+// flock(fd, operation): an advisory lock on the whole file, shared or exclusive, that belongs to the open file (its duplicates share it) and goes with its last descriptor.
+// Kept in the system's table of file locks, so every process sees it.
+uint64_t sys_flock(Process& p, uint64_t fd, uint64_t operation);
 uint64_t sys_dup(Process& p, uint64_t fd);
 uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument);
-uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path);
+// The cleaned virtual path a program names with (dirfd, path) (/proc/self/exe and the like replaced by what they lead to). 0, or -errno.
+int64_t resolve_user_path(Process& p, uint64_t dirfd, uint64_t path, bool allow_empty, String* virtual_path);
+// readlink: symbolic links of the file tree, and /proc/self/exe, /proc/self/cwd, /proc/self/root and /proc/self/fd/<n> (also by the process's number).
+uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t buffer, uint64_t size);
 uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument);
 
 // The D3DKMT services behind /dev/dxg (src/Process/DxgDevice.h): runs service `service` (an NtGdiDdDDI* number) for the process with its parameter block at `params` and

@@ -47,6 +47,8 @@ namespace filesystem {
 class IFileSystem {
  public:
   virtual FileSystemInfo info() const = 0;
+  // The same for the volume that holds `path` (statfs, GetDiskFreeSpace): a file system made of several (a mount table, a graft) answers for the one the path is in.
+  virtual FileSystemInfo info_at(StringView path) const { (void)path; return info(); }
 
   virtual Status open_file(StringView path, OpenMode mode, UniquePointer<IFile>* file) = 0;
   virtual Status open_directory(StringView path, UniquePointer<IDirectory>* directory) = 0;
