@@ -1044,7 +1044,13 @@ void Server::set_display(uint32_t width_units, uint32_t height_units, ArrayView<
     const int64_t device_h = graphics::units_to_device(static_cast<int32_t>(height_units > 32767 ? 32768 : height_units), after);
     if (width_units == 0 || height_units == 0 || device_w > 32767 || device_h > 32767) return;
     scale_ = after;
-    const uint32_t width = static_cast<uint32_t>(device_w), height = static_cast<uint32_t>(device_h);
+    // the device's own size, when the desktop says it: its last pixels past the last unit's edge belong to the area too
+    area_w_ = static_cast<int32_t>(width_units);
+    area_h_ = static_cast<int32_t>(height_units);
+    const uint32_t given_w = monitors.size() > 0 ? monitors[0].device_width : 0, given_h = monitors.size() > 0 ? monitors[0].device_height : 0;
+    spare_x_ = given_w > device_w && given_w - device_w < 8 && given_w <= 32767 ? static_cast<int32_t>(given_w - device_w) : 0;
+    spare_y_ = given_h > device_h && given_h - device_h < 8 && given_h <= 32767 ? static_cast<int32_t>(given_h - device_h) : 0;
+    const uint32_t width = static_cast<uint32_t>(device_w + spare_x_), height = static_cast<uint32_t>(device_h + spare_y_);
     const bool resized = width != screen_w_ || height != screen_h_;
     screen_w_ = width;
     screen_h_ = height;
@@ -1221,10 +1227,11 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
   out->owned = property32(*w, atom::kWmTransientFor, 0, &transient) && transient != 0;
   out->icon = w->icon;
   int32_t l, t, r, b;
-  frame_margins_units(*w, &l, &t, &r, &b);
-  const Rect inside = cover(Rect{w->x, w->y, static_cast<int32_t>(w->width), static_cast<int32_t>(w->height)});      // (units)
+  frame_margins(*w, &l, &t, &r, &b);      // (device pixels: the frame is put together there, then the desktop's units cover it)
+  const Rect inside = cover(Rect{w->x, w->y, static_cast<int32_t>(w->width), static_cast<int32_t>(w->height)});
+  const Rect frame = cover(Rect{w->x - l, w->y - t, static_cast<int32_t>(w->width) + l + r, static_cast<int32_t>(w->height) + t + b});
   out->surface = {inside.x, inside.y, static_cast<uint32_t>(inside.w), static_cast<uint32_t>(inside.h)};
-  out->window = {inside.x - l, inside.y - t, static_cast<uint32_t>(inside.w + l + r), static_cast<uint32_t>(inside.h + t + b)};
+  out->window = {frame.x, frame.y, static_cast<uint32_t>(frame.w), static_cast<uint32_t>(frame.h)};
   if (Property* p = find_property(*w, kNetWmName); p && p->format == 8 && p->data.size() > 0) {
     title->append(StringView(p->data.view()));
   } else if (Property* p2 = find_property(*w, atom::kWmName); p2 && p2->format == 8) {

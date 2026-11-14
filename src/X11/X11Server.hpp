@@ -322,8 +322,25 @@ class Server final : public desktop::IWindowsSession {
   int32_t up(int32_t v) const { return graphics::units_to_device(v, scale_); }
   int32_t down(int32_t v) const { return graphics::device_to_units(v, scale_); }
   int32_t down_up(int32_t v) const { return graphics::device_to_units_up(v, scale_); }
-  Rect up(const Rect& r) const { return {up(r.x), up(r.y), up(r.x + r.w) - up(r.x), up(r.y + r.h) - up(r.y)}; }
-  Rect cover(const Rect& r) const { return {down(r.x), down(r.y), down_up(r.x + r.w) - down(r.x), down_up(r.y + r.h) - down(r.y)}; }      // (device -> units, every pixel)
+  // a unit edge in device pixels: past the area's last unit, moved by the device's spare pixels (the area's far edge at the device's)
+  int32_t edge_up(int32_t v, bool vertical) const {
+    const int32_t d = up(v), area = vertical ? area_h_ : area_w_, spare = vertical ? spare_y_ : spare_x_;
+    return v >= area && spare > 0 ? d + spare : d;
+  }
+  Rect up(const Rect& r) const {
+    const int32_t x0 = edge_up(r.x, false), y0 = edge_up(r.y, true);
+    return {x0, y0, edge_up(r.x + r.w, false) - x0, edge_up(r.y + r.h, true) - y0};
+  }
+  // a device edge in units (floor, or `ceil`): the spare pixels past the area's last unit are that unit's, the device's edge is the area's
+  int32_t edge_down(int32_t v, bool vertical, bool ceil) const {
+    const int32_t area = vertical ? area_h_ : area_w_, spare = vertical ? spare_y_ : spare_x_, last = up(area);
+    if (spare > 0 && v >= last) return v >= last + spare ? area + (ceil ? down_up(v - last - spare) : down(v - last - spare)) : area;
+    return ceil ? down_up(v) : down(v);
+  }
+  Rect cover(const Rect& r) const {      // (device -> units, every pixel)
+    const int32_t x0 = edge_down(r.x, false, false), y0 = edge_down(r.y, true, false);
+    return {x0, y0, edge_down(r.x + r.w, false, true) - x0, edge_down(r.y + r.h, true, true) - y0};
+  }
   void rescale_top(Window& top, uint32_t before, uint32_t after);      // a top-level keeps its place in units when the scale changes
   void publish_dpi();      // RESOURCE_MANAGER's Xft.dpi and Xcursor.size on the root, for the scale
   bool decorated(Window& top);
@@ -422,6 +439,8 @@ class Server final : public desktop::IWindowsSession {
   // the screen and the desktop
   uint32_t screen_w_ = 1024, screen_h_ = 768;      // (device pixels)
   uint32_t scale_ = 100;                            // the desktop's device scale (percent): device pixels per unit
+  int32_t area_w_ = 32767, area_h_ = 32767;         // the desktop's area in units, and the device pixels past its last unit (a fractional scale)
+  int32_t spare_x_ = 0, spare_y_ = 0;
   struct WorkArea {
     Rect rect, work, panel;      // panel: the work area without what windows reserve (where panels are placed)
   };

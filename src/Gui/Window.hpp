@@ -58,6 +58,7 @@ class Window final : public Control {
   // meanwhile (stop the RenderLoop first), and the old renderer may be destroyed afterwards. The controls are laid out again.
   void set_renderer(graphics::IRenderer2D& renderer);
   uint32_t scale_percent() const { return renderer_ ? renderer_->scale_percent() : 100; }      // the device's scale (HiDPI)
+  graphics::Extent2D device_extent() const { return renderer_ ? renderer_->device().extent() : graphics::Extent2D{}; }      // its size in device pixels
   // The title bar is drawn when the title is not empty.
   void set_title(StringView title);
   static constexpr int32_t kTitleHeight = 20;

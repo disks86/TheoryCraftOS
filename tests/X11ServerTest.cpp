@@ -438,6 +438,20 @@ static void test_hidpi() {
   const std::string kept = resource_manager(c);
   CHECK(kept.find("XTerm*faceName:\tMono\n") != std::string::npos && kept.find("Xft.dpi:\t144\n") != std::string::npos &&
         kept.find("Xft.dpi:\t120") == std::string::npos);
+  // a device that is not a whole number of units: 400 x 400 at 150 % is 266 units, which map to 399. The root is the device's size and a maximized
+  // window reaches its edge (less the frame's 9 device pixels)
+  Server::Monitor odd[1] = {{{0, 0, 266, 266}, {0, 0, 266, 266}}};
+  odd[0].scale_percent = 150;
+  odd[0].device_width = odd[0].device_height = 400;
+  s.set_display(266, 266, ArrayView<const Server::Monitor>(odd, 1));
+  c.drain();
+  c.send(Request(false, 14).u32(kRoot).done());
+  p = c.reply();
+  CHECK(p.b.size() >= 24 && p.u16(16) == 400 && p.u16(18) == 400);
+  s.window_command(w, desktop::IWindowsSession::Command::Maximize);
+  p = c.event(22);
+  CHECK(!p.b.empty() && p.i16(16) + p.u16(20) == 400 - 9 && p.i16(18) + p.u16(22) == 400 - 9);
+  CHECK(s.window_info(w, &info, &title) && info.maximized && info.window.x + int32_t(info.window.width) == 266 && info.window.y + int32_t(info.window.height) == 266);
 }
 
 static void test_window_manager_hints() {

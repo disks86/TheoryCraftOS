@@ -206,6 +206,20 @@ void Win32Windows::pump(gui::WindowManager& manager) {
     bounds = manager.bounds();
     if (bounds.width == 0 || bounds.height == 0) return;
     scale = manager.window() ? manager.window()->scale_percent() : 100;
+    // the area in device pixels: up to the device's edge where it reaches the window's (the window is the screen)
+    uint32_t device_w = 0, device_h = 0;
+    if (scale != 100 && manager.window()) {
+      const graphics::Extent2D device = manager.window()->device_extent();
+      const gui::Rect2D whole = manager.window()->bounds();      // (units)
+      const gui::Point at = manager.window_origin();
+      const auto span = [&](int32_t origin, uint32_t size, uint32_t window_size, uint32_t device_size) -> uint32_t {
+        const int32_t start = graphics::units_to_device(origin, scale);
+        if (int64_t{origin} + size >= window_size && device_size > uint32_t(start)) return device_size - uint32_t(start);
+        return graphics::units_span_to_device(origin, size, scale);
+      };
+      device_w = span(at.x, bounds.width, whole.width, device.width);
+      device_h = span(at.y, bounds.height, whole.height, device.height);
+    }
     send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_;
     if (send) {
       const gui::Point o = manager.window_origin();
@@ -215,7 +229,11 @@ void Win32Windows::pump(gui::WindowManager& manager) {
         const gui::Rect2D full = {a.x - o.x, a.y - o.y, a.width, a.height};
         monitors[monitor_count++] = {{r.x - o.x, r.y - o.y, r.width, r.height}, windows_rect(manager.without_reserved(full)), windows_rect(full)};
       }
-      for (uint32_t i = 0; i < monitor_count; ++i) monitors[i].scale_percent = scale;
+      for (uint32_t i = 0; i < monitor_count; ++i) {
+        monitors[i].scale_percent = scale;
+        monitors[i].device_width = device_w;
+        monitors[i].device_height = device_h;
+      }
       sent_scale_ = scale;
       display_sent_ = true;
       sent_bounds_ = bounds;

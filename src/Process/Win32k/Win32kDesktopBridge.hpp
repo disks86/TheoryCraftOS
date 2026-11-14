@@ -88,8 +88,9 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   static constexpr uint32_t kMaxPending = 128;
   Pending* pending_slot(uint32_t window);
   bool fill_info(const user::TopLevelInfo& info, desktop::WindowsWindowInfo* out) const;
-  gdi::Rect up(const gdi::Rect& r) const;        // desktop units -> win32k's device pixels
-  gdi::Rect down(const gdi::Rect& r) const;      // and back (floor)      // (lock held) the window's entry, a new one, or null when the table is full (overflow_ is then set)
+  gdi::Rect up(const gdi::Rect& r) const;        // desktop units -> win32k's device pixels (the area's far edge at the device's: edge_up)
+  gdi::Rect down(const gdi::Rect& r) const;      // and back (floor)
+  int32_t edge_up(int32_t v, bool vertical) const;      // a unit edge in device pixels: past the last unit, moved by the device's spare pixels
 
   Pending pending_[kMaxPending];
   uint32_t pending_count_ = 0;
@@ -102,6 +103,8 @@ class DesktopBridge final : public desktop::IWindowsSession, public user::IWindo
   bool attached_ = false;
   // HiDPI (DPI virtualization): device pixels per desktop unit, and the desktop's frame in units (win32k gets it in device pixels)
   uint32_t scale_ = 100;      // (percent)
+  int32_t area_w_ = 0, area_h_ = 0;      // the desktop's area in units, and the device pixels past its last unit's edge (a fractional scale)
+  int32_t spare_x_ = 0, spare_y_ = 0;
   int32_t frame_border_ = 0, frame_title_ = 0;
 };
 
