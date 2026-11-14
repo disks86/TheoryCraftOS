@@ -191,8 +191,10 @@ bool Server::setup(Client& c) {
   w.u32(masks);
   w.u16(static_cast<uint16_t>(screen_w_));
   w.u16(static_cast<uint16_t>(screen_h_));
-  w.u16(static_cast<uint16_t>(screen_w_ * 254 / 960));      // millimetres at 96 dots per inch
-  w.u16(static_cast<uint16_t>(screen_h_ * 254 / 960));
+  // millimetres at the screen's density (96 dots per inch times the scale): what a client works its DPI out from
+  const uint32_t dpi = 96 * scale_ / 100;
+  w.u16(static_cast<uint16_t>(uint64_t{screen_w_} * 254 / (dpi * 10)));
+  w.u16(static_cast<uint16_t>(uint64_t{screen_h_} * 254 / (dpi * 10)));
   w.u16(1);
   w.u16(1);
   w.u32(kVisual24);

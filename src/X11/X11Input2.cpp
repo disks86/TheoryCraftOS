@@ -264,11 +264,12 @@ void Server::xi_touch_event(uint16_t type, const XiTouchSlot& t, int32_t x, int3
   if (!o.ok() || c.out.size() > kMaxOutputBytes) c.closing = true;
 }
 
-bool Server::touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x, int32_t y) {
+bool Server::touch(hardware::TouchPhase phase, uint32_t id, uint32_t window, int32_t x_units, int32_t y_units) {
   (void)window;
   bool taken = false;
   {
     kernel::ScopedMutex lock(mutex_);
+    const int32_t x = up(x_units), y = up(y_units);      // (the desktop's units -> device pixels)
     XiTouchSlot* slot = nullptr;
     for (XiTouchSlot& t : xi_touches_) if (t.live && t.desktop_id == id) slot = &t;
     if (phase == hardware::TouchPhase::Down) {

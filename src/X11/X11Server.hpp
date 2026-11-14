@@ -52,6 +52,7 @@
 #include "Utility/UniquePointer.hpp"
 #include "X11/X11Protocol.hpp"
 #include "X11/X11Wire.hpp"
+#include "Graphics/DeviceScale.hpp"
 
 namespace x11 {
 
@@ -130,6 +131,8 @@ class Server final : public desktop::IWindowsSession {
   void windows(List<uint32_t>* out) override;
   bool window_info(uint32_t window, desktop::WindowsWindowInfo* out, String* title) override;
   bool draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) override;
+  bool draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale_percent, uint32_t* width, uint32_t* height) override;
+  uint32_t scale() { kernel::ScopedMutex lock(mutex_); return scale_; }      // (tests: the device scale the server works at)
   void move_window(uint32_t window, const desktop::WindowsRect& rect) override;
   void activate_window(uint32_t window) override;
   void window_command(uint32_t window, Command command) override;
@@ -313,7 +316,16 @@ class Server final : public desktop::IWindowsSession {
   void note_changed(Window& top);
   void note_repaint(Window& top, const Rect& dirty);
   void place(Window& top);
-  void frame_margins(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom);
+  void frame_margins(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom);      // (device pixels)
+  void frame_margins_units(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom);      // (the desktop's units)
+  // HiDPI: the server works in device pixels (the root, windows, pointer, pictures); the desktop speaks units. These convert at that boundary.
+  int32_t up(int32_t v) const { return graphics::units_to_device(v, scale_); }
+  int32_t down(int32_t v) const { return graphics::device_to_units(v, scale_); }
+  int32_t down_up(int32_t v) const { return graphics::device_to_units_up(v, scale_); }
+  Rect up(const Rect& r) const { return {up(r.x), up(r.y), up(r.x + r.w) - up(r.x), up(r.y + r.h) - up(r.y)}; }
+  Rect cover(const Rect& r) const { return {down(r.x), down(r.y), down_up(r.x + r.w) - down(r.x), down_up(r.y + r.h) - down(r.y)}; }      // (device -> units, every pixel)
+  void rescale_top(Window& top, uint32_t before, uint32_t after);      // a top-level keeps its place in units when the scale changes
+  void publish_dpi();      // RESOURCE_MANAGER's Xft.dpi and Xcursor.size on the root, for the scale
   bool decorated(Window& top);
   bool property32(Window& w, uint32_t atom, uint32_t index, uint32_t* out);
   uint32_t window_type(Window& w);
@@ -408,7 +420,8 @@ class Server final : public desktop::IWindowsSession {
   };
   List<SelectionOwner> selection_owners_;
   // the screen and the desktop
-  uint32_t screen_w_ = 1024, screen_h_ = 768;
+  uint32_t screen_w_ = 1024, screen_h_ = 768;      // (device pixels)
+  uint32_t scale_ = 100;                            // the desktop's device scale (percent): device pixels per unit
   struct WorkArea {
     Rect rect, work, panel;      // panel: the work area without what windows reserve (where panels are placed)
   };

@@ -241,8 +241,8 @@ void Server::key(uint8_t hid_usage, bool pressed, uint8_t modifiers) {
 void Server::mouse_motion(int32_t dx, int32_t dy) {
   {
     kernel::ScopedMutex lock(mutex_);
-    pointer_x_ = max32(0, min32(pointer_x_ + dx, static_cast<int32_t>(screen_w_) - 1));
-    pointer_y_ = max32(0, min32(pointer_y_ + dy, static_cast<int32_t>(screen_h_) - 1));
+    pointer_x_ = max32(0, min32(pointer_x_ + up(dx), static_cast<int32_t>(screen_w_) - 1));      // (the desktop's units -> device pixels)
+    pointer_y_ = max32(0, min32(pointer_y_ + up(dy), static_cast<int32_t>(screen_h_) - 1));
     pointer_moved();
     motion();
   }
@@ -252,8 +252,8 @@ void Server::mouse_motion(int32_t dx, int32_t dy) {
 void Server::mouse_position(int32_t x, int32_t y) {
   {
     kernel::ScopedMutex lock(mutex_);
-    pointer_x_ = max32(0, min32(x, static_cast<int32_t>(screen_w_) - 1));
-    pointer_y_ = max32(0, min32(y, static_cast<int32_t>(screen_h_) - 1));
+    pointer_x_ = max32(0, min32(up(x), static_cast<int32_t>(screen_w_) - 1));
+    pointer_y_ = max32(0, min32(up(y), static_cast<int32_t>(screen_h_) - 1));
     pointer_moved();
     motion();
   }
@@ -300,8 +300,8 @@ void Server::mouse_wheel(int32_t notches) {
 
 void Server::cursor(int32_t* x, int32_t* y) {
   kernel::ScopedMutex lock(mutex_);
-  *x = pointer_x_;
-  *y = pointer_y_;
+  *x = down(pointer_x_);
+  *y = down(pointer_y_);
 }
 
 bool Server::cursor_confined() { return false; }

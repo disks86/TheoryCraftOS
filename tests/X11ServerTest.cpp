@@ -33,6 +33,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/UnixSockets.hpp"
+#include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "X11/X11Server.hpp"
 #include "X11/X11SocketServer.hpp"
 
@@ -341,6 +342,102 @@ static void test_windows_and_properties() {
   CHECK(!s.window_info(w, &info, &title));
   s.windows(&listed);
   CHECK(listed.count() == 0);
+}
+
+// HiDPI: at 200 % the server works in device pixels (the root, windows, pictures, the pointer) and tells clients the density (Xft.dpi in
+// RESOURCE_MANAGER, the screen's millimetres); the desktop still speaks units. A scale change keeps each window where it was in units.
+static std::string resource_manager(Client& c) {
+  c.drain();
+  c.send(Request(false, 20, 0).u32(kRoot).u32(23 /* RESOURCE_MANAGER */).u32(0).u32(0).u32(1000).done());
+  Packet p = c.reply();
+  if (p.b.size() < 32 || p.b[0] != 1) return "";
+  const uint32_t n = p.u32(16);
+  return p.b.size() >= 32 + n ? std::string(p.b.begin() + 32, p.b.begin() + 32 + n) : "";
+}
+
+static void test_hidpi() {
+  Server s(A);
+  s.attach(6, 19);
+  Server::Monitor monitors[1] = {{{0, 0, 640, 400}, {0, 0, 640, 380}}};
+  monitors[0].scale_percent = 200;
+  s.set_display(640, 400, ArrayView<const Server::Monitor>(monitors, 1));
+  CHECK(s.scale() == 200);
+  Client c(s, false);
+  CHECK(c.setup());
+  c.send(Request(false, 14).u32(kRoot).done());      // GetGeometry of the root: device pixels
+  Packet p = c.reply();
+  CHECK(p.b.size() >= 24 && p.u16(16) == 1280 && p.u16(18) == 800);
+  const std::string resources = resource_manager(c);
+  CHECK(resources.find("Xft.dpi:\t192\n") != std::string::npos && resources.find("Xcursor.size:\t48\n") != std::string::npos);
+  // a window asked for at (100, 50) in device pixels: its frame is the desktop's (12 + 12 across, 50 + 12 down, device), in units on the desktop's side
+  const uint32_t w = c.create_window(kRoot, 100, 50, 300, 200, kExposure | kStructure);
+  c.change_property(w, 40, 41, 32, {4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});      // (PPosition)
+  c.send(Request(false, 8).u32(w).done());
+  CHECK(!c.event(19 /* MapNotify */).b.empty());
+  desktop::WindowsWindowInfo info;
+  String title(A);
+  CHECK(s.window_info(w, &info, &title));
+  CHECK(info.surface.x == 56 && info.surface.y == 50 && info.surface.width == 150 && info.surface.height == 100);
+  CHECK(info.window.x == 50 && info.window.y == 25 && info.window.width == 162 && info.window.height == 131);
+  // the desktop moves its frame in units: the client hears device pixels
+  c.drain();
+  s.move_window(w, {100, 100, 162, 131});
+  p = c.event(22 /* ConfigureNotify */);
+  CHECK(!p.b.empty() && p.i16(16) == 212 && p.i16(18) == 250 && p.u16(20) == 300 && p.u16(22) == 200);
+  // the pointer: units in, device pixels inside, units back
+  s.mouse_position(110, 130);
+  int32_t px = 0, py = 0;
+  s.cursor(&px, &py);
+  CHECK(px == 110 && py == 130);
+  c.send(Request(false, 38).u32(kRoot).done());      // QueryPointer
+  p = c.reply();
+  CHECK(p.b.size() >= 24 && p.i16(16) == 220 && p.i16(18) == 260);
+  // it draws in device pixels; the desktop shows them 1:1 on the device, or shrunk to units
+  const uint32_t gc = c.create_gc(w, 0xFF0000);
+  c.fill_rect(w, gc, 0, 0, 10, 10);
+  c.sync();
+  c.reply();
+  CHECK(s.picture_pixel(w, 9, 9) == 0xFFFF0000u && s.picture_pixel(w, 10, 10) != 0xFFFF0000u);
+  List<uint32_t> changed(A);
+  List<desktop::IWindowsSession::Repaint> repainted(A);
+  s.take_changes(&changed, &repainted);
+  bool small = false;
+  for (const desktop::IWindowsSession::Repaint& r : repainted.view())
+    if (r.window == w && r.dirty.width <= 150 && r.dirty.height <= 100) small = true;      // (the desktop's units)
+  CHECK(small);
+  {
+    std::vector<uint32_t> big(400 * 300, 0), units(200 * 150, 0);
+    graphics::Surface bs, us;
+    bs.pixels = ArrayView<uint32_t>(big.data(), big.size());
+    bs.width = bs.pitch = 400;
+    bs.height = 300;
+    us.pixels = ArrayView<uint32_t>(units.data(), units.size());
+    us.width = us.pitch = 200;
+    us.height = 150;
+    graphics::SoftwareRenderer2D device(bs), plain(us);
+    uint32_t dw = 0, dh = 0;
+    CHECK(!s.draw_window_scaled(w, device, 0, 0, 150, &dw, &dh));      // (only at its own scale)
+    CHECK(s.draw_window_scaled(w, device, 0, 0, 200, &dw, &dh) && dw == 150 && dh == 100);
+    CHECK((big[9 * 400 + 9] & 0xFFFFFF) == 0xFF0000 && (big[10 * 400 + 10] & 0xFFFFFF) != 0xFF0000);
+    CHECK(s.draw_window(w, plain, 0, 0, &dw, &dh) && dw == 150 && dh == 100);
+    CHECK((units[2 * 200 + 2] & 0xFFFFFF) == 0xFF0000 && (units[6 * 200 + 6] & 0xFFFFFF) != 0xFF0000);
+  }
+  // back to 100 %: the window keeps its place in units (now device pixels), clients are told 96 dpi
+  monitors[0].scale_percent = 100;
+  c.drain();
+  s.set_display(640, 400, ArrayView<const Server::Monitor>(monitors, 1));
+  CHECK(s.scale() == 100);
+  p = c.event(22);
+  CHECK(!p.b.empty() && p.i16(16) == 106 && p.i16(18) == 125 && p.u16(20) == 150 && p.u16(22) == 100);
+  CHECK(s.window_info(w, &info, &title) && info.surface.x == 106 && info.surface.width == 150 && info.window.x == 100 && info.window.width == 162);
+  CHECK(resource_manager(c).find("Xft.dpi:\t96\n") != std::string::npos);
+  // a client's own resources stay when the density changes
+  c.change_string(kRoot, 23, 31, "XTerm*faceName:\tMono\nXft.dpi:\t120\n");
+  monitors[0].scale_percent = 150;
+  s.set_display(640, 400, ArrayView<const Server::Monitor>(monitors, 1));
+  const std::string kept = resource_manager(c);
+  CHECK(kept.find("XTerm*faceName:\tMono\n") != std::string::npos && kept.find("Xft.dpi:\t144\n") != std::string::npos &&
+        kept.find("Xft.dpi:\t120") == std::string::npos);
 }
 
 static void test_window_manager_hints() {
@@ -1347,6 +1444,7 @@ int main() {
   test_xdnd();
   test_xinput2();
   test_drawing();
+  test_hidpi();
   test_input();
   test_errors();
   test_truncation_and_bit_flips();

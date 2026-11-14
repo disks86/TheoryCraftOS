@@ -706,10 +706,18 @@ bool Server::decorated(Window& top) {
   return true;
 }
 
-void Server::frame_margins(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom) {
+void Server::frame_margins_units(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom) {
   const bool d = attached_ && decorated(top);
   *left = *right = *bottom = d ? frame_border_ : 0;
   *top_margin = d ? frame_border_ + frame_title_ : 0;
+}
+
+void Server::frame_margins(Window& top, int32_t* left, int32_t* top_margin, int32_t* right, int32_t* bottom) {
+  frame_margins_units(top, left, top_margin, right, bottom);
+  *left = up(*left);
+  *right = up(*right);
+  *bottom = up(*bottom);
+  *top_margin = up(*top_margin);
 }
 
 void Server::place(Window& top) {
@@ -1026,10 +1034,17 @@ void Server::attach(int32_t frame_border, int32_t frame_title) {
   }
 }
 
-void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monitor> monitors) {
+void Server::set_display(uint32_t width_units, uint32_t height_units, ArrayView<const Monitor> monitors) {
   {
     kernel::ScopedMutex lock(mutex_);
-    if (width == 0 || height == 0 || width > 32767 || height > 32767) return;
+    // the desktop gives units; the server works in device pixels (the first monitor's scale is the device scale, as for the other window systems)
+    const uint32_t before = scale_;
+    const uint32_t after = monitors.size() > 0 ? graphics::clamp_scale_percent(monitors[0].scale_percent) : 100;
+    const int64_t device_w = graphics::units_to_device(static_cast<int32_t>(width_units > 32767 ? 32768 : width_units), after);
+    const int64_t device_h = graphics::units_to_device(static_cast<int32_t>(height_units > 32767 ? 32768 : height_units), after);
+    if (width_units == 0 || height_units == 0 || device_w > 32767 || device_h > 32767) return;
+    scale_ = after;
+    const uint32_t width = static_cast<uint32_t>(device_w), height = static_cast<uint32_t>(device_h);
     const bool resized = width != screen_w_ || height != screen_h_;
     screen_w_ = width;
     screen_h_ = height;
@@ -1037,9 +1052,9 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
     for (const Monitor& m : monitors) {
       if (monitor_count_ == 8) break;
       const desktop::WindowsRect& panel = m.panel_area.width != 0 && m.panel_area.height != 0 ? m.panel_area : m.work;
-      monitors_[monitor_count_++] = {{m.rect.x, m.rect.y, static_cast<int32_t>(m.rect.width), static_cast<int32_t>(m.rect.height)},
-                                     {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)},
-                                     {panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)}};
+      monitors_[monitor_count_++] = {up(Rect{m.rect.x, m.rect.y, static_cast<int32_t>(m.rect.width), static_cast<int32_t>(m.rect.height)}),
+                                     up(Rect{m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)}),
+                                     up(Rect{panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)})};
     }
     if (monitor_count_ == 0) {
       monitors_[0] = {{0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)}, {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)},
@@ -1050,6 +1065,11 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       root_->width = width;
       root_->height = height;
       send_configure_notify(*root_);
+    }
+    if (root_ && before != after) {
+      for (Window* w : root_->children.view())
+        if (!w->input_only && w != wm_check_) rescale_top(*w, before, after);
+      publish_dpi();
     }
     // what a strut keeps is counted from the panel areas, which may have moved
     if (root_)
@@ -1068,13 +1088,15 @@ void Server::take_changes(List<uint32_t>* changed, List<Repaint>* repainted) {
     for (Window* w : root_->children.view()) {
       if (w->input_only) continue;
       changed->push_back(w->id);
-      if (w->picture) repainted->push_back({w->id, {0, 0, w->picture->width, w->picture->height}});
+      if (w->picture) repainted->push_back({w->id, {0, 0, static_cast<uint32_t>(down_up(static_cast<int32_t>(w->picture->width))), static_cast<uint32_t>(down_up(static_cast<int32_t>(w->picture->height)))}});
     }
   }
   for (const Change& c : changes_.view()) {
     if (c.changed) changed->push_back(c.window);
-    if (c.repaint)
-      repainted->push_back({c.window, {c.dirty.x, c.dirty.y, static_cast<uint32_t>(c.dirty.w), static_cast<uint32_t>(c.dirty.h)}});
+    if (c.repaint) {
+      const Rect d = cover(c.dirty);      // (the desktop's units)
+      repainted->push_back({c.window, {d.x, d.y, static_cast<uint32_t>(d.w), static_cast<uint32_t>(d.h)}});
+    }
   }
   changes_.clear();
   changes_overflow_ = false;
@@ -1083,8 +1105,8 @@ void Server::take_changes(List<uint32_t>* changed, List<Repaint>* repainted) {
 uint32_t Server::take_window_menu(int32_t* x, int32_t* y) {
   kernel::ScopedMutex lock(mutex_);
   const uint32_t w = menu_window_;
-  *x = menu_x_;
-  *y = menu_y_;
+  *x = down(menu_x_);
+  *y = down(menu_y_);
   menu_window_ = 0;
   return w;
 }
@@ -1192,15 +1214,17 @@ bool Server::window_info(uint32_t window, desktop::WindowsWindowInfo* out, Strin
   out->topmost = w->above;
   out->layer = dock ? int8_t(1) : backdrop ? int8_t(-2) : int8_t(0);      // (a panel above the windows, a desktop window below them all)
   strut(*w, &out->reserve_edge, &out->reserve);
+  out->reserve = static_cast<uint32_t>(down_up(static_cast<int32_t>(out->reserve)));
   out->popup = w->override_redirect || type == kNetWmWindowTypeMenu || type == kNetWmWindowTypePopupMenu || type == kNetWmWindowTypeDropdownMenu ||
                type == kNetWmWindowTypeTooltip || type == kNetWmWindowTypeCombo || type == kNetWmWindowTypeDnd || type == kNetWmWindowTypeNotification;
   uint32_t transient = 0;
   out->owned = property32(*w, atom::kWmTransientFor, 0, &transient) && transient != 0;
   out->icon = w->icon;
   int32_t l, t, r, b;
-  frame_margins(*w, &l, &t, &r, &b);
-  out->surface = {w->x, w->y, w->width, w->height};
-  out->window = {w->x - l, w->y - t, w->width + static_cast<uint32_t>(l + r), w->height + static_cast<uint32_t>(t + b)};
+  frame_margins_units(*w, &l, &t, &r, &b);
+  const Rect inside = cover(Rect{w->x, w->y, static_cast<int32_t>(w->width), static_cast<int32_t>(w->height)});      // (units)
+  out->surface = {inside.x, inside.y, static_cast<uint32_t>(inside.w), static_cast<uint32_t>(inside.h)};
+  out->window = {inside.x - l, inside.y - t, static_cast<uint32_t>(inside.w + l + r), static_cast<uint32_t>(inside.h + t + b)};
   if (Property* p = find_property(*w, kNetWmName); p && p->format == 8 && p->data.size() > 0) {
     title->append(StringView(p->data.view()));
   } else if (Property* p2 = find_property(*w, atom::kWmName); p2 && p2->format == 8) {
@@ -1219,12 +1243,88 @@ bool Server::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32
   s.pixels = p.pixels.view();
   s.width = s.pitch = p.width;
   s.height = p.height;
+  // the picture is in device pixels: at a scale, shrunk to units here (a renderer that cannot draw on the device), else drawn as it is
+  const uint32_t uw = static_cast<uint32_t>(down_up(static_cast<int32_t>(p.width))), uh = static_cast<uint32_t>(down_up(static_cast<int32_t>(p.height)));
   renderer.set_blend(graphics::BlendMode::Replace);
-  renderer.draw_image(s, {0, 0, p.width, p.height}, x, y);
+  if (scale_ == 100) renderer.draw_image(s, {0, 0, p.width, p.height}, x, y);
+  else renderer.draw_image_scaled(s, {0, 0, float(p.width), float(p.height)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
   renderer.set_blend(graphics::BlendMode::Alpha);
-  *width = p.width;
-  *height = p.height;
+  *width = uw;
+  *height = uh;
   return true;
+}
+
+// At a scale the picture (device pixels) goes on the device 1:1: sharp.
+bool Server::draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale_percent, uint32_t* width, uint32_t* height) {
+  kernel::ScopedMutex lock(mutex_);
+  if (scale_percent != scale_ || scale_ == 100) return false;
+  Window* w = find_window(window);
+  if (!w || w->parent != root_ || !w->picture || w->picture->pixels.count() < uint64_t{w->picture->width} * w->picture->height) return false;
+  Picture& p = *w->picture;
+  graphics::Surface s;
+  s.pixels = p.pixels.view();
+  s.width = s.pitch = p.width;
+  s.height = p.height;
+  device.set_blend(graphics::BlendMode::Replace);
+  device.draw_image(s, {0, 0, p.width, p.height}, x, y);
+  device.set_blend(graphics::BlendMode::Alpha);
+  *width = static_cast<uint32_t>(down_up(static_cast<int32_t>(p.width)));
+  *height = static_cast<uint32_t>(down_up(static_cast<int32_t>(p.height)));
+  return true;
+}
+
+void Server::rescale_top(Window& top, uint32_t before, uint32_t after) {
+  auto conv = [&](int32_t v) { return static_cast<int32_t>(int64_t{v} * after / before); };
+  auto conv_rect = [&](const Rect& r) { const int32_t x0 = conv(r.x), y0 = conv(r.y); return Rect{x0, y0, conv(r.x + r.w) - x0, conv(r.y + r.h) - y0}; };
+  if (!top.restore.empty()) top.restore = conv_rect(top.restore);
+  Rect to = conv_rect(Rect{top.x, top.y, static_cast<int32_t>(top.width), static_cast<int32_t>(top.height)});
+  if (top.fullscreen) {
+    const int32_t cx = to.x + to.w / 2, cy = to.y + to.h / 2;
+    to = monitors_[0].rect;
+    for (uint32_t i = 0; i < monitor_count_; ++i) if (contains(monitors_[i].rect, cx, cy)) to = monitors_[i].rect;
+  } else if (top.maximized) {
+    const Rect work = work_area_for(top);
+    int32_t l, t, r, b;
+    frame_margins(top, &l, &t, &r, &b);
+    to = {work.x + l, work.y + t, work.w - l - r, work.h - t - b};
+  }
+  const int32_t before_x = top.x, before_y = top.y;
+  const uint32_t before_w = top.width, before_h = top.height;
+  move_resize(top, to.x, to.y, static_cast<uint32_t>(max32(1, to.w)), static_cast<uint32_t>(max32(1, to.h)), top.border, true);
+  if (top.x != before_x || top.y != before_y || top.width != before_w || top.height != before_h) send_configure_notify(top);
+  if (top.mapped) update_wm_state(top);      // (_NET_FRAME_EXTENTS in device pixels)
+  note_changed(top);
+}
+
+// Xft and Xcursor read their density and cursor size from the root's RESOURCE_MANAGER (what xrdb loads): other lines a client put there stay.
+void Server::publish_dpi() {
+  if (!root_) return;
+  String text(allocator_);
+  if (Property* p = find_property(*root_, atom::kResourceManager); p && p->format == 8) {
+    ConstByteView old = p->data.view();
+    uint64_t start = 0;
+    for (uint64_t i = 0; i <= old.size(); ++i) {
+      if (i < old.size() && old[i] != '\n') continue;
+      const StringView line(old.subview(start, i - start));
+      if (!line.empty() && !line.starts_with("Xft.dpi:") && !line.starts_with("Xcursor.size:")) {
+        text.append(line);
+        text.push_back('\n');
+      }
+      start = i + 1;
+    }
+  }
+  char number[16];
+  auto append_number = [&](uint32_t v) {
+    uint32_t n = 0;
+    do { number[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v != 0 && n < sizeof number);
+    while (n > 0) text.push_back(number[--n]);
+  };
+  text.append("Xft.dpi:\t");
+  append_number(96 * scale_ / 100);
+  text.append("\nXcursor.size:\t");
+  append_number(24 * scale_ / 100);
+  text.push_back('\n');
+  set_property(*root_, atom::kResourceManager, atom::kString, 8, text.view().bytes());
 }
 
 void Server::move_window(uint32_t window, const desktop::WindowsRect& rect) {
@@ -1233,8 +1333,10 @@ void Server::move_window(uint32_t window, const desktop::WindowsRect& rect) {
     Window* w = find_window(window);
     if (!w || w->parent != root_ || w->maximized || w->fullscreen) return;
     int32_t l, t, r, b;
-    frame_margins(*w, &l, &t, &r, &b);
-    int32_t width = static_cast<int32_t>(rect.width) - l - r, height = static_cast<int32_t>(rect.height) - t - b;
+    frame_margins_units(*w, &l, &t, &r, &b);
+    // the frame's rectangle in units -> the inside in device pixels
+    const Rect inside = up(Rect{rect.x + l, rect.y + t, max32(1, static_cast<int32_t>(rect.width) - l - r), max32(1, static_cast<int32_t>(rect.height) - t - b)});
+    int32_t width = inside.w, height = inside.h;
     // the size hints' limits
     uint32_t flags = 0, v = 0;
     if (property32(*w, atom::kWmNormalHints, 0, &flags)) {
@@ -1245,7 +1347,7 @@ void Server::move_window(uint32_t window, const desktop::WindowsRect& rect) {
     }
     const uint32_t before_w = w->width, before_h = w->height;
     const int32_t before_x = w->x, before_y = w->y;
-    move_resize(*w, rect.x + l, rect.y + t, static_cast<uint32_t>(max32(1, width)), static_cast<uint32_t>(max32(1, height)), w->border, true);
+    move_resize(*w, inside.x, inside.y, static_cast<uint32_t>(max32(1, width)), static_cast<uint32_t>(max32(1, height)), w->border, true);
     if (w->x != before_x || w->y != before_y || w->width != before_w || w->height != before_h) send_configure_notify(*w);
     note_changed(*w);      // (the frame learns where the window is, also when the hints kept it from going where the frame wanted)
   }
