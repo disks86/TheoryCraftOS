@@ -17,6 +17,7 @@
  */
 
 #include "Program/AppImageLaunch.hpp"
+#include "FileSystem/Dwarfs/DwarfsFileSystem.hpp"
 #include "FileSystem/Iso/IsoFileSystem.hpp"
 #include "FileSystem/Squash/SquashFileSystem.hpp"
 #include "FileSystem/SystemLayout.hpp"
@@ -86,12 +87,21 @@ bool open_appimage_image(allocators::IAllocator& allocator, filesystem::IFileSys
     *image = util::move(iso);
   } else {
     uint64_t offset = 0;
-    if (!exe::appimage_payload_offset(*file, &offset)) return fail("the AppImage is damaged: no SquashFS image follows its runtime");
-    UniquePointer<filesystem::SquashFileSystem> squash;
-    mounted = filesystem::SquashFileSystem::mount(allocator, util::move(file), offset, &squash);
-    *image = util::move(squash);
+    exe::AppImagePayload payload = exe::AppImagePayload::SquashFs;
+    if (!exe::appimage_payload_offset(*file, &offset, &payload)) return fail("the AppImage is damaged: no SquashFS or DwarFS image follows its runtime");
+    if (payload == exe::AppImagePayload::DwarFs) {
+      // uruntime's AppImages (the "anylinux" builds) carry DwarFS.
+      UniquePointer<filesystem::DwarfsFileSystem> dwarfs;
+      mounted = filesystem::DwarfsFileSystem::mount(allocator, util::move(file), offset, &dwarfs);
+      *image = util::move(dwarfs);
+    } else {
+      UniquePointer<filesystem::SquashFileSystem> squash;
+      mounted = filesystem::SquashFileSystem::mount(allocator, util::move(file), offset, &squash);
+      *image = util::move(squash);
+    }
   }
   if (mounted == filesystem::Status::OutOfMemory) return fail("not enough memory to open the AppImage");
+  if (mounted == filesystem::Status::Unsupported) return fail("the AppImage's image uses a format version or feature this OS does not know");
   if (mounted != filesystem::Status::Ok) return fail("the AppImage's image cannot be read (it is damaged, or of a kind this OS does not know)");
   return true;
 }
