@@ -25,6 +25,7 @@
 #include "Utility/AllocatedView.hpp"
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/CellTextFace.hpp"
+#include "Graphics/Graphics2D/MultiScaleRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Raster2D.hpp"
@@ -2095,6 +2096,67 @@ static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskVi
   r.fill_rect({48, 28, 10, 10}, 0xFF808080);
   r.pop_clip();
 }
+// Monitors at different scales: a 64x40-unit layout whose left half is a monitor at 200 % and right half one at 100 % (its origin at unit 32). Each
+// monitor's pixels are what one renderer at its scale draws for the whole layout, in its part: shapes, text, clips and pictures. Matrices (groups,
+// transformed images) are mapped with the view's origin.
+static void draw_multi_scene(IRenderer2D& r, const Surface& image, const MaskView& mask) { draw_scaled_scene(r, image, mask); }
+
+static void test_multi_scale() {
+  TestAllocator a;
+  Surface image = make_surface(a, 6, 5);
+  for (uint32_t i = 0; i < 30; ++i) image.pixels[i] = 0xFF000000u | (i * 0x080402u);
+  uint8_t coverage[3 * 4] = {255, 0, 255, 0, 255, 0, 255, 255, 255, 0, 0, 255};
+  MaskView mask;
+  mask.coverage = ConstByteView(coverage, sizeof coverage);
+  mask.width = 3;
+  mask.height = 4;
+  mask.pitch = 3;
+  // references: the whole layout at 200 % and at 100 %
+  Surface ref2 = make_surface(a, 128, 80), ref1 = make_surface(a, 64, 40);
+  SoftwareRenderer2D d2(ref2, nullptr, &a), d1(ref1, nullptr, &a);
+  ScaledRenderer2D s2(a, d2, 200);
+  draw_multi_scene(s2, image, mask);
+  draw_multi_scene(d1, image, mask);
+  // the monitors
+  Surface left = make_surface(a, 64, 80), right = make_surface(a, 32, 40);
+  SoftwareRenderer2D dl(left, nullptr, &a), dr(right, nullptr, &a);
+  ScaledRenderer2D vl(a, dl, 200), vr(a, dr, 100);
+  vr.set_origin(32, 0);
+  MultiScaleRenderer2D multi(a, nullptr);
+  IRenderer2D* views[2] = {&vl, &vr};
+  CHECK(multi.set_views(ArrayView<IRenderer2D* const>(views, 2), Extent2D{64, 40}));
+  CHECK(multi.extent().width == 64 && multi.scale_percent() == 200 && multi.device_views() == 2);
+  DeviceView v;
+  CHECK(multi.device_view(1, &v) && v.device == &dr && v.units == &vr && v.percent == 100 && v.origin_x == 32 && !multi.device_view(2, &v));
+  draw_multi_scene(multi, image, mask);
+  uint32_t wrong_left = 0, wrong_right = 0;
+  for (uint32_t y = 0; y < 80; ++y) for (uint32_t x = 0; x < 64; ++x) wrong_left += px(left, x, y) != px(ref2, x, y);
+  for (uint32_t y = 0; y < 40; ++y) for (uint32_t x = 0; x < 32; ++x) wrong_right += px(right, x, y) != px(ref1, 32 + x, y);
+  if (wrong_left || wrong_right) printf("multi scale: %u left, %u right pixels differ\n", wrong_left, wrong_right);
+  CHECK(wrong_left == 0 && wrong_right == 0);
+  CHECK(!multi.copy_rect({0, 0, 4, 4}, 8, 8));      // (declined: a copy cannot cross monitors)
+  // matrices with an origin: a picture's point p placed at m(p) in units is at k (m(p) - o) on the device; a map of the plane m becomes D m D^-1
+  ScaledRenderer2D vo(a, dl, 200);
+  vo.set_origin(32, 4);
+  Matrix2D moved;
+  moved.e = 40;      // (a picture's (0, 0) at unit (40, 6))
+  moved.f = 6;
+  const Matrix2D placed = vo.up(moved);
+  CHECK(placed.a == 2 && placed.e == 16 && placed.f == 4);      // ((40 - 32) x 2, (6 - 4) x 2)
+  Matrix2D shift;
+  shift.e = 3;      // (the plane moved 3 units right)
+  shift.a = shift.d = 2;      // (and doubled about unit (0, 0))
+  const Matrix2D c = vo.conjugate(shift);      // device q -> D(m(D^-1 q)): D^-1(0, 0) = (32, 4) -> m = (67, 8) -> D = (70, 8)
+  CHECK(c.a == 2 && c.d == 2 && c.e == 70 && c.f == 8);
+  bool fresh = false;
+  CHECK(!multi.begin_retained(1, {0, 0, 8, 8}, {0, 0, 8, 8}, &fresh));
+  // the frame read back: each monitor's part from its own pixels (the 200 % one's units at their top left pixels)
+  std::vector<uint32_t> frame(64 * 40, 0);
+  CHECK(multi.read_frame(ArrayView<uint32_t>(frame.data(), frame.size())));
+  CHECK(frame[3 * 64 + 2] == px(ref1, 2, 3) && frame[20 * 64 + 40] == px(ref1, 40, 20));
+  for (Surface* s : {&image, &ref2, &ref1, &left, &right}) release_view(a, s->pixels);
+}
+
 // A device that is not a whole number of units: 400 pixels at 150 % are 266 units, which map to 399. The layout's far edge reaches the device's, so
 // filling the whole layout covers every pixel; inside, the mapping is as it was.
 static void test_scaled_far_edge() {
@@ -2233,6 +2295,7 @@ int main() {
   test_scaled_2d();
   test_cell_text_face();
   test_scaled_far_edge();
+  test_multi_scale();
   test_3d();
   test_device_2d();
   test_device_2d_large_image();

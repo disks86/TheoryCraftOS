@@ -24,6 +24,7 @@
 #include <vector>
 #include "FakeMonitors.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
+#include "Hardware/Monitor/MonitorRenderers.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 
 using namespace hardware;
@@ -441,6 +442,44 @@ static void test_monitor_display() {
   CHECK(a.live == 0);
 }
 
+// Monitors at different scales, each drawn at its own: A at 200 % (800x400 pixels, 400x200 units), B at 100 % (400x300) beside it. The desktop's
+// layout is 800x300 units; a rectangle across the seam lands on A at twice the size and on B 1:1, each at its place on the device.
+static void test_monitor_renderers() {
+  TestAllocator a;
+  {
+    FakeGpu gpu;
+    gpu.w = 1200;
+    gpu.h = 400;
+    MonitorLayout mixed(a);
+    CHECK(mixed.add(0, 800, 400) && mixed.set_mode(0, 800, 400, 200) && mixed.add(1, 400, 300));
+    CHECK(MonitorRenderers::mixed_scales(mixed));
+    MonitorLayout same(a);
+    CHECK(same.add(0, 800, 400) && same.add(1, 400, 300) && !MonitorRenderers::mixed_scales(same));
+    ScanoutPlacement two[2] = {{0, 0, 0, 800, 400}, {1, 800, 0, 400, 300}};
+    MonitorRenderers views(gpu, a);
+    CHECK(views.update(mixed, two, 2) && views.view_count() == 2);
+    graphics::IRenderer2D& r = views.renderer();
+    CHECK(r.extent().width == 800 && r.extent().height == 300 && r.scale_percent() == 200 && r.device_views() == 2);
+    graphics::DeviceView va, vb;
+    CHECK(r.device_view(0, &va) && va.percent == 200 && va.origin_x == 0 && r.device_view(1, &vb) && vb.percent == 100 && vb.origin_x == 400);
+    r.clear(0xFF000000u);
+    r.fill_rect({390, 10, 20, 5}, 0xFFFF0000u);
+    r.present();
+    auto at = [&](uint32_t x, uint32_t y) { return gpu.screen[size_t{y} * 1200 + x] & 0xFFFFFF; };
+    CHECK(at(780, 20) == 0xFF0000 && at(799, 29) == 0xFF0000 && at(779, 20) == 0 && at(780, 30) == 0);      // A: units 390..399, 10..14 doubled
+    CHECK(at(800, 10) == 0xFF0000 && at(809, 14) == 0xFF0000 && at(810, 10) == 0 && at(800, 15) == 0);      // B: units 400..409 at its pixels 0..9
+    CHECK(gpu.presents >= 1);
+    // the frame read back is the layout's: each monitor's part from its own pixels
+    std::vector<uint32_t> frame(800 * 300, 0);
+    CHECK(r.read_frame(ArrayView<uint32_t>(frame.data(), frame.size())));
+    CHECK((frame[10 * 800 + 395] & 0xFFFFFF) == 0xFF0000 && (frame[12 * 800 + 405] & 0xFFFFFF) == 0xFF0000 && (frame[20 * 800 + 405] & 0xFFFFFF) == 0);
+    // refused: a monitor with no place on the device (the old views stay)
+    ScanoutPlacement off[2] = {{0, 0, 0, 800, 400}, {1, 1000, 0, 400, 300}};
+    CHECK(!views.update(mixed, off, 2) && views.view_count() == 2);
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_system_monitors() {
   TestAllocator a;
   {
@@ -567,6 +606,7 @@ int main() {
   test_layout_editing();
   test_monitor_modes();
   test_monitor_display();
+  test_monitor_renderers();
   test_system_monitors();
   if (g_failed) { printf("%d check(s) failed\n", g_failed); return 1; }
   printf("monitor tests passed\n");

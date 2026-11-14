@@ -89,6 +89,17 @@ constexpr uint32_t kMaxGradientStops = 32;  // further stops are ignored
 constexpr uint32_t kMaxClipDepth = 32;
 constexpr uint32_t kMaxLayerDepth = 8;
 
+class IRenderer2D;
+
+// One device a renderer draws on (IRenderer2D::device_view): `units` draws on it alone, in the renderer's own coordinates (its clip and blend in force);
+// `device` is that device's renderer, where unit (x, y) is pixel (units_to_device(x - origin_x, percent), units_to_device(y - origin_y, percent)).
+struct DeviceView {
+  IRenderer2D* units = nullptr;
+  IRenderer2D* device = nullptr;
+  uint32_t percent = 100;
+  int32_t origin_x = 0, origin_y = 0;
+};
+
 class IRenderer2D {
  public:
   virtual const char* name() const = 0;
@@ -279,6 +290,15 @@ class IRenderer2D {
   // Pictures that were made at the device's resolution (a program that draws at the desktop's scale) are drawn there 1:1 instead of being enlarged.
   virtual uint32_t scale_percent() const { return 100; }
   virtual IRenderer2D& device() { return *this; }
+  // Monitors at different scales: the desktop is drawn on several devices at once (MultiScaleRenderer2D), each its own density. A picture made at a
+  // device's resolution goes on each view's `device` (1:1 where its scale is the view's, else through the view's `units` renderer). One view (this
+  // renderer and its device) for the others.
+  virtual uint32_t device_views() { return 1; }
+  virtual bool device_view(uint32_t index, DeviceView* out) {
+    if (index != 0) return false;
+    *out = DeviceView{this, &device(), scale_percent(), 0, 0};
+    return true;
+  }
 
   // Makes everything drawn so far visible.
   virtual void present() = 0;

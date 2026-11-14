@@ -39,9 +39,21 @@ WindowsRect windows_rect(const gui::Rect2D& r) { return {r.x, r.y, r.width, r.he
 void Win32WindowView::paint(gui::Painter& painter) {
   uint32_t w = 0, h = 0;
   graphics::IRenderer2D& r = painter.renderer();
-  const uint32_t k = r.scale_percent();
-  const bool sharp = k > 100 && session_.draw_window_scaled(window_, r.device(), graphics::units_to_device(painter.origin_x(), k), graphics::units_to_device(painter.origin_y(), k), k, &w, &h);
-  if (!sharp && !session_.draw_window(window_, r, painter.origin_x(), painter.origin_y(), &w, &h)) w = h = 0;
+  // on every device the desktop draws on (one, or each monitor at its own scale): 1:1 where the program draws at that device's scale, else through
+  // that device's units (enlarged or shrunk for it)
+  const uint32_t views = r.device_views();
+  bool drawn = false;
+  for (uint32_t i = 0; i < views; ++i) {
+    graphics::DeviceView v;
+    if (!r.device_view(i, &v)) continue;
+    uint32_t vw = 0, vh = 0;
+    const int32_t ox = painter.origin_x() - v.origin_x, oy = painter.origin_y() - v.origin_y;
+    const bool sharp = v.percent > 100 && session_.draw_window_scaled(window_, *v.device, graphics::units_to_device(ox, v.percent), graphics::units_to_device(oy, v.percent), v.percent, &vw, &vh);
+    if (!sharp && !session_.draw_window(window_, *v.units, painter.origin_x(), painter.origin_y(), &vw, &vh)) continue;
+    if (!drawn || vw < w) w = vw;      // (what every device got: the rest is filled below)
+    if (!drawn || vh < h) h = vh;
+    drawn = true;
+  }
   // what the surface does not cover yet (the frame was sized and the program has not caught up): black
   if (bounds_.width > w) painter.fill({static_cast<int32_t>(w), 0, bounds_.width - w, bounds_.height}, 0xFF000000u);
   if (bounds_.height > h) painter.fill({0, static_cast<int32_t>(h), w < bounds_.width ? w : bounds_.width, bounds_.height - h}, 0xFF000000u);

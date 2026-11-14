@@ -67,6 +67,7 @@
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
 #include "Graphics/Graphics2D/CellTextFace.hpp"
+#include "Hardware/Monitor/MonitorRenderers.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
@@ -1501,17 +1502,30 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // HiDPI: with a monitor at a scale (125 % .. 400 %) the desktop draws at it (SystemMonitors::render_percent): the renderer is
   // the device's one at that size under a ScaledRenderer2D, which the desktop keeps (its coordinates stay the layout's); programs that draw at the scale are
   // drawn 1:1 through it (IRenderer2D::device()).
+  // Monitors at different scales are each drawn at their own (MonitorRenderers: a view per monitor, the desktop's calls going to all of them).
   struct DisplayPipeline {
     hardware::SystemMonitors* monitors;
     graphics::SystemGraphics* graphics;
     hardware::MonitorDisplay* display;
     graphics::ScaledRenderer2D* scaled;
+    hardware::MonitorRenderers* views;
+    graphics::ICellTextFace* text;
+    bool per_monitor = false;
     static graphics::IRenderer2D* apply(void* context) {
       auto* self = static_cast<DisplayPipeline*>(context);
       if (!self->monitors->apply()) return nullptr;
       hardware::ScanoutPlacement placements[16];
       const uint32_t count = self->monitors->physical_placements(placements, 16);
       const uint32_t k = self->monitors->render_percent();
+      self->per_monitor = false;
+      if (self->views && self->scaled && hardware::MonitorRenderers::mixed_scales(self->monitors->layout()) &&
+          self->views->update(self->monitors->layout(), placements, count, self->text)) {
+        self->graphics->set_display_override(nullptr);
+        self->graphics->reset_renderer();      // (the device is drawn by the views now)
+        self->scaled->set_device(self->views->renderer(), 100);
+        self->per_monitor = true;
+        return self->scaled;
+      }
       const bool compose = self->monitors->needs_compositing() && self->display->update(self->monitors->layout(), placements, count, k);
       self->graphics->set_display_override(compose ? self->display : nullptr);
       self->graphics->reset_renderer();
@@ -1529,7 +1543,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     cell_text = UniquePointer<graphics::CellTextFace>::make(shared_allocator, shared_allocator);
     if (scaled_renderer && cell_text && cell_text->ready()) scaled_renderer->set_text_face(cell_text.get());
   }
-  DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get(), scaled_renderer.get()};
+  UniquePointer<hardware::MonitorRenderers> monitor_views = gpu ? UniquePointer<hardware::MonitorRenderers>::make(shared_allocator, *gpu, shared_allocator) : UniquePointer<hardware::MonitorRenderers>();
+  DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get(), scaled_renderer.get(), monitor_views.get(),
+                                   cell_text && cell_text->ready() ? cell_text.get() : nullptr};
   if (gpu && monitor_display && (monitors.layout().count() > 1 || monitors.needs_compositing())) {
     if (DisplayPipeline::apply(&display_pipeline)) {
       Entry(Level::Ok, "Monitors").dec(monitors.layout().enabled_count()).text(" monitors, desktop ").dec(monitors.desktop_width()).text("x").dec(monitors.desktop_height());
@@ -1537,8 +1553,11 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       Entry(Level::Warning, "Monitors").text("the display device cannot show the monitors separately; using one");
     }
   }
-  graphics::IRenderer2D* renderer = gpu ? system_graphics.renderer_2d() : nullptr;
-  if (renderer && scaled_renderer) {      // (the desktop draws through the scaling renderer, so that a later change of scale keeps it)
+  graphics::IRenderer2D* renderer = gpu ? (display_pipeline.per_monitor ? &monitor_views->renderer() : system_graphics.renderer_2d()) : nullptr;
+  if (renderer && scaled_renderer && display_pipeline.per_monitor) {
+    scaled_renderer->set_device(*renderer, 100);      // (every monitor at its own scale: the views)
+    renderer = scaled_renderer.get();
+  } else if (renderer && scaled_renderer) {      // (the desktop draws through the scaling renderer, so that a later change of scale keeps it)
     scaled_renderer->set_device(*renderer, monitor_display && monitor_display->width() != 0 && renderer->extent().width == monitor_display->width()
                                                ? monitor_display->render_percent() : 100);
     renderer = scaled_renderer.get();

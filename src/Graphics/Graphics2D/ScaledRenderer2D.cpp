@@ -28,7 +28,8 @@ Extent2D ScaledRenderer2D::extent() const {
 
 // A device whose size is not a whole number of units (400 rows at 150 % are 266 units, which map back to 399 rows) has pixels past the last unit's
 // edge: the layout's far edge, and everything beyond it, moves by that slack, so what reaches the edge of the screen covers it.
-int32_t ScaledRenderer2D::edge(int32_t v, bool vertical) const {
+int32_t ScaledRenderer2D::edge(int32_t v_layout, bool vertical) const {
+  const int32_t v = v_layout - (vertical ? origin_y_ : origin_x_);      // (this renderer's own units: its device starts at its origin)
   const int32_t d = units_to_device(v, percent_);
   const Extent2D e = device_->extent();
   const int32_t device_size = static_cast<int32_t>(vertical ? e.height : e.width);
@@ -39,10 +40,10 @@ int32_t ScaledRenderer2D::edge(int32_t v, bool vertical) const {
 }
 
 Rect2D ScaledRenderer2D::up(const Rect2D& r) const {
-  if (percent_ == 100) return r;
+  if (identity()) return r;
   const int64_t right = int64_t{r.x} + r.width, bottom = int64_t{r.y} + r.height;
   if (right > INT32_MAX || bottom > INT32_MAX)
-    return {units_to_device(r.x, percent_), units_to_device(r.y, percent_), units_span_to_device(r.x, r.width, percent_), units_span_to_device(r.y, r.height, percent_)};
+    return {up_x(r.x), up_y(r.y), units_span_to_device(r.x - origin_x_, r.width, percent_), units_span_to_device(r.y - origin_y_, r.height, percent_)};
   const int32_t x0 = edge(r.x, false), y0 = edge(r.y, true), x1 = edge(int32_t(right), false), y1 = edge(int32_t(bottom), true);
   return {x0, y0, static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)};
 }
@@ -52,24 +53,26 @@ CornerRadii ScaledRenderer2D::up(const CornerRadii& r) const {
   return {r.tl_x * k, r.tl_y * k, r.tr_x * k, r.tr_y * k, r.br_x * k, r.br_y * k, r.bl_x * k, r.bl_y * k};
 }
 
-Matrix2D ScaledRenderer2D::up(const Matrix2D& m) const {
+Matrix2D ScaledRenderer2D::up(const Matrix2D& m) const {      // D m, where D(p) = k (p - origin)
   const float k = factor();
-  return {m.a * k, m.b * k, m.c * k, m.d * k, m.e * k, m.f * k};
+  return {m.a * k, m.b * k, m.c * k, m.d * k, (m.e - float(origin_x_)) * k, (m.f - float(origin_y_)) * k};
 }
 
 Matrix2D ScaledRenderer2D::conjugate(const Matrix2D& m) const {
   const float k = factor();
-  return {m.a, m.b, m.c, m.d, m.e * k, m.f * k};      // (S m S^-1: the linear part is the same, the translation is in device pixels)
+  // D m D^-1 with D(p) = k (p - o): the linear part is the same; the translation is k (m(o) - o), in device pixels
+  const float ox = float(origin_x_), oy = float(origin_y_);
+  return {m.a, m.b, m.c, m.d, k * (m.a * ox + m.c * oy + m.e - ox), k * (m.b * ox + m.d * oy + m.f - oy)};
 }
 
 void ScaledRenderer2D::put_pixel(int32_t x, int32_t y, uint32_t color) {
-  if (percent_ == 100) { device_->put_pixel(x, y, color); return; }
+  if (identity()) { device_->put_pixel(x, y, color); return; }
   device_->fill_rect(up(Rect2D{x, y, 1, 1}), color);
 }
 
 // A line one unit thick: an upright one is a rectangle; any other is drawn once per device pixel of a unit's thickness.
 void ScaledRenderer2D::draw_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color) {
-  if (percent_ == 100) { device_->draw_line(x0, y0, x1, y1, color); return; }
+  if (identity()) { device_->draw_line(x0, y0, x1, y1, color); return; }
   if (x0 == x1 || y0 == y1) {
     const int32_t lx = x0 < x1 ? x0 : x1, ly = y0 < y1 ? y0 : y1;
     const uint32_t w = static_cast<uint32_t>((x0 < x1 ? x1 - x0 : x0 - x1)) + 1, h = static_cast<uint32_t>((y0 < y1 ? y1 - y0 : y0 - y1)) + 1;
@@ -77,13 +80,13 @@ void ScaledRenderer2D::draw_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
     return;
   }
   const int32_t t = static_cast<int32_t>((percent_ + 99) / 100);
-  const int32_t dx0 = up_x(x0), dy0 = up_x(y0), dx1 = up_x(x1), dy1 = up_x(y1);
+  const int32_t dx0 = up_x(x0), dy0 = up_y(y0), dx1 = up_x(x1), dy1 = up_y(y1);
   for (int32_t j = 0; j < t; ++j)
     for (int32_t i = 0; i < t; ++i) device_->draw_line(dx0 + i, dy0 + j, dx1 + i, dy1 + j, color);
 }
 
 void ScaledRenderer2D::draw_rect(const Rect2D& rect, uint32_t color) {
-  if (percent_ == 100) { device_->draw_rect(rect, color); return; }
+  if (identity()) { device_->draw_rect(rect, color); return; }
   if (rect.width == 0 || rect.height == 0) return;
   const int32_t r = rect.x + static_cast<int32_t>(rect.width) - 1, b = rect.y + static_cast<int32_t>(rect.height) - 1;
   device_->fill_rect(up(Rect2D{rect.x, rect.y, rect.width, 1}), color);      // (each side a row or column of units)
@@ -95,24 +98,24 @@ void ScaledRenderer2D::draw_rect(const Rect2D& rect, uint32_t color) {
 }
 
 void ScaledRenderer2D::fill_circle(int32_t cx, int32_t cy, uint32_t radius, uint32_t color) {
-  if (percent_ == 100) { device_->fill_circle(cx, cy, radius, color); return; }
+  if (identity()) { device_->fill_circle(cx, cy, radius, color); return; }
   const Rect2D c = up(Rect2D{cx, cy, 1, 1});
   device_->fill_circle(c.x + static_cast<int32_t>(c.width / 2), c.y + static_cast<int32_t>(c.height / 2), static_cast<uint32_t>(float(radius) * factor()), color);
 }
 
 void ScaledRenderer2D::draw_image(const Surface& source, const Rect2D& source_rect, int32_t x, int32_t y) {
-  if (percent_ == 100) { device_->draw_image(source, source_rect, x, y); return; }
+  if (identity()) { device_->draw_image(source, source_rect, x, y); return; }
   device_->draw_image_scaled(source, RectF{float(source_rect.x), float(source_rect.y), float(source_rect.width), float(source_rect.height)},
                              up(Rect2D{x, y, source_rect.width, source_rect.height}), whole() ? ImageFilter::Nearest : ImageFilter::Bilinear);
 }
 
 // The 8x16 font enlarged: each glyph's rows as runs of set pixels, one rectangle per run (mapped by its edges).
 void ScaledRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_t color) {
-  if (percent_ == 100) { device_->draw_text(x, y, text, color); return; }
+  if (identity()) { device_->draw_text(x, y, text, color); return; }
   if (!text) return;
   constexpr int32_t kCellW = static_cast<int32_t>(hardware::Font8x16::kWidth), kCellH = static_cast<int32_t>(hardware::Font8x16::kHeight);
   for (char32_t c = hardware::utf8_next(text); c != 0; c = hardware::utf8_next(text), x += kCellW) {
-    if (text_face_ && text_face_->draw_cell(*device_, c, up(Rect2D{x, y, uint32_t(kCellW), uint32_t(kCellH)}), color)) continue;
+    if (text_face_ && percent_ != 100 && text_face_->draw_cell(*device_, c, up(Rect2D{x, y, uint32_t(kCellW), uint32_t(kCellH)}), color)) continue;
     uint8_t glyph[hardware::Font8x16::kHeight];
     hardware::Font8x16::glyph_of(c, glyph);
     for (uint32_t j = 0; j < hardware::Font8x16::kHeight; ++j) {
@@ -129,16 +132,16 @@ void ScaledRenderer2D::draw_text(int32_t x, int32_t y, const char* text, uint32_
 }
 
 void ScaledRenderer2D::stroke_rounded_rect(const Rect2D& outer, const CornerRadii& radii, const EdgeWidths& widths, uint32_t color) {
-  if (percent_ == 100) { device_->stroke_rounded_rect(outer, radii, widths, color); return; }
+  if (identity()) { device_->stroke_rounded_rect(outer, radii, widths, color); return; }
   auto w = [&](uint32_t v) { return v == 0 ? 0u : static_cast<uint32_t>(units_to_device(static_cast<int32_t>(v), percent_)); };
   device_->stroke_rounded_rect(up(outer), up(radii), {w(widths.top), w(widths.right), w(widths.bottom), w(widths.left)}, color);
 }
 
 bool ScaledRenderer2D::draw_image_tiled(const Surface& tile, int32_t origin_x, int32_t origin_y, uint32_t cell_w, uint32_t cell_h, const Rect2D& area) {
-  if (percent_ == 100) return device_->draw_image_tiled(tile, origin_x, origin_y, cell_w, cell_h, area);
+  if (identity()) return device_->draw_image_tiled(tile, origin_x, origin_y, cell_w, cell_h, area);
   if (!whole()) return false;      // (cells of a fractional size do not tile evenly: the caller draws the copies, each mapped by its edges)
   const uint32_t k = percent_ / 100;
-  return device_->draw_image_tiled(tile, origin_x * static_cast<int32_t>(k), origin_y * static_cast<int32_t>(k), cell_w * k, cell_h * k, up(area));
+  return device_->draw_image_tiled(tile, (origin_x - origin_x_) * static_cast<int32_t>(k), (origin_y - origin_y_) * static_cast<int32_t>(k), cell_w * k, cell_h * k, up(area));
 }
 
 bool ScaledRenderer2D::enlarge(const MaskView& mask, const Rect2D& source_rect, uint32_t ow, uint32_t oh, MaskView* out) {
@@ -168,7 +171,7 @@ bool ScaledRenderer2D::enlarge(const MaskView& mask, const Rect2D& source_rect, 
 }
 
 void ScaledRenderer2D::draw_mask(const MaskView& mask, const Rect2D& source_rect, int32_t x, int32_t y, uint32_t color) {
-  if (percent_ == 100) { device_->draw_mask(mask, source_rect, x, y, color); return; }
+  if (identity()) { device_->draw_mask(mask, source_rect, x, y, color); return; }
   const Rect2D d = up(Rect2D{x, y, source_rect.width, source_rect.height});
   MaskView big;
   if (!enlarge(mask, source_rect, d.width, d.height, &big)) return;
@@ -176,7 +179,7 @@ void ScaledRenderer2D::draw_mask(const MaskView& mask, const Rect2D& source_rect
 }
 
 void ScaledRenderer2D::draw_glyph(uint64_t id, const MaskView& mask, int32_t x, int32_t y, uint32_t color) {
-  if (percent_ == 100) { device_->draw_glyph(id, mask, x, y, color); return; }
+  if (identity()) { device_->draw_glyph(id, mask, x, y, color); return; }
   const Rect2D d = up(Rect2D{x, y, mask.width, mask.height});
   MaskView big;
   if (!enlarge(mask, Rect2D{0, 0, mask.width, mask.height}, d.width, d.height, &big)) return;
@@ -186,7 +189,7 @@ void ScaledRenderer2D::draw_glyph(uint64_t id, const MaskView& mask, int32_t x, 
 }
 
 bool ScaledRenderer2D::push_clip_mask(const MaskView& mask, int32_t x, int32_t y) {
-  if (percent_ == 100) return device_->push_clip_mask(mask, x, y);
+  if (identity()) return device_->push_clip_mask(mask, x, y);
   const Rect2D d = up(Rect2D{x, y, mask.width, mask.height});
   MaskView big;
   if (!enlarge(mask, Rect2D{0, 0, mask.width, mask.height}, d.width, d.height, &big)) return device_->push_clip_rect(Rect2D{d.x, d.y, 0, 0});      // (nothing shows)
@@ -194,23 +197,23 @@ bool ScaledRenderer2D::push_clip_mask(const MaskView& mask, int32_t x, int32_t y
 }
 
 bool ScaledRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) {
-  if (percent_ == 100) return device_->copy_rect(source, dest_x, dest_y);
-  return device_->copy_rect(up(source), up_x(dest_x), up_x(dest_y));
+  if (identity()) return device_->copy_rect(source, dest_x, dest_y);
+  return device_->copy_rect(up(source), up_x(dest_x), up_y(dest_y));
 }
 
 bool ScaledRenderer2D::draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) {
-  if (percent_ == 100) return device_->draw_device_image(owner, image, source, x, y);
+  if (identity()) return device_->draw_device_image(owner, image, source, x, y);
   // enlarged on the device by its edges, as draw_image enlarges a picture (nearest at a whole scale, filtered at a fractional one)
   return device_->draw_device_image_scaled(owner, image, source, up(Rect2D{x, y, source.width, source.height}), whole() ? ImageFilter::Nearest : ImageFilter::Bilinear);
 }
 
 bool ScaledRenderer2D::draw_device_image_scaled(IGraphicsDevice& owner, IImage& image, const Rect2D& source, const Rect2D& dest, ImageFilter filter) {
-  if (percent_ == 100) return device_->draw_device_image_scaled(owner, image, source, dest, filter);
+  if (identity()) return device_->draw_device_image_scaled(owner, image, source, dest, filter);
   return device_->draw_device_image_scaled(owner, image, source, up(dest), filter);
 }
 
 bool ScaledRenderer2D::read_frame(ArrayView<uint32_t> out) {
-  if (percent_ == 100) return device_->read_frame(out);
+  if (identity()) return device_->read_frame(out);
   const Extent2D d = device_->extent(), l = extent();
   const uint64_t device_pixels = uint64_t{d.width} * d.height, pixels = uint64_t{l.width} * l.height;
   if (out.size() < pixels) return false;
@@ -219,9 +222,9 @@ bool ScaledRenderer2D::read_frame(ArrayView<uint32_t> out) {
   for (uint64_t i = 0; i < device_pixels; ++i) frame_.push_back(0);
   if (!device_->read_frame(frame_.view())) return false;
   for (uint64_t y = 0; y < l.height; ++y) {
-    const uint64_t dy = static_cast<uint64_t>(up_x(static_cast<int32_t>(y)));
+    const uint64_t dy = static_cast<uint64_t>(units_to_device(static_cast<int32_t>(y), percent_));      // (its own units, from its origin)
     for (uint64_t x = 0; x < l.width; ++x) {
-      const uint64_t dx = static_cast<uint64_t>(up_x(static_cast<int32_t>(x)));
+      const uint64_t dx = static_cast<uint64_t>(units_to_device(static_cast<int32_t>(x), percent_));
       out[y * l.width + x] = dy < d.height && dx < d.width ? frame_[dy * d.width + dx] : 0;
     }
   }
