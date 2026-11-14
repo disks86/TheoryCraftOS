@@ -3786,8 +3786,12 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       getOwnPropertyDescriptor: function (t, k) {
         if (kind === 'f' && k === 'prototype') return Object.getOwnPropertyDescriptor(t, k);
         var key = keyOut(k);
-        if (key === null || !crossIn(remoteCall(t.info, 'has', key))) return undefined;
-        return { value: crossIn(remoteCall(t.info, 'get', key)), writable: true, enumerable: true, configurable: true };
+        if (key === null) return undefined;
+        var r = remoteCall(t.info, 'own', key);   // (what the object itself has under that name, there: not what it inherits)
+        if (r[0] !== 'D') return undefined;
+        // (configurable whatever it is there: a stand-in may not report a fixed property that its own target lacks)
+        if (r[1] & 8) return { get: crossIn(r[2]), set: crossIn(r[3]), enumerable: (r[1] & 1) !== 0, configurable: true };
+        return { value: crossIn(r[2]), writable: (r[1] & 2) !== 0, enumerable: (r[1] & 1) !== 0, configurable: true };
       },
       apply: function (t, self, args) { return crossIn(remoteCall(t.info, 'call', '', [crossOut(self)].concat(args.map(crossOut)))); },
       construct: function (t, args) { return crossIn(remoteCall(t.info, 'new', '', args.map(crossOut))); }
@@ -3927,6 +3931,13 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'has': out = ['b', key in Object(target)]; break;
         case 'delete': out = ['b', delete target[key]]; break;
         case 'keys': out = ['k', Object.keys(Object(target))]; break;
+        case 'own': {
+          var d = Object.getOwnPropertyDescriptor(Object(target), key);
+          if (!d) out = ['u'];
+          else if ('value' in d) out = ['D', (d.enumerable ? 1 : 0) | (d.writable ? 2 : 0), crossOut(d.value)];
+          else out = ['D', 8 | (d.enumerable ? 1 : 0), crossOut(d.get), crossOut(d.set)];
+          break;
+        }
         case 'call': out = crossOut(Function.prototype.apply.call(target, args[0], args.slice(1))); break;
         case 'new': out = crossOut(Reflect.construct(target, args)); break;
         case 'text': out = ['s', functionText.call(target)]; break;
@@ -11992,23 +12003,29 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
         enumerable: false, configurable: true });
     });
   });
-  // The navigator and the screen have no properties of their own: what they answer is an attribute or a method of their interface, on its prototype
+  // The navigator and the screen (and, at the end of this library, the history, the performance object and the document) have no properties of their own: what they answer is an attribute or a method of their interface, on its prototype
   // (a script that asks whether navigator has a `webdriver` of its own is asking whether somebody put one there). The values move to a record the
   // getters read, which is also where the window writes a new screen size.
-  var lift = function (object, C) {
-    if (object === null || typeof object !== 'object' || typeof C !== 'function' || Object.getPrototypeOf(object) !== C.prototype) return;
-    var proto = C.prototype, values = {};
+  var lift = function (object, C, writable, target) {
+    if (object === null || typeof object !== 'object' || typeof C !== 'function' || !(object instanceof C)) return;
+    var proto = target || C.prototype, values = {};
     Object.getOwnPropertyNames(object).forEach(function (n) {
-      var d = Object.getOwnPropertyDescriptor(object, n);
+      var d = Object.getOwnPropertyDescriptor(object, n), there = Object.getOwnPropertyDescriptor(proto, n);
       if (!d || !d.configurable) return;
       delete object[n];
+      if ('value' in d && d.value === null && there && typeof there.set === 'function') return;   // (an event handler nobody set: the prototype's accessor answers null)
       if ('value' in d && typeof d.value === 'function') { Object.defineProperty(proto, n, { value: d.value, writable: true, enumerable: true, configurable: true }); return; }
-      var get = d.get;
-      if ('value' in d) { values[n] = d.value; get = function () { var held = __mark_get(this, '__values'); return held ? held[n] : undefined; }; }
+      var get = d.get, set = d.set;
+      if ('value' in d) {
+        values[n] = d.value;
+        get = function () { var held = __mark_get(this, '__values'); return held ? held[n] : undefined; };
+        if (writable && writable.indexOf(n) >= 0) set = function (v) { if (this === proto) throw new TypeError('Illegal invocation'); var held = __mark_get(this, '__values'); if (held) held[n] = v; };
+      }
       if (typeof get !== 'function') return;
       var getter = function () { if (this === proto) throw new TypeError('Illegal invocation'); return get.call(this); };
       Object.defineProperty(getter, 'name', { value: 'get ' + n, configurable: true });
-      Object.defineProperty(proto, n, { get: getter, set: d.set, enumerable: true, configurable: true });
+      if (typeof set === 'function') Object.defineProperty(set, 'name', { value: 'set ' + n, configurable: true });
+      Object.defineProperty(proto, n, { get: getter, set: set, enumerable: true, configurable: true });
     });
     __mark_set(object, '__values', values);
   };
@@ -12676,6 +12693,68 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (C.name !== name && typeof g[C.name] === 'function' && g[C.name] === C) return;   // (another name of an interface: its own name tags it)
     try { Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { }
   });
+  // Each member is on the prototype of the interface that declares it, and nowhere above: an <img> has no `play` or `getContext` to find, and
+  // `querySelector` is Element's (and Document's and DocumentFragment's), not Node's. Scripts list the prototypes along an element's chain and look
+  // at what they find there; this implementation defines many members once, on a prototype every element shares, and they move here.
+  var relocate = function (from, names, to) {
+    var F = g[from];
+    if (typeof F !== 'function' || !F.prototype) return;
+    names.split(' ').forEach(function (n) {
+      var d = Object.getOwnPropertyDescriptor(F.prototype, n);
+      if (!d || !d.configurable) return;
+      delete F.prototype[n];
+      to.split(' ').forEach(function (t) {
+        var T = g[t];
+        if (typeof T === 'function' && T.prototype && !Object.prototype.hasOwnProperty.call(T.prototype, n)) Object.defineProperty(T.prototype, n, d);
+      });
+    });
+  };
+  ['Node', 'Element', 'HTMLElement'].forEach(function (from) {
+    relocate(from, 'play pause load fastSeek canPlayType onencrypted onwaitingforkey', 'HTMLMediaElement');
+    relocate(from, 'captureStream', 'HTMLMediaElement HTMLCanvasElement');
+    relocate(from, 'getContext toDataURL toBlob transferControlToOffscreen', 'HTMLCanvasElement');
+    relocate(from, 'submit requestSubmit reset', 'HTMLFormElement');
+    relocate(from, 'checkValidity reportValidity', 'HTMLFormElement HTMLInputElement HTMLSelectElement HTMLTextAreaElement HTMLButtonElement HTMLFieldSetElement HTMLOutputElement HTMLObjectElement');
+    relocate(from, 'setCustomValidity', 'HTMLInputElement HTMLSelectElement HTMLTextAreaElement HTMLButtonElement HTMLFieldSetElement HTMLOutputElement HTMLObjectElement');
+    relocate(from, 'select setSelectionRange setRangeText', 'HTMLInputElement HTMLTextAreaElement');
+    relocate(from, 'showPicker', 'HTMLInputElement HTMLSelectElement');
+    relocate(from, 'stepUp stepDown', 'HTMLInputElement');
+    relocate(from, 'show showModal close', 'HTMLDialogElement');
+    relocate(from, 'popoverTargetElement', 'HTMLButtonElement HTMLInputElement');
+    relocate(from, 'decode', 'HTMLImageElement');
+    relocate(from, 'getElementsByName', 'Document');
+    relocate(from, 'ontouchstart ontouchend ontouchmove ontouchcancel', '');   // (a device with a touch screen has these; this one says it has none)
+  });
+  relocate('HTMLElement', 'onfullscreenchange onfullscreenerror onwebkitfullscreenchange onwebkitfullscreenerror', 'Element');
+  relocate('Element', 'inert autocapitalize translate popover showPopover hidePopover togglePopover', 'HTMLElement');
+  relocate('Element', 'focus blur', 'HTMLElement SVGElement MathMLElement');
+  relocate('Node', 'append prepend replaceChildren querySelector querySelectorAll', 'Element Document DocumentFragment');
+  relocate('Node', 'getElementsByClassName', 'Element Document');
+  relocate('Node', 'before after replaceWith remove', 'Element CharacterData DocumentType');
+  // (the rest of the single objects: the document's attributes are Document's, whatever kind of document it is)
+  lift(g.history, g.History); lift(g.performance, g.Performance);
+  // The location is the other way round: its attributes and methods are its own and cannot be redefined (a page must not be able to make
+  // `location.href` lie), and Location.prototype has nothing but the constructor.
+  if (g.location && typeof g.Location === 'function' && Object.getPrototypeOf(g.location) === g.Location.prototype) {
+    var LP = g.Location.prototype;
+    'valueOf ancestorOrigins href origin protocol host hostname port pathname search hash assign reload replace toString'.split(' ').forEach(function (n) {
+      var d = Object.getOwnPropertyDescriptor(g.location, n) || Object.getOwnPropertyDescriptor(LP, n);
+      if (!d && n === 'valueOf') d = { value: Object.prototype.valueOf };
+      if (!d) return;
+      try {
+        delete LP[n];
+        if (!delete g.location[n]) return;
+        if ('value' in d) Object.defineProperty(g.location, n, { value: d.value, writable: false, enumerable: n !== 'valueOf', configurable: false });
+        else Object.defineProperty(g.location, n, { get: d.get, set: d.set, enumerable: true, configurable: false });
+      } catch (e) { }
+    });
+  }
+  if (g.document && typeof g.Document === 'function') {
+    var has = Object.prototype.hasOwnProperty;
+    handlerAccessors(g.Document, Object.getOwnPropertyNames(g.document).filter(function (n) { return n.indexOf('on') === 0 && g.document[n] === null; }));
+    if (!has.call(g.document, 'readyState')) Object.defineProperty(g.document, 'readyState', { value: 'loading', writable: true, configurable: true });   // (the loader writes it as the page loads)
+    lift(g.document, g.Document, ['dir', 'designMode'], g.Document.prototype);
+  }
   // The members of an interface come before its `constructor` among the properties of its prototype (the order they are listed in: the attributes and
   // operations as the interface declares them, then the constructor), whatever order this implementation happened to add them in.
   var language = { Symbol: 1, BigInt: 1, Promise: 1, Map: 1, Set: 1, WeakMap: 1, WeakSet: 1, WeakRef: 1, FinalizationRegistry: 1, ArrayBuffer: 1, SharedArrayBuffer: 1, DataView: 1 };

@@ -137,6 +137,12 @@ inline uint64_t utf16_to_byte(StringView s, uint64_t unit) {
 }
 inline uint64_t byte_to_utf16(StringView s, uint64_t byte) { return utf16_length(s.first(byte < s.size() ? byte : s.size())); }
 inline Value str_value(Vm& vm, StringView text) { return Value::make_string(vm.new_string(text)); }
+// Where the attribute values of `object` are kept: the object itself until the page library has moved its attributes to the prototype of its interface
+// (WebPrelude.cpp: lift), after that the record their getters read.
+inline JsObject* values_of(Vm& vm, JsObject* object) {
+  Value values;
+  return vm.mark_get(object, vm.intern("__values"), &values) && values.is_object() ? values.as_object() : object;
+}
 inline Value num_value(double d) { return Value::make_number(d); }
 inline Value bool_value(bool b) { return Value::make_bool(b); }
 inline Value object_value(JsObject* o) { return o ? Value::make_object(o) : Value::make_null(); }

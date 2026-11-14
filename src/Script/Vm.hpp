@@ -205,6 +205,8 @@ class Vm {
   bool own_property(JsObject* object, JsString* key, Value* value, uint8_t* flags);
   // A mark the collections keep on an object itself (the identity Map and Set know it by, the entries of the weak collections): an own property outside
   // the object model - not inherited by the objects it is the prototype of, not seen by a proxy's traps, there on a frozen object too.
+  // Does this script function get a `prototype` of its own when it is first asked for one? (Not an arrow, not an async function.)
+  bool makes_prototype(const JsObject* function) const;
   bool mark_get(JsObject* object, JsString* key, Value* out);   // false: the object has no such mark
   void mark_set(JsObject* object, JsString* key, const Value& value);
   bool mark_remove(JsObject* object, JsString* key);
