@@ -87,7 +87,9 @@ struct TopLevelInfo {
   uint32_t surface_id = 0, owner = 0;
   uint32_t icon = 0;         // the small icon to show: WM_SETICON's small or big one, else the class's
   uint64_t pid = 0;
-  bool dpi_aware = false;    // its surface is in device pixels (else in 96-dpi units: the device scale smaller)
+  bool dpi_aware = false;    // its surface is in device pixels (surface_scale 100)
+  uint32_t surface_scale = 100;      // device pixels per surface pixel, in percent: the device scale for an unaware window, the ratio for a system-aware one
+                                     // after the scale grew, 100 for one in device pixels
 };
 bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title);
 // DPI virtualization (Win32kUserDpi.cpp): the desktop's device scale (percent, 100 .. 400); takes the lock. A change moves every
@@ -105,12 +107,12 @@ void top_levels(List<uint32_t>* out);                                      // th
 bool move_top_level(uint32_t hwnd, const gdi::Rect& window);
 bool activate_top_level(uint32_t hwnd);                                     // 0: no Windows window is active (the desktop's own is)
 uint32_t top_level_surface_locked(uint32_t hwnd);
-bool top_level_dpi_aware_locked(uint32_t hwnd);
+uint32_t top_level_surface_scale_locked(uint32_t hwnd);      // device pixels per surface pixel, in percent (100: the surface is in device pixels)
 // Mixed DPI hosting (Win32kUserDpi.cpp): a window surface changed. When it is a mixed child's own surface, its pixels are scaled into its top-level's
 // surface and the top-level and the part of it that changed are given (true); when it is a top-level's, its mixed children are put back over it (false).
 // The caller holds the lock.
 bool mixed_damage_locked(uint32_t window, const gdi::Rect& dirty, uint32_t* top, gdi::Rect* top_dirty);
-int32_t window_dpi_hosting(uint32_t hwnd);      // GetWindowDpiHostingBehavior: 0 default, 1 mixed, -1 no such window                               // its surface is in device pixels (HiDPI); the caller holds the lock                         // the window surface (gdi::window_surface_pixels) of a top-level; the caller holds the lock
+int32_t window_dpi_hosting(uint32_t hwnd);      // GetWindowDpiHostingBehavior: 0 default, 1 mixed, -1 no such window
 bool command_top_level(uint32_t hwnd, uint32_t sc);
 // The cursor the desktop shows over the Windows programs' windows (takes the lock): hidden (ShowCursor's counter below 0, or a program set no cursor), else `cursor`
 // (a cursor handle for cursor_picture; 0 with `system_id` for one of the system's shapes: OCR_NORMAL 32512, OCR_IBEAM 32513 ...).

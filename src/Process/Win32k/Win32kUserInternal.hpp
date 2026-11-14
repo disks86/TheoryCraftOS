@@ -508,7 +508,10 @@ void drop_mixed_surface(Window* m);
 void mixed_tree_changed(Window* top);                     // a window of the tree moved or changed: its mixed children are painted again
 Rect surface_rect_in_window_units(const Window* top);      // a redirected top-level's surface rectangle in its own coordinates (Win32kUserRedirect.cpp)
 void set_device_scale(uint32_t scale);
-uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (1 for an aware window, or with scale 1)
+uint32_t window_scale(const Window* w);         // the factor a window's coordinates are divided by (100 percent for an aware window, or with scale 100)
+uint32_t system_aware_scale(uint32_t context);  // a system-aware context's: the device scale over the scale of the system DPI it was set at (100 otherwise)
+uint32_t window_working_dpi(const Window* w);   // the DPI a window's coordinates are at: 96 unaware, its system DPI system aware, the device's otherwise
+uint32_t dpi_kind(const Window* w);             // windows of the same kind work in the same coordinates: unaware, system aware at a DPI, or device pixels
 uint32_t caller_scale(Call& call);              // the same for the calling thread
 bool thread_unaware(Call& call);
 // (k: the scale in percent, 100 = none; Graphics/DeviceScale.hpp's mapping, so that the desktop and win32k agree to the pixel)

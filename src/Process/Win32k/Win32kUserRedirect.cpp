@@ -136,7 +136,8 @@ bool top_level_info(uint32_t hwnd, TopLevelInfo* out, WideString* title) {
   Window* w = find_window(hwnd);
   if (!on_desktop(w) || w->destroying) return false;
   out->exists = true;
-  out->dpi_aware = !w->dpi_virtual;
+  out->surface_scale = window_scale(w);
+  out->dpi_aware = out->surface_scale == 100;
   out->visible = is_visible(w);
   out->minimized = (w->style & wn::WS_MINIMIZE) != 0;
   out->maximized = (w->style & wn::WS_MAXIMIZE) != 0;
@@ -223,9 +224,9 @@ bool cursor_picture(uint32_t cursor, uint32_t* system_id, List<uint32_t>* argb, 
   return user_misc::cursor_picture(cursor, system_id, argb, width, height, hot_x, hot_y);
 }
 
-bool top_level_dpi_aware_locked(uint32_t hwnd) {
+uint32_t top_level_surface_scale_locked(uint32_t hwnd) {
   Window* w = state_or_null() ? find_window(hwnd) : nullptr;
-  return w && !w->dpi_virtual;
+  return w ? window_scale(w) : 100;
 }
 
 uint32_t top_level_surface_locked(uint32_t hwnd) {

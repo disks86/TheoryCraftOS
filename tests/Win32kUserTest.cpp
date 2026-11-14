@@ -1409,6 +1409,98 @@ void test_dpi_virtualization() {
   gdi::shutdown();
 }
 
+// A system-aware program keeps the system DPI it started at (96 here). After the scale grows to 200 % its windows are virtualized by the ratio, as
+// Windows enlarges them: its coordinates stay what they were, and the desktop draws its pixels twice as large.
+void test_system_aware_scale_change() {
+  Program prog(97), late_prog(98);
+  Th t(prog, 97, kScratch);
+  Th l(late_prog, 98, kScratch);
+  t.proc = [&](Th& th, Call_& c) -> uint64_t { return def_proc(th, c); };
+  l.proc = t.proc;
+  auto pump = [&](Th& th) {
+    Th::M m;
+    for (int i = 0; i < 64 && th.peek(&m); ++i) th.svc(N::NtUserDispatchMessage, {th.tmp(0xA00)});
+  };
+  DesktopBridge bridge;
+  bridge.attach(6, 19);
+  desktop::IWindowsSession::Monitor one[1];
+  one[0].rect = {0, 0, 1024, 768};
+  one[0].work = {0, 0, 1024, 740};
+  one[0].scale_percent = 100;
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  CHECK(t.svc32(N::NtUserSetProcessDpiAwarenessContext, {0x11, 0}) == 1);      // (system aware, at 96 dpi)
+  CHECK(t.atom_class("SysClass") >= 0xC000);
+  const uint32_t w = t.create("SysClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 400, 300, 0, 0, "System aware");
+  CHECK(w != 0);
+  pump(t);
+  user::TopLevelInfo ti;
+  uint32_t sw0 = 0, sh0 = 0;
+  CHECK(user::top_level_info(w, &ti, nullptr) && ti.dpi_aware && ti.surface_scale == 100 && gdi::window_surface_size(ti.surface_id, &sw0, &sh0));
+
+  one[0].scale_percent = 200;
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  pump(t);
+  pump(t);
+  CHECK(gdi::screen_width() == 2048 && user_misc::system_dpi() == 192);
+  // its numbers, DPI and surface as before; twice the device pixels
+  Rc wr = t.window_rect(w);
+  CHECK(wr.l == 100 && wr.t == 100 && wr.r == 500 && wr.b == 400);
+  {
+    user::Window* x = user::find_window(w);
+    CHECK(x && x->bounds.left == 200 && x->bounds.right == 1000 && user::window_scale(x) == 200);
+  }
+  CHECK(t.svc32(N::NtUserCallHwnd, {w, 2 /* GetDpiForWindow */}) == 96);
+  CHECK(t.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9}) == 1024);
+  uint32_t sw = 0, sh = 0;
+  CHECK(user::top_level_info(w, &ti, nullptr) && !ti.dpi_aware && ti.surface_scale == 200 && gdi::window_surface_size(ti.surface_id, &sw, &sh) && sw == sw0 && sh == sh0);
+  desktop::WindowsWindowInfo info;
+  CHECK(bridge.window_info(w, &info, nullptr) && info.window.x == 100 && info.window.width == 400);
+  // it draws in its pixels; the desktop shows them enlarged (in its units with the desktop's other pictures, so not drawn on the device by itself)
+  {
+    const uint32_t dc = t.svc32(N::NtUserGetDC, {w});
+    const uint64_t brush = t.svc(N::NtGdiCreateSolidBrush, {0x0000FF, 0});
+    t.svc(N::NtGdiSelectBrush, {dc, brush});
+    CHECK(t.svc32(N::NtGdiPatBlt, {dc, 0, 0, 10, 10, 0xF00021}) == 1);
+    t.svc(N::NtUserReleaseDC, {w, dc});
+    uint32_t pw = 0, ph = 0;
+    const ArrayView<uint32_t> px = gdi::window_surface_pixels(ti.surface_id, &pw, &ph);
+    CHECK(pw == sw && (px[9 * pw + 9] & 0xFFFFFF) == 0xFF0000 && (px[10 * pw + 10] & 0xFFFFFF) != 0xFF0000);
+    std::vector<uint32_t> small(64 * 64, 0);
+    graphics::Surface ss;
+    ss.pixels = ArrayView<uint32_t>(small.data(), small.size());
+    ss.width = ss.height = ss.pitch = 64;
+    graphics::SoftwareRenderer2D r(ss);
+    uint32_t dw = 0, dh = 0;
+    CHECK(!bridge.draw_window_scaled(w, r, 0, 0, 200, &dw, &dh));
+  }
+  // a window it makes now is of the same kind
+  const uint32_t w2 = t.create("SysClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 20, 200, 100, 0, 0, "Second");
+  CHECK(w2 != 0);
+  pump(t);
+  wr = t.window_rect(w2);
+  CHECK(wr.l == 10 && wr.r == 210);
+  {
+    user::Window* x = user::find_window(w2);
+    CHECK(x && x->bounds.left == 20 && x->bounds.right == 420);
+  }
+  // a program that becomes system aware now works at the new system DPI: device pixels
+  CHECK(l.svc32(N::NtUserSetProcessDpiAwarenessContext, {0x11, 0}) == 1);
+  CHECK(l.atom_class("SysClass") >= 0xC000);
+  const uint32_t w3 = l.create("SysClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 20, 400, 300, 0, 0, "Late");      // (over the minimum tracking size at 192 dpi)
+  CHECK(w3 != 0);
+  pump(l);
+  CHECK(l.svc32(N::NtUserCallHwnd, {w3, 2}) == 192);
+  CHECK(user::top_level_info(w3, &ti, nullptr) && ti.dpi_aware);
+  {
+    user::Window* x = user::find_window(w3);
+    CHECK(x && x->bounds.left == 10 && x->bounds.right == 410);
+  }
+  bridge.detach();
+  user::set_device_scale_from_desktop(100);
+  user::reset_state();
+  gdi::shutdown();
+}
+
 void test_redirection() {
   Program prog(91);
   Th t(prog, 91, kScratch);
@@ -1818,5 +1910,6 @@ int main() {
   test_props_longs_text();
   test_redirection();
   test_dpi_virtualization();
+  test_system_aware_scale_change();
   return finish("Win32kUserTest");
 }

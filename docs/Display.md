@@ -66,6 +66,9 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
     one at the new scale), as on Windows. A program that leaves it to DefWindowProc is moved there, which Windows' DefWindowProc does not do. The
     desktop's thread posts a private `WM_SYSCOMMAND` (`kScTcosDpi`), and the window's own thread sends the message.
   - Other windows are moved through the program as a desktop move would be. An unaware window's units stay the same.
+  - A system-aware program keeps the system DPI it was made aware at (its awareness context carries it), as on Windows. After the scale grows, its
+    windows are virtualized by the ratio of the new DPI to that one, the way unaware windows are: its coordinates, DPI and surface stay what they were,
+    and the desktop draws its pixels enlarged. A program that becomes system aware after the change works at the new DPI.
 - **The screen DC.** For an unaware program on a scaled screen, `GetDC(NULL)` gives a shadow of the screen in the program's units, filled with what the
   screen shows when the DC is made. Whatever the program draws on it goes straight on to the screen, scaled up (each unit pixel over the device pixels it
   stands for). The shadow goes away with the DC.
@@ -80,8 +83,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 - A layout size that does not map onto the monitor's pixels exactly (266 units at 150 % are 399 of 400 rows) leaves the last device row or column
   undrawn.
 - Windows DPI virtualization (above) has these gaps:
-  - Only per-monitor-aware windows hear `WM_DPICHANGED`. A system-aware one keeps its device size when the scale changes (Windows would enlarge
-    its picture instead).
+  - When the scale shrinks below a system-aware program's DPI, its windows stay in device pixels (too large). Windows would shrink their picture.
   - A mixed DPI child's GPU presents (swapchains made for it) go to the top-level's surface unscaled, and its window region is not applied to its
     scaled pixels.
   - An unaware program's screen DC shows the screen as it was when the DC was made. Reading it later (`BitBlt` from it) does not see what has
