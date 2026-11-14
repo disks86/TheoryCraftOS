@@ -66,6 +66,7 @@
 #include "Hardware/Monitor/Edid.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
+#include "Graphics/Graphics2D/CellTextFace.hpp"
 #include "Hardware/Monitor/SystemMonitors.hpp"
 #include "SystemInventory.hpp"
 #include "SystemNetworkDetails.hpp"
@@ -1522,8 +1523,12 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   };
   UniquePointer<hardware::MonitorDisplay> monitor_display = gpu ? UniquePointer<hardware::MonitorDisplay>::make(shared_allocator, *gpu, shared_allocator) : UniquePointer<hardware::MonitorDisplay>();
   UniquePointer<graphics::ScaledRenderer2D> scaled_renderer;
-  if (graphics::IRenderer2D* first = gpu ? system_graphics.renderer_2d() : nullptr)
+  UniquePointer<graphics::CellTextFace> cell_text;      // (the desktop's text at the device's resolution when it is scaled)
+  if (graphics::IRenderer2D* first = gpu ? system_graphics.renderer_2d() : nullptr) {
     scaled_renderer = UniquePointer<graphics::ScaledRenderer2D>::make(shared_allocator, shared_allocator, *first, 100);
+    cell_text = UniquePointer<graphics::CellTextFace>::make(shared_allocator, shared_allocator);
+    if (scaled_renderer && cell_text && cell_text->ready()) scaled_renderer->set_text_face(cell_text.get());
+  }
   DisplayPipeline display_pipeline{&monitors, &system_graphics, monitor_display.get(), scaled_renderer.get()};
   if (gpu && monitor_display && (monitors.layout().count() > 1 || monitors.needs_compositing())) {
     if (DisplayPipeline::apply(&display_pipeline)) {

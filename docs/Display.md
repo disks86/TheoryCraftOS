@@ -16,6 +16,10 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
   - **The desktop's own drawing** goes through it. Rectangles, lines, shapes and the 8x16 font's pixels are mapped by their edges, so what touches still
     touches. At a whole scale a unit is exactly k x k pixels; at 150 % units alternate between one and two pixels. Images and masks are sampled nearest
     at a whole scale and filtered at a fractional one. What is drawn at the device's resolution is sharp.
+  - **Text.** The kernel gives the scaling renderer a text face (`graphics::CellTextFace`, `ScaledRenderer2D::set_text_face`). Each character of the
+    desktop's text is then drawn with the bundled "TCOS Mono" (Liberation Mono; "TCOS Fallback" for what it lacks) at the device's resolution,
+    anti-aliased and sized to fill its 8 x 16-unit cell on the device, so the layout is the same. Box drawing and block characters (U+2500..U+259F) stay
+    the 8x16 font's pixels, which join from cell to cell. Without a face (the renderer's default) text is the 8x16 font enlarged.
 - **Monitors.** `MonitorDisplay` maps the device-scale picture onto each monitor (by the same mapping):
   - A monitor at the device scale gets a 1:1 copy.
   - One at another scale is resampled (nearest), e.g. a 100 % monitor beside a 200 % one shows every other pixel.
@@ -82,7 +86,6 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 ## Not done
 
 - One device scale for all monitors (the largest); no per-monitor density.
-- At a fractional scale the 8x16 font's pixels become one or two device pixels unevenly.
 - A layout size that does not map onto the monitor's pixels exactly (266 units at 150 % are 399 of 400 rows) leaves the last device row or column
   undrawn.
 - Windows DPI virtualization (above) has these gaps:
@@ -90,7 +93,6 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
 - X programs are not told the density (`Xft.dpi`): they are enlarged.
-- The desktop's own text is the enlarged 8x16 font, not a font drawn at the device size.
 - A GPU device image (`draw_device_image`) cannot be enlarged by the scaling renderer: callers draw it from the CPU's view.
 
 ## Tests
@@ -98,6 +100,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | What | How |
 | --- | --- |
 | The scaling renderer: a scene at 200 % and 300 % equal to the 1x scene enlarged pixel for pixel (rectangles, outlines, lines, text, images, masks, clips); at 125, 150 and 175 % every device pixel the unit it maps back to (pictures left out); extent, device, read-back, matrices | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_2d`) |
+| The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
 | The desktop at scale 2: the session told 2, a window enlarged, then drawn on the device at twice its place when the program draws at the scale | `tests/run_host_tests.sh GuiTest` (`test_windows_hidpi`) |
 | Wayland at 200 % and 150 % (`wl_output.scale` 2, fractional 180, a fractional client's viewported buffer drawn 1:1) | `tests/run_host_tests.sh WaylandServerTest` (`test_mapping`) |

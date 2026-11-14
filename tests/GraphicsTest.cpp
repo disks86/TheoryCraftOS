@@ -24,6 +24,7 @@
 #include <vector>
 #include "Utility/AllocatedView.hpp"
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
+#include "Graphics/Graphics2D/CellTextFace.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Graphics/Graphics2D/Device/DeviceRenderer2D.hpp"
 #include "Graphics/Graphics2D/Raster2D.hpp"
@@ -2094,6 +2095,47 @@ static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskVi
   r.fill_rect({48, 28, 10, 10}, 0xFF808080);
   r.pop_clip();
 }
+// The desktop's text at the device's resolution: a character drawn with the bundled mono face inside its 8x16 cell (enlarged), anti-aliased, the
+// box-drawing characters still the 8x16 font's pixels, and the same without a face as before.
+static void test_cell_text_face() {
+  TestAllocator a;
+  graphics::CellTextFace face(a);
+  CHECK(face.ready());
+  for (uint32_t percent : {200u, 150u, 125u}) {
+    const uint32_t cw = uint32_t(units_to_device(8, percent)), ch = uint32_t(units_to_device(16, percent));
+    const uint32_t DW = uint32_t(units_to_device(48, percent)), DH = uint32_t(units_to_device(32, percent));
+    Surface with = make_surface(a, DW, DH), without = make_surface(a, DW, DH);
+    SoftwareRenderer2D dw(with, nullptr, &a), dn(without, nullptr, &a);
+    ScaledRenderer2D sw(a, dw, percent), sn(a, dn, percent);
+    sw.set_text_face(&face);
+    for (ScaledRenderer2D* r : {&sw, &sn}) {
+      r->clear(0xFF000000u);
+      r->draw_text(0, 0, "Ag", 0xFFFFFFFFu);
+      r->draw_text(16, 0, "\xE2\x94\x80", 0xFFFFFFFFu);      // U+2500 BOX DRAWINGS LIGHT HORIZONTAL
+    }
+    uint32_t lit = 0, partial = 0, outside = 0, a_cell = 0, g_cell = 0;
+    for (uint32_t y = 0; y < DH; ++y)
+      for (uint32_t x = 0; x < DW; ++x) {
+        const uint32_t v = px(with, x, y) & 0xFF;
+        if (v == 0) continue;
+        ++lit;
+        if (v != 0xFF) ++partial;
+        if (y >= ch || x >= 3 * cw) ++outside;
+        if (x < cw) ++a_cell; else if (x < 2 * cw) ++g_cell;
+      }
+    CHECK(lit > 0 && partial > 0 && outside == 0 && a_cell > 0 && g_cell > 0);      // (anti-aliased: the face's, not the 8x16 font's pixels)
+    uint32_t differs = 0, box_differs = 0;
+    for (uint32_t y = 0; y < DH; ++y)
+      for (uint32_t x = 0; x < DW; ++x) {
+        if (px(with, x, y) == px(without, x, y)) continue;
+        if (x < 2 * cw) ++differs; else ++box_differs;
+      }
+    CHECK(differs > 0 && box_differs == 0);
+    release_view(a, with.pixels);
+    release_view(a, without.pixels);
+  }
+}
+
 static void test_scaled_2d() {
   TestAllocator a;
   Surface image = make_surface(a, 6, 5);
@@ -2166,6 +2208,7 @@ int main() {
   test_math();
   test_2d();
   test_scaled_2d();
+  test_cell_text_face();
   test_3d();
   test_device_2d();
   test_device_2d_large_image();
