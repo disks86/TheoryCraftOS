@@ -17,6 +17,7 @@
  */
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Utility/ByteText.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/DxgDevice.h"
 #include "Process/Fifo.hpp"
@@ -111,8 +112,9 @@ int64_t path_error(PathResult r) {
   }
 }
 
-// The cleaned virtual path of (dirfd, path). `allow_empty`: an empty path names dirfd itself (AT_EMPTY_PATH). 0, or -errno.
-int64_t resolve_at(Process& p, uint64_t dirfd, uint64_t path_address, bool allow_empty, String* virtual_path) {
+// The cleaned virtual path of (dirfd, path), as it is spelled (/proc/self/exe stays that). `allow_empty`: an empty path names dirfd itself (AT_EMPTY_PATH).
+// 0, or -errno.
+int64_t resolve_raw(Process& p, uint64_t dirfd, uint64_t path_address, bool allow_empty, String* virtual_path) {
   ProcessFiles& files = p.files();
   if (!files.attached()) return -kEnoent;
   String text(files.allocator());
@@ -133,6 +135,116 @@ int64_t resolve_at(Process& p, uint64_t dirfd, uint64_t path_address, bool allow
   }
   const PathResult r = files.resolve_from(base, text.view(), virtual_path);
   return r == PathResult::Ok ? 0 : path_error(r);
+}
+
+// --- /proc/self: the links Linux keeps there for a process (its program file, its current folder, its descriptors). There is no /proc file system; these
+// few names are answered here, which is what programs look at to find themselves (Rust's current_exe, glibc's $ORIGIN, musl's realpath, AppImage
+// launchers such as sharun).
+
+// Does `path` name one of the process's own /proc entries? *what is what follows "/proc/<self>/" ("exe", "fd/3", "cwd/x"). "self", "thread-self" and the
+// process's own number name the process.
+bool proc_self_entry(Process& p, StringView path, StringView* what) {
+  const StringView prefix("/proc/");
+  if (!path.starts_with(prefix)) return false;
+  StringView rest = path.without_prefix(prefix.size());
+  const uint64_t slash = rest.find('/');
+  if (slash == StringView::npos) return false;
+  const StringView who = rest.first(slash);
+  bool self = who.equals("self") || who.equals("thread-self");
+  if (!self && !who.empty()) {
+    uint64_t number = 0;
+    bool digits = true;
+    for (char c : who) {
+      if (c < '0' || c > '9' || number > (~uint64_t{0} - 9) / 10) { digits = false; break; }
+      number = number * 10 + uint64_t(c - '0');
+    }
+    self = digits && number == p.id();
+  }
+  if (!self) return false;
+  *what = rest.without_prefix(slash + 1);
+  return true;
+}
+
+// What /proc/self/fd/<n> points at: the file's path, or Linux's names for what has none. 0, or -errno.
+int64_t describe_descriptor(Process& p, uint64_t fd, String* out) {
+  ProcessFiles& files = p.files();
+  auto named = [&](const char* kind, uint64_t number) {
+    if (!out->assign(kind) || !out->append(":[") || !out->append_uint(number) || !out->push_back(']')) return -kEnomem;
+    return int64_t(0);
+  };
+  switch (files.kind(fd)) {
+    case DescriptorKind::Closed: return -kEnoent;
+    case DescriptorKind::ConsoleInput:
+    case DescriptorKind::ConsoleOutput:
+    case DescriptorKind::ConsoleError: return out->assign("/dev/pts/0") ? 0 : -kEnomem;
+    case DescriptorKind::Null: return out->assign("/dev/null") ? 0 : -kEnomem;
+    case DescriptorKind::Zero: return out->assign("/dev/zero") ? 0 : -kEnomem;
+    case DescriptorKind::Random: return out->assign("/dev/urandom") ? 0 : -kEnomem;
+    case DescriptorKind::Dxg: return out->assign("/dev/dxg") ? 0 : -kEnomem;
+    case DescriptorKind::UnixSocket: return named(is_pipe_descriptor(p, fd) ? "pipe" : "socket", files.token(fd));
+    default: break;
+  }
+  const OpenObject* object = files.object(fd);
+  if (object && !object->memory && !object->gpu_buffer && !object->gpu_sync && !object->path.empty()) return out->assign(object->path.view()) ? 0 : -kEnomem;
+  return out->assign("anon_inode:[unknown]") ? 0 : -kEnomem;
+}
+
+// The link at a /proc/self path: 1 and *target if `path` is one, 0 if `path` is no such entry, -errno if it is one that cannot be answered.
+int64_t proc_self_link(Process& p, StringView path, String* target) {
+  StringView what;
+  if (!proc_self_entry(p, path, &what)) return 0;
+  ProcessFiles& files = p.files();
+  if (what.equals("exe")) {
+    if (files.executable().empty()) return -kEnoent;
+    const Status s = files.canonical(files.executable(), target);
+    return s == Status::Ok ? 1 : int64_t(errno_of(s));
+  }
+  if (what.equals("cwd")) return target->assign(files.cwd()) ? 1 : -kEnomem;
+  if (what.equals("root")) return target->assign("/") ? 1 : -kEnomem;
+  if (what.starts_with("fd/")) {
+    const StringView digits = what.without_prefix(3);
+    uint64_t fd = 0;
+    if (digits.empty() || digits.size() > 9) return -kEnoent;
+    for (char c : digits) {
+      if (c < '0' || c > '9') return -kEnoent;
+      fd = fd * 10 + uint64_t(c - '0');
+    }
+    const int64_t r = describe_descriptor(p, fd, target);
+    return r < 0 ? r : 1;
+  }
+  return 0;
+}
+
+// Paths through /proc/self that lead into the file tree (the program file, the current folder, the root) become the paths they lead to. 0, or -errno.
+int64_t follow_proc_self(Process& p, String* virtual_path) {
+  StringView what;
+  if (!proc_self_entry(p, virtual_path->view(), &what)) return 0;
+  ProcessFiles& files = p.files();
+  String base(files.allocator());
+  StringView rest;
+  if (what.equals("exe")) {
+    if (files.executable().empty()) return -kEnoent;
+    const Status s = files.canonical(files.executable(), &base);
+    if (s != Status::Ok) return int64_t(errno_of(s));
+  } else if (what.equals("cwd") || what.starts_with("cwd/")) {
+    if (!base.assign(files.cwd())) return -kEnomem;
+    rest = what.without_prefix(3);
+  } else if (what.equals("root") || what.starts_with("root/")) {
+    if (!base.assign("/")) return -kEnomem;
+    rest = what.without_prefix(4);
+  } else {
+    return 0;
+  }
+  String joined(files.allocator());
+  if (!joined.assign(base.view()) || !joined.push_back('/') || !joined.append(rest)) return -kEnomem;
+  const PathResult r = files.resolve_from("/", joined.view(), virtual_path);
+  return r == PathResult::Ok ? 0 : path_error(r);
+}
+
+// The cleaned virtual path of (dirfd, path), /proc/self/exe and the like replaced by what they lead to. 0, or -errno.
+int64_t resolve_at(Process& p, uint64_t dirfd, uint64_t path_address, bool allow_empty, String* virtual_path) {
+  const int64_t r = resolve_raw(p, dirfd, path_address, allow_empty, virtual_path);
+  return r < 0 ? r : follow_proc_self(p, virtual_path);
 }
 
 DescriptorKind kind_of(Process& p, uint64_t fd) { return p.files().kind(fd); }
@@ -204,6 +316,20 @@ void mark_socket(Process& p, StringView virtual_path, const DirectoryEntry& entr
   if (!p.files().host_path_of(virtual_path, &host)) return;
   if (is_socket_file(host.view())) { m->mode = kSIfSock | 0755; m->size = 0; }
   else if (is_fifo_node(host.view(), entry)) { m->mode = kSIfIfo | 0644; m->size = 0; }
+}
+
+constexpr uint32_t kSIfLnk = 0120000;
+constexpr uint64_t kAtSymlinkNofollow = 0x100;
+
+// lstat of `virtual_path` when it is a symbolic link (one of the file tree's, or a /proc/self link): true and *m. Its size is the length of its target.
+bool link_meta(Process& p, StringView virtual_path, Meta* m) {
+  String target(p.files().allocator());
+  if (proc_self_link(p, virtual_path, &target) <= 0 && p.files().read_link(virtual_path, &target) != Status::Ok) return false;
+  *m = Meta();
+  m->mode = kSIfLnk | 0777;
+  m->size = target.size();
+  m->ino = fnv(virtual_path);
+  return true;
 }
 
 // What a descriptor looks like to fstat. 0 and the metadata, or -errno.
@@ -449,8 +575,11 @@ uint64_t sys_statat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   ProcessFiles& files = p.files();
   if (!files.attached()) return error(kEnoent);
   String virtual_path(files.allocator());
-  const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
+  const bool no_follow = flags & kAtSymlinkNofollow;
+  const int64_t r = no_follow ? resolve_raw(p, dirfd, path, false, &virtual_path) : resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
+  if (no_follow && link_meta(p, virtual_path.view(), &m)) return write_stat(p, arch, m, buffer);
+  if (no_follow && follow_proc_self(p, &virtual_path) < 0) return error(kEnoent);
   const DescriptorKind device = files.device_at(virtual_path.view());
   if (device != DescriptorKind::Closed) return write_stat(p, arch, device_meta(kSIfChr | 0666, 3), buffer);
   DirectoryEntry entry;
@@ -472,11 +601,16 @@ uint64_t sys_statx(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags, ui
   } else {
     if (!files.attached()) return error(kEnoent);
     String virtual_path(files.allocator());
-    const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
+    const bool no_follow = flags & kAtSymlinkNofollow;
+    const int64_t r = no_follow ? resolve_raw(p, dirfd, path, false, &virtual_path) : resolve_at(p, dirfd, path, false, &virtual_path);
     if (r < 0) return error(-r);
     DirectoryEntry entry;
     const DescriptorKind device = files.device_at(virtual_path.view());
-    if (device != DescriptorKind::Closed) {
+    if (no_follow && link_meta(p, virtual_path.view(), &m)) {
+      // (a link: m is set)
+    } else if (no_follow && follow_proc_self(p, &virtual_path) < 0) {
+      return error(kEnoent);
+    } else if (device != DescriptorKind::Closed) {
       m = device_meta(kSIfChr | 0666, 3);
     } else {
       const Status status = files.stat(virtual_path.view(), &entry);
@@ -815,15 +949,32 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
   }
 }
 
-uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path) {
+int64_t resolve_user_path(Process& p, uint64_t dirfd, uint64_t path, bool allow_empty, String* virtual_path) {
+  if (!p.files().attached()) return -kEnoent;
+  return resolve_at(p, dirfd, path, allow_empty, virtual_path);
+}
+
+uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t buffer, uint64_t size) {
   ProcessFiles& files = p.files();
   if (!files.attached()) return error(kEnoent);
-  String virtual_path(files.allocator());
-  const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
+  if (int64_t(size) <= 0) return error(kEinval);
+  String virtual_path(files.allocator()), target(files.allocator());
+  const int64_t r = resolve_raw(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
-  DirectoryEntry entry;
-  const Status status = files.stat(virtual_path.view(), &entry);
-  return status == Status::Ok ? error(kEinval) : errno_of(status);      // there are no symbolic links: what exists is not one
+  const int64_t proc = proc_self_link(p, virtual_path.view(), &target);
+  if (proc < 0) return error(-proc);
+  if (proc == 0) {
+    if (follow_proc_self(p, &virtual_path) < 0) return error(kEnoent);      // (a link inside /proc/self/cwd/...)
+    const Status status = files.read_link(virtual_path.view(), &target);
+    if (status != Status::Ok) {
+      DirectoryEntry entry;
+      const Status exists = files.stat(virtual_path.view(), &entry);
+      return exists == Status::Ok ? error(kEinval) : errno_of(exists);      // (what exists but is no link: EINVAL)
+    }
+  }
+  // The target, cut to the buffer, without a terminating NUL (as readlink does).
+  const uint64_t n = target.size() < size ? target.size() : size;
+  return p.write_user(buffer, text_as_bytes(target.view().first(n))) ? n : error(kEfault);
 }
 
 namespace {

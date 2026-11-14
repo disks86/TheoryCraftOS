@@ -1077,11 +1077,14 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   p.defer_loading(spec.suspended);
   p.set_command_line(spec.command_line);
   p.set_startup(spec.startup);
-  // argv: the program's name, then (for a Linux program) the words of the command line
+  if (!spec.executable_path.empty()) p.set_executable_path(spec.executable_path);
+  // argv: the program's name, then (for a Linux program) the words of the command line; or exactly what execve was given
   StringView argv[32];
   uint32_t argc = 0;
   argv[argc++] = spec.image_path;
-  if (abi != process::SyscallAbi::Windows) {
+  if (!spec.arguments.empty()) {
+    argc = 0;
+  } else if (abi != process::SyscallAbi::Windows) {
     StringView rest = spec.command_line;
     bool first_word = true;
     while (argc < 32) {
@@ -1100,14 +1103,17 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
     t = t * 6364136223846793005ull + 1442695040888963407ull;
     b = static_cast<uint8_t>(t >> 56);
   }
-  const process::LoadStatus loaded = p.load(spec.image, ArrayView<const StringView>(argv, argc), spec.environment, ConstByteView(random, sizeof(random)));
+  const ArrayView<const StringView> arguments = spec.arguments.empty() ? ArrayView<const StringView>(argv, argc) : spec.arguments;
+  const process::LoadStatus loaded = p.load(spec.image, arguments, spec.environment, ConstByteView(random, sizeof(random)));
   if (loaded != process::LoadStatus::Ok) {
     discard();
     return loaded == process::LoadStatus::OutOfMemory ? kNoMemory : kInvalidImage;
   }
   auto count_use = [](process::DescriptorKind kind, uint64_t token) { process::descriptor_token_add(kind, token); };      // the child's table holds one more use of what the parent's does
 
-  if (spec.inherit_handles) {
+  if (spec.linux_exec) {
+    p.process()->files().inherit_for_exec(program.process()->files(), count_use);
+  } else if (spec.inherit_handles) {
     p.process()->files().inherit_from(program.process()->files(), count_use, spec.inherit_list, spec.inherit_list_count, spec.restrict_inherit);
   }
   for (uint32_t i = 0; i < 3; ++i) {      // the standard handles that are copied into the child (a console child whose parent did not let it inherit)
@@ -1198,6 +1204,17 @@ bool Task::terminate_process(uint64_t pid, uint32_t code) {
 
 bool Task::resume_process(uint64_t pid) {
   return with_child(*this, pid, [&](Child* c) { return resume_child(c); });
+}
+
+bool Task::query_child(uint64_t pid, bool* exited, uint32_t* code) {
+  for (Child* c = children; c; c = c->next) {
+    if (c->pid != pid) continue;
+    process::Process* child = c->task->program.process();
+    *exited = child->exited();
+    *code = child->exit_code();
+    return true;
+  }
+  return false;
 }
 
 bool Task::process_not_started(uint64_t pid) {

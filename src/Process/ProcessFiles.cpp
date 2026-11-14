@@ -371,6 +371,74 @@ uint32_t ProcessFiles::inherit_from(const ProcessFiles& parent, void (*copy_toke
   return copied;
 }
 
+uint32_t ProcessFiles::inherit_for_exec(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
+  uint32_t copied = 0;
+  for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
+    const Slot& s = parent.slots_[slot];
+    if (s.kind == DescriptorKind::Closed || s.kind == DescriptorKind::Thread || s.close_on_exec) continue;
+    close(slot);
+    slots_[slot].kind = s.kind;
+    slots_[slot].object = s.object;
+    slots_[slot].token = s.token;
+    slots_[slot].denied = s.denied;
+    if (copy_token && s.token != 0) copy_token(s.kind, s.token);
+    ++copied;
+  }
+  return copied;
+}
+
+bool ProcessFiles::set_executable(StringView virtual_path) {
+  if (virtual_path.size() > kMaxPath) return false;
+  for (uint64_t i = 0; i < virtual_path.size(); ++i) executable_[i] = virtual_path[i];
+  executable_size_ = virtual_path.size();
+  return true;
+}
+
+Status ProcessFiles::read_link(StringView virtual_path, String* target) const {
+  if (!fs_) return Status::NotFound;
+  String path(*allocator_);
+  if (!host_path(virtual_path, &path)) return Status::OutOfMemory;
+  bool to_directory = false;
+  return fs_->read_symbolic_link(path.view(), target, &to_directory);
+}
+
+Status ProcessFiles::canonical(StringView virtual_path, String* out) const {
+  if (!allocator_) return Status::NotFound;
+  constexpr uint32_t kMaxLinks = 40;      // (Linux's limit)
+  String current(*allocator_);
+  if (resolve_path(style_, "/", virtual_path, &current) != PathResult::Ok) return Status::InvalidPath;
+  for (uint32_t links = 0;;) {
+    // The first component that is a link, if any: everything before it is free of links, so the target can be joined to it and cleaned by name.
+    String walked(*allocator_), target(*allocator_);
+    const StringView whole = current.view();
+    bool replaced = false;
+    uint64_t at = 0;
+    while (at < whole.size()) {
+      while (at < whole.size() && whole[at] == '/') ++at;
+      if (at >= whole.size()) break;
+      uint64_t end = at;
+      while (end < whole.size() && whole[end] != '/') ++end;
+      const uint64_t before = walked.size();
+      if (!walked.push_back('/') || !walked.append(whole.substr(at, end - at))) return Status::OutOfMemory;
+      if (read_link(walked.view(), &target) == Status::Ok && !target.empty()) {
+        if (++links > kMaxLinks) return Status::TooManyLinks;
+        walked.truncate(before);
+        String joined(*allocator_);
+        if (target[0] != '/' && !joined.append(walked.empty() ? StringView("/") : walked.view())) return Status::OutOfMemory;
+        if (target[0] != '/' && !walked.empty() && !joined.push_back('/')) return Status::OutOfMemory;
+        if (!joined.append(target.view()) || !joined.push_back('/') || !joined.append(whole.substr(end))) return Status::OutOfMemory;
+        String next(*allocator_);
+        if (resolve_path(style_, "/", joined.view(), &next) != PathResult::Ok) return Status::InvalidPath;
+        if (!current.assign(next.view())) return Status::OutOfMemory;
+        replaced = true;
+        break;
+      }
+      at = end;
+    }
+    if (!replaced) return out->assign(current.view()) ? Status::Ok : Status::OutOfMemory;
+  }
+}
+
 bool ProcessFiles::adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
   if (slot >= kMaxDescriptors || slots_[slot].kind != DescriptorKind::Closed) return false;
   const Slot& s = parent.slots_[slot];

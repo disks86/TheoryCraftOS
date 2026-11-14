@@ -126,6 +126,9 @@ class ProcessFiles {
   // A new process's table gets the handles of `parent` that are inheritable, at the same numbers (what a Windows child receives). Console descriptors stay as they are.
   // `copy_token` is called for each token-carrying kind so the owner can count the extra use; returns how many were copied. With `restrict` only the descriptors in `only` are.
   uint32_t inherit_from(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token), const uint64_t* only = nullptr, uint32_t only_count = 0, bool restrict = false);
+  // What a Linux program started by execve gets: every descriptor of `parent` that is not close-on-exec, at the same number (the standard ones too, replacing this table's
+  // console descriptors). `copy_token` as for inherit_from. How many were copied.
+  uint32_t inherit_for_exec(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
   // The one descriptor `slot` of `parent`, inheritable or not, with its handle flags, if this table has nothing at that number yet. False if the parent has nothing there or this
   // table does.
   bool adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token));
@@ -145,6 +148,14 @@ class ProcessFiles {
 
   // --- names
   StringView cwd() const { return StringView(cwd_, cwd_size_); }
+  // The cleaned virtual path of the program file the process runs (what Linux shows as /proc/self/exe); empty when it is not known. False if it is too long.
+  bool set_executable(StringView virtual_path);
+  StringView executable() const { return StringView(executable_, executable_size_); }
+  // The target of the symbolic link at `virtual_path` (the link itself, not what it points to), as it is stored. InvalidArgument if it is not a link.
+  filesystem::Status read_link(StringView virtual_path, String* target) const;
+  // `virtual_path` with every symbolic link in it replaced by what it points to (as realpath does; the last component too). The path need not exist past the links.
+  // TooManyLinks after 40 links, NotFound for a link whose target cannot be read.
+  filesystem::Status canonical(StringView virtual_path, String* out) const;
   PathResult resolve(StringView path, String* virtual_path) const { return resolve_path(style_, cwd(), path, virtual_path); }
   PathResult resolve_from(StringView base, StringView path, String* virtual_path) const { return resolve_path(style_, base, path, virtual_path); }
   // The device node a cleaned Linux path names (/dev/null, /dev/zero, /dev/urandom, /dev/random, /dev/tty), or Closed.
@@ -212,6 +223,8 @@ class ProcessFiles {
   StringView root_prefix_;
   char cwd_[kMaxPath + 1] = {'/'};      // the cleaned virtual path of the current directory
   uint64_t cwd_size_ = 1;
+  char executable_[kMaxPath + 1] = {};      // the cleaned virtual path of the program file (/proc/self/exe)
+  uint64_t executable_size_ = 0;
 };
 
 // Makes sure the two trees exist in the OS's file system, each with the folders programs expect: "/Linux" (bin etc home root tmp usr var) and "/Windows"

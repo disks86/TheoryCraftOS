@@ -862,6 +862,7 @@ add_executable(BOOTX64
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
+  src/Process/LinuxExec.cpp
   src/Process/LinuxSockets.cpp
   src/Process/LinuxThreads.cpp
   src/Process/ProcessFiles.cpp

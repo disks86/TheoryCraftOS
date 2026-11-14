@@ -48,7 +48,8 @@ struct ProgramStart {
 class UserProgram final : public IModuleHost {
  public:
   UserProgram(allocators::IAllocator& allocator, uint64_t id, IProcessHost& host, uint64_t memory_limit = AddressSpace::kNoLimit)
-      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator), startup_title_(allocator), startup_desktop_(allocator) {}
+      : allocator_(allocator), id_(id), host_(host), space_(allocator, memory_limit), detail_(allocator), working_directory_(allocator), command_line_(allocator), startup_title_(allocator), startup_desktop_(allocator),
+        executable_path_(allocator) {}
   UserProgram(const UserProgram&) = delete;
   UserProgram& operator=(const UserProgram&) = delete;
 
@@ -60,6 +61,10 @@ class UserProgram final : public IModuleHost {
   void set_library_provider(ILibraryProvider* provider) { libraries_ = provider; }
   // The program's current folder, as a path inside its world ("/" or "/home/me", also for a Windows program: C:\home\me). Set before load().
   void set_working_directory(StringView path) { working_directory_.assign(path); }
+
+  // The program file as a path inside its world ("/usr/bin/foo"), for what a Linux program reads at /proc/self/exe. Set before load(); without it an
+  // absolute first argument is taken.
+  void set_executable_path(StringView path) { executable_path_.assign(path); }
 
   // The command line a Windows program sees, when it is not simply the arguments joined (CreateProcess hands over the exact text). Set before load().
   void set_command_line(StringView text) { command_line_.assign(text); }
@@ -118,7 +123,7 @@ class UserProgram final : public IModuleHost {
   filesystem::IFileSystem* files_ = nullptr;
   ILibraryProvider* libraries_ = nullptr;
   UniquePointer<ModuleSet> modules_;
-  String detail_, working_directory_, command_line_, startup_title_, startup_desktop_;
+  String detail_, working_directory_, command_line_, startup_title_, startup_desktop_, executable_path_;
   StartupSpec startup_;
   bool has_startup_ = false;
   uint32_t processor_count_ = 1;
