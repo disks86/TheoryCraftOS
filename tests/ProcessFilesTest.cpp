@@ -26,6 +26,7 @@
 #include "Process/LinuxFiles.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
+#include "Process/LinuxExec.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -937,6 +938,7 @@ static void test_linux_links_and_proc() {
   CHECK(p.syscall(lin(6, rig.str("/dangling"), st)) == 0 && (mode() & 0170000) == 0120000);       // a dangling link still has an lstat
   CHECK(sres(p.syscall(lin(4, rig.str("/dangling"), st))) == -2);
   CHECK(p.syscall(lin(6, rig.str("/etc/motd"), st)) == 0 && (mode() & 0170000) == 0100000);        // (no link: as stat)
+  CHECK((mode() & 0777) == 0755);      // (no Unix permissions are kept: every file may be run, as access(X_OK) says)
   const uint64_t sx = rig.alloc(256);
   CHECK(p.syscall(lin(332, kAtFdCwd, rig.str("/opt/current"), 0x100, 0x7FF, sx)) == 0 && (rig.u64(sx + 24) >> 32 & 0170000) == 0120000);
   CHECK(p.syscall(lin(332, kAtFdCwd, rig.str("/opt/current"), 0, 0x7FF, sx)) == 0 && (rig.u64(sx + 24) >> 32 & 0170000) == 0040000);
@@ -1023,6 +1025,25 @@ static uint64_t vector_of(Rig& rig, const std::vector<std::string>& strings) {
   return at;
 }
 
+// The stand-in for the OS's shell (src/Program/AppRunScript): what it was asked to run, and a scripted answer.
+static std::string g_shell_script;
+static std::vector<std::string> g_shell_arguments, g_shell_environment;
+static int fake_shell(allocators::IAllocator&, filesystem::IFileSystem& files, StringView world_root, StringView script, ArrayView<const StringView> arguments,
+                      ArrayView<const StringView> environment, String* program, List<String>* program_arguments, List<String>* program_environment) {
+  (void)files;
+  CHECK(world_root.equals("/Linux"));
+  g_shell_script.assign(script.data(), script.size());
+  g_shell_arguments.clear();
+  g_shell_environment.clear();
+  for (const StringView& a : arguments) g_shell_arguments.push_back(std::string(a.data(), a.size()));
+  for (const StringView& e : environment) g_shell_environment.push_back(std::string(e.data(), e.size()));
+  if (g_shell_script == "/app/quiet") return 0;      // a script that starts nothing
+  String a(A), e(A);
+  CHECK(program->assign("/app/prog") && a.assign("from the script") && program_arguments->push_back(static_cast<String&&>(a)) && e.assign("S=1") &&
+        program_environment->push_back(static_cast<String&&>(e)));
+  return 1;
+}
+
 static void test_linux_execve() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
@@ -1096,6 +1117,59 @@ static void test_linux_execve() {
     runtime.spawn_status = 0xC0000002u;
     CHECK(sres(p.syscall(lin(execve, rig.str("/app/prog"), args, 0))) == -38);
     CHECK(!runtime.spawned && !p.exited() && p.files().kind(0) != DescriptorKind::Closed);
+  }
+  {      // /bin/sh is the built-in shell: prepare_program_folders makes the marker (keeping a real shell), execve runs the script with it and execs what it starts
+    filesystem::RamFileSystem other(A);
+    CHECK(other.create_directory("/Linux") == Status::Ok && other.create_directory("/Linux/bin") == Status::Ok);
+    make_file(other, "/Linux/bin/bash", "real bash");
+    CHECK(prepare_program_folders(other));
+    CHECK(read_file(other, "/Linux/bin/bash") == "real bash" && read_file(other, "/Linux/bin/sh").rfind("#!tcos-builtin-shell\n", 0) == 0);
+    make_file(fs, "/Linux/bin/sh", read_file(other, "/Linux/bin/sh"));      // (this tree had a stand-in ELF there: the marker replaces it)
+    make_file(fs, "/Linux/bin/bash", read_file(other, "/Linux/bin/sh"));
+    make_file(fs, "/Linux/app/launcher", "#!/bin/sh -e\nexec /app/prog\n");
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    const uint64_t env = vector_of(rig, {"APPDIR=/app"});
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh", "/app/launcher"}), env))) == -8);      // no shell installed
+    process::linuxabi::install_builtin_shell(fake_shell);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh"}), env))) == -8);                       // no script
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh", "-c", "echo"}), env))) == -8);        // no command strings
+    CHECK(!runtime.spawned && !p.exited());
+    CHECK(p.syscall(lin(execve, rig.str("/app/launcher"), vector_of(rig, {"launcher", "x y"}), env)) == 0);
+    CHECK(g_shell_script == "/app/launcher" && (g_shell_arguments == std::vector<std::string>{"x y"}) && (g_shell_environment == std::vector<std::string>{"APPDIR=/app"}));
+    CHECK(runtime.spawned && (runtime.arguments == std::vector<std::string>{"/app/prog", "from the script"}) && (runtime.environment == std::vector<std::string>{"S=1"}));
+    CHECK(runtime.executable_path == "/app/prog" && p.exited() && p.exit_code() == 42);
+  }
+  {      // a real shell (by name) asked to run a script: the built-in shell runs it; with -c the real one runs
+    make_file(fs, "/Linux/app/dash", elf);
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    CHECK(p.syscall(lin(execve, rig.str("/app/dash"), vector_of(rig, {"dash", "-e", "/app/launcher", "q"}), 0)) == 0);
+    CHECK(g_shell_script == "/app/launcher" && (g_shell_arguments == std::vector<std::string>{"q"}) && runtime.executable_path == "/app/prog");
+  }
+  {
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    g_shell_script.clear();
+    CHECK(p.syscall(lin(execve, rig.str("/app/dash"), vector_of(rig, {"dash", "-c", "true"}), 0)) == 0);
+    CHECK(g_shell_script.empty() && runtime.executable_path == "/app/dash" && (runtime.arguments == std::vector<std::string>{"dash", "-c", "true"}));
+  }
+  {      // a script that starts nothing: the program ends there, with 0
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    make_file(fs, "/Linux/app/quiet", "#!/bin/bash\necho\n");
+    CHECK(p.syscall(lin(execve, rig.str("/bin/bash"), vector_of(rig, {"bash", "--norc", "--", "/app/quiet", "a"}), 0)) == 0);
+    CHECK(g_shell_script == "/app/quiet" && (g_shell_arguments == std::vector<std::string>{"a"}));
+    CHECK(!runtime.spawned && p.exited() && p.exit_code() == 0 && p.files().kind(0) == DescriptorKind::Closed);
+    process::linuxabi::install_builtin_shell(nullptr);
   }
   {      // without a runtime there is no other process to become
     Rig rig(SyscallAbi::Linux, fs);

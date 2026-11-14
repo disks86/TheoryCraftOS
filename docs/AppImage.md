@@ -125,10 +125,11 @@ Files of several extents are read as one. Interleaved files, zisofs2 and sparse 
   supported (the command that uses them is skipped).
 - **No `fork` in the Linux layer.** `execve` works (LinuxDynamicPrograms.md), but a program that forks helper processes (Electron's zygote
   and renderers, a real shell running commands) still fails at that point.
-- **No `/bin/sh`.** sharun-based AppImages (uruntime "anylinux" builds such as FeatherPad) now start: sharun finds itself through
-  `/proc/self/exe`. Their sharun then runs `AppRun.sh` with the system shell and stops with "Failed to find a shell". A real shell would need
-  `fork` for every `$( )`; the built-in AppRun interpreter could stand in, but that is not wired up (and its result for FeatherPad's hooks is
-  not right yet: the hooks also `ln -s` into `/tmp`).
+- **sharun AppImages open their window, but Qt draws nothing yet.** FeatherPad (a uruntime "anylinux" build) runs all the way in QEMU: sharun
+  finds itself through `/proc/self/exe`, runs `AppRun.sh` with the bundled `dash`, which the built-in shell stands in for
+  (LinuxDynamicPrograms.md), the hooks' `$( )` subshells work, sharun starts the bundled `ld-linux` with Qt 6, and the main window
+  ("Untitled") appears framed on the desktop. Its contents are not painted (which display protocol Qt picked, and why, is not worked out). The
+  hooks' `ln -sfn` into `/tmp` fails (no `ln` in the built-in shell), and nothing has needed those links so far.
 - **Desktop integration only through the App Manager** (AppManager.md): an AppImage started from a file gets no menu entry; there is no AppImageUpdate.
 - **Only a small static test program has run in the OS.** Real desktop AppImages (Electron, GTK) have not been started in QEMU yet;
   they also need glibc and the system libraries in `/Linux` (see LinuxDynamicPrograms.md).

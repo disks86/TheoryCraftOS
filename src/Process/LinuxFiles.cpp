@@ -270,7 +270,9 @@ struct Meta {
 Meta meta_of(const DirectoryEntry& e, StringView path) {
   Meta m;
   const bool dir = e.type == NodeType::Directory;
-  m.mode = dir ? (kSIfDir | (e.read_only ? 0555 : 0755)) : (kSIfReg | (e.read_only ? 0444 : 0644));
+  // The file systems keep no Unix permissions: every file may be run (as Linux shows a FAT volume with the default masks), which is also what access(X_OK)
+  // answers. Launchers check the bit before they run a program or a shell (sharun's is_exe).
+  m.mode = dir ? (kSIfDir | (e.read_only ? 0555 : 0755)) : (kSIfReg | (e.read_only ? 0555 : 0755));
   m.size = dir ? 4096 : e.size;
   m.ino = fnv(path);
   m.modified = e.modified;

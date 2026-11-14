@@ -163,6 +163,7 @@
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
+#include "Program/AppRunScript.hpp"
 #include "Program/EmulatedTask.hpp"
 #include "Program/ProgramRunner.hpp"
 #include "SystemFileSystem.hpp"
@@ -837,6 +838,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
   opengl::install_linux_gl(system_gl);
+  desktop::install_linux_builtin_shell();      // (the Linux tree's /bin/sh: launcher scripts run by the OS's own shell)
   system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
     Entry e(Level::Info, "OpenGL");
     e.text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");

@@ -763,6 +763,10 @@ bool prepare_program_folders(filesystem::IFileSystem& fs) {
   static const struct { const char* path; const char* text; } kFiles[] = {
     {"/Windows/Windows/win.ini", "; for 16-bit app support\r\n[fonts]\r\n[extensions]\r\n[mci extensions]\r\n[files]\r\n[Mail]\r\nMAPI=1\r\n"},
     {"/Windows/Windows/system.ini", "; for 16-bit app support\r\n[386Enh]\r\n[drivers]\r\n[mci]\r\n"},
+    // The Linux tree's shell: a marker that execve runs the OS's own shell for (LinuxExec.hpp), so scripts with "#!/bin/sh" and launchers that look
+    // for a shell (sharun's AppRun.sh) find one. Only made where nothing is: a real shell put there is kept.
+    {"/Linux/bin/sh", "#!tcos-builtin-shell\n# The built-in shell of TheoryCraftOS: scripts run by /bin/sh are interpreted by the OS itself (see LinuxExec.hpp).\n"},
+    {"/Linux/bin/bash", "#!tcos-builtin-shell\n# The built-in shell of TheoryCraftOS: scripts run by /bin/bash are interpreted by the OS itself (see LinuxExec.hpp).\n"},
   };
   for (const auto& file : kFiles) {
     DirectoryEntry entry;

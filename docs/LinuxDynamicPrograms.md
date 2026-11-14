@@ -68,6 +68,18 @@ and `statx` with `AT_SYMLINK_NOFOLLOW` report links as links. Tests: `ProcessFil
 and `tests/exec_qemu.sh` (tests/linux/exectest.c on the real kernel: readlink, lstat, an exec of itself with a kept and a close-on-exec
 descriptor, the exit code coming back).
 
+## /bin/sh
+
+The Linux tree's `/bin/sh` and `/bin/bash` are markers (a first line of `#!tcos-builtin-shell`, made by `prepare_program_folders` only where
+nothing is), not programs. `execve` of one with a script (`sh [options] script args`, or a `#!/bin/sh` script) runs the script with the OS's own
+shell (src/Program/AppRunScript.hpp, installed by `desktop::install_linux_builtin_shell` at boot), then execs the program the script finally starts;
+a script that starts nothing ends the program with 0. A real shell binary (named `sh`, `bash`, `dash` or `ash`) asked to run a script gets the
+same treatment, since without `fork` it could not get past its first `$( )`; with `-c` or interactively it runs as itself. `$( )` and `( )` are
+subshells in the built-in shell: what they change of the variables, `"$@"` and the folder stays in them.
+
+The file systems keep no Unix permissions, so `stat` reports every file as executable (0755, or 0555 read-only), as Linux shows a FAT volume with
+the default masks and as `access(X_OK)` already answered. Launchers check the bit before they run a program or a shell (sharun's `is_exe`).
+
 ## Not done
 
 - **x86-64 only in practice.** The loader is not specific to x86-64, but the development machine has no AArch64 or RISC-V C library to test with.

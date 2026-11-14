@@ -872,6 +872,7 @@ add_executable(BOOTX64
   src/Program/ProgramRunner.cpp
   src/Program/AppImageLaunch.cpp
   src/Program/AppRunScript.cpp
+  src/Program/LinuxShell.cpp
   src/Program/ShellTools.cpp
   src/Program/EmulatedTask.cpp
   src/Emulation/GuestCpu.cpp

@@ -18,7 +18,10 @@
 
 #pragma once
 #include <stdint.h>
+#include "FileSystem/IFileSystem.hpp"
+#include "ObjectContainer/List.hpp"
 #include "Process/Process.hpp"
+#include "Utility/String.hpp"
 
 namespace process::linuxabi {
 
@@ -33,5 +36,22 @@ namespace process::linuxabi {
 // four levels deep at most. Errors come back before anything has changed, as on Linux: ENOENT, EACCES (a folder), ENOEXEC (not a Linux program for this
 // machine), E2BIG, ENOSYS where the runtime cannot start processes.
 uint64_t sys_execve(Process& p, uint64_t dirfd, uint64_t path, uint64_t argv, uint64_t envp, uint64_t flags);
+
+// --- The built-in shell. The Linux tree's /bin/sh and /bin/bash (made by prepare_program_folders when nothing is there) are not programs but a
+// marker: a file whose first line is kBuiltinShellLine. execve of one (directly, or as the "#!" interpreter of a script) runs the script with the
+// OS's own shell (src/Program/AppRunScript.hpp: enough sh and bash for launcher scripts, no fork) and then execs what the script finally starts.
+// "sh [options] script [arguments]" is understood; options are ignored, "-c" and a shell without a script are not (ENOEXEC).
+// A real shell (a program named sh, bash, dash or ash, such as the dash sharun AppImages bundle) asked to run a script file is given the same treatment:
+// without fork it could not get past its first $( ). It still runs as itself for -c and interactive use.
+constexpr const char* kBuiltinShellLine = "#!tcos-builtin-shell";
+
+// Runs `script` (a path in the Linux world, whose files are `files` below `world_root`) with `arguments` after $0 and `environment`. 1: it starts
+// *program (a path in the Linux world) with *program_arguments (after argv[0]) and *program_environment; 0: it ended without starting a program;
+// -1: out of memory.
+using BuiltinShell = int (*)(allocators::IAllocator& allocator, filesystem::IFileSystem& files, StringView world_root, StringView script,
+                             ArrayView<const StringView> arguments, ArrayView<const StringView> environment, String* program, List<String>* program_arguments,
+                             List<String>* program_environment);
+// Set once at boot (src/Program installs the AppRun interpreter); without one, the marker files are refused with ENOEXEC.
+void install_builtin_shell(BuiltinShell shell);
 
 }  // namespace process::linuxabi

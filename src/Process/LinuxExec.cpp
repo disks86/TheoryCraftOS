@@ -18,6 +18,7 @@
 
 #include "Process/LinuxExec.hpp"
 #include "Executable/ExecutableKind.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Process/LinuxFiles.hpp"
 #include "Utility/ByteBuffer.hpp"
 #include "Utility/Move.hpp"
@@ -39,6 +40,8 @@ constexpr uint32_t kMaxInterpreters = 4;
 constexpr uint64_t kWaitNs = 20000000;      // how often the old program looks whether the new one has ended
 
 uint64_t error(int64_t e) { return uint64_t(-e); }
+
+BuiltinShell g_shell = nullptr;      // set once at boot, before any program runs
 
 // A NUL-terminated string of the program, at most `limit` bytes. 0, or -errno.
 int64_t read_string(Process& p, uint64_t address, uint64_t limit, String* out) {
@@ -128,7 +131,52 @@ bool shebang(ConstByteView image, StringView* interpreter, StringView* argument,
   return !interpreter->empty();
 }
 
+// The script of "sh [options] [--] script [arguments]": true and its index. False for a command string (-c), standard input (-s) or no script.
+bool shell_script(const List<String>& arguments, uint64_t* index) {
+  uint64_t at = 1;
+  while (at < arguments.count()) {
+    const StringView option = arguments[at].view();
+    if (option.equals("--")) { ++at; break; }
+    if (option.size() < 2 || (option[0] != '-' && option[0] != '+')) break;
+    if (option.equals("-c") || option.equals("-s") || option.equals("-i")) return false;
+    if (option.equals("-o") || option.equals("+o") || option.equals("-O") || option.equals("+O")) ++at;      // (an option with a value: -o errexit)
+    ++at;
+  }
+  *index = at;
+  return at < arguments.count();
+}
+
+// Is the program a POSIX shell, by its name (sh, bash, dash, ash)?
+bool is_shell_name(StringView path) {
+  const uint64_t slash = path.rfind('/');
+  const StringView name = slash == StringView::npos ? path : path.without_prefix(slash + 1);
+  return name.equals("sh") || name.equals("bash") || name.equals("dash") || name.equals("ash");
+}
+
+bool is_builtin_shell(ConstByteView image) {
+  const StringView line(kBuiltinShellLine);
+  if (image.size() < line.size()) return false;
+  for (uint64_t i = 0; i < line.size(); ++i)
+    if (image[i] != uint8_t(line[i])) return false;
+  return image.size() == line.size() || image[line.size()] == '\n' || image[line.size()] == '\r';
+}
+
+// The program is done (a shell whose script started nothing): it closes what it had, its other threads stop, it ends with `code`.
+void finish(Process& p, IProcessRuntime* runtime, uint32_t code) {
+  ProcessFiles& files = p.files();
+  for (uint64_t slot = 0; slot < ProcessFiles::kMaxDescriptors; ++slot)
+    if (files.kind(slot) != DescriptorKind::Closed) p.close_descriptor(slot);
+  if (runtime) {
+    const uint64_t self = runtime->current_thread_id();
+    for (const Process::LinuxThreadState::Thread& t : p.linux_threads().threads)
+      if (t.used && t.tid != self) runtime->request_terminate(t.tid, 0);
+  }
+  p.terminate(code & 0xFF);
+}
+
 }  // namespace
+
+void install_builtin_shell(BuiltinShell shell) { g_shell = shell; }
 
 uint64_t sys_execve(Process& p, uint64_t dirfd, uint64_t path, uint64_t argv, uint64_t envp, uint64_t flags) {
   IProcessRuntime* runtime = p.runtime();
@@ -158,6 +206,42 @@ uint64_t sys_execve(Process& p, uint64_t dirfd, uint64_t path, uint64_t argv, ui
   ByteBuffer image(allocator);
   for (uint32_t level = 0;; ++level) {
     if (const int64_t r = read_program(p, target.view(), &image); r < 0) return error(-r);
+    const bool marker = is_builtin_shell(image.view());
+    uint64_t at = 0;
+    const bool has_script = shell_script(arguments, &at);
+    // The marker, or a real shell (dash, bash...) asked to run a script: without fork a real shell gets no further than its first $( ), so the
+    // script runs in the OS's own shell either way. A real shell keeps -c and interactive use.
+    if (marker || (g_shell && has_script && is_shell_name(target.view()))) {
+      // sh [options] [--] script [arguments]: the script runs here, and what it starts in the end is exec'd instead.
+      if (level >= kMaxInterpreters) return error(kEloop);
+      if (!g_shell || !has_script) return error(kEnoexec);
+      String script(allocator);
+      if (files.resolve(arguments[at].view(), &script) != PathResult::Ok) return error(kEnoent);
+      List<StringView> rest(allocator), variables(allocator);
+      for (uint64_t i = at + 1; i < arguments.count(); ++i)
+        if (!rest.push_back(arguments[i].view())) return error(kEnomem);
+      for (const String& e : environment.view())
+        if (!variables.push_back(e.view())) return error(kEnomem);
+      String program(allocator);
+      List<String> program_arguments(allocator), program_environment(allocator);
+      const int ran = g_shell(allocator, *files.file_system(), filesystem::layout::kLinux, script.view(), rest.view(), variables.view(), &program,
+                              &program_arguments, &program_environment);
+      if (ran < 0) return error(kEnomem);
+      if (ran == 0) {      // the script ended without starting anything: so does the program
+        finish(p, runtime, 0);
+        return 0;
+      }
+      arguments.clear();
+      environment.clear();
+      String first(allocator);
+      if (!first.assign(program.view()) || !arguments.push_back(util::move(first))) return error(kEnomem);
+      for (String& a : program_arguments.view())
+        if (!arguments.push_back(util::move(a))) return error(kEnomem);
+      for (String& e : program_environment.view())
+        if (!environment.push_back(util::move(e))) return error(kEnomem);
+      if (!target.assign(program.view()) || !given.assign(program.view())) return error(kEnomem);
+      continue;
+    }
     StringView interpreter, argument;
     String line(allocator);
     if (!shebang(image.view(), &interpreter, &argument, &line)) break;
@@ -217,7 +301,7 @@ uint64_t sys_execve(Process& p, uint64_t dirfd, uint64_t path, uint64_t argv, ui
   const uint64_t self = runtime->current_thread_id();
   for (const Process::LinuxThreadState::Thread& t : p.linux_threads().threads)
     if (t.used && t.tid != self) runtime->request_terminate(t.tid, 0);
-  bool exited = false, stopped = false;
+  bool exited = false, stopped = false;      // (finish() would close and stop the same; the wait comes first here)
   uint32_t code = 0;
   while (runtime->query_child(spec.pid, &exited, &code) && !exited) {
     if (!stopped && runtime->interrupted()) {      // (Ctrl+C: it goes to the program that runs now)
