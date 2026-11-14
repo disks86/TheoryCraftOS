@@ -882,7 +882,7 @@ HostClass::Set ctx_set(Vm& vm, JsObject* o, JsString* key, const Value& value) {
   return HostClass::Set::NotHandled;
 }
 
-const HostClass kContextClass = {"CanvasRenderingContext2D", ctx_get, ctx_set, nullptr, nullptr};
+const HostClass kContextClass = {"CanvasRenderingContext2D", ctx_get, ctx_set, nullptr, nullptr, true};
 
 // --- State and transforms
 

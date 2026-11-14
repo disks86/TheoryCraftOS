@@ -12610,11 +12610,12 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
   // Members of elements that were missing or of the wrong kind. An attribute that reflects a content attribute gives a string, a number or a flag;
   // a nullable one (the ARIA attributes, role, crossOrigin) is null while the content attribute is absent, not ''. Scripts read `typeof el.longDesc` and
   // the like of an element they made to see what they run in.
+  var contentNames = { httpEquiv: 'http-equiv', ch: 'char', chOff: 'charoff', htmlFor: 'for' };   // (where the content attribute is not the property's name in lower case)
   var reflected = function (C, kind, names) {
     if (typeof C !== 'function' || !C.prototype) return;
     var proto = C.prototype, slots = kind === 'slot' || kind === 'object' ? new WeakMap() : null;
     names.split(' ').forEach(function (n) {
-      var attr = /^aria[A-Z]/.test(n) ? 'aria-' + n.slice(4).toLowerCase() : n.toLowerCase();
+      var attr = /^aria[A-Z]/.test(n) ? 'aria-' + n.slice(4).toLowerCase() : contentNames[n] || n.toLowerCase();
       var el = function (o) { if (o === proto || o === null || typeof o !== 'object' || typeof o.getAttribute !== 'function') throw new TypeError('Illegal invocation'); return o; };
       var d;
       if (kind === 'string') d = { get: function () { var v = el(this).getAttribute(attr); return v === null ? '' : v; }, set: function (v) { el(this).setAttribute(attr, String(v)); } };
@@ -12693,6 +12694,97 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (C.name !== name && typeof g[C.name] === 'function' && g[C.name] === C) return;   // (another name of an interface: its own name tags it)
     try { Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { }
   });
+  // The attributes of the element interfaces that nothing here acts on yet: each reflects its content attribute, so a script that sets one finds it
+  // again and one that lists an interface finds what every browser has there. (From a comparison with the reference browser; a member with behaviour
+  // of its own - validity, the frames' windows - is not in this list.)
+  reflected(g.HTMLAnchorElement, 'slot', 'interestForElement');
+  reflected(g.HTMLAnchorElement, 'string', 'attributionSrc coords hreflang ping referrerPolicy rev shape');
+  reflected(g.HTMLAreaElement, 'flag', 'noHref');
+  reflected(g.HTMLAreaElement, 'slot', 'interestForElement');
+  reflected(g.HTMLAreaElement, 'string', 'attributionSrc coords ping referrerPolicy shape');
+  reflected(g.HTMLBRElement, 'string', 'clear');
+  reflected(g.HTMLBodyElement, 'string', 'aLink background bgColor link text vLink');
+  reflected(g.HTMLButtonElement, 'flag', 'formNoValidate');
+  reflected(g.HTMLButtonElement, 'slot', 'commandForElement interestForElement');
+  reflected(g.HTMLButtonElement, 'string', 'command formAction formEnctype formMethod formTarget popoverTargetAction');
+  reflected(g.HTMLDListElement, 'flag', 'compact');
+  reflected(g.HTMLDialogElement, 'string', 'closedBy');
+  reflected(g.HTMLEmbedElement, 'string', 'align name');
+  reflected(g.HTMLFontElement, 'string', 'color face');
+  reflected(g.HTMLHRElement, 'flag', 'noShade');
+  reflected(g.HTMLHRElement, 'string', 'align color');
+  reflected(g.HTMLHtmlElement, 'string', 'version');
+  reflected(g.HTMLIFrameElement, 'flag', 'adAuctionHeaders allowFullscreen allowPaymentRequest browsingTopics credentialless');
+  reflected(g.HTMLIFrameElement, 'string', 'align csp frameBorder longDesc marginHeight marginWidth privateToken referrerPolicy scrolling');
+  reflected(g.HTMLInputElement, 'flag', 'formNoValidate incremental webkitdirectory');
+  reflected(g.HTMLInputElement, 'string', 'accept align dirName formAction formEnctype formMethod formTarget popoverTargetAction useMap');
+  reflected(g.HTMLLegendElement, 'string', 'align');
+  reflected(g.HTMLLinkElement, 'string', 'as charset fetchPriority hreflang imageSizes imageSrcset integrity referrerPolicy rev target');
+  reflected(g.HTMLMarqueeElement, 'flag', 'trueSpeed');
+  reflected(g.HTMLMarqueeElement, 'number', 'hspace loop scrollAmount scrollDelay vspace');
+  reflected(g.HTMLMarqueeElement, 'string', 'behavior bgColor direction height width');
+  reflected(g.HTMLMediaElement, 'flag', 'disableRemotePlayback');
+  reflected(g.HTMLMediaElement, 'string', 'loading sinkId');
+  reflected(g.HTMLMediaElement, 'zero', 'webkitAudioDecodedByteCount webkitVideoDecodedByteCount');
+  reflected(g.HTMLMenuElement, 'flag', 'compact');
+  reflected(g.HTMLMetaElement, 'string', 'httpEquiv scheme');
+  reflected(g.HTMLMeterElement, 'number', 'high low optimum');
+  reflected(g.HTMLModElement, 'string', 'cite dateTime');
+  reflected(g.HTMLOListElement, 'flag', 'compact');
+  reflected(g.HTMLObjectElement, 'flag', 'declare');
+  reflected(g.HTMLObjectElement, 'number', 'hspace vspace');
+  reflected(g.HTMLObjectElement, 'string', 'align archive border code codeBase codeType data standby useMap');
+  reflected(g.HTMLQuoteElement, 'string', 'cite');
+  reflected(g.HTMLScriptElement, 'string', 'attributionSrc event fetchPriority integrity referrerPolicy');
+  reflected(g.HTMLSourceElement, 'string', 'sizes');
+  reflected(g.HTMLTableCaptionElement, 'string', 'align');
+  reflected(g.HTMLTableCellElement, 'flag', 'noWrap');
+  reflected(g.HTMLTableCellElement, 'string', 'abbr align axis bgColor ch chOff vAlign');
+  reflected(g.HTMLTableColElement, 'string', 'align ch chOff vAlign');
+  reflected(g.HTMLTableElement, 'string', 'align bgColor border cellPadding cellSpacing frame rules summary');
+  reflected(g.HTMLTableRowElement, 'string', 'align bgColor ch chOff vAlign');
+  reflected(g.HTMLTableSectionElement, 'string', 'align ch chOff vAlign');
+  reflected(g.HTMLTemplateElement, 'flag', 'shadowRootClonable shadowRootDelegatesFocus shadowRootSerializable');
+  reflected(g.HTMLTemplateElement, 'slot', 'shadowRootReferenceTarget');
+  reflected(g.HTMLTemplateElement, 'string', 'htmlFor shadowRootCustomElementRegistry shadowRootMode shadowRootSlotAssignment');
+  reflected(g.HTMLTextAreaElement, 'string', 'dirName wrap');
+  reflected(g.HTMLTimeElement, 'string', 'dateTime');
+  reflected(g.HTMLUListElement, 'flag', 'compact');
+  reflected(g.HTMLVideoElement, 'string', 'poster');
+  reflected(g.HTMLVideoElement, 'zero', 'webkitDecodedFrameCount webkitDroppedFrameCount');
+  var svgHandlers = 'onabort onanimationcancel onanimationend onanimationiteration onanimationstart onauxclick onbeforeinput onbeforematch onbeforetoggle onbeforexrselect onblur oncancel oncanplay oncanplaythrough onchange onclick onclose oncommand oncontentvisibilityautostatechange oncontextlost oncontextmenu oncontextrestored oncopy oncuechange oncut ondblclick ondrag ondragend ondragenter ondragleave ondragover ondragstart ondrop ondurationchange onemptied onended onerror onfocus onformdata ongotpointercapture oninput oninvalid onkeydown onkeypress onkeyup onload onloadeddata onloadedmetadata onloadstart onlostpointercapture onmousedown onmouseenter onmouseleave onmousemove onmouseout onmouseover onmouseup onmousewheel onpaste onpause onplay onplaying onpointercancel onpointerdown onpointerenter onpointerleave onpointermove onpointerout onpointerover onpointerrawupdate onpointerup onprogress onratechange onreset onresize onscroll onscrollend onscrollsnapchange onscrollsnapchanging onsecuritypolicyviolation onseeked onseeking onselect onselectionchange onselectstart onslotchange onstalled onsubmit onsuspend ontimeupdate ontoggle ontransitioncancel ontransitionend ontransitionrun ontransitionstart onvolumechange onwaiting onwebkitanimationend onwebkitanimationiteration onwebkitanimationstart onwebkittransitionend onwheel'.split(' ');
+  var elementHandlers = 'onbeforecopy onbeforecut onbeforepaste onfullscreenchange onfullscreenerror onsearch onwebkitfullscreenchange onwebkitfullscreenerror'.split(' ');
+  handlerAccessors(g.Document, 'onbeforecopy onbeforecut onbeforepaste onbeforexrselect oncommand oncontentvisibilityautostatechange onmousewheel onscrollsnapchange onscrollsnapchanging onsearch'.split(' '));
+  // (the body and a frameset have the window's handlers as their own attributes)
+  var windowHandlers = 'onafterprint onbeforeprint onbeforeunload onblur onerror onfocus ongamepadconnected ongamepaddisconnected onhashchange onlanguagechange onload onmessage onmessageerror onoffline ononline onpagehide onpageshow onpopstate onrejectionhandled onresize onscroll onstorage onunhandledrejection onunload'.split(' ');
+  if (typeof g.HTMLBodyElement === 'function') delete g.HTMLBodyElement.prototype.onhashchange;   // (listed there without an accessor of its own)
+  if (typeof g.Document === 'function') ['onreadystatechange', 'onselectionchange', 'onvisibilitychange'].forEach(function (n) { delete g.Document.prototype[n]; });
+  handlerAccessors(g.HTMLBodyElement, windowHandlers); handlerAccessors(g.HTMLFrameSetElement, windowHandlers);
+  handlerAccessors(g.Document, ['onreadystatechange', 'onselectionchange', 'onvisibilitychange']);
+  if (typeof g.Document === 'function') {
+    var DPr = g.Document.prototype, FPr = typeof g.DocumentFragment === 'function' ? g.DocumentFragment.prototype : null;
+    var parentAttributes = function (P) {
+      if (!P) return;
+      var kids = function (o) { if (o === P) throw new TypeError('Illegal invocation'); return o.children; };
+      if (!('childElementCount' in P)) Object.defineProperty(P, 'childElementCount', { get: function () { return kids(this).length; }, enumerable: true, configurable: true });
+      if (!('firstElementChild' in P)) Object.defineProperty(P, 'firstElementChild', { get: function () { return kids(this)[0] || null; }, enumerable: true, configurable: true });
+      if (!('lastElementChild' in P)) Object.defineProperty(P, 'lastElementChild', { get: function () { var k = kids(this); return k[k.length - 1] || null; }, enumerable: true, configurable: true });
+    };
+    parentAttributes(DPr); parentAttributes(FPr);
+    var documentAttribute = function (n, get) { if (!Object.prototype.hasOwnProperty.call(DPr, n)) Object.defineProperty(DPr, n, { get: function () { if (this === DPr) throw new TypeError('Illegal invocation'); return get.call(this); }, enumerable: true, configurable: true }); };
+    documentAttribute('scrollingElement', function () { return this.documentElement; });
+    documentAttribute('webkitHidden', function () { return this.hidden === true; });
+    documentAttribute('webkitVisibilityState', function () { return this.visibilityState || 'visible'; });
+    documentAttribute('prerendering', function () { return false; });
+    documentAttribute('activeViewTransition', function () { return null; });
+    ['captureEvents', 'releaseEvents'].forEach(function (n) { var have = Object.getOwnPropertyDescriptor(DPr, n); if (!have || typeof have.value !== 'function') Object.defineProperty(DPr, n, { value: function () { }, writable: true, enumerable: true, configurable: true }); });
+  }
+  // Event handler attributes are HTMLElement's, SVGElement's and MathMLElement's, each with its own; Element has only the few that are its own.
+  handlerAccessors(g.SVGElement, svgHandlers); handlerAccessors(g.MathMLElement, svgHandlers);
+  handlerAccessors(g.HTMLVideoElement, ['onenterpictureinpicture', 'onleavepictureinpicture']);
+  if (typeof g.Element === 'function') Object.getOwnPropertyNames(g.Element.prototype).forEach(function (n) {
+    if (/^on[a-z]+$/.test(n) && elementHandlers.indexOf(n) < 0) delete g.Element.prototype[n];
+  });
   // Each member is on the prototype of the interface that declares it, and nowhere above: an <img> has no `play` or `getContext` to find, and
   // `querySelector` is Element's (and Document's and DocumentFragment's), not Node's. Scripts list the prototypes along an element's chain and look
   // at what they find there; this implementation defines many members once, on a prototype every element shares, and they move here.
@@ -12725,6 +12817,10 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     relocate(from, 'getElementsByName', 'Document');
     relocate(from, 'ontouchstart ontouchend ontouchmove ontouchcancel', '');   // (a device with a touch screen has these; this one says it has none)
   });
+  relocate('Document', 'ontouchstart ontouchend ontouchmove ontouchcancel', '');
+  relocate('Element', 'click', 'HTMLElement');
+  relocate('Node', 'getElementsByTagName getElementsByTagNameNS', 'Element Document');
+  relocate('DocumentFragment', 'innerHTML', 'ShadowRoot');
   relocate('HTMLElement', 'onfullscreenchange onfullscreenerror onwebkitfullscreenchange onwebkitfullscreenerror', 'Element');
   relocate('Element', 'inert autocapitalize translate popover showPopover hidePopover togglePopover', 'HTMLElement');
   relocate('Element', 'focus blur', 'HTMLElement SVGElement MathMLElement');
@@ -12754,6 +12850,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     handlerAccessors(g.Document, Object.getOwnPropertyNames(g.document).filter(function (n) { return n.indexOf('on') === 0 && g.document[n] === null; }));
     if (!has.call(g.document, 'readyState')) Object.defineProperty(g.document, 'readyState', { value: 'loading', writable: true, configurable: true });   // (the loader writes it as the page loads)
     lift(g.document, g.Document, ['dir', 'designMode'], g.Document.prototype);
+    ['ontouchstart', 'ontouchend', 'ontouchmove', 'ontouchcancel'].forEach(function (n) { delete g.Document.prototype[n]; });
   }
   // The members of an interface come before its `constructor` among the properties of its prototype (the order they are listed in: the attributes and
   // operations as the interface declares them, then the constructor), whatever order this implementation happened to add them in.
