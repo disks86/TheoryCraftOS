@@ -132,6 +132,11 @@ void Server::announce_scale() {
 // Monitors at different scales: a surface draws at the scale of the monitor its window is on (the centre of its root's window geometry: the toplevel,
 // layer surface or whatever it hangs from; a subsurface is its parent's, a popup its parent's window's). One scale for all monitors: that one.
 uint32_t Server::scale_for(const Surface& s) const {
+  const uint32_t i = monitor_index_for(s);
+  return i < monitor_count_ ? monitors_[i].scale : output_scale_;
+}
+
+uint32_t Server::monitor_index_for(const Surface& s) const {
   const Surface* root = &s;
   for (uint32_t depth = 0; depth < 64; ++depth) {
     if (root->parent) root = root->parent;
@@ -140,13 +145,36 @@ uint32_t Server::scale_for(const Surface& s) const {
   }
   const Rect r = root->role == Role::Toplevel || root->role == Role::Popup ? content_rect(*root) : Rect{root->x, root->y, 1, 1};
   const int32_t cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-  for (uint32_t i = 0; i < monitor_count_; ++i) if (contains(monitors_[i].rect, cx, cy)) return monitors_[i].scale;
-  return monitor_count_ > 0 ? monitors_[0].scale : output_scale_;
+  for (uint32_t i = 0; i < monitor_count_; ++i) if (contains(monitors_[i].rect, cx, cy)) return i;
+  return 0;
 }
 
 void Server::tell_scale(Surface& s) {
   Client* c = client_of(s.client);
   if (!c) return;
+  // a shown window is on its monitor's outputs: wl_surface.enter, and leave for the monitor it was on
+  const int32_t index = s.mapped ? static_cast<int32_t>(monitor_index_for(s)) : -1;
+  if (index != s.entered) {
+    ObjectCursor cursor;
+    List<uint32_t> left(allocator_), entered(allocator_);
+    for (bool more = c->objects.first(&cursor); more; more = c->objects.next(&cursor)) {
+      const KeyValue<uint32_t, Resource>* kv = c->objects.element(cursor);
+      if (kv->value.iface != Iface::Output) continue;
+      if (s.entered >= 0 && kv->value.output == s.entered) left.push_back(kv->key);
+      if (index >= 0 && kv->value.output == index) entered.push_back(kv->key);
+    }
+    for (uint32_t o : left.view()) {
+      Event e(s.id, 1);      // leave(output)
+      e.u(o);
+      send(*c, e);
+    }
+    for (uint32_t o : entered.view()) {
+      Event e(s.id, 0);      // enter(output)
+      e.u(o);
+      send(*c, e);
+    }
+    s.entered = index;
+  }
   const uint32_t k = scale_for(s);
   if (k == s.told_scale) return;
   s.told_scale = k;

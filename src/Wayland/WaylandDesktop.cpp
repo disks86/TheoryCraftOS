@@ -69,6 +69,7 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       for (uint64_t k = 0; k < outputs.count(); ++k) announce(*c, outputs[k], Iface::Output, versions[k]);
     }
     (void)rescaled;
+    list_outputs();
     announce_scale();      // (each surface its monitor's scale: told when that changed)
     arrange_layers();      // (panels follow their monitor)
     for (Surface* s : stack_.view())
