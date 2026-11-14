@@ -1240,14 +1240,19 @@ bool ranges_overlap(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen) {
 }
 }  // namespace
 
+// The table of locks, made on first use; false if there is none or `path` is too long to be kept in it.
+bool ObjectManager::lock_table_locked(StringView path) {
+  if (!allocator_ || path.size() >= 260) return false;
+  if (locks_) return true;
+  void* memory = allocator_->allocate(sizeof(RangeLock) * kMaxLocks);
+  if (!memory) return false;
+  locks_ = static_cast<RangeLock*>(memory);
+  for (uint32_t i = 0; i < kMaxLocks; ++i) new (&locks_[i]) RangeLock();
+  return true;
+}
+
 ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, const void* owner, uint64_t offset, uint64_t length, bool exclusive) {
-  if (!allocator_ || path.size() >= 260) return LockResult::Full;
-  if (!locks_) {
-    void* memory = allocator_->allocate(sizeof(RangeLock) * kMaxLocks);
-    if (!memory) return LockResult::Full;
-    locks_ = static_cast<RangeLock*>(memory);
-    for (uint32_t i = 0; i < kMaxLocks; ++i) new (&locks_[i]) RangeLock();
-  }
+  if (!lock_table_locked(path)) return LockResult::Full;
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
     const RangeLock& l = locks_[i];
     if (!l.used || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
@@ -1268,6 +1273,34 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
     return LockResult::Granted;
   }
   return LockResult::Full;
+}
+
+ObjectManager::LockResult ObjectManager::lock_whole_locked(StringView path, const void* owner, bool exclusive) {
+  if (!lock_table_locked(path)) return LockResult::Full;
+  RangeLock* own = nullptr;
+  RangeLock* free_entry = nullptr;
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    RangeLock& l = locks_[i];
+    if (!l.used) { if (!free_entry) free_entry = &l; continue; }
+    if (l.length == 0 || !same_name(l.path, l.path_size, path)) continue;
+    if (l.owner == owner) { if (l.offset == 0 && l.length == kWholeFile) own = &l; continue; }
+    if (l.exclusive || exclusive) return LockResult::Conflict;
+  }
+  if (own) {
+    const bool loosened = own->exclusive && !exclusive;
+    own->exclusive = exclusive;
+    if (loosened) sync_.notify_all();      // whoever waits for a shared lock looks again
+    return LockResult::Granted;
+  }
+  if (!free_entry) return LockResult::Full;
+  *free_entry = RangeLock();
+  free_entry->used = true;
+  free_entry->exclusive = exclusive;
+  free_entry->owner = owner;
+  free_entry->length = kWholeFile;
+  for (uint32_t k = 0; k < path.size(); ++k) free_entry->path[k] = path[k];
+  free_entry->path_size = static_cast<uint32_t>(path.size());
+  return LockResult::Granted;
 }
 
 bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length) {
