@@ -84,6 +84,16 @@ const ReflectedAttribute kReflected[] = {
     {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::NullableStr},
 };
 
+// width, height, size, cols and rows are numbers on the elements that are sized in pixels or characters (img, canvas, video, input, select, textarea)
+// and the content attribute's text on the others that have them, where "50%" and "2*" are values.
+bool size_is_text(const dom::Node* n, const char* property) {
+  const StringView p(property);
+  if (!p.equals("width") && !p.equals("height") && !p.equals("size") && !p.equals("cols") && !p.equals("rows")) return false;
+  for (const char* tag : {"iframe", "embed", "object", "td", "th", "table", "col", "colgroup", "hr", "marquee", "font", "frameset"})
+    if (n->is_tag(tag)) return true;
+  return false;
+}
+
 // An element in the SVG namespace: some names are not the reflected attributes of HTML (className is an SVGAnimatedString there), the script's accessors answer.
 bool in_svg_namespace(const dom::Node* n) { return n->is_element() && n->ns_set && n->ns.view().equals("http://www.w3.org/2000/svg"); }
 bool svg_own_name(StringView js) { return js.equals("className") || js.equals("href") || js.equals("target") || js.equals("type") || js.equals("media") || js.equals("name") || js.equals("content") || js.equals("width") || js.equals("height") || js.equals("max") || js.equals("min") || js.equals("rel") || js.equals("download"); }
@@ -647,7 +657,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   if (const ReflectedAttribute* r = find_reflected(k)) {
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
-    switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind) {   // (an <li>'s value is a number)
+    switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind == Reflect::Int && size_is_text(n, r->js) ? Reflect::Str : r->kind) {   // (an <li>'s value is a number)
       case Reflect::Bool: *out = bool_value(present); return true;
       case Reflect::NullableStr: *out = present ? str_value(vm, v) : Value::make_null(); return true;
       case Reflect::Int: {
@@ -1674,7 +1684,7 @@ HostClass::Set node_set_property(Vm& vm, JsObject* o, JsString* key, const Value
 
 }  // namespace
 
-const HostClass kNodeHostClass = {"Node", node_get_property, node_set_property, nullptr, nullptr};
+const HostClass kNodeHostClass = {"Node", node_get_property, node_set_property, nullptr, nullptr, true};
 
 // --- Shadow trees
 

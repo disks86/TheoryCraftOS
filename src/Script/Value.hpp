@@ -186,6 +186,9 @@ struct HostClass {
   bool (*remove)(Vm& vm, JsObject* object, JsString* key, bool* deleted);
   // Appends the names of the enumerable properties it has (as strings) to `keys`.
   void (*keys)(Vm& vm, JsObject* object, JsObject* keys);
+  // What `get` answers are attributes of the object's interface (an element's id, a URL's href), not properties the object has of its own:
+  // hasOwnProperty and getOwnPropertyDescriptor say no. (false: they are the object's own - a style's properties, a storage's keys.)
+  bool interface_attributes = false;
 };
 
 // JsObject::position of an array that is a function's `arguments` object.

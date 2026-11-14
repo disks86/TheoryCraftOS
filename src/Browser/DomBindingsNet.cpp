@@ -746,7 +746,7 @@ HostClass::Set url_set(Vm& vm, JsObject* o, JsString* key, const Value& value) {
   return HostClass::Set::Handled;
 }
 
-const HostClass kUrlClass = {"URL", url_get, url_set, nullptr, nullptr};
+const HostClass kUrlClass = {"URL", url_get, url_set, nullptr, nullptr, true};
 
 bool parse_with_base(Vm& vm, const Value& input, const Value& base, WebUrl* out, bool* threw) {
   *threw = false;

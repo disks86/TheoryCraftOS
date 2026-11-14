@@ -724,7 +724,8 @@ NATIVE(object_has_own_property) {
     return true;
   }
   Value ignored;
-  *result = Value::make_bool(self.is_object() && vm.get_own(self.as_object(), key, &ignored));
+  uint8_t flags = 0;
+  *result = Value::make_bool(self.is_object() && vm.own_property(self.as_object(), key, &ignored, &flags));
   return true;
 }
 

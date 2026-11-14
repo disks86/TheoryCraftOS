@@ -2449,6 +2449,19 @@ JsObject* Vm::own_names(JsObject* o) {
   JsObject* names = own_keys(o);
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
   push_property_keys(names, o, false);
+  if (o->host != nullptr) {   // (what the page library keeps on a host object for itself - hidden properties called __something - is not the page's to list)
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < names->length; ++i) {
+      const Value& v = names->items[i];
+      if (v.is_string() && v.as_string()->view().starts_with("__")) {
+        uint8_t flags = 0;
+        Value ignored;
+        if (own_property(o, v.as_string(), &ignored, &flags) && !(flags & kEnumerable)) continue;
+      }
+      names->items[kept++] = v;
+    }
+    names->length = kept;
+  }
   if (o->okind != ObjKind::Function && o->okind != ObjKind::Native && o->okind != ObjKind::Bound) return names;
   // a function: its length and name (and prototype, if it has or would get one) come first, whether or not they have been looked at yet
   bool prototype = makes_prototype(o);
@@ -2497,6 +2510,7 @@ bool Vm::own_property(JsObject* o, JsString* key, Value* value, uint8_t* flags) 
     *flags = o->props[at].flags;
     return true;
   }
+  if (o->host != nullptr && o->host->interface_attributes) return false;
   const bool saved = has_receiver_;
   has_receiver_ = false;
   const bool found = get_own(o, key, value);

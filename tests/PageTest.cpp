@@ -3295,6 +3295,24 @@ static void test_reference_surface() {
                  "document.getElementById('f').checkValidity(), E('canvas').getContext('2d') !== null)</script></body></html>") ==
         "false false false false false false function function function function | function function function function function function function function function | "
         "false true true true false true true true false function function function | b 1 0 true true");
+  // an element's attributes are its interface's, not properties of its own; what a script puts on it is; the library's own records on it are not listed
+  CHECK(run_page("<html><body><p id=p class=c>x</p><script>var p = document.getElementById('p'), h = function (o, k) { return Object.prototype.hasOwnProperty.call(o, k) }; p.mine = 1; p.style.color = 'red';"
+                 "console.log(h(p, 'id'), h(p, 'className'), h(p, 'mine'), p.id, 'id' in p, Object.getOwnPropertyDescriptor(p, 'id'), Object.getOwnPropertyNames(p).join(), h(new URL('http://a/b'), 'href'), h(history, 'length'),"
+                 "h(p.style, 'color'), Object.getOwnPropertyNames(document.createTextNode('t')).length); p.id = 'q'; console.log(document.getElementById('q') === p)</script></body></html>") ==
+        "false false true p true undefined mine false false true 0 | true");
+  // reflected attributes of the element interfaces, sizes that are text, the handlers of svg elements and the body, the document's element children
+  CHECK(run_page("<html><body><iframe id=f width=50% height=20></iframe><table><tr><td id=t colspan=2 width=30>x</td></tr></table><img id=i width=7><input id=n size=4><script>"
+                 "var E = function (t) { return document.createElement(t) }, I = function (i) { return document.getElementById(i) }, f = I('f'), t = I('t'), a = E('a'), m = E('meta'), td = E('td');"
+                 "a.hreflang = 'de'; m.httpEquiv = 'refresh'; f.allowFullscreen = true; td.chOff = '3'; td.noWrap = true;"
+                 "console.log(typeof f.width, f.width, f.height, t.colSpan, typeof t.width, typeof I('i').width, typeof I('n').size, a.getAttribute('hreflang'), m.getAttribute('http-equiv'), f.hasAttribute('allowfullscreen'),"
+                 "td.getAttribute('charoff'), td.hasAttribute('nowrap'), E('video').poster === '', E('ol').compact, E('input').formAction === '');"
+                 "var s = document.createElementNS('http://www.w3.org/2000/svg', 'svg'), own = function (C, n) { return C.prototype.hasOwnProperty(n) }; document.body.appendChild(s);"
+                 "console.log(document.childElementCount, document.firstElementChild.tagName, document.scrollingElement.tagName, document.onreadystatechange, document.body.onhashchange, s.onclick,"
+                 "own(SVGElement, 'onclick'), own(HTMLElement, 'onclick'), own(Element, 'onclick'), own(Element, 'onfullscreenchange'), own(HTMLBodyElement, 'onload'), own(HTMLElement, 'click'), own(Element, 'click'),"
+                 "own(Element, 'getElementsByTagName'), own(Node, 'getElementsByTagName'), typeof document.getElementsByTagName, 'ontouchstart' in document);"
+                 "var log = []; document.body.onclick = function () { log.push('body') }; s.onclick = function () { log.push('svg') }; s.dispatchEvent(new MouseEvent('click', { bubbles: true })); console.log(log.join())"
+                 "</script></body></html>") ==
+        "string 50% 20 2 string number number de refresh true 3 true true false true | 1 HTML HTML null null null true true false true true true false true false function false | svg,body");
   // what an object of another window has of its own is asked of that window (not: what it has or inherits)
   CHECK(run_page("<html><body><iframe id=f srcdoc=\"<script>var mine = { a: 1 }; Object.defineProperty(mine, 'h', { value: 2 }); Object.defineProperty(mine, 'g', { get: function () { return 7 }, enumerable: true });</script>\"></iframe><script>"
                  "addEventListener('load', function () { var w = document.getElementById('f').contentWindow, m = w.mine, h = Object.prototype.hasOwnProperty;"

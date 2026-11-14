@@ -188,7 +188,7 @@ bool history_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   return true;
 }
 
-const HostClass kHistoryClass = {"History", history_get, nullptr, nullptr, nullptr};
+const HostClass kHistoryClass = {"History", history_get, nullptr, nullptr, nullptr, true};
 
 NATIVE(history_back) {
   impl(vm).host.history_go(-1);
