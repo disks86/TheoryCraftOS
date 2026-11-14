@@ -30,6 +30,7 @@ struct Binding {
   bool lexical = false;     // let / const / class: reading it before it is initialized is a ReferenceError
   bool is_const = false;    // const: assigning to it is a TypeError
   uint32_t level = 0;       // 0: a slot of the function's Env; n: a slot of the n-th block Env that is open (see EnvScope)
+  int32_t shadowed = -1;    // (kept by FuncState's name index while it is valid) where the binding before this one with the same name is, or -1
 };
 
 // A block whose variables live in an Env of their own (a closure made in it may capture them, and each time round a loop they must be new ones).
@@ -57,10 +58,56 @@ struct Patch {
 };
 
 struct FuncState {
-  explicit FuncState(allocators::IAllocator& a) : bindings(a), scope_marks(a), ctx(a), patches(a), envs(a) {}
+  explicit FuncState(allocators::IAllocator& a) : bindings(a), scope_marks(a), ctx(a), patches(a), envs(a), constant_places(a), names_(a) {}
   FunctionCode* code = nullptr;
   FuncState* parent = nullptr;
+  // The names that are visible, in the order they were bound (a later one of the same name hides an earlier one). Read it freely; change it through
+  // add_binding(), insert_binding() and remove_last_binding() only, which keep the name index below in step.
   List<Binding> bindings;
+
+  // Where the last binding of a name is, or -1. A function with few names is searched from the end; one with many (a bundler's wrapper function holds
+  // tens of thousands, and every name used inside it is looked up through it) is answered from a hash index, so that compiling it is not quadratic.
+  int64_t latest(StringView name) {
+    if (bindings.count() < kIndexFrom || (!names_valid_ && !rebuild_names())) {
+      for (uint64_t i = bindings.count(); i > 0; --i)
+        if (bindings[i - 1].name.equals(name)) return static_cast<int64_t>(i - 1);
+      return -1;
+    }
+    const NameSlot& slot = names_[name_slot(name)];
+    return slot.latest == kNoName ? -1 : slot.latest;
+  }
+  // The same among the first `below` bindings only.
+  int64_t latest_below(StringView name, uint64_t below) {
+    if (below > bindings.count()) below = bindings.count();
+    if (bindings.count() < kIndexFrom || (!names_valid_ && !rebuild_names())) {
+      for (uint64_t i = below; i > 0; --i)
+        if (bindings[i - 1].name.equals(name)) return static_cast<int64_t>(i - 1);
+      return -1;
+    }
+    int64_t at = latest(name);
+    while (at >= 0 && static_cast<uint64_t>(at) >= below) at = bindings[static_cast<uint64_t>(at)].shadowed;
+    return at;
+  }
+  bool add_binding(const Binding& binding) {
+    if (!bindings.push_back(binding)) return false;
+    if (names_valid_) {
+      if ((uint64_t{names_used_} + 1) * 2 > names_.count()) names_valid_ = false;   // (too full: made again, larger, when it is next asked)
+      else link_name(bindings.count() - 1);
+    }
+    return true;
+  }
+  bool insert_binding(uint64_t at, const Binding& binding) {
+    if (at >= bindings.count()) return add_binding(binding);
+    names_valid_ = false;   // (the bindings after it moved: the index is made again when it is next asked)
+    return bindings.insert(at, binding);
+  }
+  void remove_last_binding() {
+    if (bindings.empty()) return;
+    const uint64_t last = bindings.count() - 1;
+    if (names_valid_) names_[name_slot(bindings[last].name)].latest = bindings[last].shadowed;   // (the one it hid shows again)
+    bindings.remove_at(last);
+  }
+
   List<uint32_t> scope_marks;
   List<Ctx> ctx;
   List<Patch> patches;
@@ -72,6 +119,57 @@ struct FuncState {
   uint32_t scope_depth = 0;     // blocks entered (0: the function's own top level)
   int32_t completion_slot = -1;
   uint32_t next_ctx_id = 1;
+
+  // Where each string constant of `code` is in its constant list: an open-addressed table of index + 1 (0: free), keyed by the interned string's
+  // address. Kept by Compiler::constant_string() once the list is long.
+  List<uint32_t> constant_places;
+  uint64_t constants_indexed = 0;   // the constants [0, constants_indexed) are in the table
+  uint32_t constant_places_used = 0;
+
+ private:
+  static constexpr uint64_t kIndexFrom = 24;
+  static constexpr int32_t kNoName = INT32_MIN;
+  // (a name stays in its slot once it was put there, with latest = -1 while no binding has it: names are only ever looked up, never taken out)
+  struct NameSlot {
+    StringView name;
+    int32_t latest = kNoName;   // kNoName: a free slot
+  };
+  List<NameSlot> names_;        // open addressing, a power of two long, at most half full
+  uint32_t names_used_ = 0;
+  bool names_valid_ = false;
+
+  // The slot of `name`, or the free one where it would go.
+  uint64_t name_slot(StringView name) const {
+    uint32_t hash = 2166136261u;
+    for (const char c : name.chars()) hash = (hash ^ static_cast<uint8_t>(c)) * 16777619u;
+    const uint64_t mask = names_.count() - 1;
+    uint64_t at = hash & mask;
+    while (names_[at].latest != kNoName && !names_[at].name.equals(name)) at = (at + 1) & mask;
+    return at;
+  }
+  void link_name(uint64_t position) {
+    Binding& binding = bindings[position];
+    NameSlot& slot = names_[name_slot(binding.name)];
+    if (slot.latest == kNoName) {
+      slot.name = binding.name;
+      slot.latest = -1;
+      ++names_used_;
+    }
+    binding.shadowed = slot.latest;
+    slot.latest = static_cast<int32_t>(position);
+  }
+  bool rebuild_names() {
+    uint64_t capacity = 64;
+    while (capacity < bindings.count() * 4) capacity *= 2;
+    names_.clear();
+    names_used_ = 0;
+    if (bindings.count() > static_cast<uint64_t>(INT32_MAX) || !names_.reserve(capacity)) return false;
+    for (uint64_t i = 0; i < capacity; ++i)
+      if (!names_.push_back(NameSlot{})) return false;
+    for (uint64_t i = 0; i < bindings.count(); ++i) link_name(i);
+    names_valid_ = true;
+    return true;
+  }
 };
 
 class Compiler {
@@ -98,7 +196,7 @@ class Compiler {
         b.lexical = e.lexical;
         b.is_const = e.is_const;
         b.level = e.level;
-        fs->bindings.push_back(b);
+        fs->add_binding(b);
       }
       if (f > 0) chain[f - 1]->parent = fs;
     }
@@ -225,10 +323,48 @@ class Compiler {
   uint32_t constant_string(StringView text) {
     JsString* s = vm_.intern(text);
     List<Value>& k = cur_->code->constants;
-    for (uint64_t i = 0; i < k.count(); ++i)
-      if (k[i].is_string() && k[i].as_string() == s) return static_cast<uint32_t>(i);
+    if (k.count() >= kConstantIndexFrom && index_constants(*cur_)) {   // (a long list: a function with thousands of names in it would search it for each)
+      const List<uint32_t>& places = cur_->constant_places;
+      const uint64_t mask = places.count() - 1;
+      for (uint64_t at = constant_hash(s) & mask; places[at] != 0; at = (at + 1) & mask)
+        if (k[places[at] - 1].as_string() == s) return places[at] - 1;
+    } else {
+      for (uint64_t i = 0; i < k.count(); ++i)
+        if (k[i].is_string() && k[i].as_string() == s) return static_cast<uint32_t>(i);
+    }
     if (!k.push_back(Value::make_string(s))) fail("Out of memory", 0);
     return static_cast<uint32_t>(k.count() - 1);
+  }
+  static constexpr uint64_t kConstantIndexFrom = 32;
+  static uint64_t constant_hash(const JsString* s) { return (reinterpret_cast<uintptr_t>(s) >> 4) * 0x9E3779B97F4A7C15ull >> 20; }   // (the address is only a number here: interned strings do not move)
+  // Brings the function's table of string constants up to date with its constant list. False if there is no memory for it (the caller then searches the list).
+  bool index_constants(FuncState& fs) {
+    const List<Value>& k = fs.code->constants;
+    List<uint32_t>& places = fs.constant_places;
+    if (k.count() > 0x7FFFFFFFull) return false;
+    while (fs.constants_indexed < k.count()) {
+      if (places.count() == 0 || (uint64_t{fs.constant_places_used} + 1) * 2 > places.count()) {   // made (again), larger, from the start of the list
+        uint64_t capacity = 128;
+        while (capacity < k.count() * 4) capacity *= 2;
+        places.clear();
+        fs.constants_indexed = 0;
+        fs.constant_places_used = 0;
+        if (!places.reserve(capacity)) return false;
+        for (uint64_t i = 0; i < capacity; ++i)
+          if (!places.push_back(0)) return false;
+      }
+      const uint64_t index = fs.constants_indexed++;
+      if (!k[index].is_string()) continue;
+      const JsString* s = k[index].as_string();
+      const uint64_t mask = places.count() - 1;
+      uint64_t at = constant_hash(s) & mask;
+      while (places[at] != 0 && k[places[at] - 1].as_string() != s) at = (at + 1) & mask;
+      if (places[at] == 0) {   // (the first place a string is at is the one that is given out)
+        places[at] = static_cast<uint32_t>(index + 1);
+        ++fs.constant_places_used;
+      }
+    }
+    return true;
   }
   uint32_t constant_number(double d) {
     List<Value>& k = cur_->code->constants;
@@ -246,7 +382,7 @@ class Compiler {
   void pop_scope() {
     const uint32_t mark = cur_->scope_marks[cur_->scope_marks.count() - 1];
     cur_->scope_marks.remove_at(cur_->scope_marks.count() - 1);
-    while (cur_->bindings.count() > mark) cur_->bindings.remove_at(cur_->bindings.count() - 1);
+    while (cur_->bindings.count() > mark) cur_->remove_last_binding();
     --cur_->scope_depth;
   }
   // Early errors of strict mode code on a name: `eval` and `arguments` cannot be bound or assigned, and the words reserved for the future are not identifiers.
@@ -266,8 +402,10 @@ class Compiler {
   // A variable of the current block (let / const) or of the function (var, parameters).
   uint32_t declare(StringView name) {
     strict_name(name, 0, true);
-    for (uint64_t i = cur_->bindings.count(); i > 0; --i) {
-      if (cur_->bindings[i - 1].name.equals(name) && i - 1 >= (cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0)) return cur_->bindings[i - 1].slot;
+    {   // (the block has it already? Then it is the last one of the name)
+      const uint64_t floor = cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0;
+      const int64_t at = cur_->latest(name);
+      if (at >= 0 && static_cast<uint64_t>(at) >= floor) return cur_->bindings[static_cast<uint64_t>(at)].slot;
     }
     Binding b{name, 0};
     if (cur_->envs.count() && cur_->envs[cur_->envs.count() - 1].scope_depth == cur_->scope_depth) {   // a variable of a block that has its own Env
@@ -281,7 +419,7 @@ class Compiler {
     } else {
       b.slot = new_slot();
     }
-    cur_->bindings.push_back(b);
+    if (!cur_->add_binding(b)) fail("Out of memory", 0);
     return b.slot;
   }
   // How many Envs out the function's own Env is.
@@ -314,11 +452,13 @@ class Compiler {
   // A let / const / class variable of the current block. A second declaration in the same block is an early error.
   uint32_t declare_lexical(StringView name, bool is_const, uint32_t line) {
     const uint64_t floor = cur_->scope_marks.count() ? cur_->scope_marks[cur_->scope_marks.count() - 1] : 0;
-    for (uint64_t i = cur_->bindings.count(); i > floor; --i)
-      if (cur_->bindings[i - 1].name.equals(name) && cur_->bindings[i - 1].lexical) {
+    {   // (a block has a name once: the one to look at is the last of the name)
+      const int64_t at = cur_->latest(name);
+      if (at >= 0 && static_cast<uint64_t>(at) >= floor && cur_->bindings[static_cast<uint64_t>(at)].lexical) {
         fail("Identifier has already been declared", line);
-        return cur_->bindings[i - 1].slot;
+        return cur_->bindings[static_cast<uint64_t>(at)].slot;
       }
+    }
     const uint32_t slot = declare(name);
     for (uint64_t i = cur_->bindings.count(); i > 0; --i)
       if (cur_->bindings[i - 1].slot == slot) {
@@ -335,22 +475,21 @@ class Compiler {
     resolved_import_ = StringView();
     resolved_lexical_ = resolved_const_ = false;
     for (FuncState* fs = cur_; fs; fs = fs->parent, ++funcs) {
-      for (uint64_t i = fs->bindings.count(); i > 0; --i) {
-        if (fs->bindings[i - 1].name.equals(name)) {
-          *depth = hops + static_cast<uint32_t>(fs->envs.count()) - fs->bindings[i - 1].level;
-          *slot = fs->bindings[i - 1].slot;
-          resolved_funcs_ = funcs;
-          resolved_import_ = fs->bindings[i - 1].import_name;
-          resolved_lexical_ = fs->bindings[i - 1].lexical;
-          resolved_const_ = fs->bindings[i - 1].is_const;
-          return true;
-        }
+      if (const int64_t at = fs->latest(name); at >= 0) {
+        const Binding& found = fs->bindings[static_cast<uint64_t>(at)];
+        *depth = hops + static_cast<uint32_t>(fs->envs.count()) - found.level;
+        *slot = found.slot;
+        resolved_funcs_ = funcs;
+        resolved_import_ = found.import_name;
+        resolved_lexical_ = found.lexical;
+        resolved_const_ = found.is_const;
+        return true;
       }
       if (name.equals("arguments") && !fs->is_global && !fs->is_program && !fs->frozen && !(fs->code ? fs->code->is_arrow : fs->arrow)) {
         FuncState* saved = cur_;
         cur_ = fs;
         const uint32_t s = new_slot();
-        fs->bindings.insert(0, Binding{name, s});   // (visible everywhere in the function)
+        fs->insert_binding(0, Binding{name, s});   // (visible everywhere in the function)
         for (uint64_t m = 0; m < fs->scope_marks.count(); ++m) ++fs->scope_marks[m];
         fs->code->arguments_slot = static_cast<int32_t>(s);
         cur_ = saved;
@@ -417,10 +556,9 @@ class Compiler {
       return;
     }
     // function-level bindings go first so that block variables of the same name shadow them
-    for (uint64_t i = 0; i < cur_->bindings.count(); ++i)
-      if (cur_->bindings[i].name.equals(name) && i < function_level_count_) return;
+    if (cur_->latest_below(name, function_level_count_) >= 0) return;
     const uint32_t slot = new_slot();
-    cur_->bindings.insert(function_level_count_, Binding{name, slot});
+    cur_->insert_binding(function_level_count_, Binding{name, slot});
     ++function_level_count_;
     for (uint64_t m = 0; m < cur_->scope_marks.count(); ++m) ++cur_->scope_marks[m];
   }
@@ -481,13 +619,12 @@ class Compiler {
   // Is `name` bound inside the with statement (by a let, a parameter or a variable of a function in the body)?
   bool bound_inside(const WithCtx& ctx, StringView name) {
     for (FuncState* fs = cur_; fs; fs = fs->parent) {
-      for (uint64_t i = fs->bindings.count(); i > 0; --i) {
-        if (!fs->bindings[i - 1].name.equals(name)) continue;
-        if (fs == ctx.fs) return i - 1 >= ctx.mark;
-        for (FuncState* f = fs->parent; f; f = f->parent)
-          if (f == ctx.fs) return true;
-        return false;
-      }
+      const int64_t at = fs->latest(name);
+      if (at < 0) continue;
+      if (fs == ctx.fs) return static_cast<uint64_t>(at) >= ctx.mark;
+      for (FuncState* f = fs->parent; f; f = f->parent)
+        if (f == ctx.fs) return true;
+      return false;
     }
     return false;
   }
@@ -632,7 +769,7 @@ class Compiler {
     bool counting = true;
     for (Node* p = fn->list; p; p = p->next) {
       const uint32_t slot = new_slot();   // (a parameter is slot `params`: they come first)
-      fs.bindings.push_back(Binding{p->text, slot});
+      fs.add_binding(Binding{p->text, slot});
       ++params;
       if (p->a || (!p->next && (fn->flags & kFlagRest))) counting = false;   // (length: the parameters before the first default or the rest)
       if (counting) fs.code->expected_args = params;
@@ -650,7 +787,7 @@ class Compiler {
       for (Node* p = fn->list; p; p = p->next) is_param = is_param || p->text.equals(fn->text);
       if (!is_param) {
         fs.code->self_slot = static_cast<int32_t>(new_slot());
-        fs.bindings.insert(function_level_count_, Binding{fn->text, static_cast<uint32_t>(fs.code->self_slot)});
+        fs.insert_binding(function_level_count_, Binding{fn->text, static_cast<uint32_t>(fs.code->self_slot)});
         ++function_level_count_;
       }
     }
@@ -666,7 +803,7 @@ class Compiler {
       emit(Opc::PushNull);
       emit(Opc::SetLiteralProto);
       const uint32_t slot = new_slot();
-      cur_->bindings.insert(function_level_count_, Binding{var, slot});
+      cur_->insert_binding(function_level_count_, Binding{var, slot});
       ++function_level_count_;
       store_plain(var, fn->line, true);
       emit(Opc::Pop);
@@ -833,7 +970,7 @@ class Compiler {
         text.append_uint(++with_counter_);
         const StringView var = vm_.intern(text.view())->view();
         const uint32_t slot = new_slot();
-        cur_->bindings.insert(function_level_count_, Binding{var, slot});
+        cur_->insert_binding(function_level_count_, Binding{var, slot});
         ++function_level_count_;
         for (uint64_t m = 0; m < cur_->scope_marks.count(); ++m) ++cur_->scope_marks[m];
         for (uint64_t k = 0; k < withs_.count(); ++k)

@@ -78,7 +78,7 @@ class MseClip final : public IVideoClip {
   uint64_t presented_before_ = 0, dropped_before_ = 0;
   void drop(Child* c);
   void drop_all();
-  bool open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into);
+  bool open_child(media::MseBuffer& buffer, uint8_t part, const media::MseSnapshotPlan& plan, Child* into, bool extend);
   Child* master();
   int64_t limit_of(const Child& c);
   void fail(uint8_t code);

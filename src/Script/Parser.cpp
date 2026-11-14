@@ -438,11 +438,17 @@ class Parser {
   }
 
   void lex_punct(Token* t) {
+    // (longest first: the first one the source starts with is the token. The lengths are worked out when this is compiled: every punctuator of a
+    // 10 MB script comes through here.)
     struct P {
       const char* text;
+      uint8_t length;
       T kind;
+      constexpr P(const char* t, T k) : text(t), length(0), kind(k) {
+        while (text[length] != 0) ++length;
+      }
     };
-    static const P kPuncts[] = {
+    static constexpr P kPuncts[] = {
         {">>>=", T::UShrAssign}, {"&&=", T::AmpAmpAssign}, {"||=", T::PipePipeAssign}, {"?\?=", T::QQAssign}, {"...", T::Ellipsis}, {"===", T::StrictEq}, {"!==", T::StrictNe}, {"**=", T::StarStarAssign}, {"<<=", T::ShlAssign},
         {">>=", T::ShrAssign},   {">>>", T::UShr},     {"=>", T::Arrow},      {"==", T::Eq},        {"!=", T::Ne},        {"<=", T::Le},
         {">=", T::Ge},           {"&&", T::AmpAmp},    {"||", T::PipePipe},   {"??", T::QQ},        {"?.", T::QuestionDot}, {"++", T::Inc},
@@ -453,9 +459,12 @@ class Parser {
         {"+", T::Plus},          {"-", T::Minus},      {"*", T::Star},        {"/", T::Slash},      {"%", T::Percent},    {"&", T::Amp},
         {"|", T::Pipe},          {"^", T::Caret},      {"~", T::Tilde},       {"!", T::Bang},       {"<", T::Lt},         {">", T::Gt},
     };
+    const StringView rest = src_.substr(pos_);
+    const char first = rest.empty() ? 0 : rest[0];
     for (const P& p : kPuncts) {
-      const StringView text(p.text);
-      if (src_.substr(pos_).starts_with(text)) {
+      if (p.text[0] != first) continue;
+      const StringView text(p.text, p.length);
+      if (rest.starts_with(text)) {
         if (p.kind == T::QuestionDot && is_digit(peek(2))) continue;   // (a ? .5 : x)
         // (a "/" where an operand is wanted starts a regular expression: see regex_literal())
         pos_ += text.size();
@@ -470,7 +479,7 @@ class Parser {
 
   // --- Parser helpers
   bool is(T kind) const { return cur_.kind == kind; }
-  bool is_word(const char* word) const { return cur_.kind == T::Ident && cur_.text.equals(word); }
+  bool is_word(const char* word) const { return cur_.kind == T::Ident && !cur_.text.empty() && cur_.text[0] == word[0] && cur_.text.equals(word); }
   bool accept(T kind) {
     if (cur_.kind != kind) return false;
     next();

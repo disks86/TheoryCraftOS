@@ -57,8 +57,17 @@ namespace {
 class BrowserVideoClip final : public browser::IVideoClip {
  public:
   BrowserVideoClip(allocators::IAllocator& allocator, const hardware::IClock& clock, hardware::SystemVideoCodecs& codecs, audio::AudioMixer* mixer, UniquePointer<ByteBuffer> data)
-      : data_(util::move(data)), source_(data_->view()), player_(clock, codecs, allocator, mixer) {}
-  bool open() { return player_.open_media(source_) == video::OpenResult::Ok; }
+      : player_(clock, codecs, allocator, mixer) {
+    data_[0] = util::move(data);
+    sources_[0].reset(data_[0]->view());
+  }
+  // The pictures are decoded by a thread of the player's own, not by the page's (whose scripts would hold them up, and be held up by them); if that
+  // thread cannot be made, update() does the work as before.
+  bool open() {
+    if (player_.open_media(sources_[0]) != video::OpenResult::Ok) return false;
+    player_.start_service();
+    return true;
+  }
 
   bool play() override { return player_.play(); }
   void pause() override { player_.pause(); }
@@ -74,20 +83,35 @@ class BrowserVideoClip final : public browser::IVideoClip {
   int64_t duration_us() override { return player_.duration_us(); }
   uint32_t width() override { return player_.frame_width(); }
   uint32_t height() override { return player_.frame_height(); }
-  void update() override { player_.update(); }
-  bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) override {
-    if (pitch < player_.frame_width() || dest.size() < uint64_t{pitch} * player_.frame_height()) return false;
-    return player_.copy_picture(dest.data(), pitch, serial);
+  void update() override {
+    if (!player_.service_running()) player_.update();
   }
+  bool copy_picture(ArrayView<uint32_t> dest, uint32_t pitch, uint32_t* serial) override { return player_.copy_picture(dest, pitch, serial); }
   bool frame_counts(uint64_t* presented, uint64_t* dropped) override {
     *presented = player_.frames_presented();
     *dropped = player_.frames_skipped();
     return true;
   }
+  bool extend(UniquePointer<ByteBuffer>* data, int64_t shift_us) override {
+    if (!data || !*data) return false;
+    const uint32_t spare = active_ ^ 1u;
+    sources_[spare].reset((*data)->view());
+    if (!player_.continue_media(sources_[spare], shift_us)) {
+      sources_[spare].reset(ConstByteView());
+      return false;
+    }
+    data_[spare] = util::move(*data);   // (the player reads the new file now: the old one can go)
+    data_[active_].reset();
+    sources_[active_].reset(ConstByteView());
+    active_ = spare;
+    return true;
+  }
 
  private:
-  UniquePointer<ByteBuffer> data_;
-  media::MemoryByteSource source_;
+  // The file the player reads, and a second place for the one extend() gives it next (declared before the player, which is so destroyed first).
+  UniquePointer<ByteBuffer> data_[2];
+  media::MemoryByteSource sources_[2];
+  uint32_t active_ = 0;
   video::VideoPlayer player_;
 };
 
