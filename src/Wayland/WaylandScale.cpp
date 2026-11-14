@@ -126,20 +126,40 @@ bool Server::check_mapping(Client& c, Surface& s, const State& state) {
 // The output scale changed (Server::set_display): each client's outputs were announced again; its fractional scale objects get the preferred scale and
 // its surfaces of version 6 the preferred buffer scale, so a client draws at the desktop's density.
 void Server::announce_scale() {
-  for (Surface& s : surfaces_) {
-    Client* c = client_of(s.client);
-    if (!c) continue;
-    if (s.fractional_id != 0) {
-      Event e(s.fractional_id, 0);
-      e.u(output_scale_ * 120 / 100);
-      send(*c, e);
-    }
-    Resource* r = c->objects.find(s.id);
-    if (r && r->version >= 6) {
-      Event e(s.id, 2);      // preferred_buffer_scale
-      e.i(static_cast<int32_t>(output_whole_scale()));
-      send(*c, e);
-    }
+  for (Surface& s : surfaces_) tell_scale(s);
+}
+
+// Monitors at different scales: a surface draws at the scale of the monitor its window is on (the centre of its root's window geometry: the toplevel,
+// layer surface or whatever it hangs from; a subsurface is its parent's, a popup its parent's window's). One scale for all monitors: that one.
+uint32_t Server::scale_for(const Surface& s) const {
+  const Surface* root = &s;
+  for (uint32_t depth = 0; depth < 64; ++depth) {
+    if (root->parent) root = root->parent;
+    else if (root->role == Role::Popup && root->popup_parent) root = root->popup_parent;
+    else break;
+  }
+  const Rect r = root->role == Role::Toplevel || root->role == Role::Popup ? content_rect(*root) : Rect{root->x, root->y, 1, 1};
+  const int32_t cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+  for (uint32_t i = 0; i < monitor_count_; ++i) if (contains(monitors_[i].rect, cx, cy)) return monitors_[i].scale;
+  return monitor_count_ > 0 ? monitors_[0].scale : output_scale_;
+}
+
+void Server::tell_scale(Surface& s) {
+  Client* c = client_of(s.client);
+  if (!c) return;
+  const uint32_t k = scale_for(s);
+  if (k == s.told_scale) return;
+  s.told_scale = k;
+  if (s.fractional_id != 0) {
+    Event e(s.fractional_id, 0);      // preferred_scale (120ths)
+    e.u(k * 120 / 100);
+    send(*c, e);
+  }
+  Resource* r = c->objects.find(s.id);
+  if (r && r->version >= 6) {
+    Event e(s.id, 2);      // preferred_buffer_scale: the whole scale at or above it
+    e.i(static_cast<int32_t>((k + 99) / 100));
+    send(*c, e);
   }
 }
 
@@ -248,7 +268,7 @@ void Server::viewport_request(Client& c, uint32_t id, Resource& r, uint16_t opco
       } else {
         s->fractional_id = object;
         Event e(object, 0);      // preferred_scale: the output's (in 120ths)
-        e.u(output_scale_ * 120 / 100);
+        e.u(scale_for(*s) * 120 / 100);      // (its window's monitor's)
         send(c, e);
       }
       return;

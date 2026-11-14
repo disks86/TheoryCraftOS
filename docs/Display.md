@@ -37,6 +37,11 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
     the text face), instead of one picture resampled.
   - Results are true only when every view did the thing (a group a view could not begin is closed again on the others). Retained layers and
     `copy_rect` are declined there, so callers draw instead.
+  - Sessions are told each monitor's own scale (`IWindowsSession::Monitor::monitor_scale`, from the view that shows the monitor:
+    `gui::Window::scale_at`; told again when a monitor's scale or place changes). The Wayland compositor asks each surface to draw at the scale of
+    the monitor its window is on (the centre of its toplevel's window geometry; popups and subsurfaces follow their window): the fractional
+    `preferred_scale` and `wl_surface.preferred_buffer_scale` are sent when that changes (shown, moved by the desktop to another monitor, the
+    monitors changed), so a GTK 4 or Qt 6 window draws at 100 % on a 100 % monitor and at 200 % on a 200 % one.
   - `IRenderer2D::device_views()` / `device_view()` list the views (a `DeviceView`: its units renderer, its device, scale and origin). Program windows
     are drawn on each: 1:1 on the device whose scale is the program's (`draw_window_scaled`), and through that view's units on the others (a picture
     made at 200 % is filtered down for a 100 % monitor).
@@ -114,9 +119,9 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 
 ## Not done
 
-- Monitors at different scales: the desktop is drawn at each one's density, but programs are not told per monitor. Every program draws at the
-  largest scale (Windows' DPI, `wl_output.scale`, the X server's density), and its picture is filtered down on the monitors at smaller scales.
-  Per-monitor-aware Windows programs get no `WM_DPICHANGED` when a window moves to another monitor, and Wayland clients get one output scale.
+- Monitors at different scales: Windows and X programs are not told per monitor. They draw at the largest scale (Windows' DPI, the X server's
+  density), and their pictures are filtered down on the monitors at smaller scales. Per-monitor-aware Windows programs get no `WM_DPICHANGED` when
+  a window moves to another monitor. Wayland has one `wl_output` (its scale the largest), so `wl_surface.enter` names no monitor.
 - With monitors at different scales the desktop is drawn on the CPU (a software renderer per monitor), as the monitor compositor's path was.
 - A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is 266 units for Wayland clients too: their logical
   coordinates are the protocol's, so a maximized one's buffer ends a device row short of the edge, where the desktop's background shows.
@@ -137,6 +142,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | Windows and X on a 400 x 400 device at 150 % (266 units): the screen and root 400 x 400, a maximized window 400 device pixels across (less X's frame), 266 units for the desktop | `tests/run_host_tests.sh Win32kUserTest` (`test_device_edge`), `X11ServerTest` (`test_hidpi`) |
 | Monitors at different scales (`test_multi_scale`): a layout half at 200 %, half at 100 % (origin at unit 32): each view's pixels equal one renderer at its scale for the whole layout; device views, read-back, declined copies and retained layers; matrices with an origin | `tests/run_host_tests.sh GraphicsTest` |
 | `MonitorRenderers` (`test_monitor_renderers`): a 200 % and a 100 % monitor on one device, a rectangle across the seam on each at its density and place, the frame read back, a refused update keeping the views | `tests/run_host_tests.sh MonitorTest` |
+| Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor | `tests/run_host_tests.sh WaylandServerTest` |
 | The desktop on a 200 % and a 100 % monitor (`test_windows_mixed_scales`): a program window across the seam drawn 1:1 on the 200 % device and through units on the 100 % one | `tests/run_host_tests.sh GuiTest` |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |

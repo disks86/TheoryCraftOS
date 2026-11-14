@@ -232,7 +232,9 @@ void Win32Windows::pump(gui::WindowManager& manager) {
       device_w = span(at.x, bounds.width, whole.width, device.width);
       device_h = span(at.y, bounds.height, whole.height, device.height);
     }
-    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_;
+    send = !display_sent_ || !same(bounds, sent_bounds_) || manager.reserve_serial() != sent_reserve_serial_ || scale != sent_scale_ ||
+           (manager.window() && manager.window()->views_signature() != sent_views_);
+    if (manager.window()) sent_views_ = manager.window()->views_signature();
     if (send) {
       const gui::Point o = manager.window_origin();
       if (monitor_count_ == 0) monitors[monitor_count++] = {{0, 0, bounds.width, bounds.height}, windows_rect(manager.area(0)), windows_rect(manager.full_area(0))};
@@ -245,6 +247,9 @@ void Win32Windows::pump(gui::WindowManager& manager) {
         monitors[i].scale_percent = scale;
         monitors[i].device_width = device_w;
         monitors[i].device_height = device_h;
+        // each monitor's own scale, when they differ (the device that shows the monitor's top left: window coordinates are the area's plus its origin)
+        const uint32_t own = manager.window() ? manager.window()->scale_at(monitors[i].rect.x + o.x, monitors[i].rect.y + o.y) : 0;
+        monitors[i].monitor_scale = own != 0 && own != scale ? own : 0;
       }
       sent_scale_ = scale;
       display_sent_ = true;

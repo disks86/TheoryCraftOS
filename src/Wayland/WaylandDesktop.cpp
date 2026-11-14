@@ -42,10 +42,12 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       const desktop::WindowsRect& panel = m.panel_area.width > 0 && m.panel_area.height > 0 ? m.panel_area : m.work;
       monitors_[monitor_count_++] = {{m.rect.x, m.rect.y, static_cast<int32_t>(m.rect.width), static_cast<int32_t>(m.rect.height)},
                                      {m.work.x, m.work.y, static_cast<int32_t>(m.work.width), static_cast<int32_t>(m.work.height)},
-                                     {panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)}};
+                                     {panel.x, panel.y, static_cast<int32_t>(panel.width), static_cast<int32_t>(panel.height)},
+                                     graphics::clamp_scale_percent(m.monitor_scale != 0 ? m.monitor_scale : m.scale_percent)};
     }
     if (monitor_count_ == 0) {
       monitors_[0].rect = monitors_[0].work = monitors_[0].panel = {0, 0, static_cast<int32_t>(width), static_cast<int32_t>(height)};
+      monitors_[0].scale = 100;      // (no monitors said: one at 100 %)
       monitor_count_ = 1;
     }
     const uint32_t scale = monitors.size() > 0 ? graphics::clamp_scale_percent(monitors[0].scale_percent) : 100;
@@ -66,7 +68,8 @@ void Server::set_display(uint32_t width, uint32_t height, ArrayView<const Monito
       }
       for (uint64_t k = 0; k < outputs.count(); ++k) announce(*c, outputs[k], Iface::Output, versions[k]);
     }
-    if (rescaled) announce_scale();
+    (void)rescaled;
+    announce_scale();      // (each surface its monitor's scale: told when that changed)
     arrange_layers();      // (panels follow their monitor)
     for (Surface* s : stack_.view())
       if (s->role == Role::Toplevel && (s->maximized || s->fullscreen)) {
@@ -225,6 +228,7 @@ void Server::move_window(uint32_t window, const desktop::WindowsRect& rect) {
     h = max32(1, min32(h, kMaxSize));
     s->x = rect.x + l;
     s->y = rect.y + t;
+    announce_scale();      // (moved to a monitor at another scale: its surfaces are told)
     int32_t shown_w = 0, shown_h = 0;
     shown_size(*s, &shown_w, &shown_h);
     if (w != shown_w || h != shown_h) {      // the client is asked to draw that size; the frame shows it meanwhile
