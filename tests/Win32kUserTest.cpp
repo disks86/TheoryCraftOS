@@ -1582,6 +1582,45 @@ void test_system_aware_scale_change() {
   gdi::shutdown();
 }
 
+// A device that is not a whole number of units: 400 x 400 at 150 % is 266 units, which map to 399. win32k's screen is the device's size, the monitor
+// reaches its edge, and a maximized window fills it; the desktop sees the same window as the whole 266 units.
+void test_device_edge() {
+  Program prog(99);
+  Th t(prog, 99, kScratch);
+  t.proc = [&](Th& th, Call_& c) -> uint64_t { return def_proc(th, c); };
+  auto pump = [&](Th& th) {
+    Th::M m;
+    for (int i = 0; i < 64 && th.peek(&m); ++i) th.svc(N::NtUserDispatchMessage, {th.tmp(0xA00)});
+  };
+  DesktopBridge bridge;
+  bridge.attach(6, 19);
+  desktop::IWindowsSession::Monitor one[1];
+  one[0].rect = {0, 0, 266, 266};
+  one[0].work = {0, 0, 266, 266};
+  one[0].scale_percent = 150;
+  one[0].device_width = one[0].device_height = 400;
+  bridge.set_display(266, 266, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  CHECK(gdi::screen_width() == 400 && gdi::screen_height() == 400);
+  CHECK(t.svc32(N::NtUserSetProcessDpiAwarenessContext, {0x22, 0}) == 1);
+  CHECK(t.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9}) == 400 && t.svc32(N::NtUserCallOneParam, {1 /* SM_CYSCREEN */, 9}) == 400);
+  CHECK(t.atom_class("EdgeClass") >= 0xC000);
+  const uint32_t w = t.create("EdgeClass", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 10, 200, 150, 0, 0, "Edge");
+  CHECK(w != 0);
+  pump(t);
+  bridge.window_command(w, desktop::IWindowsSession::Command::Maximize);      // (the desktop's maximize button)
+  pump(t);
+  {
+    user::Window* x = user::find_window(w);
+    CHECK(x && x->bounds.left == 0 && x->bounds.top == 0 && x->bounds.right == 400 && x->bounds.bottom == 400);
+  }
+  desktop::WindowsWindowInfo info;
+  CHECK(bridge.window_info(w, &info, nullptr) && info.maximized && info.window.x == 0 && info.window.width == 266 && info.window.height == 266);
+  bridge.detach();
+  user::set_device_scale_from_desktop(100);
+  user::reset_state();
+  gdi::shutdown();
+}
+
 void test_redirection() {
   Program prog(91);
   Th t(prog, 91, kScratch);
@@ -1992,5 +2031,6 @@ int main() {
   test_redirection();
   test_dpi_virtualization();
   test_system_aware_scale_change();
+  test_device_edge();
   return finish("Win32kUserTest");
 }

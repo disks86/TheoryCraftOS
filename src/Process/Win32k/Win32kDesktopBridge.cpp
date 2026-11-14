@@ -99,6 +99,13 @@ void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const
   const uint32_t scale = monitors.size() > 0 ? graphics::clamp_scale_percent(monitors[0].scale_percent) : 100;
   const bool rescaled = scale != scale_;
   scale_ = scale;
+  // the device pixels past the area's last unit (400 rows at 150 % are 266 units, which map to 399): the far edge goes to the device's
+  area_w_ = static_cast<int32_t>(width > 32767 ? 32767 : width);
+  area_h_ = static_cast<int32_t>(height > 32767 ? 32767 : height);
+  const int32_t mapped_w = graphics::units_to_device(area_w_, scale), mapped_h = graphics::units_to_device(area_h_, scale);
+  const uint32_t device_w = monitors.size() > 0 ? monitors[0].device_width : 0, device_h = monitors.size() > 0 ? monitors[0].device_height : 0;
+  spare_x_ = device_w > uint32_t(mapped_w) && device_w - uint32_t(mapped_w) < 8 ? static_cast<int32_t>(device_w) - mapped_w : 0;
+  spare_y_ = device_h > uint32_t(mapped_h) && device_h - uint32_t(mapped_h) < 8 ? static_cast<int32_t>(device_h) - mapped_h : 0;
   if (rescaled && attached_) user::set_redirection(true, this, graphics::units_to_device(frame_border_, scale), graphics::units_to_device(frame_title_, scale));
   gdi::Rect rects[8], works[8];
   uint32_t n = 0;
@@ -110,16 +117,21 @@ void DesktopBridge::set_display(uint32_t width, uint32_t height, ArrayView<const
   }
   {
     user_misc::SystemLock lock;
-    const uint64_t w = uint64_t(graphics::units_to_device(int32_t(width), scale)), h = uint64_t(graphics::units_to_device(int32_t(height), scale));
+    const uint64_t w = uint64_t(edge_up(area_w_, false)), h = uint64_t(edge_up(area_h_, true));
     if (w != gdi::screen_width() || h != gdi::screen_height()) gdi::set_screen_size(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     user_misc::set_monitors(ArrayView<const gdi::Rect>(rects, n), ArrayView<const gdi::Rect>(works, n));
   }
   user::set_device_scale_from_desktop(scale);      // (takes the lock; moves the windows when the scale changed)
 }
 
+int32_t DesktopBridge::edge_up(int32_t v, bool vertical) const {
+  const int32_t d = graphics::units_to_device(v, scale_);
+  const int32_t area = vertical ? area_h_ : area_w_, spare = vertical ? spare_y_ : spare_x_;
+  return v >= area && spare > 0 && d <= INT32_MAX - spare ? d + spare : d;
+}
+
 gdi::Rect DesktopBridge::up(const gdi::Rect& r) const {
-  auto u = [&](int32_t v) { return graphics::units_to_device(v, scale_); };
-  return {u(r.left), u(r.top), u(r.right), u(r.bottom)};
+  return {edge_up(r.left, false), edge_up(r.top, true), edge_up(r.right, false), edge_up(r.bottom, true)};
 }
 
 gdi::Rect DesktopBridge::down(const gdi::Rect& r) const {

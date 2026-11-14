@@ -14,6 +14,9 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
     `graphics::ScaledRenderer2D` over it (`src/Graphics/Graphics2D/ScaledRenderer2D.hpp`, set up by `DisplayPipeline` in `main.cpp`), whose extent is
     the layout's. When the device is not a whole number of units (400 rows at 150 % are 266 units, which map back to 399), the layout's far edge
     is stretched to the device's (`ScaledRenderer2D::edge`): the last unit takes the spare pixels, so what reaches the edge covers the screen.
+    The window systems that work in device pixels are told the device's size (`IWindowsSession::Monitor::device_width` / `device_height`) and do
+    the same: win32k's screen and the X root are the device's size, a monitor or work area that reaches the area's far edge reaches the device's,
+    and a maximized window fills it. Going back, the spare pixels count as the last unit, so the desktop still sees that window as the whole area.
   - **The desktop's own drawing** goes through it. Rectangles, lines, shapes and the 8x16 font's pixels are mapped by their edges, so what touches still
     touches. At a whole scale a unit is exactly k x k pixels; at 150 % units alternate between one and two pixels. Images and masks are sampled nearest
     at a whole scale and filtered at a fractional one. What is drawn at the device's resolution is sharp.
@@ -102,8 +105,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 ## Not done
 
 - One device scale for all monitors (the largest); no per-monitor density.
-- A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is that many units for the window systems too:
-  Windows, X and Wayland programs' maximized windows end a device row or column short of the edge, where the desktop's background shows.
+- A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is 266 units for Wayland clients too: their logical
+  coordinates are the protocol's, so a maximized one's buffer ends a device row short of the edge, where the desktop's background shows.
 - Windows DPI virtualization (above) has these gaps:
   - Below the device scale a unit is part of a device pixel: an odd coordinate a system-aware program sets at 50 % reads back one higher.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
@@ -118,6 +121,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | The scaling renderer: a scene at 200 % and 300 % equal to the 1x scene enlarged pixel for pixel (rectangles, outlines, lines, text, images, masks, clips); at 125, 150 and 175 % every device pixel the unit it maps back to (pictures left out); extent, device, read-back, matrices | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_2d`) |
 | A shared 3D frame drawn through the scaling renderer at 200 %: on the device, each pixel 2 x 2, equal to the read-back picture | `tests/run_host_tests.sh CubeRendererTest` (`test_shared`) |
 | X at 200 %: the root and windows in device pixels, `Xft.dpi` 192 and `Xcursor.size` 48, window rectangles and frame moves in units both ways, the pointer, the picture 1:1 on the device and shrunk to units, back to 100 % (the place kept, `ConfigureNotify`, 96 dpi), a client's own resources kept | `tests/run_host_tests.sh X11ServerTest` (`test_hidpi`) |
+| Windows and X on a 400 x 400 device at 150 % (266 units): the screen and root 400 x 400, a maximized window 400 device pixels across (less X's frame), 266 units for the desktop | `tests/run_host_tests.sh Win32kUserTest` (`test_device_edge`), `X11ServerTest` (`test_hidpi`) |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
