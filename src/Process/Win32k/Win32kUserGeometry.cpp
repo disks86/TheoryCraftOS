@@ -596,7 +596,7 @@ uint64_t nt_set_window_pos(Call& call) {
   SwpArgs args;
   args.w = w;
   args.after = after;
-  const uint32_t k = caller_scale(call);      // (DPI virtualization: an unaware caller's 96-dpi units)
+  const uint32_t k = caller_scale_for(call, w);      // (DPI virtualization: an unaware caller's 96-dpi units)
   args.x = dpi_up(call.argi(2), k); args.y = dpi_up(call.argi(3), k); args.cx = dpi_up(call.argi(4), k); args.cy = dpi_up(call.argi(5), k);
   args.flags = flags;
   return swp_op_begin(call, args, kNoShow, false, false);
@@ -609,7 +609,7 @@ uint64_t nt_move_window(Call& call) {
   if (!w->parent) return call.fail(kErrorAccessDenied);
   SwpArgs args;
   args.w = w;
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   args.x = dpi_up(call.argi(1), k); args.y = dpi_up(call.argi(2), k); args.cx = dpi_up(call.argi(3), k); args.cy = dpi_up(call.argi(4), k);
   args.flags = wn::SWP_NOZORDER | wn::SWP_NOACTIVATE | (call.arg_bool(5) ? 0 : wn::SWP_NOREDRAW);
   return swp_op_begin(call, args, kNoShow, false, false);
@@ -659,7 +659,7 @@ uint64_t nt_defer_window_pos(Call& call) {
   DeferPos::Item item;
   item.hwnd = w->handle;
   item.after = call.arg32(2);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   item.x = dpi_up(call.argi(3), k); item.y = dpi_up(call.argi(4), k); item.cx = dpi_up(call.argi(5), k); item.cy = dpi_up(call.argi(6), k);
   item.flags = flags;
   for (DeferPos::Item& existing : d->items) if (existing.hwnd == item.hwnd) { existing = item; return d->handle; }
@@ -690,7 +690,7 @@ uint64_t nt_get_window_placement(Call& call) {
   if (!w) return 0;
   uint32_t length = 0;
   if (!call.read_u32(call.arg(1), &length) || length != 44) return call.fail(kErrorInvalidParameter);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   uint8_t raw[44] = {};
   put32(raw, 0, 44);
   put32(raw, 4, w->placement.restore_maximized && (w->style & wn::WS_MINIMIZE) ? 2 : 0);      // WPF_RESTORETOMAXIMIZED
@@ -712,7 +712,7 @@ uint64_t nt_set_window_placement(Call& call) {
   const uint32_t flags = get32(raw, 4), cmd = get32(raw, 8);
   if (cmd > wn::SW_FORCEMINIMIZE) return call.fail(kErrorInvalidShowwinCommand);
   if (!w->parent) return call.fail(kErrorAccessDenied);
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   if (flags & 1) { w->placement.min_x = dpi_up(int32_t(get32(raw, 12)), k); w->placement.min_y = dpi_up(int32_t(get32(raw, 16)), k); }
   w->placement.max_x = dpi_up(int32_t(get32(raw, 20)), k);
   w->placement.max_y = dpi_up(int32_t(get32(raw, 24)), k);
@@ -736,7 +736,7 @@ uint64_t nt_set_window_placement(Call& call) {
 uint64_t nt_get_internal_window_pos(Call& call) {
   Window* w = window_arg(call, 0);
   if (!w) return 0;
-  const uint32_t k = caller_scale(call);
+  const uint32_t k = caller_scale_for(call, w);
   const Rect r = dpi_down((w->placement.has_normal) ? w->placement.normal : w->bounds, k);
   if (call.arg(1) != 0 && !write_rect(call, call.arg(1), r)) return call.fail(kErrorInvalidParameter);
   if (call.arg(2) != 0 && !write_point(call, call.arg(2), Point{dpi_down(w->placement.min_x, k), dpi_down(w->placement.min_y, k)})) return call.fail(kErrorInvalidParameter);

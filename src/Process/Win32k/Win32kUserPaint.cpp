@@ -190,7 +190,7 @@ bool dc_screen_offset_locked(Call& call, uint32_t dc, int32_t* dx, int32_t* dy) 
     Window* w = find_window(d.hwnd);
     Window* top = w ? top_level_of(w) : nullptr;
     if (!top || !redirected(top)) return false;      // (drawing on the screen itself: its coordinates are the screen's)
-    const uint32_t kc = caller_scale(call);
+    const uint32_t kc = caller_scale_for(call, w);
     Window* mixed = dpi_drawing_root(w);
     if (mixed && mixed != top && mixed->dpi_mixed) {      // a mixed DPI child's own surface, in its units
       const Rect mr = window_rect_screen(mixed);
@@ -424,7 +424,7 @@ uint64_t nt_get_update_rect(Call& call) {
   if (!w) return 0;
   const bool nonempty = w->update.count() != 0;
   if (call.arg(1) != 0) {
-    const Rect bounds = dpi_cover(nonempty ? region_bounds(w->update) : Rect(), caller_scale(call));
+    const Rect bounds = dpi_cover(nonempty ? region_bounds(w->update) : Rect(), caller_scale_for(call, w));
     if (!write_rect(call, call.arg(1), bounds)) return call.fail(kErrorInvalidParameter);
   }
   if (call.arg_bool(2) && nonempty && w->erase_pending) {
@@ -446,7 +446,7 @@ uint64_t nt_get_update_rgn(Call& call) {
   if (!w) return 0;
   if (!gdi::is_region(call.arg32(1))) return call.fail(kErrorInvalidHandle);
   {
-    const uint32_t k = caller_scale(call);
+    const uint32_t k = caller_scale_for(call, w);
     List<Rect> rects(S().alloc);
     region_copy(rects, w->update);
     if (k != 100) for (Rect& r : rects) r = dpi_cover(r, k);
@@ -603,7 +603,7 @@ uint64_t nt_redraw_window(Call& call) {
     rects.push_back(r);
   } else whole = true;
   {
-    const uint32_t k = caller_scale(call);
+    const uint32_t k = caller_scale_for(call, w);
     if (k != 100) for (Rect& r : rects) r = dpi_up(r, k);
   }
   const bool children = (flags & wn::RDW_ALLCHILDREN) != 0;

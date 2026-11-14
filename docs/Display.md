@@ -82,7 +82,10 @@ scale for all monitors: exactly the mapping below). The system DPI is the primar
   per-monitor aware window hears `WM_DPICHANGED` with the new DPI and the rectangle it has. Moved by the program (`SetWindowPos` in its pixels),
   a per-monitor aware one is asked to take the new DPI at the new density (`WM_DPICHANGED` with its size times new / old, which DefWindowProc
   applies) and any other is resized so that its size in its own coordinates stays, as Windows does.
-- An unaware or system-aware thread's coordinates (its calls, as `caller_scale`) follow the monitor of its window.
+- An unaware or system-aware thread's coordinates follow the monitor of the window a call is about (`caller_scale_for`: its rectangle, placement,
+  client area, update region, `SetWindowPos`, DefWindowProc's), so a program with windows on two monitors sees each at its own scale; calls about
+  no window use the monitor of its first top-level (`caller_scale`). A new top-level takes the scale of the monitor it lands on, sized there so it
+  keeps the size the program asked for.
 - The desktop draws a window's surface 1:1 on the monitor whose scale is its pixels per unit there (`draw_window_scaled`), resampled on the others.
 - When the monitors change, every top-level goes back to where it was in units.
 
@@ -144,8 +147,9 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 
 - Monitors at different scales:
   - X programs are not told per monitor (one screen, one `Xft.dpi`: the largest scale); their pictures are filtered down on smaller monitors.
-  - Windows: an unaware or system-aware thread's coordinates follow the monitor of its first top-level there, so one program with windows on two
-    monitors of different scales sees one of them in the other's coordinates. Messages between programs are not converted.
+  - Windows: calls about no window in particular (the cursor, `ClipCursor`, `MSG.pt`, `WindowFromPoint`, mapping points) from an unaware or
+    system-aware thread with windows on monitors of different scales use the monitor of its first top-level there. Messages between programs
+    are not converted.
 - With monitors at different scales on a GPU, each monitor's picture is laid into the display-sized one with a textured draw every frame (one
   extra pass over every monitor's pixels on the GPU), and this path has only been run on the software 3D device, not on real hardware or virgl.
 - A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is 266 units for Wayland clients too: their logical
@@ -170,7 +174,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | `MonitorRenderers` (`test_monitor_renderers`): a 200 % and a 100 % monitor on one device, a rectangle across the seam on each at its density and place, the frame read back, a refused update keeping the views | `tests/run_host_tests.sh MonitorTest` |
 | Wayland on a 200 % and a 100 % monitor: a window told 240 / buffer scale 2 on the first, 120 / 1 when the desktop moves it to the second, back again, nothing for a move on the same monitor; an output per monitor (listed, its mode, scale and name), the window leaving one and entering the other, the global removed and added again | `tests/run_host_tests.sh WaylandServerTest` |
 | The desktop on a 200 % and a 100 % monitor (`test_windows_mixed_scales`): a program window across the seam drawn 1:1 on the 200 % device and through units on the 100 % one | `tests/run_host_tests.sh GuiTest` |
-| Windows on a 200 % and a 100 % monitor (`test_per_monitor_dpi`): the screen 2400 x 1200, each monitor's DPI; a per-monitor aware window moved by the desktop to the 100 % monitor hears 96 dpi and keeps its rectangle, moved back by itself hears 192 at twice the size; its surface 1:1 on the 200 % device only; an unaware window keeps its size in its coordinates on both; the cursor both ways | `tests/run_host_tests.sh Win32kUserTest` |
+| Windows on a 200 % and a 100 % monitor (`test_per_monitor_dpi`): the screen 2400 x 1200, each monitor's DPI; a per-monitor aware window moved by the desktop to the 100 % monitor hears 96 dpi and keeps its rectangle, moved back by itself hears 192 at twice the size; its surface 1:1 on the 200 % device only; an unaware window keeps its size in its coordinates on both; a second window of the same program made on the other monitor, each read back at its own size; the cursor both ways | `tests/run_host_tests.sh Win32kUserTest` |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
