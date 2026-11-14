@@ -26,6 +26,7 @@
 #include <map>
 #include <vector>
 #include "Graphics/Graphics2D/ScaledRenderer2D.hpp"
+#include "Graphics/Graphics2D/MultiScaleRenderer2D.hpp"
 #include "Graphics/Graphics2D/Software/SoftwareRenderer2D.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -1589,10 +1590,11 @@ struct FakeWindowsSession final : desktop::IWindowsSession {
   uint32_t scale = 0;
   // HiDPI: when `sharp`, the program draws at the device's scale (draw_window_scaled, in another colour); the calls are noted
   bool sharp = false;
+  uint32_t sharp_scale = 0;      // (the scale the program draws at, as the real sessions insist on: 0 any)
   uint32_t sharp_color = 0xFFAA5500u;
   std::vector<std::string> sharp_calls;
   bool draw_window_scaled(uint32_t w, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t k, uint32_t* width_out, uint32_t* height_out) override {
-    if (!sharp) return false;
+    if (!sharp || (sharp_scale != 0 && k != sharp_scale)) return false;
     auto it = wins.find(w);
     if (it == wins.end()) return false;
     const desktop::WindowsRect& sr = it->second.info.surface;
@@ -2279,6 +2281,43 @@ static void test_windows_hidpi() {
   }
 }
 
+// Two monitors at different scales, each drawn at its own: A at 200 % (1600x1200 pixels, 800x600 units) and B at 100 % beside it (800x600). A
+// program window across the seam is drawn on A's device 1:1 (the program draws at 200 %) and on B through its units (shrunk for it).
+static void test_windows_mixed_scales() {
+  TestAllocator a;
+  {
+    Screen left(a, 1600, 1200), right(a, 800, 600);
+    graphics::ScaledRenderer2D va(a, left.renderer, 200), vb(a, right.renderer, 100);
+    vb.set_origin(800, 0);
+    graphics::MultiScaleRenderer2D multi(a, nullptr);
+    graphics::IRenderer2D* views[2] = {&va, &vb};
+    CHECK(multi.set_views(ArrayView<graphics::IRenderer2D* const>(views, 2), graphics::Extent2D{1600, 600}));
+    FakeKeyboard kb;
+    FakeMouse mouse;
+    FakeWindowsSession s(a);
+    s.sharp = true;
+    s.sharp_scale = 200;
+    desktop::Desktop d(a, multi, &kb, &mouse);
+    d.set_windows_session(&s);
+    gui::WindowManager& wm = d.windows();
+    d.step(0);
+    CHECK(s.scale == 200);      // (programs draw at the largest scale)
+    const Point mo = wm.window_origin();
+    s.add(7, true, {700, 80, 200, 150}, "Across", true);      // (units 700..900: on both monitors)
+    d.step(1000);
+    desktop::Win32Window* h = d.win32_windows().host(7);
+    gui::Rect2D pic;
+    CHECK(h && h->picture_area(&pic));
+    // A: drawn 1:1 on its device at twice the place
+    bool on_a = false;
+    for (const std::string& call : s.sharp_calls) on_a |= call == "7 " + std::to_string((mo.x + pic.x) * 2) + " " + std::to_string((mo.y + pic.y) * 2) + " 200";
+    CHECK(on_a);
+    CHECK(left.px((mo.x + pic.x + 10) * 2, (mo.y + pic.y + 10) * 2) == 0xFFAA5500u);
+    // B: the picture through its units, at its pixels (unit 850 is B's column 50)
+    CHECK(right.px(mo.x + 850 - 800, mo.y + pic.y + 10) == 0xFF336699u);
+  }
+}
+
 static void test_windows_screen() {
   TestAllocator a;
   {
@@ -2769,6 +2808,7 @@ int main() {
   test_desktop_toasts();
   test_windows_screen();
   test_windows_hidpi();
+  test_windows_mixed_scales();
   test_windows_touch();
   test_x11_frames();
   test_windows_more();

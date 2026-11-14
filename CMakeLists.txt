@@ -592,6 +592,7 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/Virtio/VirtioGpu.cpp
   src/Hardware/GraphicsProcessingUnit/VMware/VmwareSvgaGpu.cpp
   src/Graphics/Graphics2D/ScaledRenderer2D.cpp
+  src/Graphics/Graphics2D/MultiScaleRenderer2D.cpp
   src/Graphics/Graphics2D/CellTextFace.cpp
   src/Graphics/Graphics2D/Software/SoftwareRenderer2D.cpp
   src/Graphics/Graphics2D/Device/DeviceRenderer2D.cpp
@@ -758,6 +759,7 @@ add_executable(BOOTX64
   src/Hardware/Monitor/Edid.cpp
   src/Hardware/Monitor/Monitor.cpp
   src/Hardware/Monitor/MonitorDisplay.cpp
+  src/Hardware/Monitor/MonitorRenderers.cpp
   src/Hardware/Monitor/MonitorLayout.cpp
   src/Hardware/Monitor/SystemMonitors.cpp
   src/Hardware/MidiDevice/Mpu401.cpp
