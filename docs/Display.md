@@ -12,7 +12,8 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
     and back is the value it was, and edges keep their order.
   - **The renderer.** The display device's renderer is that size (`MonitorDisplay::update(..., render_percent)`). The desktop holds a
     `graphics::ScaledRenderer2D` over it (`src/Graphics/Graphics2D/ScaledRenderer2D.hpp`, set up by `DisplayPipeline` in `main.cpp`), whose extent is
-    the layout's.
+    the layout's. When the device is not a whole number of units (400 rows at 150 % are 266 units, which map back to 399), the layout's far edge
+    is stretched to the device's (`ScaledRenderer2D::edge`): the last unit takes the spare pixels, so what reaches the edge covers the screen.
   - **The desktop's own drawing** goes through it. Rectangles, lines, shapes and the 8x16 font's pixels are mapped by their edges, so what touches still
     touches. At a whole scale a unit is exactly k x k pixels; at 150 % units alternate between one and two pixels. Images and masks are sampled nearest
     at a whole scale and filtered at a fractional one. What is drawn at the device's resolution is sharp.
@@ -86,8 +87,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 ## Not done
 
 - One device scale for all monitors (the largest); no per-monitor density.
-- A layout size that does not map onto the monitor's pixels exactly (266 units at 150 % are 399 of 400 rows) leaves the last device row or column
-  undrawn.
+- A screen that is not a whole number of units at its scale (400 rows at 150 % are 266 units) is that many units for the window systems too:
+  Windows, X and Wayland programs' maximized windows end a device row or column short of the edge, where the desktop's background shows.
 - Windows DPI virtualization (above) has these gaps:
   - Below the device scale a unit is part of a device pixel: an odd coordinate a system-aware program sets at 50 % reads back one higher.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
@@ -100,6 +101,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | What | How |
 | --- | --- |
 | The scaling renderer: a scene at 200 % and 300 % equal to the 1x scene enlarged pixel for pixel (rectangles, outlines, lines, text, images, masks, clips); at 125, 150 and 175 % every device pixel the unit it maps back to (pictures left out); extent, device, read-back, matrices | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_2d`) |
+| A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
 | The desktop at scale 2: the session told 2, a window enlarged, then drawn on the device at twice its place when the program draws at the scale | `tests/run_host_tests.sh GuiTest` (`test_windows_hidpi`) |

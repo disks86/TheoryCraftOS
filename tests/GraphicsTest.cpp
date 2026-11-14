@@ -2095,6 +2095,29 @@ static void draw_scaled_scene(IRenderer2D& r, const Surface& image, const MaskVi
   r.fill_rect({48, 28, 10, 10}, 0xFF808080);
   r.pop_clip();
 }
+// A device that is not a whole number of units: 400 pixels at 150 % are 266 units, which map to 399. The layout's far edge reaches the device's, so
+// filling the whole layout covers every pixel; inside, the mapping is as it was.
+static void test_scaled_far_edge() {
+  TestAllocator a;
+  Surface big = make_surface(a, 400, 400);
+  SoftwareRenderer2D device(big, nullptr, &a);
+  ScaledRenderer2D scaled(a, device, 150);
+  CHECK(scaled.extent().width == 266 && scaled.extent().height == 266);
+  scaled.clear(0xFF000000u);
+  const Extent2D e = scaled.extent();
+  scaled.set_clip(Rect2D{0, 0, e.width, e.height});
+  scaled.fill_rect(Rect2D{0, 0, e.width, e.height}, 0xFFFFFFFFu);
+  uint32_t unfilled = 0;
+  for (uint32_t y = 0; y < 400; ++y) for (uint32_t x = 0; x < 400; ++x) if (px(big, x, y) != 0xFFFFFFFFu) ++unfilled;
+  CHECK(unfilled == 0);
+  const Rect2D inside = scaled.up(Rect2D{10, 20, 30, 40});
+  CHECK(inside.x == 15 && inside.y == 30 && inside.width == 45 && inside.height == 60);
+  const Rect2D last = scaled.up(Rect2D{265, 265, 1, 1});      // (the last unit takes the slack: device 398..399)
+  CHECK(last.x == 398 && last.y == 398 && last.width == 2 && last.height == 2);
+  CHECK(scaled.edge(266, false) == 400 && scaled.edge(265, true) == 398);
+  release_view(a, big.pixels);
+}
+
 // The desktop's text at the device's resolution: a character drawn with the bundled mono face inside its 8x16 cell (enlarged), anti-aliased, the
 // box-drawing characters still the 8x16 font's pixels, and the same without a face as before.
 static void test_cell_text_face() {
@@ -2209,6 +2232,7 @@ int main() {
   test_2d();
   test_scaled_2d();
   test_cell_text_face();
+  test_scaled_far_edge();
   test_3d();
   test_device_2d();
   test_device_2d_large_image();
