@@ -697,6 +697,25 @@ bool DeviceRenderer2D::draw_device_image(IGraphicsDevice& owner, IImage& image, 
   return draw_textured_quad(image, dx, dy, w, h, static_cast<float>(sx0) / iw, static_cast<float>(sy0) / ih, static_cast<float>(sx1) / iw, static_cast<float>(sy1) / ih);
 }
 
+bool DeviceRenderer2D::draw_device_image_scaled(IGraphicsDevice& owner, IImage& image, const Rect2D& rect, const Rect2D& dest, ImageFilter filter) {
+  if (!valid_ || &owner != &device_ || !texture_blended_ || !texture_opaque_ || !texture_vertices_ || opacity_ != 1.0f) return false;
+  if (rect.width == 0 || rect.height == 0 || dest.width == 0 || dest.height == 0) return true;
+  const Extent2D e = image.extent();
+  const int64_t sx0 = rect.x > 0 ? rect.x : 0, sy0 = rect.y > 0 ? rect.y : 0;
+  const int64_t sx1 = int64_t{rect.x} + rect.width < e.width ? int64_t{rect.x} + rect.width : e.width;
+  const int64_t sy1 = int64_t{rect.y} + rect.height < e.height ? int64_t{rect.y} + rect.height : e.height;
+  if (sx0 >= sx1 || sy0 >= sy1) return true;
+  // what of `dest` the part of `source` inside the image covers (the same proportion)
+  const float kx = float(dest.width) / float(rect.width), ky = float(dest.height) / float(rect.height);
+  const float x0 = float(dest.x) + float(sx0 - rect.x) * kx, x1 = float(dest.x) + float(sx1 - rect.x) * kx;
+  const float y0 = float(dest.y) + float(sy0 - rect.y) * ky, y1 = float(dest.y) + float(sy1 - rect.y) * ky;
+  const Rect2D covered{raster::saturate_i32(int64_t(x0)), raster::saturate_i32(int64_t(y0)), uint32_t(x1 - x0 + 1.0f), uint32_t(y1 - y0 + 1.0f)};
+  if (raster::intersect(covered, clip_).width == 0) return true;
+  const float xs[4] = {x0, x1, x1, x0}, ys[4] = {y0, y0, y1, y1};
+  const float iw = static_cast<float>(e.width), ih = static_cast<float>(e.height);
+  return draw_textured_corners(image, xs, ys, float(sx0) / iw, float(sy0) / ih, float(sx1) / iw, float(sy1) / ih, filter == ImageFilter::Nearest ? Filter::Nearest : Filter::Linear);
+}
+
 void DeviceRenderer2D::draw_image(const Surface& s, const Rect2D& rect, int32_t x, int32_t y) {
   if (!s.valid()) return;
   if (valid_ && draw_texture(s, rect, x, y)) return;

@@ -106,6 +106,7 @@ class DeviceRenderer2D final : public IRenderer2D {
   void pop_layer() override;
   bool copy_rect(const Rect2D& source, int32_t dest_x, int32_t dest_y) override;
   bool draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) override;
+  bool draw_device_image_scaled(IGraphicsDevice& owner, IImage& image, const Rect2D& source, const Rect2D& dest, ImageFilter filter) override;
   bool begin_retained(uint64_t key, const Rect2D& bounds, const Rect2D& update, bool* fresh) override;
   void end_retained() override;
   bool draw_retained(uint64_t key, const Rect2D& bounds) override;

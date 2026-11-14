@@ -200,7 +200,13 @@ bool ScaledRenderer2D::copy_rect(const Rect2D& source, int32_t dest_x, int32_t d
 
 bool ScaledRenderer2D::draw_device_image(IGraphicsDevice& owner, IImage& image, const Rect2D& source, int32_t x, int32_t y) {
   if (percent_ == 100) return device_->draw_device_image(owner, image, source, x, y);
-  return false;      // (a device image cannot be enlarged here: the caller draws it from the CPU's view)
+  // enlarged on the device by its edges, as draw_image enlarges a picture (nearest at a whole scale, filtered at a fractional one)
+  return device_->draw_device_image_scaled(owner, image, source, up(Rect2D{x, y, source.width, source.height}), whole() ? ImageFilter::Nearest : ImageFilter::Bilinear);
+}
+
+bool ScaledRenderer2D::draw_device_image_scaled(IGraphicsDevice& owner, IImage& image, const Rect2D& source, const Rect2D& dest, ImageFilter filter) {
+  if (percent_ == 100) return device_->draw_device_image_scaled(owner, image, source, dest, filter);
+  return device_->draw_device_image_scaled(owner, image, source, up(dest), filter);
 }
 
 bool ScaledRenderer2D::read_frame(ArrayView<uint32_t> out) {

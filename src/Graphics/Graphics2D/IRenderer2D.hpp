@@ -248,6 +248,11 @@ class IRenderer2D {
     (void)owner, (void)image, (void)source, (void)x, (void)y;
     return false;
   }
+  // The same, `source` stretched over `dest` (a scaled desktop drawing a picture made at 1x): the same conditions, false and nothing drawn otherwise.
+  virtual bool draw_device_image_scaled(IGraphicsDevice& owner, IImage& image, const Rect2D& source, const Rect2D& dest, ImageFilter filter) {
+    (void)owner, (void)image, (void)source, (void)dest, (void)filter;
+    return false;
+  }
 
   // Retained layers: pictures the renderer keeps from frame to frame, under a key the caller picks (unique to its content: a page view), so that content
   // which changes in a small part (a video playing in a page) is not drawn whole every frame. begin_retained() starts drawing into the layer `key`
