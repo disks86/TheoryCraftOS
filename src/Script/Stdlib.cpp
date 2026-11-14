@@ -370,6 +370,7 @@ const char kStdlib[] = R"JSLIB((function (g) {
   }
   var DP = NativeDate.prototype;
   Date_.prototype = DP;
+  Object.defineProperty(Date_, 'name', { value: 'Date', configurable: true });
   def(DP, 'constructor', Date_);
   def(Date_, 'now', NativeDate.now);
   def(Date_, 'parse', function (s) { return clip(parseDate(s)); });

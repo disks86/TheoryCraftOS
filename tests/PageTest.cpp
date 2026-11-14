@@ -874,7 +874,21 @@ struct FakeEnvironment final : IPageEnvironment {
     (on ? fullscreen_entered : fullscreen_left)++;
     return true;
   }
-  uint64_t now_ms() override { return clock; }
+  // (PROBE_WALLCLOCK: the clock also moves while a script runs, as a real one does - by the time that has passed since `clock` last changed.
+  // A script that times its own work, or checks that the clock runs at all, sees a frozen clock otherwise.)
+  uint64_t now_ms() override {
+    if (!running_clock) return clock;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t mono = static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
+    if (clock != stamped_clock) {
+      stamped_clock = clock;
+      stamp_ms = mono;
+    }
+    return clock + (mono - stamp_ms);
+  }
+  bool running_clock = getenv("PROBE_WALLCLOCK") != nullptr;
+  uint64_t stamped_clock = 0, stamp_ms = 0;
   uint64_t monotonic_step = 0, monotonic_now = 1000000;   // (a test that sets the step gets a clock that moves that much per reading)
   uint64_t monotonic_us() override {
     if (monotonic_step) return monotonic_now += monotonic_step;
@@ -3244,6 +3258,55 @@ static void test_interface_surface() {
                  "console.log(n.filter(function (x) { return x.indexOf('__') === 0 }).join(), n.indexOf('document') >= 0, n.indexOf('HTMLElement') >= 0, n.indexOf('setTimeout') >= 0, Object.keys(window).indexOf('__mine') >= 0);"
                  "var seen = []; for (var k in window) if (k.indexOf('__') === 0) seen.push(k); console.log(seen.join())"
                  "</script></body></html>") == "__mine true true true true | __mine");
+}
+
+// The navigator and the screen answer from their interfaces' prototypes; a blank frame that the page reaches into lists and shapes its interfaces from
+// the reference table (DomBindingsSurface.cpp), and its getters answer for the page's own objects.
+static void test_reference_surface() {
+  CHECK(run_page("<html><body><script>"
+                 "console.log(Object.getOwnPropertyNames(navigator).length, Object.getOwnPropertyNames(screen).length, navigator.hasOwnProperty('webdriver'), navigator.webdriver, typeof navigator.userAgent,"
+                 "screen.width > 0, screen.availTop, typeof navigator.sendBeacon); var d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver'); console.log(typeof d.get, d.set, d.enumerable);"
+                 "try { Navigator.prototype.webdriver } catch (e) { console.log(e.name, e.message) }"
+                 "var c = navigator.connection; console.log(Object.getOwnPropertyNames(NetworkInformation.prototype).join(), 'type' in c, c.onchange, c.effectiveType); console.log(Date.name, String(Date))"
+                 "</script></body></html>") ==
+        "0 0 false false string true 0 function | function undefined true | TypeError Illegal invocation | onchange,effectiveType,rtt,downlink,saveData,constructor false null 4g | "
+        "Date function Date() { [native code] }");
+  {   // the screen is the display, not the page area, and follows a change of either
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 640; media.height = 480; media.screen_width = 1920; media.screen_height = 1080;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load("<html><body><script>console.log(screen.width, screen.height, screen.availWidth, innerWidth, Object.getOwnPropertyNames(screen).length);"
+                "addEventListener('resize', function () { console.log(screen.width, screen.height, Object.getOwnPropertyNames(screen).length) })</script></body></html>");
+      media.width = 800; media.screen_width = 2560; media.screen_height = 1440;
+      page.set_media(media);
+      CHECK(std::string(page.log().data(), page.log().size()) == "1920 1080 1920 640 0\n2560 1440 0\n");
+    }
+    CHECK(a.live == 0);
+  }
+  const char* frame = "<html><body><iframe id=own srcdoc=\"<p>x</p>\"></iframe><script>"
+      "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow, names = w.Object.getOwnPropertyNames(w);"
+      "var R = function (fn) { try { return String(fn()) } catch (e) { return e.name + ': ' + e.message } };";
+  std::string page = std::string(frame) +
+      "console.log(names.length, names[0], names.indexOf('__reference_surface'), typeof w.XRWebGLBinding, typeof window.XRWebGLBinding, w.Map.length, w.KeyboardEvent.length,"
+      "w.Object.getOwnPropertyNames(w.SVGNumberList.prototype).slice(0, 4).join());"
+      "var o = document.getElementById('own').contentWindow; console.log(o.Object.getOwnPropertyNames(o).length === names.length, typeof o.XRWebGLBinding, Object.getOwnPropertyNames(window).length === names.length)"
+      "</script></body></html>";
+  CHECK(run_page(page.c_str()) == "1225 Object -1 function undefined 0 1 length,numberOfItems,appendItem,clear | false undefined false");
+  page = std::string(frame) +   // each member has the table's shape: kind, arity and flags
+      "var D = function (C, m) { var d = w.Object.getOwnPropertyDescriptor(w[C].prototype, m); return !d ? 'none' : 'value' in d ? typeof d.value + (typeof d.value === 'function' ? d.value.length : d.value) +"
+      "(d.enumerable ? 'e' : '') + (d.writable ? 'w' : '') + (d.configurable ? 'c' : '') : (d.get ? 'g' : '') + (d.set ? 's' : '') + (d.enumerable ? 'e' : '') };"
+      "console.log(D('KeyboardEvent', 'ctrlKey'), D('SVGNumberList', 'replaceItem'), D('WebGLRenderingContext', 'DEPTH_RANGE'), D('Map', 'size'), D('SVGElement', 'onbeforetoggle'), D('Range', 'collapse'),"
+      "D('XRWebGLBinding', 'getDepthInformation'))</script></body></html>";
+  CHECK(run_page(page.c_str()) == "ge function2ewc number2928e g gse function0ewc function1ewc");
+  page = std::string(frame) +   // a getter of the frame: the page's own object answers, anything that is not one of its kind is refused, and what the frame has still works
+      "var get = w.Object.getOwnPropertyDescriptor(w.Navigator.prototype, 'webdriver').get;"
+      "console.log([R(function () { return get.call(navigator) }), R(function () { return get.call(window) }), R(function () { return get.call(w.navigator) }), R(function () { return w.KeyboardEvent.prototype.ctrlKey }),"
+      "R(function () { return w.navigator.webdriver }), R(function () { return new w.KeyboardEvent('keydown', { ctrlKey: true }).ctrlKey }), R(function () { return new w.XRWebGLBinding() }),"
+      "R(function () { return w.XRWebGLBinding.prototype.getDepthInformation() }), R(function () { return w.document.body.nodeName })].join('; '))</script></body></html>";
+  CHECK(run_page(page.c_str()) == "false; TypeError: Illegal invocation; false; TypeError: Illegal invocation; false; true; TypeError: Illegal constructor; TypeError: Illegal invocation; BODY");
 }
 
 static void test_iframe() {
@@ -7216,9 +7279,12 @@ int main(int argc, char** argv) {
     TestAllocator a;
     {
       FakeEnvironment env(a);
+      if (getenv("PROBE_WALLCLOCK")) env.clock = static_cast<uint64_t>(time(nullptr)) * 1000u;   // (the page's clock starts at the real time: a server that looks at times sent to it sees today's)
       MediaEnvironment media;
       media.width = getenv("PROBE_WIDTH") ? atoi(getenv("PROBE_WIDTH")) : 1280;   // (the browser window's page area: PROBE_WIDTH / PROBE_HEIGHT)
       media.height = getenv("PROBE_HEIGHT") ? atoi(getenv("PROBE_HEIGHT")) : 800;
+      if (getenv("PROBE_SCREEN_WIDTH")) media.screen_width = atoi(getenv("PROBE_SCREEN_WIDTH"));   // (the screen around it: PROBE_SCREEN_WIDTH / PROBE_SCREEN_HEIGHT)
+      if (getenv("PROBE_SCREEN_HEIGHT")) media.screen_height = atoi(getenv("PROBE_SCREEN_HEIGHT"));
       Page page(a, env, getenv("PROBE_URL") ? getenv("PROBE_URL") : "https://app.example/", media, true);   // (PROBE_URL: the address it was saved from, on app.example)
       font::FontSet probe_fonts(a);   // (what scripts measure with once the page has changed; the probe's pictures use their own)
       probe_fonts.add_bundled_fonts();
@@ -7410,6 +7476,7 @@ int main(int argc, char** argv) {
   if (getenv("ONLY_IFRAME")) {   // (just the frame tests)
     test_iframe();
     test_interface_surface();
+    test_reference_surface();
     printf(g_failed ? "%d check(s) failed\n" : "frame tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -7491,6 +7558,7 @@ int main(int argc, char** argv) {
   test_template();
   test_iframe();
   test_interface_surface();
+  test_reference_surface();
   test_svg();
   test_input_more();
   test_wpt();

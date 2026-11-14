@@ -1261,6 +1261,9 @@ static void test_regexp_symbol_methods() {
 // derived from it, a prototype and its instances, Function.prototype and every function), a proxy is a key of its own and its traps are not asked, and a
 // frozen object can be a key. (The table of objects a window hands to other windows is a Map: with Function.prototype in it every function was the same key.)
 static void test_collection_keys() {
+  // a listing mark: what Object.getOwnPropertyNames gives for the object, whatever it has (a copy each time)
+  CHECK(is("var o = { a: 1, b: 2 }; __mark_set(o, '__listing', ['x', 'y']); var n = Object.getOwnPropertyNames(o); n.push('z');"
+           "[n.join(), Object.getOwnPropertyNames(o).join(), Object.keys(o).join(), 'x' in o, Object.getOwnPropertyNames({ c: 3 }).join()].join('|')", "x,y,z|x,y|a,b|false|c"));
   CHECK(is("var m = new Map(); m.set(Function.prototype, 'proto'); [m.get(Function.prototype), m.get(Array), m.get(function () {}), m.has(Object), m.size].join()", "proto,,,false,1"));
   CHECK(is("var m = new Map(); m.set(Object.prototype, 1); [m.get({}), m.get([]), m.has(Object.create(null)), m.get(Object.prototype)].join()", ",,false,1"));
   CHECK(is("class A {} class B extends A {} var m = new Map([[A, 'a']]); m.set(A.prototype, 'ap'); var b = new B();"

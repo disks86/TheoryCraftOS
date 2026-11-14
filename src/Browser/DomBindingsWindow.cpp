@@ -1152,10 +1152,14 @@ void update_metrics(DomBindings::Impl& c) {
   Value screen;
   if (vm.get_named(Value::make_object(g), "screen", &screen) && screen.is_object()) {
     const int sw = env.screen_width > 0 ? env.screen_width : env.width, sh = env.screen_height > 0 ? env.screen_height : env.height;
-    vm.define_named(screen.as_object(), "width", num_value(sw));
-    vm.define_named(screen.as_object(), "height", num_value(sh));
-    vm.define_named(screen.as_object(), "availWidth", num_value(sw));
-    vm.define_named(screen.as_object(), "availHeight", num_value(sh));
+    // (once the page library is up the screen's values are in a record its getters read - WebPrelude.cpp: lift)
+    JsObject* target = screen.as_object();
+    Value values;
+    if (vm.mark_get(target, vm.intern("__values"), &values) && values.is_object()) target = values.as_object();
+    vm.define_named(target, "width", num_value(sw));
+    vm.define_named(target, "height", num_value(sh));
+    vm.define_named(target, "availWidth", num_value(sw));
+    vm.define_named(target, "availHeight", num_value(sh));
   }
 }
 

@@ -494,6 +494,18 @@ NATIVE(object_get_own_property_names) {
     *result = Value::make_object(vm.new_array());
     return true;
   }
+  // (an object whose list of names the host has laid down - Vm::mark_set(object, "__listing", array) - lists those; see DomBindingsSurface.cpp)
+  Value listing;
+  JsString* mark = vm.intern("__listing");
+  if (mark && vm.mark_get(target.as_object(), mark, &listing) && listing.is_object() && listing.as_object()->okind == ObjKind::Array) {
+    const JsObject* from = listing.as_object();
+    JsObject* names = vm.new_array(from->length);
+    if (!names) return vm.throw_error(ErrorKind::RangeError, "out of memory");
+    for (uint32_t i = 0; i < from->length; ++i)
+      if (!vm.array_push(names, from->items[i])) return vm.throw_error(ErrorKind::RangeError, "out of memory");
+    *result = Value::make_object(names);
+    return true;
+  }
   *result = Value::make_object(vm.own_names(target.as_object()));
   return true;
 }

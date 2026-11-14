@@ -1,0 +1,29 @@
+<!doctype html>
+<!-- Open this page in the reference browser (served from any local web server) to dump the interface surface that src/Browser/DomBindingsSurface.cpp
+     carries: the property names of the window of a blank frame, in the order the browser lists them, what kind of value each is, how many arguments each function declares, and the property names
+     of each interface's prototype with the shape of each (method, accessor or constant, and its flags). The page shows the JSON; save it and run tools/surface/generate.py <file>. -->
+<title>surface</title><body><pre id=out></pre><script>
+var f=document.createElement('iframe'); document.body.appendChild(f); var w=f.contentWindow;
+var win=w.Object.getOwnPropertyNames(w), protos={}, shapes={}, lens={}, kinds='';
+var kindOf={object:'o',undefined:'u',number:'d',string:'s',boolean:'b',symbol:'y',bigint:'i','function':'f'};
+// One member of a prototype: its flags as a digit (1 enumerable, 2 writable, 4 configurable), then
+//   m<arity>            a method
+//   g<r> a<r> w         a getter, a getter with a setter, a setter alone; <r> is what reading it on the prototype itself gives: T throws, else a kind letter
+//   d<number> s<text>   a number or a text constant;  o u b n f: another value (n null)
+function shape(proto, name){
+  var d=w.Object.getOwnPropertyDescriptor(proto, name); if (!d) return '0u';
+  var flags=(d.enumerable?1:0)+(d.writable?2:0)+(d.configurable?4:0);
+  if ('value' in d) { var v=d.value, t=typeof v;
+    if (t==='function') return flags+'m'+v.length; if (t==='number') return flags+'d'+v; if (t==='string') return flags+'s'+v.replace(/[,\\]/g,''); if (v===null) return flags+'n'; return flags+(kindOf[t]||'o'); }
+  if (!d.get) return flags+'w';
+  var r; try { var v2=proto[name]; r=v2===null?'n':(kindOf[typeof v2]||'o'); } catch (e) { r='T'; }
+  return flags+(d.set?'a':'g')+r;
+}
+win.forEach(function(n){ var v, k; try { v=w[n]; } catch (e) { kinds+='x'; return; }
+  var t=typeof v; if (v===null) k='n'; else if (t==='function') { if (v.length) lens[n]=v.length;
+      if (v.prototype && typeof v.prototype==='object') { k='f'; try { protos[n]=w.Object.getOwnPropertyNames(v.prototype); shapes[n]=protos[n].map(function(m){ return shape(v.prototype, m); }).join(','); } catch (e) { k='c'; delete protos[n]; } } else k='c'; }
+  else k=kindOf[t]||'o'; kinds+=k; });
+var body=JSON.stringify({ ua: navigator.userAgent, win: win, kinds: kinds, lens: lens, protos: protos, shapes: shapes });
+document.getElementById('out').textContent=body;
+if (location.search.indexOf('post') >= 0) fetch('/trace',{method:'POST',body:body}).then(function(){ document.title='sent '+win.length+' names, '+Object.keys(protos).length+' interfaces, '+body.length+' bytes'; });
+</script></body>

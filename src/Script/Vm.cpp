@@ -2409,7 +2409,7 @@ namespace {
 // The same goes for what the host keeps on the global object for its own library (hidden properties called __something: the hooks the page loader
 // calls, the natives the library is written with): Object.getOwnPropertyNames(window) lists what a page can use, as in any browser.
 bool is_identity_key(StringView k) {
-  if (k.equals("__oid")) return true;
+  if (k.equals("__oid") || k.equals("__listing") || k.equals("__shape") || k.equals("__values")) return true;
   if ((!k.starts_with("__ws") && !k.starts_with("__wm")) || k.size() == 4) return false;
   for (uint64_t i = 4; i < k.size(); ++i)
     if (k[i] < '0' || k[i] > '9') return false;

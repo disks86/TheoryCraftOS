@@ -384,6 +384,7 @@ add_executable(BOOTX64
   src/Browser/RendererBoxes.cpp
   src/Browser/Page.cpp
   src/Browser/DomBindings.cpp
+  src/Browser/DomBindingsSurface.cpp
   src/Browser/DomBindingsNode.cpp
   src/Browser/DomBindingsEvents.cpp
   src/Browser/DomBindingsStyle.cpp

@@ -1214,6 +1214,10 @@ browser::MediaEnvironment WebBrowser::current_media() {
     m.width = page_.viewport_width();
     m.height = page_.viewport_height();
   }
+  if (const gui::Window* screen = window()) {   // (the window tree's root covers the screen: `screen.width` is the display's, not the page area's)
+    const auto& all = screen->bounds();
+    if (all.width > 1 && all.height > 1) { m.screen_width = static_cast<int32_t>(all.width); m.screen_height = static_cast<int32_t>(all.height); }
+  }
   m.dark = dark_;
   m.scripting = scripts_enabled_;
   return m;
