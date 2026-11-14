@@ -66,7 +66,7 @@ constexpr uint32_t kLastPredefinedAtom = sizeof kPredefinedAtoms / sizeof kPrede
 
 namespace atom {
 constexpr uint32_t kAtom = 4, kCardinal = 6, kString = 31, kWindow = 33, kWmHints = 35, kWmIconName = 37, kWmName = 39, kWmNormalHints = 40,
-                   kWmSizeHints = 41, kWmClass = 67, kWmTransientFor = 68;
+                   kWmSizeHints = 41, kWmClass = 67, kWmTransientFor = 68, kResourceManager = 23;
 }
 
 // The keyboard: keycode = USB HID usage + 8 (the evdev convention is the same offset over different numbers; clients read the map, not the numbers).

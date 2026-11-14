@@ -110,10 +110,11 @@ void Server::out_drag_position() {
   out_drag_.pending = false;
 }
 
-bool Server::desktop_drag(uint32_t window, int32_t x, int32_t y, StringView text) {
+bool Server::desktop_drag(uint32_t window, int32_t x_units, int32_t y_units, StringView text) {
   bool taken = false;
   {
     kernel::ScopedMutex lock(mutex_);
+    const int32_t x = up(x_units), y = up(y_units);      // (the desktop's units -> device pixels)
     if (out_drag_.dropped) return false;      // (the last drop is not finished)
     Window* top = window != 0 ? find_window(window) : nullptr;
     uint32_t version = 0;
@@ -395,8 +396,8 @@ bool Server::take_program_drop(String* text, int32_t* x, int32_t* y) {
   if (!in_drag_.ready || in_drag_.given) return false;
   if (!text->assign(in_text_.view())) return false;
   in_drag_.given = true;
-  *x = in_drag_.x;
-  *y = in_drag_.y;
+  *x = down(in_drag_.x);
+  *y = down(in_drag_.y);
   return true;
 }
 
@@ -413,8 +414,8 @@ bool Server::program_drag(String* text, int32_t* x, int32_t* y) {
   kernel::ScopedMutex lock(mutex_);
   if (!in_drag_.active || in_drag_.dropped || !in_drag_.read || in_text_.empty()) return false;
   if (!text->assign(in_text_.view())) return false;
-  *x = in_drag_.x;
-  *y = in_drag_.y;
+  *x = down(in_drag_.x);
+  *y = down(in_drag_.y);
   return true;
 }
 

@@ -30,8 +30,20 @@ rectangle is its pixels divided by its scale (`MonitorLayout`), and the desktop,
 - **Programs.** Sessions are told the device scale (`IWindowsSession::Monitor::scale_percent`). A window is drawn with `draw_window_scaled` on the device
   renderer (`IRenderer2D::device()`, `scale_percent()`) when its session can: the Wayland compositor draws a buffer made at that scale 1:1 and announces the scale
   (`wl_output.scale`, `preferred_buffer_scale`, fractional `preferred_scale`; see [Wayland.md](Wayland.md)). Windows programs are DPI-virtualized as
-  on Windows (below): an aware program's window is drawn 1:1, an unaware one's enlarged. X programs' windows are drawn with `draw_window` through the
-  scaling renderer, enlarged as everything was before.
+  on Windows (below): an aware program's window is drawn 1:1, an unaware one's enlarged. X programs work in device pixels (below) and their windows
+  are drawn 1:1 on the device.
+
+## X programs
+
+The kernel X server (`src/X11`) works in device pixels at a scale: the root window, the screen's millimetres (at 96 x the scale dots per inch),
+windows, pictures, the pointer and touches. It converts at its side of `IWindowsSession`, as `DesktopBridge` does for Windows: what the desktop gives
+(the display and monitors, frame moves, the mouse, touches, drag positions) is multiplied by the scale, and what it reports (window and inside
+rectangles, repaints, the pointer, drop positions, strut sizes, the window menu's place) divided. The desktop's frame is the scale's device pixels
+around a window (`_NET_FRAME_EXTENTS` says so). Pictures go on the device 1:1 (`draw_window_scaled`), or shrunk on a renderer that cannot draw there.
+
+Clients are told the density through the root's `RESOURCE_MANAGER`: `Xft.dpi` (96 x the scale / 100) and `Xcursor.size` (24 x the scale / 100). A
+client's own lines there stay. When the scale changes, each top-level keeps its place in units (its device rectangle times the change; a maximized or
+full-screen one fills its area again), clients hear `ConfigureNotify`, and `Xft.dpi` is updated.
 
 ## Windows programs: DPI virtualization
 
@@ -96,7 +108,8 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
   - Below the device scale a unit is part of a device pixel: an odd coordinate a system-aware program sets at 50 % reads back one higher.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
-- X programs are not told the density (`Xft.dpi`): they are enlarged.
+- X programs that ignore `Xft.dpi` and the screen size (core-font Xlib programs, the 8x16 core font itself) look small at a scale, as on a Linux
+  HiDPI screen. X cursors are drawn as the desktop's pointer size, not at the device's.
 
 ## Tests
 
@@ -104,6 +117,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 | --- | --- |
 | The scaling renderer: a scene at 200 % and 300 % equal to the 1x scene enlarged pixel for pixel (rectangles, outlines, lines, text, images, masks, clips); at 125, 150 and 175 % every device pixel the unit it maps back to (pictures left out); extent, device, read-back, matrices | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_2d`) |
 | A shared 3D frame drawn through the scaling renderer at 200 %: on the device, each pixel 2 x 2, equal to the read-back picture | `tests/run_host_tests.sh CubeRendererTest` (`test_shared`) |
+| X at 200 %: the root and windows in device pixels, `Xft.dpi` 192 and `Xcursor.size` 48, window rectangles and frame moves in units both ways, the pointer, the picture 1:1 on the device and shrunk to units, back to 100 % (the place kept, `ConfigureNotify`, 96 dpi), a client's own resources kept | `tests/run_host_tests.sh X11ServerTest` (`test_hidpi`) |
 | A 400-pixel device at 150 %: filling the 266-unit layout covers every device pixel; the last unit takes the spare one | `tests/run_host_tests.sh GraphicsTest` (`test_scaled_far_edge`) |
 | The desktop's text at 200, 150 and 125 %: drawn with the bundled mono face inside its cells, anti-aliased, box drawing unchanged | `tests/run_host_tests.sh GraphicsTest` (`test_cell_text_face`) |
 | `MonitorDisplay` at 200 % and 150 %: a 200 % monitor 1:1 in one copy, a 100 % monitor beside it halved, a part of the picture, 300 % at 3/2 with its last columns | `tests/run_host_tests.sh MonitorTest` |
