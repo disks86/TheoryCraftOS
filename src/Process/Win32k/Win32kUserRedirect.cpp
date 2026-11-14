@@ -78,7 +78,7 @@ Rect surface_rect_screen(const Window* top) {
 Rect surface_rect_in_window_units(const Window* top) {
   const Rect r = surface_rect_screen(top);
   const uint32_t k = window_scale(top);
-  if (k <= 100) return r;
+  if (k == 100) return r;
   return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.left, k) + graphics::device_to_units_up(r.right - r.left, k),
           dpi_down(r.top, k) + graphics::device_to_units_up(r.bottom - r.top, k)};
 }

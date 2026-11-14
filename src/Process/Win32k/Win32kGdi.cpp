@@ -636,7 +636,7 @@ void refresh_shadow(Bitmap& b) {
 
 uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale) {
   State* st = state();
-  if (!st || scale <= 100) return 0;
+  if (!st || scale == 100 || scale == 0) return 0;
   Bitmap& screen = screen_bitmap();
   const int32_t w = graphics::device_to_units(screen.width, scale), h = graphics::device_to_units(screen.height, scale);
   if (w <= 0 || h <= 0) return 0;

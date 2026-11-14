@@ -29,6 +29,7 @@ namespace process::win32k::user {
 namespace {
 State& S() { return state(); }
 uint32_t g_device_scale = 100;      // (percent)
+constexpr uint32_t kMinWindowScale = 25;      // (a system-aware program at 400 % on a 100 % screen)
 }  // namespace
 
 uint32_t device_scale() { return g_device_scale; }
@@ -39,14 +40,14 @@ void set_device_scale(uint32_t scale) {
 }
 
 // A system-aware context carries the system DPI of when it was set (normalize_context): the program keeps working at that DPI, as on Windows. When the
-// device scale has grown since, its coordinates are virtualized by the ratio, as an unaware program's are by the scale. (When the scale has shrunk, it
-// works in device pixels: virtualization only enlarges.)
+// device scale has changed since, its coordinates are virtualized by the ratio, as an unaware program's are by the scale: enlarged when the scale grew,
+// shrunk when it fell (a ratio under 100: its units are finer than device pixels).
 uint32_t system_aware_scale(uint32_t context) {
   if ((context & 0x0F) != 1) return 100;
   const uint32_t dpi = (context >> 8) & 0x1FF;
   if (dpi == 0) return 100;
   const uint32_t k = 96 * g_device_scale / dpi;
-  return k > 100 ? graphics::clamp_scale_percent(k) : 100;
+  return k < kMinWindowScale ? kMinWindowScale : k > graphics::kMaxScalePercent ? graphics::kMaxScalePercent : k;
 }
 
 uint32_t window_scale(const Window* w) {

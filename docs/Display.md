@@ -69,8 +69,9 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
     desktop's thread posts a private `WM_SYSCOMMAND` (`kScTcosDpi`), and the window's own thread sends the message.
   - Other windows are moved through the program as a desktop move would be. An unaware window's units stay the same.
   - A system-aware program keeps the system DPI it was made aware at (its awareness context carries it), as on Windows. After the scale grows, its
-    windows are virtualized by the ratio of the new DPI to that one, the way unaware windows are: its coordinates, DPI and surface stay what they were,
-    and the desktop draws its pixels enlarged. A program that becomes system aware after the change works at the new DPI.
+    windows are virtualized by the ratio of the new DPI to that one, the way unaware windows are: its coordinates, DPI, screen size and surface stay
+    what they were, and the desktop draws its pixels enlarged, or shrunk when the scale fell below its DPI (its units are then finer than device
+    pixels). A program that becomes system aware after the change works at the new DPI.
 - **The screen DC.** For an unaware program on a scaled screen, `GetDC(NULL)` gives a shadow of the screen in the program's units, filled with what the
   screen shows when the DC is made. Whatever the program draws on it goes straight on to the screen, scaled up (each unit pixel over the device pixels it
   stands for). What changes on the screen afterwards is taken into the shadow before the DC is next drawn on or read. The shadow goes away with the DC.
@@ -85,7 +86,7 @@ surface rectangles, and the cursor. It also sets the system DPI to 96 x the scal
 - A layout size that does not map onto the monitor's pixels exactly (266 units at 150 % are 399 of 400 rows) leaves the last device row or column
   undrawn.
 - Windows DPI virtualization (above) has these gaps:
-  - When the scale shrinks below a system-aware program's DPI, its windows stay in device pixels (too large). Windows would shrink their picture.
+  - Below the device scale a unit is part of a device pixel: an odd coordinate a system-aware program sets at 50 % reads back one higher.
   - Messages one program sends another with coordinates are not converted between their awarenesses.
   - Window regions are read back as they were set.
 - X programs are not told the density (`Xft.dpi`): they are enlarged.
