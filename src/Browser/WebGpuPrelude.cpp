@@ -174,6 +174,7 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
   getter(GPU.prototype, 'wgslLanguageFeatures', function () { return new Set(['readonly_and_readwrite_storage_textures', 'packed_4x8_integer_dot_product', 'unrestricted_pointer_parameters', 'pointer_composite_access']); });
   if (g.navigator) Object.defineProperty(g.navigator, 'gpu', { value: gpu, configurable: true, enumerable: true });
   g.__gpu_object = gpu;
+  Object.defineProperty(g, '__gpu_object', { enumerable: false });   // (the host's own: not among the properties a page lists)
 
   // ------------------------------------------------------------------------------------------------------------------------------------ the device
   var createDevice = function (adapter, desc) {
@@ -632,6 +633,7 @@ const char kWebGpuPrelude[] = R"JSPRELUDE((function (g) {
     hide(ctx, '__w', 0); hide(ctx, '__h', 0);
     return ctx;
   };
+  Object.defineProperty(g, '__make_gpu_context', { enumerable: false });   // (the host's own: not among the properties a page lists)
   var CC = GPUCanvasContext.prototype;
   def(CC, 'configure', function (config) {
     if (!config || !config.device) throw new TypeError("Failed to execute 'configure' on 'GPUCanvasContext': device is required.");

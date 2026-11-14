@@ -1158,7 +1158,147 @@ static void test_large_scopes() {
   CHECK(is((vars + "let gl = v20; { let gl = v21; } gl + v299").c_str(), "319"));
 }
 
+// Function.prototype.toString: a function of a script gives the text it was written as, so that evaluating that text makes the function again (Google's
+// attestation script on YouTube replaces one of its own functions with `eval("N=" + N)`: with a placeholder for the body it stopped working, and the
+// server ended every video after a minute). Built-in and bound functions read as native code.
+static void test_function_source() {
+  CHECK(is("(function () { return 1 + 2; }).toString()", "function () { return 1 + 2; }"));
+  CHECK(is("function add(a, b) { /* sum */ return a+b }  add.toString()", "function add(a, b) { /* sum */ return a+b }"));
+  CHECK(is("'' + function(a,b){return a*b}", "function(a,b){return a*b}"));
+  CHECK(is("String(function*gen(){ yield 1 })", "function*gen(){ yield 1 }"));
+  CHECK(is("var f = async function named ( x ) { await x; };  f.toString()", "async function named ( x ) { await x; }"));
+  CHECK(is("async function decl() {}  decl.toString()", "async function decl() {}"));
+  CHECK(is("var f = async  function* ag() { yield 1; };  f.toString()", "async  function* ag() { yield 1; }"));
+  // arrows: one parameter, a list, an expression or a block as the body
+  CHECK(is("(x => x * 2).toString()", "x => x * 2"));
+  CHECK(is("var f = (a, b = 2) => { return a + b; };  f.toString()", "(a, b = 2) => { return a + b; }"));
+  CHECK(is("var f = async x => x;  f.toString()", "async x => x"));
+  CHECK(is("var f = async (x, y) => [x, y];  f.toString()", "async (x, y) => [x, y]"));
+  CHECK(is("[1].map(v => ({ v })).length + (() => 'a' + 'b').toString()", "1() => 'a' + 'b'"));
+  // methods and accessors, in objects and classes; a class is the whole class
+  CHECK(is("var o = { m(a) { return a; }, get g() { return 1; }, set g(v) {}, async am() {}, *gm() {}, ['c' + 1]() {}, p: function () {} };"
+           "[o.m, Object.getOwnPropertyDescriptor(o, 'g').get, Object.getOwnPropertyDescriptor(o, 'g').set, o.am, o.gm, o.c1, o.p].join('|')",
+           "m(a) { return a; }|get g() { return 1; }|set g(v) {}|async am() {}|*gm() {}|['c' + 1]() {}|function () {}"));
+  CHECK(is("class A { constructor(x) { this.x = x; } static s() {} m() { return this.x; } get v() { return 1; } }"
+           "[A, A.s, A.prototype.m, Object.getOwnPropertyDescriptor(A.prototype, 'v').get].join('|')",
+           "class A { constructor(x) { this.x = x; } static s() {} m() { return this.x; } get v() { return 1; } }|static s() {}|m() { return this.x; }|get v() { return 1; }"));
+  CHECK(is("var B = class extends Object { f = 1; };  B.toString()", "class extends Object { f = 1; }"));
+  // nested functions each have their own text; text with characters outside ASCII comes back whole
+  CHECK(is("function outer() { function inner(q) { return q; } return inner; }  outer() + '|' + outer", "function inner(q) { return q; }|function outer() { function inner(q) { return q; } return inner; }"));
+  CHECK(is("(function () { return '\xC3\xA9\xE2\x82\xAC'; }).toString()", "function () { return '\xC3\xA9\xE2\x82\xAC'; }"));
+  // evaluating the text makes the function again, with the variables around the eval (what the attestation script does)
+  CHECK(is("(function () { var k = 5; var N = function (a) { return a + k; }; var text = 'N=' + N; eval(text.replace('a + k', 'a * k')); return N(4) + '|' + N; })()", "20|function (a) { return a * k; }"));
+  CHECK(is("var g = function (a, b) { return a - b; }; var copy = (0, eval)('(' + g + ')'); copy(9, 4) + '|' + (copy.toString() === g.toString())", "5|true"));
+  // functions made from text: eval, the Function constructor
+  CHECK(is("eval('(function fromEval(z) { return z; })').toString()", "function fromEval(z) { return z; }"));
+  CHECK(is("new Function('a', 'b', 'return a + b').toString()", "function anonymous(a,b\n) {\nreturn a + b\n}"));
+  CHECK(is("Function('return 1').toString()", "function anonymous(\n) {\nreturn 1\n}"));
+  // built-in and bound functions; anything else is an error
+  CHECK(is("Math.max.toString()", "function max() { [native code] }"));
+  CHECK(is("Function.prototype.toString.call(Array.prototype.push)", "function push() { [native code] }"));
+  CHECK(is("(function f() {}).bind(null).toString()", "function () { [native code] }"));
+  CHECK(is("var seen = 0; var p = new Proxy(function target() {}, { get: function (t, k) { seen++; return t[k]; } }); Function.prototype.toString.call(p) + seen", "function () { [native code] }0"));
+  CHECK(is("/\\{\\s*\\[native code\\]\\s*\\}/.test('' + Object.keys) + '|' + /\\[native code\\]/.test('' + function () {})", "true|false"));
+  CHECK(eval("Function.prototype.toString.call({})").find("ERR: TypeError") == 0);
+  CHECK(eval("Function.prototype.toString.call(1)").find("ERR: TypeError") == 0);
+  // a function outlives the text it was compiled from (the engine keeps a copy), and many functions of one script share it
+  {
+    std::string big = "var fs = [];";
+    for (int i = 0; i < 200; ++i) big += "fs.push(function f" + std::to_string(i) + "() { return " + std::to_string(i) + "; });";
+    big += "fs[199].toString() + '|' + fs[0] + '|' + fs.length";
+    CHECK(is(big.c_str(), "function f199() { return 199; }|function f0() { return 0; }|200"));
+  }
+  // damaged programs: the text stops inside a function (every prefix of a script), or a byte of it is flipped; nothing is read outside the text
+  {
+    const std::string whole = "var o = { m() { return 1; }, get g() { return async x => x; } }; class K { static s() {} }; (function q(a) { return [o.m, K, K.s, q] + ''; })(1)";
+    for (size_t cut = 0; cut <= whole.size(); ++cut) (void)eval(whole.substr(0, cut).c_str());
+    for (size_t at = 0; at < whole.size(); ++at)
+      for (int bit = 0; bit < 8; bit += 3) {
+        std::string flipped = whole;
+        flipped[at] = static_cast<char>(flipped[at] ^ (1 << bit));
+        if (flipped[at] != '\0') (void)eval(flipped.c_str());
+      }
+    CHECK(is(whole.c_str(), "m() { return 1; },class K { static s() {} },static s() {},function q(a) { return [o.m, K, K.s, q] + ''; }"));
+  }
+}
+
+// apply() and Reflect.apply / Reflect.construct take the arguments from any object with a length, not only from an array.
+static void test_apply_array_likes() {
+  CHECK(is("(function (a, b, c) { return [a, b, c, arguments.length].join(); }).apply(null, { length: 2, 0: 'x', 1: 'y', 2: 'never' })", "x,y,,2"));
+  CHECK(is("String.fromCharCode.apply(null, new Uint8Array([72, 105]))", "Hi"));
+  CHECK(is("Math.max.apply(null, new Float64Array([1.5, 9.25, 3]))", "9.25"));
+  CHECK(is("'a-b'.replace.apply('a-b', { length: 2, 0: /-/, 1: '+' })", "a+b"));
+  CHECK(is("var seen = []; var p = new Proxy([7, 8], { get: function (t, k) { seen.push(String(k)); return t[k]; } });"
+           "(function () { return Array.prototype.join.call(arguments, '+'); }).apply(null, p) + '|' + seen.join()", "7+8|length,0,1"));
+  CHECK(is("(function () { return arguments.length; }).apply(null, { length: -3 }) + ',' + (function () { return arguments.length; }).apply(null, { length: 'x' }) + ',' + (function () { return arguments.length; }).apply(null, {})", "0,0,0"));
+  CHECK(is("(function () { return arguments.length; }).apply(null) + ',' + (function () { return arguments.length; }).apply(null, null) + ',' + (function () { return arguments.length; }).apply(null, undefined)", "0,0,0"));
+  CHECK(is("(function () { return arguments.length; }).apply(null, 'ab'.split(''))", "2"));
+  CHECK(eval("(function () {}).apply(null, 5)").find("ERR: TypeError") == 0);
+  CHECK(eval("(function () {}).apply(null, 'text')").find("ERR: TypeError") == 0);
+  CHECK(eval("(function () {}).apply(null, { length: 1e9 })").find("ERR: RangeError") == 0);
+  CHECK(eval("(function () {}).apply(null, { get length() { throw new Error('len'); } })").find("ERR: Error: len") == 0);
+  CHECK(eval("(function () {}).apply(null, { length: 2, get 1() { throw new Error('el'); } })").find("ERR: Error: el") == 0);
+  CHECK(is("Reflect.apply(function (a, b) { return this + a + b; }, 'r', { length: 2, 0: 1, 1: 2 })", "r12"));
+  CHECK(is("function P(a, b) { this.s = a + b; }  Reflect.construct(P, { length: 2, 0: 'n', 1: 'ew' }).s + Reflect.construct(Array, new Uint8Array([1, 2, 3])).length", "new3"));
+  CHECK(eval("Reflect.construct(function () {}, null)").find("ERR: TypeError") == 0);
+  // the collector may run in the function that is called: the list made from the array-like stays alive, and so do its elements
+  CHECK(is("function churn(a, b) { var junk = []; for (var i = 0; i < 20000; i++) junk.push({ i: i, s: 'x' + i }); return a.v + b.v + arguments.length; }"
+           "var r = ''; for (var k = 0; k < 20; k++) r = churn.apply(null, { length: 2, get 0() { return { v: 'left' + k }; }, get 1() { return { v: 'right' }; } }); r", "left19right2"));
+}
+
+// A regular expression has the methods the String methods hand over to: RegExp.prototype[Symbol.replace] and the others.
+static void test_regexp_symbol_methods() {
+  CHECK(is("[typeof /a/[Symbol.replace], typeof /a/[Symbol.match], typeof /a/[Symbol.matchAll], typeof /a/[Symbol.search], typeof /a/[Symbol.split]].join()", "function,function,function,function,function"));
+  CHECK(is("/-/g[Symbol.replace]('a-b-c', '+') + '|' + /(\\d)/[Symbol.replace]('x1y', function (m, d) { return '<' + d + '>'; })", "a+b+c|x<1>y"));
+  CHECK(is("/\\d/[Symbol.split]('a1b2c').join() + '|' + /\\d/[Symbol.split]('a1b2c', 2).join()", "a,b,c|a,b"));
+  CHECK(is("/b(.)/[Symbol.match]('abcd')[1] + '|' + /[bc]/g[Symbol.match]('abcd').join() + '|' + /c/[Symbol.search]('abcd') + '|' + Array.from(/[ad]/g[Symbol.matchAll]('abcd'), function (m) { return m.index; }).join()", "c|b,c|2|0,3"));
+  CHECK(is("RegExp.prototype[Symbol.replace].name + '|' + RegExp.prototype[Symbol.split].length + '|' + Object.keys(RegExp.prototype).length", "[Symbol.replace]|2|0"));
+  CHECK(eval("RegExp.prototype[Symbol.replace].call({}, 'a', 'b')").find("ERR: TypeError") == 0);
+  CHECK(is("'a1b'.replace(/\\d/, '-') + 'a1b'.split(/\\d/).join() + 'a1b'.search(/\\d/) + 'a1b'.match(/\\d/)[0]", "a-ba,b11"));   // (the String methods as before)
+}
+
+// The keys of Map, Set, WeakMap and WeakSet are the objects themselves: an object is not found under the key of its prototype (a class and the classes
+// derived from it, a prototype and its instances, Function.prototype and every function), a proxy is a key of its own and its traps are not asked, and a
+// frozen object can be a key. (The table of objects a window hands to other windows is a Map: with Function.prototype in it every function was the same key.)
+static void test_collection_keys() {
+  // a listing mark: what Object.getOwnPropertyNames gives for the object, whatever it has (a copy each time)
+  CHECK(is("var o = { a: 1, b: 2 }; __mark_set(o, '__listing', ['x', 'y']); var n = Object.getOwnPropertyNames(o); n.push('z');"
+           "[n.join(), Object.getOwnPropertyNames(o).join(), Object.keys(o).join(), 'x' in o, Object.getOwnPropertyNames({ c: 3 }).join()].join('|')", "x,y,z|x,y|a,b|false|c"));
+  CHECK(is("var m = new Map(); m.set(Function.prototype, 'proto'); [m.get(Function.prototype), m.get(Array), m.get(function () {}), m.has(Object), m.size].join()", "proto,,,false,1"));
+  CHECK(is("var m = new Map(); m.set(Object.prototype, 1); [m.get({}), m.get([]), m.has(Object.create(null)), m.get(Object.prototype)].join()", ",,false,1"));
+  CHECK(is("class A {} class B extends A {} var m = new Map([[A, 'a']]); m.set(A.prototype, 'ap'); var b = new B();"
+           "[m.get(A), m.get(B), m.get(B.prototype), m.get(b), m.has(new A())].join() + '|' + (m.set(B, 'b'), m.set(b, 'inst'), [m.get(A), m.get(B), m.get(b), m.size].join())", "a,,,,false|a,b,inst,4"));
+  CHECK(is("var s = new Set(); var base = { x: 1 }; var child = Object.create(base); s.add(base); [s.has(base), s.has(child), s.size, (s.add(child), s.size), s.delete(base), s.has(child)].join()", "true,false,1,2,true,true"));
+  CHECK(is("class A {} class B extends A {} var w = new WeakMap(); w.set(A, 1); w.set(A.prototype, 2);"
+           "[w.get(A), w.get(B), w.has(B), w.has(new A()), w.get(B.prototype), w.delete(B), w.has(A)].join() + '|' + (w.set(B, 3), [w.get(A), w.get(B), w.delete(A), w.has(A), w.get(B)].join())", "1,,false,false,,false,true|1,3,true,false,3"));
+  CHECK(is("var ws = new WeakSet(); var p = {}; var o = Object.create(p); ws.add(p); [ws.has(p), ws.has(o), ws.delete(o), ws.has(p), (ws.add(o), ws.delete(p)), ws.has(o)].join()", "true,false,false,true,true,true"));
+  // frozen, sealed and non-extensible keys
+  CHECK(is("var f = Object.freeze({ a: 1 }), g = Object.seal({}), h = Object.preventExtensions({}); var m = new Map([[f, 'f'], [g, 'g'], [h, 'h']]); var w = new WeakMap([[f, 1], [g, 2]]); var ws = new WeakSet([h]);"
+           "[m.get(f), m.get(g), m.get(h), m.get(Object.freeze({ a: 1 })), w.get(f), w.get(g), ws.has(h), w.delete(f), w.has(f), Object.isFrozen(f), Object.keys(f).join()].join()", "f,g,h,,1,2,true,true,false,true,a"));
+  // a proxy is a key of its own; its traps are not asked
+  CHECK(is("var asked = []; var t = {}; var p = new Proxy(t, { get: function (o, k) { asked.push('get'); return o[k]; }, has: function (o, k) { asked.push('has'); return k in o; },"
+           "defineProperty: function (o, k, d) { asked.push('define'); return Reflect.defineProperty(o, k, d); }, getOwnPropertyDescriptor: function (o, k) { asked.push('gopd'); return Reflect.getOwnPropertyDescriptor(o, k); } });"
+           "var m = new Map(); m.set(t, 'target'); m.set(p, 'proxy'); var w = new WeakMap(); w.set(p, 1); var s = new WeakSet([t]);"
+           "[m.get(t), m.get(p), m.size, w.get(p), w.has(t), s.has(p), s.has(t), asked.length].join()", "target,proxy,2,1,false,false,true,0"));
+  // the marks are not among the properties of the key
+  CHECK(is("var k = { a: 1 }; new Map().set(k, 1); new WeakMap().set(k, 2); new WeakSet().add(k); new Set().add(k);"
+           "[Object.keys(k).join(), Object.getOwnPropertyNames(k).join(), Reflect.ownKeys(k).join(), JSON.stringify(k), (function () { var n = []; for (var x in k) n.push(x); return n.join(); })()].join('|')", "a|a|a|{\"a\":1}|a"));
+  // what is not an object: no key of a weak collection, an ordinary one of a Map
+  CHECK(is("var w = new WeakMap(), s = new WeakSet(); [w.get(1), w.has('a'), w.delete(null), s.has(undefined), s.delete(5)].join()", ",false,false,false,false"));
+  CHECK(eval("new WeakMap().set(1, 2)").find("ERR: TypeError") == 0);
+  CHECK(eval("new WeakSet().add('a')").find("ERR: TypeError") == 0);
+  CHECK(is("var m = new Map([[1, 'a'], ['1', 'b'], [NaN, 'c'], [null, 'd'], [undefined, 'e']]); [m.get(1), m.get('1'), m.get(NaN), m.get(null), m.get(undefined), m.get(-0 + 1)].join()", "a,b,c,d,e,a"));
+  // many keys, each found again; the entries of a weak map go with its keys through collections
+  CHECK(is("var m = new Map(), keys = []; for (var i = 0; i < 3000; i++) { var k = i % 2 ? {} : function () {}; keys.push(k); m.set(k, i); } var bad = 0; for (var i = 0; i < 3000; i++) if (m.get(keys[i]) !== i) bad++; bad + ',' + m.size", "0,3000"));
+  CHECK(is("var w = new WeakMap(); var kept = []; for (var i = 0; i < 20000; i++) { var k = { i: i }; w.set(k, { v: i }); if (i % 1000 === 0) kept.push(k); } kept.map(function (k) { return w.get(k).v; }).join()",
+           "0,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000,11000,12000,13000,14000,15000,16000,17000,18000,19000"));
+}
+
 static void run_all() {
+  test_function_source();
+  test_collection_keys();
+  test_regexp_symbol_methods();
+  test_apply_array_likes();
   test_large_scopes();
   test_expressions();
   test_variables_and_functions();

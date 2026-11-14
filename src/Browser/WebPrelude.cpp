@@ -3711,7 +3711,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   // operations are sent to that window's script as text (__window_request) and done there on the real object. Values cross as [kind, ...]: primitives by value,
   // objects and functions as [kind, handle, window]. The objects handed out stay in a table for as long as the page.
   var served = [g], servedIds = new Map(), remotes = new Map(), infoKey = '\u0001window-object';   // (a stand-in tells what it stands for when asked for this key: a WeakMap keyed by one would run its traps)
-  var wellKnown = ['iterator', 'toPrimitive', 'toStringTag', 'hasInstance', 'asyncIterator', 'isConcatSpreadable', 'species'];
+  var wellKnown = ['iterator', 'toPrimitive', 'toStringTag', 'hasInstance', 'asyncIterator', 'isConcatSpreadable', 'species', 'replace', 'match', 'matchAll', 'search', 'split', 'unscopables'];
   function handleOf(o) {
     var h = servedIds.get(o);
     if (h === undefined && (o === g.window || o === g.self || o === g.globalThis)) h = 0;   // (the global object under its other names)
@@ -3735,6 +3735,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (v === null) return ['n'];
     var info = v[infoKey];
     if (info && typeof info.window === 'number') return [info.kind, info.handle, info.window];
+    if (shaping) { var pending = __mark_get(v, '__shape'); if (pending !== undefined) shaping(pending); }
     return [typeof v === 'function' ? 'f' : 'o', handleOf(v), windowId];
   }
   function crossIn(a) {
@@ -3811,7 +3812,113 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     remotes.set(key, p);
     return p;
   }
+  // A blank frame that the page around it reaches into lists the properties of its window, and of the interfaces in it, as the reference browser does
+  // (the table of DomBindingsSurface.cpp, which says why): Object.getOwnPropertyNames gives the table's lists, and a name of the table that this
+  // browser has nothing for is there as an inert value of the kind the table says. It is done once, when the first request from outside arrives.
+  var surfaced = false, shaping = null;
+  function referenceSurface() {
+    surfaced = true;
+    if (!__parent_window_id() || typeof g.__reference_surface !== 'function' || String(g.location && g.location.href) !== 'about:blank') return;
+    var table;
+    try { table = JSON.parse(g.__reference_surface()); } catch (e) { return; }
+    var own = Object.prototype.hasOwnProperty, inert = { o: function () { return {}; }, n: function () { return null; }, u: function () { return undefined; },
+      d: function () { return 0; }, s: function () { return ''; }, b: function () { return false; }, c: function () { return function () { }; } };
+    var placeholder = function (name) {   // an interface this browser does not have: it cannot be constructed and has no members
+      var C = function () { throw new TypeError('Illegal constructor'); };
+      Object.defineProperty(C, 'name', { value: name, configurable: true });
+      C.prototype = {};
+      Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
+      Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
+      return C;
+    };
+    for (var i = 0; i < table.win.length; i++) {
+      var name = table.win[i], kind = table.kinds.charAt(i);
+      if (!own.call(g, name)) {
+        var value;
+        if (kind === 'f') value = placeholder(name); else if (inert[kind]) value = inert[kind](); else continue;
+        try { Object.defineProperty(g, name, { value: value, writable: true, configurable: true }); } catch (e) { continue; }
+        if (kind === 'c') Object.defineProperty(value, 'name', { value: name, configurable: true });
+      }
+      if (kind !== 'f' && kind !== 'c') continue;
+      var C = g[name];
+      if (typeof C !== 'function') continue;
+      if (kind === 'f' && own.call(table.protos, name) && C.prototype !== null && typeof C.prototype === 'object') {
+        __mark_set(C.prototype, '__listing', table.protos[name]);
+        if (name !== 'Object' && name !== 'Function' && name !== 'Array') { __mark_set(C.prototype, '__shape', name); __mark_set(C, '__shape', name); }
+      } else if (C.length !== (table.lens[name] || 0)) {
+        try { Object.defineProperty(C, 'length', { value: table.lens[name] || 0, configurable: true }); } catch (e) { }
+      }
+    }
+    __mark_set(g, '__listing', table.win);
+    // The members of an interface take the shape the table gives them the first time the interface or its prototype is handed to another window:
+    // a method declares that many arguments, an attribute is a getter (and a setter) on the prototype that refuses the prototype itself, a constant
+    // is a constant, each with the table's flags. A member this browser lacks is there and refuses to be used.
+    var named = function (fn, name, length) {
+      Object.defineProperty(fn, 'name', { value: name, configurable: true });
+      if (fn.length !== length) Object.defineProperty(fn, 'length', { value: length, configurable: true });
+      return fn;
+    };
+    var isPrototypeOf = Object.prototype.isPrototypeOf;
+    var foreign = function (v) {
+      if (v === null || typeof v !== 'object' && typeof v !== 'function') return false;
+      var info = v[infoKey];
+      return !!info && typeof info.window === 'number' && info.window !== windowId;
+    };
+    var inertValue = { o: function () { return {}; }, s: function () { return ''; }, d: function () { return 0; }, b: function () { return false; }, n: function () { return null; },
+      f: function () { return function () { }; } };
+    var shapeMember = function (proto, up, member, want) {
+      var flags = +want.charAt(0), kind = want.charAt(1), rest = want.slice(2), d = Object.getOwnPropertyDescriptor(proto, member);
+      var E = (flags & 1) !== 0, W = (flags & 2) !== 0, F = (flags & 4) !== 0;
+      if (kind === 'm') {
+        var fn = d && typeof d.value === 'function' ? d.value : null, made = !fn;
+        if (made) fn = named(function () { throw new TypeError('Illegal invocation'); }, member, +rest);
+        else if (fn.length !== +rest) Object.defineProperty(fn, 'length', { value: +rest, configurable: true });
+        if (made || d.enumerable !== E || d.writable !== W || d.configurable !== F) Object.defineProperty(proto, member, { value: fn, enumerable: E, writable: W, configurable: F });
+      } else if (kind === 'g' || kind === 'a') {
+        var get0 = d && d.get, set0 = d && d.set, data = !!d && 'value' in d, value0 = data ? d.value : undefined;
+        var get = named(function () {
+          if (this === proto) {
+            if (rest === 'T') throw new TypeError('Illegal invocation');
+            if (rest === 'u') return undefined;
+            var given;
+            try { given = get0 ? get0.call(this) : value0; } catch (e) { given = undefined; }
+            return given !== undefined && given !== null || !inertValue[rest] ? given : inertValue[rest]();
+          }
+          if (foreign(this)) {   // an object of another window, handed to this window's getter: that object's own answer, if it is one of these
+            if (!(member in this)) throw new TypeError('Illegal invocation');
+            return this[member];
+          }
+          if (this === null || this === undefined || !isPrototypeOf.call(proto, this)) throw new TypeError('Illegal invocation');
+          return get0 ? get0.call(this) : data ? value0 : up ? Reflect.get(up, member, this) : undefined;
+        }, 'get ' + member, 0);
+        var set = kind === 'a' ? named(function (v) {
+          if (this === proto) throw new TypeError('Illegal invocation');
+          if (foreign(this)) { if (!(member in this)) throw new TypeError('Illegal invocation'); this[member] = v; return; }
+          if (this === null || this === undefined || !isPrototypeOf.call(proto, this)) throw new TypeError('Illegal invocation');
+          if (set0) return set0.call(this, v);
+          if (!get0 && !data && up && member in up) { Reflect.set(up, member, v, this); return; }
+          if (!get0) Object.defineProperty(this, member, { value: v, writable: true, enumerable: true, configurable: true });
+        }, 'set ' + member, 1) : undefined;
+        Object.defineProperty(proto, member, { get: get, set: set, enumerable: E, configurable: F });
+      } else if (kind === 'd' || kind === 's') {
+        if (!d || !('value' in d) || d.enumerable !== E || d.writable !== W || d.configurable !== F)
+          Object.defineProperty(proto, member, { value: d && 'value' in d ? d.value : kind === 'd' ? +rest : rest, enumerable: E, writable: W, configurable: F });
+      } else if (d && 'value' in d && (d.enumerable !== E || d.writable !== W || d.configurable !== F)) {
+        Object.defineProperty(proto, member, { value: d.value, enumerable: E, writable: W, configurable: F });
+      }
+    };
+    shaping = function (name) {
+      var C = g[name], proto = C && C.prototype;
+      if (!proto) return;
+      __mark_delete(proto, '__shape'); __mark_delete(C, '__shape');
+      var names = table.protos[name], shapes = String(table.shapes[name] || '').split(','), up = Object.getPrototypeOf(proto);
+      for (var m = 0; m < names.length && m < shapes.length; m++) {
+        try { shapeMember(proto, up, names[m], shapes[m]); } catch (e) { }
+      }
+    };
+  }
   hide(g, '__window_serve', function (text) {
+    if (!surfaced) referenceSurface();
     var req = JSON.parse(text), op = req[0], target = served[req[1]], key = req[2] === '' ? '' : keyIn(req[2]), args = req[3].map(crossIn), out;
     try {
       switch (op) {
@@ -3822,6 +3929,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'keys': out = ['k', Object.keys(Object(target))]; break;
         case 'call': out = crossOut(Function.prototype.apply.call(target, args[0], args.slice(1))); break;
         case 'new': out = crossOut(Reflect.construct(target, args)); break;
+        case 'text': out = ['s', functionText.call(target)]; break;
         default: out = ['u'];
       }
     } catch (e) {
@@ -3829,6 +3937,19 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       out = ['x', isObj && e.constructor && e.constructor.name || 'Error', isObj && 'message' in e ? String(e.message) : String(e), isObj && e.name ? String(e.name) : 'Error'];
     }
     return JSON.stringify(out);
+  });
+  // The text of a function of another window is the text it has there, whichever window's Function.prototype.toString is asked: a script takes the
+  // function from a frame it made to be sure of an untouched one, and evaluates what it gives for its own functions.
+  var functionText = Function.prototype.toString;
+  hide(Function.prototype, 'toString', function toString() {
+    if (typeof this === 'function') {
+      var info = this[infoKey];
+      if (info && typeof info.window === 'number') {
+        var r = ask(info.window, ['text', info.handle, '', []]);
+        if (r && r[0] === 's') return r[1];
+      }
+    }
+    return functionText.call(this);
   });
   hide(g, '__window_name', function () { return String(g.name); });
   hide(g, '__set_window_name', function (name) { g.name = String(name); });
@@ -6884,8 +7005,10 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     battery.onchargingchange = battery.onchargingtimechange = battery.ondischargingtimechange = battery.onlevelchange = null;
     put('getBattery', function () { return Promise.resolve(battery); });
     var NetworkInformation = klass('NetworkInformation', ET), connection = Object.create(NetworkInformation.prototype);
-    [['effectiveType', '4g'], ['downlink', 10], ['rtt', 50], ['saveData', false], ['type', 'unknown'], ['downlinkMax', Infinity]].forEach(function (p) { defineGetter(NetworkInformation.prototype, p[0], function () { return p[1]; }); });
-    connection.onchange = null;
+    // (as a desktop browser has it: the estimates, no `type` or `downlinkMax` - those are for devices that know what kind of link they are on)
+    var connectionChange = null;
+    Object.defineProperty(NetworkInformation.prototype, 'onchange', { get: function () { return connectionChange; }, set: function (v) { connectionChange = typeof v === 'function' ? v : null; }, enumerable: true, configurable: true });
+    [['effectiveType', '4g'], ['rtt', 50], ['downlink', 10], ['saveData', false]].forEach(function (p) { defineGetter(NetworkInformation.prototype, p[0], function () { return p[1]; }); });
     put('connection', getter(function () { return connection; }));
     var NavigatorUAData = klass('NavigatorUAData', null), uad = Object.create(NavigatorUAData.prototype);
     defineGetter(NavigatorUAData.prototype, 'brands', function () { return [{ brand: 'TheoryCraftOS', version: '1' }]; });
@@ -10258,6 +10381,11 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       g.dispatchEvent(e);
       return e.defaultPrevented || (typeof e.returnValue === 'string' && e.returnValue !== '') ? '1' : '';
     });
+    // The <iframe> of this page left its document, but the page is kept for the objects other windows hold: what plays stops.
+    hide(g, '__page_detached', function () {
+      var playing = document.querySelectorAll('video, audio');
+      for (var i = 0; i < playing.length; i++) { try { playing[i].pause(); } catch (e) {} }
+    });
     hide(g, '__page_unload', function () {
       __set_hidden(true);
       document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
@@ -11545,6 +11673,9 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
   eventClass('IDBVersionChangeEvent', [['oldVersion', 0], ['newVersion', null]]);
   eventClass('DeviceOrientationEvent', [['alpha', null], ['beta', null], ['gamma', null], ['absolute', false]]);
   eventClass('DeviceMotionEvent', [['acceleration', null], ['accelerationIncludingGravity', null], ['rotationRate', null], ['interval', 0]]);
+  // Web Speech: the events of an utterance. (The synthesizer has no voices and fires none; the interfaces are part of the API a page may ask for.)
+  var SpeechSynthesisEvent = eventClass('SpeechSynthesisEvent', [['utterance', null], ['charIndex', 0], ['charLength', 0], ['elapsedTime', 0], ['name', '']]);
+  eventClass('SpeechSynthesisErrorEvent', [['error', '']], SpeechSynthesisEvent);
 
   // EventSource (server-sent events) over fetch()
   var CONNECTING = 0, OPEN = 1, CLOSED = 2;
@@ -11842,7 +11973,10 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     Notification: 'title body icon tag onclick',
     Lock: 'name mode',
     Gamepad: 'id index connected mapping axes buttons timestamp vibrationActuator',
-    SpeechSynthesisUtterance: 'text lang voice volume rate pitch',
+    SpeechSynthesisUtterance: 'text lang voice volume rate pitch onstart onend onerror onpause onresume onmark onboundary',
+    SpeechSynthesisEvent: 'utterance charIndex charLength elapsedTime name',
+    SpeechSynthesisErrorEvent: 'error',
+    MediaMetadata: 'title artist album artwork chapterInfo',
     DeviceOrientationEvent: 'alpha beta gamma absolute',
     DeviceMotionEvent: 'acceleration interval'
   };
@@ -11858,6 +11992,27 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
         enumerable: false, configurable: true });
     });
   });
+  // The navigator and the screen have no properties of their own: what they answer is an attribute or a method of their interface, on its prototype
+  // (a script that asks whether navigator has a `webdriver` of its own is asking whether somebody put one there). The values move to a record the
+  // getters read, which is also where the window writes a new screen size.
+  var lift = function (object, C) {
+    if (object === null || typeof object !== 'object' || typeof C !== 'function' || Object.getPrototypeOf(object) !== C.prototype) return;
+    var proto = C.prototype, values = {};
+    Object.getOwnPropertyNames(object).forEach(function (n) {
+      var d = Object.getOwnPropertyDescriptor(object, n);
+      if (!d || !d.configurable) return;
+      delete object[n];
+      if ('value' in d && typeof d.value === 'function') { Object.defineProperty(proto, n, { value: d.value, writable: true, enumerable: true, configurable: true }); return; }
+      var get = d.get;
+      if ('value' in d) { values[n] = d.value; get = function () { var held = __mark_get(this, '__values'); return held ? held[n] : undefined; }; }
+      if (typeof get !== 'function') return;
+      var getter = function () { if (this === proto) throw new TypeError('Illegal invocation'); return get.call(this); };
+      Object.defineProperty(getter, 'name', { value: 'get ' + n, configurable: true });
+      Object.defineProperty(proto, n, { get: getter, set: d.set, enumerable: true, configurable: true });
+    });
+    __mark_set(object, '__values', values);
+  };
+  lift(g.navigator, g.Navigator); lift(g.screen, g.Screen);
   // Event handler properties are accessors on the prototype of their interface (scripts read their descriptors to wrap the setters); setting one makes it an own value,
   // which is where the dispatch looks for it.
   var handlerAccessors = function (C, names) {
@@ -12401,6 +12556,141 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (pd && pd.writable && d.value.prototype && d.value.prototype.constructor === d.value && d.value.prototype !== Object.prototype) {
       try { Object.defineProperty(d.value, 'prototype', { writable: false }); } catch (e) { }
     }
+  });
+
+  // Every interface says what it is: Object.prototype.toString.call(document.body) is "[object HTMLBodyElement]" - the prototype of an interface has
+  // its name as Symbol.toStringTag. (The language's own classes that have no tag keep having none: an Array is "[object Array]" by what it is.)
+  // The number of arguments an operation must be given is its length (document.createElement.length is 1), whatever further ones this implementation
+  // names: the ones pages most often look at.
+  var lengths = function (root, table) {
+    if (root === null || (typeof root !== 'object' && typeof root !== 'function')) return;
+    Object.keys(table).forEach(function (name) {
+      var f;
+      try { f = root[name]; } catch (e) { return; }
+      if (typeof f !== 'function' || f.length === table[name]) return;
+      try { Object.defineProperty(f, 'length', { value: table[name], configurable: true }); } catch (e) { }
+    });
+  };
+  lengths(g, { setTimeout: 1, setInterval: 1, clearTimeout: 0, clearInterval: 0, requestAnimationFrame: 1, cancelAnimationFrame: 1, requestIdleCallback: 1, cancelIdleCallback: 1,
+               fetch: 1, getComputedStyle: 1, postMessage: 1, matchMedia: 1, atob: 1, btoa: 1, alert: 0, confirm: 0, prompt: 0, open: 0, close: 0, focus: 0, blur: 0, stop: 0, print: 0,
+               scroll: 0, scrollTo: 0, scrollBy: 0, queueMicrotask: 1, structuredClone: 1, reportError: 1, getSelection: 0, createImageBitmap: 1,
+               addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 });
+  lengths(g.document, { createElement: 1, createElementNS: 2, createTextNode: 1, createComment: 1, createDocumentFragment: 0, createEvent: 1, createRange: 0, createTreeWalker: 1,
+               createNodeIterator: 1, createAttribute: 1, getElementById: 1, getElementsByTagName: 1, getElementsByClassName: 1, getElementsByName: 1, querySelector: 1,
+               querySelectorAll: 1, importNode: 1, adoptNode: 1, hasFocus: 0, write: 0, writeln: 0, open: 0, close: 0, elementFromPoint: 2, elementsFromPoint: 2, execCommand: 1,
+               getSelection: 0, addEventListener: 2, removeEventListener: 2, dispatchEvent: 1, appendChild: 1, removeChild: 1, insertBefore: 2, replaceChild: 2, cloneNode: 0,
+               contains: 1, hasChildNodes: 0, compareDocumentPosition: 1, isEqualNode: 1, isSameNode: 1, getRootNode: 0, normalize: 0, append: 0, prepend: 0, replaceChildren: 0 });
+  lengths(typeof g.HTMLElement === 'function' ? g.HTMLElement.prototype : null, { getAttribute: 1, setAttribute: 2, removeAttribute: 1, hasAttribute: 1, toggleAttribute: 1,
+               getAttributeNames: 0, getAttributeNode: 1, getBoundingClientRect: 0, getClientRects: 0, querySelector: 1, querySelectorAll: 1, matches: 1, closest: 1,
+               attachShadow: 1, scrollIntoView: 0, remove: 0, append: 0, prepend: 0, after: 0, before: 0, replaceWith: 0, replaceChildren: 0, insertAdjacentHTML: 2,
+               insertAdjacentElement: 2, insertAdjacentText: 2, getElementsByTagName: 1, getElementsByClassName: 1, animate: 1, getAnimations: 0, focus: 0, blur: 0, click: 0,
+               scroll: 0, scrollTo: 0, scrollBy: 0, setPointerCapture: 1, releasePointerCapture: 1, hasPointerCapture: 1, requestFullscreen: 0 });
+  lengths(typeof g.XMLHttpRequest === 'function' ? g.XMLHttpRequest.prototype : null, { open: 2, send: 0, setRequestHeader: 2, getResponseHeader: 1, getAllResponseHeaders: 0, abort: 0, overrideMimeType: 1 });
+  lengths(g.navigator, { sendBeacon: 1, javaEnabled: 0, vibrate: 1 });
+  lengths(g.performance, { now: 0, mark: 1, measure: 1, getEntries: 0, getEntriesByType: 1, getEntriesByName: 1, clearMarks: 0, clearMeasures: 0 });
+  lengths(g.history, { pushState: 2, replaceState: 2, go: 0, back: 0, forward: 0 });
+
+  // Members of elements that were missing or of the wrong kind. An attribute that reflects a content attribute gives a string, a number or a flag;
+  // a nullable one (the ARIA attributes, role, crossOrigin) is null while the content attribute is absent, not ''. Scripts read `typeof el.longDesc` and
+  // the like of an element they made to see what they run in.
+  var reflected = function (C, kind, names) {
+    if (typeof C !== 'function' || !C.prototype) return;
+    var proto = C.prototype, slots = kind === 'slot' || kind === 'object' ? new WeakMap() : null;
+    names.split(' ').forEach(function (n) {
+      var attr = /^aria[A-Z]/.test(n) ? 'aria-' + n.slice(4).toLowerCase() : n.toLowerCase();
+      var el = function (o) { if (o === proto || o === null || typeof o !== 'object' || typeof o.getAttribute !== 'function') throw new TypeError('Illegal invocation'); return o; };
+      var d;
+      if (kind === 'string') d = { get: function () { var v = el(this).getAttribute(attr); return v === null ? '' : v; }, set: function (v) { el(this).setAttribute(attr, String(v)); } };
+      else if (kind === 'nullable') d = { get: function () { return el(this).getAttribute(attr); }, set: function (v) { if (v === null || v === undefined) el(this).removeAttribute(attr); else el(this).setAttribute(attr, String(v)); } };
+      else if (kind === 'flag') d = { get: function () { return el(this).hasAttribute(attr); }, set: function (v) { if (v) el(this).setAttribute(attr, ''); else el(this).removeAttribute(attr); } };
+      else if (kind === 'number') d = { get: function () { var v = parseInt(el(this).getAttribute(attr), 10); return v > 0 ? v : 0; }, set: function (v) { el(this).setAttribute(attr, String(v >>> 0)); } };
+      else if (kind === 'zero') d = { get: function () { el(this); return 0; } };
+      else if (kind === 'slot') d = { get: function () { var m = slots.get(el(this)); return m && n in m ? m[n] : null; }, set: function (v) { var m = slots.get(el(this)); if (!m) slots.set(this, m = {}); m[n] = v === undefined ? null : v; } };
+      else d = { get: function () { var m = slots.get(el(this)); if (!m) slots.set(this, m = {}); return m[n] || (m[n] = {}); } };   // 'object': one per element
+      d.enumerable = true; d.configurable = true;
+      Object.defineProperty(proto, n, d);
+    });
+  };
+  reflected(g.HTMLImageElement, 'string', 'sizes referrerPolicy decoding fetchPriority lowsrc align longDesc border attributionSrc');
+  reflected(g.HTMLImageElement, 'nullable', 'crossOrigin');
+  reflected(g.HTMLImageElement, 'flag', 'isMap browsingTopics');
+  reflected(g.HTMLImageElement, 'number', 'hspace vspace');
+  reflected(g.HTMLImageElement, 'zero', 'x y');
+  reflected(g.HTMLElement, 'string', 'enterKeyHint inputMode virtualKeyboardPolicy writingSuggestions nonce');
+  reflected(g.HTMLElement, 'flag', 'autocorrect focusGroupStart');
+  reflected(g.HTMLElement, 'slot', 'editContext');
+  reflected(g.HTMLElement, 'object', 'attributeStyleMap focusGroup');
+  ['HTMLDivElement', 'HTMLParagraphElement', 'HTMLHeadingElement'].forEach(function (n) { if (g[n] && !('align' in g[n].prototype && typeof document.createElement(n === 'HTMLDivElement' ? 'div' : n === 'HTMLParagraphElement' ? 'p' : 'h1').align === 'string')) reflected(g[n], 'string', 'align'); });
+  reflected(g.Element, 'zero', 'clientTop clientLeft');
+  reflected(g.Element, 'nullable', 'role ariaAtomic ariaAutoComplete ariaBusy ariaBrailleLabel ariaBrailleRoleDescription ariaChecked ariaColCount ariaColIndex ariaColIndexText ariaColSpan ariaCurrent ariaDescription ariaDisabled ariaExpanded ariaHasPopup ariaHidden ariaInvalid ariaKeyShortcuts ariaLabel ariaLevel ariaLive ariaModal ariaMultiLine ariaMultiSelectable ariaOrientation ariaPlaceholder ariaPosInSet ariaPressed ariaReadOnly ariaRelevant ariaRequired ariaRoleDescription ariaRowCount ariaRowIndex ariaRowIndexText ariaRowSpan ariaSelected ariaSetSize ariaSort ariaValueMax ariaValueMin ariaValueNow ariaValueText');
+  reflected(g.Element, 'slot', 'activeViewTransition ariaActionsElements ariaActiveDescendantElement ariaControlsElements ariaDescribedByElements ariaDetailsElements ariaErrorMessageElements ariaFlowToElements ariaLabelledByElements');
+  if (g.Element) {
+    Object.defineProperty(g.Element.prototype, 'currentCSSZoom', { get: function () { return 1; }, enumerable: true, configurable: true });
+    Object.defineProperty(g.Element.prototype, 'customElementRegistry', { get: function () { return g.customElements || null; }, enumerable: true, configurable: true });
+  }
+  handlerAccessors(g.Element, ['onbeforecopy', 'onbeforecut', 'onbeforepaste', 'onsearch']);
+  handlerAccessors(g.HTMLElement, ['oncommand', 'oncontentvisibilityautostatechange', 'onmousewheel', 'onbeforexrselect', 'onscrollsnapchange', 'onscrollsnapchanging']);
+  // moveBefore() moves a node without resetting it (nothing is reset here by a move anyway); setHTML() takes markup and drops what could run script;
+  // an element has no view transition of its own and no pseudo-element objects, and nothing listens to announcements.
+  M(g.Element, 'moveBefore', function (node, child) { return this.insertBefore(node, child); });
+  M(g.Element, 'setHTML', function (html) {
+    var t = document.createElement('template');
+    t.innerHTML = String(html);
+    var all = t.content.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      if (/^(script|iframe|frame|object|embed|base|link|meta|style)$/i.test(e.localName)) { if (e.parentNode) e.parentNode.removeChild(e); continue; }
+      var names = e.getAttributeNames();
+      for (var k = 0; k < names.length; k++) {
+        var a = names[k].toLowerCase();
+        if (a.indexOf('on') === 0 || (/^(href|src|action|formaction|xlink:href)$/.test(a) && /^\s*javascript:/i.test(e.getAttribute(names[k])))) e.removeAttribute(names[k]);
+      }
+    }
+    this.replaceChildren(t.content);
+  });
+  M(g.Element, 'startViewTransition', function (update) {
+    var done;
+    try { done = Promise.resolve(typeof update === 'function' ? update() : undefined); } catch (e) { done = Promise.reject(e); }
+    return { updateCallbackDone: done, ready: done.then(function () { }), finished: done.then(function () { }), skipTransition: function () { } };
+  });
+  M(g.Element, 'ariaNotify', function () { });
+  M(g.Element, 'pseudo', function () { return null; });
+  // EventTarget.when(type): what the event is observed through. Only subscribe() is there: it listens.
+  M(g.EventTarget, 'when', function (type, options) {
+    var target = this;
+    return { subscribe: function (observer) {
+      var next = typeof observer === 'function' ? observer : observer && observer.next;
+      if (typeof next === 'function') target.addEventListener(type, function (e) { next.call(observer, e); }, options);
+    } };
+  });
+
+  var untagged = { Object: 1, Function: 1, Array: 1, String: 1, Number: 1, Boolean: 1, Date: 1, RegExp: 1, Error: 1, EvalError: 1, RangeError: 1, ReferenceError: 1,
+                   SyntaxError: 1, TypeError: 1, URIError: 1, AggregateError: 1, Proxy: 1 };
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var c = name.charCodeAt(0);
+    if (c < 65 || c > 90 || untagged[name] === 1 || /^(Int|Uint|Float|BigInt|BigUint)\d+(Clamped)?Array$/.test(name)) return;
+    var d = Object.getOwnPropertyDescriptor(g, name), C = d && d.value;
+    if (typeof C !== 'function') return;
+    var P = C.prototype;
+    if (P === null || typeof P !== 'object' || Object.prototype.hasOwnProperty.call(P, Symbol.toStringTag)) return;
+    if (C.name !== name && typeof g[C.name] === 'function' && g[C.name] === C) return;   // (another name of an interface: its own name tags it)
+    try { Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { }
+  });
+  // The members of an interface come before its `constructor` among the properties of its prototype (the order they are listed in: the attributes and
+  // operations as the interface declares them, then the constructor), whatever order this implementation happened to add them in.
+  var language = { Symbol: 1, BigInt: 1, Promise: 1, Map: 1, Set: 1, WeakMap: 1, WeakSet: 1, WeakRef: 1, FinalizationRegistry: 1, ArrayBuffer: 1, SharedArrayBuffer: 1, DataView: 1 };
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var c = name.charCodeAt(0);
+    if (c < 65 || c > 90 || untagged[name] === 1 || language[name] === 1 || /^(Int|Uint|Float|BigInt|BigUint)\d+(Clamped)?Array$/.test(name)) return;
+    var d = Object.getOwnPropertyDescriptor(g, name), C = d && d.value;
+    if (typeof C !== 'function') return;
+    var P = C.prototype;
+    if (P === null || typeof P !== 'object') return;
+    var own = Object.getOwnPropertyDescriptor(P, 'constructor');
+    if (!own || !own.configurable || !('value' in own)) return;
+    var names = Object.getOwnPropertyNames(P);
+    if (names.length < 2 || names[names.length - 1] === 'constructor') return;
+    try { if (delete P.constructor) Object.defineProperty(P, 'constructor', own); } catch (e) { }
   });
 }(this));
 )JSPRELUDE";
@@ -15254,6 +15544,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     motionScheduled = true;
     g.requestAnimationFrame(function () { motionScheduled = false; flushMotion(); });
   };
+  Object.defineProperty(g, '__style_dirty', { enumerable: false });   // (the host's own: not among the properties a page lists)
   // getComputedStyle(el) brings el's transitions and animations up to date (a script that sets a value, reads the style and sets another expects a transition
   // between them); the rest of the page's wait for the next frame (looking at every changed element on every read cost YouTube seconds).
   function flushMotionOf(el) {

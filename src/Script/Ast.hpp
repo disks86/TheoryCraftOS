@@ -82,6 +82,7 @@ struct Node {
   uint32_t line = 0;
   double number = 0;
   StringView text;
+  StringView source;      // Function: the text it was written as (what Function.prototype.toString gives; empty for a function the parser made up); the program's Block: the whole text
   Node *a = nullptr, *b = nullptr, *c = nullptr, *d = nullptr;
   Node* list = nullptr;   // the first of a list of children (arguments, statements, elements, properties, declarators)
   Node* next = nullptr;   // the next in the list this node is in

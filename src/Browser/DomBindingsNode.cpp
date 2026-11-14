@@ -61,7 +61,7 @@ Value upper_value(Vm& vm, StringView s) {
 
 // --- Reflected attributes --------------------------------------------------------------------------------------------
 
-enum class Reflect : uint8_t { Str, Bool, Int, Url };
+enum class Reflect : uint8_t { Str, Bool, Int, Url, NullableStr };   // (NullableStr: null while the content attribute is absent - role, crossOrigin; setting null removes it)
 struct ReflectedAttribute {
   const char* js;
   const char* attribute;
@@ -79,9 +79,9 @@ const ReflectedAttribute kReflected[] = {
     {"width", "width", Reflect::Int}, {"height", "height", Reflect::Int}, {"colSpan", "colspan", Reflect::Int}, {"rowSpan", "rowspan", Reflect::Int},
     {"maxLength", "maxlength", Reflect::Int}, {"size", "size", Reflect::Int}, {"cols", "cols", Reflect::Int}, {"rows", "rows", Reflect::Int}, {"start", "start", Reflect::Int},
     {"span", "span", Reflect::Int}, {"min", "min", Reflect::Str}, {"max", "max", Reflect::Str}, {"step", "step", Reflect::Str}, {"pattern", "pattern", Reflect::Str},
-    {"autocomplete", "autocomplete", Reflect::Str}, {"media", "media", Reflect::Str}, {"role", "role", Reflect::Str}, {"srcset", "srcset", Reflect::Str},
+    {"autocomplete", "autocomplete", Reflect::Str}, {"media", "media", Reflect::Str}, {"role", "role", Reflect::NullableStr}, {"srcset", "srcset", Reflect::Str},
     {"label", "label", Reflect::Str}, {"scope", "scope", Reflect::Str}, {"headers", "headers", Reflect::Str}, {"enctype", "enctype", Reflect::Str},
-    {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::Str},
+    {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::NullableStr},
 };
 
 // An element in the SVG namespace: some names are not the reflected attributes of HTML (className is an SVGAnimatedString there), the script's accessors answer.
@@ -649,6 +649,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     const bool present = dom::get_attribute(n, r->attribute, &v);
     switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind) {   // (an <li>'s value is a number)
       case Reflect::Bool: *out = bool_value(present); return true;
+      case Reflect::NullableStr: *out = present ? str_value(vm, v) : Value::make_null(); return true;
       case Reflect::Int: {
         double d = r->js[0] == 't' ? -1 : 0;
         if (present) {
@@ -817,6 +818,10 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
         dom::remove_attribute(n, r->attribute);
         return HostClass::Set::Handled;
       default:
+        if (r->kind == Reflect::NullableStr && value.is_nullish()) {
+          dom::remove_attribute(n, r->attribute);
+          return HostClass::Set::Handled;
+        }
         if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
         if (r->kind == Reflect::Int && value.is_number()) {
           String number(vm.allocator());
@@ -985,7 +990,9 @@ NATIVE(node_to_string) {
   dom::Node* n = node_of(self);
   String text(vm.allocator());
   text.append("[object ");
-  if (!n) text.append("Object");
+  Value tag;   // (the interface the node is an object of names itself: "[object HTMLBodyElement]")
+  if (self.is_object() && vm.get_named(self, "@@toStringTag", &tag) && tag.is_string() && tag.as_string()->length > 0) text.append(tag.as_string()->view());
+  else if (!n) text.append("Object");
   else if (n->is_element()) text.append("HTMLElement");
   else if (n->is_text()) text.append("Text");
   else if (n->type == dom::NodeType::Comment) text.append("Comment");

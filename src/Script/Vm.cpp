@@ -2405,10 +2405,12 @@ JsObject* Vm::own_symbols(JsObject* o) {
 
 // The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
 namespace {
-// The properties Map, Set and WeakSet mark an object with (__oid, __ws<n>): not the page's, so not among the names it gets to see.
+// The properties Map, Set and the weak collections mark an object with (__oid, __ws<n>, __wm<n>): not the page's, so not among the names it gets to see.
+// The same goes for what the host keeps on the global object for its own library (hidden properties called __something: the hooks the page loader
+// calls, the natives the library is written with): Object.getOwnPropertyNames(window) lists what a page can use, as in any browser.
 bool is_identity_key(StringView k) {
-  if (k.equals("__oid")) return true;
-  if (!k.starts_with("__ws") || k.size() == 4) return false;
+  if (k.equals("__oid") || k.equals("__listing") || k.equals("__shape") || k.equals("__values")) return true;
+  if ((!k.starts_with("__ws") && !k.starts_with("__wm")) || k.size() == 4) return false;
   for (uint64_t i = 4; i < k.size(); ++i)
     if (k[i] < '0' || k[i] > '9') return false;
   return true;
@@ -2437,7 +2439,7 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n) && (enumerable || !is_identity_key(o->props[i].key->view())))
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n) && (enumerable || (!is_identity_key(o->props[i].key->view()) && !(o == global_ && o->props[i].key->view().starts_with("__")))))
       array_push(names, Value::make_string(o->props[i].key));
   }
 }
@@ -2448,6 +2450,25 @@ JsObject* Vm::own_names(JsObject* o) {
   if (o->okind == ObjKind::Array) array_push(names, Value::make_string(length_));
   push_property_keys(names, o, false);
   return names;
+}
+
+bool Vm::mark_get(JsObject* o, JsString* key, Value* out) {
+  const int64_t at = find_prop(o, key);
+  if (at < 0) return false;
+  *out = o->props[at].value;
+  return true;
+}
+
+void Vm::mark_set(JsObject* o, JsString* key, const Value& value) { define(o, key, value, kWritable); }   // (not enumerable)
+
+bool Vm::mark_remove(JsObject* o, JsString* key) {
+  const int64_t at = find_prop(o, key);
+  if (at < 0) return false;
+  barrier(o);
+  for (uint32_t i = static_cast<uint32_t>(at); i + 1 < o->prop_count; ++i) o->props[i] = o->props[i + 1];
+  --o->prop_count;
+  index_rebuild(o);
+  return true;
 }
 
 bool Vm::own_property(JsObject* o, JsString* key, Value* value, uint8_t* flags) {

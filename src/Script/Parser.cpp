@@ -162,6 +162,7 @@ class Parser {
     Node* st = new_statement(fn);
     if (!program || !st) return nullptr;
     program->list = st;
+    program->source = src_;
     return program;
   }
 
@@ -176,6 +177,7 @@ class Parser {
       *tail = s;
       tail = &s->next;
     }
+    block->source = src_;
     return failed_ ? nullptr : block;
   }
 
@@ -300,6 +302,7 @@ class Parser {
   void next() {
     Token t;
     bool newline = false;
+    last_end_ = pos_;
     skip_space(&newline);
     t.newline_before = newline;
     t.line = line_;
@@ -531,13 +534,30 @@ class Parser {
     uint32_t line;
     Token cur;
     uint64_t prev_end;
+    uint64_t last_end;
   };
-  Mark mark() const { return {pos_, line_, cur_, prev_end_}; }
+  Mark mark() const { return {pos_, line_, cur_, prev_end_, last_end_}; }
   void rewind(const Mark& m) {
     pos_ = m.pos;
     line_ = m.line;
     cur_ = m.cur;
     prev_end_ = m.prev_end;
+    last_end_ = m.last_end;
+  }
+
+  // --- The text of functions (Function.prototype.toString gives a function back as it was written)
+  // Where the current token starts.
+  uint64_t here() const { return prev_end_; }
+  // The same, or the start of the `async` that was read just before it.
+  uint64_t here_with_async() const {
+    uint64_t at = prev_end_;
+    while (at > 0 && (src_[at - 1] == ' ' || src_[at - 1] == '\t')) --at;
+    if (at >= 5 && src_.substr(at - 5, 5).equals("async") && (at == 5 || !is_ident_part(src_[at - 6]))) return at - 5;
+    return prev_end_;
+  }
+  // `f` was written from `start` to the end of the token before the current one.
+  void set_source(Node* f, uint64_t start) {
+    if (f && start <= last_end_ && last_end_ <= src_.size()) f->source = src_.substr(start, last_end_ - start);
   }
 
   // --- Statements
@@ -1277,6 +1297,7 @@ class Parser {
   Node* function_rest(bool expression, bool is_async = false) {
     Node* f = make(NodeKind::Function);
     if (!f) return nullptr;
+    const uint64_t start = is_async ? here_with_async() : here();
     if (is_async) f->flags |= kFlagAsync;
     next();   // `function`
     const bool generator = accept(T::Star);
@@ -1288,6 +1309,7 @@ class Parser {
     if (expression) f->flags |= kFlagExpression;
     if (!parameters(f)) return nullptr;
     f->a = function_body(is_async, generator);
+    set_source(f, start);
     if (f->a && is_async && generator) wrap_async_generator(f);
     return f->a ? f : nullptr;
   }
@@ -1427,6 +1449,7 @@ class Parser {
   Node* arrow_function(bool from_parens, bool is_async = false) {
     Node* f = make(NodeKind::Function);
     if (!f) return nullptr;
+    const uint64_t start = is_async ? here_with_async() : here();
     f->flags |= kFlagArrow;
     if (is_async) f->flags |= kFlagAsync;
     if (from_parens) {
@@ -1469,6 +1492,7 @@ class Parser {
         f->flags &= static_cast<uint8_t>(~kFlagExprBody);
       }
     }
+    set_source(f, start);
     return f->a ? f : nullptr;
   }
 
@@ -2025,10 +2049,11 @@ class Parser {
   };
 
   Node* class_declaration() {
+    const uint64_t start = here();
     next();   // `class`
     if (!is(T::Ident) || reserved(cur_.text)) return null_fail("Unexpected token");
     const StringView name = cur_.text;
-    Node* value = class_body(name);
+    Node* value = class_body(name, start);
     if (!value) return nullptr;
     Node* v = make(NodeKind::Var);
     Node* d = make(NodeKind::Declarator);
@@ -2041,14 +2066,15 @@ class Parser {
   }
 
   Node* class_expression() {
+    const uint64_t start = here();
     next();   // `class`
     StringView name;
     if (is(T::Ident) && !reserved(cur_.text) && !is_word("extends")) name = cur_.text;
-    return class_body(name);
+    return class_body(name, start);
   }
 
-  // At the class name (or at `extends` / `{` for a class without one).
-  Node* class_body(StringView name) {
+  // At the class name (or at `extends` / `{` for a class without one). The class was written from `class_start` on.
+  Node* class_body(StringView name, uint64_t class_start) {
     StrictScope strict(strict_parse_);
     if (!name.empty()) next();
     Node* parent = nullptr;
@@ -2068,6 +2094,7 @@ class Parser {
     ClassMember** tail = &first;
     while (!is(T::RBrace) && !is(T::Eof) && !failed_) {
       if (accept(T::Semi)) continue;
+      const uint64_t member_start = here();
       void* mem = arena_.allocate(sizeof(ClassMember));
       if (!mem) return null_fail("Out of memory");
       ClassMember* m = new (mem) ClassMember();
@@ -2123,6 +2150,7 @@ class Parser {
         f->a = function_body(async_method, generator_method);
         derived_ctor_next_ = false;
         if (!f->a) return nullptr;
+        set_source(f, member_start);
         if (async_method && generator_method) wrap_async_generator(f);
         m->value = f;
         if (is_constructor) {
@@ -2155,6 +2183,7 @@ class Parser {
     object_super_ = saved_object_super;
     class_static_ = saved_static;
     if (!expect(T::RBrace, "Unexpected token")) return nullptr;
+    const uint64_t class_end = last_end_;
 
     // the constructor: its own, or an empty one (a derived class passes its arguments on)
     Node* ctor = constructor;
@@ -2178,6 +2207,7 @@ class Parser {
     }
     ctor->text = cname;
     ctor->flags |= kFlagExpression;
+    if (class_start <= class_end && class_end <= src_.size()) ctor->source = src_.substr(class_start, class_end - class_start);   // (the class is its constructor: its text is the whole class)
     {   // a class constructor cannot be called without new
       Node* target = make(NodeKind::Ident);
       if (!target) return nullptr;
@@ -2750,6 +2780,7 @@ class Parser {
       } else {
         p = make(NodeKind::Property);
         if (!p) return nullptr;
+        const uint64_t member_start = here();
         bool word = false, method_async = false;
         uint8_t accessor = 0;   // 1: get name() {}, 2: set name(v) {}
         bool generator = accept(T::Star);   // *name() { ... }
@@ -2770,6 +2801,7 @@ class Parser {
           if (!parameters(f)) return nullptr;
           f->a = function_body(false);
           if (!f->a) return nullptr;
+          set_source(f, member_start);
           p->a = f;
           p->flags |= accessor == 1 ? kFlagGetter : kFlagSetter;
         } else if (accept(T::Colon)) {
@@ -2784,6 +2816,7 @@ class Parser {
           if (!parameters(f)) return nullptr;
           f->a = function_body(method_async, generator);
           if (!f->a) return nullptr;
+          set_source(f, member_start);
           if (method_async && generator) wrap_async_generator(f);
           p->a = f;
         } else if (word && !(p->flags & kFlagComputed) && !reserved(p->text)) {   // shorthand: { name }
@@ -2879,7 +2912,8 @@ class Parser {
   Arena& arena_;
   String* error_;
   String scratch_;
-  uint64_t pos_ = 0, prev_end_ = 0;
+  uint64_t pos_ = 0, prev_end_ = 0;   // (prev_end_: where the current token starts)
+  uint64_t last_end_ = 0;             // where the token before it ended
   uint32_t line_ = 1;
   Token cur_;
   bool lenient_escapes_ = false;   // inside a tagged template an invalid escape is allowed: the cooked string is undefined

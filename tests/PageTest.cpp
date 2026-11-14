@@ -451,8 +451,10 @@ struct FakeNet final : IPageLoader {
     Answer a;
     if (it != answers.end()) a = it->second;
     else a.status = 404;
-    if (it == answers.end() && getenv("PROBE_ROOT") && key.find("GET https://app.example/") == 0) {   // (PROBE: files of a directory are the site)
-      std::string rel = key.substr(strlen("GET https://app.example/"));
+    // (PROBE_SITE=http://localhost:8765/: the directory is also served at that address, for a page that is compared with the same page in another browser)
+    const std::string own_site = std::string("GET ") + (getenv("PROBE_SITE") && key.find(std::string("GET ") + getenv("PROBE_SITE")) == 0 ? getenv("PROBE_SITE") : "https://app.example/");
+    if (it == answers.end() && getenv("PROBE_ROOT") && key.find(own_site) == 0) {   // (PROBE: files of a directory are the site)
+      std::string rel = key.substr(own_site.size());
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
       const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + rel;
@@ -480,9 +482,12 @@ struct FakeNet final : IPageLoader {
         a.headers = probe_content_type(path) + "Access-Control-Allow-Origin: *\r\n";   // (gstatic's icons are fetched by script: the real servers allow it)
       }
     }
-    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && key.find("POST https://app.example/youtubei/") == 0 && key.find("/log_event") == std::string::npos) {
-      // (PROBE: YouTube's API calls - the guide, the browse continuations - go to the live site, as the browser would send them)
-      const std::string rest = key.substr(strlen("POST https://app.example/"));
+    // (PROBE: the page is at https://app.example/, or - with PROBE_URL - at the live host itself, for scripts that look at the address they run at)
+    const std::string live_site = std::string("POST https://") + (getenv("PROBE_LIVE") ? getenv("PROBE_LIVE") : "app.example") + "/";
+    const std::string site = key.find(live_site) == 0 ? live_site : std::string("POST https://app.example/");
+    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && (key.find(site + "youtubei/") == 0 || key.find(site + "api/jnn/") == 0) && key.find("/log_event") == std::string::npos) {
+      // (PROBE: YouTube's API calls - the guide, the browse continuations, the attestation service - go to the live site, as the browser would send them)
+      const std::string rest = key.substr(site.size());
       bool plain = true;
       for (char ch : rest) plain &= isalnum(static_cast<unsigned char>(ch)) || strchr("/._=?&-", ch);
       const std::string dir = getenv("PROBE_ROOT"), body_file = dir + "/_post_body", out_file = dir + "/_post_answer";
@@ -728,8 +733,9 @@ struct FakeEnvironment final : IPageEnvironment {
   bool fetch_text(StringView address, uint64_t, String* text) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = files.find(fetched.back());
-    if (it == files.end() && (getenv("WPT_REAL_FILE") || getenv("PROBE_HTML")) && fetched.back().compare(0, 20, "https://app.example/") == 0) {   // (a real web-platform-tests run: the checkout is the site)
-      std::string rel = fetched.back().substr(20);
+    const std::string own = getenv("PROBE_SITE") && fetched.back().find(getenv("PROBE_SITE")) == 0 ? getenv("PROBE_SITE") : "https://app.example/";   // (PROBE_SITE: see exchange())
+    if (it == files.end() && (getenv("WPT_REAL_FILE") || getenv("PROBE_HTML")) && fetched.back().compare(0, own.size(), own) == 0) {   // (a real web-platform-tests run: the checkout is the site)
+      std::string rel = fetched.back().substr(own.size());
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
       if (rel == "resources/testharnessreport.js") {
@@ -868,7 +874,21 @@ struct FakeEnvironment final : IPageEnvironment {
     (on ? fullscreen_entered : fullscreen_left)++;
     return true;
   }
-  uint64_t now_ms() override { return clock; }
+  // (PROBE_WALLCLOCK: the clock also moves while a script runs, as a real one does - by the time that has passed since `clock` last changed.
+  // A script that times its own work, or checks that the clock runs at all, sees a frozen clock otherwise.)
+  uint64_t now_ms() override {
+    if (!running_clock) return clock;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t mono = static_cast<uint64_t>(ts.tv_sec) * 1000u + static_cast<uint64_t>(ts.tv_nsec) / 1000000u;
+    if (clock != stamped_clock) {
+      stamped_clock = clock;
+      stamp_ms = mono;
+    }
+    return clock + (mono - stamp_ms);
+  }
+  bool running_clock = getenv("PROBE_WALLCLOCK") != nullptr;
+  uint64_t stamped_clock = 0, stamp_ms = 0;
   uint64_t monotonic_step = 0, monotonic_now = 1000000;   // (a test that sets the step gets a clock that moves that much per reading)
   uint64_t monotonic_us() override {
     if (monotonic_step) return monotonic_now += monotonic_step;
@@ -3208,6 +3228,87 @@ static uint32_t node_of_text(Page& page, const char* text) {
   return 0;
 }
 
+// What a page sees when it looks at the platform's interfaces themselves, as scripts do that check what they run in (the attestation script of
+// YouTube among them): an object says which interface it is, the operations and accessors are called what they are and read as native code, an
+// operation's length is the number of arguments it needs, the members of an interface come before its constructor, and the host's own helpers
+// are not among the properties of the window.
+static void test_interface_surface() {
+  CHECK(run_page("<html><body><div id=d class=c style='color:red'>t</div><script>var T = function (v) { return Object.prototype.toString.call(v) }, d = document.getElementById('d');"
+                 "console.log(T(document.body), T(d), T(d.firstChild), T(new Event('x')), T(d.style), T(d.classList), T(document), T(window), String(document.body), String(d))"
+                 "</script></body></html>") ==
+        "[object HTMLBodyElement] [object HTMLDivElement] [object Text] [object Event] [object CSSStyleDeclaration] [object DOMTokenList] [object HTMLDocument] [object Window] [object HTMLBodyElement] [object HTMLDivElement]");
+  CHECK(run_page("<html><body><script>var get = Object.getOwnPropertyDescriptor(Document.prototype, 'body').get;"
+                 "console.log(document.createElement.name, get.name, String(document.createElement), String(get), String(window.setTimeout), /\\[native code\\]/.test(String(document.body.appendChild)))"
+                 "</script></body></html>") ==
+        "createElement get body function createElement() { [native code] } function get body() { [native code] } function setTimeout() { [native code] } true");
+  CHECK(run_page("<html><body><script>console.log([document.createElement.length, document.addEventListener.length, window.addEventListener.length, setTimeout.length, fetch.length,"
+                 "getComputedStyle.length, postMessage.length, document.body.cloneNode.length, document.body.insertBefore.length, document.body.setAttribute.length, XMLHttpRequest.prototype.open.length].join())"
+                 "</script></body></html>") == "1,2,2,1,1,1,1,0,2,2,2");
+  CHECK(run_page("<html><body><script>var names = function (C) { return Object.getOwnPropertyNames(C.prototype) };"
+                 "console.log(names(SpeechSynthesisEvent).join(), names(SpeechSynthesisErrorEvent).join(), names(SpeechSynthesisUtterance).slice(0, 7).join(), names(MediaMetadata).slice(0, 4).join(),"
+                 "['HTMLElement', 'Node', 'Event', 'Document', 'XMLHttpRequest', 'NetworkInformation'].map(function (n) { var all = names(window[n]); return all[all.length - 1] }).join())"
+                 "</script></body></html>") ==
+        "utterance,charIndex,charLength,elapsedTime,name,constructor error,constructor text,lang,voice,volume,rate,pitch,onstart title,artist,album,artwork "
+        "constructor,constructor,constructor,constructor,constructor,constructor");
+  CHECK(run_page("<html><body><script>var u = new SpeechSynthesisUtterance('hi'), e = new SpeechSynthesisErrorEvent('error', { utterance: u, error: 'network', charIndex: 3 }), m = new MediaMetadata({ title: 't', artist: 'a' });"
+                 "console.log(e instanceof SpeechSynthesisEvent, e instanceof Event, e.type, e.error, e.charIndex, e.utterance === u, e.elapsedTime, u.text, u.onstart, m.title, m.artist, m.album === '', Array.isArray(m.artwork));"
+                 "try { SpeechSynthesisEvent('x') } catch (x) { console.log(x.name) }"
+                 "</script></body></html>") == "true true error network 3 true 0 hi null t a true true | TypeError");
+  CHECK(run_page("<html><body><script>window.__mine = 1; var n = Object.getOwnPropertyNames(window);"
+                 "console.log(n.filter(function (x) { return x.indexOf('__') === 0 }).join(), n.indexOf('document') >= 0, n.indexOf('HTMLElement') >= 0, n.indexOf('setTimeout') >= 0, Object.keys(window).indexOf('__mine') >= 0);"
+                 "var seen = []; for (var k in window) if (k.indexOf('__') === 0) seen.push(k); console.log(seen.join())"
+                 "</script></body></html>") == "__mine true true true true | __mine");
+}
+
+// The navigator and the screen answer from their interfaces' prototypes; a blank frame that the page reaches into lists and shapes its interfaces from
+// the reference table (DomBindingsSurface.cpp), and its getters answer for the page's own objects.
+static void test_reference_surface() {
+  CHECK(run_page("<html><body><script>"
+                 "console.log(Object.getOwnPropertyNames(navigator).length, Object.getOwnPropertyNames(screen).length, navigator.hasOwnProperty('webdriver'), navigator.webdriver, typeof navigator.userAgent,"
+                 "screen.width > 0, screen.availTop, typeof navigator.sendBeacon); var d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver'); console.log(typeof d.get, d.set, d.enumerable);"
+                 "try { Navigator.prototype.webdriver } catch (e) { console.log(e.name, e.message) }"
+                 "var c = navigator.connection; console.log(Object.getOwnPropertyNames(NetworkInformation.prototype).join(), 'type' in c, c.onchange, c.effectiveType); console.log(Date.name, String(Date))"
+                 "</script></body></html>") ==
+        "0 0 false false string true 0 function | function undefined true | TypeError Illegal invocation | onchange,effectiveType,rtt,downlink,saveData,constructor false null 4g | "
+        "Date function Date() { [native code] }");
+  {   // the screen is the display, not the page area, and follows a change of either
+    TestAllocator a;
+    {
+      FakeEnvironment env(a);
+      MediaEnvironment media;
+      media.width = 640; media.height = 480; media.screen_width = 1920; media.screen_height = 1080;
+      Page page(a, env, "http://example.com/", media, true);
+      page.load("<html><body><script>console.log(screen.width, screen.height, screen.availWidth, innerWidth, Object.getOwnPropertyNames(screen).length);"
+                "addEventListener('resize', function () { console.log(screen.width, screen.height, Object.getOwnPropertyNames(screen).length) })</script></body></html>");
+      media.width = 800; media.screen_width = 2560; media.screen_height = 1440;
+      page.set_media(media);
+      CHECK(std::string(page.log().data(), page.log().size()) == "1920 1080 1920 640 0\n2560 1440 0\n");
+    }
+    CHECK(a.live == 0);
+  }
+  const char* frame = "<html><body><iframe id=own srcdoc=\"<p>x</p>\"></iframe><script>"
+      "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow, names = w.Object.getOwnPropertyNames(w);"
+      "var R = function (fn) { try { return String(fn()) } catch (e) { return e.name + ': ' + e.message } };";
+  std::string page = std::string(frame) +
+      "console.log(names.length, names[0], names.indexOf('__reference_surface'), typeof w.XRWebGLBinding, typeof window.XRWebGLBinding, w.Map.length, w.KeyboardEvent.length,"
+      "w.Object.getOwnPropertyNames(w.SVGNumberList.prototype).slice(0, 4).join());"
+      "var o = document.getElementById('own').contentWindow; console.log(o.Object.getOwnPropertyNames(o).length === names.length, typeof o.XRWebGLBinding, Object.getOwnPropertyNames(window).length === names.length)"
+      "</script></body></html>";
+  CHECK(run_page(page.c_str()) == "1225 Object -1 function undefined 0 1 length,numberOfItems,appendItem,clear | false undefined false");
+  page = std::string(frame) +   // each member has the table's shape: kind, arity and flags
+      "var D = function (C, m) { var d = w.Object.getOwnPropertyDescriptor(w[C].prototype, m); return !d ? 'none' : 'value' in d ? typeof d.value + (typeof d.value === 'function' ? d.value.length : d.value) +"
+      "(d.enumerable ? 'e' : '') + (d.writable ? 'w' : '') + (d.configurable ? 'c' : '') : (d.get ? 'g' : '') + (d.set ? 's' : '') + (d.enumerable ? 'e' : '') };"
+      "console.log(D('KeyboardEvent', 'ctrlKey'), D('SVGNumberList', 'replaceItem'), D('WebGLRenderingContext', 'DEPTH_RANGE'), D('Map', 'size'), D('SVGElement', 'onbeforetoggle'), D('Range', 'collapse'),"
+      "D('XRWebGLBinding', 'getDepthInformation'))</script></body></html>";
+  CHECK(run_page(page.c_str()) == "ge function2ewc number2928e g gse function0ewc function1ewc");
+  page = std::string(frame) +   // a getter of the frame: the page's own object answers, anything that is not one of its kind is refused, and what the frame has still works
+      "var get = w.Object.getOwnPropertyDescriptor(w.Navigator.prototype, 'webdriver').get;"
+      "console.log([R(function () { return get.call(navigator) }), R(function () { return get.call(window) }), R(function () { return get.call(w.navigator) }), R(function () { return w.KeyboardEvent.prototype.ctrlKey }),"
+      "R(function () { return w.navigator.webdriver }), R(function () { return new w.KeyboardEvent('keydown', { ctrlKey: true }).ctrlKey }), R(function () { return new w.XRWebGLBinding() }),"
+      "R(function () { return w.XRWebGLBinding.prototype.getDepthInformation() }), R(function () { return w.document.body.nodeName })].join('; '))</script></body></html>";
+  CHECK(run_page(page.c_str()) == "false; TypeError: Illegal invocation; false; TypeError: Illegal invocation; false; true; TypeError: Illegal constructor; TypeError: Illegal invocation; BODY");
+}
+
 static void test_iframe() {
   TestAllocator a;
   {   // srcdoc and src: the page of the frame is drawn between rules
@@ -3274,6 +3375,73 @@ static void test_iframe() {
               "console.log(w.eval('callback(7)'), w.parent === window, Object.keys(d.getElementById('p').dataset).length);"
               "</script></body></html>");
     CHECK(page_log(page) == "true true inner 2 3 | 42 42 true c true | changed T a,b true false | InvalidCharacterError true | from parent 7 true 0");
+  }
+  CHECK(a.live == 0);
+  {   // A frame's built-ins used on the page's own values, as a script does that wants built-ins nobody has replaced (the attestation script of YouTube
+      // takes String.prototype.replace and Function.prototype.toString from a frame it makes, reads the text of its own functions with them, edits it and
+      // evaluates it again): the text of a function of another window is its text there, apply() takes its arguments from an array of another window,
+      // and a regular expression of another window still replaces and splits.
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><script>"
+              "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow;"
+              "var N = function (a, b) { return a + b; };"
+              "var text = w.String.prototype.replace.toString, replace = w.String.prototype.replace;"
+              "console.log(text.apply(N, []), text.call(replace), text === w.Function.prototype.toString);"
+              "var patched = replace.apply('0,' + text.apply(N, []), ['+', '*']);"
+              "console.log(patched, eval(patched)(6, 7));"
+              "console.log(replace.apply('a-b-c', [/-/g, '+']), replace.call('x1y22', /\\d+/g, function (m) { return '<' + m.length + '>'; }), w.String.prototype.split.call('a1b2c', /\\d/).join());"
+              "w.eval('function twice(x) { return x * 2 }');"
+              "console.log(w.Math.max.apply(null, [3, 9, 4]), '' + w.twice, Function.prototype.toString.call(w.twice), String(w.Math.max), w.twice.apply(null, [21]));"
+              "try { text.call({}) } catch (e) { console.log(e.name) }"
+              "console.log(Function.prototype.toString.call(Function.prototype.toString), (function () {}).toString.name)"
+              "</script></body></html>");
+    CHECK(page_log(page) == "function (a, b) { return a + b; } function replace() { [native code] } true | 0,function (a, b) { return a * b; } 42 | a+b+c x<1>y<2> a,b,c | "
+                            "9 function twice(x) { return x * 2 } function twice(x) { return x * 2 } function max() { [native code] } 42 | TypeError | function toString() { [native code] } toString");
+    if (page_log(page).find("function max") == std::string::npos) printf("   frame built-ins: %s\n", page_log(page).c_str());
+  }
+  CHECK(a.live == 0);
+  {   // A function taken from a frame goes on working when the frame has left the document (the attestation script removes its frame at once and uses the
+      // functions in later tasks; with the frame's script gone the video stopped after a minute). The page of the frame is kept, with nothing running in
+      // it. An <iframe> that is put back is a new window.
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><script>"
+              "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow;"
+              "var text = w.Function.prototype.toString, replace = w.String.prototype.replace, max = w.Math.max; w.mark = 'first';"
+              "w.setTimeout(function () { console.log('a timer of the removed frame ran') }, 5);"
+              "document.body.removeChild(f);"
+              "console.log(replace.call('a-b', '-', '+'), max(2, 7));"
+              "setTimeout(function () {"
+              "  console.log(replace.apply('x1', ['1', '2']), text.call(function () { return 1; }), max.apply(null, [4, 9, 3]), typeof replace.apply, w.mark);"
+              "  document.body.appendChild(f);"
+              "  console.log(f.contentWindow === w, f.contentWindow.mark, typeof f.contentWindow.Math.max, w.mark, replace.call('q', 'q', 'r'));"
+              "}, 10);"
+              "</script></body></html>");
+    page_text(page, 60);   // (the frames are compared with the document: the one that was removed is retired)
+    page.run_due_timers(1e18);
+    page_text(page, 60);
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "a+b 7 | x2 function () { return 1; } 9 function first | false undefined function first r");
+    if (page_log(page).find("first r") == std::string::npos) printf("   removed frame: %s\n", page_log(page).c_str());
+  }
+  CHECK(a.live == 0);
+  {   // only the last few removed frames are kept (a page that makes frame after frame); a frame nobody took anything from is not kept at all
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe id=plain srcdoc='<p>plain</p>'></iframe><script>"
+              "var fs = []; for (var i = 0; i < 7; i++) { var e = document.createElement('iframe'); document.body.appendChild(e); fs.push(e.contentWindow.Math.max); document.body.removeChild(e); }"
+              "var plain = document.getElementById('plain'); plain.parentNode.removeChild(plain);"
+              "setTimeout(function () { var r = fs.map(function (m) { try { return String(m(1, 2)); } catch (x) { return 'threw'; } });"
+              "  console.log(r.slice(0, 2).join(), r.slice(-4).join()); }, 10);"   // (a function of a window that is gone answers nothing)
+              "</script></body></html>");
+    page_text(page, 60);
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "undefined,undefined 2,2,2,2");
+    if (page_log(page) != "undefined,undefined 2,2,2,2") printf("   removed frames: %s\n", page_log(page).c_str());
   }
   CHECK(a.live == 0);
   {   // a form with a target submits into the frame of that name, in the encoding of the page (or of its accept-charset)
@@ -7111,9 +7279,12 @@ int main(int argc, char** argv) {
     TestAllocator a;
     {
       FakeEnvironment env(a);
+      if (getenv("PROBE_WALLCLOCK")) env.clock = static_cast<uint64_t>(time(nullptr)) * 1000u;   // (the page's clock starts at the real time: a server that looks at times sent to it sees today's)
       MediaEnvironment media;
       media.width = getenv("PROBE_WIDTH") ? atoi(getenv("PROBE_WIDTH")) : 1280;   // (the browser window's page area: PROBE_WIDTH / PROBE_HEIGHT)
       media.height = getenv("PROBE_HEIGHT") ? atoi(getenv("PROBE_HEIGHT")) : 800;
+      if (getenv("PROBE_SCREEN_WIDTH")) media.screen_width = atoi(getenv("PROBE_SCREEN_WIDTH"));   // (the screen around it: PROBE_SCREEN_WIDTH / PROBE_SCREEN_HEIGHT)
+      if (getenv("PROBE_SCREEN_HEIGHT")) media.screen_height = atoi(getenv("PROBE_SCREEN_HEIGHT"));
       Page page(a, env, getenv("PROBE_URL") ? getenv("PROBE_URL") : "https://app.example/", media, true);   // (PROBE_URL: the address it was saved from, on app.example)
       font::FontSet probe_fonts(a);   // (what scripts measure with once the page has changed; the probe's pictures use their own)
       probe_fonts.add_bundled_fonts();
@@ -7302,6 +7473,13 @@ int main(int argc, char** argv) {
     printf(g_failed ? "%d check(s) failed\n" : "wpt tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
+  if (getenv("ONLY_IFRAME")) {   // (just the frame tests)
+    test_iframe();
+    test_interface_surface();
+    test_reference_surface();
+    printf(g_failed ? "%d check(s) failed\n" : "frame tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
   if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)
     test_cache_api();
     if (getenv("ONLY_SW")[0] == '2') test_service_workers();
@@ -7379,6 +7557,8 @@ int main(int argc, char** argv) {
   test_details_and_dialog();
   test_template();
   test_iframe();
+  test_interface_surface();
+  test_reference_surface();
   test_svg();
   test_input_more();
   test_wpt();

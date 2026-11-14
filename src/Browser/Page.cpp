@@ -122,6 +122,7 @@ Page::Page(allocators::IAllocator& allocator, IPageEnvironment& environment, Str
       sheets_(allocator),
       objects_(allocator),
       frames_(allocator),
+      detached_frames_(allocator),
       messages_(allocator),
       port_homes_(allocator),
       frame_windows_(allocator),
@@ -2577,6 +2578,22 @@ void Page::deliver_frame(uint32_t frame_serial, StringView address, const char* 
   else frame_navigate(frame_serial, address);
 }
 
+// An <iframe> left the document. Its page goes with it, unless a script of another window holds objects of its script: then the page is kept, with nothing
+// running in it (its media paused, no timers, no drawing), so that those objects go on working. An <iframe> that comes back is a new window either way.
+void Page::retire_frame(UniquePointer<Frame> frame) {
+  if (!frame) return;
+  for (uint64_t i = 0; i < frame_windows_.count(); ++i)
+    if (frame_windows_[i].port == frame->serial) {
+      frame_windows_.remove_at(i);
+      break;
+    }
+  if (!frame->page || !frame->page->lent_objects_ || !frame->page->bindings_) return;
+  frame->page->bindings_->call_hook("__page_detached", nullptr, 0);
+  frame->page->flush_errors();
+  if (detached_frames_.count() >= kMaxDetachedFrames) detached_frames_.remove_at(0);   // (the oldest goes: a page that makes frame after frame does not keep them all)
+  detached_frames_.push_back(util::move(frame));
+}
+
 // Makes the pages of the <iframe>s that are new or whose address changed, draws those that changed, forgets those that are gone.
 bool Page::sync_frames() {
   List<dom::Node*> found(allocator_);
@@ -2584,10 +2601,16 @@ bool Page::sync_frames() {
     dom::Node* n = doc_.by_serial(serial);
     if (n && n->is_tag("iframe") && dom::is_connected(n)) found.push_back(n);
   }
-  for (uint64_t i = frames_.count(); i > 0; --i) {
+  for (uint64_t i = 0; i < frames_.count();) {   // (in the order they were made: of the frames that are kept without their <iframe>, the oldest go first)
     bool still = false;
-    for (uint64_t k = 0; k < found.count(); ++k) still = still || found[k]->serial == frames_[i - 1]->serial;
-    if (!still) frames_.remove_at(i - 1);
+    for (uint64_t k = 0; k < found.count(); ++k) still = still || found[k]->serial == frames_[i]->serial;
+    if (still) {
+      ++i;
+      continue;
+    }
+    UniquePointer<Frame> gone = util::move(frames_[i]);
+    frames_.remove_at(i);
+    retire_frame(util::move(gone));
   }
   List<uint32_t> loaded(allocator_);
   for (uint64_t k = 0; k < found.count(); ++k) {
@@ -2710,6 +2733,10 @@ Page* Page::find_window(uint32_t id) {
   for (uint64_t i = 0; i < frames_.count(); ++i) {
     if (!frames_[i]->page) continue;
     if (Page* p = frames_[i]->page->find_window(id)) return p;
+  }
+  for (uint64_t i = 0; i < detached_frames_.count(); ++i) {   // (a frame that left the document, kept for the objects other windows hold)
+    if (!detached_frames_[i]->page) continue;
+    if (Page* p = detached_frames_[i]->page->find_window(id)) return p;
   }
   return nullptr;
 }
@@ -3137,6 +3164,7 @@ bool Page::window_request(uint32_t target_window, StringView request, String* re
   const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(request)};
   reply->clear();
   target->engine_->vm().reset_instruction_count();   // (each request is a task of its own for the script that answers it)
+  target->lent_objects_ = true;
   return target->bindings_->call_hook("__window_serve", args, 1, reply) && !reply->empty();
 }
 

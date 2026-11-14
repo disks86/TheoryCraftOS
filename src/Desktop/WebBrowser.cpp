@@ -1129,12 +1129,14 @@ void WebBrowser::settle() {
   const bool shown = __atomic_load_n(&page_shown_, __ATOMIC_ACQUIRE);
   const bool must = defer_scroll_ >= 0 || restore_scroll_ >= 0;
   if (live_->changed() || must) {
-    if (!must && (!shown || (in_timers_ && now_ms < __atomic_load_n(&last_refresh_ms_, __ATOMIC_ACQUIRE) + kMinRefreshGapMs))) {   // (a timer made it too soon, or nobody looks: tick comes back for it; a click or key is drawn at once)
+    if (!must && (!shown || (in_timers_ && now_ms < __atomic_load_n(&next_refresh_ms_, __ATOMIC_ACQUIRE)))) {   // (a timer made it too soon, or nobody looks: tick comes back for it; a click or key is drawn at once)
       __atomic_store_n(&refresh_deferred_, true, __ATOMIC_RELEASE);
     } else {
       __atomic_store_n(&refresh_deferred_, false, __ATOMIC_RELEASE);
-      __atomic_store_n(&last_refresh_ms_, now_ms, __ATOMIC_RELEASE);
+      const uint64_t started_ms = hardware::uptime_us() / 1000;
       refresh(true);
+      // (the drawing of a big page takes a few hundred milliseconds: the timers that keep changing it get their share before the next one)
+      __atomic_store_n(&next_refresh_ms_, next_refresh_after(started_ms, hardware::uptime_us() / 1000, kMinRefreshGapMs, kMaxRefreshWaitMs), __ATOMIC_RELEASE);
     }
   } else if (live_->errors() != reported_errors_) {
     UiGuard lock(this);
@@ -1212,6 +1214,10 @@ browser::MediaEnvironment WebBrowser::current_media() {
     m.width = page_.viewport_width();
     m.height = page_.viewport_height();
   }
+  if (const gui::Window* screen = window()) {   // (the window tree's root covers the screen: `screen.width` is the display's, not the page area's)
+    const auto& all = screen->bounds();
+    if (all.width > 1 && all.height > 1) { m.screen_width = static_cast<int32_t>(all.width); m.screen_height = static_cast<int32_t>(all.height); }
+  }
   m.dark = dark_;
   m.scripting = scripts_enabled_;
   return m;
@@ -1271,7 +1277,7 @@ void WebBrowser::tick(uint64_t uptime_us) {
     }
   }
   const uint64_t due = __atomic_load_n(&next_due_ms_, __ATOMIC_ACQUIRE);
-  if (__atomic_load_n(&refresh_deferred_, __ATOMIC_ACQUIRE) && shown_now && ms >= __atomic_load_n(&last_refresh_ms_, __ATOMIC_ACQUIRE) + kMinRefreshGapMs && !__atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) {
+  if (__atomic_load_n(&refresh_deferred_, __ATOMIC_ACQUIRE) && shown_now && ms >= __atomic_load_n(&next_refresh_ms_, __ATOMIC_ACQUIRE) && !__atomic_exchange_n(&timer_pending_, true, __ATOMIC_ACQ_REL)) {
     queue(timer_handler_, *this, true);   // (a redraw was put off: the handler's settle() does it now)
     return;
   }

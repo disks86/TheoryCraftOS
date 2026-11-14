@@ -211,6 +211,7 @@ const char kWebGlPrelude[] = R"JSPRELUDE((function (g) {
     // the context has the default framebuffer-sized viewport (the native side did that)
     return ctx;
   };
+  Object.defineProperty(g, '__make_gl_context', { enumerable: false });   // (the host's own: not among the properties a page lists)
 
   var C = function (ctx, op) { return call.apply(null, [ctx.__id, op].concat(Array.prototype.slice.call(arguments, 2))); };
   var CALL = function (ctx, name, a, b, c, d, e, f, gg, h, i, j, k) { return call(ctx.__id, OP[name], a, b, c, d, e, f, gg, h, i, j, k); };

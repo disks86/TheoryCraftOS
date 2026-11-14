@@ -219,6 +219,7 @@ class Compiler {
   }
 
   bool program(Node* block, FunctionCode** out) {
+    whole_source_ = block->source;
     FuncState fs(vm_.allocator());
     fs.code = vm_.new_code();
     if (!fs.code) return fail("Out of memory", 0);
@@ -726,6 +727,25 @@ class Compiler {
     emit(Opc::Closure, static_cast<int32_t>(cur_->code->children.count() - 1), 0, fn->line);
   }
 
+  // A function keeps the text it was written as (Function.prototype.toString gives it back, and pages do evaluate that text again): one copy of the script,
+  // made when its first function is compiled, is shared by all of them. The host's own scripts are not kept: their functions read as native code.
+  void keep_source(FunctionCode* code, const Node* fn) {
+    if (library_ || fn->source.empty() || whole_source_.empty()) return;
+    const uint64_t start = static_cast<uint64_t>(fn->source.data() - whole_source_.data());   // (the parser made fn->source a part of the text it was given)
+    if (start > whole_source_.size() || fn->source.size() > whole_source_.size() - start || whole_source_.size() > 0xFFFFFFFFull) return;
+    if (!kept_source_) {
+      kept_source_ = SharedPointer<String>::make(vm_.allocator(), vm_.allocator());
+      if (kept_source_ && !kept_source_->assign(whole_source_)) kept_source_.reset();
+      if (!kept_source_) {   // (out of memory: these functions have no text)
+        whole_source_ = StringView();
+        return;
+      }
+    }
+    code->source = kept_source_;
+    code->source_start = static_cast<uint32_t>(start);
+    code->source_length = static_cast<uint32_t>(fn->source.size());
+  }
+
   FunctionCode* compile_function(Node* fn) {
     FuncState fs(vm_.allocator());
     fs.code = vm_.new_code();
@@ -737,6 +757,7 @@ class Compiler {
     infer_name_ = StringView();
     fs.parent = cur_;
     fs.code->library = library_;
+    keep_source(fs.code, fn);
     fs.code->strict = (cur_ && cur_->code->strict) || (fn->flags & kFlagStrict) != 0 || (!(fn->flags & kFlagExprBody) && has_use_strict(fn->a->list));
     FuncState* saved = cur_;
     const uint32_t saved_level = function_level_count_;
@@ -1882,6 +1903,8 @@ class Compiler {
   StringView pending_label_;
   StringView infer_name_;   // the name an anonymous function expression takes from where it is stored (var f = function () {}), taken by the next compile_function
   List<WithCtx> withs_;     // the with statements whose body is being compiled
+  StringView whole_source_;              // the text being compiled (the functions' texts are parts of it)
+  SharedPointer<String> kept_source_;    // the copy of it the compiled functions share, once one of them needed it
   uint32_t with_counter_ = 0;
   List<uint32_t>* dummy_ = nullptr;
   List<uint32_t> optional_jumps_{vm_.allocator()};

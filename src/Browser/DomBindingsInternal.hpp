@@ -190,6 +190,7 @@ void flush_gl(DomBindings::Impl& c, uint32_t serial);   // copies what a WebGL c
 // An ImageSource for an <img>, <canvas> or <video> element value (DomBindingsMedia.cpp).
 bool media_source_pixels(Vm& vm, const Value& v, ImageSource* src);
 bool install_rtc(DomBindings::Impl& c);              // RTCPeerConnection's natives (DomBindingsRtc.cpp)
+bool install_surface(DomBindings::Impl& c);          // the reference interface surface, as data (DomBindingsSurface.cpp)
 bool install_service_worker(DomBindings::Impl& c);   // the Cache API and service worker natives (DomBindingsServiceWorker.cpp)
 bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest's natives, byte and text helpers (DomBindingsNet.cpp)
 // Uint8Array objects (DomBindingsMedia.cpp): a new one holding these bytes, and the bytes of one (a view into the array; false for anything else).
