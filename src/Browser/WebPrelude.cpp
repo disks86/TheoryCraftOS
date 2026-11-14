@@ -11564,6 +11564,9 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
   eventClass('IDBVersionChangeEvent', [['oldVersion', 0], ['newVersion', null]]);
   eventClass('DeviceOrientationEvent', [['alpha', null], ['beta', null], ['gamma', null], ['absolute', false]]);
   eventClass('DeviceMotionEvent', [['acceleration', null], ['accelerationIncludingGravity', null], ['rotationRate', null], ['interval', 0]]);
+  // Web Speech: the events of an utterance. (The synthesizer has no voices and fires none; the interfaces are part of the API a page may ask for.)
+  var SpeechSynthesisEvent = eventClass('SpeechSynthesisEvent', [['utterance', null], ['charIndex', 0], ['charLength', 0], ['elapsedTime', 0], ['name', '']]);
+  eventClass('SpeechSynthesisErrorEvent', [['error', '']], SpeechSynthesisEvent);
 
   // EventSource (server-sent events) over fetch()
   var CONNECTING = 0, OPEN = 1, CLOSED = 2;
@@ -11861,7 +11864,10 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     Notification: 'title body icon tag onclick',
     Lock: 'name mode',
     Gamepad: 'id index connected mapping axes buttons timestamp vibrationActuator',
-    SpeechSynthesisUtterance: 'text lang voice volume rate pitch',
+    SpeechSynthesisUtterance: 'text lang voice volume rate pitch onstart onend onerror onpause onresume onmark onboundary',
+    SpeechSynthesisEvent: 'utterance charIndex charLength elapsedTime name',
+    SpeechSynthesisErrorEvent: 'error',
+    MediaMetadata: 'title artist album artwork chapterInfo',
     DeviceOrientationEvent: 'alpha beta gamma absolute',
     DeviceMotionEvent: 'acceleration interval'
   };
@@ -12465,6 +12471,22 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (P === null || typeof P !== 'object' || Object.prototype.hasOwnProperty.call(P, Symbol.toStringTag)) return;
     if (C.name !== name && typeof g[C.name] === 'function' && g[C.name] === C) return;   // (another name of an interface: its own name tags it)
     try { Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { }
+  });
+  // The members of an interface come before its `constructor` among the properties of its prototype (the order they are listed in: the attributes and
+  // operations as the interface declares them, then the constructor), whatever order this implementation happened to add them in.
+  var language = { Symbol: 1, BigInt: 1, Promise: 1, Map: 1, Set: 1, WeakMap: 1, WeakSet: 1, WeakRef: 1, FinalizationRegistry: 1, ArrayBuffer: 1, SharedArrayBuffer: 1, DataView: 1 };
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var c = name.charCodeAt(0);
+    if (c < 65 || c > 90 || untagged[name] === 1 || language[name] === 1 || /^(Int|Uint|Float|BigInt|BigUint)\d+(Clamped)?Array$/.test(name)) return;
+    var d = Object.getOwnPropertyDescriptor(g, name), C = d && d.value;
+    if (typeof C !== 'function') return;
+    var P = C.prototype;
+    if (P === null || typeof P !== 'object') return;
+    var own = Object.getOwnPropertyDescriptor(P, 'constructor');
+    if (!own || !own.configurable || !('value' in own)) return;
+    var names = Object.getOwnPropertyNames(P);
+    if (names.length < 2 || names[names.length - 1] === 'constructor') return;
+    try { if (delete P.constructor) Object.defineProperty(P, 'constructor', own); } catch (e) { }
   });
 }(this));
 )JSPRELUDE";
@@ -15318,6 +15340,7 @@ const char kAnimationPrelude[] = R"JSPRELUDE((function (g) {
     motionScheduled = true;
     g.requestAnimationFrame(function () { motionScheduled = false; flushMotion(); });
   };
+  Object.defineProperty(g, '__style_dirty', { enumerable: false });   // (the host's own: not among the properties a page lists)
   // getComputedStyle(el) brings el's transitions and animations up to date (a script that sets a value, reads the style and sets another expects a transition
   // between them); the rest of the page's wait for the next frame (looking at every changed element on every read cost YouTube seconds).
   function flushMotionOf(el) {

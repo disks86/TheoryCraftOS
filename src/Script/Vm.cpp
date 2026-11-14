@@ -2406,6 +2406,8 @@ JsObject* Vm::own_symbols(JsObject* o) {
 // The own property names of an ordinary object, in the order the language gives: integer indices ascending, then the rest as they were added.
 namespace {
 // The properties Map, Set and the weak collections mark an object with (__oid, __ws<n>, __wm<n>): not the page's, so not among the names it gets to see.
+// The same goes for what the host keeps on the global object for its own library (hidden properties called __something: the hooks the page loader
+// calls, the natives the library is written with): Object.getOwnPropertyNames(window) lists what a page can use, as in any browser.
 bool is_identity_key(StringView k) {
   if (k.equals("__oid")) return true;
   if ((!k.starts_with("__ws") && !k.starts_with("__wm")) || k.size() == 4) return false;
@@ -2437,7 +2439,7 @@ void Vm::push_property_keys(JsObject* names, JsObject* o, bool enumerable) {
   for (uint64_t a = 0; a < indexed.count(); ++a) array_push(names, Value::make_string(o->props[indexed[a]].key));
   for (uint32_t i = 0; i < o->prop_count; ++i) {
     uint32_t n;
-    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n) && (enumerable || !is_identity_key(o->props[i].key->view())))
+    if (!o->props[i].key->symbol && ((o->props[i].flags & kEnumerable) != 0) == enumerable && !canonical_index(o->props[i].key->view(), &n) && (enumerable || (!is_identity_key(o->props[i].key->view()) && !(o == global_ && o->props[i].key->view().starts_with("__")))))
       array_push(names, Value::make_string(o->props[i].key));
   }
 }

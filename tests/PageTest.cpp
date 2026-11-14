@@ -3214,6 +3214,38 @@ static uint32_t node_of_text(Page& page, const char* text) {
   return 0;
 }
 
+// What a page sees when it looks at the platform's interfaces themselves, as scripts do that check what they run in (the attestation script of
+// YouTube among them): an object says which interface it is, the operations and accessors are called what they are and read as native code, an
+// operation's length is the number of arguments it needs, the members of an interface come before its constructor, and the host's own helpers
+// are not among the properties of the window.
+static void test_interface_surface() {
+  CHECK(run_page("<html><body><div id=d class=c style='color:red'>t</div><script>var T = function (v) { return Object.prototype.toString.call(v) }, d = document.getElementById('d');"
+                 "console.log(T(document.body), T(d), T(d.firstChild), T(new Event('x')), T(d.style), T(d.classList), T(document), T(window), String(document.body), String(d))"
+                 "</script></body></html>") ==
+        "[object HTMLBodyElement] [object HTMLDivElement] [object Text] [object Event] [object CSSStyleDeclaration] [object DOMTokenList] [object HTMLDocument] [object Window] [object HTMLBodyElement] [object HTMLDivElement]");
+  CHECK(run_page("<html><body><script>var get = Object.getOwnPropertyDescriptor(Document.prototype, 'body').get;"
+                 "console.log(document.createElement.name, get.name, String(document.createElement), String(get), String(window.setTimeout), /\\[native code\\]/.test(String(document.body.appendChild)))"
+                 "</script></body></html>") ==
+        "createElement get body function createElement() { [native code] } function get body() { [native code] } function setTimeout() { [native code] } true");
+  CHECK(run_page("<html><body><script>console.log([document.createElement.length, document.addEventListener.length, window.addEventListener.length, setTimeout.length, fetch.length,"
+                 "getComputedStyle.length, postMessage.length, document.body.cloneNode.length, document.body.insertBefore.length, document.body.setAttribute.length, XMLHttpRequest.prototype.open.length].join())"
+                 "</script></body></html>") == "1,2,2,1,1,1,1,0,2,2,2");
+  CHECK(run_page("<html><body><script>var names = function (C) { return Object.getOwnPropertyNames(C.prototype) };"
+                 "console.log(names(SpeechSynthesisEvent).join(), names(SpeechSynthesisErrorEvent).join(), names(SpeechSynthesisUtterance).slice(0, 7).join(), names(MediaMetadata).slice(0, 4).join(),"
+                 "['HTMLElement', 'Node', 'Event', 'Document', 'XMLHttpRequest', 'NetworkInformation'].map(function (n) { var all = names(window[n]); return all[all.length - 1] }).join())"
+                 "</script></body></html>") ==
+        "utterance,charIndex,charLength,elapsedTime,name,constructor error,constructor text,lang,voice,volume,rate,pitch,onstart title,artist,album,artwork "
+        "constructor,constructor,constructor,constructor,constructor,constructor");
+  CHECK(run_page("<html><body><script>var u = new SpeechSynthesisUtterance('hi'), e = new SpeechSynthesisErrorEvent('error', { utterance: u, error: 'network', charIndex: 3 }), m = new MediaMetadata({ title: 't', artist: 'a' });"
+                 "console.log(e instanceof SpeechSynthesisEvent, e instanceof Event, e.type, e.error, e.charIndex, e.utterance === u, e.elapsedTime, u.text, u.onstart, m.title, m.artist, m.album === '', Array.isArray(m.artwork));"
+                 "try { SpeechSynthesisEvent('x') } catch (x) { console.log(x.name) }"
+                 "</script></body></html>") == "true true error network 3 true 0 hi null t a true true | TypeError");
+  CHECK(run_page("<html><body><script>window.__mine = 1; var n = Object.getOwnPropertyNames(window);"
+                 "console.log(n.filter(function (x) { return x.indexOf('__') === 0 }).join(), n.indexOf('document') >= 0, n.indexOf('HTMLElement') >= 0, n.indexOf('setTimeout') >= 0, Object.keys(window).indexOf('__mine') >= 0);"
+                 "var seen = []; for (var k in window) if (k.indexOf('__') === 0) seen.push(k); console.log(seen.join())"
+                 "</script></body></html>") == "__mine true true true true | __mine");
+}
+
 static void test_iframe() {
   TestAllocator a;
   {   // srcdoc and src: the page of the frame is drawn between rules
@@ -7377,6 +7409,7 @@ int main(int argc, char** argv) {
   }
   if (getenv("ONLY_IFRAME")) {   // (just the frame tests)
     test_iframe();
+    test_interface_surface();
     printf(g_failed ? "%d check(s) failed\n" : "frame tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
@@ -7457,6 +7490,7 @@ int main(int argc, char** argv) {
   test_details_and_dialog();
   test_template();
   test_iframe();
+  test_interface_surface();
   test_svg();
   test_input_more();
   test_wpt();
