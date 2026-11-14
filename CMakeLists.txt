@@ -340,6 +340,8 @@ add_executable(BOOTX64
   src/FileSystem/Mount/MountTable.cpp
   src/FileSystem/Mount/GraftFileSystem.cpp
   src/FileSystem/Squash/SquashFileSystem.cpp
+  src/FileSystem/Dwarfs/DwarfsFileSystem.cpp
+  src/FileSystem/Dwarfs/DwarfsMetadata.cpp
   src/FileSystem/Iso/IsoFileSystem.cpp
   src/FileSystem/Fat/FatFileSystem.cpp
   src/FileSystem/Befs/BefsFileSystem.cpp
@@ -731,6 +733,7 @@ add_executable(BOOTX64
   src/Media/ImageCodecs.cpp
   src/Media/Zlib.cpp
   src/Media/Zstd.cpp
+  src/Media/Xxh3.cpp
   src/Media/Xz.cpp
   src/Media/Lz4.cpp
   src/Media/Lzo.cpp

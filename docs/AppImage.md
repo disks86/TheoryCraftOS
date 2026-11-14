@@ -8,10 +8,10 @@ does what the AppImage's own runtime would do, without running the runtime. It d
 `desktop::run_program` (src/Program/ProgramRunner.cpp) looks at every ELF it is asked to run. If the ELF carries the AppImage mark
 (`AI` and the type in bytes 8..10 of its identification), the runner hands it to `AppImageSession` (src/Program/AppImageLaunch.hpp):
 
-1. **Find the image.** For type 2, the SquashFS image starts where the runtime ELF ends. That is the end of its section header table or of
+1. **Find the image.** For type 2, the SquashFS (or, with uruntime, DwarFS) image starts where the runtime ELF ends. That is the end of its section header table or of
    its last section, whichever is later (`exe::appimage_payload_offset`, src/Executable/AppImage.hpp). A type 1 AppImage *is* an ISO 9660
    image, with the runtime in the 32 KiB system area that ISO 9660 leaves free, so its image starts at byte 0.
-2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash) or, for type 1, `IsoFileSystem` (src/FileSystem/Iso) reads the image straight
+2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash), `DwarfsFileSystem` (src/FileSystem/Dwarfs) or, for type 1, `IsoFileSystem` (src/FileSystem/Iso) reads the image straight
    from the AppImage file. A `GraftFileSystem`
    (src/FileSystem/Mount) places it at `/tmp/.mount_<first six characters of the name><id>` of the Linux world, the way the runtime names its
    mount point. The graft is the program's own view of the OS file system, so nothing else sees the mount and nothing is left behind. It
@@ -56,6 +56,23 @@ All SquashFS 4.0 features mksquashfs writes are read:
 Extended attributes and the export table are ignored. Decompressed metadata and data blocks are cached (32 and 8 blocks). Decompression
 runs outside the cache lock.
 
+## DwarFS
+
+AppImages built with [uruntime](https://github.com/VHSgunzo/uruntime), such as the "anylinux" builds of pkgforge-dev that the App Manager
+installs (FeatherPad and many others), carry a DwarFS image instead of SquashFS. `DwarfsFileSystem` reads format 2.3 to 2.5 (mkdwarfs
+0.5 and later):
+
+- the sections: data blocks, the metadata schema and the metadata, each checked against its XXH3-64 checksum (src/Media/Xxh3) when read;
+- block compression: none, Zstandard, LZMA (xz, with BCJ filters), LZ4 and LZ4HC;
+- the metadata (src/FileSystem/Dwarfs/DwarfsMetadata.cpp): the Thrift compact-encoded Frozen2 schema, the bit-packed structure it
+  describes, the packed directory, chunk and shared-file tables, and names and link targets compressed with FSST;
+- deduplicated files, holes, hard links (the same `file_id`), devices, FIFOs and sockets (listed as specials), entries without a name
+  (written by an mkdwarfs bug, skipped as DwarFS itself does), link targets written on Windows with `\`.
+
+The metadata is decoded once at mount into plain tables. Blocks are often 16 or 32 MiB; a few decompressed blocks (as many as fit 64 MiB,
+2 to 16) are cached. Brotli, FLAC and ricepp blocks give Unsupported when read. Older formats (2.2 and before) and images with a feature
+flag this reader does not know do not mount (Unsupported).
+
 ## ISO 9660
 
 `IsoFileSystem` reads the most capable tree an image has:
@@ -84,6 +101,10 @@ Files of several extents are read as one. Interleaved files, zisofs2 and sparse 
   - a type 1 `AppImageSession` (an xorriso image with the runtime written over its system area);
   - links leaving a SquashFS image through the graft: absolute targets, `..` above the root, out and back in, a loop between the two,
     listings, `stat` and `readlink` of such links.
+- `tests/run_host_tests.sh DwarfsTest` covers the DwarFS reader with the images of tests/data/dwarfs (from the DwarFS project, CC0),
+  compared with the contents and times its own tests expect; those images with their blocks re-compressed (liblzma, liblz4) or stored
+  plain; truncated and bit-flipped images and scrambled metadata with fixed-up checksums; 8 threads; XXH3 against libxxhash; a DwarFS
+  AppImage through `open_appimage_image`. `DwarfsTest --dump <file>` lists a DwarFS image or AppImage.
 - `ZstdTest` and `XzLz4Test` test the decoders against the zstd, xz and lz4 command-line tools and liblzo2.
 - `tests/appimage_qemu.sh` packs `tests/linux/appimagetest.c` (static) with a bash-style `AppRun` twice: as a type 2 AppImage
   (`/Desktop/Downloads/Hello.AppImage`) and as a type 1 (`Hello1.AppImage`, ISO 9660 from xorriso). The kernel autoruns each in a QEMU boot

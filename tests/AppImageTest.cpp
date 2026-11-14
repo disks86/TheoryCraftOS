@@ -1445,7 +1445,9 @@ static int real_appimage(int argc, char** argv) {
     UniquePointer<IFile> file;
     if (host.open_file(StringView(path.c_str()), OpenMode::Read, &file) != Status::Ok) { fprintf(stderr, "cannot open %s\n", path.c_str()); return 2; }
     uint64_t offset = 0;
-    if (!exe::appimage_payload_offset(*file, &offset)) { fprintf(stderr, "not a type 2 AppImage\n"); return 2; }
+    exe::AppImagePayload payload = exe::AppImagePayload::SquashFs;
+    if (!exe::appimage_payload_offset(*file, &offset, &payload)) { fprintf(stderr, "not a type 2 AppImage\n"); return 2; }
+    if (payload == exe::AppImagePayload::DwarFs) { fprintf(stderr, "a DwarFS AppImage: list it with DwarfsTest --dump\n"); return 2; }
     UniquePointer<SquashFileSystem> fs;
     const Status s = SquashFileSystem::mount(a, util::move(file), offset, &fs);
     if (s != Status::Ok) { fprintf(stderr, "mount: %s\n", status_name(s)); return 2; }

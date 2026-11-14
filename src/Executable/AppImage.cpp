@@ -60,7 +60,7 @@ AppImageType identify_appimage(ConstByteView head) {
   return AppImageType::None;
 }
 
-bool appimage_payload_offset(filesystem::IFile& file, uint64_t* offset) {
+bool appimage_payload_offset(filesystem::IFile& file, uint64_t* offset, AppImagePayload* payload) {
   uint8_t header[64];
   if (file.size() < sizeof(header) || !read_exact(file, 0, ByteView(header))) return false;
   if (identify_appimage(ConstByteView(header)) != AppImageType::Type2) return false;
@@ -82,10 +82,19 @@ bool appimage_payload_offset(filesystem::IFile& file, uint64_t* offset) {
   const uint64_t type = s.at(4, 4);
   if (type != 8 /* SHT_NOBITS */ && section_offset <= size && section_size <= size - section_offset && section_offset + section_size > end)
     end = section_offset + section_size;
-  uint8_t magic[4];
-  if (end > size || size - end < 96 || !read_exact(file, end, ByteView(magic))) return false;
-  if (magic[0] != 'h' || magic[1] != 's' || magic[2] != 'q' || magic[3] != 's') return false;
+  // A SquashFS superblock (96 bytes, "hsqs") or a DwarFS section header (64 bytes, "DWARFS").
+  uint8_t magic[6];
+  if (end > size || size - end < 64 || !read_exact(file, end, ByteView(magic))) return false;
+  AppImagePayload found;
+  if (magic[0] == 'h' && magic[1] == 's' && magic[2] == 'q' && magic[3] == 's' && size - end >= 96) {
+    found = AppImagePayload::SquashFs;
+  } else if (magic[0] == 'D' && magic[1] == 'W' && magic[2] == 'A' && magic[3] == 'R' && magic[4] == 'F' && magic[5] == 'S') {
+    found = AppImagePayload::DwarFs;
+  } else {
+    return false;
+  }
   *offset = end;
+  if (payload) *payload = found;
   return true;
 }
 
