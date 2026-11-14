@@ -250,13 +250,26 @@ bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t widt
   while (top->parent && !on_desktop(top)) top = top->parent;
   if (!redirected(top)) return false;
   if (!is_visible(w) || (top->style & wn::WS_MINIMIZE)) return true;      // (nothing shows: the frame is dropped, as a hidden window's would be)
-  sync_surface(top);
+  // the surface the window's tree draws on: the top-level's, or a mixed DPI child's own (in its units: win32k scales it into the top-level's)
+  Window* mixed = dpi_drawing_root(w);
+  if (!mixed || mixed == top || !mixed->dpi_mixed) mixed = nullptr;
+  uint32_t target = 0, k = 100;
+  Rect origin;
+  if (mixed) {
+    sync_mixed_surface(mixed);
+    target = mixed->child_surface;
+    k = window_scale(mixed);
+    origin = mixed_rect_units(mixed);
+  } else {
+    sync_surface(top);
+    target = top->surface;
+    k = window_scale(top);      // (an unaware window's surface is in its units)
+    origin = surface_rect_in_window_units(top);
+  }
   uint32_t sw = 0, sh = 0;
-  const ByteView surface = gdi::window_surface_bytes(top->surface, &sw, &sh);
+  const ByteView surface = gdi::window_surface_bytes(target, &sw, &sh);
   if (surface.empty()) return true;
   // the client area in surface coordinates (clipped to the surface); the picture is stretched over it (nearest pixel), or copied a row at a time when the sizes agree
-  const uint32_t k = window_scale(top);      // (an unaware window's surface is in its units)
-  const Rect origin = surface_rect_in_window_units(top);
   const Rect client = dpi_down(client_rect_screen(w), k);
   const int64_t cw = int64_t{client.right} - client.left, ch = int64_t{client.bottom} - client.top;
   const int64_t cx = int64_t{client.left} - origin.left, cy = int64_t{client.top} - origin.top;
@@ -285,7 +298,7 @@ bool present_to_window_locked(uint32_t hwnd, ConstByteView pixels, uint32_t widt
       dst[i * 4 + 3] = p[3];
     }
   }
-  gdi::window_surface_damaged(top->surface, gdi::Rect{int32_t(cx + x0), int32_t(cy + y0), int32_t(cx + x1), int32_t(cy + y1)});
+  gdi::window_surface_damaged(target, gdi::Rect{int32_t(cx + x0), int32_t(cy + y0), int32_t(cx + x1), int32_t(cy + y1)});
   return true;
 }
 

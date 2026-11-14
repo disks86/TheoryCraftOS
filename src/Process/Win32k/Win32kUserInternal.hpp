@@ -503,7 +503,8 @@ Window* dpi_drawing_root(Window* w);
 // A child's awareness when it is made or moved under `parent`: with default hosting it takes the tree's; with mixed hosting it keeps its own and is a
 // mixed child when that differs. False when `mixed_allowed` is false and they differ (SetParent's refusal).
 bool adopt_tree_awareness(Window* w, Window* parent, bool mixed_allowed);
-void sync_mixed_surface(Window* m);                       // a mixed child's own surface follows its size (a no-op for other windows)
+void sync_mixed_surface(Window* m);
+Rect mixed_rect_units(const Window* m);                   // a mixed child's surface rectangle: its window rectangle, in its own units on the screen                       // a mixed child's own surface follows its size (a no-op for other windows)
 void drop_mixed_surface(Window* m);
 void mixed_tree_changed(Window* top);                     // a window of the tree moved or changed: its mixed children are painted again
 Rect surface_rect_in_window_units(const Window* top);      // a redirected top-level's surface rectangle in its own coordinates (Win32kUserRedirect.cpp)

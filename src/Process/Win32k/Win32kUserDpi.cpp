@@ -157,8 +157,6 @@ bool adopt_tree_awareness(Window* w, Window* parent, bool mixed_allowed) {
   return true;
 }
 
-namespace {
-
 // A mixed child's surface rectangle: its window rectangle, in its own units.
 Rect mixed_rect_units(const Window* m) {
   const Rect r = window_rect_screen(m);
@@ -166,6 +164,8 @@ Rect mixed_rect_units(const Window* m) {
   return {dpi_down(r.left, k), dpi_down(r.top, k), dpi_down(r.left, k) + graphics::device_to_units_up(r.right - r.left, k),
           dpi_down(r.top, k) + graphics::device_to_units_up(r.bottom - r.top, k)};
 }
+
+namespace {
 
 template <typename F>
 void each_window_in(Window* w, F&& f) {

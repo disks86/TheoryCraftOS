@@ -1349,6 +1349,30 @@ void test_dpi_virtualization() {
       a2.svc(N::NtUserReleaseDC, {dc});
       if (sx >= 0 && sy >= 0 && sx + 21 < int32_t(vw) && sy + 21 < int32_t(vh)) CHECK((vp[uint64_t(sy + 5) * vw + uint64_t(sx + 5)] & 0xFFFFFF) == 0xFF0000);
     }
+    const bool inside = sx >= 0 && sy >= 0 && sx + 100 <= int32_t(vw) && sy + 80 <= int32_t(vh);
+    CHECK(inside);
+    auto shown = [&](int32_t x, int32_t y) { return inside ? vp[uint64_t(sy + y) * vw + uint64_t(sx + x)] & 0xFFFFFF : 0xDEADu; };
+    // a GPU present to it goes on its own surface, in its units, and shows scaled like its drawing
+    {
+      const uint8_t picture[16] = {0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255};      // B, G, R, A: red, green / blue, white
+      CHECK(user::present_to_window_locked(mixed, ConstByteView(picture, 16), 2, 2, 8, false));
+      uint32_t pw = 0, ph = 0;
+      const ArrayView<uint32_t> mp = gdi::window_surface_pixels(mw->child_surface, &pw, &ph);
+      CHECK(pw == 50 && (mp[0] & 0xFFFFFF) == 0xFF0000 && (mp[uint64_t(39) * pw + 49] & 0xFFFFFF) == 0xFFFFFF);
+      CHECK(shown(0, 0) == 0xFF0000 && shown(99, 0) == 0x00FF00 && shown(0, 79) == 0x0000FF && shown(99, 79) == 0xFFFFFF);
+    }
+    // its window region (its units) shapes its scaled pixels: the aware window's own picture shows where the region leaves out
+    {
+      const uint32_t rgn = m4.svc32(N::NtGdiCreateRectRgn, {0, 0, 25, 40});
+      CHECK(m4.svc32(N::NtUserSetWindowRgn, {mixed, rgn, 0}) != 0);
+      pump(m4);
+      const uint32_t dc = a2.svc32(N::NtUserGetDCEx, {v, 0, 0});
+      const uint64_t brush = a2.svc(N::NtGdiCreateSolidBrush, {0x00FFFF, 0});
+      a2.svc(N::NtGdiSelectBrush, {dc, brush});
+      a2.svc32(N::NtGdiPatBlt, {dc, 0, 0, 400, 300, 0xF00021});
+      a2.svc(N::NtUserReleaseDC, {dc});
+      CHECK(shown(5, 5) == 0xFF0000 && shown(49, 79) == 0x0000FF && shown(50, 5) == 0xFFFF00 && shown(99, 79) == 0xFFFF00);
+    }
     // a top-level again: no longer mixed
     CHECK(m4.svc32(N::NtUserSetParent, {mixed, 0}) != 0 || true);
     m4.svc(N::NtUserDestroyWindow, {mixed});
