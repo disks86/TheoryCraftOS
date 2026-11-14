@@ -754,6 +754,23 @@ export GTK_PATH="$APPDIR//usr/lib/x86_64-linux-gnu/gtk-3.0:/usr/lib64/gtk-3.0"
 static const char* kQtHook = "export QT_PLUGIN_PATH=\"$APPDIR/usr/plugins\"\nexport QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-xcb}\n";
 
 static void test_apprun() {
+  // Subshells keep what they change: sharun's AppRun.sh hooks do `$(set -- "$APPDIR"/*.desktop; echo "${1##*/}")` and then `exec "$@"`.
+  {
+    Run r;
+    put_file(r.fs, std::string(kMount) + "/AppRun", "#!/bin/sh\n"
+             "desktop=$(set -- \"$APPDIR\"/*.desktop; echo \"${1##*/}\")\n"
+             "( set -- z; cd /; X=inner )\n"
+             "dir=$(cd /tmp; pwd)\n"
+             "Y=$(Z=sub; echo \"$Z\")\n"
+             "set -- \"$APPDIR/bin/app\" \"$@\" \"$desktop\" \"$dir\" \"${X:-unset}\" \"${Z:-unset}\" \"$Y\"\n"
+             "exec \"$@\"\n");
+    put_file(r.fs, std::string(kMount) + "/bin/app", kElf);
+    put_file(r.fs, std::string(kMount) + "/app.desktop", "[Desktop Entry]\n");
+    r.go("/tmp/.mount_t/AppRun", {"/tmp/x.txt"});
+    CHECK(r.result == AppRunResult::Launch);
+    CHECK(r.program == "/tmp/.mount_t/bin/app");
+    CHECK((r.args == std::vector<std::string>{"/tmp/x.txt", "app.desktop", "/tmp", "unset", "unset", "sub"}));
+  }
   // An ELF AppRun, and a link to one: the program itself, links resolved.
   {
     Run r;

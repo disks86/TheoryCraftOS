@@ -432,6 +432,11 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   if (files_) {
     process->attach_file_system(allocator_, *files_);
     if (!working_directory_.empty()) process->files().change_directory(working_directory_.view());
+    if (binding.abi == SyscallAbi::Linux) {      // (/proc/self/exe)
+      const StringView given = !executable_path_.empty() ? executable_path_.view() : (arguments.size() > 0 && arguments[0].starts_with('/') ? arguments[0] : StringView());
+      String clean(allocator_);
+      if (!given.empty() && process->files().resolve_from("/", given, &clean) == PathResult::Ok) process->files().set_executable(clean.view());
+    }
   }
   modules_ = static_cast<UniquePointer<ModuleSet>&&>(loaded_modules);
   start_ = ProgramStart{binding.arch, image.entry, stack_pointer, argument, argument2, fs_base, gs_base};

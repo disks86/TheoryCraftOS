@@ -58,6 +58,36 @@ with a message that names the interpreter.
   `libc.so.6`, `libm.so.6`, `libwayland-client.so.0`, `libxkbcommon.so.0` and `libffi.so.8` added to a copy of `primary.img`. dynamictest passed
   21/21 with native threads; wl_client passed 24/24 (`--parallel --screen=any`).
 
+## /proc/self and links
+
+There is no /proc file system, but the links programs read to find themselves are answered (src/Process/LinuxFiles.cpp): `/proc/self/exe`
+(the program file, links resolved: what Rust's `current_exe`, glibc's `$ORIGIN` and AppImage launchers like sharun use), `/proc/self/cwd`,
+`/proc/self/root` and `/proc/self/fd/<n>`, also as `/proc/<own pid>/...` and `/proc/thread-self/...`. Opening or `stat`ing a path through
+`exe`, `cwd` or `root` reaches the file itself. `readlink` returns the targets of the file tree's symbolic links, and `lstat`, `newfstatat`
+and `statx` with `AT_SYMLINK_NOFOLLOW` report links as links. Tests: `ProcessFilesTest` (links, /proc/self, execve with a recording runtime)
+and `tests/exec_qemu.sh` (tests/linux/exectest.c on the real kernel: readlink, lstat, an exec of itself with a kept and a close-on-exec
+descriptor, the exit code coming back).
+
+## /bin/sh
+
+The Linux tree's `/bin/sh` and `/bin/bash` are markers (a first line of `#!tcos-builtin-shell`, made by `prepare_program_folders` only where
+nothing is), not programs. `execve` of one with a script (`sh [options] script args`, or a `#!/bin/sh` script) runs the script with the OS's own
+shell (src/Program/AppRunScript.hpp, installed by `desktop::install_linux_builtin_shell` at boot), then execs the program the script finally starts;
+a script that starts nothing ends the program with 0. A real shell binary (named `sh`, `bash`, `dash` or `ash`) asked to run a script gets the
+same treatment, since without `fork` it could not get past its first `$( )`; with `-c` or interactively it runs as itself. `$( )` and `( )` are
+subshells in the built-in shell: what they change of the variables, `"$@"` and the folder stays in them.
+
+The file systems keep no Unix permissions, so `stat` reports every file as executable (0755, or 0555 read-only), as Linux shows a FAT volume with
+the default masks and as `access(X_OK)` already answered. Launchers check the bit before they run a program or a shell (sharun's `is_exe`).
+
+## Fonts
+
+The OS's fonts are built into the kernel (src/Font), so Linux programs, whose fontconfig looks for font files, would find none and draw every
+letter as a box. Before a Linux program starts, `font::write_bundled_fonts` (src/Font/FontFiles.hpp) writes them, decoded to TrueType, to
+`/usr/share/fonts/TheoryCraftOS` of the Linux tree (TCOS Sans, Serif and Mono in four styles, and the fallback face); files already there are
+kept, so this costs a `stat` each after the first time. There is no `/etc/fonts/fonts.conf`: programs that bring their own (AppImages do) find the
+fonts, others depend on fontconfig's built-in defaults.
+
 ## Not done
 
 - **x86-64 only in practice.** The loader is not specific to x86-64, but the development machine has no AArch64 or RISC-V C library to test with.
@@ -66,6 +96,9 @@ with a message that names the interpreter.
   file written after it was mapped is not seen through the mapping. Shared writable file mappings are not supported.
 - **No vDSO** (`AT_SYSINFO_EHDR`): glibc makes real system calls for `clock_gettime` and `gettimeofday`.
 - **No `/etc/ld.so.cache`, no `ldconfig`.** Only the interpreter's built-in directories, `LD_LIBRARY_PATH` and `RUNPATH` are searched.
-- **No `execve` of a dynamic program from a program**, as for static ones (programs are started by the desktop and the shell).
+- **`execve` starts a new process.** `execve`/`execveat` (src/Process/LinuxExec.cpp) start the new image as a child process with exactly the
+  arguments and environment given, the current folder and every descriptor that is not close-on-exec; the old program closes what it had,
+  stops its other threads, waits and ends with the new program's code. So the process id changes across an exec, and a parent waiting on the
+  old id sees the new program's result. `#!` scripts run their interpreter. There is no `fork`, `vfork` or `wait4`.
 - **Not tried yet:** a whole distribution's programs (GTK applications, foot) inside the OS. They need more libraries in the image and more system
   calls, which will show up as they are tried.

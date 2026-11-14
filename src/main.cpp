@@ -163,6 +163,7 @@
 #endif
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
+#include "Program/AppRunScript.hpp"
 #include "Program/EmulatedTask.hpp"
 #include "Program/ProgramRunner.hpp"
 #include "SystemFileSystem.hpp"
@@ -837,6 +838,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   static opengl::GlService system_gl(shared_allocator);
   opengl::install_windows_gl(system_gl);
   opengl::install_linux_gl(system_gl);
+  desktop::install_linux_builtin_shell();      // (the Linux tree's /bin/sh: launcher scripts run by the OS's own shell)
   system_gl.set_report([](uint64_t pid, const webgl::GlContext::HardwareStats& stats) {
     Entry e(Level::Info, "OpenGL");
     e.text("process ").dec(pid).text(": ").dec(stats.gpu_draws).text(" draws on the GPU, ").dec(stats.cpu_draws).text(" on the CPU");
@@ -2343,10 +2345,19 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
           arguments[count++] = end == StringView::npos ? rest : rest.first(end);
           rest = end == StringView::npos ? StringView() : rest.without_prefix(end + 1);
         }
+        StringView variables[32];      // (TCOS_AUTORUN_ENVIRONMENT, separated the same way)
+        uint32_t variable_count = 0;
+        rest = StringView(TCOS_AUTORUN_ENVIRONMENT);
+        while (!rest.empty() && variable_count < 32) {
+          const uint64_t end = rest.find('\x1f');
+          variables[variable_count++] = end == StringView::npos ? rest : rest.first(end);
+          rest = end == StringView::npos ? StringView() : rest.without_prefix(end + 1);
+        }
         desktop::ProgramRun run;
         run.allocator = a.allocator;
         run.files = a.files;
         run.path = TCOS_AUTORUN;
+        run.extra_environment = ArrayView<const StringView>(variables, variable_count);
         const uint64_t slash = run.path.rfind('/');
         run.working_directory = slash == StringView::npos ? StringView("/") : run.path.first(slash);
         run.arguments = ArrayView<const StringView>(arguments, count);

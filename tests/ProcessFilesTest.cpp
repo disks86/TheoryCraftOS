@@ -26,6 +26,7 @@
 #include "Process/LinuxFiles.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Process.hpp"
+#include "Process/LinuxExec.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
@@ -702,7 +703,7 @@ struct NoWaitSync final : ISystemSync {
 static void test_change_notifications() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
-  NoWaitSync sync;
+  static NoWaitSync sync;      // (static: the system's unix socket manager, made on first use, keeps the sync of the objects it was made with)
   ObjectManager objects(sync);
   objects.set_allocator(&A);
   set_system_objects(&objects);
@@ -781,7 +782,7 @@ static std::vector<NotifyRecord> notify_records(NtRig& rig, uint64_t at, uint64_
 static void test_read_directory_changes() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
-  NoWaitSync sync;
+  static NoWaitSync sync;      // (static: the system's unix socket manager, made on first use, keeps the sync of the objects it was made with)
   ObjectManager objects(sync);
   objects.set_allocator(&A);
   set_system_objects(&objects);
@@ -834,7 +835,7 @@ static void test_read_directory_changes() {
 static void test_mailslots() {
   filesystem::RamFileSystem fs(A);
   populate(fs);
-  NoWaitSync sync;
+  static NoWaitSync sync;      // (static: the system's unix socket manager, made on first use, keeps the sync of the objects it was made with)
   ObjectManager objects(sync);
   objects.set_allocator(&A);
   set_system_objects(&objects);
@@ -897,6 +898,286 @@ static void test_mailslots() {
   set_system_objects(nullptr);
 }
 
+// Symbolic links of the file tree as Linux sees them (readlink, lstat, statx without following) and the links of /proc/self.
+static void test_linux_links_and_proc() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  CHECK(fs.create_directory("/Linux/opt") == Status::Ok && fs.create_directory("/Linux/opt/app") == Status::Ok && fs.create_directory("/Linux/opt/app/bin") == Status::Ok);
+  make_file(fs, "/Linux/opt/app/bin/tool", "\x7f" "ELFtool");
+  CHECK(fs.create_symbolic_link("/Linux/opt/current", "app", true) == Status::Ok);                   // relative, to a folder
+  CHECK(fs.create_symbolic_link("/Linux/usr-tool", "/Linux/opt/current/bin/tool", false) == Status::Ok);  // (the RAM file system's own absolute target)
+  CHECK(fs.create_symbolic_link("/Linux/opt/app/bin/up", "../../current/bin/tool", false) == Status::Ok);
+  CHECK(fs.create_symbolic_link("/Linux/loop1", "loop2", false) == Status::Ok && fs.create_symbolic_link("/Linux/loop2", "loop1", false) == Status::Ok);
+  CHECK(fs.create_symbolic_link("/Linux/dangling", "nowhere", false) == Status::Ok);
+  Rig rig(SyscallAbi::Linux, fs);
+  Process& p = *rig.process;
+  const uint64_t buf = rig.alloc(256);
+  auto readlink = [&](const char* path, uint64_t size = 256) { return sres(p.syscall(lin(89, rig.str(path), buf, size))); };
+
+  // readlink: the stored target, cut to the buffer, no NUL; EINVAL for what is no link; ENOENT for what does not exist.
+  CHECK(readlink("/opt/current") == 3 && rig.bytes(buf, 3) == "app");
+  CHECK(readlink("/opt/current", 2) == 2 && rig.bytes(buf, 2) == "ap");
+  CHECK(readlink("/opt/current", 0) == -22);
+  CHECK(readlink("/opt/app/bin/up") == 22 && rig.bytes(buf, 22) == "../../current/bin/tool");
+  CHECK(readlink("/opt/current/bin/up") == 22);                                       // (through a linked folder)
+  CHECK(readlink("/dangling") == 7 && rig.bytes(buf, 7) == "nowhere");
+  CHECK(readlink("/etc/motd") == -22 && readlink("/etc") == -22 && readlink("/nothing") == -2);
+  CHECK(sres(p.syscall(lin(267, kAtFdCwd, rig.str("/opt/current"), buf, 256))) == 3);  // readlinkat
+  const int64_t opt = sres(p.syscall(lin(2, rig.str("/opt"), 0x10000)));
+  CHECK(opt >= 3 && sres(p.syscall(lin(267, opt, rig.str("current"), buf, 256))) == 3);
+  CHECK(sres(p.syscall(lin(267, opt, rig.str("current"), 0xDEAD0000, 256))) == -14);    // EFAULT
+
+  // lstat sees the link (S_IFLNK, the target's length as its size), stat what it points at; statx likewise with AT_SYMLINK_NOFOLLOW.
+  const uint64_t st = rig.alloc(144);
+  auto mode = [&]() { return uint32_t(rig.u64(st + 24) & 0xFFFFFFFFu); };
+  auto size = [&]() { return rig.u64(st + 48); };
+  CHECK(p.syscall(lin(6, rig.str("/opt/current"), st)) == 0 && (mode() & 0170000) == 0120000 && size() == 3);
+  CHECK(p.syscall(lin(4, rig.str("/opt/current"), st)) == 0 && (mode() & 0170000) == 0040000);
+  CHECK(p.syscall(lin(262, kAtFdCwd, rig.str("/opt/app/bin/up"), st, 0x100)) == 0 && (mode() & 0170000) == 0120000 && size() == 22);
+  CHECK(p.syscall(lin(262, kAtFdCwd, rig.str("/opt/app/bin/up"), st, 0)) == 0 && (mode() & 0170000) == 0100000 && size() == 8);
+  CHECK(p.syscall(lin(6, rig.str("/dangling"), st)) == 0 && (mode() & 0170000) == 0120000);       // a dangling link still has an lstat
+  CHECK(sres(p.syscall(lin(4, rig.str("/dangling"), st))) == -2);
+  CHECK(p.syscall(lin(6, rig.str("/etc/motd"), st)) == 0 && (mode() & 0170000) == 0100000);        // (no link: as stat)
+  CHECK((mode() & 0777) == 0755);      // (no Unix permissions are kept: every file may be run, as access(X_OK) says)
+  const uint64_t sx = rig.alloc(256);
+  CHECK(p.syscall(lin(332, kAtFdCwd, rig.str("/opt/current"), 0x100, 0x7FF, sx)) == 0 && (rig.u64(sx + 24) >> 32 & 0170000) == 0120000);
+  CHECK(p.syscall(lin(332, kAtFdCwd, rig.str("/opt/current"), 0, 0x7FF, sx)) == 0 && (rig.u64(sx + 24) >> 32 & 0170000) == 0040000);
+
+  // canonical(): every link replaced, the last one too, ".." taken after each link; loops end.
+  String out(A);
+  CHECK(p.files().canonical("/opt/app/bin/up", &out) == Status::Ok && std::string(out.view().data(), out.view().size()) == "/opt/app/bin/tool");
+  CHECK(p.files().canonical("/opt/current/bin/../bin/tool", &out) == Status::Ok && std::string(out.view().data(), out.view().size()) == "/opt/app/bin/tool");
+  CHECK(p.files().canonical("/dangling", &out) == Status::Ok && std::string(out.view().data(), out.view().size()) == "/nowhere");
+  CHECK(p.files().canonical("/loop1", &out) == Status::TooManyLinks);
+  CHECK(p.files().canonical("/etc/motd", &out) == Status::Ok && std::string(out.view().data(), out.view().size()) == "/etc/motd");
+
+  // /proc/self/exe: unknown until the program file is set; then the file with its links resolved, also by the process's number and as thread-self.
+  CHECK(readlink("/proc/self/exe") == -2);
+  CHECK(p.files().set_executable("/opt/current/bin/up"));
+  CHECK(readlink("/proc/self/exe") == 17 && rig.bytes(buf, 17) == "/opt/app/bin/tool");
+  CHECK(readlink("/proc/1/exe") == 17 && readlink("/proc/thread-self/exe") == 17);
+  CHECK(readlink("/proc/2/exe") == -2 && readlink("/proc/self/nothing") == -2 && readlink("/proc/self") == -2);
+  CHECK(p.syscall(lin(6, rig.str("/proc/self/exe"), st)) == 0 && (mode() & 0170000) == 0120000);   // lstat: a link
+  CHECK(p.syscall(lin(4, rig.str("/proc/self/exe"), st)) == 0 && (mode() & 0170000) == 0100000 && size() == 8);      // stat: the file
+  int64_t fd = sres(p.syscall(lin(2, rig.str("/proc/self/exe"), 0)));                    // open: the file itself
+  CHECK(fd >= 3 && p.syscall(lin(0, fd, buf, 4)) == 4 && rig.bytes(buf, 4) == "\x7f" "ELF");
+  // /proc/self/fd/<n>, /proc/self/cwd, /proc/self/root.
+  CHECK(readlink((std::string("/proc/self/fd/") + std::to_string(fd)).c_str()) == 17 && rig.bytes(buf, 17) == "/opt/app/bin/tool");
+  CHECK(readlink("/proc/self/fd/0") == 10 && rig.bytes(buf, 10) == "/dev/pts/0");
+  CHECK(readlink("/proc/self/fd/999") == -2 && readlink("/proc/self/fd/x") == -2);
+  CHECK(p.syscall(lin(80, rig.str("/etc"))) == 0 && readlink("/proc/self/cwd") == 4 && rig.bytes(buf, 4) == "/etc");
+  CHECK(readlink("/proc/self/root") == 1);
+  const int64_t motd = sres(p.syscall(lin(2, rig.str("/proc/self/cwd/motd"), 0)));      // (a path through /proc/self/cwd)
+  CHECK(motd >= 3 && p.syscall(lin(0, motd, buf, 7)) == 7 && rig.bytes(buf, 7) == "welcome");
+  p.syscall(lin(3, motd));
+  p.syscall(lin(3, fd));
+  p.syscall(lin(3, opt));
+}
+
+// A runtime that records what execve asks it to start, and says the new program ended with 42 after a few looks.
+struct ExecRuntime final : IProcessRuntime {
+  std::vector<std::string> arguments, environment;
+  std::string image_path, executable_path, directory;
+  std::string image;
+  bool linux_exec = false, spawned = false;
+  uint32_t spawn_status = 0;
+  int looks = 0;
+  std::vector<uint64_t> terminated;
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t) override { return false; }
+  void notify() override {}
+  bool interrupted() override { return false; }
+  bool start_thread(const ThreadStart&, bool) override { return false; }
+  bool resume_thread(uint64_t) override { return false; }
+  uint64_t current_thread_id() override { return 1; }
+  void request_terminate(uint64_t id, uint32_t) override { terminated.push_back(id); }
+  uint64_t allocate_process_id() override { return 77; }
+  uint32_t spawn_process(const ChildSpec& spec) override {
+    if (spawn_status) return spawn_status;
+    spawned = true;
+    arguments.clear();
+    environment.clear();
+    for (const StringView& a : spec.arguments) arguments.push_back(std::string(a.data(), a.size()));
+    for (const StringView& e : spec.environment) environment.push_back(std::string(e.data(), e.size()));
+    image_path.assign(spec.image_path.data(), spec.image_path.size());
+    executable_path.assign(spec.executable_path.data(), spec.executable_path.size());
+    directory.assign(spec.working_directory.data(), spec.working_directory.size());
+    image.assign(reinterpret_cast<const char*>(spec.image.data()), spec.image.size());
+    linux_exec = spec.linux_exec;
+    return 0;
+  }
+  bool query_child(uint64_t pid, bool* exited, uint32_t* code) override {
+    if (pid != 77) return false;
+    *exited = ++looks >= 3;
+    *code = 42;
+    return true;
+  }
+};
+
+// Puts a NULL-terminated array of strings in the program's memory.
+static uint64_t vector_of(Rig& rig, const std::vector<std::string>& strings) {
+  std::vector<uint64_t> pointers;
+  for (const std::string& s : strings) pointers.push_back(rig.str(s));
+  const uint64_t at = rig.alloc(8 * (pointers.size() + 1));
+  for (size_t i = 0; i < pointers.size(); ++i) CHECK(rig.process->write_user_u64(at + 8 * i, pointers[i]));
+  CHECK(rig.process->write_user_u64(at + 8 * pointers.size(), 0));
+  return at;
+}
+
+// The stand-in for the OS's shell (src/Program/AppRunScript): what it was asked to run, and a scripted answer.
+static std::string g_shell_script;
+static std::vector<std::string> g_shell_arguments, g_shell_environment;
+static int fake_shell(allocators::IAllocator&, filesystem::IFileSystem& files, StringView world_root, StringView script, ArrayView<const StringView> arguments,
+                      ArrayView<const StringView> environment, String* program, List<String>* program_arguments, List<String>* program_environment) {
+  (void)files;
+  CHECK(world_root.equals("/Linux"));
+  g_shell_script.assign(script.data(), script.size());
+  g_shell_arguments.clear();
+  g_shell_environment.clear();
+  for (const StringView& a : arguments) g_shell_arguments.push_back(std::string(a.data(), a.size()));
+  for (const StringView& e : environment) g_shell_environment.push_back(std::string(e.data(), e.size()));
+  if (g_shell_script == "/app/quiet") return 0;      // a script that starts nothing
+  String a(A), e(A);
+  CHECK(program->assign("/app/prog") && a.assign("from the script") && program_arguments->push_back(static_cast<String&&>(a)) && e.assign("S=1") &&
+        program_environment->push_back(static_cast<String&&>(e)));
+  return 1;
+}
+
+static void test_linux_execve() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  const std::string elf = std::string("\x7f" "ELF\x02\x01\x01\x00", 8) + std::string(56, '\0');
+  CHECK(fs.create_directory("/Linux/bin") == Status::Ok && fs.create_directory("/Linux/app") == Status::Ok);
+  make_file(fs, "/Linux/bin/sh", elf);
+  make_file(fs, "/Linux/app/prog", elf);
+  make_file(fs, "/Linux/app/script", "#!/bin/sh -e\necho hi\n");
+  make_file(fs, "/Linux/app/script2", "#! /app/script  \r\n");
+  make_file(fs, "/Linux/app/text", "plain text");
+  make_file(fs, "/Linux/app/self1", "#!/app/self2\n");
+  make_file(fs, "/Linux/app/self2", "#!/app/self1\n");
+  CHECK(fs.create_symbolic_link("/Linux/app/link", "prog", false) == Status::Ok);
+  const uint64_t execve = 59;
+
+  {      // a program: its exact arguments and environment, the current folder, /proc/self/exe with links resolved; the old program waits and takes its code
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    CHECK(p.syscall(lin(80, rig.str("/app"))) == 0);
+    const int64_t keep = sres(p.syscall(lin(2, rig.str("/etc/motd"), 0)));
+    const int64_t drop = sres(p.syscall(lin(2, rig.str("/etc/motd"), 0x80000)));      // O_CLOEXEC
+    CHECK(keep >= 3 && drop > keep && p.files().close_on_exec(uint64_t(drop)) && !p.files().close_on_exec(uint64_t(keep)));
+    // what inherit_for_exec gives the new program's table: the one without close-on-exec, at its number
+    ProcessFiles child(PathStyle::Posix);
+    child.attach(A, fs, "/Linux");
+    CHECK(child.inherit_for_exec(p.files(), nullptr) >= 1);
+    CHECK(child.kind(uint64_t(keep)) != DescriptorKind::Closed && child.kind(uint64_t(drop)) == DescriptorKind::Closed);
+    child.close(uint64_t(keep));
+    CHECK(p.syscall(lin(execve, rig.str("link"), vector_of(rig, {"prog", "a b", ""}), vector_of(rig, {"A=1", "PATH=/bin"}))) == 0);
+    CHECK(runtime.spawned && runtime.linux_exec);
+    CHECK((runtime.arguments == std::vector<std::string>{"prog", "a b", ""}));
+    CHECK((runtime.environment == std::vector<std::string>{"A=1", "PATH=/bin"}));
+    CHECK(runtime.executable_path == "/app/prog" && runtime.image_path == "/app/prog" && runtime.directory == "/app" && runtime.image == elf);
+    CHECK(p.exited() && p.exit_code() == 42 && runtime.looks == 3);
+    CHECK(p.files().kind(uint64_t(keep)) == DescriptorKind::Closed && p.files().kind(0) == DescriptorKind::Closed);      // (all closed: they live on in the new program)
+  }
+  {      // scripts: the interpreter, its argument, the script as named, then argv[1...]; a script of a script; a loop of scripts
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    CHECK(p.syscall(lin(execve, rig.str("/app/script"), vector_of(rig, {"script", "x"}), 0)) == 0);
+    CHECK((runtime.arguments == std::vector<std::string>{"/bin/sh", "-e", "/app/script", "x"}) && runtime.executable_path == "/bin/sh" && runtime.environment.empty());
+  }
+  {
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    CHECK(p.syscall(lin(322, kAtFdCwd, rig.str("/app/script2"), vector_of(rig, {"s2", "y"}), vector_of(rig, {}), 0)) == 0);      // execveat
+    CHECK((runtime.arguments == std::vector<std::string>{"/bin/sh", "-e", "/app/script", "/app/script2", "y"}));
+  }
+  {      // errors leave the program as it was
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    const uint64_t args = vector_of(rig, {"x"});
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/nothing"), args, 0))) == -2);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app"), args, 0))) == -13);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/text"), args, 0))) == -8);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/self1"), args, 0))) == -40);
+    CHECK(sres(p.syscall(lin(execve, 0xDEAD0000, args, 0))) == -14);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/prog"), 0xDEAD0000, 0))) == -14);
+    const uint64_t bad = rig.alloc(16);
+    CHECK(rig.process->write_user_u64(bad, 0xDEAD0000) && rig.process->write_user_u64(bad + 8, 0));
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/prog"), args, bad))) == -14);
+    CHECK(sres(p.syscall(lin(322, kAtFdCwd, rig.str("/app/prog"), args, 0, 0x8000))) == -22);      // an unknown flag
+    runtime.spawn_status = 0xC0000002u;
+    CHECK(sres(p.syscall(lin(execve, rig.str("/app/prog"), args, 0))) == -38);
+    CHECK(!runtime.spawned && !p.exited() && p.files().kind(0) != DescriptorKind::Closed);
+  }
+  {      // /bin/sh is the built-in shell: prepare_program_folders makes the marker (keeping a real shell), execve runs the script with it and execs what it starts
+    filesystem::RamFileSystem other(A);
+    CHECK(other.create_directory("/Linux") == Status::Ok && other.create_directory("/Linux/bin") == Status::Ok);
+    make_file(other, "/Linux/bin/bash", "real bash");
+    CHECK(prepare_program_folders(other));
+    CHECK(read_file(other, "/Linux/bin/bash") == "real bash" && read_file(other, "/Linux/bin/sh").rfind("#!tcos-builtin-shell\n", 0) == 0);
+    make_file(fs, "/Linux/bin/sh", read_file(other, "/Linux/bin/sh"));      // (this tree had a stand-in ELF there: the marker replaces it)
+    make_file(fs, "/Linux/bin/bash", read_file(other, "/Linux/bin/sh"));
+    make_file(fs, "/Linux/app/launcher", "#!/bin/sh -e\nexec /app/prog\n");
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    const uint64_t env = vector_of(rig, {"APPDIR=/app"});
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh", "/app/launcher"}), env))) == -8);      // no shell installed
+    process::linuxabi::install_builtin_shell(fake_shell);
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh"}), env))) == -8);                       // no script
+    CHECK(sres(p.syscall(lin(execve, rig.str("/bin/sh"), vector_of(rig, {"sh", "-c", "echo"}), env))) == -8);        // no command strings
+    CHECK(!runtime.spawned && !p.exited());
+    CHECK(p.syscall(lin(execve, rig.str("/app/launcher"), vector_of(rig, {"launcher", "x y"}), env)) == 0);
+    CHECK(g_shell_script == "/app/launcher" && (g_shell_arguments == std::vector<std::string>{"x y"}) && (g_shell_environment == std::vector<std::string>{"APPDIR=/app"}));
+    CHECK(runtime.spawned && (runtime.arguments == std::vector<std::string>{"/app/prog", "from the script"}) && (runtime.environment == std::vector<std::string>{"S=1"}));
+    CHECK(runtime.executable_path == "/app/prog" && p.exited() && p.exit_code() == 42);
+  }
+  {      // a real shell (by name) asked to run a script: the built-in shell runs it; with -c the real one runs
+    make_file(fs, "/Linux/app/dash", elf);
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    CHECK(p.syscall(lin(execve, rig.str("/app/dash"), vector_of(rig, {"dash", "-e", "/app/launcher", "q"}), 0)) == 0);
+    CHECK(g_shell_script == "/app/launcher" && (g_shell_arguments == std::vector<std::string>{"q"}) && runtime.executable_path == "/app/prog");
+  }
+  {
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    g_shell_script.clear();
+    CHECK(p.syscall(lin(execve, rig.str("/app/dash"), vector_of(rig, {"dash", "-c", "true"}), 0)) == 0);
+    CHECK(g_shell_script.empty() && runtime.executable_path == "/app/dash" && (runtime.arguments == std::vector<std::string>{"dash", "-c", "true"}));
+  }
+  {      // a script that starts nothing: the program ends there, with 0
+    Rig rig(SyscallAbi::Linux, fs);
+    Process& p = *rig.process;
+    ExecRuntime runtime;
+    p.attach_runtime(&runtime);
+    make_file(fs, "/Linux/app/quiet", "#!/bin/bash\necho\n");
+    CHECK(p.syscall(lin(execve, rig.str("/bin/bash"), vector_of(rig, {"bash", "--norc", "--", "/app/quiet", "a"}), 0)) == 0);
+    CHECK(g_shell_script == "/app/quiet" && (g_shell_arguments == std::vector<std::string>{"a"}));
+    CHECK(!runtime.spawned && p.exited() && p.exit_code() == 0 && p.files().kind(0) == DescriptorKind::Closed);
+    process::linuxabi::install_builtin_shell(nullptr);
+  }
+  {      // without a runtime there is no other process to become
+    Rig rig(SyscallAbi::Linux, fs);
+    CHECK(sres(rig.process->syscall(lin(execve, rig.str("/app/prog"), vector_of(rig, {"p"}), 0))) == -38);
+    CHECK(!rig.process->exited());
+  }
+}
+
 // Garbage in the program's memory and wild pointers in the arguments must only ever produce errors.
 static void test_hostile_arguments() {
   filesystem::RamFileSystem fs(A);
@@ -916,7 +1197,7 @@ static void test_hostile_arguments() {
       for (int i = 0; i < 6; ++i) a[i] = (next() % 4 == 0) ? next() : 0x20000 + next() % 0x800;
       for (int i = 0; i < 12; ++i) rig.process->write_user_u64(0x1F000 + 0x28 + i * 8, (next() % 3 == 0) ? next() : 0x20000 + next() % 0x800);
       if (abi == SyscallAbi::Linux) {
-        static const uint16_t numbers[] = {0, 1, 2, 3, 4, 5, 8, 16, 17, 18, 19, 20, 21, 72, 76, 77, 78, 79, 80, 82, 83, 84, 87, 217, 257, 258, 262, 263, 264, 267, 269, 316, 332};
+        static const uint16_t numbers[] = {0, 1, 2, 3, 4, 5, 6, 8, 16, 17, 18, 19, 20, 21, 59, 72, 76, 77, 78, 79, 80, 82, 83, 84, 87, 89, 217, 257, 258, 262, 263, 264, 267, 269, 316, 322, 332};
         r.number = numbers[next() % (sizeof(numbers) / sizeof(numbers[0]))];
         a[0] = (next() % 2) ? next() % 40 : a[0];
       } else {
@@ -933,6 +1214,8 @@ int main() {
   test_paths();
   test_prepare();
   test_linux_files();
+  test_linux_links_and_proc();
+  test_linux_execve();
   test_dxg_device();
   test_windows_files();
   test_change_notifications();

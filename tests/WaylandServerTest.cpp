@@ -4175,6 +4175,42 @@ static void test_mapping() {
     if (plain) CHECK(drawn == got);
     CHECK(target[100 * 100 - 1] == 0);      // (nothing outside the surface)
   }
+  for (int short_pool = 0; short_pool < 2; ++short_pool) {      // Qt's raster windows: XRGB8888 rows padded past the width, a viewport destination of
+                                                                  // the buffer's own size, offset(0, 0) before each attach; and a pool that ends at the last pixel
+    App app(server);
+    const uint32_t viewporter = app.bind(app.reg, "wp_viewporter");
+    App::Window w = app.toplevel(true, "qt-like");
+    const uint32_t viewport = app.new_id();
+    app.send(Msg(viewporter, 1).u(viewport).u(w.surface));
+    app.send(Msg(viewport, 2).i(BW).i(BH));
+    constexpr int32_t kStride = (BW + 4) * 4;
+    App::Pool p = app.pool(short_pool ? size_t(kStride) * (BH - 1) + BW * 4 : size_t(kStride) * BH);
+    for (int32_t y = 0; y < BH; ++y)
+      for (int32_t x = 0; x < BW + 4 && (y < BH - 1 || x < BW || !short_pool); ++x) {
+        const uint32_t v = x < BW ? pattern_px(uint32_t(x), uint32_t(y)) : 0u;
+        memcpy(p.memory->data() + y * kStride + x * 4, &v, 4);
+      }
+    const uint32_t b = app.buffer(p, 0, BW, BH, kStride, 1 /* XRGB8888 */);
+    app.send(Msg(w.surface, 10).i(0).i(0));      // offset (version 5)
+    app.send(Msg(w.surface, 1).u(b).i(0).i(0));
+    app.send(Msg(w.surface, 9).i(0).i(0).i(BW).i(BH));      // damage_buffer
+    app.send(Msg(w.surface, 6));
+    std::vector<uint32_t> list = listed(server);
+    CHECK(list.size() == 1 && !app.closing);
+    if (list.size() == 1) {
+      CHECK(server.window_pixel(list[0], 7, 9) == pattern_px(7, 9));
+      std::vector<uint32_t> target(100 * 100, 0);
+      graphics::Surface ts;
+      ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+      ts.width = ts.height = ts.pitch = 100;
+      graphics::SoftwareRenderer2D r(ts);
+      uint32_t dw = 0, dh = 0;
+      CHECK(server.draw_window(list[0], r, 0, 0, &dw, &dh) && dw == uint32_t(BW) && dh == uint32_t(BH));
+      if (target[9 * 100 + 7] != pattern_px(7, 9) || target[19 * 100 + 39] != pattern_px(39, 19))
+        printf("   qt-like (short pool %d): drawn %08x %08x\n", short_pool, target[9 * 100 + 7], target[19 * 100 + 39]);
+      CHECK(target[9 * 100 + 7] == pattern_px(7, 9) && target[19 * 100 + 39] == pattern_px(39, 19));
+    }
+  }
   {      // a GPU buffer turned: read through its image
     DmabufApp app(server);
     App::Window w = app.toplevel(true, "gpu turned");

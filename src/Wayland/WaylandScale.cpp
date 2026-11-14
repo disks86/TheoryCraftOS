@@ -192,9 +192,7 @@ void Server::draw_mapped(Surface& s, graphics::IRenderer2D& renderer, int32_t ux
     picture.pitch = uint32_t(b.width);
     picture.format = graphics::Format::B8G8R8A8Unorm;      // (read gives 0xAARRGGBB)
   } else {
-    picture.pixels = buffer_pixels(b);
-    if (picture.pixels.size() == 0) return;
-    picture.pitch = b.pitch();
+    if (!drawable_pixels(b, &gpu_pixels, &picture.pixels, &picture.pitch)) return;      // (gpu_pixels holds a tight copy when one is needed)
     picture.format = b.format == kFormatAbgr8888 || b.format == kFormatXbgr8888 ? graphics::Format::R8G8B8A8Unorm : graphics::Format::B8G8R8A8Unorm;
   }
   picture.width = uint32_t(b.width);

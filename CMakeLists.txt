@@ -539,6 +539,7 @@ add_executable(BOOTX64
   src/Font/GlyphRaster.cpp
   src/Font/GlyphCache.cpp
   src/Font/FontSet.cpp
+  src/Font/FontFiles.cpp
   src/Font/Shaper.cpp
   src/Font/SystemFontService.cpp
   src/Font/FontDataSans.cpp
@@ -862,6 +863,7 @@ add_executable(BOOTX64
   src/Process/ModuleLoader.cpp
   src/Process/LinuxSyscalls.cpp
   src/Process/LinuxFiles.cpp
+  src/Process/LinuxExec.cpp
   src/Process/LinuxSockets.cpp
   src/Process/LinuxThreads.cpp
   src/Process/ProcessFiles.cpp
@@ -871,6 +873,7 @@ add_executable(BOOTX64
   src/Program/ProgramRunner.cpp
   src/Program/AppImageLaunch.cpp
   src/Program/AppRunScript.cpp
+  src/Program/LinuxShell.cpp
   src/Program/ShellTools.cpp
   src/Program/EmulatedTask.cpp
   src/Emulation/GuestCpu.cpp
@@ -1481,9 +1484,11 @@ if(TCOS_APPMAN_SELFTEST)
 endif()
 set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
 set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
+set(TCOS_AUTORUN_ENVIRONMENT "" CACHE STRING "More environment variables for it (;-separated NAME=value)")
 if(TCOS_AUTORUN)
   string(REPLACE ";" "\\037" _autorun_arguments "${TCOS_AUTORUN_ARGUMENTS}")      # (octal: a hex escape would take the letters a-f that begin the next argument)
-  target_compile_definitions(BOOTX64 PRIVATE "TCOS_AUTORUN=\"${TCOS_AUTORUN}\"" "TCOS_AUTORUN_ARGUMENTS=\"${_autorun_arguments}\"")
+  string(REPLACE ";" "\\037" _autorun_environment "${TCOS_AUTORUN_ENVIRONMENT}")
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_AUTORUN=\"${TCOS_AUTORUN}\"" "TCOS_AUTORUN_ARGUMENTS=\"${_autorun_arguments}\"" "TCOS_AUTORUN_ENVIRONMENT=\"${_autorun_environment}\"")
 endif()
 option(TCOS_INTEL_WIFI "Start the Intel Wireless-AC 9000 series card (firmware from /firmware, initialisation, hardware address and channels; no scanning or joining yet; not yet run on a real card)" OFF)
 if(TCOS_INTEL_WIFI)

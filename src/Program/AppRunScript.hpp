@@ -77,4 +77,8 @@ class IScriptNetwork {
 [[nodiscard]] AppRunResult evaluate_apprun(allocators::IAllocator& allocator, filesystem::IFileSystem& files, StringView world_root, StringView entry,
                                            ArrayView<const StringView> arguments, ArrayView<const StringView> environment, AppRunLaunch* launch);
 
+// Makes this shell the Linux tree's /bin/sh (process::linuxabi::install_builtin_shell): a program that execs /bin/sh or /bin/bash with a script, or a
+// "#!/bin/sh" script, has the script interpreted here and execs what it starts in the end. Called once at boot.
+void install_linux_builtin_shell();
+
 }  // namespace desktop

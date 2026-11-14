@@ -123,10 +123,14 @@ Files of several extents are read as one. Interleaved files, zisofs2 and sparse 
 - **AppRun scripts get no real process.** A script that needs a real external command to decide what to start (`sed`, `grep`, `awk` for
   something that matters) may pick the wrong program. `case` blocks are skipped, and `$(( ))` arithmetic and `${X:offset}` are not
   supported (the command that uses them is skipped).
-- **No `execve` or `fork` in the Linux layer.** A program that starts helper processes (Electron's zygote and renderers, for example)
-  still fails at that point.
-- **`/proc/self/exe`** is not answered, so glibc's `$ORIGIN` falls back to `LD_ORIGIN_PATH`, which is not set. AppRun normally sets
-  `LD_LIBRARY_PATH`, which covers the usual case.
+- **No `fork` in the Linux layer.** `execve` works (LinuxDynamicPrograms.md), but a program that forks helper processes (Electron's zygote
+  and renderers, a real shell running commands) still fails at that point.
+- **sharun AppImages: FeatherPad runs, other ones untried.** FeatherPad (a uruntime "anylinux" build, Qt 6 on Wayland) runs in QEMU and can be
+  typed into: sharun finds itself through `/proc/self/exe`, its `AppRun.sh` runs in the built-in shell (LinuxDynamicPrograms.md), sharun
+  starts the bundled `ld-linux` with Qt, Qt draws through `wl_shm` and finds the OS's fonts in `/usr/share/fonts`. The hooks' `ln -sfn` into
+  `/tmp` fails (no `ln` in the built-in shell); nothing has needed those links so far. Run it again with
+  `cmake -DTCOS_AUTORUN=/Desktop/Downloads/FeatherPad.AppImage` and the AppImage put there with `primary_image` (as tests/appimage_qemu.sh does);
+  `-DTCOS_AUTORUN_ENVIRONMENT="QT_LOGGING_RULES=qt.qpa.*=true;WAYLAND_DEBUG=1"` gives it more variables.
 - **Desktop integration only through the App Manager** (AppManager.md): an AppImage started from a file gets no menu entry; there is no AppImageUpdate.
 - **Only a small static test program has run in the OS.** Real desktop AppImages (Electron, GTK) have not been started in QEMU yet;
   they also need glibc and the system libraries in `/Linux` (see LinuxDynamicPrograms.md).

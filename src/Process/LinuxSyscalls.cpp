@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/AddressSpace.hpp"
+#include "Process/LinuxExec.hpp"
 #include "Process/LinuxFiles.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
@@ -41,7 +42,7 @@ enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Ge
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
   EpollCtl, EpollWait, EpollPwait, EpollPwait2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
-  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate };
+  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate, Execve, Execveat };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -74,6 +75,7 @@ constexpr NumberEntry kNumbers[] = {
     {162, 81, Call::Succeed},
     {56, 220, Call::Clone},        {435, 435, Call::Clone3},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
     {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
+    {59, 221, Call::Execve},       {322, 281, Call::Execveat},
     // sockets (AF_UNIX: LinuxSockets.cpp)
     {22, kAbsent, Call::Pipe},     {293, 59, Call::Pipe2},      {284, kAbsent, Call::Eventfd}, {290, 19, Call::Eventfd2},
     {283, 85, Call::TimerfdCreate}, {286, 86, Call::TimerfdSettime}, {287, 87, Call::TimerfdGettime}, {282, kAbsent, Call::Signalfd},
@@ -333,6 +335,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ExitGroup: process.terminate(uint32_t(a[0] & 0xFF)); return 0;
       case Call::Clone: return linuxabi::sys_clone(process, arch_, a);
       case Call::Clone3: return linuxabi::sys_clone3(process, arch_, a[0], a[1]);
+      case Call::Execve: return linuxabi::sys_execve(process, kAtFdCwd, a[0], a[1], a[2], 0);
+      case Call::Execveat: return linuxabi::sys_execve(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::Futex: return linuxabi::sys_futex(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Tgkill: return 0;      // signals are not delivered; asking whether a thread exists, or sending one, succeeds
       case Call::SchedGetaffinity: return linuxabi::sys_sched_getaffinity(process, a[1], a[2]);
@@ -351,14 +355,14 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0], a[1], a[2]);
       case Call::Fstat: return linuxabi::sys_fstat(process, arch_, a[0], a[1]);
       case Call::Newfstatat: return linuxabi::sys_statat(process, arch_, a[0], a[1], a[2], a[3]);
-      case Call::Stat:
-      case Call::Lstat: return linuxabi::sys_statat(process, arch_, kAtFdCwd, a[0], a[1], 0);
+      case Call::Stat: return linuxabi::sys_statat(process, arch_, kAtFdCwd, a[0], a[1], 0);
+      case Call::Lstat: return linuxabi::sys_statat(process, arch_, kAtFdCwd, a[0], a[1], 0x100);      // (AT_SYMLINK_NOFOLLOW)
       case Call::Statx: return linuxabi::sys_statx(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::Lseek: return linuxabi::sys_lseek(process, a[0], a[1], a[2]);
       case Call::Openat: return linuxabi::sys_openat(process, arch_, a[0], a[1], a[2]);
       case Call::Open: return linuxabi::sys_openat(process, arch_, kAtFdCwd, a[0], a[1]);
-      case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1]);
-      case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0]);
+      case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1], a[2], a[3]);
+      case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0], a[1], a[2]);
       case Call::Pread: return linuxabi::sys_pread(process, a[0], a[1], a[2], a[3]);
       case Call::Pwrite: return linuxabi::sys_pwrite(process, a[0], a[1], a[2], a[3]);
       case Call::Readv: return linuxabi::sys_readv(process, a[0], a[1], a[2]);
