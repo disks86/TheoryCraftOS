@@ -264,7 +264,16 @@ uint32_t default_bitmap_handle() {
 
 IScreenSink* g_screen_sink = nullptr;      // (outside the state: the desktop sets it before any Windows program made the state)
 
+const Bitmap* g_shadow_writing = nullptr;      // (the shadow whose drawing is going on to the screen: it has that already)
+
 void sink_changed(const Rect& dirty) {
+  if (State* st = state_ptr()) {      // the screen's shadows (unaware programs' screen DCs) take it before they are used next
+    for (WindowSurface& ws : st->surfaces) {
+      Bitmap* b = ws.bitmap.get();
+      if (!b || !b->shadow_scale || b == g_shadow_writing || rect_empty(dirty)) continue;
+      b->shadow_stale = rect_empty(b->shadow_stale) ? dirty : rect_union(b->shadow_stale, dirty);
+    }
+  }
   if (!g_live || !g_screen_sink) return;
   const Rect r = rect_and(dirty, Rect{0, 0, int32_t(state_ptr()->screen_w), int32_t(state_ptr()->screen_h)});
   if (!rect_empty(r)) g_screen_sink->screen_changed(r);
@@ -579,7 +588,9 @@ void shadow_to_screen(const Bitmap& b, const Rect& dirty) {
       dst.put_raw32(x, y, uint32_t(src[at]) | uint32_t(src[at + 1]) << 8 | uint32_t(src[at + 2]) << 16 | uint32_t(src[at + 3]) << 24);
     }
   }
+  g_shadow_writing = &b;
   sink_changed(device);
+  g_shadow_writing = nullptr;
 }
 
 void window_surface_changed(const Bitmap& b, const Rect& dirty) {
@@ -600,6 +611,29 @@ uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, Arra
   return dc->handle;
 }
 
+// A pixel of the shadow is taken from the top-left device pixel it stands for (the pixel its drawing put there first: what it drew reads back as it was).
+void refresh_shadow(Bitmap& b) {
+  const uint32_t k = b.shadow_scale;
+  if (!k || rect_empty(b.shadow_stale) || !state()) return;
+  Bitmap& screen = screen_bitmap();
+  const Rect stale = rect_and(b.shadow_stale, Rect{0, 0, screen.width, screen.height});
+  b.shadow_stale = Rect();
+  if (rect_empty(stale)) return;
+  // the shadow pixels that stand for any of it (a few more at a fractional scale do no harm: they are taken again as they are)
+  const Rect area = rect_and(Rect{graphics::device_to_units(stale.left, k), graphics::device_to_units(stale.top, k), graphics::device_to_units_up(stale.right, k),
+                                  graphics::device_to_units_up(stale.bottom, k)}, Rect{0, 0, b.width, b.height});
+  Surface dst = surface_of(b);
+  const Surface src = surface_of(screen);
+  for (int32_t y = area.top; y < area.bottom; ++y) {
+    const int32_t sy = graphics::units_to_device(y, k);
+    if (sy >= screen.height) break;
+    for (int32_t x = area.left; x < area.right; ++x) {
+      const int32_t sx = graphics::units_to_device(x, k);
+      if (sx < screen.width) dst.put_raw32(x, y, src.get_raw32(sx, sy));
+    }
+  }
+}
+
 uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale) {
   State* st = state();
   if (!st || scale <= 100) return 0;
@@ -611,16 +645,8 @@ uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale) {
   Bitmap* b = window_surface_bitmap(id);
   if (!b) { destroy_window_surface(id); return 0; }
   b->shadow_scale = scale;
-  // what is on the screen now, a pixel of the shadow taken from the top-left device pixel it stands for
-  Surface dst = surface_of(*b);
-  const Surface src = surface_of(screen);
-  for (int32_t y = 0; y < h; ++y) {
-    const int32_t sy = graphics::units_to_device(y, scale);
-    for (int32_t x = 0; x < w; ++x) {
-      const int32_t sx = graphics::units_to_device(x, scale);
-      if (sx < screen.width && sy < screen.height) dst.put_raw32(x, y, src.get_raw32(sx, sy));
-    }
-  }
+  b->shadow_stale = Rect{0, 0, screen.width, screen.height};
+  refresh_shadow(*b);
   const Rect all{0, 0, w, h};
   const uint32_t dc = create_screen_dc(pid, 0, 0, ArrayView<const Rect>(&all, 1), id);
   Dc* d = dc ? find_dc(dc) : nullptr;

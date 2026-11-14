@@ -1197,6 +1197,16 @@ void test_dpi_virtualization() {
     const ConstByteView screen = gdi::screen_pixels();
     auto at = [&](int32_t x, int32_t y) { const uint64_t o = (uint64_t(y) * 2048 + uint64_t(x)) * 4; return uint32_t(screen[o]) | uint32_t(screen[o + 1]) << 8 | uint32_t(screen[o + 2]) << 16; };
     CHECK(at(2000, 1400) == 0x00FF00 && at(2047, 1535) == 0x00FF00 && at(1999, 1400) != 0x00FF00 && at(2000, 1399) != 0x00FF00);
+    // what changes on the screen afterwards (an aware program's drawing there) the shadow shows when it is read next
+    {
+      const uint32_t sdc = a2.svc32(N::NtUserGetDC, {0});
+      const uint64_t blue = a2.svc(N::NtGdiCreateSolidBrush, {0xFF0000, 0});
+      a2.svc(N::NtGdiSelectBrush, {sdc, blue});
+      CHECK(a2.svc32(N::NtGdiPatBlt, {sdc, 100, 100, 40, 40, 0xF00021}) == 1);      // (device pixels: units 50..69)
+      a2.svc(N::NtUserReleaseDC, {0, sdc});
+    }
+    CHECK(t.svc32(N::NtGdiGetPixel, {dc, 50, 50}) == 0xFF0000 && t.svc32(N::NtGdiGetPixel, {dc, 69, 69}) == 0xFF0000 && t.svc32(N::NtGdiGetPixel, {dc, 70, 70}) != 0xFF0000);
+    CHECK(t.svc32(N::NtGdiGetPixel, {dc, 1023, 767}) == 0x00FF00);      // (its own drawing reads back as it was)
     const uint32_t rgn = t.svc32(N::NtGdiCreateRectRgn, {0, 0, 1, 1});
     const uint64_t box = t.tmp(0x800);
     CHECK(t.svc32(N::NtGdiGetRandomRgn, {dc, rgn, 5}) == 1 && t.svc32(N::NtGdiGetRgnBox, {rgn, box}) != 0);
