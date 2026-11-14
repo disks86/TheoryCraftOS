@@ -165,6 +165,7 @@ Surface dc_surface(Dc& dc, Bitmap** bitmap) {
   if (dc.screen && dc.surface) {      // a window with a window surface draws there (nowhere once the surface is gone)
     Bitmap* b = window_surface_bitmap(dc.surface);
     if (!b) return Surface();
+    if (b->shadow_scale) refresh_shadow(*b);      // (an unaware program's screen DC: what changed on the screen since it last looked)
     *bitmap = b;
     return surface_of(*b);
   }
