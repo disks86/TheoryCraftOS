@@ -985,7 +985,9 @@ NATIVE(node_to_string) {
   dom::Node* n = node_of(self);
   String text(vm.allocator());
   text.append("[object ");
-  if (!n) text.append("Object");
+  Value tag;   // (the interface the node is an object of names itself: "[object HTMLBodyElement]")
+  if (self.is_object() && vm.get_named(self, "@@toStringTag", &tag) && tag.is_string() && tag.as_string()->length > 0) text.append(tag.as_string()->view());
+  else if (!n) text.append("Object");
   else if (n->is_element()) text.append("HTMLElement");
   else if (n->is_text()) text.append("Text");
   else if (n->type == dom::NodeType::Comment) text.append("Comment");

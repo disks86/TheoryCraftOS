@@ -451,8 +451,10 @@ struct FakeNet final : IPageLoader {
     Answer a;
     if (it != answers.end()) a = it->second;
     else a.status = 404;
-    if (it == answers.end() && getenv("PROBE_ROOT") && key.find("GET https://app.example/") == 0) {   // (PROBE: files of a directory are the site)
-      std::string rel = key.substr(strlen("GET https://app.example/"));
+    // (PROBE_SITE=http://localhost:8765/: the directory is also served at that address, for a page that is compared with the same page in another browser)
+    const std::string own_site = std::string("GET ") + (getenv("PROBE_SITE") && key.find(std::string("GET ") + getenv("PROBE_SITE")) == 0 ? getenv("PROBE_SITE") : "https://app.example/");
+    if (it == answers.end() && getenv("PROBE_ROOT") && key.find(own_site) == 0) {   // (PROBE: files of a directory are the site)
+      std::string rel = key.substr(own_site.size());
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
       const std::string path = std::string(getenv("PROBE_ROOT")) + "/" + rel;
@@ -480,9 +482,12 @@ struct FakeNet final : IPageLoader {
         a.headers = probe_content_type(path) + "Access-Control-Allow-Origin: *\r\n";   // (gstatic's icons are fetched by script: the real servers allow it)
       }
     }
-    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && key.find("POST https://app.example/youtubei/") == 0 && key.find("/log_event") == std::string::npos) {
-      // (PROBE: YouTube's API calls - the guide, the browse continuations - go to the live site, as the browser would send them)
-      const std::string rest = key.substr(strlen("POST https://app.example/"));
+    // (PROBE: the page is at https://app.example/, or - with PROBE_URL - at the live host itself, for scripts that look at the address they run at)
+    const std::string live_site = std::string("POST https://") + (getenv("PROBE_LIVE") ? getenv("PROBE_LIVE") : "app.example") + "/";
+    const std::string site = key.find(live_site) == 0 ? live_site : std::string("POST https://app.example/");
+    if (it == answers.end() && getenv("PROBE_LIVE") && getenv("PROBE_ROOT") && (key.find(site + "youtubei/") == 0 || key.find(site + "api/jnn/") == 0) && key.find("/log_event") == std::string::npos) {
+      // (PROBE: YouTube's API calls - the guide, the browse continuations, the attestation service - go to the live site, as the browser would send them)
+      const std::string rest = key.substr(site.size());
       bool plain = true;
       for (char ch : rest) plain &= isalnum(static_cast<unsigned char>(ch)) || strchr("/._=?&-", ch);
       const std::string dir = getenv("PROBE_ROOT"), body_file = dir + "/_post_body", out_file = dir + "/_post_answer";
@@ -728,8 +733,9 @@ struct FakeEnvironment final : IPageEnvironment {
   bool fetch_text(StringView address, uint64_t, String* text) override {
     fetched.push_back(std::string(address.data(), address.size()));
     auto it = files.find(fetched.back());
-    if (it == files.end() && (getenv("WPT_REAL_FILE") || getenv("PROBE_HTML")) && fetched.back().compare(0, 20, "https://app.example/") == 0) {   // (a real web-platform-tests run: the checkout is the site)
-      std::string rel = fetched.back().substr(20);
+    const std::string own = getenv("PROBE_SITE") && fetched.back().find(getenv("PROBE_SITE")) == 0 ? getenv("PROBE_SITE") : "https://app.example/";   // (PROBE_SITE: see exchange())
+    if (it == files.end() && (getenv("WPT_REAL_FILE") || getenv("PROBE_HTML")) && fetched.back().compare(0, own.size(), own) == 0) {   // (a real web-platform-tests run: the checkout is the site)
+      std::string rel = fetched.back().substr(own.size());
       const size_t cut = rel.find_first_of("?#");
       if (cut != std::string::npos) rel.resize(cut);
       if (rel == "resources/testharnessreport.js") {
@@ -3274,6 +3280,73 @@ static void test_iframe() {
               "console.log(w.eval('callback(7)'), w.parent === window, Object.keys(d.getElementById('p').dataset).length);"
               "</script></body></html>");
     CHECK(page_log(page) == "true true inner 2 3 | 42 42 true c true | changed T a,b true false | InvalidCharacterError true | from parent 7 true 0");
+  }
+  CHECK(a.live == 0);
+  {   // A frame's built-ins used on the page's own values, as a script does that wants built-ins nobody has replaced (the attestation script of YouTube
+      // takes String.prototype.replace and Function.prototype.toString from a frame it makes, reads the text of its own functions with them, edits it and
+      // evaluates it again): the text of a function of another window is its text there, apply() takes its arguments from an array of another window,
+      // and a regular expression of another window still replaces and splits.
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><script>"
+              "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow;"
+              "var N = function (a, b) { return a + b; };"
+              "var text = w.String.prototype.replace.toString, replace = w.String.prototype.replace;"
+              "console.log(text.apply(N, []), text.call(replace), text === w.Function.prototype.toString);"
+              "var patched = replace.apply('0,' + text.apply(N, []), ['+', '*']);"
+              "console.log(patched, eval(patched)(6, 7));"
+              "console.log(replace.apply('a-b-c', [/-/g, '+']), replace.call('x1y22', /\\d+/g, function (m) { return '<' + m.length + '>'; }), w.String.prototype.split.call('a1b2c', /\\d/).join());"
+              "w.eval('function twice(x) { return x * 2 }');"
+              "console.log(w.Math.max.apply(null, [3, 9, 4]), '' + w.twice, Function.prototype.toString.call(w.twice), String(w.Math.max), w.twice.apply(null, [21]));"
+              "try { text.call({}) } catch (e) { console.log(e.name) }"
+              "console.log(Function.prototype.toString.call(Function.prototype.toString), (function () {}).toString.name)"
+              "</script></body></html>");
+    CHECK(page_log(page) == "function (a, b) { return a + b; } function replace() { [native code] } true | 0,function (a, b) { return a * b; } 42 | a+b+c x<1>y<2> a,b,c | "
+                            "9 function twice(x) { return x * 2 } function twice(x) { return x * 2 } function max() { [native code] } 42 | TypeError | function toString() { [native code] } toString");
+    if (page_log(page).find("function max") == std::string::npos) printf("   frame built-ins: %s\n", page_log(page).c_str());
+  }
+  CHECK(a.live == 0);
+  {   // A function taken from a frame goes on working when the frame has left the document (the attestation script removes its frame at once and uses the
+      // functions in later tasks; with the frame's script gone the video stopped after a minute). The page of the frame is kept, with nothing running in
+      // it. An <iframe> that is put back is a new window.
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><script>"
+              "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow;"
+              "var text = w.Function.prototype.toString, replace = w.String.prototype.replace, max = w.Math.max; w.mark = 'first';"
+              "w.setTimeout(function () { console.log('a timer of the removed frame ran') }, 5);"
+              "document.body.removeChild(f);"
+              "console.log(replace.call('a-b', '-', '+'), max(2, 7));"
+              "setTimeout(function () {"
+              "  console.log(replace.apply('x1', ['1', '2']), text.call(function () { return 1; }), max.apply(null, [4, 9, 3]), typeof replace.apply, w.mark);"
+              "  document.body.appendChild(f);"
+              "  console.log(f.contentWindow === w, f.contentWindow.mark, typeof f.contentWindow.Math.max, w.mark, replace.call('q', 'q', 'r'));"
+              "}, 10);"
+              "</script></body></html>");
+    page_text(page, 60);   // (the frames are compared with the document: the one that was removed is retired)
+    page.run_due_timers(1e18);
+    page_text(page, 60);
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "a+b 7 | x2 function () { return 1; } 9 function first | false undefined function first r");
+    if (page_log(page).find("first r") == std::string::npos) printf("   removed frame: %s\n", page_log(page).c_str());
+  }
+  CHECK(a.live == 0);
+  {   // only the last few removed frames are kept (a page that makes frame after frame); a frame nobody took anything from is not kept at all
+    FakeEnvironment env(a);
+    MediaEnvironment media;
+    Page page(a, env, "http://example.com/", media, true);
+    page.load("<html><body><iframe id=plain srcdoc='<p>plain</p>'></iframe><script>"
+              "var fs = []; for (var i = 0; i < 7; i++) { var e = document.createElement('iframe'); document.body.appendChild(e); fs.push(e.contentWindow.Math.max); document.body.removeChild(e); }"
+              "var plain = document.getElementById('plain'); plain.parentNode.removeChild(plain);"
+              "setTimeout(function () { var r = fs.map(function (m) { try { return String(m(1, 2)); } catch (x) { return 'threw'; } });"
+              "  console.log(r.slice(0, 2).join(), r.slice(-4).join()); }, 10);"   // (a function of a window that is gone answers nothing)
+              "</script></body></html>");
+    page_text(page, 60);
+    page.run_due_timers(1e18);
+    CHECK(page_log(page) == "undefined,undefined 2,2,2,2");
+    if (page_log(page) != "undefined,undefined 2,2,2,2") printf("   removed frames: %s\n", page_log(page).c_str());
   }
   CHECK(a.live == 0);
   {   // a form with a target submits into the frame of that name, in the encoding of the page (or of its accept-charset)
@@ -7300,6 +7373,11 @@ int main(int argc, char** argv) {
   if (getenv("ONLY_WPT")) {   // (just the web-platform-tests derived suites)
     test_wpt();
     printf(g_failed ? "%d check(s) failed\n" : "wpt tests passed\n", g_failed);
+    return g_failed ? 1 : 0;
+  }
+  if (getenv("ONLY_IFRAME")) {   // (just the frame tests)
+    test_iframe();
+    printf(g_failed ? "%d check(s) failed\n" : "frame tests passed\n", g_failed);
     return g_failed ? 1 : 0;
   }
   if (getenv("ONLY_SW")) {   // (just the Cache API and service worker tests)

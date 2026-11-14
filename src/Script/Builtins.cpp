@@ -319,6 +319,22 @@ NATIVE(object_get_prototype_of) {
   return true;
 }
 
+// The host's own scripts give the platform's interfaces their operations and accessors with Object.defineProperty. A function of theirs that has no name
+// of its own yet (or only the one its place in the descriptor gave it: { value: function () {} }) is called what it is defined as - "createElement",
+// "get body" - as a built-in is: pages look at the names (and at the text, which has the name in it) to tell a browser's own function from one put in its place.
+void name_library_function(Vm& vm, const Value& fn, JsString* key, const char* prefix, const char* placeholder) {
+  if (!fn.is_object() || key->symbol) return;
+  JsObject* f = fn.as_object();
+  if (f->okind != ObjKind::Function || !f->code || !f->code->library) return;
+  if (f->code->name && f->code->name->length > 0 && !f->code->name->view().equals(placeholder)) return;
+  JsString* name_key = vm.intern("name");
+  Value own;
+  if (!name_key || vm.mark_get(f, name_key, &own)) return;   // (named already: the first name stays)
+  String text(vm.allocator());
+  if (!text.append(prefix) || !text.append(key->view())) return;
+  vm.define(f, name_key, str_value(vm, text.view()), 0);
+}
+
 NATIVE(object_define_property) {
   const Value target = arg_at(args, argc, 0), desc = arg_at(args, argc, 2);
   if (!target.is_object() || !desc.is_object()) return vm.throw_error(ErrorKind::TypeError, "Object.defineProperty called on non-object");
@@ -363,6 +379,11 @@ NATIVE(object_define_property) {
   const bool exists = vm.own_property(o, key, &current_value, &current);
   // the host's own scripts leave a property configurable unless they say otherwise; a page's script gets what the standard says
   const bool default_configurable = vm.in_library_code();
+  if (default_configurable) {   // (... and their functions are called what they are defined as, like the built-ins they stand for)
+    if (has_value) name_library_function(vm, value, key, "", "value");
+    if (has_get) name_library_function(vm, getter, key, "get ", "get");
+    if (has_set) name_library_function(vm, setter, key, "set ", "set");
+  }
   if (!exists) {
     if (o->non_extensible || o->sealed || o->frozen) return refuse("Cannot define property ");
     uint8_t flags = static_cast<uint8_t>((Vm::to_boolean(enumerable) ? kEnumerable : 0) | ((has_configurable ? Vm::to_boolean(configurable) : default_configurable) ? 0 : kNonConfigurable));
@@ -787,12 +808,46 @@ NATIVE(function_call) {
   return vm.call(self, arg_at(args, argc, 0), argc > 1 ? args + 1 : nullptr, argc > 1 ? argc - 1 : 0, result);
 }
 
+// CreateListFromArrayLike: the arguments of apply() and of Reflect.apply / Reflect.construct are the elements of any object with a length (a typed array,
+// a list of nodes, a proxy: an array of another window is one), not only of an array. `*out` is the array itself, or a new array of the elements (`*made`),
+// or null for no arguments at all (apply(self, undefined)).
+constexpr double kMaxSpreadArguments = 1 << 20;
+bool arguments_list(Vm& vm, const Value& list, bool nullish_is_empty, JsObject** out, bool* made) {
+  *out = nullptr;
+  *made = false;
+  if (nullish_is_empty && list.is_nullish()) return true;
+  if (!list.is_object()) return vm.throw_error(ErrorKind::TypeError, "CreateListFromArrayLike called on non-object");
+  JsObject* o = list.as_object();
+  if (o->okind == ObjKind::Array) {
+    vm.refresh_arguments(o);
+    *out = o;
+    return true;
+  }
+  Value length;
+  double n = 0;
+  if (!vm.get_named(list, "length", &length) || !vm.to_number(length, &n)) return false;
+  if (!(n >= 1)) n = 0;   // (not a number, negative, a fraction of one)
+  if (n > kMaxSpreadArguments) return vm.throw_error(ErrorKind::RangeError, "Too many arguments in function call");
+  const uint32_t count = static_cast<uint32_t>(n);
+  JsObject* elements = vm.new_array(count);
+  if (!elements) return vm.throw_error(ErrorKind::RangeError, "out of memory");
+  for (uint32_t i = 0; i < count; ++i) {
+    Value element;
+    if (!vm.get_member(list, num_value(static_cast<double>(i)), &element)) return false;
+    if (!vm.array_push(elements, element)) return vm.throw_error(ErrorKind::RangeError, "out of memory");
+  }
+  *out = elements;
+  *made = true;
+  return true;
+}
+
 NATIVE(function_apply) {
   if (!need_function(vm, self)) return false;
-  const Value list = arg_at(args, argc, 1);
-  const Vm::PassThrough pass(vm);
-  if (list.is_object() && list.as_object()->okind == ObjKind::Array) vm.refresh_arguments(list.as_object());
-  if (list.is_object() && list.as_object()->okind == ObjKind::Array) return vm.call(self, arg_at(args, argc, 0), list.as_object()->items, list.as_object()->length, result);
+  JsObject* list = nullptr;
+  bool made = false;
+  if (!arguments_list(vm, arg_at(args, argc, 1), true, &list, &made)) return false;
+  const Vm::PassThrough pass(vm, !made);   // (a list made here is in no variable of the script: the collector must not run under this call)
+  if (list) return vm.call(self, arg_at(args, argc, 0), list->items, list->length, result);
   return vm.call(self, arg_at(args, argc, 0), nullptr, 0, result);
 }
 
@@ -809,18 +864,25 @@ NATIVE(function_bind) {
   return true;
 }
 
+// A function of a script reads as the text it was written as (a class as the whole class), as pages expect: some evaluate that text again to get a copy of
+// a function. Everything else - built-in functions, bound functions, the host's own library - reads as native code.
 NATIVE(function_to_string) {
-  String text(vm.allocator());
-  if (self.is_object() && self.as_object()->okind == ObjKind::Native) {
-    Value name;
-    if (!vm.get_named(self, "name", &name)) return false;
-    text.append("function ");
-    if (name.is_string()) text.append(name.as_string()->view());
-    text.append("() { [native code] }");
-    *result = str_value(vm, text.view());
-    return true;
+  if (!Vm::is_callable(self)) return vm.throw_error(ErrorKind::TypeError, "Function.prototype.toString requires that 'this' be a Function");
+  const JsObject* f = self.as_object();
+  if (f->okind == ObjKind::Function && f->code && f->code->source) {
+    const StringView whole = f->code->source->view();
+    StringView text;
+    if (whole.try_substr(f->code->source_start, f->code->source_length, &text)) {
+      *result = str_value(vm, text);
+      return true;
+    }
   }
-  vm.describe(self, &text, 0);
+  String text(vm.allocator());
+  Value name;
+  if (f->okind != ObjKind::Bound && f->okind != ObjKind::Proxy && !vm.get_named(self, "name", &name)) return false;   // (those two have no name of their own to show)
+  text.append("function ");
+  if (name.is_string()) text.append(name.as_string()->view());
+  text.append("() { [native code] }");
   *result = str_value(vm, text.view());
   return true;
 }
@@ -2228,6 +2290,65 @@ NATIVE(symbol_function) {
   return true;
 }
 
+// The marks of the collections (Vm::mark_get and the others), for the library that implements them: __mark_get(object, name) (undefined: none),
+// __mark_has(object, name), __mark_set(object, name, value), __mark_delete(object, name). What is not an object has no marks.
+bool mark_target(Vm& vm, const Value* args, uint32_t argc, JsObject** object, JsString** name) {
+  const Value target = arg_at(args, argc, 0), key = arg_at(args, argc, 1);
+  if (!target.is_object() || !key.is_string() || key.as_string()->symbol) return false;
+  *object = target.as_object();
+  *name = vm.intern(key.as_string()->view());
+  return *name != nullptr;
+}
+
+NATIVE(mark_get) {
+  (void)self;
+  JsObject* o;
+  JsString* name;
+  *result = Value();
+  if (mark_target(vm, args, argc, &o, &name)) vm.mark_get(o, name, result);
+  return true;
+}
+
+NATIVE(mark_has) {
+  (void)self;
+  JsObject* o;
+  JsString* name;
+  Value ignored;
+  *result = Value::make_bool(mark_target(vm, args, argc, &o, &name) && vm.mark_get(o, name, &ignored));
+  return true;
+}
+
+NATIVE(mark_set) {
+  (void)self;
+  JsObject* o;
+  JsString* name;
+  if (mark_target(vm, args, argc, &o, &name)) vm.mark_set(o, name, arg_at(args, argc, 2));
+  *result = Value();
+  return true;
+}
+
+NATIVE(mark_delete) {
+  (void)self;
+  JsObject* o;
+  JsString* name;
+  *result = Value::make_bool(mark_target(vm, args, argc, &o, &name) && vm.mark_remove(o, name));
+  return true;
+}
+
+// __oid_of(object, fresh): the number Map and Set know the object by; an object that has none yet gets `fresh` (and the caller sees that it was used).
+NATIVE(oid_of) {
+  (void)self;
+  const Value target = arg_at(args, argc, 0);
+  *result = Value();
+  if (!target.is_object()) return true;
+  JsString* name = vm.intern("__oid");
+  if (!name) return true;
+  if (vm.mark_get(target.as_object(), name, result) && result->is_number()) return true;
+  *result = arg_at(args, argc, 1);
+  vm.mark_set(target.as_object(), name, *result);
+  return true;
+}
+
 // __symbol_info(symbol, what): 0 the description (undefined if there is none), 1 "Symbol(description)", 2 whether it is a symbol
 NATIVE(symbol_info) {
   (void)self;
@@ -2269,9 +2390,11 @@ NATIVE(symbol_info) {
 NATIVE(reflect_construct) {
   (void)self;
   const Value f = arg_at(args, argc, 0), list = arg_at(args, argc, 1), target = arg_at(args, argc, 2);
-  if (!list.is_object() || list.as_object()->okind != ObjKind::Array) return vm.throw_error(ErrorKind::TypeError, "CreateListFromArrayLike called on non-object");
-  const Vm::PassThrough pass(vm);
-  return vm.construct_with(f, list.as_object()->items, list.as_object()->length, target, result);
+  JsObject* elements = nullptr;
+  bool made = false;
+  if (!arguments_list(vm, list, false, &elements, &made)) return false;
+  const Vm::PassThrough pass(vm, !made);
+  return vm.construct_with(f, elements->items, elements->length, target, result);
 }
 
 NATIVE(function_protos) {
@@ -3306,6 +3429,11 @@ bool install_builtins(Vm& vm) {
     vm.define_named(symbol, name, Value::make_string(s), 0);
   }
   vm.define_native(g, "__symbol_info", symbol_info, 2);
+  vm.define_native(g, "__mark_get", mark_get, 2);
+  vm.define_native(g, "__mark_has", mark_has, 2);
+  vm.define_native(g, "__mark_set", mark_set, 3);
+  vm.define_native(g, "__mark_delete", mark_delete, 2);
+  vm.define_native(g, "__oid_of", oid_of, 2);
   vm.define_native(g, "__primitive_of", primitive_of_native, 1);
   vm.define_native(g, "__htmldda", mark_htmldda, 1);
   vm.define_native(g, "__proto_of", object_get_prototype_of, 1);

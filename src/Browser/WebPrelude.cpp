@@ -3711,7 +3711,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   // operations are sent to that window's script as text (__window_request) and done there on the real object. Values cross as [kind, ...]: primitives by value,
   // objects and functions as [kind, handle, window]. The objects handed out stay in a table for as long as the page.
   var served = [g], servedIds = new Map(), remotes = new Map(), infoKey = '\u0001window-object';   // (a stand-in tells what it stands for when asked for this key: a WeakMap keyed by one would run its traps)
-  var wellKnown = ['iterator', 'toPrimitive', 'toStringTag', 'hasInstance', 'asyncIterator', 'isConcatSpreadable', 'species'];
+  var wellKnown = ['iterator', 'toPrimitive', 'toStringTag', 'hasInstance', 'asyncIterator', 'isConcatSpreadable', 'species', 'replace', 'match', 'matchAll', 'search', 'split', 'unscopables'];
   function handleOf(o) {
     var h = servedIds.get(o);
     if (h === undefined && (o === g.window || o === g.self || o === g.globalThis)) h = 0;   // (the global object under its other names)
@@ -3822,6 +3822,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'keys': out = ['k', Object.keys(Object(target))]; break;
         case 'call': out = crossOut(Function.prototype.apply.call(target, args[0], args.slice(1))); break;
         case 'new': out = crossOut(Reflect.construct(target, args)); break;
+        case 'text': out = ['s', functionText.call(target)]; break;
         default: out = ['u'];
       }
     } catch (e) {
@@ -3829,6 +3830,19 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       out = ['x', isObj && e.constructor && e.constructor.name || 'Error', isObj && 'message' in e ? String(e.message) : String(e), isObj && e.name ? String(e.name) : 'Error'];
     }
     return JSON.stringify(out);
+  });
+  // The text of a function of another window is the text it has there, whichever window's Function.prototype.toString is asked: a script takes the
+  // function from a frame it made to be sure of an untouched one, and evaluates what it gives for its own functions.
+  var functionText = Function.prototype.toString;
+  hide(Function.prototype, 'toString', function toString() {
+    if (typeof this === 'function') {
+      var info = this[infoKey];
+      if (info && typeof info.window === 'number') {
+        var r = ask(info.window, ['text', info.handle, '', []]);
+        if (r && r[0] === 's') return r[1];
+      }
+    }
+    return functionText.call(this);
   });
   hide(g, '__window_name', function () { return String(g.name); });
   hide(g, '__set_window_name', function (name) { g.name = String(name); });
@@ -10258,6 +10272,11 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       g.dispatchEvent(e);
       return e.defaultPrevented || (typeof e.returnValue === 'string' && e.returnValue !== '') ? '1' : '';
     });
+    // The <iframe> of this page left its document, but the page is kept for the objects other windows hold: what plays stops.
+    hide(g, '__page_detached', function () {
+      var playing = document.querySelectorAll('video, audio');
+      for (var i = 0; i < playing.length; i++) { try { playing[i].pause(); } catch (e) {} }
+    });
     hide(g, '__page_unload', function () {
       __set_hidden(true);
       document.dispatchEvent(new Event('visibilitychange', { bubbles: true }));
@@ -12401,6 +12420,51 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (pd && pd.writable && d.value.prototype && d.value.prototype.constructor === d.value && d.value.prototype !== Object.prototype) {
       try { Object.defineProperty(d.value, 'prototype', { writable: false }); } catch (e) { }
     }
+  });
+
+  // Every interface says what it is: Object.prototype.toString.call(document.body) is "[object HTMLBodyElement]" - the prototype of an interface has
+  // its name as Symbol.toStringTag. (The language's own classes that have no tag keep having none: an Array is "[object Array]" by what it is.)
+  // The number of arguments an operation must be given is its length (document.createElement.length is 1), whatever further ones this implementation
+  // names: the ones pages most often look at.
+  var lengths = function (root, table) {
+    if (root === null || (typeof root !== 'object' && typeof root !== 'function')) return;
+    Object.keys(table).forEach(function (name) {
+      var f;
+      try { f = root[name]; } catch (e) { return; }
+      if (typeof f !== 'function' || f.length === table[name]) return;
+      try { Object.defineProperty(f, 'length', { value: table[name], configurable: true }); } catch (e) { }
+    });
+  };
+  lengths(g, { setTimeout: 1, setInterval: 1, clearTimeout: 0, clearInterval: 0, requestAnimationFrame: 1, cancelAnimationFrame: 1, requestIdleCallback: 1, cancelIdleCallback: 1,
+               fetch: 1, getComputedStyle: 1, postMessage: 1, matchMedia: 1, atob: 1, btoa: 1, alert: 0, confirm: 0, prompt: 0, open: 0, close: 0, focus: 0, blur: 0, stop: 0, print: 0,
+               scroll: 0, scrollTo: 0, scrollBy: 0, queueMicrotask: 1, structuredClone: 1, reportError: 1, getSelection: 0, createImageBitmap: 1,
+               addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 });
+  lengths(g.document, { createElement: 1, createElementNS: 2, createTextNode: 1, createComment: 1, createDocumentFragment: 0, createEvent: 1, createRange: 0, createTreeWalker: 1,
+               createNodeIterator: 1, createAttribute: 1, getElementById: 1, getElementsByTagName: 1, getElementsByClassName: 1, getElementsByName: 1, querySelector: 1,
+               querySelectorAll: 1, importNode: 1, adoptNode: 1, hasFocus: 0, write: 0, writeln: 0, open: 0, close: 0, elementFromPoint: 2, elementsFromPoint: 2, execCommand: 1,
+               getSelection: 0, addEventListener: 2, removeEventListener: 2, dispatchEvent: 1, appendChild: 1, removeChild: 1, insertBefore: 2, replaceChild: 2, cloneNode: 0,
+               contains: 1, hasChildNodes: 0, compareDocumentPosition: 1, isEqualNode: 1, isSameNode: 1, getRootNode: 0, normalize: 0, append: 0, prepend: 0, replaceChildren: 0 });
+  lengths(typeof g.HTMLElement === 'function' ? g.HTMLElement.prototype : null, { getAttribute: 1, setAttribute: 2, removeAttribute: 1, hasAttribute: 1, toggleAttribute: 1,
+               getAttributeNames: 0, getAttributeNode: 1, getBoundingClientRect: 0, getClientRects: 0, querySelector: 1, querySelectorAll: 1, matches: 1, closest: 1,
+               attachShadow: 1, scrollIntoView: 0, remove: 0, append: 0, prepend: 0, after: 0, before: 0, replaceWith: 0, replaceChildren: 0, insertAdjacentHTML: 2,
+               insertAdjacentElement: 2, insertAdjacentText: 2, getElementsByTagName: 1, getElementsByClassName: 1, animate: 1, getAnimations: 0, focus: 0, blur: 0, click: 0,
+               scroll: 0, scrollTo: 0, scrollBy: 0, setPointerCapture: 1, releasePointerCapture: 1, hasPointerCapture: 1, requestFullscreen: 0 });
+  lengths(typeof g.XMLHttpRequest === 'function' ? g.XMLHttpRequest.prototype : null, { open: 2, send: 0, setRequestHeader: 2, getResponseHeader: 1, getAllResponseHeaders: 0, abort: 0, overrideMimeType: 1 });
+  lengths(g.navigator, { sendBeacon: 1, javaEnabled: 0, vibrate: 1 });
+  lengths(g.performance, { now: 0, mark: 1, measure: 1, getEntries: 0, getEntriesByType: 1, getEntriesByName: 1, clearMarks: 0, clearMeasures: 0 });
+  lengths(g.history, { pushState: 2, replaceState: 2, go: 0, back: 0, forward: 0 });
+
+  var untagged = { Object: 1, Function: 1, Array: 1, String: 1, Number: 1, Boolean: 1, Date: 1, RegExp: 1, Error: 1, EvalError: 1, RangeError: 1, ReferenceError: 1,
+                   SyntaxError: 1, TypeError: 1, URIError: 1, AggregateError: 1, Proxy: 1 };
+  Object.getOwnPropertyNames(g).forEach(function (name) {
+    var c = name.charCodeAt(0);
+    if (c < 65 || c > 90 || untagged[name] === 1 || /^(Int|Uint|Float|BigInt|BigUint)\d+(Clamped)?Array$/.test(name)) return;
+    var d = Object.getOwnPropertyDescriptor(g, name), C = d && d.value;
+    if (typeof C !== 'function') return;
+    var P = C.prototype;
+    if (P === null || typeof P !== 'object' || Object.prototype.hasOwnProperty.call(P, Symbol.toStringTag)) return;
+    if (C.name !== name && typeof g[C.name] === 'function' && g[C.name] === C) return;   // (another name of an interface: its own name tags it)
+    try { Object.defineProperty(P, Symbol.toStringTag, { value: name, configurable: true }); } catch (e) { }
   });
 }(this));
 )JSPRELUDE";

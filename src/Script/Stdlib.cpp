@@ -132,6 +132,14 @@ const char kStdlib[] = R"JSLIB((function (g) {
     Object.defineProperty(wrapper, 'name', { value: name });
     Object.defineProperty(wrapper, 'length', { value: orig.length });
     def(SP, name, wrapper);
+    // ... and a regular expression has the method itself (code calls it directly, and so does a String method that was given a regular expression of another window)
+    var own = function (string) {
+      if (!(this instanceof RegExp)) throw new TypeError('RegExp.prototype[Symbol.' + name + '] called on incompatible receiver');
+      return orig.apply(String(string), [this].concat(Array.prototype.slice.call(arguments, 1)));
+    };
+    Object.defineProperty(own, 'name', { value: '[Symbol.' + name + ']' });
+    Object.defineProperty(own, 'length', { value: name === 'replace' || name === 'split' ? 2 : 1 });
+    def(RegExp.prototype, sym, own);
   });
   (function () {
     var orig = AP.concat, spread = Symbol.isConcatSpreadable;

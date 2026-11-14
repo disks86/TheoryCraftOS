@@ -559,6 +559,13 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
     uint32_t port, window;
   };
   List<UniquePointer<Frame>> frames_;
+  // The pages of <iframe>s that left the document after another window was given script objects of theirs: a function taken from a frame can still be
+  // called when the frame is gone (scripts make a frame just to take untouched built-ins from it, and remove it at once). Nothing is loaded, drawn or
+  // timed for such a page any more; its script only answers the windows that hold its objects. The last few are kept.
+  List<UniquePointer<Frame>> detached_frames_;
+  static constexpr uint64_t kMaxDetachedFrames = 4;
+  bool lent_objects_ = false;   // a script of another window has asked this page's script for something (window_request)
+  void retire_frame(UniquePointer<Frame> frame);
   List<Message> messages_;
   Page* parent_ = nullptr;
   uint32_t frame_serial_ = 0, depth_ = 0;

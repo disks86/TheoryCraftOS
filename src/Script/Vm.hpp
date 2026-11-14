@@ -203,6 +203,11 @@ class Vm {
   // Every own property name (also the ones that are not enumerable), and the value and attributes of one own property (a getter / setter is not called).
   JsObject* own_names(JsObject* object);
   bool own_property(JsObject* object, JsString* key, Value* value, uint8_t* flags);
+  // A mark the collections keep on an object itself (the identity Map and Set know it by, the entries of the weak collections): an own property outside
+  // the object model - not inherited by the objects it is the prototype of, not seen by a proxy's traps, there on a frozen object too.
+  bool mark_get(JsObject* object, JsString* key, Value* out);   // false: the object has no such mark
+  void mark_set(JsObject* object, JsString* key, const Value& value);
+  bool mark_remove(JsObject* object, JsString* key);
   static bool callable_object(const JsObject* o) {
     for (int depth = 0; o && depth < 16; ++depth) {
       if (o->okind == ObjKind::Function || o->okind == ObjKind::Native || o->okind == ObjKind::Bound) return true;

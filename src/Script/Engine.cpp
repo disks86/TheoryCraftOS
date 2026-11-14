@@ -349,12 +349,14 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (value === null) return 'l';
     if (t === 'symbol') return 'y' + __symbol_info(value, 3);
     if (t === 'bigint') return 'g' + String(value);
-    var id = value.__oid;
-    if (id === undefined) {
-      id = nextId++;
-      try { Object.defineProperty(value, '__oid', { value: id }); } catch (e) { return 'x' + (map.__loose.push(value) - 1); }
-    }
-    return 'o' + id;
+    return 'o' + oidOf(value);
+  }
+  // The number an object is known by: a mark on the object itself (not one of its prototype's: an object that is the prototype of others is a key of
+  // its own; not a property a proxy would be asked for; there on a frozen object too).
+  function oidOf(value) {
+    var id = __oid_of(value, nextId);
+    if (id === nextId) nextId++;
+    return id;
   }
   function Table() {
     this.keys = []; this.values = []; this.alive = []; this.index = {}; this.live = 0; this.dead = 0; this.iterators = []; this.loose = [];
@@ -363,11 +365,7 @@ const char kCollections[] = R"JSLIB((function (g) {
     var t = typeof value;
     if (t === 'object' || t === 'function') {
       if (value === null) return table.index['l'];
-      if (value.__oid === undefined) {
-        for (var i = 0; i < table.loose.length; i++) if (table.loose[i] === value) return table.index['x' + i];
-        try { Object.defineProperty(value, '__oid', { value: nextId++ }); } catch (e) { return undefined; }
-      }
-      return table.index['o' + value.__oid];
+      return table.index['o' + oidOf(value)];
     }
     return table.index[keyOf(table, value)];
   }
@@ -377,11 +375,8 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (at !== undefined) { table.values[at] = value; return; }
     var name;
     var t = typeof key;
-    if ((t === 'object' || t === 'function') && key !== null && key.__oid === undefined) {
-      try { Object.defineProperty(key, '__oid', { value: nextId++ }); name = 'o' + key.__oid; }
-      catch (e) { name = 'x' + table.loose.length; table.loose.push(key); }
-    } else if ((t === 'object' || t === 'function') && key !== null) {
-      name = 'o' + key.__oid;
+    if ((t === 'object' || t === 'function') && key !== null) {
+      name = 'o' + oidOf(key);
     } else {
       name = keyOf(table, key);
     }
@@ -516,15 +511,16 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (iterable !== undefined && iterable !== null) for (var e of iterable) this.set(e[0], e[1]);
   }
   var WMP = WeakMap.prototype;
-  def(WMP, 'get', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k ? k[this.__p] : undefined; });
+  // (an entry is a mark on the key itself - __mark_get and the others: an object does not have the entries of its prototype, a proxy's traps are not
+  // asked, and a frozen object can be a key)
+  def(WMP, 'get', function (k) { return __mark_get(k, this.__p); });
   def(WMP, 'set', function (k, v) {
     weakKey(k, 'as weak map key');
-    if (this.__p in k) k[this.__p] = v;
-    else Object.defineProperty(k, this.__p, { value: v, writable: true, configurable: true });
+    __mark_set(k, this.__p, v);
     return this;
   });
-  def(WMP, 'has', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k; });
-  def(WMP, 'delete', function (k) { if (!WMP.has.call(this, k)) return false; delete k[this.__p]; return true; });
+  def(WMP, 'has', function (k) { return __mark_has(k, this.__p); });
+  def(WMP, 'delete', function (k) { return __mark_delete(k, this.__p); });
   def(WMP, 'toString', function () { return '[object WeakMap]'; });
   def(g, 'WeakMap', WeakMap);
   function WeakSet(iterable) {
@@ -533,9 +529,9 @@ const char kCollections[] = R"JSLIB((function (g) {
     if (iterable !== undefined && iterable !== null) for (var v of iterable) this.add(v);
   }
   var WSP = WeakSet.prototype;
-  def(WSP, 'add', function (k) { weakKey(k, 'in weak set'); if (!(this.__p in k)) Object.defineProperty(k, this.__p, { value: true, writable: true, configurable: true }); return this; });
-  def(WSP, 'has', function (k) { return k !== null && (typeof k === 'object' || typeof k === 'function') && this.__p in k; });
-  def(WSP, 'delete', function (k) { if (!WSP.has.call(this, k)) return false; delete k[this.__p]; return true; });
+  def(WSP, 'add', function (k) { weakKey(k, 'in weak set'); __mark_set(k, this.__p, true); return this; });
+  def(WSP, 'has', function (k) { return __mark_has(k, this.__p); });
+  def(WSP, 'delete', function (k) { return __mark_delete(k, this.__p); });
   def(WSP, 'toString', function () { return '[object WeakSet]'; });
   def(g, 'WeakSet', WeakSet);
   function WeakRef(target) { needNew(this, WeakRef, 'WeakRef'); weakKey(target, 'as WeakRef target'); def(this, '__target', target); }
