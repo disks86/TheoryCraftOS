@@ -43,6 +43,11 @@ class MessageDialog : public Frame {
 
   // Texts; call before show(). The title names the document or the program the question is about. (Takes the third button away again.)
   void set_texts(StringView title, StringView line1, StringView line2, StringView accept, StringView decline);
+  // Which button Enter presses, has the heavier outline and starts with the focus: the first one unless told otherwise. A question whose first
+  // button destroys something (Delete, Replace) makes the last one, which leaves everything as it was, the default: set_default_choice(Choice::Decline).
+  // set_texts() makes the first button the default again.
+  void set_default_choice(Choice choice);
+  Choice default_choice() const { return default_; }
   // The third button, between the other two (empty: none); call after set_texts().
   void set_alternate(StringView text);
   // The question asked before a document with unsaved changes goes away: "Save" (the default), "Don't Save", "Cancel". `document` is its name
@@ -73,7 +78,9 @@ class MessageDialog : public Frame {
   Label line1_, line2_;
   Panel buttons_, gap_, gap2_;
   Button accept_, decline_, alternate_;
+  Button& default_button() { return default_ == Choice::Accept ? accept_ : default_ == Choice::Alternate ? alternate_ : decline_; }
   uint8_t choice_ = 0;
+  Choice default_ = Choice::Accept;
 };
 
 }  // namespace gui

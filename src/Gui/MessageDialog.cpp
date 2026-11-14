@@ -79,6 +79,15 @@ void MessageDialog::set_texts(StringView title, StringView line1, StringView lin
   accept_.set_text(accept);
   decline_.set_text(decline);
   set_alternate(StringView());
+  set_default_choice(Choice::Accept);
+}
+
+void MessageDialog::set_default_choice(Choice choice) {
+  UiGuard lock(this);
+  default_ = choice;
+  accept_.set_default(choice == Choice::Accept);
+  alternate_.set_default(choice == Choice::Alternate);
+  decline_.set_default(choice == Choice::Decline);
 }
 
 void MessageDialog::set_alternate(StringView text) {
@@ -113,7 +122,7 @@ bool MessageDialog::show(WindowManager& manager) {
   if (!manager.add_window(this, /*modal=*/true)) return false;
   if (Window* win = window()) {
     win->layout();
-    win->set_focus(&accept_);
+    win->set_focus(&default_button());
   }
   return true;
 }
@@ -129,7 +138,7 @@ void MessageDialog::on_alternate(void* self, Control&) { static_cast<MessageDial
 
 bool MessageDialog::on_key(const KeyArgs& args) {
   if (args.usage == hardware::key::kEnter) {  // a focused button handles Enter itself; this is for anything else
-    accept_.click();
+    default_button().click();
     return true;
   }
   return Frame::on_key(args);

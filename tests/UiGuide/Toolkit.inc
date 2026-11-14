@@ -210,6 +210,18 @@ static void ui_guide_toolkit() {
     // set_texts() makes it a two-button question again.
     ask.set_texts("Trash", "Empty the trash?", "", "Empty", "Cancel");
     CHECK(!ask.alternate_button().visible());
+    // A question whose first button destroys something: the last button is the default, so Enter and Escape both leave things alone.
+    ask.set_default_choice(MessageDialog::Choice::Decline);
+    CHECK(ask.decline_button().is_default() && !ask.accept_button().is_default());
+    CHECK(ask.show(mgr) && w.focus() == &ask.decline_button());
+    press(w, key::kEnter);
+    CHECK(!ask.showing() && ask.choice() == MessageDialog::Choice::Decline);
+    CHECK(ask.show(mgr));
+    w.layout();
+    alt(w, 'e');      // the action itself is still one key away
+    CHECK(!ask.showing() && ask.choice() == MessageDialog::Choice::Accept);
+    ask.set_texts("Trash", "Empty the trash?", "", "Empty", "Cancel");
+    CHECK(ask.default_choice() == MessageDialog::Choice::Accept && ask.accept_button().is_default());
 
     // --- A message is titled with what it is about: the name given, else the window the user was in. Never "Error".
     Frame doc(a);
