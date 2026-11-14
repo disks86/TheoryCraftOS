@@ -23,6 +23,12 @@ namespace desktop {
 using namespace gui;
 using namespace hardware;
 
+namespace {
+// The sheet is a picture of what comes out of the printer: white paper with black marks, whatever the colours of the desktop. These are content, like
+// the pixels of a photograph, not colours of the interface; everything around the sheet is painted with the theme.
+constexpr uint32_t kPaper = 0xFFFFFFFF, kPaperEdge = 0xFF000000, kInk = 0xFF303030, kDot = 0xFF202020;
+}  // namespace
+
 void PrintPreview::set_sheet(PaperSize paper, bool landscape, uint32_t margin_mm10) {
   UiGuard lock(this);
   paper_ = paper;
@@ -126,11 +132,11 @@ void PrintPreview::rebuild_picture(const Rect2D& area) {
   if (cache_.empty() || !picture_) return;
   PageBitmap page(allocator());
   if (!page.create(area.width, area.height) || !render_surface(*picture_, &page, fit_, method_, allocator())) {
-    for (uint32_t& p : cache_) p = 0xFFFFFFFF;
+    for (uint32_t& p : cache_) p = kPaper;
     return;
   }
   for (uint32_t y = 0; y < area.height; ++y)
-    for (uint32_t x = 0; x < area.width; ++x) cache_[uint64_t{y} * area.width + x] = page.get(x, y) ? 0xFF202020 : 0xFFFFFFFF;
+    for (uint32_t x = 0; x < area.width; ++x) cache_[uint64_t{y} * area.width + x] = page.get(x, y) ? kDot : kPaper;
 }
 
 void PrintPreview::paint(Painter& painter) {
@@ -140,8 +146,8 @@ void PrintPreview::paint(Painter& painter) {
   const Rect2D sheet = sheet_rect();
   if (sheet.width == 0) return;
   painter.fill({sheet.x + 3, sheet.y + 3, sheet.width, sheet.height}, t.dark);   // its shadow
-  painter.fill(sheet, 0xFFFFFFFF);
-  painter.outline(sheet, 0xFF000000);
+  painter.fill(sheet, kPaper);
+  painter.outline(sheet, kPaperEdge);
   const Rect2D area = printable_rect();
   if (area.width == 0 || area.height == 0) return;
   if (text_ && page_ < text_->page_count()) {
@@ -161,7 +167,7 @@ void PrintPreview::paint(Painter& painter) {
         while (end < line.size() && line[end] != ' ') ++end;
         const int32_t x0 = area.x + static_cast<int32_t>(k * area.width / columns);
         const int32_t x1 = area.x + static_cast<int32_t>(end * area.width / columns);
-        painter.fill({x0, bar_y, static_cast<uint32_t>(x1 > x0 ? x1 - x0 : 1), static_cast<uint32_t>(bar_h)}, 0xFF303030);
+        painter.fill({x0, bar_y, static_cast<uint32_t>(x1 > x0 ? x1 - x0 : 1), static_cast<uint32_t>(bar_h)}, kInk);
         k = end;
       }
     }

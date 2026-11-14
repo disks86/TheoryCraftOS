@@ -18,6 +18,7 @@
 
 #include "Desktop/Terminal.hpp"
 #include "Desktop/FileStatus.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Sync.hpp"
 
@@ -30,7 +31,7 @@ using filesystem::NodeType;
 using filesystem::OpenMode;
 using filesystem::Status;
 
-Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), shell_(allocator), opened_path_(allocator), pending_folder_(allocator), pending_line_(allocator) {
+Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(allocator), view_(allocator), view_menu_(allocator), ask_(allocator), shell_(allocator), opened_path_(allocator), pending_folder_(allocator), pending_line_(allocator) {
   set_title("Terminal");
   set_bounds({100, 80, 600, 380});
   set_padding(Insets::all(4));
@@ -40,16 +41,28 @@ Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(
   menu_.set_size(0, 22);
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("New Terminal", {&Terminal::on_new, this}, "Ctrl+N");
-    file->add_item("Save Output As...", {&Terminal::on_save, this}, "Ctrl+S");
+    save_item_ = file->add_item("Save Output As...", {&Terminal::on_save, this}, "Ctrl+S");
     file->add_separator();
-    file->add_item("Close", {&Terminal::on_close, this});
+    file->add_item("Exit", {&Terminal::on_close, this});   // (Exit, not Close: closing the frame ends the shell behind it)
   }
   if (Menu* edit = menu_.add_menu("Edit")) {
+    // (Ctrl+C alone stops the running program, so copying has the Shift: the shortcut text here is where the user learns that)
     edit->add_item("Copy All", {&Terminal::on_copy_all, this}, "Ctrl+Shift+C");
-    edit->add_item("Paste", {&Terminal::on_paste, this}, "Ctrl+V");
+    menu_paste_item_ = edit->add_item("Paste", {&Terminal::on_paste, this}, "Ctrl+V");
     edit->add_separator();
     edit->add_item("Clear", {&Terminal::on_clear, this}, "Ctrl+L");
   }
+  if (Menu* help = menu_.add_menu("Help")) help->add_item("About Terminal", {&Terminal::on_about, this});
+  menu_.on_opening(Handler::immediate(&Terminal::on_menu_opening, this));
+
+  // The view's own menu: the transfer commands, then Clear.
+  view_menu_.add_item("Copy All", {&Terminal::on_copy_all, this});
+  paste_item_ = view_menu_.add_item("Paste", {&Terminal::on_paste, this});
+  view_menu_.add_separator();
+  view_menu_.add_item("Clear", {&Terminal::on_clear, this});
+  view_menu_.on_opening(Handler::immediate(&Terminal::on_menu_opening, this));
+  view_.set_context_menu(&view_menu_);
+  ask_.on_result({&Terminal::on_close_answer, this});
 
   view_.set_dock(DockStyle::Fill);
   view_.on_submit({&Terminal::on_submitted, this});
@@ -66,7 +79,7 @@ Terminal::Terminal(allocators::IAllocator& allocator) : Frame(allocator), menu_(
   host.run_executable = &Terminal::host_run_executable;
   host.context = this;
   shell_.set_host(host);
-  view_.write("TheoryCraftOS terminal. Type help for the commands;\ndrop a folder here to go to it.\n\n");
+  view_.write("TheoryCraftOS terminal. Type help for the commands;\ndrop a folder here to go to it.\nCtrl+C stops a running program; Ctrl+Shift+C copies the output.\n\n");
   refresh_prompt();
 }
 
@@ -186,12 +199,45 @@ namespace {
 const FileDialog::Filter kOutputFilters[] = {{"Text files", "txt;log"}, {"All files", "*"}};
 }
 
+// Save Output As applies while there is a disk and a file dialog to choose the file in (the item is disabled otherwise).
 void Terminal::ask_save_output() {
-  if (!dialog_ || !manager()) return notify(NoticeKind::Error, "No file dialog available.");
+  if (!dialog_ || !fs_ || !manager()) return;
   String start(allocator());
   start.assign(shell_.cwd());
   if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save Output As", kOutputFilters, 2, start.view(), {&Terminal::on_save_picked, this}))
-    notify(NoticeKind::Warning, "The file dialog is busy.");
+    notify(NoticeKind::Information, "The output cannot be saved while another file dialog is open. Close that dialog, then choose Save Output As again.");
+}
+
+// Brings the items up to date as a menu opens: Paste needs text on the clipboard, Save Output As a disk and the file dialog.
+void Terminal::on_menu_opening(void* self, Control&) {
+  auto* t = static_cast<Terminal*>(self);
+  const kernel::Clipboard* board = t->view_.clipboard();
+  const bool text = !board || board->has_text();   // (with no system clipboard the view keeps what Copy All copied)
+  if (t->paste_item_) t->paste_item_->set_enabled(text);
+  if (t->menu_paste_item_) t->menu_paste_item_->set_enabled(text);
+  if (t->save_item_) t->save_item_->set_enabled(t->dialog_ != nullptr && t->fs_ != nullptr);
+}
+
+void Terminal::on_about(void* self, Control&) {
+  auto* t = static_cast<Terminal*>(self);
+  NoticeDialog::post(t->notices_, t->manager(), NoticeKind::Information, "Terminal is part of TheoryCraftOS.", "About Terminal");
+}
+
+bool Terminal::close_requested() {
+  WindowManager* m = manager();
+  if (!running_ || close_confirmed_ || !m) return true;
+  ask_.set_texts(title(), "A program is still running in this terminal.", "Closing the terminal stops the program.", "Close Terminal", "Cancel");
+  ask_.set_default_choice(MessageDialog::Choice::Decline);   // (stopping a program cannot be undone: the safe button is the default)
+  return !ask_.show(*m);   // (if the question cannot be shown, closing is not held up for ever)
+}
+
+void Terminal::on_close_answer(void* self, Control&) {
+  auto* t = static_cast<Terminal*>(self);
+  if (!t->ask_.accepted()) return;
+  t->close_confirmed_ = true;
+  if (IProgramControl* program = t->running_) program->interrupt();
+  t->close();
+  t->close_confirmed_ = false;
 }
 
 void Terminal::on_save_picked(void* self, Control&) {
@@ -201,12 +247,12 @@ void Terminal::on_save_picked(void* self, Control&) {
 
 bool Terminal::save_output(StringView path) {
   if (!fs_) {
-    notify(NoticeKind::Error, "No storage available.");
+    notify(NoticeKind::Error, "The output could not be saved because no disk is ready.");
     return false;
   }
   String text(allocator());
   if (!view_.text(&text)) {
-    notify(NoticeKind::Error, "Out of memory.");
+    notify(NoticeKind::Error, "The output could not be saved because there is not enough memory. Close something you do not need and try again.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -215,10 +261,11 @@ bool Terminal::save_output(StringView path) {
   if (status == Status::Ok) status = file->write(0, ConstByteView(reinterpret_cast<const uint8_t*>(text.c_str()), text.size()), &written);
   if (status == Status::Ok) status = file->flush();
   if (status != Status::Ok) {
+    // (the file's name as the file explorer shows it, not its path)
+    const uint64_t slash = path.rfind('/');
     String message(allocator());
-    message.append("Cannot save the output: ");
-    message.append(describe_status(status));
-    notify(NoticeKind::Error, message.view());
+    if (describe_failure(&message, "The output could not be saved as \"%1\" because %2.", slash == StringView::npos ? path : path.substr(slash + 1), status))
+      notify(NoticeKind::Error, message.view());
     return false;
   }
   fs_->flush();

@@ -40,7 +40,7 @@ class ToastCenter : public Control {
   static constexpr int32_t kActionHeight = 20, kActionGap = 6, kActionPad = 8;
   static constexpr int32_t kWidth = 340, kMargin = 8, kGap = 6, kPad = 6, kStripe = 4;
 
-  explicit ToastCenter(allocators::IAllocator& allocator) : Control(allocator), toasts_(allocator) {}
+  explicit ToastCenter(allocators::IAllocator& allocator) : Control(allocator), toasts_(allocator), missed_(allocator) {}
 
   // Shows a toast: a title (one line, cut at kTitleChars) and a message (word-wrapped over up to kMaxLines lines, longer text ends in "...").
   // It stays `duration_ms` (0: until clicked). `on_click` runs when the toast is clicked, with the center as its sender. Returns the toast's
@@ -73,6 +73,20 @@ class ToastCenter : public Control {
   // The bounds of toast number `index` (0 is the oldest, at the top) in the parent's coordinates; an empty rectangle if there is none.
   Rect2D toast_bounds(uint32_t index) const;
 
+  // --- The record of what was missed. A toast that goes away by itself (its time is up, or newer ones pushed it out) before it was clicked may never have
+  // been seen, so its texts are kept: the newest kMaxMissed of them, the oldest first, until clear_missed(). The desktop shows them in its Notifications
+  // window. A toast that was clicked, closed with its [x] or taken back with dismiss() is not recorded, and neither is one marked set_transient() (feedback
+  // that is only worth something at the moment, such as the volume level while its key is held). Read the texts with the UI lock held.
+  static constexpr uint32_t kMaxMissed = 50;
+  void set_transient(uint32_t id);
+  uint32_t missed_count() const { return static_cast<uint32_t>(missed_.count()); }
+  StringView missed_title(uint32_t index) const { return index < missed_.count() ? missed_[index].title.view() : StringView(); }
+  StringView missed_message(uint32_t index) const { return index < missed_.count() ? missed_[index].body.view() : StringView(); }
+  NoticeKind missed_kind(uint32_t index) const { return index < missed_.count() ? missed_[index].kind : NoticeKind::Information; }
+  // Counts every toast ever recorded (it does not go back when the record is cleared): whoever shows the record sees from it that there is something new.
+  uint32_t missed_serial() const { return missed_serial_; }
+  void clear_missed();
+
   void layout() override;
   void paint(Painter& painter) override;
   void on_mouse_down(const MouseArgs& args) override;
@@ -90,6 +104,12 @@ class ToastCenter : public Control {
     Handler on_click, on_action;
     String actions[kMaxActions];   // the texts of the buttons
     uint32_t action_count = 0;
+    bool transient = false;   // not recorded when it times out
+  };
+  struct Missed {
+    explicit Missed(allocators::IAllocator& allocator) : title(allocator), body(allocator) {}
+    String title, body;
+    NoticeKind kind = NoticeKind::Information;
   };
 
   static int32_t height_of(const Toast& toast);
@@ -99,8 +119,12 @@ class ToastCenter : public Control {
   int32_t stack_height() const;
   // The toast whose rectangle holds y (this control's coordinates), or count() if none.
   uint32_t toast_at(int32_t y) const;
+  // Records toast `index`, which is about to go away unseen (see missed_count()).
+  void remember(uint64_t index);
 
   List<Toast> toasts_;
+  List<Missed> missed_;
+  uint32_t missed_serial_ = 0;
   Rect2D area_;
   bool has_area_ = false;
   uint32_t next_id_ = 1;

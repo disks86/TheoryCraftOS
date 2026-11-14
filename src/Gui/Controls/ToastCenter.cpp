@@ -94,7 +94,10 @@ uint32_t ToastCenter::post(StringView title, StringView message, NoticeKind kind
   if (!toasts_.push_back(static_cast<Toast&&>(toast))) return 0;
   const uint32_t id = next_id_++;
   if (next_id_ == 0) next_id_ = 1;
-  while (toasts_.count() > kMaxToasts) toasts_.remove_at(0);
+  while (toasts_.count() > kMaxToasts) {   // (pushed out by newer ones: it may not have been read)
+    remember(0);
+    toasts_.remove_at(0);
+  }
   invalidate();
   return id;
 }
@@ -108,6 +111,27 @@ bool ToastCenter::dismiss(uint32_t id) {
     return true;
   }
   return false;
+}
+
+void ToastCenter::set_transient(uint32_t id) {
+  UiGuard lock(this);
+  for (Toast& t : toasts_)
+    if (t.id == id) t.transient = true;
+}
+
+void ToastCenter::remember(uint64_t index) {
+  Toast& t = toasts_[index];
+  if (t.transient) return;
+  Missed m(allocator());
+  if (!m.title.assign(t.title.view()) || !m.body.assign(t.body.view())) return;   // (no memory: the record goes without this one)
+  m.kind = t.kind;
+  if (missed_.count() >= kMaxMissed) missed_.remove_at(0);
+  if (missed_.push_back(static_cast<Missed&&>(m))) ++missed_serial_;
+}
+
+void ToastCenter::clear_missed() {
+  UiGuard lock(this);
+  missed_.clear();
 }
 
 void ToastCenter::clear() {
@@ -128,6 +152,7 @@ uint32_t ToastCenter::tick(uint64_t uptime_us) {
       if (t.deadline_us == 0) t.deadline_us = 1;
     }
     if (uptime_us >= t.deadline_us) {
+      remember(i);
       toasts_.remove_at(i);
       ++gone;
     } else {

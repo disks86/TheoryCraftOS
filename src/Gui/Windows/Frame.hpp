@@ -165,6 +165,13 @@ class Frame : public Control {
   void on_mouse_up(const MouseArgs& args) override;
   bool on_key(const KeyArgs& args) override;
 
+  // Access keys (see AccessKey.hpp). The frame is the scope: every label in it (menu titles, buttons, check boxes, labels ending in a colon) gets a letter
+  // that no other label in the frame has, in the order the controls were added. Done before the frame is painted and before a key is looked up, so the
+  // underlines always match. A tab leaves it to the window that holds it.
+  void assign_access_keys();
+  // Alt+letter: activates the control whose label has that access key. False if no enabled, visible control has it.
+  bool on_access_key(char letter) override;
+
  protected:
   // Told when the manager the frame is in changes (a window manager added or removed it): a tabbed window passes that on to its tabs.
   virtual void manager_changed() {}

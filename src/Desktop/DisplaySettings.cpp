@@ -17,6 +17,8 @@
  */
 
 #include "Desktop/DisplaySettings.hpp"
+#include "Desktop/Format.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Gui/Window.hpp"
 
 namespace desktop {
@@ -52,7 +54,7 @@ void make_row(Panel& row, Label& label, DropDown& list, const char* text) {
   row.set_size(0, 28);
   label.set_text(text);
   label.set_dock(DockStyle::Left);
-  label.set_size(140, 0);
+  label.set_size(220, 0);
   list.set_dock(DockStyle::Fill);
   row.add(&label);
   row.add(&list);
@@ -63,12 +65,19 @@ void make_row(Panel& row, Label& label, DropDown& list, const char* text) {
 DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
     : Frame(allocator),
       map_(allocator),
+      body_(allocator),
+      buttons_(allocator),
       details_(allocator),
       settings_(allocator),
       resolution_row_(allocator),
       refresh_row_(allocator),
       scale_row_(allocator),
-      buttons_(allocator),
+      filler_(allocator),
+      spacer_(allocator),
+      gap_a_(allocator),
+      gap_b_(allocator),
+      gap_c_(allocator),
+      map_menu_(allocator),
       info_{Label(allocator), Label(allocator), Label(allocator), Label(allocator), Label(allocator)},
       resolution_label_(allocator),
       refresh_label_(allocator),
@@ -77,39 +86,66 @@ DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
       refresh_(allocator),
       scale_(allocator),
       primary_button_(allocator),
-      apply_button_(allocator),
-      close_button_(allocator) {
+      restore_button_(allocator),
+      ok_button_(allocator),
+      cancel_button_(allocator),
+      apply_button_(allocator) {
   set_title("Display Settings");
   set_bounds({110, 40, 600, 500});
   set_padding(Insets::all(8));
-  set_minimize_enabled(true);
+  set_minimize_enabled(false);     // a secondary frame: no Minimize or Maximize
+  set_maximize_enabled(false);
 
-  buttons_.set_style(PanelStyle::Transparent);
-  buttons_.set_dock(DockStyle::Bottom);
+  // The buttons: what acts on the monitors at the left, then OK (the default button), Cancel and Apply at the right.
   buttons_.set_size(0, 30);
-  close_button_.set_text("Close");
-  close_button_.set_dock(DockStyle::Right);
-  close_button_.set_size(90, 0);
-  close_button_.on_click(Handler::immediate(&DisplaySettings::on_close, this));
   primary_button_.set_text("Make Primary");
-  primary_button_.set_dock(DockStyle::Left);
-  primary_button_.set_size(130, 0);
+  primary_button_.set_size(118, 0);
   primary_button_.on_click({&DisplaySettings::on_primary, this});
+  restore_button_.set_text("Restore Previous");
+  restore_button_.set_size(142, 0);
+  restore_button_.on_click({&DisplaySettings::on_restore, this});
+  ok_button_.set_text("OK");
+  ok_button_.set_size(80, 0);
+  ok_button_.set_default(true);
+  ok_button_.on_click({&DisplaySettings::on_ok, this});
+  cancel_button_.set_text("Cancel");
+  cancel_button_.set_size(80, 0);
+  cancel_button_.on_click({&DisplaySettings::on_cancel, this});
   apply_button_.set_text("Apply");
-  apply_button_.set_dock(DockStyle::Left);
-  apply_button_.set_size(100, 0);
+  apply_button_.set_size(80, 0);
   apply_button_.on_click({&DisplaySettings::on_apply, this});
-  buttons_.add(&close_button_);
+  Panel* const gaps[] = {&gap_a_, &gap_b_, &gap_c_};
+  for (Panel* gap : gaps) {
+    gap->set_style(PanelStyle::Transparent);
+    gap->set_size(6, 0);
+  }
+  spacer_.set_style(PanelStyle::Transparent);
+  spacer_.set_dock(DockStyle::Fill);
   buttons_.add(&primary_button_);
+  buttons_.add(&gap_a_);
+  buttons_.add(&restore_button_);
+  buttons_.add(&spacer_);
+  buttons_.add(&ok_button_);
+  buttons_.add(&gap_b_);
+  buttons_.add(&cancel_button_);
+  buttons_.add(&gap_c_);
   buttons_.add(&apply_button_);
 
-  map_.set_dock(DockStyle::Top);
+  // A monitor's commands, for the keyboard and for those who do not drag.
+  primary_item_ = map_menu_.add_item("Make Primary", {&DisplaySettings::on_primary, this});
+  map_menu_.add_separator();
+  move_items_[0] = map_menu_.add_item("Move Left", {&DisplaySettings::on_move_left, this});
+  move_items_[1] = map_menu_.add_item("Move Right", {&DisplaySettings::on_move_right, this});
+  move_items_[2] = map_menu_.add_item("Move Up", {&DisplaySettings::on_move_up, this});
+  move_items_[3] = map_menu_.add_item("Move Down", {&DisplaySettings::on_move_down, this});
+  map_menu_.on_opening(Handler::immediate(&DisplaySettings::on_map_menu_opening, this));
+  map_.set_context_menu(&map_menu_);
+
   map_.set_size(0, 190);
   map_.on_selection_changed({&DisplaySettings::on_map_selected, this});
   map_.on_moved({&DisplaySettings::on_map_moved, this});
 
   details_.set_style(PanelStyle::Transparent);
-  details_.set_dock(DockStyle::Top);
   details_.set_size(0, 6 + kInfoLines * 20);
   details_.set_padding({0, 4, 0, 0});
   for (Label& line : info_) {
@@ -119,21 +155,27 @@ DisplaySettings::DisplaySettings(allocators::IAllocator& allocator)
   }
 
   settings_.set_style(PanelStyle::Transparent);
-  settings_.set_dock(DockStyle::Top);
   settings_.set_size(0, 3 * 28 + 4);
   settings_.set_padding({0, 4, 0, 0});
-  make_row(resolution_row_, resolution_label_, resolution_, "Resolution");
-  make_row(refresh_row_, refresh_label_, refresh_, "Refresh rate");
-  make_row(scale_row_, scale_label_, scale_, "Scale (DPI)");
+  make_row(resolution_row_, resolution_label_, resolution_, "Resolution:");
+  make_row(refresh_row_, refresh_label_, refresh_, "Refresh rate:");
+  make_row(scale_row_, scale_label_, scale_, "Size of text and pictures:");
   resolution_.on_selection_changed({&DisplaySettings::on_resolution_chosen, this});
+  refresh_.on_selection_changed({&DisplaySettings::on_list_chosen, this});
+  scale_.on_selection_changed({&DisplaySettings::on_list_chosen, this});
   settings_.add(&resolution_row_);
   settings_.add(&refresh_row_);
   settings_.add(&scale_row_);
 
-  add(&buttons_);
-  add(&map_);
-  add(&details_);
-  add(&settings_);
+  filler_.set_style(PanelStyle::Transparent);
+  filler_.set_dock(DockStyle::Fill);
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&map_);
+  body_.add(&details_);
+  body_.add(&settings_);
+  body_.add(&filler_);
+  body_.add(&buttons_);
+  add(&body_);
   refresh();
 }
 
@@ -223,6 +265,7 @@ void DisplaySettings::fill_dependent_lists() {
     scale_.set_selected_index(scale_count_ ? current_scale : -1);
   }
   filling_ = false;
+  update_buttons();
 }
 
 void DisplaySettings::update_details() {
@@ -292,7 +335,7 @@ void DisplaySettings::update_details() {
   text.append(", scale ");
   append_scale(&text, monitors_->scale_of(m->id()));
   info_[3].set_text(text.view());
-  if (asking_) info_[4].set_text("Keep the new settings? They go back soon.");
+  if (asking_) info_[4].set_text("The new settings are waiting for your answer: Keep or Revert.");
   else if (!monitors_->can_set_refresh(m->id())) info_[4].set_text("This display device cannot change the refresh rate.");
   else info_[4].set_text(StringView());
 }
@@ -301,7 +344,27 @@ void DisplaySettings::update_buttons() {
   const Monitor* m = selected_monitor();
   const int32_t slot = m && monitors_ ? monitors_->layout().find(m->id()) : -1;
   primary_button_.set_enabled(slot >= 0 && !monitors_->layout().at(static_cast<uint32_t>(slot)).primary);
-  apply_button_.set_enabled(m != nullptr && !asking_);
+  apply_button_.set_enabled(m != nullptr && !asking_ && pending());   // (nothing to apply: unavailable)
+  restore_button_.set_enabled(previous_.valid() && !asking_);
+}
+
+bool DisplaySettings::pending() const {
+  const Monitor* m = selected_monitor();
+  if (!m || !monitors_) return false;
+  const int32_t res = resolution_.selected_index(), rate = refresh_.selected_index(), scale = scale_.selected_index();
+  if (res < 0 || static_cast<uint32_t>(res) >= resolution_count_) return false;
+  const MonitorMode now = m->current_mode();
+  if (resolutions_[res].width != now.width || resolutions_[res].height != now.height) return true;
+  if (rate >= 0 && static_cast<uint32_t>(rate) < rate_count_ && refresh_.enabled() && rates_[rate] != now.refresh_millihz) return true;
+  // (the scale list starts at the largest scale that is not more than the one in use; another choice than that is a change)
+  if (scale >= 0 && static_cast<uint32_t>(scale) < scale_count_) {
+    const uint32_t in_use = monitors_->scale_of(m->id());
+    uint32_t shown = scales_[0];
+    for (uint32_t i = 0; i < scale_count_; ++i)
+      if (scales_[i] <= in_use) shown = scales_[i];
+    if (scales_[scale] != shown) return true;
+  }
+  return false;
 }
 
 // --- Events --------------------------------------------------------------------------------------------
@@ -324,15 +387,106 @@ void DisplaySettings::on_resolution_chosen(void* self, Control&) {
   if (!d->filling_) d->fill_dependent_lists();
 }
 
+void DisplaySettings::on_list_chosen(void* self, Control&) {
+  auto* d = static_cast<DisplaySettings*>(self);
+  if (!d->filling_) d->update_buttons();
+}
+
 void DisplaySettings::on_primary(void* self, Control&) { static_cast<DisplaySettings*>(self)->make_primary(); }
 void DisplaySettings::on_apply(void* self, Control&) { static_cast<DisplaySettings*>(self)->apply_settings(); }
-void DisplaySettings::on_close(void* self, Control&) { static_cast<DisplaySettings*>(self)->close(); }
+void DisplaySettings::on_ok(void* self, Control&) { static_cast<DisplaySettings*>(self)->accept(); }
+void DisplaySettings::on_cancel(void* self, Control&) { static_cast<DisplaySettings*>(self)->cancel(); }
+void DisplaySettings::on_restore(void* self, Control&) { static_cast<DisplaySettings*>(self)->restore_previous(); }
+void DisplaySettings::on_move_left(void* self, Control&) { static_cast<DisplaySettings*>(self)->map_.move_selected(-1, 0); }
+void DisplaySettings::on_move_right(void* self, Control&) { static_cast<DisplaySettings*>(self)->map_.move_selected(1, 0); }
+void DisplaySettings::on_move_up(void* self, Control&) { static_cast<DisplaySettings*>(self)->map_.move_selected(0, -1); }
+void DisplaySettings::on_move_down(void* self, Control&) { static_cast<DisplaySettings*>(self)->map_.move_selected(0, 1); }
+
+void DisplaySettings::on_map_menu_opening(void* self, Control&) {   // what does not apply is unavailable, not missing
+  auto* d = static_cast<DisplaySettings*>(self);
+  if (d->primary_item_) d->primary_item_->set_enabled(d->primary_button_.enabled());
+  for (MenuItem* item : d->move_items_)
+    if (item) item->set_enabled(d->map_.box_count() > 1 && d->map_.selected() != MonitorMap::kNone);
+}
+
+// Enter is OK and Escape is Cancel (a focused button or list takes Enter first); Ctrl+Z is Restore Previous.
+bool DisplaySettings::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter) {
+    ok_button_.click();
+    return true;
+  }
+  if (args.usage == hardware::key::kA + 25 && (args.modifiers & hardware::modifier::kControl)) {   // Ctrl+Z
+    if (restore_button_.enabled()) restore_button_.click();
+    return true;
+  }
+  if (args.usage == hardware::key::kEscape) {
+    cancel_button_.click();
+    return true;
+  }
+  return Frame::on_key(args);
+}
+
+// OK: applies what is pending (the window then closes once the new settings are kept), or just closes.
+void DisplaySettings::accept() {
+  if (asking_) return;
+  if (!pending()) {
+    close();
+    return;
+  }
+  close_when_kept_ = true;
+  if (!apply_settings() || !asking_) {      // it did not work (the window stays), or nobody had to be asked
+    const bool done = !pending();
+    close_when_kept_ = false;
+    if (done) close();
+  }
+}
+
+// Cancel: the choices that were not applied are dropped (what Apply already did stays).
+void DisplaySettings::cancel() {
+  if (asking_) return;
+  fill_lists();
+  close();
+}
+
+// The close button is not Cancel: with choices that were not applied it asks what to do with them.
+bool DisplaySettings::close_requested() {
+  if (asking_) return false;      // (the keep question is open: it is answered first)
+  if (!pending() || !confirm_ || !manager()) return true;
+  question_ = Question::ApplyOnClose;
+  confirm_->set_texts("Display Settings", "Apply the changes to the display settings?", "They have not been applied yet.", "Apply", "Cancel");
+  confirm_->set_alternate("Don't Apply");
+  confirm_->on_result({&DisplaySettings::on_confirm_result, this});
+  if (!confirm_->show(*manager())) {
+    question_ = Question::None;
+    return true;
+  }
+  return false;
+}
+
+bool DisplaySettings::restore_previous() {
+  if (!previous_.valid() || !monitors_ || asking_) return false;
+  hardware::SystemMonitors::State now;
+  monitors_->save(&now);
+  const bool ok = monitors_->restore(previous_) && make_real();
+  if (!ok) {              // it could not be put back: as it was
+    monitors_->restore(now);
+    make_real();
+  } else {
+    previous_ = now;      // (Restore Previous again goes forward again)
+  }
+  refresh();
+  return ok;
+}
 
 // --- Commands ----------------------------------------------------------------------------------------
 
 bool DisplaySettings::make_primary() {
   const Monitor* m = selected_monitor();
-  if (!m || !monitors_ || !monitors_->layout().set_primary(m->id())) return false;
+  if (!m || !monitors_) return false;
+  hardware::SystemMonitors::State was;
+  monitors_->save(&was);
+  if (!monitors_->layout().set_primary(m->id())) return false;
+  previous_ = was;
   make_real();
   refresh();
   return true;
@@ -340,8 +494,13 @@ bool DisplaySettings::make_primary() {
 
 bool DisplaySettings::move_monitor(uint32_t id, int32_t x, int32_t y) {
   if (!monitors_) return false;
+  hardware::SystemMonitors::State was;
+  monitors_->save(&was);
   const bool moved = monitors_->move_monitor(id, x, y);
-  if (moved) make_real();
+  if (moved) {
+    previous_ = was;
+    make_real();
+  }
   refresh();   // (a monitor that could go nowhere is drawn back where it was)
   return moved;
 }
@@ -373,39 +532,81 @@ bool DisplaySettings::apply_settings() {
   }
   refresh();
   if (!confirm_ || !manager()) {   // nobody to ask: the settings are kept
+    previous_ = before_;
     before_ = hardware::SystemMonitors::State();
+    update_buttons();
     return true;
   }
   asking_ = true;
   seconds_left_ = kConfirmSeconds;
-  confirm_->set_texts("Display Settings", "Keep these display settings?", "They go back in 15 seconds.", "Keep", "Revert");
-  confirm_->on_result({&DisplaySettings::on_confirm_result, this});
-  if (!confirm_->show(*manager())) {
+  show_keep_question();
+  if (!confirm_->showing()) {      // it could not be asked: kept
     asking_ = false;
+    question_ = Question::None;
+    previous_ = before_;
     before_ = hardware::SystemMonitors::State();
   }
   update_buttons();
   return true;
 }
 
+// "Keep these display settings?" with Keep, More Time and Revert. Revert, the answer that brings back a picture that worked, is the default
+// button and has the focus, so Enter and Escape both go back; the line under the question says how long the automatic way back still waits.
+void DisplaySettings::show_keep_question() {
+  if (!confirm_ || !manager()) return;
+  String seconds(allocator()), line(allocator());
+  seconds.append_uint(seconds_left_);
+  format_message(&line, seconds_left_ == 1 ? "The old ones come back in %1 second." : "The old ones come back in %1 seconds.", seconds.view());
+  confirm_->set_texts("Display Settings", "Keep these display settings?", line.view(), "Keep", "Revert");
+  confirm_->set_alternate("More Time");
+  confirm_->set_default_choice(MessageDialog::Choice::Decline);
+  if (confirm_->showing()) return;      // (only the seconds changed)
+  question_ = Question::Keep;
+  confirm_->on_result({&DisplaySettings::on_confirm_result, this});
+  confirm_->show(*manager());
+}
+
+void DisplaySettings::more_time() {
+  if (!asking_) return;
+  seconds_left_ = kMoreSeconds;
+  show_keep_question();
+}
+
 void DisplaySettings::on_confirm_result(void* self, Control&) {
   auto* d = static_cast<DisplaySettings*>(self);
+  const MessageDialog::Choice choice = d->confirm_ ? d->confirm_->choice() : MessageDialog::Choice::Decline;
+  const Question question = d->question_;
+  if (question == Question::ApplyOnClose) {
+    d->question_ = Question::None;
+    if (choice == MessageDialog::Choice::Accept) d->accept();           // apply, then close
+    else if (choice == MessageDialog::Choice::Alternate) d->cancel();   // close without applying
+    return;                                                             // (Cancel: the window stays, the choices too)
+  }
   if (!d->asking_) return;
-  if (d->confirm_ && d->confirm_->accepted()) d->keep_changes();
+  if (choice == MessageDialog::Choice::Accept) d->keep_changes();
+  else if (choice == MessageDialog::Choice::Alternate) d->more_time();
   else d->revert_changes();
 }
 
 void DisplaySettings::keep_changes() {
   if (!asking_) return;
   asking_ = false;
+  question_ = Question::None;
+  previous_ = before_;      // (Restore Previous can still take them back)
   before_ = hardware::SystemMonitors::State();
   if (confirm_ && confirm_->showing()) confirm_->close();
   update_details();
+  if (close_when_kept_) {
+    close_when_kept_ = false;
+    close();
+  }
 }
 
 void DisplaySettings::revert_changes() {
   const bool was_asking = asking_;
   asking_ = false;
+  question_ = Question::None;
+  close_when_kept_ = false;      // (OK did not get its settings: the window stays)
   if (confirm_ && confirm_->showing()) confirm_->close();
   if (!was_asking || !before_.valid() || !monitors_) return;
   monitors_->restore(before_);
@@ -422,13 +623,7 @@ void DisplaySettings::tick() {
     revert_changes();   // (the dialog closes with it)
     return;
   }
-  if (confirm_ && confirm_->showing()) {
-    String text(allocator());
-    text.assign("They go back in ");
-    text.append_uint(seconds_left_);
-    text.append(seconds_left_ == 1 ? " second." : " seconds.");
-    confirm_->set_texts("Display Settings", "Keep these display settings?", text.view(), "Keep", "Revert");
-  }
+  if (confirm_ && confirm_->showing()) show_keep_question();   // (the seconds in its second line)
 }
 
 }  // namespace desktop

@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/WebNotifications.hpp"
+#include "Desktop/Format.hpp"
 #include "Utility/Move.hpp"
 
 namespace desktop {
@@ -153,11 +154,11 @@ void WebNotifications::pump() {
   mutex_.unlock();
   if (!next.empty()) {
     const bool microphone = next.view().starts_with("m:");
+    // One whole sentence with the site in it, under the name of the program that asks; "Block" changes nothing and is the default.
     String line(allocator_);
-    line.append(next.view().substr(2));
-    line.append(microphone ? " wants to use your microphone." : " wants to show notifications.");
-    if (microphone) dialog_.set_texts("Microphone", line.view(), "Allow this site to use the microphone?", "Allow", "Block");
-    else dialog_.set_texts("Notifications", line.view(), "Allow this site to show notifications?", "Allow", "Block");
+    format_message(&line, microphone ? "%1 wants to use your microphone." : "%1 wants to show notifications.", next.view().substr(2));
+    dialog_.set_texts("Web Browser", line.view(), microphone ? "Allow this site to use the microphone?" : "Allow this site to show notifications?", "Allow", "Block");
+    dialog_.set_default_choice(gui::MessageDialog::Choice::Decline);
     if (!dialog_.show(windows_)) {   // (it cannot be asked: the answer is no)
       mutex_.lock();
       asking_.clear();

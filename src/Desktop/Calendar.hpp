@@ -27,16 +27,23 @@
 // and the marks in the month show them too. Monthly and yearly ones can keep to a weekday instead of a date (the 4th Thursday of November, the last Monday of
 // May). For a repeating appointment the "Change" box says whether Save and Delete work on all of its occurrences or only on the one chosen in the list (an
 // occurrence can be given another day, time or title, or be left out; Reset gives it back to the series).
+//
+// From the keyboard: the arrow keys move by a day or a week in the month, Home and End go to the start and end of the week, Page Up / Page Down
+// change the month; every label carries the access key of its field; Enter in the form presses the button with the heavier outline (Save while an
+// appointment is chosen, Add otherwise); Delete in the list deletes the chosen appointment. Deleting cannot be undone, so it asks first and the
+// button that keeps the appointment is the default. The month and the list each have a context menu (right click, the Menu key, Shift+F10).
 #pragma once
 #include "Desktop/CalendarStore.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/CheckBox.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/DatePicker.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
 #include "Gui/Controls/SpinBox.hpp"
 #include "Gui/Controls/TextBox.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
@@ -103,6 +110,11 @@ class Calendar : public gui::Frame {
   bool delete_event();
   bool reset_event();
   void go_to_today();
+  // What the Delete button, the Delete key and the menu do: they ask first ("Delete" / "Cancel", Cancel being the default) and delete when the answer
+  // is Delete. False when no appointment is chosen or the question could not be shown.
+  bool ask_delete();
+  // Puts the focus in the title field with the chosen appointment's title selected, ready to be changed (the menu's "Edit").
+  bool edit_event();
   // Chooses a day (the list shows its appointments).
   void select_date(const gui::Date& date);
   // Chooses the appointment at `index` in the list (-1: none) and puts it in the form.
@@ -136,7 +148,12 @@ class Calendar : public gui::Frame {
   gui::Button& delete_button() { return delete_; }
   gui::Button& reset_button() { return reset_; }
   gui::Button& today_button() { return today_button_; }
+  gui::ContextMenu& event_menu() { return event_menu_; }
+  gui::ContextMenu& month_menu() { return month_menu_; }
+  gui::MessageDialog& question() { return ask_; }
+  gui::Label& day_label() { return day_label_; }
 
+  bool on_key(const gui::KeyArgs& args) override;
   void layout() override;
 
  private:
@@ -148,6 +165,12 @@ class Calendar : public gui::Frame {
   static void on_reset(void* self, gui::Control&);
   static void on_today(void* self, gui::Control&);
   static void on_form_changed(void* self, gui::Control&);
+  static void on_edit(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  static void on_answer(void* self, gui::Control&);
+  // Says what is wrong with the form and puts the focus on the field at fault.
+  void fault(gui::Control& field, StringView text);
+  bool remove_occurrence(uint32_t id, int64_t original_day, bool one);
   void say(StringView text) { status_.set_text(text); }
   // The form's start (on the date of the form), and the same on the first day of the chosen appointment (for a change of all of its occurrences).
   int64_t form_start() const;
@@ -159,7 +182,7 @@ class Calendar : public gui::Frame {
   bool repeating_selection() const;
   void update_form();   // enables what applies to the form as it is (no time for an all-day appointment, no "every" for one that does not repeat, ...)
 
-  gui::Label day_label_, title_label_, time_label_, colon_label_, length_label_, remind_label_, repeat_label_, every_label_, by_label_, scope_label_, status_;
+  gui::Label day_label_, title_label_, time_label_, at_label_, colon_label_, length_label_, remind_label_, repeat_label_, every_label_, by_label_, scope_label_, status_;
   MonthGrid grid_;
   gui::ListView list_;
   gui::TextBox title_;
@@ -168,6 +191,13 @@ class Calendar : public gui::Frame {
   gui::CheckBox all_day_, until_check_;
   gui::DropDown repeat_, by_, scope_;
   gui::Button add_, update_, delete_, reset_, today_button_;
+  gui::ContextMenu event_menu_, month_menu_;
+  gui::MenuItem *menu_delete_ = nullptr, *menu_reset_ = nullptr, *menu_edit_ = nullptr;
+  // The question before an appointment is deleted, and which one it was asked about.
+  gui::MessageDialog ask_;
+  uint32_t pending_id_ = 0;
+  int64_t pending_day_ = 0;
+  bool pending_one_ = false;
   CalendarStore* store_ = nullptr;
   TimeSource time_ = nullptr;
   void* time_context_ = nullptr;

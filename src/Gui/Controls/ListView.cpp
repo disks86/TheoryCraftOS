@@ -222,6 +222,8 @@ void ListView::clear_items() {
   icons_.clear();
   marks_.clear();
   marked_ = 0;
+  focus_only_ = false;
+  anchor_ = collapse_on_release_ = -1;
   scroll_x_ = scroll_y_ = 0;
   last_click_item_ = -1;
   const bool had_selection = selected_ >= 0;
@@ -397,7 +399,9 @@ void ListView::select_item(int32_t item) {
   UiGuard lock(this);
   if (item < -1 || item >= static_cast<int32_t>(model_.row_count())) return;
   if (item >= 0) ensure_visible(static_cast<uint32_t>(item));
-  const bool was_multiple = clear_marks();
+  const bool was_multiple = clear_marks() || focus_only_;
+  focus_only_ = false;
+  anchor_ = item;
   if (item == selected_ && !was_multiple) return;
   selected_ = item;
   invalidate();
@@ -417,18 +421,73 @@ void ListView::select_all() {
   if (n == 0 || marks_.count() != n) return;
   for (uint8_t& m : marks_) m = 1;
   marked_ = n;
+  focus_only_ = false;
   if (selected_ < 0) selected_ = 0;
   invalidate();
   fire(selection_changed_);
 }
 
-void ListView::move_selection(int32_t delta) {
+void ListView::move_selection(int32_t delta, uint8_t modifiers) {
   const int32_t n = static_cast<int32_t>(model_.row_count());
   if (n == 0) return;
   int32_t target = selected_ < 0 ? (delta > 0 ? 0 : n - 1) : selected_ + delta;
   if (target < 0) target = 0;
   if (target >= n) target = n - 1;
-  select_item(target);
+  move_to(target, modifiers);
+}
+
+// A navigation key lands on `target`: alone it selects it; in an extended selection Shift selects from the anchor to it and Ctrl only moves the focus.
+void ListView::move_to(int32_t target, uint8_t modifiers) {
+  if (!extended_ || !(modifiers & (hardware::modifier::kShift | hardware::modifier::kControl))) {
+    select_item(target);
+    return;
+  }
+  if (modifiers & hardware::modifier::kShift) {
+    select_range(anchor_ >= 0 ? anchor_ : (selected_ >= 0 ? selected_ : target), target);
+    return;
+  }
+  marks_from_single();
+  if (!marked_) focus_only_ = true;
+  selected_ = target;
+  ensure_visible(static_cast<uint32_t>(target));
+  invalidate();
+}
+
+// A single selected item becomes a marked one, so that others can be added to it.
+void ListView::marks_from_single() {
+  if (marked_ || focus_only_ || selected_ < 0 || static_cast<uint64_t>(selected_) >= marks_.count()) return;
+  marks_[static_cast<uint64_t>(selected_)] = 1;
+  marked_ = 1;
+}
+
+// Selects the items from `from` to `to` (either order) and nothing else; the focus goes to `to` and the anchor stays `from`.
+void ListView::select_range(int32_t from, int32_t to) {
+  const int32_t n = static_cast<int32_t>(marks_.count());
+  if (from < 0 || to < 0 || from >= n || to >= n) return;
+  const int32_t low = from < to ? from : to, high = from < to ? to : from;
+  for (int32_t i = 0; i < n; ++i) marks_[static_cast<uint64_t>(i)] = i >= low && i <= high ? 1 : 0;
+  marked_ = static_cast<uint32_t>(high - low + 1);
+  focus_only_ = false;
+  anchor_ = from;
+  selected_ = to;
+  ensure_visible(static_cast<uint32_t>(to));
+  invalidate();
+  fire(selection_changed_);
+}
+
+// Ctrl+click, Space: the item changes sides and the rest stays. It gets the focus and becomes the anchor.
+void ListView::toggle_item(int32_t item) {
+  if (item < 0 || static_cast<uint64_t>(item) >= marks_.count()) return;
+  marks_from_single();
+  uint8_t& mark = marks_[static_cast<uint64_t>(item)];
+  mark = mark ? 0 : 1;
+  marked_ = mark ? marked_ + 1 : marked_ - 1;
+  focus_only_ = marked_ == 0;   // the last one went: the item keeps the focus, selected no more
+  selected_ = item;
+  anchor_ = item;
+  ensure_visible(static_cast<uint32_t>(item));
+  invalidate();
+  fire(selection_changed_);
 }
 
 void ListView::scroll_by(int32_t dx, int32_t dy) {
@@ -538,7 +597,8 @@ void ListView::paint(Painter& painter) {
         x += w;
       }
     }
-    if (selected && focused() && mode_ != ViewMode::Icons) painter.focus_frame(cell);
+    // (with an extended selection the focus is on one item, selected or not)
+    if ((extended_ ? static_cast<int32_t>(i) == selected_ : selected) && focused() && mode_ != ViewMode::Icons) painter.focus_frame(cell);
     painter.pop_frame();
   }
   painter.pop_frame();
@@ -583,7 +643,23 @@ void ListView::on_mouse_down(const MouseArgs& args) {
     last_click_item_ = -1;
     return;
   }
-  select_item(item);
+  collapse_on_release_ = -1;
+  if (extended_) {
+    const uint8_t held = window() ? window()->held_modifiers() : 0;
+    if (held & hardware::modifier::kControl) {   // toggles the item; the rest stays
+      toggle_item(item);
+      last_click_item_ = -1;
+      return;
+    }
+    if (held & hardware::modifier::kShift) {     // from the anchor to here
+      select_range(anchor_ >= 0 ? anchor_ : (selected_ >= 0 ? selected_ : item), item);
+      last_click_item_ = -1;
+      return;
+    }
+  }
+  // A press on one of several selected items keeps them, so that they can be dragged together; released in place, the item becomes the only one.
+  if (extended_ && selection_count() > 1 && is_selected(static_cast<uint32_t>(item))) collapse_on_release_ = item;
+  else select_item(item);
   press_item_ = item;
   press_x_ = args.x;
   press_y_ = args.y;
@@ -611,6 +687,8 @@ void ListView::on_mouse_move(const MouseArgs& args) {
 
 void ListView::on_mouse_up(const MouseArgs&) {
   resizing_ = -1;
+  if (collapse_on_release_ >= 0 && press_item_ == collapse_on_release_) select_item(collapse_on_release_);   // (no drag came of the press)
+  collapse_on_release_ = -1;
   press_item_ = -1;
 }
 
@@ -635,7 +713,9 @@ bool ListView::copy_selected_item() {
 void ListView::prepare_context_menu(int32_t x, int32_t y) {
   if (x < 0 || y < 0) return;   // from the keyboard: the selection stays
   if (contains(header_rect(), x, y)) return;
-  select_item(item_at(x, y));
+  const int32_t item = item_at(x, y);
+  if (extended_ && item >= 0 && is_selected(static_cast<uint32_t>(item))) return;   // on the selection: the menu is for all of it
+  select_item(item);
 }
 
 bool ListView::on_key(const KeyArgs& args) {
@@ -647,24 +727,30 @@ bool ListView::on_key(const KeyArgs& args) {
     return true;
   }
   if (copy_enabled_ && (args.modifiers & modifier::kControl) && args.usage == key::kA + 2) return copy_selected_item();   // Ctrl+C
+  const uint8_t held = args.modifiers;   // (only an extended selection gives Shift and Ctrl a meaning with the navigation keys)
+  if (extended_ && args.usage == key::kSpace && selected_ >= 0) {   // Space (Ctrl+Space): toggles the item with the focus
+    toggle_item(selected_);
+    return true;
+  }
   switch (args.usage) {
     case key::kEnter:
+      if (held & (modifier::kLeftAlt | modifier::kRightAlt)) return false;   // Alt+Enter is Properties: the owner's key, not "open"
       if (selected_ >= 0) fire(activated_);
       return true;
-    case 0x4A: if (n) select_item(0); return true;      // Home
-    case 0x4D: if (n) select_item(n - 1); return true;  // End
-    case key::kDown: move_selection(mode_ == ViewMode::Icons ? per : 1); return true;
-    case key::kUp: move_selection(mode_ == ViewMode::Icons ? -per : -1); return true;
-    case 0x4E: move_selection(mode_ == ViewMode::Details ? 10 : mode_ == ViewMode::Icons ? per * 3 : per); return true;    // Page Down
-    case 0x4B: move_selection(mode_ == ViewMode::Details ? -10 : mode_ == ViewMode::Icons ? -per * 3 : -per); return true;  // Page Up
+    case 0x4A: if (n) move_to(0, held); return true;      // Home
+    case 0x4D: if (n) move_to(n - 1, held); return true;  // End
+    case key::kDown: move_selection(mode_ == ViewMode::Icons ? per : 1, held); return true;
+    case key::kUp: move_selection(mode_ == ViewMode::Icons ? -per : -1, held); return true;
+    case 0x4E: move_selection(mode_ == ViewMode::Details ? 10 : mode_ == ViewMode::Icons ? per * 3 : per, held); return true;    // Page Down
+    case 0x4B: move_selection(mode_ == ViewMode::Details ? -10 : mode_ == ViewMode::Icons ? -per * 3 : -per, held); return true;  // Page Up
     case key::kRight:
-      if (mode_ == ViewMode::List) move_selection(per);
-      else if (mode_ == ViewMode::Icons) move_selection(1);
+      if (mode_ == ViewMode::List) move_selection(per, held);
+      else if (mode_ == ViewMode::Icons) move_selection(1, held);
       else scroll_by(16, 0);
       return true;
     case key::kLeft:
-      if (mode_ == ViewMode::List) move_selection(-per);
-      else if (mode_ == ViewMode::Icons) move_selection(-1);
+      if (mode_ == ViewMode::List) move_selection(-per, held);
+      else if (mode_ == ViewMode::Icons) move_selection(-1, held);
       else scroll_by(-16, 0);
       return true;
     default:

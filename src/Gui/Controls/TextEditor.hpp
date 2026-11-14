@@ -21,8 +21,9 @@
 // Backspace/Delete/arrows/Home/End/Page Up/Page Down edit and move it, Ctrl+Home/End jump to the ends of the text.
 // Shift with a movement key, a drag with the mouse or Ctrl+A select text; typing replaces the selection, and
 // Ctrl+C / Ctrl+X / Ctrl+V (also Ctrl+Insert, Shift+Delete, Shift+Insert) copy, cut and paste through the window's clipboard. Long text scrolls
-// (scroll bars, the mouse wheel, and the caret staying in view). No undo. Keys it does not use (Ctrl+S ...) go to the
-// parent.
+// (scroll bars, the mouse wheel, and the caret staying in view). Ctrl+Z takes back the last change and Ctrl+Y (or Ctrl+Shift+Z) makes it again:
+// a run of typing, or of erasing, counts as one change, and the history holds up to kMaxUndoSteps changes within kMaxUndoBytes of text (the oldest
+// are forgotten first; one change is always kept). Keys it does not use (Ctrl+S ...) go to the parent.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
@@ -35,6 +36,8 @@ class TextEditor : public Control {
  public:
   static constexpr int32_t kBorder = 2, kPad = 3, kLineHeight = Painter::kGlyphHeight, kTabWidth = 4;
   static constexpr uint32_t kDefaultMaxLength = 1u << 20;
+  static constexpr uint32_t kMaxUndoSteps = 64;
+  static constexpr uint64_t kMaxUndoBytes = 4u << 20;
 
   explicit TextEditor(allocators::IAllocator& allocator);
 
@@ -46,7 +49,7 @@ class TextEditor : public Control {
   // Replaces the selection (or inserts at the caret). False if read-only, too long or out of memory.
   bool insert_text(StringView text);
   bool modified() const { return modified_; }
-  void mark_saved() { UiGuard lock(this); modified_ = false; fire(moved_); }
+  void mark_saved();
   void set_read_only(bool read_only) { UiGuard lock(this); read_only_ = read_only; }
   void set_max_length(uint32_t max) { UiGuard lock(this); max_length_ = max; }
   // Fired when the text changes / when the caret or selection moves (also after a change).
@@ -69,6 +72,12 @@ class TextEditor : public Control {
   bool cut_selection();
   void paste();
   void delete_selection() { UiGuard lock(this); if (has_selection()) replace(selection_start(), selection_end(), StringView()); }
+
+  // --- Undo (the keys do the same). False if there is nothing to take back / to make again. set_text() empties the history.
+  bool can_undo() const { return undo_.count() > 0; }
+  bool can_redo() const { return redo_.count() > 0; }
+  bool undo();
+  bool redo();
 
   // --- Lines
   uint32_t line_count() const { return static_cast<uint32_t>(starts_.count()); }
@@ -117,14 +126,31 @@ class TextEditor : public Control {
   static void vertical_changed(void* self, Control&);
   static void horizontal_changed(void* self, Control&);
 
+  // The text and the caret as they were before a change (or, on the redo side, after it).
+  struct Snapshot {
+    explicit Snapshot(allocators::IAllocator& allocator) : text(allocator) {}
+    String text;
+    uint32_t caret = 0, anchor = 0;
+    bool modified = false;
+  };
+  enum class Edit : uint8_t { None, Typing, Erasing, Other };
+  bool remember(List<Snapshot>* history);   // the state as it is now, onto the end of `history`
+  bool swap_with(List<Snapshot>* from, List<Snapshot>* to);
+  static void trim(List<Snapshot>* history);
+
   static void opening(void* self, Control&);
+  static void run_undo(void* self, Control&);
   static void run_cut(void* self, Control&);
   static void run_copy(void* self, Control&);
   static void run_paste(void* self, Control&);
   static void run_delete(void* self, Control&);
   static void run_select_all(void* self, Control&);
 
-  ContextMenu context_;   // Cut, Copy, Paste, Delete, Select All; built the first time it is wanted
+  ContextMenu context_;   // Undo, Cut, Copy, Paste, Delete, Select All; built the first time it is wanted
+  MenuItem* undo_item_ = nullptr;
+  List<Snapshot> undo_, redo_;
+  Edit last_edit_ = Edit::None;   // the kind of the last change, and where it left the caret: the next one of the same kind there joins it
+  uint32_t last_edit_caret_ = 0;
   MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr, *paste_item_ = nullptr, *delete_item_ = nullptr, *select_item_ = nullptr;
   String text_, clipboard_, scratch_;
   List<uint32_t> starts_;  // offset of each line's first byte

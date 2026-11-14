@@ -72,14 +72,24 @@ class ListView : public Control {
   bool copy_selected_item();
 
   // --- Selection
-  int32_t selected_item() const { return selected_; }  // -1 = none
+  // The item with the focus (-1 = none). Without an extended selection that is the selected item.
+  int32_t selected_item() const { return selected_; }
+  // Lets the user select several items the standard way (off by default: one item, or all of them with Ctrl+A). Ctrl+click toggles an item
+  // and Shift+click selects from the anchor to it; a click on one of several selected items keeps them (so that they can be dragged) until the
+  // button is released; a right click on a selected item keeps the selection. Shift with a navigation key selects from the anchor, Ctrl with one
+  // moves the focus without selecting, and Space (or Ctrl+Space) toggles the item with the focus. With it on, selected_item() is the item with
+  // the focus, which need not be selected: ask is_selected() and selection_count().
+  void set_extended_selection(bool extended) { UiGuard lock(this); extended_ = extended; }
+  bool extended_selection() const { return extended_; }
+  // The item a Shift+click or Shift+arrow selects from (-1: none yet).
+  int32_t anchor_item() const { return anchor_; }
   // Selects an item (-1 clears) and scrolls it into view. The handler fires when the selection changes.
   void select_item(int32_t item);
   // Selects every item (selected_item() stays the item with the focus, or the first). Choosing an item afterwards, or clearing the list, ends it.
   void select_all();
   // Whether an item is selected (several can be, after select_all()), and how many are.
-  bool is_selected(uint32_t item) const { return marked_ ? (item < marks_.count() && marks_[item]) : static_cast<int32_t>(item) == selected_; }
-  uint32_t selection_count() const { return marked_ ? marked_ : (selected_ >= 0 ? 1 : 0); }
+  bool is_selected(uint32_t item) const { return marked_ ? (item < marks_.count() && marks_[item]) : (!focus_only_ && static_cast<int32_t>(item) == selected_); }
+  uint32_t selection_count() const { return marked_ ? marked_ : (selected_ >= 0 && !focus_only_ ? 1 : 0); }
   void on_selection_changed(Handler handler) { UiGuard lock(this); selection_changed_ = handler; }
   // Fired by Enter or a double click on the selected item.
   void on_item_activated(Handler handler) { UiGuard lock(this); activated_ = handler; }
@@ -159,7 +169,11 @@ class ListView : public Control {
   void update_scroll_bars();
   void ensure_visible(uint32_t item);
   int32_t item_at(int32_t x, int32_t y) const;
-  void move_selection(int32_t delta);
+  void move_selection(int32_t delta, uint8_t modifiers = 0);
+  void move_to(int32_t target, uint8_t modifiers);
+  void select_range(int32_t from, int32_t to);
+  void toggle_item(int32_t item);
+  void marks_from_single();
   void scroll_by(int32_t dx, int32_t dy);
   int32_t column_at(int32_t x, bool* on_border) const;
   void paint_item_text(Painter& painter, const Rect2D& cell, uint32_t item, bool selected, uint32_t color);
@@ -171,6 +185,10 @@ class ListView : public Control {
   List<uint8_t> icons_;
   List<uint8_t> marks_;   // 1 for the items of a multiple selection (see select_all()); only meaningful while marked_ is not 0
   uint32_t marked_ = 0;
+  // An extended selection (see set_extended_selection): the anchor of ranges, the item that keeps a selection of several until the button is
+  // released, and whether the focus item is merely focused (nothing is selected although selected_ is an item).
+  bool extended_ = false, focus_only_ = false;
+  int32_t anchor_ = -1, collapse_on_release_ = -1;
   List<Column> columns_;
   ViewMode mode_ = ViewMode::Details;
   int32_t selected_ = -1;

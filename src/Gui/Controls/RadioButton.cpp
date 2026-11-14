@@ -96,6 +96,11 @@ void RadioButton::set_checked(bool checked) {
   fire(changed_);
 }
 
+void RadioButton::access_activate(uint32_t) {
+  if (Window* w = window()) w->set_focus(this);
+  if (enabled()) set_checked(true);
+}
+
 void RadioButton::paint(Painter& painter) {
   const Theme& t = painter.theme();
   const int32_t h = static_cast<int32_t>(bounds_.height);
@@ -121,6 +126,7 @@ void RadioButton::paint(Painter& painter) {
   const int32_t text_x = kCircle + kGap;
   const int32_t text_y = (h - Painter::kGlyphHeight) / 2;
   painter.text(text_x, text_y, text_.view(), enabled() ? t.text : t.disabled_text);
+  painter.underline(text_x, text_y, text_.view(), access_index(0), enabled() ? t.text : t.disabled_text);
   if (focused() && text_.size() > 0)
     painter.focus_frame({text_x - 2, text_y - 2, static_cast<uint32_t>(Painter::text_width(text_.view()) + 4), static_cast<uint32_t>(Painter::kGlyphHeight + 4)});
   else if (focused())

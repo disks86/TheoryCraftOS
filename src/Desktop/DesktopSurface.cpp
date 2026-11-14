@@ -22,14 +22,16 @@ namespace desktop {
 
 void DesktopSurface::paint(gui::Painter& painter) {
   const StringView name = "TheoryCraftOS";
-  const uint32_t mark = 0xFF40A0A0;
+  const uint32_t mark = painter.theme().desktop_text;   // (the pair of the desktop colour)
+  // What lies between the monitors is on no screen: it is not interface and has no theme colour, it is just left unlit.
+  constexpr uint32_t kNoMonitor = 0xFF000000u;
   if (regions_.count() == 0) {
     painter.fill({0, 0, bounds().width, bounds().height}, painter.theme().desktop);
     // A quiet watermark in the corner.
     painter.text(static_cast<int32_t>(bounds().width) - gui::Painter::text_width(name) - 16, static_cast<int32_t>(bounds().height) - 32, name, mark);
     return;
   }
-  painter.fill({0, 0, bounds().width, bounds().height}, 0xFF000000u);
+  painter.fill({0, 0, bounds().width, bounds().height}, kNoMonitor);
   for (uint64_t i = 0; i < regions_.count(); ++i) painter.fill(regions_[i], painter.theme().desktop);
   const gui::Rect2D& primary = regions_[0];
   painter.text(primary.x + static_cast<int32_t>(primary.width) - gui::Painter::text_width(name) - 16, primary.y + static_cast<int32_t>(primary.height) - 32, name, mark);

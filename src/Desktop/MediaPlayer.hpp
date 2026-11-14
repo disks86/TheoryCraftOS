@@ -23,6 +23,11 @@
 // WebP, Y4M) get a VideoPlayerControl with the picture over the same kind of bar. Problems (no audio output, a file that cannot be decoded)
 // appear in the notice dialog. The machine's sound mixer, video codecs and clock are handed over with set_services(); without them
 // the player says what is missing instead of playing. Closing the window stops playback and lets go of the file.
+//
+// The title is the file's name, then the program's ("Song.mp3 - Media Player"). The menus are File (Open, Close, Exit), Playback (Play or Pause,
+// Stop, Previous Track, Next Track) and Help; the playback commands are also the context menu of the player's area, and the bar under the picture has
+// them as buttons. Space plays or pauses, Ctrl+Left and Ctrl+Right change the track. What does not apply (nothing is open, there is no next
+// track) is disabled.
 #pragma once
 #include "Allocators/IAllocator.hpp"
 #include "Audio/AudioMixer.hpp"
@@ -30,6 +35,7 @@
 #include "Desktop/FileDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/AudioPlayerControl.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -74,6 +80,10 @@ class MediaPlayer : public gui::Frame {
   void ask_open();
   // Stops and forgets the open file.
   void close_media();
+  // Playback > Play / Pause (Space) and Stop. False when nothing is open.
+  bool toggle_play();
+  bool stop_playback();
+  bool playing() const;
 
   enum class Kind : uint8_t { None, Audio, Video };
   Kind kind() const { return kind_; }
@@ -83,6 +93,7 @@ class MediaPlayer : public gui::Frame {
 
   gui::Label& status_label() { return status_; }
   gui::MenuBar& menu_bar() { return menu_; }
+  gui::ContextMenu& playback_menu() { return playback_menu_; }
   gui::AudioPlayerControl* audio_control() { return audio_control_.get(); }
   gui::VideoPlayerControl* video_control() { return video_control_.get(); }
   audio::AudioPlayer* audio_player() { return audio_player_.get(); }
@@ -102,7 +113,14 @@ class MediaPlayer : public gui::Frame {
   void notify(gui::NoticeKind kind, StringView text) {
     if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) status_.set_text(text);
   }
-  bool open_source();
+  // A message about the file called `name`: `pattern` is the whole sentence, with %1 for the name.
+  void notify_file(StringView pattern, StringView name);
+  static void on_play_menu(void* self, gui::Control&);
+  static void on_stop_menu(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  void update_commands();   // enables the commands that apply now and names Play / Pause after what it will do
+  bool open_source(StringView name);
   bool play_path(StringView path);
   void load_folder(StringView path);
   bool play_index(uint64_t index);
@@ -111,6 +129,10 @@ class MediaPlayer : public gui::Frame {
   static void on_previous_menu(void* self, gui::Control&);
 
   gui::MenuBar menu_;
+  gui::ContextMenu playback_menu_;
+  // The commands that come and go with what is open: [0] in the menu bar, [1] in the context menu (nullptr where a menu has no such item).
+  gui::MenuItem *open_item_ = nullptr, *close_item_ = nullptr;
+  gui::MenuItem *play_items_[2] = {}, *stop_items_[2] = {}, *previous_items_[2] = {}, *next_items_[2] = {};
   gui::Panel status_bar_;
   gui::Label status_;
   filesystem::IFileSystem* fs_ = nullptr;

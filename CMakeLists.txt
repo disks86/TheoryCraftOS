@@ -665,6 +665,7 @@ add_executable(BOOTX64
   src/Desktop/BrowserStore.cpp
   src/Desktop/SessionStore.cpp
   src/Desktop/DesktopSession.cpp
+  src/Desktop/NotificationLog.cpp
   src/Desktop/Paint.cpp
   src/Desktop/MediaPlayer.cpp
   src/Desktop/Graphics3DTest.cpp

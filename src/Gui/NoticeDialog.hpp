@@ -16,8 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// A modal notice with one OK button: information, a warning or an error, shown with a matching title and
-// icon. The message is word-wrapped over up to four lines (longer text ends in "..."). Enter, Escape, OK and
+// A modal notice with one OK button: information, a warning or an error, shown with a matching icon. Its title names the document or the
+// program the message is about (never "Warning" or "Error"): the title given to show(), else the title of the window that was active when it
+// was shown. The message is word-wrapped over up to four lines (longer text ends in "..."). Enter, Escape, OK and
 // the close button all dismiss it. One dialog is shared by the programs; showing another notice while it
 // is open replaces the text. Minimize and maximize are disabled.
 // A message too long for the four lines also gets a details area, a read-only text box with the whole message (wrapped to its width, with scroll
@@ -57,10 +58,10 @@ class NoticeDialog : public Frame {
   static uint32_t wrap(StringView text, StringView* lines, uint32_t max_lines, String* storage);
 
   // Opens it modally in the middle of the manager's area. Returns false if it could not be added.
-  bool show(WindowManager& manager, NoticeKind kind, StringView message);
+  bool show(WindowManager& manager, NoticeKind kind, StringView message, StringView title = StringView());
   // Convenience: shows a notice on `dialog` if there is one (and a manager to show it in). False if not shown.
-  static bool post(NoticeDialog* dialog, WindowManager* manager, NoticeKind kind, StringView message) {
-    return dialog && manager && dialog->show(*manager, kind, message);
+  static bool post(NoticeDialog* dialog, WindowManager* manager, NoticeKind kind, StringView message, StringView title = StringView()) {
+    return dialog && manager && dialog->show(*manager, kind, message, title);
   }
   // Runs after the dialog was dismissed.
   void on_dismissed(Handler handler) { on_closed(handler); }

@@ -22,6 +22,9 @@
 // Copy Row puts the selected line on the clipboard.
 #pragma once
 #include "Desktop/DeviceDetails.hpp"
+#include "Desktop/DialogGrid.hpp"
+#include "Desktop/StackPanel.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -50,11 +53,17 @@ class DeviceProperties : public gui::Frame {
   // The value of the line with this property name (empty if there is none).
   StringView value(StringView property) const;
   gui::Button& copy_button() { return copy_button_; }
+  gui::Button& close_button() { return close_button_; }
+  // The table's context menu: Copy Row.
+  gui::ContextMenu& grid_menu() { return grid_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
   StringView status() const { return status_.text(); }
 
  private:
   static void on_copy(void* self, gui::Control&);
   static void on_close(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
   void fill(const DevicePropertyList& list);
 
   IDeviceDetails* details_ = nullptr;
@@ -62,8 +71,12 @@ class DeviceProperties : public gui::Frame {
   uint32_t id_ = 0;
   String opened_name_;   // what the device was called when the window showed it first (another device with the number is not it)
   bool have_name_ = false;
-  gui::DataGrid grid_;
-  gui::Panel buttons_;
+  DialogGrid grid_;       // (Enter goes on to the default button)
+  StackColumn body_;        // top to bottom: the table, the status line, the buttons (the order Tab takes)
+  StackRow buttons_;        // left to right: Copy Row, the space, Close
+  gui::Panel spacer_;
+  gui::ContextMenu grid_menu_;
+  gui::MenuItem* copy_item_ = nullptr;
   gui::Button copy_button_, close_button_;
   gui::Label status_;
   List<DeviceProperty> lines_;

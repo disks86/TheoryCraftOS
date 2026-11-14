@@ -17,7 +17,7 @@
  */
 
 #include "Desktop/Paint.hpp"
-#include "Desktop/FileStatus.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -100,7 +100,7 @@ struct ToolDef {
   ToolIcon icon;
 };
 const ToolDef kTools[] = {{"Pencil", icon_pencil}, {"Eraser", icon_eraser}, {"Line", icon_line},      {"Rectangle", icon_rectangle},
-                          {"Ellipse", icon_ellipse}, {"Fill", icon_fill},   {"Color picker", icon_picker}, {"Select", icon_select}};
+                          {"Ellipse", icon_ellipse}, {"Fill", icon_fill},   {"Color Picker", icon_picker}, {"Select", icon_select}};
 
 // --- Files ---
 
@@ -140,12 +140,14 @@ bool normalize(StringView in, String* out) {
   return out->append(in.substr(from, to - from));
 }
 
+uint32_t g_pictures = 0;   // numbers the new pictures: "Picture 1", "Picture 2"...
+
 }  // namespace
 
 bool Paint::is_picture_name(StringView name) { return format_of_name(name) != media::ImageFormat::Unknown; }
 
 Paint::Paint(allocators::IAllocator& allocator)
-    : Frame(allocator),
+    : DocumentFrame(allocator, "Paint", "Picture", &g_pictures),
       menu_(allocator),
       canvas_menu_(allocator),
       options_bar_(allocator),
@@ -160,9 +162,7 @@ Paint::Paint(allocators::IAllocator& allocator)
       tools_(allocator),
       palette_(allocator),
       picker_(allocator),
-      canvas_(allocator),
-      path_(allocator),
-      name_(allocator) {
+      canvas_(allocator) {
   set_bounds({30, 20, 640, 470});
   set_padding(Insets::all(4));
   set_minimize_enabled(true);
@@ -170,47 +170,56 @@ Paint::Paint(allocators::IAllocator& allocator)
   // The menus.
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
+  menu_.on_opening(Handler::immediate(&Paint::on_menu_opening, this));
   if (Menu* file = menu_.add_menu("File")) {
     file->add_item("New", {&Paint::on_new, this}, "Ctrl+N");
-    file->add_item("Open...", {&Paint::on_open, this}, "Ctrl+O");
-    file->add_item("Save", {&Paint::on_save, this}, "Ctrl+S");
-    file->add_item("Save As...", {&Paint::on_save_as, this}, "Ctrl+Shift+S");
+    open_item_ = file->add_item("Open...", {&Paint::on_open, this}, "Ctrl+O");
+    save_item_ = file->add_item("Save", {&Paint::on_save, this}, "Ctrl+S");
+    save_as_item_ = file->add_item("Save As...", {&Paint::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
-    file->add_item("Print...", {&Paint::on_print, this}, "Ctrl+P");
+    print_item_ = file->add_item("Print...", {&Paint::on_print, this}, "Ctrl+P");
     file->add_separator();
-    file->add_item("Close", {&Paint::on_close_window, this});
+    file->add_item("Exit", {&Paint::on_close_window, this});   // (the picture goes with its window, so this is Exit and not Close)
   }
   if (Menu* edit = menu_.add_menu("Edit")) {
     undo_item_ = edit->add_item("Undo", {&Paint::on_undo, this}, "Ctrl+Z");
     redo_item_ = edit->add_item("Redo", {&Paint::on_redo, this}, "Ctrl+Y");
     edit->add_separator();
-    edit->add_item("Cut", {&Paint::on_cut, this}, "Ctrl+X");
+    cut_item_ = edit->add_item("Cut", {&Paint::on_cut, this}, "Ctrl+X");
     edit->add_item("Copy", {&Paint::on_copy, this}, "Ctrl+C");
-    edit->add_item("Paste", {&Paint::on_paste, this}, "Ctrl+V");
+    paste_item_ = edit->add_item("Paste", {&Paint::on_paste, this}, "Ctrl+V");
+    delete_item_ = edit->add_item("Delete", {&Paint::on_delete_selection, this}, "Del");
     edit->add_separator();
     edit->add_item("Select All", {&Paint::on_select_all, this}, "Ctrl+A");
   }
   if (Menu* view = menu_.add_menu("View")) {
-    view->add_item("Zoom In", {&Paint::on_zoom_in, this}, "Ctrl++");
-    view->add_item("Zoom Out", {&Paint::on_zoom_out, this}, "Ctrl+-");
-    view->add_item("Actual Size", {&Paint::on_actual_size, this}, "Ctrl+0");
+    zoom_in_item_ = view->add_item("Zoom In", {&Paint::on_zoom_in, this}, "Ctrl++");
+    zoom_out_item_ = view->add_item("Zoom Out", {&Paint::on_zoom_out, this}, "Ctrl+-");
+    actual_item_ = view->add_item("Actual Size", {&Paint::on_actual_size, this}, "Ctrl+0");
     view->add_separator();
     grid_item_ = view->add_item("Pixel Grid", {&Paint::on_toggle_grid, this});
   }
-  if (Menu* options = menu_.add_menu("Options")) {
-    filled_item_ = options->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
-    options->add_separator();
-    options->add_item("Primary Color...", {&Paint::on_primary_color, this});
-    options->add_item("Secondary Color...", {&Paint::on_secondary_color, this});
+  // Everything the tool strip offers is here as well, so that no tool is reachable with the pointer only; the tool in use has the check mark.
+  if (Menu* tools = menu_.add_menu("Tools")) {
+    static constexpr void (*kChoose[kToolCount])(void*, Control&) = {&Paint::on_tool_item<0>, &Paint::on_tool_item<1>, &Paint::on_tool_item<2>, &Paint::on_tool_item<3>,
+                                                                     &Paint::on_tool_item<4>, &Paint::on_tool_item<5>, &Paint::on_tool_item<6>, &Paint::on_tool_item<7>};
+    for (uint32_t i = 0; i < kToolCount; ++i) tool_items_[i] = tools->add_item(kTools[i].name, {kChoose[i], this});
+    tools->add_separator();
+    filled_item_ = tools->add_item("Filled Shapes", {&Paint::on_toggle_filled, this});
   }
+  if (Menu* colors = menu_.add_menu("Colors")) {
+    primary_item_ = colors->add_item("Primary Color...", {&Paint::on_primary_color, this});
+    secondary_item_ = colors->add_item("Secondary Color...", {&Paint::on_secondary_color, this});
+  }
+  if (Menu* help = menu_.add_menu("Help")) help->add_item("About Paint", {&Paint::on_about, this});
 
   // Options bar: brush size and the zoom shown.
   options_bar_.set_dock(DockStyle::Top);
   options_bar_.set_size(0, 28);
   options_bar_.set_padding(Insets{0, 2, 0, 2});
-  size_label_.set_text("Size");
+  size_label_.set_text("Size:");   // (the colon makes it the label of the slider: its access key moves the focus there)
   size_label_.set_dock(DockStyle::Left);
-  size_label_.set_size(40, 0);
+  size_label_.set_size(48, 0);
   size_.set_range(1, 32);
   size_.set_value(1);
   size_.set_step(1, 4);
@@ -285,19 +294,43 @@ Paint::Paint(allocators::IAllocator& allocator)
   add(&tools_);
   add(&canvas_);  // Fill goes last
   update_state();
-  say("Draw with the left button; the right button uses the second color.");
+  say("Draw with the left button; the right button draws in the secondary color.");
 }
 
 // --- Display ------------------------------------------------------------------------
 
-void Paint::update_state() {
-  String title(allocator());
-  title.assign("Paint - ");
-  title.append(name_.empty() ? StringView("Untitled") : name_.view());
-  if (canvas_.modified()) title.append(" *");
-  set_title(title.view());
+bool Paint::can_paste() const {
+  const kernel::Clipboard* clip = clipboard();
+  return clip && clip->has_image();
+}
+
+// The items that cannot work right now are disabled instead of answering with a message; the tool in use and the switches have their check marks.
+void Paint::update_menus() {
+  if (open_item_) open_item_->set_enabled(can_open());
+  if (save_item_) save_item_->set_enabled(can_save());
+  if (save_as_item_) save_as_item_->set_enabled(can_open());
+  if (print_item_) print_item_->set_enabled(print_dialog_ != nullptr);
   if (undo_item_) undo_item_->set_enabled(canvas_.can_undo());
   if (redo_item_) redo_item_->set_enabled(canvas_.can_redo());
+  if (cut_item_) cut_item_->set_enabled(canvas_.has_selection());
+  if (delete_item_) delete_item_->set_enabled(canvas_.has_selection());
+  if (paste_item_) paste_item_->set_enabled(can_paste());
+  if (zoom_in_item_) zoom_in_item_->set_enabled(canvas_.zoom() < 16);
+  if (zoom_out_item_) zoom_out_item_->set_enabled(canvas_.zoom() > 1);
+  if (actual_item_) actual_item_->set_enabled(canvas_.zoom() != 1);
+  if (primary_item_) primary_item_->set_enabled(color_dialog_ != nullptr);
+  if (secondary_item_) secondary_item_->set_enabled(color_dialog_ != nullptr);
+  for (uint32_t i = 0; i < kToolCount; ++i)
+    if (tool_items_[i]) tool_items_[i]->set_checked(static_cast<int32_t>(i) == tools_.selected_tool());
+}
+
+void Paint::on_menu_opening(void* self, Control&) { static_cast<Paint*>(self)->update_menus(); }
+void Paint::on_about(void* self, Control&) {
+  static_cast<Paint*>(self)->show_about("Paint draws and changes pictures. It is part of TheoryCraftOS.");
+}
+
+void Paint::update_state() {
+  update_menus();
   update_position();
 }
 
@@ -317,9 +350,7 @@ void Paint::update_position() {
 }
 
 void Paint::on_canvas_changed(void* self, Control&) {
-  auto* p = static_cast<Paint*>(self);
-  p->discard_armed_ = false;
-  p->update_state();
+  static_cast<Paint*>(self)->update_state();
 }
 void Paint::on_pointer(void* self, Control&) { static_cast<Paint*>(self)->update_position(); }
 void Paint::on_zoom_changed(void* self, Control&) {
@@ -328,6 +359,7 @@ void Paint::on_zoom_changed(void* self, Control&) {
   text.append_uint(p->canvas_.zoom() * 100);
   text.append("%");
   p->zoom_label_.set_text(text.view());
+  p->update_menus();
 }
 
 // --- Tools and colors ---------------------------------------------------------------------
@@ -349,15 +381,16 @@ void Paint::on_tool_changed(void* self, Control&) {  // the canvas switched tool
   p->tools_.select_tool(static_cast<int32_t>(p->canvas_.tool()));
 }
 
+// (Cut needs a selection and Paste a picture on the clipboard: their menu items are disabled without, and the keys then do nothing.)
 void Paint::copy_to_clipboard(bool cut) {
+  if (cut && !canvas_.has_selection()) return;
   const bool ok = cut ? canvas_.cut_selection() : canvas_.copy_selection();
   if (ok) say(cut ? "Cut to the clipboard." : canvas_.has_selection() ? "Copied the selection." : "Copied the whole picture.");
-  else notify(gui::NoticeKind::Warning, cut ? "Select something to cut first." : "Cannot copy.");
+  update_menus();
 }
 
 void Paint::paste_from_clipboard() {
-  if (canvas_.paste()) say("Pasted. Drag it into place; Enter sets it down, Escape takes it back.");
-  else notify(gui::NoticeKind::Warning, "Nothing to paste: the clipboard has no picture.");
+  if (can_paste() && canvas_.paste()) say("Pasted. Drag it into place; Enter sets it down, Esc takes it back.");
 }
 
 void Paint::on_cut(void* self, Control&) { static_cast<Paint*>(self)->copy_to_clipboard(true); }
@@ -413,11 +446,11 @@ void Paint::on_canvas_menu_opening(void* self, Control&) {
   p->ctx_cut_->set_enabled(selected);
   p->ctx_copy_->set_enabled(true);   // nothing selected: the whole picture
   p->ctx_delete_->set_enabled(selected);
-  p->ctx_paste_->set_enabled(p->clipboard() && p->clipboard()->has_image());
+  p->ctx_paste_->set_enabled(p->can_paste());
 }
 
 void Paint::on_actual_size(void* self, Control&) { static_cast<Paint*>(self)->canvas_.set_zoom(1); }
-void Paint::on_close_window(void* self, Control&) { static_cast<Paint*>(self)->close(); }
+void Paint::on_close_window(void* self, Control&) { static_cast<Paint*>(self)->exit_requested(); }
 void Paint::on_select_all(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
   p->canvas_.select_all();
@@ -431,16 +464,6 @@ void Paint::on_zoom_out(void* self, Control&) { static_cast<Paint*>(self)->canva
 
 // --- Files ------------------------------------------------------------------------------------
 
-bool Paint::may_discard() {
-  if (!canvas_.modified() || discard_armed_) {
-    discard_armed_ = false;
-    return true;
-  }
-  discard_armed_ = true;
-  notify(gui::NoticeKind::Warning, "Unsaved changes - repeat the command to discard them, or press Save.");
-  return false;
-}
-
 void Paint::on_new(void* self, Control&) { static_cast<Paint*>(self)->new_picture(); }
 void Paint::on_save(void* self, Control&) { static_cast<Paint*>(self)->save_file(); }
 void Paint::on_open(void* self, Control&) { static_cast<Paint*>(self)->ask_open(); }
@@ -450,14 +473,11 @@ void Paint::on_primary_color(void* self, Control&) { static_cast<Paint*>(self)->
 void Paint::on_secondary_color(void* self, Control&) { static_cast<Paint*>(self)->ask_color(true); }
 
 void Paint::ask_print() {
-  if (!print_dialog_ || !manager()) {
-    notify(gui::NoticeKind::Error, "No print dialog available.");
-    return;
-  }
+  if (!print_dialog_ || !manager()) return;   // (the menu item is disabled then)
   canvas_.commit_floating();  // a picture still being placed is part of what is printed
   print_surface_ = canvas_.surface();
   print_dialog_->set_picture(&print_surface_);   // for the preview
-  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Picture, "Print", {&Paint::on_print_picked, this})) notify(gui::NoticeKind::Warning, "The print dialog is busy.");
+  if (!print_dialog_->show(*manager(), PrintDialog::Kind::Picture, "Print", {&Paint::on_print_picked, this})) say("The Print dialog is already open for another window.");
 }
 
 void Paint::on_print_picked(void* self, Control&) {
@@ -465,25 +485,19 @@ void Paint::on_print_picked(void* self, Control&) {
   PrintDialog& d = *p->print_dialog_;
   if (!d.accepted() || !d.print_service()) return;
   String error(p->allocator());
-  if (d.print_service()->print_picture(d.printer_index(), p->canvas_.surface(), p->name_.empty() ? StringView("Untitled") : p->name_.view(), d.options(), &error)) {
+  if (d.print_service()->print_picture(d.printer_index(), p->canvas_.surface(), p->document_name(), d.options(), &error)) {
     p->say("Sent to the printer.");
   } else {
-    String message(p->allocator());
-    message.append("Cannot print: ");
-    message.append(error.view());
-    p->notify(gui::NoticeKind::Error, message.view());
+    p->notify(NoticeKind::Error, "\"%1\" could not be printed. %2", p->document_name(), error.view());
   }
 }
 
 void Paint::ask_color(bool secondary) {
-  if (!color_dialog_ || !manager()) {
-    notify(gui::NoticeKind::Error, "No color dialog available.");
-    return;
-  }
+  if (!color_dialog_ || !manager()) return;   // (the menu items are disabled then)
   choosing_secondary_ = secondary;
   if (!color_dialog_->show(*manager(), secondary ? "Secondary Color" : "Primary Color", secondary ? palette_.secondary() : palette_.primary(),
                            {&Paint::on_color_picked_by_dialog, this}))
-    notify(gui::NoticeKind::Warning, "The color dialog is busy.");
+    say("The color dialog is already open for another window.");
 }
 
 void Paint::on_color_picked_by_dialog(void* self, Control&) {
@@ -496,85 +510,101 @@ void Paint::on_color_picked_by_dialog(void* self, Control&) {
 namespace {
 const FileDialog::Filter kPictureFilters[] = {
     {"Pictures", "png;jpg;jpeg;bmp;gif;qoi;tga;tif;tiff;webp;ppm;pnm"}, {"PNG", "png"}, {"JPEG", "jpg;jpeg"}, {"BMP", "bmp"}, {"GIF", "gif"},
-    {"QOI", "qoi"}, {"TGA", "tga"}, {"TIFF", "tif;tiff"}, {"WebP", "webp"}, {"PPM", "ppm;pnm"}, {"All files", "*"}};
+    {"QOI", "qoi"}, {"TGA", "tga"}, {"TIFF", "tif;tiff"}, {"WebP", "webp"}, {"PPM", "ppm;pnm"}, {"All Files", "*"}};
 constexpr uint32_t kPictureFilterCount = sizeof kPictureFilters / sizeof kPictureFilters[0];
 }  // namespace
 
+void Paint::carry_out(Next next, StringView path) {
+  if (next == Next::New) start_new(new_width_, new_height_);
+  else if (next == Next::Open) show_open_dialog();
+  else if (next == Next::OpenFile) read_picture(path);
+}
+
 void Paint::ask_open() {
-  if (!dialog_ || !manager()) {
-    notify(gui::NoticeKind::Error, "No file dialog available.");
-    return;
-  }
-  if (!may_discard()) return;
-  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_open_picked, this}))
-    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
+  if (!can_open() || !manager()) return;   // (the menu item is disabled then)
+  if (ready_for(Next::Open)) show_open_dialog();
+}
+
+void Paint::show_open_dialog() {
+  String start(allocator());
+  dialog_start(fs_, filesystem::layout::kPictures, ".png", false, &start);
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kPictureFilters, kPictureFilterCount, start.view(), {&Paint::on_open_picked, this}))
+    say("The Open dialog is already open for another window.");
 }
 
 void Paint::ask_save_as() {
-  if (!dialog_ || !manager()) {
-    notify(gui::NoticeKind::Error, "No file dialog available.");
+  if (!can_open() || !manager()) {
+    save_abandoned();
     return;
   }
-  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kPictureFilters, kPictureFilterCount, path_.view(), {&Paint::on_save_picked, this}))
-    notify(gui::NoticeKind::Warning, "The file dialog is busy.");
+  String start(allocator());
+  dialog_start(fs_, filesystem::layout::kPictures, ".png", true, &start);
+  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kPictureFilters, kPictureFilterCount, start.view(), {&Paint::on_save_picked, this})) {
+    save_abandoned();
+    say("The Save As dialog is already open for another window.");
+  }
 }
 
 void Paint::on_open_picked(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
-  if (p->dialog_->accepted()) p->read_picture(p->dialog_->selected_path());   // the unsaved changes were agreed to before the dialog opened
+  if (p->dialog_->accepted()) p->read_picture(p->dialog_->selected_path());   // (the unsaved changes were dealt with before the dialog opened)
 }
 
 void Paint::on_save_picked(void* self, Control&) {
   auto* p = static_cast<Paint*>(self);
   if (p->dialog_->accepted()) p->write_picture(p->dialog_->selected_path());
+  else p->save_abandoned();
+}
+
+void Paint::start_new(uint32_t width, uint32_t height) {
+  if (!canvas_.new_image(width, height)) {
+    notify(NoticeKind::Error, "A picture of that size cannot be made. Pictures can be up to 4096 by 4096 dots.");
+    return;
+  }
+  name_new_document();
+  update_state();
+  say("New picture.");
 }
 
 bool Paint::new_picture(uint32_t width, uint32_t height) {
-  if (!may_discard()) return false;
-  if (!canvas_.new_image(width, height)) {
-    notify(gui::NoticeKind::Error, "Cannot make a picture of that size.");
+  if (width == 0 || height == 0 || width > DrawingCanvas::kMaxSide || height > DrawingCanvas::kMaxSide) {
+    notify(NoticeKind::Error, "A picture of that size cannot be made. Pictures can be up to 4096 by 4096 dots.");
     return false;
   }
-  path_.clear();
-  name_.clear();
-  update_state();
-  say("New picture.");
+  new_width_ = width;
+  new_height_ = height;
+  if (!ready_for(Next::New)) return false;
+  start_new(width, height);
   return true;
 }
 
 bool Paint::open_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested, &path) || path.empty()) {
-    notify(gui::NoticeKind::Warning, "Enter the path of a picture to open.");
-    return false;
-  }
+  if (!normalize(requested, &path) || path.empty()) return false;
   if (!fs_) {
-    notify(gui::NoticeKind::Error, "No storage available.");
+    say("There is no disk to open pictures from.");
     return false;
   }
-  if (!may_discard()) return false;
+  if (!ready_for(Next::OpenFile, path.view())) return false;
   return read_picture(path.view());
 }
 
 bool Paint::read_picture(StringView path) {
-  if (!fs_) {
-    notify(gui::NoticeKind::Error, "No storage available.");
-    return false;
-  }
+  if (!fs_) return false;
+  const StringView name = name_of(path);
   UniquePointer<IFile> file;
   Status status = fs_->open_file(path, OpenMode::Read, &file);
   if (status != Status::Ok) {
-    String message(allocator());
-    message.append("Cannot open ");
-    message.append(path);
-    message.append(": ");
-    message.append(describe_status(status));
-    notify(gui::NoticeKind::Error, message.view());
+    notify(NoticeKind::Error, "\"%1\" could not be opened. %2", name, file_advice(status, false));
     return false;
   }
   const uint64_t size = file->size();
-  if (size == 0 || size > kMaxFileBytes) {
-    notify(gui::NoticeKind::Error, size ? "The file is too large to open." : "The file is empty.");
+  if (size == 0) {
+    notify(NoticeKind::Error, "\"%1\" could not be opened. The file is empty, so there is no picture in it.", name);
+    return false;
+  }
+  if (size > kMaxFileBytes) {
+    notify(NoticeKind::Error, "\"%1\" is too large for Paint, which opens files of up to 64 MB. Open it with another program.", name);
     return false;
   }
   ArrayView<uint8_t> bytes = allocate_view<uint8_t>(allocator(), size);
@@ -585,31 +615,27 @@ bool Paint::read_picture(StringView path) {
   const bool decoded = status == Status::Ok && got == size && media::decode_image(ConstByteView(bytes.data(), got), &image);
   release_view(allocator(), bytes);
   if (!decoded) {
-    notify(gui::NoticeKind::Error, status == Status::Ok ? "That is not a picture this program can read." : "The file could not be read.");
+    if (status == Status::Ok) notify(NoticeKind::Error, "\"%1\" could not be opened. It is not a picture of a kind Paint can read, or the file is damaged.", name);
+    else notify(NoticeKind::Error, "\"%1\" could not be opened. %2", name, file_advice(status, false));
     return false;
   }
   if (image.width() > DrawingCanvas::kMaxSide || image.height() > DrawingCanvas::kMaxSide ||
       !canvas_.set_pixels(image.frame(0).data(), image.width(), image.height())) {
-    notify(gui::NoticeKind::Error, "The picture is too large to edit (limit 4096 x 4096).");
+    notify(NoticeKind::Error, "\"%1\" is too large for Paint, which works on pictures of up to 4096 by 4096 dots. Open it with another program.", name);
     return false;
   }
-  path_.assign(path);
-  const uint64_t slash = path.rfind('/');
-  name_.assign(slash == StringView::npos ? path : path.substr(slash + 1));
-  discard_armed_ = false;
+  name_document(path);
   update_state();
   String message(allocator());
-  message.append("Opened ");
-  message.append(path);
+  format_message(&message, "Opened \"%1\".", name);
   say(message.view());
   return true;
 }
 
 bool Paint::save_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
-    if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
-    else notify(gui::NoticeKind::Warning, "Enter a path to save to.");
+  if (!normalize(requested.empty() ? this->path() : requested, &path) || path.empty()) {
+    ask_save_as();   // nowhere to save to yet: the same as Save As
     return false;
   }
   return write_picture(path.view());
@@ -617,27 +643,33 @@ bool Paint::save_file(StringView requested) {
 
 bool Paint::write_picture(StringView requested) {
   String path(allocator());
-  if (!path.assign(requested)) return false;
-  if (!fs_) {
-    notify(gui::NoticeKind::Error, "No storage available.");
+  if (!fs_ || !path.assign(requested)) {
+    save_abandoned();
+    if (!fs_) say("There is no disk to save pictures on.");
     return false;
   }
   media::ImageFormat format = format_of_name(path.view());
   if (format == media::ImageFormat::Unknown) {  // no known extension: a PNG file with .png added
-    if (!path.append(".png")) return false;
+    if (!path.append(".png")) {
+      save_abandoned();
+      return false;
+    }
     format = media::ImageFormat::Png;
   }
+  const StringView name = name_of(path.view());
   canvas_.commit_floating();  // a picture still being placed is part of what is saved
   media::Image image(allocator());
   ByteBuffer encoded(allocator());
   const ArrayView<const uint32_t> pixels = canvas_.pixels();
   if (!image.create(canvas_.image_width(), canvas_.image_height())) {
-    notify(gui::NoticeKind::Error, "Out of memory.");
+    save_abandoned();
+    notify(NoticeKind::Error, "\"%1\" could not be saved. %2", name, file_advice(Status::OutOfMemory, true));
     return false;
   }
   image.frame(0).copy_from(pixels);
   if (!media::encode_image(image, format, 90, &encoded)) {
-    notify(gui::NoticeKind::Error, "The picture could not be encoded.");
+    save_abandoned();
+    notify(NoticeKind::Error, "\"%1\" could not be saved as that kind of picture. Choose another type in Save As, such as PNG.", name);
     return false;
   }
   UniquePointer<IFile> file;
@@ -646,25 +678,19 @@ bool Paint::write_picture(StringView requested) {
   if (status == Status::Ok) status = file->write(0, encoded.view(), &written);
   if (status == Status::Ok) status = file->flush();
   file.reset();
-  String message(allocator());
   if (status != Status::Ok) {
-    message.append("Cannot save ");
-    message.append(path.view());
-    message.append(": ");
-    message.append(describe_status(status));
-    notify(gui::NoticeKind::Error, message.view());
+    save_abandoned();
+    notify(NoticeKind::Error, "\"%1\" could not be saved. %2", name, file_advice(status, true));
     return false;
   }
   fs_->flush();
-  path_.assign(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
+  name_document(path.view());
   canvas_.mark_saved();
-  discard_armed_ = false;
   update_state();
-  message.append("Saved ");
-  message.append(path.view());
+  String message(allocator());
+  format_message(&message, "Saved \"%1\".", document_name());
   say(message.view());
+  document_saved();   // (what waited for the save - New, Open, closing - goes ahead)
   return true;
 }
 
@@ -677,9 +703,12 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 15: ask_print(); return true;                   // P
       case key::kA + 18:                                             // S
         if (args.modifiers & hardware::modifier::kShift) ask_save_as();
-        else save_file();
+        else if (can_save()) save_file();
         return true;
-      case key::kA + 25: canvas_.undo(); return true;                // Z
+      case key::kA + 25:                                             // Z, with Shift the same as Y
+        if (args.modifiers & hardware::modifier::kShift) canvas_.redo();
+        else canvas_.undo();
+        return true;
       case key::kA + 24: canvas_.redo(); return true;                // Y
       case key::kA: on_select_all(this, *this); return true;   // A
       case 0x2E: canvas_.zoom_in(); return true;                // + (the = key)
@@ -692,6 +721,11 @@ bool Paint::on_key(const KeyArgs& args) {
       case key::kA + 21: paste_from_clipboard(); return true;        // V
       default: break;
     }
+  }
+  // Del removes the selection wherever the focus is in the window (the canvas does it itself when it has the focus).
+  if (args.usage == key::kDelete && !args.modifiers && canvas_.has_selection()) {
+    canvas_.delete_selection();
+    return true;
   }
   return Frame::on_key(args);
 }

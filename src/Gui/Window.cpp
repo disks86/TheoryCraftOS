@@ -524,6 +524,13 @@ void Window::key(const KeyArgs& args) {
       return;
     }
   }
+  // Alt+letter: the access key of a label in the frame that has the focus (see AccessKey.hpp). A letter no label has goes on as an ordinary key.
+  if ((args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) && !(args.modifiers & hardware::modifier::kControl) &&
+      args.usage >= hardware::key::kA && args.usage < hardware::key::kA + 26) {
+    const char letter = static_cast<char>('a' + (args.usage - hardware::key::kA));
+    for (Control* c = focus_ ? focus_ : focus_scope_; c; c = c->parent_)
+      if (c->effectively_enabled() && c->on_access_key(letter)) return;
+  }
   for (Control* c = focus_; c; c = c->parent_)
     if (c->effectively_enabled() && c->on_key(args)) return;
   if (args.usage == hardware::key::kTab) focus_next(!(args.modifiers & hardware::modifier::kShift));

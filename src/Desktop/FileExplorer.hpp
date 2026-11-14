@@ -58,11 +58,13 @@ class FileExplorer : public gui::Frame {
   void on_file_opened(gui::Handler handler) { file_opened_ = handler; }
   StringView opened_file() const { return opened_file_.view(); }
 
-  // --- Copy, paste, select all, properties (File menu, the list's context menu, Ctrl+C / Ctrl+V / Ctrl+A).
-  // copy_selected() puts the full paths of the selected items on the clipboard, one per line. paste() copies the files and folders whose paths are
-  // on the clipboard (from this explorer or another) into the folder shown, next to what is there already: a name that is taken becomes "Copy of
-  // <name>" (then "Copy of <name> (2)", ...). False (with a notice) if nothing could be pasted. select_all() selects every item of the folder.
+  // --- Cut, copy, paste, select all, properties (Edit and File menus, the list's context menus, Ctrl+X / Ctrl+C / Ctrl+V / Ctrl+A).
+  // copy_selected() and cut_selected() put the full paths of the selected items on the clipboard, one per line. paste() copies the files and
+  // folders whose paths are on the clipboard (from this explorer or another) into the folder shown, next to what is there already - a name that
+  // is taken becomes "Copy of <name>" (then "Copy 2 of <name>", ...) - or, after Cut, moves them there. Long transfers run in the transfer dialog
+  // (set_transfer_dialog). False (with a notice where there is something to say) if nothing could be pasted. select_all() selects every item.
   bool copy_selected();
+  bool cut_selected();
   bool paste();
   void select_all();
   // Fired (see Gui::Handler) by Properties: properties_path() is the selected item's full path, or the folder shown when nothing is selected.
@@ -102,7 +104,7 @@ class FileExplorer : public gui::Frame {
   // Turns a network address into the path in the tree ("/Network/server/share/folder"); *user and *password get a login written into the address
   // ("smb://user:password@server/..."). False if `address` is not a network address.
   static bool parse_network_address(allocators::IAllocator& allocator, StringView address, String* path, String* user, String* password);
-  // File > New Folder / New File (also in the list's context menu): makes "New Folder" / "New File.txt" in the current folder - or "New Folder 2",
+  // File > New Folder / New Text Document (also in the folder's context menu): makes "New Folder" / "New Text Document.txt" in the current folder - or "New Folder 2",
   // "New Folder 3", ... if the name is taken - and selects it. False (with a notice) if it could not be made, e.g. in the read-only root.
   bool new_folder();
   bool new_file();
@@ -111,8 +113,8 @@ class FileExplorer : public gui::Frame {
   // if it fails, e.g. because the name is taken or this place cannot be changed.
   bool rename_selected();
   bool rename_item(StringView from, StringView to);
-  // File > Delete (the Delete key, or Delete in the list's context menu): asks "Delete <name>?" in delete_dialog(); on "Delete" the selected file
-  // - or folder with everything in it - is removed. False if nothing is selected or the dialog cannot be shown.
+  // Edit > Delete (the Delete key, or Delete in the list's context menu): asks "Delete <name>?" in delete_dialog() - Cancel is its default button - and
+  // on "Delete" the selected files and folders, with everything in them, are removed. False if nothing is selected or the dialog cannot be shown.
   bool delete_selected();
   gui::MessageDialog& delete_dialog() { return delete_dialog_; }
   // The dialog that warnings, information and errors are shown in (nullptr: the status bar says them instead). It must outlive the explorer.
@@ -137,7 +139,8 @@ class FileExplorer : public gui::Frame {
   gui::ListView& view() { return view_; }
   gui::BreadcrumbBar& address_bar() { return address_; }
   gui::MenuBar& menu_bar() { return menu_; }
-  // The context menus: on the list (Open, Copy Path, the views, Refresh, Up) and on the address bar (Copy Address, Edit Address).
+  // The context menus: on the list - for the selection (Open; Cut, Copy; Rename, Delete, Copy Path; Properties) or, on empty space, for the folder
+  // (Paste; New Folder, New Text Document; Select All; the views; Up One Level, Refresh; Properties) - and on the address bar (Copy Address, Edit Address).
   gui::ContextMenu& list_menu() { return list_menu_; }
   gui::ContextMenu& address_menu() { return address_menu_; }
   // The View menu's entries; the one for the view in use is checked.
@@ -158,6 +161,20 @@ class FileExplorer : public gui::Frame {
   static void on_open_item(void* self, gui::Control&);
   static void on_copy_path(void* self, gui::Control&);
   static void on_copy_menu(void* self, gui::Control&);
+  static void on_cut_menu(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  void build_list_menu(bool on_items);
+  void update_commands();
+  void update_title();
+  int32_t single_item() const;
+  uint32_t selected_paths(String* out) const;
+  bool selection_can_change() const;
+  bool can_paste() const;
+  bool can_eject() const;
+  void say_transferred(const char* one, const char* several, StringView paths, uint32_t count);
+  bool transfer_into(StringView sources, StringView folder, bool move, bool from_paste);
+  bool drop_folder(int32_t x, int32_t y, String* folder) const;
   static void on_paste_menu(void* self, gui::Control&);
   static void on_select_all_menu(void* self, gui::Control&);
   static void on_properties_menu(void* self, gui::Control&);
@@ -191,12 +208,17 @@ class FileExplorer : public gui::Frame {
   void activate_selected();
   void update_status();
   // Warnings, information and errors go to the notice dialog (or the status bar when there is none to show it in).
-  void notify(gui::NoticeKind kind, StringView text) {
-    if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) status_.set_text(text);
+  // The title names what the message is about; without one it is the folder shown (the title of this window).
+  void notify(gui::NoticeKind kind, StringView text, StringView about = StringView()) {
+    if (!gui::NoticeDialog::post(notices_, manager(), kind, text, about.empty() ? title() : about)) status_.set_text(text);
   }
 
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_, address_menu_;
+  bool list_menu_on_items_ = false;   // which of its two sets of items the list's menu holds
+  gui::MenuItem *open_item_ = nullptr, *rename_item_ = nullptr, *properties_item_ = nullptr, *eject_item_ = nullptr, *cut_item_ = nullptr, *copy_item_ = nullptr, *paste_item_ = nullptr,
+      *delete_item_ = nullptr, *select_all_item_ = nullptr, *copy_path_item_ = nullptr, *up_item_ = nullptr;
+  gui::MenuItem *ctx_cut_ = nullptr, *ctx_properties_ = nullptr;
   gui::MenuItem *ctx_open_ = nullptr, *ctx_copy_files_ = nullptr, *ctx_paste_ = nullptr, *ctx_select_all_ = nullptr, *ctx_rename_ = nullptr, *ctx_delete_ = nullptr, *ctx_copy_ = nullptr, *ctx_up_ = nullptr, *ctx_list_ = nullptr, *ctx_icons_ = nullptr, *ctx_details_ = nullptr;
   gui::Panel toolbar_, status_bar_;
   gui::BreadcrumbBar address_;
@@ -213,7 +235,7 @@ class FileExplorer : public gui::Frame {
   CopyProgressDialog* transfers_ = nullptr;
   gui::NoticeDialog* notices_ = nullptr;
   gui::MessageDialog delete_dialog_;
-  String delete_path_;   // what the dialog asks about
+  String delete_paths_;   // what the dialog asks about: full paths, one per line
   CredentialsDialog credentials_dialog_;
   LoginFunction login_ = nullptr;
   void* login_context_ = nullptr;

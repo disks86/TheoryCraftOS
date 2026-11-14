@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "Gui/AccessKey.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Window.hpp"
@@ -122,8 +123,11 @@ void Frame::restore() {
 }
 void Frame::close() {
   UiGuard lock(this);
-  if (host_) host_->close_tab(this);
-  else if (manager_ && close_requested()) manager_->close_window(this);
+  if (host_) {   // (a tab is asked like a window: a document with unsaved changes keeps its tab until the question is answered)
+    if (close_requested()) host_->close_tab(this);
+  } else if (manager_ && close_requested()) {
+    manager_->close_window(this);
+  }
 }
 void Frame::dock(Dock edge) {
   UiGuard lock(this);
@@ -271,8 +275,63 @@ void Frame::draw_button(Painter& painter, Part button) {
   }
 }
 
+namespace {
+
+// One pass over the labels of a frame: `explicit_pass` serves the labels that ask for a letter, the other pass the rest.
+void assign_labels(Control& control, AccessKeys& keys, bool explicit_pass) {
+  if (!control.visible()) return;
+  const uint32_t labels = control.access_label_count();
+  for (uint32_t i = 0; i < labels; ++i) {
+    const char wanted = control.access_key_wanted(i);
+    if (explicit_pass) control.set_access_index(i, wanted ? keys.claim(control.access_label(i), wanted) : AccessKeys::kNone);
+    else if (control.access_index(i) == AccessKeys::kNone) control.set_access_index(i, keys.pick(control.access_label(i)));
+  }
+  for (uint32_t i = 0; i < control.child_count(); ++i) assign_labels(*control.child(i), keys, explicit_pass);
+}
+
+// Activates the label with the access key `letter`; false if there is none that is visible and enabled.
+bool activate_label(Control& control, char letter) {
+  if (!control.visible() || !control.enabled()) return false;
+  const uint32_t labels = control.access_label_count();
+  for (uint32_t i = 0; i < labels; ++i) {
+    if (AccessKeys::key_of(control.access_label(i), control.access_index(i)) != letter) continue;
+    control.access_activate(i);
+    return true;
+  }
+  for (uint32_t i = 0; i < control.child_count(); ++i)
+    if (activate_label(*control.child(i), letter)) return true;
+  return false;
+}
+
+bool enter_first_menu(Control& control) {
+  if (!control.visible() || !control.enabled()) return false;
+  if (control.enter_menu()) return true;
+  for (uint32_t i = 0; i < control.child_count(); ++i)
+    if (enter_first_menu(*control.child(i))) return true;
+  return false;
+}
+
+}  // namespace
+
+void Frame::assign_access_keys() {
+  UiGuard lock(this);
+  AccessKeys keys;
+  for (uint32_t i = 0; i < child_count(); ++i) assign_labels(*child(i), keys, true);
+  for (uint32_t i = 0; i < child_count(); ++i) assign_labels(*child(i), keys, false);
+}
+
+bool Frame::on_access_key(char letter) {
+  if (host_) return false;   // the window that holds the tab looks, with all of its labels
+  UiGuard lock(this);
+  assign_access_keys();
+  for (uint32_t i = 0; i < child_count(); ++i)
+    if (activate_label(*child(i), letter)) return true;
+  return false;
+}
+
 void Frame::paint(Painter& painter) {
   const Theme& t = painter.theme();
+  if (!host_) assign_access_keys();   // (the children are painted after this, with the letters they have now)
   if (host_ || fullscreen_ || !decorated_) {   // a tab (or a window in fullscreen, or an undecorated one) has only its surface
     if (!opaque_client_) painter.fill({0, 0, bounds_.width, bounds_.height}, t.face);
     return;
@@ -454,6 +513,11 @@ bool Frame::on_key(const KeyArgs& args) {
   if (args.usage == hardware::key::kSpace && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) &&
       !(args.modifiers & (hardware::modifier::kLeftControl | hardware::modifier::kRightControl)) && !host_)
     return show_window_menu(kBorder, kBorder + kTitleHeight, true);
+  // F10: into the menu bar (the first menu opens)
+  if (args.usage == hardware::key::kF1 + 9 && !(args.modifiers & (hardware::modifier::kShift | hardware::modifier::kControl | hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) && !host_) {
+    for (uint32_t i = 0; i < child_count(); ++i)
+      if (enter_first_menu(*child(i))) return true;
+  }
   return false;
 }
 

@@ -1262,7 +1262,7 @@ static void test_explorer_network() {
     ex.address_bar().edit_box().set_text("smb://srv/other");
     w.set_focus(&ex.address_bar().edit_box());
     press(w, key::kEnter);
-    CHECK(!dialog.showing() && ex.status_label().text().find("Cannot open") != StringView::npos);
+    CHECK(!dialog.showing() && ex.status_label().text().find("could not be opened because the server could not be reached") != StringView::npos);
     mgr.remove_window(&ex);
   }
   CHECK(a.live == 0);
@@ -1438,7 +1438,7 @@ static void test_file_explorer() {
     CHECK(name_of(0).view().equals("Apps") && name_of(1).view().equals("docs") && name_of(2).view().equals("a.bin") &&
           name_of(3).view().equals("b.txt") && name_of(4).view().equals("readme"));
     CHECK(ex.view().item_icon(1) == ItemIcon::Folder && ex.view().item_icon(2) == ItemIcon::File);
-    CHECK(cell_of(3, 1).view().equals("11 B") && cell_of(3, 2).view().equals("TXT File") && cell_of(4, 2).view().equals("File") && cell_of(0, 2).view().equals("Folder") && cell_of(0, 1).empty());
+    CHECK(cell_of(3, 1).view().equals("11 B") && cell_of(3, 2).view().equals("Text Document") && cell_of(2, 2).view().equals("BIN File") && cell_of(4, 2).view().equals("File") && cell_of(0, 2).view().equals("Folder") && cell_of(0, 1).empty());
     CHECK(ex.status_label().text().equals("5 items"));
     CHECK(ex.address_bar().path().equals("/") && ex.address_bar().segment_count() == 1 && ex.details_item()->checked() && ex.view().view_mode() == ViewMode::Details);
 
@@ -1464,7 +1464,7 @@ static void test_file_explorer() {
       w.set_clipboard(&cb);
       press(w, key::kA + 2, modifier::kLeftControl);
       String copied(a);
-      CHECK(cb.get_text(&copied) && copied.view().equals("/b.txt") && ex.status_label().text().equals("Copied /b.txt"));
+      CHECK(cb.get_text(&copied) && copied.view().equals("/b.txt") && ex.status_label().text().equals("Copied \"b.txt\". Paste it where the copy should go."));
       w.set_clipboard(nullptr);
     }
 
@@ -1499,7 +1499,7 @@ static void test_file_explorer() {
       ex.address_bar().begin_edit();
       ex.address_bar().edit_box().set_text("/nowhere");
       press(w, key::kEnter);
-      CHECK(ex.path().equals("/docs/old") && ex.status_label().text().equals("Cannot open /nowhere"));
+      CHECK(ex.path().equals("/docs/old") && ex.status_label().text().equals("\"/nowhere\" could not be opened because it could not be found. It may have been moved, renamed or deleted."));
       press(w, key::kA + 11, modifier::kLeftControl);   // Ctrl+L, from anywhere in the window
       CHECK(ex.address_bar().editing());
       press(w, key::kEscape);
@@ -1537,23 +1537,24 @@ static void test_file_explorer() {
       filesystem::DirectoryEntry made;
       CHECK(ex.new_folder() && fs.stat("/New Folder", &made) == filesystem::Status::Ok && made.type == filesystem::NodeType::Directory);
       CHECK(ex.new_folder() && fs.stat("/New Folder 2", &made) == filesystem::Status::Ok);
-      CHECK(ex.new_file() && fs.stat("/New File.txt", &made) == filesystem::Status::Ok && made.type == filesystem::NodeType::File && made.size == 0);
-      CHECK(ex.new_file() && fs.stat("/New File 2.txt", &made) == filesystem::Status::Ok);
+      CHECK(ex.new_file() && fs.stat("/New Text Document.txt", &made) == filesystem::Status::Ok && made.type == filesystem::NodeType::File && made.size == 0);
+      CHECK(ex.new_file() && fs.stat("/New Text Document 2.txt", &made) == filesystem::Status::Ok);
       CHECK(ex.view().item_count() == 9 && ex.view().selected_item() >= 0);
       // The new item's name is open for editing; typing a name and pressing Enter renames it.
       CHECK(ex.view().renaming());
       ex.view().rename_box().set_text("Projects");
       press(w, key::kEnter);
-      CHECK(!ex.view().renaming() && fs.stat("/Projects", &made) == filesystem::Status::Ok && fs.stat("/New File 2.txt", &made) == filesystem::Status::NotFound);
+      CHECK(!ex.view().renaming() && fs.stat("/Projects", &made) == filesystem::Status::Ok && fs.stat("/New Text Document 2.txt", &made) == filesystem::Status::NotFound);
       CHECK(ex.view().selected_item() >= 0);
       // Escape drops an edit; a taken or empty name is refused and nothing changes.
       CHECK(ex.rename_selected() && ex.view().renaming());
       ex.view().rename_box().set_text("zzz");
       press(w, key::kEscape);
       CHECK(!ex.view().renaming() && fs.stat("/zzz", &made) == filesystem::Status::NotFound);
-      CHECK(!ex.rename_item("Projects", "New Folder 2") && !ex.rename_item("Projects", "") && !ex.rename_item("Projects", "a/b"));
+      CHECK(!ex.rename_item("Projects", "New Folder 2") && ex.status_label().text().equals("\"Projects\" could not be renamed because that name is already used. Choose another name."));
+      CHECK(!ex.rename_item("Projects", "a/b") && ex.rename_item("Projects", "") && fs.stat("/Projects", &made) == filesystem::Status::Ok);   // (nothing typed: the name stays, without a message)
       CHECK(ex.rename_item("Projects", "Projects") && ex.rename_item("Projects", "  Work  ") && fs.stat("/Work", &made) == filesystem::Status::Ok);
-      CHECK(fs.rename("/Work", "/New File 2.txt") == filesystem::Status::Ok);
+      CHECK(fs.rename("/Work", "/New Text Document 2.txt") == filesystem::Status::Ok);
       // Delete asks first: Cancel keeps the item, Delete removes a folder with its contents.
       CHECK(fs.create_directory("/New Folder/inner") == filesystem::Status::Ok);
       make_file(fs, "/New Folder/inner/f.txt", "x");
@@ -1568,21 +1569,24 @@ static void test_file_explorer() {
       CHECK(fs.create_directory("/New Folder") == filesystem::Status::Ok);
       CHECK(ex.refresh());
       CHECK(fs.remove("/New Folder") == filesystem::Status::Ok && fs.remove("/New Folder 2") == filesystem::Status::Ok);
-      CHECK(fs.remove("/New File.txt") == filesystem::Status::Ok && fs.remove("/New File 2.txt") == filesystem::Status::Ok);
+      CHECK(fs.remove("/New Text Document.txt") == filesystem::Status::Ok && fs.remove("/New Text Document 2.txt") == filesystem::Status::Ok);
       CHECK(ex.refresh() && ex.view().item_count() == 5);
     }
     // File > Eject: the selected folder at the root, else the folder of the path's first component; the answer goes to the status bar
     {
       EjectProbe probe;
       ex.set_eject_handler(probe_eject, &probe);
-      CHECK(ex.open_folder("/") && !ex.eject_selected() && probe.calls == 0 && ex.status_label().text().equals("Select a drive to eject"));
+      CHECK(ex.open_folder("/"));
+      ex.menu_bar().open_menu(0);   // with no drive selected there is nothing to eject: the command is unavailable (and says nothing)
+      CHECK(!ex.menu_bar().find_item("File", "Eject")->enabled() && !ex.eject_selected() && probe.calls == 0);
+      w.close_popup();
       ex.view().select_item(0);   // a folder (Apps)
       CHECK(ex.eject_selected() && probe.calls == 1 && strcmp(probe.volume, "Apps") == 0 && ex.status_label().text().equals("ejected"));
       CHECK(ex.open_folder("/Apps") && ex.eject_selected() && probe.calls == 2 && strcmp(probe.volume, "Apps") == 0);
       probe.answer = nullptr;
       CHECK(ex.eject_selected() && probe.calls == 3);
       ex.set_eject_handler(nullptr, nullptr);
-      CHECK(!ex.eject_selected() && ex.status_label().text().equals("Nothing here can be ejected") && probe.calls == 3);
+      CHECK(!ex.eject_selected() && probe.calls == 3);
       ex.open_folder("/");
     }
     desktop::FileExplorer detached(a);
@@ -1672,7 +1676,7 @@ static void test_computer_manager_npu() {
     mon.npu_info.present = true;
     mon.npu_info.busy_us = 500000;
     tm.update(2000000);
-    CHECK(tm.npu_row_visible() && tm.npu_label().text().equals("n/a"));   // the first sample has nothing to compare with
+    CHECK(tm.npu_row_visible() && tm.npu_label().text().equals("Not available"));   // the first sample has nothing to compare with
     mon.npu_info.busy_us = 1250000;                     // 750 ms busy in the 1 s since the last update
     tm.update(3000000);
     CHECK(tm.npu_label().text().equals("75%") && tm.npu_meter().level() == 75);
@@ -1726,7 +1730,7 @@ static void test_computer_manager() {
     w.add(&mgr);
     desktop::ComputerManager tm(a);
     tm.update(1000000);
-    CHECK(tm.info_label().text().equals("No system monitor available"));
+    CHECK(tm.info_label().text().equals("No information about the system is available."));
     tm.set_monitor(&mon);
     CHECK(mgr.add_window(&tm));
     w.layout();
@@ -1736,10 +1740,10 @@ static void test_computer_manager() {
     CHECK(tm.memory_label().text().equals("512.0 MB / 1.0 GB") && tm.memory_meter().level() == 50);
     CHECK(tm.info_label().text().equals("Threads: 3   Cores: 2   Uptime: 00:00:01"));
     CHECK(tm.core_meter(0) && tm.core_meter(1) && !tm.core_meter(2) && tm.core_label(0)->text().equals("0%"));
-    CHECK(tm.tabs().page_count() == 4 && tm.tabs().page_title(0).equals("Processes") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().page_title(3).equals("Usermode") && tm.tabs().selected_page() == 0);
+    CHECK(tm.tabs().page_count() == 4 && tm.tabs().page_title(0).equals("Threads") && tm.tabs().page_title(1).equals("Performance") && tm.tabs().page_title(2).equals("Hardware") && tm.tabs().page_title(3).equals("Programs") && tm.tabs().selected_page() == 0);
 
     // The GPU, its memory and the temperatures: unknown figures read n/a, known ones fill their meters.
-    CHECK(tm.gpu_label().text().equals("n/a") && tm.vram_label().text().equals("n/a") && tm.gpu_temp_label().text().equals("n/a"));
+    CHECK(tm.gpu_label().text().equals("Not available") && tm.vram_label().text().equals("Not available") && tm.gpu_temp_label().text().equals("Not available"));
     CHECK(tm.cpu_temp_label().text().equals("62.5 C") && tm.cpu_temp_meter().level() == 62);
     mon.gpu_info.usage_percent = 40;
     mon.gpu_info.memory_known = true;
@@ -1759,7 +1763,7 @@ static void test_computer_manager() {
     CHECK(tm.battery_label().text().equals("No battery") && tm.battery_meter().level() == 0);
     mon.battery_info.present = true;
     tm.update(1000000);
-    CHECK(tm.battery_label().text().equals("n/a"));
+    CHECK(tm.battery_label().text().equals("Not available"));
     mon.battery_info.percent = 85;
     mon.battery_info.state = desktop::ChargeState::Charging;
     tm.update(1000000);
@@ -2020,8 +2024,8 @@ static void test_hardware_tab() {
     CHECK(tm.hardware_info().text().equals("1 device"));
     // Display Settings is in the menu of the Displays group, and of nothing else.
     const Point on_displays = node_point(tree, displays), on_storage = node_point(tree, storage);
-    CHECK(!choose_context(w, tm.display_menu(), on_storage.x, on_storage.y, "Display Settings...") && !w.popup() && opened.count == 0);
-    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 1);
+    CHECK(!choose_context(w, tm.display_menu(), on_storage.x, on_storage.y, "Display Settings") && !w.popup() && opened.count == 0);
+    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings") && opened.count == 1);
     const Point on_monitor = node_point(tree, tree.child_at(displays, 0));
     right_click(w, on_monitor.x, on_monitor.y);   // (a display has a menu of its own: Properties and Display Settings)
     CHECK(w.popup() && tm.monitor_menu().open() && opened.count == 1);
@@ -2032,13 +2036,13 @@ static void test_hardware_tab() {
     const int32_t nic = tree.child_at(network, 1);
     CHECK(tree.node_text(nic).equals("Fake NIC two") && tree.child_count(network) == 2);
     const Point on_nic = node_point(tree, nic), on_adapters = node_point(tree, network);
-    CHECK(choose_context(w, tm.adapter_menu(), on_nic.x, on_nic.y, "Properties...") && properties.count == 1 && tm.network_adapter() == 8 && opened.count == 1);
+    CHECK(choose_context(w, tm.adapter_menu(), on_nic.x, on_nic.y, "Properties") && properties.count == 1 && tm.network_adapter() == 8 && opened.count == 1);
     const int32_t first_nic = tree.child_at(network, 0);
     const Point on_first = node_point(tree, first_nic);
-    CHECK(choose_context(w, tm.adapter_menu(), on_first.x, on_first.y, "Properties...") && properties.count == 2 && tm.network_adapter() == 7);
+    CHECK(choose_context(w, tm.adapter_menu(), on_first.x, on_first.y, "Properties") && properties.count == 2 && tm.network_adapter() == 7);
     right_click(w, on_adapters.x, on_adapters.y);
     CHECK(!w.popup() && properties.count == 2);
-    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings...") && opened.count == 2);
+    CHECK(choose_context(w, tm.display_menu(), on_displays.x, on_displays.y, "Display Settings") && opened.count == 2);
 
     // A new look at the machine: another monitor, a network adapter; what was closed stays closed and the selection stays on its device.
     tree.set_expanded(storage, false);
@@ -2054,7 +2058,7 @@ static void test_hardware_tab() {
     tm.update(2000000);
     CHECK(tree.node_count() == nodes && tree.node_text(tree.selected()).equals("Monitor B"));
     // The View menu has the tab, checked when it is up.
-    CHECK(choose(w, tm.menu_bar(), "View", "Processes") && tm.tabs().selected_page() == 0);
+    CHECK(choose(w, tm.menu_bar(), "View", "Threads") && tm.tabs().selected_page() == 0);
     CHECK(choose(w, tm.menu_bar(), "View", "Hardware") && tm.tabs().selected_page() == 2);
     // Without an inventory the tab says so.
     tm.set_hardware_inventory(nullptr);
@@ -2115,7 +2119,7 @@ static void test_network_properties() {
     props.set_details(&details);
     props.show_adapter(3);
     w.layout();
-    CHECK(props.adapter() == 3 && props.title().equals("Fake e1000 - Properties") && props.grid().row_count() == P::kRowCount);
+    CHECK(props.adapter() == 3 && props.title().equals("Fake e1000 Properties") && props.grid().row_count() == P::kRowCount);
     CHECK(props.cell(P::kLink, 0).equals("Link") && props.cell(P::kLink, 1).equals("Connected"));
     CHECK(props.cell(P::kSpeed, 1).equals("1 Gbps, full duplex") && props.cell(P::kMac, 1).equals("52:54:00:12:34:AB"));
     CHECK(props.cell(P::kConfiguration, 1).equals("Automatic (DHCP, bound)"));
@@ -2240,7 +2244,7 @@ static void test_wireless_properties() {
     props.set_details(&details);
     props.show_adapter(5);
     w.layout();
-    CHECK(details.scans == 1 && props.adapter() == 5 && props.title().equals("Fake Wi-Fi - Wi-Fi Properties") && props.grid().row_count() == 3);
+    CHECK(details.scans == 1 && props.adapter() == 5 && props.title().equals("Wi-Fi Networks - Fake Wi-Fi") && props.grid().row_count() == 3);
     CHECK(props.connection_label().text().equals("Not connected"));
     CHECK(props.cell(0, 0).equals("Home") && props.cell(0, 1).equals("90%") && props.cell(0, 2).equals("WPA2") && props.cell(0, 3).equals("6"));
     CHECK(props.cell(1, 2).equals("Open") && props.cell(2, 2).equals("WEP") && props.cell(7, 0).empty());
@@ -2253,7 +2257,7 @@ static void test_wireless_properties() {
     CHECK(props.status_label().text().find(StringView("password")) != StringView::npos && props.connection_label().text().equals("Not connected"));
     props.password_box().set_text("nope");
     click_center(w, props.connect_button());
-    CHECK(props.status_label().text().equals("The password is not right.") && props.connection_label().text().equals("Not connected"));
+    CHECK(props.status_label().text().equals("The password was not accepted. Type it again, then choose Connect.") && props.connection_label().text().equals("Not connected"));
     props.password_box().set_text("sesame123");
     click_center(w, props.connect_button());
     CHECK(props.status_label().text().equals("Connected to Home.") && props.password_box().text().empty());
@@ -2279,7 +2283,7 @@ static void test_wireless_properties() {
     details.info.state = desktop::WirelessState::Disconnected;
     details.known = 9;
     props.update();
-    CHECK(props.grid().row_count() == 0 && props.connection_label().text().find(StringView("not there")) != StringView::npos && !props.scan_button().enabled());
+    CHECK(props.grid().row_count() == 0 && props.connection_label().text().find(StringView("no longer connected")) != StringView::npos && !props.scan_button().enabled());
     props.close();
     CHECK(!props.manager());
   }
@@ -2308,15 +2312,15 @@ static void test_wireless_menu() {
     CHECK(network >= 0 && cm.hardware_tree().child_count(network) == 2);
     const Point wired = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
     const Point wifi = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 1));
-    CHECK(!choose_context(w, cm.adapter_menu(), wifi.x, wifi.y, "Wi-Fi Properties...") && !d.wireless_properties().manager());
+    CHECK(!choose_context(w, cm.adapter_menu(), wifi.x, wifi.y, "Wi-Fi Networks") && !d.wireless_properties().manager());
     w.close_popup();
-    CHECK(!choose_context(w, cm.wireless_menu(), wired.x, wired.y, "Wi-Fi Properties...") && !d.wireless_properties().manager());
+    CHECK(!choose_context(w, cm.wireless_menu(), wired.x, wired.y, "Wi-Fi Networks") && !d.wireless_properties().manager());
     w.close_popup();
-    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Wi-Fi Properties...") && d.wireless_properties().manager() != nullptr);
+    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Wi-Fi Networks") && d.wireless_properties().manager() != nullptr);
     CHECK(d.wireless_properties().adapter() == 5 && cm.wireless_adapter() == 5 && d.wireless_properties().grid().row_count() == 3 && !d.network_properties().manager());
     // The menu still has the adapter's ordinary Properties.
     cm.activate();
-    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Properties...") && d.network_properties().manager() != nullptr && d.network_properties().adapter() == 5);
+    CHECK(choose_context(w, cm.wireless_menu(), wifi.x, wifi.y, "Properties") && d.network_properties().manager() != nullptr && d.network_properties().adapter() == 5);
     // The window follows the adapter once a second.
     details.info.state = desktop::WirelessState::Connected;
     details.info.network = details.list[0];
@@ -2383,7 +2387,7 @@ static void test_start_menu_installed_apps() {
     CHECK(menu_index(menu, "Firefox (Linux)") < 0);
     d.set_file_system(&ram);
     const int32_t firefox = menu_index(menu, "Firefox (Linux)"), chrome = menu_index(menu, "Google Chrome (Windows)");
-    const int32_t about = menu_index(menu, "About TheoryCraftOS..."), test3d = menu_index(menu, "3D Test");
+    const int32_t about = menu_index(menu, "Notifications"), test3d = menu_index(menu, "3D Test");
     CHECK(menu.item_count() == before + 3);
     CHECK(firefox == test3d + 2 && menu.item(static_cast<uint32_t>(test3d + 1))->separator && chrome == firefox + 1 && about == chrome + 1);
 
@@ -2511,7 +2515,7 @@ static void test_bluetooth_properties() {
     props.set_details(&details);
     props.show_adapter(0);
     w.layout();
-    CHECK(details.discovery_calls == 1 && props.grid().row_count() == 3 && props.title().equals("Fake Bluetooth - Bluetooth"));
+    CHECK(details.discovery_calls == 1 && props.grid().row_count() == 3 && props.title().equals("Bluetooth Devices - Fake Bluetooth"));
     CHECK(props.adapter_label().text().equals("Fake Bluetooth (11:22:33:44:55:66) - looking for devices..."));
     CHECK(props.cell(0, 0).equals("Keyboard") && props.cell(0, 1).equals("Keyboard") && props.cell(0, 2).equals("90%") && props.cell(0, 3).equals("Paired"));
     CHECK(props.cell(1, 3).equals("Not paired") && props.cell(2, 0).equals("A1:A2:A3:A4:A5:A6") && props.cell(2, 2).empty() && props.cell(2, 3).equals("Not supported yet") && props.cell(7, 0).empty());
@@ -2542,7 +2546,9 @@ static void test_bluetooth_properties() {
     CHECK(props.cell(0, 3).equals("Connected") && props.disconnect_button().enabled());
     click_center(w, props.disconnect_button());
     CHECK(details.disconnects == 1 && props.cell(0, 3).equals("Paired") && props.status_label().text().equals("Disconnected."));
-    click_center(w, props.forget_button());
+    click_center(w, props.forget_button());   // (deleting a pairing asks first, and Cancel is the default answer)
+    CHECK(props.forget_dialog().showing() && details.forgets == 0 && props.forget_dialog().default_choice() == MessageDialog::Choice::Decline);
+    props.forget_dialog().accept_button().click();
     CHECK(details.forgets == 1 && props.cell(0, 3).equals("Not paired") && !props.forget_button().enabled());
     // Refusals and failures say why.
     details.connect_result = desktop::BluetoothResult::Busy;
@@ -2607,7 +2613,7 @@ static void test_bluetooth_properties() {
     // An adapter that is gone, or not ready.
     details.known = 9;
     props.update();
-    CHECK(props.grid().row_count() == 0 && props.adapter_label().text().find(StringView("not there")) != StringView::npos && !props.search_button().enabled() && !props.auto_reconnect_box().enabled());
+    CHECK(props.grid().row_count() == 0 && props.adapter_label().text().find(StringView("no longer connected")) != StringView::npos && !props.search_button().enabled() && !props.auto_reconnect_box().enabled());
     details.known = 0;
     details.info.ready = false;
     props.update();
@@ -2641,9 +2647,9 @@ static void test_bluetooth_menu() {
     const Point adapter = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(group, 0));
     const int32_t network = cm.hardware_group_node(HardwareGroup::Network);
     const Point wired = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
-    CHECK(!choose_context(w, cm.bluetooth_menu(), wired.x, wired.y, "Bluetooth Settings...") && !d.bluetooth_properties().manager());
+    CHECK(!choose_context(w, cm.bluetooth_menu(), wired.x, wired.y, "Bluetooth Devices") && !d.bluetooth_properties().manager());
     w.close_popup();
-    CHECK(choose_context(w, cm.bluetooth_menu(), adapter.x, adapter.y, "Bluetooth Settings...") && d.bluetooth_properties().manager() != nullptr);
+    CHECK(choose_context(w, cm.bluetooth_menu(), adapter.x, adapter.y, "Bluetooth Devices") && d.bluetooth_properties().manager() != nullptr);
     CHECK(d.bluetooth_properties().adapter() == 0 && cm.bluetooth_adapter() == 0 && d.bluetooth_properties().grid().row_count() == 3 && details.discovery_calls == 1);
     // The window follows the adapter several times a second.
     details.rows[0].signal_percent = 33;
@@ -2742,7 +2748,7 @@ static void test_display_settings_entry() {
     using desktop::HardwareGroup;
     Screen screen(a, 800, 600);
     desktop::Desktop d(a, screen.renderer, nullptr, nullptr);
-    CHECK(d.start_button().menu().item_count() == 18);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, App Manager, Paint, Media Player, Video Viewer, 3D Test, About, a line, Shut Down
+    CHECK(d.start_button().menu().item_count() == 19);   // Explorer, Computer Manager, Text Editor, Spreadsheet, Database, Web Browser, Terminal, Calculator, Calendar, To-Do, App Manager, Paint, Media Player, Video Viewer, 3D Test, Notifications, About, a line, Shut Down
     FakeInventory inv(a);
     inv.list.add(HardwareGroup::Displays, "Monitor A", "HDMI-1");
     d.set_hardware_inventory(&inv);
@@ -2754,7 +2760,7 @@ static void test_display_settings_entry() {
     const int32_t displays = cm.hardware_group_node(HardwareGroup::Displays);
     CHECK(displays >= 0 && !d.display_settings().manager());
     const Point p = node_point(cm.hardware_tree(), displays);
-    CHECK(choose_context(w, cm.display_menu(), p.x, p.y, "Display Settings...") && d.display_settings().manager() != nullptr);
+    CHECK(choose_context(w, cm.display_menu(), p.x, p.y, "Display Settings") && d.display_settings().manager() != nullptr);
     CHECK(strcmp(cm.title().data(), "Computer Manager") == 0);
 
     // A network adapter's Properties opens its window, which follows the adapter once a second. (The display settings window is out of the way.)
@@ -2768,7 +2774,7 @@ static void test_display_settings_entry() {
     const int32_t network = cm.hardware_group_node(HardwareGroup::Network);
     CHECK(network >= 0 && !d.network_properties().manager());
     const Point q = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(network, 0));
-    CHECK(choose_context(w, cm.adapter_menu(), q.x, q.y, "Properties...") && d.network_properties().manager() != nullptr);
+    CHECK(choose_context(w, cm.adapter_menu(), q.x, q.y, "Properties") && d.network_properties().manager() != nullptr);
     CHECK(d.network_properties().adapter() == 3 && d.network_properties().cell(desktop::NetworkProperties::kAddress, 1).equals("10.0.2.15"));
     details.info.link_up = false;
     d.step(5000000);
@@ -2831,10 +2837,10 @@ static void test_device_properties() {
 
     // Properties of the second card opens the window for that card (the menu is the same for both).
     const Point q = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(audio, 1));
-    CHECK(choose_context(w, cm.device_menu(), q.x, q.y, "Properties...") && d.device_properties().manager() != nullptr);
+    CHECK(choose_context(w, cm.device_menu(), q.x, q.y, "Properties") && d.device_properties().manager() != nullptr);
     P& props = d.device_properties();
     CHECK(cm.device_group() == HardwareGroup::Audio && cm.device_id() == 1 && props.group() == HardwareGroup::Audio && props.device() == 1);
-    CHECK(props.title().equals("USB Headset - Properties") && props.grid().row_count() == 3);
+    CHECK(props.title().equals("USB Headset Properties") && props.grid().row_count() == 3);
     CHECK(props.cell(0, 0).equals("Type") && props.cell(0, 1).equals("Sound card") && props.value("Volume").equals("70 %"));
     CHECK(props.status().empty());
 
@@ -2848,17 +2854,17 @@ static void test_device_properties() {
     props.close();
     cm.activate();
     const Point r = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(audio, 0));
-    CHECK(choose_context(w, cm.device_menu(), r.x, r.y, "Properties...") && props.device() == 0 && props.title().equals("HDA Codec - Properties"));
+    CHECK(choose_context(w, cm.device_menu(), r.x, r.y, "Properties") && props.device() == 0 && props.title().equals("HDA Codec Properties"));
 
     // A display has Properties besides Display Settings; Properties opens the same window.
     props.close();
     cm.activate();
     const int32_t displays = cm.hardware_group_node(HardwareGroup::Displays);
     const Point m = node_point(cm.hardware_tree(), cm.hardware_tree().child_at(displays, 0));
-    CHECK(choose_context(w, cm.monitor_menu(), m.x, m.y, "Properties...") && props.group() == HardwareGroup::Displays && props.title().equals("Monitor A - Properties"));
+    CHECK(choose_context(w, cm.monitor_menu(), m.x, m.y, "Properties") && props.group() == HardwareGroup::Displays && props.title().equals("Monitor A Properties"));
     props.close();
     cm.activate();
-    CHECK(!d.display_settings().manager() && choose_context(w, cm.monitor_menu(), m.x, m.y, "Display Settings...") && d.display_settings().manager() != nullptr);
+    CHECK(!d.display_settings().manager() && choose_context(w, cm.monitor_menu(), m.x, m.y, "Display Settings") && d.display_settings().manager() != nullptr);
 
     d.display_settings().close();
     cm.activate();
@@ -2867,7 +2873,7 @@ static void test_device_properties() {
     CHECK(props.grid().row_count() == 3);
     details.cards = 1;
     props.update();
-    CHECK(props.grid().row_count() == 0 && props.status().equals("This device is not there any more."));
+    CHECK(props.grid().row_count() == 0 && props.status().equals("This device is no longer connected. Close this window."));
     details.cards = 2;
     props.show_device(HardwareGroup::Audio, 0);
     CHECK(props.grid().row_count() == 3 && props.status().empty());
@@ -3031,7 +3037,7 @@ static void test_media_player() {
     CHECK(!mp.open_file("/note.txt") && notices.showing() && notices.kind() == gui::NoticeKind::Error);
     notices.close();
     mp.set_file_system(&fs);
-    CHECK(!mp.open_file("/missing.wav") && notices.showing() && notices.message().first(11).equals("Cannot open"));
+    CHECK(!mp.open_file("/missing.wav") && notices.showing() && notices.message().first(36).equals("\"missing.wav\" could not be opened be"));
     notices.close();
     CHECK(!mp.open_file("/note.txt") && notices.showing() && mp.kind() == desktop::MediaPlayer::Kind::None);
     notices.close();
@@ -3113,7 +3119,7 @@ static void test_media_player() {
         file.reset();
         CHECK(desktop::MediaPlayer::is_media_name("tune.MID") && desktop::MediaPlayer::is_media_name("tune.midi") && desktop::MediaPlayer::is_media_name("x.kar"));
         CHECK(sound_player.open_file("/song.mid") && sound_player.kind() == desktop::MediaPlayer::Kind::Audio && !notices.showing());
-        CHECK(sound_player.status_label().text().equals("Playing /song.mid (synthesized) (1 of 3)") && sound_player.audio_player()->duration() >= 48000);
+        CHECK(sound_player.status_label().text().equals("Playing \"song.mid\" with the built-in synthesizer (1 of 3)") && sound_player.audio_player()->duration() >= 48000);
         int loud = 0;
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
@@ -3132,7 +3138,7 @@ static void test_media_player() {
           void reset() override {}
         } hardware;
         sound_player.set_midi_output(&hardware);
-        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing /song.mid (on the MIDI hardware) (1 of 3)"));
+        CHECK(sound_player.open_file("/song.mid") && sound_player.status_label().text().equals("Playing \"song.mid\" on the MIDI hardware (1 of 3)"));
         for (int i = 0; i < 40; ++i) {
           sound_player.audio_player()->update();
           mixer.pump();
@@ -3166,42 +3172,45 @@ static void test_notepad() {
     desktop::Notepad np(a);
     CHECK(mgr.add_window(&np));
     w.layout();
-    CHECK(!np.open_file("/t.txt") && np.status_label().text().equals("No storage available."));
+    CHECK(!np.open_file("/t.txt") && np.status_label().text().equals("There is no disk to open files from."));
     np.set_file_system(&fs);
-    CHECK(np.title().equals("Text Editor - Untitled") && np.position_label().text().equals("Ln 1, Col 1"));
+    CHECK(np.title().first(9).equals("Document ") && np.title().find(StringView(" - Text Editor")) != StringView::npos && np.position_label().text().equals("Ln 1, Col 1"));   // a new document: its type and a number, then the application
 
     CHECK(np.open_file("t.txt"));               // the leading slash is optional; CRs are dropped
     CHECK(np.editor().text().equals("a\nb\n") && np.path().equals("/t.txt") && !np.editor().modified());
-    CHECK(np.title().equals("Text Editor - t.txt") && np.status_label().text().equals("Opened /t.txt"));
-    CHECK(!np.open_file("/nope") && np.status_label().text().equals("Cannot open /nope: not found") && np.editor().text().equals("a\nb\n"));
+    CHECK(np.title().equals("t.txt - Text Editor") && np.status_label().text().equals("Opened \"t.txt\"."));
+    CHECK(!np.open_file("/nope") && np.status_label().text().equals("\"nope\" could not be opened. It is no longer there. It may have been moved, renamed or deleted.") && np.editor().text().equals("a\nb\n"));
     CHECK(!np.open_file("/dir"));
     // With a notice dialog the error opens in it instead of going to the status bar.
     {
       gui::NoticeDialog notices(a);
       np.set_notices(&notices);
-      CHECK(!np.open_file("/gone") && notices.showing() && notices.kind() == gui::NoticeKind::Error && notices.message().equals("Cannot open /gone: not found"));
+      CHECK(!np.open_file("/gone") && notices.showing() && notices.kind() == gui::NoticeKind::Error && notices.message().first(31).equals("\"gone\" could not be opened. It "));
       notices.close();
       np.set_notices(nullptr);
     }
 
-    // Unsaved changes are only thrown away when the command is repeated.
+    // Unsaved changes are only thrown away when the user says so: New asks Save / Don't Save / Cancel (tests/UiGuide/Editors.inc has the rest).
     w.set_focus(&np.editor());
     np.editor().set_caret(np.editor().text().size());
     type_char(w, 'c');
-    CHECK(np.editor().modified() && np.title().equals("Text Editor - t.txt *") && np.position_label().text().equals("Ln 3, Col 2"));
-    CHECK(!np.new_document() && np.status_label().text().first(13).equals("Unsaved chang"));
-    type_char(w, 'd');                          // typing again disarms it
-    CHECK(!np.new_document() && np.editor().text().equals("a\nb\ncd"));
-    CHECK(np.new_document() && np.editor().text().empty() && np.path().empty() && np.title().equals("Text Editor - Untitled"));
+    CHECK(np.editor().modified() && np.title().equals("t.txt - Text Editor") && np.position_label().text().equals("Ln 3, Col 2"));
+    CHECK(!np.new_document() && np.save_question().showing() && np.editor().text().equals("a\nb\nc"));
+    press(w, key::kEscape);                     // Cancel: nothing changes
+    CHECK(!np.save_question().showing() && np.editor().text().equals("a\nb\nc"));
+    CHECK(!np.new_document() && np.save_question().showing());
+    np.save_question().alternate_button().click();   // Don't Save
+    CHECK(np.editor().text().empty() && np.path().empty() && np.title().first(9).equals("Document "));
+    w.set_focus(&np.editor());
 
     // Saving writes the text to the file it came from; a new document has none (and without a dialog nothing asks).
     type_text(w, "hello");
     press(w, key::kEnter);
     type_text(w, "world");
     press(w, key::kA + 18, modifier::kLeftControl);
-    CHECK(np.editor().modified() && np.status_label().text().equals("Enter a path to save to."));
+    CHECK(np.editor().modified() && !np.menu_bar().find_item("File", "Save")->enabled());   // (Save is disabled: there is nowhere to save to and nothing to ask with)
     CHECK(np.save_file("out.txt"));
-    CHECK(!np.editor().modified() && np.path().equals("/out.txt") && np.status_label().text().equals("Saved /out.txt") && np.title().equals("Text Editor - out.txt"));
+    CHECK(!np.editor().modified() && np.path().equals("/out.txt") && np.status_label().text().equals("Saved \"out.txt\".") && np.title().equals("out.txt - Text Editor"));
     UniquePointer<filesystem::IFile> f;
     CHECK(fs.open_file("/out.txt", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 11);
     char got[16] = {};
@@ -3210,11 +3219,11 @@ static void test_notepad() {
     f.reset();
     type_text(w, "!");
     press(w, key::kA + 18, modifier::kLeftControl);   // Ctrl+S writes to the same file again
-    CHECK(!np.editor().modified() && np.status_label().text().equals("Saved /out.txt"));
-    CHECK(!np.save_file("/missing/x.txt") && np.status_label().text().equals("Cannot save /missing/x.txt: not found"));
+    CHECK(!np.editor().modified() && np.status_label().text().equals("Saved \"out.txt\"."));
+    CHECK(!np.save_file("/missing/x.txt") && np.status_label().text().first(27).equals("\"x.txt\" could not be saved."));
     CHECK(np.path().equals("/out.txt"));
-    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog
-    CHECK(np.status_label().text().equals("No file dialog available."));
+    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog: Open is disabled, the key does nothing
+    CHECK(!np.menu_bar().find_item("File", "Open...")->enabled() && np.status_label().text().first(27).equals("\"x.txt\" could not be saved."));
     w.render();
     mgr.remove_window(&np);
   }
@@ -3631,7 +3640,7 @@ static void test_paint() {
     w.layout();
     DrawingCanvas& c = paint.canvas();
     CHECK(desktop::Paint::is_picture_name("a/b.PNG") && desktop::Paint::is_picture_name("x.jpeg") && !desktop::Paint::is_picture_name("x.txt") && !desktop::Paint::is_picture_name("png"));
-    CHECK(paint.title().equals("Paint - Untitled") && c.image_width() == 640 && c.image_height() == 480 && !paint.menu_bar().find_item("Edit", "Undo")->enabled());
+    CHECK(paint.title().first(8).equals("Picture ") && paint.title().find(StringView(" - Paint")) != StringView::npos && c.image_width() == 640 && c.image_height() == 480 && !paint.menu_bar().find_item("Edit", "Undo")->enabled());
     CHECK(paint.tools().tool_count() == 8 && paint.tools().tool_name(3).equals("Rectangle") && paint.tools().tool_name(7).equals("Select"));
 
     // The tool strip, palette, size slider and options drive the canvas.
@@ -3645,10 +3654,10 @@ static void test_paint() {
     CHECK(paint.palette().primary() == 0xFFFF0000 && c.primary() == 0xFFFF0000 && paint.color_picker().color() == 0xFFFF0000);
     paint.size_slider().set_value(3);
     CHECK(c.brush_size() == 3);
-    CHECK(choose(w, paint.menu_bar(), "Options", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
-    CHECK(c.filled() && c.grid() && paint.menu_bar().find_item("Options", "Filled Shapes")->checked() && paint.menu_bar().find_item("View", "Pixel Grid")->checked());
-    CHECK(choose(w, paint.menu_bar(), "Options", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
-    CHECK(!c.filled() && !c.grid() && !paint.menu_bar().find_item("Options", "Filled Shapes")->checked());
+    CHECK(choose(w, paint.menu_bar(), "Tools", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
+    CHECK(c.filled() && c.grid() && paint.menu_bar().find_item("Tools", "Filled Shapes")->checked() && paint.menu_bar().find_item("View", "Pixel Grid")->checked());
+    CHECK(choose(w, paint.menu_bar(), "Tools", "Filled Shapes") && choose(w, paint.menu_bar(), "View", "Pixel Grid"));
+    CHECK(!c.filled() && !c.grid() && !paint.menu_bar().find_item("Tools", "Filled Shapes")->checked());
     CHECK(choose(w, paint.menu_bar(), "View", "Zoom In"));
     CHECK(c.zoom() == 2 && paint.zoom_label().text().equals("200%"));
     CHECK(choose(w, paint.menu_bar(), "View", "Zoom Out"));
@@ -3658,7 +3667,7 @@ static void test_paint() {
     w.layout();
     drag(w, pixel_point(c, 10, 10), pixel_point(c, 40, 10));
     CHECK(c.pixel(25, 10) == 0xFFFF0000 && c.modified() && paint.menu_bar().find_item("Edit", "Undo")->enabled() && !paint.menu_bar().find_item("Edit", "Redo")->enabled());
-    CHECK(paint.title().equals("Paint - Untitled *"));
+    CHECK(paint.title().first(8).equals("Picture "));   // (the title is the picture's name: no mark for unsaved changes)
     CHECK(choose(w, paint.menu_bar(), "Edit", "Undo"));
     CHECK(c.pixel(25, 10) == 0xFFFFFFFF && paint.menu_bar().find_item("Edit", "Redo")->enabled());
     CHECK(choose(w, paint.menu_bar(), "Edit", "Redo"));
@@ -3672,12 +3681,12 @@ static void test_paint() {
     CHECK(c.primary() == 0xFF0000FF);
 
     // Saving and opening: the format follows the extension; PNG is the default.
-    CHECK(!paint.save_file("/x.png") && paint.status_label().text().equals("No storage available."));
+    CHECK(!paint.save_file("/x.png") && paint.status_label().text().equals("There is no disk to save pictures on."));
     paint.set_file_system(&fs);
-    CHECK(!paint.save_file("") && paint.status_label().text().equals("Enter a path to save to."));
+    CHECK(!paint.save_file("") && !paint.menu_bar().find_item("File", "Save As...")->enabled());   // (no name and no dialog to ask for one: Save As is disabled)
     CHECK(!paint.save_file("/dir/missing.png"));
     CHECK(paint.save_file("art"));
-    CHECK(paint.path().equals("/art.png") && !c.modified() && paint.title().equals("Paint - art.png") && paint.status_label().text().equals("Saved /art.png"));
+    CHECK(paint.path().equals("/art.png") && !c.modified() && paint.title().equals("art.png - Paint") && paint.status_label().text().equals("Saved \"art.png\"."));
     UniquePointer<filesystem::IFile> f;
     CHECK(fs.open_file("/art.png", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() > 8);
     uint8_t magic[4] = {};
@@ -3690,20 +3699,23 @@ static void test_paint() {
       c.new_image(8, 8, 0xFF123456);             // blank, then bring the picture back
       CHECK(paint.open_file(name) && c.image_width() == 640 && c.pixel(25, 10) == 0xFFFF0000 && c.pixel(25, 11) == 0xFFFF0000 && c.pixel(100, 100) == 0xFFFFFFFF);
     }
-    CHECK(paint.open_file("/art.png") && c.pixel(25, 10) == 0xFFFF0000 && !c.modified() && paint.title().equals("Paint - art.png"));
-    CHECK(!paint.open_file("/missing.png") && paint.status_label().text().equals("Cannot open /missing.png: not found"));
-    CHECK(!paint.open_file("/notes.txt") && paint.status_label().text().equals("That is not a picture this program can read."));
+    CHECK(paint.open_file("/art.png") && c.pixel(25, 10) == 0xFFFF0000 && !c.modified() && paint.title().equals("art.png - Paint"));
+    CHECK(!paint.open_file("/missing.png") && paint.status_label().text().first(38).equals("\"missing.png\" could not be opened. It "));
+    CHECK(!paint.open_file("/notes.txt") && paint.status_label().text().equals("\"notes.txt\" could not be opened. It is not a picture of a kind Paint can read, or the file is damaged."));
 
-    // Unsaved changes survive the first New / Open.
+    // Unsaved changes survive New / Open until the question about them is answered.
     paint.tools().select_tool(0);
     drag(w, pixel_point(c, 60, 60), pixel_point(c, 70, 60));
     CHECK(c.modified());
-    CHECK(!paint.new_picture() && paint.status_label().text().first(13).equals("Unsaved chang") && c.pixel(65, 60) == 0xFF0000FF);
-    CHECK(paint.new_picture(200, 100) && c.image_width() == 200 && c.image_height() == 100 && c.pixel(65, 60) == 0xFFFFFFFF && paint.path().empty());
+    CHECK(!paint.new_picture() && paint.save_question().showing() && c.pixel(65, 60) == 0xFF0000FF);
+    press(w, key::kEscape);   // Cancel
+    CHECK(!paint.new_picture(200, 100) && paint.save_question().showing() && c.image_width() == 640);
+    paint.save_question().alternate_button().click();   // Don't Save: the new picture, of the size asked for
+    CHECK(c.image_width() == 200 && c.image_height() == 100 && c.pixel(65, 60) == 0xFFFFFFFF && paint.path().empty());
     w.mouse_move(799, 599);
     CHECK(paint.position_label().text().equals("200 x 100"));
-    press(w, key::kA + 18, modifier::kLeftControl);   // Ctrl+S with no path
-    CHECK(paint.status_label().text().equals("Enter a path to save to."));
+    press(w, key::kA + 18, modifier::kLeftControl);   // Ctrl+S with no path and no dialog: Save is disabled
+    CHECK(!paint.menu_bar().find_item("File", "Save")->enabled() && paint.status_label().text().equals("New picture."));
     w.render();
     mgr.remove_window(&paint);
   }
@@ -4003,8 +4015,7 @@ static void test_paint_clipboard() {
     drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
     CHECK(c.pixel(20, 10) == 0xFFFF0000);
 
-    CHECK(choose(w, paint.menu_bar(), "Edit", "Cut"));                 // nothing selected
-    CHECK(paint.status_label().text().equals("Select something to cut first."));
+    CHECK(!choose(w, paint.menu_bar(), "Edit", "Cut"));                // nothing selected: Cut is disabled
     CHECK(choose(w, paint.menu_bar(), "Edit", "Copy"));                // so the whole picture is copied
     uint32_t cw, ch;
     CHECK(paint.status_label().text().equals("Copied the whole picture.") && cb.image_size(&cw, &ch) && cw == 640 && ch == 480);
@@ -4030,8 +4041,8 @@ static void test_paint_clipboard() {
     CHECK(c.floating());
     c.undo();
     CHECK(cb.set_text("words"));
-    CHECK(choose(w, paint.menu_bar(), "Edit", "Paste"));
-    CHECK(!c.floating() && paint.status_label().text().equals("Nothing to paste: the clipboard has no picture."));
+    CHECK(!choose(w, paint.menu_bar(), "Edit", "Paste"));   // text on the clipboard, no picture: Paste is disabled
+    CHECK(!c.floating());
     w.render();
     mgr.remove_window(&paint);
   }
@@ -4138,7 +4149,7 @@ static void test_app_menus() {
       CHECK(mgr.add_window(&np));
       w.layout();
       MenuBar& bar = np.menu_bar();
-      CHECK(bar.menu_count() == 2 && bar.menu(0)->title().equals("File") && bar.menu(1)->title().equals("Edit") && bar.parent() == &np);
+      CHECK(bar.menu_count() == 3 && bar.menu(0)->title().equals("File") && bar.menu(1)->title().equals("Edit") && bar.menu(2)->title().equals("Help") && bar.parent() == &np);
       CHECK(bar.bounds().width > 100 && bar.window_origin().y < np.editor().window_origin().y && bar.find_item("File", "Save As..."));
       CHECK(bar.find_item("File", "Save") && bar.find_item("File", "Save")->shortcut.view().equals("Ctrl+S") && !bar.find_item("File", "Nope"));
       MenuItem* cut = bar.find_item("Edit", "Cut");
@@ -4153,10 +4164,10 @@ static void test_app_menus() {
       CHECK(!choose(w, bar, "Edit", "Cut") && w.popup() == nullptr);   // disabled: nothing happens, the menu closes
       CHECK(choose(w, bar, "Edit", "Paste") && np.editor().text().equals("hello"));
       // File > Save with no file yet opens the Save dialog; the name is completed with the type's extension.
-      CHECK(choose(w, bar, "File", "Save") && dlg.showing() && dlg.mode() == desktop::FileDialog::Mode::Save && dlg.name_box().text().empty());
+      CHECK(choose(w, bar, "File", "Save") && dlg.showing() && dlg.mode() == desktop::FileDialog::Mode::Save && dlg.name_box().text().first(9).equals("Document "));   // (it offers the document's name)
       dlg.name_box().set_text("note");
       dlg.ok_button().click();
-      CHECK(!dlg.showing() && dlg.accepted() && np.status_label().text().equals("Saved /note.txt") && !np.editor().modified() && np.path().equals("/note.txt"));
+      CHECK(!dlg.showing() && dlg.accepted() && np.status_label().text().equals("Saved \"note.txt\".") && !np.editor().modified() && np.path().equals("/note.txt"));
       CHECK(choose(w, bar, "File", "New") && np.editor().text().empty() && np.path().empty());
       // File > Open... shows the Open dialog; picking a file loads it.
       CHECK(choose(w, bar, "File", "Open...") && dlg.showing() && dlg.mode() == desktop::FileDialog::Mode::Open);
@@ -4164,11 +4175,11 @@ static void test_app_menus() {
       dlg.ok_button().click();
       CHECK(!dlg.showing() && np.editor().text().equals("abc") && np.path().equals("/a.txt"));
       press(w, key::kA + 18, modifier::kLeftControl);    // Ctrl+S writes to the same file
-      CHECK(np.status_label().text().equals("Saved /a.txt"));
+      CHECK(np.status_label().text().equals("Saved \"a.txt\"."));
       CHECK(choose(w, bar, "File", "Save As...") && dlg.showing() && dlg.name_box().text().equals("a.txt") && dlg.folder().equals("/"));
       dlg.cancel_button().click();                       // cancelled: nothing changes
       CHECK(!dlg.showing() && !dlg.accepted() && np.path().equals("/a.txt"));
-      CHECK(choose(w, bar, "File", "Close") && np.manager() == nullptr && mgr.window_count() == 0);
+      CHECK(choose(w, bar, "File", "Exit") && np.manager() == nullptr && mgr.window_count() == 0);
     }
 
     // --- File explorer
@@ -4178,7 +4189,7 @@ static void test_app_menus() {
       CHECK(mgr.add_window(&ex));
       w.layout();
       MenuBar& bar = ex.menu_bar();
-      CHECK(bar.menu_count() == 3 && bar.menu(2)->title().equals("Go") && ex.details_item()->checked() && !ex.list_item()->checked());
+      CHECK(bar.menu_count() == 5 && bar.menu(3)->title().equals("Go") && ex.details_item()->checked() && !ex.list_item()->checked());
       CHECK(choose(w, bar, "View", "Icons") && ex.view().view_mode() == ViewMode::Icons && ex.icons_item()->checked() && !ex.details_item()->checked());
       CHECK(choose(w, bar, "View", "Details") && ex.view().view_mode() == ViewMode::Details);
       ex.view().select_item(0);                        // "docs"
@@ -4186,8 +4197,8 @@ static void test_app_menus() {
       CHECK(choose(w, bar, "Go", "Up One Level") && ex.path().equals("/"));
       CHECK(!choose(w, bar, "Go", "Up One Level") || ex.path().equals("/"));   // at the root nothing changes
       ex.view().select_item(1);
-      CHECK(choose(w, bar, "File", "Copy Path") && cb.get_text(&got) && got.view().equals("/a.txt"));
-      CHECK(choose(w, bar, "Go", "Address") && ex.address_bar().editing());
+      CHECK(choose(w, bar, "Edit", "Copy Path") && cb.get_text(&got) && got.view().equals("/a.txt"));
+      CHECK(choose(w, bar, "Go", "Go To Address...") && ex.address_bar().editing());
       press(w, key::kEscape);
       CHECK(!ex.address_bar().editing());
       const uint32_t before = ex.view().item_count();
@@ -4203,12 +4214,12 @@ static void test_app_menus() {
       CHECK(mgr.add_window(&tm));
       w.layout();
       MenuBar& bar = tm.menu_bar();
-      CHECK(bar.menu_count() == 2 && bar.find_item("View", "Processes")->checked() && !bar.find_item("View", "Performance")->checked());
-      CHECK(choose(w, bar, "View", "Performance") && tm.tabs().selected_page() == 1 && bar.find_item("View", "Performance")->checked() && !bar.find_item("View", "Processes")->checked());
+      CHECK(bar.menu_count() == 5 && bar.find_item("View", "Threads")->checked() && !bar.find_item("View", "Performance")->checked());
+      CHECK(choose(w, bar, "View", "Performance") && tm.tabs().selected_page() == 1 && bar.find_item("View", "Performance")->checked() && !bar.find_item("View", "Threads")->checked());
       tm.tabs().select_page(0);                        // switching the tab by hand moves the check mark too
-      CHECK(bar.find_item("View", "Processes")->checked() && !bar.find_item("View", "Performance")->checked());
-      CHECK(choose(w, bar, "View", "Processes") && tm.tabs().selected_page() == 0);
-      CHECK(choose(w, bar, "File", "Close") && tm.manager() == nullptr);
+      CHECK(bar.find_item("View", "Threads")->checked() && !bar.find_item("View", "Performance")->checked());
+      CHECK(choose(w, bar, "View", "Threads") && tm.tabs().selected_page() == 0);
+      CHECK(choose(w, bar, "File", "Exit") && tm.manager() == nullptr);
     }
 
     // --- Paint
@@ -4220,7 +4231,7 @@ static void test_app_menus() {
       w.layout();
       MenuBar& bar = paint.menu_bar();
       DrawingCanvas& c = paint.canvas();
-      CHECK(bar.menu_count() == 4 && bar.menu(3)->title().equals("Options") && bar.find_item("Edit", "Paste")->shortcut.view().equals("Ctrl+V"));
+      CHECK(bar.menu_count() == 6 && bar.menu(3)->title().equals("Tools") && bar.menu(4)->title().equals("Colors") && bar.menu(5)->title().equals("Help") && bar.find_item("Edit", "Paste")->shortcut.view().equals("Ctrl+V"));
       CHECK(!bar.find_item("Edit", "Undo")->enabled() && !choose(w, bar, "Edit", "Undo"));
       drag(w, pixel_point(c, 10, 10), pixel_point(c, 30, 10));
       CHECK(bar.find_item("Edit", "Undo")->enabled());
@@ -4234,16 +4245,17 @@ static void test_app_menus() {
       CHECK(choose(w, bar, "File", "Save") && dlg.showing());     // no file yet: the Save dialog
       dlg.name_box().set_text("pic");
       dlg.ok_button().click();
-      CHECK(paint.path().equals("/pic.png") && paint.title().equals("Paint - pic.png") && !c.modified());
+      CHECK(paint.path().equals("/pic.png") && paint.title().equals("pic.png - Paint") && !c.modified());
       paint.tools().select_tool(0);
       drag(w, pixel_point(c, 50, 50), pixel_point(c, 60, 50));
-      CHECK(choose(w, bar, "File", "New") && paint.status_label().text().first(13).equals("Unsaved chang") && c.pixel(55, 50) != 0xFFFFFFFF);
-      CHECK(choose(w, bar, "File", "New") && c.pixel(55, 50) == 0xFFFFFFFF && c.image_width() == 640);
+      CHECK(choose(w, bar, "File", "New") && paint.save_question().showing() && c.pixel(55, 50) != 0xFFFFFFFF);
+      paint.save_question().alternate_button().click();   // Don't Save
+      CHECK(c.pixel(55, 50) == 0xFFFFFFFF && c.image_width() == 640);
       CHECK(choose(w, bar, "File", "Open...") && dlg.showing() && dlg.list().item_count() > 0);
       dlg.name_box().set_text("pic.png");
       dlg.ok_button().click();
       CHECK(!dlg.showing() && paint.path().equals("/pic.png") && c.pixel(25, 10) == 0xFF000000);
-      CHECK(choose(w, bar, "File", "Close") && paint.manager() == nullptr);
+      CHECK(choose(w, bar, "File", "Exit") && paint.manager() == nullptr);
     }
     w.render();
   }
@@ -4324,10 +4336,11 @@ static void test_file_dialog() {
     // Names that do not exist or are not picked are refused with a message; a folder name goes into the folder.
     dlg.name_box().set_text("zzz.txt");
     dlg.ok_button().click();
-    CHECK(dlg.showing() && dlg.message_label().text().equals("Not found: zzz.txt") && closed.count == 0);
-    dlg.name_box().set_text("");
-    dlg.ok_button().click();
-    CHECK(dlg.message_label().text().equals("Enter a file name."));
+    CHECK(dlg.showing() && dlg.message_label().text().equals("\"zzz.txt\" could not be found. Check the name, or pick the file from the list.") && closed.count == 0);
+    CHECK(w.focus() == &dlg.name_box());   // (the field at fault has the focus)
+    dlg.name_box().select_all();
+    press(w, key::kDelete);
+    CHECK(dlg.name_box().text().empty() && !dlg.ok_button().enabled() && dlg.message_label().text().empty());   // with no name there is nothing to open: the button is unavailable
     dlg.name_box().set_text("docs");
     dlg.ok_button().click();
     CHECK(dlg.folder().equals("/docs") && dlg.name_box().text().empty() && dlg.message_label().text().empty());
@@ -4400,7 +4413,7 @@ static void test_file_dialog() {
     CHECK(dlg.show(mgr, Mode::Save, "Save As", kFilters, 3, "/", closed.handler()));
     dlg.name_box().set_text("/missing/file.txt");
     dlg.ok_button().click();
-    CHECK(dlg.showing() && dlg.message_label().text().equals("The folder does not exist."));
+    CHECK(dlg.showing() && dlg.message_label().text().equals("The folder for \"/missing/file.txt\" does not exist. Pick a folder from the list, then type the name."));
     dlg.cancel_button().click();
     // Starting on a file picks the type that fits it; a typed address goes there.
     CHECK(dlg.show(mgr, Mode::Open, "Open", kFilters, 3, "/b.png", closed.handler()) && dlg.type_box().selected_index() == 1);
@@ -4411,7 +4424,7 @@ static void test_file_dialog() {
     dlg.address_bar().begin_edit();
     dlg.address_bar().edit_box().set_text("/nowhere");
     press(w, key::kEnter);
-    CHECK(dlg.folder().equals("/docs/old") && dlg.message_label().text().equals("That folder cannot be opened."));
+    CHECK(dlg.folder().equals("/docs/old") && dlg.message_label().text().equals("\"/nowhere\" could not be opened. It may have been removed, or you may not be allowed to look in it."));
     w.render();
     dlg.cancel_button().click();
     // With no filters given every file is shown.
@@ -4469,7 +4482,7 @@ static void test_desktop_file_dialog() {
     d.print_dialog().cancel_button().click();
     CHECK(choose(d.window(), d.paint().menu_bar(), "File", "Print...") && d.print_dialog().showing());
     d.print_dialog().cancel_button().click();
-    CHECK(choose(d.window(), d.paint().menu_bar(), "Options", "Primary Color...") && d.color_dialog().showing());
+    CHECK(choose(d.window(), d.paint().menu_bar(), "Colors", "Primary Color...") && d.color_dialog().showing());
     d.color_dialog().cancel_button().click();
   }
   CHECK(a.live == 0);
@@ -4823,7 +4836,7 @@ static void test_print_dialog() {
     FakePrintService service;
 
     // Without a service there are no printers, and nothing can be printed.
-    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.status_label().text().equals("No printers found.") && !dlg.print_button().enabled());
+    CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && dlg.status_label().text().equals("No printer was found. Connect one, then open this dialog again.") && !dlg.print_button().enabled());
     dlg.print_button().click();
     CHECK(dlg.showing());
     dlg.cancel_button().click();
@@ -4834,15 +4847,15 @@ static void test_print_dialog() {
     CHECK(dlg.show(mgr, Kind::Text, "Print", closed.handler()) && !dlg.show(mgr, Kind::Text, "Print", closed.handler()));
     w.layout();
     CHECK(dlg.printer_box().item_count() == 3 && dlg.printer_box().item(1).equals("Color jet") && dlg.printer_box().selected_index() == 0);
-    CHECK(dlg.status_label().text().equals("Ready - black and white, duplex, up to 1200 dpi, 20 pages/min") && dlg.print_button().enabled());
+    CHECK(dlg.status_label().text().equals("Ready - black and white, both sides of the paper, up to 1200 dpi, 20 pages a minute") && dlg.print_button().enabled());
     CHECK(dlg.paper_box().item_count() == 2 && dlg.paper_box().selected_text().equals("A4") && dlg.paper_box().item(1).equals("Letter"));
-    CHECK(dlg.quality_box().item_count() == 3 && dlg.quality_box().selected_text().equals("600 dpi (normal)"));
+    CHECK(dlg.quality_box().item_count() == 3 && dlg.quality_box().selected_text().equals("Normal (600 dpi)"));
     CHECK(dlg.copies_box().value() == 1 && dlg.portrait_button().checked() && !dlg.landscape_button().checked() && !dlg.toner_box().checked());
     CHECK(!dlg.picture_box().parent()->visible() && !dlg.stretch_box().parent()->visible());       // picture options are for pictures
     // Another printer offers other things.
     dlg.printer_box().set_selected_index(1);
     CHECK(dlg.status_label().text().first(5).equals("Ready") && dlg.status_label().text().find("color") != StringView::npos);
-    CHECK(dlg.paper_box().item_count() == 1 && dlg.quality_box().item_count() == 2 && dlg.quality_box().selected_text().equals("600 dpi (normal)"));
+    CHECK(dlg.paper_box().item_count() == 1 && dlg.quality_box().item_count() == 2 && dlg.quality_box().selected_text().equals("Normal (600 dpi)"));
     dlg.printer_box().set_selected_index(2);              // one that is not there cannot be printed on
     CHECK(dlg.status_label().text().first(13).equals("Not connected") && !dlg.print_button().enabled());
     dlg.printer_box().set_selected_index(0);
@@ -5007,16 +5020,16 @@ static void test_print_and_color_flows() {
       w.layout();
       MenuBar& bar = np.menu_bar();
       CHECK(bar.find_item("File", "Print...") && bar.find_item("File", "Print...")->shortcut.view().equals("Ctrl+P"));
-      CHECK(choose(w, bar, "File", "Print...") && np.status_label().text().equals("No print dialog available."));
+      CHECK(!choose(w, bar, "File", "Print..."));   // no print dialog: Print is disabled
       np.set_print_dialog(&print);
-      CHECK(choose(w, bar, "File", "Print...") && !print.showing() && np.status_label().text().equals("There is nothing to print."));
+      CHECK(!choose(w, bar, "File", "Print...") && !print.showing());   // and so it is while there is nothing to print
       w.set_focus(&np.editor());
       type_text(w, "print me");
       CHECK(choose(w, bar, "File", "Print...") && print.showing() && print.kind() == desktop::PrintDialog::Kind::Text);
       print.copies_box().set_value(2);
       print.printer_box().set_selected_index(1);
       print.print_button().click();
-      CHECK(!print.showing() && service.jobs == 1 && service.last_printer == 1 && service.last_text == "print me" && service.last_name == "Untitled" &&
+      CHECK(!print.showing() && service.jobs == 1 && service.last_printer == 1 && service.last_text == "print me" && service.last_name.rfind("Document ", 0) == 0 &&
             service.last_options.copies == 2 && np.status_label().text().equals("Sent to the printer."));
       press(w, key::kA + 15, modifier::kLeftControl);            // Ctrl+P
       CHECK(print.showing());
@@ -5033,26 +5046,25 @@ static void test_print_and_color_flows() {
       service.fail_with = "The printer's queue is full.";
       CHECK(choose(w, bar, "File", "Print..."));
       print.print_button().click();
-      CHECK(np.status_label().text().equals("Cannot print: The printer's queue is full.") && service.jobs == 1);
+      CHECK(np.status_label().text().first(9).equals("\"Document") && np.status_label().text().find(StringView("could not be printed. The printer's queue is full.")) != StringView::npos && service.jobs == 1);
       service.fail_with = nullptr;
-      CHECK(choose(w, bar, "File", "Close"));
+      CHECK(choose(w, bar, "File", "Exit") && np.manager() == nullptr);
     }
 
-    // --- Paint: File > Print... and Options > Primary / Secondary Color...
+    // --- Paint: File > Print... and Colors > Primary / Secondary Color...
     {
       desktop::Paint paint(a);
       CHECK(mgr.add_window(&paint));
       w.layout();
       MenuBar& bar = paint.menu_bar();
       DrawingCanvas& c = paint.canvas();
-      CHECK(choose(w, bar, "File", "Print...") && paint.status_label().text().equals("No print dialog available."));
-      CHECK(choose(w, bar, "Options", "Primary Color...") && paint.status_label().text().equals("No color dialog available."));
+      CHECK(!choose(w, bar, "File", "Print...") && !choose(w, bar, "Colors", "Primary Color..."));   // no dialogs to show: the commands are disabled
       paint.set_print_dialog(&print);
       paint.set_color_dialog(&colors);
       CHECK(choose(w, bar, "File", "Print...") && print.showing() && print.kind() == desktop::PrintDialog::Kind::Picture);
       print.picture_box().set_selected_index(1);
       print.print_button().click();
-      CHECK(!print.showing() && service.jobs == 2 && service.picture_w == 640 && service.picture_h == 480 && service.last_name == "Untitled" &&
+      CHECK(!print.showing() && service.jobs == 2 && service.picture_w == 640 && service.picture_h == 480 && service.last_name.rfind("Picture ", 0) == 0 &&
             service.last_options.halftone == hardware::Halftone::Threshold && paint.status_label().text().equals("Sent to the printer."));
       // A picture still being placed is set down before it is printed.
       paint.tools().select_tool(7);
@@ -5063,15 +5075,15 @@ static void test_print_and_color_flows() {
       CHECK(!c.floating());
       print.cancel_button().click();
       // Colors: the dialog starts at the current color; OK sets it in the palette and the canvas.
-      CHECK(choose(w, bar, "Options", "Primary Color...") && colors.showing() && colors.title().equals("Primary Color") && colors.color() == paint.palette().primary());
+      CHECK(choose(w, bar, "Colors", "Primary Color...") && colors.showing() && colors.title().equals("Primary Color") && colors.color() == paint.palette().primary());
       colors.set_color(0xFF336699);
       colors.ok_button().click();
       CHECK(!colors.showing() && paint.palette().primary() == 0xFF336699 && c.primary() == 0xFF336699 && paint.color_picker().color() == 0xFF336699);
-      CHECK(choose(w, bar, "Options", "Secondary Color...") && colors.title().equals("Secondary Color") && colors.color() == 0xFFFFFFFF);
+      CHECK(choose(w, bar, "Colors", "Secondary Color...") && colors.title().equals("Secondary Color") && colors.color() == 0xFFFFFFFF);
       colors.set_color(0xFFFFEE00);
       colors.cancel_button().click();                          // cancelled: nothing changes
       CHECK(paint.palette().secondary() == 0xFFFFFFFF);
-      CHECK(choose(w, bar, "Options", "Secondary Color..."));
+      CHECK(choose(w, bar, "Colors", "Secondary Color..."));
       colors.hex_box().set_text("#FFEE00");
       colors.ok_button().click();
       CHECK(paint.palette().secondary() == 0xFFFFEE00 && c.secondary() == 0xFFFFEE00);
@@ -5083,7 +5095,9 @@ static void test_print_and_color_flows() {
       press(w, key::kA + 15, modifier::kLeftControl);            // Ctrl+P
       CHECK(print.showing());
       print.cancel_button().click();
-      CHECK(choose(w, bar, "File", "Close"));
+      CHECK(choose(w, bar, "File", "Exit") && paint.save_question().showing());   // the picture was drawn on: closing asks first
+      paint.save_question().alternate_button().click();
+      CHECK(paint.manager() == nullptr);
     }
     w.render();
   }
@@ -5315,10 +5329,13 @@ static void test_application_context_menus() {
       right_click(w, fx, fy);
       ContextMenu& menu = ex.list_menu();
       CHECK(menu.open() && ex.view().selected_item() == 1 && enabled(menu, "Open") && enabled(menu, "Copy Path") && !enabled(menu, "Up One Level"));
-      CHECK(menu.find_item("Details")->checked() && !menu.find_item("List")->checked());
+      CHECK(!menu.find_item("Details") && menu.find_item("Properties"));   // (an item's menu has the item's commands; the views are in the folder's)
       w.close_popup();
       CHECK(choose_context(w, menu, fx, fy, "Copy Path") && cb.get_text(&got) && got.view().equals("/a.txt"));
-      CHECK(choose_context(w, menu, fx, fy, "Icons") && ex.view().view_mode() == ViewMode::Icons && ex.icons_item()->checked());
+      right_click(w, o.x + 200, o.y + 100);                       // an empty place: the folder's menu, which shows the view in use
+      CHECK(menu.open() && menu.find_item("Details")->checked() && !menu.find_item("List")->checked());
+      w.close_popup();
+      CHECK(choose_context(w, menu, o.x + 200, o.y + 100, "Icons") && ex.view().view_mode() == ViewMode::Icons && ex.icons_item()->checked());
       CHECK(ex.view().item_rect(0, &row));
       CHECK(choose_context(w, menu, o.x + row.x + 20, o.y + row.y + 20, "Open") && ex.path().equals("/docs"));   // the folder, by its icon
       CHECK(choose_context(w, menu, o.x + 200, o.y + 100, "Details") && ex.view().view_mode() == ViewMode::Details);
@@ -5358,7 +5375,7 @@ static void test_application_context_menus() {
       w.close_popup();
       CHECK(choose_context(w, tm.grid_menu(), rx, ry, "Copy Row") && tm.grid().selected_row() >= 0 && cb.get_text(&got));
       CHECK(got.view().find('\t') != StringView::npos && got.view().find("idle") != StringView::npos);
-      CHECK(choose(w, tm.menu_bar(), "File", "Close"));
+      CHECK(choose(w, tm.menu_bar(), "File", "Exit"));
     }
 
     // --- Paint: the right button paints, except with the Select tool, where it opens the menu.
@@ -5387,7 +5404,9 @@ static void test_application_context_menus() {
       CHECK(choose_context(w, menu, at.x, at.y, "Undo") && c.pixel(25, 20) == 0xFF00FF00);
       CHECK(choose_context(w, menu, at.x, at.y, "Select All") && c.has_selection() && c.selection().width == 640);
       CHECK(choose_context(w, menu, at.x, at.y, "Paste") && c.floating());
-      CHECK(choose(w, paint.menu_bar(), "File", "Close"));
+      CHECK(choose(w, paint.menu_bar(), "File", "Exit") && paint.save_question().showing());   // the picture was changed: closing asks first
+      paint.save_question().alternate_button().click();
+      CHECK(paint.manager() == nullptr);
     }
     w.render();
   }
@@ -6730,7 +6749,7 @@ static void test_spreadsheet_app() {
     w.layout();
     sp.set_file_system(&fs);
     gui::SpreadsheetGrid& g = sp.grid();
-    CHECK(sp.title().equals("Spreadsheet - Untitled") && sp.name_label().text().equals("A1") && sp.formula_bar().text().empty());
+    CHECK(sp.title().first(6).equals("Sheet ") && sp.title().find(StringView(" - Spreadsheet")) != StringView::npos && sp.name_label().text().equals("A1") && sp.formula_bar().text().empty());
 
     // Typing in the grid starts an edit in the formula bar, which shows in the cell; Enter keeps it and moves down.
     w.set_focus(&g);
@@ -6738,7 +6757,7 @@ static void test_spreadsheet_app() {
     CHECK(sp.editing() && sp.formula_bar().text().equals("5") && w.focus() == &sp.formula_bar() && g.editing());
     press(w, key::kEnter);
     CHECK(!sp.editing() && !g.editing() && w.focus() == &g && g.active_row() == 1 && sp.sheet().text(0, 0).equals("5"));
-    CHECK(sp.title().equals("Spreadsheet - Untitled *") && sp.name_label().text().equals("A2"));
+    CHECK(sp.sheet().modified() && sp.title().first(6).equals("Sheet ") && sp.name_label().text().equals("A2"));   // (the title is the sheet's name: no mark for unsaved changes)
     type_text(w, "=A1*2");
     CHECK(sp.editing() && sp.formula_bar().text().equals("=A1*2") && sp.sheet().text(0, 1).empty());   // (not kept yet)
     press(w, key::kEnter);
@@ -6770,7 +6789,7 @@ static void test_spreadsheet_app() {
     // Errors show in the cell, and the status bar sums the selection.
     g.select(0, 0);
     g.select(0, 1, true);
-    CHECK(sp.summary_label().text().equals("Count: 2   Sum: 210   Avg: 105"));
+    CHECK(sp.summary_label().text().equals("Count: 2   Sum: 210   Average: 105"));
     g.select(5, 5);
     type_text(w, "=1/0");
     press(w, key::kEnter);
@@ -6804,22 +6823,23 @@ static void test_spreadsheet_app() {
     sp.sheet().set_text(1, 0, "2");
     sp.sheet().set_text(2, 0, "=A1+B1");
     sp.sheet().set_text(0, 1, "x,y");
-    CHECK(sp.save_file("out.csv") && sp.path().equals("/out.csv") && sp.title().equals("Spreadsheet - out.csv") && sp.status_label().text().equals("Saved /out.csv"));
+    CHECK(sp.save_file("out.csv") && sp.path().equals("/out.csv") && sp.title().equals("out.csv - Spreadsheet") && sp.status_label().text().equals("Saved \"out.csv\"."));
     UniquePointer<filesystem::IFile> f;
     CHECK(fs.open_file("/out.csv", filesystem::OpenMode::Read, &f) == filesystem::Status::Ok && f->size() == 19);
     char got[32] = {};
     uint64_t n = 0;
     CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 19), &n) == filesystem::Status::Ok && !strcmp(got, "1,2,=A1+B1\n\"x,y\",,\n"));
     f.reset();
-    CHECK(sp.new_document() && sp.sheet().text(0, 0).empty() && sp.path().empty() && sp.title().equals("Spreadsheet - Untitled"));   // (saved: nothing to lose)
+    CHECK(sp.new_document() && sp.sheet().text(0, 0).empty() && sp.path().empty() && sp.title().first(6).equals("Sheet "));   // (saved: nothing to lose)
     CHECK(sp.open_file("/in.csv") && shows(a, sp, 2, 0, "3") && sp.sheet().text(0, 1).equals("x,y") && !sp.sheet().modified() && sp.path().equals("/in.csv"));
     CHECK(sp.name_label().text().equals("A1") && g.active_column() == 0);
     sp.sheet().set_text(0, 5, "dirty");
-    CHECK(!sp.open_file("/out.csv") && sp.status_label().text().first(13).equals("Unsaved chang"));   // the first time only warns
-    CHECK(sp.open_file("/out.csv") && sp.sheet().text(0, 5).empty());
-    CHECK(!sp.open_file("/nope.csv") && sp.status_label().text().equals("Cannot open /nope.csv: not found"));
-    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog
-    CHECK(sp.status_label().text().equals("No file dialog available."));
+    CHECK(!sp.open_file("/out.csv") && sp.save_question().showing() && sp.sheet().text(0, 5).equals("dirty"));   // unsaved changes: Save / Don't Save / Cancel
+    sp.save_question().alternate_button().click();   // Don't Save: the file opens
+    CHECK(sp.path().equals("/out.csv") && sp.sheet().text(0, 5).empty());
+    CHECK(!sp.open_file("/nope.csv") && sp.status_label().text().first(35).equals("\"nope.csv\" could not be opened. It "));
+    press(w, key::kA + 14, modifier::kLeftControl);   // Ctrl+O without a dialog: Open is disabled, the key does nothing
+    CHECK(!sp.menu_bar().find_item("File", "Open...")->enabled() && sp.status_label().text().first(10).equals("\"nope.csv\""));
     CHECK(desktop::Spreadsheet::is_sheet_name("/a/b.csv") && desktop::Spreadsheet::is_sheet_name("X.CSV") && !desktop::Spreadsheet::is_sheet_name("a.txt") && !desktop::Spreadsheet::is_sheet_name(".csv"));
     w.render();
     mgr.remove_window(&sp);
@@ -6867,7 +6887,7 @@ static void test_video_viewer() {
       }
     } sources;
     d.set_video_sources(&sources);
-    CHECK(d.start_button().menu().item_count() == 18);
+    CHECK(d.start_button().menu().item_count() == 19);
     d.open_video_viewer();
     desktop::VideoViewer& v = d.video_viewer();
     CHECK(v.manager() && v.source_list().item_count() == 2 && v.source_list().selected_index() == 0 && sources.watching == 5);
@@ -6888,7 +6908,7 @@ static void test_video_viewer() {
     // the source watched goes: it says so and watches nothing
     sources.list.pop_back();
     d.pump(4000000);
-    CHECK(v.source_list().item_count() == 1 && v.status() == StringView("The source went"));
+    CHECK(v.source_list().item_count() == 1 && v.status() == StringView("The source is no longer there. Choose another one."));
     // closed: it watches nothing more
     v.source_list().set_selected_index(0);
     CHECK(sources.watching == 5);
@@ -6924,7 +6944,7 @@ static void test_calculator() {
     keys("12+30*2=");
     CHECK(c.display().equals("84"));
     keys("/0=");
-    CHECK(c.display().equals("Error"));
+    CHECK(c.display().equals("Cannot divide by zero"));
     c.press_clear();
     keys("1.5+2.25=");
     CHECK(c.display().equals("3.75"));
@@ -7105,12 +7125,12 @@ static void test_todo() {
         gui::ContextMenu& menu = t1->item_menu();
         CHECK(t1->list().context_menu() == &menu);
         right_click(w, rx, ry);
-        CHECK(menu.open() && menu.find_item("Move to This week")->checked() && !menu.find_item("Move to This week")->enabled());
+        CHECK(menu.open() && menu.find_item("Move to This Week")->checked() && !menu.find_item("Move to This Week")->enabled());
         CHECK(menu.find_item("Move to Tomorrow")->enabled() && menu.find_item("Mark Complete")->text.view().equals("Mark Complete"));
         w.close_popup();
         CHECK(choose_context(w, menu, rx, ry, "Move to Tomorrow") && t1->item_count() == 1 && d.todo_store().open_count(desktop::Bucket::Tomorrow) == 1);
         CHECK(d.todo_store().open_count(desktop::Bucket::ThisWeek) == 0 && t1->bucket_box().selected_index() == static_cast<int32_t>(desktop::Bucket::Tomorrow));
-        CHECK(choose_context(w, menu, rx, ry, "Move to This week") && d.todo_store().open_count(desktop::Bucket::ThisWeek) == 1);
+        CHECK(choose_context(w, menu, rx, ry, "Move to This Week") && d.todo_store().open_count(desktop::Bucket::ThisWeek) == 1);
         CHECK(choose_context(w, menu, rx, ry, "Mark Complete") && t1->item_count() == 0 && d.todo_store().done_count() == 2);
         t1->set_filter(desktop::Todo::kShowCompleted);
         CHECK(t1->item_count() == 2 && t1->list().item_rect(0, &row));
@@ -7316,7 +7336,7 @@ static void test_calendar_recurrence() {
       c->repeat_box().set_selected_index(2);   // Weekly
       c->until_check().set_checked(true);
       c->until_box().set_date({2026, 3, 1});
-      CHECK(!c->add_event() && c->status().equals("The last day is before the appointment.") && c->event_count() == 0);
+      CHECK(!c->add_event() && c->status().equals("The last day is before the appointment starts. Choose a later date.") && c->event_count() == 0);
       c->until_box().set_date({2026, 4, 30});
       CHECK(c->add_event() && c->event_count() == 1);
       c->select_date({2026, 4, 29});
@@ -7361,7 +7381,7 @@ static void test_calendar_floating_and_occurrences() {
     c->select_date({2026, 5, 18});
     c->title_box().set_text("Memorial Day");
     c->by_box().set_selected_index(2);       // The last weekday
-    CHECK(!c->add_event() && c->status().equals("That day is not the last of its weekday in the month.") && c->event_count() == 0);
+    CHECK(!c->add_event() && c->status().equals("That day is not the last of its weekday in the month. Choose another day.") && c->event_count() == 0);
     c->select_date({2026, 5, 25});
     CHECK(c->add_event());
     c->select_date({2028, 5, 29});
@@ -7469,7 +7489,7 @@ static void test_explorer_copy_paste_properties() {
     select("a.txt");
     CHECK(ex.copy_selected() && cb.get_text(&got) && got.view().equals("/w/a.txt"));
     CHECK(ex.open_folder("/w/docs") && ex.paste() && exists("/w/docs/a.txt"));
-    CHECK(ex.paste() && exists("/w/docs/Copy of a.txt") && ex.paste() && exists("/w/docs/Copy of a.txt (2)"));
+    CHECK(ex.paste() && exists("/w/docs/Copy of a.txt") && ex.paste() && exists("/w/docs/Copy 2 of a.txt"));
     CHECK(exists("/w/a.txt"));   // (copied, not moved)
 
     // A folder is pasted with what is in it; it cannot go into itself; the list of drives takes nothing.
@@ -7491,15 +7511,23 @@ static void test_explorer_copy_paste_properties() {
     press(w, key::kA, modifier::kLeftControl);   // Ctrl+A in the list
     CHECK(ex.view().selection_count() == 3);
 
-    // The context menu offers Copy, Paste, Select All, Open and Properties.
+    // The context menu on empty space offers the folder's commands (Paste, Select All, Properties); on an item, the item's (Open, Copy, Properties).
     ContextMenu& menu = ex.list_menu();
     auto enabled = [&](const char* item) { return menu.find_item(item) && menu.find_item(item)->enabled(); };
     ex.view().select_item(-1);
     const Point o = ex.view().window_origin();
     right_click(w, o.x + 300, o.y + 150);
-    CHECK(menu.find_item("Copy") && menu.find_item("Paste") && menu.find_item("Select All") && menu.find_item("Open") && menu.find_item("Properties"));
-    CHECK(!enabled("Copy") && !enabled("Open") && enabled("Paste") && enabled("Select All") && enabled("Properties"));
+    CHECK(menu.find_item("Paste") && menu.find_item("Select All") && menu.find_item("Properties") && !menu.find_item("Copy") && !menu.find_item("Open"));
+    CHECK(enabled("Paste") && enabled("Select All") && enabled("Properties"));
     w.close_popup();
+    {
+      Rect2D first;
+      CHECK(ex.view().item_rect(0, &first));
+      right_click(w, o.x + first.x + 30, o.y + first.y + 5);
+      CHECK(enabled("Copy") && enabled("Open") && enabled("Properties") && !menu.find_item("Paste"));
+      w.close_popup();
+      ex.view().select_item(-1);
+    }
     Counter shown;
     ex.on_properties(shown.handler());
     CHECK(choose_context(w, menu, o.x + 300, o.y + 150, "Properties") && shown.count == 1 && ex.properties_path().equals("/w"));
@@ -7541,7 +7569,7 @@ static void test_explorer_copy_paste_properties() {
     desktop::FileProperties props(a);
     props.set_file_system(&fs);
     CHECK(props.show("/pics/t.txt"));
-    CHECK(props.value_of("Name").equals("t.txt") && props.value_of("Location").equals("/pics") && props.value_of("Type").equals("File"));
+    CHECK(props.value_of("Name").equals("t.txt") && props.value_of("Location").equals("/pics") && props.value_of("Type").equals("Text Document"));
     CHECK(props.value_of("Size").equals("5 bytes") && props.value_of("Permissions").equals("Read and write") && props.value_of("Dimensions").empty());
     CHECK(props.title().equals("t.txt Properties") && props.grid().row_count() == props.row_count());
     CHECK(props.show("/pics/p.png") && props.value_of("Format").equals("PNG") && props.value_of("Dimensions").equals("3 x 2 pixels"));
@@ -7763,13 +7791,12 @@ static void test_database_query() {
     q.set_clock(&clock);
     CHECK(mgr.add_window(&q));
     w.layout();
-    CHECK(q.title().equals("Database - Untitled") && q.connect_button().text().equals("Connect") && !q.connected());
+    CHECK(q.title().first(6).equals("Query ") && q.title().find(StringView(" - Database")) != StringView::npos && q.connect_button().text().equals("Connect") && !q.connected());
 
-    // Nothing to connect to.
+    // Nothing to connect to: Connect is disabled.
     q.url_box().set_text("postgres://app@db.test/shop");
-    CHECK(!q.connect() && notices.showing() && notices.message().find(StringView("No databases")) != StringView::npos);
-    notices.close();
-    CHECK(!q.run() && notices.showing() && notices.message().equals("Connect to a database first."));
+    CHECK(!q.connect() && !notices.showing() && !q.connect_button().enabled() && !q.menu_bar().find_item("Query", "Connect")->enabled());
+    CHECK(!q.run() && notices.showing() && notices.message().first(25).equals("No database is connected,"));
     notices.close();
 
     NoTransport transport;
@@ -7781,24 +7808,24 @@ static void test_database_query() {
 
     // A bad URL, a refused login.
     q.url_box().set_text("db.test/shop");
-    CHECK(!q.connect() && notices.showing() && notices.message().first(21).equals("The URL is not valid:"));
+    CHECK(!q.connect() && notices.showing() && notices.message().first(37).equals("The server's address cannot be used: ") && w.focus() == &q.url_box());   // (the focus goes to the entry at fault)
     notices.close();
     q.url_box().set_text("postgres://bad@db.test/shop");
-    CHECK(!q.connect() && !q.connected() && notices.showing() && notices.message().equals("Cannot connect: password authentication failed (28P01)"));
+    CHECK(!q.connect() && !q.connected() && notices.showing() && notices.message().equals("\"db.test/shop\" could not be connected. Check the address, the user name and the password. The answer was: password authentication failed (28P01)"));
     notices.close();
 
     // Connecting; the password box fills in the password the URL lacks.
     q.url_box().set_text("postgres://app@db.test/shop");
     q.password_box().set_text("pw");
     CHECK(q.connect() && q.connected() && driver.last_password == "pw" && driver.last_host == "db.test" && driver.last_database == "shop");
-    CHECK(q.connect_button().text().equals("Disconnect") && q.title().equals("Database - Untitled - db.test/shop") && q.status_label().text().equals("Connected to db.test/shop (server fake-1.0)"));
+    CHECK(q.connect_button().text().equals("Disconnect") && q.title().first(6).equals("Query ") && q.status_label().text().equals("Connected to db.test/shop (server fake-1.0)."));
     CHECK(q.url_box().text().equals("postgres://app@db.test/shop"));
 
     // A statement with rows: the table, NULL as NULL, the status line.
     q.editor().set_text("SELECT id, name FROM t");
     clock = 1000000;
     CHECK(q.run() && q.result() && q.result()->row_count() == 3 && q.grid().column_count() == 2 && q.grid().column_title(1).equals("name") && q.grid().row_count() == 3);
-    CHECK(q.status_label().text().equals("SELECT 3") && q.info_label().text().equals("3 rows, 0 ms") && driver.last->log.back() == "SELECT id, name FROM t");
+    CHECK(q.status_label().text().equals("SELECT 3") && q.info_label().text().equals("Rows: 3   Time: 0 ms") && driver.last->log.back() == "SELECT id, name FROM t");
     q.grid().select_row(1);
     CHECK(q.grid().copy_selected_row());
     String copied(a);
@@ -7811,10 +7838,10 @@ static void test_database_query() {
     q.editor().set_caret(24, true);
     CHECK(q.editor().has_selection() && q.run() && driver.last->log.back() == "SELECT id, name FROM t;" == false);
     q.editor().set_caret(0);
-    CHECK(q.run() && q.result() && q.result()->column_count() == 0 && q.grid().column_count() == 0 && q.info_label().text().equals("4 rows affected, 0 ms") && q.status_label().text().equals("UPDATE 4"));
+    CHECK(q.run() && q.result() && q.result()->column_count() == 0 && q.grid().column_count() == 0 && q.info_label().text().equals("Rows changed: 4   Time: 0 ms") && q.status_label().text().equals("UPDATE 4"));
     CHECK(driver.last->log.back().find("UPDATE t SET x = 1") != std::string::npos);
     q.editor().set_text("   \n ");
-    CHECK(!q.run() && q.status_label().text().first(14).equals("Nothing to run"));
+    CHECK(!q.run() && q.status_label().text().equals("There is no statement to run. Type one first."));
 
     // F5 and Ctrl+R run it too (from the editor).
     q.editor().set_text("SELECT id, name FROM t");
@@ -7827,7 +7854,7 @@ static void test_database_query() {
 
     // The server's error: shown with its code and detail; the table is cleared and the session goes on.
     q.editor().set_text("boom");
-    CHECK(!q.run() && notices.showing() && notices.message().equals("syntax error at or near \"boom\" (42601): somewhere") && !q.result() && q.grid().column_count() == 0 && q.connected());
+    CHECK(!q.run() && notices.showing() && notices.message().equals("The statement could not be run. Correct it and run it again. The server answered: syntax error at or near \"boom\" (42601): somewhere") && !q.result() && q.grid().column_count() == 0 && q.connected());
     notices.close();
 
     // Export and SQL files.
@@ -7839,24 +7866,24 @@ static void test_database_query() {
     uint64_t n = 0;
     CHECK(f->read(0, ByteView(reinterpret_cast<uint8_t*>(got), 38), &n) == filesystem::Status::Ok && !strcmp(got, "id,name\n1,alpha\n2,\n3,\"say \"\"hi\"\", ok\"\n"));
     f.reset();
-    CHECK(q.status_label().text().equals("Exported 3 rows to /out.csv"));
+    CHECK(q.status_label().text().equals("Exported the results to \"out.csv\"."));
     w.set_focus(&q.editor());
     type_char(w, ' ');   // typing marks the text as changed
-    CHECK(q.editor().modified() && q.title().equals("Database - Untitled * - db.test/shop"));
-    CHECK(q.save_file("/q.sql") && q.path().equals("/q.sql") && q.title().equals("Database - q.sql - db.test/shop") && !q.editor().modified());
+    CHECK(q.editor().modified() && q.title().first(6).equals("Query "));
+    CHECK(q.save_file("/q.sql") && q.path().equals("/q.sql") && q.title().equals("q.sql - Database") && !q.editor().modified());
     CHECK(q.new_document() && q.editor().text().empty() && q.path().empty());
     CHECK(q.open_file("in.sql") && q.editor().text().equals("SELECT id, name FROM t") && q.path().equals("/in.sql"));
     type_char(w, 'x');
-    CHECK(!q.open_file("/q.sql") && notices.showing());   // unsaved changes: a warning, and nothing is thrown away the first time
-    notices.close();
-    CHECK(q.open_file("/q.sql") && q.path().equals("/q.sql") && !q.editor().modified());
+    CHECK(!q.open_file("/q.sql") && q.save_question().showing() && q.path().equals("/in.sql"));   // unsaved changes: Save / Don't Save / Cancel
+    q.save_question().alternate_button().click();   // Don't Save: the file opens
+    CHECK(q.path().equals("/q.sql") && !q.editor().modified());
     CHECK(desktop::DatabaseQuery::is_sql_name("/a/b.sql") && desktop::DatabaseQuery::is_sql_name("X.SQL") && !desktop::DatabaseQuery::is_sql_name("a.txt") && !desktop::DatabaseQuery::is_sql_name(".sql"));
 
     // A connection that dies: the window notices.
     q.editor().set_text("die");
     CHECK(!q.run() && !q.connected() && q.connect_button().text().equals("Connect") && notices.showing());
     notices.close();
-    CHECK(!q.run() && notices.showing() && notices.message().equals("Connect to a database first."));
+    CHECK(!q.run() && notices.showing() && notices.message().first(25).equals("No database is connected,"));
     notices.close();
 
     // Disconnecting with the button; closing the window ends the session.
@@ -7906,9 +7933,9 @@ static void test_database_query_system() {
       CHECK(mgr.add_window(&q));
       w.layout();
       CHECK(q.url_box().text().equals("system://localhost/system"));   // nothing remembered yet: the default
-      CHECK(q.connect() && q.connected() && q.title().equals("Database - Untitled - localhost/system"));
+      CHECK(q.connect() && q.connected() && q.title().first(6).equals("Query "));
       q.editor().set_text("SELECT scope, name, value FROM settings WHERE scope = 'database-query'");
-      CHECK(q.run() && q.grid().row_count() == 1 && q.info_label().text().first(5).equals("1 row"));
+      CHECK(q.run() && q.grid().row_count() == 1 && q.info_label().text().first(7).equals("Rows: 1"));
       q.editor().set_text("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
       CHECK(q.run() && q.status_label().text().equals("CREATE TABLE"));
       q.editor().set_text("INSERT INTO notes VALUES (1, 'kept')");
@@ -8250,7 +8277,7 @@ static void test_web_browser() {
     w.layout();
 
     // It starts on a welcome page, with nowhere to go back to.
-    CHECK(b.title().equals("Web Browser - Welcome") || b.title().equals("Web Browser"));
+    CHECK(b.title().equals("New Tab - Web Browser"));
     CHECK(b.address().empty() && !b.can_go_back() && !b.can_go_forward() && !b.back_button().enabled() && !b.forward_button().enabled());
     CHECK(b.page().picture() && b.page().picture()->height() > 80 && run_contains(b, "TheoryCraftOS Web Browser"));
 
@@ -8259,7 +8286,7 @@ static void test_web_browser() {
     b.address_box().set_text("one.test");
     press(w, key::kEnter);
     CHECK(loader.asked.size() == 1 && loader.asked[0] == "http://one.test/" && b.address().equals("http://one.test/") && !b.loading());
-    CHECK(b.title().equals("Web Browser - Plain") && b.address_box().text().equals("http://one.test/") && b.status_label().text().equals("Done."));
+    CHECK(b.title().equals("Plain - Web Browser") && b.address_box().text().equals("http://one.test/") && b.status_label().text().equals("Done."));
     CHECK(run_contains(b, "Page ") && !b.can_go_back());
 
     // Moving over the link shows where it leads; a click follows it, and the way back opens.
@@ -8271,10 +8298,10 @@ static void test_web_browser() {
     w.mouse_move(origin.x + 300, origin.y + 200);
     CHECK(b.page().hovered_link().empty() && b.status_label().text().equals("Done."));
     click(w, link_x, link_y);
-    CHECK(loader.asked.size() == 2 && loader.asked[1] == "http://one.test/next" && b.address().equals("http://one.test/next") && b.title().equals("Web Browser - Two"));
+    CHECK(loader.asked.size() == 2 && loader.asked[1] == "http://one.test/next" && b.address().equals("http://one.test/next") && b.title().equals("Two - Web Browser"));
     CHECK(b.can_go_back() && !b.can_go_forward() && b.back_button().enabled());
     click_center(w, b.back_button());
-    CHECK(b.address().equals("http://one.test/") && b.can_go_forward() && !b.can_go_back() && b.title().equals("Web Browser - Plain"));
+    CHECK(b.address().equals("http://one.test/") && b.can_go_forward() && !b.can_go_back() && b.title().equals("Plain - Web Browser"));
     click_center(w, b.forward_button());
     CHECK(b.address().equals("http://one.test/next") && b.can_go_back() && !b.can_go_forward());
     press(w, key::kLeft, hardware::modifier::kLeftAlt);
@@ -8290,32 +8317,32 @@ static void test_web_browser() {
 
     // Pages that fail, pages with an error status, and things that are not pages.
     CHECK(b.navigate("http://down.test/"));
-    CHECK(b.status_label().text().equals("Cannot open http://down.test/: connection refused") && b.address().equals("http://new.test/") && b.address_box().text().equals("http://new.test/"));
-    CHECK(b.navigate("http://missing.test/") && b.status_label().text().equals("HTTP 404: Done.") && run_contains(b, "gone"));
+    CHECK(b.status_label().text().equals("\"down.test\" could not be opened because connection refused. Check the address and the network connection, then try again.") && b.address().equals("http://new.test/") && b.address_box().text().equals("http://new.test/"));
+    CHECK(b.navigate("http://missing.test/") && b.status_label().text().equals("Done. The server reported a problem with this page (status 404).") && run_contains(b, "gone"));
     CHECK(b.navigate("http://data.test/") && run_contains(b, "cannot be shown") && run_contains(b, "image/png"));
     const size_t asked = loader.asked.size();
     CHECK(!b.navigate("ftp://files.test/x") && !b.navigate("   ") && loader.asked.size() == asked);
     b.set_page_loader(nullptr);
-    CHECK(b.navigate("http://one.test/") && b.status_label().text().contains("no network") && b.address().equals("http://data.test/"));
+    CHECK(b.navigate("http://one.test/") && b.status_label().text().contains("not connected to a network") && b.address().equals("http://data.test/"));
     b.set_page_loader(&loader);
 
     // Scripts: a file the page names and its own, run as it is read; what they write is in the page, the title they set is the page's, a script that
     // throws is counted and the others carry on, and the log has what they printed.
     CHECK(b.scripts_enabled() && b.navigate("http://js.test/") && b.address().equals("http://js.test/"));
-    CHECK(b.title().equals("Web Browser - Scripted: http://js.test/"));
+    CHECK(b.title().equals("Scripted: http://js.test/ - Web Browser"));
     CHECK(run_contains(b, "from file") && run_contains(b, "42") && run_contains(b, "written") && run_contains(b, "text"));
     CHECK(b.script_errors() == 1 && b.script_log().contains("hi 2\n") && b.script_log().contains("script error: ReferenceError: undefinedFunction is not defined"));
-    CHECK(b.status_label().text().contains("1 script error: ReferenceError"));
+    CHECK(b.status_label().text().contains("A script on this page stopped early: ReferenceError"));
     b.set_scripts_enabled(false);
     CHECK(b.navigate("http://js.test/") && !run_contains(b, "written") && !run_contains(b, "from file") && run_contains(b, "text") && b.script_errors() == 0 && b.script_log().empty());
-    CHECK(b.title().equals("Web Browser - Plain"));
+    CHECK(b.title().equals("Plain - Web Browser"));
     b.set_scripts_enabled(true);
     CHECK(b.navigate("http://one.test/") && b.script_errors() == 0 && b.script_log().empty());
 
     // The page is a tree scripts can change: a click reaches its listeners (and preventDefault keeps the link from being followed), timers run from
     // tick(), the colour scheme is a media query the page watches, and the page is drawn again each time.
     {
-      CHECK(b.navigate("http://dom.test/") && run_contains(b, "start") && run_contains(b, "wide") && b.title().equals("Web Browser - light"));
+      CHECK(b.navigate("http://dom.test/") && run_contains(b, "start") && run_contains(b, "wide") && b.title().equals("light - Web Browser"));
       CHECK(find_text_op(b, "start") && find_text_op(b, "start")->color == 0xFFFF0000);
       int32_t link_px = 0, link_py = 0;
       CHECK(text_point(b, "go", &link_px, &link_py));
@@ -8327,23 +8354,23 @@ static void test_web_browser() {
       b.tick(500 * 1000);
       CHECK(run_contains(b, "clicked timer"));
       b.set_dark(true);
-      CHECK(b.title().equals("Web Browser - dark"));
+      CHECK(b.title().equals("dark - Web Browser"));
       b.set_dark(false);
-      CHECK(b.title().equals("Web Browser - light"));
+      CHECK(b.title().equals("light - Web Browser"));
       CHECK(b.live_page() && b.live_page()->scripting());
     }
 
     // Files on the system's own volumes: pages (links resolve against the folder), plain text, and files that are not there.
-    CHECK(b.navigate("/docs/index.html") && b.title().equals("Web Browser - Index") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));
+    CHECK(b.navigate("/docs/index.html") && b.title().equals("Index - Web Browser") && b.address().equals("/docs/index.html") && run_contains(b, "Local"));
     int32_t cx = 0, cy = 0;
     CHECK(text_point(b, "two", &cx, &cy));
     click(w, cx, cy);   // "two"
-    CHECK(b.address().equals("/docs/two.html") && b.title().equals("Web Browser - Second") && run_contains(b, "second page"));
+    CHECK(b.address().equals("/docs/two.html") && b.title().equals("Second - Web Browser") && run_contains(b, "second page"));
     CHECK(b.go_back());
     CHECK(text_point(b, "notes", &cx, &cy));
     click(w, cx, cy);   // "notes"
     CHECK(b.address().equals("/notes.txt") && run_contains(b, "plain  text") && run_contains(b, "line two"));
-    CHECK(b.navigate("/nothing.html") && b.status_label().text().contains("Cannot open /nothing.html") && b.address().equals("/notes.txt"));
+    CHECK(b.navigate("/nothing.html") && b.status_label().text().contains("\"nothing.html\" could not be opened") && b.address().equals("/notes.txt"));
     CHECK(b.navigate("file:///docs/two.html") && b.address().equals("/docs/two.html"));
     // A file dragged from an explorer opens.
     CHECK(b.accepts_drop("/notes.txt", 0, 0, nullptr) && !b.accepts_drop("x", 0, 0, nullptr));
@@ -8433,7 +8460,7 @@ static void test_web_browser_media() {
         "<canvas id=c width=60 height=32></canvas><video src=clip.gif width=32 height=32 autoplay loop></video>"
         "<script>var ctx = document.getElementById('c').getContext('2d'); ctx.fillStyle = '#ff0000'; ctx.fillRect(4, 4, 20, 10); ctx.fillStyle = '#0000ff'; ctx.beginPath(); ctx.arc(44, 16, 10, 0, 7); ctx.fill();"
         "document.getElementById('c').addEventListener('click', function(e) { document.title = 'canvas clicked'; });</script></body></html>"};
-    CHECK(b.navigate("http://media.test/") && b.title().equals("Web Browser - Media"));
+    CHECK(b.navigate("http://media.test/") && b.title().equals("Media - Web Browser"));
     CHECK(b.script_errors() == 0);
     w.render();
     const Point po = b.page().window_origin();
@@ -8455,7 +8482,7 @@ static void test_web_browser_media() {
     CHECK(second_frame != first_frame && (second_frame == 0xFFFF0000u || second_frame == 0xFF0000FFu));
     // a click on the canvas reaches its script
     click(w, po.x + obj[1].x + 30, po.y + obj[1].y + 16);
-    CHECK(b.title().equals("Web Browser - canvas clicked"));
+    CHECK(b.title().equals("canvas clicked - Web Browser"));
     // scripts off: the canvas has nothing on it, the picture is still there
     b.set_scripts_enabled(false);
     CHECK(b.navigate("http://media.test/"));
@@ -8491,7 +8518,7 @@ static void test_web_form() {
     loader.files["http://form.test/"] = {"text/html",
         "<html><head><title>Form</title></head><body><form action=/submit method=post><input name=user size=8> <input type=checkbox name=ok> <button>Go</button></form>"
         "<p>one</p><p>two</p></body></html>"};
-    CHECK(b.navigate("http://form.test/") && b.title().equals("Web Browser - Form"));
+    CHECK(b.navigate("http://form.test/") && b.title().equals("Form - Web Browser"));
     CHECK(run_contains(b, "Go"));
     const Point po = b.page().window_origin();
     // Tab focuses the first field (the page view has the keyboard focus after a click on the page)
@@ -8512,7 +8539,7 @@ static void test_web_form() {
     CHECK(text_point(b, "Go", &gx, &gy));
     click(w, gx, gy);
     CHECK(loader.posted.size() == 1 && loader.posted[0] == "http://form.test/submit [application/x-www-form-urlencoded] user=bob&ok=on");
-    CHECK(b.title().equals("Web Browser - Posted") && run_contains(b, "thanks"));
+    CHECK(b.title().equals("Posted - Web Browser") && run_contains(b, "thanks"));
     // with nothing focused the keys scroll the page again
     press(w, key::kEscape);
     press(w, key::kDown);
@@ -8582,7 +8609,7 @@ static void test_web_navigation() {
     CHECK(!b->leave_dialog().showing() && b->address().equals("http://leave.test/") && b->address_box().text().equals("http://leave.test/") && loader.asked.size() == asked);
     CHECK(b->navigate("http://leave.test/after"));
     click_center(w, b->leave_dialog().accept_button());
-    CHECK(!b->leave_dialog().showing() && b->address().equals("http://leave.test/after") && b->title().equals("Web Browser - left=yes hid=1"));
+    CHECK(!b->leave_dialog().showing() && b->address().equals("http://leave.test/after") && b->title().equals("left=yes hid=1 - Web Browser"));
     CHECK(b->go_back() && b->address().equals("http://leave.test/") && !b->leave_dialog().showing());   // (no question about the page that is left now)
     CHECK(b->navigate("http://one.test/") && b->leave_dialog().showing());
     click_center(w, b->leave_dialog().accept_button());
@@ -8591,23 +8618,23 @@ static void test_web_navigation() {
     // <meta http-equiv=refresh content="0; url=/next"> follows, and Back does not come back to the page that sent us on
     CHECK(b->navigate("http://refresh.test/") && b->address().equals("http://refresh.test/"));
     b->tick(1000000000ull);
-    CHECK(b->address().equals("http://refresh.test/next") && b->title().equals("Web Browser - Plain"));
+    CHECK(b->address().equals("http://refresh.test/next") && b->title().equals("Plain - Web Browser"));
     CHECK(b->go_back() && b->address().equals("http://one.test/"));
 
     // document.referrer: set by a link of the page, not by a typed address
-    CHECK(b->navigate("http://ref.test/") && b->title().equals("Web Browser - first=[]"));
+    CHECK(b->navigate("http://ref.test/") && b->title().equals("first=[] - Web Browser"));
     int32_t lx = 0, ly = 0;
     CHECK(text_point(*b, "to", &lx, &ly));
     click(w, lx, ly);
-    CHECK(b->address().equals("http://ref.test/to") && b->title().equals("Web Browser - ref=[http://ref.test/]"));
-    CHECK(b->navigate("http://ref.test/other") && b->title().equals("Web Browser - other=[]"));
+    CHECK(b->address().equals("http://ref.test/to") && b->title().equals("ref=[http://ref.test/] - Web Browser"));
+    CHECK(b->navigate("http://ref.test/other") && b->title().equals("other=[] - Web Browser"));
 
     // window.open(): another tab next to this one; a script may close the window it opened
     const uint32_t before = d.web_browser_count();
     CHECK(b->navigate("http://open.test/"));
     CHECK(d.web_browser_count() == before + 1);
     auto* opened = static_cast<desktop::WebBrowser*>(host->tab_at(host->tab_count() - 1));
-    CHECK(opened != b && opened->address().equals("http://closer.test/") && opened->title().equals("Web Browser - Closer"));
+    CHECK(opened != b && opened->address().equals("http://closer.test/") && opened->title().equals("Closer - Web Browser"));
     CHECK(opened->navigate("http://closer.test/now"));
     d.step(1000000);
     CHECK(d.web_browser_count() == before);
@@ -8647,14 +8674,14 @@ static void test_web_clipboard() {
     put(host, {20, 20, 700, 500});
     w.layout();
 
-    CHECK(b->navigate("http://localhost/clip") && b->title().equals("Web Browser - Clip"));
+    CHECK(b->navigate("http://localhost/clip") && b->title().equals("Clip - Web Browser"));
     int32_t x = 0, y = 0;
     CHECK(text_point(*b, "go", &x, &y));
     click(w, x, y);
     String text(a);
     CHECK(clipboard.get_text(&text) && text.view().equals("plain!"));
     b->tick(1000000);
-    CHECK(b->title().equals("Web Browser - text/plain+text/html"));
+    CHECK(b->title().equals("text/plain+text/html - Web Browser"));
     // someone else puts text on the clipboard: the html is not theirs
     CHECK(clipboard.set_text("other"));
     CHECK(b->navigate("http://localhost/clip") && text_point(*b, "go", &x, &y));
@@ -8667,7 +8694,7 @@ static void test_web_clipboard() {
     b->tick(2000000);
     b->tick(3000000);
     uint32_t width = 0, height = 0;
-    CHECK(clipboard.has_image() && clipboard.image_size(&width, &height) && width == 4 && height == 3 && b->title().equals("Web Browser - png true"));
+    CHECK(clipboard.has_image() && clipboard.image_size(&width, &height) && width == 4 && height == 3 && b->title().equals("png true - Web Browser"));
     uint32_t back[12] = {};
     CHECK(clipboard.get_image(back, 12));
     bool same = true;
@@ -8692,7 +8719,7 @@ static void test_web_fullscreen() {
     auto* host = static_cast<gui::TabFrame*>(b->host());
     put(host, {20, 20, 600, 400});
     w.layout();
-    CHECK(b->navigate("http://localhost/full") && b->title().equals("Web Browser - enabled true"));
+    CHECK(b->navigate("http://localhost/full") && b->title().equals("enabled true - Web Browser"));
     CHECK(!b->fullscreen() && b->menu_bar().visible() && host->state() == Frame::State::Normal && host->strip_rect().width > 0);
     const Rect2D before = host->bounds();
     const int32_t small_view = b->page().viewport_width();
@@ -8704,7 +8731,7 @@ static void test_web_fullscreen() {
     CHECK(host->fullscreen());
     CHECK(!b->menu_bar().visible());
     CHECK(host->state() == Frame::State::Maximized && host->strip_rect().width == 0 && host->client_rect().y == 0);
-    CHECK(b->title().equals("Web Browser - fs d true"));
+    CHECK(b->title().equals("fs d true - Web Browser"));
     w.render();
     // the element covers the page area of the window
     CHECK(b->page().viewport_width() > small_view);   // (the page got the room)
@@ -8718,7 +8745,7 @@ static void test_web_fullscreen() {
     CHECK(host->state() == Frame::State::Normal);
     CHECK(host->strip_rect().width > 0);
     CHECK(host->bounds().width == before.width && host->bounds().height == before.height);
-    CHECK(b->title().equals("Web Browser - fs none false"));
+    CHECK(b->title().equals("fs none false - Web Browser"));
     // a new page takes the window back as well
     CHECK(text_point(*b, "go", &x, &y));
     click(w, x, y);
@@ -8817,7 +8844,7 @@ static void test_web_browser_tabs() {
         for (uint32_t t = 0; tabs && t < tabs->tab_count(); ++t) {
           if (tabs->tab_at(t)->app_kind() != desktop::Desktop::kAppBrowser) continue;
           auto* br = static_cast<desktop::WebBrowser*>(tabs->tab_at(t));
-          local = local || (br->address().equals("/page.html") && br->title().equals("Web Browser - Page"));
+          local = local || (br->address().equals("/page.html") && br->title().equals("Page - Web Browser"));
           shown_only = shown_only || (br->address().empty() && br->address_box().text().equals("http://one.test/"));
         }
       }
@@ -8905,11 +8932,11 @@ static void test_app_manager() {
     CHECK(listed);
     // Installed only.
     m->set_filter(desktop::AppManager::kShowInstalled);
-    CHECK(m->list().item_count() == 1 && m->status().contains("1 AppImage installed"));
+    CHECK(m->list().item_count() == 1 && m->status().contains("1 application installed"));
     m->select_row(0);
     CHECK(m->update_selected() && m->status().contains("up to date"));
     // Remove.
-    CHECK(m->remove_selected() && m->status().contains("is removed") && m->list().item_count() == 0);
+    CHECK(m->remove_selected() && m->status().contains("was removed") && m->list().item_count() == 0);
     CHECK(fs.stat("/Linux/opt/notes", &e) == filesystem::Status::NotFound);
     m->set_filter(desktop::AppManager::kShowAll);
     // A failure says why.

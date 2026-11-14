@@ -16,18 +16,20 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The paint application: a window with a menu bar (File: New, Open, Save, Save As, Print, Close; Edit: Undo, Redo, Cut, Copy, Paste,
-// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Options: Filled Shapes, Primary Color, Secondary Color), the
-// brush size, a strip of tools at the left, the DrawingCanvas, and at the bottom a
+// The paint application: a window with a menu bar (File: New, Open, Save, Save As, Print, Exit; Edit: Undo, Redo, Cut, Copy, Paste, Delete,
+// Select All; View: Zoom In, Zoom Out, Actual Size, Pixel Grid; Tools: the drawing tools and Filled Shapes; Colors: Primary Color, Secondary Color;
+// Help: About Paint), the brush size, a strip of tools at the left, the DrawingCanvas, and at the bottom a
 // color palette with a color picker for any other color. Files are opened and saved as images; the format follows the
 // extension (png, jpg, bmp, gif, ppm, qoi, tga, tif, webp; png when there is none); Open and Save As pick the file in
 // the shared FileDialog, Save writes to the file the picture came from (or asks like Save As when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Z, Ctrl+Y and Ctrl+A
 // do what their menu items do. Cut, Copy and Paste (Ctrl+X, Ctrl+C, Ctrl+V) use the system clipboard: the selection made with the
 // Select tool (the whole picture when nothing is selected) goes onto it as a picture, and a picture on it is pasted as a floating
-// selection to drag into place. Warnings and errors appear in the shared NoticeDialog. A command that would throw away unsaved changes does nothing the first time (a
-// warning says so) and goes ahead when it is repeated.
+// selection to drag into place. Warnings and errors appear in the shared NoticeDialog; a command that cannot work right now is disabled in its menu.
+// The title is "Picture name - Paint" (a new picture is "Picture 1", "Picture 2"...), and New, Open and closing the window ask Save / Don't Save /
+// Cancel first when there are unsaved changes (see DocumentFrame). Everything the tool strip offers is in the Tools menu too.
 #pragma once
 #include "Desktop/ColorDialog.hpp"
+#include "Desktop/DocumentFrame.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
@@ -40,12 +42,10 @@
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/Slider.hpp"
 #include "Gui/Controls/ToolStrip.hpp"
-#include "Gui/NoticeDialog.hpp"
-#include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
 
-class Paint : public gui::Frame {
+class Paint : public DocumentFrame {
  public:
   static constexpr uint32_t kNewWidth = 640, kNewHeight = 480;
   static constexpr uint64_t kMaxFileBytes = 64u << 20;
@@ -54,15 +54,14 @@ class Paint : public gui::Frame {
 
   // The filesystem pictures are opened from and saved to (nullptr: none). It must outlive the window.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
-  // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the window.
+  // The dialog that Open and Save As use (nullptr: none, the commands are then disabled). It must outlive the window.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
-  // The dialog that Print uses, and the one that Options > Primary / Secondary Color use (nullptr: none, they then say so). They must outlive the window.
+  // The dialog that Print uses, and the one that Colors > Primary / Secondary Color use (nullptr: none, the commands are then disabled). They must outlive the window.
   void set_print_dialog(PrintDialog* dialog) { print_dialog_ = dialog; }
   void set_color_dialog(ColorDialog* dialog) { color_dialog_ = dialog; }
-  // The dialog that warnings, information and errors are shown in (nullptr: the status line says them instead). It must outlive the window.
-  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
-  // Starts a blank white picture. False (nothing changes) while there are unsaved changes the user has not agreed to lose.
+  // Starts a blank white picture. False (nothing changes yet) while there are unsaved changes: the question about them is then on the screen and
+  // the new picture starts when the answer allows it.
   bool new_picture(uint32_t width = kNewWidth, uint32_t height = kNewHeight);
   // Loads the picture at `path`; false if it cannot be read or decoded (an error dialog says why) or unsaved changes are in the way.
   bool open_file(StringView path);
@@ -73,19 +72,18 @@ class Paint : public gui::Frame {
   void ask_save_as();
   // File > Print: the print dialog, then the picture goes to the chosen printer.
   void ask_print();
-  // Options > Primary Color / Secondary Color: the color dialog, then the palette takes the choice.
+  // Colors > Primary Color / Secondary Color: the color dialog, then the palette takes the choice.
   void ask_color(bool secondary);
   // True if a file name ends in an extension of a picture format (case does not matter).
   static bool is_picture_name(StringView name);
 
-  StringView path() const { return path_.view(); }
   gui::DrawingCanvas& canvas() { return canvas_; }
   gui::ToolStrip& tools() { return tools_; }
   gui::ColorPalette& palette() { return palette_; }
   gui::ColorPicker& color_picker() { return picker_; }
   gui::Slider& size_slider() { return size_; }
   gui::MenuBar& menu_bar() { return menu_; }
-  // The canvas's context menu (while the Select tool is in use): Undo, Redo, Cut, Copy, Paste, Delete, Select All.
+  // The canvas's context menu (a right click while the Select tool is in use, Shift+F10 with any tool): Undo, Redo, Cut, Copy, Paste, Delete, Select All.
   gui::ContextMenu& canvas_menu() { return canvas_menu_; }
   gui::Label& status_label() { return status_; }
   gui::Label& position_label() { return position_; }
@@ -96,7 +94,25 @@ class Paint : public gui::Frame {
   void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { open_file(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
+ protected:
+  bool document_modified() const override { return canvas_.modified(); }
+  bool save_document() override { return save_file(); }
+  void carry_out(Next next, StringView path) override;
+  void say(StringView text) override { status_.set_text(text); }
+
  private:
+  static constexpr uint32_t kToolCount = 8;
+  template <uint32_t N>
+  static void on_tool_item(void* self, gui::Control&) { static_cast<Paint*>(self)->tools_.select_tool(N); }
+  static void on_about(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  void start_new(uint32_t width, uint32_t height);
+  void show_open_dialog();
+  void update_menus();
+  // What the commands need to be able to work (the menu items are enabled by the same rules).
+  bool can_open() const { return dialog_ && fs_; }
+  bool can_save() const { return fs_ && (!path().empty() || dialog_); }
+  bool can_paste() const;
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
   static void on_save(void* self, gui::Control&);
@@ -134,14 +150,8 @@ class Paint : public gui::Frame {
   static void on_canvas_changed(void* self, gui::Control&);
   static void on_pointer(void* self, gui::Control&);
   static void on_zoom_changed(void* self, gui::Control&);
-  bool may_discard();
   bool read_picture(StringView path);
   bool write_picture(StringView path);
-  void say(StringView text) { status_.set_text(text); }
-  // Warnings, information and errors go to the notice dialog (or the status line when there is none to show it in).
-  void notify(gui::NoticeKind kind, StringView text) {
-    if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) say(text);
-  }
   void update_state();
   void update_position();
 
@@ -152,6 +162,9 @@ class Paint : public gui::Frame {
   gui::Label size_label_, size_value_, zoom_label_, status_, position_;
   gui::Slider size_;
   gui::MenuItem *undo_item_ = nullptr, *redo_item_ = nullptr, *filled_item_ = nullptr, *grid_item_ = nullptr;
+  gui::MenuItem *open_item_ = nullptr, *save_item_ = nullptr, *save_as_item_ = nullptr, *print_item_ = nullptr, *cut_item_ = nullptr, *paste_item_ = nullptr, *delete_item_ = nullptr;
+  gui::MenuItem *zoom_in_item_ = nullptr, *zoom_out_item_ = nullptr, *actual_item_ = nullptr, *primary_item_ = nullptr, *secondary_item_ = nullptr;
+  gui::MenuItem* tool_items_[kToolCount] = {};
   gui::ToolStrip tools_;
   gui::ColorPalette palette_;
   gui::ColorPicker picker_;
@@ -159,13 +172,10 @@ class Paint : public gui::Frame {
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
   PrintDialog* print_dialog_ = nullptr;
-  gui::NoticeDialog* notices_ = nullptr;
   ColorDialog* color_dialog_ = nullptr;
   bool choosing_secondary_ = false;
+  uint32_t new_width_ = kNewWidth, new_height_ = kNewHeight;   // the size New was asked for (it may have to wait for the question about unsaved changes)
   graphics::Surface print_surface_;   // the picture the print dialog previews (it borrows it)
-  String path_;  // the file the picture came from or was saved to (empty: none yet)
-  String name_;
-  bool discard_armed_ = false;
 };
 
 }  // namespace desktop

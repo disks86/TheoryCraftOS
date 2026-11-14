@@ -20,7 +20,11 @@
 // hue strip), red / green / blue number boxes and a #RRGGBB box all show and change the same color, a row of basic colors
 // gives quick choices, and a preview shows the new color beside the one it started from. OK (or Enter) accepts, Cancel, Escape or
 // the close button leave accepted() false. One dialog serves every program: show() is given the handler to run once the dialog is gone.
+// Its title is the name of the command that opened it ("Primary Color"). Tab goes through the spectrum, the number boxes and the code, then OK
+// and Cancel; the labels of the boxes carry their access keys. OK with a code that is not a color keeps the dialog open, says what a code looks like
+// and puts the focus in the box.
 #pragma once
+#include "Desktop/StackPanel.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/ColorPalette.hpp"
 #include "Gui/Controls/ColorSpectrum.hpp"
@@ -35,7 +39,7 @@ namespace desktop {
 
 class ColorDialog : public gui::Frame {
  public:
-  static constexpr int32_t kWidth = 420, kHeight = 360;
+  static constexpr int32_t kWidth = 420, kHeight = 404;
 
   explicit ColorDialog(allocators::IAllocator& allocator);
 
@@ -58,6 +62,8 @@ class ColorDialog : public gui::Frame {
   gui::ColorPalette& basic_colors() { return basic_; }
   gui::Button& ok_button() { return ok_; }
   gui::Button& cancel_button() { return cancel_; }
+  // The line above the buttons: empty, or what is wrong with the code that was typed.
+  gui::Label& message_label() { return message_; }
   // The two preview squares' colors: the new one and the one the dialog started from.
   uint32_t preview_color() const { return new_swatch_.color; }
   uint32_t original_color() const { return old_swatch_.color; }
@@ -65,7 +71,7 @@ class ColorDialog : public gui::Frame {
   bool on_key(const gui::KeyArgs& args) override;
 
  private:
-  // A square of one color.
+  // A square of one color: a sample to look at, so it has a plain outline and no bevel (it does nothing when clicked).
   class Swatch final : public gui::Control {
    public:
     explicit Swatch(allocators::IAllocator& allocator) : Control(allocator) {}
@@ -84,7 +90,12 @@ class ColorDialog : public gui::Frame {
   static void on_cancel(void* self, gui::Control&);
   void apply(uint32_t argb, bool update_spectrum, bool update_components, bool update_hex);
 
-  gui::Panel top_, form_, caption_row_, preview_row_, palette_row_, button_row_, gap_;
+  static bool parse_code(StringView text, uint32_t* out);
+
+  StackColumn body_;        // top to bottom: the spectrum and the form, the basic colors, the message, the buttons
+  StackRow button_row_;     // left to right: the space, OK, Cancel
+  gui::Panel top_, form_, caption_row_, preview_row_, palette_row_, spacer_, gap_;
+  gui::Label basic_label_, message_;
   gui::ColorSpectrum spectrum_;
   gui::Label new_label_, old_label_;
   Swatch new_swatch_, old_swatch_;

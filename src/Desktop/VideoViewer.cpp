@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/VideoViewer.hpp"
+#include "Desktop/Format.hpp"
 #include "Utility/Move.hpp"
 
 namespace desktop {
@@ -25,25 +26,41 @@ using namespace gui;
 
 namespace {
 constexpr uint64_t kListEveryUs = 1000000;      // (the list of sources is looked at again once a second)
+constexpr const char* kNoSources = "There are no video sources. Connect a camera or start sharing a screen.";
+constexpr const char* kSourceGone = "The source is no longer there. Choose another one.";
 }  // namespace
 
 VideoViewer::VideoViewer(allocators::IAllocator& allocator)
-    : Frame(allocator), list_(allocator), status_(allocator), view_(allocator), ids_(allocator), pixels_(allocator), status_text_(allocator) {
+    : Frame(allocator), top_(allocator), source_label_(allocator), list_(allocator), status_(allocator), view_(allocator), ids_(allocator), pixels_(allocator), status_text_(allocator) {
   set_title("Video Viewer");
   set_bounds({200, 120, 520, 420});
   set_padding(Insets::all(6));
   set_minimize_enabled(true);
-  list_.set_dock(DockStyle::Top);
-  list_.set_size(0, 24);
+  // The list with its label directly before it (the label ends in a colon: it carries the list's access key).
+  top_.set_style(PanelStyle::Transparent);
+  top_.set_dock(DockStyle::Top);
+  top_.set_size(0, 24);
+  source_label_.set_text("Source:");
+  source_label_.set_dock(DockStyle::Left);
+  list_.set_dock(DockStyle::Fill);
   list_.on_selection_changed({&VideoViewer::on_pick, this});
-  add(&list_);
+  top_.add(&source_label_);
+  top_.add(&list_);
+  add(&top_);
   status_.set_dock(DockStyle::Bottom);
   status_.set_size(0, 20);
   add(&status_);
   view_.set_dock(DockStyle::Fill);
   view_.set_fit_enlarges(true);
   add(&view_);
-  set_status("No video sources");
+  set_status(kNoSources);
+}
+
+void VideoViewer::update_title() {
+  const int32_t index = list_.selected_index();
+  String title(allocator());
+  if (watching_ && index >= 0 && index < list_.item_count() && format_message(&title, "%1 - Video Viewer", list_.item(index))) set_title(title.view());
+  else set_title("Video Viewer");
 }
 
 VideoViewer::~VideoViewer() { stop_watching(); }
@@ -63,6 +80,7 @@ void VideoViewer::set_status(StringView text) {
 
 void VideoViewer::stop_watching() {
   if (sources_ && watching_) sources_->watch(0);
+  if (watching_) set_title("Video Viewer");   // (no source on show any more)
   watching_ = 0;
   sequence_ = 0;
 }
@@ -92,12 +110,13 @@ void VideoViewer::refresh_list() {
   if (keep < 0 && watching_) {      // (the source went: said, and nothing else picked for the user)
     stop_watching();
     view_.set_image(nullptr);
-    set_status("The source went");
+    set_status(kSourceGone);
     went = true;
   }
-  if (keep < 0 && !ids_.count() && !went) set_status("No video sources");
+  if (keep < 0 && !ids_.count() && !went) set_status(kNoSources);
   if (keep < 0 && ids_.count() && !went && !pictures_) list_.set_selected_index(0);      // (the first one, when nothing was shown yet)
   else if (keep >= 0) list_.set_selected_index(keep);
+  update_title();
 }
 
 void VideoViewer::on_pick(void* self, Control&) {
@@ -111,8 +130,9 @@ void VideoViewer::on_pick(void* self, Control&) {
     v.watching_ = id;
     v.set_status("Waiting for a picture...");
   } else {
-    v.set_status("The source cannot be watched");
+    v.set_status("This source cannot be shown now. Choose another one.");
   }
+  v.update_title();
 }
 
 void VideoViewer::update(uint64_t now_us) {

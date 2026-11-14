@@ -252,7 +252,7 @@ bool TextBox::on_key(const KeyArgs& args) {
       break;
   }
   const char c = args.character;
-  if (c >= 32 && c < 127 && !ctrl) {
+  if (c >= 32 && c < 127 && !ctrl && !(args.modifiers & (modifier::kLeftAlt | modifier::kRightAlt))) {   // (Alt+letter is an access key, not typing)
     if (!read_only_ && (!max_length_ || length - (selection_end() - selection_start()) < max_length_)) replace_selection(StringView(&c, 1));
     return true;
   }

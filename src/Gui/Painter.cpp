@@ -107,10 +107,17 @@ void Painter::text(int32_t x, int32_t y, StringView s, uint32_t color) {
   }
 }
 
-void Painter::text_centered(const Rect2D& r, StringView s, uint32_t color) {
+void Painter::text_centered(const Rect2D& r, StringView s, uint32_t color, int32_t access_index) {
   const int32_t x = r.x + (static_cast<int32_t>(r.width) - text_width(s)) / 2;
   const int32_t y = r.y + (static_cast<int32_t>(r.height) - kGlyphHeight) / 2;
   text(x, y, s, color);
+  underline(x, y, s, access_index, color);
+}
+
+void Painter::underline(int32_t x, int32_t y, StringView s, int32_t index, uint32_t color) {
+  if (index < 0 || static_cast<uint64_t>(index) >= s.size()) return;
+  const int32_t left = x + text_width(s.first(static_cast<uint64_t>(index)));
+  line(left, y + kGlyphHeight - 2, left + kGlyphWidth - 1, y + kGlyphHeight - 2, color);
 }
 
 void Painter::focus_frame(const Rect2D& r) {

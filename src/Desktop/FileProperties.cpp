@@ -17,10 +17,13 @@
  */
 
 #include "Desktop/FileProperties.hpp"
+#include "Desktop/DirectoryListing.hpp"
 #include "Desktop/FileByteSource.hpp"
 #include "Desktop/FileStatus.hpp"
 #include "Desktop/FileTransfer.hpp"
 #include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Media/AudioCodecs.hpp"
 #include "Media/ImageCodecs.hpp"
 #include "Media/Mp4.hpp"
@@ -112,35 +115,166 @@ constexpr uint64_t kHeadBytes = 64 * 1024;
 }  // namespace
 
 FileProperties::FileProperties(allocators::IAllocator& allocator)
-    : Frame(allocator), path_(allocator), grid_(allocator), buttons_(allocator), copy_button_(allocator), close_button_(allocator), names_(allocator), values_(allocator) {
+    : Frame(allocator), path_(allocator), name_(allocator), body_(allocator), name_row_(allocator), filler_(allocator), gap_(allocator), gap2_(allocator),
+      name_label_(allocator), message_(allocator), name_box_(allocator), grid_(allocator), buttons_(allocator), copy_button_(allocator), ok_(allocator),
+      cancel_(allocator), apply_(allocator), ask_(allocator), names_(allocator), values_(allocator) {
   set_title("Properties");
-  set_bounds({150, 90, 440, 400});
+  set_bounds({150, 90, 460, 420});
   set_padding(Insets::all(8));
-  set_minimize_enabled(true);
+  set_minimize_enabled(false);   // a secondary frame: a title, a Close button, nothing else
+  set_maximize_enabled(false);
 
-  buttons_.set_style(PanelStyle::Transparent);
-  buttons_.set_dock(DockStyle::Bottom);
-  buttons_.set_size(0, 30);
-  close_button_.set_text("Close");
-  close_button_.set_dock(DockStyle::Right);
-  close_button_.set_size(90, 0);
-  close_button_.on_click(Handler::immediate(&FileProperties::on_close, this));
-  copy_button_.set_text("Copy Row");
-  copy_button_.set_dock(DockStyle::Left);
-  copy_button_.set_size(100, 0);
-  copy_button_.on_click({&FileProperties::on_copy, this});
-  buttons_.add(&close_button_);
-  buttons_.add(&copy_button_);
+  // In reading order (the order Tab takes): the name, the properties, the buttons.
+  name_row_.set_style(PanelStyle::Transparent);
+  name_row_.set_size(0, 30);
+  name_row_.set_padding(Insets{0, 0, 0, 6});
+  name_label_.set_text("Name:");
+  name_label_.set_dock(DockStyle::Left);
+  name_label_.set_size(70, 0);
+  name_box_.set_dock(DockStyle::Fill);
+  name_box_.on_changed(Handler::immediate(&FileProperties::on_name_changed, this));
+  name_row_.add(&name_label_);
+  name_row_.add(&name_box_);
 
   grid_.add_column("Property", 130);
-  grid_.add_column("Value", 270);
+  grid_.add_column("Value", 290);
   grid_.set_dock(DockStyle::Fill);
-  add(&buttons_);
-  add(&grid_);   // (Fill goes last)
+
+  message_.set_size(0, 22);
+
+  // Copy Row serves the table and sits at its side; the transaction buttons are right-aligned, the default one first, all the same width.
+  buttons_.set_size(0, 30);
+  copy_button_.set_text("Copy Row");
+  copy_button_.set_size(100, 0);
+  copy_button_.on_click({&FileProperties::on_copy, this});
+  filler_.set_style(PanelStyle::Transparent);
+  filler_.set_dock(DockStyle::Fill);
+  ok_.set_text("OK");
+  ok_.set_size(84, 0);
+  ok_.set_default(true);
+  ok_.on_click({&FileProperties::on_ok, this});
+  gap_.set_style(PanelStyle::Transparent);
+  gap_.set_size(8, 0);
+  cancel_.set_text("Cancel");
+  cancel_.set_size(84, 0);
+  cancel_.on_click({&FileProperties::on_cancel, this});
+  gap2_.set_style(PanelStyle::Transparent);
+  gap2_.set_size(8, 0);
+  apply_.set_text("Apply");
+  apply_.set_size(84, 0);
+  apply_.set_enabled(false);
+  apply_.on_click({&FileProperties::on_apply, this});
+  buttons_.add(&copy_button_);
+  buttons_.add(&filler_);
+  buttons_.add(&ok_);
+  buttons_.add(&gap_);
+  buttons_.add(&cancel_);
+  buttons_.add(&gap2_);
+  buttons_.add(&apply_);
+
+  ask_.on_result({&FileProperties::on_answer, this});
+
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&name_row_);
+  body_.add(&grid_);
+  body_.add(&message_);
+  body_.add(&buttons_);
+  add(&body_);
 }
 
 void FileProperties::on_copy(void* self, Control&) { static_cast<FileProperties*>(self)->grid_.copy_selected_row(); }
-void FileProperties::on_close(void* self, Control&) { static_cast<FileProperties*>(self)->close(); }
+
+// --- OK, Cancel, Apply, Close ------------------------------------------------------------
+
+bool FileProperties::pending() const {
+  const StringView typed = name_box_.text().trimmed();
+  return !name_.empty() && !typed.empty() && !typed.equals(name_.view());
+}
+
+void FileProperties::on_name_changed(void* self, Control&) {
+  auto* p = static_cast<FileProperties*>(self);
+  p->apply_.set_enabled(p->pending());
+  p->message_.set_text(StringView());
+}
+
+// What is wrong with the change: the sheet stays open and the field at fault gets the focus.
+void FileProperties::refuse(StringView text) {
+  if (Window* w = window()) w->set_focus(&name_box_);
+  name_box_.select_all();
+  if (!NoticeDialog::post(notices_, manager(), NoticeKind::Error, text, title())) message_.set_text(text);
+}
+
+bool FileProperties::apply() {
+  if (!pending()) return true;
+  String wanted(allocator()), target(allocator()), message(allocator());
+  if (!wanted.assign(name_box_.text().trimmed())) return false;
+  if (wanted.view().find('/') != StringView::npos) {
+    format_message(&message, "\"%1\" was not renamed because a name cannot contain a slash. Choose another name.", name_.view());
+    refuse(message.view());
+    return false;
+  }
+  const StringView path = path_.view();
+  const uint64_t slash = path.rfind('/');
+  if (!fs_ || slash == StringView::npos || !target.assign(path.first(slash + 1)) || !target.append(wanted.view())) return false;
+  DirectoryEntry taken;
+  Status status = fs_->stat(target.view(), &taken) == Status::NotFound ? fs_->rename(path, target.view()) : Status::AlreadyExists;
+  if (status != Status::Ok) {
+    describe_failure(&message, "\"%1\" could not be renamed because %2.", name_.view(), status);
+    refuse(message.view());
+    return false;
+  }
+  fs_->flush();
+  show(target.view());   // the sheet now shows the object under its new name (and the title follows it)
+  fire(changed_);
+  return true;
+}
+
+void FileProperties::close_now() {
+  closing_ = true;
+  close();
+  closing_ = false;
+}
+
+void FileProperties::on_ok(void* self, Control&) {
+  auto* p = static_cast<FileProperties*>(self);
+  if (p->apply()) p->close_now();
+}
+
+void FileProperties::on_cancel(void* self, Control&) { static_cast<FileProperties*>(self)->close_now(); }   // what was not applied is dropped
+void FileProperties::on_apply(void* self, Control&) { static_cast<FileProperties*>(self)->apply(); }
+
+// The Close button is not Cancel: a change that was not applied is asked about.
+bool FileProperties::close_requested() {
+  if (closing_ || !pending() || !manager()) return true;
+  String line(allocator());
+  format_message(&line, "The name was changed to \"%1\".", name_box_.text().trimmed().size() > 20 ? name_box_.text().trimmed().first(20) : name_box_.text().trimmed());
+  ask_.set_texts(title(), line.view(), "Do you want to apply the change?", "Apply", "Cancel");
+  ask_.set_alternate("Don't Apply");
+  ask_.show(*manager());
+  return false;
+}
+
+void FileProperties::on_answer(void* self, Control&) {
+  auto* p = static_cast<FileProperties*>(self);
+  if (p->ask_.choice() == MessageDialog::Choice::Accept) {
+    if (p->apply()) p->close_now();
+  } else if (p->ask_.choice() == MessageDialog::Choice::Alternate) {
+    p->close_now();
+  }
+}
+
+// Enter is OK and Esc is Cancel, wherever the focus is (a button with the focus takes Enter itself).
+bool FileProperties::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter && !(args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) {
+    if (apply()) close_now();
+    return true;
+  }
+  if (args.usage == hardware::key::kEscape) {
+    close_now();
+    return true;
+  }
+  return Frame::on_key(args);
+}
 
 StringView FileProperties::value_of(StringView name) const {
   for (uint64_t i = 0; i < names_.count(); ++i)
@@ -168,14 +302,26 @@ void FileProperties::add_row(StringView name, StringView value) {
 bool FileProperties::show(StringView path) {
   UiGuard lock(this);
   clear();
+  String kept(allocator());   // (`path` may be a view of path_ itself)
+  kept.assign(path);
+  path = kept.view();
   path_.assign(path);
+  name_.clear();
+  message_.set_text(StringView());
+  apply_.set_enabled(false);
   DirectoryEntry entry;
   const bool root = path.size() <= 1;
   const Status status = !fs_ ? Status::NotFound : root ? Status::Ok : fs_->stat(path, &entry);
   if (status != Status::Ok) {
+    String why(allocator()), title(allocator());
+    const StringView last = path.substr(path.rfind('/') + 1);
+    if (fs_) describe_failure(&why, "\"%1\" cannot be shown because %2.", last, status);
+    else why.assign("There is no storage to look on.");
     add_row("Path", path);
-    add_row("Status", fs_ ? StringView(describe_status(status)) : StringView("No storage available."));
-    set_title("Properties");
+    add_row("Status", why.view());
+    name_box_.set_text(last);
+    name_box_.set_enabled(false);
+    if (format_message(&title, "%1 Properties", last)) set_title(title.view());
     return false;
   }
   const uint64_t slash = path.rfind('/');
@@ -187,15 +333,23 @@ bool FileProperties::show(StringView path) {
     where.assign(slash == 0 ? StringView("/") : path.substr(0, slash));
   }
   String title(allocator());
-  title.append(name.view());
-  title.append(" Properties");
-  set_title(title.view());
+  if (format_message(&title, "%1 Properties", name.view())) set_title(title.view());
+  // The name can be changed, except that of the list of drives and of what cannot be written to.
+  const bool can_rename = !root && !entry.read_only;
+  if (can_rename) name_.assign(name.view());
+  name_box_.set_text(name.view());
+  name_box_.set_enabled(can_rename);
 
   const bool folder = root || entry.type == NodeType::Directory;
   add_row("Name", name.view());
   if (!root) add_row("Location", where.view());
   add_row("Path", path);
-  add_row("Type", folder ? StringView("Folder") : StringView("File"));
+  String type(allocator());   // the type in the user's words, as the file explorer's list names it
+  DirectoryEntry named = entry;
+  named.type = folder ? NodeType::Directory : entry.type;
+  named.name.assign(name.view());
+  describe_entry_type(named, &type);
+  add_row("Type", type.view());
   if (folder) {
     add_folder_contents(path);
   } else {

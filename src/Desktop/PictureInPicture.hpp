@@ -18,8 +18,12 @@
 #pragma once
 // The Picture-in-Picture window of the web browser: a small window that shows one video of a page (drawn by PageObjects::paint_pip()). Clicking the picture plays or
 // pauses the video; closing the window, or changing its size, is reported so that the page can tell its scripts.
+//
+// It is a palette (docs/UserInterfaceGuidelines.md, 11.7): a short title bar with only a Close button, and no entry on the task bar. The picture
+// takes the focus (it shows the focus frame), so Space or Enter plays or pauses as a click does; its context menu has Play or Pause, and Close.
 #include "Browser/Objects.hpp"
 #include "Gui/Control.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
 
@@ -34,8 +38,14 @@ class PictureInPictureView : public gui::Control {
     video_ = video;
     invalidate();
   }
+  // Plays the video, or pauses it if it is playing. False when no video is shown.
+  bool toggle();
+  // Whether the video is paused now (true also when none is shown).
+  bool paused() const;
+  bool focusable() const override { return true; }
   void paint(gui::Painter& painter) override;
   void on_mouse_down(const gui::MouseArgs& args) override;
+  bool on_key(const gui::KeyArgs& args) override;
 
  private:
   browser::PageObjects* objects_ = nullptr;
@@ -56,11 +66,18 @@ class PictureInPictureWindow : public gui::Frame {
   uint32_t picture_width() const { return client_rect().width; }
   uint32_t picture_height() const { return client_rect().height; }
   PictureInPictureView& view() { return view_; }
+  gui::ContextMenu& picture_menu() { return menu_; }
   // Called by the browser's loop: draws the next picture.
   void refresh();
 
  private:
+  static void on_toggle(void* self, gui::Control&);
+  static void on_close_menu(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+
   PictureInPictureView view_;
+  gui::ContextMenu menu_;
+  gui::MenuItem* toggle_item_ = nullptr;
 };
 
 }  // namespace desktop

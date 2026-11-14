@@ -17,6 +17,7 @@
  */
 
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace gui {
@@ -26,9 +27,10 @@ void Button::paint(Painter& painter) {
   const Rect2D all{0, 0, bounds_.width, bounds_.height};
   painter.fill(all, t.face);
   painter.bevel(all, pressed_);
+  if (default_ && enabled()) painter.outline(all, t.dark);
   const int32_t nudge = pressed_ ? 1 : 0;
   painter.text_centered({nudge, nudge, bounds_.width, bounds_.height}, text_.view(),
-                        enabled() ? t.text : t.disabled_text);
+                        enabled() ? t.text : t.disabled_text, access_index(0));
   if (focused() && bounds_.width > 8 && bounds_.height > 8)
     painter.focus_frame({4, 4, bounds_.width - 8, bounds_.height - 8});
 }
@@ -54,6 +56,11 @@ void Button::on_mouse_up(const MouseArgs& args) {
   held_ = pressed_ = false;
   invalidate();
   if (fire) click();
+}
+
+void Button::access_activate(uint32_t) {
+  if (Window* w = window()) w->set_focus(this);
+  click();
 }
 
 bool Button::on_key(const KeyArgs& args) {

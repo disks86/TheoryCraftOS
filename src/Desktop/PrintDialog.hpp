@@ -24,7 +24,11 @@
 // picture placed and turned into dots; it follows the choices. Give the dialog what is to be printed (set_text / set_picture) before show(). Print (or Enter) accepts, Cancel, Escape or the close button leave accepted() false. The dialog
 // only collects the choices; the program that opened it sends the job. One dialog serves every program: show() is given
 // the handler to run once the dialog is gone.
+// Properties, beside the list of printers, leads to the chosen printer's property sheet (on_printer_properties: whoever owns the dialog opens it;
+// without a handler, or without a printer, the button is unavailable). Tab goes through the options from the top, then the page buttons, then
+// Print and Cancel; Print is the default button.
 #pragma once
+#include "Desktop/StackPanel.hpp"
 #include "Desktop/PrintPreview.hpp"
 #include "Desktop/PrintService.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -55,6 +59,10 @@ class PrintDialog : public gui::Frame {
   // dialog is up. The next show() uses whatever was given last for its kind.
   void set_text(StringView text) { text_.assign(text); }
   void set_picture(const graphics::Surface* picture) { picture_ = picture; }
+
+  // Run when Properties is chosen: printer_index() is the printer picked in the list. (A handler given once stays.)
+  void on_printer_properties(gui::Handler handler) { gui::UiGuard lock(this); printer_properties_ = handler; update_properties_button(); }
+  gui::Button& properties_button() { return properties_; }
 
   // Opens the dialog modally in `manager`. `result` runs once it has closed, accepted or not. False if it is already showing.
   bool show(gui::WindowManager& manager, Kind kind, StringView title, gui::Handler result);
@@ -105,12 +113,16 @@ class PrintDialog : public gui::Frame {
   void relayout();
   void update_pages();
   static void on_cancel(void* self, gui::Control&);
+  static void on_properties(void* self, gui::Control&);
+  void update_properties_button();
   void load_printers();
   void load_printer(uint32_t index);
   void gather();
 
-  gui::Panel options_panel_, preview_panel_, page_row_, printer_row_, paper_row_, orientation_row_, range_row_, quality_row_, copies_row_, toner_row_,
-      picture_row_, stretch_row_, button_row_, gap_;
+  StackColumn body_;        // top to bottom: the options beside the preview, then the buttons (so Tab reaches the buttons last)
+  StackRow button_row_;     // left to right: the message, Print, Cancel
+  gui::Panel main_, options_panel_, preview_panel_, page_row_, printer_row_, paper_row_, orientation_row_, range_row_, quality_row_, copies_row_, toner_row_,
+      picture_row_, stretch_row_, gap_, printer_gap_;
   gui::Label printer_label_, paper_label_, orientation_label_, range_label_, to_label_, quality_label_, copies_label_, picture_label_, page_label_;
   gui::Label status_, message_;
   gui::DropDown printer_, paper_, quality_, picture_type_;
@@ -120,7 +132,8 @@ class PrintDialog : public gui::Frame {
   gui::RadioGroup range_group_;
   gui::RadioButton all_pages_, page_range_;
   gui::SpinBox from_page_, to_page_, copies_;
-  gui::Button previous_, next_;
+  gui::Button previous_, next_, properties_;
+  gui::Handler printer_properties_;
   PrintPreview preview_;
   hardware::TextLayout layout_;
   String text_;

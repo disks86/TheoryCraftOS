@@ -46,6 +46,25 @@ inline bool format_unix_time(uint64_t seconds, String* out) {
          out->push_back(' ') && two(t.hour) && out->push_back(':') && two(t.minute);
 }
 
+// One whole sentence with placeholders, as the interface guidelines ask for messages (a sentence is never glued together from pieces, since
+// the words come in another order in other languages): %1, %2 and %3 in `pattern` are replaced by the arguments and %% is a percent sign.
+//   format_message(&text, "\"%1\" could not be opened because %2.", name, reason)
+// Replaces the contents of `out`; false if memory ran out.
+inline bool format_message(String* out, StringView pattern, StringView first = StringView(), StringView second = StringView(), StringView third = StringView()) {
+  out->clear();
+  for (uint64_t i = 0; i < pattern.size(); ++i) {
+    const char c = pattern[i];
+    const char next = i + 1 < pattern.size() ? pattern[i + 1] : 0;
+    if (c != '%' || (next != '%' && (next < '1' || next > '3'))) {
+      if (!out->push_back(c)) return false;
+      continue;
+    }
+    ++i;
+    if (!(next == '%' ? out->push_back('%') : out->append(next == '1' ? first : next == '2' ? second : third))) return false;
+  }
+  return true;
+}
+
 // Appends a number given in tenths: 123 -> "12.3".
 inline bool append_tenths(String* out, uint64_t tenths) {
   return out->append_uint(tenths / 10) && out->push_back('.') && out->append_uint(tenths % 10);

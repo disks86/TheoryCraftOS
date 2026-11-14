@@ -22,6 +22,11 @@
 // Enter, or a double click on a file) accepts the name. The Open dialog only accepts files that exist; the Save dialog adds the
 // type's first extension to a name that has none and asks before replacing a file. Cancel, Escape or the close button
 // leave accepted() false. One dialog serves every program: show() is given the handler to run once the dialog is gone.
+//
+// As the interface guidelines ask (docs/UserInterfaceGuidelines.md, 11.2 - 11.6): the dialog remembers the folder it was last in and starts there
+// when the program names no folder (the documents folder the first time); Open / Save is the default button and is unavailable while there is
+// nothing to open or save; a name that cannot be used keeps the dialog open, says why and puts the focus back in the name box; replacing a
+// file is asked about with "Cancel" as the default; and Tab goes through the controls in reading order.
 #pragma once
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/BreadcrumbBar.hpp"
@@ -34,6 +39,7 @@
 #include "Gui/MessageDialog.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
+#include "Desktop/StackPanel.hpp"
 
 namespace desktop {
 
@@ -58,7 +64,7 @@ class FileDialog : public gui::Frame {
   void set_clock(const uint64_t* now_us) { list_.set_clock(now_us); }
 
   // Opens the dialog modally in `manager`. `start_path` is a folder or a file: its folder is shown and its name (if it names a file or
-  // is not an existing folder) is put in the name box. `result` runs once the dialog has closed, accepted or not. False if the
+  // is not an existing folder) is put in the name box. A name without a folder (or nothing) starts in the folder the dialog was last in. `result` runs once the dialog has closed, accepted or not. False if the
   // dialog is already showing or there is no filesystem.
   bool show(gui::WindowManager& manager, Mode mode, StringView title, const Filter* filters, uint32_t filter_count, StringView start_path,
             gui::Handler result);
@@ -95,18 +101,24 @@ class FileDialog : public gui::Frame {
   static void on_ok(void* self, gui::Control&);
   static void on_cancel(void* self, gui::Control&);
   static void on_replace_answer(void* self, gui::Control&);
+  static void on_name_changed(void* self, gui::Control&);
   void finish(StringView path);
-  // An error for the user (empty text clears the message line); it goes to the notice dialog, or the message line when there is none.
-  void say(StringView text) {
-    if (text.empty() || !gui::NoticeDialog::post(notices_, manager(), gui::NoticeKind::Error, text)) message_.set_text(text);
-  }
+  // Open / Save is available when there is something to open or save: a name in the box, or a folder selected in the list.
+  void update_ok();
+  bool folder_selected() const;
+  void open_selected_folder();
+  // A problem with what was typed (empty text clears the message line): the dialog stays open, the name box gets the focus back with its text
+  // selected, and the notice dialog - or the message line when there is none - says what is wrong.
+  void say(StringView text);
   StringView current_extensions() const;
   bool join(StringView name, String* out) const;
 
-  gui::Panel address_row_, name_row_, type_row_, button_row_, gap_;
+  StackColumn body_;   // (the controls in reading order, which is the order Tab takes)
+  gui::Panel address_row_, name_row_, type_row_, gap_;
+  StackRow button_row_;
   gui::BreadcrumbBar bar_;
   gui::ListView list_;
-  gui::Label name_label_, type_label_, message_;
+  gui::Label look_label_, name_label_, type_label_, message_;
   gui::TextBox name_;
   gui::DropDown type_;
   gui::Button ok_, cancel_;

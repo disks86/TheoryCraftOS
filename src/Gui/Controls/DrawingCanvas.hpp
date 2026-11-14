@@ -48,7 +48,7 @@ class DrawingCanvas : public Control {
   static constexpr uint32_t kMaxSide = 4096;
   static constexpr uint64_t kMaxHistoryBytes = 24u << 20;
   static constexpr uint32_t kMaxHistoryEntries = 64;
-  static constexpr uint32_t kBackground = 0xFF808080;  // around the bitmap
+  static constexpr uint32_t kBackground = 0xFF808080;  // around the bitmap until it is first painted; then the theme's shadow colour
 
   explicit DrawingCanvas(allocators::IAllocator& allocator);
   ~DrawingCanvas();
@@ -173,6 +173,7 @@ class DrawingCanvas : public Control {
   bool filled_ = false, grid_ = false, modified_ = false;
   uint32_t primary_ = 0xFF000000, secondary_ = 0xFFFFFFFF;
   uint32_t zoom_ = 1;
+  uint32_t surround_ = kBackground;
   int32_t scroll_x_ = 0, scroll_y_ = 0;
   bool show_v_ = false, show_h_ = false, syncing_ = false, cache_dirty_ = true;
   ScrollBar vscroll_, hscroll_;

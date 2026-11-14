@@ -28,12 +28,13 @@ constexpr int32_t kIconSize = 32, kLineHeight = 22, kButtonHeight = 28, kFrameOv
 }
 
 void NoticeIcon::paint(Painter& painter) {
+  const Theme& t = painter.theme();
   uint32_t fill, ink;
   const char* glyph;
   switch (kind_) {
-    case NoticeKind::Error: fill = 0xFFC62828u; ink = 0xFFFFFFFFu; glyph = "X"; break;
-    case NoticeKind::Warning: fill = 0xFFF9C02Du; ink = 0xFF000000u; glyph = "!"; break;
-    default: fill = 0xFF1565C0u; ink = 0xFFFFFFFFu; glyph = "i"; break;
+    case NoticeKind::Error: fill = t.error; ink = t.error_text; glyph = "X"; break;
+    case NoticeKind::Warning: fill = t.warning; ink = t.warning_text; glyph = "!"; break;
+    default: fill = t.information; ink = t.information_text; glyph = "i"; break;
   }
   const int32_t x = (static_cast<int32_t>(bounds_.width) - kIconSize) / 2, y = 0;
   const Rect2D badge{x, y, static_cast<uint32_t>(kIconSize), static_cast<uint32_t>(kIconSize)};
@@ -71,6 +72,7 @@ NoticeDialog::NoticeDialog(allocators::IAllocator& allocator)
   ok_.set_dock(DockStyle::Right);
   ok_.set_size(104, 0);
   ok_.set_text("OK");
+  ok_.set_default(true);
   ok_.on_click(Handler::immediate(&NoticeDialog::on_ok, this));
   toggle_.set_dock(DockStyle::Left);
   toggle_.set_size(136, 0);
@@ -85,7 +87,7 @@ NoticeDialog::NoticeDialog(allocators::IAllocator& allocator)
   copy_bar_.set_size(0, 0);
   copy_.set_dock(DockStyle::Left);
   copy_.set_size(176, 0);
-  copy_.set_text("Copy to clipboard");
+  copy_.set_text("Copy to Clipboard");
   copy_.on_click(Handler::immediate(&NoticeDialog::on_copy, this));
   copy_gap_.set_style(PanelStyle::Transparent);
   copy_gap_.set_dock(DockStyle::Fill);
@@ -173,14 +175,23 @@ uint32_t NoticeDialog::wrap(StringView text, StringView* lines, uint32_t max_lin
   return count;
 }
 
-bool NoticeDialog::show(WindowManager& manager, NoticeKind kind, StringView message) {
+bool NoticeDialog::show(WindowManager& manager, NoticeKind kind, StringView message, StringView title) {
   UiGuard lock(&manager);
   kind_ = kind;
   message_.assign(message);
   StringView wrapped[kMaxLines];
   const uint32_t count = wrap(message_.view(), wrapped, kMaxLines, &storage_);
   icon_.set_kind(kind);
-  set_title(kind == NoticeKind::Error ? "Error" : kind == NoticeKind::Warning ? "Warning" : "Information");
+  // The title says what the message is about: what the caller named, else the window the user was working in. (A notice that replaces the
+  // one already shown, with no name of its own, keeps the title.)
+  if (!title.empty()) {
+    set_title(title);
+  } else if (!showing()) {
+    const Frame* about = manager.active();
+    String name(allocator());
+    name.assign(about && about != this && !about->title().empty() ? about->title() : StringView("TheoryCraftOS"));
+    set_title(name.view());
+  }
   for (uint32_t i = 0; i < kMaxLines; ++i) lines_[i].set_text(i < count ? wrapped[i] : StringView());
   shown_lines_ = count < 2 ? 2 : static_cast<int32_t>(count);
   for (uint32_t i = 0; i < kMaxLines; ++i) lines_[i].set_size(0, static_cast<int32_t>(i) < shown_lines_ ? kLineHeight : 0);

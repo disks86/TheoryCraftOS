@@ -18,6 +18,7 @@
 
 #include "Desktop/Calculator.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
+#include "Kernel/Clipboard.hpp"
 #include "Spreadsheet/Sheet.hpp"
 
 namespace desktop {
@@ -32,30 +33,66 @@ struct Key {
   uint32_t row, column, span;
 };
 const Key kKeypad[] = {
-    {"C", 'C', 0, 0, 1},  {"<-", 'B', 0, 1, 1}, {"+/-", 'N', 0, 2, 1}, {"/", '/', 0, 3, 1},
-    {"7", '7', 1, 0, 1},  {"8", '8', 1, 1, 1},  {"9", '9', 1, 2, 1},   {"*", '*', 1, 3, 1},
-    {"4", '4', 2, 0, 1},  {"5", '5', 2, 1, 1},  {"6", '6', 2, 2, 1},   {"-", '-', 2, 3, 1},
-    {"1", '1', 3, 0, 1},  {"2", '2', 3, 1, 1},  {"3", '3', 3, 2, 1},   {"+", '+', 3, 3, 1},
-    {"0", '0', 4, 0, 2},  {".", '.', 4, 2, 1},  {"=", '=', 4, 3, 1},
+    {"C", 'C', 0, 0, 1},  {"Back", 'B', 0, 1, 1}, {"+/-", 'N', 0, 2, 1}, {"/", '/', 0, 3, 1},
+    {"7", '7', 1, 0, 1},  {"8", '8', 1, 1, 1},    {"9", '9', 1, 2, 1},   {"*", '*', 1, 3, 1},
+    {"4", '4', 2, 0, 1},  {"5", '5', 2, 1, 1},    {"6", '6', 2, 2, 1},   {"-", '-', 2, 3, 1},
+    {"1", '1', 3, 0, 1},  {"2", '2', 3, 1, 1},    {"3", '3', 3, 2, 1},   {"+", '+', 3, 3, 1},
+    {"0", '0', 4, 0, 2},  {".", '.', 4, 2, 1},    {"=", '=', 4, 3, 1},
 };
 constexpr uint32_t kRows = 5, kColumns = 4, kDisplayHeight = 44, kGap = 4;
 constexpr uint32_t kMaxDigits = 15;
+// What the display says after a division by zero (the next digit, C or Escape starts over).
+constexpr const char* kDivideByZero = "Cannot divide by zero";
 }  // namespace
 
+// The number in a sunken field, right-aligned like a pocket calculator's; the focus frame goes around the inside of the field.
+void CalculatorDisplay::paint(Painter& painter) {
+  const Theme& t = painter.theme();
+  const Rect2D all{0, 0, bounds_.width, bounds_.height};
+  painter.fill(all, t.field);
+  painter.bevel(all, true);
+  const int32_t width = Painter::text_width(text_.view());
+  const int32_t x = static_cast<int32_t>(bounds_.width) - 8 - width, y = (static_cast<int32_t>(bounds_.height) - Painter::kGlyphHeight) / 2;
+  painter.text(x > 4 ? x : 4, y, text_.view(), t.text);
+  if (focused() && bounds_.width > 8 && bounds_.height > 8) painter.focus_frame({3, 3, bounds_.width - 6, bounds_.height - 6});
+}
+
+bool KeypadButton::on_key(const KeyArgs& args) {
+  if (args.usage != hardware::key::kSpace) return false;   // (Enter goes on to the calculator: it is "=")
+  click();
+  return true;
+}
+
 Calculator::Calculator(allocators::IAllocator& allocator)
-    : Frame(allocator), display_(allocator),
-      buttons_{Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator),
-               Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator),
-               Button(allocator), Button(allocator), Button(allocator), Button(allocator), Button(allocator)},
-      entry_(allocator) {
+    : Frame(allocator), menu_(allocator), display_(allocator),
+      buttons_{KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator),
+               KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator),
+               KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator), KeypadButton(allocator),
+               KeypadButton(allocator)},
+      display_menu_(allocator), about_(allocator), entry_(allocator) {
   static_assert(sizeof(kKeypad) / sizeof(kKeypad[0]) == kKeys, "one button per key");
   set_title("Calculator");
-  set_bounds({160, 100, 260, 340});
+  set_bounds({160, 100, 260, 362});
   set_padding(Insets::all(6));
   set_minimize_enabled(true);
 
+  menu_.set_dock(DockStyle::Top);
+  menu_.set_size(0, 22);
+  if (Menu* edit = menu_.add_menu("Edit")) {
+    menu_copy_item_ = edit->add_item("Copy", {&Calculator::on_copy, this}, "Ctrl+C");
+    menu_paste_item_ = edit->add_item("Paste", {&Calculator::on_paste, this}, "Ctrl+V");
+  }
+  menu_.on_opening(Handler::immediate(&Calculator::on_menu_opening, this));
+  if (Menu* help = menu_.add_menu("Help")) help->add_item("About Calculator", {&Calculator::on_about, this});
+  add(&menu_);
+
+  // The display comes first in the tab order, so the focus starts there.
   display_.set_dock(DockStyle::Top);
   display_.set_size(0, static_cast<int32_t>(kDisplayHeight));
+  copy_item_ = display_menu_.add_item("Copy", {&Calculator::on_copy, this});
+  paste_item_ = display_menu_.add_item("Paste", {&Calculator::on_paste, this});
+  display_menu_.on_opening(Handler::immediate(&Calculator::on_menu_opening, this));
+  display_.set_context_menu(&display_menu_);
   add(&display_);
   for (uint32_t i = 0; i < kKeys; ++i) {
     buttons_[i].set_text(kKeypad[i].label);
@@ -66,11 +103,18 @@ Calculator::Calculator(allocators::IAllocator& allocator)
   refresh();
 }
 
+gui::Button* Calculator::key_button(char key) {
+  for (uint32_t i = 0; i < kKeys; ++i)
+    if (kKeypad[i].key == key) return &buttons_[i];
+  return nullptr;
+}
+
 void Calculator::layout() {
-  Frame::layout();   // (the display docks to the top; the rest of the client area is the keypad)
+  Frame::layout();   // (the menu bar and the display dock to the top; the rest of the client area is the keypad)
   const Rect2D area = client_rect();
-  const int32_t top = area.y + static_cast<int32_t>(kDisplayHeight) + static_cast<int32_t>(kGap);
-  const int32_t width = static_cast<int32_t>(area.width), height = area.height > kDisplayHeight + kGap ? static_cast<int32_t>(area.height - kDisplayHeight - kGap) : 0;
+  const int32_t top = display_.bounds().y + static_cast<int32_t>(display_.bounds().height) + static_cast<int32_t>(kGap);
+  const int32_t bottom = area.y + static_cast<int32_t>(area.height);
+  const int32_t width = static_cast<int32_t>(area.width), height = bottom > top ? bottom - top : 0;
   const int32_t cell_w = width / static_cast<int32_t>(kColumns), cell_h = height / static_cast<int32_t>(kRows);
   for (uint32_t i = 0; i < kKeys; ++i) {
     const Key& k = kKeypad[i];
@@ -96,7 +140,53 @@ void Calculator::press(char key) {
   else if (key == 'N') press_negate();
 }
 
-void Calculator::refresh() { display_.set_text(entry_.view()); }
+// The display follows the entry; Copy applies while a number is shown (not the message after a division by zero).
+void Calculator::refresh() {
+  display_.set_text(entry_.view());
+  if (copy_item_) copy_item_->set_enabled(!error_);
+  if (menu_copy_item_) menu_copy_item_->set_enabled(!error_);
+}
+
+void Calculator::on_copy(void* self, Control&) { static_cast<Calculator*>(self)->copy_display(); }
+void Calculator::on_paste(void* self, Control&) { static_cast<Calculator*>(self)->paste_number(); }
+void Calculator::on_about(void* self, Control&) {
+  auto* c = static_cast<Calculator*>(self);
+  if (WindowManager* m = c->manager()) c->about_.show(*m, NoticeKind::Information, "Calculator is part of TheoryCraftOS.", "About Calculator");
+}
+
+// Paste applies while the clipboard holds text (whether that text is a number is only known when it is pasted).
+void Calculator::on_menu_opening(void* self, Control&) {
+  auto* c = static_cast<Calculator*>(self);
+  const kernel::Clipboard* board = c->clipboard();
+  const bool text = board && board->has_text();
+  if (c->paste_item_) c->paste_item_->set_enabled(text);
+  if (c->menu_paste_item_) c->menu_paste_item_->set_enabled(text);
+}
+
+bool Calculator::copy_display() {
+  UiGuard lock(this);
+  kernel::Clipboard* board = clipboard();
+  return board && !error_ && board->set_text(entry_.view());
+}
+
+// A number on the clipboard (blanks and line ends around it do not count) replaces the one shown, as if it had been typed. Anything else is left alone.
+bool Calculator::paste_number() {
+  UiGuard lock(this);
+  kernel::Clipboard* board = clipboard();
+  String text(allocator());
+  if (!board || !board->get_text(&text)) return false;
+  StringView number = text.view();
+  auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  while (!number.empty() && blank(number[0])) number = number.substr(1);
+  while (!number.empty() && blank(number[number.size() - 1])) number = number.substr(0, number.size() - 1);
+  double value = 0;
+  if (!spreadsheet::Sheet::parse_number(number, &value)) return false;
+  if (error_) press_clear();
+  show_value(value);
+  fresh_ = false;   // (it is the number being entered: an operator typed next applies to it)
+  refresh();
+  return true;
+}
 
 void Calculator::press_digit(char digit) {
   if (error_) press_clear();
@@ -132,7 +222,7 @@ void Calculator::apply_pending() {
     case '/':
       if (rhs == 0) {
         error_ = true;
-        entry_.assign("Error");
+        entry_.assign(kDivideByZero);
         return;
       }
       accumulator_ /= rhs;
@@ -190,10 +280,17 @@ void Calculator::press_negate() {
 
 bool Calculator::on_key(const KeyArgs& args) {
   namespace key = hardware::key;
-  if (!(args.modifiers & hardware::modifier::kControl)) {
+  const bool ctrl = (args.modifiers & hardware::modifier::kControl) != 0;
+  const bool alt = (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) != 0;
+  if (ctrl && !alt) {
+    if (args.usage == key::kA + 2) { copy_display(); return true; }    // Ctrl+C
+    if (args.usage == key::kA + 21) { paste_number(); return true; }   // Ctrl+V
+  }
+  if (!ctrl && !alt) {
     if (args.usage == key::kEnter || args.usage == key::kKeypadEnter) { press_equals(); return true; }
     if (args.usage == key::kBackspace) { press_backspace(); return true; }
     if (args.usage == key::kEscape || args.usage == key::kDelete) { press_clear(); return true; }
+    if (args.usage == key::kF1 + 8) { press_negate(); return true; }   // F9 changes the sign
     const char c = args.character;
     if ((c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' || c == '*' || c == '/' || c == '=') {
       press(c);

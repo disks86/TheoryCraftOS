@@ -842,12 +842,19 @@ The toolkit is in `src/Gui` and the built-in applications in `src/Desktop`. Befo
 | Guideline concept | Toolkit |
 | --- | --- |
 | Theme colours and their pairs | `gui::Theme` (`Theme.hpp`): `face`/`text`, `field`/`text`, `selection`/`selection_text`, `title`/`title_text`, `inactive_title`/`inactive_title_text`, `disabled_text`, and the bevel colours `highlight`, `light`, `shadow`, `dark` |
+| Access keys | `gui::AccessKeys` (`AccessKey.hpp`): handed out automatically per frame (`Frame::assign_access_keys`) and per menu; labels of fields end in a colon and come directly before the field. Pin a letter with `Control::set_access_key` or `MenuItem::access_key` |
+| A document application: title, unsaved-changes question, About | `desktop::DocumentFrame` (`DocumentFrame.hpp`), with `Frame::close_requested()` |
+| A question with a destructive answer, or three answers | `gui::MessageDialog`: `set_default_choice(Choice::Decline)`, `set_alternate`, `set_save_changes` |
+| A message as one sentence with placeholders | `desktop::format_message` (`Format.hpp`), `describe_failure` (`FileStatus.hpp`) |
+| Dialog contents in reading (and Tab) order | `desktop::StackColumn`, `desktop::StackRow` (`StackPanel.hpp`); a table that leaves Enter to the default button: `DialogGrid.hpp` |
+| Enabling menu items for the state of the moment | `MenuBar::on_opening`, `ContextMenu::on_opening` |
+| Undo in text | `gui::TextEditor::undo` / `redo` |
 | Frame, title bar, frame buttons, size borders | `gui::Frame` |
 | Several documents as tabs in one frame | `gui::TabFrame` |
 | Frame order, activation, modal dialogs, `Alt+Tab` | `gui::WindowManager`, `gui::WindowSwitcher` |
 | Warning with a decision | `gui::MessageDialog`: the default button comes first, `Enter` chooses it, `Esc` and the Close button decline |
 | Information, warning or error with one OK button | `gui::NoticeDialog` with `NoticeKind` |
-| Notification that does not interrupt | `ToastCenter` |
+| Notification that does not interrupt | `ToastCenter`; one that goes away unseen is kept (`missed_count()`) and listed in the desktop's Notifications window (`NotificationLog`) |
 | Menu bar and drop-down menus, context menus, menu buttons | `Menu`, `ContextMenu` (see `Control::prepare_context_menu`), `MenuButton` |
 | Toolbar, tooltip, status and progress | `ToolStrip`, `Tooltip`, `Label`, `ProgressBar` |
 | Choice controls | `Button`, `CheckBox`, `Toggle`, `RadioButton`, `DropDown`, `ListView`, `TreeView`, `DataGrid`, `SpinBox`, `Slider`, `TabControl`, `DatePicker` |

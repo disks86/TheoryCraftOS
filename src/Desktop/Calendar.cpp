@@ -17,6 +17,8 @@
  */
 
 #include "Desktop/Calendar.hpp"
+#include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
@@ -28,6 +30,8 @@ const char* const kMonths[12] = {"January", "February", "March",     "April",   
                                  "July",    "August",   "September", "October", "November", "December"};
 const char* const kWeekdayNames[7] = {"Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"};
 constexpr int32_t kGap = 6, kRowHeight = 24, kLabelHeight = 22, kRightWidth = 330;
+// The most of an appointment's title a question quotes (a line of the question holds about 45 characters).
+constexpr uint64_t kQuoted = 24;
 
 Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
   return {x, y, static_cast<uint32_t>(width > 0 ? width : 0), static_cast<uint32_t>(height > 0 ? height : 0)};
@@ -73,7 +77,7 @@ void MonthGrid::paint(Painter& painter) {
   title.push_back(' ');
   title.append_uint(static_cast<uint64_t>(view_.year));
   painter.text_centered(rect(kHeader, 0, kWidth - 2 * kHeader, kHeader), title.view(), t.text);
-  for (int32_t c = 0; c < 7; ++c) painter.text_centered(rect(c * kCellWidth, kHeader, kCellWidth, kWeekdays), kWeekdayNames[c], t.shadow);
+  for (int32_t c = 0; c < 7; ++c) painter.text_centered(rect(c * kCellWidth, kHeader, kCellWidth, kWeekdays), kWeekdayNames[c], t.text);
   painter.fill(rect(0, kGridTop, kWidth, kRows * kCellHeight), t.field);
   const Date first = first_cell();
   for (int32_t i = 0; i < 7 * kRows; ++i) {
@@ -84,8 +88,8 @@ void MonthGrid::paint(Painter& painter) {
     if (d == today_) painter.outline(rect(cell.x + 1, cell.y + 1, kCellWidth - 2, kCellHeight - 2), t.shadow);
     const char digits[3] = {static_cast<char>(d.day >= 10 ? '0' + d.day / 10 : ' '), static_cast<char>('0' + d.day % 10), 0};
     painter.text_centered(rect(cell.x, cell.y, kCellWidth, kCellHeight - 6), StringView(digits, 2), chosen ? t.selection_text : this_month ? t.text : t.disabled_text);
-    if (store_ && store_->has_events_on(days_from_date(d)))   // (a small bar under the number)
-      painter.fill(rect(cell.x + kCellWidth / 2 - 8, cell.y + kCellHeight - 7, 16, 3), chosen ? t.selection_text : 0xFF2060C0);
+    if (store_ && store_->has_events_on(days_from_date(d)))   // (a small bar under the number, in the colour of the number: the shape is the mark)
+      painter.fill(rect(cell.x + kCellWidth / 2 - 8, cell.y + kCellHeight - 7, 16, 3), chosen ? t.selection_text : this_month ? t.text : t.disabled_text);
     if (chosen && focused()) painter.focus_frame(rect(cell.x + 1, cell.y + 1, kCellWidth - 2, kCellHeight - 2));
   }
   painter.outline(rect(0, kGridTop, kWidth, kRows * kCellHeight), t.shadow);
@@ -110,6 +114,8 @@ bool MonthGrid::on_key(const KeyArgs& args) {
     case key::kRight: moved = add_days(selected_, +1); break;
     case key::kUp: moved = add_days(selected_, -7); break;
     case key::kDown: moved = add_days(selected_, +7); break;
+    case 0x4A: moved = add_days(selected_, -weekday(selected_)); break;      // Home: the start of the week
+    case 0x4D: moved = add_days(selected_, 6 - weekday(selected_)); break;   // End: the end of the week
     case 0x4B: moved = add_months(selected_, -1); break;   // Page Up
     case 0x4E: moved = add_months(selected_, +1); break;   // Page Down
     default: return false;
@@ -121,25 +127,27 @@ bool MonthGrid::on_key(const KeyArgs& args) {
 // --- Calendar ------------------------------------------------------------------
 
 Calendar::Calendar(allocators::IAllocator& allocator)
-    : Frame(allocator), day_label_(allocator), title_label_(allocator), time_label_(allocator), colon_label_(allocator), length_label_(allocator), remind_label_(allocator),
+    : Frame(allocator), day_label_(allocator), title_label_(allocator), time_label_(allocator), at_label_(allocator), colon_label_(allocator), length_label_(allocator), remind_label_(allocator),
       repeat_label_(allocator), every_label_(allocator), by_label_(allocator), scope_label_(allocator), status_(allocator), grid_(allocator), list_(allocator), title_(allocator),
       date_(allocator), until_(allocator), hour_(allocator), minute_(allocator), length_(allocator), remind_(allocator), every_(allocator), all_day_(allocator),
       until_check_(allocator), repeat_(allocator), by_(allocator), scope_(allocator), add_(allocator), update_(allocator), delete_(allocator), reset_(allocator),
-      today_button_(allocator), occurrences_(allocator) {
+      today_button_(allocator), event_menu_(allocator), month_menu_(allocator), ask_(allocator), occurrences_(allocator) {
   set_title("Calendar");
   set_bounds({100, 20, 670, 600});
   set_padding(Insets::all(6));
   set_minimize_enabled(true);
 
-  title_label_.set_text("Title");
-  time_label_.set_text("On");
+  // (each label ends in a colon and comes directly before its field: it carries the field's access key)
+  title_label_.set_text("Title:");
+  time_label_.set_text("On:");
+  at_label_.set_text("At:");
   colon_label_.set_text(":");
-  length_label_.set_text("Length (minutes)");
-  remind_label_.set_text("Remind (minutes before)");
-  repeat_label_.set_text("Repeat");
-  every_label_.set_text("every");
-  by_label_.set_text("Keep to");
-  scope_label_.set_text("Change");
+  length_label_.set_text("Length (minutes):");
+  remind_label_.set_text("Remind (minutes before):");
+  repeat_label_.set_text("Repeat:");
+  every_label_.set_text("Every:");
+  by_label_.set_text("Keep to:");
+  scope_label_.set_text("Change:");
   all_day_.set_text("All day");
   until_check_.set_text("Until");
   static const char* const kRepeatNames[] = {"Does not repeat", "Daily", "Weekly", "Monthly", "Yearly"};
@@ -185,8 +193,21 @@ Calendar::Calendar(allocators::IAllocator& allocator)
   repeat_.on_selection_changed({&Calendar::on_form_changed, this});
   scope_.on_selection_changed({&Calendar::on_form_changed, this});
   until_check_.on_changed({&Calendar::on_form_changed, this});
+  title_.on_changed({&Calendar::on_form_changed, this});
+  ask_.on_result({&Calendar::on_answer, this});
 
-  Control* const parts[] = {&grid_,   &today_button_, &day_label_, &list_,     &title_label_, &title_,    &time_label_, &date_,         &hour_,   &colon_label_, &minute_, &all_day_,
+  // The menu of an appointment: delete it, give a changed occurrence back to its series, and last the command that edits it. The month's menu
+  // has the command of the month.
+  menu_delete_ = event_menu_.add_item("Delete", {&Calendar::on_delete, this});
+  menu_reset_ = event_menu_.add_item("Reset", {&Calendar::on_reset, this});
+  event_menu_.add_separator();
+  menu_edit_ = event_menu_.add_item("Edit", {&Calendar::on_edit, this});
+  event_menu_.on_opening(Handler::immediate(&Calendar::on_menu_opening, this));
+  list_.set_context_menu(&event_menu_);
+  month_menu_.add_item("Today", {&Calendar::on_today, this});
+  grid_.set_context_menu(&month_menu_);
+
+  Control* const parts[] = {&grid_,   &today_button_, &day_label_, &list_,     &title_label_, &title_,    &time_label_, &date_,   &at_label_,      &hour_,   &colon_label_, &minute_, &all_day_,
                             &length_label_, &length_, &remind_label_, &remind_, &repeat_label_, &repeat_, &every_label_, &every_, &by_label_, &by_, &until_check_, &until_,
                             &scope_label_,  &scope_,  &add_,          &update_, &delete_,       &reset_,  &status_};
   for (Control* part : parts) add(part);
@@ -210,8 +231,18 @@ bool Calendar::repeating_selection() const {
   return store_ && selected_event() && store_->get(selected_event(), &e) && e.repeats();
 }
 
+// A command that cannot work now is disabled, not left to answer with a message: nothing to add or save while the title is empty, nothing to save
+// or delete while no appointment is chosen. Enter in the form presses Save while an appointment is chosen and Add otherwise; that button has the
+// heavier outline.
 void Calendar::update_form() {
   const bool all_day = all_day_.checked(), repeating = repeating_selection();
+  const bool chosen = selected_occurrence() != nullptr, titled = !title_.text().empty();
+  const bool can_save = chosen && titled, can_add = store_ != nullptr && titled;
+  add_.set_enabled(can_add);
+  update_.set_enabled(can_save);
+  delete_.set_enabled(chosen);
+  update_.set_default(can_save);
+  add_.set_default(can_add && !can_save);
   const bool one = repeating && scope_.selected_index() == kThisOccurrence;   // (only this occurrence: the series settings are not part of the change)
   const bool kind_repeats = repeat_.selected_index() > 0;
   const bool by_choice = repeat_.selected_index() == static_cast<int32_t>(Repeat::Monthly) || repeat_.selected_index() == static_cast<int32_t>(Repeat::Yearly);
@@ -254,13 +285,13 @@ bool Calendar::form_recurrence(int64_t first_day, Recurrence* out) {
     out->on = by == 1 ? On::NthWeekday : by == 2 ? On::LastWeekday : On::Date;
   }
   if (!recurrence_fits(first_day, *out)) {
-    say("That day is not the last of its weekday in the month.");
+    fault(by_, "That day is not the last of its weekday in the month. Choose another day.");
     return false;
   }
   if (out->kind != Repeat::None && until_check_.checked()) {
     out->until_day = days_from_date(until_.date());
     if (out->until_day < first_day) {
-      say("The last day is before the appointment.");
+      fault(until_, "The last day is before the appointment starts. Choose a later date.");
       return false;
     }
   }
@@ -308,9 +339,7 @@ void Calendar::refresh() {
   String day(allocator());
   char date[11];
   format_date(grid_.selected(), date);
-  day.assign("Appointments on ");
-  day.append(StringView(date, 10));
-  day_label_.set_text(day.view());
+  if (format_message(&day, "Appointments on %1:", StringView(date, 10))) day_label_.set_text(day.view());   // (the colon: it is the label of the list)
   if (store_) {
     store_->occurrences_on(days_from_date(grid_.selected()), &occurrences_);
     for (const CalendarStore::Occurrence& o : occurrences_) {
@@ -359,20 +388,24 @@ void Calendar::select_event(int32_t index) {
 
 bool Calendar::add_event() {
   UiGuard lock(this);
-  if (!store_ || title_.text().empty()) {
-    say(store_ ? "Give the appointment a title." : "There is no storage for appointments.");
+  if (!store_) {
+    say("Appointments cannot be kept because no disk is ready.");
+    return false;
+  }
+  if (title_.text().empty()) {
+    fault(title_, "Give the appointment a title, then choose Add.");
     return false;
   }
   Recurrence recurrence;
   if (!form_recurrence(day_of(form_start()), &recurrence)) return false;
   if (!store_->add(form_start(), form_minutes(), static_cast<uint32_t>(remind_.value()), title_.text(), recurrence)) {
-    say("The appointment could not be saved.");
+    say("The appointment could not be saved. The disk may be full.");
     return false;
   }
   title_.set_text("");
   grid_.select(date_.date());   // (shows the day it was put on)
   refresh();
-  say(store_->persistent() ? "Added." : "Added (the storage cannot be written: it is kept until shutdown).");
+  say(store_->persistent() ? "Added." : "Added, but only until shutdown: the disk cannot be written.");
   return true;
 }
 
@@ -380,15 +413,19 @@ bool Calendar::update_event() {
   UiGuard lock(this);
   const CalendarStore::Occurrence* o = selected_occurrence();
   CalendarStore::Event e(allocator());
-  if (!store_ || !o || title_.text().empty() || !store_->get(o->id, &e)) {
-    say(!o ? "Choose an appointment first." : "Give the appointment a title.");
+  if (!store_ || !o || !store_->get(o->id, &e)) {
+    say("Choose an appointment first.");
+    return false;
+  }
+  if (title_.text().empty()) {
+    fault(title_, "Give the appointment a title, then choose Save.");
     return false;
   }
   const uint32_t id = o->id;
   const int64_t original_day = o->original_day;
   if (e.repeats() && scope_.selected_index() == kThisOccurrence) {
     if (!store_->change_occurrence(id, original_day, form_start(), form_minutes(), title_.text())) {
-      say("The occurrence could not be saved.");
+      say("The occurrence could not be saved. The disk may be full.");
       return false;
     }
     grid_.select(date_.date());
@@ -400,7 +437,7 @@ bool Calendar::update_event() {
   Recurrence recurrence;
   if (!form_recurrence(day_of(start), &recurrence)) return false;
   if (!store_->update(id, start, form_minutes(), static_cast<uint32_t>(remind_.value()), title_.text(), recurrence)) {
-    say("The appointment could not be saved.");
+    say("The appointment could not be saved. The disk may be full.");
     return false;
   }
   if (!e.repeats()) grid_.select(date_.date());
@@ -417,14 +454,93 @@ bool Calendar::delete_event() {
     say("Choose an appointment first.");
     return false;
   }
-  const bool one = e.repeats() && scope_.selected_index() == kThisOccurrence;
-  if (!(one ? store_->cancel_occurrence(o->id, o->original_day) : store_->remove(o->id))) {
-    say("The appointment could not be deleted.");
+  return remove_occurrence(o->id, o->original_day, e.repeats() && scope_.selected_index() == kThisOccurrence);
+}
+
+bool Calendar::remove_occurrence(uint32_t id, int64_t original_day, bool one) {
+  if (!store_ || !(one ? store_->cancel_occurrence(id, original_day) : store_->remove(id))) {
+    say("The appointment could not be deleted. The disk may be full.");
     return false;
   }
   refresh();
   say(one ? "Left out this occurrence." : "Deleted.");
   return true;
+}
+
+// A deleted appointment cannot be brought back, so the question comes first, and the button that keeps it is the default: Enter and Escape both
+// leave the calendar as it was. The question says whether one occurrence or the whole series goes.
+bool Calendar::ask_delete() {
+  UiGuard lock(this);
+  const CalendarStore::Occurrence* o = selected_occurrence();
+  CalendarStore::Event e(allocator());
+  WindowManager* m = manager();
+  if (!m || !store_ || !o || !store_->get(o->id, &e)) return false;
+  String name(allocator()), line(allocator());
+  const StringView title = o->title.view();
+  if (title.size() > kQuoted) {
+    uint64_t cut = kQuoted;
+    while (cut > 0 && (static_cast<uint8_t>(title[cut]) & 0xC0) == 0x80) --cut;   // (not in the middle of a character)
+    if (!name.assign(title.first(cut)) || !name.append("...")) return false;
+  } else if (!name.assign(title)) {
+    return false;
+  }
+  pending_id_ = o->id;
+  pending_day_ = o->original_day;
+  pending_one_ = e.repeats() && scope_.selected_index() == kThisOccurrence;
+  const StringView pattern = !e.repeats() ? StringView("Delete \"%1\"?") : pending_one_ ? StringView("Delete this occurrence of \"%1\"?") : StringView("Delete all occurrences of \"%1\"?");
+  if (!format_message(&line, pattern, name.view())) return false;
+  ask_.set_texts(this->title(), line.view(), "A deleted appointment cannot be brought back.", "Delete", "Cancel");
+  ask_.set_default_choice(MessageDialog::Choice::Decline);
+  return ask_.show(*m);
+}
+
+void Calendar::on_answer(void* self, Control&) {
+  auto* c = static_cast<Calendar*>(self);
+  UiGuard lock(c);
+  if (c->ask_.accepted()) c->remove_occurrence(c->pending_id_, c->pending_day_, c->pending_one_);
+}
+
+bool Calendar::edit_event() {
+  UiGuard lock(this);
+  if (!selected_occurrence()) return false;
+  if (Window* w = window()) w->set_focus(&title_);
+  title_.select_all();
+  return true;
+}
+
+void Calendar::fault(Control& field, StringView text) {
+  say(text);
+  if (Window* w = window()) {
+    if (field.effectively_enabled()) w->set_focus(&field);
+  }
+}
+
+void Calendar::on_edit(void* self, Control&) { static_cast<Calendar*>(self)->edit_event(); }
+
+// Enables what applies to the appointment under the menu: none (empty space), one, or a changed occurrence that can go back to its series.
+void Calendar::on_menu_opening(void* self, Control&) {
+  auto* c = static_cast<Calendar*>(self);
+  const CalendarStore::Occurrence* o = c->selected_occurrence();
+  c->menu_delete_->set_enabled(o != nullptr);
+  c->menu_reset_->set_enabled(o && o->changed);
+  c->menu_edit_->set_enabled(o != nullptr);
+}
+
+// Delete in the list deletes the chosen appointment (after the question). Enter that no control used (the title, a number, a list of the form)
+// presses the default button: Save while an appointment is chosen, Add otherwise.
+bool Calendar::on_key(const KeyArgs& args) {
+  namespace key = hardware::key;
+  const bool plain = !(args.modifiers & (hardware::modifier::kControl | hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt));
+  if (plain && args.usage == key::kDelete && list_.focused() && selected_occurrence()) {
+    ask_delete();
+    return true;
+  }
+  if (plain && (args.usage == key::kEnter || args.usage == key::kKeypadEnter)) {
+    if (update_.is_default()) update_.click();
+    else if (add_.is_default()) add_.click();
+    return true;
+  }
+  return Frame::on_key(args);
 }
 
 bool Calendar::reset_event() {
@@ -435,7 +551,7 @@ bool Calendar::reset_event() {
     return false;
   }
   if (!store_->restore_occurrence(o->id, o->original_day)) {
-    say("The occurrence could not be reset.");
+    say("The occurrence could not be reset. The disk may be full.");
     return false;
   }
   grid_.select(date_from_days(o->original_day));
@@ -455,7 +571,7 @@ void Calendar::on_pick(void* self, Control&) {
 }
 void Calendar::on_add(void* self, Control&) { static_cast<Calendar*>(self)->add_event(); }
 void Calendar::on_update(void* self, Control&) { static_cast<Calendar*>(self)->update_event(); }
-void Calendar::on_delete(void* self, Control&) { static_cast<Calendar*>(self)->delete_event(); }
+void Calendar::on_delete(void* self, Control&) { static_cast<Calendar*>(self)->ask_delete(); }
 void Calendar::on_reset(void* self, Control&) { static_cast<Calendar*>(self)->reset_event(); }
 void Calendar::on_today(void* self, Control&) { static_cast<Calendar*>(self)->go_to_today(); }
 
@@ -465,47 +581,50 @@ void Calendar::layout() {
   const int32_t left = area.x, top = area.y, width = static_cast<int32_t>(area.width), height = static_cast<int32_t>(area.height);
   place(grid_, rect(left, top, MonthGrid::kWidth, MonthGrid::kHeight));
   place(today_button_, rect(left, top + MonthGrid::kHeight + kGap, 80, 26));
-  place(status_, rect(left, top + height - kLabelHeight, MonthGrid::kWidth, kLabelHeight));
+  place(status_, rect(left, top + height - kLabelHeight, width, kLabelHeight));   // (the whole width: a message is a sentence or two)
 
   const int32_t x = left + MonthGrid::kWidth + 2 * kGap;
   const int32_t w = width - MonthGrid::kWidth - 2 * kGap > kRightWidth ? width - MonthGrid::kWidth - 2 * kGap : kRightWidth;
   int32_t y = top;
   place(day_label_, rect(x, y, w, kLabelHeight));
   y += kLabelHeight + 2;
-  const int32_t form_height = 9 * (kRowHeight + 4) + 30 + kGap;
+  const int32_t form_height = 9 * (kRowHeight + 4) + 30 + kGap + kLabelHeight + kGap;   // (the form, its buttons, and the status line under them)
   const int32_t list_height = height - (y - top) - form_height;
   place(list_, rect(x, y, w, list_height > 60 ? list_height : 60));
   y += (list_height > 60 ? list_height : 60) + kGap;
-  place(title_label_, rect(x, y, 48, kRowHeight));
-  place(title_, rect(x + 48, y, w - 48, kRowHeight));
+  // The labels of the first column share one width (the longest of them, "Keep to:"), so the fields line up.
+  const int32_t label = 9 * Painter::kGlyphWidth;
+  place(title_label_, rect(x, y, label, kRowHeight));
+  place(title_, rect(x + label, y, w - label, kRowHeight));
   y += kRowHeight + 4;
-  place(time_label_, rect(x, y, 48, kRowHeight));
-  place(date_, rect(x + 48, y, 130, kRowHeight));
-  place(hour_, rect(x + 186, y, 64, kRowHeight));
-  place(colon_label_, rect(x + 250, y, 12, kRowHeight));
-  place(minute_, rect(x + 262, y, 64, kRowHeight));
+  place(time_label_, rect(x, y, label, kRowHeight));
+  place(date_, rect(x + label, y, 130, kRowHeight));
   y += kRowHeight + 4;
-  place(all_day_, rect(x + 48, y, 100, kRowHeight));
+  place(at_label_, rect(x, y, label, kRowHeight));
+  place(hour_, rect(x + label, y, 64, kRowHeight));
+  place(colon_label_, rect(x + label + 64, y, 12, kRowHeight));
+  place(minute_, rect(x + label + 76, y, 64, kRowHeight));
+  place(all_day_, rect(x + label + 150, y, 100, kRowHeight));
   y += kRowHeight + 4;
-  place(length_label_, rect(x, y, 16 * 8 + 8, kRowHeight));
-  place(length_, rect(x + 16 * 8 + 8, y, 76, kRowHeight));
+  place(length_label_, rect(x, y, 17 * 8 + 8, kRowHeight));
+  place(length_, rect(x + 17 * 8 + 8, y, 76, kRowHeight));
   y += kRowHeight + 4;
-  place(remind_label_, rect(x, y, 23 * 8 + 8, kRowHeight));
-  place(remind_, rect(x + 23 * 8 + 8, y, 76, kRowHeight));
+  place(remind_label_, rect(x, y, 24 * 8 + 8, kRowHeight));
+  place(remind_, rect(x + 24 * 8 + 8, y, 76, kRowHeight));
   y += kRowHeight + 4;
-  place(repeat_label_, rect(x, y, 56, kRowHeight));
-  place(repeat_, rect(x + 56, y, 140, kRowHeight));
-  place(every_label_, rect(x + 204, y, 48, kRowHeight));
-  place(every_, rect(x + 252, y, 64, kRowHeight));
+  place(repeat_label_, rect(x, y, label, kRowHeight));
+  place(repeat_, rect(x + label, y, 134, kRowHeight));
+  place(every_label_, rect(x + label + 140, y, 52, kRowHeight));
+  place(every_, rect(x + label + 192, y, 64, kRowHeight));
   y += kRowHeight + 4;
-  place(by_label_, rect(x, y, 56, kRowHeight));
-  place(by_, rect(x + 56, y, 140, kRowHeight));
-  place(until_check_, rect(x + 204, y, 64, kRowHeight));
+  place(by_label_, rect(x, y, label, kRowHeight));
+  place(by_, rect(x + label, y, 134, kRowHeight));
+  place(until_check_, rect(x + label + 140, y, 72, kRowHeight));
   y += kRowHeight + 4;
-  place(until_, rect(x + 204, y, 120, kRowHeight));
+  place(until_, rect(x + label + 140, y, 120, kRowHeight));
   y += kRowHeight + 4;
-  place(scope_label_, rect(x, y, 56, kRowHeight));
-  place(scope_, rect(x + 56, y, 180, kRowHeight));
+  place(scope_label_, rect(x, y, label, kRowHeight));
+  place(scope_, rect(x + label, y, 180, kRowHeight));
   y += kRowHeight + 6;
   place(add_, rect(x, y, 70, 26));
   place(update_, rect(x + 76, y, 70, 26));

@@ -17,6 +17,9 @@
  */
 
 #include "Desktop/BluetoothProperties.hpp"
+#include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
 
@@ -75,12 +78,18 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
       adapter_label_(allocator),
       status_(allocator),
       prompt_label_(allocator),
+      list_label_(allocator),
       grid_(allocator),
-      prompt_row_(allocator),
+      body_(allocator),
       buttons_(allocator),
+      prompt_row_(allocator),
       gap_a_(allocator),
       gap_b_(allocator),
       gap_c_(allocator),
+      gap_d_(allocator),
+      spacer_(allocator),
+      grid_menu_(allocator),
+      ask_(allocator),
       passkey_(allocator),
       auto_reconnect_(allocator),
       search_button_(allocator),
@@ -91,53 +100,46 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
       accept_button_(allocator),
       reject_button_(allocator),
       cell_text_(allocator) {
-  set_title("Bluetooth");
+  set_title("Bluetooth Devices");   // (with an adapter: "Bluetooth Devices - <its name>")
   set_bounds({110, 60, 560, 430});
   set_padding(Insets::all(8));
-  set_minimize_enabled(true);
+  set_minimize_enabled(false);      // a secondary frame: no Minimize or Maximize
+  set_maximize_enabled(false);
 
-  adapter_label_.set_dock(DockStyle::Top);
   adapter_label_.set_size(0, 24);
 
   auto_reconnect_.set_text("Reconnect to paired devices automatically");
-  auto_reconnect_.set_dock(DockStyle::Top);
   auto_reconnect_.set_size(0, 22);
   auto_reconnect_.set_enabled(false);
   auto_reconnect_.on_changed({&BluetoothProperties::on_auto_reconnect, this});
 
-  buttons_.set_style(PanelStyle::Transparent);
-  buttons_.set_dock(DockStyle::Bottom);
+  list_label_.set_text("Devices:");
+  list_label_.set_size(0, 22);
+
   buttons_.set_size(0, 30);
-  close_button_.set_text("Close");
-  close_button_.set_dock(DockStyle::Right);
-  close_button_.set_size(70, 0);
-  close_button_.on_click(Handler::immediate(&BluetoothProperties::on_close, this));
   search_button_.set_text("Search");
-  search_button_.set_dock(DockStyle::Left);
   search_button_.set_size(76, 0);
   search_button_.on_click({&BluetoothProperties::on_search, this});
-  gap_a_.set_style(PanelStyle::Transparent);
-  gap_a_.set_dock(DockStyle::Left);
-  gap_a_.set_size(6, 0);
   connect_button_.set_text("Connect");
-  connect_button_.set_dock(DockStyle::Left);
   connect_button_.set_size(80, 0);
+  connect_button_.set_default(true);
   connect_button_.on_click({&BluetoothProperties::on_connect, this});
-  gap_b_.set_style(PanelStyle::Transparent);
-  gap_b_.set_dock(DockStyle::Left);
-  gap_b_.set_size(6, 0);
   disconnect_button_.set_text("Disconnect");
-  disconnect_button_.set_dock(DockStyle::Left);
   disconnect_button_.set_size(92, 0);
   disconnect_button_.on_click({&BluetoothProperties::on_disconnect, this});
-  gap_c_.set_style(PanelStyle::Transparent);
-  gap_c_.set_dock(DockStyle::Left);
-  gap_c_.set_size(6, 0);
   forget_button_.set_text("Forget");
-  forget_button_.set_dock(DockStyle::Left);
   forget_button_.set_size(70, 0);
   forget_button_.on_click({&BluetoothProperties::on_forget, this});
-  buttons_.add(&close_button_);
+  close_button_.set_text("Close");
+  close_button_.set_size(70, 0);
+  close_button_.on_click(Handler::immediate(&BluetoothProperties::on_close, this));
+  Panel* const gaps[] = {&gap_a_, &gap_b_, &gap_c_, &gap_d_};
+  for (Panel* gap : gaps) {
+    gap->set_style(PanelStyle::Transparent);
+    gap->set_size(6, 0);
+  }
+  spacer_.set_style(PanelStyle::Transparent);
+  spacer_.set_dock(DockStyle::Fill);
   buttons_.add(&search_button_);
   buttons_.add(&gap_a_);
   buttons_.add(&connect_button_);
@@ -145,29 +147,27 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
   buttons_.add(&disconnect_button_);
   buttons_.add(&gap_c_);
   buttons_.add(&forget_button_);
+  buttons_.add(&spacer_);
+  buttons_.add(&close_button_);
 
-  status_.set_dock(DockStyle::Bottom);
   status_.set_size(0, 22);
 
-  prompt_row_.set_style(PanelStyle::Transparent);
-  prompt_row_.set_dock(DockStyle::Bottom);
+  // The pairing question: its text, the box for a typed passkey (the text then ends in a colon and names the box), and the answers.
   prompt_row_.set_size(0, 28);
-  reject_button_.set_text("Cancel");
-  reject_button_.set_dock(DockStyle::Right);
-  reject_button_.set_size(70, 0);
-  reject_button_.on_click({&BluetoothProperties::on_reject, this});
-  accept_button_.set_text("OK");
-  accept_button_.set_dock(DockStyle::Right);
-  accept_button_.set_size(70, 0);
-  accept_button_.on_click({&BluetoothProperties::on_accept, this});
-  passkey_.set_dock(DockStyle::Right);
+  prompt_label_.set_dock(DockStyle::Fill);
   passkey_.set_size(90, 0);
   passkey_.set_max_length(6);
-  prompt_label_.set_dock(DockStyle::Fill);
-  prompt_row_.add(&reject_button_);
-  prompt_row_.add(&accept_button_);
-  prompt_row_.add(&passkey_);
+  accept_button_.set_text("OK");
+  accept_button_.set_size(70, 0);
+  accept_button_.on_click({&BluetoothProperties::on_accept, this});
+  reject_button_.set_text("Cancel");
+  reject_button_.set_size(70, 0);
+  reject_button_.on_click({&BluetoothProperties::on_reject, this});
   prompt_row_.add(&prompt_label_);
+  prompt_row_.add(&passkey_);
+  prompt_row_.add(&gap_d_);
+  prompt_row_.add(&accept_button_);
+  prompt_row_.add(&reject_button_);
   prompt_row_.set_visible(false);
 
   grid_.add_column("Device", 190);
@@ -176,14 +176,40 @@ BluetoothProperties::BluetoothProperties(allocators::IAllocator& allocator)
   grid_.add_column("Status", 160);
   grid_.set_dock(DockStyle::Fill);
   grid_.on_selection_changed({&BluetoothProperties::on_selection, this});
+  // The commands of a device are also in its context menu; update_buttons() keeps them in step with the buttons.
+  connect_item_ = grid_menu_.add_item("Connect", {&BluetoothProperties::on_connect, this});
+  disconnect_item_ = grid_menu_.add_item("Disconnect", {&BluetoothProperties::on_disconnect, this});
+  grid_menu_.add_separator();
+  forget_item_ = grid_menu_.add_item("Forget", {&BluetoothProperties::on_forget, this});
+  grid_.set_context_menu(&grid_menu_);
+  ask_.on_result({&BluetoothProperties::on_forget_answer, this});
 
-  add(&adapter_label_);
-  add(&auto_reconnect_);
-  add(&buttons_);
-  add(&status_);
-  add(&prompt_row_);
-  add(&grid_);   // (Fill goes last)
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&adapter_label_);
+  body_.add(&auto_reconnect_);
+  body_.add(&list_label_);
+  body_.add(&grid_);
+  body_.add(&prompt_row_);
+  body_.add(&status_);
+  body_.add(&buttons_);
+  add(&body_);
   update_buttons();
+}
+
+// Enter is the default action: the answer to the pairing question while there is one, else Connect. Escape stops what is in progress - the pairing -
+// before it closes the window.
+bool BluetoothProperties::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter) {
+    if (prompt_row_.visible() && accept_button_.visible()) accept_button_.click();
+    else if (!prompt_row_.visible()) connect_button_.click();
+    return true;
+  }
+  if (args.usage == hardware::key::kEscape) {
+    if (prompt_row_.visible()) reject_button_.click();
+    else close();
+    return true;
+  }
+  return Frame::on_key(args);
 }
 
 StringView BluetoothProperties::cell(uint32_t row, uint32_t column) const {
@@ -266,27 +292,13 @@ void BluetoothProperties::update_prompt() {
   if (!changed) return;
   String text(allocator());
   const bool entry = now.kind == BluetoothPromptKind::EnterPasskey, compare = now.kind == BluetoothPromptKind::ConfirmNumber;
+  String number(allocator());
+  six_digits(&number, now.number);
   switch (now.kind) {
     case BluetoothPromptKind::None: break;
-    case BluetoothPromptKind::ShowPasskey:
-      text.assign("Type ");
-      six_digits(&text, now.number);
-      text.append(" on ");
-      text.append(now.device);
-      text.append(", then press Enter.");
-      break;
-    case BluetoothPromptKind::ConfirmNumber:
-      text.assign("Does ");
-      text.append(now.device);
-      text.append(" show ");
-      six_digits(&text, now.number);
-      text.append("?");
-      break;
-    case BluetoothPromptKind::EnterPasskey:
-      text.assign("Type the passkey ");
-      text.append(now.device);
-      text.append(" shows:");
-      break;
+    case BluetoothPromptKind::ShowPasskey: format_message(&text, "Type %1 on %2, then press Enter.", number.view(), now.device); break;
+    case BluetoothPromptKind::ConfirmNumber: format_message(&text, "Does %1 show %2?", now.device, number.view()); break;
+    case BluetoothPromptKind::EnterPasskey: format_message(&text, "Type the passkey %1 shows:", now.device); break;
   }
   prompt_label_.set_text(text.view());
   passkey_.set_text(StringView());
@@ -306,6 +318,9 @@ void BluetoothProperties::update_buttons() {
   connect_button_.set_enabled(known_ && d && idle_state && d->supported);
   disconnect_button_.set_enabled(known_ && d && !idle_state);
   forget_button_.set_enabled(known_ && d && d->paired);
+  if (connect_item_) connect_item_->set_enabled(connect_button_.enabled());
+  if (disconnect_item_) disconnect_item_->set_enabled(disconnect_button_.enabled());
+  if (forget_item_) forget_item_->set_enabled(forget_button_.enabled());
 }
 
 void BluetoothProperties::update() {
@@ -315,7 +330,7 @@ void BluetoothProperties::update() {
     known_ = false;
     discovering_ = false;
     auto_reconnect_.set_enabled(false);
-    adapter_label_.set_text(details_ ? "This Bluetooth adapter is not there any more." : "No Bluetooth information is available.");
+    adapter_label_.set_text(details_ ? "This Bluetooth adapter is no longer connected. Close this window." : "No Bluetooth information is available.");
     fill_devices(nullptr, 0);
     update_prompt();
     update_buttons();
@@ -327,17 +342,12 @@ void BluetoothProperties::update() {
   auto_reconnect_.set_checked(info.auto_reconnect);
   auto_reconnect_.set_enabled(true);
   syncing_ = false;
-  String text(allocator());
-  text.assign(info.name);
-  text.append(" - Bluetooth");
+  String text(allocator()), name(allocator());
+  format_message(&text, "Bluetooth Devices - %1", info.name);
   set_title(text.view());
-  text.assign(info.name);
-  if (info.address[0]) {
-    text.append(" (");
-    text.append(info.address);
-    text.append(")");
-  }
-  text.append(info.ready ? (info.discovering ? " - looking for devices..." : " - ready") : " - not ready");
+  if (info.address[0]) format_message(&name, "%1 (%2)", info.name, info.address);
+  else name.assign(info.name);
+  format_message(&text, info.ready ? (info.discovering ? "%1 - looking for devices..." : "%1 - ready") : "%1 - not ready", name.view());
   adapter_label_.set_text(text.view());
   const uint32_t count = known_ ? details_->devices(id_, fresh_, IBluetoothDetails::kMaxDevices) : 0;
   fill_devices(fresh_, count < IBluetoothDetails::kMaxDevices ? count : IBluetoothDetails::kMaxDevices);
@@ -363,7 +373,7 @@ void BluetoothProperties::on_connect(void* self, Control&) {
   UiGuard lock(w);
   const BluetoothDeviceRow* d = w->selected();
   if (!w->details_ || !d) {
-    w->status_.set_text("Pick a device first.");
+    w->status_.set_text("Select a device in the list first.");
     return;
   }
   const BluetoothDeviceRow device = *d;
@@ -374,9 +384,7 @@ void BluetoothProperties::on_connect(void* self, Control&) {
     return;
   }
   String text(w->allocator());
-  text.assign("Connecting to ");
-  text.append(device.name[0] ? device.name : device.address);
-  text.append("...");
+  format_message(&text, "Connecting to %1...", device.name[0] ? device.name : device.address);
   w->status_.set_text(text.view());
 }
 
@@ -391,15 +399,39 @@ void BluetoothProperties::on_disconnect(void* self, Control&) {
   w->update();
 }
 
+// Forgetting deletes the pairing, and that cannot be taken back from here (the device has to be paired again), so it asks first. The answer that
+// leaves things as they were is the default one.
 void BluetoothProperties::on_forget(void* self, Control&) {
   auto* w = static_cast<BluetoothProperties*>(self);
   UiGuard lock(w);
   const BluetoothDeviceRow* d = w->selected();
   if (!w->details_ || !d) return;
   const BluetoothDeviceRow device = *d;
-  w->details_->forget(w->id_, device.key);
-  w->status_.set_text("The pairing was deleted.");
-  w->update();
+  if (!w->manager()) {      // (nowhere to ask)
+    w->forget(device.key);
+    return;
+  }
+  for (int i = 0; i < 6; ++i) w->forget_key_[i] = device.key[i];
+  String line(w->allocator());
+  const StringView name = device.name[0] ? StringView(device.name) : StringView(device.address);
+  format_message(&line, "Forget \"%1\"?", name.size() > 30 ? name.first(30) : name);
+  w->ask_.set_texts(w->title(), line.view(), "It must be paired again before it can connect.", "Forget", "Cancel");
+  w->ask_.set_default_choice(MessageDialog::Choice::Decline);
+  w->ask_.show(*w->manager());
+}
+
+void BluetoothProperties::on_forget_answer(void* self, Control&) {
+  auto* w = static_cast<BluetoothProperties*>(self);
+  if (!w->ask_.accepted()) return;
+  UiGuard lock(w);
+  w->forget(w->forget_key_);
+}
+
+void BluetoothProperties::forget(const uint8_t key[6]) {
+  if (!details_) return;
+  details_->forget(id_, key);
+  status_.set_text("The pairing was deleted.");
+  update();
 }
 
 void BluetoothProperties::on_auto_reconnect(void* self, Control&) {
@@ -421,11 +453,13 @@ void BluetoothProperties::on_accept(void* self, Control&) {
     uint32_t value = 0;
     if (typed.empty() || typed.size() > 6) {
       w->status_.set_text("Type the passkey the device shows (up to six digits).");
+      if (Window* win = w->window()) win->set_focus(&w->passkey_);   // the field at fault
       return;
     }
     for (uint64_t i = 0; i < typed.size(); ++i) {
       if (typed[i] < '0' || typed[i] > '9') {
-        w->status_.set_text("The passkey is digits only.");
+        w->status_.set_text("A passkey has digits only. Type it again.");
+        if (Window* win = w->window()) win->set_focus(&w->passkey_);
         return;
       }
       value = value * 10 + static_cast<uint32_t>(typed[i] - '0');

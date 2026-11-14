@@ -27,8 +27,10 @@ using namespace graphics;
 
 namespace {
 constexpr float kTwoPi = 6.2831853f;
+// What the scene is cleared to before the cube is drawn: part of the picture (content), like the cube's own colours. Everything around the
+// picture - the status lines, the controls - is interface and takes its colours from the theme.
 constexpr uint32_t kBackground = 0xFF10101A;
-constexpr uint32_t kGreen = 0xFF40E060, kAmber = 0xFFFFB030, kRed = 0xFFFF5050, kWhite = 0xFFFFFFFF, kShadow = 0xFF000000;
+constexpr int32_t kLineHeight = 18, kStatusLines = 6, kStatusPad = 4;
 
 void append_ms(FixedString<96>& line, uint64_t us) {
   line.append_uint(us / 1000);
@@ -136,12 +138,19 @@ bool CubeView::ensure_renderer(uint32_t width, uint32_t height) {
 }
 
 void CubeView::paint(gui::Painter& painter) {
-  const gui::Rect2D area{0, 0, bounds().width, bounds().height};
-  painter.fill(area, kBackground);
-  if (!api_available(api_)) {
-    painter.text_centered(area, api_ == CubeApi::OpenGL ? "No OpenGL in the kernel." : "No Direct3D driver.", kRed);
+  const gui::Theme& theme = painter.theme();
+  const gui::Rect2D all{0, 0, bounds().width, bounds().height};
+  if (!api_available(api_)) {   // (nothing to draw with: a message in the interface's colours, where the picture would be)
+    painter.fill(all, theme.face);
+    painter.text_centered(all, api_ == CubeApi::OpenGL ? "OpenGL is not available on this machine." : "Direct3D and Vulkan need a 3D driver, and none is loaded.", theme.text);
     return;
   }
+  // The picture takes the area above the status lines.
+  const uint32_t status_height = static_cast<uint32_t>(kStatusLines * kLineHeight + 2 * kStatusPad);
+  const gui::Rect2D area{0, 0, all.width, all.height > status_height ? all.height - status_height : 0};
+  const gui::Rect2D status{0, static_cast<int32_t>(area.height), all.width, all.height - area.height};
+  painter.fill(area, kBackground);
+  painter.fill(status, theme.face);
 
   const uint64_t frame_start = hardware::uptime_us();
   if (!start_us_) start_us_ = frame_start;
@@ -158,7 +167,7 @@ void CubeView::paint(gui::Painter& painter) {
     const bool shared = renderer.shareable() && !share_refused_;
     drawn = renderer.render(angle, use_texture_, &times, !shared);
     if (drawn) {
-      const int32_t px = (area.width - static_cast<int32_t>(width)) / 2, py = (area.height - static_cast<int32_t>(height)) / 2;
+      const int32_t px = (static_cast<int32_t>(area.width) - static_cast<int32_t>(width)) / 2, py = (static_cast<int32_t>(area.height) - static_cast<int32_t>(height)) / 2;
       bool shown = false;
       if (shared) {
         graphics::IGraphicsDevice* device = nullptr;
@@ -217,20 +226,45 @@ void CubeView::paint(gui::Painter& painter) {
     }
   }
 
-  // The status, over the picture's corner.
+  // The status, under the picture, in the theme's text colour on its face colour. What is drawn where is said in words (no coloured lamp:
+  // colour alone must not carry the meaning).
+  int32_t y = status.y + kStatusPad;
+  const auto put = [&](StringView text) {
+    painter.text(8, y, text, theme.text);
+    y += kLineHeight;
+  };
+  const bool gpu = active_accelerated_ && !failed_;
+  FixedString<96> mode;
+  mode.assign(cube_api_name(api_));
+  mode.append(": ");
+  mode.append(failed_ ? "3D drawing failed" : gpu ? "GPU accelerated" : "Software (CPU)");
+  if (!failed_ && device_name_.view().size()) {
+    mode.append(" - ");
+    mode.append(device_name_.view());
+  }
+  put(mode.view());
+  if (api_ == CubeApi::OpenGL && !failed_) {
+    put("The kernel's OpenGL draws on the CPU.");
+  } else if (!gpu_available() && !failed_) {   // say why, so the machine's setup can be fixed
+    FixedString<128> why;
+    why.assign("No GPU: ");
+    why.append(software_reason());
+    put(why.view());
+  } else {
+    put(StringView());
+  }
+
   FixedString<96> line;
   line.assign("FPS: ");
   line.append_uint(fps_);
   line.append("   render: ");
   append_ms(line, frame_us_);
   line.append(" ms");
-  painter.text(9, 9, line.view(), kShadow);
-  painter.text(8, 8, line.view(), kWhite);
+  put(line.view());
 
   FixedString<64> faces;
   faces.assign(failed_ ? "" : active_textured_ ? "Faces: logo texture" : texture_available_ ? "Faces: flat colors" : "Faces: flat colors (no texture support)");
-  painter.text(9, 63, faces.view(), kShadow);
-  painter.text(8, 62, faces.view(), kWhite);
+  put(faces.view());
 
   // The benchmark: where a frame's time goes, and how it has varied since the adapter or the faces were switched.
   if (bench_frames_) {
@@ -240,8 +274,7 @@ void CubeView::paint(gui::Painter& painter) {
     split.append("   readback: ");
     append_ms(split, readback_us_);
     split.append(" ms");
-    painter.text(9, 81, split.view(), kShadow);
-    painter.text(8, 80, split.view(), kWhite);
+    put(split.view());
     FixedString<96> spread;
     spread.assign("avg ");
     append_ms(spread, bench_average_us());
@@ -250,33 +283,7 @@ void CubeView::paint(gui::Painter& painter) {
     spread.append("  max ");
     append_ms(spread, bench_worst_us_);
     spread.append(" ms");
-    painter.text(9, 99, spread.view(), kShadow);
-    painter.text(8, 98, spread.view(), kWhite);
-  }
-
-  const bool gpu = active_accelerated_ && !failed_;
-  const uint32_t indicator = failed_ ? kRed : gpu ? kGreen : kAmber;
-  painter.fill({8, 28, 12, 12}, indicator);
-  painter.outline({8, 28, 12, 12}, kWhite);
-  FixedString<96> mode;
-  mode.assign(cube_api_name(api_));
-  mode.append(": ");
-  mode.append(failed_ ? "3D drawing failed" : gpu ? "GPU accelerated" : "Software (CPU)");
-  if (!failed_ && device_name_.view().size()) {
-    mode.append(" - ");
-    mode.append(device_name_.view());
-  }
-  painter.text(27, 27, mode.view(), kShadow);
-  painter.text(26, 26, mode.view(), indicator);
-  if (api_ == CubeApi::OpenGL && !failed_) {
-    painter.text(9, 45, "The kernel's GL draws on the CPU", kShadow);
-    painter.text(8, 44, "The kernel's GL draws on the CPU", kAmber);
-  } else if (!gpu_available() && !failed_) {   // say why, so the machine's setup can be fixed
-    FixedString<128> why;
-    why.assign("No GPU: ");
-    why.append(software_reason());
-    painter.text(9, 45, why.view(), kShadow);
-    painter.text(8, 44, why.view(), kAmber);
+    put(spread.view());
   }
   if (gui::Window* w = window()) w->request_frame_interval(kFrameIntervalUs);
   invalidate();   // the next frame, as soon as the render loop is ready (at the display's pace)
@@ -285,16 +292,20 @@ void CubeView::paint(gui::Painter& painter) {
 // --- The window ------------------------------------------------------------------------------------
 
 Graphics3DTest::Graphics3DTest(allocators::IAllocator& allocator)
-    : Frame(allocator), view_(allocator), bar_(allocator), gpu_box_(allocator), texture_box_(allocator), api_bar_(allocator), direct3d_button_(allocator), vulkan_button_(allocator),
-      opengl_button_(allocator) {
+    : Frame(allocator), view_(allocator), controls_(allocator), bar_(allocator), gpu_box_(allocator), texture_box_(allocator), api_bar_(allocator), api_label_(allocator),
+      direct3d_button_(allocator), vulkan_button_(allocator), opengl_button_(allocator) {
   set_title("3D Test");
-  set_bounds({100, 60, 440, 406});
+  set_bounds({100, 60, 440, 406 + kStatusLines * kLineHeight + 2 * kStatusPad});   // (the picture, the status lines under it, the two rows of controls)
   set_padding(gui::Insets::all(4));
   set_minimize_enabled(true);
 
+  // The controls: one panel along the bottom with the API row above the check boxes, added in that order, so that Tab goes through them in
+  // reading order (two panels docked to the bottom would be in the tree the other way round).
+  controls_.set_style(gui::PanelStyle::Transparent);
+  controls_.set_dock(gui::DockStyle::Bottom);
+  controls_.set_size(0, 52);
   bar_.set_style(gui::PanelStyle::Sunken);
-  bar_.set_dock(gui::DockStyle::Bottom);
-  bar_.set_size(0, 26);
+  bar_.set_dock(gui::DockStyle::Fill);
   gpu_box_.set_text("Use GPU acceleration");
   gpu_box_.set_dock(gui::DockStyle::Fill);
   gpu_box_.set_checked(true);
@@ -307,23 +318,28 @@ Graphics3DTest::Graphics3DTest(allocators::IAllocator& allocator)
   texture_box_.on_changed({&Graphics3DTest::on_texture_changed, this});
   bar_.add(&texture_box_);
   bar_.add(&gpu_box_);
-  // The API: one row of radio buttons under the check boxes.
+  // The API: one row of radio buttons above the check boxes, behind the label that names the group.
   api_bar_.set_style(gui::PanelStyle::Sunken);
-  api_bar_.set_dock(gui::DockStyle::Bottom);
+  api_bar_.set_dock(gui::DockStyle::Top);
   api_bar_.set_size(0, 26);
+  api_label_.set_text("Draw with:");
+  api_label_.set_dock(gui::DockStyle::Left);
+  api_label_.set_size(92, 0);
+  api_bar_.add(&api_label_);
   for (uint32_t i = 0; i < kCubeApiCount; ++i) {
     gui::RadioButton& b = api_button(static_cast<CubeApi>(i));
     b.set_text(cube_api_name(static_cast<CubeApi>(i)));
     b.set_group(&api_group_);
     b.set_dock(gui::DockStyle::Left);
-    b.set_size(110, 0);
+    b.set_size(104, 0);
     b.on_changed({&Graphics3DTest::on_api_changed, this});
     api_bar_.add(&b);
   }
   direct3d_button_.set_checked(true);
   view_.set_dock(gui::DockStyle::Fill);
-  add(&api_bar_);
-  add(&bar_);
+  controls_.add(&api_bar_);
+  controls_.add(&bar_);
+  add(&controls_);
   add(&view_);
 }
 

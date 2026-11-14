@@ -174,6 +174,11 @@ class Window final : public Control {
     key_filter_context_ = context;
   }
 
+  // --- The modifier keys held (modifier:: bits) as of the last input event. Pointer events carry none of their own, so a control that gives
+  // Shift+click or Ctrl+click a meaning (a list with an extended selection) asks here. Whoever feeds the window its input keeps it up to date.
+  void set_held_modifiers(uint8_t modifiers) { __atomic_store_n(&held_modifiers_, modifiers, __ATOMIC_RELEASE); }
+  uint8_t held_modifiers() const { return __atomic_load_n(&held_modifiers_, __ATOMIC_ACQUIRE); }
+
   // --- Drag and drop between controls (also in different windows of the manager). A control that sees the mouse move far enough
   // with the button held calls begin_drag() with what it carries (`text`, e.g. a file's full path); the pointer then shows the last
   // part of the text. When the button is released the controls under the pointer are asked accept_drop() (the nearest first) and the
@@ -259,6 +264,7 @@ class Window final : public Control {
   Control* popup_owner_ = nullptr;
   KeyFilter key_filter_ = nullptr;
   void* key_filter_context_ = nullptr;
+  uint8_t held_modifiers_ = 0;                  // (atomic: set by the input pump, read by controls)
   Control* drag_source_ = nullptr;
   String drag_text_, drag_label_;
   Control* drop_target_ = nullptr;   // the drop waiting for the handler thread

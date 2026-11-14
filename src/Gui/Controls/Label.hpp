@@ -22,7 +22,8 @@
 
 namespace gui {
 
-// One line of text, vertically centered.
+// One line of text, vertically centered. A label that ends in a colon names the control after it: it carries that control's access key (see
+// AccessKey.hpp), and Alt+letter moves the focus there.
 class Label : public Control {
  public:
   explicit Label(allocators::IAllocator& allocator) : Control(allocator), text_(allocator) {}
@@ -30,9 +31,11 @@ class Label : public Control {
   StringView text() const { return text_.view(); }
   void paint(Painter& painter) override;
   bool wheel_to_parent() const override { return true; }
+  void access_activate(uint32_t label) override;
 
  protected:
   Size default_size() const override { return {Painter::text_width(text_.view()) + 8, 22}; }
+  StringView access_text() const override { return text_.view().ends_with(":") ? text_.view() : StringView(); }
 
  private:
   String text_;
