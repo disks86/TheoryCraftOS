@@ -263,7 +263,8 @@ bool DesktopBridge::fill_info(const user::TopLevelInfo& info, desktop::WindowsWi
 // The surface is drawn from where it lives, under the lock (no program draws on it meanwhile). Its pixels are B, G, R, X bytes, which is the desktop's own format
 // (0x..RRGGBB words): Replace copies each row as it is.
 // The surface of an unaware program's window is in units (drawn as it is); an aware one's is in device pixels, shrunk here to units (the desktop at scale
-// 1, or a renderer that cannot draw on the device) or drawn 1:1 by draw_window_scaled.
+// 1, or a renderer that cannot draw on the device) or drawn 1:1 by draw_window_scaled. A system-aware program's, after the scale grew, is in pixels of
+// the scale it started at: resampled to units here, or enlarged by the ratio on the device.
 bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer, int32_t x, int32_t y, uint32_t* width, uint32_t* height) {
   user_misc::SystemLock lock;
   const uint32_t id = user::top_level_surface_locked(window);
@@ -275,10 +276,12 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
   s.pixels = pixels;
   s.width = s.pitch = w;
   s.height = h;
-  const bool device = scale_ > 100 && user::top_level_dpi_aware_locked(window);
-  const uint32_t uw = device ? uint32_t(graphics::device_to_units(int32_t(w), scale_)) : w, uh = device ? uint32_t(graphics::device_to_units(int32_t(h), scale_)) : h;
+  const uint32_t k = user::top_level_surface_scale_locked(window);
+  const bool resample = k != scale_;      // (a surface in units is drawn as it is)
+  const uint32_t uw = resample ? uint32_t(graphics::device_to_units(graphics::units_to_device(int32_t(w), k), scale_)) : w;
+  const uint32_t uh = resample ? uint32_t(graphics::device_to_units(graphics::units_to_device(int32_t(h), k), scale_)) : h;
   renderer.set_blend(graphics::BlendMode::Replace);
-  if (device) renderer.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
+  if (resample) renderer.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, uw, uh}, graphics::ImageFilter::Bilinear);
   else renderer.draw_image(s, {0, 0, w, h}, x, y);
   renderer.set_blend(graphics::BlendMode::Alpha);
   *width = uw;
@@ -288,7 +291,8 @@ bool DesktopBridge::draw_window(uint32_t window, graphics::IRenderer2D& renderer
 
 bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& device, int32_t x, int32_t y, uint32_t scale, uint32_t* width, uint32_t* height) {
   user_misc::SystemLock lock;
-  if (scale != scale_ || scale <= 100 || !user::top_level_dpi_aware_locked(window)) return false;      // (unaware: the desktop enlarges its units)
+  const uint32_t k = user::top_level_surface_scale_locked(window);
+  if (scale != scale_ || scale <= 100 || k == scale_) return false;      // (a surface in units: the desktop enlarges it with everything else)
   const uint32_t id = user::top_level_surface_locked(window);
   if (id == 0) return false;
   uint32_t w = 0, h = 0;
@@ -298,11 +302,14 @@ bool DesktopBridge::draw_window_scaled(uint32_t window, graphics::IRenderer2D& d
   s.pixels = pixels;
   s.width = s.pitch = w;
   s.height = h;
+  // device pixels 1:1, or (a system-aware program's after the scale grew) its pixels enlarged by the ratio
+  const uint32_t dw = uint32_t(graphics::units_to_device(int32_t(w), k)), dh = uint32_t(graphics::units_to_device(int32_t(h), k));
   device.set_blend(graphics::BlendMode::Replace);
-  device.draw_image(s, {0, 0, w, h}, x, y);
+  if (k == 100) device.draw_image(s, {0, 0, w, h}, x, y);
+  else device.draw_image_scaled(s, {0, 0, float(w), float(h)}, {x, y, dw, dh}, graphics::ImageFilter::Bilinear);
   device.set_blend(graphics::BlendMode::Alpha);
-  *width = uint32_t(graphics::device_to_units(int32_t(w), scale));
-  *height = uint32_t(graphics::device_to_units(int32_t(h), scale));
+  *width = uint32_t(graphics::device_to_units(int32_t(dw), scale));
+  *height = uint32_t(graphics::device_to_units(int32_t(dh), scale));
   return true;
 }
 

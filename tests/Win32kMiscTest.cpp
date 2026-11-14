@@ -998,9 +998,12 @@ void test_monitors() {
   CHECK(one(p, 12, 0x77) == 0 && last_error(p) == kErrorInvalidParameter);
   // handing back a context marked as the process's makes the thread follow the process again
   CHECK(one(p, 12, 0x22) == (0x6011u | 0x80000000u) && one(p, 12, 0x6011u | 0x80000000u) == 0x22 && one(p, 12, 0) == (0x6011u | 0x80000000u));
-  // a system DPI of 144: unaware threads keep seeing 96, aware ones see 144
+  // a system DPI of 144: unaware threads keep seeing 96, system-aware ones the 96 they were set at (as on Windows), per-monitor aware ones see 144
   user_misc::set_system_dpi(144);
-  CHECK(one(p, 9, 2) == 26 && p.call(N::NtUserGetDpiForCurrentProcess) == 144 && user_misc::dpi_for_monitor(mon) == 144);
+  CHECK(one(p, 9, 2) == 17 && p.call(N::NtUserGetDpiForCurrentProcess) == 96 && user_misc::dpi_for_monitor(mon) == 144);
+  CHECK(one(p, 12, 0x22) == (0x6011u | 0x80000000u));
+  CHECK(one(p, 9, 2) == 26 && p.call(N::NtUserGetDpiForCurrentProcess) == 144);
+  CHECK(one(p, 12, 0x6011u | 0x80000000u) == 0x22);
   Program unaware(151);
   setup(unaware);
   CHECK(one(unaware, 9, 2) == 17 && unaware.call(N::NtUserGetDpiForCurrentProcess) == 96 && unaware.call(N::NtUserGetSystemDpiForProcess, ~0ull) == 96);

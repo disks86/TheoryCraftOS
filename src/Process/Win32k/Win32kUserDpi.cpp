@@ -38,11 +38,39 @@ void set_device_scale(uint32_t scale) {
   user_misc::set_system_dpi(96 * g_device_scale / 100);
 }
 
-uint32_t window_scale(const Window* w) { return w && w->dpi_virtual ? g_device_scale : 100; }
+// A system-aware context carries the system DPI of when it was set (normalize_context): the program keeps working at that DPI, as on Windows. When the
+// device scale has grown since, its coordinates are virtualized by the ratio, as an unaware program's are by the scale. (When the scale has shrunk, it
+// works in device pixels: virtualization only enlarges.)
+uint32_t system_aware_scale(uint32_t context) {
+  if ((context & 0x0F) != 1) return 100;
+  const uint32_t dpi = (context >> 8) & 0x1FF;
+  if (dpi == 0) return 100;
+  const uint32_t k = 96 * g_device_scale / dpi;
+  return k > 100 ? graphics::clamp_scale_percent(k) : 100;
+}
+
+uint32_t window_scale(const Window* w) {
+  if (!w) return 100;
+  return w->dpi_virtual ? g_device_scale : system_aware_scale(w->dpi_context);
+}
 
 bool thread_unaware(Call& call) { return user_misc::dpi_awareness(call.tid(), call.pid()) == 0; }
 
-uint32_t caller_scale(Call& call) { return g_device_scale > 100 && thread_unaware(call) ? g_device_scale : 100; }
+uint32_t caller_scale(Call& call) {
+  if (thread_unaware(call)) return g_device_scale;
+  return system_aware_scale(user_misc::dpi_context_of(call.tid(), call.pid()));
+}
+
+uint32_t window_working_dpi(const Window* w) {
+  if (!w || w->dpi_virtual) return 96;
+  if ((w->dpi_context & 0x0F) == 1 && ((w->dpi_context >> 8) & 0x1FF) != 0) return (w->dpi_context >> 8) & 0x1FF;
+  return 96 * g_device_scale / 100;
+}
+
+uint32_t dpi_kind(const Window* w) {
+  if (w->dpi_virtual) return 1;
+  return (w->dpi_context & 0x0F) == 1 ? 0x10000u | ((w->dpi_context >> 8) & 0x1FF) : 0;
+}
 uint32_t caller_dpi_scale(Call& call) { return caller_scale(call); }
 gdi::Rect rect_for_caller(Call& call, const gdi::Rect& r) { return dpi_down(r, caller_scale(call)); }
 
@@ -113,7 +141,7 @@ Window* dpi_drawing_root(Window* w) {
 bool adopt_tree_awareness(Window* w, Window* parent, bool mixed_allowed) {
   Window* root = dpi_drawing_root(parent);
   if (!root) return true;
-  if (w->dpi_virtual == root->dpi_virtual) {
+  if (dpi_kind(w) == dpi_kind(root)) {
     if (w->dpi_mixed) drop_mixed_surface(w);
     w->dpi_mixed = false;
     return true;

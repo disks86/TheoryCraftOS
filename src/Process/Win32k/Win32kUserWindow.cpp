@@ -83,7 +83,7 @@ uint64_t create_step(Call& call, Op& op) {
       op.phase = 21;
       if (!has_proc) return create_step(call, op);
       const uint32_t k = window_scale(w);      // (in the window's coordinates; an aware window's metrics at the system's dpi)
-      const uint32_t dpi = k > 100 ? 96 : 96 * device_scale() / 100;
+      const uint32_t dpi = window_working_dpi(w);
       const Rect max = dpi_down(window_maximized_rect(w), k);
       gdi::Rect none{0, 0, 0, 0};
       adjust_window_rect(&none, w->style, w->ex_style, false, 0);      // (the frame, as negative left and top)
@@ -910,9 +910,10 @@ uint64_t nt_set_window_display_affinity(Call& call) { Window* w = window_arg(cal
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // NtUserCallHwnd
 
-// GetDpiForWindow: an unaware window works at 96 dpi (DPI virtualization), an aware one at the monitor's.
+// GetDpiForWindow: an unaware window works at 96 dpi (DPI virtualization), a system-aware one at the system DPI it started at, a per-monitor aware one
+// at the monitor's.
 uint32_t window_dpi(Window* w) {
-  if (w && w->dpi_virtual) return 96;
+  if (w && (w->dpi_virtual || (w->dpi_context & 0x0F) == 1)) return window_working_dpi(w);
   return user_misc::dpi_for_monitor(user_misc::monitor_from_point(0, 0, 1));
 }
 

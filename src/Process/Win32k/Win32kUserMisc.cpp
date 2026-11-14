@@ -103,7 +103,9 @@ uint32_t thread_dpi(Call& call) {
   uint32_t context = 0;
   if (ThreadRecord* t = find_thread_record(call.tid())) context = t->dpi_context;
   if (context == 0) if (ProcessRecord* p = find_process_record(call.pid())) context = p->dpi_context;
-  return (context & 0x0F) == 0 ? 96 : system_dpi();      // unaware (also: never set) threads see 96 dpi
+  if ((context & 0x0F) == 0) return 96;      // unaware (also: never set) threads see 96 dpi
+  if ((context & 0x0F) == 1 && ((context >> 8) & 0x1FF) != 0) return (context >> 8) & 0x1FF;      // system aware: the system DPI it was set at (normalize_context)
+  return system_dpi();
 }
 
 namespace {
