@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Font/FontFiles.hpp"
 #include "Font/FontSet.hpp"
 #include "Font/GlyphCache.hpp"
 #include "Font/GlyphRaster.hpp"
@@ -783,8 +786,55 @@ static void test_bundled_corruption() {
   }
 }
 
+// The bundled fonts as TrueType files (for Linux programs' fontconfig): every face, each a font that parses, under its family's name; a second call
+// writes nothing; a file already there is kept.
+static void test_font_files() {
+  TestAllocator a;
+  {
+    filesystem::RamFileSystem fs(a);
+    CHECK(fs.create_directory("/Linux") == filesystem::Status::Ok);
+    CHECK(font::write_bundled_fonts(a, fs, "/Linux/usr/share/fonts/TheoryCraftOS"));
+    UniquePointer<filesystem::IDirectory> dir;
+    CHECK(fs.open_directory("/Linux/usr/share/fonts/TheoryCraftOS", &dir) == filesystem::Status::Ok);
+    int files = 0, parsed = 0;
+    filesystem::DirectoryEntry e;
+    while (dir && dir->next(&e) == filesystem::Status::Ok) {
+      ++files;
+      std::string path = "/Linux/usr/share/fonts/TheoryCraftOS/" + std::string(e.name.view().data(), e.name.view().size());
+      UniquePointer<filesystem::IFile> f;
+      if (fs.open_file(path.c_str(), filesystem::OpenMode::Read, &f) != filesystem::Status::Ok) continue;
+      std::string bytes(f->size(), '\0');
+      uint64_t got = 0;
+      f->read(0, ByteView(reinterpret_cast<uint8_t*>(bytes.data()), bytes.size()), &got);
+      font::TrueTypeFont ttf(a);
+      if (got == bytes.size() && ttf.parse(ConstByteView(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size())) && ttf.glyph_count() > 100) ++parsed;
+    }
+    const uint64_t faces = font::bundled_sans_faces().size() + font::bundled_serif_faces().size() + font::bundled_mono_faces().size() + font::bundled_fallback_faces().size();
+    CHECK(files == int(faces) && parsed == files && faces == 13);
+    filesystem::DirectoryEntry sans;
+    CHECK(fs.stat("/Linux/usr/share/fonts/TheoryCraftOS/TCOS-Sans-BoldItalic.ttf", &sans) == filesystem::Status::Ok && sans.size > 10000);
+    // again: nothing changes; a file someone put there stays
+    UniquePointer<filesystem::IFile> mine;
+    CHECK(fs.open_file("/Linux/usr/share/fonts/TheoryCraftOS/TCOS-Mono-Regular.ttf", filesystem::OpenMode::CreateTruncate, &mine) == filesystem::Status::Ok);
+    uint64_t n = 0;
+    CHECK(mine->write(0, ConstByteView(reinterpret_cast<const uint8_t*>("mine"), 4), &n) == filesystem::Status::Ok);
+    mine = UniquePointer<filesystem::IFile>();
+    CHECK(font::write_bundled_fonts(a, fs, "/Linux/usr/share/fonts/TheoryCraftOS"));
+    filesystem::DirectoryEntry kept;
+    CHECK(fs.stat("/Linux/usr/share/fonts/TheoryCraftOS/TCOS-Mono-Regular.ttf", &kept) == filesystem::Status::Ok && kept.size == 4);
+    // a file where a folder should be
+    filesystem::RamFileSystem other(a);
+    UniquePointer<filesystem::IFile> blocker;
+    CHECK(other.open_file("/usr", filesystem::OpenMode::CreateTruncate, &blocker) == filesystem::Status::Ok);
+    blocker = UniquePointer<filesystem::IFile>();
+    CHECK(!font::write_bundled_fonts(a, other, "/usr/share/fonts"));
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
+  test_font_files();
   test_parse_and_metrics();
   test_outlines();
   test_raster();

@@ -80,6 +80,14 @@ subshells in the built-in shell: what they change of the variables, `"$@"` and t
 The file systems keep no Unix permissions, so `stat` reports every file as executable (0755, or 0555 read-only), as Linux shows a FAT volume with
 the default masks and as `access(X_OK)` already answered. Launchers check the bit before they run a program or a shell (sharun's `is_exe`).
 
+## Fonts
+
+The OS's fonts are built into the kernel (src/Font), so Linux programs, whose fontconfig looks for font files, would find none and draw every
+letter as a box. Before a Linux program starts, `font::write_bundled_fonts` (src/Font/FontFiles.hpp) writes them, decoded to TrueType, to
+`/usr/share/fonts/TheoryCraftOS` of the Linux tree (TCOS Sans, Serif and Mono in four styles, and the fallback face); files already there are
+kept, so this costs a `stat` each after the first time. There is no `/etc/fonts/fonts.conf`: programs that bring their own (AppImages do) find the
+fonts, others depend on fontconfig's built-in defaults.
+
 ## Not done
 
 - **x86-64 only in practice.** The loader is not specific to x86-64, but the development machine has no AArch64 or RISC-V C library to test with.

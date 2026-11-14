@@ -70,7 +70,7 @@ for t in "${WANTED[@]}"; do
   case $t in
     UrlCanonTest) build_and_run UrlCanonTest tests/UrlCanonTest.cpp ;;
     GraphicsConsoleTest) build_and_run GraphicsConsoleTest tests/GraphicsConsoleTest.cpp src/GraphicsConsole.cpp ;;
-    FontTest) build_and_run FontTest tests/FontTest.cpp tests/KernelStubs.cpp src/Font/*.cpp src/Media/Zlib.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp ;;
+    FontTest) build_and_run FontTest tests/FontTest.cpp tests/KernelStubs.cpp src/Font/*.cpp src/Media/Zlib.cpp src/Hardware/GraphicsProcessingUnit/Font8x16.cpp src/FileSystem/Ram/*.cpp src/FileSystem/FileSystemTypes.cpp src/Kernel/Sync.cpp ;;
     DashTest) build_and_run DashTest tests/DashTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp $media \
                 src/Hardware/VideoCodec/*.cpp src/Hardware/VideoCodec/Intel/*.cpp src/Hardware/VideoCodec/AMD/*.cpp src/Hardware/Platform/AMD/*.cpp src/Hardware/VideoCodec/NVIDIA/*.cpp src/Hardware/GraphicsProcessingUnit/AMD/*.cpp src/Hardware/GraphicsProcessingUnit/NVIDIA/*.cpp src/Hardware/GraphicsProcessingUnit/Intel/*.cpp src/Hardware/VideoCodec/Software/*.cpp src/Video/*.cpp src/Math/FloatMath.cpp \
                 src/Audio/Resampler.cpp src/Audio/AudioStream.cpp src/Audio/AudioMixer.cpp src/Audio/AudioPlayer.cpp ;;

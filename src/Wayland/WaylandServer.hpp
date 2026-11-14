@@ -542,6 +542,10 @@ class Server final : public desktop::IWindowsSession {
   void forget_exports(Surface& s);
   void actual_size(const Surface& s, int32_t* w, int32_t* h) const;
   static ArrayView<uint32_t> buffer_pixels(const BufferInfo& b);
+  // What the renderer draws a wl_shm or YUV buffer from: its pixels and the words between rows, a graphics::Surface of `height` rows of that pitch being
+  // valid only if every row is there in full. When the last row's padding is missing from the pool, the rows are copied into *tight. False if there is
+  // nothing to draw.
+  bool drawable_pixels(const BufferInfo& b, List<uint32_t>* tight, ArrayView<uint32_t>* pixels, uint32_t* pitch);
   void copy_region(Client& c, uint32_t region, SharedPointer<RegionRects>* out, uint32_t from);
   void dismiss_popup(Surface& s);
   void release_buffer(Client& c, const BufferInfo& b);
