@@ -66,7 +66,20 @@ struct ReflectedAttribute {
   const char* js;
   const char* attribute;
   Reflect kind;
+  const char* tags = nullptr;   // the elements that have it (names with spaces between); nullptr: every element
 };
+
+// True if `tags` (names with spaces between, or nullptr for all) lists the element.
+bool tag_listed(const dom::Node* n, const char* tags) {
+  if (!tags) return true;
+  StringView rest(tags);
+  while (!rest.empty()) {
+    const uint64_t space = rest.find(' '), end = space == StringView::npos ? rest.size() : space;
+    if (n->name.view().equals(rest.substr(0, end))) return true;
+    rest = end < rest.size() ? rest.substr(end + 1) : StringView();
+  }
+  return false;
+}
 const ReflectedAttribute kReflected[] = {
     {"id", "id", Reflect::Str}, {"className", "class", Reflect::Str}, {"title", "title", Reflect::Str}, {"lang", "lang", Reflect::Str}, {"dir", "dir", Reflect::Str},
     {"hidden", "hidden", Reflect::Bool}, {"accessKey", "accesskey", Reflect::Str}, {"tabIndex", "tabindex", Reflect::Int}, {"href", "href", Reflect::Url},
@@ -82,7 +95,129 @@ const ReflectedAttribute kReflected[] = {
     {"autocomplete", "autocomplete", Reflect::Str}, {"media", "media", Reflect::Str}, {"role", "role", Reflect::NullableStr}, {"srcset", "srcset", Reflect::Str},
     {"label", "label", Reflect::Str}, {"scope", "scope", Reflect::Str}, {"headers", "headers", Reflect::Str}, {"enctype", "enctype", Reflect::Str},
     {"noValidate", "novalidate", Reflect::Bool}, {"srcdoc", "srcdoc", Reflect::Str}, {"sandbox", "sandbox", Reflect::Str}, {"allow", "allow", Reflect::Str}, {"useMap", "usemap", Reflect::Str}, {"loading", "loading", Reflect::Str}, {"crossOrigin", "crossorigin", Reflect::NullableStr},
+    // attributes of particular elements (a property of this name on another element is the script's own)
+    {"hreflang", "hreflang", Reflect::Str, "a link"}, {"ping", "ping", Reflect::Str, "a area"}, {"coords", "coords", Reflect::Str, "a area"}, {"shape", "shape", Reflect::Str, "a area"},
+    {"rev", "rev", Reflect::Str, "a link"}, {"sizes", "sizes", Reflect::Str, "img source"}, {"integrity", "integrity", Reflect::Str, "link script"}, {"accept", "accept", Reflect::Str, "input"},
+    {"dirName", "dirname", Reflect::Str, "input textarea"}, {"formTarget", "formtarget", Reflect::Str, "button input"}, {"imageSrcset", "imagesrcset", Reflect::Str, "link"},
+    {"imageSizes", "imagesizes", Reflect::Str, "link"}, {"dateTime", "datetime", Reflect::Str, "time del ins"}, {"httpEquiv", "http-equiv", Reflect::Str, "meta"},
+    {"acceptCharset", "accept-charset", Reflect::Str, "form"}, {"abbr", "abbr", Reflect::Str, "td th"}, {"vAlign", "valign", Reflect::Str, "td th tr col colgroup thead tbody tfoot"},
+    {"align", "align", Reflect::Str, "div p h1 h2 h3 h4 h5 h6 img iframe table td th tr col colgroup thead tbody tfoot caption hr legend input object embed"},
+    {"bgColor", "bgcolor", Reflect::Str, "body table td th tr"}, {"border", "border", Reflect::Str, "img table object"}, {"cellPadding", "cellpadding", Reflect::Str, "table"},
+    {"cellSpacing", "cellspacing", Reflect::Str, "table"}, {"frameBorder", "frameborder", Reflect::Str, "iframe frame"}, {"scrolling", "scrolling", Reflect::Str, "iframe frame"},
+    {"marginWidth", "marginwidth", Reflect::Str, "iframe frame"}, {"marginHeight", "marginheight", Reflect::Str, "iframe frame"}, {"srclang", "srclang", Reflect::Str, "track"},
+    {"event", "event", Reflect::Str, "script"}, {"link", "link", Reflect::Str, "body"}, {"vLink", "vlink", Reflect::Str, "body"}, {"aLink", "alink", Reflect::Str, "body"},
+    {"background", "background", Reflect::Str, "body"}, {"color", "color", Reflect::Str, "font basefont"}, {"face", "face", Reflect::Str, "font"}, {"summary", "summary", Reflect::Str, "table"},
+    {"rules", "rules", Reflect::Str, "table"}, {"frame", "frame", Reflect::Str, "table"}, {"ch", "char", Reflect::Str, "td th tr col colgroup thead tbody tfoot"},
+    {"chOff", "charoff", Reflect::Str, "td th tr col colgroup thead tbody tfoot"}, {"axis", "axis", Reflect::Str, "td th"}, {"clear", "clear", Reflect::Str, "br"},
+    {"standby", "standby", Reflect::Str, "object"}, {"archive", "archive", Reflect::Str, "object"}, {"code", "code", Reflect::Str, "object"}, {"codeType", "codetype", Reflect::Str, "object"},
+    {"version", "version", Reflect::Str, "html"}, {"scheme", "scheme", Reflect::Str, "meta"}, {"wrap", "wrap", Reflect::Str, "textarea"}, {"valueType", "valuetype", Reflect::Str, "param"},
+    {"nonce", "nonce", Reflect::Str, "script style link"},
+    {"isMap", "ismap", Reflect::Bool, "img"}, {"noModule", "nomodule", Reflect::Bool, "script"}, {"allowFullscreen", "allowfullscreen", Reflect::Bool, "iframe"},
+    {"formNoValidate", "formnovalidate", Reflect::Bool, "button input"}, {"inert", "inert", Reflect::Bool}, {"noWrap", "nowrap", Reflect::Bool, "td th"},
+    {"compact", "compact", Reflect::Bool, "dl ol ul menu dir"}, {"noResize", "noresize", Reflect::Bool, "frame"}, {"noShade", "noshade", Reflect::Bool, "hr"},
+    {"noHref", "nohref", Reflect::Bool, "area"}, {"default", "default", Reflect::Bool, "track"}, {"playsInline", "playsinline", Reflect::Bool, "video"}, {"declare", "declare", Reflect::Bool, "object"},
+    {"cite", "cite", Reflect::Url, "blockquote q del ins"}, {"longDesc", "longdesc", Reflect::Url, "img iframe frame"}, {"poster", "poster", Reflect::Url, "video"},
+    {"codeBase", "codebase", Reflect::Url, "object"}, {"data", "data", Reflect::Url, "object"}, {"lowsrc", "lowsrc", Reflect::Url, "img"}, {"manifest", "manifest", Reflect::Url, "html"},
+    {"hspace", "hspace", Reflect::Int, "img object"}, {"vspace", "vspace", Reflect::Int, "img object"},
 };
+
+// Enumerated attributes: the property is the keyword the attribute's value stands for (compared without case), `missing` while the attribute is absent
+// (nullptr: null) and `invalid` for anything else.
+struct EnumeratedAttribute {
+  const char* js;
+  const char* attribute;
+  const char* tags;
+  const char* keywords;
+  const char* missing;
+  const char* invalid;
+};
+#define TCOS_FORM_ENCODINGS "application/x-www-form-urlencoded multipart/form-data text/plain"
+const EnumeratedAttribute kEnumerated[] = {
+    {"dir", "dir", nullptr, "ltr rtl auto", "", ""},
+    {"method", "method", "form", "get post dialog", "get", "get"},
+    {"enctype", "enctype", "form", TCOS_FORM_ENCODINGS, "application/x-www-form-urlencoded", "application/x-www-form-urlencoded"},
+    {"encoding", "enctype", "form", TCOS_FORM_ENCODINGS, "application/x-www-form-urlencoded", "application/x-www-form-urlencoded"},
+    {"formMethod", "formmethod", "button input", "get post dialog", "", "get"},
+    {"formEnctype", "formenctype", "button input", TCOS_FORM_ENCODINGS, "", "application/x-www-form-urlencoded"},
+    {"crossOrigin", "crossorigin", nullptr, "anonymous use-credentials", nullptr, "anonymous"},
+    {"referrerPolicy", "referrerpolicy", "a area img iframe link script",
+     "no-referrer no-referrer-when-downgrade same-origin origin strict-origin origin-when-cross-origin strict-origin-when-cross-origin unsafe-url", "", ""},
+    {"loading", "loading", "img iframe", "lazy eager", "eager", "eager"},
+    {"decoding", "decoding", "img", "async sync auto", "auto", "auto"},
+    {"fetchPriority", "fetchpriority", "img link script", "high low auto", "auto", "auto"},
+    {"type", "type", "button", "submit reset button", "submit", "submit"},
+    {"scope", "scope", "th", "row col rowgroup colgroup", "", ""},
+    {"autocomplete", "autocomplete", "form", "on off", "on", "on"},
+    {"inputMode", "inputmode", nullptr, "none text tel url email numeric decimal search", "", ""},
+    {"enterKeyHint", "enterkeyhint", nullptr, "enter done go next previous search send", "", ""},
+    {"kind", "kind", "track", "subtitles captions descriptions chapters metadata", "subtitles", "metadata"},
+    {"as", "as", "link", "fetch audio audioworklet document embed font frame iframe image json manifest object paintworklet report script serviceworker sharedworker style track video worker xslt", "", ""},
+};
+#undef TCOS_FORM_ENCODINGS
+
+const EnumeratedAttribute* find_enumerated(const dom::Node* n, StringView js) {
+  for (const EnumeratedAttribute& e : kEnumerated)
+    if (js.equals(e.js) && tag_listed(n, e.tags)) return &e;
+  return nullptr;
+}
+
+// The keyword of an enumerated attribute that `value` stands for (ASCII case does not matter), or nullptr.
+StringView enumerated_keyword(const EnumeratedAttribute& e, StringView value) {
+  StringView rest(e.keywords);
+  while (!rest.empty()) {
+    const uint64_t space = rest.find(' '), end = space == StringView::npos ? rest.size() : space;
+    const StringView word = rest.substr(0, end);
+    if (word.size() == value.size()) {
+      bool same = true;
+      for (uint64_t i = 0; i < word.size() && same; ++i) {
+        const char ch = value[i];
+        same = (ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + 32) : ch) == word[i];
+      }
+      if (same) return word;
+    }
+    rest = end < rest.size() ? rest.substr(end + 1) : StringView();
+  }
+  return StringView();
+}
+
+// HTML's "rules for parsing integers": white space, an optional sign, digits; anything after them is ignored. False when there is no number.
+bool parse_html_integer(StringView text, double* out) {
+  uint64_t i = 0;
+  while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\f' || text[i] == '\r')) ++i;
+  bool negative = false;
+  if (i < text.size() && (text[i] == '-' || text[i] == '+')) negative = text[i++] == '-';
+  if (i >= text.size() || text[i] < '0' || text[i] > '9') return false;
+  double value = 0;
+  for (; i < text.size() && text[i] >= '0' && text[i] <= '9'; ++i) value = value * 10 + (text[i] - '0');
+  *out = negative ? -value : value;
+  return true;
+}
+
+// What tabIndex is without a tabindex attribute: 0 for what takes the focus by itself, -1 for the rest.
+bool focusable_by_default(const dom::Node* n) {
+  if (n->is_tag("a") || n->is_tag("area")) return dom::has_attribute(n, "href");
+  if (n->is_tag("summary")) return n->parent && n->parent->is_tag("details");
+  if (n->is_tag("audio") || n->is_tag("video")) return dom::has_attribute(n, "controls");
+  for (const char* tag : {"button", "input", "select", "textarea", "iframe", "frame", "object", "embed"})
+    if (n->is_tag(tag)) return true;
+  StringView editable;
+  return dom::get_attribute(n, "contenteditable", &editable) && !editable.equals("false");
+}
+
+// The value of a reflected integer attribute, by the rules of its kind (limited to a range, with a default when it is missing or not a number).
+double reflected_integer(const dom::Node* n, StringView js, bool present, StringView text) {
+  double v = 0;
+  const bool ok = present && parse_html_integer(text, &v) && v >= -2147483648.0 && v <= 2147483647.0;
+  if (js.equals("tabIndex")) return ok ? v : focusable_by_default(n) ? 0 : -1;
+  if (js.equals("maxLength") || js.equals("minLength")) return ok && v >= 0 ? v : -1;
+  if (js.equals("colSpan") || js.equals("span")) return ok && v >= 1 ? (v > 1000 ? 1000 : v) : 1;
+  if (js.equals("rowSpan")) return ok && v >= 0 ? (v > 65534 ? 65534 : v) : 1;
+  if (js.equals("size")) return ok && v >= 1 ? v : n->is_tag("input") ? 20 : 0;
+  if (js.equals("cols")) return ok && v >= 1 ? v : 20;
+  if (js.equals("rows")) return ok && v >= 1 ? v : 2;
+  if (js.equals("start")) return ok ? v : 1;
+  return ok && v >= 0 ? v : 0;   // (width, height, hspace, vspace: not negative)
+}
 
 // width, height, size, cols and rows are numbers on the elements that are sized in pixels or characters (img, canvas, video, input, select, textarea)
 // and the content attribute's text on the others that have them, where "50%" and "2*" are values.
@@ -98,9 +233,9 @@ bool size_is_text(const dom::Node* n, const char* property) {
 bool in_svg_namespace(const dom::Node* n) { return n->is_element() && n->ns_set && n->ns.view().equals("http://www.w3.org/2000/svg"); }
 bool svg_own_name(StringView js) { return js.equals("className") || js.equals("href") || js.equals("target") || js.equals("type") || js.equals("media") || js.equals("name") || js.equals("content") || js.equals("width") || js.equals("height") || js.equals("max") || js.equals("min") || js.equals("rel") || js.equals("download"); }
 
-const ReflectedAttribute* find_reflected(StringView js) {
+const ReflectedAttribute* find_reflected(const dom::Node* n, StringView js) {
   for (const ReflectedAttribute& r : kReflected)
-    if (js.equals(r.js)) return &r;
+    if (js.equals(r.js) && tag_listed(n, r.tags)) return &r;
   return nullptr;
 }
 
@@ -654,25 +789,25 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return false;   // (token lists, and the flag of a style sheet: the script's accessors)
   if (in_svg_namespace(n) && svg_own_name(k)) return false;
-  if (const ReflectedAttribute* r = find_reflected(k)) {
+  if (const EnumeratedAttribute* e = element ? find_enumerated(n, k) : nullptr) {
+    StringView v;
+    if (!dom::get_attribute(n, e->attribute, &v)) {
+      *out = e->missing ? str_value(vm, e->missing) : Value::make_null();
+    } else {
+      const StringView word = enumerated_keyword(*e, v);
+      *out = str_value(vm, !word.empty() ? word : StringView(e->invalid));
+    }
+    return true;
+  }
+  if (const ReflectedAttribute* r = find_reflected(n, k)) {
     StringView v;
     const bool present = dom::get_attribute(n, r->attribute, &v);
     switch (IS("value") && n->is_tag("li") ? Reflect::Int : r->kind == Reflect::Int && size_is_text(n, r->js) ? Reflect::Str : r->kind) {   // (an <li>'s value is a number)
       case Reflect::Bool: *out = bool_value(present); return true;
       case Reflect::NullableStr: *out = present ? str_value(vm, v) : Value::make_null(); return true;
-      case Reflect::Int: {
-        double d = r->js[0] == 't' ? -1 : 0;
-        if (present) {
-          uint64_t digits = 0;
-          bool negative = false, any = false;
-          StringView t = v.trimmed();
-          if (t.starts_with('-')) { negative = true; t = t.substr(1); }
-          for (uint64_t i = 0; i < t.size() && t[i] >= '0' && t[i] <= '9'; ++i) { digits = digits * 10 + static_cast<uint64_t>(t[i] - '0'); any = true; }
-          if (any) d = negative ? -static_cast<double>(digits) : static_cast<double>(digits);
-        }
-        *out = num_value(d);
+      case Reflect::Int:
+        *out = num_value(reflected_integer(n, r->js, present, v));
         return true;
-      }
       case Reflect::Url: {
         if (!present) { *out = str_value(vm, ""); return true; }
         String resolved(vm.allocator());
@@ -821,7 +956,15 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   }
   if ((IS("htmlFor") && n->is_tag("output")) || (IS("sandbox") && n->is_tag("iframe")) || (IS("disabled") && (n->is_tag("style") || n->is_tag("link")))) return HostClass::Set::NotHandled;
   if (in_svg_namespace(n) && svg_own_name(k)) return HostClass::Set::NotHandled;
-  if (const ReflectedAttribute* r = find_reflected(k)) {
+  if (const EnumeratedAttribute* e = element ? find_enumerated(n, k) : nullptr) {
+    if (!e->missing && value.is_nullish()) {   // (a nullable one: null takes the attribute away)
+      dom::remove_attribute(n, e->attribute);
+      return HostClass::Set::Handled;
+    }
+    if (!arg_string(vm, value, &text)) return HostClass::Set::Threw;
+    return done(dom::set_attribute(n, e->attribute, text.view()));
+  }
+  if (const ReflectedAttribute* r = find_reflected(n, k)) {
     switch (r->kind) {
       case Reflect::Bool:
         if (Vm::to_boolean(value)) return done(dom::set_attribute(n, r->attribute, ""));
@@ -832,14 +975,25 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
           dom::remove_attribute(n, r->attribute);
           return HostClass::Set::Handled;
         }
-        if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
-        if (r->kind == Reflect::Int && value.is_number()) {
+        if (r->kind == Reflect::Int && !size_is_text(n, r->js)) {   // (a number: converted the way WebIDL converts to a long)
+          double d = 0;
+          if (!vm.to_number(value, &d)) return HostClass::Set::Threw;
+          if (d != d || d - d != 0) d = 0;   // (NaN and the infinities are 0)
+          d = d < 0 ? -static_cast<double>(static_cast<uint64_t>(-d)) : static_cast<double>(static_cast<uint64_t>(d));
+          const StringView js(r->js);
+          if ((js.equals("maxLength") || js.equals("minLength")) && d < 0) {
+            throw_dom(vm, "IndexSizeError", "The value provided is negative.");
+            return HostClass::Set::Threw;
+          }
+          const bool unsigned_kind = !js.equals("tabIndex") && !js.equals("start") && !js.equals("maxLength") && !js.equals("minLength");
+          if (unsigned_kind && (d < 0 || d > 2147483647.0)) d = js.equals("colSpan") || js.equals("rowSpan") || js.equals("span") ? 1 : js.equals("size") || js.equals("cols") ? 20 : js.equals("rows") ? 2 : 0;
+          if (unsigned_kind && d == 0 && (js.equals("size") || js.equals("cols") || js.equals("rows") || js.equals("span") || js.equals("colSpan"))) d = reflected_integer(n, js, false, StringView());
           String number(vm.allocator());
-          const double d = value.u.number;
           if (d < 0) number.push_back('-');
           number.append_uint(static_cast<uint64_t>(d < 0 ? -d : d));
           return done(dom::set_attribute(n, r->attribute, number.view()));
         }
+        if (!arg_string(vm, value, &text)) return HostClass::Set::Threw;
         return done(dom::set_attribute(n, r->attribute, text.view()));
     }
   }
@@ -1128,7 +1282,9 @@ NATIVE(el_get_attribute) {
 NATIVE(el_set_attribute) {
   dom::Node* n = this_element(vm, self);
   String name(vm.allocator()), value(vm.allocator());
-  if (!n || !arg_text(vm, arg_at(args, argc, 0), &name) || !arg_text(vm, arg_at(args, argc, 1), &value)) return false;
+  if (!n) return false;
+  if (argc < 2) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'setAttribute' on 'Element': 2 arguments required.");
+  if (!arg_string(vm, args[0], &name) || !arg_string(vm, args[1], &value)) return false;   // (null is "null", undefined "undefined": WebIDL's DOMString)
   for (uint64_t i = 0; i < name.size(); ++i) {
     const char ch = name[i];
     if (is_space(ch) || ch == '/' || ch == '=' || ch == '>' || ch == '"' || ch == '\'' || ch == '<') return throw_dom(vm, "InvalidCharacterError", "The attribute name is not valid.");

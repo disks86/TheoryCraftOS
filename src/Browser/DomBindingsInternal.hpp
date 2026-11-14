@@ -52,7 +52,7 @@ struct NetJob {
 };
 
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()), named_names(v.allocator()), named_nodes(v.allocator()) {}
   ~Impl();   // waits for the request threads
   dom::Document* inert_document = nullptr;   // the document the contents of templates belong to as far as ownerDocument tells (made when first asked for)
   struct CustomValidity {
@@ -71,6 +71,11 @@ struct DomBindings::Impl {
                    *storage_proto = nullptr, *location_proto = nullptr, *history_proto = nullptr, *media_query_proto = nullptr, *exception_proto = nullptr,
                    *canvas_context_proto = nullptr, *gradient_proto = nullptr, *pattern_proto = nullptr, *path2d_proto = nullptr, *typed_array_proto = nullptr,
                    *image_data_proto = nullptr, *text_metrics_proto = nullptr, *thenable_proto = nullptr, *time_ranges_proto = nullptr, *media_error_proto = nullptr, *shadow_root_proto = nullptr;
+  // Named access on the window (window.someId): the names asked for since the document last changed, and the element each one is (nullptr: none).
+  uint64_t named_version = ~uint64_t{0};
+  List<String> named_names;
+  List<dom::Node*> named_nodes;
+  dom::Node* pre_activated = nullptr;         // the checkbox or radio button the click that was just dispatched already changed (see dispatch_event)
   bool style_dirty = false;                   // the page changed since a script was last told (see style_change_hook)
   script::JsObject *svg_proto = nullptr, *svg_tag_protos = nullptr;   // SVGElement.prototype, and local name -> the prototype of its interface (SVGRectElement.prototype ...)
   script::JsObject* tag_protos = nullptr;     // tag name -> the prototype of its interface (HTMLInputElement.prototype ...)
@@ -170,6 +175,9 @@ void set_interface(Vm& vm, JsObject* array, const char* name);
 
 // The text of a string-like argument ("" for undefined and null, ToString otherwise).
 bool arg_text(Vm& vm, const Value& v, String* out);
+// The text of an argument the way WebIDL converts to a DOMString: null is "null" and undefined is "undefined" (arg_text() makes both empty, which is what an
+// argument left out, or one that treats null as the empty string, wants).
+bool arg_string(Vm& vm, const Value& v, String* out);
 
 // The address of the page and the parts of it, for location and URL resolution.
 struct AddressParts {
@@ -216,7 +224,8 @@ uint32_t media_changed_impl(DomBindings::Impl& c);
 
 // Events (DomBindingsEvents.cpp).
 // (`object_target`: a script object that is the target, instead of a node or the window)
-bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target = nullptr);
+// `activation_target` (optional) gets the element a click activates (the first on the path with an activation behaviour), nullptr for other events.
+bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target = nullptr, dom::Node** activation_target = nullptr);
 Value make_event(DomBindings::Impl& c, StringView type, const EventInit& init, JsObject* proto = nullptr);
 
 // Styles (DomBindingsStyle.cpp).

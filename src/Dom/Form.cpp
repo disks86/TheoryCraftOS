@@ -328,6 +328,17 @@ void set_checked(Node* n, bool checked) {
   n->owner->touch();
 }
 
+Node* checked_radio_of_group(Node* radio) {
+  if (is_checked(radio)) return radio;
+  const StringView name = attr(radio, "name");
+  if (name.empty()) return nullptr;
+  Node* owner = form_owner(radio);
+  const Node* root = owner ? owner : radio->owner->root();
+  for (Node* d = root->first_child; d; d = next_in_tree(d, root))
+    if (d != radio && type_is(d, InputType::Radio) && attr(d, "name").equals(name) && form_owner(d) == owner && is_checked(d)) return d;
+  return nullptr;
+}
+
 int32_t selected_index(const Node* select) {
   List<Node*> options(select->owner->allocator());
   select_options(select, &options);

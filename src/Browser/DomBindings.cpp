@@ -115,6 +115,14 @@ bool arg_text(Vm& vm, const Value& v, String* out) {
   return true;
 }
 
+bool arg_string(Vm& vm, const Value& v, String* out) {
+  out->clear();
+  JsString* s;
+  if (!vm.to_string(v, &s)) return false;
+  out->assign(s->view());
+  return true;
+}
+
 void split_address(StringView address, AddressParts* out) {
   StringView rest = address;
   StringView hash;

@@ -683,9 +683,43 @@ class Parser {
       fail("Unexpected token");
       return false;
     }
-    *request = request_of(cur_.text);
+    const StringView specifier = cur_.text;
     next();
+    // import attributes: `with { type: "json" }` (and the older `assert`). A request with a type is another request than the plain one: the loader gets
+    // "specifier\x01type".
+    StringView type;
+    if ((is_word("with") || (is_word("assert") && !cur_.newline_before)) && attributes_ahead()) {
+      next();
+      next();   // `{`
+      while (!is(T::RBrace) && !is(T::Eof) && !failed_) {
+        if (!is(T::Ident) && !is(T::String)) return fail("Unexpected token"), false;
+        const StringView key = cur_.text;
+        next();
+        if (!accept(T::Colon) || !is(T::String)) return fail("Unexpected token"), false;
+        if (key.equals("type")) type = cur_.text;
+        next();
+        if (!accept(T::Comma)) break;
+      }
+      if (!expect(T::RBrace, "Unexpected token")) return false;
+    }
+    if (type.empty()) {
+      *request = request_of(specifier);
+    } else {
+      String both(arena_.allocator());
+      both.append(specifier);
+      both.push_back('\x01');
+      both.append(type);
+      *request = request_of(both.view());
+    }
     return !failed_;
+  }
+  // `with {` or `assert {` after a module specifier.
+  bool attributes_ahead() {
+    const Mark m = mark();
+    next();
+    const bool yes = is(T::LBrace);
+    rewind(m);
+    return yes;
   }
   void add_export(ExportEntry::Kind kind, StringView exported, StringView local, uint32_t request) {
     if (kind != ExportEntry::Star)
@@ -2675,9 +2709,15 @@ class Parser {
     next();
     Node* specifier = assignment(false);
     if (!specifier) return nullptr;
-    accept(T::Comma);
+    Node* options = nullptr;   // import(specifier, { with: { type: "json" } })
+    if (accept(T::Comma) && !is(T::RParen)) {
+      options = assignment(false);
+      if (!options) return nullptr;
+      accept(T::Comma);
+    }
     if (!expect(T::RParen, "Unexpected token")) return nullptr;
     Node* referrer = module_ ? new_member(new_ident("import.meta"), "url") : new_ident("undefined");
+    if (options) return new_call(new_ident("__dynamic_import"), {specifier, referrer, options});
     return new_call(new_ident("__dynamic_import"), {specifier, referrer});
   }
 

@@ -6678,7 +6678,6 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   if (!('moveBy' in g)) hide(g, 'moveBy', function () { });
   if (!('resizeBy' in g)) hide(g, 'resizeBy', function () { });
   if (!('find' in g)) hide(g, 'find', function () { return false; });
-  if (!('event' in g)) defineGetter(g, 'event', function () { return g.__current_event; });
   if (!('external' in g)) hide(g, 'external', { AddSearchProvider: function () { }, IsSearchProviderInstalled: function () { return 0; } });
   if (!('reportError' in g)) hide(g, 'reportError', function (error) {
     if (arguments.length < 1) throw typeErr("execute 'reportError' on 'Window'", '1 argument required, but only 0 present.');
@@ -8157,6 +8156,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(proto, name, function () {
       var e = this;
       if (e.__dispatching) return;
+      if (e.__uninit) Object.defineProperty(e, '__uninit', { value: false, writable: true, configurable: true });
       var a = arguments;
       if (typeof a[0] !== 'undefined') Object.defineProperty(e, 'type', { value: String(a[0]), configurable: true });
       for (var i = 1; i < fields.length; i++) {
@@ -8182,11 +8182,15 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     Object.defineProperty(g.Event.prototype, 'cancelBubble', {
       get: function () { return this.__stop === true; },
       set: function (v) { if (v) this.stopPropagation(); }, configurable: true, enumerable: true });
+    Object.defineProperty(g.Event.prototype, 'returnValue', {
+      get: function () { return !this.defaultPrevented; },
+      set: function (v) { if (v === false || !v) this.preventDefault(); }, configurable: true, enumerable: true });
     // addEventListener's signal option: the listener goes when the signal aborts (and is not added when it already has)
     var ET = g.EventTarget && g.EventTarget.prototype, nativeAdd = ET && ET.addEventListener;
     if (nativeAdd) method(ET, 'addEventListener', function (type, fn, options) {
       var signal = options && typeof options === 'object' ? options.signal : undefined, self = this;
-      if (signal !== undefined && signal !== null) {
+      if (signal === null) throw typeErr("execute 'addEventListener' on 'EventTarget'", "member signal is not of type 'AbortSignal'.");
+      if (signal !== undefined) {
         if (signal.aborted) return;
         var capture = !!options.capture;
         nativeAdd.call(this, type, fn, options);
@@ -9984,6 +9988,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       var e;
       try { e = new C(''); } catch (x) { return nativeCreate ? nativeCreate.call(this, name) : new Event(''); }
       Object.defineProperty(e, '__legacy', { value: true });
+      Object.defineProperty(e, '__uninit', { value: true, writable: true, configurable: true });   // (not to be dispatched before its init method)
       return e;
     });
   }());
@@ -11392,16 +11397,39 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
     } catch (e) { rec.error = e; }
     return rec;
   }
+  // A module that is not JavaScript (import attributes: `with { type: "json" }`): its only export is `default`, the parsed JSON, a CSSStyleSheet or the text.
+  function syntheticRecord(key, address, type, text) {
+    var rec = { key: key, url: address, ns: makeNamespace(), meta: { url: address }, depUrls: null, depRecs: null, promise: null, error: null, fn: null,
+                requests: [], imports: [], exportNames: ['default'], stars: [] };
+    records[key] = rec;
+    try {
+      var value;
+      if (type === 'json') value = JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text);
+      else if (type === 'css') { value = new CSSStyleSheet({ baseURL: address }); value.replaceSync(text); }
+      else if (type === 'text') value = text;
+      else throw new TypeError("Failed to fetch dynamically imported module: \"" + type + "\" is not a valid module type.");
+      rec.fn = function (deps, ns) { __export_get(ns, 'default', function () { return value; }); };
+    } catch (e) { rec.error = e; }
+    return rec;
+  }
+  // `address` may carry the type of an import attribute ("address\x01json").
   function recordFor(address) {
     var rec = records[address];
     if (rec) return rec;
+    var cut = address.indexOf('\x01');
+    if (cut >= 0) return syntheticRecord(address, address.slice(0, cut), address.slice(cut + 1), sourceOf(address.slice(0, cut)));
     return newRecord(address, address, sourceOf(address));
+  }
+  // A request of a module: the specifier, with the type of its import attribute after a \x01 when it has one.
+  function resolveRequest(request, referrer) {
+    var cut = request.indexOf('\x01');
+    return cut < 0 ? resolveSpecifier(request, referrer) : resolveSpecifier(request.slice(0, cut), referrer) + request.slice(cut);
   }
   // Fetches and compiles everything `rec` imports (not the same module twice); throws what went wrong.
   function load(rec, seen) {
     if (rec.error) throw rec.error;
     seen[rec.key] = true;
-    if (!rec.depUrls) rec.depUrls = rec.requests.map(function (specifier) { return resolveSpecifier(specifier, rec.url); });
+    if (!rec.depUrls) rec.depUrls = rec.requests.map(function (specifier) { return resolveRequest(specifier, rec.url); });
     rec.depRecs = rec.depUrls.map(function (address) {
       var dep = recordFor(address);
       if (dep.error) throw dep.error;
@@ -11463,9 +11491,21 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
     });
   } });
   // import(specifier) with the address of the module that wrote it (undefined in a script: the document's)
-  Object.defineProperty(g, '__dynamic_import', { value: function (specifier, referrer) {
+  Object.defineProperty(g, '__dynamic_import', { value: function (specifier, referrer, options) {
     return new Promise(function (resolve, reject) {
-      try { resolve(importRecord(recordFor(resolveSpecifier(String(specifier), referrer || baseAddress())))); } catch (e) { reject(e); }
+      try {
+        var type = '';
+        if (options !== undefined) {
+          if (options === null || typeof options !== 'object') throw new TypeError('The second argument of import() must be an object.');
+          var attributes = options['with'] !== undefined ? options['with'] : options.assert;
+          if (attributes !== undefined) {
+            if (attributes === null || typeof attributes !== 'object') throw new TypeError("The 'with' option of import() must be an object.");
+            Object.keys(attributes).forEach(function (k) { if (typeof attributes[k] !== 'string') throw new TypeError('Import attribute values must be strings.'); });
+            if (attributes.type !== undefined) type = '\x01' + attributes.type;
+          }
+        }
+        resolve(importRecord(recordFor(resolveSpecifier(String(specifier), referrer || baseAddress()) + type)));
+      } catch (e) { reject(e); }
     });
   } });
 
@@ -12868,6 +12908,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     if (names.length < 2 || names[names.length - 1] === 'constructor') return;
     try { if (delete P.constructor) Object.defineProperty(P, 'constructor', own); } catch (e) { }
   });
+  if (typeof __install_named_window === 'function') __install_named_window();   // (window.someId: the element with that id)
 }(this));
 )JSPRELUDE";
 

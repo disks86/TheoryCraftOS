@@ -1857,10 +1857,12 @@ bool Page::activate_control(dom::Node* node) {
     }
     if (p->is_tag("a")) break;
   }
+  dom::Node* done = bindings_ ? bindings_->take_pre_activated() : nullptr;
   if (!c) {
     if (focus_) set_focus(nullptr);
     return false;
   }
+  if (done == c) return true;   // (a checkbox or radio button that its click event already changed)
   if (c->is_tag("summary")) {
     toggle_details(c->parent);
     return true;

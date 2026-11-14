@@ -76,6 +76,8 @@ void default_value(const Node* control, String* out);   // what the markup says
 // For a checkbox or radio button, and for an <option> (its selectedness).
 bool is_checked(const Node* n);
 void set_checked(Node* n, bool checked);
+// The checked radio button of the group of `radio` (which may be `radio` itself), or nullptr.
+Node* checked_radio_of_group(Node* radio);
 
 void select_options(const Node* select, List<Node*>* out);   // the <option>s of a select (also those in an <optgroup>)
 void option_value(const Node* option, String* out);          // its value attribute, else its text

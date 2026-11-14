@@ -886,6 +886,66 @@ HostClass::Set window_set_property(Vm& vm, JsObject* o, JsString* key, const Val
 
 const HostClass kWindowClass = {"Window", nullptr, window_set_property, nullptr, nullptr};
 
+// Named access on the window (HTML: "named access on the Window object"): a name that nothing else on the window answers is the element with that id, or the
+// embed / form / img / object / iframe with that name (an iframe gives its window). The object that answers sits in the window's prototype chain, behind
+// Window.prototype (the standard's WindowProperties object), and only answers names that the objects behind it do not have.
+bool named_window_get(Vm& vm, JsObject* object, JsString* key, Value* out) {
+  if (key->symbol) return false;
+  const StringView name = key->view();
+  if (name.empty() || name.starts_with("__")) return false;   // (the engine's own hooks are looked up on the window all the time)
+  if (object->proto && vm.has_property(object->proto, key)) return false;
+  DomBindings::Impl& c = impl(vm);
+  if (c.named_version != c.doc.version() || c.named_names.count() > 64) {
+    c.named_version = c.doc.version();
+    c.named_names.clear();
+    c.named_nodes.clear();
+  }
+  dom::Node* found = nullptr;
+  bool known = false;
+  for (uint64_t i = 0; i < c.named_names.count() && !known; ++i)
+    if (c.named_names[i].view().equals(name)) {
+      found = c.named_nodes[i];
+      known = true;
+    }
+  if (!known) {
+    const dom::Node* root = c.doc.root();
+    for (dom::Node* n = root ? root->first_child : nullptr; n && !found; n = dom::next_in_tree(n, root)) {
+      if (!n->is_element()) continue;
+      StringView value;
+      if (dom::get_attribute(n, "id", &value) && value.equals(name)) found = n;
+      else if ((n->is_tag("embed") || n->is_tag("form") || n->is_tag("img") || n->is_tag("object") || n->is_tag("iframe") || n->is_tag("frame")) && dom::get_attribute(n, "name", &value) && value.equals(name)) found = n;
+    }
+    String copy(vm.allocator());
+    copy.assign(name);
+    if (c.named_names.push_back(util::move(copy))) c.named_nodes.push_back(found);
+  }
+  if (!found) return false;
+  *out = node_value(c, found);
+  StringView frame_name;
+  if ((found->is_tag("iframe") || found->is_tag("frame")) && dom::get_attribute(found, "name", &frame_name) && frame_name.equals(name)) {
+    Value window;
+    if (vm.get_named(*out, "contentWindow", &window) && window.is_object()) *out = window;
+  }
+  return true;
+}
+
+const HostClass kNamedWindowClass = {"WindowProperties", named_window_get, nullptr, nullptr, nullptr, true};
+
+// __install_named_window(): puts the named properties object into the window's prototype chain, in front of EventTarget.prototype (once the chain is final).
+NATIVE(install_named_window) {
+  JsObject* g = vm.global();
+  Value target_proto;
+  if (!vm.get_named(Value::make_object(g), "__event_target_proto", &target_proto) || !target_proto.is_object()) return true;
+  for (JsObject* o = g; o && o->proto; o = o->proto) {
+    if (o->proto->host == &kNamedWindowClass) return true;   // (already there)
+    if (o->proto != target_proto.as_object()) continue;
+    JsObject* named = vm.new_host_object(target_proto.as_object(), &kNamedWindowClass, nullptr);
+    if (named) o->proto = named;
+    return true;
+  }
+  return true;
+}
+
 void define_function_global(Vm& vm, const char* name, NativeFn fn, uint32_t arity) { vm.define_native(vm.global(), name, fn, arity); }
 
 // --- Fullscreen: the script side (WebPrelude.cpp) keeps the promises and events; these ask the page and the window.
@@ -1224,6 +1284,7 @@ bool install_window(DomBindings::Impl& c) {
   JsObject* g = vm.global();
   g->host = &kWindowClass;
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
+  vm.define_native(g, "__install_named_window", install_named_window, 0);
   vm.define_native(g, "__set_content_type", set_content_type, 2);
   vm.define_native(g, "__detach_buffer", detach_buffer, 1);
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);

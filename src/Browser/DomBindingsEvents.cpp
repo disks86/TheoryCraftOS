@@ -59,9 +59,10 @@ JsObject* listeners_of(Vm& vm, JsObject* target, bool create) {
   return l;
 }
 
-bool read_options(Vm& vm, const Value& options, bool* capture, bool* once, bool* passive = nullptr) {
+bool read_options(Vm& vm, const Value& options, bool* capture, bool* once, bool* passive = nullptr, bool* passive_given = nullptr) {
   *capture = *once = false;
   if (passive) *passive = false;
+  if (passive_given) *passive_given = false;
   if (options.is_object()) {
     Value v;
     if (!vm.get_named(options, "capture", &v)) return false;
@@ -71,6 +72,7 @@ bool read_options(Vm& vm, const Value& options, bool* capture, bool* once, bool*
     if (passive) {
       if (!vm.get_named(options, "passive", &v)) return false;
       *passive = Vm::to_boolean(v);
+      if (passive_given) *passive_given = !v.is_undefined();
     }
   } else {
     *capture = Vm::to_boolean(options);
@@ -90,9 +92,15 @@ NATIVE(add_event_listener) {
   String type(vm.allocator());
   if (!target || !arg_text(vm, arg_at(args, argc, 0), &type)) return false;
   const Value fn = arg_at(args, argc, 1);
+  bool capture, once, passive, passive_given;
+  if (!read_options(vm, arg_at(args, argc, 2), &capture, &once, &passive, &passive_given)) return false;   // (read even for a null listener: pages detect the options this way)
   if (!Vm::is_callable(fn) && !fn.is_object()) return true;   // (null: nothing to add)
-  bool capture, once, passive;
-  if (!read_options(vm, arg_at(args, argc, 2), &capture, &once, &passive)) return false;
+  if (!passive_given && (type.view().equals("touchstart") || type.view().equals("touchmove") || type.view().equals("wheel") || type.view().equals("mousewheel"))) {
+    // (the scrolling events are passive by default on the window, the document, its element and the body: a listener there must not hold up scrolling)
+    DomBindings::Impl& c = impl(vm);
+    const dom::Node* node = node_of(self);
+    passive = target == vm.global() || (node && (node->type == dom::NodeType::Document || node == c.doc.document_element() || node == c.doc.body()));
+  }
   JsObject* l = listeners_of(vm, target, true);
   JsString* key = vm.intern(type.view());
   Value list_value;
@@ -137,6 +145,8 @@ NATIVE(remove_event_listener) {
   return true;
 }
 
+bool event_flag(Vm& vm, JsObject* e, const char* name);
+
 NATIVE(dispatch_event_native) {
   DomBindings::Impl& c = impl(vm);
   const Value event = arg_at(args, argc, 0);
@@ -144,11 +154,18 @@ NATIVE(dispatch_event_native) {
   dom::Node* node = node_of(self);
   const bool window = !node && (self.is_nullish() || (self.is_object() && self.as_object() == vm.global()));
   if (!node && !window && !self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  if (event_flag(vm, event.as_object(), "__dispatching") || event_flag(vm, event.as_object(), "__uninit"))
+    return throw_dom(vm, "InvalidStateError", "Failed to execute 'dispatchEvent' on 'EventTarget': The event is already being dispatched, or was not initialized.");
+  vm.define_named(event.as_object(), "isTrusted", bool_value(false));
   bool prevented = false;
   // (the event is an argument, on the VM stack; what the dispatch keeps across the listeners hangs off it: __path, __keep. So the collector may run in the
   // listeners - YouTube builds its whole results page in one)
   const Vm::PassThrough pass(vm);
-  const bool ok = dispatch_event(c, node, window, event, &prevented, !node && !window ? self.as_object() : nullptr);
+  dom::Node* activation = nullptr;
+  const bool ok = dispatch_event(c, node, window, event, &prevented, !node && !window ? self.as_object() : nullptr, &activation);
+  // what a click a script dispatched does when no listener canceled it: the same as the user's (a link is followed, a form submitted, a box checked)
+  if (ok && activation && !prevented && (dom::is_connected(activation) || c.pre_activated == activation)) c.owner.activate(activation);
+  c.pre_activated = nullptr;
   *result = bool_value(!prevented);
   return ok;
 }
@@ -197,7 +214,18 @@ NATIVE(event_composed_path) {
 NATIVE(event_init) {   // initEvent(type, bubbles, cancelable) and initCustomEvent(type, bubbles, cancelable, detail)
   if (!self.is_object()) return true;
   JsObject* e = self.as_object();
-  vm.define_named(e, "type", arg_at(args, argc, 0));
+  if (argc == 0) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present.");
+  if (event_flag(vm, e, "__dispatching")) return true;   // (an event that is on its way keeps what it has)
+  String type(vm.allocator());
+  if (!arg_text(vm, args[0], &type)) return false;
+  vm.define(e, hidden(vm, "__stop"), bool_value(false), 0);
+  vm.define(e, hidden(vm, "__stopi"), bool_value(false), 0);
+  vm.define(e, hidden(vm, "__uninit"), bool_value(false), 0);
+  vm.define_named(e, "defaultPrevented", bool_value(false));
+  vm.define_named(e, "isTrusted", bool_value(false));
+  vm.define_named(e, "target", Value::make_null());
+  vm.define_named(e, "srcElement", Value::make_null());
+  vm.define_named(e, "type", str_value(vm, type.view()));
   vm.define_named(e, "bubbles", bool_value(Vm::to_boolean(arg_at(args, argc, 1))));
   vm.define_named(e, "cancelable", bool_value(Vm::to_boolean(arg_at(args, argc, 2))));
   if (argc > 3) vm.define_named(e, "detail", args[3]);
@@ -216,7 +244,9 @@ void fill_event(DomBindings::Impl& c, JsObject* e, StringView type, const EventI
   vm.define_named(e, "defaultPrevented", bool_value(false));
   vm.define_named(e, "eventPhase", num_value(0));
   vm.define_named(e, "isTrusted", bool_value(trusted));
-  vm.define_named(e, "timeStamp", num_value(vm.clock_ms()));
+  Value origin;   // (the same clock as performance.now(): milliseconds since the page started)
+  vm.get_named(Value::make_object(vm.global()), "__time_origin", &origin);
+  vm.define_named(e, "timeStamp", num_value(vm.clock_ms() - (origin.is_number() ? origin.u.number : 0)));
   vm.define_named(e, "detail", num_value(init.detail));
   vm.define_named(e, "clientX", num_value(init.client_x));
   vm.define_named(e, "clientY", num_value(init.client_y));
@@ -263,6 +293,16 @@ NATIVE(event_constructor) {
   init.bubbles = false;
   init.cancelable = false;
   fill_event(c, e, type.view(), init, false);
+  // the members of the interfaces of the event that its dictionary did not give have their default values (UIEvent.view is null, WheelEvent.deltaX is 0 ...)
+  for (JsObject* p = e->proto; p; p = p->proto) {
+    Value defaults;
+    if (!vm.get_plain(p, hidden(vm, "__defaults"), &defaults) || !defaults.is_object()) continue;
+    JsObject* keys = vm.own_keys(defaults.as_object());
+    for (uint32_t i = 0; i < keys->length; ++i) {
+      Value v;
+      if (vm.get_plain(defaults.as_object(), keys->items[i].as_string(), &v)) vm.define(e, keys->items[i].as_string(), v);
+    }
+  }
   const Value options = arg_at(args, argc, 1);
   if (options.is_object()) {   // the options become properties of the event (bubbles, cancelable, detail, clientX, key ...)
     JsObject* keys = vm.own_keys(options.as_object());
@@ -451,12 +491,52 @@ bool invoke(DomBindings::Impl& c, dom::Node* node, JsObject* current, StringView
 
 Value make_event(DomBindings::Impl& c, StringView type, const EventInit& init, JsObject* proto) {
   Vm& vm = c.vm;
+  const char* interface = nullptr;   // (what the browser fires is an object of the interface of its type: a click is a PointerEvent, a keydown a KeyboardEvent)
+  if (!proto) {
+    if (type.equals("click") || type.equals("auxclick") || type.equals("contextmenu") || type.starts_with("pointer")) interface = "PointerEvent";
+    else if (type.equals("dblclick") || type.starts_with("mouse")) interface = type.equals("mousewheel") ? "WheelEvent" : "MouseEvent";
+    else if (type.equals("keydown") || type.equals("keyup") || type.equals("keypress")) interface = "KeyboardEvent";
+    else if (type.equals("focus") || type.equals("blur") || type.equals("focusin") || type.equals("focusout")) interface = "FocusEvent";
+    else if (type.equals("input") || type.equals("beforeinput")) interface = "InputEvent";
+    else if (type.equals("wheel")) interface = "WheelEvent";
+    else if (type.starts_with("touch")) interface = "TouchEvent";
+    Value ctor, p;
+    if (interface && vm.get_named(Value::make_object(vm.global()), interface, &ctor) && ctor.is_object() && vm.get_plain(ctor.as_object(), vm.prototype_name(), &p) && p.is_object())
+      proto = p.as_object();
+  }
   JsObject* e = vm.new_object(proto ? proto : c.event_proto);
   fill_event(c, e, type, init, true);
+  if (interface) {
+    vm.define_named(e, "view", Value::make_object(vm.global()));
+    vm.define_named(e, "relatedTarget", Value::make_null());
+    if (StringView(interface).equals("PointerEvent")) {
+      vm.define_named(e, "pointerId", num_value(1));
+      vm.define_named(e, "pointerType", str_value(vm, "mouse"));
+      vm.define_named(e, "isPrimary", bool_value(true));
+    }
+  }
   return Value::make_object(e);
 }
 
-bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target) {
+// A click (a MouseEvent, from the browser or from a script) is what activates things.
+static bool is_mouse_event(DomBindings::Impl& c, JsObject* e) {
+  Vm& vm = c.vm;
+  Value ctor, p;
+  if (!vm.get_named(Value::make_object(vm.global()), "MouseEvent", &ctor) || !ctor.is_object() || !vm.get_plain(ctor.as_object(), vm.prototype_name(), &p) || !p.is_object()) return false;
+  for (JsObject* at = e->proto; at; at = at->proto)
+    if (at == p.as_object()) return true;
+  return false;
+}
+
+static bool has_activation_behavior(const dom::Node* n) {
+  if (!n->is_element()) return false;
+  if (n->is_tag("input")) return dom::input_type(n) != dom::InputType::Hidden;
+  if (n->is_tag("button") || n->is_tag("label")) return true;
+  if (n->is_tag("a") || n->is_tag("area")) return dom::has_attribute(n, "href");
+  return n->is_tag("summary") && n->parent && n->parent->is_tag("details");
+}
+
+bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_window, const Value& event, bool* prevented, JsObject* object_target, dom::Node** activation_target) {
   Vm& vm = c.vm;
   JsObject* e = event.as_object();
   String type(vm.allocator());
@@ -495,15 +575,49 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   }
   const uint32_t kept_at = keep->length - 1;
   vm.define(e, vm.intern("__orig"), path->length ? path->items[0] : Value::make_null(), 0);
-  vm.define(e, vm.intern("__stop"), bool_value(false), 0);
-  vm.define(e, vm.intern("__stopi"), bool_value(false), 0);
+  vm.define(e, vm.intern("__dispatching"), bool_value(true), 0);
+  // A click on a checkbox or a radio button changes it before the listeners run (they see the new state: frameworks read `checked` in their click
+  // listeners), and a listener that cancels the click puts the old state back.
+  dom::Node* activation = nullptr;
+  bool was_checked = false, was_indeterminate = false;
+  dom::Node* was_radio = nullptr;
+  if (type.view().equals("click") && !target_is_window && is_mouse_event(c, e)) {
+    Value bubbles_now;
+    vm.get_named(event, "bubbles", &bubbles_now);
+    for (uint64_t i = 0; i < nodes.count() && !activation; ++i) {
+      if (has_activation_behavior(nodes[i])) activation = nodes[i];
+      if (!Vm::to_boolean(bubbles_now)) break;
+    }
+    c.pre_activated = nullptr;
+    if (activation && activation->is_tag("input") && dom::input_type(activation) == dom::InputType::Checkbox) {
+      was_checked = dom::is_checked(activation);
+      was_indeterminate = activation->form_state & dom::kFormIndeterminate;
+      activation->form_state &= static_cast<uint8_t>(~dom::kFormIndeterminate);
+      dom::set_checked(activation, !was_checked);
+    } else if (activation && activation->is_tag("input") && dom::input_type(activation) == dom::InputType::Radio) {
+      was_checked = dom::is_checked(activation);
+      was_radio = dom::checked_radio_of_group(activation);
+      dom::set_checked(activation, true);
+    }
+  }
+  if (activation_target) *activation_target = activation;
   vm.define_named(e, "target", path->length ? path->items[0] : Value::make_null());
   vm.define_named(e, "srcElement", path->length ? path->items[0] : Value::make_null());
   Value bubbles_value;
   vm.get_named(event, "bubbles", &bubbles_value);
   const bool bubbles = Vm::to_boolean(bubbles_value);
   auto node_at = [&](uint32_t i) -> dom::Node* { return i < nodes.count() ? nodes[i] : nullptr; };
-  bool stopped = false;
+  // window.event is the event being handled (unless the page has a variable `event` of its own)
+  JsObject* global = vm.global();
+  Value event_before, event_ours;
+  const bool had_event = vm.get_plain(global, vm.intern("event"), &event_before);
+  vm.get_plain(global, vm.intern("__window_event"), &event_ours);
+  const bool show_event = !had_event || event_before.is_undefined() || (event_before.is_object() && event_ours.is_object() && event_before.as_object() == event_ours.as_object());
+  if (show_event) {
+    vm.define(global, vm.intern("event"), event, kWritable);
+    vm.define(global, vm.intern("__window_event"), event, kWritable);
+  }
+  bool stopped = event_flag(vm, e, "__stop");   // (stopPropagation() before the dispatch: no listener runs)
   for (uint32_t i = path->length; i > 1 && !stopped; --i) {   // capture: from the outside in
     JsObject* current = path->items[i - 1].as_object();
     invoke(c, node_at(i - 1), current, type.view(), Phase::Capture, event);
@@ -528,9 +642,41 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
     vm.define_named(e, "srcElement", path->items[0]);
   }
   if (keep->length > kept_at) keep->length = kept_at;
+  if (show_event) {
+    Value now;
+    if (vm.get_plain(global, vm.intern("event"), &now) && now.is_object() && now.as_object() == e) {   // (still ours: a listener may have assigned to it)
+      vm.define(global, vm.intern("event"), had_event ? event_before : Value(), kWritable);
+      vm.define(global, vm.intern("__window_event"), had_event ? event_before : Value(), kWritable);
+    }
+  }
+  vm.define(e, vm.intern("__dispatching"), bool_value(false), 0);
+  vm.define(e, vm.intern("__stop"), bool_value(false), 0);
+  vm.define(e, vm.intern("__stopi"), bool_value(false), 0);
   Value dp;
   vm.get_named(event, "defaultPrevented", &dp);
   *prevented = Vm::to_boolean(dp);
+  if (activation && activation->is_tag("input")) {
+    const dom::InputType kind = dom::input_type(activation);
+    if (kind == dom::InputType::Checkbox || kind == dom::InputType::Radio) {
+      if (*prevented) {   // canceled: as it was
+        if (kind == dom::InputType::Checkbox) {
+          dom::set_checked(activation, was_checked);
+          if (was_indeterminate) activation->form_state |= dom::kFormIndeterminate;
+        } else {
+          dom::set_checked(activation, was_checked);
+          if (was_radio && was_radio != activation) dom::set_checked(was_radio, true);
+        }
+      } else {
+        c.pre_activated = activation;   // (what a click does to this control is done: Page::activate_control leaves it)
+        if (dom::is_connected(activation) && (kind == dom::InputType::Checkbox || !was_checked)) {
+          EventInit changed;
+          changed.cancelable = false;
+          c.owner.dispatch(activation, "input", changed);
+          c.owner.dispatch(activation, "change", changed);
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -538,8 +684,10 @@ NATIVE(el_click) {
   DomBindings::Impl& c = impl(vm);
   dom::Node* node = node_of(self);
   if (!node) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  if (dom::is_listed_control(node) && dom::is_disabled(node)) return true;   // (a disabled control is not clicked)
   EventInit init;
   if (c.owner.dispatch(node, "click", init)) c.owner.activate(node);
+  c.pre_activated = nullptr;
   return true;
 }
 
@@ -548,6 +696,8 @@ NATIVE(doc_create_event) {
   EventInit init;
   init.bubbles = init.cancelable = false;
   *result = make_event(c, "", init);
+  vm.define(result->as_object(), hidden(vm, "__uninit"), bool_value(true), 0);   // (not to be dispatched before initEvent())
+  vm.define_named(result->as_object(), "isTrusted", bool_value(false));
   return true;
 }
 
@@ -566,6 +716,7 @@ bool install_events(DomBindings::Impl& c) {
   vm.delete_property(g, vm.intern("addEventListener"));
   vm.delete_property(g, vm.intern("removeEventListener"));
 
+  vm.define_named(g, "event", Value(), kWritable);   // (window.event: the event being handled, undefined between dispatches)
   c.event_proto = vm.new_plain();
   vm.define_native(c.event_proto, "preventDefault", event_prevent_default, 0);
   vm.define_native(c.event_proto, "stopPropagation", event_stop_propagation, 0);
@@ -575,9 +726,43 @@ bool install_events(DomBindings::Impl& c) {
   vm.define_native(c.event_proto, "initCustomEvent", event_init, 4);
   static const char* const kEventClasses[] = {"Event", "CustomEvent", "UIEvent", "MouseEvent", "KeyboardEvent", "FocusEvent", "InputEvent", "PointerEvent", "WheelEvent", "TouchEvent",
                                               "MessageEvent", "ErrorEvent", "HashChangeEvent", "PopStateEvent", "StorageEvent", "ProgressEvent", "AnimationEvent", "TransitionEvent"};
+  // what the members of each interface are when the dictionary of the constructor does not give them: name=value pairs (null, a number, "" or false)
+  static const struct { const char* name; const char* defaults; } kDefaults[] = {
+      {"UIEvent", "view=null detail=0 which=0"},
+      {"MouseEvent", "relatedTarget=null movementX=0 movementY=0"},
+      {"FocusEvent", "relatedTarget=null"},
+      {"KeyboardEvent", "key= code= location=0 repeat=false isComposing=false charCode=0 keyCode=0"},
+      {"InputEvent", "data=null inputType= isComposing=false dataTransfer=null"},
+      {"WheelEvent", "deltaX=0 deltaY=0 deltaZ=0 deltaMode=0"},
+      {"PointerEvent", "pointerId=0 width=1 height=1 pressure=0 tangentialPressure=0 tiltX=0 tiltY=0 twist=0 pointerType= isPrimary=false"},
+      {"MessageEvent", "data=null origin= lastEventId= source=null"},
+      {"ErrorEvent", "message= filename= lineno=0 colno=0"},
+      {"HashChangeEvent", "oldURL= newURL="},
+      {"PopStateEvent", "state=null"},
+      {"StorageEvent", "key=null oldValue=null newValue=null url= storageArea=null"},
+      {"ProgressEvent", "lengthComputable=false loaded=0 total=0"},
+      {"AnimationEvent", "animationName= elapsedTime=0 pseudoElement="},
+      {"TransitionEvent", "propertyName= elapsedTime=0 pseudoElement="},
+  };
   for (const char* name : kEventClasses) {
     JsObject* f = vm.new_native(event_constructor, name, 1);
     JsObject* proto = StringView(name).equals("Event") ? c.event_proto : vm.new_object(c.event_proto);
+    for (const auto& row : kDefaults) {
+      if (!StringView(name).equals(row.name)) continue;
+      JsObject* defaults = vm.new_plain();
+      StringView rest(row.defaults);
+      while (!rest.empty()) {
+        const uint64_t space = rest.find(' '), end = space == StringView::npos ? rest.size() : space;
+        const StringView pair = rest.substr(0, end);
+        const uint64_t eq = pair.find('=');
+        const StringView key = pair.substr(0, eq), text = pair.substr(eq + 1);
+        uint64_t number = 0;
+        const Value value = text.equals("null") ? Value::make_null() : text.equals("false") ? bool_value(false) : text.empty() ? str_value(vm, "") : num_value(text.parse_uint(&number) ? static_cast<double>(number) : 0);
+        vm.define(defaults, vm.intern(key), value);
+        rest = end < rest.size() ? rest.substr(end + 1) : StringView();
+      }
+      vm.define(proto, hidden(vm, "__defaults"), Value::make_object(defaults), 0);
+    }
     vm.define(f, vm.prototype_name(), Value::make_object(proto), kNonConfigurable);
     vm.define(proto, vm.intern("constructor"), Value::make_object(f), kWritable);
     vm.define_named(g, name, Value::make_object(f), kWritable);
@@ -588,6 +773,12 @@ bool install_events(DomBindings::Impl& c) {
 }  // namespace bind
 
 // --- What the page offers -------------------------------------------------------------------------------------------------------
+
+dom::Node* DomBindings::take_pre_activated() {
+  dom::Node* node = impl_->pre_activated;
+  impl_->pre_activated = nullptr;
+  return node;
+}
 
 void DomBindings::activate(dom::Node* node) {
   Impl& c = *impl_;

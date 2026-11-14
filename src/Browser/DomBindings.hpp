@@ -330,6 +330,8 @@ class DomBindings {
   // What a click on a node does when no listener stopped it: follows a link, toggles a check box. (Called by element.click() and by the browser after
   // dispatch(node, "click") returned true.)
   void activate(dom::Node* node);
+  // The checkbox or radio button that the last click event already changed, if any (the dispatch checks it before the listeners run); asked once.
+  dom::Node* take_pre_activated();
   // What setCustomValidity() was given for a control ("" if nothing).
   bool custom_validity(const dom::Node* control, String* message);
   // The element whose script is running now (document.currentScript).
