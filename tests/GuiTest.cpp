@@ -1221,10 +1221,10 @@ static void test_switcher() {
     CHECK(mgr.active() == before);
     d.shutdown_dialog().close();
     CHECK(!d.shutdown_dialog().showing() && !d.shutdown_requested());
-    // The Start menu's About window is an ordinary window and appears on the taskbar once.
+    // The Start menu's About window is a secondary frame: opened once, and not on the taskbar.
     d.open_about();
     d.open_about();
-    CHECK(sw.button_count() == 4 && d.about_window().manager() == &mgr);
+    CHECK(sw.button_count() == 3 && mgr.window_count() == 4 && d.about_window().manager() == &mgr);
     d.about_window().minimize();
     d.open_about();
     CHECK(d.about_window().state() != Frame::State::Minimized && mgr.active() == &d.about_window());
@@ -1459,15 +1459,23 @@ static void test_desktop() {
     d.step(6000000);
     // A modal confirmation opens first; nothing is shut down yet.
     CHECK(!start.open() && d.shutdown_dialog().showing() && d.windows().has_modal() && !d.shutdown_requested());
-    CHECK(w.focus() == &d.shutdown_dialog().accept_button());
+    CHECK(w.focus() == &d.shutdown_dialog().decline_button());   // Cancel is the default: shutting down cannot be taken back
     // Escape declines: the dialog goes away and the desktop keeps running.
     kb.push(key::kEscape, true); kb.push(key::kEscape, false);
     d.step(7000000);
     CHECK(!d.shutdown_dialog().showing() && !d.shutdown_requested() && !d.windows().has_modal());
-    // Ask again and accept with Enter on the default button.
+    // Ask again: Enter on the default button cancels too; Tab to Shut Down and Enter accepts.
     d.ask_shut_down();
     d.step(8000000);
     CHECK(d.shutdown_dialog().showing());
+    kb.push(key::kEnter, true); kb.push(key::kEnter, false);
+    d.step(8200000);
+    CHECK(!d.shutdown_dialog().showing() && !d.shutdown_requested());
+    d.ask_shut_down();
+    d.step(8400000);
+    kb.push(key::kTab, true); kb.push(key::kTab, false);
+    d.step(8600000);
+    CHECK(w.focus() == &d.shutdown_dialog().accept_button());
     kb.push(key::kEnter, true); kb.push(key::kEnter, false);
     d.step(9000000);
     CHECK(d.shutdown_requested() && !d.shutdown_dialog().showing());

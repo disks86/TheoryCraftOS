@@ -17,6 +17,9 @@
  */
 
 #include "Desktop/WirelessProperties.hpp"
+#include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
 
@@ -48,11 +51,11 @@ const char* wireless_result_text(WirelessResult result) {
   switch (result) {
     case WirelessResult::Ok: return "";
     case WirelessResult::NoSuchNetwork: return "The network is not in range.";
-    case WirelessResult::BadPassphrase: return "The password is not right.";
+    case WirelessResult::BadPassphrase: return "The password was not accepted. Type it again, then choose Connect.";
     case WirelessResult::Unsupported: return "This kind of network is not supported.";
-    case WirelessResult::InvalidArgument: return "Not a valid network name.";
+    case WirelessResult::InvalidArgument: return "This network's name cannot be used to connect to it.";
     case WirelessResult::Busy: return "The adapter is busy; try again in a moment.";
-    case WirelessResult::Failed: return "The connection failed.";
+    case WirelessResult::Failed: return "The network could not be joined. Move closer to it, or check the password, and try again.";
   }
   return "";
 }
@@ -79,58 +82,60 @@ WirelessProperties::WirelessProperties(allocators::IAllocator& allocator)
       connection_(allocator),
       status_(allocator),
       password_label_(allocator),
+      list_label_(allocator),
       grid_(allocator),
-      password_row_(allocator),
+      body_(allocator),
       buttons_(allocator),
+      password_row_(allocator),
       gap_a_(allocator),
       gap_b_(allocator),
+      spacer_(allocator),
+      grid_menu_(allocator),
       password_(allocator),
       scan_button_(allocator),
       connect_button_(allocator),
       disconnect_button_(allocator),
       close_button_(allocator),
       cell_text_(allocator) {
-  set_title("Wi-Fi Properties");
+  set_title("Wi-Fi Networks");     // (with an adapter: "Wi-Fi Networks - <its name>")
   set_bounds({120, 70, 470, 420});
   set_padding(Insets::all(8));
-  set_minimize_enabled(true);
+  set_minimize_enabled(false);     // a secondary frame: no Minimize or Maximize, and Escape closes it
+  set_maximize_enabled(false);
+  set_escape_closes(true);
 
-  connection_.set_dock(DockStyle::Top);
   connection_.set_size(0, 24);
+  list_label_.set_text("Networks in range:");
+  list_label_.set_size(0, 22);
 
-  buttons_.set_style(PanelStyle::Transparent);
-  buttons_.set_dock(DockStyle::Bottom);
   buttons_.set_size(0, 30);
-  close_button_.set_text("Close");
-  close_button_.set_dock(DockStyle::Right);
-  close_button_.set_size(80, 0);
-  close_button_.on_click(Handler::immediate(&WirelessProperties::on_close, this));
   scan_button_.set_text("Scan");
-  scan_button_.set_dock(DockStyle::Left);
   scan_button_.set_size(80, 0);
   scan_button_.on_click({&WirelessProperties::on_scan, this});
   gap_a_.set_style(PanelStyle::Transparent);
-  gap_a_.set_dock(DockStyle::Left);
   gap_a_.set_size(6, 0);
   connect_button_.set_text("Connect");
-  connect_button_.set_dock(DockStyle::Left);
   connect_button_.set_size(90, 0);
+  connect_button_.set_default(true);
   connect_button_.on_click({&WirelessProperties::on_connect, this});
   gap_b_.set_style(PanelStyle::Transparent);
-  gap_b_.set_dock(DockStyle::Left);
   gap_b_.set_size(6, 0);
   disconnect_button_.set_text("Disconnect");
-  disconnect_button_.set_dock(DockStyle::Left);
   disconnect_button_.set_size(100, 0);
   disconnect_button_.on_click({&WirelessProperties::on_disconnect, this});
-  buttons_.add(&close_button_);
+  spacer_.set_style(PanelStyle::Transparent);
+  spacer_.set_dock(DockStyle::Fill);
+  close_button_.set_text("Close");
+  close_button_.set_size(80, 0);
+  close_button_.on_click(Handler::immediate(&WirelessProperties::on_close, this));
   buttons_.add(&scan_button_);
   buttons_.add(&gap_a_);
   buttons_.add(&connect_button_);
   buttons_.add(&gap_b_);
   buttons_.add(&disconnect_button_);
+  buttons_.add(&spacer_);
+  buttons_.add(&close_button_);
 
-  status_.set_dock(DockStyle::Bottom);
   status_.set_size(0, 22);
 
   password_label_.set_text("Password:");
@@ -140,7 +145,6 @@ WirelessProperties::WirelessProperties(allocators::IAllocator& allocator)
   password_.set_password(true);
   password_.set_max_length(63);
   password_row_.set_style(PanelStyle::Transparent);
-  password_row_.set_dock(DockStyle::Bottom);
   password_row_.set_size(0, 28);
   password_row_.add(&password_label_);
   password_row_.add(&password_);
@@ -151,13 +155,28 @@ WirelessProperties::WirelessProperties(allocators::IAllocator& allocator)
   grid_.add_column("Channel", 60, Align::Right);
   grid_.set_dock(DockStyle::Fill);
   grid_.on_selection_changed({&WirelessProperties::on_selection, this});
+  // The commands of a network are also in its context menu; update_buttons() keeps them in step with the buttons.
+  connect_item_ = grid_menu_.add_item("Connect", {&WirelessProperties::on_connect, this});
+  disconnect_item_ = grid_menu_.add_item("Disconnect", {&WirelessProperties::on_disconnect, this});
+  grid_.set_context_menu(&grid_menu_);
 
-  add(&connection_);
-  add(&buttons_);
-  add(&status_);
-  add(&password_row_);
-  add(&grid_);   // (Fill goes last)
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&connection_);
+  body_.add(&list_label_);
+  body_.add(&grid_);
+  body_.add(&password_row_);
+  body_.add(&status_);
+  body_.add(&buttons_);
+  add(&body_);
   update_buttons();
+}
+
+bool WirelessProperties::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter) {   // the default button (a focused button takes Enter itself)
+    connect_button_.click();
+    return true;
+  }
+  return Frame::on_key(args);
 }
 
 StringView WirelessProperties::cell(uint32_t row, uint32_t column) const {
@@ -218,6 +237,8 @@ void WirelessProperties::update_buttons() {
   connect_button_.set_enabled(known_ && !busy && grid_.selected_row() >= 0);
   disconnect_button_.set_enabled(joined);
   password_.set_enabled(known_);
+  if (connect_item_) connect_item_->set_enabled(connect_button_.enabled());
+  if (disconnect_item_) disconnect_item_->set_enabled(joined);
 }
 
 void WirelessProperties::update() {
@@ -226,7 +247,7 @@ void WirelessProperties::update() {
   if (!details_ || !details_->adapter(id_, &info)) {
     known_ = false;
     state_ = WirelessState::Disconnected;
-    connection_.set_text(details_ ? "This Wi-Fi adapter is not there any more." : "No Wi-Fi information is available.");
+    connection_.set_text(details_ ? "This Wi-Fi adapter is no longer connected. Close this window." : "No Wi-Fi information is available.");
     fill_networks(nullptr, 0, StringView());
     update_buttons();
     return;
@@ -234,19 +255,16 @@ void WirelessProperties::update() {
   known_ = true;
   state_ = info.state;
   String text(allocator());
-  text.assign(info.name);
-  text.append(" - Wi-Fi Properties");
+  format_message(&text, "Wi-Fi Networks - %1", info.name);
   set_title(text.view());
-  text.assign(wireless_state_name(info.state));
   if (info.state == WirelessState::Connected || info.state == WirelessState::Connecting) {
-    text.append(" to ");
-    text.append(info.network.ssid);
-    text.append(" - ");
-    text.append(wireless_security_name(info.network.security));
-    text.append(", channel ");
-    text.append_uint(info.network.channel);
-    text.append(", signal ");
-    signal_text(&text, info.network.signal_percent);
+    String channel(allocator()), signal(allocator()), about(allocator());
+    channel.append_uint(info.network.channel);
+    signal_text(&signal, info.network.signal_percent);
+    format_message(&about, "%1, channel %2, signal %3", wireless_security_name(info.network.security), channel.view(), signal.view());
+    format_message(&text, info.state == WirelessState::Connected ? "Connected to %1 - %2" : "Connecting to %1 - %2", info.network.ssid, about.view());
+  } else {
+    text.assign(wireless_state_name(info.state));
   }
   connection_.set_text(text.view());
   if (info.state == WirelessState::Disconnected && info.last_result != WirelessResult::Ok) status_.set_text(wireless_result_text(info.last_result));
@@ -272,13 +290,14 @@ void WirelessProperties::on_connect(void* self, Control&) {
   UiGuard lock(w);
   const int32_t row = w->grid_.selected_row();
   if (!w->details_ || row < 0 || static_cast<uint32_t>(row) >= w->shown_count_) {
-    w->status_.set_text("Pick a network first.");
+    w->status_.set_text("Select a network in the list first.");
     return;
   }
   const WirelessNetworkInfo network = w->shown_[row];
   const StringView ssid(network.ssid, __builtin_strlen(network.ssid));
   if (network.security != WirelessSecurity::Open && w->password_.text().empty()) {
-    w->status_.set_text("Type the password of the network first.");
+    w->status_.set_text("This network needs a password. Type it, then choose Connect.");
+    if (Window* win = w->window()) win->set_focus(&w->password_);    // the field at fault
     return;
   }
   const WirelessResult result = w->details_->connect(w->id_, ssid, w->password_.text());
@@ -289,9 +308,7 @@ void WirelessProperties::on_connect(void* self, Control&) {
   }
   w->password_.set_text(StringView());
   String text(w->allocator());
-  text.assign(w->state_ == WirelessState::Connected ? "Connected to " : "Connecting to ");
-  text.append(ssid);
-  text.append(w->state_ == WirelessState::Connected ? "." : "...");
+  format_message(&text, w->state_ == WirelessState::Connected ? "Connected to %1." : "Connecting to %1...", ssid);
   w->status_.set_text(text.view());
 }
 

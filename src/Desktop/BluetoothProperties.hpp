@@ -19,8 +19,16 @@
 // The Bluetooth window of an adapter: the devices around (found by searching), and Connect, Disconnect and Forget for the one picked. Connecting pairs the device first when it is not
 // paired; if the pairing needs the user - a passkey to type on the device's keyboard, a passkey shown by the device, two numbers to compare - the window asks in its bottom row. It
 // refreshes itself when update() is called (the desktop does so several times a second while the window is open).
+// It is the window of the Bluetooth Devices command of a Bluetooth adapter and is titled after it ("Bluetooth Devices - <adapter>"). What it does
+// happens at once, so its buttons are the actions and Close. Forget deletes a pairing: it asks first, and Cancel is the default answer. Enter
+// answers the pairing question when there is one and otherwise connects the selected device; Escape cancels the pairing question when there is
+// one and otherwise closes the window. The list has a context menu (Connect, Disconnect, Forget).
 #pragma once
 #include "Desktop/BluetoothDetails.hpp"
+#include "Desktop/DialogGrid.hpp"
+#include "Desktop/StackPanel.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/CheckBox.hpp"
 #include "Gui/Controls/DataGrid.hpp"
@@ -55,8 +63,14 @@ class BluetoothProperties : public gui::Frame {
   gui::Button& connect_button() { return connect_button_; }
   gui::Button& disconnect_button() { return disconnect_button_; }
   gui::Button& forget_button() { return forget_button_; }
+  gui::Button& close_button() { return close_button_; }
+  // "Forget <device>?": asked before a pairing is deleted (when the window is in a window manager).
+  gui::MessageDialog& forget_dialog() { return ask_; }
+  gui::ContextMenu& grid_menu() { return grid_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
   // The pairing question: a line of text, the box for a typed passkey, and the two answers. Hidden while nothing is asked.
-  gui::Panel& prompt_row() { return prompt_row_; }
+  gui::Control& prompt_row() { return prompt_row_; }
   gui::Label& prompt_label() { return prompt_label_; }
   gui::TextBox& passkey_box() { return passkey_; }
   gui::Button& accept_button() { return accept_button_; }
@@ -72,6 +86,8 @@ class BluetoothProperties : public gui::Frame {
   static void on_accept(void* self, gui::Control&);
   static void on_reject(void* self, gui::Control&);
   static void on_auto_reconnect(void* self, gui::Control&);
+  static void on_forget_answer(void* self, gui::Control&);
+  void forget(const uint8_t key[6]);
   void fill_devices(const BluetoothDeviceRow* list, uint32_t count);
   void update_prompt();
   void update_buttons();
@@ -81,9 +97,16 @@ class BluetoothProperties : public gui::Frame {
   uint32_t id_ = 0;
   bool known_ = false, discovering_ = false;
   BluetoothPrompt prompt_;
-  gui::Label adapter_label_, status_, prompt_label_;
-  gui::DataGrid grid_;
-  gui::Panel prompt_row_, buttons_, gap_a_, gap_b_, gap_c_;
+  gui::Label adapter_label_, status_, prompt_label_, list_label_;
+  DialogGrid grid_;       // (Enter goes on to the default button)
+  StackColumn body_;       // top to bottom, the order Tab takes: the setting, the list, the pairing question, the status line, the buttons
+  StackRow buttons_;       // left to right: Search, Connect, Disconnect, Forget, the space, Close
+  StackRow prompt_row_;    // left to right: the question, the passkey box, the two answers
+  gui::Panel gap_a_, gap_b_, gap_c_, gap_d_, spacer_;
+  gui::ContextMenu grid_menu_;
+  gui::MenuItem *connect_item_ = nullptr, *disconnect_item_ = nullptr, *forget_item_ = nullptr;
+  gui::MessageDialog ask_;
+  uint8_t forget_key_[6] = {};   // the device the question is about
   gui::TextBox passkey_;
   gui::CheckBox auto_reconnect_;
   bool syncing_ = false;      // the box is being set from the adapter, not by the user

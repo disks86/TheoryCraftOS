@@ -22,10 +22,25 @@
 // (the DPI of the desktop: 100 % is 96 dpi, 200 % 192 dpi). The lists offer only what the monitor and the graphics device can both do: the
 // resolutions are those of the monitor's EDID that the device can show, the refresh rates those the monitor takes at the chosen resolution (and the
 // device can set; a device that cannot set one shows the rate in use, greyed), the scales those that leave at least 640x480 on the monitor.
-// Apply makes the chosen settings real and asks "Keep these display settings?": they are taken back after 15 seconds if the answer does not come, so
-// a mode the screen cannot show does not leave the user blind. Make Primary puts the taskbar on the selected monitor.
+// Make Primary puts the taskbar on the selected monitor.
+//
+// The buttons mean what they mean in every property sheet (docs/UserInterfaceGuidelines.md, 6.3 and 11.5): Apply makes the choices in the lists real and
+// stays; OK does that and closes; Cancel drops the choices that were not applied and closes; the close button asks whether to apply them.
+//
+// A new mode may be one the screen cannot show, and then the user cannot see what to do. So after the change the window asks "Keep these display
+// settings?", and the question is built so that nothing depends on seeing it or on answering in time:
+//  - Revert is the default button and has the focus: Enter and Escape both bring the old settings back. Keeping needs a deliberate choice (the Keep
+//    button, or Alt+K).
+//  - The old settings also come back by themselves when the time runs out (kConfirmSeconds). That is a safety net, not the route: it loses nothing, and
+//    More Time starts it again with a longer time (kMoreSeconds) for whoever needs longer to read.
+//  - Settings that were kept can still be taken back: Restore Previous (Ctrl+Z) puts the monitors back as they were before the last change made here -
+//    a kept mode, another primary monitor or a monitor moved.
+// The monitors are moved with the pointer (drag in the picture), or with Ctrl+arrow in the picture, or with the Move commands of a monitor's
+// context menu (Menu key), which also has Make Primary.
 #pragma once
+#include "Desktop/StackPanel.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -38,7 +53,7 @@ namespace desktop {
 
 class DisplaySettings : public gui::Frame {
  public:
-  static constexpr uint32_t kInfoLines = 5, kMaxResolutions = 64, kMaxRates = 16, kMaxScales = 8, kConfirmSeconds = 15;
+  static constexpr uint32_t kInfoLines = 5, kMaxResolutions = 64, kMaxRates = 16, kMaxScales = 8, kConfirmSeconds = 15, kMoreSeconds = 60;
 
   explicit DisplaySettings(allocators::IAllocator& allocator);
 
@@ -48,7 +63,8 @@ class DisplaySettings : public gui::Frame {
   // only reach the layout.
   using Applier = bool (*)(void* context);
   void set_applier(Applier applier, void* context) { applier_ = applier; applier_context_ = context; }
-  // Where "keep these settings?" is asked (nullptr: new settings are kept without asking). It must outlive the window.
+  // Where "keep these settings?" and "apply the changes?" are asked (nullptr: new settings are kept without asking, and closing drops what was
+  // not applied). It must outlive the window.
   void set_confirm_dialog(gui::MessageDialog* dialog) { confirm_ = dialog; }
   // Fills the picture, the details and the lists from the monitors again (keeps the selection where it can).
   void refresh();
@@ -64,8 +80,18 @@ class DisplaySettings : public gui::Frame {
   // The answer to the question: keep the new settings, or go back to the ones before.
   void keep_changes();
   void revert_changes();
+  // More Time: the countdown starts again, with kMoreSeconds.
+  void more_time();
   bool asking() const { return asking_; }
   uint32_t seconds_left() const { return seconds_left_; }
+  // True while a list shows something other than what the selected monitor does now (Apply and OK would change it).
+  bool pending() const;
+  // Puts the monitors back as they were before the last change made here that was kept. False if there is nothing to go back to.
+  bool restore_previous();
+  bool can_restore() const { return previous_.valid(); }
+  // What OK and Cancel do.
+  void accept();
+  void cancel();
 
   const hardware::Monitor* selected_monitor() const;
   MonitorMap& map() { return map_; }
@@ -75,6 +101,16 @@ class DisplaySettings : public gui::Frame {
   gui::Label& info_line(uint32_t index) { return info_[index]; }
   gui::Button& primary_button() { return primary_button_; }
   gui::Button& apply_button() { return apply_button_; }
+  gui::Button& ok_button() { return ok_button_; }
+  gui::Button& cancel_button() { return cancel_button_; }
+  gui::Button& restore_button() { return restore_button_; }
+  // The context menu of a monitor in the picture: Make Primary and the four Move commands.
+  gui::ContextMenu& map_menu() { return map_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
+
+ protected:
+  bool close_requested() override;
 
  private:
   static void on_map_selected(void* self, gui::Control&);
@@ -82,8 +118,17 @@ class DisplaySettings : public gui::Frame {
   static void on_resolution_chosen(void* self, gui::Control&);
   static void on_primary(void* self, gui::Control&);
   static void on_apply(void* self, gui::Control&);
-  static void on_close(void* self, gui::Control&);
+  static void on_ok(void* self, gui::Control&);
+  static void on_cancel(void* self, gui::Control&);
+  static void on_restore(void* self, gui::Control&);
+  static void on_list_chosen(void* self, gui::Control&);
+  static void on_move_left(void* self, gui::Control&);
+  static void on_move_right(void* self, gui::Control&);
+  static void on_move_up(void* self, gui::Control&);
+  static void on_move_down(void* self, gui::Control&);
+  static void on_map_menu_opening(void* self, gui::Control&);
   static void on_confirm_result(void* self, gui::Control&);
+  void show_keep_question();         // (again, with the seconds that are left)
   void fill_lists();                 // the three lists for the selected monitor (what is in use is chosen)
   void fill_dependent_lists();       // the refresh rates and scales for the resolution chosen in the first list
   void update_details();
@@ -95,11 +140,15 @@ class DisplaySettings : public gui::Frame {
   void* applier_context_ = nullptr;
   gui::MessageDialog* confirm_ = nullptr;
   MonitorMap map_;
-  gui::Panel details_, settings_, resolution_row_, refresh_row_, scale_row_, buttons_;
+  StackColumn body_;       // top to bottom, the order Tab takes: the picture, the details, the lists, the buttons
+  StackRow buttons_;       // left to right: Make Primary, Restore Previous, the space, OK, Cancel, Apply
+  gui::Panel details_, settings_, resolution_row_, refresh_row_, scale_row_, filler_, spacer_, gap_a_, gap_b_, gap_c_;
+  gui::ContextMenu map_menu_;
+  gui::MenuItem *primary_item_ = nullptr, *move_items_[4] = {};
   gui::Label info_[kInfoLines];
   gui::Label resolution_label_, refresh_label_, scale_label_;
   gui::DropDown resolution_, refresh_, scale_;
-  gui::Button primary_button_, apply_button_, close_button_;
+  gui::Button primary_button_, restore_button_, ok_button_, cancel_button_, apply_button_;
   hardware::MonitorMode resolutions_[kMaxResolutions];
   uint32_t resolution_count_ = 0;
   uint32_t rates_[kMaxRates] = {};
@@ -108,7 +157,11 @@ class DisplaySettings : public gui::Frame {
   uint32_t scale_count_ = 0;
   uint32_t selected_id_ = MonitorMap::kNone;
   bool filling_ = false;
-  hardware::SystemMonitors::State before_;
+  hardware::SystemMonitors::State before_;     // while the keep question is open: what Revert puts back
+  hardware::SystemMonitors::State previous_;   // what Restore Previous puts back
+  enum class Question : uint8_t { None, Keep, ApplyOnClose };
+  Question question_ = Question::None;
+  bool close_when_kept_ = false;               // OK: the window closes once the new settings are kept
   bool asking_ = false;
   uint32_t seconds_left_ = 0;
 };

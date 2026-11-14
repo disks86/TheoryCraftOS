@@ -24,7 +24,12 @@
 // adapter offers Properties (its address, gateway, DNS server, link state and speed - another window, see NetworkProperties); a Wi-Fi adapter also offers Wi-Fi Properties (the network it is joined to, the networks in range and joining one - see WirelessProperties). The File menu
 // closes the window; the View menu picks the tab. Every other device has a Properties item too (a display's also Display Settings): the same window for
 // every device of a kind, whatever its driver - see DeviceProperties and IDeviceDetails.
+//
+// The menu bar is File (Exit), Edit (Copy Row), View (the tabs), Device and Help. The Device menu has every command of the context menus of the
+// hardware tree (nothing is only in a context menu): Display Settings, Wi-Fi Networks, Bluetooth Devices and, last, Properties (Alt+Enter); what
+// does not apply to the selected device is unavailable. A context menu holds the commands of its device, Properties last.
 #pragma once
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -145,6 +150,8 @@ class ComputerManager : public gui::Frame {
   // Fired when Bluetooth Settings is chosen for a Bluetooth adapter; bluetooth_adapter() is the adapter's number (HardwareEntry::id).
   void on_open_bluetooth_properties(gui::Handler handler) { open_bluetooth_properties_ = handler; }
   uint32_t bluetooth_adapter() const { return properties_adapter_; }
+  // Where About Computer Manager is shown (nullptr: the command is unavailable). It must outlive the computer manager.
+  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; update_commands(); }
   // Reads the monitor and refreshes everything. `now_us` is the uptime; load figures are over the time since
   // the previous call.
   void update(uint64_t now_us);
@@ -163,6 +170,10 @@ class ComputerManager : public gui::Frame {
   gui::Label& info_label() { return info_; }
   gui::TabControl& tabs() { return tabs_; }
   gui::TreeView& hardware_tree() { return tree_; }
+  // The context menu of the Programs table (Copy Row).
+  gui::ContextMenu& process_grid_menu() { return process_grid_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
   gui::ContextMenu& display_menu() { return display_menu_; }
   gui::ContextMenu& adapter_menu() { return adapter_menu_; }
   // The menu of a device that has no menu of its own (a sound card, a disk, ...): Properties. A display's also has Display Settings.
@@ -267,18 +278,36 @@ class ComputerManager : public gui::Frame {
   static void on_wireless_item(void* self, gui::Control&);
   static void on_device_item(void* self, gui::Control&);
   static void on_bluetooth_item(void* self, gui::Control&);
+  static void on_copy_process_row(void* self, gui::Control&);
+  static void on_process_menu_opening(void* self, gui::Control&);
+  static void on_edit_copy(void* self, gui::Control&);
+  static void on_any_properties(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  static void on_grid_selection(void* self, gui::Control&);
+  void update_commands();      // the items of the menu bar, for the tab that is up and what is selected in it
+  gui::DataGrid* shown_grid(); // the table of the tab that is up (nullptr: it has none)
   bool selected_adapter(uint32_t* id) const;
   bool selected_entry(HardwareEntry* out) const;
   void rebuild_hardware();
 
+  // The hardware tree gives Enter to the frame when Alt is held: Alt+Enter is Properties, not "open the node".
+  class DeviceTree final : public gui::TreeView {
+   public:
+    explicit DeviceTree(allocators::IAllocator& allocator) : TreeView(allocator) {}
+    bool on_key(const gui::KeyArgs& args) override;
+  };
+
   gui::MenuBar menu_;
-  gui::ContextMenu grid_menu_;
-  gui::MenuItem* copy_row_item_ = nullptr;
+  gui::NoticeDialog* notices_ = nullptr;
+  gui::ContextMenu grid_menu_, process_grid_menu_;
+  gui::MenuItem *copy_row_item_ = nullptr, *copy_process_row_item_ = nullptr;
+  gui::MenuItem *edit_copy_item_ = nullptr, *about_item_ = nullptr;
+  gui::MenuItem *menu_display_item_ = nullptr, *menu_wireless_item_ = nullptr, *menu_bluetooth_item_ = nullptr, *menu_properties_item_ = nullptr;
   gui::MenuItem *processes_item_ = nullptr, *performance_item_ = nullptr, *hardware_item_ = nullptr, *usermode_item_ = nullptr;
   gui::TabControl tabs_;
   gui::ScrollPanel core_scroll_;
   gui::Panel processes_page_, performance_page_, hardware_page_, usermode_page_, cpu_row_, memory_row_;
-  gui::TreeView tree_;
+  DeviceTree tree_;
   gui::ContextMenu display_menu_, adapter_menu_, wireless_menu_, device_menu_, monitor_menu_, bluetooth_menu_;
   gui::MenuItem *device_properties_item_ = nullptr, *monitor_properties_item_ = nullptr, *monitor_settings_item_ = nullptr, *bluetooth_properties_item_ = nullptr, *bluetooth_settings_item_ = nullptr;
   gui::MenuItem *display_settings_item_ = nullptr, *properties_item_ = nullptr, *wireless_properties_item_ = nullptr, *wireless_adapter_item_ = nullptr;

@@ -29,12 +29,12 @@ using filesystem::Status;
 
 CopyProgressDialog::CopyProgressDialog(allocators::IAllocator& allocator)
     : Frame(allocator), heading_(allocator), file_(allocator), bytes_(allocator), bar_(allocator), buttons_(allocator), gap_(allocator),
-      cancel_button_(allocator), source_(allocator), target_(allocator), message_(allocator), scratch_(allocator), size_a_(allocator),
-      size_b_(allocator) {
+      cancel_button_(allocator), sources_(allocator), targets_(allocator), message_(allocator), scratch_(allocator), size_a_(allocator),
+      size_b_(allocator), number_a_(allocator), number_b_(allocator) {
   set_title("Copying");
   set_minimize_enabled(false);
   set_maximize_enabled(false);
-  set_close_enabled(false);   // Cancel is the way out: closing would leave the copy running unseen
+  set_escape_closes(true);   // Esc and the Close button cancel (see close_requested)
   set_resizable(false);
   set_padding(Insets::all(10));
 
@@ -65,11 +65,18 @@ CopyProgressDialog::CopyProgressDialog(allocators::IAllocator& allocator)
   add(&bytes_);
 }
 
-void CopyProgressDialog::on_cancel(void* self, Control&) {
-  auto* d = static_cast<CopyProgressDialog*>(self);
-  d->cancel();
-  d->cancel_button_.set_enabled(false);
-  d->heading_.set_text("Cancelling...");
+void CopyProgressDialog::on_cancel(void* self, Control&) { static_cast<CopyProgressDialog*>(self)->request_cancel(); }
+
+void CopyProgressDialog::request_cancel() {
+  if (!can_cancel()) return;
+  cancel();
+  cancel_button_.set_enabled(false);
+  heading_.set_text("Cancelling...");
+}
+
+bool CopyProgressDialog::close_requested() {
+  request_cancel();
+  return false;   // done() takes the window away when the work has stopped
 }
 
 bool CopyProgressDialog::wait_until_idle(uint64_t timeout_us) {
@@ -80,7 +87,25 @@ bool CopyProgressDialog::wait_until_idle(uint64_t timeout_us) {
   }
 }
 
+// One String per line of `text` (empty lines left out). False if memory ran out.
+bool CopyProgressDialog::split_lines(StringView text, List<String>* out) {
+  out->clear();
+  while (!text.empty()) {
+    const uint64_t end = text.find('\n');
+    const StringView line = end == StringView::npos ? text : text.first(end);
+    text = end == StringView::npos ? StringView() : text.without_prefix(end + 1);
+    if (line.empty()) continue;
+    String one(allocator());
+    if (!one.assign(line) || !out->push_back(util::move(one))) return false;
+  }
+  return true;
+}
+
 bool CopyProgressDialog::start(WindowManager& manager, filesystem::IFileSystem& fs, StringView source, StringView target, bool remove_source) {
+  return start_batch(manager, fs, source, target, remove_source);
+}
+
+bool CopyProgressDialog::start_batch(WindowManager& manager, filesystem::IFileSystem& fs, StringView sources, StringView targets, bool remove_source) {
   if (__atomic_exchange_n(&busy_, true, __ATOMIC_ACQ_REL)) return false;
   fs_ = &fs;
   manager_ = &manager;
@@ -88,13 +113,15 @@ bool CopyProgressDialog::start(WindowManager& manager, filesystem::IFileSystem& 
   result_ = Status::Ok;
   message_.clear();
   __atomic_store_n(&cancel_, false, __ATOMIC_RELEASE);
-  if (!source_.assign(source) || !target_.assign(target)) {
+  __atomic_store_n(&committed_, false, __ATOMIC_RELEASE);
+  if (!split_lines(sources, &sources_) || !split_lines(targets, &targets_) || sources_.count() == 0 || sources_.count() != targets_.count()) {
     __atomic_store_n(&busy_, false, __ATOMIC_RELEASE);
     return false;
   }
   set_title(remove_source ? "Moving" : "Copying");
   heading_.set_text("Preparing...");
-  file_.set_text(source.substr(source.rfind('/') + 1));
+  const StringView first = sources_[0].view();
+  file_.set_text(first.substr(first.rfind('/') + 1));
   bytes_.set_text("");
   bar_.set_maximum(0);
   bar_.set_value(0);
@@ -121,12 +148,12 @@ void CopyProgressDialog::work(void* self) { static_cast<CopyProgressDialog*>(sel
 
 void CopyProgressDialog::on_file(void* self, StringView path, uint64_t files_done, uint64_t files_total) {
   auto* d = static_cast<CopyProgressDialog*>(self);
-  d->scratch_.clear();
-  d->scratch_.append(d->remove_source_ ? "Moving " : "Copying ");
-  d->scratch_.append_uint(files_done + 1);
-  d->scratch_.append(" of ");
-  d->scratch_.append_uint(files_total);
-  d->scratch_.append(files_total == 1 ? " file" : " files");
+  if (d->cancelled()) return;   // (the heading says "Cancelling..." already)
+  d->number_a_.clear();
+  d->number_a_.append_uint(files_done + 1);
+  d->number_b_.clear();
+  d->number_b_.append_uint(files_total);
+  format_message(&d->scratch_, d->remove_source_ ? "Moving file %1 of %2" : "Copying file %1 of %2", d->number_a_.view(), d->number_b_.view());
   d->heading_.set_text(d->scratch_.view());
   d->file_.set_text(path.substr(path.rfind('/') + 1));
 }
@@ -137,10 +164,7 @@ void CopyProgressDialog::on_bytes(void* self, uint64_t bytes_done, uint64_t byte
   d->bar_.set_value(bytes_done);
   format_size(bytes_done, &d->size_a_);
   format_size(bytes_total, &d->size_b_);
-  d->scratch_.clear();
-  d->scratch_.append(d->size_a_.view());
-  d->scratch_.append(" of ");
-  d->scratch_.append(d->size_b_.view());
+  format_message(&d->scratch_, "%1 of %2", d->size_a_.view(), d->size_b_.view());
   d->bytes_.set_text(d->scratch_.view());
 }
 
@@ -149,25 +173,43 @@ void CopyProgressDialog::run() {
   FileTransfer transfer(allocator(), *fs_);
   transfer.set_callbacks(&CopyProgressDialog::on_file, &CopyProgressDialog::on_bytes, this);
   transfer.set_cancel_flag(&cancel_);
-  Status status = transfer.measure(source_.view());
+  Status status = Status::Ok;
+  uint64_t failed = 0;   // which one it stopped at
+  for (uint64_t i = 0; i < sources_.count() && status == Status::Ok; ++i) {
+    failed = i;
+    status = cancelled() ? FileTransfer::kCancelled : transfer.measure_also(sources_[i].view());
+  }
+  uint64_t started = 0;   // how many copies were begun (and may have left something behind)
   if (status == Status::Ok) {
     bar_.set_maximum(transfer.bytes_total());
-    status = transfer.copy(source_.view(), target_.view());
+    for (uint64_t i = 0; i < sources_.count() && status == Status::Ok; ++i) {
+      failed = i;
+      started = i + 1;
+      status = transfer.copy_also(sources_[i].view(), targets_[i].view());
+    }
   }
-  if (status == Status::Ok && remove_source_) {
+  // Cancel is taken up to here. After it the originals go, and nothing could put them back.
+  if (status == Status::Ok && cancelled()) status = FileTransfer::kCancelled;
+  if (status != Status::Ok) {
+    for (uint64_t i = 0; i < started; ++i) FileTransfer::remove_tree(allocator(), *fs_, targets_[i].view());   // no half-copied leftovers
+  } else if (remove_source_) {
+    __atomic_store_n(&committed_, true, __ATOMIC_RELEASE);
+    cancel_button_.set_enabled(false);
     heading_.set_text("Removing the originals...");
-    status = FileTransfer::remove_tree(allocator(), *fs_, source_.view());
-  } else if (status != Status::Ok) {
-    FileTransfer::remove_tree(allocator(), *fs_, target_.view());   // no half-copied leftovers
+    for (uint64_t i = 0; i < sources_.count() && status == Status::Ok; ++i) {
+      failed = i;
+      status = FileTransfer::remove_tree(allocator(), *fs_, sources_[i].view());
+    }
   }
   fs_->flush();
   result_ = status;
   message_.clear();
   if (status != Status::Ok && status != FileTransfer::kCancelled) {
-    message_.append(remove_source_ ? "Cannot move " : "Cannot copy ");
-    message_.append(source_.view().substr(source_.view().rfind('/') + 1));
-    message_.append(": ");
-    message_.append(describe_status(status));
+    const StringView source = sources_[failed].view();
+    const StringView name = source.substr(source.rfind('/') + 1);
+    const bool committed = __atomic_load_n(&committed_, __ATOMIC_ACQUIRE);
+    describe_failure(&message_, committed ? "\"%1\" was copied, but the original could not be removed because %2."
+                                : remove_source_ ? "\"%1\" could not be moved because %2." : "\"%1\" could not be copied because %2.", name, status);
   }
 }
 

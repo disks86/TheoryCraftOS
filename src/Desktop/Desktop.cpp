@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/Desktop.hpp"
+#include "Desktop/Format.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -39,6 +40,7 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       switcher_(allocator, windows_),
       tray_(allocator),
       clock_(allocator),
+      notify_button_(allocator),
       shutdown_dialog_(allocator),
       notice_dialog_(allocator),
       toasts_(allocator),
@@ -83,6 +85,9 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
       bluetooth_properties_(allocator),
       about_(allocator),
       about_lines_{Label(allocator), Label(allocator), Label(allocator)},
+      about_buttons_(allocator),
+      about_ok_(allocator),
+      notification_log_(allocator),
       database_url_(allocator),
       extra_explorers_(allocator),
       extra_notepads_(allocator),
@@ -125,7 +130,8 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   start_.menu().add_item("Media Player", {&Desktop::on_media_player, this});
   start_.menu().add_item("Video Viewer", {&Desktop::on_video_viewer, this});
   start_.menu().add_item("3D Test", {&Desktop::on_graphics_test, this});
-  about_item_ = start_.menu().add_item("About TheoryCraftOS...", {&Desktop::on_about, this});   // (the installed applications go before it)
+  system_item_ = start_.menu().add_item("Notifications", {&Desktop::on_notifications, this});   // (the installed applications go before it)
+  start_.menu().add_item("About TheoryCraftOS", {&Desktop::on_about, this});   // (no ellipsis: it asks for nothing)
   start_.on_opening({&Desktop::on_start_opening, this});
   start_.on_closed({&Desktop::on_start_closed, this});
   start_.menu().add_separator();
@@ -143,7 +149,12 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   tray_.set_size(180, 0);
   clock_.set_dock(DockStyle::Fill);
   clock_.set_text("--/--/---- --:-- --");
-  tray_.add(&clock_);
+  // Missed notifications: a button with its name and their number, there only while there is something to look at (see update_notifications_button()).
+  notify_button_.set_dock(DockStyle::Left);
+  notify_button_.set_visible(false);
+  notify_button_.on_click({&Desktop::on_notifications, this});
+  tray_.add(&notify_button_);
+  tray_.add(&clock_);   // Fill goes last
 
   switcher_.set_dock(DockStyle::Fill);
 
@@ -159,7 +170,10 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   surface_.add(&windows_);
   surface_.add(&toasts_);   // over the windows
 
-  shutdown_dialog_.set_texts("Shut Down", "Shut down TheoryCraftOS now?", "Running services will be stopped.", "Shut Down", "Cancel");
+  // The title names what the question is about. Shutting down cannot be taken back (every running program ends), so the button that leaves everything
+  // as it was is the default one: Enter and Escape both cancel, and Shut Down takes a deliberate choice (its access key, or Tab and Enter).
+  shutdown_dialog_.set_texts("Shut Down TheoryCraftOS", "Shut down the computer now?", "Programs that are still running will be closed.", "Shut Down", "Cancel");
+  shutdown_dialog_.set_default_choice(MessageDialog::Choice::Decline);
   shutdown_dialog_.on_result({&Desktop::on_shutdown_answer, this});
 
   media_player_.set_app_kind(kAppMedia);
@@ -180,13 +194,30 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   app_manager_.set_app_kind(kAppAppManager);
   setup_explorer(explorer_);
   copy_progress_.on_finished({&Desktop::on_copy_finished, this});
+  file_properties_.set_notices(&notice_dialog_);
+  file_properties_.on_changed({&Desktop::on_files_changed, this});   // (a rename applied in the property sheet: the explorers read the folder again)
 
   about_.set_title("About TheoryCraftOS");
   about_.set_bounds({140, 90, 400, 170});
   about_.set_padding(Insets::all(12));
-  about_.set_minimize_enabled(true);
+  // A secondary frame: no task-bar entry, no minimize or maximize, a fixed size; OK is its default button, Escape closes it too.
+  about_.set_minimize_enabled(false);
+  about_.set_maximize_enabled(false);
+  about_.set_resizable(false);
+  about_.set_in_taskbar(false);
+  about_.set_escape_closes(true);
   static const char* const kAbout[3] = {"TheoryCraftOS", "A minimal UEFI x86_64 operating system.",
                                         "Move, resize, minimize or maximize windows."};
+  about_buttons_.set_style(PanelStyle::Transparent);
+  about_buttons_.set_dock(DockStyle::Bottom);
+  about_buttons_.set_size(0, 28);
+  about_ok_.set_text("OK");
+  about_ok_.set_dock(DockStyle::Right);
+  about_ok_.set_size(90, 0);
+  about_ok_.set_default(true);
+  about_ok_.on_click(Handler::immediate(&Desktop::on_about_ok, this));
+  about_buttons_.add(&about_ok_);
+  about_.add(&about_buttons_);
   for (int i = 0; i < 3; ++i) {
     about_lines_[i].set_text(kAbout[i]);
     about_lines_[i].set_dock(DockStyle::Top);
@@ -206,6 +237,19 @@ Desktop::Desktop(allocators::IAllocator& allocator, graphics::IRenderer2D& rende
   computer_manager_.on_open_wireless_properties({&Desktop::on_wireless_properties, this});
   computer_manager_.on_open_device_properties({&Desktop::on_device_properties, this});
   computer_manager_.on_open_bluetooth_properties({&Desktop::on_bluetooth_properties, this});
+  computer_manager_.set_notices(&notice_dialog_);   // (About Computer Manager)
+  app_manager_.set_notices(&notice_dialog_);        // (About App Manager, and a job that failed)
+  // Properties in the print dialog: the property sheet of the printer chosen there. The print dialog is modal, so the sheet is shown modal on top of
+  // it (a dialog may open one further dialog); a sheet that was open already is brought there.
+  print_dialog_.on_printer_properties({[](void* self, Control&) {
+                                         auto* d = static_cast<Desktop*>(self);
+                                         d->window_.locked([&] {
+                                           d->device_properties_.show_device(HardwareGroup::Printers, d->print_dialog_.printer_index());
+                                           if (d->device_properties_.manager()) d->windows_.remove_window(&d->device_properties_);
+                                           d->windows_.add_window(&d->device_properties_, /*modal=*/true);
+                                         });
+                                       },
+                                       this});
   input_.set_confine(&Desktop::confine_pointer, this);
   input_.set_taps(&Desktop::tap_key, &Desktop::tap_mouse, this);
   window_.set_key_filter(&Desktop::on_shortcut, this);
@@ -216,10 +260,34 @@ bool Desktop::on_shortcut(void* self, const KeyArgs& args) {
   namespace key = hardware::key;
   auto* d = static_cast<Desktop*>(self);
   if (d->on_media_key(args.usage)) return true;   // (these work while a dialog is up, too)
-  if (d->windows_.has_modal()) return false;   // a dialog wants an answer first
-  if (args.usage == key::kTab && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) {
+  const bool alt = (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt)) != 0;
+  const bool control = (args.modifiers & hardware::modifier::kControl) != 0;
+  const bool forward = !(args.modifiers & hardware::modifier::kShift);
+  // Alt+F4 closes the active frame, a dialog too, the way its close button does: through Frame::close(), so a document with unsaved changes asks first.
+  // With no frame left to close it is the desktop's turn: the Shut Down question.
+  if (alt && !control && args.usage == key::kF1 + 3) {
     d->window_.close_popup();
-    d->windows_.cycle(!(args.modifiers & hardware::modifier::kShift));
+    Frame* active = d->windows_.active();
+    if (!active) d->ask_shut_down();
+    else if (active->close_enabled()) active->close();
+    return true;
+  }
+  if (d->windows_.has_modal()) return false;   // a dialog wants an answer first
+  // Alt+Tab and Alt+Esc go to the next frame (Shift: the previous one).
+  if (alt && !control && (args.usage == key::kTab || args.usage == key::kEscape)) {
+    d->window_.close_popup();
+    d->windows_.cycle(forward);
+    return true;
+  }
+  // Alt+F6: the next frame of the same program.
+  if (alt && !control && args.usage == key::kF1 + 5) {
+    d->window_.close_popup();
+    d->cycle_same_program(forward);
+    return true;
+  }
+  // Ctrl+Esc opens the launcher menu (as the Super key does, for keyboards without one).
+  if (control && !alt && args.usage == key::kEscape) {
+    d->start_.toggle_menu();
     return true;
   }
   if (args.usage == key::kTab && (args.modifiers & hardware::modifier::kControl)) {   // Ctrl+Tab: the next tab, whatever the focused program does with it
@@ -250,6 +318,7 @@ void show_level(Desktop& d, uint32_t* toast, StringView title, uint32_t percent)
   text[n++] = static_cast<char>('0' + percent % 10);
   text[n++] = '%';
   *toast = d.notify(title, StringView(text, n), gui::NoticeKind::Information, 1200);
+  if (*toast) d.toasts().set_transient(*toast);   // (feedback for the key, not a notification: it is not kept in the record of missed ones)
 }
 }  // namespace
 
@@ -295,6 +364,7 @@ bool Desktop::toggle_mute() {
   media_mixer_->set_master_muted(muted);
   if (osd_toast_) toasts_.dismiss(osd_toast_);
   osd_toast_ = notify("Volume", muted ? "Muted" : "Sound on", gui::NoticeKind::Information, 1200);
+  if (osd_toast_) toasts_.set_transient(osd_toast_);
   return true;
 }
 
@@ -420,7 +490,7 @@ void Desktop::apply_scanned_apps() {
     apps_separator_ = nullptr;
   }
   if (scanned_apps_.count() > 0 && !apps_separator_) {
-    const int32_t at = menu.index_of(about_item_);
+    const int32_t at = menu.index_of(system_item_);
     apps_separator_ = menu.insert_separator(at < 0 ? menu.item_count() : static_cast<uint32_t>(at));
   }
   for (InstalledApp& app : scanned_apps_.view()) {
@@ -434,7 +504,7 @@ void Desktop::apply_scanned_apps() {
       entry = made.get();
       if (!installed_apps_.push_back(util::move(made))) break;
     }
-    const int32_t at = menu.index_of(about_item_);
+    const int32_t at = menu.index_of(system_item_);
     entry->item = menu.insert_item(at < 0 ? menu.item_count() : static_cast<uint32_t>(at), entry->app.label.view(), {&Desktop::on_installed_app, entry});
     if (entry->item && !listed_apps_.push_back(entry)) {
       menu.remove_item(entry->item);
@@ -456,15 +526,19 @@ void Desktop::on_start_closed(void* self, Control&) {
 void Desktop::on_installed_app(void* self, Control&) {
   auto* entry = static_cast<InstalledEntry*>(self);
   Desktop* d = entry->desktop;
-  String folder(d->allocator_), line(d->allocator_);
+  String folder(d->allocator_), line(d->allocator_), name(d->allocator_);
   bool listed = false;
   d->window_.locked([&] {
     listed = entry->item && folder.assign(entry->app.working_directory.view()) && installed_app_command_line(entry->app, &line);
+    name.assign(entry->app.label.view());
   });
   if (!listed) return;
   Terminal* terminal = d->open_terminal();
-  if (terminal && !terminal->start_command(folder.view(), line.view()))
-    gui::NoticeDialog::post(&d->notice_dialog_, &d->windows_, gui::NoticeKind::Error, "Not enough memory to start the application.");
+  if (terminal && !terminal->start_command(folder.view(), line.view())) {   // (the message is about the application, so its name is the title)
+    String message(d->allocator_);
+    format_message(&message, "\"%1\" could not be started because there is not enough memory. Close something you do not need and try again.", name.view());
+    gui::NoticeDialog::post(&d->notice_dialog_, &d->windows_, gui::NoticeKind::Error, message.view(), name.view());
+  }
 }
 
 void Desktop::set_program_launcher(IProgramLauncher* launcher) {
@@ -904,33 +978,32 @@ uint32_t Desktop::announce_calendar(int64_t now_minutes) {
     const int64_t away = start - now_minutes;
     const int32_t m = minute_of_day(start);
     char clock[6] = {static_cast<char>('0' + m / 600), static_cast<char>('0' + m / 60 % 10), ':', static_cast<char>('0' + m % 60 / 10), static_cast<char>('0' + m % 10), 0};
-    if (day_of(start) == day_of(now_minutes)) {
-      text.assign("Today ");
-    } else {
-      char date[11];
+    // One whole sentence per case (never pieces glued together: the words come in another order in other languages). %1 is the day, %2 the time.
+    char date[11];
+    StringView day = "Today";
+    if (day_of(start) != day_of(now_minutes)) {
       gui::format_date(gui::date_from_days(day_of(start)), date);
-      text.assign(StringView(date, 10));
-      text.push_back(' ');
+      day = StringView(date, 10);
     }
-    if (announcement.all_day()) text.append("(all day)");
-    else text.append(StringView(clock, 5));
-    if (announcement.all_day()) {
-      // (nothing about minutes: the day itself is the appointment)
-    } else if (away > 0) {
-      text.append(", in ");
-      if (away >= 120) {
-        text.append_uint(static_cast<uint64_t>(away / 60));
-        text.append(" hours");
-      } else {
-        text.append_uint(static_cast<uint64_t>(away));
-        text.append(away == 1 ? " minute" : " minutes");
-      }
+    const StringView time(clock, 5);
+    String number(allocator_);
+    if (announcement.all_day()) {   // (nothing about minutes: the day itself is the appointment)
+      format_message(&text, "%1 (all day)", day);
+    } else if (away >= 120) {
+      number.append_uint(static_cast<uint64_t>(away / 60));
+      format_message(&text, "%1 %2, in %3 hours", day, time, number.view());
+    } else if (away > 1) {
+      number.append_uint(static_cast<uint64_t>(away));
+      format_message(&text, "%1 %2, in %3 minutes", day, time, number.view());
+    } else if (away == 1) {
+      format_message(&text, "%1 %2, in 1 minute", day, time);
     } else if (away == 0) {
-      text.append(", now");
+      format_message(&text, "%1 %2, now", day, time);
+    } else if (away == -1) {
+      format_message(&text, "%1 %2, started 1 minute ago", day, time);
     } else {
-      text.append(", started ");
-      text.append_uint(static_cast<uint64_t>(-away));
-      text.append(away == -1 ? " minute ago" : " minutes ago");
+      number.append_uint(static_cast<uint64_t>(-away));
+      format_message(&text, "%1 %2, started %3 minutes ago", day, time, number.view());
     }
     // (it stays until it is clicked or for a minute, whichever: a reminder must not be missed by looking away for a few seconds)
     if (notify(announcement.title.view(), text.view(), gui::NoticeKind::Information, 60000, {&Desktop::on_calendar_toast, this})) ++posted;
@@ -1245,11 +1318,118 @@ void Desktop::confine_pointer(void* self, int32_t* x, int32_t* y) {
 }
 
 void Desktop::open_about() {
-  if (about_.manager()) about_.activate();
-  else windows_.add_window(&about_);
+  window_.locked([&] {
+    if (about_.manager()) about_.activate();
+    else windows_.add_window(&about_);
+  });
+}
+void Desktop::on_about_ok(void* self, Control&) { static_cast<Desktop*>(self)->about_.close(); }
+
+void Desktop::open_notifications() {
+  window_.locked([&] {
+    notification_log_.refresh(toasts_);
+    if (notification_log_.manager()) notification_log_.activate();
+    else windows_.add_window(&notification_log_);
+    window_.set_focus(&notification_log_.close_button());   // (the default button: Enter closes, the arrow keys are a Tab away)
+    update_notifications_button();   // (they have been looked at now: the button goes)
+  });
+}
+void Desktop::on_notifications(void* self, Control&) { static_cast<Desktop*>(self)->open_notifications(); }
+
+void Desktop::update_notifications_button() {
+  const uint32_t serial = toasts_.missed_serial();
+  if (notification_log_.manager()) {   // open: it shows them as they come, and none is unseen
+    if (notification_log_.shown_serial() != serial) notification_log_.refresh(toasts_);
+    seen_missed_ = serial;
+  }
+  uint32_t unseen = serial - seen_missed_;
+  if (unseen > toasts_.missed_count()) unseen = toasts_.missed_count();   // (only the newest are kept)
+  if (unseen == indicated_missed_) return;
+  indicated_missed_ = unseen;
+  int32_t width = 0;
+  if (unseen) {
+    String number(allocator_), text(allocator_);
+    number.append_uint(unseen);
+    format_message(&text, "Notifications: %1", number.view());
+    width = Painter::text_width(text.view()) + 16;
+    notify_button_.set_text(text.view());
+    notify_button_.set_size(width, 0);
+  }
+  notify_button_.set_visible(unseen != 0);
+  tray_.set_size(180 + width, 0);
+  window_.layout();
+}
+
+void Desktop::cycle_same_program(bool forward) {
+  window_.locked([&] {
+    // The program of a window is that of the tab it shows.
+    auto kind_of = [](Frame* f) {
+      TabFrame* tabs = f->as_tabs();
+      Frame* shown = tabs ? tabs->selected() : f;
+      return shown ? shown->app_kind() : static_cast<uint8_t>(kAppNone);
+    };
+    Frame* active = windows_.active();
+    if (!active || kind_of(active) == kAppNone) return;
+    const uint32_t count = windows_.window_count();
+    uint32_t at = count;
+    for (uint32_t i = 0; i < count; ++i)
+      if (windows_.window_at(i) == active) at = i;
+    if (at == count) return;
+    for (uint32_t step = 1; step < count; ++step) {
+      Frame* f = windows_.window_at(forward ? (at + step) % count : (at + count - step) % count);
+      if (!f->in_taskbar() || kind_of(f) != kind_of(active)) continue;
+      windows_.activate(f);
+      return;
+    }
+  });
 }
 
 void Desktop::ask_shut_down() { shutdown_dialog_.show(windows_); }
+
+Frame* Desktop::unsaved_frame() {
+  Frame* found = nullptr;
+  auto look = [&](Frame& f, bool modified) {
+    if (!found && f.manager() && modified) found = &f;
+  };
+  look(notepad_, notepad_.editor().modified());
+  for (auto& n : extra_notepads_) look(*n, n->editor().modified());
+  look(paint_, paint_.canvas().modified());
+  for (auto& p : extra_paints_) look(*p, p->canvas().modified());
+  look(spreadsheet_, spreadsheet_.sheet().modified());
+  for (auto& s : extra_sheets_) look(*s, s->sheet().modified());
+  look(database_query_, database_query_.editor().modified());
+  for (auto& q : extra_queries_) look(*q, q->editor().modified());
+  return found;
+}
+
+// A confirmed shutdown goes on here, a step at a time (from pump(), and once straight from the answer): while a question, a Save As dialog or a save is
+// still under way nothing happens; then the next window with unsaved changes is brought forward and closed the ordinary way, which makes it ask. A window
+// that was asked and is still there with its changes means the user chose Cancel (or the save failed): the shutdown is off, and what is still open stays
+// exactly as it is.
+void Desktop::continue_shutdown() {
+  if (!shutdown_pending()) return;
+  if (!window_.wait_for_handlers(0)) return;   // (an answer is still being carried out)
+  window_.locked([&] {
+    if (!shutdown_pending() || windows_.has_modal()) return;
+    Frame* next = unsaved_frame();
+    if (!next) {
+      __atomic_store_n(&shutdown_pending_, false, __ATOMIC_RELEASE);
+      shutdown_asked_ = nullptr;
+      request_shutdown();
+      return;
+    }
+    if (next == shutdown_asked_) {
+      __atomic_store_n(&shutdown_pending_, false, __ATOMIC_RELEASE);
+      shutdown_asked_ = nullptr;
+      return;
+    }
+    shutdown_asked_ = next;
+    if (Frame* host = next->host())
+      if (TabFrame* tabs = host->as_tabs()) tabs->select_tab(next);
+    next->activate();
+    next->close();   // (asks Save / Don't Save / Cancel; a window that does not ask just closes, and the next step looks again)
+  });
+}
 
 void Desktop::on_computer_manager(void* self, Control&) { static_cast<Desktop*>(self)->open_computer_manager(); }
 void Desktop::on_video_viewer(void* self, Control&) { static_cast<Desktop*>(self)->open_video_viewer(); }
@@ -1278,8 +1458,12 @@ void Desktop::open_file(StringView file) {
   if (fs_) {   // programs cannot be run yet: say so instead of showing the bytes as text
     const exe::ExecutableKind kind = exe::identify_executable_file(*fs_, file);
     if (kind != exe::ExecutableKind::None) {
+      // (nothing to decide and nothing went wrong with the file: information, titled with the file it is about)
+      const uint64_t slash = file.rfind('/');
+      const StringView name = slash == StringView::npos ? file : file.substr(slash + 1);
       String message(allocator_);
-      if (exe::unsupported_executable_message(file, kind, &message)) gui::NoticeDialog::post(&notice_dialog_, &windows_, gui::NoticeKind::Warning, message.view());
+      if (format_message(&message, "\"%1\" is a program. Programs cannot be started by opening them yet. Start it from a terminal instead.", name))
+        gui::NoticeDialog::post(&notice_dialog_, &windows_, gui::NoticeKind::Information, message.view(), name);
       return;
     }
   }
@@ -1337,7 +1521,7 @@ Desktop::~Desktop() {
 void Desktop::on_copy_finished(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
   d->refresh_explorers();
-  if (!d->copy_progress_.message().empty()) d->notice_dialog_.show(d->windows_, NoticeKind::Error, d->copy_progress_.message());
+  if (!d->copy_progress_.message().empty()) d->notice_dialog_.show(d->windows_, NoticeKind::Error, d->copy_progress_.message(), d->copy_progress_.title());   // (titled like the window that showed the copy)
 }
 void Desktop::on_files_changed(void* self, Control&) { static_cast<Desktop*>(self)->refresh_explorers(); }
 void Desktop::on_explorer(void* self, Control&) { static_cast<Desktop*>(self)->open_explorer(); }
@@ -1346,7 +1530,10 @@ void Desktop::on_shut_down(void* self, Control&) { static_cast<Desktop*>(self)->
 
 void Desktop::on_shutdown_answer(void* self, Control&) {
   auto* d = static_cast<Desktop*>(self);
-  if (d->shutdown_dialog_.accepted()) d->request_shutdown();
+  if (!d->shutdown_dialog_.accepted()) return;
+  d->window_.locked([&] { d->shutdown_asked_ = nullptr; });
+  __atomic_store_n(&d->shutdown_pending_, true, __ATOMIC_RELEASE);
+  d->continue_shutdown();   // (with nothing unsaved and nothing else going on, this is the shutdown; otherwise pump() goes on with it)
 }
 
 uint32_t format_date_time(const DateTime& t, char* out) {
@@ -1397,11 +1584,13 @@ void Desktop::pump(uint64_t uptime_us) {
   __atomic_store_n(&now_us_, uptime_us, __ATOMIC_RELAXED);
   window_.tick(uptime_us);
   input_.pump();
+  continue_shutdown();
   win32_windows_.pump(windows_);
   x11_windows_.pump(windows_);
   wayland_windows_.pump(windows_);
   web_browser_.tick(uptime_us);
   toasts_.tick(uptime_us);
+  window_.locked([&] { update_notifications_button(); });
   if (media_player_.manager()) window_.locked([&] { media_player_.pump(); });
   web_notifications_.pump();
   if (browser_store_ && browser_data_restored_ && uptime_us - last_browser_save_us_ > 30000000ull) {   // (the data of the browser is saved when it changed, at most every half minute)

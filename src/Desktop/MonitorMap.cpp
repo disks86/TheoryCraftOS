@@ -128,8 +128,6 @@ void MonitorMap::paint(Painter& painter) {
         r.y = pointer_y_ - grab_dy_ - 2;
       }
       const bool selected = b.id == selected_;
-      const Rect2D box{r.x - 2, r.y - 2, r.width, r.height};
-      (void)box;
       painter.fill({r.x - 2, r.y - 2, r.width, r.height}, selected ? t.selection : t.face);
       painter.bevel({r.x - 2, r.y - 2, r.width, r.height}, false);
       if (b.primary) painter.fill({r.x, r.y - 2 + static_cast<int32_t>(r.height) - 7, r.width > 4 ? r.width - 4 : 0, 4}, selected ? t.selection_text : t.dark);   // the taskbar
@@ -189,9 +187,50 @@ void MonitorMap::on_mouse_up(const MouseArgs& args) {
   fire(moved_);
 }
 
+bool MonitorMap::move_selected(int32_t dx, int32_t dy) {
+  const int32_t at = selected_ == kNone ? -1 : index_of(selected_);
+  if (at < 0 || boxes_.count() < 2 || (dx == 0 && dy == 0)) return false;
+  const hardware::MonitorRect own = boxes_[static_cast<uint64_t>(at)].rect;
+  // The bounds of the other monitors: the selected one goes against the edge asked for.
+  bool any = false;
+  int32_t l = 0, t = 0, r = 0, b = 0;
+  for (uint64_t i = 0; i < boxes_.count(); ++i) {
+    if (static_cast<int32_t>(i) == at) continue;
+    const hardware::MonitorRect& m = boxes_[i].rect;
+    if (!any || m.x < l) l = m.x;
+    if (!any || m.y < t) t = m.y;
+    if (!any || m.right() > r) r = m.right();
+    if (!any || m.bottom() > b) b = m.bottom();
+    any = true;
+  }
+  moved_id_ = selected_;
+  moved_x_ = dx < 0 ? l - static_cast<int32_t>(own.width) : dx > 0 ? r : own.x;
+  moved_y_ = dy < 0 ? t - static_cast<int32_t>(own.height) : dy > 0 ? b : own.y;
+  fire(moved_);
+  return true;
+}
+
+// The menu is a monitor's: a click on the empty part of the picture has none; from the keyboard it is the selected monitor's.
+bool MonitorMap::accepts_context_menu(int32_t x, int32_t y) const { return box_at(x, y, compute_view()) >= 0; }
+
+void MonitorMap::prepare_context_menu(int32_t x, int32_t y) {
+  if (x < 0 || y < 0) return;   // (the Menu key: what is selected)
+  const int32_t i = box_at(x, y, compute_view());
+  if (i >= 0) select(boxes_[static_cast<uint64_t>(i)].id);
+}
+
 bool MonitorMap::on_key(const KeyArgs& args) {
   using namespace hardware;
   if (boxes_.count() == 0) return false;
+  if (args.modifiers & modifier::kControl) {   // Ctrl+arrow: the selected monitor goes to that side of the others
+    switch (args.usage) {
+      case key::kLeft: return move_selected(-1, 0);
+      case key::kRight: return move_selected(1, 0);
+      case key::kUp: return move_selected(0, -1);
+      case key::kDown: return move_selected(0, 1);
+      default: return false;
+    }
+  }
   const int32_t at = selected_ == kNone ? -1 : index_of(selected_);
   if (args.usage == key::kRight) select(boxes_[static_cast<uint64_t>(at + 1 < static_cast<int32_t>(boxes_.count()) ? at + 1 : at < 0 ? 0 : at)].id);
   else if (args.usage == key::kLeft) select(boxes_[static_cast<uint64_t>(at > 0 ? at - 1 : 0)].id);

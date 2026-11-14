@@ -23,7 +23,6 @@
 namespace gui {
 
 namespace {
-constexpr uint32_t kGridLine = 0xFFD0D0D0, kSelectedCell = 0xFFDCE6F7, kSelectedHeader = 0xFFA8B8D8, kActiveFrame = 0xFF000000;
 
 uint32_t digits_of(uint32_t n) {
   uint32_t d = 1;
@@ -302,7 +301,7 @@ void SpreadsheetGrid::paint(Painter& painter) {
       const int32_t w = column_width(c);
       const bool selected = c >= left && c <= right;
       const Rect2D cell{x, 0, static_cast<uint32_t>(w), static_cast<uint32_t>(kHeaderHeight)};
-      painter.fill(cell, selected ? kSelectedHeader : t.face);
+      painter.fill(cell, t.face);   // (a selected heading is shown pressed, by its bevel: the face keeps the colour its text is made for)
       painter.bevel(cell, selected);
       column_title(c, &title);
       painter.push_frame(cell);
@@ -318,7 +317,7 @@ void SpreadsheetGrid::paint(Painter& painter) {
   for (uint32_t r = first_row_, y = 0; r < rows() && y < body.height; ++r, y += kRowHeight) {
     const bool selected = r >= top && r <= bottom;
     const Rect2D cell{0, static_cast<int32_t>(y), static_cast<uint32_t>(row_header_width()), static_cast<uint32_t>(kRowHeight)};
-    painter.fill(cell, selected ? kSelectedHeader : t.face);
+    painter.fill(cell, t.face);   // (a selected heading is shown pressed, by its bevel: the face keeps the colour its text is made for)
     painter.bevel(cell, selected);
     title.clear();
     title.append_uint(r + 1);
@@ -336,9 +335,11 @@ void SpreadsheetGrid::paint(Painter& painter) {
       const Rect2D cell{x, static_cast<int32_t>(y), static_cast<uint32_t>(w), static_cast<uint32_t>(kRowHeight)};
       const bool in_selection = c >= left && c <= right && r >= top && r <= bottom;
       const bool active = c == active_column_ && r == active_row_;
-      painter.fill(cell, in_selection && !active && !single_cell_selected() ? kSelectedCell : t.field);
-      painter.fill({x, static_cast<int32_t>(y) + kRowHeight - 1, static_cast<uint32_t>(w), 1}, kGridLine);
-      painter.fill({x + w - 1, static_cast<int32_t>(y), 1, static_cast<uint32_t>(kRowHeight)}, kGridLine);
+      // Every colour is the theme's, in its pair: the selected cells in the selection colours, the others as fields.
+      const bool lit = in_selection && !active && !single_cell_selected();
+      painter.fill(cell, lit ? t.selection : t.field);
+      painter.fill({x, static_cast<int32_t>(y) + kRowHeight - 1, static_cast<uint32_t>(w), 1}, t.light);
+      painter.fill({x + w - 1, static_cast<int32_t>(y), 1, static_cast<uint32_t>(kRowHeight)}, t.light);
       const bool editing_here = editing_ && active;
       if (editing_here) {
         cell_text_.assign(edit_text_.view());
@@ -352,7 +353,7 @@ void SpreadsheetGrid::paint(Painter& painter) {
         int32_t tx = 3;
         if (editing_here && tw > w - 8) tx = w - 8 - tw;   // the end of long text, where it is being typed
         else if (right_aligned && tw < w - 8) tx = w - 5 - tw;
-        painter.text(tx, (kRowHeight - Painter::kGlyphHeight) / 2, cell_text_.view(), ink);
+        painter.text(tx, (kRowHeight - Painter::kGlyphHeight) / 2, cell_text_.view(), lit ? t.selection_text : ink);
         painter.pop_frame();
       }
       x += w;
@@ -362,8 +363,8 @@ void SpreadsheetGrid::paint(Painter& painter) {
   if (columns() && rows() && active_row_ >= first_row_ && active_column_ >= first_column_) {
     const Rect2D a = cell_rect(active_column_, active_row_);
     const Rect2D r{a.x - body.x - 1, a.y - body.y - 1, a.width + 1, a.height + 1};
-    painter.outline(r, kActiveFrame);
-    painter.outline({r.x + 1, r.y + 1, r.width > 2 ? r.width - 2 : 0, r.height > 2 ? r.height - 2 : 0}, kActiveFrame);
+    painter.outline(r, t.text);
+    painter.outline({r.x + 1, r.y + 1, r.width > 2 ? r.width - 2 : 0, r.height > 2 ? r.height - 2 : 0}, t.text);
   }
   painter.pop_frame();
 }

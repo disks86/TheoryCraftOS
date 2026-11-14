@@ -21,7 +21,7 @@
 // upwards), the window switcher in the space in between, and the clock. The Start menu offers "File Explorer", "Computer Manager", "Text Editor", "Terminal", "Calculator", "Calendar", "To-Do", "Paint", "Media Player", "3D Test",
 // then the Windows and Linux applications installed on the system as "Name (Windows)" / "Name (Linux)" (InstalledApps.hpp: their Start menu
 // shortcuts and desktop entries, looked for again each time the menu opens; one starts in a new Terminal window),
-// and "About" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
+// "Notifications" (what the toasts said, for whoever missed one) and "About TheoryCraftOS" (ordinary windows; a second File Explorer, Text Editor or Paint opens a new window next to the first, as many as wanted,
 // and files can be dragged from one explorer to another or onto an editor) and "Shut Down...", which asks for confirmation in a modal dialog and then only
 // requests the shutdown (shutdown_requested()): the boot code owns the hardware and does the orderly
 // power-off once the desktop loop returns.
@@ -48,6 +48,7 @@
 #include "Desktop/Todo.hpp"
 #include "Desktop/TodoStore.hpp"
 #include "Desktop/Notepad.hpp"
+#include "Desktop/NotificationLog.hpp"
 #include "Database/DatabaseManager.hpp"
 #include "Desktop/DatabaseQuery.hpp"
 #include "Desktop/WebBrowser.hpp"
@@ -64,6 +65,7 @@
 #include "Desktop/Terminal.hpp"
 #include "Desktop/ComputerManager.hpp"
 #include "Desktop/Win32Windows.hpp"
+#include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/MenuButton.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -128,6 +130,11 @@ class Desktop {
                   uint32_t duration_ms = gui::ToastCenter::kDefaultDurationMs, gui::Handler on_click = gui::Handler()) {
     return toasts_.post(title, message, kind, duration_ms, on_click);
   }
+  // The Notifications window: the toasts that went away before they were clicked (see NotificationLog.hpp). It is opened from the Start menu and from the
+  // button that appears next to the clock when something was missed (notifications_button(), hidden otherwise).
+  void open_notifications();
+  NotificationLog& notifications_window() { return notification_log_; }
+  gui::Button& notifications_button() { return notify_button_; }
   // The window that shows files being moved between volumes and remote shares.
   CopyProgressDialog& copy_progress() { return copy_progress_; }
   gui::Frame& about_window() { return about_; }
@@ -333,8 +340,12 @@ class Desktop {
   BluetoothProperties& bluetooth_properties() { return bluetooth_properties_; }
   // Opens the display settings window, or brings it forward. It is reached from the Displays group of the computer manager's hardware tree.
   void open_display_settings();
-  // Asks "shut down?" in a modal dialog; accepting it makes shutdown_requested() true.
+  // Asks "shut down?" in a modal dialog. Cancel is its default button (shutting down ends every running program and cannot be taken back), and Escape and the
+  // close button cancel too. Choosing Shut Down then asks every window with unsaved changes, one after the other, the way closing it does (Save / Don't Save /
+  // Cancel); a Cancel there, or a save that fails, calls the shutdown off and leaves the remaining windows as they are. Only when nothing unsaved is left does
+  // shutdown_requested() become true. shutdown_pending() is true while those questions are being asked.
   void ask_shut_down();
+  bool shutdown_pending() const { return __atomic_load_n(&shutdown_pending_, __ATOMIC_ACQUIRE); }
   StringView clock_text() const { return clock_.text(); }
   bool shutdown_requested() const { return __atomic_load_n(&shutdown_requested_, __ATOMIC_ACQUIRE); }
   void request_shutdown() { __atomic_store_n(&shutdown_requested_, true, __ATOMIC_RELEASE); }
@@ -403,6 +414,16 @@ class Desktop {
   static void confine_pointer(void* self, int32_t* x, int32_t* y);
   static void on_shut_down(void* self, gui::Control&);
   static void on_shutdown_answer(void* self, gui::Control&);
+  static void on_notifications(void* self, gui::Control&);
+  static void on_about_ok(void* self, gui::Control&);
+  // The next step of a shutdown the user confirmed: asks the next window with unsaved changes, or requests the shutdown when there is none (see ask_shut_down).
+  void continue_shutdown();
+  // An open program window whose document has changes that are not saved (nullptr: none).
+  gui::Frame* unsaved_frame();
+  // Alt+F6: the next window of the program the active window belongs to.
+  void cycle_same_program(bool forward);
+  // Shows the button next to the clock while there are notifications the Notifications window has not shown yet. Under the window lock.
+  void update_notifications_button();
 
   // --- the installed Windows and Linux applications in the Start menu
   // One per application listed since the desktop started. An entry is never freed or reused while the desktop lives (an application that
@@ -465,6 +486,7 @@ class Desktop {
   gui::WindowSwitcher switcher_;
   gui::Panel tray_;
   gui::Label clock_;
+  gui::Button notify_button_;   // "Notifications: 2", left of the clock while some were missed
   gui::MessageDialog shutdown_dialog_;
   gui::NoticeDialog notice_dialog_;
   gui::ToastCenter toasts_;
@@ -510,6 +532,13 @@ class Desktop {
   BluetoothProperties bluetooth_properties_;
   gui::Frame about_;
   gui::Label about_lines_[3];
+  gui::Panel about_buttons_;
+  gui::Button about_ok_;
+  NotificationLog notification_log_;
+  uint32_t seen_missed_ = 0;        // ToastCenter::missed_serial() when the Notifications window was last opened
+  uint32_t indicated_missed_ = 0;   // how many the button says
+  bool shutdown_pending_ = false;   // the user confirmed the shutdown; windows with unsaved changes are being asked
+  gui::Frame* shutdown_asked_ = nullptr;   // the one asked last
   filesystem::IFileSystem* fs_ = nullptr;
   IProgramLauncher* program_launcher_ = nullptr;
   database::DatabaseManager* databases_ = nullptr;
@@ -543,7 +572,7 @@ class Desktop {
   List<InstalledEntry*> listed_apps_;        // the ones in the menu now, in menu order
   List<InstalledApp> scanned_apps_;          // what the last scan found, until it is in the menu (only the scan thread touches it while one runs)
   filesystem::IFileSystem* scan_fs_ = nullptr;
-  gui::MenuItem* about_item_ = nullptr;      // the installed applications go just before it,
+  gui::MenuItem* system_item_ = nullptr;     // the first item of the desktop's own (Notifications, About): the installed applications go just before it,
   gui::MenuItem* apps_separator_ = nullptr;  // after a separator of their own
   bool scan_running_ = false, scan_again_ = false, scan_ready_ = false;
   bool reap_needed_ = false;

@@ -52,6 +52,10 @@ class FileTransfer {
   filesystem::Status measure(StringView path);
   // Copies `from` (a file or a folder with everything in it) to `to`, which must not exist.
   filesystem::Status copy(StringView from, StringView to);
+  // The same for one of several items that are transferred together: the totals and the progress run on from the items before it
+  // (measure_also() all of them first, then copy_also() each).
+  filesystem::Status measure_also(StringView path) { return measure_at(path, 0); }
+  filesystem::Status copy_also(StringView from, StringView to) { return copy_at(from, to, 0); }
   // Removes a file, or a folder with everything in it.
   static filesystem::Status remove_tree(allocators::IAllocator& allocator, filesystem::IFileSystem& fs, StringView path, uint32_t depth = 0);
 

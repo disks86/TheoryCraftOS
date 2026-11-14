@@ -17,10 +17,14 @@
  */
 
 // The window that shows a copy or move between volumes, or from and to a remote share, while it runs: what it is doing ("Moving 3 of 12 files"),
-// the file in progress, a progress bar with the bytes done, and a Cancel button. One transfer runs at a time (start() says no while busy). The
-// work is done on a background thread so the desktop stays usable - the window is not modal. When it ends - done, failed or cancelled - the window
-// closes, a failed or cancelled copy has its partial copy removed again, and the finished handler runs (result() and message() say how it went).
-// A move removes the original only after everything was copied. The dialog must outlive the transfer: call cancel() and wait_until_idle() first.
+// the file in progress, a progress bar with the bytes done, and a Cancel button. One transfer runs at a time (start() says no while busy); it may
+// be of several files and folders (start_batch()). The work is done on a background thread so the desktop stays usable - the window is not modal.
+// When it ends - done, failed or cancelled - the window closes and the finished handler runs (result() and message() say how it went).
+//
+// Cancel means what the guidelines say it means: everything is put back as it was. So nothing is taken away before everything has been
+// copied: a failed or cancelled transfer has all of its copies removed again, and a move removes the originals only at the very end - from then
+// on nothing can be put back, and the Cancel button (and Esc, and the Close button, which do the same) is unavailable.
+// The dialog must outlive the transfer: call cancel() and wait_until_idle() first.
 #pragma once
 #include "Desktop/FileTransfer.hpp"
 #include "FileSystem/IFileSystem.hpp"
@@ -30,6 +34,7 @@
 #include "Gui/Controls/ProgressBar.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "Gui/Windows/WindowManager.hpp"
+#include "ObjectContainer/List.hpp"
 
 namespace desktop {
 
@@ -42,8 +47,12 @@ class CopyProgressDialog : public gui::Frame {
   // Opens the window in `manager` and copies `source` (a file or folder) to `target` (which must not exist) on `fs`; with `remove_source` it is a
   // move. False if a transfer is already running or the window could not be shown. `fs` must outlive the transfer.
   bool start(gui::WindowManager& manager, filesystem::IFileSystem& fs, StringView source, StringView target, bool remove_source);
-  // Asks the running transfer to stop (the Cancel button does this).
+  // The same for several: `sources` and `targets` hold one full path per line, the n-th source goes to the n-th target.
+  bool start_batch(gui::WindowManager& manager, filesystem::IFileSystem& fs, StringView sources, StringView targets, bool remove_source);
+  // Asks the running transfer to stop and put back what it did (the Cancel button does this). Too late once the originals of a move are being removed.
   void cancel() { __atomic_store_n(&cancel_, true, __ATOMIC_RELEASE); }
+  // Whether Cancel can still put everything back.
+  bool can_cancel() const { return busy() && !__atomic_load_n(&committed_, __ATOMIC_ACQUIRE); }
   bool busy() const { return __atomic_load_n(&busy_, __ATOMIC_ACQUIRE); }
   bool cancelled() const { return __atomic_load_n(&cancel_, __ATOMIC_ACQUIRE); }
   // Waits for the transfer to end; false on timeout.
@@ -61,8 +70,14 @@ class CopyProgressDialog : public gui::Frame {
   gui::ProgressBar& bar() { return bar_; }
   gui::Button& cancel_button() { return cancel_button_; }
 
+ protected:
+  // The Close button and Esc are Cancel: the window stays until the transfer has stopped and tidied up.
+  bool close_requested() override;
+
  private:
   static void on_cancel(void* self, gui::Control&);
+  void request_cancel();
+  bool split_lines(StringView text, List<String>* out);
   static void work(void* self);
   static void done(void* self, gui::Control&);
   static void on_file(void* self, StringView path, uint64_t files_done, uint64_t files_total);
@@ -76,9 +91,10 @@ class CopyProgressDialog : public gui::Frame {
   gui::Handler finished_;
   filesystem::IFileSystem* fs_ = nullptr;
   gui::WindowManager* manager_ = nullptr;
-  String source_, target_, message_, scratch_, size_a_, size_b_;
+  List<String> sources_, targets_;
+  String message_, scratch_, size_a_, size_b_, number_a_, number_b_;
   bool remove_source_ = false;
-  bool busy_ = false, cancel_ = false;
+  bool busy_ = false, cancel_ = false, committed_ = false;
   filesystem::Status result_ = filesystem::Status::Ok;
 };
 

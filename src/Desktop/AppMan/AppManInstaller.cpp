@@ -102,16 +102,16 @@ bool write_chunk(void* context, ConstByteView data) {
 StringView result_name(Result result) {
   switch (result) {
     case Result::Ok: return "done";
-    case Result::InvalidName: return "not a valid application name";
-    case Result::NoScript: return "AppMan has no install script of that name (or it could not be fetched)";
-    case Result::NoDownload: return "the install script's download link could not be worked out";
+    case Result::InvalidName: return "its name is not a valid application name";
+    case Result::NoScript: return "the list has no install script for it, or the script could not be fetched";
+    case Result::NoDownload: return "its download address could not be worked out";
     case Result::DownloadFailed: return "the download failed";
-    case Result::NotAnAppImage: return "the download is not an AppImage";
+    case Result::NotAnAppImage: return "what was downloaded is not an application this program can install";
     case Result::NotInstalled: return "it is not installed";
     case Result::UpToDate: return "it is up to date";
-    case Result::Cancelled: return "cancelled";
-    case Result::FileError: return "the files could not be written";
-    case Result::OutOfMemory: return "not enough memory";
+    case Result::Cancelled: return "the work was cancelled";
+    case Result::FileError: return "its files could not be written";
+    case Result::OutOfMemory: return "there is not enough memory";
   }
   return "";
 }

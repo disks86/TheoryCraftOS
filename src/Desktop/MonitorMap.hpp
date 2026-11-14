@@ -20,6 +20,8 @@
 // with a dark bar along the bottom of the primary one (that is where the taskbar is). Click a rectangle to select it; drag it to another place
 // and let go: the handler is told where its top left would be on the desktop (the layout then puts it next to the others). Left and Right choose the
 // previous and the next monitor. The picture is scaled to fit and leaves room around the monitors to drop one beside the others.
+// Dragging is a shortcut: move_selected() puts the selected monitor on a side of the others, which is what Ctrl+arrow does and what the Move
+// commands of the context menu (given by the owner, see DisplaySettings) run. A secondary click, or the Menu key, selects the monitor first.
 #pragma once
 #include "Gui/Control.hpp"
 #include "Hardware/Monitor/MonitorTypes.hpp"
@@ -51,6 +53,10 @@ class MonitorMap : public gui::Control {
   int32_t moved_x() const { return moved_x_; }
   int32_t moved_y() const { return moved_y_; }
 
+  // Asks for the selected monitor to be put beside the others on one side (dx, dy: -1, 0 or 1), the way a drop there does: fires the moved
+  // handler with the place. False if there is no selected monitor or no other one to put it beside.
+  bool move_selected(int32_t dx, int32_t dy);
+
   bool dragging() const { return dragging_ != kNone; }
   // Where a monitor's rectangle is drawn (this control's coordinates); false if there is no such monitor.
   bool box_rect(uint32_t id, gui::Rect2D* out) const;
@@ -61,6 +67,8 @@ class MonitorMap : public gui::Control {
   void on_mouse_move(const gui::MouseArgs& args) override;
   void on_mouse_up(const gui::MouseArgs& args) override;
   bool on_key(const gui::KeyArgs& args) override;
+  bool accepts_context_menu(int32_t x, int32_t y) const override;
+  void prepare_context_menu(int32_t x, int32_t y) override;
 
  protected:
   gui::Size default_size() const override { return {320, 160}; }

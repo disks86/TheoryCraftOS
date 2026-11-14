@@ -78,6 +78,7 @@ uint32_t InputPump::pump() {
       const uint8_t bit = static_cast<uint8_t>(1u << (key.usage - hardware::key::kLeftControl));
       modifiers_ = key.pressed ? (modifiers_ | bit) : (modifiers_ & ~bit);
     }
+    window_.set_held_modifiers(modifiers_);   // (a click that follows is modified by what is held now)
     if (key_tap_) key_tap_(tap_context_, key, modifiers_);
     if (!key.pressed) continue;
     KeyArgs args;
@@ -86,7 +87,10 @@ uint32_t InputPump::pump() {
     args.character = hardware::key_to_ascii(key.usage, args.modifiers);
     window_.key(args);
   }
-  if (keyboard_) modifiers_ = keyboard_->modifiers();  // everything is delivered: the keyboard's own state is the truth again
+  if (keyboard_) {
+    modifiers_ = keyboard_->modifiers();  // everything is delivered: the keyboard's own state is the truth again
+    window_.set_held_modifiers(modifiers_);
+  }
 
   hardware::MouseEvent m;
   while (mouse_ && mouse_->poll(&m)) {

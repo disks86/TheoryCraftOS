@@ -23,15 +23,24 @@
 // The work happens on a thread of its own (a download can take minutes; the window stays usable and Cancel stops it), one job at a time. The catalog
 // is kept in /AppStore/AppMan (so the list is there at once next time; "Refresh list" fetches it again); the programs go where AppMan puts them
 // (AppMan/AppManInstaller.hpp). Like every program window it can be a tab of a tabbed window.
+//
+// Every command is in the menu bar (File, View, Application, Help) as well as on a button, and the commands of an application are in the
+// context menu of the list. What cannot be done now is unavailable. Remove deletes an application's files, so it asks first and Cancel is the
+// default answer (Del in the list is Remove). F5 is Refresh List. A job that fails says so in a message when the window is the active one
+// (never on top of other work), and in the status line either way.
 #pragma once
 #include "Desktop/AppMan/AppManCatalog.hpp"
 #include "Desktop/AppMan/AppManInstaller.hpp"
 #include "Desktop/HandlerThread.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/ListView.hpp"
+#include "Gui/Controls/Menu.hpp"
+#include "Gui/MessageDialog.hpp"
+#include "Gui/NoticeDialog.hpp"
 #include "Gui/Controls/ProgressBar.hpp"
 #include "Gui/Controls/TextBox.hpp"
 #include "Gui/Windows/Frame.hpp"
@@ -57,7 +66,11 @@ class AppManager : public gui::Frame {
   bool install_selected();
   bool update_selected();
   bool remove_selected();
+  // What the Remove button, menu item and Del do: asks "Remove <name>?" first (when the window is in a window manager), then removes.
+  bool ask_remove();
   void cancel();
+  // Where messages are shown (nullptr: in the status line only). It must outlive the window.
+  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; update_controls(); }
   void set_query(StringView text);
   void set_filter(Filter filter);
   void select_row(int32_t row);
@@ -78,6 +91,11 @@ class AppManager : public gui::Frame {
   gui::Button& cancel_button() { return cancel_; }
   gui::Button& refresh_button() { return refresh_; }
   gui::ProgressBar& progress_bar() { return progress_; }
+  gui::MenuBar& menu_bar() { return menu_; }
+  gui::ContextMenu& list_menu() { return list_menu_; }
+  gui::MessageDialog& remove_dialog() { return ask_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
 
   void layout() override;
 
@@ -92,6 +110,11 @@ class AppManager : public gui::Frame {
   static void on_remove(void* self, gui::Control&);
   static void on_cancel(void* self, gui::Control&);
   static void on_refresh(void* self, gui::Control&);
+  static void on_exit(void* self, gui::Control&);
+  static void on_installed_only(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  static void on_remove_answer(void* self, gui::Control&);
+  void report(gui::NoticeKind kind, StringView text);   // a result the user must not miss
   static void run_job(void* self, gui::Control&);
   static void on_progress(void* self, const appman::Progress& progress);
 
@@ -104,6 +127,13 @@ class AppManager : public gui::Frame {
   void say(StringView text) { status_.set_text(text); }
 
   allocators::IAllocator& allocator_;
+  gui::MenuBar menu_;
+  gui::ContextMenu list_menu_;
+  gui::MenuItem *installed_only_item_ = nullptr, *refresh_item_ = nullptr, *install_item_ = nullptr, *update_item_ = nullptr, *remove_item_ = nullptr,
+                *cancel_item_ = nullptr, *about_item_ = nullptr, *list_install_item_ = nullptr, *list_update_item_ = nullptr, *list_remove_item_ = nullptr;
+  gui::MessageDialog ask_;                      // "Remove <name>?"
+  String remove_name_;                          // the application the question is about
+  gui::NoticeDialog* notices_ = nullptr;
   gui::Label search_label_, show_label_, details_, status_;
   gui::TextBox search_;
   gui::DropDown show_;

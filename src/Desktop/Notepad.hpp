@@ -16,15 +16,16 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The text editor application: a window with a menu bar (File: New, Open, Save, Save As, Print, Close; Edit: Cut, Copy, Paste,
-// Select All), a TextEditor and a status bar showing the caret position and what the last command did. Warnings, information and
-// errors appear in the shared NoticeDialog rather than in the status bar. Open and Save As
-// pick the file in the shared FileDialog; Save writes to the file the text came from (or asks like Save As when there is
-// none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S and Ctrl+P do the same as the menu items. A
-// command that would throw away unsaved changes does nothing the first time (a warning says so) and
-// goes ahead when it is repeated. Files are read and written as plain bytes; a CR before a line break is dropped
-// on opening, so saved files always use LF.
+// The text editor application: a window with a menu bar (File: New, Open, Save, Save As, Print, Exit; Edit: Undo, Redo, Cut, Copy, Paste, Delete,
+// Select All; Help: About Text Editor), a TextEditor and a status bar showing the caret position and what the last command did. Warnings, information
+// and errors appear in the shared NoticeDialog. Open and Save As pick the file in the shared FileDialog; Save writes to the file the text came from
+// (or asks like Save As when there is none). Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S and Ctrl+P do the same as the menu items. A command that cannot
+// work right now is disabled in the menu (nothing selected to cut, nothing to undo, nothing to print), and its key then does nothing.
+// The title is "Document name - Text Editor"; a new document is "Document 1", "Document 2"... New, Open and closing the window ask
+// Save / Don't Save / Cancel first when there are unsaved changes (see DocumentFrame). Files are read and written as plain bytes; a CR before
+// a line break is dropped on opening, so saved files always use LF.
 #pragma once
+#include "Desktop/DocumentFrame.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/PrintDialog.hpp"
 #include "FileSystem/IFileSystem.hpp"
@@ -32,12 +33,10 @@
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/TextEditor.hpp"
-#include "Gui/NoticeDialog.hpp"
-#include "Gui/Windows/Frame.hpp"
 
 namespace desktop {
 
-class Notepad : public gui::Frame {
+class Notepad : public DocumentFrame {
  public:
   static constexpr uint64_t kMaxFileBytes = gui::TextEditor::kDefaultMaxLength;
 
@@ -46,18 +45,15 @@ class Notepad : public gui::Frame {
   // The filesystem files are opened from and saved to (nullptr: none). It must outlive the editor.
   void set_file_system(filesystem::IFileSystem* fs) { fs_ = fs; }
 
-  // The dialog that Open and Save As use (nullptr: none, they then say so). It must outlive the editor.
+  // The dialog that Open and Save As use (nullptr: none, the commands are then disabled). It must outlive the editor.
   void set_file_dialog(FileDialog* dialog) { dialog_ = dialog; }
-  // The dialog that Print uses (nullptr: none, Print then says so). It must outlive the editor.
+  // The dialog that Print uses (nullptr: none, Print is then disabled). It must outlive the editor.
   void set_print_dialog(PrintDialog* dialog) { print_dialog_ = dialog; }
-  // The dialog that warnings, information and errors are shown in (nullptr: the status line says them instead). It must outlive the editor.
-  void set_notices(gui::NoticeDialog* notices) { notices_ = notices; }
 
-  // Starts an empty, unnamed document. False (and nothing changes) while there are unsaved changes the user has not
-  // agreed to lose.
+  // Starts an empty, unnamed document. False (and nothing changes yet) while there are unsaved changes: the question about them is then on
+  // the screen and the new document starts when the answer allows it.
   bool new_document();
-  // Loads the file at `path` into the editor. False if it cannot be read (an error dialog says why) or unsaved changes
-  // are in the way.
+  // Loads the file at `path` into the editor. False if it cannot be read (an error dialog says why) or unsaved changes are in the way (as above).
   bool open_file(StringView path);
   // Writes the text to `path` (the file it came from when empty; with neither, the Save As dialog opens and this returns false).
   // False if that fails.
@@ -68,7 +64,6 @@ class Notepad : public gui::Frame {
   // File > Print: the print dialog, then the text goes to the chosen printer.
   void ask_print();
 
-  StringView path() const { return path_.view(); }
   gui::TextEditor& editor() { return editor_; }
   gui::MenuBar& menu_bar() { return menu_; }
   gui::Label& status_label() { return status_; }
@@ -79,6 +74,12 @@ class Notepad : public gui::Frame {
   void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { open_file(text); }
   bool on_key(const gui::KeyArgs& args) override;
 
+ protected:
+  bool document_modified() const override { return editor_.modified(); }
+  bool save_document() override { return save_file(); }
+  void carry_out(Next next, StringView path) override;
+  void say(StringView text) override { status_.set_text(text); }
+
  private:
   static void on_new(void* self, gui::Control&);
   static void on_open(void* self, gui::Control&);
@@ -88,37 +89,38 @@ class Notepad : public gui::Frame {
   static void on_print_picked(void* self, gui::Control&);
   static void on_open_picked(void* self, gui::Control&);
   static void on_save_picked(void* self, gui::Control&);
-  static void on_close(void* self, gui::Control&);
+  static void on_exit(void* self, gui::Control&);
+  static void on_undo(void* self, gui::Control&);
+  static void on_redo(void* self, gui::Control&);
   static void on_cut(void* self, gui::Control&);
   static void on_copy(void* self, gui::Control&);
   static void on_paste(void* self, gui::Control&);
+  static void on_delete(void* self, gui::Control&);
   static void on_select_all(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
   static void on_edited(void* self, gui::Control&);
   static void on_moved(void* self, gui::Control&);
-  bool may_discard();
+  static void on_menu_opening(void* self, gui::Control&);
+  void start_new();
+  void show_open_dialog();
   bool read_into_editor(StringView path);
   bool write_from_editor(StringView path);
-  void say(StringView text) { status_.set_text(text); }
-  // Warnings, information and errors go to the notice dialog (or the status line when there is none to show it in).
-  void notify(gui::NoticeKind kind, StringView text) {
-    if (!gui::NoticeDialog::post(notices_, manager(), kind, text)) say(text);
-  }
-  void update_title();
   void update_position();
   void update_menus();
+  // What the commands need to be able to work (the menu items are enabled by the same rules).
+  bool can_open() const { return dialog_ && fs_; }
+  bool can_save() const { return fs_ && (!path().empty() || dialog_); }
+  bool can_print() const { return print_dialog_ && !editor_.text().empty(); }
 
   gui::MenuBar menu_;
   gui::Panel status_bar_;
   gui::Label status_, position_;
-  gui::MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr;
+  gui::MenuItem *open_item_ = nullptr, *save_item_ = nullptr, *save_as_item_ = nullptr, *print_item_ = nullptr;
+  gui::MenuItem *undo_item_ = nullptr, *redo_item_ = nullptr, *cut_item_ = nullptr, *copy_item_ = nullptr, *paste_item_ = nullptr, *delete_item_ = nullptr;
   gui::TextEditor editor_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;
   PrintDialog* print_dialog_ = nullptr;
-  gui::NoticeDialog* notices_ = nullptr;
-  String path_;  // the file the text came from or was saved to (empty: none yet)
-  String name_;  // its name as shown in the title
-  bool discard_armed_ = false;
 };
 
 }  // namespace desktop

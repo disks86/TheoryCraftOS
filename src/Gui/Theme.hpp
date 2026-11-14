@@ -24,6 +24,7 @@ namespace gui {
 
 struct Theme {
   uint32_t desktop = 0xFF008080;
+  uint32_t desktop_text = 0xFF40A0A0;  // text drawn straight on the desktop (its pair): quiet, a watermark
   uint32_t face = 0xFFC0C0C0;       // window and button surface
   uint32_t highlight = 0xFFFFFFFF;  // bevel, lit edge
   uint32_t light = 0xFFDFDFDF;      // bevel, inner lit edge

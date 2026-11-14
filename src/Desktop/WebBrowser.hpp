@@ -16,16 +16,22 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The web browser: a window with a menu bar (File: Open File, Close; Go: Back, Forward, Reload; View: Scripts, Dark Colors), a bar with the Back, Forward
-// and Reload buttons, the address box and Go, the page, and a status bar that says what is happening (and where the link under the pointer leads). It
+// The web browser: a window with a menu bar (File: New Tab, Open Location, Open File, Save Page As, Close; Edit: the clipboard commands of the address box
+// or of the field of the page that is being typed in; View: Dark Colors; Go: Back, Forward, Reload, Stop and the pages that were visited; Tools: Run Scripts,
+// the cookie settings; Help), a bar with the Back, Forward, Reload and Stop buttons, the address box and Go, the page, and a status bar that says what is
+// happening (and where the link under the pointer leads). The title is the page's, then the program's ("Page - Web Browser"). It
 // shows HTML pages as browser::Page loads them - a document tree (see dom::Document) that scripts can read and change (see browser::DomBindings), styled
 // by CSS from <style>, style attributes and linked stylesheets, with selectors and @media queries answered for the size of the window and the colour
 // scheme, drawn as text, headings, lists, tables and links, with its pictures (<img>: PNG, JPEG, GIF - animated too -, BMP, WebP lossless and more), videos (<video>: AVI, MP4 / MOV with H.264, GIF, APNG, Y4M, with sound and a control bar, on the machine's video hardware when it has some) and canvases (<canvas> with the 2D context, drawn by the GPU when the machine has one) in the places the layout gives them - and plain text, from the web (http:// and https://, through the page loader the
 // desktop gives it) and from the system's own volumes (a path such as /docs/index.html).
 // A click on the page goes to the page as a click event (and follows a link when no script stops it); timers run from tick(); when a script changes the
 // page, or the window is resized, the page is drawn again where it was scrolled to.
-// Enter in the address box, or Go, opens what is typed; Ctrl+L goes to the address box, Alt+Left and Alt+Right are Back and Forward, F5 and Ctrl+R
-// reload, Ctrl+O opens a file. A file dragged here from a file explorer is opened.
+// Enter in the address box, or Go, opens what is typed; Ctrl+L (or Alt and the access key of "Address:") goes to the address box, F6 goes from the
+// address box to the page and back, Alt+Left and Alt+Right are Back and Forward, F5 and Ctrl+R reload, Esc stops a page that is being fetched (in the
+// address box it puts the address of the page back), Ctrl+O opens a file, Ctrl+S saves the page (the Downloads folder is offered), Ctrl+W closes the
+// tab, F1 shows the help page. Every one of them is a menu item too. A file dragged here from a file explorer is opened.
+// A right click on the page shows a menu for the link under the pointer and the page; the Back and Forward buttons list where they would go (the Go
+// menu has the same list).
 //
 // Pages are fetched on the window's handler thread (without one - in tests - right away), so the desktop stays alive while a server thinks; opening
 // something while a page is still loading replaces the request that has not started yet. Everything that touches the loaded page runs on that thread.
@@ -57,6 +63,22 @@
 
 namespace desktop {
 
+// The browser's toolbar: buttons docked at the left (and right), and one control that fills what is left wherever it stands among the others. The
+// address box so comes before the Go button in the tree - and with that in the Tab order, which follows reading order - although Go is docked at
+// the right. (Control::layout() gives a Fill control everything that is left at the moment it is reached.)
+class BrowserToolbar final : public gui::Panel {
+ public:
+  explicit BrowserToolbar(allocators::IAllocator& allocator) : gui::Panel(allocator) {}
+  void layout() override;
+};
+
+// The address box: a text box that leaves Alt+Left and Alt+Right alone (they are Back and Forward, also while an address is being typed).
+class AddressBox final : public gui::TextBox {
+ public:
+  explicit AddressBox(allocators::IAllocator& allocator) : gui::TextBox(allocator) {}
+  bool on_key(const gui::KeyArgs& args) override;
+};
+
 // Where the notifications of pages and the questions about their permission go: the desktop shows them as toasts and a dialog (see WebNotifications.hpp). Called from any thread.
 class INotificationSink {
  public:
@@ -81,6 +103,10 @@ class WebBrowser : public gui::Frame {
   // A script, style sheet or picture that does not come within this long is given up (the page goes on without it); downloads started ahead of time are waited
   // for no longer than this either.
   static constexpr uint32_t kSubresourceTimeoutMs = 15000;
+  // The address of the built-in help page (Help > Help Topics, F1).
+  static constexpr const char* kHelpAddress = "about:help";
+  // The largest file a form can send.
+  static constexpr uint64_t kMaxUploadBytes = 16u << 20;
   // The time of day in milliseconds since 1970 for Date (0 if there is none).
   using UnixClock = uint64_t (*)(void* context);
 
@@ -149,6 +175,14 @@ class WebBrowser : public gui::Frame {
   bool go_back();
   bool go_forward();
   bool reload();
+  // Gives up the page that is being fetched: what comes back is thrown away and the page that was shown stays. False if nothing is loading.
+  bool stop();
+  // Shows the built-in help page.
+  bool show_help() { return navigate(kHelpAddress); }
+  // The page shown can be saved as a file (it came from somewhere, and there is a dialog and a disk to save with).
+  bool can_save() const { return dialog_ && fs_ && !current_.empty() && saved_.size() > 0; }
+  // File > Save Page As: asks for a name (offering the page's, in the Downloads folder) and writes the page as it came.
+  void ask_save();
   bool can_go_back() const { return history_.can_go(-1); }
   bool can_go_forward() const { return history_.can_go(1); }
   // Puts an address in the address box without opening it (a restored session shows it so; the user presses Go).
@@ -159,6 +193,10 @@ class WebBrowser : public gui::Frame {
 
   gui::PageView& page() { return page_; }
   gui::TextBox& address_box() { return address_; }
+  gui::Label& address_label() { return address_label_; }
+  gui::Button& stop_button() { return stop_; }
+  gui::ContextMenu& page_menu() { return page_menu_; }
+  gui::MessageDialog& clear_dialog() { return clear_dialog_; }
   gui::Button& back_button() { return back_; }
   gui::ContextMenu& back_menu() { return back_menu_; }
   gui::ContextMenu& forward_menu() { return forward_menu_; }
@@ -195,6 +233,9 @@ class WebBrowser : public gui::Frame {
   bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return !text.empty() && text[0] == '/'; }
   void on_drop(StringView text, int32_t, int32_t, const gui::Control*) override { navigate(text); }
   bool on_key(const gui::KeyArgs& args) override;
+  // Enables the menu items and buttons that apply right now and disables the others. Called whenever something they depend on changed, and before
+  // a menu opens (MenuBar::on_opening).
+  void update_commands();
 
  protected:
   void window_closed(gui::Window* window) override;
@@ -292,6 +333,32 @@ class WebBrowser : public gui::Frame {
   static void on_window_gone(void* self, gui::Control&);
   void show_welcome();
   bool window_shown();
+  static void on_stop(void* self, gui::Control&);
+  static void on_new_tab(void* self, gui::Control&);
+  static void on_open_location(void* self, gui::Control&);
+  static void on_save(void* self, gui::Control&);
+  static void on_save_picked(void* self, gui::Control&);
+  static void on_cut(void* self, gui::Control&);
+  static void on_copy(void* self, gui::Control&);
+  static void on_paste(void* self, gui::Control&);
+  static void on_delete(void* self, gui::Control&);
+  static void on_select_all(void* self, gui::Control&);
+  static void on_help(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  static void on_page_menu_opening(void* self, gui::Control&);
+  static void on_open_link(void* self, gui::Control&);
+  static void on_clear_answer(void* self, gui::Control&);
+  // What the Edit menu's commands do: in the address box when it has the focus, else in the field of the page that is being typed in.
+  enum class EditCommand : uint8_t { Cut, Copy, Paste, Delete, SelectAll };
+  void edit(EditCommand command);
+  void focus_address();
+  void follow_link(StringView link);
+  // The pages Back and Forward lead to, as items at the end of the Go menu (the page shown has the check mark).
+  void rebuild_go_history();
+  void set_loading(bool loading);
+  // A message about `name` (%1 of `pattern`, see format_message) and `reason` (%2), as a notice.
+  void notify_about(gui::NoticeKind kind, StringView pattern, StringView name, StringView reason = StringView());
   static void on_toggle_scripts(void* self, gui::Control&);
   static void on_toggle_dark(void* self, gui::Control&);
   static void on_toggle_third_party(void* self, gui::Control&);
@@ -348,10 +415,27 @@ class WebBrowser : public gui::Frame {
   uint64_t rich_sequence_ = 0;
   bool rich_valid_ = false;
   gui::MenuBar menu_;
-  gui::ContextMenu back_menu_, forward_menu_;
+  gui::ContextMenu back_menu_, forward_menu_, page_menu_;
   Hop hops_[2 * kHops];
   gui::MenuItem* hop_items_[2 * kHops] = {};
-  gui::MessageDialog leave_dialog_;
+  // The Go menu's list: up to kGoBack pages back and kGoForward pages forward around the one shown.
+  static constexpr uint32_t kGoBack = 6, kGoForward = 5, kGoEntries = kGoBack + 1 + kGoForward, kGoTextChars = 40;
+  Hop go_hops_[kGoEntries];
+  gui::MenuItem* go_items_[kGoEntries] = {};
+  gui::MenuItem* go_separator_ = nullptr;
+  gui::Menu* go_menu_ = nullptr;
+  bool go_dirty_ = true;
+  gui::MenuItem *new_tab_item_ = nullptr, *open_item_ = nullptr, *save_item_ = nullptr;
+  gui::MenuItem *cut_item_ = nullptr, *copy_item_ = nullptr, *paste_item_ = nullptr, *delete_item_ = nullptr, *select_all_item_ = nullptr;
+  gui::MenuItem *back_item_ = nullptr, *forward_item_ = nullptr, *reload_item_ = nullptr, *stop_item_ = nullptr;
+  gui::MenuItem *link_item_ = nullptr, *page_back_item_ = nullptr, *page_forward_item_ = nullptr, *page_reload_item_ = nullptr, *page_save_item_ = nullptr;
+  String menu_link_;                // the link the page's context menu was opened on ("" off a link)
+  String shown_title_;              // the name of the page in the title bar
+  ByteBuffer saved_;                // the page shown as it came (what Save Page As writes)
+  bool saved_html_ = false;
+  bool stop_requested_ = false;     // Stop was chosen while a page was being fetched (atomic)
+  uint8_t page_capture_ = 0;        // the page's key capture mode as last set: kCaptureAll while a field of the page is typed in (atomic)
+  gui::MessageDialog leave_dialog_, clear_dialog_;
   Request leave_kind_ = Request::None;
   String leave_target_;
   bool leave_confirmed_ = false;
@@ -378,9 +462,11 @@ class WebBrowser : public gui::Frame {
   INotificationSink* notification_sink_ = nullptr;
   OpenWindowFn open_fn_ = nullptr;
   void* open_ctx_ = nullptr;
-  gui::Panel toolbar_, status_bar_;
-  gui::Button back_, forward_, reload_, go_;
-  gui::TextBox address_;
+  BrowserToolbar toolbar_;
+  gui::Panel status_bar_;
+  gui::Button back_, forward_, reload_, stop_, go_;
+  gui::Label address_label_;
+  AddressBox address_;
   gui::Label status_;
   gui::PageView page_;
   filesystem::IFileSystem* fs_ = nullptr;

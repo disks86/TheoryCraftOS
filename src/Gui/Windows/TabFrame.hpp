@@ -43,7 +43,7 @@ class TabFrame : public Frame {
   bool add_tab(Frame* tab, int32_t index = -1);
   // Takes the tab out and hands it back without closing it. A tab next to it is selected. An empty window stays open (see close_tab).
   bool remove_tab(Frame* tab);
-  // Takes the tab out and runs its closed handler; closes the window when it was the last one.
+  // Takes the tab out and runs its closed handler; closes the window when it was the last one. The tab is not asked: Frame::close() on the tab asks it first.
   void close_tab(Frame* tab);
   void select_tab(Frame* tab);
 
@@ -87,6 +87,7 @@ class TabFrame : public Frame {
 
  protected:
   void manager_changed() override;
+  bool close_requested() override;   // asks every tab
   void window_closed(Window* window) override;
   void tab_title_changed(Frame* tab) override;
 

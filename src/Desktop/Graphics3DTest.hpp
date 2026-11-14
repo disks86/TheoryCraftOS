@@ -18,9 +18,10 @@
 
 // The 3D test application: a window with a spinning, depth-tested, colored cube drawn through the kernel-mode Direct3D driver (CubeRenderer: the
 // same calls a Direct3D program's user-mode driver makes) on one of its adapters, the frame rate, and
-// an indicator of where the drawing happens - green "GPU accelerated" when the host's graphics hardware does it (virgl on QEMU, SVGA3D on
-// VMware / VirtualBox), amber "Software (CPU)" when the OS's own rasterizer does. A check box switches between the two when a GPU device is
-// there, so the speeds can be compared.
+// a line that says where the drawing happens - "GPU accelerated" when the host's graphics hardware does it (virgl on QEMU, SVGA3D on
+// VMware / VirtualBox), "Software (CPU)" when the OS's own rasterizer does. A check box switches between the two when a GPU device is
+// there, so the speeds can be compared. The status lines are under the picture, in the theme's colours (only the picture has colours of its
+// own); the controls are ordinary check boxes and radio buttons with access keys, in reading order for Tab, the radio group behind its label.
 //
 // Each frame is drawn from paint(), which runs on the window's render thread - the only thread that uses the 3D device - so the cube needs no
 // thread or lock of its own. The picture is read back from the device (small, so that reading it back is cheap) and shown like any image.
@@ -37,6 +38,7 @@
 #include "Graphics/SystemGraphics.hpp"
 #include "Kernel/Dxgkrnl/DxgKernel.hpp"
 #include "Gui/Controls/CheckBox.hpp"
+#include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
 #include "Gui/Controls/RadioButton.hpp"
 #include "Gui/Windows/Frame.hpp"
@@ -134,6 +136,7 @@ class Graphics3DTest : public gui::Frame {
   CubeView& view() { return view_; }
   gui::CheckBox& gpu_box() { return gpu_box_; }
   gui::CheckBox& texture_box() { return texture_box_; }
+  gui::Label& api_label() { return api_label_; }
   gui::RadioButton& api_button(CubeApi api) { return api == CubeApi::Vulkan ? vulkan_button_ : api == CubeApi::OpenGL ? opengl_button_ : direct3d_button_; }
 
  private:
@@ -143,11 +146,13 @@ class Graphics3DTest : public gui::Frame {
   void update_gpu_box();
 
   CubeView view_;
+  gui::Panel controls_;   // the two rows of controls along the bottom
   gui::Panel bar_;
   gui::CheckBox gpu_box_;
   gui::CheckBox texture_box_;
   gui::RadioGroup api_group_;   // (before its buttons: it must outlive them)
   gui::Panel api_bar_;
+  gui::Label api_label_;
   gui::RadioButton direct3d_button_, vulkan_button_, opengl_button_;
 };
 

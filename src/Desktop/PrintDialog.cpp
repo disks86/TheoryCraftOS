@@ -17,6 +17,7 @@
  */
 
 #include "Desktop/PrintDialog.hpp"
+#include "Desktop/Format.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 
@@ -30,6 +31,9 @@ using hardware::PrinterState;
 
 PrintDialog::PrintDialog(allocators::IAllocator& allocator)
     : Frame(allocator),
+      body_(allocator),
+      button_row_(allocator),
+      main_(allocator),
       options_panel_(allocator),
       preview_panel_(allocator),
       page_row_(allocator),
@@ -42,8 +46,8 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
       toner_row_(allocator),
       picture_row_(allocator),
       stretch_row_(allocator),
-      button_row_(allocator),
       gap_(allocator),
+      printer_gap_(allocator),
       printer_label_(allocator),
       paper_label_(allocator),
       orientation_label_(allocator),
@@ -70,6 +74,7 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
       copies_(allocator),
       previous_(allocator),
       next_(allocator),
+      properties_(allocator),
       preview_(allocator),
       layout_(allocator),
       text_(allocator),
@@ -82,27 +87,23 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
   set_escape_closes(true);
   set_padding(Insets::all(8));
 
-  // Buttons along the bottom, with the message beside them.
-  button_row_.set_style(PanelStyle::Transparent);
-  button_row_.set_dock(DockStyle::Bottom);
+  // Buttons along the bottom, right-aligned, with the message beside them: Print (the default button), then Cancel.
   button_row_.set_size(0, 32);
   button_row_.set_padding(Insets{0, 4, 0, 0});
+  message_.set_dock(DockStyle::Fill);
+  print_.set_text("Print");
+  print_.set_size(92, 0);
+  print_.set_default(true);
+  print_.on_click({&PrintDialog::on_print, this});
+  gap_.set_style(PanelStyle::Transparent);
+  gap_.set_size(8, 0);
   cancel_.set_text("Cancel");
-  cancel_.set_dock(DockStyle::Right);
   cancel_.set_size(92, 0);
   cancel_.on_click({&PrintDialog::on_cancel, this});
-  gap_.set_style(PanelStyle::Transparent);
-  gap_.set_dock(DockStyle::Right);
-  gap_.set_size(8, 0);
-  print_.set_text("Print");
-  print_.set_dock(DockStyle::Right);
-  print_.set_size(92, 0);
-  print_.on_click({&PrintDialog::on_print, this});
-  message_.set_dock(DockStyle::Fill);
-  button_row_.add(&cancel_);
-  button_row_.add(&gap_);
-  button_row_.add(&print_);
   button_row_.add(&message_);
+  button_row_.add(&print_);
+  button_row_.add(&gap_);
+  button_row_.add(&cancel_);
 
   // The rows, from the top: a caption on the left and the control after it.
   struct Row {
@@ -133,9 +134,20 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
       r.row.set_padding(Insets{112, 2, 0, 2});   // a check box lines up with the controls
     }
   }
-  printer_.set_dock(DockStyle::Fill);
+  // The printer, and beside it the button to its properties (a button that serves one field sits next to it).
+  printer_.set_dock(DockStyle::Left);
+  printer_.set_size(192, 0);
   printer_.on_selection_changed({&PrintDialog::on_printer, this});
+  printer_gap_.set_style(PanelStyle::Transparent);
+  printer_gap_.set_dock(DockStyle::Left);
+  printer_gap_.set_size(6, 0);
+  properties_.set_text("Properties");
+  properties_.set_dock(DockStyle::Left);
+  properties_.set_size(100, 0);
+  properties_.on_click({&PrintDialog::on_properties, this});
   printer_row_.add(&printer_);
+  printer_row_.add(&printer_gap_);
+  printer_row_.add(&properties_);
   paper_.set_dock(DockStyle::Left);
   paper_.set_size(180, 0);
   paper_row_.add(&paper_);
@@ -184,9 +196,10 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
   from_page_.set_size(70, 0);
   from_page_.set_range(1, 1);
   from_page_.on_value_changed({&PrintDialog::on_from, this});
-  to_label_.set_text(" to ");
+  to_label_.set_text("To:");      // (a label with a colon: its access key goes to the box after it)
   to_label_.set_dock(DockStyle::Left);
   to_label_.set_size(36, 0);
+  to_label_.set_padding(Insets{6, 0, 0, 0});
   to_page_.set_dock(DockStyle::Left);
   to_page_.set_size(70, 0);
   to_page_.set_range(1, 1);
@@ -214,13 +227,13 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
   page_row_.set_dock(DockStyle::Bottom);
   page_row_.set_size(0, 30);
   page_row_.set_padding(Insets{0, 4, 0, 0});
-  previous_.set_text("<");
+  previous_.set_text("Previous");
   previous_.set_dock(DockStyle::Left);
-  previous_.set_size(32, 0);
+  previous_.set_size(76, 0);
   previous_.on_click({&PrintDialog::on_previous, this});
-  next_.set_text(">");
+  next_.set_text("Next");
   next_.set_dock(DockStyle::Right);
-  next_.set_size(32, 0);
+  next_.set_size(76, 0);
   next_.on_click({&PrintDialog::on_next, this});
   page_label_.set_dock(DockStyle::Fill);
   page_row_.add(&previous_);
@@ -244,9 +257,25 @@ PrintDialog::PrintDialog(allocators::IAllocator& allocator)
   options_panel_.add(&picture_row_);
   options_panel_.add(&stretch_row_);
 
-  add(&button_row_);
-  add(&options_panel_);
-  add(&preview_panel_);  // Fill goes last
+  main_.set_style(PanelStyle::Transparent);
+  main_.set_dock(DockStyle::Fill);
+  main_.add(&options_panel_);
+  main_.add(&preview_panel_);  // Fill goes last
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&main_);
+  body_.add(&button_row_);
+  add(&body_);
+  update_properties_button();
+}
+
+// Properties needs a printer to show and somebody to show it.
+void PrintDialog::update_properties_button() { properties_.set_enabled(static_cast<bool>(printer_properties_) && printer_.selected_index() >= 0); }
+
+void PrintDialog::on_properties(void* self, Control&) {
+  auto* d = static_cast<PrintDialog*>(self);
+  if (d->printer_.selected_index() < 0) return;
+  d->printer_index_ = static_cast<uint32_t>(d->printer_.selected_index());
+  d->fire(d->printer_properties_);
 }
 
 bool PrintDialog::show(WindowManager& manager, Kind kind, StringView title, Handler result) {
@@ -294,11 +323,12 @@ void PrintDialog::load_printers() {
   }
   loading_ = false;
   if (count == 0) {
-    status_.set_text("No printers found.");
+    status_.set_text("No printer was found. Connect one, then open this dialog again.");
     paper_.clear_items();
     quality_.clear_items();
     paper_count_ = dpi_count_ = 0;
     print_.set_enabled(false);
+    update_properties_button();
     relayout();
     return;
   }
@@ -315,18 +345,14 @@ void PrintDialog::load_printer(uint32_t index) {
   loading_ = true;
   printer_index_ = index;
   margin_mm10_ = p.unprintable_mm10;
-  String line(allocator());
-  line.append(!p.present ? "Not connected" : p.state == PrinterState::Busy ? "Busy" : p.state == PrinterState::Error ? "Error" : "Ready");
-  line.append(p.color ? " - color" : " - black and white");
-  if (p.duplex) line.append(", duplex");
-  line.append(", up to ");
-  line.append_uint(p.max_dpi);
-  line.append(" dpi");
-  if (p.pages_per_minute) {
-    line.append(", ");
-    line.append_uint(p.pages_per_minute);
-    line.append(" pages/min");
-  }
+  // One line about the printer: its state, then what it can do. (Whole patterns with places for the numbers, not a sentence put together from pieces.)
+  const char* state = !p.present ? "Not connected" : p.state == PrinterState::Busy ? "Busy" : p.state == PrinterState::Error ? "Needs attention" : "Ready";
+  const char* inks = p.color ? (p.duplex ? "color, both sides of the paper" : "color") : (p.duplex ? "black and white, both sides of the paper" : "black and white");
+  String dpi(allocator()), speed(allocator()), abilities(allocator()), line(allocator());
+  dpi.append_uint(p.max_dpi);
+  speed.append_uint(p.pages_per_minute);
+  format_message(&abilities, p.pages_per_minute ? "%1, up to %2 dpi, %3 pages a minute" : "%1, up to %2 dpi", inks, dpi.view(), speed.view());
+  format_message(&line, "%1 - %2", state, abilities.view());
   status_.set_text(line.view());
 
   paper_.clear_items();
@@ -343,7 +369,7 @@ void PrintDialog::load_printer(uint32_t index) {
 
   quality_.clear_items();
   dpi_count_ = 0;
-  static const struct { uint16_t dpi; const char* name; } kQualities[] = {{300, "300 dpi (draft)"}, {600, "600 dpi (normal)"}, {1200, "1200 dpi (best)"}};
+  static const struct { uint16_t dpi; const char* name; } kQualities[] = {{300, "Draft (300 dpi)"}, {600, "Normal (600 dpi)"}, {1200, "Best (1200 dpi)"}};
   int32_t normal = 0;
   for (const auto& q : kQualities) {
     if (q.dpi > p.max_dpi && dpi_count_ > 0) break;
@@ -355,6 +381,7 @@ void PrintDialog::load_printer(uint32_t index) {
   quality_.set_selected_index(normal);
   print_.set_enabled(p.present);
   loading_ = false;
+  update_properties_button();
   relayout();
 }
 
@@ -420,13 +447,13 @@ void PrintDialog::update_pages() {
   String text(allocator());
   if (pages == 0) {
     text.assign("Nothing to preview");
+  } else if (kind_ == Kind::Picture) {
+    text.assign("The page");
   } else {
-    text.assign(kind_ == Kind::Picture ? "The page" : "Page ");
-    if (kind_ == Kind::Text) {
-      text.append_uint(preview_.page() + 1);
-      text.append(" of ");
-      text.append_uint(pages);
-    }
+    String page(allocator()), count(allocator());
+    page.append_uint(preview_.page() + 1);
+    count.append_uint(pages);
+    format_message(&text, "Page %1 of %2", page.view(), count.view());
   }
   page_label_.set_text(text.view());
   previous_.set_enabled(preview_.page() > 0);

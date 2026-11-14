@@ -19,10 +19,13 @@
 // The Video Viewer: what a video source of the system shows (the cameras, the screen, a program's camera or screen share: every PipeWire video
 // producer), picked from a list, the picture fitted to the window. It watches only the source it shows and only while it is open (so a camera
 // streams only then); encoded video is decoded (Motion JPEG, and H.264, H.265, MPEG-2, VC-1, VP8 and VP9 through the machine's video codecs). The sources come from an IVideoSources the kernel gives the desktop (src/PipeWire over the graph).
+// The title names the source on show, then the program ("Camera - Video Viewer"). The list of sources has a label ("Source:") whose access key
+// goes to it; the line at the bottom says in a sentence what is shown, or why nothing is and what to do about it.
 #pragma once
 #include "Gui/Controls/DropDown.hpp"
 #include "Gui/Controls/ImageView.hpp"
 #include "Gui/Controls/Label.hpp"
+#include "Gui/Controls/Panel.hpp"
 #include "Gui/Windows/Frame.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/String.hpp"
@@ -61,13 +64,17 @@ class VideoViewer : public gui::Frame {
   uint64_t pictures() const { return pictures_; }
   StringView status() const { return status_text_.view(); }
   gui::DropDown& source_list() { return list_; }
+  gui::Label& source_label() { return source_label_; }
 
  private:
   static void on_pick(void* self, gui::Control& sender);
   void refresh_list();
   void set_status(StringView text);
+  void update_title();   // "<source> - Video Viewer" while one is watched, the program's name otherwise
 
   IVideoSources* sources_ = nullptr;
+  gui::Panel top_;              // the row with the list and its label
+  gui::Label source_label_;
   gui::DropDown list_;
   gui::Label status_;
   gui::ImageView view_;

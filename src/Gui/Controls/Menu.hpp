@@ -176,6 +176,9 @@ class MenuBar : public Control, public MenuHost {
   int32_t open_menu_index() const { return open_; }  // -1 = none open
   // The item with this text in the menu with this title (for enabling, checking or running it from code); nullptr if there is none.
   MenuItem* find_item(StringView menu_title, StringView item_text) const;
+  // Runs (in the thread that opens the menu, before it shows) every time a menu of the bar is about to open: the place to enable, disable and
+  // check the items for the state of the program, as ContextMenu::on_opening is for a context menu.
+  void on_opening(Handler handler) { UiGuard lock(this); opening_ = handler; }
 
   void paint(Painter& painter) override;
   void on_mouse_move(const MouseArgs& args) override;
@@ -210,6 +213,7 @@ class MenuBar : public Control, public MenuHost {
 
   List<Menu*> menus_;
   MenuPopup popup_;
+  Handler opening_;
   int32_t open_ = -1;
   int32_t hot_ = -1;
 };

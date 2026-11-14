@@ -59,11 +59,24 @@ Status read_sorted_directory(IFileSystem& fs, StringView path, List<DirectoryEnt
 }
 
 bool describe_entry_type(const DirectoryEntry& entry, String* out) {
+  // The friendly names of the types the built-in applications open (the user's word for the thing, not the name of its format).
+  static const struct {
+    const char* extensions;
+    const char* name;
+  } kTypes[] = {{"txt;md;log", "Text Document"},
+                {"png;jpg;jpeg;gif;bmp;webp;tga;ico;qoi", "Picture"},
+                {"csv", "Spreadsheet"},
+                {"sql", "Database Query"},
+                {"wav;mp3;ogg;flac;opus;aac", "Sound"},
+                {"mp4;webm;avi;mkv;mov;y4m", "Video"},
+                {"htm;html", "Web Page"}};
   out->clear();
   if (entry.type == NodeType::Directory) return out->assign("Folder");
   const StringView name = entry.name.view();
   const uint64_t dot = name.rfind('.');
   if (dot == StringView::npos || dot == 0 || dot + 1 == name.size()) return out->assign("File");
+  for (const auto& type : kTypes)
+    if (name_has_extension(name, type.extensions)) return out->assign(type.name);
   for (uint64_t i = dot + 1; i < name.size() && i < dot + 6; ++i)
     if (!out->push_back(upper(name[i]))) return false;
   return out->append(" File");

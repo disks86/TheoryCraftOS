@@ -144,6 +144,31 @@ uint32_t Desktop::save_session() {
 }
 
 namespace {
+// The remembered place of a window, adjusted to the screen as it is now (it may be smaller than when the session was saved, or a monitor may be gone):
+// the window is made no larger than the work area it is mostly on and moved to lie wholly inside it, so all of it can be seen and reached.
+gui::Rect2D fit_to_screen(const gui::WindowManager& windows, gui::Rect2D bounds) {
+  gui::Rect2D area = windows.area(0);
+  uint64_t best = 0;
+  for (uint32_t i = 0; i < windows.area_count(); ++i) {
+    const gui::Rect2D a = windows.area(i);
+    const int64_t left = bounds.x > a.x ? bounds.x : a.x, top = bounds.y > a.y ? bounds.y : a.y;
+    const int64_t right = int64_t{bounds.x} + bounds.width < int64_t{a.x} + a.width ? int64_t{bounds.x} + bounds.width : int64_t{a.x} + a.width;
+    const int64_t bottom = int64_t{bounds.y} + bounds.height < int64_t{a.y} + a.height ? int64_t{bounds.y} + bounds.height : int64_t{a.y} + a.height;
+    const uint64_t shared = right > left && bottom > top ? static_cast<uint64_t>(right - left) * static_cast<uint64_t>(bottom - top) : 0;
+    if (shared > best) {
+      best = shared;
+      area = a;
+    }
+  }
+  if (area.width == 0 || area.height == 0) return bounds;   // (not laid out yet: the window manager places it later)
+  if (bounds.width > area.width) bounds.width = area.width;
+  if (bounds.height > area.height) bounds.height = area.height;
+  const int32_t max_x = area.x + static_cast<int32_t>(area.width - bounds.width), max_y = area.y + static_cast<int32_t>(area.height - bounds.height);
+  bounds.x = bounds.x < area.x ? area.x : bounds.x > max_x ? max_x : bounds.x;
+  bounds.y = bounds.y < area.y ? area.y : bounds.y > max_y ? max_y : bounds.y;
+  return bounds;
+}
+
 // Puts a window where it was: its normal place first, then maximized, docked or minimized the way it was.
 void apply_geometry(Frame* window, const gui::Rect2D& bounds, Frame::State state, Frame::State before, Frame::Dock dock) {
   window->set_bounds(bounds);
@@ -222,7 +247,7 @@ uint32_t Desktop::restore_session() {
         window = host;
       }
       if (!window) continue;
-      if (width > 0) apply_geometry(window, bounds, state, before, dock);
+      if (width > 0) apply_geometry(window, fit_to_screen(windows_, bounds), state, before, dock);
       ++restored;
     }
   });

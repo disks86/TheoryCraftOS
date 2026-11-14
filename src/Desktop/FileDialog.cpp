@@ -18,6 +18,8 @@
 
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/DirectoryListing.hpp"
+#include "Desktop/FileStatus.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Desktop/Format.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
@@ -52,17 +54,35 @@ bool normalize(StringView in, String* out) {
   return any || out->assign("/");
 }
 
+// Whether a name ends in what reads like an extension the user typed on purpose: a full stop followed by one to five letters and digits,
+// at least one of them a letter, and not at the start of the name.
+bool typed_extension(StringView name) {
+  const uint64_t dot = name.rfind('.');
+  if (dot == StringView::npos || dot == 0) return false;
+  const StringView ext = name.substr(dot + 1);
+  if (ext.empty() || ext.size() > 5) return false;
+  bool letter = false;
+  for (char c : ext) {
+    const bool is_letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (!is_letter && !(c >= '0' && c <= '9')) return false;
+    letter = letter || is_letter;
+  }
+  return letter;
+}
+
 }  // namespace
 
 FileDialog::FileDialog(allocators::IAllocator& allocator)
     : Frame(allocator),
+      body_(allocator),
       address_row_(allocator),
       name_row_(allocator),
       type_row_(allocator),
-      button_row_(allocator),
       gap_(allocator),
+      button_row_(allocator),
       bar_(allocator),
       list_(allocator),
+      look_label_(allocator),
       name_label_(allocator),
       type_label_(allocator),
       message_(allocator),
@@ -75,43 +95,48 @@ FileDialog::FileDialog(allocators::IAllocator& allocator)
       selected_(allocator),
       pending_(allocator) {
   set_minimize_enabled(false);
+  set_maximize_enabled(false);
   set_escape_closes(true);
   set_padding(Insets::all(8));
 
+  // From the top, in reading order (which is also the order Tab takes): the folder, what is in it, the name, the type, the buttons.
   address_row_.set_style(PanelStyle::Transparent);
-  address_row_.set_dock(DockStyle::Top);
   address_row_.set_size(0, 30);
   address_row_.set_padding(Insets{0, 0, 0, 4});
+  look_label_.set_text("Look in:");
+  look_label_.set_access_key('l');   // (pinned, so that the same letters lead to the same fields in Open and in Save As)
+  look_label_.set_dock(DockStyle::Left);
+  look_label_.set_size(120, 0);
   bar_.set_dock(DockStyle::Fill);
   bar_.on_navigate({&FileDialog::on_navigate, this});
+  address_row_.add(&look_label_);
   address_row_.add(&bar_);
 
-  // Along the bottom, from the lowest row up: the buttons (with the message beside them), the type, the name.
-  button_row_.set_style(PanelStyle::Transparent);
-  button_row_.set_dock(DockStyle::Bottom);
-  button_row_.set_size(0, 32);
-  button_row_.set_padding(Insets{0, 4, 0, 0});
-  cancel_.set_text("Cancel");
-  cancel_.set_dock(DockStyle::Right);
-  cancel_.set_size(92, 0);
-  cancel_.on_click({&FileDialog::on_cancel, this});
-  gap_.set_style(PanelStyle::Transparent);
-  gap_.set_dock(DockStyle::Right);
-  gap_.set_size(8, 0);
-  ok_.set_dock(DockStyle::Right);
-  ok_.set_size(92, 0);
-  ok_.on_click({&FileDialog::on_ok, this});
-  message_.set_dock(DockStyle::Fill);
-  button_row_.add(&cancel_);
-  button_row_.add(&gap_);
-  button_row_.add(&ok_);
-  button_row_.add(&message_);
+  list_.add_column("Name", 280);
+  list_.add_column("Size", 80, Align::Right);
+  list_.add_column("Type", 110);
+  list_.set_dock(DockStyle::Fill);
+  list_.set_copy_enabled(false);
+  list_.on_selection_changed({&FileDialog::on_selection, this});
+  list_.on_item_activated({&FileDialog::on_activated, this});
+
+  name_row_.set_style(PanelStyle::Transparent);
+  name_row_.set_size(0, 30);
+  name_row_.set_padding(Insets{0, 2, 0, 2});
+  name_label_.set_text("File name:");
+  name_label_.set_access_key('n');
+  name_label_.set_dock(DockStyle::Left);
+  name_label_.set_size(120, 0);
+  name_.set_dock(DockStyle::Fill);
+  name_.on_changed(Handler::immediate(&FileDialog::on_name_changed, this));
+  name_row_.add(&name_label_);
+  name_row_.add(&name_);
 
   type_row_.set_style(PanelStyle::Transparent);
-  type_row_.set_dock(DockStyle::Bottom);
   type_row_.set_size(0, 30);
   type_row_.set_padding(Insets{0, 2, 0, 2});
   type_label_.set_text("Files of type:");
+  type_label_.set_access_key('t');
   type_label_.set_dock(DockStyle::Left);
   type_label_.set_size(120, 0);
   type_.set_dock(DockStyle::Fill);
@@ -119,32 +144,55 @@ FileDialog::FileDialog(allocators::IAllocator& allocator)
   type_row_.add(&type_label_);
   type_row_.add(&type_);
 
-  name_row_.set_style(PanelStyle::Transparent);
-  name_row_.set_dock(DockStyle::Bottom);
-  name_row_.set_size(0, 30);
-  name_row_.set_padding(Insets{0, 2, 0, 2});
-  name_label_.set_text("File name:");
-  name_label_.set_dock(DockStyle::Left);
-  name_label_.set_size(120, 0);
-  name_.set_dock(DockStyle::Fill);
-  name_row_.add(&name_label_);
-  name_row_.add(&name_);
-
-  list_.add_column("Name", 280);
-  list_.add_column("Size", 80, Align::Right);
-  list_.add_column("Type", 100);
-  list_.set_dock(DockStyle::Fill);
-  list_.set_copy_enabled(false);
-  list_.on_selection_changed({&FileDialog::on_selection, this});
-  list_.on_item_activated({&FileDialog::on_activated, this});
+  // The buttons, right-aligned: the default one first, then Cancel; both the same width. (The message line fills what is left of them.)
+  button_row_.set_size(0, 32);
+  button_row_.set_padding(Insets{0, 4, 0, 0});
+  message_.set_dock(DockStyle::Fill);
+  ok_.set_size(92, 0);
+  ok_.set_default(true);
+  ok_.on_click({&FileDialog::on_ok, this});
+  gap_.set_style(PanelStyle::Transparent);
+  gap_.set_size(8, 0);
+  cancel_.set_text("Cancel");
+  cancel_.set_size(92, 0);
+  cancel_.on_click({&FileDialog::on_cancel, this});
+  button_row_.add(&message_);
+  button_row_.add(&ok_);
+  button_row_.add(&gap_);
+  button_row_.add(&cancel_);
 
   replace_.on_result({&FileDialog::on_replace_answer, this});
 
-  add(&address_row_);
-  add(&button_row_);
-  add(&type_row_);
-  add(&name_row_);
-  add(&list_);  // Fill goes last
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&address_row_);
+  body_.add(&list_);
+  body_.add(&name_row_);
+  body_.add(&type_row_);
+  body_.add(&button_row_);
+  add(&body_);
+}
+
+void FileDialog::say(StringView text) {
+  if (text.empty()) {
+    message_.set_text(text);
+    return;
+  }
+  if (Window* w = window()) w->set_focus(&name_);
+  name_.select_all();
+  if (!gui::NoticeDialog::post(notices_, manager(), gui::NoticeKind::Error, text, title())) message_.set_text(text);
+}
+
+bool FileDialog::folder_selected() const {
+  const int32_t item = list_.selected_item();
+  return item >= 0 && list_.item_icon(static_cast<uint32_t>(item)) == ItemIcon::Folder;
+}
+
+void FileDialog::update_ok() { ok_.set_enabled(!name_.text().trimmed().empty() || folder_selected()); }
+
+void FileDialog::on_name_changed(void* self, Control&) {   // typing takes the complaint about the old name away
+  auto* d = static_cast<FileDialog*>(self);
+  d->message_.set_text(StringView());
+  d->update_ok();
 }
 
 // --- Showing ---------------------------------------------------------------------------
@@ -158,6 +206,7 @@ bool FileDialog::show(WindowManager& manager, Mode mode, StringView title, const
   selected_.clear();
   set_title(title);
   ok_.set_text(mode == Mode::Open ? "Open" : "Save");
+  look_label_.set_text(mode == Mode::Open ? "Look in:" : "Save in:");
   filter_count_ = filter_count < kMaxFilters ? filter_count : kMaxFilters;
   type_.clear_items();
   for (uint32_t i = 0; i < filter_count_; ++i) {
@@ -165,16 +214,23 @@ bool FileDialog::show(WindowManager& manager, Mode mode, StringView title, const
     type_.add_item(filters[i].name);
   }
   if (filter_count_ == 0) {
-    filters_[0] = {"All files", "*"};
+    filters_[0] = {"All Files", "*"};
     filter_count_ = 1;
-    type_.add_item("All files");
+    type_.add_item("All Files");
   }
   // A file path starts in its folder with its name filled in; a folder path just starts there.
+  // A name without a folder (a document that was never saved) or nothing at all starts where the dialog was last, for the whole session;
+  // the first time that is the user's documents folder.
   String start(allocator());
-  normalize(start_path, &start);
   DirectoryEntry entry;
   String folder(allocator()), name(allocator());
-  if (start.view().equals("/") || (fs_->stat(start.view(), &entry) == Status::Ok && entry.type == NodeType::Directory)) {
+  const StringView given = start_path.trimmed();
+  if (given.empty() || given[0] != '/') {
+    const StringView documents(filesystem::layout::kDocuments);
+    if (folder_.size() > 0) folder.assign(folder_.view());
+    else folder.assign(fs_->stat(documents, &entry) == Status::Ok && entry.type == NodeType::Directory ? documents : StringView("/"));
+    name.assign(given);
+  } else if (normalize(start_path, &start), start.view().equals("/") || (fs_->stat(start.view(), &entry) == Status::Ok && entry.type == NodeType::Directory)) {
     folder.assign(start.view());
   } else {
     const uint64_t slash = start.view().rfind('/');
@@ -191,10 +247,13 @@ bool FileDialog::show(WindowManager& manager, Mode mode, StringView title, const
   type_.set_selected_index(chosen);
   if (!open_folder(folder.view()) && !open_folder("/")) return false;
   name_.set_text(name.view());
+  name_.select_all();   // (typing replaces the name that was offered)
   say(StringView());
+  update_ok();
   on_closed(result);
   const int32_t area_w = static_cast<int32_t>(manager.dialog_area().width), area_h = static_cast<int32_t>(manager.dialog_area().height);
   const int32_t w = kWidth < area_w ? kWidth : area_w, h = kHeight < area_h ? kHeight : area_h;
+  set_resizable(false);
   set_bounds({manager.dialog_area().x + ((area_w - w) / 2 > 0 ? (area_w - w) / 2 : 0), manager.dialog_area().y + ((area_h - h) / 3 > 0 ? (area_h - h) / 3 : 0), static_cast<uint32_t>(w), static_cast<uint32_t>(h)});
   if (!manager.add_window(this, /*modal=*/true)) return false;
   if (Window* win = window()) {
@@ -249,24 +308,38 @@ void FileDialog::finish(StringView path) {
   close();
 }
 
+// Goes into the folder selected in the list.
+void FileDialog::open_selected_folder() {
+  const int32_t item = list_.selected_item();
+  if (item < 0) return;
+  String name(allocator()), path(allocator()), message(allocator());
+  list_.item_text(static_cast<uint32_t>(item), 0, &name);
+  if (!path.assign(folder_.view()) || (folder_.size() > 1 && !path.push_back('/')) || !path.append(name.view())) return;
+  if (open_folder(path.view())) {
+    say(StringView());
+  } else {
+    format_message(&message, "\"%1\" could not be opened. It may have been removed, or you may not be allowed to look in it.", name.view());
+    say(message.view());
+  }
+  update_ok();
+}
+
 void FileDialog::accept_name() {
-  String name(allocator());
+  String name(allocator()), message(allocator());
   name.assign(name_.text());
   if (name.view().find('/') == StringView::npos) {  // no folders in it: trim blanks only
-    uint64_t from = 0, to = name.size();
-    while (from < to && name[from] == ' ') ++from;
-    while (to > from && name[to - 1] == ' ') --to;
     String trimmed(allocator());
-    trimmed.assign(name.view().substr(from, to - from));
+    trimmed.assign(name.view().trimmed());
     name = util::move(trimmed);
   }
-  if (name.empty()) {
-    say("Enter a file name.");
+  if (name.empty()) {   // (the button is unavailable then, unless a folder is selected: Open goes into it)
+    if (folder_selected()) open_selected_folder();
     return;
   }
   String full(allocator());
   if (!join(name.view(), &full)) {
-    say("That name cannot be used.");
+    format_message(&message, "\"%1\" cannot be used as a file name. Type another name.", name.view());
+    say(message.view());
     return;
   }
   DirectoryEntry entry;
@@ -275,8 +348,10 @@ void FileDialog::accept_name() {
     if (open_folder(full.view())) {
       name_.set_text(StringView());
       say(StringView());
+      update_ok();
     } else {
-      say("That folder cannot be opened.");
+      format_message(&message, "\"%1\" could not be opened. It may have been removed, or you may not be allowed to look in it.", name.view());
+      say(message.view());
     }
     return;
   }
@@ -284,27 +359,34 @@ void FileDialog::accept_name() {
     if (status == Status::Ok) {
       finish(full.view());
     } else {
-      String message(allocator());
-      message.append(status == Status::NotFound ? "Not found: " : "Cannot open: ");
-      message.append(name.view());
+      if (status == Status::NotFound) format_message(&message, "\"%1\" could not be found. Check the name, or pick the file from the list.", name.view());
+      else describe_failure(&message, "\"%1\" could not be opened because %2.", name.view(), status);
       say(message.view());
     }
     return;
   }
-  // Save: a name without an extension gets the type's first one.
+  // Save: a name gets the type's first extension unless it already ends in one - an extension of one of the types offered, or something
+  // that reads like one ("data.bin"). A full stop inside a name ("Report v1.2", "Mr. Smith") is not an extension the user meant.
   const StringView extension = first_extension(current_extensions());
   const StringView last = full.view().substr(full.view().rfind('/') + 1);
-  if (status == Status::NotFound && !extension.empty() && last.rfind('.') == StringView::npos) {
+  bool has_extension = typed_extension(last);
+  for (uint32_t i = 0; i < filter_count_ && !has_extension; ++i)
+    has_extension = !StringView(filters_[i].extensions).equals("*") && name_has_extension(last, filters_[i].extensions);
+  if (status == Status::NotFound && !extension.empty() && !has_extension) {
     if (!full.push_back('.') || !full.append(extension)) return;
     status = fs_->stat(full.view(), &entry);
   }
-  if (status == Status::Ok) {  // it exists: ask before replacing it
+  if (status == Status::Ok && entry.type == NodeType::Directory) {
+    format_message(&message, "\"%1\" is the name of a folder here. Type another name.", full.view().substr(full.view().rfind('/') + 1));
+    say(message.view());
+    return;
+  }
+  if (status == Status::Ok) {  // it exists: ask before replacing it, and make leaving it alone the default
     pending_ = util::move(full);
-    String line(allocator());
     const StringView shown = pending_.view().substr(pending_.view().rfind('/') + 1);
-    line.assign(shown);
-    line.append(" already exists.");
-    replace_.set_texts("Confirm Save", line.view(), "Do you want to replace it?", "Replace", "Cancel");
+    format_message(&message, "\"%1\" already exists.", shown.size() > 24 ? shown.first(24) : shown);
+    replace_.set_texts(shown, message.view(), "Do you want to replace it?", "Replace", "Cancel");
+    replace_.set_default_choice(MessageDialog::Choice::Decline);
     if (WindowManager* m = manager()) replace_.show(*m);
     return;
   }
@@ -312,7 +394,8 @@ void FileDialog::accept_name() {
   if (slash != StringView::npos && slash > 0) {  // the folder has to exist
     DirectoryEntry parent;
     if (fs_->stat(full.view().first(slash), &parent) != Status::Ok || parent.type != NodeType::Directory) {
-      say("The folder does not exist.");
+      format_message(&message, "The folder for \"%1\" does not exist. Pick a folder from the list, then type the name.", name.view());
+      say(message.view());
       return;
     }
   }
@@ -321,41 +404,49 @@ void FileDialog::accept_name() {
 
 void FileDialog::on_replace_answer(void* self, Control&) {
   auto* d = static_cast<FileDialog*>(self);
-  if (d->replace_.accepted()) d->finish(d->pending_.view());
-  else if (Window* w = d->window()) w->set_focus(&d->name_);
+  if (d->replace_.accepted()) {
+    d->finish(d->pending_.view());
+  } else {   // back to the name, ready to be typed over
+    if (Window* w = d->window()) w->set_focus(&d->name_);
+    d->name_.select_all();
+  }
 }
 
 void FileDialog::on_navigate(void* self, Control&) {
   auto* d = static_cast<FileDialog*>(self);
-  String target(d->allocator());
+  String target(d->allocator()), message(d->allocator());
   target.assign(d->bar_.requested_path());
-  if (d->open_folder(target.view())) d->say(StringView());
-  else d->say("That folder cannot be opened.");
+  if (d->open_folder(target.view())) {
+    d->say(StringView());
+  } else {
+    format_message(&message, "\"%1\" could not be opened. It may have been removed, or you may not be allowed to look in it.", target.view());
+    d->say(message.view());
+  }
+  d->update_ok();
 }
 
 void FileDialog::on_selection(void* self, Control&) {  // a click on a file puts its name in the box
   auto* d = static_cast<FileDialog*>(self);
   const int32_t item = d->list_.selected_item();
-  if (item < 0 || d->list_.item_icon(static_cast<uint32_t>(item)) == ItemIcon::Folder) return;
-  String name(d->allocator());
-  d->list_.item_text(static_cast<uint32_t>(item), 0, &name);
-  d->name_.set_text(name.view());
-  d->say(StringView());
+  if (item >= 0 && d->list_.item_icon(static_cast<uint32_t>(item)) != ItemIcon::Folder) {
+    String name(d->allocator());
+    d->list_.item_text(static_cast<uint32_t>(item), 0, &name);
+    d->name_.set_text(name.view());
+    d->say(StringView());
+  }
+  d->update_ok();
 }
 
 void FileDialog::on_activated(void* self, Control&) {  // Enter or a double click: into a folder, or take the file
   auto* d = static_cast<FileDialog*>(self);
   const int32_t item = d->list_.selected_item();
   if (item < 0) return;
-  String name(d->allocator());
-  d->list_.item_text(static_cast<uint32_t>(item), 0, &name);
   if (d->list_.item_icon(static_cast<uint32_t>(item)) == ItemIcon::Folder) {
-    String path(d->allocator());
-    if (!path.assign(d->folder_.view()) || (d->folder_.size() > 1 && !path.push_back('/')) || !path.append(name.view())) return;
-    if (d->open_folder(path.view())) d->say(StringView());
-    else d->say("That folder cannot be opened.");
+    d->open_selected_folder();
     return;
   }
+  String name(d->allocator());
+  d->list_.item_text(static_cast<uint32_t>(item), 0, &name);
   d->name_.set_text(name.view());
   d->accept_name();
 }
@@ -365,6 +456,7 @@ void FileDialog::on_type(void* self, Control&) {  // another type: show its file
   String folder(d->allocator());
   folder.assign(d->folder_.view());
   d->open_folder(folder.view());
+  d->update_ok();
 }
 
 void FileDialog::on_ok(void* self, Control&) { static_cast<FileDialog*>(self)->accept_name(); }
@@ -381,6 +473,7 @@ bool FileDialog::on_key(const KeyArgs& args) {
     if (folder_.size() > 1) {
       parent.assign(slash == 0 || slash == StringView::npos ? StringView("/") : folder_.view().first(slash));
       open_folder(parent.view());
+      update_ok();
     }
     return true;
   }

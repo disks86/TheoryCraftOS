@@ -180,6 +180,21 @@ void TabFrame::manager_changed() {
   for (uint32_t i = 0; i < tabs_.count(); ++i) __atomic_store_n(&tabs_[i]->manager_, manager_, __ATOMIC_RELEASE);
 }
 
+// Closing the window closes every tab, so every tab is asked first. The first one that wants to stay (it shows its question about unsaved changes) is
+// brought to the front, so that the question is seen next to what it is about, and the window stays open; nothing has been closed by then.
+bool TabFrame::close_requested() {
+  for (uint64_t i = 0; i < tabs_.count(); ++i) {
+    Frame* tab = tabs_[i];
+    if (tab->close_requested()) continue;
+    Window* w = window();
+    Control* asked = w ? w->focus() : nullptr;   // (the question's default button: showing the tab must not take the focus from it)
+    select_tab(tab);
+    if (w && asked && w->focus() != asked) w->set_focus(asked);
+    return false;
+  }
+  return true;
+}
+
 // The window was closed by the manager: the tabs are closed with it.
 void TabFrame::window_closed(Window* window) {
   UiGuard lock(this);
@@ -284,7 +299,7 @@ void TabFrame::on_mouse_up(const MouseArgs& args) {
     fire(new_tab_);
   } else if (press == Press::Close && tab) {
     const int32_t i = index_of(tab);
-    if (i >= 0 && contains(close_rect(static_cast<uint32_t>(i)), args.x, args.y)) close_tab(tab);
+    if (i >= 0 && contains(close_rect(static_cast<uint32_t>(i)), args.x, args.y)) tab->close();   // (through close(): the tab is asked first)
   }
 }
 

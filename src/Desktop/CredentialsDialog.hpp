@@ -16,10 +16,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// "Sign in": asks for a user name and a password for a server (a network share that wants a login), in a modal dialog. show() opens it; when it
+// "Sign In": asks for a user name and a password for a server (a network share that wants a login), in a modal dialog. show() opens it; when it
 // is dismissed - OK (or Enter) or Cancel (or Escape, or the close button) - the result handler runs and accepted() says which. The password is
 // kept only until clear() (call it when done with it) or the next show().
+// OK with a box that cannot be right (no user name, an id that is not a number) keeps the dialog open, says what is missing in the note line and puts
+// the focus in that box. Tab goes user name, password, OK, Cancel; Alt+U and Alt+P reach the boxes (the labels' access keys).
 #pragma once
+#include "Desktop/StackPanel.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/Label.hpp"
 #include "Gui/Controls/Panel.hpp"
@@ -64,10 +67,12 @@ class CredentialsDialog : public gui::Frame {
   static void on_cancel(void* self, gui::Control&);
 
   gui::Label heading_, note_, user_label_, password_label_;
-  gui::Panel user_row_, password_row_, buttons_, gap_;
+  gui::Panel user_row_, password_row_, spacer_, gap_;
+  StackRow buttons_;      // (left to right: the space, OK, Cancel - so Tab reaches OK before Cancel)
   gui::TextBox user_, password_;
   gui::Button ok_, cancel_;
   String server_;
+  Style style_ = Style::Login;
   bool accepted_ = false;
 };
 

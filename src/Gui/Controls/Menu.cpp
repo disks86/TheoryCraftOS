@@ -355,6 +355,7 @@ void MenuBar::open_menu(int32_t index) {
   UiGuard lock(this);
   Window* w = window();
   if (!w || index < 0 || index >= static_cast<int32_t>(menus_.count()) || index == open_) return;
+  if (opening_) opening_(*this);   // (the program brings its items up to date)
   popup_.show(menus_[static_cast<uint64_t>(index)]);
   const Point o = window_origin();
   if (w->open_popup(&popup_, this, o.x + title_x(index), o.y + static_cast<int32_t>(bounds_.height) - 1))

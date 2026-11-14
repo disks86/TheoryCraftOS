@@ -25,7 +25,9 @@
 #include "Browser/WebUrl.hpp"
 #include "Dom/LegacyEncodings.hpp"
 #include "Media/ImageCodecs.hpp"
-#include "Desktop/FileStatus.hpp"
+#include "Desktop/DocumentFrame.hpp"
+#include "Desktop/Format.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Kernel/Delay.hpp"
 #include "Gui/Window.hpp"
 #include "Gui/Windows/TabFrame.hpp"
@@ -153,18 +155,53 @@ class BrowserAudioClip final : public browser::IVideoClip {
   allocators::IAllocator& allocator_;
 };
 
-const char kWelcome[] =
-    "<html><head><title>Welcome</title></head><body>"
-    "<h1>TheoryCraftOS Web Browser</h1>"
-    "<p>Type an address in the box above and press Enter. Web addresses (http:// and https://) and files on this computer "
-    "(such as /docs/index.html) can be opened.</p>"
-    "<hr>"
-    "<h2>Keys</h2>"
-    "<ul><li>Ctrl+L: go to the address box</li><li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload</li>"
-    "<li>Ctrl+O: open a file</li><li>Space, Page Up, Page Down: scroll</li></ul>"
-    "<p>This browser shows text, headings, lists, tables and links, with the colours and spacing that stylesheets give them, and pictures, videos, sounds and canvases.</p>"
-    "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>"
-    "</body></html>";
+// The page a new tab starts on and the help page (Help > Help Topics, F1) say the same: how to do the common things, in steps, and the keys.
+#define BROWSER_HELP_BODY \
+    "<h1>TheoryCraftOS Web Browser</h1>" \
+    "<p>This browser shows web pages, and pages, text and pictures that are files on this computer.</p>" \
+    "<h2>To open a page</h2>" \
+    "<ol><li>Press Ctrl+L, or click the Address box.</li>" \
+    "<li>Type the address (such as example.com) or the path of a file (such as /Desktop/Documents/page.html).</li>" \
+    "<li>Press Enter.</li></ol>" \
+    "<h2>To keep a page or a file</h2>" \
+    "<ol><li>On the File menu, choose Save Page As.</li>" \
+    "<li>Choose a folder (the Downloads folder is offered) and a name.</li>" \
+    "<li>Choose Save.</li></ol>" \
+    "<hr>" \
+    "<h2>Keys</h2>" \
+    "<ul><li>Ctrl+L: go to the Address box</li><li>F6: move between the Address box and the page</li>" \
+    "<li>Alt+Left, Alt+Right: back and forward</li><li>F5 or Ctrl+R: reload the page</li><li>Esc: stop a page that is loading</li>" \
+    "<li>Ctrl+T: new tab</li><li>Ctrl+Tab: next tab</li><li>Ctrl+W: close the tab</li>" \
+    "<li>Ctrl+O: open a file</li><li>Ctrl+S: save the page</li>" \
+    "<li>Space, Page Up, Page Down, Home, End: scroll</li><li>F10: the menus</li><li>F1: this page</li></ul>" \
+    "<p>A place to start: <a href=\"http://example.com/\">http://example.com/</a></p>" \
+    "</body></html>"
+const char kWelcome[] = "<html><head><title>New Tab</title></head><body>" BROWSER_HELP_BODY;
+const char kHelp[] = "<html><head><title>Web Browser Help</title></head><body>" BROWSER_HELP_BODY;
+
+// The messages (whole sentences; %1 is the name of the page or file as the title bar would show it).
+const char kCannotOpenHere[] = "\"%1\" cannot be opened here. This browser opens web addresses (http and https) and files on this computer.";
+const char kNoNetwork[] = "\"%1\" could not be opened because this computer is not connected to a network. Check the connection, then try again.";
+const char kNoAnswer[] = "\"%1\" could not be opened because %2. Check the address and the network connection, then try again.";
+const char kFileNotOpened[] = "\"%1\" could not be opened. %2";
+const char kNoMemory[] = "There is not enough memory to show this page. Close windows or tabs you do not need, then try again.";
+const char kDialogBusy[] = "Another file dialog is still open. Finish with it, then choose the command again.";
+
+// The bytes of a text constant (the one place a string's characters are handed on as bytes: same size, same lifetime, no alignment to speak of).
+ConstByteView bytes_of(StringView text) { return ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size()); }
+
+// What a loader said went wrong, as the end of a sentence: no full stop, and something to say when it said nothing.
+StringView reason_of(StringView error) {
+  StringView text = error.trimmed();
+  while (text.ends_with('.')) text = text.without_suffix(1);
+  return text.empty() ? StringView("the server did not answer") : text;
+}
+
+// The last part of a path: the name the file explorer shows.
+StringView name_of_path(StringView path) {
+  const uint64_t slash = path.rfind('/');
+  return slash == StringView::npos || slash + 1 >= path.size() ? path : path.substr(slash + 1);
+}
 
 bool contains_ignore_case(StringView text, const char* needle) {
   const StringView n(needle);
@@ -197,6 +234,36 @@ bool is_text(StringView type, StringView body) {
 
 static void visible_referrer(allocators::IAllocator& allocator, StringView from, StringView to, String* out);
 
+// Left and Right docked children in the order they stand, then the Fill child gets what is left (see the header).
+void BrowserToolbar::layout() {
+  Rect2D rest = client_rect();
+  Control* fill = nullptr;
+  for (uint32_t i = 0; i < child_count(); ++i) {
+    Control* c = child(i);
+    if (!c->visible()) continue;
+    const int32_t wanted = c->preferred_size().width;
+    const uint32_t width = wanted < 0 ? 0u : (static_cast<uint32_t>(wanted) < rest.width ? static_cast<uint32_t>(wanted) : rest.width);
+    if (c->dock() == DockStyle::Left) {
+      c->set_bounds({rest.x, rest.y, width, rest.height});
+      rest.x += static_cast<int32_t>(width);
+      rest.width -= width;
+    } else if (c->dock() == DockStyle::Right) {
+      c->set_bounds({rest.x + static_cast<int32_t>(rest.width - width), rest.y, width, rest.height});
+      rest.width -= width;
+    } else if (c->dock() == DockStyle::Fill) {
+      fill = c;
+    }
+  }
+  if (fill) fill->set_bounds(rest);
+  for (uint32_t i = 0; i < child_count(); ++i) child(i)->layout();
+}
+
+bool AddressBox::on_key(const KeyArgs& args) {
+  const bool alt = args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt);
+  if (alt && (args.usage == hardware::key::kLeft || args.usage == hardware::key::kRight)) return false;   // Back and Forward: the browser's
+  return TextBox::on_key(args);
+}
+
 bool WebBrowser::is_page_name(StringView name) {
   const uint64_t dot = name.rfind('.');
   if (dot == StringView::npos) return false;
@@ -210,7 +277,12 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       menu_(allocator),
       back_menu_(allocator),
       forward_menu_(allocator),
+      page_menu_(allocator),
+      menu_link_(allocator),
+      shown_title_(allocator),
+      saved_(allocator),
       leave_dialog_(allocator),
+      clear_dialog_(allocator),
       leave_target_(allocator),
       pending_referrer_(allocator),
       referrer_(allocator),
@@ -225,7 +297,9 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
       back_(allocator),
       forward_(allocator),
       reload_(allocator),
+      stop_(allocator),
       go_(allocator),
+      address_label_(allocator),
       address_(allocator),
       status_(allocator),
       page_(allocator),
@@ -256,25 +330,59 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
 
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
+  menu_.on_opening({&WebBrowser::on_menu_opening, this});
   if (Menu* file = menu_.add_menu("File")) {
-    file->add_item("Open File...", {&WebBrowser::on_open, this}, "Ctrl+O");
+    new_tab_item_ = file->add_item("New Tab", {&WebBrowser::on_new_tab, this}, "Ctrl+T");
+    file->add_item("Open Location...", {&WebBrowser::on_open_location, this}, "Ctrl+L");
+    open_item_ = file->add_item("Open File...", {&WebBrowser::on_open, this}, "Ctrl+O");
+    save_item_ = file->add_item("Save Page As...", {&WebBrowser::on_save, this}, "Ctrl+S");
     file->add_separator();
-    file->add_item("Close", {&WebBrowser::on_close, this});
+    file->add_item("Close", {&WebBrowser::on_close, this}, "Ctrl+W");   // (the tab: the other tabs of the window stay)
   }
-  if (Menu* view = menu_.add_menu("View")) {
-    scripts_item_ = view->add_item("Run Scripts", {&WebBrowser::on_toggle_scripts, this});
-    dark_item_ = view->add_item("Dark Colors", {&WebBrowser::on_toggle_dark, this});
-    third_party_item_ = view->add_item("Block Third-Party Cookies", {&WebBrowser::on_toggle_third_party, this});
-    view->add_separator();
-    view->add_item("Clear Cookies and Site Data", {&WebBrowser::on_clear_site_data, this});
+  if (Menu* edit = menu_.add_menu("Edit")) {
+    cut_item_ = edit->add_item("Cut", {&WebBrowser::on_cut, this}, "Ctrl+X");
+    copy_item_ = edit->add_item("Copy", {&WebBrowser::on_copy, this}, "Ctrl+C");
+    paste_item_ = edit->add_item("Paste", {&WebBrowser::on_paste, this}, "Ctrl+V");
+    delete_item_ = edit->add_item("Delete", {&WebBrowser::on_delete, this}, "Del");
+    edit->add_separator();
+    select_all_item_ = edit->add_item("Select All", {&WebBrowser::on_select_all, this}, "Ctrl+A");
+  }
+  if (Menu* view = menu_.add_menu("View")) dark_item_ = view->add_item("Dark Colors", {&WebBrowser::on_toggle_dark, this});
+  if (Menu* go = menu_.add_menu("Go")) {
+    go_menu_ = go;
+    back_item_ = go->add_item("Back", {&WebBrowser::on_back, this}, "Alt+Left");
+    forward_item_ = go->add_item("Forward", {&WebBrowser::on_forward, this}, "Alt+Right");
+    go->add_separator();
+    reload_item_ = go->add_item("Reload", {&WebBrowser::on_reload, this}, "F5");
+    stop_item_ = go->add_item("Stop", {&WebBrowser::on_stop, this}, "Esc");
+  }
+  if (Menu* tools = menu_.add_menu("Tools")) {
+    scripts_item_ = tools->add_item("Run Scripts", {&WebBrowser::on_toggle_scripts, this});
+    third_party_item_ = tools->add_item("Block Third-Party Cookies", {&WebBrowser::on_toggle_third_party, this});
+    tools->add_separator();
+    tools->add_item("Clear Cookies and Site Data", {&WebBrowser::on_clear_site_data, this});   // (it asks first)
     if (scripts_item_) scripts_item_->set_checked(scripts_enabled_);
   }
-  if (Menu* go = menu_.add_menu("Go")) {
-    go->add_item("Back", {&WebBrowser::on_back, this}, "Alt+Left");
-    go->add_item("Forward", {&WebBrowser::on_forward, this}, "Alt+Right");
-    go->add_item("Reload", {&WebBrowser::on_reload, this}, "F5");
+  if (Menu* help = menu_.add_menu("Help")) {
+    help->add_item("Help Topics", {&WebBrowser::on_help, this}, "F1");
+    help->add_separator();
+    help->add_item("About Web Browser", {&WebBrowser::on_about, this});
   }
+  for (Hop& hop : go_hops_) hop.owner = this;
 
+  // The page's context menu: the link under the pointer first, then what can be done with the page. Everything in it is in the menu bar too
+  // (a link is opened with a click).
+  link_item_ = page_menu_.add_item("Open Link", {&WebBrowser::on_open_link, this});
+  page_menu_.add_separator();
+  page_back_item_ = page_menu_.add_item("Back", {&WebBrowser::on_back, this});
+  page_forward_item_ = page_menu_.add_item("Forward", {&WebBrowser::on_forward, this});
+  page_reload_item_ = page_menu_.add_item("Reload", {&WebBrowser::on_reload, this});
+  page_menu_.add_separator();
+  page_save_item_ = page_menu_.add_item("Save Page As...", {&WebBrowser::on_save, this});
+  page_menu_.on_opening({&WebBrowser::on_page_menu_opening, this});
+  page_.set_context_menu(&page_menu_);
+
+  clear_dialog_.on_result({&WebBrowser::on_clear_answer, this});
   leave_dialog_.on_result({&WebBrowser::on_leave_answer, this});
   for (uint32_t i = 0; i < 2 * kHops; ++i) {
     hops_[i].owner = this;
@@ -289,30 +397,37 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
   toolbar_.set_dock(DockStyle::Top);
   toolbar_.set_size(0, 28);
   toolbar_.set_padding(Insets::all(1));
-  back_.set_text("<");
+  // Every button has a text label (and with it an access key), so none needs a tooltip. The label "Address:" stands directly before the box
+  // it names: Alt and its letter go there.
+  back_.set_text("Back");
   back_.set_dock(DockStyle::Left);
-  back_.set_size(28, 0);
   back_.on_click({&WebBrowser::on_back, this});
   back_.set_context_menu(&back_menu_);
-  forward_.set_text(">");
+  forward_.set_text("Forward");
+  forward_.set_access_key('w');   // (F is the File menu's)
   forward_.set_dock(DockStyle::Left);
-  forward_.set_size(28, 0);
   forward_.on_click({&WebBrowser::on_forward, this});
   forward_.set_context_menu(&forward_menu_);
   reload_.set_text("Reload");
   reload_.set_dock(DockStyle::Left);
-  reload_.set_size(64, 0);
   reload_.on_click({&WebBrowser::on_reload, this});
+  stop_.set_text("Stop");
+  stop_.set_dock(DockStyle::Left);
+  stop_.on_click({&WebBrowser::on_stop, this});
+  address_label_.set_text("Address:");
+  address_label_.set_dock(DockStyle::Left);
+  address_.set_dock(DockStyle::Fill);
   go_.set_text("Go");
   go_.set_dock(DockStyle::Right);
   go_.set_size(40, 0);
   go_.on_click({&WebBrowser::on_go, this});
-  address_.set_dock(DockStyle::Fill);
   toolbar_.add(&back_);
   toolbar_.add(&forward_);
   toolbar_.add(&reload_);
+  toolbar_.add(&stop_);
+  toolbar_.add(&address_label_);
+  toolbar_.add(&address_);   // (before Go: the Tab order is the reading order; BrowserToolbar lets the box fill what is left all the same)
   toolbar_.add(&go_);
-  toolbar_.add(&address_);   // Fill goes last
 
   status_bar_.set_style(PanelStyle::Sunken);
   status_bar_.set_dock(DockStyle::Bottom);
@@ -349,10 +464,10 @@ WebBrowser::WebBrowser(allocators::IAllocator& allocator)
 
 void WebBrowser::show_welcome() {
   Fetched welcome(allocator());
-  welcome.body.append(ConstByteView(reinterpret_cast<const uint8_t*>(kWelcome), sizeof kWelcome - 1));
+  welcome.body.append(bytes_of(kWelcome));
   welcome.type.assign("text/html");
   show(welcome);
-  say("Type an address and press Enter.");
+  say("Type an address in the Address box and press Enter.");
 }
 
 // The window (or the tab) was closed. The first browser of the desktop is kept to be opened again, so its page would go on playing its videos and sounds
@@ -374,6 +489,7 @@ void WebBrowser::on_window_gone(void* self, Control&) {
     b->history_.clear();
     b->current_.clear();
     b->referrer_.clear();
+    b->saved_.clear();
   }
   b->show_welcome();   // (unloads the page: pagehide and unload run, its media players and sounds are closed)
 }
@@ -403,18 +519,99 @@ void WebBrowser::say(StringView text) {
 }
 
 void WebBrowser::update_buttons() {
-  back_.set_enabled(can_go_back());
-  forward_.set_enabled(can_go_forward());
+  UiGuard lock(this);
+  go_dirty_ = true;   // (the history changed, or the title of the page)
+  update_commands();
 }
 
-void WebBrowser::update_title(StringView page_title) {
-  String title(allocator());
-  title.assign("Web Browser");
-  const StringView name = page_title.empty() ? browser::address_name(current_.view()) : page_title;
-  if (!name.empty()) {
-    title.append(" - ");
-    title.append(name);
+void WebBrowser::set_loading(bool loading) {
+  {
+    UiGuard lock(this);
+    loading_ = loading;
   }
+  update_commands();
+}
+
+void WebBrowser::update_commands() {
+  UiGuard lock(this);
+  Window* w = window();
+  // (only what changes is touched: this runs often, and a change repaints)
+  auto button = [&](Button& b, bool on) {
+    if (b.enabled() == on) return;
+    if (!on && b.focused() && w) w->set_focus(&page_);   // (the focus does not stay on something that cannot be used)
+    b.set_enabled(on);
+  };
+  auto item = [](MenuItem* i, bool on) {
+    if (i && i->enabled() != on) i->set_enabled(on);
+  };
+  const bool back = can_go_back(), forward = can_go_forward(), shown = !current_.empty(), save = can_save();
+  button(back_, back);
+  button(forward_, forward);
+  button(reload_, shown);
+  button(stop_, loading_);
+  item(back_item_, back);
+  item(forward_item_, forward);
+  item(reload_item_, shown);
+  item(stop_item_, loading_);
+  item(page_back_item_, back);
+  item(page_forward_item_, forward);
+  item(page_reload_item_, shown);
+  item(page_save_item_, save);
+  item(save_item_, save);
+  item(open_item_, dialog_ != nullptr);
+  Frame* tabs = host();
+  item(new_tab_item_, tabs && tabs->as_tabs());
+  // Edit: the address box when it has the focus, else the field of the page that is being typed in (the page says what it can do when asked).
+  const bool in_address = address_.focused(), selection = in_address && address_.has_selection();
+  const bool in_page = page_.focused() && __atomic_load_n(&page_capture_, __ATOMIC_ACQUIRE) == PageView::kCaptureAll;
+  item(cut_item_, selection || in_page);
+  item(copy_item_, selection || in_page);
+  item(paste_item_, in_address || in_page);
+  item(delete_item_, selection || in_page);
+  item(select_all_item_, (in_address && !address_.text().empty()) || in_page);
+  if (go_dirty_ && menu_.open_menu_index() < 0) rebuild_go_history();
+}
+
+// The Go menu ends with the pages around the one shown, the newest first; choosing one goes there. (Called with the window's lock held, while the
+// Go menu is not on the screen.)
+void WebBrowser::rebuild_go_history() {
+  if (!go_menu_) return;
+  go_dirty_ = false;
+  for (MenuItem*& entry : go_items_) {
+    if (entry) go_menu_->remove_item(entry);
+    entry = nullptr;
+  }
+  if (go_separator_) go_menu_->remove_item(go_separator_);
+  go_separator_ = nullptr;
+  if (history_.count() < 2) return;
+  go_separator_ = go_menu_->add_separator();
+  uint32_t slot = 0;
+  for (int32_t delta = static_cast<int32_t>(kGoForward); delta >= -static_cast<int32_t>(kGoBack); --delta) {
+    if (delta != 0 && !history_.can_go(delta)) continue;
+    const browser::SessionHistory::Entry& e = history_.at(static_cast<uint32_t>(history_.index() + delta));
+    StringView text = delta == 0 && !shown_title_.empty() ? shown_title_.view() : e.title.empty() ? e.address.view() : e.title.view();
+    String label(allocator());
+    if (text.size() > kGoTextChars) {
+      label.assign(text.first(kGoTextChars - 3));
+      label.append("...");
+    } else {
+      label.assign(text);
+    }
+    go_hops_[slot].delta = delta;
+    go_items_[slot] = go_menu_->add_item(label.view(), {&WebBrowser::on_history_hop, &go_hops_[slot]});
+    if (go_items_[slot] && delta == 0) go_items_[slot]->set_checked(true);
+    ++slot;
+  }
+}
+
+// "Page - Web Browser": the page first, as the guidelines ask (the title of the page, else the name in its address).
+void WebBrowser::update_title(StringView page_title) {
+  const StringView name = page_title.empty() ? browser::address_name(current_.view()) : page_title;
+  shown_title_.assign(name);
+  go_dirty_ = true;   // (the Go menu names the page shown)
+  String title(allocator());
+  if (name.empty()) title.assign("Web Browser");
+  else format_message(&title, "%1 - Web Browser", name);
   set_title(title.view());
 }
 
@@ -430,6 +627,141 @@ void WebBrowser::on_go(void* self, Control&) {
   b->navigate(b->address_.text());
 }
 void WebBrowser::on_open(void* self, Control&) { static_cast<WebBrowser*>(self)->ask_open(); }
+void WebBrowser::on_stop(void* self, Control&) { static_cast<WebBrowser*>(self)->stop(); }
+void WebBrowser::on_open_location(void* self, Control&) { static_cast<WebBrowser*>(self)->focus_address(); }
+void WebBrowser::on_save(void* self, Control&) { static_cast<WebBrowser*>(self)->ask_save(); }
+void WebBrowser::on_cut(void* self, Control&) { static_cast<WebBrowser*>(self)->edit(EditCommand::Cut); }
+void WebBrowser::on_copy(void* self, Control&) { static_cast<WebBrowser*>(self)->edit(EditCommand::Copy); }
+void WebBrowser::on_paste(void* self, Control&) { static_cast<WebBrowser*>(self)->edit(EditCommand::Paste); }
+void WebBrowser::on_delete(void* self, Control&) { static_cast<WebBrowser*>(self)->edit(EditCommand::Delete); }
+void WebBrowser::on_select_all(void* self, Control&) { static_cast<WebBrowser*>(self)->edit(EditCommand::SelectAll); }
+void WebBrowser::on_help(void* self, Control&) { static_cast<WebBrowser*>(self)->show_help(); }
+void WebBrowser::on_menu_opening(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  UiGuard lock(b);
+  b->update_commands();
+  if (b->go_dirty_) b->rebuild_go_history();   // (a menu is being put up: the one that was open, if any, is on its way out)
+}
+
+void WebBrowser::on_about(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  const StringView text = "Web Browser shows web pages and files on this computer. It is part of TheoryCraftOS.";
+  if (!NoticeDialog::post(b->notices_, b->manager(), NoticeKind::Information, text, "About Web Browser")) b->say(text);
+}
+
+// File > New Tab: what Ctrl+T does in the window that holds the tabs (it decides what a new tab is).
+void WebBrowser::on_new_tab(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  Frame* window = b->host();
+  TabFrame* tabs = window ? window->as_tabs() : nullptr;
+  if (!tabs) return;
+  KeyArgs key;
+  key.usage = hardware::key::kA + 19;   // T
+  key.modifiers = hardware::modifier::kLeftControl;
+  tabs->on_key(key);
+}
+
+void WebBrowser::focus_address() {
+  UiGuard lock(this);
+  if (Window* w = window()) {
+    w->set_focus(&address_);
+    address_.select_all();
+  }
+  update_commands();
+}
+
+void WebBrowser::edit(EditCommand command) {
+  namespace key = hardware::key;
+  if (address_.focused()) {
+    switch (command) {
+      case EditCommand::Cut: address_.cut_selection(); break;
+      case EditCommand::Copy: address_.copy_selection(); break;
+      case EditCommand::Paste: address_.paste(); break;
+      case EditCommand::Delete: address_.delete_selection(); break;
+      case EditCommand::SelectAll: address_.select_all(); break;
+    }
+    update_commands();
+    return;
+  }
+  if (!page_.focused()) return;
+  // The page has these commands as keys (see on_form_key): it gets the key the menu item stands for.
+  KeyArgs args;
+  args.modifiers = command == EditCommand::Delete ? 0 : hardware::modifier::kLeftControl;
+  switch (command) {
+    case EditCommand::Cut: args.usage = key::kA + 23; break;
+    case EditCommand::Copy: args.usage = key::kA + 2; break;
+    case EditCommand::Paste: args.usage = key::kA + 21; break;
+    case EditCommand::Delete: args.usage = key::kDelete; break;
+    case EditCommand::SelectAll: args.usage = key::kA; break;
+  }
+  page_.on_key(args);
+}
+
+void WebBrowser::notify_about(NoticeKind kind, StringView pattern, StringView name, StringView reason) {
+  String message(allocator());
+  format_message(&message, pattern, name, reason);
+  notify(kind, message.view());
+}
+
+bool WebBrowser::stop() {
+  {
+    UiGuard lock(this);
+    if (!loading_) return false;
+    __atomic_store_n(&stop_requested_, true, __ATOMIC_RELEASE);
+    request_ = Request::None;   // (and what was asked for after it)
+  }
+  say("Stopping...");
+  return true;
+}
+
+namespace {
+const FileDialog::Filter kSavePageFilters[] = {{"Web pages", "html;htm"}, {"All files", "*"}};
+const FileDialog::Filter kSaveFileFilters[] = {{"All files", "*"}};
+}  // namespace
+
+void WebBrowser::ask_save() {
+  if (!can_save() || !manager()) return;
+  // The name the page has in its address ("report.html", or the site's name), in the Downloads folder.
+  StringView name = browser::address_name(current_.view());
+  const uint64_t query = name.find('?');
+  if (query != StringView::npos) name = name.first(query);
+  String start(allocator());
+  start.assign(filesystem::layout::kDownloads);
+  start.append("/");
+  start.append(name.empty() ? StringView("Page") : name);
+  if (saved_html_ && !is_page_name(start.view())) start.append(".html");
+  const bool shown = saved_html_ ? dialog_->show(*manager(), FileDialog::Mode::Save, "Save Page As", kSavePageFilters, 2, start.view(), {&WebBrowser::on_save_picked, this})
+                                 : dialog_->show(*manager(), FileDialog::Mode::Save, "Save Page As", kSaveFileFilters, 1, start.view(), {&WebBrowser::on_save_picked, this});
+  if (!shown) notify(NoticeKind::Warning, kDialogBusy);
+}
+
+// The name was chosen (the dialog has asked before replacing a file that is there): the page is written as it came.
+void WebBrowser::on_save_picked(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->dialog_->accepted() || !b->fs_) return;
+  String path(b->allocator());
+  path.assign(b->dialog_->selected_path());
+  ByteBuffer bytes(b->allocator());   // (a copy: the page may be replaced while the file is written, and the window is not held up meanwhile)
+  bool copied;
+  {
+    UiGuard lock(b);
+    copied = bytes.append(b->saved_.view());
+  }
+  UniquePointer<IFile> file;
+  Status status = copied ? b->fs_->open_file(path.view(), OpenMode::CreateTruncate, &file) : Status::OutOfMemory;
+  uint64_t written = 0;
+  if (status == Status::Ok) status = file->write(0, bytes.view(), &written);
+  if (status == Status::Ok && written != bytes.size()) status = Status::NoSpace;
+  file.reset();
+  const StringView name = name_of_path(path.view());
+  if (status != Status::Ok) {
+    b->notify_about(NoticeKind::Error, "\"%1\" could not be saved. %2", name, file_advice(status, true));
+    return;
+  }
+  String message(b->allocator());
+  format_message(&message, "Saved \"%1\".", name);
+  b->say(message.view());
+}
 void WebBrowser::on_close(void* self, Control&) { static_cast<WebBrowser*>(self)->close(); }
 void WebBrowser::on_load(void* self, Control&) { static_cast<WebBrowser*>(self)->run_request(); }
 
@@ -462,7 +794,7 @@ const char* type_of_name(StringView name) {
 void WebBrowser::ask_file(uint32_t node_serial) {
   if (!dialog_ || !manager()) return;
   pending_file_node_ = node_serial;
-  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Choose File", kAnyFile, 1, StringView(), {&WebBrowser::on_file_picked, this})) notify(NoticeKind::Warning, "The file dialog is busy.");
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Choose File", kAnyFile, 1, StringView(), {&WebBrowser::on_file_picked, this})) notify(NoticeKind::Warning, kDialogBusy);
 }
 
 void WebBrowser::on_file_picked(void* self, Control&) {
@@ -470,11 +802,16 @@ void WebBrowser::on_file_picked(void* self, Control&) {
   if (!b->dialog_->accepted() || !b->fs_ || !b->live_) return;
   String path(b->allocator());
   path.assign(b->dialog_->selected_path());
+  const StringView picked = name_of_path(path.view());
   UniquePointer<IFile> file;
-  if (b->fs_->open_file(path.view(), OpenMode::Read, &file) != Status::Ok) return;
+  const Status opened = b->fs_->open_file(path.view(), OpenMode::Read, &file);
+  if (opened != Status::Ok) {
+    b->notify_about(NoticeKind::Error, kFileNotOpened, picked, file_advice(opened, false));
+    return;
+  }
   const uint64_t size = file->size();
-  if (size > (16u << 20)) {
-    b->notify(NoticeKind::Warning, "That file is too large to send.");
+  if (size > kMaxUploadBytes) {
+    b->notify_about(NoticeKind::Warning, "\"%1\" is too large to send from this browser, which sends files of up to 16 MB. Choose a smaller file.", picked);
     return;
   }
   ByteBuffer bytes(b->allocator());
@@ -484,25 +821,48 @@ void WebBrowser::on_file_picked(void* self, Control&) {
   file.reset();
   const bool ok = status == Status::Ok && bytes.append(ConstByteView(chunk.data(), got));
   release_view(b->allocator(), chunk);
-  if (!ok) return;
-  const uint64_t slash = path.view().rfind('/');
-  const StringView name = slash == StringView::npos ? path.view() : path.view().substr(slash + 1);
+  if (!ok) {
+    b->notify_about(NoticeKind::Error, kFileNotOpened, picked, file_advice(status == Status::Ok ? Status::OutOfMemory : status, false));
+    return;
+  }
+  const StringView name = picked;
   b->live_->file_chosen(b->pending_file_node_, name, type_of_name(name), bytes.view());
   b->settle();
 }
 
 void WebBrowser::on_link(void* self, Control&) {
   auto* b = static_cast<WebBrowser*>(self);
-  String target(b->allocator());
-  if (browser::resolve_reference(b->allocator(), b->current_.view(), b->page_.clicked_link(), &target)) {
-    b->pending_referrer_.assign(b->current_.view());
-    if (!b->navigate(target.view())) b->pending_referrer_.clear();
+  b->follow_link(b->page_.clicked_link());
+}
+
+// Opens what a link of the page shown leads to; a link this browser cannot follow (mail, another program's) gets a message that says so.
+void WebBrowser::follow_link(StringView link) {
+  String target(allocator());
+  if (browser::resolve_reference(allocator(), current_.view(), link, &target)) {
+    pending_referrer_.assign(current_.view());
+    if (!navigate(target.view())) pending_referrer_.clear();
     return;
   }
-  String message(b->allocator());
-  message.append("Cannot follow ");
-  message.append(b->page_.clicked_link());
-  b->say(message.view());
+  notify_about(NoticeKind::Warning, kCannotOpenHere, link);
+}
+
+// The page's context menu is about to open: "Open Link" is for the link the pointer is on.
+void WebBrowser::on_page_menu_opening(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  UiGuard lock(b);
+  b->menu_link_.assign(b->page_.hovered_link());
+  if (b->link_item_) b->link_item_->set_enabled(!b->menu_link_.empty());
+  b->update_commands();
+}
+
+void WebBrowser::on_open_link(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  String link(b->allocator());
+  {
+    UiGuard lock(b);
+    link.assign(b->menu_link_.view());
+  }
+  if (!link.empty()) b->follow_link(link.view());
 }
 
 void WebBrowser::on_hover(void* self, Control&) {
@@ -516,27 +876,20 @@ const FileDialog::Filter kPageFilters[] = {{"Web pages", "html;htm"}, {"Text fil
 }
 
 void WebBrowser::ask_open() {
-  if (!dialog_ || !manager()) {
-    notify(NoticeKind::Error, "No file dialog available.");
-    return;
-  }
-  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kPageFilters, 3, current_.view().starts_with('/') ? current_.view() : StringView(), {&WebBrowser::on_open_picked, this}))
-    notify(NoticeKind::Warning, "The file dialog is busy.");
+  if (!dialog_ || !manager()) return;   // (Open File is disabled then)
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open File", kPageFilters, 3, current_.view().starts_with('/') ? current_.view() : StringView(), {&WebBrowser::on_open_picked, this}))
+    notify(NoticeKind::Warning, kDialogBusy);
 }
 
 bool WebBrowser::navigate(StringView typed) {
   String address(allocator());
 
   if (!browser::normalize_address(typed, &address)) {
-    say("Type an address first.");
+    say("Type an address in the Address box first.");
     return false;
   }
-  if (!browser::is_web_address(address.view()) && !browser::is_file_address(address.view())) {
-    String message(allocator());
-    message.append("Cannot open ");
-    message.append(address.view());
-    message.append(": only web addresses (http:// and https://) and files are supported.");
-    notify(NoticeKind::Warning, message.view());
+  if (!browser::is_web_address(address.view()) && !browser::is_file_address(address.view()) && !address.view().equals(kHelpAddress)) {
+    notify_about(NoticeKind::Warning, kCannotOpenHere, address.view());
     return false;
   }
   return post(Request::Go, address.view());
@@ -619,39 +972,47 @@ void WebBrowser::load(Request kind, StringView target) {
       case Request::Submit: address.assign(target); break;
       default: return;
     }
-    if (!in_place) loading_ = true;
+    if (!in_place) {
+      loading_ = true;
+      __atomic_store_n(&stop_requested_, false, __ATOMIC_RELEASE);
+    }
   }
   if (in_place) {
     traverse_in_place(request_delta_);
     return;
   }
+  update_commands();   // (Stop applies now)
   if (live_ && manager() && !leave_confirmed_ && live_->before_unload()) {   // the page wants the user to say they want to leave
-    {
-      UiGuard lock(this);
-      loading_ = false;
-    }
+    set_loading(false);
     ask_leave(kind, target);
     return;
   }
   leave_confirmed_ = false;
   leave_current();
   String message(allocator());
-  message.append("Loading ");
-  message.append(address.view());
-  message.append("...");
+  format_message(&message, "Loading %1...", address.view());
   say(message.view());
   Fetched page(allocator());
   page.address.assign(address.view());
   bool ok;
   if (kind == Request::Submit) ok = fetch_post(address.view(), &page);
   else ok = fetch(address.view(), &page);
+  if (__atomic_exchange_n(&stop_requested_, false, __ATOMIC_ACQ_REL)) {   // Stop: what came (or did not) is dropped, the page that was shown stays
+    {
+      UiGuard lock(this);
+      address_.set_text(current_.view());
+    }
+    set_loading(false);
+    say("Stopped.");
+    return;
+  }
   if (!ok) {
     {
       UiGuard lock(this);
-      loading_ = false;
       address_.set_text(current_.view());
     }
-    say("Failed.");
+    set_loading(false);
+    say("The page could not be opened.");
     notify(NoticeKind::Error, page.error.view());
     return;
   }
@@ -672,8 +1033,12 @@ void WebBrowser::load(Request kind, StringView target) {
 
 bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool subresource) {
   if (browser::is_file_address(address)) return fetch_file(address, page, limit);
+  if (address.equals(kHelpAddress)) {   // the built-in help page
+    page->type.assign("text/html");
+    return page->body.append(bytes_of(kHelp));
+  }
   if (!loader_) {
-    page->error.assign("Web pages cannot be opened: there is no network connection.");
+    format_message(&page->error, kNoNetwork, browser::address_name(address));
     return false;
   }
   browser::FetchOptions options;
@@ -691,13 +1056,7 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool s
   const bool fetched = verdict == browser::ServiceWorkerHub::Intercept::Responded ||
                        (verdict == browser::ServiceWorkerHub::Intercept::Pass && browser::fetch_resource(allocator(), *loader_, jar(), options, &result));
   if (!fetched) {
-    String message(allocator());
-    message.append("Cannot open ");
-    message.append(address.size() > 24 ? address.first(24) : address);   // (the notice dialog has room for four short lines)
-    if (address.size() > 24) message.append("...");
-    message.append(": ");
-    message.append(result.error.empty() ? StringView("the page could not be fetched.") : result.error.view());
-    page->error.assign(message.view());
+    format_message(&page->error, kNoAnswer, browser::address_name(address), reason_of(result.error.view()));   // (the name, not the whole address: the message stays short)
     return false;
   }
   if (!result.url.empty()) page->address.assign(result.url.view());
@@ -706,7 +1065,7 @@ bool WebBrowser::fetch(StringView address, Fetched* page, uint64_t limit, bool s
   page->type.assign(type);
   page->status = result.status;
   if (!page->body.append(result.body.view())) {
-    page->error.assign("Out of memory.");
+    page->error.assign(kNoMemory);
     return false;
   }
   return true;
@@ -720,7 +1079,8 @@ bool WebBrowser::fetch_post(StringView address, Fetched* page) {
     body.assign(request_body_.view());
   }
   if (!browser::is_web_address(address) || !loader_) {
-    page->error.assign(loader_ ? "A form can only be sent to a web address." : "Web pages cannot be opened: there is no network connection.");
+    if (loader_) page->error.assign("The form could not be sent because the page did not say where on the web it should go.");
+    else page->error.assign("The form could not be sent because this computer is not connected to a network. Check the connection, then try again.");
     return false;
   }
   browser::FetchOptions options;
@@ -740,10 +1100,7 @@ bool WebBrowser::fetch_post(StringView address, Fetched* page) {
   const bool sent = verdict == browser::ServiceWorkerHub::Intercept::Responded ||
                     (verdict == browser::ServiceWorkerHub::Intercept::Pass && browser::fetch_resource(allocator(), *loader_, jar(), options, &result));
   if (!sent) {
-    String message(allocator());
-    message.append("Cannot send the form: ");
-    message.append(result.error.empty() ? StringView("the server did not answer.") : result.error.view());
-    page->error.assign(message.view());
+    format_message(&page->error, "The form could not be sent because %1. Check the network connection, then try again.", reason_of(result.error.view()));
     return false;
   }
   if (!result.url.empty()) page->address.assign(result.url.view());
@@ -752,7 +1109,7 @@ bool WebBrowser::fetch_post(StringView address, Fetched* page) {
   page->type.assign(result_type);
   page->status = result.status;
   if (!page->body.append(result.body.view())) {
-    page->error.assign("Out of memory.");
+    page->error.assign(kNoMemory);
     return false;
   }
   return true;
@@ -762,26 +1119,20 @@ bool WebBrowser::fetch_file(StringView path, Fetched* page, uint64_t limit) {
   String name(allocator());
   name.assign(path.starts_with("file://") ? path.substr(7) : path);
   page->address.assign(name.view());
-  String problem(allocator());
-  problem.append("Cannot open ");
-  problem.append(name.view());
-  problem.append(": ");
+  const StringView shown_name = name_of_path(name.view());   // (as the file explorer shows it: no path)
   if (!fs_) {
-    problem.append("no storage available.");
-    page->error.assign(problem.view());
+    format_message(&page->error, kFileNotOpened, shown_name, "No disk is available to read it from.");
     return false;
   }
   UniquePointer<IFile> file;
   Status status = fs_->open_file(name.view(), OpenMode::Read, &file);
   if (status != Status::Ok) {
-    problem.append(describe_status(status));
-    page->error.assign(problem.view());
+    format_message(&page->error, kFileNotOpened, shown_name, file_advice(status, false));
     return false;
   }
   const uint64_t size = file->size();
   if (size > limit) {
-    problem.append("the file is too large.");
-    page->error.assign(problem.view());
+    format_message(&page->error, kFileNotOpened, shown_name, "It is larger than this browser can show. Open it with another program.");
     return false;
   }
   ArrayView<uint8_t> bytes = allocate_view<uint8_t>(allocator(), size ? size : 1);
@@ -791,8 +1142,7 @@ bool WebBrowser::fetch_file(StringView path, Fetched* page, uint64_t limit) {
   const bool ok = status == Status::Ok && page->body.append(ConstByteView(bytes.data(), got));
   release_view(allocator(), bytes);
   if (!ok) {
-    problem.append(status == Status::Ok ? "out of memory." : "the file could not be read.");
-    page->error.assign(problem.view());
+    format_message(&page->error, kFileNotOpened, shown_name, file_advice(status == Status::Ok ? Status::OutOfMemory : status, false));
     return false;
   }
   return true;
@@ -883,7 +1233,7 @@ void WebBrowser::show(Fetched& page) {
   const StringView body(page.body.view());
   UniquePointer<browser::PagePicture> picture = UniquePointer<browser::PagePicture>::make(allocator(), allocator());
   if (!picture) {
-    notify(NoticeKind::Error, "Out of memory.");
+    notify(NoticeKind::Error, kNoMemory);
     return;
   }
   {
@@ -922,13 +1272,18 @@ void WebBrowser::show(Fetched& page) {
       dom::decode_document(page.body.view(), page.type.view(), &decoded, &used);
       text_as_html(decoded.view(), &synthetic);
     } else {
-      String note(allocator());
-      note.append("This kind of file (");
-      note.append(page.type.empty() ? StringView("unknown type") : page.type.view());
-      note.append(") cannot be shown.");
+      String note(allocator());   // (what it is, and what can be done with it; the type the server named goes last, as a reference)
+      if (page.type.empty()) note.assign("This kind of file cannot be shown here.\nTo keep it, choose Save Page As on the File menu.");
+      else format_message(&note, "This kind of file cannot be shown here (%1).\nTo keep it, choose Save Page As on the File menu.", page.type.view());
       text_as_html(note.view(), &synthetic);
     }
     html = synthetic.view();
+  }
+  {   // what Save Page As writes: the page as it came (nothing for the page a new tab starts on)
+    UiGuard lock(this);
+    saved_.clear();
+    saved_html_ = is_html(page.type.view(), page.address.view(), body);
+    if (!page.address.empty() && !saved_.append(page.body.view())) saved_.clear();
   }
   load_timing_.clear();
   bool ok = true;
@@ -977,7 +1332,7 @@ void WebBrowser::show(Fetched& page) {
   }
   if (!ok) {
     live_.reset();
-    notify(NoticeKind::Error, "Out of memory.");
+    notify(NoticeKind::Error, kNoMemory);
     return;
   }
   present(util::move(picture), false, page.status);
@@ -988,7 +1343,6 @@ void WebBrowser::show(Fetched& page) {
 void WebBrowser::present(UniquePointer<browser::PagePicture> picture, bool keep_scroll, uint32_t http_status) {
   String page_title(allocator());
   if (live_) page_title.assign(live_->page_title());
-  const bool cut = false;
   page_.set_picture(util::move(picture), keep_scroll);
   int32_t scroll = defer_scroll_;
   defer_scroll_ = -1;
@@ -1016,23 +1370,18 @@ void WebBrowser::present(UniquePointer<browser::PagePicture> picture, bool keep_
   }
   if (keep_scroll && errors == reported_errors_) return;   // (drawn again: the status bar keeps what it said, unless there is news)
   reported_errors_ = errors;
-  String message(allocator());
-  if (http_status >= 400) {
-    message.append("HTTP ");
-    message.append_uint(http_status);
-    message.append(": ");
-  }
-  message.append(cut ? "Done (the page is cut off)." : "Done.");
-  if (!keep_scroll && !load_timing_.empty()) {
-    message.append(" ");
-    message.append(load_timing_.view());
-  }
-  if (errors > 0) {
-    message.truncate(message.size() - 1);
-    message.append(" - ");
-    message.append_uint(errors);
-    message.append(errors == 1 ? " script error: " : " script errors; first: ");
-    message.append(first_error.view());
+  // The status bar says how it went, in a whole sentence. (Where the time went is in the script log and on the debug console, not here.)
+  String message(allocator()), number(allocator());
+  if (errors == 1) {
+    format_message(&message, "Done. A script on this page stopped early: %1", first_error.view());
+  } else if (errors > 1) {
+    number.append_uint(errors);
+    format_message(&message, "Done. %1 scripts on this page stopped early. The first: %2", number.view(), first_error.view());
+  } else if (http_status >= 400) {
+    number.append_uint(http_status);
+    format_message(&message, "Done. The server reported a problem with this page (status %1).", number.view());
+  } else {
+    message.assign("Done.");
   }
   say(message.view());
 }
@@ -1042,7 +1391,7 @@ void WebBrowser::refresh(bool keep_scroll) {
   if (!live_) return;
   UniquePointer<browser::PagePicture> picture = UniquePointer<browser::PagePicture>::make(allocator(), allocator());
   if (!picture || !live_->render_picture(picture.get(), layout_fonts())) {
-    notify(NoticeKind::Error, "Out of memory.");
+    notify(NoticeKind::Error, kNoMemory);
     return;
   }
   present(util::move(picture), keep_scroll, 0);
@@ -1149,11 +1498,13 @@ void WebBrowser::settle() {
 // Keys go to the page while a control has the focus (and Tab is the page's whenever it has a control to step to).
 void WebBrowser::update_key_capture() {
   if (!live_) {
+    __atomic_store_n(&page_capture_, uint8_t{PageView::kCaptureNone}, __ATOMIC_RELEASE);
     page_.set_capture_keys(PageView::kCaptureNone);
     return;
   }
   __atomic_store_n(&caret_blinks_, live_->caret_blinks(), __ATOMIC_RELEASE);
   const uint8_t mode = live_->has_focus() || live_->has_modal() ? PageView::kCaptureAll : live_->has_controls() ? PageView::kCaptureTab : PageView::kCaptureNone;
+  __atomic_store_n(&page_capture_, mode, __ATOMIC_RELEASE);   // (the Edit menu works on the page's field while one is typed in)
   page_.set_capture_keys(mode);
 }
 
@@ -1478,7 +1829,22 @@ void WebBrowser::on_toggle_third_party(void* self, Control&) {
   b->set_block_third_party_cookies(!b->block_third_party_);
 }
 
-void WebBrowser::on_clear_site_data(void* self, Control&) { static_cast<WebBrowser*>(self)->clear_site_data(); }
+// Tools > Clear Cookies and Site Data cannot be undone, so it asks first, and the button that leaves everything as it is is the default.
+void WebBrowser::on_clear_site_data(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  UiGuard lock(b);
+  if (!b->manager() || b->clear_dialog_.showing()) return;
+  b->clear_dialog_.set_texts("Web Browser", "Clear the cookies and data of all websites?", "This signs you out and cannot be undone.", "Clear", "Cancel");
+  b->clear_dialog_.set_default_choice(MessageDialog::Choice::Decline);
+  b->clear_dialog_.show(*b->manager());
+}
+
+void WebBrowser::on_clear_answer(void* self, Control&) {
+  auto* b = static_cast<WebBrowser*>(self);
+  if (!b->clear_dialog_.accepted()) return;
+  b->clear_site_data();
+  b->say("The cookies and data of all websites were cleared.");
+}
 
 UniquePointer<browser::IWebSocket> WebBrowser::Env::open_websocket(StringView url, StringView protocols, StringView origin, String* error) {
   if (!owner_.loader_) {
@@ -1725,6 +2091,14 @@ bool WebBrowser::on_key(const KeyArgs& args) {
     queue(resize_handler_, *this, true);
     return true;
   }
+  if (args.usage == key::kEscape && !control && !alt) {
+    if (stop()) return true;   // Esc stops the page that is being fetched
+    if (address_.focused() && !address_.text().equals(current_.view())) {   // in the address box it cancels what was typed
+      address_.set_text(current_.view());
+      address_.select_all();
+      return true;
+    }
+  }
   if (args.usage == key::kEnter && address_.focused()) {
     navigate(address_.text());
     return true;
@@ -1737,20 +2111,31 @@ bool WebBrowser::on_key(const KeyArgs& args) {
     go_forward();
     return true;
   }
-  if (args.usage == key::kF1 + 4) {   // F5
-    reload();
-    return true;
+  if (!control && !alt) {
+    if (args.usage == key::kF1) {
+      show_help();
+      return true;
+    }
+    if (args.usage == key::kF1 + 4) {   // F5
+      reload();
+      return true;
+    }
+    if (args.usage == key::kF1 + 5) {   // F6: from the address box to the page and back
+      if (address_.focused()) {
+        if (Window* w = window()) w->set_focus(&page_);
+      } else {
+        focus_address();
+      }
+      return true;
+    }
   }
-  if (control) {
+  if (control && !alt) {
     switch (args.usage) {
-      case key::kA + 17: reload(); return true;   // R
-      case key::kA + 14: ask_open(); return true; // O
-      case key::kA + 11:                          // L
-        if (Window* w = window()) {
-          w->set_focus(&address_);
-          address_.select_all();
-        }
-        return true;
+      case key::kA + 17: reload(); return true;      // R
+      case key::kA + 14: ask_open(); return true;    // O
+      case key::kA + 18: ask_save(); return true;    // S
+      case key::kA + 22: close(); return true;       // W: the tab
+      case key::kA + 11: focus_address(); return true;   // L
       default: break;
     }
   }
@@ -1795,7 +2180,9 @@ void WebBrowser::ask_leave(Request kind, StringView target) {
   leave_kind_ = kind;
   leave_target_.assign(target);
   if (!manager() || leave_dialog_.showing()) return;
-  leave_dialog_.set_texts("Leave page?", "This page asks whether you want to leave it.", "Changes you made may not be saved.", "Leave", "Stay");
+  // (titled by the page it is about; leaving may lose what was typed, so staying is the default)
+  leave_dialog_.set_texts(title(), "Changes you made here may not be saved.", "Leave this page anyway?", "Leave", "Stay");
+  leave_dialog_.set_default_choice(MessageDialog::Choice::Decline);
   leave_dialog_.show(*manager());
 }
 
@@ -1852,7 +2239,7 @@ void WebBrowser::on_history_opening(void* self, Control&) {
 void WebBrowser::on_history_hop(void* context, Control&) {
   Hop* hop = static_cast<Hop*>(context);
   WebBrowser* b = hop->owner;
-  if (!b->history_.can_go(hop->delta)) return;
+  if (hop->delta == 0 || !b->history_.can_go(hop->delta)) return;   // (the page shown is in the Go menu's list too)
   b->request_delta_ = hop->delta;
   b->post(hop->delta < 0 ? Request::Back : Request::Forward, StringView());
 }

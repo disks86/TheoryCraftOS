@@ -26,19 +26,23 @@ using namespace gui;
 
 void ColorDialog::Swatch::paint(Painter& painter) {
   const Rect2D all{0, 0, bounds_.width, bounds_.height};
-  painter.fill(all, color);
-  painter.bevel(all, true);
+  painter.fill(all, color);                   // (the color itself: content, not a color of the interface)
+  painter.outline(all, painter.theme().dark);
 }
 
 ColorDialog::ColorDialog(allocators::IAllocator& allocator)
     : Frame(allocator),
+      body_(allocator),
+      button_row_(allocator),
       top_(allocator),
       form_(allocator),
       caption_row_(allocator),
       preview_row_(allocator),
       palette_row_(allocator),
-      button_row_(allocator),
+      spacer_(allocator),
       gap_(allocator),
+      basic_label_(allocator),
+      message_(allocator),
       spectrum_(allocator),
       new_label_(allocator),
       old_label_(allocator),
@@ -66,28 +70,30 @@ ColorDialog::ColorDialog(allocators::IAllocator& allocator)
   set_escape_closes(true);
   set_padding(Insets::all(8));
 
-  // The bottom, from the lowest row up: the buttons, the basic colors.
-  button_row_.set_style(PanelStyle::Transparent);
-  button_row_.set_dock(DockStyle::Bottom);
+  // The buttons, right-aligned: OK (the default button), then Cancel.
   button_row_.set_size(0, 32);
   button_row_.set_padding(Insets{0, 4, 0, 0});
+  spacer_.set_style(PanelStyle::Transparent);
+  spacer_.set_dock(DockStyle::Fill);
+  ok_.set_text("OK");
+  ok_.set_size(92, 0);
+  ok_.set_default(true);
+  ok_.on_click({&ColorDialog::on_ok, this});
+  gap_.set_style(PanelStyle::Transparent);
+  gap_.set_size(8, 0);
   cancel_.set_text("Cancel");
-  cancel_.set_dock(DockStyle::Right);
   cancel_.set_size(92, 0);
   cancel_.on_click({&ColorDialog::on_cancel, this});
-  gap_.set_style(PanelStyle::Transparent);
-  gap_.set_dock(DockStyle::Right);
-  gap_.set_size(8, 0);
-  ok_.set_text("OK");
-  ok_.set_dock(DockStyle::Right);
-  ok_.set_size(92, 0);
-  ok_.on_click({&ColorDialog::on_ok, this});
-  button_row_.add(&cancel_);
-  button_row_.add(&gap_);
+  button_row_.add(&spacer_);
   button_row_.add(&ok_);
+  button_row_.add(&gap_);
+  button_row_.add(&cancel_);
 
+  // The basic colors under a caption. (No colon: the palette is used with the pointer and takes no focus, so there is nothing for an access key to go to;
+  // every color in it can also be made with the boxes.)
+  basic_label_.set_text("Basic colors");
+  basic_label_.set_size(0, 22);
   palette_row_.set_style(PanelStyle::Transparent);
-  palette_row_.set_dock(DockStyle::Bottom);
   palette_row_.set_size(0, 52);
   palette_row_.set_padding(Insets{0, 4, 0, 0});
   basic_.set_indicator_visible(false);
@@ -95,8 +101,9 @@ ColorDialog::ColorDialog(allocators::IAllocator& allocator)
   basic_.set_size(basic_.preferred_size().width, 0);
   basic_.on_colors_changed({&ColorDialog::on_basic, this});
   palette_row_.add(&basic_);
+  message_.set_size(0, 22);
 
-  // Above them: the spectrum at the left and the form at the right.
+  // The top: the spectrum at the left and the form at the right.
   top_.set_style(PanelStyle::Transparent);
   top_.set_dock(DockStyle::Fill);
   spectrum_.set_dock(DockStyle::Left);
@@ -107,7 +114,7 @@ ColorDialog::ColorDialog(allocators::IAllocator& allocator)
   top_.add(&spectrum_);
   top_.add(&form_);
 
-  // Under the captions "New" and "Current": two squares side by side.
+  // Under the captions "New" and "Current": two squares side by side, the sample of the choice next to what it replaces.
   caption_row_.set_style(PanelStyle::Transparent);
   caption_row_.set_dock(DockStyle::Top);
   caption_row_.set_size(0, 22);
@@ -137,7 +144,7 @@ ColorDialog::ColorDialog(allocators::IAllocator& allocator)
     Label& label;
     const char* text;
   };
-  const Component rows[4] = {{red_row_, red_label_, "Red"}, {green_row_, green_label_, "Green"}, {blue_row_, blue_label_, "Blue"}, {hex_row_, hex_label_, "Hex"}};
+  const Component rows[4] = {{red_row_, red_label_, "Red:"}, {green_row_, green_label_, "Green:"}, {blue_row_, blue_label_, "Blue:"}, {hex_row_, hex_label_, "Code:"}};
   for (const Component& r : rows) {
     r.row.set_style(PanelStyle::Transparent);
     r.row.set_dock(DockStyle::Top);
@@ -164,9 +171,14 @@ ColorDialog::ColorDialog(allocators::IAllocator& allocator)
   hex_.on_changed({&ColorDialog::on_hex, this});
   hex_row_.add(&hex_);
 
-  add(&button_row_);
-  add(&palette_row_);
-  add(&top_);  // Fill goes last
+  // In reading order, which is also the order Tab takes.
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&top_);
+  body_.add(&basic_label_);
+  body_.add(&palette_row_);
+  body_.add(&message_);
+  body_.add(&button_row_);
+  add(&body_);
   apply(0xFF000000, true, true, true);
 }
 
@@ -175,6 +187,7 @@ bool ColorDialog::show(WindowManager& manager, StringView title, uint32_t initia
   if (showing()) return false;
   set_title(title);
   accepted_ = false;
+  message_.set_text(StringView());
   old_swatch_.color = initial | 0xFF000000u;
   set_color(initial);
   on_closed(result);
@@ -184,7 +197,7 @@ bool ColorDialog::show(WindowManager& manager, StringView title, uint32_t initia
   if (!manager.add_window(this, /*modal=*/true)) return false;
   if (Window* win = window()) {
     win->layout();
-    win->set_focus(&ok_);
+    win->set_focus(&spectrum_);   // the main field; Enter is still OK from here
   }
   return true;
 }
@@ -228,20 +241,27 @@ void ColorDialog::on_component(void* self, Control&) {
   d->apply(make_color(static_cast<uint8_t>(d->red_.value()), static_cast<uint8_t>(d->green_.value()), static_cast<uint8_t>(d->blue_.value())), true, false, true);
 }
 
-// A complete #RRGGBB (or RRGGBB) typed in the box is taken at once; anything else waits.
+// "#RRGGBB" or "RRGGBB": the color it names. False for anything else.
+bool ColorDialog::parse_code(StringView text, uint32_t* out) {
+  if (!text.empty() && text[0] == '#') text = text.without_prefix(1);
+  if (text.size() != 6) return false;
+  uint32_t value = 0;
+  for (const char c : text) {
+    const uint32_t digit = c >= '0' && c <= '9' ? static_cast<uint32_t>(c - '0') : c >= 'a' && c <= 'f' ? static_cast<uint32_t>(c - 'a' + 10) : c >= 'A' && c <= 'F' ? static_cast<uint32_t>(c - 'A' + 10) : 16;
+    if (digit > 15) return false;
+    value = value * 16 + digit;
+  }
+  *out = value;
+  return true;
+}
+
+// A complete code typed in the box is taken at once; anything else waits (OK asks for it to be finished).
 void ColorDialog::on_hex(void* self, Control&) {
   auto* d = static_cast<ColorDialog*>(self);
   if (d->updating_) return;
-  StringView text = d->hex_.text();
-  if (!text.empty() && text[0] == '#') text = text.without_prefix(1);
-  if (text.size() != 6) return;
   uint32_t value = 0;
-  for (uint64_t i = 0; i < 6; ++i) {
-    const char c = text[i];
-    const uint32_t digit = c >= '0' && c <= '9' ? static_cast<uint32_t>(c - '0') : c >= 'a' && c <= 'f' ? static_cast<uint32_t>(c - 'a' + 10) : c >= 'A' && c <= 'F' ? static_cast<uint32_t>(c - 'A' + 10) : 16;
-    if (digit > 15) return;
-    value = value * 16 + digit;
-  }
+  if (!parse_code(d->hex_.text(), &value)) return;
+  d->message_.set_text(StringView());
   d->apply(value, true, true, false);
 }
 
@@ -252,6 +272,14 @@ void ColorDialog::on_basic(void* self, Control&) {
 
 void ColorDialog::on_ok(void* self, Control&) {
   auto* d = static_cast<ColorDialog*>(self);
+  // A half-typed code is not the color the user meant: the dialog stays, says what a code looks like, and the focus goes to the box.
+  uint32_t typed = 0;
+  if (!parse_code(d->hex_.text(), &typed)) {
+    d->message_.set_text("A color code is # and six of 0-9 and A-F: #FF8000.");
+    if (Window* win = d->window()) win->set_focus(&d->hex_);
+    d->hex_.select_all();
+    return;
+  }
   d->accepted_ = true;
   d->close();
 }

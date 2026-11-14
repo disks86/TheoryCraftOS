@@ -17,6 +17,8 @@
  */
 
 #include "Desktop/NetworkProperties.hpp"
+#include "Desktop/Format.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
 
@@ -46,7 +48,10 @@ void append_hex2(String* out, uint8_t value) {
 NetworkProperties::NetworkProperties(allocators::IAllocator& allocator)
     : Frame(allocator),
       grid_(allocator),
+      body_(allocator),
       buttons_(allocator),
+      spacer_(allocator),
+      grid_menu_(allocator),
       copy_button_(allocator),
       close_button_(allocator),
       status_(allocator),
@@ -55,24 +60,30 @@ NetworkProperties::NetworkProperties(allocators::IAllocator& allocator)
   set_title("Network Adapter Properties");
   set_bounds({130, 80, 440, 400});
   set_padding(Insets::all(8));
-  set_minimize_enabled(true);
+  set_minimize_enabled(false);
 
-  buttons_.set_style(PanelStyle::Transparent);
-  buttons_.set_dock(DockStyle::Bottom);
+  // A property sheet is a secondary frame: no Minimize or Maximize, and Escape closes it. Nothing in it can be changed, so there is nothing to
+  // apply or to cancel and its one transaction button is Close (the default button: Enter).
+  set_maximize_enabled(false);
+  set_escape_closes(true);
   buttons_.set_size(0, 30);
-  close_button_.set_text("Close");
-  close_button_.set_dock(DockStyle::Right);
-  close_button_.set_size(90, 0);
-  close_button_.on_click(Handler::immediate(&NetworkProperties::on_close, this));
   copy_button_.set_text("Copy Row");
-  copy_button_.set_dock(DockStyle::Left);
   copy_button_.set_size(100, 0);
   copy_button_.on_click({&NetworkProperties::on_copy, this});
-  buttons_.add(&close_button_);
+  spacer_.set_style(PanelStyle::Transparent);
+  spacer_.set_dock(DockStyle::Fill);
+  close_button_.set_text("Close");
+  close_button_.set_size(90, 0);
+  close_button_.set_default(true);
+  close_button_.on_click(Handler::immediate(&NetworkProperties::on_close, this));
   buttons_.add(&copy_button_);
+  buttons_.add(&spacer_);
+  buttons_.add(&close_button_);
 
-  status_.set_dock(DockStyle::Bottom);
   status_.set_size(0, 22);
+  copy_item_ = grid_menu_.add_item("Copy Row", {&NetworkProperties::on_copy, this});
+  grid_menu_.on_opening(Handler::immediate(&NetworkProperties::on_menu_opening, this));
+  grid_.set_context_menu(&grid_menu_);
 
   grid_.add_column("Property", 150);
   grid_.add_column("Value", 240);
@@ -81,9 +92,24 @@ NetworkProperties::NetworkProperties(allocators::IAllocator& allocator)
     const StringView cells[2] = {kProperties[i], StringView()};
     grid_.add_row(cells, 2);
   }
-  add(&buttons_);
-  add(&status_);
-  add(&grid_);   // (Fill goes last)
+  body_.set_dock(DockStyle::Fill);
+  body_.add(&grid_);
+  body_.add(&status_);
+  body_.add(&buttons_);
+  add(&body_);
+}
+
+void NetworkProperties::on_menu_opening(void* self, Control&) {
+  auto* p = static_cast<NetworkProperties*>(self);
+  p->copy_item_->set_enabled(p->grid_.selected_row() >= 0);
+}
+
+bool NetworkProperties::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter) {   // (a focused button takes Enter itself; this is for the table)
+    close_button_.click();
+    return true;
+  }
+  return Frame::on_key(args);
 }
 
 StringView NetworkProperties::cell(uint32_t row, uint32_t column) const {
@@ -109,13 +135,12 @@ void NetworkProperties::update() {
   NetworkAdapterInfo info;
   if (!details_ || !details_->adapter(id_, &info)) {
     for (uint32_t i = 0; i < kRowCount; ++i) set_value(i, StringView());
-    status_.set_text(details_ ? "This adapter is not there any more." : "No network information is available.");
+    status_.set_text(details_ ? "This adapter is no longer connected. Close this window." : "No network information is available.");
     return;
   }
   status_.set_text(StringView());
   String title(allocator());
-  title.assign(info.name);
-  title.append(" - Properties");
+  format_message(&title, "%1 Properties", info.name);   // (the object's name, then Properties)
   set_title(title.view());
   String text(allocator());
   set_value(kAdapter, info.name);

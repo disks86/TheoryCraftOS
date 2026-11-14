@@ -18,7 +18,7 @@
 
 #include "Desktop/DatabaseQuery.hpp"
 #include "Database/ConnectionOptions.hpp"
-#include "Desktop/FileStatus.hpp"
+#include "FileSystem/SystemLayout.hpp"
 #include "Gui/Window.hpp"
 #include "Hardware/Keyboard/KeyCodes.hpp"
 #include "Kernel/Clipboard.hpp"
@@ -46,8 +46,10 @@ bool normalize(StringView in, String* out) {
   return out->append(in.substr(from, to - from));
 }
 
-const FileDialog::Filter kSqlFilters[] = {{"SQL files", "sql;txt"}, {"All files", "*"}};
-const FileDialog::Filter kCsvFilters[] = {{"CSV files", "csv"}, {"All files", "*"}};
+const FileDialog::Filter kSqlFilters[] = {{"Queries", "sql;txt"}, {"All Files", "*"}};
+const FileDialog::Filter kCsvFilters[] = {{"Spreadsheets", "csv"}, {"All Files", "*"}};
+
+uint32_t g_queries = 0;   // numbers the new queries: "Query 1", "Query 2"...
 
 bool is_number_type(DbType t) { return t == DbType::Integer || t == DbType::Real || t == DbType::Decimal; }
 
@@ -86,8 +88,9 @@ bool DatabaseQuery::ResultModel::cell_text(uint32_t row, uint32_t column, String
 }
 
 DatabaseQuery::DatabaseQuery(allocators::IAllocator& allocator)
-    : Frame(allocator),
+    : DocumentFrame(allocator, "Database", "Query", &g_queries),
       menu_(allocator),
+      results_menu_(allocator),
       connection_bar_(allocator),
       status_bar_(allocator),
       url_label_(allocator),
@@ -99,8 +102,6 @@ DatabaseQuery::DatabaseQuery(allocators::IAllocator& allocator)
       connect_button_(allocator),
       editor_(allocator),
       grid_(allocator),
-      path_(allocator),
-      name_(allocator),
       server_(allocator) {
   set_bounds({110, 60, 680, 480});
   set_padding(Insets::all(4));
@@ -109,54 +110,58 @@ DatabaseQuery::DatabaseQuery(allocators::IAllocator& allocator)
 
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
+  menu_.on_opening(Handler::immediate(&DatabaseQuery::on_menu_opening, this));
   if (Menu* file = menu_.add_menu("File")) {
-    file->add_item("New Query", {&DatabaseQuery::on_new, this}, "Ctrl+N");
-    file->add_item("Open SQL...", {&DatabaseQuery::on_open, this}, "Ctrl+O");
-    file->add_item("Save SQL", {&DatabaseQuery::on_save, this}, "Ctrl+S");
-    file->add_item("Save SQL As...", {&DatabaseQuery::on_save_as, this}, "Ctrl+Shift+S");
+    file->add_item("New", {&DatabaseQuery::on_new, this}, "Ctrl+N");
+    open_item_ = file->add_item("Open...", {&DatabaseQuery::on_open, this}, "Ctrl+O");
+    save_item_ = file->add_item("Save", {&DatabaseQuery::on_save, this}, "Ctrl+S");
+    save_as_item_ = file->add_item("Save As...", {&DatabaseQuery::on_save_as, this}, "Ctrl+Shift+S");
     file->add_separator();
-    file->add_item("Export Results as CSV...", {&DatabaseQuery::on_export, this});
+    export_item_ = file->add_item("Export Results...", {&DatabaseQuery::on_export, this});
     file->add_separator();
-    file->add_item("Close", {&DatabaseQuery::on_close, this});
+    file->add_item("Exit", {&DatabaseQuery::on_close, this});   // (the query and the session go with the window, so this is Exit and not Close)
   }
   if (Menu* edit = menu_.add_menu("Edit")) {
-    edit->add_item("Cut", {&DatabaseQuery::on_cut, this}, "Ctrl+X");
-    edit->add_item("Copy", {&DatabaseQuery::on_copy, this}, "Ctrl+C");
-    edit->add_item("Paste", {&DatabaseQuery::on_paste, this}, "Ctrl+V");
+    undo_item_ = edit->add_item("Undo", {&DatabaseQuery::on_undo, this}, "Ctrl+Z");
+    redo_item_ = edit->add_item("Redo", {&DatabaseQuery::on_redo, this}, "Ctrl+Y");
+    edit->add_separator();
+    cut_item_ = edit->add_item("Cut", {&DatabaseQuery::on_cut, this}, "Ctrl+X");
+    copy_item_ = edit->add_item("Copy", {&DatabaseQuery::on_copy, this}, "Ctrl+C");
+    paste_item_ = edit->add_item("Paste", {&DatabaseQuery::on_paste, this}, "Ctrl+V");
+    delete_item_ = edit->add_item("Delete", {&DatabaseQuery::on_delete, this}, "Del");
+    edit->add_separator();
     edit->add_item("Select All", {&DatabaseQuery::on_select_all, this}, "Ctrl+A");
     edit->add_separator();
-    edit->add_item("Copy Results", {&DatabaseQuery::on_copy_results, this});
+    copy_results_item_ = edit->add_item("Copy Results", {&DatabaseQuery::on_copy_results, this});
   }
   if (Menu* query = menu_.add_menu("Query")) {
-    run_item_ = query->add_item("Run", {&DatabaseQuery::on_run, this}, "F5 / Ctrl+R");
+    run_item_ = query->add_item("Run", {&DatabaseQuery::on_run, this}, "F5");
     query->add_separator();
     connect_item_ = query->add_item("Connect", {&DatabaseQuery::on_connect_clicked, this});
     disconnect_item_ = query->add_item("Disconnect", {&DatabaseQuery::on_connect_clicked, this});
   }
+  if (Menu* help = menu_.add_menu("Help")) help->add_item("About Database", {&DatabaseQuery::on_about, this});
 
-  connection_bar_.set_style(PanelStyle::Transparent);
+  // The connection bar, in reading order (which is also the order of Tab): the server, the password, Connect. Each label ends in a colon and comes
+  // directly before its box, so its access key moves the focus there.
   connection_bar_.set_dock(DockStyle::Top);
   connection_bar_.set_size(0, 28);
   connection_bar_.set_padding(Insets::all(1));
-  url_label_.set_text("URL");
-  url_label_.set_dock(DockStyle::Left);
-  url_label_.set_size(36, 0);
-  connect_button_.set_text("Connect");
-  connect_button_.set_dock(DockStyle::Right);
-  connect_button_.set_size(84, 0);
-  connect_button_.on_click({&DatabaseQuery::on_connect_clicked, this});
-  password_.set_password(true);
-  password_.set_dock(DockStyle::Right);
-  password_.set_size(130, 0);
-  password_label_.set_text("Password");
-  password_label_.set_dock(DockStyle::Right);
-  password_label_.set_size(76, 0);
+  url_label_.set_text("Server:");
+  url_label_.set_size(60, 0);
   url_.set_dock(DockStyle::Fill);
+  password_label_.set_text("Password:");
+  password_label_.set_size(84, 0);
+  password_.set_password(true);
+  password_.set_size(130, 0);
+  connect_button_.set_text("Connect");
+  connect_button_.set_size(92, 0);
+  connect_button_.on_click({&DatabaseQuery::on_connect_clicked, this});
   connection_bar_.add(&url_label_);
-  connection_bar_.add(&connect_button_);
-  connection_bar_.add(&password_);
-  connection_bar_.add(&password_label_);
   connection_bar_.add(&url_);
+  connection_bar_.add(&password_label_);
+  connection_bar_.add(&password_);
+  connection_bar_.add(&connect_button_);
 
   editor_.set_dock(DockStyle::Top);
   editor_.set_size(0, 130);
@@ -166,12 +171,17 @@ DatabaseQuery::DatabaseQuery(allocators::IAllocator& allocator)
   status_bar_.set_dock(DockStyle::Bottom);
   status_bar_.set_size(0, 22);
   info_.set_dock(DockStyle::Right);
-  info_.set_size(200, 0);
+  info_.set_size(260, 0);
   status_.set_dock(DockStyle::Fill);
   status_bar_.add(&info_);
   status_bar_.add(&status_);
 
   grid_.set_dock(DockStyle::Fill);
+  // The table's own menu (the same commands as in the Edit and File menus).
+  ctx_copy_results_ = results_menu_.add_item("Copy Results", {&DatabaseQuery::on_copy_results, this});
+  ctx_export_ = results_menu_.add_item("Export Results...", {&DatabaseQuery::on_export, this});
+  results_menu_.on_opening(Handler::immediate(&DatabaseQuery::on_menu_opening, this));
+  grid_.set_context_menu(&results_menu_);
 
   add(&menu_);
   add(&connection_bar_);
@@ -179,7 +189,7 @@ DatabaseQuery::DatabaseQuery(allocators::IAllocator& allocator)
   add(&status_bar_);
   add(&grid_);  // Fill goes last
   update_connection_state();
-  say("Enter the server's URL, press Connect, type SQL and press F5.");
+  say("Enter the server, choose Connect, type a statement and press F5.");
 }
 
 DatabaseQuery::~DatabaseQuery() { connection_.reset(); }
@@ -188,33 +198,44 @@ void DatabaseQuery::manager_changed() {
   if (!manager()) disconnect();   // the window was closed: the session ends with it
 }
 
-void DatabaseQuery::update_title() {
-  String title(allocator());
-  title.assign("Database - ");
-  title.append(name_.empty() ? StringView("Untitled") : name_.view());
-  if (editor_.modified()) title.append(" *");
-  if (connected() && !server_.empty()) {
-    title.append(" - ");
-    title.append(server_.view());
-  }
-  set_title(title.view());
+// The items that cannot work right now are disabled instead of answering with a message.
+void DatabaseQuery::update_menus() {
+  const kernel::Clipboard* clip = clipboard();
+  const bool on = connected();
+  if (connect_item_) connect_item_->set_enabled(!on && databases_);
+  if (disconnect_item_) disconnect_item_->set_enabled(on);
+  if (run_item_) run_item_->set_enabled(on && !running_);
+  if (open_item_) open_item_->set_enabled(can_open());
+  if (save_item_) save_item_->set_enabled(can_save());
+  if (save_as_item_) save_as_item_->set_enabled(can_open());
+  if (export_item_) export_item_->set_enabled(can_open() && has_table());
+  if (ctx_export_) ctx_export_->set_enabled(can_open() && has_table());
+  if (copy_results_item_) copy_results_item_->set_enabled(has_table() && clip);
+  if (ctx_copy_results_) ctx_copy_results_->set_enabled(has_table() && clip);
+  if (undo_item_) undo_item_->set_enabled(editor_.can_undo());
+  if (redo_item_) redo_item_->set_enabled(editor_.can_redo());
+  if (cut_item_) cut_item_->set_enabled(editor_.has_selection());
+  if (copy_item_) copy_item_->set_enabled(editor_.has_selection());
+  if (delete_item_) delete_item_->set_enabled(editor_.has_selection());
+  if (paste_item_) paste_item_->set_enabled(clip && clip->has_text());
 }
 
 void DatabaseQuery::update_connection_state() {
   const bool on = connected();
   connect_button_.set_text(on ? "Disconnect" : "Connect");
-  if (connect_item_) connect_item_->set_enabled(!on);
-  if (disconnect_item_) disconnect_item_->set_enabled(on);
-  if (run_item_) run_item_->set_enabled(on);
+  connect_button_.set_enabled(on || databases_);
   if (!on) server_.clear();
-  url_.set_read_only(on);
-  update_title();
+  url_.set_read_only(on);   // (the box shows where the session is connected to for as long as it lasts)
+  update_menus();
 }
 
-void DatabaseQuery::on_edited(void* self, Control&) {
-  auto* q = static_cast<DatabaseQuery*>(self);
-  q->discard_armed_ = false;
-  q->update_title();
+void DatabaseQuery::on_edited(void* self, Control&) { static_cast<DatabaseQuery*>(self)->update_menus(); }
+void DatabaseQuery::on_menu_opening(void* self, Control&) { static_cast<DatabaseQuery*>(self)->update_menus(); }
+void DatabaseQuery::on_undo(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.undo(); }
+void DatabaseQuery::on_redo(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.redo(); }
+void DatabaseQuery::on_delete(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.delete_selection(); }
+void DatabaseQuery::on_about(void* self, Control&) {
+  static_cast<DatabaseQuery*>(self)->show_about("Database connects to a database server, runs statements and shows what comes back. It is part of TheoryCraftOS.");
 }
 
 void DatabaseQuery::on_new(void* self, Control&) { static_cast<DatabaseQuery*>(self)->new_document(); }
@@ -222,7 +243,7 @@ void DatabaseQuery::on_open(void* self, Control&) { static_cast<DatabaseQuery*>(
 void DatabaseQuery::on_save(void* self, Control&) { static_cast<DatabaseQuery*>(self)->save_file(); }
 void DatabaseQuery::on_save_as(void* self, Control&) { static_cast<DatabaseQuery*>(self)->ask_save_as(); }
 void DatabaseQuery::on_export(void* self, Control&) { static_cast<DatabaseQuery*>(self)->ask_export(); }
-void DatabaseQuery::on_close(void* self, Control&) { static_cast<DatabaseQuery*>(self)->close(); }
+void DatabaseQuery::on_close(void* self, Control&) { static_cast<DatabaseQuery*>(self)->exit_requested(); }
 void DatabaseQuery::on_cut(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.cut_selection(); }
 void DatabaseQuery::on_copy(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.copy_selection(); }
 void DatabaseQuery::on_paste(void* self, Control&) { static_cast<DatabaseQuery*>(self)->editor_.paste(); }
@@ -247,8 +268,8 @@ void DatabaseQuery::set_settings(database::local::SystemSettings* settings, Stri
 // --- Connection -----------------------------------------------------------------------------------------------------------------------------------------
 
 bool DatabaseQuery::connect() {
-  if (!databases_) {
-    notify(NoticeKind::Error, "No databases are available on this system.");
+  if (!databases_) {   // (Connect is disabled then)
+    say("No database drivers are installed, so no database can be connected.");
     return false;
   }
   database::ConnectionOptions options(allocator());
@@ -256,10 +277,9 @@ bool DatabaseQuery::connect() {
   String url(allocator());
   url.assign(url_.text());
   if (!database::parse_database_url(url.view(), &options, &error)) {
-    String message(allocator());
-    message.append("The URL is not valid: ");
-    message.append(error.message.view());
-    notify(NoticeKind::Warning, message.view());
+    // The entry is at fault: the message says what is wrong with it and the focus goes to the box.
+    notify(NoticeKind::Error, "The server's address cannot be used: %1. An address looks like \"postgres://user@host/database\".", error.message.view());
+    if (Window* w = window()) w->set_focus(&url_);
     return false;
   }
   const bool url_has_password = !options.password.empty();
@@ -267,35 +287,30 @@ bool DatabaseQuery::connect() {
   disconnect();
   say("Connecting...");
   const DbStatus status = databases_->connect(options, &connection_, &error);
+  String where(allocator());
+  where.assign(options.host.view());
+  if (!options.database.empty()) {
+    where.push_back('/');
+    where.append(options.database.view());
+  }
   if (status != DbStatus::Ok || !connection_) {
-    String message(allocator());
-    message.append("Cannot connect: ");
-    message.append(error.message.empty() ? StringView(database::db_status_name(status)) : error.message.view());
-    if (!error.sqlstate.empty()) {
-      message.append(" (");
-      message.append(error.sqlstate.view());
-      message.append(")");
-    }
+    // What the server (or the driver) gave as the reason, with its reference code at the end.
+    String reason(allocator());
+    const StringView said = error.message.empty() ? StringView(database::db_status_name(status)) : error.message.view();
+    if (error.sqlstate.empty()) reason.assign(said);
+    else format_message(&reason, "%1 (%2)", said, error.sqlstate.view());
     connection_.reset();
     update_connection_state();
-    notify(NoticeKind::Error, message.view());
+    say("Not connected.");
+    notify(NoticeKind::Error, "\"%1\" could not be connected. Check the address, the user name and the password. The answer was: %2", where.view(), reason.view());
     return false;
   }
-  server_.assign(options.host.view());
-  if (!options.database.empty()) {
-    server_.push_back('/');
-    server_.append(options.database.view());
-  }
+  server_.assign(where.view());
   update_connection_state();
   if (settings_ && !url_has_password) settings_->set_text("database-query", "url", url.view());   // the next window starts here
   String message(allocator());
-  message.append("Connected to ");
-  message.append(server_.view());
-  if (!connection_->server_version().empty()) {
-    message.append(" (server ");
-    message.append(connection_->server_version());
-    message.append(connection_->encrypted() ? ", encrypted)" : ")");
-  }
+  if (connection_->server_version().empty()) format_message(&message, "Connected to %1.", server_.view());
+  else format_message(&message, connection_->encrypted() ? "Connected to %1 (server %2, encrypted)." : "Connected to %1 (server %2).", server_.view(), connection_->server_version());
   say(message.view());
   return true;
 }
@@ -326,9 +341,9 @@ bool DatabaseQuery::run() {
     say("A statement is still running.");
     return false;
   }
-  if (!connected()) {
+  if (!connected()) {   // (Run is disabled in the menu; this answers F5)
     update_connection_state();
-    notify(NoticeKind::Warning, "Connect to a database first.");
+    notify(NoticeKind::Information, "No database is connected, so the statement was not run. Enter the server, choose Connect, and run it again.");
     return false;
   }
   String sql(allocator());
@@ -341,7 +356,7 @@ bool DatabaseQuery::run() {
   while (from < to && (sql[from] == ' ' || sql[from] == '\t' || sql[from] == '\n' || sql[from] == '\r')) ++from;
   while (to > from && (sql[to - 1] == ' ' || sql[to - 1] == '\t' || sql[to - 1] == '\n' || sql[to - 1] == '\r')) --to;
   if (from == to) {
-    say("Nothing to run: type a statement first.");
+    say("There is no statement to run. Type one first.");
     return false;
   }
   running_ = true;
@@ -358,21 +373,21 @@ bool DatabaseQuery::run() {
       result_.reset();
       show_result();
     }
+    // What the server gave as the reason: its message, its reference code, and the detail when it sent one.
     const database::DbError& error = connection_->last_error();
-    String message(allocator());
-    message.append(error.message.empty() ? StringView(database::db_status_name(status)) : error.message.view());
-    if (!error.sqlstate.empty()) {
-      message.append(" (");
-      message.append(error.sqlstate.view());
-      message.append(")");
-    }
-    if (!error.detail.empty()) {
-      message.append(": ");
-      message.append(error.detail.view());
-    }
+    const StringView said = error.message.empty() ? StringView(database::db_status_name(status)) : error.message.view();
+    String reason(allocator());
+    if (error.sqlstate.empty()) reason.assign(said);
+    else format_message(&reason, "%1 (%2)", said, error.sqlstate.view());
     update_connection_state();   // (the connection may have ended with it)
     info_.set_text(StringView());
-    notify(NoticeKind::Error, message.view());
+    say("The statement was not run.");
+    if (error.detail.empty()) notify(NoticeKind::Error, "The statement could not be run. Correct it and run it again. The server answered: %1", reason.view());
+    else {
+      String message(allocator());
+      format_message(&message, "The statement could not be run. Correct it and run it again. The server answered: %1: %2", reason.view(), error.detail.view());
+      notify(NoticeKind::Error, message.view());
+    }
     return false;
   }
   {
@@ -381,25 +396,25 @@ bool DatabaseQuery::run() {
     result_ = util::move(fresh);
     show_result();
   }
-  String text(allocator());
+  // The status bar: what the statement did, and beside it how many rows and how long (as "name: value" pairs, which read the same for one row and many).
+  String text(allocator()), count(allocator()), time(allocator());
+  time.append_uint(elapsed_ms);
   if (result_ && result_->column_count()) {
-    text.append_uint(result_->row_count());
-    text.append(result_->row_count() == 1 ? " row" : " rows");
+    count.append_uint(result_->row_count());
+    format_message(&text, clock_ ? "Rows: %1   Time: %2 ms" : "Rows: %1", count.view(), time.view());
     say(result_->command());
   } else {
     if (result_ && !result_->command().empty()) say(result_->command());
     else say("Done.");
     if (result_) {
-      text.append_uint(result_->rows_affected());
-      text.append(result_->rows_affected() == 1 ? " row affected" : " rows affected");
+      count.append_uint(result_->rows_affected());
+      format_message(&text, clock_ ? "Rows changed: %1   Time: %2 ms" : "Rows changed: %1", count.view(), time.view());
+    } else if (clock_) {
+      format_message(&text, "Time: %1 ms", time.view());
     }
   }
-  if (clock_) {
-    text.append(", ");
-    text.append_uint(elapsed_ms);
-    text.append(" ms");
-  }
   info_.set_text(text.view());
+  update_menus();
   return true;
 }
 
@@ -423,14 +438,7 @@ void append_csv_field(String* out, StringView v) {
 
 bool DatabaseQuery::copy_results() {
   kernel::Clipboard* clip = clipboard();
-  if (!result_ || result_->column_count() == 0) {
-    say("There is no table to copy.");
-    return false;
-  }
-  if (!clip) {
-    say("There is no clipboard.");
-    return false;
-  }
+  if (!has_table() || !clip) return false;   // (the menu items are disabled then)
   String text(allocator());
   for (uint32_t c = 0; c < result_->column_count(); ++c) {
     if (c) text.push_back('\t');
@@ -446,23 +454,16 @@ bool DatabaseQuery::copy_results() {
     text.push_back('\n');
   }
   if (!clip->set_text(text.view())) {
-    say("The table is too large for the clipboard.");
+    notify(NoticeKind::Error, "The results are too large for the clipboard, so nothing was copied. Use Export Results in the File menu to save them in a file.");
     return false;
   }
-  say("Copied the table.");
+  say("Copied the results.");
   return true;
 }
 
 bool DatabaseQuery::export_csv(StringView requested) {
-  if (!result_ || result_->column_count() == 0) {
-    notify(NoticeKind::Information, "There is no table to export: run a statement that returns rows.");
-    return false;
-  }
   String path(allocator());
-  if (!normalize(requested, &path) || path.empty()) {
-    notify(NoticeKind::Warning, "Enter a path to export to.");
-    return false;
-  }
+  if (!has_table() || !normalize(requested, &path) || path.empty()) return false;   // (Export Results is disabled without a table)
   String csv(allocator());
   for (uint32_t c = 0; c < result_->column_count(); ++c) {
     if (c) csv.push_back(',');
@@ -478,56 +479,48 @@ bool DatabaseQuery::export_csv(StringView requested) {
   }
   if (!write_text(path.view(), csv.view())) return false;
   String message(allocator());
-  message.append("Exported ");
-  message.append_uint(result_->row_count());
-  message.append(" rows to ");
-  message.append(path.view());
+  format_message(&message, "Exported the results to \"%1\".", name_of(path.view()));
   say(message.view());
   return true;
 }
 
 // --- SQL files ------------------------------------------------------------------------------------------------------------------------------------------
 
-bool DatabaseQuery::may_discard() {
-  if (!editor_.modified() || discard_armed_) {
-    discard_armed_ = false;
-    return true;
-  }
-  discard_armed_ = true;
-  notify(NoticeKind::Warning, "Unsaved changes - repeat the command to discard them, or press Save.");
-  return false;
+void DatabaseQuery::carry_out(Next next, StringView path) {
+  if (next == Next::New) start_new();
+  else if (next == Next::Open) show_open_dialog();
+  else if (next == Next::OpenFile) load_file(path);
+}
+
+void DatabaseQuery::start_new() {
+  editor_.set_text(StringView());
+  editor_.mark_saved();
+  name_new_document();
+  update_menus();
+  say("New query.");
 }
 
 bool DatabaseQuery::new_document() {
-  if (!may_discard()) return false;
-  editor_.set_text(StringView());
-  editor_.mark_saved();
-  path_.clear();
-  name_.clear();
-  update_title();
-  say("New query.");
+  if (!ready_for(Next::New)) return false;
+  start_new();
   return true;
 }
 
 bool DatabaseQuery::read_text(StringView path, String* out) {
   if (!fs_) {
-    notify(NoticeKind::Error, "No storage available.");
+    say("There is no disk to open files from.");
     return false;
   }
+  const StringView name = name_of(path);
   UniquePointer<IFile> file;
   Status status = fs_->open_file(path, OpenMode::Read, &file);
   if (status != Status::Ok) {
-    String message(allocator());
-    message.append("Cannot open ");
-    message.append(path);
-    message.append(": ");
-    message.append(describe_status(status));
-    notify(NoticeKind::Error, message.view());
+    notify(NoticeKind::Error, "\"%1\" could not be opened. %2", name, file_advice(status, false));
     return false;
   }
   const uint64_t size = file->size();
   if (size > kMaxFileBytes) {
-    notify(NoticeKind::Error, "The file is too large to open (limit 1 MiB).");
+    notify(NoticeKind::Error, "\"%1\" is too large for Database, which opens queries of up to 1 MB. Open it with another program.", name);
     return false;
   }
   ArrayView<uint8_t> bytes = allocate_view<uint8_t>(allocator(), size ? size : 1);
@@ -539,13 +532,13 @@ bool DatabaseQuery::read_text(StringView path, String* out) {
   for (uint64_t i = 0; ok && i < got; ++i)
     if (bytes[i] != '\r') ok = out->push_back(static_cast<char>(bytes[i]));
   release_view(allocator(), bytes);
-  if (!ok) notify(NoticeKind::Error, status == Status::Ok ? "Out of memory." : "The file could not be read.");
+  if (!ok) notify(NoticeKind::Error, "\"%1\" could not be opened. %2", name, file_advice(status == Status::Ok ? Status::OutOfMemory : status, false));
   return ok;
 }
 
 bool DatabaseQuery::write_text(StringView path, StringView text) {
   if (!fs_) {
-    notify(NoticeKind::Error, "No storage available.");
+    say("There is no disk to save files on.");
     return false;
   }
   UniquePointer<IFile> file;
@@ -555,12 +548,7 @@ bool DatabaseQuery::write_text(StringView path, StringView text) {
   if (status == Status::Ok) status = file->flush();
   file.reset();
   if (status != Status::Ok) {
-    String message(allocator());
-    message.append("Cannot save ");
-    message.append(path);
-    message.append(": ");
-    message.append(describe_status(status));
-    notify(NoticeKind::Error, message.view());
+    notify(NoticeKind::Error, "\"%1\" could not be saved. %2", name_of(path), file_advice(status, true));
     return false;
   }
   fs_->flush();
@@ -568,46 +556,45 @@ bool DatabaseQuery::write_text(StringView path, StringView text) {
 }
 
 void DatabaseQuery::ask_open() {
-  if (!dialog_ || !manager()) {
-    notify(NoticeKind::Error, "No file dialog available.");
-    return;
-  }
-  if (!may_discard()) return;
-  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kSqlFilters, 2, path_.view(), {&DatabaseQuery::on_open_picked, this}))
-    notify(NoticeKind::Warning, "The file dialog is busy.");
+  if (!can_open() || !manager()) return;   // (the menu item is disabled then)
+  if (ready_for(Next::Open)) show_open_dialog();
+}
+
+void DatabaseQuery::show_open_dialog() {
+  String start(allocator());
+  dialog_start(fs_, filesystem::layout::kDocuments, ".sql", false, &start);
+  if (!dialog_->show(*manager(), FileDialog::Mode::Open, "Open", kSqlFilters, 2, start.view(), {&DatabaseQuery::on_open_picked, this}))
+    say("The Open dialog is already open for another window.");
 }
 
 void DatabaseQuery::ask_save_as() {
-  if (!dialog_ || !manager()) {
-    notify(NoticeKind::Error, "No file dialog available.");
+  if (!can_open() || !manager()) {
+    save_abandoned();
     return;
   }
-  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kSqlFilters, 2, path_.view(), {&DatabaseQuery::on_save_picked, this}))
-    notify(NoticeKind::Warning, "The file dialog is busy.");
+  String start(allocator());
+  dialog_start(fs_, filesystem::layout::kDocuments, ".sql", true, &start);
+  if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Save As", kSqlFilters, 2, start.view(), {&DatabaseQuery::on_save_picked, this})) {
+    save_abandoned();
+    say("The Save As dialog is already open for another window.");
+  }
 }
 
 void DatabaseQuery::ask_export() {
-  if (!dialog_ || !manager()) {
-    notify(NoticeKind::Error, "No file dialog available.");
-    return;
-  }
-  if (!result_ || result_->column_count() == 0) {
-    notify(NoticeKind::Information, "There is no table to export: run a statement that returns rows.");
-    return;
-  }
+  if (!can_open() || !manager() || !has_table()) return;   // (the menu item is disabled then)
   if (!dialog_->show(*manager(), FileDialog::Mode::Save, "Export Results", kCsvFilters, 2, StringView(), {&DatabaseQuery::on_export_picked, this}))
-    notify(NoticeKind::Warning, "The file dialog is busy.");
+    say("The Export Results dialog is already open for another window.");
 }
 
 void DatabaseQuery::on_open_picked(void* self, Control&) {
   auto* q = static_cast<DatabaseQuery*>(self);
-  if (!q->dialog_->accepted()) return;
-  q->open_file(q->dialog_->selected_path());
+  if (q->dialog_->accepted()) q->load_file(q->dialog_->selected_path());   // (the unsaved changes were dealt with before the dialog opened)
 }
 
 void DatabaseQuery::on_save_picked(void* self, Control&) {
   auto* q = static_cast<DatabaseQuery*>(self);
   if (q->dialog_->accepted()) q->save_file(q->dialog_->selected_path());
+  else q->save_abandoned();
 }
 
 void DatabaseQuery::on_export_picked(void* self, Control&) {
@@ -617,45 +604,41 @@ void DatabaseQuery::on_export_picked(void* self, Control&) {
 
 bool DatabaseQuery::open_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested, &path) || path.empty()) {
-    notify(NoticeKind::Warning, "Enter the path of a file to open.");
-    return false;
-  }
-  if (!may_discard()) return false;
+  if (!normalize(requested, &path) || path.empty()) return false;
+  if (!ready_for(Next::OpenFile, path.view())) return false;
+  return load_file(path.view());
+}
+
+bool DatabaseQuery::load_file(StringView path) {
   String text(allocator());
-  if (!read_text(path.view(), &text)) return false;
+  if (!read_text(path, &text)) return false;
   editor_.set_text(text.view());
   editor_.mark_saved();
-  path_.assign(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
-  discard_armed_ = false;
-  update_title();
+  name_document(path);
+  update_menus();
   String message(allocator());
-  message.append("Opened ");
-  message.append(path.view());
+  format_message(&message, "Opened \"%1\".", document_name());
   say(message.view());
   return true;
 }
 
 bool DatabaseQuery::save_file(StringView requested) {
   String path(allocator());
-  if (!normalize(requested.empty() ? path_.view() : requested, &path) || path.empty()) {
-    if (dialog_ && manager()) ask_save_as();   // nowhere to save to yet: the same as Save As
-    else notify(NoticeKind::Warning, "Enter a path to save to.");
+  if (!normalize(requested.empty() ? this->path() : requested, &path) || path.empty()) {
+    ask_save_as();   // nowhere to save to yet: the same as Save As
     return false;
   }
-  if (!write_text(path.view(), editor_.text())) return false;
-  path_.assign(path.view());
-  const uint64_t slash = path.view().rfind('/');
-  name_.assign(slash == StringView::npos ? path.view() : path.view().substr(slash + 1));
+  if (!write_text(path.view(), editor_.text())) {
+    save_abandoned();
+    return false;
+  }
+  name_document(path.view());
   editor_.mark_saved();
-  discard_armed_ = false;
-  update_title();
+  update_menus();
   String message(allocator());
-  message.append("Saved ");
-  message.append(path.view());
+  format_message(&message, "Saved \"%1\".", document_name());
   say(message.view());
+  document_saved();   // (what waited for the save - New, Open, closing - goes ahead)
   return true;
 }
 
@@ -674,7 +657,7 @@ bool DatabaseQuery::on_key(const KeyArgs& args) {
       case key::kA + 14: ask_open(); return true;      // O
       case key::kA + 18:                               // S
         if (args.modifiers & hardware::modifier::kShift) ask_save_as();
-        else save_file();
+        else if (can_save()) save_file();
         return true;
       default: break;
     }

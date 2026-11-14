@@ -17,13 +17,20 @@
  */
 
 #include "Desktop/Todo.hpp"
+#include "Desktop/Format.hpp"
+#include "Gui/Window.hpp"
+#include "Hardware/Keyboard/KeyCodes.hpp"
 
 namespace desktop {
 
 using namespace gui;
 
 namespace {
-constexpr int32_t kGap = 6, kRowHeight = 24, kLabelHeight = 22, kButtonHeight = 26;
+constexpr int32_t kGap = 6, kRowHeight = 24, kLabelHeight = 22, kButtonHeight = 26, kLabelWidth = 88;
+// The menu's "Move to" commands, one whole text per bucket (title capitalization, as menu items have it).
+const char* const kMoveCommands[kBucketCount] = {"Move to Today", "Move to Tomorrow", "Move to This Week", "Move to Next Week", "Move to Someday"};
+// The most of an item's text a question quotes (a line of the question holds about 45 characters).
+constexpr uint64_t kQuoted = 28;
 
 Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
   return {x, y, static_cast<uint32_t>(width > 0 ? width : 0), static_cast<uint32_t>(height > 0 ? height : 0)};
@@ -32,15 +39,16 @@ Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
 
 Todo::Todo(allocators::IAllocator& allocator)
     : Frame(allocator), show_label_(allocator), text_label_(allocator), bucket_label_(allocator), status_(allocator), list_(allocator), text_(allocator), show_(allocator),
-      bucket_(allocator), add_(allocator), save_(allocator), done_(allocator), delete_(allocator), clear_(allocator), item_menu_(allocator), items_(allocator) {
+      bucket_(allocator), add_(allocator), save_(allocator), done_(allocator), delete_(allocator), clear_(allocator), item_menu_(allocator), ask_(allocator), items_(allocator) {
   set_title("To-Do");
   set_bounds({140, 40, 520, 500});
   set_padding(Insets::all(6));
   set_minimize_enabled(true);
 
-  show_label_.set_text("Show");
-  text_label_.set_text("To do");
-  bucket_label_.set_text("Assign to");
+  // (each label ends in a colon and comes directly before its field: it carries the field's access key)
+  show_label_.set_text("Show:");
+  text_label_.set_text("To do:");
+  bucket_label_.set_text("Assign to:");
   show_.add_item("All open items");
   for (uint32_t b = 0; b < kBucketCount; ++b) {
     show_.add_item(bucket_name(static_cast<Bucket>(b)));
@@ -51,9 +59,9 @@ Todo::Todo(allocators::IAllocator& allocator)
   bucket_.set_selected_index(static_cast<int32_t>(Bucket::Today));
   add_.set_text("Add");
   save_.set_text("Save");
-  done_.set_text("Done");
+  done_.set_text("Mark Complete");
   delete_.set_text("Delete");
-  clear_.set_text("Clear completed");
+  clear_.set_text("Clear Completed");
   text_.set_max_length(TodoStore::kMaxTitleBytes);
   list_.add_column("To do", 330);
   list_.add_column("When", 90);
@@ -63,24 +71,25 @@ Todo::Todo(allocators::IAllocator& allocator)
   show_.on_selection_changed({&Todo::on_show, this});
   list_.on_selection_changed({&Todo::on_pick, this});
   list_.on_item_activated({&Todo::on_done, this});
+  text_.on_changed({&Todo::on_text_changed, this});
   add_.on_click({&Todo::on_add, this});
   save_.on_click({&Todo::on_save, this});
   done_.on_click({&Todo::on_done, this});
   delete_.on_click({&Todo::on_delete, this});
   clear_.on_click({&Todo::on_clear, this});
+  ask_.on_result({&Todo::on_answer, this});
 
-  // The menu of an item: complete it (or put it back), move it to another bucket, delete it.
-  menu_done_ = item_menu_.add_item("Mark Complete", {&Todo::on_done, this}, "Enter");
+  // The menu of an item: complete it (or put it back), move it to another bucket, delete it, and last the command that edits it.
+  menu_done_ = item_menu_.add_item("Mark Complete", {&Todo::on_done, this});
   item_menu_.add_separator();
   for (uint32_t b = 0; b < kBucketCount; ++b) {
-    String label(allocator);
-    label.assign("Move to ");
-    label.append(bucket_name(static_cast<Bucket>(b)));
     move_targets_[b] = {this, static_cast<Bucket>(b)};
-    menu_move_[b] = item_menu_.add_item(label.view(), {&Todo::on_menu_move, &move_targets_[b]});
+    menu_move_[b] = item_menu_.add_item(kMoveCommands[b], {&Todo::on_menu_move, &move_targets_[b]});
   }
   item_menu_.add_separator();
   menu_delete_ = item_menu_.add_item("Delete", {&Todo::on_delete, this});
+  item_menu_.add_separator();
+  menu_edit_ = item_menu_.add_item("Edit", {&Todo::on_edit, this});
   item_menu_.on_opening(Handler::immediate(&Todo::on_menu_opening, this));
   list_.set_context_menu(&item_menu_);
 
@@ -100,13 +109,19 @@ uint32_t Todo::selected_id() const {
   return index >= 0 && static_cast<uint64_t>(index) < items_.count() ? items_[static_cast<uint64_t>(index)].id : 0;
 }
 
+// A command that cannot work now is disabled, not left to answer with a message: nothing to add or save while the text field is empty, nothing to
+// complete, delete or save while no item is chosen. Enter in the form presses Save while an open item is chosen and Add otherwise; that button has
+// the heavier outline.
 void Todo::update_buttons() {
-  const bool chosen = selected_id() != 0, completed = showing_completed();
-  done_.set_text(completed ? "Restore" : "Done");
+  const bool chosen = selected_id() != 0, completed = showing_completed(), written = !text_.text().empty();
+  const bool can_save = chosen && !completed && written, can_add = store_ != nullptr && written;
+  done_.set_text(completed ? "Restore" : "Mark Complete");
   done_.set_enabled(chosen);
   delete_.set_enabled(chosen);
-  save_.set_enabled(chosen && !completed);
-  add_.set_enabled(store_ != nullptr);
+  save_.set_enabled(can_save);
+  add_.set_enabled(can_add);
+  save_.set_default(can_save);
+  add_.set_default(can_add && !can_save);
   clear_.set_enabled(store_ && store_->done_count() > 0);
 }
 
@@ -155,18 +170,18 @@ void Todo::select_item(int32_t index) {
 bool Todo::add_item() {
   UiGuard lock(this);
   if (!store_ || text_.text().empty()) {
-    say(store_ ? "Write what there is to do." : "There is no storage for the list.");
+    say(store_ ? "Write what there is to do, then choose Add." : "The list cannot be used because no disk is ready.");
     return false;
   }
   const Bucket bucket = static_cast<Bucket>(bucket_.selected_index() < 0 ? 0 : bucket_.selected_index());
   if (!store_->add(bucket, text_.text())) {
-    say("The item could not be saved.");
+    say("The item could not be saved. The disk may be full.");
     return false;
   }
   text_.set_text("");
   if (showing_completed()) show_.set_selected_index(kShowOpen);   // (the new item is not among the completed ones)
   refresh();
-  say(store_->persistent() ? "Added." : "Added (the storage cannot be written: it is kept until shutdown).");
+  say(store_->persistent() ? "Added." : "Added, but only until shutdown: the disk cannot be written.");
   return true;
 }
 
@@ -178,11 +193,11 @@ bool Todo::update_item() {
     return false;
   }
   if (text_.text().empty()) {
-    say("Write what there is to do.");
+    say("Write what there is to do, then choose Save.");
     return false;
   }
   if (!store_->update(id, static_cast<Bucket>(bucket_.selected_index() < 0 ? 0 : bucket_.selected_index()), text_.text())) {
-    say("The item could not be saved.");
+    say("The item could not be saved. The disk may be full.");
     return false;
   }
   refresh();
@@ -199,7 +214,7 @@ bool Todo::complete_item() {
   }
   const bool restoring = showing_completed();
   if (!store_->set_done(id, !restoring)) {
-    say("The change could not be saved.");
+    say("The change could not be saved. The disk may be full.");
     return false;
   }
   text_.set_text("");
@@ -216,24 +231,19 @@ bool Todo::move_item(Bucket bucket) {
     return false;
   }
   if (!store_->set_bucket(id, bucket)) {
-    say("The change could not be saved.");
+    say("The change could not be saved. The disk may be full.");
     return false;
   }
   refresh();
   if (list_.selected_item() >= 0) select_item(list_.selected_item());   // (the form follows the item to its new bucket)
   String text(allocator());
-  text.assign("Moved to ");
-  text.append(bucket_name(bucket));
-  text.append(".");
-  say(text.view());
+  if (format_message(&text, "Moved to \"%1\".", bucket_name(bucket))) say(text.view());
   return true;
 }
 
-bool Todo::delete_item() {
-  UiGuard lock(this);
-  const uint32_t id = selected_id();
+bool Todo::remove_item(uint32_t id) {
   if (!store_ || !id || !store_->remove(id)) {
-    say(id ? "The item could not be deleted." : "Choose an item first.");
+    say(id ? "The item could not be deleted. The disk may be full." : "Choose an item first.");
     return false;
   }
   text_.set_text("");
@@ -242,12 +252,70 @@ bool Todo::delete_item() {
   return true;
 }
 
+bool Todo::delete_item() {
+  UiGuard lock(this);
+  return remove_item(selected_id());
+}
+
 uint32_t Todo::clear_completed() {
   UiGuard lock(this);
   const uint32_t n = store_ ? store_->remove_done() : 0;
   refresh();
-  say(n ? "Completed items deleted." : "Nothing to clear.");
+  say(n ? "Completed items deleted." : "There are no completed items.");
   return n;
+}
+
+// A deleted item cannot be brought back, so the question comes first, and the button that keeps the item is the default: Enter and Escape both
+// leave the list as it was.
+bool Todo::ask_delete() {
+  UiGuard lock(this);
+  const uint32_t id = selected_id();
+  TodoStore::Item item(allocator());
+  WindowManager* m = manager();
+  if (!m || !store_ || !id || !store_->get(id, &item)) return false;
+  String name(allocator()), line(allocator());
+  const StringView title = item.title.view();
+  if (title.size() > kQuoted) {
+    uint64_t cut = kQuoted;
+    while (cut > 0 && (static_cast<uint8_t>(title[cut]) & 0xC0) == 0x80) --cut;   // (not in the middle of a character)
+    if (!name.assign(title.first(cut)) || !name.append("...")) return false;
+  } else if (!name.assign(title)) {
+    return false;
+  }
+  if (!format_message(&line, "Delete \"%1\"?", name.view())) return false;
+  pending_ = Pending::DeleteItem;
+  pending_id_ = id;
+  ask_.set_texts(this->title(), line.view(), "A deleted item cannot be brought back.", "Delete", "Cancel");
+  ask_.set_default_choice(MessageDialog::Choice::Decline);
+  return ask_.show(*m);
+}
+
+bool Todo::ask_clear_completed() {
+  UiGuard lock(this);
+  WindowManager* m = manager();
+  if (!m || !store_ || store_->done_count() == 0) return false;
+  pending_ = Pending::ClearCompleted;
+  ask_.set_texts(title(), "Delete all completed items?", "Deleted items cannot be brought back.", "Delete", "Cancel");
+  ask_.set_default_choice(MessageDialog::Choice::Decline);
+  return ask_.show(*m);
+}
+
+void Todo::on_answer(void* self, Control&) {
+  auto* t = static_cast<Todo*>(self);
+  UiGuard lock(t);
+  const Pending what = t->pending_;
+  t->pending_ = Pending::None;
+  if (!t->ask_.accepted()) return;
+  if (what == Pending::DeleteItem) t->remove_item(t->pending_id_);
+  else if (what == Pending::ClearCompleted) t->clear_completed();
+}
+
+bool Todo::edit_item() {
+  UiGuard lock(this);
+  if (!selected_id() || showing_completed()) return false;
+  if (Window* w = window()) w->set_focus(&text_);
+  text_.select_all();
+  return true;
 }
 
 void Todo::on_show(void* self, Control&) {
@@ -263,10 +331,16 @@ void Todo::on_pick(void* self, Control&) {
 void Todo::on_add(void* self, Control&) { static_cast<Todo*>(self)->add_item(); }
 void Todo::on_save(void* self, Control&) { static_cast<Todo*>(self)->update_item(); }
 void Todo::on_done(void* self, Control&) { static_cast<Todo*>(self)->complete_item(); }
-void Todo::on_delete(void* self, Control&) { static_cast<Todo*>(self)->delete_item(); }
-void Todo::on_clear(void* self, Control&) { static_cast<Todo*>(self)->clear_completed(); }
+void Todo::on_delete(void* self, Control&) { static_cast<Todo*>(self)->ask_delete(); }
+void Todo::on_clear(void* self, Control&) { static_cast<Todo*>(self)->ask_clear_completed(); }
+void Todo::on_edit(void* self, Control&) { static_cast<Todo*>(self)->edit_item(); }
+void Todo::on_text_changed(void* self, Control&) {
+  auto* t = static_cast<Todo*>(self);
+  UiGuard lock(t);
+  t->update_buttons();
+}
 
-// Enables what applies to the chosen item: a completed one can be put back or deleted, an open one moved to any bucket but its own.
+// Enables what applies to the chosen item: a completed one can be put back or deleted, an open one moved to any bucket but its own, or edited.
 void Todo::on_menu_opening(void* self, Control&) {
   auto* t = static_cast<Todo*>(self);
   const bool chosen = t->selected_id() != 0, completed = t->showing_completed();
@@ -275,6 +349,7 @@ void Todo::on_menu_opening(void* self, Control&) {
   t->menu_done_->text.assign(completed ? "Restore" : "Mark Complete");
   t->menu_done_->set_enabled(chosen);
   t->menu_delete_->set_enabled(chosen);
+  t->menu_edit_->set_enabled(chosen && !completed);
   for (uint32_t b = 0; b < kBucketCount; ++b) {
     const bool current = known && static_cast<uint32_t>(item.bucket) == b;
     t->menu_move_[b]->set_checked(current);
@@ -286,29 +361,49 @@ void Todo::on_menu_move(void* target, Control&) {
   move->todo->move_item(move->bucket);
 }
 
+// Delete in the list deletes the chosen item (after the question). Enter that no control used (the text field, the bucket list) presses the default
+// button: Save while an open item is chosen, Add otherwise.
+bool Todo::on_key(const KeyArgs& args) {
+  namespace key = hardware::key;
+  const bool plain = !(args.modifiers & (hardware::modifier::kControl | hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt));
+  if (plain && args.usage == key::kDelete && list_.focused() && selected_id()) {
+    ask_delete();
+    return true;
+  }
+  if (plain && (args.usage == key::kEnter || args.usage == key::kKeypadEnter)) {
+    if (save_.is_default()) save_.click();
+    else if (add_.is_default()) add_.click();
+    return true;
+  }
+  return Frame::on_key(args);
+}
+
 void Todo::layout() {
   Frame::layout();
   const Rect2D area = client_rect();
   const int32_t left = area.x, top = area.y, width = static_cast<int32_t>(area.width), height = static_cast<int32_t>(area.height);
   int32_t y = top;
-  place(show_label_, rect(left, y, 48, kRowHeight));
-  place(show_, rect(left + 48, y, 180, kRowHeight));
+  place(show_label_, rect(left, y, kLabelWidth, kRowHeight));
+  place(show_, rect(left + kLabelWidth, y, 180, kRowHeight));
   y += kRowHeight + kGap;
   const int32_t form_height = 2 * (kRowHeight + 4) + kButtonHeight + kGap + kLabelHeight;
   const int32_t list_height = height - (y - top) - form_height - kGap;
   place(list_, rect(left, y, width, list_height > 60 ? list_height : 60));
   y += (list_height > 60 ? list_height : 60) + kGap;
-  place(text_label_, rect(left, y, 72, kRowHeight));
-  place(text_, rect(left + 72, y, width - 72, kRowHeight));
+  place(text_label_, rect(left, y, kLabelWidth, kRowHeight));
+  place(text_, rect(left + kLabelWidth, y, width - kLabelWidth, kRowHeight));
   y += kRowHeight + 4;
-  place(bucket_label_, rect(left, y, 72, kRowHeight));
-  place(bucket_, rect(left + 72, y, 140, kRowHeight));
+  place(bucket_label_, rect(left, y, kLabelWidth, kRowHeight));
+  place(bucket_, rect(left + kLabelWidth, y, 140, kRowHeight));
   y += kRowHeight + 4;
-  place(add_, rect(left, y, 64, kButtonHeight));
-  place(save_, rect(left + 70, y, 64, kButtonHeight));
-  place(done_, rect(left + 140, y, 72, kButtonHeight));
-  place(delete_, rect(left + 218, y, 64, kButtonHeight));
-  place(clear_, rect(left + 288, y, 130, kButtonHeight));
+  // The buttons are as wide as their texts need (the texts differ a lot in length), with the same gap between them.
+  int32_t x = left;
+  Button* const row[] = {&add_, &save_, &done_, &delete_, &clear_};
+  for (Button* button : row) {
+    const int32_t w = button == &done_ ? 128 : button == &clear_ ? 144 : 64;
+    place(*button, rect(x, y, w, kButtonHeight));
+    x += w + kGap;
+  }
   y += kButtonHeight + kGap;
   place(status_, rect(left, y, width, kLabelHeight));
 }

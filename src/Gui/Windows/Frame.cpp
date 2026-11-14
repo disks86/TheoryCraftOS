@@ -123,8 +123,11 @@ void Frame::restore() {
 }
 void Frame::close() {
   UiGuard lock(this);
-  if (host_) host_->close_tab(this);
-  else if (manager_ && close_requested()) manager_->close_window(this);
+  if (host_) {   // (a tab is asked like a window: a document with unsaved changes keeps its tab until the question is answered)
+    if (close_requested()) host_->close_tab(this);
+  } else if (manager_ && close_requested()) {
+    manager_->close_window(this);
+  }
 }
 void Frame::dock(Dock edge) {
   UiGuard lock(this);

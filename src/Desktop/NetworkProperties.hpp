@@ -22,6 +22,9 @@
 // a cable plugged in or a lease renewed shows at once. Copy Row puts the selected line on the clipboard.
 #pragma once
 #include "Desktop/NetworkDetails.hpp"
+#include "Desktop/DialogGrid.hpp"
+#include "Desktop/StackPanel.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -50,16 +53,26 @@ class NetworkProperties : public gui::Frame {
   // The text of a cell of the table (column 0: the property, column 1: its value).
   StringView cell(uint32_t row, uint32_t column) const;
   gui::Button& copy_button() { return copy_button_; }
+  gui::Button& close_button() { return close_button_; }
+  // The table's context menu: Copy Row.
+  gui::ContextMenu& grid_menu() { return grid_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
 
  private:
   static void on_copy(void* self, gui::Control&);
   static void on_close(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
   void set_value(uint32_t row, StringView text);
 
   INetworkDetails* details_ = nullptr;
   uint32_t id_ = 0;
-  gui::DataGrid grid_;
-  gui::Panel buttons_;
+  DialogGrid grid_;       // (Enter goes on to the default button)
+  StackColumn body_;        // top to bottom: the table, the status line, the buttons (the order Tab takes)
+  StackRow buttons_;        // left to right: Copy Row, the space, Close
+  gui::Panel spacer_;
+  gui::ContextMenu grid_menu_;
+  gui::MenuItem* copy_item_ = nullptr;
   gui::Button copy_button_, close_button_;
   gui::Label status_;
   String values_[kRowCount];

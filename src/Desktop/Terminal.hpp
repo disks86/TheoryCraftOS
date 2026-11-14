@@ -16,19 +16,25 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The terminal application: a window with a menu bar (File: New Terminal, Save Output As, Close; Edit: Copy All, Paste, Clear) around a
-// TerminalView, with a Shell behind it that runs the commands typed. The title shows the current folder. A folder dragged from a file
-// explorer and dropped on the window becomes the current folder (as if "cd" had been typed); a file dropped there has its path put on the
-// command line. Ctrl+N, Ctrl+S, Ctrl+V and Ctrl+L do the same as the menu items. Commands run on the window's handler thread.
+// The terminal application: a window with a menu bar (File: New Terminal, Save Output As, Exit; Edit: Copy All, Paste, Clear; Help: About
+// Terminal) around a TerminalView, with a Shell behind it that runs the commands typed. The title shows the current folder. A folder dragged
+// from a file explorer and dropped on the window becomes the current folder (as if "cd" had been typed); a file dropped there has its path put
+// on the command line. Ctrl+N, Ctrl+S, Ctrl+V and Ctrl+L do the same as the menu items. Commands run on the window's handler thread.
+//
+// Ctrl+C belongs to the program that is running (it stops it), as in every terminal, so copying is Ctrl+Shift+C; the Edit menu shows that
+// next to Copy All, and the view's context menu has the same commands. Closing the terminal while a program runs in it would stop the program,
+// so it asks first, and the button that leaves it running is the default.
 #pragma once
 #include "Desktop/ColorDialog.hpp"
 #include "Desktop/FileDialog.hpp"
 #include "Desktop/ProgramLauncher.hpp"
 #include "Desktop/Shell.hpp"
 #include "FileSystem/IFileSystem.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Menu.hpp"
 #include "Gui/Controls/TerminalView.hpp"
 #include "Executable/ExecutableKind.hpp"
+#include "Gui/MessageDialog.hpp"
 #include "Gui/NoticeDialog.hpp"
 #include "Gui/Windows/Frame.hpp"
 
@@ -68,11 +74,19 @@ class Terminal : public gui::Frame, private IProgramSink {
   gui::TerminalView& view() { return view_; }
   Shell& shell() { return shell_; }
   gui::MenuBar& menu_bar() { return menu_; }
+  gui::ContextMenu& view_menu() { return view_menu_; }
+  gui::MessageDialog& question() { return ask_; }
+  // Whether a program started from the command line is running now.
+  bool program_running() const { return running_ != nullptr; }
 
   // A path dragged here from a file explorer: a folder is entered, a file's path is put on the command line.
   bool accepts_drop(StringView text, int32_t, int32_t, const gui::Control*) const override { return fs_ && !text.empty() && text[0] == '/'; }
   void on_drop(StringView text, int32_t x, int32_t y, const gui::Control* source) override;
   bool on_key(const gui::KeyArgs& args) override;
+
+ protected:
+  // Closing stops the program that is running, so it asks first; with nothing running the terminal just closes.
+  bool close_requested() override;
 
  private:
   static void on_new(void* self, gui::Control&);
@@ -82,6 +96,9 @@ class Terminal : public gui::Frame, private IProgramSink {
   static void on_copy_all(void* self, gui::Control&);
   static void on_paste(void* self, gui::Control&);
   static void on_clear(void* self, gui::Control&);
+  static void on_about(void* self, gui::Control&);
+  static void on_menu_opening(void* self, gui::Control&);
+  static void on_close_answer(void* self, gui::Control&);
   static void on_submitted(void* self, gui::Control&);
   static bool is_link(void* self, StringView word);
   static void on_link(void* self, gui::Control&);
@@ -114,6 +131,10 @@ class Terminal : public gui::Frame, private IProgramSink {
 
   gui::MenuBar menu_;
   gui::TerminalView view_;
+  gui::ContextMenu view_menu_;
+  gui::MenuItem *save_item_ = nullptr, *paste_item_ = nullptr, *menu_paste_item_ = nullptr;
+  gui::MessageDialog ask_;         // "a program is still running": asked before the terminal closes
+  bool close_confirmed_ = false;
   Shell shell_;
   filesystem::IFileSystem* fs_ = nullptr;
   FileDialog* dialog_ = nullptr;

@@ -19,8 +19,15 @@
 // The Wi-Fi properties of a wireless adapter: the network it is joined to (name, signal, security, channel), and the networks in range with their
 // signal, security and channel. Pick a network, type its password if it has one and choose Connect; Disconnect leaves the current one; Scan looks
 // again. It refreshes itself when update() is called (the desktop does so once a second while the window is open).
+// It is the window of the Wi-Fi Networks command of a wireless adapter and is titled after it ("Wi-Fi Networks - <adapter>"); the adapter's property
+// sheet is NetworkProperties. What it does happens at once (there is nothing to apply), so its buttons are the actions and Close. Connect is the
+// default button: Enter in the list or in the password box joins the selected network. Connect without the password the network needs keeps the
+// focus in the password box and says so. The list has a context menu (Connect, Disconnect).
 #pragma once
+#include "Desktop/DialogGrid.hpp"
+#include "Desktop/StackPanel.hpp"
 #include "Desktop/WirelessDetails.hpp"
+#include "Gui/Controls/ContextMenu.hpp"
 #include "Gui/Controls/Button.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Gui/Controls/Label.hpp"
@@ -53,6 +60,10 @@ class WirelessProperties : public gui::Frame {
   gui::Button& scan_button() { return scan_button_; }
   gui::Button& connect_button() { return connect_button_; }
   gui::Button& disconnect_button() { return disconnect_button_; }
+  gui::Button& close_button() { return close_button_; }
+  gui::ContextMenu& grid_menu() { return grid_menu_; }
+
+  bool on_key(const gui::KeyArgs& args) override;
 
  private:
   static void on_scan(void* self, gui::Control&);
@@ -67,9 +78,13 @@ class WirelessProperties : public gui::Frame {
   uint32_t id_ = 0;
   WirelessState state_ = WirelessState::Disconnected;
   bool known_ = false;
-  gui::Label connection_, status_, password_label_;
-  gui::DataGrid grid_;
-  gui::Panel password_row_, buttons_, gap_a_, gap_b_;
+  gui::Label connection_, status_, password_label_, list_label_;
+  DialogGrid grid_;       // (Enter goes on to the default button)
+  StackColumn body_;      // top to bottom, the order Tab takes: the list, the password, the status line, the buttons
+  StackRow buttons_;      // left to right: Scan, Connect, Disconnect, the space, Close
+  gui::Panel password_row_, gap_a_, gap_b_, spacer_;
+  gui::ContextMenu grid_menu_;
+  gui::MenuItem *connect_item_ = nullptr, *disconnect_item_ = nullptr;
   gui::TextBox password_;
   gui::Button scan_button_, connect_button_, disconnect_button_, close_button_;
   WirelessNetworkInfo shown_[IWirelessDetails::kMaxNetworks], fresh_[IWirelessDetails::kMaxNetworks];   // (the list on screen; the one just read)

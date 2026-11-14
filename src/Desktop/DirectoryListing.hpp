@@ -28,7 +28,9 @@ namespace desktop {
 // regard to case. The status of opening the folder, or Ok.
 filesystem::Status read_sorted_directory(filesystem::IFileSystem& fs, StringView path, List<filesystem::DirectoryEntry>* entries);
 
-// "Folder", "TXT File" for "notes.txt", or "File" without an extension. False if memory ran out.
+// The type of an entry in the user's words: "Folder"; "Text Document", "Picture", "Sound" and the like for the types the system knows by
+// their extension; "XYZ File" for a type it does not know (the extension is then all there is to say); "File" without an extension.
+// False if memory ran out.
 bool describe_entry_type(const filesystem::DirectoryEntry& entry, String* out);
 
 // Whether the file name ends in one of the extensions in `extensions`: names without the dot, separated by ';' ("png;jpg"), compared

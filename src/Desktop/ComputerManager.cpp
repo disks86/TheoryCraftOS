@@ -25,7 +25,8 @@
 namespace desktop {
 
 namespace {
-constexpr int32_t kTitleWidth = 80;   // wide enough for "CPU Temp" and "GPU Temp" in the 8-pixel font
+constexpr int32_t kTitleWidth = 136;   // wide enough for "GPU temperature" in the 8-pixel font
+constexpr char kNotAvailable[] = "Not available";   // a figure the machine cannot tell
 }
 
 using namespace gui;
@@ -73,6 +74,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     : Frame(allocator),
       menu_(allocator),
       grid_menu_(allocator),
+      process_grid_menu_(allocator),
       tabs_(allocator),
       core_scroll_(allocator),
       processes_page_(allocator),
@@ -120,15 +122,27 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
 
   menu_.set_dock(DockStyle::Top);
   menu_.set_size(0, 22);
-  if (Menu* file = menu_.add_menu("File")) file->add_item("Close", {&ComputerManager::on_close_window, this});
-  if (Menu* view = menu_.add_menu("View")) {
-    processes_item_ = view->add_item("Processes", {&ComputerManager::on_show_processes, this});
+  if (Menu* file = menu_.add_menu("File")) file->add_item("Exit", {&ComputerManager::on_close_window, this});
+  if (Menu* edit = menu_.add_menu("Edit")) edit_copy_item_ = edit->add_item("Copy Row", {&ComputerManager::on_edit_copy, this}, "Ctrl+C");
+  if (Menu* view = menu_.add_menu("View")) {      // (in the order of the tabs)
+    processes_item_ = view->add_item("Threads", {&ComputerManager::on_show_processes, this});
     performance_item_ = view->add_item("Performance", {&ComputerManager::on_show_performance, this});
     hardware_item_ = view->add_item("Hardware", {&ComputerManager::on_show_hardware, this});
-    usermode_item_ = view->add_item("Usermode", {&ComputerManager::on_show_usermode, this});
+    usermode_item_ = view->add_item("Programs", {&ComputerManager::on_show_usermode, this});
   }
-  copy_row_item_ = grid_menu_.add_item("Copy Row", {&ComputerManager::on_copy_row, this}, "Ctrl+C");
+  // The commands of the selected device: what its context menu has, in the same order, Properties last.
+  if (Menu* device = menu_.add_menu("Device")) {
+    menu_display_item_ = device->add_item("Display Settings", {&ComputerManager::on_display_settings_item, this});
+    menu_wireless_item_ = device->add_item("Wi-Fi Networks", {&ComputerManager::on_wireless_item, this});
+    menu_bluetooth_item_ = device->add_item("Bluetooth Devices", {&ComputerManager::on_bluetooth_item, this});
+    device->add_separator();
+    menu_properties_item_ = device->add_item("Properties", {&ComputerManager::on_any_properties, this}, "Alt+Enter");
+  }
+  if (Menu* help = menu_.add_menu("Help")) about_item_ = help->add_item("About Computer Manager", {&ComputerManager::on_about, this});
+  copy_row_item_ = grid_menu_.add_item("Copy Row", {&ComputerManager::on_copy_row, this});
   grid_menu_.on_opening(Handler::immediate(&ComputerManager::on_grid_menu_opening, this));
+  copy_process_row_item_ = process_grid_menu_.add_item("Copy Row", {&ComputerManager::on_copy_process_row, this});
+  process_grid_menu_.on_opening(Handler::immediate(&ComputerManager::on_process_menu_opening, this));
   tabs_.set_dock(DockStyle::Fill);
   tabs_.on_selection_changed(Handler::immediate(&ComputerManager::on_tab_changed, this));
   processes_page_.set_style(PanelStyle::Transparent);
@@ -145,7 +159,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     LevelMeter& meter;
     const char* text;
   };
-  const RowParts rows[2] = {{cpu_row_, cpu_title_, cpu_value_, cpu_meter_, "CPU"}, {memory_row_, memory_title_, memory_value_, memory_meter_, "Memory"}};
+  const RowParts rows[2] = {{cpu_row_, cpu_title_, cpu_value_, cpu_meter_, "Processor"}, {memory_row_, memory_title_, memory_value_, memory_meter_, "Memory"}};
   for (const RowParts& r : rows) {
     r.row.set_style(PanelStyle::Transparent);
     r.row.set_dock(DockStyle::Top);
@@ -163,12 +177,12 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
     r.row.add(&r.meter);
     performance_page_.add(&r.row);
   }
-  setup_stat_row(gpu_row_, "GPU");
-  setup_stat_row(npu_row_, "NPU");
+  setup_stat_row(gpu_row_, "Graphics");
+  setup_stat_row(npu_row_, "AI processor");
   npu_row_.row.set_visible(false);   // (until the machine turns out to have one)
-  setup_stat_row(vram_row_, "VRAM");
-  setup_stat_row(cpu_temp_row_, "CPU Temp");
-  setup_stat_row(gpu_temp_row_, "GPU Temp");
+  setup_stat_row(vram_row_, "Graphics memory");
+  setup_stat_row(cpu_temp_row_, "CPU temperature");
+  setup_stat_row(gpu_temp_row_, "GPU temperature");
   setup_stat_row(battery_row_, "Battery");
   cpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);   // degrees Celsius
   gpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);
@@ -188,16 +202,19 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   grid_.set_model(&model_);
   grid_.set_dock(DockStyle::Fill);
   grid_.set_context_menu(&grid_menu_);
+  grid_.on_selection_changed(Handler::immediate(&ComputerManager::on_grid_selection, this));
 
   process_grid_.add_column("PID", 40, Align::Right);
   process_grid_.add_column("Program", 106);
   process_grid_.add_column("Type", 54);
   process_grid_.add_column("State", 62);
-  process_grid_.add_column("Thr", 32, Align::Right);
+  process_grid_.add_column("Threads", 62, Align::Right);
   process_grid_.add_column("CPU %", 48, Align::Right);
   process_grid_.add_column("Memory", 70, Align::Right);
   process_grid_.set_model(&process_model_);
   process_grid_.set_dock(DockStyle::Fill);
+  process_grid_.set_context_menu(&process_grid_menu_);
+  process_grid_.on_selection_changed(Handler::immediate(&ComputerManager::on_grid_selection, this));
   usermode_page_.add(&process_grid_);
 
   // The Hardware tab: the tree, and a line about the selected device under it. The Displays group has a menu of its own.
@@ -208,23 +225,27 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   tree_.set_dock(DockStyle::Fill);
   tree_.on_selection_changed(Handler::immediate(&ComputerManager::on_hardware_selection, this));
   tree_.set_context_menu(&display_menu_);   // (the nodes that have a menu say which; see TreeView)
-  display_settings_item_ = display_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
-  properties_item_ = adapter_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
-  wireless_adapter_item_ = wireless_menu_.add_item("Properties...", {&ComputerManager::on_properties_item, this});
-  wireless_properties_item_ = wireless_menu_.add_item("Wi-Fi Properties...", {&ComputerManager::on_wireless_item, this});
-  device_properties_item_ = device_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
-  monitor_properties_item_ = monitor_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
-  monitor_settings_item_ = monitor_menu_.add_item("Display Settings...", {&ComputerManager::on_display_settings_item, this});
-  bluetooth_properties_item_ = bluetooth_menu_.add_item("Properties...", {&ComputerManager::on_device_item, this});
-  bluetooth_settings_item_ = bluetooth_menu_.add_item("Bluetooth Settings...", {&ComputerManager::on_bluetooth_item, this});
+  // The context menus: the commands of the device first, Properties last. None ends in "...": each opens a window and asks nothing first.
+  display_settings_item_ = display_menu_.add_item("Display Settings", {&ComputerManager::on_display_settings_item, this});
+  properties_item_ = adapter_menu_.add_item("Properties", {&ComputerManager::on_properties_item, this});
+  wireless_properties_item_ = wireless_menu_.add_item("Wi-Fi Networks", {&ComputerManager::on_wireless_item, this});
+  wireless_menu_.add_separator();
+  wireless_adapter_item_ = wireless_menu_.add_item("Properties", {&ComputerManager::on_properties_item, this});
+  device_properties_item_ = device_menu_.add_item("Properties", {&ComputerManager::on_device_item, this});
+  monitor_settings_item_ = monitor_menu_.add_item("Display Settings", {&ComputerManager::on_display_settings_item, this});
+  monitor_menu_.add_separator();
+  monitor_properties_item_ = monitor_menu_.add_item("Properties", {&ComputerManager::on_device_item, this});
+  bluetooth_settings_item_ = bluetooth_menu_.add_item("Bluetooth Devices", {&ComputerManager::on_bluetooth_item, this});
+  bluetooth_menu_.add_separator();
+  bluetooth_properties_item_ = bluetooth_menu_.add_item("Properties", {&ComputerManager::on_device_item, this});
   hardware_page_.add(&hardware_info_);
   hardware_page_.add(&tree_);
 
   processes_page_.add(&grid_);
-  tabs_.add_page("Processes", &processes_page_);
+  tabs_.add_page("Threads", &processes_page_);
   tabs_.add_page("Performance", &performance_page_);
   tabs_.add_page("Hardware", &hardware_page_);
-  tabs_.add_page("Usermode", &usermode_page_);
+  tabs_.add_page("Programs", &usermode_page_);
   add(&menu_);
   add(&tabs_);
   on_tab_changed(this, tabs_);
@@ -244,6 +265,63 @@ void ComputerManager::on_tab_changed(void* self, Control&) {  // the View menu s
   if (t->performance_item_) t->performance_item_->set_checked(t->tabs_.selected_page() == 1);
   if (t->hardware_item_) t->hardware_item_->set_checked(t->tabs_.selected_page() == 2);
   if (t->usermode_item_) t->usermode_item_->set_checked(t->tabs_.selected_page() == 3);
+  t->update_commands();
+}
+
+DataGrid* ComputerManager::shown_grid() { return tabs_.selected_page() == 0 ? &grid_ : tabs_.selected_page() == 3 ? &process_grid_ : nullptr; }
+
+// What cannot be done now is unavailable, not answered with a message: Copy Row needs a selected row of the table that is up, the Device commands
+// the kind of device they are for, selected in the tree of the Hardware tab.
+void ComputerManager::update_commands() {
+  DataGrid* grid = shown_grid();
+  if (edit_copy_item_) edit_copy_item_->set_enabled(grid && grid->selected_row() >= 0);
+  if (about_item_) about_item_->set_enabled(notices_ != nullptr);
+  const bool hardware = tabs_.selected_page() == 2;
+  const int32_t node = hardware ? tree_.selected() : -1;
+  HardwareEntry e;
+  const bool device = hardware && selected_entry(&e);
+  const bool displays_group = node >= 0 && tree_.node_tag(node) == (0x10000u | static_cast<uint32_t>(HardwareGroup::Displays));
+  if (menu_display_item_) menu_display_item_->set_enabled(displays_group || (device && e.group == HardwareGroup::Displays));
+  if (menu_wireless_item_) menu_wireless_item_->set_enabled(device && e.group == HardwareGroup::Network && e.wireless);
+  if (menu_bluetooth_item_) menu_bluetooth_item_->set_enabled(device && e.group == HardwareGroup::Bluetooth && e.bluetooth);
+  if (menu_properties_item_) menu_properties_item_->set_enabled(device);
+}
+
+void ComputerManager::on_grid_selection(void* self, Control&) { static_cast<ComputerManager*>(self)->update_commands(); }
+
+void ComputerManager::on_edit_copy(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  if (DataGrid* grid = t->shown_grid()) grid->copy_selected_row();
+}
+
+// Properties of the selected device: a network adapter has a sheet of its own, every other device the common one.
+void ComputerManager::on_any_properties(void* self, Control& sender) {
+  auto* t = static_cast<ComputerManager*>(self);
+  HardwareEntry e;
+  if (t->tabs_.selected_page() != 2 || !t->selected_entry(&e)) return;
+  if (e.group == HardwareGroup::Network) on_properties_item(self, sender);
+  else on_device_item(self, sender);
+}
+
+void ComputerManager::on_about(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  NoticeDialog::post(t->notices_, t->manager(), NoticeKind::Information,
+                     "Computer Manager shows what the computer is doing and what it is made of: the running threads and programs, the load, and the devices.",
+                     "About Computer Manager");
+}
+
+bool ComputerManager::DeviceTree::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) return false;
+  return TreeView::on_key(args);
+}
+
+// Alt+Enter: Properties of the selected device.
+bool ComputerManager::on_key(const KeyArgs& args) {
+  if (args.usage == hardware::key::kEnter && (args.modifiers & (hardware::modifier::kLeftAlt | hardware::modifier::kRightAlt))) {
+    on_any_properties(this, *this);
+    return true;
+  }
+  return Frame::on_key(args);
 }
 void ComputerManager::on_show_processes(void* self, Control&) { static_cast<ComputerManager*>(self)->tabs_.select_page(0); }
 void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
@@ -255,7 +333,7 @@ void ComputerManager::setup_stat_row(CoreRow& r, const char* title) {
   r.title.set_size(kTitleWidth, 0);
   r.value.set_dock(DockStyle::Right);
   r.value.set_size(170, 0);
-  r.value.set_text("n/a");
+  r.value.set_text(kNotAvailable);
   r.meter.set_peak_hold(false);
   r.meter.set_dock(DockStyle::Fill);
   r.row.add(&r.title);
@@ -308,6 +386,11 @@ void ComputerManager::on_copy_row(void* self, Control&) { static_cast<ComputerMa
 void ComputerManager::on_grid_menu_opening(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
   t->copy_row_item_->set_enabled(t->grid_.selected_row() >= 0);
+}
+void ComputerManager::on_copy_process_row(void* self, Control&) { static_cast<ComputerManager*>(self)->process_grid_.copy_selected_row(); }
+void ComputerManager::on_process_menu_opening(void* self, Control&) {
+  auto* t = static_cast<ComputerManager*>(self);
+  t->copy_process_row_item_->set_enabled(t->process_grid_.selected_row() >= 0);
 }
 void ComputerManager::on_close_window(void* self, Control&) { static_cast<ComputerManager*>(self)->close(); }
 
@@ -385,6 +468,7 @@ void ComputerManager::rebuild_hardware() {
 void ComputerManager::on_hardware_selection(void* self, Control&) {
   auto* t = static_cast<ComputerManager*>(self);
   const int32_t node = t->tree_.selected();
+  t->update_commands();
   if (node < 0 || !t->inventory_) {
     t->hardware_info_.set_text(StringView());
     return;
@@ -392,9 +476,13 @@ void ComputerManager::on_hardware_selection(void* self, Control&) {
   const uint32_t tag = t->tree_.node_tag(node);
   String text(t->allocator());
   if (tag & 0x10000u) {
-    text.append_uint(t->tree_.child_count(node));
-    text.append(t->tree_.child_count(node) == 1 ? " device" : " devices");
-    if ((tag & 0xFFFFu) == static_cast<uint32_t>(HardwareGroup::Displays)) text.append(" - right-click for Display Settings");
+    String count(t->allocator());
+    count.append_uint(t->tree_.child_count(node));
+    const bool one = t->tree_.child_count(node) == 1;
+    if ((tag & 0xFFFFu) == static_cast<uint32_t>(HardwareGroup::Displays))   // (where the command is, for whoever does not think of the context menu)
+      format_message(&text, one ? "%1 device. Display Settings is in the Device menu." : "%1 devices. Display Settings is in the Device menu.", count.view());
+    else
+      format_message(&text, one ? "%1 device" : "%1 devices", count.view());
   } else {
     HardwareEntry e;
     if (t->inventory_->entry(tag, &e)) text.assign(e.detail[0] ? StringView(e.detail) : StringView(e.name));
@@ -432,7 +520,7 @@ void ComputerManager::update(uint64_t now_us) {
   UiGuard lock(this);
   if (inventory_ && inventory_->refresh()) rebuild_hardware();
   if (!monitor_ || buffer_.empty()) {
-    info_.set_text("No system monitor available");
+    info_.set_text("No information about the system is available.");
     return;
   }
   const uint64_t hz = monitor_->ticks_per_second() ? monitor_->ticks_per_second() : 1;
@@ -466,7 +554,7 @@ void ComputerManager::update(uint64_t now_us) {
       row->row.set_dock(DockStyle::Top);
       row->row.set_size(0, 22);
       row->title.set_dock(DockStyle::Left);
-      row->title.set_size(96, 0);
+      row->title.set_size(kTitleWidth, 0);
       row->value.set_dock(DockStyle::Right);
       row->value.set_size(50, 0);
       row->meter.set_peak_hold(false);
@@ -483,9 +571,9 @@ void ComputerManager::update(uint64_t now_us) {
     row.row.set_visible(core.online);
     if (!core.online) continue;
     const uint64_t percent = busy + idle ? busy * 100 / (busy + idle) : 0;
-    text.assign("Core ");
-    text.append_uint(i);
-    if (core.efficiency) text.append(" (E)");
+    String number(allocator());
+    number.append_uint(i);
+    format_message(&text, core.efficiency ? "Core %1 (efficiency)" : "Core %1", number.view());
     row.title.set_text(text.view());
     row.meter.set_level(static_cast<int32_t>(percent));
     text.assign("");
@@ -517,7 +605,7 @@ void ComputerManager::update(uint64_t now_us) {
   auto show_percent = [&](CoreRow& row, int32_t percent) {
     row.meter.set_level(percent < 0 ? 0 : percent > 100 ? 100 : percent);
     text.clear();
-    if (percent < 0) text.assign("n/a");
+    if (percent < 0) text.assign(kNotAvailable);
     else { text.append_uint(static_cast<uint64_t>(percent)); text.append("%"); }
     row.value.set_text(text.view());
   };
@@ -525,7 +613,7 @@ void ComputerManager::update(uint64_t now_us) {
     row.meter.set_level(millicelsius < 0 ? 0 : millicelsius >= 100000 ? 100 : millicelsius / 1000);
     text.clear();
     if (millicelsius < 0) {
-      text.assign("n/a");
+      text.assign(kNotAvailable);
     } else {
       text.append_uint(static_cast<uint64_t>(millicelsius) / 1000);
       text.push_back('.');
@@ -551,8 +639,7 @@ void ComputerManager::update(uint64_t now_us) {
   if (gpu.memory_known && !gpu.memory_total_bytes) {   // the adapter knows what is in use but not what there is
     vram_row_.meter.set_level(0);
     format_size(gpu.memory_used_bytes, &used_text);
-    text.assign(used_text.view());
-    text.append(" used");
+    format_message(&text, "%1 used", used_text.view());
     vram_row_.value.set_text(text.view());
   } else if (gpu.memory_known) {
     vram_row_.meter.set_level(static_cast<int32_t>(gpu.memory_used_bytes * 100 / gpu.memory_total_bytes));
@@ -564,7 +651,7 @@ void ComputerManager::update(uint64_t now_us) {
     vram_row_.value.set_text(text.view());
   } else {
     vram_row_.meter.set_level(0);
-    vram_row_.value.set_text("n/a");
+    vram_row_.value.set_text(kNotAvailable);
   }
   show_temperature(cpu_temp_row_, monitor_->cpu_temperature_millicelsius());
   show_temperature(gpu_temp_row_, gpu.temperature_millicelsius);
@@ -575,17 +662,18 @@ void ComputerManager::update(uint64_t now_us) {
     battery_row_.value.set_text("No battery");
   } else if (battery.percent < 0) {
     battery_row_.meter.set_level(0);
-    battery_row_.value.set_text("n/a");
+    battery_row_.value.set_text(kNotAvailable);
   } else {
     const int32_t percent = battery.percent > 100 ? 100 : battery.percent;
     battery_row_.meter.set_level(percent);
-    text.clear();
-    text.append_uint(static_cast<uint64_t>(percent));
-    text.append("%");
-    if (battery.state == ChargeState::Charging) text.append(" - Charging");
-    else if (battery.state == ChargeState::Discharging) text.append(" - Discharging");
-    else if (battery.state == ChargeState::Full) text.append(" - Full");
-    else if (battery.state == ChargeState::NotCharging) text.append(" - Not charging");
+    String level(allocator());
+    level.append_uint(static_cast<uint64_t>(percent));
+    const char* pattern = battery.state == ChargeState::Charging      ? "%1% - Charging"
+                          : battery.state == ChargeState::Discharging ? "%1% - Discharging"
+                          : battery.state == ChargeState::Full        ? "%1% - Full"
+                          : battery.state == ChargeState::NotCharging ? "%1% - Not charging"
+                                                                      : "%1%";
+    format_message(&text, pattern, level.view());
     battery_row_.value.set_text(text.view());
   }
 
@@ -668,23 +756,23 @@ void ComputerManager::update(uint64_t now_us) {
   have_previous_ = true;
   grid_.model_changed();
   grid_.select_row(reselect);
+  update_commands();
 
   // --- Summary line.
-  text.assign("Threads: ");
-  text.append_uint(shown_threads);
-  text.append("   Cores: ");
-  text.append_uint(online);
-  text.append("   Uptime: ");
+  String threads_text(allocator()), cores_text(allocator()), uptime(allocator());
+  threads_text.append_uint(shown_threads);
+  cores_text.append_uint(online);
   const uint64_t seconds = now_us / 1000000;
   auto two = [&](uint64_t v) {
-    text.push_back(static_cast<char>('0' + (v / 10) % 10));
-    text.push_back(static_cast<char>('0' + v % 10));
+    uptime.push_back(static_cast<char>('0' + (v / 10) % 10));
+    uptime.push_back(static_cast<char>('0' + v % 10));
   };
   two(seconds / 3600);
-  text.push_back(':');
+  uptime.push_back(':');
   two(seconds / 60 % 60);
-  text.push_back(':');
+  uptime.push_back(':');
   two(seconds % 60);
+  format_message(&text, "Threads: %1   Cores: %2   Uptime: %3", threads_text.view(), cores_text.view(), uptime.view());
   info_.set_text(text.view());
 }
 

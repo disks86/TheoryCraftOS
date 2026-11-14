@@ -798,7 +798,7 @@ void DrawingCanvas::rebuild_cache() {
     const uint32_t vy = y + static_cast<uint32_t>(scroll_y_), iy = vy / zoom_;
     for (uint32_t x = 0; x < cache_w_; ++x) {
       const uint32_t vx = x + static_cast<uint32_t>(scroll_x_), ix = vx / zoom_;
-      uint32_t c = ix < width_ && iy < height_ ? pixels_[uint64_t{iy} * width_ + ix] : kBackground;
+      uint32_t c = ix < width_ && iy < height_ ? pixels_[uint64_t{iy} * width_ + ix] : surround_;
       if (lines && ix < width_ && iy < height_ && (vx % zoom_ == 0 || vy % zoom_ == 0)) c = ((c >> 1) & 0x7F7F7F7Fu) | 0xFF404040u;
       row[x] = c;
     }
@@ -808,7 +808,11 @@ void DrawingCanvas::rebuild_cache() {
 void DrawingCanvas::paint(Painter& painter) {
   const Theme& t = painter.theme();
   const Rect2D all{0, 0, bounds_.width, bounds_.height};
-  painter.fill(all, kBackground);
+  if (surround_ != t.shadow) {   // the area around the picture is the theme's, not a colour of its own
+    surround_ = t.shadow;
+    cache_dirty_ = true;
+  }
+  painter.fill(all, surround_);
   painter.bevel(all, true);
   if (cache_dirty_ || cache_.empty()) {
     rebuild_cache();
