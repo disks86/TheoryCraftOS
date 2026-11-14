@@ -188,7 +188,8 @@ constexpr uint64_t kUpcallDueValue = 0x7FFFFFF1u, kDrainRetryValue = 0x7FFFFFF3u
 // user-misc module; it may add more below the marked line.
 namespace process::win32k::user_misc {
 
-int32_t system_metrics(uint32_t index, uint32_t dpi);               // GetSystemMetricsForDpi (dpi 0 or 96: the metrics at 96 dpi); the values of Windows 10 at 96 dpi
+int32_t system_metrics(uint32_t index, uint32_t dpi, uint32_t screen_scale = 0);      // GetSystemMetricsForDpi (dpi 0 or 96: the metrics at 96 dpi); the values of Windows 10 at 96 dpi
+// (screen_scale: device pixels per unit the screen sizes are given in, percent; 0: an unaware caller's 96 dpi on a scaled system, else device pixels)
 uint32_t system_color(uint32_t index);                              // GetSysColor: a COLORREF (0x00BBGGRR)
 uint32_t monitor_from_rect(const gdi::Rect& rect, uint32_t flags);  // MonitorFromRect (flags: MONITOR_DEFAULTTONULL 0, TOPRIMARY 1, TONEAREST 2); there is one monitor
 uint32_t monitor_from_point(int32_t x, int32_t y, uint32_t flags);

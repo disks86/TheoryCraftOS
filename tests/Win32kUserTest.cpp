@@ -1529,6 +1529,53 @@ void test_system_aware_scale_change() {
     user::Window* x = user::find_window(w3);
     CHECK(x && x->bounds.left == 10 && x->bounds.right == 410);
   }
+  uint32_t lw0 = 0, lh0 = 0;
+  CHECK(user::top_level_info(w3, &ti, nullptr) && gdi::window_surface_size(ti.surface_id, &lw0, &lh0));
+
+  // back to 100 %: the program made aware at 192 dpi keeps working at it - its units are half device pixels - and the first program is in device pixels again
+  one[0].scale_percent = 100;
+  bridge.set_display(1024, 768, ArrayView<const desktop::IWindowsSession::Monitor>(one, 1));
+  pump(t);
+  pump(l);
+  CHECK(gdi::screen_width() == 1024 && user_misc::system_dpi() == 96);
+  wr = l.window_rect(w3);
+  CHECK(wr.l == 10 && wr.t == 20 && wr.r == 410 && wr.b == 320);
+  {
+    user::Window* x = user::find_window(w3);
+    CHECK(x && x->bounds.left == 5 && x->bounds.top == 10 && x->bounds.right == 205 && user::window_scale(x) == 50);
+  }
+  CHECK(l.svc32(N::NtUserCallHwnd, {w3, 2}) == 192);
+  CHECK(l.svc32(N::NtUserCallOneParam, {0 /* SM_CXSCREEN */, 9}) == 2048);
+  CHECK(user::top_level_info(w3, &ti, nullptr) && !ti.dpi_aware && ti.surface_scale == 50 && gdi::window_surface_size(ti.surface_id, &sw, &sh) && sw == lw0 && sh == lh0);
+  CHECK(bridge.window_info(w3, &info, nullptr) && info.window.x == 5 && info.window.width == 200);
+  {      // the desktop shows its pixels at half the size
+    std::vector<uint32_t> target(1024 * 768, 0);
+    graphics::Surface ts;
+    ts.pixels = ArrayView<uint32_t>(target.data(), target.size());
+    ts.width = ts.pitch = 1024;
+    ts.height = 768;
+    graphics::SoftwareRenderer2D r(ts);
+    uint32_t dw = 0, dh = 0;
+    CHECK(bridge.draw_window(w3, r, 0, 0, &dw, &dh) && dw == (lw0 + 1) / 2 && dh == (lh0 + 1) / 2);
+  }
+  wr = t.window_rect(w);
+  CHECK(wr.l == 100 && wr.t == 100 && wr.r == 500 && wr.b == 400);
+  {
+    user::Window* x = user::find_window(w);
+    CHECK(x && x->bounds.left == 100 && x->bounds.right == 500 && user::window_scale(x) == 100);
+  }
+  // its screen DC is a shadow twice the screen's size; what it draws shows at half the size
+  {
+    const uint32_t dc = l.svc32(N::NtUserGetDC, {0});
+    CHECK(dc != 0);
+    const uint64_t brush = l.svc(N::NtGdiCreateSolidBrush, {0x00FF00, 0});
+    l.svc(N::NtGdiSelectBrush, {dc, brush});
+    CHECK(l.svc32(N::NtGdiPatBlt, {dc, 2044, 1532, 4, 4, 0xF00021}) == 1);
+    const ConstByteView screen = gdi::screen_pixels();
+    auto at = [&](int32_t px, int32_t py) { const uint64_t o = (uint64_t(py) * 1024 + uint64_t(px)) * 4; return uint32_t(screen[o]) | uint32_t(screen[o + 1]) << 8 | uint32_t(screen[o + 2]) << 16; };
+    CHECK(at(1022, 766) == 0x00FF00 && at(1023, 767) == 0x00FF00 && at(1021, 766) != 0x00FF00);
+    CHECK(l.svc32(N::NtUserReleaseDC, {0, dc}) == 1);
+  }
   bridge.detach();
   user::set_device_scale_from_desktop(100);
   user::reset_state();

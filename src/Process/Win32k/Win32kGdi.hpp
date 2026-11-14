@@ -50,7 +50,7 @@ void set_screen_sink(IScreenSink* sink);
 // array means "nowhere" (everything is clipped). Returns the HDC (0 on failure). The DC belongs to process `pid` (gone when it ends).
 // `surface`: a window surface (below) the DC draws on instead of the screen; origin and clip are then in the surface's coordinates.
 uint32_t create_screen_dc(uint64_t pid, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);
-// A screen DC for a DPI unaware program (scale > 100 percent): it draws on a shadow of the screen in the program's units (sized device_to_units of the screen,
+// A screen DC for a program whose coordinates are virtualized (scale: device pixels per unit, in percent, not 100): it draws on a shadow of the screen in the program's units (sized device_to_units of the screen,
 // filled with what the screen shows when it is made), and what it draws goes on to the screen scaled up as it is drawn. The shadow goes with the DC. 0: no memory.
 uint32_t create_screen_shadow_dc(uint64_t pid, uint32_t scale);
 bool update_screen_dc(uint32_t dc, int32_t origin_x, int32_t origin_y, ArrayView<const Rect> clip, uint32_t surface = 0);

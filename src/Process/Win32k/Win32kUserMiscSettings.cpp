@@ -462,13 +462,14 @@ bool scales(uint32_t i) {
 }
 }  // namespace
 
-int32_t system_metrics(uint32_t index, uint32_t dpi) {
+int32_t system_metrics(uint32_t index, uint32_t dpi, uint32_t screen_scale) {
   SettingsState* s = st();
   if (!s) return 0;
   if (dpi == 0) dpi = 96;
   // (DPI virtualization: the screen is in device pixels; asked for 96 dpi on a scaled system - an unaware program - its sizes are the 96-dpi units)
   const uint32_t sd = system_dpi();
-  const uint32_t vp = dpi == 96 && sd > 96 ? sd * 100 / 96 : 100;      // (the scale in percent an unaware program's sizes are divided by)
+  uint32_t vp = dpi == 96 && sd > 96 ? sd * 100 / 96 : 100;      // (the scale in percent an unaware program's sizes are divided by)
+  if (screen_scale != 0) vp = screen_scale;      // (the caller's own: a system-aware program's after the scale changed)
   auto d = [&](int32_t v) { return graphics::device_to_units(v, vp); };
   const int32_t w = d(int32_t(gdi::screen_width())), h = d(int32_t(gdi::screen_height()));
   Rect work = monitor_rect(monitor_handle(), true);

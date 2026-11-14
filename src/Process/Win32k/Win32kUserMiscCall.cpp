@@ -103,7 +103,7 @@ uint64_t one_param(Call& c) {
       }
       return slot;
     }
-    case kGetSystemMetrics: return uint32_t(system_metrics(uint32_t(arg), thread_dpi(c)));
+    case kGetSystemMetrics: return uint32_t(system_metrics(uint32_t(arg), thread_dpi(c), user::caller_dpi_scale(c)));      // (the screen in the caller's units)
     case kGetVirtualScreenRect1: return c.write_struct(arg, user::rect_for_caller(c, virtual_screen_rect())) ? 1 : c.fail(kErrorNoAccess);
     case kSetKeyboardAutoRepeat: {
       const uint32_t previous = g_keyboard_auto_repeat;
