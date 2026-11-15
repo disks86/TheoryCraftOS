@@ -394,6 +394,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     status = build_windows_startup(space_, pe, image, input, &startup);
     if (status != LoadStatus::Ok) return status;
     gs_base = startup.teb;
+    if (wow) fs_base = startup.teb + kWindowsTeb32Offset;      // (the TEB a 32-bit program sees)
     argument = startup.peb;
     // With ntdll the thread starts in RtlUserThreadStart(entry, parameter), which runs the libraries' entry points and then the program's.
     const uint64_t thunk = modules ? modules->export_address("ntdll.dll", "RtlUserThreadStart") : 0;

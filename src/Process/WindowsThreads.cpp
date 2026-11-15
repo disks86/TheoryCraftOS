@@ -75,6 +75,14 @@ bool remote_thread_handle(Process& p, uint64_t handle, uint64_t* thread_id) {
   return true;
 }
 
+// A thread of a 32-bit program: its FS base is its 32-bit TEB, and its start routine finds its two arguments on the stack.
+static bool start_32bit_thread(Process& process, uint64_t teb, uint64_t stack_top, uint64_t start, uint64_t argument, ThreadStart* ts) {
+  if (process.arch() != UserArch::X86_32) return true;
+  ts->fs_base = teb + kWindowsTeb32Offset;
+  IUserMemory* memory = process.address_space();
+  return memory && windows_initial_stack_32(*memory, stack_top, static_cast<uint32_t>(start), static_cast<uint32_t>(argument), &ts->stack_pointer);
+}
+
 uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_value, bool suspended, uint64_t stack_size, uint64_t* thread_id) {
   IProcessRuntime* runtime = target.runtime();
   AddressSpace* space = target.address_space();
@@ -106,6 +114,7 @@ uint32_t create_thread_in(Process& target, uint64_t start, uint64_t argument_val
   ts.argument2 = argument_value;
   ts.stack_pointer = thread.stack_pointer;
   ts.gs_base = thread.teb;
+  if (!start_32bit_thread(target, thread.teb, thread.stack_top, start, argument_value, &ts)) return kAccessViolation;
   ts.id = id;
   const bool gate = !suspended && debug_object_of(target.id()) != 0;      // (a thread of a debugged program does not run before its event is continued)
   if (!runtime->start_thread(ts, suspended || gate)) {
@@ -286,6 +295,7 @@ uint32_t nt_create_thread_ex(Process& p, const SyscallRequest& r) {
   ts.argument2 = argument_value;
   ts.stack_pointer = thread.stack_pointer;
   ts.gs_base = thread.teb;
+  if (!start_32bit_thread(p, thread.teb, thread.stack_top, start, argument_value, &ts)) return kAccessViolation;
   ts.id = id;
   const bool suspended = (flags & kCreateSuspended) != 0;
   const bool gate = !suspended && debug_object_of(p.id()) != 0;      // (a thread of a debugged program does not run before its event is continued)

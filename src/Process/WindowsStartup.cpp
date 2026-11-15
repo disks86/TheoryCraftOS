@@ -25,6 +25,11 @@ namespace {
 
 constexpr uint64_t kPage = AddressSpace::kPageSize;
 constexpr uint64_t kPebSize = kPage, kTebSize = 2 * kPage, kParametersHeader = 0x440;
+// A thread of a 32-bit program has two TEBs, as under WoW64: the one above, which the kernel's services read (the program's GS base), and right after it
+// (kTeb32Offset, where Windows has it too) the 32-bit one the program itself sees through FS. The kernel fills in what code may read before the 32-bit
+// ntdll.dll has run - the stack, the ids, the pointer to itself; ntdll.dll does the rest (the 32-bit PEB, parameters and loader lists are its own).
+constexpr uint64_t kTeb32Size = kPage;
+uint64_t teb_bytes(const AddressSpace& space) { return space.is_32bit() ? kTebSize + kTeb32Size : kTebSize; }
 constexpr uint64_t kMaxStartupBytes = 1ull << 20;
 constexpr uint64_t kPlacementHint = 0x00007FF000000000ull;
 constexpr uint32_t kTlsDirectory = 9;      // IMAGE_DIRECTORY_ENTRY_TLS
@@ -56,9 +61,20 @@ class Writer {
   bool ok_ = true;
 };
 
+void write_teb32(Writer& w, uint64_t teb, uint64_t stack_top, uint64_t stack_limit, uint64_t process_id, uint64_t thread_id) {
+  const uint64_t teb32 = teb + kWindowsTeb32Offset;
+  w.u32(teb32 + 0x00, 0xFFFFFFFFu);                         // ExceptionList: the end of the chain
+  w.u32(teb32 + 0x04, static_cast<uint32_t>(stack_top));    // StackBase
+  w.u32(teb32 + 0x08, static_cast<uint32_t>(stack_limit));  // StackLimit
+  w.u32(teb32 + 0x18, static_cast<uint32_t>(teb32));        // Self
+  w.u32(teb32 + 0x20, static_cast<uint32_t>(process_id));   // ClientId
+  w.u32(teb32 + 0x24, static_cast<uint32_t>(thread_id));
+  w.u32(teb32 + 0xE0C, static_cast<uint32_t>(stack_limit)); // DeallocationStack
+}
+
 // The thread-local data of every module: an array of one block pointer per module (what ThreadLocalStoragePointer points at; a module finds its block with its _tls_index),
 // then the blocks. Bytes needed:
-constexpr uint64_t kTlsArrayBytes = kMaxTlsModules * 8;      // (room for a pointer for every module that may ever have a block: libraries loaded later add theirs)
+constexpr uint64_t kTlsArrayBytes = kMaxTlsModules * 8;      // (room for a pointer for every module that may ever have a block: libraries loaded later add theirs; a 32-bit program's pointers take half of it)
 uint64_t tls_bytes_needed(const TlsTemplate* t, uint32_t n) {
   uint64_t total = kTlsArrayBytes;
   for (uint32_t i = 0; i < n; ++i) total += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
@@ -68,9 +84,11 @@ uint64_t tls_bytes_needed(const TlsTemplate* t, uint32_t n) {
 // With `deferred` the TEB's ThreadLocalStoragePointer stays empty (a thread that has not started has no thread-local storage yet): the array's address waits in the unused
 // DeallocationBStore slot, and the thread's first code (ntdll's TcosThreadStart) moves it.
 bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, const TlsTemplate* t, uint32_t n, bool deferred = false) {
+  const bool narrow = space.is_32bit();      // a 32-bit program: 32-bit pointers in the array, and the array's address in the 32-bit TEB
   uint64_t block = area + kTlsArrayBytes;
   for (uint32_t i = 0; i < n; ++i) {
-    w.u64(area + 8 * uint64_t{i}, block);
+    if (narrow) w.u32(area + 4 * uint64_t{i}, static_cast<uint32_t>(block));
+    else w.u64(area + 8 * uint64_t{i}, block);
     uint8_t chunk[256];
     for (uint64_t done = 0; done < t[i].bytes;) {
       const uint64_t k = t[i].bytes - done < sizeof(chunk) ? t[i].bytes - done : sizeof(chunk);
@@ -80,7 +98,8 @@ bool write_tls(Writer& w, AddressSpace& space, uint64_t teb, uint64_t area, cons
     }
     block += (t[i].bytes + t[i].zero_fill + 15) & ~uint64_t{15};
   }
-  w.u64(teb + (deferred ? 0x1788 : 0x58), area);     // ThreadLocalStoragePointer
+  if (narrow && !deferred) w.u32(teb + kWindowsTeb32Offset + 0x2C, static_cast<uint32_t>(area));      // ThreadLocalStoragePointer of the 32-bit TEB
+  else w.u64(teb + (deferred ? 0x1788 : 0x58), area);     // ThreadLocalStoragePointer (deferred: it waits in the 64-bit TEB for either kind of program)
   return true;
 }
 
@@ -170,6 +189,19 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   uint64_t tls_index_at[kMaxTlsModules] = {};
   uint32_t tls_count = 0;
   auto find_tls = [&](uint64_t base, uint32_t rva, uint32_t size) -> LoadStatus {
+    if (space.is_32bit()) {      // IMAGE_TLS_DIRECTORY32: four 32-bit addresses (start, end, index, callbacks), then the size of the zero fill
+      if (rva == 0 || size < 0x18) return LoadStatus::Ok;
+      if (tls_count == kMaxTlsModules) return LoadStatus::Malformed;
+      uint8_t raw32[0x18];
+      if (!space.read_privileged(base + rva, ByteView(raw32, sizeof(raw32)))) return LoadStatus::Malformed;
+      auto word32 = [&](uint32_t at) { return uint64_t{raw32[at]} | (uint64_t{raw32[at + 1]} << 8) | (uint64_t{raw32[at + 2]} << 16) | (uint64_t{raw32[at + 3]} << 24); };
+      const uint64_t start = word32(0), end = word32(4), zero = word32(0x10);
+      if (end < start || end - start > kMaxStartupBytes || zero > kMaxStartupBytes) return LoadStatus::Malformed;
+      tls[tls_count] = TlsTemplate{start, end - start, zero};
+      tls_index_at[tls_count] = word32(8);
+      ++tls_count;
+      return LoadStatus::Ok;
+    }
     if (rva == 0 || size < 0x28) return LoadStatus::Ok;
     if (tls_count == kMaxTlsModules) return LoadStatus::Malformed;
     uint8_t raw[0x28];
@@ -202,11 +234,11 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   constexpr uint64_t kLdrHeader = 0x60, kEntrySize = 0x140, kPerModule = 1024;
   uint64_t ldr_bytes = 0;
   if (!input.modules.empty() && !AddressSpace::round_up(kLdrHeader + input.modules.size() * kPerModule, &ldr_bytes)) return LoadStatus::Malformed;
-  total = kPebSize + kTebSize + parameters_bytes + tls_bytes + ldr_bytes;
+  total = kPebSize + teb_bytes(space) + parameters_bytes + tls_bytes + ldr_bytes;
   uint64_t base = 0;
   if (!space.find_free(total, kPlacementHint, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
   if (input.stack_size > 4 * AddressSpace::kPageSize) reserve_stack_floor(space, input.stack_top - input.stack_size);
-  const uint64_t peb = base, teb = base + kPebSize, parameters = teb + kTebSize, tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
+  const uint64_t peb = base, teb = base + kPebSize, parameters = teb + teb_bytes(space), tls_area = parameters + parameters_bytes, ldr = tls_area + tls_bytes;
   const uint64_t tls_block = tls_count ? tls_area + kTlsArrayBytes : 0;
 
   Writer w(space);
@@ -275,6 +307,7 @@ LoadStatus build_windows_startup(AddressSpace& space, const exe::PeFile& pe, con
   w.u64(teb + 0x7E0, input.thread_id);
   w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, input.stack_top - input.stack_size);    // DeallocationStack
+  if (space.is_32bit()) write_teb32(w, teb, input.stack_top, input.stack_top - input.stack_size, input.process_id, input.thread_id);
   if (!write_tls(w, space, teb, tls_area, tls, tls_count)) return LoadStatus::Malformed;
   for (uint32_t i = 0; i < tls_count; ++i) if (tls_index_at[i] != 0) w.u32(tls_index_at[i], i);      // _tls_index = the module's number
 
@@ -355,10 +388,10 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   for (uint32_t i = 0; i < input.tls_count; ++i) if (input.tls[i].bytes > kMaxStartupBytes || input.tls[i].zero_fill > kMaxStartupBytes) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(input.stack_bytes < kMinStack ? kMinStack : input.stack_bytes, &stack) || stack > kMaxStack) return LoadStatus::Malformed;
   if (!AddressSpace::round_up(tls_bytes_needed(input.tls, input.tls_count), &tls_bytes)) return LoadStatus::Malformed;
-  total = stack + kTebSize + tls_bytes;
+  total = stack + teb_bytes(space) + tls_bytes;
   uint64_t base = 0;
   if (!space.find_free(total, kPlacement, &base) || !space.map(base, total, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
-  const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + kTebSize;
+  const uint64_t stack_top = base + stack, teb = stack_top, tls_area = teb + teb_bytes(space);
   if (stack > 4 * AddressSpace::kPageSize) reserve_stack_floor(space, base);
   Writer w(space);
   w.u64(teb + 0x00, ~uint64_t{0});
@@ -373,6 +406,7 @@ LoadStatus build_windows_thread(AddressSpace& space, const WindowsThreadInput& i
   w.u64(teb + 0x7E0, input.thread_id);
   w.unicode_string(teb + 0x1258, teb + 0x1268, 0, 522);      // StaticUnicodeString
   w.u64(teb + 0x1478, base);                        // DeallocationStack
+  if (space.is_32bit()) write_teb32(w, teb, stack_top, base, input.process_id, input.thread_id);
   if (!write_tls(w, space, teb, tls_area, input.tls, input.tls_count, true)) { space.unmap(base, total); return LoadStatus::Malformed; }
   if (!w.ok()) { space.unmap(base, total); return LoadStatus::Malformed; }
   out->teb = teb;

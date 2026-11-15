@@ -75,6 +75,14 @@ void __cdecl start32(const unsigned char *peb) {
   double half = 0.5, three = 3.0;              /* the floating point state came with the thread */
   check((int)(half * three * 4.0) == 6, "floating point");
 
+  /* The 32-bit TEB is at FS: it points at itself, and knows the stack this code runs on. */
+  u32 self, stack_base, stack_limit;
+  __asm__ volatile("movl %%fs:0x18, %0" : "=r"(self));
+  __asm__ volatile("movl %%fs:0x04, %0" : "=r"(stack_base));
+  __asm__ volatile("movl %%fs:0x08, %0" : "=r"(stack_limit));
+  check(self != 0 && self < 0x7FFF0000u && *(u32 *)(self + 0x18) == self, "FS is the 32-bit TEB");
+  check((u32)&local < stack_base && (u32)&local >= stack_limit && *(u32 *)self == 0xFFFFFFFFu, "the TEB knows the stack, and the exception chain is empty");
+
   /* Memory: NtAllocateVirtualMemory(process, &base, zero bits, &size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE). */
   u64 base = 0, size = 0x30000;
   const u64 allocate[6] = {~0ull, (u32)&base, 0, (u32)&size, 0x3000, 4};

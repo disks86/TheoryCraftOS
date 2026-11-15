@@ -28,6 +28,10 @@
 
 namespace process {
 
+// Where the 32-bit TEB of a thread of a 32-bit program is, from its TEB (the one the services read): right after it, as under WoW64. It is the thread's FS base.
+inline constexpr uint64_t kWindowsTeb32Offset = 0x2000;
+
+
 // Where the structures a Windows program expects to find ended up.
 struct WindowsStartup {
   uint64_t peb = 0;                 // Process Environment Block: the program's first argument, and gs:[0x60]
