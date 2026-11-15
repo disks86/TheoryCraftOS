@@ -4356,56 +4356,102 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     SHOW_COMMENT: 128, SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024, SHOW_NOTATION: 2048
   };
   hide(g, 'NodeFilter', NodeFilter);
+  // An attribute of an interface: an accessor on the prototype (a read-only one has no setter, so a write does nothing).
+  var attribute = function (proto, name, get, set) { Object.defineProperty(proto, name, { get: get, set: set, enumerable: true, configurable: true }); };
+  var isNode = function (x) { return x !== null && typeof x === 'object' && x instanceof Node; };
+  var needNode = function (x, what, type, n) { if (!isNode(x)) throw new TypeError("Failed to execute '" + what + "' on '" + type + "': parameter " + (n || 1) + " is not of type 'Node'."); };
+  var needArgs = function (args, n, what, type) {
+    if (args.length < n) throw new TypeError("Failed to execute '" + what + "' on '" + type + "': " + n + ' argument' + (n > 1 ? 's' : '') + ' required, but only ' + args.length + ' present.');
+  };
+  // The live ranges and node iterators are kept by the document (dom::LiveRanges), which moves them when the tree changes; these are the ways in.
+  var lrNew = g.__lr_new, lrGet = g.__lr_get, lrSet = g.__lr_set, lrCmp = g.__lr_cmp, niNew = g.__ni_new, niGet = g.__ni_get, niSet = g.__ni_set, niFree = g.__ni_free;
+  var lenOf = g.__node_length, idxOf = g.__node_index, rootOf = g.__node_root, cmpPoints = g.__pt_cmp, checkInsert = g.__check_insert, setData = g.__set_data;
+  // "Replace data" of a text or comment node (the CharacterData methods are this too): offsets are UTF-16 code units, and may cut a surrogate pair.
+  var replaceData = function (node, offset, count, data) {
+    var s = node.data;
+    if (typeof s !== 'string') throw new TypeError('Illegal invocation');
+    if (offset > s.length) throw dom('The offset ' + offset + " is larger than the node's length (" + s.length + ').', 'IndexSizeError');
+    if (count > s.length - offset) count = s.length - offset;
+    setData(node, s.substring(0, offset) + data + s.substring(offset + count), offset, count, data.length);
+  };
+  hide(g, '__replace_data', replaceData);
+  var nodeContains = NP.contains;
+  // "Filter" a node: 1 accept, 2 reject, 3 skip.
   function accepts(walker, node) {
-    var bit = Math.pow(2, node.nodeType - 1);
-    if (Math.floor(walker.whatToShow / bit) % 2 !== 1) return 3;
-    var f = walker.filter;
-    if (!f) return 1;
     if (walker.__active) throw dom('The filter is already running.', 'InvalidStateError');
+    if (!((walker.__show >>> (node.nodeType - 1)) & 1)) return 3;
+    var f = walker.__filter;
+    if (f === null) return 1;
     walker.__active = true;
-    try { return (typeof f === 'function' ? f(node) : f.acceptNode(node)) | 0; } finally { walker.__active = false; }
+    try {
+      var r;
+      if (typeof f === 'function') r = f.call(undefined, node);
+      else {
+        var fn = f.acceptNode;
+        if (typeof fn !== 'function') throw new TypeError("Failed to execute 'acceptNode' on 'NodeFilter': The provided callback is not a function.");
+        r = fn.call(f, node);
+      }
+      return (+r) & 65535;
+    } finally { walker.__active = false; }
+  }
+  // The arguments of createTreeWalker and createNodeIterator after the root.
+  function walkerInit(w, root, whatToShow, filter, what) {
+    if (filter === undefined || filter === null) filter = null;
+    else if (typeof filter !== 'object' && typeof filter !== 'function') throw new TypeError("Failed to execute '" + what + "' on 'Document': parameter 3 is not of type 'NodeFilter'.");
+    hide(w, '__root', root); hide(w, '__show', whatToShow === undefined ? 4294967295 : whatToShow >>> 0); hide(w, '__filter', filter); hide(w, '__active', false);
+  }
+  function walkerAttributes(proto) {
+    attribute(proto, 'root', function () { if (this.__root === undefined) throw new TypeError('Illegal invocation'); return this.__root; });
+    attribute(proto, 'whatToShow', function () { if (this.__root === undefined) throw new TypeError('Illegal invocation'); return this.__show; });
+    attribute(proto, 'filter', function () { if (this.__root === undefined) throw new TypeError('Illegal invocation'); return this.__filter; });
   }
   function TreeWalker() { throw new TypeError('Illegal constructor'); }
   hide(g, 'TreeWalker', TreeWalker);
   var TW = TreeWalker.prototype;
+  walkerAttributes(TW);
+  attribute(TW, 'currentNode', function () { if (this.__root === undefined) throw new TypeError('Illegal invocation'); return this.__cur; }, function (node) {
+    if (this.__root === undefined) throw new TypeError('Illegal invocation');
+    if (!isNode(node)) throw new TypeError("Failed to set the 'currentNode' property on 'TreeWalker': The provided value is not of type 'Node'.");
+    this.__cur = node;
+  });
   function children(w, first) {
-    var node = first ? w.currentNode.firstChild : w.currentNode.lastChild;
+    var node = first ? w.__cur.firstChild : w.__cur.lastChild;
     while (node) {
       var r = accepts(w, node);
-      if (r === 1) { w.currentNode = node; return node; }
+      if (r === 1) { w.__cur = node; return node; }
       if (r === 3) { var child = first ? node.firstChild : node.lastChild; if (child) { node = child; continue; } }
       while (node) {
         var sib = first ? node.nextSibling : node.previousSibling;
         if (sib) { node = sib; break; }
         var p = node.parentNode;
-        if (!p || p === w.root || p === w.currentNode) return null;
+        if (!p || p === w.__root || p === w.__cur) return null;
         node = p;
       }
     }
     return null;
   }
   function siblings(w, next) {
-    var node = w.currentNode;
-    if (node === w.root) return null;
+    var node = w.__cur;
+    if (node === w.__root) return null;
     while (true) {
       var sib = next ? node.nextSibling : node.previousSibling;
       while (sib) {
         node = sib;
         var r = accepts(w, node);
-        if (r === 1) { w.currentNode = node; return node; }
+        if (r === 1) { w.__cur = node; return node; }
         sib = next ? node.firstChild : node.lastChild;
         if (r === 2 || !sib) sib = next ? node.nextSibling : node.previousSibling;
       }
       node = node.parentNode;
-      if (!node || node === w.root) return null;
+      if (!node || node === w.__root) return null;
       if (accepts(w, node) === 1) return null;
     }
   }
   method(TW, 'parentNode', function () {
-    var node = this.currentNode;
-    while (node && node !== this.root) {
+    var node = this.__cur;
+    while (node && node !== this.__root) {
       node = node.parentNode;
-      if (node && accepts(this, node) === 1) { this.currentNode = node; return node; }
+      if (node && accepts(this, node) === 1) { this.__cur = node; return node; }
     }
     return null;
   });
@@ -4414,54 +4460,57 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   method(TW, 'nextSibling', function () { return siblings(this, true); });
   method(TW, 'previousSibling', function () { return siblings(this, false); });
   method(TW, 'nextNode', function () {
-    var node = this.currentNode, result = 1;
+    var node = this.__cur, result = 1;
     while (true) {
       while (result !== 2 && node.firstChild) {
         node = node.firstChild;
         result = accepts(this, node);
-        if (result === 1) { this.currentNode = node; return node; }
+        if (result === 1) { this.__cur = node; return node; }
       }
       var sibling = null, temp = node;
       while (temp) {
-        if (temp === this.root) return null;
+        if (temp === this.__root) return null;
         sibling = temp.nextSibling;
         if (sibling) { node = sibling; break; }
         temp = temp.parentNode;
       }
       if (!sibling) return null;
       result = accepts(this, node);
-      if (result === 1) { this.currentNode = node; return node; }
+      if (result === 1) { this.__cur = node; return node; }
     }
   });
   method(TW, 'previousNode', function () {
-    var node = this.currentNode;
-    while (node !== this.root) {
+    var node = this.__cur;
+    while (node !== this.__root) {
       var sibling = node.previousSibling;
       while (sibling) {
         node = sibling;
         var result = accepts(this, node);
         while (result !== 2 && node.lastChild) { node = node.lastChild; result = accepts(this, node); }
-        if (result === 1) { this.currentNode = node; return node; }
+        if (result === 1) { this.__cur = node; return node; }
         sibling = node.previousSibling;
       }
-      if (node === this.root || !node.parentNode) return null;
+      if (node === this.__root || !node.parentNode) return null;
       node = node.parentNode;
-      if (accepts(this, node) === 1) { this.currentNode = node; return node; }
+      if (accepts(this, node) === 1) { this.__cur = node; return node; }
     }
     return null;
   });
   method(TW, 'toString', function () { return '[object TreeWalker]'; });
-  function filterArg(filter) { return filter === undefined ? null : filter; }
   method(DP, 'createTreeWalker', function (root, whatToShow, filter) {
-    if (!root || typeof root.nodeType !== 'number') throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
+    needNode(root, 'createTreeWalker', 'Document');
     var w = Object.create(TW);
-    w.root = root; w.whatToShow = whatToShow === undefined ? 4294967295 : whatToShow >>> 0; w.filter = filterArg(filter); w.currentNode = root;
-    hide(w, '__active', false);
+    walkerInit(w, root, whatToShow, filter, 'createTreeWalker');
+    hide(w, '__cur', root);
     return w;
   });
+  // A NodeIterator's reference node and the side of it the pointer is on are kept by the document, which moves them when the node is removed.
   function NodeIterator() { throw new TypeError('Illegal constructor'); }
   hide(g, 'NodeIterator', NodeIterator);
   var NI = NodeIterator.prototype;
+  walkerAttributes(NI);
+  attribute(NI, 'referenceNode', function () { return niGet(this.__ni, 0); });
+  attribute(NI, 'pointerBeforeReferenceNode', function () { return niGet(this.__ni, 1); });
   function following(node, root) {
     if (node.firstChild) return node.firstChild;
     while (node) {
@@ -4478,263 +4527,430 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     while (s.lastChild) s = s.lastChild;
     return s;
   }
+  // "Traverse". While a filter looks at a candidate, where the walk stands is kept by the document too (an entry of its own, for the time of the call), so
+  // that a filter that removes nodes moves it the way it moves the reference node; the candidate that was accepted is returned, and the reference node
+  // becomes where the walk then stands. A filter that throws, or a walk that finds nothing, leaves the iterator where it was.
   function iterate(it, next) {
-    var node = it.referenceNode, before = it.pointerBeforeReferenceNode;
-    while (true) {
-      if (next) {
-        if (!before) { node = following(node, it.root); if (!node) return null; } else before = false;
-      } else {
-        if (before) { node = preceding(node, it.root); if (!node) return null; } else before = true;
+    var id = it.__ni, node = niGet(id, 0), before = niGet(id, 1), root = it.__root, flight = it.__filter === null ? -1 : niNew(it, root);
+    try {
+      while (true) {
+        if (next) {
+          if (!before) { node = following(node, root); if (!node) return null; } else before = false;
+        } else {
+          if (before) { node = preceding(node, root); if (!node) return null; } else before = true;
+        }
+        if (flight >= 0) niSet(flight, node, before);
+        var candidate = node, result = accepts(it, node);
+        if (flight >= 0) { node = niGet(flight, 0); before = niGet(flight, 1); }
+        if (result === 1) { niSet(id, node, before); return candidate; }
       }
-      if (accepts(it, node) === 1) break;
-    }
-    it.referenceNode = node; it.pointerBeforeReferenceNode = before;
-    return node;
+    } finally { if (flight >= 0) niFree(flight); }
   }
   method(NI, 'nextNode', function () { return iterate(this, true); });
   method(NI, 'previousNode', function () { return iterate(this, false); });
   method(NI, 'detach', function () {});
   method(NI, 'toString', function () { return '[object NodeIterator]'; });
   method(DP, 'createNodeIterator', function (root, whatToShow, filter) {
-    if (!root || typeof root.nodeType !== 'number') throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
+    needNode(root, 'createNodeIterator', 'Document');
     var it = Object.create(NI);
-    it.root = root; it.whatToShow = whatToShow === undefined ? 4294967295 : whatToShow >>> 0; it.filter = filterArg(filter); it.referenceNode = root; it.pointerBeforeReferenceNode = true;
-    hide(it, '__active', false);
+    walkerInit(it, root, whatToShow, filter, 'createNodeIterator');
+    hide(it, '__ni', niNew(it, root));
     return it;
   });
 
   // ------------------------------------------------------------------------------------------------------------------ Range
-  function cmpPoints(a, ao, b, bo) {
-    if (a === b) return ao < bo ? -1 : ao > bo ? 1 : 0;
-    var pos = a.compareDocumentPosition(b);
-    if (pos & 4) {
-      if (pos & 16) {
-        var c = b;
-        while (c.parentNode !== a) c = c.parentNode;
-        return indexOf(c) < ao ? 1 : -1;
-      }
-      return -1;
-    }
-    return -cmpPoints(b, bo, a, ao);
-  }
-  function rangeRoot(node) { while (node.parentNode) node = node.parentNode; return node; }
-  function checkOffset(node, offset, what) {
-    if (node.nodeType === 10) throw dom("Failed to execute '" + what + "' on 'Range': The node provided is a doctype.", 'InvalidNodeTypeError');
-    if (offset > nodeLength(node)) throw dom("Failed to execute '" + what + "' on 'Range': The offset " + offset + ' is larger than the node\'s length (' + nodeLength(node) + ').', 'IndexSizeError');
-  }
+  // A Range is a live range: its boundary points are kept by the document (see lrNew), which moves them as nodes are inserted, removed, split, merged and
+  // have their text changed. Offsets into text are UTF-16 code units.
+  var isCharData = function (n) { var t = n.nodeType; return t === 3 || t === 4 || t === 7 || t === 8; };
+  var isTextNode = function (n) { var t = n.nodeType; return t === 3 || t === 4; };
+  var childAt = function (node, i) { var c = node.firstChild; while (c && i-- > 0) c = c.nextSibling; return c; };
+  var commonAncestor = function (a, b) { while (a !== b && !nodeContains.call(a, b)) a = a.parentNode; return a; };
+  var documentOf = function (node) { return node.nodeType === 9 ? node : node.ownerDocument; };
+  var selRange = null, selChanged = function () {};   // the range of the selection, and what to do when it is changed (see Selection)
   function Range() {
     if (!(this instanceof Range)) throw new TypeError("Failed to construct 'Range': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-    this.startContainer = doc; this.startOffset = 0; this.endContainer = doc; this.endOffset = 0;
-    this.collapsed = true; this.commonAncestorContainer = doc;
+    hide(this, '__r', lrNew(this, doc));
   }
   hide(g, 'Range', Range);
   var RP = Range.prototype;
-  Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
-  function refresh(r) {
-    r.collapsed = r.startContainer === r.endContainer && r.startOffset === r.endOffset;
-    var n = r.startContainer;
-    while (n && !isInclusiveAncestor(n, r.endContainer)) n = n.parentNode;
-    r.commonAncestorContainer = n || r.startContainer;
+  [['START_TO_START', 0], ['START_TO_END', 1], ['END_TO_END', 2], ['END_TO_START', 3]].forEach(function (c) {
+    Object.defineProperty(Range, c[0], { value: c[1], enumerable: true });
+    Object.defineProperty(RP, c[0], { value: c[1], enumerable: true });
+  });
+  function newRange(sc, so, ec, eo) { var r = new Range(); lrSet(r.__r, sc, so, ec, eo); return r; }
+  function sameRange(id, sc, so, ec, eo) { return lrGet(id, 0) === sc && lrGet(id, 1) === so && lrGet(id, 2) === ec && lrGet(id, 3) === eo; }
+  function setRange(r, sc, so, ec, eo) {
+    if (r === selRange && !sameRange(r.__r, sc, so, ec, eo)) selChanged();
+    lrSet(r.__r, sc, so, ec, eo);
   }
-  method(RP, 'setStart', function (node, offset) {
-    checkOffset(node, offset, 'setStart');
-    this.startContainer = node; this.startOffset = offset;
-    if (rangeRoot(this.endContainer) !== rangeRoot(node) || cmpPoints(node, offset, this.endContainer, this.endOffset) > 0) { this.endContainer = node; this.endOffset = offset; }
-    refresh(this);
-  });
-  method(RP, 'setEnd', function (node, offset) {
-    checkOffset(node, offset, 'setEnd');
-    this.endContainer = node; this.endOffset = offset;
-    if (rangeRoot(this.startContainer) !== rangeRoot(node) || cmpPoints(node, offset, this.startContainer, this.startOffset) < 0) { this.startContainer = node; this.startOffset = offset; }
-    refresh(this);
-  });
-  method(RP, 'setStartBefore', function (node) { this.setStart(node.parentNode, indexOf(node)); });
-  method(RP, 'setStartAfter', function (node) { this.setStart(node.parentNode, indexOf(node) + 1); });
-  method(RP, 'setEndBefore', function (node) { this.setEnd(node.parentNode, indexOf(node)); });
-  method(RP, 'setEndAfter', function (node) { this.setEnd(node.parentNode, indexOf(node) + 1); });
+  function isRange(x) { return x !== null && typeof x === 'object' && typeof x.__r === 'number' && x instanceof Range; }
+  attribute(RP, 'startContainer', function () { return lrGet(this.__r, 0); });
+  attribute(RP, 'startOffset', function () { return lrGet(this.__r, 1); });
+  attribute(RP, 'endContainer', function () { return lrGet(this.__r, 2); });
+  attribute(RP, 'endOffset', function () { return lrGet(this.__r, 3); });
+  attribute(RP, 'collapsed', function () { var id = this.__r; return lrGet(id, 0) === lrGet(id, 2) && lrGet(id, 1) === lrGet(id, 3); });
+  attribute(RP, 'commonAncestorContainer', function () { var id = this.__r; return commonAncestor(lrGet(id, 0), lrGet(id, 2)); });
+  function checkPoint(node, offset, what) {
+    if (node.nodeType === 10) throw dom("Failed to execute '" + what + "' on 'Range': The node provided is a doctype.", 'InvalidNodeTypeError');
+    if (offset > lenOf(node)) throw dom("Failed to execute '" + what + "' on 'Range': The offset " + offset + ' is larger than the node\'s length (' + lenOf(node) + ').', 'IndexSizeError');
+  }
+  // "Set the start or end" of a range.
+  function setStart(r, node, offset, what) {
+    var id = r.__r, ec = lrGet(id, 2), eo = lrGet(id, 3);
+    checkPoint(node, offset, what);
+    if (rootOf(ec) !== rootOf(node) || cmpPoints(node, offset, ec, eo) > 0) setRange(r, node, offset, node, offset);
+    else setRange(r, node, offset, ec, eo);
+  }
+  function setEnd(r, node, offset, what) {
+    var id = r.__r, sc = lrGet(id, 0), so = lrGet(id, 1);
+    checkPoint(node, offset, what);
+    if (rootOf(sc) !== rootOf(node) || cmpPoints(node, offset, sc, so) < 0) setRange(r, node, offset, node, offset);
+    else setRange(r, sc, so, node, offset);
+  }
+  function parentFor(node, what) {
+    var p = node.parentNode;
+    if (!p) throw dom("Failed to execute '" + what + "' on 'Range': the given Node has no parent.", 'InvalidNodeTypeError');
+    return p;
+  }
+  method(RP, 'setStart', function (node, offset) { lrGet(this.__r, 1); needArgs(arguments, 2, 'setStart', 'Range'); needNode(node, 'setStart', 'Range'); setStart(this, node, offset >>> 0, 'setStart'); });
+  method(RP, 'setEnd', function (node, offset) { lrGet(this.__r, 1); needArgs(arguments, 2, 'setEnd', 'Range'); needNode(node, 'setEnd', 'Range'); setEnd(this, node, offset >>> 0, 'setEnd'); });
+  method(RP, 'setStartBefore', function (node) { lrGet(this.__r, 1); needNode(node, 'setStartBefore', 'Range'); setStart(this, parentFor(node, 'setStartBefore'), idxOf(node), 'setStartBefore'); });
+  method(RP, 'setStartAfter', function (node) { lrGet(this.__r, 1); needNode(node, 'setStartAfter', 'Range'); setStart(this, parentFor(node, 'setStartAfter'), idxOf(node) + 1, 'setStartAfter'); });
+  method(RP, 'setEndBefore', function (node) { lrGet(this.__r, 1); needNode(node, 'setEndBefore', 'Range'); setEnd(this, parentFor(node, 'setEndBefore'), idxOf(node), 'setEndBefore'); });
+  method(RP, 'setEndAfter', function (node) { lrGet(this.__r, 1); needNode(node, 'setEndAfter', 'Range'); setEnd(this, parentFor(node, 'setEndAfter'), idxOf(node) + 1, 'setEndAfter'); });
   method(RP, 'collapse', function (toStart) {
-    if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; } else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
-    refresh(this);
+    var id = this.__r;
+    if (toStart) setRange(this, lrGet(id, 0), lrGet(id, 1), lrGet(id, 0), lrGet(id, 1));
+    else setRange(this, lrGet(id, 2), lrGet(id, 3), lrGet(id, 2), lrGet(id, 3));
   });
   method(RP, 'selectNode', function (node) {
-    if (!node.parentNode) throw dom("Failed to execute 'selectNode' on 'Range': the given Node has no parent.", 'InvalidNodeTypeError');
-    var p = node.parentNode, i = indexOf(node);
-    this.startContainer = p; this.startOffset = i; this.endContainer = p; this.endOffset = i + 1; refresh(this);
+    lrGet(this.__r, 1); needNode(node, 'selectNode', 'Range');
+    var p = parentFor(node, 'selectNode'), i = idxOf(node);
+    setRange(this, p, i, p, i + 1);
   });
   method(RP, 'selectNodeContents', function (node) {
-    this.startContainer = node; this.startOffset = 0; this.endContainer = node; this.endOffset = nodeLength(node); refresh(this);
+    lrGet(this.__r, 1); needNode(node, 'selectNodeContents', 'Range');
+    if (node.nodeType === 10) throw dom("Failed to execute 'selectNodeContents' on 'Range': The node provided is a doctype.", 'InvalidNodeTypeError');
+    setRange(this, node, 0, node, lenOf(node));
   });
-  method(RP, 'cloneRange', function () {
-    var r = new Range();
-    r.startContainer = this.startContainer; r.startOffset = this.startOffset; r.endContainer = this.endContainer; r.endOffset = this.endOffset; refresh(r);
-    return r;
-  });
+  method(RP, 'cloneRange', function () { var id = this.__r; return newRange(lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3)); });
   method(RP, 'detach', function () {});
   method(RP, 'compareBoundaryPoints', function (how, other) {
-    var a, ao, b, bo;
-    if (how === 0) { a = this.startContainer; ao = this.startOffset; b = other.startContainer; bo = other.startOffset; }
-    else if (how === 1) { a = this.endContainer; ao = this.endOffset; b = other.startContainer; bo = other.startOffset; }
-    else if (how === 2) { a = this.endContainer; ao = this.endOffset; b = other.endContainer; bo = other.endOffset; }
-    else if (how === 3) { a = this.startContainer; ao = this.startOffset; b = other.endContainer; bo = other.endOffset; }
-    else throw dom("Failed to execute 'compareBoundaryPoints' on 'Range': The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.", 'NotSupportedError');
-    return cmpPoints(a, ao, b, bo);
+    var id = this.__r; lrGet(id, 1);
+    needArgs(arguments, 2, 'compareBoundaryPoints', 'Range');
+    if (!isRange(other)) throw new TypeError("Failed to execute 'compareBoundaryPoints' on 'Range': parameter 2 is not of type 'Range'.");
+    how = (+how) & 65535;
+    if (how > 3) throw dom("Failed to execute 'compareBoundaryPoints' on 'Range': The comparison method provided must be one of 'START_TO_START', 'START_TO_END', 'END_TO_END', or 'END_TO_START'.", 'NotSupportedError');
+    var oid = other.__r;
+    if (rootOf(lrGet(id, 0)) !== rootOf(lrGet(oid, 0))) throw dom("Failed to execute 'compareBoundaryPoints' on 'Range': The source range is in a different document than this range.", 'WrongDocumentError');
+    if (how === 0) return cmpPoints(lrGet(id, 0), lrGet(id, 1), lrGet(oid, 0), lrGet(oid, 1));
+    if (how === 1) return cmpPoints(lrGet(id, 2), lrGet(id, 3), lrGet(oid, 0), lrGet(oid, 1));
+    if (how === 2) return cmpPoints(lrGet(id, 2), lrGet(id, 3), lrGet(oid, 2), lrGet(oid, 3));
+    return cmpPoints(lrGet(id, 0), lrGet(id, 1), lrGet(oid, 2), lrGet(oid, 3));
   });
   method(RP, 'comparePoint', function (node, offset) {
-    checkOffset(node, offset, 'comparePoint');
-    if (cmpPoints(node, offset, this.startContainer, this.startOffset) < 0) return -1;
-    if (cmpPoints(node, offset, this.endContainer, this.endOffset) > 0) return 1;
-    return 0;
+    var id = this.__r, sc = lrGet(id, 0);
+    needArgs(arguments, 2, 'comparePoint', 'Range'); needNode(node, 'comparePoint', 'Range'); offset = offset >>> 0;
+    if (rootOf(node) !== rootOf(sc)) throw dom("Failed to execute 'comparePoint' on 'Range': The node provided is not in this Range's tree.", 'WrongDocumentError');
+    checkPoint(node, offset, 'comparePoint');
+    return lrCmp(id, node, offset);
   });
   method(RP, 'isPointInRange', function (node, offset) {
-    if (rangeRoot(node) !== rangeRoot(this.startContainer)) return false;
-    checkOffset(node, offset, 'isPointInRange');
-    return cmpPoints(node, offset, this.startContainer, this.startOffset) >= 0 && cmpPoints(node, offset, this.endContainer, this.endOffset) <= 0;
+    var id = this.__r, sc = lrGet(id, 0);
+    needArgs(arguments, 2, 'isPointInRange', 'Range'); needNode(node, 'isPointInRange', 'Range'); offset = offset >>> 0;
+    if (rootOf(node) !== rootOf(sc)) return false;
+    checkPoint(node, offset, 'isPointInRange');
+    return lrCmp(id, node, offset) === 0;
   });
   method(RP, 'intersectsNode', function (node) {
-    if (rangeRoot(node) !== rangeRoot(this.startContainer)) return false;
+    var id = this.__r, sc = lrGet(id, 0);
+    needNode(node, 'intersectsNode', 'Range');
+    if (rootOf(node) !== rootOf(sc)) return false;
     var p = node.parentNode;
     if (!p) return true;
-    var i = indexOf(node);
-    return cmpPoints(p, i, this.endContainer, this.endOffset) < 0 && cmpPoints(p, i + 1, this.startContainer, this.startOffset) > 0;
+    var i = idxOf(node);
+    return cmpPoints(p, i, lrGet(id, 2), lrGet(id, 3)) < 0 && cmpPoints(p, i + 1, sc, lrGet(id, 1)) > 0;
   });
-  function textOf(range) {
-    var out = '', sc = range.startContainer, ec = range.endContainer;
-    if (sc === ec && sc.nodeType === 3) return sc.data.slice(range.startOffset, range.endOffset);
-    var root = range.commonAncestorContainer;
-    var w = doc.createTreeWalker(root, 4);
-    var n = root.nodeType === 3 ? root : w.nextNode();
-    while (n) {
-      if (cmpPoints(n, n.data.length, sc, range.startOffset) > 0 && cmpPoints(n, 0, ec, range.endOffset) < 0) {
-        var from = n === sc ? range.startOffset : 0, to = n === ec ? range.endOffset : n.data.length;
-        out += n.data.slice(from, to);
-      }
-      n = root.nodeType === 3 ? null : w.nextNode();
-    }
+  // The node after `node` in tree order that is not inside it.
+  function afterSubtree(node) {
+    while (node) { if (node.nextSibling) return node.nextSibling; node = node.parentNode; }
+    return null;
+  }
+  function textOf(sc, so, ec, eo) {
+    if (sc === ec && isTextNode(sc)) return sc.data.substring(so, eo);
+    var out = isTextNode(sc) ? sc.data.substring(so) : '';
+    var n = isCharData(sc) ? following(sc, null) : (childAt(sc, so) || afterSubtree(sc));
+    var stop = isCharData(ec) ? ec : (childAt(ec, eo) || afterSubtree(ec));
+    for (; n && n !== stop; n = following(n, null)) if (isTextNode(n)) out += n.data;
+    if (isTextNode(ec)) out += ec.data.substring(0, eo);
     return out;
   }
-  method(RP, 'toString', function () { return textOf(this); });
-  // cloneContents / extractContents / deleteContents after the algorithm of the DOM standard
-  function contents(range, mode) {
-    var frag = doc.createDocumentFragment();
-    if (range.collapsed) return frag;
-    var sc = range.startContainer, so = range.startOffset, ec = range.endContainer, eo = range.endOffset;
-    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8)) {
-      var clone = sc.cloneNode(false);
-      clone.data = sc.data.slice(so, eo);
-      frag.appendChild(clone);
-      if (mode !== 'clone') sc.replaceData(so, eo - so, '');
+  method(RP, 'toString', function () { var id = this.__r; return textOf(lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3)); });
+  function charSlice(node, from, to) { var c = node.cloneNode(false); c.data = node.data.substring(from, to); return c; }
+  // "Clone the contents" and "extract" of a range, after the algorithms of the standard: `range` (extract only) is collapsed to where the contents were.
+  function contents(sc, so, ec, eo, extract, range) {
+    var frag = documentOf(sc).createDocumentFragment();
+    if (sc === ec && so === eo) return frag;
+    if (sc === ec && isCharData(sc)) {
+      frag.appendChild(charSlice(sc, so, eo));
+      if (extract) replaceData(sc, so, eo - so, '');
       return frag;
     }
-    var common = sc;
-    while (!isInclusiveAncestor(common, ec)) common = common.parentNode;
-    var firstPartial = null, lastPartial = null;
-    if (!isInclusiveAncestor(sc, ec)) { firstPartial = sc; while (firstPartial.parentNode !== common) firstPartial = firstPartial.parentNode; }
-    if (!isInclusiveAncestor(ec, sc)) { lastPartial = ec; while (lastPartial.parentNode !== common) lastPartial = lastPartial.parentNode; }
-    var contained = [];
-    for (var c = common.firstChild; c; c = c.nextSibling) {
-      if (cmpPoints(c.parentNode, indexOf(c), sc, so) >= 0 && cmpPoints(c.parentNode, indexOf(c) + 1, ec, eo) <= 0) contained.push(c);
+    var common = commonAncestor(sc, ec), firstPartial = null, lastPartial = null;
+    if (sc !== common) { firstPartial = sc; while (firstPartial.parentNode !== common) firstPartial = firstPartial.parentNode; }
+    if (ec !== common) { lastPartial = ec; while (lastPartial.parentNode !== common) lastPartial = lastPartial.parentNode; }
+    var contained = [], stop = lastPartial || childAt(common, eo);
+    for (var c = firstPartial ? firstPartial.nextSibling : childAt(common, so); c && c !== stop; c = c.nextSibling) {
+      if (c.nodeType === 10) throw dom('A doctype cannot be part of the contents of a Range.', 'HierarchyRequestError');
+      contained.push(c);
     }
-    var newNode, newOffset;
-    if (isInclusiveAncestor(sc, ec)) { newNode = sc; newOffset = so; }
-    else { var ref = sc; while (ref.parentNode && !isInclusiveAncestor(ref.parentNode, ec)) ref = ref.parentNode; newNode = ref.parentNode; newOffset = indexOf(ref) + 1; }
-    function sub(n1, o1, n2, o2) { var r = new Range(); r.startContainer = n1; r.startOffset = o1; r.endContainer = n2; r.endOffset = o2; refresh(r); return r; }
+    var newNode = sc, newOffset = so;
+    if (firstPartial) { newNode = common; newOffset = idxOf(firstPartial) + 1; }
     if (firstPartial) {
-      if (firstPartial.nodeType === 3 || firstPartial.nodeType === 8) {
-        var cl = sc.cloneNode(false); cl.data = sc.data.slice(so); frag.appendChild(cl);
-        if (mode !== 'clone') sc.replaceData(so, sc.data.length - so, '');
+      if (isCharData(firstPartial)) {
+        frag.appendChild(charSlice(sc, so, lenOf(sc)));
+        if (extract) replaceData(sc, so, lenOf(sc) - so, '');
       } else {
-        var cl2 = firstPartial.cloneNode(false); frag.appendChild(cl2);
-        cl2.appendChild(contents(sub(sc, so, firstPartial, nodeLength(firstPartial)), mode));
+        var first = firstPartial.cloneNode(false);
+        frag.appendChild(first);
+        first.appendChild(contents(sc, so, firstPartial, lenOf(firstPartial), extract, null));
       }
     }
-    contained.forEach(function (n) {
-      if (mode === 'clone') frag.appendChild(n.cloneNode(true));
-      else frag.appendChild(n);
-    });
+    for (var i = 0; i < contained.length; i++) frag.appendChild(extract ? contained[i] : contained[i].cloneNode(true));
     if (lastPartial) {
-      if (lastPartial.nodeType === 3 || lastPartial.nodeType === 8) {
-        var cl3 = ec.cloneNode(false); cl3.data = ec.data.slice(0, eo); frag.appendChild(cl3);
-        if (mode !== 'clone') ec.replaceData(0, eo, '');
+      if (isCharData(lastPartial)) {
+        frag.appendChild(charSlice(ec, 0, eo));
+        if (extract) replaceData(ec, 0, eo, '');
       } else {
-        var cl4 = lastPartial.cloneNode(false); frag.appendChild(cl4);
-        cl4.appendChild(contents(sub(lastPartial, 0, ec, eo), mode));
+        var last = lastPartial.cloneNode(false);
+        frag.appendChild(last);
+        last.appendChild(contents(lastPartial, 0, ec, eo, extract, null));
       }
     }
-    if (mode !== 'clone') { range.startContainer = newNode; range.startOffset = newOffset; range.endContainer = newNode; range.endOffset = newOffset; refresh(range); }
+    if (range) setRange(range, newNode, newOffset, newNode, newOffset);
     return frag;
   }
-  method(RP, 'cloneContents', function () { return contents(this, 'clone'); });
-  method(RP, 'extractContents', function () { return contents(this, 'extract'); });
-  method(RP, 'deleteContents', function () { contents(this, 'extract'); });
-  method(RP, 'insertNode', function (node) {
-    var sc = this.startContainer, ref, parent;
-    if (sc.nodeType === 3) { ref = sc.splitText(this.startOffset); parent = sc.parentNode; }
-    else { ref = sc.childNodes[this.startOffset] || null; parent = sc; }
+  method(RP, 'cloneContents', function () { var id = this.__r; return contents(lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3), false, null); });
+  method(RP, 'extractContents', function () { var id = this.__r; return contents(lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3), true, this); });
+  method(RP, 'deleteContents', function () {
+    var id = this.__r, sc = lrGet(id, 0), so = lrGet(id, 1), ec = lrGet(id, 2), eo = lrGet(id, 3), c, n;
+    if (sc === ec && so === eo) return;
+    if (sc === ec && isCharData(sc)) { replaceData(sc, so, eo - so, ''); return; }
+    // the contained nodes whose parent is not contained, in tree order: after the start on its side, between the two sides, before the end on its side
+    var common = commonAncestor(sc, ec), remove = [], firstPartial = null, lastPartial = null;
+    if (sc !== common) {
+      if (!isCharData(sc)) for (c = childAt(sc, so); c; c = c.nextSibling) remove.push(c);
+      for (n = sc; n.parentNode !== common; n = n.parentNode) for (c = n.nextSibling; c; c = c.nextSibling) remove.push(c);
+      firstPartial = n;
+    }
+    var chain = [];
+    if (ec !== common) {
+      for (n = ec; n.parentNode !== common; n = n.parentNode) chain.push(n);
+      lastPartial = n;
+    }
+    var stop = lastPartial || childAt(common, eo);
+    for (c = firstPartial ? firstPartial.nextSibling : childAt(common, so); c && c !== stop; c = c.nextSibling) remove.push(c);
+    for (var k = chain.length - 1; k >= 0; k--) for (c = chain[k].parentNode.firstChild; c !== chain[k]; c = c.nextSibling) remove.push(c);
+    if (ec !== common && !isCharData(ec)) { stop = childAt(ec, eo); for (c = ec.firstChild; c && c !== stop; c = c.nextSibling) remove.push(c); }
+    var newNode = sc, newOffset = so;
+    if (firstPartial) { newNode = common; newOffset = idxOf(firstPartial) + 1; }
+    if (isCharData(sc)) replaceData(sc, so, lenOf(sc) - so, '');
+    for (var i = 0; i < remove.length; i++) if (remove[i].parentNode) remove[i].parentNode.removeChild(remove[i]);
+    if (isCharData(ec)) replaceData(ec, 0, eo, '');
+    setRange(this, newNode, newOffset, newNode, newOffset);
+  });
+  function insertNode(range, node) {
+    var id = range.__r, sc = lrGet(id, 0), so = lrGet(id, 1), t = sc.nodeType;
+    if (t === 7 || t === 8 || (isTextNode(sc) && !sc.parentNode) || sc === node)
+      throw dom("Failed to execute 'insertNode' on 'Range': Nodes of type '" + sc.nodeName + "' may not be inserted here.", 'HierarchyRequestError');
+    var ref = isTextNode(sc) ? sc : childAt(sc, so), parent = ref ? ref.parentNode : sc;
+    checkInsert(parent, node, ref);
+    if (isTextNode(sc)) ref = sc.splitText(so);
     if (node === ref) ref = ref.nextSibling;
     if (node.parentNode) node.parentNode.removeChild(node);
-    var count = node.nodeType === 11 ? node.childNodes.length : 1;
+    var newOffset = (ref ? idxOf(ref) : lenOf(parent)) + (node.nodeType === 11 ? lenOf(node) : 1);
     parent.insertBefore(node, ref);
-    var idx = ref ? indexOf(ref) : parent.childNodes.length;
-    if (this.collapsed) { this.endContainer = parent; this.endOffset = idx; refresh(this); }
-    else if (this.endContainer === parent) { this.endOffset += count; refresh(this); }
-  });
+    if (lrGet(id, 0) === lrGet(id, 2) && lrGet(id, 1) === lrGet(id, 3)) setRange(range, lrGet(id, 0), lrGet(id, 1), parent, newOffset);
+  }
+  method(RP, 'insertNode', function (node) { lrGet(this.__r, 1); needNode(node, 'insertNode', 'Range'); insertNode(this, node); });
   method(RP, 'surroundContents', function (parent) {
-    var frag = this.extractContents();
-    while (parent.firstChild) parent.removeChild(parent.firstChild);
-    this.insertNode(parent);
+    var id = this.__r, sc = lrGet(id, 0), ec = lrGet(id, 2);
+    needNode(parent, 'surroundContents', 'Range');
+    // (a node that is not Text is partially contained unless both ends are in the same node, the parents of text ends counted)
+    if ((isTextNode(sc) ? sc.parentNode : sc) !== (isTextNode(ec) ? ec.parentNode : ec))
+      throw dom("Failed to execute 'surroundContents' on 'Range': The Range has partially selected a non-Text node.", 'InvalidStateError');
+    var t = parent.nodeType;
+    if (t === 9 || t === 10 || t === 11) throw dom("Failed to execute 'surroundContents' on 'Range': The node provided is of type '" + parent.nodeName + "'.", 'InvalidNodeTypeError');
+    var frag = contents(sc, lrGet(id, 1), ec, lrGet(id, 3), true, this);
+    if (parent.firstChild) parent.textContent = '';
+    insertNode(this, parent);
     parent.appendChild(frag);
-    this.selectNode(parent);
+    var p = parent.parentNode, i = idxOf(parent);
+    setRange(this, p, i, p, i + 1);
   });
   method(RP, 'createContextualFragment', function (html) {
-    var t = doc.createElement('template');
+    needArgs(arguments, 1, 'createContextualFragment', 'Range');
+    var t = documentOf(lrGet(this.__r, 0)).createElement('template');
     t.innerHTML = html;
     return t.content;
   });
   method(RP, 'getBoundingClientRect', function () { return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; });
   method(RP, 'getClientRects', function () { return []; });
-  method(DP, 'createRange', function () { var r = new Range(); r.startContainer = doc; r.endContainer = doc; return r; });
+  method(DP, 'createRange', function () { var r = new Range(); if (this !== doc) lrSet(r.__r, this, 0, this, 0); return r; });
 
   // ------------------------------------------------------------------------------------------------------------------ Selection
+  // The selection of the document: at most one range (the Range object a script added is the selection's own: changing it changes the selection), and the
+  // direction it was made in, which says which end is the anchor and which the focus.
   function Selection() { throw new TypeError('Illegal constructor'); }
   hide(g, 'Selection', Selection);
   var SP = Selection.prototype;
   var selection = Object.create(SP);
-  var current = null;
-  function syncSelection() {
-    var r = current;
-    selection.rangeCount = r ? 1 : 0;
-    selection.anchorNode = r ? r.startContainer : null; selection.anchorOffset = r ? r.startOffset : 0;
-    selection.focusNode = r ? r.endContainer : null; selection.focusOffset = r ? r.endOffset : 0;
-    selection.isCollapsed = r ? r.collapsed : true;
-    selection.type = !r ? 'None' : r.collapsed ? 'Caret' : 'Range';
+  var selBackward = false, selTold = false;
+  // selectionchange is told to the document in a task of its own, once for the changes made until then.
+  selChanged = function () {
+    if (selTold) return;
+    selTold = true;
+    setTimeout(function () { selTold = false; doc.dispatchEvent(new Event('selectionchange')); }, 0);
+  };
+  function selSet(range, backward) {
+    backward = !!backward && range !== null;
+    var same = range === selRange;   // (the same selection made again is not a change)
+    if (!same && range && selRange) { var id = range.__r; same = backward === selBackward && sameRange(selRange.__r, lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3)); }
+    selRange = range; selBackward = backward;
+    if (!same) selChanged();
   }
-  syncSelection();
-  method(SP, 'getRangeAt', function (i) { if (!current || i !== 0) throw dom("Failed to execute 'getRangeAt' on 'Selection': " + i + ' is not a valid index.', 'IndexSizeError'); return current; });
-  method(SP, 'addRange', function (r) { if (!current) { current = r; syncSelection(); } });
-  method(SP, 'removeRange', function (r) { if (current === r) { current = null; syncSelection(); } });
-  method(SP, 'removeAllRanges', function () { current = null; syncSelection(); });
+  function selCheck(s) { if (s !== selection) throw new TypeError('Illegal invocation'); }
+  function selPoint(which) {   // 0 the anchor's node, 1 its offset, 2 the focus's node, 3 its offset
+    if (!selRange) return which & 1 ? 0 : null;
+    return lrGet(selRange.__r, selBackward ? which ^ 2 : which);
+  }
+  // Is the document a shadow-including inclusive ancestor of the node?
+  var composedRoot = { composed: true }, rootNodeOf = NP.getRootNode;
+  function inDocument(node) { return rootNodeOf.call(node, composedRoot) === doc; }
+  attribute(SP, 'anchorNode', function () { selCheck(this); return selPoint(0); });
+  attribute(SP, 'anchorOffset', function () { selCheck(this); return selPoint(1); });
+  attribute(SP, 'focusNode', function () { selCheck(this); return selPoint(2); });
+  attribute(SP, 'focusOffset', function () { selCheck(this); return selPoint(3); });
+  attribute(SP, 'isCollapsed', function () { selCheck(this); return selRange ? selRange.collapsed : true; });
+  attribute(SP, 'rangeCount', function () { selCheck(this); return selRange ? 1 : 0; });
+  attribute(SP, 'type', function () { selCheck(this); return !selRange ? 'None' : selRange.collapsed ? 'Caret' : 'Range'; });
+  attribute(SP, 'direction', function () { selCheck(this); return !selRange || selRange.collapsed ? 'none' : selBackward ? 'backward' : 'forward'; });
+  method(SP, 'getRangeAt', function (i) {
+    selCheck(this); needArgs(arguments, 1, 'getRangeAt', 'Selection');
+    if (!selRange || (i >>> 0) !== 0) throw dom("Failed to execute 'getRangeAt' on 'Selection': " + (i >>> 0) + ' is not a valid index.', 'IndexSizeError');
+    return selRange;
+  });
+  method(SP, 'addRange', function (r) {
+    selCheck(this);
+    if (!isRange(r)) throw new TypeError("Failed to execute 'addRange' on 'Selection': parameter 1 is not of type 'Range'.");
+    if (selRange || !inDocument(r.startContainer)) return;
+    selSet(r, false);
+  });
+  method(SP, 'removeRange', function (r) {
+    selCheck(this);
+    if (!isRange(r)) throw new TypeError("Failed to execute 'removeRange' on 'Selection': parameter 1 is not of type 'Range'.");
+    if (selRange !== r) throw dom("Failed to execute 'removeRange' on 'Selection': The given range is not in this selection.", 'NotFoundError');
+    selSet(null, false);
+  });
+  method(SP, 'removeAllRanges', function () { selCheck(this); if (selRange) selSet(null, false); });
   method(SP, 'empty', SP.removeAllRanges);
   method(SP, 'collapse', function (node, offset) {
-    if (node === null) { current = null; syncSelection(); return; }
-    var r = new Range(); r.setStart(node, offset || 0); r.collapse(true); current = r; syncSelection();
+    selCheck(this);
+    if (node === null || node === undefined) { if (selRange) selSet(null, false); return; }
+    needNode(node, 'collapse', 'Selection'); offset = offset >>> 0;
+    if (node.nodeType === 10) throw dom("Failed to execute 'collapse' on 'Selection': The node provided is a doctype.", 'InvalidNodeTypeError');
+    if (offset > lenOf(node)) throw dom("Failed to execute 'collapse' on 'Selection': The offset " + offset + ' is larger than the node\'s length (' + lenOf(node) + ').', 'IndexSizeError');
+    if (!inDocument(node)) return;
+    selSet(newRange(node, offset, node, offset), false);
   });
   method(SP, 'setPosition', SP.collapse);
-  method(SP, 'collapseToStart', function () { if (!current) throw dom("Failed to execute 'collapseToStart' on 'Selection': there is no selection.", 'InvalidStateError'); current.collapse(true); syncSelection(); });
-  method(SP, 'collapseToEnd', function () { if (!current) throw dom("Failed to execute 'collapseToEnd' on 'Selection': there is no selection.", 'InvalidStateError'); current.collapse(false); syncSelection(); });
-  method(SP, 'extend', function (node, offset) { if (!current) throw dom("Failed to execute 'extend' on 'Selection': This Selection object doesn't have any Ranges.", 'InvalidStateError'); current.setEnd(node, offset || 0); syncSelection(); });
-  method(SP, 'setBaseAndExtent', function (an, ao, fn, fo) { var r = new Range(); r.setStart(an, ao); r.setEnd(fn, fo); current = r; syncSelection(); });
-  method(SP, 'selectAllChildren', function (node) { var r = new Range(); r.selectNodeContents(node); current = r; syncSelection(); });
-  method(SP, 'containsNode', function (node, partial) {
-    if (!current) return false;
-    var r = new Range(); r.selectNode(node);
-    if (partial) return current.intersectsNode(node);
-    return current.compareBoundaryPoints(0, r) <= 0 && current.compareBoundaryPoints(2, r) >= 0;
+  method(SP, 'collapseToStart', function () {
+    selCheck(this);
+    if (!selRange) throw dom("Failed to execute 'collapseToStart' on 'Selection': there is no selection.", 'InvalidStateError');
+    var id = selRange.__r; selSet(newRange(lrGet(id, 0), lrGet(id, 1), lrGet(id, 0), lrGet(id, 1)), false);
   });
-  method(SP, 'deleteFromDocument', function () { if (current) { current.deleteContents(); syncSelection(); } });
-  method(SP, 'toString', function () { return current ? current.toString() : ''; });
-  method(SP, 'modify', function () {});
+  method(SP, 'collapseToEnd', function () {
+    selCheck(this);
+    if (!selRange) throw dom("Failed to execute 'collapseToEnd' on 'Selection': there is no selection.", 'InvalidStateError');
+    var id = selRange.__r; selSet(newRange(lrGet(id, 2), lrGet(id, 3), lrGet(id, 2), lrGet(id, 3)), false);
+  });
+  // The selection from an anchor to a focus, whichever comes first in the document.
+  function selSpan(an, ao, fn, fo) {
+    if (rootOf(an) !== rootOf(fn)) { selSet(newRange(fn, fo, fn, fo), false); return; }
+    var backward = cmpPoints(fn, fo, an, ao) < 0;
+    selSet(backward ? newRange(fn, fo, an, ao) : newRange(an, ao, fn, fo), backward);
+  }
+  method(SP, 'extend', function (node, offset) {
+    selCheck(this); needArgs(arguments, 1, 'extend', 'Selection'); needNode(node, 'extend', 'Selection'); offset = offset >>> 0;
+    if (!inDocument(node)) return;
+    if (!selRange) throw dom("Failed to execute 'extend' on 'Selection': This Selection object doesn't have any Ranges.", 'InvalidStateError');
+    checkPoint(node, offset, 'extend');
+    selSpan(selPoint(0), selPoint(1), node, offset);
+  });
+  method(SP, 'setBaseAndExtent', function (an, ao, fn, fo) {
+    selCheck(this); needArgs(arguments, 4, 'setBaseAndExtent', 'Selection');
+    needNode(an, 'setBaseAndExtent', 'Selection'); needNode(fn, 'setBaseAndExtent', 'Selection', 3); ao = ao >>> 0; fo = fo >>> 0;
+    if (ao > lenOf(an) || fo > lenOf(fn)) throw dom("Failed to execute 'setBaseAndExtent' on 'Selection': The offset is larger than the node's length.", 'IndexSizeError');
+    if (!inDocument(an) || !inDocument(fn)) return;
+    selSpan(an, ao, fn, fo);
+  });
+  method(SP, 'selectAllChildren', function (node) {
+    selCheck(this); needNode(node, 'selectAllChildren', 'Selection');
+    if (node.nodeType === 10) throw dom("Failed to execute 'selectAllChildren' on 'Selection': The node provided is a doctype.", 'InvalidNodeTypeError');
+    if (!inDocument(node)) return;
+    selSet(newRange(node, 0, node, node.childNodes.length), false);
+  });
+  method(SP, 'containsNode', function (node, partial) {
+    selCheck(this); needNode(node, 'containsNode', 'Selection');
+    if (!selRange || !inDocument(node)) return false;
+    var id = selRange.__r, sc = lrGet(id, 0);
+    if (rootOf(sc) !== doc) return false;
+    if (partial) return selRange.intersectsNode(node);
+    return cmpPoints(sc, lrGet(id, 1), node, 0) <= 0 && cmpPoints(lrGet(id, 2), lrGet(id, 3), node, lenOf(node)) >= 0;
+  });
+  method(SP, 'deleteFromDocument', function () { selCheck(this); if (selRange) selRange.deleteContents(); });
+  method(SP, 'toString', function () { selCheck(this); return selRange ? selRange.toString() : ''; });
+  // modify(): the focus moves through the text of the document by a character or a word, or to an end of the text it is in (there are no lines here to move by).
+  function wordChar(ch) { return /[A-Za-z0-9_]/.test(ch) || ch.charCodeAt(0) > 127; }
+  function textFrom(node, forward) {   // the next text node with something in it, in that direction
+    var w = doc.createTreeWalker(doc, 4), n;
+    w.currentNode = node;
+    while ((n = forward ? w.nextNode() : w.previousNode())) if (n.data.length > 0) return n;
+    return null;
+  }
+  function moved(node, offset, forward, granularity) {
+    if (granularity === 'documentboundary') { var b = doc.body || doc.documentElement || doc; return forward ? [b, lenOf(b)] : [b, 0]; }
+    if (!isTextNode(node)) {   // (onto the text the point is at)
+      var at = forward ? (childAt(node, offset) || node) : (offset > 0 ? childAt(node, offset - 1) : node), t = at;
+      if (forward) { if (!isTextNode(t) || t.data.length === 0) t = textFrom(offset < lenOf(node) ? preceding(at, null) || at : at, true); }
+      else { while (t.lastChild && t !== node) t = t.lastChild; if (!isTextNode(t) || t.data.length === 0) t = textFrom(t, false); }
+      if (!t) return [node, offset];
+      node = t; offset = forward ? 0 : t.data.length;
+    }
+    var s = node.data, other;
+    if (granularity === 'character') {
+      if (forward ? offset < s.length : offset > 0) return [node, forward ? offset + 1 : offset - 1];
+      other = textFrom(node, forward);
+      return other ? [other, forward ? 1 : other.data.length - 1] : [node, offset];
+    }
+    if (granularity === 'word') {
+      if (forward ? offset >= s.length : offset <= 0) { other = textFrom(node, forward); if (!other) return [node, offset]; node = other; s = node.data; offset = forward ? 0 : s.length; }
+      if (forward) { while (offset < s.length && !wordChar(s.charAt(offset))) offset++; while (offset < s.length && wordChar(s.charAt(offset))) offset++; }
+      else { while (offset > 0 && !wordChar(s.charAt(offset - 1))) offset--; while (offset > 0 && wordChar(s.charAt(offset - 1))) offset--; }
+      return [node, offset];
+    }
+    return [node, forward ? s.length : 0];
+  }
+  method(SP, 'modify', function (alter, direction, granularity) {
+    selCheck(this);
+    if (!selRange) return;
+    alter = String(alter).toLowerCase(); direction = String(direction).toLowerCase(); granularity = String(granularity).toLowerCase();
+    var p = moved(selPoint(2), selPoint(3), direction === 'forward' || direction === 'right', granularity);
+    if (alter === 'extend') selSpan(selPoint(0), selPoint(1), p[0], p[1]);
+    else selSet(newRange(p[0], p[1], p[0], p[1]), false);
+  });
   hide(g, 'getSelection', function () { return selection; });
-  method(DP, 'getSelection', function () { return selection; });
+  method(DP, 'getSelection', function () { return this === doc ? selection : null; });
 
   // ------------------------------------------------------------------------------------------------------------------ DOMImplementation, XMLSerializer, Option
   function escapeText(t) { return t.split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;'); }
@@ -5946,21 +6162,31 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!target || typeof target.nodeType !== 'number') throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
     options = options || {};
     var o = { childList: !!options.childList, subtree: !!options.subtree, attributes: options.attributes, characterData: options.characterData,
-              attributeOldValue: !!options.attributeOldValue, characterDataOldValue: !!options.characterDataOldValue, attributeFilter: options.attributeFilter };
-    if (o.attributes === undefined && (o.attributeOldValue || o.attributeFilter !== undefined)) o.attributes = true;
-    if (o.characterData === undefined && o.characterDataOldValue) o.characterData = true;
-    o.attributes = !!o.attributes; o.characterData = !!o.characterData;
-    if (!o.childList && !o.attributes && !o.characterData)
-      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
-    if (o.attributeOldValue && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
-    for (var i = 0; i < this.__targets.length; i++) if (this.__targets[i].node === target) { this.__targets[i].options = o; return; }
-    this.__targets.push({ node: target, options: o });
+              attributeOldValue: options.attributeOldValue, characterDataOldValue: options.characterDataOldValue, attributeFilter: options.attributeFilter };
+    // (an option about attributes or text that is present turns the observation of them on, unless that was said too)
+    if (o.attributes === undefined && (o.attributeOldValue !== undefined || o.attributeFilter !== undefined)) o.attributes = true;
+    if (o.characterData === undefined && o.characterDataOldValue !== undefined) o.characterData = true;
+    o.attributes = !!o.attributes; o.characterData = !!o.characterData; o.attributeOldValue = !!o.attributeOldValue; o.characterDataOldValue = !!o.characterDataOldValue;
+    if (o.attributeFilter !== undefined) o.attributeFilter = Array.prototype.map.call(o.attributeFilter, String);
+    var fail = function (why) { return new TypeError("Failed to execute 'observe' on 'MutationObserver': " + why); };
+    if (!o.childList && !o.attributes && !o.characterData) throw fail("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    if (o.attributeOldValue && !o.attributes) throw fail("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    if (o.attributeFilter !== undefined && !o.attributes) throw fail("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    if (o.characterDataOldValue && !o.characterData) throw fail("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    for (var i = 0; i < this.__targets.length; i++) {
+      var reg = this.__targets[i];
+      if (reg.node !== target || reg.source) continue;
+      this.__targets = this.__targets.filter(function (t) { return t.source !== reg; });   // (what it watched only through this registration is let go)
+      reg.options = o;
+      return;
+    }
+    this.__targets.push({ node: target, options: o, source: null });
     if (observers.indexOf(this) < 0) observers.push(this);
     __mutations_on();
     __watch_node(target);
   });
   method(MutationObserver.prototype, 'disconnect', function () {
-    this.__targets.length = 0;
+    this.__targets = [];
     this.__queue.length = 0;
     var at = observers.indexOf(this);
     if (at >= 0) observers.splice(at, 1);
@@ -5973,24 +6199,42 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   function reportError(e) {
     try { setTimeout(function () { throw e; }, 0); } catch (ignored) { }
   }
-  function deliver(record) {
+  var queueNotify = function () {};   // (set where the observers are told)
+  function regApplies(reg, record) { return reg.node === record.target || (reg.options.subtree && record.watchers.indexOf(reg.node) >= 0); }
+  // A node taken out of a tree an observer watches with its subtree stays watched by that observer (a transient registration: `source` is the one it comes
+  // from) until the observer has been told, so that what happens inside it meanwhile is reported.
+  function keepWatching(record) {
     for (var i = 0; i < observers.length; i++) {
-      var observer = observers[i];
+      var regs = observers[i].__targets, count = regs.length;
+      for (var t = 0; t < count; t++) {
+        var reg = regs[t];
+        if (!reg.options.subtree || !regApplies(reg, record)) continue;
+        for (var k = 0; k < record.removedNodes.length; k++) regs.push({ node: record.removedNodes[k], options: reg.options, source: reg.source || reg });
+        queueNotify();
+      }
+    }
+  }
+  function deliver(record) {
+    var type = record.type;
+    for (var i = 0; i < observers.length; i++) {
+      var observer = observers[i], interested = false, old = false;
       for (var t = 0; t < observer.__targets.length; t++) {
         var reg = observer.__targets[t], o = reg.options;
-        var applies = reg.node === record.target || (o.subtree && record.watchers.indexOf(reg.node) >= 0);
-        if (!applies) continue;
-        if (record.type === 'childList' && !o.childList) continue;
-        if (record.type === 'attributes' && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(record.attributeName) < 0))) continue;
-        if (record.type === 'characterData' && !o.characterData) continue;
-        var copy = Object.create(MutationRecord.prototype);
-        copy.type = record.type; copy.target = record.target; copy.addedNodes = record.addedNodes; copy.removedNodes = record.removedNodes;
-        copy.previousSibling = record.previousSibling; copy.nextSibling = record.nextSibling; copy.attributeName = record.attributeName;
-        copy.attributeNamespace = null;
-        copy.oldValue = (record.type === 'attributes' && o.attributeOldValue) || (record.type === 'characterData' && o.characterDataOldValue) ? record.oldValue : null;
-        observer.__queue.push(copy);
-        break;   // (an observer gets a record once)
+        if (!regApplies(reg, record)) continue;
+        if (type === 'childList' && !o.childList) continue;
+        if (type === 'attributes' && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(record.attributeName) < 0))) continue;
+        if (type === 'characterData' && !o.characterData) continue;
+        interested = true;   // (an observer gets a record once, with the old value if any of its registrations asked for it)
+        if ((type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue)) old = true;
       }
+      if (!interested) continue;
+      var copy = Object.create(MutationRecord.prototype);
+      copy.type = type; copy.target = record.target; copy.addedNodes = record.addedNodes; copy.removedNodes = record.removedNodes;
+      copy.previousSibling = record.previousSibling; copy.nextSibling = record.nextSibling; copy.attributeName = record.attributeName;
+      copy.attributeNamespace = null;
+      copy.oldValue = old ? record.oldValue : null;
+      observer.__queue.push(copy);
+      queueNotify();
     }
   }
 
@@ -6086,34 +6330,66 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   // The records wait in one queue, numbered in the order they happened: a reaction that changes the DOM (or upgrades an element, which takes the log
   // early) adds to the end of the same queue, so they are handled in order whoever drains it.
   var logQueue = [], logHead = 0, logSeq = 0;
+  // The child list changes of one operation (the children replaced, a fragment put in, a child replaced: they carry the same group) on one node are one
+  // record, as the standard has it: every node that went and came, the sibling before the first and the one after the last. It stands where the last of
+  // them stood.
   function takeLog() {
-    var records = __take_mutations();
+    var records = __take_mutations(), group = 0, open = null;
     for (var i = 0; i < records.length; i++) {
-      records[i].__seq = ++logSeq;
-      logQueue.push(records[i]);
+      var r = records[i];
+      if (r.group !== undefined) {
+        if (r.group !== group) { group = r.group; open = []; }
+        var m = null;
+        for (var k = 0; k < open.length; k++) if (open[k].target === r.target) { m = open[k]; break; }
+        if (m) {
+          logQueue[m.__at] = null;
+          for (var a = 0; a < r.addedNodes.length; a++) m.addedNodes.push(r.addedNodes[a]);
+          for (var d = 0; d < r.removedNodes.length; d++) m.removedNodes.push(r.removedNodes[d]);
+          m.nextSibling = r.nextSibling;
+          r = m;
+        } else open.push(r);
+        r.__at = logQueue.length;
+      }
+      r.__seq = ++logSeq;
+      logQueue.push(r);
     }
   }
   function processLog() {
     takeLog();
     while (logHead < logQueue.length) {
       var r = logQueue[logHead++];
+      if (r === null) continue;
       if (r.target.nodeType === 1 || r.type === 'childList') reactions(r);
       deliver(r);
+      if (r.type === 'childList' && r.removedNodes.length) keepWatching(r);
     }
     logQueue.length = 0;
     logHead = 0;
   }
   hide(g, '__process_mutations', processLog);
-  hide(g, '__deliver_mutations', function () {
+  // The log is looked at when the call that changed the tree is over (and, should that not have happened, in a microtask the first change queued). The observers
+  // are told in a microtask of their own, queued when the first record is queued for one of them (or a removed subtree starts being watched): microtasks
+  // queued before that run before it.
+  hide(g, '__deliver_mutations', processLog);
+  var notifyQueued = false;
+  queueNotify = function () { if (!notifyQueued) { notifyQueued = true; queueMicrotask(notify); } };
+  function notify() {
+    notifyQueued = false;
     processLog();
-    for (var o = 0; o < observers.length; o++) {
-      var observer = observers[o];
+    var all = observers.slice();
+    for (var n = 0; n < all.length; n++) {   // (told now: what was watched only because it had been taken out is let go)
+      var regs = all[n].__targets;
+      for (var k = 0; k < regs.length; k++) if (regs[k].source) { all[n].__targets = regs.filter(function (t) { return !t.source; }); break; }
+    }
+    __mutations_delivered();
+    for (var o = 0; o < all.length; o++) {
+      var observer = all[o];
       if (observer.__queue.length === 0) continue;
       var queue = observer.__queue.slice();
       observer.__queue.length = 0;
       try { observer.__callback.call(observer, queue, observer); } catch (e) { reportError(e); }
     }
-  });
+  }
   function CustomElementRegistry() { throw new TypeError('Illegal constructor'); }
   var registry = Object.create(CustomElementRegistry.prototype);
   method(CustomElementRegistry.prototype, 'define', function (name, ctor, options) {
@@ -11957,7 +12233,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     Range: 'commonAncestorContainer',
     Selection: 'anchorNode focusNode rangeCount isCollapsed type direction',
     TreeWalker: 'root whatToShow filter currentNode',
-    NodeIterator: 'root referenceNode pointerBeforeReference whatToShow filter',
+    NodeIterator: 'root referenceNode pointerBeforeReferenceNode whatToShow filter',
     NodeList: 'length',
     HTMLCollection: 'length',
     HTMLAllCollection: 'length',
@@ -12215,10 +12491,10 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
     };
     var need2 = function (n, args, what) { if (args.length < n) throw new TypeError("Failed to execute '" + what + "' on 'CharacterData': " + n + ' arguments required, but only ' + args.length + ' present.'); };
     M(CD, 'substringData', function (o, c) { need2(2, arguments, 'substringData'); var s = this.data; o = offset(s, o, 'substringData'); return s.slice(o, o + (c >>> 0)); });
-    M(CD, 'replaceData', function (o, c, d) { need2(3, arguments, 'replaceData'); var s = this.data; o = offset(s, o, 'replaceData'); this.data = s.slice(0, o) + String(d) + s.slice(o + (c >>> 0)); });
-    M(CD, 'appendData', function (d) { need2(1, arguments, 'appendData'); this.data = this.data + String(d); });
-    M(CD, 'insertData', function (o, d) { need2(2, arguments, 'insertData'); var s = this.data; o = offset(s, o, 'insertData'); this.data = s.slice(0, o) + String(d) + s.slice(o); });
-    M(CD, 'deleteData', function (o, c) { need2(2, arguments, 'deleteData'); var s = this.data; o = offset(s, o, 'deleteData'); this.data = s.slice(0, o) + s.slice(o + (c >>> 0)); });
+    M(CD, 'replaceData', function (o, c, d) { need2(3, arguments, 'replaceData'); __replace_data(this, o >>> 0, c >>> 0, String(d)); });
+    M(CD, 'appendData', function (d) { need2(1, arguments, 'appendData'); __replace_data(this, __node_length(this), 0, String(d)); });
+    M(CD, 'insertData', function (o, d) { need2(2, arguments, 'insertData'); __replace_data(this, o >>> 0, 0, String(d)); });
+    M(CD, 'deleteData', function (o, c) { need2(2, arguments, 'deleteData'); __replace_data(this, o >>> 0, c >>> 0, ''); });
   }());
 
   // ShadowRoot HTML, Document.parseHTMLUnsafe

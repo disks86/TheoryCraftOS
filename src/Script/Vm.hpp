@@ -374,6 +374,13 @@ class Vm {
     epilogue_user_ = user;
   }
   void request_epilogue() { epilogue_pending_ = true; }
+  // Weak references for the host: `hook` is called by every collection once it knows what is alive and before anything is freed. In it dying(cell) says whether
+  // a cell the host knows of (without keeping it alive) is about to be freed, so that the host can forget it. The hook must not touch the heap.
+  void set_sweep_hook(void (*hook)(void*), void* user) {
+    sweep_hook_ = hook;
+    sweep_user_ = user;
+  }
+  bool dying(const Cell* cell) const { return !cell->marked && (!minor_ || cell->gen == kGenYoung); }
   // Lets the host make the object `new` starts with (a custom element class makes a document node): given the prototype, an object or nullptr for the usual one.
   void set_construct_hook(JsObject* (*hook)(void* user, JsObject* proto), void* user) {
     construct_hook_ = hook;
@@ -560,6 +567,8 @@ class Vm {
   bool has_exception_ = false;
   uint32_t throw_line_ = 0;   // the source line an exception was thrown from (kept for debugging builds: TCOS_ERROR_LINES prints it)
   Value last_result_;
+  void (*sweep_hook_)(void*) = nullptr;
+  void* sweep_user_ = nullptr;
   Value extra_root_;    // a value the collector must keep while native code that is not in a frame holds it (see Engine::call_guarded)
   Value iter_return_;   // the value an iterator finished with (done: true, value: ...): what `yield*` evaluates to
   JsObject *global_ = nullptr, *object_proto_ = nullptr, *array_proto_ = nullptr, *function_proto_ = nullptr, *string_proto_ = nullptr, *number_proto_ = nullptr,

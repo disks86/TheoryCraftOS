@@ -2885,15 +2885,11 @@ DomError set_inner_html(Node* element, StringView html, bool allow_shadow_roots)
     context = element->owner->create_element("body");
     if (!context) return DomError::OutOfMemory;
   }
-  Node* target_first = element->is_tag("template") ? template_content(element) : element;
-  if (!target_first) return DomError::OutOfMemory;
-  while (target_first->first_child) remove_child(target_first, target_first->first_child);   // (before the parse: a declarative shadow root attaches to the element as it is read)
   Node* fragment = parse_in_context(*element->owner, html, context, allow_shadow_roots);
   if (!fragment) return DomError::OutOfMemory;
   Node* target = element->is_tag("template") ? template_content(element) : element;   // (a template's markup is its content)
   if (!target) return DomError::OutOfMemory;
-  while (target->first_child) remove_child(target, target->first_child);
-  return append_child(target, fragment);
+  return replace_children(target, fragment);
 }
 
 }  // namespace dom

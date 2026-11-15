@@ -32,6 +32,7 @@
 namespace dom {
 
 class Document;
+class LiveRanges;
 
 enum class NodeType : uint8_t { Element = 1, Text = 3, Comment = 8, Document = 9, Fragment = 11 };
 
@@ -96,6 +97,9 @@ struct Mutation {
   String old_value;                        // attributes and character data: what it was
   bool had_old_value = false;              // attributes: false if the attribute was added
   String watchers;                         // the serials (comma separated) of the watched nodes that were this target or above it when the change was made
+  // Child list: not 0 for a change that is part of one operation the standard reports as a single record (the children replaced, a fragment put in, a child
+  // replaced): the records of one target with the same number are one record to an observer.
+  uint32_t group = 0;
 };
 
 // What the tree operations say when they refuse.
@@ -218,8 +222,15 @@ class Document {
     watched_.push_back(node);
   }
   void unwatch_all() { watched_.clear(); }
+  // The observers were told of the changes so far: the nodes that were watched only because they had been taken out of a watched tree are let go.
+  void end_transient_watches() { transient_.clear(); }
   void record(Mutation&& m);
   List<Mutation>& log() { return log_; }
+  // The number the child list records made now carry as Mutation::group (0: none); see MutationGroup.
+  uint32_t group() const { return group_; }
+  // The live ranges and node iterators that are told of the changes to this document's nodes (see LiveRanges.hpp); nullptr for none.
+  void set_live(LiveRanges* live) { live_ = live; }
+  LiveRanges* live() const { return live_; }
 
  private:
   Node* make(NodeType type, StringView name);
@@ -235,12 +246,34 @@ class Document {
   void (*change_hook_)(void*) = nullptr;
   void* change_context_ = nullptr;
   List<Mutation> log_;
-  List<Node*> watched_;
+  List<Node*> watched_, transient_;
   bool recording_ = false;
+  friend class MutationGroup;
+  uint32_t group_ = 0, last_group_ = 0;
+  LiveRanges* live_ = nullptr;
   void (*insert_hook_)(void*, Node*) = nullptr;
   void* insert_context_ = nullptr;
   void (*hook_)(void*) = nullptr;
   void* hook_context_ = nullptr;
+};
+
+// While one of these is alive the child list records of the document belong to one operation (Mutation::group). One inside another changes nothing: the outer
+// operation is the one reported.
+class MutationGroup {
+ public:
+  explicit MutationGroup(Document* doc) : doc_(doc && doc->recording_ && doc->group_ == 0 ? doc : nullptr) {
+    if (!doc_) return;
+    if (++doc_->last_group_ == 0) ++doc_->last_group_;
+    doc_->group_ = doc_->last_group_;
+  }
+  ~MutationGroup() {
+    if (doc_) doc_->group_ = 0;
+  }
+  MutationGroup(const MutationGroup&) = delete;
+  MutationGroup& operator=(const MutationGroup&) = delete;
+
+ private:
+  Document* doc_;
 };
 
 // --- Tree operations. They follow the standard: a node is first taken out of where it is; a fragment's children go in its place; nothing can be put
@@ -249,6 +282,8 @@ DomError append_child(Node* parent, Node* child);
 DomError insert_before(Node* parent, Node* child, Node* reference);
 DomError remove_child(Node* parent, Node* child);
 DomError replace_child(Node* parent, Node* child, Node* old_child);
+// Could insert_before(parent, child, reference) put the node there ("ensure pre-insertion validity")? Nothing is changed.
+DomError check_insert(const Node* parent, const Node* child, const Node* reference);
 // Takes `node` out of its parent (if it has one).
 void detach(Node* node);
 // A copy (with the children too if `deep`) that is in no tree. nullptr if memory ran out.
@@ -291,6 +326,8 @@ bool has_class(const Node* element, StringView word);
 void text_content(const Node* node, String* out);
 // Replaces the children of an element or fragment with one text node (none for ""); a text or comment node's data is replaced.
 DomError set_text_content(Node* node, StringView text);
+// Replaces the children of `node` with `child` (a node or a fragment; nullptr: with nothing): "replace all", one record for an observer.
+DomError replace_children(Node* node, Node* child);
 // The markup of the children (innerHTML) or of the node itself (outerHTML).
 void inner_html(const Node* node, String* out);
 void outer_html(const Node* node, String* out);

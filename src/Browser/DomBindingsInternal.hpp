@@ -21,6 +21,7 @@
 #include "Browser/DomBindings.hpp"
 #include "Browser/Canvas.hpp"
 #include "Browser/Fetcher.hpp"
+#include "Dom/LiveRanges.hpp"
 #include "Kernel/Sync.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/UniquePointer.hpp"
@@ -52,7 +53,7 @@ struct NetJob {
 };
 
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()), named_names(v.allocator()), named_nodes(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), live(v.allocator()), live_documents(v.allocator()), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()), named_names(v.allocator()), named_nodes(v.allocator()) {}
   ~Impl();   // waits for the request threads
   dom::Document* inert_document = nullptr;   // the document the contents of templates belong to as far as ownerDocument tells (made when first asked for)
   struct CustomValidity {
@@ -63,6 +64,8 @@ struct DomBindings::Impl {
 
   script::Vm& vm;
   dom::Document& doc;
+  dom::LiveRanges live;   // the live ranges and node iterators of the page's scripts (DomBindingsRange.cpp)
+  List<dom::Document*> live_documents;   // the documents that tell `live` of their changes (until this goes)
   IDomHost& host;
   DomBindings& owner;
 
@@ -211,6 +214,12 @@ bool install_net(DomBindings::Impl& c);    // URL, fetch()'s and XMLHttpRequest'
 JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);
 bool byte_array_bytes(const Value& v, StringView* out);
 bool install_dash(DomBindings::Impl& c);     // the natives under the dashjs-style player (DomBindingsDash.cpp)
+bool install_ranges(DomBindings::Impl& c);   // the natives under Range and NodeIterator (DomBindingsRange.cpp)
+// The document of `n` tells the page's live ranges (Impl::live) of its changes from now on.
+void attach_live(DomBindings::Impl& c, dom::Node* n);
+// "Replace data" of a text or comment node: `count` UTF-16 code units from `offset` on (both inside the text) become `data`; ranges follow, an observer is told.
+// False (with an exception thrown) if memory ran out.
+bool replace_data(DomBindings::Impl& c, dom::Node* n, uint64_t offset, uint64_t count, StringView data);
 bool install_tracks(DomBindings::Impl& c);   // the natives under text tracks and WebVTT (DomBindingsTracks.cpp)
 bool install_mse(DomBindings::Impl& c);    // the natives under MediaSource and SourceBuffer (DomBindingsMse.cpp)
 // A TimeRanges holding `count` ranges, as start and end seconds one after the other in `pairs`.

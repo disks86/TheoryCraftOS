@@ -391,6 +391,7 @@ add_executable(BOOTX64
   src/Browser/DomBindingsWindow.cpp
   src/Browser/DomBindingsMedia.cpp
   src/Browser/DomBindingsMse.cpp
+  src/Browser/DomBindingsRange.cpp
   src/Browser/DomBindingsTracks.cpp
   src/Browser/DomBindingsDash.cpp
   src/Browser/DomBindingsForm.cpp
@@ -472,6 +473,7 @@ add_executable(BOOTX64
   src/Browser/MseClip.cpp
   src/Browser/Svg.cpp
   src/Dom/Dom.cpp
+  src/Dom/LiveRanges.cpp
   src/Dom/Selector.cpp
   src/Dom/Form.cpp
   src/Dom/Entities.cpp

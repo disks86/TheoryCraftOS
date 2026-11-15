@@ -7341,7 +7341,10 @@ static int run_real_wpt(const char* root, const char* file) {
     std::string log;
     for (const std::string& line : env.console_lines) log += line + "\n";
     printf("%s", log.c_str());
-    if (log.find("WPTDONE") == std::string::npos) printf("WPTDONE NOFINISH the harness did not finish (%u script errors, clock %llu)\n", page.errors(), static_cast<unsigned long long>(env.clock));
+    if (log.find("WPTDONE") == std::string::npos) {
+      printf("WPTDONE NOFINISH the harness did not finish (%u script errors, clock %llu)\n", page.errors(), static_cast<unsigned long long>(env.clock));
+      if (getenv("WPT_ERRORS")) printf("first error: %.*s\n", static_cast<int>(page.first_error().size()), page.first_error().data());   // (what stopped it, when somebody asks)
+    }
   }
   fflush(stdout);
   _Exit(0);   // (no leak check, no teardown: the runs are for the list of results)

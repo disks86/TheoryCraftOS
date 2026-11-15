@@ -26,6 +26,7 @@
 #include "Dom/Entities.hpp"
 #include "Dom/Form.hpp"
 #include "Dom/HtmlBuilder.hpp"
+#include "Dom/LiveRanges.hpp"
 #include "Dom/Selector.hpp"
 
 using namespace dom;
@@ -407,11 +408,120 @@ static void test_forms() {
   CHECK(text.view().equals("-42"));
 }
 
+// Live ranges and node iterators follow the tree (the standard's live range pre-remove and insert steps, "replace data", "split a Text node", normalize and
+// the NodeIterator pre-removing steps), and one operation's child list changes carry one group.
+static void test_live_ranges() {
+  TestAllocator a;
+  {
+    Document doc(a);
+    build_document(doc, "<div id=a><p id=b>one</p><p id=c>two</p><p id=e>three</p></div><div id=d></div>", nullptr);
+    Node* A = doc.element_by_id("a");
+    Node* B = doc.element_by_id("b");
+    Node* C = doc.element_by_id("c");
+    Node* D = doc.element_by_id("d");
+    Node* E = doc.element_by_id("e");
+    LiveRanges live(a);
+    int owner_one = 0, owner_two = 0, owner_three = 0;
+    CHECK(!live.active());
+    doc.set_live(&live);
+    CHECK(remove_child(A, B) == DomError::None && insert_before(A, B, C) == DomError::None);   // (nothing registered: nothing to do, nothing breaks)
+    const Optional<uint32_t> one = live.add_range(A, &owner_one);
+    const Optional<uint32_t> two = live.add_range(C->first_child, &owner_two);
+    CHECK(one.has_value() && two.has_value() && live.active() && live.range_count() == 2);
+    if (one.has_value() && two.has_value()) {
+      LiveRange* r = live.range(*one);
+      r->start_offset = 1;   // [A,1 .. A,3]: the second and third paragraph
+      r->end_offset = 3;
+      live.range(*two)->start_offset = 1;   // inside "two"
+      live.range(*two)->end_offset = 2;
+      // a child before the range goes: both ends move down; put back at the very index of the start, only the end moves up (the start stays before it)
+      CHECK(remove_child(A, B) == DomError::None);
+      r = live.range(*one);
+      CHECK(r->start == A && r->start_offset == 0 && r->end_offset == 2);
+      CHECK(insert_before(A, B, A->first_child) == DomError::None && r->start_offset == 0 && r->end_offset == 3);
+      // a child put in between the two ends
+      Node* extra = doc.create_element("hr");
+      CHECK(insert_before(A, extra, C) == DomError::None && r->start_offset == 0 && r->end_offset == 4);
+      CHECK(remove_child(A, extra) == DomError::None && r->start_offset == 0 && r->end_offset == 3);
+      // the node a boundary is in goes: the boundary moves to where the node was in its parent
+      CHECK(append_child(D, C) == DomError::None);
+      LiveRange* t = live.range(*two);
+      CHECK(t->start == A && t->start_offset == 1 && t->end == A && t->end_offset == 1 && r->start_offset == 0 && r->end_offset == 2);
+      // text: replace data moves what is after the change, and snaps what is inside it to its start
+      t->start = t->end = E->first_child;   // "three"
+      t->start_offset = 2;
+      t->end_offset = 5;
+      live.data_replaced(E->first_child, 0, 0, 2);   // two units put in at the start
+      CHECK(t->start_offset == 4 && t->end_offset == 7);
+      live.data_replaced(E->first_child, 3, 3, 1);   // units 3..6 become one
+      CHECK(t->start_offset == 3 && t->end_offset == 5);
+      live.data_replaced(E->first_child, 0, 9, 0);   // everything goes
+      CHECK(t->start_offset == 0 && t->end_offset == 0);
+      // split: what is after the cut moves into the new node; merge: it comes back
+      Node* tail = doc.create_text("ee");
+      t->start_offset = 1;
+      t->end_offset = 4;
+      CHECK(insert_before(E, tail, nullptr) == DomError::None);
+      live.text_split(E->first_child, 3, tail);
+      CHECK(t->start == E->first_child && t->start_offset == 1 && t->end == tail && t->end_offset == 1);
+      live.text_merging(tail, E->first_child, 3);
+      CHECK(t->end == E->first_child && t->end_offset == 4);
+      // an entry whose owner is gone is dropped, and its slot is used again
+      live.sweep([&](const void* owner) { return owner == &owner_two; });
+      CHECK(live.range_count() == 1 && live.range(*two) == nullptr && live.range(*one) != nullptr);
+      const Optional<uint32_t> three = live.add_range(A, &owner_three);
+      CHECK(three.has_value() && *three == *two);
+    }
+    // a node iterator whose reference node goes: to the node before it (pointer after), or to the next one (pointer before)
+    int owner_it = 0;
+    const Optional<uint32_t> it = live.add_iterator(A, &owner_it);
+    CHECK(it.has_value());
+    if (it.has_value()) {
+      LiveIterator* i = live.iterator(*it);
+      i->reference = B->first_child;
+      i->before = false;
+      CHECK(remove_child(A, B) == DomError::None && i->reference == A && !i->before);
+      CHECK(insert_before(A, B, A->first_child) == DomError::None);
+      i->reference = B;
+      i->before = true;
+      CHECK(remove_child(A, B) == DomError::None && i->reference == E && i->before);
+      i->reference = E->last_child;
+      i->before = true;   // (nothing after it inside the root: the pointer goes behind what is before it)
+      CHECK(remove_child(A, E) == DomError::None && i->reference == A && !i->before);
+      // the root itself going changes nothing
+      CHECK(append_child(D, A) == DomError::None && i->reference == A);
+      live.remove_iterator(*it);
+      CHECK(live.iterator(*it) == nullptr && live.iterator_count() == 0);
+    }
+    doc.set_live(nullptr);
+  }
+  {
+    // the records of one operation carry one group; a node leaving its old place first does not
+    Document doc(a);
+    build_document(doc, "<div id=a><p id=b></p><p id=c></p></div><div id=d><i id=i></i></div>", nullptr);
+    Node* A = doc.element_by_id("a");
+    Node* B = doc.element_by_id("b");
+    Node* I = doc.element_by_id("i");
+    doc.set_recording(true);
+    CHECK(set_text_content(A, "x") == DomError::None);
+    List<Mutation>& log = doc.log();
+    CHECK(log.count() == 3 && log[0].group != 0 && log[0].group == log[1].group && log[1].group == log[2].group && log[0].removed == B && log[2].added == A->first_child);
+    log.clear();
+    CHECK(replace_child(A, I, A->first_child) == DomError::None);
+    CHECK(log.count() == 3 && log[0].group == 0 && log[0].removed == I && log[1].group != 0 && log[1].group == log[2].group && log[1].removed && log[2].added == I);
+    log.clear();
+    CHECK(append_child(A, B) == DomError::None && log.count() == 1 && log[0].group == 0);
+    CHECK(check_insert(B, A, nullptr) == DomError::HierarchyRequest && check_insert(A, B, nullptr) == DomError::None && log.count() == 1);
+  }
+  CHECK(a.live == 0);
+}
+
 int main() {
   setvbuf(stdout, nullptr, _IONBF, 0);
   test_builder();
   test_scripts_in_builder();
   test_tree_operations();
+  test_live_ranges();
   test_selectors();
   test_entities();
   test_media_queries();

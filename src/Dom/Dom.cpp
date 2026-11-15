@@ -17,6 +17,7 @@
  */
 
 #include "Dom/Dom.hpp"
+#include "Dom/LiveRanges.hpp"
 #include <new>
 #include "Utility/Move.hpp"
 
@@ -36,7 +37,7 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) {
+Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator), transient_(allocator) {
   character_set.assign("UTF-8");
   root_ = make(NodeType::Document, "#document");
 }
@@ -127,6 +128,13 @@ void Document::record(Mutation&& m) {
     if (!m.watchers.empty()) m.watchers.push_back(',');
     m.watchers.append_uint(watched_[i]->serial);
   }
+  for (uint64_t i = 0; i < transient_.count(); ++i) {
+    if (!contains(transient_[i], m.target)) continue;
+    if (!m.watchers.empty()) m.watchers.push_back(',');
+    m.watchers.append_uint(transient_[i]->serial);
+  }
+  // (a node taken out of something that is watched is watched itself until the observers were told: what happens in it meanwhile is theirs to hear)
+  if (m.removed && !m.watchers.empty() && transient_.count() < kMaxLog) transient_.push_back(m.removed);
   const bool first = log_.count() == 0;
   log_.push_back(util::move(m));
   if (first && hook_) hook_(hook_context_);
@@ -159,9 +167,17 @@ void touch_attribute(Node* e, StringView name) {
   if (e && e->owner) e->owner->touch_attribute(e, name);
 }
 
-void unlink(Node* node) {
+// The live ranges and node iterators that must hear of a change at `n`, or nullptr (the usual case: the page has none).
+inline LiveRanges* live_of(const Node* n) {
+  LiveRanges* live = n->owner ? n->owner->live() : nullptr;
+  return live && live->active() ? live : nullptr;
+}
+
+// `grouped`: the removal is part of the operation that is going on (MutationGroup), not a node leaving its old place before it is put somewhere else.
+void unlink(Node* node, bool grouped = true) {
   Node* p = node->parent;
   if (!p) return;
+  if (LiveRanges* live = live_of(p)) live->removing(node);
   if (p->owner && p->owner->recording()) {
     Mutation m(p->owner->allocator());
     m.kind = Mutation::Kind::ChildList;
@@ -169,6 +185,7 @@ void unlink(Node* node) {
     m.previous = node->prev;
     m.next = node->next;
     m.removed = node;
+    m.group = grouped ? p->owner->group() : 0;
     p->owner->record(util::move(m));
   }
   if (node->prev) node->prev->next = node->next;
@@ -194,8 +211,10 @@ void link_before(Node* parent, Node* node, Node* reference) {
     m.previous = node->prev;
     m.next = node->next;
     m.added = node;
+    m.group = parent->owner->group();
     parent->owner->record(util::move(m));
   }
+  if (LiveRanges* live = live_of(parent)) live->inserted(node);
   if (parent->owner) parent->owner->inserted(node);
 }
 
@@ -299,10 +318,13 @@ static DomError check_insertion(const Node* parent, const Node* node, const Node
   return DomError::None;
 }
 
+DomError check_insert(const Node* parent, const Node* child, const Node* reference) { return check_insertion(parent, child, reference, nullptr); }
+
 DomError insert_before(Node* parent, Node* child, Node* reference) {
   if (const DomError e = check_insertion(parent, child, reference, nullptr); e != DomError::None) return e;
   if (reference == child) reference = child->next;
   if (child->type == NodeType::Fragment) {
+    MutationGroup group(parent->owner);
     while (Node* c = child->first_child) {
       unlink(c);
       link_before(parent, c, reference);
@@ -310,7 +332,7 @@ DomError insert_before(Node* parent, Node* child, Node* reference) {
     touch(parent);
     return DomError::None;
   }
-  unlink(child);
+  unlink(child, false);
   link_before(parent, child, reference);
   touch(parent);
   return DomError::None;
@@ -327,18 +349,19 @@ DomError remove_child(Node* parent, Node* child) {
 
 DomError replace_child(Node* parent, Node* child, Node* old_child) {
   if (const DomError e = check_insertion(parent, child, nullptr, old_child); e != DomError::None) return e;
-  if (child == old_child) return DomError::None;
   Node* reference = old_child->next == child ? child->next : old_child->next;
+  // (the order of the standard: the new child leaves where it was, the old one goes, the new one comes in; an observer gets the last two as one record)
+  if (child->type != NodeType::Fragment) unlink(child, false);
+  MutationGroup group(parent->owner);
+  if (old_child->parent == parent) unlink(old_child);
   if (child->type == NodeType::Fragment) {
     while (Node* c = child->first_child) {
       unlink(c);
       link_before(parent, c, reference);
     }
   } else {
-    unlink(child);
     link_before(parent, child, reference);
   }
-  unlink(old_child);
   touch(parent);
   return DomError::None;
 }
@@ -592,15 +615,32 @@ DomError set_text_content(Node* node, StringView text) {
     return DomError::None;
   }
   if (node->type == NodeType::Document) return DomError::None;
-  if (!node->owner->recording()) {   // (nothing to replace: already empty, or already just this text)
+  if (!node->owner->recording() && !live_of(node)) {   // (nothing to replace: already empty, or already just this text)
     if (text.empty() && !node->first_child) return DomError::None;
     if (!text.empty() && node->first_child && !node->first_child->next && node->first_child->type == NodeType::Text && node->first_child->data.view().equals(text)) return DomError::None;
   }
-  while (node->first_child) unlink(node->first_child);
+  Node* t = nullptr;
   if (!text.empty()) {
-    Node* t = node->owner->create_text(text);
+    t = node->owner->create_text(text);
     if (!t) return DomError::OutOfMemory;
-    link_before(node, t, nullptr);
+  }
+  return replace_children(node, t);
+}
+
+DomError replace_children(Node* node, Node* child) {
+  if (child) {
+    if (const DomError e = check_insertion(node, child, nullptr, nullptr); e != DomError::None) return e;
+  }
+  MutationGroup group(node->owner);
+  while (node->first_child) unlink(node->first_child);
+  if (child && child->type == NodeType::Fragment) {
+    while (Node* c = child->first_child) {
+      unlink(c);
+      link_before(node, c, nullptr);
+    }
+  } else if (child) {
+    unlink(child, false);
+    link_before(node, child, nullptr);
   }
   touch(node);
   return DomError::None;

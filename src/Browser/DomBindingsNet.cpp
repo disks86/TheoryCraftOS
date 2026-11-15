@@ -822,6 +822,7 @@ NATIVE(url_resolve) {
 }  // namespace
 
 DomBindings::Impl::~Impl() {
+  for (dom::Document* d : live_documents.view()) d->set_live(nullptr);   // (the documents outlive the script engine)
   {
     kernel::ScopedMutex lock(net_mutex);
     net_closing = true;
