@@ -68,10 +68,10 @@ class LiveRanges {
   // Frees every entry whose owner `gone(owner)` says is gone.
   template <class F>
   void sweep(F&& gone) {
-    for (uint64_t i = 0; i < ranges_.count() && used_ranges_ > 0; ++i)
-      if (ranges_[i].owner && gone(ranges_[i].owner)) remove_range(static_cast<uint32_t>(i));
-    for (uint64_t i = 0; i < iterators_.count() && used_iterators_ > 0; ++i)
-      if (iterators_[i].owner && gone(iterators_[i].owner)) remove_iterator(static_cast<uint32_t>(i));
+    for (uint32_t i = range_end_; i-- > 0;)
+      if (ranges_[i].owner && gone(ranges_[i].owner)) remove_range(i);
+    for (uint32_t i = iterator_end_; i-- > 0;)
+      if (iterators_[i].owner && gone(iterators_[i].owner)) remove_iterator(i);
   }
 
   // --- What the tree operations tell (only worth calling while active()).
@@ -94,6 +94,9 @@ class LiveRanges {
   List<LiveIterator> iterators_;
   uint32_t used_ranges_ = 0, used_iterators_ = 0;
   uint32_t free_range_hint_ = 0, free_iterator_hint_ = 0;   // (no free slot below these)
+  // One past the last slot in use: new entries take the lowest free slot, so after a burst of short-lived ranges the changes of the tree look at the few
+  // slots still used, not at every slot there ever was.
+  uint32_t range_end_ = 0, iterator_end_ = 0;
 };
 
 // The number of siblings before `node`.

@@ -888,7 +888,8 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   }
   if (IS("nodeValue") || ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data"))) {
     if (n->is_text() || n->type == dom::NodeType::Comment) {
-      if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+      if (value.is_undefined() && IS("data")) text.append("undefined");   // (data takes null as "", anything else as its string; nodeValue takes undefined as null)
+      else if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
       return replace_data(c, n, 0, utf16_length(n->data.view()), text.view()) ? HostClass::Set::Handled : HostClass::Set::Threw;
     }
     return HostClass::Set::Handled;

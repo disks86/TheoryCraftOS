@@ -133,6 +133,14 @@ NATIVE(ni_set) {
   return true;
 }
 
+// __ni_free(id): the iterator entry is given back (the one a walk keeps while a filter runs)
+NATIVE(ni_free) {
+  (void)self;
+  impl(vm).live.remove_iterator(arg_id(args, argc, 0));
+  *result = Value();
+  return true;
+}
+
 // __set_data(node, text, offset, count, added): "replace data" of a text or comment node whose outcome the caller worked out: the text becomes `text`, in which
 // `count` UTF-16 code units from `offset` on were replaced by `added` units (script strings can cut a surrogate pair in two; the offsets here are for the ranges)
 NATIVE(set_data) {
@@ -146,6 +154,15 @@ NATIVE(set_data) {
   const dom::DomError e = dom::set_text_content(n, text.view());
   if (e != dom::DomError::None) return throw_dom_error(vm, e);
   if (c.live.active()) c.live.data_replaced(n, arg_offset(args, argc, 2), arg_offset(args, argc, 3), arg_offset(args, argc, 4));
+  return true;
+}
+
+// __lr_count(): how many live ranges and node iterators the page has at the moment (for tests: the ones nobody holds any more go with a collection)
+NATIVE(lr_count) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  *result = num_value(impl(vm).live.range_count() + impl(vm).live.iterator_count());
   return true;
 }
 
@@ -260,12 +277,14 @@ bool install_ranges(DomBindings::Impl& c) {
   vm.define_native(g, "__ni_new", ni_new, 2);
   vm.define_native(g, "__ni_get", ni_get, 2);
   vm.define_native(g, "__ni_set", ni_set, 3);
+  vm.define_native(g, "__ni_free", ni_free, 1);
   vm.define_native(g, "__set_data", set_data, 5);
   vm.define_native(g, "__node_length", node_length, 1);
   vm.define_native(g, "__node_index", node_index, 1);
   vm.define_native(g, "__node_root", node_root, 1);
   vm.define_native(g, "__pt_cmp", pt_cmp, 4);
   vm.define_native(g, "__lr_cmp", lr_cmp, 3);
+  vm.define_native(g, "__lr_count", lr_count, 0);
   vm.define_native(g, "__check_insert", check_insert_native, 3);
   vm.set_sweep_hook(sweep_hook, &c);
   return true;

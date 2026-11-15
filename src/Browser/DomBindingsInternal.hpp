@@ -53,7 +53,7 @@ struct NetJob {
 };
 
 struct DomBindings::Impl {
-  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()), named_names(v.allocator()), named_nodes(v.allocator()), live(v.allocator()), live_documents(v.allocator()) {}
+  Impl(script::Vm& v, dom::Document& d, IDomHost& h, DomBindings& o) : vm(v), doc(d), live(v.allocator()), live_documents(v.allocator()), host(h), owner(o), first_error(v.allocator()), custom_validity(v.allocator()), net_jobs(v.allocator()), pending_scripts(v.allocator()), named_names(v.allocator()), named_nodes(v.allocator()) {}
   ~Impl();   // waits for the request threads
   dom::Document* inert_document = nullptr;   // the document the contents of templates belong to as far as ownerDocument tells (made when first asked for)
   struct CustomValidity {

@@ -55,6 +55,48 @@ Fixed with it: `compareDocumentPosition` of disconnected nodes, `new Text()`/`ne
 `createDocumentType`, `Document.implementation` of every document, `cloneNode`, serialization) and the order of the checks in `insertBefore`/`replaceChild` ("ensure
 pre-insertion validity", including the rules for a document's doctype and element).
 
+## Ranges, selection, traversal and mutation observers
+
+`Range`, `Selection`, `TreeWalker`, `NodeIterator` and `MutationObserver` are written in script (`kDomPrelude` in `WebPrelude.cpp`) after the algorithms of the DOM and
+Selection API standards, with their errors (`IndexSizeError`, `InvalidNodeTypeError`, `WrongDocumentError`, `HierarchyRequestError`, `InvalidStateError`,
+`NotFoundError`, `TypeError` for an argument that is not a node) and their attributes as read-only accessors on the prototypes.
+
+A `Range` is a live range. Its boundary points, and a `NodeIterator`'s reference node and pointer side, are not kept in script: they are entries of the page's
+`dom::LiveRanges` (`src/Dom/LiveRanges.hpp`, owned by the bindings, `Document::set_live`), and the two functions every tree change goes through (`unlink` and
+`link_before` in `Dom.cpp`) run the standard's "live range pre-remove steps", insert steps and "NodeIterator pre-removing steps" on them the moment a node moves.
+"Replace data" (the `CharacterData` methods and the `data`/`nodeValue`/`textContent` setters), "split a Text node" and `normalize()` tell the registry from the
+bindings, in UTF-16 code units. The script objects name their entry by a number (`__lr_get`/`__lr_set`, `__ni_get`/`__ni_set` in `DomBindingsRange.cpp`).
+
+- Cost when unused: a document without a registry, or with an empty one, does one pointer test and one count test per tree change. With ranges, a change
+  looks at the slots in use (new entries take the lowest free slot, so a burst of short-lived ranges does not leave a long table behind).
+- Lifetime: the registry does not keep a range alive. The collector calls a hook after marking and before freeing (`Vm::set_sweep_hook`, `Vm::dying`), and the
+  entries whose script object is about to be freed are dropped then. (`WeakRef` and `FinalizationRegistry` of this engine hold strongly, so they could not be used.)
+- Documents made by `DOMParser`/`createHTMLDocument` tell the same registry once a range or an iterator has been in them; a node adopted into another document
+  takes its boundaries with it.
+- The selection has at most one range, the very object a script added (`addRange`), and a direction; its attributes are computed from that range, so it follows
+  every change of the tree. `selectionchange` is fired at the document, in a task, once for the changes made by scripts through `Selection` or the selected
+  `Range` (not for a change of the tree that moves the range, and not for one that leaves the selection as it was). `modify()` moves by character and by word
+  through the text nodes of the document and to the ends of a text node for the line, sentence and paragraph granularities: there are no lines to move by.
+- A `MutationObserver` gets one record for one operation: the child list changes of a replaced child, a fragment put in, and "replace all" (`textContent`,
+  `innerHTML`, `replaceChildren`) carry a group number (`Mutation::group`, `MutationGroup`) and are merged where the log is read. A node taken out of a tree
+  that is observed with its subtree stays observed until the observers were told (transient registered observers: `Document::transient_`). The observer
+  microtask is queued when a record is queued for an observer.
+
+Real web-platform-tests before and after this work (2026-11-14; subtests passed / failed, files that did not finish; a 180 second limit per file because the
+machine was busy): `dom/ranges` 22279 / 13029 (4) to 30985 / 4323 (4), `dom/traversal` 1566 / 40 to 1598 / 8, `dom/nodes` 9657 / 2931 (41) to 9732 / 2859 (41),
+`selection` 20425 / 15437 (28) to 33608 / 518 (28; the unfinished ones are reference and crash tests without a harness). What is left:
+
+- `Range-insertNode`, `-surroundContents`, `-extractContents`, `-cloneContents`, `-deleteContents` and `selection/deleteFromDocument` (4 200 subtests) build
+  their trees in two `<iframe>`s and move nodes between the page and the frames (`iframe.contentDocument.appendChild(referenceDoc.documentElement.cloneNode(true))`).
+  A frame is another script engine with its own documents; a node cannot cross, so these cannot run here. The same algorithms are covered locally
+  (`dom_ranges_traversal.js`).
+- `Attr` nodes are not nodes of the tree: a range cannot have one as a boundary (`Range-attribute-nodes`), and a mutation record has no `attributeNamespace`.
+- `MutationObserver-document` (records for what the parser inserts while the page is still being read) still fails; the cause has not been looked into.
+- `Range-set.html` runs and passes all its 10 920 subtests, but the harness then fails to finish with the error a document gives at its node limit
+  (`Document::kMaxNodes`; a larger script heap does not help), so the file counts as unfinished.
+- `getClientRects()`/`getBoundingClientRect()` of a range are empty, the tentative `OpaqueRange`, `expand()` and composed (cross shadow tree) selection
+  ranges (`getComposedRanges`) are not there, and the selection is not drawn or changed by the mouse and the keyboard outside text controls.
+
 ## Text encodings
 
 `src/Dom/LegacyEncodings.cpp` has the decoders of the Encoding Standard (UTF-8, UTF-16, the 28 single-byte encodings, GBK/gb18030, Big5, EUC-JP, ISO-2022-JP, Shift_JIS,

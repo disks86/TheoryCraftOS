@@ -4360,7 +4360,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (args.length < n) throw new TypeError("Failed to execute '" + what + "' on '" + type + "': " + n + ' argument' + (n > 1 ? 's' : '') + ' required, but only ' + args.length + ' present.');
   };
   // The live ranges and node iterators are kept by the document (dom::LiveRanges), which moves them when the tree changes; these are the ways in.
-  var lrNew = g.__lr_new, lrGet = g.__lr_get, lrSet = g.__lr_set, lrCmp = g.__lr_cmp, niNew = g.__ni_new, niGet = g.__ni_get, niSet = g.__ni_set;
+  var lrNew = g.__lr_new, lrGet = g.__lr_get, lrSet = g.__lr_set, lrCmp = g.__lr_cmp, niNew = g.__ni_new, niGet = g.__ni_get, niSet = g.__ni_set, niFree = g.__ni_free;
   var lenOf = g.__node_length, idxOf = g.__node_index, rootOf = g.__node_root, cmpPoints = g.__pt_cmp, checkInsert = g.__check_insert, setData = g.__set_data;
   // "Replace data" of a text or comment node (the CharacterData methods are this too): offsets are UTF-16 code units, and may cut a surrogate pair.
   var replaceData = function (node, offset, count, data) {
@@ -4523,18 +4523,24 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     while (s.lastChild) s = s.lastChild;
     return s;
   }
+  // "Traverse". While a filter looks at a candidate, where the walk stands is kept by the document too (an entry of its own, for the time of the call), so
+  // that a filter that removes nodes moves it the way it moves the reference node; the candidate that was accepted is returned, and the reference node
+  // becomes where the walk then stands. A filter that throws, or a walk that finds nothing, leaves the iterator where it was.
   function iterate(it, next) {
-    var id = it.__ni, node = niGet(id, 0), before = niGet(id, 1), root = it.__root;
-    while (true) {
-      if (next) {
-        if (!before) { node = following(node, root); if (!node) return null; } else before = false;
-      } else {
-        if (before) { node = preceding(node, root); if (!node) return null; } else before = true;
+    var id = it.__ni, node = niGet(id, 0), before = niGet(id, 1), root = it.__root, flight = it.__filter === null ? -1 : niNew(it, root);
+    try {
+      while (true) {
+        if (next) {
+          if (!before) { node = following(node, root); if (!node) return null; } else before = false;
+        } else {
+          if (before) { node = preceding(node, root); if (!node) return null; } else before = true;
+        }
+        if (flight >= 0) niSet(flight, node, before);
+        var candidate = node, result = accepts(it, node);
+        if (flight >= 0) { node = niGet(flight, 0); before = niGet(flight, 1); }
+        if (result === 1) { niSet(id, node, before); return candidate; }
       }
-      if (accepts(it, node) === 1) break;
-    }
-    niSet(id, node, before);
-    return node;
+    } finally { if (flight >= 0) niFree(flight); }
   }
   method(NI, 'nextNode', function () { return iterate(this, true); });
   method(NI, 'previousNode', function () { return iterate(this, false); });
@@ -4568,7 +4574,11 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     Object.defineProperty(RP, c[0], { value: c[1], enumerable: true });
   });
   function newRange(sc, so, ec, eo) { var r = new Range(); lrSet(r.__r, sc, so, ec, eo); return r; }
-  function setRange(r, sc, so, ec, eo) { lrSet(r.__r, sc, so, ec, eo); if (r === selRange) selChanged(); }
+  function sameRange(id, sc, so, ec, eo) { return lrGet(id, 0) === sc && lrGet(id, 1) === so && lrGet(id, 2) === ec && lrGet(id, 3) === eo; }
+  function setRange(r, sc, so, ec, eo) {
+    if (r === selRange && !sameRange(r.__r, sc, so, ec, eo)) selChanged();
+    lrSet(r.__r, sc, so, ec, eo);
+  }
   function isRange(x) { return x !== null && typeof x === 'object' && typeof x.__r === 'number' && x instanceof Range; }
   attribute(RP, 'startContainer', function () { return lrGet(this.__r, 0); });
   attribute(RP, 'startOffset', function () { return lrGet(this.__r, 1); });
@@ -4798,13 +4808,21 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     selTold = true;
     setTimeout(function () { selTold = false; doc.dispatchEvent(new Event('selectionchange')); }, 0);
   };
-  function selSet(range, backward) { selRange = range; selBackward = !!backward && range !== null; selChanged(); }
+  function selSet(range, backward) {
+    backward = !!backward && range !== null;
+    var same = range === selRange;   // (the same selection made again is not a change)
+    if (!same && range && selRange) { var id = range.__r; same = backward === selBackward && sameRange(selRange.__r, lrGet(id, 0), lrGet(id, 1), lrGet(id, 2), lrGet(id, 3)); }
+    selRange = range; selBackward = backward;
+    if (!same) selChanged();
+  }
   function selCheck(s) { if (s !== selection) throw new TypeError('Illegal invocation'); }
   function selPoint(which) {   // 0 the anchor's node, 1 its offset, 2 the focus's node, 3 its offset
     if (!selRange) return which & 1 ? 0 : null;
     return lrGet(selRange.__r, selBackward ? which ^ 2 : which);
   }
-  function inDocument(node) { return rootOf(node) === doc; }
+  // Is the document a shadow-including inclusive ancestor of the node?
+  var composedRoot = { composed: true }, rootNodeOf = NP.getRootNode;
+  function inDocument(node) { return rootNodeOf.call(node, composedRoot) === doc; }
   attribute(SP, 'anchorNode', function () { selCheck(this); return selPoint(0); });
   attribute(SP, 'anchorOffset', function () { selCheck(this); return selPoint(1); });
   attribute(SP, 'focusNode', function () { selCheck(this); return selPoint(2); });

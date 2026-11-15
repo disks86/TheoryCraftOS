@@ -36,6 +36,7 @@ Optional<uint32_t> LiveRanges::add_range(Node* node, const void* owner) {
   r.start_offset = r.end_offset = 0;
   r.owner = owner;
   free_range_hint_ = id + 1;
+  if (id >= range_end_) range_end_ = id + 1;
   ++used_ranges_;
   return id;
 }
@@ -50,6 +51,7 @@ Optional<uint32_t> LiveRanges::add_iterator(Node* root, const void* owner) {
   it.before = true;
   it.owner = owner;
   free_iterator_hint_ = id + 1;
+  if (id >= iterator_end_) iterator_end_ = id + 1;
   ++used_iterators_;
   return id;
 }
@@ -59,6 +61,7 @@ void LiveRanges::remove_range(uint32_t id) {
   ranges_[id] = LiveRange{};
   --used_ranges_;
   if (id < free_range_hint_) free_range_hint_ = id;
+  while (range_end_ > 0 && !ranges_[range_end_ - 1].owner) --range_end_;
 }
 
 void LiveRanges::remove_iterator(uint32_t id) {
@@ -66,6 +69,7 @@ void LiveRanges::remove_iterator(uint32_t id) {
   iterators_[id] = LiveIterator{};
   --used_iterators_;
   if (id < free_iterator_hint_) free_iterator_hint_ = id;
+  while (iterator_end_ > 0 && !iterators_[iterator_end_ - 1].owner) --iterator_end_;
 }
 
 // "Live range pre-remove steps" and "NodeIterator pre-removing steps".
@@ -82,14 +86,14 @@ void LiveRanges::removing(Node* node) {
         offset = index;
       }
     };
-    for (LiveRange& r : ranges_.view()) {
+    for (LiveRange& r : ranges_.view().first(range_end_)) {
       if (!r.owner) continue;
       fix(r.start, r.start_offset);
       fix(r.end, r.end_offset);
     }
   }
   if (used_iterators_ == 0) return;
-  for (LiveIterator& it : iterators_.view()) {
+  for (LiveIterator& it : iterators_.view().first(iterator_end_)) {
     // (only a node inside the root that is the reference node or above it matters)
     if (!it.owner || node == it.root || !contains(node, it.reference) || !contains(it.root, node)) continue;
     if (it.before) {
@@ -122,7 +126,7 @@ void LiveRanges::inserted(Node* node) {
   Node* parent = node->parent;
   if (!parent || used_ranges_ == 0 || !node->next) return;   // (the last child: no boundary of the parent is after it)
   const uint32_t index = child_index(node);
-  for (LiveRange& r : ranges_.view()) {
+  for (LiveRange& r : ranges_.view().first(range_end_)) {
     if (!r.owner) continue;
     if (r.start == parent && r.start_offset > index) ++r.start_offset;
     if (r.end == parent && r.end_offset > index) ++r.end_offset;
@@ -137,7 +141,7 @@ void LiveRanges::data_replaced(Node* node, uint32_t offset, uint32_t count, uint
     if (o - offset <= count) o = offset;
     else o = o - count + added;
   };
-  for (LiveRange& r : ranges_.view()) {
+  for (LiveRange& r : ranges_.view().first(range_end_)) {
     if (!r.owner) continue;
     fix(r.start, r.start_offset);
     fix(r.end, r.end_offset);
@@ -157,7 +161,7 @@ void LiveRanges::text_split(Node* node, uint32_t offset, Node* tail) {
       ++o;
     }
   };
-  for (LiveRange& r : ranges_.view()) {
+  for (LiveRange& r : ranges_.view().first(range_end_)) {
     if (!r.owner) continue;
     fix(r.start, r.start_offset);
     fix(r.end, r.end_offset);
@@ -178,7 +182,7 @@ void LiveRanges::text_merging(Node* from, Node* into, uint32_t length) {
       o = length;
     }
   };
-  for (LiveRange& r : ranges_.view()) {
+  for (LiveRange& r : ranges_.view().first(range_end_)) {
     if (!r.owner) continue;
     fix(r.start, r.start_offset);
     fix(r.end, r.end_offset);
@@ -186,12 +190,12 @@ void LiveRanges::text_merging(Node* from, Node* into, uint32_t length) {
 }
 
 void LiveRanges::node_moved(Node* from, Node* to) {
-  for (LiveRange& r : ranges_.view()) {
+  for (LiveRange& r : ranges_.view().first(range_end_)) {
     if (!r.owner) continue;
     if (r.start == from) r.start = to;
     if (r.end == from) r.end = to;
   }
-  for (LiveIterator& it : iterators_.view()) {
+  for (LiveIterator& it : iterators_.view().first(iterator_end_)) {
     if (!it.owner) continue;
     if (it.root == from) it.root = to;
     if (it.reference == from) it.reference = to;
