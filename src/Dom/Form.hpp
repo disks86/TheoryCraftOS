@@ -142,6 +142,8 @@ enum ValidityBit : uint32_t {
 struct ValidityHooks {
   bool (*has_custom_error)(void* context, const Node* control) = nullptr;
   void* context = nullptr;
+  // The states of a control that is barred from validation too (disabled, read-only): a ValidityState tells them, :invalid and submission do not ask.
+  bool even_if_barred = false;
 };
 bool will_validate(const Node* control);   // is subject to constraints (not disabled, read-only, hidden, or a plain button)
 uint32_t validity(const Node* control, const ValidityHooks* hooks = nullptr);

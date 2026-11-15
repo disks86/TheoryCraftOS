@@ -55,8 +55,9 @@ dom::ValidityHooks hooks_for(DomBindings::Impl& c, bool (**fn)(void*, const dom:
 
 Value make_validity(DomBindings::Impl& c, dom::Node* n) {
   Vm& vm = c.vm;
-  const dom::ValidityHooks hooks = hooks_for(c, nullptr);
-  const uint32_t f = dom::will_validate(n) || c.owner.custom_validity(n, nullptr) ? dom::validity(n, &hooks) : 0;
+  dom::ValidityHooks hooks = hooks_for(c, nullptr);
+  hooks.even_if_barred = true;   // (validity.patternMismatch and the others are told for a disabled control too; it is willValidate that says it is not checked)
+  const uint32_t f = dom::validity(n, &hooks);
   JsObject* v = vm.new_plain();
   static const struct {
     const char* name;

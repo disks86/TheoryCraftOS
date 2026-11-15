@@ -1443,7 +1443,13 @@ bool valid_url(StringView v) {
 uint32_t validity(const Node* n, const ValidityHooks* hooks) {
   uint32_t flags = 0;
   if (hooks && hooks->has_custom_error && hooks->has_custom_error(hooks->context, n)) flags |= kCustomError;
-  if (!will_validate(n)) return flags;
+  if (!will_validate(n)) {
+    if (!hooks || !hooks->even_if_barred || !is_submittable(n) || n->is_tag("button")) return flags;
+    if (n->is_tag("input")) {
+      const InputType barred = input_type(n);
+      if (barred == InputType::Hidden || barred == InputType::Button || barred == InputType::Reset) return flags;
+    }
+  }
   allocators::IAllocator& a = n->owner->allocator();
   const bool required = has_attribute(n, "required");
   if (n->is_tag("select")) {
