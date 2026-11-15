@@ -35,6 +35,9 @@ uint32_t nt_tcos_access_check(Process& p, const SyscallRequest& r);
 bool caller_token_blob(Process& p, ByteBuffer& out);
 // The token of the process `pid` into `out` (the default token if it has none yet).
 bool process_token_blob(uint64_t pid, ByteBuffer& out);
+// Gives the process `pid`, before it runs, the elevated form of the user's token: what "run as administrator" does on Windows. The programs it starts
+// inherit it. False if there is no memory for it (the process then keeps the limited token).
+[[nodiscard]] bool elevate_process_token(uint64_t pid);
 // A new process (the child) starts with a copy of the token of its parent.
 void token_inherit(uint64_t parent_pid, uint64_t child_pid);
 // A thread has ended: its impersonation token is let go.

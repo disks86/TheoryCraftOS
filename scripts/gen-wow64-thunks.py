@@ -27,7 +27,7 @@ OUT = os.path.join(WINDOWS, "ntdll", "wow64_services.inc")
 
 # Written by hand in wow64.inc (the generated file leaves them out).
 SPECIAL = {"NtWaitForMultipleObjects", "NtCreateUserProcess", "NtQueryVirtualMemory", "NtQueryInformationProcess", "NtQueryInformationThread",
-           "NtGetContextThread", "NtSetContextThread", "NtContinue", "NtRaiseException", "NtQuerySystemInformation", "NtQueryObject"}
+           "NtGetContextThread", "NtSetContextThread", "NtContinue", "NtRaiseException", "NtQuerySystemInformation", "NtQueryObject", "NtTcosToken"}
 
 HANDLES = {"HANDLE", "HMODULE", "HINSTANCE", "HKEY"}
 SIGNED = {"LONG", "NTSTATUS", "INT", "int", "BOOL"}

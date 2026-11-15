@@ -32,12 +32,14 @@ build() {
   local lists="$w/stubs/$name.inc"
   [ -f "$lists" ] || { lists="$out/${name}_none.inc"; : > "$lists"; }      # (a library with no list of stubs)
   [ "$name" = ntdll ] && lists="$lists+$w/ntdll/wow64_unthunked.inc"      # (the services without a function of their own: see scripts/gen-wow64-thunks.py)
-  python3 scripts/gen-wow64-stubs.py "$name" "$lists" "$result" "$nm" "$mingw_lib" "$out/${name}_stubs.S"
+  python3 scripts/gen-wow64-stubs.py "$name" "$lists" "$result" "$nm" "$mingw_lib" "$out/${name}_stubs.S" "$w/$name/${name}32.implemented"
   $cc $flags -w -DSTUB_DLLMAIN -Wl,--image-base="$base" -Wl,--output-def="$out/$name.def" -o "$out/${name}_decorated.dll" $inputs "$out/${name}_stubs.S" $w/stubs/stubs.c -lgcc
   $dlltool -k -d "$out/$name.def" -D "$name.dll" -l "$out/lib$name.a"
   if [ -f "$w/$name/$name.def" ]; then      # (its forwarders and ordinals, with the names as this build has them)
     python3 scripts/gen-wow64-def.py "$w/$name/$name.def" "$out/$name.def" "$out/${name}_final.def"
     def="$out/${name}_final.def"
+    # (exports only the 32-bit library has: <dll>32.def, a list of lines for the EXPORTS section)
+    if [ -f "$w/$name/${name}32.def" ]; then grep -v '^;' "$w/$name/${name}32.def" >> "$out/${name}_final.def"; fi
   fi
   $cc $flags -DSTUB_DLLMAIN -Wl,--kill-at -Wl,--image-base="$base" -o "$out/$name.dll" $inputs $def "$out/${name}_stubs.S" $w/stubs/stubs.c -lgcc
   rm -f "$out/${name}_decorated.dll"

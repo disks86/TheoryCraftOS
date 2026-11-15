@@ -558,7 +558,7 @@ static void test_sqlite_and_catalog() {
     appman::WingetCatalog catalog(a);
     CHECK(catalog.parse_index(data_of(msix)));
     // 13 packages and 400 fillers; the one with the overlong name and the one with the bad identifier are left out.
-    CHECK(catalog.count() == 413);
+    CHECK(catalog.count() == 414);
     const appman::WingetPackage* tool = catalog.find("test.portable");      // (any case)
     CHECK(tool && tool->id.view().equals("Test.Portable") && tool->name.view().equals("Portable Tool") && tool->moniker.view().equals("ptool") && tool->version.view().equals("2.0"));
     CHECK(catalog.find("Allen&Heath.Mixer") && !catalog.find("Long.Name") && !catalog.find("Bad/Identifier") && !catalog.find("Test.Port"));
@@ -570,10 +570,10 @@ static void test_sqlite_and_catalog() {
     List<uint64_t> found(a);
     List<uint8_t> tiers(a);
     uint64_t total = 0;
-    CHECK(catalog.search("", 1000, &found, &total) && total == 413 && found.count() == 413);
+    CHECK(catalog.search("", 1000, &found, &total) && total == 414 && found.count() == 414);
     CHECK(catalog.search("ptool", 10, &found, &total, &tiers) && total == 1 && tiers[0] == 0 && catalog.at(found[0]).id.view().equals("Test.Portable"));
     CHECK(catalog.search("ZIP", 10, &found, &total, &tiers) && total == 1 && catalog.at(found[0]).name.view().equals("Zip Suite") && tiers[0] == 0);
-    CHECK(catalog.search("test.", 100, &found, &total, &tiers) && total == 12 && tiers[0] == 2);      // (identifiers only)
+    CHECK(catalog.search("test.", 100, &found, &total, &tiers) && total == 13 && tiers[0] == 2);      // (identifiers only)
     CHECK(catalog.search("filler 39", 5, &found, &total, &tiers) && total == 14 && found.count() == 5 && catalog.at(found[0]).name.view().equals("Filler 390") && tiers[0] == 0);      // (both words anywhere; the names that start with the query first)
     CHECK(catalog.search("39 filler", 100, &found, &total, &tiers) && total == 14 && tiers[0] == 2 && catalog.at(found[0]).name.view().equals("Filler 039"));
     CHECK(catalog.search("no such thing", 5, &found, &total) && total == 0 && found.count() == 0);
@@ -611,7 +611,7 @@ static void test_sqlite_and_catalog() {
       if (columns.size() >= 8 && columns[2].text().size() > r.longest) r.longest = columns[2].text().size();
       return columns.size() == 8 && columns[0].kind == appman::SqliteValue::Kind::Null && columns[7].kind == appman::SqliteValue::Kind::Blob && columns[7].bytes.size() == 32;
     }, &rows));
-    CHECK(rows.count == 415 && rows.longest == 6000 && rows.ordered);
+    CHECK(rows.count == 416 && rows.longest == 6000 && rows.ordered);
     const std::string database = sv(StringView(db.view()));
     for (const std::string& junk : {std::string(), std::string("SQLite format 3"), std::string(4096, '\0'), database.substr(0, 100)}) {
       appman::WingetCatalog c(a);
@@ -1086,6 +1086,16 @@ static void test_winget_setup_programs() {
     CHECK(run(installer.install(package("Test.Msi"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("Windows Installer"));
     CHECK(run(installer.install(package("Test.Setup32"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("32-bit"));
     CHECK(host.runs.empty() && temp_empty() && installer.list_installed(&apps) && apps.count() == 0);
+    // A 32-bit setup program of Nullsoft's kind is run (and so is its uninstaller, which is 32-bit too); the Inno Setup one above was refused.
+    host.app = "Nsis App";
+    host.key = "Nsis App";
+    host.version = "3.1";
+    CHECK(run(installer.install(package("Test.Nsis32"), &progress, &detail), appman::Result::Ok));
+    CHECK(host.runs.size() == 1 && host.runs[0] == "/Windows/Windows/Temp/WinGet/Test.Nsis32.3.1/nsis32.exe|/S" && temp_empty());
+    CHECK(read_ram(fs, "/AppStore/AppMan/Winget/Test.Nsis32.txt").find("InstallerType: nullsoft\n") != std::string::npos && installer.installed("Test.Nsis32"));
+    CHECK(run(installer.remove("Test.Nsis32", &detail), appman::Result::Ok) && host.runs.size() == 2 && host.runs[1] == "/Windows/Program Files/Nsis App/unins000.exe|/S");
+    CHECK(!installer.installed("Test.Nsis32") && installer.list_installed(&apps) && apps.count() == 0);
+    host.runs.clear();
     // A setup program that fails, one that cannot be started, one that is cancelled while it runs.
     host.app = "Setup Program";
     host.key = "Setup Program_is1";

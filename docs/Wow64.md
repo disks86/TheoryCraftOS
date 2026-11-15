@@ -33,9 +33,14 @@ it, the 32-bit TEB the program sees (the FS base). The kernel fills in what code
 pointer, the exception chain's end, and the thread-local storage pointer. The 32-bit PEB, process parameters and loader lists are the 32-bit ntdll's
 to make, from the 64-bit ones.
 
+**What a 32-bit program is told about itself.** As under WOW64: `IsWow64Process` says yes (`ProcessWow64Information` is nonzero for the calling
+process), `GetSystemInfo` describes a 32-bit processor and `GetNativeSystemInfo` the real one, and turning file-system redirection off and on
+succeeds (nothing is redirected here: System32 is System32 for a 32-bit program too, and its libraries are found in SysWOW64 by the loader).
+
 **Loading.** `bind_executable` gives a PE32/i386 program the architecture `UserArch::X86_32`. The image loader and the module loader map PE32 images
 in a 32-bit address space: 32-bit import slots, image base, security cookie, TLS directory. A 32-bit program's libraries are the 32-bit ones, from
-`C:\Windows\SysWOW64` (`ILibraryProvider::find_32bit`).
+`C:\Windows\SysWOW64` (`ILibraryProvider::find_32bit`); a library it loads by its path while it runs (a setup program's plug-in in a folder of
+temporary files) is that file.
 
 **The libraries.** The sources of the libraries (src/Windows) are built a second time, for i386, into `C:\Windows\SysWOW64`
 (scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32,
@@ -84,6 +89,9 @@ comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32.
   - msvcrt.dll has the handlers of the Microsoft compilers' `__try` frames (src/Windows/msvcrt/seh32.inc): `_except_handler3`,
     `_except_handler4_common`, `_local_unwind2/4`, `_global_unwind2`, `_abnormal_termination`. A program that links the C runtime statically
     brings its own and needs only `RtlUnwind`.
+  - msvcrt.dll also has the 32-bit compiler's **C++ exceptions**: `_CxxThrowException` and `__CxxFrameHandler` (try blocks, catch by type, by
+    reference and `catch (...)`, the destructors of the function's objects, `throw;`), and the operators and data an old C++ library imports
+    (`operator new` and `delete`, `type_info`'s destructor, `_adjust_fdiv`; their compiler-made names are in src/Windows/msvcrt/msvcrt32.def).
 
 ## Status
 
@@ -115,12 +123,14 @@ Not done yet, in the order planned:
 2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; information classes with
    pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; a 32-bit program cannot start another program
    (`RtlCreateProcessParameters` writes the 64-bit layout); `%p` prints 16 digits; the old runtime's `_iob` array has the wrong stride.
-3. **What exceptions still lack**: C++ exceptions of the Microsoft runtime (`__CxxFrameHandler`, `_CxxThrowException`: msvcrt.dll has neither, for
-   64-bit programs either); the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
+3. **What exceptions still lack**: C++ exceptions are there for 32-bit programs only (a 64-bit msvcrt.dll has neither `__CxxFrameHandler` nor
+   `_CxxThrowException`), without exception specifications and without tests of their own (a real setup program's plug-in is what has run them);
+   the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
    debugged (no debug events for it); a stack overflow ends the program (no guard-page exception on the 32-bit stack).
-4. **Setup programs**: the App Manager still refuses 32-bit setup programs (docs/AppManager.md). The libraries they import are there and a
-   program like tests/windows/gui32.c runs; no real setup program has been run yet. oleaut32 parses numbers exactly only up to 2^62 in a 32-bit
-   program (i386 has no 128-bit integers).
+4. **Setup programs**: Nullsoft (NSIS) setup programs run when they install without showing themselves, and the App Manager runs them
+   (docs/AppManager.md): Notepad++'s and qBittorrent's have installed in QEMU, with their uninstallers and plug-in libraries. Inno Setup's have
+   not been run - they make windows even when silent, and lean on what item 1 lists - and the App Manager still refuses them. oleaut32 parses
+   numbers exactly only up to 2^62 in a 32-bit program (i386 has no 128-bit integers).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Tests

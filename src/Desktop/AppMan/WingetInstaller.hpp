@@ -35,7 +35,7 @@
 //                        for it; find the latest version's manifest in it;
 //                     2. fetch that manifest and check it against the SHA-256 the version list has for it. It says what to download for which kind
 //                        of computer, the SHA-256 of that, and how it is installed;
-//                     3. choose the installer for this computer (x64, else neutral: 32-bit programs do not run here yet) among the kinds that need no
+//                     3. choose the installer for this computer (x64, else neutral: 32-bit applications are not offered yet) among the kinds that need no
 //                        setup program to be run:
 //                        a "portable" program (one .exe) or a "zip" archive of portable programs;
 //                     4. download it into the package's folder (through a .part file) and check its SHA-256 - so every byte that is installed is the
@@ -60,8 +60,8 @@
 //   remove:   runs the recorded uninstall command (with the quiet switches of its kind, unless it is the registry's QuietUninstallString), then
 //             forgets the package.
 //
-// Packages of other kinds (MSI, MSIX, WiX Burn, ...), setup programs for another processor (most NSIS and Inno Setup programs are 32-bit, which this
-// system does not run yet), and "exe" installers without a silent switch are refused: Result::NotSupported, with the reason in the detail. Calls block:
+// Packages of other kinds (MSI, MSIX, WiX Burn, ...), setup programs this system cannot run (a 32-bit Nullsoft setup program is run; a 32-bit Inno Setup
+// or "exe" one is not yet: docs/Wow64.md), and "exe" installers without a silent switch are refused: Result::NotSupported, with the reason in the detail. Calls block:
 // run them on a thread of their own.
 namespace desktop::appman {
 
@@ -154,6 +154,7 @@ class WingetInstaller {
   bool read_setup_record(StringView id, WingetInstalled* app, SetupRecord* record) const;
   bool setup_record_path(StringView id, String* out) const;
   bool is_for_this_processor(StringView path) const;
+  bool setup_program_runs(StringView path, StringView type) const;
   bool folder_of(StringView id, String* out) const;
   bool read_record(StringView id, WingetInstalled* app, List<String>* shortcuts) const;
   void remove_shortcuts(const List<String>& shortcuts);

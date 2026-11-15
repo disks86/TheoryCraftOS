@@ -1,0 +1,6 @@
+; Exports that stubs/msvcrt.inc lists as not implemented and that the 32-bit msvcrt.dll does have (src/Windows/msvcrt/seh32.inc): the stub generator of
+; the i386 build (scripts/gen-wow64-stubs.py) leaves these out.
+_CxxThrowException
+__CxxFrameHandler
+__CxxFrameHandler2
+__CxxFrameHandler3

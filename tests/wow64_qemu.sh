@@ -2,7 +2,7 @@
 # 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Four programs, each started by the kernel's autorun in a boot of its own:
 #   hello32  tests/windows/hello32.c: PE32 for i386 with no libraries. It runs in the CPU's compatibility mode and calls the NT services through INT 2E.
 #   crt32    tests/windows/crt32.c: built the ordinary way, with a C runtime; it runs on the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll of
-#            C:\Windows\SysWOW64 (the heap, files, the environment, thread-local storage, threads).
+#            C:\Windows\SysWOW64 (the heap, files, the environment, thread-local storage, threads, a library loaded while it runs).
 #   seh32    tests/windows/seh32.c: exceptions - faults delivered with an i386 CONTEXT, the handlers at FS:[0], RtlUnwind, _except_handler3.
 #   gui32    tests/windows/gui32.c: the other libraries - the registry, the shell's folders, a shortcut through COM, and a window with its messages.
 # Passes if all the checks of each pass and the autorun sees exit code 42. Uses its own build folder (build-wow64-qemu) so the normal build keeps no
@@ -17,14 +17,15 @@ programs=("$@")
 [ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
+i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
 i686-w64-mingw32-gcc -O1 -o "$work/seh32.exe" tests/windows/seh32.c
 i686-w64-mingw32-gcc -O1 -o "$work/gui32.exe" tests/windows/gui32.c -ladvapi32 -luser32 -lgdi32 -lshell32 -lole32 -lcomctl32 -luuid
 status=0
 for program in "${programs[@]}"; do
-  cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" >/dev/null
+  cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" -DTCOS_AUTORUN_ARGUMENTS= -DTCOS_AUTORUN_ELEVATED=OFF >/dev/null      # (no arguments, not elevated: whatever an earlier build of this folder had)
   cmake --build "$build" >/dev/null
   cmake --build "$build" --target vars >/dev/null
-  "$build/tools/primary_image" "$build/primary.img" "file:/Windows/$program.exe=$work/$program.exe" >/dev/null
+  "$build/tools/primary_image" "$build/primary.img" "file:/Windows/$program.exe=$work/$program.exe" "file:/Windows/plug32.dll=$work/plug32.dll" >/dev/null
   qemu=$(ninja -C "$build" -t commands run-std | tail -1)
   qemu=$(sed -E 's/-audiodev [a-z]+,/-audiodev none,/' <<< "$qemu")
   rm -f "$build/debugcon.log"

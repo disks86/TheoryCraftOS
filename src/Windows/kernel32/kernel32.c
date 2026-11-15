@@ -677,7 +677,19 @@ EXPORT BOOL WINAPI GetVersionExA(LPOSVERSIONINFOA v) {
 static ULONGLONG get64(const BYTE *p) { ULONGLONG v; memcpy(&v, p, 8); return v; }
 static DWORD get32(const BYTE *p) { DWORD v; memcpy(&v, p, 4); return v; }
 static WORD get16(const BYTE *p) { WORD v; memcpy(&v, p, 2); return v; }
+#ifdef __i386__
+EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info);
+EXPORT void WINAPI GetNativeSystemInfo(LPSYSTEM_INFO info);
+static void system_info_native(LPSYSTEM_INFO info);
+static void system_info(LPSYSTEM_INFO info, BOOL native) {
+  system_info_native(info);
+  info->lpMaximumApplicationAddress = (LPVOID)0x7FFEFFFFu;      /* (what a 32-bit program can address) */
+  if (!native) { info->wProcessorArchitecture = 0; info->dwProcessorType = 586; }      /* PROCESSOR_ARCHITECTURE_INTEL, PROCESSOR_INTEL_PENTIUM */
+}
+static void system_info_native(LPSYSTEM_INFO info) {
+#else
 EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info) {
+#endif
   memset(info, 0, sizeof(*info));
   BYTE basic[64] = {}, processor[16] = {};
   info->wProcessorArchitecture = 9;      /* PROCESSOR_ARCHITECTURE_AMD64 */
@@ -703,7 +715,14 @@ EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info) {
     info->wProcessorRevision = get16(processor + 4);
   }
 }
+#ifdef __i386__
+/* A 32-bit program is told of a 32-bit processor by GetSystemInfo, and of the real one here. */
+static void system_info(LPSYSTEM_INFO info, BOOL native);
+EXPORT void WINAPI GetSystemInfo(LPSYSTEM_INFO info) { system_info(info, FALSE); }
+EXPORT void WINAPI GetNativeSystemInfo(LPSYSTEM_INFO info) { system_info(info, TRUE); }
+#else
 EXPORT void WINAPI GetNativeSystemInfo(LPSYSTEM_INFO info) { GetSystemInfo(info); }
+#endif
 EXPORT BOOL WINAPI GlobalMemoryStatusEx(LPMEMORYSTATUSEX m) {
   if (m->dwLength < sizeof(MEMORYSTATUSEX)) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }
   BYTE basic[64] = {}, performance[312] = {};

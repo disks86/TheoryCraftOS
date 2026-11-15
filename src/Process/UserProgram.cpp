@@ -50,6 +50,11 @@ class SingleFileProvider final : public ILibraryProvider {
     if (canonical_name.equals(name_)) { *image = file_; return true; }
     return fallback_ && fallback_->find(canonical_name, image);
   }
+  // (a 32-bit program's LoadLibrary: the file it found is the library, and what that imports are 32-bit libraries)
+  bool find_32bit(StringView canonical_name, ConstByteView* image) override {
+    if (canonical_name.equals(name_)) { *image = file_; return true; }
+    return fallback_ && fallback_->find_32bit(canonical_name, image);
+  }
   bool directory_of(StringView canonical_name, String* windows_directory) override { return !canonical_name.equals(name_) && fallback_ && fallback_->directory_of(canonical_name, windows_directory); }
 
  private:

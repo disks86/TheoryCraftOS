@@ -107,6 +107,20 @@ int main(void) {
   check(RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\TheoryCraftOS\\gui32") == ERROR_SUCCESS &&
         RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\TheoryCraftOS\\gui32", 0, KEY_READ, &key) == ERROR_FILE_NOT_FOUND, "RegDeleteKeyW");
 
+  /* The process's token: what a setup program asks to see whether it runs as an administrator. */
+  HANDLE token = NULL;
+  DWORD elevation_type = 0, token_size = 0;
+  check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) && token != NULL, "OpenProcessToken of the current process");
+  check(GetTokenInformation(token, TokenElevationType, &elevation_type, sizeof(elevation_type), &token_size) && token_size == sizeof(elevation_type) &&
+        elevation_type >= TokenElevationTypeDefault && elevation_type <= TokenElevationTypeLimited, "GetTokenInformation(TokenElevationType)");
+  SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
+  PSID administrators = NULL;
+  BOOL member = FALSE;
+  check(AllocateAndInitializeSid(&nt_authority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &administrators) &&
+        CheckTokenMembership(NULL, administrators, &member) && member, "CheckTokenMembership: the user is an administrator");
+  if (administrators) FreeSid(administrators);
+  if (token) CloseHandle(token);
+
   /* Strings of user32. */
   WCHAR formatted[64];
   const int written = wsprintfW(formatted, L"%s-%d-%x", L"abc", 42, 0xBEEF);

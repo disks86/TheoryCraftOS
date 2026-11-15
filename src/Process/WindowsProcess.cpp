@@ -561,8 +561,9 @@ uint32_t nt_query_information_process(Process& p, const SyscallRequest& r) {
   } else if (info_class == 18 && !self) {      // ProcessPriorityClass of another program
     b.put(1, nt_priority_class(remote_priority), 1);
     size = 2;
-  } else if (info_class == 26 || info_class == 24) {      // ProcessWow64Information: not a 32-bit process; ProcessSessionInformation: session 1 (the one in the PEB)
+  } else if (info_class == 26 || info_class == 24) {      // ProcessWow64Information: nonzero for a 32-bit process; ProcessSessionInformation: session 1 (the one in the PEB)
     if (info_class == 24) b.put(0, 1, 4);
+    else if (self && p.arch() == UserArch::X86_32) b.put(0, 1, 8);      // (asked of itself: another process's width is not known here, and reads as 64-bit)
     size = info_class == 24 ? 4 : 8;
   } else if (!self && (info_class == 2 || info_class == 3 || info_class == 4)) {      // another program's I/O counters (none counted), memory and times
     if (info_class == 3) {

@@ -30,6 +30,7 @@
 #include "Process/ProgramEnvironment.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/UserProgram.hpp"
+#include "Process/WindowsTokens.hpp"
 #include "Program/EmulatedTask.hpp"
 #include "Utility/ByteBuffer.hpp"
 
@@ -285,6 +286,8 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
     }
     return RunResult::CouldNotRun;
   }
+  // (before its first instruction: the token is what the program asks about itself at once. Without memory for it the program runs with the limited token.)
+  if (run.elevated && run.kind == exe::ExecutableKind::Pe && program.process()) (void)process::windowsabi::elevate_process_token(program.process()->id());
 
   // How it ended, whichever way it ran.
   uint32_t code = 0;

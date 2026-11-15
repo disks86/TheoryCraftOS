@@ -1,0 +1,8 @@
+; msvcrt.dll for i386 only (docs/Wow64.md): exports whose names are those of the 32-bit Microsoft C++ compiler, which the C code cannot spell. Added to
+; msvcrt.def by scripts/build-wow64-dlls.sh. The functions are in src/Windows/msvcrt/seh32.inc.
+"??2@YAPAXI@Z" = msvcrt_operator_new
+"??3@YAXPAX@Z" = msvcrt_operator_delete
+"??_U@YAPAXI@Z" = msvcrt_operator_new
+"??_V@YAXPAX@Z" = msvcrt_operator_delete
+"??1type_info@@UAE@XZ" = msvcrt_type_info_destroy
+_adjust_fdiv = msvcrt_adjust_fdiv DATA

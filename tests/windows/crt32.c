@@ -130,6 +130,32 @@ int main(int argc, char **argv) {
   Sleep(30);
   check(GetTickCount() - before >= 20, "Sleep");
 
+  /* A library loaded while the program runs, by its full path, from a folder that is not the system's (plug32.dll: tests/windows/plug32.c). */
+  CreateDirectoryA("C:\\Windows\\Temp\\crt32.tmp", NULL);
+  check(CopyFileA("C:\\plug32.dll", "C:\\Windows\\Temp\\crt32.tmp\\plug32.dll", FALSE), "the library is copied to a temporary folder");
+  HMODULE plugin = LoadLibraryExA("C:\\Windows\\Temp\\crt32.tmp\\plug32.dll", NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+  check(plugin != NULL, "LoadLibraryEx by full path");
+  if (plugin) {
+    void (__cdecl *entry)(HWND, int, char *, void **, void *) = (void (__cdecl *)(HWND, int, char *, void **, void *))(void *)GetProcAddress(plugin, "_");
+    int (__stdcall *twice)(int) = (int (__stdcall *)(int))(void *)GetProcAddress(plugin, "Twice@4");
+    int answer = 0;
+    if (entry) entry(NULL, 24, NULL, NULL, &answer);
+    check(entry != NULL && answer == 1025, "its cdecl function is found by GetProcAddress and called (and its entry point had run)");
+    check(twice != NULL && twice(21) == 42, "and its stdcall function");
+    check(FreeLibrary(plugin), "FreeLibrary");
+  }
+  DeleteFileA("C:\\Windows\\Temp\\crt32.tmp\\plug32.dll");
+  RemoveDirectoryA("C:\\Windows\\Temp\\crt32.tmp");
+
+  /* What a 32-bit program is told about itself and the machine: it runs "under WOW64" on a 64-bit processor. */
+  BOOL wow = FALSE;
+  SYSTEM_INFO own, native;
+  GetSystemInfo(&own);
+  GetNativeSystemInfo(&native);
+  check(IsWow64Process(GetCurrentProcess(), &wow) && wow, "IsWow64Process says so");
+  check(own.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL && native.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 &&
+        (UINT_PTR)own.lpMaximumApplicationAddress < 0x80000000u && own.dwPageSize == 4096, "GetSystemInfo is a 32-bit processor's, GetNativeSystemInfo the real one's");
+
   printf(g_failed == 0 ? "crt32: all %d checks passed\n" : "crt32: %d checks passed, some FAILED\n", g_passed);
   fflush(stdout);
   return g_failed == 0 ? 42 : 1;

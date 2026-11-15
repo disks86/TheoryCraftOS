@@ -51,6 +51,9 @@ struct ProgramRun {
   // itself and ends at once): the run is over when the last of them is. Ctrl+C ends them too. Without this they go on by themselves - and must not, when the
   // caller's `host` or `files` end with the call.
   bool wait_for_descendants = false;
+  // A Windows program gets the elevated form of the user's token - it is run "as administrator", as a setup program wants to be (many refuse to go on
+  // otherwise, and would ask Windows to start them again elevated). The programs it starts inherit that.
+  bool elevated = false;
 };
 
 static constexpr uint64_t kMaxEnvironment = 512;

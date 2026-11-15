@@ -193,8 +193,8 @@ StringView key_leaf(StringView key) {
   return slash == StringView::npos ? key : key.substr(slash + 1);
 }
 
-// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run (32-bit x86 programs among them: the Windows layer runs
-// 64-bit programs only so far).
+// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run. 32-bit x86 programs are among those: the Windows layer
+// runs them only in part so far (docs/Wow64.md), which is enough for a setup program of a 64-bit package but not to offer 32-bit applications.
 int architecture_rank(StringView architecture) {
   if (equals_folded(architecture, "x64")) return 0;
   if (equals_folded(architecture, "neutral")) return 1;
@@ -483,6 +483,21 @@ bool WingetInstaller::is_for_this_processor(StringView path) const {
   if (!head.put_zeros(size) || file->read(0, head.writable_view(), &got) != Status::Ok || got > size) return false;
   const ConstByteView bytes = head.view().first(got);
   return exe::identify_executable(bytes) == exe::ExecutableKind::Pe && exe::identify_architecture(bytes) == exe::Architecture::X86_64;
+}
+
+// Can the setup program (or uninstaller) at `path`, of a package of installer type `type`, be run here? A 64-bit Windows program can. A 32-bit one
+// (most setup programs are, whatever they install) can if it is of a kind that has been run here: Nullsoft's (docs/Wow64.md). The window system of
+// 32-bit programs is not whole yet, and the other kinds lean on it more.
+bool WingetInstaller::setup_program_runs(StringView path, StringView type) const {
+  if (is_for_this_processor(path)) return true;
+  UniquePointer<filesystem::IFile> file;
+  if (files_.open_file(path, filesystem::OpenMode::Read, &file) != Status::Ok) return false;
+  ByteBuffer head(allocator_);
+  const uint64_t size = file->size() < exe::kIdentifyBytes ? file->size() : exe::kIdentifyBytes;
+  uint64_t got = 0;
+  if (!head.put_zeros(size) || file->read(0, head.writable_view(), &got) != Status::Ok || got > size) return false;
+  const ConstByteView bytes = head.view().first(got);
+  return exe::identify_executable(bytes) == exe::ExecutableKind::Pe && exe::identify_architecture(bytes) == exe::Architecture::X86_32 && equals_folded(type, "nullsoft");
 }
 
 bool WingetInstaller::list_installed(List<WingetInstalled>* apps) const {
@@ -862,9 +877,9 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
     detail->assign(entry.url.view());
     return finish(Result::BadChecksum);
   }
-  if (!is_for_this_processor(program.view())) {
+  if (!setup_program_runs(program.view(), entry.type.view())) {
     const bool windows_program = exe::identify_executable_file(files_, program.view()) == exe::ExecutableKind::Pe;
-    detail->assign(windows_program ? "its setup program is a 32-bit program (or one for another processor), which cannot be run here yet" : "its setup program is not a Windows program");
+    detail->assign(windows_program ? "its setup program is a 32-bit program of a kind that cannot be run here yet (or one for another processor)" : "its setup program is not a Windows program");
     return finish(windows_program ? Result::NotSupported : Result::NotAnAppImage);
   }
 
@@ -971,8 +986,8 @@ Result WingetInstaller::remove_setup(StringView id, const SetupRecord& record, S
   if (!exists(files_, program.view())) {      // (it was uninstalled some other way: nothing is left to do but forget it)
     return files_.remove(record_path.view()) == Status::Ok ? Result::Ok : Result::FileError;
   }
-  if (!is_for_this_processor(program.view())) {
-    detail->assign("its uninstaller is a 32-bit program (or one for another processor), which cannot be run here yet");
+  if (!setup_program_runs(program.view(), record.type.view())) {
+    detail->assign("its uninstaller is a 32-bit program of a kind that cannot be run here yet (or one for another processor)");
     return Result::NotSupported;
   }
   List<StringView> arguments(allocator_);

@@ -1392,18 +1392,6 @@ EXPORT NTSTATUS NTAPI NtTcosOpenGl(void * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosOpenGl(void * a0) { return NtTcosOpenGl(a0); }
-EXPORT NTSTATUS NTAPI NtTcosToken(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4, ULONG_PTR a5) {
-  ULONG64 v[6] = {0};
-  v[0] = (ULONG64)(ULONG_PTR)a0;
-  v[1] = (ULONG64)(ULONG_PTR)a1;
-  v[2] = (ULONG64)(ULONG_PTR)a2;
-  v[3] = (ULONG64)(ULONG_PTR)a3;
-  v[4] = (ULONG64)(ULONG_PTR)a4;
-  v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosToken, v);
-  return status;
-}
-EXPORT NTSTATUS NTAPI ZwTcosToken(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4, ULONG_PTR a5) { return NtTcosToken(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtTerminateJobObject(HANDLE a0, NTSTATUS a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);

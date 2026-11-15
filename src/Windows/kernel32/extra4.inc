@@ -1032,9 +1032,15 @@ EXPORT BOOL WINAPI GetProcessorSystemCycleTime(USHORT group, PVOID information, 
 }
 EXPORT BOOL WINAPI CheckTokenCapability(HANDLE token, PVOID capability, PBOOL has) { (void)token; (void)capability; if (!has) { set_error(ERROR_INVALID_PARAMETER); return FALSE; } *has = FALSE; return TRUE; }
 EXPORT BOOL WINAPI GetThreadSelectorEntry(HANDLE thread, DWORD selector, PVOID entry) { (void)thread; (void)selector; (void)entry; set_error(ERROR_NOT_SUPPORTED); return FALSE; }      /* (no descriptor tables to read on x64) */
+#ifdef __i386__      /* (a 32-bit program: nothing is redirected here - System32 is System32 for it too - so turning that off and on again succeeds) */
+EXPORT BOOL WINAPI Wow64DisableWow64FsRedirection(PVOID *old) { if (old) *old = NULL; return TRUE; }
+EXPORT BOOLEAN WINAPI Wow64EnableWow64FsRedirection(BOOLEAN enable) { (void)enable; return TRUE; }
+EXPORT BOOL WINAPI Wow64RevertWow64FsRedirection(PVOID old) { (void)old; return TRUE; }
+#else
 EXPORT BOOL WINAPI Wow64DisableWow64FsRedirection(PVOID *old) { (void)old; set_error(ERROR_INVALID_FUNCTION); return FALSE; }      /* (a 64-bit process, as on 64-bit Windows) */
 EXPORT BOOLEAN WINAPI Wow64EnableWow64FsRedirection(BOOLEAN enable) { (void)enable; set_error(ERROR_INVALID_FUNCTION); return FALSE; }
 EXPORT BOOL WINAPI Wow64RevertWow64FsRedirection(PVOID old) { (void)old; set_error(ERROR_INVALID_FUNCTION); return FALSE; }
+#endif
 EXPORT BOOL WINAPI Wow64GetThreadContext(HANDLE thread, PVOID context) { (void)thread; (void)context; set_error(ERROR_INVALID_FUNCTION); return FALSE; }
 EXPORT BOOL WINAPI Wow64SetThreadContext(HANDLE thread, const void *context) { (void)thread; (void)context; set_error(ERROR_INVALID_FUNCTION); return FALSE; }
 EXPORT BOOL WINAPI Wow64GetThreadSelectorEntry(HANDLE thread, DWORD selector, PVOID entry) { (void)thread; (void)selector; (void)entry; set_error(ERROR_INVALID_FUNCTION); return FALSE; }

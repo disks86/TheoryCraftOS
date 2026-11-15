@@ -663,7 +663,8 @@ EXPORT BOOL WINAPI GetSystemRegistryQuota(PDWORD allowed, PDWORD used) {
   if (used) *used = 0x180000;
   return TRUE;
 }
-/* Nothing here runs under WOW64: the machine of a program is "unknown" (it is the native one), the native machine is x86-64. */
+/* A 32-bit program is one "under WOW64" (docs/Wow64.md): its machine is i386. Any other program's machine is "unknown" (it is the native one), and the
+ * native machine is x86-64. */
 EXPORT BOOL WINAPI IsWow64Process(HANDLE process, PBOOL wow64) {
   ULONG_PTR information = 0;
   const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
@@ -675,7 +676,7 @@ EXPORT BOOL WINAPI IsWow64Process2(HANDLE process, USHORT *machine, USHORT *nati
   ULONG_PTR information = 0;
   const NTSTATUS status = NtQueryInformationProcess(process, 26 /* ProcessWow64Information */, &information, sizeof(information), NULL);
   if (!NT_SUCCESS(status)) return fail_nt(status);
-  if (machine) *machine = 0;      /* IMAGE_FILE_MACHINE_UNKNOWN */
+  if (machine) *machine = information ? 0x014C : 0;      /* IMAGE_FILE_MACHINE_I386, or IMAGE_FILE_MACHINE_UNKNOWN */
   if (native_machine) *native_machine = 0x8664;      /* IMAGE_FILE_MACHINE_AMD64 */
   return TRUE;
 }

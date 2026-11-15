@@ -102,11 +102,37 @@ EXPORT NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE process, PVOID address, ULONG 
   return status;
 }
 
+/* The token service (token.c, advapi32): one call with an operation and five numbers, which are handles, sizes and addresses by the operation. A
+ * handle keeps its sign (the current process and thread are -1 and -2); the operations that give a handle back write 64 bits, here into a copy. */
+#include "../tcos_token.h"
+EXPORT NTSTATUS NTAPI NtTcosToken(ULONG operation, ULONG_PTR a, ULONG_PTR b, ULONG_PTR c, ULONG_PTR d, ULONG_PTR e) {
+  ULONG64 v[6] = {operation, (ULONG64)(LONG64)(LONG_PTR)a, (ULONG64)(LONG64)(LONG_PTR)b, (ULONG64)(LONG64)(LONG_PTR)c, (ULONG64)(LONG64)(LONG_PTR)d, (ULONG64)(LONG64)(LONG_PTR)e};
+  ULONG64 handle = 0;
+  ULONG_PTR *out = NULL;
+  switch (operation) {
+    case TCOS_TOKEN_CREATE: out = (ULONG_PTR *)e; if (out) v[5] = WOW_POINTER(&handle); break;
+    case TCOS_TOKEN_OPEN_PROCESS: case TCOS_TOKEN_OPEN_THREAD: out = (ULONG_PTR *)c; if (out) v[3] = WOW_POINTER(&handle); break;
+    case TCOS_TOKEN_CALLER: out = (ULONG_PTR *)a; if (out) v[1] = WOW_POINTER(&handle); break;
+    default: break;
+  }
+  const NTSTATUS status = wow_service(NT_SERVICE_NtTcosToken, v);
+  if (out && status >= 0) *out = (ULONG_PTR)handle;
+  return status;
+}
+
 static PEB *g_wow_peb;      /* the 32-bit PEB (wow64_start_process) */
 
 /* ProcessBasicInformation (class 0) and ThreadBasicInformation (class 0) have pointer-sized fields - and name the PEB and the TEB, which for a 32-bit
  * program are the 32-bit ones. The other classes are passed as they are. */
 EXPORT NTSTATUS NTAPI NtQueryInformationProcess(HANDLE process, ULONG information_class, PVOID buffer, ULONG size, PULONG returned) {
+  /* A class whose answer is one pointer-sized value (the debug port, "is it a 32-bit process", the debug object): 8 bytes in the kernel, 4 here. */
+  if ((information_class == 7 || information_class == 26 || information_class == 30) && size == sizeof(ULONG_PTR) && buffer) {
+    ULONG64 wide = 0;
+    const ULONG64 v[5] = {WOW_HANDLE(process), information_class, WOW_POINTER(&wide), sizeof(wide), 0};
+    const NTSTATUS status = wow_service(NT_SERVICE_NtQueryInformationProcess, v);
+    if (status >= 0) { *(ULONG_PTR *)buffer = (ULONG_PTR)wide; if (returned) *returned = sizeof(ULONG_PTR); }
+    return status;
+  }
   /* (48 bytes: these libraries' own callers, which were written for the 64-bit record and read it as such) */
   if (information_class != 0 || size == 48) {
     const ULONG64 v[5] = {WOW_HANDLE(process), information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};

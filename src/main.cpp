@@ -2387,6 +2387,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
         const StringView name(TCOS_AUTORUN);      // (a Windows program by its .exe; anything else is taken for a Linux one)
         run.kind = name.ends_with(".exe") || name.ends_with(".EXE") ? exe::ExecutableKind::Pe : exe::ExecutableKind::Elf;
         run.output = [](void*, StringView text) { console::puts(text); };
+#ifdef TCOS_AUTORUN_ELEVATED
+        run.elevated = true;      // (as an administrator, the way the App Manager runs a setup program)
+#endif
         console::puts("autorun: starting " TCOS_AUTORUN "\n");
         uint32_t code = 0;
         String message(*a.allocator);

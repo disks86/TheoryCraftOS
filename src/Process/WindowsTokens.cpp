@@ -65,20 +65,26 @@ ConstByteView bytes_of(const TcosTokenBlob& header) {
   return ConstByteView(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
 }
 
-// Builds the token of the system's user: an administrator in a session of its own, elevated.
-bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
+// Builds the token of the system's user, an administrator in a session of its own. As on Windows it comes in two forms: the limited one every program
+// starts with (medium integrity, a standard user's privileges), and the elevated one (high integrity, an administrator's privileges) that a program run
+// "as administrator" has - here: a setup program the App Manager runs. Each names the other as its linked token (ntdll makes that one when asked).
+bool make_default_blob(ByteBuffer& out, uint64_t token_id, bool elevated = false) {
   const SidBuf user = make_sid(5, {21, 0, 0, 0, 1000});
   const SidBuf group = make_sid(5, {21, 0, 0, 0, 513});
   struct G { SidBuf sid; uint32_t attrs; };
   const G groups[] = {
       {make_sid(5, {21, 0, 0, 0, 513}), 7}, {make_sid(1, {0}), 7}, {make_sid(2, {0}), 7}, {make_sid(2, {1}), 7}, {make_sid(5, {32, 544}), 0xF}, {make_sid(5, {32, 545}), 7}, {make_sid(5, {4}), 7}, {make_sid(5, {11}), 7},
-      {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {8192}), 0x60},
+      {make_sid(5, {15}), 7}, {make_sid(5, {64, 10}), 7}, {make_sid(5, {5, 0, 0x3E7}), 0xC0000007u}, {make_sid(16, {elevated ? 12288u : 8192u}), 0x60},      // (the last: the integrity level)
   };
   struct P { uint32_t low, attrs; };
   // The privileges a standard user's token holds, all disabled to start with (what the program enables, it asks for).
-  const P privileges[] = {{8, 0}, {19, 1}, {23, 1}, {25, 1}, {33, 1}, {34, 1}, {35, 1}};
+  // An elevated token has an administrator's as well (the same list ntdll gives the elevated twin of a limited token).
+  const P privileges[] = {{8, 0}, {19, 1}, {23, 1}, {25, 1}, {33, 1}, {34, 1}, {35, 1},
+                          {5, 0}, {9, 0}, {10, 0}, {11, 0}, {12, 0}, {13, 0}, {14, 0}, {15, 0}, {17, 0}, {18, 0}, {20, 0}, {22, 0}, {24, 0}, {28, 0}, {29, 0}, {30, 0}, {36, 0}};
+  constexpr uint32_t kLimitedPrivileges = 7;
   const SidBuf admins = make_sid(5, {32, 544}), system_sid = make_sid(5, {18});
-  constexpr uint32_t kGroupCount = sizeof(groups) / sizeof(groups[0]), kPrivilegeCount = sizeof(privileges) / sizeof(privileges[0]);
+  constexpr uint32_t kGroupCount = sizeof(groups) / sizeof(groups[0]);
+  const uint32_t kPrivilegeCount = elevated ? uint32_t(sizeof(privileges) / sizeof(privileges[0])) : kLimitedPrivileges;
   // Layout: header, user, owner (the user is the owner), primary group, groups (the table, then the SIDs), privileges, default DACL.
   ByteBuffer tail(*system_objects()->allocator());
   TcosTokenBlob h = {};
@@ -90,7 +96,7 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   h.modified_id = token_id;
   h.expiration = 0x7FFFFFFFFFFFFFFFull;
   h.session = 1;
-  h.elevation_type = 3;      // limited: medium integrity, with an elevated token linked to it
+  h.elevation_type = elevated ? 2 : 3;      // full, or limited: medium integrity, with an elevated token linked to it
   h.flags = TCOS_TOKEN_FLAG_VIRT_ALLOWED;
   h.mandatory_policy = 1;
   for (int i = 0; i < 8; ++i) h.source_name[i] = uint8_t("User32  "[i]);
@@ -108,7 +114,7 @@ bool make_default_blob(ByteBuffer& out, uint64_t token_id) {
   for (uint32_t i = 0; i < kGroupCount; ++i) { tail.put32(offsets[i]); tail.put32(groups[i].attrs); at += 8; }
   h.privilege_count = kPrivilegeCount;
   h.privileges_off = at;
-  for (const P& p : privileges) { tail.put32(p.low); tail.put32(0); tail.put32(p.attrs); at += 12; }
+  for (uint32_t i = 0; i < kPrivilegeCount; ++i) { tail.put32(privileges[i].low); tail.put32(0); tail.put32(privileges[i].attrs); at += 12; }
   // the default DACL: GENERIC_ALL for the administrators and for SYSTEM
   h.dacl_off = at;
   const uint32_t ace_size = 8 + admins.size, ace_size2 = 8 + system_sid.size, acl_size = 8 + ace_size + ace_size2;
@@ -263,6 +269,19 @@ bool thread_of(Process& p, uint64_t handle, uint64_t* tid) {
 }
 
 }  // namespace
+
+// The process `pid`, which has not run yet, gets the elevated form of the user's token (and so do the programs it starts, which inherit it).
+bool elevate_process_token(uint64_t pid) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->allocator()) return false;
+  ByteBuffer blob(*objects->allocator());
+  if (!make_default_blob(blob, __atomic_fetch_add(&g_next_token_id, 1, __ATOMIC_RELAXED), true)) return false;
+  const uint32_t object = new_token_object(blob.view());
+  if (object == 0) return false;
+  const bool set = set_owner(g_process_tokens, pid, object);
+  objects->release(object);      // (the table holds it now, or nothing does)
+  return set;
+}
 
 bool process_token_blob(uint64_t pid, ByteBuffer& out) {
   const uint32_t object = process_token_object(pid);

@@ -60,6 +60,7 @@ bool KernelSetupHost::run(StringView program, ArrayView<const StringView> argume
   run.kind = exe::ExecutableKind::Pe;
   run.host = &host;
   run.wait_for_descendants = true;      // (an uninstaller hands its work to a copy of itself and ends: the work is done when the copy is)
+  run.elevated = true;                  // (as an administrator: the user asked for the installation, and a setup program that is not elevated asks to be)
   Watch watch{&host, cancel};
   kernel::Thread* watcher = cancel ? kernel::spawn(&Watch::entry, &watch, "setup-cancel") : nullptr;
   const RunResult result = run_program(run, exit_code, message);
