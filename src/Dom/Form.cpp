@@ -339,6 +339,17 @@ Node* checked_radio_of_group(Node* radio) {
   return nullptr;
 }
 
+bool radio_group_has_checked(const Node* radio) {
+  if (is_checked(radio)) return true;
+  const StringView name = attr(radio, "name");
+  if (name.empty()) return false;
+  const Node* owner = form_owner(radio);
+  const Node* root = owner ? owner : radio->owner->root();
+  for (const Node* d = root->first_child; d; d = next_in_tree(d, root))
+    if (d != radio && type_is(d, InputType::Radio) && attr(d, "name").equals(name) && form_owner(d) == owner && is_checked(d)) return true;
+  return false;
+}
+
 int32_t selected_index(const Node* select) {
   List<Node*> options(select->owner->allocator());
   select_options(select, &options);
@@ -1425,16 +1436,6 @@ bool valid_url(StringView v) {
   for (uint64_t k = 0; k < v.size(); ++k)
     if (static_cast<uint8_t>(v[k]) <= ' ') return false;
   return true;
-}
-
-bool radio_group_has_checked(const Node* radio) {
-  const StringView name = attr(radio, "name");
-  if (name.empty()) return is_checked(radio);
-  Node* owner = form_owner(radio);
-  const Node* root = owner ? owner : radio->owner->root();
-  for (Node* d = root->first_child; d; d = next_in_tree(d, root))
-    if (type_is(d, InputType::Radio) && attr(d, "name").equals(name) && form_owner(d) == owner && is_checked(d)) return true;
-  return false;
 }
 
 }  // namespace

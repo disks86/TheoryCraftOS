@@ -42,7 +42,7 @@ struct Attribute {
 };
 
 // Bits of Node::ui_state.
-enum UiState : uint8_t { kUiHover = 1, kUiActive = 2 };
+enum UiState : uint8_t { kUiHover = 1, kUiActive = 2, kUiPopoverOpen = 4, kUiTarget = 8 };   // (a popover that is showing; the element the fragment of the address names)
 
 struct Node {
   Node(allocators::IAllocator& allocator, NodeType t, Document* d) : type(t), owner(d), name(allocator), data(allocator), attrs(allocator), ns(allocator), qname(allocator), animated(allocator) {}

@@ -78,6 +78,8 @@ bool is_checked(const Node* n);
 void set_checked(Node* n, bool checked);
 // The checked radio button of the group of `radio` (which may be `radio` itself), or nullptr.
 Node* checked_radio_of_group(Node* radio);
+// True if a radio button of the group of `radio` is checked.
+bool radio_group_has_checked(const Node* radio);
 
 void select_options(const Node* select, List<Node*>* out);   // the <option>s of a select (also those in an <optgroup>)
 void option_value(const Node* option, String* out);          // its value attribute, else its text

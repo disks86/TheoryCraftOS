@@ -70,6 +70,7 @@ void ua_defaults(const dom::Node* n, Style* s) {
   if (n->is_tag("ol") && s->list_type == 0 && !s->list_none) s->list_type = 3;
   if (tag_in(n, {"ul", "menu", "dir"}) && s->list_type == 3) s->list_type = 0;
   if (n->is_tag("dialog") && !dom::has_attribute(n, "open")) s->display = Display::None;
+  if (dom::has_attribute(n, "popover") && !(n->ui_state & dom::kUiPopoverOpen)) s->display = Display::None;   // (a popover shows only while it is open)
   if (n->is_tag("mark")) {
     s->own_background = true;
     s->own_background_color = 0xFFFF00;

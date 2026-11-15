@@ -59,6 +59,173 @@ Value upper_value(Vm& vm, StringView s) {
   return str_value(vm, u.view());
 }
 
+// --- innerText: the text as it is rendered ------------------------------------------------------------------------------
+// HTML's "rendered text collection steps", without a layout: text of elements that are not shown is left out, white space collapses the way `white-space`
+// says (across the borders of inline elements too), text-transform is applied, <br> is a line break, a block starts and ends a line, a paragraph has an
+// empty line around it, table cells are separated by tabs and rows by line breaks.
+struct RenderedText {
+  String out;
+  uint32_t required = 0;      // line breaks owed before the next text
+  bool pending_space = false; // a collapsed space waiting for text to follow on the same line
+  bool line_start = true;     // nothing on the current line yet (a space here is dropped)
+  explicit RenderedText(allocators::IAllocator& a) : out(a) {}
+  void need_breaks(uint32_t count) {
+    pending_space = false;
+    line_start = true;
+    if (count > required) required = count;
+  }
+  void flush() {
+    if (!out.empty())
+      for (uint32_t i = 0; i < required; ++i) out.push_back('\n');
+    required = 0;
+  }
+  void put(char ch) {
+    flush();
+    if (pending_space && !line_start) out.push_back(' ');
+    pending_space = false;
+    line_start = false;
+    out.push_back(ch);
+  }
+  // Something in the line that is not text (an image, a control, an empty inline-block): the spaces on both sides of it stay.
+  void atom() {
+    flush();
+    if (pending_space && !line_start) out.push_back(' ');
+    pending_space = false;
+    line_start = false;
+  }
+  void line_break() {
+    flush();
+    pending_space = false;
+    line_start = true;
+    out.push_back('\n');
+  }
+};
+
+void collect_rendered_text(DomBindings::Impl& c, dom::Node* node, const Style& parent_style, RenderedText* r, uint32_t depth) {
+  if (depth > 512) return;
+  for (dom::Node* n = node->first_child; n; n = n->next) {
+    if (n->is_text()) {
+      if (parent_style.visibility != Visibility::Visible) continue;
+      const StringView text = n->data.view();
+      const uint8_t ws = parent_style.white_space;
+      const bool collapse = ws == 0 || ws == 1 || ws == 4, keep_lines = ws == 4;
+      bool word_start = true;
+      for (uint64_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        const bool space = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f';
+        if (collapse && space) {
+          if (keep_lines && ch == '\n') r->line_break();
+          else r->pending_space = true;
+          word_start = true;
+          continue;
+        }
+        if (!collapse && ch == '\n') {
+          r->line_break();
+          word_start = true;
+          continue;
+        }
+        if (parent_style.transform == 1 || (parent_style.transform == 3 && word_start)) ch = ch >= 'a' && ch <= 'z' ? static_cast<char>(ch - 32) : ch;
+        else if (parent_style.transform == 2) ch = ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch + 32) : ch;
+        word_start = space;
+        r->put(ch);
+      }
+      continue;
+    }
+    if (!n->is_element()) continue;
+    Style style;
+    if (!c.host.computed_style(n, &style) || style.display == Display::None) continue;
+    if (n->is_tag("br")) {
+      r->line_break();
+      continue;
+    }
+    if (n->is_tag("rp")) continue;
+    if (n->is_tag("select")) {   // the options, one a line
+      r->atom();
+      for (dom::Node* d = n->first_child; d; d = dom::next_in_tree(d, n)) {
+        if (!d->is_tag("option")) continue;
+        String label(c.vm.allocator());
+        dom::text_content(d, &label);
+        r->need_breaks(1);
+        for (uint64_t i = 0; i < label.size(); ++i) r->put(label[i]);
+        r->need_breaks(1);
+      }
+      continue;
+    }
+    if (n->is_tag("textarea") || n->is_tag("input") || n->is_tag("img") || n->is_tag("canvas") || n->is_tag("video") || n->is_tag("audio") || n->is_tag("iframe") ||
+        n->is_tag("object")) {   // (replaced and control content is not text of the page; a block one still breaks the line)
+      const bool block = !style.inline_box && style.display != Display::Inline;
+      if (block) r->need_breaks(1);
+      else r->atom();
+      continue;
+    }
+    const bool cell = style.layout == Layout::TableCell, row = style.layout == Layout::TableRow;
+    const bool block = !style.inline_box && !cell && (style.display == Display::Block || style.display == Display::ListItem || style.flow_root || style.layout == Layout::TableCaption ||
+                                                      row || style.float_side != Float::None || style.position == Position::Absolute || style.position == Position::Fixed);
+    const bool paragraph = n->is_tag("p"), option = n->is_tag("option") || n->is_tag("optgroup");
+    const uint32_t breaks = paragraph ? 2 : 1;
+    if (block || paragraph || option) r->need_breaks(breaks);
+    if (n->is_tag("details") && !dom::has_attribute(n, "open")) {   // closed: only its summary shows
+      for (dom::Node* d = n->first_child; d; d = d->next)
+        if (d->is_tag("summary")) {
+          Style summary;
+          if (c.host.computed_style(d, &summary) && summary.display != Display::None) collect_rendered_text(c, d, summary, r, depth + 1);
+          break;
+        }
+      r->need_breaks(1);
+      continue;
+    }
+    if (style.inline_box) {   // (an inline-block is a line of its own inside: its edge spaces go, the text around it stays separated)
+      const bool had_space = r->pending_space;
+      r->pending_space = false;
+      RenderedText inner(c.vm.allocator());
+      collect_rendered_text(c, n, style, &inner, depth + 1);
+      if (!inner.out.empty()) {
+        r->pending_space = had_space;
+        for (uint64_t i = 0; i < inner.out.size(); ++i) {
+          if (inner.out[i] == '\n') r->line_break();
+          else r->put(inner.out[i]);
+        }
+      } else {
+        r->pending_space = had_space;
+        r->atom();
+      }
+    } else {
+      collect_rendered_text(c, n, style, r, depth + 1);
+    }
+    if (block || paragraph || option) r->need_breaks(breaks);
+    if (cell) {   // a tab after a cell that another follows, a line break after a row that another follows
+      bool more = false;
+      for (dom::Node* d = n->next; d && !more; d = d->next) more = d->is_element();
+      if (more) {
+        r->flush();
+        r->pending_space = false;
+        r->out.push_back('\t');
+        r->line_start = true;
+      }
+    }
+  }
+}
+
+// element.innerText. An element that is not rendered gives its textContent.
+void rendered_text(DomBindings::Impl& c, dom::Node* n, String* out) {
+  Style style;
+  bool rendered = n->is_element() && dom::is_connected(n) && c.host.computed_style(n, &style);
+  for (dom::Node* a = n; rendered && a && a->is_element(); a = a->parent) {   // (display: none here or above: not rendered)
+    Style above;
+    rendered = c.host.computed_style(a, &above) && above.display != Display::None;
+  }
+  if (!rendered) {
+    dom::text_content(n, out);
+    return;
+  }
+  out->clear();
+  for (const char* tag : {"textarea", "iframe", "video", "audio", "canvas", "img", "input", "object"})
+    if (n->is_tag(tag)) return;   // (their content is not text of the page)
+  RenderedText r(c.vm.allocator());
+  collect_rendered_text(c, n, style, &r, 0);
+  out->assign(r.out.view());
+}
+
 // --- Reflected attributes --------------------------------------------------------------------------------------------
 
 enum class Reflect : uint8_t { Str, Bool, Int, Url, NullableStr };   // (NullableStr: null while the content attribute is absent - role, crossOrigin; setting null removes it)
@@ -656,7 +823,7 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
   }
   if (IS("innerText") || IS("outerText")) {
     String text(vm.allocator());
-    dom::text_content(n, &text);
+    rendered_text(c, n, &text);
     *out = str_value(vm, text.view());
     return true;
   }
@@ -687,9 +854,41 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     return true;
   }
   if (IS("offsetParent")) { *out = Value::make_null(); return true; }
-  if (IS("isContentEditable")) { *out = bool_value(false); return true; }
-  if (IS("contentEditable")) { *out = str_value(vm, "inherit"); return true; }
-  if (IS("draggable") || IS("spellcheck")) { *out = bool_value(false); return true; }
+  if (IS("isContentEditable")) {   // the nearest contenteditable attribute on the way up decides
+    bool editable = false;
+    for (const dom::Node* a = n; a && a->is_element(); a = a->parent) {
+      StringView v;
+      if (!dom::get_attribute(a, "contenteditable", &v)) continue;
+      if (v.empty() || v.equals_ignore_case("true") || v.equals_ignore_case("plaintext-only")) editable = true;
+      else if (!v.equals_ignore_case("false")) continue;   // (an unknown value inherits)
+      break;
+    }
+    *out = bool_value(editable);
+    return true;
+  }
+  if (IS("contentEditable")) {
+    StringView v;
+    const bool present = dom::get_attribute(n, "contenteditable", &v);
+    *out = str_value(vm, !present ? "inherit" : v.empty() || v.equals_ignore_case("true") ? "true" : v.equals_ignore_case("false") ? "false" : v.equals_ignore_case("plaintext-only") ? "plaintext-only" : "inherit");
+    return true;
+  }
+  if (IS("draggable")) {   // true / false as written, else what the element is by itself (images and links)
+    StringView v;
+    const bool present = dom::get_attribute(n, "draggable", &v);
+    *out = bool_value(present && v.equals_ignore_case("true") ? true : present && v.equals_ignore_case("false") ? false : n->is_tag("img") || (n->is_tag("a") && dom::has_attribute(n, "href")));
+    return true;
+  }
+  if (IS("spellcheck")) {
+    bool on = true;
+    for (const dom::Node* a = n; a && a->is_element(); a = a->parent) {
+      StringView v;
+      if (!dom::get_attribute(a, "spellcheck", &v)) continue;
+      if (v.empty() || v.equals_ignore_case("true")) break;
+      if (v.equals_ignore_case("false")) { on = false; break; }
+    }
+    *out = bool_value(on);
+    return true;
+  }
   if (IS("sheet")) {   // the CSSStyleSheet of a <style> or <link rel=stylesheet>: the built-in script makes it
     *out = Value::make_null();
     Value make;
@@ -880,7 +1079,28 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     const HostClass::Set handled = form_set(c, n, k, value);
     if (handled != HostClass::Set::NotHandled) return handled;
   }
-  if (IS("textContent") || (element && (IS("innerText") || IS("outerText")))) {
+  if (element && IS("innerText")) {   // the lines of the text become text nodes with <br> elements between them
+    if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+    const StringView all = text.view();
+    if (all.find('\n') == StringView::npos && all.find('\r') == StringView::npos) return done(dom::set_text_content(n, all));
+    dom::DomError e = dom::set_text_content(n, StringView());
+    for (uint64_t at = 0; e == dom::DomError::None && at <= all.size();) {
+      uint64_t end = at;
+      while (end < all.size() && all[end] != '\n' && all[end] != '\r') ++end;
+      if (end > at) {
+        dom::Node* line = n->owner->create_text(all.substr(at, end - at));
+        e = line ? dom::append_child(n, line) : dom::DomError::OutOfMemory;
+      }
+      if (end >= all.size()) break;
+      if (e == dom::DomError::None) {
+        dom::Node* br = n->owner->create_element("br");
+        e = br ? dom::append_child(n, br) : dom::DomError::OutOfMemory;
+      }
+      at = end + (all[end] == '\r' && end + 1 < all.size() && all[end + 1] == '\n' ? 2 : 1);
+    }
+    return done(e);
+  }
+  if (IS("textContent") || (element && IS("outerText"))) {
     if (document) return HostClass::Set::Handled;
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
@@ -943,6 +1163,20 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
     if (!fragment) return done(dom::DomError::OutOfMemory);
     return done(dom::replace_child(parent, fragment, n));
   }
+  if (element && IS("contentEditable")) {
+    if (!arg_string(vm, value, &text)) return HostClass::Set::Threw;
+    const StringView v = text.view();
+    if (v.equals_ignore_case("inherit")) {
+      dom::remove_attribute(n, "contenteditable");
+      return HostClass::Set::Handled;
+    }
+    if (!v.equals_ignore_case("true") && !v.equals_ignore_case("false") && !v.equals_ignore_case("plaintext-only")) {
+      throw_dom(vm, "SyntaxError", "The value provided is not one of 'true', 'false', 'plaintext-only', or 'inherit'.");
+      return HostClass::Set::Threw;
+    }
+    return done(dom::set_attribute(n, "contenteditable", v));
+  }
+  if (element && (IS("draggable") || IS("spellcheck"))) return done(dom::set_attribute(n, IS("draggable") ? "draggable" : "spellcheck", Vm::to_boolean(value) ? "true" : "false"));
   if (IS("style")) {   // style = "..." sets the style attribute
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
     return done(dom::set_attribute(n, "style", text.view()));

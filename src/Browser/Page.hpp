@@ -547,6 +547,8 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void refresh_geometry(bool force = false);
   int32_t scroll_y_ = 0;
   void record_geometry(const layout::BoxTree& tree);
+  void mark_target(dom::Node* target);
+  uint32_t target_node_ = 0;   // the element the fragment of the address names (:target)
   uint32_t scroll_node_ = 0;   // an element scrollIntoView() was called on: its place is worked out when the page is drawn
   uint32_t focus_ = 0, open_select_ = 0, invalid_node_ = 0;   // forms: the focused control, the open list, the control a submit stopped at
   struct Message {

@@ -931,6 +931,18 @@ bool named_window_get(Vm& vm, JsObject* object, JsString* key, Value* out) {
 
 const HostClass kNamedWindowClass = {"WindowProperties", named_window_get, nullptr, nullptr, nullptr, true};
 
+// __set_popover_open(element, open): the showing state of a popover (:popover-open; a closed popover is not displayed).
+NATIVE(set_popover_open) {
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  if (!n || !n->is_element()) return true;
+  const bool open = Vm::to_boolean(arg_at(args, argc, 1));
+  if (open == ((n->ui_state & dom::kUiPopoverOpen) != 0)) return true;
+  if (open) n->ui_state |= dom::kUiPopoverOpen;
+  else n->ui_state &= static_cast<uint8_t>(~dom::kUiPopoverOpen);
+  n->owner->touch_at(n, true);
+  return true;
+}
+
 // __install_named_window(): puts the named properties object into the window's prototype chain, in front of EventTarget.prototype (once the chain is final).
 NATIVE(install_named_window) {
   JsObject* g = vm.global();
@@ -1285,6 +1297,7 @@ bool install_window(DomBindings::Impl& c) {
   g->host = &kWindowClass;
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
   vm.define_native(g, "__install_named_window", install_named_window, 0);
+  vm.define_native(g, "__set_popover_open", set_popover_open, 2);
   vm.define_native(g, "__set_content_type", set_content_type, 2);
   vm.define_native(g, "__detach_buffer", detach_buffer, 1);
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);

@@ -972,11 +972,11 @@ void Page::set_pointer(uint32_t node_serial, bool pressed) {
     node_serial = 0;
   }
   if (node_serial == pointer_node_ && pressed == pointer_pressed_) return;
-  for (dom::Node* n = doc_.by_serial(pointer_node_); n; n = n->parent) n->ui_state = 0;
+  for (dom::Node* n = doc_.by_serial(pointer_node_); n; n = n->parent) n->ui_state &= static_cast<uint8_t>(~(dom::kUiHover | dom::kUiActive));
   pointer_node_ = node_serial;
   pointer_pressed_ = pressed;
   for (dom::Node* n = doc_.by_serial(node_serial); n; n = n->parent)
-    n->ui_state = static_cast<uint8_t>(dom::kUiHover | (pressed ? dom::kUiActive : 0));
+    n->ui_state |= static_cast<uint8_t>(dom::kUiHover | (pressed ? dom::kUiActive : 0));
   if (style_sheet().uses_pointer_state()) doc_.touch();
 }
 
@@ -1350,6 +1350,21 @@ void Page::fetch_css_images(const paint::DisplayList& list) {
   objects_.fetch_css_images(object_environment(), address_.view());
 }
 
+// :target is the element the fragment of the address names.
+void Page::mark_target(dom::Node* target) {
+  dom::Node* old = target_node_ ? doc_.by_serial(target_node_) : nullptr;
+  if (old == target) return;
+  if (old) {
+    old->ui_state &= static_cast<uint8_t>(~dom::kUiTarget);
+    doc_.touch_at(old, true);
+  }
+  if (target) {
+    target->ui_state |= dom::kUiTarget;
+    doc_.touch_at(target, true);
+  }
+  target_node_ = target ? target->serial : 0;
+}
+
 void Page::resolve_scroll_target(const layout::BoxTree& tree) {
   dom::Node* target = nullptr;
   bool top = false;
@@ -1379,6 +1394,7 @@ void Page::resolve_scroll_target(const layout::BoxTree& tree) {
       }
       if (target) top = false;
     }
+    mark_target(target);
   }
   fragment_pending_ = false;
   scroll_node_ = 0;
@@ -1561,6 +1577,7 @@ void Page::set_hash(StringView hash) {
   base.assign(at == StringView::npos ? address_.view() : address_.view().first(at));
   if (hash.size() > 1) base.append(hash);
   if (hash.size() > 1) fragment_pending_ = true;
+  mark_target(hash.size() > 1 ? doc_.element_by_id(hash.substr(1)) : nullptr);   // (at once: scripts and style rules see :target before the page is drawn)
   if (base.view().equals(before.view())) {
     env_.set_hash(hash);
     return;

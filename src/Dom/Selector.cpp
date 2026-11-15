@@ -608,6 +608,15 @@ class SelectorSet::Reader {
     else if (n.equals("valid")) t->kind = TestKind::Valid;
     else if (n.equals("invalid")) t->kind = TestKind::Invalid;
     else if (n.equals("placeholder-shown")) t->kind = TestKind::PlaceholderShown;
+    else if (n.equals("target")) t->kind = TestKind::Target;
+    else if (n.equals("target-within")) t->kind = TestKind::TargetWithin;
+    else if (n.equals("modal")) t->kind = TestKind::Modal;
+    else if (n.equals("open")) t->kind = TestKind::Open;
+    else if (n.equals("popover-open")) t->kind = TestKind::PopoverOpen;
+    else if (n.equals("indeterminate")) t->kind = TestKind::Indeterminate;
+    else if (n.equals("default")) t->kind = TestKind::Default;
+    else if (n.equals("in-range")) t->kind = TestKind::InRange;
+    else if (n.equals("out-of-range")) t->kind = TestKind::OutOfRange;
     else if (n.equals("before") || n.equals("after")) {   // (the old pseudo-element syntax)
       pseudo_element_ = n.equals("before") ? 1 : 2;
       t->kind = TestKind::Always;
@@ -615,8 +624,8 @@ class SelectorSet::Reader {
     } else if (n.equals("hover")) t->kind = TestKind::Hover;
     else if (n.equals("active")) t->kind = TestKind::Active;
     else {   // visited, target, first-line and the rest: states a page being read does not have
-      static const char* const kInert[] = {"visited", "target", "target-within", "first-line", "first-letter", "indeterminate", "default", "in-range", "out-of-range", "user-valid", "user-invalid", "defined",
-                                           "paused", "playing", "popover-open", "modal", "open", "closed", "autofill", "-webkit-autofill", "blank", "local-link", "picture-in-picture", "seeking", "stalled",
+      static const char* const kInert[] = {"visited", "first-line", "first-letter", "user-valid", "user-invalid", "defined",
+                                           "paused", "playing", "closed", "autofill", "-webkit-autofill", "blank", "local-link", "picture-in-picture", "seeking", "stalled",
                                            "buffering", "muted", "volume-locked", "current", "past", "future", "active-view-transition", "scope-root", "has-slotted", "xr-overlay", "left", "right", "first", "root-like", "selection"};
       bool known = false;
       for (const char* k : kInert) known = known || n.equals(k);
@@ -874,6 +883,43 @@ bool SelectorSet::match_test(const Test& t, const Node* node, const Node* scope)
       return false;
     case TestKind::Fullscreen: return (node->form_state & kFormFullscreen) != 0;
     case TestKind::Hover: return (node->ui_state & kUiHover) != 0;
+    case TestKind::Target: return (node->ui_state & kUiTarget) != 0;
+    case TestKind::TargetWithin:
+      if (node->ui_state & kUiTarget) return true;
+      for (const Node* d = next_in_tree(node, node); d; d = next_in_tree(d, node))
+        if (d->is_element() && (d->ui_state & kUiTarget)) return true;
+      return false;
+    case TestKind::PopoverOpen: return (node->ui_state & kUiPopoverOpen) != 0;
+    case TestKind::Modal: return node->is_tag("dialog") && (node->form_state & kFormModal) && has_attribute(node, "open");
+    case TestKind::Open: return (node->is_tag("details") || node->is_tag("dialog")) && has_attribute(node, "open");
+    case TestKind::Indeterminate: {
+      if (node->is_tag("progress")) return !has_attribute(node, "value");
+      if (!node->is_tag("input")) return false;
+      const InputType it = input_type(node);
+      if (it == InputType::Checkbox) return (node->form_state & kFormIndeterminate) != 0;
+      return it == InputType::Radio && has_attribute(node, "name") && !radio_group_has_checked(node);
+    }
+    case TestKind::Default: {
+      if (node->is_tag("option")) return has_attribute(node, "selected");
+      if (node->is_tag("input")) {
+        const InputType it = input_type(node);
+        if (it == InputType::Checkbox || it == InputType::Radio) return has_attribute(node, "checked");
+      }
+      if (!is_submit_button(node)) return false;
+      const Node* form = form_owner(node);   // (the first submit button of its form)
+      if (!form) return false;
+      for (const Node* d = next_in_tree(form, form); d; d = next_in_tree(d, form))
+        if (d->is_element() && is_submit_button(d) && form_owner(d) == form) return d == node;
+      return false;
+    }
+    case TestKind::InRange:
+    case TestKind::OutOfRange: {
+      if (!node->is_tag("input") || (!has_attribute(node, "min") && !has_attribute(node, "max"))) return false;
+      const InputType it = input_type(node);
+      if (it != InputType::Number && it != InputType::Range && it != InputType::Date && it != InputType::Month && it != InputType::Week && it != InputType::Time && it != InputType::DateTimeLocal) return false;
+      const bool out = (validity(node) & (kRangeUnderflow | kRangeOverflow)) != 0;
+      return t.kind == TestKind::OutOfRange ? out : !out;
+    }
     case TestKind::Active: return (node->ui_state & kUiActive) != 0;
     case TestKind::Always: return true;
     case TestKind::Required: return is_submittable(node) && has_attribute(node, "required");

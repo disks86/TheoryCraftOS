@@ -8316,10 +8316,55 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       Object.defineProperty(navigation, p[0], { value: p[1], enumerable: true });
     });
     var paints = [entry(PerformancePaintTiming, 'first-paint', 'paint', 1, 0), entry(PerformancePaintTiming, 'first-contentful-paint', 'paint', 1, 0)];
+    // PerformanceObserver: an entry that is added is queued for the observers of its type, which are called in a task of their own with what gathered
+    var observers = [], deliveryQueued = false;
+    var deliver = function () {
+      deliveryQueued = false;
+      observers.slice().forEach(function (o) {
+        if (!o.queue.length) return;
+        var list = Object.create(g.PerformanceObserverEntryList ? g.PerformanceObserverEntryList.prototype : Object.prototype);
+        Object.defineProperty(list, '__entries', { value: o.queue.splice(0) });
+        try { o.callback.call(o.self, list, o.self, { droppedEntriesCount: 0 }); } catch (e) { if (typeof g.reportError === 'function') g.reportError(e); }
+      });
+    };
+    var queueFor = function (o, e) {
+      o.queue.push(e);
+      if (!deliveryQueued) { deliveryQueued = true; setTimeout(deliver, 0); }
+    };
     var add = function (e) {
       entries.push(e);
+      for (var i = 0; i < observers.length; i++) if (observers[i].types.indexOf(e.entryType) >= 0) queueFor(observers[i], e);
       return e;
     };
+    var SUPPORTED = ['element', 'event', 'first-input', 'largest-contentful-paint', 'layout-shift', 'longtask', 'mark', 'measure', 'navigation', 'paint', 'resource'];
+    var observerStates = typeof WeakMap === 'function' ? new WeakMap() : null;
+    if (observerStates && g.PerformanceObserver) {
+      var PerformanceObserver = function (callback) {
+        if (!(this instanceof PerformanceObserver)) throw typeErr("construct 'PerformanceObserver'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+        if (typeof callback !== 'function') throw typeErr("construct 'PerformanceObserver'", 'parameter 1 is not of type \'Function\'.');
+        observerStates.set(this, { callback: callback, self: this, types: [], queue: [], mode: '' });
+      };
+      var stateOf = function (o) { var st = observerStates.get(o); if (!st) throw new TypeError('Illegal invocation'); return st; };
+      method(PerformanceObserver.prototype, 'observe', function (options) {
+        var st = stateOf(this);
+        if (!options || (options.entryTypes === undefined && options.type === undefined)) throw typeErr("execute 'observe' on 'PerformanceObserver'", "An observe() call must include either entryTypes or type arguments.");
+        if (options.entryTypes !== undefined && (options.type !== undefined || options.buffered !== undefined)) throw typeErr("execute 'observe' on 'PerformanceObserver'", "An observe() call must not include both entryTypes and type arguments.");
+        var mode = options.entryTypes !== undefined ? 'multiple' : 'single';
+        if (st.mode && st.mode !== mode) throw new DOMException("Failed to execute 'observe' on 'PerformanceObserver': This PerformanceObserver has performed observe({" + (st.mode === 'single' ? 'type' : 'entryTypes') + ':...}), therefore it cannot perform the other kind.', 'InvalidModificationError');
+        var wanted = (mode === 'multiple' ? Array.prototype.slice.call(options.entryTypes) : [options.type]).map(String).filter(function (t) { return SUPPORTED.indexOf(t) >= 0; });
+        if (!wanted.length) return;
+        st.mode = mode;
+        if (mode === 'multiple') st.types = wanted; else wanted.forEach(function (t) { if (st.types.indexOf(t) < 0) st.types.push(t); });
+        if (observers.indexOf(st) < 0) observers.push(st);
+        if (mode === 'single' && options.buffered) all().filter(function (e) { return e.entryType === wanted[0]; }).forEach(function (e) { queueFor(st, e); });
+      });
+      method(PerformanceObserver.prototype, 'disconnect', function () { var st = stateOf(this), at = observers.indexOf(st); if (at >= 0) observers.splice(at, 1); st.types = []; st.queue = []; st.mode = ''; });
+      method(PerformanceObserver.prototype, 'takeRecords', function () { return stateOf(this).queue.splice(0); });
+      Object.defineProperty(PerformanceObserver.prototype, 'constructor', { value: PerformanceObserver, writable: true, configurable: true });
+      Object.defineProperty(PerformanceObserver, 'name', { value: 'PerformanceObserver' });
+      tag(PerformanceObserver, 'PerformanceObserver');
+      hide(g, 'PerformanceObserver', PerformanceObserver);
+    }
     var time = function (v, what) {
       if (typeof v === 'number') return v;
       if (v === undefined) return P.now();
@@ -8540,6 +8585,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (!fireToggle(this, 'beforetoggle', 'closed', 'open', true)) return;
       if (this.popover === 'auto') open.slice().forEach(function (o) { if (o.popover === 'auto' && !o.contains(this)) o.hidePopover(); }, this);
       open.push(this);
+      if (typeof __set_popover_open === 'function') __set_popover_open(this, true);
       var el = this;
       later(function () { fireToggle(el, 'toggle', 'closed', 'open', false); });
     });
@@ -8549,6 +8595,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (at < 0) throw new DOMException("Failed to execute 'hidePopover' on 'HTMLElement': Invalid on popover elements which are not showing.", 'InvalidStateError');
       fireToggle(this, 'beforetoggle', 'open', 'closed', false);
       open.splice(at, 1);
+      if (typeof __set_popover_open === 'function') __set_popover_open(this, false);
       var el = this;
       later(function () { fireToggle(el, 'toggle', 'open', 'closed', false); });
     });
@@ -8559,14 +8606,46 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (!shown) this.showPopover();
       return true;
     });
-    var nativeMatches = EP.matches;
-    method(EP, 'matches', function (sel) {
-      if (typeof sel === 'string' && sel.indexOf(':popover-open') >= 0) {
-        var el = this;
-        if (sel.trim() === ':popover-open') return open.indexOf(el) >= 0;
-      }
-      return nativeMatches.apply(this, arguments);
-    });
+    // A button with popovertarget shows / hides / toggles the popover it names; a click outside the open `auto` popovers, or Escape, closes them
+    // ("light dismiss"). These run after the page's own listeners, and not for a click they canceled.
+    var popoverOf = function (button) {
+      if (button.__popoverTarget) return button.__popoverTarget;
+      var id = button.getAttribute('popovertarget');
+      if (id === null || id === '') return null;
+      var root = button.getRootNode(), el = root && root.getElementById ? root.getElementById(id) : document.getElementById(id);
+      return el && el.getAttribute('popover') !== null ? el : null;
+    };
+    var nativeListen = g.EventTarget && g.EventTarget.prototype.addEventListener;
+    if (nativeListen) {
+      nativeListen.call(g, 'click', function (e) {
+        if (e.defaultPrevented) return;
+        var invoker = null, inside = [];
+        for (var n = e.target; n && n.nodeType === 1; n = n.parentNode) {
+          if (!invoker && (n.localName === 'button' || (n.localName === 'input' && /^(button|submit|reset|image)$/.test(n.type))) && !n.disabled && popoverOf(n)) invoker = n;
+          if (open.indexOf(n) >= 0) inside.push(n);
+        }
+        var target = invoker ? popoverOf(invoker) : null;
+        if (target) {
+          var action = String(invoker.getAttribute('popovertargetaction') || 'toggle').toLowerCase(), shown = open.indexOf(target) >= 0;
+          try {
+            if (action === 'show') { if (!shown) target.showPopover(); }
+            else if (action === 'hide') { if (shown) target.hidePopover(); }
+            else target.togglePopover();
+          } catch (x) { }
+          return;
+        }
+        open.slice().forEach(function (o) { if (o.popover === 'auto' && inside.indexOf(o) < 0 && open.indexOf(o) >= 0) { try { o.hidePopover(); } catch (x) { } } });
+      });
+      nativeListen.call(g, 'keydown', function (e) {
+        if (e.key !== 'Escape' || e.defaultPrevented) return;
+        for (var i = open.length - 1; i >= 0; i--) if (open[i].popover !== 'manual') { try { open[i].hidePopover(); } catch (x) { } return; }
+      });
+    }
+    // (a popover that leaves the document, or loses its attribute, is not showing any more)
+    var dropClosed = function () {
+      for (var i = open.length - 1; i >= 0; i--) if (!open[i].isConnected || open[i].getAttribute('popover') === null) { if (typeof __set_popover_open === 'function') __set_popover_open(open[i], false); open.splice(i, 1); }
+    };
+    ['showPopover', 'togglePopover'].forEach(function (name) { var f = EP[name]; method(EP, name, function () { dropClosed(); return f.apply(this, arguments); }); });
   }());
 
   // The classes whose objects the engine hands out as plain arrays: instanceof and their names are right for them. Their prototypes are not
