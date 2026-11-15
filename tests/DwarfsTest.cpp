@@ -795,6 +795,77 @@ static void test_appimage() {
     CHECK(!desktop::open_appimage_image(a, files, "/Desktop/Downloads/Tool.AppImage", &mounted, &message));
     CHECK(sv(message.view()).find("no SquashFS or DwarFS image") != std::string::npos);
   }
+  {
+    // uruntime's newer AppImages: a small SquashFS stand-in first (its AppRun only says the payload is DwarFS), the DwarFS image after it.
+    auto stand_in = [](uint64_t bytes_used, size_t padded) {
+      std::string squash(96, '\0');
+      memcpy(squash.data(), "hsqs", 4);
+      for (int i = 0; i < 8; ++i) squash[40 + i] = char((bytes_used >> (8 * i)) & 0xFF);
+      squash.resize(padded, '\0');
+      return squash;
+    };
+    auto locate = [&](const std::string& bytes, uint64_t* offset) {
+      MemoryFile file(std::make_shared<const std::string>(bytes));
+      exe::AppImagePayload payload = exe::AppImagePayload::SquashFs;
+      *offset = ~0ull;
+      CHECK(exe::appimage_payload_offset(file, offset, &payload));
+      return payload;
+    };
+    uint64_t offset = 0;
+    // Padded to a block, as the real ones are; and so that the DwarFS header lies across the end of a chunk the search reads, at every position.
+    for (size_t padded : {size_t(131072), size_t(200), size_t(19174)}) {
+      CHECK(locate(runtime + stand_in(200, padded) + image, &offset) == exe::AppImagePayload::DwarFs);
+      CHECK(offset == runtime.size() + padded);
+    }
+    for (size_t padded = 200 + 4096 - 70; padded <= 200 + 4096 + 70; ++padded) {
+      CHECK(locate(runtime + stand_in(200, padded) + image, &offset) == exe::AppImagePayload::DwarFs);
+      CHECK(offset == runtime.size() + padded);
+    }
+    {
+      OneFileSystem files(a, runtime + stand_in(19174, 131072) + image);
+      UniquePointer<IFileSystem> mounted;
+      String message(a);
+      CHECK(desktop::open_appimage_image(a, files, "/Desktop/Downloads/Tool.AppImage", &mounted, &message));
+      if (mounted) {
+        Status s;
+        CHECK(same_tree(listing(*mounted, a, &s), compat_reference(), true));
+      }
+    }
+    // The word alone is not an image: another major version, or a section that is not the first, is passed over.
+    std::string decoys = stand_in(200, 4096);
+    memcpy(decoys.data() + 300, "DWARFS\x03\x00", 8);
+    memcpy(decoys.data() + 600, image.data(), 64);
+    decoys[600 + 48] = 1;
+    memcpy(decoys.data() + 4096 - 6, "DWARFS", 6);
+    CHECK(locate(runtime + decoys + image, &offset) == exe::AppImagePayload::DwarFs);
+    CHECK(offset == runtime.size() + decoys.size());
+    CHECK(locate(runtime + decoys, &offset) == exe::AppImagePayload::SquashFs);
+    CHECK(offset == runtime.size());
+    // A plain SquashFS AppImage (the image is the rest of the file), one whose size field is nonsense, and a DwarFS image too far away to be its payload.
+    CHECK(locate(runtime + stand_in(4096, 4096), &offset) == exe::AppImagePayload::SquashFs && offset == runtime.size());
+    CHECK(locate(runtime + stand_in(~0ull, 4096) + image, &offset) == exe::AppImagePayload::SquashFs && offset == runtime.size());
+    CHECK(locate(runtime + stand_in(0, 4096) + image, &offset) == exe::AppImagePayload::SquashFs && offset == runtime.size());
+    CHECK(locate(runtime + stand_in(200, 200 + 1024 * 1024) + image, &offset) == exe::AppImagePayload::SquashFs && offset == runtime.size());
+    CHECK(locate(runtime + stand_in(200, 200 + 1024 * 1024 - 64) + image, &offset) == exe::AppImagePayload::DwarFs);
+    // Cut anywhere in the stand-in or the DwarFS header after it: SquashFS still (or not an AppImage), never a read past the end.
+    const std::string whole = runtime + stand_in(200, 300) + image;
+    for (size_t length = runtime.size(); length < runtime.size() + 300 + 64; ++length) {
+      MemoryFile file(std::make_shared<const std::string>(whole.substr(0, length)));
+      exe::AppImagePayload payload = exe::AppImagePayload::DwarFs;
+      if (exe::appimage_payload_offset(file, &offset, &payload)) CHECK(payload == exe::AppImagePayload::SquashFs && offset == runtime.size());
+      else CHECK(length < runtime.size() + 96);
+    }
+    // Every single bit flipped in the stand-in's superblock and in the DwarFS header: an answer inside the file, whichever it is.
+    for (size_t at : {runtime.size(), runtime.size() + 300}) {
+      for (size_t bit = 0; bit < 96 * 8; ++bit) {
+        std::string flipped = whole;
+        flipped[at + bit / 8] = char(flipped[at + bit / 8] ^ (1 << (bit % 8)));
+        MemoryFile file(std::make_shared<const std::string>(flipped));
+        exe::AppImagePayload payload;
+        if (exe::appimage_payload_offset(file, &offset, &payload)) CHECK(offset == runtime.size() || offset == runtime.size() + 300);
+      }
+    }
+  }
   CHECK(a.live == 0);
 }
 

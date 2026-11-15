@@ -38,7 +38,8 @@ AppImageType identify_appimage(ConstByteView head);
 
 // Where the filesystem image of a type 2 AppImage starts in `file`: the end of the runtime ELF (32- or 64-bit, either byte order), checked to hold a
 // SquashFS superblock or a DwarFS section header (*payload says which, when given). False if the file is not a type 2 AppImage or no image is
-// where the runtime says.
+// where the runtime says. Where a DwarFS image follows a SquashFS one (uruntime's stand-in for tools that read SquashFS only: its AppRun just says
+// that the payload is DwarFS), the DwarFS image is the answer.
 [[nodiscard]] bool appimage_payload_offset(filesystem::IFile& file, uint64_t* offset, AppImagePayload* payload = nullptr);
 
 }  // namespace exe

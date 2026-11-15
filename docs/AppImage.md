@@ -11,6 +11,11 @@ does what the AppImage's own runtime would do, without running the runtime. It d
 1. **Find the image.** For type 2, the SquashFS (or, with uruntime, DwarFS) image starts where the runtime ELF ends. That is the end of its section header table or of
    its last section, whichever is later (`exe::appimage_payload_offset`, src/Executable/AppImage.hpp). A type 1 AppImage *is* an ISO 9660
    image, with the runtime in the 32 KiB system area that ISO 9660 leaves free, so its image starts at byte 0.
+
+   Newer uruntime AppImages (Firefox from ivan-hc/Firefox-appimage, for one) put a small stand-in SquashFS image there for tools that
+   only know SquashFS: the icon, the desktop entry and an `AppRun` that prints "this is a DwarFS AppImage" and exits. The real DwarFS
+   image follows it, padded to a block. So when the SquashFS image ends before the file does, the next 1 MiB is searched for the first
+   DwarFS section header (`DWARFS`, major version 2, section number 0), and that image is mounted instead.
 2. **Mount it.** `SquashFileSystem` (src/FileSystem/Squash), `DwarfsFileSystem` (src/FileSystem/Dwarfs) or, for type 1, `IsoFileSystem` (src/FileSystem/Iso) reads the image straight
    from the AppImage file. A `GraftFileSystem`
    (src/FileSystem/Mount) places it at `/tmp/.mount_<first six characters of the name><id>` of the Linux world, the way the runtime names its

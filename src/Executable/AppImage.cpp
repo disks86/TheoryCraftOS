@@ -49,6 +49,35 @@ struct Fields {
   }
 };
 
+// How far past the end of a SquashFS image a DwarFS image is looked for (the stand-in is padded to a block of the real image, 128 KiB as built today).
+constexpr uint64_t kDwarfsSearchLimit = 1024 * 1024;
+
+// The first DwarFS section header in [from, from + kDwarfsSearchLimit) of `file` (`size` bytes long): "DWARFS", format major version 2, and section
+// number 0, as the first section of an image has. Mounting checks the rest (the checksums of every section).
+bool find_dwarfs_image(filesystem::IFile& file, uint64_t from, uint64_t size, uint64_t* found) {
+  constexpr uint64_t kHeader = 64, kNumberAt = 48;
+  static constexpr uint8_t kMagic[] = {'D', 'W', 'A', 'R', 'F', 'S', 2};
+  if (from > size || size - from < kHeader) return false;
+  const uint64_t stop = size - from < kDwarfsSearchLimit ? size : from + kDwarfsSearchLimit;   // one past the last byte looked at
+  uint8_t chunk[4096 + kHeader];
+  uint64_t at = from;
+  while (stop - at >= kHeader) {
+    // Chunks overlap by a header less one byte, so a header across a chunk's end is seen whole in the next.
+    const uint64_t length = stop - at < sizeof(chunk) ? stop - at : sizeof(chunk);
+    const ByteView window = ByteView(chunk).first(length);
+    if (!read_exact(file, at, window)) return false;
+    const ConstByteView bytes(window);
+    for (uint64_t i = 0; i <= length - kHeader; ++i) {
+      if (!bytes.subview(i, sizeof(kMagic)).equals(ConstByteView(kMagic))) continue;
+      if (ByteReader(bytes.subview(i + kNumberAt, 4)).le32() != 0) continue;
+      *found = at + i;
+      return true;
+    }
+    at += length - (kHeader - 1);
+  }
+  return false;
+}
+
 }  // namespace
 
 AppImageType identify_appimage(ConstByteView head) {
@@ -88,6 +117,17 @@ bool appimage_payload_offset(filesystem::IFile& file, uint64_t* offset, AppImage
   AppImagePayload found;
   if (magic[0] == 'h' && magic[1] == 's' && magic[2] == 'q' && magic[3] == 's' && size - end >= 96) {
     found = AppImagePayload::SquashFs;
+    // uruntime's newer AppImages put a small stand-in SquashFS image first (an AppRun that only says the payload is DwarFS, the icon and the desktop
+    // entry, for tools that know SquashFS alone) and the DwarFS image after it. The real image is the one to mount.
+    uint8_t used[8];
+    if (read_exact(file, end + 40, ByteView(used))) {
+      const uint64_t bytes_used = ByteReader(ConstByteView(used)).le64();
+      uint64_t dwarfs = 0;
+      if (bytes_used >= 96 && bytes_used < size - end && find_dwarfs_image(file, end + bytes_used, size, &dwarfs)) {
+        end = dwarfs;
+        found = AppImagePayload::DwarFs;
+      }
+    }
   } else if (magic[0] == 'D' && magic[1] == 'W' && magic[2] == 'A' && magic[3] == 'R' && magic[4] == 'F' && magic[5] == 'S') {
     found = AppImagePayload::DwarFs;
   } else {

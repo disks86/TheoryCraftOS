@@ -24,6 +24,7 @@
 //   AppImageTest                       the tests
 //   AppImageTest --dump <AppImage>     lists the image (for tests/appimage_interop.sh, which compares with the runtime's own --appimage-extract)
 //   AppImageTest --apprun <AppImage> [args...]   prints what its AppRun would start
+//   AppImageTest --cat <AppImage> <path>         prints one file of the image (SquashFS, DwarFS or ISO 9660)
 //   AppImageTest --make <out.AppImage> <folder>  packs a folder into a type 2 AppImage (a stand-in runtime and a SquashFS image; for tests/appimage_qemu.sh)
 //   AppImageTest --make1 <out.AppImage> <folder> the same as a type 1 AppImage (an ISO 9660 image from xorriso, the stand-in runtime in its system area)
 #include <dirent.h>
@@ -1473,6 +1474,17 @@ static int real_appimage(int argc, char** argv) {
     dump(*fs, "/");
     return 0;
   }
+  if (std::string(argv[1]) == "--cat") {
+    if (argc != 4) { fprintf(stderr, "usage: AppImageTest --cat <AppImage> <path in the image>\n"); return 2; }
+    UniquePointer<IFileSystem> image;
+    String why(a);
+    if (!desktop::open_appimage_image(a, host, StringView(path.c_str()), &image, &why)) { fprintf(stderr, "%s\n", sv(why.view()).c_str()); return 2; }
+    Status rs;
+    const std::string data = read_all(*image, argv[3], &rs);
+    if (rs != Status::Ok) { fprintf(stderr, "read %s: %s\n", argv[3], status_name(rs)); return 2; }
+    fwrite(data.data(), 1, data.size(), stdout);
+    return 0;
+  }
   std::vector<StringView> args;
   for (int i = 3; i < argc; ++i) args.push_back(argv[i]);
   const StringView env[] = {"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/root", "LANG=C.UTF-8"};
@@ -1548,7 +1560,7 @@ static int make_appimage(const char* out, const char* folder) {
 int main(int argc, char** argv) {
   if (argc == 4 && std::string(argv[1]) == "--make") return make_appimage(argv[2], argv[3]);
   if (argc == 4 && std::string(argv[1]) == "--make1") return make_type1(argv[2], argv[3]);
-  if (argc >= 3 && (std::string(argv[1]) == "--dump" || std::string(argv[1]) == "--apprun")) return real_appimage(argc, argv);
+  if (argc >= 3 && (std::string(argv[1]) == "--dump" || std::string(argv[1]) == "--apprun" || std::string(argv[1]) == "--cat")) return real_appimage(argc, argv);
   printf("squashfs images\n");
   test_images();
   printf("damaged images\n");
