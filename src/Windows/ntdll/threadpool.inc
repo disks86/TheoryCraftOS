@@ -278,7 +278,7 @@ static volatile LONG g_tp_starved;
 static void tp_wake_manager(void);
 static void tp_wake_mgr(LONG index);
 static LONG tp_processors(void) {
-  const LONG n = (LONG)*(const DWORD *)((const BYTE *)NtCurrentPeb() + 0xB8);      /* PEB.NumberOfProcessors */
+  const LONG n = (LONG)*(const DWORD *)(PEB_RAW() + 0xB8);      /* PEB.NumberOfProcessors */
   return n < 2 ? 2 : n;
 }
 static void tp_object_ref(TP_OBJ_ *object) { __sync_fetch_and_add(&object->refs, 1); }
@@ -601,7 +601,7 @@ EXPORT NTSTATUS NTAPI TpSetPoolMinThreads(PVOID pool_, ULONG minimum) {
 EXPORT void NTAPI TpSetPoolMaxThreadsSoftLimit(PVOID pool, ULONG maximum) { TpSetPoolMaxThreads(pool, maximum); }
 /* The stack of a pool's threads is what the program's image asks for, unless the program set it. */
 static void tp_image_stack(SIZE_T *reserve, SIZE_T *commit) {
-  const BYTE *image = *(BYTE **)((BYTE *)NtCurrentPeb() + 0x10);
+  const BYTE *image = *(BYTE **)(PEB_RAW() + 0x10);
   const BYTE *nt = image + *(const DWORD *)(image + 0x3C);
   *reserve = *(const ULONGLONG *)(nt + 0x18 + 0x48);
   *commit = *(const ULONGLONG *)(nt + 0x18 + 0x50);

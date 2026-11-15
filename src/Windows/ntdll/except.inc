@@ -415,7 +415,7 @@ static PEXCEPTION_ROUTINE unwind_step(ULONG type, DISPATCHER_CONTEXT *dc, CONTEX
 }
 
 static int stack_contains(ULONG64 address) {
-  const ULONG64 base = *(const ULONG64 *)TEB_BYTE(NtCurrentTeb(), 0x08), limit = *(const ULONG64 *)TEB_BYTE(NtCurrentTeb(), 0x10);
+  const ULONG64 base = *(const ULONG64 *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x08), limit = *(const ULONG64 *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x10);
   return base == 0 || (address >= limit && address < base);
 }
 

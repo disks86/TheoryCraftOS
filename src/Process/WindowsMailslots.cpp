@@ -77,6 +77,7 @@ bool wants_inherit(Process& p, uint64_t attributes) {
 
 // IO_STATUS_BLOCK { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
 bool store_io_status(Process& p, uint64_t address, uint32_t status, uint64_t information) {
+  if (address != 0 && p.arch() == UserArch::X86_32) return p.write_user_u32(address, status) && p.write_user_u32(address + 4, static_cast<uint32_t>(information));      // (a 32-bit program's: two 32-bit fields)
   return address == 0 || (p.write_user_u64(address, status) && p.write_user_u64(address + 8, information));
 }
 

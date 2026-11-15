@@ -460,7 +460,8 @@ constexpr uint64_t kMaxHiveBytes = 64ull << 20;
 
 // IO_STATUS_BLOCK { Status (4), Information (8, at 8) }.
 void set_io_status(Process& p, uint64_t address, uint32_t status) {
-  if (address != 0) { p.write_user_u32(address, status); p.write_user_u64(address + 8, 0); }
+  if (address != 0 && p.arch() == UserArch::X86_32) { p.write_user_u32(address, status); p.write_user_u32(address + 4, 0); }      // (a 32-bit program's: two 32-bit fields)
+  else if (address != 0) { p.write_user_u32(address, status); p.write_user_u64(address + 8, 0); }
 }
 
 // The file behind a handle that was opened for the hive services; null if it is not a file.

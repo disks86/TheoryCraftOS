@@ -150,7 +150,7 @@ static Heap *heap_new(ULONG flags, SIZE_T initial, SIZE_T maximum, int process_h
   Heap *h = (Heap *)base;
   h->ffeeffee = 0xFFEEFFEEu;
   const ULONG kept = flags & (HEAP_FLAG_NO_SERIALIZE | HEAP_FLAG_GENERATE_EXCEPTIONS);      /* (the others - tail and free checking, shared - come from the global flags only) */
-  const ULONG global = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC);
+  const ULONG global = *(ULONG *)(PEB_RAW() + 0xBC);
   ULONG derived = 0;
   if (global & 0x10) derived |= HF_TAIL;
   if (global & 0x20) derived |= HF_FREE;
@@ -381,7 +381,7 @@ static PVOID heap_alloc_locked(Heap *h, ULONG flags, SIZE_T bytes) {
   if (heap_is_fixed(h) && bytes >= 0xFF000) return NULL;      /* (a fixed heap holds no very big blocks) */
   if (bytes >= LARGE_MIN && !heap_is_fixed(h)) return large_alloc(h, flags, bytes);
   const int info = (flags & 0x100) != 0;
-  const int big = *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC) != 0 || (flags & (HF_TAIL | HF_FREE));
+  const int big = *(ULONG *)(PEB_RAW() + 0xBC) != 0 || (flags & (HF_TAIL | HF_FREE));
   const ULONGLONG need = chunk_need(h, bytes, info, big);
   Chunk *c = NULL;
   if (h->lfh_active && need <= LFH_MAX_CHUNK) {
@@ -573,7 +573,7 @@ static void heap_unlock_for(Heap *h, void *held) { inner_unlock(h); if (held) us
 static void heap_error(ULONG error) { TEB_LAST_ERROR(NtCurrentTeb()) = error; }
 EXPORT void NTAPI RtlRaiseStatus(NTSTATUS status);
 
-EXPORT ULONG NTAPI RtlGetNtGlobalFlags(void) { return *(ULONG *)((BYTE *)NtCurrentPeb() + 0xBC); }
+EXPORT ULONG NTAPI RtlGetNtGlobalFlags(void) { return *(ULONG *)(PEB_RAW() + 0xBC); }
 
 EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T commit, PVOID lock, PVOID parameters) {
   (void)base; (void)lock; (void)parameters;

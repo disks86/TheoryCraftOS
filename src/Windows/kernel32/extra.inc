@@ -230,13 +230,13 @@ typedef struct Fiber {
   PVOID actctx_stack;              /* its stack of activation contexts (TEB->ActivationContextStackPointer while it runs; a new fiber has none until it activates one) */
 } Fiber;
 #define FIBER_MAGIC 0x46494252u
-#define TEB_FIBER_DATA(teb) (*(Fiber **)TEB_BYTE(teb, 0x20))
-#define TEB_STACK_BASE(teb) (*(PVOID *)TEB_BYTE(teb, 0x08))
-#define TEB_STACK_LIMIT(teb) (*(PVOID *)TEB_BYTE(teb, 0x10))
-#define TEB_FLS_SLOTS_PTR(teb) (*(PVOID *)TEB_BYTE(teb, 0x17c8))
-#define TEB_ACTCTX_STACK_PTR(teb) (*(PVOID *)TEB_BYTE(teb, 0x2c8))
+#define TEB_FIBER_DATA(teb) (*(Fiber **)TEB_BYTE(TEB_RAW(teb), 0x20))
+#define TEB_STACK_BASE(teb) (*(PVOID *)TEB_BYTE(TEB_RAW(teb), 0x08))
+#define TEB_STACK_LIMIT(teb) (*(PVOID *)TEB_BYTE(TEB_RAW(teb), 0x10))
+#define TEB_FLS_SLOTS_PTR(teb) (*(PVOID *)TEB_BYTE(TEB_RAW(teb), 0x17c8))
+#define TEB_ACTCTX_STACK_PTR(teb) (*(PVOID *)TEB_BYTE(TEB_RAW(teb), 0x2c8))
 IMPORT void NTAPI RtlFreeActivationContextStack(PVOID stack);
-#define TEB_SAME_FLAGS(teb) (*(USHORT *)TEB_BYTE(teb, 0x17ee))      /* bit 2: HasFiberData */
+#define TEB_SAME_FLAGS(teb) (*(USHORT *)TEB_BYTE(TEB_RAW(teb), 0x17ee))      /* bit 2: HasFiberData */
 IMPORT void NTAPI RtlProcessFlsData(PVOID data, ULONG flags);
 
 /* switch_stacks(save, target): keeps the registers a Windows function has to keep (and xmm6-xmm15) on the stack, saves the stack pointer in *save and goes on with the one

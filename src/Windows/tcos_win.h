@@ -27,8 +27,17 @@ typedef unsigned short WORD, USHORT, WCHAR, ATOM;
 typedef short SHORT;
 typedef int INT, BOOL, LONG, NTSTATUS;
 typedef unsigned int UINT, DWORD, ULONG, *PDWORD, *PULONG;
-typedef long long LONGLONG, INT64, LONG64, LONG_PTR, SSIZE_T, INT_PTR;
-typedef unsigned long long ULONGLONG, UINT64, DWORD64, ULONG64, ULONG_PTR, SIZE_T, UINT_PTR, DWORD_PTR, *PSIZE_T;
+typedef long long LONGLONG, INT64, LONG64;
+typedef unsigned long long ULONGLONG, UINT64, DWORD64, ULONG64;
+/* The integers as wide as a pointer. These libraries are built twice: for x86-64 (C:\Windows\System32) and for i386 (C:\Windows\SysWOW64, the libraries
+ * of 32-bit programs, see docs/Wow64.md). Everything below that depends on the width says so with __i386__. */
+#ifdef __i386__
+typedef int LONG_PTR, SSIZE_T, INT_PTR;
+typedef unsigned int ULONG_PTR, SIZE_T, UINT_PTR, DWORD_PTR, *PSIZE_T;
+#else
+typedef long long LONG_PTR, SSIZE_T, INT_PTR;
+typedef unsigned long long ULONG_PTR, SIZE_T, UINT_PTR, DWORD_PTR, *PSIZE_T;
+#endif
 typedef void VOID, *PVOID, *LPVOID, *HANDLE, *HMODULE, *HINSTANCE, *HLOCAL, *HGLOBAL, *HKEY, *FARPROC;
 typedef const void *LPCVOID;
 typedef CHAR *LPSTR, *PSTR;
@@ -40,15 +49,22 @@ typedef LONG *PLONG;
 typedef DWORD *LPDWORD;
 typedef HANDLE *PHANDLE;
 typedef ULONG64 *PULONG64;
-typedef unsigned long long size_t_;
+typedef ULONG_PTR size_t_;
 typedef __builtin_va_list va_list_;
 
 #define NULL ((void *)0)
 #define TRUE 1
 #define FALSE 0
+/* The calling convention of the Windows interfaces: on x86-64 there is only one; on i386 it is stdcall (the function takes its arguments off the stack). */
+#ifdef __i386__
+#define WINAPI __stdcall
+#define NTAPI __stdcall
+#define CALLBACK __stdcall
+#else
 #define WINAPI
 #define NTAPI
 #define CALLBACK
+#endif
 #define EXPORT __declspec(dllexport)
 #ifndef IMPORT
 #define IMPORT __declspec(dllimport)      /* (ntdll.dll itself defines IMPORT as nothing first: it implements these) */
@@ -268,9 +284,15 @@ typedef struct _CRITICAL_SECTION {
 
 typedef struct _MEMORY_BASIC_INFORMATION {
   PVOID BaseAddress, AllocationBase;
+#ifdef __i386__
+  DWORD AllocationProtect;
+  SIZE_T RegionSize;
+  DWORD State, Protect, Type;
+#else
   DWORD AllocationProtect, __alignment1;
   SIZE_T RegionSize;
   DWORD State, Protect, Type, __alignment2;
+#endif
 } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
 
 typedef struct _SYSTEM_INFO {
@@ -415,7 +437,10 @@ typedef void (WINAPI *PFLS_CALLBACK_FUNCTION)(PVOID);
 typedef struct _LDR_DATA_TABLE_ENTRY {
   LIST_ENTRY InLoadOrderLinks, InMemoryOrderLinks, InInitializationOrderLinks;
   PVOID DllBase, EntryPoint;
-  ULONG SizeOfImage, pad0;
+  ULONG SizeOfImage;
+#ifndef __i386__
+  ULONG pad0;
+#endif
   UNICODE_STRING FullDllName, BaseDllName;
   ULONG Flags;
   USHORT LoadCount, TlsIndex;
@@ -442,9 +467,26 @@ typedef struct _PEB {
 } PEB;
 typedef struct _TEB TEB;
 
+#define TEB_BYTE(teb, offset) ((BYTE *)(teb) + (offset))
+#ifdef __i386__
+/* The 32-bit TEB (the FS segment), with the offsets of Windows 10 x86. The TEB the kernel's services use is TEB64_OF(teb) (docs/Wow64.md). */
+static inline TEB *NtCurrentTeb(void) { TEB *t; __asm__ volatile("movl %%fs:0x18, %0" : "=r"(t)); return t; }
+static inline PEB *NtCurrentPeb(void) { PEB *p; __asm__ volatile("movl %%fs:0x30, %0" : "=r"(p)); return p; }
+#define TEB_LAST_ERROR(teb) (*(DWORD *)TEB_BYTE(teb, 0x34))
+#define TEB_TLS_POINTER(teb) (*(PVOID **)TEB_BYTE(teb, 0x2C))
+#define TEB_TLS_SLOTS(teb) ((PVOID *)TEB_BYTE(teb, 0xE10))        /* 64 slots */
+#define TEB_TLS_EXPANSION(teb) (*(PVOID **)TEB_BYTE(teb, 0xF94))  /* 1024 more */
+#define TEB_FLS_DATA(teb) (*(PVOID **)TEB_BYTE(teb, 0xFB4))
+#define TEB_CLIENT_PROCESS(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x20))
+#define TEB_CLIENT_THREAD(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x24))
+#define TEB64_OF(teb) ((BYTE *)(teb) - 0x2000)
+/* The fields these libraries keep in the TEB and the PEB by their offsets (the x64 ones: private state, and what the kernel reads and writes) are in the
+ * 64-bit TEB and PEB here too: TEB_RAW(teb) + offset, PEB_RAW() + offset. What is 8 bytes wide there holds an address below 4 GiB: its low half is it. */
+#define TEB_RAW(teb) TEB64_OF(teb)
+#define PEB_RAW() (*(BYTE **)(TEB64_OF(NtCurrentTeb()) + 0x60))
+#else
 static inline TEB *NtCurrentTeb(void) { TEB *t; __asm__ volatile("movq %%gs:0x30, %0" : "=r"(t)); return t; }
 static inline PEB *NtCurrentPeb(void) { PEB *p; __asm__ volatile("movq %%gs:0x60, %0" : "=r"(p)); return p; }
-#define TEB_BYTE(teb, offset) ((BYTE *)(teb) + (offset))
 #define TEB_LAST_ERROR(teb) (*(DWORD *)TEB_BYTE(teb, 0x68))
 #define TEB_TLS_POINTER(teb) (*(PVOID **)TEB_BYTE(teb, 0x58))
 #define TEB_TLS_SLOTS(teb) ((PVOID *)TEB_BYTE(teb, 0x1480))       /* 64 slots */
@@ -452,6 +494,10 @@ static inline PEB *NtCurrentPeb(void) { PEB *p; __asm__ volatile("movq %%gs:0x60
 #define TEB_FLS_DATA(teb) (*(PVOID **)TEB_BYTE(teb, 0x17C8))
 #define TEB_CLIENT_PROCESS(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x40))
 #define TEB_CLIENT_THREAD(teb) (*(ULONG_PTR *)TEB_BYTE(teb, 0x48))
+#define TEB64_OF(teb) ((BYTE *)(teb))
+#define TEB_RAW(teb) ((BYTE *)(teb))
+#define PEB_RAW() ((BYTE *)NtCurrentPeb())
+#endif
 #define NtCurrentProcess() ((HANDLE)(LONG_PTR)-1)
 #define NtCurrentThread() ((HANDLE)(LONG_PTR)-2)
 

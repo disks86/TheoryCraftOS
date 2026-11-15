@@ -411,7 +411,7 @@ EXPORT NTSTATUS NTAPI RtlEnterCriticalSection(PRTL_CRITICAL_SECTION cs);
 EXPORT NTSTATUS NTAPI RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION cs);
 static RTL_CRITICAL_SECTION g_loader_section = {NULL, -1, 0, NULL, NULL, 0};
 static void loader_publish(void) {
-  PRTL_CRITICAL_SECTION *slot = (PRTL_CRITICAL_SECTION *)((BYTE *)NtCurrentPeb() + 0x110);
+  PRTL_CRITICAL_SECTION *slot = (PRTL_CRITICAL_SECTION *)(PEB_RAW() + 0x110);
   if (*slot != &g_loader_section) *slot = &g_loader_section;
 }
 static void loader_lock(void) {
@@ -555,13 +555,13 @@ EXPORT void NTAPI RtlExitUserProcess(NTSTATUS status) {
 EXPORT BOOLEAN NTAPI RtlDllShutdownInProgress(void) { return g_process_ending != 0 && !g_cs_taken_over; }
 
 /* The thread ends (the libraries and the program are told); the process ends with its last thread. */
-static int thread_skips_attach(void) { return (*(USHORT *)((BYTE *)NtCurrentTeb() + 0x17EE) & 0x08) != 0; }      /* TEB.SameTebFlags.SkipThreadAttach */
+static int thread_skips_attach(void) { return (*(USHORT *)(TEB_RAW(NtCurrentTeb()) + 0x17EE) & 0x08) != 0; }      /* TEB.SameTebFlags.SkipThreadAttach */
 EXPORT void NTAPI RtlExitUserThread(NTSTATUS status) {
   fls_destroy_current(0);
   if (!g_process_ending && !thread_skips_attach()) notify_all_modules(DLL_THREAD_DETACH, NULL, 0);
   fls_destroy_current(1);
   RtlFreeThreadActivationContextStack();
-  { HANDLE *debug_object = (HANDLE *)((BYTE *)NtCurrentTeb() + 0x1660); if (*debug_object) { NtClose(*debug_object); *debug_object = NULL; } }      /* (a thread that debugged lets go of it) */
+  { HANDLE *debug_object = (HANDLE *)(TEB_RAW(NtCurrentTeb()) + 0x1660); if (*debug_object) { NtClose(*debug_object); *debug_object = NULL; } }      /* (a thread that debugged lets go of it) */
   for (;;) NtTerminateThread((HANDLE)(LONG_PTR)-2, status);
 }
 
@@ -575,7 +575,7 @@ static void reset_floating_point(void) {
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
   reset_floating_point();
   if (!thread_skips_attach()) {      /* (a thread made with THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH has neither thread-local storage nor a call to the libraries) */
-    if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)((BYTE *)NtCurrentTeb() + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
+    if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)(TEB_RAW(NtCurrentTeb()) + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
     fls_thread_begins();
     notify_all_modules(DLL_THREAD_ATTACH, NULL, 1);
   }
@@ -939,7 +939,7 @@ static void read_global_flags(void) {
     for (ULONG i = base; i < length && n < 255; ++i) path[n++] = image[i];
     if (!key_global_flag((const WCHAR *)path, n, &flags)) key_global_flag((const WCHAR *)session, sizeof(session) / 2 - 1, &flags);
   }
-  *(ULONG *)((BYTE *)peb + 0xBC) = flags;
+  *(ULONG *)(PEB_RAW() + 0xBC) = flags;
 }
 static PVOID process_heap(void) {
   PEB *peb = NtCurrentPeb();
@@ -1069,7 +1069,7 @@ typedef BOOL (WINAPI *DllEntry)(HANDLE, DWORD, PVOID);
 typedef int (WINAPI *ProgramEntry)(PVOID);
 
 /* The program's first breakpoint, where a debugger that started it takes over; it is not DbgBreakPoint, as on Windows. */
-static __attribute__((noinline)) void tcos_initial_break(void) { *((BYTE *)NtCurrentTeb() + 0x1668) = 2; __asm__ volatile("int3" ::: "memory"); *((BYTE *)NtCurrentTeb() + 0x1668) = 0; }
+static __attribute__((noinline)) void tcos_initial_break(void) { *(TEB_RAW(NtCurrentTeb()) + 0x1668) = 2; __asm__ volatile("int3" ::: "memory"); *(TEB_RAW(NtCurrentTeb()) + 0x1668) = 0; }
 
 /* The thread of a program starts here: the kernel puts the program's entry point in the first argument and the PEB in the second. The libraries' entry points run first
  * (in the order the kernel listed them: a library after the libraries it imports), then the program's. Its return value ends the process. */
@@ -1359,7 +1359,7 @@ static WCHAR *append_path(WCHAR *p, const WCHAR *text, SIZE_T length) {
   return p + length + 1;
 }
 static const WCHAR *image_path_name(void) {
-  const BYTE *params = *(const BYTE *const *)(*(const BYTE *const *)((const BYTE *)NtCurrentTeb() + 0x60) + 0x20);
+  const BYTE *params = *(const BYTE *const *)(*(const BYTE *const *)(TEB_RAW(NtCurrentTeb()) + 0x60) + 0x20);
   return ((const UNICODE_STRING *)(params + 0x60))->Buffer;
 }
 /* module folder; dll_dir or the current folder; the system folders; PATH (with the current folder before it in safe mode). The result is from the process heap. */

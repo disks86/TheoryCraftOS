@@ -134,7 +134,10 @@ void notify_directory_renamed(Process& p, StringView old_path, StringView new_pa
 }
 
 // IO_STATUS_BLOCK { NTSTATUS Status (8 bytes with padding); ULONG_PTR Information; }
+// A 32-bit program's is { NTSTATUS Status; ULONG Information; }: written as such, since it may be written when the operation completes, long after the call
+// (so the 32-bit ntdll.dll cannot stand in a 64-bit one of its own for it, as it does for what is only read; docs/Wow64.md).
 bool store_io_status(Process& p, uint64_t address, uint32_t status, uint64_t information) {
+  if (p.arch() == UserArch::X86_32) return p.write_user_u32(address, status) && p.write_user_u32(address + 4, static_cast<uint32_t>(information));
   return p.write_user_u64(address, status) && p.write_user_u64(address + 8, information);
 }
 

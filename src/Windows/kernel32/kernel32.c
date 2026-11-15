@@ -2058,13 +2058,13 @@ EXPORT BOOL WINAPI GetProcessPriorityBoost(HANDLE process, PBOOL disabled) { (vo
 
 /* The limits of the thread's stack, and the part of it kept for handling a stack overflow. */
 EXPORT void WINAPI GetCurrentThreadStackLimits(PULONG_PTR low, PULONG_PTR high) {
-  *low = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);      /* DeallocationStack */
-  *high = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08);      /* StackBase */
+  *low = *(ULONG_PTR *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x1478);      /* DeallocationStack */
+  *high = *(ULONG_PTR *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x08);      /* StackBase */
 }
 EXPORT BOOL WINAPI SetThreadStackGuarantee(PULONG size) {
-  ULONG *guarantee = (ULONG *)TEB_BYTE(NtCurrentTeb(), 0x1748);
+  ULONG *guarantee = (ULONG *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x1748);
   const ULONG old = *guarantee, wanted = *size;
-  const ULONG_PTR stack = *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x08) - *(ULONG_PTR *)TEB_BYTE(NtCurrentTeb(), 0x1478);
+  const ULONG_PTR stack = *(ULONG_PTR *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x08) - *(ULONG_PTR *)TEB_BYTE(TEB_RAW(NtCurrentTeb()), 0x1478);
   *size = old;
   if (wanted == 0) return TRUE;
   if (wanted > stack / 2) { set_error(ERROR_INVALID_PARAMETER); return FALSE; }

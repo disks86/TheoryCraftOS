@@ -140,7 +140,7 @@ EXPORT NTSTATUS NTAPI RtlSetThreadErrorMode(ULONG mode, PULONG old) {
   ULONG *p = error_mode_of();
   if (old) *old = *p;
   *p = mode;
-  *(ULONG *)((BYTE *)NtCurrentTeb() + 0x16B0) = mode;      /* (TEB.HardErrorMode) */
+  *(ULONG *)(TEB_RAW(NtCurrentTeb()) + 0x16B0) = mode;      /* (TEB.HardErrorMode) */
   return STATUS_SUCCESS;
 }
 

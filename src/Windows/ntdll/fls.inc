@@ -24,7 +24,7 @@
 
 #define FLS_MAX_INDEXES 4080
 #define FLS_CHUNKS 8
-#define TEB_FLS_SLOTS(teb) (*(FlsThread **)TEB_BYTE(teb, 0x17c8))
+#define TEB_FLS_SLOTS(teb) (*(FlsThread **)TEB_BYTE(TEB_RAW(teb), 0x17c8))
 typedef struct FlsCallbackEntry { PVOID unknown; PFLS_CALLBACK_FUNCTION callback; } FlsCallbackEntry;
 typedef struct FlsCallbackChunk { ULONG_PTR count; FlsCallbackEntry callbacks[1]; } FlsCallbackChunk;
 typedef struct GlobalFls { FlsCallbackChunk *chunks[FLS_CHUNKS]; LIST_ENTRY list; ULONG high_index; } GlobalFls;

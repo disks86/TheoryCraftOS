@@ -40,6 +40,7 @@ uint64_t current_thread(Process& p) { return p.runtime() ? p.runtime()->current_
 // A 16-byte IO_STATUS_BLOCK in the program's memory.
 bool store_status_block(Process& p, uint64_t address, uint32_t status, uint64_t information) {
   if (address == 0) return true;
+  if (p.arch() == UserArch::X86_32) return p.write_user_u32(address, status) && p.write_user_u32(address + 4, static_cast<uint32_t>(information));      // (a 32-bit program's is 8 bytes)
   uint8_t raw[16] = {};
   for (uint32_t i = 0; i < 4; ++i) raw[i] = uint8_t(status >> (8 * i));
   for (uint32_t i = 0; i < 8; ++i) raw[8 + i] = uint8_t(information >> (8 * i));

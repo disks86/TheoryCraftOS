@@ -49,7 +49,7 @@
 #define ACT_SECTION_COUNT 13
 
 #define ACT_FRAME_HEAP_ALLOCATED 8
-#define TEB_ACTIVATION_STACK(teb) (*(ActStack **)TEB_BYTE(teb, 0x2c8))
+#define TEB_ACTIVATION_STACK(teb) (*(ActStack **)TEB_BYTE(TEB_RAW(teb), 0x2c8))
 
 typedef struct ActGuid { ULONG d1; USHORT d2, d3; BYTE d4[8]; } ActGuid;
 typedef struct ActFrame { struct ActFrame *previous; struct ActCtx *context; ULONG flags; } ActFrame;
@@ -1789,7 +1789,7 @@ static const BYTE *act_image_manifest(const BYTE *base, SIZE_T size, int flat, U
 
 static void act_init_process(void) {
   PEB *peb = NtCurrentPeb();
-  const BYTE *params = *(const BYTE **)((const BYTE *)peb + 0x20);
+  const BYTE *params = *(const BYTE **)(PEB_RAW() + 0x20);
   if (!params || g_process_ctx) return;
   const UNICODE_STRING *image = (const UNICODE_STRING *)(params + 0x60);
   if (!image->Buffer || image->Length < 2 || image->Length > 2 * 520) return;

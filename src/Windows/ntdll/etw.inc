@@ -96,7 +96,7 @@ EXPORT ULONG NTAPI EtwEnumerateTraceGuids(PVOID guids, ULONG count, PULONG retur
 
 /* The activity id of the thread (EtwEventActivityIdControl: 1 get, 2 set, 3 create, 4 get and set, 5 create and set; the id is in the TEB at 0x1B0). */
 EXPORT ULONG NTAPI EtwEventActivityIdControl(ULONG control, ETW_GUID_ *id) {
-  ETW_GUID_ *current = (ETW_GUID_ *)((BYTE *)NtCurrentTeb() + 0x1B0);
+  ETW_GUID_ *current = (ETW_GUID_ *)(TEB_RAW(NtCurrentTeb()) + 0x1B0);
   if (control < 1 || control > 5) return 87;
   if (!id) return 87;
   if (control == 1) { *id = *current; return 0; }
