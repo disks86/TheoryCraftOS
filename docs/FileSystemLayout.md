@@ -95,5 +95,5 @@ are lost at power-off.
 The build makes `primary.img` (the `primary` target, part of the default build): a FAT32 volume that already holds the files an installed system has on its root volume, today the
 three libraries in `/Windows/Windows/System32`. `tools/PrimaryImage.cpp` fills it with the OS's own FAT driver (`scripts/make-primary-image.sh` creates the volume with `mkfs.fat`
 the first time). An existing image keeps its files, so the disk the OS writes to survives rebuilds; the build only puts the libraries on it again. The run targets and
-`scripts/qemu-debug.sh` attach it as the primary disk. The size is `TCOS_PRIMARY_IMAGE_SIZE` (256M). A system without this disk has no Windows libraries, and Windows programs
+`scripts/qemu-debug.sh` attach it as the primary disk. The size is `TCOS_PRIMARY_IMAGE_SIZE` (10G; the file is sparse, and an image that exists keeps the size it was made with - delete it to have it made anew). A system without this disk has no Windows libraries, and Windows programs
 that need them report that they cannot load them. The boot-time user-mode demo (`TCOS_USERMODE_DEMO`) has no disk and writes copies of the libraries into its RAM file system.
