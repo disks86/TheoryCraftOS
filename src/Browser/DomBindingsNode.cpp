@@ -883,12 +883,13 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   if (IS("textContent") || (element && (IS("innerText") || IS("outerText")))) {
     if (document) return HostClass::Set::Handled;
     if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
+    if (n->is_text() || n->type == dom::NodeType::Comment) return replace_data(c, n, 0, utf16_length(n->data.view()), text.view()) ? HostClass::Set::Handled : HostClass::Set::Threw;
     return done(dom::set_text_content(n, text.view()));
   }
   if (IS("nodeValue") || ((n->is_text() || n->type == dom::NodeType::Comment) && IS("data"))) {
     if (n->is_text() || n->type == dom::NodeType::Comment) {
       if (!arg_text(vm, value, &text)) return HostClass::Set::Threw;
-      return done(dom::set_text_content(n, text.view()));
+      return replace_data(c, n, 0, utf16_length(n->data.view()), text.view()) ? HostClass::Set::Handled : HostClass::Set::Threw;
     }
     return HostClass::Set::Handled;
   }
@@ -1006,6 +1007,7 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
 // it (and for what is under it) is pointed at the new nodes, so that what a script holds on to stays the same node.
 void adopt_moved(dom::Node* from, dom::Node* to, void* user) {
   Vm& vm = *static_cast<Vm*>(user);
+  if (impl(vm).live.active()) impl(vm).live.node_moved(from, to);
   if (!from->script) return;
   JsObject* w = static_cast<JsObject*>(from->script);
   w->host_data = to;
@@ -1101,7 +1103,10 @@ NATIVE(node_has_child_nodes) {
 NATIVE(node_get_root) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  while (n->parent) n = n->parent;
+  Value composed;   // getRootNode({ composed: true }): through the shadow roots to the top of the document's tree
+  const Value options = arg_at(args, argc, 0);
+  const bool through = options.is_object() && vm.get_named(options, "composed", &composed) && Vm::to_boolean(composed);
+  while (n->parent || (through && n->shadow_host)) n = n->parent ? n->parent : n->shadow_host;
   *result = node_value(impl(vm), n);
   return true;
 }
@@ -1127,19 +1132,34 @@ NATIVE(node_compare_position) {
 NATIVE(node_normalize) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  for (dom::Node* d = n->first_child; d;) {
-    dom::Node* next = dom::next_in_tree(d, n);
-    if (d->is_text()) {
-      if (d->data.empty()) {
-        if (next == d->next || true) next = d->next ? d->next : dom::next_in_tree(d, n);
-        dom::detach(d);
-      } else if (d->next && d->next->is_text()) {
-        d->data.append(d->next->data.view());
-        dom::detach(d->next);
-        next = d;   // (look at it again: there may be more)
-      }
+  DomBindings::Impl& c = impl(vm);
+  auto plain_text = [](const dom::Node* d) { return d && d->is_text() && d->dom_type == 0; };   // (an "exclusive Text node": not a CDATA section)
+  for (dom::Node* d = dom::next_in_tree(n, n); d;) {
+    if (!plain_text(d)) {
+      d = dom::next_in_tree(d, n);
+      continue;
     }
-    d = next;
+    dom::Node* after = d;   // (where to go on: the node after `d` and what is merged into it)
+    if (d->data.empty()) {
+      while (after && !after->next && after != n) after = after->parent;
+      after = after && after != n ? after->next : nullptr;
+      dom::detach(d);
+      d = after;
+      continue;
+    }
+    if (plain_text(d->next)) {
+      String merged(vm.allocator());
+      merged.append(d->data.view());
+      uint64_t length = utf16_length(d->data.view());
+      for (dom::Node* s = d->next; plain_text(s); s = s->next) {
+        if (c.live.active()) c.live.text_merging(s, d, static_cast<uint32_t>(length));
+        length += utf16_length(s->data.view());
+        merged.append(s->data.view());
+      }
+      if (dom::set_text_content(d, merged.view()) != dom::DomError::None) return throw_dom_error(vm, dom::DomError::OutOfMemory);
+      while (plain_text(d->next)) dom::detach(d->next);
+    }
+    d = dom::next_in_tree(d, n);
   }
   return true;
 }
@@ -1191,8 +1211,7 @@ NATIVE(node_replace_children) {
   if (!n) return false;
   dom::Node* f = nodes_to_fragment(vm, args, argc);
   if (!f) return false;
-  while (n->first_child) dom::remove_child(n, n->first_child);
-  const dom::DomError e = dom::append_child(n, f);
+  const dom::DomError e = dom::replace_children(n, f);
   return e == dom::DomError::None ? true : throw_dom_error(vm, e);
 }
 
@@ -1250,13 +1269,19 @@ NATIVE(text_split) {
   double at = 0;
   if (!vm.to_number(arg_at(args, argc, 0), &at)) return false;
   if (at != at || at < 0 || at > static_cast<double>(utf16_length(n->data.view()))) return throw_dom(vm, "IndexSizeError", "The offset is larger than the node's length.");
-  const uint64_t i = utf16_to_byte(n->data.view(), static_cast<uint64_t>(at));
+  DomBindings::Impl& c = impl(vm);
+  const uint64_t offset = static_cast<uint64_t>(at), length = utf16_length(n->data.view());
+  const uint64_t i = utf16_to_byte(n->data.view(), offset);
   dom::Node* tail = n->owner->create_text(n->data.view().substr(i));
   if (!tail) return throw_dom_error(vm, dom::DomError::OutOfMemory);
-  n->data.truncate(i);
-  if (n->parent) dom::insert_before(n->parent, tail, n->next);
-  *result = node_value(impl(vm), tail);
-  return true;
+  tail->dom_type = n->dom_type;   // (a CDATA section splits into CDATA sections)
+  if (n->dom_type) tail->name.assign(n->name.view());
+  if (n->parent) {   // ("split a Text node": the new node goes in, the ranges after the cut move into it, then the text is cut)
+    dom::insert_before(n->parent, tail, n->next);
+    if (c.live.active()) c.live.text_split(n, static_cast<uint32_t>(offset), tail);
+  }
+  *result = node_value(c, tail);
+  return replace_data(c, n, offset, length - offset, StringView());
 }
 
 // --- Methods: elements -----------------------------------------------------------------------------------------------------
@@ -1980,6 +2005,7 @@ NATIVE(take_mutations) {
       at = end + 1;
     }
     vm.define_named(r, "watchers", Value::make_object(watchers));
+    if (m.group) vm.define_named(r, "group", num_value(m.group));
     vm.array_push(out, Value::make_object(r));
   }
   log.clear();

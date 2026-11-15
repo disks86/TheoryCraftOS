@@ -2863,8 +2863,7 @@ DomError set_inner_html(Node* element, StringView html) {
   if (!fragment) return DomError::OutOfMemory;
   Node* target = element->is_tag("template") ? template_content(element) : element;   // (a template's markup is its content)
   if (!target) return DomError::OutOfMemory;
-  while (target->first_child) remove_child(target, target->first_child);
-  return append_child(target, fragment);
+  return replace_children(target, fragment);
 }
 
 }  // namespace dom

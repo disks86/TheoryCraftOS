@@ -1639,6 +1639,7 @@ void Vm::collect_minor() {
   mark_roots();
   for (uint64_t i = 0; i < remembered_.count(); ++i) gray_.push_back(remembered_[i]);   // (looked into: they may point to young cells)
   trace();
+  if (sweep_hook_) sweep_hook_(sweep_user_);
   if (verify_generations) verify_minor_marks();
   prune_young_interned();
   sweep_young();
@@ -1661,6 +1662,7 @@ void Vm::collect_major() {
   marked_bytes_ = 0;
   mark_roots();
   trace();
+  if (sweep_hook_) sweep_hook_(sweep_user_);
   prune_intern_table();
   young_interned_.clear();
   young_interned_lost_ = false;
