@@ -85,6 +85,7 @@ struct PeSectionPlacement {
 bool place_pe_sections(const exe::PeFile& pe, ConstByteView file, uint64_t image_pages, PeSectionPlacement* out, uint32_t capacity, uint32_t* count);
 
 constexpr uint64_t kDefaultStackBytes = 8ull << 20;
+constexpr uint64_t kDefaultStackBytes32 = 2ull << 20;      // of a 32-bit Windows program (whose whole address space is 2 GiB)
 // Maps a read-write stack of `size` bytes just under the top of the user space, with an unmapped guard page above it. `*top` is the first address
 // past the stack (the initial stack pointer is below it).
 LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top);
@@ -97,5 +98,8 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
                              StringView platform = "x86_64");
 // The stack pointer a Windows thread starts with: 16-byte aligned plus 8 (as if just called), with the 32-byte home space above it.
 uint64_t windows_initial_stack_pointer(uint64_t stack_top);
+// The same for a thread of a 32-bit program, whose start routine takes its two arguments from the stack: writes them (and a return address of 0: the routine
+// does not return) below `stack_top` and gives the stack pointer the thread starts with. False if the stack cannot be written.
+[[nodiscard]] bool windows_initial_stack_32(IUserMemory& memory, uint64_t stack_top, uint32_t argument, uint32_t argument2, uint64_t* stack_pointer);
 
 }  // namespace process

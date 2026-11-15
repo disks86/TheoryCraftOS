@@ -121,6 +121,24 @@ bool FileLibraryProvider::find(StringView canonical_name, ConstByteView* image) 
   return path.assign("/Windows/Windows/System32/") && path.append(canonical_name) && load(path.view(), canonical_name, image);
 }
 
+// The 32-bit libraries are kept apart from the 64-bit ones of the same name: under "32:<name>".
+bool FileLibraryProvider::find_32bit(StringView canonical_name, ConstByteView* image) {
+  kernel::ScopedMutex hold(lock_);
+  String key(allocator_), path(allocator_);
+  if (!key.assign("32:") || !key.append(canonical_name)) return false;
+  for (Entry* e = entries_; e; e = e->next) {
+    if (e->name.view().equals(key.view())) {
+      *image = e->bytes.view();
+      return true;
+    }
+  }
+  if (!files_ || canonical_name.contains('/') || canonical_name.contains('\\')) return false;      // a plain file name only
+  for (const String& directory : directories_.view()) {      // (the program's own folder first: the libraries it brought are of its kind)
+    if (path.assign(directory.view()) && path.append(canonical_name) && load(path.view(), key.view(), image)) return true;
+  }
+  return path.assign("/Windows/Windows/SysWOW64/") && path.append(canonical_name) && load(path.view(), key.view(), image);
+}
+
 bool FileLibraryProvider::directory_of(StringView canonical_name, String* windows_directory) {
   kernel::ScopedMutex hold(lock_);
   for (Entry* e = entries_; e; e = e->next) {
@@ -227,7 +245,8 @@ void record_image_base(AddressSpace& space, uint64_t base) {
   const uint64_t nt = raw[0] | (uint64_t{raw[1]} << 8) | (uint64_t{raw[2]} << 16) | (uint64_t{raw[3]} << 24);
   uint8_t value[8];
   for (uint32_t i = 0; i < 8; ++i) value[i] = uint8_t(base >> (8 * i));
-  space.write_privileged(base + nt + 24 + 24, ConstByteView(value, 8));      // OptionalHeader.ImageBase
+  if (space.is_32bit()) space.write_privileged(base + nt + 24 + 28, ConstByteView(value, 4));      // OptionalHeader.ImageBase of a PE32 image: 32 bits, after BaseOfData
+  else space.write_privileged(base + nt + 24 + 24, ConstByteView(value, 8));                        // OptionalHeader.ImageBase
 }
 
 // What Windows says about the pages of a mapped image: one allocation of type image, the headers read-only, each section with the protection its characteristics ask for (a
@@ -265,6 +284,23 @@ void say(Context& c, StringView a, StringView b = StringView()) {
 void initialise_security_cookie(AddressSpace& space, const exe::PeFile& pe, uint64_t base) {
   static uint64_t counter = 0x9E3779B97F4A7C15ull;
   uint32_t rva = 0, size = 0;
+  if (!pe.is_pe32_plus()) {      // a 32-bit image: the cookie's address is 32 bits at 0x3C, and so is the cookie
+    if (!pe.directory(10, &rva, &size) || size < 0x40 || rva == 0) return;
+    uint8_t raw[4];
+    if (!space.read_privileged(base + rva + 0x3C, ByteView(raw, 4))) return;
+    const uint64_t address = raw[0] | (uint64_t{raw[1]} << 8) | (uint64_t{raw[2]} << 16) | (uint64_t{raw[3]} << 24);
+    if (address < base || address - base > pe.size_of_image() || pe.size_of_image() - (address - base) < 4) return;
+    if (!space.read_privileged(address, ByteView(raw, 4))) return;
+    const uint32_t current = raw[0] | (uint32_t{raw[1]} << 8) | (uint32_t{raw[2]} << 16) | (uint32_t{raw[3]} << 24);
+    constexpr uint32_t kDefault32 = 0xBB40E64Eu;
+    if (current != kDefault32 && current != 0) return;
+    counter = counter * 6364136223846793005ull + 1442695040888963407ull + base;
+    uint32_t value = static_cast<uint32_t>(counter >> 32) ^ static_cast<uint32_t>(base << 3);
+    if (value == 0 || value == kDefault32) value = kDefault32 + 1;
+    for (uint32_t i = 0; i < 4; ++i) raw[i] = uint8_t(value >> (8 * i));
+    space.write_privileged(address, ConstByteView(raw, 4));
+    return;
+  }
   if (!pe.directory(10, &rva, &size) || size < 0x60 || rva == 0) return;      // IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG; the cookie is at 0x58
   uint8_t raw[8];
   if (!space.read_privileged(base + rva + 0x58, ByteView(raw, 8))) return;
@@ -294,14 +330,17 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
     return LoadStatus::NeedsLibraries;
   }
   ConstByteView file;
-  if (!c.provider.find(canonical, &file)) return LoadStatus::Ok;      // not available: its imports become stubs
+  const bool wow = c.space.is_32bit();      // a 32-bit program: its libraries are 32-bit ones
+  if (!(wow ? c.provider.find_32bit(canonical, &file) : c.provider.find(canonical, &file))) return LoadStatus::Ok;      // not available: its imports become stubs
   UniquePointer<Module> module = UniquePointer<Module>::make(c.allocator, c.allocator);
   if (!module || !module->name.assign(canonical)) return LoadStatus::OutOfMemory;
   c.provider.directory_of(canonical, &module->directory);      // (where it came from, when that is not System32: the program's own folder)
   const bool parsed_ok = module->owned.parse(file);
   const bool data_only_32bit = parsed_ok && !module->owned.is_pe32_plus() && module->owned.machine() == 0x14C && !pe_image_contains_code(module->owned);
-  if (!parsed_ok || !(data_only_32bit || (module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineAmd64)) || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
-    say(c, canonical, " is not a 64-bit x86 DLL");
+  const bool right_kind = parsed_ok && (wow ? !module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineI386
+                                            : module->owned.is_pe32_plus() && module->owned.machine() == exe::kPeMachineAmd64);
+  if (!parsed_ok || !(right_kind || (data_only_32bit && !wow)) || (!module->owned.is_dll() && !(c.allow_program && depth == 1))) {
+    say(c, canonical, wow ? " is not a 32-bit x86 DLL" : " is not a 64-bit x86 DLL");
     return LoadStatus::Malformed;
   }
   module->pe = &module->owned;
@@ -358,7 +397,7 @@ LoadStatus ensure_loaded(Context& c, StringView canonical, uint32_t depth, Modul
   describe_image_pages(c.space, pe, base);
   module->base = base;
   module->size = size;
-  module->no_bind = !c.bind || !pe.is_dll() || !pe.is_pe32_plus();      // (a program image loaded as a library is only mapped)
+  module->no_bind = !c.bind || !pe.is_dll() || !right_kind;      // (a program image loaded as a library is only mapped)
   module->entry = pe.is_dll() ? image.entry : 0;
   Module* raw = module.get();
   if (!c.set.modules_.push_back(static_cast<UniquePointer<Module>&&>(module))) return LoadStatus::OutOfMemory;
@@ -421,6 +460,13 @@ bool put_u64(AddressSpace& space, uint64_t address, uint64_t value) {
   return space.write_privileged(address, ConstByteView(raw, 8));
 }
 
+bool put_u32(AddressSpace& space, uint64_t address, uint64_t value) {
+  if (value > 0xFFFFFFFFull) return false;
+  uint8_t raw[4];
+  for (uint32_t i = 0; i < 4; ++i) raw[i] = static_cast<uint8_t>(value >> (8 * i));
+  return space.write_privileged(address, ConstByteView(raw, 4));
+}
+
 // Fills the import address table of one module.
 LoadStatus bind_imports(Context& c, Module& module) {
   String library(c.allocator);
@@ -454,7 +500,8 @@ LoadStatus bind_imports(Context& c, Module& module) {
       address = c.set.stub_base_ + c.set.missing_.count() * kStubSize;
       if (!c.set.missing_.push_back(static_cast<String&&>(described))) return LoadStatus::OutOfMemory;
     }
-    if (!put_u64(c.space, module.base + imp.slot_rva, address)) return LoadStatus::Malformed;
+    // (a slot of the table is as wide as a pointer of the program)
+    if (!(module.pe->is_pe32_plus() ? put_u64(c.space, module.base + imp.slot_rva, address) : put_u32(c.space, module.base + imp.slot_rva, address))) return LoadStatus::Malformed;
   }
   return LoadStatus::Ok;
 }

@@ -21,6 +21,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/Process.hpp"
+#include "Process/HostArch.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsSyscalls.hpp"
 
@@ -105,6 +106,23 @@ static Bytes pe_header(uint16_t machine, uint16_t characteristics, uint16_t subs
   return b;
 }
 
+// The same as a PE32 image (a 32-bit program): the optional header is 224 bytes, with a 32-bit image base after BaseOfData.
+static Bytes pe32_header(uint16_t machine, uint16_t characteristics, uint16_t subsystem) {
+  Bytes b(0x400, 0);
+  auto u16 = [&](size_t o, uint16_t v) { b[o] = uint8_t(v); b[o + 1] = uint8_t(v >> 8); };
+  auto u32 = [&](size_t o, uint32_t v) { u16(o, uint16_t(v)); u16(o + 2, uint16_t(v >> 16)); };
+  b[0] = 'M'; b[1] = 'Z'; u32(0x3C, 0x40);
+  b[0x40] = 'P'; b[0x41] = 'E';
+  u16(0x44, machine); u16(0x46, 1); u16(0x54, 224); u16(0x56, characteristics);
+  const size_t o = 0x58;
+  u16(o, 0x10B); u32(o + 16, 0x1000); u32(o + 20, 0x1000); u32(o + 28, 0x400000); u32(o + 32, 0x1000); u32(o + 36, 0x200);
+  u32(o + 56, 0x2000); u32(o + 60, 0x200); u16(o + 68, subsystem); u32(o + 92, 16);
+  const size_t s = 0x138;
+  b[s] = '.'; b[s + 1] = 't'; u32(s + 8, 0x100); u32(s + 12, 0x1000); u32(s + 16, 0x200); u32(s + 20, 0x200);
+  u32(s + 36, 0x60000020u);
+  return b;
+}
+
 static ProcessBinding binding_for(SyscallAbi abi, UserArch arch) {
   return ProcessBinding{abi, arch, syscall_interface(abi, arch)};
 }
@@ -161,8 +179,36 @@ static void test_selection() {
   CHECK(pe.parse(ConstByteView(efi.data(), efi.size())));
   CHECK(!bind_executable(pe, &b));
 
+  // A 32-bit Windows program (PE32 for i386) speaks the same services; the kinds do not mix (a PE32 image for x86-64, a PE32+ image for i386).
+  Bytes p32 = pe32_header(0x014C, 0x0102, 3);
+  CHECK(pe.parse(ConstByteView(p32.data(), p32.size())) && !pe.is_pe32_plus() && pe.image_base() == 0x400000);
+  b = ProcessBinding{};
+  CHECK(bind_executable(pe, &b) && b.abi == SyscallAbi::Windows && b.arch == UserArch::X86_32 && b.interface == syscall_interface(SyscallAbi::Windows, UserArch::X86_64));
+  Bytes dll32 = pe32_header(0x014C, 0x2102, 3);
+  CHECK(pe.parse(ConstByteView(dll32.data(), dll32.size())));
+  b = ProcessBinding{};
+  CHECK(!bind_executable(pe, &b));
+  Bytes odd = pe32_header(0x8664, 0x0002, 3);
+  if (pe.parse(ConstByteView(odd.data(), odd.size()))) CHECK(!bind_executable(pe, &b));
+  Bytes odd_plus = pe_header(0x014C, 0x0002, 3);
+  if (pe.parse(ConstByteView(odd_plus.data(), odd_plus.size()))) CHECK(!bind_executable(pe, &b));
+  CHECK(syscall_interface(SyscallAbi::Linux, UserArch::X86_32) == nullptr);
+  CHECK(runs_natively(UserArch::X86_32) == (native_arch() == UserArch::X86_64) && user_arch_for(exe::Architecture::X86_32) == UserArch::X86_32);
+
   CHECK(syscall_interface(SyscallAbi::Windows, UserArch::AArch64) == nullptr);
   CHECK(syscall_interface(SyscallAbi::None, UserArch::X86_64) == nullptr);
+}
+
+// INT 2E of a 32-bit Windows program: the number in EAX, the arguments (64 bits each) where EDX points; the services find the ones past the fourth
+// where they look for a 64-bit program's stack arguments.
+static void test_decode_32() {
+  const uint64_t first[4] = {0xFFFFFFFFFFFFFFFFull, 0x1000, 3, 0x2000};
+  SyscallRequest q;
+  decode_x86_32_windows(7, 0x00123450, ArrayView<const uint64_t>(first, 4), &q);
+  CHECK(q.number == 7 && q.args[0] == ~uint64_t{0} && q.args[1] == 0x1000 && q.args[2] == 3 && q.args[3] == 0x2000 && q.args[4] == 0);
+  for (uint32_t i = 4; i < 12; ++i) CHECK(q.user_stack + kWindowsStackArgumentBase + (i - 4) * 8 == 0x00123450ull + i * 8);
+  decode_x86_32_windows(0xFFFFFFFFu, 0xFFFFFFF0u, ArrayView<const uint64_t>(first, 4), &q);      // (nothing wraps at the top of 32 bits)
+  CHECK(q.number == 0xFFFFFFFFu && q.user_stack + kWindowsStackArgumentBase == 0xFFFFFFF0ull + 32);
 }
 
 static void test_decode() {
@@ -633,6 +679,7 @@ static void test_service_numbers_agree() {
 
 int main() {
   test_selection();
+  test_decode_32();
   test_decode();
   test_linux();
   test_linux_generic_table();

@@ -43,11 +43,14 @@ constexpr UserArch user_arch_for(exe::Architecture arch) {
     case exe::Architecture::AArch64: return UserArch::AArch64;
     case exe::Architecture::RiscV64: return UserArch::RiscV64;
     case exe::Architecture::LoongArch64: return UserArch::LoongArch64;
+    case exe::Architecture::X86_32: return UserArch::X86_32;
     default: return UserArch::None;
   }
 }
 
 // A program for `guest` cannot use the CPU's own user mode and needs the emulator.
-constexpr bool needs_emulation(UserArch guest) { return guest != UserArch::None && guest != native_arch(); }
+// (A 32-bit x86 program runs on an x86-64 CPU as it is, in compatibility mode.)
+constexpr bool runs_natively(UserArch guest) { return guest == native_arch() || (guest == UserArch::X86_32 && native_arch() == UserArch::X86_64); }
+constexpr bool needs_emulation(UserArch guest) { return guest != UserArch::None && !runs_natively(guest); }
 
 }  // namespace process

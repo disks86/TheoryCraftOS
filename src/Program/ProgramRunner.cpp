@@ -115,15 +115,15 @@ Plan plan_for(const ProgramRun& run, ConstByteView image, String* message) {
     message->append(", which this OS cannot run");
     return Plan::Impossible;
   }
-  if (run.kind == exe::ExecutableKind::Pe && guest != process::UserArch::X86_64) {
+  if (run.kind == exe::ExecutableKind::Pe && guest != process::UserArch::X86_64 && guest != process::UserArch::X86_32) {
     message->assign("this Windows program is for ");
     message->append(exe::architecture_name(arch));
-    message->append("; only x86-64 Windows programs are supported");
+    message->append("; only x86 Windows programs (64-bit and 32-bit) are supported");
     return Plan::Impossible;
   }
   const bool native_possible =
 #if defined(__x86_64__)
-      guest == process::native_arch();
+      process::runs_natively(guest);      // (a 32-bit x86 program too: in the CPU's compatibility mode)
 #else
       false;      // (the other machines have no ring-3 entry yet: every program is emulated)
 #endif

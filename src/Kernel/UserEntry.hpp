@@ -26,6 +26,10 @@ struct Thread;
 #if defined(__x86_64__)
 // Selectors of the per-core GDT (kernel code and data come first, see Interrupts.hpp).
 constexpr uint16_t kSelectorUserData = 0x18 | 3, kSelectorUserCode = 0x20 | 3, kSelectorTss = 0x28;
+// The code segment of 32-bit programs (compatibility mode: the same CPU, 32-bit operands and addresses). Their data, stack and FS segments are the user data
+// segment, which is flat; FS gets its base (the 32-bit TEB) from the FS base register, as a 64-bit program's GS does.
+constexpr uint16_t kSelectorUserCode32 = 0x38 | 3;
+constexpr uint8_t kVectorSyscall32 = 0x2E;    // INT 2E: how a 32-bit Windows program calls a system service
 constexpr uint8_t kVectorSyscall = 0x80;      // what the SYSCALL entry stub reports as its "interrupt"
 
 // What the CPU and the entry stubs need while they are still on the user page tables, so it all sits in the core's own page (see Core in the thread

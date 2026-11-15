@@ -67,11 +67,20 @@ class AddressSpace final : public IUserMemory {
  public:
   static constexpr uint64_t kPageSize = 4096;
   static constexpr uint64_t kUserTop = 0x0000800000000000ull;      // the lower half of 48-bit addresses
+  // The top of a 32-bit Windows program's addresses: the last 64 KiB below 2 GiB are no man's land, as on Windows (the shared user data page is just below).
+  static constexpr uint64_t kUserTop32 = 0x7FFF0000ull;
+  // Where find_free() starts looking when it is asked for a place above the top: the callers' hints are made for 64-bit programs.
+  static constexpr uint64_t kLowHint32 = 0x10000000ull;
 
   // `max_bytes` limits what all regions together may span (kNoLimit: only memory itself limits what is touched).
   explicit AddressSpace(allocators::IAllocator& allocator, uint64_t max_bytes = kNoLimit) : allocator_(allocator), retired_(allocator), regions_(allocator), pages_(allocator), max_bytes_(max_bytes) {}
   ~AddressSpace();
   static constexpr uint64_t kNoLimit = ~uint64_t{0};
+  // The end of the addresses regions may have (kUserTop unless set lower: a 32-bit program's pointers reach 4 GiB at most, and Windows gives such
+  // a program the lower 2 GiB). Set before anything is mapped.
+  uint64_t top() const { return top_; }
+  void set_top(uint64_t top) { top_ = top < kUserTop ? round_down(top) : kUserTop; }
+  bool is_32bit() const { return top_ <= 0x100000000ull; }
   AddressSpace(const AddressSpace&) = delete;
   AddressSpace& operator=(const AddressSpace&) = delete;
 
@@ -100,7 +109,8 @@ class AddressSpace final : public IUserMemory {
   // Unmaps whatever is mapped inside [address, address + size) (size rounded up); regions that stick out are cut. Gaps are fine. False for a bad range
   // or if cutting a region ran out of memory (nothing is unmapped then).
   bool unmap(uint64_t address, uint64_t size);
-  // The lowest page-aligned address at or above `hint` where `size` bytes fit between regions and below kUserTop.
+  // The lowest page-aligned address at or above `hint` where `size` bytes fit between regions and below the top. A hint at or above a lowered top
+  // counts as kLowHint32.
   bool find_free(uint64_t size, uint64_t hint, uint64_t* out) const;
   // Changes the permissions of a range, cutting regions at its ends. Every page of the range must be mapped, or nothing changes.
   bool protect(uint64_t address, uint64_t size, uint8_t protection);
@@ -240,6 +250,7 @@ class AddressSpace final : public IUserMemory {
   List<UniquePointer<Region>> regions_;      // sorted by base
   PageMap pages_;                            // the memory of the private pages
   uint64_t max_bytes_;
+  uint64_t top_ = kUserTop;
   uint64_t mapped_bytes_ = 0;
   uint64_t shared_bytes_ = 0;
   static constexpr uint32_t kMaxChanges = 16;

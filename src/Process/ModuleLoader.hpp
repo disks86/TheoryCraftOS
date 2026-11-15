@@ -36,6 +36,9 @@ class ILibraryProvider {
   // The file of a library by its canonical name ("kernel32.dll", see canonical_library_name()). False if there is none. The bytes must stay valid until the
   // provider is destroyed or find() is called again for the same name.
   virtual bool find(StringView canonical_name, ConstByteView* image) = 0;
+  // The same for a 32-bit program: its libraries are the 32-bit ones (C:\Windows\SysWOW64, where a 64-bit program has C:\Windows\System32). False where
+  // there are none.
+  virtual bool find_32bit(StringView canonical_name, ConstByteView* image) { (void)canonical_name; (void)image; return false; }
   // The Windows folder the library found by find() came from ("C:\\Program Files\\App\\", with the backslash at the end), if not System32. False: System32.
   virtual bool directory_of(StringView canonical_name, String* windows_directory) { (void)canonical_name; (void)windows_directory; return false; }
 
@@ -77,6 +80,7 @@ class FileLibraryProvider final : public ILibraryProvider {
   FileLibraryProvider(allocators::IAllocator& allocator, filesystem::IFileSystem* files);
   ~FileLibraryProvider();
   bool find(StringView canonical_name, ConstByteView* image) override;
+  bool find_32bit(StringView canonical_name, ConstByteView* image) override;
   bool directory_of(StringView canonical_name, String* windows_directory) override;
   // A folder of the OS file system ("/Windows/Program Files/App") to look in before System32.
   bool add_directory(StringView directory);

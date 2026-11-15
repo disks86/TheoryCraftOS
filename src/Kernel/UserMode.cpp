@@ -137,6 +137,7 @@ void load_core(void* argument) {
   entry->gdt[2] = 0x00CF92000000FFFFull;      // kernel data
   entry->gdt[3] = 0x00CFF2000000FFFFull;      // user data (ring 3)
   entry->gdt[4] = 0x00AFFA000000FFFFull;      // user code, 64-bit (ring 3)
+  entry->gdt[7] = 0x00CFFA000000FFFFull;      // user code, 32-bit (ring 3): compatibility mode, for 32-bit Windows programs
   const uint64_t tss = address_of(entry->tss);
   entry->gdt[5] = tss_descriptor_low(tss, 103);
   entry->gdt[6] = tss >> 32;
@@ -149,6 +150,11 @@ void load_core(void* argument) {
   __asm__ volatile("lgdt %0" ::"m"(gdt) : "memory");
   __asm__ volatile("ltr %0" ::"r"(kSelectorTss) : "memory");
   __asm__ volatile("lidt %0" ::"m"(idt) : "memory");
+  // A 32-bit program addresses its data through DS, ES and SS and its TEB through FS, and compatibility mode checks those segments (a 64-bit program's are
+  // ignored, so nothing loads them otherwise): DS, ES and FS are the flat user data segment from here on, on every core. Nothing in the kernel uses them;
+  // interrupts and returns leave them alone. (FS keeps the base the FS base register gives it at every thread switch; loading the selector clears it once, here.
+  // GS is left as it is: its base is the kernel's while the kernel runs.)
+  __asm__ volatile("mov %0, %%ds\n mov %0, %%es\n mov %0, %%fs" ::"r"(static_cast<uint32_t>(kSelectorUserData)) : "memory");
   // Global pages would survive the switch of page tables and could shadow a user address.
   uint64_t cr4;
   __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
@@ -284,8 +290,24 @@ Frame* on_syscall(Frame* frame, void*) {
   regs.rsi = frame->rsi; regs.rdi = frame->rdi; regs.r8 = frame->r8; regs.r9 = frame->r9; regs.r10 = frame->r10; regs.r11 = frame->r11;
   process::SyscallRequest request;
   self->syscall_frame = frame;
-  if (process::decode_x86_64(process->abi(), regs, &request)) frame->rax = process->syscall(request);
-  else frame->rax = ~uint64_t{37};      // -ENOSYS
+  if ((frame->vector & 0xFF) == kVectorSyscall32) {
+    // INT 2E. Only a 32-bit Windows program has a use for it: anything else gets "no such service" (a 64-bit program's services are reached by SYSCALL).
+    uint64_t first_four[4] = {};
+    bool readable = process->arch() == process::UserArch::X86_32;
+    for (uint32_t i = 0; readable && i < 4; ++i) readable = process->read_user_u64((frame->rdx & 0xFFFFFFFFu) + uint64_t{i} * 8, &first_four[i]);
+    if (process->arch() != process::UserArch::X86_32) {
+      frame->rax = 0xC000001Cu;      // STATUS_INVALID_SYSTEM_SERVICE
+    } else if (!readable) {
+      frame->rax = 0xC0000005u;      // STATUS_ACCESS_VIOLATION: the arguments are not there
+    } else {
+      process::decode_x86_32_windows(static_cast<uint32_t>(frame->rax), static_cast<uint32_t>(frame->rdx), ArrayView<const uint64_t>(first_four, 4), &request);
+      frame->rax = process->syscall(request) & 0xFFFFFFFFu;
+    }
+  } else if (process::decode_x86_64(process->abi(), regs, &request)) {
+    frame->rax = process->syscall(request);
+  } else {
+    frame->rax = ~uint64_t{37};      // -ENOSYS
+  }
   self->syscall_frame = nullptr;
   process::Process::LinuxThreadState::CloneRequest clone;
   if (process->take_clone(&clone) && !task->start_linux_thread(*frame, clone)) frame->rax = uint64_t(-int64_t{11});      // clone()/clone3(): -EAGAIN if no thread
@@ -525,7 +547,8 @@ void user_main(void* argument) {
   frame.rdx = start.argument2;
   frame.vector = frame.error = 0;
   frame.rip = start.entry;
-  frame.cs = kSelectorUserCode;
+  // A 32-bit program starts in the 32-bit code segment (its arguments are on its stack, where whoever made the thread put them).
+  frame.cs = task->program.process()->arch() == process::UserArch::X86_32 ? kSelectorUserCode32 : kSelectorUserCode;
   frame.rflags = kFlagsInterrupt | 2;
   frame.rsp = start.stack_pointer;
   frame.ss = kSelectorUserData;
@@ -579,7 +602,8 @@ bool init(allocators::IAllocator& allocator) {
     gate.offset_low = static_cast<uint16_t>(stub);
     gate.selector = kSelectorCode;
     gate.ist = 0;
-    gate.type_attributes = v == 3 ? 0xEE : 0x8E;      // present, interrupt gate; ring 0 only except INT3, which a program may execute (a breakpoint)
+    // present, interrupt gate; ring 0 only except INT3, which a program may execute (a breakpoint), and INT 2E, a 32-bit Windows program's system call
+    gate.type_attributes = v == 3 || v == kVectorSyscall32 ? 0xEE : 0x8E;
     gate.offset_middle = static_cast<uint16_t>(stub >> 16);
     gate.offset_high = static_cast<uint32_t>(stub >> 32);
     gate.reserved = 0;
@@ -587,6 +611,7 @@ bool init(allocators::IAllocator& allocator) {
   g.ranges[g.range_count++] = {address_of(g.code), g.code_bytes};
   g.ranges[g.range_count++] = {address_of(g.idt), kPageSize};
   set_interrupt_handler(kVectorSyscall, on_syscall, nullptr);
+  set_interrupt_handler(kVectorSyscall32, on_syscall, nullptr);
   set_user_fault_handler(on_user_fault);
   set_user_tick_hook(on_user_tick);
 

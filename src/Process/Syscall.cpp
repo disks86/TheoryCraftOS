@@ -44,7 +44,7 @@ const ISyscallInterface* syscall_interface(SyscallAbi abi, UserArch arch) {
     case SyscallAbi::Linux:
       if (arch == UserArch::X86_64 || arch == UserArch::AArch64 || arch == UserArch::RiscV64 || arch == UserArch::LoongArch64) return &linux_interface(arch);
       return nullptr;
-    case SyscallAbi::Windows: return arch == UserArch::X86_64 ? &windows_interface() : nullptr;
+    case SyscallAbi::Windows: return arch == UserArch::X86_64 || arch == UserArch::X86_32 ? &windows_interface() : nullptr;      // (one set of services for both)
     default: return nullptr;
   }
 }
@@ -73,12 +73,26 @@ bool bind_executable(const exe::ElfFile& elf, ProcessBinding* out) {
 }
 
 bool bind_executable(const exe::PeFile& pe, ProcessBinding* out) {
-  if (pe.is_dll() || !pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) return false;
+  if (pe.is_dll()) return false;
+  // A 64-bit program (PE32+ for x86-64) or a 32-bit one (PE32 for i386); nothing in between.
+  UserArch arch = UserArch::None;
+  if (pe.is_pe32_plus() && pe.machine() == exe::kPeMachineAmd64) arch = UserArch::X86_64;
+  else if (!pe.is_pe32_plus() && pe.machine() == exe::kPeMachineI386) arch = UserArch::X86_32;
+  else return false;
   if (pe.subsystem() != exe::kPeSubsystemConsole && pe.subsystem() != exe::kPeSubsystemGui) return false;
-  const ISyscallInterface* interface = syscall_interface(SyscallAbi::Windows, UserArch::X86_64);
+  const ISyscallInterface* interface = syscall_interface(SyscallAbi::Windows, arch);
   if (!interface) return false;
-  *out = ProcessBinding{SyscallAbi::Windows, UserArch::X86_64, interface};
+  *out = ProcessBinding{SyscallAbi::Windows, arch, interface};
   return true;
+}
+
+void decode_x86_32_windows(uint32_t eax, uint32_t edx, ArrayView<const uint64_t> first_four, SyscallRequest* out) {
+  SyscallRequest request;
+  request.number = eax;
+  for (uint64_t i = 0; i < 4 && i < first_four.size(); ++i) request.args[i] = first_four[i];
+  // The services read argument i (from the fifth on) at user_stack + 0x28 + (i - 4) * 8; here it is at EDX + i * 8.
+  request.user_stack = uint64_t{edx} + 4 * 8 - kWindowsStackArgumentBase;
+  *out = request;
 }
 
 bool decode_x86_64(SyscallAbi abi, const X86UserRegisters& regs, SyscallRequest* out) {

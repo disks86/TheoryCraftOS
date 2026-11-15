@@ -337,6 +337,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     exe::PeFile& pe = *headers;
     if (!pe.parse(file)) return LoadStatus::Malformed;
     if (!bind_executable(pe, &binding)) return LoadStatus::Unsupported;
+    const bool wow = binding.arch == UserArch::X86_32;      // a 32-bit program: everything it can point at is below 2 GiB
+    if (wow) space_.set_top(AddressSpace::kUserTop32);
     describe_pe_image(pe, file.size(), image_information);
     if (!pe.imports().empty() && !libraries_) return LoadStatus::NeedsLibraries;      // nothing resolves imports: it would jump to address 0
     LoadStatus status = load_pe(pe, file, space_, &image, false);
@@ -350,7 +352,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       status = load_windows_modules(space_, allocator_, pe, file, program_file, *libraries_, modules.get(), &detail_, !defer_loading_);
       if (status != LoadStatus::Ok) return status;
     }
-    status = map_stack(space_, kDefaultStackBytes, &stack_top);
+    const uint64_t stack_bytes = wow ? kDefaultStackBytes32 : kDefaultStackBytes;
+    status = map_stack(space_, stack_bytes, &stack_top);
     if (status != LoadStatus::Ok) return status;
     stack_pointer = windows_initial_stack_pointer(stack_top);
     String command_line(allocator_);
@@ -360,7 +363,7 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
     input.process_id = id_;
     input.thread_id = id_;
     input.stack_top = stack_top;
-    input.stack_size = kDefaultStackBytes;
+    input.stack_size = stack_bytes;
     input.image_path = path.empty() ? StringView("C:\\program.exe") : path;
     input.command_line = command_line.view();
     input.environment = environment;
@@ -399,6 +402,8 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
       argument2 = startup.peb;
       image.entry = thunk;
     }
+    // A 32-bit program finds its two arguments on its stack, as a call leaves them.
+    if (wow && !windows_initial_stack_32(space_, stack_top, static_cast<uint32_t>(argument), static_cast<uint32_t>(argument2), &stack_pointer)) return LoadStatus::OutOfMemory;
     dispatcher = modules ? modules->export_address("ntdll.dll", "KiUserExceptionDispatcher") : 0;
     thread_thunk = modules ? modules->export_address("ntdll.dll", "TcosThreadStart") : 0;
     thread_support.peb = startup.peb;

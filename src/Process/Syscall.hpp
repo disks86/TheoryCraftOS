@@ -30,7 +30,9 @@ namespace process {
 // system services that ntdll.dll's stubs invoke). The two never mix inside one process.
 enum class SyscallAbi : uint8_t { None, Linux, Windows };
 // The CPU the program was built for; selects the register convention and, for Linux, the number table.
-enum class UserArch : uint8_t { None, X86_64, AArch64, RiscV64, LoongArch64 };
+// X86_32 is a 32-bit Windows program (PE32, i386): it runs in the compatibility mode of an x86-64 CPU and speaks the same NT services, called through INT 2E
+// (decode_x86_32_windows). There is no 32-bit Linux interface.
+enum class UserArch : uint8_t { None, X86_64, AArch64, RiscV64, LoongArch64, X86_32 };
 
 StringView abi_name(SyscallAbi abi);
 // ELF -> Linux, PE -> Windows, anything else -> None.
@@ -82,6 +84,12 @@ struct X86UserRegisters {
   uint64_t rax = 0, rcx = 0, rdx = 0, rbx = 0, rsp = 0, rbp = 0, rsi = 0, rdi = 0, r8 = 0, r9 = 0, r10 = 0, r11 = 0;
 };
 bool decode_x86_64(SyscallAbi abi, const X86UserRegisters& regs, SyscallRequest* out);
+// A 32-bit Windows program's INT 2E: the service number in EAX, and in EDX the address of the arguments, every one of them a 64-bit value in the
+// program's memory (the 32-bit ntdll.dll widens what it is given and lays structures out as the 64-bit services read them, so that the services
+// themselves are the same for both kinds of program). `first_four` are the first four of them, read by the caller; the services read the others
+// themselves, eight bytes apart, as they read a 64-bit program's stack arguments (so `user_stack` is set to where that reading finds them).
+inline constexpr uint64_t kWindowsStackArgumentBase = 0x28;      // a 64-bit program's fifth argument is at RSP + 0x28
+void decode_x86_32_windows(uint32_t eax, uint32_t edx, ArrayView<const uint64_t> first_four, SyscallRequest* out);
 // AArch64 SVC (Linux only): number in x8, arguments x0..x5. `x` holds x0..x30.
 bool decode_aarch64_linux(ArrayView<const uint64_t> x, SyscallRequest* out);
 // RISC-V ECALL (Linux only): number in a7 (x17), arguments a0..a5 (x10..x15). `x` holds x0..x31.

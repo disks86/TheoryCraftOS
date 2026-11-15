@@ -118,7 +118,7 @@ void AddressSpace::remove_region(uint64_t index) {
 bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
   uint64_t rounded = 0;
   if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded)) return false;
-  if (address >= kUserTop || rounded > kUserTop - address) return false;
+  if (address >= top_ || rounded > top_ - address) return false;
   if (rounded > max_bytes_ || mapped_bytes_ > max_bytes_ - rounded) return false;
   const uint64_t index = first_ending_after(address);
   if (index < regions_.count() && regions_[index]->base < address + rounded) return false;      // overlaps the region after
@@ -140,7 +140,7 @@ bool AddressSpace::map(uint64_t address, uint64_t size, uint8_t protection) {
 bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protection, uint8_t* storage, SharedMemory* owner) {
   uint64_t rounded = 0;
   if (!storage || !owner || size == 0 || address % kPageSize != 0 || !round_up(size, &rounded)) return false;
-  if (address >= kUserTop || rounded > kUserTop - address) return false;
+  if (address >= top_ || rounded > top_ - address) return false;
   if (rounded > max_bytes_ || mapped_bytes_ > max_bytes_ - rounded) return false;
   const uint64_t index = first_ending_after(address);
   if (index < regions_.count() && regions_[index]->base < address + rounded) return false;
@@ -243,7 +243,7 @@ bool AddressSpace::discard(uint64_t address, uint64_t size) {
 
 bool AddressSpace::prepare_range(uint64_t address, uint64_t size, uint64_t* end) const {
   uint64_t rounded = 0;
-  if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || address >= kUserTop || rounded > kUserTop - address) return false;
+  if (size == 0 || address % kPageSize != 0 || !round_up(size, &rounded) || address >= top_ || rounded > top_ - address) return false;
   *end = address + rounded;
   return true;
 }
@@ -354,7 +354,7 @@ bool AddressSpace::set_page_protect(uint64_t address, uint64_t size, uint32_t pr
 }
 
 bool AddressSpace::break_copy_on_write(uint64_t address, uint64_t size) {
-  if (size == 0 || address >= kUserTop || size > kUserTop - address) return false;
+  if (size == 0 || address >= top_ || size > top_ - address) return false;
   bool any = false;
   for (uint64_t page = round_down(address); page < address + size; page += kPageSize) {
     uint64_t i = first_ending_after(page);
@@ -447,7 +447,7 @@ bool AddressSpace::resize(uint64_t base, uint64_t size) {
   }
   if (rounded > r.size) {
     const uint64_t extra = rounded - r.size;
-    if (base >= kUserTop || rounded > kUserTop - base || extra > max_bytes_ || mapped_bytes_ > max_bytes_ - extra) return false;
+    if (base >= top_ || rounded > top_ - base || extra > max_bytes_ || mapped_bytes_ > max_bytes_ - extra) return false;
     if (i + 1 < regions_.count() && regions_[i + 1]->base < base + rounded) return false;
     if (overlaps_reserved(base + r.size, base + rounded)) return false;
     note_change(base + r.size, base + rounded);      // (the new pages have no memory: they are zero)
@@ -472,11 +472,12 @@ bool AddressSpace::region_extent(uint64_t address, uint64_t* base, uint64_t* siz
 
 bool AddressSpace::find_free(uint64_t size, uint64_t hint, uint64_t* out) const {
   uint64_t rounded = 0;
-  if (size == 0 || !round_up(size, &rounded) || rounded > kUserTop) return false;
+  if (size == 0 || !round_up(size, &rounded) || rounded > top_) return false;
   uint64_t candidate = round_down(hint);
+  if (candidate >= top_ && top_ < kUserTop) candidate = kLowHint32;      // (a place asked for where a 64-bit program has room: anywhere, then)
   if (candidate < kPageSize) candidate = kPageSize;      // never hand out page zero
   for (;;) {
-    if (candidate > kUserTop - rounded) return false;
+    if (candidate > top_ - rounded) return false;
     uint64_t after = 0;
     const uint64_t i = first_ending_after(candidate);
     if (i < regions_.count() && regions_[i]->base < candidate + rounded) {
@@ -492,7 +493,7 @@ bool AddressSpace::find_free(uint64_t size, uint64_t hint, uint64_t* out) const 
 
 bool AddressSpace::check(uint64_t address, uint64_t size, uint8_t protection) const {
   if (size == 0) return true;
-  if (address >= kUserTop || size > kUserTop - address) return false;
+  if (address >= top_ || size > top_ - address) return false;
   uint64_t cursor = address;
   const uint64_t end = address + size;
   for (uint64_t i = first_ending_after(address); cursor < end; ++i) {

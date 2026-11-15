@@ -98,6 +98,26 @@ static void test_address_space() {
   CHECK(s.find_free(0x8000, 0x1000, &at) && at == 0x1000);         // fits below 0xF000
   CHECK(s.find_free(0x10000, 0x1000, &at) && at == 0x12000);       // too big for the low hole
   CHECK(!s.find_free(AddressSpace::kUserTop, 0, &at));
+
+  // The address space of a 32-bit program ends below 2 GiB: nothing is mapped or found above, and a place asked for up there (the hints are made
+  // for 64-bit programs) is found low instead.
+  {
+    AddressSpace low(A);
+    CHECK(low.top() == AddressSpace::kUserTop && !low.is_32bit());
+    low.set_top(AddressSpace::kUserTop32);
+    CHECK(low.top() == 0x7FFF0000ull && low.is_32bit());
+    uint64_t where = 0;
+    CHECK(low.map(0x400000, 0x2000, kProtRead) && low.map(0x7FFE0000, 0x1000, kProtRead));
+    CHECK(!low.map(0x7FFF0000, 0x1000, kProtRead) && !low.map(0x7FFEF000, 0x2000, kProtRead) && !low.map(0x100000000ull, 0x1000, kProtRead));
+    CHECK(low.find_free(0x10000, 0x00007FF000000000ull, &where) && where == AddressSpace::kLowHint32);
+    CHECK(low.map(where, 0x10000, kProtRead | kProtWrite));
+    CHECK(low.find_free(0x10000, 0x00007FF800000000ull, &where) && where == AddressSpace::kLowHint32 + 0x10000);
+    CHECK(low.find_free(0x1000, 0x7FFE0000, &where) && where == 0x7FFE1000 && low.find_free(0xF000, 0x7FFE0000, &where) && !low.find_free(0x10000, 0x7FFE0000, &where));
+    CHECK(!low.find_free(0x80000000ull, 0, &where));
+    CHECK(low.resize(AddressSpace::kLowHint32, 0x20000) && !low.resize(0x7FFE0000, 0x20000));
+    uint8_t byte = 7;
+    CHECK(low.write(AddressSpace::kLowHint32 + 0x1FFFF, ConstByteView(&byte, 1)) && !low.check(0x7FFF0000, 1, kProtRead));
+  }
   CHECK(!s.find_free(0, 0, &at));
 
   CHECK(s.unmap(0xF000, 0x3000));                                  // three whole regions

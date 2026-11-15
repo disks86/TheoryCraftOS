@@ -132,7 +132,9 @@ LoadStatus load_dynamic_elf(const exe::ElfFile& elf, ConstByteView file, const e
 }
 
 LoadStatus load_pe(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, LoadedImage* out, bool require_entry) {
-  if (!pe.is_pe32_plus() || pe.is_dll()) return LoadStatus::Unsupported;
+  if (pe.is_dll()) return LoadStatus::Unsupported;
+  // A 64-bit program, or a 32-bit one into an address space that was made for one (set_top: its pointers do not reach further).
+  if (!pe.is_pe32_plus() && !(pe.machine() == exe::kPeMachineI386 && space.is_32bit())) return LoadStatus::Unsupported;
   return map_pe_image(pe, file, space, pe.image_base(), require_entry, out);
 }
 
@@ -224,12 +226,14 @@ struct MappedPieces {
 
 LoadStatus map_pe_image_pieces(const exe::PeFile& pe, ConstByteView file, AddressSpace& space, uint64_t base, bool require_entry, LoadedImage* out, MappedPieces& pieces) {
   const bool data_only_32bit = !pe.is_pe32_plus() && pe.machine() == 0x14C && !pe_image_contains_code(pe);      // (a 32-bit image with nothing to run can be mapped like data)
-  if ((!pe.is_pe32_plus() || pe.machine() != exe::kPeMachineAmd64) && !data_only_32bit) return LoadStatus::Unsupported;
+  // What runs in this address space: x86-64 code in a 64-bit program's, i386 code in a 32-bit program's.
+  const bool runs_here = space.is_32bit() ? !pe.is_pe32_plus() && pe.machine() == exe::kPeMachineI386 : pe.is_pe32_plus() && pe.machine() == exe::kPeMachineAmd64;
+  if (!runs_here && !data_only_32bit) return LoadStatus::Unsupported;
   if (pe.section_alignment() < AddressSpace::kPageSize) return LoadStatus::Unsupported;      // the old 512-byte layout shares pages between sections
   const uint64_t image_size = pe.size_of_image();
   uint64_t image_pages = 0;
   if (base == 0 || base % AddressSpace::kPageSize != 0 || !AddressSpace::round_up(image_size, &image_pages) || image_pages == 0 ||
-      base >= AddressSpace::kUserTop || image_pages > AddressSpace::kUserTop - base)
+      base >= space.top() || image_pages > space.top() - base)
     return LoadStatus::Malformed;
 
   const uint64_t header_bytes = pe.size_of_headers() < file.size() ? pe.size_of_headers() : file.size();
@@ -268,8 +272,10 @@ LoadStatus map_pe_image(const exe::PeFile& pe, ConstByteView file, AddressSpace&
 
 LoadStatus map_stack(AddressSpace& space, uint64_t size, uint64_t* top) {
   uint64_t rounded = 0;
-  if (size == 0 || !AddressSpace::round_up(size, &rounded) || rounded > AddressSpace::kUserTop - 2 * AddressSpace::kPageSize) return LoadStatus::Malformed;
-  const uint64_t end = AddressSpace::kUserTop - AddressSpace::kPageSize;      // the page above stays unmapped
+  if (size == 0 || !AddressSpace::round_up(size, &rounded) || rounded > space.top() - 2 * AddressSpace::kPageSize) return LoadStatus::Malformed;
+  // The page above stays unmapped. (In a 32-bit program the shared user data page is the last one below the top: the stack ends 64 KiB under it.)
+  const uint64_t end = space.is_32bit() ? space.top() - 0x20000 : space.top() - AddressSpace::kPageSize;
+  if (rounded >= end) return LoadStatus::Malformed;
   if (!space.map(end - rounded, rounded, kProtRead | kProtWrite)) return LoadStatus::OutOfMemory;
   *top = end;
   return LoadStatus::Ok;
@@ -333,5 +339,18 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
 }
 
 uint64_t windows_initial_stack_pointer(uint64_t stack_top) { return ((stack_top - 0x28) & ~uint64_t{15}) | 8; }
+
+bool windows_initial_stack_32(IUserMemory& memory, uint64_t stack_top, uint32_t argument, uint32_t argument2, uint64_t* stack_pointer) {
+  // As a call leaves it: the return address (none: the routine never returns), then the two arguments. ESP + 4 is 16-byte aligned, as compilers expect.
+  const uint64_t sp = ((stack_top - 0x40) & ~uint64_t{15}) - 4;
+  uint8_t words[12] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
+    words[4 + i] = static_cast<uint8_t>(argument >> (8 * i));
+    words[8 + i] = static_cast<uint8_t>(argument2 >> (8 * i));
+  }
+  if (!memory.write(sp, ConstByteView(words))) return false;
+  *stack_pointer = sp;
+  return true;
+}
 
 }  // namespace process
