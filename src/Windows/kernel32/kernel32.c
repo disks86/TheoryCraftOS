@@ -1877,7 +1877,7 @@ EXPORT BOOL WINAPI VirtualProtectEx(HANDLE process, LPVOID address, SIZE_T size,
 }
 EXPORT SIZE_T WINAPI VirtualQueryEx(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T length) {
   if (length < sizeof(*info)) { set_error(ERROR_INVALID_PARAMETER); return 0; }
-  ULONG64 got = 0;
+  SIZE_T got = 0;
   const NTSTATUS status = NtQueryVirtualMemory(process, (PVOID)address, 0, info, sizeof(*info), &got);
   if (!NT_SUCCESS(status)) { fail_nt(status); return 0; }
   return sizeof(*info);

@@ -241,6 +241,16 @@ IMPORT void NTAPI RtlProcessFlsData(PVOID data, ULONG flags);
 
 /* switch_stacks(save, target): keeps the registers a Windows function has to keep (and xmm6-xmm15) on the stack, saves the stack pointer in *save and goes on with the one
    in `target`, which has the same layout. */
+#ifdef __i386__
+/* On i386: ebx, ebp, edi and esi are the registers a function has to keep (the arguments are on the stack), and a new fiber's first return finds the fiber in esi. */
+__asm__(".text\n.globl _tcos_switch_stacks\n_tcos_switch_stacks:\n"
+        " push %ebx\n push %ebp\n push %edi\n push %esi\n"
+        " mov 20(%esp), %eax\n mov 24(%esp), %edx\n"
+        " mov %esp, (%eax)\n mov %edx, %esp\n"
+        " pop %esi\n pop %edi\n pop %ebp\n pop %ebx\n ret\n"
+        ".globl _tcos_fiber_entry\n_tcos_fiber_entry:\n"
+        " push %esi\n call _tcos_fiber_main\n int3\n");
+#else
 __asm__(".text\n.globl tcos_switch_stacks\ntcos_switch_stacks:\n"
         " push %rbx\n push %rbp\n push %rdi\n push %rsi\n push %r12\n push %r13\n push %r14\n push %r15\n"
         " sub $160, %rsp\n"
@@ -253,6 +263,7 @@ __asm__(".text\n.globl tcos_switch_stacks\ntcos_switch_stacks:\n"
         " pop %r15\n pop %r14\n pop %r13\n pop %r12\n pop %rsi\n pop %rdi\n pop %rbp\n pop %rbx\n ret\n"
         ".globl tcos_fiber_entry\ntcos_fiber_entry:\n"      /* a new fiber's first return lands here with the fiber in r12 */
         " mov %r12, %rcx\n sub $32, %rsp\n call tcos_fiber_main\n int3\n");
+#endif
 extern void tcos_switch_stacks(PVOID *save, PVOID target);
 extern void tcos_fiber_entry(void);
 
@@ -315,11 +326,18 @@ EXPORT PVOID WINAPI CreateFiberEx(SIZE_T commit, SIZE_T reserve, DWORD flags, LP
   f->magic = FIBER_MAGIC;
   /* The first switch to it pops the registers and "returns" to tcos_fiber_entry with the fiber in r12; the layout is what tcos_switch_stacks saved. */
   ULONG_PTR *top = (ULONG_PTR *)((((ULONG_PTR)stack + size) & ~(ULONG_PTR)15) - 64);
+#ifdef __i386__
+  ULONG_PTR *frame = top - 5;      /* esi edi ebp ebx and the return address */
+  memset(frame, 0, (top - frame) * sizeof(ULONG_PTR));
+  frame[0] = (ULONG_PTR)f;      /* esi */
+  frame[4] = (ULONG_PTR)tcos_fiber_entry;
+#else
   ULONG_PTR *frame = top - (160 / 8) - 9;      /* xmm save area, then rbx rbp rdi rsi r12 r13 r14 r15 and the return address */
   memset(frame, 0, (top - frame) * 8);
   ULONG_PTR *regs = frame + 160 / 8;      /* r15 r14 r13 r12 rsi rdi rbp rbx ret */
   regs[3] = (ULONG_PTR)f;      /* r12 */
   regs[8] = (ULONG_PTR)tcos_fiber_entry;
+#endif
   f->rsp = frame;
   return f;
 }

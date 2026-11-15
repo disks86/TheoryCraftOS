@@ -7,11 +7,18 @@ EXPORT NTSTATUS NTAPI NtAcceptSocket(HANDLE a0, PHANDLE a1, PVOID a2, PULONG a3)
   v[1] = a1 ? WOW_POINTER(&w1) : 0;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtAcceptSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtAcceptSocket, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwAcceptSocket(HANDLE a0, PHANDLE a1, PVOID a2, PULONG a3) { return NtAcceptSocket(a0, a1, a2, a3); }
+EXPORT NTSTATUS NTAPI NtAlertThreadByThreadId(ULONG_PTR a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtAlertThreadByThreadId, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwAlertThreadByThreadId(ULONG_PTR a0) { return NtAlertThreadByThreadId(a0); }
 EXPORT NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE a0, PVOID * a1, ULONG_PTR a2, PSIZE_T a3, ULONG a4, ULONG a5) {
   ULONG64 v[6] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -22,17 +29,34 @@ EXPORT NTSTATUS NTAPI NtAllocateVirtualMemory(HANDLE a0, PVOID * a1, ULONG_PTR a
   v[3] = a3 ? WOW_POINTER(&w3) : 0;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtAllocateVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtAllocateVirtualMemory, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   if (a3) *a3 = (__typeof__(*a3))(ULONG_PTR)w3;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwAllocateVirtualMemory(HANDLE a0, PVOID * a1, ULONG_PTR a2, PSIZE_T a3, ULONG a4, ULONG a5) { return NtAllocateVirtualMemory(a0, a1, a2, a3, a4, a5); }
+EXPORT NTSTATUS NTAPI NtAllocateVirtualMemoryEx(HANDLE a0, PVOID * a1, PSIZE_T a2, ULONG a3, ULONG a4, PVOID a5, ULONG a6) {
+  ULONG64 v[7] = {0};
+  v[0] = WOW_HANDLE(a0);
+  ULONG64 w1 = a1 ? (ULONG64)(ULONG_PTR)*a1 : 0;
+  v[1] = a1 ? WOW_POINTER(&w1) : 0;
+  ULONG64 w2 = a2 ? (ULONG64)(ULONG_PTR)*a2 : 0;
+  v[2] = a2 ? WOW_POINTER(&w2) : 0;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  v[6] = (ULONG64)(ULONG_PTR)a6;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtAllocateVirtualMemoryEx, v);
+  if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
+  if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwAllocateVirtualMemoryEx(HANDLE a0, PVOID * a1, PSIZE_T a2, ULONG a3, ULONG a4, PVOID a5, ULONG a6) { return NtAllocateVirtualMemoryEx(a0, a1, a2, a3, a4, a5, a6); }
 EXPORT NTSTATUS NTAPI NtAssignProcessToJobObject(HANDLE a0, HANDLE a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtAssignProcessToJobObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtAssignProcessToJobObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwAssignProcessToJobObject(HANDLE a0, HANDLE a1) { return NtAssignProcessToJobObject(a0, a1); }
@@ -41,31 +65,65 @@ EXPORT NTSTATUS NTAPI NtBindSocket(HANDLE a0, const void * a1, ULONG a2) {
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtBindSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtBindSocket, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwBindSocket(HANDLE a0, const void * a1, ULONG a2) { return NtBindSocket(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtCancelIoFile(HANDLE a0, PIO_STATUS_BLOCK a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCancelIoFile, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCancelIoFile(HANDLE a0, PIO_STATUS_BLOCK a1) { return NtCancelIoFile(a0, a1); }
+EXPORT NTSTATUS NTAPI NtCancelIoFileEx(HANDLE a0, PIO_STATUS_BLOCK a1, PIO_STATUS_BLOCK a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCancelIoFileEx, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCancelIoFileEx(HANDLE a0, PIO_STATUS_BLOCK a1, PIO_STATUS_BLOCK a2) { return NtCancelIoFileEx(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtCancelSynchronousIoFile(HANDLE a0, PIO_STATUS_BLOCK a1, PIO_STATUS_BLOCK a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCancelSynchronousIoFile, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCancelSynchronousIoFile(HANDLE a0, PIO_STATUS_BLOCK a1, PIO_STATUS_BLOCK a2) { return NtCancelSynchronousIoFile(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtCancelTimer(HANDLE a0, PBOOLEAN a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCancelTimer, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCancelTimer, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCancelTimer(HANDLE a0, PBOOLEAN a1) { return NtCancelTimer(a0, a1); }
 EXPORT NTSTATUS NTAPI NtClose(HANDLE a0) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtClose, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtClose, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwClose(HANDLE a0) { return NtClose(a0); }
+EXPORT NTSTATUS NTAPI NtCompareObjects(HANDLE a0, HANDLE a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCompareObjects, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCompareObjects(HANDLE a0, HANDLE a1) { return NtCompareObjects(a0, a1); }
 EXPORT NTSTATUS NTAPI NtConnectSocket(HANDLE a0, const void * a1, ULONG a2) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtConnectSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtConnectSocket, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwConnectSocket(HANDLE a0, const void * a1, ULONG a2) { return NtConnectSocket(a0, a1, a2); }
@@ -77,12 +135,37 @@ EXPORT NTSTATUS NTAPI NtCreateChangeNotification(POBJECT_ATTRIBUTES a0, ULONG a1
   v[2] = (ULONG64)(ULONG_PTR)a2;
   ULONG64 w3 = a3 ? WOW_HANDLE(*a3) : 0;
   v[3] = a3 ? WOW_POINTER(&w3) : 0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateChangeNotification, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateChangeNotification, v);
   if (a3) *a3 = (__typeof__(*a3))(ULONG_PTR)w3;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCreateChangeNotification(POBJECT_ATTRIBUTES a0, ULONG a1, ULONG a2, PHANDLE a3) { return NtCreateChangeNotification(a0, a1, a2, a3); }
-static NTSTATUS NTAPI RawNtCreateEvent(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3, BOOLEAN a4) {
+EXPORT NTSTATUS NTAPI NtCreateDebugObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) {
+  ULONG64 v[4] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateDebugObject, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCreateDebugObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) { return NtCreateDebugObject(a0, a1, a2, a3); }
+EXPORT NTSTATUS NTAPI NtCreateDirectoryObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
+  ULONG64 v[4] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateDirectoryObject, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCreateDirectoryObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) { return NtCreateDirectoryObject(a0, a1, a2); }
+NTSTATUS NTAPI RawNtCreateEvent(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3, BOOLEAN a4) {
   ULONG64 v[5] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -91,11 +174,11 @@ static NTSTATUS NTAPI RawNtCreateEvent(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES 
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateEvent, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateEvent, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-static NTSTATUS NTAPI RawNtCreateFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PIO_STATUS_BLOCK a3, PLARGE_INTEGER a4, ULONG a5, ULONG a6, ULONG a7, ULONG a8, PVOID a9, ULONG a10) {
+NTSTATUS NTAPI RawNtCreateFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PIO_STATUS_BLOCK a3, PLARGE_INTEGER a4, ULONG a5, ULONG a6, ULONG a7, ULONG a8, PVOID a9, ULONG a10) {
   ULONG64 v[11] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -110,18 +193,47 @@ static NTSTATUS NTAPI RawNtCreateFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a
   v[8] = (ULONG64)(ULONG_PTR)a8;
   v[9] = (ULONG64)(ULONG_PTR)a9;
   v[10] = (ULONG64)(ULONG_PTR)a10;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateFile, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-static NTSTATUS NTAPI RawNtCreateJobObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
+EXPORT NTSTATUS NTAPI NtCreateIoCompletion(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateJobObject, v);
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateIoCompletion, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwCreateIoCompletion(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) { return NtCreateIoCompletion(a0, a1, a2, a3); }
+NTSTATUS NTAPI RawNtCreateJobObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
+  ULONG64 v[4] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateJobObject, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+NTSTATUS NTAPI RawNtCreateKey(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3, PUNICODE_STRING a4, ULONG a5, PULONG a6) {
+  ULONG64 v[7] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  UNICODE_STRING64 s4;
+  v[4] = wow_unicode_string(&s4, a4);
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  v[6] = (ULONG64)(ULONG_PTR)a6;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateKey, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -137,12 +249,12 @@ EXPORT NTSTATUS NTAPI NtCreateMailslotFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBU
   v[5] = (ULONG64)(ULONG_PTR)a5;
   v[6] = (ULONG64)(ULONG_PTR)a6;
   v[7] = (ULONG64)(ULONG_PTR)a7;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateMailslotFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateMailslotFile, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCreateMailslotFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PIO_STATUS_BLOCK a3, ULONG a4, ULONG a5, ULONG a6, PLARGE_INTEGER a7) { return NtCreateMailslotFile(a0, a1, a2, a3, a4, a5, a6, a7); }
-static NTSTATUS NTAPI RawNtCreateMutant(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, BOOLEAN a3) {
+NTSTATUS NTAPI RawNtCreateMutant(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, BOOLEAN a3) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -150,11 +262,11 @@ static NTSTATUS NTAPI RawNtCreateMutant(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateMutant, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateMutant, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-static NTSTATUS NTAPI RawNtCreateNamedPipeFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PIO_STATUS_BLOCK a3, ULONG a4, ULONG a5, ULONG a6, ULONG a7, ULONG a8, ULONG a9, ULONG a10, ULONG a11, ULONG a12, PLARGE_INTEGER a13) {
+NTSTATUS NTAPI RawNtCreateNamedPipeFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PIO_STATUS_BLOCK a3, ULONG a4, ULONG a5, ULONG a6, ULONG a7, ULONG a8, ULONG a9, ULONG a10, ULONG a11, ULONG a12, PLARGE_INTEGER a13) {
   ULONG64 v[14] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -172,7 +284,7 @@ static NTSTATUS NTAPI RawNtCreateNamedPipeFile(PHANDLE a0, ULONG a1, POBJECT_ATT
   v[11] = (ULONG64)(ULONG_PTR)a11;
   v[12] = (ULONG64)(ULONG_PTR)a12;
   v[13] = (ULONG64)(ULONG_PTR)a13;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateNamedPipeFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateNamedPipeFile, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -185,13 +297,13 @@ EXPORT NTSTATUS NTAPI NtCreatePipe(PHANDLE a0, PHANDLE a1, POBJECT_ATTRIBUTES a2
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreatePipe, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreatePipe, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCreatePipe(PHANDLE a0, PHANDLE a1, POBJECT_ATTRIBUTES a2, ULONG a3) { return NtCreatePipe(a0, a1, a2, a3); }
-static NTSTATUS NTAPI RawNtCreateSection(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PLARGE_INTEGER a3, ULONG a4, ULONG a5, HANDLE a6) {
+NTSTATUS NTAPI RawNtCreateSection(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PLARGE_INTEGER a3, ULONG a4, ULONG a5, HANDLE a6) {
   ULONG64 v[7] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -202,11 +314,11 @@ static NTSTATUS NTAPI RawNtCreateSection(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTE
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
   v[6] = WOW_HANDLE(a6);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateSection, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateSection, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-static NTSTATUS NTAPI RawNtCreateSemaphore(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, LONG a3, LONG a4) {
+NTSTATUS NTAPI RawNtCreateSemaphore(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, LONG a3, LONG a4) {
   ULONG64 v[5] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -215,7 +327,7 @@ static NTSTATUS NTAPI RawNtCreateSemaphore(PHANDLE a0, ULONG a1, POBJECT_ATTRIBU
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(LONG64)a3;
   v[4] = (ULONG64)(LONG64)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateSemaphore, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateSemaphore, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -226,7 +338,7 @@ EXPORT NTSTATUS NTAPI NtCreateSocket(ULONG a0, ULONG a1, ULONG a2, PHANDLE a3) {
   v[2] = (ULONG64)(ULONG_PTR)a2;
   ULONG64 w3 = a3 ? WOW_HANDLE(*a3) : 0;
   v[3] = a3 ? WOW_POINTER(&w3) : 0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateSocket, v);
   if (a3) *a3 = (__typeof__(*a3))(ULONG_PTR)w3;
   return status;
 }
@@ -238,7 +350,7 @@ EXPORT NTSTATUS NTAPI NtCreateSymbolicLink(POBJECT_ATTRIBUTES a0, PUNICODE_STRIN
   UNICODE_STRING64 s1;
   v[1] = wow_unicode_string(&s1, a1);
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateSymbolicLink, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateSymbolicLink, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCreateSymbolicLink(POBJECT_ATTRIBUTES a0, PUNICODE_STRING a1, BOOLEAN a2) { return NtCreateSymbolicLink(a0, a1, a2); }
@@ -256,12 +368,12 @@ EXPORT NTSTATUS NTAPI NtCreateThreadEx(PHANDLE a0, ULONG a1, PVOID a2, HANDLE a3
   v[8] = (ULONG64)(ULONG_PTR)a8;
   v[9] = (ULONG64)(ULONG_PTR)a9;
   v[10] = (ULONG64)(ULONG_PTR)a10;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateThreadEx, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateThreadEx, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCreateThreadEx(PHANDLE a0, ULONG a1, PVOID a2, HANDLE a3, PVOID a4, PVOID a5, ULONG a6, SIZE_T a7, SIZE_T a8, SIZE_T a9, PVOID a10) { return NtCreateThreadEx(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10); }
-static NTSTATUS NTAPI RawNtCreateTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) {
+NTSTATUS NTAPI RawNtCreateTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, ULONG a3) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
   v[0] = a0 ? WOW_POINTER(&w0) : 0;
@@ -269,29 +381,55 @@ static NTSTATUS NTAPI RawNtCreateTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES 
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateTimer, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateTimer, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-static NTSTATUS NTAPI RawNtDelayExecution(BOOLEAN a0, PLARGE_INTEGER a1) {
+EXPORT NTSTATUS NTAPI NtDebugActiveProcess(HANDLE a0, HANDLE a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDebugActiveProcess, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwDebugActiveProcess(HANDLE a0, HANDLE a1) { return NtDebugActiveProcess(a0, a1); }
+EXPORT NTSTATUS NTAPI NtDebugContinue(HANDLE a0, PVOID a1, NTSTATUS a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(LONG64)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDebugContinue, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwDebugContinue(HANDLE a0, PVOID a1, NTSTATUS a2) { return NtDebugContinue(a0, a1, a2); }
+NTSTATUS NTAPI RawNtDelayExecution(BOOLEAN a0, PLARGE_INTEGER a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtDelayExecution, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDelayExecution, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI NtDeleteFile(POBJECT_ATTRIBUTES a0) {
   ULONG64 v[4] = {0};
   WOW_OBJECT_ATTRIBUTES o0;
   v[0] = wow_object_attributes(&o0, a0);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtDeleteFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDeleteFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwDeleteFile(POBJECT_ATTRIBUTES a0) { return NtDeleteFile(a0); }
+EXPORT NTSTATUS NTAPI NtDeleteValueKey(HANDLE a0, PUNICODE_STRING a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  UNICODE_STRING64 s1;
+  v[1] = wow_unicode_string(&s1, a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDeleteValueKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwDeleteValueKey(HANDLE a0, PUNICODE_STRING a1) { return NtDeleteValueKey(a0, a1); }
 EXPORT NTSTATUS NTAPI NtDequeueApc(ULONG64 * a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtDequeueApc, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDequeueApc, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwDequeueApc(ULONG64 * a0) { return NtDequeueApc(a0); }
@@ -305,19 +443,36 @@ EXPORT NTSTATUS NTAPI NtDuplicateObject(HANDLE a0, HANDLE a1, HANDLE a2, PHANDLE
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
   v[6] = (ULONG64)(ULONG_PTR)a6;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtDuplicateObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDuplicateObject, v);
   if (a3) *a3 = (__typeof__(*a3))(ULONG_PTR)w3;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwDuplicateObject(HANDLE a0, HANDLE a1, HANDLE a2, PHANDLE a3, ULONG a4, ULONG a5, ULONG a6) { return NtDuplicateObject(a0, a1, a2, a3, a4, a5, a6); }
+EXPORT NTSTATUS NTAPI NtEnumerateValueKey(HANDLE a0, ULONG a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) {
+  ULONG64 v[6] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtEnumerateValueKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwEnumerateValueKey(HANDLE a0, ULONG a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) { return NtEnumerateValueKey(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtFlushBuffersFile(HANDLE a0, PIO_STATUS_BLOCK a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtFlushBuffersFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtFlushBuffersFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwFlushBuffersFile(HANDLE a0, PIO_STATUS_BLOCK a1) { return NtFlushBuffersFile(a0, a1); }
+EXPORT VOID NTAPI NtFlushProcessWriteBuffers(void) {
+  ULONG64 v[4] = {0};
+  wow_service(NT_SERVICE_NtFlushProcessWriteBuffers, v);
+}
+EXPORT VOID NTAPI ZwFlushProcessWriteBuffers(void) { NtFlushProcessWriteBuffers(); }
 EXPORT NTSTATUS NTAPI NtFlushVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, PIO_STATUS_BLOCK a3) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -326,7 +481,7 @@ EXPORT NTSTATUS NTAPI NtFlushVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, PI
   ULONG64 w2 = a2 ? (ULONG64)(ULONG_PTR)*a2 : 0;
   v[2] = a2 ? WOW_POINTER(&w2) : 0;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtFlushVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtFlushVirtualMemory, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
   return status;
@@ -340,13 +495,13 @@ EXPORT NTSTATUS NTAPI NtFreeVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, ULO
   ULONG64 w2 = a2 ? (ULONG64)(ULONG_PTR)*a2 : 0;
   v[2] = a2 ? WOW_POINTER(&w2) : 0;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtFreeVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtFreeVirtualMemory, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwFreeVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, ULONG a3) { return NtFreeVirtualMemory(a0, a1, a2, a3); }
-static NTSTATUS NTAPI RawNtFsControlFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, ULONG a5, PVOID a6, ULONG a7, PVOID a8, ULONG a9) {
+NTSTATUS NTAPI RawNtFsControlFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, ULONG a5, PVOID a6, ULONG a7, PVOID a8, ULONG a9) {
   ULONG64 v[10] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
@@ -358,14 +513,27 @@ static NTSTATUS NTAPI RawNtFsControlFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
   v[9] = (ULONG64)(ULONG_PTR)a9;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtFsControlFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtFsControlFile, v);
   return status;
 }
+EXPORT ULONG NTAPI NtGetCurrentProcessorNumber(void) {
+  ULONG64 v[4] = {0};
+  const ULONG status = (ULONG)wow_service(NT_SERVICE_NtGetCurrentProcessorNumber, v);
+  return status;
+}
+EXPORT ULONG NTAPI ZwGetCurrentProcessorNumber(void) { return NtGetCurrentProcessorNumber(); }
+EXPORT NTSTATUS NTAPI NtGetCurrentProcessorNumberEx(PVOID a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtGetCurrentProcessorNumberEx, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwGetCurrentProcessorNumberEx(PVOID a0) { return NtGetCurrentProcessorNumberEx(a0); }
 EXPORT NTSTATUS NTAPI NtIsProcessInJob(HANDLE a0, HANDLE a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtIsProcessInJob, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtIsProcessInJob, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwIsProcessInJob(HANDLE a0, HANDLE a1) { return NtIsProcessInJob(a0, a1); }
@@ -373,7 +541,7 @@ EXPORT NTSTATUS NTAPI NtListenSocket(HANDLE a0, ULONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtListenSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtListenSocket, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwListenSocket(HANDLE a0, ULONG a1) { return NtListenSocket(a0, a1); }
@@ -387,7 +555,7 @@ EXPORT NTSTATUS NTAPI NtLoadModule(PUNICODE_STRING a0, PVOID * a1, PVOID a2, ULO
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtLoadModule, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtLoadModule, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   return status;
 }
@@ -404,7 +572,7 @@ EXPORT NTSTATUS NTAPI NtLockFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_S
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
   v[9] = (ULONG64)(ULONG_PTR)a9;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtLockFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtLockFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwLockFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PLARGE_INTEGER a5, PLARGE_INTEGER a6, ULONG a7, BOOLEAN a8, BOOLEAN a9) { return NtLockFile(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
@@ -422,7 +590,7 @@ EXPORT NTSTATUS NTAPI NtMapViewOfSection(HANDLE a0, HANDLE a1, PVOID * a2, ULONG
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
   v[9] = (ULONG64)(ULONG_PTR)a9;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtMapViewOfSection, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtMapViewOfSection, v);
   if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
   if (a6) *a6 = (__typeof__(*a6))(ULONG_PTR)w6;
   return status;
@@ -439,10 +607,22 @@ EXPORT NTSTATUS NTAPI NtNotifyChangeDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2
   v[6] = (ULONG64)(ULONG_PTR)a6;
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtNotifyChangeDirectoryFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtNotifyChangeDirectoryFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwNotifyChangeDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, ULONG a7, BOOLEAN a8) { return NtNotifyChangeDirectoryFile(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+EXPORT NTSTATUS NTAPI NtOpenDirectoryObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
+  ULONG64 v[4] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenDirectoryObject, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwOpenDirectoryObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) { return NtOpenDirectoryObject(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtOpenEvent(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
@@ -450,7 +630,7 @@ EXPORT NTSTATUS NTAPI NtOpenEvent(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenEvent, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenEvent, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -465,7 +645,7 @@ EXPORT NTSTATUS NTAPI NtOpenFile(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, PI
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenFile, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -477,11 +657,23 @@ EXPORT NTSTATUS NTAPI NtOpenJobObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenJobObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenJobObject, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwOpenJobObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) { return NtOpenJobObject(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtOpenKey(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
+  ULONG64 v[4] = {0};
+  ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
+  v[0] = a0 ? WOW_POINTER(&w0) : 0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenKey, v);
+  if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwOpenKey(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) { return NtOpenKey(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtOpenMutant(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
@@ -489,7 +681,7 @@ EXPORT NTSTATUS NTAPI NtOpenMutant(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) 
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenMutant, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenMutant, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -502,7 +694,7 @@ EXPORT NTSTATUS NTAPI NtOpenProcess(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2,
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenProcess, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenProcess, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -514,7 +706,7 @@ EXPORT NTSTATUS NTAPI NtOpenSection(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2)
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenSection, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenSection, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -526,7 +718,7 @@ EXPORT NTSTATUS NTAPI NtOpenSemaphore(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenSemaphore, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenSemaphore, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -539,7 +731,7 @@ EXPORT NTSTATUS NTAPI NtOpenThread(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2, 
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenThread, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -551,7 +743,7 @@ EXPORT NTSTATUS NTAPI NtOpenTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   v[1] = (ULONG64)(ULONG_PTR)a1;
   WOW_OBJECT_ATTRIBUTES o2;
   v[2] = wow_object_attributes(&o2, a2);
-  const NTSTATUS status = wow_service(NT_SERVICE_NtOpenTimer, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtOpenTimer, v);
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
@@ -565,7 +757,7 @@ EXPORT NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, 
   v[2] = a2 ? WOW_POINTER(&w2) : 0;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtProtectVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtProtectVirtualMemory, v);
   if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
   if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
   return status;
@@ -575,7 +767,7 @@ EXPORT NTSTATUS NTAPI NtPulseEvent(HANDLE a0, PLONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtPulseEvent, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtPulseEvent, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwPulseEvent(HANDLE a0, PLONG a1) { return NtPulseEvent(a0, a1); }
@@ -584,7 +776,7 @@ EXPORT NTSTATUS NTAPI NtQueryAttributesFile(POBJECT_ATTRIBUTES a0, PVOID a1) {
   WOW_OBJECT_ATTRIBUTES o0;
   v[0] = wow_object_attributes(&o0, a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryAttributesFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryAttributesFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryAttributesFile(POBJECT_ATTRIBUTES a0, PVOID a1) { return NtQueryAttributesFile(a0, a1); }
@@ -602,7 +794,7 @@ EXPORT NTSTATUS NTAPI NtQueryDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID
   UNICODE_STRING64 s9;
   v[9] = wow_unicode_string(&s9, a9);
   v[10] = (ULONG64)(ULONG_PTR)a10;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryDirectoryFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryDirectoryFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, ULONG a7, BOOLEAN a8, PUNICODE_STRING a9, BOOLEAN a10) { return NtQueryDirectoryFile(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10); }
@@ -613,7 +805,7 @@ EXPORT NTSTATUS NTAPI NtQueryInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVO
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryInformationFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryInformationFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) { return NtQueryInformationFile(a0, a1, a2, a3, a4); }
@@ -624,22 +816,45 @@ EXPORT NTSTATUS NTAPI NtQueryInformationJobObject(HANDLE a0, ULONG a1, PVOID a2,
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryInformationJobObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryInformationJobObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryInformationJobObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtQueryInformationJobObject(a0, a1, a2, a3, a4); }
+EXPORT NTSTATUS NTAPI NtQueryIoCompletion(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) {
+  ULONG64 v[5] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryIoCompletion, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwQueryIoCompletion(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtQueryIoCompletion(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtQueryPerformanceCounter(PLARGE_INTEGER a0, PLARGE_INTEGER a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryPerformanceCounter, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryPerformanceCounter, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryPerformanceCounter(PLARGE_INTEGER a0, PLARGE_INTEGER a1) { return NtQueryPerformanceCounter(a0, a1); }
-static NTSTATUS NTAPI RawNtQuerySystemTime(PLARGE_INTEGER a0) {
+EXPORT NTSTATUS NTAPI NtQuerySystemInformationEx(ULONG a0, PVOID a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) {
+  ULONG64 v[6] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQuerySystemInformationEx, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwQuerySystemInformationEx(ULONG a0, PVOID a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) { return NtQuerySystemInformationEx(a0, a1, a2, a3, a4, a5); }
+NTSTATUS NTAPI RawNtQuerySystemTime(PLARGE_INTEGER a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQuerySystemTime, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQuerySystemTime, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI NtQueryTimer(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) {
@@ -649,7 +864,7 @@ EXPORT NTSTATUS NTAPI NtQueryTimer(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULO
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryTimer, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryTimer, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryTimer(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtQueryTimer(a0, a1, a2, a3, a4); }
@@ -658,10 +873,23 @@ EXPORT NTSTATUS NTAPI NtQueryTimerResolution(PULONG a0, PULONG a1, PULONG a2) {
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryTimerResolution, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryTimerResolution, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryTimerResolution(PULONG a0, PULONG a1, PULONG a2) { return NtQueryTimerResolution(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtQueryValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) {
+  ULONG64 v[6] = {0};
+  v[0] = WOW_HANDLE(a0);
+  UNICODE_STRING64 s1;
+  v[1] = wow_unicode_string(&s1, a1);
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryValueKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwQueryValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) { return NtQueryValueKey(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtQueryVolumeInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) {
   ULONG64 v[5] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -669,10 +897,22 @@ EXPORT NTSTATUS NTAPI NtQueryVolumeInformationFile(HANDLE a0, PIO_STATUS_BLOCK a
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryVolumeInformationFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryVolumeInformationFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryVolumeInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) { return NtQueryVolumeInformationFile(a0, a1, a2, a3, a4); }
+EXPORT NTSTATUS NTAPI NtQueryWnfStateData(const ULONGLONG * a0, const void * a1, const void * a2, ULONG * a3, void * a4, ULONG * a5) {
+  ULONG64 v[6] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryWnfStateData, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwQueryWnfStateData(const ULONGLONG * a0, const void * a1, const void * a2, ULONG * a3, void * a4, ULONG * a5) { return NtQueryWnfStateData(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtQueueApcThread(HANDLE a0, PVOID a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4) {
   ULONG64 v[5] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -680,11 +920,11 @@ EXPORT NTSTATUS NTAPI NtQueueApcThread(HANDLE a0, PVOID a1, ULONG_PTR a2, ULONG_
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtQueueApcThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueueApcThread, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueueApcThread(HANDLE a0, PVOID a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4) { return NtQueueApcThread(a0, a1, a2, a3, a4); }
-static NTSTATUS NTAPI RawNtReadFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, PLARGE_INTEGER a7, PULONG a8) {
+NTSTATUS NTAPI RawNtReadFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, PLARGE_INTEGER a7, PULONG a8) {
   ULONG64 v[9] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
@@ -695,7 +935,7 @@ static NTSTATUS NTAPI RawNtReadFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PI
   v[6] = (ULONG64)(ULONG_PTR)a6;
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReadFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReadFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI NtReadVirtualMemory(HANDLE a0, PVOID a1, PVOID a2, SIZE_T a3, PSIZE_T a4) {
@@ -706,7 +946,7 @@ EXPORT NTSTATUS NTAPI NtReadVirtualMemory(HANDLE a0, PVOID a1, PVOID a2, SIZE_T 
   v[3] = (ULONG64)(ULONG_PTR)a3;
   ULONG64 w4 = a4 ? (ULONG64)(ULONG_PTR)*a4 : 0;
   v[4] = a4 ? WOW_POINTER(&w4) : 0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReadVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReadVirtualMemory, v);
   if (a4) *a4 = (__typeof__(*a4))(ULONG_PTR)w4;
   return status;
 }
@@ -720,7 +960,7 @@ EXPORT NTSTATUS NTAPI NtReceiveSocket(HANDLE a0, PVOID a1, ULONG a2, PULONG a3, 
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
   v[6] = (ULONG64)(ULONG_PTR)a6;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReceiveSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReceiveSocket, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwReceiveSocket(HANDLE a0, PVOID a1, ULONG a2, PULONG a3, PVOID a4, PULONG a5, PBOOLEAN a6) { return NtReceiveSocket(a0, a1, a2, a3, a4, a5, a6); }
@@ -730,7 +970,7 @@ EXPORT NTSTATUS NTAPI NtReleaseModule(PVOID a0, PVOID a1, ULONG a2, PULONG a3) {
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReleaseModule, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReleaseModule, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwReleaseModule(PVOID a0, PVOID a1, ULONG a2, PULONG a3) { return NtReleaseModule(a0, a1, a2, a3); }
@@ -738,7 +978,7 @@ EXPORT NTSTATUS NTAPI NtReleaseMutant(HANDLE a0, PLONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReleaseMutant, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReleaseMutant, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwReleaseMutant(HANDLE a0, PLONG a1) { return NtReleaseMutant(a0, a1); }
@@ -747,15 +987,49 @@ EXPORT NTSTATUS NTAPI NtReleaseSemaphore(HANDLE a0, LONG a1, PLONG a2) {
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(LONG64)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtReleaseSemaphore, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReleaseSemaphore, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwReleaseSemaphore(HANDLE a0, LONG a1, PLONG a2) { return NtReleaseSemaphore(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtRemoveIoCompletion(HANDLE a0, ULONG_PTR * a1, ULONG_PTR * a2, PIO_STATUS_BLOCK a3, PLARGE_INTEGER a4) {
+  ULONG64 v[5] = {0};
+  v[0] = WOW_HANDLE(a0);
+  ULONG64 w1 = a1 ? (ULONG64)(ULONG_PTR)*a1 : 0;
+  v[1] = a1 ? WOW_POINTER(&w1) : 0;
+  ULONG64 w2 = a2 ? (ULONG64)(ULONG_PTR)*a2 : 0;
+  v[2] = a2 ? WOW_POINTER(&w2) : 0;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtRemoveIoCompletion, v);
+  if (a1) *a1 = (__typeof__(*a1))(ULONG_PTR)w1;
+  if (a2) *a2 = (__typeof__(*a2))(ULONG_PTR)w2;
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwRemoveIoCompletion(HANDLE a0, ULONG_PTR * a1, ULONG_PTR * a2, PIO_STATUS_BLOCK a3, PLARGE_INTEGER a4) { return NtRemoveIoCompletion(a0, a1, a2, a3, a4); }
+NTSTATUS NTAPI RawNtRemoveIoCompletionEx(HANDLE a0, PVOID a1, ULONG a2, PULONG a3, PLARGE_INTEGER a4, BOOLEAN a5) {
+  ULONG64 v[6] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtRemoveIoCompletionEx, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI NtRemoveProcessDebug(HANDLE a0, HANDLE a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtRemoveProcessDebug, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwRemoveProcessDebug(HANDLE a0, HANDLE a1) { return NtRemoveProcessDebug(a0, a1); }
 EXPORT NTSTATUS NTAPI NtResetEvent(HANDLE a0, PLONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtResetEvent, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtResetEvent, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwResetEvent(HANDLE a0, PLONG a1) { return NtResetEvent(a0, a1); }
@@ -763,7 +1037,7 @@ EXPORT NTSTATUS NTAPI NtResumeThread(HANDLE a0, PULONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtResumeThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtResumeThread, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwResumeThread(HANDLE a0, PULONG a1) { return NtResumeThread(a0, a1); }
@@ -777,7 +1051,7 @@ EXPORT NTSTATUS NTAPI NtSelectSockets(PULONG a0, PULONG a1, PULONG a2, PULONG a3
   v[5] = (ULONG64)(ULONG_PTR)a5;
   v[6] = (ULONG64)(ULONG_PTR)a6;
   v[7] = (ULONG64)(ULONG_PTR)a7;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSelectSockets, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSelectSockets, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSelectSockets(PULONG a0, PULONG a1, PULONG a2, PULONG a3, PULONG a4, PULONG a5, PLARGE_INTEGER a6, PULONG a7) { return NtSelectSockets(a0, a1, a2, a3, a4, a5, a6, a7); }
@@ -789,7 +1063,7 @@ EXPORT NTSTATUS NTAPI NtSendSocket(HANDLE a0, PVOID a1, ULONG a2, PULONG a3, con
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSendSocket, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSendSocket, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSendSocket(HANDLE a0, PVOID a1, ULONG a2, PULONG a3, const void * a4, ULONG a5) { return NtSendSocket(a0, a1, a2, a3, a4, a5); }
@@ -797,10 +1071,21 @@ EXPORT NTSTATUS NTAPI NtSetEvent(HANDLE a0, PLONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetEvent, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetEvent, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetEvent(HANDLE a0, PLONG a1) { return NtSetEvent(a0, a1); }
+EXPORT NTSTATUS NTAPI NtSetInformationDebugObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) {
+  ULONG64 v[5] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationDebugObject, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwSetInformationDebugObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtSetInformationDebugObject(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtSetInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) {
   ULONG64 v[5] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -808,7 +1093,7 @@ EXPORT NTSTATUS NTAPI NtSetInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetInformationFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) { return NtSetInformationFile(a0, a1, a2, a3, a4); }
@@ -818,7 +1103,7 @@ EXPORT NTSTATUS NTAPI NtSetInformationJobObject(HANDLE a0, ULONG a1, PVOID a2, U
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetInformationJobObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationJobObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationJobObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3) { return NtSetInformationJobObject(a0, a1, a2, a3); }
@@ -828,7 +1113,7 @@ EXPORT NTSTATUS NTAPI NtSetInformationObject(HANDLE a0, ULONG a1, PVOID a2, ULON
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetInformationObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3) { return NtSetInformationObject(a0, a1, a2, a3); }
@@ -838,7 +1123,7 @@ EXPORT NTSTATUS NTAPI NtSetInformationProcess(HANDLE a0, ULONG a1, PVOID a2, ULO
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetInformationProcess, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationProcess, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationProcess(HANDLE a0, ULONG a1, PVOID a2, ULONG a3) { return NtSetInformationProcess(a0, a1, a2, a3); }
@@ -848,10 +1133,30 @@ EXPORT NTSTATUS NTAPI NtSetInformationThread(HANDLE a0, ULONG a1, PVOID a2, ULON
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetInformationThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationThread, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationThread(HANDLE a0, ULONG a1, PVOID a2, ULONG a3) { return NtSetInformationThread(a0, a1, a2, a3); }
+EXPORT NTSTATUS NTAPI NtSetIoCompletion(HANDLE a0, ULONG_PTR a1, ULONG_PTR a2, NTSTATUS a3, ULONG_PTR a4) {
+  ULONG64 v[5] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(LONG64)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetIoCompletion, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwSetIoCompletion(HANDLE a0, ULONG_PTR a1, ULONG_PTR a2, NTSTATUS a3, ULONG_PTR a4) { return NtSetIoCompletion(a0, a1, a2, a3, a4); }
+EXPORT NTSTATUS NTAPI NtSetSystemInformation(ULONG a0, PVOID a1, ULONG a2) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetSystemInformation, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwSetSystemInformation(ULONG a0, PVOID a1, ULONG a2) { return NtSetSystemInformation(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtSetTimer(HANDLE a0, PLARGE_INTEGER a1, PVOID a2, PVOID a3, BOOLEAN a4, LONG a5, PBOOLEAN a6) {
   ULONG64 v[7] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -861,7 +1166,7 @@ EXPORT NTSTATUS NTAPI NtSetTimer(HANDLE a0, PLARGE_INTEGER a1, PVOID a2, PVOID a
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(LONG64)a5;
   v[6] = (ULONG64)(ULONG_PTR)a6;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetTimer, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetTimer, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetTimer(HANDLE a0, PLARGE_INTEGER a1, PVOID a2, PVOID a3, BOOLEAN a4, LONG a5, PBOOLEAN a6) { return NtSetTimer(a0, a1, a2, a3, a4, a5, a6); }
@@ -870,17 +1175,30 @@ EXPORT NTSTATUS NTAPI NtSetTimerResolution(ULONG a0, BOOLEAN a1, PULONG a2) {
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSetTimerResolution, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetTimerResolution, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetTimerResolution(ULONG a0, BOOLEAN a1, PULONG a2) { return NtSetTimerResolution(a0, a1, a2); }
-static NTSTATUS NTAPI RawNtSignalAndWaitForSingleObject(HANDLE a0, HANDLE a1, BOOLEAN a2, PLARGE_INTEGER a3) {
+EXPORT NTSTATUS NTAPI NtSetValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, ULONG a3, PVOID a4, ULONG a5) {
+  ULONG64 v[6] = {0};
+  v[0] = WOW_HANDLE(a0);
+  UNICODE_STRING64 s1;
+  v[1] = wow_unicode_string(&s1, a1);
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetValueKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwSetValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, ULONG a3, PVOID a4, ULONG a5) { return NtSetValueKey(a0, a1, a2, a3, a4, a5); }
+NTSTATUS NTAPI RawNtSignalAndWaitForSingleObject(HANDLE a0, HANDLE a1, BOOLEAN a2, PLARGE_INTEGER a3) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSignalAndWaitForSingleObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSignalAndWaitForSingleObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI NtSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) {
@@ -891,7 +1209,7 @@ EXPORT NTSTATUS NTAPI NtSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, P
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSocketControl, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSocketControl, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) { return NtSocketControl(a0, a1, a2, a3, a4, a5); }
@@ -899,14 +1217,14 @@ EXPORT NTSTATUS NTAPI NtSuspendThread(HANDLE a0, PULONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtSuspendThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSuspendThread, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSuspendThread(HANDLE a0, PULONG a1) { return NtSuspendThread(a0, a1); }
 EXPORT NTSTATUS NTAPI NtTcosAccessCheck(void * a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTcosAccessCheck, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosAccessCheck, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosAccessCheck(void * a0) { return NtTcosAccessCheck(a0); }
@@ -915,7 +1233,7 @@ EXPORT NTSTATUS NTAPI NtTcosDebugException(PVOID a0, BOOLEAN a1, PVOID a2) {
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTcosDebugException, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosDebugException, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosDebugException(PVOID a0, BOOLEAN a1, PVOID a2) { return NtTcosDebugException(a0, a1, a2); }
@@ -923,7 +1241,7 @@ EXPORT NTSTATUS NTAPI NtTcosLinkModules(PVOID a0, PVOID a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTcosLinkModules, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosLinkModules, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosLinkModules(PVOID a0, PVOID a1) { return NtTcosLinkModules(a0, a1); }
@@ -935,7 +1253,7 @@ EXPORT NTSTATUS NTAPI NtTcosToken(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PT
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTcosToken, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosToken, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosToken(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4, ULONG_PTR a5) { return NtTcosToken(a0, a1, a2, a3, a4, a5); }
@@ -943,7 +1261,7 @@ EXPORT NTSTATUS NTAPI NtTerminateJobObject(HANDLE a0, NTSTATUS a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(LONG64)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTerminateJobObject, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTerminateJobObject, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTerminateJobObject(HANDLE a0, NTSTATUS a1) { return NtTerminateJobObject(a0, a1); }
@@ -951,7 +1269,7 @@ EXPORT NTSTATUS NTAPI NtTerminateProcess(HANDLE a0, NTSTATUS a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(LONG64)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTerminateProcess, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTerminateProcess, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTerminateProcess(HANDLE a0, NTSTATUS a1) { return NtTerminateProcess(a0, a1); }
@@ -959,14 +1277,14 @@ EXPORT NTSTATUS NTAPI NtTerminateThread(HANDLE a0, NTSTATUS a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(LONG64)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtTerminateThread, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTerminateThread, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTerminateThread(HANDLE a0, NTSTATUS a1) { return NtTerminateThread(a0, a1); }
 EXPORT NTSTATUS NTAPI NtUnloadModule(PVOID a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtUnloadModule, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtUnloadModule, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwUnloadModule(PVOID a0) { return NtUnloadModule(a0); }
@@ -977,7 +1295,7 @@ EXPORT NTSTATUS NTAPI NtUnlockFile(HANDLE a0, PIO_STATUS_BLOCK a1, PLARGE_INTEGE
   v[2] = (ULONG64)(ULONG_PTR)a2;
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtUnlockFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtUnlockFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwUnlockFile(HANDLE a0, PIO_STATUS_BLOCK a1, PLARGE_INTEGER a2, PLARGE_INTEGER a3, ULONG a4) { return NtUnlockFile(a0, a1, a2, a3, a4); }
@@ -985,19 +1303,50 @@ EXPORT NTSTATUS NTAPI NtUnmapViewOfSection(HANDLE a0, PVOID a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtUnmapViewOfSection, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtUnmapViewOfSection, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwUnmapViewOfSection(HANDLE a0, PVOID a1) { return NtUnmapViewOfSection(a0, a1); }
-static NTSTATUS NTAPI RawNtWaitForSingleObject(HANDLE a0, BOOLEAN a1, PLARGE_INTEGER a2) {
+EXPORT NTSTATUS NTAPI NtUpdateWnfStateData(const ULONGLONG * a0, const void * a1, ULONG a2, const void * a3, const void * a4, ULONG a5, ULONG a6) {
+  ULONG64 v[7] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  v[6] = (ULONG64)(ULONG_PTR)a6;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtUpdateWnfStateData, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwUpdateWnfStateData(const ULONGLONG * a0, const void * a1, ULONG a2, const void * a3, const void * a4, ULONG a5, ULONG a6) { return NtUpdateWnfStateData(a0, a1, a2, a3, a4, a5, a6); }
+EXPORT NTSTATUS NTAPI NtWaitForAlertByThreadId(PVOID a0, PLARGE_INTEGER a1) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtWaitForAlertByThreadId, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwWaitForAlertByThreadId(PVOID a0, PLARGE_INTEGER a1) { return NtWaitForAlertByThreadId(a0, a1); }
+EXPORT NTSTATUS NTAPI NtWaitForDebugEvent(HANDLE a0, BOOLEAN a1, PLARGE_INTEGER a2, PVOID a3) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtWaitForSingleObject, v);
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtWaitForDebugEvent, v);
   return status;
 }
-static NTSTATUS NTAPI RawNtWriteFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, PLARGE_INTEGER a7, PULONG a8) {
+EXPORT NTSTATUS NTAPI ZwWaitForDebugEvent(HANDLE a0, BOOLEAN a1, PLARGE_INTEGER a2, PVOID a3) { return NtWaitForDebugEvent(a0, a1, a2, a3); }
+NTSTATUS NTAPI RawNtWaitForSingleObject(HANDLE a0, BOOLEAN a1, PLARGE_INTEGER a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtWaitForSingleObject, v);
+  return status;
+}
+NTSTATUS NTAPI RawNtWriteFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, PLARGE_INTEGER a7, PULONG a8) {
   ULONG64 v[9] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = WOW_HANDLE(a1);
@@ -1008,7 +1357,7 @@ static NTSTATUS NTAPI RawNtWriteFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, P
   v[6] = (ULONG64)(ULONG_PTR)a6;
   v[7] = (ULONG64)(ULONG_PTR)a7;
   v[8] = (ULONG64)(ULONG_PTR)a8;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtWriteFile, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtWriteFile, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI NtWriteVirtualMemory(HANDLE a0, PVOID a1, PVOID a2, SIZE_T a3, PSIZE_T a4) {
@@ -1019,14 +1368,14 @@ EXPORT NTSTATUS NTAPI NtWriteVirtualMemory(HANDLE a0, PVOID a1, PVOID a2, SIZE_T
   v[3] = (ULONG64)(ULONG_PTR)a3;
   ULONG64 w4 = a4 ? (ULONG64)(ULONG_PTR)*a4 : 0;
   v[4] = a4 ? WOW_POINTER(&w4) : 0;
-  const NTSTATUS status = wow_service(NT_SERVICE_NtWriteVirtualMemory, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtWriteVirtualMemory, v);
   if (a4) *a4 = (__typeof__(*a4))(ULONG_PTR)w4;
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwWriteVirtualMemory(HANDLE a0, PVOID a1, PVOID a2, SIZE_T a3, PSIZE_T a4) { return NtWriteVirtualMemory(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtYieldExecution(void) {
   ULONG64 v[4] = {0};
-  const NTSTATUS status = wow_service(NT_SERVICE_NtYieldExecution, v);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtYieldExecution, v);
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwYieldExecution(void) { return NtYieldExecution(); }

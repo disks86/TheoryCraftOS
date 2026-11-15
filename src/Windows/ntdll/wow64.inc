@@ -67,15 +67,13 @@ static ULONG64 wow_object_attributes(WOW_OBJECT_ATTRIBUTES *out, const OBJECT_AT
 /* ---- services written by hand ------------------------------------------------------------------------------------------------------------------------ */
 
 /* The handles are an array of pointer-sized values. */
-EXPORT NTSTATUS NTAPI NtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
+/* (ntdll.c's NtWaitForMultipleObjects, which runs the queued APCs, calls this.) */
+NTSTATUS NTAPI RawNtWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
   ULONG64 wide[64];
   if (count > 64) return (NTSTATUS)0xC00000EFu;      /* STATUS_INVALID_PARAMETER_1 */
   for (ULONG i = 0; i < count; ++i) wide[i] = WOW_HANDLE(handles[i]);
   const ULONG64 v[5] = {count, WOW_POINTER(wide), type, alertable, WOW_POINTER(timeout)};
   return wow_service(NT_SERVICE_NtWaitForMultipleObjects, v);
-}
-EXPORT NTSTATUS NTAPI ZwWaitForMultipleObjects(ULONG count, const HANDLE *handles, ULONG type, BOOLEAN alertable, PLARGE_INTEGER timeout) {
-  return NtWaitForMultipleObjects(count, handles, type, alertable, timeout);
 }
 
 /* MEMORY_BASIC_INFORMATION (class 0) has pointer-sized fields; the other classes are passed as they are. */
@@ -109,7 +107,8 @@ static PEB *g_wow_peb;      /* the 32-bit PEB (wow64_start_process) */
 /* ProcessBasicInformation (class 0) and ThreadBasicInformation (class 0) have pointer-sized fields - and name the PEB and the TEB, which for a 32-bit
  * program are the 32-bit ones. The other classes are passed as they are. */
 EXPORT NTSTATUS NTAPI NtQueryInformationProcess(HANDLE process, ULONG information_class, PVOID buffer, ULONG size, PULONG returned) {
-  if (information_class != 0) {
+  /* (48 bytes: these libraries' own callers, which were written for the 64-bit record and read it as such) */
+  if (information_class != 0 || size == 48) {
     const ULONG64 v[5] = {WOW_HANDLE(process), information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};
     return wow_service(NT_SERVICE_NtQueryInformationProcess, v);
   }
@@ -130,7 +129,7 @@ EXPORT NTSTATUS NTAPI NtQueryInformationProcess(HANDLE process, ULONG informatio
   return status;
 }
 EXPORT NTSTATUS NTAPI NtQueryInformationThread(HANDLE thread, ULONG information_class, PVOID buffer, ULONG size, PULONG returned) {
-  if (information_class != 0) {
+  if (information_class != 0 || size == 48) {      /* (48 bytes: as above) */
     const ULONG64 v[5] = {WOW_HANDLE(thread), information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};
     return wow_service(NT_SERVICE_NtQueryInformationThread, v);
   }
@@ -225,6 +224,7 @@ static void wow64_start_process(const BYTE *peb64) {
     parameters->WindowFlags = numbers[7]; parameters->ShowWindowFlags = numbers[8];
     narrow_string(&parameters->WindowTitle, parameters64 + 0xB0);
     narrow_string(&parameters->DesktopInfo, parameters64 + 0xC0);
+    *(SIZE_T *)((BYTE *)parameters + PARAMS_ENVIRONMENT_SIZE) = (SIZE_T)wide_at(parameters64 + 0x3F0);
     peb->ProcessParameters = parameters;
   }
 

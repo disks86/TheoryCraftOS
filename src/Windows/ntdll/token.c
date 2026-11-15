@@ -1732,7 +1732,11 @@ done:
 }
 
 /* The Zw names of the services above: the same calls. */
+#ifdef __i386__
+#define ZW_ALIAS(zw, nt)      /* (the 32-bit ntdll.dll does not export the Zw names of these: its functions carry the size of their arguments in their names) */
+#else
 #define ZW_ALIAS(zw, nt) __asm__(".text\n.globl " #zw "\n" #zw ":\n jmp " #nt "\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
+#endif
 ZW_ALIAS(ZwOpenProcessTokenEx, NtOpenProcessTokenEx);
 ZW_ALIAS(ZwOpenProcessToken, NtOpenProcessToken);
 ZW_ALIAS(ZwOpenThreadTokenEx, NtOpenThreadTokenEx);

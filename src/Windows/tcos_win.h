@@ -498,6 +498,18 @@ static inline PEB *NtCurrentPeb(void) { PEB *p; __asm__ volatile("movq %%gs:0x60
 #define TEB_RAW(teb) ((BYTE *)(teb))
 #define PEB_RAW() ((BYTE *)NtCurrentPeb())
 #endif
+/* RTL_USER_PROCESS_PARAMETERS by offset, for the code that moves the whole block: where the environment and its size are, how much of the block is
+ * fixed fields, and where its strings' headers are (the current directory, DllPath, ImagePathName, CommandLine, WindowTitle, DesktopInfo, ShellInfo,
+ * RuntimeData). */
+#ifdef __i386__
+#define PARAMS_ENVIRONMENT 0x48
+#define PARAMS_ENVIRONMENT_SIZE 0x290
+#define PARAMS_STRING_OFFSETS {0x24, 0x30, 0x38, 0x40, 0x70, 0x78, 0x80, 0x88}
+#else
+#define PARAMS_ENVIRONMENT 0x80
+#define PARAMS_ENVIRONMENT_SIZE 0x3F0
+#define PARAMS_STRING_OFFSETS {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0}
+#endif
 #define NtCurrentProcess() ((HANDLE)(LONG_PTR)-1)
 #define NtCurrentThread() ((HANDLE)(LONG_PTR)-2)
 

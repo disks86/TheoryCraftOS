@@ -348,7 +348,6 @@ EXPORT NTSTATUS NTAPI RtlGetImageFileMachines(PCWSTR path, USHORT *machines) { (
 EXPORT ULONG NTAPI RtlRandomEx(PULONG seed) { return RtlRandom(seed); }
 EXPORT BOOLEAN NTAPI RtlUdiv128(ULONGLONG high, ULONGLONG low, ULONGLONG divisor, ULONGLONG *quotient, ULONGLONG *remainder) {
   if (divisor == 0 || high >= divisor) return FALSE;
-  unsigned __int128 n = ((unsigned __int128)high << 64) | low;
   /* a division the compiler's runtime would have to supply: done bit by bit */
   ULONGLONG q = 0, r = high;
   for (int i = 63; i >= 0; --i) {
@@ -356,7 +355,6 @@ EXPORT BOOLEAN NTAPI RtlUdiv128(ULONGLONG high, ULONGLONG low, ULONGLONG divisor
     r = (r << 1) | ((low >> i) & 1);
     if (carry || r >= divisor) { r -= divisor; q |= 1ull << i; }
   }
-  (void)n;
   *quotient = q;
   *remainder = r;
   return TRUE;

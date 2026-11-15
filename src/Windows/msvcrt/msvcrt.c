@@ -27,8 +27,7 @@ typedef unsigned short wchar_t;
 #define API __declspec(dllexport)
 #undef EXPORT
 #define EXPORT API
-typedef unsigned long long size_t_;
-typedef unsigned long long uintptr_t_;
+typedef ULONG_PTR uintptr_t_;      /* (size_t_ is tcos_win.h's: as wide as a pointer) */
 typedef long long intptr_t;
 typedef __builtin_va_list va_list_;
 #define va_start_(a, b) __builtin_va_start(a, b)
@@ -1254,7 +1253,9 @@ typedef struct Stream {
   int buffer_size, read_pos, read_end, write_pos, ungot, pad;
   struct Stream *next;
 } Stream;
+#ifndef __i386__      /* (a 32-bit program built against the old runtime indexes _iob by 32 bytes, which this record is not: only __acrt_iob_func and __iob_func's first stream serve it) */
 _Static_assert(sizeof(Stream) == 48, "the streams of __iob_func() are 48 bytes apart in the Microsoft headers");
+#endif
 
 static Stream g_iob[3] = {{0, S_READ | S_STATIC, 0, 0, 0, 0, 0, -1, 0, 0}, {1, S_WRITE | S_STATIC, 0, 0, 0, 0, 0, -1, 0, 0}, {2, S_WRITE | S_STATIC | S_UNBUF, 0, 0, 0, 0, 0, -1, 0, 0}};
 static Stream *g_streams;      /* the streams opened with fopen */
@@ -2045,6 +2046,42 @@ API int gettimeofday(void *tv, void *tz) { (void)tz; FILETIME ft; GetSystemTimeA
  * setjmp and longjmp: the layout of the Microsoft _JUMP_BUFFER (256 bytes)
  * ==================================================================================================================================================================== */
 
+#ifdef __i386__
+/* i386: the Microsoft _JUMP_BUFFER is ebp, ebx, edi, esi, esp, eip (then the exception registration, which is left alone). The C names have an underscore
+ * before them here; _setjmp3 is what the compilers call (its extra arguments are for unwinding, which is not done). */
+__asm__(
+    ".text\n"
+    ".globl __setjmp\n__setjmp:\n"
+    ".globl __setjmp3\n__setjmp3:\n"
+    ".globl _setjmp\n_setjmp:\n"
+    "  movl 4(%esp), %eax\n"
+    "  movl %ebp, 0(%eax)\n"
+    "  movl %ebx, 4(%eax)\n"
+    "  movl %edi, 8(%eax)\n"
+    "  movl %esi, 12(%eax)\n"
+    "  leal 4(%esp), %ecx\n"
+    "  movl %ecx, 16(%eax)\n"
+    "  movl (%esp), %ecx\n"
+    "  movl %ecx, 20(%eax)\n"
+    "  xorl %eax, %eax\n"
+    "  ret\n"
+    ".globl _longjmp\n_longjmp:\n"
+    "  movl 4(%esp), %edx\n"
+    "  movl 8(%esp), %eax\n"
+    "  testl %eax, %eax\n"
+    "  jnz 1f\n"
+    "  incl %eax\n"
+    "1:\n"
+    "  movl 0(%edx), %ebp\n"
+    "  movl 4(%edx), %ebx\n"
+    "  movl 8(%edx), %edi\n"
+    "  movl 12(%edx), %esi\n"
+    "  movl 16(%edx), %esp\n"
+    "  jmp *20(%edx)\n"
+    ".section .drectve\n"
+    ".ascii \" -export:_setjmp -export:_setjmp3 -export:setjmp -export:longjmp\"\n"
+    ".text\n");
+#else
 __asm__(
     ".text\n"
     ".globl _setjmp\n_setjmp:\n"
@@ -2109,6 +2146,7 @@ __asm__(
     "  movq 16(%rcx), %rsp\n"
     "  jmpq *80(%rcx)\n"
     ".section .drectve\n.ascii \" -export:_setjmp -export:__intrinsic_setjmp -export:_setjmpex -export:__intrinsic_setjmpex -export:setjmp -export:longjmp\"\n.text\n");
+#endif
 
 /* ====================================================================================================================================================================
  * Signals, exit, atexit and the start-up entry points of the runtime

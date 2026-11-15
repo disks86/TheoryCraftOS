@@ -2299,8 +2299,10 @@ EXPORT BOOL WINAPI EnumSystemGeoNames(DWORD geo_class, GEO_ENUMNAMEPROC_ callbac
   return TRUE;
 }
 EXPORT int WINAPI ConvertNLSDayOfWeekToWin32DayOfWeek(int day) { return (day + 1) % 7; }      /* NLS: Monday = 0; Win32: Sunday = 0 */
+#ifndef __i386__      /* (64-bit Windows only: 128-bit products) */
 EXPORT LONG64 WINAPI MultiplyExtract128(LONG64 a, LONG64 b, BYTE shift) { return (LONG64)(((__int128)a * (__int128)b) >> (shift & 127)); }
 EXPORT ULONG64 WINAPI UnsignedMultiplyExtract128(ULONG64 a, ULONG64 b, BYTE shift) { return (ULONG64)(((unsigned __int128)a * (unsigned __int128)b) >> (shift & 127)); }
+#endif
 EXPORT VOID WINAPI RtlSecureZeroMemory(PVOID p, SIZE_T n) { volatile BYTE *b = p; while (n--) *b++ = 0; }
 EXPORT BOOLEAN WINAPI RtlIsEcCode(ULONG64 address) { (void)address; return FALSE; }      /* (no emulation-compatible code in a native process) */
 typedef BOOL (WINAPI *SECURE_MEMORY_CACHE_CALLBACK_)(PVOID, SIZE_T);

@@ -1611,6 +1611,26 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   foreach(_library ${WINDOWS_LIBRARIES})
     list(APPEND _system32_files file:${_system32}/${_library}.dll=${WINDOWS_DIR}/${_library}.dll)
   endforeach()
+  # The libraries of 32-bit programs (C:\\Windows\\SysWOW64, see docs/Wow64.md): the same sources built for i386, where there is a compiler for that.
+  find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
+  set(WOW64_LIBRARIES ntdll kernel32 msvcrt)
+  set(_wow64_outputs "")
+  if(TCOS_WOW64_CC)
+    set(WOW64_DIR ${CMAKE_BINARY_DIR}/windows32)
+    foreach(_library ${WOW64_LIBRARIES})
+      list(APPEND _wow64_outputs ${WOW64_DIR}/${_library}.dll)
+      list(APPEND _system32_files file:/Windows/Windows/SysWOW64/${_library}.dll=${WOW64_DIR}/${_library}.dll)
+    endforeach()
+    file(GLOB _wow64_sources ${CMAKE_SOURCE_DIR}/src/Windows/*.h ${CMAKE_SOURCE_DIR}/src/Windows/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/*
+         ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/* ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/*)
+    add_custom_command(OUTPUT ${_wow64_outputs}
+      COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-wow64-dlls.sh ${WOW64_DIR}
+      DEPENDS ${_wow64_sources} ${CMAKE_SOURCE_DIR}/scripts/build-wow64-dlls.sh
+      COMMENT "Building the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll (SysWOW64)")
+    add_custom_target(windows_dlls32 DEPENDS ${_wow64_outputs})
+  else()
+    message(STATUS "No i686-w64-mingw32-gcc: the libraries of 32-bit Windows programs are not built")
+  endif()
   add_custom_target(primary ALL
     COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-primary-image.sh ${TCOS_PRIMARY_IMAGE} ${TCOS_PRIMARY_IMAGE_SIZE} ${_primary_tool}
            
@@ -1618,6 +1638,9 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
     DEPENDS ${_primary_tool}
     COMMENT "Filling the primary disk image")
   add_dependencies(primary windows_dlls)
+  if(TCOS_WOW64_CC)
+    add_dependencies(primary windows_dlls32)
+  endif()
 else()
   message(WARNING "No primary disk image: it needs an x86-64 build, mkfs.fat and a host C++ compiler")
   add_custom_target(primary COMMAND ${CMAKE_COMMAND} -E touch ${TCOS_PRIMARY_IMAGE})

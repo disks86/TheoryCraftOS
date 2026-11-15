@@ -30,6 +30,15 @@
 /* A function with a big frame calls this to touch its pages; the stack here is mapped in full, so there is nothing to do. */
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
+#ifdef __i386__
+/* The 32-bit ntdll.dll (docs/Wow64.md): its services are C functions that widen their arguments and call the kernel through INT 2E (wow64.inc and the
+ * generated wow64_services.inc), so the stub macros below make nothing. The services the kernel has no code for are not exported. */
+#define NT_SERVICE(name)
+#define NT_SERVICE_RAW(name)
+#define ZW_SERVICE(nt, zw)
+#define ZW_ALIAS(nt, zw)
+#include "wow64.inc"
+#else
 /* The service stubs: "mov r10, rcx; mov eax, number; syscall; ret". Arguments past the fourth stay on the stack where the caller put them. */
 #define NT_SERVICE(name)                                                                                                                                      \
   __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
@@ -40,6 +49,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define ZW_SERVICE(nt, zw)                                                                                                                                    \
   __asm__(".text\n.globl " #zw "\n" #zw ":\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_##nt) ", %eax\n syscall\n ret\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
 #define ZW_ALIAS(nt, zw) __asm__(".text\n.globl " #zw "\n" #zw ":\n jmp " #nt "\n.section .drectve\n.ascii \" -export:" #zw "\"\n.text\n")
+#endif
 #define _STR(x) _STR2(x)
 #define _STR2(x) #x
 NT_SERVICE_RAW(NtReadFile);
@@ -133,8 +143,10 @@ NT_SERVICE(NtTerminateProcess);
 NT_SERVICE(NtYieldExecution);
 NT_SERVICE_RAW(NtDelayExecution);
 NT_SERVICE_RAW(NtQuerySystemTime);
+#ifndef __i386__
 #include "services.inc"      /* the rest of the services: generated, the kernel answers STATUS_NOT_IMPLEMENTED for the ones it has no code for */
 #include "zw.inc"
+#endif
 NT_SERVICE(NtAllocateVirtualMemory);
 NT_SERVICE(NtFreeVirtualMemory);
 NT_SERVICE(NtProtectVirtualMemory);
@@ -483,10 +495,17 @@ static BOOL notify_module(LDR_DATA_TABLE_ENTRY *m, DWORD reason, PVOID reserved)
   const BYTE *image = (const BYTE *)m->DllBase;
   if (!image) return TRUE;
   const ULONG nt = *(const ULONG *)(image + 0x3C);
+#ifdef __i386__      /* (a PE32 image: the directories start at 0x60, and the TLS directory holds 32-bit addresses) */
+  const ULONG rva = *(const ULONG *)(image + nt + 24 + 0x60 + 9 * 8);      /* IMAGE_DIRECTORY_ENTRY_TLS */
+  const ULONG size = *(const ULONG *)(image + nt + 24 + 0x60 + 9 * 8 + 4);
+  if (rva && size >= 0x18) {
+    const TlsCallback *callbacks = (const TlsCallback *)*(const ULONG *)(image + rva + 0x0C);
+#else
   const ULONG rva = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8);      /* IMAGE_DIRECTORY_ENTRY_TLS */
   const ULONG size = *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8 + 4);
   if (rva && size >= 0x28) {
     const TlsCallback *callbacks = (const TlsCallback *)*(const ULONG64 *)(image + rva + 0x18);
+#endif
     if (callbacks) for (; *callbacks; ++callbacks) (*callbacks)(m->DllBase, reason, reserved);
   }
   if (!is_program(m) && m->EntryPoint) return call_library_entry(m, reason, reserved);
@@ -573,6 +592,9 @@ static void reset_floating_point(void) {
   __asm__ volatile("fldcw %0; ldmxcsr %1" : : "m"(cw), "m"(mxcsr));
 }
 EXPORT void NTAPI TcosThreadStart(LPTHREAD_START_ROUTINE start, PVOID parameter) {
+#ifdef __i386__
+  wow64_start_thread();      /* (the 32-bit TEB learns where the 32-bit PEB is) */
+#endif
   reset_floating_point();
   if (!thread_skips_attach()) {      /* (a thread made with THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH has neither thread-local storage nor a call to the libraries) */
     if (!TEB_TLS_POINTER(NtCurrentTeb())) TEB_TLS_POINTER(NtCurrentTeb()) = *(PVOID **)(TEB_RAW(NtCurrentTeb()) + 0x1788);      /* (the kernel left the thread-local array where it could not be seen) */
@@ -1058,7 +1080,11 @@ EXPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION cs) {
 
 /* ---- exceptions: unwinding, dispatching, __C_specific_handler ----------------------------------------------------------------------------------------------- */
 
+#ifdef __i386__
+#include "except32.inc"      /* (the exceptions of i386 are frames on the stack, not tables: another mechanism altogether) */
+#else
 #include "except.inc"
+#endif
 #include "actctx.inc"
 /* SSE and SSE2 are there (PF_XMMI_INSTRUCTIONS_AVAILABLE = 6, PF_XMMI64_INSTRUCTIONS_AVAILABLE = 10); nothing newer is reported. */
 EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return feature == 6 || feature == 10; }
@@ -1066,7 +1092,12 @@ EXPORT BOOLEAN NTAPI RtlIsProcessorFeaturePresent(ULONG feature) { return featur
 /* ---- process start-up ------------------------------------------------------------------------------------------------------------------------------- */
 
 typedef BOOL (WINAPI *DllEntry)(HANDLE, DWORD, PVOID);
+/* (On i386 a program's entry point is called as a C function: the ones compilers make take no arguments and leave the stack as it is.) */
+#ifdef __i386__
+typedef int (__cdecl *ProgramEntry)(PVOID);
+#else
 typedef int (WINAPI *ProgramEntry)(PVOID);
+#endif
 
 /* The program's first breakpoint, where a debugger that started it takes over; it is not DbgBreakPoint, as on Windows. */
 static __attribute__((noinline)) void tcos_initial_break(void) { *(TEB_RAW(NtCurrentTeb()) + 0x1668) = 2; __asm__ volatile("int3" ::: "memory"); *(TEB_RAW(NtCurrentTeb()) + 0x1668) = 0; }
@@ -1074,6 +1105,10 @@ static __attribute__((noinline)) void tcos_initial_break(void) { *(TEB_RAW(NtCur
 /* The thread of a program starts here: the kernel puts the program's entry point in the first argument and the PEB in the second. The libraries' entry points run first
  * (in the order the kernel listed them: a library after the libraries it imports), then the program's. Its return value ends the process. */
 EXPORT void NTAPI RtlUserThreadStart(ProgramEntry entry, PVOID parameter) {
+#ifdef __i386__
+  wow64_start_process((const BYTE *)parameter);      /* the kernel passed the PEB it made, a 64-bit one: the 32-bit one is made from it, first of all */
+  parameter = NtCurrentPeb();
+#endif
   PEB *peb = NtCurrentPeb();
   PEB_LDR_DATA *ldr = peb->Ldr;
   process_heap();
@@ -1359,8 +1394,7 @@ static WCHAR *append_path(WCHAR *p, const WCHAR *text, SIZE_T length) {
   return p + length + 1;
 }
 static const WCHAR *image_path_name(void) {
-  const BYTE *params = *(const BYTE *const *)(*(const BYTE *const *)(TEB_RAW(NtCurrentTeb()) + 0x60) + 0x20);
-  return ((const UNICODE_STRING *)(params + 0x60))->Buffer;
+  return NtCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
 }
 /* module folder; dll_dir or the current folder; the system folders; PATH (with the current folder before it in safe mode). The result is from the process heap. */
 static NTSTATUS get_dll_load_path(const WCHAR *module, const WCHAR *dll_dir, LONG safe_mode, PWSTR *path) {

@@ -1351,13 +1351,13 @@ EXPORT NTSTATUS NTAPI RtlSetEnvironmentVar(PWSTR *penv, PCWSTR name, SIZE_T name
   }
   fresh[out++] = 0;
   if (out == 1) fresh[out++] = 0;
-  const SIZE_T capacity = penv ? RtlSizeHeap(RtlProcessHeap(), 0, old) : *(SIZE_T *)((BYTE *)params + 0x3F0);
+  const SIZE_T capacity = penv ? RtlSizeHeap(RtlProcessHeap(), 0, old) : *(SIZE_T *)((BYTE *)params + PARAMS_ENVIRONMENT_SIZE);
   if (out * 2 <= capacity) {      /* it fits where it is: the block keeps its size */
     memcpy(old, fresh, out * 2);
     RtlFreeHeap(RtlProcessHeap(), 0, fresh);
     return STATUS_SUCCESS;
   }
-  if (penv) *penv = fresh; else { params->Environment = fresh; *(SIZE_T *)((BYTE *)params + 0x3F0) = out * 2; }
+  if (penv) *penv = fresh; else { params->Environment = fresh; *(SIZE_T *)((BYTE *)params + PARAMS_ENVIRONMENT_SIZE) = out * 2; }
   RtlFreeHeap(RtlProcessHeap(), 0, old);
   return STATUS_SUCCESS;
 }
@@ -1369,24 +1369,24 @@ EXPORT void NTAPI RtlSetCurrentEnvironment(PWSTR environment, PWSTR *previous) {
   RTL_USER_PROCESS_PARAMETERS *params = NtCurrentPeb()->ProcessParameters;
   if (previous) *previous = (PWSTR)params->Environment;
   params->Environment = environment;
-  *(SIZE_T *)((BYTE *)params + 0x3F0) = RtlSizeHeap(RtlProcessHeap(), 0, environment);
+  *(SIZE_T *)((BYTE *)params + PARAMS_ENVIRONMENT_SIZE) = RtlSizeHeap(RtlProcessHeap(), 0, environment);
 }
 /* The process's parameters and environment become blocks of the heap, as they are on Windows (the strings follow the header; the current directory stays where it is). */
 static void relocate_process_parameters(void) {
   PEB *peb = NtCurrentPeb();
   BYTE *old = (BYTE *)peb->ProcessParameters;
   if (!old) return;
-  const ULONG index[8] = {0x38, 0x50, 0x60, 0x70, 0xB0, 0xC0, 0xD0, 0xE0};
+  const ULONG index[8] = PARAMS_STRING_OFFSETS;
   ULONG size = PARAMS_HEADER;
   for (int i = 1; i < 8; ++i) { const UNICODE_STRING *u = (const UNICODE_STRING *)(old + index[i]); if (u->Buffer) size += u->MaximumLength; }
   BYTE *fresh = RtlAllocateHeap(RtlProcessHeap(), 8, size);
-  const SIZE_T chars = *(PVOID *)(old + 0x80) ? env_chars(*(const WCHAR **)(old + 0x80)) : 2;
+  const SIZE_T chars = *(PVOID *)(old + PARAMS_ENVIRONMENT) ? env_chars(*(const WCHAR **)(old + PARAMS_ENVIRONMENT)) : 2;
   WCHAR *env = RtlAllocateHeap(RtlProcessHeap(), 8, chars * 2);
   if (!fresh || !env) return;
-  memcpy(fresh, old, 0x3F0);
-  if (*(PVOID *)(old + 0x80)) memcpy(env, *(const WCHAR **)(old + 0x80), chars * 2);
-  *(PVOID *)(fresh + 0x80) = env;
-  *(SIZE_T *)(fresh + 0x3F0) = chars * 2;
+  memcpy(fresh, old, PARAMS_ENVIRONMENT_SIZE);
+  if (*(PVOID *)(old + PARAMS_ENVIRONMENT)) memcpy(env, *(const WCHAR **)(old + PARAMS_ENVIRONMENT), chars * 2);
+  *(PVOID *)(fresh + PARAMS_ENVIRONMENT) = env;
+  *(SIZE_T *)(fresh + PARAMS_ENVIRONMENT_SIZE) = chars * 2;
   *(ULONG *)fresh = *(ULONG *)(fresh + 4) = size;
   ULONG pos = PARAMS_HEADER;
   for (int i = 1; i < 8; ++i) {

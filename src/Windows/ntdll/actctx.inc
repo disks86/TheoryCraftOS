@@ -1789,9 +1789,8 @@ static const BYTE *act_image_manifest(const BYTE *base, SIZE_T size, int flat, U
 
 static void act_init_process(void) {
   PEB *peb = NtCurrentPeb();
-  const BYTE *params = *(const BYTE **)(PEB_RAW() + 0x20);
-  if (!params || g_process_ctx) return;
-  const UNICODE_STRING *image = (const UNICODE_STRING *)(params + 0x60);
+  if (!peb->ProcessParameters || g_process_ctx) return;
+  const UNICODE_STRING *image = &peb->ProcessParameters->ImagePathName;
   if (!image->Buffer || image->Length < 2 || image->Length > 2 * 520) return;
   WCHAR path[540], dir[540];
   const SIZE_T n = image->Length / 2;

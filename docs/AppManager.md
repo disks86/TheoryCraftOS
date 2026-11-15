@@ -119,7 +119,8 @@ choosing Remove a second time forgets the package.
 Refused, with the reason in the message:
 
 - `msi`, `wix`, `burn`, `msix`, `appx` and Store packages (there is no Windows Installer here);
-- a setup program that is a 32-bit program. Many are, even for 64-bit applications: of five popular ones looked at, 7-Zip's and Git's are 64-bit,
+- a setup program that is a 32-bit program (32-bit programs are being brought up, see Wow64.md: console programs run, the windowing libraries
+  setup programs need are not built for them yet). Many are, even for 64-bit applications: of five popular ones looked at, 7-Zip's and Git's are 64-bit,
   Firefox's, Visual Studio Code's and HandBrake's are 32-bit;
 - an `exe` installer whose manifest has no silent switch;
 - packages with no x64 or neutral installer.

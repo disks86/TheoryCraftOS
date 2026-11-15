@@ -18,10 +18,26 @@
 /* ntdll.dll: process creation with the Windows interface of NtCreateUserProcess (the system's own service, with its own arguments, is TcosCreateUserProcess; kernel32 uses that).
    Included by ntdll.c after atom.inc. */
 
+#ifdef __i386__
+/* (the 32-bit ntdll.dll: widened by hand, as wow64.inc does for the others; `startup` is passed as it is) */
+EXPORT NTSTATUS NTAPI TcosCreateUserProcess(PHANDLE process, PHANDLE thread, PUNICODE_STRING image, PUNICODE_STRING command, PUNICODE_STRING cwd, PVOID environment, ULONG flags,
+                                            PULONG process_id, PULONG thread_id, HANDLE std_in, HANDLE std_out, HANDLE std_err, PVOID startup) {
+  ULONG64 wide_process = 0, wide_thread = 0;
+  UNICODE_STRING64 wide_image, wide_command, wide_cwd;
+  const ULONG64 v[13] = {WOW_POINTER(&wide_process), WOW_POINTER(&wide_thread), wow_unicode_string(&wide_image, image), wow_unicode_string(&wide_command, command),
+                         wow_unicode_string(&wide_cwd, cwd), WOW_POINTER(environment), flags, WOW_POINTER(process_id), WOW_POINTER(thread_id),
+                         WOW_HANDLE(std_in), WOW_HANDLE(std_out), WOW_HANDLE(std_err), WOW_POINTER(startup)};
+  const NTSTATUS status = wow_service(NT_SERVICE_NtCreateUserProcess, v);
+  if (process) *process = (HANDLE)(ULONG_PTR)wide_process;
+  if (thread) *thread = (HANDLE)(ULONG_PTR)wide_thread;
+  return status;
+}
+#else
 __asm__(".text\n.globl TcosCreateUserProcess\nTcosCreateUserProcess:\n mov %rcx, %r10\n mov $" _STR(NT_SERVICE_NtCreateUserProcess) ", %eax\n syscall\n ret\n"
         ".section .drectve\n.ascii \" -export:TcosCreateUserProcess\"\n.text\n");
 NTSTATUS NTAPI TcosCreateUserProcess(PHANDLE process, PHANDLE thread, PUNICODE_STRING image, PUNICODE_STRING command, PUNICODE_STRING cwd, PVOID environment, ULONG flags,
                                      PULONG process_id, PULONG thread_id, HANDLE std_in, HANDLE std_out, HANDLE std_err, PVOID startup);
+#endif
 
 typedef struct { ULONG_PTR Attribute; SIZE_T Size; ULONG_PTR Value; PSIZE_T ReturnLength; } PS_ATTRIBUTE_;
 typedef struct { SIZE_T TotalLength; PS_ATTRIBUTE_ Attributes[1]; } PS_ATTRIBUTE_LIST_;
