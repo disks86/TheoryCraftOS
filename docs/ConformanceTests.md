@@ -60,8 +60,10 @@ pre-insertion validity", including the rules for a document's doctype and elemen
 
 ### Pass of 2026-11-14
 
-Real web-platform-tests, subtests passed before / after (the same checkout, the same runner): `dom/events` 399 / 565, `html/dom` 47758 / 61592 (attribute reflection),
-`custom-elements` 821 / 1203, `shadow-dom` 191 / 279, `html/dom/elements/the-innertext-and-outertext-properties` about 190 / 374. What was found and done:
+Real web-platform-tests, subtests passed before / after (the same checkout, the same runner): `dom/events` 399 / 570, `dom/nodes` 9597 / 9942, `html/dom` 47758 / 61767
+(attribute reflection), `html/semantics` 6221 / 7913, `custom-elements` 821 / 1201, `shadow-dom` 191 / 293, `css/selectors` 476 / 3293 (most of it named access letting the
+test pages run), `html/dom/elements/the-innertext-and-outertext-properties` about 190 / 374; with the two sections below, `dom/ranges` 22279 / 30985, `selection` 20425 / 33608
+and `workers` 213 / 651. A big file can time out at the runner's 60 seconds when the machine is busy: compare runs made under the same load. What was found and done:
 
 - **Events**: `returnValue`, `cancelBubble` and the stop flags as the standard has them (set before a dispatch they hold, both are cleared after it), `initEvent()` does nothing
   during a dispatch, `dispatchEvent()` throws `InvalidStateError` for an event on its way or not initialized, `window.event`, `timeStamp` on the clock of `performance.now()`,
@@ -88,7 +90,7 @@ Real web-platform-tests, subtests passed before / after (the same checkout, the 
 - **`PerformanceObserver`** delivers (`mark`, `measure`, and `buffered` for what is kept); `Response` / `Request` / `Blob` `text()` and `json()` drop a UTF-8 byte order mark.
 - The small harness lets the next promise test run when one never settles (a hung test used to hide the results of all the later ones).
 
-Known and left: a `toggle` event when a script changes `details.open`, `Float16Array`, scoped custom element registries, most of what the fetch / XHR tests need a server for,
+Known and left: `Float16Array`, the value of an input whose `type` changes, scoped custom element registries, most of what the fetch / XHR tests need a server for,
 `srcset` tests (they need images that load in the test environment), frames in the `Range` tests.
 ## Ranges, selection, traversal and mutation observers
 
