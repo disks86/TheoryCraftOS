@@ -164,7 +164,13 @@ static int g_argc;
 static char **g_argv, **g_environ;
 static wchar_t **g_wargv;
 static char *g_pgmptr;
-static int g_fmode, g_commode;
+/* Data that programs import by name (not through a __p_ function): the startup code of programs linked against this runtime the old way (mainCRTStartup of the
+ * Windows SDK's msvcrt.lib, as 7-Zip's setup program has it) stores its file modes into _fmode and _commode and reads the command line from _acmdln. */
+API int _fmode, _commode;
+API char *_acmdln;
+API wchar_t *_wcmdln;
+#define g_fmode _fmode
+#define g_commode _commode
 
 /* Splits a command line the way the Microsoft runtime does: blanks separate; "..." groups; backslashes only count before a quote. Fills `argv` (if not NULL) with pointers
  * into `store`, returns the count and the bytes of store needed. */
@@ -2218,8 +2224,8 @@ API int _initialize_narrow_environment(void) { init_environment(); return 0; }
 API int _initialize_wide_environment(void) { init_environment(); return 0; }
 API char **_get_initial_narrow_environment(void) { init_environment(); return g_environ; }
 API wchar_t **_get_initial_wide_environment(void) { return NULL; }
-API char **__p__acmdln(void) { static char *line; if (!line) line = GetCommandLineA(); return &line; }
-API wchar_t **__p__wcmdln(void) { static wchar_t *line; if (!line) line = GetCommandLineW(); return &line; }
+API char **__p__acmdln(void) { if (!_acmdln) _acmdln = GetCommandLineA(); return &_acmdln; }
+API wchar_t **__p__wcmdln(void) { if (!_wcmdln) _wcmdln = GetCommandLineW(); return &_wcmdln; }
 API char ***__p___initenv(void) { init_environment(); return &g_environ; }
 API void *__p__wenviron(void) { static wchar_t **e; return &e; }
 API wchar_t **__p__wpgmptr(void) { static wchar_t *p; if (!p) { init_arguments(); p = g_wargv && g_wargv[0] ? g_wargv[0] : L""; } return &p; }
@@ -2261,7 +2267,11 @@ API void _endthread(void) { ExitThread(0); }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module; (void)reserved;
-  if (reason == DLL_PROCESS_ATTACH) g_errno_slot = TlsAlloc();
+  if (reason == DLL_PROCESS_ATTACH) {
+    g_errno_slot = TlsAlloc();
+    _acmdln = GetCommandLineA();      /* (read as data, so they must be there before the program's first instruction) */
+    _wcmdln = GetCommandLineW();
+  }
   if (reason == DLL_THREAD_DETACH && g_errno_slot != TLS_OUT_OF_INDEXES) {      /* the thread's errno goes with it */
     int *p = TlsGetValue(g_errno_slot);
     if (p) { TlsSetValue(g_errno_slot, NULL); HeapFree(GetProcessHeap(), 0, p); }

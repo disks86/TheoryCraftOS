@@ -47,6 +47,10 @@ struct ProgramRun {
   // More environment variables ("NAME=value") after the standard ones; one of the same name replaces the standard one, or one given before it here.
   // (D-Bus's activation environment and starter variables for a service the bus starts.) At most kMaxEnvironment variables in all.
   ArrayView<const StringView> extra_environment;
+  // Wait for the programs this one started as well, where they go on after it has ended (a setup program or an uninstaller that hands its work to a copy of
+  // itself and ends at once): the run is over when the last of them is. Ctrl+C ends them too. Without this they go on by themselves - and must not, when the
+  // caller's `host` or `files` end with the call.
+  bool wait_for_descendants = false;
 };
 
 static constexpr uint64_t kMaxEnvironment = 512;

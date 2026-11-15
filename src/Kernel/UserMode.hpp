@@ -194,6 +194,11 @@ uint32_t module_snapshot(uint64_t pid, process::IProcessRuntime::ModuleEntry* ou
 // Ends the program as soon as it can: at its next system call or timer tick, whichever comes first (a blocked wait must be woken by the caller, for
 // instance by the host's interrupt()). The exit code is 130. Safe from any thread.
 void request_kill(Task& task, uint32_t exit_code = 130);
+// Programs that a program started and that went on after it ended use what it was given - its host, its file system - so whoever owns those must not let
+// them go while such a program runs. True while a program whose host is `host` (it, a child of it, a child of a child: all share the host) is still
+// running without its parent; the ones that have ended are freed on the way. terminate_descendants() ends them (as TerminateProcess would, with `exit_code`).
+bool descendants_running(const process::IProcessHost& host);
+void terminate_descendants(const process::IProcessHost& host, uint32_t exit_code);
 // Waits for the program to end (timeout_us 0 = forever); false on timeout. The exit code is the program's own, or 128 + the vector of the fault that
 // stopped it. Call once; afterwards the task may be destroyed.
 bool wait(Task& task, uint32_t* exit_code, uint64_t timeout_us = 0);

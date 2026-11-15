@@ -71,6 +71,8 @@ enum class Result : uint8_t {
   NoManifest,        // the package's version list or manifest could not be fetched, or is not what the index says it is
   NotSupported,      // the package is installed by a setup program, or there is none for this kind of computer
   BadChecksum,       // the download is not the file the manifest names (its SHA-256 differs)
+  SetupFailed,       // the package's setup program (or its uninstaller) could not be run, or ended with an error
+  NoUninstaller,     // the package's setup program left no uninstaller to remove it with
 };
 StringView result_name(Result result);
 
@@ -78,6 +80,7 @@ StringView result_name(Result result);
 struct Progress {
   uint64_t done = 0, total = 0;      // bytes (total 0: unknown)
   bool cancel = false;
+  bool running_setup = false;        // the download is done: the package's setup program is running
   // Called on the downloading thread as the bytes come (about every 256 KiB, and at the end).
   void (*changed)(void* context, const Progress& progress) = nullptr;
   void* context = nullptr;

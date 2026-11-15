@@ -71,9 +71,12 @@ package, so the next start does not unpack a database.
 2. **Fetch the manifest** of the latest version. It must have the SHA-256 the version list names. It is YAML
    (src/Desktop/AppMan/Yaml.hpp, the part of YAML that winget's files use) and says what to download for which CPU, the SHA-256 of that, and
    what kind of installer it is.
-3. **Choose the installer**: x64, else neutral, else x86, among the kinds that need no setup program to be run:
+3. **Choose the installer**: x64, else neutral (the Windows layer runs 64-bit programs only, so x86 installers are not taken). One of the kinds
+   the App Manager puts in place itself is taken first:
    - `portable`: one `.exe`;
    - `zip` with `NestedInstallerType: portable`: an archive of portable programs.
+
+   Otherwise a setup program, see below.
 4. **Download it** into the package's folder, through `download.part`, and check its SHA-256 against the manifest. Every byte that is installed
    is therefore the one the catalog names, from the index down.
 5. **Put it in place**, in `C:\Program Files\WinGet\Packages\<identifier>_Microsoft.Winget.Source_8wekyb3d8bbwe`, which is where winget puts
@@ -89,8 +92,37 @@ package, so the next start does not unpack a database.
 **Update** does nothing when the installed version is the catalog's (no network needed). Otherwise it repeats steps 1 to 5; the old files go
 only after the new download has been checked. **Remove** deletes the shortcuts the record names and the folder.
 
-Packages that come as a setup program (Inno Setup, NSIS, MSI, MSIX, Burn, plain `exe`) are refused, and the message names the kind. So are
-packages with no x64, x86 or neutral installer.
+### Packages that come as a setup program
+
+A package of the kind `inno` (Inno Setup), `nullsoft` (NSIS) or `exe` is installed by running its setup program in the Windows layer. The App
+Manager reaches that through `appman::ISetupHost` (src/Desktop/AppMan/SetupHost.hpp); the kernel's is `KernelSetupHost`, which runs the program
+with `run_program` and reads the registry's Uninstall keys (`list_uninstall_entries` in src/Process/WindowsRegistry.hpp).
+
+1. Steps 1 and 2 above, then the setup program is **downloaded** into `C:\Windows\Temp\WinGet\<identifier>.<version>` and its SHA-256 checked.
+   It must be a 64-bit Windows program.
+2. It is **run with the switches that make it ask nothing**: the manifest's `InstallerSwitches` (`Silent`, else `SilentWithProgress`), else the
+   usual ones of its kind (`/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` for Inno Setup, `/S` for NSIS), then the manifest's `Custom` switches.
+   The status line says "Running the setup program", and Cancel stops it.
+3. It **succeeded** if it ended with 0 or one of the manifest's `InstallerSuccessCodes`.
+4. The registry's **Uninstall entries** are read before and after. The entry the setup program added is the package's (with several, the one
+   with the manifest's `ProductCode`, else the one named like the package); for a program that was already installed, the entry the manifest
+   names.
+5. The **record** is `/AppStore/AppMan/Winget/<identifier>.txt`: identifier, name, version, kind, and the uninstall command of that entry (its
+   `QuietUninstallString` if it has one). It is a file of the App Manager's because this system's registry is kept in memory and does not
+   outlast a restart. The downloaded setup program is deleted.
+
+**Update** runs the new version's setup program, which replaces the old version itself. A package stays of the kind it was installed as.
+**Remove** runs the recorded uninstall command, with the quiet switches of its kind unless it is a quiet command already, and then forgets the
+package. If the uninstaller is no longer on the disk the package is just forgotten. If the setup program registered no uninstaller, Remove says so;
+choosing Remove a second time forgets the package.
+
+Refused, with the reason in the message:
+
+- `msi`, `wix`, `burn`, `msix`, `appx` and Store packages (there is no Windows Installer here);
+- a setup program that is a 32-bit program. Many are, even for 64-bit applications: of five popular ones looked at, 7-Zip's and Git's are 64-bit,
+  Firefox's, Visual Studio Code's and HandBrake's are 32-bit;
+- an `exe` installer whose manifest has no silent switch;
+- packages with no x64 or neutral installer.
 
 ## The network
 
@@ -119,6 +151,9 @@ Windows side:
     short at many lengths and with bits flipped;
   - the catalog: identifiers, search order, the kept list;
   - manifests, the choice of installer, archive member names, and a shortcut written and read back;
+  - setup programs, with a stand-in for the Windows layer: the switches of each kind and of the manifest, success codes, which registry entry
+    is the package's, the record, update, remove, and the refusals and failures (32-bit, MSI, no silent switch, a wrong checksum, an exit code,
+    a program that does not start, cancelling, a missing or failing uninstaller, no uninstaller, an edited record);
   - the installer on a RAM file system: a portable program, update (cancelled, done, up to date), an archive of two programs, an archive of
     one, an identifier that is escaped in the address, remove, and the refusals (a setup program, ARM only, a wrong checksum, an archive with
     `../`, a download that is not a program, a forged version list and manifest, a missing download, a cancelled install, a full disk). None of
@@ -129,6 +164,18 @@ Windows side:
   fetched and verified the manifests of `Mozilla.Firefox`, `Notepad++.Notepad++`, `7zip.7zip` and `Allen&Heath.SQMixPad`, and installed `jq`,
   Notepad++ and Sysinternals Autoruns into a RAM file system, where the Start menu found them. (Sysinternals Process Explorer was refused: the
   vendor's file no longer has the SHA-256 its manifest names.)
+
+- `tests/winget_qemu.sh [package]` checks the Windows side in the real kernel under QEMU, on the real network. It uses a build with
+  `TCOS_WINGET_SELFTEST=<package>` (its own folder, `build-winget-qemu`): once DHCP is done the kernel fetches and reads winget's index, installs
+  the package, reports what the Start menu lists, and removes it again. It passed with:
+  - `jqlang.jq` (a portable program): 16,396 packages in the index, 1 MB installed, "jq (Windows)" in the Start menu, removed;
+  - `7zip.7zip` (a 64-bit setup program): downloaded, run with `/S`, "7-Zip File Manager (Windows)" in the Start menu, then removed by its own
+    uninstaller.
+
+  The 7-Zip run found two faults that are fixed: this system's `msvcrt.dll` did not export the data `_fmode`, `_commode` and `_acmdln` that the
+  startup code of older programs imports (the setup program crashed at once), and a program that an ended program had started went on using what
+  its parent's run owned (an uninstaller hands its work to a copy of itself and ends; the kernel then stopped with a page fault). A setup run now
+  waits for every program it started (`ProgramRun::wait_for_descendants`).
 
 Linux side:
 
@@ -154,10 +201,14 @@ Linux side:
 
 Windows:
 
-- **No setup programs.** Most of winget's catalog (Firefox, 7-Zip, ...) is installed by a setup program, which would have to run in the Windows
-  layer and be uninstalled through the registry. Only portable programs and archives of them are installed.
-- **Not run in QEMU.** The Windows side has run on the host only (the tests above, and against the real network with the host's `curl`), not with
-  the kernel's HTTP client, and no installed program has been started from the Start menu there.
+- **Setup programs only where the Windows layer can run them.** No 32-bit setup programs, no MSI, MSIX or Burn (see above). What a setup
+  program wrote to the registry is gone after a restart (the registry is kept in memory), so a program that needs its registry settings may not
+  start then; the App Manager's own record, and with it Remove, is kept.
+- **A setup program's shortcuts and files are its own business.** The App Manager does not check what it installed, and a setup program that
+  shows a window although asked not to waits for the user.
+- **Two packages have been through QEMU** (see Tests): one portable program and one setup program. Inno Setup and NSIS setup programs have not
+  run there (the popular ones are 32-bit), the App Manager's window has not been clicked through there, and no installed program has been
+  started from the Start menu there.
 - **An archive member is unpacked in memory**, so one file of an archive can be at most 1 GiB and needs that much memory.
 - **No dependencies** (a package's `Dependencies`, such as the Visual C++ runtime, are not installed), no command aliases in a `Links` folder,
   no descriptions in the list (winget's index has none), and only the latest version of a package can be installed.

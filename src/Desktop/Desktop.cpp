@@ -429,7 +429,7 @@ void Desktop::set_file_system(filesystem::IFileSystem* fs) {
   });
   media_player_.set_file_system(fs);
   file_dialog_.set_file_system(fs);
-  app_manager_.set_services(fs, appman_network_);      // (the programs it installs go in /Linux of this file system)
+  app_manager_.set_services(fs, appman_network_, appman_setup_);      // (the programs it installs go in /Linux and /Windows of this file system)
   request_app_scan();   // the installed applications of this filesystem, for the Start menu
 }
 
@@ -952,7 +952,7 @@ void Desktop::on_app_manager(void* self, Control&) { static_cast<Desktop*>(self)
 
 void Desktop::set_appman_network(appman::INetwork* network) {
   appman_network_ = network;
-  app_manager_.set_services(fs_, network);
+  app_manager_.set_services(fs_, network, appman_setup_);
 }
 
 void Desktop::on_calendar(void* self, Control&) { static_cast<Desktop*>(self)->open_calendar(); }

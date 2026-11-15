@@ -47,7 +47,7 @@ Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
 // "\"name\" could not be installed because <why>." - one whole sentence per job, with what to try where that is known.
 const char* failure_pattern(bool install, bool update, appman::Result result) {
   const bool network = result == appman::Result::NoScript || result == appman::Result::NoDownload || result == appman::Result::DownloadFailed ||
-                       result == appman::Result::NoManifest;
+                       result == appman::Result::NoManifest;      // (what the network may be the reason of)
   if (install) return network ? "\"%1\" could not be installed because %2. Check the network connection and try again." : "\"%1\" could not be installed because %2.";
   if (update) return network ? "\"%1\" could not be updated because %2. Check the network connection and try again." : "\"%1\" could not be updated because %2.";
   return "\"%1\" could not be removed because %2.";
@@ -160,13 +160,13 @@ AppManager::~AppManager() {
   worker_.stop();
 }
 
-void AppManager::set_services(filesystem::IFileSystem* files, appman::INetwork* network) {
+void AppManager::set_services(filesystem::IFileSystem* files, appman::INetwork* network, appman::ISetupHost* setup) {
   {
     UiGuard lock(this);
     files_ = files;
     network_ = network;
     installer_ = files && network ? UniquePointer<appman::Installer>::make(allocator_, allocator_, *files, *network) : UniquePointer<appman::Installer>();
-    windows_installer_ = files && network ? UniquePointer<appman::WingetInstaller>::make(allocator_, allocator_, *files, *network) : UniquePointer<appman::WingetInstaller>();
+    windows_installer_ = files && network ? UniquePointer<appman::WingetInstaller>::make(allocator_, allocator_, *files, *network, setup) : UniquePointer<appman::WingetInstaller>();
   }
   reload_installed();
   if (!load_cached_catalog() && network) refresh_catalog();
@@ -458,6 +458,7 @@ bool AppManager::start(Job job, AppPlatform platform, StringView name) {
     job_name_.assign(name);
   }
   __atomic_store_n(&progress_state_.cancel, false, __ATOMIC_RELAXED);
+  __atomic_store_n(&progress_state_.running_setup, false, __ATOMIC_RELAXED);
   progress_state_.changed = &AppManager::on_progress;
   progress_state_.context = this;
   progress_.set_value(0);
@@ -524,6 +525,12 @@ void AppManager::on_progress(void* self, const appman::Progress& progress) {
   {
     kernel::ScopedMutex lock(m->state_mutex_);
     name.assign(m->job_name_.view());
+  }
+  if (__atomic_load_n(&progress.running_setup, __ATOMIC_RELAXED)) {      // (the download is done: how long the setup program takes is not known)
+    format_message(&text, "Running the setup program of \"%1\"...", name.view());
+    m->progress_.set_value(100);
+    m->say(text.view());
+    return;
   }
   String done_text(m->allocator_), total_text(m->allocator_);
   append_megabytes(&done_text, done);

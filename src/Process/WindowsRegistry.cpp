@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/WindowsRegistry.hpp"
+#include "Utility/Move.hpp"
 #include "Process/Objects.hpp"
 #include "Process/RegistryTree.hpp"
 #include "Process/WindowsFiles.hpp"
@@ -912,6 +913,62 @@ uint32_t nt_flush_key(Process& p, const SyscallRequest& r) {
     if (!t->save(id, &image)) return kNoMemory;
   }
   return write_file_at(p, file.view(), image.view());
+}
+
+namespace {
+// A string value (REG_SZ, REG_EXPAND_SZ: UTF-16 with its end) as UTF-8. "" if the key has no such value.
+bool string_value(const RegistryTree& t, uint32_t id, StringView name, String* out) {
+  out->clear();
+  const RegValue* value = t.find_value(id, name);
+  if (!value || (value->type != 1 && value->type != 2)) return true;
+  ConstByteView units = value->data.view();
+  units = units.first(units.size() & ~uint64_t{1});
+  for (uint64_t i = 0; i + 1 < units.size(); i += 2)
+    if (units[i] == 0 && units[i + 1] == 0) {
+      units = units.first(i);
+      break;
+    }
+  return util::append_utf8_from_utf16le(out, units);
+}
+
+// With the lock held: the subkeys of the Uninstall key at `path`.
+bool append_uninstall_keys(RegistryTree& t, StringView path, allocators::IAllocator& allocator, List<UniquePointer<RegistryUninstallEntry>>* out) {
+  uint32_t id = 0;
+  bool created = false;
+  if (t.resolve(RegistryTree::kRoot, path, false, 0, &id, &created) != kRegSuccess) return true;
+  const RegKey* key = t.key(id);
+  if (!key) return true;
+  for (const uint32_t child : key->subkeys.view()) {
+    if (!t.alive(child)) continue;
+    UniquePointer<RegistryUninstallEntry> entry = UniquePointer<RegistryUninstallEntry>::make(allocator, allocator);
+    if (!entry || !t.full_name(child, &entry->key) || !string_value(t, child, "DisplayName", &entry->display_name) || !string_value(t, child, "DisplayVersion", &entry->display_version) ||
+        !string_value(t, child, "UninstallString", &entry->uninstall) || !string_value(t, child, "QuietUninstallString", &entry->quiet_uninstall) || !out->push_back(util::move(entry)))
+      return false;
+  }
+  return true;
+}
+}  // namespace
+
+bool list_uninstall_entries(allocators::IAllocator& allocator, List<UniquePointer<RegistryUninstallEntry>>* out) {
+  Guard guard;
+  if (!g_tree) return true;
+  RegistryTree& t = *g_tree;
+  static constexpr StringView kUninstall = "\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+  String path(allocator);
+  static constexpr StringView kSoftware[] = {"\\REGISTRY\\MACHINE\\SOFTWARE", "\\REGISTRY\\MACHINE\\SOFTWARE\\WOW6432Node"};
+  for (const StringView software : kSoftware) {
+    if (!path.assign(software) || !path.append(kUninstall) || !append_uninstall_keys(t, path.view(), allocator, out)) return false;
+  }
+  // Each user's own.
+  uint32_t users = 0;
+  bool created = false;
+  if (t.resolve(RegistryTree::kRoot, "\\REGISTRY\\USER", false, 0, &users, &created) == kRegSuccess && t.key(users)) {
+    for (const uint32_t user : t.key(users)->subkeys.view()) {
+      if (!t.alive(user)) continue;
+      if (!t.full_name(user, &path) || !path.append("\\Software") || !path.append(kUninstall) || !append_uninstall_keys(t, path.view(), allocator, out)) return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace process::windowsabi

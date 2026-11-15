@@ -8969,12 +8969,12 @@ static void test_app_manager() {
       }
     }
     CHECK(m->refresh_catalog() && !m->busy());
-    CHECK(m->status().contains("3 applications for Linux and 409 for Windows"));
-    CHECK(m->linux_count() == 3 && m->windows_count() == 409 && m->catalog_count() == 412);
+    CHECK(m->status().contains("3 applications for Linux and 413 for Windows"));
+    CHECK(m->linux_count() == 3 && m->windows_count() == 413 && m->catalog_count() == 416);
     CHECK(fs.stat(filesystem::layout::kWingetCatalog, &e) == filesystem::Status::Ok && e.size > 0);
     CHECK(m->list().item_count() == desktop::AppManager::kMaxRows);
     m->set_query(" ");      // (the list again: the status line counts it)
-    CHECK(m->status().contains("412 of 412") && m->status().contains("the first 400 are shown"));
+    CHECK(m->status().contains("416 of 416") && m->status().contains("the first 400 are shown"));
     m->set_query("");
     desktop::AppPlatform platform = desktop::AppPlatform::Linux;
     // Both kinds in one list, the better matches first whichever kind they are.
@@ -8990,7 +8990,7 @@ static void test_app_manager() {
     m->set_filter(desktop::AppManager::kShowLinux);
     CHECK(m->list().item_count() == 3 && m->status().contains("3 of 3"));
     m->set_filter(desktop::AppManager::kShowWindows);
-    CHECK(m->list().item_count() == desktop::AppManager::kMaxRows && m->status().contains("409 of 409"));
+    CHECK(m->list().item_count() == desktop::AppManager::kMaxRows && m->status().contains("413 of 413"));
     m->set_filter(desktop::AppManager::kShowAll);
     // Install an application for Windows: the Start menu has it.
     m->set_query("single");
@@ -9036,7 +9036,7 @@ static void test_app_manager() {
     // Without a network nothing is offered.
     desktop::AppManager lone(a);
     lone.set_services(&fs, nullptr);
-    CHECK(lone.catalog_count() == 412 && lone.windows_count() == 409);      // (the kept copies)
+    CHECK(lone.catalog_count() == 416 && lone.windows_count() == 413);      // (the kept copies)
     lone.select_row(0);
     CHECK(!lone.install_button().enabled() && !lone.refresh_button().enabled() && !lone.install_selected());
   }

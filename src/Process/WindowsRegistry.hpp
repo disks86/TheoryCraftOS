@@ -17,6 +17,9 @@
  */
 #pragma once
 #include <stdint.h>
+#include "ObjectContainer/List.hpp"
+#include "Utility/String.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
@@ -57,5 +60,15 @@ void key_token_add(uint64_t token);
 void key_token_release(uint64_t token);
 // The full path of the key a key handle's token names (\Registry\Machine\...); false if there is none.
 bool key_full_name(Process& p, uint64_t token, String* out);
+
+// The programs that setup programs registered as installed: every subkey of the Uninstall keys (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, the same
+// under WOW6432Node, and each user's Software\...\Uninstall), with the values a package manager needs. For kernel code (the App Manager), not a system service.
+struct RegistryUninstallEntry {
+  explicit RegistryUninstallEntry(allocators::IAllocator& allocator) : key(allocator), display_name(allocator), display_version(allocator), uninstall(allocator), quiet_uninstall(allocator) {}
+  String key;                // the key's full name ("\REGISTRY\MACHINE\SOFTWARE\...\Uninstall\{product code}")
+  String display_name, display_version, uninstall, quiet_uninstall;      // DisplayName, DisplayVersion, UninstallString, QuietUninstallString ("" if absent)
+};
+// Appends them to `out`. False only if memory ran out. Before any Windows program has run there is no registry, and nothing is appended.
+[[nodiscard]] bool list_uninstall_entries(allocators::IAllocator& allocator, List<UniquePointer<RegistryUninstallEntry>>* out);
 
 }  // namespace process::windowsabi

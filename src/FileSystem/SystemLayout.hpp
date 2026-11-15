@@ -74,6 +74,10 @@ inline constexpr const char* kLinuxLocalBin = "/Linux/usr/local/bin";
 // portable packages installed for every user, C:\Program Files\WinGet\Packages\<PackageIdentifier>_<source>, with a shortcut in the Start menu.
 inline constexpr const char* kWingetCatalog = "/AppStore/AppMan/winget-packages";
 inline constexpr const char* kWindowsWingetPackages = "/Windows/Program Files/WinGet/Packages";
+// What it remembers of the packages a setup program installed (one file per package: what was installed and how it is uninstalled; the registry, where
+// Windows keeps that, does not outlast a restart here), and where it downloads a setup program to before running it (winget's %TEMP%\WinGet).
+inline constexpr const char* kWingetRecords = "/AppStore/AppMan/Winget";
+inline constexpr const char* kWindowsWingetTemp = "/Windows/Windows/Temp/WinGet";
 
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";

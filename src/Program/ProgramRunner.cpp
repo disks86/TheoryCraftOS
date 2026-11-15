@@ -345,6 +345,20 @@ RunResult run_loaded(const ProgramRun& run, uint32_t* exit_code, String* message
     fault_rip = task->fault_rip;
 #endif
   }
+#if defined(__x86_64__)
+  if (run.wait_for_descendants) {      // the programs it started that go on without it
+    bool stop_sent = false;
+    while (kernel::usermode::descendants_running(host)) {
+      pass_on_output(host, run, allocator);
+      if (host.interrupted() && !stop_sent) {
+        kernel::usermode::terminate_descendants(host, 130);
+        stop_sent = true;
+        killed = true;
+      }
+      kernel::sleep_ms(20);
+    }
+  }
+#endif
   pass_on_output(host, run, allocator);
   *exit_code = code;
 

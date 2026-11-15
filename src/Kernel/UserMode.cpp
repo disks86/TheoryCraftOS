@@ -1045,6 +1045,22 @@ static void reap_orphans() {
   }
 }
 
+static bool terminate_child(Task::Child* c, uint32_t code);
+
+bool descendants_running(const process::IProcessHost& host) {
+  reap_orphans();
+  ScopedMutex hold(g_orphans_mutex);
+  for (const Task::Child* o = g_orphans; o; o = o->next)
+    if (&o->program->host() == &host) return true;
+  return false;
+}
+
+void terminate_descendants(const process::IProcessHost& host, uint32_t exit_code) {
+  ScopedMutex hold(g_orphans_mutex);
+  for (Task::Child* o = g_orphans; o; o = o->next)
+    if (&o->program->host() == &host) (void)terminate_child(o, exit_code);
+}
+
 uint64_t Task::allocate_process_id() {
   static uint64_t next = 0x40000;
   static Mutex ids;

@@ -63,7 +63,8 @@ class AppManager : public gui::Frame {
 
   // Where programs are installed (the OS file system, which holds /Linux and /AppStore) and how the network is reached. Either may be null: nothing can be
   // installed then. Both must outlive the window. Loads the catalog kept from last time, or fetches it.
-  void set_services(filesystem::IFileSystem* files, appman::INetwork* network);
+  // `setup` runs the setup programs of Windows packages (nullptr: packages that come as one are refused); it must outlive the window too.
+  void set_services(filesystem::IFileSystem* files, appman::INetwork* network, appman::ISetupHost* setup = nullptr);
 
   // The commands behind the controls (the jobs run on the window's thread, or at once where there are no threads: the tests). False when it cannot be
   // done now (nothing chosen, already installed, a job running); status() says why.

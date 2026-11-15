@@ -78,6 +78,7 @@
 #include "Graphics/Logo/Logo.hpp"
 #include "Utility/AllocatedView.hpp"
 #include "Desktop/AppMan/HttpNetwork.hpp"
+#include "Desktop/AppMan/KernelSetupHost.hpp"
 #include "Desktop/Desktop.hpp"
 #include "Graphics/Graphics3D/WebGlAccelerator.hpp"
 #include "Graphics/GraphicsPool.hpp"
@@ -2346,6 +2347,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       Entry(Level::Warning, "D-Bus").text("the buses could not start (no machine id)");
     }
     desktop::appman::HttpNetwork appman_network(shared_allocator, &web_tls);      // the App Manager's downloads (AppImages from AppMan's catalog)
+    desktop::appman::KernelSetupHost appman_setup(shared_allocator, explorer_files.file_system());      // runs the setup programs of Windows packages
+    desktop.set_appman_setup_host(&appman_setup);
     desktop.set_appman_network(&appman_network);
     desktop.set_file_system(&explorer_files.file_system());
     desktop.set_program_launcher(&program_launcher);
@@ -2459,6 +2462,76 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     };
     static AppManSelfTest appman_selftest{&shared_allocator, &explorer_files.file_system(), &appman_network};
     kernel::detach(kernel::spawn(&AppManSelfTest::main, &appman_selftest, "appman-selftest"));
+#endif
+#ifdef TCOS_WINGET_SELFTEST
+    // The build asked for the App Manager's Windows side to be tried (tests/winget_qemu.sh): once the network is up, winget's index is fetched and read, the
+    // package is installed (a setup program is run in the Windows layer), what the Start menu then lists is said, and the package is removed again.
+    struct WingetSelfTest {
+      allocators::IAllocator* allocator;
+      filesystem::IFileSystem* files;
+      desktop::appman::HttpNetwork* network;
+      desktop::appman::ISetupHost* setup;
+      static void main(void* argument) {
+        WingetSelfTest& t = *static_cast<WingetSelfTest*>(argument);
+        desktop::appman::WingetCatalog catalog(*t.allocator);
+        bool fetched = false;
+        for (uint32_t attempt = 0; attempt < 30 && !fetched; ++attempt) {      // (DHCP may take a while)
+          kernel::sleep_ms(2000);
+          String index(*t.allocator);
+          fetched = t.network->fetch(desktop::appman::kWingetIndexUrl, desktop::appman::kMaxWingetIndexBytes, &index) && catalog.parse_index(index.view().bytes());
+        }
+        console::puts("winget-selftest: index ");
+        console::puts(fetched ? "ok, " : "FAILED, ");
+        console::put_dec(static_cast<int64_t>(catalog.count()));
+        console::puts(" packages (");
+        console::puts(t.network->last_error());
+        console::puts(")\n");
+        const desktop::appman::WingetPackage* package = catalog.find(TCOS_WINGET_SELFTEST);
+        desktop::appman::WingetInstaller installer(*t.allocator, *t.files, *t.network, t.setup);
+        desktop::appman::Progress progress;
+        progress.changed = [](void*, const desktop::appman::Progress& p) {
+          if (p.running_setup) console::puts("winget-selftest: running the setup program\n");
+        };
+        String detail(*t.allocator);
+        const desktop::appman::Result r = package ? installer.install(*package, &progress, &detail) : desktop::appman::Result::NoManifest;
+        console::puts("winget-selftest: install " TCOS_WINGET_SELFTEST ": ");
+        console::puts(desktop::appman::result_name(r));
+        console::puts(" (");
+        console::puts(detail.view());
+        console::puts("; ");
+        console::puts(t.network->last_error());
+        console::puts("), ");
+        console::put_dec(static_cast<int64_t>(progress.done));
+        console::puts(" bytes\n");
+        List<desktop::InstalledApp> apps(*t.allocator);
+        if (desktop::find_installed_apps(*t.files, *t.allocator, &apps))
+          for (const desktop::InstalledApp& app : apps.view()) {
+            console::puts("winget-selftest: start menu: ");
+            console::puts(app.label.view());
+            console::puts(" -> ");
+            console::puts(app.program.view());
+            console::puts("\n");
+          }
+        if (r == desktop::appman::Result::Ok) {
+          const desktop::appman::Result removed = installer.remove(package->id.view(), &detail);
+          console::puts("winget-selftest: remove: ");
+          console::puts(desktop::appman::result_name(removed));
+          console::puts(" (");
+          console::puts(detail.view());
+          console::puts(")\n");
+          apps.clear();
+          uint64_t left = 0;
+          if (desktop::find_installed_apps(*t.files, *t.allocator, &apps))
+            for (const desktop::InstalledApp& app : apps.view()) left += app.platform == desktop::AppPlatform::Windows;
+          console::puts("winget-selftest: Windows programs in the start menu after the removal: ");
+          console::put_dec(static_cast<int64_t>(left));
+          console::puts(installer.installed(package->id.view()) ? ", still on record\n" : ", no longer on record\n");
+        }
+        console::puts(r == desktop::appman::Result::Ok ? "winget-selftest: PASSED\n" : "winget-selftest: FAILED\n");
+      }
+    };
+    static WingetSelfTest winget_selftest{&shared_allocator, &explorer_files.file_system(), &appman_network, &appman_setup};
+    kernel::detach(kernel::spawn(&WingetSelfTest::main, &winget_selftest, "winget-selftest"));
 #endif
     explorer_files.set_notifier(on_storage_change, &desktop);
     EjectContext eject_context{&explorer_files, {}};

@@ -221,6 +221,8 @@ class Desktop {
   // How the App Manager reaches the network (main gives it the kernel's HTTP client, AppMan/HttpNetwork.hpp; nullptr: nothing can be installed). Must
   // outlive the desktop.
   void set_appman_network(appman::INetwork* network);
+  // How the App Manager runs the setup programs of Windows packages (nullptr: such packages are refused). Set it before the network and the file system.
+  void set_appman_setup_host(appman::ISetupHost* host) { appman_setup_ = host; }
   browser::IPageLoader* page_loader() const { return page_loader_; }
   // Opens a web browser window: the first one is web_browser() (when that is closed), further ones are made as needed and go away when closed.
   WebBrowser* open_web_browser(gui::TabFrame* into = nullptr);
@@ -521,6 +523,7 @@ class Desktop {
   UniquePointer<TodoStore> todo_store_;   // (before the to-do windows, which show it)
   Todo todo_;
   appman::INetwork* appman_network_ = nullptr;
+  appman::ISetupHost* appman_setup_ = nullptr;
   AppManager app_manager_;
   MediaPlayer media_player_;
   Graphics3DTest graphics_test_;

@@ -161,21 +161,55 @@ StringView kind_name(StringView type) {
   return "a setup program";
 }
 
-bool can_install(const WingetInstallerEntry& entry) {
+// Put in place by this package manager itself: one program, or an archive of programs.
+bool is_native(const WingetInstallerEntry& entry) {
   if (!web_address(entry.url.view()) || entry.sha256.size() != 64) return false;
   if (equals_folded(entry.type.view(), "portable")) return true;
   return equals_folded(entry.type.view(), "zip") && equals_folded(entry.nested_type.view(), "portable") && entry.nested.count() > 0;
 }
 
-// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run.
+// The switches that make a setup program of this kind ask nothing ("" if the kind has none of its own), and its uninstaller.
+StringView silent_switches(StringView type) {
+  if (equals_folded(type, "inno")) return "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
+  if (equals_folded(type, "nullsoft")) return "/S";
+  return "";
+}
+StringView silent_uninstall_switches(StringView type) {
+  if (equals_folded(type, "inno")) return "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART";
+  if (equals_folded(type, "nullsoft")) return "/S";
+  return "";
+}
+
+// A setup program this package manager can run without a person: Inno Setup, NSIS, or any other that the manifest has a silent switch for.
+bool is_setup(const WingetInstallerEntry& entry) {
+  if (!web_address(entry.url.view()) || entry.sha256.size() != 64) return false;
+  if (equals_folded(entry.type.view(), "inno") || equals_folded(entry.type.view(), "nullsoft")) return true;
+  return equals_folded(entry.type.view(), "exe") && !entry.silent.empty();
+}
+
+// The last part of a registry key's name.
+StringView key_leaf(StringView key) {
+  const uint64_t slash = key.rfind('\\');
+  return slash == StringView::npos ? key : key.substr(slash + 1);
+}
+
+// 0 for the architecture this computer runs best, higher for worse, -1 for one it cannot run (32-bit x86 programs among them: the Windows layer runs
+// 64-bit programs only so far).
 int architecture_rank(StringView architecture) {
   if (equals_folded(architecture, "x64")) return 0;
   if (equals_folded(architecture, "neutral")) return 1;
-  if (equals_folded(architecture, "x86")) return 2;
   return -1;
 }
 
 }  // namespace
+
+// What is remembered of a package a setup program installed.
+struct WingetInstaller::SetupRecord {
+  explicit SetupRecord(allocators::IAllocator& allocator) : type(allocator), uninstall(allocator) {}
+  String type;            // InstallerType
+  String uninstall;       // the uninstall command line ("" if the setup program registered none)
+  bool quiet = false;     // it is the registry's QuietUninstallString: no switches are added
+};
 
 struct WingetInstaller::Program {
   explicit Program(allocators::IAllocator& allocator) : path(allocator), label(allocator) {}
@@ -269,6 +303,27 @@ bool WingetInstaller::parse_manifest(allocators::IAllocator& allocator, StringVi
         !entry->nested_type.assign(own_or_shared("NestedInstallerType")) || !entry->url.assign(item->text("InstallerUrl")) ||
         !entry->sha256.assign(item->text("InstallerSha256")))
       return false;
+    const YamlNode* switches = item->find("InstallerSwitches");
+    if (!switches) switches = root.find("InstallerSwitches");
+    if (switches && switches->kind == YamlNode::Kind::Map) {
+      const StringView silent = !switches->text("Silent").empty() ? switches->text("Silent") : switches->text("SilentWithProgress");
+      if (!entry->silent.assign(silent) || !entry->custom.assign(switches->text("Custom"))) return false;
+    }
+    const YamlNode* apps = item->find("AppsAndFeaturesEntries");
+    if (!apps) apps = root.find("AppsAndFeaturesEntries");
+    const YamlNode* app = apps && apps->kind == YamlNode::Kind::Sequence && apps->children.count() > 0 ? apps->children.view()[0].get() : nullptr;
+    const StringView product_code = !own_or_shared("ProductCode").empty() ? own_or_shared("ProductCode") : app ? app->text("ProductCode") : StringView();
+    if (!entry->product_code.assign(product_code) || (app && !entry->display_name.assign(app->text("DisplayName")))) return false;
+    const YamlNode* codes = item->find("InstallerSuccessCodes");
+    if (!codes) codes = root.find("InstallerSuccessCodes");
+    if (codes && codes->kind == YamlNode::Kind::Sequence) {
+      for (const UniquePointer<YamlNode>& code : codes->children.view()) {
+        uint64_t value = 0;
+        bool number = code->kind == YamlNode::Kind::Scalar && !code->value.empty() && code->value.size() <= 10;
+        for (const char c : code->value.view()) number = number && c >= '0' && c <= '9', value = value * 10 + static_cast<uint64_t>(c - '0');
+        if (number && value <= 0xFFFFFFFFull && entry->success_codes.count() < 64 && !entry->success_codes.push_back(static_cast<uint32_t>(value))) return false;
+      }
+    }
     const YamlNode* nested = item->find("NestedInstallerFiles");
     if (!nested) nested = root.find("NestedInstallerFiles");
     if (nested && nested->kind == YamlNode::Kind::Sequence) {
@@ -284,30 +339,84 @@ bool WingetInstaller::parse_manifest(allocators::IAllocator& allocator, StringVi
   return true;
 }
 
-const WingetInstallerEntry* WingetInstaller::choose_installer(const WingetManifest& manifest, String* why) {
+const WingetInstallerEntry* WingetInstaller::choose_installer(const WingetManifest& manifest, uint32_t kinds, String* why) {
   why->clear();
   const WingetInstallerEntry* best = nullptr;
-  const WingetInstallerEntry* other = nullptr;      // one for this computer that is a setup program
+  const WingetInstallerEntry* other = nullptr;      // one for this computer that cannot be installed
   int best_rank = 0;
   for (const UniquePointer<WingetInstallerEntry>& entry : manifest.installers.view()) {
-    const int rank = architecture_rank(entry->architecture.view());
-    if (rank < 0) continue;
-    if (!can_install(*entry)) {
+    const int architecture = architecture_rank(entry->architecture.view());
+    if (architecture < 0) continue;
+    const bool native = (kinds & kNative) && is_native(*entry), setup = (kinds & kSetup) && is_setup(*entry);
+    if (!native && !setup) {
       if (!other) other = entry.get();
       continue;
     }
+    const int rank = (native ? 0 : 10) + architecture;
     if (!best || rank < best_rank) best = entry.get(), best_rank = rank;
   }
   if (best) return best;
-  if (other) {
-    (void)(why->assign("it is installed by ") && why->append(kind_name(equals_folded(other->type.view(), "zip") && !other->nested_type.empty() && !equals_folded(other->nested_type.view(), "portable")
-                                                                             ? other->nested_type.view()
-                                                                             : other->type.view())) &&
-           why->append(", which cannot be run here yet"));
+  if (!other) {
+    (void)why->assign("there is no version of it for this kind of computer (64-bit x64)");
+  } else if (is_native(*other)) {      // (asked for a setup program only: an update of a package that was installed by one)
+    (void)why->assign("this version does not come as a setup program, as the installed one did; remove it and install it again");
+  } else if ((kinds & kSetup) && equals_folded(other->type.view(), "exe")) {
+    (void)why->assign("its setup program has no way to run without asking questions");
+  } else if (is_setup(*other)) {
+    (void)(why->assign("it is installed by ") && why->append(kind_name(other->type.view())) && why->append(kinds & kNative ? ", which cannot be run here yet" : ", not put in place as the installed version was; remove it and install it again"));
   } else {
-    (void)why->assign("there is no version of it for this kind of computer (x64)");
+    const StringView type = equals_folded(other->type.view(), "zip") && !other->nested_type.empty() && !equals_folded(other->nested_type.view(), "portable") ? other->nested_type.view() : other->type.view();
+    (void)(why->assign("it is installed by ") && why->append(kind_name(type)) && why->append(", which cannot be run here yet"));
   }
   return nullptr;
+}
+
+bool WingetInstaller::split_command_line(allocators::IAllocator& allocator, StringView text, String* program, List<String>* arguments) {
+  arguments->clear();
+  text = text.trimmed();
+  if (program) {
+    program->clear();
+    if (text.starts_with('"')) {
+      const uint64_t close = text.find('"', 1);
+      if (close == StringView::npos) return false;
+      if (!program->assign(text.substr(1, close - 1))) return false;
+      text = text.substr(close + 1);
+    } else {
+      // Up to the first ".exe" that ends a word, else the first word.
+      uint64_t end = StringView::npos;
+      for (uint64_t i = 0; i + 4 <= text.size() && end == StringView::npos; ++i)
+        if (equals_folded(text.substr(i, 4), ".exe") && (i + 4 == text.size() || text[i + 4] == ' ' || text[i + 4] == '\t')) end = i + 4;
+      if (end == StringView::npos) end = text.find(' ') == StringView::npos ? text.size() : text.find(' ');
+      if (!program->assign(text.first(end))) return false;
+      text = text.substr(end);
+    }
+    if (program->empty()) return false;
+  }
+  // The arguments: words, with "..." keeping spaces together and \" a quote.
+  String word(allocator);
+  bool in_word = false, quoted = false;
+  for (uint64_t i = 0; i <= text.size(); ++i) {
+    const char c = i < text.size() ? text[i] : ' ';
+    if (i < text.size() && c == '\\' && i + 1 < text.size() && text[i + 1] == '"') {
+      if (!word.push_back('"')) return false;
+      in_word = true;
+      ++i;
+    } else if (i < text.size() && c == '"') {
+      quoted = !quoted;
+      in_word = true;
+    } else if ((c == ' ' || c == '\t') && (!quoted || i == text.size())) {
+      if (in_word) {
+        String done(allocator);
+        if (arguments->count() >= 256 || !done.assign(word.view()) || !arguments->push_back(util::move(done))) return false;
+      }
+      word.clear();
+      in_word = false;
+    } else {
+      if (!word.push_back(c)) return false;
+      in_word = true;
+    }
+  }
+  return true;
 }
 
 bool WingetInstaller::folder_of(StringView id, String* out) const {
@@ -335,17 +444,53 @@ bool WingetInstaller::read_record(StringView id, WingetInstalled* app, List<Stri
   return ok && named;
 }
 
+bool WingetInstaller::setup_record_path(StringView id, String* out) const {
+  return valid_package_id(id) && join(out, filesystem::layout::kWingetRecords, "/", id, ".txt");
+}
+
+bool WingetInstaller::read_setup_record(StringView id, WingetInstalled* app, SetupRecord* record) const {
+  String path(allocator_), text(allocator_);
+  if (!setup_record_path(id, &path) || !read_text_file(files_, allocator_, path.view(), kMaxRecordBytes, &text)) return false;
+  bool ok = true, named = false;
+  StringView rest = text.view(), line;
+  while (ok && rest.next_token('\n', &line)) {
+    StringView key, value;
+    if (!line.split_once(':', &key, &value)) continue;
+    value = value.trimmed();
+    if (key.equals("PackageIdentifier")) ok = app->id.assign(value), named = !value.empty();
+    else if (key.equals("PackageName")) ok = app->name.assign(value);
+    else if (key.equals("PackageVersion")) ok = app->version.assign(value);
+    else if (key.equals("InstallerType")) ok = record->type.assign(value);
+    else if (key.equals("Uninstall")) ok = record->uninstall.assign(value);
+    else if (key.equals("QuietUninstall")) record->quiet = value.equals("yes");
+  }
+  return ok && named;
+}
+
 bool WingetInstaller::installed(StringView id) const {
   WingetInstalled app(allocator_);
-  return read_record(id, &app, nullptr);
+  SetupRecord record(allocator_);
+  return read_record(id, &app, nullptr) || read_setup_record(id, &app, &record);
+}
+
+// Is the file at `path` a Windows program for the processor this system runs programs on (x86-64)?
+bool WingetInstaller::is_for_this_processor(StringView path) const {
+  UniquePointer<filesystem::IFile> file;
+  if (files_.open_file(path, filesystem::OpenMode::Read, &file) != Status::Ok) return false;
+  ByteBuffer head(allocator_);
+  const uint64_t size = file->size() < exe::kIdentifyBytes ? file->size() : exe::kIdentifyBytes;
+  uint64_t got = 0;
+  if (!head.put_zeros(size) || file->read(0, head.writable_view(), &got) != Status::Ok || got > size) return false;
+  const ConstByteView bytes = head.view().first(got);
+  return exe::identify_executable(bytes) == exe::ExecutableKind::Pe && exe::identify_architecture(bytes) == exe::Architecture::X86_64;
 }
 
 bool WingetInstaller::list_installed(List<WingetInstalled>* apps) const {
   apps->clear();
   UniquePointer<filesystem::IDirectory> listing;
-  if (files_.open_directory(filesystem::layout::kWindowsWingetPackages, &listing) != Status::Ok) return true;      // (nothing installed yet)
   filesystem::DirectoryEntry entry;
-  for (uint32_t guard = 0; guard < 100000 && listing->next(&entry) == Status::Ok; ++guard) {
+  const bool have_folder = files_.open_directory(filesystem::layout::kWindowsWingetPackages, &listing) == Status::Ok;      // (not there: nothing put in place yet)
+  for (uint32_t guard = 0; have_folder && guard < 100000 && listing->next(&entry) == Status::Ok; ++guard) {
     const StringView folder = entry.name.view();
     if (entry.type != filesystem::NodeType::Directory || !folder.ends_with(kFolderSuffix)) continue;
     const StringView id = folder.first(folder.size() - kFolderSuffix.size());
@@ -354,6 +499,24 @@ bool WingetInstaller::list_installed(List<WingetInstalled>* apps) const {
     if (!app.id.assign(id)) return false;      // (the folder is the identifier, whatever the record says)
     if (app.name.empty() && !app.name.assign(id)) return false;
     if (!apps->push_back(util::move(app))) return false;
+  }
+  // The ones a setup program installed.
+  UniquePointer<filesystem::IDirectory> records;
+  if (files_.open_directory(filesystem::layout::kWingetRecords, &records) == Status::Ok) {
+    for (uint32_t guard = 0; guard < 100000 && records->next(&entry) == Status::Ok; ++guard) {
+      const StringView file = entry.name.view();
+      if (entry.type != filesystem::NodeType::File || !file.ends_with(".txt")) continue;
+      const StringView id = file.first(file.size() - 4);
+      WingetInstalled app(allocator_);
+      SetupRecord record(allocator_);
+      if (!read_setup_record(id, &app, &record)) continue;
+      bool listed = false;
+      for (const WingetInstalled& other : static_cast<const List<WingetInstalled>*>(apps)->view()) listed |= equals_folded(other.id.view(), id);
+      if (listed) continue;
+      if (!app.id.assign(id)) return false;
+      if (app.name.empty() && !app.name.assign(id)) return false;
+      if (!apps->push_back(util::move(app))) return false;
+    }
   }
   ArrayView<WingetInstalled> list = apps->view();
   for (uint64_t i = 1; i < list.size(); ++i)
@@ -412,23 +575,25 @@ Result WingetInstaller::install(const WingetPackage& package, Progress* progress
   WingetManifest manifest(allocator_);
   const Result r = resolve(package, &manifest, detail);
   if (r != Result::Ok) return r;
-  const WingetInstallerEntry* entry = choose_installer(manifest, detail);
+  // A package that is installed stays of the kind it was installed as.
+  WingetInstalled current(allocator_);
+  SetupRecord record(allocator_);
+  const bool was_native = read_record(package.id.view(), &current, nullptr);
+  const bool was_setup = !was_native && read_setup_record(package.id.view(), &current, &record);
+  const uint32_t can_run = setup_ ? uint32_t{kSetup} : 0u;
+  const uint32_t kinds = was_native ? uint32_t{kNative} : was_setup ? can_run : kNative | can_run;
+  const WingetInstallerEntry* entry = choose_installer(manifest, kinds, detail);
   if (!entry) return Result::NotSupported;
-  return place(manifest, *entry, installed(package.id.view()), progress, detail);
+  return is_native(*entry) ? place(manifest, *entry, was_native, progress, detail) : place_setup(manifest, *entry, progress, detail);
 }
 
 Result WingetInstaller::update(const WingetPackage& package, Progress* progress, String* detail) {
   detail->clear();
   WingetInstalled current(allocator_);
-  if (!read_record(package.id.view(), &current, nullptr)) return Result::NotInstalled;
+  SetupRecord record(allocator_);
+  if (!read_record(package.id.view(), &current, nullptr) && !read_setup_record(package.id.view(), &current, &record)) return Result::NotInstalled;
   if (current.version.view().equals(package.version.view())) return Result::UpToDate;
-  WingetManifest manifest(allocator_);
-  const Result r = resolve(package, &manifest, detail);
-  if (r != Result::Ok) return r;
-  if (current.version.view().equals(manifest.version.view())) return Result::UpToDate;
-  const WingetInstallerEntry* entry = choose_installer(manifest, detail);
-  if (!entry) return Result::NotSupported;
-  return place(manifest, *entry, true, progress, detail);
+  return install(package, progress, detail);
 }
 
 void WingetInstaller::remove_shortcuts(const List<String>& shortcuts) {
@@ -486,9 +651,10 @@ Result WingetInstaller::place(const WingetManifest& manifest, const WingetInstal
     detail->assign(entry.url.view());
     return give_up(Result::BadChecksum);
   }
-  if (!archive && exe::identify_executable_file(files_, part.view()) != exe::ExecutableKind::Pe) {
-    detail->assign("it is not a Windows program");
-    return give_up(Result::NotAnAppImage);
+  if (!archive && !is_for_this_processor(part.view())) {
+    const bool windows_program = exe::identify_executable_file(files_, part.view()) == exe::ExecutableKind::Pe;
+    detail->assign(windows_program ? "it is a 32-bit program (or one for another processor), which cannot be run here yet" : "it is not a Windows program");
+    return give_up(windows_program ? Result::NotSupported : Result::NotAnAppImage);
   }
 
   // The programs the package has, and what their shortcuts are called.
@@ -562,9 +728,9 @@ Result WingetInstaller::place(const WingetManifest& manifest, const WingetInstal
   for (const UniquePointer<Program>& program : programs.view()) {
     String path(allocator_), target(allocator_), directory(allocator_), link(allocator_), name(allocator_);
     if (!join(&path, folder.view(), "/", program->path.view())) return fail(Result::OutOfMemory);
-    if (exe::identify_executable_file(files_, path.view()) != exe::ExecutableKind::Pe) {
+    if (!is_for_this_processor(path.view())) {
       if (programs.count() == 1) {
-        detail->assign("the program its manifest names is not in the archive, or is not a Windows program");
+        detail->assign("the program its manifest names is not in the archive, or is not a Windows program for this computer's processor");
         return fail(Result::NotAnAppImage);
       }
       continue;
@@ -648,11 +814,184 @@ Result WingetInstaller::remove(StringView id, String* detail) {
   WingetInstalled app(allocator_);
   List<String> shortcuts(allocator_);
   String folder(allocator_);
-  if (!read_record(id, &app, &shortcuts)) return Result::NotInstalled;
+  if (!read_record(id, &app, &shortcuts)) {
+    SetupRecord record(allocator_);
+    return read_setup_record(id, &app, &record) ? remove_setup(id, record, detail) : Result::NotInstalled;
+  }
   if (!folder_of(id, &folder)) return Result::OutOfMemory;
   remove_shortcuts(shortcuts);
   if (!remove_tree(files_, allocator_, folder.view())) {
     detail->assign(folder.view());
+    return Result::FileError;
+  }
+  return Result::Ok;
+}
+
+// A package that comes as a setup program: downloaded, checked, run, and what it registered remembered.
+Result WingetInstaller::place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail) {
+  if (!setup_) return Result::NotSupported;
+  const StringView id = manifest.id.view();
+  String folder(allocator_), version(allocator_), name(allocator_), program(allocator_), record_path(allocator_);
+  if (!setup_record_path(id, &record_path)) return Result::InvalidName;
+  if (!safe_name(manifest.version.view(), &version)) return Result::OutOfMemory;
+  StringView leaf = entry.url.view();
+  const uint64_t query = leaf.find('?');
+  if (query != StringView::npos) leaf = leaf.first(query);
+  if (!safe_name(leaf_of(leaf), &name) || (name.empty() && !name.assign("setup"))) return Result::OutOfMemory;
+  if ((name.size() < 4 || !equals_folded(name.view().substr(name.size() - 4), ".exe")) && !name.append(".exe")) return Result::OutOfMemory;
+  if (!join(&folder, filesystem::layout::kWindowsWingetTemp, "/", id, ".") || !folder.append(version.view()) || !join(&program, folder.view(), "/", name.view())) return Result::OutOfMemory;
+  if (!make_folders(files_, folder.view())) {
+    detail->assign(folder.view());
+    return Result::FileError;
+  }
+  auto finish = [&](Result result) {      // (the setup program is not kept, whatever came of it)
+    if (progress) __atomic_store_n(&progress->running_setup, false, __ATOMIC_RELAXED);
+    (void)remove_tree(files_, allocator_, folder.view());
+    return result;
+  };
+
+  // The download, and that it is what the manifest names and something this system can run.
+  crypto::Hasher hasher(crypto::HashKind::Sha256);
+  const Result fetched = download_to_file(files_, network_, entry.url.view(), program.view(), progress, &hasher, detail);
+  if (fetched != Result::Ok) return finish(fetched);
+  uint8_t hash[32];
+  hasher.finish(hash);
+  String hex(allocator_);
+  if (!append_hex(&hex, ConstByteView(hash))) return finish(Result::OutOfMemory);
+  if (!equals_folded(hex.view(), entry.sha256.view())) {
+    detail->assign(entry.url.view());
+    return finish(Result::BadChecksum);
+  }
+  if (!is_for_this_processor(program.view())) {
+    const bool windows_program = exe::identify_executable_file(files_, program.view()) == exe::ExecutableKind::Pe;
+    detail->assign(windows_program ? "its setup program is a 32-bit program (or one for another processor), which cannot be run here yet" : "its setup program is not a Windows program");
+    return finish(windows_program ? Result::NotSupported : Result::NotAnAppImage);
+  }
+
+  // The switches: the manifest's own for a run that asks nothing, else the usual ones of the kind; then the ones the manifest always wants.
+  List<String> switches(allocator_), custom(allocator_);
+  if (!split_command_line(allocator_, !entry.silent.empty() ? entry.silent.view() : silent_switches(entry.type.view()), nullptr, &switches) ||
+      !split_command_line(allocator_, entry.custom.view(), nullptr, &custom))
+    return finish(Result::OutOfMemory);
+  List<StringView> arguments(allocator_);
+  for (const String& word : static_cast<const List<String>&>(switches).view())
+    if (!arguments.push_back(word.view())) return finish(Result::OutOfMemory);
+  for (const String& word : static_cast<const List<String>&>(custom).view())
+    if (!arguments.push_back(word.view())) return finish(Result::OutOfMemory);
+
+  // Run it, with the registry's list of installed programs taken before and after.
+  List<UniquePointer<UninstallEntry>> before(allocator_), after(allocator_);
+  if (!setup_->uninstall_entries(&before)) return finish(Result::OutOfMemory);
+  if (progress) {
+    __atomic_store_n(&progress->running_setup, true, __ATOMIC_RELAXED);
+    if (progress->changed) progress->changed(progress->context, *progress);
+  }
+  uint32_t code = 0;
+  String message(allocator_);
+  const bool ran = setup_->run(program.view(), static_cast<const List<StringView>&>(arguments).view(), progress ? &progress->cancel : nullptr, &code, &message);
+  if (!ran) {
+    if (progress && __atomic_load_n(&progress->cancel, __ATOMIC_RELAXED)) return finish(Result::Cancelled);
+    (void)(detail->assign("the setup program: ") && detail->append(message.view()));
+    return finish(Result::SetupFailed);
+  }
+  bool success = code == 0;
+  for (const uint32_t good : entry.success_codes.view()) success |= code == good;
+  if (!success) {
+    (void)(detail->assign("the setup program ended with code ") && detail->append_uint(code));
+    return finish(Result::SetupFailed);
+  }
+  if (!setup_->uninstall_entries(&after)) return finish(Result::OutOfMemory);
+
+  // What it registered: an entry that was not there before (the one the manifest names, if there are several); else, for a program that was
+  // installed already, the one the manifest names.
+  const StringView wanted_name = !entry.display_name.empty() ? entry.display_name.view() : manifest.name.view();
+  const UninstallEntry* found = nullptr;
+  int found_score = -1;
+  for (const UniquePointer<UninstallEntry>& candidate : after.view()) {
+    bool is_new = true;
+    for (const UniquePointer<UninstallEntry>& old : before.view()) is_new &= !equals_folded(old->key.view(), candidate->key.view());
+    const bool by_code = !entry.product_code.empty() && equals_folded(key_leaf(candidate->key.view()), entry.product_code.view());
+    const bool by_name = !wanted_name.empty() && contains_folded(candidate->name.view(), wanted_name);
+    if (!is_new && !by_code && !by_name) continue;
+    const int score = (by_code ? 4 : 0) + (by_name ? 2 : 0) + (is_new ? 1 : 0);
+    if (score > found_score) found = candidate.get(), found_score = score;
+  }
+
+  String record(allocator_);
+  if (!join(&record, "PackageIdentifier: ", id, "\nPackageName: ", manifest.name.view()) || !record.append("\nPackageVersion: ") || !record.append(manifest.version.view()) ||
+      !record.append("\nInstallerType: ") || !record.append(entry.type.view()) || !record.append("\nInstallerUrl: ") || !record.append(entry.url.view()) || !record.push_back('\n'))
+    return finish(Result::OutOfMemory);
+  if (found) {
+    const bool quiet = !found->quiet_command.empty();
+    const StringView command = quiet ? found->quiet_command.view() : found->command.view();
+    bool one_line = !command.empty();
+    for (const char c : command) one_line &= static_cast<uint8_t>(c) >= 0x20;
+    if (one_line && (!record.append("UninstallKey: ") || !record.append(found->key.view()) || !record.append("\nUninstall: ") || !record.append(command) ||
+                     !record.append(quiet ? "\nQuietUninstall: yes\n" : "\n")))
+      return finish(Result::OutOfMemory);
+  }
+  String asked(allocator_);
+  if (join(&asked, record_path.view(), ".asked")) (void)files_.remove(asked.view());      // (of an earlier Remove that found no uninstaller)
+  if (!make_folders(files_, filesystem::layout::kWingetRecords) || !write_text_file(files_, record_path.view(), record.view())) {
+    detail->assign(record_path.view());
+    return finish(Result::FileError);
+  }
+  return finish(Result::Ok);
+}
+
+// Runs the uninstaller the setup program registered, then forgets the package.
+Result WingetInstaller::remove_setup(StringView id, const SetupRecord& record, String* detail) {
+  String record_path(allocator_), windows_program(allocator_), program(allocator_);
+  if (!setup_record_path(id, &record_path)) return Result::InvalidName;
+  if (record.uninstall.empty()) {
+    detail->assign("remove it with its own means, then choose Remove again");
+    // (asked a second time, the package is forgotten: there is nothing else this program can do)
+    String marker(allocator_);
+    if (!join(&marker, record_path.view(), ".asked")) return Result::OutOfMemory;
+    if (exists(files_, marker.view())) {
+      detail->clear();
+      (void)files_.remove(marker.view());
+      return files_.remove(record_path.view()) == Status::Ok ? Result::Ok : Result::FileError;
+    }
+    (void)write_text_file(files_, marker.view(), "asked\n");
+    return Result::NoUninstaller;
+  }
+  if (!setup_) {
+    detail->assign("its uninstaller cannot be run here");
+    return Result::NotSupported;
+  }
+  List<String> words(allocator_), more(allocator_);
+  if (!split_command_line(allocator_, record.uninstall.view(), &windows_program, &words) ||
+      !split_command_line(allocator_, record.quiet ? StringView() : silent_uninstall_switches(record.type.view()), nullptr, &more))
+    return Result::OutOfMemory;
+  if (!windows_path_to_system(windows_program.view(), &program)) {
+    (void)(detail->assign("its uninstaller is not a program on this computer's disk: ") && detail->append(windows_program.view()));
+    return Result::SetupFailed;
+  }
+  if (!exists(files_, program.view())) {      // (it was uninstalled some other way: nothing is left to do but forget it)
+    return files_.remove(record_path.view()) == Status::Ok ? Result::Ok : Result::FileError;
+  }
+  if (!is_for_this_processor(program.view())) {
+    detail->assign("its uninstaller is a 32-bit program (or one for another processor), which cannot be run here yet");
+    return Result::NotSupported;
+  }
+  List<StringView> arguments(allocator_);
+  for (const String& word : static_cast<const List<String>&>(words).view())
+    if (!arguments.push_back(word.view())) return Result::OutOfMemory;
+  for (const String& word : static_cast<const List<String>&>(more).view())
+    if (!arguments.push_back(word.view())) return Result::OutOfMemory;
+  uint32_t code = 0;
+  String message(allocator_);
+  if (!setup_->run(program.view(), static_cast<const List<StringView>&>(arguments).view(), nullptr, &code, &message)) {
+    (void)(detail->assign("the uninstaller: ") && detail->append(message.view()));
+    return Result::SetupFailed;
+  }
+  if (code != 0) {
+    (void)(detail->assign("the uninstaller ended with code ") && detail->append_uint(code));
+    return Result::SetupFailed;
+  }
+  if (files_.remove(record_path.view()) != Status::Ok) {
+    detail->assign(record_path.view());
     return Result::FileError;
   }
   return Result::Ok;

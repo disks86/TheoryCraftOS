@@ -647,6 +647,7 @@ add_executable(BOOTX64
   src/Desktop/AppMan/WingetInstaller.cpp
   src/Desktop/AppMan/Yaml.cpp
   src/Desktop/AppMan/HttpNetwork.cpp
+  src/Desktop/AppMan/KernelSetupHost.cpp
   src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
   src/Desktop/CopyProgressDialog.cpp
@@ -1493,6 +1494,10 @@ endif()
 set(TCOS_APPMAN_SELFTEST "" CACHE STRING "An AppImage of AppMan's catalog for the kernel to install when it is up (tests/appman_qemu.sh)")
 if(TCOS_APPMAN_SELFTEST)
   target_compile_definitions(BOOTX64 PRIVATE "TCOS_APPMAN_SELFTEST=\"${TCOS_APPMAN_SELFTEST}\"")
+endif()
+set(TCOS_WINGET_SELFTEST "" CACHE STRING "A package of winget's catalog for the kernel to install and remove when it is up (tests/winget_qemu.sh)")
+if(TCOS_WINGET_SELFTEST)
+  target_compile_definitions(BOOTX64 PRIVATE "TCOS_WINGET_SELFTEST=\"${TCOS_WINGET_SELFTEST}\"")
 endif()
 set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
 set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")

@@ -73,6 +73,8 @@ StringView result_name(Result result) {
     case Result::NoManifest: return "its description in the package list could not be fetched";
     case Result::NotSupported: return "it is not a kind of package the App Manager can install yet";
     case Result::BadChecksum: return "what was downloaded is not the file the package list describes";
+    case Result::SetupFailed: return "its setup program did not finish its work";
+    case Result::NoUninstaller: return "its setup program left no uninstaller";
   }
   return "";
 }
