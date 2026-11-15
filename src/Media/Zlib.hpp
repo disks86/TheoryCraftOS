@@ -33,6 +33,10 @@ uint32_t adler32(ConstByteView data, uint32_t adler = 1);
 // decompression bombs). `consumed` (optional) gets the input bytes used.
 bool inflate(ConstByteView in, ByteBuffer* out, uint64_t max_output, bool raw = false, uint64_t* consumed = nullptr);
 
+// Inflates bare deflate data (RFC 1951) appending to `out`, where matches may reach back into the last `history` bytes that `out` already holds - the
+// blocks before this one of an MSZIP stream, each of which is deflate data with the ones before it as its dictionary. False as for inflate().
+bool inflate_with_history(ConstByteView in, ByteBuffer* out, uint64_t max_output, uint64_t history);
+
 // Deflates `in` into a zlib stream appended to `out`: LZ77 matching over a 32 KiB window (hash chains) coded with the
 // fixed Huffman codes of the standard - always valid, compresses repetition well but not as tightly as a dynamic
 // code. `level` 0 stores, 1 to 9 search harder. False if memory ran out.

@@ -8873,6 +8873,17 @@ struct FakeAppNetwork final : desktop::appman::INetwork {
   }
 };
 
+// A file of the stand-in winget source (tests/data/winget, made by make_fixtures.py there).
+static std::string winget_fixture(const std::string& name) {
+  std::string out;
+  FILE* f = fopen(("tests/data/winget/" + name).c_str(), "rb");
+  char buf[65536];
+  size_t n;
+  while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+  if (f) fclose(f);
+  return out;
+}
+
 static void test_app_manager() {
   TestAllocator a;
   {
@@ -8922,7 +8933,8 @@ static void test_app_manager() {
     CHECK(m->install_selected());
     CHECK(!m->busy() && m->status().contains("is installed"));
     CHECK(m->progress_bar().percent() == 100);
-    CHECK(m->list().item_text(0, 2, &cell) && cell.view().equals("Installed"));
+    CHECK(m->list().item_text(0, 3, &cell) && cell.view().equals("Installed"));
+    CHECK(m->list().item_text(0, 1, &cell) && cell.view().equals("Linux"));
     CHECK(!m->install_button().enabled() && m->remove_button().enabled() && m->update_button().enabled() && m->details().contains("installed from"));
     CHECK(fs.stat("/Linux/opt/notes/notes", &e) == filesystem::Status::Ok && fs.stat("/Linux/usr/local/share/applications/notes-AM.desktop", &e) == filesystem::Status::Ok);
     List<desktop::InstalledApp> apps(a);
@@ -8942,10 +8954,89 @@ static void test_app_manager() {
     // A failure says why.
     m->select_row(1);      // paint-x: AppMan has no script of it here
     CHECK(m->install_selected() && m->status().contains("no install script"));
+    CHECK(m->linux_count() == 3 && m->windows_count() == 0);      // (this network has no winget source: the Linux list is there all the same)
+
+    // With winget's source on the network the list has the applications for Windows as well, and says which is which.
+    net.pages[std::string(desktop::appman::kWingetIndexUrl.data(), desktop::appman::kWingetIndexUrl.size())] = winget_fixture("source2.msix");
+    {
+      const std::string listing = winget_fixture("urls.txt");
+      size_t at = 0;
+      while (at < listing.size()) {
+        const size_t end = listing.find('\n', at), tab1 = listing.find('\t', at), tab2 = listing.find('\t', tab1 + 1);
+        if (end == std::string::npos || tab1 > end || tab2 > end) break;
+        (listing.compare(at, 4, "page") == 0 ? net.pages : net.files)[listing.substr(tab1 + 1, tab2 - tab1 - 1)] = winget_fixture(listing.substr(tab2 + 1, end - tab2 - 1));
+        at = end + 1;
+      }
+    }
+    CHECK(m->refresh_catalog() && !m->busy());
+    CHECK(m->status().contains("3 applications for Linux and 409 for Windows"));
+    CHECK(m->linux_count() == 3 && m->windows_count() == 409 && m->catalog_count() == 412);
+    CHECK(fs.stat(filesystem::layout::kWingetCatalog, &e) == filesystem::Status::Ok && e.size > 0);
+    CHECK(m->list().item_count() == desktop::AppManager::kMaxRows);
+    m->set_query(" ");      // (the list again: the status line counts it)
+    CHECK(m->status().contains("412 of 412") && m->status().contains("the first 400 are shown"));
+    m->set_query("");
+    desktop::AppPlatform platform = desktop::AppPlatform::Linux;
+    // Both kinds in one list, the better matches first whichever kind they are.
+    m->set_query("tool");
+    CHECK(m->list().item_count() == 2);
+    CHECK(m->list().item_text(0, 0, &cell) && cell.view().equals("Portable Tool") && m->list().item_text(0, 1, &cell) && cell.view().equals("Windows"));
+    CHECK(m->list().item_text(0, 2, &cell) && cell.view().equals("Test.Portable, version 2.0"));
+    CHECK(m->row_name(0, &name) && name.view().equals("Test.Portable") && m->row_platform(0, &platform) && platform == desktop::AppPlatform::Windows);
+    CHECK(m->list().item_text(1, 0, &cell) && cell.view().equals("termtool") && m->list().item_text(1, 1, &cell) && cell.view().equals("Linux"));
+    CHECK(m->row_platform(1, &platform) && platform == desktop::AppPlatform::Linux);
+    // One kind only.
+    m->set_query("");
+    m->set_filter(desktop::AppManager::kShowLinux);
+    CHECK(m->list().item_count() == 3 && m->status().contains("3 of 3"));
+    m->set_filter(desktop::AppManager::kShowWindows);
+    CHECK(m->list().item_count() == desktop::AppManager::kMaxRows && m->status().contains("409 of 409"));
+    m->set_filter(desktop::AppManager::kShowAll);
+    // Install an application for Windows: the Start menu has it.
+    m->set_query("single");
+    CHECK(m->list().item_count() == 1 && m->row_name(0, &name) && name.view().equals("Test.Single"));
+    m->select_row(0);
+    CHECK(m->install_button().enabled() && !m->remove_button().enabled() && m->details().contains("Single App (Test.Single), version 1.5, for Windows"));
+    CHECK(m->install_selected() && !m->busy());
+    CHECK(m->status().contains("\"Single App\" is installed") && m->progress_bar().percent() == 100);
+    CHECK(m->list().item_text(0, 3, &cell) && cell.view().equals("Installed") && m->details().contains("version 1.5 is installed"));
+    CHECK(!m->install_button().enabled() && m->remove_button().enabled() && m->update_button().enabled());
+    listed = false;
+    apps.clear();
+    if (desktop::find_installed_apps(fs, a, &apps))
+      for (const desktop::InstalledApp& app : apps.view())
+        listed |= app.label.view().equals("Single App (Windows)") &&
+                  app.program.view().equals("/Windows/Program Files/WinGet/Packages/Test.Single_Microsoft.Winget.Source_8wekyb3d8bbwe/app/Single.exe");
+    CHECK(listed);
+    CHECK(m->update_selected() && m->status().contains("up to date"));
+    // Installed: both kinds (notes is installed again for it).
+    m->set_query("");
+    m->select_row(0);
+    CHECK(m->row_name(0, &name) && !name.view().equals("notes"));
+    m->set_query("notes");
+    m->select_row(0);
+    CHECK(m->install_selected() && m->status().contains("is installed"));
+    m->set_query("");
+    m->set_filter(desktop::AppManager::kShowInstalled);
+    CHECK(m->list().item_count() == 2 && m->status().contains("2 applications installed"));
+    CHECK(m->list().item_text(0, 0, &cell) && cell.view().equals("notes") && m->list().item_text(0, 1, &cell) && cell.view().equals("Linux"));
+    CHECK(m->list().item_text(1, 0, &cell) && cell.view().equals("Single App") && m->list().item_text(1, 1, &cell) && cell.view().equals("Windows"));
+    // Remove the one for Windows; the one for Linux stays.
+    m->select_row(1);
+    CHECK(m->remove_selected() && m->status().contains("\"Single App\" was removed") && m->list().item_count() == 1);
+    CHECK(fs.stat("/Windows/Program Files/WinGet/Packages/Test.Single_Microsoft.Winget.Source_8wekyb3d8bbwe", &e) == filesystem::Status::NotFound);
+    CHECK(fs.stat("/Linux/opt/notes/notes", &e) == filesystem::Status::Ok);
+    m->set_filter(desktop::AppManager::kShowAll);
+    // A package that comes as a setup program says so.
+    m->set_query("setup program");
+    m->select_row(0);
+    CHECK(m->install_selected() && m->status().contains("not a kind of package") && m->status().contains("Inno Setup"));
+    m->set_query("");
+
     // Without a network nothing is offered.
     desktop::AppManager lone(a);
     lone.set_services(&fs, nullptr);
-    CHECK(lone.catalog_count() == 3);      // (the kept copy)
+    CHECK(lone.catalog_count() == 412 && lone.windows_count() == 409);      // (the kept copies)
     lone.select_row(0);
     CHECK(!lone.install_button().enabled() && !lone.refresh_button().enabled() && !lone.install_selected());
   }

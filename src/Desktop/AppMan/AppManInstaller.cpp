@@ -18,6 +18,7 @@
 
 #include "Desktop/AppMan/AppManInstaller.hpp"
 #include "Desktop/AppMan/AppManCatalog.hpp"
+#include "Desktop/AppMan/InstallFiles.hpp"
 #include "FileSystem/SystemLayout.hpp"
 #include "Program/AppImageLaunch.hpp"
 #include "Utility/ByteBuffer.hpp"
@@ -42,11 +43,6 @@ bool is_identifier(StringView name) {
   return true;
 }
 
-// Paths of the layout ("/Linux/opt/<name>", ...).
-bool join(String* out, StringView a, StringView b = {}, StringView c = {}, StringView d = {}) {
-  return out->assign(a) && out->append(b) && out->append(c) && out->append(d);
-}
-
 // What a download that is not an AppImage is, by its first bytes.
 StringView packed_kind(ConstByteView head) {
   if (head.size() >= 4 && head[0] == 'P' && head[1] == 'K' && head[2] == 3 && head[3] == 4) return "a .zip archive";
@@ -57,44 +53,6 @@ StringView packed_kind(ConstByteView head) {
   if (head.size() >= 4 && head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F') return "a plain Linux program, not an AppImage";
   if (head.size() >= 1 && head[0] == '<') return "a web page";
   return "not an AppImage";
-}
-
-// Makes the folder at `path` and every folder above it that is missing.
-bool make_folders(filesystem::IFileSystem& files, StringView path) {
-  for (uint64_t at = 1; at <= path.size(); ++at) {
-    if (at < path.size() && path[at] != '/') continue;
-    const Status s = files.create_directory(path.first(at));
-    if (s != Status::Ok && s != Status::AlreadyExists) return false;
-  }
-  return true;
-}
-
-struct Writer {
-  filesystem::IFile* file;
-  Progress* progress;
-  const uint64_t* total = nullptr;      // (filled in by the network before the first bytes)
-  uint64_t offset = 0, reported = 0;
-  bool failed = false;
-};
-
-bool write_chunk(void* context, ConstByteView data) {
-  Writer& w = *static_cast<Writer*>(context);
-  if (w.progress && __atomic_load_n(&w.progress->cancel, __ATOMIC_RELAXED)) return false;
-  uint64_t done = 0;
-  if (w.file->write(w.offset, data, &done) != Status::Ok || done != data.size()) {
-    w.failed = true;
-    return false;
-  }
-  w.offset += done;
-  if (w.progress) {
-    __atomic_store_n(&w.progress->done, w.offset, __ATOMIC_RELAXED);
-    if (w.total && *w.total) __atomic_store_n(&w.progress->total, *w.total, __ATOMIC_RELAXED);
-    if (w.progress->changed && w.offset - w.reported >= (256u << 10)) {
-      w.reported = w.offset;
-      w.progress->changed(w.progress->context, *w.progress);
-    }
-  }
-  return true;
 }
 
 }  // namespace
@@ -112,6 +70,9 @@ StringView result_name(Result result) {
     case Result::Cancelled: return "the work was cancelled";
     case Result::FileError: return "its files could not be written";
     case Result::OutOfMemory: return "there is not enough memory";
+    case Result::NoManifest: return "its description in the package list could not be fetched";
+    case Result::NotSupported: return "it is not a kind of package the App Manager can install yet";
+    case Result::BadChecksum: return "what was downloaded is not the file the package list describes";
   }
   return "";
 }
@@ -137,27 +98,9 @@ bool Installer::download_lines(StringView script, String* out) {
   return false;
 }
 
-bool Installer::read_file(StringView path, uint64_t limit, String* text) const {
-  UniquePointer<filesystem::IFile> file;
-  if (files_.open_file(path, filesystem::OpenMode::Read, &file) != Status::Ok) return false;
-  const uint64_t size = file->size() < limit ? file->size() : limit;
-  ByteBuffer bytes(allocator_);
-  if (!bytes.put_zeros(size)) return false;
-  uint64_t done = 0;
-  while (done < size) {
-    uint64_t got = 0;
-    if (file->read(done, bytes.writable_view().subview(done), &got) != Status::Ok || got == 0) return false;
-    done += got;
-  }
-  return text->assign(StringView(bytes.view()));
-}
+bool Installer::read_file(StringView path, uint64_t limit, String* text) const { return read_text_file(files_, allocator_, path, limit, text); }
 
-bool Installer::write_file(StringView path, StringView text) {
-  UniquePointer<filesystem::IFile> file;
-  if (files_.open_file(path, filesystem::OpenMode::CreateTruncate, &file) != Status::Ok) return false;
-  uint64_t done = 0;
-  return file->write(0, text.bytes(), &done) == Status::Ok && done == text.size() && file->flush() == Status::Ok;
-}
+bool Installer::write_file(StringView path, StringView text) { return write_text_file(files_, path, text); }
 
 bool Installer::installed(StringView name) const {
   if (!valid_app_name(name)) return false;
@@ -255,35 +198,8 @@ Result Installer::fetch_and_install(StringView name, StringView url, Progress* p
   }
 
   // The download, into a .part file.
-  {
-    UniquePointer<filesystem::IFile> file;
-    if (files_.open_file(part.view(), filesystem::OpenMode::CreateTruncate, &file) != Status::Ok) {
-      detail->assign(part.view());
-      return Result::FileError;
-    }
-    uint64_t total = 0;
-    Writer writer{file.get(), progress, &total};
-    if (progress) {
-      __atomic_store_n(&progress->done, 0, __ATOMIC_RELAXED);
-      __atomic_store_n(&progress->total, 0, __ATOMIC_RELAXED);
-    }
-    const bool ok = network_.download(url, &write_chunk, &writer, &total);
-    if (progress && total) __atomic_store_n(&progress->total, total, __ATOMIC_RELAXED);
-    if (progress && progress->changed) progress->changed(progress->context, *progress);
-    const bool flushed = file->flush() == Status::Ok;
-    file = UniquePointer<filesystem::IFile>();
-    if (!ok || !flushed || writer.offset == 0) {
-      (void)files_.remove(part.view());
-      if (progress && __atomic_load_n(&progress->cancel, __ATOMIC_RELAXED)) return Result::Cancelled;
-      if (writer.failed || !flushed) {
-        detail->assign("writing ");
-        detail->append(part.view());
-        return Result::FileError;
-      }
-      detail->assign(url);
-      return Result::DownloadFailed;
-    }
-  }
+  const Result fetched = download_to_file(files_, network_, url, part.view(), progress, nullptr, detail);
+  if (fetched != Result::Ok) return fetched;
   if (appimage_type(files_, part.view()) == exe::AppImageType::None) {
     uint8_t head[8] = {};
     UniquePointer<filesystem::IFile> file;
@@ -430,29 +346,6 @@ Result Installer::install_launcher(StringView name, String* detail) {
   return Result::Ok;
 }
 
-bool Installer::remove_tree(StringView path, uint32_t depth) {
-  if (depth > 32) return false;
-  filesystem::DirectoryEntry entry;
-  const Status s = files_.stat(path, &entry);
-  if (s == Status::NotFound) return true;
-  if (s == Status::Ok && entry.type == filesystem::NodeType::Directory && !entry.is_symlink) {
-    List<String> names(allocator_);
-    {
-      UniquePointer<filesystem::IDirectory> listing;
-      if (files_.open_directory(path, &listing) != Status::Ok) return false;
-      filesystem::DirectoryEntry child;
-      for (uint32_t guard = 0; guard < 100000 && listing->next(&child) == Status::Ok; ++guard) {
-        String full(allocator_);
-        if (!join(&full, path, "/", child.name.view()) || !names.push_back(util::move(full))) return false;
-      }
-    }
-    for (const String& child : names.view())
-      if (!remove_tree(child.view(), depth + 1)) return false;
-  }
-  const Status r = files_.remove(path);
-  return r == Status::Ok || r == Status::NotFound;
-}
-
 Result Installer::remove(StringView name, String* detail) {
   detail->clear();
   if (!valid_app_name(name)) return Result::InvalidName;
@@ -463,7 +356,7 @@ Result Installer::remove(StringView name, String* detail) {
     return Result::OutOfMemory;
   (void)files_.remove(link.view());
   (void)files_.remove(desktop.view());
-  if (!remove_tree(dir.view(), 0)) {
+  if (!remove_tree(files_, allocator_, dir.view())) {
     detail->assign(dir.view());
     return Result::FileError;
   }

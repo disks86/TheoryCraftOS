@@ -30,7 +30,7 @@ spirv_host() {
 }
 gl_kernel="$(ls src/OpenGl/*.cpp | grep -v WindowsGl) src/OpenGl/generated/GlApiVariants.cpp"
 # The App Manager (src/Desktop/AppManager.cpp, in src/Desktop/*.cpp) and what it stands on: AppMan's catalog and installer, the AppImage readers and the shell.
-appman_src="src/Desktop/AppMan/AppManCatalog.cpp src/Desktop/AppMan/AppManInstaller.cpp src/Program/AppRunScript.cpp src/Program/ShellTools.cpp src/Program/AppImageLaunch.cpp \
+appman_src="src/Desktop/AppMan/AppManCatalog.cpp src/Desktop/AppMan/AppManInstaller.cpp src/Desktop/AppMan/InstallFiles.cpp src/Desktop/AppMan/SqliteReader.cpp src/Desktop/AppMan/WingetCatalog.cpp src/Desktop/AppMan/WingetInstaller.cpp src/Desktop/AppMan/Yaml.cpp src/Program/AppRunScript.cpp src/Program/ShellTools.cpp src/Program/AppImageLaunch.cpp \
             src/FileSystem/Squash/*.cpp src/FileSystem/Dwarfs/*.cpp src/FileSystem/Iso/*.cpp src/FileSystem/Mount/GraftFileSystem.cpp src/Process/ProgramEnvironment.cpp"      # (the decoders come with $media)
 dxg_desktop="src/Kernel/Dxgkrnl/*.cpp src/Graphics/Logo/Logo.cpp src/Graphics/Graphics3D/Software/*.cpp $gl_kernel $spirv_object"
 
@@ -503,6 +503,7 @@ for t in "${WANTED[@]}"; do
         build_and_run AppImageTest -I tests tests/AppImageTest.cpp $appimage_src $appimage_libs
       else
         build_and_run AppManTest -I tests tests/AppManTest.cpp $appimage_src src/Desktop/AppMan/AppManCatalog.cpp src/Desktop/AppMan/AppManInstaller.cpp \
+                      src/Desktop/AppMan/InstallFiles.cpp src/Desktop/AppMan/SqliteReader.cpp src/Desktop/AppMan/WingetCatalog.cpp src/Desktop/AppMan/WingetInstaller.cpp src/Desktop/AppMan/Yaml.cpp src/Media/Zip.cpp \
                       src/Desktop/InstalledApps.cpp src/Executable/ExecutableKind.cpp src/Executable/ElfFile.cpp src/Executable/PeFile.cpp $appimage_libs
       fi ;;
     ExtTest) build_and_run ExtTest tests/ExtTest.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \

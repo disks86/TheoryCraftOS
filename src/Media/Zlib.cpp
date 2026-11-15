@@ -79,6 +79,7 @@ struct Inflater {
   uint64_t out_start;
   uint64_t max_output;
   bool failed = false;
+  uint64_t history = 0;      // bytes of `out` before out_start that matches may reach back into (MSZIP: the blocks before this one)
 
   uint32_t bits(int need) {
     uint32_t value = bit_buffer;
@@ -118,7 +119,7 @@ struct Inflater {
 
   // Copies `length` bytes from `distance` back in what this stream has written.
   bool copy(uint32_t length, uint32_t distance) {
-    if (distance > out->size() - out_start) return false;
+    if (distance > out->size() - out_start + history) return false;
     for (uint32_t i = 0; i < length; ++i) {
       const uint8_t byte = out->view()[out->size() - distance];
       if (!put(byte)) return false;
@@ -242,6 +243,26 @@ bool inflate(ConstByteView in, ByteBuffer* out, uint64_t max_output, bool raw, u
     if (adler32(out->view().subview(z.out_start)) != want) return false;
   }
   if (consumed) *consumed = z.position;
+  return true;
+}
+
+bool inflate_with_history(ConstByteView in, ByteBuffer* out, uint64_t max_output, uint64_t history) {
+  Inflater z{in, 0, 0, 0, out, out->size(), max_output};
+  z.history = history < out->size() ? history : out->size();
+  bool last;
+  do {
+    last = z.bits(1);
+    const uint32_t type = z.bits(2);
+    if (z.failed) return false;
+    bool ok;
+    switch (type) {
+      case 0: ok = z.stored(); break;
+      case 1: ok = z.fixed(); break;
+      case 2: ok = z.dynamic(); break;
+      default: ok = false; break;
+    }
+    if (!ok || z.failed) return false;
+  } while (!last);
   return true;
 }
 

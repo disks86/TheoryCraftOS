@@ -67,6 +67,10 @@ enum class Result : uint8_t {
   Cancelled,
   FileError,         // the Linux world could not be written (full, read only)
   OutOfMemory,
+  // (the Windows packages of winget, WingetInstaller.hpp)
+  NoManifest,        // the package's version list or manifest could not be fetched, or is not what the index says it is
+  NotSupported,      // the package is installed by a setup program, or there is none for this kind of computer
+  BadChecksum,       // the download is not the file the manifest names (its SHA-256 differs)
 };
 StringView result_name(Result result);
 
@@ -105,7 +109,6 @@ class Installer {
  private:
   Result fetch_and_install(StringView name, StringView url, Progress* progress, String* detail);
   Result install_launcher(StringView name, String* detail);
-  bool remove_tree(StringView path, uint32_t depth);
   bool write_file(StringView path, StringView text);
   bool read_file(StringView path, uint64_t limit, String* text) const;
 

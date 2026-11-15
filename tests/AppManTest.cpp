@@ -24,10 +24,13 @@
 //   AppManTest                             the tests
 //   AppManTest --resolve <script> <cache>  prints the link an AppMan install script would download, curl answered from <cache> (tests/appman_interop.sh)
 //   AppManTest --lines <script>            prints the lines of the script that work the link out (what --resolve runs)
+//   AppManTest --winget <source2.msix> <id>...          what winget's real catalog says of those packages, fetched as an install fetches it (tests/winget_interop.sh)
+//   AppManTest --winget-install <source2.msix> <id>...  and installs them into a RAM file system
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
 #include <map>
@@ -35,8 +38,13 @@
 #include <vector>
 #include "Desktop/AppMan/AppManCatalog.hpp"
 #include "Desktop/AppMan/AppManInstaller.hpp"
+#include "Desktop/AppMan/SqliteReader.hpp"
+#include "Desktop/AppMan/WingetCatalog.hpp"
+#include "Desktop/AppMan/WingetInstaller.hpp"
+#include "Desktop/AppMan/Yaml.hpp"
 #include "Desktop/InstalledApps.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Media/Zip.hpp"
 #include "Program/ShellTools.hpp"
 #include "SquashWriter.hpp"
 
@@ -434,6 +442,493 @@ static void test_installer() {
   CHECK(a.live == 0);
 }
 
+// ------------------------------------------------------------------ winget: the Windows applications
+// The stand-in winget source of tests/data/winget (made by make_fixtures.py there).
+static std::string fixture(const std::string& name) {
+  std::string out;
+  FILE* f = fopen(("tests/data/winget/" + name).c_str(), "rb");
+  if (!f) { printf("  missing tests/data/winget/%s (run the tests from the repository's root)\n", name.c_str()); ++g_failed; return out; }
+  char buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+  fclose(f);
+  return out;
+}
+static ConstByteView data_of(const std::string& s) { return ConstByteView(reinterpret_cast<const uint8_t*>(s.data()), s.size()); }
+
+// The network of the fixture: every address of urls.txt, answered with its file.
+static void load_winget_site(FakeNetwork* net) {
+  const std::string listing = fixture("urls.txt");
+  size_t at = 0;
+  while (at < listing.size()) {
+    const size_t end = listing.find('\n', at), tab1 = listing.find('\t', at), tab2 = listing.find('\t', tab1 + 1);
+    if (end == std::string::npos || tab1 > end || tab2 > end) break;
+    const std::string kind = listing.substr(at, tab1 - at), url = listing.substr(tab1 + 1, tab2 - tab1 - 1), file = listing.substr(tab2 + 1, end - tab2 - 1);
+    (kind == "page" ? net->pages : net->files)[url] = fixture(file);
+    at = end + 1;
+  }
+}
+
+// Runs `decode` on `good` cut short at many lengths and with single bits flipped: it must neither crash nor read outside the data (the sanitizers
+// say), whatever it answers.
+template <class Decode>
+static void damage(const std::string& good, Decode decode) {
+  const size_t step = good.size() > 4000 ? good.size() / 997 : 1;
+  for (size_t length = 0; length < good.size(); length += step) decode(good.substr(0, length));
+  uint32_t seed = 12345;
+  for (int i = 0; i < 1500 && !good.empty(); ++i) {
+    seed = seed * 1664525u + 1013904223u;
+    std::string bad = good;
+    bad[(seed >> 8) % bad.size()] ^= char(1u << (seed & 7));
+    if (i % 3 == 0) {      // (and a second one, near the start, where the headers are)
+      seed = seed * 1664525u + 1013904223u;
+      bad[(seed >> 8) % std::min<size_t>(bad.size(), 512)] ^= char(1u << (seed & 7));
+    }
+    decode(bad);
+  }
+}
+
+static void test_zip() {
+  TestAllocator a;
+  {
+    const std::string msix = fixture("source2.msix");
+    media::MemoryZipSource source(data_of(msix));
+    media::ZipReader zip(a, source);
+    CHECK(zip.open() && zip.entries().size() == 3);
+    const media::ZipEntry* logo = zip.find("Assets/AppPackageStoreLogo.scale-100.png");
+    const media::ZipEntry* index = zip.find("Public/index.db");
+    CHECK(logo && index && !zip.find("public/index.db"));
+    ByteBuffer out(a);
+    CHECK(logo && zip.extract(*logo, 1 << 20, &out) && sv(StringView(out.view())) == "\x89PNG\r\n\x1a\nnot really");
+    // A member whose sizes and offset are in its ZIP64 extra field, deflated.
+    ByteBuffer db(a);
+    CHECK(index && index->method == 8 && index->size == 61440 && zip.extract(*index, 1 << 20, &db) && db.size() == 61440);
+    CHECK(sv(StringView(db.view().first(15))) == "SQLite format 3");
+    // Too large for the caller: nothing is added.
+    ByteBuffer small(a);
+    CHECK(index && !zip.extract(*index, 1000, &small) && small.size() == 0);
+    CHECK(media::crc32(data_of(std::string("123456789"))) == 0xCBF43926u);
+    // An ordinary archive (no ZIP64), with a comment after the end record.
+    std::string plain;
+    {
+      const std::string name = "a.txt", data = "hello";
+      auto le = [&](std::string& s, uint64_t v, int n) { for (int i = 0; i < n; ++i) s.push_back(char(v >> (8 * i))); };
+      std::string local, central;
+      le(local, 0x04034B50, 4); le(local, 20, 2); le(local, 0, 2); le(local, 0, 2); le(local, 0, 4); le(local, media::crc32(data_of(data)), 4);
+      le(local, 5, 4); le(local, 5, 4); le(local, name.size(), 2); le(local, 0, 2);
+      local += name + data;
+      le(central, 0x02014B50, 4); le(central, 20, 2); le(central, 20, 2); le(central, 0, 2); le(central, 0, 2); le(central, 0, 4); le(central, media::crc32(data_of(data)), 4);
+      le(central, 5, 4); le(central, 5, 4); le(central, name.size(), 2); le(central, 0, 2); le(central, 0, 2); le(central, 0, 2); le(central, 0, 2); le(central, 0, 4); le(central, 0, 4);
+      central += name;
+      plain = local + central;
+      le(plain, 0x06054B50, 4); le(plain, 0, 2); le(plain, 0, 2); le(plain, 1, 2); le(plain, 1, 2); le(plain, central.size(), 4); le(plain, local.size(), 4); le(plain, 7, 2);
+      plain += "comment";
+    }
+    media::MemoryZipSource plain_source(data_of(plain));
+    media::ZipReader plain_zip(a, plain_source);
+    ByteBuffer hello(a);
+    CHECK(plain_zip.open() && plain_zip.entries().size() == 1 && plain_zip.extract(plain_zip.entries()[0], 100, &hello) && sv(StringView(hello.view())) == "hello");
+    // Not archives.
+    for (const std::string& junk : {std::string(), std::string("PK"), std::string(100, 'x'), std::string("PK\x05\x06", 4) + std::string(18, '\xFF')}) {
+      media::MemoryZipSource s(data_of(junk));
+      media::ZipReader z(a, s);
+      CHECK(!z.open());
+    }
+    // Damaged: never a crash, and what is unpacked is what was packed (the CRC says) or nothing.
+    int opened = 0, unpacked = 0;
+    damage(msix, [&](const std::string& bad) {
+      media::MemoryZipSource s(data_of(bad));
+      media::ZipReader z(a, s);
+      if (!z.open()) return;
+      ++opened;
+      for (const media::ZipEntry& entry : z.entries()) {
+        ByteBuffer got(a);
+        if (z.extract(entry, 1 << 20, &got)) ++unpacked;
+      }
+    });
+    CHECK(opened > 0 && unpacked > 0);
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_sqlite_and_catalog() {
+  TestAllocator a;
+  {
+    const std::string msix = fixture("source2.msix");
+    appman::WingetCatalog catalog(a);
+    CHECK(catalog.parse_index(data_of(msix)));
+    // 9 packages and 400 fillers; the one with the overlong name and the one with the bad identifier are left out.
+    CHECK(catalog.count() == 409);
+    const appman::WingetPackage* tool = catalog.find("test.portable");      // (any case)
+    CHECK(tool && tool->id.view().equals("Test.Portable") && tool->name.view().equals("Portable Tool") && tool->moniker.view().equals("ptool") && tool->version.view().equals("2.0"));
+    CHECK(catalog.find("Allen&Heath.Mixer") && !catalog.find("Long.Name") && !catalog.find("Bad/Identifier") && !catalog.find("Test.Port"));
+    // Sorted by name.
+    bool sorted = true;
+    for (uint64_t i = 1; i < catalog.count(); ++i) sorted &= appman::compare_folded(catalog.at(i - 1).name.view(), catalog.at(i).name.view()) <= 0;
+    CHECK(sorted);
+    // Searching: the moniker and a name that starts with the query first, then names that contain it, then identifiers.
+    List<uint64_t> found(a);
+    List<uint8_t> tiers(a);
+    uint64_t total = 0;
+    CHECK(catalog.search("", 1000, &found, &total) && total == 409 && found.count() == 409);
+    CHECK(catalog.search("ptool", 10, &found, &total, &tiers) && total == 1 && tiers[0] == 0 && catalog.at(found[0]).id.view().equals("Test.Portable"));
+    CHECK(catalog.search("ZIP", 10, &found, &total, &tiers) && total == 1 && catalog.at(found[0]).name.view().equals("Zip Suite") && tiers[0] == 0);
+    CHECK(catalog.search("test.", 100, &found, &total, &tiers) && total == 8 && tiers[0] == 2);      // (identifiers only)
+    CHECK(catalog.search("filler 39", 5, &found, &total, &tiers) && total == 14 && found.count() == 5 && catalog.at(found[0]).name.view().equals("Filler 390") && tiers[0] == 0);      // (both words anywhere; the names that start with the query first)
+    CHECK(catalog.search("39 filler", 100, &found, &total, &tiers) && total == 14 && tiers[0] == 2 && catalog.at(found[0]).name.view().equals("Filler 039"));
+    CHECK(catalog.search("no such thing", 5, &found, &total) && total == 0 && found.count() == 0);
+    // The kept list holds the same.
+    String list(a);
+    appman::WingetCatalog again(a);
+    CHECK(catalog.write_list(&list) && again.parse_list(list.view()) && again.count() == catalog.count());
+    const appman::WingetPackage* same = again.find("Test.Portable");
+    CHECK(same && tool && same->version.view().equals("2.0") && memcmp(same->hash, tool->hash, 32) == 0 && same->moniker.view().equals("ptool"));
+    CHECK(!again.parse_list("") && !again.parse_list("something else\n") && !again.parse_list("winget-packages 1\nnot\ta\tpackage\n"));
+    damage(sv(list.view()), [&](const std::string& bad) {
+      appman::WingetCatalog c(a);
+      (void)c.parse_list(view(bad));
+    });
+
+    // Identifiers.
+    CHECK(appman::valid_package_id("Mozilla.Firefox") && appman::valid_package_id("Notepad++.Notepad++") && appman::valid_package_id("Allen&Heath.SQMixPad") &&
+          appman::valid_package_id("Chapp\xC3\xA9" "e.PRO"));
+    for (const char* bad : {"", ".hidden", "a/b", "a\\b", "a..b", "C:x", "a*b", "tab\there", "ends.", "ends ", " starts", "q?", "a|b", "<a>", "say\"it"}) CHECK(!appman::valid_package_id(bad));
+
+    // The database itself: the table by name, a row that spills into overflow pages, and damage.
+    media::MemoryZipSource source(data_of(msix));
+    media::ZipReader zip(a, source);
+    ByteBuffer db(a);
+    CHECK(zip.open() && zip.extract(*zip.find("Public/index.db"), 1 << 20, &db));
+    appman::SqliteReader reader(a, db.view());
+    uint32_t root = 0;
+    CHECK(reader.open() && reader.table_root("packages", &root) && root > 1 && !reader.table_root("no_such_table", &root));
+    struct Rows { uint64_t count = 0, longest = 0; int64_t last = 0; bool ordered = true; } rows;
+    CHECK(reader.scan_table(root, [](void* context, int64_t rowid, ArrayView<const appman::SqliteValue> columns) {
+      Rows& r = *static_cast<Rows*>(context);
+      ++r.count;
+      r.ordered &= rowid > r.last;
+      r.last = rowid;
+      if (columns.size() >= 8 && columns[2].text().size() > r.longest) r.longest = columns[2].text().size();
+      return columns.size() == 8 && columns[0].kind == appman::SqliteValue::Kind::Null && columns[7].kind == appman::SqliteValue::Kind::Blob && columns[7].bytes.size() == 32;
+    }, &rows));
+    CHECK(rows.count == 411 && rows.longest == 6000 && rows.ordered);
+    const std::string database = sv(StringView(db.view()));
+    for (const std::string& junk : {std::string(), std::string("SQLite format 3"), std::string(4096, '\0'), database.substr(0, 100)}) {
+      appman::WingetCatalog c(a);
+      CHECK(!c.parse_database(data_of(junk)));
+    }
+    int read = 0;
+    damage(database, [&](const std::string& bad) {
+      appman::WingetCatalog c(a);
+      if (c.parse_database(data_of(bad))) ++read;
+    });
+    CHECK(read > 0);
+    damage(msix, [&](const std::string& bad) {
+      appman::WingetCatalog c(a);
+      (void)c.parse_index(data_of(bad));
+    });
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_yaml() {
+  TestAllocator a;
+  {
+    appman::YamlNode root(a);
+    const char* text =
+        "# a comment\n---\nPlain: a value  # with a comment\nNumber: 1.8.2\nEmpty:\nQuoted: \"two\\nlines \\xA9 \\u00e9 \\\"q\\\"\"\nSingle: 'it''s'\n"
+        "Folded: first part\n  second part\n\n  after a break\nLong: \"a quoted value that the\n  emitter broke, and \\\n  joined\"\n"
+        "Literal: |\n  line one\n    indented\n\n  line three\nFoldedBlock: >-\n  one\n  two\nUrl: https://example.org/a:b\n"
+        "List:\n- one\n- two: 2\n  three: 3\n- - nested\n  - items\nIndented:\n  - x\n  - y\nMap:\n  Inner:\n    Deep: yes\n  Other: no\nFlow: [a, b]\n\"Quoted Key\": v\nLast: end\n";
+    CHECK(appman::parse_yaml(a, text, &root) && root.kind == appman::YamlNode::Kind::Map);
+    CHECK(root.text("Plain").equals("a value") && root.text("Number").equals("1.8.2") && root.find("Empty") && root.text("Empty").empty());
+    CHECK(sv(root.text("Quoted")) == "two\nlines \xC2\xA9 \xC3\xA9 \"q\"" && root.text("Single").equals("it's"));
+    CHECK(sv(root.text("Folded")) == "first part second part\nafter a break");
+    CHECK(sv(root.text("Long")) == "a quoted value that the emitter broke, and joined");
+    CHECK(sv(root.text("Literal")) == "line one\n  indented\n\nline three" && root.text("FoldedBlock").equals("one two"));
+    CHECK(root.text("Url").equals("https://example.org/a:b") && root.text("Flow").equals("[a, b]") && root.text("Quoted Key").equals("v") && root.text("Last").equals("end"));
+    const appman::YamlNode* list = root.find("List");
+    CHECK(list && list->kind == appman::YamlNode::Kind::Sequence && list->children.count() == 3);
+    if (list && list->children.count() == 3) {
+      CHECK(list->children[0]->value.view().equals("one") && list->children[1]->text("two").equals("2") && list->children[1]->text("three").equals("3"));
+      CHECK(list->children[2]->kind == appman::YamlNode::Kind::Sequence && list->children[2]->children.count() == 2 && list->children[2]->children[1]->value.view().equals("items"));
+    }
+    const appman::YamlNode* indented = root.find("Indented");
+    CHECK(indented && indented->children.count() == 2 && indented->children[1]->value.view().equals("y"));
+    const appman::YamlNode* map = root.find("Map");
+    CHECK(map && map->find("Inner") && map->find("Inner")->text("Deep").equals("yes") && map->text("Other").equals("no") && !root.find("Deep"));
+    // Not YAML of this kind.
+    for (const char* bad : {"a: \"never closed\n", "- x\ny: 1\n", "a: 1\n- x\n", "a: \"bad \\q escape\"\n", "key: v\n nonsense\n: x\n"}) {
+      appman::YamlNode node(a);
+      if (appman::parse_yaml(a, bad, &node)) printf("  parsed: %s\n", bad);
+      CHECK(!appman::parse_yaml(a, bad, &node));
+    }
+    // An empty document, and nesting that is too deep.
+    appman::YamlNode empty(a);
+    CHECK(appman::parse_yaml(a, "\n# nothing\n", &empty) && empty.kind == appman::YamlNode::Kind::Map && empty.children.count() == 0);
+    std::string deep;
+    for (int i = 0; i < 100; ++i) deep += std::string(size_t(i) * 2, ' ') + "k:\n";
+    CHECK(!appman::parse_yaml(a, view(deep), &empty));
+    std::string dashes;
+    for (int i = 0; i < 200; ++i) dashes += "- ";
+    CHECK(!appman::parse_yaml(a, view(dashes + "x\n"), &empty));
+    damage(text, [&](const std::string& bad) {
+      appman::YamlNode node(a);
+      (void)appman::parse_yaml(a, view(bad), &node);
+    });
+  }
+  CHECK(a.live == 0);
+}
+
+static void test_winget_manifests() {
+  TestAllocator a;
+  {
+    FakeNetwork net;
+    load_winget_site(&net);
+    // The long version list: several MSZIP blocks, each with the ones before it as its dictionary.
+    std::string packed, manifest_20;
+    for (const auto& page : net.pages) {
+      if (page.first.find("packages/Test.Portable/") != std::string::npos) packed = page.second;
+      if (page.first.find("manifests/t/Test/Portable/2.0/") != std::string::npos) manifest_20 = page.second;
+    }
+    const std::string expected = fixture("versions.yaml");
+    String text(a);
+    CHECK(!packed.empty() && expected.size() > 65536);
+    CHECK(appman::WingetInstaller::decode_mszyml(a, data_of(packed), 1 << 20, &text) && sv(text.view()) == expected);
+    CHECK(!appman::WingetInstaller::decode_mszyml(a, data_of(packed), 1000, &text));      // longer than the caller allows
+    CHECK(!appman::WingetInstaller::decode_mszyml(a, data_of(std::string("not packed at all, just text")), 1 << 20, &text));
+    int decoded = 0;
+    damage(packed, [&](const std::string& bad) {
+      String out(a);
+      if (appman::WingetInstaller::decode_mszyml(a, data_of(bad), 1 << 20, &out)) ++decoded;
+    });
+    (void)decoded;
+    // The version asked for, else the first.
+    String version(a), path(a), sha(a);
+    CHECK(appman::WingetInstaller::find_version(a, view(expected), "1.0", &version, &path, &sha) && version.view().equals("1.0") &&
+          path.view().equals("manifests/t/Test/Portable/1.0/16cd") && sha.size() == 64);
+    CHECK(appman::WingetInstaller::find_version(a, view(expected), "7.7", &version, &path, &sha) && version.view().equals("2.0"));
+    CHECK(!appman::WingetInstaller::find_version(a, "sV: 1.0\nvD:\n- v: 1\n  rP: ../../elsewhere\n  s256H: 00\n", "1", &version, &path, &sha));
+    CHECK(!appman::WingetInstaller::find_version(a, "sV: 1.0\n", "1", &version, &path, &sha));
+
+    // A manifest: what each installer does not say, the manifest says for all.
+    appman::WingetManifest manifest(a);
+    CHECK(!manifest_20.empty() && appman::WingetInstaller::parse_manifest(a, view(manifest_20), &manifest));
+    CHECK(manifest.id.view().equals("Test.Portable") && manifest.name.view().equals("Portable Tool") && manifest.version.view().equals("2.0") && manifest.command.view().equals("ptool"));
+    CHECK(manifest.installers.count() == 3 && manifest.installers[1]->architecture.view().equals("x64") && manifest.installers[1]->type.view().equals("portable"));
+    String why(a);
+    const appman::WingetInstallerEntry* chosen = appman::WingetInstaller::choose_installer(manifest, &why);
+    CHECK(chosen && chosen->architecture.view().equals("x64") && chosen->url.view().equals("https://example.org/dl/ptool-2.0-x64.exe"));
+    const char* others =
+        "PackageIdentifier: A.B\nPackageName: B\nPackageVersion: 1\nInstallerType: zip\nNestedInstallerType: portable\nNestedInstallerFiles:\n- RelativeFilePath: shared.exe\n"
+        "Installers:\n- Architecture: x86\n  InstallerUrl: https://example.org/x86.zip\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "- Architecture: x64\n  InstallerType: msi\n  InstallerUrl: https://example.org/x64.msi\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n"
+        "- Architecture: neutral\n  InstallerUrl: ftp://example.org/n.zip\n  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000\n";
+    CHECK(appman::WingetInstaller::parse_manifest(a, others, &manifest) && manifest.installers.count() == 3);
+    chosen = appman::WingetInstaller::choose_installer(manifest, &why);      // the x64 one is a setup program, the neutral one not a web address
+    CHECK(chosen && chosen->architecture.view().equals("x86") && chosen->nested.count() == 1 && chosen->nested[0]->path.view().equals("shared.exe"));
+    CHECK(!appman::WingetInstaller::parse_manifest(a, "PackageName: no identifier\nInstallers: []\n", &manifest));
+    CHECK(!appman::WingetInstaller::parse_manifest(a, "- a\n- list\n", &manifest));
+    damage(manifest_20, [&](const std::string& bad) {
+      appman::WingetManifest m(a);
+      String w(a);
+      if (appman::WingetInstaller::parse_manifest(a, view(bad), &m)) (void)appman::WingetInstaller::choose_installer(m, &w);
+    });
+
+    // The names of archive members.
+    String safe(a);
+    CHECK(appman::WingetInstaller::safe_member_path("bin\\tool.exe", &safe) && safe.view().equals("bin/tool.exe"));
+    CHECK(appman::WingetInstaller::safe_member_path("a/b/", &safe) && safe.view().equals("a/b"));
+    for (const char* bad : {"", "/abs", "\\abs", "../up", "a/../b", "a//b", "C:\\x", "a/./b", "nul\x01", "a/b.", "what?", "a/ b /c "}) CHECK(!appman::WingetInstaller::safe_member_path(bad, &safe));
+
+    // A shortcut: written, and read back as the Start menu reads it.
+    ByteBuffer link(a);
+    ShellLinkInfo info(a);
+    CHECK(write_shell_link("C:\\Program Files\\WinGet\\Packages\\Caf\xC3\xA9\\tool.exe", "C:\\Program Files\\WinGet\\Packages\\Caf\xC3\xA9", &link));
+    CHECK(parse_shell_link(link.view(), &info) && sv(info.target.view()) == "C:\\Program Files\\WinGet\\Packages\\Caf\xC3\xA9\\tool.exe" &&
+          sv(info.working_directory.view()) == "C:\\Program Files\\WinGet\\Packages\\Caf\xC3\xA9" && info.arguments.empty());
+    CHECK(!write_shell_link("", "C:\\", &link) && link.size() == 0);
+  }
+  CHECK(a.live == 0);
+}
+
+static bool start_menu_has(RamFileSystem& fs, TestAllocator& a, const char* label, const char* program) {
+  List<InstalledApp> apps(a);
+  bool listed = false;
+  if (find_installed_apps(fs, a, &apps))
+    for (const InstalledApp& app : apps.view()) listed |= app.platform == AppPlatform::Windows && app.label.view().equals(label) && app.program.view().equals(program);
+  return listed;
+}
+
+static void test_winget_installer() {
+  TestAllocator a;
+  {
+    RamFileSystem fs(a);
+    for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData"}) (void)fs.create_directory(d);
+    FakeNetwork net;
+    load_winget_site(&net);
+    appman::WingetCatalog catalog(a);
+    CHECK(catalog.parse_index(data_of(fixture("source2.msix"))));
+    appman::WingetInstaller installer(a, fs, net);
+    String detail(a);
+    appman::Progress progress;
+    auto package = [&](const char* id) -> const appman::WingetPackage& {
+      const appman::WingetPackage* found = catalog.find(id);
+      if (!found) { printf("  no package %s\n", id); ++g_failed; return catalog.at(0); }
+      return *found;
+    };
+    auto run = [&](appman::Result r, appman::Result want) {
+      if (r != want) printf("  got: %s (%s)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str());
+      return r == want;
+    };
+    const char* kPackages = "/Windows/Program Files/WinGet/Packages";
+    const std::string tool_dir = std::string(kPackages) + "/Test.Portable_Microsoft.Winget.Source_8wekyb3d8bbwe";
+    const char* kMenu = "/Windows/ProgramData/Microsoft/Windows/Start Menu/Programs";
+
+    // A portable program, version 1.0 first (as if the catalog were older), for this computer's CPU.
+    appman::WingetPackage older(a);
+    CHECK(older.copy_from(package("Test.Portable")) && older.version.assign("1.0"));
+    CHECK(!installer.installed("Test.Portable"));
+    CHECK(run(installer.install(older, &progress, &detail), appman::Result::Ok));
+    CHECK(installer.installed("Test.Portable") && installer.installed("test.portable") == false);      // (the folder is named as the identifier is written)
+    CHECK(read_ram(fs, (tool_dir + "/ptool.exe").c_str()) == net.files["https://example.org/dl/ptool-1.0-x64.exe"]);
+    CHECK(progress.done == net.files["https://example.org/dl/ptool-1.0-x64.exe"].size() && progress.total == progress.done);
+    const std::string record = read_ram(fs, (tool_dir + "/winget-install.txt").c_str());
+    CHECK(record.find("PackageIdentifier: Test.Portable\n") != std::string::npos && record.find("PackageVersion: 1.0\n") != std::string::npos &&
+          record.find("Shortcut: Portable Tool.lnk\n") != std::string::npos);
+    CHECK(!exists(fs, (tool_dir + "/download.part").c_str()));
+    CHECK(start_menu_has(fs, a, "Portable Tool (Windows)", (tool_dir + "/ptool.exe").c_str()));
+    List<appman::WingetInstalled> apps(a);
+    CHECK(installer.list_installed(&apps) && apps.count() == 1 && apps[0].id.view().equals("Test.Portable") && apps[0].name.view().equals("Portable Tool") &&
+          apps[0].version.view().equals("1.0"));
+
+    // Update: a download that is cancelled keeps the old version; then the new one; then nothing to do.
+    progress.cancel = false;
+    net.cancel_after_first = &progress;
+    CHECK(run(installer.update(package("Test.Portable"), &progress, &detail), appman::Result::Cancelled));
+    net.cancel_after_first = nullptr;
+    progress.cancel = false;
+    CHECK(read_ram(fs, (tool_dir + "/ptool.exe").c_str()) == net.files["https://example.org/dl/ptool-1.0-x64.exe"] && installer.installed("Test.Portable"));
+    CHECK(run(installer.update(package("Test.Portable"), &progress, &detail), appman::Result::Ok));
+    CHECK(read_ram(fs, (tool_dir + "/ptool.exe").c_str()) == net.files["https://example.org/dl/ptool-2.0-x64.exe"]);
+    CHECK(installer.list_installed(&apps) && apps.count() == 1 && apps[0].version.view().equals("2.0"));
+    const size_t fetched = net.fetched.size();
+    CHECK(run(installer.update(package("Test.Portable"), &progress, &detail), appman::Result::UpToDate) && net.fetched.size() == fetched);      // (no network needed)
+    CHECK(start_menu_has(fs, a, "Portable Tool (Windows)", (tool_dir + "/ptool.exe").c_str()));
+
+    // An archive of two programs: everything unpacked, a shortcut for each.
+    const std::string suite_dir = std::string(kPackages) + "/Test.Zipped_Microsoft.Winget.Source_8wekyb3d8bbwe";
+    CHECK(run(installer.install(package("Test.Zipped"), &progress, &detail), appman::Result::Ok));
+    CHECK(read_ram(fs, (suite_dir + "/bin/alpha.exe").c_str()).find("alpha") != std::string::npos && exists(fs, (suite_dir + "/beta.exe").c_str()));
+    CHECK(read_ram(fs, (suite_dir + "/docs/readme.txt").c_str()).size() == 9000 && exists(fs, (suite_dir + "/data").c_str()) && !exists(fs, (suite_dir + "/download.part").c_str()));
+    CHECK(start_menu_has(fs, a, "alpha (Windows)", (suite_dir + "/bin/alpha.exe").c_str()) && start_menu_has(fs, a, "beta (Windows)", (suite_dir + "/beta.exe").c_str()));
+    // An archive of one: its shortcut has the package's name. An identifier with '&' in it (escaped in the address).
+    CHECK(run(installer.install(package("Test.Single"), &progress, &detail), appman::Result::Ok));
+    CHECK(start_menu_has(fs, a, "Single App (Windows)", (std::string(kPackages) + "/Test.Single_Microsoft.Winget.Source_8wekyb3d8bbwe/app/Single.exe").c_str()));
+    CHECK(run(installer.install(package("Allen&Heath.Mixer"), &progress, &detail), appman::Result::Ok));
+    CHECK(exists(fs, (std::string(kPackages) + "/Allen&Heath.Mixer_Microsoft.Winget.Source_8wekyb3d8bbwe/Mixer%20Setup.exe").c_str()));
+    CHECK(installer.list_installed(&apps) && apps.count() == 4 && apps[0].name.view().equals("A&H Mixer") && apps[3].name.view().equals("Zip Suite"));
+
+    // A shortcut of the same name that is someone else's is left alone.
+    CHECK(run(installer.remove("Test.Single", &detail), appman::Result::Ok));
+    {
+      UniquePointer<IFile> f;
+      uint64_t done = 0;
+      CHECK(fs.open_file((std::string(kMenu) + "/Single App.lnk").c_str(), OpenMode::CreateTruncate, &f) == Status::Ok && f->write(0, data_of(std::string("theirs")), &done) == Status::Ok);
+    }
+    CHECK(run(installer.install(package("Test.Single"), &progress, &detail), appman::Result::Ok));
+    CHECK(read_ram(fs, (std::string(kMenu) + "/Single App.lnk").c_str()) == "theirs" && exists(fs, (std::string(kMenu) + "/Single App (Test.Single).lnk").c_str()));
+    CHECK(run(installer.remove("Test.Single", &detail), appman::Result::Ok));
+    CHECK(read_ram(fs, (std::string(kMenu) + "/Single App.lnk").c_str()) == "theirs" && !exists(fs, (std::string(kMenu) + "/Single App (Test.Single).lnk").c_str()));
+
+    // Remove: the folder and the shortcuts.
+    CHECK(run(installer.remove("Test.Zipped", &detail), appman::Result::Ok));
+    CHECK(!exists(fs, suite_dir.c_str()) && !exists(fs, (std::string(kMenu) + "/alpha.lnk").c_str()) && !exists(fs, (std::string(kMenu) + "/beta.lnk").c_str()));
+    CHECK(!installer.installed("Test.Zipped") && run(installer.remove("Test.Zipped", &detail), appman::Result::NotInstalled));
+    CHECK(run(installer.remove("../../Windows", &detail), appman::Result::InvalidName) && exists(fs, "/Windows/Program Files"));
+    CHECK(exists(fs, (std::string(kMenu) + "/Portable Tool.lnk").c_str()));      // (the others' stay)
+
+    // Refusals, none of which leaves anything behind.
+    auto nothing_left = [&](const char* id) { return !exists(fs, (std::string(kPackages) + "/" + id + "_Microsoft.Winget.Source_8wekyb3d8bbwe").c_str()) && !installer.installed(id); };
+    CHECK(run(installer.install(package("Test.Setup"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("Inno Setup") && nothing_left("Test.Setup"));
+    CHECK(net.downloaded.empty() || net.downloaded.back() != "https://example.org/dl/setup-9.0.exe");      // (not even downloaded)
+    CHECK(run(installer.install(package("Test.ArmOnly"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("this kind of computer") && nothing_left("Test.ArmOnly"));
+    CHECK(run(installer.install(package("Test.BadSum"), &progress, &detail), appman::Result::BadChecksum) && nothing_left("Test.BadSum"));
+    CHECK(run(installer.install(package("Test.Evil"), &progress, &detail), appman::Result::NotAnAppImage) && detail.view().contains("not safe") && nothing_left("Test.Evil"));
+    CHECK(!exists(fs, (std::string(kPackages) + "/evil.exe").c_str()) && !exists(fs, "/Windows/Program Files/WinGet/evil.exe"));
+    CHECK(run(installer.install(package("Test.NotPe"), &progress, &detail), appman::Result::NotAnAppImage) && detail.view().contains("not a Windows program") && nothing_left("Test.NotPe"));
+    // A version list or a manifest that is not the one named by what came before it.
+    appman::WingetPackage forged(a);
+    CHECK(forged.copy_from(package("Test.Zipped")));
+    std::string list_url, manifest_url;
+    for (const auto& page : net.pages) {
+      if (page.first.find("packages/Test.Zipped/") != std::string::npos) list_url = page.first;
+      if (page.first.find("manifests/t/Test/Zipped/") != std::string::npos) manifest_url = page.first;
+    }
+    const std::string good_list = net.pages[list_url], good_manifest = net.pages[manifest_url];
+    net.pages[list_url][40] ^= 1;
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::NoManifest) && detail.view().contains("list of versions") && nothing_left("Test.Zipped"));
+    net.pages[list_url] = good_list;
+    net.pages[manifest_url] += "# changed\n";
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::NoManifest) && detail.view().contains("manifest is not the one") && nothing_left("Test.Zipped"));
+    net.pages[manifest_url] = good_manifest;
+    net.pages.erase(manifest_url);
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::NoManifest) && nothing_left("Test.Zipped"));
+    net.pages[manifest_url] = good_manifest;
+    // No such download; a cancelled first install.
+    const std::string zip_url = "https://example.org/dl/suite-3.1.zip", zip = net.files[zip_url];
+    net.files.erase(zip_url);
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::DownloadFailed) && nothing_left("Test.Zipped"));
+    net.files[zip_url] = zip;
+    net.cancel_after_first = &progress;
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::Cancelled) && nothing_left("Test.Zipped"));
+    net.cancel_after_first = nullptr;
+    progress.cancel = false;
+    // An archive that is damaged after all (the checksum is the manifest's, so the manifest is "wrong" here: the download is cut short).
+    CHECK(run(installer.update(forged, &progress, &detail), appman::Result::NotInstalled));
+    // A record someone edited cannot make Remove delete something else.
+    CHECK(run(installer.install(forged, &progress, &detail), appman::Result::Ok));
+    {
+      UniquePointer<IFile> f;
+      uint64_t done = 0;
+      const std::string edited = "PackageIdentifier: Test.Zipped\nPackageVersion: 3.1\nShortcut: ../../../../Program Files/WinGet/Packages/Test.Portable_Microsoft.Winget.Source_8wekyb3d8bbwe/ptool.exe\nShortcut: Portable Tool.lnk\n";
+      CHECK(fs.open_file((suite_dir + "/winget-install.txt").c_str(), OpenMode::CreateTruncate, &f) == Status::Ok && f->write(0, data_of(edited), &done) == Status::Ok);
+    }
+    CHECK(run(installer.remove("Test.Zipped", &detail), appman::Result::Ok) && exists(fs, (tool_dir + "/ptool.exe").c_str()));
+
+    // A full disk.
+    RamFileSystem tiny(a, 600);
+    for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData"}) (void)tiny.create_directory(d);
+    appman::WingetInstaller cramped(a, tiny, net);
+    const appman::Result full = cramped.install(package("Test.Zipped"), &progress, &detail);
+    CHECK(full == appman::Result::FileError && !cramped.installed("Test.Zipped"));
+  }
+  CHECK(a.live == 0);
+}
+
+// With WINGET_SOURCE naming a copy of the real https://cdn.winget.microsoft.com/cache/source2.msix: the real index is read.
+static void test_real_winget_source() {
+  const char* path = getenv("WINGET_SOURCE");
+  if (!path) return;
+  std::string msix;
+  FILE* f = fopen(path, "rb");
+  char buf[65536];
+  size_t n;
+  while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0) msix.append(buf, n);
+  if (f) fclose(f);
+  TestAllocator a;
+  {
+    appman::WingetCatalog catalog(a);
+    CHECK(catalog.parse_index(data_of(msix)));
+    printf("  the real source: %llu packages\n", (unsigned long long)catalog.count());
+    CHECK(catalog.count() > 5000 && catalog.find("Microsoft.PowerToys") && catalog.find("jqlang.jq"));
+    String list(a);
+    appman::WingetCatalog again(a);
+    CHECK(catalog.write_list(&list) && again.parse_list(list.view()) && again.count() == catalog.count());
+  }
+  CHECK(a.live == 0);
+}
+
 // ------------------------------------------------------------------ real install scripts (tests/appman_interop.sh)
 // curl answered from files in `cache`: the URL with every character other than a letter or a digit made "_", at most 200 of them (as the script's curl
 // stand-in for bash names them).
@@ -478,7 +973,88 @@ static int resolve_real(const char* script_path, const char* cache) {
   return 0;
 }
 
+// ------------------------------------------------------------------ the real winget source (tests/winget_interop.sh)
+// The network, by this machine's curl (run directly, never through a shell: the addresses come from the catalog).
+struct CurlNetwork final : appman::INetwork {
+  static bool run(const std::string& url, std::string* out) {
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    const pid_t child = fork();
+    if (child == 0) {
+      dup2(fds[1], 1);
+      close(fds[0]);
+      close(fds[1]);
+      execlp("curl", "curl", "-sfL", "--max-time", "300", "--", url.c_str(), static_cast<char*>(nullptr));
+      _exit(127);
+    }
+    close(fds[1]);
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0) out->append(buf, size_t(n));
+    close(fds[0]);
+    int status = 0;
+    return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  }
+  bool fetch(StringView url, uint64_t max_bytes, String* body) override {
+    std::string out;
+    return run(sv(url), &out) && out.size() <= max_bytes && body->assign(view(out));
+  }
+  bool download(StringView url, Sink sink, void* context, uint64_t* total) override {
+    std::string out;
+    if (!run(sv(url), &out)) return false;
+    *total = out.size();
+    for (size_t at = 0; at < out.size(); at += 65536)
+      if (!sink(context, ConstByteView(reinterpret_cast<const uint8_t*>(out.data() + at), std::min<size_t>(65536, out.size() - at)))) return false;
+    return true;
+  }
+};
+
+// Reads the real source at `source`, then for each identifier: the manifest of its latest version (checked against the index, as an install does),
+// which installer would be taken, and - with `install` - the install itself, into a RAM file system, with what the Start menu then lists.
+static int winget_real(const char* source, bool install, int count, char** ids) {
+  std::string msix;
+  FILE* f = fopen(source, "rb");
+  char buf[65536];
+  size_t n;
+  while (f && (n = fread(buf, 1, sizeof(buf), f)) > 0) msix.append(buf, n);
+  if (f) fclose(f);
+  TestAllocator a;
+  int failed = 0;
+  {
+    appman::WingetCatalog catalog(a);
+    if (!catalog.parse_index(data_of(msix))) { printf("the source could not be read\n"); return 1; }
+    printf("%llu packages\n", (unsigned long long)catalog.count());
+    RamFileSystem fs(a);
+    for (const char* d : {"/Windows", "/Windows/Program Files", "/Windows/ProgramData"}) (void)fs.create_directory(d);
+    CurlNetwork net;
+    appman::WingetInstaller installer(a, fs, net);
+    for (int i = 0; i < count; ++i) {
+      const appman::WingetPackage* package = catalog.find(ids[i]);
+      if (!package) { printf("%s: not in the catalog\n", ids[i]); ++failed; continue; }
+      appman::WingetManifest manifest(a);
+      String detail(a), why(a);
+      const appman::Result resolved = installer.resolve(*package, &manifest, &detail);
+      if (resolved != appman::Result::Ok) { printf("%s: %s (%s)\n", ids[i], sv(appman::result_name(resolved)).c_str(), sv(detail.view()).c_str()); ++failed; continue; }
+      const appman::WingetInstallerEntry* entry = appman::WingetInstaller::choose_installer(manifest, &why);
+      printf("%s %s \"%s\": %llu installers; %s\n", sv(manifest.id.view()).c_str(), sv(manifest.version.view()).c_str(), sv(manifest.name.view()).c_str(),
+             (unsigned long long)manifest.installers.count(), entry ? (sv(entry->type.view()) + " " + sv(entry->architecture.view()) + " " + sv(entry->url.view())).c_str() : sv(why.view()).c_str());
+      if (!install || !entry) continue;
+      appman::Progress progress;
+      const appman::Result r = installer.install(*package, &progress, &detail);
+      printf("  install: %s %s (%llu bytes)\n", sv(appman::result_name(r)).c_str(), sv(detail.view()).c_str(), (unsigned long long)progress.done);
+      if (r != appman::Result::Ok) { ++failed; continue; }
+      List<InstalledApp> apps(a);
+      if (find_installed_apps(fs, a, &apps))
+        for (const InstalledApp& app : apps.view()) printf("  start menu: %s -> %s\n", sv(app.label.view()).c_str(), sv(app.program.view()).c_str());
+      if (installer.remove(package->id.view(), &detail) != appman::Result::Ok) { printf("  remove failed\n"); ++failed; }
+    }
+  }
+  if (a.live != 0) { printf("leak\n"); ++failed; }
+  return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 3 && (std::string(argv[1]) == "--winget" || std::string(argv[1]) == "--winget-install")) return winget_real(argv[2], std::string(argv[1]) == "--winget-install", argc - 3, argv + 3);
   if (argc == 4 && std::string(argv[1]) == "--resolve") return resolve_real(argv[2], argv[3]);
   if (argc == 3 && std::string(argv[1]) == "--lines") return resolve_real(argv[2], nullptr);
   printf("pipelines\n");
@@ -491,6 +1067,17 @@ int main(int argc, char** argv) {
   test_download_lines();
   printf("installer\n");
   test_installer();
+  printf("zip archives\n");
+  test_zip();
+  printf("winget: the index\n");
+  test_sqlite_and_catalog();
+  printf("winget: YAML\n");
+  test_yaml();
+  printf("winget: version lists, manifests, shortcuts\n");
+  test_winget_manifests();
+  printf("winget: installer\n");
+  test_winget_installer();
+  test_real_winget_source();
   printf(g_failed ? "AppManTest: %d of %d checks FAILED\n" : "AppManTest: all %d checks passed\n", g_failed ? g_failed : g_checks, g_checks);
   return g_failed ? 1 : 0;
 }

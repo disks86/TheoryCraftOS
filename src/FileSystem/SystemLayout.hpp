@@ -70,6 +70,10 @@ inline constexpr const char* kAppManFolder = "/AppStore/AppMan";
 inline constexpr const char* kAppManCatalog = "/AppStore/AppMan/stats-appimages";
 inline constexpr const char* kLinuxOpt = "/Linux/opt";
 inline constexpr const char* kLinuxLocalBin = "/Linux/usr/local/bin";
+// Its copy of winget's package list (the Windows applications, src/Desktop/AppMan/WingetCatalog.hpp), and where it installs those: winget's own folder for
+// portable packages installed for every user, C:\Program Files\WinGet\Packages\<PackageIdentifier>_<source>, with a shortcut in the Start menu.
+inline constexpr const char* kWingetCatalog = "/AppStore/AppMan/winget-packages";
+inline constexpr const char* kWindowsWingetPackages = "/Windows/Program Files/WinGet/Packages";
 
 // The Thunderbolt driver's one-time keys, one file of 32 bytes per device named by its UUID in hex (the "Thunderbolt" application's folder in the AppStore).
 inline constexpr const char* kThunderboltKeys = "/AppStore/Thunderbolt/Keys";

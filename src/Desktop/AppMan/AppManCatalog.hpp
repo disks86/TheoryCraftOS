@@ -59,8 +59,9 @@ class Catalog {
   // The entry of that name, or nullptr.
   const CatalogEntry* find(StringView name) const;
   // The entries whose name or description contains every word of `query` (any case), in name order, best first: names that start with the query, then
-  // names that contain it, then the rest. At most `limit` indices; *total gets how many matched in all.
-  bool search(StringView query, uint64_t limit, List<uint64_t>* indices, uint64_t* total) const;
+  // names that contain it, then the rest (tiers 0, 1 and 2). At most `limit` indices, with the tier of each in `tiers` if that is not null; *total gets
+  // how many matched in all.
+  bool search(StringView query, uint64_t limit, List<uint64_t>* indices, uint64_t* total, List<uint8_t>* tiers = nullptr) const;
 
  private:
   allocators::IAllocator& allocator_;

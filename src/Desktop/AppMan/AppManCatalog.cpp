@@ -115,8 +115,9 @@ const CatalogEntry* Catalog::find(StringView name) const {
   return nullptr;
 }
 
-bool Catalog::search(StringView query, uint64_t limit, List<uint64_t>* indices, uint64_t* total) const {
+bool Catalog::search(StringView query, uint64_t limit, List<uint64_t>* indices, uint64_t* total, List<uint8_t>* tier_of) const {
   indices->clear();
+  if (tier_of) tier_of->clear();
   *total = 0;
   query = query.trimmed();
   List<uint64_t> tiers[3] = {List<uint64_t>(allocator_), List<uint64_t>(allocator_), List<uint64_t>(allocator_)};
@@ -134,10 +135,10 @@ bool Catalog::search(StringView query, uint64_t limit, List<uint64_t>* indices, 
     const int tier = query.empty() ? 0 : contains_folded(e.name.view(), query, &at) ? (at == 0 ? 0 : 1) : 2;
     if (!tiers[tier].push_back(i)) return false;
   }
-  for (const List<uint64_t>& tier : tiers)
-    for (const uint64_t i : tier.view()) {
+  for (uint8_t tier = 0; tier < 3; ++tier)
+    for (const uint64_t i : tiers[tier].view()) {
       if (indices->count() >= limit) return true;
-      if (!indices->push_back(i)) return false;
+      if (!indices->push_back(i) || (tier_of && !tier_of->push_back(tier))) return false;
     }
   return true;
 }

@@ -16,13 +16,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// The App Manager: the AppImage package manager of the desktop, over AppMan's catalog (https://github.com/ivan-hc/AM). It lists the AppImages AppMan
-// knows (about 9000), finds them by name or description as you type, and installs, updates and removes them in the Linux world, where the Start menu
-// then lists them ("Name (Linux)") and they run as AppImages do (src/Program/AppImageLaunch.hpp). "Show" narrows the list to the installed programs.
+// The App Manager: the package manager of the desktop, for the applications of both worlds in one list. The ones for Linux are the AppImages of AppMan's
+// catalog (https://github.com/ivan-hc/AM, about 9000), the ones for Windows the packages of winget's (https://github.com/microsoft/winget-pkgs, about
+// 16000); the Type column says which a row is. It finds them by name or description as you type, and installs, updates and removes them in the Linux
+// world (AppMan/AppManInstaller.hpp) or the Windows world (AppMan/WingetInstaller.hpp), where the Start menu then lists them ("Name (Linux)",
+// "Name (Windows)"). "Show" narrows the list to the installed programs, or to one of the two kinds.
 //
 // The work happens on a thread of its own (a download can take minutes; the window stays usable and Cancel stops it), one job at a time. The catalog
-// is kept in /AppStore/AppMan (so the list is there at once next time; "Refresh list" fetches it again); the programs go where AppMan puts them
-// (AppMan/AppManInstaller.hpp). Like every program window it can be a tab of a tabbed window.
+// of each kind is kept in /AppStore/AppMan (so the list is there at once next time; "Refresh list" fetches both again); the programs go where AppMan
+// and winget put them. Like every program window it can be a tab of a tabbed window.
 //
 // Every command is in the menu bar (File, View, Application, Help) as well as on a button, and the commands of an application are in the
 // context menu of the list. What cannot be done now is unavailable. Remove deletes an application's files, so it asks first and Cancel is the
@@ -31,6 +33,9 @@
 #pragma once
 #include "Desktop/AppMan/AppManCatalog.hpp"
 #include "Desktop/AppMan/AppManInstaller.hpp"
+#include "Desktop/AppMan/WingetCatalog.hpp"
+#include "Desktop/AppMan/WingetInstaller.hpp"
+#include "Desktop/InstalledApps.hpp"
 #include "Desktop/HandlerThread.hpp"
 #include "FileSystem/IFileSystem.hpp"
 #include "Gui/Controls/Button.hpp"
@@ -50,7 +55,7 @@ namespace desktop {
 
 class AppManager : public gui::Frame {
  public:
-  enum Filter : int32_t { kShowAll, kShowInstalled };
+  enum Filter : int32_t { kShowAll, kShowInstalled, kShowLinux, kShowWindows };
   static constexpr uint64_t kMaxRows = 400;      // (the list shows the best matches; typing narrows it)
 
   explicit AppManager(allocators::IAllocator& allocator);
@@ -78,10 +83,14 @@ class AppManager : public gui::Frame {
   // What the window shows.
   StringView status() const { return status_.text(); }
   StringView details() const { return details_.text(); }
-  uint64_t catalog_count() const;
+  uint64_t catalog_count() const;      // of both kinds
+  uint64_t linux_count() const;
+  uint64_t windows_count() const;
   bool busy() const { return __atomic_load_n(&busy_, __ATOMIC_ACQUIRE); }
-  // The application of a row of the list ("" if none).
+  // The application of a row of the list: its name in AppMan's catalog, or its identifier in winget's. False if there is no such row.
   bool row_name(int32_t row, String* out) const;
+  // Which kind of application the row is. False if there is no such row.
+  bool row_platform(int32_t row, AppPlatform* out) const;
   gui::ListView& list() { return list_; }
   gui::TextBox& search_box() { return search_; }
   gui::DropDown& show_box() { return show_; }
@@ -112,27 +121,31 @@ class AppManager : public gui::Frame {
   static void on_refresh(void* self, gui::Control&);
   static void on_exit(void* self, gui::Control&);
   static void on_installed_only(void* self, gui::Control&);
+  static void on_linux_only(void* self, gui::Control&);
+  static void on_windows_only(void* self, gui::Control&);
   static void on_about(void* self, gui::Control&);
   static void on_remove_answer(void* self, gui::Control&);
   void report(gui::NoticeKind kind, StringView text);   // a result the user must not miss
   static void run_job(void* self, gui::Control&);
   static void on_progress(void* self, const appman::Progress& progress);
 
-  bool start(Job job, StringView name);
+  bool start(Job job, AppPlatform platform, StringView name);
+  bool start_selected(Job job);
   bool load_cached_catalog();
   void reload_installed();
   void rebuild();            // the list from the catalog, the query and the filter
   void update_controls();    // the details line and the buttons, for the chosen row
-  bool is_installed(StringView name) const;      // (state_mutex_ held)
+  bool is_installed(AppPlatform platform, StringView name) const;      // (state_mutex_ held)
   void say(StringView text) { status_.set_text(text); }
 
   allocators::IAllocator& allocator_;
   gui::MenuBar menu_;
   gui::ContextMenu list_menu_;
-  gui::MenuItem *installed_only_item_ = nullptr, *refresh_item_ = nullptr, *install_item_ = nullptr, *update_item_ = nullptr, *remove_item_ = nullptr,
+  gui::MenuItem *installed_only_item_ = nullptr, *linux_only_item_ = nullptr, *windows_only_item_ = nullptr, *refresh_item_ = nullptr, *install_item_ = nullptr, *update_item_ = nullptr, *remove_item_ = nullptr,
                 *cancel_item_ = nullptr, *about_item_ = nullptr, *list_install_item_ = nullptr, *list_update_item_ = nullptr, *list_remove_item_ = nullptr;
   gui::MessageDialog ask_;                      // "Remove <name>?"
   String remove_name_;                          // the application the question is about
+  AppPlatform remove_platform_ = AppPlatform::Linux;
   gui::NoticeDialog* notices_ = nullptr;
   gui::Label search_label_, show_label_, details_, status_;
   gui::TextBox search_;
@@ -144,15 +157,27 @@ class AppManager : public gui::Frame {
   filesystem::IFileSystem* files_ = nullptr;
   appman::INetwork* network_ = nullptr;
   UniquePointer<appman::Installer> installer_;
+  UniquePointer<appman::WingetInstaller> windows_installer_;
 
   // What the worker thread and the controls share. Lock order: the UI lock (UiGuard) before state_mutex_, never the other way round.
   mutable kernel::Mutex state_mutex_;
-  appman::Catalog catalog_;                     // (state_mutex_)
+  // A row of the list: which catalog it is of, and its name there (AppMan's name, winget's identifier).
+  struct RowKey {
+    explicit RowKey(allocators::IAllocator& allocator) : id(allocator) {}
+    RowKey(RowKey&&) = default;
+    RowKey& operator=(RowKey&&) = default;
+    AppPlatform platform = AppPlatform::Linux;
+    String id;
+  };
+  appman::Catalog catalog_;                     // (state_mutex_) the applications for Linux
+  appman::WingetCatalog windows_catalog_;       // (state_mutex_) the applications for Windows
   List<appman::InstalledApp> installed_;        // (state_mutex_) by name
-  List<String> rows_;                           // (state_mutex_) the application of each row of the list
+  List<appman::WingetInstalled> windows_installed_;      // (state_mutex_) by name
+  List<RowKey> rows_;                           // (state_mutex_) the application of each row of the list
   String query_;                                // (state_mutex_)
   Job job_ = Job::None;                         // (state_mutex_) the job the worker is to run, and for what
   String job_name_;                             // (state_mutex_)
+  AppPlatform job_platform_ = AppPlatform::Linux;      // (state_mutex_)
   appman::Progress progress_state_;
   bool busy_ = false;
   HandlerThread worker_;                        // (last: stopped first when the window goes)

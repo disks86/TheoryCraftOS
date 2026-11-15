@@ -46,7 +46,8 @@ Rect2D rect(int32_t x, int32_t y, int32_t width, int32_t height) {
 
 // "\"name\" could not be installed because <why>." - one whole sentence per job, with what to try where that is known.
 const char* failure_pattern(bool install, bool update, appman::Result result) {
-  const bool network = result == appman::Result::NoScript || result == appman::Result::NoDownload || result == appman::Result::DownloadFailed;
+  const bool network = result == appman::Result::NoScript || result == appman::Result::NoDownload || result == appman::Result::DownloadFailed ||
+                       result == appman::Result::NoManifest;
   if (install) return network ? "\"%1\" could not be installed because %2. Check the network connection and try again." : "\"%1\" could not be installed because %2.";
   if (update) return network ? "\"%1\" could not be updated because %2. Check the network connection and try again." : "\"%1\" could not be updated because %2.";
   return "\"%1\" could not be removed because %2.";
@@ -58,12 +59,35 @@ bool append_megabytes(String* out, uint64_t bytes) {
   return out->append_uint(tenths / 10) && out->push_back('.') && out->append_uint(tenths % 10) && out->append(" MB");
 }
 
+// The whole file at `path` (at most `limit` bytes). False if it is not there, is empty or larger, or cannot be read.
+bool read_whole(filesystem::IFileSystem& files, StringView path, uint64_t limit, ByteBuffer* bytes) {
+  UniquePointer<filesystem::IFile> file;
+  if (files.open_file(path, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
+  const uint64_t size = file->size();
+  if (size == 0 || size > limit || !bytes->put_zeros(size)) return false;
+  uint64_t done = 0;
+  while (done < size) {
+    uint64_t got = 0;
+    if (file->read(done, bytes->writable_view().subview(done), &got) != filesystem::Status::Ok || got == 0) return false;
+    done += got;
+  }
+  return true;
+}
+
+// Keeps `text` in the file at `path` of the App Manager's folder for next time (best effort).
+void keep_file(filesystem::IFileSystem& files, allocators::IAllocator& allocator, const char* path, StringView text) {
+  (void)filesystem::layout::create_app_folder(files, "AppMan", allocator);
+  UniquePointer<filesystem::IFile> file;
+  uint64_t written = 0;
+  if (files.open_file(path, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok) (void)file->write(0, text.bytes(), &written);
+}
+
 }  // namespace
 
 AppManager::AppManager(allocators::IAllocator& allocator)
     : Frame(allocator), allocator_(allocator), menu_(allocator), list_menu_(allocator), ask_(allocator), remove_name_(allocator), search_label_(allocator), show_label_(allocator), details_(allocator), status_(allocator), search_(allocator),
       show_(allocator), refresh_(allocator), install_(allocator), update_(allocator), remove_(allocator), cancel_(allocator), list_(allocator), progress_(allocator),
-      catalog_(allocator), installed_(allocator), rows_(allocator), query_(allocator), job_name_(allocator), worker_(allocator) {
+      catalog_(allocator), windows_catalog_(allocator), installed_(allocator), windows_installed_(allocator), rows_(allocator), query_(allocator), job_name_(allocator), worker_(allocator) {
   set_title("App Manager");
   set_bounds({120, 50, 760, 540});
   set_padding(Insets::all(6));
@@ -73,6 +97,8 @@ AppManager::AppManager(allocators::IAllocator& allocator)
   if (Menu* file = menu_.add_menu("File")) file->add_item("Exit", {&AppManager::on_exit, this});
   if (Menu* view = menu_.add_menu("View")) {
     installed_only_item_ = view->add_item("Installed Only", {&AppManager::on_installed_only, this});
+    linux_only_item_ = view->add_item("For Linux Only", {&AppManager::on_linux_only, this});
+    windows_only_item_ = view->add_item("For Windows Only", {&AppManager::on_windows_only, this});
     view->add_separator();
     refresh_item_ = view->add_item("Refresh List", {&AppManager::on_refresh, this}, "F5");
   }
@@ -95,6 +121,8 @@ AppManager::AppManager(allocators::IAllocator& allocator)
   show_label_.set_text("Show:");
   show_.add_item("All applications");
   show_.add_item("Installed");
+  show_.add_item("For Linux");
+  show_.add_item("For Windows");
   show_.set_selected_index(kShowAll);
   refresh_.set_text("Refresh List");
   install_.set_text("Install");
@@ -103,8 +131,9 @@ AppManager::AppManager(allocators::IAllocator& allocator)
   cancel_.set_text("Cancel");
   search_.set_max_length(200);
   list_.add_column("Application", 170);
-  list_.add_column("Description", 420);
-  list_.add_column("Status", 100);
+  list_.add_column("Type", 70);
+  list_.add_column("Description", 340);
+  list_.add_column("Status", 110);
   list_.set_view_mode(ViewMode::Details);
   list_.set_copy_enabled(false);
   progress_.set_maximum(100);
@@ -122,7 +151,7 @@ AppManager::AppManager(allocators::IAllocator& allocator)
   // (in reading order: that is the order Tab takes)
   Control* const parts[] = {&menu_, &search_label_, &search_, &show_label_, &show_, &refresh_, &list_, &details_, &install_, &update_, &remove_, &cancel_, &progress_, &status_};
   for (Control* part : parts) add(part);
-  say("Applications for Linux from the AppMan list. The list is fetched when the network is available.");
+  say("Applications for Linux (the AppMan list) and for Windows (the winget list). The lists are fetched when the network is available.");
   update_controls();
 }
 
@@ -137,6 +166,7 @@ void AppManager::set_services(filesystem::IFileSystem* files, appman::INetwork* 
     files_ = files;
     network_ = network;
     installer_ = files && network ? UniquePointer<appman::Installer>::make(allocator_, allocator_, *files, *network) : UniquePointer<appman::Installer>();
+    windows_installer_ = files && network ? UniquePointer<appman::WingetInstaller>::make(allocator_, allocator_, *files, *network) : UniquePointer<appman::WingetInstaller>();
   }
   reload_installed();
   if (!load_cached_catalog() && network) refresh_catalog();
@@ -145,108 +175,181 @@ void AppManager::set_services(filesystem::IFileSystem* files, appman::INetwork* 
 
 uint64_t AppManager::catalog_count() const {
   kernel::ScopedMutex lock(state_mutex_);
+  return catalog_.count() + windows_catalog_.count();
+}
+
+uint64_t AppManager::linux_count() const {
+  kernel::ScopedMutex lock(state_mutex_);
   return catalog_.count();
+}
+
+uint64_t AppManager::windows_count() const {
+  kernel::ScopedMutex lock(state_mutex_);
+  return windows_catalog_.count();
 }
 
 bool AppManager::row_name(int32_t row, String* out) const {
   kernel::ScopedMutex lock(state_mutex_);
   if (row < 0 || uint64_t(row) >= rows_.count()) return false;
-  return out->assign(rows_.view()[uint64_t(row)].view());
+  return out->assign(rows_.view()[uint64_t(row)].id.view());
 }
 
-bool AppManager::is_installed(StringView name) const {
+bool AppManager::row_platform(int32_t row, AppPlatform* out) const {
+  kernel::ScopedMutex lock(state_mutex_);
+  if (row < 0 || uint64_t(row) >= rows_.count()) return false;
+  *out = rows_.view()[uint64_t(row)].platform;
+  return true;
+}
+
+bool AppManager::is_installed(AppPlatform platform, StringView name) const {
+  if (platform == AppPlatform::Windows) {
+    for (const appman::WingetInstalled& app : windows_installed_.view())
+      if (appman::compare_folded(app.id.view(), name) == 0) return true;
+    return false;
+  }
   for (const appman::InstalledApp& app : installed_.view())
     if (app.name.view().equals(name)) return true;
   return false;
 }
 
+// The lists kept from last time. False unless both are there (the one that is missing is then fetched).
 bool AppManager::load_cached_catalog() {
   if (!files_) return false;
-  UniquePointer<filesystem::IFile> file;
-  if (files_->open_file(filesystem::layout::kAppManCatalog, filesystem::OpenMode::Read, &file) != filesystem::Status::Ok) return false;
-  const uint64_t size = file->size();
-  if (size == 0 || size > appman::kMaxCatalogBytes) return false;
-  ByteBuffer bytes(allocator_);
-  if (!bytes.put_zeros(size)) return false;
-  uint64_t done = 0;
-  while (done < size) {
-    uint64_t got = 0;
-    if (file->read(done, bytes.writable_view().subview(done), &got) != filesystem::Status::Ok || got == 0) return false;
-    done += got;
+  bool have_linux = false, have_windows = false;
+  {
+    ByteBuffer bytes(allocator_);
+    appman::Catalog fresh(allocator_);
+    if (read_whole(*files_, filesystem::layout::kAppManCatalog, appman::kMaxCatalogBytes, &bytes) && fresh.parse(StringView(bytes.view()))) {
+      kernel::ScopedMutex lock(state_mutex_);
+      have_linux = catalog_.take(fresh);
+    }
   }
-  appman::Catalog fresh(allocator_);
-  if (!fresh.parse(StringView(bytes.view()))) return false;
-  kernel::ScopedMutex lock(state_mutex_);
-  return catalog_.take(fresh);
+  {
+    ByteBuffer bytes(allocator_);
+    appman::WingetCatalog fresh(allocator_);
+    if (read_whole(*files_, filesystem::layout::kWingetCatalog, appman::kMaxWingetListBytes, &bytes) && fresh.parse_list(StringView(bytes.view()))) {
+      kernel::ScopedMutex lock(state_mutex_);
+      have_windows = windows_catalog_.take(fresh);
+    }
+  }
+  return have_linux && have_windows;
 }
 
 void AppManager::reload_installed() {
   List<appman::InstalledApp> found(allocator_);
-  if (installer_ && !installer_->list_installed(&found)) return;
+  List<appman::WingetInstalled> windows_found(allocator_);
+  const bool have = !installer_ || installer_->list_installed(&found);
+  const bool have_windows = !windows_installer_ || windows_installer_->list_installed(&windows_found);
   kernel::ScopedMutex lock(state_mutex_);
-  move_list(installed_, found);
+  if (have) move_list(installed_, found);
+  if (have_windows) move_list(windows_installed_, windows_found);
 }
 
 namespace {
 // A row of the list, gathered under the state lock and shown after it (a control's handlers may run at once and take the lock themselves).
 struct Row {
-  explicit Row(allocators::IAllocator& allocator) : name(allocator), description(allocator) {}
-  String name, description;
-  bool installed = false;
+  explicit Row(allocators::IAllocator& allocator) : id(allocator), name(allocator), description(allocator) {}
+  Row(Row&&) = default;
+  Row& operator=(Row&&) = default;
+  AppPlatform platform = AppPlatform::Linux;
+  String id, name, description;
+  StringView status;      // (a literal)
 };
 }  // namespace
 
 void AppManager::rebuild() {
   UiGuard lock(this);
-  List<String> names(allocator_);
+  List<RowKey> keys(allocator_);
   List<Row> rows(allocator_);
-  uint64_t total = 0;
-  const bool only_installed = show_.selected_index() == kShowInstalled;
+  uint64_t total = 0, count = 0;
+  const int32_t filter = show_.selected_index();
+  const bool only_installed = filter == kShowInstalled, want_linux = filter != kShowWindows, want_windows = filter != kShowLinux;
   {
     kernel::ScopedMutex state(state_mutex_);
-    auto add_row = [&](StringView name, StringView description) {
+    count = (want_linux ? catalog_.count() : 0) + (want_windows ? windows_catalog_.count() : 0);
+    auto add_row = [&](AppPlatform platform, StringView id, StringView name, StringView description, StringView status) {
       Row row(allocator_);
-      String copy(allocator_);
-      if (!row.name.assign(name) || !row.description.assign(description) || !copy.assign(name)) return false;
-      row.installed = is_installed(name);
-      return rows.push_back(util::move(row)) && names.push_back(util::move(copy));
+      RowKey key(allocator_);
+      row.platform = key.platform = platform;
+      row.status = status;
+      if (!row.id.assign(id) || !row.name.assign(name) || !row.description.assign(description) || !key.id.assign(id)) return false;
+      return rows.push_back(util::move(row)) && keys.push_back(util::move(key));
+    };
+    auto add_linux = [&](const appman::CatalogEntry& entry) {
+      return add_row(AppPlatform::Linux, entry.name.view(), entry.name.view(), entry.description.view(), is_installed(AppPlatform::Linux, entry.name.view()) ? "Installed" : "");
+    };
+    // "jqlang.jq, version 1.8.2": winget's list has no descriptions, so the row says which package it is.
+    auto add_windows = [&](const appman::WingetPackage& package) {
+      String description(allocator_);
+      format_message(&description, "%1, version %2", package.id.view(), package.version.view());
+      StringView status;
+      for (const appman::WingetInstalled& app : windows_installed_.view())
+        if (appman::compare_folded(app.id.view(), package.id.view()) == 0) status = app.version.view().equals(package.version.view()) ? "Installed" : "Update available";
+      return add_row(AppPlatform::Windows, package.id.view(), package.name.view(), description.view(), status);
+    };
+    auto matches = [&](StringView name, StringView more) {
+      StringView words = query_.view(), word;
+      while (words.next_token(' ', &word))
+        if (!word.empty() && !appman::contains_folded(name, word) && !appman::contains_folded(more, word)) return false;
+      return true;
     };
     if (only_installed) {
-      for (const appman::InstalledApp& app : installed_.view()) {
-        const appman::CatalogEntry* entry = catalog_.find(app.name.view());
-        const StringView description = entry ? entry->description.view() : StringView("(not in the list any more)");
-        bool matches = true;
-        StringView words = query_.view(), word;
-        while (matches && words.next_token(' ', &word)) {
-          if (word.empty()) continue;
-          matches = app.name.view().contains(word) || description.contains(word);
+      // Both kinds by name, as the two lists are.
+      uint64_t l = 0, w = 0;
+      const ArrayView<const appman::InstalledApp> linux_apps = static_cast<const List<appman::InstalledApp>&>(installed_).view();
+      const ArrayView<const appman::WingetInstalled> windows_apps = static_cast<const List<appman::WingetInstalled>&>(windows_installed_).view();
+      while (l < linux_apps.size() || w < windows_apps.size()) {
+        const bool take_linux = w >= windows_apps.size() || (l < linux_apps.size() && appman::compare_folded(linux_apps[l].name.view(), windows_apps[w].name.view()) <= 0);
+        if (take_linux) {
+          const appman::InstalledApp& app = linux_apps[l++];
+          const appman::CatalogEntry* entry = catalog_.find(app.name.view());
+          const StringView description = entry ? entry->description.view() : StringView("(not in the list any more)");
+          if (!matches(app.name.view(), description)) continue;
+          ++total;
+          if (!add_row(AppPlatform::Linux, app.name.view(), app.name.view(), description, "Installed")) break;
+        } else {
+          const appman::WingetInstalled& app = windows_apps[w++];
+          const appman::WingetPackage* package = windows_catalog_.find(app.id.view());
+          String description(allocator_);
+          format_message(&description, "%1, version %2", app.id.view(), app.version.view());
+          if (!matches(app.name.view(), description.view())) continue;
+          ++total;
+          if (!add_row(AppPlatform::Windows, app.id.view(), app.name.view(), description.view(), package && !package->version.view().equals(app.version.view()) ? "Update available" : "Installed"))
+            break;
         }
-        if (!matches) continue;
-        ++total;
-        if (!add_row(app.name.view(), description)) break;
       }
     } else {
-      List<uint64_t> found(allocator_);
-      if (catalog_.search(query_.view(), kMaxRows, &found, &total)) {
-        for (const uint64_t i : found.view())
-          if (!add_row(catalog_.at(i).name.view(), catalog_.at(i).description.view())) break;
+      // The best matches of each catalog, merged: better matches first, by name among equals.
+      List<uint64_t> linux_found(allocator_), windows_found(allocator_);
+      List<uint8_t> linux_tiers(allocator_), windows_tiers(allocator_);
+      uint64_t linux_total = 0, windows_total = 0;
+      const bool ok = (!want_linux || catalog_.search(query_.view(), kMaxRows, &linux_found, &linux_total, &linux_tiers)) &&
+                      (!want_windows || windows_catalog_.search(query_.view(), kMaxRows, &windows_found, &windows_total, &windows_tiers));
+      total = linux_total + windows_total;
+      uint64_t l = 0, w = 0;
+      while (ok && rows.count() < kMaxRows && (l < linux_found.count() || w < windows_found.count())) {
+        bool take_linux = w >= windows_found.count();
+        if (!take_linux && l < linux_found.count()) {
+          const uint8_t lt = linux_tiers[l], wt = windows_tiers[w];
+          take_linux = lt != wt ? lt < wt : appman::compare_folded(catalog_.at(linux_found[l]).name.view(), windows_catalog_.at(windows_found[w]).name.view()) <= 0;
+        }
+        if (!(take_linux ? add_linux(catalog_.at(linux_found[l++])) : add_windows(windows_catalog_.at(windows_found[w++])))) break;
       }
     }
-    move_list(rows_, names);
+    move_list(rows_, keys);
   }
   list_.clear_items();
   for (const Row& row : rows.view()) {
-    const StringView cells[3] = {row.name.view(), row.description.view(), row.installed ? StringView("Installed") : StringView()};
-    list_.add_item(cells, 3, ItemIcon::File);
+    const StringView cells[4] = {row.name.view(), app_platform_name(row.platform), row.description.view(), row.status};
+    list_.add_item(cells, 4, ItemIcon::File);
   }
   if (!busy()) {
     String text(allocator_), total_text(allocator_), count_text(allocator_), shown_text(allocator_);
     const uint64_t shown = list_.item_count();
-    const uint64_t count = catalog_count();
     total_text.append_uint(total);
     count_text.append_uint(count);
     shown_text.append_uint(shown);
-    if (show_.selected_index() == kShowInstalled) {
+    if (only_installed) {
       format_message(&text, total == 1 ? "%1 application installed" : "%1 applications installed", total_text.view());
     } else if (count == 0) {
       text.assign(network_ ? "There is no list of applications yet. Choose Refresh List to fetch it." : "The list of applications cannot be fetched because there is no network.");
@@ -263,12 +366,23 @@ void AppManager::rebuild() {
 void AppManager::update_controls() {
   UiGuard lock(this);
   String name(allocator_), text(allocator_);
-  const bool have = row_name(list_.selected_item(), &name);
+  AppPlatform platform = AppPlatform::Linux;
+  const bool have = row_name(list_.selected_item(), &name) && row_platform(list_.selected_item(), &platform);
   bool installed = false;
   {
     kernel::ScopedMutex state(state_mutex_);
-    installed = have && is_installed(name.view());
-    if (have) {
+    installed = have && is_installed(platform, name.view());
+    if (have && platform == AppPlatform::Windows) {
+      const appman::WingetPackage* package = windows_catalog_.find(name.view());
+      if (!package) text.assign(name.view());
+      else format_message(&text, "%1 (%2), version %3, for Windows", package->name.view(), package->id.view(), package->version.view());
+      for (const appman::WingetInstalled& app : windows_installed_.view())
+        if (appman::compare_folded(app.id.view(), name.view()) == 0) {
+          String with(allocator_);
+          format_message(&with, "%1  -  version %2 is installed", text.view(), app.version.view());
+          text.assign(with.view());
+        }
+    } else if (have) {
       const appman::CatalogEntry* entry = catalog_.find(name.view());
       if (!entry) text.assign(name.view());
       else format_message(&text, entry->command_line ? "%1: %2 (a program for the terminal)" : "%1: %2", name.view(), entry->description.view());
@@ -281,7 +395,7 @@ void AppManager::update_controls() {
     }
   }
   details_.set_text(text.view());
-  const bool ready = installer_ && !busy();
+  const bool ready = installer_ && windows_installer_ && !busy();
   install_.set_enabled(ready && have && !installed);
   update_.set_enabled(ready && have && installed);
   remove_.set_enabled(ready && have && installed);
@@ -297,6 +411,8 @@ void AppManager::update_controls() {
   if (list_update_item_) list_update_item_->set_enabled(update_.enabled());
   if (list_remove_item_) list_remove_item_->set_enabled(remove_.enabled());
   if (installed_only_item_) installed_only_item_->set_checked(show_.selected_index() == kShowInstalled);
+  if (linux_only_item_) linux_only_item_->set_checked(show_.selected_index() == kShowLinux);
+  if (windows_only_item_) windows_only_item_->set_checked(show_.selected_index() == kShowWindows);
   if (about_item_) about_item_->set_enabled(notices_ != nullptr);
 }
 
@@ -326,8 +442,8 @@ void AppManager::select_row(int32_t row) {
 }
 
 // ---------------------------------------------------------------- jobs
-bool AppManager::start(Job job, StringView name) {
-  if (!network_ || (job != Job::Catalog && !installer_)) {
+bool AppManager::start(Job job, AppPlatform platform, StringView name) {
+  if (!network_ || (job != Job::Catalog && (!installer_ || !windows_installer_))) {
     say("Applications cannot be installed because the network or the disk is not available.");
     return false;
   }
@@ -338,6 +454,7 @@ bool AppManager::start(Job job, StringView name) {
   {
     kernel::ScopedMutex lock(state_mutex_);
     job_ = job;
+    job_platform_ = platform;
     job_name_.assign(name);
   }
   __atomic_store_n(&progress_state_.cancel, false, __ATOMIC_RELAXED);
@@ -347,7 +464,7 @@ bool AppManager::start(Job job, StringView name) {
   update_controls();
   String text(allocator_);
   switch (job) {
-    case Job::Catalog: text.assign("Fetching the list of applications..."); break;
+    case Job::Catalog: text.assign("Fetching the lists of applications..."); break;
     case Job::Install: format_message(&text, "Installing \"%1\"...", name); break;
     case Job::Update: format_message(&text, "Looking for a newer \"%1\"...", name); break;
     case Job::Remove: format_message(&text, "Removing \"%1\"...", name); break;
@@ -358,41 +475,28 @@ bool AppManager::start(Job job, StringView name) {
   return true;
 }
 
-bool AppManager::refresh_catalog() { return start(Job::Catalog, StringView()); }
+bool AppManager::refresh_catalog() { return start(Job::Catalog, AppPlatform::Linux, StringView()); }
 
-bool AppManager::install_selected() {
+bool AppManager::start_selected(Job job) {
   String name(allocator_);
-  if (!row_name(list_.selected_item(), &name)) {
+  AppPlatform platform = AppPlatform::Linux;
+  if (!row_name(list_.selected_item(), &name) || !row_platform(list_.selected_item(), &platform)) {
     say("Select an application in the list first.");
     return false;
   }
-  return start(Job::Install, name.view());
+  return start(job, platform, name.view());
 }
 
-bool AppManager::update_selected() {
-  String name(allocator_);
-  if (!row_name(list_.selected_item(), &name)) {
-    say("Select an application in the list first.");
-    return false;
-  }
-  return start(Job::Update, name.view());
-}
-
-bool AppManager::remove_selected() {
-  String name(allocator_);
-  if (!row_name(list_.selected_item(), &name)) {
-    say("Select an application in the list first.");
-    return false;
-  }
-  return start(Job::Remove, name.view());
-}
+bool AppManager::install_selected() { return start_selected(Job::Install); }
+bool AppManager::update_selected() { return start_selected(Job::Update); }
+bool AppManager::remove_selected() { return start_selected(Job::Remove); }
 
 // Removing deletes the application's files, and nothing here brings them back, so the question comes first; the answer that leaves everything as it
 // was is the default one. Without a window manager (nowhere to ask) it removes at once.
 bool AppManager::ask_remove() {
   if (!remove_.enabled()) return false;
   if (!manager()) return remove_selected();
-  if (!row_name(list_.selected_item(), &remove_name_)) return false;
+  if (!row_name(list_.selected_item(), &remove_name_) || !row_platform(list_.selected_item(), &remove_platform_)) return false;
   String line(allocator_);
   const StringView name = remove_name_.view();
   format_message(&line, "Remove \"%1\"?", name.size() > 30 ? name.first(30) : name);
@@ -403,7 +507,7 @@ bool AppManager::ask_remove() {
 
 void AppManager::on_remove_answer(void* self, Control&) {
   auto* m = static_cast<AppManager*>(self);
-  if (m->ask_.accepted() && !m->remove_name_.empty()) m->start(Job::Remove, m->remove_name_.view());
+  if (m->ask_.accepted() && !m->remove_name_.empty()) m->start(Job::Remove, m->remove_platform_, m->remove_name_.view());
 }
 
 void AppManager::cancel() {
@@ -437,46 +541,80 @@ void AppManager::on_progress(void* self, const appman::Progress& progress) {
 void AppManager::run_job(void* self, Control&) {
   auto* m = static_cast<AppManager*>(self);
   Job job;
+  AppPlatform platform;
   String name(m->allocator_), detail(m->allocator_), text(m->allocator_);
+  appman::WingetPackage package(m->allocator_);      // (a copy: the catalog may be replaced while the job runs)
+  bool have_package = false;
   {
     kernel::ScopedMutex lock(m->state_mutex_);
     job = m->job_;
+    platform = m->job_platform_;
     name.assign(m->job_name_.view());
+    if (platform == AppPlatform::Windows && job != Job::Catalog) {
+      const appman::WingetPackage* found = m->windows_catalog_.find(name.view());
+      have_package = found && package.copy_from(*found);
+    }
   }
   appman::Result result = appman::Result::Ok;
   NoticeKind kind = NoticeKind::Information;
   bool tell = false;      // a failure: said in a message, not only in the status line
   if (job == Job::Catalog) {
-    String list(m->allocator_);
-    appman::Catalog fresh(m->allocator_);
-    if (!m->network_->fetch(appman::kCatalogUrl, appman::kMaxCatalogBytes, &list) || !fresh.parse(list.view())) {
+    // Both lists; one that cannot be fetched leaves the one from last time in place.
+    bool have_linux = false, have_windows = false, memory = true;
+    {
+      String list(m->allocator_);
+      appman::Catalog fresh(m->allocator_);
+      if (m->network_->fetch(appman::kCatalogUrl, appman::kMaxCatalogBytes, &list) && fresh.parse(list.view())) {
+        if (m->files_) keep_file(*m->files_, m->allocator_, filesystem::layout::kAppManCatalog, list.view());
+        kernel::ScopedMutex lock(m->state_mutex_);
+        have_linux = m->catalog_.take(fresh);
+        memory = memory && have_linux;
+      }
+    }
+    {
+      String index(m->allocator_), list(m->allocator_);
+      appman::WingetCatalog fresh(m->allocator_);
+      if (m->network_->fetch(appman::kWingetIndexUrl, appman::kMaxWingetIndexBytes, &index) && fresh.parse_index(index.view().bytes())) {
+        if (m->files_ && fresh.write_list(&list)) keep_file(*m->files_, m->allocator_, filesystem::layout::kWingetCatalog, list.view());
+        kernel::ScopedMutex lock(m->state_mutex_);
+        have_windows = m->windows_catalog_.take(fresh);
+        memory = memory && have_windows;
+      }
+    }
+    String linux_text(m->allocator_), windows_text(m->allocator_);
+    linux_text.append_uint(m->linux_count());
+    windows_text.append_uint(m->windows_count());
+    if (!memory) {
+      text.assign("The list of applications could not be kept because there is not enough memory. Close other programs and try again.");
+      kind = NoticeKind::Error;
+      tell = true;
+    } else if (have_linux && have_windows) {
+      format_message(&text, "The list has %1 applications for Linux and %2 for Windows.", linux_text.view(), windows_text.view());
+    } else if (have_linux) {
+      format_message(&text, "The list has %1 applications for Linux. The list of applications for Windows could not be fetched.", linux_text.view());
+    } else if (have_windows) {
+      format_message(&text, "The list has %1 applications for Windows. The list of applications for Linux could not be fetched.", windows_text.view());
+    } else {
       text.assign("The list of applications could not be fetched. Check the network connection, then choose Refresh List.");
       kind = NoticeKind::Error;
       tell = true;
-    } else {
-      String count(m->allocator_);
-      count.append_uint(fresh.count());
-      format_message(&text, "The list has %1 applications.", count.view());
-      if (m->files_) {      // kept for next time (best effort)
-        (void)filesystem::layout::create_app_folder(*m->files_, "AppMan", m->allocator_);
-        UniquePointer<filesystem::IFile> file;
-        uint64_t written = 0;
-        if (m->files_->open_file(filesystem::layout::kAppManCatalog, filesystem::OpenMode::CreateTruncate, &file) == filesystem::Status::Ok)
-          (void)file->write(0, list.view().bytes(), &written);
-      }
-      kernel::ScopedMutex lock(m->state_mutex_);
-      if (!m->catalog_.take(fresh)) {
-        text.assign("The list of applications could not be kept because there is not enough memory. Close other programs and try again.");
-        kind = NoticeKind::Error;
-        tell = true;
-      }
     }
   } else {
-    switch (job) {
-      case Job::Install: result = m->installer_->install(name.view(), &m->progress_state_, &detail); break;
-      case Job::Update: result = m->installer_->update(name.view(), &m->progress_state_, &detail); break;
-      case Job::Remove: result = m->installer_->remove(name.view(), &detail); break;
-      default: break;
+    if (platform == AppPlatform::Windows) {
+      switch (job) {
+        case Job::Install: result = have_package ? m->windows_installer_->install(package, &m->progress_state_, &detail) : appman::Result::NoManifest; break;
+        case Job::Update: result = have_package ? m->windows_installer_->update(package, &m->progress_state_, &detail) : appman::Result::NoManifest; break;
+        case Job::Remove: result = m->windows_installer_->remove(name.view(), &detail); break;
+        default: break;
+      }
+      if (have_package) name.assign(package.name.view());      // (the messages name the application, not its identifier)
+    } else {
+      switch (job) {
+        case Job::Install: result = m->installer_->install(name.view(), &m->progress_state_, &detail); break;
+        case Job::Update: result = m->installer_->update(name.view(), &m->progress_state_, &detail); break;
+        case Job::Remove: result = m->installer_->remove(name.view(), &detail); break;
+        default: break;
+      }
     }
     if (result == appman::Result::Ok) {
       format_message(&text, job == Job::Remove ? "\"%1\" was removed." : job == Job::Update ? "\"%1\" was updated. The Start menu starts the new version." : "\"%1\" is installed. It is in the Start menu.",
@@ -504,14 +642,15 @@ void AppManager::run_job(void* self, Control&) {
   }
   __atomic_store_n(&m->busy_, false, __ATOMIC_RELEASE);
   String keep(m->allocator_);
-  const bool had = m->row_name(m->list_.selected_item(), &keep);
+  AppPlatform keep_platform = AppPlatform::Linux;
+  const bool had = m->row_name(m->list_.selected_item(), &keep) && m->row_platform(m->list_.selected_item(), &keep_platform);
   m->rebuild();
   if (had) {      // the same application stays chosen (found under the state lock, chosen after it: the UI lock always comes first)
     int32_t row = -1;
     {
       kernel::ScopedMutex lock(m->state_mutex_);
       for (uint64_t i = 0; i < m->rows_.count() && row < 0; ++i)
-        if (m->rows_.view()[i].view().equals(keep.view())) row = static_cast<int32_t>(i);
+        if (m->rows_.view()[i].platform == keep_platform && m->rows_.view()[i].id.view().equals(keep.view())) row = static_cast<int32_t>(i);
     }
     if (row >= 0) m->list_.select_item(row);
   }
@@ -529,12 +668,21 @@ void AppManager::on_show(void* self, Control&) { static_cast<AppManager*>(self)-
 void AppManager::on_exit(void* self, Control&) { static_cast<AppManager*>(self)->close(); }
 void AppManager::on_installed_only(void* self, Control&) {
   auto* m = static_cast<AppManager*>(self);
-  m->set_filter(m->show_.selected_index() == kShowInstalled ? kShowAll : kShowInstalled);
+  m->set_filter(m->show_.selected_index() == kShowInstalled ? kShowAll : kShowInstalled);      // (from one of the two kinds as well: Installed is of both)
+}
+void AppManager::on_linux_only(void* self, Control&) {
+  auto* m = static_cast<AppManager*>(self);
+  m->set_filter(m->show_.selected_index() == kShowLinux ? kShowAll : kShowLinux);
+}
+void AppManager::on_windows_only(void* self, Control&) {
+  auto* m = static_cast<AppManager*>(self);
+  m->set_filter(m->show_.selected_index() == kShowWindows ? kShowAll : kShowWindows);
 }
 void AppManager::on_about(void* self, Control&) {
   auto* m = static_cast<AppManager*>(self);
   NoticeDialog::post(m->notices_, m->manager(), NoticeKind::Information,
-                     "App Manager installs, updates and removes applications for Linux from the AppMan list (github.com/ivan-hc/AM).", "About App Manager");
+                     "App Manager installs, updates and removes applications for Linux from the AppMan list (github.com/ivan-hc/AM) and applications for Windows from the winget list (github.com/microsoft/winget-pkgs).",
+                     "About App Manager");
 }
 
 // F5: Refresh List. Del: Remove (the selected application; a text box takes Del for itself first).

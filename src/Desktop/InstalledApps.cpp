@@ -507,6 +507,32 @@ bool parse_shell_link(ConstByteView data, ShellLinkInfo* out) {
   return in.ok();
 }
 
+bool write_shell_link(StringView target, StringView working_directory, ByteBuffer* out) {
+  out->clear();
+  ByteBuffer target16(out->allocator()), directory16(out->allocator());
+  if (target.empty() || !util::append_utf16le(&target16, target) || !util::append_utf16le(&directory16, working_directory)) return false;
+  if (target16.size() / 2 > 32767 || directory16.size() / 2 > 32767) return false;
+  // The header: a link to a file, with link information, a working directory and Unicode strings.
+  bool ok = out->put32(0x4C) && out->append(ConstByteView(kShellLinkClsid)) && out->put32(kHasLinkInfo | kIsUnicode | (working_directory.empty() ? 0 : kHasWorkingDir)) &&
+            out->put32(0x80) &&                  // FILE_ATTRIBUTE_NORMAL
+            out->put_zeros(24 + 4 + 4) &&        // the three times, the size, the icon
+            out->put32(1) &&                     // SW_SHOWNORMAL
+            out->put_zeros(2 + 10);              // no hot key; reserved
+  // The link information: a volume (a fixed disk with no label) and the local base path, as ANSI text and as UTF-16.
+  constexpr uint32_t kHeader = 0x24, kVolume = 0x11;
+  const uint32_t base_at = kHeader + kVolume, suffix_at = base_at + static_cast<uint32_t>(target.size()) + 1, base16_at = suffix_at + 1;
+  const uint32_t suffix16_at = base16_at + static_cast<uint32_t>(target16.size()) + 2, info_size = suffix16_at + 2;
+  ok = ok && out->put32(info_size) && out->put32(kHeader) && out->put32(1) &&      // VolumeIDAndLocalBasePath
+       out->put32(kHeader) && out->put32(base_at) && out->put32(0) && out->put32(suffix_at) && out->put32(base16_at) && out->put32(suffix16_at) &&
+       out->put32(kVolume) && out->put32(3) && out->put32(0) && out->put32(0x10) && out->put8(0);      // DRIVE_FIXED, no serial number, an empty label
+  // (the ANSI copy: characters beyond ASCII become '?', as Windows writes those its code page does not have; readers prefer the UTF-16 copy)
+  for (const char c : target) ok = ok && out->put8(static_cast<uint8_t>(c) < 0x80 ? static_cast<uint8_t>(c) : '?');
+  ok = ok && out->put8(0) && out->put8(0) && out->append(target16.view()) && out->put16(0) && out->put16(0);
+  if (!working_directory.empty()) ok = ok && out->put16(static_cast<uint32_t>(directory16.size() / 2)) && out->append(directory16.view());
+  if (!ok) out->clear();
+  return ok;
+}
+
 bool parse_desktop_entry(StringView text, DesktopEntryInfo* out) {
   out->name.clear();
   out->program.clear();

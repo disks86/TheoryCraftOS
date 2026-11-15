@@ -641,6 +641,11 @@ add_executable(BOOTX64
   src/Desktop/AppManager.cpp
   src/Desktop/AppMan/AppManCatalog.cpp
   src/Desktop/AppMan/AppManInstaller.cpp
+  src/Desktop/AppMan/InstallFiles.cpp
+  src/Desktop/AppMan/SqliteReader.cpp
+  src/Desktop/AppMan/WingetCatalog.cpp
+  src/Desktop/AppMan/WingetInstaller.cpp
+  src/Desktop/AppMan/Yaml.cpp
   src/Desktop/AppMan/HttpNetwork.cpp
   src/Desktop/TodoStore.cpp
   src/Desktop/FileProperties.cpp
@@ -739,6 +744,7 @@ add_executable(BOOTX64
   src/Media/Image.cpp
   src/Media/ImageCodecs.cpp
   src/Media/Zlib.cpp
+  src/Media/Zip.cpp
   src/Media/Zstd.cpp
   src/Media/Xxh3.cpp
   src/Media/Xz.cpp

@@ -35,6 +35,7 @@
 #include "FileSystem/IFileSystem.hpp"
 #include "ObjectContainer/List.hpp"
 #include "Utility/ArrayView.hpp"
+#include "Utility/ByteBuffer.hpp"
 #include "Utility/String.hpp"
 #include "Utility/StringView.hpp"
 
@@ -75,6 +76,12 @@ struct ShellLinkInfo {
 };
 // False if `data` is not a well-formed shortcut. A shortcut with no target (one to a virtual folder) parses with `target` empty.
 [[nodiscard]] bool parse_shell_link(ConstByteView data, ShellLinkInfo* out);
+
+// Writes the shortcut file (.lnk) of a program into `out` (replacing what it holds): `target` and `working_directory` are Windows paths
+// ("C:\\Program Files\\App\\app.exe"), kept in the LinkInfo's local base path (as text of the ANSI code page and as UTF-16) and as the working
+// directory string. What parse_shell_link() and Windows' own shell read back. False if a path is empty, too long (32767 characters), not UTF-8, or memory
+// ran out.
+[[nodiscard]] bool write_shell_link(StringView target, StringView working_directory, ByteBuffer* out);
 
 // What a desktop entry says, from its [Desktop Entry] group.
 struct DesktopEntryInfo {
