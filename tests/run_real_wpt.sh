@@ -7,13 +7,14 @@
 #                             git -C wpt sparse-checkout set resources common dom url encoding html/dom
 # PAGETEST is the PageTest binary (default build/PageTest; tests/run_host_tests.sh PageTest builds one). One result file per test file goes to <out dir>
 # (lines "WPT PASS|FAIL|TIMEOUT|NOTRUN <name> :: <message>" and "WPTDONE <status>"); summary.txt has the counts per file. Each file runs in its own process with a
-# 60 second limit. Pages (.html), .window.js and .any.js files run; manual tests, https-only tests, crash tests and idlharness files are left out.
+# 60 second limit. Pages (.html), .window.js, .any.js and .worker.js files run; manual tests, https-only tests, crash tests and idlharness files are left out.
+# WPT_ANY_WORKER=1 runs the .any.js files in a dedicated worker instead of the window.
 set -e
 root=$(cd "$1" && pwd); out=$2; shift 2
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 export root out PAGETEST=${PAGETEST:-build/PageTest}
 cd "$root"
-for t in "$@"; do find "$t" -type f \( -name '*.html' -o -name '*.htm' -o -name '*.window.js' -o -name '*.any.js' \); done \
+for t in "$@"; do find "$t" -type f \( -name '*.html' -o -name '*.htm' -o -name '*.window.js' -o -name '*.any.js' -o -name '*.worker.js' \); done \
   | grep -v -e '/resources/' -e '-manual' -e 'support/' -e '\.https\.' -e 'crashtests' -e '\-ref\.' -e '/reference/' -e 'idlharness' | sort > "$out/pages.txt"
 # a page with <meta name=variant content="?1-1000"> is run once per variant (the page address has the variant)
 python3 - "$out" <<'PY'

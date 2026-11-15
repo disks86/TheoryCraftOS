@@ -370,7 +370,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool worker_scope() override { return worker_runtime_ != nullptr; }
   StringView worker_scope_name() override;
   void worker_scope_post(StringView message, StringView ports) override;
-  void worker_scope_fail(StringView text) override;
+  void worker_scope_fail(StringView text, bool unusable, StringView filename) override;
   void worker_scope_close() override;
   bool worker_scope_blob(StringView address, String* wire) override;
   bool compile_handler(StringView code, script::Value* function) override;
@@ -614,6 +614,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   Page* worker_owner_ = nullptr;
   WorkerRuntime* worker_runtime_ = nullptr;
   uint32_t worker_depth_ = 0;   // (a worker may start workers of its own, a few levels deep)
+  static constexpr uint64_t kMaxWorkers = 16;   // (to a page or a worker: each is a script engine with the web platform in it)
   void run_dedicated_worker(StringView source, bool module);
   Page* find_worker_window(uint32_t id);
   bool worker_runtime_closed() const;

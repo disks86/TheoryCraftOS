@@ -558,7 +558,7 @@ NATIVE(ws_release) {
 }
 
 // --- Web Workers: __worker_start(source, url, name, module) -> id (0: not started, the reason in __worker_error), __worker_post(id, text, ports),
-// __worker_terminate(id), __worker_pump() -> [[id, kind, text, ports] ...] (kind 0 message, 1 error, 2 closed)
+// __worker_terminate(id), __worker_pump() -> [[id, kind, text, ports] ...] (kind 0 message, 1 error (ports: the script it is from), 2 closed, 3 not loaded)
 NATIVE(worker_start) {
   String source(vm.allocator()), url(vm.allocator()), name(vm.allocator()), error(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &source) || !arg_text(vm, arg_at(args, argc, 1), &url) || !arg_text(vm, arg_at(args, argc, 2), &name)) return false;
@@ -600,7 +600,7 @@ NATIVE(worker_pump) {
 }
 
 // Inside a worker: __worker_scope() -> the worker's name, or null in a document; __worker_out(text, ports) a message for the page that owns the worker;
-// __worker_fail(text) an error nothing in the worker handled; __worker_close(); __worker_blob(address) -> the serialized Blob behind a blob: address of the owner (or null).
+// __worker_fail(text, unusable, filename) an error nothing in the worker handled (unusable: its script could not be compiled or loaded); __worker_close(); __worker_blob(address) -> the serialized Blob behind a blob: address of the owner (or null).
 NATIVE(worker_scope) {
   IDomHost& host = impl(vm).host;
   *result = host.worker_scope() ? str_value(vm, host.worker_scope_name()) : Value::make_null();
@@ -616,7 +616,9 @@ NATIVE(worker_out) {
 NATIVE(worker_fail) {
   String text(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
-  impl(vm).host.worker_scope_fail(text.view());
+  String filename(vm.allocator());
+  if (argc > 2 && !arg_text(vm, args[2], &filename)) return false;
+  impl(vm).host.worker_scope_fail(text.view(), Vm::to_boolean(arg_at(args, argc, 1)), filename.view());
   return true;
 }
 NATIVE(worker_close) {
@@ -887,7 +889,7 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__worker_post", worker_post, 3);
   vm.define_native(g, "__worker_scope", worker_scope, 0);
   vm.define_native(g, "__worker_out", worker_out, 2);
-  vm.define_native(g, "__worker_fail", worker_fail, 1);
+  vm.define_native(g, "__worker_fail", worker_fail, 3);
   vm.define_native(g, "__worker_close", worker_close, 0);
   vm.define_native(g, "__worker_blob", worker_blob, 1);
   vm.define_native(g, "__worker_terminate", worker_terminate, 1);

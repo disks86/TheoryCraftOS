@@ -26,13 +26,16 @@ PageTest binary (`PAGETEST=path`); the console log of a page is capped at 16 KB,
 | `web_audio.js` | WPT `webaudio/` | offline rendering of the graph: parameters and their automation, oscillators, sources, filters, delay, convolver, analyser, worklet, decoding |
 | `dom_svg.js` | WPT `svg/types`, `svg/geometry` | the SVG DOM interfaces, animated attributes, lengths, transform lists, geometry and text methods |
 | `web_apis_behavior.js` | WPT `geometry`, `encoding`, `WebCryptoAPI`, `hr-time`, `user-timing`, `FileAPI`, `IndexedDB`, `workers`, `eventsource`, `html/semantics` | DOMMatrix/DOMRect, TextEncoder/Decoder, atob/btoa, SubtleCrypto, performance, EventTarget, AbortSignal, Blob/File, Web Storage, Worker, IndexedDB, EventSource, popover, dialog, custom elements, canvas 2D |
+| `workers.js` | WPT `workers/`, `html/webappapis/structured-clone`, and `fetch`, `xhr`, `FileAPI`, `WebCryptoAPI`, `IndexedDB`, `webmessaging` in a worker | the dedicated worker global scope (no window, the interfaces, location, navigator, events), messages and transfers both ways, message ports, importScripts, module workers, error events, the script budget, close and terminate |
 | `dom_nodes.js` … `messaging_streams.js` | WPT `dom`, `url`, `fetch`, `html`, `streams`, … | the earlier suites (see `tests/data/wpt/`) |
 
 ## The real web-platform-tests
 
 `tests/run_real_wpt.sh <wpt checkout> <out dir> <dirs...>` runs files of the real [web-platform-tests](https://github.com/web-platform-tests/wpt) (the unmodified
 `testharness.js`, one process per file, 60 seconds each) in `PageTest` (`WPT_ROOT=<checkout> WPT_REAL_FILE=<path>` runs one file and prints `WPT PASS|FAIL <name> :: <message>`
-lines). The checkout can be sparse (`resources common dom url encoding html/dom`). Pages, `.window.js` and `.any.js` files run (not manual, https-only, crash or idlharness files).
+lines). The checkout can be sparse (`resources common dom url encoding html/dom`). Pages, `.window.js`, `.any.js` and `.worker.js` files run (not manual, https-only, crash or idlharness files).
+A `.worker.js` file runs as the dedicated worker of the page wpt serves for it (`fetch_tests_from_worker`), and so does an `.any.js` file whose `// META: global=` line
+names workers but not windows; `WPT_ANY_WORKER=1` runs every `.any.js` file that allows workers in a dedicated worker instead of the window (wpt's `.any.worker.html`).
 A page with `<meta name="variant" content="?1-1000">` lines runs once per variant (the page address has the variant; the output file is named after it), and the runner's
 limits are far above a page's (`WPT_BUDGET` millions of instructions per task, default 200; `WPT_MEMORY` megabytes, default 768; `Page::set_script_limits`). The results are read
 from the console, not from the page's log (which keeps only its first 16 KB).
@@ -54,6 +57,32 @@ Fixed with it: `compareDocumentPosition` of disconnected nodes, `new Text()`/`ne
 `before()`/`after()`/`append()`, the CharacterData methods' argument checks, `Node.ENTITY_NODE` and the other constants, doctypes as real nodes (`document.childNodes`,
 `createDocumentType`, `Document.implementation` of every document, `cloneNode`, serialization) and the order of the checks in `insertBefore`/`replaceChild` ("ensure
 pre-insertion validity", including the rules for a document's doctype and element).
+
+## Workers
+
+A dedicated worker (`new Worker(url, { type, name })`) is a hidden page of its own, as a service worker is (`Page::worker_start`, `kWorkerPrelude` in
+`src/Browser/WebPrelude.cpp`): a script engine with everything a page's scripts have, made a `DedicatedWorkerGlobalScope`. `window`, `document`, the node and element
+interfaces, Web Storage, history and the dialogs are not there; `self` is a `WorkerGlobalScope` and an `EventTarget`, `location` a `WorkerLocation`, `navigator` a
+`WorkerNavigator`. In it: `fetch` / `Request` / `Response` / `Headers` (every method, binary bodies, through the service worker of the page), `XMLHttpRequest` (also
+synchronous), streams, `URL`, `Blob` / `File` / `FileReader` / `FileReaderSync`, `AbortController`, `crypto` with `subtle`, `structuredClone`, `MessageChannel`,
+`BroadcastChannel`, `performance`, `console` (the page's console, lines marked `[worker]`), `indexedDB` and `caches` (those of the page's origin), `WebSocket`, `WebAssembly`,
+`importScripts` (network, `blob:` and `data:` addresses; a script must be served as JavaScript), nested workers, `reportError`. `blob:` addresses made by the page work in
+the worker (the page is asked for the Blob). Messages are structured clones both ways (typed arrays, `ArrayBuffer`, `DataView`, `Map`, `Set`, `Date`, `RegExp`, `Blob`,
+errors, `BigInt`, shared references and cycles; `DataCloneError` for functions and for a transfer list of things that cannot be transferred), a transferred `ArrayBuffer`
+is detached in the sender and a transferred `MessagePort` goes on working from the other side. A module worker runs through the page's module loader (static `import`,
+`import()`, top-level `await`, `import.meta.url`). An uncaught error fires `error` at the scope first (`onerror` gets message, file, line, column and the value thrown;
+returning true or `preventDefault()` keeps it there), then an `ErrorEvent` at the `Worker` object; a script that cannot be loaded or compiled is a plain `error` event;
+unhandled rejections fire `unhandledrejection`. A task of a worker has the script budget and the heap limit of its page (192 million instructions, 768 MB by default);
+one that runs longer is stopped and reported as an error, and the worker goes on with its next task.
+
+Limits: a worker runs on the thread of its page, between the page's tasks (a long computation in a worker still holds the page up, and `Atomics.wait` cannot block
+on another thread); it costs about what a frame costs to start and to keep (every interface of the page is built again in it), and a page or a worker may have 16 of them,
+nested 3 deep; error events carry no line numbers; a transferred buffer is copied, not moved; `SharedWorker` is not there; a database the page already has open
+does not see what a worker writes until it is opened again; `ImageBitmap`, `OffscreenCanvas` and streams are not transferable to a worker; a `blob:` address made
+in a worker is not known to its page (the Blob itself can be posted).
+With the real `workers/` directory of web-platform-tests (2026-11-14; the tests that need the wpt server's `.py` handlers and substitutions cannot pass): 651 subtests
+pass and 285 fail, 181 of the failures in the `SharedWorker` files; before this the same files gave 213 / 421. The `.any.js` files of `streams`, `url`, `FileAPI` and
+`fetch/api` (headers, request, response, body, abort) pass at least as many subtests in a worker (`WPT_ANY_WORKER=1`) as in the window.
 
 ## Text encodings
 
@@ -100,7 +129,7 @@ gaps: `grep -c xfail tests/data/wpt/*.js`. The largest ones today:
   document), `Document.parseHTMLUnsafe`, `ElementInternals`/`ValidityState` via `attachInternals()`, `URLPattern` (names, `*`, `(regexp)`, `{groups}` and `? + *`
   modifiers, base URLs; not the full constructor-string grammar), SVG `getPathData()` and polygon/polyline `points`, `Highlight`/`CSS.highlights` (registered, not painted),
   `form.elements`/`select.options` as `HTMLFormControlsCollection`/`HTMLOptionsCollection` (`add`, `remove`, `selectedIndex`; a form not in the document lists no controls), `dialog.requestClose()`, `getModifierState`, `PerformanceObserver.supportedEntryTypes`. Interface-only (calling the members is an illegal invocation, or there is
-  nothing behind them): `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces, `FileSystem*Handle`, `PublicKeyCredential`,
+  nothing behind them): `MediaRecorder` (the constructor throws `NotSupportedError`: no encoder), `Worklet`, the worker global scope interfaces (in a window; a worker has the real ones), `FileSystem*Handle`, `PublicKeyCredential`,
   `OffscreenCanvas.transferToImageBitmap`; `createScriptProcessor` returns a gain node whose `onaudioprocess` is never called. Interface objects are now not
   enumerable and have a read-only `prototype`.
 - **CSS**: closed: `getComputedStyle` reports table parts (with `cellpadding`), controls, closed `dialog`, blockified `display`, `em`/`i`, `pre`, `ol`, link colour,

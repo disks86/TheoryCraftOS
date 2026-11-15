@@ -5262,7 +5262,8 @@ S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, ['sign']).then(function 
                  "setTimeout(function () { console.log(got.join(), typeof w.terminate); }, 80);", "first function", nullptr, "https://app.example/"));
   CHECK(async_is("var src = 'onmessage = function (e) { var bytes = new TextEncoder().encode(e.data); postMessage([bytes.length, new TextDecoder().decode(bytes), btoa(\"hello\"), atob(\"aGVsbG8=\"), typeof fetch]); };'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
                  "w.onmessage = function (e) { console.log(JSON.stringify(e.data)); w.terminate(); }; w.postMessage('héllo');", "[6,\"héllo\",\"aGVsbG8=\",\"hello\",\"function\"]", nullptr, "https://app.example/"));
-  CHECK(async_is("var r = []; try { new Worker('https://other.example/w.js'); } catch (e) { r.push(e.name); } try { new Worker(); } catch (e) { r.push(e.name); } console.log(r.join());", "SecurityError,TypeError", nullptr, "https://app.example/"));
+  // (a script of another origin is not an exception of the constructor: the Worker object hears a plain error event)
+  CHECK(async_is("var r = []; try { new Worker('https://other.example/w.js').onerror = function (e) { console.log('error event', e.constructor === Event); this.terminate(); }; } catch (e) { r.push(e.name); } try { new Worker(); } catch (e) { r.push(e.name); } console.log(r.join());", "TypeError | error event true", nullptr, "https://app.example/"));
   CHECK(async_is("var src = 'var n = 0; onmessage = function () { n++; postMessage(n + \":\" + (typeof importScripts) + \":\" + typeof Promise + \":\" + [1, 2, 3].map(function (x) { return x * 2; }).join(\"\")); };'; var w = new Worker(URL.createObjectURL(new Blob([src])));"
                  "var seen = []; w.onmessage = function (e) { seen.push(e.data); if (seen.length === 2) { console.log(seen.join('|')); w.terminate(); } }; w.postMessage(0); w.postMessage(0);", "1:function:function:246|2:function:function:246", nullptr, "https://app.example/"));
   // shadow trees: events and styles
@@ -5305,7 +5306,7 @@ S.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, ['sign']).then(function 
   CHECK(async_is("var c = new MessageChannel(); onmessage = function (e) { var p = e.ports[0]; console.log(e.data, e.ports.length, p instanceof MessagePort); p.onmessage = function (m) { console.log('on moved port', m.data); p.postMessage('reply') } };"
                  "c.port1.onmessage = function (m) { console.log('port1', m.data) }; postMessage('here', '*', [c.port2]); try { c.port2.postMessage('detached') } catch (e) { console.log(e.name) } c.port1.postMessage('to moved');",
                  "here 1 true | on moved port to moved | port1 reply"));
-  CHECK(async_is("var c = new MessageChannel(); try { postMessage('x', '*', [c.port2, c.port2]) } catch (e) { console.log('dup ' + e.name) } try { c.port1.postMessage(1, [c.port1]) } catch (e) { console.log(e.name) } try { new MessagePort() } catch (e) { console.log(e.name) }", "DataCloneError | TypeError"));
+  CHECK(async_is("var c = new MessageChannel(); try { postMessage('x', '*', [c.port2, c.port2]) } catch (e) { console.log('dup ' + e.name) } try { c.port1.postMessage(1, [c.port1]) } catch (e) { console.log(e.name) } try { new MessagePort() } catch (e) { console.log(e.name) }", "dup DataCloneError | DataCloneError | TypeError"));   // (a port listed twice cannot be transferred twice)
   // BroadcastChannel
   CHECK(async_is("var a = new BroadcastChannel('news'), b = new BroadcastChannel('news'), other = new BroadcastChannel('other'); b.onmessage = function (e) { console.log('b', e.data.v, e.origin, e.target === b) }; a.onmessage = function () { console.log('NO a') }; other.onmessage = function () { console.log('NO other') }; a.postMessage({ v: 42 }); setTimeout(function () { b.close(); try { b.postMessage(1) } catch (e) { console.log(e.name) } }, 10);", "b 42 https://app.example true | InvalidStateError"));
   CHECK(windows_are("var c = new BroadcastChannel('room'); c.onmessage = function (e) { console.log('A got', JSON.stringify(e.data)) }; c.postMessage({ from: 'A' });", "var c = new BroadcastChannel('room'); c.onmessage = function (e) { console.log('B got', JSON.stringify(e.data)); c.postMessage('reply') }; var d = new BroadcastChannel('elsewhere'); d.onmessage = function () { console.log('NO') };",
@@ -7269,7 +7270,9 @@ static void test_wpt() {
 }
 
 // WPT_ROOT=<checkout> WPT_REAL_FILE=<path in it>: one test file of the real web-platform-tests is loaded as https://app.example/<path> (the checkout is the site) and its
-// harness results are printed as "WPT ..." lines. .html and .htm are pages; .window.js and .any.js get the page that wpt serves for them (META: script lines included).
+// harness results are printed as "WPT ..." lines. .html and .htm are pages; .window.js and .any.js get the page that wpt serves for them (META: script lines included);
+// a .worker.js file runs as the dedicated worker of such a page, and so does an .any.js file that is not for windows (// META: global=dedicatedworker), or every
+// .any.js file that allows workers when WPT_ANY_WORKER is set (what wpt serves as .any.worker.html).
 static int run_real_wpt(const char* root, const char* file) {
   auto read_all = [](const std::string& path) { std::string s; if (FILE* f = fopen(path.c_str(), "rb")) { int c; while ((c = fgetc(f)) != EOF) s.push_back(static_cast<char>(c)); fclose(f); } return s; };
   const std::string whole = file;   // (a variant of the test is named as file?query: the file is read without the query, the page has it)
@@ -7277,7 +7280,34 @@ static int run_real_wpt(const char* root, const char* file) {
   if (source.empty()) { printf("WPTDONE MISSING no such file\n"); return 1; }
   auto ends = [&](const char* suffix) { const size_t n = strlen(suffix); return path.size() >= n && path.compare(path.size() - n, n, suffix) == 0; };
   std::string html = source;
-  if (ends(".window.js") || ends(".any.js")) {
+  const std::string leaf = path.substr(path.rfind('/') == std::string::npos ? 0 : path.rfind('/') + 1);
+  const char* harness_page = "<!doctype html><meta charset=utf-8><script src=\"/resources/testharness.js\"></script><script src=\"/resources/testharnessreport.js\"></script>";
+  std::string worker_script;   // WPT_ANY_WORKER: the script wpt serves as <name>.any.worker.js, which runs an .any.js file in a dedicated worker
+  if (ends(".worker.js")) {   // a test that is the script of a dedicated worker: the page wpt serves for it collects its results
+    html = std::string(harness_page) + "<script>fetch_tests_from_worker(new Worker(\"" + leaf + "\"));</script>";
+  }
+  // An .any.js file names the scopes it is for (// META: global=window,dedicatedworker): one that is not for windows runs in a dedicated worker.
+  bool any_in_worker = getenv("WPT_ANY_WORKER") != nullptr;
+  if (const size_t meta = source.find("// META: global="); ends(".any.js") && meta != std::string::npos) {
+    const std::string globals = "," + source.substr(meta + 16, source.find('\n', meta) - meta - 16) + ",";
+    const bool window = globals.find(",window,") != std::string::npos, worker = globals.find(",worker,") != std::string::npos || globals.find(",dedicatedworker,") != std::string::npos;
+    if (!window && worker) any_in_worker = true;
+    if (!worker) any_in_worker = false;
+  }
+  if (ends(".worker.js")) {
+  } else if (ends(".any.js") && any_in_worker) {
+    worker_script = "importScripts(\"/resources/testharness.js\");\n";
+    for (size_t at = 0; at < source.size();) {
+      size_t end = source.find('\n', at);
+      if (end == std::string::npos) end = source.size();
+      const std::string line = source.substr(at, end - at);
+      if (line.compare(0, 16, "// META: script=") == 0) worker_script += "importScripts(\"" + line.substr(16) + "\");\n";
+      else if (line.compare(0, 2, "//") != 0 && !line.empty()) break;
+      at = end + 1;
+    }
+    worker_script += "importScripts(\"/" + path + "\");\ndone();\n";
+    html = std::string(harness_page) + "<script>fetch_tests_from_worker(new Worker(\"" + leaf.substr(0, leaf.size() - 3) + ".worker.js\"));</script>";
+  } else if (ends(".window.js") || ends(".any.js")) {
     html = "<!doctype html><meta charset=utf-8><script src=\"/resources/testharness.js\"></script><script src=\"/resources/testharnessreport.js\"></script>";
     for (size_t at = 0; at < source.size();) {
       size_t end = source.find('\n', at);
@@ -7294,6 +7324,7 @@ static int run_real_wpt(const char* root, const char* file) {
   {
     FakeEnvironment env(a);
     MediaEnvironment media;
+    if (!worker_script.empty()) env.net.answers["GET https://app.example/" + path.substr(0, path.size() - 3) + ".worker.js"] = {200, "Content-Type: text/javascript\r\n", worker_script};
     Page page(a, env, (std::string("https://app.example/") + whole).c_str(), media, true);
     // a conformance page may build tens of thousands of tests (WPT_BUDGET: millions of instructions, WPT_MEMORY: megabytes)
     page.set_script_limits(static_cast<uint64_t>(getenv("WPT_BUDGET") ? atof(getenv("WPT_BUDGET")) : 200) * 1000000, static_cast<uint64_t>(getenv("WPT_MEMORY") ? atof(getenv("WPT_MEMORY")) : 768) * (1u << 20));

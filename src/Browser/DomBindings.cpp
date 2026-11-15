@@ -333,6 +333,8 @@ bool DomBindings::custom_validity(const dom::Node* control, String* message) {
   return false;
 }
 
+void DomBindings::fire_error(StringView text) { bind::fire_error_event(*impl_, text); }
+
 uint32_t DomBindings::errors() const { return impl_->error_count; }
 
 void DomBindings::take_error(String* message) {

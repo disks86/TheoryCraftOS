@@ -2830,8 +2830,9 @@ bool Page::cookie_write(StringView text) {
 // streams, URL, Blob, crypto, IndexedDB, message ports, WebAssembly, modules ...), turned into a DedicatedWorkerGlobalScope by worker_prelude(), which takes
 // `window`, `document` and the other things of a document away. The other choice - a bare engine with a prelude of its own, which is what this was - starts in
 // a few milliseconds and a megabyte, but every interface had to be written a second time and most were missing or approximate, and libraries that pick their code
-// path by what the scope offers went wrong. This way a worker costs what a small frame costs (the preludes of a page without the drawing ones: tens of milliseconds
-// and a few megabytes) and behaves like the page does. The worker runs on the thread of its page, between the page's tasks: worker_pump() gives it its messages
+// path by what the scope offers went wrong. This way a worker costs what a frame with scripts costs to start and to keep (the preludes of a page without the
+// drawing ones are compiled and run again for it: in the sanitizer build of the host tests about 0.4 s and some tens of megabytes each, so a page may have
+// kMaxWorkers of them) and behaves like the page does. The worker runs on the thread of its page, between the page's tasks: worker_pump() gives it its messages
 // and its timers, each task under the page's own script budget, so a worker that never returns is stopped like a page's script is and says so with an error event.
 
 // What a worker asks of the browser: the page that owns it answers, and there is no window to move or to draw in.
@@ -2900,7 +2901,7 @@ struct Page::WorkerRuntime {
 };
 
 uint32_t Page::worker_start(StringView source, StringView url, StringView name, bool module, String* error) {
-  if (workers_.count() >= 8) {
+  if (workers_.count() >= kMaxWorkers) {
     error->assign("Too many workers are running.");
     return 0;
   }
@@ -2953,7 +2954,14 @@ void Page::run_dedicated_worker(StringView source, bool module) {
     bindings_->call_hook("__worker_module", args, 2);
   } else {
     String problem(allocator_);
-    if (!engine_->run(source, &problem, nullptr)) script_error(problem.view());
+    if (!engine_->run(source, &problem, nullptr)) {
+      if (engine_->compile_failed()) {   // (the script never ran: nothing in the scope could hear of it)
+        note_error(problem.view());
+        worker_scope_fail(problem.view(), true, StringView());
+      } else {
+        script_error(problem.view());
+      }
+    }
   }
   flush_errors();
 }
@@ -2968,8 +2976,7 @@ void Page::script_error(StringView text) {
       vm.recover();
       vm.reset_instruction_count();
     }
-    const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(text)};
-    bindings_->call_hook("__window_error", args, 1);
+    bindings_->fire_error(text);
   }
 }
 
@@ -2983,8 +2990,8 @@ void Page::worker_scope_post(StringView message, StringView ports) {
   worker_runtime_->add_event(0, message, ports);
 }
 
-void Page::worker_scope_fail(StringView text) {
-  if (worker_runtime_) worker_runtime_->add_event(1, text, StringView());
+void Page::worker_scope_fail(StringView text, bool unusable, StringView filename) {
+  if (worker_runtime_) worker_runtime_->add_event(unusable ? 3 : 1, text, filename);   // (an error has no ports: the place is the file's)
 }
 
 void Page::worker_scope_close() {
@@ -3350,7 +3357,7 @@ void Page::deliver_messages() {
       uint32_t home = window_id_;
       for (uint64_t i = 0; i < top->port_homes_.count(); ++i)
         if (top->port_homes_[i].port == m.port) home = top->port_homes_[i].window;
-      if (home != window_id_ && home != 0xFFFFFFFFu) {
+      if (home != window_id_ && home != 0xFFFFFFFFu) {   // (not the bridge to a service worker or another document: post_port_message() sent it here on purpose)
         if (Page* target = top->find_window(home)) {
           claim_ports(m.ports.view(), home);
           target->queue_port_message(m.port, m.payload.view(), m.ports.view());
