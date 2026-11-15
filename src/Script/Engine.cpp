@@ -841,6 +841,7 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
     return false;
   }
   vm_.recover();
+  compile_failed_ = true;
   Arena arena(allocator_);
   String message(allocator_);
   Node* program = parse_program(source, arena, &message);
@@ -855,6 +856,7 @@ bool Engine::run_here(StringView source, String* error, String* result, Value* o
     error->append(message.view());
     return false;
   }
+  compile_failed_ = false;
   Value value;
   if (!vm_.run(code, &value)) {
     vm_.take_exception(error);

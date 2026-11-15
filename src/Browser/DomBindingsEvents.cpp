@@ -28,17 +28,23 @@ namespace browser {
 namespace bind {
 
 void fire_error_event(DomBindings::Impl& c, StringView text) {
-  if (c.in_error_event) return;
+  if (c.in_error_event) {   // (an error of a listener of the error event is not told to the scope again; a worker's goes on to its Worker object)
+    if (c.host.worker_scope()) c.host.worker_scope_fail(text, false, StringView());
+    return;
+  }
   Vm& vm = c.vm;
   Value hook;
   if (!vm.get_named(Value::make_object(vm.global()), "__window_error", &hook) || !Vm::is_callable(hook)) return;
   c.in_error_event = true;
-  const Value arg = Value::make_string(vm.new_string(text));
+  // (the hook is given the text and what was thrown, which the engine keeps alive until the call has it)
+  const Value hook_args[2] = {Value::make_string(vm.new_string(text)), vm.taken_exception()};
   Value ignored;
-  if (!vm.call(hook, Value(), &arg, 1, &ignored)) {
+  const bool called = vm.call(hook, Value(), hook_args, 2, &ignored);
+  if (!called) {
     String dropped(vm.allocator());
     vm.take_exception(&dropped);
   }
+  vm.forget_taken_exception();
   c.in_error_event = false;
 }
 
@@ -614,7 +620,8 @@ bool dispatch_event(DomBindings::Impl& c, dom::Node* target, bool target_is_wind
   Value event_before, event_ours;
   const bool had_event = vm.get_plain(global, vm.intern("event"), &event_before);
   vm.get_plain(global, vm.intern("__window_event"), &event_ours);
-  const bool show_event = !had_event || event_before.is_undefined() || (event_before.is_object() && event_ours.is_object() && event_before.as_object() == event_ours.as_object());
+  // (a worker has no `event`)
+  const bool show_event = !c.host.worker_scope() && (!had_event || event_before.is_undefined() || (event_before.is_object() && event_ours.is_object() && event_before.as_object() == event_ours.as_object()));
   if (show_event) {
     vm.define(global, vm.intern("event"), event, kWritable);
     vm.define(global, vm.intern("__window_event"), event, kWritable);

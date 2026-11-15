@@ -1552,6 +1552,7 @@ void Vm::mark_roots() {
   mark_value(pending_frame_new_target_);
   for (uint64_t i = 0; i < handlers_.count(); ++i) mark(handlers_[i].env);
   mark_value(exception_);
+  mark_value(taken_exception_);
   mark_value(last_result_);
   mark_value(iter_return_);
   mark_value(extra_root_);
@@ -2804,11 +2805,23 @@ static constexpr bool js_stacks_enabled() {
 
 void Vm::take_exception(String* text) {
   text->clear();
+  taken_exception_ = halted_ ? Value() : exception_;
   if (halted_ && !halt_reason_.empty()) {
     text->append("Error: ");
     text->append(halt_reason_.view());
   } else {
-    describe(exception_, text, 0);
+    // An exception object that is not an Error of the language but says what it is (a DOMException: own `name` and `message`) reads as an Error does.
+    Value name, message;
+    if (exception_.is_object() && exception_.as_object()->okind != ObjKind::Error && !is_callable(exception_) && get_own(exception_.as_object(), name_, &name) && name.is_string() &&
+        get_own(exception_.as_object(), message_, &message) && message.is_string()) {
+      text->append(name.as_string()->view());
+      if (message.as_string()->length) {
+        text->append(": ");
+        text->append(message.as_string()->view());
+      }
+    } else {
+      describe(exception_, text, 0);
+    }
     if (js_stacks_enabled() && exception_.is_object() && exception_.as_object()->okind == ObjKind::Error) {   // (debugging a site: TCOS_JS_STACKS=1 adds the frames the error was made in, the lines after the first of its stack)
       Value stack;
       if (get(exception_, intern("stack"), &stack) && stack.is_string()) {

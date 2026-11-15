@@ -45,6 +45,8 @@ class Engine {
   // Compiles and runs a script. False with *error ("TypeError: x is not a function", "SyntaxError: ... (line 3)") if it could not be compiled or
   // threw. `result` (may be null) gets the value of the last expression statement as text.
   bool run(StringView source, String* error, String* result = nullptr);
+  // After a run() that failed: did the script not compile (true), or did it throw as it ran (false)?
+  bool compile_failed() const { return compile_failed_; }
   // The same for library code that the host runs before the page's scripts: the document is not looked at afterwards (reading its title would build parts of it).
   bool run_library(StringView source, String* error);
 
@@ -75,6 +77,7 @@ class Engine {
   IHost* host_;
   Vm vm_;
   uint64_t budget_ = 20000000, memory_ = 64u << 20;
+  bool compile_failed_ = false;
 };
 
 }  // namespace script

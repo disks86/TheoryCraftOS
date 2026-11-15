@@ -237,7 +237,11 @@ bool fetch_resource(allocators::IAllocator& allocator, IPageLoader& loader, Cook
   if (!target.scheme.equals("http") && !target.scheme.equals("https")) return fail("Unsupported URL scheme");
 
   WebUrl page(allocator);
-  const bool has_page = !opt.page_address.empty() && WebUrl::parse(allocator, opt.page_address, nullptr, &page) && page.is_special() && !page.is_file();
+  bool has_page = !opt.page_address.empty() && WebUrl::parse(allocator, opt.page_address, nullptr, &page) && page.is_special() && !page.is_file();
+  if (!has_page && opt.page_address.starts_with("blob:")) {   // (a worker or a frame made from a blob: its origin is that of the address inside, which made the blob)
+    String inner(allocator);
+    has_page = inner.assign(opt.page_address.substr(5)) && WebUrl::parse(allocator, inner.view(), nullptr, &page) && page.is_special() && !page.is_file();
+  }
   const bool local_page = !opt.page_address.empty() && !has_page;   // (a file on this machine: its origin is opaque, so everything is cross-origin)
   String page_origin(allocator);
   if (has_page) page.origin(&page_origin);

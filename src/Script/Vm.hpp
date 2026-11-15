@@ -321,6 +321,10 @@ class Vm {
   // The `resolve` / `reject` function of a promise; `shared` is a plain object that the pair of them share (once one has been called, the other does nothing).
   JsObject* resolving_function(JsObject* promise, JsObject* shared, bool reject);
   void set_extra_root(const Value& v) { extra_root_ = v; }
+  // The value of the exception take_exception() last turned into text (what a script threw), for the error event that tells of it; undefined when a script
+  // was stopped instead. forget_taken_exception() lets go of it.
+  const Value& taken_exception() const { return taken_exception_; }
+  void forget_taken_exception() { taken_exception_ = Value(); }
   // Takes the pending exception as a value (and clears it).
   void take_exception_value(Value* out) {
     *out = exception_;
@@ -563,7 +567,7 @@ class Vm {
   uint32_t sp_ = 0;
   List<Frame> frames_;
   List<Handler> handlers_;
-  Value exception_;
+  Value exception_, taken_exception_;
   bool has_exception_ = false;
   uint32_t throw_line_ = 0;   // the source line an exception was thrown from (kept for debugging builds: TCOS_ERROR_LINES prints it)
   Value last_result_;

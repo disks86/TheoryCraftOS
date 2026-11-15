@@ -23,6 +23,7 @@ namespace browser {
 namespace {
 
 const char kPrelude[] = R"JSPRELUDE((function (g) {
+  var Node = g.Node, window = g, document = g.document;   // (kept by name: the global scope of a worker loses both after this has run)
   var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
   var method = function (proto, name, fn) { Object.defineProperty(proto, name, { value: fn, writable: true }); };
   var ITER = Symbol.iterator;
@@ -414,12 +415,24 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       return address;
     }
     if (!(blob instanceof Blob)) throw typeError("execute 'createObjectURL' on 'URL'", "Overload resolution failed.");
-    var url = 'blob:' + origin + '/' + (++blobCounter) + '-' + Date.now();
+    var url = 'blob:' + origin + '/' + (inWorker ? 'w' + __window_id() + '-' : '') + (++blobCounter) + '-' + Date.now();   // (a worker's addresses are not those of its page)
     blobUrls[url] = blob;
     if (blob.__bytes.length > 0) __blob_register(url, __string_to_bytes(blob.__bytes));   // (for <img>, <video> and <audio>)
     return url;
   };
   URL.revokeObjectURL = function (url) { url = String(url); delete blobUrls[url]; __mse_revoke_url(url); __blob_revoke(url); };
+  // The Blob behind a blob: address. A worker is handed addresses made by the page that owns it: that page is asked for what this scope does not know.
+  var inWorker = typeof __worker_scope === 'function' && __worker_scope() !== null;
+  function blobAt(url) {
+    var blob = blobUrls[url];
+    if (!blob && inWorker) {
+      var wire = __worker_blob(url);
+      if (wire) blob = deserialize(wire, null);
+    }
+    return blob;
+  }
+  hide(g, '__blob_at', blobAt);
+  hide(g, '__blob_wire', function (url) { var blob = blobUrls[url]; return blob ? serialize(blob, null).text : ''; });
 
   // ------------------------------------------------------------------------------------------------------------ Media Source Extensions
   // MediaSource, SourceBuffer and SourceBufferList; the bytes, the frames and the ranges are the engine's (DomBindingsMse.cpp, Media/Mse.hpp). Appending is done
@@ -3110,7 +3123,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
       signal.addEventListener('abort', onabort);
       var fail = function (e) { if (finished) return; finished = true; signal.removeEventListener('abort', onabort); reject(e); };
       if (url.slice(0, 5) === 'blob:') {
-        var blob = blobUrls[url];
+        var blob = blobAt(url);
         if (!blob || request.method !== 'GET') { fail(new TypeError('Failed to fetch (blob URL not found)')); return; }
         var bh = new Headers(); bh.set('content-type', blob.type || 'application/octet-stream'); bh.set('content-length', String(blob.size));
         bh.__immutable = true;
@@ -3257,7 +3270,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (x.responseType === 'document' && essence !== 'text/html' && !isXmlMime(type) && type !== '') essence = 'text/xml';
     try {
       var text = decodeText(xhr, x.received);
-      doc = new DOMParser().parseFromString(text, essence === 'text/html' ? 'text/html' : (isXmlMime(type) ? (essence === 'application/xhtml+xml' ? 'application/xhtml+xml' : essence) : 'text/xml'));
+      if (typeof g.DOMParser !== 'function') return null;   // (a worker has no documents)
+      doc = new g.DOMParser().parseFromString(text, essence === 'text/html' ? 'text/html' : (isXmlMime(type) ? (essence === 'application/xhtml+xml' ? 'application/xhtml+xml' : essence) : 'text/xml'));
       if (doc && isXmlMime(type) && doc.getElementsByTagName('parsererror').length) doc = null;
     } catch (e) { doc = null; }
     x.objectCache = { kind: 'document', value: doc };
@@ -3499,12 +3513,17 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (transfer) {
       var list = Array.isArray(transfer) ? transfer : (isObject(transfer) && Array.isArray(transfer.transfer) ? transfer.transfer : []);
       for (var t = 0; t < list.length; t++) {
+        if (!isObject(list[t])) throw new TypeError('Value at index ' + t + ' of the transfer list is not an object.');
+        var plain = Object.getPrototypeOf(list[t]);
+        if (plain === Object.prototype || plain === Array.prototype || plain === null) throw dataCloneError('Value at index ' + t + ' does not have a transferable type.');
         if (list[t] instanceof MessagePort) {
           if (list[t].__detached) throw dataCloneError('Port is already detached.');
-          if (transferred.indexOf(list[t]) < 0) { transferred.push(list[t]); ids.push(list[t].__id); }
+          if (transferred.indexOf(list[t]) >= 0) throw dataCloneError('Message port at index ' + t + ' is a duplicate of an earlier port.');
+          transferred.push(list[t]); ids.push(list[t].__id);
         } else if (list[t] instanceof ArrayBuffer) {
           if (list[t].byteLength === 0 && list[t].__transferred) throw dataCloneError('An ArrayBuffer is detached and could not be cloned.');
-          if (buffers.indexOf(list[t]) < 0) buffers.push(list[t]);
+          if (buffers.indexOf(list[t]) >= 0) throw dataCloneError('ArrayBuffer at index ' + t + ' is a duplicate of an earlier ArrayBuffer.');
+          buffers.push(list[t]);
         }
       }
     }
@@ -3519,7 +3538,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         return v;
       }
       if (type === 'undefined') return { $: 'u' };
-      if (type !== 'object') throw dataCloneError('A function could not be cloned.');
+      if (type === 'bigint') return { $: 'bi', v: String(v) };
+      if (type !== 'object') throw dataCloneError(type === 'symbol' ? 'A Symbol could not be cloned.' : String(v).slice(0, 60) + ' could not be cloned.');
       var at = seen.indexOf(v);
       if (at >= 0) return { $: 'r', i: at };
       if (v instanceof MessagePort) {
@@ -3565,6 +3585,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         case 'u': return undefined;
         case 'n': return e.v === 'NaN' ? NaN : e.v === 'Infinity' ? Infinity : e.v === '-Infinity' ? -Infinity : -0;
         case 'r': return objs[e.i];
+        case 'bi': return BigInt(e.v);
         case 'a':
           out = []; objs.push(out);
           for (i = 0; i < e.e.length; i++) out.push(dec(e.e[i]));
@@ -3676,12 +3697,21 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     for (var i = 0; i < s.ports.length; i++) { s.ports[i].__detached = true; __port_move(s.ports[i].__id, 4294967295); }
     return { text: s.text, ids: s.ids.join(',') };
   });
+  // for a Worker and the scope of one: the same, with the ports left to the page tree (the natives say where they go) and the transferred buffers detached
+  function wireOut(value, transfer) {
+    var s = serialize(value, transfer);
+    for (var i = 0; i < s.ports.length; i++) s.ports[i].__detached = true;
+    for (var b = 0; b < s.buffers.length; b++) __detach_buffer(s.buffers[b]);
+    return [s.text, s.ids.join(','), s.ports];
+  }
+  hide(g, '__worker_wire', wireOut);
   hide(g, '__deserialize_transfer', function (text, idsCsv) {
     var found = [], data = deserialize(text, found);
     return { data: data, ports: arrivedPorts(parseIds(idsCsv), found) };
   });
   hide(g, '__port_deliver', function (id, text, idsCsv) {
     var port = portRegistry[id];
+    if (port && port.__limbo) { port.__limbo.push([text, idsCsv]); return; }   // (on its way to a worker that has not started: kept for it)
     if (!port || port.__closed || port.__detached) return;
     var found = [], data;
     try { data = deserialize(text, found); } catch (e) { port.dispatchEvent(new MessageEvent('messageerror', { data: null })); return; }
@@ -4132,47 +4162,71 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     if (arguments.length < 1) throw typeError("construct 'Worker'", "1 argument required, but only 0 present.");
     var address;
     try { address = new URL(String(url), location.href); } catch (e) { throw new DOMException("Failed to construct 'Worker': Script at '" + url + "' cannot be accessed from origin '" + location.origin + "'.", 'SyntaxError'); }
-    if (address.protocol !== 'blob:' && address.protocol !== 'data:' && address.origin !== location.origin)
-      throw new DOMException("Failed to construct 'Worker': Script at '" + address.href + "' cannot be accessed from origin '" + location.origin + "'.", 'SecurityError');
+    var type = isObject(options) && options.type !== undefined ? String(options.type) : 'classic';
+    if (type !== 'classic' && type !== 'module') throw typeError("construct 'Worker'", "Failed to read the 'type' property from 'WorkerOptions': The provided value '" + type + "' is not a valid enum value of type WorkerType.");
     this.onmessage = null; this.onerror = null; this.onmessageerror = null;
     hide(this, '__id', 0);
+    hide(this, '__url', address.href);
     hide(this, '__pending', []);
     hide(this, '__dead', false);
-    hide(this, '__timer', 0);
-    var self = this, name = options && options.name !== undefined ? String(options.name) : '';
-    var source = address.protocol === 'blob:' ? (blobUrls[address.href] ? blobUrls[address.href].text() : Promise.reject(new Error('The blob is gone'))) : fetch(address.href).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+    var self = this, name = isObject(options) && options.name !== undefined ? String(options.name) : '';
+    var source;
+    if (address.protocol !== 'blob:' && address.protocol !== 'data:' && address.origin !== location.origin) {
+      source = Promise.reject(new Error('The script is of another origin'));   // (it is not fetched: the Worker object hears an error event, the constructor does not throw)
+    } else if (address.protocol === 'blob:') {
+      var blob = blobAt(address.href);
+      source = blob ? blob.text() : Promise.reject(new Error('The blob is gone'));
+    } else {
+      source = fetch(address.href).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+    }
     source.then(function (text) {
       if (self.__dead) return;
-      var id = __worker_start(text, address.href, name);
-      if (!id) { fail(self, __worker_error || 'The worker could not be started'); return; }
+      var id = __worker_start(text, address.href, name, type === 'module');
+      if (!id) { unusable(self); return; }
       self.__id = id;
       workers[id] = self;
-      self.__pending.forEach(function (m) { __worker_post(id, m); });
+      self.__pending.forEach(function (m) {
+        __worker_post(id, m[0], m[1]);
+        m[2].forEach(function (port) {   // (what was posted to a transferred port while the worker was starting follows it)
+          var held = port.__limbo || [];
+          port.__limbo = null;
+          held.forEach(function (h) { __port_post(port.__id, h[0], h[1]); });
+        });
+      });
       self.__pending.length = 0;
-      self.__timer = setInterval(pumpWorkers, 5);
-    }).catch(function (e) { fail(self, e && e.message ? e.message : String(e)); });
+      if (!pumpTimer) pumpTimer = setInterval(pumpWorkers, 5);   // (one timer runs all the workers of the page, for as long as it has any)
+      pumpWorkers();   // (what the script said as it started)
+    }).catch(function () { unusable(self); });
   }
   Worker.prototype = Object.create(EventTarget.prototype);
   method(Worker.prototype, 'constructor', Worker);
-  function fail(worker, message) {
+  function fail(worker, message, filename) {
     if (worker.__dead) return;
-    var e = new Event('error', { cancelable: true });
-    e.message = String(message); e.filename = ''; e.lineno = 0; e.colno = 0; e.error = null;
+    var e, where = filename || worker.__url;
+    try { e = new ErrorEvent('error', { message: String(message), filename: where, lineno: 0, colno: 0, error: null, cancelable: true }); }
+    catch (x) { e = new Event('error', { cancelable: true }); e.message = String(message); e.filename = where; e.lineno = 0; e.colno = 0; e.error = null; }
     worker.dispatchEvent(e);
   }
-  method(Worker.prototype, 'postMessage', function (message) {
+  // The script could not be had or does not compile: a plain error event (no script ran, there is no error to describe).
+  function unusable(worker) {
+    if (worker.__dead) return;
+    worker.dispatchEvent(new Event('error', { cancelable: true }));
+  }
+  method(Worker.prototype, 'postMessage', function (message, transfer) {
     if (arguments.length < 1) throw typeError("execute 'postMessage' on 'Worker'", "1 argument required, but only 0 present.");
+    var wire = wireOut(message, transfer);   // (a value that cannot be cloned throws also when the worker is gone)
     if (this.__dead) return;
-    var text = __wire_encode(message);
-    if (this.__id) __worker_post(this.__id, text); else this.__pending.push(text);
+    if (this.__id) __worker_post(this.__id, wire[0], wire[1]);
+    else { wire[2].forEach(function (port) { port.__limbo = []; }); this.__pending.push(wire); }
   });
   method(Worker.prototype, 'terminate', function () {
     if (this.__dead) return;
     this.__dead = true;
     if (this.__id) { __worker_terminate(this.__id); delete workers[this.__id]; }
-    if (this.__timer) { clearInterval(this.__timer); this.__timer = 0; }
+    for (var id in workers) return;
+    if (pumpTimer) { clearInterval(pumpTimer); pumpTimer = 0; }
   });
-  var pumping = false;
+  var pumping = false, pumpTimer = 0;
   function pumpWorkers() {
     if (pumping) return;
     pumping = true;
@@ -4182,18 +4236,18 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
         var id = events[i][0], kind = events[i][1], text = events[i][2], worker = workers[id];
         if (!worker || worker.__dead) continue;
         if (kind === 0) {
-          var data;
-          try { data = __wire_decode(text); } catch (e) { worker.dispatchEvent(new MessageEvent('messageerror', { data: null })); continue; }
-          worker.dispatchEvent(new MessageEvent('message', { data: data, origin: '', lastEventId: '', source: null, ports: [] }));
+          var found = [], data;
+          try { data = deserialize(text, found); } catch (e) { worker.dispatchEvent(new MessageEvent('messageerror', { data: null })); continue; }
+          worker.dispatchEvent(new MessageEvent('message', { data: data, origin: '', lastEventId: '', source: null, ports: arrivedPorts(parseIds(events[i][3]), found) }));
         } else if (kind === 1) {
-          fail(worker, text);
+          fail(worker, text, events[i][3]);
+        } else if (kind === 3) {
+          unusable(worker);
         } else {
           worker.terminate();
         }
       }
     } finally { pumping = false; }
-    var any = false;
-    for (var k in workers) any = true;
   }
   hide(g, 'Worker', Worker);
 
@@ -4249,6 +4303,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
 
 
 const char kDomPrelude[] = R"JSPRELUDE((function (g) {
+  var window = g, document = g.document;   // (kept by name: the global scope of a worker loses both after this has run)
   var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
   var method = function (proto, name, fn) { Object.defineProperty(proto, name, { value: fn, writable: true }); };
   var illegal = function (name) { var f = function () { throw new TypeError('Illegal constructor'); }; Object.defineProperty(f, 'name', { value: name }); return f; };
@@ -6444,7 +6499,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var def = hide;
     var PREFIX = '__idb__';
     var open = {};   // name -> the database as it is in memory
-    function store() { try { return g.localStorage; } catch (e) { return null; } }
+    var kept = null;   // (a worker has no localStorage of its own to name, and keeps its databases where its page does)
+    try { kept = g.localStorage; } catch (e) { }
+    function store() { try { return g.localStorage || kept; } catch (e) { return kept; } }
     function load(name) {
       var ls = store(), text = ls ? ls.getItem(PREFIX + name) : null;
       if (text === null) return null;
@@ -11576,95 +11633,191 @@ const char kWebAssemblyPrelude[] = R"JSPRELUDE((function (g) {
 }(this));
 )JSPRELUDE";
 
+// The global scope of a dedicated worker. It is run last in the page that is a worker (Page::worker_start), after the preludes that give a window its
+// interfaces: it makes the global object a DedicatedWorkerGlobalScope (the prototype chain, postMessage / close / importScripts / name, the error events of
+// the scope), gives it a WorkerLocation and a WorkerNavigator, and takes away what belongs to a document - `window`, `document`, the node and element
+// interfaces, storage, history, dialogs - because scripts tell a worker from a window by what is there.
 const char kWorkerPrelude[] = R"JSPRELUDE((function (g) {
-  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true }); };
-  var listeners = { message: [], messageerror: [], error: [] };
-  var start = Date.now();
-  g.self = g;
-  g.name = __worker_name;
-  g.onmessage = null; g.onmessageerror = null; g.onerror = null;
-  var m = /^([a-z][a-z0-9+.-]*:)(?:\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(__worker_url) || [];
-  g.location = { href: __worker_url, protocol: m[1] || '', host: m[2] || '', hostname: (m[2] || '').replace(/:\d+$/, ''), origin: m[2] ? (m[1] + '//' + m[2]) : 'null', pathname: m[3] || '', search: m[4] || '', hash: m[5] || '', toString: function () { return __worker_url; } };
-  g.performance = { now: function () { return Date.now() - start; }, timeOrigin: start };
-  g.navigator = { userAgent: navigator.userAgent, language: 'en-US', languages: ['en-US'], hardwareConcurrency: 1, onLine: true };
-  g.postMessage = function (message) { if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present."); __out(__wire_encode(message)); };
-  g.close = function () { __worker_close(); };
-  g.addEventListener = function (type, fn) { if (listeners[type] && typeof fn === 'function' && listeners[type].indexOf(fn) < 0) listeners[type].push(fn); };
-  g.removeEventListener = function (type, fn) { var l = listeners[type], i = l ? l.indexOf(fn) : -1; if (i >= 0) l.splice(i, 1); };
-  g.dispatchEvent = function (event) {
-    var handler = g['on' + event.type];
-    if (typeof handler === 'function') handler.call(g, event);
-    var l = listeners[event.type] ? listeners[event.type].slice() : [];
-    for (var i = 0; i < l.length; i++) l[i].call(g, event);
-    return true;
+  if (typeof __worker_scope !== 'function' || __worker_scope() === null) return;
+  var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
+  var method = function (proto, name, fn) { Object.defineProperty(proto, name, { value: fn, writable: true, enumerable: true, configurable: true }); };
+  var getter = function (proto, name, fn) { Object.defineProperty(proto, name, { get: fn, enumerable: true, configurable: true }); };
+  var tag = function (proto, name) { Object.defineProperty(proto, Symbol.toStringTag, { value: name, configurable: true }); };
+  var illegal = function () { throw new TypeError('Illegal constructor'); };
+  var iface = function (name, parent) {
+    var C = function () { illegal(); };
+    Object.defineProperty(C, 'name', { value: name });
+    C.prototype = Object.create(parent ? parent.prototype : Object.prototype);
+    Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
+    tag(C.prototype, name);
+    if (parent) Object.setPrototypeOf(C, parent);
+    hide(g, name, C);
+    return C;
   };
-  g.importScripts = function () {
-    for (var i = 0; i < arguments.length; i++) {
-      var url = String(arguments[i]);
-      var base = __worker_url.slice(0, __worker_url.lastIndexOf('/') + 1);
-      if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = url.charAt(0) === '/' ? g.location.origin + url : base + url;
-      var source = __worker_fetch(url);
-      if (source === null) throw new Error("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '" + url + "' failed to load.");
-      (0, eval)(source);
+  var EventTarget = g.EventTarget, Event = g.Event, MessageEvent = g.MessageEvent, ErrorEvent = g.ErrorEvent, DOMException = g.DOMException;
+  var XMLHttpRequest = g.XMLHttpRequest, URL = g.URL, Blob = g.Blob, TextDecoder = g.TextDecoder;
+  var oldNavigator = g.navigator, address = String(g.location.href), moduleWorker = false;
+  var workerName = __worker_scope();
+
+  // --- the interfaces of the scope
+  var WorkerGlobalScope = iface('WorkerGlobalScope', EventTarget);
+  var DedicatedWorkerGlobalScope = iface('DedicatedWorkerGlobalScope', WorkerGlobalScope);
+  delete g[Symbol.toStringTag];
+  Object.setPrototypeOf(g, DedicatedWorkerGlobalScope.prototype);
+
+  // --- what a worker does not have
+  var gone = ['window', 'document', 'parent', 'top', 'frames', 'opener', 'frameElement', 'length', 'localStorage', 'sessionStorage', 'history', 'navigation', 'screen',
+    'alert', 'confirm', 'prompt', 'print', 'open', 'stop', 'focus', 'blur', 'moveTo', 'moveBy', 'resizeTo', 'resizeBy', 'scroll', 'scrollTo', 'scrollBy', 'getComputedStyle',
+    'matchMedia', 'getSelection', 'find', 'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset', 'screenX', 'screenY',
+    'screenLeft', 'screenTop', 'devicePixelRatio', 'visualViewport', 'customElements', 'external', 'event', 'status', 'closed', 'locationbar', 'menubar', 'personalbar',
+    'scrollbars', 'statusbar', 'toolbar', 'speechSynthesis', 'captureEvents', 'releaseEvents', 'SharedWorker', 'requestIdleCallback', 'cancelIdleCallback', 'cookieStore', 'documentPictureInPicture', 'trustedTypes',
+    'Window', 'Document', 'XMLDocument', 'DocumentFragment', 'DocumentType', 'DOMImplementation', 'Node', 'NodeList', 'NodeFilter', 'NodeIterator', 'TreeWalker', 'Element',
+    'Attr', 'NamedNodeMap', 'CharacterData', 'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'ShadowRoot', 'Range', 'StaticRange', 'AbstractRange', 'Selection',
+    'DOMParser', 'XMLSerializer', 'XPathEvaluator', 'XPathExpression', 'XPathResult', 'XSLTProcessor', 'MutationObserver', 'MutationRecord', 'IntersectionObserver',
+    'IntersectionObserverEntry', 'ResizeObserver', 'ResizeObserverEntry', 'ResizeObserverSize', 'DOMTokenList', 'DOMStringMap', 'DOMRect', 'DOMRectReadOnly', 'DOMRectList',
+    'Image', 'Audio', 'Option', 'Storage', 'StorageEvent', 'History', 'Location', 'Navigator', 'Screen', 'ScreenOrientation', 'VisualViewport', 'CustomElementRegistry',
+    'ElementInternals', 'MediaQueryList', 'MediaQueryListEvent', 'UIEvent', 'MouseEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'WheelEvent', 'PointerEvent', 'TouchEvent',
+    'Touch', 'TouchList', 'DragEvent', 'ClipboardEvent', 'CompositionEvent', 'SubmitEvent', 'FormDataEvent', 'ToggleEvent', 'PopStateEvent', 'HashChangeEvent',
+    'PageTransitionEvent', 'BeforeUnloadEvent', 'AnimationEvent', 'TransitionEvent', 'DataTransfer', 'DataTransferItem', 'DataTransferItemList', 'Clipboard', 'ClipboardItem',
+    'StyleSheet', 'StyleSheetList', 'MediaList', 'MediaSource', 'SourceBuffer', 'SourceBufferList', 'ValidityState', 'RadioNodeList', 'External', 'BarProp',
+    'ServiceWorkerContainer', 'Plugin', 'PluginArray', 'MimeType', 'MimeTypeArray'];
+  for (var i = 0; i < gone.length; i++) { try { delete g[gone[i]]; } catch (e) { } }
+  Object.getOwnPropertyNames(g).forEach(function (k) {
+    if (/^(HTML|SVG|CSS.|Audio|MediaStream|MediaKey|MediaElement|TextTrack|VTT|RTC|Speech|Gamepad|XR|WebGL|GPU.|Animation|KeyframeEffect|CanvasRendering|CanvasCapture|Document|Shadow)/.test(k)) {
+      try { delete g[k]; } catch (e) { }
     }
-  };
-  // what workers expect to find
-  function TextEncoder() { this.encoding = 'utf-8'; }
-  TextEncoder.prototype.encode = function (text) { return __string_to_bytes(text === undefined ? '' : String(text)); };
-  g.TextEncoder = TextEncoder;
-  function TextDecoder(label) { this.encoding = 'utf-8'; this.fatal = false; this.ignoreBOM = false; }
-  TextDecoder.prototype.decode = function (input) {
-    if (input === undefined) return '';
-    var bytes = input instanceof ArrayBuffer ? new Uint8Array(input) : (ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength) : null);
-    if (!bytes) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
-    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) bytes = bytes.subarray(3);
-    return __bytes_to_string(bytes);
-  };
-  g.TextDecoder = TextDecoder;
-  var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  g.btoa = function (text) {
-    text = String(text);
-    var out = '';
-    for (var i = 0; i < text.length; i += 3) {
-      var a = text.charCodeAt(i), b = text.charCodeAt(i + 1), c = text.charCodeAt(i + 2);
-      if (a > 255 || b > 255 || c > 255) throw new Error("Failed to execute 'btoa' on 'WorkerGlobalScope': The string to be encoded contains characters outside of the Latin1 range.");
-      out += B64.charAt(a >> 2) + B64.charAt(((a & 3) << 4) | ((b || 0) >> 4)) + (i + 1 < text.length ? B64.charAt(((b & 15) << 2) | ((c || 0) >> 6)) : '=') + (i + 2 < text.length ? B64.charAt(c & 63) : '=');
-    }
-    return out;
-  };
-  g.atob = function (text) {
-    text = String(text).replace(/[\t\n\f\r ]/g, '');
-    if (text.length % 4 === 1 || /[^A-Za-z0-9+\/=]/.test(text)) throw new Error("Failed to execute 'atob' on 'WorkerGlobalScope': The string to be decoded is not correctly encoded.");
-    var bytes = [];
-    for (var i = 0; i < text.length; i += 4) {
-      var n = [0, 1, 2, 3].map(function (k) { var ch = text.charAt(i + k); return ch === '' || ch === '=' ? -1 : B64.indexOf(ch); });
-      bytes.push((n[0] << 2) | (n[1] >> 4));
-      if (n[2] >= 0) bytes.push(((n[1] & 15) << 4) | (n[2] >> 2));
-      if (n[3] >= 0) bytes.push(((n[2] & 3) << 6) | n[3]);
-    }
-    return bytes.map(function (b) { return String.fromCharCode(b); }).join('');
-  };
-  // fetch() for a worker: the answer is had at once (only GET, only text), and comes as a promise
-  g.fetch = function (resource) {
-    var url = typeof resource === 'string' ? resource : resource && resource.url ? resource.url : String(resource);
-    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = url.charAt(0) === '/' ? g.location.origin + url : __worker_url.slice(0, __worker_url.lastIndexOf('/') + 1) + url;
-    var text = __worker_fetch(url);
-    if (text === null) return Promise.reject(new TypeError('Failed to fetch'));
-    var response = {
-      ok: true, status: 200, statusText: 'OK', url: url, type: 'basic', redirected: false, headers: { get: function () { return null; }, has: function () { return false; } }, bodyUsed: false,
-      text: function () { return Promise.resolve(text); },
-      json: function () { try { return Promise.resolve(JSON.parse(text)); } catch (e) { return Promise.reject(e); } },
-      arrayBuffer: function () { return Promise.resolve(__string_to_bytes(text).buffer); },
-      clone: function () { return response; }
-    };
-    return Promise.resolve(response);
-  };
-  hide(g, '__deliver', function () {
-    var text = g.__inbox, data;
-    try { data = __wire_decode(text); } catch (e) { g.dispatchEvent({ type: 'messageerror', data: null, target: g }); return; }
-    try { g.dispatchEvent({ type: 'message', data: data, origin: '', lastEventId: '', source: null, ports: [], target: g }); }
-    catch (e) { __worker_fail(String(e && e.message !== undefined ? (e.name || 'Error') + ': ' + e.message : e)); }
+    if (/^on[a-z]+$/.test(k)) { try { delete g[k]; } catch (e) { } }   // (the event handler attributes of a window)
   });
+
+  // --- location and navigator
+  var WorkerLocation = iface('WorkerLocation');
+  var place = new URL(address);
+  ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].forEach(function (k) {
+    getter(WorkerLocation.prototype, k, function () { return k === 'origin' && place.protocol !== 'http:' && place.protocol !== 'https:' ? __worker_origin : place[k]; });
+  });
+  method(WorkerLocation.prototype, 'toString', function () { return place.href; });
+  var __worker_origin = g.origin !== undefined && g.origin !== 'null' ? String(g.origin) : place.origin;
+  var location = Object.create(WorkerLocation.prototype);
+  Object.defineProperty(g, 'location', { get: function () { return location; }, enumerable: true, configurable: true });
+
+  var WorkerNavigator = iface('WorkerNavigator');
+  ['userAgent', 'platform', 'language', 'languages', 'onLine', 'hardwareConcurrency', 'deviceMemory', 'appName', 'appVersion', 'appCodeName', 'product', 'productSub',
+    'vendor', 'vendorSub', 'userAgentData', 'storage', 'locks', 'permissions', 'connection', 'mediaCapabilities', 'serviceWorker'].forEach(function (k) {
+    if (oldNavigator && oldNavigator[k] !== undefined) getter(WorkerNavigator.prototype, k, function () { return oldNavigator[k]; });
+  });
+  var navigator = Object.create(WorkerNavigator.prototype);
+  Object.defineProperty(g, 'navigator', { get: function () { return navigator; }, enumerable: true, configurable: true });
+
+  // --- the scope itself
+  Object.defineProperty(g, 'self', { get: function () { return g; }, enumerable: true, configurable: true });
+  Object.defineProperty(g, 'name', { value: workerName, writable: true, enumerable: true, configurable: true });
+  if (g.origin === undefined || g.origin === 'null') { try { Object.defineProperty(g, 'origin', { value: __worker_origin, writable: true, configurable: true }); } catch (e) { } }
+  // The event handler attributes of the scope: a function or null (anything else that is set reads back as null), heard like a listener added when first set.
+  var handlerOf = function (type) {
+    var current = null, listening = false;
+    Object.defineProperty(g, 'on' + type, { enumerable: true, configurable: true,
+      get: function () { return current; },
+      set: function (v) {
+        current = typeof v === 'function' || (v !== null && typeof v === 'object') ? v : null;
+        if (!listening && typeof current === 'function') { listening = true; g.addEventListener(type, function (e) { if (typeof current === 'function') return current.call(g, e); }); }
+      } });
+  };
+  ['message', 'messageerror', 'unhandledrejection', 'rejectionhandled', 'languagechange', 'online', 'offline'].forEach(handlerOf);
+  hide(g, 'postMessage', function postMessage(message, transfer) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present.");
+    var wire = __worker_wire(message, transfer);
+    __worker_out(wire[0], wire[1]);
+  });
+  var closing = false;
+  hide(g, 'close', function close() { closing = true; if (g.__timers) g.__timers.length = 0; __worker_close(); });   // (the timers that wait are dropped)
+  var thrownBy = null;
+  var scripty = function (type) {
+    var essence = String(type).split(';')[0].replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '').toLowerCase();
+    return /^(application\/(x-)?(ecma|java)script|text\/(x-)?(ecma|java)script|text\/javascript1\.[0-5]|text\/(jscript|livescript))$/.test(essence);
+  };
+  hide(g, 'importScripts', function importScripts() {
+    if (moduleWorker) throw new TypeError("Failed to execute 'importScripts' on 'WorkerGlobalScope': Module scripts don't support importScripts().");
+    var sources = [];
+    for (var i = 0; i < arguments.length; i++) {   // (all of them are fetched before the first runs)
+      var url;
+      try { url = new URL(String(arguments[i]), address).href; }
+      catch (e) { throw new DOMException("Failed to execute 'importScripts' on 'WorkerGlobalScope': The URL '" + arguments[i] + "' is invalid.", 'SyntaxError'); }
+      var failed = function () { return new DOMException("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '" + url + "' failed to load.", 'NetworkError'); };
+      if (url.slice(0, 5) === 'blob:') {
+        var blob = __blob_at(url);
+        if (!blob) throw failed();
+        if (blob.type && !scripty(blob.type)) throw failed();
+        sources.push({ url: url, text: new TextDecoder().decode(__string_to_bytes(blob.__bytes)) });
+      } else {
+        var x = new XMLHttpRequest();
+        try { x.open('GET', url, false); x.send(); } catch (e) { throw failed(); }
+        if (x.status < 200 || x.status > 299) throw failed();
+        var type = x.getResponseHeader('Content-Type');
+        if (type && !scripty(type)) throw failed();   // (a script must be served as one)
+        sources.push({ url: url, text: x.responseText });
+      }
+    }
+    for (var k = 0; k < sources.length; k++) {
+      try { (0, eval)(sources[k].text); }
+      catch (e) { if (!thrownBy || thrownBy.value !== e) thrownBy = { value: e, url: sources[k].url }; throw e; }   // (if nothing catches it, the error event names the file it is from)
+    }
+  });
+
+  // --- errors: the scope's error event first; what it does not cancel is the error event of the Worker object in the page
+  var unhandled = function (message, filename) { __worker_fail(String(message), false, filename || ''); };
+  hide(g, '__worker_unhandled', unhandled);
+  hide(g, '__worker_unusable', function (e) { __worker_fail(String(e && e.name !== undefined && e.message !== undefined ? e.name + ': ' + e.message : e), true); });
+  var raise = function (message, error) {
+    var where = address;
+    if (thrownBy) { if (thrownBy.value === error) where = thrownBy.url; thrownBy = null; }
+    var e = new ErrorEvent('error', { message: String(message), filename: where, lineno: 0, colno: 0, error: error === undefined ? null : error, cancelable: true });
+    var go = true;
+    try { go = g.dispatchEvent(e); } catch (x) { }
+    if (go) unhandled(message, where);
+  };
+  hide(g, '__window_error', function (text, thrown) { raise(text, thrown); });
+  hide(g, 'reportError', function reportError(error) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'reportError' on 'WorkerGlobalScope': 1 argument required, but only 0 present.");
+    raise('Uncaught ' + (error && error.name !== undefined && error.message !== undefined ? error.name + ': ' + error.message : String(error)), error);
+  });
+  // onerror is called the way a window's is: (message, filename, lineno, colno, error), and returning true says the error was dealt with
+  var onerror = null;
+  Object.defineProperty(g, 'onerror', { get: function () { return onerror; }, set: function (v) { onerror = typeof v === 'function' ? v : null; }, enumerable: true, configurable: true });
+  g.addEventListener('error', function (e) {
+    if (typeof onerror !== 'function') return;
+    var r = e instanceof ErrorEvent ? onerror.call(g, e.message, e.filename, e.lineno, e.colno, e.error) : onerror.call(g, e);
+    if (r === true) e.preventDefault();
+  });
+
+  // --- messages from the page
+  hide(g, '__fire_message', function (text, origin, sourceId, idsCsv) {
+    if (closing) return;
+    var m;
+    try { m = __deserialize_transfer(text, idsCsv); } catch (e) { g.dispatchEvent(new MessageEvent('messageerror', { data: null })); return; }
+    g.dispatchEvent(new MessageEvent('message', { data: m.data, origin: '', lastEventId: '', source: null, ports: m.ports }));
+  });
+  var runModule = g.__worker_module;
+  hide(g, '__worker_module', function (where, text) { moduleWorker = true; runModule(where, text); });
+  hide(g, '__storage_event', function () { });   // (a worker has no Web Storage to hear about)
+
+  // --- FileReaderSync
+  function FileReaderSync() {
+    if (!(this instanceof FileReaderSync)) throw new TypeError("Failed to construct 'FileReaderSync': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+  }
+  tag(FileReaderSync.prototype, 'FileReaderSync');
+  var blobOf = function (what, blob) {
+    if (!(blob instanceof Blob)) throw new TypeError("Failed to execute '" + what + "' on 'FileReaderSync': parameter 1 is not of type 'Blob'.");
+    return blob.__bytes;
+  };
+  method(FileReaderSync.prototype, 'readAsArrayBuffer', function (blob) { return __string_to_bytes(blobOf('readAsArrayBuffer', blob)).buffer; });
+  method(FileReaderSync.prototype, 'readAsBinaryString', function (blob) { return blobOf('readAsBinaryString', blob); });
+  method(FileReaderSync.prototype, 'readAsText', function (blob, encoding) {
+    var bytes = __string_to_bytes(blobOf('readAsText', blob)), decoder;
+    try { decoder = new TextDecoder(encoding === undefined ? 'utf-8' : String(encoding)); } catch (e) { decoder = new TextDecoder(); }
+    return decoder.decode(bytes);
+  });
+  method(FileReaderSync.prototype, 'readAsDataURL', function (blob) { return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(blobOf('readAsDataURL', blob)); });
+  hide(g, 'FileReaderSync', FileReaderSync);
 }(this));
 )JSPRELUDE";
 
@@ -11673,6 +11826,7 @@ const char kWorkerPrelude[] = R"JSPRELUDE((function (g) {
 // registry kept here, anything else with a synchronous XMLHttpRequest), so a page's module graph is loaded when import() or a <script type=module> asks for it;
 // only evaluation is asynchronous (a module is an async function: top-level await). Also: <script> elements put in the document by a script, import maps.
 const char kModulePrelude[] = R"JSPRELUDE((function (g) {
+  var window = g, document = g.document;   // (kept by name: the global scope of a worker loses both after this has run)
   var hide = function (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, configurable: true }); };
   var records = {};          // address -> module record
   var blobs = {};            // blob: address -> Blob (module sources are read from here)
@@ -11683,7 +11837,7 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
   URL.createObjectURL = function (blob) { var address = nativeCreate.apply(URL, arguments); if (blob instanceof Blob) blobs[address] = blob; return address; };
   URL.revokeObjectURL = function (address) { delete blobs[String(address)]; return nativeRevoke.apply(URL, arguments); };
 
-  var baseAddress = function () { return document.baseURI || location.href; };
+  var baseAddress = function () { return typeof g.document === 'object' ? document.baseURI || location.href : g.location.href; };   // (a worker has no document)
   var parse = function (text, base) { try { return base === undefined ? new URL(text) : new URL(text, base); } catch (e) { return null; } };
   // A specifier that is an address: absolute, or starting with /, ./ or ../ (a bare name like "lodash" is not).
   var parseLike = function (text, base) { return /^(\/|\.\/|\.\.\/)/.test(text) ? parse(text, base) : parse(text); };
@@ -11753,7 +11907,7 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
   function sourceOf(address) {
     var failed = function () { return new TypeError('Failed to fetch dynamically imported module: ' + address); };
     if (address.indexOf('blob:') === 0) {
-      var b = blobs[address];
+      var b = blobs[address] || (typeof g.__blob_at === 'function' ? g.__blob_at(address) : null);
       if (!b) throw failed();
       return b.__bytes;
     }
@@ -11903,8 +12057,14 @@ const char kModulePrelude[] = R"JSPRELUDE((function (g) {
   function report(e) {
     var ev;
     try { ev = new ErrorEvent('error', { message: 'Uncaught ' + (e && e.name ? e.name + ': ' + e.message : String(e)), error: e, cancelable: true }); } catch (x) { ev = null; }
-    if (ev) { if (g.dispatchEvent(ev)) console.error(ev.message); } else console.error(String(e));
+    if (ev) { if (g.dispatchEvent(ev)) { if (typeof g.__worker_unhandled === 'function') g.__worker_unhandled(ev.message); else console.error(ev.message); } } else console.error(String(e));
   }
+  // The script of a module worker: `text` is the module at `address` (already read by the page that made the worker).
+  Object.defineProperty(g, '__worker_module', { value: function (address, text) {
+    var rec = newRecord(address, address, text);
+    try { load(rec, {}); link(rec, {}); } catch (e) { g.__worker_unusable(e); return; }   // (it never ran)
+    evaluate(rec, []).then(function () {}, function (e) { report(e); });
+  } });
   function fire(el, type) { try { el.dispatchEvent(new Event(type)); } catch (e) { report(e); } }
   function later(fn) { setTimeout(fn, 0); }
 

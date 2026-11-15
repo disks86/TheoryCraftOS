@@ -249,20 +249,32 @@ class IDomHost {
     return false;
   }
   virtual void rtc_release(uint32_t id) { (void)id; }
-  // Web Workers: a worker is a script engine of its own that the page owns. worker_start() runs `source` in it (0 and *error set when that cannot be done);
-  // worker_post() hands it a message (serialized); worker_pump() lets it run (messages in, timers) and collects what it says, which worker_next_event() gives
-  // one at a time: kind 0 a message (text), 1 an uncaught error (text), 2 the worker closed itself.
-  virtual uint32_t worker_start(StringView source, StringView url, StringView name, String* error) {
+  // Web Workers: a worker is a global scope of its own (a script engine with the web platform, no document) that the page owns. worker_start() runs `source`
+  // in it, as a module if `module` (0 and *error set when that cannot be done); worker_post() hands it a message (serialized; `ports` are the numbers of the
+  // message ports that go with it, comma separated); worker_pump() lets it run (messages in, timers) and collects what it says, which worker_next_event()
+  // gives one at a time: kind 0 a message (text, ports), 1 an uncaught error (text), 2 the worker closed itself, 3 its script could not be compiled or loaded.
+  virtual uint32_t worker_start(StringView source, StringView url, StringView name, bool module, String* error) {
     (void)source;
     (void)url;
     (void)name;
+    (void)module;
     error->assign("This browser cannot run workers.");
     return 0;
   }
-  virtual void worker_post(uint32_t id, StringView message) { (void)id; (void)message; }
+  virtual void worker_post(uint32_t id, StringView message, StringView ports) { (void)id; (void)message; (void)ports; }
   virtual void worker_terminate(uint32_t id) { (void)id; }
   virtual void worker_pump() {}
-  virtual bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) { (void)id; (void)kind; (void)text; return false; }
+  virtual bool worker_next_event(uint32_t* id, uint32_t* kind, String* text, String* ports) { (void)id; (void)kind; (void)text; (void)ports; return false; }
+  // The other side: is this the global scope of a dedicated worker, and what the worker says to the page that owns it (a message, an error nothing in the
+  // worker handled, close()). worker_scope_name() is the name the page gave it. worker_scope_blob() asks the owner for the bytes behind a blob: address made there.
+  virtual bool worker_scope() { return false; }
+  virtual StringView worker_scope_name() { return StringView(); }
+  virtual void worker_scope_post(StringView message, StringView ports) { (void)message; (void)ports; }
+  // (`unusable`: the script of the worker could not be compiled, or what it imports could not be had - it never ran)
+  // `filename` is the script the error is from, when the scope knows.
+  virtual void worker_scope_fail(StringView text, bool unusable, StringView filename) { (void)text; (void)unusable; (void)filename; }
+  virtual void worker_scope_close() {}
+  virtual bool worker_scope_blob(StringView address, String* wire) { (void)address; (void)wire; return false; }
   // Service workers and the Cache API. service_workers() is the hub of the browser (nullptr: none); service_worker_client() is the id of this document there (0: it is not one
   // that service workers know); service_worker_id() is not 0 when this page is the global scope of that worker. cache_store() holds the caches of every origin.
   virtual ServiceWorkerHub* service_workers() { return nullptr; }
@@ -321,6 +333,8 @@ class DomBindings {
   };
   // `result` (optional) gets the value the function returned as text ("" for undefined and null).
   bool call_hook(StringView name, const HookArg* args, uint32_t count, String* result = nullptr);
+  // An error no listener was running for (a script as it starts, a timer): the error event of the global scope.
+  void fire_error(StringView text);
   // The same, as a task of its own: it runs when the event loop gets to it (the next timer turn), not now.
   void schedule_hook(StringView name, const HookArg* args, uint32_t count);
 

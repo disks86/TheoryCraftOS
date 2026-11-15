@@ -192,12 +192,12 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
-      if (!engine_->run_library(webgl_prelude(), &prelude_error)) {
+      if (!worker_runtime_ && !engine_->run_library(webgl_prelude(), &prelude_error)) {   // (a worker draws nothing: it does without the drawing interfaces)
         prelude_error.insert(0, "The WebGL script failed: ");
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
-      if (!engine_->run_library(webgpu_prelude(), &prelude_error)) {
+      if (!worker_runtime_ && !engine_->run_library(webgpu_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The WebGPU script failed: ");
         env_.console(3, prelude_error.view());
       }
@@ -216,17 +216,17 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
-      if (!engine_->run_library(animation_prelude(), &prelude_error)) {
+      if (!worker_runtime_ && !engine_->run_library(animation_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The animation script failed: ");
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
-      if (!engine_->run_library(web_audio_prelude(), &prelude_error)) {
+      if (!worker_runtime_ && !engine_->run_library(web_audio_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The Web Audio script failed: ");
         env_.console(3, prelude_error.view());
       }
       prelude_error.clear();
-      if (!engine_->run_library(svg_prelude(), &prelude_error)) {
+      if (!worker_runtime_ && !engine_->run_library(svg_prelude(), &prelude_error)) {
         prelude_error.insert(0, "The SVG script failed: ");
         env_.console(3, prelude_error.view());
       }
@@ -236,6 +236,13 @@ bool Page::start_engine() {
         env_.console(3, prelude_error.view());
       }
       bindings_->mark_interfaces();
+      if (worker_runtime_) {   // (last: what came before was written for a window, and this takes the window away)
+        prelude_error.clear();
+        if (!engine_->run_library(worker_prelude(), &prelude_error)) {
+          prelude_error.insert(0, "The worker script failed: ");
+          env_.console(3, prelude_error.view());
+        }
+      }
       bindings_->set_ready_state(loading_ ? "loading" : "complete");
       bindings_->set_hidden(hidden_);
       return true;
@@ -1043,6 +1050,7 @@ bool Page::run_due_timers(double now_ms) {
     deliver_messages();
     any_frame = true;
   }
+  if (worker_runtime_ && worker_runtime_closed()) return true;   // (close(): nothing of the worker runs after the task that called it)
   if (sw_client_ != 0) {
     if (ServiceWorkerHub* hub = env_.service_workers()) {
       if (hub->busy()) {
@@ -1060,7 +1068,7 @@ bool Page::run_due_timers(double now_ms) {
   if (!engine_->next_timer(&due) || due > now_ms) return any_frame;
   String error(allocator_);
   engine_->run_due_timers(now_ms, 50, &error);
-  if (!error.empty()) note_error(error.view());
+  if (!error.empty()) script_error(error.view());
   if (bindings_ && bindings_->errors()) {
     String text(allocator_);
     bindings_->take_error(&text);
@@ -2749,6 +2757,7 @@ void each_number(StringView list, F&& visit) {
 
 Page* Page::find_window(uint32_t id) {
   if (window_id_ == id) return this;
+  if (Page* p = find_worker_window(id)) return p;
   for (uint64_t i = 0; i < frames_.count(); ++i) {
     if (!frames_[i]->page) continue;
     if (Page* p = frames_[i]->page->find_window(id)) return p;
@@ -2769,6 +2778,7 @@ uint32_t Page::frame_window_id(uint32_t iframe_serial) {
 }
 
 const String& Page::storage_origin() {
+  if (worker_owner_) return worker_owner_->storage_origin();   // (a worker is of the origin of its page, also when its script came from a blob: or data: address)
   if (storage_origin_.empty()) {
     WebUrl url(allocator_);
     if (WebUrl::parse(allocator_, address_.view(), nullptr, &url) && !url.is_file()) {
@@ -2831,138 +2841,199 @@ bool Page::cookie_write(StringView text) {
   return env_.cookies().store(text, url, env_.now_ms(), true);
 }
 
-// --- Web Workers: a script engine of its own, without the document
+// --- Web Workers ----------------------------------------------------------------------------------------------------------------
+//
+// A dedicated worker is a hidden Page of its own, as a service worker is: a script engine with everything the page's scripts have (fetch, XMLHttpRequest,
+// streams, URL, Blob, crypto, IndexedDB, message ports, WebAssembly, modules ...), turned into a DedicatedWorkerGlobalScope by worker_prelude(), which takes
+// `window`, `document` and the other things of a document away. The other choice - a bare engine with a prelude of its own, which is what this was - starts in
+// a few milliseconds and a megabyte, but every interface had to be written a second time and most were missing or approximate, and libraries that pick their code
+// path by what the scope offers went wrong. This way a worker costs what a frame with scripts costs to start and to keep (the preludes of a page without the
+// drawing ones are compiled and run again for it: in the sanitizer build of the host tests about 0.4 s and some tens of megabytes each, so a page may have
+// kMaxWorkers of them) and behaves like the page does. The worker runs on the thread of its page, between the page's tasks: worker_pump() gives it its messages
+// and its timers, each task under the page's own script budget, so a worker that never returns is stopped like a page's script is and says so with an error event.
 
-struct Page::WorkerRuntime final : script::IHost {
-  struct Event {
-    explicit Event(allocators::IAllocator& a) : text(a) {}
-    uint32_t kind = 0;
-    String text;
-  };
-  WorkerRuntime(Page& owner, uint32_t worker_id) : page(owner), id(worker_id), url(owner.allocator_), name(owner.allocator_), inbox(owner.allocator_), events(owner.allocator_) {}
-  Page& page;
-  uint32_t id;
-  UniquePointer<script::Engine> engine;
-  UniquePointer<bind::WasmState> wasm;   // (made after the engine, so destroyed before it)
-  String url, name;
-  List<String> inbox;      // messages for the worker, serialized
-  List<Event> events;      // what it said: messages, errors, its closing
-  bool closed = false;
-  void add_event(uint32_t kind, StringView text) {
-    Event e(page.allocator_);
-    e.kind = kind;
-    e.text.assign(text);
-    events.push_back(util::move(e));
-  }
-  // script::IHost
-  void console(int level, StringView text) override {
-    String line(page.allocator_);
+// What a worker asks of the browser: the page that owns it answers, and there is no window to move or to draw in.
+class Page::WorkerEnv final : public IPageEnvironment {
+ public:
+  explicit WorkerEnv(Page& owner) : owner_(owner) {}
+  bool fetch_text(StringView address, uint64_t limit, String* text) override { return owner_.env_.fetch_text(address, limit, text); }
+  bool fetch_bytes(StringView address, uint64_t limit, ByteBuffer* out) override { return owner_.env_.fetch_bytes(address, limit, out); }
+  UniquePointer<IVideoClip> open_video(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_video(util::move(data)); }
+  UniquePointer<IVideoClip> open_audio(UniquePointer<ByteBuffer> data) override { return owner_.env_.open_audio(util::move(data)); }
+  void navigate(StringView, bool) override {}
+  void set_hash(StringView) override {}
+  void reload() override {}
+  void history_go(int32_t) override {}
+  uint32_t history_length() override { return 1; }
+  void push_state(StringView, StringView, bool, bool) override {}
+  void alert(StringView) override {}
+  bool confirm(StringView) override { return false; }
+  void scroll_to(int32_t) override {}
+  uint64_t now_ms() override { return owner_.env_.now_ms(); }
+  uint64_t monotonic_us() override { return owner_.env_.monotonic_us(); }
+  void console(int level, StringView text) override {   // (what a worker logs is in the console of its page)
+    String line(owner_.allocator_);
     line.append("[worker] ");
     line.append(text);
-    page.env_.console(level, line.view());
+    owner_.env_.console(level, line.view());
   }
-  void alert(StringView) override {}
-  void document_write(StringView, bool) override {}
-  uint64_t now_ms() override { return page.env_.now_ms(); }
-  StringView location() override { return url.view(); }
-  StringView title() override { return StringView(); }
-  void set_title(StringView) override {}
-  StringView user_agent() override { return "Mozilla/5.0 (compatible; TheoryCraftOS-Browser/1.0)"; }
+  CacheStore* cache_store() override { return &owner_.cache_store(); }
+  StorageHub& local_storage_hub() override { return owner_.env_.local_storage_hub(); }
+  StorageHub& session_storage_hub() override { return owner_.env_.session_storage_hub(); }
+  PageHub& page_hub() override { return owner_.env_.page_hub(); }
+  uint64_t tab_id() override { return owner_.env_.tab_id(); }
+  CookieJar& cookies() override { return owner_.env_.cookies(); }
+  // (through the page: the service worker in charge of the page answers the requests of its workers too)
+  bool http_request(const FetchOptions& options, NetResponse* response) override { return owner_.http_request(options, response); }
+  void http_answered(const NetResponse& response) override { owner_.env_.http_answered(response); }
+  UniquePointer<IWebSocket> open_websocket(StringView url, StringView protocols, StringView origin, String* error) override {
+    return owner_.env_.open_websocket(url, protocols, origin, error);
+  }
+
+ private:
+  Page& owner_;
 };
 
-uint32_t Page::worker_start(StringView source, StringView url, StringView name, String* error) {
-  if (workers_.count() >= 8) {
+struct Page::WorkerRuntime {
+  struct Event {
+    explicit Event(allocators::IAllocator& a) : text(a), ports(a) {}
+    uint32_t kind = 0;
+    String text, ports;
+  };
+  WorkerRuntime(Page& owner, uint32_t worker_id) : env(owner), id(worker_id), name(owner.allocator_), events(owner.allocator_) {}
+  WorkerEnv env;
+  uint32_t id;
+  String name;
+  List<Event> events;      // what it said: messages, errors, its closing
+  bool closed = false, close_told = false;
+  UniquePointer<Page> page;   // (last: destroyed first)
+  void add_event(uint32_t kind, StringView text, StringView ports) {
+    if (events.count() >= 4096) return;   // (a page that never listens does not make the worker's messages pile up without end)
+    Event e(name.allocator());
+    e.kind = kind;
+    e.text.assign(text);
+    e.ports.assign(ports);
+    events.push_back(util::move(e));
+  }
+};
+
+uint32_t Page::worker_start(StringView source, StringView url, StringView name, bool module, String* error) {
+  if (workers_.count() >= kMaxWorkers) {
     error->assign("Too many workers are running.");
     return 0;
   }
+  if (worker_depth_ >= 3) {
+    error->assign("Workers are nested too deeply.");
+    return 0;
+  }
   auto runtime = UniquePointer<WorkerRuntime>::make(allocator_, *this, next_worker_);
-  if (!runtime) {
+  if (!runtime || !runtime->name.assign(name)) {
     error->assign("Out of memory.");
     return 0;
   }
-  runtime->url.assign(url);
-  runtime->name.assign(name);
-  runtime->engine = UniquePointer<script::Engine>::make(allocator_, allocator_, static_cast<script::IHost*>(runtime.get()));
-  if (!runtime->engine || !runtime->engine->ok()) {
+  runtime->page = UniquePointer<Page>::make(allocator_, allocator_, runtime->env, url, media_, true);
+  if (!runtime->page) {
     error->assign("Out of memory.");
     return 0;
   }
-  runtime->engine->set_limits(4000000, 24u << 20);
-  script::Vm& vm = runtime->engine->vm();
-  vm.set_user(runtime.get());
-  using script::Value;
-  vm.define_native(vm.global(), "__out", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {
-    (void)result;
-    script::JsString* text;
-    if (argc > 0 && v.to_string(args[0], &text)) static_cast<WorkerRuntime*>(v.user())->add_event(0, text->view());
-    return true;
-  }, 1);
-  vm.define_native(vm.global(), "__worker_close", [](script::Vm& v, const Value&, const Value*, uint32_t, Value*) {
-    WorkerRuntime* w = static_cast<WorkerRuntime*>(v.user());
-    if (!w->closed) {
-      w->closed = true;
-      w->add_event(2, StringView());
-    }
-    return true;
-  }, 0);
-  vm.define_native(vm.global(), "__worker_fail", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value*) {
-    script::JsString* text;
-    if (argc > 0 && v.to_string(args[0], &text)) static_cast<WorkerRuntime*>(v.user())->add_event(1, text->view());
-    return true;
-  }, 1);
-  vm.define_native(vm.global(), "__worker_fetch", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {
-    script::JsString* address;
-    *result = Value::make_null();
-    if (argc == 0 || !v.to_string(args[0], &address)) return true;
-    WorkerRuntime* w = static_cast<WorkerRuntime*>(v.user());
-    String text(w->page.allocator_);
-    if (w->page.env_.fetch_text(address->view(), 1u << 20, &text)) *result = Value::make_string(v.new_string(text.view()));
-    return true;
-  }, 1);
-  install_text_encoding_natives(vm);
-  vm.define_native(vm.global(), "__bytes_to_string", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {   // (TextDecoder)
-    ArrayView<uint8_t> bytes;
-    if (argc == 0 || !script::typed_array_bytes(args[0], &bytes)) return v.throw_error(script::ErrorKind::TypeError, "The provided value is not a byte array.");
-    *result = Value::make_string(v.new_string(bytes_as_text(ConstByteView(bytes.data(), bytes.size()))));
-    return true;
-  }, 1);
-  vm.define_native(vm.global(), "__string_to_bytes", [](script::Vm& v, const Value&, const Value* args, uint32_t argc, Value* result) {   // (TextEncoder)
-    script::JsString* text;
-    if (argc == 0 || !v.to_string(args[0], &text)) return false;
-    *result = Value::make_object(script::new_typed_array(v, script::ArrayKind::Uint8, text->view()));
-    return true;
-  }, 1);
-  vm.define_named(vm.global(), "__worker_url", Value::make_string(vm.new_string(url)), 0);
-  vm.define_named(vm.global(), "__worker_name", Value::make_string(vm.new_string(name)), 0);
-  String problem(allocator_);
-  if (!runtime->engine->run_library(worker_prelude(), &problem)) {
-    error->assign(problem.view());
+  Page& scope = *runtime->page;
+  scope.worker_owner_ = this;
+  scope.worker_runtime_ = runtime.get();
+  scope.worker_depth_ = worker_depth_ + 1;
+  scope.window_id_ = root()->next_window_id_++;
+  scope.set_script_limits(instruction_limit_, memory_limit_);   // (a task of a worker may run as long, and the worker hold as much, as a task of its page)
+  if (!scope.load("<!doctype html><html><head></head><body></body></html>") || !scope.start_engine()) {
+    error->assign("The script engine could not be started.");
     return 0;
-  }
-  runtime->wasm = bind::install_wasm_natives(vm);
-  if (runtime->wasm && !runtime->engine->run_library(web_assembly_prelude(), &problem)) {   // (a worker is still useful without WebAssembly)
-    runtime->wasm.reset();
-    vm.set_extension(nullptr);
   }
   const uint32_t id = next_worker_++;
-  runtime->id = id;
   if (!workers_.push_back(util::move(runtime))) {
     error->assign("Out of memory.");
     return 0;
   }
-  WorkerRuntime* started = workers_[workers_.count() - 1].get();
-  String result(allocator_);
-  if (!started->engine->run(source, &problem, &result)) started->add_event(1, problem.view());   // (an error in the script is the worker's error event)
+  if (engine_) scope.engine_->vm().set_skew(engine_->vm().skew());
+  scope.run_dedicated_worker(source, module);   // (an error in the script is the worker's error event)
   return id;
 }
 
-void Page::worker_post(uint32_t id, StringView message) {
+// (a worker has a number like a frame's window has: message ports are sent to it by that)
+Page* Page::find_worker_window(uint32_t id) {
+  for (uint64_t i = 0; i < workers_.count(); ++i)
+    if (Page* p = workers_[i]->page ? workers_[i]->page->find_window(id) : nullptr) return p;
+  return nullptr;
+}
+
+void Page::run_dedicated_worker(StringView source, bool module) {
+  if (!bindings_) return;
+  if (module) {   // (the module loader of the page: static imports are read and linked now, the module runs as a task)
+    using Arg = DomBindings::HookArg;
+    const Arg args[2] = {Arg::of(address_.view()), Arg::of(source)};
+    bindings_->call_hook("__worker_module", args, 2);
+  } else {
+    String problem(allocator_);
+    if (!engine_->run(source, &problem, nullptr)) {
+      if (engine_->compile_failed()) {   // (the script never ran: nothing in the scope could hear of it)
+        note_error(problem.view());
+        worker_scope_fail(problem.view(), true, StringView());
+      } else {
+        script_error(problem.view());
+      }
+    }
+  }
+  flush_errors();
+}
+
+// An error of a script that no listener was running for (a script as it starts, a timer). In a worker it is an error event of the scope, and then of the
+// Worker object in the page.
+void Page::script_error(StringView text) {
+  note_error(text);
+  if (worker_runtime_ && bindings_) {
+    script::Vm& vm = engine_->vm();
+    if (vm.halted()) {   // (a script that was stopped for running too long: the scope can hear of it once the engine is usable again)
+      vm.recover();
+      vm.reset_instruction_count();
+    }
+    bindings_->fire_error(text);
+  }
+}
+
+bool Page::worker_runtime_closed() const { return worker_runtime_ && worker_runtime_->closed; }
+
+StringView Page::worker_scope_name() { return worker_runtime_ ? worker_runtime_->name.view() : StringView(); }
+
+void Page::worker_scope_post(StringView message, StringView ports) {
+  if (!worker_runtime_) return;   // (what a worker posts in the task that closes it still arrives: nothing of it runs after that task)
+  claim_ports(ports, worker_owner_->window_id_);
+  worker_runtime_->add_event(0, message, ports);
+}
+
+void Page::worker_scope_fail(StringView text, bool unusable, StringView filename) {
+  if (worker_runtime_) worker_runtime_->add_event(unusable ? 3 : 1, text, filename);   // (an error has no ports: the place is the file's)
+}
+
+void Page::worker_scope_close() {
+  if (worker_runtime_) worker_runtime_->closed = true;   // (worker_pump() tells the page, after what the worker said before)
+}
+
+// A blob: address the worker was handed names a Blob of the page that made it (or of the page that made that one).
+bool Page::worker_scope_blob(StringView address, String* wire) {
+  for (Page* owner = worker_owner_; owner; owner = owner->worker_owner_) {
+    if (!owner->bindings_) continue;
+    const DomBindings::HookArg args[1] = {DomBindings::HookArg::of(address)};
+    wire->clear();
+    if (owner->bindings_->call_hook("__blob_wire", args, 1, wire) && !wire->empty()) return true;
+  }
+  return false;
+}
+
+void Page::worker_post(uint32_t id, StringView message, StringView ports) {
   for (uint64_t i = 0; i < workers_.count(); ++i) {
     WorkerRuntime* w = workers_[i].get();
-    if (w->id != id || w->closed || w->inbox.count() > 1000) continue;
-    String text(allocator_);
-    text.assign(message);
-    w->inbox.push_back(util::move(text));
+    if (w->id != id || w->closed) continue;
+    claim_ports(ports, w->page->window_id_);
+    String origin(allocator_);
+    page_origin(&origin);
+    w->page->queue_window_message(message, origin.view(), window_id_, ports);
   }
 }
 
@@ -2975,31 +3046,29 @@ void Page::worker_terminate(uint32_t id) {
 }
 
 void Page::worker_pump() {
+  // The worker's clock is its page's: where the page's timers are run ahead of the wall clock (a test, a page loaded in one go), the worker's are too.
+  const double now = engine_ ? engine_->vm().clock_ms() : static_cast<double>(env_.now_ms());
   for (uint64_t i = 0; i < workers_.count(); ++i) {
     WorkerRuntime* w = workers_[i].get();
-    if (w->closed) continue;
-    String problem(allocator_), ignored(allocator_);
-    for (uint32_t guard = 0; guard < 100 && w->inbox.count() > 0 && !w->closed; ++guard) {   // the messages for the worker
-      script::Vm& vm = w->engine->vm();
-      vm.define_named(vm.global(), "__inbox", script::Value::make_string(vm.new_string(w->inbox[0].view())), script::kWritable);
-      w->inbox.remove_at(0);
-      problem.clear();
-      if (!w->engine->run("__deliver()", &problem, &ignored)) w->add_event(1, problem.view());
+    if (!w->closed && w->page->engine_) {
+      if (engine_) w->page->engine_->vm().set_skew(engine_->vm().skew());
+      w->page->run_due_timers(now);
     }
-    if (w->closed) continue;
-    problem.clear();
-    w->engine->run_due_timers(static_cast<double>(env_.now_ms()), 50, &problem);
-    if (!problem.empty()) w->add_event(1, problem.view());
+    if (w->closed && !w->close_told) {
+      w->close_told = true;
+      w->add_event(2, StringView(), StringView());
+    }
   }
 }
 
-bool Page::worker_next_event(uint32_t* id, uint32_t* kind, String* text) {
+bool Page::worker_next_event(uint32_t* id, uint32_t* kind, String* text, String* ports) {
   for (uint64_t i = 0; i < workers_.count(); ++i) {
     WorkerRuntime* w = workers_[i].get();
     if (w->events.count() == 0) continue;
     *id = w->id;
     *kind = w->events[0].kind;
     text->assign(w->events[0].text.view());
+    ports->assign(w->events[0].ports.view());
     w->events.remove_at(0);
     return true;
   }
@@ -3147,6 +3216,7 @@ void Page::rtc_release(uint32_t id) {
 }
 
 void Page::page_origin(String* out) {
+  if (worker_owner_) return worker_owner_->page_origin(out);
   WebUrl url(allocator_);
   if (WebUrl::parse(allocator_, address_.view(), nullptr, &url)) url.origin(out);
   else out->append("null");
@@ -3291,17 +3361,33 @@ void Page::poll_hub() {
 }
 
 void Page::deliver_messages() {
-  while (messages_.count() > 0 && bindings_) {
+  while (messages_.count() > 0 && bindings_ && !(worker_runtime_ && worker_runtime_closed())) {
     Message m = util::move(messages_[0]);
     messages_.remove_at(0);
     using Arg = DomBindings::HookArg;
+    script::Vm& vm = engine_->vm();
+    if (vm.halted()) vm.recover();
+    vm.reset_instruction_count();   // (each message is a task of its own)
     if (m.to_port) {
+      // The port may have been sent on (to a worker, another frame) while this waited: the message follows it.
+      Page* top = root();
+      uint32_t home = window_id_;
+      for (uint64_t i = 0; i < top->port_homes_.count(); ++i)
+        if (top->port_homes_[i].port == m.port) home = top->port_homes_[i].window;
+      if (home != window_id_ && home != 0xFFFFFFFFu) {   // (not the bridge to a service worker or another document: post_port_message() sent it here on purpose)
+        if (Page* target = top->find_window(home)) {
+          claim_ports(m.ports.view(), home);
+          target->queue_port_message(m.port, m.payload.view(), m.ports.view());
+        }
+        continue;
+      }
       const Arg args[3] = {Arg::of(static_cast<double>(m.port)), Arg::of(m.payload.view()), Arg::of(m.ports.view())};
       bindings_->call_hook("__port_deliver", args, 3);
     } else {
       const Arg args[4] = {Arg::of(m.payload.view()), Arg::of(m.origin.view()), Arg::of(static_cast<double>(m.source)), Arg::of(m.ports.view())};
       bindings_->call_hook("__fire_message", args, 4);
     }
+    if (worker_runtime_ && vm.halted()) script_error("Error: the script ran too long");   // (the listener was stopped: nothing could be told to the scope until now)
   }
   messages_.clear();
   flush_errors();
