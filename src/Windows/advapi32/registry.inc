@@ -41,7 +41,7 @@ IMPORT ULONG NTAPI RtlNtStatusToDosError(NTSTATUS);
 #define KEY_WOW64_MASK_ 0x300
 
 static LSTATUS nt_error(NTSTATUS status) { return (LSTATUS)RtlNtStatusToDosError(status); }
-static BOOL is_predefined(HKEY key) { return ((ULONG_PTR)key & 0xFFFFFFFFFFFFFFF0ull) == 0xFFFFFFFF80000000ull; }
+static BOOL is_predefined(HKEY key) { return ((ULONG_PTR)key & ~(ULONG_PTR)0xF) == (ULONG_PTR)(LONG_PTR)(LONG)0x80000000; }      /* (the sign-extended values, whatever the pointer size) */
 
 static void wide_set(UNICODE_STRING *u, const WCHAR *text) {
   size_t_ n = 0;

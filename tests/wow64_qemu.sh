@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Three programs, each started by the kernel's autorun in a boot of its own:
+# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Four programs, each started by the kernel's autorun in a boot of its own:
 #   hello32  tests/windows/hello32.c: PE32 for i386 with no libraries. It runs in the CPU's compatibility mode and calls the NT services through INT 2E.
 #   crt32    tests/windows/crt32.c: built the ordinary way, with a C runtime; it runs on the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll of
 #            C:\Windows\SysWOW64 (the heap, files, the environment, thread-local storage, threads).
 #   seh32    tests/windows/seh32.c: exceptions - faults delivered with an i386 CONTEXT, the handlers at FS:[0], RtlUnwind, _except_handler3.
+#   gui32    tests/windows/gui32.c: the other libraries - the registry, the shell's folders, a shortcut through COM, and a window with its messages.
 # Passes if all the checks of each pass and the autorun sees exit code 42. Uses its own build folder (build-wow64-qemu) so the normal build keeps no
 # autorun. Needs i686-w64-mingw32-gcc.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -o "$work/seh32.exe" tests/windows/seh32.c
+i686-w64-mingw32-gcc -O1 -o "$work/gui32.exe" tests/windows/gui32.c -ladvapi32 -luser32 -lgdi32 -lshell32 -lole32 -lcomctl32 -luuid
 status=0
 for program in "${programs[@]}"; do
   cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" >/dev/null

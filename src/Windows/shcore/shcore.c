@@ -935,8 +935,13 @@ EXPORT BOOL WINAPI IsOS(DWORD feature) {
 #define STARTF_APPID_SET_ 0x4000
 typedef struct { USHORT Length, MaximumLength; WCHAR *Buffer; } TitleString;
 static BYTE *process_parameters(void) { return (BYTE *)NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters; }
+#ifdef __i386__      /* (a 32-bit program's parameters block: WindowFlags 0x68, WindowTitle 0x70) */
+#define PARAMS_FLAGS(p) (*(DWORD *)((p) + 0x68))
+#define PARAMS_TITLE(p) ((TitleString *)((p) + 0x70))
+#else
 #define PARAMS_FLAGS(p) (*(DWORD *)((p) + 0xA4))
 #define PARAMS_TITLE(p) ((TitleString *)((p) + 0xB0))
+#endif
 EXPORT HRESULT WINAPI SetCurrentProcessExplicitAppUserModelID(const WCHAR *id) {
   BYTE *params = process_parameters();
   if (!id || !*id || wlen(id) >= APPID_MAX_CHARS) return E_INVALIDARG;

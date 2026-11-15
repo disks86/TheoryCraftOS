@@ -184,8 +184,18 @@ EXPORT HRESULT WINAPI VarParseNumFromStr(const OLECHAR *string, LCID lcid, ULONG
 
 /* ---- from the parsed digits to a value ------------------------------------------------------------------------------------------------------------------ */
 
+#ifdef __i386__
+/* (i386 has no 128-bit integers: a 32-bit program's numbers are parsed exactly up to 2^62 only, and a longer one is an overflow - docs/Wow64.md) */
+typedef unsigned long long oa_u128;
+#define PARSE_BIG ((oa_u128)1 << 62)
+#define PARSE_DECIMAL_LIMIT ((oa_u128)1 << 62)
+#define PARSE_HIGH64(value) 0ull
+#else
 typedef unsigned __int128 oa_u128;
 #define PARSE_BIG ((oa_u128)1 << 120)
+#define PARSE_DECIMAL_LIMIT ((oa_u128)1 << 96)
+#define PARSE_HIGH64(value) ((unsigned long long)((value) >> 64))
+#endif
 
 /* The value of the digits times 10^extra, rounded to a whole number (halves to even) in `result`; FALSE when it does not fit 120 bits. */
 static BOOL parse_magnitude(const NUMPARSE *parse, const BYTE *digits, int extra, oa_u128 *result) {
@@ -237,7 +247,7 @@ static BOOL parse_double(const NUMPARSE *parse, const BYTE *digits, double *resu
   oa_u128 magnitude;
   if (parse->nBaseShift) {
     if (!parse_magnitude(parse, digits, 0, &magnitude)) return FALSE;
-    unsigned long long hi = (unsigned long long)(magnitude >> 64), lo = (unsigned long long)magnitude;
+    unsigned long long hi = PARSE_HIGH64(magnitude), lo = (unsigned long long)magnitude;
     *result = (double)hi * 18446744073709551616.0 + (double)lo;
     return TRUE;
   }
@@ -273,7 +283,7 @@ static BOOL parse_double(const NUMPARSE *parse, const BYTE *digits, double *resu
 
 /* The parsed digits as a DECIMAL (96 bits, scale 0..28). */
 static BOOL parse_decimal(const NUMPARSE *parse, const BYTE *digits, DECIMAL *out) {
-  const oa_u128 limit = (oa_u128)1 << 96;
+  const oa_u128 limit = PARSE_DECIMAL_LIMIT;
   oa_u128 mantissa = 0;
   int scale = 0;
   if (parse->nBaseShift || parse->nPwr10 >= 0) {
@@ -306,7 +316,7 @@ static BOOL parse_decimal(const NUMPARSE *parse, const BYTE *digits, DECIMAL *ou
   out->scale = (BYTE)scale;
   out->sign = (parse->dwOutFlags & NUMPRS_NEG) ? DECIMAL_NEG : 0;
   out->Lo64 = (ULONG64)mantissa;
-  out->Hi32 = (ULONG)(mantissa >> 64);
+  out->Hi32 = (ULONG)PARSE_HIGH64(mantissa);
   return TRUE;
 }
 

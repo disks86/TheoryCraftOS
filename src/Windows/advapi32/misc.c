@@ -25,7 +25,15 @@
 #include <winnt.h>
 
 /* (the label is the export: the headers of windows.h declare some of these with types of their own, which these generic stand-ins do not repeat) */
+#ifdef __i386__
+/* (a C symbol of i386 starts with an underscore, which is the name an export is looked up by: the label and the export are written out) */
+#define STUB(ret, name, ...)                                                                                  \
+  ret WINAPI impl_##name(__VA_ARGS__) __asm__("_" #name);                                                     \
+  __asm__(".section .drectve\n.ascii \" -export:" #name "\"\n.text\n");                                      \
+  ret WINAPI impl_##name(__VA_ARGS__)
+#else
 #define STUB(ret, name, ...) ret WINAPI impl_##name(__VA_ARGS__) __asm__(#name); __declspec(dllexport) ret WINAPI impl_##name(__VA_ARGS__)
+#endif
 #define NOT_SUPPORTED_DWORD(name, ...) STUB(DWORD, name, __VA_ARGS__) { return ERROR_NOT_SUPPORTED; }
 #define NOT_SUPPORTED_BOOL(name, ...) STUB(BOOL, name, __VA_ARGS__) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
 #define NOT_IMPLEMENTED_DWORD(name, ...) STUB(DWORD, name, __VA_ARGS__) { return ERROR_CALL_NOT_IMPLEMENTED; }

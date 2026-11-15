@@ -32,7 +32,17 @@
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");      /* (the stack probe of the compiler: the stack is committed) */
 
+#ifdef __i386__
+/* The library of 32-bit programs (docs/Wow64.md). A parameter is 32 bits here and 64 bits in the kernel, which has one set of services, written for
+ * 64-bit programs: a service is called through INT 2E with every argument widened (see the stubs below), and the structures the kernel reads and
+ * writes keep their 64-bit layouts - the libraries that call these services (user32.dll, gdi32.dll) hand them over that way. What a window
+ * procedure is given is the exception: it is a 32-bit program's code, so the structures of its messages are converted here, around the call. */
+typedef unsigned long U;           /* every parameter and result of a service is one register */
+#define PROC_CALL __stdcall        /* (window procedures, hooks and timer procedures take their arguments off the stack) */
+#else
 typedef unsigned long long U;      /* every parameter and result of a service is one register */
+#define PROC_CALL
+#endif
 typedef unsigned long long U64;
 typedef unsigned int U32;
 typedef unsigned short U16;
@@ -42,8 +52,14 @@ typedef unsigned char U8;
 #define TCOS_DRAIN_RETRY 0x7FFFFFF3ull
 
 /* ---- the stubs --------------------------------------------------------------------------------------------------------------------------------------------------- */
+#ifdef __i386__
+#include "../tcos_wow64_win32k.h"
+WOW_WIN32K_CODE(_wow_win32k_service, "");
+#define NT_SERVICE_ASM(label, number) WOW_WIN32K_STUB(label, number, _wow_win32k_service)
+#else
 #define NT_SERVICE_ASM(label, number)                                                                                                                          \
   __asm__(".text\n.globl " #label "\n" #label ":\n mov %rcx, %r10\n mov $" _STR(number) ", %eax\n syscall\n ret\n")
+#endif
 #define NT_SERVICE_EXPORT(name) __asm__(".section .drectve\n.ascii \" -export:" #name "\"\n.text\n")
 
 /* The services that have a wrapper below: WRAPPED_<name> expands to "~," which the macros recognise. */
@@ -79,6 +95,21 @@ typedef unsigned char U8;
 #define WRAPPED_NtUserCallHwnd ~,
 #define WRAPPED_NtUserCallNextHookEx ~,
 #define WRAPPED_NtUserCallMsgFilter ~,
+
+#ifdef __i386__      /* (the services whose structures are converted for a 32-bit program: wow64.inc) */
+#define WRAPPED_NtUserRegisterClassExWOW ~,
+#define WRAPPED_NtUserGetClassInfoEx ~,
+#define WRAPPED_NtUserUnregisterClass ~,
+#define WRAPPED_NtUserGetClassName ~,
+#define WRAPPED_NtUserRegisterWindowMessage ~,
+#define WRAPPED_NtUserGetAtomName ~,
+#define WRAPPED_NtUserFindWindowEx ~,
+#define WRAPPED_NtUserTranslateMessage ~,
+#define WRAPPED_NtUserCallHwndParam ~,
+#define WRAPPED_NtUserBuildHwndList ~,
+#define WRAPPED_NtUserEndPaint ~,
+#define WRAPPED_NtUserGetGUIThreadInfo ~,
+#endif
 
 #define SECOND_OF(a, b, ...) b
 #define IS_PROBE(...) SECOND_OF(__VA_ARGS__, 0, )
@@ -119,8 +150,13 @@ typedef struct {
 static struct { volatile U64 tid; U64 name, cls; } g_create[32];
 
 static U64 current_thread_id(void) {
+#ifdef __i386__
+  U32 tid;
+  __asm__ volatile("movl %%fs:0x24, %0" : "=r"(tid));     /* TEB.ClientId.UniqueThread of the 32-bit TEB */
+#else
   U64 tid;
   __asm__ volatile("mov %%gs:0x48, %0" : "=r"(tid));      /* TEB.ClientId.UniqueThread */
+#endif
   return tid;
 }
 static int create_context_enter(U64 name, U64 cls) {
@@ -146,35 +182,111 @@ static int create_context_find(U64* name, U64* cls) {
   return 0;
 }
 
+#ifdef __i386__
+/* ---- the structures of a window procedure's messages, for a 32-bit program -------------------------------------------------------------------------------------
+ * The kernel hands over the structure a message's lparam points to in its 64-bit layout (the payload of the upcall). A 32-bit window procedure gets
+ * the 32-bit layout, made here, and what it changed goes back into the payload before the kernel takes it. Only the structures with handles or
+ * pointers in them differ: CREATESTRUCT, WINDOWPOS, NCCALCSIZE_PARAMS, COPYDATASTRUCT. */
+#define WM_CREATE_ 0x0001u
+#define WM_WINDOWPOSCHANGING_ 0x0046u
+#define WM_WINDOWPOSCHANGED_ 0x0047u
+#define WM_COPYDATA_ 0x004Au
+#define WM_NCCREATE_ 0x0081u
+#define WM_NCCALCSIZE_ 0x0083u
+typedef struct { U32 params, instance, menu, parent; int cy, cx, y, x; U32 style, name, cls, ex_style; } CreateStruct32;
+typedef struct { U32 hwnd, after; int x, y, cx, cy; U32 flags; } WindowPos32;
+typedef struct { int rects[12]; U32 pos; WindowPos32 window_pos; } NcCalcSize32;
+typedef struct { U32 data, bytes, pointer; } CopyData32;
+typedef union { CreateStruct32 create; WindowPos32 pos; NcCalcSize32 calc; CopyData32 copy; } Message32;
+
+static U64 get64(const U8* at) { U64 v; __builtin_memcpy(&v, at, 8); return v; }
+static U32 get32(const U8* at) { U32 v; __builtin_memcpy(&v, at, 4); return v; }
+static void put32(U8* at, U32 v) { __builtin_memcpy(at, &v, 4); }
+static void put64s(U8* at, U32 v) { const long long wide = (int)v; __builtin_memcpy(at, &wide, 8); }      /* (a handle: with its sign) */
+
+static void window_pos_to_32(WindowPos32* out, const U8* in) {
+  out->hwnd = (U32)get64(in); out->after = (U32)get64(in + 8);
+  out->x = (int)get32(in + 16); out->y = (int)get32(in + 20); out->cx = (int)get32(in + 24); out->cy = (int)get32(in + 28); out->flags = get32(in + 32);
+}
+static void window_pos_from_32(U8* out, const WindowPos32* in) {
+  put64s(out, in->hwnd); put64s(out + 8, in->after);
+  put32(out + 16, (U32)in->x); put32(out + 20, (U32)in->y); put32(out + 24, (U32)in->cx); put32(out + 28, (U32)in->cy); put32(out + 32, in->flags);
+}
+/* The 32-bit form of the upcall's payload in `m`, if the message has one; 0 if the payload is passed as it is. */
+static int message_to_32(const TcosUpcall* u, Message32* m) {
+  const U8* p = u->payload;
+  if ((u->flags & UPF_CREATESTRUCT) && u->payload_len >= 80) {
+    m->create.params = (U32)get64(p); m->create.instance = (U32)get64(p + 8); m->create.menu = (U32)get64(p + 16); m->create.parent = (U32)get64(p + 24);
+    m->create.cy = (int)get32(p + 32); m->create.cx = (int)get32(p + 36); m->create.y = (int)get32(p + 40); m->create.x = (int)get32(p + 44);
+    m->create.style = get32(p + 48); m->create.name = (U32)get64(p + 56); m->create.cls = (U32)get64(p + 64); m->create.ex_style = get32(p + 72);
+    return 1;
+  }
+  if (u->kind != KIND_WNDPROC) return 0;
+  if ((u->msg == WM_WINDOWPOSCHANGING_ || u->msg == WM_WINDOWPOSCHANGED_) && u->payload_len >= 40) { window_pos_to_32(&m->pos, p); return 1; }
+  if (u->msg == WM_NCCALCSIZE_ && u->wparam && u->payload_len >= 104) {
+    __builtin_memcpy(m->calc.rects, p, 48);
+    m->calc.pos = (U32)&m->calc.window_pos;
+    window_pos_to_32(&m->calc.window_pos, p + 56);
+    return 1;
+  }
+  if (u->msg == WM_COPYDATA_ && u->payload_len >= 24) {
+    m->copy.data = (U32)get64(p); m->copy.bytes = get32(p + 8); m->copy.pointer = (U32)(p + 24);
+    return 1;
+  }
+  return 0;
+}
+/* What the procedure changed, back in the payload. */
+static void message_from_32(TcosUpcall* u, const Message32* m) {
+  U8* p = u->payload;
+  if (u->flags & UPF_CREATESTRUCT) {
+    put32(p + 32, (U32)m->create.cy); put32(p + 36, (U32)m->create.cx); put32(p + 40, (U32)m->create.y); put32(p + 44, (U32)m->create.x);
+  } else if (u->msg == WM_WINDOWPOSCHANGING_ || u->msg == WM_WINDOWPOSCHANGED_) {
+    window_pos_from_32(p, &m->pos);
+  } else if (u->msg == WM_NCCALCSIZE_) {
+    __builtin_memcpy(p, m->calc.rects, 48);
+    window_pos_from_32(p + 56, &m->calc.window_pos);
+  }
+}
+#endif
+
 static void drain_upcalls(void) {
   TcosUpcall u;
   while ((U32)NtUserTcosGetUpcall((U)&u)) {
     U64 lparam = u.lparam, result = 0;
     if (u.flags & UPF_PAYLOAD_LPARAM) {
-      if (u.fix_at != 0xFFFF && u.fix_at + 8u <= sizeof(u.payload) && u.fix_to < sizeof(u.payload)) *(U64*)(u.payload + u.fix_at) = (U64)(u.payload + u.fix_to);
-      lparam = (U64)u.payload;
+      if (u.fix_at != 0xFFFF && u.fix_at + 8u <= sizeof(u.payload) && u.fix_to < sizeof(u.payload)) *(U64*)(u.payload + u.fix_at) = (U64)(U)(u.payload + u.fix_to);
+      lparam = (U64)(U)u.payload;
     }
     if ((u.flags & UPF_CREATESTRUCT) && u.payload_len >= 80) {      /* CREATESTRUCTW: lpszName at 56, lpszClass at 64 */
       U64 name = 0, cls = 0;
       if (create_context_find(&name, &cls)) { *(U64*)(u.payload + 56) = name; *(U64*)(u.payload + 64) = cls; }
     }
+#ifdef __i386__
+    Message32 message32;
+    const int converted = (u.flags & UPF_PAYLOAD_LPARAM) && message_to_32(&u, &message32);
+    if (converted) lparam = (U64)(U)&message32;
+#endif
     switch (u.kind) {
       case KIND_WNDPROC:
-        result = ((U64(*)(U64, U32, U64, U64))u.proc)(u.hwnd, u.msg, u.wparam, lparam);
+        result = ((U (PROC_CALL *)(U, U32, U, U))(U)u.proc)((U)u.hwnd, u.msg, (U)u.wparam, (U)lparam);
         break;
       case KIND_HOOK:      /* HOOKPROC(code, wparam, lparam); the "hwnd" of the record is the hook handle */
-        result = ((U64(*)(int, U64, U64))u.proc)((int)u.msg, u.wparam, lparam);
+        result = ((U (PROC_CALL *)(int, U, U))(U)u.proc)((int)u.msg, (U)u.wparam, (U)lparam);
         break;
       case KIND_WINEVENT:      /* WINEVENTPROC(hook, event, hwnd, object id, child id, thread, time) */
-        ((void(*)(U64, U32, U64, int, int, U32, U32))u.proc)(u.wparam, u.msg, u.hwnd, (int)u.lparam, (int)u.extra[0], (U32)u.extra[1], (U32)u.extra[2]);
+        ((void (PROC_CALL *)(U, U32, U, int, int, U32, U32))(U)u.proc)((U)u.wparam, u.msg, (U)u.hwnd, (int)u.lparam, (int)u.extra[0], (U32)u.extra[1], (U32)u.extra[2]);
         break;
       case KIND_TIMER:      /* TIMERPROC(hwnd, WM_TIMER, id, tick) */
-        ((void(*)(U64, U32, U64, U32))u.proc)(u.hwnd, u.msg, u.wparam, (U32)u.lparam);
+        ((void (PROC_CALL *)(U, U32, U, U32))(U)u.proc)((U)u.hwnd, u.msg, (U)u.wparam, (U32)u.lparam);
         break;
       default:
         break;
     }
-    NtUserTcosUpcallDone(u.id, result, (U)u.payload, u.payload_len);
+#ifdef __i386__
+    if (converted) message_from_32(&u, &message32);
+    result = (U64)(long long)(int)(U32)result;      /* (an LRESULT: with its sign) */
+#endif
+    NtUserTcosUpcallDone((U)u.id, (U)result, (U)u.payload, u.payload_len);
   }
 }
 
@@ -218,7 +330,9 @@ WRAP(NtUserShowWindow, P2, A2)
 WRAP(NtUserShowWindowAsync, P2, A2)
 WRAP(NtUserEndDeferWindowPosEx, P2, A2)
 WRAP(NtUserSetWindowPlacement, P2, A2)
+#ifndef __i386__
 WRAP(NtUserBeginPaint, P2, A2)
+#endif
 WRAP(NtUserGetUpdateRect, P3, A3)
 WRAP(NtUserGetUpdateRgn, P3, A3)
 WRAP(NtUserRedrawWindow, P4, A4)
@@ -227,13 +341,23 @@ WRAP(NtUserSetFocus, P1, A1)
 WRAP(NtUserSetActiveWindow, P1, A1)
 WRAP(NtUserSetForegroundWindow, P1, A1)
 WRAP(NtUserSetCapture, P1, A1)
+#ifndef __i386__
 WRAP(NtUserMessageCall, P7, A7)
+#endif
+#ifndef __i386__
 WRAP(NtUserDispatchMessage, P1, A1)
+#endif
+#ifndef __i386__
 WRAP(NtUserGetMessage, P4, A4)
+#endif
+#ifndef __i386__
 WRAP(NtUserPeekMessage, P5, A5)
+#endif
 WRAP(NtUserCallHwnd, P2, A2)
 WRAP(NtUserCallNextHookEx, P4, A4)
+#ifndef __i386__
 WRAP(NtUserCallMsgFilter, P2, A2)
+#endif
 
 /* NtUserReleaseCapture() and NtUserWaitMessage() take no arguments */
 extern U NtUserReleaseCapture_raw(void);
@@ -249,22 +373,38 @@ __attribute__((dllexport)) U NtUserWaitMessage(void) {
   return r;
 }
 
+#ifdef __i386__
+#include "wow64.inc"
+#else
 /* NtUserCreateWindowEx has 17 parameters; the class name and the title are remembered for the creation messages. */
 extern U NtUserCreateWindowEx_raw(U, U, U, U, U, U, U, U, U, U, U, U, U, U, U, U, U);
 __attribute__((dllexport)) U NtUserCreateWindowEx(U ex_style, U class_name, U version, U window_name, U style, U x, U y, U cx, U cy, U parent, U menu, U instance, U params, U flags,
                                                   U client_instance, U cls, U ansi) {
   U64 title = 0;
-  if (window_name) title = *(U64*)(window_name + 8);      /* UNICODE_STRING.Buffer */
+  if (window_name) title = *(U64*)(U)(window_name + 8);      /* UNICODE_STRING.Buffer */
   const int slot = create_context_enter(title, cls);
   U r = NtUserCreateWindowEx_raw(ex_style, class_name, version, window_name, style, x, y, cx, cy, parent, menu, instance, params, flags, client_instance, cls, ansi);
   while (r == TCOS_UPCALL_DUE) { drain_upcalls(); r = NtUserTcosResume(); }
   create_context_leave(slot);
   return r;
 }
+#endif
 
 /* ---- waiting for objects and input --------------------------------------------------------------------------------------------------------------------------------- */
 extern U NtUserMsgWaitForMultipleObjectsEx_raw(U, U, U, U, U);
 
+#ifdef __i386__
+/* (the kernel reads 64-bit handles and 64-bit arguments: see the stubs above) */
+static long nt_wait_for_multiple_objects(unsigned count, const void* handles, unsigned wait_type, unsigned alertable, const long long* timeout) {
+  long long wide[64];
+  if (count > 64) return (long)0xC00000EFu;      /* STATUS_INVALID_PARAMETER_1 */
+  for (unsigned i = 0; i < count; ++i) wide[i] = ((const int*)handles)[i];
+  const U64 arguments[5] = {count, (U)wide, wait_type, alertable, (U)timeout};
+  long status;
+  __asm__ volatile("int $0x2e" : "=a"(status) : "a"(NT_SERVICE_NtWaitForMultipleObjects), "d"(arguments) : "memory", "cc");
+  return status;
+}
+#else
 static long nt_wait_for_multiple_objects(unsigned count, const void* handles, unsigned wait_type, unsigned alertable, const long long* timeout) {
   long status;
   __asm__ volatile(
@@ -282,6 +422,7 @@ static long nt_wait_for_multiple_objects(unsigned count, const void* handles, un
       : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
   return status;
 }
+#endif
 
 /* MsgWaitForMultipleObjectsEx: the kernel half waits for input and time; the objects are polled between slices of the wait (10 ms at most), so they are noticed within
  * that time. Answers WAIT_OBJECT_0 + n for object n, WAIT_OBJECT_0 + count for input, WAIT_TIMEOUT. */
@@ -315,7 +456,7 @@ __attribute__((dllexport)) U NtUserMsgWaitForMultipleObjectsEx(U count, U handle
   }
 }
 
-int DllMain(void* module, unsigned reason, void* reserved) {
+int PROC_CALL DllMain(void* module, unsigned reason, void* reserved) {
   (void)module;
   (void)reason;
   (void)reserved;

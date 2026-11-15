@@ -34,11 +34,21 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #include "../tcos_syscalls.h"
 
+#ifdef __i386__
+/* A 32-bit program's gdi32.dll (docs/Wow64.md): the services are called through INT 2E with the arguments widened, and are cdecl here whatever the
+ * prototypes say (GDI_CALL below), because the one piece of code that makes the call does not know how many arguments to take off the stack. */
+#include "../tcos_wow64_win32k.h"
+WOW_WIN32K_CODE(_gdi_service, "  cmpl $0xC0000002, %eax\n  jne 2f\n  xorl %eax, %eax\n2:\n");
+WOW_WIN32K_CODE(_dxg_service, "");
+#define GDI_SERVICE(name) WOW_WIN32K_STUB(name, NT_SERVICE_##name, _gdi_service);
+#define DXG_SERVICE(name) WOW_WIN32K_STUB(name, NT_SERVICE_##name, _dxg_service);
+#else
 #define GDI_SERVICE(name)                                                                                                                                     \
   __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" GDI_STR(NT_SERVICE_##name) ", %eax\n syscall\n cmp $0xC0000002, %eax\n jne 1f\n xor %eax, %eax\n1: ret\n");
 /* The Direct3D thunks (D3DKMT*) pass the status of the kernel on as it is: a service the kernel does not implement is STATUS_NOT_IMPLEMENTED, not success. */
 #define DXG_SERVICE(name)                                                                                                                                     \
   __asm__(".text\n.globl " #name "\n" #name ":\n mov %rcx, %r10\n mov $" GDI_STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n");
+#endif
 #define GDI_STR(x) GDI_STR2(x)
 #define GDI_STR2(x) #x
 
@@ -51,7 +61,15 @@ struct font_realization_info { DWORD size, flags, cache_num, instance_id, file_c
 struct char_width_info { INT lsb, rsb, unk; };
 struct font_fileinfo { FILETIME writetime; LARGE_INTEGER size; WCHAR path[1]; };
 
+#ifdef __i386__
+#pragma push_macro("WINAPI")
+#undef WINAPI
+#define WINAPI __cdecl      /* (the service stubs: see GDI_SERVICE) */
 #include "svc_proto.inc"
+#pragma pop_macro("WINAPI")
+#else
+#include "svc_proto.inc"
+#endif
 #include "svc_stubs.inc"
 
 /* Handles (src/Process/Win32k/Win32kGdi.cpp): generation << 24 | stock << 23 | type << 16 | index. The metafile objects are "client objects" of the kernel (type 0x20); gdi32

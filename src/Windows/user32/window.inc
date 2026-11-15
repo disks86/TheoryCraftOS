@@ -42,7 +42,11 @@ typedef struct {
 } WNDCLASS_;
 
 /* ---- the services (win32u.dll) ------------------------------------------------------------------------------------------------------------------------------------ */
+#ifdef __i386__
+#define SVC IMPORT ULONG_PTR __cdecl      /* (the 32-bit win32u.dll's stubs leave the arguments to the caller: they do not know how many there are) */
+#else
 #define SVC IMPORT ULONG_PTR WINAPI
+#endif
 SVC NtUserCreateWindowEx(ULONG_PTR ex_style, ULONG_PTR class_name, ULONG_PTR version, ULONG_PTR window_name, ULONG_PTR style, ULONG_PTR x, ULONG_PTR y, ULONG_PTR cx, ULONG_PTR cy,
                          ULONG_PTR parent, ULONG_PTR menu, ULONG_PTR instance, ULONG_PTR params, ULONG_PTR flags, ULONG_PTR client_instance, ULONG_PTR cls, ULONG_PTR ansi);
 SVC NtUserDestroyWindow(ULONG_PTR hwnd);
@@ -622,9 +626,20 @@ EXPORT HANDLE WINAPI GetTopWindow(HANDLE hwnd) { return GetWindow(hwnd ? hwnd : 
 EXPORT BOOL WINAPI IsChild(HANDLE parent, HANDLE hwnd) { return (NtUserCallHwndParam((ULONG_PTR)parent, (ULONG_PTR)hwnd, CHP_IS_CHILD) & 0xFFFFFFFFu) != 0; }
 EXPORT DWORD WINAPI GetWindowThreadProcessId(HANDLE hwnd, LPDWORD process) { return (DWORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)process, CHP_GET_WINDOW_THREAD); }
 /* On 64 bits the 32-bit functions cannot hold a pointer: the window procedure, the instance and the parent are refused */
+EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index);
+EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index);
+EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value);
+EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value);
+/* The window procedure, the instance and the parent are pointers: GetWindowLong cannot give them in a 64-bit program, and is how a 32-bit program asks. */
+#ifdef __i386__
+#define LONG_IS_POINTER(index) ((index) == -4 || (index) == -6 || (index) == -8)
+#else
+#define LONG_IS_POINTER(index) 0
+#endif
 static BOOL long_index_is_pointer(int index) { if (index == -4 || index == -6 || index == -8) { SetLastError(1413 /* ERROR_INVALID_INDEX */); return TRUE; } return FALSE; }
-EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { if (long_index_is_pointer(index)) return 0; return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
+EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { if (LONG_IS_POINTER(index)) return (LONG)GetWindowLongPtrW(hwnd, index); if (long_index_is_pointer(index)) return 0; return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
 EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) {
+  if (LONG_IS_POINTER(index)) return (LONG)GetWindowLongPtrA(hwnd, index);
   if (long_index_is_pointer(index)) return 0;
   const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_A);
   return (LONG)(index == -4 /* GWL_WNDPROC */ ? ansi_unwrap(v) : v);
@@ -642,6 +657,7 @@ static void layered_redraw(HANDLE hwnd, int index, LONG old_style, LONG value) {
   for (HANDLE c = GetWindow(hwnd, 5); c; c = GetWindow(c, 2)) InvalidateRect(c, NULL, TRUE);
 }
 EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) {
+  if (LONG_IS_POINTER(index)) return (LONG)SetWindowLongPtrW(hwnd, index, value);
   if (long_index_is_pointer(index)) return 0;
   const LONG old_style = index == -20 ? GetWindowLongW(hwnd, -20) : 0;
   const LONG r = (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0);
@@ -649,6 +665,7 @@ EXPORT LONG WINAPI SetWindowLongW(HANDLE hwnd, int index, LONG value) {
   return r;
 }
 EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) {
+  if (LONG_IS_POINTER(index)) return (LONG)SetWindowLongPtrA(hwnd, index, value);
   if (long_index_is_pointer(index)) return 0;
   const LONG old_style = index == -20 ? GetWindowLongW(hwnd, -20) : 0;
   const LONG r = (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)(DWORD)value, 0);

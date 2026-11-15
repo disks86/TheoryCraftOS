@@ -38,7 +38,21 @@ in a 32-bit address space: 32-bit import slots, image base, security cookie, TLS
 `C:\Windows\SysWOW64` (`ILibraryProvider::find_32bit`).
 
 **The libraries.** The sources of the libraries (src/Windows) are built a second time, for i386, into `C:\Windows\SysWOW64`
-(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): ntdll.dll, kernel32.dll and msvcrt.dll so far.
+(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32,
+comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32.
+
+- **Exports that are not implemented** are stubs, as in the 64-bit libraries, but a stdcall stub has to take its arguments off the stack: the
+  sizes come from the import libraries i686-w64-mingw32 ships (scripts/gen-wow64-stubs.py). The NT services nothing here has a prototype for are
+  exported the same way and answer STATUS_NOT_IMPLEMENTED (src/Windows/ntdll/wow64_unthunked.inc).
+- **A library's .def** (forwarders, ordinals) is rewritten with the decorated names of the i386 build (scripts/gen-wow64-def.py).
+- **The window system** (win32k's `NtUser*` and `NtGdi*` services) is reached through one piece of code per library
+  (src/Windows/tcos_wow64_win32k.h): the stubs are cdecl, and every argument is widened with its sign, which is right for pointers (below 2 GiB),
+  for handles like `HWND_TOPMOST`, and for 32-bit values (the kernel takes their low half). user32.dll and gdi32.dll are the same sources for
+  both widths and hand a service what the program gave them, so **the structures with handles or pointers in them are converted in the 32-bit
+  win32u.dll** (src/Windows/win32u/wow64.inc): `UNICODE_STRING`, `WNDCLASSEX`, `MSG`, `PAINTSTRUCT`, `GUITHREADINFO`, the parameter blocks of
+  `NtUserCallHwndParam`, the window list of `NtUserBuildHwndList`, and the structures of the messages that carry one (`CREATESTRUCT`,
+  `WINDOWPOS`, `NCCALCSIZE_PARAMS`, `COPYDATASTRUCT`) in both directions: when the kernel has a window procedure called, and when the program
+  sends such a message or passes it to `DefWindowProc`.
 
 - `tcos_win.h` gives the pointer-sized integers, the calling convention (`WINAPI`, `NTAPI`, `CALLBACK` are `__stdcall` on i386), the TEB accessors
   and a few structures their 32-bit form under `__i386__`. The structures are written with the natural pointer types, so the PEB, the process
@@ -80,6 +94,10 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 - **A program with a C runtime** (tests/windows/crt32.c, built with `i686-w64-mingw32-gcc` the ordinary way) runs on the 32-bit ntdll.dll,
   kernel32.dll and msvcrt.dll: the runtime's start-up, `printf`, the heap, files, the environment, `VirtualAlloc` / `VirtualQuery`, thread-local
   storage, critical sections, four threads and waiting for them, events, `Sleep`. All 21 of its checks pass.
+- **The other libraries** (tests/windows/gui32.c): the registry; `wsprintf` and the character functions; `InitCommonControls`; `OleInitialize`,
+  the shell's folders, a shortcut made through `IShellLink` and saved through `IPersistFile`; then a window class, a window with its creation
+  messages, its text, rectangles and window longs, `SetWindowPos`, sent and posted messages, a timer, a device context, `DestroyWindow` and
+  `WM_QUIT`. All 37 of its checks pass.
 - **Exceptions** (tests/windows/seh32.c): faults (bad reads and writes, division by zero, a breakpoint) reach the handler of a frame with the right
   record and registers, and the program goes on from a changed `CONTEXT`; the x87 and SSE registers are in the `CONTEXT` and come back; `RtlUnwind`;
   an exception that cannot be continued; an exception inside a handler; vectored handlers; the unhandled-exception filter; a `__try` frame handled
@@ -88,17 +106,21 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 
 Not done yet, in the order planned:
 
-1. **The other libraries** (advapi32, user32, gdi32, win32u, shell32, ole32, comctl32, ...) built for i386, with the win32k services' structures
-   converted; the stub libraries need the argument sizes of their functions (stdcall: the function takes its arguments off the stack), which the
-   32-bit import libraries of mingw give.
-2. **The long tail in the three libraries that are built**: the services ntdll has no prototype for are not exported; information classes with
+1. **The rest of the window system's structures.** These are still passed to the kernel in the 32-bit layout, so the services that take them
+   do not work in a 32-bit program yet: menus (`MENUITEMINFO`, `MENUINFO`), icons and cursors (`ICONINFO`), `SendInput` (`INPUT`),
+   `TrackMouseEvent`, hooks (the hook's module name, and the structures a hook procedure is given), the clipboard, keyboard layouts, monitor
+   enumeration, `SetScrollInfo`'s block, and in GDI `GetObject` of a bitmap (`BITMAP`, `DIBSECTION`). Dialogs keep their procedure at the 64-bit
+   offset of the window's extra bytes (`DWLP_DLGPROC` is 4, not 8, in a 32-bit program), and comctl32 has no controls yet (for 64-bit programs
+   either). A message with a structure sent between a 32-bit and a 64-bit program is not converted.
+2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; information classes with
    pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; a 32-bit program cannot start another program
    (`RtlCreateProcessParameters` writes the 64-bit layout); `%p` prints 16 digits; the old runtime's `_iob` array has the wrong stride.
 3. **What exceptions still lack**: C++ exceptions of the Microsoft runtime (`__CxxFrameHandler`, `_CxxThrowException`: msvcrt.dll has neither, for
    64-bit programs either); the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
    debugged (no debug events for it); a stack overflow ends the program (no guard-page exception on the 32-bit stack).
-4. **Setup programs**: the App Manager refuses 32-bit setup programs until 1 is done (docs/AppManager.md). They are GUI programs that use
-   user32, gdi32, comctl32, shell32 and ole32.
+4. **Setup programs**: the App Manager still refuses 32-bit setup programs (docs/AppManager.md). The libraries they import are there and a
+   program like tests/windows/gui32.c runs; no real setup program has been run yet. oleaut32 parses numbers exactly only up to 2^62 in a 32-bit
+   program (i386 has no 128-bit integers).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Tests
@@ -106,4 +128,4 @@ Not done yet, in the order planned:
 - `tests/run_host_tests.sh SyscallTest LoaderTest`: binding a PE32 program, the INT 2E argument convention, the address-space ceiling.
 - `tests/run_host_tests.sh WindowsExceptionTest`: the i386 `CONTEXT` and record the kernel writes and reads, with truncated and bit-flipped
   contexts.
-- `tests/wow64_qemu.sh [hello32] [crt32] [seh32]`: the three programs above in the real kernel, each in a boot of its own.
+- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32]`: the four programs above in the real kernel, each in a boot of its own.

@@ -417,6 +417,13 @@ EXPORT NTSTATUS NTAPI NtDeleteFile(POBJECT_ATTRIBUTES a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwDeleteFile(POBJECT_ATTRIBUTES a0) { return NtDeleteFile(a0); }
+EXPORT NTSTATUS NTAPI NtDeleteKey(HANDLE a0) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtDeleteKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwDeleteKey(HANDLE a0) { return NtDeleteKey(a0); }
 EXPORT NTSTATUS NTAPI NtDeleteValueKey(HANDLE a0, PUNICODE_STRING a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -448,6 +455,18 @@ EXPORT NTSTATUS NTAPI NtDuplicateObject(HANDLE a0, HANDLE a1, HANDLE a2, PHANDLE
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwDuplicateObject(HANDLE a0, HANDLE a1, HANDLE a2, PHANDLE a3, ULONG a4, ULONG a5, ULONG a6) { return NtDuplicateObject(a0, a1, a2, a3, a4, a5, a6); }
+EXPORT NTSTATUS NTAPI NtEnumerateKey(HANDLE a0, ULONG a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) {
+  ULONG64 v[6] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtEnumerateKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwEnumerateKey(HANDLE a0, ULONG a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) { return NtEnumerateKey(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtEnumerateValueKey(HANDLE a0, ULONG a1, ULONG a2, PVOID a3, ULONG a4, PULONG a5) {
   ULONG64 v[6] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -468,6 +487,13 @@ EXPORT NTSTATUS NTAPI NtFlushBuffersFile(HANDLE a0, PIO_STATUS_BLOCK a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwFlushBuffersFile(HANDLE a0, PIO_STATUS_BLOCK a1) { return NtFlushBuffersFile(a0, a1); }
+EXPORT NTSTATUS NTAPI NtFlushKey(HANDLE a0) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtFlushKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwFlushKey(HANDLE a0) { return NtFlushKey(a0); }
 EXPORT VOID NTAPI NtFlushProcessWriteBuffers(void) {
   ULONG64 v[4] = {0};
   wow_service(NT_SERVICE_NtFlushProcessWriteBuffers, v);
@@ -545,6 +571,16 @@ EXPORT NTSTATUS NTAPI NtListenSocket(HANDLE a0, ULONG a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwListenSocket(HANDLE a0, ULONG a1) { return NtListenSocket(a0, a1); }
+EXPORT NTSTATUS NTAPI NtLoadKey(POBJECT_ATTRIBUTES a0, POBJECT_ATTRIBUTES a1) {
+  ULONG64 v[4] = {0};
+  WOW_OBJECT_ATTRIBUTES o0;
+  v[0] = wow_object_attributes(&o0, a0);
+  WOW_OBJECT_ATTRIBUTES o1;
+  v[1] = wow_object_attributes(&o1, a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtLoadKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwLoadKey(POBJECT_ATTRIBUTES a0, POBJECT_ATTRIBUTES a1) { return NtLoadKey(a0, a1); }
 EXPORT NTSTATUS NTAPI NtLoadModule(PUNICODE_STRING a0, PVOID * a1, PVOID a2, ULONG a3, PULONG a4, ULONG a5) {
   ULONG64 v[6] = {0};
   UNICODE_STRING64 s0;
@@ -611,6 +647,22 @@ EXPORT NTSTATUS NTAPI NtNotifyChangeDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwNotifyChangeDirectoryFile(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PIO_STATUS_BLOCK a4, PVOID a5, ULONG a6, ULONG a7, BOOLEAN a8) { return NtNotifyChangeDirectoryFile(a0, a1, a2, a3, a4, a5, a6, a7, a8); }
+EXPORT NTSTATUS NTAPI NtNotifyChangeKey(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PVOID a4, ULONG a5, BOOLEAN a6, PVOID a7, ULONG a8, BOOLEAN a9) {
+  ULONG64 v[10] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  v[5] = (ULONG64)(ULONG_PTR)a5;
+  v[6] = (ULONG64)(ULONG_PTR)a6;
+  v[7] = (ULONG64)(ULONG_PTR)a7;
+  v[8] = (ULONG64)(ULONG_PTR)a8;
+  v[9] = (ULONG64)(ULONG_PTR)a9;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtNotifyChangeKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwNotifyChangeKey(HANDLE a0, HANDLE a1, PVOID a2, PVOID a3, PVOID a4, ULONG a5, BOOLEAN a6, PVOID a7, ULONG a8, BOOLEAN a9) { return NtNotifyChangeKey(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9); }
 EXPORT NTSTATUS NTAPI NtOpenDirectoryObject(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   ULONG64 v[4] = {0};
   ULONG64 w0 = a0 ? WOW_HANDLE(*a0) : 0;
@@ -831,6 +883,17 @@ EXPORT NTSTATUS NTAPI NtQueryIoCompletion(HANDLE a0, ULONG a1, PVOID a2, ULONG a
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwQueryIoCompletion(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtQueryIoCompletion(a0, a1, a2, a3, a4); }
+EXPORT NTSTATUS NTAPI NtQueryKey(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) {
+  ULONG64 v[5] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtQueryKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwQueryKey(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtQueryKey(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtQueryPerformanceCounter(PLARGE_INTEGER a0, PLARGE_INTEGER a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1025,6 +1088,26 @@ EXPORT NTSTATUS NTAPI NtRemoveProcessDebug(HANDLE a0, HANDLE a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwRemoveProcessDebug(HANDLE a0, HANDLE a1) { return NtRemoveProcessDebug(a0, a1); }
+EXPORT NTSTATUS NTAPI NtRenameKey(HANDLE a0, PUNICODE_STRING a1) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  UNICODE_STRING64 s1;
+  v[1] = wow_unicode_string(&s1, a1);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtRenameKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwRenameKey(HANDLE a0, PUNICODE_STRING a1) { return NtRenameKey(a0, a1); }
+EXPORT NTSTATUS NTAPI NtReplaceKey(POBJECT_ATTRIBUTES a0, HANDLE a1, POBJECT_ATTRIBUTES a2) {
+  ULONG64 v[4] = {0};
+  WOW_OBJECT_ATTRIBUTES o0;
+  v[0] = wow_object_attributes(&o0, a0);
+  v[1] = WOW_HANDLE(a1);
+  WOW_OBJECT_ATTRIBUTES o2;
+  v[2] = wow_object_attributes(&o2, a2);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtReplaceKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwReplaceKey(POBJECT_ATTRIBUTES a0, HANDLE a1, POBJECT_ATTRIBUTES a2) { return NtReplaceKey(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtResetEvent(HANDLE a0, PLONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -1033,6 +1116,15 @@ EXPORT NTSTATUS NTAPI NtResetEvent(HANDLE a0, PLONG a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwResetEvent(HANDLE a0, PLONG a1) { return NtResetEvent(a0, a1); }
+EXPORT NTSTATUS NTAPI NtRestoreKey(HANDLE a0, HANDLE a1, ULONG a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtRestoreKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwRestoreKey(HANDLE a0, HANDLE a1, ULONG a2) { return NtRestoreKey(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtResumeThread(HANDLE a0, PULONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -1041,6 +1133,15 @@ EXPORT NTSTATUS NTAPI NtResumeThread(HANDLE a0, PULONG a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwResumeThread(HANDLE a0, PULONG a1) { return NtResumeThread(a0, a1); }
+EXPORT NTSTATUS NTAPI NtSaveKeyEx(HANDLE a0, HANDLE a1, ULONG a2) {
+  ULONG64 v[4] = {0};
+  v[0] = WOW_HANDLE(a0);
+  v[1] = WOW_HANDLE(a1);
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSaveKeyEx, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwSaveKeyEx(HANDLE a0, HANDLE a1, ULONG a2) { return NtSaveKeyEx(a0, a1, a2); }
 EXPORT NTSTATUS NTAPI NtSelectSockets(PULONG a0, PULONG a1, PULONG a2, PULONG a3, PULONG a4, PULONG a5, PLARGE_INTEGER a6, PULONG a7) {
   ULONG64 v[8] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1192,6 +1293,13 @@ EXPORT NTSTATUS NTAPI NtSetValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, ULO
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetValueKey(HANDLE a0, PUNICODE_STRING a1, ULONG a2, ULONG a3, PVOID a4, ULONG a5) { return NtSetValueKey(a0, a1, a2, a3, a4, a5); }
+EXPORT NTSTATUS NTAPI NtShutdownSystem(ULONG a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtShutdownSystem, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwShutdownSystem(ULONG a0) { return NtShutdownSystem(a0); }
 NTSTATUS NTAPI RawNtSignalAndWaitForSingleObject(HANDLE a0, HANDLE a1, BOOLEAN a2, PLARGE_INTEGER a3) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -1228,6 +1336,20 @@ EXPORT NTSTATUS NTAPI NtTcosAccessCheck(void * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosAccessCheck(void * a0) { return NtTcosAccessCheck(a0); }
+EXPORT NTSTATUS NTAPI NtTcosCommonDialog(void * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosCommonDialog, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosCommonDialog(void * a0) { return NtTcosCommonDialog(a0); }
+EXPORT NTSTATUS NTAPI NtTcosCrypto(ULONG64 * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosCrypto, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosCrypto(ULONG64 * a0) { return NtTcosCrypto(a0); }
 EXPORT NTSTATUS NTAPI NtTcosDebugException(PVOID a0, BOOLEAN a1, PVOID a2) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1237,6 +1359,24 @@ EXPORT NTSTATUS NTAPI NtTcosDebugException(PVOID a0, BOOLEAN a1, PVOID a2) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosDebugException(PVOID a0, BOOLEAN a1, PVOID a2) { return NtTcosDebugException(a0, a1, a2); }
+EXPORT NTSTATUS NTAPI NtTcosDwm(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4) {
+  ULONG64 v[5] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosDwm, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosDwm(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4) { return NtTcosDwm(a0, a1, a2, a3, a4); }
+EXPORT NTSTATUS NTAPI NtTcosFont(void * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosFont, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosFont(void * a0) { return NtTcosFont(a0); }
 EXPORT NTSTATUS NTAPI NtTcosLinkModules(PVOID a0, PVOID a1) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1245,6 +1385,13 @@ EXPORT NTSTATUS NTAPI NtTcosLinkModules(PVOID a0, PVOID a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosLinkModules(PVOID a0, PVOID a1) { return NtTcosLinkModules(a0, a1); }
+EXPORT NTSTATUS NTAPI NtTcosOpenGl(void * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtTcosOpenGl, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwTcosOpenGl(void * a0) { return NtTcosOpenGl(a0); }
 EXPORT NTSTATUS NTAPI NtTcosToken(ULONG a0, ULONG_PTR a1, ULONG_PTR a2, ULONG_PTR a3, ULONG_PTR a4, ULONG_PTR a5) {
   ULONG64 v[6] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
@@ -1281,6 +1428,14 @@ EXPORT NTSTATUS NTAPI NtTerminateThread(HANDLE a0, NTSTATUS a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTerminateThread(HANDLE a0, NTSTATUS a1) { return NtTerminateThread(a0, a1); }
+EXPORT NTSTATUS NTAPI NtUnloadKey(POBJECT_ATTRIBUTES a0) {
+  ULONG64 v[4] = {0};
+  WOW_OBJECT_ATTRIBUTES o0;
+  v[0] = wow_object_attributes(&o0, a0);
+  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtUnloadKey, v);
+  return status;
+}
+EXPORT NTSTATUS NTAPI ZwUnloadKey(POBJECT_ATTRIBUTES a0) { return NtUnloadKey(a0); }
 EXPORT NTSTATUS NTAPI NtUnloadModule(PVOID a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;

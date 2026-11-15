@@ -28,7 +28,12 @@
 #endif
 
 #ifdef STUB_DLLMAIN
-__attribute__((weak)) int DllMain(void* module, unsigned reason, void* reserved) {
+#ifdef __i386__
+#define STUB_ENTRY __stdcall      /* (the entry point of a 32-bit library takes its three arguments off the stack) */
+#else
+#define STUB_ENTRY
+#endif
+__attribute__((weak)) int STUB_ENTRY DllMain(void* module, unsigned reason, void* reserved) {
   (void)module;
   (void)reason;
   (void)reserved;

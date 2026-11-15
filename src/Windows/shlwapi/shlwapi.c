@@ -300,8 +300,17 @@ EXPORT HRESULT_ WINAPI StrFormatByteSizeEx(ULONGLONG size, DWORD flags, LPWSTR o
       int found = 0;
       for (int d = 2; d >= 0 && !found; --d) {
         unsigned long long scale = d == 2 ? 100 : d == 1 ? 10 : 1;
+#ifdef __i386__
+        /* (no 128-bit integers on i386: the product is kept as a high and a low half - the scale is 100 at most, so the high half is small) */
+        const unsigned long long low_part = (size & 0xFFFFFFFFull) * scale, high_part = (size >> 32) * scale + (low_part >> 32);
+        unsigned long long low = (high_part << 32) | (low_part & 0xFFFFFFFFull), high = high_part >> 32;
+        if (round) { const unsigned long long before = low; low += 1ull << (shift - 1); if (low < before) ++high; }
+        if (high >> shift) continue;      /* (shift is 10 to 60: far too big for this unit) */
+        const unsigned long long x = (low >> shift) | (high << (64 - shift));
+#else
         unsigned __int128 x = (unsigned __int128)size * scale;
         x = round ? (x + ((unsigned __int128)1 << (shift - 1))) >> shift : x >> shift;
+#endif
         if (x >= 1000) continue;      /* (it needs a bigger unit, or fewer decimals) */
         const ULONGLONG whole = (ULONGLONG)x / scale, frac = (ULONGLONG)x % scale;
         n = append_decimal(t, whole);

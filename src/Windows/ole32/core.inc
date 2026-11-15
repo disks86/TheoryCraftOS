@@ -170,8 +170,14 @@ EXPORT HRESULT WINAPI CoCreateGuid(GUID *guid) {
   return S_OK;
 }
 
+#ifdef __i386__
+/* (i386: the symbol of a stdcall function is _Name@bytes, and the export is written out because the compiler would export the label as it stands) */
+BOOL WINAPI Ole32_IsEqualGUID(REFGUID a, REFGUID b) __asm__("_IsEqualGUID@8");
+__asm__(".section .drectve\n.ascii \" -export:IsEqualGUID@8\"\n.text\n");
+#else
 EXPORT BOOL WINAPI Ole32_IsEqualGUID(REFGUID a, REFGUID b) __asm__("IsEqualGUID");
-EXPORT BOOL WINAPI Ole32_IsEqualGUID(REFGUID a, REFGUID b) { return mem_cmp(a, b, sizeof(GUID)) == 0; }
+#endif
+BOOL WINAPI Ole32_IsEqualGUID(REFGUID a, REFGUID b) { return mem_cmp(a, b, sizeof(GUID)) == 0; }
 
 static const char kHex[] = "0123456789ABCDEF";
 static void put_hex(WCHAR **p, ULONGLONG v, int digits) { for (int i = digits - 1; i >= 0; i--) *(*p)++ = (WCHAR)kHex[(v >> (4 * i)) & 15]; }
@@ -283,7 +289,12 @@ typedef struct ThreadData {
 } ThreadData;
 
 /* The data of a thread hangs on TEB.ReservedForOle (offset 0x1758 on x64), where Windows keeps it, so that programs can see its flags. */
-static void **teb_ole_slot(void) { return (void **)((BYTE *)NtCurrentTeb() + 0x1758); }
+#ifdef __i386__
+#define TEB_RESERVED_FOR_OLE 0xF80      /* (the 32-bit TEB's) */
+#else
+#define TEB_RESERVED_FOR_OLE 0x1758
+#endif
+static void **teb_ole_slot(void) { return (void **)((BYTE *)NtCurrentTeb() + TEB_RESERVED_FOR_OLE); }
 static ThreadData *thread_data(BOOL create) {
   void **slot = teb_ole_slot();
   ThreadData *td = *slot;

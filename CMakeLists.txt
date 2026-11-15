@@ -1613,7 +1613,8 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   endforeach()
   # The libraries of 32-bit programs (C:\\Windows\\SysWOW64, see docs/Wow64.md): the same sources built for i386, where there is a compiler for that.
   find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
-  set(WOW64_LIBRARIES ntdll kernel32 msvcrt)
+  # (the same list, in the order of building, is LIBRARIES in scripts/build-wow64-dlls.sh)
+  set(WOW64_LIBRARIES ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32)
   set(_wow64_outputs "")
   if(TCOS_WOW64_CC)
     set(WOW64_DIR ${CMAKE_BINARY_DIR}/windows32)
@@ -1621,12 +1622,18 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
       list(APPEND _wow64_outputs ${WOW64_DIR}/${_library}.dll)
       list(APPEND _system32_files file:/Windows/Windows/SysWOW64/${_library}.dll=${WOW64_DIR}/${_library}.dll)
     endforeach()
-    file(GLOB _wow64_sources ${CMAKE_SOURCE_DIR}/src/Windows/*.h ${CMAKE_SOURCE_DIR}/src/Windows/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/ntdll/*
-         ${CMAKE_SOURCE_DIR}/src/Windows/kernel32/* ${CMAKE_SOURCE_DIR}/src/Windows/msvcrt/*)
+    set(_wow64_sources "")
+    file(GLOB _wow64_shared ${CMAKE_SOURCE_DIR}/src/Windows/*.h ${CMAKE_SOURCE_DIR}/src/Windows/*.inc ${CMAKE_SOURCE_DIR}/src/Windows/stubs/stubs.c
+         ${CMAKE_SOURCE_DIR}/scripts/gen-wow64-stubs.py ${CMAKE_SOURCE_DIR}/scripts/gen-wow64-def.py)
+    list(APPEND _wow64_sources ${_wow64_shared})
+    foreach(_library ${WOW64_LIBRARIES})
+      file(GLOB _wow64_library_sources ${CMAKE_SOURCE_DIR}/src/Windows/${_library}/* ${CMAKE_SOURCE_DIR}/src/Windows/stubs/${_library}.inc)
+      list(APPEND _wow64_sources ${_wow64_library_sources})
+    endforeach()
     add_custom_command(OUTPUT ${_wow64_outputs}
       COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-wow64-dlls.sh ${WOW64_DIR}
       DEPENDS ${_wow64_sources} ${CMAKE_SOURCE_DIR}/scripts/build-wow64-dlls.sh
-      COMMENT "Building the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll (SysWOW64)")
+      COMMENT "Building the libraries of 32-bit programs (SysWOW64)")
     add_custom_target(windows_dlls32 DEPENDS ${_wow64_outputs})
   else()
     message(STATUS "No i686-w64-mingw32-gcc: the libraries of 32-bit Windows programs are not built")

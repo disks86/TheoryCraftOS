@@ -150,7 +150,14 @@ IMPORT DWORD WINAPI GetLastError(void);
 #define FRAME 8
 
 /* The device contexts of the screen and the system colours, over win32k (NtUserGetDC: a null window is the screen) and gdi32's solid brushes. */
+#ifdef __i386__
+/* (a 32-bit program's: through INT 2E with the arguments widened, see tcos_wow64_win32k.h) */
+#include "../tcos_wow64_win32k.h"
+WOW_WIN32K_CODE(_user32_service, "");
+#define USER32_SERVICE(name) __asm__(".text\n.p2align 4\nuser32_" #name ":\n movl $" U32_STR(NT_SERVICE_##name) ", %eax\n jmp _user32_service\n")
+#else
 #define USER32_SERVICE(name) __asm__(".text\n.p2align 4\nuser32_" #name ":\n mov %rcx, %r10\n mov $" U32_STR(NT_SERVICE_##name) ", %eax\n syscall\n ret\n")
+#endif
 #define U32_STR(x) U32_STR2(x)
 #define U32_STR2(x) #x
 USER32_SERVICE(NtUserGetDC);
