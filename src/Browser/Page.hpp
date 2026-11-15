@@ -216,7 +216,7 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   void traverse(StringView address, StringView state_json, bool has_state);
 
   // --- Frames
-  Page* root() { return parent_ ? parent_->root() : this; }
+  Page* root() { return parent_ ? parent_->root() : worker_owner_ ? worker_owner_->root() : this; }   // (a worker is in the tree of the page that owns it: its message ports are numbered and routed there)
   // This page is the content of the <iframe> with that node serial in `parent` (set before load()). Frames are nested up to 3 deep, 8 to a page.
   void set_parent(Page* parent, uint32_t frame_serial, uint32_t depth) {
     parent_ = parent;
@@ -362,11 +362,17 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   bool rtc_op(uint32_t id, StringView name, StringView a, StringView b, ConstByteView bytes, int64_t n1, int64_t n2, String* out) override;
   void rtc_release(uint32_t id) override;
   void ws_release(uint32_t id) override;
-  uint32_t worker_start(StringView source, StringView url, StringView name, String* error) override;
-  void worker_post(uint32_t id, StringView message) override;
+  uint32_t worker_start(StringView source, StringView url, StringView name, bool module, String* error) override;
+  void worker_post(uint32_t id, StringView message, StringView ports) override;
   void worker_terminate(uint32_t id) override;
   void worker_pump() override;
-  bool worker_next_event(uint32_t* id, uint32_t* kind, String* text) override;
+  bool worker_next_event(uint32_t* id, uint32_t* kind, String* text, String* ports) override;
+  bool worker_scope() override { return worker_runtime_ != nullptr; }
+  StringView worker_scope_name() override;
+  void worker_scope_post(StringView message, StringView ports) override;
+  void worker_scope_fail(StringView text) override;
+  void worker_scope_close() override;
+  bool worker_scope_blob(StringView address, String* wire) override;
   bool compile_handler(StringView code, script::Value* function) override;
   ServiceWorkerHub* service_workers() override { return sw_hub_ ? sw_hub_ : env_.service_workers(); }
   uint32_t service_worker_client() override { return sw_client_; }
@@ -600,9 +606,18 @@ class Page final : public script::IHost, public IDomHost, public dom::IScriptRun
   };
   List<Socket> sockets_;
   List<uint32_t> rtc_ids_, rtc_sources_;   // the connections this page made, and the microphones it opened   // the peer connections this page made (let go of with it)
+  class WorkerEnv;
   struct WorkerRuntime;
   List<UniquePointer<WorkerRuntime>> workers_;
   uint32_t next_worker_ = 1;
+  // Set for the page that is the global scope of a dedicated worker: the page that made the worker, and what it keeps about it.
+  Page* worker_owner_ = nullptr;
+  WorkerRuntime* worker_runtime_ = nullptr;
+  uint32_t worker_depth_ = 0;   // (a worker may start workers of its own, a few levels deep)
+  void run_dedicated_worker(StringView source, bool module);
+  Page* find_worker_window(uint32_t id);
+  bool worker_runtime_closed() const;
+  void script_error(StringView text);
   uint32_t next_socket_ = 1;
   IWebSocket* socket_of(uint32_t id);
   uint64_t style_cache_version_ = 0;

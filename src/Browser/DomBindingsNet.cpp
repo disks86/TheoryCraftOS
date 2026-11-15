@@ -557,21 +557,22 @@ NATIVE(ws_release) {
   return true;
 }
 
-// --- Web Workers: __worker_start(source, url, name) -> id (0: not started, the reason in __worker_error), __worker_post(id, text), __worker_terminate(id),
-// __worker_pump() -> [[id, kind, text] ...] (kind 0 message, 1 error, 2 closed)
+// --- Web Workers: __worker_start(source, url, name, module) -> id (0: not started, the reason in __worker_error), __worker_post(id, text, ports),
+// __worker_terminate(id), __worker_pump() -> [[id, kind, text, ports] ...] (kind 0 message, 1 error, 2 closed)
 NATIVE(worker_start) {
   String source(vm.allocator()), url(vm.allocator()), name(vm.allocator()), error(vm.allocator());
   if (!arg_text(vm, arg_at(args, argc, 0), &source) || !arg_text(vm, arg_at(args, argc, 1), &url) || !arg_text(vm, arg_at(args, argc, 2), &name)) return false;
-  const uint32_t id = impl(vm).host.worker_start(source.view(), url.view(), name.view(), &error);
+  const uint32_t id = impl(vm).host.worker_start(source.view(), url.view(), name.view(), Vm::to_boolean(arg_at(args, argc, 3)), &error);
   vm.define_named(vm.global(), "__worker_error", str_value(vm, error.view()), 0);
   *result = num_value(id);
   return true;
 }
 NATIVE(worker_post) {
   double id;
-  String text(vm.allocator());
+  String text(vm.allocator()), ports(vm.allocator());
   if (!vm.to_number(arg_at(args, argc, 0), &id) || !arg_text(vm, arg_at(args, argc, 1), &text)) return false;
-  impl(vm).host.worker_post(static_cast<uint32_t>(id), text.view());
+  if (argc > 2 && !arg_text(vm, args[2], &ports)) return false;
+  impl(vm).host.worker_post(static_cast<uint32_t>(id), text.view(), ports.view());
   return true;
 }
 NATIVE(worker_terminate) {
@@ -586,14 +587,46 @@ NATIVE(worker_pump) {
   JsObject* out = vm.new_array();
   *result = Value::make_object(out);
   uint32_t id, kind, guard = 0;
-  String text(vm.allocator());
-  while (guard++ < 500 && c.host.worker_next_event(&id, &kind, &text)) {
-    JsObject* entry = vm.new_array(3);
+  String text(vm.allocator()), ports(vm.allocator());
+  while (guard++ < 500 && c.host.worker_next_event(&id, &kind, &text, &ports)) {
+    JsObject* entry = vm.new_array(4);
     vm.array_push(entry, num_value(id));
     vm.array_push(entry, num_value(kind));
     vm.array_push(entry, str_value(vm, text.view()));
+    vm.array_push(entry, str_value(vm, ports.view()));
     vm.array_push(out, Value::make_object(entry));
   }
+  return true;
+}
+
+// Inside a worker: __worker_scope() -> the worker's name, or null in a document; __worker_out(text, ports) a message for the page that owns the worker;
+// __worker_fail(text) an error nothing in the worker handled; __worker_close(); __worker_blob(address) -> the serialized Blob behind a blob: address of the owner (or null).
+NATIVE(worker_scope) {
+  IDomHost& host = impl(vm).host;
+  *result = host.worker_scope() ? str_value(vm, host.worker_scope_name()) : Value::make_null();
+  return true;
+}
+NATIVE(worker_out) {
+  String text(vm.allocator()), ports(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  if (argc > 1 && !arg_text(vm, args[1], &ports)) return false;
+  impl(vm).host.worker_scope_post(text.view(), ports.view());
+  return true;
+}
+NATIVE(worker_fail) {
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &text)) return false;
+  impl(vm).host.worker_scope_fail(text.view());
+  return true;
+}
+NATIVE(worker_close) {
+  impl(vm).host.worker_scope_close();
+  return true;
+}
+NATIVE(worker_blob) {
+  String address(vm.allocator()), wire(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 0), &address)) return false;
+  *result = impl(vm).host.worker_scope_blob(address.view(), &wire) ? str_value(vm, wire.view()) : Value::make_null();
   return true;
 }
 
@@ -850,8 +883,13 @@ bool install_net(DomBindings::Impl& c) {
   vm.define_native(g, "__form_decode", net_form_decode, 1);
   vm.define_native(g, "__url_resolve", url_resolve, 2);
   vm.define_native(g, "__run_hook", run_hook, 1);
-  vm.define_native(g, "__worker_start", worker_start, 3);
-  vm.define_native(g, "__worker_post", worker_post, 2);
+  vm.define_native(g, "__worker_start", worker_start, 4);
+  vm.define_native(g, "__worker_post", worker_post, 3);
+  vm.define_native(g, "__worker_scope", worker_scope, 0);
+  vm.define_native(g, "__worker_out", worker_out, 2);
+  vm.define_native(g, "__worker_fail", worker_fail, 1);
+  vm.define_native(g, "__worker_close", worker_close, 0);
+  vm.define_native(g, "__worker_blob", worker_blob, 1);
   vm.define_native(g, "__worker_terminate", worker_terminate, 1);
   vm.define_native(g, "__worker_pump", worker_pump, 0);
   vm.define_native(g, "__crypto_hash", crypto_hash, 2);

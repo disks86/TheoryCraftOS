@@ -7221,14 +7221,36 @@ static void test_webrtc() {
 // checks for the base platform: dom/nodes, dom/events, dom/lists, url, fetch/api + FileAPI + encoding, html/webappapis + domparsing + ranges + observers, css selectors and
 // cssom, html forms/tables, custom elements/shadow dom/templates, messaging, streams, history, webcrypto, xhr. harness.js reports "FAIL name: reason" for a failing test and
 // "XPASS name" for a known gap (xfail("name") in the file) that started to work, so fixing an engine gap makes this test ask for its xfail line to be removed.
+// The site the suites fetch from (https://app.example/wpt/): the scripts of workers, modules and what they load.
+static void wpt_site(FakeEnvironment& env) {
+  const std::string site = "https://app.example/wpt/";
+  const char* js = "Content-Type: text/javascript\r\n";
+  auto& answers = env.net.answers;
+  answers["GET " + site + "where.js?a=1"] = {200, js, "postMessage([location.href, location.protocol, location.host, location.hostname, location.port, location.pathname, location.search, location.hash, location.origin]);"};
+  answers["GET " + site + "relative.js"] = {200, js, "fetch('data.json').then(function (r) { return r.json().then(function (j) { var x = new XMLHttpRequest(); x.open('GET', './file.txt', false); x.send(); postMessage([r.status, j.n, x.responseText]); }); });"};
+  answers["GET " + site + "data.json"] = {200, "Content-Type: application/json\r\n", "{\"n\":42,\"list\":[1,2,3]}"};
+  answers["GET " + site + "file.txt"] = {200, "Content-Type: text/plain\r\n", "text of the file\n"};
+  answers["POST " + site + "api"] = {201, "Content-Type: application/octet-stream\r\nX-Reply: posted\r\n", std::string("\x00\xff\x80\n\r\xc8", 6)};
+  answers["GET " + site + "lib.js"] = {200, js, "var libOrder = ['lib']; var libValue = 'lib'; function libFunction() { return this; }"};
+  answers["GET " + site + "lib2.js"] = {200, js, "libOrder.push('lib2'); var lib2Value = 'lib2 after ' + libValue;"};
+  answers["GET " + site + "throws.js"] = {200, js, "throw new Error('thrown by the script');"};
+  answers["GET " + site + "dep.js"] = {200, js, "export const name = 'dep'; export function twice(n) { return n * 2; } export default 'default export';"};
+  answers["GET " + site + "module.js"] = {200, js,
+      "import { name, twice } from './dep.js';\n"
+      "var noImport; try { importScripts('lib.js'); noImport = 'no throw'; } catch (e) { noImport = e.name; }\n"
+      "postMessage([name, twice(21), import.meta.url, typeof this, typeof window, noImport, Object.prototype.toString.call(self)]);\n"
+      "self.onmessage = function () { import('./dep.js').then(function (m) { return import('./dep.js').then(function (again) { postMessage(['dynamic ' + m.name, m.default, m === again]); }); }); };"};
+  answers["GET " + site + "bad-import.js"] = {200, js, "import './nowhere.js'; postMessage('ran');"};
+}
+
 static void test_wpt() {
   const std::string harness = read_text_file("tests/data/wpt/harness.js");
   CHECK(!harness.empty());
-  static const char* const files[] = {"dom_nodes", "dom_events", "dom_lists", "url", "fetch_api", "html_platform", "css_selectors", "cssom", "html_forms", "components", "messaging_streams", "js_language", "js_strict", "js_builtins", "html_parser", "css_conformance", "wasm_jsapi", "dom_ranges_traversal", "web_apis", "web_apis_behavior", "js_modules", "dom_svg", "web_audio", "web_animations", "css_animations", "css_font_loading"};
+  static const char* const files[] = {"dom_nodes", "dom_events", "dom_lists", "url", "fetch_api", "html_platform", "css_selectors", "cssom", "html_forms", "components", "messaging_streams", "js_language", "js_strict", "js_builtins", "html_parser", "css_conformance", "wasm_jsapi", "dom_ranges_traversal", "web_apis", "web_apis_behavior", "workers", "js_modules", "dom_svg", "web_audio", "web_animations", "css_animations", "css_font_loading"};
   for (const char* name : files) {
     const std::string source = read_text_file((std::string("tests/data/wpt/") + name + ".js").c_str());
     CHECK(!source.empty());
-    const std::string log = run_async((harness + "\n" + source).c_str(), "https://app.example/dir/page.html", nullptr, 4000);
+    const std::string log = run_async((harness + "\n" + source).c_str(), "https://app.example/dir/page.html", wpt_site, 4000);
     const bool done = log.find("DONE ") != std::string::npos;
     if (!done) printf("   wpt %s never finished: %s\n", name, log.substr(0, 400).c_str());
     CHECK(done);
@@ -7537,7 +7559,7 @@ int main(int argc, char** argv) {
     return g_failed ? 1 : 0;
   }
   if (argc > 1) {   // (a scratch: PageTest 'script' prints what the script logs, with timers run)
-    printf("%s\n", run_async(argv[1], "https://app.example/dir/page.html").c_str());
+    printf("%s\n", run_async(argv[1], "https://app.example/dir/page.html", wpt_site, 4000).c_str());
     return 0;
   }
   test_tree();
