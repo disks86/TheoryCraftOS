@@ -1565,7 +1565,7 @@ dom::Node* this_tokens(Vm& vm, const Value& self) {
 }
 
 bool token_arg(Vm& vm, const Value& v, String* out) {
-  if (!arg_text(vm, v, out)) return false;
+  if (!arg_string(vm, v, out)) return false;   // (null is the token "null")
   if (out->empty()) return throw_dom(vm, "SyntaxError", "The token provided must not be empty.");
   for (uint64_t i = 0; i < out->size(); ++i)
     if (is_space((*out)[i])) return throw_dom(vm, "InvalidCharacterError", "The token provided contains HTML space characters, which are not valid in tokens.");
@@ -1615,7 +1615,7 @@ NATIVE(tokens_toggle) {
   const bool want = argc > 1 && !args[1].is_undefined() ? Vm::to_boolean(args[1]) : at < 0;
   if (want && at < 0) tokens.push_back(util::move(t));
   else if (!want && at >= 0) tokens.remove_at(static_cast<uint64_t>(at));
-  write_tokens(n, tokens);
+  if (want != (at >= 0)) write_tokens(n, tokens);   // (nothing to change: the attribute stays as it is written)
   *result = bool_value(want);
   return true;
 }
@@ -1623,7 +1623,7 @@ NATIVE(tokens_toggle) {
 NATIVE(tokens_contains) {
   dom::Node* n = this_tokens(vm, self);
   String t(vm.allocator());
-  if (!n || !arg_text(vm, arg_at(args, argc, 0), &t)) return false;
+  if (!n || !arg_string(vm, arg_at(args, argc, 0), &t)) return false;
   *result = bool_value(dom::has_class(n, t.view()));
   return true;
 }

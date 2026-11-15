@@ -109,6 +109,26 @@ class SelectorSet::Reader {
     while (pos_ < text_.size() && is_space(text_[pos_])) ++pos_;
   }
 
+  // The UTF-8 of a code point an escape names (U+FFFD for 0, a surrogate or one beyond Unicode).
+  static void append_code_point(uint32_t cp, String* out) {
+    if (cp == 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+    if (cp < 0x80) {
+      out->push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out->push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+
   // An identifier (escapes decoded) into scratch_.
   bool ident() {
     scratch_.clear();
@@ -128,7 +148,7 @@ class SelectorSet::Reader {
             ++n;
           }
           if (pos_ < text_.size() && is_space(text_[pos_])) ++pos_;
-          scratch_.push_back(cp < 0x80 ? static_cast<char>(cp) : '?');
+          append_code_point(cp, &scratch_);
         } else {
           scratch_.push_back(text_[pos_++]);
         }
@@ -369,7 +389,19 @@ class SelectorSet::Reader {
       if (cur() == '"' || cur() == '\'') {
         const char q = text_[pos_++];
         while (!end() && cur() != q) {
-          if (cur() == '\\' && pos_ + 1 < text_.size()) ++pos_;
+          if (cur() == '\\' && pos_ + 1 < text_.size()) {
+            ++pos_;
+            if (is_hex(cur())) {   // \e9: the character with that code point
+              uint32_t cp = 0;
+              for (int n = 0; n < 6 && !end() && is_hex(cur()); ++n) {
+                const char h = text_[pos_++];
+                cp = cp * 16 + static_cast<uint32_t>(is_digit(h) ? h - '0' : (h | 32) - 'a' + 10);
+              }
+              if (!end() && is_space(cur())) ++pos_;
+              append_code_point(cp, &value);
+              continue;
+            }
+          }
           value.push_back(text_[pos_++]);
         }
         if (!end()) ++pos_;   // (a string the text ends in is closed there)

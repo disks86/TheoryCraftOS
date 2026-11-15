@@ -8577,7 +8577,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     // popover: the state and the events (the page decides how it shows)
     var open = [];
     put('popover', function () { var v = this.getAttribute('popover'); return v === null ? null : v === 'manual' ? 'manual' : v === 'hint' ? 'hint' : 'auto'; }, function (v) { if (v === null) this.removeAttribute('popover'); else this.setAttribute('popover', String(v)); });
-    put('popoverTargetElement', function () { return this.__popoverTarget || null; }, function (v) { Object.defineProperty(this, '__popoverTarget', { value: v, writable: true, configurable: true }); });
+    put('popoverTargetElement', function () { return this.__popoverTarget && this.__popoverTarget.isConnected ? this.__popoverTarget : popoverOf(this); }, function (v) { Object.defineProperty(this, '__popoverTarget', { value: v, writable: true, configurable: true }); });
     var fireToggle = function (el, type, oldState, newState, cancelable) {
       var e = new g.ToggleEvent(type, { oldState: oldState, newState: newState, cancelable: cancelable });
       el.dispatchEvent(e);

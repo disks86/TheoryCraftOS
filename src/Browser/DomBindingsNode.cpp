@@ -339,6 +339,7 @@ const EnumeratedAttribute kEnumerated[] = {
     {"autocomplete", "autocomplete", "form", "on off", "on", "on"},
     {"inputMode", "inputmode", nullptr, "none text tel url email numeric decimal search", "", ""},
     {"enterKeyHint", "enterkeyhint", nullptr, "enter done go next previous search send", "", ""},
+    {"popoverTargetAction", "popovertargetaction", "button input", "toggle show hide", "toggle", "toggle"},
     {"kind", "kind", "track", "subtitles captions descriptions chapters metadata", "subtitles", "metadata"},
     {"as", "as", "link", "fetch audio audioworklet document embed font frame iframe image json manifest object paintworklet report script serviceworker sharedworker style track video worker xslt", "", ""},
 };
@@ -1622,7 +1623,9 @@ NATIVE(el_get_attribute_names) {
 bool query_impl(Vm& vm, const Value& self, const Value* args, uint32_t argc, Value* result, bool all) {
   dom::Node* n = this_node(vm, self);
   String selector(vm.allocator());
-  if (!n || !arg_text(vm, arg_at(args, argc, 0), &selector)) return false;
+  if (!n) return false;
+  if (argc == 0) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'querySelector': 1 argument required, but only 0 present.");
+  if (!arg_string(vm, args[0], &selector)) return false;   // (null and undefined are the selectors "null" and "undefined")
   List<dom::Node*> found(vm.allocator());
   if (!select(vm, n, selector.view(), all, &found)) return false;
   if (all) *result = Value::make_object(make_collection(impl(vm), found, false));
