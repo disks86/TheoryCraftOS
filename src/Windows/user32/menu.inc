@@ -78,7 +78,7 @@ static BOOL mii_has_text(const MII_ *m) { return (m->fMask & MIIM_STRING_) || ((
 
 /* SetMenuItemInfo / InsertMenuItem: the A string is converted; the service takes the Unicode structure. */
 static BOOL menu_item_set(HANDLE menu, UINT pos, UINT flags, int method, const MII_ *mii, BOOL ansi) {
-  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != 72)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != sizeof(MII_) - sizeof(HANDLE))  /* (without hbmpItem: the older form) */) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   MII_ copy;
   for (size_t_ i = 0; i < sizeof copy; ++i) ((BYTE *)&copy)[i] = i < mii->cbSize ? ((const BYTE *)mii)[i] : 0;
   WCHAR *wide = NULL;
@@ -92,11 +92,11 @@ EXPORT BOOL WINAPI SetMenuItemInfoA(HANDLE menu, UINT item, BOOL by_position, co
 EXPORT BOOL WINAPI InsertMenuItemW(HANDLE menu, UINT item, BOOL by_position, const MII_ *mii) { return menu_item_set(menu, item, by_position ? MF_BYPOSITION_ : 0, MENU_INSERT_ITEM, mii, FALSE); }
 EXPORT BOOL WINAPI InsertMenuItemA(HANDLE menu, UINT item, BOOL by_position, const MII_ *mii) { return menu_item_set(menu, item, by_position ? MF_BYPOSITION_ : 0, MENU_INSERT_ITEM, mii, TRUE); }
 EXPORT BOOL WINAPI GetMenuItemInfoW(HANDLE menu, UINT item, BOOL by_position, MII_ *mii) {
-  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != 72)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != sizeof(MII_) - sizeof(HANDLE))  /* (without hbmpItem: the older form) */) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return (NtUserThunkedMenuItemInfo((ULONG_PTR)menu, item, by_position ? MF_BYPOSITION_ : 0, MENU_GET_INFO_W, (ULONG_PTR)mii, 0) & 0xFFFFFFFFu) != 0;
 }
 EXPORT BOOL WINAPI GetMenuItemInfoA(HANDLE menu, UINT item, BOOL by_position, MII_ *mii) {
-  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != 72)) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  if (!mii || (mii->cbSize != sizeof(MII_) && mii->cbSize != sizeof(MII_) - sizeof(HANDLE))  /* (without hbmpItem: the older form) */) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
   return (NtUserThunkedMenuItemInfo((ULONG_PTR)menu, item, by_position ? MF_BYPOSITION_ : 0, MENU_GET_INFO_A, (ULONG_PTR)mii, 0) & 0xFFFFFFFFu) != 0;
 }
 

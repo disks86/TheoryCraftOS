@@ -109,6 +109,35 @@ WOW_WIN32K_CODE(_wow_win32k_service, "");
 #define WRAPPED_NtUserBuildHwndList ~,
 #define WRAPPED_NtUserEndPaint ~,
 #define WRAPPED_NtUserGetGUIThreadInfo ~,
+#define WRAPPED_NtUserThunkedMenuItemInfo ~,
+#define WRAPPED_NtUserThunkedMenuInfo ~,
+#define WRAPPED_NtUserCallTwoParam ~,
+#define WRAPPED_NtUserSetCursorIconData ~,
+#define WRAPPED_NtUserFindExistingCursorIcon ~,
+#define WRAPPED_NtUserGetIconInfo ~,
+#define WRAPPED_NtUserGetCursorInfo ~,
+#define WRAPPED_NtUserSetClipboardData ~,
+#define WRAPPED_NtUserGetClipboardData ~,
+#define WRAPPED_NtUserGetKeyboardLayoutList ~,
+#define WRAPPED_NtUserBuildHimcList ~,
+#define WRAPPED_NtUserLoadKeyboardLayoutEx ~,
+#define WRAPPED_NtUserGetImeHotKey ~,
+#define WRAPPED_NtUserRegisterRawInputDevices ~,
+#define WRAPPED_NtUserGetRegisteredRawInputDevices ~,
+#define WRAPPED_NtUserGetRawInputDeviceList ~,
+#define WRAPPED_NtUserGetRawInputData ~,
+#define WRAPPED_NtUserSendInput ~,
+#define WRAPPED_NtUserTrackMouseEvent ~,
+#define WRAPPED_NtUserSystemParametersInfo ~,
+#define WRAPPED_NtUserSystemParametersInfoForDpi ~,
+#define WRAPPED_NtUserEnumDisplaySettings ~,
+#define WRAPPED_NtUserEnumDisplayDevices ~,
+#define WRAPPED_NtUserChangeDisplaySettings ~,
+#define WRAPPED_NtUserDefSetText ~,
+#define WRAPPED_NtUserCreateWindowStation ~,
+#define WRAPPED_NtUserOpenWindowStation ~,
+#define WRAPPED_NtUserCreateDesktopEx ~,
+#define WRAPPED_NtUserOpenDesktop ~,
 #endif
 
 #define SECOND_OF(a, b, ...) b
@@ -354,7 +383,9 @@ WRAP(NtUserGetMessage, P4, A4)
 WRAP(NtUserPeekMessage, P5, A5)
 #endif
 WRAP(NtUserCallHwnd, P2, A2)
+#ifndef __i386__
 WRAP(NtUserCallNextHookEx, P4, A4)
+#endif
 #ifndef __i386__
 WRAP(NtUserCallMsgFilter, P2, A2)
 #endif

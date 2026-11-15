@@ -174,5 +174,5 @@ EXPORT UINT WINAPI GetRawInputBuffer(void *data, UINT *size, UINT header_size) {
 /* DefRawInputProc does nothing with the records (win32k drops the old ones itself); it only checks the header size, as Windows does. */
 EXPORT LONG_PTR WINAPI DefRawInputProc(void *inputs, INT count, UINT header_size) {
   (void)inputs; (void)count;
-  return header_size == 24 /* sizeof(RAWINPUTHEADER) */ ? 0 : -1;
+  return header_size == 8 + 2 * sizeof(ULONG_PTR) /* sizeof(RAWINPUTHEADER): two DWORDs, a handle and a WPARAM */ ? 0 : -1;
 }

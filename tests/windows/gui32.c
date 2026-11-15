@@ -19,8 +19,9 @@
 /* A 32-bit Windows program that uses the libraries beyond the C runtime, for tests/wow64_qemu.sh (docs/Wow64.md): what a setup program does when it
  * installs without showing itself - the registry (advapi32), the shell's folders and a shortcut through COM (shell32, ole32), common controls'
  * start-up (comctl32), strings (user32) - and then the window system through the 32-bit user32.dll, gdi32.dll and win32u.dll: a class, a window,
- * the messages of its creation with their structures, sent and posted messages, a timer, a device context. Ends with exit code 42 if every check
- * passed.
+ * the messages of its creation with their structures, sent and posted messages, a timer, a device context, a hook, the lists of windows, monitors
+ * and keyboard layouts, menus, bitmaps and what GetObject says of them, icons, the clipboard, input, and a dialog. Ends with exit code 42 if every
+ * check passed.
  *   i686-w64-mingw32-gcc -O1 -o gui32.exe tests/windows/gui32.c -ladvapi32 -luser32 -lgdi32 -lshell32 -lole32 -lcomctl32 -luuid */
 #define COBJMACROS
 #include <stdio.h>
@@ -76,6 +77,41 @@ static LRESULT CALLBACK window_procedure(HWND window, UINT message, WPARAM wpara
       return 0;
   }
   return DefWindowProcW(window, message, wparam, lparam);
+}
+
+/* ---- a hook, a dialog, and the lists the window system makes ---- */
+static int g_hook_calls, g_hook_good;
+static HWND g_hook_window;
+static LRESULT CALLBACK call_hook(int code, WPARAM wparam, LPARAM lparam) {
+  const CWPSTRUCT *call = (const CWPSTRUCT *)lparam;
+  if (code == HC_ACTION && call->message == WM_USER + 1) {
+    ++g_hook_calls;
+    g_hook_good = call->hwnd == g_hook_window && call->wParam == 0x55 && call->lParam == 0x66;
+  }
+  return CallNextHookEx(NULL, code, wparam, lparam);
+}
+static int g_dialog_init, g_dialog_commands;
+static LPARAM g_dialog_param;
+static INT_PTR CALLBACK dialog_procedure(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam) {
+  (void)dialog;
+  if (message == WM_INITDIALOG) { ++g_dialog_init; g_dialog_param = lparam; return TRUE; }
+  if (message == WM_COMMAND && LOWORD(wparam) == 77) { ++g_dialog_commands; return TRUE; }
+  return FALSE;
+}
+static int g_enumerated, g_enumerated_ours;
+static HWND g_enumerate_for;
+static BOOL CALLBACK count_window(HWND window, LPARAM lparam) {
+  ++g_enumerated;
+  if (window == g_enumerate_for && lparam == 0x1234) ++g_enumerated_ours;
+  return TRUE;
+}
+static int g_monitors;
+static BOOL CALLBACK count_monitor(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM lparam) {
+  (void)dc; (void)lparam;
+  MONITORINFO info;
+  info.cbSize = sizeof(info);
+  if (monitor && rect && rect->right > rect->left && GetMonitorInfoW(monitor, &info) && info.rcMonitor.right > info.rcMonitor.left) ++g_monitors;
+  return TRUE;
 }
 
 int main(void) {
@@ -212,6 +248,144 @@ int main(void) {
   check(dc != NULL && brush != NULL && FillRect(dc, &fill, brush) && SetBkMode(dc, TRANSPARENT) != 0 && SetTextColor(dc, RGB(1, 2, 3)) != CLR_INVALID, "a device context of the window: FillRect, SetBkMode, SetTextColor");
   if (brush) DeleteObject(brush);
   if (dc) ReleaseDC(window, dc);
+  /* A hook on the calls of window procedures: its structure is a 32-bit program's. */
+  g_hook_window = window;
+  HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, call_hook, NULL, GetCurrentThreadId());
+  SendMessageW(window, WM_USER + 1, 0x55, 0x66);
+  check(hook != NULL && g_hook_calls == 1 && g_hook_good, "SetWindowsHookEx(WH_CALLWNDPROC): the hook sees a sent message, with a CWPSTRUCT it can read");
+  check(hook != NULL && UnhookWindowsHookEx(hook), "UnhookWindowsHookEx");
+
+  /* Lists: the top-level windows, the monitors, the keyboard layouts, a display mode. */
+  g_enumerate_for = window;
+  check(EnumWindows(count_window, 0x1234) && g_enumerated >= 1 && g_enumerated_ours == 1, "EnumWindows lists the window");
+  check(EnumDisplayMonitors(NULL, NULL, count_monitor, 0) && g_monitors >= 1, "EnumDisplayMonitors and GetMonitorInfo");
+  HKL layouts[8];
+  const int layout_count = GetKeyboardLayoutList(8, layouts);
+  check(layout_count >= 1 && layouts[0] != NULL && GetKeyboardLayout(0) != NULL, "GetKeyboardLayoutList");
+  DEVMODEW mode;
+  memset(&mode, 0, sizeof(mode));
+  mode.dmSize = sizeof(mode);
+  check(EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth > 0 && mode.dmPelsHeight > 0, "EnumDisplaySettings gives the current mode");
+  HDC display = CreateDCW(L"DISPLAY", NULL, NULL, NULL);
+  check(display != NULL && GetDeviceCaps(display, HORZRES) > 0, "CreateDC(\"DISPLAY\")");
+  if (display) DeleteDC(display);
+
+  /* Menus: an item with text, an id and item data, read back; the menu's own information. */
+  HMENU menu = CreatePopupMenu();
+  check(menu != NULL && AppendMenuW(menu, MF_STRING, 501, L"First") && AppendMenuW(menu, MF_STRING | MF_GRAYED, 502, L"Second") && GetMenuItemCount(menu) == 2,
+        "CreatePopupMenu and AppendMenu");
+  MENUITEMINFOW item;
+  WCHAR item_text[32] = {0};
+  memset(&item, 0, sizeof(item));
+  item.cbSize = sizeof(item);
+  item.fMask = MIIM_ID | MIIM_STRING | MIIM_DATA | MIIM_STATE;
+  item.wID = 503; item.dwTypeData = (LPWSTR)L"Third"; item.dwItemData = 0xABCD1234u; item.fState = MFS_CHECKED;
+  check(InsertMenuItemW(menu, 1, TRUE, &item) && GetMenuItemCount(menu) == 3 && GetMenuItemID(menu, 1) == 503, "InsertMenuItem with a MENUITEMINFO");
+  memset(&item, 0, sizeof(item));
+  item.cbSize = sizeof(item);
+  item.fMask = MIIM_ID | MIIM_STRING | MIIM_DATA | MIIM_STATE;
+  item.dwTypeData = item_text; item.cch = 32;
+  check(GetMenuItemInfoW(menu, 503, FALSE, &item) && item.wID == 503 && item.dwItemData == 0xABCD1234u && (item.fState & MFS_CHECKED) && item.cch == 5 &&
+        lstrcmpW(item_text, L"Third") == 0, "GetMenuItemInfo gives it back");
+  check(GetMenuState(menu, 502, MF_BYCOMMAND) != (UINT)-1 && (GetMenuState(menu, 502, MF_BYCOMMAND) & MF_GRAYED) && EnableMenuItem(menu, 502, MF_ENABLED) != -1, "GetMenuState and EnableMenuItem");
+  MENUINFO menu_info;
+  memset(&menu_info, 0, sizeof(menu_info));
+  menu_info.cbSize = sizeof(menu_info);
+  menu_info.fMask = MIM_MENUDATA | MIM_MAXHEIGHT;
+  menu_info.dwMenuData = 0x77778888u; menu_info.cyMax = 300;
+  const BOOL menu_set = SetMenuInfo(menu, &menu_info);
+  memset(&menu_info, 0, sizeof(menu_info));
+  menu_info.cbSize = sizeof(menu_info);
+  menu_info.fMask = MIM_MENUDATA | MIM_MAXHEIGHT;
+  check(menu_set && GetMenuInfo(menu, &menu_info) && menu_info.dwMenuData == 0x77778888u && menu_info.cyMax == 300, "SetMenuInfo and GetMenuInfo");
+  check(DestroyMenu(menu) && !IsMenu(menu), "DestroyMenu");
+
+  /* Bitmaps: what GetObject says of a bitmap, a DIB section and a brush is a 32-bit program's structure. */
+  HDC memory = CreateCompatibleDC(NULL);
+  HBITMAP plain = CreateBitmap(16, 8, 1, 32, NULL);
+  BITMAP bitmap_info;
+  memset(&bitmap_info, 0xEE, sizeof(bitmap_info));
+  check(memory != NULL && plain != NULL && GetObjectW(plain, sizeof(bitmap_info), &bitmap_info) == sizeof(BITMAP) && bitmap_info.bmWidth == 16 && bitmap_info.bmHeight == 8 &&
+        bitmap_info.bmBitsPixel == 32 && bitmap_info.bmPlanes == 1 && GetObjectW(plain, 0, NULL) == sizeof(BITMAP), "GetObject of a bitmap (a BITMAP of 24 bytes)");
+  BITMAPINFO dib_header;
+  memset(&dib_header, 0, sizeof(dib_header));
+  dib_header.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  dib_header.bmiHeader.biWidth = 4; dib_header.bmiHeader.biHeight = -4; dib_header.bmiHeader.biPlanes = 1; dib_header.bmiHeader.biBitCount = 32;
+  DWORD *pixels = NULL;
+  DWORD guard_after = 0x5A5A5A5Au;      /* (next to the pointer on the stack: the kernel must not write past the pointer) */
+  HBITMAP section = CreateDIBSection(memory, &dib_header, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+  check(section != NULL && pixels != NULL && (UINT_PTR)pixels < 0x7FFF0000u && guard_after == 0x5A5A5A5Au, "CreateDIBSection gives the address of the bits");
+  DIBSECTION dib;
+  memset(&dib, 0, sizeof(dib));
+  if (pixels) pixels[5] = 0x00112233u;
+  check(section != NULL && GetObjectW(section, sizeof(dib), &dib) == sizeof(DIBSECTION) && dib.dsBm.bmBits == pixels && dib.dsBm.bmWidth == 4 && dib.dsBmih.biBitCount == 32 &&
+        dib.dsBmih.biSize == sizeof(BITMAPINFOHEADER), "GetObject of a DIB section (a DIBSECTION of 84 bytes, with the bits' address)");
+  HGDIOBJ previous = section ? SelectObject(memory, section) : NULL;
+  check(section != NULL && GetPixel(memory, 1, 1) == RGB(0x11, 0x22, 0x33), "the bits written through that address are the bitmap's");
+  if (previous) SelectObject(memory, previous);
+  HBRUSH hatched = CreateHatchBrush(HS_CROSS, RGB(9, 8, 7));
+  LOGBRUSH brush_info;
+  check(hatched != NULL && GetObjectW(hatched, sizeof(brush_info), &brush_info) == sizeof(LOGBRUSH) && brush_info.lbStyle == BS_HATCHED && brush_info.lbColor == RGB(9, 8, 7) &&
+        brush_info.lbHatch == HS_CROSS, "GetObject of a brush (a LOGBRUSH of 12 bytes)");
+  if (hatched) DeleteObject(hatched);
+
+  /* Icons and cursors. */
+  HBITMAP mask = CreateBitmap(16, 16, 1, 1, NULL), color = CreateBitmap(16, 16, 1, 32, NULL);
+  ICONINFO icon_in = {TRUE, 0, 0, mask, color}, icon_out;
+  HICON icon = CreateIconIndirect(&icon_in);
+  memset(&icon_out, 0, sizeof(icon_out));
+  check(icon != NULL && GetIconInfo(icon, &icon_out) && icon_out.fIcon && icon_out.hbmMask != NULL && icon_out.hbmColor != NULL, "CreateIconIndirect and GetIconInfo");
+  if (icon_out.hbmMask) DeleteObject(icon_out.hbmMask);
+  if (icon_out.hbmColor) DeleteObject(icon_out.hbmColor);
+  check(icon != NULL && DestroyIcon(icon), "DestroyIcon");
+  if (mask) DeleteObject(mask);
+  if (color) DeleteObject(color);
+  CURSORINFO cursor_info;
+  cursor_info.cbSize = sizeof(cursor_info);
+  check(LoadCursorW(NULL, (LPCWSTR)IDC_ARROW) != NULL && GetCursorInfo(&cursor_info) && cursor_info.cbSize == sizeof(CURSORINFO), "LoadCursor(IDC_ARROW) and GetCursorInfo");
+  if (section) DeleteObject(section);
+  if (plain) DeleteObject(plain);
+  if (memory) DeleteDC(memory);
+
+  /* The clipboard. */
+  const WCHAR clip_text[] = L"gui32 on the clipboard";
+  HGLOBAL clip = GlobalAlloc(GMEM_MOVEABLE, sizeof(clip_text));
+  if (clip) { memcpy(GlobalLock(clip), clip_text, sizeof(clip_text)); GlobalUnlock(clip); }
+  const BOOL clip_set = clip != NULL && OpenClipboard(window) && EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, clip) != NULL && CloseClipboard();
+  check(clip_set && IsClipboardFormatAvailable(CF_UNICODETEXT), "SetClipboardData");
+  int clip_same = 0;
+  if (clip_set && OpenClipboard(window)) {
+    HANDLE got = GetClipboardData(CF_UNICODETEXT);
+    const WCHAR *got_text = got ? (const WCHAR *)GlobalLock(got) : NULL;
+    clip_same = got_text != NULL && lstrcmpW(got_text, clip_text) == 0;
+    if (got_text) GlobalUnlock(got);
+    CloseClipboard();
+  }
+  check(clip_same, "GetClipboardData gives the text back");
+
+  /* Input: an event made by the program, and asking to be told when the mouse leaves. */
+  INPUT input;
+  memset(&input, 0, sizeof(input));
+  input.type = INPUT_MOUSE;
+  input.mi.dwFlags = MOUSEEVENTF_MOVE; input.mi.dx = 1; input.mi.dy = 1;
+  check(sizeof(INPUT) == 28 && SendInput(1, &input, sizeof(input)) == 1, "SendInput takes an INPUT of 28 bytes");
+  TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, window, 0};
+  check(TrackMouseEvent(&track), "TrackMouseEvent");
+
+  /* A dialog from a template in memory: its procedure and user data are window longs at a 32-bit program's offsets (4 and 8). */
+  struct { DLGTEMPLATE header; WORD menu, class_name, title; } dialog_template;
+  memset(&dialog_template, 0, sizeof(dialog_template));
+  dialog_template.header.style = WS_POPUP | WS_CAPTION;
+  dialog_template.header.cx = 100; dialog_template.header.cy = 50;
+  HWND dialog = CreateDialogIndirectParamW(cls.hInstance, &dialog_template.header, NULL, dialog_procedure, (LPARAM)0x0BADF00D);
+  check(dialog != NULL && g_dialog_init == 1 && g_dialog_param == (LPARAM)0x0BADF00D, "CreateDialogIndirectParam: WM_INITDIALOG with the parameter");
+  check(dialog != NULL && (DLGPROC)GetWindowLongW(dialog, DWL_DLGPROC) == dialog_procedure, "GetWindowLong(DWL_DLGPROC) is the dialog procedure");
+  check(dialog != NULL && SetWindowLongW(dialog, DWL_USER, 0x13572468) == 0 && GetWindowLongW(dialog, DWL_USER) == 0x13572468 &&
+        (DLGPROC)GetWindowLongW(dialog, DWL_DLGPROC) == dialog_procedure, "DWL_USER is the dialog's own, and does not touch the procedure");
+  if (dialog) SendMessageW(dialog, WM_COMMAND, 77, 0);
+  check(g_dialog_commands == 1, "a message sent to the dialog reaches its procedure");
+  check(dialog != NULL && DestroyWindow(dialog), "the dialog is destroyed");
+
   check(DestroyWindow(window) && g_destroyed == 1 && !IsWindow(window), "DestroyWindow, with WM_DESTROY");
   int quit = 0;
   while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) if (message.message == WM_QUIT && message.wParam == 7) quit = 1;

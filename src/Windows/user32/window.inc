@@ -633,8 +633,12 @@ EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value)
 /* The window procedure, the instance and the parent are pointers: GetWindowLong cannot give them in a 64-bit program, and is how a 32-bit program asks. */
 #ifdef __i386__
 #define LONG_IS_POINTER(index) ((index) == -4 || (index) == -6 || (index) == -8)
+/* The window's extra bytes (index 0 and up) are the program's, laid out by the program: a pointer there is 4 bytes in a 32-bit program, and the
+ * "Ptr" functions must not read or write 8 (the dialog procedure is at 4 and the dialog's user data at 8). */
+#define EXTRA_IS_LONG(index) ((index) >= 0)
 #else
 #define LONG_IS_POINTER(index) 0
+#define EXTRA_IS_LONG(index) 0
 #endif
 static BOOL long_index_is_pointer(int index) { if (index == -4 || index == -6 || index == -8) { SetLastError(1413 /* ERROR_INVALID_INDEX */); return TRUE; } return FALSE; }
 EXPORT LONG WINAPI GetWindowLongW(HANDLE hwnd, int index) { if (LONG_IS_POINTER(index)) return (LONG)GetWindowLongPtrW(hwnd, index); if (long_index_is_pointer(index)) return 0; return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); }
@@ -644,10 +648,10 @@ EXPORT LONG WINAPI GetWindowLongA(HANDLE hwnd, int index) {
   const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_A);
   return (LONG)(index == -4 /* GWL_WNDPROC */ ? ansi_unwrap(v) : v);
 }
-EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index) { return (LONG_PTR)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_W); }
+EXPORT LONG_PTR WINAPI GetWindowLongPtrW(HANDLE hwnd, int index) { if (EXTRA_IS_LONG(index)) return (LONG)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_W); return (LONG_PTR)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_W); }
 EXPORT LONG_PTR WINAPI GetWindowLongPtrA(HANDLE hwnd, int index) {
-  const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_LONG_PTR_A);
-  return (LONG_PTR)((index == -4 || index == 8 /* DWLP_DLGPROC */) ? ansi_unwrap(v) : v);
+  const ULONG_PTR v = NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, EXTRA_IS_LONG(index) ? CHP_GET_WINDOW_LONG_A : CHP_GET_WINDOW_LONG_PTR_A);
+  return (LONG_PTR)((index == -4 || index == (int)sizeof(LONG_PTR) /* DWLP_DLGPROC */) ? ansi_unwrap(v) : v);
 }
 EXPORT WORD WINAPI GetWindowWord(HANDLE hwnd, int index) { if (long_index_is_pointer(index)) return 0; return (WORD)NtUserCallHwndParam((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, CHP_GET_WINDOW_WORD); }
 /* A window that becomes or stops being layered is drawn again, children included */
@@ -672,10 +676,11 @@ EXPORT LONG WINAPI SetWindowLongA(HANDLE hwnd, int index, LONG value) {
   layered_redraw(hwnd, index, old_style, (LONG)value);
   return r;
 }
-EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { if (index == -4 && value == 0 && IsWindow(hwnd)) return GetWindowLongPtrW(hwnd, index); return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
+EXPORT LONG_PTR WINAPI SetWindowLongPtrW(HANDLE hwnd, int index, LONG_PTR value) { if (index == -4 && value == 0 && IsWindow(hwnd)) return GetWindowLongPtrW(hwnd, index); if (EXTRA_IS_LONG(index)) return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); return (LONG_PTR)NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, (ULONG_PTR)value, 0); }
 EXPORT LONG_PTR WINAPI SetWindowLongPtrA(HANDLE hwnd, int index, LONG_PTR value) {
   if (index == -4 && value == 0 && IsWindow(hwnd)) return GetWindowLongPtrA(hwnd, index);
   const ULONG_PTR in = index == -4 ? (ULONG_PTR)ansi_wrap((WNDPROC_)value) : (ULONG_PTR)value;
+  if (EXTRA_IS_LONG(index)) return (LONG)NtUserSetWindowLong((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
   const ULONG_PTR old = NtUserSetWindowLongPtr((ULONG_PTR)hwnd, (ULONG_PTR)(LONG_PTR)index, in, 0);
   return (LONG_PTR)(index == -4 ? ansi_unwrap(old) : old);
 }
@@ -774,7 +779,7 @@ static LONG_PTR def_proc_w(void *ctx, HANDLE hwnd, UINT message, ULONG_PTR wpara
   }
   if (message == 0x000F /* WM_PAINT */) {
     /* painting nothing still erases the background and validates */
-    ULONG_PTR ps[9] = {0};
+    ULONG64 ps[9] = {0};      /* (room for a PAINTSTRUCT of either width: 72 bytes) */
     if (BeginPaint(hwnd, ps)) EndPaint(hwnd, ps);
     return 0;
   }
@@ -1009,7 +1014,11 @@ EXPORT BOOL WINAPI AttachThreadInput(DWORD from, DWORD to, BOOL attach) { return
 
 /* ---- synthesized input ---------------------------------------------------------------------------------------------------------------------------------------------- */
 SVC NtUserSendInput(ULONG_PTR count, ULONG_PTR inputs, ULONG_PTR size);
+#ifdef __i386__      /* (the INPUT of a 32-bit program: 28 bytes, the union right after the type; the 32-bit win32u.dll makes the kernel's 40 bytes of it) */
+typedef struct { DWORD type; union { struct { LONG dx, dy; DWORD data, flags, time; ULONG_PTR extra; } mouse; struct { WORD vk, scan; DWORD flags, time; ULONG_PTR extra; } key; BYTE raw[24]; } u; } Input_;
+#else
 typedef struct { DWORD type; DWORD pad_; union { struct { LONG dx, dy; DWORD data, flags, time; ULONG_PTR extra; } mouse; struct { WORD vk, scan; DWORD flags, time; ULONG_PTR extra; } key; BYTE raw[32]; } u; } Input_;
+#endif
 EXPORT UINT WINAPI SendInput(UINT count, Input_ *inputs, int size) {
   if (!count || !inputs || size != (int)sizeof(Input_)) { SetLastError(ERROR_INVALID_PARAMETER); return 0; }
   return (UINT)NtUserSendInput(count, (ULONG_PTR)inputs, (ULONG_PTR)(LONG_PTR)size);

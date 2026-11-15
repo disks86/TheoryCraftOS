@@ -91,6 +91,9 @@ struct font_fileinfo { FILETIME writetime; LARGE_INTEGER size; WCHAR path[1]; };
 #define NTGDI_OBJ_MEMDC 0x410000u      /* (not a kernel type: GetObjectType asks IsMemDC) */
 #define NTGDI_HANDLE_TYPE_MASK 0x007f0000u
 #define NTGDI_HANDLE_STOCK_OBJECT 0x00800000u
+#ifdef __i386__
+#include "wow64.inc"      /* (the services whose data a 32-bit program lays out differently) */
+#endif
 #define NTGDI_GETCHARWIDTH_INT 0x02
 #define NTGDI_GETCHARWIDTH_INDICES 0x08
 #define NTGDI_GETCHARABCWIDTHS_INT 0x01

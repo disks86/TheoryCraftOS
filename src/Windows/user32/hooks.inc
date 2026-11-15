@@ -57,7 +57,11 @@ static struct { HANDLE handle; int id; ULONG_PTR proc; } g_hooks[HOOK_SLOTS];
 /* the hooks of an event, newest first: `(1 << 32) | (id + 1)` is win32k's name for the start of the chain */
 static LONG_PTR call_hooks(int id, int code, ULONG_PTR wparam, LONG_PTR lparam) {
   if (!HOOK_ACTIVE(id)) return 0;
+#ifdef __i386__      /* (bit 32 does not fit a 32-bit argument: bit 30 says the same to the 32-bit win32u.dll, which makes the kernel's value of it) */
+  return (LONG_PTR)NtUserCallNextHookEx((ULONG_PTR)0x40000000u | (ULONG_PTR)(id + 1), (ULONG_PTR)(LONG_PTR)code, wparam, (ULONG_PTR)lparam);
+#else
   return (LONG_PTR)NtUserCallNextHookEx(((ULONG_PTR)1 << 32) | (ULONG_PTR)(id + 1), (ULONG_PTR)(LONG_PTR)code, wparam, (ULONG_PTR)lparam);
+#endif
 }
 
 static void hook_remember(HANDLE handle, int id, ULONG_PTR proc) {

@@ -41,7 +41,12 @@ IMPORT BOOL WINAPI SwitchToThread(void);
 #define MEM_INVALID_HANDLE_FLAGS 0x8000
 #define MEM_BIG_BLOCK 0x4000      /* from this size on a block may be resized in place */
 
+#ifdef __i386__      /* (an entry is 16 bytes and its pointer 8 bytes into it whatever the pointer size: that is the shape a handle is told by) */
+typedef struct { UINT_PTR flags; ULONG pad_; void *ptr; ULONG pad2_; } MemEntry;
+#else
 typedef struct { UINT_PTR flags; void *ptr; } MemEntry;
+#endif
+_Static_assert(sizeof(MemEntry) == 16 && __builtin_offsetof(MemEntry, ptr) == 8, "the shape of a moveable memory handle");
 static MemEntry g_mem_entries[MEM_MAX_ENTRIES] __attribute__((aligned(16)));
 static MemEntry *g_mem_free;      /* freed entries, linked through their flags field */
 static ULONG g_mem_unused;        /* entries before this one have been used */

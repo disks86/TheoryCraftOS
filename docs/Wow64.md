@@ -57,7 +57,16 @@ comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32.
   win32u.dll** (src/Windows/win32u/wow64.inc): `UNICODE_STRING`, `WNDCLASSEX`, `MSG`, `PAINTSTRUCT`, `GUITHREADINFO`, the parameter blocks of
   `NtUserCallHwndParam`, the window list of `NtUserBuildHwndList`, and the structures of the messages that carry one (`CREATESTRUCT`,
   `WINDOWPOS`, `NCCALCSIZE_PARAMS`, `COPYDATASTRUCT`) in both directions: when the kernel has a window procedure called, and when the program
-  sends such a message or passes it to `DefWindowProc`.
+  sends such a message or passes it to `DefWindowProc`. And the rest of the window system: menus (`MENUITEMINFO`, `MENUINFO`), icons and cursors
+  (`ICONINFO`, `CURSORINFO`, the frames of a cursor being made), the clipboard's blocks, the lists of keyboard layouts and input contexts, raw
+  input (`RAWINPUTDEVICE`, `RAWINPUTDEVICELIST`, `RAWINPUTHEADER`), `INPUT` of `SendInput`, `TRACKMOUSEEVENT`, the pointer-sized actions of
+  `SystemParametersInfo`, the device names of the display services, and `OBJECT_ATTRIBUTES` of window stations and desktops.
+- **gdi32.dll** calls its services itself, so its three that differ are converted there (src/Windows/gdi32/wow64.inc): `GetObject` of a bitmap,
+  a DIB section, a brush or an extended pen (`BITMAP`, `DIBSECTION`, `LOGBRUSH`, `EXTLOGPEN`), the bits' address `CreateDIBSection` gives, and
+  the names of `CreateDC`.
+- **In user32.dll** a few things follow the pointer size: a dialog's procedure and user data are at 4 and 8 of its window's extra bytes
+  (`DWLP_DLGPROC`, `DWLP_USER`), and `Get/SetWindowLongPtr` of the extra bytes reads and writes 4 bytes; the first hook of a chain is asked for
+  with bit 30 set where a 64-bit program sets bit 32; a moveable memory handle (`GlobalAlloc`, kernel32) keeps its shape.
 
 - `tcos_win.h` gives the pointer-sized integers, the calling convention (`WINAPI`, `NTAPI`, `CALLBACK` are `__stdcall` on i386), the TEB accessors
   and a few structures their 32-bit form under `__i386__`. The structures are written with the natural pointer types, so the PEB, the process
@@ -102,10 +111,13 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 - **A program with a C runtime** (tests/windows/crt32.c, built with `i686-w64-mingw32-gcc` the ordinary way) runs on the 32-bit ntdll.dll,
   kernel32.dll and msvcrt.dll: the runtime's start-up, `printf`, the heap, files, the environment, `VirtualAlloc` / `VirtualQuery`, thread-local
   storage, critical sections, four threads and waiting for them, events, `Sleep`. All 21 of its checks pass.
-- **The other libraries** (tests/windows/gui32.c): the registry; `wsprintf` and the character functions; `InitCommonControls`; `OleInitialize`,
-  the shell's folders, a shortcut made through `IShellLink` and saved through `IPersistFile`; then a window class, a window with its creation
-  messages, its text, rectangles and window longs, `SetWindowPos`, sent and posted messages, a timer, a device context, `DestroyWindow` and
-  `WM_QUIT`. All 37 of its checks pass.
+- **The other libraries** (tests/windows/gui32.c): the registry; the process's token; `wsprintf` and the character functions;
+  `InitCommonControls`; `OleInitialize`, the shell's folders, a shortcut made through `IShellLink` and saved through `IPersistFile`; then a
+  window class, a window with its creation messages, its text, rectangles and window longs, `SetWindowPos`, sent and posted messages, a timer, a
+  device context; a `WH_CALLWNDPROC` hook; `EnumWindows`, the monitors, the keyboard layouts, the display mode, `CreateDC`; a menu with
+  `MENUITEMINFO` and `MENUINFO`; `GetObject` of a bitmap, a DIB section and a brush, and the bits of a DIB section; an icon and the cursor; the
+  clipboard; `SendInput` and `TrackMouseEvent`; a dialog with its procedure and user data; `DestroyWindow` and `WM_QUIT`. All 70 of its checks
+  pass.
 - **Exceptions** (tests/windows/seh32.c): faults (bad reads and writes, division by zero, a breakpoint) reach the handler of a frame with the right
   record and registers, and the program goes on from a changed `CONTEXT`; the x87 and SSE registers are in the `CONTEXT` and come back; `RtlUnwind`;
   an exception that cannot be continued; an exception inside a handler; vectored handlers; the unhandled-exception filter; a `__try` frame handled
@@ -114,12 +126,12 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 
 Not done yet, in the order planned:
 
-1. **The rest of the window system's structures.** These are still passed to the kernel in the 32-bit layout, so the services that take them
-   do not work in a 32-bit program yet: menus (`MENUITEMINFO`, `MENUINFO`), icons and cursors (`ICONINFO`), `SendInput` (`INPUT`),
-   `TrackMouseEvent`, hooks (the hook's module name, and the structures a hook procedure is given), the clipboard, keyboard layouts, monitor
-   enumeration, `SetScrollInfo`'s block, and in GDI `GetObject` of a bitmap (`BITMAP`, `DIBSECTION`). Dialogs keep their procedure at the 64-bit
-   offset of the window's extra bytes (`DWLP_DLGPROC` is 4, not 8, in a 32-bit program), and comctl32 has no controls yet (for 64-bit programs
-   either). A message with a structure sent between a 32-bit and a 64-bit program is not converted.
+1. **What is left of the window system.** Not converted, so not working in a 32-bit program: touch and pointer input (`POINTER_TOUCH_INFO`,
+   `TOUCHINPUT`), `GetRawInputBuffer`, the input method's `IMEINFOEX` (imm32 is not built for i386), the DWM thumbnail and composition
+   attribute services, `NtGdiPolyTextOutW` and `NtGdiPolyPatBlt` when called through win32u (gdi32 does not use them), and every Direct3D
+   service (their structures are full of pointers; no Direct3D library is built for i386). A message with a structure sent between a 32-bit and
+   a 64-bit program is not converted. comctl32 has no controls yet (for 64-bit programs either), and comdlg32, imm32, winmm and the other
+   libraries are not built for i386.
 2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; information classes with
    pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; a 32-bit program cannot start another program
    (`RtlCreateProcessParameters` writes the 64-bit layout); `%p` prints 16 digits; the old runtime's `_iob` array has the wrong stride.

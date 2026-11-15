@@ -22,8 +22,8 @@
  * and the user data are window extra bytes (DWLP_MSGRESULT 0, DWLP_DLGPROC 8, DWLP_USER 16) of the class. Not done: DlgDirList and friends, menus in templates, fonts other than a size ratio
  * of the system font for dialog units, MS-DOS style accelerator mnemonics (WM_SYSCHAR), DS_* positioning beyond centering. */
 #define DWLP_MSGRESULT_ 0
-#define DWLP_DLGPROC_ 8
-#define DWLP_USER_ 16
+#define DWLP_DLGPROC_ ((int)sizeof(LONG_PTR))           /* (8 and 16 in a 64-bit program, 4 and 8 in a 32-bit one: where programs look for them) */
+#define DWLP_USER_ ((int)(2 * sizeof(LONG_PTR)))
 #define DS_ABSALIGN_ 0x1
 #define DS_SETFONT_ 0x40
 #define DS_MODALFRAME_ 0x80
