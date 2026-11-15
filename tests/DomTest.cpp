@@ -289,7 +289,7 @@ static void test_selectors() {
   CHECK(select(page, "P") == "p1,p2,p3" && select(page, "[TITLE]") == "p2");
   CHECK(select(page, "#p\\31") == "p1" && select(page, ".nothing") == "");
   CHECK(select(page, "p,,span") == "SYNTAX");
-  CHECK(select(page, "") == "SYNTAX" && select(page, ">") == "SYNTAX" && select(page, "p >") == "SYNTAX" && select(page, "[a") == "SYNTAX" && select(page, ")") == "SYNTAX");
+  CHECK(select(page, "") == "SYNTAX" && select(page, ">") == "SYNTAX" && select(page, "p >") == "SYNTAX" && select(page, "[a=") == "SYNTAX" && select(page, ")") == "SYNTAX");
   // Specificity: ids, classes and attributes and pseudo-classes, types.
   {
     TestAllocator a;

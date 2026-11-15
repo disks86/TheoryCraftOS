@@ -295,6 +295,13 @@ class SelectorSet::Reader {
     while (!end()) {
       const char k = cur();
       if (is_space(k) || k == '>' || k == '+' || k == '~' || k == ',' || k == ')') break;
+      // a namespace prefix: *| (any namespace) and | (no namespace) are read past - elements are matched by their local names
+      const char after = pos_ + 1 < text_.size() ? text_[pos_ + 1] : '\0', after2 = pos_ + 2 < text_.size() ? text_[pos_ + 2] : '\0';
+      if (first && mine->count() == 0 && ((k == '*' && after == '|' && after2 != '=') || (k == '|' && after != '='))) {
+        pos_ += k == '*' ? 2 : 1;
+        if (end() || !(cur() == '*' || is_ident_start(cur()))) return false;
+        continue;
+      }
       Test t = blank(TestKind::Tag);
       if (k == '*') {
         ++pos_;
@@ -340,6 +347,8 @@ class SelectorSet::Reader {
   bool attribute(Test* t) {
     ++pos_;   // [
     skip_space();
+    if (cur() == '*' && pos_ + 1 < text_.size() && text_[pos_ + 1] == '|') pos_ += 2;   // (a namespace prefix: the attribute is matched by its local name)
+    else if (cur() == '|' && pos_ + 1 < text_.size() && text_[pos_ + 1] != '=') ++pos_;
     if (!ident()) return false;
     String name(set_.alloc_);
     for (uint64_t i = 0; i < scratch_.size(); ++i) name.push_back(lower(scratch_[i]));
@@ -363,8 +372,7 @@ class SelectorSet::Reader {
           if (cur() == '\\' && pos_ + 1 < text_.size()) ++pos_;
           value.push_back(text_[pos_++]);
         }
-        if (end()) return false;
-        ++pos_;
+        if (!end()) ++pos_;   // (a string the text ends in is closed there)
       } else {
         if (!ident()) {
           // numbers and other unquoted values
@@ -384,8 +392,8 @@ class SelectorSet::Reader {
         skip_space();
       }
     }
-    if (cur() != ']') return false;
-    ++pos_;
+    if (cur() != ']' && !end()) return false;   // (the end of the text closes the bracket)
+    if (!end()) ++pos_;
     if (!keep(name.view(), &t->name_offset) || !keep(value.view(), &t->value_offset)) return false;
     t->name_length = static_cast<uint32_t>(name.size());
     t->value_length = static_cast<uint32_t>(value.size());
@@ -519,10 +527,12 @@ class SelectorSet::Reader {
         // the specificity inside counts (the most specific), except for :where()
         const uint64_t selectors_before = set_.selectors_.count();
         uint32_t first, count;
+        const bool unknown_before = unknown_pseudo_;
         if (!list(true, has, true, &first, &count)) return false;
+        if (t->kind == TestKind::Is && !n.equals("host")) unknown_pseudo_ = unknown_before;   // (:is() and :where() forgive what they do not know: it matches nothing)
         skip_space();
-        if (cur() != ')') return false;
-        ++pos_;
+        if (cur() != ')' && !end()) return false;   // (the end of the text closes what is open)
+        if (!end()) ++pos_;
         t->first_ref = first;
         t->ref_count = count;
         uint32_t best = 0;
@@ -669,7 +679,35 @@ private:
   List<Test> local_{set_.alloc_};
 };
 
-bool SelectorSet::parse(StringView text, uint32_t tag, uint32_t* added, bool forgiving) {
+bool SelectorSet::parse(StringView written, uint32_t tag, uint32_t* added, bool forgiving) {
+  // Comments are not part of a selector: one between two names keeps them apart ([a=b/**/i]), any other is just left out.
+  String cleaned(alloc_);
+  StringView text = written;
+  if (written.find(StringView("/*")) != StringView::npos) {
+    auto name_char = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || static_cast<uint8_t>(c) >= 0x80; };
+    for (uint64_t i = 0; i < written.size();) {
+      if (written[i] == '"' || written[i] == '\'') {   // (a string is copied as it is)
+        const char quote = written[i];
+        cleaned.push_back(written[i++]);
+        while (i < written.size() && written[i] != quote) {
+          if (written[i] == '\\' && i + 1 < written.size()) cleaned.push_back(written[i++]);
+          cleaned.push_back(written[i++]);
+        }
+        if (i < written.size()) cleaned.push_back(written[i++]);
+        continue;
+      }
+      if (written[i] == '/' && i + 1 < written.size() && written[i + 1] == '*') {
+        uint64_t close = i + 2;
+        while (close + 1 < written.size() && !(written[close] == '*' && written[close + 1] == '/')) ++close;
+        const uint64_t next = close + 1 < written.size() ? close + 2 : written.size();
+        if (!cleaned.empty() && name_char(cleaned[cleaned.size() - 1]) && next < written.size() && name_char(written[next])) cleaned.push_back(' ');
+        i = next;
+        continue;
+      }
+      cleaned.push_back(written[i++]);
+    }
+    text = cleaned.view().trimmed();
+  }
   Reader reader(*this, text, tag);
   bool syntax = true;
   const uint64_t before = tops_.count();

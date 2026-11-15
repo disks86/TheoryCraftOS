@@ -59,6 +59,28 @@ Value upper_value(Vm& vm, StringView s) {
   return str_value(vm, u.view());
 }
 
+// The width of a border as it is drawn (none and hidden have none). side: 0 top, 1 right, 2 bottom, 3 left.
+double border_px(const Style& s, int side) {
+  return s.border_style[side] == BorderStyle::None || s.border_style[side] == BorderStyle::Hidden ? 0 : s.border_px100[side] / 100.0;
+}
+
+// element.offsetParent (CSSOM View): the nearest ancestor that is positioned - or, for an element that is not, a table cell or table - else the body. None for
+// the root, the body, an element without a box and one with position: fixed.
+dom::Node* offset_parent(DomBindings::Impl& c, dom::Node* n) {
+  double box[8];
+  Style style;
+  if (!n->is_element() || n == c.doc.document_element() || n == c.doc.body() || !c.host.node_rect(n, box) || !c.host.computed_style(n, &style) || style.position == Position::Fixed) return nullptr;
+  const bool positioned = style.position != Position::Static;
+  for (dom::Node* a = n->parent ? n->parent : n->shadow_host; a; a = a->parent ? a->parent : a->shadow_host) {
+    if (!a->is_element()) continue;   // (a shadow root: on to its host)
+    if (a == c.doc.body()) return a;
+    Style above;
+    if (c.host.computed_style(a, &above) && above.position != Position::Static) return a;
+    if (!positioned && (a->is_tag("td") || a->is_tag("th") || a->is_tag("table"))) return a;
+  }
+  return nullptr;
+}
+
 // --- innerText: the text as it is rendered ------------------------------------------------------------------------------
 // HTML's "rendered text collection steps", without a layout: text of elements that are not shown is left out, white space collapses the way `white-space`
 // says (across the borders of inline elements too), text-transform is applied, <br> is a line break, a block starts and ends a line, a paragraph has an
@@ -848,12 +870,37 @@ bool node_get(Vm& vm, JsObject* o, JsString* key, Value* out) {
     }
     if (element && (IS("offsetWidth") || IS("offsetHeight") || IS("clientWidth") || IS("clientHeight") || IS("scrollWidth") || IS("scrollHeight")) && c.host.node_rect(n, box)) {
       const bool width = IS("offsetWidth") || IS("clientWidth") || IS("scrollWidth");
-      const double size = width ? box[2] : box[3];
+      double size = width ? box[2] : box[3];
+      if (!IS("offsetWidth") && !IS("offsetHeight")) {   // the client and scroll sizes are of the padding box: without the borders (0 for an inline box)
+        Style style;
+        if (c.host.computed_style(n, &style)) {
+          if (style.display == Display::Inline && !style.inline_box && box[4] == 0 && box[5] == 0) size = 0;
+          else size -= width ? border_px(style, 3) + border_px(style, 1) : border_px(style, 0) + border_px(style, 2);
+        }
+      }
       *out = num_value(size < 0 ? 0 : static_cast<double>(static_cast<int64_t>(size + 0.5)));
+    }
+    if (element && (IS("clientLeft") || IS("clientTop")) && c.host.node_rect(n, box)) {   // the width of the left / top border
+      Style style;
+      if (c.host.computed_style(n, &style) && !(style.display == Display::Inline && !style.inline_box)) *out = num_value(static_cast<double>(static_cast<int64_t>(border_px(style, IS("clientLeft") ? 3 : 0) + 0.5)));
+    }
+    if (element && (IS("offsetLeft") || IS("offsetTop")) && c.host.node_rect(n, box)) {   // from the padding edge of the offset parent (the document without one)
+      double x = box[0], y = box[1];
+      double parent_box[8];
+      if (dom::Node* parent = offset_parent(c, n); parent && c.host.node_rect(parent, parent_box)) {
+        Style style;
+        const bool styled = c.host.computed_style(parent, &style);
+        // (a body that is not positioned stands for the page: the offsets are from the top left of the document, as every browser has them)
+        if (parent == c.doc.body() && (!styled || style.position == Position::Static)) parent_box[0] = parent_box[1] = 0;
+        x -= parent_box[0] + (styled ? border_px(style, 3) : 0);
+        y -= parent_box[1] + (styled ? border_px(style, 0) : 0);
+      }
+      const double v = IS("offsetLeft") ? x : y;
+      *out = num_value(static_cast<double>(static_cast<int64_t>(v < 0 ? v - 0.5 : v + 0.5)));
     }
     return true;
   }
-  if (IS("offsetParent")) { *out = Value::make_null(); return true; }
+  if (IS("offsetParent")) { *out = element ? node_value(c, offset_parent(c, n)) : Value::make_null(); return true; }
   if (IS("isContentEditable")) {   // the nearest contenteditable attribute on the way up decides
     bool editable = false;
     for (const dom::Node* a = n; a && a->is_element(); a = a->parent) {

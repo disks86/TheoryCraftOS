@@ -1064,6 +1064,24 @@ Value build_computed_snapshot(DomBindings::Impl& c, dom::Node* element, PseudoEl
     if (z.length == &s.flex_basis && s.flex_basis_zero_percent && s.flex_basis.kind == Length::Px && s.flex_basis.px100 == 0) t.assign("0%");
     set(z.name, t.view());
   }
+  // The resolved value of width and height is the used value - pixels - for an element that has a box (CSSOM: scripts measure with it); an inline box and an
+  // element that is not displayed keep the computed value.
+  if (pseudo == PseudoElement::None) {
+    double box[8];
+    const bool replaced = element->is_tag("img") || element->is_tag("canvas") || element->is_tag("video") || element->is_tag("iframe") || element->is_tag("input") || element->is_tag("textarea") ||
+                          element->is_tag("select") || element->is_tag("button") || element->is_tag("object") || element->is_tag("embed") || element->is_tag("svg");
+    if ((s.display != Display::Inline || s.inline_box || replaced) && s.display != Display::None && !s.contents && c.host.node_rect(element, box)) {
+      const bool border_box = s.sizing == BoxSizing::BorderBox;
+      const double used[2] = {border_box ? box[2] : box[4], border_box ? box[3] : box[5]};
+      static const char* const kUsed[2] = {"width", "height"};
+      for (int i = 0; i < 2; ++i) {
+        if (!(used[i] >= 0) || used[i] > 10000000.0) continue;
+        t.clear();
+        fixed_px(static_cast<int32_t>(used[i] * 100 + 0.5), &t);
+        set(kUsed[i], t.view());
+      }
+    }
+  }
   set("boxSizing", s.sizing == BoxSizing::BorderBox ? "border-box" : "content-box");
   static const char* const kPosition[] = {"static", "relative", "absolute", "fixed", "sticky"};
   set("position", kPosition[static_cast<int>(s.position)]);

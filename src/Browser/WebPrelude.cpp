@@ -379,7 +379,9 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     this.type = /* lower-case, and empty if it holds anything but printable ASCII */ /^[\x20-\x7E]+$/.test(type) ? lower(type) : '';
   }
   var B = Blob.prototype;
-  method(B, 'text', function () { return Promise.resolve(__utf8_clean(this.__bytes)); });
+  // ("UTF-8 decode": a byte order mark at the start is not part of the text)
+  var utf8Decode = function (bytes) { var t = __utf8_clean(bytes); return t.charCodeAt(0) === 0xFEFF ? t.slice(1) : t; };
+  method(B, 'text', function () { return Promise.resolve(utf8Decode(this.__bytes)); });
   method(B, 'arrayBuffer', function () { return Promise.resolve(__string_to_bytes(this.__bytes)); });
   method(B, 'bytes', function () { return Promise.resolve(__string_to_bytes(this.__bytes)); });
   method(B, 'slice', function (start, end, type) {
@@ -2729,8 +2731,8 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   function installBody(proto) {
     Object.defineProperty(proto, 'body', { get: function () { return bodyStreamOf(this); }, enumerable: true, configurable: true });
     Object.defineProperty(proto, 'bodyUsed', { get: function () { return bodyUsedOf(this); }, enumerable: true, configurable: true });
-    method(proto, 'text', function () { return consume(this, 'text').then(__utf8_clean); });
-    method(proto, 'json', function () { return consume(this, 'json').then(function (b) { return JSON.parse(__utf8_clean(b)); }); });
+    method(proto, 'text', function () { return consume(this, 'text').then(utf8Decode); });
+    method(proto, 'json', function () { return consume(this, 'json').then(function (b) { return JSON.parse(utf8Decode(b)); }); });
     method(proto, 'arrayBuffer', function () { return consume(this, 'arrayBuffer').then(function (b) { return __string_to_bytes(b).buffer; }); });
     method(proto, 'bytes', function () { return consume(this, 'bytes').then(__string_to_bytes); });
     method(proto, 'blob', function () {

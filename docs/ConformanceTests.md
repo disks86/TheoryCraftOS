@@ -55,6 +55,39 @@ Fixed with it: `compareDocumentPosition` of disconnected nodes, `new Text()`/`ne
 `createDocumentType`, `Document.implementation` of every document, `cloneNode`, serialization) and the order of the checks in `insertBefore`/`replaceChild` ("ensure
 pre-insertion validity", including the rules for a document's doctype and element).
 
+### Pass of 2026-11-14
+
+Real web-platform-tests, subtests passed before / after (the same checkout, the same runner): `dom/events` 399 / 565, `html/dom` 47758 / 61592 (attribute reflection),
+`custom-elements` 821 / 1203, `shadow-dom` 191 / 279, `html/dom/elements/the-innertext-and-outertext-properties` about 190 / 374. What was found and done:
+
+- **Events**: `returnValue`, `cancelBubble` and the stop flags as the standard has them (set before a dispatch they hold, both are cleared after it), `initEvent()` does nothing
+  during a dispatch, `dispatchEvent()` throws `InvalidStateError` for an event on its way or not initialized, `window.event`, `timeStamp` on the clock of `performance.now()`,
+  default values of the members of the event interfaces, the browser's own events are `PointerEvent` / `KeyboardEvent` / `FocusEvent` ... objects, scrolling events are passive by
+  default on the window and the document. A click changes a checkbox or radio button *before* its listeners run and a canceled click puts it back (`dispatch_event` in
+  `DomBindingsEvents.cpp`; `Page::activate_control` is told through `DomBindings::take_pre_activated`), and a click a script dispatches activates like the user's.
+- **Named access on the window** (`window.someId`): a host object in the window's prototype chain behind `Window.prototype` (`named_window_get` in `DomBindingsWindow.cpp`); it
+  answers only names nothing else has, and remembers the names asked for until the document changes.
+- **Import attributes**: `import x from "./a.json" with { type: "json" }`, `css` (a constructed `CSSStyleSheet`) and `text`, and `import(url, { with })`. The parser hands the
+  loader `specifier\x01type`.
+- **Reflected attributes** (`DomBindingsNode.cpp`): integers by HTML's parsing rules with their defaults and ranges (`tabIndex` is 0 for links, buttons and controls), a table of
+  enumerated attributes (`dir`, `method`, `enctype`, `crossOrigin`, `referrerPolicy`, `loading` ...), per-element attributes that were missing (`ReflectedAttribute::tags`: on
+  other elements such a name stays the script's own property), `null` / `undefined` become `"null"` / `"undefined"` in `setAttribute()` and the string setters (`arg_string`).
+  `contentEditable`, `isContentEditable`, `draggable`, `spellcheck` follow their attributes.
+- **`innerText`** is the rendered text (white space collapsing across inline elements, `display: none` and `visibility`, `text-transform`, line breaks for `<br>`, blocks,
+  paragraphs, table cells and rows; the setter makes `<br>` elements). Not done: `::first-line` / `::first-letter`, case mapping beyond ASCII, SVG text.
+- **Selectors**: `:target`, `:target-within`, `:modal`, `:open`, `:popover-open`, `:indeterminate`, `:default`, `:in-range`, `:out-of-range` match (they were parsed and never
+  matched); namespace prefixes `*|` and `|`, a bracket or string that the text ends in, comments, and `:is()` / `:where()` forgiving what they do not know.
+- **Popovers** are not displayed until shown (`kUiPopoverOpen`); `popovertarget` buttons, light dismiss and Escape. Not done: the top layer and the default centring.
+- **Declarative shadow DOM**: `<template shadowrootmode>` in the page's markup, `setHTMLUnsafe()` and `parseHTMLUnsafe()`. Custom elements inside a shadow tree are upgraded,
+  connected and disconnected with their host.
+- **Layout values for scripts**: `offsetParent`, `offsetLeft`, `offsetTop`, `clientLeft`, `clientTop`, the client and scroll sizes without the borders, and `getComputedStyle()`
+  gives `width` and `height` in pixels for an element that has a box. Not done: resolved `top` / `left` / `right` / `bottom` and margins.
+- **`PerformanceObserver`** delivers (`mark`, `measure`, and `buffered` for what is kept); `Response` / `Request` / `Blob` `text()` and `json()` drop a UTF-8 byte order mark.
+- The small harness lets the next promise test run when one never settles (a hung test used to hide the results of all the later ones).
+
+Known and left: a `toggle` event when a script changes `details.open`, `Float16Array`, scoped custom element registries, most of what the fetch / XHR tests need a server for,
+`srcset` tests (they need images that load in the test environment), frames in the `Range` tests.
+
 ## Text encodings
 
 `src/Dom/LegacyEncodings.cpp` has the decoders of the Encoding Standard (UTF-8, UTF-16, the 28 single-byte encodings, GBK/gb18030, Big5, EUC-JP, ISO-2022-JP, Shift_JIS,

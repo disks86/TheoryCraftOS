@@ -7212,6 +7212,34 @@ static void test_webrtc() {
     const std::string log(page.log().data(), page.log().size());
     CHECK(log.find("fresh 123 77 77") != std::string::npos);
   }
+  {   // offsetParent / offsetLeft / offsetTop, the client sizes (the padding box) and the resolved width and height of getComputedStyle come from the layout
+    FakeEnvironment env(a);
+    env.clock = 1700000000000ull;
+    env.monotonic_step = 1000;
+    MediaEnvironment media;
+    Page page(a, env, "https://app.example/page.html", media, true);
+    font::FontSet fonts(a);
+    fonts.add_bundled_fonts();
+    page.set_layout_fonts(&fonts);
+    page.load("<!doctype html><html><body style='margin:0'><div id=rel style='position:relative; margin:20px; border:5px solid red; padding:10px; width:200px; height:100px'>"
+              "<div id=abs style='position:absolute; left:30px; top:40px; width:50px; height:20px; border:2px solid blue; box-sizing:border-box'>a</div><span id=sp>inline</span>"
+              "<p id=stat style='margin:0'>static</p></div><div id=gone style='display:none; width:10px'></div>"
+              "<script>setTimeout(function () {\n"
+              "  var $ = function (id) { return document.getElementById(id); }, r = $('rel'), ab = $('abs'), st = $('stat'), sp = $('sp');\n"
+              "  console.log('geo ' + [r.offsetLeft, r.offsetTop, r.offsetWidth, r.clientWidth, r.clientLeft, r.clientTop, r.offsetParent.tagName, ab.offsetLeft, ab.offsetTop, ab.offsetParent.id, ab.clientWidth,\n"
+              "    getComputedStyle(r).width, getComputedStyle(r).height, getComputedStyle(ab).width, st.offsetParent.id, st.offsetLeft, st.offsetTop > 0, sp.clientWidth, getComputedStyle(sp).width,\n"
+              "    document.body.offsetParent, $('gone').offsetParent, getComputedStyle($('gone')).width].join(' '));\n"
+              "}, 10);</script></body></html>");
+    PagePicture picture(a);
+    CHECK(page.render_picture(&picture, fonts));
+    for (int i = 0; i < 5; ++i) {
+      env.clock += 10;
+      page.run_due_timers(env.clock);
+    }
+    const std::string log(page.log().data(), page.log().size());
+    if (getenv("SHOW_GEO")) printf("%s\n", log.c_str());
+    CHECK(log.find("geo 20 20 230 220 5 5 BODY 30 40 rel 46 200px 100px 50px rel 10 true 0 auto   10px") != std::string::npos);
+  }
   {   // the timing line of a page that fetched and ran nothing (the slowest file and script names are empty)
     FakeEnvironment env(a);
     MediaEnvironment media;
