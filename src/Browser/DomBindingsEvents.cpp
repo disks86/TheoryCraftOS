@@ -150,7 +150,9 @@ bool event_flag(Vm& vm, JsObject* e, const char* name);
 NATIVE(dispatch_event_native) {
   DomBindings::Impl& c = impl(vm);
   const Value event = arg_at(args, argc, 0);
-  if (!event.is_object()) return vm.throw_error(ErrorKind::TypeError, "parameter 1 is not of type 'Event'.");
+  bool is_event = false;
+  for (JsObject* p = event.is_object() ? event.as_object()->proto : nullptr; p && !is_event; p = p->proto) is_event = p == c.event_proto;
+  if (!is_event) return vm.throw_error(ErrorKind::TypeError, "Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'.");
   dom::Node* node = node_of(self);
   const bool window = !node && (self.is_nullish() || (self.is_object() && self.as_object() == vm.global()));
   if (!node && !window && !self.is_object()) return vm.throw_error(ErrorKind::TypeError, "Illegal invocation");

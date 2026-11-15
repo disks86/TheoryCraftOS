@@ -1891,7 +1891,9 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   hide(g, 'FileReader', FileReader);
 
   // ------------------------------------------------------------------------------------------------------------------------ AbortController
-  function AbortSignal() { this.aborted = false; this.reason = undefined; this.onabort = null; }
+  var makingSignal = false;   // (an AbortSignal is made by a controller or the static methods, not by `new`)
+  function AbortSignal() { if (!makingSignal) throw new TypeError("Failed to construct 'AbortSignal': Illegal constructor"); this.aborted = false; this.reason = undefined; this.onabort = null; }
+  function newSignal() { makingSignal = true; try { return new AbortSignal(); } finally { makingSignal = false; } }
   AbortSignal.prototype = Object.create(EventTarget.prototype);
   method(AbortSignal.prototype, 'constructor', AbortSignal);
   method(AbortSignal.prototype, 'throwIfAborted', function () { if (this.aborted) throw this.reason; });
@@ -1901,14 +1903,14 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     signal.reason = reason === undefined ? new DOMException('signal is aborted without reason', 'AbortError') : reason;
     signal.dispatchEvent(new Event('abort'));
   }
-  AbortSignal.abort = function (reason) { var s = new AbortSignal(); signalAbort(s, reason); return s; };
+  AbortSignal.abort = function (reason) { var s = newSignal(); signalAbort(s, reason); return s; };
   AbortSignal.timeout = function (ms) {
-    var s = new AbortSignal();
+    var s = newSignal();
     setTimeout(function () { signalAbort(s, new DOMException('signal timed out', 'TimeoutError')); }, ms);
     return s;
   };
   AbortSignal.any = function (signals) {
-    var s = new AbortSignal();
+    var s = newSignal();
     for (var i = 0; i < signals.length; i++) {
       if (signals[i].aborted) { signalAbort(s, signals[i].reason); return s; }
     }
@@ -1917,7 +1919,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
   };
   function AbortController() {
     if (!(this instanceof AbortController)) throw typeError("construct 'AbortController'", "Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
-    this.signal = new AbortSignal();
+    this.signal = newSignal();
   }
   method(AbortController.prototype, 'abort', function (reason) { signalAbort(this.signal, reason); });
   hide(g, 'AbortSignal', AbortSignal);
@@ -2891,7 +2893,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     hide(this, '__h', new Headers(init.headers !== undefined ? init.headers : (src ? src.__h : undefined), guard));
     var signal = init.signal !== undefined ? init.signal : (src ? src.signal : null);
     if (signal !== null && signal !== undefined && !(signal instanceof AbortSignal)) throw typeError("construct 'Request'", "Failed to read the 'signal' property from 'RequestInit': Failed to convert value to 'AbortSignal'.");
-    var own = new AbortSignal();
+    var own = newSignal();
     if (signal) {
       if (signal.aborted) signalAbort(own, signal.reason);
       else signal.addEventListener('abort', function () { signalAbort(own, signal.reason); });
@@ -2929,7 +2931,7 @@ const char kPrelude[] = R"JSPRELUDE((function (g) {
     var copy = Object.create(Request.prototype);
     hide(copy, '__q', JSON.parse(JSON.stringify(this.__q)));
     hide(copy, '__h', new Headers(this.__h, this.__h.__guard));
-    var own = new AbortSignal(), original = this.__sig;
+    var own = newSignal(), original = this.__sig;
     if (original.aborted) signalAbort(own, original.reason); else original.addEventListener('abort', function () { signalAbort(own, original.reason); });
     hide(copy, '__sig', own);
     hide(copy, '__b', cloneBody(this));
@@ -7915,8 +7917,19 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     });
     method(DOMMatrix.prototype, 'setMatrixValue', function (v) { this.__m = parseMatrix(v); return this; });
     method(DOMMatrix.prototype, 'preMultiplySelf', function (o) { this.__m = mul(new DOMMatrix(o.__m || o).__m, this.__m); return this; });
-    DOMMatrixReadOnly.fromMatrix = function (o) { return new DOMMatrixReadOnly(o && o.__m ? o.__m : o); };
-    DOMMatrix.fromMatrix = function (o) { return new DOMMatrix(o && o.__m ? o.__m : o); };
+    DOMMatrixReadOnly.fromMatrix = function (o) { return new DOMMatrixReadOnly(o && o.__m ? o.__m : typeof o === 'object' && o !== null && typeof o.length !== 'number' ? DOMMatrix.fromMatrix(o).__m : o); };
+    // (a DOMMatrixInit dictionary: a..f / m11..m44, the rest as in the identity)
+    var fromInit = function (o) {
+      if (o === undefined || o === null) return undefined;
+      if (o.__m) return o.__m;
+      if (typeof o !== 'object' || typeof o.length === 'number') return o;
+      var m = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], names = ['m11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44'];
+      var alias = { a: 0, b: 1, c: 4, d: 5, e: 12, f: 13 };
+      names.forEach(function (n, i) { if (o[n] !== undefined) m[i] = Number(o[n]); });
+      Object.keys(alias).forEach(function (k) { if (o[k] !== undefined) m[alias[k]] = Number(o[k]); });
+      return m;
+    };
+    DOMMatrix.fromMatrix = function (o) { return new DOMMatrix(fromInit(o)); };
     DOMMatrix.fromFloat32Array = DOMMatrix.fromFloat64Array = function (a) { return new DOMMatrix(a); };
     hide(g, 'WebKitCSSMatrix', DOMMatrix);
     var DOMQuad = klass('DOMQuad', null, function (p1, p2, p3, p4) {
@@ -8384,6 +8397,8 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     method(Performance.prototype, 'mark', function (name, options) {
       if (arguments.length < 1) throw typeErr("execute 'mark' on 'Performance'", '1 argument required, but only 0 present.');
       if (options && options.startTime !== undefined && (typeof options.startTime !== 'number' || options.startTime < 0)) throw typeErr("execute 'mark' on 'Performance'", "'startTime' must be a non-negative number.");
+      if (/^(navigationStart|unloadEvent(Start|End)|redirect(Start|End)|fetchStart|domainLookup(Start|End)|connect(Start|End)|secureConnectionStart|request(Start)|response(Start|End)|domLoading|domInteractive|domContentLoadedEvent(Start|End)|domComplete|loadEvent(Start|End))$/.test(String(name)))
+        throw new DOMException("Failed to execute 'mark' on 'Performance': '" + name + "' is part of the PerformanceTiming interface, and cannot be used as a mark name.", 'SyntaxError');
       return add(new PerformanceMark(name, options));
     });
     method(Performance.prototype, 'measure', function (name, a, b) {
@@ -8574,7 +8589,9 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       map.forEach = function (fn) { for (var i = 0; i < cs.length; i++) fn(wrap(cs.getPropertyValue(cs[i])), cs[i], map); };
       return map;
     });
-    // popover: the state and the events (the page decides how it shows)
+    // (a <details> a script opened or closed: its toggle event)
+    hide(g, '__details_toggled', function (el, wasOpen) { el.dispatchEvent(new g.ToggleEvent('toggle', { oldState: wasOpen ? 'open' : 'closed', newState: wasOpen ? 'closed' : 'open' })); });
+    // popover: the state and the events
     var open = [];
     put('popover', function () { var v = this.getAttribute('popover'); return v === null ? null : v === 'manual' ? 'manual' : v === 'hint' ? 'hint' : 'auto'; }, function (v) { if (v === null) this.removeAttribute('popover'); else this.setAttribute('popover', String(v)); });
     put('popoverTargetElement', function () { return this.__popoverTarget && this.__popoverTarget.isConnected ? this.__popoverTarget : popoverOf(this); }, function (v) { Object.defineProperty(this, '__popoverTarget', { value: v, writable: true, configurable: true }); });

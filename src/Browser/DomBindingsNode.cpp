@@ -59,6 +59,19 @@ Value upper_value(Vm& vm, StringView s) {
   return str_value(vm, u.view());
 }
 
+// A <details> whose `open` attribute a script changes fires `toggle` (in a task of its own). Made before the change; told after it.
+struct DetailsWatch {
+  DomBindings::Impl& c;
+  dom::Node* details;
+  bool was_open;
+  DetailsWatch(DomBindings::Impl& impl, dom::Node* n) : c(impl), details(n && n->is_tag("details") ? n : nullptr), was_open(details && dom::has_attribute(details, "open")) {}
+  void changed() const {
+    if (!details || dom::has_attribute(details, "open") == was_open) return;
+    const DomBindings::HookArg args[2] = {DomBindings::HookArg::of(details), DomBindings::HookArg::of(was_open)};
+    c.owner.schedule_hook("__details_toggled", args, 2);
+  }
+};
+
 // The width of a border as it is drawn (none and hidden have none). side: 0 top, 1 right, 2 bottom, 3 left.
 double border_px(const Style& s, int side) {
   return s.border_style[side] == BorderStyle::None || s.border_style[side] == BorderStyle::Hidden ? 0 : s.border_px100[side] / 100.0;
@@ -1248,10 +1261,14 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
   }
   if (const ReflectedAttribute* r = find_reflected(n, k)) {
     switch (r->kind) {
-      case Reflect::Bool:
-        if (Vm::to_boolean(value)) return done(dom::set_attribute(n, r->attribute, ""));
-        dom::remove_attribute(n, r->attribute);
-        return HostClass::Set::Handled;
+      case Reflect::Bool: {
+        const DetailsWatch watch(c, n);
+        dom::DomError e = dom::DomError::None;
+        if (Vm::to_boolean(value)) e = dom::set_attribute(n, r->attribute, "");
+        else dom::remove_attribute(n, r->attribute);
+        watch.changed();
+        return done(e);
+      }
       default:
         if (r->kind == Reflect::NullableStr && value.is_nullish()) {
           dom::remove_attribute(n, r->attribute);
@@ -1572,7 +1589,9 @@ NATIVE(el_set_attribute) {
     if (is_space(ch) || ch == '/' || ch == '=' || ch == '>' || ch == '"' || ch == '\'' || ch == '<') return throw_dom(vm, "InvalidCharacterError", "The attribute name is not valid.");
   }
   if (name.empty()) return throw_dom(vm, "InvalidCharacterError", "The attribute name is not valid.");
+  const DetailsWatch watch(impl(vm), n);
   const dom::DomError e = dom::set_attribute(n, name.view(), value.view());
+  watch.changed();
   return e == dom::DomError::None ? true : throw_dom_error(vm, e);
 }
 
@@ -1580,7 +1599,9 @@ NATIVE(el_remove_attribute) {
   dom::Node* n = this_element(vm, self);
   String name(vm.allocator());
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
+  const DetailsWatch watch(impl(vm), n);
   dom::remove_attribute(n, name.view());
+  watch.changed();
   return true;
 }
 
@@ -1605,8 +1626,10 @@ NATIVE(el_toggle_attribute) {
   if (!n || !arg_text(vm, arg_at(args, argc, 0), &name)) return false;
   const bool present = dom::has_attribute(n, name.view());
   const bool want = argc > 1 && !args[1].is_undefined() ? Vm::to_boolean(args[1]) : !present;
+  const DetailsWatch watch(impl(vm), n);
   if (want && !present) dom::set_attribute(n, name.view(), "");
   else if (!want && present) dom::remove_attribute(n, name.view());
+  watch.changed();
   *result = bool_value(want);
   return true;
 }

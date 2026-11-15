@@ -726,6 +726,7 @@ NATIVE(el_dialog_show) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
   if (!n->is_tag("dialog")) return vm.throw_error(ErrorKind::TypeError, "show is not a function");
+  if (dom::has_attribute(n, "open") && (n->form_state & dom::kFormModal)) return throw_dom(vm, "InvalidStateError", "The dialog is already open as a modal dialog, and therefore cannot be opened as a non-modal dialog.");
   impl(vm).host.show_dialog(n, false);
   return true;
 }

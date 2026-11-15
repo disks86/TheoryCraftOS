@@ -316,6 +316,7 @@ void DomBindings::schedule_hook(StringView name, const HookArg* args, uint32_t c
       case HookArg::Kind::Bool: values.push_back(Value::make_bool(args[i].boolean)); break;
       case HookArg::Kind::Number: values.push_back(Value::make_number(args[i].number)); break;
       case HookArg::Kind::String: values.push_back(Value::make_string(vm_.new_string(args[i].text))); break;
+      case HookArg::Kind::Node: values.push_back(bind::node_value(*impl_, args[i].node)); break;
     }
   }
   vm_.add_timer(runner, 0, -1, &values[0], static_cast<uint32_t>(values.count()));
