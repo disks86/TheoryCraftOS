@@ -6028,7 +6028,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     Object.defineProperty(el, '__ceSeq', { value: logSeq, writable: true, configurable: true });
     for (var i = 0; i < def.observed.length; i++) {
       var a = def.observed[i];
-      if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a)]);
+      if (el.hasAttribute(a)) callback(el, 'attributeChangedCallback', [a, null, el.getAttribute(a), null]);
     }
     if (el.isConnected) connected(el);
   }
@@ -6037,8 +6037,14 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (typeof fn !== 'function') return;
     try { fn.apply(el, args); } catch (e) { reportError(e); }
   }
+  // (in shadow-including tree order: an element, its shadow tree, its children)
+  var shadowOf = typeof __shadow_of === 'function' ? __shadow_of : function (el) { return el.shadowRoot; };
   function eachElement(node, fn) {
-    if (node.nodeType === 1) fn(node);
+    if (node.nodeType === 1) {
+      fn(node);
+      var root = shadowOf(node);
+      if (root) for (var s = root.firstChild; s; s = s.nextSibling) eachElement(s, fn);
+    }
     for (var c = node.firstChild; c; c = c.nextSibling) eachElement(c, fn);
   }
   // slotchange: a slot whose assigned nodes differ from the last time the slots of that tree were looked at is told so
@@ -6069,7 +6075,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     } else if (record.type === 'attributes') {
       var el = record.target, def = el.nodeType === 1 ? defOf(el) : null;
       if (def && el.__ce !== undefined && record.__seq > (el.__ceSeq || 0) && def.observed.indexOf(record.attributeName) >= 0)
-        callback(el, 'attributeChangedCallback', [record.attributeName, record.oldValue, el.getAttribute(record.attributeName)]);
+        callback(el, 'attributeChangedCallback', [record.attributeName, record.oldValue, el.getAttribute(record.attributeName), record.attributeNamespace === undefined ? null : record.attributeNamespace]);
     }
   }
   // The changes since the last time: custom element reactions run, observers get their records queued.
@@ -8554,7 +8560,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var m = function (name, fn) { if (!(name in EP)) method(EP, name, fn); };
     m('scroll', function () { return this.scrollTo.apply(this, arguments); });
     m('scrollIntoViewIfNeeded', function () { return this.scrollIntoView(); });
-    m('setHTMLUnsafe', function (html) { this.innerHTML = String(html); });
+    m('setHTMLUnsafe', function (html) { if (typeof __set_html_unsafe === 'function') __set_html_unsafe(this, String(html)); else this.innerHTML = String(html); });
     m('getHTML', function () { return this.innerHTML; });
     m('computedStyleMap', function () {
       var cs = g.getComputedStyle(this), map = {};
@@ -12198,7 +12204,7 @@ const char kFinishPrelude[] = R"JSPRELUDE((function (g) {
 
   // ShadowRoot HTML, Document.parseHTMLUnsafe
   M(g.ShadowRoot, 'getHTML', function () { return this.innerHTML; });
-  M(g.ShadowRoot, 'setHTMLUnsafe', function (html) { this.innerHTML = String(html); });
+  M(g.ShadowRoot, 'setHTMLUnsafe', function (html) { if (typeof __set_html_unsafe === 'function') __set_html_unsafe(this, String(html)); else this.innerHTML = String(html); });
   S(g.Document, 'parseHTMLUnsafe', function (html) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'parseHTMLUnsafe' on 'Document': 1 argument required, but only 0 present.");
     return new g.DOMParser().parseFromString(String(html), 'text/html');

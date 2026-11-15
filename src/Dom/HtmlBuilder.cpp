@@ -136,8 +136,8 @@ class TreeBuilder {
  public:
   static constexpr uint32_t kMaxDepth = 400;
 
-  TreeBuilder(Document& doc, IScriptRunner* scripts, Node* fragment, Node* context)
-      : doc_(doc), scripts_(scripts), fragment_(fragment), context_(context), a_(doc.allocator()), open_(a_), afe_(a_), tmpl_modes_(a_), input_(a_), chars_(a_), temp_(a_),
+  TreeBuilder(Document& doc, IScriptRunner* scripts, Node* fragment, Node* context, bool allow_shadow_roots = true)
+      : doc_(doc), scripts_(scripts), fragment_(fragment), context_(context), allow_shadow_roots_(allow_shadow_roots), a_(doc.allocator()), open_(a_), afe_(a_), tmpl_modes_(a_), input_(a_), chars_(a_), temp_(a_),
         last_start_(a_), attr_name_(a_), attr_value_(a_), tok_a_(a_), tok_b_(a_), tok_c_(a_), pending_text_(a_), table_text_(a_), written_(a_) {}
 
   bool run(StringView html) {
@@ -1926,8 +1926,33 @@ class TreeBuilder {
       return;
     }
     if (start(t, "template")) {
-      Node* el = insert_html(t);
-      if (el) template_content(el);
+      // A declarative shadow root: <template shadowrootmode="open|closed"> gives the element it is in a shadow root, and what is inside the template is
+      // parsed into that root (the template itself never gets into the tree).
+      Node* el = nullptr;
+      bool closed = false, declarative = false;
+      for (uint64_t i = 0; allow_shadow_roots_ && i < t.attrs.count(); ++i) {
+        if (t.attrs[i].dropped || !t.attrs[i].name.view().equals("shadowrootmode")) continue;
+        closed = t.attrs[i].value.view().equals_ignore_case("closed");
+        declarative = closed || t.attrs[i].value.view().equals_ignore_case("open");
+        break;
+      }
+      if (declarative) {
+        Node* host = appropriate_place().parent;
+        if (fragment_ && open_.count() > 0 && host == open_[0]) host = context_;
+        Node* root = host && host->is_element() && !host->shadow && !is_el(host, "template") ? doc_.create_fragment() : nullptr;
+        el = root ? create_for(t, nullptr) : nullptr;
+        if (el) {
+          root->shadow_host = host;
+          root->shadow_closed = closed;
+          host->shadow = root;
+          el->content = root;
+          push(el);
+        }
+      }
+      if (!el) {
+        el = insert_html(t);
+        if (el) template_content(el);
+      }
       afe_marker();
       frameset_ok_ = false;
       mode_ = Mode::InTemplate;
@@ -2785,6 +2810,7 @@ class TreeBuilder {
   IScriptRunner* scripts_;
   Node* fragment_;
   Node* context_;
+  bool allow_shadow_roots_;   // <template shadowrootmode> attaches a shadow root (the document's parser and setHTMLUnsafe; not innerHTML)
   allocators::IAllocator& a_;
   List<Node*> open_;
   List<Node*> afe_;
@@ -2837,10 +2863,10 @@ bool build_document(Document& doc, StringView html, IScriptRunner* scripts) {
   return ok;
 }
 
-static Node* parse_in_context(Document& doc, StringView html, Node* context) {
+static Node* parse_in_context(Document& doc, StringView html, Node* context, bool allow_shadow_roots = false) {
   Node* fragment = doc.create_fragment();
   if (!fragment) return nullptr;
-  TreeBuilder builder(doc, nullptr, fragment, context);
+  TreeBuilder builder(doc, nullptr, fragment, context, allow_shadow_roots);
   const bool ok = builder.run(html);
   adopt_template_contents(doc);
   return ok ? fragment : nullptr;
@@ -2852,14 +2878,17 @@ Node* parse_fragment(Document& doc, StringView html, StringView context_tag) {
   return parse_in_context(doc, html, context);
 }
 
-DomError set_inner_html(Node* element, StringView html) {
+DomError set_inner_html(Node* element, StringView html, bool allow_shadow_roots) {
   if (element->type != NodeType::Element && element->type != NodeType::Fragment) return DomError::HierarchyRequest;
   Node* context = element;
   if (element->type == NodeType::Fragment) {   // (a shadow root or fragment: parsed as for a <body>)
     context = element->owner->create_element("body");
     if (!context) return DomError::OutOfMemory;
   }
-  Node* fragment = parse_in_context(*element->owner, html, context);
+  Node* target_first = element->is_tag("template") ? template_content(element) : element;
+  if (!target_first) return DomError::OutOfMemory;
+  while (target_first->first_child) remove_child(target_first, target_first->first_child);   // (before the parse: a declarative shadow root attaches to the element as it is read)
+  Node* fragment = parse_in_context(*element->owner, html, context, allow_shadow_roots);
   if (!fragment) return DomError::OutOfMemory;
   Node* target = element->is_tag("template") ? template_content(element) : element;   // (a template's markup is its content)
   if (!target) return DomError::OutOfMemory;

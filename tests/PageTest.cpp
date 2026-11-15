@@ -1134,6 +1134,15 @@ static void test_timers_and_window() {
   CHECK(a.live == 0);
   CHECK(js("", "console.log(innerWidth, innerHeight, window.innerWidth === window.outerWidth, devicePixelRatio, screen.width, typeof window.scrollY, window === window.self, window.top === window, this === window)", "640 480 true 1 640 number true true true"));
   CHECK(is("<html><body><script>console.log(innerWidth, innerHeight, matchMedia('(min-width: 700px)').matches, matchMedia('(max-width: 700px)').matches)</script></body></html>", "640 480 false true"));
+  // a declarative shadow root in the page's own markup: the parser attaches it, the template is not in the tree, its styles apply inside
+  CHECK(is("<!doctype html><html><body><my-el id=m><template shadowrootmode=\"open\"><style>b { color: rgb(1, 2, 3) }</style><b id=inner>shadow</b><slot></slot></template>light</my-el>"
+           "<script>var m = document.getElementById('m'); console.log(!!m.shadowRoot, m.shadowRoot.getElementById('inner').textContent, document.querySelector('template') === null,"
+           " getComputedStyle(m.shadowRoot.getElementById('inner')).color, m.textContent)</script></body></html>",
+           "true shadow true rgb(1, 2, 3) light"));
+  // named access on the window, and what a click does to a checkbox before its listeners run
+  CHECK(is("<html><body><div id=box1></div><input type=checkbox id=cb><script>var seen = []; cb.addEventListener('click', function (e) { seen.push(cb.checked, e instanceof MouseEvent); });"
+           "cb.click(); console.log(box1 === document.getElementById('box1'), seen.join(','), typeof nothing_named_this)</script></body></html>",
+           "true true,true undefined"));
   CHECK(run_page("<html><body><script>console.log(innerWidth, matchMedia('(orientation: portrait)').matches, matchMedia('(prefers-color-scheme: dark)').matches)</script></body></html>", "http://x/", 300, 500, true) == "300 true true");
   CHECK(js("", "var q = matchMedia('(min-width: 400px) and (max-width: 800px)'); console.log(q.matches, q.media, matchMedia('garbage ((').media, matchMedia('(width >= 600px)').matches, matchMedia('print').matches)", "true (min-width: 400px) and (max-width: 800px) not all true false"));
   CHECK(js("<p id=p>x</p>", "document.title = 'New'; console.log(document.title, document.querySelector('title').textContent, document.head.children.length); document.title = ' a  b '; console.log(document.title)", "New New 1 | a b"));

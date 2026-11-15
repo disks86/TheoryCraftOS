@@ -943,6 +943,22 @@ NATIVE(set_popover_open) {
   return true;
 }
 
+// __shadow_of(element): its shadow root, open or closed (for the built-in script: custom element reactions reach into closed trees too).
+NATIVE(shadow_of) {
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  *result = n && n->is_element() && n->shadow ? node_value(impl(vm), n->shadow) : Value::make_null();
+  return true;
+}
+
+// __set_html_unsafe(element or shadow root, html): as innerHTML, but declarative shadow roots in the markup are attached.
+NATIVE(set_html_unsafe) {
+  dom::Node* n = node_of(arg_at(args, argc, 0));
+  String html(vm.allocator());
+  if (!n || !arg_string(vm, arg_at(args, argc, 1), &html)) return n ? false : vm.throw_error(ErrorKind::TypeError, "Illegal invocation");
+  const dom::DomError e = dom::set_inner_html(n, html.view(), true);
+  return e == dom::DomError::None ? true : throw_dom_error(vm, e);
+}
+
 // __install_named_window(): puts the named properties object into the window's prototype chain, in front of EventTarget.prototype (once the chain is final).
 NATIVE(install_named_window) {
   JsObject* g = vm.global();
@@ -1298,6 +1314,8 @@ bool install_window(DomBindings::Impl& c) {
   vm.define_named(g, "__time_origin", num_value(vm.clock_ms()), 0);
   vm.define_native(g, "__install_named_window", install_named_window, 0);
   vm.define_native(g, "__set_popover_open", set_popover_open, 2);
+  vm.define_native(g, "__shadow_of", shadow_of, 1);
+  vm.define_native(g, "__set_html_unsafe", set_html_unsafe, 2);
   vm.define_native(g, "__set_content_type", set_content_type, 2);
   vm.define_native(g, "__detach_buffer", detach_buffer, 1);
   vm.define_native(g, "__set_attr_ns", set_attr_ns, 4);

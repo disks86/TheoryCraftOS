@@ -298,7 +298,8 @@ void outer_html(const Node* node, String* out);
 bool is_void_tag(StringView tag);
 // Replaces the children of `element` with what `html` makes (without running scripts in it); an element's tag decides how its text is read (as a
 // <textarea>'s or a <style>'s content is not markup). Returns DomError::None on success.
-DomError set_inner_html(Node* element, StringView html);
+// `allow_shadow_roots`: <template shadowrootmode> in the markup attaches shadow roots (setHTMLUnsafe; innerHTML does not).
+DomError set_inner_html(Node* element, StringView html, bool allow_shadow_roots = false);
 // The content of a <template> (made empty if it has none yet): the nodes inside a template are not in the tree of the page, they are in this fragment.
 Node* template_content(Node* tmpl);
 // Moves what is inside every <template> of the document into its content (done once a page has been read).
