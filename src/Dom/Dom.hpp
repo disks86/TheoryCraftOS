@@ -222,6 +222,8 @@ class Document {
     watched_.push_back(node);
   }
   void unwatch_all() { watched_.clear(); }
+  // The observers were told of the changes so far: the nodes that were watched only because they had been taken out of a watched tree are let go.
+  void end_transient_watches() { transient_.clear(); }
   void record(Mutation&& m);
   List<Mutation>& log() { return log_; }
   // The number the child list records made now carry as Mutation::group (0: none); see MutationGroup.
@@ -244,7 +246,7 @@ class Document {
   void (*change_hook_)(void*) = nullptr;
   void* change_context_ = nullptr;
   List<Mutation> log_;
-  List<Node*> watched_;
+  List<Node*> watched_, transient_;
   bool recording_ = false;
   friend class MutationGroup;
   uint32_t group_ = 0, last_group_ = 0;

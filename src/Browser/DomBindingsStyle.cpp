@@ -1595,10 +1595,11 @@ NATIVE(tokens_toggle) {
   for (uint64_t k = 0; k < tokens.count(); ++k)
     if (tokens[k].view().equals(t.view())) at = static_cast<int64_t>(k);
   const bool want = argc > 1 && !args[1].is_undefined() ? Vm::to_boolean(args[1]) : at < 0;
+  *result = bool_value(want);
   if (want && at < 0) tokens.push_back(util::move(t));
   else if (!want && at >= 0) tokens.remove_at(static_cast<uint64_t>(at));
+  else return true;   // (nothing to change: the attribute is not written, so no observer hears of it)
   write_tokens(n, tokens);
-  *result = bool_value(want);
   return true;
 }
 

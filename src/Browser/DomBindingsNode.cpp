@@ -1007,7 +1007,10 @@ HostClass::Set node_set(Vm& vm, JsObject* o, JsString* key, const Value& value) 
 // it (and for what is under it) is pointed at the new nodes, so that what a script holds on to stays the same node.
 void adopt_moved(dom::Node* from, dom::Node* to, void* user) {
   Vm& vm = *static_cast<Vm*>(user);
-  if (impl(vm).live.active()) impl(vm).live.node_moved(from, to);
+  if (impl(vm).live.active()) {   // (a range in the node goes with it, and the document it is now in has to tell of its changes)
+    impl(vm).live.node_moved(from, to);
+    attach_live(impl(vm), to);
+  }
   if (!from->script) return;
   JsObject* w = static_cast<JsObject*>(from->script);
   w->host_data = to;
@@ -1209,7 +1212,8 @@ NATIVE(node_prepend) {
 NATIVE(node_replace_children) {
   dom::Node* n = this_node(vm, self);
   if (!n) return false;
-  dom::Node* f = nodes_to_fragment(vm, args, argc);
+  // (one node goes in as it is - if it is a child already, its leaving is part of the one record - several are gathered in a fragment first)
+  dom::Node* f = argc == 1 && node_of(args[0]) && node_of(args[0])->type != dom::NodeType::Document && node_of(args[0])->owner == n->owner ? node_of(args[0]) : nodes_to_fragment(vm, args, argc);
   if (!f) return false;
   const dom::DomError e = dom::replace_children(n, f);
   return e == dom::DomError::None ? true : throw_dom_error(vm, e);
@@ -1958,6 +1962,16 @@ NATIVE(watch_node) {
   return true;
 }
 
+// __mutations_delivered(): the observers have been told of everything so far
+NATIVE(mutations_delivered) {
+  (void)self;
+  (void)args;
+  (void)argc;
+  (void)result;
+  impl(vm).doc.end_transient_watches();
+  return true;
+}
+
 NATIVE(mutations_on) {
   (void)self;
   (void)args;
@@ -2199,6 +2213,7 @@ bool install_nodes(DomBindings::Impl& c) {
   JsObject* g = vm.global();
   vm.define_native(g, "__mutations_on", mutations_on, 0);
   vm.define_native(g, "__watch_node", watch_node, 1);
+  vm.define_native(g, "__mutations_delivered", mutations_delivered, 0);
   vm.define_native(g, "__take_mutations", take_mutations, 0);
   vm.define_native(g, "__register_tag", register_tag, 2);
   vm.define_native(g, "__register_svg_tag", register_svg_tag, 2);

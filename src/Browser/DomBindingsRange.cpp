@@ -41,14 +41,7 @@ uint32_t arg_id(const Value* args, uint32_t argc, uint32_t i) {
 uint32_t arg_offset(const Value* args, uint32_t argc, uint32_t i) {
   const Value v = arg_at(args, argc, i);
   const double d = v.is_number() ? v.u.number : 0;
-  return d >= 0 && d < 4294967295.0 ? static_cast<uint32_t>(d) : 0;
-}
-
-// The document of `n` tells the page's registry of its changes from now on.
-void attach(DomBindings::Impl& c, dom::Node* n) {
-  dom::Document* d = n->owner;
-  if (d->live() == &c.live) return;
-  if (c.live_documents.push_back(d)) d->set_live(&c.live);
+  return d >= 0 && d <= 4294967295.0 ? static_cast<uint32_t>(d) : 0;
 }
 
 void sweep_hook(void* user) {
@@ -65,7 +58,7 @@ NATIVE(lr_new) {
   if (!n || !arg_at(args, argc, 0).is_object()) return illegal(vm);
   const Optional<uint32_t> id = c.live.add_range(n, args[0].as_object());
   if (!id.has_value()) return throw_dom_error(vm, dom::DomError::OutOfMemory);
-  attach(c, n);
+  attach_live(c, n);
   *result = num_value(*id);
   return true;
 }
@@ -97,8 +90,8 @@ NATIVE(lr_set) {
   r->start_offset = arg_offset(args, argc, 2);
   r->end = end;
   r->end_offset = arg_offset(args, argc, 4);
-  attach(c, start);
-  attach(c, end);
+  attach_live(c, start);
+  attach_live(c, end);
   *result = Value();
   return true;
 }
@@ -111,7 +104,7 @@ NATIVE(ni_new) {
   if (!n || !arg_at(args, argc, 0).is_object()) return illegal(vm);
   const Optional<uint32_t> id = c.live.add_iterator(n, args[0].as_object());
   if (!id.has_value()) return throw_dom_error(vm, dom::DomError::OutOfMemory);
-  attach(c, n);
+  attach_live(c, n);
   *result = num_value(*id);
   return true;
 }
@@ -140,21 +133,20 @@ NATIVE(ni_set) {
   return true;
 }
 
-// __replace_data(node, offset, count, data): "replace data" of a text or comment node, offsets in UTF-16 code units; an IndexSizeError if the offset is past the end
-NATIVE(replace_data_native) {
+// __set_data(node, text, offset, count, added): "replace data" of a text or comment node whose outcome the caller worked out: the text becomes `text`, in which
+// `count` UTF-16 code units from `offset` on were replaced by `added` units (script strings can cut a surrogate pair in two; the offsets here are for the ranges)
+NATIVE(set_data) {
   (void)self;
   DomBindings::Impl& c = impl(vm);
   dom::Node* n = node_of(arg_at(args, argc, 0));
-  if (!n || (!n->is_text() && n->type != dom::NodeType::Comment)) return illegal(vm);
-  String data(vm.allocator());
-  if (!arg_text(vm, arg_at(args, argc, 3), &data)) return false;
-  const uint64_t length = utf16_length(n->data.view());
-  const uint64_t offset = arg_offset(args, argc, 1);
-  if (offset > length) return throw_dom(vm, "IndexSizeError", "The offset is larger than the node's length.");
-  uint64_t count = arg_offset(args, argc, 2);
-  if (count > length - offset) count = length - offset;
+  if (!n || (!n->is_text() && (n->type != dom::NodeType::Comment || n->dom_type == 10))) return illegal(vm);
+  String text(vm.allocator());
+  if (!arg_text(vm, arg_at(args, argc, 1), &text)) return false;
   *result = Value();
-  return replace_data(c, n, offset, count, data.view());
+  const dom::DomError e = dom::set_text_content(n, text.view());
+  if (e != dom::DomError::None) return throw_dom_error(vm, e);
+  if (c.live.active()) c.live.data_replaced(n, arg_offset(args, argc, 2), arg_offset(args, argc, 3), arg_offset(args, argc, 4));
+  return true;
 }
 
 bool character_data(const dom::Node* n) { return n->is_text() || (n->type == dom::NodeType::Comment && n->dom_type != 10); }
@@ -242,6 +234,12 @@ NATIVE(check_insert_native) {
 
 }  // namespace
 
+void attach_live(DomBindings::Impl& c, dom::Node* n) {
+  dom::Document* d = n->owner;
+  if (d->live() == &c.live) return;
+  if (c.live_documents.push_back(d)) d->set_live(&c.live);
+}
+
 bool replace_data(DomBindings::Impl& c, dom::Node* n, uint64_t offset, uint64_t count, StringView data) {
   const StringView old = n->data.view();
   const uint64_t from = utf16_to_byte(old, offset), to = utf16_to_byte(old, offset + count);
@@ -262,7 +260,7 @@ bool install_ranges(DomBindings::Impl& c) {
   vm.define_native(g, "__ni_new", ni_new, 2);
   vm.define_native(g, "__ni_get", ni_get, 2);
   vm.define_native(g, "__ni_set", ni_set, 3);
-  vm.define_native(g, "__replace_data", replace_data_native, 4);
+  vm.define_native(g, "__set_data", set_data, 5);
   vm.define_native(g, "__node_length", node_length, 1);
   vm.define_native(g, "__node_index", node_index, 1);
   vm.define_native(g, "__node_root", node_root, 1);

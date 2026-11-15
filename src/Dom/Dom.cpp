@@ -37,7 +37,7 @@ void lowercase_into(StringView in, String* out) {
 
 // --- Document ----------------------------------------------------------------------------------------------------
 
-Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator) {
+Document::Document(allocators::IAllocator& allocator) : doctype_name(allocator), doctype_public(allocator), doctype_system(allocator), content_type(allocator), character_set(allocator), allocator_(allocator), nodes_(allocator), log_(allocator), watched_(allocator), transient_(allocator) {
   character_set.assign("UTF-8");
   root_ = make(NodeType::Document, "#document");
 }
@@ -128,6 +128,13 @@ void Document::record(Mutation&& m) {
     if (!m.watchers.empty()) m.watchers.push_back(',');
     m.watchers.append_uint(watched_[i]->serial);
   }
+  for (uint64_t i = 0; i < transient_.count(); ++i) {
+    if (!contains(transient_[i], m.target)) continue;
+    if (!m.watchers.empty()) m.watchers.push_back(',');
+    m.watchers.append_uint(transient_[i]->serial);
+  }
+  // (a node taken out of something that is watched is watched itself until the observers were told: what happens in it meanwhile is theirs to hear)
+  if (m.removed && !m.watchers.empty() && transient_.count() < kMaxLog) transient_.push_back(m.removed);
   const bool first = log_.count() == 0;
   log_.push_back(util::move(m));
   if (first && hook_) hook_(hook_context_);
@@ -343,16 +350,16 @@ DomError remove_child(Node* parent, Node* child) {
 DomError replace_child(Node* parent, Node* child, Node* old_child) {
   if (const DomError e = check_insertion(parent, child, nullptr, old_child); e != DomError::None) return e;
   Node* reference = old_child->next == child ? child->next : old_child->next;
-  // (the order of the standard: the old child goes, the new one leaves where it was, then it comes in; an observer gets the first and the last as one record)
+  // (the order of the standard: the new child leaves where it was, the old one goes, the new one comes in; an observer gets the last two as one record)
+  if (child->type != NodeType::Fragment) unlink(child, false);
   MutationGroup group(parent->owner);
-  if (child != old_child) unlink(old_child);
+  if (old_child->parent == parent) unlink(old_child);
   if (child->type == NodeType::Fragment) {
     while (Node* c = child->first_child) {
       unlink(c);
       link_before(parent, c, reference);
     }
   } else {
-    unlink(child, child == old_child);
     link_before(parent, child, reference);
   }
   touch(parent);

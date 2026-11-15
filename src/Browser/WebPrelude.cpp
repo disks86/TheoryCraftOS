@@ -4361,7 +4361,16 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   };
   // The live ranges and node iterators are kept by the document (dom::LiveRanges), which moves them when the tree changes; these are the ways in.
   var lrNew = g.__lr_new, lrGet = g.__lr_get, lrSet = g.__lr_set, lrCmp = g.__lr_cmp, niNew = g.__ni_new, niGet = g.__ni_get, niSet = g.__ni_set;
-  var lenOf = g.__node_length, idxOf = g.__node_index, rootOf = g.__node_root, cmpPoints = g.__pt_cmp, checkInsert = g.__check_insert, replaceData = g.__replace_data;
+  var lenOf = g.__node_length, idxOf = g.__node_index, rootOf = g.__node_root, cmpPoints = g.__pt_cmp, checkInsert = g.__check_insert, setData = g.__set_data;
+  // "Replace data" of a text or comment node (the CharacterData methods are this too): offsets are UTF-16 code units, and may cut a surrogate pair.
+  var replaceData = function (node, offset, count, data) {
+    var s = node.data;
+    if (typeof s !== 'string') throw new TypeError('Illegal invocation');
+    if (offset > s.length) throw dom('The offset ' + offset + " is larger than the node's length (" + s.length + ').', 'IndexSizeError');
+    if (count > s.length - offset) count = s.length - offset;
+    setData(node, s.substring(0, offset) + data + s.substring(offset + count), offset, count, data.length);
+  };
+  hide(g, '__replace_data', replaceData);
   var nodeContains = NP.contains;
   // "Filter" a node: 1 accept, 2 reject, 3 skip.
   function accepts(walker, node) {
@@ -6131,21 +6140,31 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     if (!target || typeof target.nodeType !== 'number') throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
     options = options || {};
     var o = { childList: !!options.childList, subtree: !!options.subtree, attributes: options.attributes, characterData: options.characterData,
-              attributeOldValue: !!options.attributeOldValue, characterDataOldValue: !!options.characterDataOldValue, attributeFilter: options.attributeFilter };
-    if (o.attributes === undefined && (o.attributeOldValue || o.attributeFilter !== undefined)) o.attributes = true;
-    if (o.characterData === undefined && o.characterDataOldValue) o.characterData = true;
-    o.attributes = !!o.attributes; o.characterData = !!o.characterData;
-    if (!o.childList && !o.attributes && !o.characterData)
-      throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
-    if (o.attributeOldValue && !o.attributes) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
-    for (var i = 0; i < this.__targets.length; i++) if (this.__targets[i].node === target) { this.__targets[i].options = o; return; }
-    this.__targets.push({ node: target, options: o });
+              attributeOldValue: options.attributeOldValue, characterDataOldValue: options.characterDataOldValue, attributeFilter: options.attributeFilter };
+    // (an option about attributes or text that is present turns the observation of them on, unless that was said too)
+    if (o.attributes === undefined && (o.attributeOldValue !== undefined || o.attributeFilter !== undefined)) o.attributes = true;
+    if (o.characterData === undefined && o.characterDataOldValue !== undefined) o.characterData = true;
+    o.attributes = !!o.attributes; o.characterData = !!o.characterData; o.attributeOldValue = !!o.attributeOldValue; o.characterDataOldValue = !!o.characterDataOldValue;
+    if (o.attributeFilter !== undefined) o.attributeFilter = Array.prototype.map.call(o.attributeFilter, String);
+    var fail = function (why) { return new TypeError("Failed to execute 'observe' on 'MutationObserver': " + why); };
+    if (!o.childList && !o.attributes && !o.characterData) throw fail("The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+    if (o.attributeOldValue && !o.attributes) throw fail("The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+    if (o.attributeFilter !== undefined && !o.attributes) throw fail("The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+    if (o.characterDataOldValue && !o.characterData) throw fail("The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+    for (var i = 0; i < this.__targets.length; i++) {
+      var reg = this.__targets[i];
+      if (reg.node !== target || reg.source) continue;
+      this.__targets = this.__targets.filter(function (t) { return t.source !== reg; });   // (what it watched only through this registration is let go)
+      reg.options = o;
+      return;
+    }
+    this.__targets.push({ node: target, options: o, source: null });
     if (observers.indexOf(this) < 0) observers.push(this);
     __mutations_on();
     __watch_node(target);
   });
   method(MutationObserver.prototype, 'disconnect', function () {
-    this.__targets.length = 0;
+    this.__targets = [];
     this.__queue.length = 0;
     var at = observers.indexOf(this);
     if (at >= 0) observers.splice(at, 1);
@@ -6158,24 +6177,42 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
   function reportError(e) {
     try { setTimeout(function () { throw e; }, 0); } catch (ignored) { }
   }
-  function deliver(record) {
+  var queueNotify = function () {};   // (set where the observers are told)
+  function regApplies(reg, record) { return reg.node === record.target || (reg.options.subtree && record.watchers.indexOf(reg.node) >= 0); }
+  // A node taken out of a tree an observer watches with its subtree stays watched by that observer (a transient registration: `source` is the one it comes
+  // from) until the observer has been told, so that what happens inside it meanwhile is reported.
+  function keepWatching(record) {
     for (var i = 0; i < observers.length; i++) {
-      var observer = observers[i];
+      var regs = observers[i].__targets, count = regs.length;
+      for (var t = 0; t < count; t++) {
+        var reg = regs[t];
+        if (!reg.options.subtree || !regApplies(reg, record)) continue;
+        for (var k = 0; k < record.removedNodes.length; k++) regs.push({ node: record.removedNodes[k], options: reg.options, source: reg.source || reg });
+        queueNotify();
+      }
+    }
+  }
+  function deliver(record) {
+    var type = record.type;
+    for (var i = 0; i < observers.length; i++) {
+      var observer = observers[i], interested = false, old = false;
       for (var t = 0; t < observer.__targets.length; t++) {
         var reg = observer.__targets[t], o = reg.options;
-        var applies = reg.node === record.target || (o.subtree && record.watchers.indexOf(reg.node) >= 0);
-        if (!applies) continue;
-        if (record.type === 'childList' && !o.childList) continue;
-        if (record.type === 'attributes' && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(record.attributeName) < 0))) continue;
-        if (record.type === 'characterData' && !o.characterData) continue;
-        var copy = Object.create(MutationRecord.prototype);
-        copy.type = record.type; copy.target = record.target; copy.addedNodes = record.addedNodes; copy.removedNodes = record.removedNodes;
-        copy.previousSibling = record.previousSibling; copy.nextSibling = record.nextSibling; copy.attributeName = record.attributeName;
-        copy.attributeNamespace = null;
-        copy.oldValue = (record.type === 'attributes' && o.attributeOldValue) || (record.type === 'characterData' && o.characterDataOldValue) ? record.oldValue : null;
-        observer.__queue.push(copy);
-        break;   // (an observer gets a record once)
+        if (!regApplies(reg, record)) continue;
+        if (type === 'childList' && !o.childList) continue;
+        if (type === 'attributes' && (!o.attributes || (o.attributeFilter && o.attributeFilter.indexOf(record.attributeName) < 0))) continue;
+        if (type === 'characterData' && !o.characterData) continue;
+        interested = true;   // (an observer gets a record once, with the old value if any of its registrations asked for it)
+        if ((type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue)) old = true;
       }
+      if (!interested) continue;
+      var copy = Object.create(MutationRecord.prototype);
+      copy.type = type; copy.target = record.target; copy.addedNodes = record.addedNodes; copy.removedNodes = record.removedNodes;
+      copy.previousSibling = record.previousSibling; copy.nextSibling = record.nextSibling; copy.attributeName = record.attributeName;
+      copy.attributeNamespace = null;
+      copy.oldValue = old ? record.oldValue : null;
+      observer.__queue.push(copy);
+      queueNotify();
     }
   }
 
@@ -6272,8 +6309,7 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
     var records = __take_mutations(), group = 0, open = null;
     for (var i = 0; i < records.length; i++) {
       var r = records[i];
-      if (r.group === undefined) { group = 0; open = null; }
-      else {
+      if (r.group !== undefined) {
         if (r.group !== group) { group = r.group; open = []; }
         var m = null;
         for (var k = 0; k < open.length; k++) if (open[k].target === r.target) { m = open[k]; break; }
@@ -6297,21 +6333,35 @@ const char kDomPrelude[] = R"JSPRELUDE((function (g) {
       if (r === null) continue;
       if (r.target.nodeType === 1 || r.type === 'childList') reactions(r);
       deliver(r);
+      if (r.type === 'childList' && r.removedNodes.length) keepWatching(r);
     }
     logQueue.length = 0;
     logHead = 0;
   }
   hide(g, '__process_mutations', processLog);
-  hide(g, '__deliver_mutations', function () {
+  // The log is looked at when the call that changed the tree is over (and, should that not have happened, in a microtask the first change queued). The observers
+  // are told in a microtask of their own, queued when the first record is queued for one of them (or a removed subtree starts being watched): microtasks
+  // queued before that run before it.
+  hide(g, '__deliver_mutations', processLog);
+  var notifyQueued = false;
+  queueNotify = function () { if (!notifyQueued) { notifyQueued = true; queueMicrotask(notify); } };
+  function notify() {
+    notifyQueued = false;
     processLog();
-    for (var o = 0; o < observers.length; o++) {
-      var observer = observers[o];
+    var all = observers.slice();
+    for (var n = 0; n < all.length; n++) {   // (told now: what was watched only because it had been taken out is let go)
+      var regs = all[n].__targets;
+      for (var k = 0; k < regs.length; k++) if (regs[k].source) { all[n].__targets = regs.filter(function (t) { return !t.source; }); break; }
+    }
+    __mutations_delivered();
+    for (var o = 0; o < all.length; o++) {
+      var observer = all[o];
       if (observer.__queue.length === 0) continue;
       var queue = observer.__queue.slice();
       observer.__queue.length = 0;
       try { observer.__callback.call(observer, queue, observer); } catch (e) { reportError(e); }
     }
-  });
+  }
   function CustomElementRegistry() { throw new TypeError('Illegal constructor'); }
   var registry = Object.create(CustomElementRegistry.prototype);
   method(CustomElementRegistry.prototype, 'define', function (name, ctor, options) {

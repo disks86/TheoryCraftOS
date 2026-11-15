@@ -215,6 +215,8 @@ JsObject* make_byte_array(DomBindings::Impl& c, StringView bytes);
 bool byte_array_bytes(const Value& v, StringView* out);
 bool install_dash(DomBindings::Impl& c);     // the natives under the dashjs-style player (DomBindingsDash.cpp)
 bool install_ranges(DomBindings::Impl& c);   // the natives under Range and NodeIterator (DomBindingsRange.cpp)
+// The document of `n` tells the page's live ranges (Impl::live) of its changes from now on.
+void attach_live(DomBindings::Impl& c, dom::Node* n);
 // "Replace data" of a text or comment node: `count` UTF-16 code units from `offset` on (both inside the text) become `data`; ranges follow, an observer is told.
 // False (with an exception thrown) if memory ran out.
 bool replace_data(DomBindings::Impl& c, dom::Node* n, uint64_t offset, uint64_t count, StringView data);
