@@ -938,7 +938,7 @@ static FARPROC export_of(HMODULE module, LPCSTR name, DWORD ordinal, int depth) 
   const BYTE *base = module;
   if (!base || depth > 4) return NULL;
   const ULONG pe = *(const ULONG *)(base + 0x3C);
-  const ULONG dir_rva = *(const ULONG *)(base + pe + 0x18 + 0x70), dir_size = *(const ULONG *)(base + pe + 0x18 + 0x74);
+  const ULONG dir_rva = *(const ULONG *)(base + pe + 0x18 + PE_DIRECTORIES), dir_size = *(const ULONG *)(base + pe + 0x18 + PE_DIRECTORIES + 4);
   if (!dir_rva) return NULL;
   const ExportDirectory *d = (const ExportDirectory *)(base + dir_rva);
   const ULONG *functions = (const ULONG *)(base + d->AddressOfFunctions), *names = (const ULONG *)(base + d->AddressOfNames);

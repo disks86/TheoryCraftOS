@@ -1196,7 +1196,7 @@ static LDR_DATA_TABLE_ENTRY *ldr_add(const LoadRecord *record, const UNICODE_STR
   {      /* TlsIndex: -1 when the image has thread-local data that was set up */
     const BYTE *image = (const BYTE *)e->DllBase;
     const ULONG nt = *(const ULONG *)(image + 0x3C);
-    e->TlsIndex = (!mapped_only && *(const ULONG *)(image + nt + 24 + 0x70 + 9 * 8) != 0) ? 0xFFFF : 0;
+    e->TlsIndex = (!mapped_only && *(const ULONG *)(image + nt + 24 + PE_DIRECTORIES + 9 * 8) != 0) ? 0xFFFF : 0;
   }
   if (mapped_only) e->EntryPoint = NULL;
   PEB_LDR_DATA *ldr = NtCurrentPeb()->Ldr;

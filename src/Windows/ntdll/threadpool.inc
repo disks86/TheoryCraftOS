@@ -603,8 +603,13 @@ EXPORT void NTAPI TpSetPoolMaxThreadsSoftLimit(PVOID pool, ULONG maximum) { TpSe
 static void tp_image_stack(SIZE_T *reserve, SIZE_T *commit) {
   const BYTE *image = *(BYTE **)(PEB_RAW() + 0x10);
   const BYTE *nt = image + *(const DWORD *)(image + 0x3C);
+#ifdef __i386__
+  *reserve = *(const ULONG *)(nt + 0x18 + 0x48);      /* (a PE32 image: 32-bit sizes) */
+  *commit = *(const ULONG *)(nt + 0x18 + 0x4C);
+#else
   *reserve = *(const ULONGLONG *)(nt + 0x18 + 0x48);
   *commit = *(const ULONGLONG *)(nt + 0x18 + 0x50);
+#endif
 }
 EXPORT NTSTATUS NTAPI TpQueryPoolStackInformation(PVOID pool_, SIZE_T *information) {
   TP_POOL_ *pool = pool_;

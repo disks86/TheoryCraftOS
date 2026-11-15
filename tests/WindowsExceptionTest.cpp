@@ -70,7 +70,7 @@ static void test_mapping() {
   CHECK(fault_to_exception(6, 0, 0, &at, &e) && e.code == 0xC000001Du);
   CHECK(fault_to_exception(13, 0, 0, &at, &e) && e.code == 0xC0000096u);
   at.rip = 0x2001;
-  CHECK(fault_to_exception(3, 0, 0, &at, &e) && e.code == 0x80000003u && at.rip == 0x2000 && e.address == 0x2000);      // reported at the INT3
+  CHECK(fault_to_exception(3, 0, 0, &at, &e) && e.code == 0x80000003u && at.rip == 0x2001 && e.address == 0x2000);      // reported at the INT3; the context stays after it
   CHECK(!fault_to_exception(8, 0, 0, &at, &e));      // double fault
   CHECK(!fault_to_exception(18, 0, 0, &at, &e));     // machine check
   at.fpu[24] = 0x04;      // MXCSR: the divide-by-zero flag
@@ -150,7 +150,7 @@ static void test_apply() {
   CHECK(apply_context(p, at, &c) && c.rip == 0x402000 && c.gpr[X86Context::kRax] == 0x55 && c.gpr[X86Context::kRsp] == 0x7FFF9000);
   // privileged flag bits are masked: IOPL 3, NT, VM, RF, AC, TF
   build_context(mem, at, 0x10000B, 0x401000, 0x7FFF8000, 1, 0xFFFFFFFFu, 0x1F80);
-  CHECK(apply_context(p, at, &c) && (c.rflags & 0x3000) == 0 && !(c.rflags & 0x4000) && !(c.rflags & 0x20000) && !(c.rflags & 0x10000) && !(c.rflags & 0x40000) && !(c.rflags & 0x100));
+  CHECK(apply_context(p, at, &c) && (c.rflags & 0x3000) == 0 && !(c.rflags & 0x4000) && !(c.rflags & 0x20000) && !(c.rflags & 0x10000) && !(c.rflags & 0x40000));      // (the trap flag is a program's to set: single-stepping)
   // a rip or rsp that is not a user address would fault the kernel in IRET: refused
   build_context(mem, at, 0x10000B, 0xFFFF800000001000ull, 0x7FFF8000, 1, 0x246, 0x1F80);
   CHECK(!apply_context(p, at, &c));
@@ -181,7 +181,7 @@ static void test_flips() {
     X86Context c;
     if (!apply_context(p, at, &c)) continue;
     CHECK(c.rip < 0x0000800000000000ull && c.gpr[X86Context::kRsp] < 0x0000800000000000ull);
-    CHECK((c.rflags & ~uint64_t{0x0CD5 | 0x202}) == 0);
+    CHECK((c.rflags & ~uint64_t{0x0DD5 | 0x202}) == 0);
     uint32_t mxcsr = uint32_t(c.fpu[24]) | uint32_t(c.fpu[25]) << 8 | uint32_t(c.fpu[26]) << 16 | uint32_t(c.fpu[27]) << 24;
     CHECK((mxcsr & ~0xFFBFu) == 0);
   }
@@ -212,12 +212,157 @@ static void test_services() {
   CHECK(p.exception_dispatcher() == 0x180001000);
 }
 
+// ---- a 32-bit program (i386): its own CONTEXT (0x2CC bytes) and EXCEPTION_RECORD (0x50 bytes) ----
+static ProcessBinding binding32() { return ProcessBinding{SyscallAbi::Windows, UserArch::X86_32, syscall_interface(SyscallAbi::Windows, UserArch::X86_32)}; }
+static X86Context registers32() {
+  X86Context at;
+  for (int i = 0; i < 8; ++i) at.gpr[i] = 0x1000 + uint64_t(i);
+  at.gpr[X86Context::kRsp] = kBase + kSize - 0x104;
+  at.rip = 0x401234;
+  at.rflags = 0x246;
+  at.fpu[0] = 0x7F; at.fpu[1] = 0x03;        // the x87 control word 0x037F
+  at.fpu[2] = 0x00; at.fpu[3] = 0x38;        // status: top of stack = 7
+  at.fpu[4] = 0x80;                          // the register in use is the physical one 7, which is ST(0)
+  at.fpu[32 + 7] = 0xA0; at.fpu[32 + 8] = 0x00; at.fpu[32 + 9] = 0x40;      // ST(0) = 2.5
+  at.fpu[24] = 0x80; at.fpu[25] = 0x1F;      // MXCSR 0x1F80
+  at.fpu[160] = 0x77;                        // XMM0
+  return at;
+}
+
+static void test_dispatch32() {
+  FakeMemory mem;
+  Host host;
+  Process p(1, binding32(), mem, host);
+  const X86Context at = registers32();
+  X86Context entry;
+  ExceptionInfo info;
+  info.code = 0xC0000005u;
+  info.address = 0x401234;
+  info.count = 2;
+  info.information[0] = 1;
+  info.information[1] = 0x20;
+  CHECK(dispatch_exception(p, at, info, 0x70001000, &entry));
+  const uint64_t sp = entry.gpr[X86Context::kRsp];
+  CHECK(entry.rip == 0x70001000 && (sp & 15) == 0 && sp < at.gpr[X86Context::kRsp] && sp >= kBase);
+  const uint64_t record = mem.u32(sp), context = mem.u32(sp + 4);      // the two arguments, as a call leaves them less its return address
+  CHECK(record == sp + 8 && context == record + kExceptionRecordBytes32 && context + kContextBytes32 <= at.gpr[X86Context::kRsp]);
+  CHECK(mem.u32(record) == 0xC0000005u && mem.u32(record + 4) == 0 && mem.u32(record + 8) == 0 && mem.u32(record + 12) == 0x401234 && mem.u32(record + 16) == 2 &&
+        mem.u32(record + 20) == 1 && mem.u32(record + 24) == 0x20);
+  CHECK(mem.u32(context) == 0x1002F);      // i386: control, integer, segments, floating point, extended registers
+  CHECK(mem.u32(context + 0x9C) == 0x1007 && mem.u32(context + 0xA0) == 0x1006 && mem.u32(context + 0xA4) == 0x1003 && mem.u32(context + 0xA8) == 0x1002 &&
+        mem.u32(context + 0xAC) == 0x1001 && mem.u32(context + 0xB0) == 0x1000);      // Edi Esi Ebx Edx Ecx Eax
+  CHECK(mem.u32(context + 0xB4) == 0x1005 && mem.u32(context + 0xB8) == 0x401234 && mem.u32(context + 0xBC) == 0x3B && mem.u32(context + 0xC0) == 0x246 &&
+        mem.u32(context + 0xC4) == uint32_t(at.gpr[X86Context::kRsp]) && mem.u32(context + 0xC8) == 0x2B);      // Ebp Eip SegCs EFlags Esp SegSs
+  // FloatSave: the control word, the status word, the full tag word (register 7 valid, the others empty), then the registers, ten bytes each
+  CHECK(mem.u32(context + 0x1C) == 0xFFFF037Fu && mem.u32(context + 0x20) == 0xFFFF3800u && mem.u32(context + 0x24) == 0xFFFF3FFFu);
+  CHECK(mem.bytes[context + 0x1C + 28 + 7 - kBase] == 0xA0 && mem.bytes[context + 0x1C + 28 + 9 - kBase] == 0x40);
+  CHECK(mem.bytes[context + 0xCC + 160 - kBase] == 0x77 && mem.bytes[context + 0xCC + 24 - kBase] == 0x80);      // the FXSAVE image: XMM0, MXCSR
+  // a breakpoint: the CONTEXT is at the INT3 itself
+  info.code = 0x80000003u;
+  info.address = 0x401233;
+  info.count = 1;
+  CHECK(dispatch_exception(p, at, info, 0x70001000, &entry));
+  CHECK(mem.u32(mem.u32(entry.gpr[X86Context::kRsp] + 4) + 0xB8) == 0x401233);
+  // no room on the stack, a stack that is not a 32-bit program's, or no dispatcher: not delivered
+  X86Context bad = at;
+  bad.gpr[X86Context::kRsp] = kBase + 0x100;
+  CHECK(!dispatch_exception(p, bad, info, 0x70001000, &entry));
+  bad.gpr[X86Context::kRsp] = 0x1000;
+  CHECK(!dispatch_exception(p, bad, info, 0x70001000, &entry));
+  bad.gpr[X86Context::kRsp] = 0x80000100ull;
+  CHECK(!dispatch_exception(p, bad, info, 0x70001000, &entry));
+  CHECK(!dispatch_exception(p, at, info, 0, &entry));
+  info.count = 16;
+  CHECK(!dispatch_exception(p, at, info, 0x70001000, &entry));
+}
+
+static void test_context32() {
+  FakeMemory mem;
+  Host host;
+  Process p(1, binding32(), mem, host);
+  const uint64_t at = kBase + 0x1000;
+  const X86Context from = registers32();
+  // GetThreadContext writes the parts the flags ask for and leaves the rest of the record alone
+  for (uint32_t i = 0; i < kContextBytes32; ++i) mem.bytes[at - kBase + i] = 0xEE;
+  mem.put32(at, 0x10001);      // control only
+  CHECK(store_context(p, at, from));
+  CHECK(mem.u32(at + 0xB8) == 0x401234 && mem.u32(at + 0xC4) == uint32_t(from.gpr[X86Context::kRsp]) && mem.u32(at + 0xB4) == 0x1005);
+  CHECK(mem.u32(at + 0xB0) == 0xEEEEEEEEu && mem.u32(at + 0x1C) == 0xEEEEEEEEu && mem.u32(at + 0xCC) == 0xEEEEEEEEu);
+  mem.put32(at, 0x1002F);
+  CHECK(store_context(p, at, from));
+  // and SetThreadContext / NtContinue reads it back: the same registers
+  X86Context c;
+  for (uint64_t& value : c.gpr) value = 0xDEADBEEF00000000ull;
+  CHECK(apply_context(p, at, &c));
+  for (int i = 0; i < 8; ++i) CHECK(c.gpr[i] == from.gpr[i]);
+  CHECK(c.rip == 0x401234 && c.rflags == 0x246 && c.fpu[160] == 0x77 && c.fpu[24] == 0x80 && c.fpu[25] == 0x1F);
+  // the x87 state from the FloatSave area alone (no extended registers): the SSE registers stay what they were
+  mem.put32(at, 0x10008);
+  X86Context x87;
+  x87.fpu[160] = 0x99;
+  x87.fpu[24] = 0x80; x87.fpu[25] = 0x1F;
+  CHECK(apply_context(p, at, &x87));
+  CHECK(x87.fpu[0] == 0x7F && x87.fpu[1] == 0x03 && x87.fpu[3] == 0x38 && x87.fpu[4] == 0x80 && x87.fpu[32 + 7] == 0xA0 && x87.fpu[32 + 9] == 0x40 && x87.fpu[160] == 0x99 &&
+        x87.fpu[24] == 0x80);
+  // a program cannot give itself privileged flags, or addresses that are not a 32-bit program's
+  mem.put32(at, 0x10001);
+  mem.put32(at + 0xC0, 0x00243246u | 0x100);      // IOPL 3, NT, VM, AC, TF
+  CHECK(apply_context(p, at, &c) && (c.rflags & 0x3000) == 0 && !(c.rflags & 0x4000) && !(c.rflags & 0x20000) && !(c.rflags & 0x40000) && (c.rflags & 0x200));
+  mem.put32(at + 0xB8, 0x80000000u);
+  CHECK(!apply_context(p, at, &c));
+  mem.put32(at + 0xB8, 0x401000);
+  mem.put32(at + 0xC4, 0xFFFFF000u);
+  CHECK(!apply_context(p, at, &c));
+  mem.put32(at + 0xC4, 0x7FFF8000u);
+  CHECK(apply_context(p, at, &c));
+  mem.put32(at, 0x10000B);      // an x64 CONTEXT's flags: not this program's
+  CHECK(!apply_context(p, at, &c) && !store_context(p, at, from));
+  // MXCSR's reserved bits (loading them would fault in the kernel)
+  mem.put32(at, 0x10020);
+  mem.put32(at + 0xCC + 24, 0xFFFFFFFFu);
+  CHECK(apply_context(p, at, &c) && c.fpu[26] == 0 && c.fpu[27] == 0 && c.fpu[24] == 0xBF);
+  // truncated: a CONTEXT that runs off the end of the mapped memory
+  mem.put32(kBase + kSize - kContextBytes32, 0x10001);
+  mem.put32(kBase + kSize - kContextBytes32 + 0xB8, 0x401000);
+  mem.put32(kBase + kSize - kContextBytes32 + 0xC4, 0x7FFF8000u);
+  CHECK(apply_context(p, kBase + kSize - kContextBytes32, &c));
+  CHECK(!apply_context(p, kBase + kSize - kContextBytes32 + 1, &c) && !store_context(p, kBase + kSize - kContextBytes32 + 1, from));
+  CHECK(!apply_context(p, 0x1000, &c));
+}
+
+// Bit flips of a good 32-bit context must never make the kernel accept something that would fault it.
+static void test_flips32() {
+  FakeMemory mem;
+  Host host;
+  Process p(1, binding32(), mem, host);
+  const uint64_t at = kBase + 0x1000;
+  const X86Context from = registers32();
+  std::vector<uint8_t> good;
+  mem.put32(at, 0x1002F);
+  CHECK(store_context(p, at, from));
+  good.assign(mem.bytes.begin() + 0x1000, mem.bytes.begin() + 0x1000 + kContextBytes32);
+  for (uint32_t bit = 0; bit < kContextBytes32 * 8; ++bit) {
+    for (uint32_t i = 0; i < kContextBytes32; ++i) mem.bytes[0x1000 + i] = good[i];
+    mem.bytes[0x1000 + bit / 8] ^= uint8_t(1u << (bit % 8));
+    X86Context c;
+    if (!apply_context(p, at, &c)) continue;
+    CHECK(c.rip < 0x80000000ull && c.gpr[X86Context::kRsp] < 0x80000000ull);
+    for (int i = 0; i < 8; ++i) CHECK((c.gpr[i] >> 32) == 0);
+    CHECK((c.rflags & ~uint64_t{0x0DD5 | 0x202}) == 0);
+    const uint32_t mxcsr = uint32_t(c.fpu[24]) | uint32_t(c.fpu[25]) << 8 | uint32_t(c.fpu[26]) << 16 | uint32_t(c.fpu[27]) << 24;
+    CHECK((mxcsr & ~0xFFBFu) == 0);
+  }
+}
+
 int main() {
   test_mapping();
   test_dispatch();
   test_apply();
   test_flips();
   test_services();
+  test_dispatch32();
+  test_context32();
+  test_flips32();
   if (g_failed) { printf("WindowsExceptionTest: %d failed\n", g_failed); return 1; }
   printf("WindowsExceptionTest: all passed\n");
   return 0;

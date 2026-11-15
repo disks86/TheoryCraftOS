@@ -40,6 +40,10 @@ constexpr uint32_t kContextBytes = 0x4D0;           // sizeof(CONTEXT) of x64
 constexpr uint32_t kExceptionRecordBytes = 0x98;    // sizeof(EXCEPTION_RECORD)
 constexpr uint32_t kContextAmd64 = 0x100000, kContextControl = 1, kContextInteger = 2, kContextSegments = 4, kContextFloatingPoint = 8;
 
+// A 32-bit program's (i386): its own CONTEXT and EXCEPTION_RECORD layouts, which the functions below read and write for a process of UserArch::X86_32.
+constexpr uint32_t kContextBytes32 = 0x2CC, kExceptionRecordBytes32 = 0x50;
+constexpr uint32_t kContextI386 = 0x10000, kContextExtendedRegisters = 0x20;      // (control, integer, segments and floating point are the same bits)
+
 constexpr uint32_t kStatusAccessViolation = 0xC0000005u;
 
 struct ExceptionInfo {
@@ -51,7 +55,7 @@ struct ExceptionInfo {
 };
 
 // What an x86 exception means as an NT exception (STATUS_ACCESS_VIOLATION for a page fault, ...). `error` is the CPU's error code, `cr2` the faulting address. A
-// breakpoint is reported at the INT3 itself (the context is moved back one byte, as Windows does). False for an exception that cannot be delivered (machine check, ...).
+// breakpoint is reported at the INT3 itself; the context stays after it (a 32-bit program's CONTEXT is at the INT3, which dispatch_exception sees to). False for an exception that cannot be delivered (machine check, ...).
 bool fault_to_exception(uint64_t vector, uint64_t error, uint64_t cr2, X86Context* at, ExceptionInfo* out);
 
 // Pushes the CONTEXT of `at` and the EXCEPTION_RECORD of `info` on the program's stack and sets up `*entry` to call dispatcher(record, context): ntdll's

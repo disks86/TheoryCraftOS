@@ -1187,10 +1187,11 @@ EXPORT PVOID NTAPI RtlImageDirectoryEntryToData(PVOID base, BOOLEAN mapped_as_im
   BYTE *nt = image_nt_headers(base);
   if (!nt) return NULL;
   const USHORT magic = *(const USHORT *)(nt + 24);
-  if (magic != 0x20B) return NULL;      /* only PE32+ here */
-  const ULONG count = *(const ULONG *)(nt + 24 + 108);
+  if (magic != 0x20B && magic != 0x10B) return NULL;
+  const ULONG directories = magic == 0x20B ? 112 : 96;      /* (PE32+, PE32: the count is just before them) */
+  const ULONG count = *(const ULONG *)(nt + 24 + directories - 4);
   if (directory >= count || directory >= 16) return NULL;
-  const ULONG rva = *(const ULONG *)(nt + 24 + 112 + directory * 8), length = *(const ULONG *)(nt + 24 + 112 + directory * 8 + 4);
+  const ULONG rva = *(const ULONG *)(nt + 24 + directories + directory * 8), length = *(const ULONG *)(nt + 24 + directories + directory * 8 + 4);
   if (!rva) return NULL;
   if (size) *size = length;
   BYTE *image = (BYTE *)((ULONG_PTR)base & ~(ULONG_PTR)1);

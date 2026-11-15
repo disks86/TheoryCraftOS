@@ -381,7 +381,7 @@ static const BYTE *resource_address(HMODULE module, DWORD rva) {
 static const ResourceDirectory *resource_root(HMODULE module, DWORD *size) {
   const BYTE *base = resource_base(module);
   const ULONG pe = *(const ULONG *)(base + 0x3C);
-  const ULONG rva = *(const ULONG *)(base + pe + 0x18 + 0x70 + 2 * 8), bytes = *(const ULONG *)(base + pe + 0x18 + 0x70 + 2 * 8 + 4);
+  const ULONG rva = *(const ULONG *)(base + pe + 0x18 + PE_DIRECTORIES + 2 * 8), bytes = *(const ULONG *)(base + pe + 0x18 + PE_DIRECTORIES + 2 * 8 + 4);
   if (!rva) return NULL;
   *size = bytes;
   return (const ResourceDirectory *)resource_address(module, rva);

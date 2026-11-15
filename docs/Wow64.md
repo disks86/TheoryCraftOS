@@ -55,9 +55,21 @@ in a 32-bit address space: 32-bit import slots, image base, security cookie, TLS
   (`wow64_start_process`), then goes on as in a 64-bit program. A later thread's `TcosThreadStart` points its 32-bit TEB at that PEB.
 - The functions are exported by their plain names (`--kill-at`); a library that imports them links against an import library made from the
   decorated names (`dlltool -k`).
-- **Exceptions** (src/Windows/ntdll/except32.inc): only a beginning. An exception raised by software is offered to the vectored handlers and the
-  unhandled-exception filter and then ends the process; the frame-based handlers of i386 (`FS:[0]`, `RtlUnwind`) are not written, and a fault of
-  the processor ends the program in the kernel.
+- **Exceptions** (src/Windows/ntdll/except32.inc) are the i386 mechanism, which is not the x64 one: a function with a handler links a record on its
+  stack at `FS:[0]`, and there are no unwind tables.
+  - The kernel delivers a fault of the processor with an **i386 `CONTEXT`** (716 bytes) and a 32-bit `EXCEPTION_RECORD` on the program's stack, and
+    starts `KiUserExceptionDispatcher` with their two addresses on the stack (src/Process/WindowsException.cpp). `NtContinue`, `NtGetContextThread`
+    and `NtSetContextThread` read and write the same layout for a 32-bit program, with the same checks as for a 64-bit one (addresses below
+    2 GiB, no privileged flags, the usable bits of MXCSR). The x87 state is given both ways a 32-bit `CONTEXT` has it: the FSAVE layout
+    (`FloatSave`) and the FXSAVE image (`ExtendedRegisters`).
+  - `RtlDispatchException` offers the exception to the vectored handlers, then to each frame's handler from the newest. A handler runs inside a
+    frame of the dispatcher's own, so an exception inside a handler is seen and marked `EXCEPTION_NESTED_CALL`. What no frame handles goes to the
+    unhandled-exception filter (kernel32's `UnhandledExceptionFilter`), and then the process ends with the exception's code.
+  - `RtlUnwind` calls the handlers of the frames above the target with `EXCEPTION_UNWINDING`, takes their records off the list, and returns.
+  - `RtlRaiseException` captures the caller's registers, so a handler that says "continue" goes back with all of them.
+  - msvcrt.dll has the handlers of the Microsoft compilers' `__try` frames (src/Windows/msvcrt/seh32.inc): `_except_handler3`,
+    `_except_handler4_common`, `_local_unwind2/4`, `_global_unwind2`, `_abnormal_termination`. A program that links the C runtime statically
+    brings its own and needs only `RtlUnwind`.
 
 ## Status
 
@@ -68,22 +80,30 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 - **A program with a C runtime** (tests/windows/crt32.c, built with `i686-w64-mingw32-gcc` the ordinary way) runs on the 32-bit ntdll.dll,
   kernel32.dll and msvcrt.dll: the runtime's start-up, `printf`, the heap, files, the environment, `VirtualAlloc` / `VirtualQuery`, thread-local
   storage, critical sections, four threads and waiting for them, events, `Sleep`. All 21 of its checks pass.
+- **Exceptions** (tests/windows/seh32.c): faults (bad reads and writes, division by zero, a breakpoint) reach the handler of a frame with the right
+  record and registers, and the program goes on from a changed `CONTEXT`; the x87 and SSE registers are in the `CONTEXT` and come back; `RtlUnwind`;
+  an exception that cannot be continued; an exception inside a handler; vectored handlers; the unhandled-exception filter; a `__try` frame handled
+  by `_except_handler3` (the frame is made by hand, as no compiler here has `__try` for i386); a fault in a second thread; `GetThreadContext` and
+  `SetThreadContext`. All 20 of its checks pass.
 
 Not done yet, in the order planned:
 
-1. **Exceptions for 32-bit programs**: frame-based SEH in ntdll (`FS:[0]` handlers, `RtlUnwind`, `_except_handler3/4` in msvcrt), and in the
-   kernel a 32-bit `CONTEXT`, the delivery of faults to `KiUserExceptionDispatcher`, `NtContinue`, `Get/SetThreadContext`.
-2. **The other libraries** (advapi32, user32, gdi32, win32u, shell32, ole32, comctl32, ...) built for i386, with the win32k services' structures
+1. **The other libraries** (advapi32, user32, gdi32, win32u, shell32, ole32, comctl32, ...) built for i386, with the win32k services' structures
    converted; the stub libraries need the argument sizes of their functions (stdcall: the function takes its arguments off the stack), which the
    32-bit import libraries of mingw give.
-3. **The long tail in the three libraries that are built**: the services ntdll has no prototype for are not exported; information classes with
+2. **The long tail in the three libraries that are built**: the services ntdll has no prototype for are not exported; information classes with
    pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; a 32-bit program cannot start another program
    (`RtlCreateProcessParameters` writes the 64-bit layout); `%p` prints 16 digits; the old runtime's `_iob` array has the wrong stride.
-4. **Setup programs**: the App Manager refuses 32-bit setup programs until 1 and 2 are done (docs/AppManager.md). They are GUI programs that use
+3. **What exceptions still lack**: C++ exceptions of the Microsoft runtime (`__CxxFrameHandler`, `_CxxThrowException`: msvcrt.dll has neither, for
+   64-bit programs either); the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
+   debugged (no debug events for it); a stack overflow ends the program (no guard-page exception on the 32-bit stack).
+4. **Setup programs**: the App Manager refuses 32-bit setup programs until 1 is done (docs/AppManager.md). They are GUI programs that use
    user32, gdi32, comctl32, shell32 and ole32.
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Tests
 
 - `tests/run_host_tests.sh SyscallTest LoaderTest`: binding a PE32 program, the INT 2E argument convention, the address-space ceiling.
-- `tests/wow64_qemu.sh [hello32] [crt32]`: the two programs above in the real kernel, each in a boot of its own.
+- `tests/run_host_tests.sh WindowsExceptionTest`: the i386 `CONTEXT` and record the kernel writes and reads, with truncated and bit-flipped
+  contexts.
+- `tests/wow64_qemu.sh [hello32] [crt32] [seh32]`: the three programs above in the real kernel, each in a boot of its own.

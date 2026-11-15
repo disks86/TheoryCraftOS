@@ -377,11 +377,22 @@ typedef struct _RTL_CONDITION_VARIABLE { PVOID Ptr; } CONDITION_VARIABLE, *PCOND
 #define EXCEPTION_CONTINUE_SEARCH 0
 #define EXCEPTION_CONTINUE_EXECUTION (-1)
 #define CONTEXT_AMD64 0x100000
+#ifdef __i386__
+#define CONTEXT_i386 0x10000
+#define CONTEXT_CONTROL (CONTEXT_i386 | 0x1)      /* Ebp, Eip, SegCs, EFlags, Esp, SegSs */
+#define CONTEXT_INTEGER (CONTEXT_i386 | 0x2)      /* Edi, Esi, Ebx, Edx, Ecx, Eax */
+#define CONTEXT_SEGMENTS (CONTEXT_i386 | 0x4)
+#define CONTEXT_FLOATING_POINT (CONTEXT_i386 | 0x8)
+#define CONTEXT_DEBUG_REGISTERS (CONTEXT_i386 | 0x10)
+#define CONTEXT_EXTENDED_REGISTERS (CONTEXT_i386 | 0x20)
+#define CONTEXT_FULL (CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS)
+#else
 #define CONTEXT_CONTROL (CONTEXT_AMD64 | 0x1)
 #define CONTEXT_INTEGER (CONTEXT_AMD64 | 0x2)
 #define CONTEXT_SEGMENTS (CONTEXT_AMD64 | 0x4)
 #define CONTEXT_FLOATING_POINT (CONTEXT_AMD64 | 0x8)
 #define CONTEXT_FULL (CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT)
+#endif
 #define CONTEXT_UNWOUND_TO_CALL 0x20000000
 #define UNW_FLAG_NHANDLER 0
 #define UNW_FLAG_EHANDLER 1
@@ -394,9 +405,32 @@ struct _EXCEPTION_RECORD {
   struct _EXCEPTION_RECORD *ExceptionRecord;
   PVOID ExceptionAddress;
   DWORD NumberParameters;
-  ULONG64 ExceptionInformation[15];
+  ULONG_PTR ExceptionInformation[15];
 };
 typedef struct _EXCEPTION_RECORD EXCEPTION_RECORD;
+#ifdef __i386__
+/* The CONTEXT of i386 (716 bytes), and the frame a function chains at FS:[0] for its exception handler. */
+typedef struct _FLOATING_SAVE_AREA {
+  DWORD ControlWord, StatusWord, TagWord, ErrorOffset, ErrorSelector, DataOffset, DataSelector;
+  BYTE RegisterArea[80];
+  DWORD Cr0NpxState;
+} FLOATING_SAVE_AREA;
+struct _CONTEXT {
+  DWORD ContextFlags;
+  DWORD Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+  FLOATING_SAVE_AREA FloatSave;
+  DWORD SegGs, SegFs, SegEs, SegDs;
+  DWORD Edi, Esi, Ebx, Edx, Ecx, Eax;
+  DWORD Ebp, Eip, SegCs, EFlags, Esp, SegSs;
+  BYTE ExtendedRegisters[512];      /* FXSAVE image */
+};
+struct _EXCEPTION_RECORD;
+typedef struct _EXCEPTION_REGISTRATION_RECORD {
+  struct _EXCEPTION_REGISTRATION_RECORD *Prev;
+  int (__cdecl *Handler)(struct _EXCEPTION_RECORD *, struct _EXCEPTION_REGISTRATION_RECORD *, struct _CONTEXT *, struct _EXCEPTION_REGISTRATION_RECORD **);
+} EXCEPTION_REGISTRATION_RECORD;
+#define EXCEPTION_CHAIN_END ((EXCEPTION_REGISTRATION_RECORD *)(ULONG_PTR)-1)
+#else
 struct __attribute__((aligned(16))) _CONTEXT {
   ULONG64 P1Home, P2Home, P3Home, P4Home, P5Home, P6Home;
   DWORD ContextFlags, MxCsr;
@@ -409,8 +443,21 @@ struct __attribute__((aligned(16))) _CONTEXT {
   M128A VectorRegister[26];
   ULONG64 VectorControl, DebugControl, LastBranchToRip, LastBranchFromRip, LastExceptionToRip, LastExceptionFromRip;
 };
+#endif
 typedef struct _CONTEXT CONTEXT;
 typedef CONTEXT *PCONTEXT;
+/* Where the data directories are in the optional header of the images this library sees: a PE32 image's are 16 bytes earlier than a PE32+ one's. */
+#ifdef __i386__
+#define PE_DIRECTORIES 0x60
+#else
+#define PE_DIRECTORIES 0x70
+#endif
+/* The instruction pointer of a CONTEXT, whichever processor it is for. */
+#ifdef __i386__
+#define CONTEXT_PC(c) ((c)->Eip)
+#else
+#define CONTEXT_PC(c) ((c)->Rip)
+#endif
 #define CONTEXT_XMM(c, n) (((M128A *)((c)->FltSave + 160))[n])
 typedef struct _RUNTIME_FUNCTION { DWORD BeginAddress, EndAddress, UnwindData; } RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;
 typedef struct _UNWIND_HISTORY_TABLE UNWIND_HISTORY_TABLE, *PUNWIND_HISTORY_TABLE;

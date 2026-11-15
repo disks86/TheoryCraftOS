@@ -1017,7 +1017,7 @@ static void soft_break(void) {
   record.ExceptionCode = 0x80000003u;      /* STATUS_BREAKPOINT */
   record.NumberParameters = 1;
   RtlCaptureContext(&context);
-  record.ExceptionAddress = (PVOID)context.Rip;
+  record.ExceptionAddress = (PVOID)CONTEXT_PC(&context);
   if (!debugger_handled(&record, &context, TRUE)) RtlDispatchException(&record, &context);
 }
 

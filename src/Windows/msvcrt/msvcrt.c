@@ -2081,6 +2081,7 @@ __asm__(
     ".section .drectve\n"
     ".ascii \" -export:_setjmp -export:_setjmp3 -export:setjmp -export:longjmp\"\n"
     ".text\n");
+#include "seh32.inc"
 #else
 __asm__(
     ".text\n"
