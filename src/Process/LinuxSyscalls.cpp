@@ -62,6 +62,7 @@ enum class Call : uint16_t { None, Clone3, Read, Write, Writev, Close, Getpid, G
   Cachestat, RestartSyscall,
   // System V IPC (LinuxIpc.cpp)
   Shmget, Shmat, Shmdt, Shmctl, Semget, Semop, Semtimedop, Semctl, Msgget, Msgsnd, Msgrcv, Msgctl,
+  MqOpen, MqUnlink, MqTimedsend, MqTimedreceive, MqNotify, MqGetsetattr,
   // calls that are in Linux's tables and have a fixed answer here: see the table
   Unsupported, Absent };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
@@ -164,6 +165,9 @@ constexpr NumberEntry kNumbers[] = {
     {29, 194, Call::Shmget},       {30, 196, Call::Shmat},      {67, 197, Call::Shmdt},       {31, 195, Call::Shmctl},
     {64, 190, Call::Semget},       {65, 193, Call::Semop},      {220, 192, Call::Semtimedop}, {66, 191, Call::Semctl},
     {68, 186, Call::Msgget},       {69, 189, Call::Msgsnd},     {70, 188, Call::Msgrcv},      {71, 187, Call::Msgctl},
+    // POSIX message queues (LinuxIpc.cpp)
+    {240, 180, Call::MqOpen},      {241, 181, Call::MqUnlink},  {242, 182, Call::MqTimedsend}, {243, 183, Call::MqTimedreceive},
+    {244, 184, Call::MqNotify},    {245, 185, Call::MqGetsetattr},
     // more of what only an administrator of a real system does (EPERM): vhangup, iopl, ioperm, init_module, finit_module, delete_module, kexec_load,
     // kexec_file_load, and the newer mount calls open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr, open_tree_attr, and fchroot
     {153, 58, Call::Refuse},       {172, kAbsent, Call::Refuse}, {173, kAbsent, Call::Refuse}, {175, 105, Call::Refuse},
@@ -694,6 +698,12 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ProcessVmReadv: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], false);
       case Call::ProcessVmWritev: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], true);
       case Call::Cachestat: return linuxabi::sys_cachestat(process, a[0], a[1], a[2], a[3]);
+      case Call::MqOpen: return linuxabi::sys_mq_open(process, a[0], a[1], a[2], a[3]);
+      case Call::MqUnlink: return linuxabi::sys_mq_unlink(process, a[0]);
+      case Call::MqTimedsend: return linuxabi::sys_mq_timedsend(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::MqTimedreceive: return linuxabi::sys_mq_timedreceive(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::MqNotify: return linuxabi::sys_mq_notify(process, a[0], a[1]);
+      case Call::MqGetsetattr: return linuxabi::sys_mq_getsetattr(process, a[0], a[1], a[2]);
       case Call::Shmget: return linuxabi::sys_shmget(process, a[0], a[1], a[2]);
       case Call::Shmat: return linuxabi::sys_shmat(process, a[0], a[1], a[2]);
       case Call::Shmdt: return linuxabi::sys_shmdt(process, a[0]);

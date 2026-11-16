@@ -1947,8 +1947,9 @@ struct IpcSync final : ISystemSync {
 struct IpcRig {
   IpcSync sync;
   LinuxIpcManager* ipc;
-  IpcRig() : ipc(new LinuxIpcManager(sync, A)) { set_system_linux_ipc(ipc); }
-  ~IpcRig() { set_system_linux_ipc(nullptr); delete ipc; }
+  UnixSocketManager* sockets;      // (the descriptors of message queues, pidfds and inotify instances live here)
+  IpcRig() : ipc(new LinuxIpcManager(sync, A)), sockets(new UnixSocketManager(sync, A)) { set_system_linux_ipc(ipc); set_system_unix_sockets(sockets); }
+  ~IpcRig() { set_system_unix_sockets(nullptr); set_system_linux_ipc(nullptr); delete sockets; delete ipc; }
 };
 
 static void test_shared_memory() {
@@ -2186,6 +2187,83 @@ static void test_message_queues() {
   CHECK(made == 64 && rig.s(68, 0, kCreate) == -28);
 }
 
+// --- POSIX message queues: mq_open (240), mq_unlink (241), mq_timedsend (242), mq_timedreceive (243), mq_notify (244), mq_getsetattr (245) -----------------
+static void test_posix_message_queues() {
+  constexpr uint64_t kCreate = 0x40, kExclusive = 0x80, kNonBlock = 0x800, kUsr1 = 10;
+  IpcRig system;
+  {
+    Waiting w;
+    Rig& rig = w.rig;
+    system.sync.host = &rig.host;
+    const uint64_t buf = rig.alloc(256), prio = rig.alloc(8), attr = rig.words({0, 3, 16, 0, 0, 0, 0, 0}), got = rig.alloc(64), fds = rig.alloc(16);
+    auto soon = [&](uint64_t seconds) { return rig.words({1700000000ull + rig.host.now / 1000000000u + seconds, rig.host.now % 1000000000u}); };
+    auto ready = [&](int64_t fd) {      // poll(): POLLIN 1, POLLOUT 4
+      rig.put32(fds, uint32_t(fd)); rig.put32(fds + 4, 1 | 4);
+      return rig.s(7, fds, 1, 0) < 0 ? -1 : int(rig.u32(fds + 4) >> 16);
+    };
+    const int64_t q = rig.s(240, rig.str("q1"), kCreate | 2, 0600, attr);
+    CHECK(q >= 3);
+    const int64_t reader = rig.s(240, rig.str("q1"), 0, 0, 0), writer = rig.s(240, rig.str("q1"), 1 | kNonBlock, 0, 0);
+    CHECK(reader > q && writer > reader);
+    CHECK(rig.s(240, rig.str("q1"), kCreate | kExclusive, 0600, 0) == -17 && rig.s(240, rig.str("nope"), 2, 0, 0) == -2 && rig.s(240, rig.str("a/b"), kCreate, 0, 0) == -22);
+    CHECK(rig.s(240, rig.str(""), kCreate, 0, 0) == -22 && rig.s(240, rig.str(std::string(64, 'n')), kCreate, 0, 0) == -36 && rig.s(240, kBad, kCreate, 0, 0) == -14);
+    CHECK(rig.s(240, rig.str("bad"), kCreate | 2, 0600, rig.words({0, 0, 16, 0})) == -22 && rig.s(240, rig.str("bad"), kCreate | 2, 0600, rig.words({0, 3, 1 << 20, 0})) == -22);
+    CHECK(rig.s(240, rig.str("bad"), kCreate | 2, 0600, kBad) == -14 && rig.s(240, rig.str("bad"), kCreate | 3, 0600, 0) == -22 && rig.s(240, rig.str("bad"), 2, 0, 0) == -2);
+    // messages come out by priority, the oldest first among equals
+    CHECK(ready(q) == 4);      // nothing to take, room to put
+    CHECK(rig.s(242, q, rig.str("low"), 3, 1, 0) == 0 && rig.s(242, q, rig.str("high"), 4, 5, 0) == 0 && rig.s(242, writer, rig.str("high2"), 5, 5, 0) == 0);
+    CHECK(rig.s(245, q, 0, got) == 0 && rig.u64(got) == 0 && rig.u64(got + 8) == 3 && rig.u64(got + 16) == 16 && rig.u64(got + 24) == 3);
+    CHECK(rig.s(245, writer, 0, got) == 0 && rig.u64(got) == kNonBlock && ready(q) == 1 && ready(reader) == 1 && ready(writer) == 0);
+    CHECK(rig.s(242, writer, rig.str("x"), 1, 0, 0) == -11 && rig.s(242, q, rig.str("x"), 1, 0, soon(0)) == -110);      // full: EAGAIN without waiting, ETIMEDOUT with a time that is up
+    CHECK(rig.s(243, q, buf, 15, prio, 0) == -90 && rig.s(242, q, rig.str("0123456789abcdefg"), 17, 0, 0) == -90);        // EMSGSIZE both ways
+    CHECK(rig.s(243, reader, buf, 100, prio, 0) == 4 && rig.bytes(buf, 4) == "high" && rig.u32(prio) == 5);
+    CHECK(rig.s(243, reader, buf, 100, 0, 0) == 5 && rig.bytes(buf, 5) == "high2" && rig.s(243, q, buf, 16, prio, 0) == 3 && rig.bytes(buf, 3) == "low" && rig.u32(prio) == 1);
+    // an empty queue: a time to wait until, O_NONBLOCK, another thread
+    const uint64_t started = rig.host.now;
+    CHECK(rig.s(243, q, buf, 100, 0, soon(2)) == -110 && rig.host.now - started >= 1900000000ull && rig.host.now - started < 2200000000ull);
+    CHECK(rig.s(245, q, rig.words({kNonBlock, 99, 99, 99}), got) == 0 && rig.u64(got) == 0 && rig.s(243, q, buf, 100, 0, 0) == -11);
+    CHECK(rig.s(245, q, rig.words({0}), got) == 0 && rig.u64(got) == kNonBlock && rig.u64(got + 8) == 3);      // (only the flag can be changed)
+    CHECK(rig.s(245, q, rig.words({4}), 0) == -22 && rig.s(245, q, kBad, 0) == -14 && rig.s(245, q, 0, kBad) == -14 && rig.s(245, 1, 0, got) == -9 && rig.s(245, 999, 0, got) == -9);
+    system.sync.meanwhile = [&]() { CHECK(rig.s(242, writer, rig.str("woke"), 4, 31, 0) == 0); };
+    CHECK(rig.s(243, q, buf, 100, prio, 0) == 4 && rig.bytes(buf, 4) == "woke" && rig.u32(prio) == 31);
+    CHECK(rig.s(242, q, rig.str(""), 0, 0, 0) == 0 && rig.s(243, q, buf, 100, 0, 0) == 0);      // an empty message is one
+    // how it was opened; what is refused
+    CHECK(rig.s(242, reader, rig.str("x"), 1, 0, 0) == -9 && rig.s(243, writer, buf, 100, 0, 0) == -9 && rig.s(242, 1, rig.str("x"), 1, 0, 0) == -9 && rig.s(243, 999, buf, 100, 0, 0) == -9);
+    CHECK(rig.s(242, q, rig.str("x"), 1, 32768, 0) == -22 && rig.s(242, q, kBad, 1, 0, 0) == -14 && rig.s(242, q, rig.str("x"), 1, 0, kBad) == -14);
+    CHECK(rig.s(242, q, rig.str("x"), 1, 0, rig.words({1, 1000000000})) == -22 && rig.s(242, q, rig.str("x"), uint64_t{1} << 40, 0, 0) == -90);
+    CHECK(rig.s(242, q, rig.str("lost"), 4, 0, 0) == 0 && rig.s(243, q, kBad, 100, 0, 0) == -14 && rig.s(245, q, 0, got) == 0 && rig.u64(got + 24) == 0);
+    CHECK(rig.s(0, q, buf, 16) == -22);      // (not something read() reads)
+    // mq_notify: told once when a message comes to the empty queue
+    const uint64_t event = rig.alloc(64), set = rig.alloc(8);
+    rig.put64(event, 0); rig.put32(event + 8, uint32_t(kUsr1)); rig.put32(event + 12, 0);
+    CHECK(rig.s(14, 0, rig.words({uint64_t{1} << (kUsr1 - 1)}), 0, 8) == 0);
+    CHECK(rig.s(244, q, event) == 0 && rig.s(244, reader, event) == -16);      // EBUSY: somebody asked already
+    CHECK(rig.s(242, q, rig.str("a"), 1, 0, 0) == 0 && rig.s(127, set, 8) == 0 && rig.u64(set) == uint64_t{1} << (kUsr1 - 1));
+    CHECK(rig.s(128, set, 0, rig.words({0, 0}), 8) == int64_t(kUsr1));
+    CHECK(rig.s(242, q, rig.str("b"), 1, 0, 0) == 0 && rig.s(127, set, 8) == 0 && rig.u64(set) == 0);      // (only once, and only for an empty queue)
+    CHECK(rig.s(244, q, event) == 0 && rig.s(244, q, 0) == 0 && rig.s(244, q, event) == 0 && rig.s(244, q, 0) == 0);
+    rig.put32(event + 12, 2);
+    CHECK(rig.s(244, q, event) == -22);      // SIGEV_THREAD
+    rig.put32(event + 12, 0); rig.put32(event + 8, 0);
+    CHECK(rig.s(244, q, event) == -22 && rig.s(244, q, kBad) == -14 && rig.s(244, 1, event) == -9);
+    // unlinked: the name is free, the descriptors go on, and the queue goes with the last of them
+    CHECK(rig.s(241, rig.str("q1")) == 0 && rig.s(241, rig.str("q1")) == -2 && rig.s(240, rig.str("q1"), 2, 0, 0) == -2 && rig.s(241, kBad) == -14);
+    CHECK(rig.s(243, reader, buf, 100, 0, 0) == 1 && rig.bytes(buf, 1) == "a");
+    const int64_t fresh = rig.s(240, rig.str("q1"), kCreate | 2, 0600, 0);
+    CHECK(fresh >= 3 && rig.s(245, fresh, 0, got) == 0 && rig.u64(got + 8) == 10 && rig.u64(got + 16) == 8192 && rig.u64(got + 24) == 0);      // another queue, with the defaults
+    const int64_t copy = rig.s(32, q);
+    CHECK(copy >= 3 && rig.s(3, q) == 0 && rig.s(3, reader) == 0 && rig.s(3, writer) == 0 && rig.s(243, copy, buf, 100, 0, 0) == 1 && rig.s(3, copy) == 0);
+    CHECK(rig.s(243, copy, buf, 100, 0, 0) == -9);
+    int made = 0;
+    for (int i = 0; i < 40; ++i) {
+      const int64_t fd = rig.s(240, rig.str("many-" + std::to_string(i)), kCreate | 2, 0600, 0);
+      if (fd >= 0) ++made;
+      else CHECK(fd == -28);
+    }
+    CHECK(made == 31);      // 32 queues in all: the old one's slot was free again
+  }
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -2251,7 +2329,7 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
-      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues},
       {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {

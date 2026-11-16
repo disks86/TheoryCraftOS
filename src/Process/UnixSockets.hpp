@@ -61,7 +61,13 @@ enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      //
                                 Signal = 0x43,       // signalfd: no signal is routed to it (never ready)
                                 // Named pipes (FIFOs, see below): the pipe itself, which no descriptor holds, and one open() of it.
                                 Fifo = 0x44,
-                                FifoEnd = 0x45 };
+                                FifoEnd = 0x45,
+                                // Descriptors for a thing that lives somewhere else ("linked", see create_linked): the manager keeps what they
+                                // refer to and whether they are ready, and tells the owner when the last descriptor is gone.
+                                MessageQueue = 0x46,     // mq_open: a POSIX message queue (LinuxIpc.cpp)
+                                Pidfd = 0x47,            // pidfd_open: a process (LinuxProcess.cpp)
+                                Inotify = 0x48 };        // inotify_init: a set of watches (LinuxInotify.cpp)
+inline bool unix_type_is_linked(UnixType t) { return t == UnixType::MessageQueue || t == UnixType::Pidfd || t == UnixType::Inotify; }
 inline bool unix_type_is_socket(UnixType t) { return uint8_t(t) < 0x40; }
 
 // One descriptor an epoll instance watches: the descriptor number in the process that added it and what was there (kind, socket id), so that a
@@ -155,6 +161,14 @@ class UnixSocketManager {
   UnixStatus create_timer(uint64_t owner_pid, uint32_t clock, uint32_t* id);
   UnixStatus create_epoll(uint64_t owner_pid, uint32_t* id);
   UnixStatus create_signal(uint64_t owner_pid, uint32_t* id);
+  // A descriptor for something another part of the system keeps (a message queue, a process, a set of inotify watches): `link` says which, `mode` is the
+  // owner's to use (how it was opened). poll() reports it readable and writable as the owner last said (set_link_ready_locked). When its last descriptor
+  // is closed the hook registered for its type is called, with the lock held.
+  UnixStatus create_linked(UnixType type, uint64_t owner_pid, uint64_t link, uint32_t mode, uint32_t* id);
+  bool linked_locked(uint32_t id, UnixType* type, uint64_t* link, uint32_t* mode) const;
+  void set_link_ready_locked(uint32_t id, bool readable, bool writable);
+  using LinkReleased = void (*)(uint64_t link, uint32_t mode);
+  static void set_link_release_hook(UnixType type, LinkReleased hook);
   static constexpr uint32_t kMaxEpollEntries = 4096;
 
   // --- named pipes (see above)
@@ -291,6 +305,9 @@ class UnixSocketManager {
     UnixStatus pending_error = UnixStatus::Ok;
     bool non_blocking = false, pass_credentials = false;
     uint64_t counter = 0;                // an eventfd's value (UnixType::Event), a timer's expirations (UnixType::Timer)
+    uint64_t link = 0;                   // a linked descriptor: what it refers to, how it was opened, and whether it is ready
+    uint32_t link_mode = 0;
+    bool link_readable = false, link_writable = false;
     bool semaphore = false;
     uint32_t timer_clock = 0;
     uint64_t timer_deadline = 0, timer_interval = 0;

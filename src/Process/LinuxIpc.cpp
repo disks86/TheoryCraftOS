@@ -17,6 +17,8 @@
  */
 #include "Process/LinuxIpc.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/LinuxProcess.hpp"
+#include "Process/LinuxSockets.hpp"
 #include "Process/Process.hpp"
 #include "Process/UnixSockets.hpp"
 #include "Utility/ByteStream.hpp"
@@ -54,13 +56,14 @@ LinuxIpcManager* system_linux_ipc() {
 
 void set_system_linux_ipc(LinuxIpcManager* manager) { __atomic_store_n(&g_ipc_override, manager, __ATOMIC_RELEASE); }
 
-namespace {
-// The manager if there is one already (a process that ends has nothing to take back from one that was never made).
-LinuxIpcManager* existing_linux_ipc() {
+// The manager if there is one already (a process that ends, or a descriptor that is closed, has nothing to do with one that was never made).
+static LinuxIpcManager* existing_linux_ipc() {
   if (LinuxIpcManager* chosen = __atomic_load_n(&g_ipc_override, __ATOMIC_ACQUIRE)) return chosen;
   return __atomic_load_n(&g_ipc_made, __ATOMIC_ACQUIRE);
 }
-}  // namespace
+namespace linuxabi {
+static LinuxIpcManager* existing_ipc_for_hooks() { return existing_linux_ipc(); }
+}
 
 namespace linuxabi {
 
@@ -867,3 +870,349 @@ uint64_t sys_msgctl(Process& p, uint64_t id, uint64_t command, uint64_t buffer) 
 
 }  // namespace linuxabi
 }  // namespace process
+
+// --- POSIX message queues ----------------------------------------------------------------------------------------------------------------------------
+// A queue's descriptor is a "linked" descriptor of the AF_UNIX manager (UnixSockets.hpp), so that poll(), dup(), fork() and close() know it; its link is
+// the queue's id and its mode how it was opened (0 reading, 1 writing, 2 both).
+
+namespace process::linuxabi {
+
+namespace {
+
+constexpr int64_t kEbadf = 9, kEbusy = 16, kEmsgsize = 90, kEtimedout = 110, kEnametoolong = 36;
+constexpr int64_t kEnoent2 = 2, kEintr2 = 4, kEagain2 = 11, kEnomem2 = 12, kEfault2 = 14, kEexist2 = 17, kEinval2 = 22, kEnospc2 = 28, kEnosys2 = 38;
+uint64_t failure(int64_t e) { return uint64_t(-e); }
+constexpr uint32_t kMqIdStep = 32768;
+constexpr uint64_t kMqRecordHead = 8;
+constexpr uint64_t kPriorityMax = 32768;      // MQ_PRIO_MAX
+
+struct MqLocked {
+  ISystemSync& sync;
+  explicit MqLocked(ISystemSync& s) : sync(s) { sync.lock(); }
+  ~MqLocked() { sync.unlock(); }
+  MqLocked(const MqLocked&) = delete;
+  MqLocked& operator=(const MqLocked&) = delete;
+};
+
+uint64_t mq_link(const LinuxIpcManager& ipc, const LinuxIpcManager::NamedQueue* queue) {
+  return uint64_t(queue - &ipc.named[0]) + uint64_t{queue->permission.sequence} * kMqIdStep;
+}
+
+LinuxIpcManager::NamedQueue* mq_by_link(LinuxIpcManager& ipc, uint64_t link) {
+  const uint64_t index = link % kMqIdStep, sequence = link / kMqIdStep;
+  if (index >= LinuxIpcManager::kNamedQueues || !ipc.named[index].used || ipc.named[index].permission.sequence != sequence) return nullptr;
+  return &ipc.named[index];
+}
+
+void mq_free(LinuxIpcManager::NamedQueue& queue) {
+  const uint16_t sequence = uint16_t((queue.permission.sequence + 1) % 0x7FFF);
+  queue = LinuxIpcManager::NamedQueue();
+  queue.permission.sequence = sequence;
+}
+
+// The last descriptor of a queue's open was closed (called by the descriptor manager with the system's lock held).
+void mq_descriptor_gone(uint64_t link, uint32_t) {
+  LinuxIpcManager* ipc = existing_ipc_for_hooks();
+  if (!ipc) return;
+  LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+  if (!queue) return;
+  if (queue->opens > 0) --queue->opens;
+  if (queue->opens == 0 && queue->unlinked) mq_free(*queue);
+}
+
+// The name a program gave: up to 63 bytes, with no slash in it. 0, or the failure.
+uint64_t read_queue_name(Process& p, uint64_t address, char (&name)[LinuxIpcManager::kQueueNameBytes], uint32_t* size) {
+  for (uint32_t i = 0; i < LinuxIpcManager::kQueueNameBytes; ++i) {
+    uint8_t c = 0;
+    if (!p.read_user(address + i, ByteView(&c, 1))) return failure(kEfault2);
+    if (c == 0) {
+      if (i == 0) return failure(kEinval2);
+      *size = i;
+      return 0;
+    }
+    if (c == '/') return failure(kEinval2);
+    name[i] = char(c);
+  }
+  return failure(kEnametoolong);
+}
+
+LinuxIpcManager::NamedQueue* mq_by_name(LinuxIpcManager& ipc, const char* name, uint32_t size) {
+  for (LinuxIpcManager::NamedQueue& queue : ipc.named) {
+    if (!queue.used || queue.unlinked || queue.name_size != size) continue;
+    bool same = true;
+    for (uint32_t i = 0; i < size; ++i) same = same && queue.name[i] == name[i];
+    if (same) return &queue;
+  }
+  return nullptr;
+}
+
+// A time on CLOCK_REALTIME to wait until, as how long from now (~0: for ever; 0: it is past).
+uint64_t read_deadline(Process& p, uint64_t address, uint64_t* wait_ns) {
+  *wait_ns = ~uint64_t{0};
+  if (address == 0) return 0;
+  uint64_t seconds = 0, nanoseconds = 0;
+  if (!p.read_user_u64(address, &seconds) || !p.read_user_u64(address + 8, &nanoseconds)) return failure(kEfault2);
+  if (int64_t(seconds) < 0 || nanoseconds >= 1000000000u) return failure(kEinval2);
+  const uint64_t at = seconds > (~uint64_t{0} - 999999999u) / 1000000000u ? ~uint64_t{0} - 1 : seconds * 1000000000u + nanoseconds;
+  const uint64_t now = p.host().realtime_ns();
+  *wait_ns = at > now ? at - now : 0;
+  return 0;
+}
+
+}  // namespace
+
+void mq_readiness_locked(uint64_t link, uint32_t mode, bool* readable, bool* writable) {
+  *readable = *writable = false;
+  LinuxIpcManager* ipc = existing_ipc_for_hooks();
+  if (!ipc) return;
+  const LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+  if (!queue) return;
+  *readable = mode != 1 && queue->messages != 0;
+  *writable = mode != 0 && queue->messages < queue->capacity;
+}
+
+// mq_open(name, flags, mode, struct mq_attr*). struct mq_attr: mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs (8 bytes each), then four unused words.
+uint64_t sys_mq_open(Process& p, uint64_t name_address, uint64_t flags, uint64_t mode, uint64_t attributes) {
+  constexpr uint64_t kAccess = 3, kCreate = 0x40, kExclusive = 0x80, kNonBlock = 0x800, kCloseOnExec = 0x80000;
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  if ((flags & kAccess) == 3) return failure(kEinval2);
+  char name[LinuxIpcManager::kQueueNameBytes] = {};
+  uint32_t name_size = 0;
+  if (const uint64_t r = read_queue_name(p, name_address, name, &name_size); r != 0) return r;
+  uint64_t capacity = LinuxIpcManager::kNamedMessagesDefault, message_bytes = LinuxIpcManager::kNamedMessageBytesDefault;
+  if ((flags & kCreate) && attributes != 0) {
+    if (!p.read_user_u64(attributes + 8, &capacity) || !p.read_user_u64(attributes + 16, &message_bytes)) return failure(kEfault2);
+    if (capacity == 0 || capacity > LinuxIpcManager::kNamedMessagesMax || message_bytes == 0 || message_bytes > LinuxIpcManager::kNamedMessageBytesMax) return failure(kEinval2);
+  }
+  UnixSocketManager::set_link_release_hook(UnixType::MessageQueue, mq_descriptor_gone);
+  uint64_t link = 0;
+  {
+    MqLocked locked(ipc->sync());
+    LinuxIpcManager::NamedQueue* queue = mq_by_name(*ipc, name, name_size);
+    if (queue) {
+      if ((flags & kCreate) && (flags & kExclusive)) return failure(kEexist2);
+    } else {
+      if (!(flags & kCreate)) return failure(kEnoent2);
+      for (LinuxIpcManager::NamedQueue& candidate : ipc->named)
+        if (!candidate.used) { queue = &candidate; break; }
+      if (!queue) return failure(kEnospc2);
+      UniquePointer<ByteBuffer> data = UniquePointer<ByteBuffer>::make(ipc->allocator(), ipc->allocator());
+      if (!data) return failure(kEnomem2);
+      const uint16_t sequence = queue->permission.sequence;
+      *queue = LinuxIpcManager::NamedQueue();
+      queue->permission.sequence = sequence;
+      queue->permission.mode = uint32_t(mode & 0777);
+      queue->used = true;
+      for (uint32_t i = 0; i < name_size; ++i) queue->name[i] = name[i];
+      queue->name_size = name_size;
+      queue->capacity = capacity;
+      queue->message_bytes = message_bytes;
+      queue->data = static_cast<UniquePointer<ByteBuffer>&&>(data);
+    }
+    ++queue->opens;      // (the descriptor's: taken back by mq_descriptor_gone, also when the descriptor cannot be made)
+    link = mq_link(*ipc, queue);
+  }
+  const uint64_t fd = open_linked(p, UnixType::MessageQueue, link, uint32_t(flags & kAccess), (flags & kCloseOnExec) != 0, (flags & kNonBlock) != 0);
+  if (int64_t(fd) < 0 && int64_t(fd) != -24) {
+    // (A descriptor that was made and could not be given a number, EMFILE, was let go again, which ran the hook. One that could not even be made did not.)
+    MqLocked locked(ipc->sync());
+    mq_descriptor_gone(link, 0);
+  }
+  return fd;
+}
+
+uint64_t sys_mq_unlink(Process& p, uint64_t name_address) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  char name[LinuxIpcManager::kQueueNameBytes] = {};
+  uint32_t name_size = 0;
+  if (const uint64_t r = read_queue_name(p, name_address, name, &name_size); r != 0) return r;
+  MqLocked locked(ipc->sync());
+  LinuxIpcManager::NamedQueue* queue = mq_by_name(*ipc, name, name_size);
+  if (!queue) return failure(kEnoent2);
+  queue->unlinked = true;
+  if (queue->opens == 0) mq_free(*queue);
+  return 0;
+}
+
+uint64_t sys_mq_timedsend(Process& p, uint64_t fd, uint64_t message, uint64_t size, uint64_t priority, uint64_t timeout) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  uint64_t link = 0;
+  uint32_t mode = 0;
+  bool non_blocking = false;
+  if (linked_of(p, fd, UnixType::MessageQueue, &link, &mode, &non_blocking) < 0 || mode == 0) return failure(kEbadf);
+  if (uint32_t(priority) >= kPriorityMax) return failure(kEinval2);
+  if (size > LinuxIpcManager::kNamedMessageBytesMax) return failure(kEmsgsize);
+  ByteBuffer text(ipc->allocator());
+  if (!text.put_zeros(size)) return failure(kEnomem2);
+  if (size != 0 && !p.read_user(message, text.writable_view())) return failure(kEfault2);
+  uint64_t wait_ns = 0;
+  if (const uint64_t r = read_deadline(p, timeout, &wait_ns); r != 0 && !non_blocking) return r;
+  uint64_t result = 0;
+  uint64_t notify_process = 0;
+  uint32_t notify_signal = 0;
+  const uint32_t outcome = system_wait(p, ipc->sync(), non_blocking ? 0 : wait_ns, [&]() -> bool {
+    LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+    if (!queue) { result = failure(kEbadf); return true; }
+    if (size > queue->message_bytes) { result = failure(kEmsgsize); return true; }
+    if (queue->messages >= queue->capacity) return false;
+    // After every message of this priority or a higher one: found by walking the records, which are in that order.
+    ByteBuffer& data = *queue->data;
+    uint64_t at = 0;
+    const ConstByteView bytes = data.view();
+    while (at + kMqRecordHead <= bytes.size()) {
+      ByteReader reader{bytes.subview(at, kMqRecordHead)};
+      const uint32_t record_priority = reader.le32(), record_size = reader.le32();
+      if (record_priority < uint32_t(priority)) break;
+      at += kMqRecordHead + record_size;
+    }
+    const uint64_t before = data.size(), added = kMqRecordHead + size;
+    if (!data.put_zeros(added)) { result = failure(kEnomem2); return true; }
+    ByteView all = data.writable_view();
+    for (uint64_t i = before; i > at; --i) all[i - 1 + added] = all[i - 1];      // (the lower priorities move up, from the end)
+    ByteWriter writer{all.subview(at, added)};
+    writer.le32(uint32_t(priority));
+    writer.le32(uint32_t(size));
+    writer.bytes(text.view());
+    // Whoever asked to be told about a message in the empty queue is told once, unless a receiver was already waiting for it.
+    if (queue->messages == 0 && queue->notify_process != 0 && queue->waiting_receivers == 0) {
+      notify_process = queue->notify_process;
+      notify_signal = queue->notify_signal;
+      queue->notify_process = 0;
+      queue->notify_signal = 0;
+    }
+    ++queue->messages;
+    ipc->sync().notify_all();
+    result = 0;
+    return true;
+  });
+  if (outcome == 1) return failure(non_blocking ? kEagain2 : kEtimedout);
+  if (outcome == 2) return failure(kEintr2);
+  if (result == 0 && notify_process != 0 && notify_signal != 0) {
+    if (notify_process == p.id()) raise_signal(p, notify_signal, 0, -3 /* SI_MESGQ */);
+    else if (p.runtime()) p.runtime()->send_signal(notify_process, notify_signal);
+  }
+  return result;
+}
+
+uint64_t sys_mq_timedreceive(Process& p, uint64_t fd, uint64_t message, uint64_t size, uint64_t priority_address, uint64_t timeout) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  uint64_t link = 0;
+  uint32_t mode = 0;
+  bool non_blocking = false;
+  if (linked_of(p, fd, UnixType::MessageQueue, &link, &mode, &non_blocking) < 0 || mode == 1) return failure(kEbadf);
+  uint64_t wait_ns = 0;
+  if (const uint64_t r = read_deadline(p, timeout, &wait_ns); r != 0 && !non_blocking) return r;
+  ByteBuffer text(ipc->allocator());
+  uint64_t result = 0;
+  uint32_t taken_priority = 0;
+  bool counted = false;
+  const uint32_t outcome = system_wait(p, ipc->sync(), non_blocking ? 0 : wait_ns, [&]() -> bool {
+    LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+    if (!queue) { result = failure(kEbadf); return true; }
+    if (counted) { counted = false; --queue->waiting_receivers; }
+    if (size < queue->message_bytes) { result = failure(kEmsgsize); return true; }      // (the buffer must take the largest message the queue can hold)
+    if (queue->messages == 0) {
+      counted = true;
+      ++queue->waiting_receivers;
+      return false;
+    }
+    ByteBuffer& data = *queue->data;
+    ByteReader reader{data.view().first(kMqRecordHead)};
+    taken_priority = reader.le32();
+    const uint64_t record_size = reader.le32();
+    text.clear();
+    if (!text.append(data.view().subview(kMqRecordHead, record_size))) { result = failure(kEnomem2); return true; }
+    ByteView all = data.writable_view();
+    const uint64_t gone = kMqRecordHead + record_size;
+    for (uint64_t i = 0; i + gone < all.size(); ++i) all[i] = all[i + gone];
+    data.truncate(all.size() - gone);
+    --queue->messages;
+    ipc->sync().notify_all();
+    result = record_size;
+    return true;
+  });
+  if (outcome != 0) {
+    MqLocked locked(ipc->sync());
+    if (counted)
+      if (LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link); queue && queue->waiting_receivers > 0) --queue->waiting_receivers;
+    return failure(outcome == 2 ? kEintr2 : non_blocking ? kEagain2 : kEtimedout);
+  }
+  if (int64_t(result) < 0) return result;
+  if (result != 0 && !p.write_user(message, text.view())) return failure(kEfault2);
+  if (priority_address != 0) {
+    uint8_t raw[4];
+    ByteWriter writer{ByteView(raw, sizeof(raw))};
+    writer.le32(taken_priority);
+    if (!p.write_user(priority_address, ConstByteView(raw, sizeof(raw)))) return failure(kEfault2);
+  }
+  return result;
+}
+
+// mq_notify(fd, struct sigevent*): one process at a time may ask to be told, once, when a message comes to the empty queue. Null takes the request back.
+uint64_t sys_mq_notify(Process& p, uint64_t fd, uint64_t event) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  uint64_t link = 0;
+  uint32_t mode = 0;
+  if (linked_of(p, fd, UnixType::MessageQueue, &link, &mode) < 0) return failure(kEbadf);
+  uint32_t signal = 0, notify = 0;
+  if (event != 0) {
+    uint8_t raw[16];
+    if (!p.read_user(event, ByteView(raw, sizeof(raw)))) return failure(kEfault2);
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    reader.skip(8);
+    signal = reader.le32();
+    notify = reader.le32();
+    // (SIGEV_THREAD is done by the C library with a socket of a kind that is not here: it is refused, and the library reports that)
+    if (notify != 0 && notify != 1) return failure(kEinval2);
+    if (notify == 0 && (signal == 0 || signal > 64)) return failure(kEinval2);
+  }
+  MqLocked locked(ipc->sync());
+  LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+  if (!queue) return failure(kEbadf);
+  if (event == 0) {
+    if (queue->notify_process == p.id()) { queue->notify_process = 0; queue->notify_signal = 0; }
+    return 0;
+  }
+  if (queue->notify_process != 0) return failure(kEbusy);
+  queue->notify_process = p.id();
+  queue->notify_signal = notify == 0 ? signal : 0;
+  return 0;
+}
+
+uint64_t sys_mq_getsetattr(Process& p, uint64_t fd, uint64_t new_attributes, uint64_t old_attributes) {
+  constexpr uint64_t kNonBlock = 0x800;
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return failure(kEnosys2);
+  uint64_t link = 0;
+  uint32_t mode = 0;
+  bool non_blocking = false;
+  if (linked_of(p, fd, UnixType::MessageQueue, &link, &mode, &non_blocking) < 0) return failure(kEbadf);
+  uint64_t new_flags = 0;
+  if (new_attributes != 0) {
+    if (!p.read_user_u64(new_attributes, &new_flags)) return failure(kEfault2);
+    if (new_flags & ~kNonBlock) return failure(kEinval2);
+  }
+  if (old_attributes != 0) {
+    uint8_t raw[64] = {};
+    ByteWriter writer{ByteView(raw, sizeof(raw))};
+    {
+      MqLocked locked(ipc->sync());
+      const LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
+      if (!queue) return failure(kEbadf);
+      writer.le64(non_blocking ? kNonBlock : 0);
+      writer.le64(queue->capacity);
+      writer.le64(queue->message_bytes);
+      writer.le64(queue->messages);
+    }
+    if (!p.write_user(old_attributes, ConstByteView(raw, sizeof(raw)))) return failure(kEfault2);
+  }
+  if (new_attributes != 0) set_linked_non_blocking(p, fd, (new_flags & kNonBlock) != 0);
+  return 0;
+}
+
+}  // namespace process::linuxabi

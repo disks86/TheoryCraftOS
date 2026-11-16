@@ -96,6 +96,44 @@ UnixStatus UnixSocketManager::create_signal(uint64_t owner_pid, uint32_t* id) {
   return make_locked(UnixType::Signal, owner_pid, id);
 }
 
+namespace {
+// What to call when the last descriptor of a linked kind is gone: one for each kind (0x46 ..), set once by the code that owns the kind.
+constexpr uint32_t kLinkedKinds = 3;
+UnixSocketManager::LinkReleased g_link_released[kLinkedKinds] = {};
+uint32_t linked_index(UnixType type) { return uint32_t(type) - uint32_t(UnixType::MessageQueue); }
+}  // namespace
+
+void UnixSocketManager::set_link_release_hook(UnixType type, LinkReleased hook) {
+  if (unix_type_is_linked(type)) __atomic_store_n(&g_link_released[linked_index(type)], hook, __ATOMIC_RELEASE);
+}
+
+UnixStatus UnixSocketManager::create_linked(UnixType type, uint64_t owner_pid, uint64_t link, uint32_t mode, uint32_t* id) {
+  if (!unix_type_is_linked(type)) return UnixStatus::Invalid;
+  Hold hold(sync_);
+  const UnixStatus st = make_locked(type, owner_pid, id);
+  if (st != UnixStatus::Ok) return st;
+  Socket* s = at(*id);
+  s->link = link;
+  s->link_mode = mode;
+  return UnixStatus::Ok;
+}
+
+bool UnixSocketManager::linked_locked(uint32_t id, UnixType* type, uint64_t* link, uint32_t* mode) const {
+  const Socket* s = at(id);
+  if (!s || !unix_type_is_linked(s->type)) return false;
+  *type = s->type;
+  *link = s->link;
+  *mode = s->link_mode;
+  return true;
+}
+
+void UnixSocketManager::set_link_ready_locked(uint32_t id, bool readable, bool writable) {
+  Socket* s = at(id);
+  if (!s || !unix_type_is_linked(s->type)) return;
+  s->link_readable = readable;
+  s->link_writable = writable;
+}
+
 bool UnixSocketManager::timer_state_locked(uint32_t id, uint32_t* clock, uint64_t* deadline, uint64_t* interval) const {
   const Socket* s = at(id);
   if (!s || s->type != UnixType::Timer) return false;
@@ -240,6 +278,8 @@ void UnixSocketManager::release_locked(uint32_t id) {
   Socket* s = at(id);
   if (!s || --s->references != 0) return;
   if (s->type == UnixType::FifoEnd) fifo_end_gone_locked(*s);      // (its pipe loses a reader or writer, and the use the end had of it)
+  if (unix_type_is_linked(s->type))
+    if (const LinkReleased hook = __atomic_load_n(&g_link_released[linked_index(s->type)], __ATOMIC_ACQUIRE)) hook(s->link, s->link_mode);
   // Connections that were never accepted: their clients see the connection reset.
   uint32_t pending = 0;
   while (s->backlog.dequeue(&pending)) {
@@ -604,6 +644,11 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
   }
   if (s->type == UnixType::Timer) {
     r.readable = s->counter > 0;      // (as of the last timer_advance_locked)
+    return r;
+  }
+  if (unix_type_is_linked(s->type)) {      // (as its owner last said)
+    r.readable = s->link_readable;
+    r.writable = s->link_writable;
     return r;
   }
   if (s->type == UnixType::FifoEnd) {      // (Linux's pipe_poll)

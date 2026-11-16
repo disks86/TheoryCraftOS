@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/UnixSockets.hpp"
 
 // The Linux socket system calls, for AF_UNIX sockets (UnixSockets.hpp: the same sockets Windows programs use, so the two can talk). Other families answer
 // EAFNOSUPPORT. Each returns the value for the result register: the result, or -errno. Signals are not delivered here, so a send to a closed connection is
@@ -37,6 +38,12 @@ bool is_pipe_descriptor(Process& p, uint64_t fd);
 // F_GETFL's access mode of a FIFO's end (0 O_RDONLY, 1 O_WRONLY, 2 O_RDWR); -1 for anything else.
 int fifo_access_mode(Process& p, uint64_t fd);
 uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags);      // (eventfd(initial) is eventfd2(initial, 0))
+// Descriptors for things kept elsewhere (UnixSockets.hpp: create_linked): a POSIX message queue, a process (pidfd), a set of inotify watches.
+// A new one for `link`: the descriptor, or -errno (the owner's release hook has run then).
+uint64_t open_linked(Process& p, UnixType type, uint64_t link, uint32_t mode, bool close_on_exec, bool non_blocking);
+// What `fd` refers to if it is one of `wanted`: 0, or -errno (EBADF).
+int64_t linked_of(Process& p, uint64_t fd, UnixType wanted, uint64_t* link, uint32_t* mode, bool* non_blocking = nullptr);
+void set_linked_non_blocking(Process& p, uint64_t fd, bool on);
 uint64_t sys_timerfd_create(Process& p, uint64_t clock, uint64_t flags);
 uint64_t sys_timerfd_settime(Process& p, uint64_t fd, uint64_t flags, uint64_t value, uint64_t old);
 uint64_t sys_timerfd_gettime(Process& p, uint64_t fd, uint64_t current);

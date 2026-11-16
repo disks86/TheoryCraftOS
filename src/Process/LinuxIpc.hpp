@@ -92,6 +92,26 @@ class LinuxIpcManager {
     uint32_t last_sender = 0, last_receiver = 0;
   };
 
+  // A POSIX message queue (mq_open): found by name until it is unlinked, there until its last descriptor is closed. Its messages lie in `data` in the
+  // order they come out (highest priority first, the oldest first among equals): the priority (4 bytes), the size (4 bytes), the text.
+  static constexpr uint32_t kNamedQueues = 32, kQueueNameBytes = 64;
+  static constexpr uint64_t kNamedMessagesMax = 256, kNamedMessageBytesMax = 16384, kNamedMessagesDefault = 10, kNamedMessageBytesDefault = 8192;
+  struct NamedQueue {
+    bool used = false;
+    bool unlinked = false;
+    Permission permission;      // (only the mode and the sequence number are used)
+    char name[kQueueNameBytes] = {};
+    uint32_t name_size = 0;
+    uint32_t opens = 0;         // descriptors there are for it
+    uint64_t capacity = kNamedMessagesDefault, message_bytes = kNamedMessageBytesDefault, messages = 0;
+    UniquePointer<ByteBuffer> data;
+    uint32_t waiting_receivers = 0;      // threads in mq_receive (a message that comes for one of them is no news for mq_notify)
+    // mq_notify: the process to tell when a message comes to the empty queue (0: nobody), and with which signal (0: SIGEV_NONE, only the registration)
+    uint64_t notify_process = 0;
+    uint32_t notify_signal = 0;
+  };
+  NamedQueue named[kNamedQueues];
+
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];
   Undo undos[kUndos];
@@ -121,6 +141,15 @@ uint64_t sys_msgget(Process& p, uint64_t key, uint64_t flags);
 uint64_t sys_msgsnd(Process& p, uint64_t id, uint64_t message, uint64_t size, uint64_t flags);
 uint64_t sys_msgrcv(Process& p, uint64_t id, uint64_t message, uint64_t size, uint64_t type, uint64_t flags);
 uint64_t sys_msgctl(Process& p, uint64_t id, uint64_t command, uint64_t buffer);
+// POSIX message queues. The name is as the C library hands it on (without the leading slash); a queue's descriptor can be polled.
+uint64_t sys_mq_open(Process& p, uint64_t name, uint64_t flags, uint64_t mode, uint64_t attributes);
+uint64_t sys_mq_unlink(Process& p, uint64_t name);
+uint64_t sys_mq_timedsend(Process& p, uint64_t fd, uint64_t message, uint64_t size, uint64_t priority, uint64_t timeout);
+uint64_t sys_mq_timedreceive(Process& p, uint64_t fd, uint64_t message, uint64_t size, uint64_t priority, uint64_t timeout);
+uint64_t sys_mq_notify(Process& p, uint64_t fd, uint64_t event);
+uint64_t sys_mq_getsetattr(Process& p, uint64_t fd, uint64_t new_attributes, uint64_t old_attributes);
+// For poll() (the system's lock held): can a message be taken from the queue behind a descriptor, and can one be put in?
+void mq_readiness_locked(uint64_t link, uint32_t mode, bool* readable, bool* writable);
 // A Linux process ended: its semaphore operations made with SEM_UNDO are taken back.
 void ipc_process_gone(uint64_t pid);
 

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxSockets.hpp"
+#include "Process/LinuxIpc.hpp"
 #include "Process/LinuxFiles.hpp"
 #include "Process/UnixSockets.hpp"
 #include "ObjectContainer/List.hpp"
@@ -518,12 +519,27 @@ void advance_timer_locked(Process& p, UnixSocketManager& m, uint32_t id, uint64_
   if (at < *due) *due = at;
 }
 
+// A linked descriptor (a message queue, a pidfd, an inotify instance) brought up to now (the lock held): its owner is asked whether it is ready.
+void refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
+  UnixType type;
+  uint64_t link = 0;
+  uint32_t mode = 0;
+  if (!m.linked_locked(id, &type, &link, &mode)) return;
+  bool readable = false, writable = false;
+  switch (type) {
+    case UnixType::MessageQueue: mq_readiness_locked(link, mode, &readable, &writable); break;
+    default: break;
+  }
+  m.set_link_ready_locked(id, readable, writable);
+}
+
 // What poll() reports for one descriptor, for the events asked for (the lock held). Sockets report their state; anything else is ready. A timer is
 // advanced first, and *due notes when it fires next.
 uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, uint16_t events, uint64_t* due) {
   if (w.kind == DescriptorKind::Closed) return kPollNval;
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
   advance_timer_locked(p, *m, w.id, due);
+  refresh_linked_locked(p, *m, w.id);
   const UnixReadiness r = m->readiness_locked(w.id);
   uint16_t out = 0;
   if (r.readable) out |= events & (kPollIn | kPollRdNorm);
@@ -1464,10 +1480,36 @@ bool is_pipe_descriptor(Process& p, uint64_t fd) {
   return s.m->is_pipe_locked(s.id);
 }
 
+uint64_t open_linked(Process& p, UnixType type, uint64_t link, uint32_t mode, bool close_on_exec, bool non_blocking) {
+  UnixSocketManager* m = system_unix_sockets();
+  if (!m) return error(kEnomem);
+  uint32_t id = 0;
+  if (const UnixStatus st = m->create_linked(type, p.id(), link, mode, &id); st != UnixStatus::Ok) return result_of(st);
+  return give_fd(p, *m, id, close_on_exec, non_blocking);
+}
+
+int64_t linked_of(Process& p, uint64_t fd, UnixType wanted, uint64_t* link, uint32_t* mode, bool* non_blocking) {
+  Sock s;
+  if (socket_of(p, fd, &s) < 0) return -kEbadf;
+  Hold hold(*s.m);
+  UnixType type;
+  if (!s.m->linked_locked(s.id, &type, link, mode) || type != wanted) return -kEbadf;
+  if (non_blocking) *non_blocking = s.m->non_blocking_locked(s.id);
+  return 0;
+}
+
+void set_linked_non_blocking(Process& p, uint64_t fd, bool on) {
+  Sock s;
+  if (socket_of(p, fd, &s) < 0) return;
+  Hold hold(*s.m);
+  s.m->set_non_blocking_locked(s.id, on);
+}
+
 uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   Sock s;
   if (socket_of(p, fd, &s) == 0) {
     switch (type_of(s)) {
+      case UnixType::MessageQueue: case UnixType::Pidfd: return error(kEinval);      // (not read from: they have calls of their own)
       case UnixType::Event: return event_read(p, s, buffer, count);
       case UnixType::Timer: return timer_read(p, s, buffer, count);
       case UnixType::FifoEnd: return fifo_read(p, s, buffer, count > kMaxIoBytes ? kMaxIoBytes : count);
