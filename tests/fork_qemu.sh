@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # fork(), wait and signals with their handlers on the real kernel under QEMU. Four programs are put at /Linux/usr/bin/forktest in turn and started by the
 # kernel's autorun: tests/linux/forktest.c and signaltest.c (static, no libc: the calls themselves, handlers entered after calls, at timer ticks and on
-# faults) and spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
-# a SIGCHLD handler). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
+# faults), spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
+# a SIGCHLD handler) and ipctest.c (static, glibc: System V IPC, POSIX message queues and timers, inotify, pidfd, asynchronous I/O). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
 # Then signaltest.c as an AArch64, a RISC-V and a LoongArch program, which the kernel runs on its CPU emulator.
 # Uses its own build folder (build-fork-qemu) so the normal build keeps no autorun.
 set -euo pipefail
@@ -13,7 +13,7 @@ rm -rf "$work"; mkdir -p "$work"
 for program in forktest signaltest; do
   gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/$program" "tests/linux/$program.c"
 done
-for program in spawntest handlertest; do
+for program in spawntest handlertest ipctest; do
   gcc -static -O1 -pthread -o "$work/$program" "tests/linux/$program.c" 2>/dev/null
 done
 cmake -S . -B "$build" -G Ninja -DTCOS_AUTORUN=/Linux/usr/bin/forktest >/dev/null
@@ -41,13 +41,13 @@ run_one() {
   grep -a -q -E "autorun: ended, result 0, exit code 0x0+( |$)" "$build/debugcon.log" || status=1
 }
 # Each program in turn is the one the kernel starts (at the autorun's path), after it ran here for what it should print.
-for program in forktest signaltest spawntest handlertest; do
+for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
   (cd "$work" && "./$program" > "$program-expected.txt")
   run_one "$program" "$work/$program" "$work/$program-expected.txt" "on Linux"
 done
 # The same signal program built for the other CPUs runs on the kernel's CPU emulator (checked-in builds and what they print under qemu's user mode:
 # tests/linux/build_signaltest.sh).
-for cpu in aarch64 riscv64 loongarch64; do
+for cpu in ${EMULATED-aarch64 riscv64 loongarch64}; do
   run_one "signals-$cpu (emulated)" "tests/data/emulation/signals-$cpu.elf" "tests/data/emulation/signals-$cpu-expected.txt" "under qemu-$cpu"
 done
 [ $status -eq 0 ] && echo "fork qemu: passed" || echo "fork qemu: FAILED"

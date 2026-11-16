@@ -333,7 +333,8 @@ static void test_linux_generic_table() {
   Process p(3, binding_for(SyscallAbi::Linux, UserArch::AArch64), mem, host);
   mem.put(kBase, "hi");
   CHECK(p.syscall(req(64, 1, kBase, 2)) == 2 && host.out == "hi");        // write is 64 here, 1 on x86-64
-  CHECK(sres(p.syscall(req(1, 1, kBase, 2))) == -38);                     // x86-64's number means nothing here
+  CHECK(sres(p.syscall(req(1, 1, kBase, 2))) == -22 && host.out == "hi");   // x86-64's number is another call here (io_destroy: no such context)
+  CHECK(sres(p.syscall(req(244, 1, kBase, 2))) == -38);                   // and a number that is no call at all
   CHECK(p.syscall(req(172)) == 3);
   CHECK(p.syscall(req(160, kBase + 0x100)) == 0 && std::string((const char*)&mem.bytes[0x100 + 65 * 4]) == "aarch64");
   CHECK(p.syscall(req(113, 0, kBase + 0x200)) == 0 && mem.get64(kBase + 0x200) == 1700000000);

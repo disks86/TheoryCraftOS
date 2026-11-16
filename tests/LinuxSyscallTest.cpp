@@ -2491,6 +2491,12 @@ static void test_inotify() {
     CHECK(gone == 5 && rig.s(84, rig.str("/tmp/gone")) == 0);
     got = events(fd);
     CHECK(got.size() == 3 && got[0].wd == 1 && got[0].mask == (kDelete | kIsDir) && got[1].wd == 5 && got[1].mask == kDeleteSelf && got[2].wd == 5 && got[2].mask == kIgnored);
+    // ... also when the same read has what happened in it before
+    CHECK(rig.s(83, rig.str("/tmp/gone2"), 0755) == 0);
+    events(fd);
+    CHECK(rig.s(254, fd, rig.str("/tmp/gone2"), kAll) == 6 && touch(rig, "/tmp/gone2/f") && rig.s(87, rig.str("/tmp/gone2/f")) == 0 && rig.s(84, rig.str("/tmp/gone2")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 5 && got[0].wd == 1 && got[1].wd == 6 && got[1].mask == kCreate && got[2].mask == kDelete && got[3].wd == 6 && got[3].mask == kDeleteSelf && got[4].mask == kIgnored);
     // reading: whole events as far as they fit, EINVAL for a buffer that takes none, a wait for the next one
     CHECK(touch(rig, "/tmp/first-name") && touch(rig, "/tmp/second"));
     CHECK(rig.s(0, fd, buf, 15) == -22 && rig.s(0, fd, buf, 16) == -22);
@@ -2565,6 +2571,29 @@ static void test_generic_numbers() {
   }
 }
 
+// Every system call Linux has (as of 6.18: tests/linux has no list of its own, the ranges are those of <asm/unistd_64.h> and <asm-generic/unistd.h>) is
+// in the table of its CPU: implemented, or with the answer a Linux kernel without that part gives. A number that is no call is not.
+static void test_every_call_is_known() {
+  struct Range { uint64_t first, last; };
+  const Range x86[] = {{0, 336}, {424, 472}}, generic[] = {{0, 243}, {260, 294}, {424, 472}};
+  int known = 0;
+  for (const Range& r : x86)
+    for (uint64_t n = r.first; n <= r.last; ++n) { CHECK(linuxabi::call_known(UserArch::X86_64, n)); ++known; }
+  CHECK(known == 386);
+  for (const UserArch arch : {UserArch::AArch64, UserArch::RiscV64, UserArch::LoongArch64}) {
+    known = 0;
+    for (const Range& r : generic)
+      for (uint64_t n = r.first; n <= r.last; ++n) {
+        if (!linuxabi::call_known(arch, n)) printf("  generic call %llu is not in the table\n", (unsigned long long)n);
+        CHECK(linuxabi::call_known(arch, n));
+        ++known;
+      }
+    CHECK(known == 328);
+    for (const uint64_t n : {244ull, 259ull, 295ull, 402ull, 423ull, 473ull, 100000ull, ~0ull}) CHECK(!linuxabi::call_known(arch, n));
+  }
+  for (const uint64_t n : {337ull, 400ull, 423ull, 473ull, 512ull, ~0ull}) CHECK(!linuxabi::call_known(UserArch::X86_64, n));
+}
+
 // Pointers and sizes a hostile program would pass: nothing may crash, read or write outside the program's memory.
 static void test_hostile_arguments() {
   filesystem::RamFileSystem fs(A);
@@ -2609,7 +2638,7 @@ int main(int argc, char** argv) {
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
       {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io}, {"inotify", test_inotify},
-      {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
+      {"every call is known", test_every_call_is_known}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {
     if (verbose) { printf("%s\n", test.name); fflush(stdout); }

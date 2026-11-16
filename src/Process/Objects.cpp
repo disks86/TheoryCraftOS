@@ -2691,7 +2691,7 @@ void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t actio
     const StringView watched(w.path, w.path_size);
     uint64_t start = 0;
     if (!watch_covers(watched, w.subtree, changed_path, &start)) {
-      if (action == 2 /* FILE_ACTION_REMOVED */ && (filter_mask & kChangeDirName) && changed_path == watched) { o.signaled = true; any = true; }      // (the watched directory itself is gone)
+      if (action == 2 /* FILE_ACTION_REMOVED */ && (filter_mask & kChangeDirName) && changed_path == watched) { o.signaled = true; w.removed = true; any = true; }      // (the watched directory itself is gone)
       continue;
     }
     if (filter_mask != 0 && (w.filter & filter_mask) == 0) continue;
@@ -2824,17 +2824,19 @@ bool ObjectManager::take_watch_records_locked(uint32_t id, WatchRecord* out, uin
   return true;
 }
 
-bool ObjectManager::drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* fired) {
+bool ObjectManager::drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* removed) {
   *count = 0;
-  *overflow = *fired = false;
+  *overflow = *removed = false;
   Object* o = at(id);
   if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
   Watch& w = watches_[o->watch];
-  *fired = o->signaled;
   *overflow = w.overflow;
   w.overflow = false;
   take_watch_records_locked(id, out, capacity, count);
-  if (w.record_count == 0) o->signaled = false;
+  if (w.record_count == 0) {      // (everything it had is out: now, and not before, the reader hears that the directory is gone)
+    *removed = w.removed;
+    o->signaled = false;
+  }
   return true;
 }
 

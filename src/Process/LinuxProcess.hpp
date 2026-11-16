@@ -66,6 +66,8 @@ struct InterruptedCall {
   uint64_t first_argument = 0;      // (AArch64, RISC-V and LoongArch: the call's result is in the register its first argument was in)
 };
 bool call_restarts(UserArch arch, const SyscallRequest& request);
+// Is this number a system call of this CPU's table (whatever it answers)? For the test that the table has every call Linux has.
+bool call_known(UserArch arch, uint64_t number);
 // Acts on the signals that are pending for the calling thread, whose registers are `context`: default actions are carried out (the process may have ended
 // when this returns), and the first signal with a handler has its frame written to the thread's stack and `context` pointed at the handler. `call`: the
 // system call being returned from (its result is in the context), or null. True if `context` changed.

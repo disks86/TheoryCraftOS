@@ -369,9 +369,9 @@ class ObjectManager {
   // Is any change notification being watched at all? (No lock: for whoever makes changes very often, a Linux program's write(), to skip the rest.)
   bool any_watches() const { return __atomic_load_n(&live_watches_, __ATOMIC_RELAXED) != 0; }
   // For a reader that takes everything a watch has (inotify), the system's lock held: its records as take_watch_records_locked, whether changes were lost
-  // for want of room (*overflow, cleared), and whether it fired at all since the last call (*fired: true without records and without an overflow means the
-  // watched directory itself went away). The watch is not signalled afterwards. False if `id` is no change notification.
-  bool drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* fired);
+  // for want of room (*overflow, cleared), and whether the watched directory itself was removed (*removed). The watch is not signalled afterwards. False
+  // if `id` is no change notification.
+  bool drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* removed);
   // Has that watch anything for such a reader (the system's lock held)?
   bool watch_has_news_locked(uint32_t id);
 
@@ -551,6 +551,7 @@ class ObjectManager {
     WatchRecord records[kMaxWatchRecords];      // a ring, oldest first: ReadDirectoryChangesW's own queue (a plain FindFirstChangeNotification watch never drains it)
     uint32_t record_head = 0, record_count = 0;
     bool overflow = false, want_data = true, owes_ack = false;
+    bool removed = false;      // the watched directory itself was removed
     uint32_t waiters = 0;
     uint32_t event_object = 0;      // a registry watch of the kernel: the event it signals once (0: none), and the process it belongs to
     uint64_t owner = 0;

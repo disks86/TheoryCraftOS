@@ -864,9 +864,11 @@ static void test_linux_thread_pointer_and_startup_calls() {
   CHECK(sres(p.syscall(lin(318, 0xDEAD0000, 16, 0))) == -14);
   host.give_random = false;
   CHECK(sres(p.syscall(lin(318, 0x10600, 16, 0))) == -38);
-  // A call this OS lacks (io_uring_setup) is reported to the host; one only an administrator makes (reboot) is refused.
-  CHECK(sres(p.syscall(lin(425, 0, 0, 0))) == -38 && host.unhandled == 425);
-  CHECK(sres(p.syscall(lin(169, 0, 0, 0))) == -1 && host.unhandled == 425);
+  // A number that is no call is reported to the host; a part of Linux that is not here (io_uring_setup) answers ENOSYS without a report; a call only an
+  // administrator makes (reboot) is refused.
+  CHECK(sres(p.syscall(lin(400, 0, 0, 0))) == -38 && host.unhandled == 400);
+  CHECK(sres(p.syscall(lin(425, 0, 0, 0))) == -38 && host.unhandled == 400);
+  CHECK(sres(p.syscall(lin(169, 0, 0, 0))) == -1 && host.unhandled == 400);
   // The generic table has its own numbers and no arch_prctl.
   Process g(2, ProcessBinding{SyscallAbi::Linux, UserArch::AArch64, syscall_interface(SyscallAbi::Linux, UserArch::AArch64)}, s, host);
   CHECK(g.syscall(lin(158, 0x1002, 0x7000)) == 0 && g.syscall(lin(173)) == 0 && g.syscall(lin(169, 0x10500, 0)) == 0);      // (158 is getgroups there: no groups, nothing written)

@@ -950,6 +950,8 @@ bool call_restarts(UserArch arch, const SyscallRequest& request) {
   }
 }
 
+bool call_known(UserArch arch, uint64_t number) { return translate(arch, number) != Call::None; }
+
 uint64_t map_user_memory(Process& process, uint64_t bytes) {
   const uint64_t r = do_mmap(process, 0, bytes, kProtRead | kProtWrite, kMapPrivate | kMapAnonymous, ~uint64_t{0}, 0);
   return r > ~uint64_t{4095} ? 0 : r;      // (-errno is a failure)

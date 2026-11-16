@@ -83,11 +83,10 @@ void collect_locked(LinuxIpcManager& ipc, LinuxIpcManager::InotifyInstance& inst
     if (!watch.used || watch.instance != link) continue;
     ObjectManager::WatchRecord records[ObjectManager::kMaxWatchRecords];
     uint32_t count = 0;
-    bool overflow = false, fired = false;
-    if (!objects->drain_watch_locked(watch.object, records, ObjectManager::kMaxWatchRecords, &count, &overflow, &fired)) continue;
+    bool overflow = false, removed = false;
+    if (!objects->drain_watch_locked(watch.object, records, ObjectManager::kMaxWatchRecords, &count, &overflow, &removed)) continue;
     if (overflow) instance.overflowed = true;
-    bool gone = fired && count == 0 && !overflow && !watch.on_file;      // (fired with nothing to show: the watched folder itself was removed)
-    bool told = false;
+    bool gone = false, told = false;
     for (uint32_t i = 0; i < count && !gone; ++i) {
       const ObjectManager::WatchRecord& record = records[i];
       const StringView name(record.name, record.name_size);
@@ -117,7 +116,10 @@ void collect_locked(LinuxIpcManager& ipc, LinuxIpcManager::InotifyInstance& inst
       told = true;
       if (watch.mask & kInOneShot) break;      // (one event, and the watch is over)
     }
-    if (gone && !watch.on_file && (watch.mask & kInDeleteSelf)) queue_event(instance, watch.descriptor, kInDeleteSelf, 0, StringView());
+    if (removed && !watch.on_file && !gone) {      // the watched folder itself was removed (told after what happened in it)
+      gone = true;
+      if (watch.mask & kInDeleteSelf) queue_event(instance, watch.descriptor, kInDeleteSelf, 0, StringView());
+    }
     if (gone || (told && (watch.mask & kInOneShot))) {
       queue_event(instance, watch.descriptor, kInIgnored, 0, StringView());
       drop_watch_locked(watch);
