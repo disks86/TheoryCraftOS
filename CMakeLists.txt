@@ -880,6 +880,7 @@ add_executable(BOOTX64
   src/Process/LinuxSockets.cpp
   src/Process/LinuxThreads.cpp
   src/Process/LinuxProcess.cpp
+  src/Process/LinuxMisc.cpp
   src/Process/LinuxSignals.cpp
   src/Process/ProcessFiles.cpp
   src/Process/WindowsFiles.cpp

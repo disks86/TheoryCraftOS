@@ -97,6 +97,12 @@ uint64_t sys_rt_sigreturn(Process& p);
 uint64_t sys_alarm(Process& p, uint64_t seconds);
 uint64_t sys_getitimer(Process& p, uint64_t which, uint64_t value);
 uint64_t sys_setitimer(Process& p, uint64_t which, uint64_t value, uint64_t old_value);
+// POSIX timers: they raise their signal (SIGEV_SIGNAL, SIGEV_THREAD_ID) or only keep time (SIGEV_NONE). Looked at where the interval timers are.
+uint64_t sys_timer_create(Process& p, uint64_t clock, uint64_t event, uint64_t id_address);
+uint64_t sys_timer_settime(Process& p, uint64_t id, uint64_t flags, uint64_t value, uint64_t old_value);
+uint64_t sys_timer_gettime(Process& p, uint64_t id, uint64_t value);
+uint64_t sys_timer_getoverrun(Process& p, uint64_t id);
+uint64_t sys_timer_delete(Process& p, uint64_t id);
 
 // --- fork and wait ---------------------------------------------------------------------------------------------------------------------------------------
 // fork() makes a second process that is a copy of the first: its memory (copied at once, page by page: there is no copy-on-write), its descriptors (the open
@@ -149,6 +155,23 @@ uint64_t sys_getcpu(Process& p, uint64_t cpu, uint64_t node);
 uint64_t sys_personality(Process& p, uint64_t persona);
 uint64_t sys_prctl(Process& p, UserArch arch, uint64_t option, uint64_t a, uint64_t b);
 uint64_t sys_membarrier(Process& p, uint64_t command, uint64_t flags);
+
+// --- LinuxMisc.cpp: calls that have little to do here but answer as a Linux kernel on such a machine would
+// Memory policy on a machine with one memory node: every policy is accepted and comes to the same; a node other than 0 is refused.
+uint64_t sys_get_mempolicy(Process& p, uint64_t mode, uint64_t nodemask, uint64_t max_node, uint64_t address, uint64_t flags);
+uint64_t sys_set_mempolicy(Process& p, uint64_t mode, uint64_t nodemask, uint64_t max_node);
+uint64_t sys_mbind(Process& p, uint64_t address, uint64_t length, uint64_t mode, uint64_t nodemask, uint64_t max_node, uint64_t flags);
+uint64_t sys_set_mempolicy_home_node(Process& p, uint64_t address, uint64_t length, uint64_t node, uint64_t flags);
+uint64_t sys_migrate_pages(Process& p, uint64_t pid, uint64_t max_node, uint64_t old_nodes, uint64_t new_nodes);
+uint64_t sys_move_pages(Process& p, uint64_t pid, uint64_t count, uint64_t pages, uint64_t nodes, uint64_t status, uint64_t flags);
+// Protection keys: none to be had (ENOSPC, as on a processor without them); pkey_mprotect with key -1 is mprotect (LinuxSyscalls.cpp).
+uint64_t sys_pkey_alloc(Process& p, uint64_t flags, uint64_t access);
+uint64_t sys_pkey_free(Process& p, uint64_t key);
+// kcmp: for the calling process only. KCMP_FILE tells whether two descriptors are one open file (0), or orders them (1, 2).
+uint64_t sys_kcmp(Process& p, uint64_t pid1, uint64_t pid2, uint64_t type, uint64_t index1, uint64_t index2);
+// process_vm_readv / process_vm_writev: within the calling process; another process's memory is EPERM.
+uint64_t sys_process_vm(Process& p, uint64_t pid, uint64_t local, uint64_t local_count, uint64_t remote, uint64_t remote_count, uint64_t flags, bool write);
+uint64_t sys_cachestat(Process& p, uint64_t fd, uint64_t range, uint64_t out, uint64_t flags);
 uint64_t sys_set_robust_list(Process& p, uint64_t head, uint64_t size);
 uint64_t sys_get_robust_list(Process& p, uint64_t pid, uint64_t head_at, uint64_t size_at);
 // The CPU time of the process (`thread` false) or of the calling thread, in nanoseconds (0 where nothing counts it).

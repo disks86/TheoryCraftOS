@@ -393,9 +393,9 @@ class Process {
 
   // --- Linux threads (clone, futex). The table lives here; the runtime starts the CPU threads. All of it is touched with the process lock held.
   struct LinuxThreadState {
-    static constexpr uint32_t kMaxThreads = 64, kMaxWaiters = 64;
+    static constexpr uint32_t kMaxThreads = 64, kMaxWaiters = 256;      // (a thread in futex_waitv takes a waiter for each of its words)
     struct Thread { uint64_t tid = 0, clear_child_tid = 0; bool used = false; };
-    struct Waiter { uint64_t address = 0; uint32_t bitset = 0; bool used = false, woken = false; };
+    struct Waiter { uint64_t address = 0; uint32_t bitset = 0; bool used = false, woken = false; uint64_t owner = 0; uint32_t index = 0; };      // (owner, index: futex_waitv, the thread that waits and which of its words this is)
     // clone() decided to make a thread: the runtime copies the calling thread's registers for it (see take_clone).
     struct CloneRequest { bool pending = false; uint64_t tid = 0, stack = 0, tls = 0; bool set_tls = false; };
     Thread threads[kMaxThreads];

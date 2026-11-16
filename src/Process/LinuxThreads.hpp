@@ -30,9 +30,14 @@ namespace linuxabi {
 uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* args);
 // clone3(struct clone_args*, size), what glibc tries first: the same threads and forks as sys_clone (EINVAL for a pidfd, set_tid or a cgroup).
 uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size);
-//   futex: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI (no priority is lent; the private
-//   flag ignored); the rest (the requeue-PI pair, WAKE_OP) is -ENOSYS.
+//   futex: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, WAKE_OP, LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI (no priority is lent;
+//   the private flag ignored); the requeue-PI pair is -ENOSYS (no C library has used it for years).
 uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, uint64_t timeout_or_count, uint64_t address2, uint64_t value3);
+// The newer calls, one for each operation: a wait for any of several words (futex_waitv), and wake, wait and requeue with flags for each futex.
+uint64_t sys_futex_waitv(Process& p, uint64_t waiters, uint64_t count, uint64_t flags, uint64_t timeout, uint64_t clock);
+uint64_t sys_futex2_wake(Process& p, uint64_t address, uint64_t mask, uint64_t count, uint64_t flags);
+uint64_t sys_futex2_wait(Process& p, uint64_t address, uint64_t value, uint64_t mask, uint64_t flags, uint64_t timeout, uint64_t clock);
+uint64_t sys_futex2_requeue(Process& p, uint64_t waiters, uint64_t flags, uint64_t wake, uint64_t requeue);
 uint64_t sys_set_tid_address(Process& p, uint64_t address);
 uint64_t sys_gettid(Process& p);
 // exit(): ends the calling thread; the last thread takes the process with it.

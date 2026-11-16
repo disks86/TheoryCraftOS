@@ -17,6 +17,7 @@
  */
 #include "Process/LinuxThreads.hpp"
 #include "Process/LinuxProcess.hpp"
+#include "Utility/ByteStream.hpp"
 
 namespace process {
 namespace linuxabi {
@@ -43,6 +44,17 @@ Process::LinuxThreadState::Thread* find_thread(Process& p, uint64_t tid) {
 // wait in the kernel, as on Linux, so glibc's PTHREAD_PRIO_INHERIT mutexes (and its check that the kernel has them) work. No priority is lent to the
 // owner: the scheduler has no priority donation, so these are fair sleeping locks.
 constexpr uint32_t kFutexWaiters = 0x80000000u, kFutexTidMask = 0x3FFFFFFFu;      // (FUTEX_OWNER_DIED, 0x40000000, is kept as it is)
+
+bool read_word(Process& p, uint64_t address, uint32_t* out) {
+  uint8_t raw[4];
+  if (!p.read_user(address, ByteView(raw, sizeof(raw)))) return false;
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  *out = reader.le32();
+  return true;
+}
+
+// How many to wake, from a call's argument: an int, and a negative one wakes nobody.
+uint32_t wake_count(uint64_t value) { return static_cast<uint32_t>(value) > 0x7FFFFFFFu ? 0 : static_cast<uint32_t>(value); }
 
 uint64_t futex_deadline(Process& p, uint64_t timeout, bool realtime, uint64_t* deadline) {      // (an absolute time on the chosen clock)
   *deadline = ~uint64_t{0};
@@ -271,6 +283,45 @@ uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, ui
       }
       return woken + moved;
     }
+    case 5: {      // FUTEX_WAKE_OP: changes the word at address2, wakes `value` at address and, if the old word compares as asked, `timeout_or_count` at address2
+      uint32_t old_word = 0;
+      if (!read_word(p, address2, &old_word)) return error(kEfault);
+      const uint32_t encoded = static_cast<uint32_t>(value3);
+      const uint32_t operation = (encoded >> 28) & 7, comparison = (encoded >> 24) & 0xF;
+      int32_t operand = static_cast<int32_t>((encoded >> 12) & 0xFFF) << 20 >> 20;
+      const int32_t compared = static_cast<int32_t>(encoded & 0xFFF) << 20 >> 20;
+      if (encoded & 0x80000000u) {      // FUTEX_OP_OPARG_SHIFT: the operand is a bit number
+        if (operand < 0 || operand > 31) return error(kEinval);
+        operand = static_cast<int32_t>(uint32_t{1} << operand);
+      }
+      uint32_t new_word;
+      switch (operation) {
+        case 0: new_word = static_cast<uint32_t>(operand); break;
+        case 1: new_word = old_word + static_cast<uint32_t>(operand); break;
+        case 2: new_word = old_word | static_cast<uint32_t>(operand); break;
+        case 3: new_word = old_word & ~static_cast<uint32_t>(operand); break;
+        case 4: new_word = old_word ^ static_cast<uint32_t>(operand); break;
+        default: return error(kEnosys);
+      }
+      const int32_t old_signed = static_cast<int32_t>(old_word);
+      bool second;
+      switch (comparison) {
+        case 0: second = old_signed == compared; break;
+        case 1: second = old_signed != compared; break;
+        case 2: second = old_signed < compared; break;
+        case 3: second = old_signed <= compared; break;
+        case 4: second = old_signed > compared; break;
+        case 5: second = old_signed >= compared; break;
+        default: return error(kEnosys);
+      }
+      uint8_t raw[4];
+      ByteWriter writer{ByteView(raw, sizeof(raw))};
+      writer.le32(new_word);
+      if (!p.write_user(address2, ConstByteView(raw, sizeof(raw)))) return error(kEfault);
+      uint64_t woken = futex_wake(p, address, wake_count(value), ~0u);
+      if (second) woken += futex_wake(p, address2, wake_count(timeout_or_count), ~0u);
+      return woken;
+    }
     case 0: case 9: {      // FUTEX_WAIT, FUTEX_WAIT_BITSET
       if (!runtime) return error(kEnosys);
       const uint32_t bitset = command == 9 ? static_cast<uint32_t>(value3) : ~0u;
@@ -329,6 +380,130 @@ uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, ui
     default:
       return error(kEnosys);
   }
+}
+
+// --- the newer futex calls: futex_waitv (what Wine and Proton wait for several objects with), futex_wake, futex_wait, futex_requeue ----------------------
+// Each futex has flags of its own: the size of the word (only 32 bits exist, FUTEX2_SIZE_U32) and "private" (which is all there is here).
+
+namespace {
+
+constexpr uint32_t kFutex2SizeMask = 3, kFutex2Size32 = 2, kFutex2Private = 128;
+
+bool futex2_flags_ok(uint64_t flags) { return (flags & kFutex2SizeMask) == kFutex2Size32 && (flags & ~uint64_t{kFutex2SizeMask | kFutex2Private}) == 0; }
+
+// struct futex_waitv { val (8), uaddr (8), flags (4), reserved (4) }
+struct WaitvEntry { uint64_t value = 0, address = 0; };
+uint64_t read_waitv(Process& p, uint64_t at, WaitvEntry* out) {
+  uint8_t raw[24];
+  if (!p.read_user(at, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  out->value = reader.le64();
+  out->address = reader.le64();
+  const uint32_t flags = reader.le32(), reserved = reader.le32();
+  if (!futex2_flags_ok(flags) || reserved != 0 || (out->value >> 32) != 0 || (out->address & 3) != 0) return error(kEinval);
+  return 0;
+}
+
+// Waits until one of `count` words is woken (each must still hold its value when the wait begins): the index of one that was, or an error.
+uint64_t wait_on_words(Process& p, const WaitvEntry* entries, uint32_t count, uint32_t bitset, uint64_t deadline) {
+  IProcessRuntime* runtime = p.runtime();
+  if (!runtime) return error(kEnosys);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t current = 0;
+    if (!read_word(p, entries[i].address, &current)) return error(kEfault);
+    if (current != static_cast<uint32_t>(entries[i].value)) return error(kEagain);
+  }
+  // The waiters this thread takes are marked with its id (in `owner`) so that it finds and gives back exactly its own.
+  Process::LinuxThreadState& threads = p.linux_threads();
+  const uint64_t self = current_tid(p);
+  uint32_t taken = 0;
+  for (Process::LinuxThreadState::Waiter& w : threads.waiters) {
+    if (taken == count) break;
+    if (w.used) continue;
+    w.used = true;
+    w.woken = false;
+    w.address = entries[taken].address;
+    w.bitset = bitset;
+    w.owner = self;
+    w.index = taken;
+    ++taken;
+  }
+  auto give_back = [&]() {
+    for (Process::LinuxThreadState::Waiter& w : threads.waiters)
+      if (w.used && w.owner == self) w = Process::LinuxThreadState::Waiter();
+  };
+  if (taken != count) {
+    give_back();
+    return error(kEnomem);
+  }
+  uint64_t result = 0;
+  for (;;) {
+    bool woken = false;
+    for (const Process::LinuxThreadState::Waiter& w : threads.waiters)
+      if (w.used && w.owner == self && w.woken) { woken = true; result = w.index; }
+    if (woken) break;
+    if (runtime->interrupted() || p.exited() || p.signal_interrupts()) { result = error(kEintr); break; }
+    uint64_t left = ~uint64_t{0};
+    if (deadline != ~uint64_t{0}) {
+      const uint64_t now = p.host().monotonic_ns();
+      if (now >= deadline) { result = error(kEtimedout); break; }
+      left = deadline - now;
+    }
+    runtime->wait(p.wait_slice(left));
+  }
+  give_back();
+  return result;
+}
+
+}  // namespace
+
+// futex_waitv(struct futex_waitv* waiters, count, flags, struct timespec* timeout, clock): the timeout is a time on the clock (CLOCK_REALTIME or MONOTONIC).
+uint64_t sys_futex_waitv(Process& p, uint64_t waiters, uint64_t count, uint64_t flags, uint64_t timeout, uint64_t clock) {
+  constexpr uint32_t kMost = 128;
+  if (flags != 0 || count == 0 || count > kMost || (timeout != 0 && clock > 1)) return error(kEinval);
+  WaitvEntry entries[kMost];
+  for (uint32_t i = 0; i < count; ++i)
+    if (const uint64_t r = read_waitv(p, waiters + uint64_t{i} * 24, &entries[i]); r != 0) return r;
+  uint64_t deadline = ~uint64_t{0};
+  if (const uint64_t r = futex_deadline(p, timeout, clock == 0, &deadline); r != 0) return r;
+  return wait_on_words(p, entries, static_cast<uint32_t>(count), ~0u, deadline);
+}
+
+// futex_wake(address, mask, count, flags)
+uint64_t sys_futex2_wake(Process& p, uint64_t address, uint64_t mask, uint64_t count, uint64_t flags) {
+  if (!futex2_flags_ok(flags) || static_cast<uint32_t>(mask) == 0 || (mask >> 32) != 0 || (address & 3) != 0 || static_cast<int32_t>(count) < 0) return error(kEinval);
+  return futex_wake(p, address, static_cast<uint32_t>(count), static_cast<uint32_t>(mask));
+}
+
+// futex_wait(address, value, mask, flags, struct timespec* timeout, clock)
+uint64_t sys_futex2_wait(Process& p, uint64_t address, uint64_t value, uint64_t mask, uint64_t flags, uint64_t timeout, uint64_t clock) {
+  if (!futex2_flags_ok(flags) || static_cast<uint32_t>(mask) == 0 || (mask >> 32) != 0 || (value >> 32) != 0 || (address & 3) != 0 || (timeout != 0 && clock > 1)) return error(kEinval);
+  uint64_t deadline = ~uint64_t{0};
+  if (const uint64_t r = futex_deadline(p, timeout, clock == 0, &deadline); r != 0) return r;
+  WaitvEntry entry;
+  entry.value = value;
+  entry.address = address;
+  const uint64_t r = wait_on_words(p, &entry, 1, static_cast<uint32_t>(mask), deadline);
+  return static_cast<int64_t>(r) < 0 ? r : 0;
+}
+
+// futex_requeue(struct futex_waitv waiters[2], flags, wake, requeue): if the first word still holds its value, wakes `wake` of its waiters and moves up
+// to `requeue` more to the second word.
+uint64_t sys_futex2_requeue(Process& p, uint64_t waiters, uint64_t flags, uint64_t wake, uint64_t requeue) {
+  if (flags != 0 || static_cast<int32_t>(wake) < 0 || static_cast<int32_t>(requeue) < 0) return error(kEinval);
+  WaitvEntry from, to;
+  if (const uint64_t r = read_waitv(p, waiters, &from); r != 0) return r;
+  if (const uint64_t r = read_waitv(p, waiters + 24, &to); r != 0) return r;
+  uint32_t current = 0;
+  if (!read_word(p, from.address, &current)) return error(kEfault);
+  if (current != static_cast<uint32_t>(from.value)) return error(kEagain);
+  const uint64_t woken = futex_wake(p, from.address, static_cast<uint32_t>(wake), ~0u);
+  uint64_t moved = 0;
+  for (Process::LinuxThreadState::Waiter& w : p.linux_threads().waiters) {
+    if (moved >= static_cast<uint32_t>(requeue)) break;
+    if (w.used && !w.woken && w.address == from.address) { w.address = to.address; ++moved; }
+  }
+  return woken + moved;
 }
 
 uint64_t sys_sched_getaffinity(Process& p, uint64_t size, uint64_t mask_address) {

@@ -37,7 +37,7 @@ constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 2
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
-enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, ClockGetres, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, ClockNanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
+enum class Call : uint16_t { None, Clone3, Read, Write, Writev, Close, Getpid, Gettid, Getuid, Getgid, Getresid, ClockGetres, Exit, ExitGroup, Uname, ClockGettime, Nanosleep, ClockNanosleep, SchedYield, SetTidAddress, Brk, Mmap, Munmap, Mprotect, ArchPrctl, Ioctl, Fstat, Newfstatat, Lseek, Openat, Readlinkat, RtSigaction, RtSigprocmask, Sigaltstack,
   SetRobustList, Rseq, Prlimit64, Getrandom, Gettimeofday, Time, Getppid, Madvise,
   Open, Stat, Lstat, Pread, Pwrite, Readv, Getdents64, Mkdir, Mkdirat, Mknod, Mknodat, Rmdir, Unlink, Unlinkat, Rename, Renameat, Renameat2, Getcwd, Chdir, Fchdir, Access, Faccessat,
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
@@ -54,7 +54,13 @@ enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Ge
   Getgroups, Setgroups, Capget, Capset, Getrlimit, Setrlimit, Getrusage, Times, Sysinfo, Getpriority, Setpriority, SchedSetparam, SchedGetparam, SchedSetscheduler,
   SchedGetscheduler, SchedPriorityMax, SchedPriorityMin, SchedRrInterval, SchedSetaffinity, SchedSetattr, SchedGetattr, Getcpu, Personality, Membarrier, GetRobustList,
   // memory
-  Mremap, Msync, Mincore, Mlock, Mlockall };
+  Mremap, Msync, Mincore, Mlock, Mlockall,
+  // timers, the newer futex calls, and the calls of LinuxMisc.cpp
+  TimerCreate, TimerSettime, TimerGettime, TimerGetoverrun, TimerDelete, FutexWaitv, FutexWake2, FutexWait2, FutexRequeue2,
+  GetMempolicy, SetMempolicy, Mbind, SetMempolicyHomeNode, MigratePages, MovePages, PkeyAlloc, PkeyFree, PkeyMprotect, Kcmp, ProcessVmReadv, ProcessVmWritev,
+  Cachestat, RestartSyscall,
+  // calls that are in Linux's tables and have a fixed answer here: see the table
+  Unsupported, Absent };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -142,6 +148,48 @@ constexpr NumberEntry kNumbers[] = {
     // more of memory
     {25, 216, Call::Mremap},       {26, 227, Call::Msync},      {27, 232, Call::Mincore},     {149, 228, Call::Mlock},
     {150, 229, Call::Mlock},       {325, 284, Call::Mlock},     {151, 230, Call::Mlockall},   {152, 231, Call::Mlockall},
+    // POSIX timers (LinuxSignals.cpp)
+    {222, 107, Call::TimerCreate}, {223, 110, Call::TimerSettime}, {224, 108, Call::TimerGettime}, {225, 109, Call::TimerGetoverrun}, {226, 111, Call::TimerDelete},
+    // futex_waitv, futex_wake, futex_wait, futex_requeue (LinuxThreads.cpp)
+    {449, 449, Call::FutexWaitv},  {454, 454, Call::FutexWake2}, {455, 455, Call::FutexWait2}, {456, 456, Call::FutexRequeue2},
+    // memory policy, protection keys, kcmp, another process's memory, cachestat (LinuxMisc.cpp)
+    {239, 236, Call::GetMempolicy}, {238, 237, Call::SetMempolicy}, {237, 235, Call::Mbind},  {450, 450, Call::SetMempolicyHomeNode},
+    {256, 238, Call::MigratePages}, {279, 239, Call::MovePages}, {330, 289, Call::PkeyAlloc}, {331, 290, Call::PkeyFree},
+    {329, 288, Call::PkeyMprotect}, {312, 272, Call::Kcmp},     {310, 270, Call::ProcessVmReadv}, {311, 271, Call::ProcessVmWritev},
+    {451, 451, Call::Cachestat},   {219, 128, Call::RestartSyscall},
+    // more of what only an administrator of a real system does (EPERM): vhangup, iopl, ioperm, init_module, finit_module, delete_module, kexec_load,
+    // kexec_file_load, and the newer mount calls open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr, open_tree_attr, and fchroot
+    {153, 58, Call::Refuse},       {172, kAbsent, Call::Refuse}, {173, kAbsent, Call::Refuse}, {175, 105, Call::Refuse},
+    {313, 273, Call::Refuse},      {176, 106, Call::Refuse},    {246, 104, Call::Refuse},     {320, 294, Call::Refuse},
+    {428, 428, Call::Refuse},      {429, 429, Call::Refuse},    {430, 430, Call::Refuse},     {431, 431, Call::Refuse},
+    {432, 432, Call::Refuse},      {433, 433, Call::Refuse},    {442, 442, Call::Refuse},     {467, 467, Call::Refuse},
+    {472, 472, Call::Refuse},
+    // Calls for something no file system or processor here has (EOPNOTSUPP, which is what Linux answers then): file handles (name_to_handle_at,
+    // open_by_handle_at), the *xattrat calls, file_getattr and file_setattr (inode flags), map_shadow_stack
+    {303, 264, Call::Unsupported}, {304, 265, Call::Unsupported}, {463, 463, Call::Unsupported}, {464, 464, Call::Unsupported},
+    {465, 465, Call::Unsupported}, {466, 466, Call::Unsupported}, {468, 468, Call::Unsupported}, {469, 469, Call::Unsupported},
+    {453, 453, Call::Unsupported},
+    // Parts of Linux that are not here, answered as a kernel built without them answers (ENOSYS, and programs fall back): io_uring (setup, enter,
+    // register), fanotify (init, mark), the key retention service (add_key, request_key, keyctl), landlock (three calls), the security-module calls
+    // (lsm_get_self_attr, lsm_set_self_attr, lsm_list_modules), memfd_secret, mseal, statmount, listmount, listns, seccomp, remap_file_pages, quotactl,
+    // quotactl_fd, bpf, perf_event_open, userfaultfd, rseq_slice_yield, process_madvise, process_mrelease
+    {425, 425, Call::Absent},      {426, 426, Call::Absent},    {427, 427, Call::Absent},     {300, 262, Call::Absent},
+    {301, 263, Call::Absent},      {248, 217, Call::Absent},    {249, 218, Call::Absent},     {250, 219, Call::Absent},
+    {444, 444, Call::Absent},      {445, 445, Call::Absent},    {446, 446, Call::Absent},     {459, 459, Call::Absent},
+    {460, 460, Call::Absent},      {461, 461, Call::Absent},    {447, 447, Call::Absent},     {462, 462, Call::Absent},
+    {457, 457, Call::Absent},      {458, 458, Call::Absent},    {470, 470, Call::Absent},     {317, 277, Call::Absent},
+    {216, 234, Call::Absent},      {179, 60, Call::Absent},     {443, 443, Call::Absent},     {321, 280, Call::Absent},
+    {298, 241, Call::Absent},      {323, 282, Call::Absent},    {471, 471, Call::Absent},     {440, 440, Call::Absent},
+    {448, 448, Call::Absent},
+    // Numbers Linux itself answers ENOSYS for, because the call was never there or was taken out: afs_syscall, getpmsg, putpmsg, security, tuxcall,
+    // vserver, create_module, get_kernel_syms, query_module, nfsservctl, _sysctl, uselib, epoll_ctl_old, epoll_wait_old, lookup_dcookie; and what a
+    // 64-bit program has no use for or a current kernel is built without: sysfs, ustat, modify_ldt, set_thread_area, get_thread_area, uprobe, uretprobe
+    {183, kAbsent, Call::Absent},  {181, kAbsent, Call::Absent}, {182, kAbsent, Call::Absent}, {185, kAbsent, Call::Absent},
+    {184, kAbsent, Call::Absent},  {236, kAbsent, Call::Absent}, {174, kAbsent, Call::Absent}, {177, kAbsent, Call::Absent},
+    {178, kAbsent, Call::Absent},  {180, 42, Call::Absent},     {156, kAbsent, Call::Absent}, {134, kAbsent, Call::Absent},
+    {214, kAbsent, Call::Absent},  {215, kAbsent, Call::Absent}, {212, 18, Call::Absent},     {139, kAbsent, Call::Absent},
+    {136, kAbsent, Call::Absent},  {154, kAbsent, Call::Absent}, {205, kAbsent, Call::Absent}, {211, kAbsent, Call::Absent},
+    {336, kAbsent, Call::Absent},  {335, kAbsent, Call::Absent},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -614,6 +662,31 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Syncfs: return linuxabi::sys_file_advice(process, a[0], false);
       case Call::Getdents: return linuxabi::sys_getdents(process, a[0], a[1], a[2]);
       case Call::Xattr: return error(kEopnotsupp);
+      case Call::Unsupported: return error(kEopnotsupp);
+      case Call::Absent: return error(kEnosys);      // (known and not there: nothing for the host to be told)
+      case Call::RestartSyscall: return error(kEintr);      // (the kernel's own; there is never a call waiting to be started again)
+      case Call::TimerCreate: return linuxabi::sys_timer_create(process, a[0], a[1], a[2]);
+      case Call::TimerSettime: return linuxabi::sys_timer_settime(process, a[0], a[1], a[2], a[3]);
+      case Call::TimerGettime: return linuxabi::sys_timer_gettime(process, a[0], a[1]);
+      case Call::TimerGetoverrun: return linuxabi::sys_timer_getoverrun(process, a[0]);
+      case Call::TimerDelete: return linuxabi::sys_timer_delete(process, a[0]);
+      case Call::FutexWaitv: return linuxabi::sys_futex_waitv(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::FutexWake2: return linuxabi::sys_futex2_wake(process, a[0], a[1], a[2], a[3]);
+      case Call::FutexWait2: return linuxabi::sys_futex2_wait(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::FutexRequeue2: return linuxabi::sys_futex2_requeue(process, a[0], a[1], a[2], a[3]);
+      case Call::GetMempolicy: return linuxabi::sys_get_mempolicy(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::SetMempolicy: return linuxabi::sys_set_mempolicy(process, a[0], a[1], a[2]);
+      case Call::Mbind: return linuxabi::sys_mbind(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::SetMempolicyHomeNode: return linuxabi::sys_set_mempolicy_home_node(process, a[0], a[1], a[2], a[3]);
+      case Call::MigratePages: return linuxabi::sys_migrate_pages(process, a[0], a[1], a[2], a[3]);
+      case Call::MovePages: return linuxabi::sys_move_pages(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::PkeyAlloc: return linuxabi::sys_pkey_alloc(process, a[0], a[1]);
+      case Call::PkeyFree: return linuxabi::sys_pkey_free(process, a[0]);
+      case Call::PkeyMprotect: return int32_t(a[3]) == -1 ? do_mprotect(process, a[0], a[1], a[2]) : error(kEinval);      // (key -1: plain mprotect; there is no other key)
+      case Call::Kcmp: return linuxabi::sys_kcmp(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::ProcessVmReadv: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], false);
+      case Call::ProcessVmWritev: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], true);
+      case Call::Cachestat: return linuxabi::sys_cachestat(process, a[0], a[1], a[2], a[3]);
       case Call::Refuse: return error(kEperm);
       case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1], a[2], a[3]);
       case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0], a[1], a[2]);

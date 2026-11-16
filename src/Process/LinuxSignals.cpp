@@ -160,6 +160,8 @@ bool choose_stack(const LinuxProcessState::Thread& thread, const LinuxProcessSta
   return true;
 }
 
+constexpr int32_t kSiTimer = -2;      // si_code of a POSIX timer's signal
+
 // siginfo_t, the same on every 64-bit CPU: si_signo, si_errno, si_code (4 each), padding (4), then what the kind of signal has: the address of a fault, or
 // who sent it (pid, uid) and, for SIGCHLD, how the child ended.
 void write_siginfo(ByteWriter& writer, uint32_t signal, const LinuxProcessState::Info& info) {
@@ -168,7 +170,11 @@ void write_siginfo(ByteWriter& writer, uint32_t signal, const LinuxProcessState:
   writer.le32(0);
   writer.le32(uint32_t(info.code));
   writer.le32(0);
-  if (signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap) {
+  if (info.code == kSiTimer) {      // a timer_create() timer: its id, how many expirations were missed, and the value it was made with
+    writer.le32(info.sender);
+    writer.le32(uint32_t(info.status));
+    writer.le64(info.value);
+  } else if (signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap) {
     writer.le64(info.address);
   } else {
     writer.le32(info.sender);
@@ -465,7 +471,42 @@ void raise_signal(Process& p, uint32_t signal, uint64_t for_thread, int32_t code
   if (!own && p.runtime()) p.runtime()->notify();      // (the other thread may be waiting in a call)
 }
 
+// The timers of timer_create() that are due: each raises its signal once (signals of one kind do not queue) and counts the expirations that went by
+// without one as its overrun.
+static void check_posix_timers(Process& p) {
+  LinuxProcessState& state = p.linux_state();
+  bool any = false;
+  for (const LinuxProcessState::PosixTimer& timer : state.posix_timers) any = any || (timer.used && timer.deadline_ns != 0);
+  if (!any) return;
+  const uint64_t now = p.host().monotonic_ns();
+  for (uint32_t id = 0; id < LinuxProcessState::kMaxPosixTimers && !p.exited(); ++id) {
+    LinuxProcessState::PosixTimer& timer = state.posix_timers[id];
+    if (!timer.used || timer.deadline_ns == 0 || now < timer.deadline_ns) continue;
+    uint64_t missed = 0;
+    if (timer.interval_ns == 0) {
+      timer.deadline_ns = 0;
+    } else {
+      missed = (now - timer.deadline_ns) / timer.interval_ns;
+      const uint64_t step = missed + 1;
+      timer.deadline_ns = step > (~uint64_t{0} - timer.deadline_ns) / timer.interval_ns ? ~uint64_t{0} : timer.deadline_ns + step * timer.interval_ns;
+    }
+    timer.overrun = missed > 0x7FFFFFFFu ? 0x7FFFFFFFu : uint32_t(missed);
+    if (timer.notify == 1 || timer.signal == 0) continue;      // SIGEV_NONE: the timer only keeps time
+    const uint64_t thread = timer.notify == 4 ? timer.thread : 0;
+    uint64_t& pending = thread == 0 ? state.pending : thread_of(p, thread).pending;
+    const bool was_pending = (pending & bit(timer.signal)) != 0;
+    raise_signal(p, timer.signal, thread, kSiTimer);
+    if (p.exited() || was_pending) continue;      // (a signal of this kind that waited already keeps what it was sent with)
+    if (!(pending & bit(timer.signal))) continue; // (ignored, or carried out at once without a handler)
+    LinuxProcessState::Info& info = state.info[timer.signal];
+    info.sender = id;
+    info.status = int32_t(timer.overrun);
+    info.value = timer.value;
+  }
+}
+
 void check_timers(Process& p) {
+  check_posix_timers(p);
   LinuxProcessState& state = p.linux_state();
   if ((state.timers[0].deadline_ns | state.timers[1].deadline_ns | state.timers[2].deadline_ns) == 0) return;
   const uint64_t now = p.host().monotonic_ns();
@@ -503,6 +544,8 @@ bool signals_wanted(Process& p) {
   const LinuxProcessState& state = p.linux_state();
   if (p.posted_signals() != 0 || state.pending != 0) return true;
   if ((state.timers[0].deadline_ns | state.timers[1].deadline_ns | state.timers[2].deadline_ns) != 0) return true;
+  for (const LinuxProcessState::PosixTimer& timer : state.posix_timers)
+    if (timer.used && timer.deadline_ns != 0) return true;
   for (const LinuxProcessState::Thread& t : state.threads)
     if (t.used && (t.pending != 0 || t.has_saved_mask)) return true;
   return false;
@@ -516,6 +559,10 @@ bool signal_hint(Process& p, uint64_t tid, uint64_t now_ns) {
   for (const LinuxProcessState::IntervalTimer& timer : state.timers) {
     const uint64_t deadline = __atomic_load_n(&timer.deadline_ns, __ATOMIC_RELAXED);
     if (deadline != 0 && now_ns >= deadline) return true;
+  }
+  for (const LinuxProcessState::PosixTimer& timer : state.posix_timers) {
+    const uint64_t deadline = __atomic_load_n(&timer.deadline_ns, __ATOMIC_RELAXED);
+    if (deadline != 0 && now_ns >= deadline && __atomic_load_n(&timer.used, __ATOMIC_RELAXED)) return true;
   }
   const uint64_t for_process = __atomic_load_n(&state.pending, __ATOMIC_RELAXED);
   for (const LinuxProcessState::Thread& t : state.threads) {
@@ -900,14 +947,10 @@ uint64_t sys_rt_sigtimedwait(Process& p, uint64_t set, uint64_t info, uint64_t t
       const LinuxProcessState::Info detail = state.info[signal];
       state.info[signal] = LinuxProcessState::Info();
       if (info != 0) {
-        uint8_t raw[128] = {};
+        uint8_t raw[kSiginfoBytes] = {};
         ByteWriter writer{ByteView(raw, sizeof(raw))};
-        writer.le32(signal);
-        writer.le32(0);
-        writer.le32(uint32_t(detail.code));
-        writer.le32(0);
-        writer.le32(detail.sender);
-        if (!p.write_user(info, ConstByteView(raw, sizeof(raw)))) return error(kEfault);
+        write_siginfo(writer, signal, detail);
+        if (!writer.ok() || !p.write_user(info, ConstByteView(raw, sizeof(raw)))) return error(kEfault);
       }
       return signal;
     }
@@ -1067,6 +1110,124 @@ uint64_t sys_setitimer(Process& p, uint64_t which, uint64_t value, uint64_t old_
   const uint64_t now = p.host().monotonic_ns();
   timer.interval_ns = first == 0 ? 0 : interval;
   timer.deadline_ns = first == 0 ? 0 : first > ~uint64_t{0} - now ? ~uint64_t{0} : now + first;
+  return 0;
+}
+
+// --- POSIX timers (timer_create and friends) ------------------------------------------------------------------------------------------------------------
+// A timer is on one of the clocks, but every clock here ticks alike (the CPU-time clocks too: a process's CPU time is not measured), so its deadline is kept
+// on the monotonic one. An absolute time on CLOCK_REALTIME is turned into that when the timer is set; a later change of the wall clock does not move it.
+
+namespace {
+
+LinuxProcessState::PosixTimer* posix_timer(Process& p, uint64_t id) {
+  if (id >= LinuxProcessState::kMaxPosixTimers) return nullptr;
+  LinuxProcessState::PosixTimer& timer = p.linux_state().posix_timers[id];
+  return timer.used ? &timer : nullptr;
+}
+
+bool timer_clock_known(uint64_t clock) {      // REALTIME, MONOTONIC, the two CPU-time clocks, BOOTTIME, the two ALARM clocks, TAI
+  return clock == 0 || clock == 1 || clock == 2 || clock == 3 || clock == 7 || clock == 8 || clock == 9 || clock == 11;
+}
+
+// struct itimerspec { interval (seconds, nanoseconds), value (seconds, nanoseconds) }: what is left of the timer, and its period.
+bool write_timer_state(Process& p, const LinuxProcessState::PosixTimer& timer, uint64_t address) {
+  const uint64_t now = p.host().monotonic_ns();
+  // (a timer that is due and was not looked at yet reads as one nanosecond away, never as disarmed)
+  const uint64_t left = timer.deadline_ns == 0 ? 0 : timer.deadline_ns > now ? timer.deadline_ns - now : 1;
+  uint8_t raw[32];
+  ByteWriter writer{ByteView(raw, sizeof(raw))};
+  writer.le64(timer.interval_ns / 1000000000u);
+  writer.le64(timer.interval_ns % 1000000000u);
+  writer.le64(left / 1000000000u);
+  writer.le64(left % 1000000000u);
+  return p.write_user(address, ConstByteView(raw, sizeof(raw)));
+}
+
+}  // namespace
+
+// timer_create(clock, struct sigevent*, timer_t*). struct sigevent: sigev_value (8), sigev_signo (4), sigev_notify (4), then the thread id for SIGEV_THREAD_ID.
+// Without one the timer raises SIGALRM with its id as the value. (SIGEV_THREAD is the C library's business: it asks for SIGEV_THREAD_ID.)
+uint64_t sys_timer_create(Process& p, uint64_t clock, uint64_t event, uint64_t id_address) {
+  if (!timer_clock_known(clock)) return error(kEinval);
+  LinuxProcessState& state = p.linux_state();
+  uint32_t id = 0;
+  while (id < LinuxProcessState::kMaxPosixTimers && state.posix_timers[id].used) ++id;
+  if (id == LinuxProcessState::kMaxPosixTimers) return error(kEagain);
+  LinuxProcessState::PosixTimer timer;
+  timer.used = true;
+  timer.clock = uint32_t(clock);
+  timer.signal = kSigAlrm;
+  timer.value = id;
+  if (event != 0) {
+    uint8_t raw[20];
+    if (!p.read_user(event, ByteView(raw, sizeof(raw)))) return error(kEfault);
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    timer.value = reader.le64();
+    timer.signal = reader.le32();
+    timer.notify = reader.le32();
+    const uint32_t thread = reader.le32();
+    if (timer.notify != 0 && timer.notify != 1 && timer.notify != 4) return error(kEinval);
+    if (timer.notify != 1 && (timer.signal == 0 || timer.signal > kSignals)) return error(kEinval);
+    if (timer.notify == 4) {      // the thread has to be one of this process's
+      bool found = thread == current_tid(p);
+      for (const LinuxProcessState::Thread& t : state.threads) found = found || (t.used && t.tid == thread);
+      if (!found) return error(kEinval);
+      timer.thread = thread;
+    }
+  }
+  uint8_t out[4];
+  ByteWriter writer{ByteView(out, sizeof(out))};
+  writer.le32(id);
+  if (!p.write_user(id_address, ConstByteView(out, sizeof(out)))) return error(kEfault);
+  state.posix_timers[id] = timer;
+  return 0;
+}
+
+// timer_settime(id, flags, const struct itimerspec* value, struct itimerspec* old). TIMER_ABSTIME (1): the value is a time on the timer's clock.
+uint64_t sys_timer_settime(Process& p, uint64_t id, uint64_t flags, uint64_t value, uint64_t old_value) {
+  LinuxProcessState::PosixTimer* timer = posix_timer(p, id);
+  if (!timer || (flags & ~uint64_t{1}) != 0) return error(kEinval);
+  uint8_t raw[32];
+  if (!p.read_user(value, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint64_t interval_s = reader.le64(), interval_n = reader.le64(), value_s = reader.le64(), value_n = reader.le64();
+  uint64_t interval = 0, first = 0;
+  if (!to_ns(interval_s, interval_n, 1000000000u, &interval) || !to_ns(value_s, value_n, 1000000000u, &first)) return error(kEinval);
+  if (old_value != 0 && !write_timer_state(p, *timer, old_value)) return error(kEfault);
+  const uint64_t now = p.host().monotonic_ns();
+  timer->overrun = 0;
+  if (first == 0) {
+    timer->deadline_ns = 0;
+    timer->interval_ns = 0;
+    return 0;
+  }
+  timer->interval_ns = interval;
+  if (flags & 1) {
+    const bool wall = timer->clock == 0 || timer->clock == 8 || timer->clock == 11;
+    const uint64_t clock_now = wall ? p.host().realtime_ns() : now;
+    // (a time that is past already is due at once: 1, since 0 means "not armed")
+    timer->deadline_ns = first <= clock_now ? (now == 0 ? 1 : now) : (first - clock_now > ~uint64_t{0} - now ? ~uint64_t{0} : now + (first - clock_now));
+  } else {
+    timer->deadline_ns = first > ~uint64_t{0} - now ? ~uint64_t{0} : now + first;
+  }
+  return 0;
+}
+
+uint64_t sys_timer_gettime(Process& p, uint64_t id, uint64_t value) {
+  const LinuxProcessState::PosixTimer* timer = posix_timer(p, id);
+  if (!timer) return error(kEinval);
+  return write_timer_state(p, *timer, value) ? 0 : error(kEfault);
+}
+
+uint64_t sys_timer_getoverrun(Process& p, uint64_t id) {
+  const LinuxProcessState::PosixTimer* timer = posix_timer(p, id);
+  return timer ? timer->overrun : error(kEinval);
+}
+
+uint64_t sys_timer_delete(Process& p, uint64_t id) {
+  LinuxProcessState::PosixTimer* timer = posix_timer(p, id);
+  if (!timer) return error(kEinval);
+  *timer = LinuxProcessState::PosixTimer();
   return 0;
 }
 

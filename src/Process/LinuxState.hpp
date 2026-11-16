@@ -44,7 +44,8 @@ struct LinuxProcessState {
     int32_t code = 0;                // SI_USER 0, SI_TKILL -6, or the fault's or child's code
     uint32_t sender = 0;             // si_pid
     uint64_t address = 0;            // si_addr of a fault
-    int32_t status = 0;              // si_status of SIGCHLD
+    int32_t status = 0;              // si_status of SIGCHLD; si_overrun of a timer's signal (code SI_TIMER, with the timer's id as the sender)
+    uint64_t value = 0;              // si_value of a timer's signal
   };
   Info info[kSignals + 1];
 
@@ -96,6 +97,20 @@ struct LinuxProcessState {
     uint64_t interval_ns = 0;
   };
   IntervalTimer timers[3];      // ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF (all on the monotonic clock here)
+  // timer_create(): its id is the index. A child made by fork() has none of them.
+  static constexpr uint32_t kMaxPosixTimers = 32;
+  struct PosixTimer {
+    bool used = false;
+    uint32_t clock = 0;              // the clock it was made on (the deadline below is kept on the monotonic one whichever it is)
+    uint32_t notify = 0;             // SIGEV_SIGNAL 0, SIGEV_NONE 1, SIGEV_THREAD_ID 4
+    uint32_t signal = 0;
+    uint64_t thread = 0;             // SIGEV_THREAD_ID: the thread the signal is for
+    uint64_t value = 0;              // sigev_value, handed to the handler
+    uint64_t deadline_ns = 0;        // 0: not armed
+    uint64_t interval_ns = 0;
+    uint32_t overrun = 0;            // expirations that went by without a signal of their own, at the last signal
+  };
+  PosixTimer posix_timers[kMaxPosixTimers];
 
   // --- the processes fork() made, until wait() has told the program how each one ended
   static constexpr uint32_t kMaxChildren = 64;

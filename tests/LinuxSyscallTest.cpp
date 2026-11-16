@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
@@ -57,6 +58,8 @@ struct Host final : IProcessHost {
   uint64_t monotonic_ns() override { return now; }
   void sleep_ns(uint64_t ns) override { now += ns; }
   void yield() override {}
+  std::vector<uint64_t> unhandled;      // the numbers the system-call table did not know
+  void unhandled_syscall(SyscallAbi, uint64_t number) override { unhandled.push_back(number); }
 };
 
 struct NoWaitSync final : ISystemSync {
@@ -1662,6 +1665,268 @@ static void test_signal_handlers_loongarch() {
   }
 }
 
+// A runtime for calls that wait: time passes while a thread waits, and the test can have "another thread" do something meanwhile.
+struct WaitRuntime final : IProcessRuntime {
+  Host* host = nullptr;
+  std::function<void()> meanwhile;      // run once, at the first wait
+  int waits = 0;
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t ns) override {
+    ++waits;
+    if (meanwhile) { auto run = meanwhile; meanwhile = nullptr; run(); return true; }
+    host->now += ns == ~uint64_t{0} ? 1000000000ull : ns;
+    return true;
+  }
+  void notify() override {}
+  bool interrupted() override { return waits > 100000; }      // (a wait that nothing ends must not hang the test)
+  bool start_thread(const ThreadStart&, bool) override { return false; }
+  bool resume_thread(uint64_t) override { return false; }
+  uint64_t current_thread_id() override { return 1; }
+};
+struct Waiting {
+  Rig rig;
+  WaitRuntime runtime;
+  explicit Waiting(filesystem::IFileSystem* fs = nullptr, UserArch arch = UserArch::X86_64) : rig(fs, 1, arch) { runtime.host = &rig.host; rig.process->attach_runtime(&runtime); }
+  ~Waiting() { rig.process->attach_runtime(nullptr); }
+};
+
+// --- POSIX timers (222..226) ------------------------------------------------------------------------------------------------------------------------------
+static void test_posix_timers() {
+  constexpr uint64_t kAlrm = 14, kUsr1 = 10;
+  auto bit = [](uint64_t signal) { return uint64_t{1} << (signal - 1); };
+  Rig rig;
+  const uint64_t id = rig.alloc(8), got = rig.alloc(32), info = rig.alloc(128), set = rig.alloc(8);
+  CHECK(rig.s(14, 0, rig.words({bit(kAlrm) | bit(kUsr1)}), 0, 8) == 0);      // both blocked: they stay pending for the test to look at
+  // without a sigevent: SIGALRM, with the timer's id as the value
+  rig.put32(id, 99);
+  CHECK(rig.s(222, 1, 0, id) == 0 && rig.u32(id) == 0);
+  CHECK(rig.s(224, 0, got) == 0 && rig.u64(got) == 0 && rig.u64(got + 8) == 0 && rig.u64(got + 16) == 0 && rig.u64(got + 24) == 0);      // not armed
+  CHECK(rig.s(223, 0, 0, rig.words({0, 0, 1, 500000000}), got) == 0 && rig.u64(got + 16) == 0);      // once, after 1.5 s
+  rig.host.now += 1000000000;
+  CHECK(rig.s(224, 0, got) == 0 && rig.u64(got + 16) == 0 && rig.u64(got + 24) == 500000000 && rig.s(127, set, 8) == 0 && rig.u64(set) == 0);
+  rig.host.now += 500000000;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kAlrm));
+  CHECK(rig.s(128, rig.words({bit(kAlrm)}), info, rig.words({0, 0}), 8) == int64_t(kAlrm));
+  CHECK(rig.u32(info) == kAlrm && int32_t(rig.u32(info + 8)) == -2 && rig.u32(info + 16) == 0 && rig.u32(info + 20) == 0 && rig.u64(info + 24) == 0);      // SI_TIMER, the id, no overrun, the value
+  CHECK(rig.s(224, 0, got) == 0 && rig.u64(got + 16) == 0 && rig.u64(got + 24) == 0 && rig.s(225, 0) == 0);      // it ran once
+  // with one: another signal, a value, a period; expirations nobody saw are the overrun
+  const uint64_t event = rig.alloc(64);
+  rig.put64(event, 0x1234567890ull);
+  rig.put32(event + 8, uint32_t(kUsr1));
+  rig.put32(event + 12, 0);
+  CHECK(rig.s(222, 0, event, id) == 0 && rig.u32(id) == 1);
+  CHECK(rig.s(223, 1, 0, rig.words({0, 100000000, 0, 100000000}), 0) == 0);      // every 0.1 s
+  rig.host.now += 1050000000;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kUsr1) && rig.s(225, 1) == 9);
+  CHECK(rig.s(128, rig.words({bit(kUsr1)}), info, rig.words({0, 0}), 8) == int64_t(kUsr1));
+  CHECK(int32_t(rig.u32(info + 8)) == -2 && rig.u32(info + 16) == 1 && rig.u32(info + 20) == 9 && rig.u64(info + 24) == 0x1234567890ull);
+  CHECK(rig.s(224, 1, got) == 0 && rig.u64(got + 8) == 100000000 && rig.u64(got + 24) == 50000000);      // the next one is due in 0.05 s
+  rig.host.now += 60000000;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kUsr1) && rig.s(225, 1) == 0);
+  CHECK(rig.s(223, 1, 0, rig.words({0, 0, 0, 0}), got) == 0 && rig.u64(got + 8) == 100000000);      // disarmed; what it was comes back
+  CHECK(rig.s(128, rig.words({bit(kUsr1)}), 0, rig.words({0, 0}), 8) == int64_t(kUsr1));
+  rig.host.now += 5000000000ull;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == 0);
+  // TIMER_ABSTIME: a time on the timer's clock (CLOCK_REALTIME here), also one that is past
+  const uint64_t wall = 1700000000ull + rig.host.now / 1000000000u;
+  CHECK(rig.s(223, 1, 1, rig.words({0, 0, wall + 3, 0}), 0) == 0 && rig.s(224, 1, got) == 0 && rig.u64(got + 16) >= 2 && rig.u64(got + 16) <= 3);
+  CHECK(rig.s(223, 1, 1, rig.words({0, 0, 5, 0}), 0) == 0 && rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kUsr1));
+  CHECK(rig.s(128, rig.words({bit(kUsr1)}), 0, rig.words({0, 0}), 8) == int64_t(kUsr1));
+  // SIGEV_NONE keeps time and raises nothing; SIGEV_THREAD_ID is for a thread of the process
+  rig.put32(event + 12, 1);
+  CHECK(rig.s(222, 1, event, id) == 0 && rig.u32(id) == 2 && rig.s(223, 2, 0, rig.words({0, 0, 1, 0}), 0) == 0);
+  rig.host.now += 2000000000;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == 0 && rig.s(224, 2, got) == 0 && rig.u64(got + 16) == 0 && rig.u64(got + 24) == 0);
+  rig.put32(event + 12, 4);
+  rig.put32(event + 16, 1);
+  CHECK(rig.s(222, 1, event, id) == 0 && rig.u32(id) == 3 && rig.s(223, 3, 0, rig.words({0, 0, 0, 1000}), 0) == 0);
+  rig.host.now += 1000;
+  CHECK(rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kUsr1));
+  rig.put32(event + 16, 77);
+  CHECK(rig.s(222, 1, event, id) == -22);      // no such thread
+  // deleting; what is refused
+  CHECK(rig.s(226, 1) == 0 && rig.s(226, 1) == -22 && rig.s(224, 1, got) == -22 && rig.s(223, 1, 0, rig.words({0, 0, 1, 0}), 0) == -22 && rig.s(225, 1) == -22);
+  rig.put32(event + 12, 0);
+  CHECK(rig.s(222, 1, event, id) == 0 && rig.u32(id) == 1);      // the id is used again
+  rig.put32(event + 12, 2);
+  CHECK(rig.s(222, 1, event, id) == -22);      // SIGEV_THREAD is the C library's
+  rig.put32(event + 12, 0);
+  rig.put32(event + 8, 65);
+  CHECK(rig.s(222, 1, event, id) == -22);
+  rig.put32(event + 8, 0);
+  CHECK(rig.s(222, 1, event, id) == -22);
+  CHECK(rig.s(222, 4, 0, id) == -22 && rig.s(222, 12, 0, id) == -22 && rig.s(222, 1, kBad, id) == -14 && rig.s(222, 1, 0, kBad) == -14);
+  CHECK(rig.s(226, 99) == -22 && rig.s(226, ~uint64_t{0}) == -22 && rig.s(223, 0, 2, rig.words({0, 0, 1, 0}), 0) == -22 && rig.s(223, 0, 0, kBad, 0) == -14);
+  CHECK(rig.s(223, 0, 0, rig.words({0, 0, 1, 1000000000}), 0) == -22 && rig.s(223, 0, 0, rig.words({0, 0, uint64_t(-1), 0}), 0) == -22 && rig.s(224, 0, kBad) == -14);
+  CHECK(rig.s(223, 0, 0, rig.words({0, 0, 1, 0}), kBad) == -14);
+  CHECK(rig.s(223, 0, 0, rig.words({~uint64_t{0} >> 1, 999999999, ~uint64_t{0} >> 1, 999999999}), 0) == 0);      // as far away as can be written
+  rig.host.now += 1000000000;
+  CHECK(rig.s(127, set, 8) == 0 && (rig.u64(set) & bit(kAlrm)) == 0);
+  int made = 0;
+  while (rig.s(222, 1, 0, id) == 0) ++made;
+  CHECK(made == 32 - 4 && rig.s(222, 1, 0, id) == -11);      // EAGAIN: no more timers
+  // with nothing blocked and no handler, a timer's signal ends the process as any other does
+  Rig plain;
+  CHECK(plain.s(222, 1, 0, plain.alloc(8)) == 0 && plain.s(223, 0, 0, plain.words({0, 0, 0, 5000}), 0) == 0 && plain.s(39) == 1);
+  plain.host.now += 5000;
+  plain.call(39);
+  CHECK(plain.process->exited() && plain.process->exit_code() == 128 + kAlrm);
+}
+
+// --- futex: FUTEX_WAKE_OP, and futex_waitv (449), futex_wake (454), futex_wait (455), futex_requeue (456) -------------------------------------------------
+static void test_futex_calls() {
+  constexpr uint64_t kSize32 = 2, kPrivate = 128;
+  Waiting w;
+  Rig& rig = w.rig;
+  const uint64_t a = rig.alloc(16), b = a + 4, c = a + 8;
+  rig.put32(a, 7); rig.put32(b, 8); rig.put32(c, 9);
+  auto deadline = [&](uint64_t seconds) { return rig.words({rig.host.now / 1000000000u + seconds, rig.host.now % 1000000000u}); };
+  // FUTEX_WAKE_OP (5): word2 = word2 OP n; wake at word1; wake at word2 if the old word2 compares as asked
+  const uint64_t add5_gt0 = (uint64_t{1} << 28) | (uint64_t{4} << 24) | (5u << 12) | 0;
+  CHECK(rig.s(202, a, 5, 1, 1, b, add5_gt0) == 0 && rig.u32(b) == 13);
+  CHECK(rig.s(202, a, 5, 1, 1, b, (uint64_t{0} << 28) | (0u << 24) | (0xFFFu << 12) | 13) == 0 && int32_t(rig.u32(b)) == -1);      // SET -1 (sign-extended)
+  CHECK(rig.s(202, a, 5, 1, 1, b, (uint64_t{0xA} << 28) | (3u << 12)) == 0 && rig.u32(b) == 0xFFFFFFFFu);      // OR (1 << 3)
+  CHECK(rig.s(202, a, 5, 1, 1, b, (uint64_t{3} << 28) | (0xF0u << 12)) == 0 && rig.u32(b) == 0xFFFFFF0Fu);      // ANDN
+  CHECK(rig.s(202, a, 5, 1, 1, b, (uint64_t{4} << 28) | (0xFFu << 12)) == 0 && rig.u32(b) == 0xFFFFFFF0u);      // XOR
+  CHECK(rig.s(202, a, 5, 1, 1, b, uint64_t{5} << 28) == -38 && rig.s(202, a, 5, 1, 1, b, uint64_t{6} << 24) == -38 && rig.s(202, a, 5, 1, 1, kBad, add5_gt0) == -14);
+  CHECK(rig.s(202, a, 5, 1, 1, b, (uint64_t{8} << 28) | (40u << 12)) == -22);      // a shift that is no bit of the word
+  rig.put32(b, 8);
+  // the newer calls: flags say the word's size
+  CHECK(rig.s(454, a, 0xFFFFFFFFu, 1, kSize32) == 0 && rig.s(454, a, 0xFFFFFFFFu, 1, kSize32 | kPrivate) == 0);
+  CHECK(rig.s(454, a, 0xFFFFFFFFu, 1, 0) == -22 && rig.s(454, a, 0xFFFFFFFFu, 1, 3) == -22 && rig.s(454, a, 0, 1, kSize32) == -22 && rig.s(454, a + 1, 1, 1, kSize32) == -22);
+  CHECK(rig.s(454, a, 1, uint64_t(-1), kSize32) == -22 && rig.s(454, a, 1, 1, kSize32 | 4) == -22);
+  CHECK(rig.s(455, a, 6, 0xFFFFFFFFu, kSize32, 0, 1) == -11);                 // the word is not 6: EAGAIN
+  CHECK(rig.s(455, a, 7, 0xFFFFFFFFu, kSize32, deadline(2), 1) == -110);      // nobody wakes it: ETIMEDOUT
+  CHECK(rig.s(455, a, 7, 0xFFFFFFFFu, kSize32, deadline(2), 5) == -22 && rig.s(455, kBad, 7, 1, kSize32, 0, 1) == -14 && rig.s(455, a, 7, 1, 1, 0, 1) == -22);
+  CHECK(rig.s(455, a, 7, 1, kSize32, kBad, 1) == -14 && rig.s(455, a, 7, 1, kSize32, rig.words({1, 1000000000}), 1) == -22);
+  w.runtime.meanwhile = [&]() { CHECK(rig.s(454, a, 0xFFFFFFFFu, 5, kSize32) == 1); };
+  CHECK(rig.s(455, a, 7, 0xFFFFFFFFu, kSize32, 0, 1) == 0);                    // woken
+  w.runtime.meanwhile = [&]() { CHECK(rig.s(454, a, 0xF0, 5, kSize32) == 0 && rig.s(454, a, 0x0F, 5, kSize32) == 1); };      // (a wake for other bits passes it by)
+  CHECK(rig.s(455, a, 7, 0x0F, kSize32, 0, 1) == 0);
+  // futex_waitv: any of several words
+  auto entry = [&](uint64_t at, uint64_t value, uint64_t address, uint32_t flags, uint32_t reserved = 0) {
+    rig.put64(at, value); rig.put64(at + 8, address); rig.put32(at + 16, flags); rig.put32(at + 20, reserved);
+  };
+  const uint64_t list = rig.alloc(24 * 3);
+  entry(list, 7, a, kSize32); entry(list + 24, 8, b, kSize32 | kPrivate); entry(list + 48, 9, c, kSize32);
+  CHECK(rig.s(449, list, 3, 0, deadline(1), 1) == -110);
+  w.runtime.meanwhile = [&]() { CHECK(rig.s(202, b, 1, 1) == 1); };            // an old-style wake of the second word
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == 1);
+  w.runtime.meanwhile = [&]() { CHECK(rig.s(454, c, 1, 1, kSize32) == 1); };
+  CHECK(rig.s(449, list, 3, 0, rig.words({1700000000ull + rig.host.now / 1000000000u + 5, 0}), 0) == 2);      // (a time on CLOCK_REALTIME)
+  CHECK(rig.s(449, list, 3, 0, rig.words({1700000000ull, 0}), 0) == -110);                                       // ... that is past
+  CHECK(rig.s(454, a, 1, 9, kSize32) == 0 && rig.s(454, b, 1, 9, kSize32) == 0);      // the wait gave back every waiter it had taken
+  rig.put32(b, 80);
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == -11);                                  // one word changed already: EAGAIN
+  rig.put32(b, 8);
+  CHECK(rig.s(449, list, 0, 0, 0, 1) == -22 && rig.s(449, list, 129, 0, 0, 1) == -22 && rig.s(449, list, 3, 1, 0, 1) == -22 && rig.s(449, kBad, 3, 0, 0, 1) == -14);
+  CHECK(rig.s(449, list, 3, 0, deadline(1), 7) == -22 && rig.s(449, list, 3, 0, kBad, 1) == -14);
+  entry(list + 24, 8, b, 0);
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == -22);                                  // no size
+  entry(list + 24, 8, b, kSize32, 1);
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == -22);                                  // the reserved word
+  entry(list + 24, uint64_t{1} << 32 | 8, b, kSize32);
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == -22);                                  // a value that is no 32-bit one
+  entry(list + 24, 8, kBad, kSize32);
+  CHECK(rig.s(449, list, 3, 0, 0, 1) == -14);
+  entry(list + 24, 8, b, kSize32);
+  {      // as many words as one call takes
+    const uint64_t many = rig.alloc(24 * 128), words = rig.alloc(4 * 128);
+    for (uint64_t i = 0; i < 128; ++i) { rig.put32(words + 4 * i, uint32_t(i)); entry(many + 24 * i, i, words + 4 * i, kSize32); }
+    w.runtime.meanwhile = [&]() { CHECK(rig.s(454, words + 4 * 127, 1, 1, kSize32) == 1); };
+    CHECK(rig.s(449, many, 128, 0, 0, 1) == 127);
+  }
+  // futex_requeue: the waiters of one word move to another
+  const uint64_t pair = rig.alloc(48);
+  entry(pair, 7, a, kSize32); entry(pair + 24, 0, c, kSize32);
+  w.runtime.meanwhile = [&]() {
+    CHECK(rig.s(456, pair, 0, 0, 1) == 1);                                     // nobody woken, one moved to c
+    CHECK(rig.s(454, a, 1, 9, kSize32) == 0 && rig.s(454, c, 1, 9, kSize32) == 1);
+  };
+  CHECK(rig.s(455, a, 7, 1, kSize32, 0, 1) == 0);
+  rig.put32(a, 70);
+  CHECK(rig.s(456, pair, 0, 1, 1) == -11);                                     // the first word is not what the caller thought
+  rig.put32(a, 7);
+  CHECK(rig.s(456, pair, 1, 1, 1) == -22 && rig.s(456, pair, 0, uint64_t(-1), 1) == -22 && rig.s(456, kBad, 0, 1, 1) == -14 && rig.s(456, pair, 0, 1, 1) == 0);
+  // without anyone to run other threads a wait is refused, as the old call's is
+  Rig alone;
+  const uint64_t word = alone.alloc(8);
+  CHECK(alone.s(455, word, 0, 1, kSize32, 0, 1) == -38 && alone.s(454, word, 1, 1, kSize32) == 0);
+}
+
+// --- memory policy, protection keys, kcmp, process_vm_readv/writev, cachestat, and the calls with a fixed answer ---------------------------------------------
+static void test_misc_calls() {
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  Rig rig(&fs);
+  const uint64_t buf = rig.alloc(256), mask = rig.alloc(32);
+  // one memory node: get_mempolicy (239), set_mempolicy (238), mbind (237), set_mempolicy_home_node (450), migrate_pages (256), move_pages (279)
+  rig.put32(buf, 99); rig.put64(mask, ~uint64_t{0}); rig.put64(mask + 8, ~uint64_t{0});
+  CHECK(rig.s(239, buf, mask, 128, 0, 0) == 0 && rig.u32(buf) == 0 && rig.u64(mask) == 0 && rig.u64(mask + 8) == 0);      // MPOL_DEFAULT
+  CHECK(rig.s(239, 0, mask, 64, 0, 4) == 0 && rig.u64(mask) == 1);                                                          // MPOL_F_MEMS_ALLOWED: node 0
+  rig.put32(buf, 99);
+  CHECK(rig.s(239, buf, 0, 0, 0x10000, 3) == 0 && rig.u32(buf) == 0 && rig.s(239, buf, 0, 0, kBad, 3) == -14);              // the node of an address
+  CHECK(rig.s(239, buf, 0, 0, 0, 8) == -22 && rig.s(239, buf, 0, 0, 0x10000, 0) == -22 && rig.s(239, kBad, 0, 0, 0, 0) == -14 && rig.s(239, 0, kBad, 64, 0, 0) == -14);
+  CHECK(rig.s(239, 0, mask, uint64_t{1} << 40, 0, 0) == -22 && rig.s(239, 0, 0, 0, 0, 6) == -22);
+  CHECK(rig.s(238, 0, 0, 0) == 0 && rig.s(238, 2, rig.words({1}), 64) == 0 && rig.s(238, 3 | 0x8000, rig.words({1, 0}), 100) == 0);
+  CHECK(rig.s(238, 2, rig.words({2}), 64) == -22 && rig.s(238, 2, rig.words({1, 1}), 128) == -22 && rig.s(238, 7, 0, 0) == -22 && rig.s(238, 2, kBad, 64) == -14);
+  CHECK(rig.s(238, 2, rig.words({~uint64_t{0}}), 1) == 0);      // (only as many bits as the call says are looked at)
+  CHECK(rig.s(237, 0x10000, 8192, 2, rig.words({1}), 64, 0) == 0 && rig.s(237, 0x10001, 8192, 2, 0, 0, 0) == -22 && rig.s(237, 0x10000, 8192, 9, 0, 0, 0) == -22);
+  CHECK(rig.s(237, 0x10000, 8192, 2, rig.words({4}), 64, 0) == -22 && rig.s(237, 0x10000, ~uint64_t{0}, 0, 0, 0, 0) == -22 && rig.s(237, 0x10000, 4096, 0, 0, 0, 8) == -22);
+  CHECK(rig.s(450, 0x10000, 4096, 0, 0) == 0 && rig.s(450, 0x10000, 4096, 1, 0) == -22 && rig.s(450, 0x10000, 4096, 0, 1) == -22);
+  CHECK(rig.s(256, 0, 64, rig.words({1}), rig.words({1})) == 0 && rig.s(256, 1, 0, 0, 0) == 0 && rig.s(256, 77, 0, 0, 0) == -3 && rig.s(256, 0, 64, rig.words({2}), 0) == -22);
+  const uint64_t pages = rig.words({0x10000, kBad, 0x2F000}), status = rig.alloc(16);
+  CHECK(rig.s(279, 0, 3, pages, 0, status, 0) == 0 && rig.u32(status) == 0 && int32_t(rig.u32(status + 4)) == -14 && rig.u32(status + 8) == 0);
+  const uint64_t nodes = rig.alloc(16);
+  rig.put32(nodes, 0); rig.put32(nodes + 4, 0); rig.put32(nodes + 8, 1);
+  CHECK(rig.s(279, 1, 3, pages, nodes, status, 2) == 0 && rig.u32(status) == 0 && int32_t(rig.u32(status + 4)) == -14 && int32_t(rig.u32(status + 8)) == -19);
+  CHECK(rig.s(279, 77, 1, pages, 0, status, 0) == -3 && rig.s(279, 0, 1, kBad, 0, status, 0) == -14 && rig.s(279, 0, 1, pages, 0, kBad, 0) == -14);
+  CHECK(rig.s(279, 0, 1, pages, kBad, status, 0) == -14 && rig.s(279, 0, 1, pages, 0, status, 1) == -22 && rig.s(279, 0, ~uint64_t{0}, pages, 0, status, 0) == -22);
+  CHECK(rig.s(279, 0, 0, 0, 0, 0, 0) == 0 && rig.s(279, 0, 3, pages, 0, 0, 0) == 0);
+  // protection keys: pkey_alloc (330), pkey_free (331), pkey_mprotect (329)
+  CHECK(rig.s(330, 0, 0) == -28 && rig.s(330, 1, 0) == -22 && rig.s(330, 0, 4) == -22 && rig.s(331, 1) == -22);
+  const uint64_t m = rig.call(9, 0, 8192, 3, 0x22, ~uint64_t{0}, 0);
+  uint8_t protection = 0;
+  CHECK(int64_t(m) > 0 && rig.s(329, m, 4096, 1, uint64_t(-1)) == 0 && rig.space.protection_at(m, &protection) && protection == kProtRead);
+  CHECK(rig.s(329, m, 4096, 3, 1) == -22 && rig.s(329, m, 4096, 3, 0) == -22 && rig.s(329, m + 1, 4096, 3, uint64_t(-1)) == -22);
+  // kcmp (312): are two descriptors one open file?
+  const int64_t f1 = rig.s(2, rig.str("/etc/motd"), 0), f2 = rig.s(2, rig.str("/etc/motd"), 0), f3 = rig.s(32, f1);
+  CHECK(f1 >= 3 && f2 > f1 && f3 > f2);
+  CHECK(rig.s(312, 1, 1, 0, f1, f3) == 0 && rig.s(312, 1, 1, 0, f1, f1) == 0);
+  const int64_t order = rig.s(312, 1, 1, 0, f1, f2);
+  CHECK((order == 1 || order == 2) && rig.s(312, 1, 1, 0, f2, f1) == 3 - order && rig.s(312, 1, 1, 0, f3, f2) == order);
+  CHECK(rig.s(312, 1, 1, 0, f1, 0) == 1 || rig.s(312, 1, 1, 0, f1, 0) == 2);      // a file and the console
+  CHECK(rig.s(312, 1, 1, 0, 0, 0) == 0 && rig.s(312, 1, 1, 0, f1, 999) == -9 && rig.s(312, 1, 1, 0, 5000, f1) == -9);
+  for (uint64_t type = 1; type <= 6; ++type) CHECK(rig.s(312, 1, 1, type, 0, 0) == 0);      // its own memory, descriptor table, ...: the same as its own
+  CHECK(rig.s(312, 1, 1, 7, 0, 0) == -22 && rig.s(312, 1, 1, 8, 0, 0) == -22 && rig.s(312, 1, 77, 0, 0, 0) == -3 && rig.s(312, 77, 1, 0, 0, 0) == -3);
+  // process_vm_readv (310), process_vm_writev (311): within the process
+  const uint64_t from = rig.str("0123456789abcdef"), to = rig.alloc(32);
+  const uint64_t local = rig.words({to, 4, to + 8, 6}), remote = rig.words({from + 2, 3, from + 10, 20});
+  CHECK(rig.s(310, 1, local, 2, remote, 2, 0) == 10 && rig.bytes(to, 4) == "234a" && rig.bytes(to + 8, 6) == "bcdef" + std::string(1, '\0'));
+  CHECK(rig.s(311, 1, rig.words({from, 3}), 1, rig.words({to + 16, 8}), 1, 0) == 3 && rig.bytes(to + 16, 3) == "012");
+  CHECK(rig.s(310, 1, local, 0, remote, 2, 0) == 0 && rig.s(310, 1, local, 2, remote, 0, 0) == 0);
+  CHECK(rig.s(310, 77, local, 2, remote, 2, 0) == -3 && rig.s(310, 1, local, 2, remote, 2, 1) == -22 && rig.s(310, 1, local, 1025, remote, 2, 0) == -22);
+  CHECK(rig.s(310, 1, kBad, 2, remote, 2, 0) == -14 && rig.s(310, 1, local, 2, kBad, 2, 0) == -14);
+  CHECK(rig.s(310, 1, rig.words({to, 8}), 1, rig.words({kBad, 8}), 1, 0) == -14 && rig.s(311, 1, rig.words({from, 8}), 1, rig.words({kBad, 8}), 1, 0) == -14);
+  CHECK(rig.s(310, 1, rig.words({to, 8, to, 8}), 2, rig.words({from, 4, kBad, 8}), 2, 0) == 4);      // what was copied before the bad range counts
+  CHECK(rig.s(310, 1, rig.words({to, ~uint64_t{0}}), 1, rig.words({from, ~uint64_t{0}}), 1, 0) > 0);  // sizes that run off the memory: as far as it goes
+  // cachestat (451): nothing is in a page cache
+  for (int i = 0; i < 40; ++i) rig.put32(buf + uint64_t(i) * 4, 0xAAAAAAAA);
+  CHECK(rig.s(451, f1, rig.words({0, 4096}), buf, 0) == 0 && rig.u64(buf) == 0 && rig.u64(buf + 32) == 0 && rig.u32(buf + 40) == 0xAAAAAAAA);
+  CHECK(rig.s(451, 999, rig.words({0, 0}), buf, 0) == -9 && rig.s(451, 1, rig.words({0, 0}), buf, 0) == -9 && rig.s(451, f1, kBad, buf, 0) == -14);
+  CHECK(rig.s(451, f1, rig.words({0, 0}), kBad, 0) == -14 && rig.s(451, f1, rig.words({0, 0}), buf, 1) == -22);
+  // fixed answers: the kernel's own restart call, what only an administrator does, what nothing here has, what is not built in
+  CHECK(rig.s(219) == -4);
+  for (const uint64_t n : {153, 172, 173, 175, 313, 176, 246, 320, 428, 429, 430, 431, 432, 433, 442, 467, 472}) CHECK(rig.s(n) == -1);
+  for (const uint64_t n : {303, 304, 463, 464, 465, 466, 468, 469, 453}) CHECK(rig.s(n) == -95);
+  for (const uint64_t n : {425, 426, 427, 300, 301, 248, 249, 250, 444, 445, 446, 459, 460, 461, 447, 462, 457, 458, 470, 317, 216, 179, 443, 321, 298, 323, 471, 440, 448,
+                           183, 181, 182, 185, 184, 236, 174, 177, 178, 180, 156, 134, 214, 215, 212, 139, 136, 154, 205, 211, 336, 335})
+    CHECK(rig.s(n) == -38);
+  CHECK(rig.host.unhandled.empty());      // every one of them is known: nothing was reported as missing
+  CHECK(rig.s(400) == -38 && rig.host.unhandled.size() == 1 && rig.host.unhandled[0] == 400);      // (a number that is no call is)
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -1726,7 +1991,8 @@ int main(int argc, char** argv) {
       {"files", test_files}, {"record locks", test_record_locks}, {"memory", test_memory}, {"address space copy", test_address_space_copy}, {"signals", test_signals},
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
-      {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
+      {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
+      {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   for (const auto& test : tests) {
     test.run();
     if (A.live != 0) {      // every test gives back what it took
