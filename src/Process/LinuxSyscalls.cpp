@@ -22,6 +22,7 @@
 #include "Process/LinuxProcess.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
+#include "Process/LinuxPacket.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
@@ -298,7 +299,35 @@ uint64_t map_file_copy(Process& process, AddressSpace& space, OpenObject& object
   return where;
 }
 
+// mmap() of an AF_PACKET socket: its rings (LinuxPacketRing.hpp), the receive ring and then the transmit ring, as one run of memory the program and the
+// socket share. The size has to be exactly theirs, as on Linux.
+uint64_t map_packet_rings(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t link, uint64_t offset) {
+  BlockRef blocks[2];
+  uint64_t sizes[2] = {};
+  const uint32_t count = linuxabi::packet_rings(link, blocks, sizes);
+  if (count == 0 || offset != 0 || size != sizes[0] + sizes[1]) return error(kEinval);
+  uint64_t where = 0;
+  if (flags & kMapFixed) {
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    if (!space.unmap(address, size)) return error(kEnomem);
+    where = address;
+  } else if (!space.find_free(size, address ? address : process.mmap_cursor(), &where)) {
+    return error(kEnomem);
+  }
+  uint64_t done = 0;
+  for (uint32_t i = 0; i < count; ++i) {      // (each mapping holds its block from here on)
+    if (!space.map_shared(where + done, sizes[i], uint8_t(prot), blocks[i].get()->storage(), blocks[i].get())) {
+      if (done != 0) (void)space.unmap(where, done);
+      return error(kEnomem);
+    }
+    done += sizes[i];
+  }
+  if (!(flags & kMapFixed) && !address) process.set_mmap_cursor(where + size);
+  return where;
+}
+
 uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
+  if (uint64_t link = 0; linuxabi::packet_descriptor(process, fd, &link)) return map_packet_rings(process, space, address, size, prot, flags, link, offset);
   OpenObject* object = process.files().object(fd);
   if (!object) return error(kEbadf);
   if (offset % AddressSpace::kPageSize != 0) return error(kEinval);

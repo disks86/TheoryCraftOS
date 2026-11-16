@@ -19,6 +19,8 @@
 
 #include <stdint.h>
 
+#include "Process/MemoryFile.hpp"
+
 namespace process {
 class Process;
 
@@ -40,8 +42,11 @@ uint64_t packet_setsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
 uint64_t packet_getsockopt(Process& p, uint64_t link, uint64_t level, uint64_t name, uint64_t value, uint64_t length_at);
 // FIONREAD: the size of the frame a read would get.
 uint64_t packet_pending(Process& p, uint64_t link, uint64_t argument);
-// For poll() (the system's lock held): is there a frame to read? (Nothing tells a wait when one arrives: it looks again every 2 ms.)
-bool packet_ready_locked(uint64_t link);
+// For poll() (the system's lock held): is there a frame to read, or with a receive ring something in the ring the program has not given back? (Nothing
+// tells a wait when a frame arrives: it looks again every 2 ms. With a ring this is also what moves frames into it.)
+bool packet_ready_locked(uint64_t link, uint64_t realtime_ns, uint64_t monotonic_ns);
+// For mmap(): the socket's rings, the receive ring first, each with a use for the caller and its size. How many there are (0: none to map).
+uint32_t packet_rings(uint64_t link, BlockRef blocks[2], uint64_t sizes[2]);
 
 }  // namespace linuxabi
 }  // namespace process

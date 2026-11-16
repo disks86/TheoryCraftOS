@@ -889,6 +889,7 @@ add_executable(BOOTX64
   src/Process/LinuxBpf.cpp
   src/Process/LinuxNetlink.cpp
   src/Process/LinuxPacket.cpp
+  src/Process/LinuxPacketRing.cpp
   src/Process/LinuxNetlinkMessages.cpp
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp

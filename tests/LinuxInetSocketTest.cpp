@@ -29,6 +29,8 @@
 #include "Ipv6Harness.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/LinuxBpf.hpp"
+#include "Process/LinuxPacket.hpp"
+#include "Process/LinuxPacketRing.hpp"
 #include "Process/LinuxIpc.hpp"
 #include "Process/LinuxNetlink.hpp"
 #include "Process/Process.hpp"
@@ -1849,7 +1851,7 @@ static void test_packet_sockets() {
   // what a packet socket is not, and what it refuses
   CHECK(t.s(50, arp, 1) == -95 && t.s(43, arp, 0, 0) == -95 && t.s(42, arp, address(0, 2), 20) == -95 && t.s(48, arp, 2) == -95 && t.s(52, arp, name, size) == -95);
   CHECK(send(arp, std::string(13, 'x')) == -22 && send(arp, std::string(1515, 'x')) == -90 && send(arp, request, address(0, 7)) == -6 && t.s(44, arp, kBad, 60, 0, 0, 0) == -14);
-  CHECK(t.s(54, arp, 263, 5, buffer, 16) == -92 && t.s(54, arp, 263, 10, t.word(2), 4) == -92 && t.option(arp, 263, 11, &v) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // rings and versions
+  CHECK(t.s(54, arp, 263, 18, t.word(1), 4) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // PACKET_FANOUT; another level
   CHECK(t.s(54, arp, 263, 1, buffer, 16) == 0 && t.s(54, arp, 263, 1, buffer, 8) == -22);      // PACKET_ADD_MEMBERSHIP (promiscuous mode): taken
   // read and write, readv and writev; the interface ioctls
   {
@@ -1871,6 +1873,301 @@ static void test_packet_sockets() {
   }
 }
 
+// --- packet rings -------------------------------------------------------------------------------------------------------------------------------------------
+namespace rings {
+uint32_t u32(ConstByteView ring, uint64_t at) { return uint32_t(ring[at]) | uint32_t(ring[at + 1]) << 8 | uint32_t(ring[at + 2]) << 16 | uint32_t(ring[at + 3]) << 24; }
+uint16_t u16(ConstByteView ring, uint64_t at) { return uint16_t(ring[at] | ring[at + 1] << 8); }
+void put32(ByteView ring, uint64_t at, uint32_t v) { for (int i = 0; i < 4; ++i) ring[at + uint64_t(i)] = uint8_t(v >> (8 * i)); }
+std::string bytes(ConstByteView ring, uint64_t at, uint64_t n) { return std::string(reinterpret_cast<const char*>(ring.subview(at, n).data()), n); }
+}  // namespace rings
+
+// The ring layouts on their own: frames in, frames out, a ring that is full, and a program that writes nonsense into its side.
+static void test_packet_ring_formats() {
+  using namespace linuxabi::ring;
+  using rings::u32; using rings::u16;
+  CHECK(header_size(0) == 32 && header_size(1) == 32 && header_size(2) == 48 && header_size(3) == 0);
+  Request r;
+  r.block_size = 4096; r.block_count = 2; r.frame_size = 2048; r.frame_count = 4;
+  CHECK(valid(Version::V1, r, 0) && valid(Version::V2, r, 0) && valid(Version::V3, r, 0));
+  Request bad = r;
+  bad.block_size = 4000; CHECK(!valid(Version::V2, bad, 0));          // not whole pages
+  bad = r; bad.frame_count = 5; CHECK(!valid(Version::V2, bad, 0));   // not what the blocks hold
+  bad = r; bad.frame_size = 2040; CHECK(!valid(Version::V2, bad, 0)); // not a multiple of 16
+  bad = r; bad.frame_size = 48; bad.frame_count = 170; CHECK(!valid(Version::V2, bad, 0));      // less than a header and an address
+  bad = r; bad.frame_size = 8192; bad.frame_count = 0; CHECK(!valid(Version::V2, bad, 0));      // larger than a block
+  bad = r; bad.block_count = 0; bad.frame_count = 0; CHECK(!valid(Version::V2, bad, 0));
+  bad = r; bad.private_size = 5000; CHECK(!valid(Version::V3, bad, 0) && valid(Version::V2, bad, 0));
+  bad = r; bad.frame_size = 64; bad.frame_count = 128; CHECK(valid(Version::V2, bad, 0) && !valid(Version::V2, bad, 16) && !valid(Version::V3, bad, 0));
+
+  const uint8_t link[14] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00};
+  uint8_t name[20];
+  for (int i = 0; i < 20; ++i) name[i] = uint8_t(0xA0 + i);
+  std::string payload;
+  for (int i = 0; i < 300; ++i) payload.push_back(char('a' + i % 26));
+  auto frame = [&](bool with_link, uint32_t kept = 1 << 20) {
+    Frame f;
+    if (with_link) f.link = ConstByteView(link);
+    f.data = ConstByteView(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+    f.kept = kept;
+    f.name = ConstByteView(name);
+    f.time_ns = 1700000000123456789ull;
+    return f;
+  };
+  std::vector<uint8_t> memory(8192);
+  const ByteView ring(memory.data(), memory.size());
+  // TPACKET_V2, whole frames: the header, the address at 32, the link header at 66 and what follows it at 80
+  Receiver receiver;
+  receiver.start(Version::V2, r, 0);
+  CHECK(!receiver.readable(ring) && receiver.put(ring, frame(true), 0) && receiver.readable(ring));
+  CHECK(u32(ring, 0) == 1 && u32(ring, 4) == 314 && u32(ring, 8) == 314 && u16(ring, 12) == 66 && u16(ring, 14) == 80 && u32(ring, 16) == 1700000000 && u32(ring, 20) == 123456789);
+  CHECK(rings::bytes(ring, 32, 20) == std::string(reinterpret_cast<const char*>(name), 20) && rings::bytes(ring, 66, 14) == std::string(reinterpret_cast<const char*>(link), 14) &&
+        rings::bytes(ring, 80, 300) == payload);
+  // the next ones go into the next places; one cut short by the filter; a ring the program has not emptied takes no more
+  CHECK(receiver.put(ring, frame(true, 100), 0) && u32(ring, 2048) == 1 && u32(ring, 2048 + 4) == 314 && u32(ring, 2048 + 8) == 100 && rings::bytes(ring, 2048 + 80, 86) == payload.substr(0, 86));
+  CHECK(receiver.put(ring, frame(true), 0) && receiver.put(ring, frame(true), 0) && u32(ring, 4096) == 1 && u32(ring, 6144) == 1 && !receiver.put(ring, frame(true), 0));
+  rings::put32(ring, 0, 0);      // (the program gives the first place back)
+  CHECK(receiver.put(ring, frame(true), 0) && u32(ring, 0) == 1 && !receiver.put(ring, frame(true), 0));
+  // a frame larger than a place is cut to it, and marked (TP_STATUS_COPY)
+  {
+    Request small = r;
+    small.frame_size = 256; small.frame_count = 32;
+    Receiver cut;
+    cut.start(Version::V2, small, 0);
+    std::fill(memory.begin(), memory.end(), 0);
+    CHECK(cut.put(ring, frame(true), 0) && u32(ring, 0) == 3 && u32(ring, 4) == 314 && u32(ring, 8) == 256 - 66 && rings::bytes(ring, 80, 256 - 80) == payload.substr(0, 256 - 80));
+  }
+  // TPACKET_V1: the same places, a status of eight bytes, and microseconds; without link headers what follows them is at 80 too
+  std::fill(memory.begin(), memory.end(), 0);
+  receiver.start(Version::V1, r, 0);
+  CHECK(receiver.put(ring, frame(true), 0) && u32(ring, 0) == 1 && u32(ring, 4) == 0 && u32(ring, 8) == 314 && u32(ring, 12) == 314 && u16(ring, 16) == 66 && u16(ring, 18) == 80 &&
+        u32(ring, 20) == 1700000000 && u32(ring, 24) == 123456 && rings::bytes(ring, 80, 300) == payload);
+  CHECK(receiver.put(ring, frame(false), 0) && u32(ring, 2048 + 8) == 300 && u16(ring, 2048 + 16) == 80 && u16(ring, 2048 + 18) == 80 && rings::bytes(ring, 2048 + 80, 300) == payload);
+  // PACKET_RESERVE moves the frame further in
+  std::fill(memory.begin(), memory.end(), 0);
+  receiver.start(Version::V2, r, 32);
+  CHECK(receiver.put(ring, frame(true), 0) && u16(ring, 12) == 98 && u16(ring, 14) == 112 && rings::bytes(ring, 112, 300) == payload);
+
+  // TPACKET_V3: blocks. A block's header, then frames one after another; the block is the program's when it is full or has waited long enough
+  std::fill(memory.begin(), memory.end(), 0);
+  Request three = r;
+  three.retire_ms = 50;
+  receiver.start(Version::V3, three, 0);
+  CHECK(receiver.put(ring, frame(true), 1000) && !receiver.readable(ring) && u32(ring, 0) == 2 && u32(ring, 4) == 48 && u32(ring, 8) == 0 && u32(ring, 12) == 1 && u32(ring, 16) == 48);
+  const uint32_t each = (82 + 314 + 7) & ~7u;      // a frame's header and address, the frame at 82, to a multiple of 8
+  CHECK(u32(ring, 48) == each && u32(ring, 48 + 4) == 1700000000 && u32(ring, 48 + 8) == 123456789 && u32(ring, 48 + 12) == 314 && u32(ring, 48 + 16) == 314 && u32(ring, 48 + 20) == 1 &&
+        u16(ring, 48 + 24) == 82 && u16(ring, 48 + 26) == 96 && rings::bytes(ring, 48 + 48, 20) == std::string(reinterpret_cast<const char*>(name), 20) &&
+        rings::bytes(ring, 48 + 82, 14) == std::string(reinterpret_cast<const char*>(link), 14) && rings::bytes(ring, 48 + 96, 300) == payload);
+  receiver.tick(ring, 1000 + 49000000);
+  CHECK(!receiver.readable(ring));
+  receiver.tick(ring, 1000 + 50000000);      // (waited long enough: handed over, marked as timed out)
+  CHECK(receiver.readable(ring) && u32(ring, 8) == 0x21 && u32(ring, 12) == 1 && u32(ring, 20) == 48 + each && u32(ring, 48) == 0 && u32(ring, 24) == 1 && u32(ring, 32) == 1700000000);
+  // a block fills: the frame that does not fit closes it and opens the next; with every block the program's, frames are lost until it gives one back
+  int put = 0;
+  while (receiver.put(ring, frame(true), 2000) && put < 100) ++put;
+  const uint32_t per_block = (4096 - 48) / each;
+  CHECK(put == int(per_block) && u32(ring, 4096 + 8) == 1 && u32(ring, 4096 + 12) == per_block && u32(ring, 4096 + 24) == 2 && receiver.frozen() == 1 &&
+        !receiver.put(ring, frame(true), 2000) && receiver.frozen() == 1);      // (the second block: full, handed over, the second in order; then nowhere to go)
+  // walking a block the way a program does: by tp_next_offset, as many frames as num_pkts says
+  {
+    uint32_t at = u32(ring, 4096 + 16), seen = 0;
+    for (uint32_t i = 0; i < u32(ring, 4096 + 12); ++i) {
+      CHECK(u32(ring, 4096 + at + 12) == 314 && rings::bytes(ring, 4096 + at + 96, 300) == payload);
+      ++seen;
+      const uint32_t next = u32(ring, 4096 + at);
+      CHECK((next == 0) == (i + 1 == u32(ring, 4096 + 12)));
+      at += next;
+    }
+    CHECK(seen == per_block);
+  }
+  rings::put32(ring, 8, 0);
+  CHECK(receiver.put(ring, frame(true), 3000) && u32(ring, 24) == 3 && u32(ring, 12) == 1);      // (the first block again, the third in order)
+
+  // The sending side: what a program left to be sent, in order; a frame that makes no sense is marked and passed over
+  std::fill(memory.begin(), memory.end(), 0);
+  Transmitter transmitter;
+  transmitter.start(Version::V2, r);
+  using Wrong = Transmitter::Wrong;
+  ConstByteView out;
+  Wrong wrong = Wrong::No;
+  CHECK(!transmitter.next(ring, false, 1514, false, &out, &wrong));
+  auto leave = [&](uint64_t slot, uint32_t length, uint32_t status = 1) {
+    rings::put32(ring, slot + 4, length);
+    for (uint32_t i = 0; i < 64; ++i) ring[slot + 32 + i] = uint8_t(slot / 2048 * 16 + i);
+    rings::put32(ring, slot, status);
+  };
+  leave(0, 60); leave(2048, 3000); leave(4096, 0); leave(6144, 42);
+  CHECK(transmitter.next(ring, false, 1514, false, &out, &wrong) && wrong == Wrong::No && out.size() == 60 && out[0] == 0 && out[59] == 59 && u32(ring, 0) == 0);
+  // one too long for its place stays at the head, marked, until the program puts it right; with PACKET_LOSS it is passed over
+  CHECK(transmitter.next(ring, false, 1514, false, &out, &wrong) && wrong == Wrong::TooLong && u32(ring, 2048) == 4 && !transmitter.next(ring, false, 1514, false, &out, &wrong));
+  leave(2048, 30);
+  CHECK(transmitter.next(ring, false, 1514, false, &out, &wrong) && wrong == Wrong::No && out.size() == 30);
+  CHECK(transmitter.next(ring, false, 1514, true, &out, &wrong) && wrong == Wrong::Malformed && u32(ring, 4096) == 0);      // (no length at all)
+  CHECK(transmitter.next(ring, false, 1514, false, &out, &wrong) && wrong == Wrong::No && out.size() == 42 && out[0] == 48 && !transmitter.next(ring, false, 1514, false, &out, &wrong));
+  leave(0, 1600);
+  CHECK(transmitter.next(ring, false, 1514, true, &out, &wrong) && wrong == Wrong::TooLong);      // (more than a frame may be)
+  // PACKET_TX_HAS_OFF: the header says where the frame starts
+  leave(2048, 20);
+  ring[2048 + 12] = 100; ring[2048 + 13] = 0;
+  CHECK(transmitter.next(ring, true, 1514, false, &out, &wrong) && wrong == Wrong::No && out.size() == 20 && out.data() == ring.data() + 2048 + 100);
+  leave(4096, 20);
+  ring[4096 + 12] = 8; ring[4096 + 13] = 0;      // (inside the header)
+  CHECK(transmitter.next(ring, true, 1514, false, &out, &wrong) && wrong == Wrong::Malformed);
+  // Any nonsense in the ring: whatever a program writes there, both sides stay inside it (the sanitizers watch) and the walk ends
+  uint32_t seed = 99;
+  for (int round = 0; round < 3000; ++round) {
+    for (uint8_t& b : memory) { seed = seed * 1664525u + 1013904223u; b = uint8_t((seed >> 24) & (round % 3 == 0 ? 0x01 : 0xFF)); }
+    const Version version = Version(round % 3);
+    Request any = r;
+    if (round % 2) { any.frame_size = 128; any.frame_count = 64; }
+    Transmitter t;
+    t.start(version, any);
+    for (int i = 0; i < 80; ++i) {
+      ConstByteView taken;
+      Wrong w = Wrong::No;
+      if (!t.next(ring, round % 5 == 0, 1514, true, &taken, &w)) break;
+      CHECK(w != Wrong::No || (taken.data() >= ring.data() && taken.data() + taken.size() <= ring.data() + ring.size() && taken.size() <= 1514));
+    }
+    Receiver into;
+    into.start(version, any, uint32_t(round % 4) * 8);
+    for (int i = 0; i < 40; ++i) (void)into.put(ring, frame(i % 2 == 0, uint32_t(seed >> 20)), uint64_t(i) * 30000000);
+    into.tick(ring, 5000000000ull);
+    (void)into.readable(ring);
+  }
+}
+
+// Rings through the socket calls. (mmap() itself needs an address space, which this rig has none of: the test looks at the same memory through the
+// call mmap() uses. The real mapping is exercised on the kernel, by tests/linux/ringtest.c.)
+static void test_packet_ring_sockets() {
+  constexpr uint64_t kPacket = 17, kRaw = 3, kAllProtocols = 0x0300, kArp = 0x0608;
+  using rings::u32; using rings::u16;
+  Setup t;
+  const uint8_t* mac_a = t.lan.nic_a.mac.bytes;
+  const uint8_t* mac_b = t.lan.nic_b.mac.bytes;
+  const uint8_t everyone[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  const std::string here("\x0A\0\0\x01", 4), there("\x0A\0\0\x02", 4);
+  uint32_t v = 0;
+  auto request = [&](uint32_t block_size, uint32_t blocks, uint32_t frame_size, uint32_t frames, uint32_t retire_ms = 0) {
+    const uint64_t at = t.alloc(32);
+    t.put32(at, block_size); t.put32(at + 4, blocks); t.put32(at + 8, frame_size); t.put32(at + 12, frames); t.put32(at + 16, retire_ms); t.put32(at + 20, 0); t.put32(at + 24, 0);
+    return at;
+  };
+  auto ring_of = [&](int64_t fd, int which, uint32_t* count = nullptr) {
+    uint64_t link = 0;
+    BlockRef blocks[2];
+    uint64_t sizes[2] = {};
+    const uint32_t n = linuxabi::packet_descriptor(t.process, uint64_t(fd), &link) ? linuxabi::packet_rings(link, blocks, sizes) : 0;
+    if (count) *count = n;
+    return uint32_t(which) < n ? blocks[which].get()->bytes().first(sizes[which]) : ByteView();      // (the socket keeps the memory alive)
+  };
+  const uint64_t address = t.alloc(24), size = t.alloc(8), buffer = t.alloc(2048);
+  {
+    const uint8_t raw[20] = {17, 0, 0, 0, 2};
+    t.memory.write(address, ConstByteView(raw, 20));
+  }
+  SharedPointer<network::IFrameTap> other = t.lan.b.frame_open();
+  CHECK(other);
+  other->listen(0x0806, false, true, false, false);
+  const std::string asked = ethernet(everyone, mac_b, 0x0806, arp_message(1, mac_b, there, std::string("\x0A\0\0\x63", 4)));
+  auto arrives = [&](int64_t fd) {
+    return other->send(ConstByteView(reinterpret_cast<const uint8_t*>(asked.data()), asked.size())) && t.lan.run_until([&] { return t.polled(fd, kPollIn) == kPollIn; }, 3000);
+  };
+
+  // the versions, and the size of a frame's header in each
+  const int64_t fd = t.s(41, kPacket, kRaw | kNonBlock, kArp);
+  CHECK(fd >= 3 && t.s(49, fd, address, 20) == 0 && t.option(fd, 263, 10, &v) == 0 && v == 0);
+  for (uint32_t version = 0; version < 4; ++version) {
+    t.put32(buffer, version); t.put32(size, 4);
+    const int64_t r = t.s(55, fd, 263, 11, buffer, size);
+    CHECK(version < 3 ? (r == 0 && t.u32(buffer) == (version == 2 ? 48u : 32u)) : r == -22);
+  }
+  CHECK(t.s(54, fd, 263, 10, t.word(3), 4) == -22 && t.s(54, fd, 263, 10, t.word(1), 4) == 0 && t.option(fd, 263, 10, &v) == 0 && v == 1);
+  // a receive ring: what it may be; with one, the version and the reserve stay as they are
+  CHECK(t.s(54, fd, 263, 5, request(4096, 2, 2048, 5), 16) == -22 && t.s(54, fd, 263, 5, request(4000, 2, 2000, 4), 16) == -22 && t.s(54, fd, 263, 5, request(4096, 2, 2048, 4), 8) == -22 &&
+        t.s(54, fd, 263, 5, request(1 << 20, 100, 2048, 51200), 16) == -12 && t.s(54, fd, 263, 5, kBad, 16) == -14);
+  CHECK(t.s(54, fd, 263, 5, request(4096, 2, 2048, 4), 16) == 0 && t.s(54, fd, 263, 10, t.word(0), 4) == -16 && t.s(54, fd, 263, 12, t.word(8), 4) == -16);
+  uint32_t count = 0;
+  ByteView ring = ring_of(fd, 0, &count);
+  CHECK(count == 1 && ring.size() == 8192 && t.polled(fd) == kPollOut);
+  // a frame arrives: poll says so, and it is in the ring (TPACKET_V2: status, lengths, where it is, its address)
+  CHECK(arrives(fd) && u32(ring, 0) == 1 && u32(ring, 4) >= asked.size() && u32(ring, 8) == u32(ring, 4) && u16(ring, 12) == 66 && u16(ring, 14) == 80 &&
+        rings::bytes(ring, 66, asked.size()) == asked && rings::bytes(ring, 32, 12) == std::string("\x11\0\x08\x06\x02\0\0\0\x01\0\x01\x06", 12) && memcmp(ring.data() + 44, mac_b, 6) == 0);
+  CHECK(t.s(45, fd, buffer, 2048, 0, 0, 0) == -11);      // (nothing comes by recv() any more)
+  // poll goes on saying so until the program gives the frame back; then the next one goes into the next place
+  CHECK(t.polled(fd, kPollIn) == kPollIn);
+  rings::put32(ring, 0, 0);
+  CHECK(t.polled(fd, kPollIn) == 0 && arrives(fd) && u32(ring, 2048) == 1 && u32(ring, 0) == 0);
+  // a ring that is full loses frames, and the statistics say so
+  for (int i = 0; i < 5; ++i) CHECK(other->send(ConstByteView(reinterpret_cast<const uint8_t*>(asked.data()), asked.size())));
+  t.lan.step(30);
+  CHECK(t.polled(fd, kPollIn) == kPollIn && u32(ring, 0) == 1 && u32(ring, 4096) == 1 && u32(ring, 6144) == 1);
+  t.put32(size, 8);
+  CHECK(t.s(55, fd, 263, 6, buffer, size) == 0 && t.u32(size) == 8 && t.u32(buffer) == 7 && t.u32(buffer + 4) == 2);
+  // a filter cuts what goes into the ring too
+  {
+    const std::string program = filter::op(0x06, 0, 0, 20);
+    const uint64_t at = t.alloc(16);
+    t.put64(at, 1); t.put64(at + 8, t.bytes(program));
+    for (uint64_t slot = 0; slot < 8192; slot += 2048) rings::put32(ring, slot, 0);
+    CHECK(t.s(54, fd, 1, 26, at, 16) == 0 && arrives(fd));
+    uint64_t slot = 0;
+    while (slot < 8192 && u32(ring, slot) == 0) slot += 2048;
+    CHECK(slot < 8192 && u32(ring, slot + 4) >= asked.size() && u32(ring, slot + 8) == 20);
+  }
+  // a ring that is mapped stays: here the test holds it as a mapping would (the block's uses say so); without that it can be taken away again
+  {
+    uint64_t link = 0;
+    BlockRef blocks[2];
+    uint64_t sizes[2] = {};
+    CHECK(linuxabi::packet_descriptor(t.process, uint64_t(fd), &link) && linuxabi::packet_rings(link, blocks, sizes) == 1);
+    CHECK(t.s(54, fd, 263, 5, request(0, 0, 0, 0), 16) == -16 && t.s(54, fd, 263, 5, request(4096, 1, 2048, 2), 16) == -16);
+  }
+  CHECK(t.s(54, fd, 263, 5, request(0, 0, 0, 1), 16) == -22 && t.s(54, fd, 263, 5, request(0, 0, 0, 0), 16) == 0 && ring_of(fd, 0, &count).empty() && count == 0);
+
+  // TPACKET_V3: blocks, handed over when they are full or have waited (here 20 ms)
+  CHECK(t.s(54, fd, 1, 27, t.word(0), 4) == 0 && t.s(54, fd, 263, 10, t.word(2), 4) == 0 && t.s(54, fd, 263, 5, request(4096, 2, 2048, 4, 20), 16) == -22 &&
+        t.s(54, fd, 263, 5, request(4096, 2, 2048, 4, 20), 28) == 0);
+  ring = ring_of(fd, 0);
+  CHECK(ring.size() == 8192 && arrives(fd));
+  const uint32_t first = u32(ring, 16);
+  CHECK(u32(ring, 0) == 2 && (u32(ring, 8) & 1) == 1 && u32(ring, 12) >= 1 && first == 48 && u32(ring, first + 20) == 1 && u16(ring, first + 24) == 82 && u16(ring, first + 26) == 96 &&
+        rings::bytes(ring, first + 82, asked.size()) == asked && u32(ring, first + 12) >= asked.size());
+  t.put32(size, 12);
+  CHECK(t.s(55, fd, 263, 6, buffer, size) == 0 && t.u32(size) == 12 && t.u32(buffer) >= 1 && t.u32(buffer + 8) == 0);      // (struct tpacket_stats_v3)
+  rings::put32(ring, 8, 0);
+  CHECK(t.polled(fd, kPollIn) == 0);
+
+  // A transmit ring: the program leaves frames in it, and send() sends them
+  const int64_t out = t.s(41, kPacket, kRaw | kNonBlock, kAllProtocols);
+  CHECK(out >= 3 && t.s(49, out, address, 20) == 0 && t.s(54, out, 263, 10, t.word(1), 4) == 0 && t.s(54, out, 263, 13, request(4096, 1, 2048, 2), 16) == 0);
+  ByteView transmit = ring_of(out, 0, &count);
+  CHECK(count == 1 && transmit.size() == 4096 && t.s(44, out, 0, 0, 0, 0, 0) == 0);      // (nothing left to send)
+  const std::string frame = ethernet(everyone, mac_a, 0x0806, arp_message(1, mac_a, here, there));
+  uint8_t seen[1514];
+  network::FrameInfo info;
+  while (other->receive(ByteView(seen), &info)) {}
+  for (uint64_t slot = 0; slot < 4096; slot += 2048) {
+    memcpy(transmit.data() + slot + 32, frame.data(), frame.size());
+    rings::put32(transmit, slot + 4, uint32_t(frame.size()));
+    rings::put32(transmit, slot, 1);      // TP_STATUS_SEND_REQUEST
+  }
+  CHECK(t.s(44, out, 0, 0, 0, 0, 0) == int64_t(2 * frame.size()) && u32(transmit, 0) == 0 && u32(transmit, 2048) == 0 && t.lan.run_until([&] { return other->pending() >= 2; }, 3000));
+  CHECK(other->receive(ByteView(seen), &info) && info.length >= frame.size() && memcmp(seen, frame.data(), frame.size()) == 0 && other->receive(ByteView(seen), &info));
+  // one that is too long is marked and the call fails; put right, it goes, and the one after it; with PACKET_LOSS such a frame is passed over
+  rings::put32(transmit, 4, 1900); rings::put32(transmit, 0, 1);
+  rings::put32(transmit, 2048 + 4, uint32_t(frame.size())); rings::put32(transmit, 2048, 1);
+  CHECK(t.s(1, out, buffer, 0) == -90 && u32(transmit, 0) == 4 && u32(transmit, 2048) == 1);
+  rings::put32(transmit, 4, uint32_t(frame.size())); rings::put32(transmit, 0, 1);
+  CHECK(t.s(1, out, buffer, 0) == int64_t(2 * frame.size()) && u32(transmit, 0) == 0 && u32(transmit, 2048) == 0);
+  rings::put32(transmit, 4, 1900); rings::put32(transmit, 0, 1);
+  rings::put32(transmit, 2048 + 4, uint32_t(frame.size())); rings::put32(transmit, 2048, 1);
+  CHECK(t.s(54, out, 263, 14, t.word(1), 4) == 0 && t.option(out, 263, 14, &v) == 0 && v == 1 && t.s(1, out, buffer, 0) == int64_t(frame.size()) && u32(transmit, 0) == 0 &&
+        u32(transmit, 2048) == 0);
+  // both rings on one socket: the receive ring comes first in what mmap() maps
+  CHECK(t.s(54, out, 263, 5, request(4096, 2, 4096, 2), 16) == 0);
+  CHECK(ring_of(out, 0, &count).size() == 8192 && count == 2 && ring_of(out, 1).size() == 4096 && ring_of(out, 1).data() == transmit.data());
+  CHECK(t.s(3, out) == 0 && t.s(3, fd) == 0);
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -1888,6 +2185,8 @@ int main() {
   test_raw_sockets();
   test_socket_filter();
   test_packet_sockets();
+  test_packet_ring_formats();
+  test_packet_ring_sockets();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

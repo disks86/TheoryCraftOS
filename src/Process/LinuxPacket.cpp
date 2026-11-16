@@ -38,7 +38,7 @@ namespace process::linuxabi {
 namespace {
 
 constexpr int64_t kEperm = 1, kEnoent = 2, kEintr = 4, kEnxio = 6, kEbadf = 9, kEagain = 11, kEnomem = 12, kEfault = 14, kEnodev = 19, kEinval = 22, kEmfile = 24,
-                  kEmsgsize = 90, kEnoprotoopt = 92, kEsocktnosupport = 94, kEopnotsupp = 95, kEnobufs = 105;
+                  kEbusy = 16, kEmsgsize = 90, kEnoprotoopt = 92, kEsocktnosupport = 94, kEopnotsupp = 95, kEnobufs = 105;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
 constexpr uint64_t kAfPacket = 17;
@@ -139,6 +139,39 @@ bool fetch_locked(LinuxIpcManager& ipc, Socket& socket) {
   }
 }
 
+void name_of(const Frame& f, ByteView out);
+
+ByteView receive_ring(Socket& socket) {
+  return socket.receive_block ? socket.receive_block.get()->bytes().first(socket.receive_request.bytes()) : ByteView();
+}
+ByteView transmit_ring(Socket& socket) {
+  return socket.transmit_block ? socket.transmit_block.get()->bytes().first(socket.transmit_request.bytes()) : ByteView();
+}
+
+// A socket with a receive ring: every frame that waits goes into the ring now, and a block that has waited long enough is handed over (the system's
+// lock held). Nothing drives this but the socket being looked at: poll(), a receive, an option.
+void pump_locked(LinuxIpcManager& ipc, Socket& socket, uint64_t realtime_ns, uint64_t monotonic_ns) {
+  if (!socket.receive_block) return;
+  const ByteView ring = receive_ring(socket);
+  while (fetch_locked(ipc, socket)) {
+    const Frame& f = *socket.held;
+    uint8_t name[kNameSize];
+    name_of(f, ByteView(name));
+    ring::Frame frame;
+    if (!socket.cooked) frame.link = ConstByteView(f.data).first(kHead);
+    frame.data = ConstByteView(f.data).subview(kHead, f.info.length - kHead);
+    frame.kept = f.kept;
+    frame.name = ConstByteView(name);
+    frame.time_ns = realtime_ns;
+    if (!socket.receiver.put(ring, frame, monotonic_ns)) {      // (no room: counted as lost, not as given)
+      --socket.packets;
+      ++socket.drops;
+    }
+    socket.has_held = false;
+  }
+  socket.receiver.tick(ring, monotonic_ns);
+}
+
 // Waits for the socket's next frame and copies it to `out`; with MSG_PEEK it stays the next one. 0, or -errno.
 int64_t receive_frame(Process& p, uint64_t link, bool non_blocking, uint64_t flags, Frame* out, Socket* settings) {
   LinuxIpcManager* ipc = system_linux_ipc();
@@ -153,14 +186,16 @@ int64_t receive_frame(Process& p, uint64_t link, bool non_blocking, uint64_t fla
       Locked locked(ipc->sync());
       Socket* socket = socket_of(*ipc, link);
       if (!socket) return -kEbadf;
-      if (fetch_locked(*ipc, *socket)) {
+      // (with a receive ring frames go there: nothing ever comes this way)
+      pump_locked(*ipc, *socket, p.host().realtime_ns(), p.host().monotonic_ns());
+      if (!socket->receive_block && fetch_locked(*ipc, *socket)) {
         *out = *socket->held;
         settings->cooked = socket->cooked;
         settings->aux_data = socket->aux_data;
         if (!(flags & kMsgPeek)) socket->has_held = false;
         return 0;
       }
-      if (!socket->held) return -kEnomem;
+      if (!socket->held && !socket->receive_block) return -kEnomem;
       timeout = socket->receive_timeout_ns;
     }
     if (non_blocking || (flags & kMsgDontWait)) return -kEagain;
@@ -173,7 +208,7 @@ int64_t receive_frame(Process& p, uint64_t link, bool non_blocking, uint64_t fla
 }
 
 // struct sockaddr_ll for a frame: who sent it, on which interface, and how it came by.
-void name_of(const Frame& f, ByteView out) {
+void name_of(const Frame& f, ByteView out) {      // (declared above)
   ByteWriter w{out};
   w.le16(uint16_t(kAfPacket));
   w.be16(ether_type_of(f));
@@ -264,6 +299,44 @@ int64_t read_name(Process& p, uint64_t address, uint64_t length, uint32_t* inter
   return 0;
 }
 
+// send() of a socket with a transmit ring: every frame the program left to be sent goes out, in order, until one that is not to be sent. The bytes sent
+// in all, or -errno if the first could not go.
+int64_t send_ring(uint64_t link, bool has_to, uint32_t to_interface, uint16_t to_protocol, ConstByteView to_address) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return -kEbadf;
+  int64_t total = 0;
+  for (uint32_t frames = 0; frames < 65536; ++frames) {
+    uint8_t copy[kHead + kMostData];
+    uint32_t size = 0;
+    {
+      Locked locked(ipc->sync());
+      Socket* socket = socket_of(*ipc, link);
+      if (!socket) return -kEbadf;
+      ConstByteView frame;
+      ring::Transmitter::Wrong wrong = ring::Transmitter::Wrong::No;
+      if (!socket->transmitter.next(transmit_ring(*socket), socket->transmit_offsets, socket->cooked ? kMostData : kHead + kMostData, socket->skip_wrong, &frame, &wrong)) break;
+      if (wrong != ring::Transmitter::Wrong::No) {
+        if (socket->skip_wrong) continue;
+        return wrong == ring::Transmitter::Wrong::TooLong ? -kEmsgsize : -kEinval;      // (whatever went before it: the call fails, as on Linux)
+      }
+      size = uint32_t(frame.size());
+      ByteView(copy).first(size).copy_from(frame);      // (once: the program may write there again)
+    }
+    const int64_t sent = send_frame(link, ConstByteView(copy).first(size), has_to, to_interface, to_protocol, to_address);
+    if (sent < 0) return total != 0 ? total : sent;
+    total += sent;
+  }
+  return total;
+}
+
+bool has_transmit_ring(uint64_t link) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return false;
+  Locked locked(ipc->sync());
+  const Socket* socket = socket_of(*ipc, link);
+  return socket && socket->transmit_block;
+}
+
 allocators::IAllocator* call_memory() {
   LinuxIpcManager* ipc = system_linux_ipc();
   return ipc ? &ipc->allocator() : nullptr;
@@ -339,6 +412,10 @@ uint64_t packet_sendto(Process& p, uint64_t link, uint64_t buffer, uint64_t leng
   uint8_t hardware[8] = {};
   if (address != 0)
     if (const int64_t r = read_name(p, address, address_length, &interface, &protocol, ByteView(hardware), &hardware_size); r < 0) return error(-r);
+  if (has_transmit_ring(link)) {      // (what the call hands in is not looked at: the frames are in the ring)
+    const int64_t sent = send_ring(link, address != 0, interface, protocol, ConstByteView(hardware).first(hardware_size));
+    return sent < 0 ? error(-sent) : uint64_t(sent);
+  }
   uint8_t data[kHead + kMostData];
   if (length != 0 && !p.read_user(buffer, ByteView(data).first(length))) return error(kEfault);
   const int64_t sent = send_frame(link, ConstByteView(data).first(length), address != 0, interface, protocol, ConstByteView(hardware).first(hardware_size));
@@ -361,6 +438,10 @@ uint64_t packet_sendmsg(Process& p, uint64_t link, uint64_t message, uint64_t fl
   uint8_t hardware[8] = {};
   if (name != 0)
     if (const int64_t r = read_name(p, name, name_length, &interface, &protocol, ByteView(hardware), &hardware_size); r < 0) return error(-r);
+  if (has_transmit_ring(link)) {
+    const int64_t sent = send_ring(link, name != 0, interface, protocol, ConstByteView(hardware).first(hardware_size));
+    return sent < 0 ? error(-sent) : uint64_t(sent);
+  }
   allocators::IAllocator* allocator = call_memory();
   if (!allocator) return error(kEnomem);
   ByteBuffer data(*allocator);
@@ -443,6 +524,10 @@ uint64_t packet_recvmsg(Process& p, uint64_t link, bool non_blocking, uint64_t m
 uint64_t packet_vector_io(Process& p, uint64_t link, bool non_blocking, uint64_t vectors, uint64_t count, bool write) {
   allocators::IAllocator* allocator = call_memory();
   if (!allocator) return error(kEnomem);
+  if (write && has_transmit_ring(link)) {
+    const int64_t sent = send_ring(link, false, 0, 0, ConstByteView());
+    return sent < 0 ? error(-sent) : uint64_t(sent);
+  }
   if (write) {
     ByteBuffer data(*allocator);
     if (const int64_t r = gather_vectors(p, vectors, count, kHead + kMostData, &data); r < 0) return error(-r);
@@ -499,7 +584,9 @@ namespace {
 constexpr uint64_t kSolSocket = 1, kSolPacket = 263;
 constexpr uint64_t kSoType = 3, kSoError = 4, kSoBroadcast = 6, kSoSndBuf = 7, kSoRcvBuf = 8, kSoPriority = 12, kSoRcvTimeo = 20, kSoBindToDevice = 25, kSoAttachFilter = 26,
                    kSoDetachFilter = 27, kSoSndBufForce = 32, kSoRcvBufForce = 33, kSoMark = 36, kSoProtocol = 38, kSoDomain = 39, kSoLockFilter = 44, kSoRcvTimeoNew = 66;
-constexpr uint64_t kAddMembership = 1, kDropMembership = 2, kStatistics = 6, kAuxData = 8, kReserve = 12, kLoss = 14, kQdiscBypass = 20, kIgnoreOutgoing = 23;
+constexpr uint64_t kAddMembership = 1, kDropMembership = 2, kReceiveRing = 5, kStatistics = 6, kCopyThreshold = 7, kAuxData = 8, kVersion = 10, kHeaderLength = 11, kReserve = 12,
+                   kTransmitRing = 13, kLoss = 14, kTimestamp = 17, kTransmitOffsets = 19, kQdiscBypass = 20, kIgnoreOutgoing = 23;
+constexpr uint64_t kLargestRing = 64ull << 20;
 }  // namespace
 
 uint64_t packet_setsockopt(Process& p, uint64_t link, uint64_t level, uint64_t name, uint64_t value, uint64_t length) {
@@ -582,8 +669,63 @@ uint64_t packet_setsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
     case kAddMembership: case kDropMembership: return length < 16 ? error(kEinval) : 0;
     case kAuxData: if (length < 4) return error(kEinval); socket->aux_data = number != 0; return 0;
     case kIgnoreOutgoing: if (length < 4) return error(kEinval); socket->ignore_outgoing = number != 0; listen(*socket); return 0;
-    case kReserve: case kLoss: case kQdiscBypass: return length < 4 ? error(kEinval) : 0;      // (taken)
-    // (PACKET_VERSION, PACKET_RX_RING, PACKET_TX_RING, PACKET_FANOUT and the rest: frames are read and written, not shared through a mapping)
+    case kLoss: if (length < 4) return error(kEinval); socket->skip_wrong = number != 0; return 0;
+    case kQdiscBypass: case kCopyThreshold: case kTimestamp: return length < 4 ? error(kEinval) : 0;      // (taken)
+    case kTransmitOffsets: if (length < 4) return error(kEinval); socket->transmit_offsets = number != 0; return 0;
+    // PACKET_VERSION and PACKET_RESERVE say how a ring is laid out: only while there is none
+    case kVersion:
+      if (length < 4 || number > 2) return error(kEinval);
+      if (socket->receive_block || socket->transmit_block) return error(kEbusy);
+      socket->version = uint8_t(number);
+      return 0;
+    case kReserve:
+      if (length < 4 || number > 0xFFFF) return error(kEinval);
+      if (socket->receive_block || socket->transmit_block) return error(kEbusy);
+      socket->reserve = number;
+      return 0;
+    case kReceiveRing: case kTransmitRing: {
+      // struct tpacket_req: tp_block_size, tp_block_nr, tp_frame_size, tp_frame_nr; for TPACKET_V3 struct tpacket_req3, which adds tp_retire_blk_tov,
+      // tp_sizeof_priv and tp_feature_req_word. A ring of no blocks takes the ring away. Neither while a program has the ring mapped.
+      const bool transmit = name == kTransmitRing;
+      const ring::Version version = ring::Version(socket->version);
+      const uint64_t size = version == ring::Version::V3 ? 28 : 16;
+      if (length < size) return error(kEinval);
+      uint8_t bytes[28] = {};
+      if (!p.read_user(value, ByteView(bytes).first(size))) return error(kEfault);
+      ByteReader request{ConstByteView(bytes)};
+      ring::Request r;
+      r.block_size = request.le32();
+      r.block_count = request.le32();
+      r.frame_size = request.le32();
+      r.frame_count = request.le32();
+      r.retire_ms = request.le32();
+      r.private_size = request.le32();
+      r.features = request.le32();
+      BlockRef& block = transmit ? socket->transmit_block : socket->receive_block;
+      if (block && block.get()->uses() > 1) return error(kEbusy);
+      if (r.block_count == 0) {
+        if (r.frame_count != 0) return error(kEinval);
+        block.reset();
+        (transmit ? socket->transmit_request : socket->receive_request) = ring::Request();
+        return 0;
+      }
+      if (transmit && version == ring::Version::V3 && (r.retire_ms != 0 || r.private_size != 0 || r.features != 0)) return error(kEinval);
+      if (!ring::valid(version, r, transmit ? 0 : socket->reserve)) return error(kEinval);
+      if (r.bytes() > kLargestRing) return error(kEnomem);
+      BlockRef made(MemoryBlock::make(ipc->allocator(), r.bytes()));
+      if (!made) return error(kEnomem);
+      block = static_cast<BlockRef&&>(made);
+      if (transmit) {
+        socket->transmit_request = r;
+        socket->transmitter.start(version, r);
+      } else {
+        socket->receive_request = r;
+        socket->receiver.start(version, r, socket->reserve);
+        socket->has_held = false;      // (a frame that waited for recv() is not what the ring starts with)
+      }
+      return 0;
+    }
+    // (PACKET_FANOUT and the rest)
     default: return error(kEnoprotoopt);
   }
 }
@@ -596,6 +738,8 @@ uint64_t packet_getsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
   if (!ipc) return error(kEbadf);
   uint8_t raw[16] = {};
   ByteWriter w{ByteView(raw)};
+  uint32_t requested = 0;      // (PACKET_HDRLEN reads a version from where it writes its answer)
+  if (level == kSolPacket && name == kHeaderLength && room >= 4 && !read_u32(p, value, &requested)) return error(kEfault);
   {
     Locked locked(ipc->sync());
     Socket* socket = socket_of(*ipc, link);
@@ -617,17 +761,28 @@ uint64_t packet_getsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
       }
     } else if (level == kSolPacket) {
       switch (name) {
-        case kStatistics:      // struct tpacket_stats: frames taken and frames lost since this was last asked
+        case kStatistics:      // struct tpacket_stats: frames taken and frames lost since this was last asked (TPACKET_V3: and how often the ring was full)
+          pump_locked(*ipc, *socket, p.host().realtime_ns(), p.host().monotonic_ns());
           for (SharedPointer<network::IFrameTap>& tap : socket->taps)
             if (tap) socket->drops += tap->take_dropped();
           w.le32(socket->packets + socket->drops);
           w.le32(socket->drops);
+          if (socket->version == 2) w.le32(socket->receiver.frozen());
           socket->packets = 0;
           socket->drops = 0;
           break;
+        case kVersion: w.le32(socket->version); break;
+        case kTransmitOffsets: w.le32(socket->transmit_offsets ? 1 : 0); break;
+        case kHeaderLength: {      // the size of a ring frame's header in the version the program names
+          if (room < 4 || requested > 2) return error(kEinval);
+          w.le32(ring::header_size(requested));
+          break;
+        }
         case kAuxData: w.le32(socket->aux_data ? 1 : 0); break;
         case kIgnoreOutgoing: w.le32(socket->ignore_outgoing ? 1 : 0); break;
-        case kReserve: case kLoss: case kQdiscBypass: w.le32(0); break;
+        case kReserve: w.le32(socket->reserve); break;
+        case kLoss: w.le32(socket->skip_wrong ? 1 : 0); break;
+        case kQdiscBypass: case kCopyThreshold: case kTimestamp: w.le32(0); break;
         default: return error(kEnoprotoopt);
       }
     } else {
@@ -647,16 +802,38 @@ uint64_t packet_pending(Process& p, uint64_t link, uint64_t argument) {
     Locked locked(ipc->sync());
     Socket* socket = socket_of(*ipc, link);
     if (!socket) return error(kEbadf);
-    if (fetch_locked(*ipc, *socket)) size = uint32_t(shown(*socket, *socket->held).size());
+    pump_locked(*ipc, *socket, p.host().realtime_ns(), p.host().monotonic_ns());
+    if (!socket->receive_block && fetch_locked(*ipc, *socket)) size = uint32_t(shown(*socket, *socket->held).size());
   }
   return p.write_user_u32(argument, size) ? 0 : error(kEfault);
 }
 
-bool packet_ready_locked(uint64_t link) {
+bool packet_ready_locked(uint64_t link, uint64_t realtime_ns, uint64_t monotonic_ns) {
   LinuxIpcManager* ipc = existing_linux_ipc();
   if (!ipc) return false;
   Socket* socket = socket_of(*ipc, link);
-  return socket && fetch_locked(*ipc, *socket);
+  if (!socket) return false;
+  if (!socket->receive_block) return fetch_locked(*ipc, *socket);
+  pump_locked(*ipc, *socket, realtime_ns, monotonic_ns);
+  return socket->receiver.readable(receive_ring(*socket));
+}
+
+uint32_t packet_rings(uint64_t link, BlockRef blocks[2], uint64_t sizes[2]) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc) return 0;
+  Locked locked(ipc->sync());
+  Socket* socket = socket_of(*ipc, link);
+  if (!socket) return 0;
+  uint32_t count = 0;
+  for (int transmit = 0; transmit < 2; ++transmit) {
+    BlockRef& block = transmit ? socket->transmit_block : socket->receive_block;
+    if (!block) continue;
+    block.get()->retain();      // (a use of its own for whoever asked)
+    blocks[count] = BlockRef(block.get());
+    sizes[count] = (transmit ? socket->transmit_request : socket->receive_request).bytes();
+    ++count;
+  }
+  return count;
 }
 
 }  // namespace process::linuxabi

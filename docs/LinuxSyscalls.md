@@ -223,11 +223,29 @@ sends to itself; a socket (`LinuxPacket.cpp`) holds one on each interface and te
 - `MSG_PEEK`, `MSG_TRUNC`, `FIONREAD`, `PACKET_AUXDATA` (a control message with the frame's real and kept lengths),
   `PACKET_STATISTICS`, the buffer sizes and `SO_RCVTIMEO`. `PACKET_ADD_MEMBERSHIP` (promiscuous mode, multicast addresses) is taken
   and changes nothing.
-- Limits: no memory-mapped rings (`PACKET_RX_RING`, `PACKET_TX_RING`, `PACKET_VERSION` are `ENOPROTOOPT`), which a current libpcap
-  insists on, so `tcpdump` does not run on this yet; no `PACKET_FANOUT`; an interface is not put into promiscuous mode, so frames for
-  other machines are heard only if the hardware hands them up anyway; a frame that waits has no time stamp (`SIOCGSTAMP`); a tap
-  keeps 64 frames and loses the rest (counted as drops); on Linux an `ETH_P_ALL` socket hears a loopback packet twice (going out and
-  coming in) and a `127.x` packet injected as a frame is dropped as a martian, where here it is heard once and delivered.
+- Memory-mapped rings (`LinuxPacketRing.cpp`), in the three layouts `PACKET_VERSION` chooses: `PACKET_RX_RING` and `PACKET_TX_RING`
+  make them, and `mmap` of the socket maps them (the receive ring first, then the transmit ring; the size has to be exactly theirs).
+  A ring is memory the socket and every mapping of it share, so it stays while it is mapped (`EBUSY` to change it then).
+  - Receiving: frames go into the ring and no longer to `recv`. TPACKET_V1 and V2 give each frame a place of its own with a status
+    the kernel sets and the program clears; TPACKET_V3 fills blocks with frames one after another and hands a block over when it is
+    full or has waited `tp_retire_blk_tov` milliseconds (8 if none is named) with frames in it. The offsets are Linux's (the link
+    header at 66 or 82, what follows it at 80 or 96, moved by `PACKET_RESERVE`). A place or block the program has not given back is
+    not written to: the frame is lost and counted. `poll` reports the ring readable while the last thing written has not been given
+    back, as on Linux. A filter and `PACKET_STATISTICS` apply as without a ring.
+  - Sending: `send` (with nothing to hand in) sends every frame the program left marked `TP_STATUS_SEND_REQUEST`, in order, and
+    marks each available again. One that makes no sense stays at the head marked `TP_STATUS_WRONG_FORMAT` and the call fails
+    (`EMSGSIZE` or `EINVAL`), or with `PACKET_LOSS` is passed over. `PACKET_TX_HAS_OFF` is honoured.
+  - What the program writes into a ring is not trusted: every offset is worked out on the kernel's side, a length is checked
+    against the place it is in, and a frame to send is copied out once before it is looked at.
+- Limits: frames are moved into a receive ring when the socket is looked at (`poll`, which looks every 2 ms while it waits, a
+  receive, `PACKET_STATISTICS`), not when they arrive, so a program that only watches the mapped memory without ever calling `poll`
+  sees nothing, and a V3 block is handed over by the clock only then; a ring is at most 64 MiB; frames carry the time they were
+  moved, not the time they arrived, and no checksum or VLAN status bits. `tcpdump` itself has not been run on this (it is not in the
+  system image); what it needs of packet sockets is here. No `PACKET_FANOUT`; an interface is not put into promiscuous mode, so
+  frames for other machines are heard only if the hardware hands them up anyway; a frame that waits has no time stamp
+  (`SIOCGSTAMP`); a tap keeps 64 frames and loses the rest (counted as drops); on Linux an `ETH_P_ALL` socket hears a loopback packet
+  twice (going out and coming in) and a `127.x` packet injected as a frame is dropped as a martian, where here it is heard once and
+  delivered.
 
 **Finding hosts by name.** A C library does that itself, from files and by asking a DNS server over UDP or TCP; what it needs here are
 the files (`LinuxNetworkFiles.cpp`). `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/services` and `/etc/protocols` are
@@ -276,8 +294,8 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: memory-mapped
-  rings (what `tcpdump` needs), promiscuous mode, fan-out. Of netlink: changing the
+  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: promiscuous mode, fan-out, rings
+  filled as frames arrive. Of netlink: changing the
   network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
@@ -296,7 +314,7 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets and `packettest.c` for packet sockets (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets, `packettest.c` for packet sockets and `ringtest.c` for their memory-mapped rings (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
   for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
@@ -304,8 +322,9 @@ back to `read` and `write`.
   with a DNS server, and netlink: the messages on their own (every request, cut short anywhere and with any bit flipped) and the
   sockets through the system calls, a change of address told to a listener among them; raw and echo sockets against the second
   machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters); the socket filter on its own (every instruction,
-  programs that are not, any bit of a program flipped, random programs); and packet sockets: an ARP exchange with the second
-  machine by hand, outgoing frames, the loopback, a filter.
+  programs that are not, any bit of a program flipped, random programs); packet sockets: an ARP exchange with the second
+  machine by hand, outgoing frames, the loopback, a filter; and their rings: the three layouts on their own (frames in and out, a
+  full ring, random bytes where a program writes) and through the socket calls.
 - `tests/run_host_tests.sh NetworkThreadTest`: raw sockets and frame taps used from several threads at once, under ThreadSanitizer.
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for

@@ -20,6 +20,7 @@
 #include "Allocators/IAllocator.hpp"
 #include "Network/Link/FrameTap.hpp"
 #include "Process/LinuxNetlinkMessages.hpp"
+#include "Process/LinuxPacketRing.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Syscall.hpp"
@@ -185,6 +186,16 @@ class LinuxIpcManager {
     bool locked_filter = false;           // SO_LOCK_FILTER
     UniquePointer<PacketFrame> held;      // the next frame, taken from a tap and through the filter already (has_held)
     bool has_held = false;
+    // Memory-mapped rings (LinuxPacketRing.hpp): memory the socket and the programs that mapped it share. With a receive ring frames go there and
+    // not to recv(); with a transmit ring send() sends what the program left there.
+    uint8_t version = 0;                  // PACKET_VERSION
+    uint32_t reserve = 0;                 // PACKET_RESERVE
+    bool transmit_offsets = false;        // PACKET_TX_HAS_OFF
+    bool skip_wrong = false;              // PACKET_LOSS: a frame to send that makes no sense is passed over, not an error
+    BlockRef receive_block, transmit_block;
+    linuxabi::ring::Request receive_request, transmit_request;
+    linuxabi::ring::Receiver receiver;
+    linuxabi::ring::Transmitter transmitter;
   };
   PacketSocket packet_sockets[kPacketSockets];
 

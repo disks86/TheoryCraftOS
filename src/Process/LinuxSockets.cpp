@@ -570,7 +570,7 @@ uint64_t refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
       break;
     }
     case UnixType::Packet:
-      readable = packet_ready_locked(link);
+      readable = packet_ready_locked(link, p.host().realtime_ns(), p.host().monotonic_ns());
       writable = true;
       again = 2000000;      // (a frame is looked for every 2 ms, as for the other network sockets)
       break;
