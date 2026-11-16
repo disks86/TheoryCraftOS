@@ -166,6 +166,11 @@ uint64_t Process::wait_slice(uint64_t wanted_ns) {
     const uint64_t left = timer.deadline_ns > now ? timer.deadline_ns - now : 0;
     if (left < slice) slice = left < kShortest ? (wanted_ns < kShortest ? wanted_ns : kShortest) : left;
   }
+  for (const LinuxProcessState::PosixTimer& timer : linux_state_.posix_timers) {
+    if (!timer.used || timer.deadline_ns == 0) continue;
+    const uint64_t left = timer.deadline_ns > now ? timer.deadline_ns - now : 0;
+    if (left < slice) slice = left < kShortest ? (wanted_ns < kShortest ? wanted_ns : kShortest) : left;
+  }
   return slice;
 }
 

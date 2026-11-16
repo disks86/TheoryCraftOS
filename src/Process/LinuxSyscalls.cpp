@@ -64,6 +64,7 @@ enum class Call : uint16_t { None, Clone3, Read, Write, Writev, Close, Getpid, G
   Shmget, Shmat, Shmdt, Shmctl, Semget, Semop, Semtimedop, Semctl, Msgget, Msgsnd, Msgrcv, Msgctl,
   MqOpen, MqUnlink, MqTimedsend, MqTimedreceive, MqNotify, MqGetsetattr,
   PidfdOpen, PidfdSendSignal, PidfdGetfd, ProcessMadvise, ProcessMrelease,
+  IoSetup, IoDestroy, IoSubmit, IoCancel, IoGetevents,
   // calls that are in Linux's tables and have a fixed answer here: see the table
   Unsupported, Absent };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
@@ -169,6 +170,9 @@ constexpr NumberEntry kNumbers[] = {
     // POSIX message queues (LinuxIpc.cpp)
     {240, 180, Call::MqOpen},      {241, 181, Call::MqUnlink},  {242, 182, Call::MqTimedsend}, {243, 183, Call::MqTimedreceive},
     {244, 184, Call::MqNotify},    {245, 185, Call::MqGetsetattr},
+    // asynchronous I/O (LinuxAio.cpp): io_setup, io_destroy, io_submit, io_cancel, io_getevents, io_pgetevents
+    {206, 0, Call::IoSetup},       {207, 1, Call::IoDestroy},   {209, 2, Call::IoSubmit},     {210, 3, Call::IoCancel},
+    {208, 4, Call::IoGetevents},   {333, 292, Call::IoGetevents},      // (io_pgetevents: its signal mask is not put in place for the wait)
     // pidfd (LinuxProcess.cpp), and the two calls that take one to say whose memory is meant
     {434, 434, Call::PidfdOpen},   {424, 424, Call::PidfdSendSignal}, {438, 438, Call::PidfdGetfd}, {440, 440, Call::ProcessMadvise},
     {448, 448, Call::ProcessMrelease},
@@ -719,6 +723,11 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ProcessVmReadv: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], false);
       case Call::ProcessVmWritev: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], true);
       case Call::Cachestat: return linuxabi::sys_cachestat(process, a[0], a[1], a[2], a[3]);
+      case Call::IoSetup: return linuxabi::sys_io_setup(process, a[0], a[1]);
+      case Call::IoDestroy: return linuxabi::sys_io_destroy(process, a[0]);
+      case Call::IoSubmit: return linuxabi::sys_io_submit(process, a[0], a[1], a[2]);
+      case Call::IoCancel: return linuxabi::sys_io_cancel(process, a[0], a[1], a[2]);
+      case Call::IoGetevents: return linuxabi::sys_io_getevents(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::PidfdOpen: return linuxabi::sys_pidfd_open(process, a[0], a[1]);
       case Call::PidfdSendSignal: return linuxabi::sys_pidfd_send_signal(process, a[0], a[1], a[2], a[3]);
       case Call::PidfdGetfd: return linuxabi::sys_pidfd_getfd(process, a[0], a[1], a[2]);

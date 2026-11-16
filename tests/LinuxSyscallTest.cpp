@@ -2321,6 +2321,70 @@ static void test_pidfd() {
   }
 }
 
+// --- asynchronous I/O: io_setup (206), io_destroy (207), io_getevents (208), io_submit (209), io_cancel (210), io_pgetevents (333) --------------------------
+static void test_async_io() {
+  IpcRig system;      // (for the eventfd)
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  {
+    Rig rig(&fs);
+    const uint64_t context = rig.alloc(8), events = rig.alloc(32 * 8), buf = rig.alloc(64);
+    // struct iocb as eight words
+    auto request = [&](uint64_t data, uint32_t opcode, int64_t fd, uint64_t buffer, uint64_t bytes, uint64_t offset, uint32_t flags = 0, uint32_t event_fd = 0) {
+      return rig.words({data, 0, uint64_t{opcode} | (uint64_t(uint32_t(fd)) << 32), buffer, bytes, offset, 0, uint64_t{flags} | (uint64_t{event_fd} << 32)});
+    };
+    rig.put64(context, 0);
+    CHECK(rig.s(206, 8, context) == 0);
+    const uint64_t id = rig.u64(context);
+    CHECK(id != 0 && id % 4096 == 0 && rig.u64(id) == 0);      // a page of zeros: what libaio looks at before it asks the kernel
+    CHECK(rig.s(206, 8, context) == -22 && rig.s(206, 0, rig.words({0})) == -22 && rig.s(206, 8, kBad) == -14 && rig.s(206, 1 << 20, rig.words({0})) == -11);
+    const int64_t fd = rig.s(2, rig.str("/tmp/aio"), 0x42, 0644);
+    CHECK(fd >= 3);
+    // a write, a read of what was written, a sync: carried out in the order given, results collected afterwards
+    const uint64_t w = request(0xAAA1, 1, fd, rig.str("hello, aio"), 10, 0), r = request(0xAAA2, 0, fd, buf, 5, 7), sync = request(0xAAA3, 2, fd, 0, 0, 0);
+    CHECK(rig.s(209, id, 3, rig.words({w, r, sync})) == 3 && rig.bytes(buf, 3) == "aio" && read_file(fs, "/Linux/tmp/aio") == "hello, aio");
+    CHECK(rig.s(208, id, 1, 2, events, 0) == 2 && rig.u64(events) == 0xAAA1 && rig.u64(events + 8) == w && rig.u64(events + 16) == 10 && rig.u64(events + 24) == 0);
+    CHECK(rig.u64(events + 32) == 0xAAA2 && rig.u64(events + 40) == r && rig.u64(events + 48) == 3);      // (three bytes were there from offset 7)
+    CHECK(rig.s(208, id, 0, 8, events, 0) == 1 && rig.u64(events) == 0xAAA3 && rig.u64(events + 16) == 0 && rig.s(208, id, 0, 8, events, 0) == 0);
+    // vectors, a request that fails (its result says so), one that is refused (the call says so)
+    const uint64_t vectors = rig.words({buf + 16, 2, buf + 32, 8});
+    CHECK(rig.s(209, id, 2, rig.words({request(1, 7, fd, vectors, 2, 0), request(2, 0, fd, kBad, 4, 0)})) == 2 && rig.bytes(buf + 16, 2) == "he" && rig.bytes(buf + 32, 8) == "llo, aio");
+    CHECK(rig.s(208, id, 2, 8, events, 0) == 2 && rig.u64(events + 16) == 10 && int64_t(rig.u64(events + 48)) == -14);
+    CHECK(rig.s(209, id, 1, rig.words({request(3, 0, 999, buf, 4, 0)})) == -9 && rig.s(209, id, 1, rig.words({request(3, 5, fd, 0, 1, 0)})) == -22);      // a closed descriptor; IOCB_CMD_POLL
+    CHECK(rig.s(209, id, 1, rig.words({request(3, 99, fd, 0, 0, 0)})) == -22 && rig.s(209, id, 1, rig.words({kBad})) == -14 && rig.s(209, id, 1, kBad) == -14);
+    CHECK(rig.s(209, id, 2, rig.words({request(4, 6, fd, 0, 0, 0), request(5, 0, 999, buf, 4, 0)})) == 1);      // one taken, then the bad one
+    CHECK(rig.s(209, id, 0, 0) == 0 && rig.s(209, 12345, 1, rig.words({w})) == -22 && rig.s(209, id, uint64_t(-1), rig.words({w})) == -22);
+    rig.put64(w + 48, 1);
+    CHECK(rig.s(209, id, 1, rig.words({w})) == -22);      // the reserved word
+    rig.put64(w + 48, 0);
+    CHECK(rig.s(208, id, 1, 8, events, 0) == 1 && rig.u64(events) == 4);
+    // an eventfd told of each completion
+    const int64_t event_fd = rig.s(290, 0, 0x800);
+    CHECK(event_fd >= 3 && rig.s(209, id, 2, rig.words({request(6, 6, fd, 0, 0, 0, 1, uint32_t(event_fd)), request(7, 6, fd, 0, 0, 0, 1, uint32_t(event_fd))})) == 2);
+    CHECK(rig.s(0, event_fd, buf, 8) == 8 && rig.u64(buf) == 2 && rig.s(209, id, 1, rig.words({request(8, 6, fd, 0, 0, 0, 1, 999)})) == -9);
+    CHECK(rig.s(208, id, 2, 8, events, 0) == 2);
+    // collecting: a time to wait at most, what is refused; io_pgetevents is the same call with a signal mask
+    const uint64_t started = rig.host.now;
+    CHECK(rig.s(208, id, 1, 8, events, rig.words({0, 5000000})) == 0 && rig.host.now - started >= 5000000);
+    CHECK(rig.s(208, id, 3, 2, events, 0) == -22 && rig.s(208, id, uint64_t(-1), 2, events, 0) == -22 && rig.s(208, 12345, 0, 2, events, 0) == -22);
+    CHECK(rig.s(208, id, 1, 8, events, kBad) == -14 && rig.s(208, id, 1, 8, events, rig.words({0, 1000000000})) == -22);
+    CHECK(rig.s(209, id, 1, rig.words({request(9, 6, fd, 0, 0, 0)})) == 1 && rig.s(208, id, 1, 8, kBad, 0) == -14 && rig.s(333, id, 1, 8, events, 0, 0) == 1 && rig.u64(events) == 9);
+    // a context holds as many results as it was made for
+    const uint64_t small = rig.words({0});
+    CHECK(rig.s(206, 2, small) == 0);
+    const uint64_t noop = request(1, 6, fd, 0, 0, 0);
+    CHECK(rig.s(209, rig.u64(small), 3, rig.words({noop, noop, noop})) == 2 && rig.s(209, rig.u64(small), 1, rig.words({noop})) == -11);
+    CHECK(rig.s(208, rig.u64(small), 1, 1, events, 0) == 1 && rig.s(209, rig.u64(small), 1, rig.words({noop})) == 1);
+    // io_cancel has nothing to cancel; io_destroy takes the context and its page away
+    CHECK(rig.s(210, id, w, events) == -11 && rig.s(210, 12345, w, events) == -22 && rig.s(210, id, kBad, events) == -14);
+    uint8_t protection = 0;
+    CHECK(rig.s(207, id) == 0 && rig.s(207, id) == -22 && rig.s(209, id, 1, rig.words({noop})) == -22 && !rig.space.protection_at(id, &protection));
+    int made = 1;
+    while (rig.s(206, 4, rig.words({0})) == 0) ++made;
+    CHECK(made == 4 && rig.s(206, 4, rig.words({0})) == -11);
+  }
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -2386,7 +2450,7 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
-      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io},
       {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {

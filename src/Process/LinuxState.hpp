@@ -122,6 +122,19 @@ struct LinuxProcessState {
   };
   Child children[kMaxChildren];
 
+  // --- asynchronous I/O contexts (io_setup): the results of the requests that were submitted, until io_getevents collects them. `id` is what the program
+  // knows the context by (the address of a page of its memory, see LinuxAio.cpp); 0: free. A child made by fork() has none.
+  static constexpr uint32_t kMaxAioContexts = 4, kMaxAioEvents = 128;
+  struct AioEvent {
+    uint64_t data = 0, request = 0, result = 0;
+  };
+  struct AioContext {
+    uint64_t id = 0;
+    uint32_t capacity = 0, first = 0, count = 0;      // a ring: `count` events from `first` on
+    AioEvent events[kMaxAioEvents];
+  };
+  AioContext aio[kMaxAioContexts];
+
   // --- System V shared memory attached with shmat(): where and how long, so that shmdt() can take it out again. (A child made by fork() has them too.)
   static constexpr uint32_t kMaxShmAttaches = 64;
   struct ShmAttach {

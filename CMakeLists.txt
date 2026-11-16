@@ -881,6 +881,7 @@ add_executable(BOOTX64
   src/Process/LinuxThreads.cpp
   src/Process/LinuxProcess.cpp
   src/Process/LinuxMisc.cpp
+  src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
   src/Process/LinuxSignals.cpp
   src/Process/ProcessFiles.cpp

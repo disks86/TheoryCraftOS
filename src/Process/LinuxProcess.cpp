@@ -99,6 +99,7 @@ void inherit_fork_state(Process& child, Process& parent, const LinuxProcessState
   for (LinuxProcessState::Info& info : to.info) info = LinuxProcessState::Info();
   for (LinuxProcessState::IntervalTimer& timer : to.timers) timer = LinuxProcessState::IntervalTimer();
   for (LinuxProcessState::PosixTimer& timer : to.posix_timers) timer = LinuxProcessState::PosixTimer();
+  for (LinuxProcessState::AioContext& context : to.aio) context = LinuxProcessState::AioContext();
   for (LinuxProcessState::Child& c : to.children) c = LinuxProcessState::Child();
   to.fork = LinuxProcessState::ForkRequest();
   // The child has one thread, the copy of the one that called: its mask and alternate stack are the child's first thread's.

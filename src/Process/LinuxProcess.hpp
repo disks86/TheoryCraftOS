@@ -156,6 +156,13 @@ uint64_t sys_personality(Process& p, uint64_t persona);
 uint64_t sys_prctl(Process& p, UserArch arch, uint64_t option, uint64_t a, uint64_t b);
 uint64_t sys_membarrier(Process& p, uint64_t command, uint64_t flags);
 
+// --- LinuxAio.cpp: Linux's own asynchronous I/O. A request is carried out when it is submitted; io_getevents collects the results.
+uint64_t sys_io_setup(Process& p, uint64_t count, uint64_t context_address);
+uint64_t sys_io_destroy(Process& p, uint64_t id);
+uint64_t sys_io_submit(Process& p, uint64_t id, uint64_t count, uint64_t list);
+uint64_t sys_io_cancel(Process& p, uint64_t id, uint64_t request, uint64_t result);
+uint64_t sys_io_getevents(Process& p, uint64_t id, uint64_t least, uint64_t most, uint64_t events, uint64_t timeout);
+
 // pidfd: a descriptor for a process (the caller, a child, or any process there is). It can be polled (readable once the process has ended), waited
 // for (waitid with P_PIDFD) and signalled.
 uint64_t sys_pidfd_open(Process& p, uint64_t pid, uint64_t flags);
