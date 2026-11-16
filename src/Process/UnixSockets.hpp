@@ -341,11 +341,11 @@ UnixSocketManager* system_unix_sockets();
 // Tests: use this one instead (null: back to the made-on-first-use one).
 void set_system_unix_sockets(UnixSocketManager* manager);
 
-// Runs `attempt` with the lock held until it says it is done (returns true), sleeping between tries until something changes (the process's own lock is let go
-// meanwhile, as windowsabi::wait_until does). 0 when done; 1 when `timeout_ns` (~0 = none) passed; 2 when the process is exiting or was interrupted.
+// Runs `attempt` with the system's lock held until it says it is done (returns true), sleeping between tries until something changes (the process's own lock
+// is let go meanwhile, as windowsabi::wait_until does). 0 when done; 1 when `timeout_ns` (~0 = none) passed; 2 when the process is exiting or was interrupted.
+// For anything that waits on state the whole system shares under that lock (sockets, System V IPC, message queues).
 template <typename Attempt>
-uint32_t unix_wait(Process& p, UnixSocketManager& sockets, uint64_t timeout_ns, Attempt&& attempt) {
-  ISystemSync& sync = sockets.sync();
+uint32_t system_wait(Process& p, ISystemSync& sync, uint64_t timeout_ns, Attempt&& attempt) {
   IProcessRuntime* runtime = p.runtime();
   const uint64_t started = p.host().monotonic_ns();
   sync.lock();
@@ -372,6 +372,11 @@ uint32_t unix_wait(Process& p, UnixSocketManager& sockets, uint64_t timeout_ns, 
     if (runtime) runtime->lock();
     sync.lock();
   }
+}
+
+template <typename Attempt>
+uint32_t unix_wait(Process& p, UnixSocketManager& sockets, uint64_t timeout_ns, Attempt&& attempt) {
+  return system_wait(p, sockets.sync(), timeout_ns, static_cast<Attempt&&>(attempt));
 }
 
 }  // namespace process

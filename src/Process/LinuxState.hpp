@@ -122,6 +122,14 @@ struct LinuxProcessState {
   };
   Child children[kMaxChildren];
 
+  // --- System V shared memory attached with shmat(): where and how long, so that shmdt() can take it out again. (A child made by fork() has them too.)
+  static constexpr uint32_t kMaxShmAttaches = 64;
+  struct ShmAttach {
+    uint64_t address = 0, size = 0;      // size 0: free
+    uint32_t id = 0;
+  };
+  ShmAttach shm_attaches[kMaxShmAttaches];
+
   // fork() decided to make a process: whoever runs the program copies it (the memory, the calling thread's registers) once the call is over, as with clone()
   // for a thread. See Process::take_fork.
   struct ForkRequest {

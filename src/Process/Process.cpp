@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Process.hpp"
+#include "Process/LinuxIpc.hpp"
 #include "Process/LinuxProcess.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
@@ -67,6 +68,7 @@ Process::~Process() {
   // file's address, which the next one made may get), and a file marked delete-on-close is removed.
   for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot)
     if (files_.kind(slot) == DescriptorKind::File || files_.kind(slot) == DescriptorKind::Directory) files_.close(slot);
+  if (binding_.abi == SyscallAbi::Linux) linuxabi::ipc_process_gone(id_);      // (what its semaphore operations with SEM_UNDO came to is taken back)
   if (ObjectManager* objects = system_objects()) {
     if (binding_.abi == SyscallAbi::Linux) objects->unlock_all(&linux_state_);      // (the record locks fcntl() gave the process)
     for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {

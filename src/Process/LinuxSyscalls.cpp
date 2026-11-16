@@ -18,6 +18,7 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/LinuxExec.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Process/LinuxIpc.hpp"
 #include "Process/LinuxProcess.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
@@ -59,6 +60,8 @@ enum class Call : uint16_t { None, Clone3, Read, Write, Writev, Close, Getpid, G
   TimerCreate, TimerSettime, TimerGettime, TimerGetoverrun, TimerDelete, FutexWaitv, FutexWake2, FutexWait2, FutexRequeue2,
   GetMempolicy, SetMempolicy, Mbind, SetMempolicyHomeNode, MigratePages, MovePages, PkeyAlloc, PkeyFree, PkeyMprotect, Kcmp, ProcessVmReadv, ProcessVmWritev,
   Cachestat, RestartSyscall,
+  // System V IPC (LinuxIpc.cpp)
+  Shmget, Shmat, Shmdt, Shmctl, Semget, Semop, Semtimedop, Semctl, Msgget, Msgsnd, Msgrcv, Msgctl,
   // calls that are in Linux's tables and have a fixed answer here: see the table
   Unsupported, Absent };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
@@ -157,6 +160,10 @@ constexpr NumberEntry kNumbers[] = {
     {256, 238, Call::MigratePages}, {279, 239, Call::MovePages}, {330, 289, Call::PkeyAlloc}, {331, 290, Call::PkeyFree},
     {329, 288, Call::PkeyMprotect}, {312, 272, Call::Kcmp},     {310, 270, Call::ProcessVmReadv}, {311, 271, Call::ProcessVmWritev},
     {451, 451, Call::Cachestat},   {219, 128, Call::RestartSyscall},
+    // System V shared memory, semaphores and message queues (LinuxIpc.cpp)
+    {29, 194, Call::Shmget},       {30, 196, Call::Shmat},      {67, 197, Call::Shmdt},       {31, 195, Call::Shmctl},
+    {64, 190, Call::Semget},       {65, 193, Call::Semop},      {220, 192, Call::Semtimedop}, {66, 191, Call::Semctl},
+    {68, 186, Call::Msgget},       {69, 189, Call::Msgsnd},     {70, 188, Call::Msgrcv},      {71, 187, Call::Msgctl},
     // more of what only an administrator of a real system does (EPERM): vhangup, iopl, ioperm, init_module, finit_module, delete_module, kexec_load,
     // kexec_file_load, and the newer mount calls open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr, open_tree_attr, and fchroot
     {153, 58, Call::Refuse},       {172, kAbsent, Call::Refuse}, {173, kAbsent, Call::Refuse}, {175, 105, Call::Refuse},
@@ -687,6 +694,18 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ProcessVmReadv: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], false);
       case Call::ProcessVmWritev: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], true);
       case Call::Cachestat: return linuxabi::sys_cachestat(process, a[0], a[1], a[2], a[3]);
+      case Call::Shmget: return linuxabi::sys_shmget(process, a[0], a[1], a[2]);
+      case Call::Shmat: return linuxabi::sys_shmat(process, a[0], a[1], a[2]);
+      case Call::Shmdt: return linuxabi::sys_shmdt(process, a[0]);
+      case Call::Shmctl: return linuxabi::sys_shmctl(process, a[0], a[1], a[2]);
+      case Call::Semget: return linuxabi::sys_semget(process, a[0], a[1], a[2]);
+      case Call::Semop: return linuxabi::sys_semtimedop(process, a[0], a[1], a[2], 0);
+      case Call::Semtimedop: return linuxabi::sys_semtimedop(process, a[0], a[1], a[2], a[3]);
+      case Call::Semctl: return linuxabi::sys_semctl(process, arch_, a[0], a[1], a[2], a[3]);
+      case Call::Msgget: return linuxabi::sys_msgget(process, a[0], a[1]);
+      case Call::Msgsnd: return linuxabi::sys_msgsnd(process, a[0], a[1], a[2], a[3]);
+      case Call::Msgrcv: return linuxabi::sys_msgrcv(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Msgctl: return linuxabi::sys_msgctl(process, a[0], a[1], a[2]);
       case Call::Refuse: return error(kEperm);
       case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1], a[2], a[3]);
       case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0], a[1], a[2]);

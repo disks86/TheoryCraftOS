@@ -27,6 +27,7 @@
 #include <vector>
 #include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/LinuxIpc.hpp"
 #include "Process/LinuxProcess.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
@@ -1927,6 +1928,264 @@ static void test_misc_calls() {
   CHECK(rig.s(400) == -38 && rig.host.unhandled.size() == 1 && rig.host.unhandled[0] == 400);      // (a number that is no call is)
 }
 
+// --- System V IPC ---------------------------------------------------------------------------------------------------------------------------------------
+// The system's lock for these tests: a wait lets time pass, or has "another thread" do something first.
+struct IpcSync final : ISystemSync {
+  Host* host = nullptr;
+  std::function<void()> meanwhile;      // run once, at the first wait
+  int waits = 0;
+  void lock() override {}
+  void unlock() override {}
+  bool wait(uint64_t ns) override {
+    ++waits;
+    if (meanwhile) { auto run = meanwhile; meanwhile = nullptr; run(); return true; }
+    if (host) host->now += ns == ~uint64_t{0} ? 1000000000ull : ns;
+    return true;
+  }
+  void notify_all() override {}
+};
+struct IpcRig {
+  IpcSync sync;
+  LinuxIpcManager* ipc;
+  IpcRig() : ipc(new LinuxIpcManager(sync, A)) { set_system_linux_ipc(ipc); }
+  ~IpcRig() { set_system_linux_ipc(nullptr); delete ipc; }
+};
+
+static void test_shared_memory() {
+  constexpr uint64_t kCreate = 0x200, kExclusive = 0x400;
+  IpcRig system;
+  {
+    Rig rig, other(nullptr, 2);
+    const uint64_t buf = rig.alloc(128);
+    // a private segment, attached twice here and once in another process: one memory
+    const int64_t id = rig.s(29, 0, 10000, 0600 | kCreate);
+    CHECK(id >= 0);
+    const uint64_t a1 = rig.call(30, id, 0, 0), a2 = rig.call(30, id, 0, 010000 /* SHM_RDONLY */), b1 = other.call(30, id, 0, 0);
+    CHECK(int64_t(a1) > 0 && int64_t(a2) > 0 && a1 != a2 && int64_t(b1) > 0 && a1 % 4096 == 0);
+    rig.put64(a1 + 9992, 0x1122334455667788ull);
+    CHECK(rig.u64(a2 + 9992) == 0x1122334455667788ull && other.u64(b1 + 9992) == 0x1122334455667788ull && rig.u64(a1) == 0);
+    CHECK(!rig.process->write_user_u64(a2, 1) && other.process->write_user_u64(b1, 7) && rig.u64(a1) == 7);
+    CHECK(rig.process->write_user_u64(a1 + 12280, 1) && !rig.process->write_user_u64(a1 + 12288, 1));      // whole pages, and no more
+    CHECK(rig.s(31, id, 2, buf) == 0);      // IPC_STAT: struct shmid64_ds
+    CHECK(rig.u32(buf) == 0 && rig.u32(buf + 20) == 0600 && rig.u64(buf + 48) == 10000 && rig.u64(buf + 56) != 0 && rig.u32(buf + 80) == 1 && rig.u32(buf + 84) == 2 && rig.u64(buf + 88) == 3);
+    // by key
+    const int64_t named = rig.s(29, 0x1234, 4096, 0666 | kCreate);
+    CHECK(named >= 0 && named != id && other.s(29, 0x1234, 4096, 0) == named && other.s(29, 0x1234, 100, 0666 | kCreate) == named);
+    CHECK(rig.s(29, 0x1234, 4096, kCreate | kExclusive) == -17 && rig.s(29, 0x1234, 8192, 0) == -22 && rig.s(29, 0x9999, 4096, 0) == -2);
+    CHECK(rig.s(29, 0, 0, kCreate) == -22 && rig.s(29, 0, (64ull << 20) + 1, kCreate) == -22 && rig.s(29, 0, 4096, kCreate | 04000) == -22);
+    // IPC_SET, the lists (IPC_INFO, SHM_INFO, SHM_STAT)
+    rig.put32(buf + 4, 1000); rig.put32(buf + 8, 100); rig.put32(buf + 20, 0640);
+    CHECK(rig.s(31, named, 1, buf) == 0 && rig.s(31, named, 2, buf) == 0 && rig.u32(buf + 4) == 1000 && rig.u32(buf + 8) == 100 && rig.u32(buf + 20) == 0640 && rig.u32(buf) == 0x1234);
+    CHECK(rig.s(31, 0, 3, buf) == 1 && rig.u64(buf) == (64ull << 20) && rig.u64(buf + 16) == 128);      // the highest slot in use; shmmax, shmmni
+    CHECK(rig.s(31, 0, 14, buf) == 1 && rig.u32(buf) == 2 && rig.u64(buf + 8) == 4);                     // two segments, four pages
+    CHECK(rig.s(31, 1, 13, buf) == named && rig.u32(buf) == 0x1234 && rig.s(31, 5, 13, buf) == -22 && rig.s(31, 1, 15, buf) == named);
+    CHECK(rig.s(31, id, 11, 0) == 0 && rig.s(31, id, 12, 0) == 0 && rig.s(31, id, 99, 0) == -22 && rig.s(31, id, 2, kBad) == -14 && rig.s(31, id, 1, kBad) == -14);
+    CHECK(rig.s(31, 0, 3, kBad) == -14 && rig.s(31, 77777, 2, buf) == -22 && rig.s(31, ~uint64_t{0}, 2, buf) == -22);
+    // where it goes: a given address must be free and a page's (SHM_RND rounds it down), SHM_REMAP takes whatever is there out
+    const uint64_t spot = 0x40000000;
+    CHECK(rig.call(30, named, spot, 0) == spot && rig.s(30, named, spot, 0) == -22 && rig.s(30, named, spot + 0x10000 + 5, 0) == -22);
+    CHECK(rig.call(30, named, spot + 0x10000 + 5, 020000) == spot + 0x10000 && rig.call(30, named, spot, 040000) == spot);
+    CHECK(rig.s(30, named, 0, 040000) == -22 && rig.s(30, named, 0, 1) == -22 && rig.s(30, 424242, 0, 0) == -22 && rig.s(30, named, ~uint64_t{4095}, 0) == -22);
+    uint8_t protection = 0;
+    CHECK(rig.call(30, named, spot + 0x20000, 0100000 | 010000) == spot + 0x20000 && rig.space.protection_at(spot + 0x20000, &protection) && protection == (kProtRead | kProtExecute));
+    CHECK(rig.s(67, spot + 0x20000) == 0 && rig.s(67, spot + 0x20000) == -22 && rig.s(67, spot + 4096) == -22 && rig.s(67, 0) == -22);
+    CHECK(rig.s(67, spot) == 0 && rig.s(67, spot + 0x10000) == 0);
+    // removal: no key finds it any more, the processes that have it keep it, and it is gone with the last of them
+    CHECK(rig.s(31, id, 0, 0) == 0 && rig.s(31, id, 2, buf) == 0 && (rig.u32(buf + 20) & 01000) != 0 && rig.u64(buf + 88) == 3);
+    const uint64_t a3 = rig.call(30, id, 0, 0);
+    CHECK(int64_t(a3) > 0 && rig.u64(a3) == 7);      // (attaching by id still works, as on Linux)
+    CHECK(rig.s(67, a1) == 0 && rig.s(67, a2) == 0 && rig.s(67, a3) == 0 && rig.s(31, id, 2, buf) == 0 && rig.u64(buf + 88) == 1);
+    CHECK(other.u64(b1) == 7 && other.s(67, b1) == 0);
+    CHECK(rig.s(31, id, 2, buf) == -22 && rig.s(30, id, 0, 0) == -22);
+    CHECK(rig.s(31, named, 0, 0) == 0 && rig.s(29, 0x1234, 4096, 0) == -2 && rig.s(31, named, 2, buf) == -22);
+    const int64_t again = rig.s(29, 0, 4096, kCreate);
+    CHECK(again >= 0 && again != id && again != named && again % 32768 == id % 32768);      // the slot is used again under another id
+    // a program that attaches without end; one that unmaps what it attached itself
+    int attached = 0;
+    while (int64_t(rig.call(30, again, 0, 0)) > 0) ++attached;
+    CHECK(attached == 64 && rig.s(30, again, 0, 0) == -24);      // EMFILE
+    const uint64_t mine = other.call(30, again, 0, 0);
+    CHECK(int64_t(mine) > 0 && other.s(11, mine, 4096) == 0 && other.s(67, mine) == -22);
+    CHECK(rig.s(31, again, 0, 0) == 0);      // (removed while attached 64 times: its memory goes when the process does)
+  }
+  {      // the segment's memory is gone once nothing has it: the next call sweeps
+    Rig rig;
+    CHECK(rig.s(31, 0, 14, rig.alloc(64)) == 0 && rig.u32(rig.cursor - 64) == 0);
+  }
+  {      // without the manager (a system that has none yet) the calls say so
+    set_system_linux_ipc(nullptr);
+    Rig rig;
+    CHECK(rig.s(29, 0, 4096, 0x200) == -38 && rig.s(64, 0, 1, 0x200) == -38 && rig.s(68, 0, 0x200) == -38);
+    set_system_linux_ipc(system.ipc);
+  }
+}
+
+static void test_semaphores() {
+  constexpr uint64_t kCreate = 0x200, kNoWait = 0x800, kUndo = 0x1000;
+  IpcRig system;
+  Waiting w;
+  Rig& rig = w.rig;
+  system.sync.host = &rig.host;
+  const uint64_t buf = rig.alloc(256);
+  auto ops = [&](std::initializer_list<int> values) {      // sem_num, sem_op, sem_flg, ...
+    const uint64_t at = rig.alloc(values.size() * 2);
+    uint64_t i = 0;
+    for (const int v : values) { const uint8_t raw[2] = {uint8_t(v), uint8_t(v >> 8)}; CHECK(rig.space.write_privileged(at + 2 * i++, ConstByteView(raw, 2))); }
+    return at;
+  };
+  const int64_t id = rig.s(64, 0x77, 3, 0600 | kCreate);
+  CHECK(id >= 0 && rig.s(64, 0x77, 3, 0) == id && rig.s(64, 0x77, 4, 0) == -22 && rig.s(64, 0x77, 1, kCreate | 0x400) == -17 && rig.s(64, 0x78, 1, 0) == -2);
+  CHECK(rig.s(64, 0, 0, kCreate) == -22 && rig.s(64, 0, 129, kCreate) == -22 && rig.s(64, 0, uint64_t(-1), kCreate) == -22);
+  // values: GETVAL (12), SETVAL (16), GETALL (13), SETALL (17), GETPID (11)
+  CHECK(rig.s(66, id, 0, 12) == 0 && rig.s(66, id, 0, 16, 5) == 0 && rig.s(66, id, 0, 12) == 5 && rig.s(66, id, 0, 11) == 1 && rig.s(66, id, 2, 11) == 0);
+  CHECK(rig.s(66, id, 0, 16, 32768) == -34 && rig.s(66, id, 0, 16, uint64_t(-1)) == -34 && rig.s(66, id, 3, 12) == -22 && rig.s(66, id, 3, 16, 1) == -22);
+  CHECK(rig.s(66, id, 0, 17, ops({7, 8, 9})) == 0 && rig.s(66, id, 0, 13, buf) == 0 && rig.bytes(buf, 6) == std::string("\x07\0\x08\0\x09\0", 6));
+  CHECK(rig.s(66, id, 0, 17, ops({1, 2, 0x8000})) == -34 && rig.s(66, id, 1, 12) == 8 && rig.s(66, id, 0, 17, kBad) == -14 && rig.s(66, id, 0, 13, kBad) == -14);
+  // operations: all of them or none
+  CHECK(rig.s(65, id, ops({0, -2, 0, 1, 3, 0}), 2) == 0 && rig.s(66, id, 0, 12) == 5 && rig.s(66, id, 1, 12) == 11);
+  CHECK(rig.s(65, id, ops({0, -1, 0, 2, -10, int(kNoWait)}), 2) == -11 && rig.s(66, id, 0, 12) == 5);      // the first one was not carried out either
+  CHECK(rig.s(65, id, ops({0, -5, 0, 0, 0, int(kNoWait)}), 2) == 0 && rig.s(66, id, 0, 12) == 0);          // down to zero, then "is it zero"
+  CHECK(rig.s(65, id, ops({1, 0, int(kNoWait)}), 1) == -11 && rig.s(65, id, ops({3, 1, 0}), 1) == -27 && rig.s(65, id, ops({1, 32767, 0}), 1) == -34);
+  CHECK(rig.s(65, id, kBad, 1) == -14 && rig.s(65, id, ops({0, 1, 0}), 0) == -22 && rig.s(65, id, buf, 65) == -7 && rig.s(65, 99999, ops({0, 1, 0}), 1) == -22);
+  // waiting: for a time, for another thread, for the set to go
+  const uint64_t started = rig.host.now;
+  CHECK(rig.s(220, id, ops({0, -1, 0}), 1, rig.words({2, 0})) == -11 && rig.host.now - started >= 2000000000ull && rig.host.now - started < 2200000000ull);
+  CHECK(rig.s(220, id, ops({0, -1, 0}), 1, kBad) == -14 && rig.s(220, id, ops({0, -1, 0}), 1, rig.words({1, 1000000000})) == -22);
+  CHECK(rig.s(66, id, 0, 14) == 0 && rig.s(66, id, 0, 15) == 0);      // nobody is counted as waiting any more
+  system.sync.meanwhile = [&]() {
+    CHECK(rig.s(66, id, 0, 14) == 1 && rig.s(66, id, 0, 15) == 0);    // GETNCNT: one thread waits for it to rise
+    CHECK(rig.s(65, id, ops({0, 3, 0}), 1) == 0);
+  };
+  CHECK(rig.s(65, id, ops({0, -2, 0}), 1) == 0 && rig.s(66, id, 0, 12) == 1 && rig.s(66, id, 0, 14) == 0);
+  system.sync.meanwhile = [&]() {
+    CHECK(rig.s(66, id, 0, 15) == 1 && rig.s(66, id, 0, 14) == 0);    // GETZCNT
+    CHECK(rig.s(65, id, ops({0, -1, 0}), 1) == 0);
+  };
+  CHECK(rig.s(65, id, ops({0, 0, 0}), 1) == 0);
+  // IPC_STAT (2): struct semid64_ds, which has two more words on x86-64 than on the other CPUs; IPC_SET (1); the lists
+  CHECK(rig.s(66, id, 0, 2, buf) == 0 && rig.u32(buf) == 0x77 && rig.u32(buf + 20) == 0600 && rig.u64(buf + 48) != 0 && rig.u64(buf + 64) != 0 && rig.u64(buf + 80) == 3);
+  {
+    Rig arm(nullptr, 3, UserArch::AArch64);
+    const uint64_t out = arm.alloc(128);
+    CHECK(arm.s(190, 0x77, 3, 0) == id && arm.s(191, id, 0, 2, out) == 0 && arm.u32(out) == 0x77 && arm.u64(out + 48) != 0 && arm.u64(out + 56) != 0 && arm.u64(out + 64) == 3);
+    CHECK(arm.s(193, id, arm.words({0x0000000000050001ull}), 1) == 0 && arm.s(191, id, 1, 12) == 16 && arm.s(192, id, arm.words({0x00000800FFE00001ull}), 1, 0) == -11);
+  }
+  rig.put32(buf + 20, 0644);
+  CHECK(rig.s(66, id, 0, 1, buf) == 0 && rig.s(66, id, 0, 2, buf) == 0 && rig.u32(buf + 20) == 0644);
+  CHECK(rig.s(66, 0, 0, 3, buf) == 0 && rig.u32(buf + 4) == 128 && rig.u32(buf + 16) == 128 && rig.u32(buf + 32) == 32767);      // semmni, semmsl, semvmx
+  CHECK(rig.s(66, 0, 0, 19, buf) == 0 && rig.u32(buf + 28) == 1 && rig.u32(buf + 36) == 3 && rig.s(66, 0, 0, 18, buf) == id && rig.s(66, 9, 0, 18, buf) == -22);
+  CHECK(rig.s(66, id, 0, 2, kBad) == -14 && rig.s(66, id, 0, 99) == -22 && rig.s(66, 0, 0, 3, kBad) == -14);
+  // SEM_UNDO: what a process did is taken back when it ends
+  CHECK(rig.s(66, id, 0, 17, ops({10, 10, 10})) == 0);
+  {
+    Rig other(nullptr, 2);
+    const uint64_t list = other.alloc(16);
+    auto put = [&](int number, int change, int flags) {
+      const uint8_t raw[6] = {uint8_t(number), 0, uint8_t(change), uint8_t(change >> 8), uint8_t(flags), uint8_t(flags >> 8)};
+      CHECK(other.space.write_privileged(list, ConstByteView(raw, 6)));
+    };
+    put(0, -4, int(kUndo));
+    CHECK(other.s(65, id, list, 1) == 0);
+    put(0, 1, int(kUndo));
+    CHECK(other.s(65, id, list, 1) == 0);
+    put(1, 5, int(kUndo));
+    CHECK(other.s(65, id, list, 1) == 0);
+    put(2, -3, 0);
+    CHECK(other.s(65, id, list, 1) == 0);      // (without the flag: it stays)
+    CHECK(rig.s(66, id, 0, 12) == 7 && rig.s(66, id, 1, 12) == 15 && rig.s(66, id, 2, 12) == 7 && rig.s(66, id, 1, 11) == 2);
+    CHECK(rig.s(66, id, 1, 16, 20) == 0);      // SETVAL forgets what was to be taken back for that one
+  }
+  CHECK(rig.s(66, id, 0, 12) == 10 && rig.s(66, id, 1, 12) == 20 && rig.s(66, id, 2, 12) == 7);
+  {      // more of them than can be remembered: the operation is refused whole
+    const int64_t wide = rig.s(64, 0, 128, kCreate);
+    CHECK(wide >= 0);
+    int done = 0;
+    for (int set = 0; set < 3; ++set) {
+      const int64_t one = set == 0 ? wide : rig.s(64, 0, 128, kCreate);
+      for (int i = 0; i < 128; ++i) {
+        const int64_t r = rig.s(65, one, ops({i, 1, int(kUndo)}), 1);
+        if (r == 0) ++done;
+        else CHECK(r == -28 && rig.s(66, one, i, 12) == 0);
+      }
+    }
+    CHECK(done == 256);
+  }
+  // removal (0): a thread that waits is told (EIDRM), the id names nothing afterwards
+  system.sync.meanwhile = [&]() { CHECK(rig.s(66, id, 0, 0) == 0); };
+  CHECK(rig.s(65, id, ops({0, -100, 0}), 1) == -43);
+  CHECK(rig.s(65, id, ops({0, 1, 0}), 1) == -22 && rig.s(66, id, 0, 12) == -22 && rig.s(64, 0x77, 3, 0) == -2);
+  const int64_t again = rig.s(64, 0x77, 2, kCreate);
+  CHECK(again >= 0 && again != id && rig.s(66, again, 0, 12) == 0);
+}
+
+static void test_message_queues() {
+  constexpr uint64_t kCreate = 0x200, kNoWait = 0x800, kNoError = 010000, kExcept = 020000;
+  IpcRig system;
+  Waiting w;
+  Rig& rig = w.rig;
+  system.sync.host = &rig.host;
+  const uint64_t buf = rig.alloc(256), big = rig.call(9, 0, 16384, 3, 0x22, ~uint64_t{0}, 0);
+  auto message = [&](uint64_t type, const std::string& text) {
+    const uint64_t at = rig.alloc(8 + text.size() + 1);
+    rig.put64(at, type);
+    CHECK(rig.space.write_privileged(at + 8, ConstByteView(reinterpret_cast<const uint8_t*>(text.data()), text.size())));
+    return at;
+  };
+  auto text = [&](int64_t n) { return n < 0 ? std::string("<error>") : rig.bytes(buf + 8, uint64_t(n)); };
+  const int64_t id = rig.s(68, 0x55, 0600 | kCreate);
+  CHECK(id >= 0 && rig.s(68, 0x55, 0) == id && rig.s(68, 0x55, kCreate | 0x400) == -17 && rig.s(68, 0x56, 0) == -2);
+  CHECK(rig.s(69, id, message(1, "one"), 3, 0) == 0 && rig.s(69, id, message(3, "three"), 5, 0) == 0 && rig.s(69, id, message(2, "two"), 3, 0) == 0);
+  CHECK(rig.s(69, id, message(3, "THREE"), 5, 0) == 0 && rig.s(69, id, message(9, ""), 0, 0) == 0);
+  CHECK(rig.s(71, id, 2, buf) == 0 && rig.u32(buf) == 0x55 && rig.u64(buf + 72) == 16 && rig.u64(buf + 80) == 5 && rig.u64(buf + 88) == 16384 && rig.u32(buf + 96) == 1);      // IPC_STAT
+  // which one comes out: of a type, of the lowest type up to a bound, of any other type, the first
+  int64_t n = rig.s(70, id, buf, 100, 3, 0);
+  CHECK(n == 5 && rig.u64(buf) == 3 && text(n) == "three");
+  n = rig.s(70, id, buf, 100, uint64_t(-2), 0);
+  CHECK(n == 3 && rig.u64(buf) == 1 && text(n) == "one");
+  n = rig.s(70, id, buf, 100, uint64_t(-2), 0);
+  CHECK(n == 3 && rig.u64(buf) == 2 && text(n) == "two");
+  CHECK(rig.s(70, id, buf, 100, uint64_t(-2), kNoWait) == -42);      // ENOMSG
+  n = rig.s(70, id, buf, 100, 3, kExcept);
+  CHECK(n == 0 && rig.u64(buf) == 9);
+  CHECK(rig.s(70, id, buf, 4, 0, 0) == -7);                           // E2BIG: it does not fit, and stays
+  n = rig.s(70, id, buf, 4, 0, kNoError);
+  CHECK(n == 4 && rig.u64(buf) == 3 && text(n) == "THRE");
+  CHECK(rig.s(70, id, buf, 100, 0, kNoWait) == -42 && rig.s(71, id, 2, buf) == 0 && rig.u64(buf + 72) == 0 && rig.u64(buf + 80) == 0 && rig.u32(buf + 100) == 1);
+  // what is refused
+  rig.put64(big, 1);
+  CHECK(rig.s(69, id, message(0, "x"), 1, 0) == -22 && rig.s(69, id, message(uint64_t(-1), "x"), 1, 0) == -22 && rig.s(69, id, big, 8193 - 8, 0) == 0);
+  CHECK(rig.s(70, id, buf, 0, 0, kNoWait | kNoError) == 0);
+  CHECK(rig.s(69, id, big, 8193, 0) == -22 && rig.s(69, id, kBad, 1, 0) == -14 && rig.s(69, 99999, message(1, "x"), 1, 0) == -22 && rig.s(70, 99999, buf, 1, 0, 0) == -22);
+  CHECK(rig.s(70, id, buf, uint64_t(-1), 0, 0) == -22 && rig.s(70, id, buf, 1, 0, 040000) == -38);
+  CHECK(rig.s(69, id, message(4, "lost"), 4, 0) == 0 && rig.s(70, id, kBad, 100, 0, 0) == -14 && rig.s(70, id, buf, 100, 0, kNoWait) == -42);      // (taken, and nowhere to put it)
+  // a full queue: the sender waits for a receiver, a receiver for a sender
+  CHECK(rig.s(69, id, big, 8192, 0) == 0 && rig.s(69, id, big, 8192, 0) == 0 && rig.s(69, id, big, 1, kNoWait) == -11);
+  system.sync.meanwhile = [&]() { CHECK(rig.s(70, id, big + 8192, 8192 - 8, 0, kNoError) == 8192 - 8); };
+  CHECK(rig.s(69, id, message(7, "late"), 4, 0) == 0);
+  CHECK(rig.s(70, id, big + 8192, 8192 - 8, 1, kNoError) == 8192 - 8);
+  n = rig.s(70, id, buf, 100, 0, 0);
+  CHECK(n == 4 && rig.u64(buf) == 7 && text(n) == "late");
+  system.sync.meanwhile = [&]() { CHECK(rig.s(69, id, message(5, "woke"), 4, 0) == 0); };
+  n = rig.s(70, id, buf, 100, 5, 0);
+  CHECK(n == 4 && text(n) == "woke");
+  // IPC_SET (1): the limit; the lists (IPC_INFO 3, MSG_INFO 12, MSG_STAT 11)
+  CHECK(rig.s(71, id, 2, buf) == 0);
+  rig.put64(buf + 88, 10); rig.put32(buf + 20, 0644);
+  CHECK(rig.s(71, id, 1, buf) == 0 && rig.s(71, id, 2, buf) == 0 && rig.u64(buf + 88) == 10 && rig.u32(buf + 20) == 0644);
+  CHECK(rig.s(69, id, message(1, "0123456789"), 10, kNoWait) == 0 && rig.s(69, id, message(1, "x"), 1, kNoWait) == -11 && rig.s(69, id, message(1, "0123456789a"), 11, 0) == -22);
+  rig.put64(buf + 88, uint64_t{1} << 40);
+  CHECK(rig.s(71, id, 1, buf) == -22 && rig.s(71, id, 1, kBad) == -14 && rig.s(71, id, 2, kBad) == -14 && rig.s(71, id, 99, buf) == -22);
+  CHECK(rig.s(71, 0, 3, buf) == 0 && rig.u32(buf + 8) == 8192 && rig.u32(buf + 12) == 16384 && rig.u32(buf + 16) == 64);
+  CHECK(rig.s(71, 0, 12, buf) == 0 && rig.u32(buf) == 1 && rig.u32(buf + 4) == 1 && rig.u32(buf + 24) == 10 && rig.s(71, 0, 11, buf) == id && rig.s(71, 3, 11, buf) == -22);
+  // removal (0): whoever waits is told, and the queue's messages go with it
+  system.sync.meanwhile = [&]() { CHECK(rig.s(71, id, 0, 0) == 0); };
+  CHECK(rig.s(70, id, buf, 100, 42, 0) == -43);
+  CHECK(rig.s(70, id, buf, 100, 0, kNoWait) == -22 && rig.s(68, 0x55, 0) == -2);
+  int made = 0;
+  while (rig.s(68, 0, kCreate) >= 0) ++made;
+  CHECK(made == 64 && rig.s(68, 0, kCreate) == -28);
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -1992,8 +2251,11 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues},
       {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
+  const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {
+    if (verbose) { printf("%s\n", test.name); fflush(stdout); }
     test.run();
     if (A.live != 0) {      // every test gives back what it took
       printf("FAILED: %d allocation(s) left after \"%s\"\n", A.live, test.name);
