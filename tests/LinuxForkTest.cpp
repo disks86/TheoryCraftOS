@@ -15,10 +15,10 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// fork(), wait and signals with their handlers, end to end: tests/linux/forktest.c and tests/linux/signaltest.c (freestanding x86-64 Linux programs) are run
-// on the emulator, where a forked child is a second emulated process on a host thread, and what each prints is compared with what the same program printed
-// when it ran on the build machine's own Linux kernel.
-//   LinuxForkTest <forktest.elf> <its output> <signaltest.elf> <its output>
+// fork(), wait and signals with their handlers, end to end: tests/linux/forktest.c and tests/linux/signaltest.c (freestanding Linux programs) are run on the
+// emulator, where a forked child is a second emulated process on a host thread, and what each prints is compared with what the same program printed on a
+// real Linux kernel: the x86-64 builds on the build machine's own, the AArch64 and RISC-V builds of signaltest.c (checked in) under qemu's user mode.
+//   LinuxForkTest <forktest.elf> <its output> {<signaltest.elf> <its output>}...      (signaltest: the x86-64 build, and the AArch64 and RISC-V ones)
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -175,12 +175,12 @@ static void test_program(const char* elf_path, const char* expected_path, int pr
 }
 
 int main(int argc, char** argv) {
-  if (argc < 5) {
-    printf("usage: LinuxForkTest <forktest.elf> <its output on Linux> <signaltest.elf> <its output on Linux>\n");
+  if (argc < 5 || argc % 2 == 0) {
+    printf("usage: LinuxForkTest <forktest.elf> <its output on Linux> {<signaltest.elf> <its output on Linux>}...\n");
     return 2;
   }
   test_program(argv[1], argv[2], 15, "fork ok\n");
-  test_program(argv[3], argv[4], 8, "signals ok\n");
+  for (int i = 3; i + 1 < argc; i += 2) test_program(argv[i], argv[i + 1], 8, "signals ok\n");      // (the x86-64 build, then the AArch64 and RISC-V ones)
   if (g_failed) {
     printf("LinuxForkTest: %d FAILED\n", g_failed);
     return 1;

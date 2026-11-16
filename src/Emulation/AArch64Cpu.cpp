@@ -82,6 +82,38 @@ bool AArch64Cpu::pending_syscall(process::SyscallAbi abi, process::SyscallReques
   return process::decode_aarch64_linux(ArrayView<const uint64_t>(s_.x, 31), out);
 }
 
+bool AArch64Cpu::get_signal_context(process::linuxabi::LinuxSignalContext* out) const {
+  *out = process::linuxabi::LinuxSignalContext();
+  out->arch = process::UserArch::AArch64;
+  for (uint32_t i = 0; i < 31; ++i) out->x[i] = s_.x[i];
+  out->sp = s_.sp;
+  out->pc = s_.pc;
+  out->pstate = s_.nzcv & (kN | kZ | kC | kV);
+  for (uint32_t i = 0; i < 32; ++i) {
+    out->vector[2 * i] = s_.v[i].lo;
+    out->vector[2 * i + 1] = s_.v[i].hi;
+  }
+  out->fpcr = s_.fpcr;
+  out->fpsr = s_.fpsr;
+  return true;
+}
+
+bool AArch64Cpu::set_signal_context(const process::linuxabi::LinuxSignalContext& context) {
+  if (context.arch != process::UserArch::AArch64) return false;
+  for (uint32_t i = 0; i < 31; ++i) s_.x[i] = context.x[i];
+  s_.sp = context.sp;
+  s_.pc = context.pc;
+  s_.nzcv = static_cast<uint32_t>(context.pstate) & (kN | kZ | kC | kV);
+  for (uint32_t i = 0; i < 32; ++i) {
+    s_.v[i].lo = context.vector[2 * i];
+    s_.v[i].hi = context.vector[2 * i + 1];
+  }
+  s_.fpcr = context.fpcr;
+  s_.fpsr = context.fpsr;
+  exclusive_valid_ = false;      // (an exception return clears the exclusive monitor)
+  return true;
+}
+
 AArch64Cpu::Step AArch64Cpu::fail(uint8_t vector, uint64_t address) {
   fault_.vector = vector;
   fault_.address = address;

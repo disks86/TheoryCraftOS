@@ -116,7 +116,8 @@ for t in "${WANTED[@]}"; do
                    gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$out/emu/signaltest" tests/linux/signaltest.c
                    "$out/emu/signaltest" > "$out/emu/signaltest-expected.txt"
                    $cxx $flags tests/LinuxForkTest.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -o "$out/LinuxForkTest"
-                   echo "== LinuxForkTest"; "$out/LinuxForkTest" "$out/emu/forktest" "$out/emu/forktest-expected.txt" "$out/emu/signaltest" "$out/emu/signaltest-expected.txt" ;;
+                   echo "== LinuxForkTest"; "$out/LinuxForkTest" "$out/emu/forktest" "$out/emu/forktest-expected.txt" "$out/emu/signaltest" "$out/emu/signaltest-expected.txt" \
+                     tests/data/emulation/signals-aarch64.elf tests/data/emulation/signals-aarch64-expected.txt tests/data/emulation/signals-riscv64.elf tests/data/emulation/signals-riscv64-expected.txt ;;      # (the last four: tests/linux/build_signaltest.sh)
     LinuxSyscallTest) build_and_run LinuxSyscallTest tests/LinuxSyscallTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     EmulationJitTest) mkdir -p "$out/emu"
                 gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$out/emu/guest" tests/data/emulation/guest.c

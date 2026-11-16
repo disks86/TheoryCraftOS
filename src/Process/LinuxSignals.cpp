@@ -16,7 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxProcess.hpp"
+#include "Process/LinuxSignalContext.hpp"
 #include "Process/AddressSpace.hpp"
+#include "Process/LinuxFiles.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace process::linuxabi {
@@ -125,6 +127,57 @@ struct FaultDetail {
   uint64_t error = 0, trap = 0, address = 0;
 };
 
+// What is the same for every CPU once a frame is in place: the mask while the handler runs, and the one-shot settings of the action.
+void handler_entered(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, const LinuxProcessState::Action& action, bool switched_stack) {
+  LinuxProcessState& state = p.linux_state();
+  // While the handler runs: its own signal (unless SA_NODEFER) and the action's mask are blocked on top of what was.
+  thread.blocked = (thread.blocked | action.mask | ((action.flags & kSaNoDefer) ? 0 : bit(signal))) & ~kUnblockable;
+  if (action.flags & kSaResetHand) state.actions[signal].handler = kSigDfl;
+  if (switched_stack && (thread.alt_flags & kSsAutodisarm)) {
+    thread.alt_stack = thread.alt_size = 0;
+    thread.alt_flags = kSsDisable;
+  }
+  state.info[signal] = LinuxProcessState::Info();
+}
+
+// Where a handler's frame goes: below the interrupted code's stack pointer (and its red zone, on a CPU whose ABI has one), or at the top of the alternate
+// stack when the action asks for it and the thread is not on it already. False if the alternate stack's end is not an address.
+struct StackChoice {
+  uint64_t top = 0;
+  bool has_alt = false, on_alt = false, switches = false;
+  uint32_t flags_now() const { return has_alt ? (on_alt ? kSsOnStack : 0) : kSsDisable; }      // (ss_flags of the code that was interrupted, as Linux reports it)
+};
+bool choose_stack(const LinuxProcessState::Thread& thread, const LinuxProcessState::Action& action, uint64_t sp, uint64_t red_zone, StackChoice* out) {
+  out->has_alt = thread.alt_size != 0 && !(thread.alt_flags & kSsDisable);
+  out->on_alt = out->has_alt && sp > thread.alt_stack && sp - thread.alt_stack <= thread.alt_size;
+  out->switches = (action.flags & kSaOnStack) && out->has_alt && !out->on_alt;
+  if (out->switches) {
+    if (thread.alt_size > ~uint64_t{0} - thread.alt_stack) return false;
+    out->top = thread.alt_stack + thread.alt_size;
+  } else {
+    out->top = sp >= red_zone ? sp - red_zone : sp;
+  }
+  return true;
+}
+
+// siginfo_t, the same on every 64-bit CPU: si_signo, si_errno, si_code (4 each), padding (4), then what the kind of signal has: the address of a fault, or
+// who sent it (pid, uid) and, for SIGCHLD, how the child ended.
+void write_siginfo(ByteWriter& writer, uint32_t signal, const LinuxProcessState::Info& info) {
+  const uint64_t start = writer.position();
+  writer.le32(signal);
+  writer.le32(0);
+  writer.le32(uint32_t(info.code));
+  writer.le32(0);
+  if (signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap) {
+    writer.le64(info.address);
+  } else {
+    writer.le32(info.sender);
+    writer.le32(0);
+    writer.le32(uint32_t(info.status));
+  }
+  writer.zeros(kSiginfoBytes - (writer.position() - start));
+}
+
 // Builds the frame for `signal` and points the registers at its handler. False if the frame cannot be written (no stack left, no restorer to return through):
 // the caller ends the process, as Linux does with SIGSEGV.
 bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, const LinuxProcessState::Action& action, uint64_t old_mask, const FaultDetail& fault,
@@ -134,16 +187,9 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   // The handler's address goes into the instruction pointer as it is: one that is no user address must never get there (the processor would fault in the
   // kernel on the way back to user mode).
   if (action.handler >= AddressSpace::kUserTop) return false;
-  uint64_t sp = context->gpr[X86Context::kRsp];
-  const bool has_alt = thread.alt_size != 0 && !(thread.alt_flags & kSsDisable);
-  const bool on_alt = has_alt && sp > thread.alt_stack && sp - thread.alt_stack <= thread.alt_size;
-  const bool switches = (action.flags & kSaOnStack) && has_alt && !on_alt;
-  if (switches) {
-    if (thread.alt_size > ~uint64_t{0} - thread.alt_stack) return false;
-    sp = thread.alt_stack + thread.alt_size;
-  } else if (sp >= kRedZone) {
-    sp -= kRedZone;      // (the 128 bytes below the stack pointer are the interrupted function's)
-  }
+  StackChoice stack;
+  if (!choose_stack(thread, action, context->gpr[X86Context::kRsp], kRedZone, &stack)) return false;      // (the 128 bytes below the stack pointer are the interrupted function's)
+  const uint64_t sp = stack.top;
   if (sp < kFpuBytes + kFrameBytes + 64) return false;
   const uint64_t fpu_at = (sp - kFpuBytes) & ~uint64_t{63};
   const uint64_t frame_at = ((fpu_at - kFrameBytes) & ~uint64_t{15}) - 8;      // (as after a call: the stack pointer + 8 is 16-byte aligned at the handler's first instruction)
@@ -155,7 +201,7 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   writer.le64(0);                                   // uc_flags
   writer.le64(0);                                   // uc_link
   writer.le64(thread.alt_stack);                    // uc_stack
-  writer.le32(has_alt ? (on_alt ? kSsOnStack : 0) : kSsDisable);      // (of the code that was interrupted, as Linux reports it)
+  writer.le32(stack.flags_now());
   writer.le32(0);
   writer.le64(thread.alt_size);
   for (const uint32_t index : kContextOrder) writer.le64(context->gpr[index]);
@@ -172,20 +218,7 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   writer.le64(fpu_at);                              // fpstate
   writer.zeros(64);
   writer.le64(old_mask);                            // uc_sigmask
-  // siginfo_t: si_signo, si_errno, si_code (4 each), padding (4), then what the kind of signal has: the address of a fault, or who sent it (pid, uid) and, for
-  // SIGCHLD, how the child ended.
-  const LinuxProcessState::Info& info = state.info[signal];
-  writer.le32(signal);
-  writer.le32(0);
-  writer.le32(uint32_t(info.code));
-  writer.le32(0);
-  if (signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap) {
-    writer.le64(info.address);
-  } else {
-    writer.le32(info.sender);
-    writer.le32(0);
-    writer.le32(uint32_t(info.status));
-  }
+  write_siginfo(writer, signal, state.info[signal]);
   if (!writer.ok()) return false;
   if (!p.write_user(fpu_at, ConstByteView(context->fpu, kFpuBytes)) || !p.write_user(frame_at, ConstByteView(raw, sizeof(raw)))) return false;
 
@@ -196,16 +229,152 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   context->gpr[X86Context::kRax] = 0;
   context->rip = action.handler;
   context->rflags &= ~uint64_t{0x400 | 0x100};      // the direction and trap flags are clear in a handler
-  // While the handler runs: its own signal (unless SA_NODEFER) and the action's mask are blocked on top of what was.
-  thread.blocked = (thread.blocked | action.mask | ((action.flags & kSaNoDefer) ? 0 : bit(signal))) & ~kUnblockable;
-  if (action.flags & kSaResetHand) state.actions[signal].handler = kSigDfl;
-  if (switches && (thread.alt_flags & kSsAutodisarm)) {
-    thread.alt_stack = thread.alt_size = 0;
-    thread.alt_flags = kSsDisable;
-  }
-  state.info[signal] = LinuxProcessState::Info();
+  handler_entered(p, thread, signal, action, stack.switches);
   return true;
 }
+
+// --- entering a handler (AArch64 and RISC-V) -------------------------------------------------------------------------------------------------------------
+// Neither CPU's C library gives the kernel a way back from a handler (RISC-V has no SA_RESTORER at all; AArch64 has one, which glibc does not use): Linux
+// points the handler's return address at a few instructions in the vDSO that call rt_sigreturn. There is no vDSO here, so the process gets a page of its own
+// with those instructions the first time a handler is entered.
+constexpr uint64_t kRtSigreturnGeneric = 139;      // rt_sigreturn in the generic system-call table
+
+uint64_t signal_trampoline(Process& p, UserArch arch) {
+  LinuxProcessState& state = p.linux_state();
+  if (state.signal_trampoline != 0) return state.signal_trampoline;
+  AddressSpace* space = p.address_space();
+  if (!space) return 0;
+  // AArch64: mov x8, #139; svc #0.  RISC-V: li a7, 139; ecall.
+  const uint32_t code[2] = {arch == UserArch::AArch64 ? 0xD2800008u | uint32_t(kRtSigreturnGeneric << 5) : 0x00000893u | uint32_t(kRtSigreturnGeneric << 20),
+                            arch == UserArch::AArch64 ? 0xD4000001u : 0x00000073u};
+  uint8_t raw[8];
+  ByteWriter writer{ByteView(raw, sizeof(raw))};
+  writer.le32(code[0]);
+  writer.le32(code[1]);
+  const uint64_t page = map_user_memory(p, AddressSpace::kPageSize);
+  if (page == 0) return 0;
+  if (!space->write_privileged(page, ConstByteView(raw, sizeof(raw))) || !space->protect(page, AddressSpace::kPageSize, kProtRead | kProtExecute)) {
+    unmap_user_memory(p, page, AddressSpace::kPageSize);
+    return 0;
+  }
+  state.signal_trampoline = page;
+  return page;
+}
+
+// Both CPUs' frames begin alike: struct rt_sigframe { siginfo_t info; struct ucontext uc; }, with
+//   struct ucontext { uc_flags (8), uc_link (8), uc_stack (ss_sp 8, ss_flags 4, padding 4, ss_size 8), uc_sigmask (8), 120 unused bytes, uc_mcontext }
+// and uc_mcontext, which wants 16-byte alignment, at +176.
+constexpr uint64_t kGenericContextHead = 176, kGenericMaskAt = 40;
+// AArch64: struct sigcontext { fault_address (8), regs[31], sp, pc, pstate (8 each), 8 bytes of padding, __reserved[4096] }, where __reserved holds records
+// that each begin with a magic number and a size (4 each): fpsimd_context (fpsr, fpcr (4 each), V0..V31 (16 each)), esr_context (esr, 8) after a fault, and
+// an all-zero record to end the list. Above the frame the kernel leaves a frame record (x29, x30) and points x29 at it, so that a stack walk passes through.
+constexpr uint64_t kArmRegsBytes = 288, kArmReservedBytes = 4096, kArmFrameBytes = kSiginfoBytes + kGenericContextHead + kArmRegsBytes + kArmReservedBytes;
+constexpr uint32_t kArmFpsimdMagic = 0x46508001u, kArmEsrMagic = 0x45535201u;
+constexpr uint64_t kArmFpsimdBytes = 528, kArmEsrBytes = 16;
+// RISC-V: struct sigcontext { pc, x1..x31 (8 each), then the floating-point state: 528 bytes (the size of the quad-precision form), of which the
+// double-precision form uses f0..f31 (8 each) and fcsr (4) }. The rest stays zero, which also says "no further state" where a newer kernel keeps the vector
+// registers.
+constexpr uint64_t kRiscvRegsBytes = 256, kRiscvFpBytes = 528, kRiscvFrameBytes = kSiginfoBytes + kGenericContextHead + kRiscvRegsBytes + kRiscvFpBytes;
+
+void write_generic_head(ByteWriter& writer, const LinuxProcessState::Thread& thread, const StackChoice& stack, uint64_t old_mask) {
+  writer.le64(0);                       // uc_flags
+  writer.le64(0);                       // uc_link
+  writer.le64(thread.alt_stack);        // uc_stack
+  writer.le32(stack.flags_now());
+  writer.le32(0);
+  writer.le64(thread.alt_size);
+  writer.le64(old_mask);                // uc_sigmask
+  writer.zeros(kGenericContextHead - kGenericMaskAt - 8);
+}
+
+bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, const LinuxProcessState::Action& action, uint64_t old_mask, const FaultDetail& fault,
+                bool is_fault, LinuxSignalContext* context) {
+  const bool arm = context->arch == UserArch::AArch64;
+  if (!arm && context->arch != UserArch::RiscV64) return false;
+  const uint64_t way_back = arm && (action.flags & kSaRestorer) && action.restorer != 0 ? action.restorer : signal_trampoline(p, context->arch);
+  if (way_back == 0) return false;
+  StackChoice stack;
+  if (!choose_stack(thread, action, context->stack_pointer(), 0, &stack)) return false;
+  const uint64_t top = stack.top & ~uint64_t{15};
+  const uint64_t frame_bytes = arm ? kArmFrameBytes : kRiscvFrameBytes;
+  if (top < frame_bytes + 64) return false;
+  const uint64_t record_at = arm ? top - 16 : top;
+  const uint64_t frame_at = (record_at - frame_bytes) & ~uint64_t{15};
+  const uint64_t info_at = frame_at, context_at = frame_at + kSiginfoBytes;
+
+  // (of an AArch64 frame only what has something in it is written: the list of records ends long before the 4096 bytes kept for it do)
+  uint8_t raw[kSiginfoBytes + kGenericContextHead + kArmRegsBytes + kArmFpsimdBytes + kArmEsrBytes + 16] = {};
+  static_assert(sizeof(raw) >= kRiscvFrameBytes, "the buffer holds either frame");
+  ByteWriter writer{ByteView(raw, sizeof(raw))};
+  write_siginfo(writer, signal, p.linux_state().info[signal]);
+  write_generic_head(writer, thread, stack, old_mask);
+  if (arm) {
+    writer.le64(fault.address);
+    for (uint32_t i = 0; i < 31; ++i) writer.le64(context->x[i]);
+    writer.le64(context->sp);
+    writer.le64(context->pc);
+    writer.le64(context->pstate);
+    writer.le64(0);
+    writer.le32(kArmFpsimdMagic);
+    writer.le32(uint32_t(kArmFpsimdBytes));
+    writer.le32(context->fpsr);
+    writer.le32(context->fpcr);
+    for (const uint64_t half : context->vector) writer.le64(half);
+    if (is_fault) {
+      writer.le32(kArmEsrMagic);
+      writer.le32(uint32_t(kArmEsrBytes));
+      writer.le64(fault.error);
+    }
+    writer.zeros(16);      // the end of the list
+  } else {
+    writer.le64(context->pc);
+    for (uint32_t i = 1; i < 32; ++i) writer.le64(context->x[i]);
+    for (uint32_t i = 0; i < 32; ++i) writer.le64(context->vector[i]);
+    writer.le32(context->fpcr);
+    writer.zeros(kRiscvFpBytes - 32 * 8 - 4);
+  }
+  if (!writer.ok() || !p.write_user(frame_at, writer.written())) return false;
+  if (arm) {
+    uint8_t record[16];
+    ByteWriter link{ByteView(record, sizeof(record))};
+    link.le64(context->x[29]);
+    link.le64(context->x[30]);
+    if (!p.write_user(record_at, ConstByteView(record, sizeof(record)))) return false;
+    context->x[0] = signal;
+    context->x[1] = info_at;
+    context->x[2] = context_at;
+    context->x[29] = record_at;
+    context->x[30] = way_back;
+    context->sp = frame_at;
+  } else {
+    context->x[10] = signal;
+    context->x[11] = info_at;
+    context->x[12] = context_at;
+    context->x[1] = way_back;
+    context->x[2] = frame_at;
+  }
+  context->pc = action.handler;
+  handler_entered(p, thread, signal, action, stack.switches);
+  return true;
+}
+
+// The registers a signal is delivered to: an x86-64 thread's, or an AArch64 / RISC-V thread's.
+struct Registers {
+  X86Context* x86 = nullptr;
+  LinuxSignalContext* other = nullptr;
+  uint64_t result() const { return x86 ? x86->gpr[X86Context::kRax] : other->result(); }
+  uint64_t pc() const { return x86 ? x86->rip : other->pc; }
+  // The registers of the call about to be made again (see deliver_signals).
+  void restart(const InterruptedCall& call) const {
+    if (x86) {
+      x86->gpr[X86Context::kRax] = call.number;      // (the number went where the result now is)
+      x86->rip -= 2;                                 // (SYSCALL is two bytes long)
+    } else {
+      other->result() = call.first_argument;         // (the first argument went where the result now is; the number is still in its register)
+      other->pc -= 4;                                // (SVC and ECALL are four bytes long)
+    }
+  }
+};
 
 void end_by(Process& p, uint32_t signal) {
   p.linux_state().exit_signal = signal;
@@ -318,7 +487,7 @@ bool signal_hint(Process& p, uint64_t tid, uint64_t now_ns) {
   return for_process != 0;      // (a thread that has no entry yet blocks nothing)
 }
 
-bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* call) {
+static bool deliver_to(Process& p, const Registers& registers, const InterruptedCall* call) {
   LinuxProcessState& state = p.linux_state();
   fold_posted(p);
   check_timers(p);
@@ -346,11 +515,10 @@ bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* cal
     }
     // A call the signal cut short starts again after the handler if the action says so (SA_RESTART) and the call is one that can: the registers the handler
     // returns to are those of the call about to be made.
-    if (call && call->restarts && context->gpr[X86Context::kRax] == uint64_t(-kEintr) && (action.flags & kSaRestart)) {
-      context->gpr[X86Context::kRax] = call->number;
-      context->rip -= 2;      // (the SYSCALL instruction is two bytes long)
-    }
-    if (!push_frame(p, thread, signal, action, old_mask, FaultDetail(), context)) {
+    if (call && call->restarts && registers.result() == uint64_t(-kEintr) && (action.flags & kSaRestart)) registers.restart(*call);
+    const bool pushed = registers.x86 ? push_frame(p, thread, signal, action, old_mask, FaultDetail(), registers.x86)
+                                      : push_frame(p, thread, signal, action, old_mask, FaultDetail(), false, registers.other);
+    if (!pushed) {
       end_by(p, kSigSegv);
       break;
     }
@@ -388,17 +556,17 @@ bool signal_return(Process& p, X86Context* context) {
   return true;
 }
 
-bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t error, uint64_t address) {
+static bool fault_to(Process& p, const Registers& registers, uint64_t vector, uint64_t error, uint64_t address) {
   // What a processor exception is as a signal, and its si_code.
   uint32_t signal = kSigSegv;
   int32_t code = 0x80;      // SI_KERNEL
   uint64_t where = address;
   switch (vector) {
-    case 0: signal = kSigFpe; code = 1; where = context->rip; break;                 // divide error: FPE_INTDIV
-    case 1: case 3: signal = kSigTrap; code = vector == 3 ? 1 : 2; where = context->rip; break;      // TRAP_BRKPT, TRAP_TRACE
-    case 6: signal = kSigIll; code = 2; where = context->rip; break;                 // invalid opcode: ILL_ILLOPN
+    case 0: signal = kSigFpe; code = 1; where = registers.pc(); break;                 // divide error: FPE_INTDIV
+    case 1: case 3: signal = kSigTrap; code = vector == 3 ? 1 : 2; where = registers.pc(); break;      // TRAP_BRKPT, TRAP_TRACE
+    case 6: signal = kSigIll; code = registers.x86 ? 2 : 1; where = registers.pc(); break;      // invalid instruction: ILL_ILLOPN on x86, ILL_ILLOPC elsewhere
     case 14: signal = kSigSegv; code = (error & 1) ? 2 : 1; break;                   // page fault: SEGV_ACCERR when the page is there, else SEGV_MAPERR
-    case 16: case 19: signal = kSigFpe; code = 7; where = context->rip; break;       // x87 and SIMD exceptions: FPE_FLTINV (which one is not looked up)
+    case 16: case 19: signal = kSigFpe; code = 7; where = registers.pc(); break;       // x87 and SIMD exceptions: FPE_FLTINV (which one is not looked up)
     case 17: signal = kSigBus; code = 1; break;                                      // alignment check: BUS_ADRALN
     default: where = 0; break;                                                       // general protection and the rest: SIGSEGV from the kernel
   }
@@ -417,18 +585,102 @@ bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t er
   detail.error = error;
   detail.trap = vector;
   detail.address = vector == 14 ? address : 0;
-  if (!push_frame(p, thread, signal, action, thread.blocked, detail, context)) {
+  const bool pushed = registers.x86 ? push_frame(p, thread, signal, action, thread.blocked, detail, registers.x86)
+                                    : push_frame(p, thread, signal, action, thread.blocked, detail, true, registers.other);
+  if (!pushed) {
     end_by(p, kSigSegv);
     return false;
   }
   return true;
 }
 
+bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* call) {
+  Registers registers;
+  registers.x86 = context;
+  return deliver_to(p, registers, call);
+}
+
+bool deliver_signals(Process& p, LinuxSignalContext* context, const InterruptedCall* call) {
+  Registers registers;
+  registers.other = context;
+  return deliver_to(p, registers, call);
+}
+
+bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t error, uint64_t address) {
+  Registers registers;
+  registers.x86 = context;
+  return fault_to(p, registers, vector, error, address);
+}
+
+bool deliver_fault(Process& p, LinuxSignalContext* context, uint64_t vector, uint64_t error, uint64_t address) {
+  Registers registers;
+  registers.other = context;
+  return fault_to(p, registers, vector, error, address);
+}
+
+// rt_sigreturn of an AArch64 or RISC-V thread: the stack pointer is at the frame (see push_frame).
+bool signal_return(Process& p, LinuxSignalContext* context) {
+  const bool arm = context->arch == UserArch::AArch64;
+  if (!arm && context->arch != UserArch::RiscV64) return false;
+  const uint64_t frame_at = context->stack_pointer();
+  if (frame_at > ~uint64_t{0} - (kArmFrameBytes + 16)) return false;
+  const uint64_t context_at = frame_at + kSiginfoBytes, registers_at = context_at + kGenericContextHead;
+  uint64_t mask = 0;
+  if (!p.read_user_u64(context_at + kGenericMaskAt, &mask)) return false;
+  LinuxSignalContext restored = *context;
+  if (arm) {
+    uint8_t raw[kArmRegsBytes];
+    if (!p.read_user(registers_at, ByteView(raw, sizeof(raw)))) return false;
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    reader.skip(8);      // fault_address
+    for (uint32_t i = 0; i < 31; ++i) restored.x[i] = reader.le64();
+    restored.sp = reader.le64();
+    restored.pc = reader.le64();
+    restored.pstate = reader.le64() & 0xF0000000u;      // (only the condition flags are a program's to set)
+    // The records: each a magic number and its size. The floating-point one must be there, once; what is not known is passed over; the list ends with a
+    // zero record or with the space kept for it. A size that does not fit is a frame that is not one.
+    const uint64_t records_at = registers_at + kArmRegsBytes;
+    bool have_fp = false;
+    for (uint64_t at = 0; at + 8 <= kArmReservedBytes;) {
+      uint8_t head[8];
+      if (!p.read_user(records_at + at, ByteView(head, sizeof(head)))) return false;
+      ByteReader record{ConstByteView(head, sizeof(head))};
+      const uint32_t magic = record.le32(), size = record.le32();
+      if (magic == 0 && size == 0) break;
+      if (size < 16 || size % 16 != 0 || size > kArmReservedBytes - at) return false;
+      if (magic == kArmFpsimdMagic) {
+        if (have_fp || size != kArmFpsimdBytes) return false;
+        uint8_t fp[kArmFpsimdBytes - 8];
+        if (!p.read_user(records_at + at + 8, ByteView(fp, sizeof(fp)))) return false;
+        ByteReader values{ConstByteView(fp, sizeof(fp))};
+        restored.fpsr = values.le32();
+        restored.fpcr = values.le32();
+        for (uint64_t& half : restored.vector) half = values.le64();
+        have_fp = true;
+      }
+      at += size;
+    }
+    if (!have_fp) return false;
+  } else {
+    uint8_t raw[kRiscvRegsBytes + 32 * 8 + 4];
+    if (!p.read_user(registers_at, ByteView(raw, sizeof(raw)))) return false;
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    restored.pc = reader.le64();
+    for (uint32_t i = 1; i < 32; ++i) restored.x[i] = reader.le64();
+    for (uint32_t i = 0; i < 32; ++i) restored.vector[i] = reader.le64();
+    restored.fpcr = reader.le32() & 0xFF;
+  }
+  *context = restored;
+  thread_state(p).blocked = mask & ~kUnblockable;
+  return true;
+}
+
+
 
 // struct sigaction as the kernel has it: handler (8), flags (8), then on x86-64 the restorer (8), then the mask (8).
 uint64_t sys_rt_sigaction(Process& p, UserArch arch, uint64_t signal, uint64_t action, uint64_t old_action, uint64_t set_size) {
   if (set_size != 8 || signal == 0 || signal > kSignals) return error(kEinval);
-  const bool has_restorer = arch == UserArch::X86_64;
+  const bool has_restorer = arch == UserArch::X86_64 || arch == UserArch::AArch64;      // (RISC-V and LoongArch have no SA_RESTORER, and no field for one)
   const uint64_t bytes = has_restorer ? 32 : 24;
   LinuxProcessState& state = p.linux_state();
   LinuxProcessState::Action next = state.actions[signal];

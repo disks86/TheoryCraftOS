@@ -371,7 +371,7 @@ Frame* on_syscall(Frame* frame, void*) {
         process->terminate(128 + 11);
       }
     }
-    const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(process->arch(), request)};
+    const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(process->arch(), request), request.args[0]};
     alive = !process->exited() && linux_signals(process, frame, returned ? nullptr : &call);
   }
   if (alive && !thread_ends && stop_point(self, frame)) thread_ends = true;      // SuspendThread / TerminateThread from another thread

@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Process/Process.hpp"
+#include "Process/LinuxSignalContext.hpp"
 #include "Process/Syscall.hpp"
 #include "Process/WindowsException.hpp"      // X86Context: the registers of an x86-64 thread
 
@@ -31,9 +32,9 @@ namespace process::linuxabi {
 //
 // Entering a handler is done by whoever runs the program, with the functions below, at the points where a thread is about to go back to user mode: after a
 // system call, at a timer tick that found it in user mode, and when the processor reports a fault (SIGSEGV, SIGFPE, SIGILL, SIGBUS, SIGTRAP). The handler gets
-// the frame Linux gives it on x86-64 (siginfo_t, ucontext_t with the registers, the FPU state) and returns through rt_sigreturn. Only an x86-64 program can be
-// given one; where the runtime cannot (LinuxProcessState::handlers_run is false) a signal with a handler stays pending, where sigpending, sigtimedwait
-// (sigwait) and sigsuspend (which then returns) find it.
+// the frame Linux gives it on its CPU (siginfo_t, ucontext_t with the registers and the floating-point state: x86-64, AArch64 and RISC-V each have their own)
+// and returns through rt_sigreturn. Where the runtime enters no handlers (LinuxProcessState::handlers_run is false: a LoongArch program, a process nobody
+// runs) a signal with a handler stays pending, where sigpending, sigtimedwait (sigwait) and sigsuspend (which then returns) find it.
 //
 // Signals come from the process itself (kill, tgkill, raise, abort), from its timers (alarm, setitimer), from the processor, from another process's kill()
 // and from a child that ended (SIGCHLD). The last two arrive without the process's lock (Process::post_linux_signal). A call that waits (read on a pipe or
@@ -62,18 +63,22 @@ bool signal_hint(Process& p, uint64_t tid, uint64_t now_ns);
 struct InterruptedCall {
   uint64_t number = 0;
   bool restarts = false;
+  uint64_t first_argument = 0;      // (AArch64 and RISC-V: the call's result is in the register its first argument was in)
 };
 bool call_restarts(UserArch arch, const SyscallRequest& request);
 // Acts on the signals that are pending for the calling thread, whose registers are `context`: default actions are carried out (the process may have ended
 // when this returns), and the first signal with a handler has its frame written to the thread's stack and `context` pointed at the handler. `call`: the
 // system call being returned from (its result is in the context), or null. True if `context` changed.
 bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* call);
+bool deliver_signals(Process& p, LinuxSignalContext* context, const InterruptedCall* call);      // (an AArch64 or RISC-V thread)
 // rt_sigreturn (Process::take_signal_return): `context` (the registers at the call) becomes what the handler's frame says, the signal mask too. False if the
 // frame cannot be read: the process is then to be ended (SIGSEGV).
 bool signal_return(Process& p, X86Context* context);
+bool signal_return(Process& p, LinuxSignalContext* context);
 // The processor reported exception `vector` (with its error code, and the address of a page fault) at `context`. True: the signal's handler was entered
 // (`context` changed). False: there is none to enter, and the process has been ended by the signal.
 bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t error, uint64_t address);
+bool deliver_fault(Process& p, LinuxSignalContext* context, uint64_t vector, uint64_t error, uint64_t address);
 
 // Raises the signals of the timers that ran out (alarm, setitimer). Cheap when none is armed: the system-call dispatcher calls it for every call.
 void check_timers(Process& p);

@@ -38,9 +38,11 @@ waits, and one with a handler has its handler entered.
 
 - *Where handlers are entered.* When a thread is about to go back to user mode: after a system call, at a timer tick that found it in
   user mode (so a loop that never calls the kernel is interrupted too), and when the processor reports a fault. The handler gets the
-  frame Linux gives it on x86-64 (`siginfo_t`, `ucontext_t` with every register, the FXSAVE image) and returns through `rt_sigreturn`;
-  it may change the registers it returns to. `SA_SIGINFO`, `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART` are honoured;
-  the action must have a restorer (`SA_RESTORER`), which every C library supplies.
+  frame Linux gives it on its CPU (`siginfo_t`, `ucontext_t` with every register and the floating-point state) and returns through
+  `rt_sigreturn`; it may change the registers it returns to. `SA_SIGINFO`, `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART`
+  are honoured. On x86-64 the action must have a restorer (`SA_RESTORER`), which every C library supplies. AArch64 and RISC-V C
+  libraries give none (Linux lends them a few instructions in the vDSO): the process gets a page of its own with those instructions
+  the first time a handler is entered.
 - *Faults.* A page fault, a division error, an invalid instruction and the like become `SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS` or
   `SIGTRAP` with `si_code` and `si_addr`. Without a handler, or with the signal blocked, the process ends.
 - *Where signals come from.* The process itself (`kill`, `tgkill`, `raise`, `abort`), its timers (`alarm`, `setitimer`), the
@@ -49,8 +51,10 @@ waits, and one with a handler has its handler entered.
 - *Calls that wait.* A read on a pipe or socket, `futex`, `wait4`, `nanosleep`, `poll`, `epoll_wait`, a lock that is waited for and so
   on end with `EINTR` when a signal is there for the thread. With `SA_RESTART` the calls Linux restarts are started again after the
   handler. A read of the console and a wait for a priority-inheritance futex are not cut short.
-- *Where this works.* For an x86-64 program on the kernel and in the emulator. An emulated AArch64 or RISC-V program gets no handlers:
-  a signal with a handler stays pending there, where `sigpending`, `sigtimedwait` (`sigwait`) and `sigsuspend` find it.
+- *Where this works.* For an x86-64 program on the kernel, and for x86-64, AArch64 and RISC-V programs in the emulator, each with its
+  own frame layout (`struct rt_sigframe` of that CPU: AArch64's with the `fpsimd_context` record and a frame record above it, RISC-V's
+  with the double-precision registers). A LoongArch program gets no handlers: a signal with a handler stays pending there, where
+  `sigpending`, `sigtimedwait` (`sigwait`) and `sigsuspend` find it.
 
 The code is `LinuxSignals.cpp` (`deliver_signals`, `signal_return`, `deliver_fault`); the kernel calls it from `on_syscall`,
 `on_user_tick` / `on_user_fault` in `Kernel/UserMode.cpp`, the emulator from `EmulatedProcess::thread_loop`.
@@ -74,7 +78,8 @@ back to `read` and `write`.
 
 ## Not there yet
 
-- Signal handlers for emulated AArch64 and RISC-V programs; queued real-time signals (signals of one kind do not queue, and
+- Signal handlers for LoongArch programs; the SVE, SME and RISC-V vector registers in a handler's frame (only the general, NEON and
+  floating-point registers are kept); queued real-time signals (signals of one kind do not queue, and
   `sigqueue`'s value is not kept); stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` do nothing); Ctrl+C as `SIGINT` (it still
   ends the program); the AVX halves of the vector registers in a handler's frame; POSIX timers (`timer_create`).
 - Copy-on-write for `fork`, and a `vfork` child that shares its parent's memory.
@@ -87,6 +92,7 @@ back to `read` and `write`.
 
 - `tests/run_host_tests.sh LinuxSyscallTest`: the calls one by one, with bad pointers and sizes.
 - `tests/run_host_tests.sh LinuxForkTest`: `tests/linux/forktest.c` and `signaltest.c` (no libc) under the emulator, compared with
-  what the same programs print on the build machine's own Linux kernel.
+  what the same programs print on the build machine's own Linux kernel. `signaltest.c` is also run as an AArch64 and a RISC-V program
+  (checked-in builds, `tests/linux/build_signaltest.sh`), compared with what those print under qemu's user mode.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c` and `handlertest.c` on the real kernel under QEMU, compared the
   same way.

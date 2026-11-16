@@ -81,6 +81,8 @@ class AArch64Cpu final : public IGuestCpu {
   const GuestFault& fault() const override { return fault_; }
   uint64_t instructions() const override { return retired_; }
   UniquePointer<IGuestCpu> clone_for_thread(allocators::IAllocator& allocator, uint64_t stack_pointer, bool set_tls, uint64_t tls) const override;
+  bool get_signal_context(process::linuxabi::LinuxSignalContext* out) const override;
+  bool set_signal_context(const process::linuxabi::LinuxSignalContext& context) override;
 
   State& state() { return s_; }
   const State& state() const { return s_; }

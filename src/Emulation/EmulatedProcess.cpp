@@ -126,25 +126,54 @@ class EmulatedProcess final : public process::IProcessRuntime {
     c->runtime->sync_.unlock();
   }
   bool start_fork(const IGuestCpu& cpu, const process::LinuxProcessState::ForkRequest& request);
-  // Does this runtime enter the handlers of the program's signals? (An x86-64 Linux program's: see linuxabi::deliver_signals.)
-  bool enters_handlers() const { return process_->abi() == process::SyscallAbi::Linux && arch_ == process::UserArch::X86_64; }
+  // Does this runtime enter the handlers of the program's signals? (A Linux program's, on the CPUs whose frames linuxabi::deliver_signals knows.)
+  bool enters_handlers() const {
+    return process_->abi() == process::SyscallAbi::Linux &&
+           (arch_ == process::UserArch::X86_64 || arch_ == process::UserArch::AArch64 || arch_ == process::UserArch::RiscV64);
+  }
+  // The registers of a guest thread in the form the signal code wants for its CPU, and back.
+  struct SignalRegisters {
+    bool x86 = false;
+    process::X86Context context;
+    process::linuxabi::LinuxSignalContext other;
+  };
+  bool get_registers(const IGuestCpu& cpu, SignalRegisters* out) const {
+    out->x86 = arch_ == process::UserArch::X86_64;
+    return out->x86 ? cpu.get_x86_context(&out->context) : cpu.get_signal_context(&out->other);
+  }
+  static bool set_registers(IGuestCpu& cpu, const SignalRegisters& r) { return r.x86 ? cpu.set_x86_context(r.context) : cpu.set_signal_context(r.other); }
   // The guest thread on `cpu` is about to run on: the signals that wait for it are acted on, which may point the CPU at a handler. `call`: the system call it
   // returns from, or null (between two slices).
   void linux_signals(IGuestCpu& cpu, const process::linuxabi::InterruptedCall* call) {
     if (!process::linuxabi::signals_wanted(*process_)) return;
-    process::X86Context context;
-    if (!cpu.get_x86_context(&context)) return;
-    if (process::linuxabi::deliver_signals(*process_, &context, call)) cpu.set_x86_context(context);
+    SignalRegisters r;
+    if (!get_registers(cpu, &r)) return;
+    const bool entered = r.x86 ? process::linuxabi::deliver_signals(*process_, &r.context, call) : process::linuxabi::deliver_signals(*process_, &r.other, call);
+    if (entered) set_registers(cpu, r);
     if (process_->exited()) sync_.notify_all();
+  }
+  // rt_sigreturn: the registers the handler interrupted come back from its frame. False if the frame is gone (the program then ends by SIGSEGV).
+  bool linux_signal_return(IGuestCpu& cpu) {
+    SignalRegisters r;
+    if (!get_registers(cpu, &r)) return false;
+    const bool restored = r.x86 ? process::linuxabi::signal_return(*process_, &r.context) : process::linuxabi::signal_return(*process_, &r.other);
+    return restored && set_registers(cpu, r);
   }
   // A fault of a Linux program as a signal: true if its handler was entered (the CPU is there now).
   bool deliver_signal_fault(IGuestCpu& cpu) {
     if (!enters_handlers()) return false;
-    process::X86Context context;
-    if (!cpu.get_x86_context(&context)) return false;
+    SignalRegisters r;
+    if (!get_registers(cpu, &r)) return false;
     const GuestFault& fault = cpu.fault();
-    context.rip = fault.vector == 3 ? fault.pc + 1 : fault.pc;      // (a breakpoint is reported after the INT3)
-    return process::linuxabi::deliver_fault(*process_, &context, fault.vector, fault.error, fault.address) && cpu.set_x86_context(context);
+    bool entered = false;
+    if (r.x86) {
+      r.context.rip = fault.vector == 3 ? fault.pc + 1 : fault.pc;      // (an x86 breakpoint is reported after the INT3)
+      entered = process::linuxabi::deliver_fault(*process_, &r.context, fault.vector, fault.error, fault.address);
+    } else {
+      r.other.pc = fault.pc;
+      entered = process::linuxabi::deliver_fault(*process_, &r.other, fault.vector, fault.error, fault.address);
+    }
+    return entered && set_registers(cpu, r);
   }
   // Ends the children that still run and waits for every child's thread. Called without the lock.
   void finish_forks();
@@ -380,17 +409,12 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
     if (enters_handlers() && !process_->exited()) {
       // rt_sigreturn: the registers the handler interrupted come back from its frame. Then, for any call: the signals that wait for this thread.
       const bool returned = process_->take_signal_return();
-      if (returned) {
-        process::X86Context context;
-        if (cpu.get_x86_context(&context) && process::linuxabi::signal_return(*process_, &context)) {
-          cpu.set_x86_context(context);
-        } else {      // the frame is gone: SIGSEGV
-          process_->linux_state().exit_signal = 11;
-          process_->terminate(128 + 11);
-          sync_.notify_all();
-        }
+      if (returned && !linux_signal_return(cpu)) {      // the frame is gone: SIGSEGV
+        process_->linux_state().exit_signal = 11;
+        process_->terminate(128 + 11);
+        sync_.notify_all();
       }
-      const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(arch_, request)};
+      const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(arch_, request), request.args[0]};
       if (!process_->exited()) linux_signals(cpu, returned ? nullptr : &call);
     }
     uint64_t fs = 0, gs = 0;

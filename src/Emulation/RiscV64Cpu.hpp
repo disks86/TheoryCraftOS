@@ -90,6 +90,8 @@ class RiscV64Cpu final : public IGuestCpu {
   const GuestFault& fault() const override { return fault_; }
   uint64_t instructions() const override { return retired_; }
   UniquePointer<IGuestCpu> clone_for_thread(allocators::IAllocator& allocator, uint64_t stack_pointer, bool set_tls, uint64_t tls) const override;
+  bool get_signal_context(process::linuxabi::LinuxSignalContext* out) const override;
+  bool set_signal_context(const process::linuxabi::LinuxSignalContext& context) override;
 
   // The privileged architecture (machine, supervisor and user modes, the M and S CSRs, traps and their delegation, Sv39/Sv48/Sv57, PMP). Off by default, which is the user-mode
   // guest above. After enable_system the CPU starts in machine mode at `pc`, fetches and accesses memory through the bus, and run_system() takes traps instead of reporting

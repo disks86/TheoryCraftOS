@@ -169,6 +169,27 @@ bool RiscV64Cpu::pending_syscall(process::SyscallAbi abi, process::SyscallReques
   return process::decode_riscv64_linux(ArrayView<const uint64_t>(s_.x, 32), out);
 }
 
+bool RiscV64Cpu::get_signal_context(process::linuxabi::LinuxSignalContext* out) const {
+  *out = process::linuxabi::LinuxSignalContext();
+  out->arch = process::UserArch::RiscV64;
+  for (uint32_t i = 1; i < 32; ++i) out->x[i] = s_.x[i];
+  out->pc = s_.pc;
+  for (uint32_t i = 0; i < 32; ++i) out->vector[i] = s_.f[i];
+  out->fpcr = s_.fcsr;
+  return true;
+}
+
+bool RiscV64Cpu::set_signal_context(const process::linuxabi::LinuxSignalContext& context) {
+  if (context.arch != process::UserArch::RiscV64) return false;
+  for (uint32_t i = 1; i < 32; ++i) s_.x[i] = context.x[i];
+  s_.x[0] = 0;
+  s_.pc = context.pc;
+  for (uint32_t i = 0; i < 32; ++i) s_.f[i] = context.vector[i];
+  s_.fcsr = context.fpcr & 0xFF;      // (fflags and frm)
+  reservation_valid_ = false;      // (a trap return gives up the LR/SC reservation)
+  return true;
+}
+
 RiscV64Cpu::Step RiscV64Cpu::fail(uint8_t vector, uint64_t address) {
   if (bus_) return sys_fail(vector, address);
   fault_.vector = vector;
