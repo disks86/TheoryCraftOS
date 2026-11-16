@@ -1,0 +1,6 @@
+LIBRARY shfolder.dll
+EXPORTS
+; shfolder.dll: the library old programs and setup programs load for SHGetFolderPath (it was a redistributable before shell32.dll had the function).
+; Both are shell32.dll's.
+SHGetFolderPathA = shell32.SHGetFolderPathA
+SHGetFolderPathW = shell32.SHGetFolderPathW

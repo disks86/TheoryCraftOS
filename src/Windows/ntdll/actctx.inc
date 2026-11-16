@@ -1149,20 +1149,26 @@ static BYTE *act_read_file(const WCHAR *dos_path, SIZE_T *size) {
 
 /* The assemblies the system itself provides (Windows keeps them in WinSxS): the manifests are part of this library. A request is met by the one with the same name and
  * key whose version has the same major and minor numbers and is not older. */
+/* (the system's own assemblies are of the kind of program this library serves: a 32-bit program's manifest names them for x86) */
+#ifdef __i386__
+#define ASM_ARCH "x86"
+#else
+#define ASM_ARCH "amd64"
+#endif
 #define ASM_HEAD "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\"><assemblyIdentity type=\"win32\" name=\""
 #define WC(n) "<windowClass>" n "</windowClass>"
 #define VWC(n) "<windowClass versioned=\"yes\">" n "</windowClass>"
 static const char *const g_builtin_assemblies[] = {
-  ASM_HEAD "Microsoft.Windows.Common-Controls\" version=\"6.0.10586.0\" processorArchitecture=\"amd64\" publicKeyToken=\"6595b64144ccf1df\"/>"
+  ASM_HEAD "Microsoft.Windows.Common-Controls\" version=\"6.0.10586.0\" processorArchitecture=\"" ASM_ARCH "\" publicKeyToken=\"6595b64144ccf1df\"/>"
   "<file name=\"comctl32.dll\">"
   VWC("ReBarWindow32") VWC("ComboBoxEx32") VWC("tooltips_class32") VWC("msctls_trackbar32") VWC("msctls_updown32") VWC("msctls_progress32") VWC("msctls_statusbar32")
   VWC("msctls_hotkey32") VWC("SysTreeView32") VWC("SysListView32") VWC("SysTabControl32") VWC("SysAnimate32") VWC("SysHeader32") VWC("SysIPAddress32") VWC("SysLink")
   VWC("SysPager") VWC("NativeFontCtl") VWC("Button") VWC("Edit") VWC("ListBox") VWC("ComboBox") VWC("ScrollBar") VWC("Static") VWC("ComboLBox") VWC("DropDown")
   "</file></assembly>",
-  ASM_HEAD "Microsoft.Windows.GdiPlus\" version=\"1.0.10586.0\" processorArchitecture=\"amd64\" publicKeyToken=\"6595b64144ccf1df\"/><file name=\"gdiplus.dll\"/></assembly>",
-  ASM_HEAD "Microsoft.Windows.GdiPlus\" version=\"1.1.10586.0\" processorArchitecture=\"amd64\" publicKeyToken=\"6595b64144ccf1df\"/><file name=\"gdiplus.dll\"/></assembly>",
-  ASM_HEAD "Microsoft.VC80.CRT\" version=\"8.0.50727.9999\" processorArchitecture=\"amd64\" publicKeyToken=\"1fc8b3b9a1e18e3b\"/><file name=\"msvcr80.dll\"/><file name=\"msvcp80.dll\"/><file name=\"msvcm80.dll\"/></assembly>",
-  ASM_HEAD "Microsoft.VC90.CRT\" version=\"9.0.30729.9999\" processorArchitecture=\"amd64\" publicKeyToken=\"1fc8b3b9a1e18e3b\"/><file name=\"msvcr90.dll\"/><file name=\"msvcp90.dll\"/><file name=\"msvcm90.dll\"/></assembly>",
+  ASM_HEAD "Microsoft.Windows.GdiPlus\" version=\"1.0.10586.0\" processorArchitecture=\"" ASM_ARCH "\" publicKeyToken=\"6595b64144ccf1df\"/><file name=\"gdiplus.dll\"/></assembly>",
+  ASM_HEAD "Microsoft.Windows.GdiPlus\" version=\"1.1.10586.0\" processorArchitecture=\"" ASM_ARCH "\" publicKeyToken=\"6595b64144ccf1df\"/><file name=\"gdiplus.dll\"/></assembly>",
+  ASM_HEAD "Microsoft.VC80.CRT\" version=\"8.0.50727.9999\" processorArchitecture=\"" ASM_ARCH "\" publicKeyToken=\"1fc8b3b9a1e18e3b\"/><file name=\"msvcr80.dll\"/><file name=\"msvcp80.dll\"/><file name=\"msvcm80.dll\"/></assembly>",
+  ASM_HEAD "Microsoft.VC90.CRT\" version=\"9.0.30729.9999\" processorArchitecture=\"" ASM_ARCH "\" publicKeyToken=\"1fc8b3b9a1e18e3b\"/><file name=\"msvcr90.dll\"/><file name=\"msvcp90.dll\"/><file name=\"msvcm90.dll\"/></assembly>",
 };
 
 static NTSTATUS act_load_builtin(ActBuild *b, const ActIdentity *want) {

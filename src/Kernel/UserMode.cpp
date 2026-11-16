@@ -176,6 +176,27 @@ void load_core(void* argument) {
 }
 
 // The registers of an interrupted user context as a CONTEXT-style record, and back.
+// With TCOS_TRACE_SERVICE_FAILURES: every NT service of a Windows program that answers an error status (0xC0000000 and up) is said on the debug console,
+// with the program's id, the service's number (src/Windows/tcos_syscalls.h) and its first two arguments. For finding out why a program gives up.
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+void trace_service_failure(process::Process& process, const process::SyscallRequest& request, uint64_t result) {
+  if (process.abi() != process::SyscallAbi::Windows || request.number >= 0x1000 || (result & 0xFFFFFFFFu) < 0xC0000000u) return;      // (the window system's services answer values, not statuses)
+  console::puts("service failed: pid ");
+  console::put_dec(static_cast<int64_t>(process.id()));
+  console::puts(" service ");
+  console::put_dec(static_cast<int64_t>(request.number));
+  console::puts(" status ");
+  console::put_hex(result & 0xFFFFFFFFu);
+  console::puts(" arguments ");
+  console::put_hex(request.args[0]);
+  console::puts(" ");
+  console::put_hex(request.args[1]);
+  console::puts("\n");
+}
+#else
+inline void trace_service_failure(process::Process&, const process::SyscallRequest&, uint64_t) {}
+#endif
+
 void frame_to_context(const Frame& frame, process::X86Context* c) {
   const uint64_t* in[16] = {&frame.rax, &frame.rcx, &frame.rdx, &frame.rbx, &frame.rsp, &frame.rbp, &frame.rsi, &frame.rdi,
                             &frame.r8, &frame.r9, &frame.r10, &frame.r11, &frame.r12, &frame.r13, &frame.r14, &frame.r15};
@@ -327,9 +348,11 @@ Frame* on_syscall(Frame* frame, void*) {
     } else {
       process::decode_x86_32_windows(static_cast<uint32_t>(frame->rax), static_cast<uint32_t>(frame->rdx), ArrayView<const uint64_t>(first_four, 4), &request);
       frame->rax = process->syscall(request) & 0xFFFFFFFFu;
+      trace_service_failure(*process, request, frame->rax);
     }
   } else if (process::decode_x86_64(process->abi(), regs, &request)) {
     frame->rax = process->syscall(request);
+    trace_service_failure(*process, request, frame->rax);
   } else {
     frame->rax = ~uint64_t{37};      // -ENOSYS
   }
@@ -441,6 +464,23 @@ void log_exception(Task* task, uint32_t code, uint64_t rip, uint64_t address, ui
     console::puts(region.attributes.type == process::PageAttributes::Mapped ? " view" : region.attributes.type == process::PageAttributes::Image ? " image" : "");
   }
   console::puts("\n");
+  process::Process* owner = task->program.process();
+  if (modules && owner && owner->files().attached()) {      // a call of a function no library provides (the program may handle the exception and say nothing of it)
+    String missing(owner->files().allocator());
+    if (modules->describe_missing(rip, &missing)) {
+      console::puts("    it called a function that is not there: ");
+      console::puts(missing.view());
+      console::puts("\n");
+    }
+  }
+  if (code == 0xC000001Du || code == 0xC0000096u) {      // an instruction the processor refused: the bytes of it, to tell what it was
+    uint8_t bytes[8] = {};
+    if (process::Process* process = task->program.process(); process && process->read_user(rip, ByteView(bytes))) {
+      console::puts("    instruction bytes");
+      for (const uint8_t byte : bytes) { console::puts(" "); console::put_hex(byte); }
+      console::puts("\n");
+    }
+  }
   uint8_t raw[1024] = {};      // what may be return addresses: the words on its stack that point into a module
   if (!task->program.address_space().read_privileged(rsp, ByteView(raw, sizeof raw)) && !task->program.address_space().read_privileged(rsp, ByteView(raw, 128))) return;
   uint32_t shown = 0;

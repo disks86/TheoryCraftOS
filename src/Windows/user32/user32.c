@@ -84,7 +84,7 @@ static int format_wide(Out *o, const void *format, int format_is_wide, int wide_
         int is_signed = conversion == 'd' || conversion == 'i';
         const unsigned base = conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X' || conversion == 'p') ? 16 : 10;
         const char *digits = conversion == 'x' ? "0123456789abcdef" : "0123456789ABCDEF";
-        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 16; }
+        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 2 * (int)sizeof(void *);      /* (8 digits in a 32-bit program) */ }
         else if (is_signed) {
           long long v = size == 8 ? __builtin_va_arg(args, long long) : __builtin_va_arg(args, int);
           if (size == 1) v = (short)v;

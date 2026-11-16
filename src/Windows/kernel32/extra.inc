@@ -173,11 +173,12 @@ EXPORT BOOL WINAPI CreateHardLinkW(LPCWSTR link, LPCWSTR target, LPSECURITY_ATTR
   NTSTATUS status = NtOpenFile(&h, FILE_READ_ATTRIBUTES | SYNCHRONIZE, &source_attributes, &iosb, 7, FILE_SYNCHRONOUS_IO_NONALERT_);
   if (!NT_SUCCESS(status)) return fail_nt(status);
   const ULONG name_bytes = link_name.Length;
-  BYTE *info = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, 20 + name_bytes + 2);
+  const ULONG length_at = 2 * sizeof(HANDLE), name_at = length_at + 4;      /* (FILE_LINK_INFORMATION: the name's length and the name follow a handle, as in a rename) */
+  BYTE *info = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, name_at + name_bytes + 2);
   if (!info) { NtClose(h); set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
-  *(ULONG *)(info + 16) = name_bytes;      /* [0]: ReplaceIfExists, left 0: CreateHardLink fails if the name is taken */
-  memcpy(info + 20, link_name.Buffer, name_bytes);
-  status = NtSetInformationFile(h, &iosb, info, 20 + name_bytes, 11);      /* FileLinkInformation */
+  *(ULONG *)(info + length_at) = name_bytes;      /* [0]: ReplaceIfExists, left 0: CreateHardLink fails if the name is taken */
+  memcpy(info + name_at, link_name.Buffer, name_bytes);
+  status = NtSetInformationFile(h, &iosb, info, name_at + name_bytes, 11);      /* FileLinkInformation */
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);

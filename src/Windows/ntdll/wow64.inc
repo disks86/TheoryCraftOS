@@ -120,6 +120,32 @@ EXPORT NTSTATUS NTAPI NtTcosToken(ULONG operation, ULONG_PTR a, ULONG_PTR b, ULO
   return status;
 }
 
+/* NtSetInformationFile: the classes that name a file - a rename (10, and 65 with flags) and a hard link (11, 72) - are
+ * {replace or flags, HANDLE root, ULONG name length, WCHAR name[]}, which is 12 bytes before the name here and 20 in the kernel; the completion port
+ * of a file (30) is {HANDLE port, PVOID key}. The other classes hold no handle or pointer and go as they are. */
+#define WOW_FILE_NAME_BYTES 1040      /* (a path of 520 characters: longer names are refused) */
+EXPORT NTSTATUS NTAPI NtSetInformationFile(HANDLE file, PIO_STATUS_BLOCK status_block, PVOID information, ULONG length, ULONG information_class) {
+  ULONG64 v[5] = {WOW_HANDLE(file), WOW_POINTER(status_block), WOW_POINTER(information), length, information_class};
+  if (information && (information_class == 10 || information_class == 11 || information_class == 65 || information_class == 72)) {
+    struct { ULONG replace, pad; ULONG64 root; ULONG name_bytes; WCHAR name[WOW_FILE_NAME_BYTES / 2]; } wide;
+    const struct { ULONG replace; HANDLE root; ULONG name_bytes; WCHAR name[1]; } *narrow = information;
+    if (length < 12 || narrow->name_bytes > length - 12) return (NTSTATUS)0xC0000004u;      /* STATUS_INFO_LENGTH_MISMATCH */
+    if (narrow->name_bytes > WOW_FILE_NAME_BYTES) return (NTSTATUS)0xC0000106u;               /* STATUS_NAME_TOO_LONG */
+    wide.replace = narrow->replace; wide.pad = 0; wide.root = WOW_HANDLE(narrow->root); wide.name_bytes = narrow->name_bytes;
+    for (ULONG i = 0; i < narrow->name_bytes / 2; ++i) wide.name[i] = narrow->name[i];
+    v[2] = WOW_POINTER(&wide);
+    v[3] = 20 + narrow->name_bytes;
+    return wow_service(NT_SERVICE_NtSetInformationFile, v);
+  }
+  if (information && information_class == 30 && length == 2 * sizeof(ULONG_PTR)) {
+    const ULONG64 wide[2] = {WOW_HANDLE(((const HANDLE *)information)[0]), WOW_POINTER(((const PVOID *)information)[1])};
+    v[2] = WOW_POINTER(wide);
+    v[3] = sizeof(wide);
+    return wow_service(NT_SERVICE_NtSetInformationFile, v);
+  }
+  return wow_service(NT_SERVICE_NtSetInformationFile, v);
+}
+
 static PEB *g_wow_peb;      /* the 32-bit PEB (wow64_start_process) */
 
 /* ProcessBasicInformation (class 0) and ThreadBasicInformation (class 0) have pointer-sized fields - and name the PEB and the TEB, which for a 32-bit

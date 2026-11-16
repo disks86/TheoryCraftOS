@@ -103,7 +103,9 @@ with `run_program` and reads the registry's Uninstall keys (`list_uninstall_entr
 2. It is **run with the switches that make it ask nothing**: the manifest's `InstallerSwitches` (`Silent`, else `SilentWithProgress`), else the
    usual ones of its kind (`/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART` for Inno Setup, `/S` for NSIS), then the manifest's `Custom` switches.
    The status line says "Running the setup program", and Cancel stops it. The setup program (and an uninstaller, and what they start) is run
-   **as an administrator**: with the elevated form of the user's token, where every other program has the limited one. The user asked for the
+   An Inno Setup program is also asked to keep a log (`/LOG=`, in the folder of the downloaded setup program); when it fails, what the message
+   says is its exit code and what the log says from the first error it reports (six lines at most, plain text only), else the log's last three
+   lines. It is run **as an administrator**: with the elevated form of the user's token, where every other program has the limited one. The user asked for the
    installation; a setup program that finds itself not elevated asks Windows to start it again elevated, which nothing here would answer.
 3. It **succeeded** if it ended with 0 or one of the manifest's `InstallerSuccessCodes`.
 4. The registry's **Uninstall entries** are read before and after. The entry the setup program added is the package's (with several, the one
@@ -121,10 +123,9 @@ choosing Remove a second time forgets the package.
 Refused, with the reason in the message:
 
 - `msi`, `wix`, `burn`, `msix`, `appx` and Store packages (there is no Windows Installer here);
-- a setup program that is a 32-bit program, unless it is Nullsoft's (`nullsoft`). Many setup programs are 32-bit, even for 64-bit applications:
-  of five popular ones looked at, 7-Zip's and Git's are 64-bit, Firefox's, Visual Studio Code's and HandBrake's are 32-bit. 32-bit programs are
-  being brought up (see Wow64.md): a Nullsoft setup program installing without showing itself needs little of the window system and has been run;
-  an Inno Setup one makes windows even then and has not;
+- a setup program that is a 32-bit program of no known kind (`exe`). Many setup programs are 32-bit, even for 64-bit applications - of five
+  popular ones looked at, 7-Zip's and Git's are 64-bit, Firefox's, Visual Studio Code's and HandBrake's are 32-bit - and the 32-bit ones of
+  Nullsoft (`nullsoft`) and Inno Setup (`inno`) are run (see Wow64.md for what 32-bit programs have here);
 - an `exe` installer whose manifest has no silent switch;
 - packages with no x64 or neutral installer.
 
@@ -205,13 +206,14 @@ Linux side:
 
 Windows:
 
-- **Setup programs only where the Windows layer can run them.** Of the 32-bit ones only Nullsoft's; no MSI, MSIX or Burn (see above). What a setup
+- **Setup programs only where the Windows layer can run them.** Of the 32-bit ones Nullsoft's and Inno Setup's; no MSI, MSIX or Burn (see above). What a setup
   program wrote to the registry is gone after a restart (the registry is kept in memory), so a program that needs its registry settings may not
   start then; the App Manager's own record, and with it Remove, is kept.
 - **A setup program's shortcuts and files are its own business.** The App Manager does not check what it installed, and a setup program that
   shows a window although asked not to waits for the user.
-- **A few packages have been through QEMU** (see Tests): a portable program, a 64-bit setup program, and a 32-bit Nullsoft one. Inno Setup
-  programs have not run there (the popular ones are 32-bit), the App Manager's window has not been clicked through there, and no installed program has been
+- **A few packages have been through QEMU** (see Tests): a portable program (jq), a 64-bit setup program (7-Zip), 32-bit Nullsoft ones
+  (qBittorrent) and 32-bit Inno Setup ones (WinMerge, TreeSize Free). That is
+  four setup programs out of thousands; the App Manager's window has not been clicked through there, and no installed program has been
   started from the Start menu there.
 - **An archive member is unpacked in memory**, so one file of an archive can be at most 1 GiB and needs that much memory.
 - **No dependencies** (a package's `Dependencies`, such as the Visual C++ runtime, are not installed), no command aliases in a `Links` folder,

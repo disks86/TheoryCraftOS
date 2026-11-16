@@ -514,8 +514,11 @@ uint64_t NtGdiEnumFonts(Call& c) {
   const uint32_t name_len = c.arg32(3);
   WideString want(*alloc());
   if (name_len > 0 && !c.read_wide_z(c.arg(4), 64, &want)) return 0;
-  uint32_t cap = 0;
-  if (!c.read_u32(c.arg(6), &cap)) return 0;
+  // (the count is in bytes, both ways: the size of the buffer given, and of what is there to give)
+  constexpr uint32_t kEntryBytes = 452;
+  uint32_t cap_bytes = 0;
+  if (!c.read_u32(c.arg(6), &cap_bytes)) return 0;
+  const uint32_t cap = cap_bytes / kEntryBytes;
   uint32_t matched = 0;
   for (const FaceName& f : kFaces) {
     WideString name(*alloc());
@@ -538,8 +541,8 @@ uint64_t NtGdiEnumFonts(Call& c) {
     }
     ++matched;
   }
-  if (c.arg(7) == 0) return ret_bool(c.write_u32(c.arg(6), matched));
-  return ret_bool(c.write_u32(c.arg(6), matched < cap ? matched : cap));
+  if (c.arg(7) == 0) return ret_bool(c.write_u32(c.arg(6), matched * kEntryBytes));
+  return ret_bool(c.write_u32(c.arg(6), (matched < cap ? matched : cap) * kEntryBytes));
 }
 
 }  // namespace

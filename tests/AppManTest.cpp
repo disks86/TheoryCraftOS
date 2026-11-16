@@ -966,7 +966,20 @@ struct FakeSetupHost final : appman::ISetupHost {
     *code = exit_code;
     const std::string folder = "/Windows/Program Files/" + app, root = "\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\";
     if (sv(program).find("/Windows/Windows/Temp/WinGet/") == 0) {      // the setup program
-      if (exit_code != 0 && exit_code != 3010) return true;
+      if (exit_code != 0 && exit_code != 3010) {      // it fails, and says why in the log it was asked to keep (with a control character and a long line, to be cleaned up)
+        for (const StringView& argument : arguments) {
+          const std::string word = sv(argument);
+          if (word.rfind("/LOG=C:\\", 0) != 0) continue;
+          std::string log_file = "/Windows/" + word.substr(8);
+          for (char& c : log_file) if (c == '\\') c = '/';
+          if (exit_code == 6)      // (a log with an error in the middle: what is quoted starts there, not at the end)
+            write(log_file, "starting\r\n2026 Defaulting to Abort for suppressed message box (Abort/Retry/Ignore):\r\n   C:\\x\\unins000.exe\r\n\r\n   MoveFile failed; code 32.\r\n"
+                            "2026 User chose Abort.\r\n2026 Rolling back changes.\r\n2026 Deinitializing Setup.\r\n2026 Log closed.\r\n");
+          else
+            write(log_file, "\xEF\xBB\xBFstarting\r\nline two\r\n" + std::string(600, 'x') + "\r\nSetup\x01 version: 6\r\nCould not create the window.\r\n");
+        }
+        return true;
+      }
       const std::string self = read_ram(fs, sv(program).c_str());
       (void)fs.create_directory(view(folder));
       write(folder + "/app.exe", self);
@@ -1040,7 +1053,7 @@ static void test_winget_setup_programs() {
     CHECK(run(installer.install(older, &progress, &detail), appman::Result::Ok));
     progress.changed = nullptr;
     CHECK(saw_running && !progress.running_setup);
-    CHECK(host.runs.size() == 1 && host.runs[0] == "/Windows/Windows/Temp/WinGet/Test.Setup.8.0/setup-8.0.exe|/SP-|/VERYSILENT|/SUPPRESSMSGBOXES|/NORESTART");
+    CHECK(host.runs.size() == 1 && host.runs[0] == "/Windows/Windows/Temp/WinGet/Test.Setup.8.0/setup-8.0.exe|/SP-|/VERYSILENT|/SUPPRESSMSGBOXES|/NORESTART|/LOG=C:\\Windows\\Temp\\WinGet\\Test.Setup.8.0\\setup.log");
     CHECK(temp_empty() && exists(fs, "/Windows/Program Files/Setup Program/app.exe"));
     const std::string record = read_ram(fs, kRecord);
     CHECK(record.find("PackageIdentifier: Test.Setup\n") != std::string::npos && record.find("PackageVersion: 8.0\n") != std::string::npos &&
@@ -1086,7 +1099,7 @@ static void test_winget_setup_programs() {
     CHECK(run(installer.install(package("Test.Msi"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("Windows Installer"));
     CHECK(run(installer.install(package("Test.Setup32"), &progress, &detail), appman::Result::NotSupported) && detail.view().contains("32-bit"));
     CHECK(host.runs.empty() && temp_empty() && installer.list_installed(&apps) && apps.count() == 0);
-    // A 32-bit setup program of Nullsoft's kind is run (and so is its uninstaller, which is 32-bit too); the Inno Setup one above was refused.
+    // A 32-bit setup program of Nullsoft's kind is run (and so is its uninstaller, which is 32-bit too); the one of no known kind above was refused.
     host.app = "Nsis App";
     host.key = "Nsis App";
     host.version = "3.1";
@@ -1101,6 +1114,12 @@ static void test_winget_setup_programs() {
     host.key = "Setup Program_is1";
     host.exit_code = 5;
     CHECK(run(installer.install(package("Test.Setup"), &progress, &detail), appman::Result::SetupFailed) && detail.view().contains("code 5") && !installer.installed("Test.Setup") && temp_empty());
+    // (an Inno Setup program's log: its last three lines, cut to 400 characters and to plain text, are the reason given)
+    CHECK(detail.view().contains("its log ends: ") && detail.view().ends_with("|Setup  version: 6|Could not create the window.") && !detail.view().contains("line two") &&
+          detail.size() < 480);
+    host.exit_code = 6;      // (and from the first error it reports, when it reports one)
+    CHECK(run(installer.install(package("Test.Setup"), &progress, &detail), appman::Result::SetupFailed) && detail.view().contains("code 6; its log ends: 2026 Defaulting to Abort") &&
+          detail.view().contains("MoveFile failed; code 32.") && detail.view().contains("User chose Abort.") && !detail.view().contains("Log closed") && temp_empty());
     host.exit_code = 0;
     host.start = false;
     CHECK(run(installer.install(package("Test.Setup"), &progress, &detail), appman::Result::SetupFailed) && detail.view().contains("could not be started") && temp_empty());

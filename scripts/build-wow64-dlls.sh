@@ -21,6 +21,7 @@ mkdir -p "$out"
 flags="-O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-value -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -Wno-overflow -Wno-builtin-declaration-mismatch
        -msse2 -mincoming-stack-boundary=2 -ffreestanding -fno-builtin -fno-tree-loop-distribute-patterns -fno-stack-protector -fno-strict-aliasing -nostdlib -shared
        -include src/Windows/tcos_wow64_prefix.h -Wl,--entry=_DllMain@12 -Wl,--enable-stdcall-fixup"
+flags="$flags ${WOW64_EXTRA_FLAGS:-}"      # (more compiler flags, for a build that looks for something: -DTCOS_HEAP_CHECK, see src/Windows/ntdll/heap.inc)
 w=src/Windows
 
 # build <name> <image base> <stub result> <sources and the import libraries it is linked against ...>
@@ -62,9 +63,39 @@ build_one() {
     shlwapi) build shlwapi 0x76000000 0 $w/shlwapi/shlwapi.c $(lib ntdll kernel32 advapi32 oleaut32 user32) ;;
     shcore) build shcore 0x76400000 0 $w/shcore/shcore.c $(lib ntdll kernel32 advapi32 ole32 win32u) ;;
     shell32) build shell32 0x76800000 0 $w/shell32/shell32.c $(lib ntdll kernel32 advapi32 user32 ole32) ;;
-    *) echo "build-wow64-dlls.sh: no rule for $1" >&2; exit 1 ;;
+    *)
+      # Any other library: its own code if it has any (src/Windows/<dll>/<dll>.c), over ntdll, kernel32 and the libraries it imports; without code of
+      # its own it is its stubs. The image base is only a wish (the loader moves a library whose place is taken).
+      [ -f "$w/stubs/$1.inc" ] || [ -f "$w/$1/$1.c" ] || { echo "build-wow64-dlls.sh: no library $1" >&2; exit 1; }
+      local imports="ntdll kernel32"
+      case $1 in
+        dxgi|opengl32|vulkan-1) imports="$imports gdi32 user32" ;;
+        d3d12) imports="$imports gdi32" ;;
+        imm32) imports="$imports win32u" ;;
+        crypt32) imports="$imports advapi32 bcrypt" ;;
+        secur32) imports="$imports advapi32" ;;
+        mmdevapi|xaudio2_9|xaudio2_8) imports="$imports ole32" ;;
+        comdlg32) imports="$imports user32" ;;
+      esac
+      if [ -f "$w/$1/$1.c" ]; then build "$1" 0x6a000000 0 "$w/$1/$1.c" $(lib $imports)
+      else build "$1" 0x6a000000 0
+      fi ;;
   esac
 }
 
-LIBRARIES="ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32"
-for name in ${*:-$LIBRARIES}; do build_one "$name"; done
+# The first fourteen in the order they need each other; the rest need only those (and bcrypt before crypt32). Not built for i386: winmm, dsound, mmdevapi,
+# xaudio2_8, xaudio2_9, imm32, dbghelp and vulkan-1, whose sources do not compile for it yet (docs/Wow64.md).
+LIBRARIES="ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32
+           rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder"
+# The libraries others are linked against are built one after the other; the rest, which nothing here imports from, side by side.
+ordered=" ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32 bcrypt "
+pids=()
+for name in ${*:-$LIBRARIES}; do
+  case "$ordered" in
+    *" $name "*) build_one "$name" ;;
+    *) build_one "$name" & pids+=($!) ;;
+  esac
+done
+failed=0
+for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+exit $failed

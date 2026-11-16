@@ -486,8 +486,8 @@ bool WingetInstaller::is_for_this_processor(StringView path) const {
 }
 
 // Can the setup program (or uninstaller) at `path`, of a package of installer type `type`, be run here? A 64-bit Windows program can. A 32-bit one
-// (most setup programs are, whatever they install) can if it is of a kind that has been run here: Nullsoft's (docs/Wow64.md). The window system of
-// 32-bit programs is not whole yet, and the other kinds lean on it more.
+// (most setup programs are, whatever they install) can if it is of a kind that has been run here: Nullsoft's and Inno Setup's (docs/Wow64.md). One of
+// no known kind ("exe") is anybody's program, and what it needs of the 32-bit libraries is not known.
 bool WingetInstaller::setup_program_runs(StringView path, StringView type) const {
   if (is_for_this_processor(path)) return true;
   UniquePointer<filesystem::IFile> file;
@@ -497,7 +497,7 @@ bool WingetInstaller::setup_program_runs(StringView path, StringView type) const
   uint64_t got = 0;
   if (!head.put_zeros(size) || file->read(0, head.writable_view(), &got) != Status::Ok || got > size) return false;
   const ConstByteView bytes = head.view().first(got);
-  return exe::identify_executable(bytes) == exe::ExecutableKind::Pe && exe::identify_architecture(bytes) == exe::Architecture::X86_32 && equals_folded(type, "nullsoft");
+  return exe::identify_executable(bytes) == exe::ExecutableKind::Pe && exe::identify_architecture(bytes) == exe::Architecture::X86_32 && (equals_folded(type, "nullsoft") || equals_folded(type, "inno"));
 }
 
 bool WingetInstaller::list_installed(List<WingetInstalled>* apps) const {
@@ -842,6 +842,49 @@ Result WingetInstaller::remove(StringView id, String* detail) {
   return Result::Ok;
 }
 
+// What a setup program's log says of why it gave up, as plain text: six lines (600 characters at most) from the first place it reports an error (Inno
+// Setup writes "Exception message:" or "Defaulting to ... for suppressed message box" there, and what follows is the rolling back), else its last
+// three lines (400 characters at most). The log is the program's own writing, so nothing is taken on trust: only printable ASCII is kept. False if there is no log to read.
+bool WingetInstaller::log_tail(StringView path, String* out) const {
+  constexpr uint64_t kLogLimit = 4 * 1024 * 1024, kTailCharacters = 400, kErrorCharacters = 600;
+  constexpr uint32_t kTailLines = 3, kErrorLines = 6;      // (an error is a heading, the file it is about, a blank line and the message)
+  String text(allocator_);
+  out->clear();
+  if (!read_text_file(files_, allocator_, path, kLogLimit, &text)) return false;
+  StringView rest = text.view();
+  while (!rest.empty() && (rest[rest.size() - 1] == '\n' || rest[rest.size() - 1] == '\r')) rest = rest.first(rest.size() - 1);
+  // The first line that reports an error, if any.
+  uint64_t error_at = StringView::npos;
+  static constexpr StringView kMarks[] = {"Exception message:", "Defaulting to ", "Message box ("};      // ("Defaulting to OK / Abort / No for suppressed message box")
+  for (const StringView mark : kMarks) {
+    const uint64_t at = rest.find(mark);
+    if (at != StringView::npos && (error_at == StringView::npos || at < error_at)) error_at = at;
+  }
+  if (error_at != StringView::npos) {
+    while (error_at > 0 && rest[error_at - 1] != '\n') --error_at;      // (from the start of that line)
+    rest = rest.without_prefix(error_at);
+    uint64_t end = 0;
+    for (uint32_t lines = 0; end < rest.size(); ++end) {
+      if (rest[end] == '\n' && ++lines == kErrorLines) break;
+    }
+    rest = rest.first(end);
+    if (rest.size() > kErrorCharacters) rest = rest.first(kErrorCharacters);
+  } else {
+    uint64_t start = rest.size();
+    for (uint32_t lines = 0; start > 0; --start) {
+      if (rest[start - 1] != '\n') continue;
+      if (++lines == kTailLines) break;
+    }
+    rest = rest.without_prefix(start);
+    if (rest.size() > kTailCharacters) rest = rest.without_prefix(rest.size() - kTailCharacters);
+  }
+  for (const char c : rest) {
+    const char shown = c == '\n' ? '|' : (c >= 0x20 && c < 0x7F) ? c : c == '\r' ? '\0' : ' ';
+    if (shown != '\0' && !out->push_back(shown)) return false;
+  }
+  return true;
+}
+
 // A package that comes as a setup program: downloaded, checked, run, and what it registered remembered.
 Result WingetInstaller::place_setup(const WingetManifest& manifest, const WingetInstallerEntry& entry, Progress* progress, String* detail) {
   if (!setup_) return Result::NotSupported;
@@ -893,6 +936,16 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
     if (!arguments.push_back(word.view())) return finish(Result::OutOfMemory);
   for (const String& word : static_cast<const List<String>&>(custom).view())
     if (!arguments.push_back(word.view())) return finish(Result::OutOfMemory);
+  // An Inno Setup program keeps a log when asked (as winget asks it): what it says last is the reason given when it fails. The log is in the folder of
+  // the downloaded setup program, as the program names it (the Windows world is the folder /Windows, drive C), and goes with that folder.
+  String log_path(allocator_), log_switch(allocator_);
+  constexpr StringView kWindowsRoot("/Windows/");
+  if (equals_folded(entry.type.view(), "inno") && folder.view().starts_with(kWindowsRoot)) {
+    if (!join(&log_path, folder.view(), "/setup.log") || !log_switch.assign("/LOG=C:\\")) return finish(Result::OutOfMemory);
+    for (const char c : log_path.view().without_prefix(kWindowsRoot.size()))
+      if (!log_switch.push_back(c == '/' ? '\\' : c)) return finish(Result::OutOfMemory);
+    if (!arguments.push_back(log_switch.view())) return finish(Result::OutOfMemory);
+  }
 
   // Run it, with the registry's list of installed programs taken before and after.
   List<UniquePointer<UninstallEntry>> before(allocator_), after(allocator_);
@@ -913,6 +966,8 @@ Result WingetInstaller::place_setup(const WingetManifest& manifest, const Winget
   for (const uint32_t good : entry.success_codes.view()) success |= code == good;
   if (!success) {
     (void)(detail->assign("the setup program ended with code ") && detail->append_uint(code));
+    String tail(allocator_);
+    if (!log_path.empty() && log_tail(log_path.view(), &tail) && !tail.empty()) (void)(detail->append("; its log ends: ") && detail->append(tail.view()));
     return finish(Result::SetupFailed);
   }
   if (!setup_->uninstall_entries(&after)) return finish(Result::OutOfMemory);

@@ -51,6 +51,7 @@ static DWORD WINAPI worker(LPVOID parameter) {
 }
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "child") == 0) return 7;      /* (started by itself, below: a 32-bit program starting a 32-bit program) */
   printf("crt32: a 32-bit program with a C runtime is running\n");
   check(sizeof(void *) == 4 && argc >= 1 && argv[0] && strstr(argv[0], "crt32") != NULL, "32-bit pointers, and the program's name in argv[0]");
 
@@ -146,6 +147,47 @@ int main(int argc, char **argv) {
   }
   DeleteFileA("C:\\Windows\\Temp\\crt32.tmp\\plug32.dll");
   RemoveDirectoryA("C:\\Windows\\Temp\\crt32.tmp");
+
+  /* Renaming: a file that was just written, onto a new name and over an existing file (the request names the file with a handle in it). */
+  CreateDirectoryA("C:\\Windows\\Temp\\crt32.move", NULL);
+  FILE *moved = fopen("C:\\Windows\\Temp\\crt32.move\\a.tmp", "wb");
+  if (moved) { fputs("renamed", moved); fclose(moved); }
+  check(moved != NULL && MoveFileA("C:\\Windows\\Temp\\crt32.move\\a.tmp", "C:\\Windows\\Temp\\crt32.move\\b.bin") &&
+        GetFileAttributesA("C:\\Windows\\Temp\\crt32.move\\a.tmp") == INVALID_FILE_ATTRIBUTES && GetFileAttributesA("C:\\Windows\\Temp\\crt32.move\\b.bin") != INVALID_FILE_ATTRIBUTES,
+        "MoveFile renames a file");
+  moved = fopen("C:\\Windows\\Temp\\crt32.move\\c.tmp", "wb");
+  if (moved) { fputs("second", moved); fclose(moved); }
+  char moved_text[16] = {0};
+  const BOOL replaced = MoveFileExA("C:\\Windows\\Temp\\crt32.move\\c.tmp", "C:\\Windows\\Temp\\crt32.move\\b.bin", MOVEFILE_REPLACE_EXISTING);
+  moved = fopen("C:\\Windows\\Temp\\crt32.move\\b.bin", "rb");
+  if (moved) { fread(moved_text, 1, 15, moved); fclose(moved); }
+  check(replaced && strcmp(moved_text, "second") == 0, "MoveFileEx replaces an existing file");
+  DeleteFileA("C:\\Windows\\Temp\\crt32.move\\b.bin");
+  RemoveDirectoryA("C:\\Windows\\Temp\\crt32.move");
+
+  /* A system library asked for by the path of System32 is the 32-bit one (of SysWOW64). */
+  HMODULE system_library = LoadLibraryA("C:\\Windows\\System32\\version.dll");
+  check(system_library != NULL && GetProcAddress(system_library, "GetFileVersionInfoSizeW") != NULL, "LoadLibrary of a System32 path loads the 32-bit library");
+  if (system_library) FreeLibrary(system_library);
+
+  /* %p is a 32-bit pointer. */
+  char pointer_text[32];
+  sprintf(pointer_text, "%p", (void *)0x1234ABCD);
+  check(strcmp(pointer_text, "1234ABCD") == 0, "printf's %p prints eight digits");
+
+  /* Another program: itself, with an argument. */
+  char own_path[MAX_PATH], command_line[MAX_PATH + 16];
+  STARTUPINFOA startup;
+  PROCESS_INFORMATION child;
+  DWORD child_code = 0;
+  memset(&startup, 0, sizeof(startup));
+  startup.cb = sizeof(startup);
+  GetModuleFileNameA(NULL, own_path, MAX_PATH);
+  sprintf(command_line, "\"%s\" child", own_path);
+  const BOOL child_started = CreateProcessA(NULL, command_line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child);
+  check(child_started && WaitForSingleObject(child.hProcess, 20000) == WAIT_OBJECT_0 && GetExitCodeProcess(child.hProcess, &child_code) && child_code == 7,
+        "CreateProcess starts a 32-bit program, which gets its argument and gives its exit code");
+  if (child_started) { CloseHandle(child.hThread); CloseHandle(child.hProcess); }
 
   /* What a 32-bit program is told about itself and the machine: it runs "under WOW64" on a 64-bit processor. */
   BOOL wow = FALSE;

@@ -1187,17 +1187,6 @@ EXPORT NTSTATUS NTAPI NtSetInformationDebugObject(HANDLE a0, ULONG a1, PVOID a2,
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwSetInformationDebugObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PULONG a4) { return NtSetInformationDebugObject(a0, a1, a2, a3, a4); }
-EXPORT NTSTATUS NTAPI NtSetInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) {
-  ULONG64 v[5] = {0};
-  v[0] = WOW_HANDLE(a0);
-  v[1] = (ULONG64)(ULONG_PTR)a1;
-  v[2] = (ULONG64)(ULONG_PTR)a2;
-  v[3] = (ULONG64)(ULONG_PTR)a3;
-  v[4] = (ULONG64)(ULONG_PTR)a4;
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSetInformationFile, v);
-  return status;
-}
-EXPORT NTSTATUS NTAPI ZwSetInformationFile(HANDLE a0, PIO_STATUS_BLOCK a1, PVOID a2, ULONG a3, ULONG a4) { return NtSetInformationFile(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtSetInformationJobObject(HANDLE a0, ULONG a1, PVOID a2, ULONG a3) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);

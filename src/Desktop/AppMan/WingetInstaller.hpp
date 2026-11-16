@@ -60,8 +60,8 @@
 //   remove:   runs the recorded uninstall command (with the quiet switches of its kind, unless it is the registry's QuietUninstallString), then
 //             forgets the package.
 //
-// Packages of other kinds (MSI, MSIX, WiX Burn, ...), setup programs this system cannot run (a 32-bit Nullsoft setup program is run; a 32-bit Inno Setup
-// or "exe" one is not yet: docs/Wow64.md), and "exe" installers without a silent switch are refused: Result::NotSupported, with the reason in the detail. Calls block:
+// Packages of other kinds (MSI, MSIX, WiX Burn, ...), setup programs this system cannot run (a 32-bit Nullsoft or Inno Setup program is run; a 32-bit
+// "exe" one is not: docs/Wow64.md), and "exe" installers without a silent switch are refused: Result::NotSupported, with the reason in the detail. Calls block:
 // run them on a thread of their own.
 namespace desktop::appman {
 
@@ -155,6 +155,7 @@ class WingetInstaller {
   bool setup_record_path(StringView id, String* out) const;
   bool is_for_this_processor(StringView path) const;
   bool setup_program_runs(StringView path, StringView type) const;
+  bool log_tail(StringView path, String* out) const;
   bool folder_of(StringView id, String* out) const;
   bool read_record(StringView id, WingetInstalled* app, List<String>* shortcuts) const;
   void remove_shortcuts(const List<String>& shortcuts);

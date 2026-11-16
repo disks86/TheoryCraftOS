@@ -842,7 +842,12 @@ static void test_text() {
   CHECK(f.u(N(GetTextFaceW), dc, 0, 0, 0) > 1);
   CHECK(f.u(N(GetTextFaceW), dc, 32, kOut, 0) > 1 && f.prog.memory.get16(kOut) == 'S');
   f.prog.memory.put32(kBig, 100);
-  CHECK(f.u(N(EnumFonts), dc, 1, 0, 0, 0, 0, kBig, 0) == 1 && f.prog.memory.get32(kBig) > 5);
+  // (the count is in bytes: with no buffer, the size of all the entries, 452 bytes each; with one of two entries' size, two entries and nothing past them)
+  CHECK(f.u(N(EnumFonts), dc, 1, 0, 0, 0, 0, kBig, 0) == 1 && f.prog.memory.get32(kBig) > 5 * 452 && f.prog.memory.get32(kBig) % 452 == 0);
+  f.prog.memory.put32(kBig, 2 * 452 + 100);
+  f.prog.memory.put32(kBig + 16 + 2 * 452, 0x5A5A5A5Au);
+  CHECK(f.u(N(EnumFonts), dc, 1, 0, 0, 0, 0, kBig, kBig + 16) == 1 && f.prog.memory.get32(kBig) == 2 * 452 && f.prog.memory.get32(kBig + 16) == 4 &&
+        f.prog.memory.get32(kBig + 16 + 2 * 452) == 0x5A5A5A5Au);
   // widths and glyph indices
   CHECK(f.u(N(GetCharWidthW), dc, 'a', 'c', 0, 2, kOut) == 1 && f.prog.memory.get32(kOut) == 16 && f.prog.memory.get32(kOut + 8) == 16);
   CHECK(f.u(N(GetCharABCWidthsW), dc, 65, 66, 0, 1, kBig) == 1 && f.prog.memory.get32(kBig + 4) == 16);

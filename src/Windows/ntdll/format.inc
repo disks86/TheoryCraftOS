@@ -91,7 +91,7 @@ static int FMT_FN(FMT_CH *buffer, size_t_ capacity, int raw, const FMT_CH *forma
         int is_signed = conversion == 'd' || conversion == 'i';
         unsigned base = conversion == 'o' ? 8 : (conversion == 'x' || conversion == 'X' || conversion == 'p') ? 16 : 10;
         if (conversion == 'X') digits = "0123456789ABCDEF";
-        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 16; digits = "0123456789ABCDEF"; }
+        if (conversion == 'p') { value = (unsigned long long)__builtin_va_arg(args, void *); is_signed = 0; if (precision < 0) precision = 2 * (int)sizeof(void *);      /* (8 digits in a 32-bit program) */ digits = "0123456789ABCDEF"; }
         else if (is_signed) {
           long long v = size == 8 ? __builtin_va_arg(args, long long) : __builtin_va_arg(args, int);
           if (size == 1) v = (short)v; else if (size == 2) v = (signed char)v;

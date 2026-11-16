@@ -80,6 +80,25 @@ RegistryTree::RegistryTree(allocators::IAllocator& allocator, uint64_t now) : al
     text("PathName", "C:\\Windows");
     text("CSDVersion", "");
   }
+  uint32_t setup = 0;
+  if (resolve(kRoot, StringView("MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion"), false, now, &setup, &created) == kRegSuccess) {      // where programs are installed
+    auto text = [&](const char* name, const char* value) {
+      ByteBuffer data(allocator_);
+      for (const char* c = value; *c; ++c) data.put16(static_cast<uint8_t>(*c));
+      data.put16(0);
+      set_value(setup, StringView(name), 1 /* REG_SZ */, data.view(), now);
+    };
+    // (setup programs read these: a 32-bit one asks the registry, not the environment, for the 64-bit folders, and gives up without them)
+    text("ProgramFilesDir", "C:\\Program Files");
+    text("CommonFilesDir", "C:\\Program Files\\Common Files");
+    text("ProgramFilesDir (x86)", "C:\\Program Files (x86)");
+    text("CommonFilesDir (x86)", "C:\\Program Files (x86)\\Common Files");
+    text("ProgramW6432Dir", "C:\\Program Files");
+    text("CommonW6432Dir", "C:\\Program Files\\Common Files");
+    text("ProgramFilesPath", "%ProgramFiles%");
+    text("MediaPathUnexpanded", "%SystemRoot%\\Media");
+    text("DevicePath", "%SystemRoot%\\inf");
+  }
   uint32_t geo = 0;
   if (resolve(kRoot, StringView("USER\\S-1-5-21-0-0-0-1000\\Control Panel\\International\\Geo"), false, now, &geo, &created) == kRegSuccess) {      // the user's place (GetUserGeoID)
     auto text = [&](const char* name, const char* value) {

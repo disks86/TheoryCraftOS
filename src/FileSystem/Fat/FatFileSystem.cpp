@@ -120,6 +120,8 @@ class FatFileSystem::File final : public IFile {
   }
   uint64_t entry_offset() const { return entry_offset_; }
   File* next_open() const { return next_open_; }
+  // The file was renamed: its directory entry is somewhere else now (the data, and so the place in it, stay).
+  void entry_moved(uint64_t offset) { entry_offset_ = offset; }
 
   uint64_t size() const override {
     kernel::ScopedRecursiveMutex lock(fs_.mutex_);
@@ -219,7 +221,7 @@ class FatFileSystem::File final : public IFile {
   }
 
   FatFileSystem& fs_;
-  const uint64_t entry_offset_;
+  uint64_t entry_offset_;      // (where the directory entry is: it moves when the file is renamed)
   const bool writable_;
   File* next_open_ = nullptr;
   ChainCursor cursor_;
@@ -1348,7 +1350,8 @@ Status FatFileSystem::rename(StringView from, StringView to) {
   s = resolve(from, &source);
   if (s != Status::Ok) return s;
   if (source.slots == 0) return Status::InvalidPath;
-  if (is_open(source.short_offset)) return Status::Busy;
+  // (a file that is open can be renamed - a rename is asked for through an open file, and whether the others who have it open allow it is for the caller
+  // to say: the open files follow the entry below)
   Node target_parent;
   StringView leaf;
   s = split(to, &target_parent, &leaf);
@@ -1374,6 +1377,8 @@ Status FatFileSystem::rename(StringView from, StringView to) {
   __builtin_memcpy(new_raw + 22, old_raw + 22, 4);
   s = write_bytes(created.short_offset, ConstByteView(new_raw, 32));
   if (s != Status::Ok) return s;
+  for (File* open = open_files_; open; open = open->next_open())
+    if (open->entry_offset() == source.short_offset) open->entry_moved(created.short_offset);
   Node source_parent;
   StringView source_leaf;
   s = split(from, &source_parent, &source_leaf);

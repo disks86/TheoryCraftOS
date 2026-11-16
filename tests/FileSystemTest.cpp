@@ -697,7 +697,22 @@ static void test_fat_write(FatImage::Kind kind, uint32_t block, const char* labe
     CHECK_STATUS(fs.remove("/"), Status::InvalidPath);
     CHECK_STATUS(fs.open_file("/new.txt", OpenMode::Read, &f), Status::Ok);
     CHECK_STATUS(fs.remove("/new.txt"), Status::Busy);
-    CHECK_STATUS(fs.rename("/new.txt", "/renamed.txt"), Status::Busy);
+    // (an open file can be renamed - a rename is asked for through an open file - and the open file goes on being that file: read, written and grown
+    // under its new name, across directories too)
+    CHECK_STATUS(fs.rename("/new.txt", "/renamed.txt"), Status::Ok);
+    CHECK_STATUS(fs.stat("/new.txt", &e), Status::NotFound);
+    { uint64_t moved_size = f->size(), got = 0; char first[4] = {};
+      CHECK(moved_size > 0 && f->read(0, ByteView(reinterpret_cast<uint8_t*>(first), 4), &got) == Status::Ok && got == (moved_size < 4 ? moved_size : 4));
+      UniquePointer<IFile> w; uint64_t put = 0;
+      CHECK_STATUS(fs.open_file("/renamed.txt", OpenMode::ReadWrite, &w), Status::Ok);
+      CHECK(w && w->write(moved_size, ConstByteView(reinterpret_cast<const uint8_t*>("tail"), 4), &put) == Status::Ok && put == 4);
+      CHECK_STATUS(fs.rename("/renamed.txt", "/docs/moved while open.txt"), Status::Ok);
+      CHECK(f->size() == moved_size + 4 && w->size() == moved_size + 4);
+      CHECK_STATUS(fs.stat("/docs/moved while open.txt", &e), Status::Ok);
+      CHECK(e.size == moved_size + 4);
+      w.reset();
+      CHECK_STATUS(fs.rename("/docs/moved while open.txt", "/new.txt"), Status::Ok); }
+    CHECK_STATUS(fs.remove("/new.txt"), Status::Busy);
     f.reset();
     CHECK_STATUS(fs.remove("/new.txt"), Status::Ok);
     CHECK_STATUS(fs.stat("/new.txt", &e), Status::NotFound);

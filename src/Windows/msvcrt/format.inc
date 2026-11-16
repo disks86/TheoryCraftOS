@@ -133,7 +133,7 @@ static int FORMAT_NAME(void (*put)(void *, CH), void *context, const CH *format,
         int is_signed = conv == 'd' || conv == 'i';
         unsigned base = conv == 'o' ? 8 : (conv == 'x' || conv == 'X' || conv == 'p') ? 16 : 10;
         const char *digits = conv == 'X' || conv == 'p' ? "0123456789ABCDEF" : "0123456789abcdef";
-        if (conv == 'p') { value = (unsigned long long)va_arg_(args, void *); is_signed = 0; if (precision < 0) precision = 16; }
+        if (conv == 'p') { value = (unsigned long long)va_arg_(args, void *); is_signed = 0; if (precision < 0) precision = 2 * (int)sizeof(void *);      /* (8 digits in a 32-bit program) */ }
         else if (is_signed) {
           long long v = size == 8 ? va_arg_(args, long long) : va_arg_(args, int);
           if (size == 1) v = (short)v; else if (size == 2) v = (signed char)v;

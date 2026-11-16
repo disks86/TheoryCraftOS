@@ -581,10 +581,31 @@ EXPORT PVOID NTAPI RtlCreateHeap(ULONG flags, PVOID base, SIZE_T reserve, SIZE_T
   return heap_new(flags, commit, reserve, 0);
 }
 
+/* With TCOS_HEAP_CHECK (a build of the library for finding who damages a heap; scripts/build-wow64-dlls.sh takes it in WOW64_EXTRA_FLAGS): before every
+ * allocation and release all the chunks of the heap are walked. The first time they do not add up, the thread faults on purpose so that the kernel's log
+ * shows it: the fault is a write to the address the previous heap call was made from (the damage was done between that call and this one), and the
+ * log's stack lists who made this one. Slow: every call walks the heap. */
+#ifdef TCOS_HEAP_CHECK
+static int heap_validate_all(Heap *h);
+static void *g_heap_check_previous;
+static volatile LONG g_heap_check_found;
+static void heap_check(Heap *h, void *caller) {
+  if (!g_heap_check_found && !heap_validate_all(h)) {
+    g_heap_check_found = 1;
+    *(volatile char *)g_heap_check_previous = 0;      /* (reported by the kernel as an access violation at that address; the program may handle it and go on) */
+  }
+  g_heap_check_previous = caller;
+}
+#define HEAP_CHECK(h) heap_check(h, __builtin_return_address(0))
+#else
+#define HEAP_CHECK(h) ((void)0)
+#endif
+
 EXPORT PVOID NTAPI RtlAllocateHeap(PVOID heap, ULONG flags, SIZE_T bytes) {
   Heap *h = heap;
   if (!heap_ok(h)) { heap_error(6); return NULL; }
   void *held = heap_lock_for(h, flags, bytes < 0x4000);
+  HEAP_CHECK(h);
   if (h->compat == 2 && !h->lfh_active && h->allocations >= 0x11 && lfh_allowed(h)) h->lfh_active = 1;      /* (the pattern low fragmentation waits for: the 18th allocation) */
   PVOID r = heap_alloc_locked(h, flags, bytes);
   if (r && ++h->allocations >= 0x12 && h->compat == 0 && !(h->flags & HEAP_FLAG_NO_SERIALIZE) && !heap_is_fixed(h)) h->compat = 2;
@@ -600,6 +621,7 @@ EXPORT BOOLEAN NTAPI RtlFreeHeap(PVOID heap, ULONG flags, PVOID memory) {
   if (!memory) return TRUE;
   if (!heap_ok(h)) { heap_error(6); return FALSE; }
   void *held = heap_lock_for(h, flags, 1);
+  HEAP_CHECK(h);
   const BOOLEAN r = heap_free_locked(h, memory);
   heap_unlock_for(h, held);
   if (!r) heap_error(87 /* ERROR_INVALID_PARAMETER */);

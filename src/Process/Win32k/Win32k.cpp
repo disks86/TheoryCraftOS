@@ -17,6 +17,7 @@
  */
 #include "Process/Win32k/Win32k.hpp"
 #include "Process/WindowsObjects.hpp"
+#include "Process/WindowsStartup.hpp"
 #include "Process/WindowsOpenGl.hpp"
 #include "Process/Win32k/Win32kUser.hpp"
 #include "Process/Win32k/Win32kUserMisc.hpp"
@@ -173,10 +174,28 @@ int32_t Call::write_wide(uint64_t address, ArrayView<const char16_t> text, uint3
   return int32_t(n);
 }
 
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+namespace {
+void process_log_error(uint32_t service, uint32_t error) {
+  char text[64];
+  uint32_t n = 0;
+  auto put = [&](const char* word) { while (*word && n + 1 < sizeof(text)) text[n++] = *word++; };
+  auto number = [&](uint32_t value) { char digits[12]; uint32_t k = 0; do { digits[k++] = char('0' + value % 10); value /= 10; } while (value); while (k && n + 1 < sizeof(text)) text[n++] = digits[--k]; };
+  put("window service "); number(service); put(" error "); number(error);
+  process_log(StringView(text, n));
+}
+}  // namespace
+#endif
+
 void Call::set_last_error(uint32_t error) {
   uint64_t teb = process_.gs_base();
   if (Process::ThreadRecord* thread = process_.find_thread(tid())) if (thread->teb != 0) teb = thread->teb;
   if (teb != 0) write_u32(teb + kTebLastError, error);
+  // A 32-bit program reads the last error of its own TEB (the 32-bit one, after the 64-bit one), where LastErrorValue is at 0x34.
+  if (teb != 0 && process_.arch() == UserArch::X86_32) write_u32(teb + kWindowsTeb32Offset + 0x34, error);
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+  if (error != 0) process_log_error(service(), error);      // (with the NT services' failures: Kernel/UserMode.cpp)
+#endif
 }
 
 bool register_handler(WindowsSyscallNumber number, Handler handler, bool locked) {

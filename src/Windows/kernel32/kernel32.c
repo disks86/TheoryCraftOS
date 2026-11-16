@@ -2271,6 +2271,30 @@ static BOOL is_program_file(LPCWSTR path) {
 
 /* Looks for a file the way CreateProcess and LoadLibrary do: a name with a path as it is; a bare name in the folder of this program, `extra` (SetDllDirectory), the folders
    C:\Windows\System32 and C:\Windows, the current folder and then those of PATH. `extension` (".exe", ".dll") is added to a name that has none. */
+#ifdef __i386__
+/* A 32-bit program's system libraries are those of C:\Windows\SysWOW64 (docs/Wow64.md). A file that was found in C:\Windows\System32 is taken from
+ * SysWOW64 instead when it is there; when it is not, a library is "not found" (the one in System32 is a 64-bit one, which a 32-bit program cannot
+ * load) and anything else - a program to start - stays what it is. FALSE: not to be used. */
+static BOOL wow_system_file(WCHAR *path) {
+  static const WCHAR system32[] = L"C:\\Windows\\System32\\", syswow64[] = L"C:\\Windows\\SysWOW64\\";
+  const size_t_ prefix = sizeof(system32) / sizeof(WCHAR) - 1, length = wcslen(path);
+  if (length <= prefix) return TRUE;
+  for (size_t_ i = 0; i < prefix; ++i) {
+    const WCHAR a = path[i], b = system32[i];
+    if ((a >= 'A' && a <= 'Z' ? a + 32 : a) != (b >= 'A' && b <= 'Z' ? b + 32 : b) && !(a == '/' && b == '\\')) return TRUE;
+  }
+  WCHAR other[PATH_CHARS];
+  if (length + 1 > PATH_CHARS) return TRUE;
+  memcpy(other, syswow64, prefix * 2);
+  memcpy(other + prefix, path + prefix, (length - prefix + 1) * 2);
+  if (is_program_file(other)) { memcpy(path, other, (length + 1) * 2); return TRUE; }
+  const WCHAR *end = path + length;
+  const BOOL library = length > 4 && end[-4] == '.' && (end[-3] | 32) == 'd' && (end[-2] | 32) == 'l' && (end[-1] | 32) == 'l';
+  return !library;
+}
+#else
+static BOOL wow_system_file(WCHAR *path) { (void)path; return TRUE; }
+#endif
 static BOOL try_candidate(LPCWSTR directory, size_t_ directory_length, LPCWSTR file, WCHAR *out) {
   WCHAR candidate[PATH_CHARS];
   const size_t_ f = wcslen(file);
@@ -2278,7 +2302,7 @@ static BOOL try_candidate(LPCWSTR directory, size_t_ directory_length, LPCWSTR f
   memcpy(candidate, directory, directory_length * 2);
   candidate[directory_length] = '\\';
   memcpy(candidate + directory_length + 1, file, (f + 1) * 2);
-  if (!is_program_file(candidate)) return FALSE;
+  if (!is_program_file(candidate) || !wow_system_file(candidate)) return FALSE;
   lstrcpyW(out, candidate);
   return TRUE;
 }
@@ -2295,7 +2319,7 @@ static BOOL find_file(LPCWSTR name, LPCWSTR extension, LPCWSTR extra, WCHAR *out
   if (!has_extension) memcpy(file + length, extension, (extension_length + 1) * 2);
   if (path_given) {
     if (full_path_w(file, out, PATH_CHARS) == 0) return FALSE;
-    return is_program_file(out);
+    return is_program_file(out) && wow_system_file(out);
   }
   static const WCHAR system32[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', '\\', 'S', 'y', 's', 't', 'e', 'm', '3', '2', 0};
   static const WCHAR windows[] = {'C', ':', '\\', 'W', 'i', 'n', 'd', 'o', 'w', 's', 0};
@@ -2374,7 +2398,7 @@ static int find_library_restricted(LPCWSTR name, DWORD search, WCHAR *out) {
   memcpy(file, name, (length + 1) * 2);
   if (!has_extension) memcpy(file + length, dll, sizeof(dll));
   const BOOL rooted = name[0] == '\\' || (name[0] && name[1] == ':');      /* (rooted in the current drive, or a drive with its current folder) */
-  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) ? 1 : 0;
+  if (absolute || rooted) return full_path_w(file, out, PATH_CHARS) != 0 && is_program_file(out) && wow_system_file(out) ? 1 : 0;
   if (search & 0x100) {      /* (the folder of the library that is loaded needs a path to take it from: a bare name may do without it only with the default folders) */
     if (!(search & 0x1000)) return -1;
     search &= ~(DWORD)0x100;
@@ -4065,12 +4089,15 @@ EXPORT BOOL WINAPI MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   NTSTATUS status = NtOpenFile(&h, DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES, &source, &iosb, 7, FILE_SYNCHRONOUS_IO_NONALERT_);
   if (!NT_SUCCESS(status)) return fail_nt(status);
   const ULONG name_bytes = target_name.Length;
-  BYTE *info = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, 20 + name_bytes + 2);
+  /* FILE_RENAME_INFORMATION {BOOLEAN replace; HANDLE root; ULONG name length; WCHAR name[]}: the name's length and the name follow the handle, at 16
+     and 20 in a 64-bit program and at 8 and 12 in a 32-bit one */
+  const ULONG length_at = 2 * sizeof(HANDLE), name_at = length_at + 4;
+  BYTE *info = RtlAllocateHeap(heap(), HEAP_ZERO_MEMORY, name_at + name_bytes + 2);
   if (!info) { NtClose(h); set_error(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
   info[0] = (flags & MOVEFILE_REPLACE_EXISTING) ? 1 : 0;
-  *(ULONG *)(info + 16) = name_bytes;
-  memcpy(info + 20, target_name.Buffer, name_bytes);
-  status = NtSetInformationFile(h, &iosb, info, 20 + name_bytes, 10);      /* FileRenameInformation */
+  *(ULONG *)(info + length_at) = name_bytes;
+  memcpy(info + name_at, target_name.Buffer, name_bytes);
+  status = NtSetInformationFile(h, &iosb, info, name_at + name_bytes, 10);      /* FileRenameInformation */
   RtlFreeHeap(heap(), 0, info);
   NtClose(h);
   if (!NT_SUCCESS(status)) return fail_nt(status);

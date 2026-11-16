@@ -1333,7 +1333,7 @@ if(TCOS_ARCH STREQUAL "x86_64")
       dbghelp psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite shcore
       vulkan-1 avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dsound dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib
       activeds normaliz sensapi authz rasapi32
-      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8)
+      bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent mmdevapi ndfapi tbs winusb cryptui bthprops xaudio2_9 xaudio2_8 shfolder)
   # win32u.dll holds the system-call stubs of win32k (NtUser*, NtGdi*: src/Windows/win32u/services.inc).
   add_custom_command(OUTPUT ${WINDOWS_DIR}/win32u.dll
     COMMAND ${CMAKE_COMMAND} -E make_directory ${WINDOWS_DIR}
@@ -1504,6 +1504,10 @@ endif()
 set(TCOS_AUTORUN "" CACHE STRING "A program on the primary disk to start when the desktop is up")
 set(TCOS_AUTORUN_ARGUMENTS "" CACHE STRING "Its arguments (;-separated)")
 set(TCOS_AUTORUN_ENVIRONMENT "" CACHE STRING "More environment variables for it (;-separated NAME=value)")
+option(TCOS_TRACE_SERVICE_FAILURES "Say every NT service of a Windows program that answers an error status on the debug console (for finding out why a program gives up)" OFF)
+if(TCOS_TRACE_SERVICE_FAILURES)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_TRACE_SERVICE_FAILURES)
+endif()
 option(TCOS_AUTORUN_ELEVATED "Start it with the elevated form of the user's token (a Windows program run as administrator, as the App Manager runs a setup program)" OFF)
 if(TCOS_AUTORUN)
   if(TCOS_AUTORUN_ELEVATED)
@@ -1622,7 +1626,8 @@ if(TCOS_ARCH STREQUAL "x86_64" AND MKFS_FAT AND TCOS_HOST_CXX)
   # The libraries of 32-bit programs (C:\\Windows\\SysWOW64, see docs/Wow64.md): the same sources built for i386, where there is a compiler for that.
   find_program(TCOS_WOW64_CC i686-w64-mingw32-gcc)
   # (the same list, in the order of building, is LIBRARIES in scripts/build-wow64-dlls.sh)
-  set(WOW64_LIBRARIES ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32)
+  set(WOW64_LIBRARIES ntdll kernel32 msvcrt advapi32 win32u gdi32 user32 comctl32 version oleaut32 ole32 shlwapi shcore shell32
+      rpcrt4 secur32 bcrypt crypt32 ncrypt userenv setupapi iphlpapi psapi wininet winhttp wintrust netapi32 dwmapi uxtheme mswsock gdiplus msimg32 opengl32 glu32 dnsapi mpr wtsapi32 powrprof cfgmgr32 d3d9 d3d11 d3d12 dxgi dwrite avrt winspool wevtapi pdh wldap32 urlmon msi propsys hid usp10 winscard odbc32 xinput1_4 dinput8 d2d1 d3dcompiler_47 lz32 oleacc oledlg credui ntdsapi samlib activeds normaliz sensapi authz rasapi32 bcryptprimitives combase mfplat mf mfreadwrite dcomp uiautomationcore dhcpcsvc esent ndfapi tbs winusb cryptui bthprops comdlg32 ws2_32 shfolder)
   set(_wow64_outputs "")
   if(TCOS_WOW64_CC)
     set(WOW64_DIR ${CMAKE_BINARY_DIR}/windows32)

@@ -66,8 +66,24 @@ uint32_t nt_load_module(Process& p, const SyscallRequest& r) {
     if (plain.view().rfind('.') == StringView::npos && !plain.append(".dll")) return kInvalidParameter;
     if (!(flags & 4) && !plain.view().equals(canonical.view()) && (!alias_path.assign("C:\\Windows\\System32\\") || !alias_path.append(canonical.view()))) return kInvalidParameter;
   }
+  // A 32-bit program's system libraries are the ones of SysWOW64: a library it asks for in System32 (by GetSystemDirectory's path, or an alias) is the one of that
+  // name there, and "not found" if there is none - the file in System32 is a 64-bit library, which it cannot load.
+  String redirected(p.files().allocator());
+  StringView from = alias_path.empty() ? path.view() : alias_path.view();
+  constexpr StringView kSystem32("C:\\Windows\\System32\\");
+  if (p.arch() == UserArch::X86_32 && from.size() > kSystem32.size()) {
+    bool under = true;
+    for (uint64_t i = 0; under && i < kSystem32.size(); ++i) {
+      const char a = from[i] == '/' ? '\\' : from[i], b = kSystem32[i];
+      under = (a >= 'A' && a <= 'Z' ? char(a + 32) : a) == (b >= 'A' && b <= 'Z' ? char(b + 32) : b);
+    }
+    if (under) {
+      if (!redirected.assign("C:\\Windows\\SysWOW64\\") || !redirected.append(from.without_prefix(kSystem32.size()))) return kInvalidParameter;
+      from = redirected.view();
+    }
+  }
   ByteBuffer file(p.files().allocator());
-  if (!read_program_file(p, alias_path.empty() ? path.view() : alias_path.view(), &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
+  if (!read_program_file(p, from, &file, &status)) return status == 0xC0000034u || status == 0xC000003Au ? kDllNotFound : status;
   {
     exe::PeFile checked(p.files().allocator());
     if (const uint32_t header = image_section_status(file.view(), checked)) return header;

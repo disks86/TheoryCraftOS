@@ -37,14 +37,25 @@ to make, from the 64-bit ones.
 process), `GetSystemInfo` describes a 32-bit processor and `GetNativeSystemInfo` the real one, and turning file-system redirection off and on
 succeeds (nothing is redirected here: System32 is System32 for a 32-bit program too, and its libraries are found in SysWOW64 by the loader).
 
+**Where a 32-bit program's system libraries are.** In `C:\Windows\SysWOW64`. A library asked for by the path of `C:\Windows\System32`
+(`GetSystemDirectory` answers that for every program) is the one of that name in SysWOW64, and is "not found" when there is none there - the file
+in System32 is a 64-bit library. That rule is in the kernel's load service and in kernel32's search (`wow_system_file`); other files are not
+redirected. The built-in assemblies a manifest may depend on (Common Controls 6, the old C runtimes) are x86 ones for a 32-bit program, so its
+manifest activates - and with it the Windows version it declares support for (`GetVersionEx` answers 6.2 to a program whose manifest does not
+activate).
+
 **Loading.** `bind_executable` gives a PE32/i386 program the architecture `UserArch::X86_32`. The image loader and the module loader map PE32 images
 in a 32-bit address space: 32-bit import slots, image base, security cookie, TLS directory. A 32-bit program's libraries are the 32-bit ones, from
 `C:\Windows\SysWOW64` (`ILibraryProvider::find_32bit`); a library it loads by its path while it runs (a setup program's plug-in in a folder of
 temporary files) is that file.
 
 **The libraries.** The sources of the libraries (src/Windows) are built a second time, for i386, into `C:\Windows\SysWOW64`
-(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32,
-comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32.
+(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): all of them but eight - ntdll, kernel32, msvcrt, advapi32,
+win32u, gdi32, user32, comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32, which are tested, and 66 more that are there so that a
+program importing them loads (wtsapi32, userenv, comdlg32, ws2_32, crypt32, uxtheme, shfolder, ...). Of those 66 nothing has been run: the ones
+that are stubs or work through kernel32 and advapi32 can be expected to do what their 64-bit forms do; the ones that hand the kernel structures of
+their own (comdlg32's dialogs, bcrypt, dwrite, opengl32, the Direct3D libraries, ws2_32's sockets) pass them in a 32-bit layout the kernel does
+not read. Not built, because their sources do not compile for i386 yet: winmm, dsound, mmdevapi, xaudio2_8, xaudio2_9, imm32, dbghelp, vulkan-1.
 
 - **Exports that are not implemented** are stubs, as in the 64-bit libraries, but a stdcall stub has to take its arguments off the stack: the
   sizes come from the import libraries i686-w64-mingw32 ships (scripts/gen-wow64-stubs.py). The NT services nothing here has a prototype for are
@@ -77,7 +88,9 @@ comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32.
   (src/Windows/ntdll/wow64_services.inc): a handle is sign-extended, an integer or pointer zero-extended, a pointer to a pointer-sized value
   (`PHANDLE`, `PVOID *`, `PSIZE_T`) goes through a 64-bit copy, and `OBJECT_ATTRIBUTES`, `UNICODE_STRING` and `CLIENT_ID` are passed in their
   64-bit layouts. The services whose buffers have a layout of their own are written by hand in src/Windows/ntdll/wow64.inc
-  (`NtQueryVirtualMemory`, the basic information of a process and of a thread, the handle array of `NtWaitForMultipleObjects`). An I/O status
+  (`NtQueryVirtualMemory`, the basic information of a process and of a thread, the handle array of `NtWaitForMultipleObjects`, the token
+  service, and the classes of `NtSetInformationFile` that name a file - a rename or a hard link carries a handle before the name - or a
+  completion port). An I/O status
   block is the one structure the kernel writes in the caller's layout, because it may be written long after the call.
 - **Start-up**: `RtlUserThreadStart` first makes the 32-bit PEB, process parameters and loader lists from the 64-bit ones the kernel wrote
   (`wow64_start_process`), then goes on as in a 64-bit program. A later thread's `TcosThreadStart` points its 32-bit TEB at that PEB.
@@ -133,17 +146,33 @@ Not done yet, in the order planned:
    a 64-bit program is not converted. comctl32 has no controls yet (for 64-bit programs either), and comdlg32, imm32, winmm and the other
    libraries are not built for i386.
 2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; information classes with
-   pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; a 32-bit program cannot start another program
-   (`RtlCreateProcessParameters` writes the 64-bit layout); `%p` prints 16 digits; the old runtime's `_iob` array has the wrong stride.
+   pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; the old runtime's `_iob` array has the wrong stride
+   (a stream is 40 bytes here, 32 in a 32-bit program built against the old runtime).
 3. **What exceptions still lack**: C++ exceptions are there for 32-bit programs only (a 64-bit msvcrt.dll has neither `__CxxFrameHandler` nor
    `_CxxThrowException`), without exception specifications and without tests of their own (a real setup program's plug-in is what has run them);
    the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
    debugged (no debug events for it); a stack overflow ends the program (no guard-page exception on the 32-bit stack).
-4. **Setup programs**: Nullsoft (NSIS) setup programs run when they install without showing themselves, and the App Manager runs them
-   (docs/AppManager.md): Notepad++'s and qBittorrent's have installed in QEMU, with their uninstallers and plug-in libraries. Inno Setup's have
-   not been run - they make windows even when silent, and lean on what item 1 lists - and the App Manager still refuses them. oleaut32 parses
-   numbers exactly only up to 2^62 in a 32-bit program (i386 has no 128-bit integers).
+4. **Setup programs**: Nullsoft (NSIS) and Inno Setup programs run when they install without showing themselves, and the App Manager runs
+   them (docs/AppManager.md): Notepad++'s and qBittorrent's (NSIS), WinMerge's (Inno Setup 5) and TreeSize Free's (Inno Setup 6) have installed
+   and been removed in QEMU. A 32-bit setup program of no known kind ("exe") is still refused. What an installed 32-bit program then needs is
+   another matter: TreeSize Free, started by its own setup program, faulted. oleaut32 parses numbers exactly only up to 2^62 in a 32-bit program
+   (i386 has no 128-bit integers).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
+
+## Finding out why a program gives up
+
+Three things made the setup programs above tractable, and stay in the tree:
+
+- `-DTCOS_TRACE_SERVICE_FAILURES=ON` (a kernel build option): every NT service of a Windows program that answers an error status, and every error a
+  window service sets, goes to the debug console with the service's number (src/Windows/tcos_syscalls.h).
+- The kernel's log of a program's faults names the function when the fault is a call of a function no library provides
+  ("it called a function that is not there: WTSAPI32.DLL!..."), says which library it would not load and why, and shows the bytes of an
+  instruction the processor refused.
+- `WOW64_EXTRA_FLAGS=-DTCOS_HEAP_CHECK` (an environment variable of the build): the 32-bit ntdll walks a heap at every allocation and release, and
+  at the first damage faults on purpose with a write to the address the previous heap call was made from - the damage was done after that call.
+  (This found gdi32's font enumeration writing 452 bytes an entry into a buffer sized by a count of entries: a bug for 64-bit programs too.)
+
+A setup program's own log is the other half: the App Manager asks Inno Setup for one and quotes it when the setup program fails.
 
 ## Tests
 
