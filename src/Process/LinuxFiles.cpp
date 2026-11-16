@@ -1046,7 +1046,7 @@ uint64_t sys_flock(Process& p, uint64_t fd, uint64_t operation) {
     if (result == ObjectManager::LockResult::Granted) return 0;
     if (result == ObjectManager::LockResult::Full) return error(kEnolck);
     if (operation & kLockNb) return error(kEagain);
-    if (p.exited() || (p.runtime() && p.runtime()->interrupted())) return error(kEintr);
+    if (p.exited() || (p.runtime() && p.runtime()->interrupted()) || p.signal_interrupts()) return error(kEintr);
     p.block_sleep(2000000);      // (looked at again every 2 ms: a lock that is waited for is rare, and the wait must end when the program is stopped)
     if (files.object(fd) != object) return error(kEbadf);      // another thread closed the descriptor meanwhile
   }
@@ -1142,7 +1142,7 @@ uint64_t record_lock(Process& p, uint64_t fd, uint64_t command, uint64_t argumen
     if (result == ObjectManager::LockResult::Granted) return 0;
     if (result == ObjectManager::LockResult::Full) return error(kEnolck);
     if (!wait) return error(kEagain);
-    if (p.exited() || (p.runtime() && p.runtime()->interrupted())) return error(kEintr);
+    if (p.exited() || (p.runtime() && p.runtime()->interrupted()) || p.signal_interrupts()) return error(kEintr);
     p.block_sleep(2000000);      // (looked at again every 2 ms, as flock does)
     if (files.object(fd) != object) return error(kEbadf);      // another thread closed the descriptor meanwhile
   }

@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/Process.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Process/WindowsMailslots.hpp"
 #include "Process/WindowsRegistry.hpp"
 #include "Process/WindowsPipes.hpp"
@@ -134,6 +135,36 @@ void Process::terminate(uint32_t code) {
     objects->process_exited(id_, code);
     objects->notify();
   }
+}
+
+void Process::post_linux_signal(uint32_t signal) {
+  if (binding_.abi != SyscallAbi::Linux || signal == 0 || signal > LinuxProcessState::kSignals || exited()) return;
+  __atomic_or_fetch(&posted_signals_, uint64_t{1} << (signal - 1), __ATOMIC_ACQ_REL);
+  // Whatever a thread of the process waits in looks again: its own waits, the system's objects, the sockets. (A read of the console is not cut short: the host's
+  // way of ending one means "the program is going away".)
+  if (IProcessRuntime* runtime = runtime_) runtime->notify();
+  if (ObjectManager* objects = system_objects()) objects->notify();
+  if (UnixSocketManager* sockets = system_unix_sockets()) {
+    sockets->sync().lock();
+    sockets->sync().notify_all();
+    sockets->sync().unlock();
+  }
+}
+
+bool Process::signal_interrupts() { return binding_.abi == SyscallAbi::Linux && linuxabi::signal_interrupts(*this); }
+
+uint64_t Process::wait_slice(uint64_t wanted_ns) {
+  if (binding_.abi != SyscallAbi::Linux) return wanted_ns;
+  constexpr uint64_t kLongest = 50000000u, kShortest = 1000000u;      // 50 ms; a timer that is due is not waited for in less than 1 ms steps
+  // (without a runtime the process has one thread and nobody else can reach it: only its own timers can end a wait early)
+  uint64_t slice = !runtime_ || wanted_ns < kLongest ? wanted_ns : kLongest;
+  const uint64_t now = host_.monotonic_ns();
+  for (const LinuxProcessState::IntervalTimer& timer : linux_state_.timers) {
+    if (timer.deadline_ns == 0) continue;
+    const uint64_t left = timer.deadline_ns > now ? timer.deadline_ns - now : 0;
+    if (left < slice) slice = left < kShortest ? (wanted_ns < kShortest ? wanted_ns : kShortest) : left;
+  }
+  return slice;
 }
 
 void Process::note_view_file(uint64_t base, const char (&name)[40]) {

@@ -31,9 +31,21 @@ struct LinuxProcessState {
     uint64_t flags = 0, restorer = 0, mask = 0;
   };
   Action actions[kSignals + 1];      // [n]: signal n ([0] is not used)
-  uint64_t pending = 0;              // raised and not taken yet: blocked, or waiting for a handler this OS cannot run
+  uint64_t pending = 0;              // raised for the process and not taken yet: blocked by every thread that looked, or waiting for its handler to be entered
   uint32_t exit_signal = 0;          // the signal that ended the process (0: it ended by itself)
-  bool handler_reported = false;     // the note "handlers are not run" was written once
+  bool handler_reported = false;     // the note "handlers are not run" was written once (a runtime that cannot enter handlers)
+  // Whoever runs the program enters handlers (linuxabi::deliver_signals after a system call, at a timer tick, on a fault). Without that a signal with a handler
+  // only stays pending, for sigtimedwait and sigsuspend to find.
+  bool handlers_run = false;
+  bool return_requested = false;     // rt_sigreturn was called: the runtime restores the registers from the handler's frame (Process::take_signal_return)
+  // What a handler is told about a signal (siginfo_t), one for each signal: signals of one kind do not queue.
+  struct Info {
+    int32_t code = 0;                // SI_USER 0, SI_TKILL -6, or the fault's or child's code
+    uint32_t sender = 0;             // si_pid
+    uint64_t address = 0;            // si_addr of a fault
+    int32_t status = 0;              // si_status of SIGCHLD
+  };
+  Info info[kSignals + 1];
 
   // What each thread has of its own: the signals it blocks, its alternate signal stack and its robust futex list.
   static constexpr uint32_t kMaxThreads = 65;
@@ -41,6 +53,10 @@ struct LinuxProcessState {
     bool used = false;
     uint64_t tid = 0;
     uint64_t blocked = 0;
+    uint64_t pending = 0;            // raised for this thread alone (tgkill, a fault)
+    // sigsuspend() put a mask in place for the length of the call: the one to go back to, once the handler it waited for has been entered (or was not).
+    bool has_saved_mask = false;
+    uint64_t saved_mask = 0;
     uint64_t alt_stack = 0, alt_size = 0;
     uint32_t alt_flags = 2;      // SS_DISABLE
     uint64_t robust_head = 0, robust_size = 0;

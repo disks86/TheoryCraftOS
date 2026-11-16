@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxProcess.hpp"
+#include "Process/AddressSpace.hpp"
 #include "Utility/ByteStream.hpp"
 
 namespace process::linuxabi {
@@ -23,6 +24,9 @@ namespace process::linuxabi {
 namespace {
 
 constexpr int64_t kEperm = 1, kEsrch = 3, kEintr = 4, kEagain = 11, kEnomem = 12, kEfault = 14, kEinval = 22;
+constexpr uint32_t kSigIll = 4, kSigTrap = 5, kSigBus = 7, kSigFpe = 8, kSigSegv = 11;
+constexpr uint64_t kSaNoDefer = 0x40000000u, kSaResetHand = 0x80000000u, kSaRestart = 0x10000000u, kSaOnStack = 0x08000000u, kSaRestorer = 0x04000000u;
+constexpr uint32_t kSsOnStack = 1, kSsDisable = 2, kSsAutodisarm = 0x80000000u;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
 constexpr uint32_t kSigHup = 1, kSigKill = 9, kSigAlrm = 14, kSigChld = 17, kSigCont = 18, kSigStop = 19, kSigTstp = 20, kSigTtin = 21, kSigTtou = 22, kSigUrg = 23,
@@ -38,8 +42,15 @@ constexpr uint64_t kDefaultHarmless = bit(kSigChld) | bit(kSigCont) | bit(kSigUr
 
 uint64_t current_tid(Process& p) { return p.runtime() ? p.runtime()->current_thread_id() : p.id(); }
 
-// Carries out a signal that is not blocked. True if that is the end of it (ignored, or the process ended); false if it has a handler, which nothing here can
-// call: it stays pending for sigtimedwait and sigsuspend.
+// Is the signal one that nothing happens for as things stand: ignored by the program, or by default?
+bool is_ignored(const LinuxProcessState& state, uint32_t signal) {
+  if (signal == kSigKill || signal == kSigStop) return signal == kSigStop;
+  const uint64_t handler = state.actions[signal].handler;
+  return handler == kSigIgn || (handler == kSigDfl && (kDefaultHarmless & bit(signal)));
+}
+
+// Carries out a signal that is not blocked. True if that is the end of it (ignored, or the process ended); false if it has a handler: it stays pending until
+// whoever runs the program enters the handler (deliver_signals), or, where nothing can, for sigtimedwait and sigsuspend.
 bool dispose(Process& p, uint32_t signal) {
   LinuxProcessState& state = p.linux_state();
   const uint64_t handler = signal == kSigKill || signal == kSigStop ? kSigDfl : state.actions[signal].handler;
@@ -50,7 +61,7 @@ bool dispose(Process& p, uint32_t signal) {
     p.terminate(128 + signal);      // (what a shell reports for a program a signal ended)
     return true;
   }
-  if (!state.handler_reported) {
+  if (!state.handlers_run && !state.handler_reported) {
     state.handler_reported = true;
     process_log("linux: a signal with a handler was raised; handlers are not run (it stays pending)");
   }
@@ -60,11 +71,147 @@ bool dispose(Process& p, uint32_t signal) {
 // The pending signals the thread does not block are carried out (after a mask changed, or a timer ran out).
 void deliver_unblocked(Process& p, uint64_t blocked) {
   LinuxProcessState& state = p.linux_state();
+  LinuxProcessState::Thread& thread = thread_state(p);
   for (uint32_t signal = 1; signal <= kSignals && !p.exited(); ++signal) {
-    if (!(state.pending & bit(signal)) || (blocked & bit(signal))) continue;
-    if (dispose(p, signal)) state.pending &= ~bit(signal);
+    if (!((state.pending | thread.pending) & bit(signal)) || (blocked & bit(signal))) continue;
+    if (dispose(p, signal)) {
+      state.pending &= ~bit(signal);
+      thread.pending &= ~bit(signal);
+    }
   }
 }
+
+// What was posted from outside (Process::post_linux_signal) becomes pending for the process; what would be ignored is dropped here already.
+void fold_posted(Process& p) {
+  if (p.posted_signals() == 0) return;
+  LinuxProcessState& state = p.linux_state();
+  const uint64_t posted = p.take_posted_signals();
+  for (uint32_t signal = 1; signal <= kSignals; ++signal) {
+    if (!(posted & bit(signal)) || is_ignored(state, signal)) continue;
+    if (!(state.pending & bit(signal))) state.info[signal] = LinuxProcessState::Info();
+    state.pending |= bit(signal);
+  }
+}
+
+LinuxProcessState::Thread& thread_of(Process& p, uint64_t tid) {
+  LinuxProcessState& state = p.linux_state();
+  LinuxProcessState::Thread* free_entry = nullptr;
+  for (LinuxProcessState::Thread& t : state.threads) {
+    if (t.used && t.tid == tid) return t;
+    if (!t.used && !free_entry) free_entry = &t;
+  }
+  if (!free_entry) return state.threads[0];
+  *free_entry = LinuxProcessState::Thread();
+  free_entry->used = true;
+  free_entry->tid = tid;
+  return *free_entry;
+}
+
+// --- entering a handler (x86-64) ----------------------------------------------------------------------------------------------------------------------
+// What the kernel puts on the program's stack before a handler runs, and reads back at rt_sigreturn: struct rt_sigframe of Linux/x86-64.
+//   +0    the return address of the handler: the action's restorer (which calls rt_sigreturn)
+//   +8    struct ucontext: uc_flags (8), uc_link (8), uc_stack (ss_sp 8, ss_flags 4, padding 4, ss_size 8), uc_mcontext (struct sigcontext, 256), uc_sigmask (8)
+//   +312  siginfo_t (128)
+// and, above it, the 512-byte FXSAVE image uc_mcontext.fpstate points to. struct sigcontext: r8..r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags
+// (8 each), cs, gs, fs, ss (2 each), err, trapno, oldmask, cr2, fpstate (8 each), 8 reserved words.
+constexpr uint64_t kUcontextBytes = 304, kSiginfoBytes = 128, kFrameBytes = 8 + kUcontextBytes + kSiginfoBytes, kFpuBytes = 512, kRedZone = 128;
+constexpr uint64_t kUserFlags = 0x0CD5 | 0x400 | 0x100 | 0x40000 | 0x200000;      // the status flags, DF, TF, AC, ID: what a program may set in RFLAGS
+// The order struct sigcontext keeps the registers in, as indices of X86Context::gpr.
+constexpr uint32_t kContextOrder[16] = {X86Context::kR8,  X86Context::kR9,  X86Context::kR10, X86Context::kR11, X86Context::kR12, X86Context::kR13,
+                                        X86Context::kR14, X86Context::kR15, X86Context::kRdi, X86Context::kRsi, X86Context::kRbp, X86Context::kRbx,
+                                        X86Context::kRdx, X86Context::kRax, X86Context::kRcx, X86Context::kRsp};
+
+struct FaultDetail {
+  uint64_t error = 0, trap = 0, address = 0;
+};
+
+// Builds the frame for `signal` and points the registers at its handler. False if the frame cannot be written (no stack left, no restorer to return through):
+// the caller ends the process, as Linux does with SIGSEGV.
+bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, const LinuxProcessState::Action& action, uint64_t old_mask, const FaultDetail& fault,
+                X86Context* context) {
+  LinuxProcessState& state = p.linux_state();
+  if (!(action.flags & kSaRestorer) || action.restorer == 0) return false;      // (x86-64 has no other way back; every C library gives one)
+  // The handler's address goes into the instruction pointer as it is: one that is no user address must never get there (the processor would fault in the
+  // kernel on the way back to user mode).
+  if (action.handler >= AddressSpace::kUserTop) return false;
+  uint64_t sp = context->gpr[X86Context::kRsp];
+  const bool has_alt = thread.alt_size != 0 && !(thread.alt_flags & kSsDisable);
+  const bool on_alt = has_alt && sp > thread.alt_stack && sp - thread.alt_stack <= thread.alt_size;
+  const bool switches = (action.flags & kSaOnStack) && has_alt && !on_alt;
+  if (switches) {
+    if (thread.alt_size > ~uint64_t{0} - thread.alt_stack) return false;
+    sp = thread.alt_stack + thread.alt_size;
+  } else if (sp >= kRedZone) {
+    sp -= kRedZone;      // (the 128 bytes below the stack pointer are the interrupted function's)
+  }
+  if (sp < kFpuBytes + kFrameBytes + 64) return false;
+  const uint64_t fpu_at = (sp - kFpuBytes) & ~uint64_t{63};
+  const uint64_t frame_at = ((fpu_at - kFrameBytes) & ~uint64_t{15}) - 8;      // (as after a call: the stack pointer + 8 is 16-byte aligned at the handler's first instruction)
+  const uint64_t context_at = frame_at + 8, info_at = context_at + kUcontextBytes;
+
+  uint8_t raw[kFrameBytes] = {};
+  ByteWriter writer{ByteView(raw, sizeof(raw))};
+  writer.le64(action.restorer);
+  writer.le64(0);                                   // uc_flags
+  writer.le64(0);                                   // uc_link
+  writer.le64(thread.alt_stack);                    // uc_stack
+  writer.le32(has_alt ? (on_alt ? kSsOnStack : 0) : kSsDisable);      // (of the code that was interrupted, as Linux reports it)
+  writer.le32(0);
+  writer.le64(thread.alt_size);
+  for (const uint32_t index : kContextOrder) writer.le64(context->gpr[index]);
+  writer.le64(context->rip);
+  writer.le64(context->rflags);
+  writer.le16(0x33);                                // cs: 64-bit user code
+  writer.le16(0);
+  writer.le16(0);
+  writer.le16(0x2B);                                // ss
+  writer.le64(fault.error);
+  writer.le64(fault.trap);
+  writer.le64(old_mask);                            // oldmask
+  writer.le64(fault.address);                       // cr2
+  writer.le64(fpu_at);                              // fpstate
+  writer.zeros(64);
+  writer.le64(old_mask);                            // uc_sigmask
+  // siginfo_t: si_signo, si_errno, si_code (4 each), padding (4), then what the kind of signal has: the address of a fault, or who sent it (pid, uid) and, for
+  // SIGCHLD, how the child ended.
+  const LinuxProcessState::Info& info = state.info[signal];
+  writer.le32(signal);
+  writer.le32(0);
+  writer.le32(uint32_t(info.code));
+  writer.le32(0);
+  if (signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap) {
+    writer.le64(info.address);
+  } else {
+    writer.le32(info.sender);
+    writer.le32(0);
+    writer.le32(uint32_t(info.status));
+  }
+  if (!writer.ok()) return false;
+  if (!p.write_user(fpu_at, ConstByteView(context->fpu, kFpuBytes)) || !p.write_user(frame_at, ConstByteView(raw, sizeof(raw)))) return false;
+
+  context->gpr[X86Context::kRsp] = frame_at;
+  context->gpr[X86Context::kRdi] = signal;
+  context->gpr[X86Context::kRsi] = info_at;
+  context->gpr[X86Context::kRdx] = context_at;
+  context->gpr[X86Context::kRax] = 0;
+  context->rip = action.handler;
+  context->rflags &= ~uint64_t{0x400 | 0x100};      // the direction and trap flags are clear in a handler
+  // While the handler runs: its own signal (unless SA_NODEFER) and the action's mask are blocked on top of what was.
+  thread.blocked = (thread.blocked | action.mask | ((action.flags & kSaNoDefer) ? 0 : bit(signal))) & ~kUnblockable;
+  if (action.flags & kSaResetHand) state.actions[signal].handler = kSigDfl;
+  if (switches && (thread.alt_flags & kSsAutodisarm)) {
+    thread.alt_stack = thread.alt_size = 0;
+    thread.alt_flags = kSsDisable;
+  }
+  state.info[signal] = LinuxProcessState::Info();
+  return true;
+}
+
+void end_by(Process& p, uint32_t signal) {
+  p.linux_state().exit_signal = signal;
+  p.terminate(128 + signal);
+}
+
 
 bool read_set(Process& p, uint64_t address, uint64_t* out) { return p.read_user_u64(address, out); }
 
@@ -81,19 +228,11 @@ uint32_t timer_signal(uint32_t which) { return which == 0 ? kSigAlrm : which == 
 
 }  // namespace
 
-LinuxProcessState::Thread& thread_state(Process& p) {
-  LinuxProcessState& state = p.linux_state();
-  const uint64_t tid = current_tid(p);
-  LinuxProcessState::Thread* free_entry = nullptr;
-  for (LinuxProcessState::Thread& t : state.threads) {
-    if (t.used && t.tid == tid) return t;
-    if (!t.used && !free_entry) free_entry = &t;
-  }
-  if (!free_entry) return state.threads[0];
-  *free_entry = LinuxProcessState::Thread();
-  free_entry->used = true;
-  free_entry->tid = tid;
-  return *free_entry;
+LinuxProcessState::Thread& thread_state(Process& p) { return thread_of(p, current_tid(p)); }
+
+void inherit_thread_mask(Process& p, uint64_t new_tid) {
+  const uint64_t blocked = thread_state(p).blocked;
+  thread_of(p, new_tid).blocked = blocked;
 }
 
 void thread_gone(Process& p, uint64_t tid) {
@@ -101,11 +240,22 @@ void thread_gone(Process& p, uint64_t tid) {
     if (t.used && t.tid == tid) t = LinuxProcessState::Thread();
 }
 
-void raise_signal(Process& p, uint32_t signal) {
+void raise_signal(Process& p, uint32_t signal, uint64_t for_thread, int32_t code) {
   if (signal == 0 || signal > kSignals) return;
   LinuxProcessState& state = p.linux_state();
-  const uint64_t blocked = thread_state(p).blocked & ~kUnblockable;
-  if ((blocked & bit(signal)) || !dispose(p, signal)) state.pending |= bit(signal);
+  if (is_ignored(state, signal)) return;      // (dropped at once, blocked or not)
+  LinuxProcessState::Thread& caller = thread_state(p);
+  const bool own = for_thread == 0 || for_thread == caller.tid;
+  // For the calling thread (or the process, which the calling thread may act for): carried out at once when it can be. For another thread: left for that thread.
+  if (own && !(caller.blocked & ~kUnblockable & bit(signal)) && dispose(p, signal)) return;
+  uint64_t& pending = for_thread == 0 ? state.pending : thread_of(p, for_thread).pending;
+  if (!(pending & bit(signal))) {
+    state.info[signal] = LinuxProcessState::Info();
+    state.info[signal].code = code;
+    state.info[signal].sender = uint32_t(p.id());
+  }
+  pending |= bit(signal);
+  if (!own && p.runtime()) p.runtime()->notify();      // (the other thread may be waiting in a call)
 }
 
 void check_timers(Process& p) {
@@ -117,9 +267,163 @@ void check_timers(Process& p) {
     if (timer.deadline_ns == 0 || now < timer.deadline_ns) continue;
     // (one signal however many periods went by: signals of one kind do not queue)
     timer.deadline_ns = timer.interval_ns == 0 ? 0 : timer.interval_ns > ~uint64_t{0} - now ? ~uint64_t{0} : now + timer.interval_ns;
-    raise_signal(p, timer_signal(which));
+    raise_signal(p, timer_signal(which), 0, 0x80);      // (SI_KERNEL)
   }
 }
+
+bool signal_interrupts(Process& p) {
+  LinuxProcessState& state = p.linux_state();
+  fold_posted(p);
+  check_timers(p);
+  if (p.exited()) return true;
+  LinuxProcessState::Thread& thread = thread_state(p);
+  const uint64_t ready = (state.pending | thread.pending) & ~thread.blocked;
+  if (ready == 0) return false;
+  for (uint32_t signal = 1; signal <= kSignals; ++signal) {
+    if (!(ready & bit(signal))) continue;
+    if (is_ignored(state, signal)) {      // (it became ignored while it waited)
+      state.pending &= ~bit(signal);
+      thread.pending &= ~bit(signal);
+      continue;
+    }
+    if (state.actions[signal].handler == kSigDfl || signal == kSigKill) return true;      // it ends the process: the call must not go on waiting
+    if (state.handlers_run) return true;
+  }
+  return false;
+}
+
+bool signals_wanted(Process& p) {
+  const LinuxProcessState& state = p.linux_state();
+  if (p.posted_signals() != 0 || state.pending != 0) return true;
+  if ((state.timers[0].deadline_ns | state.timers[1].deadline_ns | state.timers[2].deadline_ns) != 0) return true;
+  for (const LinuxProcessState::Thread& t : state.threads)
+    if (t.used && (t.pending != 0 || t.has_saved_mask)) return true;
+  return false;
+}
+
+bool signal_hint(Process& p, uint64_t tid, uint64_t now_ns) {
+  // (No lock: every value is read once and only compared. A wrong answer costs one look too many or a tick's delay.)
+  const LinuxProcessState& state = p.linux_state();
+  if (!__atomic_load_n(&state.handlers_run, __ATOMIC_RELAXED)) return false;
+  if (p.posted_signals() != 0) return true;
+  for (const LinuxProcessState::IntervalTimer& timer : state.timers) {
+    const uint64_t deadline = __atomic_load_n(&timer.deadline_ns, __ATOMIC_RELAXED);
+    if (deadline != 0 && now_ns >= deadline) return true;
+  }
+  const uint64_t for_process = __atomic_load_n(&state.pending, __ATOMIC_RELAXED);
+  for (const LinuxProcessState::Thread& t : state.threads) {
+    if (!__atomic_load_n(&t.used, __ATOMIC_RELAXED) || __atomic_load_n(&t.tid, __ATOMIC_RELAXED) != tid) continue;
+    return ((for_process | __atomic_load_n(&t.pending, __ATOMIC_RELAXED)) & ~__atomic_load_n(&t.blocked, __ATOMIC_RELAXED)) != 0;
+  }
+  return for_process != 0;      // (a thread that has no entry yet blocks nothing)
+}
+
+bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* call) {
+  LinuxProcessState& state = p.linux_state();
+  fold_posted(p);
+  check_timers(p);
+  LinuxProcessState::Thread& thread = thread_state(p);
+  const uint64_t old_mask = thread.has_saved_mask ? thread.saved_mask : thread.blocked;      // (what the handler's return goes back to)
+  bool entered = false;
+  uint64_t left_alone = 0;      // signals with a handler where no handler can be entered: they stay pending
+  while (!p.exited()) {
+    const uint64_t ready = (state.pending | thread.pending) & ~thread.blocked & ~left_alone;
+    if (ready == 0) break;
+    uint32_t signal = 1;
+    while (!(ready & bit(signal))) ++signal;
+    const LinuxProcessState::Action action = state.actions[signal];
+    const bool by_default = action.handler == kSigDfl || signal == kSigKill || signal == kSigStop;
+    if (!by_default && action.handler != kSigIgn && !state.handlers_run) {
+      left_alone |= bit(signal);
+      continue;
+    }
+    state.pending &= ~bit(signal);
+    thread.pending &= ~bit(signal);
+    if (is_ignored(state, signal)) continue;
+    if (by_default) {
+      end_by(p, signal);
+      break;
+    }
+    // A call the signal cut short starts again after the handler if the action says so (SA_RESTART) and the call is one that can: the registers the handler
+    // returns to are those of the call about to be made.
+    if (call && call->restarts && context->gpr[X86Context::kRax] == uint64_t(-kEintr) && (action.flags & kSaRestart)) {
+      context->gpr[X86Context::kRax] = call->number;
+      context->rip -= 2;      // (the SYSCALL instruction is two bytes long)
+    }
+    if (!push_frame(p, thread, signal, action, old_mask, FaultDetail(), context)) {
+      end_by(p, kSigSegv);
+      break;
+    }
+    entered = true;
+    break;      // (one handler at a time: the next is entered when this one returns, at its rt_sigreturn)
+  }
+  if (thread.has_saved_mask) {      // sigsuspend's mask has done its work
+    if (!entered) thread.blocked = thread.saved_mask;
+    thread.has_saved_mask = false;
+  }
+  return entered;
+}
+
+bool signal_return(Process& p, X86Context* context) {
+  uint8_t raw[kUcontextBytes];
+  if (!p.read_user(context->gpr[X86Context::kRsp], ByteView(raw, sizeof(raw)))) return false;
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  reader.skip(40);      // uc_flags, uc_link, uc_stack
+  for (const uint32_t index : kContextOrder) context->gpr[index] = reader.le64();
+  context->rip = reader.le64();
+  if (context->rip >= AddressSpace::kUserTop) return false;      // (the frame is the program's to write: see push_frame)
+  const uint64_t flags = reader.le64();
+  context->rflags = (flags & kUserFlags) | 0x202;      // (only what a program may set itself; interrupts stay on)
+  reader.skip(8 + 8 + 8 + 8 + 8);                      // the segments, err, trapno, oldmask, cr2
+  const uint64_t fpu_at = reader.le64();
+  reader.skip(64);
+  const uint64_t mask = reader.le64();
+  if (fpu_at != 0) {
+    uint8_t fpu[kFpuBytes];
+    if (!p.read_user(fpu_at, ByteView(fpu, sizeof(fpu)))) return false;
+    fpu[26] = fpu[27] = 0;      // (MXCSR's upper half is reserved: a set bit there would fault when the state is loaded)
+    ByteView(context->fpu, kFpuBytes).copy_from(ConstByteView(fpu, sizeof(fpu)));
+  }
+  thread_state(p).blocked = mask & ~kUnblockable;
+  return true;
+}
+
+bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t error, uint64_t address) {
+  // What a processor exception is as a signal, and its si_code.
+  uint32_t signal = kSigSegv;
+  int32_t code = 0x80;      // SI_KERNEL
+  uint64_t where = address;
+  switch (vector) {
+    case 0: signal = kSigFpe; code = 1; where = context->rip; break;                 // divide error: FPE_INTDIV
+    case 1: case 3: signal = kSigTrap; code = vector == 3 ? 1 : 2; where = context->rip; break;      // TRAP_BRKPT, TRAP_TRACE
+    case 6: signal = kSigIll; code = 2; where = context->rip; break;                 // invalid opcode: ILL_ILLOPN
+    case 14: signal = kSigSegv; code = (error & 1) ? 2 : 1; break;                   // page fault: SEGV_ACCERR when the page is there, else SEGV_MAPERR
+    case 16: case 19: signal = kSigFpe; code = 7; where = context->rip; break;       // x87 and SIMD exceptions: FPE_FLTINV (which one is not looked up)
+    case 17: signal = kSigBus; code = 1; break;                                      // alignment check: BUS_ADRALN
+    default: where = 0; break;                                                       // general protection and the rest: SIGSEGV from the kernel
+  }
+  LinuxProcessState& state = p.linux_state();
+  LinuxProcessState::Thread& thread = thread_state(p);
+  const LinuxProcessState::Action action = state.actions[signal];
+  // A fault cannot wait: with no handler, or with its signal blocked, the process ends, as on Linux.
+  if (!state.handlers_run || action.handler == kSigDfl || action.handler == kSigIgn || (thread.blocked & bit(signal))) {
+    end_by(p, signal);
+    return false;
+  }
+  state.info[signal] = LinuxProcessState::Info();
+  state.info[signal].code = code;
+  state.info[signal].address = where;
+  FaultDetail detail;
+  detail.error = error;
+  detail.trap = vector;
+  detail.address = vector == 14 ? address : 0;
+  if (!push_frame(p, thread, signal, action, thread.blocked, detail, context)) {
+    end_by(p, kSigSegv);
+    return false;
+  }
+  return true;
+}
+
 
 // struct sigaction as the kernel has it: handler (8), flags (8), then on x86-64 the restorer (8), then the mask (8).
 uint64_t sys_rt_sigaction(Process& p, UserArch arch, uint64_t signal, uint64_t action, uint64_t old_action, uint64_t set_size) {
@@ -151,10 +455,11 @@ uint64_t sys_rt_sigaction(Process& p, UserArch arch, uint64_t signal, uint64_t a
   if (action != 0) {
     state.actions[signal] = next;
     // A pending signal that is now ignored is dropped, as POSIX has it; one whose action became the default is carried out if nothing blocks it.
-    if (state.pending & bit(signal)) {
-      const bool ignored = next.handler == kSigIgn || (next.handler == kSigDfl && (kDefaultHarmless & bit(signal)));
-      if (ignored) state.pending &= ~bit(signal);
-      else if (next.handler == kSigDfl) deliver_unblocked(p, thread_state(p).blocked);
+    if (is_ignored(state, uint32_t(signal))) {
+      state.pending &= ~bit(uint32_t(signal));
+      for (LinuxProcessState::Thread& t : state.threads) t.pending &= ~bit(uint32_t(signal));
+    } else if (next.handler == kSigDfl) {
+      deliver_unblocked(p, thread_state(p).blocked);
     }
   }
   return 0;
@@ -220,10 +525,12 @@ uint64_t sys_sigaltstack(Process& p, uint64_t stack, uint64_t old_stack) {
 
 uint64_t sys_rt_sigpending(Process& p, uint64_t set, uint64_t set_size) {
   if (set_size > 8) return error(kEinval);
+  fold_posted(p);
   check_timers(p);
   uint8_t raw[8];
   ByteWriter writer{ByteView(raw, sizeof(raw))};
-  writer.le64(p.linux_state().pending & thread_state(p).blocked);
+  const LinuxProcessState::Thread& thread = thread_state(p);
+  writer.le64((p.linux_state().pending | thread.pending) & thread.blocked);
   return p.write_user(set, ConstByteView(raw, set_size)) ? 0 : error(kEfault);
 }
 
@@ -244,20 +551,30 @@ uint64_t sys_rt_sigtimedwait(Process& p, uint64_t set, uint64_t info, uint64_t t
   const uint64_t start = p.host().monotonic_ns();
   const uint64_t deadline = wait_ns > ~uint64_t{0} - start ? ~uint64_t{0} : start + wait_ns;
   for (;;) {
+    fold_posted(p);
     check_timers(p);
     if (p.exited()) return error(kEintr);
-    if (const uint64_t hit = state.pending & wanted) {
+    LinuxProcessState::Thread& thread = thread_state(p);
+    if (const uint64_t hit = (state.pending | thread.pending) & wanted) {
       uint32_t signal = 1;
       while (!(hit & bit(signal))) ++signal;
       state.pending &= ~bit(signal);
+      thread.pending &= ~bit(signal);
+      const LinuxProcessState::Info detail = state.info[signal];
+      state.info[signal] = LinuxProcessState::Info();
       if (info != 0) {
         uint8_t raw[128] = {};
         ByteWriter writer{ByteView(raw, sizeof(raw))};
         writer.le32(signal);
+        writer.le32(0);
+        writer.le32(uint32_t(detail.code));
+        writer.le32(0);
+        writer.le32(detail.sender);
         if (!p.write_user(info, ConstByteView(raw, sizeof(raw)))) return error(kEfault);
       }
       return signal;
     }
+    if (signal_interrupts(p)) return error(kEintr);      // another signal, one that is not waited for here, has to be seen to
     const uint64_t now = p.host().monotonic_ns();
     if (now >= deadline) return error(kEagain);
     if (p.runtime() && p.runtime()->interrupted()) return error(kEintr);
@@ -275,18 +592,30 @@ uint64_t sys_rt_sigsuspend(Process& p, uint64_t mask, uint64_t set_size, bool ha
     blocked &= ~kUnblockable;
   }
   for (;;) {
+    fold_posted(p);
     check_timers(p);
     deliver_unblocked(p, blocked);
     if (p.exited()) return error(kEintr);
-    // What is left unblocked has a handler: the call ends as if it had run (the signal is taken; the handler is not called).
-    if (const uint64_t hit = state.pending & ~blocked) {
-      uint32_t signal = 1;
-      while (!(hit & bit(signal))) ++signal;
-      state.pending &= ~bit(signal);
+    LinuxProcessState::Thread& thread = thread_state(p);
+    // What is left unblocked has a handler. Where handlers are entered, the call's mask stays in place until that has happened (the handler then returns to the
+    // mask the thread had before the call); where they are not, the signal is taken and the call ends as if the handler had run.
+    if (const uint64_t hit = (state.pending | thread.pending) & ~blocked) {
+      if (state.handlers_run) {
+        if (!thread.has_saved_mask) {
+          thread.saved_mask = thread.blocked;
+          thread.has_saved_mask = true;
+        }
+        thread.blocked = blocked;
+      } else {
+        uint32_t signal = 1;
+        while (!(hit & bit(signal))) ++signal;
+        state.pending &= ~bit(signal);
+        thread.pending &= ~bit(signal);
+      }
       return error(kEintr);
     }
     if (p.runtime() && p.runtime()->interrupted()) return error(kEintr);
-    p.block_sleep(10000000u);      // (looked at again every 10 ms: another thread's kill() or a timer may have raised one)
+    p.block_sleep(p.wait_slice(10000000u));      // (looked at again every 10 ms at most: another thread's kill() or a timer may have raised one)
   }
 }
 
@@ -302,7 +631,7 @@ uint64_t kill_other(Process& p, uint64_t pid, uint32_t signal) {
     if (c.used && c.pid == pid) child = &c;
   const bool exists = child != nullptr || (runtime && runtime->process_exists(pid));
   if (!exists) return error(kEsrch);
-  if (signal == 0 || (kDefaultHarmless & bit(signal) & ~bit(kSigStop))) return 0;
+  if (signal == 0) return 0;
   if (child && !child->exited && runtime) {      // (has it ended since it was last looked at?)
     bool exited = false;
     uint32_t code = 0;
@@ -313,6 +642,10 @@ uint64_t kill_other(Process& p, uint64_t pid, uint32_t signal) {
     }
   }
   if (child && child->exited) return 0;      // (a zombie takes any signal)
+  // A Linux process is handed the signal and does with it what its own settings say (a handler, the default action, nothing). SIGKILL, and a process that
+  // cannot be handed one, is ended from here when the signal's default action would.
+  if (signal != kSigKill && runtime && runtime->send_signal(pid, signal)) return 0;
+  if (kDefaultHarmless & bit(signal)) return 0;
   if (!runtime || !runtime->terminate_process(pid, 128 + signal)) return child ? 0 : error(kEperm);
   if (child) child->signal = signal;
   return 0;
@@ -329,7 +662,7 @@ uint64_t sys_kill(Process& p, uint64_t pid, uint64_t signal) {
   // should be able to end every program at once.
   if (target == -1) return error(kEperm);
   if (target == 0 || uint64_t(target) == p.id() || (target < 0 && uint64_t(-target) == group)) {
-    raise_signal(p, uint32_t(signal));
+    raise_signal(p, uint32_t(signal), 0, 0);      // (SI_USER)
     return 0;
   }
   if (target < 0) return error(kEsrch);
@@ -339,13 +672,18 @@ uint64_t sys_kill(Process& p, uint64_t pid, uint64_t signal) {
 uint64_t sys_tgkill(Process& p, uint64_t tgid, uint64_t tid, uint64_t signal) {
   if (signal > kSignals || int32_t(tgid) <= 0 || int32_t(tid) <= 0) return error(kEinval);
   if (uint32_t(tgid) != uint32_t(p.id())) return kill_other(p, uint32_t(tgid), uint32_t(signal));
-  // A thread of this process. Signals are kept for the process as a whole (which thread would run a handler does not matter when none is run); a thread that is
-  // not there is ESRCH, which is how a program asks whether one still lives.
-  bool found = uint32_t(tid) == uint32_t(p.id());
+  // A thread of this process: the signal is that thread's alone. A thread that is not there is ESRCH, which is how a program asks whether one still lives.
+  uint64_t thread = 0;
   for (const Process::LinuxThreadState::Thread& t : p.linux_threads().threads)
-    if (t.used && uint32_t(t.tid) == uint32_t(tid)) found = true;
-  if (!found) return error(kEsrch);
-  raise_signal(p, uint32_t(signal));
+    if (t.used && uint32_t(t.tid) == uint32_t(tid)) thread = t.tid;
+  if (thread == 0) return error(kEsrch);
+  raise_signal(p, uint32_t(signal), thread, -6);      // (SI_TKILL)
+  return 0;
+}
+
+uint64_t sys_rt_sigreturn(Process& p) {
+  if (!p.linux_state().handlers_run) return error(kEinval);      // no handler was entered, so there is no frame to return from
+  p.linux_state().return_requested = true;      // (the runtime loads the registers the frame holds: the value returned here is never seen)
   return 0;
 }
 

@@ -15,10 +15,10 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-// fork(), wait and the signal calls, end to end: tests/linux/forktest.c (a freestanding x86-64 Linux program) is run on the emulator, where a forked
-// child is a second emulated process on a host thread, and what it prints is compared with what the same program printed when it ran on the build machine's
-// own Linux kernel.
-//   LinuxForkTest <forktest.elf> <expected-output.txt>
+// fork(), wait and signals with their handlers, end to end: tests/linux/forktest.c and tests/linux/signaltest.c (freestanding x86-64 Linux programs) are run
+// on the emulator, where a forked child is a second emulated process on a host thread, and what each prints is compared with what the same program printed
+// when it ran on the build machine's own Linux kernel.
+//   LinuxForkTest <forktest.elf> <its output> <signaltest.elf> <its output>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -142,15 +142,13 @@ static std::string run(const std::vector<uint8_t>& elf, uint64_t slice, Emulated
   return printed;
 }
 
-int main(int argc, char** argv) {
-  if (argc < 3) {
-    printf("usage: LinuxForkTest <forktest.elf> <expected-output.txt>\n");
-    return 2;
-  }
-  const std::vector<uint8_t> elf = read_file(argv[1]), expected = read_file(argv[2]);
+// One program: its output on the emulator against what it printed on Linux, at several slice lengths (how often a guest thread is interrupted), and what is
+// left when it is told to stop half-way.
+static void test_program(const char* elf_path, const char* expected_path, int processes, const char* last_line) {
+  const std::vector<uint8_t> elf = read_file(elf_path), expected = read_file(expected_path);
   CHECK(!elf.empty() && !expected.empty());
   const std::string want(expected.begin(), expected.end());
-  CHECK(want.find("fork ok\n") != std::string::npos);      // (the program ran to its end on Linux itself)
+  CHECK(want.find(last_line) != std::string::npos);      // (the program ran to its end on Linux itself)
   const uint64_t slices[] = {20000, 997, 61};
   for (const uint64_t slice : slices) {
     EmulatedOutcome outcome;
@@ -158,11 +156,11 @@ int main(int argc, char** argv) {
     const std::string out = run(elf, slice, &outcome, &started);
     CHECK(outcome.exited && !outcome.faulted && !outcome.killed && outcome.exit_code == 0);
     if (outcome.faulted) printf("  faulted: vector %d address %llx pc %llx\n", outcome.fault.vector, (unsigned long long)outcome.fault.address, (unsigned long long)outcome.fault.pc);
-    CHECK(started == 15);      // one host thread for each process the program (and its children) made
-    if (started != 15) printf("  %d threads started\n", started);
+    CHECK(started == processes);      // one host thread for each process the program (and its children) made
+    if (started != processes) printf("  %s: %d threads started\n", elf_path, started);
     CHECK(out == want);
     if (out != want) {
-      printf("--- slice %llu: got\n%s--- want\n%s", (unsigned long long)slice, out.c_str(), want.c_str());
+      printf("--- %s, slice %llu: got\n%s--- want\n%s", elf_path, (unsigned long long)slice, out.c_str(), want.c_str());
       break;
     }
     CHECK(A.live == 0);      // every child's memory, CPU and descriptors went with it
@@ -174,6 +172,15 @@ int main(int argc, char** argv) {
     CHECK(outcome.killed || outcome.exited);
     CHECK(A.live == 0);
   }
+}
+
+int main(int argc, char** argv) {
+  if (argc < 5) {
+    printf("usage: LinuxForkTest <forktest.elf> <its output on Linux> <signaltest.elf> <its output on Linux>\n");
+    return 2;
+  }
+  test_program(argv[1], argv[2], 15, "fork ok\n");
+  test_program(argv[3], argv[4], 8, "signals ok\n");
   if (g_failed) {
     printf("LinuxForkTest: %d FAILED\n", g_failed);
     return 1;

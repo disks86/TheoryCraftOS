@@ -28,16 +28,32 @@ exit with its error code instead. The copying is done by whoever runs the progra
 (`LinuxExec.hpp`). So after `fork` + `exec` the id the parent waits for is still the right one, and ending that process ends the
 program it became.
 
-**wait.** The parent keeps a record of each child until `wait4` or `waitid` has reported it. Nothing wakes a waiting parent: it looks
-again every 2 ms. `SIGCHLD` is not delivered. Children never stop or continue, so `WUNTRACED` and `WCONTINUED` report nothing.
+**wait.** The parent keeps a record of each child until `wait4` or `waitid` has reported it. A waiting parent looks again every 2 ms.
+`SIGCHLD` is sent when a child ends (its `siginfo` does not say which: handlers call `waitpid`). Children never stop or continue, so
+`WUNTRACED` and `WCONTINUED` report nothing.
 
-**Signals.** The kernel keeps handlers, masks and the alternate stack and gives them back, and carries out what needs no handler: a
-signal whose action is the default ends the process (exit code 128 + signal, reported to a waiting parent as "killed by signal"), an
-ignored one is dropped, a blocked one waits. It does **not** interrupt a thread to run a handler. A signal that has a handler stays
-pending, where `sigpending`, `sigtimedwait` (`sigwait`) and `sigsuspend` find it; `sigsuspend` and `pause` return `EINTR` for it as if
-the handler had run. Signals come from the process itself (`kill`, `tgkill`, `raise`, `abort`) and from its timers (`alarm`,
-`setitimer`), which are looked at whenever the process makes a system call. `kill` of another process ends it if the signal's default
-action would; nothing else can be sent across.
+**Signals.** The kernel keeps handlers, masks and the alternate stack, and carries signals out: a signal whose action is the default
+ends the process (exit code 128 + signal, reported to a waiting parent as "killed by signal"), an ignored one is dropped, a blocked one
+waits, and one with a handler has its handler entered.
+
+- *Where handlers are entered.* When a thread is about to go back to user mode: after a system call, at a timer tick that found it in
+  user mode (so a loop that never calls the kernel is interrupted too), and when the processor reports a fault. The handler gets the
+  frame Linux gives it on x86-64 (`siginfo_t`, `ucontext_t` with every register, the FXSAVE image) and returns through `rt_sigreturn`;
+  it may change the registers it returns to. `SA_SIGINFO`, `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART` are honoured;
+  the action must have a restorer (`SA_RESTORER`), which every C library supplies.
+- *Faults.* A page fault, a division error, an invalid instruction and the like become `SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS` or
+  `SIGTRAP` with `si_code` and `si_addr`. Without a handler, or with the signal blocked, the process ends.
+- *Where signals come from.* The process itself (`kill`, `tgkill`, `raise`, `abort`), its timers (`alarm`, `setitimer`), the
+  processor, another process's `kill` (the target acts on it by its own settings) and a child that ended (`SIGCHLD`). `tgkill` and
+  faults are for one thread; the rest is taken by whichever thread of the process looks first and does not block it.
+- *Calls that wait.* A read on a pipe or socket, `futex`, `wait4`, `nanosleep`, `poll`, `epoll_wait`, a lock that is waited for and so
+  on end with `EINTR` when a signal is there for the thread. With `SA_RESTART` the calls Linux restarts are started again after the
+  handler. A read of the console and a wait for a priority-inheritance futex are not cut short.
+- *Where this works.* For an x86-64 program on the kernel and in the emulator. An emulated AArch64 or RISC-V program gets no handlers:
+  a signal with a handler stays pending there, where `sigpending`, `sigtimedwait` (`sigwait`) and `sigsuspend` find it.
+
+The code is `LinuxSignals.cpp` (`deliver_signals`, `signal_return`, `deliver_fault`); the kernel calls it from `on_syscall`,
+`on_user_tick` / `on_user_fault` in `Kernel/UserMode.cpp`, the emulator from `EmulatedProcess::thread_loop`.
 
 **Ids.** Every program starts as root. The uid, gid and group calls keep what a program sets and read it back; nothing checks an id
 afterwards. Process groups and sessions are kept per process; there is no job control.
@@ -58,7 +74,9 @@ back to `read` and `write`.
 
 ## Not there yet
 
-- Running signal handlers (delivery to a thread, `rt_sigreturn`), `SIGCHLD`, `SIGSEGV` handlers, POSIX timers (`timer_create`).
+- Signal handlers for emulated AArch64 and RISC-V programs; queued real-time signals (signals of one kind do not queue, and
+  `sigqueue`'s value is not kept); stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` do nothing); Ctrl+C as `SIGINT` (it still
+  ends the program); the AVX halves of the vector registers in a handler's frame; POSIX timers (`timer_create`).
 - Copy-on-write for `fork`, and a `vfork` child that shares its parent's memory.
 - `inotify`, `fanotify`, `io_uring`, the `aio` calls, System V IPC (`shmget`, `semget`, `msgget`), POSIX message queues, `pidfd`,
   `seccomp`, `bpf`, `perf_event_open`, `userfaultfd`, namespaces.
@@ -68,6 +86,7 @@ back to `read` and `write`.
 ## Tests
 
 - `tests/run_host_tests.sh LinuxSyscallTest`: the calls one by one, with bad pointers and sizes.
-- `tests/run_host_tests.sh LinuxForkTest`: `tests/linux/forktest.c` (no libc) under the emulator, compared with what the same
-  program prints on the build machine's own Linux kernel.
-- `tests/fork_qemu.sh`: the same program on the real kernel under QEMU.
+- `tests/run_host_tests.sh LinuxForkTest`: `tests/linux/forktest.c` and `signaltest.c` (no libc) under the emulator, compared with
+  what the same programs print on the build machine's own Linux kernel.
+- `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c` and `handlertest.c` on the real kernel under QEMU, compared the
+  same way.

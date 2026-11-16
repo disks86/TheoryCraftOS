@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# fork(), wait, kill and the signal calls on the real kernel under QEMU: tests/linux/forktest.c (static, no libc: the calls themselves) and
-# tests/linux/spawntest.c (static, glibc: fork(), posix_spawn(), abort(), exec in a child) are put at /Linux/usr/bin/forktest in turn and started by the
-# kernel's autorun. What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
+# fork(), wait and signals with their handlers on the real kernel under QEMU. Four programs are put at /Linux/usr/bin/forktest in turn and started by the
+# kernel's autorun: tests/linux/forktest.c and signaltest.c (static, no libc: the calls themselves, handlers entered after calls, at timer ticks and on
+# faults) and spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
+# a SIGCHLD handler). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
 # Uses its own build folder (build-fork-qemu) so the normal build keeps no autorun.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-fork-qemu}
 work=${TMPDIR:-/tmp}/tcos-fork-qemu
 rm -rf "$work"; mkdir -p "$work"
-gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/forktest" tests/linux/forktest.c
-gcc -static -O1 -o "$work/spawntest" tests/linux/spawntest.c 2>/dev/null
+for program in forktest signaltest; do
+  gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/$program" "tests/linux/$program.c"
+done
+for program in spawntest handlertest; do
+  gcc -static -O1 -pthread -o "$work/$program" "tests/linux/$program.c" 2>/dev/null
+done
 cmake -S . -B "$build" -G Ninja -DTCOS_AUTORUN=/Linux/usr/bin/forktest >/dev/null
 cmake --build "$build" >/dev/null
 cmake --build "$build" --target vars >/dev/null
@@ -18,7 +23,7 @@ qemu=$(ninja -C "$build" -t commands run-std | tail -1)
 qemu=$(sed -E 's/-audiodev [a-z]+,/-audiodev none,/' <<< "$qemu")
 status=0
 # Each program in turn is the one the kernel starts (at the autorun's path), after it ran here for what it should print.
-for program in forktest spawntest; do
+for program in forktest signaltest spawntest handlertest; do
   (cd "$work" && "./$program" > "$program-expected.txt")
   "$build/tools/primary_image" "$build/primary.img" "file:/Linux/usr/bin/forktest=$work/$program" >/dev/null
   rm -f "$build/debugcon.log"

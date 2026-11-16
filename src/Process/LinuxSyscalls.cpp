@@ -33,7 +33,7 @@ namespace process {
 
 namespace {
 
-constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEexist = 17, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38, kEopnotsupp = 95;
+constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEexist = 17, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38, kEopnotsupp = 95, kEintr = 4;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
@@ -564,7 +564,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::RtSigtimedwait: return linuxabi::sys_rt_sigtimedwait(process, a[0], a[1], a[2], a[3]);
       case Call::RtSigsuspend: return linuxabi::sys_rt_sigsuspend(process, a[0], a[1], true);
       case Call::Pause: return linuxabi::sys_rt_sigsuspend(process, 0, 0, false);
-      case Call::RtSigreturn: return error(kEinval);      // no handler was entered, so there is no frame to return from
+      case Call::RtSigreturn: return linuxabi::sys_rt_sigreturn(process);
       case Call::Alarm: return linuxabi::sys_alarm(process, a[0]);
       case Call::Getitimer: return linuxabi::sys_getitimer(process, a[0], a[1]);
       case Call::Setitimer: return linuxabi::sys_setitimer(process, a[0], a[1], a[2]);
@@ -742,8 +742,24 @@ class LinuxSyscalls final : public ISyscallInterface {
     if (!process.read_user_u64(request, &seconds) || !process.read_user_u64(request + 8, &nanos)) return error(kEfault);
     if (int64_t(seconds) < 0 || nanos >= 1000000000u) return error(kEinval);
     const uint64_t kMaxSeconds = (~uint64_t{0} - 999999999u) / 1000000000u;
-    process.block_sleep(seconds > kMaxSeconds ? ~uint64_t{0} : seconds * 1000000000u + nanos);
-    if (remaining && (!process.write_user_u64(remaining, 0) || !process.write_user_u64(remaining + 8, 0))) return error(kEfault);
+    const uint64_t left = sleep_or_signal(process, seconds > kMaxSeconds ? ~uint64_t{0} : seconds * 1000000000u + nanos);
+    if (remaining && (!process.write_user_u64(remaining, left / 1000000000u) || !process.write_user_u64(remaining + 8, left % 1000000000u))) return error(kEfault);
+    return left ? error(kEintr) : 0;
+  }
+
+  // Sleeps `ns`, or until a signal is there for the thread (or the program is told to stop). What was left of the time: 0 when it slept it all.
+  static uint64_t sleep_or_signal(Process& process, uint64_t ns) {
+    uint64_t now = process.host().monotonic_ns();
+    const uint64_t end = ns > ~uint64_t{0} - now ? ~uint64_t{0} : now + ns;
+    while (now < end) {
+      if (process.signal_interrupts()) return end - now;
+      if (process.exited() || (process.runtime() && process.runtime()->interrupted())) return 0;
+      const uint64_t slice = process.wait_slice(end - now);
+      process.block_sleep(slice);
+      // (a host whose clock stands still, as a test's may, still gets through its sleep: every slice counts for at least its length)
+      const uint64_t clock = process.host().monotonic_ns();
+      now = clock > now && clock - now >= slice ? clock : (slice > ~uint64_t{0} - now ? ~uint64_t{0} : now + slice);
+    }
     return 0;
   }
 
@@ -762,8 +778,7 @@ class LinuxSyscalls final : public ISyscallInterface {
       const uint64_t now = clock == 0 ? process.host().realtime_ns() : process.host().monotonic_ns();
       ns = ns > now ? ns - now : 0;
     }
-    if (ns) process.block_sleep(ns);
-    return 0;
+    return ns && sleep_or_signal(process, ns) ? error(kEintr) : 0;
   }
 
   UserArch arch_;
@@ -775,6 +790,19 @@ constexpr LinuxSyscalls kX86(UserArch::X86_64), kArm(UserArch::AArch64), kRiscV(
 }  // namespace
 
 namespace linuxabi {
+bool call_restarts(UserArch arch, const SyscallRequest& request) {
+  // The calls Linux starts again after a handler that was installed with SA_RESTART. (Not the ones that wait for a time or for signals themselves: nanosleep,
+  // poll, select, epoll_wait, sigsuspend, sigtimedwait, pause; and not a futex wait with a timeout, which would wait the whole time again.)
+  switch (translate(arch, request.number)) {
+    case Call::Read: case Call::Write: case Call::Readv: case Call::Writev: case Call::Recvfrom: case Call::Recvmsg: case Call::Sendto: case Call::Sendmsg:
+    case Call::Accept: case Call::Accept4: case Call::Connect: case Call::Wait4: case Call::Waitid: case Call::Flock: case Call::Fcntl: case Call::Open:
+    case Call::Openat: case Call::Openat2: case Call::Ioctl: case Call::Sendmmsg:
+      return true;
+    case Call::Futex: return request.args[3] == 0;
+    default: return false;
+  }
+}
+
 uint64_t map_user_memory(Process& process, uint64_t bytes) {
   const uint64_t r = do_mmap(process, 0, bytes, kProtRead | kProtWrite, kMapPrivate | kMapAnonymous, ~uint64_t{0}, 0);
   return r > ~uint64_t{4095} ? 0 : r;      // (-errno is a failure)

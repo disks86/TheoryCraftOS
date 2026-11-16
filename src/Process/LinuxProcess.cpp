@@ -92,6 +92,9 @@ void inherit_fork_state(Process& child, Process& parent, const LinuxProcessState
   // Not inherited: what is pending, the timers, the children, and the fork that is being made.
   to.pending = 0;
   to.exit_signal = 0;
+  to.return_requested = false;
+  to.handlers_run = false;      // (whoever runs the child says so again)
+  for (LinuxProcessState::Info& info : to.info) info = LinuxProcessState::Info();
   for (LinuxProcessState::IntervalTimer& timer : to.timers) timer = LinuxProcessState::IntervalTimer();
   for (LinuxProcessState::Child& c : to.children) c = LinuxProcessState::Child();
   to.fork = LinuxProcessState::ForkRequest();
@@ -103,6 +106,9 @@ void inherit_fork_state(Process& child, Process& parent, const LinuxProcessState
   caller.used = true;
   caller.tid = child.id();
   caller.robust_head = caller.robust_size = 0;
+  caller.pending = 0;
+  if (caller.has_saved_mask) caller.blocked = caller.saved_mask;
+  caller.has_saved_mask = false;
   to.threads[0] = caller;
   // It stays in its parent's process group and session.
   to.process_group = from.process_group ? from.process_group : parent.id();
@@ -145,7 +151,7 @@ int64_t wait_for_child(Process& p, uint64_t pid, bool no_hang, bool keep, LinuxP
     }
     if (!any) return -kEchild;
     if (no_hang) return 0;
-    if (p.exited() || (runtime && runtime->interrupted())) return -kEintr;
+    if (p.exited() || (runtime && runtime->interrupted()) || p.signal_interrupts()) return -kEintr;
     p.block_sleep(2000000);      // (looked at again every 2 ms: nothing tells a parent that a child has ended)
   }
 }

@@ -154,6 +154,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) override;
   bool query_child(uint64_t pid, bool* exited, uint32_t* code) override;
   uint32_t child_exit_signal(uint64_t pid) override;
+  bool send_signal(uint64_t pid, uint32_t signal) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
   bool resume_process(uint64_t pid) override;
   bool process_not_started(uint64_t pid) override;

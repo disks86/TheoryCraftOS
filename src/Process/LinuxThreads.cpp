@@ -97,7 +97,7 @@ uint64_t futex_lock_pi(Process& p, uint64_t address, bool try_only, uint64_t dea
         if (now >= deadline) { result = error(kEtimedout); break; }
         left = deadline - now;
       }
-      runtime->wait(left);
+      runtime->wait(p.wait_slice(left));
     }
     w->used = false;
     if (result) return result;
@@ -179,6 +179,7 @@ uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* a) {
   }
   slot->used = true;
   slot->tid = tid;
+  inherit_thread_mask(p, tid);      // (a new thread blocks what the thread that made it blocks)
   slot->clear_child_tid = (flags & kCloneChildCleartid) ? child_tid : 0;
   state.clone.pending = true;
   state.clone.tid = tid;
@@ -303,14 +304,14 @@ uint64_t sys_futex(Process& p, uint64_t address, uint64_t op, uint64_t value, ui
       w->bitset = bitset;
       uint64_t result = 0;
       while (!w->woken) {
-        if (runtime->interrupted() || p.exited()) { result = error(kEintr); break; }
+        if (runtime->interrupted() || p.exited() || p.signal_interrupts()) { result = error(kEintr); break; }
         uint64_t left = ~uint64_t{0};
         if (deadline != ~uint64_t{0}) {
           const uint64_t now = p.host().monotonic_ns();
           if (now >= deadline) { result = error(kEtimedout); break; }
           left = deadline - now;
         }
-        runtime->wait(left);
+        runtime->wait(p.wait_slice(left));
       }
       w->used = false;
       return result;

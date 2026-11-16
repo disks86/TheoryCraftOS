@@ -113,8 +113,10 @@ for t in "${WANTED[@]}"; do
     LinuxForkTest) mkdir -p "$out/emu"      # (the fork program run on this machine's own Linux is the expected output)
                    gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$out/emu/forktest" tests/linux/forktest.c
                    "$out/emu/forktest" > "$out/emu/forktest-expected.txt"
+                   gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$out/emu/signaltest" tests/linux/signaltest.c
+                   "$out/emu/signaltest" > "$out/emu/signaltest-expected.txt"
                    $cxx $flags tests/LinuxForkTest.cpp src/Emulation/*.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp -o "$out/LinuxForkTest"
-                   echo "== LinuxForkTest"; "$out/LinuxForkTest" "$out/emu/forktest" "$out/emu/forktest-expected.txt" ;;
+                   echo "== LinuxForkTest"; "$out/LinuxForkTest" "$out/emu/forktest" "$out/emu/forktest-expected.txt" "$out/emu/signaltest" "$out/emu/signaltest-expected.txt" ;;
     LinuxSyscallTest) build_and_run LinuxSyscallTest tests/LinuxSyscallTest.cpp src/Process/*.cpp src/Crypto/*.cpp src/Executable/*.cpp src/FileSystem/FileSystemTypes.cpp src/FileSystem/Ram/*.cpp src/Kernel/Sync.cpp tests/KernelStubs.cpp ;;
     EmulationJitTest) mkdir -p "$out/emu"
                 gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$out/emu/guest" tests/data/emulation/guest.c

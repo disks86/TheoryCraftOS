@@ -74,6 +74,16 @@ class EmulatedProcess final : public process::IProcessRuntime {
     }
     return false;
   }
+  bool send_signal(uint64_t pid, uint32_t signal) override {      // (to a child of a fork, or from one to its parent)
+    process::Process* target = nullptr;
+    for (const UniquePointer<ForkChild>& c : forks_)
+      if (c && c->pid == pid) target = c->program->process();
+    if (!target && parent_ && parent_->process_->id() == pid) target = parent_->process_;
+    if (!target || target->exited()) return false;
+    target->post_linux_signal(signal);
+    sync_.notify_all();
+    return true;
+  }
   uint32_t child_exit_signal(uint64_t pid) override {
     for (const UniquePointer<ForkChild>& c : forks_)
       if (c && c->pid == pid) return c->program->process()->linux_state().exit_signal;
@@ -82,6 +92,7 @@ class EmulatedProcess final : public process::IProcessRuntime {
   bool process_exists(uint64_t pid) override {
     bool exited = false;
     uint32_t code = 0;
+    if (parent_ && parent_->process_->id() == pid) return !parent_->process_->exited();      // (the program that forked this one)
     return pid == process_->id() || (query_child(pid, &exited, &code) && !exited);
   }
   bool terminate_process(uint64_t pid, uint32_t code) override {
@@ -109,11 +120,32 @@ class EmulatedProcess final : public process::IProcessRuntime {
     ForkChild* c = static_cast<ForkChild*>(child);
     c->runtime->run();
     c->runtime->sync_.lock();
+    if (c->runtime->parent_) c->runtime->parent_->process_->post_linux_signal(17);      // SIGCHLD
     c->done = true;
     c->runtime->sync_.notify_all();
     c->runtime->sync_.unlock();
   }
   bool start_fork(const IGuestCpu& cpu, const process::LinuxProcessState::ForkRequest& request);
+  // Does this runtime enter the handlers of the program's signals? (An x86-64 Linux program's: see linuxabi::deliver_signals.)
+  bool enters_handlers() const { return process_->abi() == process::SyscallAbi::Linux && arch_ == process::UserArch::X86_64; }
+  // The guest thread on `cpu` is about to run on: the signals that wait for it are acted on, which may point the CPU at a handler. `call`: the system call it
+  // returns from, or null (between two slices).
+  void linux_signals(IGuestCpu& cpu, const process::linuxabi::InterruptedCall* call) {
+    if (!process::linuxabi::signals_wanted(*process_)) return;
+    process::X86Context context;
+    if (!cpu.get_x86_context(&context)) return;
+    if (process::linuxabi::deliver_signals(*process_, &context, call)) cpu.set_x86_context(context);
+    if (process_->exited()) sync_.notify_all();
+  }
+  // A fault of a Linux program as a signal: true if its handler was entered (the CPU is there now).
+  bool deliver_signal_fault(IGuestCpu& cpu) {
+    if (!enters_handlers()) return false;
+    process::X86Context context;
+    if (!cpu.get_x86_context(&context)) return false;
+    const GuestFault& fault = cpu.fault();
+    context.rip = fault.vector == 3 ? fault.pc + 1 : fault.pc;      // (a breakpoint is reported after the INT3)
+    return process::linuxabi::deliver_fault(*process_, &context, fault.vector, fault.error, fault.address) && cpu.set_x86_context(context);
+  }
   // Ends the children that still run and waits for every child's thread. Called without the lock.
   void finish_forks();
 
@@ -178,6 +210,7 @@ class EmulatedProcess final : public process::IProcessRuntime {
   process::UserArch arch_ = process::UserArch::None;
   Slot slots_[kMaxSlots];
   UniquePointer<ForkChild> forks_[kMaxForks];
+  EmulatedProcess* parent_ = nullptr;      // the runtime of the program that forked this one (it outlives its children: finish_forks)
   bool forked_ = false;      // this is the child of a fork: its first thread's CPU is a copy of its parent's thread, not a program at its entry
   uint32_t live_ = 0;
   EmulatedOutcome outcome_;
@@ -214,6 +247,7 @@ bool EmulatedProcess::start_fork(const IGuestCpu& cpu, const process::LinuxProce
   child->runtime = UniquePointer<EmulatedProcess>::make(*allocator_, *child->program, *child->cpu, control_, sync_, threads_, allocator_, slice_);
   if (!child->runtime) return false;
   child->runtime->forked_ = true;
+  child->runtime->parent_ = this;
   child->handle = threads_->spawn(&EmulatedProcess::fork_entry, child.get(), "guest-fork");
   if (!child->handle) return false;
   *place = static_cast<UniquePointer<ForkChild>&&>(child);
@@ -296,6 +330,7 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
     }
     const StopReason reason = cpu.run(memory_, slice_);
     if (reason == StopReason::Budget) {
+      if (enters_handlers()) linux_signals(cpu, nullptr);      // (a timer that ran out, another process's kill: as a real kernel would at a timer tick)
       sync_.unlock();
       control_.yield();
       sync_.lock();
@@ -305,6 +340,7 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
       // A Windows program gets the fault as an exception on its own stack, to be handled by SEH or C++ code (or to end up in ntdll's last resort); only when that cannot be
       // done does it end.
       if (deliver_exception(cpu)) continue;
+      if (deliver_signal_fault(cpu)) continue;      // (SIGSEGV and the like, to the program's own handler)
       record_fault(cpu.fault());
       break;
     }
@@ -341,6 +377,22 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
       result = uint64_t(-int64_t{11});      // -EAGAIN
     }
     cpu.finish_syscall(result);
+    if (enters_handlers() && !process_->exited()) {
+      // rt_sigreturn: the registers the handler interrupted come back from its frame. Then, for any call: the signals that wait for this thread.
+      const bool returned = process_->take_signal_return();
+      if (returned) {
+        process::X86Context context;
+        if (cpu.get_x86_context(&context) && process::linuxabi::signal_return(*process_, &context)) {
+          cpu.set_x86_context(context);
+        } else {      // the frame is gone: SIGSEGV
+          process_->linux_state().exit_signal = 11;
+          process_->terminate(128 + 11);
+          sync_.notify_all();
+        }
+      }
+      const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(arch_, request)};
+      if (!process_->exited()) linux_signals(cpu, returned ? nullptr : &call);
+    }
     uint64_t fs = 0, gs = 0;
     const bool fs_changed = process_->take_fs_change(&fs), gs_changed = process_->take_gs_change(&gs);
     if (fs_changed || gs_changed) cpu.set_thread_pointers(fs_changed, fs, gs_changed, gs);      // arch_prctl
@@ -371,6 +423,7 @@ EmulatedOutcome EmulatedProcess::run() {
   slots_[0].used = true;
   live_ = 1;
   process_->attach_runtime(this);
+  if (enters_handlers()) process_->linux_state().handlers_run = true;
   sync_.lock();
   slots_[0].token = threads_ ? threads_->self() : 0;
   if (!forked_) slots_[0].cpu->reset(program_.start());

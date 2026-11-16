@@ -168,6 +168,9 @@ class IProcessRuntime {
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
   // A process this one started (spawn_process): has it ended, and with which code? False if it is not one of this process's children.
   virtual bool query_child(uint64_t pid, bool* exited, uint32_t* code) { (void)pid; (void)exited; (void)code; return false; }
+  // Sends a signal to another Linux process (kill): it is posted there (Process::post_linux_signal) and the process acts on it itself. False if there is no such
+  // process, or it is not one this can be done to (a Windows program).
+  virtual bool send_signal(uint64_t pid, uint32_t signal) { (void)pid; (void)signal; return false; }
   // For a child that has ended (a Linux process): the signal that ended it (LinuxProcessState::exit_signal), 0 if it ended by itself or is not known.
   virtual uint32_t child_exit_signal(uint64_t pid) { (void)pid; return 0; }
   // A program made suspended whose first thread has not been resumed yet (it has run nothing).
@@ -406,6 +409,19 @@ class Process {
   LinuxProcessState& linux_state() { return linux_state_; }
   // fork() asked for a child (see LinuxProcessState::ForkRequest): true once after the call that did.
   bool take_fork(LinuxProcessState::ForkRequest* out) { *out = linux_state_.fork; const bool p = linux_state_.fork.pending; linux_state_.fork = LinuxProcessState::ForkRequest(); return p; }
+  // A signal for a Linux process from outside its own system calls (another process's kill(), a child that ended): kept until a thread of the process next looks
+  // (linuxabi::deliver_signals), and whatever it waits in is woken. Takes no lock of the process: safe from any thread that keeps the process alive.
+  void post_linux_signal(uint32_t signal);
+  uint64_t take_posted_signals() { return __atomic_exchange_n(&posted_signals_, 0, __ATOMIC_ACQ_REL); }
+  uint64_t posted_signals() const { return __atomic_load_n(&posted_signals_, __ATOMIC_ACQUIRE); }
+  // rt_sigreturn asked for the registers a handler interrupted: true once after the call that did (see linuxabi::signal_return).
+  bool take_signal_return() { const bool r = linux_state_.return_requested; linux_state_.return_requested = false; return r; }
+  // Should a call of this process that waits stop waiting because a signal is there for the calling thread (the call then answers EINTR)? Always false for a
+  // Windows process. Called with the process lock held.
+  bool signal_interrupts();
+  // How long a wait of `wanted_ns` may sleep before it looks again: no longer than until the process's next interval timer runs out, and never so long that a
+  // signal posted from outside (whose wake-up can come between a waiter's look and its sleep) is kept waiting.
+  uint64_t wait_slice(uint64_t wanted_ns);
   // For a child made by fork(): the break and the place memory is handed out from, as the parent has them.
   void set_memory_cursors(uint64_t heap_break, uint64_t mmap_cursor) { heap_break_ = heap_break; mmap_cursor_ = mmap_cursor; }
 
@@ -438,6 +454,7 @@ class Process {
   ThreadRecord threads_[kMaxThreads];
   LinuxThreadState linux_;
   LinuxProcessState linux_state_;
+  uint64_t posted_signals_ = 0;      // (atomic) bit n - 1: signal n was posted from outside and not folded into linux_state_ yet
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;

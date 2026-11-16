@@ -19,24 +19,62 @@
 #include <stdint.h>
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
+#include "Process/WindowsException.hpp"      // X86Context: the registers of an x86-64 thread
 
 // The Linux calls about the process itself: its signals (LinuxSignals.cpp), and fork, wait, ids, limits, scheduling and the like (LinuxProcess.cpp). Each
 // sys_ function returns the value for the result register: the result, or -errno.
 namespace process::linuxabi {
 
 // --- signals ---------------------------------------------------------------------------------------------------------------------------------------------
-// The kernel keeps what a program says about its signals (handlers, masks, the alternate stack) and gives it back, and it carries out what needs no handler:
-// a signal whose action is the default ends the process (or is ignored, for the ones that are by default), an ignored one is dropped, a blocked one waits.
-// It cannot interrupt a thread to run a handler: a signal with a handler stays pending, where sigpending, sigtimedwait (sigwait) and sigsuspend (which then
-// returns) find it. Signals come from the process itself (kill, tgkill, raise, abort), from its timers (alarm, setitimer: looked at when the process makes a
-// system call) and, between processes, only as an ending: kill() of another process ends it when the signal's default action would.
+// The kernel keeps what a program says about its signals (handlers, masks, the alternate stack) and carries them out: a signal whose action is the default ends
+// the process (or is ignored, for the ones that are by default), an ignored one is dropped, a blocked one waits, and one with a handler has its handler entered.
+//
+// Entering a handler is done by whoever runs the program, with the functions below, at the points where a thread is about to go back to user mode: after a
+// system call, at a timer tick that found it in user mode, and when the processor reports a fault (SIGSEGV, SIGFPE, SIGILL, SIGBUS, SIGTRAP). The handler gets
+// the frame Linux gives it on x86-64 (siginfo_t, ucontext_t with the registers, the FPU state) and returns through rt_sigreturn. Only an x86-64 program can be
+// given one; where the runtime cannot (LinuxProcessState::handlers_run is false) a signal with a handler stays pending, where sigpending, sigtimedwait
+// (sigwait) and sigsuspend (which then returns) find it.
+//
+// Signals come from the process itself (kill, tgkill, raise, abort), from its timers (alarm, setitimer), from the processor, from another process's kill()
+// and from a child that ended (SIGCHLD). The last two arrive without the process's lock (Process::post_linux_signal). A call that waits (read on a pipe or
+// socket, futex, wait4, nanosleep, poll, ...) is cut short with EINTR when a signal is there for its thread, and started again after the handler when the
+// action has SA_RESTART and the call is one Linux restarts.
 
 // What the calling thread keeps for itself (made on first use; the first thread's if the table is full).
 LinuxProcessState::Thread& thread_state(Process& p);
 // A thread ended: its entry is free again.
 void thread_gone(Process& p, uint64_t tid);
-// The process raises `signal` (1..64) for itself: see above. Anything else is ignored.
-void raise_signal(Process& p, uint32_t signal);
+// The process raises `signal` (1..64) for itself (`for_thread` 0) or for one of its threads: see above. `code` is the si_code a handler is told. Anything
+// else is ignored.
+void raise_signal(Process& p, uint32_t signal, uint64_t for_thread = 0, int32_t code = 0);
+// A thread made by clone() starts with the mask of the thread that made it.
+void inherit_thread_mask(Process& p, uint64_t new_tid);
+
+// --- for whoever runs the program (all with the process lock held, on the thread in question) ---
+// Is a signal there that the calling thread has to act on now (a handler to enter, or a default action that ends the process)? A call that waits asks this
+// in its loop and answers EINTR.
+bool signal_interrupts(Process& p);
+// Could deliver_signals() have anything to do? (Cheap: asked after every system call.)
+bool signals_wanted(Process& p);
+// The same without the lock, for a timer tick: might thread `tid` have a signal to act on at `now_ns` of the host's monotonic clock? A hint only.
+bool signal_hint(Process& p, uint64_t tid, uint64_t now_ns);
+// The system call the thread is returning from, for SA_RESTART: its number, and whether it is one that starts again (call_restarts).
+struct InterruptedCall {
+  uint64_t number = 0;
+  bool restarts = false;
+};
+bool call_restarts(UserArch arch, const SyscallRequest& request);
+// Acts on the signals that are pending for the calling thread, whose registers are `context`: default actions are carried out (the process may have ended
+// when this returns), and the first signal with a handler has its frame written to the thread's stack and `context` pointed at the handler. `call`: the
+// system call being returned from (its result is in the context), or null. True if `context` changed.
+bool deliver_signals(Process& p, X86Context* context, const InterruptedCall* call);
+// rt_sigreturn (Process::take_signal_return): `context` (the registers at the call) becomes what the handler's frame says, the signal mask too. False if the
+// frame cannot be read: the process is then to be ended (SIGSEGV).
+bool signal_return(Process& p, X86Context* context);
+// The processor reported exception `vector` (with its error code, and the address of a page fault) at `context`. True: the signal's handler was entered
+// (`context` changed). False: there is none to enter, and the process has been ended by the signal.
+bool deliver_fault(Process& p, X86Context* context, uint64_t vector, uint64_t error, uint64_t address);
+
 // Raises the signals of the timers that ran out (alarm, setitimer). Cheap when none is armed: the system-call dispatcher calls it for every call.
 void check_timers(Process& p);
 
@@ -50,6 +88,7 @@ uint64_t sys_rt_sigsuspend(Process& p, uint64_t mask, uint64_t set_size, bool ha
 uint64_t sys_kill(Process& p, uint64_t pid, uint64_t signal);
 // tgkill(tgid, tid, signal); tkill(tid, signal) is the same with the caller's own process.
 uint64_t sys_tgkill(Process& p, uint64_t tgid, uint64_t tid, uint64_t signal);
+uint64_t sys_rt_sigreturn(Process& p);
 uint64_t sys_alarm(Process& p, uint64_t seconds);
 uint64_t sys_getitimer(Process& p, uint64_t which, uint64_t value);
 uint64_t sys_setitimer(Process& p, uint64_t which, uint64_t value, uint64_t old_value);

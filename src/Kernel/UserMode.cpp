@@ -193,9 +193,30 @@ void context_to_frame(const process::X86Context& c, Frame* frame) {
   for (uint32_t i = 0; i < 512; ++i) frame->fpu[i] = c.fpu[i];
 }
 
+Task* pin_task(uint64_t pid);
+void unpin(Task* task);
+
+// A Linux thread is about to go back to user mode with the registers in `frame` (after a system call, `call`; at a timer tick): the signals that wait for it are
+// acted on, which may point the frame at a handler (linuxabi::deliver_signals). Called with the program's lock held. False if a signal ended the program.
+bool linux_signals(process::Process* process, Frame* frame, const process::linuxabi::InterruptedCall* call) {
+  if (!process::linuxabi::signals_wanted(*process)) return true;
+  process::X86Context context;
+  frame_to_context(*frame, &context);
+  if (process::linuxabi::deliver_signals(*process, &context, call)) context_to_frame(context, frame);
+  return !process->exited();
+}
+
 // The thread is about to end: whoever waits for the program may now join its CPU thread.
 void thread_ends_now(UserThread* t) {
-  if (__atomic_sub_fetch(&t->task->running_threads, 1, __ATOMIC_ACQ_REL) == 0) t->task->program.process()->release_handles();      // (the last one: nothing else touches the table)
+  if (__atomic_sub_fetch(&t->task->running_threads, 1, __ATOMIC_ACQ_REL) == 0) {
+    t->task->program.process()->release_handles();      // (the last one: nothing else touches the table)
+    if (t->task->parent_id != 0) {      // the program that made it is told that a child has ended (SIGCHLD, for a Linux program)
+      if (Task* parent = pin_task(t->task->parent_id)) {
+        parent->program.process()->post_linux_signal(17);
+        unpin(parent);
+      }
+    }
+  }
   __atomic_store_n(&t->finished, true, __ATOMIC_RELEASE);
   t->task->changed.notify_all();
 }
@@ -258,7 +279,10 @@ void on_user_tick(Frame* frame) {
     frame->rip = 0;
   } else if (UserThread* u = current_user_thread()) {      // asked to stop or end: send it to address 0 (the fault there is how it gets into the kernel in a state it can wait in)
     u->tick_rip = frame->rip;
-    if (!u->redirected && (__atomic_load_n(&u->suspend_requested, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE))) {
+    // (a Linux thread that a signal waits for goes the same way: its handler is entered from there)
+    process::Process* process = task ? task->program.process() : nullptr;
+    const bool signal = process && process->abi() == process::SyscallAbi::Linux && process::linuxabi::signal_hint(*process, u->id, process->host().monotonic_ns());
+    if (!u->redirected && (signal || __atomic_load_n(&u->suspend_requested, __ATOMIC_ACQUIRE) || __atomic_load_n(&u->terminate_requested, __ATOMIC_ACQUIRE))) {
       u->saved_rip = frame->rip;
       u->redirected = true;
       frame->rip = 0;
@@ -333,6 +357,22 @@ Frame* on_syscall(Frame* frame, void*) {
       process->terminate(process::kStatusAccessViolation);
       alive = false;
     }
+  }
+  if (alive && !thread_ends && process->abi() == process::SyscallAbi::Linux) {
+    // rt_sigreturn: the registers the handler interrupted come back from its frame. Then, for any call: the signals that wait for this thread.
+    const bool returned = process->take_signal_return();
+    if (returned) {
+      process::X86Context context;
+      frame_to_context(*frame, &context);
+      if (process::linuxabi::signal_return(*process, &context)) {
+        context_to_frame(context, frame);
+      } else {      // the frame is gone: SIGSEGV
+        process->linux_state().exit_signal = 11;
+        process->terminate(128 + 11);
+      }
+    }
+    const process::linuxabi::InterruptedCall call{request.number, process::linuxabi::call_restarts(process->arch(), request)};
+    alive = !process->exited() && linux_signals(process, frame, returned ? nullptr : &call);
   }
   if (alive && !thread_ends && stop_point(self, frame)) thread_ends = true;      // SuspendThread / TerminateThread from another thread
   if (alive && kill_pending(task)) {      // asked to stop while the call ran (or in it)
@@ -425,9 +465,9 @@ Frame* on_user_fault(Frame* frame) {
   if (!task) panic("fault in user mode on a thread that is not a user program", frame);
   if ((kill_pending(task) || task->program.process()->exited()) && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the end on_user_tick() arranged: not a fault of the program's
     if (!task->program.process()->exited()) task->killed = true;
+    irq_enable();      // (the frame is of no more use: ending the program and the thread take locks, which may have to be waited for)
     task->program.process()->terminate(task->kill_code);      // (a program that already ended keeps its exit code)
     thread_ends_now(current_user_thread());
-    irq_enable();
     exit_thread();
   }
   if (UserThread* ut = current_user_thread(); ut && ut->redirected && (frame->vector & 0xFF) == 14 && frame->rip == 0) {      // the tick sent it here (see on_user_tick)
@@ -435,7 +475,8 @@ Frame* on_user_fault(Frame* frame) {
     frame->rip = ut->saved_rip;
     irq_enable();
     task->mutex.lock();
-    const bool ends = stop_point(ut, frame);
+    bool ends = stop_point(ut, frame);
+    if (!ends && task->program.process()->abi() == process::SyscallAbi::Linux) ends = !linux_signals(task->program.process(), frame, nullptr);      // (a signal's default action ended the program)
     if (ends) {
       task->sync_tables();      // (its stack is gone)
       thread_ends_now(ut);
@@ -514,6 +555,20 @@ Frame* on_user_fault(Frame* frame) {
       return frame;
     }
   }
+  // A Linux program gets the fault as a signal (SIGSEGV, SIGFPE, ...) if it has a handler for it; without one the signal ends it.
+  if (process->abi() == process::SyscallAbi::Linux && process->arch() == process::UserArch::X86_64) {
+    process::X86Context context;
+    frame_to_context(*frame, &context);
+    irq_enable();      // (the frame is saved) the program's lock may have to be waited for
+    task->mutex.lock();
+    const bool entered = process::linuxabi::deliver_fault(*process, &context, frame->vector & 0xFF, frame->error, page_fault_address);
+    task->mutex.unlock();
+    irq_disable();
+    if (entered) {
+      context_to_frame(context, frame);
+      return frame;
+    }
+  }
   task->faulted = true;
   task->fault_vector = frame->vector & 0xFF;
   task->fault_rip = frame->rip;
@@ -527,9 +582,9 @@ Frame* on_user_fault(Frame* frame) {
   console::puts(" address ");
   console::put_hex(task->fault_address);
   console::puts("\n");
+  irq_enable();      // the frame is saved; ending the program and the thread take locks (its handles, telling its parent), and has to be able to switch away
   task->program.process()->terminate(128 + static_cast<uint32_t>(task->fault_vector));
   thread_ends_now(current_user_thread());
-  irq_enable();      // the frame is saved; ending the thread has to be able to switch away
   exit_thread();
   return frame;
 }
@@ -1296,6 +1351,16 @@ bool Task::query_child(uint64_t pid, bool* exited, uint32_t* code) {
   return false;
 }
 
+bool Task::send_signal(uint64_t pid, uint32_t signal) {
+  Task* target = pin_task(pid);
+  if (!target) return false;
+  process::Process* other = target->program.process();
+  const bool linux = other && other->abi() == process::SyscallAbi::Linux && !other->exited();
+  if (linux) other->post_linux_signal(signal);      // (it acts on it itself: at its next system call or timer tick, or as soon as what it waits in looks again)
+  unpin(target);
+  return linux;
+}
+
 uint32_t Task::child_exit_signal(uint64_t pid) {
   for (Child* c = children; c; c = c->next)
     if (c->pid == pid) return c->task->program.process()->linux_state().exit_signal;
@@ -1358,6 +1423,7 @@ UniquePointer<Task> spawn(process::UserProgram& program, allocators::IAllocator&
   UserThread* t = task->add_thread(first);
   if (!t) return UniquePointer<Task>();
   program.process()->attach_runtime(task.get());
+  if (program.process()->abi() == process::SyscallAbi::Linux && program.process()->arch() == process::UserArch::X86_64) program.process()->linux_state().handlers_run = true;      // (see on_syscall, on_user_tick, on_user_fault)
   if (suspended) {      // it waits for Task::start_first_thread()
     task->first_thread = t;
   } else {

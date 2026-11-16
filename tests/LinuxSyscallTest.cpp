@@ -901,6 +901,242 @@ static void test_fork_inheritance() {
   set_system_objects(nullptr);
 }
 
+// Handlers: the frame a handler is entered with, the way back (rt_sigreturn), calls that start again, faults, and what a program can do to the frame.
+static void test_signal_handlers() {
+  constexpr uint64_t kUsr1 = 10, kUsr2 = 12, kSegv = 11, kChld = 17, kRestorer = 0x04000000, kSigInfo = 4, kRestart = 0x10000000, kOnStack = 0x08000000;
+  constexpr uint64_t kHandler = 0x400100, kReturn = 0x400200, kStackTop = 0x2F000;      // (the rig's two pages of memory are the stack too)
+  auto bit = [](uint64_t signal) { return uint64_t{1} << (signal - 1); };
+  static NoWaitSync sync;
+  ObjectManager objects(sync);
+  objects.set_allocator(&A);
+  UnixSocketManager sockets(sync, A);
+  set_system_objects(&objects);
+  set_system_unix_sockets(&sockets);
+  // A thread's registers with something to recognise in each.
+  auto registers = [&](uint64_t stack) {
+    X86Context c;
+    for (uint32_t i = 0; i < 16; ++i) c.gpr[i] = 0x1111111111111111ull * (i + 1);
+    c.gpr[X86Context::kRsp] = stack;
+    c.rip = 0x400502;
+    c.rflags = 0x246 | 0x400;      // (with the direction flag set)
+    for (uint32_t i = 0; i < 512; ++i) c.fpu[i] = uint8_t(i * 7 + 1);
+    c.fpu[26] = c.fpu[27] = 0;
+    return c;
+  };
+  struct Running {
+    Rig rig;
+    ForkRuntime runtime;
+    Running() { rig.process->attach_runtime(&runtime); rig.process->linux_state().handlers_run = true; }
+    ~Running() { rig.process->attach_runtime(nullptr); }
+  };
+  {
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    CHECK(rig.s(13, kUsr1, rig.words({kHandler, kRestorer | kSigInfo, kReturn, bit(kUsr2)}), 0, 8) == 0);
+    CHECK(!linuxabi::signals_wanted(p) && !linuxabi::signal_interrupts(p) && !linuxabi::signal_hint(p, 1, 0));
+    // kill() of itself: the call returns, and the handler is entered on the way out
+    CHECK(rig.s(62, 1, kUsr1) == 0 && !p.exited() && linuxabi::signals_wanted(p) && linuxabi::signal_interrupts(p) && linuxabi::signal_hint(p, 1, 0));
+    const X86Context before = registers(kStackTop);
+    X86Context c = before;
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr));
+    const uint64_t frame = c.gpr[X86Context::kRsp], uc = frame + 8, info = uc + 304;
+    CHECK(c.rip == kHandler && c.gpr[X86Context::kRdi] == kUsr1 && c.gpr[X86Context::kRsi] == info && c.gpr[X86Context::kRdx] == uc && c.gpr[X86Context::kRax] == 0);
+    CHECK(frame % 16 == 8 && frame + 8 + 304 + 128 <= kStackTop - 128 - 512 && (c.rflags & 0x400) == 0);      // below the red zone and the FPU image; DF clear
+    CHECK(rig.u64(frame) == kReturn);
+    CHECK(rig.u64(uc + 40) == before.gpr[X86Context::kR8] && rig.u64(uc + 40 + 8 * 8) == before.gpr[X86Context::kRdi] && rig.u64(uc + 40 + 13 * 8) == before.gpr[X86Context::kRax]);
+    CHECK(rig.u64(uc + 40 + 15 * 8) == kStackTop && rig.u64(uc + 40 + 16 * 8) == before.rip && rig.u64(uc + 40 + 17 * 8) == before.rflags);
+    CHECK(rig.u64(uc + 296) == 0 && rig.u32(uc + 24) == 2);                           // the mask to go back to; no alternate stack (SS_DISABLE)
+    const uint64_t fpu_at = rig.u64(uc + 40 + 184);
+    CHECK(fpu_at % 64 == 0 && fpu_at >= info + 128 && fpu_at + 512 <= kStackTop - 128 && rig.bytes(fpu_at, 512) == std::string(reinterpret_cast<const char*>(before.fpu), 512));
+    CHECK(rig.u32(info) == kUsr1 && rig.u32(info + 8) == 0 && rig.u32(info + 16) == 1);      // si_signo, SI_USER, si_pid
+    const uint64_t mask = rig.alloc(8);
+    CHECK(rig.s(14, 0, 0, mask, 8) == 0 && rig.u64(mask) == (bit(kUsr1) | bit(kUsr2)));     // blocked while the handler runs
+    CHECK(!linuxabi::signals_wanted(p));
+    // the handler returns: rt_sigreturn (15) with the stack pointer just past the return address
+    X86Context back = registers(0);
+    back.gpr[X86Context::kRsp] = uc;
+    CHECK(rig.s(15) == 0 && p.take_signal_return() && !p.take_signal_return());
+    CHECK(linuxabi::signal_return(p, &back));
+    for (uint32_t i = 0; i < 16; ++i) CHECK(back.gpr[i] == before.gpr[i]);
+    CHECK(back.rip == before.rip && back.rflags == before.rflags && memcmp(back.fpu, before.fpu, 512) == 0);
+    CHECK(rig.s(14, 0, 0, mask, 8) == 0 && rig.u64(mask) == 0);
+
+    // a handler changes what the program goes back to; what it must not be able to set is not taken from it
+    CHECK(rig.s(62, 1, kUsr1) == 0);
+    c = before;
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr));
+    rig.put64(uc + 40 + 16 * 8, 0x400900);                                              // rip
+    rig.put64(uc + 40 + 17 * 8, ~uint64_t{0});                                          // every flag
+    rig.put64(uc + 296, ~uint64_t{0});                                                  // every signal blocked
+    rig.put32(fpu_at + 24, 0xFFFF1F80u);                                                // MXCSR with reserved bits
+    back.gpr[X86Context::kRsp] = uc;
+    CHECK(linuxabi::signal_return(p, &back) && back.rip == 0x400900);
+    CHECK((back.rflags & 0x3000) == 0 && (back.rflags & 0x200) != 0 && (back.rflags & 0x4000) == 0 && (back.rflags & 0xCD5) == 0xCD5);      // no I/O privilege, interrupts on, no nested task
+    CHECK(back.fpu[24] == 0x80 && back.fpu[25] == 0x1F && back.fpu[26] == 0 && back.fpu[27] == 0);
+    CHECK(rig.s(14, 0, 0, mask, 8) == 0 && rig.u64(mask) == (~uint64_t{0} & ~(bit(9) | bit(19))));      // SIGKILL and SIGSTOP stay unblocked
+    CHECK(rig.s(14, 2, rig.words({0}), 0, 8) == 0);
+    // a frame that says to go on outside the program's addresses, or that is not there, or whose FPU image is not: refused
+    for (const uint64_t bad_rip : {uint64_t{0x0000800000000000ull}, uint64_t{0xFFFF800000001000ull}, ~uint64_t{0}}) {
+      rig.put64(uc + 40 + 16 * 8, bad_rip);
+      back.gpr[X86Context::kRsp] = uc;
+      CHECK(!linuxabi::signal_return(p, &back));
+    }
+    rig.put64(uc + 40 + 16 * 8, 0x400900);
+    rig.put64(uc + 40 + 184, kBad);
+    back.gpr[X86Context::kRsp] = uc;
+    CHECK(!linuxabi::signal_return(p, &back));
+    rig.put64(uc + 40 + 184, 0);                                                        // no FPU image at all is fine: the state stays
+    back = registers(uc);
+    CHECK(linuxabi::signal_return(p, &back) && back.fpu[100] == registers(0).fpu[100]);
+    for (const uint64_t bad_stack : {kBad, uint64_t{0}, uint64_t{0x30000 - 100}, ~uint64_t{0} - 8, uint64_t{0x0000800000000000ull}}) {
+      back.gpr[X86Context::kRsp] = bad_stack;
+      CHECK(!linuxabi::signal_return(p, &back));
+    }
+    // any bytes at all where a frame should be: nothing but a refusal or registers inside the program's reach
+    uint32_t seed = 12345;
+    for (int round = 0; round < 2000; ++round) {
+      uint8_t junk[304];
+      for (uint8_t& b : junk) { seed = seed * 1664525u + 1013904223u; b = uint8_t(seed >> 24); }
+      if (round % 3 == 0) memset(junk + 40 + 16 * 8 + 6, 0, 2);      // (often with an instruction pointer that could be a user address)
+      if (round % 2 == 0) memset(junk + 40 + 184, 0, 8);             // (and often without an FPU image)
+      CHECK(rig.space.write_privileged(0x20000, ConstByteView(junk, sizeof(junk))));
+      back = registers(0x20000);
+      if (linuxabi::signal_return(p, &back)) CHECK(back.rip < AddressSpace::kUserTop && (back.rflags & 0x3000) == 0 && (back.rflags & 0x200) != 0);
+    }
+    CHECK(rig.s(14, 2, rig.words({0}), 0, 8) == 0 && !p.exited());
+  }
+  {      // a call that was cut short starts again after the handler when the action says so and the call is one that does
+    SyscallRequest read_call, sleep_call, futex_call;
+    read_call.number = 0;
+    sleep_call.number = 35;
+    futex_call.number = 202;
+    CHECK(linuxabi::call_restarts(UserArch::X86_64, read_call) && !linuxabi::call_restarts(UserArch::X86_64, sleep_call) && linuxabi::call_restarts(UserArch::X86_64, futex_call));
+    futex_call.args[3] = 0x7000;      // with a timeout
+    CHECK(!linuxabi::call_restarts(UserArch::X86_64, futex_call));
+    read_call.number = 63;            // read on the other CPUs
+    CHECK(linuxabi::call_restarts(UserArch::AArch64, read_call) && !linuxabi::call_restarts(UserArch::X86_64, read_call));
+    for (const bool restart : {true, false}) {
+      for (const bool restartable : {true, false}) {
+        Running run;
+        Rig& rig = run.rig;
+        CHECK(rig.s(13, kUsr1, rig.words({kHandler, kRestorer | (restart ? kRestart : 0), kReturn, 0}), 0, 8) == 0 && rig.s(62, 1, kUsr1) == 0);
+        X86Context c = registers(kStackTop);
+        c.gpr[X86Context::kRax] = uint64_t(-4);      // the call's answer: EINTR
+        const linuxabi::InterruptedCall call{0, restartable};
+        CHECK(linuxabi::deliver_signals(*rig.process, &c, &call));
+        const uint64_t uc = c.gpr[X86Context::kRsp] + 8;
+        const bool again = restart && restartable;
+        CHECK(rig.u64(uc + 40 + 13 * 8) == (again ? 0 : uint64_t(-4)) && rig.u64(uc + 40 + 16 * 8) == (again ? 0x400500 : 0x400502));      // the call's number, at the SYSCALL instruction
+      }
+    }
+  }
+  {      // no way to enter the handler: no restorer, a handler that is no user address, no stack. The program ends by SIGSEGV.
+    const uint64_t actions[][3] = {{kHandler, kSigInfo, 0}, {kHandler, kRestorer, 0}, {0x0000800000000000ull, kRestorer, kReturn}, {~uint64_t{7}, kRestorer, kReturn}};
+    for (const auto& action : actions) {
+      Running run;
+      Rig& rig = run.rig;
+      CHECK(rig.s(13, kUsr1, rig.words({action[0], action[1], action[2], 0}), 0, 8) == 0 && rig.s(62, 1, kUsr1) == 0);
+      X86Context c = registers(kStackTop);
+      CHECK(!linuxabi::deliver_signals(*rig.process, &c, nullptr) && rig.process->exited() && rig.process->exit_code() == 139 && rig.process->linux_state().exit_signal == kSegv);
+    }
+    for (const uint64_t stack : {kBad, uint64_t{0}, uint64_t{100}, uint64_t{0x10000 + 600}, ~uint64_t{0}, uint64_t{0x0000800000000000ull}}) {
+      Running run;
+      Rig& rig = run.rig;
+      CHECK(rig.s(13, kUsr1, rig.words({kHandler, kRestorer, kReturn, 0}), 0, 8) == 0 && rig.s(62, 1, kUsr1) == 0);
+      X86Context c = registers(stack);
+      CHECK(!linuxabi::deliver_signals(*rig.process, &c, nullptr) && rig.process->exited() && rig.process->exit_code() == 139);
+    }
+  }
+  {      // faults: the handler is told where and why; with none, or with the signal blocked, the program ends
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    CHECK(rig.s(13, kSegv, rig.words({kHandler, kRestorer | kSigInfo, kReturn, 0}), 0, 8) == 0);
+    X86Context c = registers(kStackTop);
+    CHECK(linuxabi::deliver_fault(p, &c, 14, 6, 0x1234) && c.rip == kHandler && c.gpr[X86Context::kRdi] == kSegv);
+    const uint64_t uc = c.gpr[X86Context::kRsp] + 8, info = uc + 304;
+    CHECK(rig.u32(info) == kSegv && rig.u32(info + 8) == 1 && rig.u64(info + 16) == 0x1234);      // SEGV_MAPERR, si_addr
+    CHECK(rig.u64(uc + 40 + 152) == 6 && rig.u64(uc + 40 + 160) == 14 && rig.u64(uc + 40 + 176) == 0x1234 && rig.u64(uc + 40 + 16 * 8) == 0x400502);      // err, trapno, cr2, rip
+    c = registers(kStackTop);
+    CHECK(!linuxabi::deliver_fault(p, &c, 14, 7, 0x1234) && p.exited() && p.exit_code() == 139);      // (SIGSEGV is blocked while its handler runs)
+    Running plain;
+    c = registers(kStackTop);
+    CHECK(!linuxabi::deliver_fault(*plain.rig.process, &c, 0, 0, 0) && plain.rig.process->exited() && plain.rig.process->exit_code() == 136 && plain.rig.process->linux_state().exit_signal == 8);
+    Running codes;
+    CHECK(codes.rig.s(13, 8, codes.rig.words({kHandler, kRestorer, kReturn, 0}), 0, 8) == 0 && codes.rig.s(13, 4, codes.rig.words({kHandler, kRestorer, kReturn, 0}), 0, 8) == 0);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_fault(*codes.rig.process, &c, 0, 0, 0) && c.gpr[X86Context::kRdi] == 8 && codes.rig.u32(c.gpr[X86Context::kRsi] + 8) == 1 && codes.rig.u64(c.gpr[X86Context::kRsi] + 16) == 0x400502);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_fault(*codes.rig.process, &c, 6, 0, 0) && c.gpr[X86Context::kRdi] == 4 && codes.rig.u32(c.gpr[X86Context::kRsi] + 8) == 2);
+  }
+  {      // signals from outside the process's own calls: posted without its lock, found at the next look; an ignored one is dropped
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    p.post_linux_signal(kChld);      // (ignored by default)
+    CHECK(linuxabi::signal_hint(p, 1, 0) && !linuxabi::signal_interrupts(p) && !linuxabi::signals_wanted(p));
+    p.post_linux_signal(0);
+    p.post_linux_signal(65);
+    CHECK(!linuxabi::signals_wanted(p));
+    CHECK(rig.s(13, kUsr1, rig.words({kHandler, kRestorer, kReturn, 0}), 0, 8) == 0);
+    const uint64_t set = rig.words({bit(kUsr1)}), buf = rig.alloc(32);
+    CHECK(rig.s(14, 0, set, 0, 8) == 0);
+    p.post_linux_signal(kUsr1);
+    CHECK(!linuxabi::signal_interrupts(p) && rig.s(127, buf, 8) == 0 && rig.u64(buf) == bit(kUsr1));      // blocked: pending, nobody is interrupted
+    CHECK(!linuxabi::signal_hint(p, 1, 0) && linuxabi::signal_hint(p, 2, 0));          // (another thread would not block it)
+    // sigsuspend lets it in: the call ends, its mask stays until the handler has been entered, and the handler goes back to the mask from before
+    CHECK(rig.s(130, rig.words({bit(kUsr2)}), 8) == -4);
+    X86Context c = registers(kStackTop);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && rig.u64(c.gpr[X86Context::kRsp] + 8 + 296) == bit(kUsr1));
+    CHECK(rig.s(14, 0, 0, buf, 8) == 0 && rig.u64(buf) == (bit(kUsr1) | bit(kUsr2)));
+    X86Context back = registers(c.gpr[X86Context::kRsp] + 8);
+    CHECK(linuxabi::signal_return(p, &back) && rig.s(14, 0, 0, buf, 8) == 0 && rig.u64(buf) == bit(kUsr1));
+    CHECK(rig.s(14, 2, rig.words({0}), 0, 8) == 0);
+    // a call that waits is cut short: a read of an empty pipe, a sleep (which says how long was left), wait4 with a child that runs
+    const uint64_t fds = rig.alloc(8);
+    CHECK(rig.s(293, fds, 0) == 0);
+    p.post_linux_signal(kUsr1);
+    CHECK(rig.s(0, rig.u32(fds), buf, 1) == -4);
+    CHECK(rig.s(35, rig.words({5, 0}), buf) == -4 && rig.u64(buf) == 5 && rig.u64(buf + 8) == 0);
+    CHECK(rig.s(57) > 0);
+    LinuxProcessState::ForkRequest request;
+    CHECK(p.take_fork(&request));
+    run.runtime.kids.push_back(ForkRuntime::Kid{request.pid});
+    CHECK(rig.s(61, uint64_t(-1), 0, 0, 0) == -4);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && !linuxabi::signals_wanted(p));
+    // a signal of another process is handed over where that can be done, and ends the other process where it cannot
+    CHECK(rig.s(62, request.pid, kUsr1) == 0 && run.runtime.terminated.size() == 1 && run.runtime.terminated[0].second == 128 + kUsr1);      // (this runtime hands nothing over)
+    CHECK(rig.s(3, rig.u32(fds)) == 0 && rig.s(3, rig.u32(fds + 4)) == 0);
+  }
+  {      // the alternate stack: used by an action that asks for it, unless the thread is on it already; a thread made by clone() starts with its maker's mask
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    constexpr uint64_t kAlt = 0x18000, kAltSize = 0x4000;
+    CHECK(rig.s(131, rig.words({kAlt, 0, kAltSize}), 0) == 0);
+    CHECK(rig.s(13, kUsr1, rig.words({kHandler, kRestorer | kOnStack, kReturn, 0}), 0, 8) == 0 && rig.s(13, kUsr2, rig.words({kHandler, kRestorer, kReturn, 0}), 0, 8) == 0);
+    CHECK(rig.s(62, 1, kUsr1) == 0);
+    X86Context c = registers(kStackTop);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && c.gpr[X86Context::kRsp] > kAlt && c.gpr[X86Context::kRsp] < kAlt + kAltSize - 512);
+    CHECK(rig.u64(c.gpr[X86Context::kRsp] + 8 + 16) == kAlt && rig.u32(c.gpr[X86Context::kRsp] + 8 + 24) == 0 && rig.u64(c.gpr[X86Context::kRsp] + 8 + 32) == kAltSize);
+    const uint64_t on_alt = c.gpr[X86Context::kRsp];
+    CHECK(rig.s(14, 2, rig.words({0}), 0, 8) == 0 && rig.s(62, 1, kUsr1) == 0);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && c.gpr[X86Context::kRsp] < on_alt - 128 && c.gpr[X86Context::kRsp] > kAlt && rig.u32(c.gpr[X86Context::kRsp] + 8 + 24) == 1);      // nested: further down the same stack (SS_ONSTACK)
+    CHECK(rig.s(62, 1, kUsr2) == 0);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && c.gpr[X86Context::kRsp] > kAlt + kAltSize);      // an action that does not ask stays on the thread's stack
+    CHECK(rig.s(14, 2, rig.words({bit(kUsr2) | bit(15)}), 0, 8) == 0);
+    linuxabi::inherit_thread_mask(p, 77);
+    bool found = false;
+    for (const LinuxProcessState::Thread& t : p.linux_state().threads) found = found || (t.used && t.tid == 77 && t.blocked == (bit(kUsr2) | bit(15)));
+    CHECK(found);
+  }
+  set_system_unix_sockets(nullptr);
+  set_system_objects(nullptr);
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -962,7 +1198,7 @@ int main() {
   struct { const char* name; void (*run)(); } const tests[] = {
       {"files", test_files}, {"record locks", test_record_locks}, {"memory", test_memory}, {"address space copy", test_address_space_copy}, {"signals", test_signals},
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
-      {"fork inheritance", test_fork_inheritance}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
+      {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   for (const auto& test : tests) {
     test.run();
     if (A.live != 0) {      // every test gives back what it took

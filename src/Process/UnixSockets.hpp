@@ -357,7 +357,7 @@ uint32_t unix_wait(Process& p, UnixSocketManager& sockets, uint64_t timeout_ns, 
       if (used >= timeout_ns) { sync.unlock(); return 1; }
       left = timeout_ns - used;
     }
-    if (p.exited() || (runtime && runtime->interrupted())) { sync.unlock(); return 2; }
+    if (p.exited() || (runtime && runtime->interrupted()) || p.signal_interrupts()) { sync.unlock(); return 2; }      // (a signal for a Linux program's thread: EINTR)
     if (runtime && runtime->park_wanted()) {      // (asked to suspend while it waits: it stops here and goes on waiting when resumed)
       sync.unlock();
       const int parked = runtime->park_point();
@@ -367,7 +367,7 @@ uint32_t unix_wait(Process& p, UnixSocketManager& sockets, uint64_t timeout_ns, 
     }
     if (runtime) runtime->unlock();
     else p.host().yield();
-    sync.wait(left);
+    sync.wait(p.wait_slice(left));
     sync.unlock();
     if (runtime) runtime->lock();
     sync.lock();
