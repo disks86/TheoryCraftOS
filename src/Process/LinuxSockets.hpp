@@ -61,6 +61,13 @@ bool inet_non_blocking(Process& p, uint64_t fd);
 void set_inet_non_blocking(Process& p, uint64_t fd, bool on);
 // What poll() reports for the socket with this id, of the events asked for.
 uint16_t inet_poll_events(uint32_t id, uint16_t events);
+// The buffers of an array of struct iovec gathered into `out` (-errno; EMSGSIZE over `limit`), the room they have in all, and `data` spread over them.
+int64_t gather_vectors(Process& p, uint64_t vectors, uint64_t count, uint64_t limit, ByteBuffer* out);
+int64_t vectors_room(Process& p, uint64_t vectors, uint64_t count, uint64_t limit);
+bool scatter_vectors(Process& p, uint64_t vectors, uint64_t count, ConstByteView data);
+// One control message (struct cmsghdr and its data) at the end of what recvmsg() hands back in a buffer of `capacity` bytes, as Linux fills it: one
+// that does not fit is cut short or left out, and *cut says so (MSG_CTRUNC). False without memory.
+bool add_control_message(ByteBuffer& out, uint64_t capacity, uint32_t level, uint32_t type, ConstByteView data, bool* cut);
 // Descriptors for things kept elsewhere (UnixSockets.hpp: create_linked): a POSIX message queue, a process (pidfd), a set of inotify watches.
 // A new one for `link`: the descriptor, or -errno (the owner's release hook has run then).
 uint64_t open_linked(Process& p, UnixType type, uint64_t link, uint32_t mode, bool close_on_exec, bool non_blocking);

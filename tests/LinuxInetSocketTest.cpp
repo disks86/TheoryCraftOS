@@ -22,11 +22,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 #include "NetworkHarness.hpp"
 #include "Ipv6Harness.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Process/LinuxIpc.hpp"
+#include "Process/LinuxNetlink.hpp"
 #include "Process/Process.hpp"
 #include "Process/Sockets.hpp"
 #include "Process/Syscall.hpp"
@@ -104,12 +107,14 @@ struct Setup {
   Runtime runtime;
   LanSync sync;
   UnixSocketManager descriptors{sync, lan.alloc};
+  LinuxIpcManager ipc{sync, lan.alloc};
   Process process{7, ProcessBinding{SyscallAbi::Linux, UserArch::X86_64, syscall_interface(SyscallAbi::Linux, UserArch::X86_64)}, memory, host};
   uint64_t cursor = kBase + 0x1000;
   Setup() {
     lan.configure_static();
     set_system_sockets(&sockets);
     set_system_unix_sockets(&descriptors);
+    set_system_linux_ipc(&ipc);
     host.lan = &lan;
     runtime.host = &host;
     sync.host = &host;
@@ -117,6 +122,7 @@ struct Setup {
   }
   ~Setup() {
     process.release_handles();
+    set_system_linux_ipc(nullptr);
     set_system_unix_sockets(nullptr);
     set_system_sockets(nullptr);
   }
@@ -528,7 +534,7 @@ static void test_options_and_errors() {
   CHECK(t.s(55, tcp, 1, 3, small, kBad) == -14 && t.s(55, tcp, 1, 3, kBad, t.word(4)) == -14 && t.s(54, tcp, 1, 9, t.word(1), uint64_t(-1)) == -22);
   // what cannot be made
   CHECK(t.s(41, kAfInet, 3, 0) == -94 && t.s(41, kAfInet, kStream, 17) == -93 && t.s(41, kAfInet, kDgram, 6) == -93 && t.s(41, kAfInet, kDgram, 1) == -93);
-  CHECK(t.s(41, kAfInet, kStream | 0x4000, 0) == -22 && t.s(41, 16 /* AF_NETLINK */, kStream, 0) == -97 && t.s(41, kAfInet, 0, 0) == -22);
+  CHECK(t.s(41, kAfInet, kStream | 0x4000, 0) == -22 && t.s(41, 17 /* AF_PACKET */, kStream, 0) == -97 && t.s(41, kAfInet, 0, 0) == -22);
   // addresses: every length short of a whole one, a wrong family, a flipped bit anywhere: an error or a result, never anything else
   const uint64_t good = t.in4(10, 0, 0, 2, 9700);
   for (uint64_t length = 0; length < 16; ++length) {
@@ -951,6 +957,485 @@ static void test_control_messages() {
   while (peer->receive_from_ip(ByteView(buffer, sizeof(buffer)), &from, &from_port, &length)) {}
 }
 
+// --- AF_NETLINK ---------------------------------------------------------------------------------------------------------------------------------------------
+namespace nl {
+struct Message { uint16_t type = 0, flags = 0; uint32_t sequence = 0, port = 0; std::string payload; };
+uint32_t word_at(const std::string& b, size_t at) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | uint8_t(b[at + size_t(i)]); return v; }
+uint16_t half_at(const std::string& b, size_t at) { return uint16_t(uint8_t(b[at]) | uint8_t(b[at + 1]) << 8); }
+void put(std::string* out, uint64_t v, int bytes) { for (int i = 0; i < bytes; ++i) out->push_back(char(v >> (8 * i))); }
+// one request: a header and a payload, padded
+std::string request(uint16_t type, uint16_t flags, uint32_t sequence, const std::string& payload) {
+  std::string out;
+  put(&out, 16 + payload.size(), 4); put(&out, type, 2); put(&out, flags, 2); put(&out, sequence, 4); put(&out, 0, 4);
+  out += payload;
+  while (out.size() % 4 != 0) out.push_back('\0');
+  return out;
+}
+std::string attribute(uint16_t type, const std::string& data) {
+  std::string out;
+  put(&out, 4 + data.size(), 2); put(&out, type, 2);
+  out += data;
+  while (out.size() % 4 != 0) out.push_back('\0');
+  return out;
+}
+// The messages of one datagram; *whole says whether the datagram is made of whole messages and nothing else.
+std::vector<Message> messages(const std::string& datagram, bool* whole = nullptr) {
+  std::vector<Message> out;
+  size_t at = 0;
+  while (at + 16 <= datagram.size()) {
+    const uint32_t length = word_at(datagram, at);
+    if (length < 16 || length > datagram.size() - at) break;
+    Message m;
+    m.type = half_at(datagram, at + 4); m.flags = half_at(datagram, at + 6); m.sequence = word_at(datagram, at + 8); m.port = word_at(datagram, at + 12);
+    m.payload = datagram.substr(at + 16, length - 16);
+    out.push_back(m);
+    at += (size_t(length) + 3) & ~size_t{3};
+  }
+  if (whole) *whole = at == datagram.size();
+  return out;
+}
+// The attributes after the first `skip` bytes of a payload, by type; *whole as above.
+std::map<uint16_t, std::string> attributes(const std::string& payload, size_t skip, bool* whole = nullptr) {
+  std::map<uint16_t, std::string> out;
+  size_t at = skip;
+  while (at + 4 <= payload.size()) {
+    const uint16_t length = half_at(payload, at);
+    if (length < 4 || length > payload.size() - at) break;
+    out[half_at(payload, at + 2)] = payload.substr(at + 4, size_t(length) - 4);
+    at += (size_t(length) + 3) & ~size_t{3};
+  }
+  if (whole) *whole = at == payload.size();
+  return out;
+}
+// The datagrams of a queue as the message code writes it (length, group, sender, bytes).
+struct Queued { uint32_t group = 0, sender = 0; std::string bytes; };
+std::vector<Queued> queued(const ByteBuffer& buffer, bool* whole) {
+  const std::string all(reinterpret_cast<const char*>(buffer.view().data()), buffer.size());
+  std::vector<Queued> out;
+  size_t at = 0;
+  while (at + 12 <= all.size()) {
+    const uint32_t length = word_at(all, at);
+    if (length > all.size() - at - 12) break;
+    out.push_back(Queued{word_at(all, at + 4), word_at(all, at + 8), all.substr(at + 12, length)});
+    at += 12 + size_t(length);
+  }
+  *whole = at == all.size();
+  return out;
+}
+linuxabi::netlink::Snapshot example() {
+  using namespace linuxabi::netlink;
+  Snapshot n;
+  Interface& lo = n.interfaces[n.count++];
+  lo.index = 1; lo.name[0] = 'l'; lo.name[1] = 'o'; lo.name_size = 2; lo.loopback = true; lo.mtu = 65536;
+  Interface& e = n.interfaces[n.count++];
+  e.index = 2; memcpy(e.name, "eth0", 4); e.name_size = 4;
+  const uint8_t mac[6] = {2, 0, 0, 0, 0, 0xA1}, a4[4] = {192, 168, 5, 77}, g4[4] = {192, 168, 5, 1};
+  memcpy(e.mac, mac, 6); memcpy(e.address4, a4, 4); memcpy(e.gateway4, g4, 4);
+  e.has4 = true; e.prefix4 = 24;
+  e.has_link6 = true; e.link6[0] = 0xFE; e.link6[1] = 0x80; e.link6[15] = 0xA1;
+  e.has_global6 = true; e.global6[0] = 0x20; e.global6[1] = 0x01; e.global6[2] = 0x0D; e.global6[3] = 0xB8; e.global6[15] = 0xA1;
+  e.has_router6 = true; e.router6[0] = 0xFE; e.router6[1] = 0x80; e.router6[15] = 1;
+  return n;
+}
+}  // namespace nl
+
+// The kernel's side of a netlink socket on its own: requests in, datagrams out.
+static void test_netlink_messages() {
+  using namespace linuxabi::netlink;
+  constexpr uint16_t kRequest = 1, kMulti = 2, kAck = 4, kDump = 0x300;
+  Lan lan;      // (for its allocator)
+  const Snapshot network = nl::example();
+  Asker asker;
+  asker.port = 4242;
+  auto ask = [&](const std::string& request, const Asker& who, bool* whole) {
+    ByteBuffer out(lan.alloc);
+    CHECK(answer(who, ConstByteView(reinterpret_cast<const uint8_t*>(request.data()), request.size()), network, &out));
+    return nl::queued(out, whole);
+  };
+  bool whole = false, inner = false;
+  // every interface: glibc's getifaddrs asks with a one-byte struct rtgenmsg
+  std::vector<nl::Queued> d = ask(nl::request(18, kRequest | kDump, 7, std::string(1, '\0')), asker, &whole);
+  CHECK(whole && d.size() == 2);
+  if (d.size() == 2) {
+    std::vector<nl::Message> m = nl::messages(d[0].bytes, &inner);
+    CHECK(inner && m.size() == 2 && d[0].group == 0 && d[0].sender == 0);
+    if (m.size() == 2) {
+      CHECK(m[0].type == 16 && m[0].flags == kMulti && m[0].sequence == 7 && m[0].port == 4242 && m[0].payload.size() > 16);
+      std::map<uint16_t, std::string> a = nl::attributes(m[0].payload, 16, &inner);
+      CHECK(inner && nl::half_at(m[0].payload, 2) == 772 && nl::word_at(m[0].payload, 4) == 1 && (nl::word_at(m[0].payload, 8) & 0x49) == 0x49);
+      CHECK(a[3] == std::string("lo\0", 3) && a[4] == std::string("\0\0\x01\0", 4) && a[1] == std::string(6, '\0') && a[7].size() == 96 && a[23].size() == 200);
+      a = nl::attributes(m[1].payload, 16, &inner);
+      CHECK(inner && nl::half_at(m[1].payload, 2) == 1 && nl::word_at(m[1].payload, 4) == 2 && (nl::word_at(m[1].payload, 8) & 0x1043) == 0x1043);
+      CHECK(a[3] == std::string("eth0\0", 5) && a[1] == std::string("\x02\0\0\0\0\xA1", 6) && a[2] == std::string(6, '\xFF') && a[4] == std::string("\xDC\x05\0\0", 4));
+    }
+    m = nl::messages(d[1].bytes, &inner);
+    CHECK(inner && m.size() == 1 && m[0].type == 3 && m[0].flags == kMulti && m[0].sequence == 7 && m[0].payload == std::string(4, '\0'));
+  }
+  // every address, IPv4 ones first; only one family when asked
+  d = ask(nl::request(22, kRequest | kDump, 8, std::string(1, '\0')), asker, &whole);
+  CHECK(whole && d.size() == 2);
+  if (d.size() == 2) {
+    const std::vector<nl::Message> m = nl::messages(d[0].bytes, &inner);
+    CHECK(inner && m.size() == 5);
+    if (m.size() == 5) {
+      std::map<uint16_t, std::string> a = nl::attributes(m[0].payload, 8, &inner);      // 127.0.0.1/8 on lo, scope host
+      CHECK(inner && m[0].type == 20 && m[0].payload.substr(0, 8) == std::string("\x02\x08\x80\xFE\x01\0\0\0", 8) && a[1] == std::string("\x7F\0\0\x01", 4) && a[2] == a[1] && a[3] == std::string("lo\0", 3));
+      a = nl::attributes(m[1].payload, 8, &inner);                                      // 192.168.5.77/24 on eth0, with its broadcast address
+      CHECK(inner && m[1].payload.substr(0, 8) == std::string("\x02\x18\0\0\x02\0\0\0", 8) && a[1] == std::string("\xC0\xA8\x05\x4D", 4) && a[2] == a[1] && a[4] == std::string("\xC0\xA8\x05\xFF", 4) &&
+            a[3] == std::string("eth0\0", 5) && a[6].size() == 16);
+      a = nl::attributes(m[2].payload, 8, &inner);                                      // ::1/128
+      CHECK(inner && m[2].payload.substr(0, 8) == std::string("\x0A\x80\x80\xFE\x01\0\0\0", 8) && a[1] == std::string(15, '\0') + '\x01' && a.count(2) == 0);
+      a = nl::attributes(m[3].payload, 8, &inner);                                      // the global address, then the link-local one (scope link)
+      CHECK(inner && m[3].payload.substr(0, 8) == std::string("\x0A\x40\0\0\x02\0\0\0", 8) && a[1].size() == 16 && a[1][0] == 0x20);
+      CHECK(m[4].payload.substr(0, 8) == std::string("\x0A\x40\x80\xFD\x02\0\0\0", 8));
+    }
+  }
+  d = ask(nl::request(22, kRequest | kDump, 9, std::string("\x0A\0\0\0\0\0\0\0", 8)), asker, &whole);
+  CHECK(whole && d.size() == 2 && nl::messages(d[0].bytes).size() == 3);
+  // the routes: the default one and the subnet; IPv6's
+  d = ask(nl::request(26, kRequest | kDump, 10, std::string("\x02\0\0\0\0\0\0\0\0\0\0\0", 12)), asker, &whole);
+  CHECK(whole && d.size() == 2);
+  if (d.size() == 2) {
+    const std::vector<nl::Message> m = nl::messages(d[0].bytes, &inner);
+    CHECK(inner && m.size() == 2);
+    if (m.size() == 2) {
+      std::map<uint16_t, std::string> a = nl::attributes(m[0].payload, 12, &inner);
+      CHECK(inner && m[0].type == 24 && m[0].payload.substr(0, 8) == std::string("\x02\0\0\0\xFE\x10\0\x01", 8) && a[5] == std::string("\xC0\xA8\x05\x01", 4) && a[4] == std::string("\x02\0\0\0", 4) && a.count(1) == 0);
+      a = nl::attributes(m[1].payload, 12, &inner);
+      CHECK(inner && m[1].payload.substr(0, 8) == std::string("\x02\x18\0\0\xFE\x02\xFD\x01", 8) && a[1] == std::string("\xC0\xA8\x05\0", 4) && a[7] == std::string("\xC0\xA8\x05\x4D", 4) && a.count(5) == 0);
+    }
+  }
+  d = ask(nl::request(26, kRequest | kDump, 11, std::string("\x0A", 1)), asker, &whole);
+  CHECK(whole && d.size() == 2 && nl::messages(d[0].bytes).size() == 4);
+  // the route to one place: by the gateway, on the link, to the machine itself; nowhere
+  auto route_to = [&](const std::string& head, const std::string& to) { return ask(nl::request(26, kRequest, 12, head + nl::attribute(1, to)), asker, &whole); };
+  d = route_to(std::string("\x02\x20\0\0\0\0\0\0\0\0\0\0", 12), std::string("\x08\x08\x08\x08", 4));
+  CHECK(whole && d.size() == 1);
+  if (d.size() == 1) {
+    const std::vector<nl::Message> m = nl::messages(d[0].bytes, &inner);
+    std::map<uint16_t, std::string> a = nl::attributes(m.empty() ? std::string() : m[0].payload, 12);
+    CHECK(inner && m.size() == 1 && m[0].type == 24 && m[0].flags == 0 && a[1] == std::string("\x08\x08\x08\x08", 4) && a[5] == std::string("\xC0\xA8\x05\x01", 4) && a[7] == std::string("\xC0\xA8\x05\x4D", 4) &&
+          a[4] == std::string("\x02\0\0\0", 4));
+  }
+  d = route_to(std::string("\x02\x20\0\0\0\0\0\0\0\0\0\0", 12), std::string("\xC0\xA8\x05\x09", 4));
+  CHECK(d.size() == 1 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 12).count(5) == 0);
+  d = route_to(std::string("\x02\x20\0\0\0\0\0\0\0\0\0\0", 12), std::string("\x7F\0\0\x05", 4));
+  CHECK(d.size() == 1 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 12)[4] == std::string("\x01\0\0\0", 4) && nl::messages(d[0].bytes)[0].payload[7] == 2);
+  d = route_to(std::string("\x0A\x80\0\0\0\0\0\0\0\0\0\0", 12), std::string("\x20\x01\x48\x60", 4) + std::string(12, '\x01'));
+  CHECK(d.size() == 1 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 12)[5].size() == 16 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 12)[7][0] == 0x20);
+  {
+    Snapshot alone;
+    alone.interfaces[0] = network.interfaces[0];
+    alone.count = 1;
+    ByteBuffer out(lan.alloc);
+    const std::string r = nl::request(26, kRequest, 13, std::string("\x02\x20\0\0\0\0\0\0\0\0\0\0", 12) + nl::attribute(1, std::string("\x08\x08\x08\x08", 4)));
+    CHECK(answer(asker, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), r.size()), alone, &out));
+    const std::vector<nl::Queued> q = nl::queued(out, &whole);
+    CHECK(q.size() == 1 && nl::messages(q[0].bytes)[0].type == 2 && int32_t(nl::word_at(nl::messages(q[0].bytes)[0].payload, 0)) == -101);      // ENETUNREACH
+  }
+  // one interface by number and by name; one there is not
+  d = ask(nl::request(18, kRequest, 14, std::string("\0\0\0\0\x02\0\0\0\0\0\0\0\0\0\0\0", 16)), asker, &whole);
+  CHECK(whole && d.size() == 1 && nl::messages(d[0].bytes).size() == 1 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 16)[3] == std::string("eth0\0", 5));
+  d = ask(nl::request(18, kRequest | kAck, 15, std::string(16, '\0') + nl::attribute(3, std::string("lo\0", 3))), asker, &whole);
+  CHECK(whole && d.size() == 2 && nl::word_at(nl::messages(d[0].bytes)[0].payload, 4) == 1 && nl::messages(d[1].bytes)[0].type == 2 && nl::messages(d[1].bytes)[0].payload.size() == 20 &&
+        nl::word_at(nl::messages(d[1].bytes)[0].payload, 0) == 0);      // (asked to acknowledge: an error message that says 0)
+  const std::string missing = nl::request(18, kRequest, 16, std::string("\0\0\0\0\x09\0\0\0\0\0\0\0\0\0\0\0", 16));
+  d = ask(missing, asker, &whole);
+  CHECK(whole && d.size() == 1);
+  if (d.size() == 1) {      // the error and the whole request it is for; with NETLINK_CAP_ACK only its header
+    const std::vector<nl::Message> m = nl::messages(d[0].bytes, &inner);
+    CHECK(inner && m.size() == 1 && m[0].type == 2 && m[0].sequence == 16 && int32_t(nl::word_at(m[0].payload, 0)) == -19 && m[0].payload.substr(4) == missing);
+  }
+  Asker capped = asker;
+  capped.cap_ack = true;
+  d = ask(missing, capped, &whole);
+  CHECK(d.size() == 1 && nl::messages(d[0].bytes)[0].payload.size() == 20 && nl::messages(d[0].bytes)[0].flags == 0x100);
+  // what is not a Linux program's to do, what nobody knows, what is not a request, and several requests in one datagram
+  d = ask(nl::request(16, kRequest, 17, std::string(16, '\0')), asker, &whole);
+  CHECK(d.size() == 1 && int32_t(nl::word_at(nl::messages(d[0].bytes)[0].payload, 0)) == -1);
+  d = ask(nl::request(200, kRequest, 18, std::string(16, '\0')), asker, &whole);
+  CHECK(d.size() == 1 && int32_t(nl::word_at(nl::messages(d[0].bytes)[0].payload, 0)) == -95);
+  d = ask(nl::request(18, kDump, 19, std::string(1, '\0')), asker, &whole);
+  CHECK(whole && d.empty());
+  d = ask(nl::request(30, kRequest | kDump, 20, std::string(1, '\0')), asker, &whole);      // neighbours: none
+  CHECK(d.size() == 1 && nl::messages(d[0].bytes)[0].type == 3);
+  d = ask(nl::request(1, kRequest | kAck, 21, "") + nl::request(22, kRequest | kDump, 22, std::string(1, '\x02')) + nl::request(18, kRequest | kDump, 23, std::string(1, '\0')), asker, &whole);
+  CHECK(whole && d.size() == 5 && nl::messages(d[0].bytes)[0].type == 2 && nl::messages(d[0].bytes)[0].sequence == 21 && nl::messages(d[2].bytes)[0].sequence == 22 &&
+        nl::messages(d[4].bytes)[0].sequence == 23);
+  // the generic controller knows itself and nothing else
+  Asker generic = asker;
+  generic.protocol = kProtocolGeneric;
+  d = ask(nl::request(0x10, kRequest, 30, std::string("\x03\x01\0\0", 4) + nl::attribute(2, std::string("nlctrl\0", 7))), generic, &whole);
+  CHECK(whole && d.size() == 1 && nl::messages(d[0].bytes)[0].type == 0x10 && nl::attributes(nl::messages(d[0].bytes)[0].payload, 4)[1] == std::string("\x10\0", 2));
+  d = ask(nl::request(0x10, kRequest, 31, std::string("\x03\x01\0\0", 4) + nl::attribute(2, std::string("nl80211\0", 8))), generic, &whole);
+  CHECK(d.size() == 1 && nl::messages(d[0].bytes)[0].type == 2 && int32_t(nl::word_at(nl::messages(d[0].bytes)[0].payload, 0)) == -2);
+  d = ask(nl::request(0x10, kRequest | kDump, 32, std::string("\x03\x01\0\0", 4)), generic, &whole);
+  CHECK(whole && d.size() == 2);
+  // many interfaces: a dump goes out in several datagrams, none large
+  {
+    Snapshot many;
+    for (uint32_t i = 0; i < kMostInterfaces; ++i) {
+      many.interfaces[i] = network.interfaces[1];
+      many.interfaces[i].index = i + 1;
+    }
+    many.count = kMostInterfaces;
+    ByteBuffer out(lan.alloc);
+    const std::string r = nl::request(18, kRequest | kDump, 40, std::string(1, '\0'));
+    CHECK(answer(asker, ConstByteView(reinterpret_cast<const uint8_t*>(r.data()), r.size()), many, &out));
+    const std::vector<nl::Queued> q = nl::queued(out, &whole);
+    size_t links = 0;
+    for (const nl::Queued& one : q) {
+      CHECK(one.bytes.size() <= 4096);
+      for (const nl::Message& m : nl::messages(one.bytes)) links += m.type == 16;
+    }
+    CHECK(whole && q.size() >= 3 && links == kMostInterfaces);
+  }
+  // what changed between two states of the network, for the groups a socket listens to
+  {
+    Snapshot later = network;
+    later.interfaces[1].address4[3] = 78;
+    later.interfaces[1].has_global6 = false;
+    ByteBuffer out(lan.alloc);
+    constexpr uint32_t kLinks = 1, kAddresses4 = 0x10, kRoutes4 = 0x40, kAddresses6 = 0x100;
+    CHECK(changes(network, later, kAddresses4 | kAddresses6, &out));
+    std::vector<nl::Queued> q = nl::queued(out, &whole);
+    CHECK(whole && q.size() == 3);
+    if (q.size() == 3) {
+      CHECK(q[0].group == 5 && nl::messages(q[0].bytes)[0].type == 21 && nl::attributes(nl::messages(q[0].bytes)[0].payload, 8)[1] == std::string("\xC0\xA8\x05\x4D", 4));
+      CHECK(q[1].group == 5 && nl::messages(q[1].bytes)[0].type == 20 && nl::attributes(nl::messages(q[1].bytes)[0].payload, 8)[1] == std::string("\xC0\xA8\x05\x4E", 4));
+      CHECK(q[2].group == 9 && nl::messages(q[2].bytes)[0].type == 21 && nl::messages(q[2].bytes)[0].port == 0 && nl::messages(q[2].bytes)[0].sequence == 0);
+    }
+    out.clear();
+    CHECK(changes(network, later, kRoutes4, &out));
+    q = nl::queued(out, &whole);
+    CHECK(whole && q.size() == 4 && q[0].group == 7);      // (both IPv4 routes name the address as their source)
+    out.clear();
+    CHECK(changes(network, network, 0xFFFFFFFF, &out) && out.size() == 0 && changes(network, later, kLinks, &out) && out.size() == 0);
+    later.count = 1;
+    CHECK(changes(network, later, kLinks, &out));
+    q = nl::queued(out, &whole);
+    CHECK(whole && q.size() == 1 && q[0].group == 1 && nl::messages(q[0].bytes)[0].type == 17);
+  }
+  // A datagram cut short anywhere, and with any bit of it flipped: answered or not, and what comes out is always whole datagrams of whole messages
+  const std::string several = nl::request(18, kRequest | kDump, 50, std::string(1, '\0')) + nl::request(18, kRequest | kAck, 51, std::string(16, '\0') + nl::attribute(3, std::string("eth0\0", 5))) +
+                              nl::request(26, kRequest, 52, std::string("\x02\x20\0\0\0\0\0\0\0\0\0\0", 12) + nl::attribute(1, std::string("\x08\x08\x08\x08", 4))) +
+                              nl::request(22, kRequest | kDump, 53, std::string("\x0A\0\0\0\0\0\0\0", 8));
+  size_t answers = 0;
+  auto sound = [&](const std::string& request, const Asker& who) {
+    bool all = false;
+    const std::vector<nl::Queued> q = ask(request, who, &all);
+    CHECK(all);
+    for (const nl::Queued& one : q) {
+      bool good = false;
+      const std::vector<nl::Message> m = nl::messages(one.bytes, &good);
+      CHECK(good && !m.empty());
+      for (const nl::Message& each : m) CHECK(each.port == who.port);
+      answers += m.size();
+    }
+  };
+  for (size_t cut = 0; cut <= several.size(); ++cut) sound(several.substr(0, cut), asker);
+  for (size_t bit = 0; bit < several.size() * 8; ++bit) {
+    std::string flipped = several;
+    flipped[bit / 8] = char(flipped[bit / 8] ^ (1 << (bit % 8)));
+    sound(flipped, asker);
+    if (bit < 60 * 8) sound(flipped, generic);
+  }
+  CHECK(answers > 5000);
+}
+
+// AF_NETLINK sockets through the system calls.
+static void test_netlink_sockets() {
+  constexpr uint64_t kNetlink = 16, kRaw = 3;
+  constexpr uint16_t kRequest = 1, kDump = 0x300;
+  Setup t;
+  t.configure_ipv6();
+  const int64_t fd = t.s(41, kNetlink, kRaw | kCloexec, 0);
+  CHECK(fd >= 3 && t.s(41, kNetlink, kStream, 0) == -94 && t.s(41, kNetlink, kRaw, 9) == -93);      // (SOCK_STREAM; NETLINK_AUDIT)
+  uint32_t v = 0;
+  CHECK(t.option(fd, 1, 3, &v) == 0 && v == kRaw && t.option(fd, 1, 39, &v) == 0 && v == kNetlink && t.option(fd, 1, 38, &v) == 0 && v == 0);
+  const uint64_t name = t.alloc(16), size = t.alloc(8), buffer = t.alloc(8192);
+  auto address = [&](uint32_t port, uint32_t groups, uint16_t family = 16) {
+    const uint64_t at = t.alloc(16);
+    t.put32(at, family); t.put32(at + 4, port); t.put32(at + 8, groups);
+    return at;
+  };
+  auto own = [&](int64_t socket, uint32_t* groups = nullptr) {
+    t.put32(size, 12);
+    if (t.s(51, socket, name, size) != 0 || t.u32(size) != 12 || (t.u32(name) & 0xFFFF) != 16) return ~uint32_t{0};
+    if (groups) *groups = t.u32(name + 8);
+    return t.u32(name + 4);
+  };
+  // not bound until it is used or bound; bound, its address is the process's number
+  CHECK(own(fd) == 0 && t.polled(fd) == kPollOut && t.s(49, fd, address(0, 0), 12) == 0 && own(fd) == 7);
+  CHECK(t.s(49, fd, address(99, 0), 12) == -22 && t.s(49, fd, address(0, 0), 8) == -22 && t.s(49, fd, address(0, 0, 2), 12) == -22 && t.s(49, fd, kBad, 12) == -14);
+  auto send = [&](int64_t socket, const std::string& request) { return t.s(44, socket, t.bytes(request), request.size(), 0, 0, 0); };
+  // everything one request brings, read datagram by datagram until NLMSG_DONE (or one that is not part of a list)
+  auto exchange = [&](int64_t socket, const std::string& request) {
+    std::vector<nl::Message> all;
+    if (send(socket, request) != int64_t(request.size())) return all;
+    for (int i = 0; i < 64; ++i) {
+      const int64_t n = t.s(45, socket, buffer, 8192, 0x40 /* MSG_DONTWAIT */, 0, 0);
+      if (n <= 0) break;
+      bool whole = false;
+      const std::vector<nl::Message> some = nl::messages(t.text(buffer, uint64_t(n)), &whole);
+      CHECK(whole);
+      bool last = false;
+      for (const nl::Message& m : some) {
+        all.push_back(m);
+        last = last || m.type == 3 || !(m.flags & 2);
+      }
+      if (last) break;
+    }
+    return all;
+  };
+  // getifaddrs: the interfaces, then the addresses
+  std::vector<nl::Message> m = exchange(fd, nl::request(18, kRequest | kDump, 1, std::string(1, '\0')));
+  CHECK(m.size() == 3 && t.polled(fd) == kPollOut);
+  if (m.size() == 3) {
+    std::map<uint16_t, std::string> a = nl::attributes(m[1].payload, 16);
+    CHECK(m[0].type == 16 && m[0].port == 7 && m[0].sequence == 1 && nl::attributes(m[0].payload, 16)[3] == std::string("lo\0", 3) && a[3] == std::string("eth0\0", 5) && nl::word_at(m[1].payload, 4) == 2);
+    CHECK(a[1].size() == 6 && a[1] == std::string(reinterpret_cast<const char*>(t.lan.nic_a.mac.bytes), 6) && m[2].type == 3);
+  }
+  m = exchange(fd, nl::request(22, kRequest | kDump, 2, std::string(1, '\0')));
+  CHECK(m.size() == 6);
+  if (m.size() == 6) {
+    const network::Ipv6Configuration c6 = t.lan.a.configuration6();
+    CHECK(nl::attributes(m[1].payload, 8)[1] == std::string("\x0A\0\0\x01", 4) && m[1].payload[1] == 24 && nl::attributes(m[1].payload, 8)[4] == std::string("\x0A\0\0\xFF", 4));
+    CHECK(nl::attributes(m[3].payload, 8)[1] == std::string(reinterpret_cast<const char*>(c6.global.bytes), 16) && m[3].payload[1] == 64);
+    CHECK(nl::attributes(m[4].payload, 8)[1] == std::string(reinterpret_cast<const char*>(c6.link_local.bytes), 16) && uint8_t(m[4].payload[3]) == 253);
+  }
+  m = exchange(fd, nl::request(26, kRequest | kDump, 3, std::string("\x02", 1)));
+  CHECK(m.size() == 3 && nl::attributes(m[0].payload, 12)[5] == std::string("\x0A\0\0\xFE", 4));
+  // an error comes back as a message; a datagram can be looked at and sized before it is read; the sender is the kernel
+  const std::string refused = nl::request(16, kRequest, 4, std::string(16, '\0'));
+  CHECK(send(fd, refused) == int64_t(refused.size()) && t.polled(fd) == (kPollIn | kPollOut));
+  CHECK(t.s(16, fd, 0x541B, size) == 0 && t.u32(size) == 36 + refused.size() - 16);
+  CHECK(t.s(45, fd, buffer, 0, 0x22 /* MSG_PEEK | MSG_TRUNC */, 0, 0) == int64_t(20 + refused.size()) && t.s(45, fd, buffer, 16, 2, 0, 0) == 16);
+  t.put32(size, 16); t.put32(name + 4, 77);
+  CHECK(t.s(45, fd, buffer, 8192, 0, name, size) == int64_t(20 + refused.size()) && t.u32(size) == 12 && (t.u32(name) & 0xFFFF) == 16 && t.u32(name + 4) == 0 && t.u32(name + 8) == 0);
+  m = nl::messages(t.text(buffer, 20 + refused.size()));
+  CHECK(m.size() == 1 && m[0].type == 2 && int32_t(nl::word_at(m[0].payload, 0)) == -1 && t.s(45, fd, buffer, 64, 0x40, 0, 0) == -11);
+  // sendmsg and recvmsg: several buffers, a datagram longer than them (MSG_TRUNC), who sent it (SO_PASSCRED) and to which group (NETLINK_PKTINFO)
+  const uint64_t vectors = t.alloc(32), message = t.alloc(56), control = t.alloc(128), part = t.alloc(64);
+  const std::string one = nl::request(18, kRequest, 5, std::string("\0\0\0\0\x01\0\0\0\0\0\0\0\0\0\0\0", 16));
+  CHECK(t.s(54, fd, 1, 16, t.word(1), 4) == 0 && t.s(54, fd, 270, 3, t.word(1), 4) == 0 && t.option(fd, 1, 16, &v) == 0 && v == 1 && t.option(fd, 270, 3, &v) == 0 && v == 1);
+  t.put64(vectors, t.bytes(one.substr(0, 10))); t.put64(vectors + 8, 10); t.put64(vectors + 16, t.bytes(one.substr(10))); t.put64(vectors + 24, one.size() - 10);
+  t.put64(message, address(0, 0)); t.put32(message + 8, 12); t.put64(message + 16, vectors); t.put64(message + 24, 2); t.put64(message + 32, 0); t.put64(message + 40, 0); t.put32(message + 48, 0);
+  CHECK(t.s(46, fd, message, 0) == int64_t(one.size()));
+  t.put64(vectors, part); t.put64(vectors + 8, 16); t.put64(vectors + 16, part + 16); t.put64(vectors + 24, 16);
+  t.put64(message, name); t.put32(message + 8, 16); t.put64(message + 32, control); t.put64(message + 40, 128);
+  const int64_t whole_size = t.s(47, fd, message, 0x22);
+  CHECK(whole_size > 200 && t.u32(message + 48) == 0x20 && t.u32(message + 8) == 12 && t.u64(message + 40) == 32 + 24);
+  CHECK(t.text(control, 32) == std::string("\x1C\0\0\0\0\0\0\0\x01\0\0\0\x02\0\0\0", 16) + std::string(16, '\0'));                                    // SCM_CREDENTIALS: process 0, user 0, group 0
+  CHECK(t.text(control + 32, 24) == std::string("\x14\0\0\0\0\0\0\0\x0E\x01\0\0\x01\0\0\0", 16) + std::string(8, '\0'));                               // NETLINK_PKTINFO: no group
+  t.put64(message + 40, 128);
+  CHECK(t.s(47, fd, message, 0) == 32 && nl::word_at(t.text(part, 32), 0) == uint32_t(whole_size) && t.s(47, fd, message, 0x40) == -11);      // (cut to the buffers; the rest is gone)
+  CHECK(t.s(54, fd, 1, 16, t.word(0), 4) == 0 && t.s(54, fd, 270, 3, t.word(0), 4) == 0);
+  // read and write, readv and writev
+  CHECK(t.s(1, fd, t.bytes(one), one.size()) == int64_t(one.size()) && t.s(0, fd, buffer, 8192) == whole_size);
+  t.put64(vectors, t.bytes(one)); t.put64(vectors + 8, one.size());
+  CHECK(t.s(20, fd, vectors, 1) == int64_t(one.size()));
+  t.put64(vectors, buffer); t.put64(vectors + 8, 8192);
+  CHECK(t.s(19, fd, vectors, 1) == whole_size);
+  // what a netlink socket is not
+  CHECK(t.s(50, fd, 1) == -95 && t.s(43, fd, 0, 0) == -95 && t.s(48, fd, 2) == -95 && t.s(44, fd, buffer, 70000, 0, 0, 0) == -90 && t.s(44, fd, kBad, 32, 0, 0, 0) == -14);
+  CHECK(t.s(54, fd, 6, 1, t.word(1), 4) == -92 && t.option(fd, 6, 1, &v) == -92 && t.s(54, fd, 270, 99, t.word(1), 4) == -92);
+  // options: kept and read back; a filter is taken
+  CHECK(t.s(54, fd, 270, 10, t.word(1), 4) == 0 && t.s(54, fd, 270, 11, t.word(1), 4) == 0 && t.s(54, fd, 270, 12, t.word(1), 4) == 0 && t.option(fd, 270, 10, &v) == 0 && v == 1 &&
+        t.option(fd, 270, 11, &v) == 0 && v == 1 && t.option(fd, 270, 12, &v) == 0 && v == 1);
+  CHECK(send(fd, nl::request(18, kRequest, 6, std::string("\0\0\0\0\x09\0\0\0\0\0\0\0\0\0\0\0", 16))) == 32 && t.s(45, fd, buffer, 8192, 0, 0, 0) == 36);      // (NETLINK_CAP_ACK: the header only)
+  CHECK(t.s(54, fd, 1, 8, t.word(65536), 4) == 0 && t.option(fd, 1, 8, &v) == 0 && v == 131072 && t.s(54, fd, 1, 26, t.alloc(16), 16) == 0 && t.s(54, fd, 1, 27, 0, 0) == 0 &&
+        t.s(54, fd, 1, 27, 0, 0) == -2);
+  // a second socket of the process gets another address; an address in use; two sockets talk to each other
+  const int64_t second = t.s(41, kNetlink, kRaw | kNonBlock, 0);
+  CHECK(t.s(49, second, address(7, 0), 12) == -98 && t.s(49, second, address(0, 0), 12) == 0 && own(second) == 0xFFFFEFFFu);
+  CHECK(t.s(44, fd, t.bytes("to the other"), 12, 0, address(0xFFFFEFFFu, 0), 12) == 12 && t.s(44, fd, t.bytes("to nobody"), 9, 0, address(555, 0), 12) == -111);
+  t.put32(size, 12);
+  CHECK(t.polled(second, kPollIn) == kPollIn && t.s(45, second, buffer, 64, 0, name, size) == 12 && t.text(buffer, 12) == "to the other" && t.u32(name + 4) == 7);
+  CHECK(t.s(42, second, address(7, 0), 12) == 0 && t.s(1, second, t.bytes("back"), 4) == 4 && t.s(0, fd, buffer, 64) == 4 && t.text(buffer, 4) == "back");
+  t.put32(size, 12);
+  CHECK(t.s(52, second, name, size) == 0 && t.u32(name + 4) == 7 && t.s(42, second, address(0, 0, 0), 12) == 0 && t.s(0, second, buffer, 64) == -11);
+  // listening for changes: nothing while the network stays as it is; a new address is told (the old one's end first), and a wait wakes for it
+  const int64_t watcher = t.s(41, kNetlink, kRaw | kNonBlock, 0);
+  uint32_t groups = 0;
+  CHECK(t.s(49, watcher, address(0, 0x10), 12) == 0 && own(watcher, &groups) == 0xFFFFEFFEu && groups == 0x10 && t.polled(watcher, kPollIn) == 0);
+  CHECK(t.s(54, watcher, 270, 1, t.word(9), 4) == 0 && own(watcher, &groups) != 0 && groups == 0x110 && t.option(watcher, 270, 9, &v) == 0 && v == 0x110);      // NETLINK_ADD_MEMBERSHIP: IPv6 addresses
+  CHECK(t.s(54, watcher, 270, 2, t.word(9), 4) == 0 && t.s(54, watcher, 270, 1, t.word(0), 4) == -22 && t.s(0, watcher, buffer, 8192) == -11);
+  network::IpConfiguration changed = t.lan.a.configuration();
+  changed.address = network::Ipv4Address::make(10, 0, 0, 9);
+  int polls = 0;
+  t.host.meanwhile = [&] { if (++polls == 3) t.lan.a.configure(changed); };
+  const uint64_t pollfd = t.alloc(8);
+  t.put32(pollfd, uint32_t(watcher)); t.put32(pollfd + 4, kPollIn);
+  CHECK(t.s(7, pollfd, 1, 5000) == 1 && polls >= 3);
+  t.host.meanwhile = nullptr;
+  t.put64(vectors, buffer); t.put64(vectors + 8, 8192);
+  t.put64(message, name); t.put32(message + 8, 12); t.put64(message + 16, vectors); t.put64(message + 24, 1); t.put64(message + 32, 0); t.put64(message + 40, 0);
+  int64_t n = t.s(47, watcher, message, 0);
+  m = nl::messages(t.text(buffer, n > 0 ? uint64_t(n) : 0));
+  CHECK(n > 0 && m.size() == 1 && m[0].type == 21 && m[0].port == 0 && nl::attributes(m[0].payload, 8)[1] == std::string("\x0A\0\0\x01", 4) && t.u32(name + 4) == 0 && t.u32(name + 8) == 0x10);
+  n = t.s(0, watcher, buffer, 8192);
+  m = nl::messages(t.text(buffer, n > 0 ? uint64_t(n) : 0));
+  CHECK(n > 0 && m.size() == 1 && m[0].type == 20 && nl::attributes(m[0].payload, 8)[1] == std::string("\x0A\0\0\x09", 4) && t.s(0, watcher, buffer, 8192) == -11);
+  m = exchange(watcher, nl::request(22, kRequest | kDump, 9, std::string(1, '\x02')));      // (and it can ask like any other)
+  CHECK(m.size() == 3 && nl::attributes(m[1].payload, 8)[1] == std::string("\x0A\0\0\x09", 4));
+  // the generic controller; device events (a socket that hears nothing and that the kernel does not listen on)
+  const int64_t generic = t.s(41, kNetlink, kRaw, 16), events = t.s(41, kNetlink, kDgram | kNonBlock, 15);
+  m = exchange(generic, nl::request(0x10, kRequest, 1, std::string("\x03\x01\0\0", 4) + nl::attribute(2, std::string("nl80211\0", 8))));
+  CHECK(m.size() == 1 && m[0].type == 2 && int32_t(nl::word_at(m[0].payload, 0)) == -2);
+  CHECK(events > 0 && t.s(49, events, address(0, 1), 12) == 0 && t.polled(events, kPollIn) == 0 && t.s(0, events, buffer, 64) == -11 && send(events, std::string(16, 'x')) == -111);
+  // more than the queue holds is lost, and the next read says so once
+  const std::string dump = nl::request(18, kRequest | kDump, 60, std::string(1, '\0'));
+  for (int i = 0; i < 800; ++i) {
+    t.reuse();
+    CHECK(send(fd, dump) == int64_t(dump.size()));
+  }
+  t.reuse();
+  const uint64_t spare = t.alloc(8192);
+  CHECK(t.s(45, fd, spare, 8192, 0x40, 0, 0) == -105);
+  int read = 0;
+  while (t.s(45, fd, spare, 8192, 0x40, 0, 0) > 0) ++read;
+  CHECK(read > 200 && t.s(45, fd, spare, 8192, 0x40, 0, 0) == -11);
+  // the interface ioctls, of any socket: a name for a number and back, flags, addresses, the list
+  {
+    t.reuse();
+    const uint64_t ifreq = t.alloc(40), conf = t.alloc(16), list = t.alloc(160);
+    const int64_t any = t.s(41, kAfInet, kDgram, 0);
+    auto named = [&](const char* text) { memset(&t.memory.bytes[ifreq - kBase], 0, 40); t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text))); };
+    named("eth0");
+    CHECK(t.s(16, any, 0x8933, ifreq) == 0 && t.u32(ifreq + 16) == 2 && t.s(16, fd, 0x8933, ifreq) == 0);                                     // SIOCGIFINDEX
+    named("eth");
+    CHECK(t.s(16, any, 0x8933, ifreq) == -19);
+    named("");
+    t.put32(ifreq + 16, 1);
+    CHECK(t.s(16, any, 0x8910, ifreq) == 0 && t.text(ifreq, 3) == std::string("lo\0", 3));                                                    // SIOCGIFNAME
+    t.put32(ifreq + 16, 5);
+    CHECK(t.s(16, any, 0x8910, ifreq) == -19);
+    named("eth0");
+    CHECK(t.s(16, any, 0x8913, ifreq) == 0 && (t.u32(ifreq + 16) & 0xFFFF) == 0x1043 && t.text(ifreq, 5) == std::string("eth0\0", 5));         // SIOCGIFFLAGS
+    CHECK(t.s(16, any, 0x8915, ifreq) == 0 && t.text(ifreq + 16, 8) == std::string("\x02\0\0\0\x0A\0\0\x09", 8));                             // SIOCGIFADDR
+    CHECK(t.s(16, any, 0x891B, ifreq) == 0 && t.text(ifreq + 20, 4) == std::string("\xFF\xFF\xFF\0", 4));                                     // SIOCGIFNETMASK
+    CHECK(t.s(16, any, 0x8919, ifreq) == 0 && t.text(ifreq + 20, 4) == std::string("\x0A\0\0\xFF", 4));                                       // SIOCGIFBRDADDR
+    CHECK(t.s(16, any, 0x8921, ifreq) == 0 && t.u32(ifreq + 16) == 1500);                                                                     // SIOCGIFMTU
+    CHECK(t.s(16, any, 0x8927, ifreq) == 0 && t.text(ifreq + 16, 8) == std::string("\x01\0", 2) + std::string(reinterpret_cast<const char*>(t.lan.nic_a.mac.bytes), 6));      // SIOCGIFHWADDR
+    CHECK(t.s(16, any, 0x8914, ifreq) == -1 && t.s(16, any, 0x8933, kBad) == -14);                                                            // SIOCSIFFLAGS
+    t.put32(conf, 0); t.put64(conf + 8, 0);
+    CHECK(t.s(16, any, 0x8912, conf) == 0 && t.u32(conf) == 80);                                                                              // SIOCGIFCONF: how much there is
+    t.put32(conf, 160); t.put64(conf + 8, list);
+    CHECK(t.s(16, any, 0x8912, conf) == 0 && t.u32(conf) == 80 && t.text(list, 3) == std::string("lo\0", 3) && t.text(list + 20, 4) == std::string("\x7F\0\0\x01", 4) &&
+          t.text(list + 40, 5) == std::string("eth0\0", 5) && t.text(list + 60, 4) == std::string("\x0A\0\0\x09", 4));
+    t.put32(conf, 50);
+    CHECK(t.s(16, any, 0x8912, conf) == 0 && t.u32(conf) == 40 && t.s(3, any) == 0);
+  }
+  // closed sockets are free again: many more than there can be at once
+  CHECK(t.s(3, second) == 0 && t.s(3, watcher) == 0 && t.s(3, generic) == 0 && t.s(3, events) == 0);
+  for (int i = 0; i < 200; ++i) {
+    const int64_t again = t.s(41, kNetlink, kRaw, 0);
+    CHECK(again >= 3 && t.s(49, again, address(0, 0), 12) == 0 && own(again) == 0xFFFFEFFFu && t.s(3, again) == 0);
+  }
+  CHECK(t.s(3, fd) == 0 && t.s(45, fd, spare, 64, 0, 0, 0) == -9);
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -963,6 +1448,8 @@ int main() {
   test_name_resolution();
   test_peek();
   test_control_messages();
+  test_netlink_messages();
+  test_netlink_sockets();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

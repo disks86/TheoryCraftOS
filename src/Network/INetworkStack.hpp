@@ -17,6 +17,7 @@
  */
 
 #pragma once
+#include "Hardware/NetworkInterface/NetworkTypes.hpp"
 #include "Network/Dhcp/IDhcpClient.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/StringView.hpp"
@@ -86,6 +87,8 @@ class INetworkStack {
 
   // --- IPv6 (stacks without it keep these defaults). What stateless autoconfiguration has given the interface so far.
   virtual Ipv6Configuration configuration6() const { return Ipv6Configuration{}; }
+  // The hardware address of the interface this stack runs on (zeros: it has none to tell).
+  virtual hardware::MacAddress mac_address() const { return hardware::MacAddress{}; }
 
   // Waiting for the stack (see NetworkStackSet::wait_for_progress for the pattern): progress() goes up after every poll that did something
   // sockets may wait for; wait_for_progress() returns once it is no longer `seen` or `timeout_us` passed, false if this stack cannot be waited

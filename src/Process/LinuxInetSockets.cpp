@@ -1022,4 +1022,12 @@ uint16_t inet_poll_events(uint32_t id, uint16_t events) {
   return out;
 }
 
+// The same helpers for the other kinds of socket (LinuxNetlink.cpp).
+int64_t gather_vectors(Process& p, uint64_t vectors, uint64_t count, uint64_t limit, ByteBuffer* out) { return gather(p, vectors, count, limit, out); }
+int64_t vectors_room(Process& p, uint64_t vectors, uint64_t count, uint64_t limit) { return room_of(p, vectors, count, limit); }
+bool scatter_vectors(Process& p, uint64_t vectors, uint64_t count, ConstByteView data) { return scatter(p, vectors, count, data); }
+bool add_control_message(ByteBuffer& out, uint64_t capacity, uint32_t level, uint32_t type, ConstByteView data, bool* cut) {
+  return add_control(out, capacity, level, type, data, cut);
+}
+
 }  // namespace process::linuxabi

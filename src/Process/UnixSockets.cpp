@@ -98,7 +98,7 @@ UnixStatus UnixSocketManager::create_signal(uint64_t owner_pid, uint32_t* id) {
 
 namespace {
 // What to call when the last descriptor of a linked kind is gone: one for each kind (0x46 ..), set once by the code that owns the kind.
-constexpr uint32_t kLinkedKinds = 3;
+constexpr uint32_t kLinkedKinds = uint32_t(UnixType::Netlink) - uint32_t(UnixType::MessageQueue) + 1;      // (the last linked kind)
 UnixSocketManager::LinkReleased g_link_released[kLinkedKinds] = {};
 uint32_t linked_index(UnixType type) { return uint32_t(type) - uint32_t(UnixType::MessageQueue); }
 }  // namespace

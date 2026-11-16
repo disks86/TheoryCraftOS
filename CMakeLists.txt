@@ -884,6 +884,8 @@ add_executable(BOOTX64
   src/Process/LinuxNetworkFiles.cpp
   src/Process/LinuxInetSockets.cpp
   src/Process/LinuxInotify.cpp
+  src/Process/LinuxNetlink.cpp
+  src/Process/LinuxNetlinkMessages.cpp
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
   src/Process/LinuxSignals.cpp

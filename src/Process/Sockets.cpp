@@ -508,6 +508,13 @@ bool SocketManager::interface_configuration6(uint32_t index, network::Ipv6Config
   return true;
 }
 
+bool SocketManager::interface_mac(uint32_t index, hardware::MacAddress* out) const {
+  if (index >= stacks_.count()) return false;
+  network::INetworkStack* stack = stacks_.at(index);
+  *out = stack ? stack->mac_address() : hardware::MacAddress{};
+  return true;
+}
+
 bool SocketManager::has_ipv6_route() const {
   for (uint32_t i = 0; i < stacks_.count(); ++i) {
     const network::INetworkStack* stack = stacks_.at(i);

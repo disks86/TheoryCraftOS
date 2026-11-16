@@ -15,7 +15,7 @@ rm -rf "$work"; mkdir -p "$work"
 for program in forktest signaltest; do
   gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/$program" "tests/linux/$program.c"
 done
-for program in spawntest handlertest ipctest nettest resolvetest; do
+for program in spawntest handlertest ipctest nettest netlinktest resolvetest; do
   gcc -static -O1 -pthread -o "$work/$program" "tests/linux/$program.c" 2>/dev/null
 done
 # (A statically linked glibc program that looks hosts up cannot be run on this machine for what it should print: the C library then loads this machine's
@@ -46,7 +46,7 @@ run_one() {
   grep -a -q -E "autorun: ended, result 0, exit code 0x0+( |$)" "$build/debugcon.log" || status=1
 }
 # Each program in turn is the one the kernel starts (at the autorun's path), after it ran here for what it should print.
-for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest resolvetest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
+for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest netlinktest resolvetest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
   reference=$program
   [ "$program" = resolvetest ] && reference=resolvetest-reference
   (cd "$work" && "./$reference" > "$program-expected.txt")

@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Process/LinuxNetlinkMessages.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
 #include "Process/Syscall.hpp"
@@ -137,6 +138,27 @@ class LinuxIpcManager {
   };
   InotifyInstance inotify_instances[kInotifyInstances];
   InotifyWatch inotify_watches[kInotifyWatches];
+
+  // AF_NETLINK sockets (LinuxNetlink.cpp): what socket(AF_NETLINK, ...) gives a descriptor for. The kernel's answers and notices wait in `pending`.
+  static constexpr uint32_t kNetlinkSockets = 64;
+  static constexpr uint64_t kNetlinkPendingBytes = 512 * 1024;      // datagrams waiting to be read in one socket; more are lost (ENOBUFS)
+  struct NetlinkSocket {
+    bool used = false;
+    uint16_t sequence = 0;
+    uint32_t protocol = 0;
+    uint32_t port = 0;                    // nl_pid: its address (0 until it is bound, by bind() or by its first use)
+    bool bound = false;
+    uint32_t groups = 0;                  // the multicast groups it listens to (bit n-1: group n)
+    uint32_t peer_port = 0, peer_groups = 0;      // connect(): where send() goes (0: the kernel)
+    bool overflowed = false;              // datagrams were lost: the next read says ENOBUFS
+    bool packet_info = false, cap_ack = false, ext_ack = false, no_enobufs = false, strict_check = false, pass_credentials = false, broadcast_error = false,
+         all_namespaces = false, filtered = false;
+    uint32_t send_buffer = 212992, receive_buffer = 212992;
+    uint64_t receive_timeout_ns = ~uint64_t{0}, send_timeout_ns = ~uint64_t{0};
+    UniquePointer<ByteBuffer> pending;    // datagrams: netlink::kQueuedHead bytes (length, group, sender) and the bytes
+    UniquePointer<linuxabi::netlink::Snapshot> seen;      // the network as it was last told, for a socket that listens for changes
+  };
+  NetlinkSocket netlink_sockets[kNetlinkSockets];
 
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];

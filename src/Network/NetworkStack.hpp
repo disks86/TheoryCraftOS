@@ -132,6 +132,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
 
   // --- IPv6 (NetworkStackIpv6.cpp)
   Ipv6Configuration configuration6() const override;
+  hardware::MacAddress mac_address() const override { return nic_.mac_address(); }
   bool ping6(const Ipv6Address& address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
   bool resolve_ip(StringView name, uint32_t timeout_ms, IpAddress* address, bool prefer_ipv6 = false) override;
   // The address an IPv6 packet to `destination` goes out from: ::1 to itself, the link-local one on the link, else the global one (:: when
