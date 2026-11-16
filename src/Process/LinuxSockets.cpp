@@ -414,6 +414,7 @@ bool read_msghdr(Process& p, uint64_t at, Msghdr* m) {
 }
 
 uint64_t do_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags) {
+  if (is_inet_descriptor(p, fd)) return inet_sendmsg(p, fd, message, flags);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   Msghdr m;
@@ -433,6 +434,11 @@ uint64_t do_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags) {
 }
 
 uint64_t do_recvmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags, uint32_t* got_out = nullptr) {
+  if (is_inet_descriptor(p, fd)) {
+    const uint64_t r = inet_recvmsg(p, fd, message, flags);
+    if (got_out && int64_t(r) >= 0) *got_out = uint32_t(r);
+    return r;
+  }
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   Msghdr m;
@@ -506,6 +512,7 @@ struct Watched {
 uint64_t clock_now(Process& p, uint32_t clock) { return clock == 0 || clock == 8 ? p.host().realtime_ns() : p.host().monotonic_ns(); }
 
 constexpr uint64_t kNever = ~uint64_t{0};
+constexpr uint64_t kInetPollNs = 2000000;      // how often a wait looks at a network socket again (see poll_events_locked)
 
 // A timer brought up to now (the lock held): its expirations counted. *due (when given): made no later than when it next fires, on the monotonic clock.
 void advance_timer_locked(Process& p, UnixSocketManager& m, uint32_t id, uint64_t* due) {
@@ -544,6 +551,15 @@ void refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
 // advanced first, and *due notes when it fires next.
 uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, uint16_t events, uint64_t* due) {
   if (w.kind == DescriptorKind::Closed) return kPollNval;
+  if (w.kind == DescriptorKind::Socket) {      // a network socket: asked of the socket manager
+    const uint16_t now = inet_poll_events(w.id, events);
+    // (Nothing tells this wait when the network stacks have something: while such a socket is not ready it is looked at again every 2 ms.)
+    if (now == 0 && due) {
+      const uint64_t mono = p.host().monotonic_ns(), again = mono > kNever - 1 - kInetPollNs ? kNever - 1 : mono + kInetPollNs;
+      if (again < *due) *due = again;
+    }
+    return now;
+  }
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
   advance_timer_locked(p, *m, w.id, due);
   refresh_linked_locked(p, *m, w.id);
@@ -601,7 +617,7 @@ int64_t wait_ready(Process& p, uint64_t timeout_ns, Evaluate&& evaluate) {
 Watched watch(Process& p, uint64_t fd) {
   Watched w;
   w.kind = p.files().kind(fd);
-  if (w.kind == DescriptorKind::UnixSocket) w.id = uint32_t(p.files().token(fd));
+  if (w.kind == DescriptorKind::UnixSocket || w.kind == DescriptorKind::Socket) w.id = uint32_t(p.files().token(fd));
   return w;
 }
 
@@ -650,6 +666,7 @@ uint64_t do_poll(Process& p, uint64_t fds, uint64_t count, uint64_t timeout_ns) 
 // --- the system calls ----------------------------------------------------------------------------------------------------------------------------------------------
 
 uint64_t sys_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol) {
+  if (domain == 2 || domain == 10) return inet_socket(p, domain, type, protocol);      // AF_INET, AF_INET6 (LinuxInetSockets.cpp)
   if (domain != kAfUnix) return error(kEafnosupport);
   const uint64_t base = type & 0xF, extra = type & ~uint64_t{0xF};
   if (extra & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
@@ -723,6 +740,7 @@ uint64_t sys_pipe2(Process& p, uint64_t fds, uint64_t flags) {
 }
 
 uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
+  if (is_inet_descriptor(p, fd)) return inet_bind(p, fd, address, length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   UnixName name;
@@ -755,6 +773,7 @@ uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
 }
 
 uint64_t sys_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
+  if (is_inet_descriptor(p, fd)) return inet_connect(p, fd, address, length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   UnixName name;
@@ -775,6 +794,7 @@ uint64_t sys_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length)
 }
 
 uint64_t sys_listen(Process& p, uint64_t fd, uint64_t backlog) {
+  if (is_inet_descriptor(p, fd)) return inet_listen(p, fd, backlog);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   const int32_t asked = int32_t(backlog);
@@ -783,6 +803,7 @@ uint64_t sys_listen(Process& p, uint64_t fd, uint64_t backlog) {
 }
 
 uint64_t sys_accept4(Process& p, uint64_t fd, uint64_t address, uint64_t length_at, uint64_t flags) {
+  if (is_inet_descriptor(p, fd)) return inet_accept4(p, fd, address, length_at, flags);
   if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
@@ -806,6 +827,7 @@ uint64_t sys_accept4(Process& p, uint64_t fd, uint64_t address, uint64_t length_
 }
 
 uint64_t sys_sendto(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address, uint64_t address_length) {
+  if (is_inet_descriptor(p, fd)) return inet_sendto(p, fd, buffer, length, flags, address, address_length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (length > kMaxIoBytes) length = kMaxIoBytes;
@@ -820,6 +842,7 @@ uint64_t sys_sendto(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, u
 }
 
 uint64_t sys_recvfrom(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address, uint64_t length_at) {
+  if (is_inet_descriptor(p, fd)) return inet_recvfrom(p, fd, buffer, length, flags, address, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (length > kMaxIoBytes) length = kMaxIoBytes;
@@ -868,6 +891,7 @@ uint64_t sys_recvmmsg(Process& p, uint64_t fd, uint64_t vector, uint64_t count, 
 }
 
 uint64_t sys_shutdown(Process& p, uint64_t fd, uint64_t how) {
+  if (is_inet_descriptor(p, fd)) return inet_shutdown(p, fd, how);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (how > 2) return error(kEinval);
@@ -876,6 +900,7 @@ uint64_t sys_shutdown(Process& p, uint64_t fd, uint64_t how) {
 }
 
 uint64_t sys_getsockname(Process& p, uint64_t fd, uint64_t address, uint64_t length_at) {
+  if (is_inet_descriptor(p, fd)) return inet_getsockname(p, fd, address, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (address == 0 || length_at == 0) return error(kEfault);
@@ -889,6 +914,7 @@ uint64_t sys_getsockname(Process& p, uint64_t fd, uint64_t address, uint64_t len
 }
 
 uint64_t sys_getpeername(Process& p, uint64_t fd, uint64_t address, uint64_t length_at) {
+  if (is_inet_descriptor(p, fd)) return inet_getpeername(p, fd, address, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (address == 0 || length_at == 0) return error(kEfault);
@@ -909,6 +935,7 @@ constexpr uint64_t kSoReuseAddr = 2, kSoType = 3, kSoError = 4, kSoDontRoute = 5
 }  // namespace
 
 uint64_t sys_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, uint64_t value, uint64_t length) {
+  if (is_inet_descriptor(p, fd)) return inet_setsockopt(p, fd, level, name, value, length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (level != kSolSocket) return error(kEopnotsupp);
@@ -944,6 +971,7 @@ uint64_t sys_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, 
 }
 
 uint64_t sys_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, uint64_t value, uint64_t length_at) {
+  if (is_inet_descriptor(p, fd)) return inet_getsockopt(p, fd, level, name, value, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (level != kSolSocket) return error(kEopnotsupp);
@@ -1562,6 +1590,7 @@ uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) 
 }
 
 uint64_t socket_vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count, bool write) {
+  if (is_inet_descriptor(p, fd)) return inet_vector_io(p, fd, iov, count, write);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   ByteBuffer raw(s.m->allocator());
@@ -1618,6 +1647,7 @@ uint64_t socket_vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count,
 }
 
 uint64_t socket_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
+  if (is_inet_descriptor(p, fd)) return inet_ioctl(p, fd, request, argument);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   constexpr uint64_t kFionread = 0x541B, kFionbio = 0x5421, kSiocoutq = 0x5411;

@@ -349,6 +349,7 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
       m->rdev = TCOS_DXG_DEVICE_NUMBER;
       return 0;
     case DescriptorKind::UnixSocket: *m = device_meta((is_pipe_descriptor(p, fd) ? kSIfIfo | 0600 : kSIfSock | 0777), p.files().token(fd)); return 0;
+    case DescriptorKind::Socket: *m = device_meta(kSIfSock | 0777, 0x10000 + p.files().token(fd)); return 0;      // (a network socket)
     default: break;
   }
   OpenObject* object = p.files().object(fd);
@@ -468,6 +469,7 @@ uint64_t read_from(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, boo
     case DescriptorKind::Directory: return error(kEisdir);
     case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
     case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_read(p, fd, buffer, count);
+    case DescriptorKind::Socket: return positional ? error(kEspipe) : inet_recvfrom(p, fd, buffer, count, 0, 0, 0);
     case DescriptorKind::Null: return 0;
     case DescriptorKind::Zero:
     case DescriptorKind::Random: {
@@ -521,6 +523,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
     case DescriptorKind::Directory: return error(kEisdir);
     case DescriptorKind::Dxg: return error(kEinval);      // (only ioctl)
     case DescriptorKind::UnixSocket: return positional ? error(kEspipe) : socket_write(p, fd, buffer, count);
+    case DescriptorKind::Socket: return positional ? error(kEspipe) : inet_sendto(p, fd, buffer, count, 0, 0, 0);
     case DescriptorKind::Null:
     case DescriptorKind::Zero:
     case DescriptorKind::Random: return count;
@@ -552,7 +555,7 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
 uint64_t vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count, bool write) {
   if (count > kIovMax) return error(kEinval);
   if (p.descriptor(fd) == DescriptorKind::Closed) return error(kEbadf);
-  if (p.descriptor(fd) == DescriptorKind::UnixSocket) return socket_vector_io(p, fd, iov, count, write);      // (one message is one readv(), not one per buffer)
+  if (p.descriptor(fd) == DescriptorKind::UnixSocket || p.descriptor(fd) == DescriptorKind::Socket) return socket_vector_io(p, fd, iov, count, write);      // (one message is one readv(), not one per buffer)
   uint64_t total = 0;
   for (uint64_t i = 0; i < count; ++i) {
     uint64_t base = 0, length = 0;
@@ -1221,6 +1224,7 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
     case 1: return files.close_on_exec(fd) ? 1 : 0;      // F_GETFD: FD_CLOEXEC
     case 2: files.set_close_on_exec(fd, argument & 1); return 0;
     case 3: {      // F_GETFL
+      if (files.kind(fd) == DescriptorKind::Socket) return kORdWr | (inet_non_blocking(p, fd) ? kONonBlock : 0);
       if (files.kind(fd) == DescriptorKind::UnixSocket) {
         const int fifo = fifo_access_mode(p, fd);
         return (fifo < 0 ? kORdWr : uint64_t(fifo)) | (socket_non_blocking(p, fd) ? kONonBlock : 0);
@@ -1231,6 +1235,7 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
     }
     case 4:        // F_SETFL: O_NONBLOCK of a socket; nothing else here can change
       if (files.kind(fd) == DescriptorKind::UnixSocket) set_socket_non_blocking(p, fd, (argument & kONonBlock) != 0);
+      if (files.kind(fd) == DescriptorKind::Socket) set_inet_non_blocking(p, fd, (argument & kONonBlock) != 0);
       return 0;
     case 1031:     // F_SETPIPE_SZ / F_GETPIPE_SZ: a pipe's buffer is always kFifoBytes
     case 1032:
@@ -1448,7 +1453,7 @@ void set_dxg_buffer_handlers(DxgExportHandler export_handler, DxgImportHandler i
 uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument) {
   const DescriptorKind kind = p.descriptor(fd);
   if (kind == DescriptorKind::Closed) return error(kEbadf);
-  if (kind == DescriptorKind::UnixSocket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
+  if (kind == DescriptorKind::UnixSocket || kind == DescriptorKind::Socket) return socket_ioctl(p, fd, request, argument);      // (FIONREAD, FIONBIO: LinuxSockets.cpp)
   if (kind == DescriptorKind::File) return dmabuf_ioctl(p, fd, request, argument);
   if (kind != DescriptorKind::Dxg) return error(kEnotty);
   const uint32_t code = uint32_t(request);      // (the request is an unsigned int: the upper half is not part of it)

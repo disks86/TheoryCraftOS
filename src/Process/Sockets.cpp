@@ -460,6 +460,31 @@ bool SocketManager::ready_to_write(uint32_t id) const {
   return s->tcp->is_connected() || s->tcp->failed();
 }
 
+SocketManager::State SocketManager::state(uint32_t id) const {
+  const Socket* s = at(id);
+  if (!s) return State::None;
+  if (s->proto == SocketProto::Udp) return s->udp_connected ? State::Connected : State::Unconnected;
+  if (!s->tcp) return State::Unconnected;
+  if (s->listening) return State::Listening;
+  if (s->tcp->failed()) return State::Failed;
+  return s->tcp->is_connected() ? State::Connected : State::Connecting;
+}
+
+bool SocketManager::peer_closed(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && s->proto == SocketProto::Tcp && s->tcp && !s->listening && s->tcp->peer_closed();
+}
+
+bool SocketManager::is_bound(uint32_t id) const {
+  const Socket* s = at(id);
+  return s && s->bound;
+}
+
+SocketManager::Options* SocketManager::options(uint32_t id) {
+  Socket* s = at(id);
+  return s ? &s->options : nullptr;
+}
+
 bool SocketManager::has_error(uint32_t id) const {
   const Socket* s = at(id);
   return s && s->proto == SocketProto::Tcp && s->tcp && s->tcp->failed();

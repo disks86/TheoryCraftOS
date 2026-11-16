@@ -97,6 +97,22 @@ class SocketManager {
   // True if send() would not block (always, in this polled model, once connected: the 16 KiB send buffer rarely fills against a wait()); for select()'s write set.
   bool ready_to_write(uint32_t id) const;
   bool has_error(uint32_t id) const;  // for select()'s exception set
+  // What a Linux program's socket calls want to know beyond that (LinuxInetSockets.cpp).
+  enum class State : uint8_t { None, Unconnected, Listening, Connecting, Connected, Failed };      // (a UDP socket is Unconnected or Connected; None: no such socket)
+  State state(uint32_t id) const;
+  bool peer_closed(uint32_t id) const;      // a TCP connection whose other end will send nothing more
+  bool is_bound(uint32_t id) const;
+  // Settings a program makes with setsockopt and reads back, and what its own calls did to the socket; the manager only keeps them.
+  struct Options {
+    uint64_t receive_timeout_ns = 0, send_timeout_ns = 0;      // SO_RCVTIMEO, SO_SNDTIMEO (0: none)
+    bool reuse_address = false, reuse_port = false, keep_alive = false, broadcast = false, no_delay = false;
+    bool linger_on = false;
+    uint32_t linger_seconds = 0;
+    uint32_t send_buffer = 0, receive_buffer = 0;      // SO_SNDBUF, SO_RCVBUF as last set (0: the default)
+    bool connect_started = false;      // connect() was called and has not been seen to finish
+    bool shut_read = false, shut_write = false;
+  };
+  Options* options(uint32_t id);
   // See IStackProvider: read progress() before an attempt that may block; wait_for_progress() returns when some stack did something (or the
   // timeout passed), false if the stacks cannot be waited on that way (then the caller sleeps).
   uint64_t progress() const { return stacks_.progress(); }
@@ -122,6 +138,7 @@ class SocketManager {
     // A connection ITcpSocket::accept() already gave up (it cannot be "peeked" without taking it): ready_to_read() caches one here so that checking readiness
     // (select(), or a non-blocking accept() that finds nothing yet) never drops a connection that arrived; the real accept() takes this one first if there is one.
     mutable SharedPointer<network::ITcpSocket> pending_accept;
+    Options options;
   };
   Socket* at(uint32_t id) { return id >= 1 && id <= kCapacity && sockets_[id - 1].used ? &sockets_[id - 1] : nullptr; }
   const Socket* at(uint32_t id) const { return id >= 1 && id <= kCapacity && sockets_[id - 1].used ? &sockets_[id - 1] : nullptr; }

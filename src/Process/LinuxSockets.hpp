@@ -38,6 +38,29 @@ bool is_pipe_descriptor(Process& p, uint64_t fd);
 // F_GETFL's access mode of a FIFO's end (0 O_RDONLY, 1 O_WRONLY, 2 O_RDWR); -1 for anything else.
 int fifo_access_mode(Process& p, uint64_t fd);
 uint64_t sys_eventfd2(Process& p, uint64_t initial, uint64_t flags);      // (eventfd(initial) is eventfd2(initial, 0))
+// --- AF_INET and AF_INET6 sockets (LinuxInetSockets.cpp): TCP and UDP over the network stacks, through the socket manager Windows programs use too
+// (Sockets.hpp). The socket calls above hand a descriptor of kind Socket on to these.
+bool is_inet_descriptor(Process& p, uint64_t fd);
+uint64_t inet_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol);
+uint64_t inet_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length);
+uint64_t inet_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length);
+uint64_t inet_listen(Process& p, uint64_t fd, uint64_t backlog);
+uint64_t inet_accept4(Process& p, uint64_t fd, uint64_t address, uint64_t length_at, uint64_t flags);
+uint64_t inet_sendto(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address, uint64_t address_length);
+uint64_t inet_recvfrom(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, uint64_t flags, uint64_t address, uint64_t length_at);
+uint64_t inet_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags);
+uint64_t inet_recvmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags);
+uint64_t inet_vector_io(Process& p, uint64_t fd, uint64_t vectors, uint64_t count, bool write);
+uint64_t inet_shutdown(Process& p, uint64_t fd, uint64_t how);
+uint64_t inet_getsockname(Process& p, uint64_t fd, uint64_t address, uint64_t length_at);
+uint64_t inet_getpeername(Process& p, uint64_t fd, uint64_t address, uint64_t length_at);
+uint64_t inet_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, uint64_t value, uint64_t length);
+uint64_t inet_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, uint64_t value, uint64_t length_at);
+uint64_t inet_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument);
+bool inet_non_blocking(Process& p, uint64_t fd);
+void set_inet_non_blocking(Process& p, uint64_t fd, bool on);
+// What poll() reports for the socket with this id, of the events asked for.
+uint16_t inet_poll_events(uint32_t id, uint16_t events);
 // Descriptors for things kept elsewhere (UnixSockets.hpp: create_linked): a POSIX message queue, a process (pidfd), a set of inotify watches.
 // A new one for `link`: the descriptor, or -errno (the owner's release hook has run then).
 uint64_t open_linked(Process& p, UnixType type, uint64_t link, uint32_t mode, bool close_on_exec, bool non_blocking);

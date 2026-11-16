@@ -79,6 +79,9 @@ Process::~Process() {
       else if (files_.kind(slot) == DescriptorKind::Mailslot) windowsabi::mailslot_token_release(files_.token(slot));
       else if (files_.kind(slot) == DescriptorKind::Key) windowsabi::key_token_release(files_.token(slot));
     }
+  } else {      // (no object manager: the sockets, which need none, are still let go)
+    for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot)
+      if (files_.kind(slot) == DescriptorKind::Socket || files_.kind(slot) == DescriptorKind::UnixSocket) descriptor_token_release(files_.kind(slot), files_.token(slot));
   }
 }
 
@@ -98,6 +101,7 @@ bool Process::close_descriptor(uint64_t slot) {
 
 void descriptor_token_add(DescriptorKind kind, uint64_t token) {
   if (kind == DescriptorKind::UnixSocket) { if (UnixSocketManager* sockets = system_unix_sockets()) sockets->add_ref(uint32_t(token)); return; }
+  if (kind == DescriptorKind::Socket) { windowsabi::socket_token_add(token); return; }      // (the network's sockets need no object manager)
   ObjectManager* objects = system_objects();
   if (!objects) return;
   if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_add(token);
@@ -109,6 +113,7 @@ void descriptor_token_add(DescriptorKind kind, uint64_t token) {
 
 void descriptor_token_release(DescriptorKind kind, uint64_t token) {
   if (kind == DescriptorKind::UnixSocket) { if (UnixSocketManager* sockets = system_unix_sockets()) sockets->release(uint32_t(token)); return; }
+  if (kind == DescriptorKind::Socket) { windowsabi::socket_token_release(token); return; }
   ObjectManager* objects = system_objects();
   if (!objects) return;
   if (kind == DescriptorKind::Pipe) windowsabi::pipe_token_release(token);
