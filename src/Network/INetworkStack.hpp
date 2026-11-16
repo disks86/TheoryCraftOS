@@ -19,6 +19,7 @@
 #pragma once
 #include "Hardware/NetworkInterface/NetworkTypes.hpp"
 #include "Network/Dhcp/IDhcpClient.hpp"
+#include "Network/Ip/RawSocket.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/StringView.hpp"
 #include "Network/Dns/IDnsResolver.hpp"
@@ -75,6 +76,15 @@ class INetworkStack {
   }
   // A new, unconnected TCP socket.
   virtual SharedPointer<ITcpSocket> tcp_open() = 0;
+  // A raw socket for IP protocol `protocol` (see RawSocket.hpp); `identifier` is an echo socket's (0: one nobody uses). Null if this stack has none to
+  // give, or the identifier is taken.
+  virtual SharedPointer<IRawSocket> raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) {
+    (void)v6;
+    (void)protocol;
+    (void)kind;
+    (void)identifier;
+    return SharedPointer<IRawSocket>();
+  }
 
   // Multicast reception (IGMPv2 on the link): after joining, datagrams addressed to `group` reach UDP sockets bound to their port, and
   // the interface is asked to deliver multicast frames. Up to 8 groups; joining twice counts once. Sending to a multicast address

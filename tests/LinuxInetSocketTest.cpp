@@ -533,7 +533,7 @@ static void test_options_and_errors() {
   CHECK(t.s(54, udp, 6, 1, t.word(1), 4) == -92 && t.s(54, tcp, 1, 9, t.word(1), 3) == -22 && t.s(54, tcp, 1, 9, kBad, 4) == -14 && t.s(54, tcp, 1, 20, t.word(1), 4) == -22);
   CHECK(t.s(55, tcp, 1, 3, small, kBad) == -14 && t.s(55, tcp, 1, 3, kBad, t.word(4)) == -14 && t.s(54, tcp, 1, 9, t.word(1), uint64_t(-1)) == -22);
   // what cannot be made
-  CHECK(t.s(41, kAfInet, 3, 0) == -94 && t.s(41, kAfInet, kStream, 17) == -93 && t.s(41, kAfInet, kDgram, 6) == -93 && t.s(41, kAfInet, kDgram, 1) == -93);
+  CHECK(t.s(41, kAfInet, 4 /* SOCK_RDM */, 0) == -94 && t.s(41, kAfInet, kStream, 17) == -93 && t.s(41, kAfInet, kDgram, 6) == -93);
   CHECK(t.s(41, kAfInet, kStream | 0x4000, 0) == -22 && t.s(41, 17 /* AF_PACKET */, kStream, 0) == -97 && t.s(41, kAfInet, 0, 0) == -22);
   // addresses: every length short of a whole one, a wrong family, a flipped bit anywhere: an error or a result, never anything else
   const uint64_t good = t.in4(10, 0, 0, 2, 9700);
@@ -1436,6 +1436,170 @@ static void test_netlink_sockets() {
   CHECK(t.s(3, fd) == 0 && t.s(45, fd, spare, 64, 0, 0, 0) == -9);
 }
 
+// --- raw and ICMP sockets -----------------------------------------------------------------------------------------------------------------------------------
+namespace raw {
+uint16_t checksum(const std::string& bytes) {
+  uint32_t sum = 0;
+  for (size_t i = 0; i < bytes.size(); i += 2) sum += uint32_t(uint8_t(bytes[i])) << 8 | (i + 1 < bytes.size() ? uint8_t(bytes[i + 1]) : 0);
+  while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+  return uint16_t(~sum);
+}
+// an ICMP message: type, code, checksum (computed unless `sum` is false), identifier, sequence, data
+std::string icmp(uint8_t type, uint16_t identifier, uint16_t sequence, const std::string& data, bool sum = true) {
+  std::string m;
+  m.push_back(char(type)); m.push_back(0); m.push_back(0); m.push_back(0);
+  m.push_back(char(identifier >> 8)); m.push_back(char(identifier)); m.push_back(char(sequence >> 8)); m.push_back(char(sequence));
+  m += data;
+  if (sum) { const uint16_t c = checksum(m); m[2] = char(c >> 8); m[3] = char(c); }
+  return m;
+}
+uint16_t be16(const std::string& b, size_t at) { return uint16_t(uint8_t(b[at]) << 8 | uint8_t(b[at + 1])); }
+}  // namespace raw
+
+static void test_raw_sockets() {
+  constexpr uint64_t kRaw = 3;
+  Setup t;
+  t.configure_ipv6();
+  const network::Ipv6Configuration a6 = t.lan.a.configuration6(), b6 = t.lan.b.configuration6();
+  const uint64_t buffer = t.alloc(2048), name = t.alloc(32), size = t.alloc(8);
+  uint32_t v = 0;
+  auto send_to = [&](int64_t fd, const std::string& bytes, uint64_t to, uint64_t to_size) { return t.s(44, fd, t.bytes(bytes), bytes.size(), 0, to, to_size); };
+  // what one datagram of a socket is, once there is one (empty: none came)
+  auto receive = [&](int64_t fd, std::string* from = nullptr, uint64_t name_size = 16) {
+    if (!t.lan.run_until([&] { return t.polled(fd, kPollIn) == kPollIn; }, 3000)) return std::string();
+    t.put32(size, uint32_t(name_size));
+    const int64_t n = t.s(45, fd, buffer, 2048, 0, name, size);
+    if (from) *from = t.text(name, t.u32(size));
+    return n > 0 ? t.text(buffer, uint64_t(n)) : std::string();
+  };
+  auto quiet = [&](int64_t fd) { t.lan.step(30); return t.polled(fd, kPollIn) == 0; };
+  // what there is and is not
+  CHECK(t.s(41, kAfInet, kRaw, 0) == -93 && t.s(41, kAfInet, kDgram, 58) == -93 && t.s(41, kAfInet6, kDgram, 1) == -93 && t.s(41, kAfInet6, kRaw, 255) == -93 && t.s(41, kAfInet, kStream, 1) == -93);
+
+  // An echo socket (SOCK_DGRAM, IPPROTO_ICMP): requests go out under the socket's identifier, whatever the program wrote; the reply comes back alone
+  const int64_t ping = t.s(41, kAfInet, kDgram | kNonBlock, 1);
+  CHECK(ping >= 3 && t.option(ping, 1, 3, &v) == 0 && v == kDgram && t.option(ping, 1, 38, &v) == 0 && v == 1 && t.polled(ping) == kPollOut);
+  const std::string request = raw::icmp(8, 0x1234, 7, "are you there?", false);
+  CHECK(send_to(ping, request, t.in4(10, 0, 0, 2, 0), 16) == int64_t(request.size()));
+  t.put32(size, 16);
+  CHECK(t.s(51, ping, name, size) == 0);
+  const uint16_t identifier = raw::be16(t.text(name, 4), 2);
+  std::string from, reply = receive(ping, &from);
+  CHECK(identifier != 0 && identifier != 0x1234 && reply.size() == request.size() && reply[0] == 0 && raw::be16(reply, 4) == identifier && raw::be16(reply, 6) == 7 &&
+        reply.substr(8) == "are you there?" && raw::checksum(reply) == 0 && from.substr(0, 8) == std::string("\x02\0\0\0\x0A\0\0\x02", 8));
+  // the machine itself answers too; a connected one needs no address; the reply can be looked at first
+  CHECK(send_to(ping, raw::icmp(8, 0, 8, "self"), t.in4(127, 0, 0, 1, 0), 16) == 12);
+  reply = receive(ping, &from);
+  CHECK(reply.size() == 12 && reply[0] == 0 && raw::be16(reply, 6) == 8 && from.substr(4, 4) == std::string("\x7F\0\0\x01", 4));
+  CHECK(t.s(42, ping, t.in4(10, 0, 0, 2, 0), 16) == 0 && t.s(1, ping, t.bytes(raw::icmp(8, 0, 9, "connected")), 17) == 17 &&
+        t.lan.run_until([&] { return t.polled(ping, kPollIn) == kPollIn; }, 3000) && t.s(45, ping, buffer, 4, 0x22 /* MSG_PEEK | MSG_TRUNC */, 0, 0) == 17 && t.s(0, ping, buffer, 64) == 17);
+  // what is not an echo request; a second socket's own identifier, and one that is taken
+  CHECK(send_to(ping, raw::icmp(0, 0, 1, "reply"), t.in4(10, 0, 0, 2, 0), 16) == -22 && send_to(ping, "\x08\0\0", t.in4(10, 0, 0, 2, 0), 16) == -22 &&
+        send_to(ping, std::string(1481, '\x08'), t.in4(10, 0, 0, 2, 0), 16) == -90 && t.s(54, ping, 0, 3, t.word(1), 4) == -92);
+  const int64_t other = t.s(41, kAfInet, kDgram | kNonBlock, 1), third = t.s(41, kAfInet, kDgram, 1);
+  CHECK(t.s(49, other, t.in4(0, 0, 0, 0, 777), 16) == 0 && t.s(49, third, t.in4(0, 0, 0, 0, 777), 16) == -98);
+  t.put32(size, 16);
+  CHECK(t.s(51, other, name, size) == 0 && raw::be16(t.text(name, 4), 2) == 777 && send_to(other, raw::icmp(8, 1, 1, "mine"), t.in4(10, 0, 0, 2, 0), 16) == 12);
+  reply = receive(other);
+  CHECK(reply.size() == 12 && raw::be16(reply, 4) == 777 && quiet(ping));      // (and the first socket hears nothing of it)
+  CHECK(t.s(3, third) == 0 && t.s(3, other) == 0);
+
+  // A raw ICMP socket: what it sends is the ICMP message as the program made it, what it gets is whole packets, IP header first
+  const int64_t icmp = t.s(41, kAfInet, kRaw | kNonBlock, 1);
+  CHECK(icmp >= 3 && t.option(icmp, 1, 3, &v) == 0 && v == kRaw && t.option(icmp, 1, 38, &v) == 0 && v == 1 && t.option(icmp, 0, 2, &v) == 0 && v == 64);
+  SharedPointer<network::IRawSocket> watcher = t.lan.b.raw_open(false, 1, network::RawKind::Packets, 0);      // (the other machine, listening to what arrives)
+  uint8_t seen[1500];
+  network::IpAddress seen_from;
+  uint16_t seen_port = 0;
+  uint32_t seen_length = 0;
+  CHECK(watcher && send_to(icmp, raw::icmp(8, 0x5151, 1, "raw request"), t.in4(10, 0, 0, 2, 0), 16) == 19);
+  std::string packet = receive(icmp, &from);
+  CHECK(packet.size() == 20 + 19 && packet[0] == 0x45 && packet[9] == 1 && packet.substr(12, 8) == std::string("\x0A\0\0\x02\x0A\0\0\x01", 8) && raw::be16(packet, 2) == 39 &&
+        packet[20] == 0 && raw::be16(packet, 24) == 0x5151 && packet.substr(28) == "raw request" && from.substr(0, 8) == std::string("\x02\0\0\0\x0A\0\0\x02", 8) && quiet(ping));
+  CHECK(watcher->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen_length == 39 && seen[8] == 64 && seen[20] == 8);      // (the request as it arrived there: TTL 64)
+  // IP_TTL: how far its packets may go
+  CHECK(t.s(54, icmp, 0, 2, t.word(3), 4) == 0 && t.option(icmp, 0, 2, &v) == 0 && v == 3 && t.s(54, icmp, 0, 2, t.word(0), 4) == -22 && t.s(54, icmp, 0, 2, t.word(256), 4) == -22);
+  CHECK(send_to(icmp, raw::icmp(8, 0x5151, 2, "short lived"), t.in4(10, 0, 0, 2, 0), 16) == 19 && !receive(icmp).empty());
+  CHECK(watcher->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen[8] == 3);
+  CHECK(t.s(54, icmp, 0, 2, t.word(0xFFFFFFFFu), 4) == 0 && t.option(icmp, 0, 2, &v) == 0 && v == 64);
+  // over the loopback it hears its own request and the answer; ICMP_FILTER keeps the requests away
+  CHECK(send_to(icmp, raw::icmp(8, 0x5151, 3, "loop"), t.in4(127, 0, 0, 1, 0), 16) == 12);
+  packet = receive(icmp);
+  std::string second = receive(icmp);
+  CHECK(packet.size() == 32 && second.size() == 32 && packet[20] == 8 && second[20] == 0 && packet.substr(12, 4) == std::string("\x7F\0\0\x01", 4));
+  CHECK(t.s(54, icmp, 255, 1, t.word(1u << 8), 4) == 0 && t.option(icmp, 255, 1, &v) == 0 && v == 0x100 && send_to(icmp, raw::icmp(8, 0x5151, 4, "loop"), t.in4(127, 0, 0, 1, 0), 16) == 12);
+  packet = receive(icmp);
+  CHECK(packet.size() == 32 && packet[20] == 0 && quiet(icmp));
+  CHECK(t.s(54, icmp, 255, 1, t.word(0), 4) == 0 && t.s(54, icmp, 255, 1, t.word(0), 2) == -22 && t.s(54, ping, 255, 1, t.word(0), 4) == -92);
+  // recvmsg says where it arrived (IP_PKTINFO), as for any datagram
+  {
+    const uint64_t vectors = t.alloc(16), message = t.alloc(56), control = t.alloc(64);
+    CHECK(t.s(54, icmp, 0, 8, t.word(1), 4) == 0 && send_to(icmp, raw::icmp(8, 0x5151, 5, "info"), t.in4(10, 0, 0, 2, 0), 16) == 12 &&
+          t.lan.run_until([&] { return t.polled(icmp, kPollIn) == kPollIn; }, 3000));
+    t.put64(vectors, buffer); t.put64(vectors + 8, 2048);
+    t.put64(message, name); t.put32(message + 8, 16); t.put64(message + 16, vectors); t.put64(message + 24, 1); t.put64(message + 32, control); t.put64(message + 40, 64);
+    CHECK(t.s(47, icmp, message, 0) == 32 && t.u64(message + 40) == 32 && t.text(control + 16, 12) == std::string("\x02\0\0\0\x0A\0\0\x01\x0A\0\0\x01", 12));
+  }
+  // IP_HDRINCL: the program writes the whole packet; where it goes, what it carries and its TTL are taken from it. Here a UDP datagram, which the other
+  // machine's UDP socket gets (the stack filled in the checksum).
+  SharedPointer<network::IUdpSocket> peer = t.lan.b.udp_open_families(9950, network::IpFamilies::Both);
+  SharedPointer<network::IRawSocket> udp_watcher = t.lan.b.raw_open(false, 17, network::RawKind::Packets, 0);
+  const int64_t whole = t.s(41, kAfInet, kRaw, 17);
+  std::string datagram("\x30\x39\x26\xDE\0\x0D\0\0hello", 13);      // from port 12345 to port 9950, 13 bytes, no checksum yet
+  std::string header("\x45\0\0\0\0\0\0\0\x09\x11\0\0\0\0\0\0\x0A\0\0\x02", 20);
+  CHECK(peer && udp_watcher && t.s(54, whole, 0, 3, t.word(1), 4) == 0 && t.option(whole, 0, 3, &v) == 0 && v == 1);
+  CHECK(send_to(whole, header + datagram, t.in4(10, 0, 0, 2, 0), 16) == 33 && t.lan.run_until([&] { return peer->pending() > 0; }, 3000));
+  CHECK(peer->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen_length == 5 && seen_port == 12345 && memcmp(seen, "hello", 5) == 0);
+  CHECK(udp_watcher->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen_length == 33 && seen[8] == 9 && seen[9] == 17 && seen[12] == 10 && seen[15] == 1);
+  CHECK(send_to(whole, header.substr(0, 12), t.in4(10, 0, 0, 2, 0), 16) == -22 && send_to(whole, std::string("\x65", 1) + header.substr(1) + datagram, t.in4(10, 0, 0, 2, 0), 16) == -22 &&
+        send_to(whole, std::string("\x4F", 1) + header.substr(1) + datagram, t.in4(10, 0, 0, 2, 0), 16) == -22);
+  // without it the socket's own protocol is written; and a raw UDP socket hears the datagrams that come for the machine, header and all
+  CHECK(t.s(54, whole, 0, 3, t.word(0), 4) == 0 && send_to(whole, datagram, t.in4(10, 0, 0, 2, 0), 16) == 13 && t.lan.run_until([&] { return peer->pending() > 0; }, 3000));
+  CHECK(peer->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen_length == 5);
+  CHECK(peer->send_to_ip(network::IpAddress(network::Ipv4Address::make(10, 0, 0, 1)), 4000, ConstByteView(reinterpret_cast<const uint8_t*>("back"), 4)));
+  packet = receive(whole);
+  CHECK(packet.size() == 20 + 8 + 4 && packet[9] == 17 && raw::be16(packet, 22) == 4000 && packet.substr(28) == "back");
+  // IPPROTO_RAW: only sends, always whole packets
+  const int64_t sender = t.s(41, kAfInet, kRaw | kNonBlock, 255);
+  std::string echo_header("\x45\0\0\0\0\0\0\0\x05\x01\0\0\0\0\0\0\x0A\0\0\x02", 20);
+  CHECK(sender >= 3 && t.option(sender, 0, 3, &v) == 0 && v == 1 && send_to(sender, raw::icmp(8, 1, 1, "x"), t.in4(10, 0, 0, 2, 0), 16) == -22);
+  while (watcher->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length)) {}
+  CHECK(send_to(sender, echo_header + raw::icmp(8, 0x6161, 1, "by hand"), t.in4(10, 0, 0, 2, 0), 16) == 35 && t.lan.run_until([&] { return watcher->pending() > 0; }, 3000));
+  CHECK(watcher->receive_from_ip(ByteView(seen), &seen_from, &seen_port, &seen_length) && seen_length == 35 && seen[8] == 5 && seen[20] == 8 && quiet(sender));
+  packet = receive(icmp);      // (the answer comes to the raw ICMP socket)
+  CHECK(packet.size() == 35 && raw::be16(packet, 24) == 0x6161);
+  CHECK(t.s(3, sender) == 0 && t.s(3, whole) == 0);
+
+  // IPv6: an echo socket, and a raw ICMPv6 socket (no IP header in what it gets; the checksum is the stack's to write) with ICMP6_FILTER
+  const int64_t ping6 = t.s(41, kAfInet6, kDgram | kNonBlock, 58), icmp6 = t.s(41, kAfInet6, kRaw | kNonBlock, 58);
+  CHECK(ping6 >= 3 && icmp6 >= 3 && t.option(icmp6, 1, 38, &v) == 0 && v == 58);
+  // (the raw one hears neighbour discovery too: only echo replies are wanted here)
+  const uint64_t filter = t.alloc(32);
+  for (int i = 0; i < 8; ++i) t.put32(filter + 4 * uint64_t(i), i == 4 ? ~(1u << 1) : 0xFFFFFFFFu);      // everything but type 129
+  CHECK(t.s(54, icmp6, 58, 1, filter, 32) == 0 && t.s(54, icmp6, 58, 1, filter, 16) == -22 && t.s(54, icmp6, 255, 1, filter, 4) == -92);
+  t.put32(size, 32);
+  CHECK(t.s(55, icmp6, 58, 1, buffer, size) == 0 && t.u32(size) == 32 && t.u32(buffer + 16) == ~(1u << 1));
+  while (t.s(45, icmp6, buffer, 2048, 0, 0, 0) > 0) {}
+  CHECK(send_to(ping6, raw::icmp(128, 0, 1, "six", false), t.in6(b6.global, 0), 28) == 11);
+  reply = receive(ping6, &from, 28);
+  CHECK(reply.size() == 11 && uint8_t(reply[0]) == 129 && raw::be16(reply, 6) == 1 && reply.substr(8) == "six" && from.size() == 28 && memcmp(from.data() + 8, b6.global.bytes, 16) == 0);
+  reply = receive(icmp6);      // (the raw socket heard that reply as well)
+  CHECK(reply.size() == 11 && uint8_t(reply[0]) == 129);
+  CHECK(send_to(icmp6, raw::icmp(128, 0x7171, 2, "raw six", false), t.in6(b6.global, 0), 28) == 15);
+  reply = receive(icmp6, &from, 28);
+  CHECK(reply.size() == 15 && uint8_t(reply[0]) == 129 && raw::be16(reply, 4) == 0x7171 && reply.substr(8) == "raw six" && quiet(icmp6) && quiet(ping6));
+  CHECK(t.s(54, icmp6, 41, 16, t.word(9), 4) == 0 && t.option(icmp6, 41, 16, &v) == 0 && v == 9);
+  (void)a6;
+  // closed sockets hear nothing more and their identifiers are free again
+  CHECK(t.s(3, ping) == 0 && t.s(3, icmp) == 0 && t.s(3, ping6) == 0 && t.s(3, icmp6) == 0);
+  const int64_t again = t.s(41, kAfInet, kDgram, 1);
+  CHECK(t.s(49, again, t.in4(0, 0, 0, 0, identifier), 16) == 0 && t.s(3, again) == 0);
+  for (int i = 0; i < 300; ++i) {
+    const int64_t one = t.s(41, kAfInet, kRaw, 1);
+    CHECK(one >= 3 && t.s(3, one) == 0);
+  }
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -1450,6 +1614,7 @@ int main() {
   test_control_messages();
   test_netlink_messages();
   test_netlink_sockets();
+  test_raw_sockets();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

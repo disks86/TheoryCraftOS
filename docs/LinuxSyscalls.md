@@ -15,7 +15,7 @@ number means a call newer than this list.
 | Threads | `LinuxThreads.cpp` | clone, clone3 (threads), futex, futex_waitv, futex_wake, futex_wait, futex_requeue, set_tid_address, gettid, exit, sched_getaffinity |
 | Processes | `LinuxProcess.cpp`, `LinuxExec.cpp` | fork, vfork, clone and clone3 (processes), execve, execveat, wait4, waitid, exit_group, the uid/gid/group calls, getpgid, setpgid, getsid, setsid, capget, capset, getrlimit, setrlimit, prlimit64, getrusage, times, sysinfo, getpriority, setpriority, the sched_* calls, getcpu, personality, prctl, membarrier, robust lists, kcmp, pidfd_open, pidfd_send_signal, pidfd_getfd, process_mrelease |
 | Signals | `LinuxSignals.cpp` | rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigtimedwait, rt_sigsuspend, pause, sigaltstack, kill, tkill, tgkill, rt_sigqueueinfo, alarm, getitimer, setitimer, timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete |
-| Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
+| Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 (TCP, UDP, raw, ICMP echo) and AF_NETLINK sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
 | Time | `LinuxSyscalls.cpp` | clock_gettime, clock_getres, clock_nanosleep, nanosleep, gettimeofday, time |
 | System V IPC | `LinuxIpc.cpp` | shmget, shmat, shmdt, shmctl, semget, semop, semtimedop, semctl, msgget, msgsnd, msgrcv, msgctl |
 | POSIX message queues | `LinuxIpc.cpp` | mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify, mq_getsetattr |
@@ -149,7 +149,28 @@ socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback 
   taken, `SCM_RIGHTS`, `SCM_CREDENTIALS` and another family's messages are passed over, anything else of the socket's own levels or
   not whole is `EINVAL`, more than 20480 bytes `ENOBUFS`. (Descriptors and credentials travel over `AF_UNIX` sockets, see above.)
 - Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `bind` uses every interface
-  whatever address it names; no raw or ICMP sockets, no multicast membership; 256 sockets in the system.
+  whatever address it names; no multicast membership; 256 sockets in the system.
+
+**Raw and ICMP sockets.** What `ping` and `traceroute` are made of. The network stack has a raw socket (`src/Network/Ip/RawSocket.cpp`)
+that is shown every IP packet arriving for the machine; the socket manager holds it as a datagram socket whose datagrams are packets, so
+`connect`, `MSG_PEEK`, `poll` and the control messages above work as for UDP.
+
+- `socket(AF_INET or AF_INET6, SOCK_RAW, protocol)` for any IP protocol: it gets every packet of that protocol that comes for the
+  machine, also the ones a TCP, UDP or echo socket gets. Of IPv4 it gets the whole packet, IP header first; of IPv6 what follows the
+  headers. What it sends is the protocol's own bytes, as the program made them (an ICMPv6 message gets its checksum written, since
+  that covers the addresses; so do TCP and UDP). Over the loopback a raw ICMP socket hears its own echo request and the answer.
+- `SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6` is an echo ("ping") socket, open to every program: only echo requests can be
+  sent (`EINVAL` otherwise), they go out under the socket's own identifier whatever the program wrote (`bind`'s port, or one nobody
+  uses, which `getsockname` shows), with the checksum written, and only the replies to them come back, without an IP header.
+- `IP_HDRINCL` (always on for `IPPROTO_RAW`, which only sends): the program hands in a whole IPv4 packet. Its destination, protocol,
+  time to live and what follows the header are used; the header itself is written anew (source address, identification, lengths,
+  checksum), and IP options are not carried.
+- `IP_TTL` and `IPV6_UNICAST_HOPS` set how far a raw or echo socket's packets go. `ICMP_FILTER` (`SOL_RAW`) and `ICMP6_FILTER` keep
+  ICMP messages away by type. `IPV6_CHECKSUM` is taken.
+- Limits: a packet has to fit one frame (no fragments either way); a raw socket hears one network interface (the first with an
+  address) and the loopback; the stack answers echo requests and neighbour discovery itself whatever a raw socket does, and sends no
+  "port unreachable" or "time exceeded" of its own; a received packet's TTL is in its IPv4 header but still 64 in a control message;
+  `bind` to an address is not a filter; two echo sockets cannot share an identifier (some Linux kernels allow it).
 
 **Netlink.** `socket(AF_NETLINK, SOCK_RAW or SOCK_DGRAM, ...)` is how a program asks the kernel about the network and hears of changes
 to it (`getifaddrs`, `if_nameindex`, `ip addr`). The kernel's side is `LinuxNetlinkMessages.cpp` (requests in, datagrams out, knowing
@@ -230,7 +251,7 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, raw sockets. Of netlink: changing the
+  real TTL, TOS and arrival time of a received packet, the error queue, fragments, `AF_PACKET`. Of netlink: changing the
   network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
@@ -249,13 +270,14 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, and `netlinktest.c`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets (on Linux it runs in a network namespace of its own, where it may open them), and `netlinktest.c`
   for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
   datagrams, the loopback, IPv6, epoll, options, bad addresses), the files for finding hosts by name with a resolver's exchange
   with a DNS server, and netlink: the messages on their own (every request, cut short anywhere and with any bit flipped) and the
-  sockets through the system calls, a change of address told to a listener among them.
+  sockets through the system calls, a change of address told to a listener among them; and raw and echo sockets against the second
+  machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters).
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for
   `.localhost` and `.invalid` by itself, as systemd-resolved does). The expected output is the dynamically linked build's: a static

@@ -222,7 +222,16 @@ int64_t send_bytes(Process& p, const Inet& s, ConstByteView data, uint64_t flags
     if (data.size() > kLargestDatagram) return -kEmsgsize;
     if (!to && s.sockets->state(s.id) != SocketManager::State::Connected) return -kEdestaddrreq;
     // (the stack sends no fragments: a datagram has to fit one frame)
-    if (data.size() > 1472) return -kEmsgsize;
+    if (s.sockets->is_raw(s.id)) {
+      // A raw socket's datagram is an IP packet's contents, or with IP_HDRINCL (and always for IPPROTO_RAW) a whole packet; an echo socket's is an
+      // echo request.
+      const bool ipv6 = s.sockets->is_ipv6(s.id), whole = !ipv6 && (options->header_included || s.sockets->raw_protocol(s.id) == 255);
+      if (data.size() > (whole ? 1500u : ipv6 ? 1460u : 1480u)) return -kEmsgsize;
+      if (whole && (data.size() < 20 || (data[0] >> 4) != 4 || (data[0] & 0x0Fu) < 5 || (data[0] & 0x0Fu) * 4u > data.size())) return -kEinval;
+      if (s.sockets->is_echo(s.id) && (data.size() < 8 || data[0] != (ipv6 ? 128 : 8) || data[1] != 0)) return -kEinval;
+    } else if (data.size() > 1472) {
+      return -kEmsgsize;
+    }
     uint32_t status = 0, sent = 0;
     if (const int64_t r = wait_for(p, s, dont_wait, timeout, &status, [&](bool* would_block) { return s.sockets->send(s.id, data, to, to_port, &sent, would_block); }); r < 0) return r;
     return status != 0 ? -errno_of(status) : int64_t(sent);
@@ -350,13 +359,18 @@ bool is_inet_descriptor(Process& p, uint64_t fd) { return p.files().kind(fd) == 
 uint64_t inet_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol) {
   const uint64_t base = type & 0xF, extra = type & ~uint64_t{0xF};
   if (extra & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
-  if (base != kSockStream && base != kSockDgram) return error(base == 3 /* SOCK_RAW */ || base == 5 || base == 4 || base == 10 ? kEsocktnosupport : kEinval);
-  if (protocol != 0 && protocol != (base == kSockStream ? 6u : 17u)) return error(kEprotonosupport);      // IPPROTO_TCP, IPPROTO_UDP (no ICMP sockets)
+  constexpr uint64_t kSockRaw = 3;
+  if (base != kSockStream && base != kSockDgram && base != kSockRaw) return error(base == 5 || base == 4 || base == 10 ? kEsocktnosupport : kEinval);
+  // SOCK_RAW with any IP protocol (IPPROTO_RAW, 255, only sends, and only IPv4), and SOCK_DGRAM with the family's ICMP: an echo ("ping") socket.
+  const bool raw = base == kSockRaw, echo = base == kSockDgram && protocol == (domain == kAfInet6 ? 58u : 1u);
+  if (raw && (protocol == 0 || protocol > 255 || (protocol == 255 && domain == kAfInet6))) return error(kEprotonosupport);
+  if (!raw && !echo && protocol != 0 && protocol != (base == kSockStream ? 6u : 17u)) return error(kEprotonosupport);      // IPPROTO_TCP, IPPROTO_UDP
   SocketManager* sockets = system_sockets();
   if (!sockets) return error(kEafnosupport);      // (no network interface, so no network stack yet)
-  const SocketManager::Created made = sockets->create(base == kSockStream ? SocketProto::Tcp : SocketProto::Udp, domain == kAfInet6);
+  const SocketManager::Created made = raw || echo ? sockets->create_raw(domain == kAfInet6, uint8_t(protocol), echo)
+                                                  : sockets->create(base == kSockStream ? SocketProto::Tcp : SocketProto::Udp, domain == kAfInet6);
   if (made.id == 0) return error(kEnfile);
-  if (domain == kAfInet6) sockets->set_v6_only(made.id, false);      // (Linux's default: an IPv6 socket takes IPv4 too)
+  if (domain == kAfInet6 && !raw && !echo) sockets->set_v6_only(made.id, false);      // (Linux's default: an IPv6 socket takes IPv4 too)
   if (extra & kSockNonBlock) sockets->set_non_blocking(made.id, true);
   return give_descriptor(p, *sockets, made.id, (extra & kSockCloexec) != 0);
 }
@@ -867,6 +881,34 @@ uint64_t inet_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
       default: return error(kEnoprotoopt);
     }
   }
+  const bool raw = s.sockets->is_raw(s.id);
+  if (raw && ((level == kIpprotoIp && name == 2 && !s.sockets->is_ipv6(s.id)) || (level == kIpprotoIpv6 && name == 16 && s.sockets->is_ipv6(s.id)))) {
+    // IP_TTL, IPV6_UNICAST_HOPS: how far a raw socket's packets may go (what traceroute turns up one by one); -1 is the usual again
+    if (int32_t(number) == -1) number = 0;
+    else if (number < 1 || number > 255) return error(kEinval);
+    options->hop_limit = uint8_t(number);
+    s.sockets->apply_raw_options(s.id);
+    return 0;
+  }
+  if (raw && level == kIpprotoIp && name == 3 && !s.sockets->is_ipv6(s.id)) {      // IP_HDRINCL: what is sent is a whole packet
+    if (s.sockets->is_echo(s.id)) return error(kEnoprotoopt);
+    options->header_included = number != 0;
+    s.sockets->apply_raw_options(s.id);
+    return 0;
+  }
+  if (raw && !s.sockets->is_echo(s.id) && name == 1 &&
+      ((level == 255 && s.sockets->raw_protocol(s.id) == 1 && !s.sockets->is_ipv6(s.id)) || (level == 58 && s.sockets->raw_protocol(s.id) == 58 && s.sockets->is_ipv6(s.id)))) {
+    // ICMP_FILTER (SOL_RAW: one word, the types 0..31) and ICMP6_FILTER (eight words, every type): a set bit keeps that type of message away
+    uint8_t bytes[32] = {};
+    const uint64_t size = level == 255 ? 4 : 32;
+    if (length < size) return error(kEinval);
+    if (!p.read_user(value, ByteView(bytes).first(size))) return error(kEfault);
+    ByteReader in{ConstByteView(bytes)};
+    for (uint32_t& word : options->blocked_types) word = in.le32();
+    s.sockets->apply_raw_options(s.id);
+    return 0;
+  }
+  if (raw && level == kIpprotoIpv6 && name == 7 && s.sockets->is_ipv6(s.id)) return 0;      // IPV6_CHECKSUM (only ICMPv6 gets one, always)
   if (level == kIpprotoIp) {
     if (s.sockets->is_ipv6(s.id) && s.sockets->v6_only(s.id)) return error(kEnoprotoopt);
     switch (name) {
@@ -922,9 +964,9 @@ uint64_t inet_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
   const bool tcp = s.sockets->is_tcp(s.id);
   if (level == kSolSocket) {
     switch (name) {
-      case kSoType: return number(tcp ? uint32_t(kSockStream) : uint32_t(kSockDgram));
+      case kSoType: return number(tcp ? uint32_t(kSockStream) : s.sockets->is_raw(s.id) && !s.sockets->is_echo(s.id) ? 3 : uint32_t(kSockDgram));
       case kSoDomain: return number(s.sockets->is_ipv6(s.id) ? uint32_t(kAfInet6) : uint32_t(kAfInet));
-      case kSoProtocol: return number(tcp ? 6 : 17);
+      case kSoProtocol: return number(tcp ? 6 : s.sockets->is_raw(s.id) ? s.sockets->raw_protocol(s.id) : 17);
       case kSoError: return number(pending_error(s));
       case kSoAcceptConn: return number(s.sockets->state(s.id) == SocketManager::State::Listening);
       case kSoReuseAddr: return number(options->reuse_address);
@@ -969,8 +1011,16 @@ uint64_t inet_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
   if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvPktInfo) return number(options->packet_info6);
   if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvHopLimit) return number(options->receive_hop_limit);
   if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvTclass) return number(options->receive_traffic_class);
-  if (level == kIpprotoIp && (name == 1 || name == 2)) return number(name == 2 ? 64 : 0);      // IP_TOS, IP_TTL
-  if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == 16) return number(64);      // IPV6_UNICAST_HOPS
+  const uint32_t hops = s.sockets->is_raw(s.id) && options->hop_limit != 0 ? options->hop_limit : 64;
+  if (level == kIpprotoIp && (name == 1 || name == 2)) return number(name == 2 ? hops : 0);      // IP_TOS, IP_TTL
+  if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == 16) return number(hops);      // IPV6_UNICAST_HOPS
+  if (s.sockets->is_raw(s.id) && level == kIpprotoIp && name == 3) return number(options->header_included || s.sockets->raw_protocol(s.id) == 255);      // IP_HDRINCL
+  if (s.sockets->is_raw(s.id) && !s.sockets->is_echo(s.id) && name == 1 && (level == 255 || level == 58) && s.sockets->raw_protocol(s.id) == (level == 255 ? 1 : 58)) {
+    uint8_t raw[32];      // ICMP_FILTER, ICMP6_FILTER
+    ByteWriter w{ByteView(raw, sizeof(raw))};
+    for (const uint32_t word : options->blocked_types) w.le32(word);
+    return answer(ConstByteView(raw, level == 255 ? 4 : 32));
+  }
   return error(kEnoprotoopt);
 }
 

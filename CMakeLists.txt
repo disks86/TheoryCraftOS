@@ -216,6 +216,7 @@ add_executable(BOOTX64
   src/Network/Quic/Http3.cpp
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
+  src/Network/Ip/RawSocket.cpp
   src/Network/Udp/UdpManager.cpp
   src/Network/Tcp/TcpSocket.cpp
   src/Network/Tcp/TcpManager.cpp

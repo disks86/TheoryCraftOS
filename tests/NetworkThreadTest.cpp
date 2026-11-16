@@ -744,6 +744,78 @@ static void test_udp_threads() {
   CHECK(corrupt == 0 && echoed >= sent * 9 / 10);
 }
 
+// Raw sockets, several threads: on machine A three threads send echo requests from one echo socket to B (whose stack answers them) while a fourth reads
+// the replies, a fifth opens, filters and closes raw ICMP sockets all the while (the list every arriving packet is shown to changes under the
+// deliveries), and a raw socket that stays open counts what it hears. Every reply that comes back is intact.
+static void test_raw_threads() {
+  Machines m(2);
+  constexpr int kSenders = 3;
+  constexpr uint32_t kPerSender = 300, kSize = 200;
+  SharedPointer<IRawSocket> echo = m.a.at(0)->raw_open(false, kProtocolIcmp, RawKind::Echo, 0);
+  SharedPointer<IRawSocket> listener = m.a.at(0)->raw_open(false, kProtocolIcmp, RawKind::Packets, 0);
+  CHECK(echo && listener && echo->local_port() != 0);
+  if (!echo || !listener) return;
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> sent{0}, answered{0}, corrupt{0}, heard{0}, opened{0};
+  std::thread reader([&] {
+    uint8_t buffer[2000];
+    while (!stop) {
+      uint32_t length;
+      const uint64_t seen = m.a.progress();
+      bool any = false;
+      while (echo->receive_from_ip(ByteView(buffer), nullptr, nullptr, &length)) {
+        any = true;
+        bool good = length == kSize && buffer[0] == 0 && (uint16_t(buffer[4]) << 8 | buffer[5]) == echo->local_port();
+        for (uint32_t i = 12; good && i < kSize; ++i) good = buffer[i] == uint8_t(buffer[8] * 31 + buffer[9] + buffer[10] * 7 + i);
+        if (good) ++answered;
+        else ++corrupt;
+      }
+      while (listener->receive_from_ip(ByteView(buffer), nullptr, nullptr, &length)) {      // whole packets: an IP header, then the reply
+        any = true;
+        if (length == 20 + kSize && buffer[0] == 0x45 && buffer[9] == kProtocolIcmp && buffer[20] == 0) ++heard;
+        else ++corrupt;
+      }
+      if (!any) m.a.wait_for_progress(seen, 5);
+    }
+  });
+  std::thread opener([&] {
+    while (!stop) {
+      SharedPointer<IRawSocket> one = m.a.at(0)->raw_open(false, kProtocolIcmp, RawKind::Packets, 0);
+      if (!one) continue;
+      const uint32_t blocked[IRawSocket::kTypeWords] = {opened % 2 ? 1u : 0u};      // (every other one keeps the replies away)
+      one->set_blocked_types(ArrayView<const uint32_t>(blocked));
+      one->set_hop_limit(uint8_t(1 + opened % 60));
+      ++opened;
+      std::this_thread::yield();
+      one->close();
+    }
+  });
+  std::vector<std::thread> senders;
+  for (int t = 0; t < kSenders; ++t)
+    senders.emplace_back([&, t] {
+      uint8_t d[kSize] = {};
+      for (uint32_t n = 0; n < kPerSender; ++n) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (sent - answered - corrupt >= 16 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        d[0] = 8;      // an echo request; the socket writes the identifier and the checksum
+        d[8] = uint8_t(t);
+        d[9] = uint8_t(n);
+        d[10] = uint8_t(n >> 8);
+        for (uint32_t i = 12; i < kSize; ++i) d[i] = uint8_t(d[8] * 31 + d[9] + d[10] * 7 + i);
+        if (echo->send_to(Ipv4Address::make(10, 0, 0, 2), 0, ConstByteView(d, kSize))) ++sent;
+      }
+    });
+  for (std::thread& t : senders) t.join();
+  wait_until(m.a, [&] { return answered + corrupt >= sent; }, 10);
+  stop = true;
+  opener.join();
+  reader.join();
+  printf("raw threads: %u echo requests from %d threads on one socket, %u answered intact, %u corrupt; a raw socket heard %u; %u raw sockets came and went\n", sent.load(), kSenders,
+         answered.load(), corrupt.load(), heard.load(), opened.load());
+  CHECK(sent == kSenders * kPerSender);
+  CHECK(corrupt == 0 && answered >= sent * 9 / 10 && heard >= sent / 2 && opened > 10);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
@@ -755,6 +827,7 @@ int main() {
   test_one_connection_threads();
   test_backlog();
   test_udp_threads();
+  test_raw_threads();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

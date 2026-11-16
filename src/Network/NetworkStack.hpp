@@ -110,6 +110,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   bool ping(Ipv4Address address, uint32_t timeout_ms, uint32_t* rtt_ms) override;
   SharedPointer<IUdpSocket> udp_open(uint16_t port) override { return udp_open_families(port, IpFamilies::Both); }
   SharedPointer<IUdpSocket> udp_open_families(uint16_t port, IpFamilies families) override;
+  SharedPointer<IRawSocket> raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) override;
   SharedPointer<ITcpSocket> tcp_open() override;
   bool join_multicast(Ipv4Address group) override;
   void leave_multicast(Ipv4Address group) override;
@@ -122,6 +123,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   uint32_t max_payload() const override { return kMaxIpPayload; }
   uint64_t now_ms() const override { return clock_.now_ms(); }
   bool send_ip(Ipv4Address destination, uint8_t protocol, ConstByteView payload) override;
+  bool send_raw(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t hop_limit) override;
   bool send_ip_from(Ipv4Address source, Ipv4Address destination, uint8_t protocol, ConstByteView payload,
                     bool link_broadcast) override;
   uint32_t max_segmented_payload(const IpAddress& destination) const override;
@@ -277,7 +279,9 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   kernel::ConditionVariable progress_cv_;
   void note_progress();
   uint8_t outgoing_ecn_ = kEcnNotEct;   // the ECN field of the IP packet being built (set by send_ip_to for its call, under ip_lock_)
+  uint8_t outgoing_ttl_ = 0;            // the time to live of the IPv4 packet being built, if not the usual one (set by send_raw for its call, under ip_lock_)
   UdpManager udp_;
+  RawManager raw_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;
   UniquePointer<DhcpClient> dhcp_;

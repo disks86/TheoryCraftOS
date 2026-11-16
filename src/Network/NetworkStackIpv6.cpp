@@ -209,6 +209,7 @@ void NetworkStack::handle_ipv6(ConstByteView packet, bool looped, const hardware
   if (next == kHeaderFragment) return;
 
   const IpAddress from(source), to(destination);
+  raw_.deliver(true, next, from, payload, 0);      // (raw sockets see every packet that is for this machine)
   if (next == kProtocolIcmpv6) {
     handle_icmpv6(source, destination, hop_limit, payload, looped);
   } else if (next == kProtocolUdp) {

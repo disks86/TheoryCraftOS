@@ -64,6 +64,13 @@ class IIpLayer {
     return !destination.v6 && send_ip(destination.ipv4, protocol, payload);
   }
 
+  // For raw sockets: send_ip_to() with a say in how far the packet may go (`hop_limit`: the time to live or hop limit; 0: the usual one). An ICMPv6
+  // message gets its checksum here (it covers the addresses); anything else is sent as it is handed in, TCP and UDP as for send_ip().
+  virtual bool send_raw(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t hop_limit) {
+    (void)hop_limit;
+    return send_ip_to(destination, protocol, payload);
+  }
+
   // TCP segmentation offload. The largest TCP segment (header and data) that may go to `destination` in one send_tcp_segmented(): more
   // than one packet's worth when the interface cuts segments into frames itself and the way there is known; 0 otherwise (send packet by
   // packet, with send_ip_to()).

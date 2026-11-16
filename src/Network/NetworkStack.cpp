@@ -50,6 +50,7 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       looped_(allocator),
       egress_(allocator),
       udp_(*this, allocator),
+      raw_(*this, allocator),
       tcp_(*this, allocator),
       pending6_(allocator) {}
 
@@ -118,6 +119,10 @@ bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
     kernel::sleep_us(200);
   }
   return true;
+}
+
+SharedPointer<IRawSocket> NetworkStack::raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) {
+  return raw_.open(v6, protocol, kind, identifier);
 }
 
 SharedPointer<IUdpSocket> NetworkStack::udp_open_families(uint16_t port, IpFamilies families) {
@@ -202,6 +207,7 @@ void NetworkStack::poll_control() {
   tcp_.poll();
   looped += deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
+  raw_.reap();
   uint32_t drained = 0;
   bool looped_left;
   {
@@ -397,6 +403,7 @@ void NetworkStack::handle_ipv4(ConstByteView packet, bool looped, const hardware
   if (!looped && (!accepted || destination.is_loopback())) return;  // (127/8 never arrives from a wire)
 
   ConstByteView payload = packet.subview(header, total - header);
+  raw_.deliver(false, protocol, IpAddress(source), packet.first(total), header);      // (raw sockets see every packet that is for this machine)
   if (protocol == kProtocolUdp) {
     udp_.handle(source, destination, payload, checks.transport_checksum_good);
   } else if (protocol == kProtocolTcp) {
@@ -594,6 +601,21 @@ bool NetworkStack::send_ip_to(const IpAddress& destination, uint8_t protocol, Co
   return sent;
 }
 
+bool NetworkStack::send_raw(const IpAddress& destination, uint8_t protocol, ConstByteView payload, uint8_t hop_limit) {
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  if (!destination.v6) {
+    outgoing_ttl_ = hop_limit;
+    const bool sent = send_ip(destination.ipv4, protocol, payload);
+    outgoing_ttl_ = 0;
+    return sent;
+  }
+  const Ipv6Address source = source_for6(destination.ipv6);
+  if (source.is_unspecified()) return false;
+  const uint8_t hops = hop_limit != 0 ? hop_limit : 64;
+  if (protocol == kProtocolIcmpv6) return send_icmpv6(source, destination.ipv6, payload, hops);
+  return send_ip6(source, destination.ipv6, protocol, payload, hops);
+}
+
 void NetworkStack::send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip) {
   send_arp_from(operation, config_.address, target_mac, target_ip);
 }
@@ -635,7 +657,7 @@ bool NetworkStack::send_ip_from(Ipv4Address source, Ipv4Address destination, uin
   out.be16(static_cast<uint16_t>(kIpv4HeaderSize + payload.size()));
   out.be16(ip_id_++);
   out.be16(0x4000);  // don't fragment
-  out.u8(destination.is_multicast() ? (protocol == kProtocolIgmp ? 1 : 255) : 64);  // TTL (mDNS wants 255 for multicast UDP)
+  out.u8(outgoing_ttl_ != 0 ? outgoing_ttl_ : destination.is_multicast() ? (protocol == kProtocolIgmp ? 1 : 255) : 64);  // TTL (mDNS wants 255 for multicast UDP)
   out.u8(protocol);
   out.be16(0);  // header checksum, filled in below
   source.write(out);

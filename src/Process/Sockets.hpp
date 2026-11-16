@@ -48,6 +48,14 @@ class SocketManager {
     uint32_t status = 0;  // an NTSTATUS
   };
   Created create(SocketProto proto, bool ipv6 = false);
+  // A raw socket: IP packets of `protocol`, or (`echo`) ICMP echo requests and their replies only. To everything below it is a datagram socket whose
+  // datagrams are packets (network::IRawSocket says what is in them); ports mean nothing to it, except that an echo socket's is its identifier.
+  Created create_raw(bool ipv6, uint8_t protocol, bool echo);
+  bool is_raw(uint32_t id) const { const Socket* s = at(id); return s && s->raw; }
+  bool is_echo(uint32_t id) const { const Socket* s = at(id); return s && s->raw && s->raw_echo; }
+  uint8_t raw_protocol(uint32_t id) const { const Socket* s = at(id); return s && s->raw ? s->raw_protocol : 0; }
+  // Hands a raw socket's settings in Options (header_included, hop_limit, blocked_types) to the network stack; call it after changing them.
+  void apply_raw_options(uint32_t id);
   void add_ref(uint32_t id);
   void release(uint32_t id);
 
@@ -135,6 +143,10 @@ class SocketManager {
     // IPV6_RECVTCLASS, and SO_TIMESTAMP (1) or SO_TIMESTAMPNS (2).
     bool packet_info = false, packet_info6 = false, receive_ttl = false, receive_tos = false, receive_hop_limit = false, receive_traffic_class = false;
     uint8_t timestamp = 0;
+    // A raw socket's: IP_HDRINCL, IP_TTL or IPV6_UNICAST_HOPS (0: the usual), and the ICMP types it does not want (ICMP_FILTER, ICMP6_FILTER).
+    bool header_included = false;
+    uint8_t hop_limit = 0;
+    uint32_t blocked_types[network::IRawSocket::kTypeWords] = {};
   };
   Options* options(uint32_t id);
   // See IStackProvider: read progress() before an attempt that may block; wait_for_progress() returns when some stack did something (or the
@@ -156,6 +168,9 @@ class SocketManager {
     network::INetworkStack* stack = nullptr;       // the interface it ended up on (chosen at connect()/first send, or bind()/listen())
     SharedPointer<network::ITcpSocket> tcp;
     SharedPointer<network::IUdpSocket> udp;
+    bool raw = false, raw_echo = false;      // a raw socket: `udp` is then `raw_socket` too
+    uint8_t raw_protocol = 0;
+    SharedPointer<network::IRawSocket> raw_socket;
     bool udp_connected = false;  // connect() was called on a UDP socket: send()/recv() go to/from this peer without needing an address each time
     network::IpAddress peer_address;   // as the network stack has it (an IPv4 peer of a dual-stack socket is IPv4 here, mapped only when shown)
     uint16_t peer_port = 0;

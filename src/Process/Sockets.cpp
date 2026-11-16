@@ -87,6 +87,28 @@ SocketManager::Created SocketManager::create(SocketProto proto, bool ipv6) {
   return result;
 }
 
+SocketManager::Created SocketManager::create_raw(bool ipv6, uint8_t protocol, bool echo) {
+  const Created result = create(SocketProto::Udp, ipv6);
+  Socket* s = at(result.id);
+  if (!s) return result;
+  s->raw = true;
+  s->raw_echo = echo;
+  s->raw_protocol = protocol;
+  // A raw socket hears packets from the moment it is made, so it is opened on an interface at once if there is one (an echo socket only has something
+  // to hear once it has an identifier, which bind() or its first send gives it).
+  if (!echo)
+    if (network::INetworkStack* stack = stack_for(*s, IpAddress())) (void)open_udp(*s, *stack, 0);
+  return result;
+}
+
+void SocketManager::apply_raw_options(uint32_t id) {
+  Socket* s = at(id);
+  if (!s || !s->raw_socket) return;
+  s->raw_socket->set_header_included(s->options.header_included);
+  s->raw_socket->set_hop_limit(s->options.hop_limit);
+  s->raw_socket->set_blocked_types(ArrayView<const uint32_t>(s->options.blocked_types));
+}
+
 void SocketManager::add_ref(uint32_t id) {
   if (Socket* s = at(id)) ++s->references;
 }
@@ -97,6 +119,7 @@ void SocketManager::release(uint32_t id) {
   if (--s->references == 0) {
     if (s->tcp) s->tcp->close();
     if (s->udp) s->udp->close();
+    s->raw_socket = SharedPointer<network::IRawSocket>();
     if (s->pending_accept) s->pending_accept->close();  // accepted off the network but never given to the program: let it go too
     *s = Socket();
   }
@@ -137,6 +160,15 @@ network::INetworkStack* SocketManager::stack_for(Socket& s, const IpAddress& des
 }
 
 uint32_t SocketManager::open_udp(Socket& s, network::INetworkStack& stack, uint16_t port) {
+  if (s.raw) {
+    s.raw_socket = stack.raw_open(s.ipv6, s.raw_protocol, s.raw_echo ? network::RawKind::Echo : network::RawKind::Packets, port);
+    if (!s.raw_socket) return kAddressAlreadyInUse;
+    s.raw_socket->set_header_included(s.options.header_included);
+    s.raw_socket->set_hop_limit(s.options.hop_limit);
+    s.raw_socket->set_blocked_types(ArrayView<const uint32_t>(s.options.blocked_types));
+    s.udp = s.raw_socket;
+    return kSuccess;
+  }
   s.udp = stack.udp_open_families(port, families_of(s));
   return s.udp ? kSuccess : kAddressAlreadyInUse;
 }
@@ -152,7 +184,9 @@ uint32_t SocketManager::bind(uint32_t id, const IpAddress& address, uint16_t por
   network::INetworkStack* stack = stack_for(*s, IpAddress());
   if (!stack) return kNoSuchDevice;
   if (s->proto == SocketProto::Udp) {
-    if (const uint32_t status = open_udp(*s, *stack, port); status != kSuccess) return status;
+    // (a raw socket that hears packets already stays as it is: there is no port to give it)
+    if (!(s->raw && !s->raw_echo && s->udp))
+      if (const uint32_t status = open_udp(*s, *stack, port); status != kSuccess) return status;
     s->bound_port = s->udp->local_port();
   } else {
     s->bound_port = port;  // a TCP bind is only realised by the later listen() (this network stack has no separate "reserve a port" step)
@@ -295,7 +329,7 @@ uint32_t SocketManager::send(uint32_t id, ConstByteView data, const IpAddress* a
     if (!stack) return kNoSuchDevice;
     if (!s->udp)
       if (const uint32_t status = open_udp(*s, *stack, 0); status != kSuccess) return status;
-    if (data.size() > (to.v6 ? 1452u : 1472u)) return kInvalidParameter;  // what fits one Ethernet frame without fragmenting (WSAEMSGSIZE is not told apart)
+    if (data.size() > (s->raw ? network::kMtu : to.v6 ? 1452u : 1472u)) return kInvalidParameter;  // what fits one Ethernet frame without fragmenting (WSAEMSGSIZE is not told apart)
     if (!s->udp->send_to_ip(to, to_port, data)) { *would_block = true; return kSuccess; }  // the stack's own send queue is momentarily full: try again shortly
     *sent = uint32_t(data.size());
     return kSuccess;
