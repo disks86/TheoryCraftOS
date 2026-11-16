@@ -156,6 +156,16 @@ uint64_t sys_personality(Process& p, uint64_t persona);
 uint64_t sys_prctl(Process& p, UserArch arch, uint64_t option, uint64_t a, uint64_t b);
 uint64_t sys_membarrier(Process& p, uint64_t command, uint64_t flags);
 
+// pidfd: a descriptor for a process (the caller, a child, or any process there is). It can be polled (readable once the process has ended), waited
+// for (waitid with P_PIDFD) and signalled.
+uint64_t sys_pidfd_open(Process& p, uint64_t pid, uint64_t flags);
+uint64_t sys_pidfd_send_signal(Process& p, uint64_t fd, uint64_t signal, uint64_t info, uint64_t flags);
+uint64_t sys_pidfd_getfd(Process& p, uint64_t fd, uint64_t target, uint64_t flags);
+// The process a pidfd stands for; false if `fd` is none.
+bool pidfd_process(Process& p, uint64_t fd, uint64_t* pid);
+// For poll(): has the process ended?
+bool pidfd_ready(Process& p, uint64_t pid);
+
 // --- LinuxMisc.cpp: calls that have little to do here but answer as a Linux kernel on such a machine would
 // Memory policy on a machine with one memory node: every policy is accepted and comes to the same; a node other than 0 is refused.
 uint64_t sys_get_mempolicy(Process& p, uint64_t mode, uint64_t nodemask, uint64_t max_node, uint64_t address, uint64_t flags);

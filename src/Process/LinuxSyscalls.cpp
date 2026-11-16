@@ -63,6 +63,7 @@ enum class Call : uint16_t { None, Clone3, Read, Write, Writev, Close, Getpid, G
   // System V IPC (LinuxIpc.cpp)
   Shmget, Shmat, Shmdt, Shmctl, Semget, Semop, Semtimedop, Semctl, Msgget, Msgsnd, Msgrcv, Msgctl,
   MqOpen, MqUnlink, MqTimedsend, MqTimedreceive, MqNotify, MqGetsetattr,
+  PidfdOpen, PidfdSendSignal, PidfdGetfd, ProcessMadvise, ProcessMrelease,
   // calls that are in Linux's tables and have a fixed answer here: see the table
   Unsupported, Absent };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
@@ -168,6 +169,9 @@ constexpr NumberEntry kNumbers[] = {
     // POSIX message queues (LinuxIpc.cpp)
     {240, 180, Call::MqOpen},      {241, 181, Call::MqUnlink},  {242, 182, Call::MqTimedsend}, {243, 183, Call::MqTimedreceive},
     {244, 184, Call::MqNotify},    {245, 185, Call::MqGetsetattr},
+    // pidfd (LinuxProcess.cpp), and the two calls that take one to say whose memory is meant
+    {434, 434, Call::PidfdOpen},   {424, 424, Call::PidfdSendSignal}, {438, 438, Call::PidfdGetfd}, {440, 440, Call::ProcessMadvise},
+    {448, 448, Call::ProcessMrelease},
     // more of what only an administrator of a real system does (EPERM): vhangup, iopl, ioperm, init_module, finit_module, delete_module, kexec_load,
     // kexec_file_load, and the newer mount calls open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr, open_tree_attr, and fchroot
     {153, 58, Call::Refuse},       {172, kAbsent, Call::Refuse}, {173, kAbsent, Call::Refuse}, {175, 105, Call::Refuse},
@@ -183,15 +187,14 @@ constexpr NumberEntry kNumbers[] = {
     // Parts of Linux that are not here, answered as a kernel built without them answers (ENOSYS, and programs fall back): io_uring (setup, enter,
     // register), fanotify (init, mark), the key retention service (add_key, request_key, keyctl), landlock (three calls), the security-module calls
     // (lsm_get_self_attr, lsm_set_self_attr, lsm_list_modules), memfd_secret, mseal, statmount, listmount, listns, seccomp, remap_file_pages, quotactl,
-    // quotactl_fd, bpf, perf_event_open, userfaultfd, rseq_slice_yield, process_madvise, process_mrelease
+    // quotactl_fd, bpf, perf_event_open, userfaultfd, rseq_slice_yield
     {425, 425, Call::Absent},      {426, 426, Call::Absent},    {427, 427, Call::Absent},     {300, 262, Call::Absent},
     {301, 263, Call::Absent},      {248, 217, Call::Absent},    {249, 218, Call::Absent},     {250, 219, Call::Absent},
     {444, 444, Call::Absent},      {445, 445, Call::Absent},    {446, 446, Call::Absent},     {459, 459, Call::Absent},
     {460, 460, Call::Absent},      {461, 461, Call::Absent},    {447, 447, Call::Absent},     {462, 462, Call::Absent},
     {457, 457, Call::Absent},      {458, 458, Call::Absent},    {470, 470, Call::Absent},     {317, 277, Call::Absent},
     {216, 234, Call::Absent},      {179, 60, Call::Absent},     {443, 443, Call::Absent},     {321, 280, Call::Absent},
-    {298, 241, Call::Absent},      {323, 282, Call::Absent},    {471, 471, Call::Absent},     {440, 440, Call::Absent},
-    {448, 448, Call::Absent},
+    {298, 241, Call::Absent},      {323, 282, Call::Absent},    {471, 471, Call::Absent},
     // Numbers Linux itself answers ENOSYS for, because the call was never there or was taken out: afs_syscall, getpmsg, putpmsg, security, tuxcall,
     // vserver, create_module, get_kernel_syms, query_module, nfsservctl, _sysctl, uselib, epoll_ctl_old, epoll_wait_old, lookup_dcookie; and what a
     // 64-bit program has no use for or a current kernel is built without: sysfs, ustat, modify_ldt, set_thread_area, get_thread_area, uprobe, uretprobe
@@ -478,6 +481,24 @@ uint64_t do_mincore(Process& process, uint64_t address, uint64_t length, uint64_
 
 // madvise: advice the kernel may ignore, except MADV_DONTNEED, which a program may count on: anonymous private pages read as zeros afterwards (allocators give
 // memory back this way and expect it clean when they take it again). Views of shared memory and copies of files keep their bytes.
+uint64_t do_madvise(Process& process, uint64_t address, uint64_t length, uint64_t advice);
+
+// process_madvise(pidfd, struct iovec*, count, advice, flags): madvise for each range, in a process named by a descriptor. Only in the caller's own.
+uint64_t process_madvise(Process& process, uint64_t pidfd, uint64_t vectors, uint64_t count, uint64_t advice, uint64_t flags) {
+  uint64_t pid = 0;
+  if (!linuxabi::pidfd_process(process, pidfd, &pid)) return error(kEbadf);
+  if (flags != 0 || count > 1024) return error(kEinval);
+  if (pid != process.id()) return error(kEperm);
+  uint64_t done = 0;
+  for (uint64_t i = 0; i < count; ++i) {
+    uint64_t base = 0, length = 0;
+    if (!process.read_user_u64(vectors + i * 16, &base) || !process.read_user_u64(vectors + i * 16 + 8, &length)) return done != 0 ? done : error(kEfault);
+    if (const uint64_t r = do_madvise(process, base, length, advice); r != 0) return done != 0 ? done : r;
+    done += length;
+  }
+  return done;
+}
+
 uint64_t do_madvise(Process& process, uint64_t address, uint64_t length, uint64_t advice) {
   constexpr uint64_t kDontNeed = 4;
   AddressSpace* space = process.address_space();
@@ -698,6 +719,15 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::ProcessVmReadv: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], false);
       case Call::ProcessVmWritev: return linuxabi::sys_process_vm(process, a[0], a[1], a[2], a[3], a[4], a[5], true);
       case Call::Cachestat: return linuxabi::sys_cachestat(process, a[0], a[1], a[2], a[3]);
+      case Call::PidfdOpen: return linuxabi::sys_pidfd_open(process, a[0], a[1]);
+      case Call::PidfdSendSignal: return linuxabi::sys_pidfd_send_signal(process, a[0], a[1], a[2], a[3]);
+      case Call::PidfdGetfd: return linuxabi::sys_pidfd_getfd(process, a[0], a[1], a[2]);
+      case Call::ProcessMadvise: return process_madvise(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::ProcessMrelease: {      // process_mrelease(pidfd, flags): frees the memory of a process that is being killed; none ever is at this point
+        uint64_t pid = 0;
+        if (!linuxabi::pidfd_process(process, a[0], &pid)) return error(kEbadf);
+        return error(kEinval);
+      }
       case Call::MqOpen: return linuxabi::sys_mq_open(process, a[0], a[1], a[2], a[3]);
       case Call::MqUnlink: return linuxabi::sys_mq_unlink(process, a[0]);
       case Call::MqTimedsend: return linuxabi::sys_mq_timedsend(process, a[0], a[1], a[2], a[3], a[4]);

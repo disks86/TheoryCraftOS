@@ -16,6 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxProcess.hpp"
+#include "Process/LinuxFiles.hpp"
+#include "Process/LinuxSockets.hpp"
 #include "Process/AddressSpace.hpp"
 #include "Process/Objects.hpp"
 #include "Utility/ByteStream.hpp"
@@ -24,7 +26,7 @@ namespace process::linuxabi {
 
 namespace {
 
-constexpr int64_t kEperm = 1, kEsrch = 3, kEintr = 4, kEchild = 10, kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEperm = 1, kEsrch = 3, kEintr = 4, kEbadf = 9, kEchild = 10, kEagain = 11, kEfault = 14, kEinval = 22, kEnosys = 38;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
 uint64_t current_tid(Process& p) { return p.runtime() ? p.runtime()->current_thread_id() : p.id(); }
@@ -184,7 +186,15 @@ uint64_t sys_wait4(Process& p, uint64_t pid, uint64_t status_at, uint64_t option
 
 // waitid(idtype, id, siginfo_t*, options, rusage*): siginfo_t for SIGCHLD is si_signo, si_errno, si_code (4 each), padding (4), si_pid (4), si_uid (4), si_status (4).
 uint64_t sys_waitid(Process& p, uint64_t id_type, uint64_t id, uint64_t info_at, uint64_t options, uint64_t usage_at) {
-  constexpr uint64_t kPAll = 0, kPPid = 1, kPPgid = 2;
+  constexpr uint64_t kPAll = 0, kPPid = 1, kPPgid = 2, kPPidfd = 3;
+  bool descriptor_does_not_wait = false;
+  if (id_type == kPPidfd) {      // a child named by a descriptor for it (pidfd_open); one opened with PIDFD_NONBLOCK answers EAGAIN where the call would wait
+    uint64_t pid = 0;
+    uint32_t mode = 0;
+    if (linked_of(p, id, UnixType::Pidfd, &pid, &mode, &descriptor_does_not_wait) != 0) return error(kEbadf);
+    id_type = kPPid;
+    id = pid;
+  }
   constexpr uint32_t kSigChld = 17, kCldExited = 1, kCldKilled = 2;
   if ((options & ~(kWNoHang | kWUntraced | kWExited | kWContinued | kWNoWait | kWNoThread | kWAll | kWClone)) || !(options & (kWExited | kWUntraced | kWContinued))) return error(kEinval);
   if (id_type != kPAll && id_type != kPPid && id_type != kPPgid) return error(kEinval);
@@ -193,7 +203,8 @@ uint64_t sys_waitid(Process& p, uint64_t id_type, uint64_t id, uint64_t info_at,
   LinuxProcessState::Child child;
   int64_t r = 0;
   if (options & kWExited) {
-    r = wait_for_child(p, id_type == kPPid ? uint32_t(id) : 0, (options & kWNoHang) != 0, (options & kWNoWait) != 0, &child);
+    r = wait_for_child(p, id_type == kPPid ? uint32_t(id) : 0, (options & kWNoHang) != 0 || descriptor_does_not_wait, (options & kWNoWait) != 0, &child);
+    if (r == 0 && descriptor_does_not_wait && !(options & kWNoHang)) return error(kEagain);
   } else {      // only stops and continues are asked for, and children neither stop nor continue here
     r = wait_for_child(p, id_type == kPPid ? uint32_t(id) : 0, true, true, &child);
     if (r > 0) r = 0;
@@ -684,6 +695,67 @@ uint64_t sys_get_robust_list(Process& p, uint64_t pid, uint64_t head_at, uint64_
     if (!thread) return error(kEsrch);
   }
   return p.write_user_u64(head_at, thread->robust_head) && p.write_user_u64(size_at, thread->robust_size) ? 0 : error(kEfault);
+}
+
+// --- pidfd: a descriptor that stands for a process -----------------------------------------------------------------------------------------------------
+// It is a "linked" descriptor of the AF_UNIX manager whose link is the process id. poll() reports it readable once the process has ended.
+
+namespace {
+bool process_there(Process& p, uint64_t pid) {
+  if (pid == p.id()) return true;
+  for (const LinuxProcessState::Child& child : p.linux_state().children)
+    if (child.used && child.pid == pid) return true;      // (also one that ended and was not waited for yet)
+  return p.runtime() && p.runtime()->process_exists(pid);
+}
+}  // namespace
+
+bool pidfd_process(Process& p, uint64_t fd, uint64_t* pid) {
+  uint32_t mode = 0;
+  return linked_of(p, fd, UnixType::Pidfd, pid, &mode) == 0;
+}
+
+bool pidfd_ready(Process& p, uint64_t pid) {
+  if (pid == p.id()) return false;
+  for (const LinuxProcessState::Child& child : p.linux_state().children)
+    if (child.used && child.pid == pid && child.exited) return true;
+  IProcessRuntime* runtime = p.runtime();
+  if (!runtime) return true;      // (nobody runs other processes: whatever it was is not running)
+  bool exited = false;
+  uint32_t code = 0;
+  if (runtime->query_child(pid, &exited, &code)) return exited;
+  return !runtime->process_exists(pid);
+}
+
+// pidfd_open(pid, flags): PIDFD_NONBLOCK (O_NONBLOCK) is kept for waitid(P_PIDFD); a descriptor for a single thread (PIDFD_THREAD) is not to be had.
+uint64_t sys_pidfd_open(Process& p, uint64_t pid, uint64_t flags) {
+  constexpr uint64_t kNonBlock = 0x800;
+  if ((flags & ~kNonBlock) != 0 || int32_t(pid) <= 0) return error(kEinval);
+  if (!process_there(p, uint32_t(pid))) return error(kEsrch);
+  return open_linked(p, UnixType::Pidfd, uint32_t(pid), 0, true, (flags & kNonBlock) != 0);      // (always close-on-exec)
+}
+
+// pidfd_send_signal(pidfd, signal, siginfo_t*, flags): kill() by descriptor. (A siginfo of the caller's making is not kept, as with rt_sigqueueinfo.)
+uint64_t sys_pidfd_send_signal(Process& p, uint64_t fd, uint64_t signal, uint64_t info, uint64_t flags) {
+  uint64_t pid = 0;
+  if (!pidfd_process(p, fd, &pid)) return error(kEbadf);
+  if (flags != 0) return error(kEinval);
+  if (info != 0) {
+    uint8_t probe[16];
+    if (!p.read_user(info, ByteView(probe, sizeof(probe)))) return error(kEfault);
+  }
+  return sys_kill(p, pid, signal);
+}
+
+// pidfd_getfd(pidfd, fd, flags): a copy of another process's descriptor. Only of the caller's own: nothing here may reach into another process.
+uint64_t sys_pidfd_getfd(Process& p, uint64_t fd, uint64_t target, uint64_t flags) {
+  uint64_t pid = 0;
+  if (!pidfd_process(p, fd, &pid)) return error(kEbadf);
+  if (flags != 0) return error(kEinval);
+  if (pid != p.id()) return error(process_there(p, pid) ? kEperm : kEsrch);
+  if (p.files().kind(target) == DescriptorKind::Closed) return error(kEbadf);
+  const uint64_t copy = sys_dup(p, target);
+  if (int64_t(copy) >= 0) p.files().set_close_on_exec(copy, true);
+  return copy;
 }
 
 }  // namespace process::linuxabi

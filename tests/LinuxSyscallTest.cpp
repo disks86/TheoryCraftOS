@@ -823,7 +823,7 @@ static void test_fork_and_wait() {
   CHECK(rig.s(247, 0, 0, info, 4 | 0x1000000, 0) == 0 && rig.u32(info) == 17 && rig.u32(info + 8) == 2 && rig.u32(info + 16) == 503 && rig.u32(info + 24) == 6);      // CLD_KILLED
   CHECK(rig.u64(info + 128) == 0x4755415244ull);
   CHECK(rig.s(247, 1, 503, info, 4, usage) == 0 && rig.u32(info + 16) == 503 && rig.s(247, 1, 503, info, 4, 0) == -10);      // WNOWAIT left it; now it is taken
-  CHECK(rig.s(247, 1, 505, info, 0, 0) == -22 && rig.s(247, 3, 505, info, 4, 0) == -22 && rig.s(247, 1, 0, info, 4, 0) == -22 && rig.s(247, 1, 505, info, 4 | 0x10, 0) == -22);
+  CHECK(rig.s(247, 1, 505, info, 0, 0) == -22 && rig.s(247, 4, 505, info, 4, 0) == -22 && rig.s(247, 3, 505, info, 4, 0) == -9 && rig.s(247, 1, 0, info, 4, 0) == -22 && rig.s(247, 1, 505, info, 4 | 0x10, 0) == -22);
   CHECK(rig.s(247, 1, 505, info, 2 | 1, 0) == 0 && rig.s(247, 1, 505, info, 2, 0) == -22);      // only stops asked for: there are none
   // a child whose record the runtime let go of: how it ended was noted first (as the kernel does when it frees one)
   linuxabi::note_child_exit(p, 505, 9, 0);
@@ -1921,7 +1921,7 @@ static void test_misc_calls() {
   CHECK(rig.s(219) == -4);
   for (const uint64_t n : {153, 172, 173, 175, 313, 176, 246, 320, 428, 429, 430, 431, 432, 433, 442, 467, 472}) CHECK(rig.s(n) == -1);
   for (const uint64_t n : {303, 304, 463, 464, 465, 466, 468, 469, 453}) CHECK(rig.s(n) == -95);
-  for (const uint64_t n : {425, 426, 427, 300, 301, 248, 249, 250, 444, 445, 446, 459, 460, 461, 447, 462, 457, 458, 470, 317, 216, 179, 443, 321, 298, 323, 471, 440, 448,
+  for (const uint64_t n : {425, 426, 427, 300, 301, 248, 249, 250, 444, 445, 446, 459, 460, 461, 447, 462, 457, 458, 470, 317, 216, 179, 443, 321, 298, 323, 471,
                            183, 181, 182, 185, 184, 236, 174, 177, 178, 180, 156, 134, 214, 215, 212, 139, 136, 154, 205, 211, 336, 335})
     CHECK(rig.s(n) == -38);
   CHECK(rig.host.unhandled.empty());      // every one of them is known: nothing was reported as missing
@@ -2264,6 +2264,63 @@ static void test_posix_message_queues() {
   }
 }
 
+// --- pidfd_open (434), pidfd_send_signal (424), pidfd_getfd (438), waitid by pidfd, process_madvise (440), process_mrelease (448) ---------------------------
+static void test_pidfd() {
+  constexpr uint64_t kUsr1 = 10;
+  IpcRig system;      // (for the descriptor manager)
+  {
+    Rig rig;
+    const uint64_t fds = rig.alloc(16), set = rig.alloc(8);
+    auto readable = [&](Rig& r, int64_t fd) {
+      r.put32(fds, uint32_t(fd)); r.put32(fds + 4, 1);
+      return r.s(7, fds, 1, 0) == 1 && (r.u32(fds + 4) >> 16) == 1;
+    };
+    // the process itself
+    const int64_t self = rig.s(434, 1, 0);
+    CHECK(self >= 3 && rig.process->files().close_on_exec(uint64_t(self)) && !readable(rig, self));
+    CHECK(rig.s(434, 77, 0) == -3 && rig.s(434, 0, 0) == -22 && rig.s(434, uint64_t(-1), 0) == -22 && rig.s(434, 1, 1) == -22 && rig.s(434, 1, 0x80) == -22);
+    CHECK(rig.s(14, 0, rig.words({uint64_t{1} << (kUsr1 - 1)}), 0, 8) == 0);
+    CHECK(rig.s(424, self, 0, 0, 0) == 0 && rig.s(424, self, kUsr1, 0, 0) == 0 && rig.s(127, set, 8) == 0 && rig.u64(set) == uint64_t{1} << (kUsr1 - 1));
+    CHECK(rig.s(424, self, 65, 0, 0) == -22 && rig.s(424, self, kUsr1, 0, 1) == -22 && rig.s(424, self, kUsr1, kBad, 0) == -14 && rig.s(424, 1, kUsr1, 0, 0) == -9 && rig.s(424, 999, 0, 0, 0) == -9);
+    const int64_t copy = rig.s(438, self, 1, 0);      // its own descriptor 1, again
+    CHECK(copy > self && rig.process->files().close_on_exec(uint64_t(copy)) && rig.s(312, 1, 1, 0, 1, copy) == 0);
+    CHECK(rig.s(438, self, 999, 0) == -9 && rig.s(438, self, 1, 1) == -22 && rig.s(438, 1, 1, 0) == -9);
+    CHECK(rig.s(0, self, fds, 8) == -22);      // (not read from)
+    // its memory, by descriptor: process_madvise does what madvise does; process_mrelease is for a process that is being killed
+    const uint64_t m = rig.call(9, 0, 8192, 3, 0x22, ~uint64_t{0}, 0);
+    rig.put64(m, 5); rig.put64(m + 4096, 6);
+    CHECK(rig.s(440, self, rig.words({m, 4096, m + 4096, 4096}), 2, 4 /* MADV_DONTNEED */, 0) == 8192 && rig.u64(m) == 0 && rig.u64(m + 4096) == 0);
+    CHECK(rig.s(440, self, rig.words({m, 4096}), 1, 4, 1) == -22 && rig.s(440, self, kBad, 1, 4, 0) == -14 && rig.s(440, 1, rig.words({m, 4096}), 1, 4, 0) == -9);
+    CHECK(rig.s(440, self, rig.words({m, 4096, kBad, 4096}), 2, 4, 0) == 4096 && rig.s(440, self, 0, 0, 4, 0) == 0 && rig.s(440, self, 0, 1025, 4, 0) == -22);
+    CHECK(rig.s(448, self, 0) == -22 && rig.s(448, 1, 0) == -9);
+    CHECK(rig.s(3, self) == 0 && rig.s(424, self, 0, 0, 0) == -9);
+  }
+  {      // a child: its pidfd turns readable when it ends, and it is waited for by it
+    Rig rig;
+    ForkRuntime runtime;
+    rig.process->attach_runtime(&runtime);
+    const uint64_t fds = rig.alloc(16), info = rig.alloc(128);
+    LinuxProcessState::ForkRequest request;
+    CHECK(rig.s(57) == 500 && rig.process->take_fork(&request));
+    runtime.kids.push_back(ForkRuntime::Kid{500});
+    const int64_t child = rig.s(434, 500, 0x800), other = rig.s(434, 900, 0);      // (900: some process that is no child of this one)
+    CHECK(child >= 3 && other > child);
+    auto readable = [&](int64_t fd) {
+      rig.put32(fds, uint32_t(fd)); rig.put32(fds + 4, 1);
+      return rig.s(7, fds, 1, 0) == 1 && (rig.u32(fds + 4) >> 16) == 1;
+    };
+    CHECK(!readable(child) && !readable(other));
+    CHECK(rig.s(247, 3, child, info, 4 /* WEXITED */, 0) == -11);      // EAGAIN: the descriptor does not wait (PIDFD_NONBLOCK) and the child runs
+    CHECK(rig.s(438, other, 1, 0) == -1 && rig.s(440, other, rig.words({0x10000, 4096}), 1, 4, 0) == -1 && rig.s(448, other, 0) == -22);
+    CHECK(rig.s(424, child, 15, 0, 0) == 0 && runtime.terminated.size() == 1 && runtime.terminated[0].first == 500);      // SIGTERM ends it
+    CHECK(readable(child) && !readable(other));
+    CHECK(rig.s(247, 3, child, info, 4, 0) == 0 && rig.u32(info) == 17 && rig.u32(info + 16) == 500);      // waitid(P_PIDFD): SIGCHLD's siginfo, si_pid
+    CHECK(rig.s(247, 3, 1, info, 4, 0) == -9 && rig.s(247, 3, 999, info, 4, 0) == -9);
+    CHECK(rig.s(434, 501, 0) == -3);
+    rig.process->attach_runtime(nullptr);
+  }
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -2329,7 +2386,7 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
-      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd},
       {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {

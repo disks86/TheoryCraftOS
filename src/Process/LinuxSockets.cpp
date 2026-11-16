@@ -17,6 +17,7 @@
  */
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxIpc.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Process/LinuxFiles.hpp"
 #include "Process/UnixSockets.hpp"
 #include "ObjectContainer/List.hpp"
@@ -528,6 +529,7 @@ void refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
   bool readable = false, writable = false;
   switch (type) {
     case UnixType::MessageQueue: mq_readiness_locked(link, mode, &readable, &writable); break;
+    case UnixType::Pidfd: readable = pidfd_ready(p, link); break;
     default: break;
   }
   m.set_link_ready_locked(id, readable, writable);
