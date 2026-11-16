@@ -454,6 +454,14 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   /* the interpolants between the stages: the kernel counts the registers the vertex shader writes, its position included */
   const UINT n_out = dxbc_signature(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, 1, outputs, 16, &found_out);
   p->varyings = found_out ? n_out : 3;
+  /* (and the kernel gives each output its place by what it is - COLORn the place n, TEXCOORDn the place 2 + n - so a shader that writes TEXCOORD5 and
+   * not the ones below it needs the places up to that one) */
+  for (UINT k = 0; k < n_out; ++k) {
+    UINT place = 0;
+    if (ieq(outputs[k].name, "COLOR") && outputs[k].index < 2) place = outputs[k].index + 1;
+    else if (ieq(outputs[k].name, "TEXCOORD") && outputs[k].index < 14) place = outputs[k].index + 3;
+    if (place > p->varyings) p->varyings = place;
+  }
   if (p->varyings > dev->caps.max_varyings) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
   p->textures = p->rs->textures_unbounded ? dev->caps.max_texture_units : p->rs->textures;
   if (p->textures > dev->caps.max_texture_units) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }

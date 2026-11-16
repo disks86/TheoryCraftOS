@@ -18,7 +18,8 @@
 
 /* Direct3D 9 (d3d9.dll: the fixed-function pipeline, a layer on d3d12.dll) on the real kernel: the Direct3D object and what it says of the adapter,
  * a device on a window, clears, vertices that are pixels and vertices that go through the matrices, vertex and index buffers, culling, the
- * primitive types, textures of several formats and the texture stages, blending, the alpha test, depth, state blocks, drawing into a texture,
+ * primitive types, textures of several formats and the texture stages, blending, the alpha test, depth, state blocks, the program's own vertex and
+ * pixel shaders (with each other and with the fixed-function stages), drawing into a texture,
  * Present and Reset. Built for both widths; ends with exit code 42 if every check passed.
  *   x86_64-w64-mingw32-gcc -O1 -o d3d9test.exe tests/windows/d3d9test.c -ld3d9 -luser32 */
 #define COBJMACROS
@@ -26,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <d3d9.h>
+#include "d3d9test_shaders.h"
 
 static int g_passed, g_failed;
 static void check(int ok, const char *what) {
@@ -90,8 +92,8 @@ static void test_object(void) {
   check(IDirect3D9_GetAdapterCount(g_d3d) == 1 && SUCCEEDED(IDirect3D9_GetAdapterIdentifier(g_d3d, 0, 0, &id)) && id.Description[0] != 0, "one adapter, with a description");
   check(SUCCEEDED(IDirect3D9_GetAdapterDisplayMode(g_d3d, 0, &mode)) && mode.Width >= 320 && mode.Height >= 200 && mode.Format == D3DFMT_X8R8G8B8, "the display mode");
   check(IDirect3D9_GetAdapterModeCount(g_d3d, 0, D3DFMT_X8R8G8B8) >= 1 && SUCCEEDED(IDirect3D9_EnumAdapterModes(g_d3d, 0, D3DFMT_X8R8G8B8, 0, &mode)), "the modes of the adapter");
-  check(SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps)) && caps.MaxSimultaneousTextures == 2 && caps.MaxTextureWidth >= 2048 && caps.VertexShaderVersion == 0 &&
-        caps.PixelShaderVersion == 0, "the caps: two textures, no shaders of the program's");
+  check(SUCCEEDED(IDirect3D9_GetDeviceCaps(g_d3d, 0, D3DDEVTYPE_HAL, &caps)) && caps.MaxSimultaneousTextures == 2 && caps.MaxTextureWidth >= 2048 &&
+        caps.VertexShaderVersion == D3DVS_VERSION(3, 0) && caps.PixelShaderVersion == D3DPS_VERSION(3, 0), "the caps: two texture stages, shaders up to 3.0");
   check(IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_A8R8G8B8) == D3D_OK &&
         IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_DXT1) == D3DERR_NOTAVAILABLE &&
         IDirect3D9_CheckDeviceFormat(g_d3d, 0, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, D3DFMT_D24S8) == D3D_OK,
@@ -133,7 +135,7 @@ static int make_device(void) {
   IDirect3DVertexShader9 *shader = NULL;
   static const DWORD nothing[2] = {0xFFFE0101, 0x0000FFFF};
   check(IDirect3DDevice9_CreateVertexShader(g_device, nothing, &shader) == D3DERR_INVALIDCALL && shader == NULL && IDirect3DDevice9_SetVertexShader(g_device, NULL) == D3D_OK,
-        "no vertex shader can be made, and none is what can be set");
+        "a vertex shader that writes no position cannot be made, and none can be set");
   /* (what the tests below do not want unless they say so: lighting is not there in any case) */
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_LIGHTING, FALSE);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
@@ -358,6 +360,191 @@ static void test_state_blocks(void) {
   check(IDirect3DStateBlock9_Release(block) == 0, "the block is gone with its last reference");
 }
 
+/* ---- the program's own shaders (compiled ahead from tests/data/d3d9: d3d9test_shaders.h) --------------------------------------------------------------- */
+
+typedef struct { float x, y, z; DWORD colour; float u, v; } ShaderVertex;      /* D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 */
+#define FVF_SHADER (D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
+static int near_colour(DWORD p, int r, int g, int b) {
+  const int ok = red(p) >= r - 3 && red(p) <= r + 3 && green(p) >= g - 3 && green(p) <= g + 3 && blue(p) >= b - 3 && blue(p) <= b + 3;
+  if (!ok) printf("d3d9test: (a pixel is %06lx, wanted about %02x%02x%02x)\n", (unsigned long)p, r, g, b);
+  return ok;
+}
+/* The whole of clip space as two triangles, texture coordinates from the top left. */
+static void shader_quad(DWORD colour) {
+  const ShaderVertex v[4] = {{-1, 1, 0.5f, colour, 0, 0}, {1, 1, 0.5f, colour, 1, 0}, {-1, -1, 0.5f, colour, 0, 1}, {1, -1, 0.5f, colour, 1, 1}};
+  IDirect3DDevice9_SetFVF(g_device, FVF_SHADER);
+  IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+}
+/* vs_basic's constants: the matrix (a column a register) that halves x, and k. */
+static void basic_constants(float kx, float ky, float kz, float kw) {
+  const float c[5][4] = {{0.5f, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}, {kx, ky, kz, kw}};
+  IDirect3DDevice9_SetVertexShaderConstantF(g_device, 0, &c[0][0], 5);
+}
+static void test_shaders(void) {
+  D3DCAPS9 caps;
+  memset(&caps, 0, sizeof caps);
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  check(caps.VertexShaderVersion >= D3DVS_VERSION(2, 0) && caps.PixelShaderVersion >= D3DPS_VERSION(2, 0) && caps.MaxVertexShaderConst >= 256, "the caps have vertex and pixel shaders");
+
+  IDirect3DVertexShader9 *vs = NULL, *vs11 = NULL, *vs30 = NULL, *wrong_vs = (IDirect3DVertexShader9 *)1;
+  IDirect3DPixelShader9 *ps_math = NULL, *ps_math30 = NULL, *ps_tex = NULL, *wrong_ps = (IDirect3DPixelShader9 *)1;
+  check(IDirect3DDevice9_CreateVertexShader(g_device, g_vs_basic_vs_2_0, &vs) == D3D_OK && vs, "CreateVertexShader (vs_2_0)");
+  check(IDirect3DDevice9_CreateVertexShader(g_device, g_vs_basic_vs_1_1, &vs11) == D3D_OK && vs11 &&
+        IDirect3DDevice9_CreateVertexShader(g_device, g_vs_basic_vs_3_0, &vs30) == D3D_OK && vs30, "... and vs_1_1 and vs_3_0");
+  check(IDirect3DDevice9_CreatePixelShader(g_device, g_ps_math_ps_2_0, &ps_math) == D3D_OK && ps_math &&
+        IDirect3DDevice9_CreatePixelShader(g_device, g_ps_math_ps_3_0, &ps_math30) == D3D_OK && ps_math30 &&
+        IDirect3DDevice9_CreatePixelShader(g_device, g_ps_tex_ps_2_0, &ps_tex) == D3D_OK && ps_tex, "CreatePixelShader (ps_2_0, ps_3_0, one that samples)");
+  if (!vs || !vs11 || !vs30 || !ps_math || !ps_math30 || !ps_tex) return;
+  static const DWORD ps11[] = {0xFFFF0101, 0x00000042, 0xB00F0000, 0x00000001, 0x800F0000, 0xB0E40000, 0x0000FFFF};      /* ps_1_1: tex t0; mov r0, t0 */
+  check(FAILED(IDirect3DDevice9_CreateVertexShader(g_device, g_ps_math_ps_2_0, &wrong_vs)) && wrong_vs == NULL &&
+        FAILED(IDirect3DDevice9_CreatePixelShader(g_device, g_vs_basic_vs_2_0, &wrong_ps)) && wrong_ps == NULL &&
+        FAILED(IDirect3DDevice9_CreatePixelShader(g_device, ps11, &wrong_ps)) && FAILED(IDirect3DDevice9_CreateVertexShader(g_device, NULL, &wrong_vs)),
+        "a shader of the other stage, a pixel shader 1.1 and no shader at all are refused");
+  DWORD code[256];
+  UINT size = 0;
+  IDirect3DDevice9 *owner = NULL;
+  check(IDirect3DVertexShader9_GetFunction(vs, NULL, &size) == D3D_OK && size == sizeof g_vs_basic_vs_2_0 && size <= sizeof code &&
+        IDirect3DVertexShader9_GetFunction(vs, code, &size) == D3D_OK && memcmp(code, g_vs_basic_vs_2_0, size) == 0 &&
+        IDirect3DVertexShader9_GetDevice(vs, &owner) == D3D_OK && owner == g_device, "GetFunction gives the shader's tokens back, GetDevice the device");
+  if (owner) IDirect3DDevice9_Release(owner);
+
+  /* constants are kept whatever is set */
+  const float k[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+  float got[2][4];
+  const BOOL flags[2] = {TRUE, FALSE};
+  BOOL got_flags[2] = {FALSE, TRUE};
+  const int counts[4] = {3, 0, 1, 0};
+  int got_counts[4] = {0, 0, 0, 0};
+  memset(got, 0, sizeof got);
+  check(IDirect3DDevice9_SetVertexShaderConstantF(g_device, 254, &k[0][0], 2) == D3D_OK && IDirect3DDevice9_GetVertexShaderConstantF(g_device, 254, &got[0][0], 2) == D3D_OK &&
+        memcmp(k, got, sizeof k) == 0 && FAILED(IDirect3DDevice9_SetVertexShaderConstantF(g_device, 255, &k[0][0], 2)), "the vertex shader's 256 float constants");
+  memset(got, 0, sizeof got);
+  check(IDirect3DDevice9_SetPixelShaderConstantF(g_device, 30, &k[0][0], 2) == D3D_OK && IDirect3DDevice9_GetPixelShaderConstantF(g_device, 30, &got[0][0], 2) == D3D_OK &&
+        memcmp(k, got, sizeof k) == 0, "the pixel shader's float constants");
+  check(IDirect3DDevice9_SetVertexShaderConstantB(g_device, 3, flags, 2) == D3D_OK && IDirect3DDevice9_GetVertexShaderConstantB(g_device, 3, got_flags, 2) == D3D_OK &&
+        got_flags[0] && !got_flags[1] && IDirect3DDevice9_SetPixelShaderConstantI(g_device, 1, counts, 1) == D3D_OK &&
+        IDirect3DDevice9_GetPixelShaderConstantI(g_device, 1, got_counts, 1) == D3D_OK && got_counts[0] == 3 && got_counts[2] == 1, "bool and integer constants");
+
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  /* the vertex shader with the fixed-function pixel stage: x halved, the colour scaled and biased */
+  IDirect3DVertexShader9 *set = NULL;
+  check(IDirect3DDevice9_SetVertexShader(g_device, vs) == D3D_OK && IDirect3DDevice9_GetVertexShader(g_device, &set) == D3D_OK && set == vs, "SetVertexShader, GetVertexShader");
+  if (set) IDirect3DVertexShader9_Release(set);
+  basic_constants(1.0f, 0.5f, 0.0f, 0.25f);
+  clear(0xFF000000);
+  shader_quad(0xFF808080);
+  read_back();
+  check(near_colour(pixel(32, 32), 191, 128, 64) && pixel(6, 32) == 0 && pixel(58, 32) == 0 && near_colour(pixel(20, 4), 191, 128, 64) && near_colour(pixel(44, 60), 191, 128, 64),
+        "a vertex shader moves the vertices and works out their colour (the pixels by the fixed-function stage)");
+  IDirect3DDevice9_SetVertexShader(g_device, vs11);
+  clear(0xFF000000);
+  shader_quad(0xFF808080);
+  read_back();
+  check(near_colour(pixel(32, 32), 191, 128, 64) && pixel(6, 32) == 0, "... and the same shader as vs_1_1");
+
+  /* the same from a vertex buffer through a declaration, drawn by indices */
+  static const D3DVERTEXELEMENT9 elements[4] = {{0, 0, D3DDECLTYPE_FLOAT3, 0, D3DDECLUSAGE_POSITION, 0}, {0, 12, D3DDECLTYPE_D3DCOLOR, 0, D3DDECLUSAGE_COLOR, 0},
+                                                {0, 16, D3DDECLTYPE_FLOAT2, 0, D3DDECLUSAGE_TEXCOORD, 0}, D3DDECL_END()};
+  const ShaderVertex corners[4] = {{-1, 1, 0.5f, 0xFFFFFFFF, 0, 0}, {1, 1, 0.5f, 0xFFFFFFFF, 1, 0}, {-1, -1, 0.5f, 0xFFFFFFFF, 0, 1}, {1, -1, 0.5f, 0xFFFFFFFF, 1, 1}};
+  const WORD order[6] = {0, 1, 2, 2, 1, 3};
+  IDirect3DVertexDeclaration9 *declaration = NULL;
+  IDirect3DVertexBuffer9 *vb = NULL;
+  IDirect3DIndexBuffer9 *ib = NULL;
+  void *memory = NULL;
+  IDirect3DDevice9_CreateVertexDeclaration(g_device, elements, &declaration);
+  IDirect3DDevice9_CreateVertexBuffer(g_device, sizeof corners, 0, 0, D3DPOOL_MANAGED, &vb, NULL);
+  IDirect3DDevice9_CreateIndexBuffer(g_device, sizeof order, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED, &ib, NULL);
+  if (vb && SUCCEEDED(IDirect3DVertexBuffer9_Lock(vb, 0, 0, &memory, 0))) { memcpy(memory, corners, sizeof corners); IDirect3DVertexBuffer9_Unlock(vb); }
+  if (ib && SUCCEEDED(IDirect3DIndexBuffer9_Lock(ib, 0, 0, &memory, 0))) { memcpy(memory, order, sizeof order); IDirect3DIndexBuffer9_Unlock(ib); }
+  if (declaration && vb && ib) {
+    /* ... with a pixel shader: its constants follow the vertex shader's in what a draw is given, and it takes one branch or the other by one */
+    const float one[4] = {1, 0, 0, 0}, none[4] = {0, 0, 0, 0}, weights[4] = {0, 0, 0, 0};
+    IDirect3DDevice9_SetVertexShader(g_device, vs);
+    IDirect3DDevice9_SetPixelShader(g_device, (IDirect3DPixelShader9 *)ps_math);
+    IDirect3DDevice9_SetVertexDeclaration(g_device, declaration);
+    IDirect3DDevice9_SetStreamSource(g_device, 0, vb, 0, sizeof corners[0]);
+    IDirect3DDevice9_SetIndices(g_device, ib);
+    basic_constants(0.5f, 0.5f, 0.0f, 0.25f);      /* (white becomes 0.75 0.75 0.25) */
+    IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, one, 1);
+    IDirect3DDevice9_SetPixelShaderConstantF(g_device, 1, weights, 1);
+    clear(0xFF000000);
+    const HRESULT drawn = IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    read_back();
+    check(drawn == D3D_OK && near_colour(pixel(32, 32), 255, 255, 128) && pixel(6, 32) == 0, "a vertex and a pixel shader, from a vertex buffer through a declaration: twice the colour");
+    IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, none, 1);
+    clear(0xFF000000);
+    IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    read_back();
+    check(near_colour(pixel(32, 32), 64, 191, 191), "a constant of the pixel shader's takes its other branch: red and blue change places");
+    /* Shader Model 3: outputs and inputs by what they are */
+    IDirect3DDevice9_SetVertexShader(g_device, vs30);
+    IDirect3DDevice9_SetPixelShader(g_device, ps_math30);
+    clear(0xFF000000);
+    IDirect3DDevice9_DrawIndexedPrimitive(g_device, D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2);
+    read_back();
+    check(near_colour(pixel(32, 32), 64, 191, 191) && pixel(6, 32) == 0, "the same two as vs_3_0 and ps_3_0");
+  } else check(0, "a declaration, a vertex buffer and an index buffer for the shaders");
+
+  /* a pixel shader that samples: the vertex shader doubles the texture coordinates, so the 2 x 2 texture is there four times */
+  const DWORD texels[4] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0x00FFFFFF};
+  const float tint[4] = {1, 1, 1, 1}, half[4] = {0.5f, 1, 1, 1};
+  IDirect3DTexture9 *texture = make_texture(D3DFMT_A8R8G8B8, texels, 4);
+  IDirect3DDevice9_SetTexture(g_device, 0, (IDirect3DBaseTexture9 *)texture);
+  IDirect3DDevice9_SetVertexShader(g_device, vs);
+  IDirect3DDevice9_SetPixelShader(g_device, ps_tex);
+  const float all[5][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}};      /* (the colour stays white; the coordinates are doubled and moved by one) */
+  IDirect3DDevice9_SetVertexShaderConstantF(g_device, 0, &all[0][0], 5);
+  IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, tint, 1);
+  clear(0xFF202020);
+  shader_quad(0xFFFFFFFF);
+  read_back();
+  check(texture && pixel(8, 8) == 0xFF0000 && pixel(24, 8) == 0x00FF00 && pixel(40, 8) == 0xFF0000 && pixel(8, 24) == 0x0000FF && pixel(40, 56) == 0x0000FF,
+        "a pixel shader samples the texture, at coordinates the vertex shader made");
+  check(pixel(24, 24) == 0x202020 && pixel(56, 56) == 0x202020, "... and leaves a pixel out (texkill)");
+  /* the fixed-function vertex stage with the pixel shader: vertices that are pixels already */
+  IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, half, 1);
+  clear(0xFF202020);
+  textured_quad(0, 0, 64, 64, 0xFFFFFFFF);      /* (XYZRHW: the vertex shader that is set is passed by) */
+  read_back();
+  check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 8), 0, 255, 0) && near_colour(pixel(8, 56), 0, 0, 255) && pixel(56, 56) == 0x202020,
+        "a pixel shader after the fixed-function vertex stage, with its constant as the tint");
+
+  /* a state block keeps the shaders and their constants */
+  IDirect3DStateBlock9 *block = NULL;
+  IDirect3DPixelShader9 *now = NULL;
+  float tint_now[4] = {0, 0, 0, 0};
+  IDirect3DDevice9_CreateStateBlock(g_device, D3DSBT_ALL, &block);
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, tint, 1);
+  if (block) IDirect3DStateBlock9_Apply(block);
+  IDirect3DDevice9_GetPixelShader(g_device, &now);
+  IDirect3DDevice9_GetPixelShaderConstantF(g_device, 0, tint_now, 1);
+  check(block && now == ps_tex && tint_now[0] == 0.5f, "a state block sets the pixel shader and its constants back");
+  if (now) IDirect3DPixelShader9_Release(now);
+  if (block) IDirect3DStateBlock9_Release(block);
+
+  /* back to the fixed-function pipeline: it draws as before */
+  IDirect3DDevice9_SetVertexShader(g_device, NULL);
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  IDirect3DDevice9_SetTexture(g_device, 0, NULL);
+  IDirect3DDevice9_SetStreamSource(g_device, 0, NULL, 0, 0);
+  IDirect3DDevice9_SetIndices(g_device, NULL);
+  IDirect3DDevice9_SetVertexDeclaration(g_device, NULL);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0xFF00FF00);
+  read_back();
+  check(pixel(32, 32) == 0x00FF00, "with no shaders set the fixed-function pipeline draws again");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
+  int gone = 1;
+  if (declaration) gone = gone && IDirect3DVertexDeclaration9_Release(declaration) == 0;
+  if (vb) gone = gone && IDirect3DVertexBuffer9_Release(vb) == 0;
+  if (ib) gone = gone && IDirect3DIndexBuffer9_Release(ib) == 0;
+  if (texture) gone = gone && IDirect3DTexture9_Release(texture) == 0;
+  gone = gone && IDirect3DVertexShader9_Release(vs) == 0 && IDirect3DVertexShader9_Release(vs11) == 0 && IDirect3DVertexShader9_Release(vs30) == 0;
+  gone = gone && IDirect3DPixelShader9_Release(ps_math) == 0 && IDirect3DPixelShader9_Release(ps_math30) == 0 && IDirect3DPixelShader9_Release(ps_tex) == 0;
+  check(gone, "the shaders and what they drew from are gone with their last references");
+}
+
 static void test_render_to_texture(void) {
   IDirect3DTexture9 *target = NULL;
   IDirect3DSurface9 *surface = NULL, *back = NULL, *depth = NULL;
@@ -435,6 +622,7 @@ int main(void) {
     test_textures();
     test_depth();
     test_state_blocks();
+    test_shaders();
     test_render_to_texture();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");

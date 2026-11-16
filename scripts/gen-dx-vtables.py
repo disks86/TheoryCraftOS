@@ -76,6 +76,8 @@ SPECS = {
         ('IDirect3DSurface9', 'surf_vtbl', ['surf', 'res9', 'child', 'obj']),
         ('IDirect3DVertexDeclaration9', 'decl_vtbl', ['decl', 'child', 'obj']),
         ('IDirect3DStateBlock9', 'sb_vtbl', ['sb', 'child', 'obj']),
+        ('IDirect3DVertexShader9', 'vs_vtbl', ['shader', 'child', 'obj']),
+        ('IDirect3DPixelShader9', 'ps_vtbl', ['shader', 'child', 'obj']),
     ],
 }
 

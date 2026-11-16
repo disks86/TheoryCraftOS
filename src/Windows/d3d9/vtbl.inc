@@ -35,18 +35,6 @@ static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetPaletteEntries(IDirect3DDevice
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetCurrentTexturePalette(IDirect3DDevice9 *This, UINT PaletteNumber) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetCurrentTexturePalette(IDirect3DDevice9 *This, UINT *PaletteNumber) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_ProcessVertices(IDirect3DDevice9 *This, UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetVertexShaderConstantF(IDirect3DDevice9 *This, UINT reg_idx, const float *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetVertexShaderConstantF(IDirect3DDevice9 *This, UINT StartRegister, float* pConstantData, UINT Vector4fCount) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetVertexShaderConstantI(IDirect3DDevice9 *This, UINT reg_idx, const int *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetVertexShaderConstantI(IDirect3DDevice9 *This, UINT StartRegister, int* pConstantData, UINT Vector4iCount) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetVertexShaderConstantB(IDirect3DDevice9 *This, UINT reg_idx, const WINBOOL *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetVertexShaderConstantB(IDirect3DDevice9 *This, UINT StartRegister, WINBOOL* pConstantData, UINT BoolCount) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetPixelShaderConstantF(IDirect3DDevice9 *This, UINT reg_idx, const float *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetPixelShaderConstantF(IDirect3DDevice9 *This, UINT StartRegister, float* pConstantData, UINT Vector4fCount) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetPixelShaderConstantI(IDirect3DDevice9 *This, UINT reg_idx, const int *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetPixelShaderConstantI(IDirect3DDevice9 *This, UINT StartRegister, int* pConstantData, UINT Vector4iCount) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_SetPixelShaderConstantB(IDirect3DDevice9 *This, UINT reg_idx, const WINBOOL *data, UINT count) { return E_NOTIMPL; }
-static HRESULT STDMETHODCALLTYPE dev_vtbl_none_GetPixelShaderConstantB(IDirect3DDevice9 *This, UINT StartRegister, WINBOOL* pConstantData, UINT BoolCount) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_DrawRectPatch(IDirect3DDevice9 *This, UINT handle, const float *segment_count, const D3DRECTPATCH_INFO *patch_info) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_DrawTriPatch(IDirect3DDevice9 *This, UINT handle, const float *segment_count, const D3DTRIPATCH_INFO *patch_info) { return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE dev_vtbl_none_DeletePatch(IDirect3DDevice9 *This, UINT Handle) { return E_NOTIMPL; }
@@ -146,12 +134,12 @@ const IDirect3DDevice9Vtbl dev_vtbl = {
     .CreateVertexShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreateVertexShader))dev_CreateVertexShader,
     .SetVertexShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShader))dev_SetVertexShader,
     .GetVertexShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShader))dev_GetVertexShader,
-    .SetVertexShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantF))dev_vtbl_none_SetVertexShaderConstantF,
-    .GetVertexShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantF))dev_vtbl_none_GetVertexShaderConstantF,
-    .SetVertexShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantI))dev_vtbl_none_SetVertexShaderConstantI,
-    .GetVertexShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantI))dev_vtbl_none_GetVertexShaderConstantI,
-    .SetVertexShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantB))dev_vtbl_none_SetVertexShaderConstantB,
-    .GetVertexShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantB))dev_vtbl_none_GetVertexShaderConstantB,
+    .SetVertexShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantF))dev_SetVertexShaderConstantF,
+    .GetVertexShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantF))dev_GetVertexShaderConstantF,
+    .SetVertexShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantI))dev_SetVertexShaderConstantI,
+    .GetVertexShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantI))dev_GetVertexShaderConstantI,
+    .SetVertexShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetVertexShaderConstantB))dev_SetVertexShaderConstantB,
+    .GetVertexShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetVertexShaderConstantB))dev_GetVertexShaderConstantB,
     .SetStreamSource = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetStreamSource))dev_SetStreamSource,
     .GetStreamSource = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetStreamSource))dev_GetStreamSource,
     .SetStreamSourceFreq = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetStreamSourceFreq))dev_SetStreamSourceFreq,
@@ -161,12 +149,12 @@ const IDirect3DDevice9Vtbl dev_vtbl = {
     .CreatePixelShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->CreatePixelShader))dev_CreatePixelShader,
     .SetPixelShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShader))dev_SetPixelShader,
     .GetPixelShader = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShader))dev_GetPixelShader,
-    .SetPixelShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantF))dev_vtbl_none_SetPixelShaderConstantF,
-    .GetPixelShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantF))dev_vtbl_none_GetPixelShaderConstantF,
-    .SetPixelShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantI))dev_vtbl_none_SetPixelShaderConstantI,
-    .GetPixelShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantI))dev_vtbl_none_GetPixelShaderConstantI,
-    .SetPixelShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantB))dev_vtbl_none_SetPixelShaderConstantB,
-    .GetPixelShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantB))dev_vtbl_none_GetPixelShaderConstantB,
+    .SetPixelShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantF))dev_SetPixelShaderConstantF,
+    .GetPixelShaderConstantF = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantF))dev_GetPixelShaderConstantF,
+    .SetPixelShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantI))dev_SetPixelShaderConstantI,
+    .GetPixelShaderConstantI = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantI))dev_GetPixelShaderConstantI,
+    .SetPixelShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->SetPixelShaderConstantB))dev_SetPixelShaderConstantB,
+    .GetPixelShaderConstantB = (__typeof__(((IDirect3DDevice9Vtbl *)0)->GetPixelShaderConstantB))dev_GetPixelShaderConstantB,
     .DrawRectPatch = (__typeof__(((IDirect3DDevice9Vtbl *)0)->DrawRectPatch))dev_vtbl_none_DrawRectPatch,
     .DrawTriPatch = (__typeof__(((IDirect3DDevice9Vtbl *)0)->DrawTriPatch))dev_vtbl_none_DrawTriPatch,
     .DeletePatch = (__typeof__(((IDirect3DDevice9Vtbl *)0)->DeletePatch))dev_vtbl_none_DeletePatch,
@@ -273,4 +261,18 @@ const IDirect3DStateBlock9Vtbl sb_vtbl = {
     .GetDevice = (__typeof__(((IDirect3DStateBlock9Vtbl *)0)->GetDevice))child_GetDevice,
     .Capture = (__typeof__(((IDirect3DStateBlock9Vtbl *)0)->Capture))sb_Capture,
     .Apply = (__typeof__(((IDirect3DStateBlock9Vtbl *)0)->Apply))sb_Apply,
+};
+const IDirect3DVertexShader9Vtbl vs_vtbl = {
+    .QueryInterface = (__typeof__(((IDirect3DVertexShader9Vtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((IDirect3DVertexShader9Vtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((IDirect3DVertexShader9Vtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((IDirect3DVertexShader9Vtbl *)0)->GetDevice))child_GetDevice,
+    .GetFunction = (__typeof__(((IDirect3DVertexShader9Vtbl *)0)->GetFunction))shader_GetFunction,
+};
+const IDirect3DPixelShader9Vtbl ps_vtbl = {
+    .QueryInterface = (__typeof__(((IDirect3DPixelShader9Vtbl *)0)->QueryInterface))obj_QueryInterface,
+    .AddRef = (__typeof__(((IDirect3DPixelShader9Vtbl *)0)->AddRef))obj_AddRef,
+    .Release = (__typeof__(((IDirect3DPixelShader9Vtbl *)0)->Release))obj_Release,
+    .GetDevice = (__typeof__(((IDirect3DPixelShader9Vtbl *)0)->GetDevice))child_GetDevice,
+    .GetFunction = (__typeof__(((IDirect3DPixelShader9Vtbl *)0)->GetFunction))shader_GetFunction,
 };

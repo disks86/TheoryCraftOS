@@ -66,10 +66,17 @@ static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
   SetRect(&s->scissor, 0, 0, (int)width, (int)height);
   memset(&s->material, 0, sizeof s->material);
   s->fvf = 0;
+  memset(s->vs_float, 0, sizeof s->vs_float);
+  memset(s->ps_float, 0, sizeof s->ps_float);
+  memset(s->vs_int, 0, sizeof s->vs_int);
+  memset(s->ps_int, 0, sizeof s->ps_int);
+  s->vs_bool = s->ps_bool = 0;
 }
 /* Gives back the references a state holds. */
 static void state_release(State *s) {
   bind(&s->decl, NULL);
+  bind(&s->vs, NULL);
+  bind(&s->ps, NULL);
   bind(&s->indices, NULL);
   for (UINT i = 0; i < STREAMS; ++i) bind(&s->stream[i].buffer, NULL);
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) bind(&s->tex[i], NULL);
@@ -77,6 +84,8 @@ static void state_release(State *s) {
 /* `*to` becomes `*from`, with the references of what both hold moved. */
 static void state_copy(State *to, const State *from) {
   bind(&to->decl, from->decl);
+  bind(&to->vs, from->vs);
+  bind(&to->ps, from->ps);
   bind(&to->indices, from->indices);
   for (UINT i = 0; i < STREAMS; ++i) bind(&to->stream[i].buffer, from->stream[i].buffer);
   for (UINT i = 0; i < TEXTURE_SLOTS; ++i) bind(&to->tex[i], from->tex[i]);
@@ -263,13 +272,125 @@ static HRESULT STDMETHODCALLTYPE dev_GetTexture(Dev *d, DWORD stage, IDirect3DBa
   if (*texture) dx_AddRef(OBJ(*texture));
   return D3D_OK;
 }
-/* (there are no shaders of the program's: none can be made, and "none" is what is always set) */
-static HRESULT STDMETHODCALLTYPE dev_SetVertexShader(Dev *d, IDirect3DVertexShader9 *shader) { (void)d; return shader ? D3DERR_INVALIDCALL : D3D_OK; }
-static HRESULT STDMETHODCALLTYPE dev_GetVertexShader(Dev *d, IDirect3DVertexShader9 **shader) { (void)d; if (!shader) return D3DERR_INVALIDCALL; *shader = NULL; return D3D_OK; }
-static HRESULT STDMETHODCALLTYPE dev_SetPixelShader(Dev *d, IDirect3DPixelShader9 *shader) { (void)d; return shader ? D3DERR_INVALIDCALL : D3D_OK; }
-static HRESULT STDMETHODCALLTYPE dev_GetPixelShader(Dev *d, IDirect3DPixelShader9 **shader) { (void)d; if (!shader) return D3DERR_INVALIDCALL; *shader = NULL; return D3D_OK; }
-static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const DWORD *code, IDirect3DVertexShader9 **shader) { (void)d; (void)code; if (shader) *shader = NULL; return D3DERR_INVALIDCALL; }
-static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const DWORD *code, IDirect3DPixelShader9 **shader) { (void)d; (void)code; if (shader) *shader = NULL; return D3DERR_INVALIDCALL; }
+
+/* ---- the program's shaders -------------------------------------------------------------------------------------------------------------------------- */
+
+static void shader_destroy(DxObj *o) {
+  Shader *s = (Shader *)o;
+  mem_free(s->code);
+  mem_free(s->dxbc);
+  child_destroy(o);
+}
+static HRESULT STDMETHODCALLTYPE shader_GetFunction(Shader *s, void *data, UINT *size) {
+  if (!size) return D3DERR_INVALIDCALL;
+  if (data) {
+    if (*size < s->code_bytes) return D3DERR_INVALIDCALL;
+    memcpy(data, s->code, s->code_bytes);
+  }
+  *size = s->code_bytes;
+  return D3D_OK;
+}
+/* Makes a shader of the tokens at `code`, which end where the shader says they do. The translation is what a draw's pipeline is made of; a shader
+ * the translator does not take (sm_to_dxbc.h says which) cannot be made. */
+static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out) {
+  if (!out) return D3DERR_INVALIDCALL;
+  *out = NULL;
+  if (!code) return D3DERR_INVALIDCALL;
+  /* (the two are far too big for the stack) */
+  SmShader *translated = mem_alloc(sizeof *translated);
+  SmContext *context = mem_alloc(sizeof *context);
+  Shader *s = NULL;
+  HRESULT hr = E_OUTOFMEMORY;
+  if (translated && context) {
+    const int status = sm_translate((const uint32_t *)code, SM_MAX_TOKENS, translated, context);
+    hr = status == SM_OK && (translated->vertex != 0) == (vertex != 0) ? D3D_OK : D3DERR_INVALIDCALL;
+    if (status == SM_UNSUPPORTED) OutputDebugStringA(vertex ? "d3d9: a vertex shader uses what this Direct3D 9 has not\n" : "d3d9: a pixel shader uses what this Direct3D 9 has not\n");
+  }
+  if (SUCCEEDED(hr)) {
+    s = child_new(sizeof *s, d, vertex ? (const void *)&vs_vtbl : (const void *)&ps_vtbl, vertex ? g_vs_iids : g_ps_iids, shader_destroy);
+    hr = s ? D3D_OK : E_OUTOFMEMORY;
+  }
+  if (s) {
+    s->vertex = vertex;
+    s->code_bytes = (UINT)translated->tokens * 4;
+    s->dxbc_bytes = (UINT)translated->dxbc_size;
+    s->code = mem_alloc(s->code_bytes);
+    s->dxbc = mem_alloc(s->dxbc_bytes);
+    if (s->code && s->dxbc) {
+      memcpy(s->code, code, s->code_bytes);
+      memcpy(s->dxbc, translated->dxbc, s->dxbc_bytes);
+      s->floats = translated->float_registers;
+      s->bools = translated->bools_used;
+      s->registers = translated->constant_registers;
+      for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
+      s->input_count = translated->input_count;
+      memcpy(s->inputs, translated->inputs, sizeof s->inputs);
+      *out = s;
+    } else {
+      dx_Release(OBJ(s));
+      hr = E_OUTOFMEMORY;
+    }
+  }
+  mem_free(translated);
+  mem_free(context);
+  return hr;
+}
+static HRESULT STDMETHODCALLTYPE dev_CreateVertexShader(Dev *d, const DWORD *code, IDirect3DVertexShader9 **shader) { return shader_make(d, code, TRUE, (Shader **)shader); }
+static HRESULT STDMETHODCALLTYPE dev_CreatePixelShader(Dev *d, const DWORD *code, IDirect3DPixelShader9 **shader) { return shader_make(d, code, FALSE, (Shader **)shader); }
+static HRESULT STDMETHODCALLTYPE dev_SetVertexShader(Dev *d, IDirect3DVertexShader9 *shader) {
+  if (shader && ((DxObj *)shader)->lpVtbl != (const void *)&vs_vtbl) return D3DERR_INVALIDCALL;
+  bind(&d->state.vs, shader);
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_GetVertexShader(Dev *d, IDirect3DVertexShader9 **shader) {
+  if (!shader) return D3DERR_INVALIDCALL;
+  *shader = (IDirect3DVertexShader9 *)d->state.vs;
+  if (*shader) dx_AddRef(OBJ(*shader));
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_SetPixelShader(Dev *d, IDirect3DPixelShader9 *shader) {
+  if (shader && ((DxObj *)shader)->lpVtbl != (const void *)&ps_vtbl) return D3DERR_INVALIDCALL;
+  bind(&d->state.ps, shader);
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_GetPixelShader(Dev *d, IDirect3DPixelShader9 **shader) {
+  if (!shader) return D3DERR_INVALIDCALL;
+  *shader = (IDirect3DPixelShader9 *)d->state.ps;
+  if (*shader) dx_AddRef(OBJ(*shader));
+  return D3D_OK;
+}
+
+/* The constants: registers of four floats or four integers, and bools, kept for each stage whatever shader is set. (No shader the translator takes
+ * reads the integers: they count loops.) */
+/* `count` registers of 16 bytes from `first`, between a program's memory and the `limit` registers at `registers`. */
+static HRESULT registers_copy(void *registers, UINT limit, UINT first, void *to, const void *from, UINT count) {
+  if ((!to && !from) || first > limit || count > limit - first) return D3DERR_INVALIDCALL;
+  if (count && from) memcpy((BYTE *)registers + (SIZE_T)first * 16, from, (SIZE_T)count * 16);
+  if (count && to) memcpy(to, (const BYTE *)registers + (SIZE_T)first * 16, (SIZE_T)count * 16);
+  return D3D_OK;
+}
+static HRESULT bools_set(DWORD *bools, UINT first, const BOOL *data, UINT count) {
+  if (!data || first > 16 || count > 16 - first) return D3DERR_INVALIDCALL;
+  for (UINT i = 0; i < count; ++i) *bools = (*bools & ~(1u << (first + i))) | (data[i] ? 1u << (first + i) : 0u);
+  return D3D_OK;
+}
+static HRESULT bools_get(DWORD bools, UINT first, BOOL *data, UINT count) {
+  if (!data || first > 16 || count > 16 - first) return D3DERR_INVALIDCALL;
+  for (UINT i = 0; i < count; ++i) data[i] = (bools >> (first + i)) & 1;
+  return D3D_OK;
+}
+static HRESULT STDMETHODCALLTYPE dev_SetVertexShaderConstantF(Dev *d, UINT first, const float *data, UINT count) { return registers_copy(d->state.vs_float, VS_FLOATS, first, NULL, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetVertexShaderConstantF(Dev *d, UINT first, float *data, UINT count) { return registers_copy(d->state.vs_float, VS_FLOATS, first, data, NULL, count); }
+static HRESULT STDMETHODCALLTYPE dev_SetVertexShaderConstantI(Dev *d, UINT first, const int *data, UINT count) { return registers_copy(d->state.vs_int, 16, first, NULL, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetVertexShaderConstantI(Dev *d, UINT first, int *data, UINT count) { return registers_copy(d->state.vs_int, 16, first, data, NULL, count); }
+static HRESULT STDMETHODCALLTYPE dev_SetVertexShaderConstantB(Dev *d, UINT first, const BOOL *data, UINT count) { return bools_set(&d->state.vs_bool, first, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetVertexShaderConstantB(Dev *d, UINT first, BOOL *data, UINT count) { return bools_get(d->state.vs_bool, first, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_SetPixelShaderConstantF(Dev *d, UINT first, const float *data, UINT count) { return registers_copy(d->state.ps_float, PS_FLOATS, first, NULL, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetPixelShaderConstantF(Dev *d, UINT first, float *data, UINT count) { return registers_copy(d->state.ps_float, PS_FLOATS, first, data, NULL, count); }
+static HRESULT STDMETHODCALLTYPE dev_SetPixelShaderConstantI(Dev *d, UINT first, const int *data, UINT count) { return registers_copy(d->state.ps_int, 16, first, NULL, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetPixelShaderConstantI(Dev *d, UINT first, int *data, UINT count) { return registers_copy(d->state.ps_int, 16, first, data, NULL, count); }
+static HRESULT STDMETHODCALLTYPE dev_SetPixelShaderConstantB(Dev *d, UINT first, const BOOL *data, UINT count) { return bools_set(&d->state.ps_bool, first, data, count); }
+static HRESULT STDMETHODCALLTYPE dev_GetPixelShaderConstantB(Dev *d, UINT first, BOOL *data, UINT count) { return bools_get(d->state.ps_bool, first, data, count); }
 
 /* ---- state blocks ----------------------------------------------------------------------------------------------------------------------------------- */
 

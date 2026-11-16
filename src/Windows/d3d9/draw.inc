@@ -16,7 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* Part of d3d9.c: drawing. A draw decodes the vertices it reads into the shaders' one layout, copies its indices, works out the Direct3D 12
+/* Part of d3d9.c: drawing. A draw decodes the vertices it reads into the vertex shader's layout (the fixed-function one's, or one register for each
+ * input of the program's), copies its indices, works out the Direct3D 12
  * pipeline and the constants of the state that is set, and records the draw. */
 
 /* ---- vertices --------------------------------------------------------------------------------------------------------------------------------------- */
@@ -91,16 +92,75 @@ static void decode_vertices(const Layout *l, const Source *sources, UINT first, 
   }
 }
 
+/* Where the inputs of a program's vertex shader are in the vertices: for each, the element of the declaration that is the same thing (usage and
+ * index); type 255 for an input the vertices have not, which the shader reads as 0, 0, 0, 1. */
+static void shader_attributes(const Shader *vs, const D3DVERTEXELEMENT9 *e, Attribute *out) {
+  for (UINT i = 0; i < vs->input_count; ++i) {
+    out[i] = g_no_attribute;
+    for (UINT k = 0; k < MAX_ELEMENTS && e[k].Stream != 0xFF; ++k) {
+      if (e[k].Stream >= STREAMS || e[k].Usage != vs->inputs[i].usage || e[k].UsageIndex != vs->inputs[i].index || !type_bytes(e[k].Type)) continue;
+      const Attribute a = {(BYTE)e[k].Stream, e[k].Type, e[k].Offset};
+      out[i] = a;
+      break;
+    }
+  }
+}
+/* Decodes `count` vertices from `first` for a program's vertex shader: four floats for each of its `inputs` inputs. */
+static void decode_shader_vertices(const Attribute *a, UINT inputs, const Source *sources, UINT first, UINT count, BYTE *out) {
+  for (UINT v = 0; v < count; ++v) {
+    for (UINT i = 0; i < inputs; ++i, out += 16) {
+      float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+      if (a[i].type != 255) decode_element(a[i].type, sources[a[i].stream].data + (SIZE_T)(first + v) * sources[a[i].stream].stride + a[i].offset, value);
+      memcpy(out, value, 16);
+    }
+  }
+}
+
 /* ---- pipelines -------------------------------------------------------------------------------------------------------------------------------------- */
 
 static D3D12_BLEND blend_of(DWORD value) { return value >= D3DBLEND_ZERO && value <= D3DBLEND_SRCALPHASAT ? (D3D12_BLEND)value : D3D12_BLEND_ONE; }      /* (the same numbers) */
 static UINT op_of(DWORD value, UINT lowest, UINT highest, UINT otherwise) { return value >= lowest && value <= highest ? value : otherwise; }
 
-/* The Direct3D 12 pipeline state of the render states that are set; NULL when it cannot be made. */
-static ID3D12PipelineState *pipeline_get(Dev *d) {
+/* The textures a draw's tables hold: the two stages of the fixed-function pixel shader, or the samplers a program's reads, as 2, 4, 8 or 16. */
+static UINT texture_slots(const Shader *ps) {
+  const UINT count = ps ? ps->sampler_count : STAGES;
+  return count <= 2 ? 2 : count <= 4 ? 4 : count <= 8 ? 8 : 16;
+}
+/* The root signature for so many textures: the block of constants (b0), the textures (t0 ..) and their samplers (s0 ..). NULL: it cannot be made. */
+static ID3D12RootSignature *root_get(Dev *d, UINT slots) {
+  ID3D12RootSignature **root = &d->roots[slots <= 2 ? 0 : slots <= 4 ? 1 : slots <= 8 ? 2 : 3];
+  if (*root) return *root;
+  D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slots, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, slots, 0, 0, 0};
+  D3D12_ROOT_PARAMETER params[3];
+  memset(params, 0, sizeof params);
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[1].DescriptorTable.NumDescriptorRanges = 1;
+  params[1].DescriptorTable.pDescriptorRanges = &views;
+  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[2].DescriptorTable.NumDescriptorRanges = 1;
+  params[2].DescriptorTable.pDescriptorRanges = &samplers;
+  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC rsd = {3, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ID3DBlob *blob = NULL, *error = NULL;
+  HRESULT hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
+  if (error) ID3D10Blob_Release(error);
+  if (SUCCEEDED(hr) && blob)
+    hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)root);
+  if (blob) ID3D10Blob_Release(blob);
+  if (FAILED(hr)) *root = NULL;
+  return *root;
+}
+
+/* The Direct3D 12 pipeline state of the shaders (NULL: the fixed-function one) and the render states that are set; NULL when it cannot be made. */
+static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader *ps) {
   const DWORD *rs = d->state.rs;
   Pipeline key;
   memset(&key, 0, sizeof key);
+  key.vs = vs ? vs->c.id : 0;
+  key.ps = ps ? ps->c.id : 0;
   key.cull = rs[D3DRS_CULLMODE];
   key.z = rs[D3DRS_ZENABLE] != D3DZB_FALSE && d->depth != NULL;
   key.zwrite = rs[D3DRS_ZWRITEENABLE] != 0;
@@ -137,11 +197,18 @@ static ID3D12PipelineState *pipeline_get(Dev *d) {
                                                      {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
-  pd.pRootSignature = d->root;
-  pd.VS.pShaderBytecode = g_ff_vs;
-  pd.VS.BytecodeLength = sizeof g_ff_vs;
-  pd.PS.pShaderBytecode = g_ff_ps;
-  pd.PS.BytecodeLength = sizeof g_ff_ps;
+  /* (a program's vertex shader: its inputs are "ATTR" and the number of the register, each four floats, in the order the vertices are decoded in) */
+  D3D12_INPUT_ELEMENT_DESC inputs[SHADER_INPUTS];
+  for (UINT i = 0; vs && i < vs->input_count; ++i) {
+    const D3D12_INPUT_ELEMENT_DESC input = {"ATTR", vs->inputs[i].reg, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16 * i, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
+    inputs[i] = input;
+  }
+  pd.pRootSignature = root_get(d, texture_slots(ps));
+  if (!pd.pRootSignature) return NULL;
+  pd.VS.pShaderBytecode = vs ? vs->dxbc : g_ff_vs;
+  pd.VS.BytecodeLength = vs ? vs->dxbc_bytes : sizeof g_ff_vs;
+  pd.PS.pShaderBytecode = ps ? ps->dxbc : g_ff_ps;
+  pd.PS.BytecodeLength = ps ? ps->dxbc_bytes : sizeof g_ff_ps;
   pd.SampleMask = 0xFFFFFFFFu;
   D3D12_RENDER_TARGET_BLEND_DESC *blend = &pd.BlendState.RenderTarget[0];
   blend->BlendEnable = key.blend;
@@ -168,15 +235,15 @@ static ID3D12PipelineState *pipeline_get(Dev *d) {
   pd.DepthStencilState.FrontFace.StencilPassOp = (D3D12_STENCIL_OP)key.spass;
   pd.DepthStencilState.FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.sfunc;
   pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
-  pd.InputLayout.pInputElementDescs = layout;
-  pd.InputLayout.NumElements = 4;
+  pd.InputLayout.pInputElementDescs = vs ? inputs : layout;
+  pd.InputLayout.NumElements = vs ? vs->input_count : 4;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
   pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
   if (d->depth) pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
   pd.SampleDesc.Count = 1;
   ID3D12PipelineState *state = NULL;
-  TcosD3D12PipelineOptions(d->d12, VERTEX_REGISTERS, 0);      /* (the pixel shader's constants come after the vertex shader's) */
+  TcosD3D12PipelineOptions(d->d12, vs ? vs->registers : VERTEX_REGISTERS, 0);      /* (the pixel shader's constants come after the vertex shader's) */
   if (FAILED(ID3D12Device_CreateGraphicsPipelineState(d->d12, &pd, &IID_ID3D12PipelineState, (void **)&state)) || !state) return NULL;
   Pipeline *slot = d->pipeline_count < PIPELINES ? &d->pipelines[d->pipeline_count++] : oldest;
   if (slot == oldest && slot->state) {
@@ -207,52 +274,73 @@ static void stage_weights(DWORD op, DWORD arg1, DWORD arg2, float out[4]) {
     default: break;
   }
 }
-/* Writes the block of constants of the draw and gives its address. */
-static UINT64 constants_of(Dev *d, const Layout *l) {
+/* The constants of a program's shader, as its translation reads them: the floats c0 .. and, if it reads bools, 16 registers whose first word is
+ * all ones for a bool that is set. */
+static void shader_constants(float *out, const Shader *shader, const float (*floats)[4], UINT have, DWORD bools) {
+  memcpy(out, floats, (SIZE_T)(shader->floats < have ? shader->floats : have) * 16);
+  for (UINT i = 0; shader->bools && i < SM_BOOL_REGISTERS; ++i) {
+    const DWORD word = (bools >> i & 1) ? 0xFFFFFFFFu : 0u;
+    memcpy(out + (shader->floats + i) * 4, &word, 4);
+  }
+}
+/* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
+static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
+/* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) */
+static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shader *ps) {
   const State *s = &d->state;
-  float block[CONSTANT_BYTES / 4];
-  memset(block, 0, sizeof block);
-  const D3DMATRIX world_view = matrix_multiply(&s->world, &s->view), all = matrix_multiply(&world_view, &s->projection);
-  for (int row = 0; row < 4; ++row)
-    for (int column = 0; column < 4; ++column) block[column * 4 + row] = all.m[row][column];      /* (kept column by column) */
-  block[16] = 2.0f / (float)s->viewport.Width;
-  block[17] = 2.0f / (float)s->viewport.Height;
-  block[18] = l->transformed ? 1.0f : 0.0f;
-  block[20] = (float)s->viewport.X;
-  block[21] = (float)s->viewport.Y;
-  float *pixel = block + VERTEX_REGISTERS * 4;
-  BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
-  for (UINT stage = 0; stage < STAGES; ++stage) {
-    const DWORD *t = s->stage[stage];
-    on = on && t[D3DTSS_COLOROP] != D3DTOP_DISABLE;
-    /* (a stage with no texture set passes on what it is given: untextured triangles keep their colour and their alpha, whatever the stage says) */
-    const BOOL textured = on && s->tex[stage] && s->tex[stage]->res && !s->tex[stage]->depth;
-    stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
-    stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
+  const UINT vertex_registers = vs ? vs->registers : VERTEX_REGISTERS;
+  const UINT bytes = (constant_registers(vs, ps) * 16 + 255) & ~255u;
+  float *block = (float *)(d->constant_data + d->constant_used);      /* (written where it will stand, and left there unless it is the last one again) */
+  memset(block, 0, bytes);
+  if (vs) shader_constants(block, vs, s->vs_float, VS_FLOATS, s->vs_bool);
+  else {
+    const D3DMATRIX world_view = matrix_multiply(&s->world, &s->view), all = matrix_multiply(&world_view, &s->projection);
+    for (int row = 0; row < 4; ++row)
+      for (int column = 0; column < 4; ++column) block[column * 4 + row] = all.m[row][column];      /* (kept column by column) */
+    block[16] = 2.0f / (float)s->viewport.Width;
+    block[17] = 2.0f / (float)s->viewport.Height;
+    block[18] = l->transformed ? 1.0f : 0.0f;
+    block[20] = (float)s->viewport.X;
+    block[21] = (float)s->viewport.Y;
   }
-  /* The alpha test, as the least alpha that is kept (the tests that keep the higher alphas; the others keep everything). */
-  float least = -1.0f;
-  if (s->rs[D3DRS_ALPHATESTENABLE]) {
-    const float reference = (float)(s->rs[D3DRS_ALPHAREF] & 0xFF);
-    if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATEREQUAL) least = reference / 255.0f;
-    else if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATER || s->rs[D3DRS_ALPHAFUNC] == D3DCMP_NOTEQUAL) least = (reference + 0.5f) / 255.0f;
+  float *pixel = block + vertex_registers * 4;
+  if (ps) shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
+  else {
+    BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
+    for (UINT stage = 0; stage < STAGES; ++stage) {
+      const DWORD *t = s->stage[stage];
+      on = on && t[D3DTSS_COLOROP] != D3DTOP_DISABLE;
+      /* (a stage with no texture set passes on what it is given: untextured triangles keep their colour and their alpha, whatever the stage says) */
+      const BOOL textured = on && s->tex[stage] && s->tex[stage]->res && !s->tex[stage]->depth;
+      stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
+      stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
+    }
+    /* The alpha test, as the least alpha that is kept (the tests that keep the higher alphas; the others keep everything). */
+    float least = -1.0f;
+    if (s->rs[D3DRS_ALPHATESTENABLE]) {
+      const float reference = (float)(s->rs[D3DRS_ALPHAREF] & 0xFF);
+      if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATEREQUAL) least = reference / 255.0f;
+      else if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATER || s->rs[D3DRS_ALPHAFUNC] == D3DCMP_NOTEQUAL) least = (reference + 0.5f) / 255.0f;
+    }
+    pixel[16] = least;
   }
-  pixel[16] = least;
-  if (!d->constant_valid || memcmp(d->constant_data + d->constant_last, block, CONSTANT_BYTES) != 0) {
+  if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;
-    memcpy(d->constant_data + d->constant_used, block, CONSTANT_BYTES);
-    d->constant_used += 256;
+    d->constant_last_bytes = bytes;
+    d->constant_used += bytes;
     d->constant_valid = 1;
   }
   return ID3D12Resource_GetGPUVirtualAddress(d->constant_ring) + d->constant_last;
 }
 
-/* The textures and samplers of the two stages: a table of each, made again when what is set changed. */
-static void tables_of(Dev *d) {
+/* The textures and samplers of the first `slots` stages: a table of each, made again when what is set changed. */
+static void tables_of(Dev *d, UINT slots) {
   const State *s = &d->state;
-  UINT ids[STAGES];
-  DWORD samplers[STAGES][4];
-  for (UINT i = 0; i < STAGES; ++i) {
+  UINT ids[TEXTURE_SLOTS];
+  DWORD samplers[TEXTURE_SLOTS][4];
+  if (d->table_count != slots) d->tables_valid = 0;
+  d->table_count = slots;
+  for (UINT i = 0; i < slots; ++i) {
     ids[i] = s->tex[i] && s->tex[i]->res && !s->tex[i]->depth ? s->tex[i]->c.id : 0;
     samplers[i][0] = s->sampler[i][D3DSAMP_ADDRESSU] | s->sampler[i][D3DSAMP_ADDRESSV] << 8;
     samplers[i][1] = s->sampler[i][D3DSAMP_MAGFILTER];
@@ -261,24 +349,24 @@ static void tables_of(Dev *d) {
   }
   const UINT step_views = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   const UINT step_samplers = ID3D12Device_GetDescriptorHandleIncrementSize(d->d12, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-  if (!d->tables_valid || memcmp(ids, d->table_ids, sizeof ids) != 0) {
+  if (!d->tables_valid || memcmp(ids, d->table_ids, slots * sizeof ids[0]) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->view_heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->view_heap);
     at.ptr += (SIZE_T)d->view_used * step_views;
     d->table_views = gpu.ptr + (UINT64)d->view_used * step_views;
-    for (UINT i = 0; i < STAGES; ++i) {
+    for (UINT i = 0; i < slots; ++i) {
       ID3D12Device_CreateShaderResourceView(d->d12, ids[i] ? s->tex[i]->res : d->blank->res, NULL, at);
       at.ptr += step_views;
     }
-    d->view_used += STAGES;
-    memcpy(d->table_ids, ids, sizeof ids);
+    d->view_used += slots;
+    memcpy(d->table_ids, ids, slots * sizeof ids[0]);
   }
-  if (!d->tables_valid || memcmp(samplers, d->table_sampler_states, sizeof samplers) != 0) {
+  if (!d->tables_valid || memcmp(samplers, d->table_sampler_states, slots * sizeof samplers[0]) != 0) {
     D3D12_CPU_DESCRIPTOR_HANDLE at = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(d->sampler_heap);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(d->sampler_heap);
     at.ptr += (SIZE_T)d->sampler_used * step_samplers;
     d->table_samplers = gpu.ptr + (UINT64)d->sampler_used * step_samplers;
-    for (UINT i = 0; i < STAGES; ++i) {
+    for (UINT i = 0; i < slots; ++i) {
       D3D12_SAMPLER_DESC desc;
       memset(&desc, 0, sizeof desc);
       /* (D3D12_FILTER: bit 4 a linear minification, bit 2 a linear magnification, bit 0 a linear step between levels) */
@@ -292,8 +380,8 @@ static void tables_of(Dev *d) {
       ID3D12Device_CreateSampler(d->d12, &desc, at);
       at.ptr += step_samplers;
     }
-    d->sampler_used += STAGES;
-    memcpy(d->table_sampler_states, samplers, sizeof samplers);
+    d->sampler_used += slots;
+    memcpy(d->table_sampler_states, samplers, slots * sizeof samplers[0]);
   }
   d->tables_valid = 1;
 }
@@ -328,28 +416,43 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   const UINT elements = primitive_elements(type, primitives);
   if (!elements || !d->target) return D3DERR_INVALIDCALL;
   Layout layout;
-  if (d->state.decl) layout = d->state.decl->layout; else layout_of_fvf(d->state.fvf, &layout);
-  if (layout.position.type == 255) return D3DERR_INVALIDCALL;
+  D3DVERTEXELEMENT9 fvf[16];
+  const D3DVERTEXELEMENT9 *declared = d->state.decl ? d->state.decl->elements : fvf;
+  if (d->state.decl) layout = d->state.decl->layout;
+  else layout_of_elements(fvf, fvf_elements(d->state.fvf, fvf), &layout);
+  /* The shaders of the draw. Positions that are pixels already pass no vertex shader, as Direct3D 9 has it. */
+  const Shader *vs = layout.transformed ? NULL : d->state.vs, *ps = d->state.ps;
+  Attribute inputs[SHADER_INPUTS];
   if (!indices) vertices = elements;
-  if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
-      !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices))
-    return D3DERR_INVALIDCALL;
+  if (vs) {
+    shader_attributes(vs, declared, inputs);
+    for (UINT i = 0; i < vs->input_count; ++i)
+      if (!attribute_inside(&inputs[i], sources, first_vertex, vertices)) return D3DERR_INVALIDCALL;
+  } else {
+    if (layout.position.type == 255) return D3DERR_INVALIDCALL;
+    if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices))
+      return D3DERR_INVALIDCALL;
+  }
+  const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES;
+  const UINT slots = texture_slots(ps);
   const BOOL fan = type == D3DPT_TRIANGLEFAN;
   const UINT out_indices = fan ? primitives * 3 : indices ? elements : 0;
-  if (vertices > VERTEX_RING / VERTEX_BYTES || out_indices > INDEX_RING / 4) return D3DERR_INVALIDCALL;
+  if (vertices > VERTEX_RING / stride || out_indices > INDEX_RING / 4 || constant_registers(vs, ps) > CONSTANT_REGISTERS) return D3DERR_INVALIDCALL;
 
   /* what may have to send the list first */
   settle(d, d->target->tex->sampled);      /* (a texture the list's draws sampled cannot become its target) */
-  if (d->vertex_used + vertices * VERTEX_BYTES > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + 256 > CONSTANT_RING ||
-      d->view_used + STAGES > VIEW_HEAP || d->sampler_used + STAGES > VIEW_HEAP)
+  if (d->vertex_used + vertices * stride > VERTEX_RING || d->index_used + out_indices * 4 > INDEX_RING || d->constant_used + CONSTANT_REGISTERS * 16 > CONSTANT_RING ||
+      d->view_used + slots > VIEW_HEAP || d->sampler_used + slots > VIEW_HEAP)
     flush(d);
-  ID3D12PipelineState *pipeline = pipeline_get(d);
+  ID3D12PipelineState *pipeline = pipeline_get(d, vs, ps);
   if (!pipeline) return D3DERR_INVALIDCALL;
 
   /* the vertices, and the indices counted from the first of them */
   const UINT vertex_at = d->vertex_used, index_at = d->index_used;
-  decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at);
-  d->vertex_used += vertices * VERTEX_BYTES;
+  if (vs) decode_shader_vertices(inputs, vs->input_count, sources, first_vertex, vertices, d->vertex_data + vertex_at);
+  else decode_vertices(&layout, sources, first_vertex, vertices, d->vertex_data + vertex_at);
+  d->vertex_used += vertices * stride;
   if (out_indices) {
     UINT *out = (UINT *)(d->index_data + index_at);
     const INT lowest = (INT)first_vertex - index_base;      /* (the index that reads the first decoded vertex) */
@@ -370,7 +473,6 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   if (d->targets_dirty) {
     const State *s = &d->state;
     ID3D12DescriptorHeap *heaps[2] = {d->view_heap, d->sampler_heap};
-    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, d->root);
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
     ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &target->view, FALSE, depth ? &d->depth->tex->view : NULL);
     D3D12_VIEWPORT vp = {(FLOAT)s->viewport.X, (FLOAT)s->viewport.Y, (FLOAT)s->viewport.Width, (FLOAT)s->viewport.Height, s->viewport.MinZ, s->viewport.MaxZ};
@@ -387,15 +489,20 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
     d->targets_dirty = 0;
   }
+  ID3D12RootSignature *root = root_get(d, slots);      /* (there: the pipeline was made with it) */
+  if (d->root_set != root) {
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, root);
+    d->root_set = root;
+  }
   ID3D12GraphicsCommandList_SetPipelineState(list, pipeline);
   ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, type == D3DPT_POINTLIST ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST : type == D3DPT_LINELIST ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                                          : type == D3DPT_LINESTRIP ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
                                                          : type == D3DPT_TRIANGLESTRIP ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   ID3D12GraphicsCommandList_OMSetStencilRef(list, d->state.rs[D3DRS_STENCILREF] & 0xFF);
-  D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * VERTEX_BYTES, VERTEX_BYTES};
+  D3D12_VERTEX_BUFFER_VIEW vertex_view = {ID3D12Resource_GetGPUVirtualAddress(d->vertex_ring) + vertex_at, vertices * stride, stride};
   ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vertex_view);
-  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout));
-  tables_of(d);
+  ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, constants_of(d, &layout, vs, ps));
+  tables_of(d, slots);
   D3D12_GPU_DESCRIPTOR_HANDLE views = {d->table_views}, samplers = {d->table_samplers};
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 1, views);
   ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 2, samplers);
@@ -407,7 +514,7 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
     ID3D12GraphicsCommandList_DrawInstanced(list, vertices, 1, 0, 0);
   }
 
-  for (UINT i = 0; i < STAGES; ++i)
+  for (UINT i = 0; i < slots; ++i)
     if (d->state.tex[i]) d->state.tex[i]->used = d->state.tex[i]->sampled = d->epoch;
   target->used = d->epoch;
   if (depth) {

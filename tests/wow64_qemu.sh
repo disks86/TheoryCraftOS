@@ -12,7 +12,7 @@
 #            (dxgi.dll and d3d12.dll over the kernel's software adapter).
 #   d3d11test  tests/windows/d3d11test.c: Direct3D 11 (d3d11.dll, a layer on d3d12.dll) - a device, buffers, draws read back, constants a stage,
 #            textures, depth, blending, a swap chain on a window. The same source built for x86-64 tests the 64-bit library.
-#   d3d9test  tests/windows/d3d9test.c: Direct3D 9 (d3d9.dll: the fixed-function pipeline, a layer on d3d12.dll) - a device on a window, draws read
+#   d3d9test  tests/windows/d3d9test.c: Direct3D 9 (d3d9.dll: the fixed-function pipeline and a program's own shaders, a layer on d3d12.dll) - a device on a window, draws read
 #            back, buffers, textures and their stages, blending, depth, a texture drawn into, Present, Reset. Also built for x86-64.
 # Passes if all the checks of each pass and the autorun sees exit code 42. Uses its own build folder (build-wow64-qemu) so the normal build keeps no
 # autorun. Needs i686-w64-mingw32-gcc.

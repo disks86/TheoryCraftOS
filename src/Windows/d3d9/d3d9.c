@@ -16,7 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* d3d9.dll for TheoryCraftOS: the fixed-function pipeline of Direct3D 9, as a layer on this system's Direct3D 12 (d3d12.dll; docs/Direct3D9.md).
+/* d3d9.dll for TheoryCraftOS: Direct3D 9 - its fixed-function pipeline and a program's own vertex and pixel shaders - as a layer on this system's
+ * Direct3D 12 (d3d12.dll; docs/Direct3D9.md).
  *
  * A device is a Direct3D 12 device, one command queue and one command list; drawing records into the list, and the list is sent when something has
  * to be seen (Present, a lock that reads, the end of what a ring of memory holds). What the program hands over is kept in plain memory - vertex and
@@ -26,12 +27,15 @@
  *               vertex the draw reads, and a triangle fan becomes a list.
  *   shaders     one vertex shader (the world, view and projection matrices as one, or positions that are pixels already) and one pixel shader (two
  *               texture stages as weights, the alpha test), written in HLSL and compiled ahead (ff_vs.hlsl, ff_ps.hlsl -> shaders.inc).
+ *   a program's a vertex or pixel shader of the program's is translated to Shader Model 4 when it is made (sm_to_dxbc.h). A draw with a vertex
+ *   shaders     shader decodes the vertices into one register of four floats for each input the shader declares; the constants the program set
+ *               are the draw's block (the vertex shader's registers, then the pixel shader's); either stage may be the fixed-function one.
  *   states      a Direct3D 12 pipeline for each combination of the render states that a pipeline holds (culling, depth, blending, stencil, write
  *               mask), in a cache.
  *   textures    a Direct3D 12 texture of B8G8R8A8 whatever the program's format; a level is sent when it is unlocked.
  *   Present     the back buffer's pixels are read and put into the window (SetDIBitsToDevice), as dxgi.dll does for its swap chains.
  *
- * Not there: vertex and pixel shaders of the program (the caps say version 0: a program takes its fixed-function path), lighting (a vertex has
+ * Not there: pixel shaders before 2.0 and what the translator refuses (loops, cube and volume samplers, more: docs/Direct3D9.md), lighting (a vertex has
  * its diffuse colour, or white), fog, texture transforms and generated coordinates, more than two texture stages, the stage operations beyond
  * select, modulate and add, cube and volume textures, compressed formats, multisampling, queries, clip planes, point sprites. */
 #define INITGUID
@@ -44,6 +48,8 @@
 #include <d3d9.h>
 #include <d3d12.h>
 #include "../tcosdx.h"
+#include <stdint.h>
+#include "sm_to_dxbc.h"
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
@@ -55,14 +61,19 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 #define OBJ(x) ((DxObj *)(x))
 #define STAGES 2u                      /* the texture stages the pixel shader has */
-#define TEXTURE_SLOTS 8u               /* the stages a program may set textures and states of */
+#define TEXTURE_SLOTS 16u              /* the stages a program may set textures and states of: the samplers of a pixel shader */
+#define ROOTS 4u                       /* root signatures: for 2, 4, 8 and 16 textures */
 #define STREAMS 4u
 #define VERTEX_BYTES 48u               /* a decoded vertex: position (4 floats), colour (4), two texture coordinates (2 + 2) */
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
-#define CONSTANT_BYTES 176u            /* the vertex shader's 6 registers, then the pixel shader's 5 */
-#define VERTEX_REGISTERS 6u
+#define VERTEX_REGISTERS 6u            /* the constants of the fixed-function vertex shader, in registers of four floats */
+#define PIXEL_REGISTERS 5u             /* ... of the fixed-function pixel shader, which follow the vertex shader's in the block of a draw */
+#define CONSTANT_REGISTERS 256u        /* the block of a draw, at most */
+#define VS_FLOATS 256u                 /* the float constants a program sets for its vertex shaders, */
+#define PS_FLOATS 224u                 /* ... and for its pixel shaders */
+#define SHADER_INPUTS 16u
 #define VIEW_HEAP 4096u
 #define RTV_SLOTS 256u
 #define DSV_SLOTS 64u
@@ -135,6 +146,22 @@ typedef struct Decl {
 
 typedef struct Stream { Buffer *buffer; UINT offset, stride; } Stream;
 
+/* A vertex or pixel shader of the program's: its tokens (GetFunction gives them back) and what the translator made of them. */
+typedef struct Shader {
+  Child c;
+  int vertex;
+  DWORD *code;
+  UINT code_bytes;
+  BYTE *dxbc;
+  UINT dxbc_bytes;
+  UINT floats;                   /* the float constants it reads: c0 .. c<floats - 1> */
+  int bools;                     /* it reads bool constants: 16 registers after the floats */
+  UINT registers;                /* all it takes of a draw's block */
+  UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
+  SmInput inputs[SHADER_INPUTS]; /* a vertex shader: what each input register is */
+  UINT input_count;
+} Shader;
+
 /* Everything a program sets on the device that a state block records. The pointers are references. */
 typedef struct State {
   DWORD rs[RENDER_STATES];
@@ -149,11 +176,16 @@ typedef struct State {
   Stream stream[STREAMS];
   Buffer *indices;
   Tex *tex[TEXTURE_SLOTS];
+  Shader *vs, *ps;               /* NULL: the fixed-function stage */
+  float vs_float[VS_FLOATS][4], ps_float[PS_FLOATS][4];
+  int vs_int[16][4], ps_int[16][4];
+  DWORD vs_bool, ps_bool;        /* bit n: b<n> */
 } State;
 
 typedef struct StateBlock { Child c; State state; } StateBlock;
 
 typedef struct Pipeline {
+  DWORD vs, ps;                  /* the shaders' numbers (Child.id); 0: the fixed-function one */
   DWORD cull, z, zwrite, zfunc, blend, src, dst, op, separate, src_alpha, dst_alpha, op_alpha, write, stencil, sfail, szfail, spass, sfunc, smask, swrite;
   ID3D12PipelineState *state;
   UINT last_used;
@@ -173,17 +205,19 @@ struct Dev {
   ID3D12CommandQueue *queue;
   ID3D12CommandAllocator *allocator;
   ID3D12GraphicsCommandList *list;
-  ID3D12RootSignature *root;
+  ID3D12RootSignature *roots[ROOTS];      /* each: the block of constants (b0), a table of textures (t0 ..) and one of their samplers (s0 ..) */
+  ID3D12RootSignature *root_set;          /* the one the list has now */
   ID3D12DescriptorHeap *rtv_heap, *dsv_heap, *view_heap, *sampler_heap;
   UINT rtv_free[RTV_SLOTS], rtv_free_count, dsv_free[DSV_SLOTS], dsv_free_count;
   ID3D12Resource *vertex_ring, *index_ring, *constant_ring;
   BYTE *vertex_data, *index_data, *constant_data;
-  UINT vertex_used, index_used, constant_used, constant_last;
+  UINT vertex_used, index_used, constant_used, constant_last, constant_last_bytes;
   int constant_valid;
   UINT view_used, sampler_used;
   UINT64 table_views, table_samplers;
-  UINT table_ids[STAGES];
-  DWORD table_sampler_states[STAGES][4];
+  UINT table_ids[TEXTURE_SLOTS];
+  DWORD table_sampler_states[TEXTURE_SLOTS][4];
+  UINT table_count;
   int tables_valid;
   Tex *blank;                    /* a white pixel: what a stage with no texture samples */
   UINT epoch;
@@ -240,6 +274,8 @@ extern const IDirect3DTexture9Vtbl tex_vtbl;
 extern const IDirect3DSurface9Vtbl surf_vtbl;
 extern const IDirect3DVertexDeclaration9Vtbl decl_vtbl;
 extern const IDirect3DStateBlock9Vtbl sb_vtbl;
+extern const IDirect3DVertexShader9Vtbl vs_vtbl;
+extern const IDirect3DPixelShader9Vtbl ps_vtbl;
 
 static const GUID *const g_d3d_iids[] = {&IID_IDirect3D9, NULL};
 static const GUID *const g_dev_iids[] = {&IID_IDirect3DDevice9, NULL};
@@ -249,6 +285,8 @@ static const GUID *const g_tex_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3D
 static const GUID *const g_surf_iids[] = {&IID_IDirect3DResource9, &IID_IDirect3DSurface9, NULL};
 static const GUID *const g_decl_iids[] = {&IID_IDirect3DVertexDeclaration9, NULL};
 static const GUID *const g_sb_iids[] = {&IID_IDirect3DStateBlock9, NULL};
+static const GUID *const g_vs_iids[] = {&IID_IDirect3DVertexShader9, NULL};
+static const GUID *const g_ps_iids[] = {&IID_IDirect3DPixelShader9, NULL};
 
 /* ---- the command list ------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -264,6 +302,7 @@ static void flush(Dev *d) {
   ID3D12GraphicsCommandList_Reset(d->list, d->allocator, NULL);
   d->recorded = 0;
   d->targets_dirty = 1;
+  d->root_set = NULL;
   d->vertex_used = d->index_used = d->constant_used = 0;
   d->constant_valid = 0;
   d->view_used = d->sampler_used = 0;

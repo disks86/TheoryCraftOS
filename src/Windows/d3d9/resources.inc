@@ -422,40 +422,44 @@ static void layout_of_elements(const D3DVERTEXELEMENT9 *e, UINT count, Layout *l
     else if (e[i].Usage == D3DDECLUSAGE_TEXCOORD && e[i].UsageIndex < 2) l->texture[e[i].UsageIndex] = a;
   }
 }
-/* The same out of an FVF code: the position, the blend weights, the normal, the point size, the two colours and the texture coordinates follow
- * each other in the vertex in that order. */
-static void layout_of_fvf(DWORD fvf, Layout *l) {
-  UINT offset = 0;
-  l->position = l->colour = l->texture[0] = l->texture[1] = g_no_attribute;
-  l->transformed = 0;
+/* An FVF code as the elements of a declaration (the end marker is written, and not counted): the position, the blend weights, the normal, the
+ * point size, the two colours and the texture coordinates follow each other in the vertex in that order. `e` has room for 16. */
+static UINT fvf_elements(DWORD fvf, D3DVERTEXELEMENT9 *e) {
+  UINT n = 0, offset = 0;
+#define FVF_ELEMENT(type, usage, index, bytes) \
+  do { \
+    const D3DVERTEXELEMENT9 element = {0, (WORD)offset, (BYTE)(type), D3DDECLMETHOD_DEFAULT, (BYTE)(usage), (BYTE)(index)}; \
+    e[n++] = element; \
+    offset += (bytes); \
+  } while (0)
   const DWORD position = fvf & D3DFVF_POSITION_MASK;
-  if (position) {
-    l->position.stream = 0;
-    l->position.offset = 0;
-    l->position.type = position == D3DFVF_XYZRHW || position == D3DFVF_XYZW ? D3DDECLTYPE_FLOAT4 : D3DDECLTYPE_FLOAT3;
-    l->transformed = position == D3DFVF_XYZRHW;
-    offset = position == D3DFVF_XYZ ? 12 : position == D3DFVF_XYZRHW || position == D3DFVF_XYZW ? 16 : 12 + 4 * ((position - D3DFVF_XYZB1) / 2 + 1);
+  if (position == D3DFVF_XYZRHW) FVF_ELEMENT(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0, 16);
+  else if (position == D3DFVF_XYZW) FVF_ELEMENT(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITION, 0, 16);
+  else if (position) {
+    FVF_ELEMENT(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 12);
+    if (position >= D3DFVF_XYZB1) {
+      const UINT weights = (position - D3DFVF_XYZB1) / 2 + 1;
+      FVF_ELEMENT(D3DDECLTYPE_FLOAT1 + (weights > 4 ? 4 : weights) - 1, D3DDECLUSAGE_BLENDWEIGHT, 0, 4 * weights);
+    }
   }
-  if (fvf & D3DFVF_NORMAL) offset += 12;
-  if (fvf & D3DFVF_PSIZE) offset += 4;
-  if (fvf & D3DFVF_DIFFUSE) {
-    l->colour.stream = 0;
-    l->colour.offset = (WORD)offset;
-    l->colour.type = D3DDECLTYPE_D3DCOLOR;
-    offset += 4;
-  }
-  if (fvf & D3DFVF_SPECULAR) offset += 4;
+  if (fvf & D3DFVF_NORMAL) FVF_ELEMENT(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, 0, 12);
+  if (fvf & D3DFVF_PSIZE) FVF_ELEMENT(D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_PSIZE, 0, 4);
+  if (fvf & D3DFVF_DIFFUSE) FVF_ELEMENT(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0, 4);
+  if (fvf & D3DFVF_SPECULAR) FVF_ELEMENT(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 1, 4);
   const UINT count = (fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT;
   for (UINT i = 0; i < count && i < 8; ++i) {
     static const BYTE floats[4] = {2, 3, 4, 1};      /* (the size code of a coordinate set: two bits a set, from bit 16) */
-    const UINT n = floats[(fvf >> (16 + 2 * i)) & 3];
-    if (i < 2) {
-      l->texture[i].stream = 0;
-      l->texture[i].offset = (WORD)offset;
-      l->texture[i].type = (BYTE)(D3DDECLTYPE_FLOAT1 + n - 1);
-    }
-    offset += 4 * n;
+    const UINT size = floats[(fvf >> (16 + 2 * i)) & 3];
+    FVF_ELEMENT(D3DDECLTYPE_FLOAT1 + size - 1, D3DDECLUSAGE_TEXCOORD, i, 4 * size);
   }
+#undef FVF_ELEMENT
+  const D3DVERTEXELEMENT9 end = D3DDECL_END();
+  e[n] = end;
+  return n;
+}
+static void layout_of_fvf(DWORD fvf, Layout *l) {
+  D3DVERTEXELEMENT9 elements[16];
+  layout_of_elements(elements, fvf_elements(fvf, elements), l);
 }
 
 static HRESULT STDMETHODCALLTYPE decl_GetDeclaration(Decl *decl, D3DVERTEXELEMENT9 *elements, UINT *count) {

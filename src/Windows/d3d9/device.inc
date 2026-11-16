@@ -61,7 +61,16 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->MaxPointSize = 1.0f;
   caps->NumSimultaneousRTs = 1;
   caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N | D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N | D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4;
-  /* (VertexShaderVersion and PixelShaderVersion stay 0: there are no shaders of the program's) */
+  /* The program's shaders: what the translator takes (sm_to_dxbc.h). Pixel shaders before 2.0 cannot be made, whatever the version here says. */
+  caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
+  caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
+  caps->MaxVertexShaderConst = VS_FLOATS;
+  caps->PixelShader1xMaxValue = 65504.0f;
+  caps->VS20Caps.DynamicFlowControlDepth = caps->PS20Caps.DynamicFlowControlDepth = 24;
+  caps->VS20Caps.NumTemps = caps->PS20Caps.NumTemps = 32;
+  caps->PS20Caps.NumInstructionSlots = 512;
+  caps->MaxVShaderInstructionsExecuted = caps->MaxPShaderInstructionsExecuted = 65535;
+  caps->MaxVertexShader30InstructionSlots = caps->MaxPixelShader30InstructionSlots = 4096;
 }
 
 /* ---- the device's own methods ----------------------------------------------------------------------------------------------------------------------- */
@@ -367,7 +376,7 @@ static void dev_destroy(DxObj *o) {
   if (d->sampler_heap) ID3D12DescriptorHeap_Release(d->sampler_heap);
   if (d->rtv_heap) ID3D12DescriptorHeap_Release(d->rtv_heap);
   if (d->dsv_heap) ID3D12DescriptorHeap_Release(d->dsv_heap);
-  if (d->root) ID3D12RootSignature_Release(d->root);
+  for (UINT i = 0; i < ROOTS; ++i) if (d->roots[i]) ID3D12RootSignature_Release(d->roots[i]);
   if (d->list) ID3D12GraphicsCommandList_Release(d->list);
   if (d->allocator) ID3D12CommandAllocator_Release(d->allocator);
   if (d->queue) ID3D12CommandQueue_Release(d->queue);
@@ -395,28 +404,7 @@ static HRESULT dev_start(Dev *d) {
   if (SUCCEEDED(hr)) hr = ID3D12Device_CreateCommandList(d->d12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, d->allocator, NULL, &IID_ID3D12GraphicsCommandList, (void **)&d->list);
   if (FAILED(hr)) return D3DERR_NOTAVAILABLE;
 
-  /* the one root signature: the block of constants (b0), the textures of the two stages (t0, t1) and their samplers (s0, s1) */
-  D3D12_DESCRIPTOR_RANGE views = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, STAGES, 0, 0, 0}, samplers = {D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, STAGES, 0, 0, 0};
-  D3D12_ROOT_PARAMETER params[3];
-  memset(params, 0, sizeof params);
-  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[1].DescriptorTable.NumDescriptorRanges = 1;
-  params[1].DescriptorTable.pDescriptorRanges = &views;
-  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[2].DescriptorTable.NumDescriptorRanges = 1;
-  params[2].DescriptorTable.pDescriptorRanges = &samplers;
-  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  D3D12_ROOT_SIGNATURE_DESC rsd = {3, params, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
-  ID3DBlob *blob = NULL, *error = NULL;
-  hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
-  if (error) ID3D10Blob_Release(error);
-  if (SUCCEEDED(hr) && blob)
-    hr = ID3D12Device_CreateRootSignature(d->d12, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), &IID_ID3D12RootSignature, (void **)&d->root);
-  if (blob) ID3D10Blob_Release(blob);
-  if (FAILED(hr) || !d->root) return D3DERR_NOTAVAILABLE;
+  if (!root_get(d, STAGES)) return D3DERR_NOTAVAILABLE;      /* (the root signature of the fixed-function pixel shader; the others when a shader needs them) */
 
   hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, RTV_SLOTS, FALSE, &d->rtv_heap);
   if (SUCCEEDED(hr)) hr = make_heap(d, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, DSV_SLOTS, FALSE, &d->dsv_heap);
