@@ -228,6 +228,7 @@ struct ShaderDesc {
   ShaderKind kind = ShaderKind::ColoredVertex;
   graphics::ShaderStage stage = graphics::ShaderStage::Vertex;   // for Tgsi and D3d9Tokens
   ConstByteView code;                                            // Tgsi: the text; D3d9Tokens, D3d9Bytecode: little-endian 32-bit tokens (bytecode: the stage is the one it says)
+  uint32_t constant_base = 0;   // Dxbc: where the program's constant buffers begin in the pipeline's block of constants, in 16-byte registers (D3d9Program::compile_dxbc)
 };
 
 struct PipelineDesc {

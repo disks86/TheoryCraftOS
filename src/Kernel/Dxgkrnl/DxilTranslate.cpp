@@ -3251,7 +3251,7 @@ bool convert_signature(allocators::IAllocator& allocator, ConstByteView chunk, B
 
 }  // namespace
 
-NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out) {
+NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out, uint32_t constant_base) {
   if (bytes.size() < 32 || bytes.size() > (1u << 20)) return status::kInvalidParameter;
   ByteReader head(bytes);
   if (head.le32() != kFourDxbc) return status::kInvalidParameter;
@@ -3359,7 +3359,7 @@ NtStatus D3d9Program::compile_dxil(allocators::IAllocator& allocator, ConstByteV
   for (uint32_t i = 0; i < part_count; ++i)
     ok = ok && container.put32(parts[i].fourcc) && container.put32(static_cast<uint32_t>(parts[i].data.size())) && container.append(parts[i].data) && container.put_zeros((4 - parts[i].data.size() % 4) % 4);
   if (!ok) return status::kNoMemory;
-  return compile_dxbc(allocator, container.view(), out);
+  return compile_dxbc(allocator, container.view(), out, constant_base);
 }
 
 }  // namespace dxgk

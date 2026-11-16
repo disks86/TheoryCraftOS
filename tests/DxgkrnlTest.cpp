@@ -7805,6 +7805,20 @@ void test_dxbc_system_values() {
       const std::vector<uint8_t> cbuf_blob = read_blob("ps_cbuf.dxbc");
       UniquePointer<D3d9Program> cp = compile_dxbc(allocator, cbuf_blob, &st);
       CHECK(cp && st == status::kSuccess);
+      // The same shader with its constant buffers placed after another stage's (a Direct3D 11 pipeline's pixel shader, after the vertex shader's 4
+      // registers): the block is that much longer, the text reads the registers from there on, and a place past the block is refused.
+      {
+        CHECK(cp->constant_bytes() == 64 * 16);
+        UniquePointer<D3d9Program> placed;
+        CHECK(D3d9Program::compile_dxbc(allocator, view_of(cbuf_blob), &placed, 4) == status::kSuccess && placed && placed->constant_bytes() == 68 * 16);
+        String placed_text(allocator);
+        CHECK(placed && placed->emit_tgsi(&placed_text) == status::kSuccess);
+        CHECK(std::string(placed_text.data(), placed_text.size()).find("DCL CONST[0..67]") != std::string::npos);
+        UniquePointer<D3d9Program> refused;
+        CHECK(D3d9Program::compile_dxbc(allocator, view_of(cbuf_blob), &refused, D3d9Program::kMaxConstantRegisters - 63) == status::kNotSupported);
+        CHECK(D3d9Program::compile_dxbc(allocator, view_of(cbuf_blob), &refused, D3d9Program::kMaxConstantRegisters + 1) == status::kInvalidParameter);
+        CHECK(D3d9Program::compile_dxbc(allocator, view_of(cbuf_blob), &refused, D3d9Program::kMaxConstantRegisters - 64) == status::kSuccess);
+      }
       String cstr(allocator);
       CHECK(cp->emit_tgsi(&cstr) == status::kSuccess);
       const std::string ctext(cstr.data(), cstr.size());

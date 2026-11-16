@@ -198,14 +198,17 @@ static void STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *This, ID3D12Resour
 
 /* The words of a sampler (D3D12_FILTER / D3D12_TEXTURE_ADDRESS_MODE) the way the kernel has them: the first word packs filter, address modes and mip filter; rest[0..2] are the
  * LOD bias, minimum and maximum LOD as bits. The kernel has repeat and clamp only: mirrored addresses repeat, border and mirror-once clamp. */
+static float lod_within(float value, float limit) { return !(value == value) ? 0.0f : value > limit ? limit : value < -limit ? -limit : value; }
 static UINT sampler_words(UINT filter, UINT au, UINT av, float bias, float min_lod, float max_lod, UINT *rest) {
   const UINT linear = (filter & 0x14u) != 0 || filter == D3D12_FILTER_ANISOTROPIC;
   const UINT mip = (max_lod <= 0.0f) ? 0u : (((filter & 1u) || filter == D3D12_FILTER_ANISOTROPIC) ? 2u : 1u);
   UINT a[2] = {au, av};
   for (int i = 0; i < 2; ++i) a[i] = (a[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP || a[i] == D3D12_TEXTURE_ADDRESS_MODE_MIRROR) ? 0u : 1u;
-  rest[0] = bits_of(bias);
-  rest[1] = bits_of(min_lod);
-  rest[2] = bits_of(max_lod);
+  /* (the kernel takes a bias and a minimum within 100 and a maximum within 1000: "no limit" - FLT_MAX, the usual MaxLOD - is the most it takes; a
+   * value that is not a number is 0) */
+  rest[0] = bits_of(lod_within(bias, 100.0f));
+  rest[1] = bits_of(lod_within(min_lod, 100.0f));
+  rest[2] = bits_of(lod_within(max_lod, 1000.0f));
   return linear | (a[0] << 8) | (a[1] << 16) | (mip << 24);
 }
 

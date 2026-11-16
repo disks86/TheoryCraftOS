@@ -84,6 +84,7 @@ class ShaderObject {
   ArrayView<uint32_t> tokens_;    // the Direct3D 9 tokens
   graphics::TextureKind texture_kinds_[graphics::kMaxTextureUnits] = {};   // what a DXBC shader declared for its units
   uint32_t texture_mask_ = 0;               // ... the units it reads (bit n: unit n)
+  bool knows_textures_ = false;             // made from DXBC: texture_mask_ says all it reads
   uint32_t thread_group_[3] = {1, 1, 1};     // a compute shader's thread group
   uint32_t storage_mask_ = 0;                // ... and the storage buffer slots it uses (bit n: u<n>)
   bool fragment_stores_ = false;             // a pixel shader that writes them

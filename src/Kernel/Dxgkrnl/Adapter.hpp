@@ -50,6 +50,12 @@ class IPresentTap {
   ~IPresentTap() = default;
 };
 
+// For finding out why a program draws nothing: a command stream the validator refuses is dropped whole, and the program is not told. A function
+// set here is called with the command (CommandStream.hpp's Op) the stream was refused at, the status, how many commands came before it, and - for a
+// draw - the line of Adapter.cpp that refused it (0: not known).
+using StreamTrace = void (*)(uint32_t op, uint32_t status, uint32_t commands_before, uint32_t line);
+void set_stream_trace(StreamTrace trace);
+
 class Adapter {
  public:
   static constexpr uint32_t kMaxQueuedSubmissions = 4096;

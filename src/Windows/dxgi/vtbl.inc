@@ -52,6 +52,9 @@ const IDXGIAdapter4Vtbl adp_vtbl = {
     .UnregisterVideoMemoryBudgetChangeNotification = (__typeof__(((IDXGIAdapter4Vtbl *)0)->UnregisterVideoMemoryBudgetChangeNotification))adp_UnregisterVideoMemoryBudgetChangeNotification,
     .GetDesc3 = (__typeof__(((IDXGIAdapter4Vtbl *)0)->GetDesc3))adp_GetDesc3,
 };
+static HRESULT STDMETHODCALLTYPE out_vtbl_none_SetDisplaySurface(IDXGIOutput6 *This, IDXGISurface *surface) { return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE out_vtbl_none_GetDisplaySurfaceData(IDXGIOutput6 *This, IDXGISurface *surface) { return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE out_vtbl_none_GetDisplaySurfaceData1(IDXGIOutput6 *This, IDXGIResource *destination) { return E_NOTIMPL; }
 const IDXGIOutput6Vtbl out_vtbl = {
     .QueryInterface = (__typeof__(((IDXGIOutput6Vtbl *)0)->QueryInterface))obj_QueryInterface,
     .AddRef = (__typeof__(((IDXGIOutput6Vtbl *)0)->AddRef))obj_AddRef,
@@ -69,12 +72,12 @@ const IDXGIOutput6Vtbl out_vtbl = {
     .GetGammaControlCapabilities = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetGammaControlCapabilities))out_GetGammaControlCapabilities,
     .SetGammaControl = (__typeof__(((IDXGIOutput6Vtbl *)0)->SetGammaControl))out_SetGammaControl,
     .GetGammaControl = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetGammaControl))out_GetGammaControl,
-    .SetDisplaySurface = (__typeof__(((IDXGIOutput6Vtbl *)0)->SetDisplaySurface))dx_not_implemented,
-    .GetDisplaySurfaceData = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetDisplaySurfaceData))dx_not_implemented,
+    .SetDisplaySurface = (__typeof__(((IDXGIOutput6Vtbl *)0)->SetDisplaySurface))out_vtbl_none_SetDisplaySurface,
+    .GetDisplaySurfaceData = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetDisplaySurfaceData))out_vtbl_none_GetDisplaySurfaceData,
     .GetFrameStatistics = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetFrameStatistics))out_GetFrameStatistics,
     .GetDisplayModeList1 = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetDisplayModeList1))out_GetDisplayModeList1,
     .FindClosestMatchingMode1 = (__typeof__(((IDXGIOutput6Vtbl *)0)->FindClosestMatchingMode1))out_FindClosestMatchingMode1,
-    .GetDisplaySurfaceData1 = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetDisplaySurfaceData1))dx_not_implemented,
+    .GetDisplaySurfaceData1 = (__typeof__(((IDXGIOutput6Vtbl *)0)->GetDisplaySurfaceData1))out_vtbl_none_GetDisplaySurfaceData1,
     .DuplicateOutput = (__typeof__(((IDXGIOutput6Vtbl *)0)->DuplicateOutput))out_DuplicateOutput,
     .SupportsOverlays = (__typeof__(((IDXGIOutput6Vtbl *)0)->SupportsOverlays))out_SupportsOverlays,
     .CheckOverlaySupport = (__typeof__(((IDXGIOutput6Vtbl *)0)->CheckOverlaySupport))out_CheckOverlaySupport,

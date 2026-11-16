@@ -1369,9 +1369,13 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
   switch (static_cast<EscapeOp>(op)) {
     case EscapeOp::CreateShader: {
       ShaderDesc desc;
-      const uint32_t kind = in.le32(), stage = in.le32(), bytes = in.le32();
+      // (the kind is the low byte; above it, for Dxbc, the register its constant buffers begin at: ShaderDesc::constant_base)
+      const uint32_t kind_word = in.le32(), stage = in.le32(), bytes = in.le32();
+      const uint32_t kind = kind_word & 0xFF;
       if (!in.ok() || kind > static_cast<uint32_t>(ShaderKind::Dxbc) || stage > 5) return status::kInvalidParameter;
+      if ((kind_word >> 8) != 0 && kind != static_cast<uint32_t>(ShaderKind::Dxbc)) return status::kInvalidParameter;
       desc.kind = static_cast<ShaderKind>(kind);
+      desc.constant_base = kind_word >> 8;
       desc.stage = static_cast<graphics::ShaderStage>(stage);
       desc.code = in.take(bytes);
       if (!in.ok() || !in.at_end()) return status::kInvalidParameter;

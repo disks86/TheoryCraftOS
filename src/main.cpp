@@ -831,6 +831,20 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   // The CPU renderer as an adapter of its own (Windows has its "WARP" one) next to the display GPU's, so the 3D test can draw on either and compare.
   if (system_graphics.accelerated() && dxg_kernel.add_adapter(system_graphics.software_device(), dxgk::AdapterConfig()) != dxgk::kInvalidIndex) ++dxg_adapters;
   dxgk::set_system_kernel(&dxg_kernel);
+#ifdef TCOS_TRACE_SERVICE_FAILURES
+  // (with the failing services of Windows programs: a Direct3D command stream that is refused, and at which command)
+  dxgk::set_stream_trace([](uint32_t op, uint32_t status, uint32_t commands_before, uint32_t line) {
+    console::puts("direct3d stream refused: command ");
+    console::put_dec(static_cast<int64_t>(op));
+    console::puts(" after ");
+    console::put_dec(static_cast<int64_t>(commands_before));
+    console::puts(" commands, status ");
+    console::put_hex(status);
+    console::puts(" (Adapter.cpp line ");
+    console::put_dec(static_cast<int64_t>(line));
+    console::puts(")\n");
+  });
+#endif
   process::win32k::install_dxg();      // (the NtGdiDdDDI* services of win32u.dll reach the kernel-mode Direct3D driver)
   // The system's fonts for DirectWrite (dwrite.dll reaches them with NtTcosFont); lives as long as the system does.
   static font::SystemFontService system_fonts(shared_allocator);

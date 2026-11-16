@@ -120,6 +120,7 @@ struct RootSig {
   UINT parameter_count;
   UINT ptype[16];          /* of each parameter: D3D12_ROOT_PARAMETER_TYPE */
   UINT pconstants[16];     /* the 32-bit values of a constants parameter */
+  UINT pdescriptors[16];   /* the descriptors a table parameter reaches from its start (0xFFFFFFFF: to the end of the heap) */
 };
 
 static const GUID *const g_rs_iids[] = {&IID_ID3D12Object, &IID_ID3D12DeviceChild, &IID_ID3D12RootSignature, NULL};
@@ -150,11 +151,18 @@ static void rs_scan(RootSig *r, const BYTE *b, SIZE_T n) {
     if (type == 1 && payload + 12 <= n) r->pconstants[i] = rd32(b + payload + 8);
     if (type != 0 || payload + 8 > n) continue;
     const UINT range_count = rd32(b + payload), ranges = rd32(b + payload + 4), stride = version == 2 ? 24 : 20;
+    UINT next = 0;      /* where a range that is appended begins */
     for (UINT k = 0; k < range_count && k < 8; ++k) {
       if (ranges + (SIZE_T)k * stride + stride > n) return;
       const BYTE *range = b + ranges + k * stride;
+      const UINT num = rd32(range + 4), base = rd32(range + 8), offset = rd32(range + stride - 4);
+      const UINT start = offset == 0xFFFFFFFFu ? next : offset;
+      if (num == 0xFFFFFFFFu || start > 0xFFFFFFFFu - num) r->pdescriptors[i] = 0xFFFFFFFFu;
+      else {
+        next = start + num;
+        if (r->pdescriptors[i] != 0xFFFFFFFFu && next > r->pdescriptors[i]) r->pdescriptors[i] = next;
+      }
       if (rd32(range) != 0) continue;      /* SRV */
-      const UINT num = rd32(range + 4), base = rd32(range + 8);
       if (num == 0xFFFFFFFFu) r->textures_unbounded = 1;
       const UINT top = num == 0xFFFFFFFFu ? 0 : base + num;
       if (top > r->textures) r->textures = top;
@@ -369,7 +377,9 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
   UINT reply[1] = {0};
   if (!request) return E_OUTOFMEMORY;
   request[0] = ESC_CREATE_SHADER;
-  request[1] = 7;      /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6) */
+  /* ShaderKind::Dxbc (DXBC and the DXIL of Shader Model 6), or what the runtime above asked for (TcosD3D12PipelineOptions); above the kind, where a
+   * pixel shader's constant buffers begin */
+  request[1] = (dev->next_shader_kind ? dev->next_shader_kind : 7) | (stage == 1 && !dev->next_shader_kind ? dev->next_pixel_base << 8 : 0);
   request[2] = stage;
   request[3] = (UINT)code->BytecodeLength;
   memcpy(request + 4, code->pShaderBytecode, code->BytecodeLength);
@@ -415,6 +425,7 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->GS, 3, &p->shaders[2]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->HS, 4, &p->shaders[3]);
   if (SUCCEEDED(hr)) hr = make_shader(This, &desc->DS, 5, &p->shaders[4]);
+  This->next_pixel_base = This->next_shader_kind = 0;      /* (the options were for this pipeline) */
   if (FAILED(hr)) { dx_Release(OBJ(p)); return hr; }
   /* the vertex inputs: register numbers from the vertex shader's signature */
   SigElement inputs[16], outputs[16];

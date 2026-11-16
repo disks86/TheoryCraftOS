@@ -68,6 +68,14 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 /* ---- the entry points -------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
+/* (src/Windows/tcosdx.h) */
+EXPORT void WINAPI TcosD3D12PipelineOptions(ID3D12Device *device, UINT pixel_constant_base, UINT shader_kind) {
+  Dev *dev = (Dev *)device;
+  if (!dev) return;
+  dev->next_pixel_base = pixel_constant_base;
+  dev->next_shader_kind = shader_kind;
+}
+
 EXPORT HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void **out) {
   LUID luid = {0, 0};
   NTSTATUS st = 0;

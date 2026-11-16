@@ -142,7 +142,8 @@ int8_t signature_slot(const SigElement& s, bool output_of_vertex) {
 
 }  // namespace
 
-NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out) {
+NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteView bytes, UniquePointer<D3d9Program>* out, uint32_t constant_base) {
+  if (constant_base > kMaxConstantRegisters) return status::kInvalidParameter;
   using Instr = Instruction;
   // A DXIL container (a DXIL part among the chunks) is translated to the tokens of the same shader first.
   if (bytes.size() >= 32 && bytes.size() <= (1u << 20)) {
@@ -160,7 +161,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
           ByteReader t(tag);
           fourcc = t.le32();
         }
-        if (fourcc == 0x4C495844) return compile_dxil(allocator, bytes, out);   // 'DXIL'
+        if (fourcc == 0x4C495844) return compile_dxil(allocator, bytes, out, constant_base);   // 'DXIL'
       }
     }
   }
@@ -201,7 +202,7 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   uint32_t immediate_buffer_size = 0;            // vec4s of the declared immediate constant buffer
   // The register of cb<slot>[0] in the program's constant block: the declared buffers one after the other in slot order.
   auto cb_base = [&](uint32_t slot) {
-    uint32_t base = 0;
+    uint32_t base = constant_base;
     for (uint32_t k = 0; k < slot; ++k) base += cb_size[k];
     return base;
   };
@@ -1165,8 +1166,8 @@ NtStatus D3d9Program::compile_dxbc(allocators::IAllocator& allocator, ConstByteV
   {
     uint32_t total = 0;
     for (uint32_t size : cb_size) total += size;
-    if (total > kMaxConstantRegisters) return status::kNotSupported;
-    if (total) program->constant_registers_ = total;
+    if (total > kMaxConstantRegisters - constant_base) return status::kNotSupported;
+    if (total) program->constant_registers_ = constant_base + total;
     program->color_outputs_ = color_outputs;
   }
   if (compute && (!thread_group_declared || program->code_.count() == 0)) return status::kInvalidParameter;

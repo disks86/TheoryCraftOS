@@ -40,4 +40,14 @@ typedef struct ITcosPresenterVtbl {
 } ITcosPresenterVtbl;
 struct ITcosPresenter { const ITcosPresenterVtbl *lpVtbl; };
 
+
+/* What d3d12.dll does for the runtimes layered on it (d3d11.dll, d3d9.dll), beyond Direct3D 12: options of the next graphics pipeline made on a device.
+ *   pixel_constant_base  where the pixel shader's constant buffers begin in the block of constants all stages share (b0 of the root signature), in
+ *                        16-byte registers: Direct3D 12 has one b0 for every stage, Direct3D 11 constant buffers a stage - its runtime puts the pixel
+ *                        shader's after the vertex shader's.
+ *   shader_kind          0, or the kernel's kind of the pipeline's shaders when they are not DXBC (6: Direct3D 9 bytecode, vs_1_1 .. ps_3_0).
+ * Exported by d3d12.dll; the caller makes the pipeline right after, on the same thread. */
+struct ID3D12Device;
+void WINAPI TcosD3D12PipelineOptions(struct ID3D12Device *device, UINT pixel_constant_base, UINT shader_kind);
+
 #endif

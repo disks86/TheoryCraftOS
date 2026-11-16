@@ -19,3 +19,4 @@ D3D12PIXReportCounter @114
 D3D12SerializeRootSignature @115
 D3D12SerializeVersionedRootSignature @116
 GetBehaviorValue @117
+TcosD3D12PipelineOptions

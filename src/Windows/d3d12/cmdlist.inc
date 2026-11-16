@@ -34,7 +34,8 @@
 #define CHUNK_BYTES 65000
 #define CHUNK_ALLOCS 1000
 #define ROOM_BYTES 4096
-#define ROOM_ALLOCS 24
+#define ROOM_ALLOCS 160      /* (what a draw uses itself, and the resources its tables of descriptors reach: TABLE_ALLOCS a table) */
+#define TABLE_ALLOCS 32
 
 struct Indirect;
 typedef struct Chunk {
@@ -420,6 +421,16 @@ static void send_binding(CmdList *l, Binding *b, int which) {
         UINT index = 0;
         DescHeap *h = heap_for_gpu(l, a->gpu, &index);
         if (!h) break;
+        /* The resources the descriptors of the table are views of go into the list of the chunk: the kernel binds a texture or a buffer by its place
+         * there, and refuses a draw that reads one that is not in it. */
+        if (h->desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+          UINT reach = b->rs->pdescriptors[i], listed = 0;
+          if (reach > h->desc.NumDescriptors - index) reach = h->desc.NumDescriptors - index;
+          for (UINT k = 0; k < reach && listed < TABLE_ALLOCS; ++k) {
+            const SoftDesc *sd = &h->descs[index + k];
+            if (sd->alloc && (sd->kind == DK_SRV || sd->kind == DK_SRV_BUFFER || sd->kind == DK_UAV || sd->kind == DK_CBV)) { alloc_index(l, sd->alloc); ++listed; }
+          }
+        }
         w[0] = i; w[1] = index;
         packet(l, OP_SET_ROOT_TABLE, w, 2);
         break;
