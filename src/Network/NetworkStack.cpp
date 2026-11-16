@@ -51,6 +51,7 @@ NetworkStack::NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& c
       egress_(allocator),
       udp_(*this, allocator),
       raw_(*this, allocator),
+      taps_(*this, allocator),
       tcp_(*this, allocator),
       pending6_(allocator) {}
 
@@ -121,6 +122,24 @@ bool NetworkStack::wait_for_address(uint32_t timeout_ms) {
   return true;
 }
 
+SharedPointer<IFrameTap> NetworkStack::frame_open() { return taps_.open(); }
+
+bool NetworkStack::send_link_frame(ConstByteView frame, const void* origin) {
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  taps_.sent(frame, origin);      // (the other taps see it; the one that sends it does not)
+  return transmit_now(EgressQueue::Kind::Plain, frame, hardware::TransmitChecksum{}, 0);
+}
+
+bool NetworkStack::loop_ip_packet(ConstByteView packet) {
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  if (packet.empty() || packet.size() > kMtu || looped_.count() >= kMaxLooped) return false;
+  LoopedPacket p;
+  p.length = static_cast<uint16_t>(packet.size());
+  if (!ByteView(p.ip_packet).copy_from(packet) || !looped_.enqueue(p)) return false;
+  wake_service();
+  return true;
+}
+
 SharedPointer<IRawSocket> NetworkStack::raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) {
   return raw_.open(v6, protocol, kind, identifier);
 }
@@ -157,6 +176,7 @@ bool NetworkStack::poll_receive(uint32_t queue) {
     }
     if (received.length > sizeof(frame)) continue;
     const ConstByteView f = ConstByteView(frame).first(received.length);
+    taps_.received(f);      // (frame taps see everything the interface hands up, before any of it is put together or dropped)
     // Receive offload: a TCP segment for this machine may join the run being put together; anything else hands the run on first (order is kept).
     const bool ours = received.length >= hardware::kEthernetHeaderSize && hardware::MacAddress{{f[0], f[1], f[2], f[3], f[4], f[5]}} == nic_.mac_address();
     if (ours && rx.coalescer.offer(f, received)) continue;
@@ -208,6 +228,7 @@ void NetworkStack::poll_control() {
   looped += deliver_looped();  // (what the timers and the received frames sent to this stack itself)
   udp_.reap();
   raw_.reap();
+  taps_.reap();
   uint32_t drained = 0;
   bool looped_left;
   {
@@ -253,6 +274,7 @@ uint32_t NetworkStack::deliver_looped() {
       if (!looped_.dequeue(&p)) break;
     }
     const ConstByteView packet = ConstByteView(p.ip_packet).first(p.length);
+    taps_.looped(packet);
     if (p.length && (p.ip_packet[0] >> 4) == 6) handle_ipv6(packet, true);
     else handle_ipv4(packet, true);
   }
@@ -461,6 +483,11 @@ bool NetworkStack::send_frame(const hardware::MacAddress& destination, uint16_t 
 }
 
 bool NetworkStack::transmit(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum, uint16_t mss) {
+  if (taps_.any()) taps_.sent(frame, nullptr);      // (as it is handed to the interface: a checksum the interface is to write is not in it yet)
+  return transmit_now(kind, frame, checksum, mss);
+}
+
+bool NetworkStack::transmit_now(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum, uint16_t mss) {
   const uint64_t now = now_ms();
   if (!egress_.empty()) egress_.drain(nic_, now);
   if (egress_.empty()) {   // (with frames waiting, this one waits its turn too: a flow's frames stay in order)

@@ -28,6 +28,7 @@
 #include "NetworkHarness.hpp"
 #include "Ipv6Harness.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
+#include "Process/LinuxBpf.hpp"
 #include "Process/LinuxIpc.hpp"
 #include "Process/LinuxNetlink.hpp"
 #include "Process/Process.hpp"
@@ -534,7 +535,7 @@ static void test_options_and_errors() {
   CHECK(t.s(55, tcp, 1, 3, small, kBad) == -14 && t.s(55, tcp, 1, 3, kBad, t.word(4)) == -14 && t.s(54, tcp, 1, 9, t.word(1), uint64_t(-1)) == -22);
   // what cannot be made
   CHECK(t.s(41, kAfInet, 4 /* SOCK_RDM */, 0) == -94 && t.s(41, kAfInet, kStream, 17) == -93 && t.s(41, kAfInet, kDgram, 6) == -93);
-  CHECK(t.s(41, kAfInet, kStream | 0x4000, 0) == -22 && t.s(41, 17 /* AF_PACKET */, kStream, 0) == -97 && t.s(41, kAfInet, 0, 0) == -22);
+  CHECK(t.s(41, kAfInet, kStream | 0x4000, 0) == -22 && t.s(41, 4 /* AF_IPX */, kStream, 0) == -97 && t.s(41, kAfInet, 0, 0) == -22);
   // addresses: every length short of a whole one, a wrong family, a flipped bit anywhere: an error or a result, never anything else
   const uint64_t good = t.in4(10, 0, 0, 2, 9700);
   for (uint64_t length = 0; length < 16; ++length) {
@@ -1600,6 +1601,276 @@ static void test_raw_sockets() {
   }
 }
 
+// --- socket filters and AF_PACKET ---------------------------------------------------------------------------------------------------------------------------
+namespace filter {
+// one instruction of a classic BPF program
+std::string op(uint16_t code, uint8_t jt, uint8_t jf, uint32_t k) {
+  std::string out;
+  out.push_back(char(code)); out.push_back(char(code >> 8)); out.push_back(char(jt)); out.push_back(char(jf));
+  for (int i = 0; i < 4; ++i) out.push_back(char(k >> (8 * i)));
+  return out;
+}
+ConstByteView view(const std::string& bytes) { return ConstByteView(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()); }
+// "arp": the ether type at 12 is 0x0806
+std::string arp() { return op(0x28, 0, 0, 12) + op(0x15, 0, 1, 0x0806) + op(0x06, 0, 0, 0x40000) + op(0x06, 0, 0, 0); }
+// "udp dst port N" over Ethernet and IPv4, as tcpdump writes it (the IP header's length from its first byte)
+std::string udp_to(uint16_t port) {
+  return op(0x28, 0, 0, 12) + op(0x15, 0, 8, 0x0800) + op(0x30, 0, 0, 23) + op(0x15, 0, 6, 17) + op(0x28, 0, 0, 20) + op(0x45, 4, 0, 0x1FFF) + op(0xB1, 0, 0, 14) + op(0x48, 0, 0, 16) +
+         op(0x15, 0, 1, port) + op(0x06, 0, 0, 0x40000) + op(0x06, 0, 0, 0);
+}
+}  // namespace filter
+
+static std::string ethernet(const uint8_t to[6], const uint8_t from[6], uint16_t type, const std::string& payload) {
+  std::string f(reinterpret_cast<const char*>(to), 6);
+  f += std::string(reinterpret_cast<const char*>(from), 6);
+  f.push_back(char(type >> 8)); f.push_back(char(type));
+  return f + payload;
+}
+// an ARP message: who has `target`? (operation 1) asked by `sender_mac` at `sender`
+static std::string arp_message(uint16_t operation, const uint8_t sender_mac[6], const std::string& sender, const std::string& target) {
+  std::string m("\0\x01\x08\0\x06\x04", 6);
+  m.push_back(char(operation >> 8)); m.push_back(char(operation));
+  m += std::string(reinterpret_cast<const char*>(sender_mac), 6) + sender + std::string(6, '\0') + target;
+  return m;
+}
+
+static void test_socket_filter() {
+  using namespace linuxabi;
+  const uint8_t a[6] = {2, 0, 0, 0, 0, 1}, b[6] = {2, 0, 0, 0, 0, 2};
+  const std::string arp_frame = ethernet(b, a, 0x0806, arp_message(1, a, std::string("\x0A\0\0\x01", 4), std::string("\x0A\0\0\x02", 4)));
+  // an IPv4 UDP datagram to port 9999, with an IP header of 24 bytes (one option word)
+  std::string ip("\x46\0\0\x24\0\0\0\0\x40\x11\0\0\x0A\0\0\x01\x0A\0\0\x02\0\0\0\0", 24);
+  const std::string udp_frame = ethernet(b, a, 0x0800, ip + std::string("\x30\x39\x27\x0F\0\x0C\0\0data", 12));
+  auto packet = [](const std::string& frame) {
+    bpf::Packet p;
+    p.data = filter::view(frame);
+    p.network_offset = 14;
+    p.wire_length = uint32_t(frame.size());
+    p.protocol = uint16_t(uint8_t(frame[12]) << 8 | uint8_t(frame[13]));
+    p.packet_type = 1;
+    p.interface_index = 2;
+    return p;
+  };
+  auto run = [&](const std::string& program, const std::string& frame) { return bpf::run(filter::view(program), packet(frame)); };
+  CHECK(bpf::valid(filter::view(filter::arp())) && run(filter::arp(), arp_frame) == 0x40000 && run(filter::arp(), udp_frame) == 0);
+  CHECK(bpf::valid(filter::view(filter::udp_to(9999))) && run(filter::udp_to(9999), udp_frame) == 0x40000 && run(filter::udp_to(9998), udp_frame) == 0 && run(filter::udp_to(9999), arp_frame) == 0);
+  // every kind of instruction: constants, memory, arithmetic, the registers, the packet's length, facts beside the packet
+  using filter::op;
+  CHECK(run(op(0x00, 0, 0, 7) + op(0x02, 0, 0, 3) + op(0x00, 0, 0, 0) + op(0x60, 0, 0, 3) + op(0x16, 0, 0, 0), arp_frame) == 7);                                              // ld #7; st M[3]; ld #0; ld M[3]; ret a
+  CHECK(run(op(0x00, 0, 0, 10) + op(0x04, 0, 0, 5) + op(0x24, 0, 0, 3) + op(0x14, 0, 0, 1) + op(0x34, 0, 0, 4) + op(0x94, 0, 0, 7) + op(0x16, 0, 0, 0), arp_frame) == ((10 + 5) * 3 - 1) / 4 % 7);
+  CHECK(run(op(0x00, 0, 0, 0xF0) + op(0x54, 0, 0, 0x3C) + op(0x44, 0, 0, 1) + op(0xA4, 0, 0, 0xFF) + op(0x64, 0, 0, 4) + op(0x74, 0, 0, 2) + op(0x16, 0, 0, 0), arp_frame) == ((((0xF0 & 0x3C) | 1) ^ 0xFF) << 4) >> 2);
+  CHECK(run(op(0x01, 0, 0, 9) + op(0x87, 0, 0, 0) + op(0x84, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == uint32_t(-9));                                                        // ldx #9; txa; neg; ret a
+  CHECK(run(op(0x00, 0, 0, 6) + op(0x07, 0, 0, 0) + op(0x00, 0, 0, 40) + op(0x0C, 0, 0, 0) + op(0x1C, 0, 0, 0) + op(0x2C, 0, 0, 0) + op(0x3C, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == 40);      // + - * / by x
+  CHECK(run(op(0x80, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == arp_frame.size() && run(op(0x81, 0, 0, 0) + op(0x87, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == arp_frame.size());
+  CHECK(run(op(0x20, 0, 0, 0xFFFFF000u) + op(0x16, 0, 0, 0), arp_frame) == 0x0806 && run(op(0x20, 0, 0, 0xFFFFF004u) + op(0x16, 0, 0, 0), arp_frame) == 1 &&
+        run(op(0x20, 0, 0, 0xFFFFF008u) + op(0x16, 0, 0, 0), arp_frame) == 2);      // the protocol, how it came by, the interface
+  CHECK(run(op(0x30, 0, 0, 0xFFF00000u + 9) + op(0x16, 0, 0, 0), udp_frame) == 17 && run(op(0x28, 0, 0, 0xFFE00000u + 12) + op(0x16, 0, 0, 0), udp_frame) == 0x0800);      // from the network header, from the link header
+  CHECK(run(op(0x01, 0, 0, 12) + op(0x48, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == 0x0806 && run(op(0x01, 0, 0, 2) + op(0x40, 0, 0, 10) + op(0x16, 0, 0, 0), arp_frame) == 0x08060001);      // indexed loads
+  CHECK(run(op(0x05, 0, 0, 1) + op(0x06, 0, 0, 1) + op(0x06, 0, 0, 2), arp_frame) == 2);                                                                                      // ja
+  CHECK(run(op(0x00, 0, 0, 5) + op(0x25, 0, 1, 4) + op(0x06, 0, 0, 1) + op(0x06, 0, 0, 2), arp_frame) == 1 && run(op(0x00, 0, 0, 5) + op(0x35, 0, 1, 6) + op(0x06, 0, 0, 1) + op(0x06, 0, 0, 2), arp_frame) == 2);
+  CHECK(run(op(0x00, 0, 0, 6) + op(0x01, 0, 0, 2) + op(0x4D, 0, 1, 0) + op(0x06, 0, 0, 1) + op(0x06, 0, 0, 2), arp_frame) == 1);                                              // jset x
+  // a load outside the packet, and a division by a register that is zero, end the program with nothing
+  CHECK(run(op(0x20, 0, 0, uint32_t(arp_frame.size()) - 3) + op(0x06, 0, 0, 9), arp_frame) == 0 && run(op(0x20, 0, 0, uint32_t(arp_frame.size()) - 4) + op(0x06, 0, 0, 9), arp_frame) == 9);
+  CHECK(run(op(0x01, 0, 0, 5000) + op(0x50, 0, 0, 0x20) + op(0x06, 0, 0, 9), arp_frame) == 0 && run(op(0x00, 0, 0, 8) + op(0x3C, 0, 0, 0) + op(0x06, 0, 0, 9), arp_frame) == 0 &&
+        run(op(0x00, 0, 0, 8) + op(0x9C, 0, 0, 0) + op(0x06, 0, 0, 9), arp_frame) == 0 && run(op(0x00, 0, 0, 8) + op(0x01, 0, 0, 40) + op(0x6C, 0, 0, 0) + op(0x16, 0, 0, 0), arp_frame) == 0);
+  // what is not a program
+  auto bad = [](const std::string& program) { return !bpf::valid(filter::view(program)) && bpf::run(filter::view(program), bpf::Packet()) == 0; };
+  CHECK(bad("") && bad(std::string(7, '\0')) && bad(op(0x00, 0, 0, 1)) && bad(op(0x06, 0, 0, 1) + op(0x00, 0, 0, 1)));                    // empty, not whole, no return at the end
+  CHECK(bad(op(0x15, 1, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0x15, 0, 1, 0) + op(0x06, 0, 0, 1)) && bad(op(0x05, 0, 0, 1) + op(0x06, 0, 0, 1)) &&
+        bad(op(0x05, 0, 0, 0xFFFFFFFFu) + op(0x06, 0, 0, 1) + op(0x06, 0, 0, 1)));                                                       // jumps past the end
+  CHECK(bad(op(0x60, 0, 0, 16) + op(0x06, 0, 0, 1)) && bad(op(0x02, 0, 0, 16) + op(0x06, 0, 0, 1)) && bad(op(0x61, 0, 0, 99) + op(0x06, 0, 0, 1)));      // memory there is not
+  CHECK(bad(op(0x34, 0, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0x94, 0, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0x64, 0, 0, 32) + op(0x06, 0, 0, 1)));          // by zero, by too much
+  CHECK(bad(op(0x38, 0, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0xB4, 0, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0x55, 0, 0, 0) + op(0x06, 0, 0, 1)) && bad(op(0x106, 0, 0, 0)) &&
+        bad(op(0x17, 0, 0, 0) + op(0x06, 0, 0, 1)));                                                // operations there are not; too long
+  std::string longest;
+  for (int i = 0; i < 4096; ++i) longest += op(0x06, 0, 0, 1);
+  CHECK(bpf::valid(filter::view(longest)) && bad(longest + op(0x06, 0, 0, 1)));                                                           // 4096 instructions, and one more
+  // Any bit of a program flipped, and programs of random bytes: refused, or run to an end on every packet (shorter ones too)
+  const std::string programs[] = {filter::arp(), filter::udp_to(9999),
+                                  op(0x00, 0, 0, 6) + op(0x07, 0, 0, 0) + op(0x00, 0, 0, 40) + op(0x0C, 0, 0, 0) + op(0x2C, 0, 0, 0) + op(0x3C, 0, 0, 0) + op(0x02, 0, 0, 3) + op(0x61, 0, 0, 3) +
+                                      op(0x48, 0, 0, 2) + op(0x16, 0, 0, 0)};
+  size_t accepted = 0, refused = 0;
+  auto exercise = [&](const std::string& program) {
+    if (!bpf::valid(filter::view(program))) { ++refused; return; }
+    ++accepted;
+    for (const std::string& frame : {arp_frame, udp_frame, udp_frame.substr(0, 20), std::string()}) (void)run(program, frame);
+  };
+  for (const std::string& program : programs)
+    for (size_t bit = 0; bit < program.size() * 8; ++bit) {
+      std::string flipped = program;
+      flipped[bit / 8] = char(flipped[bit / 8] ^ (1 << (bit % 8)));
+      exercise(flipped);
+      exercise(flipped.substr(0, bit / 8));
+    }
+  uint32_t seed = 12345;
+  for (int i = 0; i < 20000; ++i) {
+    std::string random;
+    const size_t count = 1 + (seed >> 8) % 12;
+    for (size_t n = 0; n < count * 8; ++n) { seed = seed * 1664525u + 1013904223u; random.push_back(char((seed >> 16) % (n % 8 == 0 ? 0xC0 : n % 8 == 1 ? 2 : 256))); }
+    random[random.size() - 8] = 0x06;      // (so that some get through the check)
+    random[random.size() - 7] = 0;
+    exercise(random);
+  }
+  CHECK(accepted > 500 && refused > 500);
+}
+
+static void test_packet_sockets() {
+  constexpr uint64_t kPacket = 17, kRaw = 3;
+  constexpr uint64_t kAllProtocols = 0x0300, kArp = 0x0608, kIp = 0x0008;      // htons(ETH_P_ALL), htons(ETH_P_ARP), htons(ETH_P_IP)
+  Setup t;
+  const uint8_t* mac_a = t.lan.nic_a.mac.bytes;
+  const uint8_t* mac_b = t.lan.nic_b.mac.bytes;
+  const uint8_t everyone[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  const std::string here("\x0A\0\0\x01", 4), there("\x0A\0\0\x02", 4);
+  const uint64_t buffer = t.alloc(2048), name = t.alloc(32), size = t.alloc(8);
+  uint32_t v = 0;
+  // struct sockaddr_ll
+  auto address = [&](uint16_t protocol, uint32_t interface, const uint8_t* to = nullptr) {
+    const uint64_t at = t.alloc(24);
+    uint8_t raw[20] = {17, 0, uint8_t(protocol >> 8), uint8_t(protocol), uint8_t(interface), 0, 0, 0, 0, 0, 0, uint8_t(to ? 6 : 0)};
+    if (to) memcpy(raw + 12, to, 6);
+    t.memory.write(at, ConstByteView(raw, 20));
+    return at;
+  };
+  struct Got { std::string data, from; int64_t result = 0; };
+  auto receive = [&](int64_t fd, uint64_t flags = 0) {
+    Got g;
+    if (!t.lan.run_until([&] { return t.polled(fd, kPollIn) == kPollIn; }, 3000)) { g.result = -11; return g; }
+    t.put32(size, 20);
+    g.result = t.s(45, fd, buffer, 2048, flags, name, size);
+    if (g.result > 0) g.data = t.text(buffer, uint64_t(g.result));
+    g.from = t.text(name, t.u32(size) <= 20 ? t.u32(size) : 0);
+    return g;
+  };
+  auto quiet = [&](int64_t fd) { t.lan.step(30); return t.polled(fd, kPollIn) == 0; };
+  auto send = [&](int64_t fd, const std::string& bytes, uint64_t to = 0) { return t.s(44, fd, t.bytes(bytes), bytes.size(), 0, to, to ? 20 : 0); };
+  SharedPointer<network::IFrameTap> other = t.lan.b.frame_open();      // the other machine, tapping its own interface
+  uint8_t seen[1514];
+  network::FrameInfo info;
+  CHECK(other);
+  other->listen(0x0806, false, true, false, false);
+
+  // what there is and is not
+  CHECK(t.s(41, kPacket, kStream, kAllProtocols) == -94 && t.s(41, kPacket, kRaw, 0x10000) == -22);
+  const int64_t arp = t.s(41, kPacket, kRaw | kNonBlock, kArp);
+  CHECK(arp >= 3 && t.option(arp, 1, 3, &v) == 0 && v == kRaw && t.option(arp, 1, 39, &v) == 0 && v == kPacket && t.option(arp, 1, 38, &v) == 0 && v == kArp && t.polled(arp) == kPollOut);
+  // bind: an interface that is there; getsockname shows it with its hardware address (18 bytes: up to the address's end)
+  CHECK(t.s(49, arp, address(0, 9), 20) == -19 && t.s(49, arp, address(0, 2), 16) == -22 && t.s(49, arp, address(0, 2), 20) == 0);
+  t.put32(size, 20);
+  CHECK(t.s(51, arp, name, size) == 0 && t.u32(size) == 18 && t.text(name, 12) == std::string("\x11\0\x08\x06\x02\0\0\0\x01\0\0\x06", 12) && memcmp(t.text(name + 12, 6).data(), mac_a, 6) == 0);
+  // "arping": a request written by hand goes out, the other machine answers, and the answer comes to the socket (and nothing else does)
+  const std::string request = ethernet(everyone, mac_a, 0x0806, arp_message(1, mac_a, here, there));
+  CHECK(send(arp, request) == int64_t(request.size()));
+  Got g = receive(arp);
+  CHECK(g.result >= 42 && g.data.substr(0, 14) == ethernet(mac_a, mac_b, 0x0806, "") && g.data.substr(14 + 6, 2) == std::string("\0\x02", 2) && g.data.substr(14 + 14, 4) == there);
+  CHECK(g.from.size() == 20 && g.from.substr(0, 12) == std::string("\x11\0\x08\x06\x02\0\0\0\x01\0\0\x06", 12) && memcmp(g.from.data() + 12, mac_b, 6) == 0 && quiet(arp));      // ARPHRD_ETHER, PACKET_HOST
+  CHECK(other->receive(ByteView(seen), &info) && info.kind == network::FrameKind::Broadcast && info.length >= request.size() && memcmp(seen, request.data(), request.size()) == 0);
+  // a broadcast from the other machine: looked at first, sized, then read; FIONREAD
+  const std::string asked = ethernet(everyone, mac_b, 0x0806, arp_message(1, mac_b, there, std::string("\x0A\0\0\x63", 4)));
+  CHECK(other->send(ConstByteView(reinterpret_cast<const uint8_t*>(asked.data()), asked.size())) && t.lan.run_until([&] { return t.polled(arp, kPollIn) == kPollIn; }, 3000));
+  CHECK(t.s(16, arp, 0x541B, size) == 0 && t.u32(size) >= asked.size() && t.s(45, arp, buffer, 10, 0x22 /* MSG_PEEK | MSG_TRUNC */, 0, 0) == int64_t(t.u32(size)));      // (the wire pads a short frame)
+  g = receive(arp);
+  CHECK(g.data.substr(0, asked.size()) == asked && g.from[10] == 1 /* PACKET_BROADCAST */ && t.s(45, arp, buffer, 64, 0, 0, 0) == -11);
+
+  // SOCK_DGRAM: no link header either way; the address says where a frame goes and where one came from
+  const int64_t cooked = t.s(41, kPacket, kDgram | kNonBlock, kArp);
+  const std::string question = arp_message(1, mac_a, here, there);
+  CHECK(cooked >= 3 && t.option(cooked, 1, 3, &v) == 0 && v == kDgram && send(cooked, question) == -6 && send(cooked, question, address(0, 2)) == -22);      // no interface; nowhere to send it
+  CHECK(send(cooked, question, address(0x0806, 2, everyone)) == int64_t(question.size()));
+  g = receive(cooked);
+  CHECK(g.result >= 28 && g.data.substr(6, 2) == std::string("\0\x02", 2) && g.data.substr(8, 6) == std::string(reinterpret_cast<const char*>(mac_b), 6) && memcmp(g.from.data() + 12, mac_b, 6) == 0);
+  g = receive(arp);      // (the first socket hears the same answer, whole)
+  CHECK(g.result >= 42 && g.data.substr(12, 2) == std::string("\x08\x06", 2));
+
+  // ETH_P_ALL: what the interface sends too (PACKET_OUTGOING), unless the socket says it does not want that
+  const int64_t all = t.s(41, kPacket, kRaw | kNonBlock, kAllProtocols), udp = t.s(41, kAfInet, kDgram, 0);
+  SharedPointer<network::IUdpSocket> peer = t.lan.b.udp_open_families(9999, network::IpFamilies::Both);
+  CHECK(all >= 3 && peer && t.s(49, all, address(0, 2), 20) == 0 && t.s(44, udp, t.bytes("out"), 3, 0, t.in4(10, 0, 0, 2, 9999), 16) == 3);
+  g = receive(all);
+  CHECK(g.result == 14 + 20 + 8 + 3 && g.data.substr(0, 14) == ethernet(mac_b, mac_a, 0x0800, "") && g.data.substr(g.data.size() - 3) == "out" && g.from[10] == 4 && g.from.substr(2, 2) == std::string("\x08\0", 2));
+  network::IpAddress from;
+  uint16_t from_port = 0;
+  uint32_t length = 0;
+  CHECK(t.lan.run_until([&] { return peer->pending() > 0; }, 3000) && peer->receive_from_ip(ByteView(seen), &from, &from_port, &length) && length == 3);
+  CHECK(peer->send_to_ip(from, from_port, ConstByteView(reinterpret_cast<const uint8_t*>("back"), 4)));
+  g = receive(all);
+  CHECK(g.result >= 14 + 20 + 8 + 4 && g.from[10] == 0 && g.data.substr(14 + 20 + 8, 4) == "back" && quiet(arp));      // (incoming: PACKET_HOST; and the ARP socket hears no IP)
+  CHECK(t.s(54, all, 263, 23, t.word(1), 4) == 0 && t.option(all, 263, 23, &v) == 0 && v == 1 && t.s(44, udp, t.bytes("unseen"), 6, 0, t.in4(10, 0, 0, 2, 9999), 16) == 6 && quiet(all));
+  CHECK(t.s(54, all, 263, 23, t.word(0), 4) == 0);
+
+  // A filter (SO_ATTACH_FILTER) picks what the socket gets: here UDP to port 9999, of which 20 bytes
+  const std::string program = filter::udp_to(9999).substr(0, 9 * 8) + filter::op(0x06, 0, 0, 20) + filter::op(0x06, 0, 0, 0);
+  auto attach = [&](int64_t fd, const std::string& code, uint64_t count) {
+    const uint64_t at = t.alloc(16);
+    t.put64(at, count); t.put64(at + 8, t.bytes(code));
+    return t.s(54, fd, 1, 26, at, 16);
+  };
+  CHECK(attach(all, program, program.size() / 8) == 0 && attach(all, program.substr(0, 16), 2) == -22 && attach(all, program, 0) == -22 && attach(all, program, 5000) == -22);
+  while (peer->receive_from_ip(ByteView(seen), &from, &from_port, &length)) {}
+  CHECK(t.s(44, udp, t.bytes("other port"), 10, 0, t.in4(10, 0, 0, 2, 9998), 16) == 10 && quiet(all) && t.s(44, udp, t.bytes("this port"), 9, 0, t.in4(10, 0, 0, 2, 9999), 16) == 9);
+  // recvmsg: MSG_TRUNC in what comes back when the filter kept less than the frame, and PACKET_AUXDATA says how much there was
+  {
+    const uint64_t vectors = t.alloc(16), message = t.alloc(56), control = t.alloc(64);
+    CHECK(t.s(54, all, 263, 8, t.word(1), 4) == 0 && t.lan.run_until([&] { return t.polled(all, kPollIn) == kPollIn; }, 3000));
+    t.put64(vectors, buffer); t.put64(vectors + 8, 2048);
+    t.put64(message, name); t.put32(message + 8, 20); t.put64(message + 16, vectors); t.put64(message + 24, 1); t.put64(message + 32, control); t.put64(message + 40, 64);
+    CHECK(t.s(47, all, message, 0) == 20 && t.u32(message + 48) == 0x20 && t.u32(message + 8) == 20 && t.u64(message + 40) == 40 && t.u32(control + 8) == 263 && t.u32(control + 12) == 8 &&
+          t.u32(control + 16) == 1 && t.u32(control + 20) == 14 + 20 + 8 + 9 && t.u32(control + 24) == 20 && t.text(buffer, 14) == ethernet(mac_b, mac_a, 0x0800, ""));
+  }
+  CHECK(t.s(54, all, 1, 27, 0, 0) == -22 && t.s(54, all, 1, 27, t.word(0), 4) == 0 && t.s(54, all, 1, 27, t.word(0), 4) == -2 && attach(all, filter::arp(), 4) == 0 && t.s(54, all, 1, 44, t.word(1), 4) == 0 &&
+        t.s(54, all, 1, 27, t.word(0), 4) == -1 &&
+        attach(all, program, program.size() / 8) == -1);      // (taken off; none to take off; a locked one stays)
+  // PACKET_STATISTICS counts what the socket was given since it was last asked
+  t.put32(size, 8);
+  CHECK(t.s(55, all, 263, 6, buffer, size) == 0 && t.u32(size) == 8 && t.u32(buffer) == 3 && t.u32(buffer + 4) == 0 && t.s(55, all, 263, 6, buffer, size) == 0 && t.u32(buffer) == 0);
+
+  // the loopback: packets the machine sends to itself, shown as frames with no addresses, once each
+  const int64_t loop = t.s(41, kPacket, kRaw | kNonBlock, kIp), local = t.s(41, kAfInet, kDgram, 0);
+  CHECK(t.s(49, loop, address(0, 1), 20) == 0 && t.s(49, local, t.in4(127, 0, 0, 1, 9997), 16) == 0 && t.s(44, udp, t.bytes("to myself"), 9, 0, t.in4(127, 0, 0, 1, 9997), 16) == 9);
+  g = receive(loop);
+  CHECK(g.result == 14 + 20 + 8 + 9 && g.data.substr(0, 14) == std::string(12, '\0') + std::string("\x08\0", 2) && g.data.substr(g.data.size() - 9) == "to myself" &&
+        g.from.substr(0, 12) == std::string("\x11\0\x08\0\x01\0\0\0\x04\x03\0\x06", 12) && quiet(loop));      // interface 1, ARPHRD_LOOPBACK, PACKET_HOST
+  t.put32(size, 20);
+  CHECK(t.s(51, loop, name, size) == 0 && t.u32(size) == 18 && t.text(name, 12) == std::string("\x11\0\x08\0\x01\0\0\0\x04\x03\0\x06", 12));
+  CHECK(t.s(45, local, buffer, 64, 0, 0, 0) == 9);
+  // a frame sent on the loopback comes back to the machine: here the datagram just heard, sent again
+  CHECK(send(loop, g.data) == int64_t(g.data.size()) && t.lan.run_until([&] { return t.polled(local, kPollIn) == kPollIn; }, 3000) && t.s(45, local, buffer, 64, 0, 0, 0) == 9 &&
+        t.text(buffer, 9) == "to myself");
+  g = receive(loop);
+  CHECK(g.result == 14 + 20 + 8 + 9 && quiet(arp));
+  // SO_BINDTODEVICE names the interface; an unbound socket hears every interface
+  CHECK(t.s(54, loop, 1, 25, t.bytes(std::string("eth0\0", 5)), 5) == 0 && t.s(54, loop, 1, 25, t.bytes(std::string("nope\0", 5)), 5) == -19);
+  t.put32(size, 20);
+  CHECK(t.s(51, loop, name, size) == 0 && t.u32(name + 4) == 2 && t.s(54, loop, 1, 25, t.bytes(std::string(1, '\0')), 1) == 0 && t.s(51, loop, name, size) == 0 && t.u32(name + 4) == 0 && t.u32(size) == 12);
+  CHECK(t.s(44, udp, t.bytes("one"), 3, 0, t.in4(127, 0, 0, 1, 9997), 16) == 3 && peer->send_to_ip(from, from_port, ConstByteView(reinterpret_cast<const uint8_t*>("two"), 3)));
+  Got first = receive(loop), second = receive(loop);
+  CHECK(first.result > 0 && second.result > 0 && first.from[4] + second.from[4] == 3 && quiet(loop));      // (one from each interface)
+
+  // what a packet socket is not, and what it refuses
+  CHECK(t.s(50, arp, 1) == -95 && t.s(43, arp, 0, 0) == -95 && t.s(42, arp, address(0, 2), 20) == -95 && t.s(48, arp, 2) == -95 && t.s(52, arp, name, size) == -95);
+  CHECK(send(arp, std::string(13, 'x')) == -22 && send(arp, std::string(1515, 'x')) == -90 && send(arp, request, address(0, 7)) == -6 && t.s(44, arp, kBad, 60, 0, 0, 0) == -14);
+  CHECK(t.s(54, arp, 263, 5, buffer, 16) == -92 && t.s(54, arp, 263, 10, t.word(2), 4) == -92 && t.option(arp, 263, 11, &v) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // rings and versions
+  CHECK(t.s(54, arp, 263, 1, buffer, 16) == 0 && t.s(54, arp, 263, 1, buffer, 8) == -22);      // PACKET_ADD_MEMBERSHIP (promiscuous mode): taken
+  // read and write, readv and writev; the interface ioctls
+  {
+    const uint64_t vectors = t.alloc(32);
+    CHECK(t.s(1, arp, t.bytes(request), request.size()) == int64_t(request.size()) && t.lan.run_until([&] { return t.polled(arp, kPollIn) == kPollIn; }, 3000) && t.s(0, arp, buffer, 2048) >= 42);
+    t.put64(vectors, t.bytes(request.substr(0, 14))); t.put64(vectors + 8, 14); t.put64(vectors + 16, t.bytes(request.substr(14))); t.put64(vectors + 24, request.size() - 14);
+    CHECK(t.s(20, arp, vectors, 2) == int64_t(request.size()) && t.lan.run_until([&] { return t.polled(arp, kPollIn) == kPollIn; }, 3000));
+    t.put64(vectors, buffer); t.put64(vectors + 8, 14); t.put64(vectors + 16, buffer + 100); t.put64(vectors + 24, 2000);
+    CHECK(t.s(19, arp, vectors, 2) >= 42 && t.text(buffer, 14) == ethernet(mac_a, mac_b, 0x0806, "") && t.text(buffer + 106, 2) == std::string("\0\x02", 2));
+    const uint64_t ifreq = t.alloc(40);
+    t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>("eth0"), 5));
+    CHECK(t.s(16, arp, 0x8933, ifreq) == 0 && t.u32(ifreq + 16) == 2 && t.s(16, arp, 0x8927, ifreq) == 0 && memcmp(t.text(ifreq + 18, 6).data(), mac_a, 6) == 0);
+  }
+  // closed sockets hear nothing more; many more than there can be at once
+  CHECK(t.s(3, arp) == 0 && t.s(3, cooked) == 0 && t.s(3, all) == 0 && t.s(3, loop) == 0);
+  for (int i = 0; i < 100; ++i) {
+    const int64_t one = t.s(41, kPacket, kRaw, kAllProtocols);
+    CHECK(one >= 3 && t.s(3, one) == 0);
+  }
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -1615,6 +1886,8 @@ int main() {
   test_netlink_messages();
   test_netlink_sockets();
   test_raw_sockets();
+  test_socket_filter();
+  test_packet_sockets();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

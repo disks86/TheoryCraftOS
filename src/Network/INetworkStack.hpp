@@ -20,6 +20,7 @@
 #include "Hardware/NetworkInterface/NetworkTypes.hpp"
 #include "Network/Dhcp/IDhcpClient.hpp"
 #include "Network/Ip/RawSocket.hpp"
+#include "Network/Link/FrameTap.hpp"
 #include "Kernel/Sync.hpp"
 #include "Utility/StringView.hpp"
 #include "Network/Dns/IDnsResolver.hpp"
@@ -78,6 +79,8 @@ class INetworkStack {
   virtual SharedPointer<ITcpSocket> tcp_open() = 0;
   // A raw socket for IP protocol `protocol` (see RawSocket.hpp); `identifier` is an echo socket's (0: one nobody uses). Null if this stack has none to
   // give, or the identifier is taken.
+  // A tap on this stack's network interface (see FrameTap.hpp). Null if it has none to give.
+  virtual SharedPointer<IFrameTap> frame_open() { return SharedPointer<IFrameTap>(); }
   virtual SharedPointer<IRawSocket> raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) {
     (void)v6;
     (void)protocol;

@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Allocators/IAllocator.hpp"
+#include "Network/Link/FrameTap.hpp"
 #include "Process/LinuxNetlinkMessages.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Objects.hpp"
@@ -159,6 +160,33 @@ class LinuxIpcManager {
     UniquePointer<linuxabi::netlink::Snapshot> seen;      // the network as it was last told, for a socket that listens for changes
   };
   NetlinkSocket netlink_sockets[kNetlinkSockets];
+
+  // AF_PACKET sockets (LinuxPacket.cpp): what socket(AF_PACKET, ...) gives a descriptor for. Each has a tap on every network interface.
+  static constexpr uint32_t kPacketSockets = 32, kPacketTaps = linuxabi::netlink::kMostInterfaces - 1;
+  struct PacketFrame {
+    network::FrameInfo info;
+    uint32_t interface = 0;        // the interface's number as Linux counts them (1: the loopback)
+    uint32_t kept = 0;             // how much of it the socket's filter wants
+    uint8_t data[network::FrameTap::kMaxFrame] = {};
+  };
+  struct PacketSocket {
+    bool used = false;
+    uint16_t sequence = 0;
+    bool cooked = false;                  // SOCK_DGRAM: frames are handed over and taken without their link header
+    uint16_t protocol = 0;                // the ether type it listens for (3: every one; 0: none)
+    uint32_t interface = 0;               // the interface it is bound to (0: every one)
+    bool aux_data = false, ignore_outgoing = false;
+    uint32_t packets = 0, drops = 0;      // PACKET_STATISTICS, since last asked
+    uint32_t send_buffer = 212992, receive_buffer = 212992;
+    uint64_t receive_timeout_ns = ~uint64_t{0};
+    uint32_t next_tap = 0;                // (the interfaces are asked in turn)
+    SharedPointer<network::IFrameTap> taps[kPacketTaps];
+    UniquePointer<ByteBuffer> filter;     // SO_ATTACH_FILTER: a classic BPF program (LinuxBpf.hpp), or nothing
+    bool locked_filter = false;           // SO_LOCK_FILTER
+    UniquePointer<PacketFrame> held;      // the next frame, taken from a tap and through the filter already (has_held)
+    bool has_held = false;
+  };
+  PacketSocket packet_sockets[kPacketSockets];
 
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];

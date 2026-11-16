@@ -12,7 +12,7 @@ mkdir -p "$work"
 tool=$work/NfsLive
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -I src -I tests -Wall -Wextra -Wno-unused-parameter tests/NfsLive.cpp tests/KernelStubs.cpp src/Kernel/Sync.cpp \
   src/FileSystem/FileSystemTypes.cpp src/Network/Nfs/*.cpp src/Network/ServerNetwork.cpp src/Network/NetworkStack.cpp src/Network/NetworkStackIpv6.cpp src/Network/EgressQueue.cpp src/Network/NetworkStackSet.cpp src/Network/Dhcp/*.cpp \
-  src/Network/Dns/*.cpp src/Network/Ip/*.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Checksum.cpp -o "$tool" || exit 1
+  src/Network/Dns/*.cpp src/Network/Ip/*.cpp src/Network/Link/*.cpp src/Network/Udp/*.cpp src/Network/Tcp/*.cpp src/Network/Checksum.cpp -o "$tool" || exit 1
 
 root=$work/root
 rm -rf "$root"; mkdir -p "$root/data/sub" "$root/data/nested" "$root/public" "$root/private" "$root/nested"

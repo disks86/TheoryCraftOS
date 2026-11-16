@@ -816,6 +816,97 @@ static void test_raw_threads() {
   CHECK(corrupt == 0 && answered >= sent * 9 / 10 && heard >= sent / 2 && opened > 10);
 }
 
+// Frame taps, several threads: while two threads send UDP datagrams from A to B and B's stack receives them on its service threads, a tap on each
+// machine reads every frame that goes by (A's the outgoing ones, B's the incoming ones), a third thread sends frames of its own through a tap, and a
+// fourth opens, sets and closes taps all the while (the list every frame is shown to changes under the deliveries). Every frame read is whole.
+static void test_tap_threads() {
+  Machines m(2);
+  constexpr int kSenders = 2;
+  constexpr uint32_t kPerSender = 400, kSize = 300;
+  SharedPointer<IFrameTap> out = m.a.at(0)->frame_open(), in = m.b.at(0)->frame_open();
+  SharedPointer<IUdpSocket> from = m.a.at(0)->udp_open(0), to = m.b.at(0)->udp_open(9600);
+  CHECK(out && in && from && to);
+  if (!out || !in || !from || !to) return;
+  out->listen(0, true, true, false, true);
+  in->listen(kEtherTypeIpv4, false, true, false, false);
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> sent{0}, went{0}, came{0}, by_hand{0}, corrupt{0}, opened{0}, arrived{0};
+  // a frame carrying one of the datagrams: Ethernet, IPv4 without options, UDP to port 9600, then the pattern
+  auto datagram_in = [&](const uint8_t* f, uint32_t length, bool* ours) {
+    *ours = length == 14 + 20 + 8 + kSize && f[12] == 0x08 && f[13] == 0x00 && f[23] == kProtocolUdp && (uint16_t(f[36]) << 8 | f[37]) == 9600;
+    if (!*ours) return true;
+    const uint8_t* d = f + 42;
+    for (uint32_t i = 4; i < kSize; ++i)
+      if (d[i] != uint8_t(d[0] * 31 + d[1] + d[2] * 7 + i)) return false;
+    return true;
+  };
+  std::thread reader([&] {
+    uint8_t frame[1514];
+    FrameInfo info;
+    uint8_t buffer[2000];
+    while (!stop) {
+      const uint64_t seen = m.a.progress() + m.b.progress();
+      bool any = false, ours = false;
+      while (out->receive(ByteView(frame), &info)) {
+        any = true;
+        if (info.length > sizeof(frame) || !datagram_in(frame, info.length, &ours)) ++corrupt;
+        else if (ours && info.kind == FrameKind::Outgoing) ++went;
+      }
+      while (in->receive(ByteView(frame), &info)) {
+        any = true;
+        if (info.length > sizeof(frame) || !datagram_in(frame, info.length, &ours) || info.kind == FrameKind::Outgoing) ++corrupt;
+        else if (ours) ++came;
+      }
+      uint32_t length;
+      while (to->receive_from_ip(ByteView(buffer), nullptr, nullptr, &length)) { any = true; ++arrived; }
+      if (!any && m.a.progress() + m.b.progress() == seen) std::this_thread::yield();
+    }
+  });
+  std::thread opener([&] {
+    while (!stop) {
+      SharedPointer<IFrameTap> one = m.b.at(0)->frame_open();
+      if (!one) continue;
+      one->listen(uint16_t(opened), opened % 2 == 0, true, opened % 3 == 0, true);
+      ++opened;
+      std::this_thread::yield();
+      (void)one->take_dropped();
+      one->close();
+    }
+  });
+  std::thread injector([&] {      // frames of a type nobody speaks, from A's tap: B's taps for every type hear them, its stack lets them be
+    uint8_t frame[64] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 2, 0, 0, 0, 0, 9, 0x88, 0xB5};
+    while (!stop) {
+      if (out->send(ConstByteView(frame))) ++by_hand;
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+  });
+  std::vector<std::thread> senders;
+  for (int t = 0; t < kSenders; ++t)
+    senders.emplace_back([&, t] {
+      uint8_t d[kSize];
+      for (uint32_t n = 0; n < kPerSender; ++n) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (sent - arrived >= 16 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        d[0] = uint8_t(t);
+        d[1] = uint8_t(n);
+        d[2] = uint8_t(n >> 8);
+        d[3] = 0;
+        for (uint32_t i = 4; i < kSize; ++i) d[i] = uint8_t(d[0] * 31 + d[1] + d[2] * 7 + i);
+        if (from->send_to(Ipv4Address::make(10, 0, 0, 2), 9600, ConstByteView(d, kSize))) ++sent;
+      }
+    });
+  for (std::thread& t : senders) t.join();
+  wait_until(m.a, [&] { return arrived >= sent * 9 / 10 && came >= sent * 8 / 10 && went >= sent * 8 / 10; }, 10);
+  stop = true;
+  injector.join();
+  opener.join();
+  reader.join();
+  printf("tap threads: %u datagrams sent, %u arrived; the taps read %u going out and %u coming in, %u corrupt; %u frames sent by hand; %u taps came and went\n", sent.load(), arrived.load(),
+         went.load(), came.load(), corrupt.load(), by_hand.load(), opened.load());
+  CHECK(sent == kSenders * kPerSender && corrupt == 0);
+  CHECK(went >= sent * 8 / 10 && came >= sent * 8 / 10 && by_hand > 10 && opened > 10);
+}
+
 int main() {
   test_concurrent_connections();
   test_loopback_latency();
@@ -828,6 +919,7 @@ int main() {
   test_backlog();
   test_udp_threads();
   test_raw_threads();
+  test_tap_threads();
   if (g_failed) { printf("NetworkThreadTest: %d failed\n", g_failed.load()); return 1; }
   printf("NetworkThreadTest: all passed\n");
   return 0;

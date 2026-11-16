@@ -67,9 +67,10 @@ enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      //
                                 MessageQueue = 0x46,     // mq_open: a POSIX message queue (LinuxIpc.cpp)
                                 Pidfd = 0x47,            // pidfd_open: a process (LinuxProcess.cpp)
                                 Inotify = 0x48,          // inotify_init: a set of watches (LinuxInotify.cpp)
-                                Netlink = 0x49 };        // socket(AF_NETLINK): a socket whose other end is the kernel (LinuxNetlink.cpp)
+                                Netlink = 0x49,          // socket(AF_NETLINK): a socket whose other end is the kernel (LinuxNetlink.cpp)
+                                Packet = 0x4A };         // socket(AF_PACKET): the frames of the network interfaces (LinuxPacket.cpp)
 inline bool unix_type_is_linked(UnixType t) {
-  return t == UnixType::MessageQueue || t == UnixType::Pidfd || t == UnixType::Inotify || t == UnixType::Netlink;
+  return t == UnixType::MessageQueue || t == UnixType::Pidfd || t == UnixType::Inotify || t == UnixType::Netlink || t == UnixType::Packet;
 }
 inline bool unix_type_is_socket(UnixType t) { return uint8_t(t) < 0x40; }
 

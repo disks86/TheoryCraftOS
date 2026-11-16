@@ -542,6 +542,11 @@ bool SocketManager::interface_configuration6(uint32_t index, network::Ipv6Config
   return true;
 }
 
+SharedPointer<network::IFrameTap> SocketManager::open_frame_tap(uint32_t index) const {
+  network::INetworkStack* stack = index < stacks_.count() ? stacks_.at(index) : nullptr;
+  return stack ? stack->frame_open() : SharedPointer<network::IFrameTap>();
+}
+
 bool SocketManager::interface_mac(uint32_t index, hardware::MacAddress* out) const {
   if (index >= stacks_.count()) return false;
   network::INetworkStack* stack = stacks_.at(index);

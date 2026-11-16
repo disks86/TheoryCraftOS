@@ -43,7 +43,7 @@ namespace network {
 //   - ICMP: replies to echo requests and sends them for ping().
 //   - Multicast: join_multicast() receives a group's datagrams (IGMPv2 reports, answers to queries); multicast is sent to the
 //     group's Ethernet address.
-class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpListener {
+class NetworkStack final : public INetworkStack, public IIpLayer, public ILinkLayer, private IDhcpListener {
  public:
   // The stack drives `nic` and takes time from `clock`; both must outlive it.
   NetworkStack(hardware::INetworkInterface& nic, hardware::IClock& clock, allocators::IAllocator& allocator);
@@ -111,6 +111,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   SharedPointer<IUdpSocket> udp_open(uint16_t port) override { return udp_open_families(port, IpFamilies::Both); }
   SharedPointer<IUdpSocket> udp_open_families(uint16_t port, IpFamilies families) override;
   SharedPointer<IRawSocket> raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) override;
+  SharedPointer<IFrameTap> frame_open() override;
+  bool send_link_frame(ConstByteView frame, const void* origin) override;
+  hardware::MacAddress link_address() const override { return nic_.mac_address(); }
+  bool loop_ip_packet(ConstByteView packet) override;
   SharedPointer<ITcpSocket> tcp_open() override;
   bool join_multicast(Ipv4Address group) override;
   void leave_multicast(Ipv4Address group) override;
@@ -226,6 +230,8 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   void wake_service() { if (hooks_.wake) hooks_.wake(hooks_.context); }
   uint32_t deliver_looped();
   bool transmit(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum = hardware::TransmitChecksum{}, uint16_t mss = 0);
+  // transmit() without showing the frame to the frame taps (whoever calls it has).
+  bool transmit_now(EgressQueue::Kind kind, ConstByteView frame, hardware::TransmitChecksum checksum, uint16_t mss);
   bool send_frame(const hardware::MacAddress& destination, uint16_t ether_type, ConstByteView payload,
                   hardware::TransmitChecksum checksum = hardware::TransmitChecksum{});
   void send_arp(uint16_t operation, const hardware::MacAddress& target_mac, Ipv4Address target_ip);
@@ -282,6 +288,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, private IDhcpL
   uint8_t outgoing_ttl_ = 0;            // the time to live of the IPv4 packet being built, if not the usual one (set by send_raw for its call, under ip_lock_)
   UdpManager udp_;
   RawManager raw_;
+  FrameTapManager taps_;
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;
   UniquePointer<DhcpClient> dhcp_;

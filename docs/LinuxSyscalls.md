@@ -15,7 +15,7 @@ number means a call newer than this list.
 | Threads | `LinuxThreads.cpp` | clone, clone3 (threads), futex, futex_waitv, futex_wake, futex_wait, futex_requeue, set_tid_address, gettid, exit, sched_getaffinity |
 | Processes | `LinuxProcess.cpp`, `LinuxExec.cpp` | fork, vfork, clone and clone3 (processes), execve, execveat, wait4, waitid, exit_group, the uid/gid/group calls, getpgid, setpgid, getsid, setsid, capget, capset, getrlimit, setrlimit, prlimit64, getrusage, times, sysinfo, getpriority, setpriority, the sched_* calls, getcpu, personality, prctl, membarrier, robust lists, kcmp, pidfd_open, pidfd_send_signal, pidfd_getfd, process_mrelease |
 | Signals | `LinuxSignals.cpp` | rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigtimedwait, rt_sigsuspend, pause, sigaltstack, kill, tkill, tgkill, rt_sigqueueinfo, alarm, getitimer, setitimer, timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete |
-| Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 (TCP, UDP, raw, ICMP echo) and AF_NETLINK sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
+| Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 (TCP, UDP, raw, ICMP echo), AF_NETLINK and AF_PACKET sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
 | Time | `LinuxSyscalls.cpp` | clock_gettime, clock_getres, clock_nanosleep, nanosleep, gettimeofday, time |
 | System V IPC | `LinuxIpc.cpp` | shmget, shmat, shmdt, shmctl, semget, semop, semtimedop, semctl, msgget, msgsnd, msgrcv, msgctl |
 | POSIX message queues | `LinuxIpc.cpp` | mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify, mq_getsetattr |
@@ -204,6 +204,31 @@ nothing of processes); the sockets are `LinuxNetlink.cpp`. Up to 64 at once.
   routing table is listed (not the local one); `NETLINK_GET_STRICT_CHK` and `NETLINK_EXT_ACK` are kept and change nothing; no
   messages between the groups of two programs' sockets.
 
+**Packet sockets.** `socket(AF_PACKET, SOCK_RAW or SOCK_DGRAM, htons(protocol))`: the Ethernet frames of the network interfaces, as
+they are. What a DHCP client of a program's own, ARP tools and link-layer protocols are built on. The network stack has a frame tap
+(`src/Network/Link/FrameTap.cpp`) that is shown every frame its interface hands up, every frame it sends, and every packet the machine
+sends to itself; a socket (`LinuxPacket.cpp`) holds one on each interface and tells it what it wants. Open to every program; up to
+32 at once.
+
+- `SOCK_RAW` hands over and takes whole frames; `SOCK_DGRAM` leaves the link header to the kernel: the sender's address comes in the
+  `struct sockaddr_ll`, and the header of a frame to send is written from the address it is sent to (none is needed on the loopback).
+- A socket hears the frames of its protocol (`ETH_P_ALL`: every one, the interface's own outgoing frames among them unless
+  `PACKET_IGNORE_OUTGOING` says no), on the interface `bind` or `SO_BINDTODEVICE` names or on all of them. The address of a received
+  frame says how it came by: `PACKET_HOST`, `PACKET_BROADCAST`, `PACKET_MULTICAST`, `PACKET_OTHERHOST`, `PACKET_OUTGOING`.
+- The loopback is interface 1 as everywhere here. Its packets never are frames: they are shown with a link header of zero addresses
+  (`ARPHRD_LOOPBACK`), once each. An IP packet sent on it comes back to the machine.
+- `SO_ATTACH_FILTER` takes a classic BPF program (`LinuxBpf.cpp`: checked when attached the way Linux checks one, then run on each
+  frame), which says how much of a frame the socket gets, or that it gets none; `poll` only reports frames that passed it.
+  `SO_DETACH_FILTER` and `SO_LOCK_FILTER` too. A filter sees the protocol, the packet type and the interface as ancillary loads.
+- `MSG_PEEK`, `MSG_TRUNC`, `FIONREAD`, `PACKET_AUXDATA` (a control message with the frame's real and kept lengths),
+  `PACKET_STATISTICS`, the buffer sizes and `SO_RCVTIMEO`. `PACKET_ADD_MEMBERSHIP` (promiscuous mode, multicast addresses) is taken
+  and changes nothing.
+- Limits: no memory-mapped rings (`PACKET_RX_RING`, `PACKET_TX_RING`, `PACKET_VERSION` are `ENOPROTOOPT`), which a current libpcap
+  insists on, so `tcpdump` does not run on this yet; no `PACKET_FANOUT`; an interface is not put into promiscuous mode, so frames for
+  other machines are heard only if the hardware hands them up anyway; a frame that waits has no time stamp (`SIOCGSTAMP`); a tap
+  keeps 64 frames and loses the rest (counted as drops); on Linux an `ETH_P_ALL` socket hears a loopback packet twice (going out and
+  coming in) and a `127.x` packet injected as a frame is dropped as a martian, where here it is heard once and delivered.
+
 **Finding hosts by name.** A C library does that itself, from files and by asking a DNS server over UDP or TCP; what it needs here are
 the files (`LinuxNetworkFiles.cpp`). `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/services` and `/etc/protocols` are
 written into the program's tree (`/Linux/etc`) the first time a program names one of them, as ordinary files.
@@ -251,7 +276,8 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, fragments, `AF_PACKET`. Of netlink: changing the
+  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: memory-mapped
+  rings (what `tcpdump` needs), promiscuous mode, fan-out. Of netlink: changing the
   network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
@@ -270,14 +296,17 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets (on Linux it runs in a network namespace of its own, where it may open them), and `netlinktest.c`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets and `packettest.c` for packet sockets (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
   for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
   datagrams, the loopback, IPv6, epoll, options, bad addresses), the files for finding hosts by name with a resolver's exchange
   with a DNS server, and netlink: the messages on their own (every request, cut short anywhere and with any bit flipped) and the
-  sockets through the system calls, a change of address told to a listener among them; and raw and echo sockets against the second
-  machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters).
+  sockets through the system calls, a change of address told to a listener among them; raw and echo sockets against the second
+  machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters); the socket filter on its own (every instruction,
+  programs that are not, any bit of a program flipped, random programs); and packet sockets: an ARP exchange with the second
+  machine by hand, outgoing frames, the loopback, a filter.
+- `tests/run_host_tests.sh NetworkThreadTest`: raw sockets and frame taps used from several threads at once, under ThreadSanitizer.
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for
   `.localhost` and `.invalid` by itself, as systemd-resolved does). The expected output is the dynamically linked build's: a static

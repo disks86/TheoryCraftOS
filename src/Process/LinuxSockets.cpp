@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxNetlink.hpp"
+#include "Process/LinuxPacket.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxIpc.hpp"
 #include "Process/LinuxProcess.hpp"
@@ -419,6 +420,7 @@ uint64_t do_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags) {
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_sendmsg(p, netlink, message, flags);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_sendmsg(p, netlink, message, flags);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   Msghdr m;
@@ -447,6 +449,11 @@ uint64_t do_recvmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags, u
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) {
     const uint64_t r = netlink_recvmsg(p, netlink, netlink_non_blocking, message, flags);
+    if (got_out && int64_t(r) >= 0) *got_out = uint32_t(r);
+    return r;
+  }
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) {
+    const uint64_t r = packet_recvmsg(p, netlink, netlink_non_blocking, message, flags);
     if (got_out && int64_t(r) >= 0) *got_out = uint32_t(r);
     return r;
   }
@@ -539,17 +546,19 @@ void advance_timer_locked(Process& p, UnixSocketManager& m, uint32_t id, uint64_
 }
 
 // A linked descriptor (a message queue, a pidfd, an inotify instance, a netlink socket) brought up to now (the lock held): its owner is asked whether it
-// is ready. True if nothing will tell a wait when it becomes so (a netlink socket listening for changes to the network): the wait has to look again.
-bool refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
+// is ready. Not ready, and nothing will tell a wait when it becomes so (a netlink socket listening for changes to the network, a packet socket): how long
+// (in nanoseconds) until the wait has to look again; otherwise 0.
+uint64_t refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
   UnixType type;
   uint64_t link = 0;
   uint32_t mode = 0;
   if (uint64_t mask = 0; m.signal_mask_locked(id, &mask)) {      // a signalfd: readable while a signal of its set is pending for this thread
     m.set_link_ready_locked(id, signalfd_pending(p, mask) != 0, false);
-    return false;
+    return 0;
   }
-  if (!m.linked_locked(id, &type, &link, &mode)) return false;
+  if (!m.linked_locked(id, &type, &link, &mode)) return 0;
   bool readable = false, writable = false, watching = false;
+  uint64_t again = 0;
   switch (type) {
     case UnixType::MessageQueue: mq_readiness_locked(link, mode, &readable, &writable); break;
     case UnixType::Pidfd: readable = pidfd_ready(p, link); break;
@@ -557,12 +566,18 @@ bool refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
     case UnixType::Netlink: {
       readable = netlink_ready_locked(link, &watching);
       writable = true;
+      if (watching) again = 100000000;      // (a change to the network is looked for every 100 ms)
       break;
     }
+    case UnixType::Packet:
+      readable = packet_ready_locked(link);
+      writable = true;
+      again = 2000000;      // (a frame is looked for every 2 ms, as for the other network sockets)
+      break;
     default: break;
   }
   m.set_link_ready_locked(id, readable, writable);
-  return watching && !readable;
+  return readable ? 0 : again;
 }
 
 // What poll() reports for one descriptor, for the events asked for (the lock held). Sockets report their state; anything else is ready. A timer is
@@ -580,9 +595,8 @@ uint16_t poll_events_locked(Process& p, UnixSocketManager* m, const Watched& w, 
   }
   if (w.kind != DescriptorKind::UnixSocket || !m) return events & (kPollIn | kPollOut | kPollRdNorm | kPollWrNorm);
   advance_timer_locked(p, *m, w.id, due);
-  if (refresh_linked_locked(p, *m, w.id) && due) {      // (looked at again every 100 ms)
-    constexpr uint64_t kLookAgainNs = 100000000;
-    const uint64_t mono = p.host().monotonic_ns(), again = mono > kNever - 1 - kLookAgainNs ? kNever - 1 : mono + kLookAgainNs;
+  if (const uint64_t look = refresh_linked_locked(p, *m, w.id); look != 0 && due) {
+    const uint64_t mono = p.host().monotonic_ns(), again = mono > kNever - 1 - look ? kNever - 1 : mono + look;
     if (again < *due) *due = again;
   }
   const UnixReadiness r = m->readiness_locked(w.id);
@@ -689,6 +703,7 @@ uint64_t do_poll(Process& p, uint64_t fds, uint64_t count, uint64_t timeout_ns) 
 
 uint64_t sys_socket(Process& p, uint64_t domain, uint64_t type, uint64_t protocol) {
   if (domain == 2 || domain == 10) return inet_socket(p, domain, type, protocol);      // AF_INET, AF_INET6 (LinuxInetSockets.cpp)
+  if (domain == 17) return packet_socket(p, type, protocol);                                // AF_PACKET (LinuxPacket.cpp)
   if (domain == 16) return netlink_socket(p, type, protocol);                               // AF_NETLINK (LinuxNetlink.cpp)
   if (domain != kAfUnix) return error(kEafnosupport);
   const uint64_t base = type & 0xF, extra = type & ~uint64_t{0xF};
@@ -767,6 +782,7 @@ uint64_t sys_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_bind(p, netlink, address, length);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_bind(p, netlink, address, length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   UnixName name;
@@ -803,6 +819,7 @@ uint64_t sys_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length)
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_connect(p, netlink, address, length);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   UnixName name;
@@ -826,7 +843,7 @@ uint64_t sys_listen(Process& p, uint64_t fd, uint64_t backlog) {
   if (is_inet_descriptor(p, fd)) return inet_listen(p, fd, backlog);
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
-  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
+  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking) || packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   const int32_t asked = int32_t(backlog);
@@ -838,7 +855,7 @@ uint64_t sys_accept4(Process& p, uint64_t fd, uint64_t address, uint64_t length_
   if (is_inet_descriptor(p, fd)) return inet_accept4(p, fd, address, length_at, flags);
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
-  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
+  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking) || packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
   if (flags & ~(kSockNonBlock | kSockCloexec)) return error(kEinval);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
@@ -866,6 +883,7 @@ uint64_t sys_sendto(Process& p, uint64_t fd, uint64_t buffer, uint64_t length, u
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_sendto(p, netlink, buffer, length, flags, address, address_length);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_sendto(p, netlink, buffer, length, flags, address, address_length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (length > kMaxIoBytes) length = kMaxIoBytes;
@@ -884,6 +902,7 @@ uint64_t sys_recvfrom(Process& p, uint64_t fd, uint64_t buffer, uint64_t length,
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_recvfrom(p, netlink, netlink_non_blocking, buffer, length, flags, address, length_at);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_recvfrom(p, netlink, netlink_non_blocking, buffer, length, flags, address, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (length > kMaxIoBytes) length = kMaxIoBytes;
@@ -935,7 +954,7 @@ uint64_t sys_shutdown(Process& p, uint64_t fd, uint64_t how) {
   if (is_inet_descriptor(p, fd)) return inet_shutdown(p, fd, how);
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
-  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
+  if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking) || packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (how > 2) return error(kEinval);
@@ -948,6 +967,7 @@ uint64_t sys_getsockname(Process& p, uint64_t fd, uint64_t address, uint64_t len
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_getsockname(p, netlink, address, length_at, false);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_getsockname(p, netlink, address, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (address == 0 || length_at == 0) return error(kEfault);
@@ -965,6 +985,7 @@ uint64_t sys_getpeername(Process& p, uint64_t fd, uint64_t address, uint64_t len
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_getsockname(p, netlink, address, length_at, true);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return error(kEopnotsupp);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (address == 0 || length_at == 0) return error(kEfault);
@@ -989,6 +1010,7 @@ uint64_t sys_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, 
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_setsockopt(p, netlink, level, name, value, length);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_setsockopt(p, netlink, level, name, value, length);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (level != kSolSocket) return error(kEopnotsupp);
@@ -1028,6 +1050,7 @@ uint64_t sys_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name, 
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_getsockopt(p, netlink, level, name, value, length_at);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_getsockopt(p, netlink, level, name, value, length_at);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   if (level != kSolSocket) return error(kEopnotsupp);
@@ -1640,7 +1663,7 @@ uint64_t socket_write(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) 
     const UnixType type = type_of(s);
     if (type == UnixType::Event) return event_write(p, s, buffer, count);
     if (type == UnixType::FifoEnd) return fifo_write(p, s, buffer, count);
-    if (!unix_type_is_socket(type) && type != UnixType::Netlink) return error(kEinval);
+    if (!unix_type_is_socket(type) && type != UnixType::Netlink && type != UnixType::Packet) return error(kEinval);
   }
   return sys_sendto(p, fd, buffer, count, 0, 0, 0);
 }
@@ -1650,6 +1673,7 @@ uint64_t socket_vector_io(Process& p, uint64_t fd, uint64_t iov, uint64_t count,
   uint64_t netlink = 0;
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) return netlink_vector_io(p, netlink, netlink_non_blocking, iov, count, write);
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) return packet_vector_io(p, netlink, netlink_non_blocking, iov, count, write);
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);
   ByteBuffer raw(s.m->allocator());
@@ -1712,6 +1736,9 @@ uint64_t socket_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argume
   bool netlink_non_blocking = false;
   if (netlink_descriptor(p, fd, &netlink, &netlink_non_blocking)) {
     if (request == 0x541B) return netlink_pending(p, netlink, argument);      // FIONREAD
+  }
+  if (packet_descriptor(p, fd, &netlink, &netlink_non_blocking)) {
+    if (request == 0x541B) return packet_pending(p, netlink, argument);
   }
   Sock s;
   if (const int64_t r = socket_of(p, fd, &s); r < 0) return error(-r);

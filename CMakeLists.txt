@@ -217,6 +217,7 @@ add_executable(BOOTX64
   src/Network/NetworkStackSet.cpp
   src/Network/Udp/UdpSocket.cpp
   src/Network/Ip/RawSocket.cpp
+  src/Network/Link/FrameTap.cpp
   src/Network/Udp/UdpManager.cpp
   src/Network/Tcp/TcpSocket.cpp
   src/Network/Tcp/TcpManager.cpp
@@ -885,7 +886,9 @@ add_executable(BOOTX64
   src/Process/LinuxNetworkFiles.cpp
   src/Process/LinuxInetSockets.cpp
   src/Process/LinuxInotify.cpp
+  src/Process/LinuxBpf.cpp
   src/Process/LinuxNetlink.cpp
+  src/Process/LinuxPacket.cpp
   src/Process/LinuxNetlinkMessages.cpp
   src/Process/LinuxAio.cpp
   src/Process/LinuxIpc.cpp
