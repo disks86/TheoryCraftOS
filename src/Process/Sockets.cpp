@@ -194,6 +194,34 @@ uint32_t SocketManager::connect(uint32_t id, const IpAddress& address, uint16_t 
   return kSuccess;
 }
 
+bool SocketManager::arrival(uint32_t id, const IpAddress& sender, IpAddress* destination, uint32_t* interface_index) {
+  Socket* s = at(id);
+  if (!s) return false;
+  IpAddress from = sender;      // as the network has it: an IPv4 host seen through an IPv6 socket is IPv4
+  if (sender.v6 && is_v4_mapped(sender.ipv6))
+    from = IpAddress(Ipv4Address::make(sender.ipv6.bytes[12], sender.ipv6.bytes[13], sender.ipv6.bytes[14], sender.ipv6.bytes[15]));
+  if (from.is_loopback()) {
+    *destination = to_program(*s, from);
+    *interface_index = 1;
+    return true;
+  }
+  uint32_t index = 0;
+  for (uint32_t i = 0; i < stacks_.count(); ++i)
+    if (stacks_.at(i) == s->stack) index = i;
+  *interface_index = 2 + index;
+  IpAddress local = from.v6 ? IpAddress(network::kIpv6Any) : IpAddress(network::kAnyAddress);
+  if (s->stack) {
+    if (from.v6) {
+      const network::Ipv6Configuration c6 = s->stack->configuration6();
+      local = IpAddress(from.ipv6.is_link_local() || !c6.global_ready ? c6.link_local : c6.global);
+    } else {
+      local = IpAddress(s->stack->configuration().address);
+    }
+  }
+  *destination = to_program(*s, local);
+  return true;
+}
+
 bool SocketManager::disconnect(uint32_t id) {
   Socket* s = at(id);
   if (!s || s->proto != SocketProto::Udp) return false;
@@ -280,10 +308,12 @@ uint32_t SocketManager::send(uint32_t id, ConstByteView data, const IpAddress* a
   return kSuccess;
 }
 
-uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed) {
+uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
+                                uint32_t* datagram_length) {
   *got = 0;
   *would_block = false;
   if (peer_closed) *peer_closed = false;
+  if (datagram_length) *datagram_length = 0;
   Socket* s = at(id);
   if (!s) return kInvalidHandle;
   if (s->proto == SocketProto::Udp) {
@@ -291,6 +321,7 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
       const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
       buffer.first(n).copy_from(s->held->view().first(n));
       *got = n;
+      if (datagram_length) *datagram_length = s->held_count();
       if (from_address) *from_address = to_program(*s, s->held_from);
       if (from_port) *from_port = s->held_port;
       s->held_datagram = false;
@@ -303,6 +334,7 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
     uint32_t length = 0;
     if (!s->udp->receive_from_ip(buffer, &sender, &sender_port, &length)) { *would_block = true; return kSuccess; }
     *got = length < buffer.size() ? length : uint32_t(buffer.size());
+    if (datagram_length) *datagram_length = length;
     if (from_address) *from_address = to_program(*s, sender);
     if (from_port) *from_port = sender_port;
     return kSuccess;
@@ -332,10 +364,11 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
 }
 
 uint32_t SocketManager::peek(uint32_t id, ByteView buffer, uint32_t* got, IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
-                             allocators::IAllocator& allocator) {
+                             allocators::IAllocator& allocator, uint32_t* datagram_length) {
   *got = 0;
   *would_block = false;
   if (peer_closed) *peer_closed = false;
+  if (datagram_length) *datagram_length = 0;
   Socket* s = at(id);
   if (!s) return kInvalidHandle;
   if (s->proto == SocketProto::Tcp && !s->tcp) return kInvalidConnection;
@@ -363,6 +396,7 @@ uint32_t SocketManager::peek(uint32_t id, ByteView buffer, uint32_t* got, IpAddr
     const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
     buffer.first(n).copy_from(held.view().first(n));
     *got = n;
+    if (datagram_length) *datagram_length = s->held_count();
     if (from_address) *from_address = to_program(*s, s->held_from);
     if (from_port) *from_port = s->held_port;
     return kSuccess;

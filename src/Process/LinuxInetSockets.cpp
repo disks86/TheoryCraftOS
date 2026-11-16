@@ -43,7 +43,7 @@ uint64_t error(int64_t e) { return uint64_t(-e); }
 
 constexpr uint64_t kAfInet = 2, kAfInet6 = 10;
 constexpr uint64_t kSockStream = 1, kSockDgram = 2, kSockNonBlock = 0x800, kSockCloexec = 0x80000;
-constexpr uint64_t kMsgPeek = 2, kMsgTrunc = 0x20, kMsgDontWait = 0x40, kMsgWaitAll = 0x100;
+constexpr uint64_t kMsgPeek = 2, kMsgCtrunc = 8, kMsgTrunc = 0x20, kMsgDontWait = 0x40, kMsgWaitAll = 0x100, kMsgErrQueue = 0x2000;
 constexpr uint32_t kAddress4Bytes = 16, kAddress6Bytes = 28;
 constexpr uint64_t kMostAtOnce = 16384;      // what one call of the manager moves
 constexpr uint64_t kLargestDatagram = 65507;
@@ -249,10 +249,13 @@ int64_t send_bytes(Process& p, const Inet& s, ConstByteView data, uint64_t flags
 
 // Receives into `out` (cleared first): up to `room` bytes of the stream (all of them with MSG_WAITALL), or one datagram (cut to `room`). The count, 0 at the
 // end of a connection, or -errno. *from and *from_port say who sent it (a datagram).
-int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, ByteBuffer* out, network::IpAddress* from, uint16_t* from_port) {
+int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, ByteBuffer* out, network::IpAddress* from, uint16_t* from_port,
+                      uint32_t* whole = nullptr) {
   SocketManager::Options* options = s.sockets->options(s.id);
   if (!options) return -kEbadf;
   out->clear();
+  uint32_t datagram = 0;
+  if (whole) *whole = 0;
   const bool tcp = s.sockets->is_tcp(s.id);
   if (tcp) {
     switch (s.sockets->state(s.id)) {
@@ -272,11 +275,12 @@ int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, 
     uint32_t status = 0, got = 0;
     const int64_t r = wait_for(p, s, dont_wait, options->receive_timeout_ns, &status, [&](bool* would_block) {
       bool closed = false;
-      return s.sockets->peek(s.id, out->writable_view(), &got, from, from_port, would_block, &closed, *allocator);
+      return s.sockets->peek(s.id, out->writable_view(), &got, from, from_port, would_block, &closed, *allocator, &datagram);
     });
     if (r < 0) return r;
     if (status != 0) return -errno_of(status);
     out->truncate(got);
+    if (whole) *whole = datagram;
     return int64_t(got);
   }
   if (room > (tcp ? uint64_t{1} << 20 : kLargestDatagram)) room = tcp ? uint64_t{1} << 20 : kLargestDatagram;
@@ -287,7 +291,7 @@ int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, 
     uint32_t status = 0, got = 0;
     bool closed = false;
     const int64_t r = wait_for(p, s, dont_wait, options->receive_timeout_ns, &status,
-                               [&](bool* would_block) { return s.sockets->receive(s.id, out->writable_view().subview(done, want), &got, from, from_port, would_block, &closed); });
+                               [&](bool* would_block) { return s.sockets->receive(s.id, out->writable_view().subview(done, want), &got, from, from_port, would_block, &closed, &datagram); });
     if (r < 0) {
       if (done == 0) return r;
       break;
@@ -298,6 +302,7 @@ int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, 
     }
     done += got;
     if (!tcp) {
+      if (whole) *whole = datagram;
       if (done > room) done = room;      // (the rest of a datagram that does not fit is lost, as on Linux)
       break;
     }
@@ -479,16 +484,182 @@ uint64_t inet_recvfrom(Process& p, uint64_t fd, uint64_t buffer, uint64_t length
   ByteBuffer data(*allocator);
   network::IpAddress from;
   uint16_t from_port = 0;
-  const int64_t got = receive_bytes(p, s, length, flags, &data, &from, &from_port);
+  if (flags & kMsgErrQueue) return error(kEagain);      // (the queue of errors that came back for what was sent: nothing is ever in it)
+  uint32_t whole = 0;
+  const int64_t got = receive_bytes(p, s, length, flags, &data, &from, &from_port, &whole);
   if (got < 0) return error(-got);
-  if (got != 0 && !p.write_user(buffer, data.view())) return error(kEfault);
-  if (!s.sockets->is_tcp(s.id))
+  const bool tcp = s.sockets->is_tcp(s.id);
+  // (MSG_TRUNC on a stream: the bytes are taken off it and not handed over)
+  if (got != 0 && !(tcp && (flags & kMsgTrunc)) && !p.write_user(buffer, data.view())) return error(kEfault);
+  if (!tcp) {
     if (const int64_t w = write_address(p, address, length_at, from, from_port); w < 0) return error(-w);
+    if (flags & kMsgTrunc) return whole;      // (MSG_TRUNC asks for the datagram's real size, also when the buffer was too small for it)
+  }
   return uint64_t(got);
 }
 
+// --- control messages (ancillary data) -------------------------------------------------------------------------------------------------------------------
+// struct cmsghdr: cmsg_len (8: the header and the data), cmsg_level (4), cmsg_type (4), then the data; the next one starts at a multiple of 8.
+//
+// Received with a datagram, when the socket asked for them: where the packet arrived (IP_PKTINFO, IPV6_PKTINFO), its TTL or hop limit, its TOS or traffic
+// class, and when it came (SO_TIMESTAMP, SO_TIMESTAMPNS). The network stack hands a datagram over with its sender and nothing else, so: the address it was
+// sent to is the socket's interface's own (or the loopback), which is right except for a broadcast or multicast; the TTL is reported as 64 and the TOS as
+// 0; the time is when the program received it.
+//
+// Sent with a message: the ones a program may pass (a source address or interface, a TTL, a TOS) are checked and taken, and change nothing: there is one
+// address to send from on each interface, and the stack sets the rest.
+
+namespace {
+
+constexpr uint64_t kControlHead = 16;
+constexpr uint32_t kLevelSocket = 1, kLevelIp = 0, kLevelIpv6 = 41;
+constexpr uint32_t kIpTos = 1, kIpTtl = 2, kIpPktInfo = 8, kIpRecvTtl = 12, kIpRecvTos = 13, kIpv6RecvPktInfo = 49, kIpv6PktInfo = 50, kIpv6RecvHopLimit = 51,
+                   kIpv6HopLimit = 52, kIpv6RecvTclass = 66, kIpv6Tclass = 67, kScmRights = 1, kScmCredentials = 2, kScmTimestamp = 29, kScmTimestampNs = 35;
+
+bool is_mapped(const network::IpAddress& a) {
+  if (!a.v6) return false;
+  for (int i = 0; i < 10; ++i)
+    if (a.ipv6.bytes[i] != 0) return false;
+  return a.ipv6.bytes[10] == 0xFF && a.ipv6.bytes[11] == 0xFF;
+}
+
+// One control message at the end of `out` if `capacity` has room for all of it; else *cut (MSG_CTRUNC: the program's buffer was too small for what there was).
+bool add_control(ByteBuffer& out, uint64_t capacity, uint32_t level, uint32_t type, ConstByteView data, bool* cut) {
+  // As Linux fills the buffer: a message that does not fit whole is cut short (its length says by how much) when at least its header fits, and nothing
+  // follows it; MSG_CTRUNC tells the program either way.
+  if (*cut) return true;
+  const uint64_t room = out.size() < capacity ? capacity - out.size() : 0;
+  uint64_t length = kControlHead + data.size();
+  if (room < kControlHead) {
+    *cut = true;
+    return true;
+  }
+  if (length > room) {
+    *cut = true;
+    length = room;
+  }
+  uint64_t padded = (length + 7) & ~uint64_t{7};
+  if (padded > room) padded = room;
+  return out.put32(uint32_t(length)) && out.put32(0) && out.put32(level) && out.put32(type) && out.append(data.first(length - kControlHead)) && out.put_zeros(padded - length);
+}
+
+// What comes with a datagram from `from`, as the socket's options ask. False without memory.
+bool build_control(Process& p, const Inet& s, const network::IpAddress& from, uint64_t capacity, ByteBuffer* out, bool* cut) {
+  const SocketManager::Options* options = s.sockets->options(s.id);
+  if (!options) return true;
+  uint8_t raw[24];
+  if (options->timestamp != 0) {      // struct timeval (seconds, microseconds) or struct timespec (seconds, nanoseconds)
+    const uint64_t now = p.host().realtime_ns();
+    ByteWriter w{ByteView(raw, 16)};
+    w.le64(now / 1000000000u);
+    w.le64(options->timestamp == 1 ? now % 1000000000u / 1000u : now % 1000000000u);
+    if (!add_control(*out, capacity, kLevelSocket, options->timestamp == 1 ? kScmTimestamp : kScmTimestampNs, ConstByteView(raw, 16), cut)) return false;
+  }
+  const bool any = options->packet_info || options->packet_info6 || options->receive_ttl || options->receive_tos || options->receive_hop_limit || options->receive_traffic_class;
+  if (!any) return true;
+  network::IpAddress destination;
+  uint32_t interface_index = 0;
+  if (!s.sockets->arrival(s.id, from, &destination, &interface_index)) return true;
+  const bool version4 = !from.v6 || is_mapped(from);
+  // (the order is Linux's: an IPv6 socket's own message first, then the ones of the packet's kind)
+  if (s.sockets->is_ipv6(s.id) && options->packet_info6 && destination.v6) {      // struct in6_pktinfo: ipi6_addr, ipi6_ifindex (an IPv4 packet's address is shown mapped)
+    ByteWriter w{ByteView(raw, 20)};
+    w.bytes(ConstByteView(destination.ipv6.bytes));
+    w.le32(interface_index);
+    if (!add_control(*out, capacity, kLevelIpv6, kIpv6PktInfo, ConstByteView(raw, 20), cut)) return false;
+  }
+  if (version4) {
+    if (options->packet_info) {      // struct in_pktinfo: ipi_ifindex, ipi_spec_dst, ipi_addr
+      ByteWriter w{ByteView(raw, 12)};
+      w.le32(interface_index);
+      for (int twice = 0; twice < 2; ++twice) {
+        if (destination.v6) w.bytes(ConstByteView(destination.ipv6.bytes).subview(12, 4));
+        else w.be32(destination.ipv4.value());
+      }
+      if (!add_control(*out, capacity, kLevelIp, kIpPktInfo, ConstByteView(raw, 12), cut)) return false;
+    }
+    if (options->receive_ttl) {
+      ByteWriter w{ByteView(raw, 4)};
+      w.le32(64);
+      if (!add_control(*out, capacity, kLevelIp, kIpTtl, ConstByteView(raw, 4), cut)) return false;
+    }
+    if (options->receive_tos) {
+      raw[0] = 0;
+      if (!add_control(*out, capacity, kLevelIp, kIpTos, ConstByteView(raw, 1), cut)) return false;
+    }
+    return true;
+  }
+  if (!s.sockets->is_ipv6(s.id)) return true;
+  if (options->receive_hop_limit) {
+    ByteWriter w{ByteView(raw, 4)};
+    w.le32(64);
+    if (!add_control(*out, capacity, kLevelIpv6, kIpv6HopLimit, ConstByteView(raw, 4), cut)) return false;
+  }
+  if (options->receive_traffic_class) {
+    ByteWriter w{ByteView(raw, 4)};
+    w.le32(0);
+    if (!add_control(*out, capacity, kLevelIpv6, kIpv6Tclass, ConstByteView(raw, 4), cut)) return false;
+  }
+  return true;
+}
+
+// The control messages a program passes to sendmsg(), judged as Linux judges them: each has to be whole; one of the socket's own family or of the socket
+// level has to be one that is known, of the right size and with a value in range; one of another level is passed over. What they ask for (a source
+// address, a hop count for this one datagram) is not acted on: the datagram goes out the usual way. 0, or -errno.
+int64_t check_control(Process& p, const Inet& s, uint64_t control, uint64_t length, allocators::IAllocator& allocator) {
+  if (control == 0 || length == 0) return 0;
+  if (length > 20480) return -kEnobufs;      // (more than a socket may be handed at once)
+  ByteBuffer raw(allocator);
+  if (!raw.put_zeros(length)) return -kEnomem;
+  if (!p.read_user(control, raw.writable_view())) return -kEfault;
+  const ConstByteView all = raw.view();
+  const bool ipv6 = s.sockets->is_ipv6(s.id);
+  // a 32-bit number in the data, when the data is exactly that
+  auto number = [](ConstByteView data, int64_t* out) {
+    if (data.size() != 4) return false;
+    ByteReader in{data};
+    *out = int32_t(in.le32());
+    return true;
+  };
+  for (uint64_t at = 0; all.size() - at >= kControlHead;) {      // (less than a header at the end is not a message)
+    ByteReader in{all.subview(at, kControlHead)};
+    const uint64_t size = in.le64();
+    const uint32_t level = in.le32(), type = in.le32();
+    if (size < kControlHead || size > all.size() - at) return -kEinval;
+    const ConstByteView data = all.subview(at + kControlHead, size - kControlHead);
+    int64_t value = 0;
+    if (level == kLevelSocket) {
+      // SCM_RIGHTS and SCM_CREDENTIALS mean something over AF_UNIX only and are passed over here; SO_MARK and SO_TIMESTAMPING are a 32-bit number,
+      // SCM_TXTIME a 64-bit one
+      if (type == kScmRights || type == kScmCredentials) {}
+      else if (type == 36 || type == 37) { if (data.size() != 4) return -kEinval; }
+      else if (type == 61) { if (data.size() != 8) return -kEinval; }
+      else return -kEinval;
+    } else if (level == kLevelIp && !ipv6) {
+      if (type == kIpPktInfo) { if (data.size() != 12) return -kEinval; }
+      else if (type == kIpTtl) { if (!number(data, &value) || value < 1 || value > 255) return -kEinval; }
+      else if (type == kIpTos) { if (data.size() != 1 && (!number(data, &value) || value < 0 || value > 255)) return -kEinval; }
+      else if (type == 7 /* IP_RETOPTS */) { if (data.size() > 40) return -kEinval; }
+      else return -kEinval;
+    } else if (level == kLevelIpv6 && ipv6) {
+      if (type == kIpv6PktInfo) { if (data.size() < 20) return -kEinval; }
+      else if (type == kIpv6HopLimit || type == kIpv6Tclass) { if (!number(data, &value) || value < -1 || value > 255) return -kEinval; }
+      else if (type == 62 /* IPV6_DONTFRAG */) { if (!number(data, &value)) return -kEinval; }
+      else return -kEinval;
+    } else if (level == 17 /* SOL_UDP */ && !s.sockets->is_tcp(s.id)) {
+      if (type != 103 /* UDP_SEGMENT */ || data.size() != 2) return -kEinval;
+    }
+    const uint64_t step = (size + 7) & ~uint64_t{7};
+    if (step >= all.size() - at) break;
+    at += step;
+  }
+  return 0;
+}
+
+}  // namespace
+
 // struct msghdr: msg_name (8), msg_namelen (4, then 4 of padding), msg_iov (8), msg_iovlen (8), msg_control (8), msg_controllen (8), msg_flags (4).
-// Control messages are not carried: what a program sends with them is sent without, and none come back.
+
 uint64_t inet_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags) {
   Inet s;
   if (const int64_t r = inet_of(p, fd, &s); r < 0) return error(-r);
@@ -498,13 +669,14 @@ uint64_t inet_sendmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags)
   const uint64_t name = in.le64();
   const uint32_t name_length = in.le32();
   in.skip(4);
-  const uint64_t vectors = in.le64(), count = in.le64();
+  const uint64_t vectors = in.le64(), count = in.le64(), control = in.le64(), control_length = in.le64();
   network::IpAddress to;
   uint16_t port = 0;
   bool has = false;
   if (const int64_t r = destination_of(p, s, name, name_length, &to, &port, &has); r < 0) return error(-r);
   allocators::IAllocator* allocator = call_memory(p);
   if (!allocator) return error(kEnomem);
+  if (const int64_t r = check_control(p, s, control, control_length, *allocator); r < 0) return error(-r);
   ByteBuffer data(*allocator);
   if (const int64_t r = gather(p, vectors, count, s.sockets->is_tcp(s.id) ? uint64_t{1} << 24 : kLargestDatagram, &data); r < 0) return error(-r);
   const int64_t sent = send_bytes(p, s, data.view(), flags, has ? &to : nullptr, has ? &port : nullptr);
@@ -516,10 +688,11 @@ uint64_t inet_recvmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags)
   if (const int64_t r = inet_of(p, fd, &s); r < 0) return error(-r);
   uint8_t raw[56];
   if (!p.read_user(message, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  if (flags & kMsgErrQueue) return error(kEagain);
   ByteReader in{ConstByteView(raw, sizeof(raw))};
   const uint64_t name = in.le64();
   in.skip(8);
-  const uint64_t vectors = in.le64(), count = in.le64();
+  const uint64_t vectors = in.le64(), count = in.le64(), control = in.le64(), control_capacity = in.le64();
   const int64_t room = room_of(p, vectors, count, uint64_t{1} << 20);
   if (room < 0) return error(-room);
   allocators::IAllocator* allocator = call_memory(p);
@@ -527,17 +700,27 @@ uint64_t inet_recvmsg(Process& p, uint64_t fd, uint64_t message, uint64_t flags)
   ByteBuffer data(*allocator);
   network::IpAddress from;
   uint16_t from_port = 0;
-  const int64_t got = receive_bytes(p, s, uint64_t(room), flags, &data, &from, &from_port);
+  uint32_t whole = 0;
+  const int64_t got = receive_bytes(p, s, uint64_t(room), flags, &data, &from, &from_port, &whole);
   if (got < 0) return error(-got);
-  if (!scatter(p, vectors, count, data.view())) return error(kEfault);
-  // msg_namelen (at +8) holds the name buffer's size going in and the address's size coming out; no control data, no flags.
-  if (s.sockets->is_tcp(s.id)) {
+  const bool tcp = s.sockets->is_tcp(s.id);
+  if (!(tcp && (flags & kMsgTrunc)) && !scatter(p, vectors, count, data.view())) return error(kEfault);
+  // msg_namelen (at +8) holds the name buffer's size going in and the address's size coming out; msg_controllen (+40) and msg_flags (+48) say what came
+  // with the data.
+  uint32_t out_flags = 0;
+  ByteBuffer ancillary(*allocator);
+  if (tcp) {
     if (name != 0 && put_u32(p, message + 8, 0) != 0) return error(kEfault);
-  } else if (const int64_t w = write_address(p, name, name != 0 ? message + 8 : 0, from, from_port); w < 0) {
-    return error(-w);
+  } else {
+    if (const int64_t w = write_address(p, name, name != 0 ? message + 8 : 0, from, from_port); w < 0) return error(-w);
+    if (whole > uint64_t(got)) out_flags |= uint32_t(kMsgTrunc);
+    bool cut = false;
+    if (!build_control(p, s, from, control != 0 ? control_capacity : 0, &ancillary, &cut)) return error(kEnomem);
+    if (cut) out_flags |= uint32_t(kMsgCtrunc);
+    if (ancillary.size() != 0 && !p.write_user(control, ancillary.view())) return error(kEfault);
   }
-  if (!p.write_user_u64(message + 40, 0) || put_u32(p, message + 48, 0) != 0) return error(kEfault);
-  return uint64_t(got);
+  if (!p.write_user_u64(message + 40, ancillary.size()) || put_u32(p, message + 48, out_flags) != 0) return error(kEfault);
+  return !tcp && (flags & kMsgTrunc) ? whole : uint64_t(got);
 }
 
 // readv() and writev() of a socket: one receive into, one send of, all the buffers together (a datagram is not split).
@@ -666,7 +849,9 @@ uint64_t inet_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
       case kSoBroadcast: options->broadcast = number != 0; return 0;
       case kSoSndBuf: case kSoSndBufForce: options->send_buffer = number < 1024 ? 2048 : (number > 0x3FFFFFFFu ? 0x7FFFFFFEu : number * 2); return 0;      // (Linux doubles what is asked for)
       case kSoRcvBuf: case kSoRcvBufForce: options->receive_buffer = number < 1024 ? 2048 : (number > 0x3FFFFFFFu ? 0x7FFFFFFEu : number * 2); return 0;
-      case kSoDontRoute: case kSoOobInline: case kSoRcvLowat: case kSoPriority: case kSoTimestamp: case kSoIncomingCpu: return 0;      // (taken; nothing here depends on them)
+      case kSoTimestamp: options->timestamp = number != 0 ? 1 : 0; return 0;        // SO_TIMESTAMP: recvmsg says when each datagram came
+      case 35: options->timestamp = number != 0 ? 2 : 0; return 0;                  // SO_TIMESTAMPNS: the same in nanoseconds
+      case kSoDontRoute: case kSoOobInline: case kSoRcvLowat: case kSoPriority: case kSoIncomingCpu: return 0;      // (taken; nothing here depends on them)
       default: return error(kEnoprotoopt);
     }
   }
@@ -685,9 +870,13 @@ uint64_t inet_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
   if (level == kIpprotoIp) {
     if (s.sockets->is_ipv6(s.id) && s.sockets->v6_only(s.id)) return error(kEnoprotoopt);
     switch (name) {
-      // IP_TOS, IP_TTL, IP_RECVERR, IP_PKTINFO, IP_MTU_DISCOVER, IP_RECVTOS, IP_RECVTTL, IP_FREEBIND, IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL,
-      // IP_MULTICAST_LOOP, IP_MULTICAST_IF: taken, and nothing changes
-      case 1: case 2: case 11: case 8: case 10: case 13: case 12: case 15: case 24: case 33: case 34: case 32: return 0;
+      // what recvmsg() says about each datagram (see build_control)
+      case kIpPktInfo: options->packet_info = number != 0; return 0;
+      case kIpRecvTtl: options->receive_ttl = number != 0; return 0;
+      case kIpRecvTos: options->receive_tos = number != 0; return 0;
+      // IP_TOS, IP_TTL, IP_RECVERR, IP_MTU_DISCOVER, IP_FREEBIND, IP_BIND_ADDRESS_NO_PORT, IP_MULTICAST_TTL, IP_MULTICAST_LOOP, IP_MULTICAST_IF: taken,
+      // and nothing changes
+      case 1: case 2: case 11: case 10: case 15: case 24: case 33: case 34: case 32: return 0;
       default: return error(kEnoprotoopt);
     }
   }
@@ -698,9 +887,12 @@ uint64_t inet_setsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
         if (s.sockets->v6_only(s.id) == (number != 0)) return 0;
         return s.sockets->set_v6_only(s.id, number != 0) == 0 ? 0 : error(kEinval);
       }
-      // IPV6_UNICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP, IPV6_MTU_DISCOVER, IPV6_RECVERR, IPV6_RECVPKTINFO, IPV6_TCLASS,
-      // IPV6_RECVTCLASS, IPV6_RECVHOPLIMIT: taken, and nothing changes
-      case 16: case 17: case 18: case 19: case 23: case 25: case 49: case 67: case 66: case 51: return 0;
+      case kIpv6RecvPktInfo: options->packet_info6 = number != 0; return 0;
+      case kIpv6RecvHopLimit: options->receive_hop_limit = number != 0; return 0;
+      case kIpv6RecvTclass: options->receive_traffic_class = number != 0; return 0;
+      // IPV6_UNICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_LOOP, IPV6_MTU_DISCOVER, IPV6_RECVERR, IPV6_TCLASS: taken, and nothing
+      // changes
+      case 16: case 17: case 18: case 19: case 23: case 25: case 67: return 0;
       default: return error(kEnoprotoopt);
     }
   }
@@ -741,7 +933,9 @@ uint64_t inet_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
       case kSoBroadcast: return number(options->broadcast);
       case kSoSndBuf: return number(options->send_buffer ? options->send_buffer : kDefaultBuffer);
       case kSoRcvBuf: return number(options->receive_buffer ? options->receive_buffer : kDefaultBuffer);
-      case kSoDontRoute: case kSoOobInline: case kSoPriority: case kSoTimestamp: return number(0);
+      case kSoTimestamp: return number(options->timestamp == 1);
+      case 35: return number(options->timestamp == 2);
+      case kSoDontRoute: case kSoOobInline: case kSoPriority: return number(0);
       case kSoRcvLowat: return number(1);
       case kSoLinger: {
         uint8_t raw[8];
@@ -769,6 +963,12 @@ uint64_t inet_getsockopt(Process& p, uint64_t fd, uint64_t level, uint64_t name,
     }
   }
   if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == 26) return number(s.sockets->v6_only(s.id));
+  if (level == kIpprotoIp && name == kIpPktInfo) return number(options->packet_info);
+  if (level == kIpprotoIp && name == kIpRecvTtl) return number(options->receive_ttl);
+  if (level == kIpprotoIp && name == kIpRecvTos) return number(options->receive_tos);
+  if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvPktInfo) return number(options->packet_info6);
+  if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvHopLimit) return number(options->receive_hop_limit);
+  if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == kIpv6RecvTclass) return number(options->receive_traffic_class);
   if (level == kIpprotoIp && (name == 1 || name == 2)) return number(name == 2 ? 64 : 0);      // IP_TOS, IP_TTL
   if (level == kIpprotoIpv6 && s.sockets->is_ipv6(s.id) && name == 16) return number(64);      // IPV6_UNICAST_HOPS
   return error(kEnoprotoopt);

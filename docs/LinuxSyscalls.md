@@ -134,7 +134,21 @@ socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback 
 - `MSG_PEEK` (also of `AF_UNIX` sockets): the network stack hands data out once, so what is looked at is held with the socket until a
   read takes it, up to 64 KiB of a stream in one look, or one datagram, which the read then gets whole. `poll` and `FIONREAD` count
   what is held.
-- Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); no control messages (`IP_PKTINFO` and the like are accepted and none arrive); `bind` uses every interface
+- Control messages of datagram sockets (`recvmsg`, `recvmmsg`), once the socket asked: `SO_TIMESTAMP` or `SO_TIMESTAMPNS` (the one
+  set last), `IP_PKTINFO`, `IP_RECVTTL`, `IP_RECVTOS`, `IPV6_RECVPKTINFO`, `IPV6_RECVHOPLIMIT` and `IPV6_RECVTCLASS`, in Linux's order
+  (the time first; through an IPv6 socket an IPv4 datagram gets `IPV6_PKTINFO` with its address mapped, then the `IP_*` ones). The
+  network stack does not keep a packet's header, so the answers are worked out: the interface is 1 for the loopback and 2 onwards
+  for the network interfaces, the destination is the loopback address or that interface's own address (a broadcast or multicast
+  destination is not told apart), the TTL and the hop limit are 64, the TOS and the traffic class 0, and the time is that of the
+  `recvmsg` call, not of the packet's arrival. A buffer too small gets what fits, the last message cut short as on Linux, and
+  `MSG_CTRUNC`. `msg_flags` carries `MSG_TRUNC` for a datagram longer than the buffers, and `MSG_TRUNC` in the call's flags makes
+  the result the datagram's real length (of a stream it throws the bytes away). `MSG_ERRQUEUE` finds the queue empty (`EAGAIN`).
+- Control messages given to `sendmsg` are checked the way Linux checks them and then not acted on, so the datagram goes out with
+  the usual source address, TTL and TOS: `IP_PKTINFO`, `IP_TTL`, `IP_TOS`, `IP_RETOPTS`, `IPV6_PKTINFO`, `IPV6_HOPLIMIT`,
+  `IPV6_TCLASS`, `IPV6_DONTFRAG`, `SO_MARK`, `SO_TIMESTAMPING`, `SCM_TXTIME` and `UDP_SEGMENT` of the right size and range are
+  taken, `SCM_RIGHTS`, `SCM_CREDENTIALS` and another family's messages are passed over, anything else of the socket's own levels or
+  not whole is `EINVAL`, more than 20480 bytes `ENOBUFS`. (Descriptors and credentials travel over `AF_UNIX` sockets, see above.)
+- Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `bind` uses every interface
   whatever address it names; no raw or ICMP sockets, no `AF_NETLINK` (so `getifaddrs` fails), no multicast membership; 256 sockets in
   the system.
 
@@ -184,7 +198,8 @@ back to `read` and `write`.
 - The parts with a fixed answer above: `io_uring`, `fanotify`, `seccomp` filters, `bpf`, `perf_event_open`, `userfaultfd`, namespaces,
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
-- Of network sockets: datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`. Of name resolution:
+- Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
+  real TTL, TOS and arrival time of a received packet, the error queue, raw sockets, `AF_NETLINK`. Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
 - Of inotify: `IN_CLOSE_WRITE`, `IN_OPEN`, `IN_ACCESS`, `IN_ATTRIB`. Of asynchronous I/O: requests that would wait (`IOCB_CMD_POLL`).
@@ -202,7 +217,7 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6. `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included. `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
   datagrams, the loopback, IPv6, epoll, options, bad addresses), and the files for finding hosts by name with a resolver's exchange

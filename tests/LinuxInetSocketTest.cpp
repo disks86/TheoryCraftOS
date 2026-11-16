@@ -23,6 +23,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <vector>
 #include "NetworkHarness.hpp"
 #include "Ipv6Harness.hpp"
 #include "FileSystem/Ram/RamFileSystem.hpp"
@@ -374,7 +375,7 @@ static void test_udp() {
   const uint64_t r1 = t.alloc(8), r2 = t.alloc(8);
   t.put64(vectors, r1); t.put64(vectors + 8, 3); t.put64(vectors + 16, r2); t.put64(vectors + 24, 4);
   t.put64(message, name); t.put32(message + 8, 28); t.put64(message + 24, 2); t.put64(message + 40, 77); t.put32(message + 48, 0xEE);
-  CHECK(t.s(47, fd, message, 0) == 7 && t.text(r1, 3) == "ABC" && t.text(r2, 4) == "DEFG" && t.u32(message + 8) == 16 && t.u64(message + 40) == 0 && t.u32(message + 48) == 0);
+  CHECK(t.s(47, fd, message, 0) == 7 && t.text(r1, 3) == "ABC" && t.text(r2, 4) == "DEFG" && t.u32(message + 8) == 16 && t.u64(message + 40) == 0 && t.u32(message + 48) == 0x20 /* MSG_TRUNC: three bytes did not fit */);
   // what a datagram cannot be; what a socket of this kind cannot do
   const uint64_t big = t.alloc(70000);
   CHECK(t.s(44, fd, big, 1473, 0, 0, 0) == -90 && t.s(44, fd, big, 70000, 0, 0, 0) == -90 && t.s(44, fd, big, 1472, 0, 0, 0) == 1472);      // EMSGSIZE: no fragments
@@ -746,6 +747,210 @@ static void test_peek() {
   CHECK(t.s(45, udp, buf, 64, kPeek, 0, 0) == 4 && t.s(3, udp) == 0 && t.s(3, server) == 0);
 }
 
+// Control messages: what recvmsg says about a datagram when the socket asked, and what sendmsg takes.
+static void test_control_messages() {
+  constexpr uint64_t kTrunc = 0x20, kCtrunc = 8;
+  Setup t;
+  t.configure_ipv6();
+  SharedPointer<network::IUdpSocket> peer = t.lan.b.udp_open_families(9900, network::IpFamilies::Both);
+  const network::IpAddress here(network::Ipv4Address::make(10, 0, 0, 1));
+  const int64_t fd = t.s(41, kAfInet, kDgram, 0);
+  CHECK(peer && t.s(49, fd, t.in4(0, 0, 0, 0, 9901), 16) == 0);
+  // recvmsg into one buffer, with room for `capacity` bytes of control messages; what came back
+  struct Got { int64_t result = 0; uint64_t control_length = 0; uint32_t flags = 0; std::string control, data; };
+  const uint64_t data = t.alloc(64), control = t.alloc(512), vector = t.alloc(16), message = t.alloc(56), name = t.alloc(32);
+  auto receive = [&](int64_t socket, uint64_t room, uint64_t capacity, uint64_t flags = 0, bool with_control = true) {
+    t.put64(vector, data); t.put64(vector + 8, room);
+    t.put64(message, name); t.put32(message + 8, 28); t.put64(message + 16, vector); t.put64(message + 24, 1);
+    t.put64(message + 32, with_control ? control : 0); t.put64(message + 40, capacity); t.put32(message + 48, 0xEEEE);
+    memset(&t.memory.bytes[control - kBase], 0xEE, 512);
+    Got g;
+    g.result = t.s(47, socket, message, flags);
+    g.control_length = t.u64(message + 40);
+    g.flags = t.u32(message + 48);
+    if (g.result >= 0) {
+      g.control = t.text(control, g.control_length <= 512 ? g.control_length : 0);
+      g.data = t.text(data, uint64_t(g.result) < room ? uint64_t(g.result) : room);
+    }
+    return g;
+  };
+  // the control messages in a buffer: level, type and data of each
+  struct Message { uint32_t level = 0, type = 0; std::string data; };
+  auto parse = [](const std::string& bytes) {
+    std::vector<Message> out;
+    for (size_t at = 0; at + 16 <= bytes.size();) {
+      uint64_t length = 0;
+      for (int i = 7; i >= 0; --i) length = (length << 8) | uint8_t(bytes[at + size_t(i)]);
+      if (length < 16 || length > bytes.size() - at) break;
+      Message m;
+      for (int i = 3; i >= 0; --i) { m.level = (m.level << 8) | uint8_t(bytes[at + 8 + size_t(i)]); m.type = (m.type << 8) | uint8_t(bytes[at + 12 + size_t(i)]); }
+      m.data = bytes.substr(at + 16, size_t(length) - 16);
+      out.push_back(m);
+      at += (size_t(length) + 7) & ~size_t{7};
+    }
+    return out;
+  };
+  auto send_to_here = [&](const char* text, uint16_t port = 9901) {
+    return peer->send_to_ip(here, port, ConstByteView(reinterpret_cast<const uint8_t*>(text), strlen(text))) && t.lan.run_until([&] { return t.polled(fd, kPollIn) == kPollIn; }, 3000);
+  };
+  // nothing was asked for: nothing comes, and the lengths say so
+  CHECK(send_to_here("plain"));
+  Got g = receive(fd, 64, 256);
+  CHECK(g.result == 5 && g.data == "plain" && g.control_length == 0 && g.flags == 0 && t.u32(message + 8) == 16);
+  // asked for: when it came, where it arrived, its TTL and TOS, in that order
+  uint32_t v = 0;
+  CHECK(t.s(54, fd, 1, 29, t.word(1), 4) == 0 && t.s(54, fd, 0, 8, t.word(1), 4) == 0 && t.s(54, fd, 0, 12, t.word(1), 4) == 0 && t.s(54, fd, 0, 13, t.word(1), 4) == 0);
+  CHECK(t.option(fd, 1, 29, &v) == 0 && v == 1 && t.option(fd, 0, 8, &v) == 0 && v == 1 && t.option(fd, 0, 12, &v) == 0 && v == 1 && t.option(fd, 0, 13, &v) == 0 && v == 1);
+  CHECK(send_to_here("with everything"));
+  g = receive(fd, 64, 256);
+  std::vector<Message> m = parse(g.control);
+  CHECK(g.result == 15 && g.flags == 0 && g.control_length == 32 + 32 + 24 + 24 && m.size() == 4);
+  if (m.size() == 4) {
+    CHECK(m[0].level == 1 && m[0].type == 29 && m[0].data.size() == 16);                                                                   // SCM_TIMESTAMP: a struct timeval
+    CHECK(m[1].level == 0 && m[1].type == 8 && m[1].data == std::string("\x02\0\0\0\x0a\0\0\x01\x0a\0\0\x01", 12));                        // IP_PKTINFO: interface 2, to 10.0.0.1
+    CHECK(m[2].level == 0 && m[2].type == 2 && m[2].data == std::string("\x40\0\0\0", 4) && m[3].level == 0 && m[3].type == 1 && m[3].data == std::string(1, '\0'));      // IP_TTL 64, IP_TOS 0
+  }
+  // a buffer too small for all of it gets the ones that fit, and MSG_CTRUNC; none at all is the same
+  CHECK(send_to_here("small buffer") && send_to_here("no buffer") && send_to_here("no pointer"));
+  g = receive(fd, 64, 70);      // (the third one's header does not fit)
+  m = parse(g.control);
+  CHECK(g.result == 12 && g.flags == kCtrunc && g.control_length == 64 && m.size() == 2 && m[1].type == 8);
+  g = receive(fd, 64, 0);
+  CHECK(g.result == 9 && g.flags == kCtrunc && g.control_length == 0);
+  g = receive(fd, 64, 256, 0, false);
+  CHECK(g.result == 10 && g.flags == kCtrunc && g.control_length == 0);
+  CHECK(send_to_here("half a message"));
+  g = receive(fd, 64, 32 + 20);      // (the second one's header does, and four bytes of it)
+  m = parse(g.control);
+  CHECK(g.result == 14 && g.flags == kCtrunc && g.control_length == 52 && m.size() == 2 && m[1].type == 8 && m[1].data == std::string("\x02\0\0\0", 4));
+  CHECK(send_to_here("under a header"));
+  g = receive(fd, 64, 12);
+  CHECK(g.result == 14 && g.flags == kCtrunc && g.control_length == 0);
+  // a datagram longer than the buffer: MSG_TRUNC says so, and asked for (in the flags) the call answers with its real size
+  CHECK(send_to_here("0123456789") && send_to_here("abcdefghij") && send_to_here("ABCDEFGHIJ") && send_to_here("klmnopqrst"));
+  g = receive(fd, 4, 256);
+  CHECK(g.result == 4 && g.data == "0123" && (g.flags & kTrunc) != 0 && (g.flags & kCtrunc) == 0);
+  g = receive(fd, 4, 256, kTrunc);
+  CHECK(g.result == 10 && g.data == "abcd" && (g.flags & kTrunc) != 0);
+  CHECK(t.s(45, fd, data, 3, kTrunc, 0, 0) == 10 && t.text(data, 3) == "ABC" && t.s(45, fd, data, 3, kTrunc | 2 /* MSG_PEEK */, 0, 0) == 10 && t.s(45, fd, data, 64, 0, 0, 0) == 10);
+  // SO_TIMESTAMPNS in place of SO_TIMESTAMP; the options turned off again
+  CHECK(t.s(54, fd, 1, 35, t.word(1), 4) == 0 && t.option(fd, 1, 29, &v) == 0 && v == 0 && t.option(fd, 1, 35, &v) == 0 && v == 1 && send_to_here("ns"));
+  g = receive(fd, 64, 256);
+  m = parse(g.control);
+  CHECK(m.size() == 4 && m[0].level == 1 && m[0].type == 35 && m[0].data.size() == 16);
+  CHECK(t.s(54, fd, 1, 35, t.word(0), 4) == 0 && t.s(54, fd, 0, 12, t.word(0), 4) == 0 && t.s(54, fd, 0, 13, t.word(0), 4) == 0 && send_to_here("less"));
+  g = receive(fd, 64, 256);
+  m = parse(g.control);
+  CHECK(g.control_length == 32 && m.size() == 1 && m[0].type == 8);
+  // over the loopback: interface 1, the loopback address
+  const int64_t local = t.s(41, kAfInet, kDgram, 0);
+  CHECK(t.s(44, local, t.bytes("loop"), 4, 0, t.in4(127, 0, 0, 1, 9901), 16) == 4 && t.lan.run_until([&] { return t.polled(fd, kPollIn) == kPollIn; }, 3000));
+  g = receive(fd, 64, 256);
+  m = parse(g.control);
+  CHECK(g.result == 4 && m.size() == 1 && m[0].data == std::string("\x01\0\0\0\x7f\0\0\x01\x7f\0\0\x01", 12));
+  // the error queue is always empty; a stream socket's recvmsg has no control messages
+  CHECK(t.s(47, fd, message, 0x2000 /* MSG_ERRQUEUE */) == -11 && t.s(45, fd, data, 8, 0x2000, 0, 0) == -11);
+
+  // IPv6: IPV6_PKTINFO, the hop limit and the traffic class; an IPv4 datagram through the same socket is shown mapped
+  const network::Ipv6Configuration a6 = t.lan.a.configuration6(), b6 = t.lan.b.configuration6();
+  const int64_t six = t.s(41, kAfInet6, kDgram, 0);
+  CHECK(t.s(49, six, t.in6(network::kIpv6Any, 9902), 28) == 0 && t.s(54, six, 41, 49, t.word(1), 4) == 0 && t.s(54, six, 41, 51, t.word(1), 4) == 0 && t.s(54, six, 41, 66, t.word(1), 4) == 0);
+  CHECK(t.option(six, 41, 49, &v) == 0 && v == 1 && t.option(six, 41, 51, &v) == 0 && v == 1 && t.option(six, 41, 66, &v) == 0 && v == 1);
+  CHECK(peer->send_to_ip(network::IpAddress(a6.global), 9902, ConstByteView(reinterpret_cast<const uint8_t*>("six"), 3)) && t.lan.run_until([&] { return t.polled(six, kPollIn) == kPollIn; }, 3000));
+  g = receive(six, 64, 256);
+  m = parse(g.control);
+  CHECK(g.result == 3 && g.control_length == 40 + 24 + 24 && m.size() == 3 && t.u32(message + 8) == 28);
+  if (m.size() == 3) {
+    CHECK(m[0].level == 41 && m[0].type == 50 && m[0].data.size() == 20 && memcmp(m[0].data.data(), a6.global.bytes, 16) == 0 && m[0].data.substr(16) == std::string("\x02\0\0\0", 4));
+    CHECK(m[1].level == 41 && m[1].type == 52 && m[1].data == std::string("\x40\0\0\0", 4) && m[2].level == 41 && m[2].type == 67 && m[2].data == std::string(4, '\0'));
+  }
+  CHECK(t.s(54, six, 0, 8, t.word(1), 4) == 0 && peer->send_to_ip(here, 9902, ConstByteView(reinterpret_cast<const uint8_t*>("four"), 4)) &&
+        t.lan.run_until([&] { return t.polled(six, kPollIn) == kPollIn; }, 3000));
+  g = receive(six, 64, 256);
+  m = parse(g.control);
+  CHECK(g.result == 4 && m.size() == 2 && m[0].level == 41 && m[0].type == 50 && m[0].data.substr(10, 6) == std::string("\xff\xff\x0a\0\0\x01", 6));      // its address mapped
+  CHECK(m.size() == 2 && m[1].level == 0 && m[1].type == 8 && m[1].data == std::string("\x02\0\0\0\x0a\0\0\x01\x0a\0\0\x01", 12));                      // then IP_PKTINFO
+  CHECK(t.s(54, fd, 41, 49, t.word(1), 4) == -92 && t.option(fd, 41, 49, &v) == -92);      // (no IPv6 options on an AF_INET socket)
+  (void)b6;
+
+  // sendmsg: control messages a program may pass are taken (and the datagram goes out); anything else is refused, as is one that is not whole
+  auto cmsg = [&](std::string* out, uint32_t level, uint32_t type, const std::string& payload, int64_t length_override = -1) {
+    const uint64_t length = length_override >= 0 ? uint64_t(length_override) : 16 + payload.size();
+    for (int i = 0; i < 8; ++i) out->push_back(char(length >> (8 * i)));
+    for (int i = 0; i < 4; ++i) out->push_back(char(level >> (8 * i)));
+    for (int i = 0; i < 4; ++i) out->push_back(char(type >> (8 * i)));
+    *out += payload;
+    while (out->size() % 8 != 0) out->push_back('\0');
+  };
+  auto send_with = [&](int64_t socket, const std::string& bytes, uint64_t destination, uint64_t destination_size, uint64_t length = ~uint64_t{0}) {
+    const uint64_t at = t.alloc(bytes.size() + 8), text = t.bytes("payload");
+    t.memory.write(at, ConstByteView(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    t.put64(vector, text); t.put64(vector + 8, 7);
+    t.put64(message, destination); t.put32(message + 8, uint32_t(destination_size)); t.put64(message + 16, vector); t.put64(message + 24, 1);
+    t.put64(message + 32, at); t.put64(message + 40, length == ~uint64_t{0} ? bytes.size() : length); t.put32(message + 48, 0);
+    return t.s(46, socket, message, 0);
+  };
+  const uint64_t to_peer = t.in4(10, 0, 0, 2, 9900);
+  std::string good;
+  cmsg(&good, 0, 8, std::string("\0\0\0\0\x0a\0\0\x01\0\0\0\0", 12));      // IP_PKTINFO: from 10.0.0.1
+  cmsg(&good, 0, 2, std::string("\x10\0\0\0", 4));                         // IP_TTL
+  cmsg(&good, 0, 1, std::string("\x08", 1));                              // IP_TOS (one byte)
+  CHECK(send_with(fd, good, to_peer, 16) == 7 && t.lan.run_until([&] { return peer->pending() > 0; }, 3000));
+  uint8_t buffer[64];
+  network::IpAddress from;
+  uint16_t from_port = 0;
+  uint32_t length = 0;
+  CHECK(peer->receive_from_ip(ByteView(buffer, sizeof(buffer)), &from, &from_port, &length) && length == 7 && from_port == 9901);
+  std::string bad;
+  cmsg(&bad, 0, 8, std::string(8, '\0'));                                  // IP_PKTINFO too short
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 0, 99, std::string(4, '\0'));                    // an option nobody knows
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 0, 2, std::string(4, '\0'));                     // a TTL of nothing
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 1, 99, std::string(4, '\0'));                    // a socket-level one nobody knows
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 17, 103, std::string("\x00\x05\x00", 3));        // UDP_SEGMENT of the wrong size
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 0, 2, std::string("\x10\0\0\0", 4), 15);         // a length less than the header
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  bad.clear(); cmsg(&bad, 0, 2, std::string("\x10\0\0\0", 4), 4096);       // a length past the end
+  CHECK(send_with(fd, bad, to_peer, 16) == -22);
+  // passed over, as on Linux: descriptors and credentials (they mean something over AF_UNIX only), another family's messages, less than a header
+  std::string other;
+  cmsg(&other, 1, 1, std::string(4, '\0'));                                // SCM_RIGHTS
+  cmsg(&other, 41, 50, std::string(20, '\0'));                             // IPV6_PKTINFO to an AF_INET socket
+  cmsg(&other, 1, 36, std::string(4, '\0'));                               // SO_MARK
+  CHECK(send_with(fd, other, to_peer, 16) == 7 && send_with(six, good, t.in6(b6.global, 9900), 28) == 7 && send_with(fd, good, to_peer, 16, 8) == 7 && send_with(fd, good, to_peer, 16, 0) == 7);
+  std::string good6;
+  cmsg(&good6, 41, 50, std::string(20, '\0'));
+  cmsg(&good6, 41, 52, std::string("\xff\xff\xff\xff", 4));               // IPV6_HOPLIMIT -1: the usual one
+  CHECK(send_with(six, good6, t.in6(b6.global, 9900), 28) == 7);
+  bad.clear(); cmsg(&bad, 41, 52, std::string("\0\x01\0\0", 4));           // a hop limit of 256
+  CHECK(send_with(six, bad, t.in6(b6.global, 9900), 28) == -22);
+  CHECK(send_with(fd, std::string(20488, '\0'), to_peer, 16) == -105 && send_with(fd, std::string(8200, '\0'), to_peer, 16) == -22 && t.s(46, fd, kBad, 0) == -14);
+  t.put64(message + 32, kBad); t.put64(message + 40, 32);
+  CHECK(t.s(46, fd, message, 0) == -14);
+  // every way of cutting a good buffer short, and every bit of it flipped: taken or refused, nothing else
+  int sent = 0, refused = 0;
+  for (uint64_t cut = 0; cut <= good.size(); ++cut) {
+    t.reuse();
+    const int64_t r = send_with(fd, good, t.in4(10, 0, 0, 2, 9900), 16, cut);
+    CHECK(r == 7 || r == -22);
+    (r == 7 ? sent : refused) += 1;
+  }
+  for (size_t bit = 0; bit < good.size() * 8; ++bit) {
+    t.reuse();
+    std::string flipped = good;
+    flipped[bit / 8] = char(flipped[bit / 8] ^ (1 << (bit % 8)));
+    const int64_t r = send_with(fd, flipped, t.in4(10, 0, 0, 2, 9900), 16);
+    CHECK(r == 7 || r == -22);
+    (r == 7 ? sent : refused) += 1;
+  }
+  CHECK(sent > 20 && refused > 50);
+  while (peer->receive_from_ip(ByteView(buffer, sizeof(buffer)), &from, &from_port, &length)) {}
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -757,6 +962,7 @@ int main() {
   test_options_and_errors();
   test_name_resolution();
   test_peek();
+  test_control_messages();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

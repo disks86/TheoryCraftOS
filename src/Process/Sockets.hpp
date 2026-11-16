@@ -66,13 +66,19 @@ class SocketManager {
   // `address`/`port` non-null: send to them (sendto, UDP only). Null: send to the connected peer (send; UDP must already be "connected").
   uint32_t send(uint32_t id, ConstByteView data, const network::IpAddress* address, const uint16_t* port, uint32_t* sent, bool* would_block);
   // `from_address`/`from_port` are filled in when given (recvfrom); for TCP they are the (already known) peer.
-  uint32_t receive(uint32_t id, ByteView buffer, uint32_t* got, network::IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed);
+  // `datagram_length` (when given): the whole size of the datagram that was taken, which is more than *got when the buffer was too small for it.
+  uint32_t receive(uint32_t id, ByteView buffer, uint32_t* got, network::IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
+                   uint32_t* datagram_length = nullptr);
   // receive() that leaves what it hands out to be received again (MSG_PEEK). The network stack gives data out once, so what is looked at is taken from it
   // and held with the socket (in memory from `allocator`) until a receive() takes it: up to kMostHeld bytes of a stream, or one datagram. Everything that
   // asks what a socket has (receive(), readable(), ready_to_read()) counts what is held.
   static constexpr uint32_t kMostHeld = 65536;
   uint32_t peek(uint32_t id, ByteView buffer, uint32_t* got, network::IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
-                allocators::IAllocator& allocator);
+                allocators::IAllocator& allocator, uint32_t* datagram_length = nullptr);
+  // Where a packet from `sender` (as the program sees the address) arrived at this socket: the address it was sent to, as far as that can be told (the
+  // loopback for a loopback sender, else the socket's interface's own address of the sender's kind), and the interface's number as Linux counts them (1 the
+  // loopback, 2 the first interface, ...). False if there is no such socket.
+  bool arrival(uint32_t id, const network::IpAddress& sender, network::IpAddress* destination, uint32_t* interface_index);
   uint32_t shutdown(uint32_t id, uint32_t how);  // 0 receive, 1 send, 2 both
   bool set_non_blocking(uint32_t id, bool on);
   bool is_non_blocking(uint32_t id) const;
@@ -123,6 +129,10 @@ class SocketManager {
     bool shut_read = false, shut_write = false;
     bool has_bound_address = false;      // bind() named an address: what getsockname shows until the socket is connected
     network::IpAddress bound_address;
+    // What recvmsg() is to say about each datagram in control messages: IP_PKTINFO, IPV6_RECVPKTINFO, IP_RECVTTL, IP_RECVTOS, IPV6_RECVHOPLIMIT,
+    // IPV6_RECVTCLASS, and SO_TIMESTAMP (1) or SO_TIMESTAMPNS (2).
+    bool packet_info = false, packet_info6 = false, receive_ttl = false, receive_tos = false, receive_hop_limit = false, receive_traffic_class = false;
+    uint8_t timestamp = 0;
   };
   Options* options(uint32_t id);
   // See IStackProvider: read progress() before an attempt that may block; wait_for_progress() returns when some stack did something (or the

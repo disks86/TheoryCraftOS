@@ -306,6 +306,185 @@ static void looking(void) {
   close(b);
 }
 
+/* Control messages: what recvmsg() says about a datagram once the socket asked for it, and what sendmsg() takes. */
+static void show_control(const char* what, int fd, size_t room, size_t control_room, int flags) {
+  char data[64] = {0};
+  union { char bytes[512]; struct cmsghdr align; } control;
+  struct sockaddr_storage from;
+  struct iovec iov = {data, room};
+  struct msghdr m;
+  memset(&m, 0, sizeof(m));
+  memset(&control, 0, sizeof(control));
+  m.msg_name = &from; m.msg_namelen = sizeof(from);
+  m.msg_iov = &iov; m.msg_iovlen = 1;
+  m.msg_control = control.bytes; m.msg_controllen = control_room;
+  const long got = recvmsg(fd, &m, flags);
+  const int error = got < 0 ? errno : 0;
+  printf(" %s: %ld", what, got);
+  if (got < 0) { printf(" errno %d\n", error); return; }
+  printf(" \"%.*s\" control %lu%s%s:", (int)(got < (long)room ? got : (long)room), data, (unsigned long)m.msg_controllen, m.msg_flags & MSG_TRUNC ? " TRUNC" : "",
+         m.msg_flags & MSG_CTRUNC ? " CTRUNC" : "");
+  for (struct cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+    const unsigned char* d = CMSG_DATA(c);
+    const long size = (long)c->cmsg_len - (long)CMSG_LEN(0);
+    char text[64];
+    if (c->cmsg_level == SOL_SOCKET && (c->cmsg_type == SO_TIMESTAMP || c->cmsg_type == SO_TIMESTAMPNS) && size == 16) {
+      long long seconds;
+      memcpy(&seconds, d, 8);
+      const long long apart = seconds - (long long)time(0);
+      printf(" [%s %s]", c->cmsg_type == SO_TIMESTAMP ? "time" : "time-ns", apart >= -5 && apart <= 5 ? "now" : "wrong");
+    } else if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO && size == (long)sizeof(struct in_pktinfo)) {
+      struct in_pktinfo info;
+      memcpy(&info, d, sizeof(info));
+      printf(" [pktinfo if %d %s", info.ipi_ifindex, inet_ntop(AF_INET, &info.ipi_spec_dst, text, sizeof(text)));
+      printf(" %s]", inet_ntop(AF_INET, &info.ipi_addr, text, sizeof(text)));
+    } else if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_TTL && size == 4) {
+      int ttl;
+      memcpy(&ttl, d, 4);
+      printf(" [ttl %d]", ttl);
+    } else if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_TOS && size == 1) {
+      printf(" [tos %d]", d[0]);
+    } else if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO && size == (long)sizeof(struct in6_pktinfo)) {
+      struct in6_pktinfo info;
+      memcpy(&info, d, sizeof(info));
+      printf(" [pktinfo6 if %u %s]", info.ipi6_ifindex, inet_ntop(AF_INET6, &info.ipi6_addr, text, sizeof(text)));
+    } else if (c->cmsg_level == IPPROTO_IPV6 && (c->cmsg_type == IPV6_HOPLIMIT || c->cmsg_type == IPV6_TCLASS) && size == 4) {
+      int value;
+      memcpy(&value, d, 4);
+      printf(" [%s %d]", c->cmsg_type == IPV6_HOPLIMIT ? "hoplimit" : "tclass", value);
+    } else {
+      printf(" [level %d type %d size %ld]", c->cmsg_level, c->cmsg_type, size);
+    }
+  }
+  printf("\n");
+}
+
+static long send_control(int fd, const struct sockaddr* to, socklen_t to_size, int level, int type, const void* payload, size_t size, long length_override) {
+  union { char bytes[128]; struct cmsghdr align; } control;
+  struct iovec iov = {(void*)"with", 4};
+  struct msghdr m;
+  memset(&m, 0, sizeof(m));
+  memset(&control, 0, sizeof(control));
+  m.msg_name = (void*)to; m.msg_namelen = to_size;
+  m.msg_iov = &iov; m.msg_iovlen = 1;
+  m.msg_control = control.bytes; m.msg_controllen = CMSG_SPACE(size);
+  struct cmsghdr* c = CMSG_FIRSTHDR(&m);
+  c->cmsg_level = level; c->cmsg_type = type; c->cmsg_len = length_override >= 0 ? (size_t)length_override : CMSG_LEN(size);
+  memcpy(CMSG_DATA(c), payload, size);
+  const long sent = sendmsg(fd, &m, 0);
+  return sent < 0 ? -errno : sent;
+}
+
+static void control_messages(void) {
+  const int one = 1, zero = 0;
+  printf("control messages:\n");
+  const int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in at_b = loopback(PORT + 8);
+  bind(b, (struct sockaddr*)&at_b, sizeof(at_b));
+  const struct sockaddr* to = (struct sockaddr*)&at_b;
+  sendto(a, "plain", 5, 0, to, sizeof(at_b));
+  show_control("nothing asked", b, 64, 256, 0);
+  const int s1 = setsockopt(b, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one)), s2 = setsockopt(b, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+  const int s3 = setsockopt(b, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one)), s4 = setsockopt(b, IPPROTO_IP, IP_RECVTOS, &one, sizeof(one));
+  int value = -1;
+  socklen_t size = sizeof(value);
+  const int g1 = getsockopt(b, IPPROTO_IP, IP_PKTINFO, &value, &size);
+  printf(" asking: %d %d %d %d, read back %d %d\n", s1, s2, s3, s4, g1, value);
+  sendto(a, "everything", 10, 0, to, sizeof(at_b));
+  show_control("everything", b, 64, 256, 0);
+  sendto(a, "small", 5, 0, to, sizeof(at_b));
+  show_control("room for two", b, 64, CMSG_SPACE(16) + CMSG_SPACE(12), 0);
+  sendto(a, "smaller", 7, 0, to, sizeof(at_b));
+  show_control("room for one and a half", b, 64, CMSG_SPACE(16) + CMSG_LEN(4), 0);
+  sendto(a, "tiny", 4, 0, to, sizeof(at_b));
+  show_control("room for less than a header", b, 64, 8, 0);
+  sendto(a, "none", 4, 0, to, sizeof(at_b));
+  show_control("no room", b, 64, 0, 0);
+  sendto(a, "0123456789", 10, 0, to, sizeof(at_b));
+  show_control("cut", b, 4, 256, 0);
+  sendto(a, "abcdefghij", 10, 0, to, sizeof(at_b));
+  show_control("cut, asked its size", b, 4, 256, MSG_TRUNC);
+  sendto(a, "ABCDEFGHIJ", 10, 0, to, sizeof(at_b));
+  char few[4] = {0};
+  const long real = recv(b, few, 3, MSG_TRUNC);
+  printf(" recv with MSG_TRUNC: %ld \"%s\"\n", real, few);
+  const int s5 = setsockopt(b, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one));
+  const int s6 = setsockopt(b, IPPROTO_IP, IP_RECVTTL, &zero, sizeof(zero)), s7 = setsockopt(b, IPPROTO_IP, IP_RECVTOS, &zero, sizeof(zero));
+  size = sizeof(value);
+  getsockopt(b, SOL_SOCKET, SO_TIMESTAMP, &value, &size);
+  printf(" nanoseconds instead: %d %d %d, SO_TIMESTAMP now %d\n", s5, s6, s7, value);
+  sendto(a, "ns", 2, 0, to, sizeof(at_b));
+  show_control("nanoseconds", b, 64, 256, 0);
+  setsockopt(b, SOL_SOCKET, SO_TIMESTAMPNS, &zero, sizeof(zero));
+  show_control("error queue", b, 64, 256, MSG_ERRQUEUE | MSG_DONTWAIT);
+  /* what sendmsg takes with a datagram */
+  struct in_pktinfo info;
+  memset(&info, 0, sizeof(info));
+  info.ipi_spec_dst.s_addr = htonl(INADDR_LOOPBACK);
+  const int ttl = 9;
+  const long c1 = send_control(a, to, sizeof(at_b), IPPROTO_IP, IP_PKTINFO, &info, sizeof(info), -1);
+  const long c2 = send_control(a, to, sizeof(at_b), IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl), -1);
+  const long c3 = send_control(a, to, sizeof(at_b), IPPROTO_IP, 99, &ttl, sizeof(ttl), -1);
+  const long c4 = send_control(a, to, sizeof(at_b), IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl), 8);
+  const long c5 = send_control(a, to, sizeof(at_b), IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl), 4096);
+  const long c6 = send_control(a, to, sizeof(at_b), IPPROTO_IP, IP_PKTINFO, &info, 8, -1);
+  const long c7 = send_control(a, to, sizeof(at_b), SOL_SOCKET, SCM_RIGHTS, &a, sizeof(a), -1);
+  printf(" sending with: pktinfo %ld, ttl %ld, unknown %ld, short length %ld, long length %ld, short pktinfo %ld, rights %ld\n", c1, c2, c3, c4, c5, c6, c7);
+  show_control("sent with pktinfo", b, 64, 256, 0);
+  show_control("sent with ttl", b, 64, 256, 0);
+  char rest[16];
+  while (recv(b, rest, sizeof(rest), MSG_DONTWAIT) >= 0) {}
+  close(a);
+  close(b);
+  /* IPv6, and an IPv4 datagram through an IPv6 socket */
+  const int six = socket(AF_INET6, SOCK_DGRAM, 0), from6 = socket(AF_INET6, SOCK_DGRAM, 0), from4 = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in6 at_six;
+  memset(&at_six, 0, sizeof(at_six));
+  at_six.sin6_family = AF_INET6;
+  at_six.sin6_port = htons(PORT + 9);
+  bind(six, (struct sockaddr*)&at_six, sizeof(at_six));
+  const int t1 = setsockopt(six, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)), t2 = setsockopt(six, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &one, sizeof(one));
+  const int t3 = setsockopt(six, IPPROTO_IPV6, IPV6_RECVTCLASS, &one, sizeof(one));
+  const int t4 = setsockopt(from4, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)), t4_error = t4 < 0 ? errno : 0;
+  printf(" asking (IPv6): %d %d %d; of an IPv4 socket %d errno %d\n", t1, t2, t3, t4, t4_error);
+  at_six.sin6_addr = in6addr_loopback;
+  sendto(from6, "six", 3, 0, (struct sockaddr*)&at_six, sizeof(at_six));
+  show_control("IPv6", six, 64, 256, 0);
+  struct sockaddr_in at_four = loopback(PORT + 9);
+  sendto(from4, "four", 4, 0, (struct sockaddr*)&at_four, sizeof(at_four));
+  show_control("IPv4 through it", six, 64, 256, 0);
+  const int t5 = setsockopt(six, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+  sendto(from4, "both", 4, 0, (struct sockaddr*)&at_four, sizeof(at_four));
+  printf(" IP_PKTINFO too: %d\n", t5);
+  show_control("IPv4 through it, both asked", six, 64, 256, 0);
+  struct in6_pktinfo info6;
+  memset(&info6, 0, sizeof(info6));
+  const long d1 = send_control(from6, (struct sockaddr*)&at_six, sizeof(at_six), IPPROTO_IPV6, IPV6_PKTINFO, &info6, sizeof(info6), -1);
+  const long d2 = send_control(from6, (struct sockaddr*)&at_six, sizeof(at_six), IPPROTO_IPV6, IPV6_HOPLIMIT, &ttl, sizeof(ttl), -1);
+  const long d3 = send_control(from4, (struct sockaddr*)&at_four, sizeof(at_four), IPPROTO_IPV6, IPV6_PKTINFO, &info6, sizeof(info6), -1);
+  printf(" sending with (IPv6): pktinfo %ld, hop limit %ld; IPv6 pktinfo on an IPv4 socket %ld\n", d1, d2, d3);
+  close(six);
+  close(from6);
+  close(from4);
+  /* a stream has none */
+  const int listener = socket(AF_INET, SOCK_STREAM, 0);
+  struct sockaddr_in at = loopback(PORT + 10);
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  bind(listener, (struct sockaddr*)&at, sizeof(at));
+  listen(listener, 1);
+  const int client = socket(AF_INET, SOCK_STREAM, 0);
+  connect(client, (struct sockaddr*)&at, sizeof(at));
+  const int server = accept(listener, 0, 0);
+  setsockopt(server, IPPROTO_IP, IP_PKTINFO, &one, sizeof(one));
+  write(client, "stream", 6);
+  nap(50);
+  show_control("stream", server, 4, 256, 0);
+  show_control("stream, the rest", server, 64, 256, MSG_TRUNC);
+  close(client);
+  close(server);
+  close(listener);
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IOLBF, 0);
   stream_pair();
@@ -314,6 +493,7 @@ int main(void) {
   version_six();
   options();
   looking();
+  control_messages();
   printf("net ok\n");
   return 0;
 }
