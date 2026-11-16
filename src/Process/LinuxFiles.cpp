@@ -244,7 +244,10 @@ int64_t follow_proc_self(Process& p, String* virtual_path) {
 // The cleaned virtual path of (dirfd, path), /proc/self/exe and the like replaced by what they lead to. 0, or -errno.
 int64_t resolve_at(Process& p, uint64_t dirfd, uint64_t path_address, bool allow_empty, String* virtual_path) {
   const int64_t r = resolve_raw(p, dirfd, path_address, allow_empty, virtual_path);
-  return r < 0 ? r : follow_proc_self(p, virtual_path);
+  if (r < 0) return r;
+  if (const int64_t followed = follow_proc_self(p, virtual_path); followed < 0) return followed;
+  provide_network_file(p, virtual_path->view());      // (/etc/resolv.conf and its companions are written when a program first names them)
+  return 0;
 }
 
 DescriptorKind kind_of(Process& p, uint64_t fd) { return p.files().kind(fd); }

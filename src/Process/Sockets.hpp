@@ -56,6 +56,8 @@ class SocketManager {
   // Connects (TCP: begins the handshake, which completes later - *would_block is set the first time regardless, and the caller watches is_connected()/failed()
   // itself; UDP: just remembers the peer for send()/recv() without an address, as a real connected UDP socket does - no packet is exchanged to establish it).
   uint32_t connect(uint32_t id, const network::IpAddress& address, uint16_t port, bool* would_block);
+  // A datagram socket forgets the peer connect() gave it (connect() with AF_UNSPEC). False for anything else.
+  bool disconnect(uint32_t id);
   uint32_t listen(uint32_t id, uint32_t backlog);
   // *out_id is a new socket (already add_ref()'d once, for the caller's handle) on success.
   uint32_t accept(uint32_t id, uint32_t* out_id, network::IpAddress* peer_address, uint16_t* peer_port, bool* would_block);

@@ -3,7 +3,8 @@
 # kernel's autorun: tests/linux/forktest.c and signaltest.c (static, no libc: the calls themselves, handlers entered after calls, at timer ticks and on
 # faults), spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
 # a SIGCHLD handler), ipctest.c (static, glibc: System V IPC, POSIX message queues and timers, inotify, pidfd, asynchronous I/O) and nettest.c (static,
-# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
+# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6) and resolvetest.c (static, glibc: hosts and services by name, from /etc and from DNS
+# through QEMU's DNS server; it needs this machine's own resolver to answer for ".localhost" and ".invalid", as systemd-resolved does). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
 # Then signaltest.c as an AArch64, a RISC-V and a LoongArch program, which the kernel runs on its CPU emulator.
 # Uses its own build folder (build-fork-qemu) so the normal build keeps no autorun.
 set -euo pipefail
@@ -14,9 +15,12 @@ rm -rf "$work"; mkdir -p "$work"
 for program in forktest signaltest; do
   gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/$program" "tests/linux/$program.c"
 done
-for program in spawntest handlertest ipctest nettest; do
+for program in spawntest handlertest ipctest nettest resolvetest; do
   gcc -static -O1 -pthread -o "$work/$program" "tests/linux/$program.c" 2>/dev/null
 done
+# (A statically linked glibc program that looks hosts up cannot be run on this machine for what it should print: the C library then loads this machine's
+# own lookup modules into it, which a static program does not survive. The same source linked the usual way prints it instead.)
+gcc -O1 -o "$work/resolvetest-reference" tests/linux/resolvetest.c
 cmake -S . -B "$build" -G Ninja -DTCOS_AUTORUN=/Linux/usr/bin/forktest >/dev/null
 cmake --build "$build" >/dev/null
 cmake --build "$build" --target vars >/dev/null
@@ -42,8 +46,10 @@ run_one() {
   grep -a -q -E "autorun: ended, result 0, exit code 0x0+( |$)" "$build/debugcon.log" || status=1
 }
 # Each program in turn is the one the kernel starts (at the autorun's path), after it ran here for what it should print.
-for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
-  (cd "$work" && "./$program" > "$program-expected.txt")
+for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest resolvetest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
+  reference=$program
+  [ "$program" = resolvetest ] && reference=resolvetest-reference
+  (cd "$work" && "./$reference" > "$program-expected.txt")
   run_one "$program" "$work/$program" "$work/$program-expected.txt" "on Linux"
 done
 # The same signal program built for the other CPUs runs on the kernel's CPU emulator (checked-in builds and what they print under qemu's user mode:

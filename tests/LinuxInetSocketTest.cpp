@@ -25,6 +25,7 @@
 #include <string>
 #include "NetworkHarness.hpp"
 #include "Ipv6Harness.hpp"
+#include "FileSystem/Ram/RamFileSystem.hpp"
 #include "Process/Process.hpp"
 #include "Process/Sockets.hpp"
 #include "Process/Syscall.hpp"
@@ -569,6 +570,103 @@ static void test_options_and_errors() {
   set_system_sockets(&t.sockets);
 }
 
+// Finding hosts by name: the files a C library reads are written into the program's tree from the network configuration, and the DNS server named there is
+// asked the way a resolver asks it.
+static void test_name_resolution() {
+  Setup t;
+  filesystem::RamFileSystem fs(t.lan.alloc);
+  CHECK(fs.create_directory("/Linux") == filesystem::Status::Ok);
+  t.process.attach_file_system(t.lan.alloc, fs);
+  auto set_dns = [&](uint8_t last) {
+    network::IpConfiguration c = t.lan.a.configuration();
+    c.dns = network::Ipv4Address::make(10, 0, 0, last);
+    t.lan.a.configure(c);
+  };
+  auto contents = [&](const char* path) {
+    const int64_t fd = t.s(2, t.bytes(path), 0);
+    if (fd < 0) return std::string("<error ") + std::to_string(fd) + ">";
+    const uint64_t buf = t.alloc(8192);
+    const int64_t n = t.s(0, fd, buf, 8192);
+    t.s(3, fd);
+    return n < 0 ? std::string("<unreadable>") : t.text(buf, uint64_t(n));
+  };
+  const std::string marker = "# Written by TheoryCraftOS from the network configuration. A file without this line is left alone.\n";
+  set_dns(2);
+  // resolv.conf is there the moment a program names it (also for stat and access), with the interface's DNS server
+  const uint64_t st = t.alloc(160);
+  CHECK(t.s(4, t.bytes("/etc/resolv.conf"), st) == 0 && (t.u32(st + 24) & 0170000) == 0100000 && t.u64(st + 48) == marker.size() + 20);
+  CHECK(contents("/etc/resolv.conf") == marker + "nameserver 10.0.0.2\n" && t.s(21, t.bytes("/etc/resolv.conf"), 4) == 0);
+  // ... and follows the network configuration
+  set_dns(9);
+  CHECK(contents("/etc/resolv.conf") == marker + "nameserver 10.0.0.9\n");
+  set_dns(2);
+  CHECK(contents("/etc/../etc/./resolv.conf") == marker + "nameserver 10.0.0.2\n");
+  // the companions: written once, with what a resolver needs in them
+  const std::string hosts = contents("/etc/hosts"), order = contents("/etc/nsswitch.conf"), services = contents("/etc/services"), protocols = contents("/etc/protocols");
+  CHECK(hosts.find("127.0.0.1 localhost\n") == 0 && hosts.find("::1 localhost") != std::string::npos && hosts.find("127.0.1.1 tcos\n") != std::string::npos);
+  CHECK(order.find("hosts: files dns\n") != std::string::npos && services.find("\nhttp 80/tcp") != std::string::npos && services.find("\ndomain 53/udp\n") != std::string::npos);
+  CHECK(protocols.find("tcp 6 TCP\n") != std::string::npos && protocols.find("udp 17 UDP\n") != std::string::npos);
+  CHECK(contents("/etc/passwd") == "<error -2>" && contents("/tmp/resolv.conf") == "<error -2>" && contents("/etc/resolv.conf.bak") == "<error -2>");      // nothing else is made up
+  // a file somebody else wrote is theirs: it is not written over, whatever the network says
+  auto write = [&](const char* path, const std::string& text) {
+    const int64_t fd = t.s(2, t.bytes(path), 0x241 /* O_WRONLY | O_CREAT | O_TRUNC */, 0644);
+    const bool ok = fd >= 0 && t.s(1, fd, t.bytes(text), text.size()) == int64_t(text.size());
+    t.s(3, fd);
+    return ok;
+  };
+  CHECK(write("/etc/hosts", "10.9.8.7 mine\n") && contents("/etc/hosts") == "10.9.8.7 mine\n");
+  CHECK(write("/etc/resolv.conf", "nameserver 9.9.9.9\n"));
+  set_dns(5);
+  CHECK(contents("/etc/resolv.conf") == "nameserver 9.9.9.9\n");
+  // (removed, it is written again; so is one that still has the first line and something stale after it)
+  CHECK(t.s(87, t.bytes("/etc/resolv.conf")) == 0 && contents("/etc/resolv.conf") == marker + "nameserver 10.0.0.5\n");
+  CHECK(write("/etc/resolv.conf", marker + "nameserver 1.2.3.4\noptions rotate\n") && contents("/etc/resolv.conf") == marker + "nameserver 10.0.0.5\n");
+  CHECK(write("/etc/resolv.conf", marker.substr(0, 40)) && contents("/etc/resolv.conf") == marker.substr(0, 40));      // (a cut-off first line is not the marker)
+  CHECK(t.s(87, t.bytes("/etc/resolv.conf")) == 0);
+  set_dns(2);
+
+  // a resolver's exchange with the server the file names: a datagram socket connected to port 53, a question, the answer
+  const std::string file = contents("/etc/resolv.conf");
+  CHECK(file == marker + "nameserver 10.0.0.2\n");
+  SharedPointer<network::IUdpSocket> server = t.lan.b.udp_open(53);
+  CHECK(server);
+  bool answered = false;
+  t.host.meanwhile = [&] {
+    uint8_t question[512];
+    network::IpAddress from;
+    uint16_t from_port = 0;
+    uint32_t length = 0;
+    if (answered || !server->receive_from_ip(ByteView(question, sizeof(question)), &from, &from_port, &length)) return;
+    answered = true;
+    question[2] |= 0x80;      // (the same message, marked as an answer)
+    server->send_to_ip(from, from_port, ConstByteView(question, length));
+  };
+  const int64_t fd = t.s(41, kAfInet, kDgram | kNonBlock | kCloexec, 0);
+  CHECK(fd >= 3 && t.s(54, fd, 0, 11 /* IP_RECVERR */, t.word(1), 4) == 0 && t.s(42, fd, t.in4(10, 0, 0, 2, 53), 16) == 0);
+  const std::string query("\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x04host\x04test\x00\x00\x01\x00\x01", 27);
+  const uint64_t pfd = t.alloc(8), buf = t.alloc(2048), waiting = t.word(0);
+  t.put32(pfd, uint32_t(fd)); t.put32(pfd + 4, kPollOut);
+  CHECK(t.s(7, pfd, 1, 0) == 1 && t.s(44, fd, t.bytes(query), query.size(), 0x4000 /* MSG_NOSIGNAL */, 0, 0) == int64_t(query.size()));
+  t.put32(pfd + 4, kPollIn);
+  CHECK(t.s(7, pfd, 1, 5000) == 1 && (t.u32(pfd + 4) >> 16) == kPollIn && t.s(16, fd, 0x541B, waiting) == 0 && t.u32(waiting) == 1472);      // FIONREAD: room for any datagram
+  const uint64_t name = t.alloc(32), size = t.word(28);
+  CHECK(t.s(45, fd, buf, 2048, 0, name, size) == int64_t(query.size()) && uint8_t(t.text(buf + 2, 1)[0]) == 0x81 && t.text(buf, 2) == "\x12\x34");
+  CHECK(t.text(name + 2, 6) == std::string("\x00\x35\x0a\0\0\x02", 6) && t.s(16, fd, 0x541B, waiting) == 0 && t.u32(waiting) == 0);      // from port 53 of the server
+  t.host.meanwhile = nullptr;
+  // the same socket for another host: connect() with an address of no family takes the peer away
+  const uint64_t unspecified = t.alloc(16);
+  CHECK(t.s(52, fd, name, size) == 0 && t.s(42, fd, unspecified, 16) == 0 && t.s(52, fd, name, size) == -107 && t.s(1, fd, t.bytes("x"), 1) == -89);
+  CHECK(t.s(42, fd, t.in4(10, 0, 0, 2, 53), 16) == 0 && t.s(52, fd, name, size) == 0 && t.s(42, fd, kBad, 16) == -14);
+  const int64_t tcp = t.s(41, kAfInet, kStream, 0);
+  CHECK(t.s(42, tcp, unspecified, 16) == -97);      // (not for a stream socket)
+  // with no network at all the file is there and names no server
+  set_system_sockets(nullptr);
+  CHECK(contents("/etc/resolv.conf") == marker);
+  set_system_sockets(&t.sockets);
+  CHECK(contents("/etc/resolv.conf") == marker + "nameserver 10.0.0.2\n");
+  t.process.release_handles();
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -578,6 +676,7 @@ int main() {
   test_loopback_and_epoll();
   test_ipv6();
   test_options_and_errors();
+  test_name_resolution();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

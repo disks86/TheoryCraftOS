@@ -362,6 +362,12 @@ uint64_t inet_connect(Process& p, uint64_t fd, uint64_t address, uint64_t length
   if (const int64_t r = inet_of(p, fd, &s); r < 0) return error(-r);
   network::IpAddress to;
   uint16_t port = 0;
+  // An address of no family (AF_UNSPEC) takes a datagram socket's peer away again, which is how a C library uses one socket to try several hosts.
+  if (length >= 2) {
+    uint8_t family[2];
+    if (!p.read_user(address, ByteView(family, sizeof(family)))) return error(kEfault);
+    if (family[0] == 0 && family[1] == 0) return s.sockets->disconnect(s.id) ? 0 : error(kEafnosupport);
+  }
   if (const int64_t r = read_address(p, address, length, s.sockets->is_ipv6(s.id), &to, &port); r < 0) return error(-r);
   SocketManager::Options* options = s.sockets->options(s.id);
   if (s.sockets->is_tcp(s.id)) {
@@ -756,8 +762,9 @@ uint64_t inet_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument
   Inet s;
   if (const int64_t r = inet_of(p, fd, &s); r < 0) return error(-r);
   switch (request) {
-    case 0x541B:      // FIONREAD: the bytes of the stream that wait, or the size of the next datagram (here: how many datagrams wait, at least one byte each)
-      return put_u32(p, argument, s.sockets->readable(s.id));
+    case 0x541B:      // FIONREAD: the bytes of the stream that wait; for datagrams the size of the next one, which the stack does not say before it is taken:
+                      // the most one can be (they are never put together from fragments), so that a buffer of that size loses nothing
+      return put_u32(p, argument, s.sockets->is_tcp(s.id) ? s.sockets->readable(s.id) : s.sockets->readable(s.id) != 0 ? 1472 : 0);
     case 0x5411:      // TIOCOUTQ: nothing is ever left unsent that the program could wait for
       return put_u32(p, argument, 0);
     case 0x5421: {    // FIONBIO

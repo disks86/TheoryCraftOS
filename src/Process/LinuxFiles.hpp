@@ -73,6 +73,9 @@ uint64_t sys_dup(Process& p, uint64_t fd);
 uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument);
 // The cleaned virtual path a program names with (dirfd, path) (/proc/self/exe and the like replaced by what they lead to). 0, or -errno.
+// LinuxNetworkFiles.cpp: if `virtual_path` is one of the files a C library finds hosts by name with (/etc/resolv.conf, hosts, nsswitch.conf, services,
+// protocols) and it is not there, it is written; a resolv.conf written this way is kept in step with the network configuration's DNS servers.
+void provide_network_file(Process& p, StringView virtual_path);
 int64_t resolve_user_path(Process& p, uint64_t dirfd, uint64_t path, bool allow_empty, String* virtual_path);
 // readlink: symbolic links of the file tree, and /proc/self/exe, /proc/self/cwd, /proc/self/root and /proc/self/fd/<n> (also by the process's number).
 uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t buffer, uint64_t size);

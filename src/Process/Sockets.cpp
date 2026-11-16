@@ -194,6 +194,15 @@ uint32_t SocketManager::connect(uint32_t id, const IpAddress& address, uint16_t 
   return kSuccess;
 }
 
+bool SocketManager::disconnect(uint32_t id) {
+  Socket* s = at(id);
+  if (!s || s->proto != SocketProto::Udp) return false;
+  s->udp_connected = false;
+  s->peer_address = IpAddress();
+  s->peer_port = 0;
+  return true;
+}
+
 uint32_t SocketManager::listen(uint32_t id, uint32_t backlog) {
   (void)backlog;  // the stack keeps up to 8 pending connections regardless of what is asked for
   Socket* s = at(id);

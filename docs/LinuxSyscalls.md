@@ -134,8 +134,22 @@ socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback 
 - Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `MSG_PEEK` is
   refused (`EOPNOTSUPP`); no control messages (`IP_PKTINFO` and the like are accepted and none arrive); `bind` uses every interface
   whatever address it names; no raw or ICMP sockets, no `AF_NETLINK` (so `getifaddrs` fails), no multicast membership; 256 sockets in
-  the system. A statically linked glibc program's `getaddrinfo` needs the C library's own files, as on Linux, and there is no
-  `/etc/resolv.conf` yet: programs that name hosts by number work.
+  the system.
+
+**Finding hosts by name.** A C library does that itself, from files and by asking a DNS server over UDP or TCP; what it needs here are
+the files (`LinuxNetworkFiles.cpp`). `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/services` and `/etc/protocols` are
+written into the program's tree (`/Linux/etc`) the first time a program names one of them, as ordinary files.
+
+- `resolv.conf` names the DNS server of each network interface that has one (up to three, IPv4 ones first). Its first line says that it
+  was written here, and a file with that line is written again when the servers change (a new DHCP lease). A `resolv.conf` without the
+  line, or any of the other files once they exist, is left alone: put your own there and it stays.
+- `hosts` has `localhost` (both versions) and the machine's own name; `nsswitch.conf` says `hosts: files dns`; `services` and
+  `protocols` have the common ones.
+- A datagram socket's `connect` with `AF_UNSPEC` takes its peer away again, and `FIONREAD` of one answers with room for any datagram:
+  both are what a resolver relies on.
+- glibc looks for `AF_NETLINK` to learn which IP versions are configured and, finding none, tries both. A statically linked glibc
+  program resolves names here (the files and DNS lookups are built into the library); anything else in `nsswitch.conf` would need the
+  library's own modules in the tree.
 
 **One memory node, no protection keys.** `get_mempolicy`, `set_mempolicy`, `mbind`, `move_pages` and `migrate_pages` accept every policy
 and answer for a machine with one node. `pkey_alloc` answers `ENOSPC`, as on a processor without protection keys.
@@ -168,8 +182,9 @@ back to `read` and `write`.
 - The parts with a fixed answer above: `io_uring`, `fanotify`, `seccomp` filters, `bpf`, `perf_event_open`, `userfaultfd`, namespaces,
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
-- Of network sockets: `MSG_PEEK`, datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`, name resolution set up
-  for Linux programs (`/etc/resolv.conf`). File permission bits and owners (the calls succeed and keep nothing).
+- Of network sockets: `MSG_PEEK`, datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`. Of name resolution:
+  search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
+  never names the file again. File permission bits and owners (the calls succeed and keep nothing).
 - Of inotify: `IN_CLOSE_WRITE`, `IN_OPEN`, `IN_ACCESS`, `IN_ATTRIB`. Of asynchronous I/O: requests that would wait (`IOCB_CMD_POLL`).
   `CLONE_PIDFD`. `mq_notify` with `SIGEV_THREAD`. The requeue-PI futex operations.
 
@@ -188,4 +203,9 @@ back to `read` and `write`.
   `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6. `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
-  datagrams, the loopback, IPv6, epoll, options, bad addresses).
+  datagrams, the loopback, IPv6, epoll, options, bad addresses), and the files for finding hosts by name with a resolver's exchange
+  with a DNS server.
+- `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
+  kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for
+  `.localhost` and `.invalid` by itself, as systemd-resolved does). The expected output is the dynamically linked build's: a static
+  glibc program cannot look hosts up on a machine whose `nsswitch.conf` names modules it has to load.
