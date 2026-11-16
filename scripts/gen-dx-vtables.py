@@ -25,7 +25,7 @@ A method defined with `#define <prefix>_<Method> <function>` counts too (the IUn
 import re, os, sys
 
 INC = '/usr/x86_64-w64-mingw32/include/'
-HEADERS = ['d3d12.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h']
+HEADERS = ['d3d12.h', 'd3d12sdklayers.h', 'dxgi1_6.h', 'dxgi1_5.h', 'dxgi1_4.h', 'dxgi1_3.h', 'dxgi1_2.h', 'dxgi.h', 'd3dcommon.h', 'd3d11.h', 'd3d9.h']
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'Windows')
 
 # (interface, vtable variable, [prefixes in the order they are tried])
@@ -67,6 +67,16 @@ SPECS = {
         ('ID3D11RasterizerState', 'raster_vtbl', ['raster', 'child', 'obj']),
         ('ID3D11SamplerState', 'sampler_vtbl', ['sampler', 'child', 'obj']),
     ],
+    'd3d9': [
+        ('IDirect3D9', 'd3d_vtbl', ['d3d', 'obj']),
+        ('IDirect3DDevice9', 'dev_vtbl', ['dev', 'obj']),
+        ('IDirect3DVertexBuffer9', 'vb_vtbl', ['vb', 'buf', 'res9', 'child', 'obj']),
+        ('IDirect3DIndexBuffer9', 'ib_vtbl', ['ib', 'buf', 'res9', 'child', 'obj']),
+        ('IDirect3DTexture9', 'tex_vtbl', ['tex', 'res9', 'child', 'obj']),
+        ('IDirect3DSurface9', 'surf_vtbl', ['surf', 'res9', 'child', 'obj']),
+        ('IDirect3DVertexDeclaration9', 'decl_vtbl', ['decl', 'child', 'obj']),
+        ('IDirect3DStateBlock9', 'sb_vtbl', ['sb', 'child', 'obj']),
+    ],
 }
 
 text = ''.join(open(INC + h).read() for h in HEADERS)
@@ -74,10 +84,55 @@ text = ''.join(open(INC + h).read() for h in HEADERS)
 def members(iface):
     m = re.search(r'typedef struct %sVtbl \{(.*?)\} %sVtbl;' % (iface, iface), text, re.S)
     if not m:
-        sys.exit('no vtable for ' + iface)
+        return macro_members(iface)
     # (name, return type, parameters as the header writes them)
     return [(mm.group(2), ' '.join(mm.group(1).split()), ' '.join(mm.group(3).split()))
             for mm in re.finditer(r'(?:BEGIN_INTERFACE\s*)?([\w\s\*]+?)\s*\(\s*(?:STDMETHODCALLTYPE|WINAPI)?\s*\*\s*(\w+)\s*\)\s*\((.*?)\);', m.group(1), re.S)]
+
+def macro_members(iface):
+    """The methods of an interface the header declares with DECLARE_INTERFACE_ and STDMETHOD (d3d9.h): the same triples."""
+    m = re.search(r'#define INTERFACE %s\s*\n\s*DECLARE_INTERFACE_\w*\([^)]*\)\s*\{(.*?)\n\};' % iface, text, re.S)
+    if not m:
+        sys.exit('no vtable for ' + iface)
+    out = []
+    for mm in re.finditer(r'STDMETHOD(_)?\(\s*([^()]*?)\s*\)\s*\(\s*THIS(_?)\s*(.*?)\)\s*PURE\s*;', m.group(1), re.S):
+        inner = [part.strip() for part in mm.group(2).split(',')]
+        result, name = (inner[0], inner[1]) if mm.group(1) else ('HRESULT', inner[0])
+        arguments = ' '.join(mm.group(4).split())
+        out.append((name, result, '%s *This%s' % (iface, ', ' + arguments if mm.group(3) and arguments else '')))
+    return out
+
+problems = []
+
+def top_level_count(arguments):
+    """How many parameters a parameter list has (commas outside brackets)."""
+    arguments = arguments.strip()
+    if arguments in ('', 'void'):
+        return 0
+    depth, count = 0, 1
+    for c in arguments:
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            count += 1
+    return count
+
+def check_arguments(dll, fn, after, parameters):
+    """A method that is written takes as many parameters as the header gives it: the vtable is filled in through a cast, which would hide a method
+    that takes more or fewer - and in a 32-bit program such a method leaves the caller's stack wrong."""
+    depth, end = 1, 0
+    for end, c in enumerate(after):
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                break
+    have, want = top_level_count(after[:end]), top_level_count(parameters)
+    if have != want:
+        problems.append('%s: %s takes %d parameters, the interface gives it %d' % (dll, fn, have, want))
 
 def stub(var, name, result, parameters):
     """A method nobody wrote, with the method's own signature: in a 32-bit program a method takes its arguments off the stack, so one function cannot
@@ -104,8 +159,11 @@ for dll, specs in SPECS.items():
             impl = None
             for p in prefixes:
                 fn = '%s_%s' % (p, name)
-                if re.search(r'^(?:static\s+)?[\w\s\*]*?\b%s\s*\(' % fn, source, re.M) or re.search(r'^#define %s\b' % fn, source, re.M):
+                found = re.search(r'^(?:static\s+)?[\w\s\*]*?\b%s\s*\(' % fn, source, re.M)
+                if found or re.search(r'^#define %s\b' % fn, source, re.M):
                     impl = fn
+                    if found:
+                        check_arguments(dll, fn, source[found.end():], parameters)
                     break
             if impl is None:
                 impl, definition = stub(var, name, result, parameters)
@@ -114,3 +172,5 @@ for dll, specs in SPECS.items():
         out += table + ['};']
     open(os.path.join(folder, 'vtbl.inc'), 'w').write('\n'.join(out) + '\n')
     print('wrote', dll, 'vtbl.inc')
+if problems:
+    sys.exit('\n'.join(problems))

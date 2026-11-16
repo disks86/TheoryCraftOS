@@ -52,6 +52,8 @@ A method that is not written answers E_NOTIMPL (or does nothing, for the ones th
 - `d3d12.dll`: the resources the descriptors of a table are views of go into the command stream's list of allocations (a draw that sampled
   a texture the same list had not also copied into was refused); a sampler's LOD limits are brought within what the kernel takes (`FLT_MAX`,
   the usual "no limit", was refused).
+- The kernel does not carry two sets of values in the halves of one register between the vertex and the pixel shader (two `float2`
+  outputs the compiler packs together): [Direct3D9.md](Direct3D9.md) found it and gives each a register. Not fixed.
 - `dxgi.dll` no longer exports `D3D11CreateDevice`, `D3D12CreateDevice` and `D3D12GetDebugInterface` as stubs: a library linked against both
   got dxgi's.
 

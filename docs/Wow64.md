@@ -56,11 +56,11 @@ i386 yet (a 32-bit program's Vulkan handles are 64-bit numbers, not pointers). W
 - ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32, comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32: the test programs
   hello32, crt32, seh32, gui32 and old32, and the setup programs.
 - ws2_32, comdlg32, winmm, imm32, dbghelp and bcrypt: the test program lib32 (below).
-- dxgi and d3d12, and gdi32's D3DKMT functions: the test program dx32 (Direct3D, below). d3d11: the test program d3d11test
-  ([Direct3D11.md](Direct3D11.md)).
+- dxgi and d3d12, and gdi32's D3DKMT functions: the test program dx32 (Direct3D, below). d3d11 and d3d9: the test programs d3d11test and
+  d3d9test ([Direct3D11.md](Direct3D11.md), [Direct3D9.md](Direct3D9.md)).
 - The rest (wtsapi32, userenv, crypt32, uxtheme, shfolder, dsound, mmdevapi, xaudio2, dwrite, opengl32, ...) are there so that a program
   importing them loads; nothing of them has been run. The ones that are stubs or work through kernel32 and advapi32 can be expected to do what
-  their 64-bit forms do. dwrite's and opengl32's requests to the kernel have one layout for both widths. d3d9 is a stub for both widths.
+  their 64-bit forms do. dwrite's and opengl32's requests to the kernel have one layout for both widths.
 
 What each of the second group needed says what to look for in the others:
 
@@ -226,10 +226,10 @@ A setup program's own log is the other half: the App Manager asks Inno Setup for
 - `tests/run_host_tests.sh SyscallTest LoaderTest`: binding a PE32 program, the INT 2E argument convention, the address-space ceiling.
 - `tests/run_host_tests.sh WindowsExceptionTest`: the i386 `CONTEXT` and record the kernel writes and reads, with truncated and bit-flipped
   contexts.
-- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test]`: the eight test programs in the real kernel, each in a boot of
+- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32] [d3d11test] [d3d9test]`: the nine test programs in the real kernel, each in a boot of
   its own. dx32 is Direct3D: gdi32's D3DKMT functions with a 32-bit program's structures, then all of tests/windows/d3d12test.c (323 checks) on
   the kernel's software adapter; built for x86-64 the same source is the 64-bit test of both. d3d11test is Direct3D 11 (40 checks,
-  [Direct3D11.md](Direct3D11.md)).
+  [Direct3D11.md](Direct3D11.md)). d3d9test is Direct3D 9's fixed-function pipeline (54 checks, [Direct3D9.md](Direct3D9.md)).
   lib32 is the libraries beyond the window system (Winsock, the common dialogs' structures, the multimedia timer and wave output, the input
   method manager, a walk of its own stack, bcrypt, an object's name); old32 is a program built against the old C runtime (the same source built
   for x86-64 with `-mcrtdll=msvcrt-os` tests the 64-bit msvcrt.dll's streams).
