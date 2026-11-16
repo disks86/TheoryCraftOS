@@ -1330,6 +1330,338 @@ static void test_signal_handlers_other_cpus() {
   }
 }
 
+// What tests/linux/sigframe_loongarch.c printed under qemu's user mode (tests/linux/build_sigframe_loongarch.sh): the frames Linux gives a LoongArch
+// program's handlers, byte for byte.
+static const char* g_data_directory = "tests/data/emulation";
+struct ReferenceFrame {
+  uint64_t signal = 0, gap = 0, info = 0, context = 0;
+  uint32_t way_back[2] = {};
+  std::string bytes;
+  uint64_t u64(uint64_t at) const { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | uint8_t(bytes[at + uint64_t(i)]); return v; }
+  uint32_t u32(uint64_t at) const { return uint32_t(u64(at)); }
+};
+static bool read_reference_frames(const char* kind, std::vector<ReferenceFrame>* out, std::string* returned) {
+  const std::string path = std::string(g_data_directory) + "/sigframes-loongarch64-" + kind + ".txt";
+  FILE* file = fopen(path.c_str(), "rb");
+  if (!file) return false;
+  std::string text;
+  char chunk[4096];
+  for (size_t n; (n = fread(chunk, 1, sizeof(chunk), file)) > 0;) text.append(chunk, n);
+  fclose(file);
+  bool ended = false;
+  for (size_t at = 0; at < text.size();) {
+    size_t end = text.find('\n', at);
+    if (end == std::string::npos) end = text.size();
+    const std::string line = text.substr(at, end - at);
+    at = end + 1;
+    unsigned long long a = 0, b = 0, c = 0;
+    unsigned w0 = 0, w1 = 0;
+    if (sscanf(line.c_str(), "signal %llu", &a) == 1) {
+      out->push_back(ReferenceFrame());
+      out->back().signal = a;
+    } else if (!out->empty() && sscanf(line.c_str(), "at - gap %llu info %llu context %llu", &a, &b, &c) == 3) {
+      out->back().gap = a; out->back().info = b; out->back().context = c;
+    } else if (!out->empty() && sscanf(line.c_str(), "way-back %x %x", &w0, &w1) == 2) {
+      out->back().way_back[0] = w0; out->back().way_back[1] = w1;
+    } else if (!out->empty() && line.compare(0, 6, "frame ") == 0) {
+      if ((line.size() - 6) % 2 != 0) return false;
+      for (size_t i = 6; i + 1 < line.size(); i += 2) {
+        unsigned byte = 0;
+        if (sscanf(line.substr(i, 2).c_str(), "%2x", &byte) != 1) return false;
+        out->back().bytes.push_back(char(byte));
+      }
+    } else if (line.compare(0, 9, "returned ") == 0) {
+      *returned = line.substr(9);
+    } else if (line == "frames ok") {
+      ended = true;
+    }
+  }
+  if (!ended || out->size() != 2) return false;
+  for (const ReferenceFrame& f : *out)
+    if (f.bytes.size() != f.gap || f.gap < 128 + 448 + 16 || f.info != 0 || f.context != 128) return false;
+  return true;
+}
+
+// Handlers of LoongArch programs. Nothing here runs a LoongArch program yet, so there is no program to run on both sides and compare: the frame is compared
+// with the ones Linux makes (as qemu's user mode writes them), and rt_sigreturn is given those.
+static void test_signal_handlers_loongarch() {
+  using linuxabi::LinuxSignalContext;
+  constexpr UserArch arch = UserArch::LoongArch64;
+  constexpr uint64_t kUsr1 = 10, kUsr2 = 12, kSegv = 11, kIll = 4, kHandler = 0x400100, kStackTop = 0x2F000, kRestart = 0x10000000;
+  constexpr uint64_t kInfo = 128, kHead = 176, kRegs = 272, kRecords = kInfo + kHead + kRegs, kOwnFrame = 880;
+  constexpr uint32_t kFp = 0x46505501u, kLsx = 0x53580001u, kLasx = 0x41535801u, kLbt = 0x42540001u;
+  auto bit = [](uint64_t signal) { return uint64_t{1} << (signal - 1); };
+  auto registers = [&](uint64_t stack) {
+    LinuxSignalContext c;
+    c.arch = arch;
+    for (uint32_t i = 1; i < 32; ++i) c.x[i] = 0x0101010101010101ull * (i + 1);
+    for (uint32_t i = 0; i < 32; ++i) c.vector[i] = 0xF0F0F0F000000000ull + i;
+    c.set_stack_pointer(stack);
+    c.pc = 0x400504;
+    c.pstate = 0x0100000100010001ull;      // fcc0, fcc2, fcc4, fcc7
+    c.fpcr = 0x0300;                       // rounding mode
+    return c;
+  };
+  auto action = [&](Rig& r, uint64_t handler, uint64_t flags, uint64_t mask) { return r.words({handler, flags, mask, 0x4755415244ull}); };      // (no restorer field)
+  struct Running {
+    Rig rig;
+    ForkRuntime runtime;
+    Running() : rig(nullptr, 1, UserArch::LoongArch64) { rig.process->attach_runtime(&runtime); rig.process->linux_state().handlers_run = true; }
+    ~Running() { rig.process->attach_runtime(nullptr); }
+  };
+  auto put = [](Rig& rig, uint64_t at, const std::string& bytes) {
+    return rig.space.write_privileged(at, ConstByteView(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+  };
+  CHECK(registers(0x1230).stack_pointer() == 0x1230 && registers(0x1230).x[3] == 0x1230 && &registers(0).result() != nullptr);
+  {
+    LinuxSignalContext c = registers(0);
+    CHECK(&c.result() == &c.x[4]);
+  }
+
+  {      // the frame, the page a handler returns through, and the way back
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    const uint64_t old = rig.alloc(40);
+    rig.put64(old + 24, 0x4755415244ull);
+    CHECK(rig.s(134, kUsr1, action(rig, kHandler, 4, bit(kUsr2)), 0, 8) == 0 && rig.s(134, kUsr1, 0, old, 8) == 0);
+    CHECK(rig.u64(old) == kHandler && rig.u64(old + 8) == 4 && rig.u64(old + 16) == bit(kUsr2) && rig.u64(old + 24) == 0x4755415244ull);      // 24 bytes
+    CHECK(rig.s(129, 1, kUsr1) == 0 && linuxabi::signals_wanted(p));
+    const LinuxSignalContext before = registers(kStackTop);
+    LinuxSignalContext c = before;
+    const uint64_t regions = rig.space.region_count();
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr));
+    const uint64_t frame = c.stack_pointer(), uc = frame + kInfo, regs = uc + kHead, records = frame + kRecords;
+    CHECK(c.pc == kHandler && c.x[4] == kUsr1 && c.x[5] == frame && c.x[6] == uc && frame == kStackTop - kOwnFrame);
+    CHECK(rig.u32(frame) == kUsr1 && rig.u32(frame + 8) == 0 && rig.u32(frame + 16) == 1);
+    CHECK(rig.u64(uc + 40) == 0 && rig.u32(uc + 24) == 2);
+    const uint64_t trampoline = p.linux_state().signal_trampoline, mask = rig.alloc(8);
+    CHECK(trampoline != 0 && rig.space.region_count() == regions + 1 && c.x[1] == trampoline);
+    uint8_t protection = 0;
+    CHECK(rig.space.protection_at(trampoline, &protection) && protection == (kProtRead | kProtExecute));
+    CHECK(rig.u64(trampoline) == 0x002B000003822C0Bull);      // ori $a7, $zero, 139; syscall 0
+    CHECK(rig.u64(regs) == before.pc && rig.u64(regs + 8) == 0 && rig.u64(regs + 16) == before.x[1] && rig.u64(regs + 8 + 3 * 8) == kStackTop && rig.u64(regs + 8 + 31 * 8) == before.x[31]);
+    CHECK(rig.u32(regs + 264) == 1 && rig.u32(regs + 268) == 0);      // flags: the floating-point registers are there
+    CHECK(rig.u32(records) == kFp && rig.u32(records + 4) == 288 && rig.u64(records + 8) == 0 && rig.u64(records + 16) == before.vector[0] && rig.u64(records + 16 + 31 * 8) == before.vector[31]);
+    CHECK(rig.u64(records + 272) == before.pstate && rig.u32(records + 280) == before.fpcr && rig.u64(records + 288) == 0 && rig.u64(records + 296) == 0);
+    CHECK(rig.s(135, 0, 0, mask, 8) == 0 && rig.u64(mask) == (bit(kUsr1) | bit(kUsr2)));
+    LinuxSignalContext back;
+    back.arch = arch;
+    back.set_stack_pointer(frame);
+    CHECK(rig.s(139) == 0 && p.take_signal_return() && linuxabi::signal_return(p, &back));
+    for (uint32_t i = 1; i < 32; ++i) CHECK(back.x[i] == before.x[i]);
+    for (uint32_t i = 0; i < 32; ++i) CHECK(back.vector[i] == before.vector[i]);
+    CHECK(back.x[0] == 0 && back.pc == before.pc && back.pstate == before.pstate && back.fpcr == before.fpcr);
+    CHECK(rig.s(135, 0, 0, mask, 8) == 0 && rig.u64(mask) == 0);
+    CHECK(rig.s(129, 1, kUsr1) == 0);      // a second handler returns through the same page
+    c = before;
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && p.linux_state().signal_trampoline == trampoline && rig.space.region_count() == regions + 1);
+    CHECK(rig.s(135, 2, rig.words({0}), 0, 8) == 0);
+
+    // what a handler (or anything else) wrote where a frame should be
+    c = before;
+    CHECK(rig.s(134, kUsr1, action(rig, kHandler, 0, 0), 0, 8) == 0 && rig.s(129, 1, kUsr1) == 0 && linuxabi::deliver_signals(p, &c, nullptr));
+    const uint64_t good = c.stack_pointer(), good_regs = good + kInfo + kHead, good_records = good + kRecords;
+    auto returns = [&](uint64_t at) { LinuxSignalContext r = registers(at); return linuxabi::signal_return(p, &r); };
+    CHECK(returns(good));
+    for (const uint64_t bad : {kBad, uint64_t{0}, uint64_t{0x30000 - 64}, ~uint64_t{0}, ~uint64_t{0} - 5000, uint64_t{0x0000800000000000ull}}) CHECK(!returns(bad));
+    rig.put64(good + kInfo + 40, ~uint64_t{0});
+    CHECK(returns(good) && rig.s(135, 0, 0, mask, 8) == 0 && rig.u64(mask) == (~uint64_t{0} & ~(bit(9) | bit(19))));
+    const std::string image = rig.bytes(good, kOwnFrame);
+    {      // r0 stays zero whatever the frame says; of the condition flags and fcsr only the bits that exist are taken
+      rig.put64(good_regs + 8, 0x1234);
+      rig.put64(good_records + 272, ~uint64_t{0});
+      rig.put32(good_records + 280, ~uint32_t{0});
+      LinuxSignalContext r = registers(good);
+      r.x[0] = 0;
+      CHECK(linuxabi::signal_return(p, &r) && r.x[0] == 0 && r.pstate == 0x0101010101010101ull && r.fpcr == 0x1F1F031Fu);
+      CHECK(put(rig, good, image));
+    }
+    {      // the records: a kind nobody knows, a size that is not the kind's, the floating-point state twice, a list without an end
+      rig.put32(good_records, 0x12345678);
+      CHECK(!returns(good));
+      rig.put32(good_records, kFp);
+      for (const uint32_t size : {0u, 8u, 16u, 280u, 283u, 284u, 352u, 544u, 4096u, 0xFFFFFFF0u, 0xFFFFFFFFu}) {
+        rig.put32(good_records + 4, size);
+        CHECK(!returns(good));
+      }
+      rig.put32(good_records + 4, 288);
+      CHECK(returns(good));
+      rig.put32(good_records + 288 + 4, 16);      // the end's magic with a size
+      CHECK(!returns(good));
+      // a frame as long as the stack has room for, at the top of the program's memory
+      const uint64_t at = 0x30000 - 4096 - kRecords - 16;
+      std::string longer = image.substr(0, kRecords) + std::string(4096 + 16, '\0');
+      auto word = [&](uint64_t where, uint32_t value) { for (int i = 0; i < 4; ++i) longer[kRecords + where + uint64_t(i)] = char(value >> (8 * i)); };
+      word(0, kLbt); word(4, 96);           // binary translation state: passed over
+      word(96, kFp); word(100, 288);
+      CHECK(put(rig, at, longer) && returns(at));
+      word(384, kFp); word(388, 288);       // twice
+      CHECK(put(rig, at, longer) && !returns(at));
+      word(384, kLbt); word(388, 96);       // the other kind twice
+      CHECK(put(rig, at, longer) && !returns(at));
+      word(384, 0); word(388, 0);
+      word(0, 0); word(4, 0);               // none at all: the floating-point registers stay as they are
+      CHECK(put(rig, at, longer));
+      LinuxSignalContext r = registers(at);
+      CHECK(linuxabi::signal_return(p, &r) && r.vector[7] == registers(0).vector[7] && r.pstate == registers(0).pstate && r.x[9] == registers(0).x[9]);
+      word(0, kLbt); word(4, 4080);         // one record up to the last 16 bytes, and the end there
+      CHECK(put(rig, at, longer) && returns(at));
+      word(4, 4088);                        // ... and one that leaves no room for the end
+      CHECK(put(rig, at, longer) && !returns(at));
+      word(4, 4096);
+      CHECK(put(rig, at, longer) && !returns(at));
+      for (uint64_t where = 0; where < 4096; where += 16) { word(where, kLbt); word(where + 4, 16); }      // records all the way, and no end
+      CHECK(put(rig, at, longer) && !returns(at));
+      CHECK(put(rig, good, image) && returns(good));
+    }
+    // bits flipped anywhere in a good frame, and frames of random bytes: a refusal or a return, never anything else
+    uint32_t seed = 9191;
+    for (int round = 0; round < 3000; ++round) {
+      std::string changed = image;
+      for (int flips = 0; flips < 1 + round % 4; ++flips) {
+        seed = seed * 1664525u + 1013904223u;
+        changed[(seed >> 8) % kOwnFrame] ^= char(1u << (seed >> 29));
+      }
+      if (round % 5 == 4) for (char& b : changed) { seed = seed * 1664525u + 1013904223u; b = char(seed >> 24); }
+      CHECK(put(rig, good, changed));
+      returns(good);
+    }
+    CHECK(put(rig, good, image) && returns(good));
+    // a frame cut off by the end of the program's memory, at every length (up to the record that ends the list)
+    for (uint64_t have = 0; have < kOwnFrame - 8; have += 8) {
+      const uint64_t at = 0x30000 - have;
+      CHECK(put(rig, at, image.substr(0, have)));
+      CHECK(!returns(at));
+    }
+    CHECK(put(rig, 0x30000 - kOwnFrame, image) && returns(0x30000 - kOwnFrame));
+    CHECK(!p.exited());
+  }
+  for (const bool restart : {true, false}) {      // a call that was cut short starts again: a0 has its argument back, the program counter is at SYSCALL
+    Running run;
+    Rig& rig = run.rig;
+    CHECK(rig.s(134, kUsr1, action(rig, kHandler, restart ? kRestart : 0, 0), 0, 8) == 0 && rig.s(129, 1, kUsr1) == 0);
+    LinuxSignalContext c = registers(kStackTop);
+    c.result() = uint64_t(-4);
+    const linuxabi::InterruptedCall call{63, true, 0x7777};
+    CHECK(linuxabi::deliver_signals(*rig.process, &c, &call));
+    const uint64_t regs = c.stack_pointer() + kInfo + kHead;
+    CHECK(rig.u64(regs + 8 + 4 * 8) == (restart ? 0x7777 : uint64_t(-4)) && rig.u64(regs) == (restart ? 0x400500 : 0x400504));
+  }
+  {      // faults; the alternate stack; no stack to put a frame on
+    Running run;
+    Rig& rig = run.rig;
+    Process& p = *rig.process;
+    CHECK(rig.s(134, kSegv, action(rig, kHandler, 4, 0), 0, 8) == 0 && rig.s(134, kIll, action(rig, kHandler, 4, 0), 0, 8) == 0);
+    LinuxSignalContext c = registers(kStackTop);
+    CHECK(linuxabi::deliver_fault(p, &c, 14, 0, 0x1234) && c.pc == kHandler && c.x[4] == kSegv);
+    const uint64_t frame = c.stack_pointer();
+    CHECK(rig.u32(frame) == kSegv && rig.u32(frame + 8) == 1 && rig.u64(frame + 16) == 0x1234 && rig.u64(frame + kInfo + kHead) == 0x400504);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_fault(p, &c, 6, 0, 0) && rig.u32(c.stack_pointer()) == kIll && rig.u32(c.stack_pointer() + 8) == 1 && rig.u64(c.stack_pointer() + 16) == 0x400504);
+    constexpr uint64_t kAlt = 0x12000, kAltSize = 0x6000;
+    CHECK(rig.s(132, rig.words({kAlt, 0, kAltSize}), 0) == 0 && rig.s(134, kUsr1, action(rig, kHandler, 0x08000000, 0), 0, 8) == 0 && rig.s(129, 1, kUsr1) == 0);
+    c = registers(kStackTop);
+    CHECK(linuxabi::deliver_signals(p, &c, nullptr) && c.stack_pointer() == kAlt + kAltSize - kOwnFrame && rig.u64(c.stack_pointer() + kInfo + 16) == kAlt &&
+          rig.u32(c.stack_pointer() + kInfo + 24) == 0 && rig.u64(c.stack_pointer() + kInfo + 32) == kAltSize);
+    for (const uint64_t stack : {kBad, uint64_t{0}, uint64_t{64}, uint64_t{0x10000 + 512}, ~uint64_t{0}}) {
+      Running none;
+      CHECK(none.rig.s(134, kUsr1, action(none.rig, kHandler, 0, 0), 0, 8) == 0 && none.rig.s(129, 1, kUsr1) == 0);
+      LinuxSignalContext s = registers(stack);
+      CHECK(!linuxabi::deliver_signals(*none.rig.process, &s, nullptr) && none.rig.process->exited() && none.rig.process->exit_code() == 139);
+    }
+  }
+
+  // --- against the frames Linux makes
+  for (const char* kind : {"fpu", "lsx", "lasx"}) {
+    std::vector<ReferenceFrame> frames;
+    std::string returned;
+    const bool have = read_reference_frames(kind, &frames, &returned);
+    CHECK(have);
+    if (!have) continue;
+    const uint32_t magic = kind[1] == 'p' ? kFp : kind[2] == 'x' ? kLsx : kLasx;
+    const uint64_t words = magic == kFp ? 1 : magic == kLsx ? 2 : 4;
+    CHECK(returned == "00000000005e7bac");      // (the handler changed s0 in its frame, and the program found it changed: the registers are where this test reads them)
+    for (const ReferenceFrame& reference : frames) {
+      const bool fault = reference.signal == kSegv;
+      CHECK(reference.signal == (fault ? kSegv : kUsr1) && reference.way_back[0] == 0x03822C0Bu && reference.way_back[1] == 0x002B0000u);
+      CHECK(reference.u32(kRecords) == magic && reference.u64(kInfo + kHead + 8) == 0 && reference.u32(kInfo + kHead + 264) == 1);
+      CHECK(reference.gap == kRecords + reference.u32(kRecords + 4) + 16);      // (the records follow one another up to the interrupted stack pointer)
+      Running run;
+      Rig& rig = run.rig;
+      Process& p = *rig.process;
+      // rt_sigreturn takes Linux's frame: every register comes back as the frame has it
+      const uint64_t at = kStackTop - reference.gap;
+      CHECK(put(rig, at, reference.bytes));
+      LinuxSignalContext restored;
+      restored.arch = arch;
+      restored.set_stack_pointer(at);
+      const bool taken = linuxabi::signal_return(p, &restored);
+      CHECK(taken);
+      if (!taken) continue;
+      CHECK(restored.pc == reference.u64(kInfo + kHead) && restored.x[0] == 0);
+      for (uint32_t i = 1; i < 32; ++i) CHECK(restored.x[i] == reference.u64(kInfo + kHead + 8 + i * 8));
+      for (uint32_t i = 0; i < 32; ++i) CHECK(restored.vector[i] == reference.u64(kRecords + 16 + i * 8 * words));
+      CHECK(restored.pstate == 0x0001000000000100ull && restored.fpcr == 0);      // fcc1 and fcc6, as the program set them
+      // (the program's marks: s1..s8 and f24..f31; s0 too, until the first handler changed it)
+      for (uint32_t i = 24; i < 32; ++i) CHECK(restored.x[i] == 0xA500000000000000ull + ((i - 22) << 8) + ((i / 10) << 4) + i % 10);
+      CHECK(restored.x[23] == (fault ? 0x5E7BACull : 0xA500000000000123ull));
+      for (uint32_t i = 24; i < 32; ++i) CHECK(restored.vector[i] == 0xA500000000000000ull + ((i - 23) << 8) + (((i - 1) / 10) << 4) + (i - 1) % 10);
+      if (magic != kFp) CHECK(reference.u64(kRecords + 16 + 24 * 8 * words + 8) == 0xA500000000000123ull);      // (the upper part of vr24: this build did use the vector registers)
+      if (fault) {
+        CHECK(reference.u32(0) == kSegv && reference.u32(8) == 1 && reference.u64(16) == 0x10 && restored.x[12] == 0x10);      // SEGV_MAPERR at the address in t0
+      } else {
+        CHECK(reference.u32(8) == 0 && restored.x[4] == 0 && restored.x[5] == kUsr1 && restored.x[11] == 129);      // SI_USER; kill() had returned 0
+      }
+      // The frame made here for the same registers at the same moment is Linux's, byte for byte, where the thread had used no more than the floating-point
+      // registers. (Where it had used the vector registers Linux's frame has them in full; this one has their low halves, in the same places up to there.)
+      const uint64_t stack = restored.x[3];
+      LinuxSignalContext c = restored;
+      c.set_stack_pointer(kStackTop);
+      CHECK(rig.s(134, reference.signal, action(rig, kHandler, 4, 0), 0, 8) == 0);
+      if (fault) {
+        CHECK(linuxabi::deliver_fault(p, &c, 14, 0, 0x10));
+      } else {
+        CHECK(rig.s(129, 1, kUsr1) == 0 && linuxabi::deliver_signals(p, &c, nullptr));
+      }
+      const uint64_t frame = c.stack_pointer();
+      CHECK(frame == kStackTop - kOwnFrame && c.x[4] == reference.signal && c.x[5] == frame + reference.info && c.x[6] == frame + reference.context);
+      CHECK(rig.u32(p.linux_state().signal_trampoline) == reference.way_back[0] && rig.u32(p.linux_state().signal_trampoline + 4) == reference.way_back[1]);
+      std::string expected = reference.bytes;
+      for (int i = 0; i < 8; ++i) expected[kInfo + kHead + 8 + 3 * 8 + uint64_t(i)] = char((kStackTop + (stack & 15)) >> (8 * i));      // (the stack is elsewhere here)
+      CHECK((stack & 15) == 0);
+      const std::string made = rig.bytes(frame, kOwnFrame);
+      CHECK(made.substr(kInfo, kRecords - kInfo) == expected.substr(kInfo, kRecords - kInfo));      // struct ucontext up to the records
+      if (fault) CHECK(made.substr(0, kInfo) == expected.substr(0, kInfo));                          // siginfo_t of the fault
+      else CHECK(made.substr(0, 16) == expected.substr(0, 16) && made.substr(24, kInfo - 24) == expected.substr(24, kInfo - 24));      // (si_pid and si_uid are this OS's)
+      if (magic == kFp) {
+        CHECK(reference.gap == kOwnFrame && made.substr(kRecords) == expected.substr(kRecords));
+      } else {
+        CHECK(rig.u32(frame + kRecords) == kFp);
+        for (uint32_t i = 0; i < 32; ++i) CHECK(rig.u64(frame + kRecords + 16 + i * 8) == reference.u64(kRecords + 16 + i * 8 * words));
+        CHECK(made.substr(kRecords + 16 + 256, 16) == expected.substr(kRecords + 16 + 256 * words, 16));      // the condition flags and fcsr
+      }
+      // Linux's frames with bits flipped, and cut off: a refusal or a return
+      uint32_t seed = 77 + uint32_t(words);
+      for (int round = 0; round < 1500; ++round) {
+        std::string changed = reference.bytes;
+        for (int flips = 0; flips < 1 + round % 4; ++flips) {
+          seed = seed * 1664525u + 1013904223u;
+          changed[(seed >> 8) % changed.size()] ^= char(1u << (seed >> 29));
+        }
+        CHECK(put(rig, at, changed));
+        LinuxSignalContext r = registers(at);
+        linuxabi::signal_return(p, &r);
+      }
+      for (uint64_t have_bytes = 0; have_bytes < reference.gap - 8; have_bytes += 24) {
+        CHECK(put(rig, 0x30000 - have_bytes, reference.bytes.substr(0, have_bytes)));
+        LinuxSignalContext r = registers(0x30000 - have_bytes);
+        CHECK(!linuxabi::signal_return(p, &r));
+      }
+    }
+  }
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -1387,11 +1719,14 @@ static void test_hostile_arguments() {
   set_system_objects(nullptr);
 }
 
-int main() {
+// LinuxSyscallTest [<the directory of tests/data/emulation>]
+int main(int argc, char** argv) {
+  if (argc > 1) g_data_directory = argv[1];
   struct { const char* name; void (*run)(); } const tests[] = {
       {"files", test_files}, {"record locks", test_record_locks}, {"memory", test_memory}, {"address space copy", test_address_space_copy}, {"signals", test_signals},
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
-      {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
+      {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
+      {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   for (const auto& test : tests) {
     test.run();
     if (A.live != 0) {      // every test gives back what it took

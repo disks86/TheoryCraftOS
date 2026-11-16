@@ -129,7 +129,8 @@ class EmulatedProcess final : public process::IProcessRuntime {
   // Does this runtime enter the handlers of the program's signals? (A Linux program's, on the CPUs whose frames linuxabi::deliver_signals knows.)
   bool enters_handlers() const {
     return process_->abi() == process::SyscallAbi::Linux &&
-           (arch_ == process::UserArch::X86_64 || arch_ == process::UserArch::AArch64 || arch_ == process::UserArch::RiscV64);
+           (arch_ == process::UserArch::X86_64 || arch_ == process::UserArch::AArch64 || arch_ == process::UserArch::RiscV64 ||
+            arch_ == process::UserArch::LoongArch64);      // (LoongArch: for the day there is a guest CPU for it; create_guest_cpu has none yet)
   }
   // The registers of a guest thread in the form the signal code wants for its CPU, and back.
   struct SignalRegisters {

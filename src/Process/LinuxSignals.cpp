@@ -233,8 +233,9 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   return true;
 }
 
-// --- entering a handler (AArch64 and RISC-V) -------------------------------------------------------------------------------------------------------------
-// Neither CPU's C library gives the kernel a way back from a handler (RISC-V has no SA_RESTORER at all; AArch64 has one, which glibc does not use): Linux
+// --- entering a handler (AArch64, RISC-V and LoongArch) -------------------------------------------------------------------------------------------------------------
+// None of these CPUs' C libraries gives the kernel a way back from a handler (RISC-V and LoongArch have no SA_RESTORER at all; AArch64 has one, which glibc
+// does not use): Linux
 // points the handler's return address at a few instructions in the vDSO that call rt_sigreturn. There is no vDSO here, so the process gets a page of its own
 // with those instructions the first time a handler is entered.
 constexpr uint64_t kRtSigreturnGeneric = 139;      // rt_sigreturn in the generic system-call table
@@ -244,9 +245,15 @@ uint64_t signal_trampoline(Process& p, UserArch arch) {
   if (state.signal_trampoline != 0) return state.signal_trampoline;
   AddressSpace* space = p.address_space();
   if (!space) return 0;
-  // AArch64: mov x8, #139; svc #0.  RISC-V: li a7, 139; ecall.
-  const uint32_t code[2] = {arch == UserArch::AArch64 ? 0xD2800008u | uint32_t(kRtSigreturnGeneric << 5) : 0x00000893u | uint32_t(kRtSigreturnGeneric << 20),
-                            arch == UserArch::AArch64 ? 0xD4000001u : 0x00000073u};
+  // AArch64: mov x8, #139; svc #0.  RISC-V: li a7, 139; ecall.  LoongArch: ori $a7, $zero, 139; syscall 0.
+  uint32_t code[2] = {0x00000893u | uint32_t(kRtSigreturnGeneric << 20), 0x00000073u};
+  if (arch == UserArch::AArch64) {
+    code[0] = 0xD2800008u | uint32_t(kRtSigreturnGeneric << 5);
+    code[1] = 0xD4000001u;
+  } else if (arch == UserArch::LoongArch64) {
+    code[0] = 0x0380000Bu | uint32_t(kRtSigreturnGeneric << 10);
+    code[1] = 0x002B0000u;
+  }
   uint8_t raw[8];
   ByteWriter writer{ByteView(raw, sizeof(raw))};
   writer.le32(code[0]);
@@ -261,7 +268,7 @@ uint64_t signal_trampoline(Process& p, UserArch arch) {
   return page;
 }
 
-// Both CPUs' frames begin alike: struct rt_sigframe { siginfo_t info; struct ucontext uc; }, with
+// The three CPUs' frames begin alike: struct rt_sigframe { siginfo_t info; struct ucontext uc; }, with
 //   struct ucontext { uc_flags (8), uc_link (8), uc_stack (ss_sp 8, ss_flags 4, padding 4, ss_size 8), uc_sigmask (8), 120 unused bytes, uc_mcontext }
 // and uc_mcontext, which wants 16-byte alignment, at +176.
 constexpr uint64_t kGenericContextHead = 176, kGenericMaskAt = 40;
@@ -275,6 +282,17 @@ constexpr uint64_t kArmFpsimdBytes = 528, kArmEsrBytes = 16;
 // double-precision form uses f0..f31 (8 each) and fcsr (4) }. The rest stays zero, which also says "no further state" where a newer kernel keeps the vector
 // registers.
 constexpr uint64_t kRiscvRegsBytes = 256, kRiscvFpBytes = 528, kRiscvFrameBytes = kSiginfoBytes + kGenericContextHead + kRiscvRegsBytes + kRiscvFpBytes;
+// LoongArch: struct sigcontext { pc, r0..r31 (8 each), flags (4), 4 bytes of padding }, then records that each begin with a magic number and a size (4 each)
+// and 8 bytes of padding: the floating-point one (f0..f31 (8 each), the condition flags (8), fcsr (4), 4 bytes of padding) and an all-zero one to end the
+// list. Linux lays the records out from the top of the frame down, which for these two comes to the same as one after the other. A thread that used the
+// vector registers gets them all in a record of another kind in place of the floating-point one (LSX: 16 bytes a register, LASX: 32), and one that used
+// binary translation a record more (LBT); rt_sigreturn knows them, a frame made here never has them.
+constexpr uint64_t kLoongRegsBytes = 272, kLoongRecordHead = 16, kLoongFpBytes = kLoongRecordHead + 32 * 8 + 16;
+constexpr uint64_t kLoongFrameBytes = kSiginfoBytes + kGenericContextHead + kLoongRegsBytes + kLoongFpBytes + kLoongRecordHead;
+constexpr uint32_t kLoongFpMagic = 0x46505501u, kLoongLsxMagic = 0x53580001u, kLoongLasxMagic = 0x41535801u, kLoongLbtMagic = 0x42540001u;
+constexpr uint32_t kLoongUsedFp = 1;                  // sigcontext flags: the floating-point registers are in the frame
+constexpr uint32_t kLoongFcsrBits = 0x1F1F031Fu;      // the bits of fcsr that are there: enables, rounding mode, flags, cause
+constexpr uint64_t kLoongRecordsMax = 4096;           // (LASX + LBT + the end come to some 1200 bytes)
 
 void write_generic_head(ByteWriter& writer, const LinuxProcessState::Thread& thread, const StackChoice& stack, uint64_t old_mask) {
   writer.le64(0);                       // uc_flags
@@ -289,14 +307,14 @@ void write_generic_head(ByteWriter& writer, const LinuxProcessState::Thread& thr
 
 bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, const LinuxProcessState::Action& action, uint64_t old_mask, const FaultDetail& fault,
                 bool is_fault, LinuxSignalContext* context) {
-  const bool arm = context->arch == UserArch::AArch64;
-  if (!arm && context->arch != UserArch::RiscV64) return false;
+  const bool arm = context->arch == UserArch::AArch64, loong = context->arch == UserArch::LoongArch64;
+  if (!arm && !loong && context->arch != UserArch::RiscV64) return false;
   const uint64_t way_back = arm && (action.flags & kSaRestorer) && action.restorer != 0 ? action.restorer : signal_trampoline(p, context->arch);
   if (way_back == 0) return false;
   StackChoice stack;
   if (!choose_stack(thread, action, context->stack_pointer(), 0, &stack)) return false;
   const uint64_t top = stack.top & ~uint64_t{15};
-  const uint64_t frame_bytes = arm ? kArmFrameBytes : kRiscvFrameBytes;
+  const uint64_t frame_bytes = arm ? kArmFrameBytes : loong ? kLoongFrameBytes : kRiscvFrameBytes;
   if (top < frame_bytes + 64) return false;
   const uint64_t record_at = arm ? top - 16 : top;
   const uint64_t frame_at = (record_at - frame_bytes) & ~uint64_t{15};
@@ -304,7 +322,7 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
 
   // (of an AArch64 frame only what has something in it is written: the list of records ends long before the 4096 bytes kept for it do)
   uint8_t raw[kSiginfoBytes + kGenericContextHead + kArmRegsBytes + kArmFpsimdBytes + kArmEsrBytes + 16] = {};
-  static_assert(sizeof(raw) >= kRiscvFrameBytes, "the buffer holds either frame");
+  static_assert(sizeof(raw) >= kRiscvFrameBytes && sizeof(raw) >= kLoongFrameBytes, "the buffer holds any of the frames");
   ByteWriter writer{ByteView(raw, sizeof(raw))};
   write_siginfo(writer, signal, p.linux_state().info[signal]);
   write_generic_head(writer, thread, stack, old_mask);
@@ -326,6 +344,20 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
       writer.le64(fault.error);
     }
     writer.zeros(16);      // the end of the list
+  } else if (loong) {
+    writer.le64(context->pc);
+    writer.le64(0);        // r0
+    for (uint32_t i = 1; i < 32; ++i) writer.le64(context->x[i]);
+    writer.le32(kLoongUsedFp);
+    writer.le32(0);
+    writer.le32(kLoongFpMagic);
+    writer.le32(uint32_t(kLoongFpBytes));
+    writer.le64(0);
+    for (uint32_t i = 0; i < 32; ++i) writer.le64(context->vector[i]);
+    writer.le64(context->pstate);      // the condition flags
+    writer.le32(context->fpcr);
+    writer.le32(0);
+    writer.zeros(kLoongRecordHead);      // the end of the list
   } else {
     writer.le64(context->pc);
     for (uint32_t i = 1; i < 32; ++i) writer.le64(context->x[i]);
@@ -346,6 +378,12 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
     context->x[29] = record_at;
     context->x[30] = way_back;
     context->sp = frame_at;
+  } else if (loong) {
+    context->x[4] = signal;
+    context->x[5] = info_at;
+    context->x[6] = context_at;
+    context->x[1] = way_back;
+    context->x[3] = frame_at;
   } else {
     context->x[10] = signal;
     context->x[11] = info_at;
@@ -358,7 +396,7 @@ bool push_frame(Process& p, LinuxProcessState::Thread& thread, uint32_t signal, 
   return true;
 }
 
-// The registers a signal is delivered to: an x86-64 thread's, or an AArch64 / RISC-V thread's.
+// The registers a signal is delivered to: an x86-64 thread's, or an AArch64 / RISC-V / LoongArch thread's.
 struct Registers {
   X86Context* x86 = nullptr;
   LinuxSignalContext* other = nullptr;
@@ -371,7 +409,7 @@ struct Registers {
       x86->rip -= 2;                                 // (SYSCALL is two bytes long)
     } else {
       other->result() = call.first_argument;         // (the first argument went where the result now is; the number is still in its register)
-      other->pc -= 4;                                // (SVC and ECALL are four bytes long)
+      other->pc -= 4;                                // (SVC, ECALL and SYSCALL are four bytes long)
     }
   }
 };
@@ -618,12 +656,12 @@ bool deliver_fault(Process& p, LinuxSignalContext* context, uint64_t vector, uin
   return fault_to(p, registers, vector, error, address);
 }
 
-// rt_sigreturn of an AArch64 or RISC-V thread: the stack pointer is at the frame (see push_frame).
+// rt_sigreturn of an AArch64, RISC-V or LoongArch thread: the stack pointer is at the frame (see push_frame).
 bool signal_return(Process& p, LinuxSignalContext* context) {
-  const bool arm = context->arch == UserArch::AArch64;
-  if (!arm && context->arch != UserArch::RiscV64) return false;
+  const bool arm = context->arch == UserArch::AArch64, loong = context->arch == UserArch::LoongArch64;
+  if (!arm && !loong && context->arch != UserArch::RiscV64) return false;
   const uint64_t frame_at = context->stack_pointer();
-  if (frame_at > ~uint64_t{0} - (kArmFrameBytes + 16)) return false;
+  if (frame_at > ~uint64_t{0} - (kArmFrameBytes + 16)) return false;      // (the largest of the frames, and more than a LoongArch frame's records may take)
   const uint64_t context_at = frame_at + kSiginfoBytes, registers_at = context_at + kGenericContextHead;
   uint64_t mask = 0;
   if (!p.read_user_u64(context_at + kGenericMaskAt, &mask)) return false;
@@ -661,6 +699,52 @@ bool signal_return(Process& p, LinuxSignalContext* context) {
       at += size;
     }
     if (!have_fp) return false;
+  } else if (loong) {
+    uint8_t raw[kLoongRegsBytes];
+    if (!p.read_user(registers_at, ByteView(raw, sizeof(raw)))) return false;
+    ByteReader reader{ConstByteView(raw, sizeof(raw))};
+    restored.pc = reader.le64();
+    reader.skip(8);      // r0
+    for (uint32_t i = 1; i < 32; ++i) restored.x[i] = reader.le64();
+    // The records. Linux takes the floating-point state from the widest one that is there; here only the low 64 bits of a register are kept, which every
+    // kind has first. A frame without any leaves the floating-point registers as they are (a thread that never used them has such a frame on Linux). A
+    // kind that is not known, one that comes twice or a size that is not the kind's is a frame that is not one.
+    const uint64_t records_at = registers_at + kLoongRegsBytes;
+    bool have_fp = false, have_lbt = false, ended = false;
+    for (uint64_t at = 0; at <= kLoongRecordsMax - kLoongRecordHead;) {
+      uint8_t head[8];
+      if (!p.read_user(records_at + at, ByteView(head, sizeof(head)))) return false;
+      ByteReader record{ConstByteView(head, sizeof(head))};
+      const uint32_t magic = record.le32(), size = record.le32();
+      if (magic == 0) {
+        if (size != 0) return false;
+        ended = true;
+        break;
+      }
+      const uint64_t words = magic == kLoongFpMagic ? 1 : magic == kLoongLsxMagic ? 2 : magic == kLoongLasxMagic ? 4 : 0;      // 64-bit words a register
+      if (words != 0) {
+        const uint64_t body = 32 * 8 * words + 12;      // the registers, the condition flags, fcsr
+        if (have_fp || size < kLoongRecordHead + body || size > kLoongRecordHead + body + 64 || size % 8 != 0 || size > kLoongRecordsMax - at) return false;
+        uint8_t fp[32 * 8 * 4 + 12];
+        if (!p.read_user(records_at + at + kLoongRecordHead, ByteView(fp, body))) return false;
+        ByteReader values{ConstByteView(fp, body)};
+        for (uint32_t i = 0; i < 32; ++i) {
+          restored.vector[i] = values.le64();
+          values.skip((words - 1) * 8);
+        }
+        restored.pstate = values.le64() & 0x0101010101010101ull;
+        restored.fpcr = values.le32() & kLoongFcsrBits;
+        if (!values.ok()) return false;
+        have_fp = true;
+      } else if (magic == kLoongLbtMagic) {
+        if (have_lbt || size < kLoongRecordHead || size % 8 != 0 || size > kLoongRecordsMax - at) return false;      // (there is no binary translation state here)
+        have_lbt = true;
+      } else {
+        return false;
+      }
+      at += size;
+    }
+    if (!ended) return false;
   } else {
     uint8_t raw[kRiscvRegsBytes + 32 * 8 + 4];
     if (!p.read_user(registers_at, ByteView(raw, sizeof(raw)))) return false;

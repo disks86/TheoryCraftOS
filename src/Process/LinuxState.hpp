@@ -37,7 +37,7 @@ struct LinuxProcessState {
   // Whoever runs the program enters handlers (linuxabi::deliver_signals after a system call, at a timer tick, on a fault). Without that a signal with a handler
   // only stays pending, for sigtimedwait and sigsuspend to find.
   bool handlers_run = false;
-  uint64_t signal_trampoline = 0;    // AArch64 and RISC-V: the page with the instructions a handler returns through (0: not made yet)
+  uint64_t signal_trampoline = 0;    // AArch64, RISC-V, LoongArch: the page with the instructions a handler returns through (0: not made yet)
   bool return_requested = false;     // rt_sigreturn was called: the runtime restores the registers from the handler's frame (Process::take_signal_return)
   // What a handler is told about a signal (siginfo_t), one for each signal: signals of one kind do not queue.
   struct Info {

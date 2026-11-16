@@ -40,9 +40,9 @@ waits, and one with a handler has its handler entered.
   user mode (so a loop that never calls the kernel is interrupted too), and when the processor reports a fault. The handler gets the
   frame Linux gives it on its CPU (`siginfo_t`, `ucontext_t` with every register and the floating-point state) and returns through
   `rt_sigreturn`; it may change the registers it returns to. `SA_SIGINFO`, `SA_ONSTACK`, `SA_NODEFER`, `SA_RESETHAND` and `SA_RESTART`
-  are honoured. On x86-64 the action must have a restorer (`SA_RESTORER`), which every C library supplies. AArch64 and RISC-V C
-  libraries give none (Linux lends them a few instructions in the vDSO): the process gets a page of its own with those instructions
-  the first time a handler is entered.
+  are honoured. On x86-64 the action must have a restorer (`SA_RESTORER`), which every C library supplies. AArch64, RISC-V and LoongArch
+  C libraries give none (Linux lends them a few instructions in the vDSO): the process gets a page of its own with those
+  instructions the first time a handler is entered.
 - *Faults.* A page fault, a division error, an invalid instruction and the like become `SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS` or
   `SIGTRAP` with `si_code` and `si_addr`. Without a handler, or with the signal blocked, the process ends.
 - *Where signals come from.* The process itself (`kill`, `tgkill`, `raise`, `abort`), its timers (`alarm`, `setitimer`), the
@@ -53,8 +53,12 @@ waits, and one with a handler has its handler entered.
   handler. A read of the console and a wait for a priority-inheritance futex are not cut short.
 - *Where this works.* For an x86-64 program on the kernel, and for x86-64, AArch64 and RISC-V programs in the emulator, each with its
   own frame layout (`struct rt_sigframe` of that CPU: AArch64's with the `fpsimd_context` record and a frame record above it, RISC-V's
-  with the double-precision registers). A LoongArch program gets no handlers: a signal with a handler stays pending there, where
-  `sigpending`, `sigtimedwait` (`sigwait`) and `sigsuspend` find it.
+  with the double-precision registers).
+- *LoongArch.* The frame (`sigcontext` followed by the floating-point record and the record that ends the list), the page a handler
+  returns through, `rt_sigreturn` (which also takes the LSX and LASX records Linux writes for a thread that used the vector registers)
+  and the restart of a call are there, and the emulator's delivery points take a LoongArch thread like any other. But nothing runs a
+  LoongArch program yet: the emulator has no LoongArch guest CPU, and the LoongArch port of the kernel has no user mode. Until one of
+  them exists the code is only reached by its tests, which compare the frame with the ones Linux makes.
 
 The code is `LinuxSignals.cpp` (`deliver_signals`, `signal_return`, `deliver_fault`); the kernel calls it from `on_syscall`,
 `on_user_tick` / `on_user_fault` in `Kernel/UserMode.cpp`, the emulator from `EmulatedProcess::thread_loop`.
@@ -78,8 +82,8 @@ back to `read` and `write`.
 
 ## Not there yet
 
-- Signal handlers for LoongArch programs; the SVE, SME and RISC-V vector registers in a handler's frame (only the general, NEON and
-  floating-point registers are kept); queued real-time signals (signals of one kind do not queue, and
+- Something that runs a LoongArch program (see *LoongArch* above); the SVE, SME, RISC-V vector and LoongArch LSX / LASX registers in a
+  handler's frame (only the general, NEON and floating-point registers are kept); queued real-time signals (signals of one kind do not queue, and
   `sigqueue`'s value is not kept); stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` do nothing); Ctrl+C as `SIGINT` (it still
   ends the program); the AVX halves of the vector registers in a handler's frame; POSIX timers (`timer_create`).
 - Copy-on-write for `fork`, and a `vfork` child that shares its parent's memory.
@@ -90,7 +94,9 @@ back to `read` and `write`.
 
 ## Tests
 
-- `tests/run_host_tests.sh LinuxSyscallTest`: the calls one by one, with bad pointers and sizes.
+- `tests/run_host_tests.sh LinuxSyscallTest`: the calls one by one, with bad pointers and sizes. The LoongArch signal frame is compared
+  byte for byte with frames a LoongArch program was given under qemu's user mode (`tests/linux/sigframe_loongarch.c`, checked-in output,
+  `tests/linux/build_sigframe_loongarch.sh`), and `rt_sigreturn` is given those frames.
 - `tests/run_host_tests.sh LinuxForkTest`: `tests/linux/forktest.c` and `signaltest.c` (no libc) under the emulator, compared with
   what the same programs print on the build machine's own Linux kernel. `signaltest.c` is also run as an AArch64 and a RISC-V program
   (checked-in builds, `tests/linux/build_signaltest.sh`), compared with what those print under qemu's user mode.
