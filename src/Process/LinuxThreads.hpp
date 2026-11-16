@@ -25,10 +25,10 @@ namespace linuxabi {
 
 // The thread calls of the Linux interface. They need the process's runtime (the thing that starts CPU threads and does the waiting); without one only the single-thread
 // forms work and clone() says -ENOSYS.
-//   clone: only the flag set a threading library uses (VM, FS, FILES, SIGHAND, THREAD, plus SETTLS and the tid pointers). The caller's registers are copied for the
-//   child by whoever runs the program (Process::take_clone).
+//   clone: with CLONE_THREAD only the flag set a threading library uses (VM, FS, FILES, SIGHAND, THREAD, plus SETTLS and the tid pointers). The caller's registers are
+//   copied for the child by whoever runs the program (Process::take_clone). Without CLONE_THREAD it is a fork (LinuxProcess.hpp: sys_fork).
 uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* args);
-// clone3(struct clone_args*, size), what glibc tries first: the same threads as sys_clone (EINVAL for a pidfd, an exit signal, set_tid or a cgroup).
+// clone3(struct clone_args*, size), what glibc tries first: the same threads and forks as sys_clone (EINVAL for a pidfd, set_tid or a cgroup).
 uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size);
 //   futex: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAIT_BITSET, WAKE_BITSET, LOCK_PI, LOCK_PI2, TRYLOCK_PI, UNLOCK_PI (no priority is lent; the private
 //   flag ignored); the rest (the requeue-PI pair, WAKE_OP) is -ENOSYS.

@@ -67,6 +67,7 @@ Process::~Process() {
   for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot)
     if (files_.kind(slot) == DescriptorKind::File || files_.kind(slot) == DescriptorKind::Directory) files_.close(slot);
   if (ObjectManager* objects = system_objects()) {
+    if (binding_.abi == SyscallAbi::Linux) objects->unlock_all(&linux_state_);      // (the record locks fcntl() gave the process)
     for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
       if (is_object_kind(files_.kind(slot))) objects->release(uint32_t(files_.token(slot)));
       else if (files_.kind(slot) == DescriptorKind::Pipe) windowsabi::pipe_token_release(files_.token(slot));

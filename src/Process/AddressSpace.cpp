@@ -163,6 +163,31 @@ bool AddressSpace::map_shared(uint64_t address, uint64_t size, uint8_t protectio
   return true;
 }
 
+bool AddressSpace::copy_from(const AddressSpace& source) {
+  if (regions_.count() != 0 || &source == this) return false;
+  top_ = source.top_;
+  for (uint64_t i = 0; i < source.regions_.count(); ++i) {
+    const Region& from = *source.regions_[i];
+    const bool mapped = from.shared ? map_shared(from.base, from.size, from.protection, from.storage, from.shared) : map(from.base, from.size, from.protection);
+    if (!mapped) return false;
+    Region& made = *regions_[regions_.count() - 1];      // (the regions come in address order: the new one is the last)
+    made.allocation = from.allocation;
+    made.attributes = from.attributes;
+  }
+  next_allocation_ = source.next_allocation_;
+  bool ok = true;
+  source.pages_.for_each(0, kUserTop, [&](uint64_t page, const uint8_t* memory) {
+    if (!ok) return;
+    uint8_t* copy = static_cast<uint8_t*>(allocator_.allocate_aligned(kPageSize, kPageSize));
+    if (!copy) { ok = false; return; }
+    if (!ByteView(copy, kPageSize).copy_from(ConstByteView(memory, kPageSize)) || !pages_.set(page, copy)) {
+      allocator_.deallocate(copy);
+      ok = false;
+    }
+  });
+  return ok;
+}
+
 SharedMemory* AddressSpace::shared_at(uint64_t address) const {
   const uint64_t i = first_ending_after(address);
   return i < regions_.count() && regions_[i]->base <= address ? regions_[i]->shared : nullptr;

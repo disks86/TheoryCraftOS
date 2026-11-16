@@ -18,6 +18,7 @@
 #include "Process/Win32k/Win32k.hpp"
 #include "Kernel/UserMode.hpp"
 #include "Process/ImageCache.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Hardware/CentralProcessingUnit/ICentralProcessingUnit.hpp"
 #include "Kernel/Delay.hpp"
 #include "Executable/ExecutableKind.hpp"
@@ -311,6 +312,11 @@ Frame* on_syscall(Frame* frame, void*) {
   self->syscall_frame = nullptr;
   process::Process::LinuxThreadState::CloneRequest clone;
   if (process->take_clone(&clone) && !task->start_linux_thread(*frame, clone)) frame->rax = uint64_t(-int64_t{11});      // clone()/clone3(): -EAGAIN if no thread
+  process::LinuxProcessState::ForkRequest fork;
+  if (process->take_fork(&fork) && !task->start_fork(*frame, fork)) {      // fork(): -EAGAIN if no process
+    process::linuxabi::fork_failed(*process, fork.pid);
+    frame->rax = uint64_t(-int64_t{11});
+  }
   uint64_t fs = 0, gs = 0;
   const bool fs_changed = process->take_fs_change(&fs), gs_changed = process->take_gs_change(&gs);
   if (fs_changed || gs_changed) set_current_user_bases(fs_changed, fs, gs_changed, gs);      // arch_prctl
@@ -1179,6 +1185,38 @@ uint32_t Task::spawn_process(const process::ChildSpec& spec) {
   return 0;
 }
 
+bool Task::start_fork(const Frame& frame, const process::LinuxProcessState::ForkRequest& request) {
+  reap_children(false);
+  reap_orphans();
+  void* memory = allocator_.allocate(sizeof(Child));
+  if (!memory) return false;
+  Child* child = new (memory) Child();
+  child->owner = &allocator_;
+  auto discard = [&]() { child->~Child(); allocator_.deallocate(child); };
+  child->pid = request.pid;
+  child->program = UniquePointer<process::UserProgram>::make(allocator_, allocator_, request.pid, program.host());
+  if (!child->program) { discard(); return false; }
+  process::UserProgram& p = *child->program;
+  p.address_space().set_reserved(reserved_ranges());
+  const Thread* me = current_thread();
+  if (!p.fork_from(program, request, me ? me->user_fs : 0)) { discard(); return false; }
+  // Its first thread is made but not started: it gets the caller's registers as they are at the end of the call, 0 as the result, and its own stack if one was given.
+  child->task = usermode::spawn(p, allocator_, name, true);
+  UserThread* first = child->task ? child->task->first_thread : nullptr;
+  if (!first) { discard(); return false; }
+  frame_to_context(frame, &first->saved);
+  first->saved.gpr[process::X86Context::kRax] = 0;
+  if (request.stack != 0) first->saved.gpr[process::X86Context::kRsp] = request.stack;
+  first->start_context_set = true;
+  child->task->parent_id = program.process()->id();
+  child->task->process_mask = process_mask;
+  if (!child->task->start_first_thread()) { discard(); return false; }
+  child->started = true;
+  child->next = children;
+  children = child;
+  return true;
+}
+
 static bool terminate_child(Task::Child* c, uint32_t code) {
   if (c->task->program.process()->exited()) return false;
   if (!c->started) {      // it never ran: there is no thread to stop
@@ -1258,6 +1296,12 @@ bool Task::query_child(uint64_t pid, bool* exited, uint32_t* code) {
   return false;
 }
 
+uint32_t Task::child_exit_signal(uint64_t pid) {
+  for (Child* c = children; c; c = c->next)
+    if (c->pid == pid) return c->task->program.process()->linux_state().exit_signal;
+  return 0;
+}
+
 bool Task::process_not_started(uint64_t pid) {
   return with_child(*this, pid, [&](Child* c) { return !c->started; });
 }
@@ -1282,6 +1326,8 @@ void Task::reap_children(bool all) {
       continue;
     }
     if (process::ObjectManager* objects = process::system_objects()) objects->process_exited(c->pid, c->task->program.process()->exit_code());
+    if (process::Process* parent = program.process(); parent && parent->abi() == process::SyscallAbi::Linux)
+      process::linuxabi::note_child_exit(*parent, c->pid, c->task->program.process()->exit_code(), c->task->program.process()->linux_state().exit_signal);      // (kept for wait(): the record itself goes now)
     *link = c->next;
     c->~Child();
     allocator_.deallocate(c);

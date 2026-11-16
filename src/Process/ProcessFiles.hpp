@@ -129,6 +129,9 @@ class ProcessFiles {
   // What a Linux program started by execve gets: every descriptor of `parent` that is not close-on-exec, at the same number (the standard ones too, replacing this table's
   // console descriptors). `copy_token` as for inherit_from. How many were copied.
   uint32_t inherit_for_exec(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
+  // What a Linux process made by fork() gets: every descriptor of `parent` at the same number with its flags (the open files are shared, so is each file's position),
+  // the current folder and the program file. This table must be new. `copy_token` as for inherit_from. How many were copied.
+  uint32_t inherit_for_fork(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token));
   // The one descriptor `slot` of `parent`, inheritable or not, with its handle flags, if this table has nothing at that number yet. False if the parent has nothing there or this
   // table does.
   bool adopt_from(const ProcessFiles& parent, uint64_t slot, void (*copy_token)(DescriptorKind kind, uint64_t token));

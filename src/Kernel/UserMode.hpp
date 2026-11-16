@@ -122,6 +122,10 @@ struct Task final : process::IProcessRuntime {
   // A Linux thread that clone()/clone3() asked for (Process::take_clone after the call), started as a copy of the calling thread's registers in `frame`. False
   // if it could not be (the call then fails with EAGAIN).
   bool start_linux_thread(const Frame& frame, const process::Process::LinuxThreadState::CloneRequest& clone);
+  bool supports_linux_fork() override { return true; }
+  // The process that fork() asked for (Process::take_fork after the call): a copy of this program whose one thread is a copy of the calling thread's registers in
+  // `frame`, with 0 as the call's result. False if it could not be made (the call then fails with EAGAIN).
+  bool start_fork(const Frame& frame, const process::LinuxProcessState::ForkRequest& request);
   bool resume_thread(uint64_t id) override;
   uint64_t current_thread_id() override;
   void request_suspend(uint64_t id) override;
@@ -149,6 +153,7 @@ struct Task final : process::IProcessRuntime {
   uint32_t spawn_process(const process::ChildSpec& spec) override;
   uint32_t spawn_process_for(uint64_t parent_pid, const process::ChildSpec& spec) override;
   bool query_child(uint64_t pid, bool* exited, uint32_t* code) override;
+  uint32_t child_exit_signal(uint64_t pid) override;
   bool terminate_process(uint64_t pid, uint32_t code) override;
   bool resume_process(uint64_t pid) override;
   bool process_not_started(uint64_t pid) override;

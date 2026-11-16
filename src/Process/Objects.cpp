@@ -1225,6 +1225,7 @@ bool ObjectManager::pipe_info(uint32_t id, PipeInfo* out) {
 
 struct ObjectManager::RangeLock {
   bool used = false, exclusive = false;
+  bool record = false;      // a POSIX record lock (fcntl): those only meet each other, as on Linux, where flock() and fcntl() locks do not see one another
   const void* owner = nullptr;
   uint64_t offset = 0, length = 0;
   char path[260] = {};
@@ -1255,7 +1256,7 @@ ObjectManager::LockResult ObjectManager::lock_range_locked(StringView path, cons
   if (!lock_table_locked(path)) return LockResult::Full;
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
     const RangeLock& l = locks_[i];
-    if (!l.used || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    if (!l.used || l.record || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
     if (l.owner == owner) { if (exclusive) return LockResult::Conflict; continue; }      // (an open file does not lock itself out, except with an exclusive lock over its own)
     if (l.exclusive || exclusive) return LockResult::Conflict;      // (two shared locks may overlap, even of one file; anything with an exclusive one may not)
   }
@@ -1282,7 +1283,7 @@ ObjectManager::LockResult ObjectManager::lock_whole_locked(StringView path, cons
   for (uint32_t i = 0; i < kMaxLocks; ++i) {
     RangeLock& l = locks_[i];
     if (!l.used) { if (!free_entry) free_entry = &l; continue; }
-    if (l.length == 0 || !same_name(l.path, l.path_size, path)) continue;
+    if (l.length == 0 || l.record || !same_name(l.path, l.path_size, path)) continue;
     if (l.owner == owner) { if (l.offset == 0 && l.length == kWholeFile) own = &l; continue; }
     if (l.exclusive || exclusive) return LockResult::Conflict;
   }
@@ -1303,13 +1304,68 @@ ObjectManager::LockResult ObjectManager::lock_whole_locked(StringView path, cons
   return LockResult::Granted;
 }
 
+// POSIX record locks. Ranges are kept as [offset, offset + length - 1] with length >= 1; "to the end of the file" is a length that reaches the last offset.
+ObjectManager::LockResult ObjectManager::record_lock_locked(StringView path, const void* owner, uint64_t offset, uint64_t length, RecordKind kind, bool test_only,
+                                                             RecordLock* blocker) {
+  if (length == 0) return LockResult::Granted;
+  if (!lock_table_locked(path)) return LockResult::Full;
+  const uint64_t last = length - 1 > ~uint64_t{0} - offset ? ~uint64_t{0} : offset + (length - 1);
+  uint32_t free_entries = 0, needed = kind == RecordKind::Unlock ? 0 : 1;
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    const RangeLock& l = locks_[i];
+    if (!l.used) { ++free_entries; continue; }
+    if (!l.record || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    const uint64_t l_last = l.offset + (l.length - 1);
+    if (l.owner == owner) {
+      if (l.offset < offset && l_last > last) ++needed;      // the range falls inside it: it becomes two
+      continue;
+    }
+    if (kind != RecordKind::Unlock && (l.exclusive || kind == RecordKind::Exclusive)) {
+      if (blocker) *blocker = RecordLock{l.offset, l.length, l.exclusive, l.owner};
+      return LockResult::Conflict;
+    }
+  }
+  if (test_only) return LockResult::Granted;
+  if (needed > free_entries) return LockResult::Full;
+  auto add = [&](uint64_t from, uint64_t to, bool exclusive) {      // (a free entry is there: counted above)
+    for (uint32_t i = 0; i < kMaxLocks; ++i) {
+      RangeLock& l = locks_[i];
+      if (l.used) continue;
+      l = RangeLock();
+      l.used = l.record = true;
+      l.exclusive = exclusive;
+      l.owner = owner;
+      l.offset = from;
+      l.length = to - from == ~uint64_t{0} ? ~uint64_t{0} : to - from + 1;
+      for (uint32_t k = 0; k < path.size(); ++k) l.path[k] = path[k];
+      l.path_size = static_cast<uint32_t>(path.size());
+      return;
+    }
+  };
+  // What the owner had over the range goes: a lock that sticks out on a side keeps that side.
+  bool released = false;
+  for (uint32_t i = 0; i < kMaxLocks; ++i) {
+    RangeLock& l = locks_[i];
+    if (!l.used || !l.record || l.owner != owner || !same_name(l.path, l.path_size, path) || !ranges_overlap(l.offset, l.length, offset, length)) continue;
+    const uint64_t l_first = l.offset, l_last = l.offset + (l.length - 1);
+    const bool was_exclusive = l.exclusive;
+    l.used = false;
+    released = true;
+    if (l_first < offset) add(l_first, offset - 1, was_exclusive);
+    if (l_last > last) add(last + 1, l_last, was_exclusive);
+  }
+  if (kind != RecordKind::Unlock) add(offset, last, kind == RecordKind::Exclusive);
+  if (released) sync_.notify_all();      // whoever waits for a piece of the range looks again
+  return LockResult::Granted;
+}
+
 bool ObjectManager::unlock_range(StringView path, const void* owner, uint64_t offset, uint64_t length) {
   Locked hold(sync_);
   if (!locks_) return false;
   for (int pass = 0; pass < 2; ++pass) {      // an exclusive lock of exactly this range goes before a shared one
     for (uint32_t i = 0; i < kMaxLocks; ++i) {
       RangeLock& l = locks_[i];
-      if (!l.used || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path) || l.exclusive != (pass == 0)) continue;
+      if (!l.used || l.record || l.owner != owner || l.offset != offset || l.length != length || !same_name(l.path, l.path_size, path) || l.exclusive != (pass == 0)) continue;
       l.used = false;
       sync_.notify_all();      // whoever waits for the range looks again
       return true;

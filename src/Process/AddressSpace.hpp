@@ -84,6 +84,9 @@ class AddressSpace final : public IUserMemory {
   AddressSpace(const AddressSpace&) = delete;
   AddressSpace& operator=(const AddressSpace&) = delete;
 
+  // Where the space's own memory comes from (for memory made to be mapped into it).
+  allocators::IAllocator& allocator() const { return allocator_; }
+
   static constexpr uint64_t round_down(uint64_t value) { return value & ~(kPageSize - 1); }
   // False on overflow (the value has no page-aligned ceiling).
   static bool round_up(uint64_t value, uint64_t* out) {
@@ -117,6 +120,10 @@ class AddressSpace final : public IUserMemory {
   // Makes the region that starts at `base` exactly `size` bytes (rounded up to pages) long: new pages are zero, a size of 0 removes it. Fails if the pages
   // after it are in use, past kUserTop, or over the byte budget. This is how a heap grows.
   bool resize(uint64_t base, uint64_t size);
+  // Makes this (empty) address space a copy of `source`, for fork(): the same regions with the same permissions; every private page that has memory gets a copy of
+  // its bytes, and what is shared (a view of a file in memory, a section) is mapped again, so both see the same memory there. False if this space is not
+  // empty or memory ran out (the space is then to be thrown away).
+  bool copy_from(const AddressSpace& source);
   // The region that contains `address`: where it starts and how long it is.
   bool region_extent(uint64_t address, uint64_t* base, uint64_t* size) const;
   // The whole allocation that contains `address`: the pages one map() call created, which stay together even after protect() or unmap() cut them into

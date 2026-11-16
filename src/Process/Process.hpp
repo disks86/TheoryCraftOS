@@ -18,6 +18,7 @@
 #pragma once
 #include <stdint.h>
 #include "Process/CommonDialog.hpp"
+#include "Process/LinuxState.hpp"
 #include "Process/ProcessFiles.hpp"
 #include "Process/StartupSpec.hpp"
 #include "Process/Syscall.hpp"
@@ -141,6 +142,9 @@ class IProcessRuntime {
   virtual uint64_t current_thread_id() = 0;
   // Does the runtime start the threads that Linux clone() asks for (it must copy the calling thread's registers: Process::take_clone)? Without it clone() says -ENOSYS.
   virtual bool supports_linux_threads() { return false; }
+  // Does the runtime make the processes that Linux fork() asks for (it must copy the program and the calling thread's registers: Process::take_fork)? Without it
+  // fork() says -ENOSYS.
+  virtual bool supports_linux_fork() { return false; }
   // Stopping and ending other threads. A thread asked to suspend stops at its next system call or timer tick ("parked"); its registers are then kept.
   virtual void request_suspend(uint64_t id) { (void)id; }
   virtual void request_resume(uint64_t id) { (void)id; }
@@ -164,6 +168,8 @@ class IProcessRuntime {
   virtual bool resume_process(uint64_t pid) { (void)pid; return false; }
   // A process this one started (spawn_process): has it ended, and with which code? False if it is not one of this process's children.
   virtual bool query_child(uint64_t pid, bool* exited, uint32_t* code) { (void)pid; (void)exited; (void)code; return false; }
+  // For a child that has ended (a Linux process): the signal that ended it (LinuxProcessState::exit_signal), 0 if it ended by itself or is not known.
+  virtual uint32_t child_exit_signal(uint64_t pid) { (void)pid; return 0; }
   // A program made suspended whose first thread has not been resumed yet (it has run nothing).
   virtual bool process_not_started(uint64_t pid) { (void)pid; return false; }
   // The machine: how many cores threads can run on, and the memory.
@@ -396,6 +402,13 @@ class Process {
   LinuxThreadState& linux_threads() { return linux_; }
   bool take_clone(LinuxThreadState::CloneRequest* out) { *out = linux_.clone; const bool p = linux_.clone.pending; linux_.clone = LinuxThreadState::CloneRequest(); return p; }
 
+  // --- the rest of a Linux process's own state (signals, ids, limits, timers, the processes fork() made)
+  LinuxProcessState& linux_state() { return linux_state_; }
+  // fork() asked for a child (see LinuxProcessState::ForkRequest): true once after the call that did.
+  bool take_fork(LinuxProcessState::ForkRequest* out) { *out = linux_state_.fork; const bool p = linux_state_.fork.pending; linux_state_.fork = LinuxProcessState::ForkRequest(); return p; }
+  // For a child made by fork(): the break and the place memory is handed out from, as the parent has them.
+  void set_memory_cursors(uint64_t heap_break, uint64_t mmap_cursor) { heap_break_ = heap_break; mmap_cursor_ = mmap_cursor; }
+
   // --- blocking helpers for the system calls: they give up the process lock while the thread is stuck.
   void block_sleep(uint64_t ns);
   void block_yield();
@@ -424,6 +437,7 @@ class Process {
   IProcessRuntime* runtime_ = nullptr;
   ThreadRecord threads_[kMaxThreads];
   LinuxThreadState linux_;
+  LinuxProcessState linux_state_;
   ThreadSupport thread_support_;
   uint32_t thread_counter_ = 0, thread_exit_code_ = 0;
   bool thread_exit_pending_ = false;

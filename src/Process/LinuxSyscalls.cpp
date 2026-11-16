@@ -18,21 +18,22 @@
 #include "Process/AddressSpace.hpp"
 #include "Process/LinuxExec.hpp"
 #include "Process/LinuxFiles.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/LinuxThreads.hpp"
 #include "Process/MemoryFile.hpp"
 #include "Process/Process.hpp"
 #include "Process/Syscall.hpp"
 
-// The Linux system-call interface: the calls a statically linked program needs to talk to the console, read the clock, sleep and exit, its files, threads, and
-// AF_UNIX sockets (LinuxSockets.cpp, shared with Windows programs). Numbers differ by
+// The Linux system-call interface: the console, the clock, memory, files (LinuxFiles.cpp), threads (LinuxThreads.cpp), processes and signals (LinuxProcess.cpp,
+// LinuxSignals.cpp), and AF_UNIX sockets (LinuxSockets.cpp, shared with Windows programs). docs/LinuxSyscalls.md lists what there is. Numbers differ by
 // CPU: x86-64 has its own table, AArch64 and RISC-V 64 share the "generic" one. A call not listed returns -ENOSYS, which is what libc expects from a
 // kernel that lacks it. Results are the value or -errno in the result register.
 namespace process {
 
 namespace {
 
-constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEexist = 17, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38;
+constexpr int64_t kEperm = 1, kEnoent = 2, kEnxio = 6, kEnotty = 25, kEspipe = 29, kEnomem = 12, kEacces = 13, kEnodev = 19, kEexist = 17, kEbadf = 9, kEfault = 14, kEinval = 22, kEnosys = 38, kEopnotsupp = 95;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u;      // what Linux allows in one read or write
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 
@@ -42,7 +43,18 @@ enum class Call : uint8_t { None, Clone3, Read, Write, Writev, Close, Getpid, Ge
   Truncate, Ftruncate, Fsync, Dup, Dup2, Dup3, Fcntl, Readlink, Statx, Umask, Clone, Futex, Tgkill, SchedGetaffinity, Prctl, Succeed,
   Socket, Socketpair, Pipe, Pipe2, Eventfd, Eventfd2, TimerfdCreate, TimerfdSettime, TimerfdGettime, Signalfd, Signalfd4, EpollCreate, EpollCreate1,
   EpollCtl, EpollWait, EpollPwait, EpollPwait2, Bind, Connect, Listen, Accept, Accept4, Sendto, Recvfrom, Sendmsg, Recvmsg, Sendmmsg, Recvmmsg, Shutdown, Getsockname, Getpeername,
-  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate, Execve, Execveat, Statfs, Fstatfs, Link, Linkat, Flock };
+  Setsockopt, Getsockopt, Poll, Ppoll, Select, Pselect6, MemfdCreate, Fallocate, Execve, Execveat, Statfs, Fstatfs, Link, Linkat, Flock,
+  // files
+  Creat, Symlink, Symlinkat, Preadv, Pwritev, Preadv2, Pwritev2, Sendfile, CopyFileRange, Splice, Readahead, Fadvise, SyncFileRange, Syncfs, Getdents, Openat2, CloseRange,
+  Xattr, Refuse,
+  // signals
+  RtSigpending, RtSigtimedwait, RtSigqueueinfo, RtTgsigqueueinfo, RtSigsuspend, RtSigreturn, Kill, Tkill, Pause, Alarm, Getitimer, Setitimer,
+  // processes
+  Fork, Wait4, Waitid, Getpgrp, Getpgid, Setpgid, Setsid, Getsid, Geteuid, Getegid, Setuid, Setgid, Setreuid, Setregid, Setresuid, Setresgid, Getresuid, Getresgid, Setfsuid, Setfsgid,
+  Getgroups, Setgroups, Capget, Capset, Getrlimit, Setrlimit, Getrusage, Times, Sysinfo, Getpriority, Setpriority, SchedSetparam, SchedGetparam, SchedSetscheduler,
+  SchedGetscheduler, SchedPriorityMax, SchedPriorityMin, SchedRrInterval, SchedSetaffinity, SchedSetattr, SchedGetattr, Getcpu, Personality, Membarrier, GetRobustList,
+  // memory
+  Mremap, Msync, Mincore, Mlock, Mlockall };
 constexpr uint16_t kAbsent = 0xFFFF;      // this CPU's table has no such call
 
 struct NumberEntry {
@@ -53,7 +65,7 @@ struct NumberEntry {
 constexpr NumberEntry kNumbers[] = {
     {0, 63, Call::Read},           {1, 64, Call::Write},        {20, 66, Call::Writev},       {3, 57, Call::Close},
     {39, 172, Call::Getpid},       {186, 178, Call::Gettid},    {102, 174, Call::Getuid},     {104, 176, Call::Getgid},
-    {107, 175, Call::Getuid},      {108, 177, Call::Getgid},    {118, 148, Call::Getresid},   {120, 150, Call::Getresid},      // (geteuid, getegid, getresuid, getresgid: root)
+    {107, 175, Call::Geteuid},     {108, 177, Call::Getegid},   {118, 148, Call::Getresuid},  {120, 150, Call::Getresgid},
     {60, 93, Call::Exit},          {231, 94, Call::ExitGroup},  {63, 160, Call::Uname},       {228, 113, Call::ClockGettime},
     {229, 114, Call::ClockGetres}, {35, 101, Call::Nanosleep},    {230, 115, Call::ClockNanosleep}, {24, 124, Call::SchedYield}, {218, 96, Call::SetTidAddress},
     {12, 214, Call::Brk},          {9, 222, Call::Mmap},        {11, 215, Call::Munmap},      {10, 226, Call::Mprotect},
@@ -73,8 +85,8 @@ constexpr NumberEntry kNumbers[] = {
     {90, kAbsent, Call::Succeed},  {91, 52, Call::Succeed},     {268, 53, Call::Succeed},     {92, kAbsent, Call::Succeed},
     {93, 55, Call::Succeed},       {94, kAbsent, Call::Succeed}, {260, 54, Call::Succeed},    {280, 88, Call::Succeed},
     {162, 81, Call::Succeed},
-    {56, 220, Call::Clone},        {435, 435, Call::Clone3},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tgkill},     {204, 123, Call::SchedGetaffinity},
-    {203, 122, Call::Succeed},     {157, 167, Call::Prctl},
+    {56, 220, Call::Clone},        {435, 435, Call::Clone3},        {202, 98, Call::Futex},      {234, 131, Call::Tgkill},     {200, 130, Call::Tkill},     {204, 123, Call::SchedGetaffinity},
+    {203, 122, Call::SchedSetaffinity}, {157, 167, Call::Prctl},
     {59, 221, Call::Execve},       {322, 281, Call::Execveat},
     // sockets (AF_UNIX: LinuxSockets.cpp)
     {22, kAbsent, Call::Pipe},     {293, 59, Call::Pipe2},      {284, kAbsent, Call::Eventfd}, {290, 19, Call::Eventfd2},
@@ -92,6 +104,44 @@ constexpr NumberEntry kNumbers[] = {
     // the volume of a file, hard links, whole-file locks (what Qt's QStorageInfo, QSaveFile and QLockFile use)
     {137, 43, Call::Statfs},       {138, 44, Call::Fstatfs},    {86, kAbsent, Call::Link},   {265, 37, Call::Linkat},
     {73, 32, Call::Flock},
+    // more of the file calls (LinuxFiles.cpp)
+    {85, kAbsent, Call::Creat},    {88, kAbsent, Call::Symlink}, {266, 36, Call::Symlinkat},  {295, 69, Call::Preadv},
+    {296, 70, Call::Pwritev},      {327, 286, Call::Preadv2},   {328, 287, Call::Pwritev2},   {40, 71, Call::Sendfile},
+    {326, 285, Call::CopyFileRange}, {275, 76, Call::Splice},   {276, 77, Call::Splice},      {278, 75, Call::Splice},
+    {187, 213, Call::Readahead},   {221, 223, Call::Fadvise},   {277, 84, Call::SyncFileRange}, {306, 267, Call::Syncfs},
+    {78, kAbsent, Call::Getdents}, {437, 437, Call::Openat2},   {436, 436, Call::CloseRange},
+    {132, kAbsent, Call::Succeed}, {235, kAbsent, Call::Succeed}, {261, kAbsent, Call::Succeed}, {452, 452, Call::Succeed},      // utime, utimes, futimesat, fchmodat2
+    {251, 30, Call::Succeed},      {252, 31, Call::Succeed},                                                                       // ioprio_set, ioprio_get
+    // extended attributes (setxattr ... fremovexattr): no file system here keeps any
+    {188, 5, Call::Xattr},         {189, 6, Call::Xattr},       {190, 7, Call::Xattr},        {191, 8, Call::Xattr},
+    {192, 9, Call::Xattr},         {193, 10, Call::Xattr},      {194, 11, Call::Xattr},       {195, 12, Call::Xattr},
+    {196, 13, Call::Xattr},        {197, 14, Call::Xattr},      {198, 15, Call::Xattr},       {199, 16, Call::Xattr},
+    // what only an administrator of a real system does: chroot, mount, umount2, pivot_root, swapon, swapoff, reboot, sethostname, setdomainname, syslog, ptrace,
+    // settimeofday, clock_settime, adjtimex, clock_adjtime, unshare, setns, acct
+    {161, 51, Call::Refuse},       {165, 40, Call::Refuse},     {166, 39, Call::Refuse},      {155, 41, Call::Refuse},
+    {167, 224, Call::Refuse},      {168, 225, Call::Refuse},    {169, 142, Call::Refuse},     {170, 161, Call::Refuse},
+    {171, 162, Call::Refuse},      {103, 116, Call::Refuse},    {101, 117, Call::Refuse},     {164, 170, Call::Refuse},
+    {227, 112, Call::Refuse},      {159, 171, Call::Refuse},    {305, 266, Call::Refuse},     {272, 97, Call::Refuse},
+    {308, 268, Call::Refuse},      {163, 89, Call::Refuse},
+    // signals (LinuxSignals.cpp)
+    {127, 136, Call::RtSigpending}, {128, 137, Call::RtSigtimedwait}, {129, 138, Call::RtSigqueueinfo}, {297, 240, Call::RtTgsigqueueinfo},
+    {130, 133, Call::RtSigsuspend}, {15, 139, Call::RtSigreturn}, {62, 129, Call::Kill},       {34, kAbsent, Call::Pause},
+    {37, kAbsent, Call::Alarm},    {36, 102, Call::Getitimer},  {38, 103, Call::Setitimer},
+    // processes (LinuxProcess.cpp)
+    {57, kAbsent, Call::Fork},     {58, kAbsent, Call::Fork},   {61, 260, Call::Wait4},       {247, 95, Call::Waitid},
+    {111, kAbsent, Call::Getpgrp}, {121, 155, Call::Getpgid},   {109, 154, Call::Setpgid},    {112, 157, Call::Setsid},
+    {124, 156, Call::Getsid},      {105, 146, Call::Setuid},    {106, 144, Call::Setgid},     {113, 145, Call::Setreuid},
+    {114, 143, Call::Setregid},    {117, 147, Call::Setresuid}, {119, 149, Call::Setresgid},  {122, 151, Call::Setfsuid},
+    {123, 152, Call::Setfsgid},    {115, 158, Call::Getgroups}, {116, 159, Call::Setgroups},  {125, 90, Call::Capget},
+    {126, 91, Call::Capset},       {97, 163, Call::Getrlimit},  {160, 164, Call::Setrlimit},  {98, 165, Call::Getrusage},
+    {100, 153, Call::Times},       {99, 179, Call::Sysinfo},    {140, 141, Call::Getpriority}, {141, 140, Call::Setpriority},
+    {142, 118, Call::SchedSetparam}, {143, 121, Call::SchedGetparam}, {144, 119, Call::SchedSetscheduler}, {145, 120, Call::SchedGetscheduler},
+    {146, 125, Call::SchedPriorityMax}, {147, 126, Call::SchedPriorityMin}, {148, 127, Call::SchedRrInterval}, {314, 274, Call::SchedSetattr},
+    {315, 275, Call::SchedGetattr}, {309, 168, Call::Getcpu},   {135, 92, Call::Personality}, {324, 283, Call::Membarrier},
+    {274, 100, Call::GetRobustList},
+    // more of memory
+    {25, 216, Call::Mremap},       {26, 227, Call::Msync},      {27, 232, Call::Mincore},     {149, 228, Call::Mlock},
+    {150, 229, Call::Mlock},       {325, 284, Call::Mlock},     {151, 230, Call::Mlockall},   {152, 231, Call::Mlockall},
 };
 
 uint64_t error(int64_t errno_value) { return uint64_t(-errno_value); }
@@ -156,6 +206,12 @@ uint64_t map_file_copy(Process& process, AddressSpace& space, OpenObject& object
     return error(kEnomem);
   }
   if (!space.map(where, size, uint8_t(prot))) return error(kEnomem);
+  {      // (told apart from anonymous memory: madvise(MADV_DONTNEED) must not turn a file's pages into zeros)
+    PageAttributes attributes;
+    attributes.type = PageAttributes::Mapped;
+    attributes.file_view = true;
+    space.set_attributes(where, size, attributes);
+  }
   const uint64_t file_size = object.file->size();
   const uint64_t available = offset < file_size ? file_size - offset : 0;
   const uint64_t copy = available < size ? available : size;
@@ -210,6 +266,27 @@ uint64_t map_memory_file(Process& process, AddressSpace& space, uint64_t address
   return where;
 }
 
+// MAP_SHARED | MAP_ANONYMOUS: memory that a child made by fork() goes on sharing with its parent (how programs that fork pass results back). It is one block of
+// memory, there from the start (a private mapping's pages come one by one as they are touched), which every copy of the mapping holds a use of. Larger
+// requests than this are given private memory, as before: nothing could be shared with them anyway until a fork, and reserving that much at once is worse.
+constexpr uint64_t kMaxSharedAnonymous = 64ull << 20;
+
+uint64_t map_shared_anonymous(Process& process, AddressSpace& space, uint64_t address, uint64_t size, uint64_t prot, uint64_t flags) {
+  uint64_t where = 0;
+  if (flags & kMapFixed) {
+    if (address % AddressSpace::kPageSize != 0) return error(kEinval);
+    where = address;
+  } else if (!space.find_free(size, address ? address : process.mmap_cursor(), &where)) {
+    return error(kEnomem);
+  }
+  BlockRef block(MemoryBlock::make(space.allocator(), size));
+  if (!block) return error(kEnomem);
+  if ((flags & kMapFixed) && !space.unmap(where, size)) return error(kEnomem);
+  if (!space.map_shared(where, size, uint8_t(prot), block.get()->storage(), block.get())) return error(kEnomem);      // (the mapping holds the block from here on)
+  if (!(flags & kMapFixed) && !address) process.set_mmap_cursor(where + size);
+  return where;
+}
+
 uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) {
   AddressSpace* space = process.address_space();
   if (!space) return error(kEnomem);
@@ -224,6 +301,7 @@ uint64_t do_mmap(Process& process, uint64_t address, uint64_t length, uint64_t p
     flags = (flags & ~kMapFixedNoreplace) | kMapFixed;
   }
   if (!(flags & kMapAnonymous)) return map_memory_file(process, *space, address, size, prot, flags, fd, offset);
+  if ((flags & kMapShared) && size <= kMaxSharedAnonymous) return map_shared_anonymous(process, *space, address, size, prot, flags);
   uint64_t where = 0;
   if (flags & kMapFixed) {
     if (address % AddressSpace::kPageSize != 0) return error(kEinval);
@@ -251,6 +329,114 @@ uint64_t do_mprotect(Process& process, uint64_t address, uint64_t length, uint64
   return space->protect(address, length, uint8_t(prot)) ? 0 : error(kEnomem);      // part of the range is not mapped
 }
 
+// mremap(old, old_size, new_size, flags, new_address): shrinking lets the tail go; growing takes the pages after the mapping when they are free, and
+// otherwise (with MREMAP_MAYMOVE) moves the mapping, pages and all, to a free place. A view of shared memory (a file in memory) cannot grow: the program maps
+// the file again, as it must after the file itself grew. MREMAP_FIXED and MREMAP_DONTUNMAP are not supported.
+uint64_t do_mremap(Process& process, uint64_t old_address, uint64_t old_length, uint64_t new_length, uint64_t flags) {
+  constexpr uint64_t kMayMove = 1;
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  uint64_t old_size = 0, new_size = 0;
+  if (flags & ~kMayMove) return error(kEinval);
+  if (old_address % AddressSpace::kPageSize != 0 || old_length == 0 || new_length == 0) return error(kEinval);
+  if (!AddressSpace::round_up(old_length, &old_size) || !AddressSpace::round_up(new_length, &new_size)) return error(kEinval);
+  if (old_address >= AddressSpace::kUserTop || old_size > AddressSpace::kUserTop - old_address || !space->check(old_address, old_size, 0)) return error(kEfault);
+  if (new_size == old_size) return old_address;
+  if (new_size < old_size) return space->unmap(old_address + new_size, old_size - new_size) ? old_address : error(kEnomem);
+  if (space->is_shared(old_address) || space->is_shared(old_address + old_size - AddressSpace::kPageSize)) return error(kEnomem);
+  uint8_t protection = 0;
+  PageAttributes attributes;
+  if (!space->protection_at(old_address + old_size - AddressSpace::kPageSize, &protection) || !space->attributes_at(old_address, &attributes)) return error(kEfault);
+  const uint64_t extra = new_size - old_size, old_end = old_address + old_size;
+  uint64_t free_at = 0;
+  if (space->find_free(extra, old_end, &free_at) && free_at == old_end) {      // room right behind it
+    if (!space->map(old_end, extra, protection)) return error(kEnomem);
+    if (attributes.type != PageAttributes::Private) space->set_attributes(old_end, extra, attributes);
+    return old_address;
+  }
+  if (!(flags & kMayMove)) return error(kEnomem);
+  uint64_t where = 0;
+  if (!space->find_free(new_size, process.mmap_cursor(), &where) || !space->map(where, new_size, protection)) return error(kEnomem);
+  // The regions of the old mapping keep their permissions at the new place; the pages that have memory are copied (the others read as zeros at both).
+  bool ok = true;
+  for (uint64_t i = space->region_index(old_address);; ++i) {
+    AddressSpace::RegionInfo info;
+    if (!space->region_at(i, &info) || info.base >= old_end) break;
+    const uint64_t from = info.base > old_address ? info.base : old_address;
+    const uint64_t to = info.base + info.size < old_end ? info.base + info.size : old_end;
+    if (info.protection != protection) ok = ok && space->protect(where + (from - old_address), to - from, info.protection);
+  }
+  if (attributes.type != PageAttributes::Private) ok = ok && space->set_attributes(where, new_size, attributes);
+  space->for_each_private_page(old_address, old_end, [&](uint64_t page, const uint8_t* memory) {
+    if (!ok) return;
+    uint8_t* copy = space->materialize(where + (page - old_address));
+    ok = copy && ByteView(copy, AddressSpace::kPageSize).copy_from(ConstByteView(memory, AddressSpace::kPageSize));
+  });
+  if (!ok) {
+    space->unmap(where, new_size);
+    return error(kEnomem);
+  }
+  space->unmap(old_address, old_size);
+  process.set_mmap_cursor(where + new_size);
+  return where;
+}
+
+// Is [address, address + length) a range of whole mapped pages (what msync, mlock and mincore want)? 0, or the error.
+uint64_t check_mapped(Process& process, uint64_t address, uint64_t length, uint64_t* size) {
+  AddressSpace* space = process.address_space();
+  if (!space) return error(kEnomem);
+  if (address % AddressSpace::kPageSize != 0 || !AddressSpace::round_up(length, size)) return error(kEinval);
+  if (*size == 0) return 0;
+  if (address >= AddressSpace::kUserTop || *size > AddressSpace::kUserTop - address || !space->check(address, *size, 0)) return error(kEnomem);
+  return 0;
+}
+
+// msync: a view of shared memory is written back to where it came from (nothing to do for a file in memory); private copies of a file are not the file's.
+uint64_t do_msync(Process& process, uint64_t address, uint64_t length, uint64_t flags) {
+  constexpr uint64_t kAsync = 1, kInvalidate = 2, kSync = 4;
+  if ((flags & ~(kAsync | kInvalidate | kSync)) || ((flags & kAsync) && (flags & kSync))) return error(kEinval);
+  uint64_t size = 0;
+  if (const uint64_t r = check_mapped(process, address, length, &size); r != 0) return r;
+  if (size != 0)
+    if (SharedMemory* shared = process.address_space()->shared_at(address)) shared->flush();
+  return 0;
+}
+
+// mincore(address, length, vec): one byte a page, 1 when the page has memory (nothing is ever paged out, so that is "in core").
+uint64_t do_mincore(Process& process, uint64_t address, uint64_t length, uint64_t vector) {
+  uint64_t size = 0;
+  if (const uint64_t r = check_mapped(process, address, length, &size); r != 0) return r;
+  AddressSpace& space = *process.address_space();
+  uint8_t chunk[256];
+  for (uint64_t page = 0, pages = size / AddressSpace::kPageSize; page < pages;) {
+    const uint64_t n = pages - page < sizeof(chunk) ? pages - page : sizeof(chunk);
+    for (uint64_t i = 0; i < n; ++i) chunk[i] = space.page_memory(address + (page + i) * AddressSpace::kPageSize) ? 1 : 0;
+    if (!process.write_user(vector + page, ConstByteView(chunk, n))) return error(kEfault);
+    page += n;
+  }
+  return 0;
+}
+
+// madvise: advice the kernel may ignore, except MADV_DONTNEED, which a program may count on: anonymous private pages read as zeros afterwards (allocators give
+// memory back this way and expect it clean when they take it again). Views of shared memory and copies of files keep their bytes.
+uint64_t do_madvise(Process& process, uint64_t address, uint64_t length, uint64_t advice) {
+  constexpr uint64_t kDontNeed = 4;
+  AddressSpace* space = process.address_space();
+  if (!space || advice != kDontNeed) return 0;
+  uint64_t size = 0;
+  if (const uint64_t r = check_mapped(process, address, length, &size); r != 0) return r;
+  const uint64_t end = address + size;
+  for (uint64_t at = address; at < end;) {      // (looked up again each time: discarding may cut regions)
+    AddressSpace::RegionInfo info;
+    if (!space->region_at(space->region_index(at), &info) || info.base >= end) break;
+    const uint64_t from = info.base > at ? info.base : at;
+    const uint64_t to = info.base + info.size < end ? info.base + info.size : end;
+    if (!info.storage && info.attributes.type == PageAttributes::Private) space->discard(from, to - from);
+    at = to;
+  }
+  return 0;
+}
+
 // --- thread pointer, terminal-ish and signal calls that C libraries make while starting up -------------------------------------------------------------
 
 constexpr uint64_t kArchSetGs = 0x1001, kArchSetFs = 0x1002, kArchGetFs = 0x1003, kArchGetGs = 0x1004;
@@ -267,19 +453,6 @@ uint64_t do_arch_prctl(Process& process, uint64_t code, uint64_t address) {
     case kArchGetGs: return process.write_user_u64(address, process.gs_base()) ? 0 : error(kEfault);
     default: return error(kEinval);
   }
-}
-
-// Writes `count` zero bytes to user memory (an empty structure the program asked to be filled).
-bool write_zeros(Process& process, uint64_t address, uint64_t count) {
-  uint8_t zeros[256] = {};
-  return count <= sizeof(zeros) && process.write_user(address, ConstByteView(zeros, count));
-}
-
-uint64_t do_prlimit(Process& process, uint64_t resource, uint64_t old_limit) {
-  if (!old_limit) return 0;
-  const uint64_t infinity = ~uint64_t{0};
-  const uint64_t current = resource == 3 ? 8ull << 20 : infinity;      // RLIMIT_STACK is the 8 MiB the stack was mapped with
-  return process.write_user_u64(old_limit, current) && process.write_user_u64(old_limit + 8, resource == 3 ? infinity : infinity) ? 0 : error(kEfault);
 }
 
 uint64_t do_getrandom(Process& process, uint64_t address, uint64_t length) {
@@ -312,6 +485,8 @@ class LinuxSyscalls final : public ISyscallInterface {
 
   uint64_t dispatch(Process& process, const SyscallRequest& r) const override {
     const uint64_t* a = r.args;
+    linuxabi::check_timers(process);      // (alarm, setitimer: a signal that is due is raised before the call)
+    if (process.exited()) return 0;
     switch (translate(arch_, r.number)) {
       case Call::Read: return linuxabi::sys_read(process, a[0], a[1], a[2]);
       case Call::Write: return linuxabi::sys_write(process, a[0], a[1], a[2]);
@@ -319,17 +494,56 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Close: return process.close_descriptor(a[0]) ? 0 : error(kEbadf);
       case Call::Getpid: return process.id();
       case Call::Gettid: return linuxabi::sys_gettid(process);
-      case Call::Getuid:
-      case Call::Getgid: return 0;
+      case Call::Getuid: return linuxabi::sys_id(process, linuxabi::IdCall::Getuid, 0, 0, 0);
+      case Call::Geteuid: return linuxabi::sys_id(process, linuxabi::IdCall::Geteuid, 0, 0, 0);
+      case Call::Getgid: return linuxabi::sys_id(process, linuxabi::IdCall::Getgid, 0, 0, 0);
+      case Call::Getegid: return linuxabi::sys_id(process, linuxabi::IdCall::Getegid, 0, 0, 0);
+      case Call::Setuid: return linuxabi::sys_id(process, linuxabi::IdCall::Setuid, a[0], 0, 0);
+      case Call::Setgid: return linuxabi::sys_id(process, linuxabi::IdCall::Setgid, a[0], 0, 0);
+      case Call::Setreuid: return linuxabi::sys_id(process, linuxabi::IdCall::Setreuid, a[0], a[1], 0);
+      case Call::Setregid: return linuxabi::sys_id(process, linuxabi::IdCall::Setregid, a[0], a[1], 0);
+      case Call::Setresuid: return linuxabi::sys_id(process, linuxabi::IdCall::Setresuid, a[0], a[1], a[2]);
+      case Call::Setresgid: return linuxabi::sys_id(process, linuxabi::IdCall::Setresgid, a[0], a[1], a[2]);
+      case Call::Getresuid: return linuxabi::sys_id(process, linuxabi::IdCall::Getresuid, a[0], a[1], a[2]);
+      case Call::Getresgid: return linuxabi::sys_id(process, linuxabi::IdCall::Getresgid, a[0], a[1], a[2]);
+      case Call::Setfsuid: return linuxabi::sys_id(process, linuxabi::IdCall::Setfsuid, a[0], 0, 0);
+      case Call::Setfsgid: return linuxabi::sys_id(process, linuxabi::IdCall::Setfsgid, a[0], 0, 0);
+      case Call::Getgroups: return linuxabi::sys_getgroups(process, a[0], a[1]);
+      case Call::Setgroups: return linuxabi::sys_setgroups(process, a[0], a[1]);
+      case Call::Getpgrp: return linuxabi::sys_getpgid(process, 0);
+      case Call::Getpgid: return linuxabi::sys_getpgid(process, a[0]);
+      case Call::Setpgid: return linuxabi::sys_setpgid(process, a[0], a[1]);
+      case Call::Getsid: return linuxabi::sys_getsid(process, a[0]);
+      case Call::Setsid: return linuxabi::sys_setsid(process);
+      case Call::Capget: return linuxabi::sys_capget(process, a[0], a[1]);
+      case Call::Capset: return linuxabi::sys_capset(process, a[0], a[1]);
+      case Call::Fork: return linuxabi::sys_fork(process, linuxabi::ForkOptions());      // (fork and vfork)
+      case Call::Wait4: return linuxabi::sys_wait4(process, a[0], a[1], a[2], a[3]);
+      case Call::Waitid: return linuxabi::sys_waitid(process, a[0], a[1], a[2], a[3], a[4]);
+      case Call::Getrlimit: return linuxabi::sys_prlimit(process, 0, a[0], 0, a[1]);
+      case Call::Setrlimit: return a[1] == 0 ? error(kEfault) : linuxabi::sys_prlimit(process, 0, a[0], a[1], 0);
+      case Call::Getrusage: return linuxabi::sys_getrusage(process, a[0], a[1]);
+      case Call::Times: return linuxabi::sys_times(process, a[0]);
+      case Call::Sysinfo: return linuxabi::sys_sysinfo(process, a[0]);
+      case Call::Getpriority: return linuxabi::sys_getpriority(process, a[0], a[1]);
+      case Call::Setpriority: return linuxabi::sys_setpriority(process, a[0], a[1], a[2]);
+      case Call::SchedSetparam: return linuxabi::sys_sched(process, linuxabi::SchedCall::SetParam, a[0], a[1], 0, 0);
+      case Call::SchedGetparam: return linuxabi::sys_sched(process, linuxabi::SchedCall::GetParam, a[0], a[1], 0, 0);
+      case Call::SchedSetscheduler: return linuxabi::sys_sched(process, linuxabi::SchedCall::SetScheduler, a[0], a[1], a[2], 0);
+      case Call::SchedGetscheduler: return linuxabi::sys_sched(process, linuxabi::SchedCall::GetScheduler, a[0], 0, 0, 0);
+      case Call::SchedPriorityMax: return linuxabi::sys_sched(process, linuxabi::SchedCall::PriorityMax, a[0], 0, 0, 0);
+      case Call::SchedPriorityMin: return linuxabi::sys_sched(process, linuxabi::SchedCall::PriorityMin, a[0], 0, 0, 0);
+      case Call::SchedRrInterval: return linuxabi::sys_sched(process, linuxabi::SchedCall::RrInterval, a[0], a[1], 0, 0);
+      case Call::SchedSetattr: return linuxabi::sys_sched(process, linuxabi::SchedCall::SetAttr, a[0], a[1], a[2], 0);
+      case Call::SchedGetattr: return linuxabi::sys_sched(process, linuxabi::SchedCall::GetAttr, a[0], a[1], a[2], a[3]);
+      case Call::SchedSetaffinity: return linuxabi::sys_sched_setaffinity(process, a[0], a[1], a[2]);
+      case Call::Getcpu: return linuxabi::sys_getcpu(process, a[0], a[1]);
+      case Call::Personality: return linuxabi::sys_personality(process, a[0]);
+      case Call::Membarrier: return linuxabi::sys_membarrier(process, a[0], a[1]);
+      case Call::GetRobustList: return linuxabi::sys_get_robust_list(process, a[0], a[1], a[2]);
       case Call::ClockGetres: {      // every clock counts in nanoseconds (libdbus asks, for its timeouts)
         if (a[0] > 11) return error(kEinval);
         if (a[1] && (!process.write_user_u64(a[1], 0) || !process.write_user_u64(a[1] + 8, 1))) return error(kEfault);
-        return 0;
-      }
-      case Call::Getresid: {      // real, effective and saved ids: all 0 (libdbus takes a failure here for a setuid program and ignores the environment)
-        const uint8_t zero[4] = {};
-        for (uint32_t i = 0; i < 3; ++i)
-          if (!process.write_user(a[i], ConstByteView(zero, 4))) return error(kEfault);
         return 0;
       }
       case Call::SetTidAddress: return linuxabi::sys_set_tid_address(process, a[0]);
@@ -341,11 +555,21 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Execve: return linuxabi::sys_execve(process, kAtFdCwd, a[0], a[1], a[2], 0);
       case Call::Execveat: return linuxabi::sys_execve(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::Futex: return linuxabi::sys_futex(process, a[0], a[1], a[2], a[3], a[4], a[5]);
-      case Call::Tgkill: return 0;      // signals are not delivered; asking whether a thread exists, or sending one, succeeds
+      case Call::Tgkill: return linuxabi::sys_tgkill(process, a[0], a[1], a[2]);
+      case Call::RtTgsigqueueinfo: return linuxabi::sys_tgkill(process, a[0], a[1], a[2]);      // (the siginfo that comes with it is not kept)
+      case Call::Tkill: return linuxabi::sys_tgkill(process, process.id(), a[0], a[1]);
+      case Call::Kill: return linuxabi::sys_kill(process, a[0], a[1]);
+      case Call::RtSigqueueinfo: return linuxabi::sys_kill(process, a[0], a[1]);
+      case Call::RtSigpending: return linuxabi::sys_rt_sigpending(process, a[0], a[1]);
+      case Call::RtSigtimedwait: return linuxabi::sys_rt_sigtimedwait(process, a[0], a[1], a[2], a[3]);
+      case Call::RtSigsuspend: return linuxabi::sys_rt_sigsuspend(process, a[0], a[1], true);
+      case Call::Pause: return linuxabi::sys_rt_sigsuspend(process, 0, 0, false);
+      case Call::RtSigreturn: return error(kEinval);      // no handler was entered, so there is no frame to return from
+      case Call::Alarm: return linuxabi::sys_alarm(process, a[0]);
+      case Call::Getitimer: return linuxabi::sys_getitimer(process, a[0], a[1]);
+      case Call::Setitimer: return linuxabi::sys_setitimer(process, a[0], a[1], a[2]);
       case Call::SchedGetaffinity: return linuxabi::sys_sched_getaffinity(process, a[1], a[2]);
-      case Call::Prctl:      // PR_SET_NAME and friends succeed; the SVE vector-length calls (50 set, 51 get) and the SME ones (62 set, 63 get) report the emulated AArch64 vector length, 16 bytes
-        if ((a[0] == 50 || a[0] == 51 || a[0] == 62 || a[0] == 63) && arch_ == UserArch::AArch64) return 16;
-        return 0;
+      case Call::Prctl: return linuxabi::sys_prctl(process, arch_, a[0], a[1], a[2]);
       case Call::Uname: return write_uname(process, a[0]);
       case Call::ClockGettime: return clock_gettime(process, a[0], a[1]);
       case Call::Nanosleep: return nanosleep(process, a[0], a[1]);
@@ -354,6 +578,14 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Mmap: return do_mmap(process, a[0], a[1], a[2], a[3], a[4], a[5]);
       case Call::Munmap: return do_munmap(process, a[0], a[1]);
       case Call::Mprotect: return do_mprotect(process, a[0], a[1], a[2]);
+      case Call::Mremap: return do_mremap(process, a[0], a[1], a[2], a[3]);
+      case Call::Msync: return do_msync(process, a[0], a[1], a[2]);
+      case Call::Mincore: return do_mincore(process, a[0], a[1], a[2]);
+      case Call::Mlock: {      // mlock, munlock, mlock2: nothing is ever paged out; the range only has to be mapped
+        uint64_t size = 0;
+        return check_mapped(process, a[0] & ~(AddressSpace::kPageSize - 1), a[1], &size);
+      }
+      case Call::Mlockall: return 0;      // (mlockall, munlockall)
       case Call::ArchPrctl: return do_arch_prctl(process, a[0], a[1]);
       case Call::Ioctl: return linuxabi::sys_ioctl(process, a[0], a[1], a[2]);
       case Call::Fstat: return linuxabi::sys_fstat(process, arch_, a[0], a[1]);
@@ -364,6 +596,25 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Lseek: return linuxabi::sys_lseek(process, a[0], a[1], a[2]);
       case Call::Openat: return linuxabi::sys_openat(process, arch_, a[0], a[1], a[2]);
       case Call::Open: return linuxabi::sys_openat(process, arch_, kAtFdCwd, a[0], a[1]);
+      case Call::Creat: return linuxabi::sys_openat(process, arch_, kAtFdCwd, a[0], 0x241);      // (O_CREAT | O_WRONLY | O_TRUNC)
+      case Call::Openat2: return linuxabi::sys_openat2(process, arch_, a[0], a[1], a[2], a[3]);
+      case Call::CloseRange: return linuxabi::sys_close_range(process, a[0], a[1], a[2]);
+      case Call::Symlink: return linuxabi::sys_symlinkat(process, a[0], kAtFdCwd, a[1]);
+      case Call::Symlinkat: return linuxabi::sys_symlinkat(process, a[0], a[1], a[2]);
+      case Call::Preadv: return linuxabi::sys_vector_at(process, a[0], a[1], a[2], a[3], 0, false, false);
+      case Call::Pwritev: return linuxabi::sys_vector_at(process, a[0], a[1], a[2], a[3], 0, true, false);
+      case Call::Preadv2: return linuxabi::sys_vector_at(process, a[0], a[1], a[2], a[3], a[5], false, true);
+      case Call::Pwritev2: return linuxabi::sys_vector_at(process, a[0], a[1], a[2], a[3], a[5], true, true);
+      case Call::Sendfile: return linuxabi::sys_sendfile(process, a[0], a[1], a[2], a[3]);
+      case Call::CopyFileRange: return linuxabi::sys_copy_file_range(process, a[0], a[1], a[2], a[3], a[4], a[5]);
+      case Call::Splice: return error(kEinval);      // splice, tee, vmsplice: no pipe here hands its pages on; programs fall back to read and write
+      case Call::Readahead:
+      case Call::Fadvise:
+      case Call::SyncFileRange: return linuxabi::sys_file_advice(process, a[0], true);
+      case Call::Syncfs: return linuxabi::sys_file_advice(process, a[0], false);
+      case Call::Getdents: return linuxabi::sys_getdents(process, a[0], a[1], a[2]);
+      case Call::Xattr: return error(kEopnotsupp);
+      case Call::Refuse: return error(kEperm);
       case Call::Readlinkat: return linuxabi::sys_readlinkat(process, a[0], a[1], a[2], a[3]);
       case Call::Readlink: return linuxabi::sys_readlinkat(process, kAtFdCwd, a[0], a[1], a[2]);
       case Call::Pread: return linuxabi::sys_pread(process, a[0], a[1], a[2], a[3]);
@@ -378,8 +629,8 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Unlink: return linuxabi::sys_unlinkat(process, kAtFdCwd, a[0], 0);
       case Call::Unlinkat: return linuxabi::sys_unlinkat(process, a[0], a[1], a[2]);
       case Call::Rename: return linuxabi::sys_renameat(process, kAtFdCwd, a[0], kAtFdCwd, a[1]);
-      case Call::Renameat:
-      case Call::Renameat2: return linuxabi::sys_renameat(process, a[0], a[1], a[2], a[3]);
+      case Call::Renameat: return linuxabi::sys_renameat(process, a[0], a[1], a[2], a[3]);
+      case Call::Renameat2: return linuxabi::sys_renameat(process, a[0], a[1], a[2], a[3], a[4]);
       case Call::Getcwd: return linuxabi::sys_getcwd(process, a[0], a[1]);
       case Call::Chdir: return linuxabi::sys_chdir(process, a[0]);
       case Call::Fchdir: return linuxabi::sys_fchdir(process, a[0]);
@@ -397,15 +648,19 @@ class LinuxSyscalls final : public ISyscallInterface {
       case Call::Dup2: return linuxabi::sys_dup3(process, a[0], a[1], ~uint64_t{0});
       case Call::Dup3: return linuxabi::sys_dup3(process, a[0], a[1], a[2]);
       case Call::Fcntl: return linuxabi::sys_fcntl(process, a[0], a[1], a[2]);
-      case Call::Umask: return 022;
+      case Call::Umask: {      // (kept and given back; files have no permission bits for it to clear)
+        const uint32_t old = process.linux_state().file_mode_mask;
+        process.linux_state().file_mode_mask = uint32_t(a[0]) & 0777;
+        return old;
+      }
       case Call::Succeed: return 0;      // permissions, owners, times and syncs: there is nothing to change here
-      case Call::RtSigaction: return a[2] && !write_zeros(process, a[2], 32) ? error(kEfault) : 0;
-      case Call::RtSigprocmask: return a[2] && !write_zeros(process, a[2], 8) ? error(kEfault) : 0;
-      case Call::Sigaltstack: return a[1] && !write_zeros(process, a[1], 24) ? error(kEfault) : 0;
-      case Call::SetRobustList:
-      case Call::Madvise: return 0;
+      case Call::RtSigaction: return linuxabi::sys_rt_sigaction(process, arch_, a[0], a[1], a[2], a[3]);
+      case Call::RtSigprocmask: return linuxabi::sys_rt_sigprocmask(process, a[0], a[1], a[2], a[3]);
+      case Call::Sigaltstack: return linuxabi::sys_sigaltstack(process, a[0], a[1]);
+      case Call::SetRobustList: return linuxabi::sys_set_robust_list(process, a[0], a[1]);
+      case Call::Madvise: return do_madvise(process, a[0], a[1], a[2]);
       case Call::Rseq: return error(kEnosys);
-      case Call::Prlimit64: return do_prlimit(process, a[1], a[3]);
+      case Call::Prlimit64: return linuxabi::sys_prlimit(process, a[0], a[1], a[2], a[3]);
       case Call::Getrandom: return do_getrandom(process, a[0], a[1]);
       case Call::Gettimeofday: return do_gettimeofday(process, a[0]);
       case Call::Time: {      // time(tloc): the seconds since 1970, also stored at tloc when it is not null (x86-64 only: the generic table has no time)
@@ -413,7 +668,7 @@ class LinuxSyscalls final : public ISyscallInterface {
         if (a[0] != 0 && !process.write_user_u64(a[0], seconds)) return error(kEfault);
         return seconds;
       }
-      case Call::Getppid: return 0;
+      case Call::Getppid: return process.parent_id();
       case Call::MemfdCreate: return linuxabi::sys_memfd_create(process, a[0], a[1]);
       case Call::Fallocate: return linuxabi::sys_fallocate(process, a[0], a[1], a[2], a[3]);
       case Call::Socket: return linuxabi::sys_socket(process, a[0], a[1], a[2]);
@@ -473,8 +728,10 @@ class LinuxSyscalls final : public ISyscallInterface {
 
   static uint64_t clock_gettime(Process& process, uint64_t clock, uint64_t address) {
     uint64_t ns = 0;
-    if (clock == 0) ns = process.host().realtime_ns();            // CLOCK_REALTIME
-    else if (clock == 1 || clock == 4) ns = process.host().monotonic_ns();      // CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW
+    if (clock == 0 || clock == 5) ns = process.host().realtime_ns();            // CLOCK_REALTIME, CLOCK_REALTIME_COARSE
+    else if (clock == 1 || clock == 4 || clock == 6 || clock == 7) ns = process.host().monotonic_ns();      // CLOCK_MONOTONIC, _RAW, _COARSE, CLOCK_BOOTTIME
+    else if (clock == 2 || clock == 3) ns = linuxabi::cpu_time_ns(process, clock == 3);      // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID
+    else if (clock == 11) ns = process.host().realtime_ns() + 37ull * 1000000000u;          // CLOCK_TAI: 37 leap seconds ahead of UTC
     else return error(kEinval);
     if (!process.write_user_u64(address, ns / 1000000000u) || !process.write_user_u64(address + 8, ns % 1000000000u)) return error(kEfault);
     return 0;

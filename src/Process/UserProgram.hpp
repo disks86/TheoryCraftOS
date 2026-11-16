@@ -109,6 +109,12 @@ class UserProgram final : public IModuleHost {
   // `random` is the 16 bytes of AT_RANDOM. Call once; on failure the program is unusable (create another).
   LoadStatus load(ConstByteView file, ArrayView<const StringView> arguments, ArrayView<const StringView> environment, ConstByteView random);
 
+  // Instead of load(), for the child of a Linux fork(): this program becomes a copy of `parent` as it is now (its memory, its descriptors, its settings: see
+  // linuxabi::inherit_fork_state), with a process of this program's id. `fs_base` is the calling thread's thread pointer (the child's one thread is a copy of
+  // that thread; whoever runs the child gives it the caller's registers). Call once, with the parent's lock held; on failure the program is unusable.
+  // Set the reserved ranges of address_space() first, as before load().
+  bool fork_from(UserProgram& parent, const LinuxProcessState::ForkRequest& request, uint64_t fs_base);
+
   bool loaded() const { return process_ ? true : false; }
   Process* process() { return process_.get(); }
   AddressSpace& address_space() { return space_; }

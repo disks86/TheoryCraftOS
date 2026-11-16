@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/LinuxThreads.hpp"
+#include "Process/LinuxProcess.hpp"
 
 namespace process {
 namespace linuxabi {
@@ -138,14 +139,30 @@ uint64_t futex_wake(Process& p, uint64_t address, uint64_t count, uint32_t bitse
 
 uint64_t sys_clone(Process& p, UserArch arch, const uint64_t* a) {
   IProcessRuntime* runtime = p.runtime();
-  if (!runtime || !runtime->supports_linux_threads()) return error(kEnosys);
   const uint64_t flags = a[0], stack = a[1], parent_tid = a[2];
   // x86-64: clone(flags, stack, parent_tid, child_tid, tls); the generic table (AArch64, RISC-V): clone(flags, stack, parent_tid, tls, child_tid)
   // x86-64 and LoongArch take (flags, stack, parent_tid, child_tid, tls); AArch64 and RISC-V swap the last two.
   const bool tls_last = arch == UserArch::X86_64 || arch == UserArch::LoongArch64;
   const uint64_t child_tid = tls_last ? a[3] : a[4];
   const uint64_t tls = tls_last ? a[4] : a[3];
-  if ((flags & 0xFF) != 0) return error(kEinval);      // an exit signal means fork-like semantics
+  if (!(flags & kCloneThread)) {
+    // Not a thread: a process (fork, vfork, what posix_spawn calls). With CLONE_VM the child would run in the parent's memory, and with CLONE_VFORK the parent
+    // would wait until it has exec'd; here it is a copy that runs beside its parent (LinuxProcess.hpp). The low byte is the signal the parent would get at the
+    // child's end (SIGCHLD), which nothing delivers. Anything that would share more than that (the descriptors, the handlers) or make a namespace is refused.
+    constexpr uint64_t kCloneVfork = 0x4000;
+    constexpr uint64_t kForkAllowed = 0xFF | kCloneVm | kCloneVfork | kCloneSettls | kCloneParentSettid | kCloneChildCleartid | kCloneChildSettid;
+    if (flags & ~kForkAllowed) return error(kEinval);
+    ForkOptions options;
+    options.stack = stack;
+    options.set_tls = (flags & kCloneSettls) != 0;
+    options.tls = tls;
+    options.parent_tid_at = (flags & kCloneParentSettid) ? parent_tid : 0;
+    options.set_child_tid = (flags & kCloneChildSettid) ? child_tid : 0;
+    options.clear_child_tid = (flags & kCloneChildCleartid) ? child_tid : 0;
+    return sys_fork(p, options);
+  }
+  if (!runtime || !runtime->supports_linux_threads()) return error(kEnosys);
+  if ((flags & 0xFF) != 0) return error(kEinval);      // (an exit signal belongs to a process)
   if ((flags & kCloneRequired) != kCloneRequired || (flags & ~(kCloneAllowed | 0xFF)) != 0) return error(kEnosys);
   Process::LinuxThreadState& state = p.linux_threads();
   if (state.clone.pending) return error(kEagain);
@@ -185,7 +202,8 @@ uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size
   };
   const uint64_t flags = word(0), pidfd = word(1), child_tid = word(2), parent_tid = word(3), exit_signal = word(4), stack = word(5), stack_size = word(6), tls = word(7);
   (void)pidfd;      // (only read with CLONE_PIDFD, which is not supported; glibc fills it in anyway)
-  if (exit_signal != 0 || (flags & 0x1000u)) return error(kEinval);      // CLONE_PIDFD
+  if (exit_signal > 64 || (flags & 0xFF) || (flags & 0x1000u)) return error(kEinval);      // (0x1000: CLONE_PIDFD)
+  if (exit_signal != 0 && (flags & kCloneThread)) return error(kEinval);      // (an exit signal belongs to a process: without CLONE_THREAD this is a fork)
   if (size >= kLargest && (word(8) != 0 || word(9) != 0 || word(10) != 0)) return error(kEinval);
   if (size > kLargest) {      // (a newer structure: what this does not know must be zero)
     uint8_t rest[64];
@@ -198,7 +216,7 @@ uint64_t sys_clone3(Process& p, UserArch arch, uint64_t arguments, uint64_t size
   if ((stack == 0) != (stack_size == 0) || (stack && stack_size > ~uint64_t{0} - stack)) return error(kEinval);
   const uint64_t top = stack ? stack + stack_size : 0;      // (clone3 names the lowest address and the size; the thread starts at the top)
   const bool tls_last = arch == UserArch::X86_64 || arch == UserArch::LoongArch64;
-  const uint64_t a[5] = {flags & ~uint64_t{0xFF}, top, parent_tid, tls_last ? child_tid : tls, tls_last ? tls : child_tid};
+  const uint64_t a[5] = {flags | exit_signal, top, parent_tid, tls_last ? child_tid : tls, tls_last ? tls : child_tid};
   return sys_clone(p, arch, a);
 }
 
@@ -218,6 +236,7 @@ uint64_t sys_thread_exit(Process& p, uint32_t code) {
     t->clear_child_tid = 0;
     if (clear && p.write_user_u32(clear, 0)) futex_wake(p, clear, 1, ~0u);      // pthread_join waits on this word
   }
+  thread_gone(p, tid);      // (its signal mask and the like)
   uint32_t live = 0;
   for (const Process::LinuxThreadState::Thread& t : p.linux_threads().threads) live += t.used ? 1 : 0;
   if (live == 0 || !p.runtime()) p.terminate(code);

@@ -310,6 +310,7 @@ uint64_t sys_execve(Process& p, uint64_t dirfd, uint64_t path, uint64_t argv, ui
     }
     runtime->wait(kWaitNs);
   }
+  p.linux_state().exit_signal = runtime->child_exit_signal(spec.pid);      // (a signal ended the new program: whoever waits for this one is told so)
   p.terminate(code & 0xFF);
   return 0;
 }

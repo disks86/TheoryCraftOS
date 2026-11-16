@@ -41,7 +41,19 @@ uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count
 uint64_t sys_mkdirat(Process& p, uint64_t dirfd, uint64_t path);
 uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags);
 uint64_t sys_mknodat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t device);      // (mknod(path, mode, dev): at AT_FDCWD)
-uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path);
+// (renameat2's flags: RENAME_NOREPLACE; the others are EINVAL)
+uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags = 0);
+uint64_t sys_getdents(Process& p, uint64_t fd, uint64_t buffer, uint64_t count);      // (the layout before getdents64: x86-64 only)
+// symlinkat(target, newdirfd, linkpath) (symlink(target, linkpath): at AT_FDCWD). EPERM on a file system without symbolic links.
+uint64_t sys_symlinkat(Process& p, uint64_t target, uint64_t new_dirfd, uint64_t link_path);
+uint64_t sys_openat2(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t how, uint64_t size);
+uint64_t sys_close_range(Process& p, uint64_t first, uint64_t last, uint64_t flags);
+// preadv, pwritev, preadv2 and pwritev2.
+uint64_t sys_vector_at(Process& p, uint64_t fd, uint64_t iov, uint64_t count, uint64_t offset, uint64_t flags, bool write, bool version2);
+uint64_t sys_sendfile(Process& p, uint64_t out_fd, uint64_t in_fd, uint64_t offset_at, uint64_t count);
+uint64_t sys_copy_file_range(Process& p, uint64_t in_fd, uint64_t in_offset_at, uint64_t out_fd, uint64_t out_offset_at, uint64_t count, uint64_t flags);
+// readahead, fadvise64, sync_file_range (needs_file) and syncfs: 0 for a descriptor they apply to.
+uint64_t sys_file_advice(Process& p, uint64_t fd, bool needs_file);
 uint64_t sys_getcwd(Process& p, uint64_t buffer, uint64_t size);
 uint64_t sys_chdir(Process& p, uint64_t path);
 uint64_t sys_fchdir(Process& p, uint64_t fd);

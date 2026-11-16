@@ -851,7 +851,8 @@ static void test_linux_thread_pointer_and_startup_calls() {
   CHECK(p.syscall(lin(14, 0, 0, 0x10300, 8)) == 0 && p.syscall(lin(131, 0, 0x10300)) == 0 && p.syscall(lin(273, 0, 24)) == 0 && p.syscall(lin(28, 0x10000, 4096, 4)) == 0);
   CHECK(sres(p.syscall(lin(334, 0, 0, 0, 0))) == -38);                     // rseq: not supported
   CHECK(p.syscall(lin(302, 0, 3, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == (8ull << 20));      // prlimit64(RLIMIT_STACK)
-  CHECK(p.syscall(lin(302, 0, 7, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == ~uint64_t{0});
+  CHECK(p.syscall(lin(302, 0, 7, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == 1024);      // RLIMIT_NOFILE: as many as the descriptor table holds
+  CHECK(p.syscall(lin(302, 0, 9, 0, 0x10400)) == 0 && p.read_user_u64(0x10400, &v) && v == ~uint64_t{0});      // RLIMIT_AS: none
   CHECK(p.syscall(lin(110)) == 0);
   CHECK(p.syscall(lin(96, 0x10500, 0)) == 0 && p.read_user_u64(0x10500, &v) && v == 1700000000 && p.read_user_u64(0x10508, &v) && v == 5);
   // getrandom: the host's bytes, spread over the request; not supported without a source.
@@ -863,11 +864,12 @@ static void test_linux_thread_pointer_and_startup_calls() {
   CHECK(sres(p.syscall(lin(318, 0xDEAD0000, 16, 0))) == -14);
   host.give_random = false;
   CHECK(sres(p.syscall(lin(318, 0x10600, 16, 0))) == -38);
-  // A call this OS lacks (reboot) is reported to the host.
-  CHECK(sres(p.syscall(lin(169, 0, 0, 0))) == -38 && host.unhandled == 169);
+  // A call this OS lacks (io_uring_setup) is reported to the host; one only an administrator makes (reboot) is refused.
+  CHECK(sres(p.syscall(lin(425, 0, 0, 0))) == -38 && host.unhandled == 425);
+  CHECK(sres(p.syscall(lin(169, 0, 0, 0))) == -1 && host.unhandled == 425);
   // The generic table has its own numbers and no arch_prctl.
   Process g(2, ProcessBinding{SyscallAbi::Linux, UserArch::AArch64, syscall_interface(SyscallAbi::Linux, UserArch::AArch64)}, s, host);
-  CHECK(sres(g.syscall(lin(158, 0x1002, 0x7000))) == -38 && g.syscall(lin(173)) == 0 && g.syscall(lin(169, 0x10500, 0)) == 0);
+  CHECK(g.syscall(lin(158, 0x1002, 0x7000)) == 0 && g.syscall(lin(173)) == 0 && g.syscall(lin(169, 0x10500, 0)) == 0);      // (158 is getgroups there: no groups, nothing written)
   CHECK(g.syscall(lin(80, 1, 0x10100)) == 0 && s.read(0x10100 + 16, ByteView(mode, 4)) && mode[1] == 0x21);      // generic struct stat keeps st_mode at 16
 }
 

@@ -387,6 +387,22 @@ uint32_t ProcessFiles::inherit_for_exec(const ProcessFiles& parent, void (*copy_
   return copied;
 }
 
+uint32_t ProcessFiles::inherit_for_fork(const ProcessFiles& parent, void (*copy_token)(DescriptorKind kind, uint64_t token)) {
+  uint32_t copied = 0;
+  for (uint64_t slot = 0; slot < kMaxDescriptors; ++slot) {
+    const Slot& s = parent.slots_[slot];
+    close(slot);      // (the console descriptors a new table starts with: the parent may have closed or replaced them)
+    if (s.kind == DescriptorKind::Closed || s.kind == DescriptorKind::Thread) continue;
+    slots_[slot] = s;
+    if (copy_token && s.token != 0) copy_token(s.kind, s.token);
+    ++copied;
+  }
+  for (uint64_t i = 0; i < parent.cwd_size_; ++i) cwd_[i] = parent.cwd_[i];
+  cwd_size_ = parent.cwd_size_;
+  set_executable(parent.executable());
+  return copied;
+}
+
 bool ProcessFiles::set_executable(StringView virtual_path) {
   if (virtual_path.size() > kMaxPath) return false;
   for (uint64_t i = 0; i < virtual_path.size(); ++i) executable_[i] = virtual_path[i];

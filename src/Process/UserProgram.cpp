@@ -16,6 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Process/UserProgram.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Executable/ElfFile.hpp"
 #include "Executable/ExecutableKind.hpp"
 #include "Executable/PeFile.hpp"
@@ -454,6 +455,31 @@ LoadStatus UserProgram::load(ConstByteView file, ArrayView<const StringView> arg
   image_ = image;
   process_ = static_cast<UniquePointer<Process>&&>(process);
   return LoadStatus::Ok;
+}
+
+bool UserProgram::fork_from(UserProgram& parent, const LinuxProcessState::ForkRequest& request, uint64_t fs_base) {
+  Process* from = parent.process();
+  if (process_ || !from || from->abi() != SyscallAbi::Linux) return false;
+  const ProcessBinding binding{from->abi(), from->arch(), syscall_interface(from->abi(), from->arch())};
+  if (!binding.interface) return false;
+  files_ = parent.files_;
+  processor_count_ = parent.processor_count_;
+  if (!working_directory_.assign(parent.working_directory_.view()) || !executable_path_.assign(parent.executable_path_.view())) return false;
+  if (!space_.copy_from(parent.space_)) return false;
+  UniquePointer<Process> process = UniquePointer<Process>::make(allocator_, id_, binding, space_, host_);
+  if (!process) return false;
+  process->set_image_information(from->image_information());
+  process->create_time = host_.realtime_ns() / 100 + 11644473600ull * 10000000ull;
+  process->attach_address_space(space_, from->heap_start());
+  process->set_initial_thread_pointers(request.set_tls ? request.tls : fs_base, 0);
+  if (files_) process->attach_file_system(allocator_, *files_);
+  linuxabi::inherit_fork_state(*process, *from, request);
+  start_ = parent.start_;
+  start_.fs_base = request.set_tls ? request.tls : fs_base;
+  if (request.stack != 0) start_.stack_pointer = request.stack;
+  image_ = parent.image_;
+  process_ = static_cast<UniquePointer<Process>&&>(process);
+  return true;
 }
 
 }  // namespace process

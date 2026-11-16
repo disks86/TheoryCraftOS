@@ -36,7 +36,7 @@ using filesystem::Status;
 
 constexpr int64_t kEperm = 1, kEnoent = 2, kEintr = 4, kEio = 5, kEagain = 11, kExdev = 18, kEnolck = 37, kEbadf = 9, kEnomem = 12, kEacces = 13, kEfault = 14, kEbusy = 16, kEexist = 17, kEnodev = 19, kEnotdir = 20,
                   kEisdir = 21, kEinval = 22, kEmfile = 24, kEnotty = 25, kEfbig = 27, kEnospc = 28, kEspipe = 29, kErofs = 30, kErange = 34, kEnametoolong = 36,
-                  kEnosys = 38, kEnotempty = 39, kEopnotsupp = 95, kEloop = 40;
+                  kEnosys = 38, kEnotempty = 39, kEopnotsupp = 95, kEloop = 40, kE2big = 7, kEoverflow = 75;
 constexpr uint64_t kAtFdCwd = ~uint64_t{99};      // -100
 constexpr uint64_t kAtRemoveDir = 0x200, kAtEmptyPath = 0x1000;
 constexpr uint64_t kMaxIoBytes = 0x7FFFF000u, kIovMax = 1024, kChunk = 4096;
@@ -648,7 +648,10 @@ bool fifo_listed(Process& p, const OpenObject& directory, const DirectoryEntry& 
 }
 }  // namespace
 
-uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
+namespace {
+// getdents64 and the older getdents: the same entries in two layouts. linux_dirent64 has the type before the name (ino 8, off 8, reclen 2, type 1, name);
+// linux_dirent has no room for it there (ino 8, off 8, reclen 2, name) and keeps it in the record's last byte.
+uint64_t read_entries(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool old_layout) {
   ProcessFiles& files = p.files();
   if (files.kind(fd) == DescriptorKind::Closed) return error(kEbadf);
   if (files.kind(fd) != DescriptorKind::Directory) return error(kEnotdir);
@@ -660,7 +663,8 @@ uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count
     if (status == Status::EndOfDirectory) break;
     if (status != Status::Ok) return used ? used : errno_of(status);
     const StringView name = entry.name.view();
-    const uint64_t length = (19 + name.size() + 1 + 7) & ~uint64_t{7};
+    const uint64_t name_at = old_layout ? 18 : 19;
+    const uint64_t length = (name_at + name.size() + 1 + (old_layout ? 1 : 0) + 7) & ~uint64_t{7};
     if (length > count - used) {
       object.pending = entry;
       object.has_pending = true;
@@ -680,12 +684,20 @@ uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count
       case filesystem::SpecialNode::BlockDevice: v[18] = 6; break;    // DT_BLK
       case filesystem::SpecialNode::None: if (fifo_listed(p, object, entry)) v[18] = 1; break;
     }
-    for (uint64_t i = 0; i < name.size(); ++i) v[19 + i] = static_cast<uint8_t>(name[i]);
+    if (old_layout) {
+      v[length - 1] = v[18];
+      v[18] = 0;
+    }
+    for (uint64_t i = 0; i < name.size(); ++i) v[name_at + i] = static_cast<uint8_t>(name[i]);
     if (!p.write_user(buffer + used, ConstByteView(record, length))) return used ? used : error(kEfault);
     used += length;
   }
   return used;
 }
+}  // namespace
+
+uint64_t sys_getdents64(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) { return read_entries(p, fd, buffer, count, false); }
+uint64_t sys_getdents(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) { return read_entries(p, fd, buffer, count, true); }
 
 uint64_t sys_mkdirat(Process& p, uint64_t dirfd, uint64_t path) {
   ProcessFiles& files = p.files();
@@ -741,9 +753,11 @@ uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags)
   return errno_of_or_zero(files.remove(virtual_path.view()));
 }
 
-uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path) {
+uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags) {
+  constexpr uint64_t kRenameNoreplace = 1;      // (RENAME_EXCHANGE 2 and RENAME_WHITEOUT 4 need what no file system here has: EINVAL, as Linux answers for one that cannot)
   ProcessFiles& files = p.files();
   if (!files.attached()) return error(kEnoent);
+  if (flags & ~kRenameNoreplace) return error(kEinval);
   String from(files.allocator()), to(files.allocator());
   int64_t r = resolve_at(p, old_dirfd, old_path, false, &from);
   if (r >= 0) r = resolve_at(p, new_dirfd, new_path, false, &to);
@@ -751,9 +765,10 @@ uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_
   DirectoryEntry source, target;
   const Status found = files.stat(from.view(), &source);
   if (found != Status::Ok) return errno_of(found);
-  if (from.view() == to.view()) return 0;
+  if (from.view() == to.view()) return (flags & kRenameNoreplace) ? error(kEexist) : 0;
   // POSIX replaces an existing target (a file by a file, an empty directory by a directory).
   if (files.stat(to.view(), &target) == Status::Ok) {
+    if (flags & kRenameNoreplace) return error(kEexist);
     if (source.type == NodeType::Directory && target.type != NodeType::Directory) return error(kEnotdir);
     if (source.type != NodeType::Directory && target.type == NodeType::Directory) return error(kEisdir);
     const Status removed = files.remove(to.view());
@@ -1061,6 +1076,79 @@ uint64_t sys_dup3(Process& p, uint64_t old_fd, uint64_t new_fd, uint64_t flags) 
   return new_fd;
 }
 
+namespace {
+// fcntl record locks. struct flock (64-bit): l_type (2: F_RDLCK 0, F_WRLCK 1, F_UNLCK 2), l_whence (2), padding (4), l_start (8), l_len (8), l_pid (4).
+// The classic ones belong to the process (every descriptor of the file shares them; they go when the process ends, not, as POSIX has it, with the first
+// descriptor of the file it closes); the OFD ones to the open file. Kept in the system's table (ObjectManager::record_lock_locked), so every process sees them.
+uint64_t record_lock(Process& p, uint64_t fd, uint64_t command, uint64_t argument) {
+  constexpr uint64_t kFlockBytes = 32;
+  const bool ofd = command >= 36, get = command == 5 || command == 36, wait = command == 7 || command == 38;
+  ProcessFiles& files = p.files();
+  uint8_t raw[kFlockBytes];
+  if (!p.read_user(argument, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint16_t type = reader.le16(), whence = reader.le16();
+  reader.skip(4);
+  const int64_t start = int64_t(reader.le64()), length = int64_t(reader.le64());
+  const uint32_t pid = reader.le32();
+  if (type > 2) return error(kEinval);
+  if (ofd && pid != 0) return error(kEinval);
+  const OpenObject* const object = files.object(fd);
+  int64_t base = 0;
+  if (whence == 1) base = object ? int64_t(object->position) : 0;
+  else if (whence == 2) base = object ? int64_t(files.size_of(*object)) : 0;
+  else if (whence != 0) return error(kEinval);
+  if ((start > 0 && base > INT64_MAX - start) || (start < 0 && base < -start)) return error(start < 0 ? kEinval : kEoverflow);
+  int64_t first = base + start, count = length;
+  if (count < 0) {      // (a negative length: the bytes before the start)
+    if (count == INT64_MIN || first < -count) return error(kEinval);
+    first += count;
+    count = -count;
+  }
+  if (count > 0 && first > INT64_MAX - (count - 1)) return error(kEoverflow);
+  const uint64_t bytes = count == 0 ? ObjectManager::kWholeFile : uint64_t(count);      // (0: to the end of the file, however long it gets)
+  auto answer_unlocked = [&]() {
+    const uint8_t unlocked[2] = {2, 0};
+    return p.write_user(argument, ConstByteView(unlocked, sizeof(unlocked))) ? 0 : error(kEfault);
+  };
+  ObjectManager* objects = system_objects();
+  String path(files.allocator());
+  // What has no name in the file system (a console, a pipe, a file in memory) can only be reached through this descriptor's open file: nobody else could hold a lock.
+  const bool named = (files.kind(fd) == DescriptorKind::File || files.kind(fd) == DescriptorKind::Directory) && object && !object->memory && !object->gpu_buffer &&
+                     !object->gpu_sync && !object->path.empty();
+  if (!named || !objects || !files.host_path_of(object->path.view(), &path)) return get ? answer_unlocked() : 0;
+  if (!get && ((type == 0 && !object->readable) || (type == 1 && !object->writable))) return error(kEbadf);
+  const void* const owner = ofd ? static_cast<const void*>(object) : static_cast<const void*>(&p.linux_state());
+  const ObjectManager::RecordKind kind = type == 2 ? ObjectManager::RecordKind::Unlock : type == 1 ? ObjectManager::RecordKind::Exclusive : ObjectManager::RecordKind::Shared;
+  ISystemSync& sync = objects->sync();
+  for (;;) {
+    ObjectManager::RecordLock blocker;
+    sync.lock();
+    const ObjectManager::LockResult result = objects->record_lock_locked(path.view(), owner, uint64_t(first), bytes, kind, get, &blocker);
+    sync.unlock();
+    if (get) {
+      if (result != ObjectManager::LockResult::Conflict) return answer_unlocked();
+      uint8_t out[kFlockBytes] = {};
+      ByteWriter writer{ByteView(out, sizeof(out))};
+      const bool to_end = blocker.length - 1 >= ~uint64_t{0} - blocker.offset || blocker.offset + blocker.length > uint64_t(INT64_MAX);
+      writer.le16(blocker.exclusive ? 1 : 0);
+      writer.le16(0);
+      writer.le32(0);
+      writer.le64(blocker.offset);
+      writer.le64(to_end ? 0 : blocker.length);
+      writer.le32(ofd ? 0xFFFFFFFFu : 0);      // (whose it is, is not kept: -1 as for an OFD lock, 0 for a process nobody can name)
+      return p.write_user(argument, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+    }
+    if (result == ObjectManager::LockResult::Granted) return 0;
+    if (result == ObjectManager::LockResult::Full) return error(kEnolck);
+    if (!wait) return error(kEagain);
+    if (p.exited() || (p.runtime() && p.runtime()->interrupted())) return error(kEintr);
+    p.block_sleep(2000000);      // (looked at again every 2 ms, as flock does)
+    if (files.object(fd) != object) return error(kEbadf);      // another thread closed the descriptor meanwhile
+  }
+}
+}  // namespace
+
 uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument) {
   ProcessFiles& files = p.files();
   if (files.kind(fd) == DescriptorKind::Closed) return error(kEbadf);
@@ -1101,6 +1189,15 @@ uint64_t sys_fcntl(Process& p, uint64_t fd, uint64_t command, uint64_t argument)
       if (!object->writable) return error(kEperm);
       return object->memory->add_seals(uint32_t(argument)) ? 0 : error(kEperm);
     }
+    case 5: case 6: case 7:          // F_GETLK, F_SETLK, F_SETLKW: record locks of the process
+    case 36: case 37: case 38:       // F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW: of the open file
+      return record_lock(p, fd, command, argument);
+    case 8: case 10: case 15: return 0;      // F_SETOWN, F_SETSIG, F_SETOWN_EX: nobody is sent a signal about a descriptor here
+    case 9: case 11: return 0;               // F_GETOWN, F_GETSIG
+    case 16: {                               // F_GETOWN_EX: nobody
+      const uint8_t none[8] = {};
+      return p.write_user(argument, ConstByteView(none, sizeof(none))) ? 0 : error(kEfault);
+    }
     default: return error(kEinval);
   }
 }
@@ -1127,6 +1224,10 @@ uint64_t sys_readlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t buff
       const Status exists = files.stat(virtual_path.view(), &entry);
       return exists == Status::Ok ? error(kEinval) : errno_of(exists);      // (what exists but is no link: EINVAL)
     }
+  }
+  if (proc == 0 && !target.empty() && target.view()[0] == '/') {      // an absolute target is kept as a path of the OS's file system: the program sees its own tree's
+    String inside(files.allocator());
+    if (files.virtual_path_of_host(target.view(), &inside) && !target.assign(inside.view())) return error(kEnomem);
   }
   // The target, cut to the buffer, without a terminating NUL (as readlink does).
   const uint64_t n = target.size() < size ? target.size() : size;
@@ -1323,6 +1424,198 @@ uint64_t sys_ioctl(Process& p, uint64_t fd, uint64_t request, uint64_t argument)
   if (!g_dxg_handler(p, service, params, &status)) return error(kEinval);
   uint8_t out[4] = {uint8_t(status), uint8_t(status >> 8), uint8_t(status >> 16), uint8_t(status >> 24)};
   return p.write_user(argument + 4, ConstByteView(out, sizeof(out))) ? 0 : error(kEfault);
+}
+
+// --- the smaller file calls ---------------------------------------------------------------------------------------------------------------------------
+
+uint64_t sys_symlinkat(Process& p, uint64_t target, uint64_t new_dirfd, uint64_t link_path) {
+  ProcessFiles& files = p.files();
+  if (!files.attached()) return error(kEnoent);
+  String text(files.allocator()), link(files.allocator()), host_link(files.allocator()), stored(files.allocator());
+  if (const int64_t r = read_path(p, target, &text); r < 0) return error(-r);
+  if (text.empty()) return error(kEnoent);
+  if (const int64_t r = resolve_at(p, new_dirfd, link_path, false, &link); r < 0) return error(-r);
+  if (link.view() == StringView("/") || files.device_at(link.view()) != DescriptorKind::Closed) return error(kEexist);
+  DirectoryEntry existing;
+  if (files.stat(link.view(), &existing) == Status::Ok || files.stat_link(link.view(), &existing) == Status::Ok) return error(kEexist);
+  // What it points to, as a path of the program's tree: an absolute target as it is, a relative one from the link's own folder. Only for knowing whether it is
+  // a folder (file systems that tell the two kinds of link apart want to know) and for keeping an absolute target as the file system underneath spells it.
+  uint64_t slash = 0;
+  for (uint64_t i = 0; i < link.size(); ++i)
+    if (link.view()[i] == '/') slash = i;
+  const StringView folder = slash == 0 ? StringView("/") : link.view().first(slash);
+  String pointed(files.allocator());
+  bool to_directory = false;
+  if (files.resolve_from(folder, text.view(), &pointed) == PathResult::Ok) {
+    DirectoryEntry entry;
+    to_directory = files.stat(pointed.view(), &entry) == Status::Ok && entry.type == NodeType::Directory;
+  }
+  if (text.view()[0] == '/') {
+    if (pointed.empty() || !files.host_path_of(pointed.view(), &stored)) return error(kEnametoolong);
+  } else if (!stored.assign(text.view())) {
+    return error(kEnomem);
+  }
+  if (!files.host_path_of(link.view(), &host_link)) return error(kEnametoolong);
+  const Status made = files.file_system()->create_symbolic_link(host_link.view(), stored.view(), to_directory);
+  if (made == Status::Unsupported) return error(kEperm);      // (what Linux answers on a file system without symbolic links, FAT for one)
+  return errno_of_or_zero(made);
+}
+
+// openat2(dirfd, path, struct open_how*, size): open_how is flags (8), mode (8), resolve (8). The RESOLVE_* restrictions (no links, stay beneath dirfd, ...)
+// narrow what a path may reach; a program's paths never leave its tree here, and the known ones are taken as given.
+uint64_t sys_openat2(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t how, uint64_t size) {
+  constexpr uint64_t kHowBytes = 24, kResolveKnown = 0x3F;
+  if (size < kHowBytes) return error(kEinval);
+  if (size > 4096) return error(kE2big);
+  uint8_t raw[kHowBytes];
+  if (!p.read_user(how, ByteView(raw, sizeof(raw)))) return error(kEfault);
+  for (uint64_t at = kHowBytes; at < size; ++at) {      // a newer, longer structure is fine as long as what this kernel does not know is zero
+    uint8_t byte = 0;
+    if (!p.read_user(how + at, ByteView(&byte, 1))) return error(kEfault);
+    if (byte != 0) return error(kE2big);
+  }
+  ByteReader reader{ConstByteView(raw, sizeof(raw))};
+  const uint64_t flags = reader.le64();
+  reader.skip(8);      // (mode: files have no permission bits here)
+  const uint64_t resolve = reader.le64();
+  if (resolve & ~kResolveKnown) return error(kEinval);
+  if (flags >> 32) return error(kEinval);
+  return sys_openat(p, arch, dirfd, path, flags);
+}
+
+uint64_t sys_close_range(Process& p, uint64_t first, uint64_t last, uint64_t flags) {
+  constexpr uint64_t kUnshare = 2, kCloexec = 4;
+  if ((flags & ~(kUnshare | kCloexec)) || uint32_t(first) > uint32_t(last)) return error(kEinval);
+  const uint64_t from = uint32_t(first);
+  const uint64_t to = uint32_t(last) < ProcessFiles::kMaxDescriptors ? uint32_t(last) : ProcessFiles::kMaxDescriptors - 1;
+  for (uint64_t fd = from; fd <= to; ++fd) {
+    if (p.descriptor(fd) == DescriptorKind::Closed) continue;
+    if (flags & kCloexec) p.files().set_close_on_exec(fd, true);
+    else p.close_descriptor(fd);
+  }
+  return 0;
+}
+
+// preadv / pwritev (and the "2" forms, with flags): readv / writev at a given place, which leave the file's position alone. An offset of -1 (only the "2"
+// forms may say so) means the position, as readv / writev.
+uint64_t sys_vector_at(Process& p, uint64_t fd, uint64_t iov, uint64_t count, uint64_t offset, uint64_t flags, bool write, bool version2) {
+  constexpr uint64_t kKnownFlags = 0x1F;      // RWF_HIPRI, DSYNC, SYNC, NOWAIT, APPEND: hints, or what a write here does anyway
+  if (flags & ~kKnownFlags) return error(kEopnotsupp);
+  if (version2 && offset == ~uint64_t{0}) return vector_io(p, fd, iov, count, write);
+  if (int64_t(offset) < 0) return error(kEinval);
+  if (count > kIovMax) return error(kEinval);
+  const DescriptorKind kind = p.descriptor(fd);
+  if (kind == DescriptorKind::Closed) return error(kEbadf);
+  if (kind == DescriptorKind::UnixSocket || kind == DescriptorKind::ConsoleInput || kind == DescriptorKind::ConsoleOutput || kind == DescriptorKind::ConsoleError) return error(kEspipe);
+  uint64_t total = 0;
+  for (uint64_t i = 0; i < count; ++i) {
+    uint64_t base = 0, length = 0;
+    if (iov > ~uint64_t{0} - i * 16 - 15) return total ? total : error(kEfault);
+    if (!p.read_user_u64(iov + i * 16, &base) || !p.read_user_u64(iov + i * 16 + 8, &length)) return total ? total : error(kEfault);
+    if (length > kMaxIoBytes - total) return total ? total : error(kEinval);
+    const uint64_t result = write ? write_to(p, fd, base, length, true, offset + total) : read_from(p, fd, base, length, true, offset + total);
+    if (int64_t(result) < 0) return total ? total : result;
+    total += result;
+    if (result < length) break;
+  }
+  return total;
+}
+
+// sendfile(out, in, offset*, count): bytes of a file go to another descriptor (a file, a socket, a pipe, the console) without the program reading them. They
+// pass through a page of the program's own memory that is mapped for the call, so that whatever write() can write to, this can.
+uint64_t sys_sendfile(Process& p, uint64_t out_fd, uint64_t in_fd, uint64_t offset_at, uint64_t count) {
+  ProcessFiles& files = p.files();
+  if (files.kind(in_fd) == DescriptorKind::Closed || files.kind(out_fd) == DescriptorKind::Closed) return error(kEbadf);
+  OpenObject* const in = files.object(in_fd);
+  if (files.kind(in_fd) != DescriptorKind::File || !in || !in->file) return error(kEinval);      // (what can be mapped: a regular file)
+  if (!in->readable) return error(kEbadf);
+  if (const OpenObject* out = files.object(out_fd); out && out->append) return error(kEinval);
+  uint64_t position = in->position;
+  if (offset_at != 0) {
+    if (!p.read_user_u64(offset_at, &position)) return error(kEfault);
+    if (int64_t(position) < 0) return error(kEinval);
+  }
+  if (count > kMaxIoBytes) count = kMaxIoBytes;
+  constexpr uint64_t kWindow = 16 * 4096;
+  const uint64_t scratch = map_user_memory(p, kWindow);
+  if (!scratch) return error(kEnomem);
+  uint64_t done = 0, failure = 0;
+  uint8_t chunk[kChunk];
+  while (done < count && !failure) {
+    // One window: read it from the file into the program's page, then write it out like any write().
+    uint64_t filled = 0;
+    while (filled < kWindow && filled < count - done) {
+      const uint64_t want = count - done - filled < sizeof(chunk) ? count - done - filled : sizeof(chunk);
+      const uint64_t room = kWindow - filled < want ? kWindow - filled : want;
+      uint64_t got = 0;
+      const Status status = files.read(*in, position + filled, ByteView(chunk, room), &got);
+      if (status != Status::Ok) { failure = errno_of(status); break; }
+      if (got == 0) break;
+      if (!p.write_user(scratch + filled, ConstByteView(chunk, got))) { failure = error(kEfault); break; }
+      filled += got;
+    }
+    if (filled == 0) break;      // the end of the file (or the failure)
+    const uint64_t wrote = write_to(p, out_fd, scratch, filled, false, 0);
+    if (int64_t(wrote) < 0) { failure = wrote; break; }
+    done += wrote;
+    position += wrote;
+    if (wrote < filled) break;
+  }
+  unmap_user_memory(p, scratch, kWindow);
+  if (done == 0 && failure) return failure;
+  if (offset_at != 0) {
+    if (!p.write_user_u64(offset_at, position)) return error(kEfault);
+  } else if (files.object(in_fd) == in) {
+    in->position = position;
+  }
+  return done;
+}
+
+// copy_file_range(in, in_offset*, out, out_offset*, count, flags): both must be regular files; the bytes are copied in the kernel.
+uint64_t sys_copy_file_range(Process& p, uint64_t in_fd, uint64_t in_offset_at, uint64_t out_fd, uint64_t out_offset_at, uint64_t count, uint64_t flags) {
+  ProcessFiles& files = p.files();
+  if (flags != 0) return error(kEinval);
+  if (files.kind(in_fd) == DescriptorKind::Closed || files.kind(out_fd) == DescriptorKind::Closed) return error(kEbadf);
+  OpenObject* const in = files.object(in_fd);
+  OpenObject* const out = files.object(out_fd);
+  if (files.kind(in_fd) == DescriptorKind::Directory || files.kind(out_fd) == DescriptorKind::Directory) return error(kEisdir);
+  if (files.kind(in_fd) != DescriptorKind::File || files.kind(out_fd) != DescriptorKind::File || !in || !out || !in->file || !out->file) return error(kEinval);
+  if (!in->readable || !out->writable || out->append) return error(kEbadf);
+  uint64_t from = in->position, to = out->position;
+  if (in_offset_at != 0 && !p.read_user_u64(in_offset_at, &from)) return error(kEfault);
+  if (out_offset_at != 0 && !p.read_user_u64(out_offset_at, &to)) return error(kEfault);
+  if (int64_t(from) < 0 || int64_t(to) < 0) return error(kEinval);
+  if (count > kMaxIoBytes) count = kMaxIoBytes;
+  if (count > uint64_t(INT64_MAX) - from || count > uint64_t(INT64_MAX) - to) return error(kEoverflow);
+  if (in == out && from < to + count && to < from + count) return error(kEinval);      // the two ranges of one file overlap
+  uint64_t done = 0;
+  uint8_t chunk[kChunk];
+  while (done < count) {
+    const uint64_t want = count - done < sizeof(chunk) ? count - done : sizeof(chunk);
+    uint64_t got = 0, wrote = 0;
+    const Status read = files.read(*in, from + done, ByteView(chunk, want), &got);
+    if (read != Status::Ok) { if (done) break; return errno_of(read); }
+    if (got == 0) break;
+    const Status written = files.write(*out, to + done, ConstByteView(chunk, got), &wrote);
+    done += wrote;
+    if (written != Status::Ok) { if (done) break; return errno_of(written); }
+    if (wrote < got) break;
+  }
+  if (in_offset_at != 0) { if (!p.write_user_u64(in_offset_at, from + done)) return error(kEfault); }
+  else in->position = from + done;
+  if (out_offset_at != 0) { if (!p.write_user_u64(out_offset_at, to + done)) return error(kEfault); }
+  else out->position = to + done;
+  return done;
+}
+
+// readahead, fadvise64, sync_file_range, syncfs: advice and partial syncs. There is nothing to prepare or to hold back here, so they only say whether the
+// descriptor is one they apply to.
+uint64_t sys_file_advice(Process& p, uint64_t fd, bool needs_file) {
+  const DescriptorKind kind = p.descriptor(fd);
+  if (kind == DescriptorKind::Closed) return error(kEbadf);
+  if (needs_file && kind == DescriptorKind::UnixSocket) return error(kEspipe);
+  if (needs_file && kind != DescriptorKind::File && kind != DescriptorKind::Directory) return error(kEinval);
+  return 0;
 }
 
 }  // namespace process::linuxabi

@@ -16,7 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "Emulation/GuestCpu.hpp"
+#include "Process/LinuxProcess.hpp"
 #include "Process/Process.hpp"
+#include "Process/UserProgram.hpp"
 #include "Process/WindowsThreads.hpp"
 
 namespace emulation {
@@ -57,8 +59,64 @@ class EmulatedProcess final : public process::IProcessRuntime {
   bool resume_thread(uint64_t id) override;
   void request_terminate(uint64_t id, uint32_t code) override;
   uint32_t processor_count() override { return 1; }
+  // fork(): the child is another emulated process, run on a thread of its own with a copy of the calling thread's CPU (see start_fork).
+  bool supports_linux_fork() override { return threads_ != nullptr && allocator_ != nullptr; }
+  uint64_t allocate_process_id() override {
+    static uint32_t next = 0x5000;
+    return __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+  }
+  bool query_child(uint64_t pid, bool* exited, uint32_t* code) override {
+    for (const UniquePointer<ForkChild>& c : forks_) {
+      if (!c || c->pid != pid) continue;
+      *exited = c->program->process()->exited();
+      *code = c->program->process()->exit_code();
+      return true;
+    }
+    return false;
+  }
+  uint32_t child_exit_signal(uint64_t pid) override {
+    for (const UniquePointer<ForkChild>& c : forks_)
+      if (c && c->pid == pid) return c->program->process()->linux_state().exit_signal;
+    return 0;
+  }
+  bool process_exists(uint64_t pid) override {
+    bool exited = false;
+    uint32_t code = 0;
+    return pid == process_->id() || (query_child(pid, &exited, &code) && !exited);
+  }
+  bool terminate_process(uint64_t pid, uint32_t code) override {
+    for (const UniquePointer<ForkChild>& c : forks_) {
+      if (!c || c->pid != pid || c->program->process()->exited()) continue;
+      c->program->process()->terminate(code);
+      sync_.notify_all();
+      return true;
+    }
+    return false;
+  }
 
  private:
+  // A process made by fork(): its program (a copy of this one), the CPU its one thread starts with, and the runtime that runs it on a thread of the host.
+  struct ForkChild {
+    UniquePointer<process::UserProgram> program;
+    UniquePointer<IGuestCpu> cpu;
+    UniquePointer<EmulatedProcess> runtime;
+    void* handle = nullptr;
+    uint64_t pid = 0;
+    bool done = false;      // its run() has returned (set with the lock held)
+  };
+  static constexpr uint32_t kMaxForks = 32;
+  static void fork_entry(void* child) {
+    ForkChild* c = static_cast<ForkChild*>(child);
+    c->runtime->run();
+    c->runtime->sync_.lock();
+    c->done = true;
+    c->runtime->sync_.notify_all();
+    c->runtime->sync_.unlock();
+  }
+  bool start_fork(const IGuestCpu& cpu, const process::LinuxProcessState::ForkRequest& request);
+  // Ends the children that still run and waits for every child's thread. Called without the lock.
+  void finish_forks();
+
   struct Slot {
     bool used = false, started = false, finished = false, terminate = false;
     uint32_t terminate_code = 0;
@@ -119,6 +177,8 @@ class EmulatedProcess final : public process::IProcessRuntime {
   GuestMemory memory_;
   process::UserArch arch_ = process::UserArch::None;
   Slot slots_[kMaxSlots];
+  UniquePointer<ForkChild> forks_[kMaxForks];
+  bool forked_ = false;      // this is the child of a fork: its first thread's CPU is a copy of its parent's thread, not a program at its entry
   uint32_t live_ = 0;
   EmulatedOutcome outcome_;
 };
@@ -134,6 +194,42 @@ bool EmulatedProcess::launch(Slot& slot) {
     return false;
   }
   return true;
+}
+
+bool EmulatedProcess::start_fork(const IGuestCpu& cpu, const process::LinuxProcessState::ForkRequest& request) {
+  if (!threads_ || !allocator_) return false;
+  UniquePointer<ForkChild>* place = nullptr;
+  for (UniquePointer<ForkChild>& c : forks_) {
+    // (a child that has ended and been waited for is still asked about by nobody: its place stays taken until the program ends, which bounds a program to kMaxForks forks)
+    if (!c && !place) place = &c;
+  }
+  if (!place) return false;
+  UniquePointer<ForkChild> child = UniquePointer<ForkChild>::make(*allocator_);
+  if (!child) return false;
+  child->pid = request.pid;
+  child->program = UniquePointer<process::UserProgram>::make(*allocator_, *allocator_, request.pid, program_.host());
+  if (!child->program || !child->program->fork_from(program_, request, process_->fs_base())) return false;
+  child->cpu = cpu.clone_for_thread(*allocator_, request.stack, request.set_tls, request.tls);      // (the result register is 0 in the copy)
+  if (!child->cpu) return false;
+  child->runtime = UniquePointer<EmulatedProcess>::make(*allocator_, *child->program, *child->cpu, control_, sync_, threads_, allocator_, slice_);
+  if (!child->runtime) return false;
+  child->runtime->forked_ = true;
+  child->handle = threads_->spawn(&EmulatedProcess::fork_entry, child.get(), "guest-fork");
+  if (!child->handle) return false;
+  *place = static_cast<UniquePointer<ForkChild>&&>(child);
+  return true;
+}
+
+void EmulatedProcess::finish_forks() {
+  for (UniquePointer<ForkChild>& c : forks_) {
+    if (!c) continue;
+    sync_.lock();
+    if (!c->program->process()->exited()) c->program->process()->terminate(137);      // (a child does not outlive the emulated program that made it)
+    sync_.notify_all();
+    sync_.unlock();
+    threads_->join(c->handle);
+    c = UniquePointer<ForkChild>();
+  }
 }
 
 bool EmulatedProcess::start_thread(const process::ThreadStart& start, bool suspended) {
@@ -239,6 +335,11 @@ void EmulatedProcess::thread_loop(Slot& slot, bool main) {
         result = uint64_t(-int64_t{11});      // -EAGAIN
       }
     }
+    process::LinuxProcessState::ForkRequest fork;
+    if (process_->take_fork(&fork) && !start_fork(cpu, fork)) {      // fork(): the child is a copy of the program as it is at the end of the call
+      process::linuxabi::fork_failed(*process_, fork.pid);
+      result = uint64_t(-int64_t{11});      // -EAGAIN
+    }
     cpu.finish_syscall(result);
     uint64_t fs = 0, gs = 0;
     const bool fs_changed = process_->take_fs_change(&fs), gs_changed = process_->take_gs_change(&gs);
@@ -272,7 +373,7 @@ EmulatedOutcome EmulatedProcess::run() {
   process_->attach_runtime(this);
   sync_.lock();
   slots_[0].token = threads_ ? threads_->self() : 0;
-  slots_[0].cpu->reset(program_.start());
+  if (!forked_) slots_[0].cpu->reset(program_.start());
   sync_.unlock();
   thread_loop(slots_[0], true);
   // The first thread is done; the others may still run. Wait for them, polling so that a stop request reaches them.
@@ -291,6 +392,7 @@ EmulatedOutcome EmulatedProcess::run() {
     if (s.handle && threads_) threads_->join(s.handle);
     s.handle = nullptr;
   }
+  finish_forks();
   process_->attach_runtime(nullptr);
   process_->release_handles();
   outcome_.exited = !outcome_.killed && !outcome_.faulted;
