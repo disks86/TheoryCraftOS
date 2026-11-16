@@ -34,6 +34,7 @@ struct FrameInfo {
   FrameKind kind = FrameKind::Host;
   bool loopback = false;      // a packet this machine sent to itself (it never was a frame: it is shown with an Ethernet header of zero addresses)
   uint32_t length = 0;        // the whole frame's, also when less was copied
+  uint32_t sequence = 0;      // the frame's number among all this interface showed its taps: every tap is told the same one for the same frame
 };
 
 // What the link layer offers a frame tap.
@@ -93,7 +94,7 @@ class FrameTap final : public IFrameTap {
 
   // The tap manager shows every frame to every tap; a tap takes the ones it listens for. `header` and `payload` together are the frame (a looped
   // packet's header is made up on the way here).
-  void deliver(FrameKind kind, bool loopback, ConstByteView header, ConstByteView payload);
+  void deliver(FrameKind kind, bool loopback, ConstByteView header, ConstByteView payload, uint32_t sequence);
   bool closed() const { return __atomic_load_n(&closed_, __ATOMIC_ACQUIRE); }
 
  private:
@@ -133,6 +134,7 @@ class FrameTapManager {
   mutable kernel::Mutex mutex_;      // guards the list (held while a frame is shown to the taps; a tap's queue lock is below it)
   List<SharedPointer<FrameTap>> taps_;
   uint32_t open_ = 0;
+  uint32_t sequence_ = 0;            // frames shown so far (under mutex_)
 };
 
 }  // namespace network

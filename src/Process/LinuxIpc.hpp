@@ -196,8 +196,31 @@ class LinuxIpcManager {
     linuxabi::ring::Request receive_request, transmit_request;
     linuxabi::ring::Receiver receiver;
     linuxabi::ring::Transmitter transmitter;
+    int32_t fanout = -1;                  // the fan-out group it joined (an index into packet_fanouts), or none
   };
   PacketSocket packet_sockets[kPacketSockets];
+  // PACKET_FANOUT: sockets that share the frames of one protocol and interface, each frame going to one of them.
+  static constexpr uint32_t kPacketFanouts = 16;
+  struct PacketFanout {
+    bool used = false;
+    uint16_t id = 0;
+    uint8_t type = 0;                     // PACKET_FANOUT_HASH, ... (how a frame's socket is chosen)
+    uint16_t flags = 0;                   // PACKET_FANOUT_FLAG_*, as they were handed in
+    uint16_t protocol = 0;                // what every member listens for,
+    uint32_t interface = 0;               // and where
+    uint32_t count = 0, most = kPacketSockets;
+    uint64_t members[kPacketSockets] = {};      // the sockets' links, in the order they joined
+    UniquePointer<ByteBuffer> chooser;    // PACKET_FANOUT_CBPF: a classic BPF program whose answer picks the member
+    // PACKET_FANOUT_LB: which frame of the group's a frame is. Every member is shown every frame, so the first member to look at one gives it the
+    // next number, and the others find it here (by its interface and the number the interface gave it) when they come to it.
+    static constexpr uint32_t kRemembered = 256;      // (more than a member's taps hold)
+    struct Ranked {
+      uint32_t interface = 0, sequence = 0, rank = 0;
+    };
+    Ranked ranked[kRemembered];
+    uint32_t ranked_count = 0, next_rank = 0;
+  };
+  PacketFanout packet_fanouts[kPacketFanouts];
 
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];

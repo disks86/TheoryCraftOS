@@ -3,7 +3,7 @@
 # kernel's autorun: tests/linux/forktest.c and signaltest.c (static, no libc: the calls themselves, handlers entered after calls, at timer ticks and on
 # faults), spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
 # a SIGCHLD handler), ipctest.c (static, glibc: System V IPC, POSIX message queues and timers, inotify, pidfd, asynchronous I/O) and nettest.c (static,
-# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6), netlinktest.c (static, glibc: getifaddrs and netlink requests), rawtest.c (static, glibc: echo and raw sockets), packettest.c and ringtest.c (static, glibc: packet sockets and their memory-mapped rings) and resolvetest.c (static, glibc: hosts and services by name, from /etc and from DNS
+# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6), netlinktest.c (static, glibc: getifaddrs and netlink requests), rawtest.c (static, glibc: echo and raw sockets), packettest.c, ringtest.c and fanouttest.c (static, glibc: packet sockets, their memory-mapped rings and fan-out groups) and resolvetest.c (static, glibc: hosts and services by name, from /etc and from DNS
 # through QEMU's DNS server; it needs this machine's own resolver to answer for ".localhost" and ".invalid", as systemd-resolved does). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
 # Then signaltest.c as an AArch64, a RISC-V and a LoongArch program, which the kernel runs on its CPU emulator.
 # Uses its own build folder (build-fork-qemu) so the normal build keeps no autorun.
@@ -15,7 +15,7 @@ rm -rf "$work"; mkdir -p "$work"
 for program in forktest signaltest; do
   gcc -O2 -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -mno-red-zone -fno-asynchronous-unwind-tables -fno-builtin -o "$work/$program" "tests/linux/$program.c"
 done
-for program in spawntest handlertest ipctest nettest netlinktest rawtest packettest ringtest resolvetest; do
+for program in spawntest handlertest ipctest nettest netlinktest rawtest packettest ringtest fanouttest resolvetest; do
   gcc -static -O1 -pthread -o "$work/$program" "tests/linux/$program.c" 2>/dev/null
 done
 # (A statically linked glibc program that looks hosts up cannot be run on this machine for what it should print: the C library then loads this machine's
@@ -46,10 +46,10 @@ run_one() {
   grep -a -q -E "autorun: ended, result 0, exit code 0x0+( |$)" "$build/debugcon.log" || status=1
 }
 # Each program in turn is the one the kernel starts (at the autorun's path), after it ran here for what it should print.
-for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest netlinktest rawtest packettest ringtest resolvetest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
+for program in ${NATIVE-forktest signaltest spawntest handlertest ipctest nettest netlinktest rawtest packettest ringtest fanouttest resolvetest}; do      # (NATIVE="ipctest" EMULATED="" runs one)
   reference=$program
   [ "$program" = resolvetest ] && reference=resolvetest-reference
-  if [ "$program" = rawtest ] || [ "$program" = packettest ] || [ "$program" = ringtest ]; then
+  if [ "$program" = rawtest ] || [ "$program" = packettest ] || [ "$program" = ringtest ] || [ "$program" = fanouttest ]; then
     # (Raw and packet sockets need a right this script does not have: the program runs in a network namespace of its own, where it has it, with the loopback up
     # and echo sockets allowed, which is how the kernel under test treats every program.)
     (cd "$work" && unshare -rn sh -c 'ip link set lo up; echo "0 0" > /proc/sys/net/ipv4/ping_group_range; "./$0"' "$program" > "$program-expected.txt")

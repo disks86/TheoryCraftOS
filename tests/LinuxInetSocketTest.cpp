@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -1851,7 +1852,7 @@ static void test_packet_sockets() {
   // what a packet socket is not, and what it refuses
   CHECK(t.s(50, arp, 1) == -95 && t.s(43, arp, 0, 0) == -95 && t.s(42, arp, address(0, 2), 20) == -95 && t.s(48, arp, 2) == -95 && t.s(52, arp, name, size) == -95);
   CHECK(send(arp, std::string(13, 'x')) == -22 && send(arp, std::string(1515, 'x')) == -90 && send(arp, request, address(0, 7)) == -6 && t.s(44, arp, kBad, 60, 0, 0, 0) == -14);
-  CHECK(t.s(54, arp, 263, 18, t.word(1), 4) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // PACKET_FANOUT; another level
+  CHECK(t.s(54, arp, 263, 99, t.word(1), 4) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // an option there is not; another level
   CHECK(t.s(54, arp, 263, 1, buffer, 16) == 0 && t.s(54, arp, 263, 1, buffer, 8) == -22);      // PACKET_ADD_MEMBERSHIP (promiscuous mode): taken
   // read and write, readv and writev; the interface ioctls
   {
@@ -2168,6 +2169,148 @@ static void test_packet_ring_sockets() {
   CHECK(t.s(3, out) == 0 && t.s(3, fd) == 0);
 }
 
+// PACKET_FANOUT: sockets that share one stream of frames, each frame going to one of them.
+static void test_packet_fanout() {
+  constexpr uint64_t kPacket = 17, kRaw = 3, kArp = 0x0608, kIp = 0x0008;
+  constexpr uint32_t kHash = 0, kLoadBalance = 1 << 16, kCpu = 2 << 16, kCbpf = 6 << 16, kUniqueId = 0x2000u << 16;
+  Setup t;
+  const uint8_t* mac_b = t.lan.nic_b.mac.bytes;
+  const uint8_t everyone[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  const std::string there("\x0A\0\0\x02", 4);
+  const uint64_t address = t.alloc(24), buffer = t.alloc(2048);
+  uint32_t v = 0;
+  {
+    const uint8_t raw[20] = {17, 0, 0, 0, 2};
+    t.memory.write(address, ConstByteView(raw, 20));
+  }
+  auto open = [&](uint64_t protocol) {
+    const int64_t fd = t.s(41, kPacket, kRaw | kNonBlock, protocol);
+    CHECK(fd >= 3 && t.s(49, fd, address, 20) == 0);
+    return fd;
+  };
+  auto join = [&](int64_t fd, uint32_t group) { return t.s(54, fd, 263, 18, t.word(group), 4); };
+  SharedPointer<network::IFrameTap> other = t.lan.b.frame_open();
+  CHECK(other);
+  // ARP questions from the other machine, each for another address (so that each frame can be told from the rest)
+  auto ask = [&](int first, int count) {
+    for (int i = 0; i < count; ++i) {
+      const std::string frame = ethernet(everyone, mac_b, 0x0806, arp_message(1, mac_b, there, std::string("\x0A\0\x05", 3) + char(first + i)));
+      CHECK(other->send(ConstByteView(reinterpret_cast<const uint8_t*>(frame.data()), frame.size())));
+    }
+    t.lan.step(30);
+  };
+  // which questions a socket got: the last byte of each one's target address
+  auto got = [&](int64_t fd) {
+    std::vector<int> out;
+    for (int i = 0; i < 100; ++i) {
+      const int64_t n = t.s(45, fd, buffer, 2048, 0, 0, 0);
+      if (n < 42) break;
+      out.push_back(uint8_t(t.text(buffer + 41, 1)[0]));
+    }
+    return out;
+  };
+
+  // each in turn (PACKET_FANOUT_LB): three sockets, nine frames, three each, and every frame at exactly one of them
+  const int64_t a = open(kArp), b = open(kArp), c = open(kArp);
+  CHECK(t.option(a, 263, 18, &v) == 0 && v == 0 && join(a, 7 | kLoadBalance) == 0 && join(b, 7 | kLoadBalance) == 0 && join(c, 7 | kLoadBalance) == 0);
+  CHECK(t.option(b, 263, 18, &v) == 0 && v == (7 | kLoadBalance));
+  ask(10, 9);
+  std::vector<int> ga = got(a), gb = got(b), gc = got(c), all = ga;
+  all.insert(all.end(), gb.begin(), gb.end());
+  all.insert(all.end(), gc.begin(), gc.end());
+  std::sort(all.begin(), all.end());
+  CHECK(ga.size() == 3 && gb.size() == 3 && gc.size() == 3 && all == std::vector<int>({10, 11, 12, 13, 14, 15, 16, 17, 18}));
+  CHECK(ga.size() == 3 && ga[1] - ga[0] == 3 && ga[2] - ga[1] == 3);      // (every third one)
+  // what does not fit a group: another way of sharing, another protocol, a second group for a socket, a socket that listens for nothing, binding a member
+  const int64_t ip = open(kIp), nothing = t.s(41, kPacket, kRaw, 0), late = open(kArp);
+  CHECK(join(late, 7 | kHash) == -22 && join(ip, 7 | kLoadBalance) == -22 && join(a, 8 | kLoadBalance) == -114 && join(nothing, 9 | kLoadBalance) == -22 && t.s(49, a, address, 20) == -22);
+  CHECK(join(late, 9 | (7u << 16)) == -22 && join(late, 9 | (8u << 16)) == -22 && join(late, 9 | (3u << 16) | (0x1000u << 16)) == -22 && t.s(54, late, 263, 18, t.word(9), 2) == -22);
+  // a member that closes leaves the rest everything; the last one out ends the group, and its number is anybody's again
+  CHECK(t.s(3, c) == 0);
+  ask(30, 6);
+  ga = got(a); gb = got(b);
+  CHECK(ga.size() == 3 && gb.size() == 3 && join(late, 7 | kHash) == -22);
+  CHECK(t.s(3, a) == 0 && t.s(3, b) == 0 && join(late, 7 | kHash) == 0 && t.option(late, 263, 18, &v) == 0 && v == 7);
+  while (!got(late).empty()) {}      // (what it heard while it was in no group)
+  ask(40, 4);
+  CHECK(got(late).size() == 4);      // (a group of one gets every frame)
+
+  // by flow (PACKET_FANOUT_HASH): datagrams of one conversation all go to one socket, whichever way they travel
+  const int64_t h1 = open(kIp), h2 = open(kIp);
+  CHECK(join(h1, 20 | kHash) == 0 && join(h2, 20 | kHash) == 0 && join(ip, 20 | kHash) == 0);
+  SharedPointer<network::IUdpSocket> peers[6];
+  for (int i = 0; i < 6; ++i) {
+    peers[i] = t.lan.b.udp_open_families(uint16_t(7000 + i * 13), network::IpFamilies::Both);
+    CHECK(peers[i]);
+    for (int n = 0; n < 4 && peers[i]; ++n) {
+      CHECK(peers[i]->send_to_ip(network::IpAddress(network::Ipv4Address::make(10, 0, 0, 1)), 5555, ConstByteView(reinterpret_cast<const uint8_t*>("flow"), 4)));
+      t.lan.step(5);      // (the first one waits for the other machine's address to be found)
+    }
+  }
+  t.lan.step(40);
+  int total = 0, used = 0;
+  std::map<int, int> where;      // a source port's socket
+  bool together = true;
+  for (const int64_t fd : {h1, h2, ip}) {
+    int here = 0;
+    for (int i = 0; i < 100; ++i) {
+      const int64_t n = t.s(45, fd, buffer, 2048, 0, 0, 0);
+      if (n < 42) break;
+      const std::string frame = t.text(buffer, uint64_t(n));
+      if (frame[23] != 17) continue;      // (only the datagrams)
+      const int port = uint8_t(frame[34]) << 8 | uint8_t(frame[35]);
+      if (where.count(port) && where[port] != int(fd)) together = false;
+      where[port] = int(fd);
+      ++here;
+    }
+    total += here;
+    used += here != 0;
+  }
+  CHECK(total == 24 && together && where.size() == 6 && used >= 2);      // (six flows over three sockets: more than one of them has some)
+
+  // by a program (PACKET_FANOUT_CBPF with PACKET_FANOUT_DATA): here one that always answers 1, the second member
+  const int64_t p1 = open(kArp), p2 = open(kArp);
+  const std::string program = filter::op(0x06, 0, 0, 1);
+  const uint64_t fprog = t.alloc(16);
+  t.put64(fprog, 1); t.put64(fprog + 8, t.bytes(program));
+  CHECK(t.s(54, p1, 263, 22, fprog, 16) == -22 && join(p1, 30 | kCbpf) == 0 && join(p2, 30 | kCbpf) == 0 && t.s(54, p1, 263, 22, fprog, 16) == 0 && t.s(54, late, 263, 22, fprog, 16) == -22);
+  t.put64(fprog, 2);
+  CHECK(t.s(54, p1, 263, 22, fprog, 16) == -22);      // (not a program: two instructions where there is one)
+  while (!got(late).empty()) {}
+  ask(50, 5);
+  CHECK(got(p1).empty() && got(p2).size() == 5 && got(late).size() == 5);      // (and a socket of another group still gets them all)
+  // by processor (PACKET_FANOUT_CPU): every frame counts as the first processor's here
+  const int64_t c1 = open(kArp), c2 = open(kArp);
+  CHECK(join(c1, 31 | kCpu) == 0 && join(c2, 31 | kCpu) == 0);
+  ask(60, 4);
+  CHECK(got(c1).size() == 4 && got(c2).empty());
+  // PACKET_FANOUT_FLAG_UNIQUEID: the kernel picks a number nobody has; struct fanout_args names the most members a group may have
+  const int64_t u1 = open(kArp), u2 = open(kArp), u3 = open(kArp);
+  CHECK(join(u1, 5 | kLoadBalance | kUniqueId) == -22 && join(u1, kLoadBalance | kUniqueId) == 0 && t.option(u1, 263, 18, &v) == 0 && (v >> 16) == 1 &&
+        (v & 0xFFFF) != 7 && (v & 0xFFFF) != 20 && (v & 0xFFFF) != 30 && (v & 0xFFFF) != 31);
+  const uint64_t arguments = t.alloc(8);
+  t.put32(arguments, 40 | kLoadBalance); t.put32(arguments + 4, 1);
+  CHECK(t.s(54, u2, 263, 18, arguments, 8) == 0 && join(u3, 40 | kLoadBalance) == -28);      // (full)
+  t.put32(arguments + 4, 70000);
+  CHECK(t.s(54, u3, 263, 18, arguments, 8) == -22);
+  // a ring of a group's member gets only that member's frames
+  {
+    const int64_t r1 = open(kArp), r2 = open(kArp);
+    const uint64_t request = t.alloc(16);
+    t.put32(request, 4096); t.put32(request + 4, 2); t.put32(request + 8, 2048); t.put32(request + 12, 4);
+    CHECK(join(r1, 50 | kLoadBalance) == 0 && join(r2, 50 | kLoadBalance) == 0 && t.s(54, r1, 263, 10, t.word(1), 4) == 0 && t.s(54, r1, 263, 5, request, 16) == 0);
+    ask(70, 4);
+    uint64_t link = 0;
+    BlockRef blocks[2];
+    uint64_t sizes[2] = {};
+    CHECK(t.polled(r1, kPollIn) == kPollIn && linuxabi::packet_descriptor(t.process, uint64_t(r1), &link) && linuxabi::packet_rings(link, blocks, sizes) == 1);
+    const ConstByteView ring = blocks[0].get()->bytes();
+    CHECK(rings::u32(ring, 0) == 1 && rings::u32(ring, 2048) == 1 && rings::u32(ring, 4096) == 0 && got(r2).size() == 2);
+    CHECK(t.s(3, r1) == 0 && t.s(3, r2) == 0);
+  }
+  for (const int64_t fd : {ip, nothing, late, h1, h2, p1, p2, c1, c2, u1, u2, u3}) CHECK(t.s(3, fd) == 0);
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -2187,6 +2330,7 @@ int main() {
   test_packet_sockets();
   test_packet_ring_formats();
   test_packet_ring_sockets();
+  test_packet_fanout();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

@@ -38,7 +38,7 @@ namespace process::linuxabi {
 namespace {
 
 constexpr int64_t kEperm = 1, kEnoent = 2, kEintr = 4, kEnxio = 6, kEbadf = 9, kEagain = 11, kEnomem = 12, kEfault = 14, kEnodev = 19, kEinval = 22, kEmfile = 24,
-                  kEbusy = 16, kEmsgsize = 90, kEnoprotoopt = 92, kEsocktnosupport = 94, kEopnotsupp = 95, kEnobufs = 105;
+                  kEbusy = 16, kEnospc = 28, kEalready = 114, kEmsgsize = 90, kEnoprotoopt = 92, kEsocktnosupport = 94, kEopnotsupp = 95, kEnobufs = 105;
 uint64_t error(int64_t e) { return uint64_t(-e); }
 
 constexpr uint64_t kAfPacket = 17;
@@ -66,12 +66,115 @@ Socket* socket_of(LinuxIpcManager& ipc, uint64_t link) {
   return &ipc.packet_sockets[index];
 }
 
+uint16_t ether_type_of(const Frame& f);
+
+// PACKET_FANOUT. A group's members each hold taps of their own, so each is shown every frame; what makes a frame go to one of them only is that they
+// all work out the same member for it, from the frame (its flow, or which of the group's frames it is: rank_of) and the group as it is when the frame
+// is looked at. A frame that waits while the group changes may so go to nobody or to two: joining and leaving are rare.
+constexpr uint8_t kFanoutHash = 0, kFanoutLoadBalance = 1, kFanoutCpu = 2, kFanoutRollover = 3, kFanoutRandom = 4, kFanoutQueue = 5, kFanoutCbpf = 6;
+constexpr uint16_t kFanoutFlagRollover = 0x1000, kFanoutFlagUniqueId = 0x2000, kFanoutFlagIgnoreOutgoing = 0x4000, kFanoutFlagDefragment = 0x8000;
+
+uint32_t mix(uint32_t h) {
+  h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+  return h;
+}
+
+// A number that is the same for both directions of a flow: of an IPv4 or IPv6 frame its two addresses and (TCP, UDP) its two ports; of anything else its
+// ether type and the two hardware addresses.
+uint32_t flow_of(ConstByteView frame) {
+  auto sum = [](ConstByteView bytes) {
+    uint32_t v = 0, i = 0;
+    for (const uint8_t b : bytes) v += uint32_t{b} << (8 * (i++ & 3));
+    return v;
+  };
+  if (frame.size() < kHead) return 0;
+  const uint16_t type = uint16_t(frame[12] << 8 | frame[13]);
+  const ConstByteView packet = frame.dropped(kHead);
+  uint32_t ends = 0, protocol = 0;
+  ConstByteView transport;
+  if (type == 0x0800 && packet.size() >= 20 && (packet[0] >> 4) == 4) {
+    const uint32_t header = (packet[0] & 0x0Fu) * 4u;
+    ends = sum(packet.subview(12, 4)) + sum(packet.subview(16, 4));
+    protocol = packet[9];
+    if (header >= 20 && header <= packet.size() && (uint16_t(packet[6] << 8 | packet[7]) & 0x1FFF) == 0) transport = packet.dropped(header);      // (not a later fragment)
+  } else if (type == 0x86DD && packet.size() >= 40 && (packet[0] >> 4) == 6) {
+    ends = sum(packet.subview(8, 16)) + sum(packet.subview(24, 16));
+    protocol = packet[6];
+    transport = packet.dropped(40);
+  } else {
+    return mix(type + sum(frame.first(6)) + sum(frame.subview(6, 6)));
+  }
+  uint32_t ports = 0;
+  if ((protocol == 6 || protocol == 17) && transport.size() >= 4) ports = uint32_t(transport[0] << 8 | transport[1]) + uint32_t(transport[2] << 8 | transport[3]);
+  return mix(ends + mix(ports + protocol));
+}
+
+// Is the frame the socket's taps just handed it one for this socket? (Always, outside a group; in one, only if the group's choice for it is this socket.)
+// A frame's number among the frames of its group, the same whichever member asks (see PacketFanout::ranked).
+uint32_t rank_of(LinuxIpcManager::PacketFanout& group, const Frame& f) {
+  using Group = LinuxIpcManager::PacketFanout;
+  const uint32_t known = group.ranked_count < Group::kRemembered ? group.ranked_count : Group::kRemembered;
+  for (uint32_t i = 0; i < known; ++i) {      // (the newest first: that is where a member that keeps up finds its frame)
+    const Group::Ranked& r = group.ranked[(group.ranked_count - 1 - i) % Group::kRemembered];
+    if (r.interface == f.interface && r.sequence == f.info.sequence) return r.rank;
+  }
+  Group::Ranked& r = group.ranked[group.ranked_count % Group::kRemembered];
+  r.interface = f.interface;
+  r.sequence = f.info.sequence;
+  r.rank = group.next_rank++;
+  ++group.ranked_count;
+  return r.rank;
+}
+
+bool chosen(LinuxIpcManager& ipc, const Socket& socket, uint64_t link, const Frame& f) {
+  if (socket.fanout < 0 || uint32_t(socket.fanout) >= LinuxIpcManager::kPacketFanouts) return true;
+  LinuxIpcManager::PacketFanout& group = ipc.packet_fanouts[socket.fanout];
+  if (!group.used || group.count == 0) return true;
+  const ConstByteView frame = ConstByteView(f.data).first(f.info.length);
+  uint32_t pick = 0;
+  switch (group.type) {
+    case kFanoutHash: pick = flow_of(frame); break;
+    case kFanoutLoadBalance: pick = rank_of(group, f); break;      // (each in turn)
+    case kFanoutRandom: pick = mix(f.info.sequence + 0x9E3779B9u); break;
+    case kFanoutCbpf: {      // the program's answer
+      if (!group.chooser || group.chooser->size() == 0) break;
+      bpf::Packet packet;
+      packet.data = socket.cooked ? frame.dropped(kHead) : frame;
+      if (socket.cooked) packet.link = frame.first(kHead);
+      packet.network_offset = socket.cooked ? 0 : kHead;
+      packet.wire_length = uint32_t(packet.data.size());
+      packet.protocol = ether_type_of(f);
+      packet.packet_type = uint8_t(f.info.kind);
+      packet.interface_index = f.interface;
+      pick = bpf::run(group.chooser->view(), packet);
+      break;
+    }
+    // PACKET_FANOUT_CPU and PACKET_FANOUT_QM: frames are not told apart by processor or by queue here, so they all count as the first's;
+    // PACKET_FANOUT_ROLLOVER: the first member, which is never found too busy
+    default: break;
+  }
+  return group.members[pick % group.count] == link;
+}
+
+// Takes a socket out of its group; the last one out ends the group.
+void leave_fanout(LinuxIpcManager& ipc, Socket& socket, uint64_t link) {
+  if (socket.fanout < 0 || uint32_t(socket.fanout) >= LinuxIpcManager::kPacketFanouts) return;
+  LinuxIpcManager::PacketFanout& group = ipc.packet_fanouts[socket.fanout];
+  socket.fanout = -1;
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < group.count; ++i)
+    if (group.members[i] != link) group.members[kept++] = group.members[i];
+  group.count = kept;
+  if (kept == 0) group = LinuxIpcManager::PacketFanout();
+}
+
 // The last descriptor of a socket was closed (called by the descriptor manager with the system's lock held).
 void socket_gone(uint64_t link, uint32_t) {
   LinuxIpcManager* ipc = existing_linux_ipc();
   if (!ipc) return;
   Socket* socket = socket_of(*ipc, link);
   if (!socket) return;
+  leave_fanout(*ipc, *socket, link);
   for (SharedPointer<network::IFrameTap>& tap : socket->taps)
     if (tap) tap->close();
   const uint16_t sequence = uint16_t((socket->sequence + 1) % 0x7FFF);
@@ -99,6 +202,7 @@ ConstByteView shown(const Socket& socket, const Frame& f) {
 // Makes the next frame the socket is to get its held one: taken from a tap (each in turn), and through the filter. False if there is none now (the
 // system's lock held).
 bool fetch_locked(LinuxIpcManager& ipc, Socket& socket) {
+  const uint64_t link = link_of(ipc, &socket);
   if (socket.has_held) return true;
   if (!socket.held) {
     socket.held = UniquePointer<Frame>::make(ipc.allocator());
@@ -118,6 +222,7 @@ bool fetch_locked(LinuxIpcManager& ipc, Socket& socket) {
     if (!any) return false;
     if (f.info.length > sizeof(f.data)) f.info.length = sizeof(f.data);
     if (f.info.length < kHead) continue;
+    if (!chosen(ipc, socket, link, f)) continue;      // (another socket of its fan-out group gets this one)
     const ConstByteView data = shown(socket, f);
     f.kept = uint32_t(data.size());
     if (socket.filter && socket.filter->size() != 0) {
@@ -398,6 +503,7 @@ uint64_t packet_bind(Process& p, uint64_t link, uint64_t address, uint64_t lengt
   Locked locked(ipc->sync());
   Socket* socket = socket_of(*ipc, link);
   if (!socket) return error(kEbadf);
+  if (socket->fanout >= 0) return error(kEinval);      // (a group's members listen to the same thing: no more binding)
   socket->interface = interface;
   if (protocol != 0) socket->protocol = protocol;
   listen(*socket);
@@ -585,7 +691,7 @@ constexpr uint64_t kSolSocket = 1, kSolPacket = 263;
 constexpr uint64_t kSoType = 3, kSoError = 4, kSoBroadcast = 6, kSoSndBuf = 7, kSoRcvBuf = 8, kSoPriority = 12, kSoRcvTimeo = 20, kSoBindToDevice = 25, kSoAttachFilter = 26,
                    kSoDetachFilter = 27, kSoSndBufForce = 32, kSoRcvBufForce = 33, kSoMark = 36, kSoProtocol = 38, kSoDomain = 39, kSoLockFilter = 44, kSoRcvTimeoNew = 66;
 constexpr uint64_t kAddMembership = 1, kDropMembership = 2, kReceiveRing = 5, kStatistics = 6, kCopyThreshold = 7, kAuxData = 8, kVersion = 10, kHeaderLength = 11, kReserve = 12,
-                   kTransmitRing = 13, kLoss = 14, kTimestamp = 17, kTransmitOffsets = 19, kQdiscBypass = 20, kIgnoreOutgoing = 23;
+                   kTransmitRing = 13, kLoss = 14, kTimestamp = 17, kFanout = 18, kTransmitOffsets = 19, kQdiscBypass = 20, kFanoutData = 22, kIgnoreOutgoing = 23;
 constexpr uint64_t kLargestRing = 64ull << 20;
 }  // namespace
 
@@ -725,7 +831,81 @@ uint64_t packet_setsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
       }
       return 0;
     }
-    // (PACKET_FANOUT and the rest)
+    case kFanout: {
+      // An int: the group's number in the low half, how frames are shared out and flags in the high half; or struct fanout_args, which adds the most
+      // members the group may have. A new number makes a group; a known one is joined if everything about it is the same.
+      if (length < 4) return error(kEinval);
+      const uint16_t id = uint16_t(number), type_flags = uint16_t(number >> 16), flags = type_flags & 0xFF00;
+      const uint8_t type = uint8_t(type_flags);
+      uint32_t most = LinuxIpcManager::kPacketSockets;
+      if (length >= 8) {
+        ByteReader more{ConstByteView(raw).subview(4, 4)};
+        const uint32_t asked = more.le32();
+        if (asked > 65536) return error(kEinval);
+        if (asked != 0 && asked < most) most = asked;
+      }
+      if (type > kFanoutCbpf + 1 || (flags & ~(kFanoutFlagRollover | kFanoutFlagUniqueId | kFanoutFlagIgnoreOutgoing | kFanoutFlagDefragment)) != 0) return error(kEinval);
+      if (type == kFanoutCbpf + 1) return error(kEinval);      // PACKET_FANOUT_EBPF: there are no such programs here
+      if (type == kFanoutRollover && (flags & kFanoutFlagRollover)) return error(kEinval);
+      if (socket->fanout >= 0) return error(kEalready);
+      if (socket->protocol == 0) return error(kEinval);      // (a socket that listens for nothing has nothing to share)
+      LinuxIpcManager::PacketFanout* group = nullptr;
+      if (flags & kFanoutFlagUniqueId) {      // the kernel picks a number nobody uses
+        if (id != 0) return error(kEinval);
+        for (uint32_t candidate = 0; candidate < 65536 && !group; ++candidate) {      // (from 0, as Linux counts)
+          bool taken = false;
+          for (const LinuxIpcManager::PacketFanout& other : ipc->packet_fanouts) taken = taken || (other.used && other.id == candidate);
+          if (taken) continue;
+          for (LinuxIpcManager::PacketFanout& free : ipc->packet_fanouts)
+            if (!free.used && !group) { group = &free; group->id = uint16_t(candidate); }
+          break;
+        }
+        if (!group) return error(kEnospc);
+      } else {
+        for (LinuxIpcManager::PacketFanout& other : ipc->packet_fanouts)
+          if (other.used && other.id == id) group = &other;
+        if (group) {
+          if (group->type != type || group->flags != (flags & ~kFanoutFlagUniqueId) || group->protocol != socket->protocol || group->interface != socket->interface) return error(kEinval);
+          if (group->count >= group->most || group->count >= LinuxIpcManager::kPacketSockets) return error(kEnospc);
+        } else {
+          for (LinuxIpcManager::PacketFanout& free : ipc->packet_fanouts)
+            if (!free.used && !group) { group = &free; group->id = id; }
+          if (!group) return error(kEnospc);
+        }
+      }
+      if (!group->used) {
+        group->used = true;
+        group->type = type;
+        group->flags = flags & ~kFanoutFlagUniqueId;
+        group->protocol = socket->protocol;
+        group->interface = socket->interface;
+        group->most = most;
+        group->count = 0;
+      }
+      group->members[group->count++] = link;
+      socket->fanout = int32_t(group - &ipc->packet_fanouts[0]);
+      if (group->flags & kFanoutFlagIgnoreOutgoing) {
+        socket->ignore_outgoing = true;
+        listen(*socket);
+      }
+      return 0;
+    }
+    case kFanoutData: {      // PACKET_FANOUT_CBPF's program (struct sock_fprog, as SO_ATTACH_FILTER takes): the member is its answer modulo how many there are
+      if (socket->fanout < 0) return error(kEinval);
+      LinuxIpcManager::PacketFanout& group = ipc->packet_fanouts[socket->fanout];
+      if (group.type != kFanoutCbpf || length < 16) return error(kEinval);
+      ByteReader program{ConstByteView(raw)};
+      const uint16_t count = program.le16();
+      program.skip(6);
+      const uint64_t at = program.le64();
+      if (count == 0 || count > bpf::kMostInstructions) return error(kEinval);
+      UniquePointer<ByteBuffer> chooser = UniquePointer<ByteBuffer>::make(ipc->allocator(), ipc->allocator());
+      if (!chooser || !chooser->put_zeros(uint64_t{count} * bpf::kInstructionSize)) return error(kEnomem);
+      if (!p.read_user(at, chooser->writable_view())) return error(kEfault);
+      if (!bpf::valid(chooser->view())) return error(kEinval);
+      group.chooser = static_cast<UniquePointer<ByteBuffer>&&>(chooser);
+      return 0;
+    }
     default: return error(kEnoprotoopt);
   }
 }
@@ -772,6 +952,12 @@ uint64_t packet_getsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
           socket->drops = 0;
           break;
         case kVersion: w.le32(socket->version); break;
+        case kFanout: {      // the group's number, how it shares frames out and its flags, in one word (0: in no group)
+          if (socket->fanout < 0) { w.le32(0); break; }
+          const LinuxIpcManager::PacketFanout& group = ipc->packet_fanouts[socket->fanout];
+          w.le32(uint32_t{group.id} | uint32_t{group.type} << 16 | uint32_t{group.flags} << 16);
+          break;
+        }
         case kTransmitOffsets: w.le32(socket->transmit_offsets ? 1 : 0); break;
         case kHeaderLength: {      // the size of a ring frame's header in the version the program names
           if (room < 4 || requested > 2) return error(kEinval);

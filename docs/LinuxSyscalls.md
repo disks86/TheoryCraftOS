@@ -237,11 +237,21 @@ sends to itself; a socket (`LinuxPacket.cpp`) holds one on each interface and te
     (`EMSGSIZE` or `EINVAL`), or with `PACKET_LOSS` is passed over. `PACKET_TX_HAS_OFF` is honoured.
   - What the program writes into a ring is not trusted: every offset is worked out on the kernel's side, a length is checked
     against the place it is in, and a frame to send is copied out once before it is looked at.
+- `PACKET_FANOUT`: sockets that listen for the same protocol on the same interface join a group (a number of the program's choosing,
+  or of the kernel's with `PACKET_FANOUT_FLAG_UNIQUEID`), and each frame goes to one of them: in turn (`PACKET_FANOUT_LB`), by flow
+  (`PACKET_FANOUT_HASH`: both directions of a conversation at the same socket), at random (`PACKET_FANOUT_RND`), or as a classic BPF
+  program says (`PACKET_FANOUT_CBPF` with `PACKET_FANOUT_DATA`). A group has at most 32 members (fewer if `struct fanout_args` says
+  so) and there are 16 groups; a socket leaves its group only by closing, and the last one out ends it. Each member still has its
+  own filter, ring and statistics. Every member's taps are shown every frame; what makes a frame go to one member only is that all
+  of them work out the same member for it when they come to it. So: a frame that waits while a socket joins or leaves may go to
+  nobody or to two; `PACKET_FANOUT_CPU` and `PACKET_FANOUT_QM` send everything to the first member (frames are not told apart by
+  processor or queue here), `PACKET_FANOUT_ROLLOVER` and the rollover flag too (a member is never found too busy: one that does not
+  read loses its share), `PACKET_FANOUT_FLAG_DEFRAG` changes nothing, and `PACKET_FANOUT_EBPF` is `EINVAL`.
 - Limits: frames are moved into a receive ring when the socket is looked at (`poll`, which looks every 2 ms while it waits, a
   receive, `PACKET_STATISTICS`), not when they arrive, so a program that only watches the mapped memory without ever calling `poll`
   sees nothing, and a V3 block is handed over by the clock only then; a ring is at most 64 MiB; frames carry the time they were
   moved, not the time they arrived, and no checksum or VLAN status bits. `tcpdump` itself has not been run on this (it is not in the
-  system image); what it needs of packet sockets is here. No `PACKET_FANOUT`; an interface is not put into promiscuous mode, so
+  system image); what it needs of packet sockets is here. An interface is not put into promiscuous mode, so
   frames for other machines are heard only if the hardware hands them up anyway; a frame that waits has no time stamp
   (`SIOCGSTAMP`); a tap keeps 64 frames and loses the rest (counted as drops); on Linux an `ETH_P_ALL` socket hears a loopback packet
   twice (going out and coming in) and a `127.x` packet injected as a frame is dropped as a martian, where here it is heard once and
@@ -294,8 +304,8 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: promiscuous mode, fan-out, rings
-  filled as frames arrive. Of netlink: changing the
+  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: promiscuous mode, rings filled as
+  frames arrive, fan-out by processor or with rollover. Of netlink: changing the
   network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
@@ -314,7 +324,7 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets, `packettest.c` for packet sockets and `ringtest.c` for their memory-mapped rings (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets, `packettest.c` for packet sockets, `ringtest.c` for their memory-mapped rings and `fanouttest.c` for fan-out groups (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
   for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
@@ -324,7 +334,8 @@ back to `read` and `write`.
   machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters); the socket filter on its own (every instruction,
   programs that are not, any bit of a program flipped, random programs); packet sockets: an ARP exchange with the second
   machine by hand, outgoing frames, the loopback, a filter; and their rings: the three layouts on their own (frames in and out, a
-  full ring, random bytes where a program writes) and through the socket calls.
+  full ring, random bytes where a program writes) and through the socket calls; and fan-out groups (every frame at exactly one
+  member, in turn, by flow, by a program).
 - `tests/run_host_tests.sh NetworkThreadTest`: raw sockets and frame taps used from several threads at once, under ThreadSanitizer.
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for

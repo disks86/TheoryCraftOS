@@ -25,7 +25,7 @@ void FrameTap::listen(uint16_t ether_type, bool all, bool wire, bool loopback, b
   __atomic_store_n(&wanted_, wanted, __ATOMIC_RELEASE);
 }
 
-void FrameTap::deliver(FrameKind kind, bool loopback, ConstByteView header, ConstByteView payload) {
+void FrameTap::deliver(FrameKind kind, bool loopback, ConstByteView header, ConstByteView payload, uint32_t sequence) {
   const uint32_t wanted = __atomic_load_n(&wanted_, __ATOMIC_ACQUIRE);
   if (closed() || !(wanted & kListening) || !(wanted & (loopback ? kLoopback : kWire))) return;
   if (header.size() < hardware::kEthernetHeaderSize || payload.size() > kMaxFrame - header.size()) return;
@@ -38,6 +38,7 @@ void FrameTap::deliver(FrameKind kind, bool loopback, ConstByteView header, Cons
   Frame f;      // (filled before the lock: only the enqueue's copy happens under it)
   f.info.kind = kind;
   f.info.loopback = loopback;
+  f.info.sequence = sequence;
   f.info.length = static_cast<uint32_t>(header.size() + payload.size());
   ByteView(f.data).first(header.size()).copy_from(header);
   ByteView(f.data).subview(header.size(), payload.size()).copy_from(payload);
@@ -94,8 +95,9 @@ SharedPointer<FrameTap> FrameTapManager::open() {
 
 void FrameTapManager::deliver(FrameKind kind, bool loopback, ConstByteView header, ConstByteView payload, const void* except) {
   kernel::ScopedMutex guard(mutex_);
+  const uint32_t sequence = sequence_++;
   for (const SharedPointer<FrameTap>& tap : taps_)
-    if (tap.get() != except) tap->deliver(kind, loopback, header, payload);
+    if (tap.get() != except) tap->deliver(kind, loopback, header, payload, sequence);
 }
 
 void FrameTapManager::received(ConstByteView frame) {
