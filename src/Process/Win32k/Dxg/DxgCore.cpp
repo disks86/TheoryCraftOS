@@ -338,7 +338,11 @@ uint32_t wait_for_syncs(Session& s, Call& call, ArrayView<const dxgk::Handle> ha
     }
     IProcessRuntime* runtime = p.runtime();
     if (p.exited() || (runtime && runtime->interrupted())) return nt::kThreadIsTerminating;
+    // The process's lock is let go for the nap, as for any wait: the thread that signals is another thread of this process, and it gets nowhere - not
+    // even into the service that signals - while this one holds the lock.
+    if (runtime) runtime->unlock();
     p.host().sleep_ns(nap < left ? nap : left);
+    if (runtime) runtime->lock();
     if (nap < 1000000) nap *= 2;
   }
 }

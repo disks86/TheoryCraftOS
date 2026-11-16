@@ -70,6 +70,55 @@ static int guid_eq(const GUID *a, const GUID *b) { return memcmp(a, b, sizeof(GU
 #define KGET32(block, offset) (*(UINT32 *)((BYTE *)(block) + (offset)))
 #define KGET64(block, offset) (*(UINT64 *)((BYTE *)(block) + (offset)))
 
+/* In a 32-bit program the D3DKMT functions of gdi32.dll take the structures as a 32-bit program lays them out (gdi32 converts the ones a program
+ * calls itself, src/Windows/gdi32/wow64.inc). These libraries write the kernel's own layout - the same for both widths, by offset - so there they call the
+ * services of win32u.dll, which take it as it is. */
+#ifdef __i386__
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIEnumAdapters2(void *);
+#define D3DKMTEnumAdapters2 NtGdiDdDDIEnumAdapters2
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIOpenAdapterFromLuid(void *);
+#define D3DKMTOpenAdapterFromLuid NtGdiDdDDIOpenAdapterFromLuid
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICloseAdapter(void *);
+#define D3DKMTCloseAdapter NtGdiDdDDICloseAdapter
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIQueryAdapterInfo(void *);
+#define D3DKMTQueryAdapterInfo NtGdiDdDDIQueryAdapterInfo
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIGetDisplayModeList(void *);
+#define D3DKMTGetDisplayModeList NtGdiDdDDIGetDisplayModeList
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICreateDevice(void *);
+#define D3DKMTCreateDevice NtGdiDdDDICreateDevice
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIDestroyDevice(void *);
+#define D3DKMTDestroyDevice NtGdiDdDDIDestroyDevice
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICreateContext(void *);
+#define D3DKMTCreateContext NtGdiDdDDICreateContext
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIDestroyContext(void *);
+#define D3DKMTDestroyContext NtGdiDdDDIDestroyContext
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICreateAllocation(void *);
+#define D3DKMTCreateAllocation NtGdiDdDDICreateAllocation
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIDestroyAllocation(void *);
+#define D3DKMTDestroyAllocation NtGdiDdDDIDestroyAllocation
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDILock(void *);
+#define D3DKMTLock NtGdiDdDDILock
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIUnlock(void *);
+#define D3DKMTUnlock NtGdiDdDDIUnlock
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIRender(void *);
+#define D3DKMTRender NtGdiDdDDIRender
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIEscape(void *);
+#define D3DKMTEscape NtGdiDdDDIEscape
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDICreateSynchronizationObject2(void *);
+#define D3DKMTCreateSynchronizationObject2 NtGdiDdDDICreateSynchronizationObject2
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIDestroySynchronizationObject(void *);
+#define D3DKMTDestroySynchronizationObject NtGdiDdDDIDestroySynchronizationObject
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDISignalSynchronizationObjectFromCpu(void *);
+#define D3DKMTSignalSynchronizationObjectFromCpu NtGdiDdDDISignalSynchronizationObjectFromCpu
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForSynchronizationObjectFromCpu(void *);
+#define D3DKMTWaitForSynchronizationObjectFromCpu NtGdiDdDDIWaitForSynchronizationObjectFromCpu
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDISignalSynchronizationObjectFromGpu(void *);
+#define D3DKMTSignalSynchronizationObjectFromGpu NtGdiDdDDISignalSynchronizationObjectFromGpu
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForSynchronizationObjectFromGpu(void *);
+#define D3DKMTWaitForSynchronizationObjectFromGpu NtGdiDdDDIWaitForSynchronizationObjectFromGpu
+__declspec(dllimport) NTSTATUS __cdecl NtGdiDdDDIWaitForIdle(void *);
+#define D3DKMTWaitForIdle NtGdiDdDDIWaitForIdle
+#else
 NTSTATUS WINAPI D3DKMTEnumAdapters2(void *);
 NTSTATUS WINAPI D3DKMTOpenAdapterFromLuid(void *);
 NTSTATUS WINAPI D3DKMTCloseAdapter(void *);
@@ -92,6 +141,7 @@ NTSTATUS WINAPI D3DKMTWaitForSynchronizationObjectFromCpu(void *);
 NTSTATUS WINAPI D3DKMTSignalSynchronizationObjectFromGpu(void *);
 NTSTATUS WINAPI D3DKMTWaitForSynchronizationObjectFromGpu(void *);
 NTSTATUS WINAPI D3DKMTWaitForIdle(void *);
+#endif
 
 #pragma GCC diagnostic ignored "-Wunused-function"
 

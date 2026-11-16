@@ -56,10 +56,10 @@ i386 yet (a 32-bit program's Vulkan handles are 64-bit numbers, not pointers). W
 - ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32, comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32: the test programs
   hello32, crt32, seh32, gui32 and old32, and the setup programs.
 - ws2_32, comdlg32, winmm, imm32, dbghelp and bcrypt: the test program lib32 (below).
-- The rest (wtsapi32, userenv, crypt32, uxtheme, shfolder, dsound, mmdevapi, xaudio2, dwrite, opengl32, the Direct3D libraries, ...) are there so
-  that a program importing them loads; nothing of them has been run. The ones that are stubs or work through kernel32 and advapi32 can be expected
-  to do what their 64-bit forms do. dwrite's and opengl32's requests to the kernel have one layout for both widths; the Direct3D libraries hand
-  the kernel structures full of pointers, which nothing converts.
+- dxgi and d3d12, and gdi32's D3DKMT functions: the test program dx32 (Direct3D, below).
+- The rest (wtsapi32, userenv, crypt32, uxtheme, shfolder, dsound, mmdevapi, xaudio2, dwrite, opengl32, ...) are there so that a program
+  importing them loads; nothing of them has been run. The ones that are stubs or work through kernel32 and advapi32 can be expected to do what
+  their 64-bit forms do. dwrite's and opengl32's requests to the kernel have one layout for both widths. d3d9 and d3d11 are stubs for both widths.
 
 What each of the second group needed says what to look for in the others:
 
@@ -74,6 +74,21 @@ What each of the second group needed says what to look for in the others:
 - **A width in a context value.** winmm packed a timer's slot and id into the 64 bits of a callback's context.
 - **dbghelp** walks a 32-bit stack by its frame pointers (`StackWalk64` with `IMAGE_FILE_MACHINE_I386`): there is no unwind data, so a function
   compiled without a frame pointer is passed over. `RtlCaptureContext` describes its caller's caller in a 32-bit program, as on Windows.
+
+**Direct3D.** The kernel's Direct3D services (`NtGdiDdDDI*`, src/Process/Win32k/Dxg) read the structures of d3dkmthk.h in the 64-bit layout.
+
+- dxgi.dll and d3d12.dll are the user-mode half of the kernel's driver: they write those structures by offset (src/Windows/dxcommon.h), which gives
+  the kernel's layout in a 32-bit program too. There they call win32u.dll's services with it, not gdi32.dll's D3DKMT functions. What they hand a
+  program - COM interfaces, 64-bit GPU addresses, descriptor handles as wide as a pointer - is what the toolchain's headers say for i386; all of
+  tests/windows/d3d12test.c passes built for it.
+- gdi32.dll's D3DKMT functions are what a program calls itself, with the structures as a 32-bit compiler lays them out. The ones a program has a
+  use for are converted field by field (src/Windows/gdi32/wow64.inc, a table a structure): `OpenAdapterFromHdc`, `OpenAdapterFromDeviceName`,
+  `EnumAdapters2`, `QueryAdapterInfo`, `QueryVideoMemoryInfo`, `GetDisplayModeList`, `CreateDevice`, `CreateDCFromMemory`,
+  `DestroyDCFromMemory`, `SetVidPnSourceOwner`, `Escape`. The ones whose structure has no pointer or handle are the same in both widths
+  (`OpenAdapterFromLuid`, `CloseAdapter`, `DestroyDevice`, `EnumAdapters`, ...).
+- The rest - allocations, locks, command buffers, contexts, synchronization objects: the interface of a display driver's user-mode half - are
+  passed on as they are, which is right only for a caller that writes the kernel's layout. A 32-bit program that brings a driver half of its
+  own would need them converted; none has been seen.
 
 **The old C runtime.** A program built against msvcrt.dll itself (not the universal runtime's api sets) knows the size of a stream: it finds stdout
 and stderr 32 and 64 bytes after what `__p__iob()` gives it (or the `_iob` it imports), and locks a stream of its own around its own printf - the
@@ -165,7 +180,8 @@ Not done yet, in the order planned:
 
 1. **What is left of the window system.** Not converted, so not working in a 32-bit program: touch and pointer input (`POINTER_TOUCH_INFO`,
    `TOUCHINPUT`), `GetRawInputBuffer`, the DWM thumbnail and composition attribute services, `NtGdiPolyTextOutW` and `NtGdiPolyPatBlt` when
-   called through win32u (gdi32 does not use them), and every Direct3D service (their structures are full of pointers). A message with a
+   called through win32u (gdi32 does not use them), and the Direct3D services of a display driver's user-mode half when a program calls them
+   itself with 32-bit structures (above; dxgi and d3d12 work). A message with a
    structure sent between a 32-bit and a 64-bit program is not converted. comctl32 has no controls yet (for 64-bit programs either). The
    common dialogs' requests are right for a 32-bit program, but no dialog has been shown by one (the test checks what is refused before that).
    opengl32's 32-bit conversions are compiled and not run. vulkan-1 is not built for i386.
@@ -209,7 +225,9 @@ A setup program's own log is the other half: the App Manager asks Inno Setup for
 - `tests/run_host_tests.sh SyscallTest LoaderTest`: binding a PE32 program, the INT 2E argument convention, the address-space ceiling.
 - `tests/run_host_tests.sh WindowsExceptionTest`: the i386 `CONTEXT` and record the kernel writes and reads, with truncated and bit-flipped
   contexts.
-- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32]`: the six test programs in the real kernel, each in a boot of its own.
+- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32]`: the seven test programs in the real kernel, each in a boot of
+  its own. dx32 is Direct3D: gdi32's D3DKMT functions with a 32-bit program's structures, then all of tests/windows/d3d12test.c (323 checks) on
+  the kernel's software adapter; built for x86-64 the same source is the 64-bit test of both.
   lib32 is the libraries beyond the window system (Winsock, the common dialogs' structures, the multimedia timer and wave output, the input
   method manager, a walk of its own stack, bcrypt, an object's name); old32 is a program built against the old C runtime (the same source built
   for x86-64 with `-mcrtdll=msvcrt-os` tests the 64-bit msvcrt.dll's streams).

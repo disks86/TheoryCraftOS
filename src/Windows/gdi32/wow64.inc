@@ -80,3 +80,77 @@ static HDC gdi_wow_open_dc(UNICODE_STRING *device, const DEVMODEW *devmode, UNIC
   return NtGdiOpenDCW(gdi_wow_string(&device64, device), devmode, gdi_wow_string(&output64, output), type, is_display, hspool, driver_info, pdev);
 }
 #define NtGdiOpenDCW gdi_wow_open_dc
+
+/* ---- the Direct3D thunks (D3DKMT*) ------------------------------------------------------------------------------------------------------------------
+ * The structures a program hands D3DKMT functions itself: the ones that find and ask about an adapter, make a device, and the few others a program
+ * (not a display driver's user-mode half) has a use for. Each is copied field by field into the kernel's layout and back. A field is given as where
+ * it is here, where it is there, and what it is: 4 or 8 bytes copied as they are, or a pointer or handle (KMT_POINTER: 4 bytes here, 8 there,
+ * widened with its sign as every handle is). What a pointer in them points at holds no pointers itself (adapter records, display modes, a
+ * driver's private bytes). The offsets are those of d3dkmthk.h for the two widths.
+ *
+ * The other D3DKMT functions pass their structure on as it is. Where it has pointers in it that is the kernel's layout, not a 32-bit program's:
+ * they are the interface of a display driver's user-mode half (allocations, locks, command buffers, synchronization objects), and the libraries
+ * that are that half here - dxgi.dll, d3d12.dll - call win32u.dll with the kernel's layout themselves (src/Windows/dxcommon.h). */
+#define KMT_POINTER 0
+typedef struct { unsigned char here, there, kind; } KmtField;
+#define KMT_WIDE_BYTES 64
+static NTSTATUS gdi_wow_kmt(NTSTATUS (__cdecl *service)(void *), void *params, const KmtField *fields, unsigned count) {
+  BYTE wide[KMT_WIDE_BYTES] __attribute__((aligned(8)));
+  BYTE *narrow = params;
+  if (!params) return service(NULL);
+  memset(wide, 0, sizeof(wide));
+  for (unsigned i = 0; i < count; ++i) {
+    const KmtField f = fields[i];
+    if (f.kind == KMT_POINTER) { const LONG64 value = *(const LONG *)(narrow + f.here); memcpy(wide + f.there, &value, 8); }
+    else memcpy(wide + f.there, narrow + f.here, f.kind);
+  }
+  const NTSTATUS status = service(wide);
+  for (unsigned i = 0; i < count; ++i) {
+    const KmtField f = fields[i];
+    memcpy(narrow + f.here, wide + f.there, f.kind == KMT_POINTER ? 4 : f.kind);
+  }
+  return status;
+}
+#define KMT_CONVERTED(name, ...)                                                                    \
+  static NTSTATUS __cdecl gdi_wow_kmt_##name(void *params) {                                        \
+    static const KmtField fields[] = {__VA_ARGS__};                                                 \
+    return gdi_wow_kmt(NtGdiDdDDI##name, params, fields, sizeof(fields) / sizeof(fields[0]));       \
+  }
+
+/* D3DKMT_OPENADAPTERFROMHDC { hDc; hAdapter; AdapterLuid; VidPnSourceId }: 20 bytes here, 24 there */
+KMT_CONVERTED(OpenAdapterFromHdc, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 8}, {16, 20, 4})
+#define NtGdiDdDDIOpenAdapterFromHdc gdi_wow_kmt_OpenAdapterFromHdc
+/* D3DKMT_OPENADAPTERFROMDEVICENAME { pDeviceName; hAdapter; AdapterLuid }: 16 and 24 */
+KMT_CONVERTED(OpenAdapterFromDeviceName, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 8})
+#define NtGdiDdDDIOpenAdapterFromDeviceName gdi_wow_kmt_OpenAdapterFromDeviceName
+/* D3DKMT_ENUMADAPTERS2 { NumAdapters; pAdapters }: 8 and 16 (a D3DKMT_ADAPTERINFO is 20 bytes in both) */
+KMT_CONVERTED(EnumAdapters2, {0, 0, 4}, {4, 8, KMT_POINTER})
+#define NtGdiDdDDIEnumAdapters2 gdi_wow_kmt_EnumAdapters2
+/* D3DKMT_QUERYADAPTERINFO { hAdapter; Type; pPrivateDriverData; PrivateDriverDataSize }: 16 and 24 */
+KMT_CONVERTED(QueryAdapterInfo, {0, 0, 4}, {4, 4, 4}, {8, 8, KMT_POINTER}, {12, 16, 4})
+#define NtGdiDdDDIQueryAdapterInfo gdi_wow_kmt_QueryAdapterInfo
+/* D3DKMT_QUERYVIDEOMEMORYINFO { hProcess; hAdapter; MemorySegmentGroup; Budget, CurrentUsage, CurrentReservation, AvailableForReservation;
+ * PhysicalAdapterIndex }: 56 bytes in both, the first three fields in other places */
+KMT_CONVERTED(QueryVideoMemoryInfo, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 4}, {16, 16, 8}, {24, 24, 8}, {32, 32, 8}, {40, 40, 8}, {48, 48, 4})
+#define NtGdiDdDDIQueryVideoMemoryInfo gdi_wow_kmt_QueryVideoMemoryInfo
+/* D3DKMT_CREATEDEVICE { hAdapter (or pAdapter); Flags; hDevice; pCommandBuffer; CommandBufferSize; pAllocationList; AllocationListSize;
+ * pPatchLocationList; PatchLocationListSize }: 36 and 64 */
+KMT_CONVERTED(CreateDevice, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 4}, {12, 16, KMT_POINTER}, {16, 24, 4}, {20, 32, KMT_POINTER}, {24, 40, 4}, {28, 48, KMT_POINTER},
+              {32, 56, 4})
+#define NtGdiDdDDICreateDevice gdi_wow_kmt_CreateDevice
+/* D3DKMT_GETDISPLAYMODELIST { hAdapter; VidPnSourceId; pModeList; ModeCount }: 16 and 24 (a D3DKMT_DISPLAYMODE holds no pointer) */
+KMT_CONVERTED(GetDisplayModeList, {0, 0, 4}, {4, 4, 4}, {8, 8, KMT_POINTER}, {12, 16, 4})
+#define NtGdiDdDDIGetDisplayModeList gdi_wow_kmt_GetDisplayModeList
+/* D3DKMT_CREATEDCFROMMEMORY { pMemory; Format; Width; Height; Pitch; hDeviceDc; pColorTable; hDc; hBitmap }: 36 and 56 */
+KMT_CONVERTED(CreateDCFromMemory, {0, 0, KMT_POINTER}, {4, 8, 4}, {8, 12, 4}, {12, 16, 4}, {16, 20, 4}, {20, 24, KMT_POINTER}, {24, 32, KMT_POINTER}, {28, 40, KMT_POINTER},
+              {32, 48, KMT_POINTER})
+#define NtGdiDdDDICreateDCFromMemory gdi_wow_kmt_CreateDCFromMemory
+/* D3DKMT_DESTROYDCFROMMEMORY { hDc; hBitmap }: 8 and 16 */
+KMT_CONVERTED(DestroyDCFromMemory, {0, 0, KMT_POINTER}, {4, 8, KMT_POINTER})
+#define NtGdiDdDDIDestroyDCFromMemory gdi_wow_kmt_DestroyDCFromMemory
+/* D3DKMT_SETVIDPNSOURCEOWNER { hDevice; pType; pVidPnSourceId; VidPnSourceCount }: 16 and 32 */
+KMT_CONVERTED(SetVidPnSourceOwner, {0, 0, 4}, {4, 8, KMT_POINTER}, {8, 16, KMT_POINTER}, {12, 24, 4})
+#define NtGdiDdDDISetVidPnSourceOwner gdi_wow_kmt_SetVidPnSourceOwner
+/* D3DKMT_ESCAPE { hAdapter; hDevice; Type; Flags; pPrivateDriverData; PrivateDriverDataSize; hContext }: 28 and 32 */
+KMT_CONVERTED(Escape, {0, 0, 4}, {4, 4, 4}, {8, 8, 4}, {12, 12, 4}, {16, 16, KMT_POINTER}, {20, 24, 4}, {24, 28, 4})
+#define NtGdiDdDDIEscape gdi_wow_kmt_Escape

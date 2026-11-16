@@ -69,8 +69,9 @@ build_one() {
       [ -f "$w/stubs/$1.inc" ] || [ -f "$w/$1/$1.c" ] || { echo "build-wow64-dlls.sh: no library $1" >&2; exit 1; }
       local imports="ntdll kernel32"
       case $1 in
-        dxgi|opengl32|vulkan-1) imports="$imports gdi32 user32" ;;
-        d3d12) imports="$imports gdi32" ;;
+        dxgi) imports="$imports gdi32 user32 win32u" ;;      # (win32u: the Direct3D services with the kernel's layout, src/Windows/dxcommon.h)
+        opengl32|vulkan-1) imports="$imports gdi32 user32" ;;
+        d3d12) imports="$imports gdi32 win32u" ;;
         imm32) imports="$imports win32u" ;;
         crypt32) imports="$imports advapi32 bcrypt" ;;
         secur32) imports="$imports advapi32" ;;

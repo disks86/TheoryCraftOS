@@ -484,7 +484,10 @@ uint32_t wait_for_vertical_blank(Session& s, Call& call, uint64_t arg) {
   // The display refreshes at a fixed 60 Hz here: the vertical blank is the next multiple of the frame time on the monotonic clock.
   constexpr uint64_t kFrameNs = 1000000000ull / kRefreshHz;
   IProcessHost& host = call.process().host();
+  IProcessRuntime* runtime = call.process().runtime();
+  if (runtime) runtime->unlock();      // (the process's lock is let go for the wait: its other threads go on)
   host.sleep_ns(kFrameNs - host.monotonic_ns() % kFrameNs);
+  if (runtime) runtime->lock();
   return status::kSuccess;
 }
 
@@ -529,7 +532,9 @@ uint32_t wait_for_idle(Session& s, Call& call, uint64_t arg) {
     if (idle) return status::kSuccess;
     IProcessRuntime* runtime = p.runtime();
     if (p.exited() || (runtime && runtime->interrupted())) return nt::kThreadIsTerminating;
+    if (runtime) runtime->unlock();      // (the process's lock is let go for the nap: its other threads go on)
     p.host().sleep_ns(nap);
+    if (runtime) runtime->lock();
     if (nap < 1000000) nap *= 2;
   }
 }

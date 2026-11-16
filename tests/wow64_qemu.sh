@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Six programs, each started by the kernel's autorun in a boot of its own:
+# 32-bit Windows programs on the real kernel under QEMU (docs/Wow64.md). Seven programs, each started by the kernel's autorun in a boot of its own:
 #   hello32  tests/windows/hello32.c: PE32 for i386 with no libraries. It runs in the CPU's compatibility mode and calls the NT services through INT 2E.
 #   crt32    tests/windows/crt32.c: built the ordinary way, with a C runtime; it runs on the 32-bit ntdll.dll, kernel32.dll and msvcrt.dll of
 #            C:\Windows\SysWOW64 (the heap, files, the environment, thread-local storage, threads, a library loaded while it runs).
@@ -8,16 +8,18 @@
 #   lib32    tests/windows/lib32.c: the libraries beyond those - Winsock, the common dialogs' structures, the multimedia timer and wave output, the
 #            input method manager, a walk of its own stack with dbghelp, bcrypt.
 #   old32    tests/windows/old32.c: a program built against the old C runtime (msvcrt.dll), which finds stdout and stderr by the size of a stream.
+#   dx32     tests/windows/dx32.c: Direct3D - gdi32's D3DKMT functions with a 32-bit program's structures, and all of tests/windows/d3d12test.c
+#            (dxgi.dll and d3d12.dll over the kernel's software adapter).
 # Passes if all the checks of each pass and the autorun sees exit code 42. Uses its own build folder (build-wow64-qemu) so the normal build keeps no
 # autorun. Needs i686-w64-mingw32-gcc.
-# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32]      (no arguments: all)
+# Usage: tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32] [dx32]      (no arguments: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 build=${BUILD:-build-wow64-qemu}
 work=${TMPDIR:-/tmp}/tcos-wow64-qemu
 rm -rf "$work"; mkdir -p "$work"
 programs=("$@")
-[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32)
+[ ${#programs[@]} -eq 0 ] && programs=(hello32 crt32 seh32 gui32 lib32 old32 dx32)
 i686-w64-mingw32-gcc -O1 -ffreestanding -nostdlib -Isrc/Windows -Wl,--entry=_start32 -Wl,--subsystem,console -o "$work/hello32.exe" tests/windows/hello32.c
 i686-w64-mingw32-gcc -O1 -o "$work/crt32.exe" tests/windows/crt32.c
 i686-w64-mingw32-gcc -O1 -shared -o "$work/plug32.dll" tests/windows/plug32.c      # (a library crt32 loads while it runs)
@@ -25,6 +27,15 @@ i686-w64-mingw32-gcc -O1 -o "$work/seh32.exe" tests/windows/seh32.c
 i686-w64-mingw32-gcc -O1 -o "$work/gui32.exe" tests/windows/gui32.c -ladvapi32 -luser32 -lgdi32 -lshell32 -lole32 -lcomctl32 -luuid
 i686-w64-mingw32-gcc -O1 -fno-omit-frame-pointer -o "$work/lib32.exe" tests/windows/lib32.c -lws2_32 -lcomdlg32 -lwinmm -limm32 -ldbghelp -lbcrypt -luser32 -lntdll
 i686-w64-mingw32-gcc -O1 -mcrtdll=msvcrt-os -o "$work/old32.exe" tests/windows/old32.c
+# (the shaders dx32 draws with, as C arrays: the kernel's own fixtures, as tests/emulated_dx.sh makes them)
+python3 - "$work/dxfixtures.h" <<'PY'
+import sys
+out = open(sys.argv[1], "w")
+for n in ("vs", "ps_color", "ps_tex", "cs_fill", "vs_attrs6", "ps_tex4", "ps_mrt8"):
+    data = open("tests/data/dxbc/%s.dxbc" % n, "rb").read()
+    out.write("static const unsigned char dx_%s_dxbc[] = {%s};\n" % (n, ",".join(str(b) for b in data)))
+PY
+i686-w64-mingw32-gcc -O1 -I "$work" -o "$work/dx32.exe" tests/windows/dx32.c -ldxgi -ld3d12 -luuid -lgdi32
 status=0
 for program in "${programs[@]}"; do
   cmake -S . -B "$build" -G Ninja "-DTCOS_AUTORUN=/Windows/$program.exe" -DTCOS_AUTORUN_ARGUMENTS= -DTCOS_AUTORUN_ELEVATED=OFF -DTCOS_TRACE_SERVICE_FAILURES=OFF >/dev/null      # (no arguments, not elevated: whatever an earlier build of this folder had)
