@@ -378,7 +378,7 @@ static void test_udp() {
   // what a datagram cannot be; what a socket of this kind cannot do
   const uint64_t big = t.alloc(70000);
   CHECK(t.s(44, fd, big, 1473, 0, 0, 0) == -90 && t.s(44, fd, big, 70000, 0, 0, 0) == -90 && t.s(44, fd, big, 1472, 0, 0, 0) == 1472);      // EMSGSIZE: no fragments
-  CHECK(t.s(50, fd, 1) == -95 && t.s(43, fd, 0, 0) == -95 && t.s(45, fd, buf, 8, 2 /* MSG_PEEK */, 0, 0) == -95);
+  CHECK(t.s(50, fd, 1) == -95 && t.s(43, fd, 0, 0) == -95);
   CHECK(t.s(44, fd, kBad, 4, 0, 0, 0) == -14 && t.s(45, fd, kBad, 4, 0x40, 0, 0) == -11 && t.s(46, fd, kBad, 0) == -14 && t.s(47, fd, kBad, 0) == -14);
   // a time to wait at most (SO_RCVTIMEO): EAGAIN when it is over
   t.put64(buf, 0); t.put64(buf + 8, 300000);
@@ -667,6 +667,85 @@ static void test_name_resolution() {
   t.process.release_handles();
 }
 
+// MSG_PEEK: what is looked at is received again, in the same order, by whatever reads next.
+static void test_peek() {
+  constexpr uint64_t kPeek = 2, kDontWait = 0x40, kWaitAll = 0x100;
+  Setup t;
+  const int64_t listener = t.s(41, kAfInet, kStream | kNonBlock, 0), client = t.s(41, kAfInet, kStream | kNonBlock, 0);
+  CHECK(t.s(49, listener, t.in4(127, 0, 0, 1, 9800), 16) == 0 && t.s(50, listener, 4) == 0 && t.s(42, client, t.in4(127, 0, 0, 1, 9800), 16) == -115);
+  CHECK(t.lan.run_until([&] { return t.polled(listener, kPollIn) == kPollIn; }, 3000));
+  const int64_t server = t.s(288, listener, 0, 0, kNonBlock);
+  const uint64_t buf = t.alloc(256), waiting = t.word(0);
+  auto arrives = [&](int64_t fd, uint32_t bytes) { return t.lan.run_until([&] { return t.s(16, fd, 0x541B, waiting) == 0 && t.u32(waiting) >= bytes; }, 3000); };
+  CHECK(server >= 3 && t.s(45, server, buf, 64, kPeek, 0, 0) == -11);      // nothing there yet
+  CHECK(t.s(1, client, t.bytes("hello world"), 11) == 11 && arrives(server, 11));
+  // a stream: looked at as often as wanted, a little or all of it, then read from the start
+  CHECK(t.s(45, server, buf, 5, kPeek, 0, 0) == 5 && t.text(buf, 5) == "hello" && t.s(45, server, buf, 64, kPeek, 0, 0) == 11 && t.text(buf, 11) == "hello world");
+  CHECK(t.s(16, server, 0x541B, waiting) == 0 && t.u32(waiting) == 11 && t.polled(server, kPollIn) == kPollIn);      // still all there
+  CHECK(t.s(0, server, buf, 6) == 6 && t.text(buf, 6) == "hello " && t.s(45, server, buf, 64, kPeek | kWaitAll, 0, 0) == 5 && t.text(buf, 5) == "world");
+  // more arrives while some is held: a look sees both, in order; so does a read through several buffers
+  CHECK(t.s(1, client, t.bytes(", again"), 7) == 7 && arrives(server, 12));
+  CHECK(t.s(45, server, buf, 64, kPeek, 0, 0) == 12 && t.text(buf, 12) == "world, again" && t.u32(waiting) == 12);
+  const uint64_t r1 = t.alloc(8), r2 = t.alloc(16), vectors = t.alloc(32), message = t.alloc(56);
+  t.put64(vectors, r1); t.put64(vectors + 8, 5); t.put64(vectors + 16, r2); t.put64(vectors + 24, 16);
+  t.put64(message, 0); t.put64(message + 8, 0); t.put64(message + 16, vectors); t.put64(message + 24, 2); t.put64(message + 32, 0); t.put64(message + 40, 0); t.put64(message + 48, 0);
+  CHECK(t.s(47, server, message, kPeek) == 12 && t.text(r1, 5) == "world" && t.text(r2, 7) == ", again");
+  CHECK(t.s(19, server, vectors, 2) == 12 && t.text(r1, 5) == "world" && t.text(r2, 7) == ", again");
+  CHECK(t.s(45, server, buf, 64, kPeek, 0, 0) == -11 && t.s(0, server, buf, 64) == -11 && t.polled(server, kPollIn) == 0);      // all read: nothing is held
+  // a lot: a look takes what one call may hold; reading afterwards gets everything, in order
+  std::string sent(100000, 0), got;
+  for (size_t i = 0; i < sent.size(); ++i) sent[i] = char(i * 13 + i / 251);
+  const uint64_t large = t.alloc(100000), in = t.alloc(70000);
+  t.memory.write(large, ConstByteView(reinterpret_cast<const uint8_t*>(sent.data()), sent.size()));
+  uint64_t written = 0;
+  int64_t looked = 0;
+  for (int round = 0; round < 6000 && got.size() < sent.size(); ++round) {
+    if (written < sent.size()) {
+      const int64_t n = t.s(1, client, large + written, sent.size() - written);
+      if (n > 0) written += uint64_t(n);
+    }
+    if (round % 3 == 0 || looked < 40000) {
+      const int64_t seen = t.s(45, server, in, 70000, kPeek, 0, 0);
+      if (seen > 0) {
+        CHECK(seen <= 65536 && t.text(in, uint64_t(seen)) == sent.substr(got.size(), size_t(seen)));
+        if (seen > looked) looked = seen;
+      }
+    }
+    // (nothing is read until a look has seen a good deal more than the stack's own buffer holds: looking again takes more out of it)
+    if (looked < 40000 && round < 3000) { t.lan.step(); continue; }
+    const int64_t n = t.s(0, server, in, 3000 + round % 5000);
+    if (n > 0) got += t.text(in, uint64_t(n));
+    else t.lan.step();
+  }
+  CHECK(got == sent && looked >= 40000);
+  // a look that waits for something to come; the end of the stream after what was looked at
+  CHECK(t.s(72, server, 4, 0) == 0);
+  bool wrote = false;
+  t.host.meanwhile = [&] { if (!wrote) { wrote = true; CHECK(t.s(1, client, t.bytes("last"), 4) == 4); } };
+  CHECK(t.s(45, server, buf, 64, kPeek, 0, 0) == 4 && t.text(buf, 4) == "last" && t.s(45, server, buf, 64, kPeek | kDontWait, 0, 0) == 4);
+  t.host.meanwhile = nullptr;
+  CHECK(t.s(3, client) == 0 && t.lan.run_until([&] { return t.sockets.peer_closed(uint32_t(t.process.files().token(uint64_t(server)))); }, 3000));
+  CHECK(t.s(45, server, buf, 2, kPeek, 0, 0) == 2 && t.s(0, server, buf, 64) == 4 && t.text(buf, 4) == "last");
+  CHECK(t.s(45, server, buf, 64, kPeek, 0, 0) == 0 && t.s(0, server, buf, 64) == 0);      // the end can be looked at too
+
+  // datagrams: a look shows the next one, cut to the buffer, and leaves it whole for the receive
+  SharedPointer<network::IUdpSocket> peer = t.lan.b.udp_open(9810);
+  const int64_t udp = t.s(41, kAfInet, kDgram | kNonBlock, 0);
+  CHECK(t.s(49, udp, t.in4(0, 0, 0, 0, 9811), 16) == 0 && t.s(45, udp, buf, 64, kPeek, 0, 0) == -11);
+  const network::IpAddress here(network::Ipv4Address::make(10, 0, 0, 1));
+  CHECK(peer->send_to_ip(here, 9811, ConstByteView(reinterpret_cast<const uint8_t*>("abcdef"), 6)) && peer->send_to_ip(here, 9811, ConstByteView(reinterpret_cast<const uint8_t*>("second"), 6)));
+  CHECK(t.lan.run_until([&] { return t.sockets.readable(uint32_t(t.process.files().token(uint64_t(udp)))) == 2; }, 3000));
+  const uint64_t name = t.alloc(32), size = t.word(28);
+  CHECK(t.s(45, udp, buf, 3, kPeek, name, size) == 3 && t.text(buf, 3) == "abc" && t.u32(size) == 16 && t.text(name + 2, 6) == std::string("\x26\x52\x0a\0\0\x02", 6));
+  CHECK(t.s(45, udp, buf, 64, kPeek, 0, 0) == 6 && t.text(buf, 6) == "abcdef" && t.polled(udp, kPollIn) == kPollIn && t.s(16, udp, 0x541B, waiting) == 0 && t.u32(waiting) == 1472);
+  t.put32(size, 28);
+  CHECK(t.s(45, udp, buf, 64, 0, name, size) == 6 && t.text(buf, 6) == "abcdef" && t.text(name + 2, 6) == std::string("\x26\x52\x0a\0\0\x02", 6));      // whole, with its sender
+  CHECK(t.s(45, udp, buf, 64, 0, 0, 0) == 6 && t.text(buf, 6) == "second" && t.s(45, udp, buf, 64, kPeek, 0, 0) == -11 && t.polled(udp, kPollIn) == 0);
+  // a socket closed with something held gives its memory back (the test's allocator counts)
+  CHECK(peer->send_to_ip(here, 9811, ConstByteView(reinterpret_cast<const uint8_t*>("held"), 4)) && t.lan.run_until([&] { return t.polled(udp, kPollIn) == kPollIn; }, 3000));
+  CHECK(t.s(45, udp, buf, 64, kPeek, 0, 0) == 4 && t.s(3, udp) == 0 && t.s(3, server) == 0);
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -677,6 +756,7 @@ int main() {
   test_ipv6();
   test_options_and_errors();
   test_name_resolution();
+  test_peek();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

@@ -131,8 +131,10 @@ socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback 
 - Options: `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_KEEPALIVE`, `SO_BROADCAST`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY` and the
   common `IP_*`, `IPV6_*` and `TCP_*` ones are kept and read back, and change nothing in the stack; `SO_TYPE`, `SO_DOMAIN`,
   `SO_PROTOCOL`, `SO_ERROR`, `SO_ACCEPTCONN`, the timeouts and `IPV6_V6ONLY` are real.
-- Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `MSG_PEEK` is
-  refused (`EOPNOTSUPP`); no control messages (`IP_PKTINFO` and the like are accepted and none arrive); `bind` uses every interface
+- `MSG_PEEK` (also of `AF_UNIX` sockets): the network stack hands data out once, so what is looked at is held with the socket until a
+  read takes it, up to 64 KiB of a stream in one look, or one datagram, which the read then gets whole. `poll` and `FIONREAD` count
+  what is held.
+- Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); no control messages (`IP_PKTINFO` and the like are accepted and none arrive); `bind` uses every interface
   whatever address it names; no raw or ICMP sockets, no `AF_NETLINK` (so `getifaddrs` fails), no multicast membership; 256 sockets in
   the system.
 
@@ -182,7 +184,7 @@ back to `read` and `write`.
 - The parts with a fixed answer above: `io_uring`, `fanotify`, `seccomp` filters, `bpf`, `perf_event_open`, `userfaultfd`, namespaces,
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
-- Of network sockets: `MSG_PEEK`, datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`. Of name resolution:
+- Of network sockets: datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`. Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
 - Of inotify: `IN_CLOSE_WRITE`, `IN_OPEN`, `IN_ACCESS`, `IN_ATTRIB`. Of asynchronous I/O: requests that would wait (`IOCB_CMD_POLL`).

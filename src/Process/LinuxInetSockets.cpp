@@ -209,6 +209,8 @@ bool scatter(Process& p, uint64_t vectors, uint64_t count, ConstByteView data) {
   return true;
 }
 
+allocators::IAllocator* call_memory(Process& p);
+
 // Sends `data`: all of it over TCP unless the call does not wait (then what there is room for), one datagram over UDP. The count sent, or -errno.
 int64_t send_bytes(Process& p, const Inet& s, ConstByteView data, uint64_t flags, const network::IpAddress* to, const uint16_t* to_port) {
   SocketManager::Options* options = s.sockets->options(s.id);
@@ -250,7 +252,6 @@ int64_t send_bytes(Process& p, const Inet& s, ConstByteView data, uint64_t flags
 int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, ByteBuffer* out, network::IpAddress* from, uint16_t* from_port) {
   SocketManager::Options* options = s.sockets->options(s.id);
   if (!options) return -kEbadf;
-  if (flags & kMsgPeek) return -kEopnotsupp;      // (the stack hands data out once; nothing can be looked at and left)
   out->clear();
   const bool tcp = s.sockets->is_tcp(s.id);
   if (tcp) {
@@ -263,6 +264,21 @@ int64_t receive_bytes(Process& p, const Inet& s, uint64_t room, uint64_t flags, 
   }
   if (options->shut_read || room == 0) return 0;
   const bool dont_wait = (flags & kMsgDontWait) != 0;
+  if (flags & kMsgPeek) {      // looked at and left: the manager holds it for the receive that takes it (one go: MSG_WAITALL does not make a peek wait for more)
+    allocators::IAllocator* allocator = call_memory(p);
+    if (!allocator) return -kEnomem;
+    if (room > SocketManager::kMostHeld) room = SocketManager::kMostHeld;
+    if (!out->put_zeros(room)) return -kEnomem;
+    uint32_t status = 0, got = 0;
+    const int64_t r = wait_for(p, s, dont_wait, options->receive_timeout_ns, &status, [&](bool* would_block) {
+      bool closed = false;
+      return s.sockets->peek(s.id, out->writable_view(), &got, from, from_port, would_block, &closed, *allocator);
+    });
+    if (r < 0) return r;
+    if (status != 0) return -errno_of(status);
+    out->truncate(got);
+    return int64_t(got);
+  }
   if (room > (tcp ? uint64_t{1} << 20 : kLargestDatagram)) room = tcp ? uint64_t{1} << 20 : kLargestDatagram;
   if (!out->put_zeros(tcp ? room : kLargestDatagram < 2048 ? kLargestDatagram : (room < 2048 ? 2048 : room))) return -kEnomem;
   uint64_t done = 0;

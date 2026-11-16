@@ -287,6 +287,16 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
   Socket* s = at(id);
   if (!s) return kInvalidHandle;
   if (s->proto == SocketProto::Udp) {
+    if (s->held_datagram) {      // the datagram a peek() looked at comes first, and is taken now
+      const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
+      buffer.first(n).copy_from(s->held->view().first(n));
+      *got = n;
+      if (from_address) *from_address = to_program(*s, s->held_from);
+      if (from_port) *from_port = s->held_port;
+      s->held_datagram = false;
+      s->held->clear();
+      return kSuccess;
+    }
     if (!s->udp) { *would_block = true; return kSuccess; }  // nothing bound or connected yet: nothing can have arrived
     IpAddress sender;
     uint16_t sender_port = 0;
@@ -298,6 +308,16 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
     return kSuccess;
   }
   if (!s->tcp) return kInvalidConnection;
+  if (s->held_count() != 0) {      // what a peek() looked at comes first (also from a connection that broke since: it had arrived)
+    const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
+    buffer.first(n).copy_from(s->held->view().subview(s->held_start, n));
+    s->held_start += n;
+    if (s->held_count() == 0) { s->held->clear(); s->held_start = 0; }
+    *got = n;
+    if (from_address) *from_address = to_program(*s, s->peer_address);
+    if (from_port) *from_port = s->peer_port;
+    return kSuccess;
+  }
   if (s->tcp->failed()) return kConnectionReset;
   const uint32_t n = s->tcp->receive(buffer);
   if (n == 0) {
@@ -305,6 +325,71 @@ uint32_t SocketManager::receive(uint32_t id, ByteView buffer, uint32_t* got, IpA
     *would_block = true;
     return kSuccess;
   }
+  *got = n;
+  if (from_address) *from_address = to_program(*s, s->peer_address);
+  if (from_port) *from_port = s->peer_port;
+  return kSuccess;
+}
+
+uint32_t SocketManager::peek(uint32_t id, ByteView buffer, uint32_t* got, IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
+                             allocators::IAllocator& allocator) {
+  *got = 0;
+  *would_block = false;
+  if (peer_closed) *peer_closed = false;
+  Socket* s = at(id);
+  if (!s) return kInvalidHandle;
+  if (s->proto == SocketProto::Tcp && !s->tcp) return kInvalidConnection;
+  if (!s->held) {
+    s->held = UniquePointer<ByteBuffer>::make(allocator, allocator);
+    if (!s->held) return 0xC000009Au;  // STATUS_INSUFFICIENT_RESOURCES
+  }
+  ByteBuffer& held = *s->held;
+  if (s->proto == SocketProto::Udp) {
+    if (!s->held_datagram) {
+      if (!s->udp) { *would_block = true; return kSuccess; }
+      constexpr uint32_t kLargest = 1472;      // (what one frame carries; the stack puts no datagram together from fragments)
+      held.clear();
+      if (!held.put_zeros(kLargest)) return 0xC000009Au;
+      uint32_t length = 0;
+      if (!s->udp->receive_from_ip(held.writable_view(), &s->held_from, &s->held_port, &length)) {
+        held.clear();
+        *would_block = true;
+        return kSuccess;
+      }
+      held.truncate(length < kLargest ? length : kLargest);
+      s->held_start = 0;
+      s->held_datagram = true;
+    }
+    const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
+    buffer.first(n).copy_from(held.view().first(n));
+    *got = n;
+    if (from_address) *from_address = to_program(*s, s->held_from);
+    if (from_port) *from_port = s->held_port;
+    return kSuccess;
+  }
+  // A stream: more is taken from the stack until as much is held as was asked for (or as may be held), then handed out without being let go.
+  const uint32_t wanted = buffer.size() < kMostHeld ? uint32_t(buffer.size()) : kMostHeld;
+  if (s->held_count() < wanted && !s->tcp->failed()) {
+    if (s->held_start != 0) {      // (what was received already makes room at the front)
+      ByteView all = held.writable_view();
+      const uint32_t kept = s->held_count();
+      for (uint32_t i = 0; i < kept; ++i) all[i] = all[s->held_start + i];
+      held.truncate(kept);
+      s->held_start = 0;
+    }
+    const uint32_t before = uint32_t(held.size());
+    if (!held.put_zeros(wanted - before)) return 0xC000009Au;
+    const uint32_t more = s->tcp->receive(held.writable_view().subview(before, wanted - before));
+    held.truncate(before + more);
+  }
+  if (s->held_count() == 0) {
+    if (s->tcp->failed()) return kConnectionReset;
+    if (s->tcp->peer_closed()) { if (peer_closed) *peer_closed = true; return kSuccess; }
+    *would_block = true;
+    return kSuccess;
+  }
+  const uint32_t n = s->held_count() < buffer.size() ? s->held_count() : uint32_t(buffer.size());
+  buffer.first(n).copy_from(held.view().subview(s->held_start, n));
   *got = n;
   if (from_address) *from_address = to_program(*s, s->peer_address);
   if (from_port) *from_port = s->peer_port;
@@ -440,8 +525,8 @@ bool SocketManager::peer_name(uint32_t id, IpAddress* address, uint16_t* port) {
 uint32_t SocketManager::readable(uint32_t id) const {
   const Socket* s = at(id);
   if (!s) return 0;
-  if (s->proto == SocketProto::Udp) return s->udp ? s->udp->pending() : 0;
-  return s->tcp ? s->tcp->available() : 0;
+  if (s->proto == SocketProto::Udp) return (s->held_datagram ? 1 : 0) + (s->udp ? s->udp->pending() : 0);
+  return s->held_count() + (s->tcp ? s->tcp->available() : 0);
 }
 
 bool SocketManager::is_tcp(uint32_t id) const {
@@ -452,6 +537,7 @@ bool SocketManager::is_tcp(uint32_t id) const {
 bool SocketManager::ready_to_read(uint32_t id) const {
   const Socket* s = at(id);
   if (!s) return false;
+  if (s->held_count() != 0 || s->held_datagram) return true;      // (what a peek() holds can be received)
   if (s->proto == SocketProto::Udp) return s->udp && s->udp->pending() > 0;
   if (!s->tcp) return false;
   if (s->listening) {

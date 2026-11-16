@@ -21,6 +21,8 @@
 #include "Network/NetworkStackSet.hpp"
 #include "Network/Tcp/ITcpSocket.hpp"
 #include "Network/Udp/IUdpSocket.hpp"
+#include "Utility/ByteBuffer.hpp"
+#include "Utility/UniquePointer.hpp"
 
 // IPv4 and IPv6 sockets for user-mode processes (Windows' ws2_32.dll, behind this OS's own NT-ish services: real Windows does not reach sockets through NT services at
 // all, but through a device driver (afd.sys) with its own ioctl protocol, which is not worth reproducing here). A socket is one TCP or UDP endpoint of the system's one
@@ -65,6 +67,12 @@ class SocketManager {
   uint32_t send(uint32_t id, ConstByteView data, const network::IpAddress* address, const uint16_t* port, uint32_t* sent, bool* would_block);
   // `from_address`/`from_port` are filled in when given (recvfrom); for TCP they are the (already known) peer.
   uint32_t receive(uint32_t id, ByteView buffer, uint32_t* got, network::IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed);
+  // receive() that leaves what it hands out to be received again (MSG_PEEK). The network stack gives data out once, so what is looked at is taken from it
+  // and held with the socket (in memory from `allocator`) until a receive() takes it: up to kMostHeld bytes of a stream, or one datagram. Everything that
+  // asks what a socket has (receive(), readable(), ready_to_read()) counts what is held.
+  static constexpr uint32_t kMostHeld = 65536;
+  uint32_t peek(uint32_t id, ByteView buffer, uint32_t* got, network::IpAddress* from_address, uint16_t* from_port, bool* would_block, bool* peer_closed,
+                allocators::IAllocator& allocator);
   uint32_t shutdown(uint32_t id, uint32_t how);  // 0 receive, 1 send, 2 both
   bool set_non_blocking(uint32_t id, bool on);
   bool is_non_blocking(uint32_t id) const;
@@ -143,6 +151,13 @@ class SocketManager {
     // (select(), or a non-blocking accept() that finds nothing yet) never drops a connection that arrived; the real accept() takes this one first if there is one.
     mutable SharedPointer<network::ITcpSocket> pending_accept;
     Options options;
+    // What peek() took from the network stack and no receive() has taken yet: bytes of the stream from `held_start` on, or one datagram with its sender.
+    UniquePointer<ByteBuffer> held;
+    uint32_t held_start = 0;
+    bool held_datagram = false;
+    network::IpAddress held_from;      // (as the stack gave it)
+    uint16_t held_port = 0;
+    uint32_t held_count() const { return held ? uint32_t(held->size()) - held_start : 0; }
   };
   Socket* at(uint32_t id) { return id >= 1 && id <= kCapacity && sockets_[id - 1].used ? &sockets_[id - 1] : nullptr; }
   const Socket* at(uint32_t id) const { return id >= 1 && id <= kCapacity && sockets_[id - 1].used ? &sockets_[id - 1] : nullptr; }

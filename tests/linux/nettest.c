@@ -259,6 +259,53 @@ static void options(void) {
   close(fd);
 }
 
+/* MSG_PEEK: what is looked at is still there for the next read, of a stream and of a datagram. */
+static void looking(void) {
+  const int listener = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1;
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in address = loopback(PORT + 6);
+  bind(listener, (struct sockaddr*)&address, sizeof(address));
+  listen(listener, 4);
+  const int client = socket(AF_INET, SOCK_STREAM, 0);
+  const int connected = connect(client, (struct sockaddr*)&address, sizeof(address));
+  const int server = accept(listener, 0, 0);
+  const long sent = send(client, "peek-a-boo", 10, 0);
+  char text[32] = {0}, all[32] = {0}, first[32] = {0}, again[32] = {0}, rest[32] = {0};
+  const long some = recv(server, text, 4, MSG_PEEK);
+  const long whole = recv(server, all, sizeof(all) - 1, MSG_PEEK);
+  int waiting = -1;
+  ioctl(server, FIONREAD, &waiting);
+  const long taken = recv(server, first, 5, 0);
+  const long left = recv(server, again, sizeof(again) - 1, MSG_PEEK | MSG_DONTWAIT);
+  const long last = recv(server, rest, sizeof(rest) - 1, 0);
+  const long none = recv(server, rest, 1, MSG_PEEK | MSG_DONTWAIT);
+  const int none_errno = errno;
+  printf("peek: connect %d, send %ld; look %ld \"%s\", look %ld \"%s\", waiting %d, read %ld \"%s\", look %ld \"%s\", read %ld \"%s\", look %ld (errno %d);", connected, sent, some,
+         text, whole, all, waiting, taken, first, left, again, last, rest, none, none_errno);
+  close(client);
+  char end;
+  const long at_end = recv(server, &end, 1, MSG_PEEK);
+  const long really = recv(server, &end, 1, 0);
+  printf(" at the end %ld %ld;", at_end, really);
+  close(server);
+  close(listener);
+  const int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in at_b = loopback(PORT + 7);
+  bind(b, (struct sockaddr*)&at_b, sizeof(at_b));
+  sendto(a, "datagram", 8, 0, (struct sockaddr*)&at_b, sizeof(at_b));
+  sendto(a, "next", 4, 0, (struct sockaddr*)&at_b, sizeof(at_b));
+  char cut[8] = {0}, full[16] = {0}, second[16] = {0};
+  struct sockaddr_in from;
+  socklen_t size = sizeof(from);
+  const long looked = recvfrom(b, cut, 4, MSG_PEEK, (struct sockaddr*)&from, &size);
+  const long got = recv(b, full, sizeof(full) - 1, 0);
+  const long after = recv(b, second, sizeof(second) - 1, 0);
+  printf(" datagram: look %ld \"%s\" from %s, read %ld \"%s\", then %ld \"%s\"\n", looked, cut, inet_ntoa(from.sin_addr), got, full, after, second);
+  close(a);
+  close(b);
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IOLBF, 0);
   stream_pair();
@@ -266,6 +313,7 @@ int main(void) {
   datagrams();
   version_six();
   options();
+  looking();
   printf("net ok\n");
   return 0;
 }
