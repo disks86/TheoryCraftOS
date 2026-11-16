@@ -35,6 +35,7 @@
 #include <sys/msg.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -321,6 +322,55 @@ static void smaller_calls(void) {
   printf(" kcmp: %ld; get_mempolicy: %ld, mode %d\n", same, policy, mode);
 }
 
+/* Signals read from a descriptor: one sent with kill(), a timer's, and SIGCHLD for a child that ended (which nothing here has a handler for). */
+static void signal_descriptor(void) {
+  sigset_t set, old;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR2);
+  sigaddset(&set, SIGCHLD);
+  sigaddset(&set, SIGRTMIN + 3);
+  sigprocmask(SIG_BLOCK, &set, &old);
+  const int fd = signalfd(-1, &set, SFD_NONBLOCK | SFD_CLOEXEC);
+  if (fd < 0) { printf("signalfd: failed (%d)\n", errno); return; }
+  struct signalfd_siginfo info;
+  const long nothing = read(fd, &info, sizeof(info));
+  const int nothing_errno = errno;
+  struct pollfd poll_it = {fd, POLLIN, 0};
+  const int quiet = poll(&poll_it, 1, 0);
+  kill(getpid(), SIGUSR2);
+  const int ready = poll(&poll_it, 1, 1000);
+  memset(&info, 0xEE, sizeof(info));
+  const long first = read(fd, &info, sizeof(info));
+  printf("signalfd: empty %ld (errno %d), poll %d then %d; read %ld: signal %u code %d from this process %d;", nothing, nothing_errno, quiet, ready, first,
+         info.ssi_signo, info.ssi_code, info.ssi_pid == (uint32_t)getpid());
+  struct sigevent event;
+  memset(&event, 0, sizeof(event));
+  event.sigev_notify = SIGEV_SIGNAL;
+  event.sigev_signo = SIGRTMIN + 3;
+  event.sigev_value.sival_int = 77;
+  timer_t timer;
+  timer_create(CLOCK_MONOTONIC, &event, &timer);
+  struct itimerspec once = {{0, 0}, {0, 15000000}};
+  timer_settime(timer, 0, &once, 0);
+  const int timer_ready = poll(&poll_it, 1, 2000);
+  memset(&info, 0xEE, sizeof(info));
+  const long second = read(fd, &info, sizeof(info));
+  printf(" timer: poll %d, read %ld: realtime signal %d, SI_TIMER %d, value %d, overrun %u;", timer_ready, second, (int)info.ssi_signo - SIGRTMIN, info.ssi_code == SI_TIMER,
+         info.ssi_int, info.ssi_overrun);
+  timer_delete(timer);
+  const pid_t child = fork();
+  if (child == 0) _exit(6);
+  const int child_ready = poll(&poll_it, 1, 5000);
+  memset(&info, 0xEE, sizeof(info));
+  const long third = read(fd, &info, sizeof(info));
+  const int child_matches = info.ssi_pid == (uint32_t)child;
+  const int code = wait_code(child);
+  const int closed = close(fd);
+  printf(" child: poll %d, read %ld: signal %u, code %d, status %d, its pid %d, waited %d; close %d\n", child_ready, third, info.ssi_signo, info.ssi_code, info.ssi_status,
+         child_matches, code, closed);
+  sigprocmask(SIG_SETMASK, &old, 0);
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IOLBF, 0);
   shared_memory();
@@ -332,6 +382,7 @@ int main(void) {
   process_descriptor();
   async_io();
   smaller_calls();
+  signal_descriptor();
   printf("ipc ok\n");
   return 0;
 }

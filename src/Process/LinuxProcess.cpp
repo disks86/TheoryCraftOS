@@ -160,6 +160,20 @@ int64_t wait_for_child(Process& p, uint64_t pid, bool no_hang, bool keep, LinuxP
   }
 }
 
+}  // namespace
+
+// What SIGCHLD's siginfo says: a child that has ended and was not waited for yet (the first there is), and how it ended. False if there is none.
+bool child_exit_info(Process& p, LinuxProcessState::Info* info) {
+  LinuxProcessState::Child child;
+  if (wait_for_child(p, 0, true, true, &child) != 1) return false;
+  info->code = child.signal ? 2 : 1;      // CLD_KILLED, CLD_EXITED
+  info->sender = uint32_t(child.pid);
+  info->status = child.signal ? int32_t(child.signal) : int32_t(child.code & 0xFF);
+  return true;
+}
+
+namespace {
+
 constexpr uint64_t kWNoHang = 1, kWUntraced = 2, kWExited = 4, kWContinued = 8, kWNoWait = 0x01000000, kWNoThread = 0x20000000, kWAll = 0x40000000, kWClone = 0x80000000;
 constexpr uint64_t kUsageBytes = 144;      // struct rusage
 

@@ -127,9 +127,20 @@ bool UnixSocketManager::linked_locked(uint32_t id, UnixType* type, uint64_t* lin
   return true;
 }
 
+bool UnixSocketManager::signal_mask_locked(uint32_t id, uint64_t* mask) const {
+  const Socket* s = at(id);
+  if (!s || s->type != UnixType::Signal) return false;
+  *mask = s->counter;
+  return true;
+}
+
+void UnixSocketManager::set_signal_mask_locked(uint32_t id, uint64_t mask) {
+  if (Socket* s = at(id); s && s->type == UnixType::Signal) s->counter = mask;
+}
+
 void UnixSocketManager::set_link_ready_locked(uint32_t id, bool readable, bool writable) {
   Socket* s = at(id);
-  if (!s || !unix_type_is_linked(s->type)) return;
+  if (!s || (!unix_type_is_linked(s->type) && s->type != UnixType::Signal)) return;
   s->link_readable = readable;
   s->link_writable = writable;
 }
@@ -646,7 +657,7 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
     r.readable = s->counter > 0;      // (as of the last timer_advance_locked)
     return r;
   }
-  if (unix_type_is_linked(s->type)) {      // (as its owner last said)
+  if (unix_type_is_linked(s->type) || s->type == UnixType::Signal) {      // (as its owner last said)
     r.readable = s->link_readable;
     r.writable = s->link_writable;
     return r;
@@ -664,7 +675,7 @@ UnixReadiness UnixSocketManager::readiness_locked(uint32_t id) const {
     }
     return r;
   }
-  if (!unix_type_is_socket(s->type)) return r;      // (an epoll instance is evaluated by the Linux layer; a signalfd never fires)
+  if (!unix_type_is_socket(s->type)) return r;      // (an epoll instance is evaluated by the Linux layer)
   r.error = s->pending_error != UnixStatus::Ok;
   if (s->state == State::Listening) {
     r.readable = s->backlog.count() != 0;

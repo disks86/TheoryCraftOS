@@ -99,6 +99,12 @@ uint64_t sys_rt_sigreturn(Process& p);
 uint64_t sys_alarm(Process& p, uint64_t seconds);
 uint64_t sys_getitimer(Process& p, uint64_t which, uint64_t value);
 uint64_t sys_setitimer(Process& p, uint64_t which, uint64_t value, uint64_t old_value);
+// For SIGCHLD's siginfo: a child that has ended and was not waited for yet, and how (si_code, si_pid, si_status). False if there is none.
+bool child_exit_info(Process& p, LinuxProcessState::Info* info);
+// signalfd (the descriptor is LinuxSockets.cpp's): the signals of `mask` that are pending for the calling thread or the process, without taking them (for
+// poll()), and a read of them as struct signalfd_siginfo records, which takes them.
+uint64_t signalfd_pending(Process& p, uint64_t mask);
+uint64_t signalfd_read(Process& p, uint64_t mask, uint64_t buffer, uint64_t count, bool non_blocking);
 // POSIX timers: they raise their signal (SIGEV_SIGNAL, SIGEV_THREAD_ID) or only keep time (SIGEV_NONE). Looked at where the interval timers are.
 uint64_t sys_timer_create(Process& p, uint64_t clock, uint64_t event, uint64_t id_address);
 uint64_t sys_timer_settime(Process& p, uint64_t id, uint64_t flags, uint64_t value, uint64_t old_value);

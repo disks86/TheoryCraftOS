@@ -51,6 +51,16 @@ bool is_ignored(const LinuxProcessState& state, uint32_t signal) {
   return handler == kSigIgn || (handler == kSigDfl && (kDefaultHarmless & bit(signal)));
 }
 
+// Is a signal that would be ignored dropped the moment it is raised? Not while the thread it is for (or, for one sent to the process, any thread) blocks
+// it: a blocked signal stays pending whatever its action, as on Linux, which is what lets sigwait() and a signalfd take SIGCHLD or SIGWINCH without a
+// handler. It is dropped when it is unblocked and still ignored.
+bool dropped_at_once(const LinuxProcessState& state, uint32_t signal, uint64_t for_thread) {
+  if (!is_ignored(state, signal)) return false;
+  for (const LinuxProcessState::Thread& t : state.threads)
+    if (t.used && (for_thread == 0 || t.tid == for_thread) && (t.blocked & bit(signal))) return false;
+  return true;
+}
+
 // Carries out a signal that is not blocked. True if that is the end of it (ignored, or the process ended); false if it has a handler: it stays pending until
 // whoever runs the program enters the handler (deliver_signals), or, where nothing can, for sigtimedwait and sigsuspend.
 bool dispose(Process& p, uint32_t signal) {
@@ -89,8 +99,11 @@ void fold_posted(Process& p) {
   LinuxProcessState& state = p.linux_state();
   const uint64_t posted = p.take_posted_signals();
   for (uint32_t signal = 1; signal <= kSignals; ++signal) {
-    if (!(posted & bit(signal)) || is_ignored(state, signal)) continue;
-    if (!(state.pending & bit(signal))) state.info[signal] = LinuxProcessState::Info();
+    if (!(posted & bit(signal)) || dropped_at_once(state, signal, 0)) continue;
+    if (!(state.pending & bit(signal))) {
+      state.info[signal] = LinuxProcessState::Info();
+      if (signal == kSigChld) child_exit_info(p, &state.info[signal]);      // (which child, and how it ended)
+    }
     state.pending |= bit(signal);
   }
 }
@@ -456,8 +469,8 @@ void thread_gone(Process& p, uint64_t tid) {
 void raise_signal(Process& p, uint32_t signal, uint64_t for_thread, int32_t code) {
   if (signal == 0 || signal > kSignals) return;
   LinuxProcessState& state = p.linux_state();
-  if (is_ignored(state, signal)) return;      // (dropped at once, blocked or not)
   LinuxProcessState::Thread& caller = thread_state(p);
+  if (dropped_at_once(state, signal, for_thread)) return;
   const bool own = for_thread == 0 || for_thread == caller.tid;
   // For the calling thread (or the process, which the calling thread may act for): carried out at once when it can be. For another thread: left for that thread.
   if (own && !(caller.blocked & ~kUnblockable & bit(signal)) && dispose(p, signal)) return;
@@ -960,6 +973,74 @@ uint64_t sys_rt_sigtimedwait(Process& p, uint64_t set, uint64_t info, uint64_t t
     if (p.runtime() && p.runtime()->interrupted()) return error(kEintr);
     const uint64_t left = deadline - now;
     p.block_sleep(left < 2000000u ? left : 2000000u);      // (looked at again every 2 ms: another thread's kill() or a timer may have raised one)
+  }
+}
+
+// --- signalfd: the pending signals of a set, read as records ----------------------------------------------------------------------------------------------
+// A program blocks the signals it wants this way and reads them from the descriptor in place of having handlers entered. What is read is taken out of
+// what is pending for the calling thread and for the process, exactly as sigtimedwait takes it.
+
+uint64_t signalfd_pending(Process& p, uint64_t mask) {
+  // (For poll(), with the descriptor manager's lock held: nothing is carried out here. What was posted from outside and not looked at yet counts.)
+  const LinuxProcessState& state = p.linux_state();
+  uint64_t posted = p.posted_signals();
+  for (uint32_t signal = 1; signal <= kSignals && posted != 0; ++signal)
+    if ((posted & bit(signal)) && dropped_at_once(state, signal, 0)) posted &= ~bit(signal);
+  return (state.pending | thread_state(p).pending | posted) & mask;
+}
+
+uint64_t signalfd_read(Process& p, uint64_t mask, uint64_t buffer, uint64_t count, bool non_blocking) {
+  constexpr uint64_t kRecord = 128;      // struct signalfd_siginfo
+  if (count < kRecord) return error(kEinval);
+  mask &= ~kUnblockable;
+  LinuxProcessState& state = p.linux_state();
+  const uint64_t most = count / kRecord;
+  uint64_t done = 0;
+  for (;;) {
+    fold_posted(p);
+    check_timers(p);
+    if (p.exited()) return done != 0 ? done * kRecord : error(kEintr);
+    LinuxProcessState::Thread& thread = thread_state(p);
+    while (done < most) {
+      const uint64_t hit = (state.pending | thread.pending) & mask;
+      if (hit == 0) break;
+      uint32_t signal = 1;
+      while (!(hit & bit(signal))) ++signal;
+      const LinuxProcessState::Info detail = state.info[signal];
+      const bool is_fault = signal == kSigSegv || signal == kSigBus || signal == kSigFpe || signal == kSigIll || signal == kSigTrap;
+      const bool is_timer = detail.code == kSiTimer;
+      // ssi_signo, ssi_errno, ssi_code, ssi_pid, ssi_uid, ssi_fd, ssi_tid, ssi_band, ssi_overrun, ssi_trapno, ssi_status, ssi_int (4 bytes each), ssi_ptr,
+      // ssi_utime, ssi_stime, ssi_addr (8 each), then padding
+      uint8_t raw[kRecord] = {};
+      ByteWriter writer{ByteView(raw, sizeof(raw))};
+      writer.le32(signal);
+      writer.le32(0);
+      writer.le32(uint32_t(detail.code));
+      writer.le32(is_timer || is_fault ? 0 : detail.sender);
+      writer.le32(0);
+      writer.le32(0);
+      writer.le32(is_timer ? detail.sender : 0);                   // (a timer's id)
+      writer.le32(0);
+      writer.le32(is_timer ? uint32_t(detail.status) : 0);         // (its overrun)
+      writer.le32(0);
+      writer.le32(is_timer ? 0 : uint32_t(detail.status));         // (how a child ended)
+      writer.le32(is_timer ? uint32_t(detail.value) : 0);
+      writer.le64(is_timer ? detail.value : 0);
+      writer.le64(0);
+      writer.le64(0);
+      writer.le64(is_fault ? detail.address : 0);
+      if (!p.write_user(buffer + done * kRecord, ConstByteView(raw, sizeof(raw)))) return done != 0 ? done * kRecord : error(kEfault);      // (it stays pending)
+      state.pending &= ~bit(signal);
+      thread.pending &= ~bit(signal);
+      state.info[signal] = LinuxProcessState::Info();
+      ++done;
+    }
+    if (done != 0) return done * kRecord;
+    if (non_blocking) return error(kEagain);
+    if (signal_interrupts(p)) return error(kEintr);      // another signal, one that is not read here, has to be seen to
+    if (p.runtime() && p.runtime()->interrupted()) return error(kEintr);
+    if (!p.runtime()) return error(kEagain);              // (one thread and nobody else: nothing can raise one; the timers were looked at)
+    p.block_sleep(2000000u);      // (looked at again every 2 ms, as sigtimedwait does)
   }
 }
 

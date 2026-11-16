@@ -525,6 +525,10 @@ void refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
   UnixType type;
   uint64_t link = 0;
   uint32_t mode = 0;
+  if (uint64_t mask = 0; m.signal_mask_locked(id, &mask)) {      // a signalfd: readable while a signal of its set is pending for this thread
+    m.set_link_ready_locked(id, signalfd_pending(p, mask) != 0, false);
+    return;
+  }
   if (!m.linked_locked(id, &type, &link, &mode)) return;
   bool readable = false, writable = false;
   switch (type) {
@@ -1198,15 +1202,22 @@ uint64_t sys_signalfd4(Process& p, uint64_t fd, uint64_t mask, uint64_t size, ui
   if (size != 8) return error(kEinval);
   uint64_t bits = 0;
   if (!p.read_user_u64(mask, &bits)) return error(kEfault);
-  if (int32_t(fd) != -1) {
+  bits &= ~((uint64_t{1} << 8) | (uint64_t{1} << 18));      // (SIGKILL and SIGSTOP are never read this way)
+  if (int32_t(fd) != -1) {      // an existing one: its set is replaced
     Sock s;
     if (const int64_t r = special_of(p, fd, UnixType::Signal, &s); r < 0) return error(-r);
+    Hold hold(*s.m);
+    s.m->set_signal_mask_locked(s.id, bits);
     return fd;
   }
   UnixSocketManager* m = system_unix_sockets();
   if (!m) return error(kEnomem);
   uint32_t id = 0;
   if (const UnixStatus st = m->create_signal(p.id(), &id); st != UnixStatus::Ok) return result_of(st);
+  {
+    Hold hold(*m);
+    m->set_signal_mask_locked(id, bits);
+  }
   return give_fd(p, *m, id, flags & kSockCloexec, flags & kSockNonBlock);
 }
 
@@ -1524,15 +1535,15 @@ uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
       case UnixType::Timer: return timer_read(p, s, buffer, count);
       case UnixType::FifoEnd: return fifo_read(p, s, buffer, count > kMaxIoBytes ? kMaxIoBytes : count);
       case UnixType::Epoll: return error(kEinval);
-      case UnixType::Signal: {      // (never readable: waits for ever, or EAGAIN)
-        if (count < 128) return error(kEinval);
+      case UnixType::Signal: {      // the pending signals of its set, as records
         bool non_blocking = false;
+        uint64_t mask = 0;
         {
           Hold hold(*s.m);
           non_blocking = s.m->non_blocking_locked(s.id);
+          s.m->signal_mask_locked(s.id, &mask);
         }
-        const int64_t r = wait_ready(p, non_blocking ? 0 : kNever, [](UnixSocketManager*, uint64_t*) -> int64_t { return 0; });
-        return error(r < 0 ? -r : kEagain);
+        return signalfd_read(p, mask, buffer, count, non_blocking);
       }
       default: break;
     }

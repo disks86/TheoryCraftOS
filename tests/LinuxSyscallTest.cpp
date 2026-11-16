@@ -2549,6 +2549,68 @@ static void test_inotify() {
   set_system_objects(nullptr);
 }
 
+// --- signalfd (282) and signalfd4 (289): pending signals read as records -----------------------------------------------------------------------------------
+static void test_signalfd() {
+  constexpr uint64_t kUsr1 = 10, kUsr2 = 12, kChld = 17, kWinch = 28, kTerm = 15;
+  auto bit = [](uint64_t signal) { return uint64_t{1} << (signal - 1); };
+  IpcRig system;
+  {
+    Waiting w;
+    Rig& rig = w.rig;
+    const uint64_t buf = rig.alloc(128 * 4), fds = rig.alloc(16), set = rig.alloc(8);
+    auto readable = [&](int64_t fd) {
+      rig.put32(fds, uint32_t(fd)); rig.put32(fds + 4, 1);
+      return rig.s(7, fds, 1, 0) == 1 && (rig.u32(fds + 4) >> 16) == 1;
+    };
+    // the program blocks what it wants to read (a signal that is not blocked is carried out as ever)
+    CHECK(rig.s(14, 0, rig.words({bit(kUsr1) | bit(kUsr2) | bit(kChld) | bit(kTerm)}), 0, 8) == 0);
+    const int64_t fd = rig.s(289, uint64_t(-1), rig.words({bit(kUsr1) | bit(kUsr2) | bit(kChld) | bit(9) | bit(19)}), 8, 0x800);
+    CHECK(fd >= 3 && !readable(fd) && rig.s(0, fd, buf, 128) == -11);
+    CHECK(rig.s(62, 1, kUsr1) == 0 && readable(fd));
+    CHECK(rig.s(0, fd, buf, 128) == 128 && rig.u32(buf) == kUsr1 && rig.u32(buf + 8) == 0 && rig.u32(buf + 12) == 1 && rig.u64(buf + 72) == 0);      // ssi_signo, SI_USER, ssi_pid
+    CHECK(!readable(fd) && rig.s(0, fd, buf, 128) == -11 && rig.s(127, set, 8) == 0 && rig.u64(set) == 0);      // read: no longer pending
+    // several at once: as many records as the buffer takes, the lowest signal first
+    CHECK(rig.s(62, 1, kUsr2) == 0 && rig.s(62, 1, kUsr1) == 0 && rig.s(62, 1, kTerm) == 0);
+    CHECK(rig.s(0, fd, buf, 127) == -22 && rig.s(0, fd, kBad, 128) == -14 && rig.s(127, set, 8) == 0 && rig.u64(set) == (bit(kUsr1) | bit(kUsr2) | bit(kTerm)));      // (nothing was lost)
+    CHECK(rig.s(0, fd, buf, 128 + 100) == 128 && rig.u32(buf) == kUsr1 && rig.s(0, fd, buf, 512) == 128 && rig.u32(buf) == kUsr2);
+    CHECK(!readable(fd) && rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kTerm));      // SIGTERM is not in the descriptor's set: it stays
+    CHECK(rig.s(62, 1, kUsr1) == 0 && rig.s(62, 1, kUsr2) == 0 && rig.s(0, fd, buf, 512) == 256 && rig.u32(buf) == kUsr1 && rig.u32(buf + 128) == kUsr2);
+    // a blocked signal waits whatever its action: SIGCHLD, which is ignored by default, can be read (and one that is not blocked is dropped as before)
+    CHECK(rig.s(62, 1, kChld) == 0 && readable(fd) && rig.s(0, fd, buf, 128) == 128 && rig.u32(buf) == kChld);
+    CHECK(rig.s(62, 1, kWinch) == 0 && rig.s(127, set, 8) == 0 && rig.u64(set) == bit(kTerm));
+    CHECK(rig.s(13, kUsr2, rig.words({1 /* SIG_IGN */, 0x04000000, 0, 0}), 0, 8) == 0 && rig.s(62, 1, kUsr2) == 0 && rig.s(0, fd, buf, 128) == 128 && rig.u32(buf) == kUsr2);
+    CHECK(rig.s(13, kUsr2, rig.words({0, 0x04000000, 0, 0}), 0, 8) == 0);
+    // a timer's signal: its id, its overrun and its value
+    const uint64_t event = rig.alloc(64), id = rig.alloc(8);
+    rig.put64(event, 0x1234567890ull); rig.put32(event + 8, uint32_t(kUsr2)); rig.put32(event + 12, 0);
+    CHECK(rig.s(222, 1, event, id) == 0 && rig.s(223, rig.u32(id), 0, rig.words({0, 1000000, 0, 1000000}), 0) == 0);
+    rig.host.now += 5500000;
+    CHECK(readable(fd) && rig.s(0, fd, buf, 128) == 128 && rig.u32(buf) == kUsr2 && int32_t(rig.u32(buf + 8)) == -2 && rig.u32(buf + 12) == 0);
+    CHECK(rig.u32(buf + 24) == rig.u32(id) && rig.u32(buf + 32) == 4 && rig.u32(buf + 44) == 0x34567890u && rig.u64(buf + 48) == 0x1234567890ull);      // ssi_tid, ssi_overrun, ssi_int, ssi_ptr
+    CHECK(rig.s(226, rig.u32(id)) == 0);
+    // the descriptor's set can be replaced; SIGKILL and SIGSTOP are never in it
+    CHECK(rig.s(289, fd, rig.words({bit(kTerm)}), 8, 0) == fd && readable(fd) && rig.s(0, fd, buf, 512) == 128 && rig.u32(buf) == kTerm);
+    CHECK(rig.s(62, 1, kUsr1) == 0 && !readable(fd) && rig.s(0, fd, buf, 128) == -11 && rig.s(282, fd, rig.words({bit(kUsr1)}), 8) == fd && rig.s(0, fd, buf, 128) == 128);
+    CHECK(rig.s(289, 1, rig.words({1}), 8, 0) == -22 && rig.s(289, 999, rig.words({1}), 8, 0) == -9 && rig.s(289, uint64_t(-1), rig.words({1}), 16, 0) == -22);
+    CHECK(rig.s(289, uint64_t(-1), kBad, 8, 0) == -14 && rig.s(289, uint64_t(-1), rig.words({1}), 8, 1) == -22);
+    // a descriptor that waits: until another thread raises one
+    const int64_t blocking = rig.s(282, uint64_t(-1), rig.words({bit(kUsr1)}), 8);
+    CHECK(blocking >= 3);
+    w.runtime.meanwhile = [&]() { CHECK(rig.s(62, 1, kUsr1) == 0); };
+    CHECK(rig.s(0, blocking, buf, 128) == 128 && rig.u32(buf) == kUsr1);
+    // ... and a signal that is not read this way, and not blocked, cuts the wait short like any other wait
+    w.runtime.meanwhile = [&]() { CHECK(rig.s(13, 34, rig.words({0x400000, 0x04000000, 0x400100, 0}), 0, 8) == 0 && rig.s(62, 1, 34) == 0); };
+    rig.process->linux_state().handlers_run = true;
+    CHECK(rig.s(0, blocking, buf, 128) == -4);
+    CHECK(rig.s(3, fd) == 0 && rig.s(3, blocking) == 0);
+  }
+  {      // one thread and nobody to raise anything: a read that would wait for ever says so
+    Rig alone;
+    const int64_t fd = alone.s(282, uint64_t(-1), alone.words({1 << 9}), 8);
+    CHECK(fd >= 3 && alone.s(0, fd, alone.alloc(128), 128) == -11);
+  }
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -2637,7 +2699,7 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
-      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io}, {"inotify", test_inotify},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io}, {"inotify", test_inotify}, {"signalfd", test_signalfd},
       {"every call is known", test_every_call_is_known}, {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {

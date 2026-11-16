@@ -47,6 +47,7 @@ void set_linked_non_blocking(Process& p, uint64_t fd, bool on);
 uint64_t sys_timerfd_create(Process& p, uint64_t clock, uint64_t flags);
 uint64_t sys_timerfd_settime(Process& p, uint64_t fd, uint64_t flags, uint64_t value, uint64_t old);
 uint64_t sys_timerfd_gettime(Process& p, uint64_t fd, uint64_t current);
+// signalfd: a descriptor that pending signals of a set are read from (struct signalfd_siginfo); with an existing descriptor the set is replaced.
 uint64_t sys_signalfd4(Process& p, uint64_t fd, uint64_t mask, uint64_t size, uint64_t flags);
 uint64_t sys_epoll_create1(Process& p, uint64_t flags);
 uint64_t sys_epoll_ctl(Process& p, uint64_t epfd, uint64_t op, uint64_t fd, uint64_t event);

@@ -36,7 +36,7 @@ exit with its error code instead. The copying is done by whoever runs the progra
 program it became.
 
 **wait.** The parent keeps a record of each child until `wait4` or `waitid` has reported it. A waiting parent looks again every 2 ms.
-`SIGCHLD` is sent when a child ends (its `siginfo` does not say which: handlers call `waitpid`). Children never stop or continue, so
+`SIGCHLD` is sent when a child ends; its `siginfo` names a child that has ended and was not waited for yet, and how it ended. Children never stop or continue, so
 `WUNTRACED` and `WCONTINUED` report nothing.
 
 **Signals.** The kernel keeps handlers, masks and the alternate stack, and carries signals out: a signal whose action is the default
@@ -55,6 +55,12 @@ waits, and one with a handler has its handler entered.
 - *Where signals come from.* The process itself (`kill`, `tgkill`, `raise`, `abort`), its timers (`alarm`, `setitimer`), the
   processor, another process's `kill` (the target acts on it by its own settings) and a child that ended (`SIGCHLD`). `tgkill` and
   faults are for one thread; the rest is taken by whichever thread of the process looks first and does not block it.
+- *Blocked signals.* A signal that a thread blocks stays pending whatever its action is, also one that would be ignored (`SIGCHLD`,
+  `SIGWINCH` by default): it is dropped only if it is still ignored when it is unblocked. That is what lets `sigwaitinfo` and a
+  signalfd take such signals without a handler.
+- *signalfd.* A read takes the signals of the descriptor's set that are pending for the calling thread or the process, as
+  `struct signalfd_siginfo` records (who sent it, a timer's id, overrun and value, a fault's address, for `SIGCHLD` the child and how
+  it ended); `poll` and `epoll` report it readable while there is one. A waiting read looks again every 2 ms.
 - *Calls that wait.* A read on a pipe or socket, `futex`, `wait4`, `nanosleep`, `poll`, `epoll_wait`, a lock that is waited for and so
   on end with `EINTR` when a signal is there for the thread. With `SA_RESTART` the calls Linux restarts are started again after the
   handler. A read of the console and a wait for a priority-inheritance futex are not cut short.
@@ -138,7 +144,7 @@ back to `read` and `write`.
 - The SVE, SME, RISC-V vector and LoongArch LSX / LASX registers in a handler's frame (only the general, NEON and floating-point
   registers are kept); queued real-time signals (signals of one kind do not queue, and `sigqueue`'s value is not kept); stopping and
   continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` do nothing); Ctrl+C as `SIGINT` (it still ends the program); the AVX halves of the vector
-  registers in a handler's frame; a `signalfd` that real signals reach (it is never readable).
+  registers in a handler's frame; the sender of a signal that came from another process (`si_pid` is 0 then).
 - Copy-on-write for `fork`, and a `vfork` child that shares its parent's memory.
 - The parts with a fixed answer above: `io_uring`, `fanotify`, `seccomp` filters, `bpf`, `perf_event_open`, `userfaultfd`, namespaces,
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.

@@ -58,7 +58,7 @@ enum class UnixType : uint8_t { Stream = 1, Datagram = 2, SeqPacket = 5,      //
                                 Event = 0x40,        // eventfd: a counter
                                 Timer = 0x41,        // timerfd: expirations of a deadline (the Linux layer advances it from the process's clocks)
                                 Epoll = 0x42,        // epoll: an interest list (the Linux layer evaluates it)
-                                Signal = 0x43,       // signalfd: no signal is routed to it (never ready)
+                                Signal = 0x43,       // signalfd: a set of signals (the Linux layer takes the pending ones of it for a read)
                                 // Named pipes (FIFOs, see below): the pipe itself, which no descriptor holds, and one open() of it.
                                 Fifo = 0x44,
                                 FifoEnd = 0x45,
@@ -161,6 +161,9 @@ class UnixSocketManager {
   UnixStatus create_timer(uint64_t owner_pid, uint32_t clock, uint32_t* id);
   UnixStatus create_epoll(uint64_t owner_pid, uint32_t* id);
   UnixStatus create_signal(uint64_t owner_pid, uint32_t* id);
+  // A signalfd's set of signals (the Linux layer reads the pending ones of that set through it, and says whether there are any: set_link_ready_locked).
+  bool signal_mask_locked(uint32_t id, uint64_t* mask) const;
+  void set_signal_mask_locked(uint32_t id, uint64_t mask);
   // A descriptor for something another part of the system keeps (a message queue, a process, a set of inotify watches): `link` says which, `mode` is the
   // owner's to use (how it was opened). poll() reports it readable and writable as the owner last said (set_link_ready_locked). When its last descriptor
   // is closed the hook registered for its type is called, with the lock held.
@@ -304,7 +307,7 @@ class UnixSocketManager {
     bool shut_read = false, shut_write = false;
     UnixStatus pending_error = UnixStatus::Ok;
     bool non_blocking = false, pass_credentials = false;
-    uint64_t counter = 0;                // an eventfd's value (UnixType::Event), a timer's expirations (UnixType::Timer)
+    uint64_t counter = 0;                // an eventfd's value (UnixType::Event), a timer's expirations (UnixType::Timer), a signalfd's set (UnixType::Signal)
     uint64_t link = 0;                   // a linked descriptor: what it refers to, how it was opened, and whether it is ready
     uint32_t link_mode = 0;
     bool link_readable = false, link_writable = false;
