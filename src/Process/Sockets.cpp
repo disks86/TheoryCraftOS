@@ -467,7 +467,10 @@ SocketManager::State SocketManager::state(uint32_t id) const {
   if (!s->tcp) return State::Unconnected;
   if (s->listening) return State::Listening;
   if (s->tcp->failed()) return State::Failed;
-  return s->tcp->is_connected() ? State::Connected : State::Connecting;
+  // (A connection one side of which is closed, or that is closing, is still a connection: what the other side sent can be read, and the end of the stream
+  // is read after it.)
+  const network::TcpState now = s->tcp->state();
+  return now == network::TcpState::SynSent || now == network::TcpState::SynReceived ? State::Connecting : State::Connected;
 }
 
 bool SocketManager::peer_closed(uint32_t id) const {

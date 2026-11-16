@@ -195,7 +195,7 @@ static void test_tcp_client() {
   CHECK(fd >= 3 && t.process.files().close_on_exec(uint64_t(fd)) && t.process.files().kind(uint64_t(fd)) == DescriptorKind::Socket);
   uint32_t v = 0;
   CHECK(t.option(fd, 1, 3, &v) == 0 && v == kStream && t.option(fd, 1, 39, &v) == 0 && v == kAfInet && t.option(fd, 1, 38, &v) == 0 && v == 6 && t.option(fd, 1, 30, &v) == 0 && v == 0);
-  CHECK(t.s(1, fd, t.bytes("x"), 1) == -107 && t.s(0, fd, t.alloc(8), 8) == -107 && t.s(52, fd, t.alloc(16), t.word(16)) == -107);      // ENOTCONN before it is connected
+  CHECK(t.s(1, fd, t.bytes("x"), 1) == -32 && t.s(0, fd, t.alloc(8), 8) == -107 && t.s(52, fd, t.alloc(16), t.word(16)) == -107);      // ENOTCONN before it is connected
   CHECK(t.s(42, fd, t.in4(10, 0, 0, 2, 9000), 16) == 0 && peer && peer->is_connected());
   CHECK(t.s(42, fd, t.in4(10, 0, 0, 2, 9000), 16) == -106);      // EISCONN
   CHECK(t.s(1, fd, t.bytes("hello from the client"), 21) == 21);
@@ -233,6 +233,26 @@ static void test_tcp_client() {
   CHECK(t.s(0, fd, buf, 64) == 0 && (t.polled(fd) & kPollIn) != 0 && t.s(0, fd, buf, 64) == 0);
   CHECK(t.s(48, fd, 1) == 0 && t.s(1, fd, buf, 1) == -32 && t.s(48, fd, 3) == -22);      // shutdown(SHUT_WR): EPIPE afterwards
   CHECK(t.s(3, fd) == 0 && t.s(0, fd, buf, 1) == -9 && t.sockets.state(1) == SocketManager::State::None);
+}
+
+// A program that has said all it has to say (shutdown(SHUT_WR)) still reads what the other end sends afterwards, and then the end of the stream.
+static void test_half_close() {
+  Setup t;
+  SharedPointer<network::ITcpSocket> listener = t.lan.b.tcp_open(), peer;
+  CHECK(listener->listen(9050));
+  t.host.meanwhile = [&] { if (!peer) peer = listener->accept(); };
+  const int64_t fd = t.s(41, kAfInet, kStream, 0);
+  CHECK(t.s(42, fd, t.in4(10, 0, 0, 2, 9050), 16) == 0 && t.s(1, fd, t.bytes("request"), 7) == 7 && t.s(48, fd, 1) == 0);
+  CHECK(t.lan.run_until([&] { return peer && peer->available() >= 7; }, 3000) && received_by(peer) == "request");
+  CHECK(t.lan.run_until([&] { return peer->peer_closed(); }, 3000));      // the other end sees the end of what this one sends
+  CHECK(t.s(1, fd, t.bytes("x"), 1) == -32);      // EPIPE: its own side is closed
+  bool sent = false;
+  t.host.meanwhile = [&] { if (!sent) { sent = true; send_from(peer, "late answer"); peer->close(); } };
+  const uint64_t buf = t.alloc(64);
+  CHECK(t.s(0, fd, buf, 64) == 11 && t.text(buf, 11) == "late answer" && t.s(0, fd, buf, 64) == 0);
+  uint32_t v = 9;
+  CHECK(t.option(fd, 1, 4, &v) == 0 && v == 0 && (t.polled(fd) & kPollHup) != 0);      // no error: it ended in good order, in both directions
+  t.host.meanwhile = nullptr;
 }
 
 // A connect that does not wait, one that nobody answers, and what poll and SO_ERROR say about them.
@@ -551,6 +571,7 @@ static void test_options_and_errors() {
 
 int main() {
   test_tcp_client();
+  test_half_close();
   test_connecting();
   test_tcp_server();
   test_udp();

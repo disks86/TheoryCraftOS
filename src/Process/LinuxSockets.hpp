@@ -22,8 +22,8 @@
 #include "Process/Syscall.hpp"
 #include "Process/UnixSockets.hpp"
 
-// The Linux socket system calls, for AF_UNIX sockets (UnixSockets.hpp: the same sockets Windows programs use, so the two can talk). Other families answer
-// EAFNOSUPPORT. Each returns the value for the result register: the result, or -errno. Signals are not delivered here, so a send to a closed connection is
+// The Linux socket system calls, for AF_UNIX sockets (UnixSockets.hpp: the same sockets Windows programs use, so the two can talk) and, handed on to
+// LinuxInetSockets.cpp, AF_INET and AF_INET6 ones. Other families answer EAFNOSUPPORT. Each returns the value for the result register: the result, or -errno. Signals are not delivered here, so a send to a closed connection is
 // just EPIPE (as with MSG_NOSIGNAL) and a blocked call ends with EINTR only when the program is told to stop.
 namespace process::linuxabi {
 

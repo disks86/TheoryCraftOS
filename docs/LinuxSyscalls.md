@@ -15,7 +15,7 @@ number means a call newer than this list.
 | Threads | `LinuxThreads.cpp` | clone, clone3 (threads), futex, futex_waitv, futex_wake, futex_wait, futex_requeue, set_tid_address, gettid, exit, sched_getaffinity |
 | Processes | `LinuxProcess.cpp`, `LinuxExec.cpp` | fork, vfork, clone and clone3 (processes), execve, execveat, wait4, waitid, exit_group, the uid/gid/group calls, getpgid, setpgid, getsid, setsid, capget, capset, getrlimit, setrlimit, prlimit64, getrusage, times, sysinfo, getpriority, setpriority, the sched_* calls, getcpu, personality, prctl, membarrier, robust lists, kcmp, pidfd_open, pidfd_send_signal, pidfd_getfd, process_mrelease |
 | Signals | `LinuxSignals.cpp` | rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigtimedwait, rt_sigsuspend, pause, sigaltstack, kill, tkill, tgkill, rt_sigqueueinfo, alarm, getitimer, setitimer, timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete |
-| Sockets and events | `LinuxSockets.cpp` | AF_UNIX sockets, pipes, eventfd, timerfd, signalfd, epoll, poll, select |
+| Sockets and events | `LinuxSockets.cpp`, `LinuxInetSockets.cpp` | AF_UNIX, AF_INET and AF_INET6 sockets (socket, bind, connect, listen, accept, accept4, sendto, recvfrom, sendmsg, recvmsg, sendmmsg, recvmmsg, shutdown, getsockname, getpeername, setsockopt, getsockopt), pipes, eventfd, timerfd, signalfd, epoll, poll, select |
 | Time | `LinuxSyscalls.cpp` | clock_gettime, clock_getres, clock_nanosleep, nanosleep, gettimeofday, time |
 | System V IPC | `LinuxIpc.cpp` | shmget, shmat, shmdt, shmctl, semget, semop, semtimedop, semctl, msgget, msgsnd, msgrcv, msgctl |
 | POSIX message queues | `LinuxIpc.cpp` | mq_open, mq_unlink, mq_timedsend, mq_timedreceive, mq_notify, mq_getsetattr |
@@ -118,6 +118,25 @@ remove, rename and write (and do no work for it while nobody watches). Told: `IN
 come in the order things happened; those of several watches of one instance come watch by watch. 128 watches in the whole system, 32
 instances.
 
+**Network sockets.** `AF_INET` and `AF_INET6`, `SOCK_STREAM` (TCP) and `SOCK_DGRAM` (UDP), over the system's network stacks through the
+socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback needs no interface's address.
+
+- A call that would wait does so until the network has made progress, a signal arrives (`EINTR`) or the socket's `SO_RCVTIMEO` /
+  `SO_SNDTIMEO` runs out (`EAGAIN`). `O_NONBLOCK`, `SOCK_NONBLOCK`, `FIONBIO` and `MSG_DONTWAIT` make it not wait.
+- A `connect` that does not wait answers `EINPROGRESS`; the socket turns writable when the handshake is over and `SO_ERROR` says how it
+  went. Nothing listening is `ECONNREFUSED` (an attempt that times out is reported the same way).
+- An `AF_INET6` socket takes IPv4 too unless `IPV6_V6ONLY` is set, and shows IPv4 peers as `::ffff:a.b.c.d`, as on Linux.
+- `shutdown(SHUT_WR)` ends what this side sends; what the other side still sends can be read. `poll`, `select` and `epoll` know these
+  sockets (a wait looks at them every 2 ms). `dup` and `fork` share a socket.
+- Options: `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_KEEPALIVE`, `SO_BROADCAST`, `SO_LINGER`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY` and the
+  common `IP_*`, `IPV6_*` and `TCP_*` ones are kept and read back, and change nothing in the stack; `SO_TYPE`, `SO_DOMAIN`,
+  `SO_PROTOCOL`, `SO_ERROR`, `SO_ACCEPTCONN`, the timeouts and `IPV6_V6ONLY` are real.
+- Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `MSG_PEEK` is
+  refused (`EOPNOTSUPP`); no control messages (`IP_PKTINFO` and the like are accepted and none arrive); `bind` uses every interface
+  whatever address it names; no raw or ICMP sockets, no `AF_NETLINK` (so `getifaddrs` fails), no multicast membership; 256 sockets in
+  the system. A statically linked glibc program's `getaddrinfo` needs the C library's own files, as on Linux, and there is no
+  `/etc/resolv.conf` yet: programs that name hosts by number work.
+
 **One memory node, no protection keys.** `get_mempolicy`, `set_mempolicy`, `mbind`, `move_pages` and `migrate_pages` accept every policy
 and answer for a machine with one node. `pkey_alloc` answers `ENOSPC`, as on a processor without protection keys.
 
@@ -149,7 +168,8 @@ back to `read` and `write`.
 - The parts with a fixed answer above: `io_uring`, `fanotify`, `seccomp` filters, `bpf`, `perf_event_open`, `userfaultfd`, namespaces,
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
-- Sockets other than `AF_UNIX` for Linux programs; file permission bits and owners (the calls succeed and keep nothing).
+- Of network sockets: `MSG_PEEK`, datagrams larger than a frame, control messages, raw sockets, `AF_NETLINK`, name resolution set up
+  for Linux programs (`/etc/resolv.conf`). File permission bits and owners (the calls succeed and keep nothing).
 - Of inotify: `IN_CLOSE_WRITE`, `IN_OPEN`, `IN_ACCESS`, `IN_ATTRIB`. Of asynchronous I/O: requests that would wait (`IOCB_CMD_POLL`).
   `CLONE_PIDFD`. `mq_notify` with `SIGEV_THREAD`. The requeue-PI futex operations.
 
@@ -165,4 +185,7 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh` runs one.
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6. `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
+  runs one.
+- `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
+  datagrams, the loopback, IPv6, epoll, options, bad addresses).

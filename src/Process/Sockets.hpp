@@ -111,6 +111,8 @@ class SocketManager {
     uint32_t send_buffer = 0, receive_buffer = 0;      // SO_SNDBUF, SO_RCVBUF as last set (0: the default)
     bool connect_started = false;      // connect() was called and has not been seen to finish
     bool shut_read = false, shut_write = false;
+    bool has_bound_address = false;      // bind() named an address: what getsockname shows until the socket is connected
+    network::IpAddress bound_address;
   };
   Options* options(uint32_t id);
   // See IStackProvider: read progress() before an attempt that may block; wait_for_progress() returns when some stack did something (or the

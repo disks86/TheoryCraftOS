@@ -230,7 +230,7 @@ int64_t send_bytes(Process& p, const Inet& s, ConstByteView data, uint64_t flags
     case SocketManager::State::Connected: break;
     case SocketManager::State::Failed: return -(options->connect_started ? kEconnrefused : kEconnreset);
     case SocketManager::State::Connecting: return -kEagain;      // (not yet: Linux says EAGAIN for a send on a socket whose connect is in progress)
-    default: return -kEnotconn;
+    default: return -kEpipe;      // (a stream socket nobody connected: EPIPE for a writer, as on Linux)
   }
   uint64_t done = 0;
   while (done < data.size()) {
@@ -348,7 +348,11 @@ uint64_t inet_bind(Process& p, uint64_t fd, uint64_t address, uint64_t length) {
   if (const int64_t r = read_address(p, address, length, s.sockets->is_ipv6(s.id), &local, &port); r < 0) return error(-r);
   if (s.sockets->is_bound(s.id)) return error(kEinval);      // (bound already)
   const uint32_t status = s.sockets->bind(s.id, local, port);
-  return status == 0 ? 0 : error(errno_of(status));
+  if (status != 0) return error(errno_of(status));
+  SocketManager::Options* options = s.sockets->options(s.id);
+  options->has_bound_address = true;      // (every interface's own address is used whatever was named; the name is what the program reads back)
+  options->bound_address = local;
+  return 0;
 }
 
 // connect(): a datagram socket only remembers its peer. A stream socket's handshake takes time: a socket that does not wait answers EINPROGRESS (and EALREADY
@@ -556,6 +560,9 @@ uint64_t inet_getsockname(Process& p, uint64_t fd, uint64_t address, uint64_t le
   if (!s.sockets->local_name(s.id, &local, &port)) return error(kEbadf);
   // (an address of the socket's own family, also before anything fixed one)
   if (s.sockets->is_ipv6(s.id) && !local.v6) local = network::IpAddress(network::kIpv6Any);
+  // (until it is connected, a socket that was bound to an address shows that address)
+  if (const SocketManager::Options* options = s.sockets->options(s.id); options->has_bound_address && s.sockets->state(s.id) != SocketManager::State::Connected)
+    local = options->bound_address;
   if (address == 0 || length_at == 0) return error(kEfault);
   const int64_t w = write_address(p, address, length_at, local, port);
   return w < 0 ? error(-w) : 0;
