@@ -3,7 +3,7 @@
 # kernel's autorun: tests/linux/forktest.c and signaltest.c (static, no libc: the calls themselves, handlers entered after calls, at timer ticks and on
 # faults), spawntest.c and handlertest.c (static, glibc: fork(), posix_spawn(), abort(), signal(), siglongjmp out of a SIGSEGV handler, pthread_kill(),
 # a SIGCHLD handler), ipctest.c (static, glibc: System V IPC, POSIX message queues and timers, inotify, pidfd, asynchronous I/O) and nettest.c (static,
-# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6) and resolvetest.c (static, glibc: hosts and services by name, from /etc and from DNS
+# glibc: TCP and UDP sockets over the loopback, IPv4 and IPv6), netlinktest.c (static, glibc: getifaddrs and netlink requests) and resolvetest.c (static, glibc: hosts and services by name, from /etc and from DNS
 # through QEMU's DNS server; it needs this machine's own resolver to answer for ".localhost" and ".invalid", as systemd-resolved does). What each prints must be what the same program prints on this machine's own Linux kernel, line for line.
 # Then signaltest.c as an AArch64, a RISC-V and a LoongArch program, which the kernel runs on its CPU emulator.
 # Uses its own build folder (build-fork-qemu) so the normal build keeps no autorun.

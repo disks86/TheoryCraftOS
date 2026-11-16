@@ -149,8 +149,39 @@ socket manager that Windows programs' sockets use (`Sockets.hpp`); the loopback 
   taken, `SCM_RIGHTS`, `SCM_CREDENTIALS` and another family's messages are passed over, anything else of the socket's own levels or
   not whole is `EINVAL`, more than 20480 bytes `ENOBUFS`. (Descriptors and credentials travel over `AF_UNIX` sockets, see above.)
 - Limits: a datagram has to fit one frame (1472 bytes over IPv4, `EMSGSIZE` beyond: the stack sends no fragments); `bind` uses every interface
-  whatever address it names; no raw or ICMP sockets, no `AF_NETLINK` (so `getifaddrs` fails), no multicast membership; 256 sockets in
-  the system.
+  whatever address it names; no raw or ICMP sockets, no multicast membership; 256 sockets in the system.
+
+**Netlink.** `socket(AF_NETLINK, SOCK_RAW or SOCK_DGRAM, ...)` is how a program asks the kernel about the network and hears of changes
+to it (`getifaddrs`, `if_nameindex`, `ip addr`). The kernel's side is `LinuxNetlinkMessages.cpp` (requests in, datagrams out, knowing
+nothing of processes); the sockets are `LinuxNetlink.cpp`. Up to 64 at once.
+
+- The network as programs are shown it: the loopback is interface 1, `lo`; each network interface follows as `eth0`, `eth1`, ...
+  from number 2 (the numbers `IP_PKTINFO` reports), with its hardware address, its IPv4 address and prefix, its IPv6 link-local and
+  global addresses, and the routes these amount to (a default route by the gateway or router, the subnet or prefix on the link).
+- `NETLINK_ROUTE`: `RTM_GETLINK`, `RTM_GETADDR` and `RTM_GETROUTE` as lists (`NLM_F_DUMP`, by family if one is named; several
+  datagrams of `NLM_F_MULTI` messages and `NLMSG_DONE`), `RTM_GETLINK` for one interface by number or `IFLA_IFNAME`, and
+  `RTM_GETROUTE` for one destination (`RTA_DST`: the longest matching prefix; the machine's own addresses are local). Other lists
+  (neighbours, rules, ...) are empty. Anything that would change the network is `EPERM`, anything unknown `EOPNOTSUPP`. Errors and
+  acknowledgements (`NLM_F_ACK`) come back as `NLMSG_ERROR` with the request, or its header alone with `NETLINK_CAP_ACK`.
+- A socket bound to groups (`nl_groups`, `NETLINK_ADD_MEMBERSHIP`) is told of addresses, routes and interfaces that come and go:
+  `RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV6_IFADDR`, `RTMGRP_IPV4_ROUTE`, `RTMGRP_IPV6_ROUTE`. Nothing announces such changes
+  in this kernel, so they are found by comparing the network with what the socket was last told, whenever the socket is looked at: a
+  `poll` or a read that waits looks again within 100 ms.
+- `NETLINK_GENERIC` has the controller, which knows no family but itself (`CTRL_CMD_GETFAMILY` of anything else is `ENOENT`).
+  `NETLINK_KOBJECT_UEVENT` can be bound and filtered (`SO_ATTACH_FILTER` is taken and not run) and never hears anything. Other
+  protocols are `EPROTONOSUPPORT`.
+- The socket calls: `bind` (an address of 0 gets the process's number, a second socket of the process one counted down from
+  -4097; one in use is `EADDRINUSE`), `connect`, every way of sending and receiving, `MSG_PEEK`, `MSG_TRUNC`, `FIONREAD`,
+  `SO_PASSCRED` (`SCM_CREDENTIALS`: the kernel is process 0 of user 0), `NETLINK_PKTINFO`, the buffer sizes and timeouts, and the
+  `NETLINK_*` options kept and read back. Two sockets of one protocol can send to each other by address. A queue holds 512 KiB;
+  what does not fit is lost and the next read says `ENOBUFS` once (unless `NETLINK_NO_ENOBUFS`). `listen`, `accept` and `shutdown`
+  are `EOPNOTSUPP`.
+- The interface ioctls of any socket answer from the same picture: `SIOCGIFNAME` and `SIOCGIFINDEX` (what `if_indextoname` and
+  `if_nametoindex` are), `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFBRDADDR`, `SIOCGIFDSTADDR`, `SIOCGIFMTU`,
+  `SIOCGIFHWADDR`, `SIOCGIFMETRIC`, `SIOCGIFTXQLEN` and `SIOCGIFCONF`; the ones that set something are `EPERM`.
+- Limits: an interface is always shown up and running (there is no link state to tell); packet counts are zero; only the main
+  routing table is listed (not the local one); `NETLINK_GET_STRICT_CHK` and `NETLINK_EXT_ACK` are kept and change nothing; no
+  messages between the groups of two programs' sockets.
 
 **Finding hosts by name.** A C library does that itself, from files and by asking a DNS server over UDP or TCP; what it needs here are
 the files (`LinuxNetworkFiles.cpp`). `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/services` and `/etc/protocols` are
@@ -163,7 +194,7 @@ written into the program's tree (`/Linux/etc`) the first time a program names on
   `protocols` have the common ones.
 - A datagram socket's `connect` with `AF_UNSPEC` takes its peer away again, and `FIONREAD` of one answers with room for any datagram:
   both are what a resolver relies on.
-- glibc looks for `AF_NETLINK` to learn which IP versions are configured and, finding none, tries both. A statically linked glibc
+- glibc asks over `AF_NETLINK` (a list of addresses) which IP versions are configured, for `AI_ADDRCONFIG`. A statically linked glibc
   program resolves names here (the files and DNS lookups are built into the library); anything else in `nsswitch.conf` would need the
   library's own modules in the tree.
 
@@ -199,7 +230,8 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, raw sockets, `AF_NETLINK`. Of name resolution:
+  real TTL, TOS and arrival time of a received packet, the error queue, raw sockets. Of netlink: changing the
+  network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
 - Of inotify: `IN_CLOSE_WRITE`, `IN_OPEN`, `IN_ACCESS`, `IN_ATTRIB`. Of asynchronous I/O: requests that would wait (`IOCB_CMD_POLL`).
@@ -217,11 +249,13 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included. `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, and `netlinktest.c`
+  for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
-  datagrams, the loopback, IPv6, epoll, options, bad addresses), and the files for finding hosts by name with a resolver's exchange
-  with a DNS server.
+  datagrams, the loopback, IPv6, epoll, options, bad addresses), the files for finding hosts by name with a resolver's exchange
+  with a DNS server, and netlink: the messages on their own (every request, cut short anywhere and with any bit flipped) and the
+  sockets through the system calls, a change of address told to a listener among them.
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for
   `.localhost` and `.invalid` by itself, as systemd-resolved does). The expected output is the dynamically linked build's: a static
