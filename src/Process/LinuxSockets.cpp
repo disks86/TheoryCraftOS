@@ -530,6 +530,7 @@ void refresh_linked_locked(Process& p, UnixSocketManager& m, uint32_t id) {
   switch (type) {
     case UnixType::MessageQueue: mq_readiness_locked(link, mode, &readable, &writable); break;
     case UnixType::Pidfd: readable = pidfd_ready(p, link); break;
+    case UnixType::Inotify: readable = inotify_ready_locked(link); break;
     default: break;
   }
   m.set_link_ready_locked(id, readable, writable);
@@ -1512,6 +1513,13 @@ uint64_t socket_read(Process& p, uint64_t fd, uint64_t buffer, uint64_t count) {
   if (socket_of(p, fd, &s) == 0) {
     switch (type_of(s)) {
       case UnixType::MessageQueue: case UnixType::Pidfd: return error(kEinval);      // (not read from: they have calls of their own)
+      case UnixType::Inotify: {
+        uint64_t link = 0;
+        uint32_t mode = 0;
+        bool non_blocking = false;
+        if (linked_of(p, fd, UnixType::Inotify, &link, &mode, &non_blocking) != 0) return error(kEbadf);
+        return inotify_read(p, link, buffer, count, non_blocking);
+      }
       case UnixType::Event: return event_read(p, s, buffer, count);
       case UnixType::Timer: return timer_read(p, s, buffer, count);
       case UnixType::FifoEnd: return fifo_read(p, s, buffer, count > kMaxIoBytes ? kMaxIoBytes : count);

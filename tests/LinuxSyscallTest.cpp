@@ -2385,6 +2385,164 @@ static void test_async_io() {
   }
 }
 
+// --- inotify: inotify_init (253), inotify_add_watch (254), inotify_rm_watch (255), inotify_init1 (294) -------------------------------------------------------
+static void test_inotify() {
+  constexpr uint32_t kModify = 2, kMovedFrom = 0x40, kMovedTo = 0x80, kCreate = 0x100, kDelete = 0x200, kDeleteSelf = 0x400, kMoveSelf = 0x800, kAll = 0xFFF,
+                     kOverflow = 0x4000, kIgnored = 0x8000, kIsDir = 0x40000000;
+  filesystem::RamFileSystem fs(A);
+  populate(fs);
+  IpcRig system;
+  ObjectManager objects(system.sync);
+  objects.set_allocator(&A);
+  set_system_objects(&objects);
+  {
+    Waiting w(&fs);
+    Rig& rig = w.rig;
+    Rig other(&fs, 2);      // another process makes some of the changes
+    system.sync.host = &rig.host;
+    const uint64_t buf = rig.call(9, 0, 65536, 3, 0x22, ~uint64_t{0}, 0), fds = rig.alloc(16);
+    struct Event { int32_t wd; uint32_t mask, cookie; std::string name; };
+    // read() as far as there is anything; the events it gave
+    auto events = [&](int64_t fd, uint64_t room = 65536) {
+      std::vector<Event> out;
+      const int64_t n = rig.s(0, fd, buf, room);
+      for (int64_t at = 0; n > 0 && at + 16 <= n;) {
+        Event e;
+        e.wd = int32_t(rig.u32(buf + uint64_t(at)));
+        e.mask = rig.u32(buf + uint64_t(at) + 4);
+        e.cookie = rig.u32(buf + uint64_t(at) + 8);
+        const uint32_t length = rig.u32(buf + uint64_t(at) + 12);
+        CHECK(length % 16 == 0 && at + 16 + int64_t(length) <= n);
+        e.name = rig.bytes(buf + uint64_t(at) + 16, length).c_str();
+        CHECK(length == 0 || (e.name.size() < length && length < e.name.size() + 17));
+        out.push_back(e);
+        at += 16 + int64_t(length);
+      }
+      return out;
+    };
+    auto readable = [&](int64_t fd) {
+      rig.put32(fds, uint32_t(fd)); rig.put32(fds + 4, 1);
+      return rig.s(7, fds, 1, 0) == 1 && (rig.u32(fds + 4) >> 16) == 1;
+    };
+    auto touch = [&](Rig& r, const std::string& path) {      // makes an empty file
+      const int64_t made = r.s(85, r.str(path), 0644);
+      return made >= 3 && r.s(3, made) == 0;
+    };
+    const int64_t fd = rig.s(294, 0x800);      // IN_NONBLOCK
+    CHECK(fd >= 3 && rig.s(294, 1) == -22);
+    const int64_t tmp = rig.s(254, fd, rig.str("/tmp"), kAll), etc = rig.s(254, fd, rig.str("/etc"), kCreate | kDelete);
+    CHECK(tmp == 1 && etc == 2 && rig.s(254, fd, rig.str("/tmp/"), kAll) == 1);      // the same folder again: the same watch
+    CHECK(!readable(fd) && rig.s(0, fd, buf, 4096) == -11);
+    // made, written, renamed, removed: by this process and by another
+    int64_t f = rig.s(2, rig.str("/tmp/a.txt"), 0x42, 0644);
+    CHECK(f >= 3 && rig.s(1, f, rig.str("hello"), 5) == 5 && rig.s(1, f, rig.str("!"), 1) == 1 && rig.s(3, f) == 0);
+    CHECK(readable(fd));
+    std::vector<Event> got = events(fd);
+    CHECK(got.size() == 2 && got[0].wd == 1 && got[0].mask == kCreate && got[0].name == "a.txt" && got[1].mask == kModify && got[1].name == "a.txt" && got[1].cookie == 0);
+    CHECK(!readable(fd));
+    CHECK(other.s(83, other.str("/tmp/sub"), 0755) == 0 && other.s(82, other.str("/tmp/a.txt"), other.str("/tmp/b.txt")) == 0 && other.s(87, other.str("/tmp/b.txt")) == 0);
+    CHECK(other.s(84, other.str("/tmp/sub")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 5 && got[0].mask == (kCreate | kIsDir) && got[0].name == "sub" && got[1].mask == kMovedFrom && got[1].name == "a.txt" && got[2].mask == kMovedTo && got[2].name == "b.txt");
+    CHECK(got.size() == 5 && got[1].cookie != 0 && got[1].cookie == got[2].cookie && got[3].mask == kDelete && got[3].name == "b.txt" && got[4].mask == (kDelete | kIsDir) && got[4].name == "sub");
+    // a watch is told what its mask asks for; one on another folder only of that folder
+    CHECK(touch(rig, "/etc/new") && rig.s(76, rig.str("/etc/motd"), 3) == 0 && rig.s(87, rig.str("/etc/new")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 2 && got[0].wd == 2 && got[0].mask == kCreate && got[0].name == "new" && got[1].mask == kDelete);      // (no IN_MODIFY for motd: not asked for)
+    CHECK(rig.s(82, rig.str("/etc/motd"), rig.str("/tmp/motd")) == 0);      // from one watched folder to another
+    got = events(fd);
+    CHECK(got.size() == 1 && got[0].wd == 1 && got[0].mask == kMovedTo && got[0].name == "motd" && got[0].cookie != 0);      // (/etc is not asked about moves)
+    CHECK(rig.s(254, fd, rig.str("/etc"), kAll) == 2 && rig.s(82, rig.str("/tmp/motd"), rig.str("/etc/motd")) == 0);
+    got = events(fd);      // both folders asked: the two halves, with one cookie
+    CHECK(got.size() == 2 && got[0].wd != got[1].wd && got[0].cookie != 0 && got[0].cookie == got[1].cookie && (got[0].mask | got[1].mask) == (kMovedFrom | kMovedTo));
+    CHECK(rig.s(82, rig.str("/etc/motd"), rig.str("/tmp/motd")) == 0 && rig.s(254, fd, rig.str("/etc"), kCreate | kDelete) == 2);
+    events(fd);
+    // changing a watch's mask: replaced, or added to; IN_MASK_CREATE refuses a path that is watched
+    CHECK(rig.s(254, fd, rig.str("/etc"), kModify) == 2 && rig.s(254, fd, rig.str("/etc"), kDelete | 0x20000000) == 2 && rig.s(254, fd, rig.str("/etc"), kModify | 0x10000000) == -17);
+    f = rig.s(85, rig.str("/etc/x"), 0644);
+    CHECK(f >= 3 && rig.s(1, f, rig.str("x"), 1) == 1 && rig.s(3, f) == 0 && rig.s(87, rig.str("/etc/x")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 2 && got[0].mask == kModify && got[1].mask == kDelete);      // (and not its creation)
+    // a single file: what happens to it, without a name
+    const int64_t one = rig.s(254, fd, rig.str("/tmp/motd"), kAll);
+    CHECK(one == 3 && rig.s(254, fd, rig.str("/tmp/motd"), kAll | 0x01000000) == -20);      // IN_ONLYDIR
+    CHECK(rig.s(254, fd, rig.str("/tmp"), kDeleteSelf | 0x20000000) == 1 && rig.s(254, fd, rig.str("/etc"), kDelete) == 2);
+    CHECK(rig.s(76, rig.str("/tmp/motd"), 2) == 0);
+    got = events(fd);
+    CHECK(got.size() == 2 && got[0].wd == 1 && got[0].mask == kModify && got[0].name == "motd" && got[1].wd == 3 && got[1].mask == kModify && got[1].name.empty());
+    CHECK(rig.s(82, rig.str("/tmp/motd"), rig.str("/tmp/moved")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 3 && got[0].mask == kMovedFrom && got[1].mask == kMovedTo && got[2].wd == 3 && got[2].mask == kMoveSelf);
+    CHECK(touch(rig, "/tmp/motd") && rig.s(87, rig.str("/tmp/motd")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 4 && got[0].mask == kCreate && got[1].mask == kDelete && got[2].wd == 3 && got[2].mask == kDeleteSelf && got[3].wd == 3 && got[3].mask == kIgnored);
+    CHECK(rig.s(255, fd, 3) == -22);      // (that watch ended itself)
+    // IN_ONESHOT: one event, and the watch is over
+    CHECK(rig.s(83, rig.str("/tmp/once"), 0755) == 0);
+    events(fd);
+    const int64_t once = rig.s(254, fd, rig.str("/tmp/once"), kCreate | 0x80000000);
+    CHECK(once == 4 && touch(rig, "/tmp/once/1") && touch(rig, "/tmp/once/2"));
+    got = events(fd);
+    CHECK(got.size() == 2 && got[0].wd == 4 && got[0].mask == kCreate && got[0].name == "1" && got[1].wd == 4 && got[1].mask == kIgnored);
+    // the watched folder itself removed
+    CHECK(rig.s(87, rig.str("/tmp/once/1")) == 0 && rig.s(87, rig.str("/tmp/once/2")) == 0 && rig.s(83, rig.str("/tmp/gone"), 0755) == 0);
+    events(fd);
+    const int64_t gone = rig.s(254, fd, rig.str("/tmp/gone"), kAll);
+    CHECK(gone == 5 && rig.s(84, rig.str("/tmp/gone")) == 0);
+    got = events(fd);
+    CHECK(got.size() == 3 && got[0].wd == 1 && got[0].mask == (kDelete | kIsDir) && got[1].wd == 5 && got[1].mask == kDeleteSelf && got[2].wd == 5 && got[2].mask == kIgnored);
+    // reading: whole events as far as they fit, EINVAL for a buffer that takes none, a wait for the next one
+    CHECK(touch(rig, "/tmp/first-name") && touch(rig, "/tmp/second"));
+    CHECK(rig.s(0, fd, buf, 15) == -22 && rig.s(0, fd, buf, 16) == -22);
+    got = events(fd, 16 + 16 + 20);      // room for the first and part of the second
+    CHECK(got.size() == 1 && got[0].name == "first-name");
+    got = events(fd);
+    CHECK(got.size() == 1 && got[0].name == "second" && rig.s(0, fd, kBad, 64) == -11);
+    const int64_t blocking = rig.s(253);      // inotify_init: a descriptor that waits
+    CHECK(blocking >= 3 && rig.s(254, blocking, rig.str("/tmp"), kCreate) == 1);
+    system.sync.meanwhile = [&]() { CHECK(touch(other, "/tmp/late")); };
+    got = events(blocking);
+    CHECK(got.size() == 1 && got[0].wd == 1 && got[0].mask == kCreate && got[0].name == "late");
+    events(fd);
+    // inotify_rm_watch: IN_IGNORED, and nothing more from it
+    CHECK(rig.s(255, fd, 2) == 0 && rig.s(255, fd, 2) == -22 && rig.s(255, fd, 99) == -22 && rig.s(255, 1, 1) == -22 && rig.s(255, 999, 1) == -9);
+    got = events(fd);
+    CHECK(got.size() == 1 && got[0].wd == 2 && got[0].mask == kIgnored);
+    CHECK(touch(rig, "/etc/after") && rig.s(0, fd, buf, 4096) == -11);
+    // what is refused
+    CHECK(rig.s(254, fd, rig.str("/nowhere"), kAll) == -2 && rig.s(254, fd, rig.str("/tmp"), 0) == -22 && rig.s(254, fd, rig.str("/tmp"), 0x10000) == -22 && rig.s(254, fd, kBad, kAll) == -14);
+    CHECK(rig.s(254, 1, rig.str("/tmp"), kAll) == -22 && rig.s(254, 999, rig.str("/tmp"), kAll) == -9 && rig.s(254, fd, rig.str("/tmp"), kAll | 0x30000000) == -22);
+    // more events than the instance keeps: IN_Q_OVERFLOW says some were lost
+    for (int i = 0; i < 40; ++i) CHECK(touch(rig, "/tmp/flood-" + std::to_string(i)));
+    got = events(fd);
+    CHECK(got.size() >= 2 && got.size() <= 34 && got.back().wd == -1 && got.back().mask == kOverflow);
+    // closed: its watches go (the system has room for others again)
+    CHECK(rig.s(3, fd) == 0 && rig.s(3, blocking) == 0 && !objects.any_watches());
+    int instances = 0;
+    std::vector<int64_t> open;
+    for (;;) {
+      const int64_t n = rig.s(294, 0);
+      if (n < 0) { CHECK(n == -24); break; }
+      open.push_back(n);
+      ++instances;
+    }
+    CHECK(instances == 32);
+    int watches = 0;
+    for (int i = 0; i < 200; ++i) {
+      const std::string folder = "/tmp/w" + std::to_string(i);
+      CHECK(rig.s(83, rig.str(folder), 0755) == 0);
+      const int64_t wd = rig.s(254, open[size_t(i) % open.size()], rig.str(folder), kCreate);
+      if (wd < 0) { CHECK(wd == -28); break; }
+      ++watches;
+      rig.cursor = 0x10000 + 0x800;      // (the test's strings: used again)
+    }
+    CHECK(watches == 128);
+    for (const int64_t n : open) CHECK(rig.s(3, n) == 0);
+    CHECK(!objects.any_watches());
+  }
+  set_system_objects(nullptr);
+}
+
 // The generic table (AArch64, RISC-V, LoongArch) has the same calls under other numbers.
 static void test_generic_numbers() {
   filesystem::RamFileSystem fs(A);
@@ -2450,7 +2608,7 @@ int main(int argc, char** argv) {
       {"identity", test_identity}, {"limits and scheduling", test_limits_and_scheduling}, {"prctl", test_prctl}, {"fork and wait", test_fork_and_wait},
       {"fork inheritance", test_fork_inheritance}, {"signal handlers", test_signal_handlers}, {"signal handlers, AArch64 and RISC-V", test_signal_handlers_other_cpus},
       {"signal handlers, LoongArch", test_signal_handlers_loongarch}, {"POSIX timers", test_posix_timers}, {"futex calls", test_futex_calls}, {"miscellaneous calls", test_misc_calls},
-      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io},
+      {"shared memory", test_shared_memory}, {"semaphores", test_semaphores}, {"message queues", test_message_queues}, {"POSIX message queues", test_posix_message_queues}, {"pidfd", test_pidfd}, {"asynchronous I/O", test_async_io}, {"inotify", test_inotify},
       {"generic numbers", test_generic_numbers}, {"hostile arguments", test_hostile_arguments}};
   const bool verbose = getenv("TCOS_TEST_VERBOSE") != nullptr;      // (says which test is running: for finding one that hangs)
   for (const auto& test : tests) {

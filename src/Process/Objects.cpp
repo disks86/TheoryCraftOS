@@ -2598,6 +2598,7 @@ void ObjectManager::free_watch_locked(Object& o) {
   if (o.kind != ObjectKind::ChangeNotification || o.watch < 0 || !watches_) return;
   watches_[o.watch].used = false;
   o.watch = -1;
+  __atomic_sub_fetch(&live_watches_, 1, __ATOMIC_RELAXED);
 }
 
 ObjectManager::Created ObjectManager::create_change_notification(StringView path, bool watch_subtree, uint32_t filter) {
@@ -2622,6 +2623,7 @@ ObjectManager::Created ObjectManager::create_change_notification(StringView path
     w.path_size = static_cast<uint32_t>(path.size());
     w.subtree = watch_subtree;
     w.filter = filter;
+    __atomic_add_fetch(&live_watches_, 1, __ATOMIC_RELAXED);
     o = Object();
     o.kind = ObjectKind::ChangeNotification;
     o.references = 1;
@@ -2715,6 +2717,8 @@ void ObjectManager::notify_entry_changed(StringView changed_path, uint32_t actio
     if (w.record_count >= kMaxWatchRecords || name.size() >= kWatchNameBytes) { w.overflow = true; if (w.waiters != 0) w.owes_ack = true; continue; }
     WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
     r.action = action;
+    r.directory = (filter_mask & kChangeDirName) != 0;
+    r.rename = 0;
     uint32_t n = 0;
     for (uint64_t k = 0; k < name.size(); ++k) r.name[n++] = name[k] == '/' ? '\\' : name[k];
     r.name_size = n;
@@ -2729,6 +2733,7 @@ void ObjectManager::notify_entry_renamed(StringView old_path, StringView new_pat
   Locked hold(sync_);
   if (!watches_) return;
   bool any = false;
+  renames_ = renames_ + 1 == 0 ? 1 : renames_ + 1;
   for (Object& o : objects_) {
     if (o.kind != ObjectKind::ChangeNotification || o.watch < 0) continue;
     Watch& w = watches_[o.watch];
@@ -2747,6 +2752,8 @@ void ObjectManager::notify_entry_renamed(StringView old_path, StringView new_pat
     for (uint32_t i = 0; i < count; ++i) {
       WatchRecord& r = w.records[(w.record_head + w.record_count) % kMaxWatchRecords];
       r.action = i == 0 ? first : 5 /* RENAMED_NEW_NAME */;
+      r.directory = (filter_mask & kChangeDirName) != 0;
+      r.rename = renames_;
       uint32_t n = 0;
       for (uint64_t k = 0; k < names[i].size(); ++k) r.name[n++] = names[i][k] == '/' ? '\\' : names[i][k];
       r.name_size = n;
@@ -2815,6 +2822,26 @@ bool ObjectManager::take_watch_records_locked(uint32_t id, WatchRecord* out, uin
   w.record_count -= n;
   *count = n;
   return true;
+}
+
+bool ObjectManager::drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* fired) {
+  *count = 0;
+  *overflow = *fired = false;
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
+  Watch& w = watches_[o->watch];
+  *fired = o->signaled;
+  *overflow = w.overflow;
+  w.overflow = false;
+  take_watch_records_locked(id, out, capacity, count);
+  if (w.record_count == 0) o->signaled = false;
+  return true;
+}
+
+bool ObjectManager::watch_has_news_locked(uint32_t id) {
+  Object* o = at(id);
+  if (!o || o->kind != ObjectKind::ChangeNotification || o->watch < 0 || !watches_) return false;
+  return o->signaled || watches_[o->watch].record_count != 0 || watches_[o->watch].overflow;
 }
 
 // ---- mailslots

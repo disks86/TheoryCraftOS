@@ -112,6 +112,32 @@ class LinuxIpcManager {
   };
   NamedQueue named[kNamedQueues];
 
+  // inotify (LinuxInotify.cpp): an instance is what inotify_init gives a descriptor for; its watches are change notifications of the object manager
+  // (Objects.hpp), which the Linux file calls report what they change to. A watch on a file watches the file's folder and keeps the file's name.
+  static constexpr uint32_t kInotifyInstances = 32, kInotifyWatches = 128, kInotifyPathBytes = 512, kInotifyNameBytes = 128;
+  static constexpr uint64_t kInotifyPendingBytes = 64 * 1024;      // events waiting to be read in one instance; more are lost (IN_Q_OVERFLOW)
+  struct InotifyInstance {
+    bool used = false;
+    uint16_t sequence = 0;
+    int32_t next_descriptor = 1;
+    bool overflowed = false;              // an IN_Q_OVERFLOW is owed
+    UniquePointer<ByteBuffer> pending;    // events as read() hands them out
+  };
+  struct InotifyWatch {
+    bool used = false;
+    uint32_t instance = 0;                // its instance's link
+    int32_t descriptor = 0;
+    uint32_t object = 0;                  // the change notification
+    uint32_t mask = 0;
+    bool on_file = false;
+    char path[kInotifyPathBytes] = {};    // what is watched (the host path), to know a path that is watched already
+    uint32_t path_size = 0;
+    char name[kInotifyNameBytes] = {};    // a file's name in its folder
+    uint32_t name_size = 0;
+  };
+  InotifyInstance inotify_instances[kInotifyInstances];
+  InotifyWatch inotify_watches[kInotifyWatches];
+
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];
   Undo undos[kUndos];
@@ -150,6 +176,16 @@ uint64_t sys_mq_notify(Process& p, uint64_t fd, uint64_t event);
 uint64_t sys_mq_getsetattr(Process& p, uint64_t fd, uint64_t new_attributes, uint64_t old_attributes);
 // For poll() (the system's lock held): can a message be taken from the queue behind a descriptor, and can one be put in?
 void mq_readiness_locked(uint64_t link, uint32_t mode, bool* readable, bool* writable);
+// inotify (LinuxInotify.cpp)
+uint64_t sys_inotify_init1(Process& p, uint64_t flags);
+uint64_t sys_inotify_add_watch(Process& p, uint64_t fd, uint64_t path, uint64_t mask);
+uint64_t sys_inotify_rm_watch(Process& p, uint64_t fd, uint64_t descriptor);
+// read() of an inotify descriptor: whole events, as many as fit.
+uint64_t inotify_read(Process& p, uint64_t link, uint64_t buffer, uint64_t count, bool non_blocking);
+// For poll() and FIONREAD (the system's lock held): are there events to read, and how many bytes of them are formatted already?
+bool inotify_ready_locked(uint64_t link);
+// The manager if one was made already (for the hooks of things that go away: nothing to do without one).
+LinuxIpcManager* existing_linux_ipc();
 // A Linux process ended: its semaphore operations made with SEM_UNDO are taken back.
 void ipc_process_gone(uint64_t pid);
 

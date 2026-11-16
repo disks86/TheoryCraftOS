@@ -337,7 +337,7 @@ class ObjectManager {
   // notify_entry_changed).
   // A watch also queues what changed (action + name), FILE_NOTIFY_INFORMATION-style, for ReadDirectoryChangesW - a plain FindFirstChangeNotification watch just never
   // drains that queue, relying only on `signaled`, so one mechanism serves both APIs exactly as it does on real Windows (both go through the same underlying service).
-  static constexpr uint32_t kMaxWatches = 64, kWatchPathBytes = 512, kMaxWatchRecords = 32, kWatchNameBytes = 128;
+  static constexpr uint32_t kMaxWatches = 128, kWatchPathBytes = 512, kMaxWatchRecords = 32, kWatchNameBytes = 128;
   Created create_change_notification(StringView path, bool watch_subtree, uint32_t filter);
   // FILE_NOTIFY_CHANGE_* bits a change is matched against the watch's `filter` with (0: matches every watch).
   static constexpr uint32_t kChangeFileName = 0x1, kChangeDirName = 0x2, kChangeAttributes = 0x4, kChangeSize = 0x8, kChangeLastWrite = 0x10, kChangeLastAccess = 0x20, kChangeCreation = 0x40, kChangeSecurity = 0x100;
@@ -362,10 +362,18 @@ class ObjectManager {
   void watches_forgive_locked();
   // Takes every record a ReadDirectoryChangesW-backed watch has queued (up to `capacity` of them) as parallel arrays; the watch's queue is cleared. False if `id`
   // is not a change-notification handle. Returns how many were taken in *count (0 with no error: nothing was queued).
-  struct WatchRecord { uint32_t action = 0; char name[kWatchNameBytes] = {}; uint32_t name_size = 0; };
+  struct WatchRecord { uint32_t action = 0; char name[kWatchNameBytes] = {}; uint32_t name_size = 0; bool directory = false; uint32_t rename = 0; };      // (directory: what changed is one; rename: not 0 for the records of a rename, the same number for the old and the new name wherever they are told)
   bool take_watch_records(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
   // The same for a caller that holds the system lock already (the attempt of wait_until); the mutex is not recursive.
   bool take_watch_records_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count);
+  // Is any change notification being watched at all? (No lock: for whoever makes changes very often, a Linux program's write(), to skip the rest.)
+  bool any_watches() const { return __atomic_load_n(&live_watches_, __ATOMIC_RELAXED) != 0; }
+  // For a reader that takes everything a watch has (inotify), the system's lock held: its records as take_watch_records_locked, whether changes were lost
+  // for want of room (*overflow, cleared), and whether it fired at all since the last call (*fired: true without records and without an overflow means the
+  // watched directory itself went away). The watch is not signalled afterwards. False if `id` is no change notification.
+  bool drain_watch_locked(uint32_t id, WatchRecord* out, uint32_t capacity, uint32_t* count, bool* overflow, bool* fired);
+  // Has that watch anything for such a reader (the system's lock held)?
+  bool watch_has_news_locked(uint32_t id);
 
   // --- registry key notifications (NtNotifyChangeKey): the same watches, over the names of the registry. A key's path is spelled "/:registry/MACHINE/SOFTWARE/X" (':' is a
   // character no file name has, so a file never matches it); the registry calls notify_entry_changed() with the key's path and a leaf below it ("name" for a subkey, "\x01" for
@@ -589,6 +597,8 @@ class ObjectManager {
   uint32_t pending_kills_ = 0;       // members flagged to end that have not ended yet (atomic)
   uint64_t job_joins_ = 0;           // counts assignments to jobs (JobMember::joined)
   Watch* watches_ = nullptr;         // kMaxWatches, made with the first change notification
+  uint32_t live_watches_ = 0;        // how many of them are in use (read without the lock by any_watches())
+  uint32_t renames_ = 0;             // numbers the renames (WatchRecord::rename)
   Mailslot* mailslots_ = nullptr;    // kMaxMailslots, made with the first mailslot
 };
 

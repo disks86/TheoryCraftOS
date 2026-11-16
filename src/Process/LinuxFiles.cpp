@@ -366,6 +366,36 @@ int64_t meta_of_fd(Process& p, uint64_t fd, Meta* m) {
 
 }  // namespace
 
+namespace {
+
+// Tells whoever watches (inotify, see LinuxInotify.cpp: change notifications of the object manager, by host path) that an entry was added (1), removed
+// (2) or changed (3). Nothing is done, and nothing looked up, while nobody watches anything.
+void entry_changed(Process& p, StringView virtual_path, uint32_t action, bool directory) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->any_watches()) return;
+  String host(p.files().allocator());
+  if (!p.files().host_path_of(virtual_path, &host)) return;
+  const uint32_t kind = action == 3 ? (ObjectManager::kChangeSize | ObjectManager::kChangeLastWrite) : directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName;
+  objects->notify_entry_changed(host.view(), action, kind);
+}
+
+void entry_renamed(Process& p, StringView from, StringView to, bool directory) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->any_watches()) return;
+  String host_from(p.files().allocator()), host_to(p.files().allocator());
+  if (!p.files().host_path_of(from, &host_from) || !p.files().host_path_of(to, &host_to)) return;
+  objects->notify_entry_renamed(host_from.view(), host_to.view(), directory ? ObjectManager::kChangeDirName : ObjectManager::kChangeFileName);
+}
+
+// A file was written through a descriptor.
+void descriptor_written(Process& p, uint64_t fd) {
+  ObjectManager* objects = system_objects();
+  if (!objects || !objects->any_watches() || p.files().kind(fd) != DescriptorKind::File) return;
+  if (const OpenObject* object = p.files().object(fd); object && !object->memory) entry_changed(p, object->path.view(), 3, false);
+}
+
+}  // namespace
+
 uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, uint64_t flags) {
   ProcessFiles& files = p.files();
   if (!files.attached()) return error(kEnoent);
@@ -401,11 +431,21 @@ uint64_t sys_openat(Process& p, UserArch arch, uint64_t dirfd, uint64_t path, ui
   f.truncate = (flags & kOTrunc) && f.write;
   f.append = flags & kOAppend;
   f.must_be_directory = flags & (arch == UserArch::AArch64 ? 0x4000u : 0x10000u);      // O_DIRECTORY (AArch64 has its own value; the generic ABIs of x86-64, RISC-V and LoongArch share one)
+  // (for the watchers: was it there before? Only asked when somebody watches and the call may make or empty it.)
+  bool was_there = true;
+  ObjectManager* objects = system_objects();
+  const bool watched = objects && objects->any_watches() && (f.create || f.truncate);
+  if (watched) {
+    DirectoryEntry before;
+    was_there = files.stat(virtual_path.view(), &before) == Status::Ok;
+  }
   uint32_t slot = 0;
   const Status status = files.open(virtual_path.view(), f, &slot);
   if (status == Status::OutOfMemory && files.free_slot(0) < 0) return error(kEmfile);
   if (status != Status::Ok) return errno_of(status);
   files.set_close_on_exec(slot, cloexec);
+  if (watched && !was_there) entry_changed(p, virtual_path.view(), 1, false);
+  else if (watched && f.truncate) entry_changed(p, virtual_path.view(), 3, false);
   return slot;
 }
 
@@ -499,11 +539,13 @@ uint64_t write_to(Process& p, uint64_t fd, uint64_t buffer, uint64_t count, bool
     at += wrote;
     if (status != Status::Ok) {
       if (!positional) object.position = at;
+      if (done != 0) descriptor_written(p, fd);
       return done ? done : errno_of(status);
     }
     if (object.append && !positional) at = files.size_of(object);
   }
   if (!positional) object.position = object.append ? files.size_of(object) : at;
+  if (done != 0) descriptor_written(p, fd);
   return done;
 }
 
@@ -706,7 +748,9 @@ uint64_t sys_mkdirat(Process& p, uint64_t dirfd, uint64_t path) {
   const int64_t r = resolve_at(p, dirfd, path, false, &virtual_path);
   if (r < 0) return error(-r);
   if (virtual_path.view() == StringView("/") || files.device_at(virtual_path.view()) != DescriptorKind::Closed) return error(kEexist);
-  return errno_of_or_zero(files.make_directory(virtual_path.view()));
+  const Status made = files.make_directory(virtual_path.view());
+  if (made == Status::Ok) entry_changed(p, virtual_path.view(), 1, true);
+  return errno_of_or_zero(made);
 }
 
 // mknodat(dirfd, path, mode, dev) / mknod(path, mode, dev); mkfifo() is mknodat with S_IFIFO. A FIFO is a real node where the file system has them, else an
@@ -728,13 +772,18 @@ uint64_t sys_mknodat(Process& p, uint64_t dirfd, uint64_t path, uint64_t mode, u
   String host(files.allocator());
   filesystem::IFileSystem* fs = files.file_system();
   if (!fs || !files.host_path_of(virtual_path.view(), &host)) return error(kEnomem);
-  if (type == kSIfIfo) return errno_of_or_zero(make_fifo_node(*fs, host.view()));
-  if (type == kSIfSock) {
-    const Status made = fs->create_special(host.view(), filesystem::SpecialNode::Socket);
-    return made == Status::Unsupported ? error(kEperm) : errno_of_or_zero(made);
+  Status made;
+  if (type == kSIfIfo) {
+    made = make_fifo_node(*fs, host.view());
+  } else if (type == kSIfSock) {
+    made = fs->create_special(host.view(), filesystem::SpecialNode::Socket);
+    if (made == Status::Unsupported) return error(kEperm);
+  } else {
+    UniquePointer<filesystem::IFile> file;      // (a regular file: made empty)
+    made = fs->open_file(host.view(), filesystem::OpenMode::CreateOrOpen, &file);
   }
-  UniquePointer<filesystem::IFile> file;      // (a regular file: made empty)
-  return errno_of_or_zero(fs->open_file(host.view(), filesystem::OpenMode::CreateOrOpen, &file));
+  if (made == Status::Ok) entry_changed(p, virtual_path.view(), 1, false);
+  return errno_of_or_zero(made);
 }
 
 uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags) {
@@ -750,7 +799,9 @@ uint64_t sys_unlinkat(Process& p, uint64_t dirfd, uint64_t path, uint64_t flags)
   if ((flags & kAtRemoveDir) && !directory) return error(kEnotdir);
   if (!(flags & kAtRemoveDir) && directory) return error(kEisdir);
   if (virtual_path.view() == StringView("/")) return error(kEbusy);
-  return errno_of_or_zero(files.remove(virtual_path.view()));
+  const Status removed = files.remove(virtual_path.view());
+  if (removed == Status::Ok) entry_changed(p, virtual_path.view(), 2, directory);
+  return errno_of_or_zero(removed);
 }
 
 uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t new_dirfd, uint64_t new_path, uint64_t flags) {
@@ -774,7 +825,9 @@ uint64_t sys_renameat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_
     const Status removed = files.remove(to.view());
     if (removed != Status::Ok) return errno_of(removed);
   }
-  return errno_of_or_zero(files.rename(from.view(), to.view()));
+  const Status renamed = files.rename(from.view(), to.view());
+  if (renamed == Status::Ok) entry_renamed(p, from.view(), to.view(), source.type == NodeType::Directory);
+  return errno_of_or_zero(renamed);
 }
 
 uint64_t sys_getcwd(Process& p, uint64_t buffer, uint64_t size) {
@@ -832,6 +885,7 @@ uint64_t sys_truncate(Process& p, uint64_t path, uint64_t length) {
   if (opened != Status::Ok) return errno_of(opened);
   const Status status = files.resize(*files.object(slot), length);
   files.close(slot);
+  if (status == Status::Ok) entry_changed(p, virtual_path.view(), 3, false);
   return errno_of_or_zero(status);
 }
 
@@ -844,6 +898,7 @@ uint64_t sys_ftruncate(Process& p, uint64_t fd, uint64_t length) {
   if (!object.writable) return error(kEinval);
   const Status status = files.resize(object, length);
   if (object.memory && status == Status::AccessDenied) return error(kEperm);      // (a seal forbids it)
+  if (status == Status::Ok) descriptor_written(p, fd);
   return errno_of_or_zero(status);
 }
 
@@ -1017,6 +1072,7 @@ uint64_t sys_linkat(Process& p, uint64_t old_dirfd, uint64_t old_path, uint64_t 
   if (files.stat(to.view(), &existing) == Status::Ok || files.stat_link(to.view(), &existing) == Status::Ok) return error(kEexist);
   const Status made = files.create_hard_link(from.view(), to.view());
   if (made == Status::Unsupported) return error(kEperm);      // (what Linux answers on a file system without hard links; programs then copy or rename)
+  if (made == Status::Ok) entry_changed(p, to.view(), 1, false);
   return errno_of_or_zero(made);
 }
 
@@ -1458,6 +1514,7 @@ uint64_t sys_symlinkat(Process& p, uint64_t target, uint64_t new_dirfd, uint64_t
   if (!files.host_path_of(link.view(), &host_link)) return error(kEnametoolong);
   const Status made = files.file_system()->create_symbolic_link(host_link.view(), stored.view(), to_directory);
   if (made == Status::Unsupported) return error(kEperm);      // (what Linux answers on a file system without symbolic links, FAT for one)
+  if (made == Status::Ok) entry_changed(p, link.view(), 1, false);
   return errno_of_or_zero(made);
 }
 
@@ -1605,6 +1662,7 @@ uint64_t sys_copy_file_range(Process& p, uint64_t in_fd, uint64_t in_offset_at, 
   else in->position = from + done;
   if (out_offset_at != 0) { if (!p.write_user_u64(out_offset_at, to + done)) return error(kEfault); }
   else out->position = to + done;
+  if (done != 0) descriptor_written(p, out_fd);
   return done;
 }
 

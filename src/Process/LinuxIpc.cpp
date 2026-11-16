@@ -56,13 +56,11 @@ LinuxIpcManager* system_linux_ipc() {
 
 void set_system_linux_ipc(LinuxIpcManager* manager) { __atomic_store_n(&g_ipc_override, manager, __ATOMIC_RELEASE); }
 
-// The manager if there is one already (a process that ends, or a descriptor that is closed, has nothing to do with one that was never made).
-static LinuxIpcManager* existing_linux_ipc() {
+namespace linuxabi {
+LinuxIpcManager* existing_linux_ipc() {
   if (LinuxIpcManager* chosen = __atomic_load_n(&g_ipc_override, __ATOMIC_ACQUIRE)) return chosen;
   return __atomic_load_n(&g_ipc_made, __ATOMIC_ACQUIRE);
 }
-namespace linuxabi {
-static LinuxIpcManager* existing_ipc_for_hooks() { return existing_linux_ipc(); }
 }
 
 namespace linuxabi {
@@ -912,7 +910,7 @@ void mq_free(LinuxIpcManager::NamedQueue& queue) {
 
 // The last descriptor of a queue's open was closed (called by the descriptor manager with the system's lock held).
 void mq_descriptor_gone(uint64_t link, uint32_t) {
-  LinuxIpcManager* ipc = existing_ipc_for_hooks();
+  LinuxIpcManager* ipc = existing_linux_ipc();
   if (!ipc) return;
   LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
   if (!queue) return;
@@ -963,7 +961,7 @@ uint64_t read_deadline(Process& p, uint64_t address, uint64_t* wait_ns) {
 
 void mq_readiness_locked(uint64_t link, uint32_t mode, bool* readable, bool* writable) {
   *readable = *writable = false;
-  LinuxIpcManager* ipc = existing_ipc_for_hooks();
+  LinuxIpcManager* ipc = existing_linux_ipc();
   if (!ipc) return;
   const LinuxIpcManager::NamedQueue* queue = mq_by_link(*ipc, link);
   if (!queue) return;
