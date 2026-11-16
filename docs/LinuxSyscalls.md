@@ -51,14 +51,11 @@ waits, and one with a handler has its handler entered.
 - *Calls that wait.* A read on a pipe or socket, `futex`, `wait4`, `nanosleep`, `poll`, `epoll_wait`, a lock that is waited for and so
   on end with `EINTR` when a signal is there for the thread. With `SA_RESTART` the calls Linux restarts are started again after the
   handler. A read of the console and a wait for a priority-inheritance futex are not cut short.
-- *Where this works.* For an x86-64 program on the kernel, and for x86-64, AArch64 and RISC-V programs in the emulator, each with its
-  own frame layout (`struct rt_sigframe` of that CPU: AArch64's with the `fpsimd_context` record and a frame record above it, RISC-V's
-  with the double-precision registers).
-- *LoongArch.* The frame (`sigcontext` followed by the floating-point record and the record that ends the list), the page a handler
-  returns through, `rt_sigreturn` (which also takes the LSX and LASX records Linux writes for a thread that used the vector registers)
-  and the restart of a call are there, and the emulator's delivery points take a LoongArch thread like any other. But nothing runs a
-  LoongArch program yet: the emulator has no LoongArch guest CPU, and the LoongArch port of the kernel has no user mode. Until one of
-  them exists the code is only reached by its tests, which compare the frame with the ones Linux makes.
+- *Where this works.* For an x86-64 program on the kernel, and for x86-64, AArch64, RISC-V and LoongArch programs in the emulator, each
+  with its own frame layout (`struct rt_sigframe` of that CPU: AArch64's with the `fpsimd_context` record and a frame record above it,
+  RISC-V's with the double-precision registers, LoongArch's with the floating-point record and the record that ends the list).
+  `rt_sigreturn` on LoongArch also takes the LSX and LASX records Linux writes for a thread that used the vector registers, of which
+  the emulator has none.
 
 The code is `LinuxSignals.cpp` (`deliver_signals`, `signal_return`, `deliver_fault`); the kernel calls it from `on_syscall`,
 `on_user_tick` / `on_user_fault` in `Kernel/UserMode.cpp`, the emulator from `EmulatedProcess::thread_loop`.
@@ -82,7 +79,7 @@ back to `read` and `write`.
 
 ## Not there yet
 
-- Something that runs a LoongArch program (see *LoongArch* above); the SVE, SME, RISC-V vector and LoongArch LSX / LASX registers in a
+- The SVE, SME, RISC-V vector and LoongArch LSX / LASX registers in a
   handler's frame (only the general, NEON and floating-point registers are kept); queued real-time signals (signals of one kind do not queue, and
   `sigqueue`'s value is not kept); stopping and continuing (`SIGSTOP`, `SIGTSTP`, `SIGCONT` do nothing); Ctrl+C as `SIGINT` (it still
   ends the program); the AVX halves of the vector registers in a handler's frame; POSIX timers (`timer_create`).
@@ -98,7 +95,7 @@ back to `read` and `write`.
   byte for byte with frames a LoongArch program was given under qemu's user mode (`tests/linux/sigframe_loongarch.c`, checked-in output,
   `tests/linux/build_sigframe_loongarch.sh`), and `rt_sigreturn` is given those frames.
 - `tests/run_host_tests.sh LinuxForkTest`: `tests/linux/forktest.c` and `signaltest.c` (no libc) under the emulator, compared with
-  what the same programs print on the build machine's own Linux kernel. `signaltest.c` is also run as an AArch64 and a RISC-V program
-  (checked-in builds, `tests/linux/build_signaltest.sh`), compared with what those print under qemu's user mode.
+  what the same programs print on the build machine's own Linux kernel. `signaltest.c` is also run as an AArch64, a RISC-V and a LoongArch
+  program (checked-in builds, `tests/linux/build_signaltest.sh`), compared with what those print under qemu's user mode.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c` and `handlertest.c` on the real kernel under QEMU, compared the
   same way.

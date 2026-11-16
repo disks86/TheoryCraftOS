@@ -17,6 +17,7 @@
  */
 #include "Emulation/GuestCpu.hpp"
 #include "Emulation/AArch64Cpu.hpp"
+#include "Emulation/LoongArch64Cpu.hpp"
 #include "Emulation/RiscV64Cpu.hpp"
 #include "Emulation/X86_64Cpu.hpp"
 #include "Process/Process.hpp"
@@ -38,9 +39,10 @@ UniquePointer<IGuestCpu> create_guest_cpu(process::UserArch guest, allocators::I
   if (guest == process::UserArch::X86_64) return UniquePointer<IGuestCpu>::make_as<X86_64Cpu>(allocator);
   if (guest == process::UserArch::AArch64) return UniquePointer<IGuestCpu>::make_as<AArch64Cpu>(allocator);
   if (guest == process::UserArch::RiscV64) return UniquePointer<IGuestCpu>::make_as<RiscV64Cpu>(allocator);
+  if (guest == process::UserArch::LoongArch64) return UniquePointer<IGuestCpu>::make_as<LoongArch64Cpu>(allocator);
   return UniquePointer<IGuestCpu>();
 }
 
-bool can_emulate(process::UserArch guest) { return guest == process::UserArch::X86_64 || guest == process::UserArch::AArch64 || guest == process::UserArch::RiscV64; }
+bool can_emulate(process::UserArch guest) { return guest == process::UserArch::X86_64 || guest == process::UserArch::AArch64 || guest == process::UserArch::RiscV64 || guest == process::UserArch::LoongArch64; }
 
 }  // namespace emulation

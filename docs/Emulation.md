@@ -20,8 +20,8 @@ program uses, through the same ABI tables (`decode_x86_64` for the registers, th
 `mmap` and the loader are shared with native programs. Consequences:
 
 - no hardware user mode is needed, so it works on the AArch64 and RISC-V builds, which have none;
-- the guest's CPU and the host's are independent: `emulation::IGuestCpu` has an x86-64, an AArch64 and a RISC-V implementation, so an Arm or RISC-V Linux
-  program runs on x86-64;
+- the guest's CPU and the host's are independent: `emulation::IGuestCpu` has an x86-64, an AArch64, a RISC-V and a LoongArch implementation, so an Arm,
+  RISC-V or LoongArch Linux program runs on x86-64;
 - the interpreter runs with kernel privilege, so it is written to the memory-safety rules in `CLAUDE.md` (no raw guest pointers, checked
   arithmetic, decoder tested with truncated and bit-flipped code under ASan/UBSan).
 
@@ -163,6 +163,32 @@ AArch64 uses, so files, pipes, `mmap` and `clone` are shared with every other ki
   some H CSRs sloppy (hstatus, vsepc and hie keep bits they should not), which the probes mask out; `mtinst` / `htinst` stay zero here (the architecture allows it; qemu fills in a transformed instruction).
   **Not done**: guest external interrupts (GEILEN is 0: hgeie/hgeip are zero), the transformed instruction in htinst/mtinst, hardware performance counters (reads trap, as with `pmu-num=0`), Smepmp, the debug trigger module, multiple harts, Zcmt/Zcmp (their encodings are `c.fsdsp`/`c.fld` with Zcd), other PLIC sources (no other devices exist), the APLIC/IMSIC. Booting OpenSBI or Linux was left out on purpose (no hardware to run it on; the aim is UEFI).
 - **Not implemented** (an invalid-instruction fault, never a wrong result): RV32, Zcmt, Zicfiss shadow-stack semantics (the mops write zero).
+
+## The LoongArch guest (`LoongArch64Cpu`)
+
+An LA64 user-mode interpreter (`LoongArch64Cpu.cpp`: core, integer, memory, branches, atomics; `LoongArch64Fp.cpp`: floating point). A LoongArch Linux ELF
+(`e_machine` 258) is dispatched to it like the other guests; its system calls use the generic Linux table (number in `a7`, arguments in `a0`..`a5`, and `clone` with
+the thread pointer last, as on x86-64).
+
+- **Integer**: everything a user program may run: arithmetic and logic, the shifts and rotates, `alsl`, `bytepick`, `bstrins`/`bstrpick`, byte and bit reversal, the
+  counts, multiply and divide, CRC32 and CRC32C, the pc-relative forms, the branches, and the bound-checked loads and stores (`ldgt`, `stle`, `asrtle`, ...).
+  A division by zero traps nowhere, as on the processor (its result is what qemu computes: the quotient and remainder by one); `break 7`, which compilers
+  put behind such a division, is the divide error.
+- **Atomics**: `ll`/`sc` (a reservation on the address and the value read; a turn never ends inside the pair, and a signal's delivery gives the reservation
+  up), the `am*` instructions with and without a barrier, and of version 1.1 the byte and halfword forms and `amcas`. `sc.q`, `llacq` and `screl` are not there.
+- **Floating point** (soft-float): single and double, the eight condition flags, and `fcsr0` with its enables, rounding mode, flags and cause (and the three
+  partial views). An enabled exception is a trap (SIGFPE) that leaves no result. A NaN operand is passed on made quiet, the signaling one first; infinity times
+  zero plus a quiet NaN gives that NaN; underflow is detected after rounding. A single result has ones in the upper half of its register, as under qemu (the
+  architecture leaves that half open). `frecipe` and `frsqrte` (the estimates) are not there.
+- **Not there**: LSX and LASX (the vector extensions), LBT, and everything privileged (CSRs, IOCSR, TLB and cache instructions): an invalid instruction.
+  `CPUCFG` and `AT_HWCAP` do not announce the vector extensions, so a program that asks before using them takes its scalar path. A program built to use
+  them unconditionally (clang's default for `loongarch64-linux-gnu`; build with `-mno-lsx`) stops with SIGILL.
+- **No translated code**: the guest is interpreted only.
+- `fldle`/`fstle`/`fldgt`/`fstgt` take their address from `rj` alone, as the manual has it; qemu adds `rk`.
+
+Checked against `qemu-loongarch64 -cpu max`: `tests/data/emulation/loongarch.c` runs every instruction above over tables of operands (each floating-point
+one in the four rounding modes, with `fcsr` read back) and prints a checksum a line; all 369 lines agree. The LoongArch builds of `guest.c`, `threads.c` and
+`tests/linux/signaltest.c` (signal handlers, end to end) print what the other CPUs' builds and qemu print.
 
 ## AVX, AVX2, FMA, BMI, F16C
 
@@ -444,7 +470,7 @@ test and in the kernel link only; the kernel's `ICodeMemory` has been booted in 
 ## What an emulated program cannot do yet
 - Windows exceptions only work for x86-64 Windows programs (the only kind there is), and `SuspendThread`, `Get/SetThreadContext` and thread-targeted APCs are missing.
 - Speed: the integer core of the three guests is translated (see above); everything else (FP, SIMD, x87, atomics, divides) is interpreted, tens of times slower than native.
-- Only x86-64, AArch64 and RISC-V (RV64GC) guests exist; a 32-bit guest (x86, Arm, RV32) needs its own `IGuestCpu`. AArch64 and RISC-V Windows programs are refused with a clear message.
+- Only x86-64, AArch64, RISC-V (RV64GC) and LoongArch (LA64, no vector extensions) guests exist; a 32-bit guest (x86, Arm, RV32) needs its own `IGuestCpu`. AArch64 and RISC-V Windows programs are refused with a clear message.
 - The AArch64 and RISC-V kernel builds do not yet contain the shell, `ProgramRunner` or the process layer, so nothing launches programs there yet;
   the emulator core compiles for both targets (checked with clang `--target=aarch64-linux-gnu` / `riscv64-linux-gnu`) and `ProgramRunner` already
   falls back to emulation on any non-x86-64 build.
@@ -472,6 +498,9 @@ compressed set) match. The generator includes targeted cases for what random ope
 sign injection of +0 and -0); without them a wrong tininess rule and a wrong zero ordering both went unnoticed, and each is now caught. `EmulationTest` also runs the RISC-V builds of
 `guest.c` and `threads.c` (checked-in `guest-riscv64.elf`, `threads-riscv64.elf`; built with `clang --target=riscv64-linux-gnu -march=rv64gc -O2 -ffreestanding -nostdlib` and the
 rustup `ld.lld`) and has hand-assembled checks, fault vectors and truncation / bit-flip / random-word robustness cases for the RISC-V decoder.
+The same for LoongArch: `guest-loongarch64.elf`, `threads-loongarch64.elf` and `loongarch-loongarch64.elf` with `loongarch-expected.txt`
+(`tests/data/emulation/build_loongarch.sh` rebuilds them and takes the expected output from `qemu-loongarch64 -cpu max`), hand-assembled checks of system calls,
+fault vectors, an enabled floating-point exception and LL/SC, and bit-flip / truncation / 200,000 random-word robustness cases.
 The `bit` mode covers Zba/Zbb/Zbs/Zbc/Zicond (qemu `-cpu max`); the `vint`, `vmem` and `vfp` modes (qemu `-cpu max,vlen=128,rvv_ta_all_1s=true,rvv_ma_all_1s=true`) start every case
 with a random legal `vsetvli` (SEW, LMUL 1/8..8, tail and mask policy, `vl` from 0 to past VLMAX), initialize all 32 vector registers with random, special or float-like lanes, run
 one instruction with legal register groups, and compare every vector register, `vl`, `vtype`, `vxsat`, `vxrm`, `fcsr`, the scalar registers and a 1 KiB buffer. 4,000 to 5,000 cases

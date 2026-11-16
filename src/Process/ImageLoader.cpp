@@ -317,6 +317,8 @@ LoadStatus build_linux_stack(AddressSpace& space, uint64_t stack_top, const Load
     hwcap = 0x4fef7fb;
     hwcap2 = 0x777e | 0x7F800000 | (uint64_t{1} << 37) | (uint64_t{0xFFF} << 48);      // + SME, its integer and floating point outer products, FA64, SME2, and FPMR, LUT, FAMINMAX, FP8 (and its SME forms, and SME_LUTv2)
   }
+  // Of a LoongArch program: CPUCFG, the AM* atomics, unaligned access, floating point and CRC32 (no vector extensions: the emulator has none)
+  if (platform == StringView("loongarch64")) hwcap = 0x4F;
   struct Aux { uint64_t key, value; };
   const Aux aux[] = {{3, image.phdr}, {4, image.phent}, {5, image.phnum}, {6, AddressSpace::kPageSize}, {7, image.interpreter_base}, {8, 0},
                      {9, image.program_entry ? image.program_entry : image.entry}, {11, 0}, {12, 0},

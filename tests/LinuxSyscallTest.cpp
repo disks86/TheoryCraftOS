@@ -1382,8 +1382,8 @@ static bool read_reference_frames(const char* kind, std::vector<ReferenceFrame>*
   return true;
 }
 
-// Handlers of LoongArch programs. Nothing here runs a LoongArch program yet, so there is no program to run on both sides and compare: the frame is compared
-// with the ones Linux makes (as qemu's user mode writes them), and rt_sigreturn is given those.
+// Handlers of LoongArch programs: the frame is compared with the ones Linux makes (as qemu's user mode writes them), and rt_sigreturn is given those.
+// (LinuxForkTest runs a LoongArch program's handlers end to end.)
 static void test_signal_handlers_loongarch() {
   using linuxabi::LinuxSignalContext;
   constexpr UserArch arch = UserArch::LoongArch64;
@@ -1558,7 +1558,7 @@ static void test_signal_handlers_loongarch() {
     const uint64_t frame = c.stack_pointer();
     CHECK(rig.u32(frame) == kSegv && rig.u32(frame + 8) == 1 && rig.u64(frame + 16) == 0x1234 && rig.u64(frame + kInfo + kHead) == 0x400504);
     c = registers(kStackTop);
-    CHECK(linuxabi::deliver_fault(p, &c, 6, 0, 0) && rig.u32(c.stack_pointer()) == kIll && rig.u32(c.stack_pointer() + 8) == 1 && rig.u64(c.stack_pointer() + 16) == 0x400504);
+    CHECK(linuxabi::deliver_fault(p, &c, 6, 0, 0) && rig.u32(c.stack_pointer()) == kIll && rig.u32(c.stack_pointer() + 8) == 0 && rig.u64(c.stack_pointer() + 16) == 0x400504);
     constexpr uint64_t kAlt = 0x12000, kAltSize = 0x6000;
     CHECK(rig.s(132, rig.words({kAlt, 0, kAltSize}), 0) == 0 && rig.s(134, kUsr1, action(rig, kHandler, 0x08000000, 0), 0, 8) == 0 && rig.s(129, 1, kUsr1) == 0);
     c = registers(kStackTop);

@@ -89,7 +89,7 @@ class IGuestCpu {
   // restores one). False for a CPU that has no such image (only the x86-64 guest does).
   virtual bool get_x86_context(process::X86Context* out) const { (void)out; return false; }
   virtual bool set_x86_context(const process::X86Context& context) { (void)context; return false; }
-  // The registers a Linux signal handler's frame holds, for an AArch64 or RISC-V guest (an x86-64 guest's are its X86Context), and back. False for a CPU
+  // The registers a Linux signal handler's frame holds, for an AArch64, RISC-V or LoongArch guest (an x86-64 guest's are its X86Context), and back. False for a CPU
   // that has no such record.
   virtual bool get_signal_context(process::linuxabi::LinuxSignalContext* out) const { (void)out; return false; }
   virtual bool set_signal_context(const process::linuxabi::LinuxSignalContext& context) { (void)context; return false; }
@@ -100,7 +100,7 @@ class IGuestCpu {
   ~IGuestCpu() = default;
 };
 
-// The emulator for a guest CPU; null if there is none (this OS emulates x86-64 only so far).
+// The emulator for a guest CPU; null if there is none (x86-64, AArch64, RISC-V and LoongArch have one).
 UniquePointer<IGuestCpu> create_guest_cpu(process::UserArch guest, allocators::IAllocator& allocator);
 bool can_emulate(process::UserArch guest);
 

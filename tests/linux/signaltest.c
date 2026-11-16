@@ -19,6 +19,18 @@ static inline __attribute__((always_inline)) long sys6(long n, long a, long b, l
   __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
   return r;
 }
+#elif defined(__loongarch__)
+static inline __attribute__((always_inline)) long sys6(long n, long a, long b, long c, long d, long e, long f) {
+  register long a7 __asm__("a7") = n;
+  register long a0 __asm__("a0") = a;
+  register long a1 __asm__("a1") = b;
+  register long a2 __asm__("a2") = c;
+  register long a3 __asm__("a3") = d;
+  register long a4 __asm__("a4") = e;
+  register long a5 __asm__("a5") = f;
+  __asm__ volatile("syscall 0" : "+r"(a0) : "r"(a7), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5) : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "memory");
+  return a0;
+}
 #elif defined(__riscv)
 static inline __attribute__((always_inline)) long sys6(long n, long a, long b, long c, long d, long e, long f) {
   register long a7 __asm__("a7") = n;
@@ -55,7 +67,7 @@ static inline __attribute__((always_inline)) long sys6(long n, long a, long b, l
 enum { SYS_read = 0, SYS_write = 1, SYS_rt_sigaction = 13, SYS_rt_sigprocmask = 14, SYS_nanosleep = 35, SYS_setitimer = 38, SYS_getpid = 39, SYS_clone = 56,
        SYS_wait4 = 61, SYS_kill = 62, SYS_getppid = 110, SYS_rt_sigsuspend = 130, SYS_sigaltstack = 131, SYS_gettid = 186, SYS_exit_group = 231, SYS_tgkill = 234,
        SYS_pipe2 = 293 };
-#else      /* the table AArch64 and RISC-V share */
+#else      /* the table AArch64, RISC-V and LoongArch share */
 enum { SYS_read = 63, SYS_write = 64, SYS_rt_sigaction = 134, SYS_rt_sigprocmask = 135, SYS_nanosleep = 101, SYS_setitimer = 103, SYS_getpid = 172, SYS_clone = 220,
        SYS_wait4 = 260, SYS_kill = 129, SYS_getppid = 173, SYS_rt_sigsuspend = 133, SYS_sigaltstack = 132, SYS_gettid = 178, SYS_exit_group = 94, SYS_tgkill = 131,
        SYS_pipe2 = 59 };
@@ -115,6 +127,12 @@ __asm__(".text\n"
         "fault_opcode:\n  ud2\n  ret\n");
 /* the registers start at +40: r8 r9 r10 r11 r12 r13 r14 r15 rdi rsi rbp rbx rdx rax rcx rsp rip eflags */
 enum { UC_RESULT = 40 + 13 * 8, UC_SP = 40 + 15 * 8, UC_PC = 40 + 16 * 8, UC_TRAPNO = 40 + 160, UC_MASK = 296, UC_STACK_FLAGS = 24, ILLEGAL_BYTES = 2, HAS_DIVIDE_FAULT = 1 };
+#elif defined(__loongarch__)
+__asm__(".text\n"
+        "fault_read:\n  ld.d $a0, $a0, 0\n fault_read_resume:\n  jr $ra\n"
+        "fault_opcode:\n  .4byte 0x00000000\n  jr $ra\n");
+/* uc_sigmask at +40; struct sigcontext at +176: pc, then r0..r31 (sp is r3, a0 is r4) */
+enum { UC_RESULT = 184 + 4 * 8, UC_SP = 184 + 3 * 8, UC_PC = 176, UC_MASK = 40, UC_STACK_FLAGS = 24, ILLEGAL_BYTES = 4, HAS_DIVIDE_FAULT = 0 };
 #elif defined(__riscv)
 __asm__(".text\n .option push\n .option norvc\n"
         "fault_read:\n  ld a0, 0(a0)\n fault_read_resume:\n  ret\n"
@@ -131,11 +149,11 @@ enum { UC_RESULT = 176 + 8, UC_SP = 176 + 8 + 31 * 8, UC_PC = 176 + 8 + 32 * 8, 
 static u64 uc_word(void* uc, int at) { return *(u64*)((u8*)uc + at); }
 static void uc_set(void* uc, int at, u64 v) { *(u64*)((u8*)uc + at) = v; }
 
-/* struct sigaction as each kernel has it: x86-64 and AArch64 have a restorer between the flags and the mask (only x86-64 needs one given), RISC-V has none */
+/* struct sigaction as each kernel has it: x86-64 and AArch64 have a restorer between the flags and the mask (only x86-64 needs one given), RISC-V and LoongArch have none */
 static void handle(int signal, void (*handler)(int, int*, void*), u64 flags, u64 mask) {
 #if defined(__x86_64__)
   u64 action[4] = {(u64)handler, flags | SA_SIGINFO | SA_RESTORER, (u64)sig_restorer, mask};
-#elif defined(__riscv)
+#elif defined(__riscv) || defined(__loongarch__)
   u64 action[4] = {(u64)handler, flags | SA_SIGINFO, mask, 0};
 #else
   u64 action[4] = {(u64)handler, flags | SA_SIGINFO, 0, mask};
@@ -381,6 +399,8 @@ void start_c(void) {
 
 #if defined(__x86_64__)
 __asm__(".globl _start\n_start:\n  xor %ebp, %ebp\n  and $-16, %rsp\n  call start_c\n");
+#elif defined(__loongarch__)
+__asm__(".globl _start\n_start:\n  move $fp, $zero\n  bstrins.d $sp, $zero, 3, 0\n  bl start_c\n");
 #elif defined(__riscv)
 __asm__(".globl _start\n_start:\n  li s0, 0\n  andi sp, sp, -16\n  call start_c\n");
 #else

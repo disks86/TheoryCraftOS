@@ -16,8 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 /* A LoongArch Linux program (no C library) that prints the frames Linux gives its signal handlers, byte for byte: one for a signal sent with kill() while
- * known values are in the registers, one for a fault. Nothing here runs LoongArch programs yet, so the frame code (src/Process/LinuxSignals.cpp) is checked
- * against this output instead: tests/linux/build_sigframe_loongarch.sh runs the program under qemu's user mode (three builds of it: see VECTORS) and
+ * known values are in the registers, one for a fault. The frame code (src/Process/LinuxSignals.cpp) is checked against this output byte for byte: tests/linux/build_sigframe_loongarch.sh runs the program under qemu's user mode (three builds of it: see VECTORS) and
  * LinuxSyscallTest reads what they printed.
  *
  * Each frame is printed as

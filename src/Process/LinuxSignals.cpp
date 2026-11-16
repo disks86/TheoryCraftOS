@@ -602,7 +602,8 @@ static bool fault_to(Process& p, const Registers& registers, uint64_t vector, ui
   switch (vector) {
     case 0: signal = kSigFpe; code = 1; where = registers.pc(); break;                 // divide error: FPE_INTDIV
     case 1: case 3: signal = kSigTrap; code = vector == 3 ? 1 : 2; where = registers.pc(); break;      // TRAP_BRKPT, TRAP_TRACE
-    case 6: signal = kSigIll; code = registers.x86 ? 2 : 1; where = registers.pc(); break;      // invalid instruction: ILL_ILLOPN on x86, ILL_ILLOPC elsewhere
+    // invalid instruction: ILL_ILLOPN on x86, ILL_ILLOPC on AArch64 and RISC-V, and no code at all on LoongArch (as qemu's user mode reports it)
+    case 6: signal = kSigIll; code = registers.x86 ? 2 : registers.other->arch == UserArch::LoongArch64 ? 0 : 1; where = registers.pc(); break;
     case 14: signal = kSigSegv; code = (error & 1) ? 2 : 1; break;                   // page fault: SEGV_ACCERR when the page is there, else SEGV_MAPERR
     case 16: case 19: signal = kSigFpe; code = 7; where = registers.pc(); break;       // x87 and SIMD exceptions: FPE_FLTINV (which one is not looked up)
     case 17: signal = kSigBus; code = 1; break;                                      // alignment check: BUS_ADRALN

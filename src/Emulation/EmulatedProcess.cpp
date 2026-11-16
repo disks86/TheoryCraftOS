@@ -130,7 +130,7 @@ class EmulatedProcess final : public process::IProcessRuntime {
   bool enters_handlers() const {
     return process_->abi() == process::SyscallAbi::Linux &&
            (arch_ == process::UserArch::X86_64 || arch_ == process::UserArch::AArch64 || arch_ == process::UserArch::RiscV64 ||
-            arch_ == process::UserArch::LoongArch64);      // (LoongArch: for the day there is a guest CPU for it; create_guest_cpu has none yet)
+            arch_ == process::UserArch::LoongArch64);
   }
   // The registers of a guest thread in the form the signal code wants for its CPU, and back.
   struct SignalRegisters {

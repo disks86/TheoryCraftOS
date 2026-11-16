@@ -17,7 +17,8 @@
  */
 // Host test for the in-kernel CPU emulator: instruction semantics against hand-assembled bytes, whole programs against the same program run natively,
 // faults, and truncated / bit-flipped code (the sanitizers watch for any memory error in the decoder).
-//   EmulationTest <guest.elf> <expected-output.txt> [<guest-aarch64.elf> <threads-x86_64.elf> <threads-aarch64.elf> <threads-expected.txt> <x87.elf> <x87-expected.txt> <avx.elf> <avx-expected.txt> <sse4.elf> <sse4-expected.txt> <guest-riscv64.elf> <threads-riscv64.elf>]
+//   EmulationTest <guest.elf> <expected-output.txt> [<guest-aarch64.elf> <threads-x86_64.elf> <threads-aarch64.elf> <threads-expected.txt> <x87.elf> <x87-expected.txt> <avx.elf> <avx-expected.txt> <sse4.elf> <sse4-expected.txt> <guest-riscv64.elf> <threads-riscv64.elf> ... <guest-loongarch64.elf> <threads-loongarch64.elf> <loongarch-loongarch64.elf> <loongarch-expected.txt>]
+//   (tests/run_host_tests.sh has the whole list)
 #include <atomic>
 #include <cfenv>
 #include <chrono>
@@ -32,6 +33,7 @@
 #include <vector>
 #include "Emulation/GuestCpu.hpp"
 #include "Emulation/AArch64Cpu.hpp"
+#include "Emulation/LoongArch64Cpu.hpp"
 #include "Emulation/RiscV64Cpu.hpp"
 #include "Emulation/RiscV64Crypto.hpp"
 #include "Emulation/RiscV64Machine.hpp"
@@ -1506,6 +1508,211 @@ static void test_riscv64_robustness() {
 
 static Bytes read_file(const char* path);
 
+// --- LoongArch -------------------------------------------------------------------------------------------------------------------------------
+// (What the instructions compute is checked against qemu by the program tests/data/emulation/loongarch.c; here is what a program cannot print about itself:
+// system calls, faults, the things only the runner sees.)
+
+struct LaMachine {
+  process::AddressSpace space{A};
+  LoongArch64Cpu cpu;
+  explicit LaMachine(const std::vector<uint32_t>& words) {
+    Bytes code;
+    for (const uint32_t w : words) for (int k = 0; k < 4; ++k) code.push_back(uint8_t(w >> (8 * k)));
+    init(code);
+  }
+  struct Raw {};
+  LaMachine(Raw, const Bytes& code) { init(code); }      // the code as bytes (damaged or cut off)
+  void init(const Bytes& code) {
+    space.map(kCode, 0x2000, process::kProtRead | process::kProtExecute);
+    if (!code.empty()) space.write_privileged(kCode, ConstByteView(code.data(), code.size()));
+    space.map(kData, 0x2000, process::kProtRead | process::kProtWrite);
+    space.map(kStack, 0x1000, process::kProtRead | process::kProtWrite);
+    process::ProgramStart start;
+    start.arch = process::UserArch::LoongArch64;
+    start.entry = kCode;
+    start.stack_pointer = kStack + 0x1000;
+    start.fs_base = 0x7700;
+    cpu.reset(start);
+  }
+  StopReason run(uint64_t n = 1000) {
+    GuestMemory m(space);
+    return cpu.run(m, n);
+  }
+  uint64_t& r(int i) { return cpu.state().r[i]; }
+  uint64_t& f(int i) { return cpu.state().f[i]; }
+  uint64_t read64(uint64_t at) { uint8_t b[8] = {}; space.read(at, ByteView(b, 8)); uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | b[i]; return v; }
+};
+
+// instruction words: three registers under a 17-bit opcode; two registers and a 12-bit immediate under a 10-bit one
+static uint32_t la3(uint32_t op17, uint32_t rd, uint32_t rj, uint32_t rk) { return (op17 << 15) | (rk << 10) | (rj << 5) | rd; }
+static uint32_t la12(uint32_t op10, uint32_t rd, uint32_t rj, int32_t imm) { return (op10 << 22) | ((uint32_t(imm) & 0xFFF) << 10) | (rj << 5) | rd; }
+constexpr uint32_t kLaSyscall = 0x002B0000, kLaBreak = 0x002A0000;
+constexpr uint32_t kLaOri = 0x0E, kLaAddiD = 0x0B, kLaLdD = 0xA3, kLaStD = 0xA7;
+enum { LA_RA = 1, LA_TP = 2, LA_SP = 3, LA_A0 = 4, LA_A1 = 5, LA_A2 = 6, LA_A7 = 11, LA_T0 = 12, LA_T1 = 13 };
+
+static void test_loongarch64() {
+  {      // ori, mul.d, syscall: the call is decoded the LoongArch Linux way (a7 = number, a0..a5 = arguments)
+    LaMachine m(std::vector<uint32_t>{la12(kLaOri, LA_A7, 0, 94), la12(kLaOri, LA_A0, 0, 6), la12(kLaOri, LA_A1, 0, 7), la3(0x03B, LA_A2, LA_A0, LA_A1), la12(kLaOri, 0, 0, 5), kLaSyscall});
+    CHECK(m.r(LA_SP) == kStack + 0x1000 && m.r(LA_TP) == 0x7700);
+    CHECK(m.run() == StopReason::Syscall);
+    CHECK(m.r(LA_A2) == 42 && m.r(0) == 0 && m.cpu.state().pc == kCode + 24 && m.cpu.instructions() == 6);      // (r0 stays zero whatever is written to it)
+    process::SyscallRequest q;
+    CHECK(m.cpu.pending_syscall(process::SyscallAbi::Linux, &q) && q.number == 94 && q.args[0] == 6 && q.args[1] == 7);
+    CHECK(!m.cpu.pending_syscall(process::SyscallAbi::Windows, &q));
+    m.cpu.finish_syscall(123);
+    CHECK(m.r(LA_A0) == 123 && m.cpu.arch() == process::UserArch::LoongArch64);
+    m.cpu.set_thread_pointers(true, 0x8800, true, 0x9900);
+    CHECK(m.r(LA_TP) == 0x8800);
+    UniquePointer<IGuestCpu> thread = m.cpu.clone_for_thread(A, 0x5550, true, 0x6660);
+    CHECK(thread && thread->instructions() == 0);
+    process::linuxabi::LinuxSignalContext c;
+    CHECK(thread->get_signal_context(&c) && c.arch == process::UserArch::LoongArch64 && c.x[LA_A0] == 0 && c.x[LA_SP] == 0x5550 && c.x[LA_TP] == 0x6660 && c.x[LA_A2] == 42 && c.pc == kCode + 24);
+    thread = m.cpu.clone_for_thread(A, 0, false, 0);
+    CHECK(thread && thread->get_signal_context(&c) && c.x[LA_SP] == kStack + 0x1000 && c.x[LA_TP] == 0x8800);
+  }
+  {      // what the processor would trap, in the terms the runner knows
+    struct Case { std::vector<uint32_t> code; uint8_t vector; uint64_t address; uint32_t error; uint64_t pc; };
+    const Case cases[] = {
+        {{kLaBreak}, 3, 0, 0, kCode},                                                      // a breakpoint
+        {{kLaBreak | 7}, 0, 0, 0, kCode},                                                  // what a compiler puts behind a division by zero
+        {{0x00000000}, 6, 0, 0, kCode},                                                    // no instruction
+        {{la12(kLaOri, LA_A0, 0, 1), 0x04000000}, 6, 0, 0, kCode + 4},                     // csrrd: privileged
+        {{0x700A0000}, 6, 0, 0, kCode},                                                    // vadd.b: the vector extension is not there
+        {{0x74000000}, 6, 0, 0, kCode},                                                    // (nor the 256-bit one)
+        {{la12(kLaLdD, LA_A0, 0, 0x40)}, 14, 0x40, 0, kCode},                              // a read of memory that is not there
+        {{la12(kLaStD, LA_A0, LA_T0, 8)}, 14, kCode + 8, 2, kCode},                        // a write to the program's code
+        {{0x4C000000 | (LA_T1 << 5)}, 14, 0x5000000, 0x10, 0x5000000},                     // jirl to nowhere: the fetch faults there
+        {{0x4C000000 | (LA_T1 << 5) | (1u << 10)}, 14, 0x5000004, 0x10, 0x5000004},
+        {{la3(0x002, 0, LA_T0, LA_A0)}, 5, 0, 0, kCode},                                   // asrtle.d t0, a0 with t0 above a0: a bound
+        {{la3(0x70FF, LA_A0, LA_T0, LA_A1)}, 5, 0, 0, kCode},                              // stle.d with the address above its bound
+    };
+    for (const Case& c : cases) {
+      LaMachine m(c.code);
+      m.r(LA_T0) = kCode;
+      m.r(LA_T1) = 0x5000000;
+      CHECK(m.run(8) == StopReason::Fault);
+      CHECK(m.cpu.fault().vector == c.vector && m.cpu.fault().address == c.address && m.cpu.fault().error == c.error && m.cpu.fault().pc == c.pc && m.cpu.state().pc == c.pc);
+    }
+    LaMachine odd(std::vector<uint32_t>{la12(kLaOri, LA_A0, 0, 1)});
+    odd.cpu.state().pc = kCode + 2;
+    CHECK(odd.run(4) == StopReason::Fault && odd.cpu.fault().vector == 13);
+    LaMachine end(std::vector<uint32_t>{});      // code that runs off the end of its mapping
+    const uint8_t last[4] = {0x01, 0x04, 0x80, 0x03};      // ori $ra, $zero, 1
+    end.space.write_privileged(kCode + 0x2000 - 4, ConstByteView(last, 4));
+    end.cpu.state().pc = kCode + 0x2000 - 4;
+    CHECK(end.run(4) == StopReason::Fault && end.cpu.fault().vector == 14 && end.cpu.fault().address == kCode + 0x2000 && end.cpu.instructions() == 1);
+  }
+  {      // an enabled floating-point exception traps and leaves no result; without the enable it is a flag
+    const uint32_t movgr2fcsr0_t0 = 0x0114C000 | (LA_T0 << 5), fdiv_d = la3(0x20E, 2, 0, 1);      // fdiv.d f2, f0, f1
+    for (const bool enabled : {true, false}) {
+      LaMachine m(std::vector<uint32_t>{movgr2fcsr0_t0, fdiv_d, kLaSyscall});
+      m.r(LA_T0) = enabled ? 8 : 0;      // the enable of "division by zero"
+      m.f(0) = 0x3FF0000000000000ull;
+      m.f(1) = 0;
+      m.f(2) = 0x1234;
+      const StopReason stop = m.run(8);
+      if (enabled) {
+        CHECK(stop == StopReason::Fault && m.cpu.fault().vector == 16 && m.cpu.fault().pc == kCode + 4 && m.f(2) == 0x1234);
+        CHECK(m.cpu.state().fcsr == (0x08000000u | 8));      // the cause, and no flag
+      } else {
+        CHECK(stop == StopReason::Syscall && m.f(2) == 0x7FF0000000000000ull && m.cpu.state().fcsr == 0x08080000u);
+      }
+    }
+  }
+  {      // fldle.d / fstle.d take their address from rj alone (qemu adds rk to it, which is why the program that is compared with qemu leaves them out)
+    LaMachine m(std::vector<uint32_t>{la3(0x70EB, 1, LA_A0, LA_A1), la3(0x70EF, 1, LA_A2, LA_A1), kLaSyscall});      // fldle.d f1, a0, a1; fstle.d f1, a2, a1
+    const uint8_t value[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    m.space.write(kData + 16, ConstByteView(value, 8));
+    m.r(LA_A0) = kData + 16;
+    m.r(LA_A1) = kData + 64;
+    m.r(LA_A2) = kData + 32;
+    CHECK(m.run(8) == StopReason::Syscall && m.f(1) == 0x0807060504030201ull && m.read64(kData + 32) == 0x0807060504030201ull);
+  }
+  {      // LL and SC: a reservation does not outlive a signal's delivery, and a turn does not end inside the pair
+    const uint32_t ll_d = 0x22000000 | (LA_A1 << 5) | LA_T0, sc_d = 0x23000000 | (LA_A1 << 5) | LA_T1;
+    LaMachine m(std::vector<uint32_t>{ll_d, la12(kLaOri, LA_T1, 0, 9), sc_d, kLaSyscall});
+    m.r(LA_A1) = kData;
+    CHECK(m.run(1) == StopReason::Budget && m.r(LA_T1) == 1 && m.read64(kData) == 9 && m.cpu.state().pc == kCode + 12);      // (asked for one instruction: the pair was run to its end)
+    process::linuxabi::LinuxSignalContext c;
+    // (one instruction at a time is not possible from outside, so the reservation is made and then the registers go through a signal's frame)
+    LaMachine o(std::vector<uint32_t>{ll_d, kLaSyscall, la12(kLaOri, LA_T1, 0, 9), sc_d, kLaSyscall});
+    o.r(LA_A1) = kData;
+    CHECK(o.run(100) == StopReason::Syscall && o.cpu.get_signal_context(&c) && o.cpu.set_signal_context(c));
+    CHECK(o.run(100) == StopReason::Syscall && o.r(LA_T1) == 0 && o.read64(kData) == 0);
+  }
+  {      // the registers as a signal handler's frame has them, and back
+    LaMachine m(std::vector<uint32_t>{kLaSyscall});
+    for (int i = 1; i < 32; ++i) m.r(i) = 0x1000 + uint64_t(i);
+    for (int i = 0; i < 32; ++i) m.f(i) = 0x2000 + uint64_t(i);
+    m.cpu.state().fcc[1] = 1;
+    m.cpu.state().fcc[6] = 1;
+    m.cpu.state().fcsr = 0x0300;
+    process::linuxabi::LinuxSignalContext c;
+    CHECK(m.cpu.get_signal_context(&c) && c.stack_pointer() == 0x1003 && c.result() == 0x1004 && c.x[31] == 0x101F && c.vector[31] == 0x201F && c.pc == kCode);
+    CHECK(c.pstate == 0x0001000000000100ull && c.fpcr == 0x0300);
+    c.x[0] = 77;
+    c.x[5] = 0xAAAA;
+    c.vector[3] = 0xBBBB;
+    c.pstate = ~uint64_t{0};
+    c.fpcr = ~uint32_t{0};
+    c.pc = kCode + 0x100;
+    CHECK(m.cpu.set_signal_context(c) && m.r(0) == 0 && m.r(5) == 0xAAAA && m.f(3) == 0xBBBB && m.cpu.state().pc == kCode + 0x100 && m.cpu.state().fcsr == 0x1F1F031Fu);
+    for (int i = 0; i < 8; ++i) CHECK(m.cpu.state().fcc[i] == 1);
+    c.arch = process::UserArch::RiscV64;
+    CHECK(!m.cpu.set_signal_context(c));
+  }
+  {      // what the program is told about the processor: floating point, no vector extensions; and a clock that does not run backwards
+    const uint32_t cpucfg = 0x00006C00, rdtime_d = 0x00006800;
+    LaMachine m(std::vector<uint32_t>{la12(kLaOri, LA_T0, 0, 2), cpucfg | (LA_T0 << 5) | LA_A0, rdtime_d | (LA_T1 << 5) | LA_A1, rdtime_d | (LA_T1 << 5) | LA_A2, kLaSyscall});
+    CHECK(m.run() == StopReason::Syscall && (m.r(LA_A0) & 7) == 7 && (m.r(LA_A0) & 0xC0) == 0 && m.r(LA_A2) > m.r(LA_A1) && m.r(LA_T1) == 0);
+  }
+}
+
+// Damaged and random code: whatever it is, the guest faults or goes on; the emulator itself never does anything wrong (the sanitizers watch).
+static void test_loongarch64_robustness() {
+  const std::vector<uint32_t> sample = {la12(kLaOri, LA_A7, 0, 94), la12(kLaLdD, LA_T0, LA_A1, 8), la12(kLaAddiD, LA_T0, LA_T0, 1), la12(kLaStD, LA_T0, LA_A1, 8), la3(0x03B, LA_A2, LA_T0, LA_T0),
+                                        la3(0x044, LA_A2, LA_A2, LA_T0), 0x22000000 | (LA_A1 << 5) | LA_T0, 0x23000000 | (LA_A1 << 5) | LA_T1, la3(0x70C1, LA_T1, LA_A1, LA_T0),
+                                        la3(0x202, 2, 0, 1), la3(0x20E, 3, 2, 1), 0x08200000 | (3u << 15) | (2u << 10) | (1u << 5) | 4, 0x0C220000 | (1u << 10) | (2u << 5) | 3,
+                                        0x0114A800 | (LA_T0 << 5) | 5, 0x011B2800 | (5u << 5) | 6, 0x2B800000 | (LA_A1 << 5) | 6, 0x54000008, 0x4C000020, kLaSyscall};
+  Bytes bytes;
+  for (const uint32_t w : sample) for (int k = 0; k < 4; ++k) bytes.push_back(uint8_t(w >> (8 * k)));
+  uint32_t runs = 0;
+  for (size_t i = 0; i < bytes.size(); ++i) {      // every single-bit flip, and every truncation
+    for (int bit = 0; bit < 8; ++bit) {
+      Bytes damaged = bytes;
+      damaged[i] ^= uint8_t(1u << bit);
+      LaMachine m(LaMachine::Raw(), damaged);
+      m.r(LA_A1) = kData;
+      m.r(LA_A2) = kData + 64;
+      m.run(80);
+      ++runs;
+    }
+    LaMachine m(LaMachine::Raw(), Bytes(bytes.begin(), bytes.begin() + long(i)));
+    m.r(LA_A1) = kData;
+    m.run(80);
+    ++runs;
+  }
+  uint64_t seed = 0x9E3779B97F4A7C15ull;
+  for (int i = 0; i < 200000; ++i) {      // random words, each run on its own with random registers; every third word is one of the kinds this CPU has
+    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+    uint32_t word = uint32_t(seed >> 7);
+    static const uint32_t kinds[] = {0x00000000, 0x00100000, 0x00200000, 0x00400000, 0x00600000, 0x00800000, 0x01000000, 0x01140000, 0x01180000, 0x011C0000, 0x08000000, 0x0C000000,
+                                     0x0D000000, 0x20000000, 0x24000000, 0x28000000, 0x2A000000, 0x2B000000, 0x38000000, 0x38400000, 0x38600000, 0x38700000, 0x40000000, 0x48000000, 0x4C000000, 0x58000000};
+    if (i % 3 != 0) {
+      const uint32_t kind = kinds[(seed >> 44) % (sizeof(kinds) / sizeof(kinds[0]))];
+      word = kind | (word & (i % 3 == 1 ? 0x003FFFFFu : 0x0003FFFFu));
+    }
+    LaMachine m(std::vector<uint32_t>{word, word ^ 0x400, kLaSyscall});
+    for (int r = 1; r < 32; ++r) m.r(r) = (r % 3 == 0) ? kData + 256 + uint64_t(r) : (r % 3 == 1 ? seed * uint64_t(r + 1) : uint64_t(r) - 8);
+    for (int r = 0; r < 32; ++r) m.f(r) = seed * uint64_t(r + 7);
+    m.cpu.state().fcsr = uint32_t(seed >> 20) & LoongArch64Cpu::kFcsrBits;
+    m.run(4);
+    CHECK(m.r(0) == 0);
+    ++runs;
+  }
+  CHECK(runs > 200000);
+}
+
 // The privileged architecture. The image is a flat build of a payload from tests/riscv_sys that runs in machine mode, drops to supervisor and user mode, takes traps and interrupts
 // and prints what it sees through the UART; the expected text is what qemu-system-riscv64 printed for the same image (tests/riscv_sys.sh checks the two against each other).
 static void test_riscv64_system(const char* image_path, const char* expected_path, const char* what) {
@@ -1900,7 +2107,11 @@ static void test_dispatch() {
   CHECK(can_emulate(UserArch::X86_64) && can_emulate(UserArch::AArch64) && can_emulate(UserArch::RiscV64) && !can_emulate(UserArch::None));
   CHECK(create_guest_cpu(UserArch::RiscV64, A) && create_guest_cpu(UserArch::RiscV64, A)->arch() == UserArch::RiscV64);
   CHECK(!create_guest_cpu(UserArch::None, A));
-  CHECK(!can_emulate(UserArch::LoongArch64) && !create_guest_cpu(UserArch::LoongArch64, A));      // (no LoongArch emulator yet)
+  CHECK(can_emulate(UserArch::LoongArch64));
+  {
+    UniquePointer<IGuestCpu> cpu = create_guest_cpu(UserArch::LoongArch64, A);
+    CHECK(cpu && cpu->arch() == UserArch::LoongArch64);
+  }
   CHECK(create_guest_cpu(UserArch::X86_64, A));
 }
 
@@ -1923,6 +2134,8 @@ int main(int argc, char** argv) {
   test_riscv64_crypto();
   test_riscv64_system_random();
   test_riscv64_robustness();
+  test_loongarch64();
+  test_loongarch64_robustness();
   test_robustness();
   if (argc >= 3) test_program(argv[1], argv[2]);
   if (argc >= 4) test_program_other_cpu(argv[3], argv[2], "AArch64");
@@ -1953,6 +2166,11 @@ int main(int argc, char** argv) {
     test_riscv64_system(argv[37], argv[38], "hypervisor, wide tables, atomics, clock");
   }
   if (argc >= 13) test_avx_program(argv[11], argv[12]);      // (the SSE3/SSSE3/SSE4 program: the same kind of check)
+  if (argc >= 43) {      // LoongArch: the program every CPU runs, the threads, and every instruction against what qemu computed (tests/data/emulation/build_loongarch.sh)
+    test_program_other_cpu(argv[39], argv[2], "LoongArch");
+    test_threads(argv[40], argv[6], "LoongArch threads");
+    test_x87_program(argv[41], argv[42], "LoongArch instructions");
+  }
   test_threads_without_support();
   if (argc < 3) printf("(no guest program given: skipping the whole-program tests)\n");
   CHECK(A.live == 0);
