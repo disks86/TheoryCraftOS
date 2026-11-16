@@ -543,6 +543,34 @@ __attribute__((dllexport)) U NtUserGetImeHotKey(U id, U modifiers, U key, U layo
   return result;
 }
 
+/* IMEINFOEX starts with a keyboard layout's handle: 344 bytes here, 352 in the kernel (the 340 bytes after the handle are at 4 here and at 8 there,
+ * and the kernel's has 4 bytes of padding at its end). */
+#define WOW_IME_INFO 340
+typedef struct { U64 layout; unsigned char rest[WOW_IME_INFO]; U32 pad; } ImeInfo64;
+extern U NtUserGetImeInfoEx_raw(U, U);
+__attribute__((dllexport)) U NtUserGetImeInfoEx(U info, U search) {
+  if (!info) return NtUserGetImeInfoEx_raw(0, search);
+  ImeInfo64 wide;
+  wide.layout = (U64)(long long)*(const int*)info;      /* (a layout's handle is sign-extended, as every handle) */
+  wide.pad = 0;
+  memcpy(wide.rest, (const unsigned char*)info + 4, WOW_IME_INFO);
+  const U result = NtUserGetImeInfoEx_raw((U)&wide, search);
+  if ((U32)result) {
+    *(U32*)info = (U32)wide.layout;
+    memcpy((unsigned char*)info + 4, wide.rest, WOW_IME_INFO);
+  }
+  return result;
+}
+extern U NtUserSetImeInfoEx_raw(U);
+__attribute__((dllexport)) U NtUserSetImeInfoEx(U info) {
+  if (!info) return NtUserSetImeInfoEx_raw(0);
+  ImeInfo64 wide;
+  wide.layout = (U64)(long long)*(const int*)info;
+  wide.pad = 0;
+  memcpy(wide.rest, (const unsigned char*)info + 4, WOW_IME_INFO);
+  return NtUserSetImeInfoEx_raw((U)&wide);
+}
+
 /* Raw input: RAWINPUTDEVICE is 12 bytes here and 16 in the kernel, RAWINPUTDEVICELIST 8 and 16, RAWINPUTHEADER 16 and 24. */
 typedef struct { U16 page, usage; U32 flags, target; } RawDevice32;
 typedef struct { U16 page, usage; U32 flags; U64 target; } RawDevice64;

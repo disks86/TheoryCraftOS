@@ -30,7 +30,7 @@
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
-#define WSAAPI
+#define WSAAPI WINAPI      /* (stdcall in a 32-bit program, as Winsock's functions are) */
 
 typedef UINT_PTR SOCKET;
 typedef USHORT u_short_;
@@ -45,9 +45,14 @@ typedef struct { SHORT sin6_family; USHORT sin6_port; ULONG sin6_flowinfo; UCHAR
 /* Room for either kind of address (a real SOCKADDR_STORAGE is 128 bytes; these services never give more than a SOCKADDR_IN6). */
 typedef struct { USHORT sun_family; char sun_path[108]; } SOCKADDR_UN_;      /* <afunix.h> */
 typedef union { SOCKADDR sa; SOCKADDR_IN in; SOCKADDR_IN6_ in6; SOCKADDR_UN_ un; } ANY_SOCKADDR_;
-/* _WIN64's WSADATA orders its fields differently from the 32-bit one (iMaxSockets/iMaxUdpDg/lpVendorInfo before the description strings, not after) - this OS is
- * x86-64 only, so this is the one layout that matters, but getting it backwards would silently corrupt a real mingw-built program's WSAStartup call. */
+/* _WIN64's WSADATA orders its fields differently from the 32-bit one (iMaxSockets/iMaxUdpDg/lpVendorInfo before the description strings, not after):
+ * getting it backwards would silently corrupt a program's WSAStartup call. */
+#ifdef __i386__
+typedef struct { WORD wVersion, wHighVersion; CHAR szDescription[257], szSystemStatus[129]; USHORT iMaxSockets, iMaxUdpDg; PSTR lpVendorInfo; } WSADATA, *LPWSADATA;
+#else
 typedef struct { WORD wVersion, wHighVersion; USHORT iMaxSockets, iMaxUdpDg; PSTR lpVendorInfo; CHAR szDescription[257], szSystemStatus[129]; } WSADATA, *LPWSADATA;
+#endif
+typedef char wsadata_size_check[sizeof(WSADATA) == (sizeof(void *) == 8 ? 408 : 400) ? 1 : -1];
 typedef struct { UINT fd_count; SOCKET fd_array[64]; } fd_set_;
 typedef struct { LONG tv_sec, tv_usec; } TIMEVAL_, *PTIMEVAL_;
 

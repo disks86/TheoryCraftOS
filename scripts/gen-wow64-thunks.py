@@ -100,10 +100,10 @@ def main():
     others = sorted(glob.glob(os.path.join(WINDOWS, "kernel32", "*.c")) + glob.glob(os.path.join(WINDOWS, "kernel32", "*.inc")))
     for pattern in ("*.c", "*.inc", "*.h"):
         others += sorted(path for path in glob.glob(os.path.join(WINDOWS, "*", pattern)) if os.path.basename(os.path.dirname(path)) not in ("ntdll", "kernel32", "stubs", "win32u"))
-    for path in [os.path.join(WINDOWS, "tcos_win.h"), os.path.join(WINDOWS, "kernel32.h"), os.path.join(WINDOWS, "ntsec.h")] + sources + others:
+    for path in [os.path.join(WINDOWS, "tcos_win.h"), os.path.join(WINDOWS, "kernel32.h"), os.path.join(WINDOWS, "ntsec.h"), os.path.join(WINDOWS, "tcos_audio.h")] + sources + others:
         if not os.path.exists(path):
             continue
-        for m in re.finditer(r"(NTSTATUS|ULONG|VOID|void)\s+NTAPI\s+(?:Raw)?(Nt[A-Za-z0-9]+)\(([^;{]*?)\)\s*;", open(path).read()):
+        for m in re.finditer(r"\b(NTSTATUS|ULONG|LONG|VOID|void)\s+NTAPI\s+(?:Raw)?(Nt[A-Za-z0-9]+)\(([^;{]*?)\)\s*;", open(path).read()):
             prototypes.setdefault(m.group(2), [strip_name(p) for p in parameters(m.group(3))])
             if m.group(1) != "NTSTATUS" and m.group(2) not in results:
                 results[m.group(2)] = m.group(1)

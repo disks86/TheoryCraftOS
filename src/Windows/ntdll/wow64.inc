@@ -203,14 +203,36 @@ EXPORT NTSTATUS NTAPI NtQueryInformationThread(HANDLE thread, ULONG information_
   return status;
 }
 
-/* Passed as they are: their buffers hold no pointers in the classes these libraries ask for. (The classes that do are not converted yet.) */
+/* Passed as it is: the buffers hold no pointers in the classes these libraries ask for. (The classes that do are not converted yet.) */
 EXPORT NTSTATUS NTAPI NtQuerySystemInformation(ULONG information_class, PVOID buffer, ULONG size, PULONG returned) {
   const ULONG64 v[4] = {information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};
   return wow_service(NT_SERVICE_NtQuerySystemInformation, v);
 }
+/* An object's name (class 1) and type (class 2) begin with a UNICODE_STRING whose characters follow the structure: 16 bytes and then the text for
+ * the kernel (104 and the text for a type), 8 here (and 96). The kernel fills a buffer of its layout, which is copied into the caller's: the string's
+ * header narrowed, what follows it moved down by the 8 bytes the header lost. The other classes hold no pointers. */
+#define WOW_OBJECT_INFORMATION 1024      /* (the kernel's longest: a name of 256 units and the structure) */
 EXPORT NTSTATUS NTAPI NtQueryObject(HANDLE handle, ULONG information_class, PVOID buffer, ULONG size, PULONG returned) {
-  const ULONG64 v[5] = {WOW_HANDLE(handle), information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};
-  return wow_service(NT_SERVICE_NtQueryObject, v);
+  if (information_class != 1 && information_class != 2) {
+    const ULONG64 v[5] = {WOW_HANDLE(handle), information_class, WOW_POINTER(buffer), size, WOW_POINTER(returned)};
+    return wow_service(NT_SERVICE_NtQueryObject, v);
+  }
+  const ULONG head = information_class == 1 ? 16 : 104;      /* (where the kernel's text begins) */
+  BYTE wide[WOW_OBJECT_INFORMATION];
+  ULONG need = 0;
+  const ULONG wide_size = !buffer ? 0 : size > WOW_OBJECT_INFORMATION - 8 ? WOW_OBJECT_INFORMATION : size + 8;
+  const ULONG64 v[5] = {WOW_HANDLE(handle), information_class, wide_size ? WOW_POINTER(wide) : 0, wide_size, WOW_POINTER(&need)};
+  const NTSTATUS status = wow_service(NT_SERVICE_NtQueryObject, v);
+  if (returned) *returned = need >= 8 ? need - 8 : need;
+  if (status < 0 || !buffer) return status;
+  if (need < head || need > wide_size) return (NTSTATUS)0xC0000004;      /* STATUS_INFO_LENGTH_MISMATCH (not what the kernel said it wrote) */
+  BYTE *out = buffer;
+  UNICODE_STRING *name = buffer;
+  name->Length = *(const USHORT *)wide;
+  name->MaximumLength = *(const USHORT *)(wide + 2);
+  name->Buffer = *(const ULONG64 *)(wide + 8) ? (PWSTR)(out + head - 8) : NULL;
+  for (ULONG i = 16; i < need; ++i) out[i - 8] = wide[i];
+  return status;
 }
 
 /* ---- the start of a 32-bit process ------------------------------------------------------------------------------------------------------------------- */

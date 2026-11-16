@@ -414,15 +414,53 @@ def generate_kernel(commands, ops, versions, removed):
     ids = [LICENSE, "#pragma once\n"] + ["constexpr uint32_t kOp_%s = %d;\n" % (name, i + 1) for i, name in enumerate(ops)] + ["constexpr uint32_t kOpCount = %d;\n" % len(ops)]
     write("src/OpenGl/generated/GlOpIds.inc", "".join(ids))
 
+class _Named:
+    """A parameter under another expression (what stub_body_for writes in its place)."""
+    def __init__(self, p, expression):
+        self.p = p
+        self.c_name = expression
+    def __getattr__(self, name):
+        return getattr(self.p, name)
+
 def c_param(p):
     text = p.decl
     return "%s %s" % (text, p.c_name)
 
+# Arrays of pointers a command takes, and the parameter that counts them. The kernel reads such an array 8 bytes an element, and writes a pointer it
+# gives back as 8 bytes: a client whose pointers are 4 bytes (a 32-bit Windows program's opengl32.dll) passes a widened copy, and takes the low half
+# of a pointer that comes back. GL_WIDE_POINTERS (GlClient.h) is how many the copy holds; a call with more is cut to that.
+POINTER_ARRAYS = {"glShaderSource": (2, 1), "glGetUniformIndices": (2, 1), "glTransformFeedbackVaryings": (2, 1), "glMultiDrawElements": (3, 4),
+                  "glMultiDrawElementsBaseVertex": (3, 4)}
+
 def stub_body(c, op):
     words = 1 + sum(words_of(p) for p in c.params)
-    out = [("  uint32_t *s = gl_stream_begin(%d, %d);\n" if c.params else "  (void)gl_stream_begin(%d, %d);\n") % (op + 1, words)]
+    narrow = stub_body_for(c, op, words, True)
+    wide = stub_body_for(c, op, words, False)
+    if narrow == wide:
+        return wide
+    return "#if UINTPTR_MAX == 0xFFFFFFFFu\n%s#else\n%s#endif\n" % (narrow, wide)
+
+def stub_body_for(c, op, words, narrow):
+    out = []
+    after = []
+    names = {p.c_name: p.c_name for p in c.params}      # what is written into the stream for each parameter
+    if narrow and c.name in POINTER_ARRAYS:
+        array, count = POINTER_ARRAYS[c.name]
+        out.append("  uint64_t wide[GL_WIDE_POINTERS];\n")
+        out.append("  const uint32_t n = a%d < 0 ? 0 : (uint32_t)a%d > GL_WIDE_POINTERS ? GL_WIDE_POINTERS : (uint32_t)a%d;\n" % (count, count, count))
+        out.append("  for (uint32_t i = 0; a%d && i < n; ++i) wide[i] = (uint64_t)(uintptr_t)a%d[i];\n" % (array, array))
+        names["a%d" % array] = "(a%d ? wide : 0)" % array
+        names["a%d" % count] = "(a%d < 0 ? a%d : (GLsizei)n)" % (count, count)
+    elif narrow:
+        for p in c.params:
+            if p.stars == 2 and not p.const:      # a pointer the kernel writes
+                out.append("  uint64_t wide_%s = 0;\n" % p.c_name)
+                names[p.c_name] = "(%s ? &wide_%s : 0)" % (p.c_name, p.c_name)
+                after.append("  if (%s) *%s = (void *)(uintptr_t)wide_%s;\n" % (p.c_name, p.c_name, p.c_name))
+    out.append(("  uint32_t *s = gl_stream_begin(%d, %d);\n" if c.params else "  (void)gl_stream_begin(%d, %d);\n") % (op + 1, words))
     at = 1
     for p in c.params:
+        p = _Named(p, names[p.c_name])
         n = p.inline_count()
         if n:
             out.append("  gl_stream_copy(s + %d, %s, %d);\n" % (at, p.c_name, n * ELEMENT_BYTES[p.base]))
@@ -443,6 +481,7 @@ def stub_body(c, op):
         at += words_of(p)
     if c.sync():
         out.append("  %sgl_stream_sync(%d);\n" % ("" if c.is_void() else "const uint64_t r = ", words))
+        out += after
         if not c.is_void():
             cast = "(%s)(uintptr_t)r" % c.ret if "*" in c.ret or c.ret == "GLsync" else "(%s)r" % c.ret
             out.append("  return %s;\n" % cast)

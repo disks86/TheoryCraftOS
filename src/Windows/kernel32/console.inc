@@ -239,7 +239,7 @@ static LONG con_unbound_kind(HANDLE h) {
     ULONG got = 0;
     if (NT_SUCCESS(NtQueryObject(h, 1, buffer, sizeof(buffer), &got))) {
       const USHORT bytes = ((UNICODE_STRING *)buffer)->Length;
-      const WCHAR *name = (const WCHAR *)((BYTE *)buffer + 16);
+      const WCHAR *name = (const WCHAR *)((BYTE *)buffer + sizeof(UNICODE_STRING));      /* (the characters follow the string's header) */
       static const WCHAR prefix[] = {'\\', 'B', 'a', 's', 'e', 'N', 'a', 'm', 'e', 'd', 'O', 'b', 'j', 'e', 'c', 't', 's', '\\', 'T', 'c', 'o', 's', 'C', 'o', 'n'};
       if (bytes / 2 > sizeof(prefix) / 2 + 1) {
         BOOL same = TRUE;

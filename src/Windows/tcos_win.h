@@ -97,9 +97,8 @@ typedef unsigned short *LPWORD;
 typedef unsigned long long *PULONGLONG;
 typedef DWORD LCID;
 typedef DWORD LCTYPE;
-typedef long long LPARAM;
+typedef LONG_PTR LPARAM;      /* (as wide as a pointer; CALLBACK is defined above, with the calling convention of a 32-bit program) */
 typedef int *LPINT;
-#define CALLBACK
 typedef unsigned short LANGID;
 typedef struct _FILETIME *PFILETIME;
 typedef void *HRSRC;

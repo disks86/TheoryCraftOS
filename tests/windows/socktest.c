@@ -51,7 +51,7 @@ int main(void) {
   SOCKET udp = socket(AF_INET, SOCK_DGRAM, 0);
   check(udp != INVALID_SOCKET, "socket() creates a UDP socket");
   SOCKET bad = socket(AF_INET, 99 /* not SOCK_STREAM or SOCK_DGRAM */, 0);
-  check(bad == INVALID_SOCKET && WSAGetLastError() == WSAEINVAL, "socket() rejects an unknown type");
+  check(bad == INVALID_SOCKET && WSAGetLastError() == WSAESOCKTNOSUPPORT, "socket() rejects an unknown type (WSAESOCKTNOSUPPORT, as Windows says)");
 
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));

@@ -77,6 +77,7 @@ typedef void (APIENTRY *GLDEBUGPROCAMD)(GLuint id, GLenum category, GLenum sever
 typedef void (APIENTRY *GLVULKANPROCNV)(void);
 
 #define GL_STREAM_WORDS 16384u      /* kMaxStreamWords */
+#define GL_WIDE_POINTERS 1024u      /* the pointers of one array a client with 4-byte pointers widens for the kernel (scripts/gen-opengl.py) */
 
 typedef struct GlStream {
   uint32_t used;

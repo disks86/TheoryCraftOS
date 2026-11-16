@@ -33,6 +33,7 @@ static BOOL walk_read(WALK *w, DWORD64 address, void *buffer, DWORD n) {
   return target_read(w->process, address, buffer, n);
 }
 
+#ifndef __i386__
 /* The unwind data of the function that holds an address; base is the module's. FALSE for a leaf function (no entry). */
 static BOOL walk_function(WALK *w, DWORD64 pc, DWORD64 *base, RUNTIME_FUNCTION *entry, PVOID *entry_pointer) {
   *base = w->module_base ? w->module_base(w->process, pc) : SymGetModuleBase64(w->process, pc);
@@ -185,6 +186,52 @@ static BOOL stack_walk(DWORD machine, HANDLE process, STACKFRAME64 *f, void *con
   f->Params[0] = f->Params[1] = f->Params[2] = f->Params[3] = 0;
   return TRUE;
 }
+
+#else
+/* A 32-bit program's stack is walked by its frame pointers: the frame at EBP holds the caller's EBP and, after it, the return address. There is no
+ * unwind data to go by (a function compiled without a frame pointer is passed over, with its caller's frame taken for its own), which is what
+ * dbghelp does on Windows too when it has no FPO records. */
+static BOOL frame_read(WALK *w, DWORD at, DWORD *value) { return walk_read(w, at, value, sizeof(*value)); }
+
+static void set_flat(ADDRESS64 *a, DWORD64 offset) {
+  a->Offset = offset;
+  a->Segment = 0;
+  a->Mode = AddrModeFlat;
+}
+
+static BOOL stack_walk(DWORD machine, HANDLE process, STACKFRAME64 *f, void *context, PREAD_PROCESS_MEMORY_ROUTINE64 read, PFUNCTION_TABLE_ACCESS_ROUTINE64 table,
+                       PGET_MODULE_BASE_ROUTINE64 module_base) {
+  if (machine != IMAGE_FILE_MACHINE_I386 || !f || !context) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+  CONTEXT *c = context;
+  WALK w = {process, read, table, module_base};
+  if (f->Reserved[0] == 0) {
+    f->Reserved[0] = 1;      /* the first call: the frame is the context itself */
+  } else {
+    DWORD caller_frame = 0, return_address = 0;
+    if (c->Eip == 0 || c->Ebp == 0 || (c->Ebp & 3)) return FALSE;
+    if (c->Ebp > 0xFFFFFFF7u || !frame_read(&w, c->Ebp, &caller_frame) || !frame_read(&w, c->Ebp + 4, &return_address)) return FALSE;
+    if (return_address == 0) return FALSE;
+    if (caller_frame != 0 && caller_frame <= c->Ebp) return FALSE;      /* (the stack grows down: a caller's frame is above; anything else is not a chain) */
+    c->Esp = c->Ebp + 8;
+    c->Eip = return_address;
+    c->Ebp = caller_frame;
+  }
+  if (c->Eip == 0) return FALSE;
+  set_flat(&f->AddrPC, c->Eip);
+  set_flat(&f->AddrStack, c->Esp);
+  set_flat(&f->AddrFrame, c->Ebp);
+  /* the return address of this frame and its first four parameters, when the frame can be read */
+  DWORD value = 0;
+  const BOOL framed = c->Ebp != 0 && !(c->Ebp & 3) && c->Ebp <= 0xFFFFFFE7u;
+  set_flat(&f->AddrReturn, framed && frame_read(&w, c->Ebp + 4, &value) ? value : 0);
+  for (unsigned i = 0; i < 4; ++i) f->Params[i] = framed && frame_read(&w, c->Ebp + 8 + 4 * i, &value) ? value : 0;
+  f->FuncTableEntry = NULL;
+  set_flat(&f->AddrBStore, 0);
+  f->Far = FALSE;
+  f->Virtual = FALSE;
+  return TRUE;
+}
+#endif
 
 EXPORT BOOL WINAPI StackWalk64(DWORD machine, HANDLE process, HANDLE thread, LPSTACKFRAME64 frame, PVOID context, PREAD_PROCESS_MEMORY_ROUTINE64 read, PFUNCTION_TABLE_ACCESS_ROUTINE64 table,
                                PGET_MODULE_BASE_ROUTINE64 module_base, PTRANSLATE_ADDRESS_ROUTINE64 translate) {

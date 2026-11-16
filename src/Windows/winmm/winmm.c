@@ -78,15 +78,19 @@ static SRWLOCK g_events_lock = SRWLOCK_INIT;
 static UINT g_next_id = 1;
 
 /* The context of a slot's timer is the slot and the id it was made for: a callback that comes after the event was killed (and the slot taken again) finds another id. */
-static PVOID event_context(UINT slot, UINT id) { return (PVOID)((ULONG_PTR)id << 32 | slot); }
+/* (the slot is the low 4 bits and the id the rest - all of it in a 64-bit program, its low 28 bits in a 32-bit one - so the context fits a pointer of either width) */
+static ULONG_PTR event_id_bits(UINT id) { return (ULONG_PTR)id << 4 >> 4; }
+static PVOID event_context(UINT slot, UINT id) { return (PVOID)((ULONG_PTR)id << 4 | slot); }
 
 static void CALLBACK event_fired(PVOID context, BOOLEAN timer_fired) {
   (void)timer_fired;
-  const UINT slot = (UINT)((ULONG_PTR)context & 0xFFFFFFFFu), id = (UINT)((ULONG_PTR)context >> 32);
+  const UINT slot = (UINT)((ULONG_PTR)context & 15u);
+  const ULONG_PTR id_bits = (ULONG_PTR)context >> 4;
   if (slot >= MAX_EVENTS) return;
   TimeEvent *e = &g_events[slot];
   AcquireSRWLockExclusive(&g_events_lock);
-  if (e->id != id) { ReleaseSRWLockExclusive(&g_events_lock); return; }      /* killed before this callback got the lock */
+  if (e->id == 0 || event_id_bits(e->id) != id_bits) { ReleaseSRWLockExclusive(&g_events_lock); return; }      /* killed before this callback got the lock */
+  const UINT id = e->id;
   /* The timer queue may start the next period's callback while one still runs; winmm calls an event's callbacks one after another, so that tick is dropped (as Windows
    * does), which also keeps running_thread exact for timeKillEvent. */
   if (e->running_thread) { ReleaseSRWLockExclusive(&g_events_lock); return; }

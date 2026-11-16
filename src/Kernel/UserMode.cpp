@@ -179,7 +179,27 @@ void load_core(void* argument) {
 // With TCOS_TRACE_SERVICE_FAILURES: every NT service of a Windows program that answers an error status (0xC0000000 and up) is said on the debug console,
 // with the program's id, the service's number (src/Windows/tcos_syscalls.h) and its first two arguments. For finding out why a program gives up.
 #ifdef TCOS_TRACE_SERVICE_FAILURES
+// A program's debug text (OutputDebugString's exception record, in the 64-bit layout: the text's address is the second parameter, at 0x28) is said
+// here too, whether a debugger listens or not: the libraries' own traces come this way (kernel32's TCOS_TRACE_MISSING_PROCS).
+void trace_debug_text(process::Process& process, const process::SyscallRequest& request) {
+  uint64_t code = 0, address = 0;
+  if (!process.read_user_u64(request.args[0], &code) || (code & 0xFFFFFFFFu) != 0x40010006u || !process.read_user_u64(request.args[0] + 0x28, &address)) return;
+  char text[200];
+  uint32_t length = 0;
+  while (length + 1 < sizeof(text)) {
+    uint8_t byte = 0;
+    if (!process.read_user(address + length, ByteView(&byte, 1)) || byte == 0) break;
+    text[length++] = (byte >= 0x20 && byte < 0x7F) ? static_cast<char>(byte) : '.';
+  }
+  text[length] = 0;
+  console::puts("debug text: pid ");
+  console::put_dec(static_cast<int64_t>(process.id()));
+  console::puts(" ");
+  console::puts(text);
+  console::puts("\n");
+}
 void trace_service_failure(process::Process& process, const process::SyscallRequest& request, uint64_t result) {
+  if (process.abi() == process::SyscallAbi::Windows && request.number == 501) trace_debug_text(process, request);      // NtTcosDebugException
   if (process.abi() != process::SyscallAbi::Windows || request.number >= 0x1000 || (result & 0xFFFFFFFFu) < 0xC0000000u) return;      // (the window system's services answer values, not statuses)
   console::puts("service failed: pid ");
   console::put_dec(static_cast<int64_t>(process.id()));

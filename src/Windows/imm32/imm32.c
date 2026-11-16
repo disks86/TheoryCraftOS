@@ -34,7 +34,11 @@
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 
 /* ---- win32k services (the stubs of win32u.dll) ---------------------------------------------------------------------------------------------------------------------- */
+#ifdef __i386__
+#define SVC __declspec(dllimport) __cdecl      /* (the 32-bit win32u.dll's stubs leave the arguments to the caller) */
+#else
 #define SVC __declspec(dllimport) WINAPI
+#endif
 ULONG_PTR SVC NtUserCallHwnd(HWND hwnd, DWORD code);
 ULONG_PTR SVC NtUserQueryWindow(HWND hwnd, DWORD type);
 LRESULT SVC NtUserMessageCall(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam, void *info, DWORD type, BOOL ansi);
@@ -90,8 +94,8 @@ typedef struct {
   INT fInitOpen, fLoadFlag;
   DWORD dwProcessId, dwFlags;
   WCHAR wszImeDescription[50], wszImeFile[80];
-} IMEINFOEX_;      /* the 352 bytes win32k keeps (kImeInfoExSize) */
-typedef char imeinfoex_size_check[sizeof(IMEINFOEX_) == 352 ? 1 : -1];
+} IMEINFOEX_;      /* the 352 bytes win32k keeps (kImeInfoExSize); 344 in a 32-bit program, whose win32u.dll converts it */
+typedef char imeinfoex_size_check[sizeof(IMEINFOEX_) == (sizeof(HKL) == 8 ? 352 : 344) ? 1 : -1];
 
 #define INIT_STATUSWNDPOS 0x00000001
 #define INIT_CONVERSION 0x00000002

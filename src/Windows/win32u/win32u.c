@@ -122,6 +122,8 @@ WOW_WIN32K_CODE(_wow_win32k_service, "");
 #define WRAPPED_NtUserBuildHimcList ~,
 #define WRAPPED_NtUserLoadKeyboardLayoutEx ~,
 #define WRAPPED_NtUserGetImeHotKey ~,
+#define WRAPPED_NtUserGetImeInfoEx ~,
+#define WRAPPED_NtUserSetImeInfoEx ~,
 #define WRAPPED_NtUserRegisterRawInputDevices ~,
 #define WRAPPED_NtUserGetRegisteredRawInputDevices ~,
 #define WRAPPED_NtUserGetRawInputDeviceList ~,

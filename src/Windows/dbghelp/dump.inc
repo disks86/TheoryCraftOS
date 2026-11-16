@@ -167,7 +167,11 @@ static BOOL write_dump(HANDLE process, DWORD pid, HANDLE file, DWORD type, PMINI
     if (NtQueryInformationThread(h, (THREADINFOCLASS)0, &tbi, sizeof(tbi), NULL) >= 0) t->teb = (DWORD64)(ULONG_PTR)tbi.teb;
     CloseHandle(h);
     DWORD64 tib[3];      /* ExceptionList, StackBase, StackLimit */
+#ifdef __i386__
+    const DWORD64 sp = t->context->Esp;
+#else
     const DWORD64 sp = t->context->Rsp;
+#endif
     if (t->teb && target_read(process, t->teb, tib, sizeof(tib)) && sp >= tib[2] && sp < tib[1]) {
       DWORD64 end = tib[1];
       if (end - sp > (1u << 20)) end = sp + (1u << 20);

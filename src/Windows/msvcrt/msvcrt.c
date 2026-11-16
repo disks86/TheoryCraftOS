@@ -28,7 +28,7 @@ typedef unsigned short wchar_t;
 #undef EXPORT
 #define EXPORT API
 typedef ULONG_PTR uintptr_t_;      /* (size_t_ is tcos_win.h's: as wide as a pointer) */
-typedef long long intptr_t;
+typedef LONG_PTR intptr_t;      /* (as wide as a pointer: _open_osfhandle takes one on the stack) */
 typedef __builtin_va_list va_list_;
 #define va_start_(a, b) __builtin_va_start(a, b)
 #define va_end_(a) __builtin_va_end(a)
@@ -168,6 +168,9 @@ static char *g_pgmptr;
 API int _fmode, _commode;
 API char *_acmdln;
 API wchar_t *_wcmdln;
+/* (a 64-bit program built against the old runtime stores the environment its main gets into these, by their names) */
+API char **__initenv;
+API wchar_t **__winitenv;
 #define g_fmode _fmode
 #define g_commode _commode
 
@@ -1247,17 +1250,28 @@ API size_t_ fwrite(const void *buffer, size_t_ size, size_t_ count, void *stream
 #define S_APPEND_ 0x400
 #define S_TEXT_MODE 0x800
 #define DEFAULT_BUFFER 4096
+/* In a 32-bit program a stream is 32 bytes, as the FILE of the old runtime is: a program built against it finds stdout and stderr by itself, 32 and
+ * 64 bytes after what __iob_func() (or the _iob it imports) gives it. The file number and the flags are 16 bits each there to make it so (a file
+ * number is below MAX_FDS, the flags below 0x1000). In a 64-bit program the streams are 48 bytes apart. */
+#ifdef __i386__
+typedef short StreamFd;
+typedef unsigned short StreamFlags;
+#else
+typedef int StreamFd;
+typedef int StreamFlags;
+#endif
 typedef struct Stream {
-  int fd, flags;
+  StreamFd fd;
+  StreamFlags flags;
   unsigned char *buffer;
-  int buffer_size, read_pos, read_end, write_pos, ungot, pad;
+  int buffer_size, read_pos, read_end, write_pos, ungot;
   struct Stream *next;
 } Stream;
-#ifndef __i386__      /* (a 32-bit program built against the old runtime indexes _iob by 32 bytes, which this record is not: only __acrt_iob_func and __iob_func's first stream serve it) */
-_Static_assert(sizeof(Stream) == 48, "the streams of __iob_func() are 48 bytes apart in the Microsoft headers");
-#endif
+_Static_assert(sizeof(Stream) == (sizeof(void *) == 8 ? 48 : 32), "the streams of __iob_func() are 48 bytes apart in the Microsoft headers, 32 in the 32-bit ones");
 
-static Stream g_iob[3] = {{0, S_READ | S_STATIC, 0, 0, 0, 0, 0, -1, 0, 0}, {1, S_WRITE | S_STATIC, 0, 0, 0, 0, 0, -1, 0, 0}, {2, S_WRITE | S_STATIC | S_UNBUF, 0, 0, 0, 0, 0, -1, 0, 0}};
+/* (not static: the 32-bit library exports it as the data _iob, src/Windows/msvcrt/msvcrt32.def) */
+Stream msvcrt_iob[3] = {{0, S_READ | S_STATIC, 0, 0, 0, 0, 0, -1, 0}, {1, S_WRITE | S_STATIC, 0, 0, 0, 0, 0, -1, 0}, {2, S_WRITE | S_STATIC | S_UNBUF, 0, 0, 0, 0, 0, -1, 0}};
+#define g_iob msvcrt_iob
 static Stream *g_streams;      /* the streams opened with fopen */
 static int g_iob_ready;
 
@@ -1269,6 +1283,7 @@ static void init_streams(void) {
 }
 API void *__acrt_iob_func(unsigned i) { init_streams(); return &g_iob[i < 3 ? i : 0]; }
 API void *__iob_func(void) { init_streams(); return g_iob; }
+API void *__p__iob(void) { init_streams(); return g_iob; }
 #define STDIN_ ((Stream *)__acrt_iob_func(0))
 #define STDOUT_ ((Stream *)__acrt_iob_func(1))
 #define STDERR_ ((Stream *)__acrt_iob_func(2))
@@ -1467,9 +1482,16 @@ API int _lock_file_dummy(void) { return 0; }
 API void _lock_file(void *f) { (void)f; }
 API void _unlock_file(void *f) { (void)f; }
 
+/* A stream that is not one of the three is followed by a critical section, as in the old runtime (its _FILEX): a program built against it locks a
+ * stream itself around a printf of its own - the three by _lock(), any other by entering the critical section it expects after the stream. */
+typedef struct { Stream stream; RTL_CRITICAL_SECTION lock; } StreamWithLock;
+IMPORT NTSTATUS NTAPI RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION);
+IMPORT NTSTATUS NTAPI RtlDeleteCriticalSection(PRTL_CRITICAL_SECTION);
 static Stream *stream_open(int fd, int flags) {
-  Stream *f = calloc(1, sizeof(Stream));
-  if (!f) return NULL;
+  StreamWithLock *made = calloc(1, sizeof(StreamWithLock));
+  if (!made) return NULL;
+  if (RtlInitializeCriticalSection(&made->lock) < 0) { free(made); return NULL; }
+  Stream *f = &made->stream;
   f->fd = fd;
   f->flags = flags;
   f->ungot = -1;
@@ -1525,6 +1547,7 @@ static int fclose_nolock(void *stream) {
   if (f->buffer && (f->flags & S_BUF_OWNED)) free(f->buffer);
   if (!(f->flags & S_STATIC)) {
     for (Stream **p = &g_streams; *p; p = &(*p)->next) if (*p == f) { *p = f->next; break; }
+    RtlDeleteCriticalSection(&((StreamWithLock *)f)->lock);
     free(f);
   }
   return r;

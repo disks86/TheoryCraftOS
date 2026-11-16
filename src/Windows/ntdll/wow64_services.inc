@@ -103,13 +103,13 @@ EXPORT NTSTATUS NTAPI NtCancelTimer(HANDLE a0, PBOOLEAN a1) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwCancelTimer(HANDLE a0, PBOOLEAN a1) { return NtCancelTimer(a0, a1); }
-EXPORT NTSTATUS NTAPI NtClose(HANDLE a0) {
+EXPORT LONG NTAPI NtClose(HANDLE a0) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtClose, v);
+  const LONG status = (LONG)wow_service(NT_SERVICE_NtClose, v);
   return status;
 }
-EXPORT NTSTATUS NTAPI ZwClose(HANDLE a0) { return NtClose(a0); }
+EXPORT LONG NTAPI ZwClose(HANDLE a0) { return NtClose(a0); }
 EXPORT NTSTATUS NTAPI NtCompareObjects(HANDLE a0, HANDLE a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -331,18 +331,18 @@ NTSTATUS NTAPI RawNtCreateSemaphore(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2,
   if (a0) *a0 = (__typeof__(*a0))(ULONG_PTR)w0;
   return status;
 }
-EXPORT NTSTATUS NTAPI NtCreateSocket(ULONG a0, ULONG a1, ULONG a2, PHANDLE a3) {
+EXPORT LONG NTAPI NtCreateSocket(ULONG a0, ULONG a1, ULONG a2, PHANDLE a3) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;
   v[1] = (ULONG64)(ULONG_PTR)a1;
   v[2] = (ULONG64)(ULONG_PTR)a2;
   ULONG64 w3 = a3 ? WOW_HANDLE(*a3) : 0;
   v[3] = a3 ? WOW_POINTER(&w3) : 0;
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtCreateSocket, v);
+  const LONG status = (LONG)wow_service(NT_SERVICE_NtCreateSocket, v);
   if (a3) *a3 = (__typeof__(*a3))(ULONG_PTR)w3;
   return status;
 }
-EXPORT NTSTATUS NTAPI ZwCreateSocket(ULONG a0, ULONG a1, ULONG a2, PHANDLE a3) { return NtCreateSocket(a0, a1, a2, a3); }
+EXPORT LONG NTAPI ZwCreateSocket(ULONG a0, ULONG a1, ULONG a2, PHANDLE a3) { return NtCreateSocket(a0, a1, a2, a3); }
 EXPORT NTSTATUS NTAPI NtCreateSymbolicLink(POBJECT_ATTRIBUTES a0, PUNICODE_STRING a1, BOOLEAN a2) {
   ULONG64 v[4] = {0};
   WOW_OBJECT_ATTRIBUTES o0;
@@ -800,6 +800,17 @@ EXPORT NTSTATUS NTAPI NtOpenTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwOpenTimer(PHANDLE a0, ULONG a1, POBJECT_ATTRIBUTES a2) { return NtOpenTimer(a0, a1, a2); }
+EXPORT LONG NTAPI NtPowerInformation(int a0, PVOID a1, ULONG a2, PVOID a3, ULONG a4) {
+  ULONG64 v[5] = {0};
+  v[0] = (ULONG64)(LONG64)a0;
+  v[1] = (ULONG64)(ULONG_PTR)a1;
+  v[2] = (ULONG64)(ULONG_PTR)a2;
+  v[3] = (ULONG64)(ULONG_PTR)a3;
+  v[4] = (ULONG64)(ULONG_PTR)a4;
+  const LONG status = (LONG)wow_service(NT_SERVICE_NtPowerInformation, v);
+  return status;
+}
+EXPORT LONG NTAPI ZwPowerInformation(int a0, PVOID a1, ULONG a2, PVOID a3, ULONG a4) { return NtPowerInformation(a0, a1, a2, a3, a4); }
 EXPORT NTSTATUS NTAPI NtProtectVirtualMemory(HANDLE a0, PVOID * a1, PSIZE_T a2, ULONG a3, PULONG a4) {
   ULONG64 v[5] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -1298,7 +1309,7 @@ NTSTATUS NTAPI RawNtSignalAndWaitForSingleObject(HANDLE a0, HANDLE a1, BOOLEAN a
   const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSignalAndWaitForSingleObject, v);
   return status;
 }
-EXPORT NTSTATUS NTAPI NtSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) {
+EXPORT LONG NTAPI NtSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) {
   ULONG64 v[6] = {0};
   v[0] = WOW_HANDLE(a0);
   v[1] = (ULONG64)(ULONG_PTR)a1;
@@ -1306,10 +1317,10 @@ EXPORT NTSTATUS NTAPI NtSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, P
   v[3] = (ULONG64)(ULONG_PTR)a3;
   v[4] = (ULONG64)(ULONG_PTR)a4;
   v[5] = (ULONG64)(ULONG_PTR)a5;
-  const NTSTATUS status = (NTSTATUS)wow_service(NT_SERVICE_NtSocketControl, v);
+  const LONG status = (LONG)wow_service(NT_SERVICE_NtSocketControl, v);
   return status;
 }
-EXPORT NTSTATUS NTAPI ZwSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) { return NtSocketControl(a0, a1, a2, a3, a4, a5); }
+EXPORT LONG NTAPI ZwSocketControl(HANDLE a0, ULONG a1, PVOID a2, ULONG a3, PVOID a4, ULONG a5) { return NtSocketControl(a0, a1, a2, a3, a4, a5); }
 EXPORT NTSTATUS NTAPI NtSuspendThread(HANDLE a0, PULONG a1) {
   ULONG64 v[4] = {0};
   v[0] = WOW_HANDLE(a0);
@@ -1325,6 +1336,13 @@ EXPORT NTSTATUS NTAPI NtTcosAccessCheck(void * a0) {
   return status;
 }
 EXPORT NTSTATUS NTAPI ZwTcosAccessCheck(void * a0) { return NtTcosAccessCheck(a0); }
+EXPORT LONG NTAPI NtTcosAudio(ULONG64 * a0) {
+  ULONG64 v[4] = {0};
+  v[0] = (ULONG64)(ULONG_PTR)a0;
+  const LONG status = (LONG)wow_service(NT_SERVICE_NtTcosAudio, v);
+  return status;
+}
+EXPORT LONG NTAPI ZwTcosAudio(ULONG64 * a0) { return NtTcosAudio(a0); }
 EXPORT NTSTATUS NTAPI NtTcosCommonDialog(void * a0) {
   ULONG64 v[4] = {0};
   v[0] = (ULONG64)(ULONG_PTR)a0;

@@ -204,20 +204,21 @@ typedef struct {
   void *pvReserved;
   DWORD dwReserved, FlagsEx;
 } OFN;
-#define OFN_SIZE_VERSION_400 136u
-#define OFN_SIZE 152u
+#define OFN_SIZE_VERSION_400 ((DWORD)__builtin_offsetof(OFN, pvReserved))      /* 136; 76 in a 32-bit program */
+#define OFN_SIZE ((DWORD)sizeof(OFN))                                /* 152; 88 in a 32-bit program */
 #define OFN_NOCHANGEDIR 0x8u
 #define OFN_ENABLEHOOK 0x20u
 #define OFN_EXTENSIONDIFFERENT 0x400u
 #define OFN_READONLY 0x1u
 #define PATH_UNITS 32768      /* the longest path a dialog hands back */
 
-typedef struct {      /* the same layout as TCOS_COMMON_DIALOG of src/Windows/tcos_syscalls.h and src/Process/WindowsDialogs.hpp */
+typedef struct {      /* what NtTcosCommonDialog reads (src/Process/WindowsDialogs.cpp): 72 bytes, the addresses 64 bits wide in a 32-bit program too */
   DWORD size, kind, flags, filter_index, color, color_out, accepted, reserved;
-  const WCHAR *title, *start, *filters;
-  WCHAR *result;
+  ULONG64 title, start, filters;      /* (const WCHAR *) */
+  ULONG64 result;                     /* (WCHAR *) */
   DWORD result_capacity, result_length;
 } CommonDialog;
+typedef char common_dialog_size_check[sizeof(CommonDialog) == 72 ? 1 : -1];
 #define DIALOG_OPEN 1
 #define DIALOG_SAVE 2
 #define DIALOG_COLOR 3
@@ -369,10 +370,10 @@ static BOOL file_dialog(OFN *ofn, int wide, int save) {
   request.size = sizeof(CommonDialog);
   request.kind = save ? DIALOG_SAVE : DIALOG_OPEN;
   request.filter_index = ofn->nFilterIndex > 0 ? ofn->nFilterIndex - 1 : 0;
-  request.title = title;
-  request.start = start;
-  request.filters = kernel_filters;
-  request.result = path;
+  request.title = (ULONG64)(ULONG_PTR)title;
+  request.start = (ULONG64)(ULONG_PTR)start;
+  request.filters = (ULONG64)(ULONG_PTR)kernel_filters;
+  request.result = (ULONG64)(ULONG_PTR)path;
   request.result_capacity = PATH_UNITS;
   const NTSTATUS status = NtTcosCommonDialog(&request);
   if (status < 0 && status != (NTSTATUS)0xC0000023) {      /* (no screen, or another dialog is open; STATUS_BUFFER_TOO_SMALL cannot happen with this buffer) */
@@ -460,7 +461,7 @@ typedef struct {
 } CHOOSECOLOR_;
 #define CC_RGBINIT 0x1u
 #define CC_ENABLEHOOK 0x10u
-#define CC_SIZE 72u
+#define CC_SIZE ((DWORD)sizeof(CHOOSECOLOR_))      /* 72; 36 in a 32-bit program */
 
 static BOOL choose_color(CHOOSECOLOR_ *cc) {
   set_error(0);
@@ -506,7 +507,7 @@ typedef struct {
 #define CF_ENABLETEMPLATEHANDLE 0x20u
 #define CF_LIMITSIZE 0x2000u
 #define CF_INITTOLOGFONTSTRUCT 0x40u
-#define CF_SIZE 104u
+#define CF_SIZE ((DWORD)sizeof(CHOOSEFONT_))      /* 104; 60 in a 32-bit program */
 
 static BOOL choose_font(CHOOSEFONT_ *cf) {
   set_error(0);
@@ -540,7 +541,7 @@ typedef struct {
 #define FR_ENABLEHOOK 0x100u
 #define FR_ENABLETEMPLATE 0x200u
 #define FR_ENABLETEMPLATEHANDLE 0x2000u
-#define FR_SIZE 80u
+#define FR_SIZE ((DWORD)sizeof(FINDREPLACE_))      /* 80; 40 in a 32-bit program */
 
 static HANDLE find_replace(FINDREPLACE_ *fr, int replace) {
   set_error(0);
@@ -571,9 +572,18 @@ EXPORT HANDLE WINAPI ReplaceTextW(void *fr) { return find_replace(fr, 1); }
 #define PD_ENABLESETUPTEMPLATEHANDLE 0x20000u
 #define PD_NOPAGENUMS 0x8u
 #define PD_RETURNDEFAULT 0x400u
+/* The print structures are read by their offsets (commdlg.h packs PRINTDLG to 1 byte in a 32-bit program, which makes it 66 bytes there). */
+#ifdef __i386__
+#define PRINTDLG_SIZE 66u
+#define PAGESETUPDLG_SIZE 84u
+#define PRINTDLGEX_SIZE 84u
+enum { PDX_OWNER = 4, PDX_FLAGS = 20, PDX_MAX_RANGES = 36, PDX_RANGES = 40, PDX_PROPERTY_PAGES = 68, PDX_START_PAGE = 76, PDX_RESULT = 80 };
+#else
 #define PRINTDLG_SIZE 120u
 #define PAGESETUPDLG_SIZE 128u
 #define PRINTDLGEX_SIZE 136u
+enum { PDX_OWNER = 8, PDX_FLAGS = 40, PDX_MAX_RANGES = 56, PDX_RANGES = 64, PDX_PROPERTY_PAGES = 112, PDX_START_PAGE = 128, PDX_RESULT = 132 };
+#endif
 #define START_PAGE_GENERAL 0xFFFFFFFFu
 
 static BOOL print_dialog(const BYTE *dlg, DWORD size) {
@@ -594,15 +604,15 @@ static LONG print_dialog_ex(const BYTE *dlg) {
   set_error(0);
   if (!dlg) { set_error(CDERR_INITIALIZATION); return E_INVALIDARG_; }
   if (*(const DWORD *)dlg != PRINTDLGEX_SIZE) { set_error(CDERR_STRUCTSIZE); return E_INVALIDARG_; }
-  if (!*(void *const *)(dlg + 8)) return E_HANDLE_;
-  const DWORD flags = *(const DWORD *)(dlg + 40), max_ranges = *(const DWORD *)(dlg + 56);
-  const void *ranges = *(void *const *)(dlg + 64);
-  const DWORD start_page = *(const DWORD *)(dlg + 128), property_pages = *(const DWORD *)(dlg + 112);
+  if (!*(void *const *)(dlg + PDX_OWNER)) return E_HANDLE_;
+  const DWORD flags = *(const DWORD *)(dlg + PDX_FLAGS), max_ranges = *(const DWORD *)(dlg + PDX_MAX_RANGES);
+  const void *ranges = *(void *const *)(dlg + PDX_RANGES);
+  const DWORD start_page = *(const DWORD *)(dlg + PDX_START_PAGE), property_pages = *(const DWORD *)(dlg + PDX_PROPERTY_PAGES);
   if (start_page != START_PAGE_GENERAL && start_page >= property_pages) return E_INVALIDARG_;
   if (!(flags & PD_NOPAGENUMS) && (max_ranges == 0 || !ranges)) return E_INVALIDARG_;
   if ((flags & PD_NOPAGENUMS) && (max_ranges != 0) != (ranges != NULL)) return E_INVALIDARG_;
   set_error(PDERR_NODEFAULTPRN);
-  *(DWORD *)(dlg + 132) = 0;      /* dwResultAction = PD_RESULT_CANCEL */
+  *(DWORD *)(dlg + PDX_RESULT) = 0;      /* dwResultAction = PD_RESULT_CANCEL */
   return E_FAIL_;
 }
 

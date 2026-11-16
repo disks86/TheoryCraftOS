@@ -50,12 +50,36 @@ in a 32-bit address space: 32-bit import slots, image base, security cookie, TLS
 temporary files) is that file.
 
 **The libraries.** The sources of the libraries (src/Windows) are built a second time, for i386, into `C:\Windows\SysWOW64`
-(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): all of them but eight - ntdll, kernel32, msvcrt, advapi32,
-win32u, gdi32, user32, comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32, which are tested, and 66 more that are there so that a
-program importing them loads (wtsapi32, userenv, comdlg32, ws2_32, crypt32, uxtheme, shfolder, ...). Of those 66 nothing has been run: the ones
-that are stubs or work through kernel32 and advapi32 can be expected to do what their 64-bit forms do; the ones that hand the kernel structures of
-their own (comdlg32's dialogs, bcrypt, dwrite, opengl32, the Direct3D libraries, ws2_32's sockets) pass them in a 32-bit layout the kernel does
-not read. Not built, because their sources do not compile for i386 yet: winmm, dsound, mmdevapi, xaudio2_8, xaudio2_9, imm32, dbghelp, vulkan-1.
+(scripts/build-wow64-dlls.sh, run by the build when `i686-w64-mingw32-gcc` is there): all of them but vulkan-1, whose source does not compile for
+i386 yet (a 32-bit program's Vulkan handles are 64-bit numbers, not pointers). What has been run of them:
+
+- ntdll, kernel32, msvcrt, advapi32, win32u, gdi32, user32, comctl32, version, oleaut32, ole32, shlwapi, shcore and shell32: the test programs
+  hello32, crt32, seh32, gui32 and old32, and the setup programs.
+- ws2_32, comdlg32, winmm, imm32, dbghelp and bcrypt: the test program lib32 (below).
+- The rest (wtsapi32, userenv, crypt32, uxtheme, shfolder, dsound, mmdevapi, xaudio2, dwrite, opengl32, the Direct3D libraries, ...) are there so
+  that a program importing them loads; nothing of them has been run. The ones that are stubs or work through kernel32 and advapi32 can be expected
+  to do what their 64-bit forms do. dwrite's and opengl32's requests to the kernel have one layout for both widths; the Direct3D libraries hand
+  the kernel structures full of pointers, which nothing converts.
+
+What each of the second group needed says what to look for in the others:
+
+- **A calling convention.** Winsock's functions are stdcall in a 32-bit program (`WSAAPI`), and so is a `CALLBACK`; `LPARAM` is as wide as a pointer.
+  The shared header (src/Windows/tcos_win.h) had the 64-bit answers for the last two.
+- **A structure the program fills in.** `WSADATA` orders its fields differently in a 32-bit program; the common dialogs check `lStructSize`
+  against the size of their own structures (88 bytes for `OPENFILENAME` there, not 152) and read `PRINTDLGEX` by its 32-bit offsets.
+- **A request the kernel reads.** comdlg32's `NtTcosCommonDialog` request holds its addresses as 64-bit numbers in both widths. The audio
+  libraries' `NtTcosAudio` is an array of 64-bit numbers; all it lacked was its function in the 32-bit ntdll. imm32's `IMEINFOEX` begins with a
+  keyboard layout's handle and is converted by win32u. opengl32 widens the arrays of pointers a few commands take (`glShaderSource`,
+  `glMultiDrawElements`, ...) and narrows the pointers that come back (`glGetPointerv`, ...): scripts/gen-opengl.py, `POINTER_ARRAYS`.
+- **A width in a context value.** winmm packed a timer's slot and id into the 64 bits of a callback's context.
+- **dbghelp** walks a 32-bit stack by its frame pointers (`StackWalk64` with `IMAGE_FILE_MACHINE_I386`): there is no unwind data, so a function
+  compiled without a frame pointer is passed over. `RtlCaptureContext` describes its caller's caller in a 32-bit program, as on Windows.
+
+**The old C runtime.** A program built against msvcrt.dll itself (not the universal runtime's api sets) knows the size of a stream: it finds stdout
+and stderr 32 and 64 bytes after what `__p__iob()` gives it (or the `_iob` it imports), and locks a stream of its own around its own printf - the
+three by `_lock()`, any other by entering the critical section the old runtime keeps right after the stream. So a stream is 32 bytes in the 32-bit
+msvcrt (48 in the 64-bit one), and one that `fopen` makes is followed by a critical section, in both. Not there: the fields a Visual C++ 6 program's
+`getc` and `putc` macros read in the stream (`_cnt`, `_ptr`) and the `_filbuf` and `_flsbuf` they call.
 
 - **Exports that are not implemented** are stubs, as in the 64-bit libraries, but a stdcall stub has to take its arguments off the stack: the
   sizes come from the import libraries i686-w64-mingw32 ships (scripts/gen-wow64-stubs.py). The NT services nothing here has a prototype for are
@@ -123,7 +147,7 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
   TEB at FS, calls NT services through INT 2E, and bad argument blocks are refused.
 - **A program with a C runtime** (tests/windows/crt32.c, built with `i686-w64-mingw32-gcc` the ordinary way) runs on the 32-bit ntdll.dll,
   kernel32.dll and msvcrt.dll: the runtime's start-up, `printf`, the heap, files, the environment, `VirtualAlloc` / `VirtualQuery`, thread-local
-  storage, critical sections, four threads and waiting for them, events, `Sleep`. All 21 of its checks pass.
+  storage, critical sections, four threads and waiting for them, events, `Sleep`. All 33 of its checks pass.
 - **The other libraries** (tests/windows/gui32.c): the registry; the process's token; `wsprintf` and the character functions;
   `InitCommonControls`; `OleInitialize`, the shell's folders, a shortcut made through `IShellLink` and saved through `IPersistFile`; then a
   window class, a window with its creation messages, its text, rectangles and window longs, `SetWindowPos`, sent and posted messages, a timer, a
@@ -140,28 +164,29 @@ Done, and run in QEMU (`tests/wow64_qemu.sh`):
 Not done yet, in the order planned:
 
 1. **What is left of the window system.** Not converted, so not working in a 32-bit program: touch and pointer input (`POINTER_TOUCH_INFO`,
-   `TOUCHINPUT`), `GetRawInputBuffer`, the input method's `IMEINFOEX` (imm32 is not built for i386), the DWM thumbnail and composition
-   attribute services, `NtGdiPolyTextOutW` and `NtGdiPolyPatBlt` when called through win32u (gdi32 does not use them), and every Direct3D
-   service (their structures are full of pointers; no Direct3D library is built for i386). A message with a structure sent between a 32-bit and
-   a 64-bit program is not converted. comctl32 has no controls yet (for 64-bit programs either), and comdlg32, imm32, winmm and the other
-   libraries are not built for i386.
-2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; information classes with
-   pointers in them (`NtQuerySystemInformation`, `NtQueryObject`) are passed unconverted; the old runtime's `_iob` array has the wrong stride
-   (a stream is 40 bytes here, 32 in a 32-bit program built against the old runtime).
+   `TOUCHINPUT`), `GetRawInputBuffer`, the DWM thumbnail and composition attribute services, `NtGdiPolyTextOutW` and `NtGdiPolyPatBlt` when
+   called through win32u (gdi32 does not use them), and every Direct3D service (their structures are full of pointers). A message with a
+   structure sent between a 32-bit and a 64-bit program is not converted. comctl32 has no controls yet (for 64-bit programs either). The
+   common dialogs' requests are right for a 32-bit program, but no dialog has been shown by one (the test checks what is refused before that).
+   opengl32's 32-bit conversions are compiled and not run. vulkan-1 is not built for i386.
+2. **The long tail in ntdll, kernel32 and msvcrt**: the services ntdll has no prototype for are stubs; `NtQuerySystemInformation`'s classes
+   with pointers or pointer-sized numbers in them (the process list, the basic information) are passed unconverted (`NtQueryObject`'s name and
+   type are converted); a Visual C++ 6 program's `getc`/`putc` macros and `_filbuf`/`_flsbuf` (above).
 3. **What exceptions still lack**: C++ exceptions are there for 32-bit programs only (a 64-bit msvcrt.dll has neither `__CxxFrameHandler` nor
    `_CxxThrowException`), without exception specifications and without tests of their own (a real setup program's plug-in is what has run them);
    the stack cookies of `_except_handler4` are not checked; `setjmp`/`longjmp` do not unwind; a 32-bit program is not
    debugged (no debug events for it); a stack overflow ends the program (no guard-page exception on the 32-bit stack).
 4. **Setup programs**: Nullsoft (NSIS) and Inno Setup programs run when they install without showing themselves, and the App Manager runs
    them (docs/AppManager.md): Notepad++'s and qBittorrent's (NSIS), WinMerge's (Inno Setup 5) and TreeSize Free's (Inno Setup 6) have installed
-   and been removed in QEMU. A 32-bit setup program of no known kind ("exe") is still refused. What an installed 32-bit program then needs is
-   another matter: TreeSize Free, started by its own setup program, faulted. oleaut32 parses numbers exactly only up to 2^62 in a 32-bit program
-   (i386 has no 128-bit integers).
+   and been removed in QEMU. A 32-bit setup program of no known kind ("exe") is still refused. What the installed program then needs is
+   another matter: TreeSize Free's setup program installs a 64-bit TreeSizeFree.exe and starts it, and that program faults (a call through a
+   null pointer, after `NtOpenKey` answered "invalid handle" several times) - a gap of the 64-bit libraries, not of this layer. oleaut32 parses
+   numbers exactly only up to 2^62 in a 32-bit program (i386 has no 128-bit integers).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Finding out why a program gives up
 
-Three things made the setup programs above tractable, and stay in the tree:
+These made the setup programs above tractable, and stay in the tree:
 
 - `-DTCOS_TRACE_SERVICE_FAILURES=ON` (a kernel build option): every NT service of a Windows program that answers an error status, and every error a
   window service sets, goes to the debug console with the service's number (src/Windows/tcos_syscalls.h).
@@ -172,6 +197,11 @@ Three things made the setup programs above tractable, and stay in the tree:
   at the first damage faults on purpose with a write to the address the previous heap call was made from - the damage was done after that call.
   (This found gdi32's font enumeration writing 452 bytes an entry into a buffer sized by a count of entries: a bug for 64-bit programs too.)
 
+- `WOW64_EXTRA_FLAGS=-DTCOS_TRACE_MISSING_PROCS`, with the first option: the 32-bit kernel32 tells the kernel every function `GetProcAddress`
+  is asked for by name and does not find, and the kernel writes it on the debug console ("debug text: pid ... GetProcAddress: no X in Y.dll") - a
+  program that calls what it was given without looking faults at address 0, and this is the name. (With that option the kernel writes any
+  program's `OutputDebugString`-style text the same way.)
+
 A setup program's own log is the other half: the App Manager asks Inno Setup for one and quotes it when the setup program fails.
 
 ## Tests
@@ -179,4 +209,7 @@ A setup program's own log is the other half: the App Manager asks Inno Setup for
 - `tests/run_host_tests.sh SyscallTest LoaderTest`: binding a PE32 program, the INT 2E argument convention, the address-space ceiling.
 - `tests/run_host_tests.sh WindowsExceptionTest`: the i386 `CONTEXT` and record the kernel writes and reads, with truncated and bit-flipped
   contexts.
-- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32]`: the four programs above in the real kernel, each in a boot of its own.
+- `tests/wow64_qemu.sh [hello32] [crt32] [seh32] [gui32] [lib32] [old32]`: the six test programs in the real kernel, each in a boot of its own.
+  lib32 is the libraries beyond the window system (Winsock, the common dialogs' structures, the multimedia timer and wave output, the input
+  method manager, a walk of its own stack, bcrypt, an object's name); old32 is a program built against the old C runtime (the same source built
+  for x86-64 with `-mcrtdll=msvcrt-os` tests the 64-bit msvcrt.dll's streams).

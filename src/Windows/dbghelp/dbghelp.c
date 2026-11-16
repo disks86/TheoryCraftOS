@@ -36,6 +36,11 @@
 #include <psapi.h>
 #include "dbghelp.h"
 
+#ifdef __i386__
+/* (the entry of an x64 image's function table, which the 32-bit headers do not have: this library reads the table of any image it is shown) */
+typedef struct { DWORD BeginAddress, EndAddress, UnwindData; } RUNTIME_FUNCTION;
+#endif
+
 #define EXPORT __declspec(dllexport)
 
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");

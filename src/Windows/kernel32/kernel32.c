@@ -1013,6 +1013,25 @@ EXPORT FARPROC WINAPI GetProcAddress(HMODULE module, LPCSTR name) {
   if (!name) { set_error(ERROR_INVALID_PARAMETER); return NULL; }
   if (!range_allowed(module, 0x40, FALSE) || *(const WORD *)module != 0x5A4D) { set_error(ERROR_MOD_NOT_FOUND); return NULL; }
   FARPROC p = ((ULONG_PTR)name >> 16) == 0 ? export_of(module, NULL, (DWORD)(ULONG_PTR)name, 0) : export_of(module, name, 0, 0);
+#ifdef TCOS_TRACE_MISSING_PROCS
+  /* For finding out why a program gives up (docs/Wow64.md): a function asked for by name that the library does not have is said to the kernel as
+   * debug text, which a kernel built with TCOS_TRACE_SERVICE_FAILURES writes on its debug console - a program that calls what it was given without
+   * looking then faults at address 0, and this is the name. Built in with WOW64_EXTRA_FLAGS=-DTCOS_TRACE_MISSING_PROCS (the 32-bit libraries). */
+  if (!p && ((ULONG_PTR)name >> 16) != 0) {
+    char line[MAX_PATH + 160], path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(module, path, sizeof(path));
+    DWORD at = 0, start = 0;
+    for (DWORD i = 0; i < length; ++i) if (path[i] == '\\') start = i + 1;
+    static const char head[] = "GetProcAddress: no ";
+    for (DWORD i = 0; head[i]; ++i) line[at++] = head[i];
+    for (DWORD i = 0; name[i] && i < 120; ++i) line[at++] = name[i];
+    line[at++] = ' '; line[at++] = 'i'; line[at++] = 'n'; line[at++] = ' ';
+    for (DWORD i = start; i < length && at + 1 < sizeof(line); ++i) line[at++] = path[i];
+    line[at] = 0;
+    ULONG64 record[19] = {0x40010006u, 0, 0, 2, at + 1, (ULONG64)(ULONG_PTR)line};      /* (an EXCEPTION_RECORD as the kernel reads it) */
+    NtTcosDebugException(record, TRUE, NULL);
+  }
+#endif
   if (!p) set_error(ERROR_PROC_NOT_FOUND);
   return p;
 }

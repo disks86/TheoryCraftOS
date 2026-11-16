@@ -30,7 +30,7 @@ static BOOL is_key_handle(HANDLE handle)
     ULONG got;
     const WCHAR *name;
     if (NtQueryObject( handle, 2 /* ObjectTypeInformation */, buffer, sizeof(buffer), &got )) return FALSE;
-    name = *(const WCHAR **)(buffer + 8);
+    name = ((const UNICODE_STRING *)buffer)->Buffer;
     return *(USHORT *)buffer == 6 && name && (name[0] | 0x20) == 'k' && (name[1] | 0x20) == 'e' && (name[2] | 0x20) == 'y';
 }
 static DWORD trustee_to_sid(DWORD nDestinationSidLength, PSID pDestinationSid, PTRUSTEEW pTrustee);

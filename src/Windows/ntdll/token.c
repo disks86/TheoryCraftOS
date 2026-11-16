@@ -1130,7 +1130,7 @@ static void mapping_for_handle(HANDLE handle, GENERIC_MAPPING *m)
     if (handle == (HANDLE)(LONG_PTR)-2) { m->GenericRead = 0x20048; m->GenericWrite = 0x20037; m->GenericExecute = 0x120000; m->GenericAll = 0x1fffff; return; }
     if (NtQueryObject(handle, 2, buf, sizeof(buf), &got)) return;
     bytes = *(USHORT *)buf;
-    name = *(const WCHAR **)(buf + 8);
+    name = ((const UNICODE_STRING *)buf)->Buffer;
     if (!name) return;
     for (i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
         const char *t = types[i].name;

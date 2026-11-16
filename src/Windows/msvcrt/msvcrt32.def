@@ -6,3 +6,4 @@
 "??_V@YAXPAX@Z" = msvcrt_operator_delete
 "??1type_info@@UAE@XZ" = msvcrt_type_info_destroy
 _adjust_fdiv = msvcrt_adjust_fdiv DATA
+_iob = msvcrt_iob DATA
