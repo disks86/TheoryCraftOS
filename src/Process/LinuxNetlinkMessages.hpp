@@ -35,6 +35,7 @@ struct Interface {
   char name[16] = {};
   uint32_t name_size = 0;
   bool loopback = false;
+  bool promiscuous = false, all_multicast = false;      // IFF_PROMISC, IFF_ALLMULTI
   uint8_t mac[6] = {};
   uint32_t mtu = 1500;
   bool has4 = false;

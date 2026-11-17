@@ -48,6 +48,7 @@ class VirtioNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool) override { return true; }  // (the device passes every frame unless told to filter)
+  bool accept_all_frames(bool) override { return true; }     // (the same: this driver never asks it to filter by address)
   NetworkStatistics statistics() const override { return stats_; }
 
  private:

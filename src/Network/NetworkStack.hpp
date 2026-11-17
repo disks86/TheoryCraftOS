@@ -115,6 +115,10 @@ class NetworkStack final : public INetworkStack, public IIpLayer, public ILinkLa
   bool send_link_frame(ConstByteView frame, const void* origin) override;
   hardware::MacAddress link_address() const override { return nic_.mac_address(); }
   bool loop_ip_packet(ConstByteView packet) override;
+  void want_all_frames(bool wanted) override;
+  void want_all_multicast(bool wanted) override;
+  bool promiscuous() const override { return __atomic_load_n(&all_frames_users_, __ATOMIC_ACQUIRE) != 0; }
+  bool all_multicast() const override { return __atomic_load_n(&all_multicast_users_, __ATOMIC_ACQUIRE) != 0; }
   SharedPointer<ITcpSocket> tcp_open() override;
   bool join_multicast(Ipv4Address group) override;
   void leave_multicast(Ipv4Address group) override;
@@ -289,6 +293,7 @@ class NetworkStack final : public INetworkStack, public IIpLayer, public ILinkLa
   UdpManager udp_;
   RawManager raw_;
   FrameTapManager taps_;
+  uint32_t all_frames_users_ = 0, all_multicast_users_ = 0;   // taps that asked for promiscuous mode, for every multicast frame (changed under ip_lock_)
   TcpManager tcp_;
   SharedPointer<UdpSocket> dhcp_socket_;
   UniquePointer<DhcpClient> dhcp_;

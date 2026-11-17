@@ -32,7 +32,7 @@ constexpr uint32_t kMulticastTable = 0x5200, kRal0 = 0x5400, kRah0 = 0x5404;
 
 constexpr uint32_t kCtrlReset = 1u << 26, kCtrlSetLinkUp = 1u << 6, kCtrlAutoSpeed = 1u << 5;
 constexpr uint32_t kStatusLinkUp = 1u << 1, kStatusFullDuplex = 1u << 0, kStatusSpeedShift = 6, kStatusSpeedMask = 3;
-constexpr uint32_t kRctlEnable = 1u << 1, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;  // 2 KiB buffers: BSIZE = 0
+constexpr uint32_t kRctlEnable = 1u << 1, kRctlUnicastPromiscuous = 1u << 3, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;  // 2 KiB buffers: BSIZE = 0
 constexpr uint32_t kTctlEnable = 1u << 1, kTctlPadShortPackets = 1u << 3;
 constexpr uint32_t kTctlCollisionThreshold = 0x0F << 4, kTctlCollisionDistance = 0x40 << 12;
 constexpr uint32_t kTipgDefault = 0x0060200A;  // IPGT 10, IPGR1 8, IPGR2 6 (IEEE 802.3)
@@ -193,8 +193,24 @@ bool E1000NetworkInterface::receive(ByteView buffer, uint32_t* length) {
 namespace hardware {
 bool E1000NetworkInterface::accept_all_multicast(bool enable) {
   if (!started_) return false;
-  receive_control_ = enable ? (receive_control_ | kRctlMulticastPromiscuous) : (receive_control_ & ~kRctlMulticastPromiscuous);
-  write(kRctl, receive_control_);
+  all_multicast_ = enable;
+  write_receive_filter();
   return enable;
+}
+
+bool E1000NetworkInterface::accept_all_frames(bool enable) {
+  if (!started_) return false;
+  all_frames_ = enable;
+  write_receive_filter();
+  return enable;
+}
+
+// The receive control register with its two promiscuous bits as asked: every unicast frame (and with them every multicast one) for all frames, every
+// multicast frame for all multicast.
+void E1000NetworkInterface::write_receive_filter() {
+  receive_control_ &= ~(kRctlUnicastPromiscuous | kRctlMulticastPromiscuous);
+  if (all_frames_) receive_control_ |= kRctlUnicastPromiscuous | kRctlMulticastPromiscuous;
+  else if (all_multicast_) receive_control_ |= kRctlMulticastPromiscuous;
+  write(kRctl, receive_control_);
 }
 }  // namespace hardware

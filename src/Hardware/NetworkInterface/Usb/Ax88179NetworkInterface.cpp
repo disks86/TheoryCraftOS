@@ -30,7 +30,7 @@ constexpr uint16_t kPhysicalLinkStatus = 0x02, kRxControl = 0x0B, kNodeId = 0x10
                    kRxBulkInQueueControl = 0x2E, kClockSelect = 0x33, kRxChecksumControl = 0x34, kTxChecksumControl = 0x35,
                    kPauseWaterLevelHigh = 0x54, kPauseWaterLevelLow = 0x55;
 constexpr uint8_t kLinkStatusUsbSuper = 0x04, kLinkStatusUsbHigh = 0x02;
-constexpr uint16_t kRxControlAllMulticast = 0x0002, kRxControlBroadcast = 0x0008, kRxControlPhysical = 0x0020,
+constexpr uint16_t kRxControlPromiscuous = 0x0001, kRxControlAllMulticast = 0x0002, kRxControlBroadcast = 0x0008, kRxControlPhysical = 0x0020,
                    kRxControlStart = 0x0080, kRxControlDropCrcError = 0x0100, kRxControlIpAlign = 0x0200;
 constexpr uint16_t kMediumGiga = 0x0001, kMediumFullDuplex = 0x0002, kMedium125MHz = 0x0008, kMediumRxFlow = 0x0010, kMediumTxFlow = 0x0020,
                    kMediumReceiveEnable = 0x0100, kMedium100 = 0x0200;
@@ -273,6 +273,14 @@ bool Ax88179NetworkInterface::link_up() const {
 bool Ax88179NetworkInterface::accept_all_multicast(bool enable) {
   if (!started_ || !present()) return false;
   const uint16_t control = enable ? (receive_control_ | kRxControlAllMulticast) : (receive_control_ & ~kRxControlAllMulticast);
+  if (!write_mac16(kRxControl, control)) return false;
+  receive_control_ = control;
+  return enable;
+}
+
+bool Ax88179NetworkInterface::accept_all_frames(bool enable) {
+  if (!started_ || !present()) return false;
+  const uint16_t control = enable ? (receive_control_ | kRxControlPromiscuous) : (receive_control_ & ~kRxControlPromiscuous);
   if (!write_mac16(kRxControl, control)) return false;
   receive_control_ = control;
   return enable;

@@ -45,6 +45,9 @@ uint64_t packet_pending(Process& p, uint64_t link, uint64_t argument);
 // For poll() (the system's lock held): is there a frame to read, or with a receive ring something in the ring the program has not given back? (Nothing
 // tells a wait when a frame arrives: it looks again every 2 ms. With a ring this is also what moves frames into it.)
 bool packet_ready_locked(uint64_t link, uint64_t realtime_ns, uint64_t monotonic_ns);
+// SIOCSIFFLAGS: promiscuous mode and all-multicast as flags of interface `interface` (as Linux counts them), which stay until taken back. False if
+// there is no such interface.
+bool packet_set_interface_flags(uint32_t interface, bool promiscuous, bool all_multicast);
 // For mmap(): the socket's rings, the receive ring first, each with a use for the caller and its size. How many there are (0: none to map).
 uint32_t packet_rings(uint64_t link, BlockRef blocks[2], uint64_t sizes[2]);
 

@@ -76,6 +76,7 @@ class Ax88179NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override {
     NetworkStatistics s = stats_;
     s.frames_dropped += assembler_.overflows();

@@ -1853,7 +1853,7 @@ static void test_packet_sockets() {
   CHECK(t.s(50, arp, 1) == -95 && t.s(43, arp, 0, 0) == -95 && t.s(42, arp, address(0, 2), 20) == -95 && t.s(48, arp, 2) == -95 && t.s(52, arp, name, size) == -95);
   CHECK(send(arp, std::string(13, 'x')) == -22 && send(arp, std::string(1515, 'x')) == -90 && send(arp, request, address(0, 7)) == -6 && t.s(44, arp, kBad, 60, 0, 0, 0) == -14);
   CHECK(t.s(54, arp, 263, 99, t.word(1), 4) == -92 && t.s(54, arp, 6, 1, t.word(1), 4) == -92);      // an option there is not; another level
-  CHECK(t.s(54, arp, 263, 1, buffer, 16) == 0 && t.s(54, arp, 263, 1, buffer, 8) == -22);      // PACKET_ADD_MEMBERSHIP (promiscuous mode): taken
+  CHECK(t.s(54, arp, 263, 1, buffer, 8) == -22);      // PACKET_ADD_MEMBERSHIP: not a whole struct packet_mreq (see test_packet_promiscuous)
   // read and write, readv and writev; the interface ioctls
   {
     const uint64_t vectors = t.alloc(32);
@@ -2311,6 +2311,138 @@ static void test_packet_fanout() {
   for (const int64_t fd : {ip, nothing, late, h1, h2, p1, p2, c1, c2, u1, u2, u3}) CHECK(t.s(3, fd) == 0);
 }
 
+// Promiscuous mode: PACKET_ADD_MEMBERSHIP, the interface's flags, and frames for other machines.
+static void test_packet_promiscuous() {
+  constexpr uint64_t kPacket = 17, kRaw = 3, kAllProtocols = 0x0300, kNetlink = 16;
+  Setup t;
+  t.lan.nic_a.filters = true;      // (the interface drops what is for other machines' addresses, as hardware does)
+  const uint8_t* mac_a = t.lan.nic_a.mac.bytes;
+  const uint8_t* mac_b = t.lan.nic_b.mac.bytes;
+  const uint8_t stranger[6] = {0x02, 0, 0, 0, 0, 0x77};
+  const uint64_t address = t.alloc(24), buffer = t.alloc(2048), name = t.alloc(24), size = t.alloc(8), ifreq = t.alloc(40);
+  {
+    const uint8_t raw[20] = {17, 0, 0, 0, 2};
+    t.memory.write(address, ConstByteView(raw, 20));
+  }
+  // struct packet_mreq
+  auto membership = [&](uint32_t interface, uint16_t type, const std::string& hardware = std::string()) {
+    const uint64_t at = t.alloc(16);
+    t.put32(at, interface); t.put32(at + 4, uint32_t(type) | uint32_t(hardware.size()) << 16); t.put64(at + 8, 0);
+    if (!hardware.empty()) t.memory.write(at + 8, ConstByteView(reinterpret_cast<const uint8_t*>(hardware.data()), hardware.size()));
+    return at;
+  };
+  auto flags_of = [&](const char* interface) {
+    memset(&t.memory.bytes[ifreq - kBase], 0, 40);
+    t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>(interface), strlen(interface)));
+    return t.s(16, 3, 0x8913, ifreq) == 0 ? int(t.u32(ifreq + 16) & 0xFFFF) : -1;
+  };
+  auto set_flags = [&](const char* interface, uint16_t flags) {
+    memset(&t.memory.bytes[ifreq - kBase], 0, 40);
+    t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>(interface), strlen(interface)));
+    t.put32(ifreq + 16, flags);
+    return t.s(16, 3, 0x8914, ifreq);
+  };
+  SharedPointer<network::IFrameTap> other = t.lan.b.frame_open();
+  CHECK(other);
+  other->listen(0, true, true, false, false);
+  // a frame from the other machine to an address that is nobody's here
+  auto to_stranger = [&](const char* text) {
+    const std::string frame = ethernet(stranger, mac_b, 0x88B5, text);
+    return other->send(ConstByteView(reinterpret_cast<const uint8_t*>(frame.data()), frame.size()));
+  };
+  // the next frame of the test's own that a socket has (the other machine's stack sends frames of its own meanwhile: those are passed over); `type`
+  // is the ether type looked for
+  auto heard = [&](int64_t fd, std::string* text, int* kind, uint16_t type = 0x88B5) {
+    t.lan.step(30);
+    for (int i = 0; i < 64; ++i) {
+      t.put32(size, 20);
+      const int64_t n = t.s(45, fd, buffer, 2048, 0, name, size);
+      if (n < 14) return false;
+      const std::string head = t.text(buffer, 14);
+      if ((uint16_t(uint8_t(head[12])) << 8 | uint8_t(head[13])) != type || memcmp(head.data(), stranger, 6) != 0) continue;
+      *text = t.text(buffer + 14, 5);
+      *kind = uint8_t(t.text(name + 10, 1)[0]);
+      return true;
+    }
+    return false;
+  };
+  const int64_t fd = t.s(41, kPacket, kRaw | kNonBlock, kAllProtocols), second = t.s(41, kPacket, kRaw | kNonBlock, kAllProtocols);
+  CHECK(fd == 3 && second >= 3 && t.s(49, fd, address, 20) == 0 && t.s(49, second, address, 20) == 0 && t.s(54, fd, 263, 23, t.word(1), 4) == 0 && t.s(54, second, 263, 23, t.word(1), 4) == 0);
+  std::string text;
+  int kind = -1;
+  // as things are, the interface drops it before anybody sees it
+  CHECK(flags_of("eth0") == 0x1043 && to_stranger("lost!") && !heard(fd, &text, &kind) && t.lan.nic_a.filtered == 1 && !t.lan.nic_a.promiscuous);
+  // PACKET_MR_PROMISC: the interface hands everything up, and the frame arrives marked as another machine's (PACKET_OTHERHOST)
+  CHECK(t.s(54, fd, 263, 1, membership(2, 1), 16) == 0 && t.lan.nic_a.promiscuous && t.lan.a.promiscuous() && flags_of("eth0") == 0x1043);      // (the flags show only what was set as a flag: as on Linux)
+  CHECK(to_stranger("seen!") && heard(fd, &text, &kind) && text == "seen!" && kind == 3 && t.lan.nic_a.filtered == 1);
+  CHECK(heard(second, &text, &kind) && text == "seen!" && kind == 3);      // (every packet socket on the interface hears it, whoever asked)
+  // the stack itself goes on ignoring what is not for this machine: an echo request for its IP address at the stranger's hardware address gets no answer
+  {
+    std::string ip("\x45\0\0\x1C\0\0\0\0\x40\x01\0\0\x0A\0\0\x02\x0A\0\0\x01", 20);
+    const uint16_t sum = raw::checksum(ip);
+    ip[10] = char(sum >> 8); ip[11] = char(sum);
+    const std::string frame = ethernet(stranger, mac_b, 0x0800, ip + raw::icmp(8, 1, 1, ""));
+    uint8_t seen[1514];
+    network::FrameInfo info;
+    while (other->receive(ByteView(seen), &info)) {}
+    CHECK(other->send(ConstByteView(reinterpret_cast<const uint8_t*>(frame.data()), frame.size())));
+    t.lan.step(40);
+    bool answered = false;
+    while (other->receive(ByteView(seen), &info)) answered = answered || (info.length >= 34 && seen[12] == 0x08 && seen[13] == 0x00 && seen[23] == 1);
+    CHECK(!answered && heard(fd, &text, &kind, 0x0800) && kind == 3);
+    const std::string mine = ethernet(mac_a, mac_b, 0x0800, ip + raw::icmp(8, 1, 2, ""));      // (the same to its own address: answered)
+    CHECK(other->send(ConstByteView(reinterpret_cast<const uint8_t*>(mine.data()), mine.size())));
+    t.lan.step(40);
+    while (other->receive(ByteView(seen), &info)) answered = answered || (info.length >= 34 && seen[12] == 0x08 && seen[13] == 0x00 && seen[23] == 1);
+    CHECK(answered);
+    while (heard(fd, &text, &kind)) {}
+    while (heard(second, &text, &kind)) {}
+  }
+  // asked for twice, it is dropped twice; dropping what was not added, and what cannot be asked
+  CHECK(t.s(54, fd, 263, 1, membership(2, 1), 16) == 0 && t.s(54, fd, 263, 2, membership(2, 1), 16) == 0 && t.lan.nic_a.promiscuous && t.s(54, fd, 263, 2, membership(2, 1), 16) == 0 &&
+        !t.lan.nic_a.promiscuous && t.s(54, fd, 263, 2, membership(2, 1), 16) == 0);      // (letting go of what it does not have is no error on Linux)
+  CHECK(t.s(54, fd, 263, 1, membership(9, 1), 16) == -19 && t.s(54, fd, 263, 1, membership(2, 7), 16) == 0 && !t.lan.nic_a.promiscuous && t.s(54, fd, 263, 2, membership(2, 7), 16) == 0 &&
+        t.s(54, fd, 263, 1, membership(2, 1), 8) == -22 &&
+        t.s(54, fd, 263, 1, membership(2, 0, std::string("\x01\0\x5E\0", 4)), 16) == -22 && t.s(54, fd, 263, 1, membership(2, 1, std::string(9, 'x')), 16) == -22);
+  CHECK(to_stranger("gone!") && !heard(fd, &text, &kind) && t.lan.nic_a.filtered == 2);
+  // two sockets ask: the interface stays promiscuous until the second lets go; a socket that closes lets go of what it asked for
+  CHECK(t.s(54, fd, 263, 1, membership(2, 1), 16) == 0 && t.s(54, second, 263, 1, membership(2, 1), 16) == 0 && t.s(54, fd, 263, 2, membership(2, 1), 16) == 0 && t.lan.nic_a.promiscuous);
+  CHECK(t.s(3, second) == 0 && !t.lan.nic_a.promiscuous);
+  // every multicast frame (PACKET_MR_ALLMULTI), and one group (PACKET_MR_MULTICAST, which the interfaces here answer the same way)
+  CHECK(t.s(54, fd, 263, 1, membership(2, 2), 16) == 0 && t.lan.a.all_multicast() && flags_of("eth0") == 0x1043 && t.s(54, fd, 263, 1, membership(2, 0, std::string("\x01\0\x5E\0\0\x09", 6)), 16) == 0 &&
+        t.s(54, fd, 263, 2, membership(2, 2), 16) == 0 && t.lan.a.all_multicast() && t.s(54, fd, 263, 2, membership(2, 0, std::string("\x01\0\x5E\0\0\x09", 6)), 16) == 0 &&
+        !t.lan.a.all_multicast());
+  // the loopback has no hardware to ask: a membership there is taken and changes nothing
+  CHECK(flags_of("lo") == 0x49 && t.s(54, fd, 263, 1, membership(1, 1), 16) == 0 && flags_of("lo") == 0x49 && t.s(54, fd, 263, 2, membership(1, 1), 16) == 0);
+  // SIOCSIFFLAGS: the flag itself, which stays whoever set it, until it is taken back; nothing else about an interface can be changed
+  CHECK(set_flags("eth0", 0x1143) == 0 && t.lan.nic_a.promiscuous && flags_of("eth0") == 0x1143 && to_stranger("flag!") && heard(fd, &text, &kind) && text == "flag!" && kind == 3);
+  // netlink shows the flag too
+  {
+    const int64_t nlfd = t.s(41, kNetlink, kRaw, 0);
+    const std::string request = nl::request(18, 1, 5, std::string("\0\0\0\0\x02\0\0\0\0\0\0\0\0\0\0\0", 16));
+    CHECK(t.s(44, nlfd, t.bytes(request), request.size(), 0, 0, 0) == int64_t(request.size()));
+    const int64_t n = t.s(45, nlfd, buffer, 2048, 0x40, 0, 0);
+    const std::vector<nl::Message> m = nl::messages(t.text(buffer, n > 0 ? uint64_t(n) : 0));
+    CHECK(m.size() == 1 && (nl::word_at(m[0].payload, 8) & 0x100) != 0 && t.s(3, nlfd) == 0);
+  }
+  CHECK(set_flags("eth0", 0x1042) == -1 && set_flags("eth0", 0x1143 | 0x8) == -1 && set_flags("nope", 0x1143) == -19 && t.lan.nic_a.promiscuous);
+  CHECK(t.s(54, fd, 263, 1, membership(2, 1), 16) == 0 && set_flags("eth0", 0x1043) == 0 && t.lan.nic_a.promiscuous && flags_of("eth0") == 0x1043);      // (the socket still asks; the flag is gone)
+  CHECK(t.s(54, fd, 263, 2, membership(2, 1), 16) == 0 && !t.lan.nic_a.promiscuous);
+  CHECK(set_flags("eth0", 0x1243) == 0 && flags_of("eth0") == 0x1243 && t.lan.a.all_multicast() && set_flags("eth0", 0x1043) == 0 && flags_of("eth0") == 0x1043 && !t.lan.a.all_multicast());
+  CHECK(set_flags("lo", 0x149) == 0 && flags_of("lo") == 0x149 && set_flags("lo", 0x49) == 0 && flags_of("lo") == 0x49 && set_flags("lo", 0x48) == -1);
+  // a socket closed with memberships of every kind leaves nothing behind
+  CHECK(t.s(54, fd, 263, 1, membership(2, 1), 16) == 0 && t.s(54, fd, 263, 1, membership(2, 2), 16) == 0 && t.s(54, fd, 263, 1, membership(1, 1), 16) == 0 && t.lan.nic_a.promiscuous);
+  const int64_t watcher = t.s(41, kPacket, kRaw, 0);
+  CHECK(t.s(3, fd) == 0);
+  // (the descriptor the flags are asked through was that socket's: another one now)
+  memset(&t.memory.bytes[ifreq - kBase], 0, 40);
+  t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>("eth0"), 4));
+  CHECK(!t.lan.nic_a.promiscuous && !t.lan.a.promiscuous() && !t.lan.a.all_multicast() && t.s(16, watcher, 0x8913, ifreq) == 0 && (t.u32(ifreq + 16) & 0xFFFF) == 0x1043);
+  memset(&t.memory.bytes[ifreq - kBase], 0, 40);
+  t.memory.write(ifreq, ConstByteView(reinterpret_cast<const uint8_t*>("lo"), 2));
+  CHECK(t.s(16, watcher, 0x8913, ifreq) == 0 && (t.u32(ifreq + 16) & 0xFFFF) == 0x49 && t.s(3, watcher) == 0);
+}
+
 int main() {
   test_tcp_client();
   test_half_close();
@@ -2331,6 +2463,7 @@ int main() {
   test_packet_ring_formats();
   test_packet_ring_sockets();
   test_packet_fanout();
+  test_packet_promiscuous();
   if (g_failed) { printf("LinuxInetSocketTest: %d check(s) failed\n", g_failed); return 1; }
   printf("LinuxInetSocketTest: all passed\n");
   return 0;

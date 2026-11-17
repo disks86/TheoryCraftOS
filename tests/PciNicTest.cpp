@@ -477,6 +477,11 @@ static void test_rtl_chip(uint16_t device_id, uint32_t xid, bool is_8125) {
     CHECK((m->r32(0x44) & 0x04) && m->r32(0x08) == 0xFFFFFFFFu && m->r32(0x0C) == 0xFFFFFFFFu);
     CHECK(!nic.accept_all_multicast(false));
     CHECK(!(m->r32(0x44) & 0x04) && m->r32(0x08) == 0 && m->r32(0x0C) == 0);
+    // promiscuous mode: every physical address accepted, and with it all multicast; back to the machine's own address and broadcasts afterwards,
+    // unless multicast was asked for on its own
+    CHECK(nic.accept_all_frames(true) && (m->r32(0x44) & 0x0F) == 0x0F && m->r32(0x08) == 0xFFFFFFFFu);
+    CHECK(nic.accept_all_multicast(true) && !nic.accept_all_frames(false) && (m->r32(0x44) & 0x0F) == 0x0E && m->r32(0x08) == 0xFFFFFFFFu);
+    CHECK(!nic.accept_all_multicast(false) && (m->r32(0x44) & 0x0F) == 0x0A && m->r32(0x08) == 0);
 
     nic.shutdown();
     CHECK(m->releases == 1 && m->resets >= 2);
@@ -1008,6 +1013,10 @@ static void exercise_intel(Nic& nic, Model* m) {
 
   CHECK(nic.accept_all_multicast(true) && (m->r32(kRctl) & (1u << 4)));
   CHECK(!nic.accept_all_multicast(false) && !(m->r32(kRctl) & (1u << 4)));
+  // promiscuous mode: the unicast and multicast promiscuous bits together; the multicast one stays if multicast was asked for on its own
+  CHECK(nic.accept_all_frames(true) && (m->r32(kRctl) & (3u << 3)) == (3u << 3));
+  CHECK(nic.accept_all_multicast(true) && !nic.accept_all_frames(false) && (m->r32(kRctl) & (3u << 3)) == (1u << 4));
+  CHECK(!nic.accept_all_multicast(false) && (m->r32(kRctl) & (3u << 3)) == 0);
   CHECK((m->r32(kRctl) & ((1u << 1) | (1u << 15) | (1u << 26))) == ((1u << 1) | (1u << 15) | (1u << 26)));  // on, broadcast, CRC stripped
 
   m->w32(kStatus, 0x2 | 0x1 | (2u << 6));

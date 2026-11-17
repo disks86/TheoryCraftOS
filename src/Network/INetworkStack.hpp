@@ -81,6 +81,9 @@ class INetworkStack {
   // give, or the identifier is taken.
   // A tap on this stack's network interface (see FrameTap.hpp). Null if it has none to give.
   virtual SharedPointer<IFrameTap> frame_open() { return SharedPointer<IFrameTap>(); }
+  // Is the interface in promiscuous mode (some tap asked for every frame), or asked for every multicast frame by a tap?
+  virtual bool promiscuous() const { return false; }
+  virtual bool all_multicast() const { return false; }
   virtual SharedPointer<IRawSocket> raw_open(bool v6, uint8_t protocol, RawKind kind, uint16_t identifier) {
     (void)v6;
     (void)protocol;

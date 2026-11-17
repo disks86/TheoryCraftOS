@@ -79,8 +79,20 @@ bool FrameTap::send_looped(ConstByteView frame) {
   return link_.loop_ip_packet(packet);
 }
 
+void FrameTap::set_promiscuous(bool on) {
+  if (closed() && on) return;
+  if (__atomic_exchange_n(&promiscuous_, on, __ATOMIC_ACQ_REL) != on) link_.want_all_frames(on);
+}
+
+void FrameTap::set_all_multicast(bool on) {
+  if (closed() && on) return;
+  if (__atomic_exchange_n(&all_multicast_, on, __ATOMIC_ACQ_REL) != on) link_.want_all_multicast(on);
+}
+
 void FrameTap::close() {
   __atomic_store_n(&closed_, true, __ATOMIC_RELEASE);
+  set_promiscuous(false);      // (what it asked of the interface ends with it)
+  set_all_multicast(false);
   kernel::ScopedMutex guard(queue_lock_);
   queue_.clear();
 }

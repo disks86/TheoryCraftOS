@@ -30,7 +30,7 @@ constexpr uint32_t kRegImr0 = 0x000, kRegTxProd = 0x600, kRegRxProd = 0x800, kRe
 
 constexpr uint32_t kCmdActivate = 0xCAFE0000, kCmdReset = 0xCAFE0002, kCmdUpdateRxMode = 0xCAFE0003, kCmdGetLink = 0xF00D0002,
                    kCmdGetPermMacLo = 0xF00D0003, kCmdGetPermMacHi = 0xF00D0004;
-constexpr uint32_t kRxModeUnicast = 1, kRxModeBroadcast = 4, kRxModeAllMulticast = 8;
+constexpr uint32_t kRxModeUnicast = 1, kRxModeBroadcast = 4, kRxModeAllMulticast = 8, kRxModePromiscuous = 0x10;
 constexpr uint32_t kSharedMagic = 0xBABEFEE1;
 
 // Layout of the driver-shared block and the queue descriptors (byte offsets; the structures are packed).
@@ -267,6 +267,14 @@ bool Vmxnet3NetworkInterface::receive(ByteView buffer, uint32_t* length) {
     reg_write(pt_, kRegRxProd, rx_.next);
     if (delivered) return true;
   }
+}
+
+bool Vmxnet3NetworkInterface::accept_all_frames(bool enable) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_) return false;
+  wr32(shared_ + kRxMode, kRxModeUnicast | kRxModeBroadcast | kRxModeAllMulticast | (enable ? kRxModePromiscuous : 0));
+  command(kCmdUpdateRxMode);
+  return enable;
 }
 
 }  // namespace hardware

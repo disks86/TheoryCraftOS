@@ -257,7 +257,9 @@ void put_link(Builder& b, const Interface& on, uint16_t type, uint16_t flags, ui
   b.u8(0); b.u8(0);
   b.u16(on.loopback ? 772 : 1);      // ARPHRD_LOOPBACK, ARPHRD_ETHER
   b.u32(on.index);
-  b.u32(on.loopback ? (kUp | kLoopback | kRunning | kLowerUp) : (kUp | kBroadcast | kRunning | kMulticast | kLowerUp));
+  constexpr uint32_t kPromiscuous = 0x100, kAllMulticast = 0x200;
+  b.u32((on.loopback ? (kUp | kLoopback | kRunning | kLowerUp) : (kUp | kBroadcast | kRunning | kMulticast | kLowerUp)) | (on.promiscuous ? kPromiscuous : 0) |
+        (on.all_multicast ? kAllMulticast : 0));
   b.u32(0);
   b.attribute_text(3, StringView(on.name, on.name_size));      // IFLA_IFNAME
   b.attribute_u32(13, on.loopback ? 1000 : 1000);               // IFLA_TXQLEN

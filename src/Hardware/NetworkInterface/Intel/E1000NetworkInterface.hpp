@@ -58,6 +58,7 @@ class E1000NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
@@ -99,6 +100,8 @@ class E1000NetworkInterface final : public INetworkInterface {
   bool owns_device_ = false;
   bool started_ = false;
   uint32_t receive_control_ = 0;
+  void write_receive_filter();
+  bool all_multicast_ = false, all_frames_ = false;      // what was asked for: the two promiscuous bits of receive_control_ follow from both
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;
 };

@@ -156,6 +156,23 @@ bool chosen(LinuxIpcManager& ipc, const Socket& socket, uint64_t link, const Fra
   return group.members[pick % group.count] == link;
 }
 
+// What the socket's memberships ask of its interfaces: promiscuous mode (PACKET_MR_PROMISC) and every multicast frame (PACKET_MR_ALLMULTI, and
+// PACKET_MR_MULTICAST, which names one group: the interfaces here hand up all multicast or none). Each tap is told what holds now. The loopback has no
+// hardware to ask, and a membership there changes nothing that can be seen (an interface's flags show only what was set as a flag).
+void apply_memberships(Socket& socket) {
+  bool promiscuous[LinuxIpcManager::kPacketTaps] = {}, multicast[LinuxIpcManager::kPacketTaps] = {};
+  for (const Socket::Membership& m : socket.memberships) {
+    if (m.count == 0 || m.interface < 2 || m.interface - 2 >= LinuxIpcManager::kPacketTaps) continue;
+    promiscuous[m.interface - 2] = promiscuous[m.interface - 2] || m.type == 1;
+    multicast[m.interface - 2] = multicast[m.interface - 2] || m.type == 0 || m.type == 2;
+  }
+  for (uint32_t i = 0; i < LinuxIpcManager::kPacketTaps; ++i) {
+    if (!socket.taps[i]) continue;
+    socket.taps[i]->set_promiscuous(promiscuous[i]);
+    socket.taps[i]->set_all_multicast(multicast[i]);
+  }
+}
+
 // Takes a socket out of its group; the last one out ends the group.
 void leave_fanout(LinuxIpcManager& ipc, Socket& socket, uint64_t link) {
   if (socket.fanout < 0 || uint32_t(socket.fanout) >= LinuxIpcManager::kPacketFanouts) return;
@@ -175,6 +192,7 @@ void socket_gone(uint64_t link, uint32_t) {
   Socket* socket = socket_of(*ipc, link);
   if (!socket) return;
   leave_fanout(*ipc, *socket, link);
+  // (its memberships end with it: each tap lets go of what it asked of its interface when it is closed, below)
   for (SharedPointer<network::IFrameTap>& tap : socket->taps)
     if (tap) tap->close();
   const uint16_t sequence = uint16_t((socket->sequence + 1) % 0x7FFF);
@@ -770,9 +788,40 @@ uint64_t packet_setsockopt(Process& p, uint64_t link, uint64_t level, uint64_t n
   }
   if (level != kSolPacket) return error(kEnoprotoopt);
   switch (name) {
-    // PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP (struct packet_mreq: promiscuous mode, multicast addresses): the interface hands up what it
-    // hands up either way
-    case kAddMembership: case kDropMembership: return length < 16 ? error(kEinval) : 0;
+    case kAddMembership: case kDropMembership: {
+      // struct packet_mreq: mr_ifindex (4), mr_type (2), mr_alen (2), mr_address (8). Promiscuous mode (PACKET_MR_PROMISC), every multicast frame
+      // (PACKET_MR_ALLMULTI), one multicast group or one more unicast address (PACKET_MR_MULTICAST, PACKET_MR_UNICAST), on one interface. The same
+      // thing asked for twice is counted twice. As on Linux, a kind nobody knows is kept and changes nothing, and so does dropping what was not added.
+      if (length < 16) return error(kEinval);
+      ByteReader request{ConstByteView(raw)};
+      const uint32_t interface = request.le32();
+      const uint16_t type = request.le16(), address_size = request.le16();
+      if (address_size > 8) return error(kEinval);
+      const ConstByteView address = ConstByteView(raw).subview(8, address_size);
+      Socket::Membership* found = nullptr;
+      Socket::Membership* free = nullptr;
+      for (Socket::Membership& m : socket->memberships) {
+        if (m.count == 0) { if (!free) free = &m; continue; }
+        if (m.interface == interface && m.type == type && m.address_size == address_size && ConstByteView(m.address).first(address_size).equals(address)) found = &m;
+      }
+      if (name == kDropMembership) {
+        if (!found) return 0;
+        if (--found->count == 0) *found = Socket::Membership();
+      } else if (found) {
+        ++found->count;
+      } else {
+        if (!known_interface(interface)) return error(kEnodev);
+        if ((type == 0 || type == 3) && address_size != 6) return error(kEinval);      // (an Ethernet address is six bytes)
+        if (!free) return error(kEnobufs);
+        free->count = 1;
+        free->interface = interface;
+        free->type = type;
+        free->address_size = uint8_t(address_size);
+        ByteView(free->address).first(address_size).copy_from(address);
+      }
+      apply_memberships(*socket);
+      return 0;
+    }
     case kAuxData: if (length < 4) return error(kEinval); socket->aux_data = number != 0; return 0;
     case kIgnoreOutgoing: if (length < 4) return error(kEinval); socket->ignore_outgoing = number != 0; listen(*socket); return 0;
     case kLoss: if (length < 4) return error(kEinval); socket->skip_wrong = number != 0; return 0;
@@ -1002,6 +1051,32 @@ bool packet_ready_locked(uint64_t link, uint64_t realtime_ns, uint64_t monotonic
   if (!socket->receive_block) return fetch_locked(*ipc, *socket);
   pump_locked(*ipc, *socket, realtime_ns, monotonic_ns);
   return socket->receiver.readable(receive_ring(*socket));
+}
+
+bool packet_set_interface_flags(uint32_t interface, bool promiscuous, bool all_multicast) {
+  LinuxIpcManager* ipc = system_linux_ipc();
+  if (!ipc || !known_interface(interface) || interface == 0 || interface > netlink::kMostInterfaces) return false;
+  Locked locked(ipc->sync());
+  const uint32_t place = interface - 1;
+  if (interface != 1) {      // a network interface: a tap that listens to nothing holds the wish (the loopback only keeps the flag)
+    SharedPointer<network::IFrameTap>& tap = ipc->flag_taps[interface - 2];
+    if (!tap && (promiscuous || all_multicast)) {
+      SocketManager* sockets = system_sockets();
+      if (sockets) tap = sockets->open_frame_tap(interface - 2);
+      if (!tap) return false;
+    }
+    if (tap) {
+      tap->set_promiscuous(promiscuous);
+      tap->set_all_multicast(all_multicast);
+      if (!promiscuous && !all_multicast) {
+        tap->close();
+        tap = SharedPointer<network::IFrameTap>();
+      }
+    }
+  }
+  __atomic_store_n(&ipc->flag_promiscuous[place], promiscuous, __ATOMIC_RELEASE);
+  __atomic_store_n(&ipc->flag_all_multicast[place], all_multicast, __ATOMIC_RELEASE);
+  return true;
 }
 
 uint32_t packet_rings(uint64_t link, BlockRef blocks[2], uint64_t sizes[2]) {

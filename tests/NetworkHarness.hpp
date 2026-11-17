@@ -121,9 +121,15 @@ struct FakeNic final : hardware::INetworkInterface {
     deliver(f);
     if (wire->duplicate_percent && wire->rnd() % 100 < (uint32_t)wire->duplicate_percent) deliver(f);
     ++stats.frames_sent; return true; }
+  // Address filtering, as hardware does it (`filters`, off unless a test wants it): a frame for another machine's address is dropped before the stack
+  // sees it, unless the interface was put into promiscuous mode. `filtered` counts the drops.
+  bool filters = false, promiscuous = false; uint64_t filtered = 0;
+  bool accept_all_frames(bool enable) override { promiscuous = enable; return enable; }
   bool receive(ByteView buffer_view, uint32_t* length) override {
     uint8_t* buffer = buffer_view.data(); const uint32_t capacity = (uint32_t)buffer_view.size();
     const auto ready = [&] { return !inbox.empty() && (due.empty() || due.front() <= wire->clock->now_us()); };
+    while (filters && !promiscuous && ready() && inbox.front().size() >= 6 && !(inbox.front()[0] & 1) && memcmp(inbox.front().data(), mac.bytes, 6) != 0) {
+      inbox.pop_front(); if (!due.empty()) due.pop_front(); ++filtered; }
     if (!ready() && on_idle) on_idle();
     if (!ready()) return false; auto& f = inbox.front(); uint32_t n = f.size() < capacity ? f.size() : capacity;
     if (n) memcpy(buffer, f.data(), n); *length = f.size(); inbox.pop_front(); if (!due.empty()) due.pop_front(); ++stats.frames_received; return true; }

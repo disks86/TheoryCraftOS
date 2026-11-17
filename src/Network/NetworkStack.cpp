@@ -130,6 +130,29 @@ bool NetworkStack::send_link_frame(ConstByteView frame, const void* origin) {
   return transmit_now(EgressQueue::Kind::Plain, frame, hardware::TransmitChecksum{}, 0);
 }
 
+void NetworkStack::want_all_frames(bool wanted) {
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  if (wanted) {
+    if (all_frames_users_ == 0) nic_.accept_all_frames(true);      // (an interface that cannot goes on as before: nothing more arrives)
+    __atomic_store_n(&all_frames_users_, all_frames_users_ + 1, __ATOMIC_RELEASE);
+  } else if (all_frames_users_ != 0) {
+    __atomic_store_n(&all_frames_users_, all_frames_users_ - 1, __ATOMIC_RELEASE);
+    if (all_frames_users_ == 0) nic_.accept_all_frames(false);
+  }
+}
+
+void NetworkStack::want_all_multicast(bool wanted) {
+  kernel::ScopedRecursiveMutex guard(ip_lock_);
+  if (wanted) {
+    if (all_multicast_users_ == 0) nic_.accept_all_multicast(true);
+    __atomic_store_n(&all_multicast_users_, all_multicast_users_ + 1, __ATOMIC_RELEASE);
+  } else if (all_multicast_users_ != 0) {
+    __atomic_store_n(&all_multicast_users_, all_multicast_users_ - 1, __ATOMIC_RELEASE);
+    // (the stack's own groups and IPv6's neighbour discovery need multicast frames too)
+    if (all_multicast_users_ == 0 && group_count_ == 0 && !ipv6_started_) nic_.accept_all_multicast(false);
+  }
+}
+
 bool NetworkStack::loop_ip_packet(ConstByteView packet) {
   kernel::ScopedRecursiveMutex guard(ip_lock_);
   if (packet.empty() || packet.size() > kMtu || looped_.count() >= kMaxLooped) return false;
@@ -373,7 +396,7 @@ void NetworkStack::leave_multicast(Ipv4Address group) {
   for (uint32_t i = 0; i < group_count_; ++i) {
     if (!(groups_[i] == group)) continue;
     groups_[i] = groups_[--group_count_];
-    if (group_count_ == 0) nic_.accept_all_multicast(false);
+    if (group_count_ == 0 && all_multicast_users_ == 0) nic_.accept_all_multicast(false);
     return;
   }
 }

@@ -40,6 +40,7 @@ class UefiSimpleNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:
@@ -47,6 +48,8 @@ class UefiSimpleNetworkInterface final : public INetworkInterface {
   efi::SystemTable* st_;
   MacAddress mac_{};
   bool started_ = false;
+  bool all_multicast_ = false, all_frames_ = false;      // what was asked for
+  bool set_receive_filters();
   bool we_initialized_ = false;
   // The firmware keeps a pointer to the frame being sent until GetStatus returns
   // it, so frames are staged here, one at a time.

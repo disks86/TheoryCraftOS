@@ -311,6 +311,9 @@ static void test_ecm() {
 
   CHECK(nic->accept_all_multicast(true) && host.packet_filter == 0x0E);
   CHECK(!nic->accept_all_multicast(false) && host.packet_filter == 0x0C);
+  // promiscuous mode: the packet filter's first bit, and all multicast with it
+  CHECK(nic->accept_all_frames(true) && host.packet_filter == 0x0F && nic->accept_all_multicast(true) && !nic->accept_all_frames(false) && host.packet_filter == 0x0E &&
+        !nic->accept_all_multicast(false) && host.packet_filter == 0x0C);
 
   // Unplugged: nothing works any more.
   host.generation++;
@@ -511,6 +514,7 @@ static void test_ax88179() {
 
   CHECK(nic->accept_all_multicast(true) && host.mac_registers[0x0B] == (Bytes{0xAA, 0x03}));
   CHECK(!nic->accept_all_multicast(false) && host.mac_registers[0x0B] == (Bytes{0xA8, 0x03}));
+  CHECK(nic->accept_all_frames(true) && host.mac_registers[0x0B] == (Bytes{0xA9, 0x03}) && !nic->accept_all_frames(false) && host.mac_registers[0x0B] == (Bytes{0xA8, 0x03}));      // the promiscuous bit
   nic->shutdown();
   CHECK(host.mac_registers[0x0B] == (Bytes{0, 0}));
 

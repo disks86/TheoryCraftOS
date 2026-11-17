@@ -197,6 +197,17 @@ class LinuxIpcManager {
     linuxabi::ring::Receiver receiver;
     linuxabi::ring::Transmitter transmitter;
     int32_t fanout = -1;                  // the fan-out group it joined (an index into packet_fanouts), or none
+    // PACKET_ADD_MEMBERSHIP: what the socket asked its interfaces to hand up beyond their own traffic. Each is counted (added twice, it is dropped
+    // twice) and ends with the socket.
+    static constexpr uint32_t kMemberships = 8;
+    struct Membership {
+      uint32_t count = 0;                 // (0: a free place)
+      uint32_t interface = 0;
+      uint16_t type = 0;                  // PACKET_MR_MULTICAST 0, PACKET_MR_PROMISC 1, PACKET_MR_ALLMULTI 2, PACKET_MR_UNICAST 3 (others: kept, no effect)
+      uint8_t address_size = 0;
+      uint8_t address[8] = {};
+    };
+    Membership memberships[kMemberships];
   };
   PacketSocket packet_sockets[kPacketSockets];
   // PACKET_FANOUT: sockets that share the frames of one protocol and interface, each frame going to one of them.
@@ -221,6 +232,11 @@ class LinuxIpcManager {
     uint32_t ranked_count = 0, next_rank = 0;
   };
   PacketFanout packet_fanouts[kPacketFanouts];
+  // Promiscuous mode and all-multicast as flags of an interface (IFF_PROMISC, IFF_ALLMULTI set with SIOCSIFFLAGS: they stay until taken back, whoever
+  // set them), by the interface's place in the list (0: the loopback, which has no hardware to ask and only keeps the flag): a tap of their own holds
+  // the wish for a network interface. These, and not what sockets ask for with memberships, are what an interface's flags show, as on Linux.
+  bool flag_promiscuous[linuxabi::netlink::kMostInterfaces] = {}, flag_all_multicast[linuxabi::netlink::kMostInterfaces] = {};
+  SharedPointer<network::IFrameTap> flag_taps[kPacketTaps];
 
   Segment segments[kSegments];
   SemaphoreSet sets[kSemSets];

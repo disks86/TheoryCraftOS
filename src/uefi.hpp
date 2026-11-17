@@ -311,7 +311,7 @@ struct SimpleNetworkMode {
   uint8_t media_present;
 };
 
-constexpr uint32_t kReceiveFilterUnicast = 0x01, kReceiveFilterMulticast = 0x02, kReceiveFilterBroadcast = 0x04, kReceiveFilterPromiscuousMulticast = 0x10;
+constexpr uint32_t kReceiveFilterUnicast = 0x01, kReceiveFilterMulticast = 0x02, kReceiveFilterBroadcast = 0x04, kReceiveFilterPromiscuous = 0x08, kReceiveFilterPromiscuousMulticast = 0x10;
 
 struct SimpleNetwork {
   uint64_t revision;

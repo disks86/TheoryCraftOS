@@ -97,15 +97,29 @@ bool UefiSimpleNetworkInterface::receive(ByteView buffer, uint32_t* length) {
   return true;
 }
 
-bool UefiSimpleNetworkInterface::accept_all_multicast(bool enable) {
-  if (!started_) return false;
+// The firmware driver's receive filters as asked, of the ones it offers. False if what was asked for is not among them.
+bool UefiSimpleNetworkInterface::set_receive_filters() {
   efi::SimpleNetworkMode* mode = snp_->mode;
   uint32_t wanted = efi::kReceiveFilterUnicast | efi::kReceiveFilterBroadcast;
-  if (enable) wanted |= efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast;
+  if (all_multicast_ || all_frames_) wanted |= efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast;
+  if (all_frames_) wanted |= efi::kReceiveFilterPromiscuous;
   wanted &= mode->receive_filter_mask;
-  if (enable && !(wanted & (efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast))) return false;
   snp_->receive_filters(snp_, wanted, mode->receive_filter_mask & ~wanted, 0, 0, nullptr);
-  return enable;
+  if (all_frames_ && !(wanted & efi::kReceiveFilterPromiscuous)) return false;
+  if (all_multicast_ && !(wanted & (efi::kReceiveFilterPromiscuousMulticast | efi::kReceiveFilterMulticast | efi::kReceiveFilterPromiscuous))) return false;
+  return true;
+}
+
+bool UefiSimpleNetworkInterface::accept_all_multicast(bool enable) {
+  if (!started_) return false;
+  all_multicast_ = enable;
+  return set_receive_filters() && enable;
+}
+
+bool UefiSimpleNetworkInterface::accept_all_frames(bool enable) {
+  if (!started_) return false;
+  all_frames_ = enable;
+  return set_receive_filters() && enable;
 }
 
 }  // namespace hardware

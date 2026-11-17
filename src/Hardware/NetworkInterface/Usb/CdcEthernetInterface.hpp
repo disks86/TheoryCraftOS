@@ -49,6 +49,7 @@ class CdcEthernetInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override {
     NetworkStatistics s = stats_;
     s.frames_dropped += assembler_.overflows();
@@ -61,6 +62,7 @@ class CdcEthernetInterface final : public INetworkInterface {
 
  private:
   bool set_packet_filter(bool all_multicast);
+  bool all_multicast_ = false, all_frames_ = false;      // what was asked for
   bool setup_ncm();
   void poll_notifications() const;
   void release();

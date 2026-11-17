@@ -25,7 +25,7 @@ namespace {
 constexpr uint8_t kStandardInterfaceOut = 0x01, kClassInterfaceOut = 0x21, kClassInterfaceIn = 0xA1, kStandardEndpointOut = 0x02;
 constexpr uint8_t kRequestSetInterface = 0x0B, kRequestClearFeature = 0x01, kRequestGetDescriptor = 0x06;
 constexpr uint8_t kSetEthernetPacketFilter = 0x43, kGetNtbParameters = 0x80, kSetNtbFormat = 0x84, kSetNtbInputSize = 0x86;
-constexpr uint16_t kFilterAllMulticast = 1u << 1, kFilterDirected = 1u << 2, kFilterBroadcast = 1u << 3;
+constexpr uint16_t kFilterPromiscuous = 1u << 0, kFilterAllMulticast = 1u << 1, kFilterDirected = 1u << 2, kFilterBroadcast = 1u << 3;
 // Notifications on the interrupt endpoint: an 8-byte header (bmRequestType 0xA1, bNotification, wValue, wIndex, wLength), then the data.
 constexpr uint8_t kNotificationNetworkConnection = 0x00, kNotificationSpeedChange = 0x2A;
 constexpr uint32_t kNotificationHeader = 8;
@@ -89,7 +89,8 @@ bool CdcEthernetInterface::setup_ncm() {
 }
 
 bool CdcEthernetInterface::set_packet_filter(bool all_multicast) {
-  const uint16_t filter = kFilterDirected | kFilterBroadcast | (all_multicast ? kFilterAllMulticast : 0);
+  all_multicast_ = all_multicast;
+  const uint16_t filter = kFilterDirected | kFilterBroadcast | (all_multicast_ || all_frames_ ? kFilterAllMulticast : 0) | (all_frames_ ? kFilterPromiscuous : 0);
   return host_.control_out(port_, kClassInterfaceOut, kSetEthernetPacketFilter, filter, function_.control_interface);
 }
 
@@ -154,6 +155,14 @@ uint32_t CdcEthernetInterface::link_speed_mbps() const { return link_up() ? spee
 bool CdcEthernetInterface::accept_all_multicast(bool enable) {
   if (!started_ || !present()) return false;
   return set_packet_filter(enable) && enable;
+}
+
+bool CdcEthernetInterface::accept_all_frames(bool enable) {
+  if (!started_ || !present()) return false;
+  all_frames_ = enable;
+  if (set_packet_filter(all_multicast_)) return enable;
+  all_frames_ = false;      // (the request is optional for a device: one that refuses it filters as it likes)
+  return false;
 }
 
 bool CdcEthernetInterface::transmit(ConstByteView frame) {

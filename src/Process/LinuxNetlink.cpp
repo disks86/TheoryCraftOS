@@ -18,6 +18,7 @@
 #include "Process/LinuxNetlink.hpp"
 
 #include "Process/LinuxIpc.hpp"
+#include "Process/LinuxPacket.hpp"
 #include "Process/LinuxSockets.hpp"
 #include "Process/Process.hpp"
 #include "Process/Sockets.hpp"
@@ -287,6 +288,13 @@ void network_snapshot(netlink::Snapshot* out) {
   lo.name_size = 2;
   lo.loopback = true;
   lo.mtu = 65536;
+  // IFF_PROMISC and IFF_ALLMULTI are shown as they were set as flags (SIOCSIFFLAGS), not as packet sockets' memberships have the interface: Linux
+  // shows them so too. (Read without the lock: two flags, each written in one piece.)
+  const LinuxIpcManager* ipc = existing_linux_ipc();
+  if (ipc) {
+    lo.promiscuous = __atomic_load_n(&ipc->flag_promiscuous[0], __ATOMIC_ACQUIRE);
+    lo.all_multicast = __atomic_load_n(&ipc->flag_all_multicast[0], __ATOMIC_ACQUIRE);
+  }
   SocketManager* sockets = system_sockets();
   if (!sockets) return;
   network::IpConfiguration c;
@@ -300,6 +308,10 @@ void network_snapshot(netlink::Snapshot* out) {
     on.name_size = 4;
     hardware::MacAddress mac{};
     if (sockets->interface_mac(i, &mac)) ByteView(on.mac).copy_from(ConstByteView(mac.bytes));
+    if (ipc && 1 + i < netlink::kMostInterfaces) {
+      on.promiscuous = __atomic_load_n(&ipc->flag_promiscuous[1 + i], __ATOMIC_ACQUIRE);
+      on.all_multicast = __atomic_load_n(&ipc->flag_all_multicast[1 + i], __ATOMIC_ACQUIRE);
+    }
     if (c.configured()) {
       on.has4 = true;
       ByteView(on.address4).copy_from(ConstByteView(c.address.octets));
@@ -332,7 +344,7 @@ void network_snapshot(netlink::Snapshot* out) {
 // The interface ioctls of a socket (SIOCGIF*), the older way to ask what netlink tells: struct ifreq is the interface's name (16 bytes) and 24 bytes
 // for what is asked. if_nametoindex() and if_indextoname() are these.
 bool interface_ioctl(Process& p, uint64_t request, uint64_t argument, uint64_t* result) {
-  constexpr uint64_t kGetName = 0x8910, kGetConf = 0x8912, kGetFlags = 0x8913, kGetAddr = 0x8915, kGetDstAddr = 0x8917, kGetBrdAddr = 0x8919, kGetNetmask = 0x891B,
+  constexpr uint64_t kGetName = 0x8910, kGetConf = 0x8912, kGetFlags = 0x8913, kSetFlags = 0x8914, kGetAddr = 0x8915, kGetDstAddr = 0x8917, kGetBrdAddr = 0x8919, kGetNetmask = 0x891B,
                      kGetMetric = 0x891D, kGetMtu = 0x8921, kGetHwAddr = 0x8927, kGetIndex = 0x8933, kGetTxQueueLen = 0x8942;
   constexpr uint64_t kRequestSize = 40;
   constexpr int64_t kEperm = 1, kEnodev = 19, kEaddrnotavail = 99;
@@ -367,7 +379,7 @@ bool interface_ioctl(Process& p, uint64_t request, uint64_t argument, uint64_t* 
     *result = p.write_user_u32(argument, used) ? 0 : error(kEfault);
     return true;
   }
-  const bool known = request == kGetName || request == kGetFlags || request == kGetAddr || request == kGetDstAddr || request == kGetBrdAddr || request == kGetNetmask ||
+  const bool known = request == kGetName || request == kGetFlags || request == kSetFlags || request == kGetAddr || request == kGetDstAddr || request == kGetBrdAddr || request == kGetNetmask ||
                      request == kGetMetric || request == kGetMtu || request == kGetHwAddr || request == kGetIndex || request == kGetTxQueueLen;
   if (!known) {      // (setting any of it, and what else there is in this range: not a Linux program's to do here)
     *result = error(kEperm);
@@ -403,6 +415,8 @@ bool interface_ioctl(Process& p, uint64_t request, uint64_t argument, uint64_t* 
     broadcast[bit / 8] = uint8_t(bit < on->prefix4 ? (broadcast[bit / 8] | (on->address4[bit / 8] & at)) : (broadcast[bit / 8] | at));
   }
   const bool has4 = on->loopback || on->has4;
+  // IFF_UP | IFF_LOOPBACK | IFF_RUNNING, or IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST; with IFF_PROMISC and IFF_ALLMULTI as they are
+  const uint16_t flags = uint16_t((on->loopback ? 0x49 : 0x1043) | (on->promiscuous ? 0x100 : 0) | (on->all_multicast ? 0x200 : 0));
   if (request == kGetName) {
     w.bytes(ConstByteView(reinterpret_cast<const uint8_t*>(on->name), on->name_size));
     w.zeros(16 - on->name_size);
@@ -410,7 +424,16 @@ bool interface_ioctl(Process& p, uint64_t request, uint64_t argument, uint64_t* 
     (void)w.reserve(16);      // (the name stays as it was handed in)
     switch (request) {
       case kGetIndex: w.le32(on->index); break;
-      case kGetFlags: w.le16(on->loopback ? 0x49 : 0x1043); break;      // IFF_UP | IFF_LOOPBACK | IFF_RUNNING; IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST
+      case kGetFlags: w.le16(flags); break;
+      case kSetFlags: {
+        // SIOCSIFFLAGS: only promiscuous mode and all-multicast can be switched (what `ip link set ... promisc on` and older capture programs do);
+        // anything else an interface's flags say is not a Linux program's to change here.
+        ByteReader asked{ConstByteView(raw).subview(16, 2)};
+        const uint16_t wanted = asked.le16();
+        if (((wanted ^ flags) & ~uint16_t{0x300}) != 0) { *result = error(kEperm); return true; }
+        *result = packet_set_interface_flags(on->index, (wanted & 0x100) != 0, (wanted & 0x200) != 0) ? 0 : error(kEnodev);
+        return true;
+      }
       case kGetMtu: w.le32(on->mtu); break;
       case kGetMetric: w.le32(0); break;
       case kGetTxQueueLen: w.le32(1000); break;

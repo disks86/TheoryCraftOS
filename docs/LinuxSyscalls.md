@@ -221,8 +221,17 @@ sends to itself; a socket (`LinuxPacket.cpp`) holds one on each interface and te
   frame), which says how much of a frame the socket gets, or that it gets none; `poll` only reports frames that passed it.
   `SO_DETACH_FILTER` and `SO_LOCK_FILTER` too. A filter sees the protocol, the packet type and the interface as ancillary loads.
 - `MSG_PEEK`, `MSG_TRUNC`, `FIONREAD`, `PACKET_AUXDATA` (a control message with the frame's real and kept lengths),
-  `PACKET_STATISTICS`, the buffer sizes and `SO_RCVTIMEO`. `PACKET_ADD_MEMBERSHIP` (promiscuous mode, multicast addresses) is taken
-  and changes nothing.
+  `PACKET_STATISTICS`, the buffer sizes and `SO_RCVTIMEO`.
+- Promiscuous mode: `PACKET_ADD_MEMBERSHIP` with `PACKET_MR_PROMISC` asks the interface to hand up every frame, whoever it is for;
+  `PACKET_MR_ALLMULTI` and `PACKET_MR_MULTICAST` every multicast frame (one group is not told from all of them). A membership is
+  counted (added twice, it is dropped twice) and ends with its socket; the interface is asked when the first one comes and told to
+  stop when the last one goes. What then arrives is shown to every packet socket on the interface, as `PACKET_OTHERHOST` or
+  `PACKET_MULTICAST`; the network stack itself goes on ignoring what is not for the machine. `SIOCSIFFLAGS` sets `IFF_PROMISC` and
+  `IFF_ALLMULTI` as flags, which stay until they are taken back (nothing else about an interface can be changed that way). As on
+  Linux, an interface's flags (`SIOCGIFFLAGS`, netlink) show only what was set as a flag, not what memberships ask for; dropping a
+  membership that is not there, and one of a kind nobody knows, are no errors. Drivers that can be told: e1000, e1000e, igb/igc,
+  RTL8139, RTL8169/8125, vmxnet3, the firmware's own (UEFI), USB CDC (ECM, NCM) and AX88179; virtio hands up everything it is given
+  anyway. PCnet, Thunderbolt networking and Wi-Fi cannot, and go on filtering.
 - Memory-mapped rings (`LinuxPacketRing.cpp`), in the three layouts `PACKET_VERSION` chooses: `PACKET_RX_RING` and `PACKET_TX_RING`
   make them, and `mmap` of the socket maps them (the receive ring first, then the transmit ring; the size has to be exactly theirs).
   A ring is memory the socket and every mapping of it share, so it stays while it is mapped (`EBUSY` to change it then).
@@ -251,8 +260,8 @@ sends to itself; a socket (`LinuxPacket.cpp`) holds one on each interface and te
   receive, `PACKET_STATISTICS`), not when they arrive, so a program that only watches the mapped memory without ever calling `poll`
   sees nothing, and a V3 block is handed over by the clock only then; a ring is at most 64 MiB; frames carry the time they were
   moved, not the time they arrived, and no checksum or VLAN status bits. `tcpdump` itself has not been run on this (it is not in the
-  system image); what it needs of packet sockets is here. An interface is not put into promiscuous mode, so
-  frames for other machines are heard only if the hardware hands them up anyway; a frame that waits has no time stamp
+  system image); what it needs of packet sockets is here. Promiscuous mode has been checked against a simulated interface and at the
+  drivers' registers, not on a network with other machines' traffic; a frame that waits has no time stamp
   (`SIOCGSTAMP`); a tap keeps 64 frames and loses the rest (counted as drops); on Linux an `ETH_P_ALL` socket hears a loopback packet
   twice (going out and coming in) and a `127.x` packet injected as a frame is dropped as a martian, where here it is heard once and
   delivered.
@@ -304,8 +313,8 @@ back to `read` and `write`.
   restartable sequences, the key retention service, landlock, quotas, extended attributes, file handles.
 - A shared mapping of a regular file that is written through (`MAP_SHARED` with `PROT_WRITE`).
 - Of network sockets: datagrams larger than a frame, a source address, TTL or TOS chosen per datagram by a control message, the
-  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: promiscuous mode, rings filled as
-  frames arrive, fan-out by processor or with rollover. Of netlink: changing the
+  real TTL, TOS and arrival time of a received packet, the error queue, fragments. Of packet sockets: rings filled as frames arrive,
+  fan-out by processor or with rollover, promiscuous mode on PCnet and Wi-Fi. Of netlink: changing the
   network, link state, neighbours, the other protocols (audit, socket diagnostics, netfilter). Of name resolution:
   search domains (none are written to `resolv.conf`), mDNS, and a `resolv.conf` that follows the network while a program runs that
   never names the file again. File permission bits and owners (the calls succeed and keep nothing).
@@ -324,7 +333,7 @@ back to `read` and `write`.
 - `tests/fork_qemu.sh`: those two and the glibc programs `spawntest.c`, `handlertest.c` and `ipctest.c` (System V IPC, POSIX message
   queues and timers, inotify, pidfd, asynchronous I/O, through the C library's own functions and structures) on the real kernel under
   QEMU, compared the same way; then `signaltest.c` as an AArch64, a RISC-V and a LoongArch program on the kernel's emulator.
-  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets, `packettest.c` for packet sockets, `ringtest.c` for their memory-mapped rings and `fanouttest.c` for fan-out groups (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
+  `nettest.c` does the same for TCP and UDP sockets over the loopback, IPv4 and IPv6, control messages included, `rawtest.c` for echo and raw sockets, `packettest.c` for packet sockets, `ringtest.c` for their memory-mapped rings, `fanouttest.c` for fan-out groups and `promisctest.c` for promiscuous mode (on Linux they run in a network namespace of their own, where they may open them), and `netlinktest.c`
   for netlink (`getifaddrs`, `if_nametoindex`, and requests made by hand; it prints only what every Linux machine has, the loopback). `NATIVE="ipctest" EMULATED="" tests/fork_qemu.sh`
   runs one.
 - `tests/run_host_tests.sh LinuxInetSocketTest`: the network socket calls against a simulated second machine (clients, servers,
@@ -334,8 +343,8 @@ back to `read` and `write`.
   machine, which watches what arrives there (TTL, `IP_HDRINCL`, the filters); the socket filter on its own (every instruction,
   programs that are not, any bit of a program flipped, random programs); packet sockets: an ARP exchange with the second
   machine by hand, outgoing frames, the loopback, a filter; and their rings: the three layouts on their own (frames in and out, a
-  full ring, random bytes where a program writes) and through the socket calls; and fan-out groups (every frame at exactly one
-  member, in turn, by flow, by a program).
+  full ring, random bytes where a program writes) and through the socket calls; fan-out groups (every frame at exactly one
+  member, in turn, by flow, by a program); and promiscuous mode, against an interface that filters by address as hardware does.
 - `tests/run_host_tests.sh NetworkThreadTest`: raw sockets and frame taps used from several threads at once, under ThreadSanitizer.
 - `resolvetest.c` in `tests/fork_qemu.sh`: `getaddrinfo`, `gethostbyname`, `getnameinfo`, `getservbyname` through glibc on the real
   kernel, from the files and from DNS (QEMU's DNS server hands the questions to this machine's resolver, which must answer for

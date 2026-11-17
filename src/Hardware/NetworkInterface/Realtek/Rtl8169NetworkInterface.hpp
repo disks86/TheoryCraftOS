@@ -75,6 +75,7 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkOffloads offloads() const override { return NetworkOffloads{true, true, chip_ && chip_->tso ? kMaxSegmentation : 0u, 1}; }
   bool transmit_segmented(ConstByteView frame, TransmitChecksum checksum, uint16_t mss) override;
   bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
@@ -119,7 +120,7 @@ class Rtl8169NetworkInterface final : public INetworkInterface {
   const RtlChip* chip_ = nullptr;
   bool claimed_ = false;
   bool started_ = false;
-  bool all_multicast_ = false;
+  bool all_multicast_ = false, all_frames_ = false;
   bool interrupts_ = false;
   NetworkWake wake_ = nullptr;      // read by the interrupt handler (atomic)
   void* wake_context_ = nullptr;

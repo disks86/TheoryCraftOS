@@ -39,7 +39,7 @@ constexpr uint8_t kMsrSpeed10 = 1u << 3;       // 1 = the link runs at 10 Mb/s, 
 
 // Receive config: accept our unicast, multicast and broadcast frames; WRAP lets a
 // frame run past the ring's end instead of splitting; no FIFO threshold; DMA bursts unlimited.
-constexpr uint32_t kRcrAcceptPhysical = 1u << 1, kRcrAcceptMulticast = 1u << 2, kRcrAcceptBroadcast = 1u << 3,
+constexpr uint32_t kRcrAcceptAll = 1u << 0, kRcrAcceptPhysical = 1u << 1, kRcrAcceptMulticast = 1u << 2, kRcrAcceptBroadcast = 1u << 3,
                    kRcrWrap = 1u << 7, kRcrMaxDma = 7u << 8, kRcrNoThreshold = 7u << 13;
 constexpr uint32_t kTcrDefault = (3u << 24) | (7u << 8);  // standard inter-frame gap, unlimited DMA bursts
 constexpr uint32_t kRingSlack = 16 + 1536;  // the chip may write one maximum frame past the nominal end
@@ -167,6 +167,14 @@ bool Rtl8139NetworkInterface::receive(ByteView buffer, uint32_t* length) {
     }
   }
   return false;
+}
+
+bool Rtl8139NetworkInterface::accept_all_frames(bool enable) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_) return false;
+  const uint32_t configuration = read32(kRcr);
+  write32(kRcr, enable ? (configuration | kRcrAcceptAll) : (configuration & ~kRcrAcceptAll));
+  return enable;
 }
 
 }  // namespace hardware

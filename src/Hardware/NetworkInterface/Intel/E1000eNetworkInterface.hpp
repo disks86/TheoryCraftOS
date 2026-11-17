@@ -77,6 +77,7 @@ class E1000eNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkOffloads offloads() const override { return NetworkOffloads{true, true, kMaxSegmentation, static_cast<uint16_t>(msix_vectors_ ? queues_ : 1)}; }
   bool receive_frame(ByteView buffer, ReceivedFrame* frame) override;
   uint32_t receive_queue_count() const override { return queues_; }
@@ -164,6 +165,8 @@ class E1000eNetworkInterface final : public INetworkInterface {
   uint8_t tx_frame_end_[kTransmitDescriptors] = {};  // for the descriptor a frame starts at: the one it ends at
   static_assert(kTransmitDescriptors <= 256);
   uint32_t receive_control_ = 0;
+  void write_receive_filter();
+  bool all_multicast_ = false, all_frames_ = false;      // what was asked for: the two promiscuous bits of receive_control_ follow from both
   intel_eth::IntelInterrupts interrupts_;
   InterruptModerator moderator_;
   uint32_t msix_vectors_ = 0;    // the 82574's MSI-X: receive queue 0, 1, the other causes

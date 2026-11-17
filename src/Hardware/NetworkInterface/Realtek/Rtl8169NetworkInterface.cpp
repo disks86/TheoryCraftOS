@@ -249,10 +249,10 @@ uint32_t Rtl8169NetworkInterface::rx_opts1(uint32_t i) const {
 
 void Rtl8169NetworkInterface::set_receive_mode() {
   // Without a list of groups to join, "some multicast" means all of it: every bit of the hash filter set.
-  const uint32_t filter = all_multicast_ ? 0xFFFFFFFFu : 0;
+  const uint32_t filter = all_multicast_ || all_frames_ ? 0xFFFFFFFFu : 0;
   regs().write32(kMar0, filter);
   regs().write32(kMar0 + 4, filter);
-  const uint32_t accept = kAcceptBroadcast | kAcceptMyPhys | (all_multicast_ ? kAcceptMulticast : 0);
+  const uint32_t accept = kAcceptBroadcast | kAcceptMyPhys | (all_multicast_ || all_frames_ ? kAcceptMulticast : 0) | (all_frames_ ? kAcceptAllPhys : 0);
   regs().write32(kRxConfig, (regs().read32(kRxConfig) & ~kAcceptMask) | accept);
 }
 
@@ -260,6 +260,14 @@ bool Rtl8169NetworkInterface::accept_all_multicast(bool enable) {
   kernel::ScopedMutex guard(mutex_);
   if (!started_) return false;
   all_multicast_ = enable;
+  set_receive_mode();
+  return enable;
+}
+
+bool Rtl8169NetworkInterface::accept_all_frames(bool enable) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_) return false;
+  all_frames_ = enable;
   set_receive_mode();
   return enable;
 }

@@ -78,6 +78,7 @@ class IgbNetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool enable) override;
+  bool accept_all_frames(bool enable) override;
   NetworkOffloads offloads() const override {
     return NetworkOffloads{true, true, kMaxSegmentation, static_cast<uint16_t>(msix_vectors_ ? queues_ : 1)};
   }
@@ -165,6 +166,8 @@ class IgbNetworkInterface final : public INetworkInterface {
   uint32_t rx_turn_ = 0;  // the queue receive() looks at first
   TransmitQueue tx_[kMaxQueues];
   uint32_t receive_control_ = 0;
+  void write_receive_filter();
+  bool all_multicast_ = false, all_frames_ = false;      // what was asked for: the two promiscuous bits of receive_control_ follow from both
   MacAddress mac_{};
   kernel::Mutex mutex_;  // transmit and receive may come from different threads
   NetworkStatistics stats_;

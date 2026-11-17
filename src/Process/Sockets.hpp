@@ -102,6 +102,9 @@ class SocketManager {
   bool interface_configuration6(uint32_t index, network::Ipv6Configuration* out) const;
   // A tap on interface `index`'s frames (null: no such interface, or it gives none). For AF_PACKET sockets.
   SharedPointer<network::IFrameTap> open_frame_tap(uint32_t index) const;
+  // Is interface `index` in promiscuous mode, or asked for every multicast frame (by a frame tap)?
+  bool interface_promiscuous(uint32_t index) const;
+  bool interface_all_multicast(uint32_t index) const;
   // The hardware address of interface `index` (false: there is no such interface).
   bool interface_mac(uint32_t index, hardware::MacAddress* out) const;
   // A DNS lookup (A, or AAAA when `ipv6`) on every interface that has a DNS server, all at once; start_lookup() begins it and lookup_result() is polled, like

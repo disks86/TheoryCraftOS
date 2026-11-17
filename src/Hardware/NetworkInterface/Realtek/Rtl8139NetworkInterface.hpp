@@ -54,6 +54,7 @@ class Rtl8139NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool) override { return true; }  // (the receive configuration already accepts multicast)
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:

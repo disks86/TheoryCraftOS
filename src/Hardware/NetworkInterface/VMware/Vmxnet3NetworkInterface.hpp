@@ -50,6 +50,7 @@ class Vmxnet3NetworkInterface final : public INetworkInterface {
   bool transmit(ConstByteView frame) override;
   bool receive(ByteView buffer, uint32_t* length) override;
   bool accept_all_multicast(bool) override { return true; }
+  bool accept_all_frames(bool enable) override;
   NetworkStatistics statistics() const override { return stats_; }
 
  private:

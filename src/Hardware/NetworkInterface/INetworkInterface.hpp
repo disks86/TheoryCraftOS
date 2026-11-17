@@ -59,6 +59,14 @@ class INetworkInterface : public IHardware {
     return false;
   }
 
+  // Asks the interface to deliver every frame it sees, whoever it is addressed to (promiscuous mode), for as long as `enable` is true: what packet
+  // capture wants. Frames for other machines are then handed up like any other; whoever receives them tells them apart by their destination. True if
+  // such frames will now arrive; false if the interface cannot say so (it goes on filtering as before).
+  virtual bool accept_all_frames(bool enable) {
+    (void)enable;
+    return false;
+  }
+
   // True for an interface whose link comes and goes with a connection (Wi-Fi, a cable to another host) rather than with a cable to a network: its network stack then asks for an address
   // when the link comes up and gives it up when it goes down.
   virtual bool link_comes_and_goes() const { return false; }

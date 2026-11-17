@@ -268,9 +268,26 @@ LinkDuplex IgbNetworkInterface::link_duplex() const { return started_ ? status_d
 bool IgbNetworkInterface::accept_all_multicast(bool enable) {
   kernel::ScopedMutex guard(mutex_);
   if (!started_) return false;
-  receive_control_ = enable ? (receive_control_ | kRctlMulticastPromiscuous) : (receive_control_ & ~kRctlMulticastPromiscuous);
-  regs().write32(kRctl, receive_control_);
+  all_multicast_ = enable;
+  write_receive_filter();
   return enable;
+}
+
+bool IgbNetworkInterface::accept_all_frames(bool enable) {
+  kernel::ScopedMutex guard(mutex_);
+  if (!started_) return false;
+  all_frames_ = enable;
+  write_receive_filter();
+  return enable;
+}
+
+// The receive control register with its two promiscuous bits as asked: every unicast frame (and with them every multicast one) for all frames, every
+// multicast frame for all multicast.
+void IgbNetworkInterface::write_receive_filter() {
+  receive_control_ &= ~(kRctlUnicastPromiscuous | kRctlMulticastPromiscuous);
+  if (all_frames_) receive_control_ |= kRctlUnicastPromiscuous | kRctlMulticastPromiscuous;
+  else if (all_multicast_) receive_control_ |= kRctlMulticastPromiscuous;
+  regs().write32(kRctl, receive_control_);
 }
 
 NetworkStatistics IgbNetworkInterface::statistics() const {

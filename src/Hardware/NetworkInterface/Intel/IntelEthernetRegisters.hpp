@@ -42,7 +42,7 @@ constexpr uint32_t kStatusGioMasterEnable = 1u << 19, kStatusSpeed2500 = 1u << 2
 constexpr uint32_t kEecdAutoReadDone = 1u << 9;
 constexpr uint32_t kCtrlExtLanPhyPcDone = 1u << 2, kCtrlExtForceSmbus = 1u << 11, kCtrlExtDriverLoaded = 1u << 28;
 // RCTL, TCTL
-constexpr uint32_t kRctlEnable = 1u << 1, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;
+constexpr uint32_t kRctlEnable = 1u << 1, kRctlUnicastPromiscuous = 1u << 3, kRctlMulticastPromiscuous = 1u << 4, kRctlBroadcast = 1u << 15, kRctlStripCrc = 1u << 26;
 constexpr uint32_t kTctlEnable = 1u << 1, kTctlPadShortPackets = 1u << 3, kTctlCollisionThreshold = 0x0Fu << 4, kTctlCollisionDistance = 0x3Fu << 12;
 constexpr uint32_t kTctlRetransmitLateCollision = 1u << 24;
 constexpr uint32_t kTipgDefault = 0x0060200A;  // IPGT 10, IPGR1 8, IPGR2 6 (IEEE 802.3)

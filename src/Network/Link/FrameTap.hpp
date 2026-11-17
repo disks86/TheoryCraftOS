@@ -45,6 +45,10 @@ class ILinkLayer {
   virtual hardware::MacAddress link_address() const = 0;
   // Hands an IP packet to this machine itself, as one sent to the loopback is.
   virtual bool loop_ip_packet(ConstByteView packet) = 0;
+  // One more (or one fewer) wants the interface to hand up every frame, whoever it is for (promiscuous mode), or every multicast frame. The interface
+  // is asked when the first one comes and told to stop when the last one goes.
+  virtual void want_all_frames(bool wanted) = 0;
+  virtual void want_all_multicast(bool wanted) = 0;
 
  protected:
   ILinkLayer() = default;
@@ -68,6 +72,10 @@ class IFrameTap {
   // The same on the loopback: the IPv4 or IPv6 packet in the frame comes back to this machine. False for anything else.
   virtual bool send_looped(ConstByteView frame) = 0;
   virtual hardware::MacAddress mac_address() const = 0;
+  // Promiscuous mode, and every multicast frame, for as long as this tap wants them (until it says otherwise or is closed). What arrives because of
+  // it is shown to every tap of the interface, as FrameKind::OtherHost or Multicast; the stack itself goes on ignoring what is not for it.
+  virtual void set_promiscuous(bool on) = 0;
+  virtual void set_all_multicast(bool on) = 0;
   virtual void close() = 0;
 
  protected:
@@ -90,6 +98,8 @@ class FrameTap final : public IFrameTap {
   bool send(ConstByteView frame) override;
   bool send_looped(ConstByteView frame) override;
   hardware::MacAddress mac_address() const override { return link_.link_address(); }
+  void set_promiscuous(bool on) override;
+  void set_all_multicast(bool on) override;
   void close() override;
 
   // The tap manager shows every frame to every tap; a tap takes the ones it listens for. `header` and `payload` together are the frame (a looped
@@ -106,6 +116,7 @@ class FrameTap final : public IFrameTap {
 
   ILinkLayer& link_;
   bool closed_ = false;
+  bool promiscuous_ = false, all_multicast_ = false;      // what this tap asked of the interface (atomic)
   uint32_t wanted_ = 0;      // the ether type and the flags above
   uint32_t dropped_ = 0;
   Queue<Frame> queue_;
