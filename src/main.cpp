@@ -578,7 +578,28 @@ static bool on_nfs_login(void* context, StringView server, StringView uid, Strin
   return true;
 }
 
+// The boot thread's stack. The firmware's own is small (128 KiB under EDK2) with the firmware's pool below it, and kernel_main's frame alone takes most of
+// that: anything deep called from it wrote past the end, over the firmware's data, and the next firmware call faulted. So the entry point takes memory
+// from the firmware for a stack of its own and runs everything on that. The firmware still knows the memory as allocated, so the RAM pool does not
+// claim it, and calls into the firmware from this stack are ordinary calls.
+extern "C" efi::Status tcos_call_on_stack(efi::Status (*function)(efi::Handle, efi::SystemTable*), efi::Handle image, efi::SystemTable* st, uint64_t stack_top);
+namespace {
+constexpr uint64_t kBootStackBytes = 4ull << 20;
+constexpr uint64_t kBootStackPage = 4096;
+uint64_t g_boot_stack = 0;   // its lowest address; 0 while the firmware's stack is in use
+}  // namespace
+
+static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st);
+
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
+  uint64_t stack = 0xFFFFFFFFull;   // below 4 GiB: mapped by every firmware, before the kernel's own page tables add the rest
+  if (st->boot_services->allocate_pages(efi::AllocateType::MaxAddress, efi::MemoryType::LoaderData, kBootStackBytes / kBootStackPage, &stack) != efi::kSuccess)
+    return kernel_main(image, st);   // (no memory for it: the firmware's stack, as before)
+  g_boot_stack = stack;
+  return tcos_call_on_stack(kernel_main, image, st, stack + kBootStackBytes);
+}
+
+static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   console::init(st);
   hardware::delay_init(st);  // timing that works on every core, before anything waits
   st->boot_services->set_watchdog_timer(0, 0, 0, nullptr);  // no 5-minute reset
@@ -632,6 +653,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel::PageTables paging(kernel::cpu_paging_host(), allocator);
   const bool paging_ok = paging.initialize();
   if (!paging_ok) Entry(Level::Warning, "Paging").text("5-level paging: memory above 4 GiB and MMIO mapping are not used");
+  // The lowest page of the boot stack is taken out of the page tables: running off its end stops the machine there instead of writing over what lies below.
+  if (paging_ok && g_boot_stack && !paging.unmap(g_boot_stack, kBootStackPage)) Entry(Level::Warning, "Paging").text("the boot stack has no guard page");
   uint64_t high_bytes = 0;
   for (uint32_t i = 0; paging_ok && i < ram.extra_region_count(); ++i) {
     const hardware::MemoryRegion r = ram.extra_region(i);
@@ -1584,7 +1607,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     renderer = scaled_renderer.get();
   }
   if (renderer) {
-    // The desktop runs on a thread with a real stack: the page layout in the browser's tick would overflow the firmware's boot stack.
+    // The desktop runs on a thread with a full-size stack: the page layout in the browser's tick is deeper than the boot stack.
     kernel::run_on_large_stack([&] {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop

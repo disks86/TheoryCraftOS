@@ -69,6 +69,7 @@ add_executable(BOOTX64
   src/Utility/Bounds.cpp
   src/Kernel/Interrupts.cpp
   src/Kernel/Interrupts.S
+  src/Kernel/StackSwitch.S
   src/Kernel/UserEntry.S
   src/Kernel/UserMode.cpp
   src/UserModeDemo.cpp
