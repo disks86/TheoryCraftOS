@@ -283,10 +283,35 @@ static void shader_constants(float *out, const Shader *shader, const float (*flo
     memcpy(out + (shader->floats + i) * 4, &word, 4);
   }
 }
-/* The state registers of a program's pixel shader (sm_to_dxbc.h), out of the render states: the alpha test, and fog for the shaders below Shader
- * Model 3 - by the depth of the pixel when a table mode is set, else by the factor a program's vertex shader gives. (The fixed-function vertex
- * stage works out no fog factor.) */
-static void shader_state(float *out, const State *s, const Shader *ps, BOOL vertex_shader) {
+/* What a fog mode makes of a depth, as the shaders work it out: `fog` x, y for the linear factor depth * x + y, z, w for the exponential one
+ * 2 ^ -(depth * (z + w * depth)); `source` y or z becomes 1 for the one that is used, and w 0. FALSE for no mode. */
+static BOOL fog_terms(const State *s, DWORD mode, float fog[4], float source[4]) {
+  float start, end, density;
+  memcpy(&start, &s->rs[D3DRS_FOGSTART], 4);
+  memcpy(&end, &s->rs[D3DRS_FOGEND], 4);
+  memcpy(&density, &s->rs[D3DRS_FOGDENSITY], 4);
+  if (mode == D3DFOG_LINEAR) {      /* (end - depth) / (end - start) */
+    const float range = end - start;
+    fog[0] = range != 0.0f ? -1.0f / range : 0.0f;
+    fog[1] = range != 0.0f ? end / range : 1.0f;
+    source[1] = 1.0f;
+  } else if (mode == D3DFOG_EXP || mode == D3DFOG_EXP2) {      /* e ^ -(density * depth), e ^ -(density * depth) ^ 2: as powers of two */
+    const float log2_e = 1.44269504f;
+    fog[mode == D3DFOG_EXP ? 2 : 3] = (mode == D3DFOG_EXP ? density : density * density) * log2_e;
+    source[2] = 1.0f;
+  } else return FALSE;
+  source[3] = 0.0f;
+  return TRUE;
+}
+/* Whether the fixed-function vertex stage works out the fog factor of this draw: fog is on, by the vertex (no table mode), and the positions are
+ * not pixels already. */
+static BOOL vertex_fog(const State *s, const Layout *l) {
+  return s->rs[D3DRS_FOGENABLE] && s->rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE && s->rs[D3DRS_FOGVERTEXMODE] != D3DFOG_NONE && !l->transformed;
+}
+/* The state registers of a pixel shader (sm_to_dxbc.h; the fixed-function one has the same), out of the render states: the alpha test, and fog
+ * if the shader does fog (`fog`: not Shader Model 3) - by the depth of the pixel when a table mode is set, else by the factor the vertex stage
+ * gives if it gives one (`vertex_factor`). */
+static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_factor) {
   float state[SM_STATE_REGISTERS][4];
   sm_state_none(state);
   if (s->rs[D3DRS_ALPHATESTENABLE]) {
@@ -295,27 +320,12 @@ static void shader_state(float *out, const State *s, const Shader *ps, BOOL vert
     state[SM_STATE_ALPHA][0] = (float)(s->rs[D3DRS_ALPHAREF] & 0xFF);
     for (UINT i = 0; i < 3; ++i) state[SM_STATE_ALPHA_KEEP][i] = (function >> i & 1) ? 1.0f : 0.0f;
   }
-  if (s->rs[D3DRS_FOGENABLE] && ps->major < 3) {
-    const DWORD colour = s->rs[D3DRS_FOGCOLOR], table = s->rs[D3DRS_FOGTABLEMODE];
-    float start, end, density;
-    memcpy(&start, &s->rs[D3DRS_FOGSTART], 4);
-    memcpy(&end, &s->rs[D3DRS_FOGEND], 4);
-    memcpy(&density, &s->rs[D3DRS_FOGDENSITY], 4);
+  if (s->rs[D3DRS_FOGENABLE] && fog) {
+    const DWORD colour = s->rs[D3DRS_FOGCOLOR];
     state[SM_STATE_FOG_COLOUR][0] = ((colour >> 16) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][1] = ((colour >> 8) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][2] = (colour & 255) / 255.0f;
-    if (table == D3DFOG_LINEAR) {      /* (end - depth) / (end - start) */
-      const float range = end - start;
-      state[SM_STATE_FOG][0] = range != 0.0f ? -1.0f / range : 0.0f;
-      state[SM_STATE_FOG][1] = range != 0.0f ? end / range : 1.0f;
-      state[SM_STATE_FOG_SOURCE][1] = 1.0f;
-      state[SM_STATE_FOG_SOURCE][3] = 0.0f;
-    } else if (table == D3DFOG_EXP || table == D3DFOG_EXP2) {      /* e ^ -(density * depth), e ^ -(density * depth) ^ 2: as powers of two */
-      const float log2_e = 1.44269504f;
-      state[SM_STATE_FOG][table == D3DFOG_EXP ? 2 : 3] = (table == D3DFOG_EXP ? density : density * density) * log2_e;
-      state[SM_STATE_FOG_SOURCE][2] = 1.0f;
-      state[SM_STATE_FOG_SOURCE][3] = 0.0f;
-    } else if (vertex_shader) {
+    if (!fog_terms(s, s->rs[D3DRS_FOGTABLEMODE], state[SM_STATE_FOG], state[SM_STATE_FOG_SOURCE]) && vertex_factor) {
       state[SM_STATE_FOG_SOURCE][0] = 1.0f;
       state[SM_STATE_FOG_SOURCE][3] = 0.0f;
     }
@@ -341,11 +351,17 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     block[18] = l->transformed ? 1.0f : 0.0f;
     block[20] = (float)s->viewport.X;
     block[21] = (float)s->viewport.Y;
+    /* vertex fog: by the depth in view space (the third column of world * view), in the mode the render state names; else the factor is 1 */
+    block[35] = 1.0f;
+    if (vertex_fog(s, l)) {
+      for (int row = 0; row < 4; ++row) block[24 + row] = world_view.m[row][2];
+      fog_terms(s, s->rs[D3DRS_FOGVERTEXMODE], block + 28, block + 32);
+    }
   }
   float *pixel = block + vertex_registers * 4;
   if (ps) {
     shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
-    shader_state(pixel + ps->state * 4, s, ps, vs != NULL);
+    shader_state(pixel + ps->state * 4, s, ps->major < 3, vs ? TRUE : vertex_fog(s, l));
   } else {
     BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
     for (UINT stage = 0; stage < STAGES; ++stage) {
@@ -356,14 +372,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
       stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
       stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
     }
-    /* The alpha test, as the least alpha that is kept (the tests that keep the higher alphas; the others keep everything). */
-    float least = -1.0f;
-    if (s->rs[D3DRS_ALPHATESTENABLE]) {
-      const float reference = (float)(s->rs[D3DRS_ALPHAREF] & 0xFF);
-      if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATEREQUAL) least = reference / 255.0f;
-      else if (s->rs[D3DRS_ALPHAFUNC] == D3DCMP_GREATER || s->rs[D3DRS_ALPHAFUNC] == D3DCMP_NOTEQUAL) least = (reference + 0.5f) / 255.0f;
-    }
-    pixel[16] = least;
+    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, vs ? TRUE : vertex_fog(s, l));
   }
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;

@@ -7810,8 +7810,8 @@ void test_dxbc_system_values() {
       // them, the vertex shader with 6 registers of constants and the pixel shader with its 5 after those.
       {
         UniquePointer<D3d9Program> fixed_vs, fixed_ps;
-        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_vs, sizeof(g_ff_vs)), &fixed_vs) == status::kSuccess && fixed_vs && fixed_vs->constant_bytes() == 6 * 16);
-        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_ps, sizeof(g_ff_ps)), &fixed_ps, 6) == status::kSuccess && fixed_ps && fixed_ps->constant_bytes() == 11 * 16);
+        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_vs, sizeof(g_ff_vs)), &fixed_vs) == status::kSuccess && fixed_vs && fixed_vs->constant_bytes() == 9 * 16);
+        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_ps, sizeof(g_ff_ps)), &fixed_ps, 9) == status::kSuccess && fixed_ps && fixed_ps->constant_bytes() == 18 * 16);
         CHECK(fixed_vs && fixed_vs->stage() == graphics::ShaderStage::Vertex && fixed_ps && fixed_ps->stage() == graphics::ShaderStage::Fragment);
         CHECK(fixed_ps && fixed_ps->texture_unit_mask() == 3);
       }

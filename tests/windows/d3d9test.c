@@ -659,6 +659,111 @@ static void test_shaders(void) {
   check(gone, "the shaders and what they drew from are gone with their last references");
 }
 
+/* ---- the fixed-function pipeline's fog, and its alpha test all ways round ------------------------------------------------------------------------- */
+
+static void set_float_state(D3DRENDERSTATETYPE state, float value) {
+  DWORD bits;
+  memcpy(&bits, &value, 4);
+  IDirect3DDevice9_SetRenderState(g_device, state, bits);
+}
+/* A white rectangle over the middle of the target, through the matrices, at a depth. */
+static void world_quad(float z) {
+  const WorldVertex v[4] = {{-0.5f, 0.5f, z, 0xFFFFFFFF}, {0.5f, 0.5f, z, 0xFFFFFFFF}, {-0.5f, -0.5f, z, 0xFFFFFFFF}, {0.5f, -0.5f, z, 0xFFFFFFFF}};
+  IDirect3DDevice9_SetFVF(g_device, FVF_WORLD);
+  IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+}
+static void test_fog(void) {
+  D3DCAPS9 caps;
+  memset(&caps, 0, sizeof caps);
+  IDirect3DDevice9_GetDeviceCaps(g_device, &caps);
+  check((caps.RasterCaps & D3DPRASTERCAPS_FOGTABLE) && (caps.RasterCaps & D3DPRASTERCAPS_FOGVERTEX), "the caps have fog by the pixel and by the vertex");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_NONE);
+  /* the alpha test with the functions that keep the lower alphas (the rectangle's alpha is 0x40) */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, TRUE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x80);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_LESS);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0x40FFFFFF);
+  read_back();
+  const int less = pixel(32, 32) == 0xFFFFFF;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0x40FFFFFF);
+  read_back();
+  const int greater = pixel(32, 32) == 0;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x40);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_EQUAL);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0x40FFFFFF);
+  read_back();
+  const int equal = pixel(32, 32) == 0xFFFFFF;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_NEVER);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0x40FFFFFF);
+  read_back();
+  check(less && greater && equal && pixel(32, 32) == 0, "the alpha test: less, greater, equal and never");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, FALSE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_ALWAYS);
+
+  /* fog by the pixel's depth (a table mode): vertices that are pixels, at 0.5 */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGENABLE, TRUE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGCOLOR, 0x000000FF);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+  set_float_state(D3DRS_FOGSTART, 0.0f);
+  set_float_state(D3DRS_FOGEND, 1.0f);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
+  read_back();
+  check(near_colour(pixel(32, 32), 128, 128, 255), "linear fog by the pixel's depth: half white, half the fog's blue");
+  set_float_state(D3DRS_FOGSTART, 0.25f);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.25f, 0xFFFF0000);
+  read_back();
+  check(near_colour(pixel(32, 32), 255, 0, 0), "... and none before the fog starts");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_EXP2);
+  set_float_state(D3DRS_FOGDENSITY, 2.0f);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
+  read_back();
+  check(near_colour(pixel(32, 32), 94, 94, 255), "exponential squared fog: e ^ -(density * depth) ^ 2 of the colour");
+  /* fog by the vertex: the depth in view space, here the vertices' z (identity matrices) */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+  set_float_state(D3DRS_FOGSTART, 0.0f);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(near_colour(pixel(32, 32), 191, 191, 255) && pixel(4, 32) == 0, "linear fog by the vertex: three quarters of the colour at a quarter of the way");
+  D3DMATRIX view;
+  memset(&view, 0, sizeof view);
+  view.m[0][0] = view.m[1][1] = view.m[2][2] = view.m[3][3] = 1.0f;
+  view.m[3][2] = 0.25f;      /* (the view moves everything a quarter further away; the depth the rasterizer sees is 0.5 then) */
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_VIEW, &view);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(near_colour(pixel(32, 32), 128, 128, 255), "... and it is the depth after the view matrix");
+  view.m[3][2] = 0.0f;
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_VIEW, &view);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_EXP);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(near_colour(pixel(32, 32), 155, 155, 255), "exponential fog by the vertex");
+  /* vertices that are pixels already have no vertex fog; and with fog off there is none */
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
+  read_back();
+  const int untouched = pixel(32, 32) == 0xFFFFFF;
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGENABLE, FALSE);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(untouched && pixel(32, 32) == 0xFFFFFF, "no vertex fog on vertices that are pixels, and none at all with fog switched off");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
+}
+
 static void test_render_to_texture(void) {
   IDirect3DTexture9 *target = NULL;
   IDirect3DSurface9 *surface = NULL, *back = NULL, *depth = NULL;
@@ -737,6 +842,7 @@ int main(void) {
     test_depth();
     test_state_blocks();
     test_shaders();
+    test_fog();
     test_render_to_texture();
     test_present_and_reset();
     check(IDirect3DDevice9_Release(g_device) == 0, "the device is gone with its last reference");

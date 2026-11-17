@@ -26,7 +26,7 @@
  *               texture coordinates (48 bytes) and written into a ring of upload memory; indices are copied into another, counted from the first
  *               vertex the draw reads, and a triangle fan becomes a list.
  *   shaders     one vertex shader (the world, view and projection matrices as one, or positions that are pixels already) and one pixel shader (two
- *               texture stages as weights, the alpha test), written in HLSL and compiled ahead (ff_vs.hlsl, ff_ps.hlsl -> shaders.inc).
+ *               texture stages as weights, the alpha test, fog by the vertex shader's factor or the pixel's depth), written in HLSL and compiled ahead (ff_vs.hlsl, ff_ps.hlsl -> shaders.inc).
  *   a program's a vertex or pixel shader of the program's is translated to Shader Model 4 when it is made (sm_to_dxbc.h). A draw with a vertex
  *   shaders     shader decodes the vertices into one register of four floats for each input the shader declares; the constants the program set
  *               are the draw's block (the vertex shader's registers, then the pixel shader's); either stage may be the fixed-function one.
@@ -69,8 +69,9 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
-#define VERTEX_REGISTERS 6u            /* the constants of the fixed-function vertex shader, in registers of four floats */
-#define PIXEL_REGISTERS 5u             /* ... of the fixed-function pixel shader, which follow the vertex shader's in the block of a draw */
+#define VERTEX_REGISTERS 9u            /* the constants of the fixed-function vertex shader, in registers of four floats */
+#define PIXEL_REGISTERS 9u             /* ... of the fixed-function pixel shader, which follow the vertex shader's in the block of a draw */
+#define PIXEL_STATE_REGISTER 4u        /* ... of which the last five are the alpha test and fog, as at the end of a program's pixel shader */
 #define CONSTANT_REGISTERS 256u        /* the block of a draw, at most */
 #define VS_FLOATS 256u                 /* the float constants a program sets for its vertex shaders, */
 #define PS_FLOATS 224u                 /* ... and for its pixel shaders */
