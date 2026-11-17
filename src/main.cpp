@@ -863,7 +863,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   });
   process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
-  if (dxg_adapters > 1)
+  // (on a thread with a real stack, like the OpenGL scenes below: the CPU renderer runs the scenes' shader programs, tens of KiB deep, and this function's own frame
+  // leaves little of the firmware's boot stack. Past its end is the firmware's pool: a scene wrote over its protocol list, and the next firmware call faulted.)
+  if (dxg_adapters > 1) kernel::run_on_large_stack([&] {
     for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {
       dxgk::Adapter* a = dxg_kernel.adapter(i);
       if (!a || !a->caps().accelerated) continue;
@@ -881,6 +883,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }, nullptr);
       Entry(bad ? Level::Warning : Level::Ok, "Direct3D").dec(bad).text(" conformance scene(s) wrong");
     }
+  });
   Entry(dxg_fallbacks ? Level::Warning : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
   if (dxg_fallbacks) Entry(Level::Warning, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
   if (dxg_fallbacks)
@@ -889,7 +892,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
   // What the GL contexts' hardware path (GLSL -> TGSI) draws on this GPU, against their CPU rasterizer (webgl::run_accel_conformance): the verdicts are in the log.
-  if (system_graphics.accelerated()) {
+  if (system_graphics.accelerated()) kernel::run_on_large_stack([&] {
     const uint32_t wrong = webgl::run_accel_conformance(shared_allocator, web_accelerator, [](void*, const webgl::AccelSceneResult& r) {
       const bool bad = r.verdict == webgl::AccelVerdict::Differs || r.verdict == webgl::AccelVerdict::Broken;
       Entry e(bad ? Level::Warning : r.verdict == webgl::AccelVerdict::NotTaken ? Level::Info : Level::Ok, "OpenGL");
@@ -905,7 +908,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
     }, nullptr);
     Entry(wrong ? Level::Warning : Level::Ok, "OpenGL").dec(wrong).text(" of ").dec(webgl::accel_scene_count()).text(" GPU conformance scene(s) wrong");
-  }
+  });
   if (gpu) {
     graphics::IRenderer2D* renderer = system_graphics.renderer_2d();
     if (!renderer) {
