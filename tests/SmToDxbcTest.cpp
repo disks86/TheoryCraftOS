@@ -21,6 +21,7 @@
 //     the kernel's own compiler for Direct3D 9 bytecode takes the shader too - both programs give the same numbers for the same inputs;
 //   - shaders written here token by token, one for each kind of instruction, give the numbers worked out here - pixel shaders 1.x among them, with
 //     their modifiers, factors and texture registers;
+//   - the end of a pixel shader does the alpha test and fog its state registers ask for;
 //   - what is refused is refused, and shaders that end early or have a bit turned (every length, bits all over) are taken or refused without a
 //     wrong read (the test runs under ASan and UBSan), and what is taken of them the kernel's compiler takes or refuses the same way.
 #include <math.h>
@@ -130,9 +131,16 @@ struct Asm {
 // What the tests give a shader: the inputs v0 .. v2 (a pixel shader: the two colours and two sets of texture coordinates), and the constants.
 const float kIn[4][4] = {{0.25f, -0.5f, 0.75f, 1.0f}, {0.3f, -0.6f, 2.4f, 0.5f}, {0.125f, 0.875f, 0.0f, 1.0f}, {1.5f, 0.2f, -0.3f, 0.9f}};
 const float kMore[2][4] = {{0.5f, 0.25f, -1.0f, 1.0f}, {2.0f, 0.0f, 0.5f, 1.0f}};
+const float kFog = 0.25f;
 float constant_value(unsigned reg_number, unsigned component) { return 0.1f * static_cast<float>(reg_number + 1) + 0.37f * static_cast<float>(component) - 0.5f; }
 
 struct Result { float position[4]; float colour[4]; bool alive; bool ok; };
+
+// What a pixel shader's state registers hold in the tests that do not say: no alpha test, no fog.
+float g_state[SM_STATE_REGISTERS][4];
+void put_state(uint8_t* constants) {
+  if (!g_shader.vertex) memcpy(constants + g_shader.state_register * 16, g_state, sizeof g_state);
+}
 
 // Translates, compiles and runs: a vertex shader's position and COLOR0, a pixel shader's colour. `bools`: the device's bool constants (bit n: b<n>).
 Result run_tokens(HostAllocator& allocator, const Tokens& tokens, uint32_t bools = 0, int* translate_status = nullptr) {
@@ -148,11 +156,13 @@ Result run_tokens(HostAllocator& allocator, const Tokens& tokens, uint32_t bools
     for (unsigned k = 0; k < 4; ++k) { const float v = constant_value(n, k); memcpy(constants + n * 16 + k * 4, &v, 4); }
   if (g_shader.bools_used)
     for (unsigned n = 0; n < 16; ++n) { const uint32_t v = (bools >> n & 1) ? 0xFFFFFFFFu : 0u; memcpy(constants + (g_shader.float_registers + n) * 16, &v, 4); }
+  put_state(constants);
   graphics::Vec4 in[16] = {};
   for (unsigned i = 0; i < 4; ++i) in[i] = {kIn[i][0], kIn[i][1], kIn[i][2], kIn[i][3]};
   if (!g_shader.vertex) {      // (a pixel shader: texture coordinates 2 and 3 as well)
     in[4] = {kMore[0][0], kMore[0][1], kMore[0][2], kMore[0][3]};
     in[5] = {kMore[1][0], kMore[1][1], kMore[1][2], kMore[1][3]};
+    in[SM_SLOT_TEXCOORD + 8 - 1] = {kFog, 0, 0, 0};      // (the vertex shader's fog factor)
   }
   if (g_shader.vertex) {
     graphics::ShaderIo io = {};
@@ -425,6 +435,75 @@ void test_pixel_shaders_1(HostAllocator& allocator) {
   }
 }
 
+// What a pixel shader's end does by its state registers: the alpha test and fog. (The depth of the pixel is 0 here.)
+void test_pixel_state(HostAllocator& allocator) {
+  const float *v0 = kIn[0], *v1 = kIn[1];
+  // a shader of each model that gives v1 (alpha 0.5: 128 of 255) or v0 (alpha 1)
+  auto run = [&](uint32_t major, uint32_t input) {
+    Asm a(false, major, major == 1 ? 1 : 0);
+    if (major == 3) a.dcl(10, input, reg(kInput, 0) );
+    if (major == 1) a.ins(1, {dst(kTemp, 0), src(kInput, input)});
+    else a.ins(1, {dst(kColorOut, 0), src(kInput, major == 3 ? 0 : input)});
+    return run_tokens(allocator, a.end());
+  };
+  auto alpha = [&](float reference, float below, float equal, float above) {
+    sm_state_none(g_state);
+    g_state[SM_STATE_ALPHA][0] = reference;
+    g_state[SM_STATE_ALPHA_KEEP][0] = below; g_state[SM_STATE_ALPHA_KEEP][1] = equal; g_state[SM_STATE_ALPHA_KEEP][2] = above;
+  };
+  for (uint32_t major = 1; major <= 3; ++major) {
+    alpha(128, 0, 1, 1);      // greater or equal
+    Result r = run(major, 1);
+    CHECK(r.ok && r.alive && near_value(r.colour[0], v1[0]) && near_value(r.colour[3], v1[3]));
+    alpha(128, 0, 0, 1);      // greater
+    CHECK(!run(major, 1).alive && run(major, 0).alive);
+    alpha(128, 0, 1, 0);      // equal
+    CHECK(run(major, 1).alive && !run(major, 0).alive);
+    alpha(129, 1, 0, 0);      // less
+    CHECK(run(major, 1).alive && !run(major, 0).alive);
+    alpha(128, 1, 0, 1);      // not equal
+    CHECK(!run(major, 1).alive && run(major, 0).alive);
+    alpha(0, 0, 0, 0);        // never
+    CHECK(!run(major, 1).alive);
+    alpha(255, 1, 1, 0);      // less or equal: an alpha above 1 is 255
+    CHECK(run(major, 0).alive);
+  }
+  // fog by the vertex shader's factor: a quarter of the colour, three quarters of the fog's; the alpha stays
+  const float fog[3] = {1.0f, 0.0f, 0.5f};
+  auto fogged = [&](float f, const float* c, unsigned k) { return fog[k] + f * (c[k] - fog[k]); };
+  for (uint32_t major = 1; major <= 3; ++major) {
+    sm_state_none(g_state);
+    memcpy(g_state[SM_STATE_FOG_COLOUR], fog, sizeof fog);
+    g_state[SM_STATE_FOG_SOURCE][0] = 1; g_state[SM_STATE_FOG_SOURCE][3] = 0;
+    Result r = run(major, 0);
+    if (major < 3) CHECK(colour_is(r, fogged(kFog, v0, 0), fogged(kFog, v0, 1), fogged(kFog, v0, 2), v0[3]));
+    else CHECK(colour_is(r, v0[0], v0[1], v0[2], v0[3]));      // (Shader Model 3 does its own fog)
+    // the linear factor of the depth: depth * x + y, kept between 0 and 1
+    g_state[SM_STATE_FOG_SOURCE][0] = 0; g_state[SM_STATE_FOG_SOURCE][1] = 1;
+    g_state[SM_STATE_FOG][0] = -2.0f; g_state[SM_STATE_FOG][1] = 0.6f;
+    r = run(major, 0);
+    if (major < 3) CHECK(colour_is(r, fogged(0.6f, v0, 0), fogged(0.6f, v0, 1), fogged(0.6f, v0, 2), v0[3]));
+    g_state[SM_STATE_FOG][1] = 1.5f;
+    r = run(major, 0);
+    CHECK(colour_is(r, v0[0], v0[1], v0[2], v0[3]));
+    // the exponential one: at depth 0 there is no fog yet
+    g_state[SM_STATE_FOG_SOURCE][1] = 0; g_state[SM_STATE_FOG_SOURCE][2] = 1;
+    g_state[SM_STATE_FOG][2] = 3.0f; g_state[SM_STATE_FOG][3] = 5.0f;
+    r = run(major, 0);
+    CHECK(colour_is(r, v0[0], v0[1], v0[2], v0[3]));
+  }
+  sm_state_none(g_state);
+  // the state registers follow the floats and the bools
+  {
+    Asm a(false, 2, 0);
+    a.ins(40, {src(kConstBool, 2)}).ins(1, {dst(kColorOut, 0), src(kConst, 6)}).ins(42, {}).ins(1, {dst(kColorOut, 0), src(kInput, 0)}).ins(43, {});
+    const Tokens tokens = a.end();
+    CHECK(sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) == SM_OK && g_shader.float_registers == 7 && g_shader.state_register == 7 + SM_BOOL_REGISTERS &&
+          g_shader.constant_registers == 7 + SM_BOOL_REGISTERS + SM_STATE_REGISTERS);
+    CHECK(colour_is(run_tokens(allocator, tokens, 1u << 2), cv(6, 0), cv(6, 1), cv(6, 2), cv(6, 3)));
+  }
+}
+
 // A pixel shader 1.1 with a bit of everything, for the tests of damaged shaders.
 Tokens pixel_shader_1_sample() {
   Asm a(false, 1, 1);
@@ -509,6 +588,7 @@ void test_fixtures(HostAllocator& allocator, std::vector<Tokens>* all) {
       uint8_t constants[4096] = {};
       for (unsigned n = 0; n < 8; ++n)
         for (unsigned k = 0; k < 4; ++k) { const float v = constant_value(n + set, k) * (set & 1 ? -1.3f : 0.8f); memcpy(constants + n * 16 + k * 4, &v, 4); }
+      put_state(constants);
       graphics::Vec4 in[16] = {};
       for (unsigned i = 0; i < 4; ++i) in[i] = {kIn[(i + set) % 4][0] + 0.05f * set, kIn[(i + set) % 4][1], kIn[(i + set) % 4][2], kIn[(i + set) % 4][3]};
       bool same = true;
@@ -571,9 +651,11 @@ void test_damage(HostAllocator& allocator, const std::vector<Tokens>& shaders) {
 
 int main() {
   HostAllocator allocator;
+  sm_state_none(g_state);
   std::vector<Tokens> shaders;
   test_instructions(allocator);
   test_pixel_shaders_1(allocator);
+  test_pixel_state(allocator);
   test_refusals();
   test_fixtures(allocator, &shaders);
   shaders.push_back(pixel_shader_1_sample());

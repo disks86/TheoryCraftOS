@@ -549,6 +549,73 @@ static void test_shaders(void) {
     read_back();
     check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 8), 0, 191, 0) && near_colour(pixel(56, 56), 128, 191, 255),
           "a pixel shader 1.4: texld, a constant and a negated colour");
+
+    /* what Direct3D 9 does after a pixel shader: the alpha test (the white texel has no alpha) ... */
+    IDirect3DDevice9_SetPixelShader(g_device, old);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, TRUE);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAREF, 0x80);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+    read_back();
+    check(pixel(8, 8) == 0xFF0000 && pixel(56, 8) == 0x00FF00 && pixel(56, 56) == 0x202020, "the alpha test after a pixel shader leaves out the texel with no alpha");
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHAFUNC, D3DCMP_LESS);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+    read_back();
+    check(pixel(8, 8) == 0x202020 && pixel(56, 8) == 0x202020 && pixel(56, 56) == 0xFFFFFF, "... and with the test turned round, all the others");
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_ALPHATESTENABLE, FALSE);
+    /* ... and fog, by the depth of the pixel (the rectangle is at 0.5): linear between 0 and 1, then exponential */
+    const float fog_start = 0.0f, fog_end = 1.0f, fog_density = 2.0f;
+    DWORD bits;
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGENABLE, TRUE);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGCOLOR, 0x000000FF);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+    memcpy(&bits, &fog_start, 4);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGSTART, bits);
+    memcpy(&bits, &fog_end, 4);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGEND, bits);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+    read_back();
+    check(near_colour(pixel(8, 8), 128, 0, 128) && near_colour(pixel(56, 8), 0, 128, 128) && near_colour(pixel(8, 56), 0, 0, 255),
+          "linear fog by the pixel's depth after a pixel shader: half the colour, half the fog's");
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_EXP);
+    memcpy(&bits, &fog_density, 4);
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGDENSITY, bits);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFFFFFFFF);
+    read_back();
+    check(near_colour(pixel(8, 8), 94, 0, 161), "exponential fog: e ^ -(density * depth) of the colour");
+    /* fog by the factor a vertex shader gives (vs_1_1: mov oPos, v0; mov oFog, c0.x; mov oD0, c1), with a pixel shader that passes the colour on */
+    static const DWORD fog_vs[] = {0xFFFE0101, 0x0000001F, 0x80000000, 0x900F0000, 0x00000001, 0xC00F0000, 0x90E40000,
+                                   0x00000001, 0xC0010001, 0xA0000000, 0x00000001, 0xD00F0000, 0xA0E40001, 0x0000FFFF};
+    static const DWORD pass_ps[] = {0xFFFF0101, 0x00000001, 0x800F0000, 0x90E40000, 0x0000FFFF};      /* ps_1_1: mov r0, v0 */
+    const float fog_constants[2][4] = {{0.25f, 0, 0, 0}, {0, 1, 0, 1}};
+    IDirect3DVertexShader9 *fog_shader = NULL;
+    IDirect3DPixelShader9 *pass = NULL;
+    IDirect3DDevice9_CreateVertexShader(g_device, fog_vs, &fog_shader);
+    IDirect3DDevice9_CreatePixelShader(g_device, pass_ps, &pass);
+    if (fog_shader && pass) {
+      IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+      IDirect3DDevice9_SetVertexShader(g_device, fog_shader);
+      IDirect3DDevice9_SetPixelShader(g_device, pass);
+      IDirect3DDevice9_SetVertexShaderConstantF(g_device, 0, &fog_constants[0][0], 2);
+      clear(0xFF202020);
+      shader_quad(0xFFFFFFFF);
+      read_back();
+      check(near_colour(pixel(32, 32), 0, 64, 191), "fog by the vertex shader's factor: a quarter of the colour");
+      IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGENABLE, FALSE);
+      clear(0xFF202020);
+      shader_quad(0xFFFFFFFF);
+      read_back();
+      check(near_colour(pixel(32, 32), 0, 255, 0), "... and with fog switched off, the colour itself");
+      IDirect3DDevice9_SetVertexShader(g_device, vs);
+      IDirect3DDevice9_SetVertexShaderConstantF(g_device, 0, &all[0][0], 5);
+    } else check(0, "a vertex shader that writes a fog factor, and a pixel shader 1.1 for it");
+    IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGENABLE, FALSE);
+    if (fog_shader) IDirect3DVertexShader9_Release(fog_shader);
+    if (pass) IDirect3DPixelShader9_Release(pass);
   }
   IDirect3DDevice9_SetPixelShader(g_device, ps_tex);
   IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, half, 1);

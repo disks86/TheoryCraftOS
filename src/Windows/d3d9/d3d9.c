@@ -30,6 +30,7 @@
  *   a program's a vertex or pixel shader of the program's is translated to Shader Model 4 when it is made (sm_to_dxbc.h). A draw with a vertex
  *   shaders     shader decodes the vertices into one register of four floats for each input the shader declares; the constants the program set
  *               are the draw's block (the vertex shader's registers, then the pixel shader's); either stage may be the fixed-function one.
+ *               A translated pixel shader ends with the alpha test and fog, which a draw steers by registers after the shader's constants.
  *   states      a Direct3D 12 pipeline for each combination of the render states that a pipeline holds (culling, depth, blending, stencil, write
  *               mask), in a cache.
  *   textures    a Direct3D 12 texture of B8G8R8A8 whatever the program's format; a level is sent when it is unlocked.
@@ -157,6 +158,8 @@ typedef struct Shader {
   UINT floats;                   /* the float constants it reads: c0 .. c<floats - 1> */
   int bools;                     /* it reads bool constants: 16 registers after the floats */
   UINT registers;                /* all it takes of a draw's block */
+  UINT major;                    /* its shader model */
+  UINT state;                    /* a pixel shader: the first of its state registers (the alpha test and fog: sm_to_dxbc.h) */
   UINT sampler_count;            /* a pixel shader: the highest sampler it reads, and one */
   SmInput inputs[SHADER_INPUTS]; /* a vertex shader: what each input register is */
   UINT input_count;

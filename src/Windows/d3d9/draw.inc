@@ -283,6 +283,45 @@ static void shader_constants(float *out, const Shader *shader, const float (*flo
     memcpy(out + (shader->floats + i) * 4, &word, 4);
   }
 }
+/* The state registers of a program's pixel shader (sm_to_dxbc.h), out of the render states: the alpha test, and fog for the shaders below Shader
+ * Model 3 - by the depth of the pixel when a table mode is set, else by the factor a program's vertex shader gives. (The fixed-function vertex
+ * stage works out no fog factor.) */
+static void shader_state(float *out, const State *s, const Shader *ps, BOOL vertex_shader) {
+  float state[SM_STATE_REGISTERS][4];
+  sm_state_none(state);
+  if (s->rs[D3DRS_ALPHATESTENABLE]) {
+    /* (D3DCMP_NEVER .. D3DCMP_ALWAYS are 1 .. 8: bit 0 of the number less one keeps what is below, bit 1 what is equal, bit 2 what is above) */
+    const DWORD function = s->rs[D3DRS_ALPHAFUNC] >= D3DCMP_NEVER && s->rs[D3DRS_ALPHAFUNC] <= D3DCMP_ALWAYS ? s->rs[D3DRS_ALPHAFUNC] - 1 : 7;
+    state[SM_STATE_ALPHA][0] = (float)(s->rs[D3DRS_ALPHAREF] & 0xFF);
+    for (UINT i = 0; i < 3; ++i) state[SM_STATE_ALPHA_KEEP][i] = (function >> i & 1) ? 1.0f : 0.0f;
+  }
+  if (s->rs[D3DRS_FOGENABLE] && ps->major < 3) {
+    const DWORD colour = s->rs[D3DRS_FOGCOLOR], table = s->rs[D3DRS_FOGTABLEMODE];
+    float start, end, density;
+    memcpy(&start, &s->rs[D3DRS_FOGSTART], 4);
+    memcpy(&end, &s->rs[D3DRS_FOGEND], 4);
+    memcpy(&density, &s->rs[D3DRS_FOGDENSITY], 4);
+    state[SM_STATE_FOG_COLOUR][0] = ((colour >> 16) & 255) / 255.0f;
+    state[SM_STATE_FOG_COLOUR][1] = ((colour >> 8) & 255) / 255.0f;
+    state[SM_STATE_FOG_COLOUR][2] = (colour & 255) / 255.0f;
+    if (table == D3DFOG_LINEAR) {      /* (end - depth) / (end - start) */
+      const float range = end - start;
+      state[SM_STATE_FOG][0] = range != 0.0f ? -1.0f / range : 0.0f;
+      state[SM_STATE_FOG][1] = range != 0.0f ? end / range : 1.0f;
+      state[SM_STATE_FOG_SOURCE][1] = 1.0f;
+      state[SM_STATE_FOG_SOURCE][3] = 0.0f;
+    } else if (table == D3DFOG_EXP || table == D3DFOG_EXP2) {      /* e ^ -(density * depth), e ^ -(density * depth) ^ 2: as powers of two */
+      const float log2_e = 1.44269504f;
+      state[SM_STATE_FOG][table == D3DFOG_EXP ? 2 : 3] = (table == D3DFOG_EXP ? density : density * density) * log2_e;
+      state[SM_STATE_FOG_SOURCE][2] = 1.0f;
+      state[SM_STATE_FOG_SOURCE][3] = 0.0f;
+    } else if (vertex_shader) {
+      state[SM_STATE_FOG_SOURCE][0] = 1.0f;
+      state[SM_STATE_FOG_SOURCE][3] = 0.0f;
+    }
+  }
+  memcpy(out, state, sizeof state);
+}
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
 static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
 /* Writes the block of constants of the draw and gives its address. (The ring has room for a whole block: draw() saw to it.) */
@@ -304,8 +343,10 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     block[21] = (float)s->viewport.Y;
   }
   float *pixel = block + vertex_registers * 4;
-  if (ps) shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
-  else {
+  if (ps) {
+    shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
+    shader_state(pixel + ps->state * 4, s, ps, vs != NULL);
+  } else {
     BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
     for (UINT stage = 0; stage < STAGES; ++stage) {
       const DWORD *t = s->stage[stage];

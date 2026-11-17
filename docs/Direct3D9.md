@@ -61,6 +61,13 @@ environment instructions (`texbem`, `texbeml`, `bem`: they read a matrix of the 
 (`texm3x3tex`, `texm3x3spec`, `texm3x3vspec`) and the ones that write the depth (`texdepth`, `texm3x2depth`). Values are not kept
 between -1 and 1 (or -8 and 8) as the hardware of the time did.
 
+**After a pixel shader.** Direct3D 9 does the alpha test and fog on what a pixel shader gives, so every translated pixel shader ends with
+them, steered by five registers of constants after the shader's own (`SM_STATE_*`), which a draw fills in from the render states: the
+reference of the alpha test and which of below, equal and above keep the pixel (the alpha is compared as eight bits; all eight functions),
+the fog's colour, and where the fog factor comes from - for shaders below Shader Model 3, which is where Direct3D 9 does fog: the depth
+of the pixel when a table mode is set (linear, exponential, exponential squared; the shader reads its position for it), else the factor
+a vertex shader of the program's writes (`oFog`).
+
 Refused by the translator: loops, `rep`, subroutines and the `break` instructions, the predicate register, integer constants, cube and
 volume samplers, `texldl` and `texldd`, textures in a vertex shader, more than one render target, a depth the pixel shader writes, `vPos`
 and `vFace`.
@@ -71,10 +78,11 @@ in the program, in the kernel, on the device - and the kernel could not make rin
 
 ## What is not there
 
-- Of a program's shaders: what the translator refuses (above). With a pixel shader of the program's there is no
-  alpha test and no fog (both are the fixed-function pixel shader's work here); the half pixel between Direct3D 9's pixel centres and
-  the rasterizer's is not made up for vertices that pass a vertex shader; a colour the vertex shader does not write reaches the pixel
-  stage as 0, not as white. The caps say 3.0 although not every 3.0 shader can be made.
+- Of a program's shaders: what the translator refuses (above). Fog after a pixel shader needs a table mode or a vertex shader of the
+  program's: the fixed-function vertex stage works out no fog factor, and the fixed-function pixel stage has no fog at all. Depth fog is
+  by z, not by w. The half pixel between Direct3D 9's pixel centres and the rasterizer's is not made up for vertices that pass a vertex
+  shader; a colour the vertex shader does not write reaches the pixel stage as 0, not as white. The caps say 3.0 although not every 3.0
+  shader can be made.
 - Lighting: a vertex has its diffuse colour, or white. Materials and lights are taken and not used.
 - Fog, specular, texture transforms and generated texture coordinates, the texture factor, more than two texture stages, the stage
   operations beyond the ones above, bump mapping.
@@ -94,15 +102,15 @@ method that is written takes as many parameters as the interface gives it).
 `tests/SmToDxbcTest.cpp` (host, ASan and UBSan): shaders a compiler made (`tests/data/d3d9`, `scripts/gen-d3d9-test-shaders.sh`) are
 translated, the kernel's compiler takes the result, and the program it makes gives the same numbers as the kernel's own compiler for
 Direct3D 9 bytecode makes of the same shader; shaders written token by token give the numbers worked out for each kind of instruction
-(constants through `a0`, bools, branches, `texkill`, the outputs of Shader Model 3, and pixel shaders 1.x with their modifiers, factors
-and texture registers); what is refused; every shortened shader and 30000
+(constants through `a0`, bools, branches, `texkill`, the outputs of Shader Model 3, pixel shaders 1.x with their modifiers, factors
+and texture registers, and the alpha test and fog at a pixel shader's end); what is refused; every shortened shader and 30000
 with a bit turned.
 
-`tests/windows/d3d9test.c` (81 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/windows/d3d9test.c` (87 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
-stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4), drawing into a texture and sampling it, `GetRenderTargetData`,
+stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4, the alpha test and fog - by depth and by a vertex shader's factor - after a pixel shader), drawing into a texture and sampling it, `GetRenderTargetData`,
 `Present`, `Reset`, and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
 `tests/wow64_qemu.sh d3d9test` (32-bit); the same source built for x86-64 passes too. `DxgkrnlTest` checks that the kernel compiles the
 two shaders.

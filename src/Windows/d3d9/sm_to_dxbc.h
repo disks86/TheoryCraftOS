@@ -28,6 +28,10 @@
  *               shader's inputs are the vertex shader's outputs by their semantics.
  *   between     COLOR0 / COLOR1, TEXCOORD0 .. TEXCOORD7; the fog factor is TEXCOORD8, and the other semantics of Shader Model 3 are TEXCOORD9 .. 12
  *               (NORMAL, TANGENT, BINORMAL, BLENDWEIGHT, each with index 0).
+ *   state       a pixel shader ends with what Direct3D 9 does to its colour afterwards, the alpha test and (below Shader Model 3) fog, steered by
+ *               SM_STATE_REGISTERS registers of cb0 after the floats and bools, from `state_register` on (SM_STATE_*): whoever draws fills them
+ *               in from the render states - sm_state_none() for a draw with neither. The fog factor is the vertex shader's (TEXCOORD8) or made of
+ *               the pixel's depth, which the shader reads as its position (input register 16).
  *   samplers    s<n> is texture t<n> with sampler s<n>, two-dimensional. A pixel shader 1.x names no samplers: its stage n is that pair.
  *
  * Pixel shaders 1.x are another instruction set over the same tokens: the texture registers t<n> are filled by instructions that sample stage n at
@@ -59,7 +63,8 @@ typedef struct SmShader {
   unsigned float_registers;             /* c0 .. c<n-1> are read from cb0 */
   int relative;                         /* ... through a0 as well */
   int bools_used;                       /* b0 .. b15 follow the floats */
-  unsigned constant_registers;          /* all of cb0: the floats, and the bools if used */
+  unsigned constant_registers;          /* all of cb0: the floats, the bools if used, and a pixel shader's state registers */
+  unsigned state_register;              /* a pixel shader: the first of its SM_STATE_REGISTERS state registers */
   unsigned sampler_mask;
   SmInput inputs[16];                   /* a vertex shader's declared inputs */
   unsigned input_count;
@@ -74,6 +79,21 @@ typedef struct SmShader {
 #define SM_SLOT_COLOR 1
 #define SM_SLOT_TEXCOORD 3
 #define SM_SLOTS 16
+
+/* The state registers of a pixel shader, from `state_register` on. */
+#define SM_STATE_REGISTERS 5u
+#define SM_STATE_ALPHA 0u               /* x: the reference of the alpha test, 0 .. 255 */
+#define SM_STATE_ALPHA_KEEP 1u          /* x, y, z: 1 where an alpha below, equal to, above the reference keeps the pixel, else 0 */
+#define SM_STATE_FOG_COLOUR 2u          /* x, y, z: the fog's colour */
+#define SM_STATE_FOG 3u                 /* x, y: the linear factor is depth * x + y; z, w: the exponential one is 2 ^ -(depth * (z + w * depth)) */
+#define SM_STATE_FOG_SOURCE 4u          /* the factor is x * the vertex shader's + y * the linear + z * the exponential + w */
+
+/* The state registers of a draw with no alpha test and no fog. */
+static void sm_state_none(float state[SM_STATE_REGISTERS][4]) {
+  memset(state, 0, sizeof(float) * 4 * SM_STATE_REGISTERS);
+  state[SM_STATE_ALPHA_KEEP][0] = state[SM_STATE_ALPHA_KEEP][1] = state[SM_STATE_ALPHA_KEEP][2] = 1.0f;
+  state[SM_STATE_FOG_SOURCE][3] = 1.0f;
+}
 
 /* ---- the Direct3D 9 side ---------------------------------------------------------------------------------------------------------------------------- */
 
@@ -112,7 +132,9 @@ enum { DXT_TEMP = 0, DXT_INPUT = 1, DXT_OUTPUT = 2, DXT_IMMEDIATE = 4, DXT_SAMPL
 #define DX_ONE_BITS 0x3F800000u
 #define DX_TEMP_ADDRESS 32u             /* the integer copy of a0 */
 #define DX_TEMP_SCRATCH 33u             /* 33 .. 37: what a translated instruction needs for itself */
-#define DX_TEMPS 38u
+#define DX_TEMP_COLOUR 38u              /* a pixel shader's colour (oC0) until its end */
+#define DX_TEMPS 39u
+#define DX_INPUT_POSITION 16u           /* a pixel shader's position, declared as such */
 #define DX_TEMP_PS1_TEXTURE 8u          /* a pixel shader 1.1 to 1.3: 8 .. 13 are its t0 .. t5 */
 #define DX_TEMP_PS1_SOURCE 16u          /* ... 16 .. 19: a source with one of its modifiers, worked out */
 #define DX_TEMP_PS1_ROWS 20u            /* ... the rows of a matrix that texm3x2pad and texm3x3pad leave for the instruction that ends it */
@@ -324,7 +346,7 @@ static int sm_destination(SmContext *c, const SmParam *p, DxOperand *o) {
     case SMR_COLOROUT:
       if (s->vertex) return SM_INVALID;
       if (p->number != 0) return SM_UNSUPPORTED;
-      *o = dx_dst(DXT_OUTPUT, 0, p->mask);
+      *o = dx_dst(DXT_TEMP, DX_TEMP_COLOUR, p->mask);      /* (the end of the shader does the alpha test and fog, and writes it out) */
       return SM_OK;
     default:
       return SM_UNSUPPORTED;
@@ -816,6 +838,38 @@ static unsigned sm_parameters_ps1(unsigned op, unsigned minor) {
   }
 }
 
+/* The end of a pixel shader: the alpha test and fog on the colour it made, by the state registers (from `state` on), and the colour out. */
+static void sm_pixel_end(SmContext *c, unsigned state) {
+  const SmShader *s = c->out;
+  const unsigned colour = s->major == 1 ? 0u : (unsigned)DX_TEMP_COLOUR;      /* (pixel shaders 1.x: r0) */
+  const DxOperand reference = dx_constant(state + SM_STATE_ALPHA, 0, 0, 0, 0);
+  /* the alpha as the eight bits Direct3D 9 compares, against the reference: below, equal, above as 1 or 0, times what each keeps */
+  sm_emit2(c, DXO_MOV, DX_SATURATE, sm_scratch(0, 0x8), dx_temp(colour, SM_SWIZZLE_OF(3)));
+  sm_emit3(c, DXO_MUL, 0, sm_scratch(0, 0x8), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(3)), dx_immediate(255, 255, 255, 255));
+  sm_emit2(c, DXO_ROUND_NE, 0, sm_scratch(0, 0x8), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(3)));
+  sm_emit3(c, DXO_LT, 0, sm_scratch(1, 0x1), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(3)), reference);
+  sm_emit3(c, DXO_EQ, 0, sm_scratch(1, 0x2), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(3)), reference);
+  sm_emit3(c, DXO_LT, 0, sm_scratch(1, 0x4), reference, dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(3)));
+  sm_emit3(c, DXO_AND, 0, sm_scratch(1, 0x7), sm_scratch_source(1), dx_immediate_bits(DX_ONE_BITS));
+  sm_emit3(c, DXO_DP3, 0, sm_scratch(1, 0x1), sm_scratch_source(1), dx_constant(state + SM_STATE_ALPHA_KEEP, DX_SWIZZLE_XYZW, 0, 0, 0));
+  sm_emit1(c, DXO_DISCARD, 0, dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH + 1, 0));
+  if (s->major < 3) {      /* fog: the colour goes towards the fog's by a factor (Shader Model 3 leaves fog to the shader) */
+    const DxOperand depth = dx_src(DXT_INPUT, DX_INPUT_POSITION, SM_SWIZZLE_OF(2), 0);
+    const DxOperand fog_colour = dx_constant(state + SM_STATE_FOG_COLOUR, DX_SWIZZLE_XYZW, 0, 0, 0);
+    c->out->varying_mask |= 1u << (SM_SLOT_TEXCOORD + 8);
+    sm_emit2(c, DXO_MOV, DX_SATURATE, sm_scratch(0, 0x1), dx_src(DXT_INPUT, SM_SLOT_TEXCOORD + 8, 0, 0));
+    sm_emit4(c, DXO_MAD, DX_SATURATE, sm_scratch(0, 0x2), depth, dx_constant(state + SM_STATE_FOG, 0, 0, 0, 0), dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(1), 0, 0, 0));
+    sm_emit4(c, DXO_MAD, 0, sm_scratch(0, 0x4), depth, dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(3), 0, 0, 0), dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(2), 0, 0, 0));
+    sm_emit3(c, DXO_MUL, 0, sm_scratch(0, 0x4), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(2)), depth);
+    sm_emit2(c, DXO_EXP, DX_SATURATE, sm_scratch(0, 0x4), dx_src(DXT_TEMP, DX_TEMP_SCRATCH, SM_SWIZZLE_OF(2), 1));
+    sm_emit2(c, DXO_MOV, 0, sm_scratch(0, 0x8), dx_immediate(1, 1, 1, 1));
+    sm_emit3(c, DXO_DP4, 0, sm_scratch(0, 0x1), sm_scratch_source(0), dx_constant(state + SM_STATE_FOG_SOURCE, DX_SWIZZLE_XYZW, 0, 0, 0));
+    sm_emit3(c, DXO_ADD, 0, sm_scratch(1, 0x7), dx_temp(colour, DX_SWIZZLE_XYZW), dx_constant(state + SM_STATE_FOG_COLOUR, DX_SWIZZLE_XYZW, 1, 0, 0));
+    sm_emit4(c, DXO_MAD, 0, dx_dst(DXT_TEMP, colour, 0x7), dx_temp(DX_TEMP_SCRATCH, 0), sm_scratch_source(1), fog_colour);
+  }
+  sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, 0, 0xF), dx_temp(colour, DX_SWIZZLE_XYZW));
+}
+
 /* ---- reading a shader ---------------------------------------------------------------------------------------------------------------------------------- */
 
 static void sm_put32(uint8_t *at, uint32_t v) { at[0] = (uint8_t)v; at[1] = (uint8_t)(v >> 8); at[2] = (uint8_t)(v >> 16); at[3] = (uint8_t)(v >> 24); }
@@ -966,7 +1020,10 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (c->failed) return SM_UNSUPPORTED;      /* (too long) */
   }
   if (!ended) return SM_INVALID;
-  if (!out->vertex && out->major == 1) sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, 0, 0xF), dx_temp(0, DX_SWIZZLE_XYZW));      /* (the colour is what r0 holds) */
+  if (!out->vertex) {      /* (a pixel shader's state registers come after its floats and bools, which are all known now) */
+    out->state_register = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
+    sm_pixel_end(c, out->state_register);
+  }
   sm_emit(c, DXO_RET, 0, NULL, 0);
   if (c->failed) return SM_UNSUPPORTED;
   if (out->vertex && !(out->varying_mask & 1u)) return SM_INVALID;      /* (no position) */
@@ -976,7 +1033,7 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
     if (out->float_registers > SM_RELATIVE_REGISTERS) return SM_UNSUPPORTED;
     out->float_registers = SM_RELATIVE_REGISTERS;
   }
-  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u);
+  out->constant_registers = out->float_registers + (out->bools_used ? SM_BOOL_REGISTERS : 0u) + (out->vertex ? 0u : SM_STATE_REGISTERS);
   if (out->constant_registers > 256) return SM_UNSUPPORTED;
   for (unsigned i = 0; i < c->bool_words; ++i) c->code[c->bool_word[i]] += out->float_registers;      /* (the bools' elements were written as their numbers) */
 
@@ -984,7 +1041,7 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
   {
     uint8_t *b = out->dxbc;
     size_t size = 32 + 12, chunk_at[3];
-    uint32_t declarations[4 + 16 * 4 + 2];
+    uint32_t declarations[4 + 16 * 4 + 4 + 2];
     unsigned declaration_words = 0;
     static const char position_name[] = "SV_Position", colour_name[] = "COLOR", coordinate_name[] = "TEXCOORD", target_name[] = "SV_Target", attribute_name[] = "ATTR";
     for (unsigned chunk = 0; chunk < 2; ++chunk) {      /* 0: the inputs, 1: the outputs */
@@ -1046,6 +1103,12 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
       declarations[declaration_words++] = ((unsigned)DXT_RESOURCE << 12) | (1u << 20);
       declarations[declaration_words++] = unit;
       declarations[declaration_words++] = 0x5555;
+    }
+    if (!out->vertex && out->major < 3) {      /* dcl_input_ps_siv linear v16.xyzw, position: the depth fog is made of */
+      declarations[declaration_words++] = 100u | (2u << 11) | (4u << 24);
+      declarations[declaration_words++] = 2u | (0xFu << 4) | ((unsigned)DXT_INPUT << 12) | (1u << 20);
+      declarations[declaration_words++] = DX_INPUT_POSITION;
+      declarations[declaration_words++] = 1;
     }
     declarations[declaration_words++] = DXO_DCL_TEMPS | (2u << 24);
     declarations[declaration_words++] = DX_TEMPS;

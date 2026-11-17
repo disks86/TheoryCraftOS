@@ -34,6 +34,11 @@ static void state_defaults(State *s, BOOL depth, UINT width, UINT height) {
   s->rs[D3DRS_CULLMODE] = D3DCULL_CCW;
   s->rs[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
   s->rs[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+  {
+    const float one = 1.0f;
+    memcpy(&s->rs[D3DRS_FOGEND], &one, 4);
+    memcpy(&s->rs[D3DRS_FOGDENSITY], &one, 4);
+  }
   s->rs[D3DRS_STENCILFAIL] = s->rs[D3DRS_STENCILZFAIL] = s->rs[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
   s->rs[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
   s->rs[D3DRS_STENCILMASK] = s->rs[D3DRS_STENCILWRITEMASK] = 0xFFFFFFFFu;
@@ -322,6 +327,8 @@ static HRESULT shader_make(Dev *d, const DWORD *code, BOOL vertex, Shader **out)
       s->floats = translated->float_registers;
       s->bools = translated->bools_used;
       s->registers = translated->constant_registers;
+      s->major = translated->major;
+      s->state = translated->state_register;
       for (UINT i = 0; i < 16; ++i) if (translated->sampler_mask >> i & 1) s->sampler_count = i + 1;
       s->input_count = translated->input_count;
       memcpy(s->inputs, translated->inputs, sizeof s->inputs);
