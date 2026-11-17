@@ -79,6 +79,7 @@ static BOOL attribute_inside(const Attribute *a, const Source *sources, UINT fir
 static void decode_vertices(const Layout *l, const Source *sources, UINT first, UINT count, BYTE *out) {
   for (UINT v = 0; v < count; ++v, out += VERTEX_BYTES) {
     float *f = (float *)out, value[4];
+    f[3] = 1.0f;      /* (the fourth of a position that are pixels is 1 / w; one of three numbers has none) */
     decode_element(l->position.type, sources[l->position.stream].data + (SIZE_T)(first + v) * sources[l->position.stream].stride + l->position.offset, f);
     f[4] = f[5] = f[6] = f[7] = 1.0f;
     f[8] = f[9] = f[10] = f[11] = 0.0f;
@@ -88,6 +89,14 @@ static void decode_vertices(const Layout *l, const Source *sources, UINT first, 
       decode_element(l->texture[t].type, sources[l->texture[t].stream].data + (SIZE_T)(first + v) * sources[l->texture[t].stream].stride + l->texture[t].offset, value);
       f[8 + 2 * t] = value[0];
       f[9 + 2 * t] = value[1];
+    }
+    /* the fog factor a vertex brings is the alpha of its second colour; a vertex without one brings none (1) */
+    f[12] = 1.0f;
+    f[13] = 0.0f;
+    if (l->specular.type != 255) {
+      value[3] = 1.0f;
+      decode_element(l->specular.type, sources[l->specular.stream].data + (SIZE_T)(first + v) * sources[l->specular.stream].stride + l->specular.offset, value);
+      f[12] = value[3];
     }
   }
 }
@@ -191,10 +200,11 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
     if (p->last_used < oldest->last_used) oldest = p;
   }
 
-  static const D3D12_INPUT_ELEMENT_DESC layout[4] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+  static const D3D12_INPUT_ELEMENT_DESC layout[5] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                                                      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                                                      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                                                     {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+                                                     {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                                                     {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
   memset(&pd, 0, sizeof pd);
   /* (a program's vertex shader: its inputs are "ATTR" and the number of the register, each four floats, in the order the vertices are decoded in) */
@@ -236,7 +246,7 @@ static ID3D12PipelineState *pipeline_get(Dev *d, const Shader *vs, const Shader 
   pd.DepthStencilState.FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)key.sfunc;
   pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
   pd.InputLayout.pInputElementDescs = vs ? inputs : layout;
-  pd.InputLayout.NumElements = vs ? vs->input_count : 4;
+  pd.InputLayout.NumElements = vs ? vs->input_count : 5;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
   pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -303,14 +313,14 @@ static BOOL fog_terms(const State *s, DWORD mode, float fog[4], float source[4])
   source[3] = 0.0f;
   return TRUE;
 }
-/* Whether the fixed-function vertex stage works out the fog factor of this draw: fog is on, by the vertex (no table mode), and the positions are
- * not pixels already. */
+/* Whether the fixed-function vertex stage works out the fog factor of this draw: fog is on, by the vertex (no table mode) in a mode, and the
+ * positions are not pixels already. (Where fog is by the vertex and this is not so, the factor is the one the vertex brings.) */
 static BOOL vertex_fog(const State *s, const Layout *l) {
   return s->rs[D3DRS_FOGENABLE] && s->rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE && s->rs[D3DRS_FOGVERTEXMODE] != D3DFOG_NONE && !l->transformed;
 }
 /* The state registers of a pixel shader (sm_to_dxbc.h; the fixed-function one has the same), out of the render states: the alpha test, and fog
  * if the shader does fog (`fog`: not Shader Model 3) - by the depth of the pixel when a table mode is set (its w if `by_w`, else its z), else by
- * the factor the vertex stage gives if it gives one (`vertex_factor`). */
+ * the factor the vertex stage gives (`vertex_factor`: it gives one - the fixed-function one always does, 1 where there is no fog by the vertex). */
 static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_factor, BOOL by_w) {
   float state[SM_STATE_REGISTERS][4];
   sm_state_none(state);
@@ -336,10 +346,10 @@ static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_facto
   memcpy(out, state, sizeof state);
 }
 /* Whether fog by the pixel's depth goes by w: Direct3D 9 takes the depth before the projection where the projection matrix is a perspective one
- * (its fourth column is not 0 0 0 1), and z where it is not. Vertices that are pixels already bring no such depth here: z. */
-static BOOL fog_by_w(const State *s, const Layout *l) {
+ * (its fourth column is not 0 0 0 1), and z where it is not. Vertices that are pixels already bring their w (as 1 / w), and the same holds. */
+static BOOL fog_by_w(const State *s) {
   const D3DMATRIX *p = &s->projection;
-  return !l->transformed && (p->m[0][3] != 0.0f || p->m[1][3] != 0.0f || p->m[2][3] != 0.0f || p->m[3][3] != 1.0f);
+  return (p->m[0][3] != 0.0f || p->m[1][3] != 0.0f || p->m[2][3] != 0.0f || p->m[3][3] != 1.0f);
 }
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
 static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
@@ -371,12 +381,15 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
           block[40 + row] = world_view.m[row][1];
         }
       fog_terms(s, s->rs[D3DRS_FOGVERTEXMODE], block + 28, block + 32);
+    } else if (s->rs[D3DRS_FOGENABLE] && s->rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE) {      /* the factor the vertex brings */
+      block[32] = 1.0f;
+      block[35] = 0.0f;
     }
   }
   float *pixel = block + vertex_registers * 4;
   if (ps) {
     shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
-    shader_state(pixel + ps->state * 4, s, ps->major < 3, vs ? TRUE : vertex_fog(s, l), fog_by_w(s, l));
+    shader_state(pixel + ps->state * 4, s, ps->major < 3, TRUE, fog_by_w(s));
   } else {
     BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
     for (UINT stage = 0; stage < STAGES; ++stage) {
@@ -387,7 +400,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
       stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
       stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
     }
-    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, vs ? TRUE : vertex_fog(s, l), fog_by_w(s, l));
+    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, TRUE, fog_by_w(s));
   }
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;
@@ -496,7 +509,8 @@ static HRESULT draw(Dev *d, D3DPRIMITIVETYPE type, UINT primitives, const Source
   } else {
     if (layout.position.type == 255) return D3DERR_INVALIDCALL;
     if (!attribute_inside(&layout.position, sources, first_vertex, vertices) || !attribute_inside(&layout.colour, sources, first_vertex, vertices) ||
-        !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices))
+        !attribute_inside(&layout.texture[0], sources, first_vertex, vertices) || !attribute_inside(&layout.texture[1], sources, first_vertex, vertices) ||
+        !attribute_inside(&layout.specular, sources, first_vertex, vertices))
       return D3DERR_INVALIDCALL;
   }
   const UINT stride = vs ? 16 * (vs->input_count ? vs->input_count : 1) : VERTEX_BYTES;

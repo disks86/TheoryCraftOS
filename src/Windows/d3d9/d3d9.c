@@ -65,7 +65,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define TEXTURE_SLOTS 16u              /* the stages a program may set textures and states of: the samplers of a pixel shader */
 #define ROOTS 4u                       /* root signatures: for 2, 4, 8 and 16 textures */
 #define STREAMS 4u
-#define VERTEX_BYTES 48u               /* a decoded vertex: position (4 floats), colour (4), two texture coordinates (2 + 2) */
+#define VERTEX_BYTES 56u               /* a decoded vertex: position (4 floats), colour (4), two texture coordinates (2 + 2), the fog factor it brings (1 + 1 unused) */
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
@@ -137,6 +137,7 @@ typedef struct Surface {
 typedef struct Attribute { BYTE stream, type; WORD offset; } Attribute;
 typedef struct Layout {
   Attribute position, colour, texture[2];
+  Attribute specular;            /* the second colour: its alpha is the fog factor the vertex brings */
   int transformed;               /* the positions are pixels (XYZRHW) */
 } Layout;
 typedef struct Decl {

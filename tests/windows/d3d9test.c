@@ -672,6 +672,13 @@ static void world_quad(float z) {
   IDirect3DDevice9_SetFVF(g_device, FVF_WORLD);
   IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
 }
+/* A white rectangle of vertices that are pixels over the whole target, with a depth, a 1 / w and a second colour. */
+static void fog_quad(float z, float rhw, DWORD specular) {
+  const struct { float x, y, z, rhw; DWORD colour, specular; } v[4] = {{0, 0, z, rhw, 0xFFFFFFFF, specular}, {64, 0, z, rhw, 0xFFFFFFFF, specular},
+                                                                        {0, 64, z, rhw, 0xFFFFFFFF, specular}, {64, 64, z, rhw, 0xFFFFFFFF, specular}};
+  IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR);
+  IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+}
 static void test_fog(void) {
   D3DCAPS9 caps;
   memset(&caps, 0, sizeof caps);
@@ -757,15 +764,25 @@ static void test_fog(void) {
   check(pass && near_colour(pixel(32, 32), 94, 94, 255), "... and after a pixel shader: exponential fog of the depth 2");
   IDirect3DDevice9_SetPixelShader(g_device, NULL);
   if (pass) IDirect3DPixelShader9_Release(pass);
-  /* vertices that are pixels already go by z whatever the projection */
+  /* vertices that are pixels already bring their w, as 1 / w: here 2, half way through the fog again, whatever their z */
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+  clear(0xFF000000);
+  fog_quad(0.25f, 0.5f, 0);
+  read_back();
+  check(near_colour(pixel(32, 32), 128, 128, 255) && near_colour(pixel(2, 2), 128, 128, 255) && near_colour(pixel(61, 61), 128, 128, 255),
+        "vertices that are pixels have fog by the w they bring under a perspective projection");
+  clear(0xFF000000);
+  fog_quad(0.25f, 0.0f, 0);
+  read_back();
+  check(near_colour(pixel(32, 32), 255, 255, 255), "... and a 1 / w of 0 counts as 1, which is where this fog starts");
+  /* ... and without one fog goes by their z */
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &identity);
   set_float_state(D3DRS_FOGSTART, 0.0f);
   set_float_state(D3DRS_FOGEND, 1.0f);
   clear(0xFF000000);
-  screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
+  fog_quad(0.25f, 0.5f, 0);
   read_back();
-  check(near_colour(pixel(32, 32), 128, 128, 255), "vertices that are pixels have fog by their z, whatever the projection");
-  IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &identity);
+  check(near_colour(pixel(32, 32), 191, 191, 255), "vertices that are pixels have fog by their z where the projection is not a perspective");
   set_float_state(D3DRS_FOGDENSITY, 2.0f);
   /* fog by the vertex: the depth in view space, here the vertices' z (identity matrices) */
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
@@ -806,7 +823,24 @@ static void test_fog(void) {
   world_quad(0.25f);
   read_back();
   check(near_colour(pixel(32, 32), 155, 155, 255), "exponential fog by the vertex");
-  /* vertices that are pixels already have no vertex fog; and with fog off there is none */
+  /* vertices that are pixels already bring their fog factor: the alpha of their second colour, whatever the mode */
+  clear(0xFF000000);
+  fog_quad(0.5f, 1.0f, 0x40FFFFFF);
+  read_back();
+  check(near_colour(pixel(32, 32), 64, 64, 255), "vertices that are pixels bring their fog factor in the second colour's alpha");
+  /* ... and so do the others where fog by the vertex has no mode */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+  {
+    const struct { float x, y, z; DWORD colour, specular; } v[4] = {{-0.5f, 0.5f, 0.25f, 0xFFFFFFFF, 0x80000000}, {0.5f, 0.5f, 0.25f, 0xFFFFFFFF, 0x80000000},
+                                                                    {-0.5f, -0.5f, 0.25f, 0xFFFFFFFF, 0x80000000}, {0.5f, -0.5f, 0.25f, 0xFFFFFFFF, 0x80000000}};
+    clear(0xFF000000);
+    IDirect3DDevice9_SetFVF(g_device, D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_SPECULAR);
+    IDirect3DDevice9_DrawPrimitiveUP(g_device, D3DPT_TRIANGLESTRIP, 2, v, sizeof v[0]);
+    read_back();
+    check(near_colour(pixel(32, 32), 128, 128, 255) && pixel(4, 32) == 0, "fog by the vertex without a mode is the factor the vertices bring");
+  }
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_EXP);
+  /* vertices without a second colour bring none; and with fog off there is none */
   clear(0xFF000000);
   screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
   read_back();
@@ -815,7 +849,7 @@ static void test_fog(void) {
   clear(0xFF000000);
   world_quad(0.25f);
   read_back();
-  check(untouched && pixel(32, 32) == 0xFFFFFF, "no vertex fog on vertices that are pixels, and none at all with fog switched off");
+  check(untouched && pixel(32, 32) == 0xFFFFFF, "no fog by the vertex on vertices without a second colour, and none at all with fog switched off");
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_CULLMODE, D3DCULL_CCW);
 }
