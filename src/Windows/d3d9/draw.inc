@@ -360,10 +360,16 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
     block[18] = l->transformed ? 1.0f : 0.0f;
     block[20] = (float)s->viewport.X;
     block[21] = (float)s->viewport.Y;
-    /* vertex fog: by the depth in view space (the third column of world * view), in the mode the render state names; else the factor is 1 */
+    /* vertex fog: by the depth in view space (the third column of world * view), or with range fog by the distance from the eye (the first two
+     * columns as well), in the mode the render state names; else the factor is 1 */
     block[35] = 1.0f;
     if (vertex_fog(s, l)) {
       for (int row = 0; row < 4; ++row) block[24 + row] = world_view.m[row][2];
+      if (s->rs[D3DRS_RANGEFOGENABLE])
+        for (int row = 0; row < 4; ++row) {
+          block[36 + row] = world_view.m[row][0];
+          block[40 + row] = world_view.m[row][1];
+        }
       fog_terms(s, s->rs[D3DRS_FOGVERTEXMODE], block + 28, block + 32);
     }
   }

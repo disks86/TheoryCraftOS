@@ -7807,11 +7807,11 @@ void test_dxbc_system_values() {
       UniquePointer<D3d9Program> cp = compile_dxbc(allocator, cbuf_blob, &st);
       CHECK(cp && st == status::kSuccess);
       // The two shaders of d3d9.dll's fixed-function pipeline (src/Windows/d3d9/shaders.inc, made from ff_vs.hlsl and ff_ps.hlsl): the kernel takes
-      // them, the vertex shader with 6 registers of constants and the pixel shader with its 5 after those.
+      // them, the vertex shader with 11 registers of constants and the pixel shader with its 9 after those.
       {
         UniquePointer<D3d9Program> fixed_vs, fixed_ps;
-        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_vs, sizeof(g_ff_vs)), &fixed_vs) == status::kSuccess && fixed_vs && fixed_vs->constant_bytes() == 9 * 16);
-        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_ps, sizeof(g_ff_ps)), &fixed_ps, 9) == status::kSuccess && fixed_ps && fixed_ps->constant_bytes() == 18 * 16);
+        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_vs, sizeof(g_ff_vs)), &fixed_vs) == status::kSuccess && fixed_vs && fixed_vs->constant_bytes() == 11 * 16);
+        CHECK(D3d9Program::compile_dxbc(allocator, ConstByteView(g_ff_ps, sizeof(g_ff_ps)), &fixed_ps, 11) == status::kSuccess && fixed_ps && fixed_ps->constant_bytes() == 20 * 16);
         CHECK(fixed_vs && fixed_vs->stage() == graphics::ShaderStage::Vertex && fixed_ps && fixed_ps->stage() == graphics::ShaderStage::Fragment);
         CHECK(fixed_ps && fixed_ps->texture_unit_mask() == 3);
       }

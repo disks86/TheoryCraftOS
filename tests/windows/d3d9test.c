@@ -786,6 +786,21 @@ static void test_fog(void) {
   check(near_colour(pixel(32, 32), 128, 128, 255), "... and it is the depth after the view matrix");
   view.m[3][2] = 0.0f;
   IDirect3DDevice9_SetTransform(g_device, D3DTS_VIEW, &view);
+  /* range fog: by the distance from the eye - the corners are at (+-0.5, +-0.5, 0.25), three quarters away, and so is the middle between them */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_RANGEFOGENABLE, TRUE);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check((caps.RasterCaps & D3DPRASTERCAPS_FOGRANGE) && near_colour(pixel(32, 32), 64, 64, 255) && pixel(4, 32) == 0,
+        "range fog by the vertex: the distance from the eye, not the depth");
+  /* ... which fog by the pixel does not have */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+  clear(0xFF000000);
+  world_quad(0.25f);
+  read_back();
+  check(near_colour(pixel(32, 32), 191, 191, 255), "range fog does nothing to fog by the pixel");
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_RANGEFOGENABLE, FALSE);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_EXP);
   clear(0xFF000000);
   world_quad(0.25f);

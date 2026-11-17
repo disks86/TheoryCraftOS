@@ -69,7 +69,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #define VERTEX_RING (1u << 20)       /* (21845 vertices a draw at most. The rings are kept small: each is there three times - here, in the kernel, on the device) */
 #define INDEX_RING (256u << 10)
 #define CONSTANT_RING (256u << 10)
-#define VERTEX_REGISTERS 9u            /* the constants of the fixed-function vertex shader, in registers of four floats */
+#define VERTEX_REGISTERS 11u           /* the constants of the fixed-function vertex shader, in registers of four floats */
 #define PIXEL_REGISTERS 9u             /* ... of the fixed-function pixel shader, which follow the vertex shader's in the block of a draw */
 #define PIXEL_STATE_REGISTER 4u        /* ... of which the last five are the alpha test and fog, as at the end of a program's pixel shader */
 #define CONSTANT_REGISTERS 256u        /* the block of a draw, at most */
