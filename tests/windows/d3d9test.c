@@ -395,11 +395,11 @@ static void test_shaders(void) {
         IDirect3DDevice9_CreatePixelShader(g_device, g_ps_math_ps_3_0, &ps_math30) == D3D_OK && ps_math30 &&
         IDirect3DDevice9_CreatePixelShader(g_device, g_ps_tex_ps_2_0, &ps_tex) == D3D_OK && ps_tex, "CreatePixelShader (ps_2_0, ps_3_0, one that samples)");
   if (!vs || !vs11 || !vs30 || !ps_math || !ps_math30 || !ps_tex) return;
-  static const DWORD ps11[] = {0xFFFF0101, 0x00000042, 0xB00F0000, 0x00000001, 0x800F0000, 0xB0E40000, 0x0000FFFF};      /* ps_1_1: tex t0; mov r0, t0 */
+  static const DWORD bump[] = {0xFFFF0101, 0x00000042, 0xB00F0000, 0x00000043, 0xB00F0001, 0xB0E40000, 0x0000FFFF};      /* ps_1_1: tex t0; texbem t1, t0 */
   check(FAILED(IDirect3DDevice9_CreateVertexShader(g_device, g_ps_math_ps_2_0, &wrong_vs)) && wrong_vs == NULL &&
         FAILED(IDirect3DDevice9_CreatePixelShader(g_device, g_vs_basic_vs_2_0, &wrong_ps)) && wrong_ps == NULL &&
-        FAILED(IDirect3DDevice9_CreatePixelShader(g_device, ps11, &wrong_ps)) && FAILED(IDirect3DDevice9_CreateVertexShader(g_device, NULL, &wrong_vs)),
-        "a shader of the other stage, a pixel shader 1.1 and no shader at all are refused");
+        FAILED(IDirect3DDevice9_CreatePixelShader(g_device, bump, &wrong_ps)) && FAILED(IDirect3DDevice9_CreateVertexShader(g_device, NULL, &wrong_vs)),
+        "a shader of the other stage, one with an instruction that is not there (texbem) and no shader at all are refused");
   DWORD code[256];
   UINT size = 0;
   IDirect3DDevice9 *owner = NULL;
@@ -508,6 +508,53 @@ static void test_shaders(void) {
   read_back();
   check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 8), 0, 255, 0) && near_colour(pixel(8, 56), 0, 0, 255) && pixel(56, 56) == 0x202020,
         "a pixel shader after the fixed-function vertex stage, with its constant as the tint");
+
+  /* pixel shaders 1.x, written as tokens: stage 0's texture times the vertex colour; in 1.4 the texture times a constant, less the colour */
+  static const DWORD ps11[] = {0xFFFF0101, 0x00000042, 0xB00F0000,                              /* ps_1_1; tex t0 */
+                               0x00000005, 0x800F0000, 0xB0E40000, 0x90E40000, 0x0000FFFF};      /* mul r0, t0, v0 */
+  static const DWORD ps11x2[] = {0xFFFF0101, 0x00000042, 0xB00F0000,                             /* ps_1_1; tex t0 */
+                                 0x00000005, 0x811F0000, 0xB0E40000, 0x90E40000, 0x0000FFFF};    /* mul_x2_sat r0, t0, v0 */
+  static const DWORD ps14[] = {0xFFFF0104, 0x00000042, 0x800F0000, 0xB0E40000,                   /* ps_1_4; texld r0, t0 */
+                               0x00000004, 0x800F0000, 0x80E40000, 0xA0E40000, 0x91E40000,       /* mad r0, r0, c0, -v0 */
+                               0x0000FFFF};
+  IDirect3DPixelShader9 *old = NULL, *doubled = NULL, *newer = NULL;
+  check(IDirect3DDevice9_CreatePixelShader(g_device, ps11, &old) == D3D_OK && old && IDirect3DDevice9_CreatePixelShader(g_device, ps11x2, &doubled) == D3D_OK && doubled &&
+        IDirect3DDevice9_CreatePixelShader(g_device, ps14, &newer) == D3D_OK && newer, "CreatePixelShader (ps_1_1 and ps_1_4)");
+  if (old && doubled && newer) {
+    IDirect3DDevice9_SetPixelShader(g_device, old);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFF808080);
+    read_back();
+    check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 8), 0, 128, 0) && near_colour(pixel(8, 56), 0, 0, 128) && near_colour(pixel(56, 56), 128, 128, 128),
+          "a pixel shader 1.1: the stage's texture times the vertex colour");
+    IDirect3DDevice9_SetPixelShader(g_device, doubled);
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFF404040);
+    read_back();
+    check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 56), 128, 128, 128), "... with the result doubled (_x2)");
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFFC0C0C0);
+    read_back();
+    check(near_colour(pixel(8, 8), 255, 0, 0) && near_colour(pixel(56, 56), 255, 255, 255), "... and kept below 1 (_sat)");
+    /* the same through the program's vertex shader, which doubles the coordinates */
+    IDirect3DDevice9_SetPixelShader(g_device, old);
+    clear(0xFF202020);
+    shader_quad(0xFFFFFFFF);
+    read_back();
+    check(pixel(8, 8) == 0xFF0000 && pixel(24, 8) == 0x00FF00 && pixel(40, 8) == 0xFF0000 && pixel(8, 24) == 0x0000FF, "a pixel shader 1.1 after a vertex shader 2.0");
+    IDirect3DDevice9_SetPixelShader(g_device, newer);
+    IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, half, 1);      /* (0.5 1 1 1) */
+    clear(0xFF202020);
+    textured_quad(0, 0, 64, 64, 0xFF004000);
+    read_back();
+    check(near_colour(pixel(8, 8), 128, 0, 0) && near_colour(pixel(56, 8), 0, 191, 0) && near_colour(pixel(56, 56), 128, 191, 255),
+          "a pixel shader 1.4: texld, a constant and a negated colour");
+  }
+  IDirect3DDevice9_SetPixelShader(g_device, ps_tex);
+  IDirect3DDevice9_SetPixelShaderConstantF(g_device, 0, half, 1);
+  if (old) IDirect3DPixelShader9_Release(old);
+  if (doubled) IDirect3DPixelShader9_Release(doubled);
+  if (newer) IDirect3DPixelShader9_Release(newer);
 
   /* a state block keeps the shaders and their constants */
   IDirect3DStateBlock9 *block = NULL;

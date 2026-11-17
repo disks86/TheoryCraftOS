@@ -38,7 +38,7 @@ and two sets of texture coordinates. A shader the translator refuses cannot be m
 
 | Direct3D 9 | in the translation |
 |---|---|
-| vs_1_1, vs_2_x, vs_3_0, ps_2_x, ps_3_0 | taken. Pixel shaders 1.x are another instruction set and are refused. |
+| vs_1_1, vs_2_x, vs_3_0, ps_1_1 to ps_1_4, ps_2_x, ps_3_0 | taken. |
 | float constants `c<n>` | the registers of `cb0` up to the highest one the shader names; a shader that addresses them through `a0` gets 224. Constants a shader defines itself (`def`) are written into its code. |
 | bool constants `b<n>` | 16 registers after the floats, if the shader reads any; `defb` is decided when the shader is translated. |
 | inputs of a vertex shader | one register of four floats for each `dcl`, named `ATTR<register>`. A draw finds the element of the vertex declaration (or of the FVF code) with the same usage and index and decodes it on the CPU, whatever its type; an input the vertices have not is 0, 0, 0, 1. |
@@ -51,6 +51,16 @@ two shaders need more fails): `SetVertexShaderConstantF` keeps 256 registers, `S
 shaders read. A pipeline is cached for each pair of shaders and set of render states. Vertices whose positions are pixels already (XYZRHW)
 pass no vertex shader, as in Direct3D 9.
 
+**Pixel shaders 1.x** are another instruction set over the same tokens. Their `r<n>` are temporaries; their texture registers `t<n>`
+(written, below 1.4) are temporaries of their own, filled by the instructions that sample: stage n is texture `t<n>` with sampler `s<n>`,
+at the texture coordinates n. `tex`, `texcoord`, `texkill`, `texreg2ar`, `texreg2gb`, `texreg2rgb`, `texm3x2pad` with `texm3x2tex`,
+`texm3x3pad` with `texm3x3`, `texdp3` and `texdp3tex` are there, and of 1.4 `texld`, `texcrd` and `phase`. A source's modifier (`_bias`,
+`_bx2`, `1 - x`, `_x2`, `_dz`, `_dw`) is worked out into a temporary before the instruction; a destination's factor (`_x2`, `_x4`, `_d2`)
+is a multiplication after it, and the saturation comes after that. The colour is what `r0` holds at the end. Refused: the bump
+environment instructions (`texbem`, `texbeml`, `bem`: they read a matrix of the texture stage), the ones that look up a cube map
+(`texm3x3tex`, `texm3x3spec`, `texm3x3vspec`) and the ones that write the depth (`texdepth`, `texm3x2depth`). Values are not kept
+between -1 and 1 (or -8 and 8) as the hardware of the time did.
+
 Refused by the translator: loops, `rep`, subroutines and the `break` instructions, the predicate register, integer constants, cube and
 volume samplers, `texldl` and `texldd`, textures in a vertex shader, more than one render target, a depth the pixel shader writes, `vPos`
 and `vFace`.
@@ -61,7 +71,7 @@ in the program, in the kernel, on the device - and the kernel could not make rin
 
 ## What is not there
 
-- Of a program's shaders: pixel shaders 1.x and what the translator refuses (above). With a pixel shader of the program's there is no
+- Of a program's shaders: what the translator refuses (above). With a pixel shader of the program's there is no
   alpha test and no fog (both are the fixed-function pixel shader's work here); the half pixel between Direct3D 9's pixel centres and
   the rasterizer's is not made up for vertices that pass a vertex shader; a colour the vertex shader does not write reaches the pixel
   stage as 0, not as white. The caps say 3.0 although not every 3.0 shader can be made.
@@ -84,14 +94,15 @@ method that is written takes as many parameters as the interface gives it).
 `tests/SmToDxbcTest.cpp` (host, ASan and UBSan): shaders a compiler made (`tests/data/d3d9`, `scripts/gen-d3d9-test-shaders.sh`) are
 translated, the kernel's compiler takes the result, and the program it makes gives the same numbers as the kernel's own compiler for
 Direct3D 9 bytecode makes of the same shader; shaders written token by token give the numbers worked out for each kind of instruction
-(constants through `a0`, bools, branches, `texkill`, the outputs of Shader Model 3); what is refused; every shortened shader and 27000
+(constants through `a0`, bools, branches, `texkill`, the outputs of Shader Model 3, and pixel shaders 1.x with their modifiers, factors
+and texture registers); what is refused; every shortened shader and 30000
 with a bit turned.
 
-`tests/windows/d3d9test.c` (75 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/windows/d3d9test.c` (81 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
-stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage), drawing into a texture and sampling it, `GetRenderTargetData`,
+stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4), drawing into a texture and sampling it, `GetRenderTargetData`,
 `Present`, `Reset`, and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
 `tests/wow64_qemu.sh d3d9test` (32-bit); the same source built for x86-64 passes too. `DxgkrnlTest` checks that the kernel compiles the
 two shaders.

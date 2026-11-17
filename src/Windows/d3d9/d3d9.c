@@ -35,7 +35,7 @@
  *   textures    a Direct3D 12 texture of B8G8R8A8 whatever the program's format; a level is sent when it is unlocked.
  *   Present     the back buffer's pixels are read and put into the window (SetDIBitsToDevice), as dxgi.dll does for its swap chains.
  *
- * Not there: pixel shaders before 2.0 and what the translator refuses (loops, cube and volume samplers, more: docs/Direct3D9.md), lighting (a vertex has
+ * Not there: what the translator refuses of a program's shaders (loops, cube and volume samplers, more: docs/Direct3D9.md), lighting (a vertex has
  * its diffuse colour, or white), fog, texture transforms and generated coordinates, more than two texture stages, the stage operations beyond
  * select, modulate and add, cube and volume textures, compressed formats, multisampling, queries, clip planes, point sprites. */
 #define INITGUID

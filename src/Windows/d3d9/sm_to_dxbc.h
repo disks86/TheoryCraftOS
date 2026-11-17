@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/* Direct3D 9 shader bytecode (vs_1_1, vs_2_x, vs_3_0, ps_2_x, ps_3_0) into a DXBC container of Shader Model 4, which is what the kernel's Direct3D
+/* Direct3D 9 shader bytecode (vs_1_1, vs_2_x, vs_3_0, ps_1_1 to ps_1_4, ps_2_x, ps_3_0) into a DXBC container of Shader Model 4, which is what the kernel's Direct3D
  * compiles most of (src/Kernel/Dxgkrnl/D3d9Dxbc.cpp). Used by d3d9.dll (docs/Direct3D9.md) and, on the host, by tests/SmToDxbcTest.cpp. Plain C that
  * is also C++; it needs <stdint.h>, <stddef.h> and memcpy / memset from whoever includes it.
  *
@@ -28,11 +28,16 @@
  *               shader's inputs are the vertex shader's outputs by their semantics.
  *   between     COLOR0 / COLOR1, TEXCOORD0 .. TEXCOORD7; the fog factor is TEXCOORD8, and the other semantics of Shader Model 3 are TEXCOORD9 .. 12
  *               (NORMAL, TANGENT, BINORMAL, BLENDWEIGHT, each with index 0).
- *   samplers    s<n> is texture t<n> with sampler s<n>, two-dimensional.
+ *   samplers    s<n> is texture t<n> with sampler s<n>, two-dimensional. A pixel shader 1.x names no samplers: its stage n is that pair.
  *
- * Refused (SM_UNSUPPORTED): pixel shaders below 2.0; loops, subroutines and predicates (loop, rep, call, label, setp, break*); integer constants;
- * cube and volume samplers; texldl and texldd; several render targets and the depth output; vPos and vFace; textures in a vertex shader; the source
- * modifiers of pixel shaders 1.x. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
+ * Pixel shaders 1.x are another instruction set over the same tokens: the texture registers t<n> are filled by instructions that sample stage n at
+ * the texture coordinates n (or at something worked out of them), sources have modifiers that are arithmetic (_bias, _bx2, 1 - x, _x2, _dz, _dw),
+ * destinations a factor (_x2, _x4, _d2), and the colour is what r0 holds at the end. Their r<n> are the temporaries r<n> here, their t<n> (below
+ * 1.4, where they are written) the temporaries r<8 + n>.
+ *
+ * Refused (SM_UNSUPPORTED): of pixel shaders 1.x the bump environment instructions (texbem, texbeml, bem), the ones that look up a cube map
+ * (texm3x3tex, texm3x3spec, texm3x3vspec) and the ones that write the depth (texdepth, texm3x2depth); loops, subroutines and predicates (loop, rep, call, label, setp, break*); integer constants;
+ * cube and volume samplers; texldl and texldd; several render targets and the depth output; vPos and vFace; textures in a vertex shader. A malformed shader - a token stream that ends early, a register that is not there - is SM_INVALID. */
 #ifndef TCOS_SM_TO_DXBC_H
 #define TCOS_SM_TO_DXBC_H
 
@@ -76,7 +81,10 @@ enum { SMR_TEMP = 0, SMR_INPUT, SMR_CONST, SMR_ADDR, SMR_RASTOUT, SMR_ATTROUT, S
        SMR_CONST4, SMR_CONSTBOOL, SMR_LOOP, SMR_TEMPFLOAT16, SMR_MISC, SMR_LABEL, SMR_PREDICATE };
 enum { SMO_NOP = 0, SMO_MOV, SMO_ADD, SMO_SUB, SMO_MAD, SMO_MUL, SMO_RCP, SMO_RSQ, SMO_DP3, SMO_DP4, SMO_MIN, SMO_MAX, SMO_SLT, SMO_SGE, SMO_EXP, SMO_LOG, SMO_LIT, SMO_DST, SMO_LRP,
        SMO_FRC, SMO_M4X4, SMO_M4X3, SMO_M3X4, SMO_M3X3, SMO_M3X2, SMO_CALL, SMO_CALLNZ, SMO_LOOP, SMO_RET, SMO_ENDLOOP, SMO_LABEL, SMO_DCL, SMO_POW, SMO_CRS, SMO_SGN, SMO_ABS,
-       SMO_NRM, SMO_SINCOS, SMO_REP, SMO_ENDREP, SMO_IF, SMO_IFC, SMO_ELSE, SMO_ENDIF, SMO_BREAK, SMO_BREAKC, SMO_MOVA, SMO_DEFB, SMO_DEFI, SMO_TEXKILL = 65, SMO_TEXLD = 66,
+       SMO_NRM, SMO_SINCOS, SMO_REP, SMO_ENDREP, SMO_IF, SMO_IFC, SMO_ELSE, SMO_ENDIF, SMO_BREAK, SMO_BREAKC, SMO_MOVA, SMO_DEFB, SMO_DEFI, SMO_TEXCOORD = 64, SMO_TEXKILL = 65, SMO_TEXLD = 66,
+       SMO_TEXBEM = 67, SMO_TEXBEML = 68, SMO_TEXREG2AR = 69, SMO_TEXREG2GB = 70, SMO_TEXM3X2PAD = 71, SMO_TEXM3X2TEX = 72, SMO_TEXM3X3PAD = 73, SMO_TEXM3X3TEX = 74,
+       SMO_TEXM3X3SPEC = 76, SMO_TEXM3X3VSPEC = 77, SMO_TEXREG2RGB = 82, SMO_TEXDP3TEX = 83, SMO_TEXM3X2DEPTH = 84, SMO_TEXDP3 = 85, SMO_TEXM3X3 = 86, SMO_TEXDEPTH = 87,
+       SMO_BEM = 89, SMO_PHASE = 0xFFFD,
        SMO_EXPP = 78, SMO_LOGP = 79, SMO_CND = 80, SMO_DEF = 81, SMO_CMP = 88, SMO_DP2ADD = 90, SMO_DSX = 91, SMO_DSY = 92, SMO_TEXLDD = 93, SMO_SETP = 94, SMO_TEXLDL = 95,
        SMO_BREAKP = 96, SMO_COMMENT = 0xFFFE, SMO_END = 0xFFFF };
 
@@ -84,8 +92,9 @@ typedef struct SmParam {
   unsigned type, number;
   unsigned mask;                        /* a destination's write mask */
   unsigned swizzle;                     /* a source's, two bits a component */
-  unsigned modifier;                    /* a source's: 0 none, 1 negate, 11 abs, 12 negated abs */
+  unsigned modifier;                    /* a source's: 0 none, 1 negate, 11 abs, 12 negated abs; 2 .. 10 are those of pixel shaders 1.x */
   int saturate;                         /* a destination's */
+  unsigned shift;                       /* a destination's in a pixel shader 1.x: 1, 2, 3 times 2, 4, 8; 15, 14, 13 divided by 2, 4, 8 */
   int relative;                         /* a constant addressed through a0 */
   unsigned relative_component;
 } SmParam;
@@ -104,6 +113,9 @@ enum { DXT_TEMP = 0, DXT_INPUT = 1, DXT_OUTPUT = 2, DXT_IMMEDIATE = 4, DXT_SAMPL
 #define DX_TEMP_ADDRESS 32u             /* the integer copy of a0 */
 #define DX_TEMP_SCRATCH 33u             /* 33 .. 37: what a translated instruction needs for itself */
 #define DX_TEMPS 38u
+#define DX_TEMP_PS1_TEXTURE 8u          /* a pixel shader 1.1 to 1.3: 8 .. 13 are its t0 .. t5 */
+#define DX_TEMP_PS1_SOURCE 16u          /* ... 16 .. 19: a source with one of its modifiers, worked out */
+#define DX_TEMP_PS1_ROWS 20u            /* ... the rows of a matrix that texm3x2pad and texm3x3pad leave for the instruction that ends it */
 
 typedef struct DxOperand { uint32_t w[8]; unsigned n; } DxOperand;
 
@@ -122,6 +134,7 @@ typedef struct SmContext {
   /* where the code reads a bool constant of the device's: the word that holds its element of cb0, which is known when the floats are counted */
   uint16_t bool_word[64];
   unsigned bool_words;
+  unsigned pad_rows;                    /* a pixel shader 1.x: the rows texm3x2pad / texm3x3pad have left so far */
 } SmContext;
 
 static void sm_emit(SmContext *c, uint32_t opcode, uint32_t bits, const DxOperand *operands, unsigned count) {
@@ -241,6 +254,11 @@ static int sm_source(SmContext *c, const SmParam *p, int negate, DxOperand *o) {
     }
     case SMR_ADDR:      /* a pixel shader's t<n> (the same number as a vertex shader's a0, which is no source) */
       if (s->vertex || s->major >= 3 || p->number >= 8) return SM_INVALID;
+      if (s->major == 1 && s->minor < 4) {      /* (what an instruction put there, not the coordinates) */
+        if (p->number >= 6) return SM_INVALID;
+        *o = dx_src(DXT_TEMP, DX_TEMP_PS1_TEXTURE + p->number, p->swizzle, modifier);
+        return SM_OK;
+      }
       s->varying_mask |= 1u << (SM_SLOT_TEXCOORD + p->number);
       *o = dx_src(DXT_INPUT, SM_SLOT_TEXCOORD + p->number, p->swizzle, modifier);
       return SM_OK;
@@ -283,6 +301,10 @@ static int sm_destination(SmContext *c, const SmParam *p, DxOperand *o) {
       *o = dx_dst(DXT_TEMP, p->number, p->mask);
       return SM_OK;
     case SMR_ADDR:
+      if (!s->vertex && s->major == 1 && s->minor < 4 && p->number < 6) {
+        *o = dx_dst(DXT_TEMP, DX_TEMP_PS1_TEXTURE + p->number, p->mask);
+        return SM_OK;
+      }
       if (!s->vertex || p->number != 0) return SM_INVALID;
       *o = dx_dst(DXT_TEMP, DX_TEMP_ADDRESS, p->mask);
       return SM_OK;
@@ -596,7 +618,201 @@ static int sm_instruction(SmContext *c, unsigned op, unsigned flags, const SmPar
       return SM_OK;
     }
     default:
-      return SM_UNSUPPORTED;      /* loops, subroutines, predicates, texldl and texldd, the instructions of pixel shaders 1.x */
+      return SM_UNSUPPORTED;      /* loops, subroutines, predicates, texldl and texldd */
+  }
+}
+
+/* ---- pixel shaders 1.x ----------------------------------------------------------------------------------------------------------------------------------- */
+
+/* The texture coordinates n as the vertex shader gave them. */
+static int sm_ps1_coordinates(SmContext *c, unsigned n, unsigned swizzle, DxOperand *o) {
+  if (n >= 6) return SM_INVALID;
+  c->out->varying_mask |= 1u << (SM_SLOT_TEXCOORD + n);
+  *o = dx_src(DXT_INPUT, SM_SLOT_TEXCOORD + n, swizzle, 0);
+  return SM_OK;
+}
+/* Stage n's texture at `at`, into `d`. */
+static int sm_ps1_sample(SmContext *c, DxOperand d, DxOperand at, unsigned n) {
+  DxOperand sampler;
+  if (n >= 6) return SM_INVALID;
+  c->out->sampler_mask |= 1u << n;
+  sampler.w[0] = ((unsigned)DXT_SAMPLER << 12) | (1u << 20);
+  sampler.w[1] = n;
+  sampler.n = 2;
+  sm_emit4(c, DXO_SAMPLE, 0, d, at, dx_src(DXT_RESOURCE, n, DX_SWIZZLE_XYZW, 0), sampler);
+  return SM_OK;
+}
+/* The sources of an instruction that have one of the modifiers of pixel shaders 1.x: each is worked out into a temporary of its own, and the
+ * parameter becomes that temporary (with the swizzle it had, and negated where the modifier says so). */
+static int sm_ps1_modifiers(SmContext *c, SmParam *p, unsigned first, unsigned count) {
+  for (unsigned i = first; i < count && i < 5; ++i) {
+    const unsigned modifier = p[i].modifier;
+    SmParam plain = p[i];
+    DxOperand a, d;
+    if (modifier < 2 || modifier > 10) continue;
+    plain.modifier = 0;
+    plain.swizzle = DX_SWIZZLE_XYZW;
+    d = dx_dst(DXT_TEMP, DX_TEMP_PS1_SOURCE + i - 1 + (first == 0), 0xF);
+    switch (modifier) {
+      case 2: case 3:      /* x - 0.5 */
+        SM_TRY(sm_source(c, &plain, 0, &a));
+        sm_emit3(c, DXO_ADD, 0, d, a, dx_immediate(-0.5f, -0.5f, -0.5f, -0.5f));
+        break;
+      case 4: case 5:      /* 2 x - 1 */
+        SM_TRY(sm_source(c, &plain, 0, &a));
+        sm_emit4(c, DXO_MAD, 0, d, a, dx_immediate(2, 2, 2, 2), dx_immediate(-1, -1, -1, -1));
+        break;
+      case 6:              /* 1 - x */
+        SM_TRY(sm_source(c, &plain, 1, &a));
+        sm_emit3(c, DXO_ADD, 0, d, a, dx_immediate(1, 1, 1, 1));
+        break;
+      case 7: case 8:      /* 2 x */
+        SM_TRY(sm_source(c, &plain, 0, &a));
+        sm_emit3(c, DXO_ADD, 0, d, a, a);
+        break;
+      default: {           /* x / x.z, x / x.w */
+        DxOperand by;
+        SmParam component = plain;
+        component.swizzle = SM_SWIZZLE_OF(modifier == 9 ? 2u : 3u);
+        SM_TRY(sm_source(c, &plain, 0, &a));
+        SM_TRY(sm_source(c, &component, 0, &by));
+        sm_emit3(c, DXO_DIV, 0, d, a, by);
+        break;
+      }
+    }
+    p[i].type = SMR_TEMP;
+    p[i].number = DX_TEMP_PS1_SOURCE + i - 1 + (first == 0);
+    p[i].modifier = modifier == 3 || modifier == 5 || modifier == 8 ? 1u : 0u;
+  }
+  return SM_OK;
+}
+/* A row of the matrix the texm3x* instructions build: the texture coordinates of the destination's stage, dot the source. */
+static int sm_ps1_row(SmContext *c, const SmParam *p, unsigned row) {
+  DxOperand at, a;
+  SM_TRY(sm_ps1_coordinates(c, p[0].number, DX_SWIZZLE_XYZW, &at));
+  SM_TRY(sm_source(c, &p[1], 0, &a));
+  sm_emit3(c, DXO_DP3, 0, dx_dst(DXT_TEMP, DX_TEMP_PS1_ROWS, 1u << row), at, a);
+  return SM_OK;
+}
+
+/* One instruction of a pixel shader 1.x: those that fill a texture register here, the arithmetic ones as in the later models. */
+static int sm_instruction_ps1(SmContext *c, unsigned op, SmParam *p, unsigned count) {
+  SmShader *s = c->out;
+  const int old = s->minor < 4;      /* (1.1 to 1.3: the destination of a texture instruction is t<n>, and n is the stage and the coordinates) */
+  DxOperand d, a, at;
+  SM_TRY(sm_ps1_modifiers(c, p, op == SMO_TEXKILL ? 0u : 1u, count));
+  switch (op) {
+    case SMO_PHASE: return SM_OK;
+    case SMO_TEXLD:
+      if (old) {      /* tex t<n> */
+        if (count != 1 || p[0].type != SMR_ADDR) return SM_INVALID;
+        SM_TRY(sm_ps1_coordinates(c, p[0].number, DX_SWIZZLE_XYZW, &at));
+      } else {        /* texld r<n>, t<m> or r<m> */
+        if (count != 2 || p[0].type != SMR_TEMP) return SM_INVALID;
+        SM_TRY(sm_source(c, &p[1], 0, &at));
+      }
+      SM_TRY(sm_destination(c, &p[0], &d));
+      return sm_ps1_sample(c, d, at, p[0].number);
+    case SMO_TEXCOORD:
+      if (old) {      /* texcoord t<n>: the coordinates, between 0 and 1 */
+        if (count != 1 || p[0].type != SMR_ADDR) return SM_INVALID;
+        SM_TRY(sm_ps1_coordinates(c, p[0].number, DX_SWIZZLE_XYZW, &at));
+        SM_TRY(sm_destination(c, &p[0], &d));
+        sm_emit2(c, DXO_MOV, DX_SATURATE, d, at);
+        p[0].mask = 0x8;
+        SM_TRY(sm_destination(c, &p[0], &d));
+        sm_emit2(c, DXO_MOV, 0, d, dx_immediate(1, 1, 1, 1));
+      } else {        /* texcrd r<n>, t<m> */
+        if (count != 2) return SM_INVALID;
+        SM_TRY(sm_destination(c, &p[0], &d));
+        SM_TRY(sm_source(c, &p[1], 0, &a));
+        sm_emit2(c, DXO_MOV, 0, d, a);
+      }
+      return SM_OK;
+    case SMO_TEXKILL:
+      if (count != 1) return SM_INVALID;
+      if (old) {
+        if (p[0].type != SMR_ADDR) return SM_INVALID;
+        SM_TRY(sm_ps1_coordinates(c, p[0].number, DX_SWIZZLE_XYZW, &a));
+      } else {
+        p[0].swizzle = DX_SWIZZLE_XYZW;
+        SM_TRY(sm_source(c, &p[0], 0, &a));
+      }
+      sm_emit3(c, DXO_LT, 0, sm_scratch(0, 0x7), a, dx_immediate(0, 0, 0, 0));
+      sm_emit3(c, DXO_OR, 0, sm_scratch(0, 0x1), dx_temp(DX_TEMP_SCRATCH, 0), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(1)));
+      sm_emit3(c, DXO_OR, 0, sm_scratch(0, 0x1), dx_temp(DX_TEMP_SCRATCH, 0), dx_temp(DX_TEMP_SCRATCH, SM_SWIZZLE_OF(2)));
+      sm_emit1(c, DXO_DISCARD, DX_NONZERO, dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH, 0));
+      return SM_OK;
+    case SMO_TEXREG2AR: case SMO_TEXREG2GB: case SMO_TEXREG2RGB:      /* stage n at two (three) components of another texture register */
+      if (!old || count != 2 || p[0].type != SMR_ADDR) return SM_INVALID;
+      p[1].swizzle = op == SMO_TEXREG2AR ? 0x03u /* a r */ : op == SMO_TEXREG2GB ? 0x09u /* g b */ : DX_SWIZZLE_XYZW;
+      SM_TRY(sm_source(c, &p[1], 0, &at));
+      SM_TRY(sm_destination(c, &p[0], &d));
+      return sm_ps1_sample(c, d, at, p[0].number);
+    case SMO_TEXM3X2PAD: case SMO_TEXM3X3PAD:
+      if (!old || count != 2 || p[0].type != SMR_ADDR || c->pad_rows >= 2) return SM_INVALID;
+      SM_TRY(sm_ps1_row(c, p, c->pad_rows));
+      ++c->pad_rows;
+      return SM_OK;
+    case SMO_TEXM3X2TEX:      /* stage n at the two rows */
+      if (!old || count != 2 || p[0].type != SMR_ADDR || c->pad_rows != 1) return SM_INVALID;
+      SM_TRY(sm_ps1_row(c, p, 1));
+      c->pad_rows = 0;
+      SM_TRY(sm_destination(c, &p[0], &d));
+      return sm_ps1_sample(c, d, dx_temp(DX_TEMP_PS1_ROWS, DX_SWIZZLE_XYZW), p[0].number);
+    case SMO_TEXM3X3:         /* the three rows themselves */
+      if (!old || count != 2 || p[0].type != SMR_ADDR || c->pad_rows != 2) return SM_INVALID;
+      SM_TRY(sm_ps1_row(c, p, 2));
+      c->pad_rows = 0;
+      sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_TEMP, DX_TEMP_PS1_ROWS, 0x8), dx_immediate(1, 1, 1, 1));
+      SM_TRY(sm_destination(c, &p[0], &d));
+      sm_emit2(c, DXO_MOV, 0, d, dx_temp(DX_TEMP_PS1_ROWS, DX_SWIZZLE_XYZW));
+      return SM_OK;
+    case SMO_TEXDP3: case SMO_TEXDP3TEX:      /* the coordinates dot the source: the number itself, or stage n at it */
+      if (!old || count != 2 || p[0].type != SMR_ADDR) return SM_INVALID;
+      SM_TRY(sm_ps1_coordinates(c, p[0].number, DX_SWIZZLE_XYZW, &at));
+      SM_TRY(sm_source(c, &p[1], 0, &a));
+      sm_emit2(c, DXO_MOV, 0, sm_scratch(1, 0xF), dx_immediate(0, 0, 0, 0));
+      sm_emit3(c, DXO_DP3, 0, sm_scratch(1, op == SMO_TEXDP3 ? 0xFu : 0x1u), at, a);
+      SM_TRY(sm_destination(c, &p[0], &d));
+      if (op == SMO_TEXDP3TEX) return sm_ps1_sample(c, d, sm_scratch_source(1), p[0].number);
+      sm_emit2(c, DXO_MOV, 0, d, sm_scratch_source(1));
+      return SM_OK;
+    case SMO_NOP: case SMO_MOV: case SMO_ADD: case SMO_SUB: case SMO_MAD: case SMO_MUL: case SMO_DP3: case SMO_DP4: case SMO_LRP: case SMO_CND: case SMO_CMP: {
+      /* (the factor of the destination comes after the instruction, and the saturation after the factor) */
+      const unsigned shift = count ? p[0].shift : 0u;
+      const int saturate = count ? p[0].saturate : 0;
+      if (!shift) return sm_instruction(c, op, 0, p, count);
+      if (shift > 3 && shift < 13) return SM_INVALID;
+      p[0].saturate = 0;
+      SM_TRY(sm_instruction(c, op, 0, p, count));
+      {
+        static const float factor[16] = {1, 2, 4, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.125f, 0.25f, 0.5f};
+        const float f = factor[shift];
+        SmParam result = p[0];
+        result.swizzle = DX_SWIZZLE_XYZW;
+        result.modifier = 0;
+        SM_TRY(sm_destination(c, &p[0], &d));
+        SM_TRY(sm_source(c, &result, 0, &a));
+        sm_emit3(c, DXO_MUL, saturate ? DX_SATURATE : 0u, d, a, dx_immediate(f, f, f, f));
+      }
+      return SM_OK;
+    }
+    default:
+      return SM_UNSUPPORTED;      /* texbem, texbeml, bem; texm3x3tex, texm3x3spec, texm3x3vspec; texdepth, texm3x2depth */
+  }
+}
+/* The parameters an instruction of a pixel shader 1.x has; 255 for one that is not one of theirs. */
+static unsigned sm_parameters_ps1(unsigned op, unsigned minor) {
+  switch (op) {
+    case SMO_NOP: case SMO_PHASE: return 0;
+    case SMO_TEXKILL: case SMO_TEXDEPTH: return 1;
+    case SMO_TEXCOORD: case SMO_TEXLD: return minor < 4 ? 1 : 2;
+    case SMO_MOV: case SMO_TEXBEM: case SMO_TEXBEML: case SMO_TEXREG2AR: case SMO_TEXREG2GB: case SMO_TEXM3X2PAD: case SMO_TEXM3X2TEX: case SMO_TEXM3X3PAD:
+    case SMO_TEXM3X3TEX: case SMO_TEXM3X3VSPEC: case SMO_TEXREG2RGB: case SMO_TEXDP3TEX: case SMO_TEXM3X2DEPTH: case SMO_TEXDP3: case SMO_TEXM3X3: return 2;
+    case SMO_ADD: case SMO_SUB: case SMO_MUL: case SMO_DP3: case SMO_DP4: case SMO_TEXM3X3SPEC: case SMO_BEM: return 3;
+    case SMO_MAD: case SMO_LRP: case SMO_CND: case SMO_CMP: return 4;
+    default: return 255;
   }
 }
 
@@ -616,7 +832,8 @@ static int sm_parameter(const SmShader *s, const uint32_t *tokens, size_t availa
   if (destination) {
     p->mask = (t >> 16) & 0xF;
     p->saturate = ((t >> 20) & 1) != 0;
-    if ((t >> 24) & 0xF) return SM_UNSUPPORTED;      /* (a shift: pixel shaders 1.x) */
+    p->shift = (t >> 24) & 0xF;
+    if (p->shift && (s->vertex || s->major != 1)) return SM_INVALID;      /* (a factor: pixel shaders 1.x only) */
     if (t & 0x2000) return SM_UNSUPPORTED;           /* (a destination addressed through a register) */
   } else {
     p->swizzle = (t >> 16) & 0xFF;
@@ -662,7 +879,7 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
   out->major = (tokens[0] >> 8) & 0xFF;
   out->minor = tokens[0] & 0xFF;
   if (out->major < 1 || out->major > 3) return SM_INVALID;
-  if (!out->vertex && out->major < 2) return SM_UNSUPPORTED;      /* (pixel shaders 1.x: another instruction set) */
+  if (!out->vertex && out->major == 1 && (out->minor < 1 || out->minor > 4)) return SM_INVALID;
   if (available > SM_MAX_TOKENS) available = SM_MAX_TOKENS;
 
   while (at < available) {
@@ -725,7 +942,7 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
       at += 1 + values;
       continue;
     }
-    count = out->major >= 2 ? (t >> 24) & 0xF : sm_parameters_v1(op);
+    count = out->major >= 2 ? (t >> 24) & 0xF : out->vertex ? sm_parameters_v1(op) : sm_parameters_ps1(op, out->minor);
     if (count == 255) return SM_UNSUPPORTED;
     if (count > 5 && op != SMO_SINCOS && op != SMO_SGN) return SM_INVALID;
     {
@@ -742,13 +959,14 @@ static int sm_translate(const uint32_t *tokens, size_t available, SmShader *out,
       }
       if (read != count) return SM_INVALID;
       {
-        const int status = sm_instruction(c, op, (t >> 16) & 0xFF, p, kept);
+        const int status = !out->vertex && out->major == 1 ? sm_instruction_ps1(c, op, p, kept) : sm_instruction(c, op, (t >> 16) & 0xFF, p, kept);
         if (status != SM_OK) return status;
       }
     }
     if (c->failed) return SM_UNSUPPORTED;      /* (too long) */
   }
   if (!ended) return SM_INVALID;
+  if (!out->vertex && out->major == 1) sm_emit2(c, DXO_MOV, 0, dx_dst(DXT_OUTPUT, 0, 0xF), dx_temp(0, DX_SWIZZLE_XYZW));      /* (the colour is what r0 holds) */
   sm_emit(c, DXO_RET, 0, NULL, 0);
   if (c->failed) return SM_UNSUPPORTED;
   if (out->vertex && !(out->varying_mask & 1u)) return SM_INVALID;      /* (no position) */

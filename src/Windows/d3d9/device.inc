@@ -61,7 +61,7 @@ static void caps_fill(D3DCAPS9 *caps) {
   caps->MaxPointSize = 1.0f;
   caps->NumSimultaneousRTs = 1;
   caps->DeclTypes = D3DDTCAPS_UBYTE4 | D3DDTCAPS_UBYTE4N | D3DDTCAPS_SHORT2N | D3DDTCAPS_SHORT4N | D3DDTCAPS_USHORT2N | D3DDTCAPS_USHORT4N | D3DDTCAPS_FLOAT16_2 | D3DDTCAPS_FLOAT16_4;
-  /* The program's shaders: what the translator takes (sm_to_dxbc.h). Pixel shaders before 2.0 cannot be made, whatever the version here says. */
+  /* The program's shaders: what the translator takes (sm_to_dxbc.h), which is not everything of the version here. */
   caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
   caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
   caps->MaxVertexShaderConst = VS_FLOATS;

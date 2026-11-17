@@ -19,7 +19,8 @@
 // Host-side tests of src/Windows/d3d9/sm_to_dxbc.h, which makes Shader Model 4 of a Direct3D 9 shader for d3d9.dll:
 //   - shaders a compiler made (tests/data/d3d9, scripts/gen-d3d9-test-shaders.sh) are translated, the kernel's compiler takes the result, and - where
 //     the kernel's own compiler for Direct3D 9 bytecode takes the shader too - both programs give the same numbers for the same inputs;
-//   - shaders written here token by token, one for each kind of instruction, give the numbers worked out here;
+//   - shaders written here token by token, one for each kind of instruction, give the numbers worked out here - pixel shaders 1.x among them, with
+//     their modifiers, factors and texture registers;
 //   - what is refused is refused, and shaders that end early or have a bit turned (every length, bits all over) are taken or refused without a
 //     wrong read (the test runs under ASan and UBSan), and what is taken of them the kernel's compiler takes or refuses the same way.
 #include <math.h>
@@ -97,7 +98,8 @@ uint32_t float_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 struct Asm {
   Tokens t;
   bool vertex;
-  Asm(bool vertex_stage, uint32_t major, uint32_t minor) : vertex(vertex_stage) {
+  bool lengths;      // (an instruction says how many parameters it has from Shader Model 2 on)
+  Asm(bool vertex_stage, uint32_t major, uint32_t minor) : vertex(vertex_stage), lengths(major >= 2) {
     t.push_back((vertex ? 0xFFFE0000u : 0xFFFF0000u) | (major << 8) | minor);
     if (vertex) {      // v0 the position, v1 a colour, v2 texture coordinates
       dcl(0, 0, reg(kInput, 0));
@@ -114,7 +116,7 @@ struct Asm {
     return *this;
   }
   Asm& ins(uint32_t op, std::initializer_list<uint32_t> parameters, uint32_t flags = 0) {
-    t.push_back(op | (flags << 16) | (static_cast<uint32_t>(parameters.size()) << 24));
+    t.push_back(op | (flags << 16) | (lengths ? static_cast<uint32_t>(parameters.size()) << 24 : 0u));
     t.insert(t.end(), parameters);
     return *this;
   }
@@ -127,6 +129,7 @@ struct Asm {
 
 // What the tests give a shader: the inputs v0 .. v2 (a pixel shader: the two colours and two sets of texture coordinates), and the constants.
 const float kIn[4][4] = {{0.25f, -0.5f, 0.75f, 1.0f}, {0.3f, -0.6f, 2.4f, 0.5f}, {0.125f, 0.875f, 0.0f, 1.0f}, {1.5f, 0.2f, -0.3f, 0.9f}};
+const float kMore[2][4] = {{0.5f, 0.25f, -1.0f, 1.0f}, {2.0f, 0.0f, 0.5f, 1.0f}};
 float constant_value(unsigned reg_number, unsigned component) { return 0.1f * static_cast<float>(reg_number + 1) + 0.37f * static_cast<float>(component) - 0.5f; }
 
 struct Result { float position[4]; float colour[4]; bool alive; bool ok; };
@@ -147,6 +150,10 @@ Result run_tokens(HostAllocator& allocator, const Tokens& tokens, uint32_t bools
     for (unsigned n = 0; n < 16; ++n) { const uint32_t v = (bools >> n & 1) ? 0xFFFFFFFFu : 0u; memcpy(constants + (g_shader.float_registers + n) * 16, &v, 4); }
   graphics::Vec4 in[16] = {};
   for (unsigned i = 0; i < 4; ++i) in[i] = {kIn[i][0], kIn[i][1], kIn[i][2], kIn[i][3]};
+  if (!g_shader.vertex) {      // (a pixel shader: texture coordinates 2 and 3 as well)
+    in[4] = {kMore[0][0], kMore[0][1], kMore[0][2], kMore[0][3]};
+    in[5] = {kMore[1][0], kMore[1][1], kMore[1][2], kMore[1][3]};
+  }
   if (g_shader.vertex) {
     graphics::ShaderIo io = {};
     program->run_vertex(in, constants, &io);
@@ -306,9 +313,132 @@ void test_instructions(HostAllocator& allocator) {
   }
 }
 
+// Pixel shaders 1.x: v0, v1 the colours (kIn[0], kIn[1]); the texture coordinates 0 .. 3 are kIn[2], kIn[3], kMore[0], kMore[1].
+void test_pixel_shaders_1(HostAllocator& allocator) {
+  const float *v0 = kIn[0], *v1 = kIn[1];
+  auto pixel = [&](uint32_t minor, const std::function<void(Asm&)>& body) {
+    Asm a(false, 1, minor);
+    body(a);
+    return run_tokens(allocator, a.end());
+  };
+  auto shifted = [](uint32_t type, uint32_t number, uint32_t shift, bool saturate = false) { return dst(type, number, 0xF, saturate) | (shift << 24); };
+  // the colour is what r0 holds at the end
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 1)}); }), v1[0], v1[1], v1[2], v1[3]));
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(2, {dst(kTemp, 1), src(kInput, 0), src(kConst, 2)}).ins(5, {dst(kTemp, 0), src(kTemp, 1), src(kInput, 1)}); }),
+                  (v0[0] + cv(2, 0)) * v1[0], (v0[1] + cv(2, 1)) * v1[1], (v0[2] + cv(2, 2)) * v1[2], (v0[3] + cv(2, 3)) * v1[3]));
+  // the modifiers of a source: _bias, _bx2, 1 - x, _x2, and the negated _bx2
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0, kXyzw, 2)}); }), v0[0] - 0.5f, v0[1] - 0.5f, v0[2] - 0.5f, v0[3] - 0.5f));
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0, kXyzw, 4)}); }), 2 * v0[0] - 1, 2 * v0[1] - 1, 2 * v0[2] - 1, 2 * v0[3] - 1));
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0, kXyzw, 6)}); }), 1 - v0[0], 1 - v0[1], 1 - v0[2], 1 - v0[3]));
+  CHECK(colour_is(pixel(4, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0, swz(2, 2, 2, 3), 7)}); }), 2 * v0[2], 2 * v0[2], 2 * v0[2], 2 * v0[3]));
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(2, {dst(kTemp, 0), src(kInput, 0, kXyzw, 5), src(kInput, 1, kXyzw, 4)}); }),
+                  -(2 * v0[0] - 1) + 2 * v1[0] - 1, -(2 * v0[1] - 1) + 2 * v1[1] - 1, -(2 * v0[2] - 1) + 2 * v1[2] - 1, -(2 * v0[3] - 1) + 2 * v1[3] - 1));
+  // the factor of a destination, and saturation after it
+  CHECK(colour_is(pixel(1, [&](Asm& a) { a.ins(2, {shifted(kTemp, 0, 1), src(kInput, 0), src(kInput, 1)}); }), 2 * (v0[0] + v1[0]), 2 * (v0[1] + v1[1]), 2 * (v0[2] + v1[2]), 2 * (v0[3] + v1[3])));
+  CHECK(colour_is(pixel(1, [&](Asm& a) { a.ins(1, {shifted(kTemp, 0, 15), src(kInput, 1)}); }), v1[0] / 2, v1[1] / 2, v1[2] / 2, v1[3] / 2));
+  CHECK(colour_is(pixel(1, [&](Asm& a) { a.ins(1, {shifted(kTemp, 0, 2, true), src(kInput, 0)}); }), 1, 0, 1, 1));      // (4 x, kept between 0 and 1)
+  // lrp, mad, dp3 with a write mask, cnd on r0.a, cmp
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(18, {dst(kTemp, 0), src(kInput, 0, swz(3, 3, 3, 3), 2), src(kInput, 0), src(kInput, 1)}); }),
+                  0.5f * (v0[0] - v1[0]) + v1[0], 0.5f * (v0[1] - v1[1]) + v1[1], 0.5f * (v0[2] - v1[2]) + v1[2], 0.5f * (v0[3] - v1[3]) + v1[3]));
+  {
+    const float dot = v0[0] * v1[0] + v0[1] * v1[1] + v0[2] * v1[2];
+    CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0)}).ins(8, {dst(kTemp, 0, 0x7), src(kInput, 0), src(kInput, 1)}); }), dot, dot, dot, v0[3]));
+  }
+  CHECK(colour_is(pixel(1, [](Asm& a) {      // (r0.a is 1: the first of the two)
+          a.ins(1, {dst(kTemp, 0), src(kInput, 0)}).ins(80, {dst(kTemp, 0), src(kTemp, 0, swz(3, 3, 3, 3)), src(kInput, 1), src(kConst, 1)});
+        }), v1[0], v1[1], v1[2], v1[3]));
+  CHECK(colour_is(pixel(1, [](Asm& a) {      // (r0.a is 0.5, which is not above it: the second)
+          a.ins(1, {dst(kTemp, 0), src(kInput, 1)}).ins(80, {dst(kTemp, 0), src(kTemp, 0, swz(3, 3, 3, 3)), src(kInput, 0), src(kConst, 1)});
+        }), cv(1, 0), cv(1, 1), cv(1, 2), cv(1, 3)));
+  CHECK(colour_is(pixel(2, [](Asm& a) { a.ins(88, {dst(kTemp, 0), src(kInput, 0), src(kInput, 1), src(kConst, 0)}); }), v1[0], cv(0, 1), v1[2], v1[3]));
+  // a constant the shader defines
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.def(3, 0.25f, 0.5f, 0.75f, 1.0f).ins(1, {dst(kTemp, 0), src(kConst, 3, swz(2, 2, 2, 0))}); }), 0.75f, 0.75f, 0.75f, 0.25f));
+
+  // texcoord: the coordinates between 0 and 1, with 1 for alpha; t<n> is then a register like the others
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(64, {dst(kAddr, 1)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)}); }), 1.0f, 0.2f, 0.0f, 1.0f));
+  CHECK(colour_is(pixel(1, [](Asm& a) { a.ins(64, {dst(kAddr, 0)}).ins(2, {dst(kAddr, 0), src(kAddr, 0), src(kInput, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 0)}); }),
+                  0.125f + v0[0], 0.875f + v0[1], 0.0f + v0[2], 1.0f + v0[3]));
+  // texkill: by the coordinates' first three components
+  {
+    Result r = pixel(1, [](Asm& a) { a.ins(65, {dst(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kInput, 0)}); });
+    CHECK(r.ok && r.alive);
+    r = pixel(1, [](Asm& a) { a.ins(65, {dst(kAddr, 1)}).ins(1, {dst(kTemp, 0), src(kInput, 0)}); });      // (coordinates 1 have z below 0)
+    CHECK(r.ok && !r.alive);
+    r = pixel(4, [](Asm& a) { a.ins(64, {dst(kTemp, 2, 0x7), src(kAddr, 1)}).ins(65, {dst(kTemp, 2)}).ins(1, {dst(kTemp, 0), src(kInput, 0)}); });
+    CHECK(r.ok && !r.alive);
+  }
+  // texm3x3pad, texm3x3pad, texm3x3: the coordinates 1, 2 and 3 as the rows of a matrix, times a vector; texdp3
+  {
+    const float x[3] = {0.125f, 0.875f, 0.0f};      // (t0 after texcoord)
+    auto row = [&](const float* m) { return m[0] * x[0] + m[1] * x[1] + m[2] * x[2]; };
+    CHECK(colour_is(pixel(2, [](Asm& a) {
+            a.ins(64, {dst(kAddr, 0)}).ins(73, {dst(kAddr, 1), src(kAddr, 0)}).ins(73, {dst(kAddr, 2), src(kAddr, 0)}).ins(86, {dst(kAddr, 3), src(kAddr, 0)});
+            a.ins(1, {dst(kTemp, 0), src(kAddr, 3)});
+          }), row(kIn[3]), row(kMore[0]), row(kMore[1]), 1.0f));
+    CHECK(colour_is(pixel(2, [](Asm& a) { a.ins(64, {dst(kAddr, 0)}).ins(85, {dst(kAddr, 1), src(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)}); }),
+                    row(kIn[3]), row(kIn[3]), row(kIn[3]), row(kIn[3])));
+  }
+  // 1.4: texcrd takes coordinates as they are (and divided by w), r0 .. r5, phase
+  CHECK(colour_is(pixel(4, [](Asm& a) {
+          a.ins(64, {dst(kTemp, 3, 0x7), src(kAddr, 1)}).ins(1, {dst(kTemp, 3, 0x8), src(kInput, 0)});
+          a.ins(0xFFFD, {});
+          a.ins(5, {dst(kTemp, 5), src(kTemp, 3), src(kInput, 1)}).ins(1, {dst(kTemp, 0), src(kTemp, 5)});
+        }), 1.5f * v1[0], 0.2f * v1[1], -0.3f * v1[2], v0[3] * v1[3]));
+  CHECK(colour_is(pixel(4, [](Asm& a) { a.ins(64, {dst(kTemp, 0, 0x3), src(kAddr, 1, kXyzw, 10)}).ins(1, {dst(kTemp, 0, 0xC), src(kInput, 0)}); }),
+                  1.5f / 0.9f, 0.2f / 0.9f, v0[2], v0[3]));
+
+  // the instructions that sample are translated and compiled (there is no texture here to look at): stage n at coordinates n, at another register's
+  // components, at two rows of a matrix, at a dot product; 1.4's texld from coordinates and from a register
+  auto compiles = [&](uint32_t minor, uint32_t samplers, const std::function<void(Asm&)>& body) {
+    Asm a(false, 1, minor);
+    body(a);
+    const Tokens tokens = a.end();
+    if (sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) != SM_OK) return false;
+    UniquePointer<D3d9Program> program = compile_translated(allocator, g_shader);
+    return program && g_shader.sampler_mask == samplers && program->texture_unit_mask() == samplers;
+  };
+  CHECK(compiles(1, 0x3, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(66, {dst(kAddr, 1)}).ins(5, {dst(kTemp, 0), src(kAddr, 0), src(kAddr, 1)}); }));
+  CHECK(compiles(1, 0x7, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(69, {dst(kAddr, 1), src(kAddr, 0)}).ins(70, {dst(kAddr, 2), src(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 2)}); }));
+  CHECK(compiles(1, 0x5, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(71, {dst(kAddr, 1), src(kAddr, 0, kXyzw, 4)}).ins(72, {dst(kAddr, 2), src(kAddr, 0, kXyzw, 4)}).ins(1, {dst(kTemp, 0), src(kAddr, 2)}); }));
+  CHECK(compiles(2, 0x3, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(83, {dst(kAddr, 1), src(kAddr, 0)}).ins(1, {dst(kTemp, 0), src(kAddr, 1)}); }));
+  CHECK(compiles(4, 0x3, [](Asm& a) { a.ins(66, {dst(kTemp, 0), src(kAddr, 0)}).ins(0xFFFD, {}).ins(66, {dst(kTemp, 1), src(kTemp, 0)}).ins(5, {dst(kTemp, 0), src(kTemp, 0), src(kTemp, 1)}); }));
+
+  // what is not there, and what is not right
+  auto status_of = [](uint32_t minor, const std::function<void(Asm&)>& body) {
+    Asm a(false, 1, minor);
+    body(a);
+    const Tokens tokens = a.end();
+    return sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context);
+  };
+  CHECK(status_of(1, [](Asm& a) { a.ins(66, {dst(kAddr, 0)}).ins(67, {dst(kAddr, 1), src(kAddr, 0)}); }) == SM_UNSUPPORTED);      // texbem
+  CHECK(status_of(1, [](Asm& a) { a.ins(73, {dst(kAddr, 1), src(kAddr, 0)}).ins(73, {dst(kAddr, 2), src(kAddr, 0)}).ins(74, {dst(kAddr, 3), src(kAddr, 0)}); }) == SM_UNSUPPORTED);
+  CHECK(status_of(4, [](Asm& a) { a.ins(87, {dst(kTemp, 5)}); }) == SM_UNSUPPORTED);                                                // texdepth
+  CHECK(status_of(1, [](Asm& a) { a.ins(72, {dst(kAddr, 1), src(kAddr, 0)}); }) == SM_INVALID);                                       // texm3x2tex with no row before it
+  CHECK(status_of(1, [](Asm& a) { a.ins(66, {dst(kAddr, 7)}); }) == SM_INVALID);                                                      // a stage that is not there
+  CHECK(status_of(1, [](Asm& a) { a.ins(6, {dst(kTemp, 0), src(kInput, 0)}); }) == SM_UNSUPPORTED);                                   // rcp is no instruction of theirs
+  CHECK(status_of(5, [](Asm& a) { a.ins(1, {dst(kTemp, 0), src(kInput, 0)}); }) == SM_INVALID);                                       // ps_1_5
+  {
+    Asm a(true, 1, 1);
+    a.ins(1, {dst(kRastOut, 0) | (1u << 24), src(kInput, 0)});      // a factor on a vertex shader's destination
+    const Tokens tokens = a.end();
+    CHECK(sm_translate(tokens.data(), tokens.size(), &g_shader, &g_context) == SM_INVALID);
+  }
+}
+
+// A pixel shader 1.1 with a bit of everything, for the tests of damaged shaders.
+Tokens pixel_shader_1_sample() {
+  Asm a(false, 1, 1);
+  a.def(0, 0.5f, 0.5f, 0.5f, 1.0f);
+  a.ins(66, {dst(kAddr, 0)}).ins(64, {dst(kAddr, 1)}).ins(71, {dst(kAddr, 2), src(kAddr, 0, kXyzw, 4)}).ins(72, {dst(kAddr, 3), src(kAddr, 0, kXyzw, 4)});
+  a.ins(8, {dst(kTemp, 1, 0x7, true) | (1u << 24), src(kAddr, 0, kXyzw, 4), src(kInput, 0, kXyzw, 4)});
+  a.ins(18, {dst(kTemp, 0), src(kInput, 1, swz(3, 3, 3, 3)), src(kAddr, 3), src(kAddr, 1, kXyzw, 6)});
+  a.ins(4, {dst(kTemp, 0, 0x7), src(kTemp, 0), src(kTemp, 1), src(kConst, 0)}, 0x40 /* (with the instruction before it) */);
+  return a.end();
+}
+
 void test_refusals() {
   auto status_of = [](const Tokens& t) { return sm_translate(t.data(), t.size(), &g_shader, &g_context); };
-  CHECK(status_of({0xFFFF0101, 0x0000FFFF}) == SM_UNSUPPORTED);      // a pixel shader 1.1
+  CHECK(status_of({0xFFFF0101, 0x0000FFFF}) == SM_OK);               // a pixel shader 1.1 of no instructions: r0 as it is
   CHECK(status_of({0xFFFE0400, 0x0000FFFF}) == SM_INVALID);          // no such version
   CHECK(status_of({0x12345678, 0x0000FFFF}) == SM_INVALID);
   CHECK(status_of({0xFFFE0200}) == SM_INVALID);                      // no end
@@ -443,8 +573,11 @@ int main() {
   HostAllocator allocator;
   std::vector<Tokens> shaders;
   test_instructions(allocator);
+  test_pixel_shaders_1(allocator);
   test_refusals();
   test_fixtures(allocator, &shaders);
+  shaders.push_back(pixel_shader_1_sample());
+  CHECK(sm_translate(shaders.back().data(), shaders.back().size(), &g_shader, &g_context) == SM_OK && g_shader.sampler_mask == 0x9);
   test_damage(allocator, shaders);
   CHECK(allocator.live == 0);
   if (g_failed) {
