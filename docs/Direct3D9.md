@@ -67,7 +67,9 @@ reference of the alpha test and which of below, equal and above keep the pixel (
 the fog's colour, and where the fog factor comes from - for shaders below Shader Model 3, which is where Direct3D 9 does fog: the depth
 of the pixel when a table mode is set (linear, exponential, exponential squared; the shader reads its position for it), else the factor
 the vertex stage gives - what a vertex shader of the program's writes (`oFog`), or what the fixed-function vertex shader works out. The
-fixed-function pixel shader has the same five registers and the same ending.
+fixed-function pixel shader has the same five registers and the same ending. The depth is the pixel's z in the target, or - where the
+projection matrix is a perspective one (its fourth column is not 0 0 0 1), as Direct3D 9 decides it - the w the pixel had before the
+projection divided, which is the depth in view space: fog by w. A draw says which by two weights among the registers.
 
 Refused by the translator: loops, `rep`, subroutines and the `break` instructions, the predicate register, integer constants, cube and
 volume samplers, `texldl` and `texldd`, textures in a vertex shader, more than one render target, a depth the pixel shader writes, `vPos`
@@ -82,8 +84,8 @@ in the program, in the kernel, on the device - and the kernel could not make rin
 - Of a program's shaders: what the translator refuses (above). The half pixel between Direct3D 9's pixel centres and the rasterizer's
   is not made up for vertices that pass a vertex shader; a colour the vertex shader does not write reaches the pixel stage as 0, not as
   white. The caps say 3.0 although not every 3.0 shader can be made.
-- Of fog: by w (depth fog is by z), by the distance instead of the depth (`D3DRS_RANGEFOGENABLE`), and the factor in the specular
-  colour's alpha, which is what vertices that are pixels already (XYZRHW) bring: they have fog by a table mode only.
+- Of fog: by the distance instead of the depth (`D3DRS_RANGEFOGENABLE`), and what vertices that are pixels already (XYZRHW) bring
+  for it - the factor in the specular colour's alpha, and a w (their fog is by a table mode and by z only).
 - Lighting: a vertex has its diffuse colour, or white. Materials and lights are taken and not used.
 - Specular, texture transforms and generated texture coordinates, the texture factor, more than two texture stages, the stage
   operations beyond the ones above, bump mapping.
@@ -107,12 +109,12 @@ Direct3D 9 bytecode makes of the same shader; shaders written token by token giv
 and texture registers, and the alpha test and fog at a pixel shader's end); what is refused; every shortened shader and 30000
 with a bit turned.
 
-`tests/windows/d3d9test.c` (96 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
+`tests/windows/d3d9test.c` (99 checks): the Direct3D object and the adapter, a device on a window, clears, vertices that are pixels (to
 the pixel) and vertices through the matrices, vertex and index buffers, culling, fans, textures of 32 and 16 bits, the stage operations,
 the alpha test, blending, depth, the scissor rectangle, state blocks, the program's shaders (a vertex shader with the fixed-function pixel
 stage, vertex and pixel shaders of 1.1, 2.0 and 3.0 from FVF vertices and from a vertex buffer through a declaration, constants of both
 stages, a pixel shader that samples and discards, a pixel shader after the fixed-function vertex stage, pixel shaders 1.1 and 1.4, the alpha test and fog - by depth and by a vertex shader's factor - after a pixel shader), the fixed-function pipeline's alpha test
-with each kind of function and its fog by the pixel's depth and by the vertex, drawing into a texture and sampling it, `GetRenderTargetData`,
+with each kind of function and its fog by the pixel's depth (by z, and by w under a perspective projection) and by the vertex, drawing into a texture and sampling it, `GetRenderTargetData`,
 `Present`, `Reset`, and that everything is gone with its last reference. Run in the real kernel on its CPU renderer:
 `tests/wow64_qemu.sh d3d9test` (32-bit); the same source built for x86-64 passes too. `DxgkrnlTest` checks that the kernel compiles the
 two shaders.

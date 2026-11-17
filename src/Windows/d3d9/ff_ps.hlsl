@@ -6,7 +6,7 @@
 cbuffer pixel_constants : register(b0) {
   float4 colour0, alpha0;   // the weights of stage 0
   float4 colour1, alpha1;   // ... and of stage 1
-  float4 alpha_reference;   // x: the reference of the alpha test, 0 .. 255
+  float4 alpha_reference;   // x: the reference of the alpha test, 0 .. 255; y, z: the depth fog is made of is y * the position's z + z * its w
   float4 alpha_keep;        // x, y, z: 1 where an alpha below, equal to, above the reference keeps the pixel, else 0
   float4 fog_colour;
   float4 fog;               // x, y: the linear factor is depth * x + y; z, w: the exponential one is 2 ^ -(depth * (z + w * depth))
@@ -27,7 +27,7 @@ float4 main(float4 position : SV_Position, float4 colour : COLOR0, float4 coordi
   float alpha = round(current.a * 255);
   float3 side = float3(alpha < alpha_reference.x ? 1.0 : 0.0, alpha == alpha_reference.x ? 1.0 : 0.0, alpha > alpha_reference.x ? 1.0 : 0.0);
   clip(dot(side, alpha_keep.xyz) - 0.5);
-  float depth = position.z;
+  float depth = position.z * alpha_reference.y + alpha_reference.z / max(position.w, 1e-30);      // (a pixel shader's position has 1 / w)
   float factor = dot(fog_source, float4(saturate(vertex_fog.x), saturate(depth * fog.x + fog.y), saturate(exp2(-(depth * (fog.z + fog.w * depth)))), 1));
   current.rgb = fog_colour.rgb + factor * (current.rgb - fog_colour.rgb);
   return current;

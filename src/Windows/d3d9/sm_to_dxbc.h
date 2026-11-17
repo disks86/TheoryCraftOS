@@ -31,7 +31,7 @@
  *   state       a pixel shader ends with what Direct3D 9 does to its colour afterwards, the alpha test and (below Shader Model 3) fog, steered by
  *               SM_STATE_REGISTERS registers of cb0 after the floats and bools, from `state_register` on (SM_STATE_*): whoever draws fills them
  *               in from the render states - sm_state_none() for a draw with neither. The fog factor is the vertex shader's (TEXCOORD8) or made of
- *               the pixel's depth, which the shader reads as its position (input register 16).
+ *               the pixel's depth - z, or the w the projection gave it - which the shader reads as its position (input register 16).
  *   samplers    s<n> is texture t<n> with sampler s<n>, two-dimensional. A pixel shader 1.x names no samplers: its stage n is that pair.
  *
  * Pixel shaders 1.x are another instruction set over the same tokens: the texture registers t<n> are filled by instructions that sample stage n at
@@ -82,7 +82,8 @@ typedef struct SmShader {
 
 /* The state registers of a pixel shader, from `state_register` on. */
 #define SM_STATE_REGISTERS 5u
-#define SM_STATE_ALPHA 0u               /* x: the reference of the alpha test, 0 .. 255 */
+#define SM_STATE_ALPHA 0u               /* x: the reference of the alpha test, 0 .. 255; y, z: the depth fog is made of is y times the pixel's z in the
+                                           target plus z times the w it had before the projection divided */
 #define SM_STATE_ALPHA_KEEP 1u          /* x, y, z: 1 where an alpha below, equal to, above the reference keeps the pixel, else 0 */
 #define SM_STATE_FOG_COLOUR 2u          /* x, y, z: the fog's colour */
 #define SM_STATE_FOG 3u                 /* x, y: the linear factor is depth * x + y; z, w: the exponential one is 2 ^ -(depth * (z + w * depth)) */
@@ -91,6 +92,7 @@ typedef struct SmShader {
 /* The state registers of a draw with no alpha test and no fog. */
 static void sm_state_none(float state[SM_STATE_REGISTERS][4]) {
   memset(state, 0, sizeof(float) * 4 * SM_STATE_REGISTERS);
+  state[SM_STATE_ALPHA][1] = 1.0f;
   state[SM_STATE_ALPHA_KEEP][0] = state[SM_STATE_ALPHA_KEEP][1] = state[SM_STATE_ALPHA_KEEP][2] = 1.0f;
   state[SM_STATE_FOG_SOURCE][3] = 1.0f;
 }
@@ -854,9 +856,14 @@ static void sm_pixel_end(SmContext *c, unsigned state) {
   sm_emit3(c, DXO_DP3, 0, sm_scratch(1, 0x1), sm_scratch_source(1), dx_constant(state + SM_STATE_ALPHA_KEEP, DX_SWIZZLE_XYZW, 0, 0, 0));
   sm_emit1(c, DXO_DISCARD, 0, dx_scalar(DXT_TEMP, DX_TEMP_SCRATCH + 1, 0));
   if (s->major < 3) {      /* fog: the colour goes towards the fog's by a factor (Shader Model 3 leaves fog to the shader) */
-    const DxOperand depth = dx_src(DXT_INPUT, DX_INPUT_POSITION, SM_SWIZZLE_OF(2), 0);
+    /* the depth: the position's z, or its w - which reaches a pixel shader as 1 / w - as the state weighs them */
+    const DxOperand depth = dx_temp(DX_TEMP_SCRATCH + 2, 0);
     const DxOperand fog_colour = dx_constant(state + SM_STATE_FOG_COLOUR, DX_SWIZZLE_XYZW, 0, 0, 0);
     c->out->varying_mask |= 1u << (SM_SLOT_TEXCOORD + 8);
+    sm_emit3(c, DXO_MAX, 0, sm_scratch(2, 0x1), dx_src(DXT_INPUT, DX_INPUT_POSITION, SM_SWIZZLE_OF(3), 0), dx_immediate(1e-30f, 1e-30f, 1e-30f, 1e-30f));
+    sm_emit3(c, DXO_DIV, 0, sm_scratch(2, 0x1), dx_constant(state + SM_STATE_ALPHA, SM_SWIZZLE_OF(2), 0, 0, 0), dx_temp(DX_TEMP_SCRATCH + 2, 0));
+    sm_emit4(c, DXO_MAD, 0, sm_scratch(2, 0x1), dx_src(DXT_INPUT, DX_INPUT_POSITION, SM_SWIZZLE_OF(2), 0), dx_constant(state + SM_STATE_ALPHA, SM_SWIZZLE_OF(1), 0, 0, 0),
+             dx_temp(DX_TEMP_SCRATCH + 2, 0));
     sm_emit2(c, DXO_MOV, DX_SATURATE, sm_scratch(0, 0x1), dx_src(DXT_INPUT, SM_SLOT_TEXCOORD + 8, 0, 0));
     sm_emit4(c, DXO_MAD, DX_SATURATE, sm_scratch(0, 0x2), depth, dx_constant(state + SM_STATE_FOG, 0, 0, 0, 0), dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(1), 0, 0, 0));
     sm_emit4(c, DXO_MAD, 0, sm_scratch(0, 0x4), depth, dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(3), 0, 0, 0), dx_constant(state + SM_STATE_FOG, SM_SWIZZLE_OF(2), 0, 0, 0));

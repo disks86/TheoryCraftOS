@@ -136,6 +136,8 @@ float constant_value(unsigned reg_number, unsigned component) { return 0.1f * st
 
 struct Result { float position[4]; float colour[4]; bool alive; bool ok; };
 
+// The depth of the pixel a pixel shader runs for, and the 1 / w its position has.
+float g_depth = 0.0f, g_inverse_w = 0.0f;
 // What a pixel shader's state registers hold in the tests that do not say: no alpha test, no fog.
 float g_state[SM_STATE_REGISTERS][4];
 void put_state(uint8_t* constants) {
@@ -173,7 +175,9 @@ Result run_tokens(HostAllocator& allocator, const Tokens& tokens, uint32_t bools
     r.alive = true;
   } else {
     graphics::Vec4 colours[graphics::kMaxColorTargets] = {};
-    r.alive = program->run_fragment(in, constants, nullptr, &colours[0]);
+    graphics::FragmentContext context;
+    context.position = {32.5f, 16.5f, g_depth, g_inverse_w};
+    r.alive = program->run_fragment_ex(in, context, constants, nullptr, &colours[0]);
     const float c[4] = {colours[0].x, colours[0].y, colours[0].z, colours[0].w};
     memcpy(r.colour, c, sizeof c);
   }
@@ -491,6 +495,26 @@ void test_pixel_state(HostAllocator& allocator) {
     g_state[SM_STATE_FOG][2] = 3.0f; g_state[SM_STATE_FOG][3] = 5.0f;
     r = run(major, 0);
     CHECK(colour_is(r, v0[0], v0[1], v0[2], v0[3]));
+  }
+  // the depth: z, or the w before the projection divided (the position has 1 / w); a position with no w at all is no depth
+  for (uint32_t major = 1; major <= 2; ++major) {
+    sm_state_none(g_state);
+    memcpy(g_state[SM_STATE_FOG_COLOUR], fog, sizeof fog);
+    g_state[SM_STATE_FOG_SOURCE][1] = 1; g_state[SM_STATE_FOG_SOURCE][3] = 0;
+    g_state[SM_STATE_FOG][0] = -0.5f; g_state[SM_STATE_FOG][1] = 1.5f;      // (linear between 1 and 3)
+    g_depth = 0.9f; g_inverse_w = 1.0f / 2.5f;
+    CHECK(colour_is(run(major, 0), v0[0], v0[1], v0[2], v0[3]));              // by z, 0.9: before the fog starts
+    g_state[SM_STATE_ALPHA][1] = 0; g_state[SM_STATE_ALPHA][2] = 1;
+    CHECK(colour_is(run(major, 0), fogged(0.25f, v0, 0), fogged(0.25f, v0, 1), fogged(0.25f, v0, 2), v0[3]));      // by w, 2.5
+    g_state[SM_STATE_FOG_SOURCE][1] = 0; g_state[SM_STATE_FOG_SOURCE][2] = 1;
+    g_state[SM_STATE_FOG][2] = 0.4f; g_state[SM_STATE_FOG][3] = 0;            // 2 ^ -(0.4 * 2.5) = 0.5
+    CHECK(colour_is(run(major, 0), fogged(0.5f, v0, 0), fogged(0.5f, v0, 1), fogged(0.5f, v0, 2), v0[3]));
+    g_state[SM_STATE_FOG][2] = 0; g_state[SM_STATE_FOG][3] = 0.16f;           // 2 ^ -(0.16 * 2.5 * 2.5) = 0.5
+    CHECK(colour_is(run(major, 0), fogged(0.5f, v0, 0), fogged(0.5f, v0, 1), fogged(0.5f, v0, 2), v0[3]));
+    g_depth = 0.0f; g_inverse_w = 0.0f;
+    g_state[SM_STATE_ALPHA][1] = 1; g_state[SM_STATE_ALPHA][2] = 0;
+    const Result r = run(major, 0);
+    CHECK(r.ok && r.colour[0] == r.colour[0]);      // (not a NaN)
   }
   sm_state_none(g_state);
   // the state registers follow the floats and the bools

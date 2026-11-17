@@ -726,6 +726,47 @@ static void test_fog(void) {
   screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
   read_back();
   check(near_colour(pixel(32, 32), 94, 94, 255), "exponential squared fog: e ^ -(density * depth) ^ 2 of the colour");
+  /* A perspective projection: fog by the pixel's depth goes by w then, the depth before the projection. The rectangle is 2 away; its z in the
+   * target is 0.95, which is before the fog starts, and its w is 2, half way through it. */
+  D3DMATRIX perspective, identity;
+  memset(&perspective, 0, sizeof perspective);
+  memset(&identity, 0, sizeof identity);
+  identity.m[0][0] = identity.m[1][1] = identity.m[2][2] = identity.m[3][3] = 1.0f;
+  perspective.m[0][0] = perspective.m[1][1] = perspective.m[2][2] = 1.0f;
+  perspective.m[2][3] = 1.0f;       /* w is the depth */
+  perspective.m[3][2] = -0.1f;      /* z is the depth less 0.1 */
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &perspective);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+  set_float_state(D3DRS_FOGSTART, 1.0f);
+  set_float_state(D3DRS_FOGEND, 3.0f);
+  clear(0xFF000000);
+  world_quad(2.0f);
+  read_back();
+  check((caps.RasterCaps & D3DPRASTERCAPS_WFOG) && near_colour(pixel(32, 32), 128, 128, 255) && pixel(8, 32) == 0,
+        "with a perspective projection fog by the pixel goes by w: half way between start and end");
+  /* ... after a pixel shader of the program's too (ps_1_1: mov r0, v0) */
+  static const DWORD pass_ps[] = {0xFFFF0101, 0x00000001, 0x800F0000, 0x90E40000, 0x0000FFFF};
+  IDirect3DPixelShader9 *pass = NULL;
+  IDirect3DDevice9_CreatePixelShader(g_device, pass_ps, &pass);
+  IDirect3DDevice9_SetPixelShader(g_device, pass);
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_EXP);
+  set_float_state(D3DRS_FOGDENSITY, 0.5f);
+  clear(0xFF000000);
+  world_quad(2.0f);
+  read_back();
+  check(pass && near_colour(pixel(32, 32), 94, 94, 255), "... and after a pixel shader: exponential fog of the depth 2");
+  IDirect3DDevice9_SetPixelShader(g_device, NULL);
+  if (pass) IDirect3DPixelShader9_Release(pass);
+  /* vertices that are pixels already go by z whatever the projection */
+  IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+  set_float_state(D3DRS_FOGSTART, 0.0f);
+  set_float_state(D3DRS_FOGEND, 1.0f);
+  clear(0xFF000000);
+  screen_quad(0, 0, 64, 64, 0.5f, 0xFFFFFFFF);
+  read_back();
+  check(near_colour(pixel(32, 32), 128, 128, 255), "vertices that are pixels have fog by their z, whatever the projection");
+  IDirect3DDevice9_SetTransform(g_device, D3DTS_PROJECTION, &identity);
+  set_float_state(D3DRS_FOGDENSITY, 2.0f);
   /* fog by the vertex: the depth in view space, here the vertices' z (identity matrices) */
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
   IDirect3DDevice9_SetRenderState(g_device, D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);

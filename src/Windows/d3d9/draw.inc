@@ -309,9 +309,9 @@ static BOOL vertex_fog(const State *s, const Layout *l) {
   return s->rs[D3DRS_FOGENABLE] && s->rs[D3DRS_FOGTABLEMODE] == D3DFOG_NONE && s->rs[D3DRS_FOGVERTEXMODE] != D3DFOG_NONE && !l->transformed;
 }
 /* The state registers of a pixel shader (sm_to_dxbc.h; the fixed-function one has the same), out of the render states: the alpha test, and fog
- * if the shader does fog (`fog`: not Shader Model 3) - by the depth of the pixel when a table mode is set, else by the factor the vertex stage
- * gives if it gives one (`vertex_factor`). */
-static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_factor) {
+ * if the shader does fog (`fog`: not Shader Model 3) - by the depth of the pixel when a table mode is set (its w if `by_w`, else its z), else by
+ * the factor the vertex stage gives if it gives one (`vertex_factor`). */
+static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_factor, BOOL by_w) {
   float state[SM_STATE_REGISTERS][4];
   sm_state_none(state);
   if (s->rs[D3DRS_ALPHATESTENABLE]) {
@@ -325,12 +325,21 @@ static void shader_state(float *out, const State *s, BOOL fog, BOOL vertex_facto
     state[SM_STATE_FOG_COLOUR][0] = ((colour >> 16) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][1] = ((colour >> 8) & 255) / 255.0f;
     state[SM_STATE_FOG_COLOUR][2] = (colour & 255) / 255.0f;
-    if (!fog_terms(s, s->rs[D3DRS_FOGTABLEMODE], state[SM_STATE_FOG], state[SM_STATE_FOG_SOURCE]) && vertex_factor) {
+    if (fog_terms(s, s->rs[D3DRS_FOGTABLEMODE], state[SM_STATE_FOG], state[SM_STATE_FOG_SOURCE])) {
+      state[SM_STATE_ALPHA][1] = by_w ? 0.0f : 1.0f;
+      state[SM_STATE_ALPHA][2] = by_w ? 1.0f : 0.0f;
+    } else if (vertex_factor) {
       state[SM_STATE_FOG_SOURCE][0] = 1.0f;
       state[SM_STATE_FOG_SOURCE][3] = 0.0f;
     }
   }
   memcpy(out, state, sizeof state);
+}
+/* Whether fog by the pixel's depth goes by w: Direct3D 9 takes the depth before the projection where the projection matrix is a perspective one
+ * (its fourth column is not 0 0 0 1), and z where it is not. Vertices that are pixels already bring no such depth here: z. */
+static BOOL fog_by_w(const State *s, const Layout *l) {
+  const D3DMATRIX *p = &s->projection;
+  return !l->transformed && (p->m[0][3] != 0.0f || p->m[1][3] != 0.0f || p->m[2][3] != 0.0f || p->m[3][3] != 1.0f);
 }
 /* The registers a draw's block of constants has: the vertex shader's, then the pixel shader's. */
 static UINT constant_registers(const Shader *vs, const Shader *ps) { return (vs ? vs->registers : VERTEX_REGISTERS) + (ps ? ps->registers : PIXEL_REGISTERS); }
@@ -361,7 +370,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
   float *pixel = block + vertex_registers * 4;
   if (ps) {
     shader_constants(pixel, ps, s->ps_float, PS_FLOATS, s->ps_bool);
-    shader_state(pixel + ps->state * 4, s, ps->major < 3, vs ? TRUE : vertex_fog(s, l));
+    shader_state(pixel + ps->state * 4, s, ps->major < 3, vs ? TRUE : vertex_fog(s, l), fog_by_w(s, l));
   } else {
     BOOL on = TRUE;      /* (a stage that is switched off switches off the ones after it) */
     for (UINT stage = 0; stage < STAGES; ++stage) {
@@ -372,7 +381,7 @@ static UINT64 constants_of(Dev *d, const Layout *l, const Shader *vs, const Shad
       stage_weights(textured ? t[D3DTSS_COLOROP] : D3DTOP_DISABLE, t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], pixel + 8 * stage);
       stage_weights(textured ? t[D3DTSS_ALPHAOP] : D3DTOP_DISABLE, t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], pixel + 8 * stage + 4);
     }
-    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, vs ? TRUE : vertex_fog(s, l));
+    shader_state(pixel + PIXEL_STATE_REGISTER * 4, s, TRUE, vs ? TRUE : vertex_fog(s, l), fog_by_w(s, l));
   }
   if (!d->constant_valid || d->constant_last_bytes != bytes || memcmp(d->constant_data + d->constant_last, block, bytes) != 0) {
     d->constant_last = d->constant_used;
