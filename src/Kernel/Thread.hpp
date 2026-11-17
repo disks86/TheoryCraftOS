@@ -159,9 +159,10 @@ bool join(Thread* thread, uint64_t timeout_us = 0);
 // The thread cleans itself up when it finishes.
 void detach(Thread* thread);
 
-// Runs `work` to its end on a new thread with a full-size stack, on the calling core (so it may still call firmware), and waits for it. The boot thread runs on the firmware's
-// stack, which is small (128 KiB under EDK2) and has the firmware's own memory below it: a page layout or anything else deep in there writes past its end into the firmware's pool
-// and breaks it (the next firmware call then faults, which was the hang at shutdown). Runs `work` right here when threads are not running or cannot be started.
+// Runs `work` to its end on a new thread with a full-size stack, on the calling core (so it may still call firmware), and waits for it. The boot thread's stack is smaller
+// (4 MiB on x86-64, see efi_main; the firmware's own, 128 KiB under EDK2, on the other architectures and when that memory could not be had), and the firmware's stack has the
+// firmware's own memory below it: a page layout or anything else deep in there writes past its end into the firmware's pool and breaks it (the next firmware call then faults,
+// which was the hang at shutdown). Runs `work` right here when threads are not running or cannot be started.
 uint32_t current_core();
 template <typename Work>
 void run_on_large_stack(Work&& work) {

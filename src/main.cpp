@@ -578,7 +578,28 @@ static bool on_nfs_login(void* context, StringView server, StringView uid, Strin
   return true;
 }
 
+// The boot thread's stack. The firmware's own is small (128 KiB under EDK2) with the firmware's pool below it, and kernel_main's frame alone takes most of
+// that: anything deep called from it wrote past the end, over the firmware's data, and the next firmware call faulted. So the entry point takes memory
+// from the firmware for a stack of its own and runs everything on that. The firmware still knows the memory as allocated, so the RAM pool does not
+// claim it, and calls into the firmware from this stack are ordinary calls.
+extern "C" efi::Status tcos_call_on_stack(efi::Status (*function)(efi::Handle, efi::SystemTable*), efi::Handle image, efi::SystemTable* st, uint64_t stack_top);
+namespace {
+constexpr uint64_t kBootStackBytes = 4ull << 20;
+constexpr uint64_t kBootStackPage = 4096;
+uint64_t g_boot_stack = 0;   // its lowest address; 0 while the firmware's stack is in use
+}  // namespace
+
+static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st);
+
 extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
+  uint64_t stack = 0xFFFFFFFFull;   // below 4 GiB: mapped by every firmware, before the kernel's own page tables add the rest
+  if (st->boot_services->allocate_pages(efi::AllocateType::MaxAddress, efi::MemoryType::LoaderData, kBootStackBytes / kBootStackPage, &stack) != efi::kSuccess)
+    return kernel_main(image, st);   // (no memory for it: the firmware's stack, as before)
+  g_boot_stack = stack;
+  return tcos_call_on_stack(kernel_main, image, st, stack + kBootStackBytes);
+}
+
+static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   console::init(st);
   hardware::delay_init(st);  // timing that works on every core, before anything waits
   st->boot_services->set_watchdog_timer(0, 0, 0, nullptr);  // no 5-minute reset
@@ -632,6 +653,8 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   kernel::PageTables paging(kernel::cpu_paging_host(), allocator);
   const bool paging_ok = paging.initialize();
   if (!paging_ok) Entry(Level::Warning, "Paging").text("5-level paging: memory above 4 GiB and MMIO mapping are not used");
+  // The lowest page of the boot stack is taken out of the page tables: running off its end stops the machine there instead of writing over what lies below.
+  if (paging_ok && g_boot_stack && !paging.unmap(g_boot_stack, kBootStackPage)) Entry(Level::Warning, "Paging").text("the boot stack has no guard page");
   uint64_t high_bytes = 0;
   for (uint32_t i = 0; paging_ok && i < ram.extra_region_count(); ++i) {
     const hardware::MemoryRegion r = ram.extra_region(i);
@@ -863,7 +886,9 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   });
   process::win32k::register_process_exit_hook([](uint64_t pid) { if (opengl::GlService* gl = opengl::system_gl()) gl->process_exited(pid); });
   // What each accelerated GPU really does with Direct3D 9 / 10 / 11 programs, against the CPU renderer (dxgk::run_conformance): the verdicts are in the log.
-  if (dxg_adapters > 1)
+  // (on a thread with a real stack, like the OpenGL scenes below: the CPU renderer runs the scenes' shader programs, tens of KiB deep, and this function's own frame
+  // leaves little of the firmware's boot stack. Past its end is the firmware's pool: a scene wrote over its protocol list, and the next firmware call faulted.)
+  if (dxg_adapters > 1) kernel::run_on_large_stack([&] {
     for (uint32_t i = 0; i + 1 < dxg_adapters; ++i) {
       dxgk::Adapter* a = dxg_kernel.adapter(i);
       if (!a || !a->caps().accelerated) continue;
@@ -881,6 +906,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }, nullptr);
       Entry(bad ? Level::Warning : Level::Ok, "Direct3D").dec(bad).text(" conformance scene(s) wrong");
     }
+  });
   Entry(dxg_fallbacks ? Level::Warning : Level::Ok, "Direct3D").text("kernel mode driver: ").dec(dxg_adapters).text(" adapter(s)");
   if (dxg_fallbacks) Entry(Level::Warning, "Direct3D").dec(dxg_fallbacks).text(" GPU(s) failed the Direct3D self-test and use the CPU renderer");
   if (dxg_fallbacks)
@@ -889,7 +915,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
   graphics::WebGlAccelerator web_accelerator(system_graphics.device(), shared_allocator);
   if (system_graphics.accelerated()) webgl::set_accelerator(&web_accelerator);
   // What the GL contexts' hardware path (GLSL -> TGSI) draws on this GPU, against their CPU rasterizer (webgl::run_accel_conformance): the verdicts are in the log.
-  if (system_graphics.accelerated()) {
+  if (system_graphics.accelerated()) kernel::run_on_large_stack([&] {
     const uint32_t wrong = webgl::run_accel_conformance(shared_allocator, web_accelerator, [](void*, const webgl::AccelSceneResult& r) {
       const bool bad = r.verdict == webgl::AccelVerdict::Differs || r.verdict == webgl::AccelVerdict::Broken;
       Entry e(bad ? Level::Warning : r.verdict == webgl::AccelVerdict::NotTaken ? Level::Info : Level::Ok, "OpenGL");
@@ -905,7 +931,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
       }
     }, nullptr);
     Entry(wrong ? Level::Warning : Level::Ok, "OpenGL").dec(wrong).text(" of ").dec(webgl::accel_scene_count()).text(" GPU conformance scene(s) wrong");
-  }
+  });
   if (gpu) {
     graphics::IRenderer2D* renderer = system_graphics.renderer_2d();
     if (!renderer) {
@@ -1581,7 +1607,7 @@ extern "C" efi::Status efi_main(efi::Handle image, efi::SystemTable* st) {
     renderer = scaled_renderer.get();
   }
   if (renderer) {
-    // The desktop runs on a thread with a real stack: the page layout in the browser's tick would overflow the firmware's boot stack.
+    // The desktop runs on a thread with a full-size stack: the page layout in the browser's tick is deeper than the boot stack.
     kernel::run_on_large_stack([&] {
     // The merged keyboard and mouse are always handed over, even when there are none yet: USB ones may be plugged in later.
     kernel::Clipboard clipboard(shared_allocator);  // copy and paste between the desktop's programs; outlives the desktop
