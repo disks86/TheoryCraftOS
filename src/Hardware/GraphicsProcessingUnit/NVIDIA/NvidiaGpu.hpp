@@ -15,27 +15,46 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 #pragma once
 #include "Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.hpp"
 #include "Hardware/GraphicsProcessingUnit/UEFI/UefiGopGpu.hpp"
+#include "Utility/UniquePointer.hpp"
 
 namespace hardware {
 
-// NVIDIA display controller (PCI vendor 0x10DE), identified by device ID down to its architecture (Pascal to Blackwell; see
-// NvidiaGpuGenerations.hpp). Modes and the framebuffer come from the firmware (UEFI GOP): NVIDIA does not document the display engine of these
-// parts (Turing and newer are programmed through signed GSP firmware), so there is no native mode setting to write.
+namespace nv { class NvidiaNative; }
+
+// NVIDIA display controller (PCI vendor 0x10DE). Modes and the first framebuffer come from the firmware (UEFI GOP). On top of that the native
+// driver (NvidiaNative over Nvkm/, after nouveau) identifies the chip from its registers - every generation from NV04 to Blackwell, not only the
+// device IDs NvidiaGpuGenerations lists - reads the VRAM size and the temperature for the Computer Manager, and, built with
+// TCOS_NVIDIA_NATIVE, takes the display over (Tesla to Turing: the firmware's mode stays, the head shows a framebuffer of the OS's own in VRAM).
+// Ampere and later route their display through NVIDIA's GSP firmware, which is not run here: they stay on the firmware's framebuffer.
 class NvidiaGpu final : public UefiGopGpu {
  public:
   static constexpr uint16_t kPciVendor = 0x10DE;
 
-  explicit NvidiaGpu(const GpuContext& context) : UefiGopGpu(context), info_(nvidia_gpu_identify(context.device.device_id)) {}
+  explicit NvidiaGpu(const GpuContext& context);
+  ~NvidiaGpu();
 
-  const char* name() const override { return info_.name; }
+  const char* name() const override;
   const NvidiaGpuInfo& generation() const { return info_; }
 
+  bool initialize() override;
+  void shutdown() override;
+  bool set_mode(uint32_t index) override;
+  int32_t temperature_millicelsius() override;
+  // The native driver (null when the GPU did not answer or is not known); its chip, sensors and status.
+  nv::NvidiaNative* native() { return native_.get(); }
+  bool native_scanout() const;
+
  private:
+  void engage();
+  void release();
+
   NvidiaGpuInfo info_;
+  GpuContext context_;
+  UniquePointer<nv::NvidiaNative> native_;
+  char name_[48] = {};
 };
 
 }  // namespace hardware

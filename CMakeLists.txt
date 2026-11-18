@@ -599,6 +599,27 @@ add_executable(BOOTX64
   src/Hardware/GraphicsProcessingUnit/AMD/AmdDcn1.cpp
   src/Hardware/GraphicsProcessingUnit/AMD/AmdScanout.cpp
   src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpuGenerations.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaGpu.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/NvidiaNative.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFb.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvMmu.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBar.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvInstmem.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvFifo.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvCe.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplay.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDisplayMode.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvRegisters.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvChip.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvGpio.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvI2c.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvAux.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvI2cEdid.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvTherm.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvClk.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBios.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvBiosShadow.cpp
+  src/Hardware/GraphicsProcessingUnit/NVIDIA/Nvkm/NvDevinit.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpuGenerations.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelGpu.cpp
   src/Hardware/GraphicsProcessingUnit/Intel/IntelDisplay.cpp
@@ -1596,6 +1617,10 @@ endif()
 option(TCOS_AMD_VEGAM "Bring up the Radeon RX Vega M (Kaby Lake-G): memory controller and GART, interrupt ring, microcode through the SMC, graphics engine with compute queues, SDMA, and the display surface (not yet run on a real card)" OFF)
 if(TCOS_AMD_VEGAM)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_AMD_VEGAM)
+endif()
+option(TCOS_NVIDIA_NATIVE "NVIDIA (Tesla to Turing): take the display over from the firmware - the firmware's mode stays, the screen shows a framebuffer of the OS's own in VRAM (Nvkm/NvDisplay). The read-only parts (chip, VRAM size, temperature) run without it. Not yet run on a real card" OFF)
+if(TCOS_NVIDIA_NATIVE)
+  target_compile_definitions(BOOTX64 PRIVATE TCOS_NVIDIA_NATIVE)
 endif()
 # A program on the primary disk to start once the desktop is up (an OS path such as "/Windows/Program Files/Chromium/chrome.exe"), with its arguments (a ;-separated list):
 # what it prints goes to the debug console. For trying a big program in QEMU without driving the desktop (see scripts/run-program.sh).
