@@ -105,6 +105,7 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
       vram_row_(allocator),
       cpu_temp_row_(allocator),
       gpu_temp_row_(allocator),
+      fan_row_(allocator),
       battery_row_(allocator),
       core_rows_(allocator),
       model_(allocator),
@@ -183,6 +184,8 @@ ComputerManager::ComputerManager(allocators::IAllocator& allocator)
   setup_stat_row(vram_row_, "Graphics memory");
   setup_stat_row(cpu_temp_row_, "CPU temperature");
   setup_stat_row(gpu_temp_row_, "GPU temperature");
+  setup_stat_row(fan_row_, "Fan speed");
+  fan_row_.row.set_visible(false);   // (until the board's sensor chip reports a fan)
   setup_stat_row(battery_row_, "Battery");
   cpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);   // degrees Celsius
   gpu_temp_row_.meter.set_zones(ZoneDirection::HighIsBad, 70, 85);
@@ -655,6 +658,16 @@ void ComputerManager::update(uint64_t now_us) {
   }
   show_temperature(cpu_temp_row_, monitor_->cpu_temperature_millicelsius());
   show_temperature(gpu_temp_row_, gpu.temperature_millicelsius);
+  // The fan: the meter is full at 3000 RPM, about what a CPU cooler's fan runs at flat out.
+  const int32_t rpm = monitor_->fan_rpm();
+  fan_row_.row.set_visible(rpm >= 0);
+  if (rpm >= 0) {
+    fan_row_.meter.set_level(rpm >= 3000 ? 100 : rpm / 30);
+    text.clear();
+    text.append_uint(static_cast<uint64_t>(rpm));
+    text.append(" RPM");
+    fan_row_.value.set_text(text.view());
+  }
 
   const TaskBattery battery = monitor_->battery();
   if (!battery.present) {

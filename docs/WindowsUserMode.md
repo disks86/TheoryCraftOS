@@ -270,8 +270,10 @@ joypad code called through the NULL `IDirectInput8` that `DirectInput8Create` "s
 - **winmm** (`src/Windows/winmm/winmm.c`): `timeGetTime`, `timeGetSystemTime`, `timeGetDevCaps` (1 .. 65535 ms), `timeBegin`/`EndPeriod`, `timeSetEvent`/`timeKillEvent` over kernel32's
   timer queues (16 events, ids not reused at once, one-shot events gone once fired, one callback of an event at a time, time-critical priority, `TIME_KILL_SYNCHRONOUS`); 16 empty joystick slots
   (`JOYERR_PARMS`/`JOYERR_UNPLUGGED`); no wave, MIDI or mixer device (the open functions clear the handle and answer `MMSYSERR_BADDEVICEID`/`MMSYSERR_NODRIVER`).
-- **xinput1_4** (`src/Windows/xinput1_4`): no controller (`ERROR_DEVICE_NOT_CONNECTED` for slots 0-3, `ERROR_BAD_ARGUMENTS` otherwise), with the ordinal-only exports @100-104
-  and @108; every other name of the library (`xinput1_3`, `xinput9_1_0`, `xinputuap`) loads this one (`canonical_library_name`).
+- **xinput1_4** (`src/Windows/xinput1_4`): the kernel's game controllers through `NtTcosGamepad` (512, `src/Process/WindowsGamepad.hpp`; see
+  [GameControllers.md](GameControllers.md)): XInput users 0-3 are the service's player slots 0-3, with state, rumble, capabilities, battery and key presses.
+  An empty slot is `ERROR_DEVICE_NOT_CONNECTED`, a slot past 3 `ERROR_BAD_ARGUMENTS`. The ordinal-only exports @100-104 and @108 are there; every other
+  name of the library (`xinput1_3`, `xinput9_1_0`, `xinputuap`) loads this one (`canonical_library_name`).
 - **dinput8** (`src/Windows/dinput8`): `DirectInput8Create` hands out a real `IDirectInput8A/W` with no devices (`EnumDevices` calls nothing back, `CreateDevice` is
   `DIERR_DEVICENOTREG`); `CoCreateInstance(CLSID_DirectInput8)` reaches its class factory (ole32 knows the class). Not done: the system keyboard and mouse devices, action mapping.
 - **avrt** (`src/Windows/avrt`): MMCSS registration for the standard task names (a time-critical thread priority until reverted; handles checked against a table).

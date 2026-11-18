@@ -36,7 +36,9 @@ class SystemMonitor final : public desktop::ISystemMonitor {
   uint32_t threads(desktop::TaskThread* out, uint32_t capacity) override;
   uint32_t processes(desktop::TaskProcess* out, uint32_t capacity) override;
   desktop::TaskMemory memory() override;
+  // The CPU's own sensor, else the CPU input of the board's Super I/O (hardware::system_hardware_monitor()).
   int32_t cpu_temperature_millicelsius() override;
+  int32_t fan_rpm() override;
   desktop::TaskGpu gpu() override;
   desktop::TaskNpu npu() override;
   desktop::TaskBattery battery() override;

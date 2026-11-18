@@ -76,6 +76,18 @@ class IUsbHostController : public IHardware {
   // the endpoint and returns true. Never blocks.
   virtual bool poll_interrupt_in(uint32_t port, uint8_t endpoint_address, ByteView buffer, uint16_t* length) = 0;
 
+  // --- Interrupt OUT endpoints (game controllers' rumble and LEDs, the start-up packets an Xbox controller needs before it reports anything).
+  // Configures the endpoint; `interval` is the descriptor's bInterval. Controllers that cannot refuse (the default; xHCI can).
+  virtual bool start_interrupt_out(uint32_t port, uint8_t endpoint_address, uint16_t max_packet, uint8_t interval) {
+    (void)port; (void)endpoint_address; (void)max_packet; (void)interval;
+    return false;
+  }
+  // Sends one packet (at most the endpoint's max_packet bytes; copied) and waits for it to go out. False on any error.
+  virtual bool interrupt_out(uint32_t port, uint8_t endpoint_address, ConstByteView data) {
+    (void)port; (void)endpoint_address; (void)data;
+    return false;
+  }
+
   // A bulk IN endpoint that is received from without waiting (USB MIDI input: the device sends when a key is pressed, which may be never):
   // started like an interrupt IN endpoint, and read with poll_interrupt_in(), which hands out what has arrived and never blocks. The controller
   // keeps one transfer of `max_packet` bytes queued at all times. Controllers that cannot do this refuse (the default); the others are xHCI and EHCI.
