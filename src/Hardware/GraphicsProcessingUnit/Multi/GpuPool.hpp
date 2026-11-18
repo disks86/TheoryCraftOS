@@ -28,7 +28,10 @@
 #include "Allocators/IAllocator.hpp"
 #include "Hardware/GraphicsProcessingUnit/IGraphicsProcessingUnit.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuManager.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/GpuProbe.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuTopology.hpp"
+#include "Hardware/RegisterMapper.hpp"
+#include "Utility/UniquePointer.hpp"
 #include "uefi.hpp"
 
 namespace hardware {
@@ -48,6 +51,7 @@ struct GpuNode {
   VmwareSvgaGpu* vmware = nullptr;         // ... or a VMware SVGA adapter
   GpuDestroyFn destroy = nullptr;          // non-null for a driver the pool built (and so frees)
   bool leased_for_driver = false;          // the pool holds a power lease for the driver
+  IGpuProbe* probe = nullptr;              // for a GPU with no driver: what can be read off it (owned by the pool)
 };
 
 class GpuPool {
@@ -67,6 +71,13 @@ class GpuPool {
   // Builds drivers for the adapters that have none yet, and have a native one.
   uint32_t bind_native_drivers(efi::SystemTable* st, const IPciBus& pci);
 
+  // Gives every node that has no driver a probe from `factory` (the GPU is woken for it and put back to sleep), and lets each driverless GPU
+  // lose its power while it sleeps (a probe sets itself up again after a wake). `registers` maps the GPU's register BAR (nullptr: probes that
+  // need it are skipped). Returns how many nodes have a probe.
+  uint32_t bind_probes(efi::SystemTable* st, const IPciBus& pci, IRegisterMapper* registers, GpuProbeFactory factory);
+  // The probe's temperature, if the GPU is awake (a sensor is not worth waking a GPU for): -1 when it sleeps, has no probe or cannot tell.
+  int32_t probe_temperature(uint32_t index);
+
   uint32_t count() const { return manager_.count(); }
   GpuNode* node(uint32_t index) { return index < manager_.count() ? &nodes_[index] : nullptr; }
   const GpuNode* node(uint32_t index) const { return index < manager_.count() ? &nodes_[index] : nullptr; }
@@ -79,6 +90,9 @@ class GpuPool {
   allocators::IAllocator& allocator_;
   GpuManager manager_;
   GpuNode nodes_[GpuTopology::kMaxAdapters];
+  UniquePointer<IGpuProbe> probes_[GpuTopology::kMaxAdapters];
+  uint32_t probe_wakes_[GpuTopology::kMaxAdapters] = {};   // the manager's wake count the probe last saw (a new wake: resume() it)
+  bool resume_probe(uint32_t index);
 };
 
 }  // namespace hardware

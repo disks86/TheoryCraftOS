@@ -66,6 +66,9 @@
 #include "Hardware/Bus/Usb/UsbBus.hpp"
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/GraphicsProcessingUnit/Multi/GpuPool.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/Acpi/GpuAcpiPower.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/AppleGmux.hpp"
+#include "Hardware/GraphicsProcessingUnit/Multi/PcieLink.hpp"
 #include "Hardware/GraphicsProcessingUnit/SystemGpu.hpp"
 #include "Hardware/Monitor/Edid.hpp"
 #include "Hardware/Monitor/MonitorDisplay.hpp"
@@ -769,12 +772,33 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
   hardware::GpuPool gpu_pool(pci, shared_allocator);
   gpu_pool.initialize();
   gpu_pool.bind(st, pci, system_gpu);
+  // A discrete GPU with no driver gets a probe (the chip, its memory and sensors, read while it is awake), and sleeps 5 s after its last use,
+  // as Linux's runtime power management does; with a platform power handler (attached once the ACPI tables are loaded) its power is cut too.
+  gpu_pool.manager().set_autosuspend_ms(hardware::GpuManager::kDefaultAutosuspendMs);
+  (void)gpu_pool.bind_probes(st, pci, paging_ok ? &register_mapper : nullptr, hardware::make_vendor_gpu_probe);
+  // A GPU's HD-audio function (HDMI/DisplayPort audio of a discrete card) gets the HD-audio driver, which cannot follow the GPU through a power
+  // cut: it stays awake, and its GPU sleeps in D3hot only.
+  for (uint32_t i = 0; i < gpu_pool.count(); ++i)
+    for (uint32_t k = 0; k < gpu_pool.manager().companion_count(i); ++k) {
+      const hardware::PciAddress f = gpu_pool.manager().companion(i, k);
+      hardware::PciDeviceInfo info;
+      for (uint32_t d = 0; pci.pci_device(d, &info); ++d)
+        if (info.address.bus == f.bus && info.address.device == f.device && info.address.function == f.function && info.class_code == 0x04 && info.subclass == 0x03)
+          (void)gpu_pool.manager().mark_function_busy(f, true);
+    }
   if (gpu_pool.count() > 1) {
     for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
       const hardware::GpuNode& n = *gpu_pool.node(i);
-      Entry(Level::Info, "GPU").text(n.adapter.name).text(" (").text(hardware::gpu_kind_name(n.adapter.kind))
-          .text(static_cast<int32_t>(i) == gpu_pool.manager().display_index() ? ", display" : gpu_pool.manager().asleep(i) ? ", asleep" : "")
-          .text(n.gpu ? "" : ", no driver").text(")");
+      Entry e(Level::Info, "GPU");
+      e.text(n.probe ? n.probe->name() : n.adapter.name).text(" (").text(hardware::gpu_kind_name(n.adapter.kind))
+          .text(static_cast<int32_t>(i) == gpu_pool.manager().display_index() ? ", display" : "");
+      if (gpu_pool.manager().asleep(i)) e.text(", ").text(hardware::gpu_power_level_name(gpu_pool.manager().power_level(i)));
+      if (n.probe && n.probe->vram_bytes()) e.text(", ").dec(n.probe->vram_bytes() >> 20).text(" MiB");
+      if (n.probe && n.probe->connected_outputs()) e.text(", ").dec(n.probe->connected_outputs()).text(" monitor(s) on its outputs");
+      e.text(n.gpu ? "" : n.probe ? ", no display driver" : ", no driver");
+      if (n.probe && !StringView(n.probe->status()).equals(StringView("identified"))) e.text(", ").text(n.probe->status());
+      if (gpu_pool.manager().companion_count(i)) e.text(", ").dec(gpu_pool.manager().companion_count(i)).text(" more function(s)");
+      e.text(")");
     }
   }
 
@@ -2899,6 +2923,44 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     }
 #endif
 #ifdef TCOS_ACPI_EVENTS
+    // The platform's way of cutting a sleeping discrete GPU's power (vga_switcheroo's handlers): Apple's gmux, NVIDIA's Optimus / JT / hybrid
+    // _DSM, AMD's ATPX, or the ACPI power resources of the GPU or its root port. The GpuManager uses it once the GPU has been idle and nothing
+    // on it would lose state (a GPU with only a probe, whose audio function no driver holds).
+    hardware::X86GmuxPorts gmux_ports;
+    UniquePointer<hardware::AppleGmux> gmux;
+    UniquePointer<hardware::IGpuPlatformPower> gpu_platform_power[hardware::GpuTopology::kMaxAdapters];
+    if (acpi_events && gpu_pool.manager().is_hybrid()) {
+      acpi::AmlInterpreter& aml = acpi_events->interpreter();
+      if (acpi::Node* gmux_device = hardware::AppleGmux::find_device(aml)) {
+        hardware::AppleGmuxResource resource;
+        if (hardware::AppleGmux::find_resource(aml, gmux_device, &resource) && resource.has_io) {
+          gmux = UniquePointer<hardware::AppleGmux>::make(shared_allocator, gmux_ports, resource.io_base, resource.io_length, [](uint32_t us) { kernel::sleep_us(us); });
+          if (gmux && !gmux->initialize()) gmux = UniquePointer<hardware::AppleGmux>();
+        }
+      }
+      const hardware::GpuTopology& topology = gpu_pool.manager().topology();
+      const int32_t integrated = topology.find_first(hardware::GpuKind::Integrated);
+      for (uint32_t i = 0; i < gpu_pool.count(); ++i) {
+        const hardware::GpuAdapter& a = topology.adapter(i);
+        if (a.kind != hardware::GpuKind::Discrete || static_cast<int32_t>(i) == gpu_pool.manager().display_index()) continue;
+        hardware::IGpuPlatformPower* power = nullptr;
+        if (gmux) {
+          power = gmux.get();
+        } else {
+          hardware::PciAddress bridge;
+          const Optional<hardware::PciAddress> bridge_hint = hardware::pci_find_upstream_bridge(pci, a.device.address, &bridge) ? Optional<hardware::PciAddress>(bridge) : Optional<hardware::PciAddress>();
+          const Optional<hardware::PciAddress> igpu = integrated >= 0 ? Optional<hardware::PciAddress>(topology.adapter(static_cast<uint32_t>(integrated)).device.address) : Optional<hardware::PciAddress>();
+          gpu_platform_power[i] = hardware::GpuAcpiPower::find(aml, a.device.address, bridge_hint, a.device.vendor_id, shared_allocator, igpu, [](uint32_t ms) { kernel::sleep_ms(ms); });
+          power = gpu_platform_power[i].get();
+        }
+        if (!power || !gpu_pool.manager().attach_platform_power(i, power)) continue;
+        Entry(Level::Info, "GPU").text(gpu_pool.node(i)->probe ? gpu_pool.node(i)->probe->name() : a.name).text(": power cut while idle through ")
+            .text(hardware::gpu_power_mechanism_name(power->mechanism()));
+      }
+      if (gmux) Entry(Level::Info, "GPU").text("Apple gmux ").dec(gmux->version_major()).text(".").dec(gmux->version_minor()).text(" (display switch)");
+    }
+#endif
+#ifdef TCOS_ACPI_EVENTS
     // USB-C connectors through UCSI (the PNP0CA0 / USBC000 device): its own thread starts the policy manager and follows the changes the firmware
     // notifies (or that it finds by looking); the computer manager's hardware list shows the connectors.
     hardware::KernelUcsiClock ucsi_clock;
@@ -3109,6 +3171,15 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
 #ifdef TCOS_ISH
       if (ish) ish->poll();
 #endif
+      {
+        // The GPUs nobody uses go to sleep (and, where the platform can, lose their power) once they have been idle long enough.
+        static uint64_t gpu_service_ms = 0;
+        const uint64_t now_ms = hardware::uptime_us() / 1000;
+        if (now_ms - gpu_service_ms >= 1000) {
+          gpu_service_ms = now_ms;
+          (void)gpu_pool.manager().service(now_ms);
+        }
+      }
 #ifdef TCOS_POWER
       {
         const uint64_t now_ms = hardware::uptime_us() / 1000;
@@ -3120,6 +3191,8 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
           status.percent = tb.percent;
           status.state = tb.state == desktop::ChargeState::Charging ? hardware::BatteryState::Charging : tb.state == desktop::ChargeState::Discharging ? hardware::BatteryState::Discharging :
                          tb.state == desktop::ChargeState::Full ? hardware::BatteryState::Full : tb.state == desktop::ChargeState::NotCharging ? hardware::BatteryState::NotCharging : hardware::BatteryState::Unknown;
+          gpu_pool.manager().set_power_status(!status.present ? hardware::PowerSource::Unknown : status.state == hardware::BatteryState::Discharging ? hardware::PowerSource::Battery : hardware::PowerSource::Ac,
+                                              status.percent < 0 ? 100 : static_cast<uint8_t>(status.percent > 100 ? 100 : status.percent), power_manager.profile() == hardware::PowerProfile::PowerSaver);
           if (power_manager.update(status, now_ms)) desktop.notify("Power", power_manager.profile() == hardware::PowerProfile::PowerSaver ? "Battery is low: power saver profile" : "Balanced power profile", gui::NoticeKind::Information);
         }
         if (thermal.poll(now_ms)) {

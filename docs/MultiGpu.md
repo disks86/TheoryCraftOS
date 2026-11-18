@@ -23,16 +23,36 @@ Nothing here is limited to two GPUs: the machine's GPUs are a list of up to `Gpu
 
 `main.cpp` builds the pool and the graphics pool after `SystemGraphics` and logs the GPUs when there are several.
 
+## Laptops: runtime power of the discrete GPU
+
+What Linux does with runtime PM and vga_switcheroo, in `GpuManager` (test: `tests/run_host_tests.sh GpuRuntimePowerTest`, ASan and TSan):
+
+| Piece | What it does |
+| --- | --- |
+| Companion functions | The other functions of a discrete GPU's device (HD audio, Turing's USB-C and UCSI) are found at start-up, go to D3hot before the GPU and wake after it. A function a driver uses (`mark_function_busy`) stays awake and keeps the GPU out of D3cold; `main.cpp` marks the HD-audio function busy because the HD-audio driver binds to it and cannot follow a power cut. |
+| Autosuspend | `set_autosuspend_ms` (the kernel uses 5 s, as Linux): the last `release()` leaves the GPU on, `service(now_ms)` (called once a second from the main loop) puts it to sleep once it has been idle that long. |
+| D3cold | With an `IGpuPlatformPower` attached and `allow_cold` set, `service()` takes a D3hot GPU on to D3cold. The type 0 header of the GPU and its functions is saved before and written back after the power returns (BARs, ROM BAR, interrupt line, command last). |
+| Power source | `set_power_status` (from the battery read every 10 s) fills in what a `select()` caller leaves Unknown: on battery below 30 % or with power saver, heavy work goes to the integrated GPU. |
+| Probes | `GpuPool::bind_probes` gives a driverless GPU an `IGpuProbe` (`Multi/GpuProbe.hpp`, `GpuProbes.cpp`): for NVIDIA the native driver's read-only start (chip, VRAM, VBIOS, sensors, the EDID of monitors on the GPU's own ports). A probe sets itself up again after a wake, so a GPU with only a probe may go cold. `probe_temperature` never wakes a GPU. |
+| POST | A secondary NVIDIA GPU that the firmware did not POST (and every one after a power cut) needs its VBIOS init scripts (`Nvkm/NvInitScript`, `NvDevinit::post`, see [Nvidia.md](Nvidia.md)). They write to the card, so they run only with `TCOS_NVIDIA_NATIVE`; otherwise they are walked dry and the boot log says so. Tesla to Maxwell 1 only: GM20x-Volta need the PMU DEVINIT upload, Turing+ FWSEC. |
+| Render choice | `GraphicsPool::acquire` no longer wakes a discrete GPU with no driver and no 3D engine (the work would run on the CPU anyway): the display GPU gets it. |
+
+The platform handlers (attached in `main.cpp` once the ACPI tables are loaded, one per sleeping discrete GPU):
+
+- [MultiGpuAcpi.md](MultiGpuAcpi.md): `Multi/Acpi/`: finding the GPU's ACPI device, `_PR3`/`_PR0` power resources with `_PS3`/`_PS0`, NVIDIA Optimus / JT / the old hybrid `_DSM`, AMD ATPX (power and mux). Test `GpuAcpiPowerTest`.
+- [MultiGpuPlatform.md](MultiGpuPlatform.md): Apple gmux (`Multi/AppleGmux`: mux, discrete power, backlight) and the PCI Express link (`Multi/PcieLink`: upstream bridge, device functions, link disable/retrain, ASPM negotiation). Tests `AppleGmuxTest`, `PcieLinkTest`.
+
 ## Not done
 
 - **No native driver for the vendor GPUs.** The Intel, AMD and NVIDIA classes drive the UEFI framebuffer, which belongs to the boot display, so a second Intel/AMD/NVIDIA GPU
-  has a node with no driver: it cannot show anything, and renders only on the CPU. Real rendering on a discrete card needs a mode-setting driver and a 3D engine driver per
-  vendor; each plugs into `GpuNativeDrivers.cpp` (display) and `RenderNodeAccel.cpp` (3D). What works today is every combination of QEMU VGA, VMware SVGA and virtio-gpu
-  (e.g. QEMU with several `-device virtio-gpu-pci`).
-- The desktop does not span monitors on several GPUs: `SystemMonitors` and the monitor compositor still drive the display GPU only. `present_image()` and `renderer_2d(i)` put
-  pictures on the other GPUs' screens, but nothing yet lays windows out across them.
-- A GPU is not taken through a power cycle while it has a driver (the drivers cannot restore their state), so a GPU with a driver stays awake.
-- Cross-GPU copies are a read-back plus a blit through the CPU (no peer-to-peer DMA, no shared surfaces), and `GraphicsPool` is not thread safe.
-- Muxed laptops (a hardware switch that moves the panel between GPUs), ACPI `_PR3`/`_OFF` power resources and PCIe link-state (ASPM) control.
-- Battery state is not read by the manager; the caller fills `GpuSelectionInput` (see `Battery/AcpiBattery`).
-- Tested against fake PCI buses and fake screens (`MultiGpuTest`, `GraphicsPoolTest`) and built for UEFI, but not run on real hybrid hardware or in QEMU with several GPUs.
+  has no display driver: it cannot show anything, and renders only on the CPU. NVIDIA GPUs get a probe (identification, sensors, connectors); AMD and Intel discrete GPUs
+  get none. Each display driver plugs into `GpuNativeDrivers.cpp` (display) and `RenderNodeAccel.cpp` (3D). What works today is every combination of QEMU VGA, VMware
+  SVGA and virtio-gpu.
+- The desktop does not span monitors on several GPUs: `SystemMonitors` and the monitor compositor still drive the display GPU only.
+- A GPU with a display driver is never power-cycled (the drivers cannot restore their state), so it stays awake.
+- The mux is found (gmux, ATPX, NVIDIA hybrid `_DSM`) but nothing switches the panel: that needs a display driver on the discrete GPU.
+- Not used yet: ASPM (`pcie_aspm_configure`) and link disable on the root port around D3cold; the root port's `_DSM` function 9 delay; reference counting of power
+  resources shared with other devices; the HD-audio driver's own runtime PM (a GPU whose audio function is enabled stays in D3hot); NVIDIA PLL programming in the init
+  scripts.
+- Cross-GPU copies are a read-back plus a blit through the CPU, and `GraphicsPool` is not thread safe.
+- Tested against fake PCI buses, fake AML and fake ports, and built for UEFI, but not run on real hybrid hardware or in QEMU with several GPUs.

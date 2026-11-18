@@ -74,6 +74,7 @@ bool NvidiaNative::start() {
   const uint64_t bar0 = context_.pci->memory_bar(context_.device.address, 0);
   MmioRegion region;
   if (!bar0 || !context_.registers->map_registers(bar0, MmioNvRegisters::kBar0Bytes, &region)) return fail("BAR0 not mapped");
+  bar0_ = region;
   regs_ = UniquePointer<MmioNvRegisters>::make(allocator_, region);
   if (!regs_) return fail("out of memory");
   const uint32_t boot0 = regs_->read32(kPmcBoot0);
@@ -82,6 +83,7 @@ bool NvidiaNative::start() {
   if (chip_.family == Family::Unknown) return fail("a chip this driver does not know");
   vram_ = probe_vram(*regs_, chip_);                       // (reads only)
   (void)read_bios();                                       // (without one: no board tables, no connectors; the rest works)
+  if (!boot_display_) (void)run_post();                     // (the boot display was POSTed by the firmware that shows it)
   gpio_ = UniquePointer<NvGpio>::make(allocator_, *regs_, chip_, board_);
   if (gpio_) therm_ = UniquePointer<NvThermMonitor>::make(allocator_, *regs_, chip_, *gpio_);
   if (therm_ && !therm_->initialize()) therm_ = UniquePointer<NvThermMonitor>();
@@ -90,13 +92,51 @@ bool NvidiaNative::start() {
   return true;
 }
 
+bool NvidiaNative::resume() {
+  if (!regs_) return fail("not started");
+  const uint32_t boot0 = regs_->read32(kPmcBoot0);
+  if (boot0 == 0xFFFFFFFFu || boot0 == 0) return fail("the GPU does not answer (powered down?)");
+  if (boot0 != chip_.boot0) return fail("a different chip answers after the power cycle");
+  if (!boot_display_) (void)run_post();                     // (after a power cut the GPU is as un-POSTed as a cold boot)
+  if (therm_) {
+    therm_->shutdown();
+    if (!therm_->initialize()) therm_ = UniquePointer<NvThermMonitor>();
+  }
+  status_ = "identified";
+  return true;
+}
+
+bool NvidiaNative::run_post() {
+  if (!bios_image_) {
+    post_ = PostReport{};
+    post_.reason = "no video BIOS";
+    return false;
+  }
+  const NvBios bios(bios_image_->view());
+  MmioNvVgaIo vga(bar0_);
+  PostInputs in;
+  in.bios = &bios;
+  in.registers = regs_.get();
+  in.vga = &vga;
+  in.chip = chip_;
+  in.board = &board_;
+#ifdef TCOS_NVIDIA_NATIVE
+  in.dry_run = false;
+#else
+  in.dry_run = true;                                        // (MMIO reads only: what would be written is counted, not written)
+#endif
+  post_ = NvDevinit::post(in);
+  return post_.outcome == PostOutcome::Ran || post_.outcome == PostOutcome::AlreadyPosted || post_.outcome == PostOutcome::DryRun;
+}
+
 bool NvidiaNative::read_bios() {
   NvBiosSources sources;
   sources.registers = regs_.get();
   sources.chip = chip_;
   sources.mapper = context_.registers;
   sources.function = context_.device.address;
-  sources.boot_display = true;                              // (NvidiaGpu is the boot display's driver)
+  sources.boot_display = boot_display_;                     // (NvidiaGpu is the boot display's driver; a GpuPool probe is not)
+  sources.acpi_rom = acpi_rom_;
   sources.device_id = context_.device.device_id;
   sources.allocator = &allocator_;
   // (No expansion ROM BAR: switching it on is a write to the function's configuration space, which the GPU context does not give.)

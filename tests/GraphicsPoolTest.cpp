@@ -156,7 +156,9 @@ void run_machine(uint32_t n, const bool* with_driver) {
     {
       RenderLease lease = pool.acquire(game);
       if (n > 1) {
-        CHECK(lease && lease.node() == 0 && !gpus.manager().asleep(0) && !lease.accelerated());
+        // (A discrete GPU with no driver would render on the CPU and could not show anything: the display GPU gets the work, and it sleeps on.)
+        if (with_driver[0]) CHECK(lease && lease.node() == 0 && !gpus.manager().asleep(0) && !lease.accelerated());
+        else CHECK(lease && lease.node() == display && gpus.manager().asleep(0) && !lease.accelerated());
         for (uint32_t t = 0; t < n; ++t) {
           if (!with_driver[t]) { CHECK(!render_green(lease, pool, t, 2, 3)); continue; }
           // Rendered on GPU 0, shown on GPU t.
