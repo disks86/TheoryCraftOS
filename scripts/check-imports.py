@@ -128,6 +128,11 @@ def canonical(name):
         return "powrprof.dll"
     if n.startswith("api-ms-win-shcore-"):
         return "shcore.dll"
+    for library in ("shell32", "advapi32", "kernel32", "ole32", "user32", "shlwapi", "version"):
+        if n.startswith("api-ms-win-downlevel-" + library + "-"):
+            return library + ".dll"
+    if n.startswith("api-ms-win-appmodel-"):
+        return "kernel32.dll"
     if n == "winspool.drv":
         return "winspool.dll"
     if n == "bthprops.cpl":

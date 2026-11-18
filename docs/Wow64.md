@@ -204,7 +204,7 @@ Not done yet, in the order planned:
    passed kernel32's startup block to the kernel unconverted, which only went well while the block held nothing but zeros), the status block of
    pipe and lock calls in the 32-bit layout (the kernel wrote 16 bytes: a 32-bit `ReadFile` on a pipe saw "0 bytes read" and lost 8 bytes
    behind the block), and COM's `CLSID_GlobalOptions`. `tests/windows/crt32.c` and `gui32.c` check each. The updater then needs COM between
-   processes, which `ole32` does not have (docs/AppManager.md).
+   processes, which `ole32` has since (docs/WindowsCom.md): with it, MSXML and `cabinet.dll`, the updater installs Chrome (docs/AppManager.md).
 5. **Other machines**: on ARM and RISC-V the x86 emulator (src/Emulation, src/EmulationJit) would need a 32-bit mode; nothing is done there.
 
 ## Finding out why a program gives up

@@ -55,6 +55,14 @@ bool canonical_library_name(StringView name, String* out) {
   if (starts_with(text, "api-ms-win-core-winrt-")) return out->assign("combase.dll");
   if (starts_with(text, "api-ms-win-power-")) return out->assign("powrprof.dll");
   if (starts_with(text, "api-ms-win-shcore-")) return out->assign("shcore.dll");
+  // (the "downlevel" sets name the library they came out of: api-ms-win-downlevel-shell32-l1-1-0 is shell32, and so on; Chromium takes CommandLineToArgvW from that one)
+  if (starts_with(text, "api-ms-win-downlevel-shell32-")) return out->assign("shell32.dll");
+  if (starts_with(text, "api-ms-win-downlevel-advapi32-")) return out->assign("advapi32.dll");
+  if (starts_with(text, "api-ms-win-downlevel-kernel32-") || starts_with(text, "api-ms-win-appmodel-")) return out->assign("kernel32.dll");
+  if (starts_with(text, "api-ms-win-downlevel-ole32-")) return out->assign("ole32.dll");
+  if (starts_with(text, "api-ms-win-downlevel-user32-")) return out->assign("user32.dll");
+  if (starts_with(text, "api-ms-win-downlevel-shlwapi-")) return out->assign("shlwapi.dll");
+  if (starts_with(text, "api-ms-win-downlevel-version-")) return out->assign("version.dll");
   // Libraries with other extensions than .dll: here they are DLLs like the others (the print spooler's winspool.drv is winspool.dll).
   if (text.equals("winspool.drv")) return out->assign("winspool.dll");
   if (text.equals("bthprops.cpl")) return out->assign("bthprops.dll");

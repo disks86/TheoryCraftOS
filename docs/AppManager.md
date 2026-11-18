@@ -200,14 +200,18 @@ Windows side:
   - `KeePassXCTeam.KeePassXC` (a Windows Installer package, 69 MB, an LZX cabinet): installed by this system's own engine, "KeePassXC (Windows)"
     in the Start menu, removed again with the kept package. Its first run found that the kernel's registry makes only the last key of a path;
     the installer's registry functions now make a key's parents one by one.
-  - `Google.Chrome` is a Windows Installer package that only wraps Google's updater: the engine unpacks the updater's setup program and runs it
-    with the command line the package builds, as `msiexec` would. That program (32-bit, Chromium code) now starts, unpacks itself, starts its
-    crash handler and sets itself up; getting there fixed five faults of the Windows layer (the loader lock in a 32-bit program's PEB, the
-    startup block of a 32-bit `CreateProcess` with a list of handles, status blocks of pipe calls written in the 64-bit layout for 32-bit
-    programs, handles opened only to append, and COM's `CLSID_GlobalOptions`). It then stops with its error 75003 ("updater registration
-    failed"): the updater does its work in a second process that it reaches through COM (`CoCreateInstance` of a class served by a Windows
-    service), and this system's `ole32` has no COM between processes. Chrome does not install until it has. (The run was made with the
-    checksum check off, because Google had already replaced the file the manifest names.)
+  - `Google.Chrome` (a Windows Installer package that wraps Google's updater): **installed and removed.** The engine unpacks the updater's
+    setup program and runs it with the command line the package builds; that program sets the updater up, starts its service and asks it,
+    through COM, to run the Chrome installer the package carries; the installer unpacks Chrome (about 400 MB) into
+    `C:\Program Files\Google\Chrome\Application` and writes its shortcuts. The Start menu then lists "Google Chrome (Windows)". Removing runs
+    the package the other way, which runs Chrome's own uninstaller. The run takes about four minutes in QEMU. What it took, beyond the
+    package engine: five faults of the 32-bit layer (docs/Wow64.md), COM between processes (docs/WindowsCom.md), MSXML (the updater reads
+    its manifest with it), `cabinet.dll` (Chrome's installer unpacks its setup program with it), file mappings larger than 64 MiB (the
+    installer maps its own 160 MiB file), the "downlevel" API set names, a property store on shortcuts, and details of services and
+    registry security. Not done: the updater's scheduled tasks (there is no Task Scheduler; it goes on without), its firewall rule, and
+    whether the installed Chrome then *runs* is the subject of docs on the Chromium work, not of this. The run was made with the checksum
+    check off, because Google had already replaced the file that winget's manifest names: until the manifest follows, the App Manager
+    refuses the download, as winget itself does.
 
   The 7-Zip run found two faults that are fixed: this system's `msvcrt.dll` did not export the data `_fmode`, `_commode` and `_acmdln` that the
   startup code of older programs imports (the setup program crashed at once), and a program that an ended program had started went on using what

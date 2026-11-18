@@ -540,6 +540,7 @@ class ObjectManager {
   PipeOp* pipe_new_op_locked(Pipe& p, PipeOpKind kind, uint32_t end, uint64_t owner);
   PipeOp* pipe_find_op_locked(Pipe& p, uint32_t tag);
   void pipe_free_op_locked(Pipe& p, PipeOp& op);
+  static constexpr uint64_t kMaxSectionBytes = 1ull << 30;      // of one section
   static constexpr uint32_t kMaxPipes = 128, kMaxSections = 1024, kMaxLocks = 256, kMaxShares = 1024, kMaxTimes = 512, kMaxLinkTexts = 64, kMaxSecurity = 2048;
 
   struct Watch {

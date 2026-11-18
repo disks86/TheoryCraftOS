@@ -30,12 +30,16 @@
 #define LNK_UNICODE 0x80
 #define LNK_FORCE_NO_LINKINFO 0x100
 
+#define LINK_PROPERTIES 8
 typedef struct {
   const IShellLinkWVtbl *w;
   const IShellLinkAVtbl *a;
   const IPersistFileVtbl *file;
   const IPersistStreamVtbl *stream;
   const IShellLinkDataListVtbl *data_list;
+  const IPropertyStoreVtbl *properties;
+  struct { PROPERTYKEY key; PROPVARIANT value; } property[LINK_PROPERTIES];      /* (the properties a program gave the shortcut, for as long as this object lives) */
+  ULONG property_count;
   DWORD data_flags;
   LONG ref;
   LPITEMIDLIST pidl;
@@ -48,6 +52,7 @@ typedef struct {
 #define LINK_FROM_A(p) ((LinkObject *)((BYTE *)(p) - offsetof(LinkObject, a)))
 #define LINK_FROM_FILE(p) ((LinkObject *)((BYTE *)(p) - offsetof(LinkObject, file)))
 #define LINK_FROM_DATA(p) ((LinkObject *)((BYTE *)(p) - offsetof(LinkObject, data_list)))
+#define LINK_FROM_PROPERTIES(p) ((LinkObject *)((BYTE *)(p) - offsetof(LinkObject, properties)))
 #define LINK_FROM_STREAM(p) ((LinkObject *)((BYTE *)(p) - offsetof(LinkObject, stream)))
 #define LINK_W(p) ((LinkObject *)(p))
 
@@ -55,6 +60,40 @@ static const GUID CLSID_ShellLink_ = {0x00021401, 0x0000, 0x0000, {0xC0, 0x00, 0
 static const GUID CLSID_ShellItem_ = {0x9AC9FBE1, 0xE0A2, 0x4AD6, {0xB4, 0xEE, 0xE2, 0x12, 0x01, 0x3E, 0xA9, 0x17}};
 static HRESULT known_folder_manager_create(REFIID riid, void **out);
 static const GUID CLSID_KnownFolderManager_ = {0x4DF0C730, 0xDF9D, 0x4AE3, {0x91, 0x53, 0xAA, 0x6B, 0x82, 0xE9, 0x79, 0x5A}};
+
+/* A property's value: text, a class identifier, or a plain number or flag are kept (as copies of their own). */
+static void link_property_clear(PROPVARIANT *v) {
+  if (v->vt == VT_LPWSTR) CoTaskMemFree(v->pwszVal);
+  else if (v->vt == VT_CLSID) CoTaskMemFree(v->puuid);
+  memset(v, 0, sizeof(*v));
+}
+static HRESULT link_property_copy(PROPVARIANT *to, const PROPVARIANT *from) {
+  memset(to, 0, sizeof(*to));
+  switch (from->vt) {
+    case VT_EMPTY: return S_OK;
+    case VT_LPWSTR: {
+      const size_t bytes = from->pwszVal ? (wcslen(from->pwszVal) + 1) * sizeof(WCHAR) : 0;
+      if (bytes) {
+        to->pwszVal = CoTaskMemAlloc(bytes);
+        if (!to->pwszVal) return E_OUTOFMEMORY;
+        memcpy(to->pwszVal, from->pwszVal, bytes);
+      }
+      to->vt = VT_LPWSTR;
+      return S_OK;
+    }
+    case VT_CLSID:
+      if (!from->puuid) return E_INVALIDARG;
+      to->puuid = CoTaskMemAlloc(sizeof(GUID));
+      if (!to->puuid) return E_OUTOFMEMORY;
+      *to->puuid = *from->puuid;
+      to->vt = VT_CLSID;
+      return S_OK;
+    case VT_BOOL: case VT_I2: case VT_UI2: case VT_I4: case VT_UI4: case VT_I8: case VT_UI8: case VT_FILETIME:
+      *to = *from;
+      return S_OK;
+    default: return E_NOTIMPL;      /* (a kind of value a shortcut has no use for) */
+  }
+}
 
 static void link_set(WCHAR **field, const WCHAR *value) {
   WCHAR *copy = value ? w_dup(value) : NULL;
@@ -71,6 +110,7 @@ static HRESULT STDMETHODCALLTYPE lw_query(IShellLinkW *self, REFIID riid, void *
   else if (IsEqualIID(riid, &IID_IPersistFile) || IsEqualIID(riid, &IID_IPersist)) *out = &l->file;
   else if (IsEqualIID(riid, &IID_IPersistStream)) *out = &l->stream;
   else if (IsEqualIID(riid, &IID_IShellLinkDataList)) *out = &l->data_list;
+  else if (IsEqualIID(riid, &IID_IPropertyStore)) *out = &l->properties;
   else return E_NOINTERFACE;
   InterlockedIncrement(&l->ref);
   return S_OK;
@@ -80,6 +120,7 @@ static ULONG STDMETHODCALLTYPE lw_release(IShellLinkW *self) {
   LinkObject *l = LINK_W(self);
   const LONG n = InterlockedDecrement(&l->ref);
   if (!n) {
+    for (ULONG i = 0; i < l->property_count; i++) link_property_clear(&l->property[i].value);
     SHFree(l->pidl);
     mem_free(l->target); mem_free(l->description); mem_free(l->working_dir); mem_free(l->arguments); mem_free(l->icon_path); mem_free(l->relative_path); mem_free(l->current_file);
     mem_free(l);
@@ -563,6 +604,54 @@ static HRESULT STDMETHODCALLTYPE ld_get_flags(IShellLinkDataList *self, DWORD *f
 static HRESULT STDMETHODCALLTYPE ld_set_flags(IShellLinkDataList *self, DWORD flags) { LINK_FROM_DATA(self)->data_flags = flags; LINK_FROM_DATA(self)->dirty = TRUE; return S_OK; }
 static const IShellLinkDataListVtbl g_link_data_vtbl = {ld_query, ld_addref, ld_release, ld_add, ld_copy, ld_remove, ld_get_flags, ld_set_flags};
 
+/* IPropertyStore: the properties of a shortcut (the application's identity for the taskbar, the class a notification starts, ...). Programs set them when they make a
+   shortcut - Chromium's installer gives up on a shortcut whose link object has no property store. They are kept with the object and given back; the file does not
+   carry them (nothing here reads them from a shortcut file). */
+static HRESULT STDMETHODCALLTYPE lp_query(IPropertyStore *self, REFIID riid, void **out) { return lw_query((IShellLinkW *)LINK_FROM_PROPERTIES(self), riid, out); }
+static ULONG STDMETHODCALLTYPE lp_addref(IPropertyStore *self) { return lw_addref((IShellLinkW *)LINK_FROM_PROPERTIES(self)); }
+static ULONG STDMETHODCALLTYPE lp_release(IPropertyStore *self) { return lw_release((IShellLinkW *)LINK_FROM_PROPERTIES(self)); }
+static HRESULT STDMETHODCALLTYPE lp_count(IPropertyStore *self, DWORD *count) {
+  if (!count) return E_POINTER;
+  *count = LINK_FROM_PROPERTIES(self)->property_count;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lp_at(IPropertyStore *self, DWORD index, PROPERTYKEY *key) {
+  LinkObject *l = LINK_FROM_PROPERTIES(self);
+  if (!key) return E_POINTER;
+  if (index >= l->property_count) return E_INVALIDARG;
+  *key = l->property[index].key;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lp_get(IPropertyStore *self, REFPROPERTYKEY key, PROPVARIANT *value) {
+  LinkObject *l = LINK_FROM_PROPERTIES(self);
+  if (!key || !value) return E_POINTER;
+  memset(value, 0, sizeof(*value));      /* (a property the store does not have is an empty value, and no error) */
+  for (ULONG i = 0; i < l->property_count; i++)
+    if (IsEqualGUID(&l->property[i].key.fmtid, &key->fmtid) && l->property[i].key.pid == key->pid) return link_property_copy(value, &l->property[i].value);
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lp_set(IPropertyStore *self, REFPROPERTYKEY key, REFPROPVARIANT value) {
+  LinkObject *l = LINK_FROM_PROPERTIES(self);
+  PROPVARIANT copy;
+  if (!key || !value) return E_POINTER;
+  const HRESULT hr = link_property_copy(&copy, value);
+  if (FAILED(hr)) return hr;
+  ULONG at = 0;
+  while (at < l->property_count && !(IsEqualGUID(&l->property[at].key.fmtid, &key->fmtid) && l->property[at].key.pid == key->pid)) at++;
+  if (at == l->property_count) {
+    if (at == LINK_PROPERTIES) { link_property_clear(&copy); return E_OUTOFMEMORY; }
+    l->property[at].key = *key;
+    memset(&l->property[at].value, 0, sizeof(PROPVARIANT));
+    l->property_count++;
+  }
+  link_property_clear(&l->property[at].value);
+  l->property[at].value = copy;
+  l->dirty = TRUE;
+  return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE lp_commit(IPropertyStore *self) { (void)self; return S_OK; }
+static const IPropertyStoreVtbl g_link_properties_vtbl = {lp_query, lp_addref, lp_release, lp_count, lp_at, lp_get, lp_set, lp_commit};
+
 static HRESULT link_create(REFIID riid, void **out) {
   LinkObject *l = mem_alloc(sizeof(*l));
   if (!l) return E_OUTOFMEMORY;
@@ -571,6 +660,7 @@ static HRESULT link_create(REFIID riid, void **out) {
   l->file = &g_link_file_vtbl;
   l->stream = &g_link_stream_vtbl;
   l->data_list = &g_link_data_vtbl;
+  l->properties = &g_link_properties_vtbl;
   l->ref = 1;
   l->show = SW_SHOWNORMAL;
   objects_add();

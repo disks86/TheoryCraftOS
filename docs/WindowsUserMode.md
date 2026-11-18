@@ -695,6 +695,19 @@ Not done: cabinets that are one of a set (`FDIERROR_CABINET_NOT_FOUND`; no `fdin
 FCI (`FCICreate` fails) and the Compression API (stubs). Tests: `CabinetTest` and `SyscallTest` (the service: every fixture, short buffers, wrong indices, cabinets cut short and with bits
 flipped, bad pointers) and `tests/windows/cab32.c` (the DLL on the real kernel, as a 32-bit and a 64-bit program: `tests/wow64_qemu.sh cab32 cab64`).
 
+## msxml3.dll and msxml6.dll
+
+The XML DOM that `CoCreateInstance` of the `DOMDocument` classes gives (`src/Windows/msxml3`; `msxml6.dll` forwards to it, and ole32 knows
+which library serves which class without registry entries). A document loads XML from text or a local file with a parser of its own - no
+DOCTYPE entities, nothing fetched, limits on depth and size - and is read through the MSXML interfaces: nodes, children, attributes, text,
+namespaces, element lists, and simple paths (`a/b`, `//name`, `@attr`, one `[@a='v']` test). Trees cannot be changed: the methods that would
+are in the virtual tables and answer `E_NOTIMPL`. `tests/wow64_qemu.sh xml32` runs 164 checks (32-bit; the 64-bit library is built and was
+exercised only by Chrome's installer run).
+
+## Objects in other processes
+
+See [WindowsCom.md](WindowsCom.md): `CLSCTX_LOCAL_SERVER`, services that serve COM classes, calls by type library.
+
 ## shcore.dll
 
 `src/Windows/shcore/shcore.c` implements the shell core library: DPI (`GetDpiForMonitor`, `Get/SetProcessDpiAwareness`, `GetScaleFactorForMonitor/Device`, `GetDpiForShellUIComponent`)

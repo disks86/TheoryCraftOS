@@ -204,6 +204,36 @@ int main(void) {
     HRESULT saved = E_FAIL;
     IShellLinkW_SetPath(link, L"C:\\Windows\\gui32.exe");
     IShellLinkW_SetDescription(link, L"made by gui32");
+    {
+      /* The shortcut's properties (the application's identity for the taskbar): an installer sets them before it saves, and reads them back. The interface is
+         declared here by hand: the property system's headers are not needed for the rest. */
+      static const GUID iid_store = {0x886D8EEB, 0x8CF2, 0x4446, {0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99}};
+      struct Key { GUID fmtid; DWORD pid; } app_id = {{0x9F4C2855, 0x9F79, 0x4B39, {0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3}}, 5};      /* PKEY_AppUserModel_ID */
+      struct Store;
+      struct StoreVtbl {
+        HRESULT (WINAPI *QueryInterface)(struct Store *, REFIID, void **);
+        ULONG (WINAPI *AddRef)(struct Store *);
+        ULONG (WINAPI *Release)(struct Store *);
+        HRESULT (WINAPI *GetCount)(struct Store *, DWORD *);
+        HRESULT (WINAPI *GetAt)(struct Store *, DWORD, struct Key *);
+        HRESULT (WINAPI *GetValue)(struct Store *, const struct Key *, PROPVARIANT *);
+        HRESULT (WINAPI *SetValue)(struct Store *, const struct Key *, const PROPVARIANT *);
+        HRESULT (WINAPI *Commit)(struct Store *);
+      };
+      struct Store { const struct StoreVtbl *lpVtbl; } *store = NULL;
+      PROPVARIANT value, back;
+      DWORD count = 99;
+      memset(&value, 0, sizeof(value));
+      memset(&back, 0, sizeof(back));
+      value.vt = VT_LPWSTR;
+      value.pwszVal = (WCHAR *)L"TheoryCraftOS.gui32";
+      const HRESULT got = IShellLinkW_QueryInterface(link, &iid_store, (void **)&store);
+      check(SUCCEEDED(got) && store && store->lpVtbl->GetValue(store, &app_id, &back) == S_OK && back.vt == VT_EMPTY && store->lpVtbl->SetValue(store, &app_id, &value) == S_OK &&
+            store->lpVtbl->Commit(store) == S_OK && store->lpVtbl->GetCount(store, &count) == S_OK && count == 1 && store->lpVtbl->GetValue(store, &app_id, &back) == S_OK &&
+            back.vt == VT_LPWSTR && back.pwszVal != value.pwszVal && lstrcmpW(back.pwszVal, L"TheoryCraftOS.gui32") == 0, "a shortcut's property store keeps what is set");
+      if (back.vt == VT_LPWSTR) CoTaskMemFree(back.pwszVal);
+      if (store) store->lpVtbl->Release(store);
+    }
     if (SUCCEEDED(IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&file)) && file) {
       saved = IPersistFile_Save(file, L"C:\\Windows\\Temp\\gui32.lnk", TRUE);
       IPersistFile_Release(file);

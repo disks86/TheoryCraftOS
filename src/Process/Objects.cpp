@@ -1786,7 +1786,9 @@ ObjectManager::Created ObjectManager::create_section(StringView name, uint64_t s
     file_size = file->size();
   }
   const uint64_t bytes = size > file_size ? size : file_size;
-  if (bytes == 0 || bytes > (64ull << 20)) { result.status = bytes == 0 ? kInvalid : kNoResources; return result; }
+  // (A section is held in memory whole, so there is a limit to its size: the one a program's image has. 64 MiB was too little - an installer maps its own file,
+  // 160 MiB of it for Chrome's, to get at the archive inside.)
+  if (bytes == 0 || bytes > kMaxSectionBytes) { result.status = bytes == 0 ? kInvalid : kNoResources; return result; }
   const uint64_t rounded = (bytes + 4095) & ~uint64_t{4095};
   uint8_t* storage = static_cast<uint8_t*>(allocator_->allocate_aligned(rounded, 4096));
   if (!storage) { result.status = 0xC0000017u; return result; }
