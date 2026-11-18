@@ -1280,15 +1280,16 @@ NtStatus Kernel::escape_d3d12(ProcessId pid, Handle device, uint32_t op, ByteRea
       for (uint32_t i = 0; i < count; ++i) {
         const uint32_t index = in.le32(), kind = in.le32(), allocation = in.le32(), off_lo = in.le32(), off_hi = in.le32(), size_lo = in.le32(), size_hi = in.le32();
         const uint32_t filter = in.le32(), au = in.le32(), av = in.le32(), mip = in.le32(), bias = in.le32(), min_lod = in.le32(), max_lod = in.le32();
-        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::Sampler) || filter > 1 || au > 1 || av > 1 || mip > 2) return status::kInvalidParameter;
         DescriptorDesc d;
+        graphics::BorderColor no_border;
+        if (!in.ok() || kind > static_cast<uint32_t>(DescriptorKind::Sampler) || filter > 1 || !decode_address_word(au, &d.sampler.address_u, &d.sampler.border) ||
+            !decode_address_word(av, &d.sampler.address_v, &no_border) || mip > 2)
+          return status::kInvalidParameter;
         d.kind = static_cast<DescriptorKind>(kind);
         d.allocation = allocation;
         d.offset = off_lo | (uint64_t{off_hi} << 32);
         d.size = size_lo | (uint64_t{size_hi} << 32);
         d.sampler.filter = static_cast<graphics::Filter>(filter);
-        d.sampler.address_u = static_cast<graphics::AddressMode>(au);
-        d.sampler.address_v = static_cast<graphics::AddressMode>(av);
         d.sampler.mip_filter = static_cast<graphics::MipFilter>(mip);
         d.sampler.lod_bias = bits_float(bias);
         d.sampler.min_lod = bits_float(min_lod);
@@ -1400,7 +1401,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
         a.location = in.le32();
         const uint32_t format = in.le32();
         a.offset = in.le32();
-        if (format > static_cast<uint32_t>(graphics::VertexFormat::Float4)) return status::kInvalidParameter;
+        if (format >= graphics::kVertexFormatCount) return status::kInvalidParameter;
         a.format = static_cast<graphics::VertexFormat>(format);
       }
       const uint32_t enable = in.le32(), compare = in.le32(), fail = in.le32(), depth_fail = in.le32(), pass = in.le32();
@@ -1472,7 +1473,7 @@ NtStatus Kernel::escape(ProcessId pid, Handle device, ConstByteView request, Byt
                         a.location = in.le32();
                         const uint32_t packed = in.le32();      // format | slot << 8
                         a.offset = in.le32();
-                        if ((packed & 0xFF) > static_cast<uint32_t>(graphics::VertexFormat::Float4) || (packed >> 8) >= graphics::kMaxVertexBuffers) return status::kInvalidParameter;
+                        if ((packed & 0xFF) >= graphics::kVertexFormatCount || (packed >> 8) >= graphics::kMaxVertexBuffers) return status::kInvalidParameter;
                         a.format = static_cast<graphics::VertexFormat>(packed & 0xFF);
                         a.slot = static_cast<uint8_t>(packed >> 8);
                       }

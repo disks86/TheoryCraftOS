@@ -23,6 +23,8 @@ static void dev_destroy(DxObj *o) {
   Dev *d = (Dev *)o;
   mem_free(d->shared);      /* (empty: every pipeline has gone, and each gave its shaders back) */
   if (d->null_target) kmt_destroy_allocation(d->kdev, d->null_target);
+  for (UINT i = 0; i < d->companion_count; ++i) kmt_destroy_allocation(d->kdev, d->companions[i].color);
+  mem_free(d->companions);
   if (d->kdev) kmt_destroy_device(d->kdev);
   if (d->adapter) kmt_close_adapter(d->adapter);
 }
@@ -57,7 +59,9 @@ static D3D12_HEAP_PROPERTIES *STDMETHODCALLTYPE dev_GetCustomHeapProperties(Dev 
  * 10_0 the same but fewer interpolants (the ones it needs are 16 as well), and below that 9_3 (4 render targets, 16 textures) or 9_1. */
 static D3D_FEATURE_LEVEL dev_feature_level(const Dev *d) {
   const KmtCaps *c = &d->caps;
-  if (c->max_vertex_attributes >= 16 && c->max_varyings >= 16 && c->max_texture_units >= 16 && c->max_color_targets >= 8) return D3D_FEATURE_LEVEL_11_0;
+  /* (11_0: sixteen vertex inputs and texture units, eight render targets. The level also names 32 interpolants; a GPU reached through OpenGL has 14 or 15 for the shaders'
+   * own - GL_MAX_VARYING_COMPONENTS less the position - and a pipeline whose shaders pass more than the device takes is refused when it is made) */
+  if (c->max_vertex_attributes >= 16 && c->max_varyings >= 14 && c->max_texture_units >= 16 && c->max_color_targets >= 8) return D3D_FEATURE_LEVEL_11_0;
   if (c->max_texture_units >= 16 && c->max_color_targets >= 4 && c->max_varyings >= 8) return D3D_FEATURE_LEVEL_9_3;
   return D3D_FEATURE_LEVEL_9_1;
 }

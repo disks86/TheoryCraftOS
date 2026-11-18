@@ -132,6 +132,8 @@ struct CmdList {
   UINT dsv;
   int pass_open;
   int pending_clear;           /* a depth/stencil clear waiting for a pass */
+  UINT pending_width, pending_height, pending_samples;      /* (the buffer's size: for its companion, if no pass takes the clear) */
+  UINT dsv_width, dsv_height, dsv_samples;                  /* the size of the depth buffer in `dsv` */
   UINT pending_alloc, pending_flags;
   float pending_depth;
   UINT pending_stencil;
@@ -290,9 +292,11 @@ static HRESULT STDMETHODCALLTYPE dev_CreateCommandList(Dev *This, UINT mask, D3D
 }
 
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(CmdList *This) { return This->type; }
+static void flush_pending_clear(CmdList *l);
 static HRESULT STDMETHODCALLTYPE list_Close(CmdList *This) {
   if (This->closed) return E_FAIL;
   end_pass(This);
+  if (!This->bundle) flush_pending_clear(This);
   This->closed = 1;
   return S_OK;
 }
@@ -333,11 +337,83 @@ static void begin_pass_packet(CmdList *l, UINT color_alloc, UINT depth_alloc, UI
   packet(l, OP_BEGIN_PASS, w, n);
 }
 
+/* The kernel's passes have a colour target; Direct3D 12's need not (a shadow map is drawn with a depth buffer alone). Such a pass draws into a colour target of the depth
+ * buffer's size that nothing reads: the buffer's companion, made the first time it is needed and kept until the buffer is destroyed (resource.inc drops it). It costs the
+ * memory of a 32-bit image of that size; a device whose passes need no colour target would save it. Returns 0 if it cannot be made. */
+static UINT depth_companion(Dev *dev, UINT depth, UINT width, UINT height, UINT samples) {
+  UINT color = 0;
+  if (!depth || !width || !height) return 0;
+  AcquireSRWLockExclusive(&dev->companion_lock);
+  for (UINT i = 0; i < dev->companion_count; ++i)
+    if (dev->companions[i].depth == depth) { color = dev->companions[i].color; break; }
+  if (!color) {
+    if (dev->companion_count == dev->companion_capacity) {
+      const UINT capacity = dev->companion_capacity ? dev->companion_capacity * 2 : 8;
+      struct Companion *grown = mem_alloc((SIZE_T)capacity * sizeof *grown);
+      if (grown) {
+        if (dev->companion_count) memcpy(grown, dev->companions, (SIZE_T)dev->companion_count * sizeof *grown);
+        mem_free(dev->companions);
+        dev->companions = grown;
+        dev->companion_capacity = capacity;
+      }
+    }
+    if (dev->companion_count < dev->companion_capacity) {
+      KmtAllocDesc ad;
+      memset(&ad, 0, sizeof ad);
+      ad.flags = KA_RENDER_TARGET;
+      ad.format = KF_A8R8G8B8;
+      ad.width = width;
+      ad.height = height;
+      ad.mips = ad.layers = 1;
+      ad.samples = samples ? samples : 1;
+      if (KMT_OK(kmt_create_allocation(dev->kdev, &ad, &color, NULL, NULL)) && color) {
+        dev->companions[dev->companion_count].depth = depth;
+        dev->companions[dev->companion_count++].color = color;
+      } else {
+        color = 0;
+      }
+    }
+  }
+  ReleaseSRWLockExclusive(&dev->companion_lock);
+  return color;
+}
+/* (the depth buffer is being destroyed) */
+static void depth_companion_drop(Dev *dev, UINT depth) {
+  UINT color = 0;
+  AcquireSRWLockExclusive(&dev->companion_lock);
+  for (UINT i = 0; i < dev->companion_count; ++i) {
+    if (dev->companions[i].depth != depth) continue;
+    color = dev->companions[i].color;
+    dev->companions[i] = dev->companions[--dev->companion_count];
+    break;
+  }
+  ReleaseSRWLockExclusive(&dev->companion_lock);
+  if (color) kmt_destroy_allocation(dev->kdev, color);
+}
+
+/* A depth clear that no pass has taken (the next pass was of another depth buffer, or the list ends) is a pass of its own, on the buffer's companion. */
+static void flush_pending_clear(CmdList *l) {
+  static const float zero[4] = {0, 0, 0, 0};
+  if (!l->pending_clear) return;
+  l->pending_clear = 0;
+  const UINT color = depth_companion(l->d.dev, l->pending_alloc, l->pending_width, l->pending_height, l->pending_samples);
+  if (!color) return;
+  ensure_room(l, ROOM_BYTES, ROOM_ALLOCS);
+  const UINT saved = l->rtv_count;
+  l->rtv_count = 1;
+  begin_pass_packet(l, color, l->pending_alloc, l->pending_flags, zero, l->pending_depth, l->pending_stencil);
+  l->rtv_count = saved;
+  packet(l, OP_END_PASS, NULL, 0);
+}
+
 /* Begins the pass of the current targets if there is none. Returns 0 when there is nothing to draw on. */
 static int ensure_pass(CmdList *l) {
   static const float zero[4] = {0, 0, 0, 0};
   if (l->pass_open) return 1;
   UINT color = l->rtv_count ? l->rtv[0] : 0, depth = l->dsv;
+  if (l->pending_clear && l->pending_alloc != depth) flush_pending_clear(l);
+  const int companion = !color && depth && !(l->pso && l->pso->so_entries);
+  if (companion) color = depth_companion(l->d.dev, depth, l->dsv_width, l->dsv_height, l->dsv_samples);
   if (!color && l->pso && l->pso->so_entries) {
     /* stream output without a target: the kernel's passes have one, a 1 x 1 target of the device's that nothing is rasterized into */
     if (!l->d.dev->null_target) {
@@ -361,7 +437,14 @@ static int ensure_pass(CmdList *l) {
     stencil = l->pending_stencil;
     l->pending_clear = 0;
   }
-  begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
+  if (companion) {      /* (the pass has the companion alone as its colour target, whatever the list's render targets are) */
+    const UINT saved = l->rtv_count;
+    l->rtv_count = 1;
+    begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
+    l->rtv_count = saved;
+  } else {
+    begin_pass_packet(l, color, depth, flags, zero, depth_value, stencil);
+  }
   l->pass_open = 1;
   /* a new pass forgets what was bound (a device may have its own idea of what carries over) */
   l->sent_pipeline = 0;
@@ -624,7 +707,12 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(CmdList *l, UINT count, co
   l->dsv = 0;
   if (dsv && dsv->ptr) {
     const SoftDesc *d = view_at(*dsv);
-    if (d && d->kind == DK_DSV) l->dsv = d->alloc;
+    if (d && d->kind == DK_DSV) {
+      l->dsv = d->alloc;
+      l->dsv_width = (UINT)d->size;
+      l->dsv_height = (UINT)(d->size >> 32);
+      l->dsv_samples = (UINT)d->offset;
+    }
   }
 }
 
@@ -710,9 +798,13 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(CmdList *l, D3D12_CPU_D
   const SoftDesc *d = view_at(dsv);
   if (!d || d->kind != DK_DSV || !d->alloc) return;
   if (l->pass_open && l->dsv == d->alloc) end_pass(l);
-  /* (kept until the next pass that uses the buffer: it needs a colour target) */
+  if (l->pending_clear && l->pending_alloc != d->alloc) flush_pending_clear(l);
+  /* (kept until the next pass that uses the buffer, which clears as it begins; a pass of its own if none does: flush_pending_clear) */
   l->pending_clear = 1;
   l->pending_alloc = d->alloc;
+  l->pending_width = (UINT)d->size;
+  l->pending_height = (UINT)(d->size >> 32);
+  l->pending_samples = (UINT)d->offset;
   l->pending_flags = ((flags & D3D12_CLEAR_FLAG_DEPTH) ? 2u : 0u) | ((flags & D3D12_CLEAR_FLAG_STENCIL) ? 4u : 0u);
   l->pending_depth = depth < 0.0f ? 0.0f : depth > 1.0f ? 1.0f : depth;
   l->pending_stencil = stencil;

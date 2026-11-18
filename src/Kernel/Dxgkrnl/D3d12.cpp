@@ -34,7 +34,17 @@ bool reader_at(ConstByteView blob, uint64_t offset, ByteReader* out) {
   return true;
 }
 
-graphics::AddressMode address_of(uint32_t mode) { return mode == 1 || mode == 2 ? graphics::AddressMode::Repeat : graphics::AddressMode::ClampToEdge; }   // (wrap and mirror; clamp, border and mirror once)
+// D3D12_TEXTURE_ADDRESS_MODE (1 wrap, 2 mirror, 3 clamp, 4 border, 5 mirror once; the caller has checked the range). A device without the last three gets the nearest
+// mode when the texture is bound (Adapter.cpp).
+graphics::AddressMode address_of(uint32_t mode) {
+  switch (mode) {
+    case 1: return graphics::AddressMode::Repeat;
+    case 2: return graphics::AddressMode::MirrorRepeat;
+    case 4: return graphics::AddressMode::ClampToBorder;
+    case 5: return graphics::AddressMode::MirrorOnce;
+    default: return graphics::AddressMode::ClampToEdge;
+  }
+}
 
 NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
   ByteReader head(blob);
@@ -112,7 +122,7 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     const float bias = word_float(at.le32());
     at.le32();   // (anisotropy)
     at.le32();   // (comparison)
-    at.le32();   // (border colour)
+    const uint32_t border = at.le32();   // (D3D12_STATIC_BORDER_COLOR: transparent black, opaque black, opaque white)
     const float min_lod = word_float(at.le32()), max_lod = word_float(at.le32());
     const uint32_t reg = at.le32(), space = at.le32(), visibility = at.le32();
     if (!at.ok() || address_u < 1 || address_u > 5 || address_v < 1 || address_v > 5 || visibility > 5) return status::kInvalidParameter;
@@ -122,6 +132,7 @@ NtStatus parse_blob(ConstByteView blob, RootSignatureDesc* out) {
     s.sampler.mip_filter = filter & 0x1 ? graphics::MipFilter::Linear : graphics::MipFilter::Nearest;
     s.sampler.address_u = address_of(address_u);
     s.sampler.address_v = address_of(address_v);
+    s.sampler.border = border == 1 ? graphics::BorderColor::OpaqueBlack : border == 2 ? graphics::BorderColor::OpaqueWhite : graphics::BorderColor::TransparentBlack;
     s.sampler.lod_bias = bias == bias && bias > -100.0f && bias < 100.0f ? bias : 0.0f;
     s.sampler.min_lod = min_lod == min_lod && min_lod > -100.0f && min_lod < 1000.0f ? min_lod : 0.0f;
     s.sampler.max_lod = max_lod == max_lod && max_lod > -100.0f && max_lod < 1000.0f ? max_lod : 1000.0f;

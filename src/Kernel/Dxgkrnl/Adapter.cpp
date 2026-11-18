@@ -47,7 +47,6 @@ bool as_words(ByteView bytes, ArrayView<uint32_t>* out) { return bytes.try_cast<
 // The device takes shader text as a `const char*`. The bytes are the shader's own copy, NUL terminated by the caller, and char has no alignment requirement.
 const char* text_pointer(ByteView text) { return reinterpret_cast<const char*>(text.data()); }
 
-uint32_t vertex_format_bytes(graphics::VertexFormat f) { return (static_cast<uint32_t>(f) + 1) * 4; }
 
 // Copies a w x h block of pixels between the system-memory backings of two allocations of one format (they may be the same allocation, the blocks overlapping).
 // The GPU's newer contents are read back first, and the destination's device object is marked stale. The caller has checked the rectangles.
@@ -532,7 +531,10 @@ class Adapter::StreamRunner {
   NtStatus bind_texture(ByteReader& p) {
     const uint32_t unit = p.le32(), index = p.le32(), filter = p.le32(), au = p.le32(), av = p.le32(), mip = p.le32();
     const float bias = bits_float(p.le32()), min_lod = bits_float(p.le32()), max_lod = bits_float(p.le32());
-    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || au > 1 || av > 1 || mip > 2) return refuse(__LINE__);
+    graphics::AddressMode mode_u, mode_v;
+    graphics::BorderColor border, no_border;
+    if (!exact(p) || unit >= adapter_.caps_.max_texture_units || filter > 1 || !decode_address_word(au, &mode_u, &border) || !decode_address_word(av, &mode_v, &no_border) || mip > 2) return refuse(__LINE__);
+    if (!(adapter_.caps_.features & graphics::kFeatureAddressModes)) mode_u = base_address_mode(mode_u), mode_v = base_address_mode(mode_v);   // (the device has wrap and clamp alone)
     if (!finite_within(bias, 100.0f) || !finite_within(min_lod, 100.0f) || !finite_within(max_lod, 1000.0f)) return refuse(__LINE__);
     Allocation* a = alloc(index);
     if (!a || !a->is_image() || !(a->desc().flags & kAllocTexture) || a->is_staging() || !use(a, state::kPixelShaderResource | state::kNonPixelShaderResource)) return refuse(__LINE__);
@@ -542,8 +544,9 @@ class Adapter::StreamRunner {
     if (!exec_) return status::kSuccess;
     graphics::SamplerDesc sampler;
     sampler.filter = static_cast<graphics::Filter>(filter);
-    sampler.address_u = static_cast<graphics::AddressMode>(au);
-    sampler.address_v = static_cast<graphics::AddressMode>(av);
+    sampler.address_u = mode_u;
+    sampler.address_v = mode_v;
+    sampler.border = border;
     sampler.mip_filter = static_cast<graphics::MipFilter>(mip);
     sampler.lod_bias = bias;
     sampler.min_lod = min_lod;
@@ -1182,7 +1185,7 @@ class Adapter::StreamRunner {
     uint32_t index = 0;
     if (!a || !index_of(a, &index)) return refuse(__LINE__);   // (the allocation is in the list or the draw is refused)
     ByteBuffer packet(adapter_.allocator_);
-    for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), static_cast<uint32_t>(sampler.address_u), static_cast<uint32_t>(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
+    for (uint32_t w : {unit, index, static_cast<uint32_t>(sampler.filter), address_word(sampler.address_u, sampler.border), address_word(sampler.address_v), static_cast<uint32_t>(sampler.mip_filter),
                        __builtin_bit_cast(uint32_t, sampler.lod_bias), __builtin_bit_cast(uint32_t, sampler.min_lod), __builtin_bit_cast(uint32_t, sampler.max_lod)})
       packet.put32(w);
     ByteReader reader(packet.view());
@@ -1511,9 +1514,10 @@ NtStatus Adapter::create_pipeline(const PipelineDesc& d, const SharedPointer<Sha
   uint32_t vertex_slots = 0, instance_slots = 0;
   for (uint32_t i = 0; i < d.attribute_count; ++i) {
     const graphics::VertexAttribute& a = d.attributes[i];
-    if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4)) return status::kInvalidParameter;
+    if (a.location >= caps_.max_vertex_attributes || a.slot >= caps_.max_vertex_buffers || static_cast<uint32_t>(a.format) >= graphics::kVertexFormatCount) return status::kInvalidParameter;
+    if (static_cast<uint32_t>(a.format) > static_cast<uint32_t>(graphics::VertexFormat::Float4) && !(caps_.features & graphics::kFeatureVertexFormats)) return status::kNotSupported;
     const uint32_t stride = a.slot == 0 ? d.vertex_stride : d.slot_strides[a.slot];
-    if (stride == 0 || a.offset > stride || vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
+    if (stride == 0 || a.offset > stride || graphics::vertex_format_bytes(a.format) > stride - a.offset) return status::kInvalidParameter;
     (a.per_instance ? instance_slots : vertex_slots) |= 1u << a.slot;
   }
   const graphics::StencilState& st = d.stencil;

@@ -29,7 +29,7 @@
 //   BindVertexBuffer allocation_index, offset
 //   BindIndexBuffer  allocation_index, index_type (0: 16 bit, 1: 32 bit), offset
 //   PushConstants    byte_count (a multiple of 16, at most the adapter's max_push_constant_bytes: 128 for most, 4096 for the CPU renderer and virgl), then the bytes padded to a whole word
-//   BindTexture      unit, allocation_index, filter, address_u, address_v, mip_filter, lod_bias, min_lod, max_lod (floats)
+//   BindTexture      unit, allocation_index, filter, address_u, address_v (address_word() of DxgTypes.hpp: the mode, and the border colour in address_u), mip_filter, lod_bias, min_lod, max_lod (floats)
 //   SetViewport      x, y, width, height, min_depth, max_depth (floats)
 //   SetScissor       x, y, width, height (x and y signed)
 //   Draw             vertex_count, first_vertex
@@ -147,7 +147,7 @@ class CommandWriter {
     ok_ &= bytes_.put_zeros(uint64_t{words} * 4 - data.size());
   }
   void bind_texture(uint32_t unit, uint32_t allocation, const graphics::SamplerDesc& s) {
-    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), static_cast<uint32_t>(s.address_u), static_cast<uint32_t>(s.address_v), static_cast<uint32_t>(s.mip_filter),
+    packet(Op::BindTexture, {unit, allocation, static_cast<uint32_t>(s.filter), address_word(s.address_u, s.border), address_word(s.address_v), static_cast<uint32_t>(s.mip_filter),
                              float_bits(s.lod_bias), float_bits(s.min_lod), float_bits(s.max_lod)});
   }
   void set_viewport(const graphics::Viewport& v) { packet(Op::SetViewport, {float_bits(v.x), float_bits(v.y), float_bits(v.width), float_bits(v.height), float_bits(v.min_depth), float_bits(v.max_depth)}); }

@@ -322,7 +322,7 @@ EXPORT HRESULT WINAPI D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED
 #define MAX_PSO_PIPELINES 8
 typedef struct PsoPipe { UINT strides[8], stencil_ref, handle; } PsoPipe;
 
-typedef struct Attr { UINT location, floats, offset, per_instance, slot; } Attr;
+typedef struct Attr { UINT location, format, offset, per_instance, slot; } Attr;      /* (format: the kernel's graphics::VertexFormat) */
 
 struct Pso {
   DObj d;
@@ -459,14 +459,56 @@ static HRESULT make_shader(Dev *dev, const D3D12_SHADER_BYTECODE *code, UINT sta
   return S_OK;
 }
 
-static int vertex_floats(DXGI_FORMAT f) {
+/* A vertex element's format as the kernel's graphics::VertexFormat (type * 4 + components - 1 with the types float, unorm8, snorm8, uint8, sint8, unorm16, snorm16, uint16,
+ * sint16, half, uint32, sint32; 48 is B8G8R8A8_UNORM and 49 R10G10B10A2_UNORM) and the bytes it takes in the buffer; -1 for a format a vertex cannot have. Formats other
+ * than 32-bit floats need a device that reads them (DEV_FEATURE_VERTEX_FORMATS; the kernel refuses the pipeline on one that does not). */
+static int vertex_format(DXGI_FORMAT f, UINT *bytes) {
+#define VF(type, components, size) (*bytes = (size) * (components), (type) * 4 + (components) - 1)
   switch (f) {
-    case DXGI_FORMAT_R32_FLOAT: return 1;
-    case DXGI_FORMAT_R32G32_FLOAT: return 2;
-    case DXGI_FORMAT_R32G32B32_FLOAT: return 3;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 4;
-    default: return 0;
+    case DXGI_FORMAT_R32_FLOAT: return VF(0, 1, 4);
+    case DXGI_FORMAT_R32G32_FLOAT: return VF(0, 2, 4);
+    case DXGI_FORMAT_R32G32B32_FLOAT: return VF(0, 3, 4);
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return VF(0, 4, 4);
+    case DXGI_FORMAT_R8_UNORM: return VF(1, 1, 1);
+    case DXGI_FORMAT_R8G8_UNORM: return VF(1, 2, 1);
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return VF(1, 4, 1);
+    case DXGI_FORMAT_R8_SNORM: return VF(2, 1, 1);
+    case DXGI_FORMAT_R8G8_SNORM: return VF(2, 2, 1);
+    case DXGI_FORMAT_R8G8B8A8_SNORM: return VF(2, 4, 1);
+    case DXGI_FORMAT_R8_UINT: return VF(3, 1, 1);
+    case DXGI_FORMAT_R8G8_UINT: return VF(3, 2, 1);
+    case DXGI_FORMAT_R8G8B8A8_UINT: return VF(3, 4, 1);
+    case DXGI_FORMAT_R8_SINT: return VF(4, 1, 1);
+    case DXGI_FORMAT_R8G8_SINT: return VF(4, 2, 1);
+    case DXGI_FORMAT_R8G8B8A8_SINT: return VF(4, 4, 1);
+    case DXGI_FORMAT_R16_UNORM: return VF(5, 1, 2);
+    case DXGI_FORMAT_R16G16_UNORM: return VF(5, 2, 2);
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return VF(5, 4, 2);
+    case DXGI_FORMAT_R16_SNORM: return VF(6, 1, 2);
+    case DXGI_FORMAT_R16G16_SNORM: return VF(6, 2, 2);
+    case DXGI_FORMAT_R16G16B16A16_SNORM: return VF(6, 4, 2);
+    case DXGI_FORMAT_R16_UINT: return VF(7, 1, 2);
+    case DXGI_FORMAT_R16G16_UINT: return VF(7, 2, 2);
+    case DXGI_FORMAT_R16G16B16A16_UINT: return VF(7, 4, 2);
+    case DXGI_FORMAT_R16_SINT: return VF(8, 1, 2);
+    case DXGI_FORMAT_R16G16_SINT: return VF(8, 2, 2);
+    case DXGI_FORMAT_R16G16B16A16_SINT: return VF(8, 4, 2);
+    case DXGI_FORMAT_R16_FLOAT: return VF(9, 1, 2);
+    case DXGI_FORMAT_R16G16_FLOAT: return VF(9, 2, 2);
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return VF(9, 4, 2);
+    case DXGI_FORMAT_R32_UINT: return VF(10, 1, 4);
+    case DXGI_FORMAT_R32G32_UINT: return VF(10, 2, 4);
+    case DXGI_FORMAT_R32G32B32_UINT: return VF(10, 3, 4);
+    case DXGI_FORMAT_R32G32B32A32_UINT: return VF(10, 4, 4);
+    case DXGI_FORMAT_R32_SINT: return VF(11, 1, 4);
+    case DXGI_FORMAT_R32G32_SINT: return VF(11, 2, 4);
+    case DXGI_FORMAT_R32G32B32_SINT: return VF(11, 3, 4);
+    case DXGI_FORMAT_R32G32B32A32_SINT: return VF(11, 4, 4);
+    case DXGI_FORMAT_B8G8R8A8_UNORM: *bytes = 4; return 48;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: *bytes = 4; return 49;
+    default: *bytes = 0; return -1;
   }
+#undef VF
 }
 
 static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
@@ -506,14 +548,17 @@ static HRESULT STDMETHODCALLTYPE dev_CreateGraphicsPipelineState(Dev *This, cons
   UINT appended[8] = {0};
   for (UINT i = 0; i < desc->InputLayout.NumElements; ++i) {
     const D3D12_INPUT_ELEMENT_DESC *e = &desc->InputLayout.pInputElementDescs[i];
-    const int floats = vertex_floats(e->Format);
-    if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || !floats) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
+    UINT bytes = 0;
+    const int format = vertex_format(e->Format, &bytes);
+    if (e->InputSlot >= dev->caps.max_vertex_buffers || e->InputSlot >= 8 || format < 0 || (format > 3 && !(dev->caps.features & DEV_FEATURE_VERTEX_FORMATS))) { dx_Release(OBJ(p)); return DXGI_ERROR_UNSUPPORTED; }
     Attr *a = &p->attrs[p->attr_count++];
-    a->floats = (UINT)floats;
+    a->format = (UINT)format;
     a->slot = e->InputSlot;
     a->per_instance = e->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-    a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? appended[e->InputSlot] : e->AlignedByteOffset;
-    appended[e->InputSlot] = a->offset + (UINT)floats * 4;
+    /* (an appended element starts at the next multiple of its size, of four bytes at most) */
+    const UINT unit = bytes >= 4 ? 4 : bytes ? bytes : 1;
+    a->offset = e->AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT ? (appended[e->InputSlot] + unit - 1) / unit * unit : e->AlignedByteOffset;
+    appended[e->InputSlot] = a->offset + bytes;
     p->slots_used |= 1u << e->InputSlot;
     a->location = i;
     for (UINT k = 0; k < n_in; ++k)
@@ -622,7 +667,7 @@ static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
   r[w++] = (p->depth.DepthEnable ? 1u : 0u) | (p->depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 2u : 0u) | (rt->BlendEnable ? 4u : 0u);
   for (UINT i = 0; i < 4; ++i) {
     r[w++] = i < p->attr_count ? p->attrs[i].location : 0;
-    r[w++] = i < p->attr_count ? p->attrs[i].floats - 1 : 0;
+    r[w++] = i < p->attr_count ? p->attrs[i].format : 0;
     r[w++] = i < p->attr_count ? p->attrs[i].offset : 0;
   }
   r[w++] = p->depth.StencilEnable ? 1 : 0;
@@ -684,7 +729,7 @@ static UINT pso_pipeline(Pso *p, const UINT strides[8], UINT stencil_ref) {
     for (UINT k = 0; k < extra; ++k) {
       const Attr *a = &p->attrs[4 + k];
       r[w++] = a->location;
-      r[w++] = (a->floats - 1) | (a->slot << 8);
+      r[w++] = a->format | (a->slot << 8);
       r[w++] = a->offset;
       if (a->per_instance) instance_high |= 1u << k;
     }

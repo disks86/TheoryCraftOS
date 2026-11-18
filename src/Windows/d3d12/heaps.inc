@@ -192,18 +192,26 @@ static void STDMETHODCALLTYPE dev_CreateDepthStencilView(Dev *This, ID3D12Resour
     d.kind = DK_DSV;
     d.alloc = r->alloc;
     d.format = desc ? desc->Format : r->desc.Format;
+    /* (the size of the buffer, for the colour target a pass with this view alone is given: cmdlist.inc depth_companion) */
+    d.size = (UINT64)(UINT)r->desc.Width | ((UINT64)r->desc.Height << 32);
+    d.offset = r->desc.SampleDesc.Count ? r->desc.SampleDesc.Count : 1;
   }
   desc_write(handle, &d);
 }
 
 /* The words of a sampler (D3D12_FILTER / D3D12_TEXTURE_ADDRESS_MODE) the way the kernel has them: the first word packs filter, address modes and mip filter; rest[0..2] are the
- * LOD bias, minimum and maximum LOD as bits. The kernel has repeat and clamp only: mirrored addresses repeat, border and mirror-once clamp. */
+ * LOD bias, minimum and maximum LOD as bits. An address byte is the kernel's mode (0 wrap, 1 clamp, 2 mirror, 3 border, 4 mirror once) and, in the byte of U, the border colour
+ * in bits 4-5 (0 transparent black, 1 opaque black, 2 opaque white: the three a static sampler can have; another colour is the nearest of them). A device with wrap and
+ * clamp alone uses the nearer of the two (the kernel does that). */
 static float lod_within(float value, float limit) { return !(value == value) ? 0.0f : value > limit ? limit : value < -limit ? -limit : value; }
-static UINT sampler_words(UINT filter, UINT au, UINT av, float bias, float min_lod, float max_lod, UINT *rest) {
+static UINT sampler_words(UINT filter, UINT au, UINT av, const float *border, float bias, float min_lod, float max_lod, UINT *rest) {
   const UINT linear = (filter & 0x14u) != 0 || filter == D3D12_FILTER_ANISOTROPIC;
   const UINT mip = (max_lod <= 0.0f) ? 0u : (((filter & 1u) || filter == D3D12_FILTER_ANISOTROPIC) ? 2u : 1u);
   UINT a[2] = {au, av};
-  for (int i = 0; i < 2; ++i) a[i] = (a[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP || a[i] == D3D12_TEXTURE_ADDRESS_MODE_MIRROR) ? 0u : 1u;
+  for (int i = 0; i < 2; ++i)
+    a[i] = a[i] == D3D12_TEXTURE_ADDRESS_MODE_WRAP ? 0u : a[i] == D3D12_TEXTURE_ADDRESS_MODE_MIRROR ? 2u : a[i] == D3D12_TEXTURE_ADDRESS_MODE_BORDER ? 3u :
+           a[i] == D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE ? 4u : 1u;
+  if (border) a[0] |= (border[3] < 0.5f ? 0u : border[0] + border[1] + border[2] < 1.5f ? 1u : 2u) << 4;
   /* (the kernel takes a bias and a minimum within 100 and a maximum within 1000: "no limit" - FLT_MAX, the usual MaxLOD - is the most it takes; a
    * value that is not a number is 0) */
   rest[0] = bits_of(lod_within(bias, 100.0f));
@@ -217,7 +225,7 @@ static void STDMETHODCALLTYPE dev_CreateSampler(Dev *This, const D3D12_SAMPLER_D
   memset(&d, 0, sizeof d);
   if (desc) {
     d.kind = DK_SAMPLER;
-    d.sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d.sampler[1]);
+    d.sampler[0] = sampler_words(desc->Filter, desc->AddressU, desc->AddressV, desc->BorderColor, desc->MipLODBias, desc->MinLOD, desc->MaxLOD, &d.sampler[1]);
   }
   desc_write(handle, &d);
 }
@@ -278,7 +286,7 @@ static void dheap_sync(DescHeap *h) {
       request[w++] = (UINT)d->size;
       request[w++] = (UINT)(d->size >> 32);
       request[w++] = d->sampler[0] & 0xFF;
-      request[w++] = (d->sampler[0] >> 8) & 0xFF;
+      request[w++] = ((d->sampler[0] >> 8) & 0xF) | (((d->sampler[0] >> 12) & 0xF) << 8);      /* (the mode, and the border colour above it) */
       request[w++] = (d->sampler[0] >> 16) & 0xFF;
       request[w++] = (d->sampler[0] >> 24) & 0xFF;
       request[w++] = d->sampler[1];

@@ -90,6 +90,22 @@ constexpr bool is_wide(Format f) { return is_float(f) || f == Format::A16B16G16R
 constexpr bool is_color(Format f) { return f == Format::A8R8G8B8 || f == Format::X8R8G8B8 || f == Format::A8B8G8R8 || f == Format::X8B8G8R8 || is_srgb(f) || is_wide(f); }
 constexpr bool has_alpha(Format f) { return f == Format::A8R8G8B8 || f == Format::A8B8G8R8 || is_srgb(f) || is_wide(f); }
 // Bytes of one pixel of a colour format.
+// A sampler's address mode in a command stream or a descriptor: the graphics::AddressMode in the low byte and, in the word of the u direction, the graphics::BorderColor in
+// bits 8-9. False for a word that is neither.
+constexpr uint32_t address_word(graphics::AddressMode mode, graphics::BorderColor border = graphics::BorderColor::TransparentBlack) {
+  return static_cast<uint32_t>(mode) | (static_cast<uint32_t>(border) << 8);
+}
+constexpr bool decode_address_word(uint32_t word, graphics::AddressMode* mode, graphics::BorderColor* border) {
+  if ((word & 0xFF) > static_cast<uint32_t>(graphics::AddressMode::MirrorOnce) || (word >> 8) > static_cast<uint32_t>(graphics::BorderColor::OpaqueWhite)) return false;
+  *mode = static_cast<graphics::AddressMode>(word & 0xFF);
+  *border = static_cast<graphics::BorderColor>(word >> 8);
+  return true;
+}
+// What a device without graphics::kFeatureAddressModes does with the other modes: the nearest of the two it has.
+constexpr graphics::AddressMode base_address_mode(graphics::AddressMode mode) {
+  return mode == graphics::AddressMode::Repeat || mode == graphics::AddressMode::MirrorRepeat ? graphics::AddressMode::Repeat : graphics::AddressMode::ClampToEdge;
+}
+
 constexpr uint32_t pixel_bytes(Format f) {
   switch (f) {
     case Format::A16B16G16R16F: case Format::A16B16G16R16: case Format::A16B16G16R16Snorm: case Format::A16B16G16R16Uint: case Format::A16B16G16R16Sint: return 8;

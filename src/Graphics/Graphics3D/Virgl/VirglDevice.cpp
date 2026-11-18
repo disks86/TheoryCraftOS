@@ -119,6 +119,10 @@ class VirglBuffer final : public IBuffer {
     if (usage & kBufferIndex) bind_ |= virgl::kBindIndexBuffer;
     if (usage & kBufferStorage) bind_ |= virgl::kBindShaderBuffer;
     if (usage & kBufferStreamOutput) bind_ |= virgl::kBindStreamOutput;
+    // The host takes a buffer with exactly one use (anything else is "Invalid texture bind flags"), but the use only picks the GL target the buffer object is first bound
+    // to: any buffer object can then be bound as vertex, index, storage or stream output buffer. A buffer of several uses (every Direct3D 12 buffer is one) is made as a
+    // vertex buffer, or as the first use it has.
+    if (bind_ & (bind_ - 1)) bind_ = (bind_ & virgl::kBindVertexBuffer) ? virgl::kBindVertexBuffer : bind_ & (~bind_ + 1);
     id_ = gpu.allocate_resource_id();
     ok_ = make_resource(id_, /*fence=*/true);
     gpu.add_resource_bytes(size);
@@ -214,7 +218,8 @@ class VirglImage final : public IImage {
       case Format::R8G8B8A8Uint: color_format_ = virgl::kFormatR8G8B8A8Uint; break;
       case Format::R16G16B16A16Snorm: color_format_ = virgl::kFormatR16G16B16A16Snorm; break;
       case Format::R10G10B10A2Unorm: color_format_ = virgl::kFormatR10G10B10A2Unorm; break;
-      case Format::B8G8R8A8Srgb: color_format_ = virgl::kFormatB8G8R8A8Srgb; break;
+      case Format::B8G8R8A8Srgb: case Format::R8G8B8A8Srgb: color_format_ = virgl::kFormatB8G8R8A8Srgb; break;
+      // (R8G8B8A8Unorm too is a BGRA image on the host: pixels go in and come out as 0xAARRGGBB words whatever the format's memory order, and a shader sees colours, not bytes)
       default: color_format_ = virgl::kFormatB8G8R8A8Unorm; break;
     }
     const uint32_t depth_format = desc.stencil ? virgl::kFormatZ32FloatS8X24Uint : virgl::kFormatZ32Float;
@@ -460,6 +465,15 @@ class VirglShaderModule final : public IShaderModule {
 };
 
 // Both kinds of pipeline, so that destroy_pipeline can tell them apart.
+// The host's vertex element format of a VertexFormat: VIRGL_FORMAT_* runs R, RG, RGB, RGBA for each component type.
+uint32_t virgl_vertex_format(VertexFormat format) {
+  static const uint32_t kFirst[] = {virgl::kFormatR32Float, 64 /* R8_UNORM */, 74 /* R8_SNORM */, 177 /* R8_UINT */, 181 /* R8_SINT */, 48 /* R16_UNORM */, 56 /* R16_SNORM */,
+                                    185 /* R16_UINT */, 189 /* R16_SINT */, 91 /* R16_FLOAT */, 193 /* R32_UINT */, 197 /* R32_SINT */};
+  if (format == VertexFormat::Bgra8Unorm) return virgl::kFormatB8G8R8A8Unorm;
+  if (format == VertexFormat::Rgb10A2Unorm) return virgl::kFormatR10G10B10A2Unorm;
+  return kFirst[static_cast<uint32_t>(vertex_format_type(format))] + vertex_format_components(format) - 1;
+}
+
 class VirglPipelineBase : public IPipeline {
  public:
   bool compute() const { return compute_; }
@@ -623,7 +637,7 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = (desc.independent_blend ? 1u : 0u) | (desc.alpha_to_coverage && desc.multisample ? 1u << 3 : 0u);  // s0: independent blend enable, alpha to coverage (no logic op, dither...)
     cmd[n++] = 0;  // s1
     cmd[n++] = blend_rt;
-    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kBaseColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
+    for (uint32_t i = 1; i < 8; ++i) cmd[n++] = desc.independent_blend && i < kMaxColorTargets ? (desc.target_blend[i - 1].custom ? render_target_blend(desc.target_blend[i - 1]) : 0xFu << 27) : 0u;
 
     // Depth and stencil (the same stencil state for both faces).
     const uint32_t depth_func = desc.depth_test ? static_cast<uint32_t>(desc.depth_compare) : virgl::kFuncAlways;   // (CompareOp is numbered as PIPE_FUNC)
@@ -659,16 +673,30 @@ class VirglPipeline final : public VirglPipelineBase {
     cmd[n++] = 0;
     cmd[n++] = 0;
 
-    // Vertex elements, all from vertex buffer 0.
-    cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectVertexElements, desc.attribute_count * 4 + 1);
-    cmd[n++] = elements_;
+    // Vertex elements. Element n is the vertex shader's input n on the host, so they are laid out by location (a location nothing feeds repeats the first attribute: the
+    // shader does not read it). The host keeps the instance divisor with a buffer binding, so every vertex buffer slot in use gets a binding for its per-vertex attributes and
+    // another for its per-instance ones (bindings_[], which the draw fills with the slots' buffers).
+    uint32_t by_location[kMaxVertexAttributes];
+    uint32_t element_count = 0;
+    for (uint32_t& a : by_location) a = kMaxVertexAttributes;
     for (uint32_t i = 0; i < desc.attribute_count; ++i) {
-      static const uint32_t kFormats[] = {virgl::kFormatR32Float, virgl::kFormatR32G32Float,
-                                          virgl::kFormatR32G32B32Float, virgl::kFormatR32G32B32A32Float};
-      cmd[n++] = desc.attributes[i].offset;
-      cmd[n++] = desc.attributes[i].per_instance ? 1 : 0;   // instance divisor
-      cmd[n++] = desc.attributes[i].per_instance ? 1 : 0;   // vertex buffer index (the divisor belongs to a buffer binding on the host: per-instance attributes get a binding of their own, of the same buffer)
-      cmd[n++] = kFormats[static_cast<uint32_t>(desc.attributes[i].format)];
+      const VertexAttribute& a = desc.attributes[i];
+      if (a.location >= kMaxVertexAttributes || a.slot >= kMaxVertexBuffers || by_location[a.location] != kMaxVertexAttributes) return;
+      by_location[a.location] = i;
+      if (a.location + 1 > element_count) element_count = a.location + 1;
+    }
+    cmd[n++] = virgl::header(virgl::kCreateObject, virgl::kObjectVertexElements, element_count * 4 + 1);
+    cmd[n++] = elements_;
+    for (uint32_t location = 0; location < element_count; ++location) {
+      const VertexAttribute& a = desc.attributes[by_location[location] != kMaxVertexAttributes ? by_location[location] : 0];
+      const uint8_t key = static_cast<uint8_t>(a.slot * 2 + (a.per_instance ? 1 : 0));
+      uint32_t binding = 0;
+      while (binding < binding_count_ && bindings_[binding] != key) ++binding;
+      if (binding == binding_count_) bindings_[binding_count_++] = key;
+      cmd[n++] = a.offset;
+      cmd[n++] = a.per_instance ? 1 : 0;   // instance divisor
+      cmd[n++] = binding;
+      cmd[n++] = virgl_vertex_format(a.format);
     }
     ok_ = n <= sizeof cmd / sizeof cmd[0] && device.send_commands(cmd, n);
   }
@@ -684,11 +712,9 @@ class VirglPipeline final : public VirglPipelineBase {
   uint32_t dsa() const { return dsa_; }
   uint32_t rasterizer() const { return rasterizer_; }
   uint32_t elements() const { return elements_; }
-  bool has_per_instance() const {
-    for (uint32_t i = 0; i < desc_.attribute_count; ++i)
-      if (desc_.attributes[i].per_instance) return true;
-    return false;
-  }
+  // The host's vertex buffer bindings: binding n is vertex buffer slot binding_slot(n), with the stride of that slot.
+  uint32_t binding_count() const { return binding_count_; }
+  uint32_t binding_slot(uint32_t binding) const { return bindings_[binding] / 2; }
   uint8_t stencil_reference() const { return stencil_reference_; }
   bool stencil_enabled() const { return desc_.stencil.enable; }
   uint32_t vertex_shader() const { return vs_; }
@@ -708,6 +734,8 @@ class VirglPipeline final : public VirglPipelineBase {
   uint8_t so_stream_of_buffer_[kMaxStreamOutputBuffers] = {};
   uint8_t stencil_reference_ = 0;
   uint32_t blend_ = 0, dsa_ = 0, rasterizer_ = 0, elements_ = 0;
+  uint8_t bindings_[kMaxVertexBuffers * 2] = {};   // slot * 2 + per_instance of each host vertex buffer binding
+  uint32_t binding_count_ = 0;
   bool ok_ = false;
 };
 
@@ -738,15 +766,19 @@ VirglDevice::~VirglDevice() {
 }
 
 uint32_t VirglDevice::sampler_state(const SamplerDesc& sampler) {
-  const uint32_t key = (sampler.filter == Filter::Linear ? 1u : 0u) | (sampler.address_u == AddressMode::ClampToEdge ? 2u : 0u) | (sampler.address_v == AddressMode::ClampToEdge ? 4u : 0u);
+  // (PIPE_TEX_WRAP_*: repeat 0, clamp to edge 2, clamp to border 3, mirror repeat 4, mirror clamp to edge 6)
+  static const uint32_t kWrap[] = {virgl::kWrapRepeat, virgl::kWrapClampToEdge, 4, 3, 6};
+  const uint32_t u = static_cast<uint32_t>(sampler.address_u), v = static_cast<uint32_t>(sampler.address_v), border = static_cast<uint32_t>(sampler.border);
+  if (u > 4 || v > 4 || border > 2) return 0;
+  const bool bordered = sampler.address_u == AddressMode::ClampToBorder || sampler.address_v == AddressMode::ClampToBorder;
+  const uint32_t key = (sampler.filter == Filter::Linear ? 1u : 0u) | (u << 1) | (v << 4) | ((bordered ? border : 0u) << 7);
   if (sampler_states_[key]) return sampler_states_[key];
   const uint32_t handle = new_handle();
-  const uint32_t wrap_s = sampler.address_u == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
-  const uint32_t wrap_t = sampler.address_v == AddressMode::Repeat ? virgl::kWrapRepeat : virgl::kWrapClampToEdge;
   const uint32_t filter = sampler.filter == Filter::Linear ? virgl::kFilterLinear : virgl::kFilterNearest;
   // No mipmaps: the minification filter is the magnification one and no level is chosen between.
-  const uint32_t s0 = wrap_s | (wrap_t << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
-  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, 0, 0, 0, 0};
+  const uint32_t s0 = kWrap[u] | (kWrap[v] << 3) | (virgl::kWrapClampToEdge << 6) /* r: the slices of a volume are clamped */ | (filter << 9) | (virgl::kMipFilterNone << 11) | (filter << 13) | (1u << 19) /* seamless cube maps: Direct3D always filters across the edges of a cube */;
+  const Vec4 color = border_color_value(sampler.border);
+  const uint32_t cmd[] = {virgl::header(virgl::kCreateObject, virgl::kObjectSamplerState, 9), handle, s0, 0, 0, 0, float_bits(color.x), float_bits(color.y), float_bits(color.z), float_bits(color.w)};
   if (!send_commands(cmd, 10)) return 0;
   sampler_states_[key] = handle;
   return handle;
@@ -774,21 +806,19 @@ IImage* VirglDevice::create_image(const ImageDesc& desc) {
   if (desc.samples != 1) {
     // (a multisampled image is an 8-bit colour image, which a shader may read with texel fetches, or a depth attachment alone: resolved)
     const bool depth = desc.format == Format::D32Float;
-    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm)) return nullptr;
+    if ((desc.samples != 2 && desc.samples != 4) || desc.kind != TextureKind::Texture2D || (depth ? desc.usage != kImageDepthAttachment : (desc.usage & ~kImageSampled) != kImageColorAttachment) || (!depth && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm)) return nullptr;
   }
   if (desc.kind != TextureKind::Texture2D) {
     // (a volume, array or cube is only sampled: 8-bit colour, one level)
     const uint32_t layers = desc.kind == TextureKind::TextureCube ? 6 : desc.layers;
-    if (desc.usage != kImageSampled || desc.format != Format::B8G8R8A8Unorm || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
+    if (desc.usage != kImageSampled || (desc.format != Format::B8G8R8A8Unorm && desc.format != Format::R8G8B8A8Unorm) || layers == 0 || layers > kMaxTextureLayers || (desc.kind == TextureKind::TextureCube && desc.extent.width != desc.extent.height)) return nullptr;
   } else if (desc.layers != 1) {
     return nullptr;
   }
   // A texture is not drawn into: the two kinds of image are stored in opposite row order (see VirglImage).
   if ((desc.usage & kImageSampled) && (desc.usage & (kImageDepthAttachment | kImagePresent))) return nullptr;
-  if (desc.format == Format::R8G8B8A8Srgb) return nullptr;   // (only BGRA sRGB colour)
-  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && !is_wide_format(desc.format)) return nullptr;
+  if ((desc.usage & kImageSampled) && desc.format != Format::B8G8R8A8Unorm && desc.format != Format::B8G8R8A8Srgb && desc.format != Format::R8G8B8A8Unorm && desc.format != Format::R8G8B8A8Srgb && !is_wide_format(desc.format)) return nullptr;
   if (!desc.extent.width || !desc.extent.height || desc.format == Format::Undefined) return nullptr;
-  if (desc.format == Format::R8G8B8A8Unorm) return nullptr;  // only BGRA color images for now
   if (desc.stencil && desc.format != Format::D32Float) return nullptr;
   VirglImage* image = make<VirglImage>(gpu_.allocator(), *this, desc);
   if (image && !image->valid()) {
@@ -873,11 +903,11 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
 
   const VirglPipeline* pipeline = nullptr;
   VirglImage* color = nullptr;
-  VirglImage* extra_colors[kBaseColorTargets - 1] = {};
+  VirglImage* extra_colors[kMaxColorTargets - 1] = {};
   uint32_t target_count = 1;
   VirglImage* depth = nullptr;
-  VirglBuffer* vertex_buffer = nullptr;
-  uint64_t vertex_offset = 0;
+  VirglBuffer* vertex_buffers[kMaxVertexBuffers] = {};
+  uint64_t vertex_offsets[kMaxVertexBuffers] = {};
   const VirglImage* textures[kMaxTextureUnits] = {};
   SamplerDesc samplers[kMaxTextureUnits];
   bool textures_dirty = false, compute_textures_dirty = false;
@@ -1058,10 +1088,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         if (depth && (depth->format() != Format::D32Float || !depth->surface())) return false;
         const Extent2D e = color->extent();
         target_count = 1;
-        for (uint32_t n = 0; n + 1 < kBaseColorTargets; ++n) {
+        for (uint32_t n = 0; n + 1 < kMaxColorTargets; ++n) {
           extra_colors[n] = static_cast<VirglImage*>(cmd.pass.extra_colors[n]);
           if (!extra_colors[n]) {
-            for (uint32_t k = n + 1; k + 1 < kBaseColorTargets; ++k)
+            for (uint32_t k = n + 1; k + 1 < kMaxColorTargets; ++k)
               if (cmd.pass.extra_colors[k]) return false;   // (a gap)
             break;
           }
@@ -1074,7 +1104,7 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
             if (extra_colors[k] == extra) return false;
           target_count = n + 2;
         }
-        for (uint32_t n = target_count - 1; n + 1 < kBaseColorTargets; ++n) extra_colors[n] = nullptr;
+        for (uint32_t n = target_count - 1; n + 1 < kMaxColorTargets; ++n) extra_colors[n] = nullptr;
         stream.command(virgl::kSetFramebufferState, 0, 2 + target_count);
         stream.put(target_count);
         stream.put(depth ? depth->surface() : 0);
@@ -1307,9 +1337,10 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
         break;
       }
       case RecordedCommand::Type::BindVertexBuffer:
-        vertex_buffer = static_cast<VirglBuffer*>(cmd.buffer);
-        vertex_offset = cmd.offset;
-        use(vertex_buffer);
+        if (cmd.unit >= kMaxVertexBuffers) return false;
+        vertex_buffers[cmd.unit] = static_cast<VirglBuffer*>(cmd.buffer);
+        vertex_offsets[cmd.unit] = cmd.offset;
+        use(vertex_buffers[cmd.unit]);
         break;
       case RecordedCommand::Type::BindIndexBuffer:
         index_buffer = static_cast<VirglBuffer*>(cmd.buffer);
@@ -1353,7 +1384,9 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
       }
       case RecordedCommand::Type::Draw:
       case RecordedCommand::Type::DrawIndexed: {
-        if (!in_pass || !pipeline || !vertex_buffer || pipeline->desc().color_target_count > target_count) return false;
+        if (!in_pass || !pipeline || pipeline->desc().color_target_count > target_count) return false;
+        for (uint32_t binding = 0; binding < pipeline->binding_count(); ++binding)
+          if (!vertex_buffers[pipeline->binding_slot(binding)]) return false;   // (a slot the pipeline reads with no buffer)
         const bool indexed = cmd.type == RecordedCommand::Type::DrawIndexed;
         if (indexed && !index_buffer) return false;
         if (pipeline->desc().stream_output_count && !begin_stream_output()) return false;
@@ -1424,22 +1457,25 @@ bool VirglDevice::submit(ICommandBuffer* commands) {
           }
           constants_dirty = false;
         }
-        const bool instanced_attributes = pipeline->has_per_instance();
-        stream.command(virgl::kSetVertexBuffers, 0, instanced_attributes ? 6 : 3);
-        for (uint32_t binding = 0; binding < (instanced_attributes ? 2u : 1u); ++binding) {
-          stream.put(pipeline->desc().vertex_stride);
-          stream.put(static_cast<uint32_t>(vertex_offset));
-          stream.put(vertex_buffer->id());
+        if (const uint32_t bindings = pipeline->binding_count()) {
+          stream.command(virgl::kSetVertexBuffers, 0, bindings * 3);
+          for (uint32_t binding = 0; binding < bindings; ++binding) {
+            const uint32_t slot = pipeline->binding_slot(binding);
+            stream.put(slot == 0 ? pipeline->desc().vertex_stride : pipeline->desc().slot_strides[slot]);
+            stream.put(static_cast<uint32_t>(vertex_offsets[slot]));
+            stream.put(vertex_buffers[slot]->id());
+          }
         }
         if (indexed) {
           stream.command(virgl::kSetIndexBuffer, 0, 3);
           stream.put(index_buffer->id());
           stream.put(index_type == IndexType::Uint16 ? 2 : 4);
-          stream.put(static_cast<uint32_t>(index_offset));
+          // (the host draws from the index buffer's offset and does not look at the draw's first index: the first index is part of the offset)
+          stream.put(static_cast<uint32_t>(index_offset + uint64_t{cmd.first} * (index_type == IndexType::Uint16 ? 2 : 4)));
         }
         const bool patches = topology == PrimitiveTopology::PatchList;
         stream.command(virgl::kDrawVbo, 0, patches ? 14 : 12);
-        stream.put(cmd.first);
+        stream.put(indexed ? 0 : cmd.first);
         stream.put(cmd.count);
         stream.put(patches ? virgl::kPrimPatches : topology == PrimitiveTopology::LineListAdjacency ? virgl::kPrimLinesAdjacency : topology == PrimitiveTopology::TriangleListAdjacency ? virgl::kPrimTrianglesAdjacency : topology == PrimitiveTopology::LineList ? virgl::kPrimLines : topology == PrimitiveTopology::PointList ? virgl::kPrimPoints : virgl::kPrimTriangles);
         stream.put(indexed ? 1 : 0);

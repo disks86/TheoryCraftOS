@@ -199,12 +199,17 @@ enum class ShaderStage : uint8_t { Vertex, Fragment, Compute, Geometry, Hull, Do
 // from the derivatives; any further lookup of the unit in the same invocation uses the same level.
 enum class Filter : uint8_t { Nearest, Linear };
 enum class MipFilter : uint8_t { None, Nearest, Linear };
-// What a coordinate outside 0..1 means: wrap around, or take the edge texel.
-enum class AddressMode : uint8_t { Repeat, ClampToEdge };
+// What a coordinate outside 0..1 means: wrap around, or take the edge texel. With kFeatureAddressModes also: wrap around with every second copy mirrored, take the sampler's
+// border colour (a linear filter blends it in within half a texel of the edge), or mirror once about zero and then take the edge texel.
+enum class AddressMode : uint8_t { Repeat, ClampToEdge, MirrorRepeat, ClampToBorder, MirrorOnce };
+// The border colours a sampler can have (those of a Direct3D 12 static sampler).
+enum class BorderColor : uint8_t { TransparentBlack, OpaqueBlack, OpaqueWhite };
+constexpr Vec4 border_color_value(BorderColor b) { return b == BorderColor::OpaqueWhite ? Vec4{1, 1, 1, 1} : b == BorderColor::OpaqueBlack ? Vec4{0, 0, 0, 1} : Vec4{0, 0, 0, 0}; }
 struct SamplerDesc {
   Filter filter = Filter::Nearest;
   AddressMode address_u = AddressMode::Repeat;
   AddressMode address_v = AddressMode::Repeat;
+  BorderColor border = BorderColor::TransparentBlack;   // AddressMode::ClampToBorder
   MipFilter mip_filter = MipFilter::None;
   float lod_bias = 0.0f;
   float min_lod = 0.0f, max_lod = 1000.0f;
@@ -458,7 +463,36 @@ class IShaderModule {
 
 // --- Pipelines ---------------------------------------------------------------
 
-enum class VertexFormat : uint8_t { Float1, Float2, Float3, Float4 };
+// What a vertex attribute is in the vertex buffer. Float1 .. Float4 are one to four 32-bit floats, which every device reads. The others need kFeatureVertexFormats: a
+// VertexType of one to four components (the value is type * 4 + components - 1), and two packed ones. Normalised types reach the shader as floats in 0..1 (Unorm) or -1..1
+// (Snorm, the most negative value clamped); Uint and Sint types reach it as integers (the bits of an integer in the register, as an integer input of a Direct3D 10 shader
+// expects). Components the format does not have are 0, the fourth 1 (the integer 1 for an integer type).
+enum class VertexType : uint8_t { Float, Unorm8, Snorm8, Uint8, Sint8, Unorm16, Snorm16, Uint16, Sint16, Half, Uint32, Sint32 };
+enum class VertexFormat : uint8_t {
+  Float1, Float2, Float3, Float4,
+  Unorm8x1 = 4, Unorm8x2, Unorm8x3, Unorm8x4, Snorm8x1 = 8, Snorm8x2, Snorm8x3, Snorm8x4, Uint8x1 = 12, Uint8x2, Uint8x3, Uint8x4, Sint8x1 = 16, Sint8x2, Sint8x3, Sint8x4,
+  Unorm16x1 = 20, Unorm16x2, Unorm16x3, Unorm16x4, Snorm16x1 = 24, Snorm16x2, Snorm16x3, Snorm16x4, Uint16x1 = 28, Uint16x2, Uint16x3, Uint16x4,
+  Sint16x1 = 32, Sint16x2, Sint16x3, Sint16x4, Half1 = 36, Half2, Half3, Half4, Uint32x1 = 40, Uint32x2, Uint32x3, Uint32x4, Sint32x1 = 44, Sint32x2, Sint32x3, Sint32x4,
+  Bgra8Unorm = 48,     // four bytes B, G, R, A read as the colour (R, G, B, A)
+  Rgb10A2Unorm = 49,   // a 32-bit word: R in bits 0-9, G in 10-19, B in 20-29, A in 30-31
+};
+constexpr uint32_t kVertexFormatCount = 50;
+constexpr bool vertex_format_packed(VertexFormat f) { return f == VertexFormat::Bgra8Unorm || f == VertexFormat::Rgb10A2Unorm; }
+constexpr VertexType vertex_format_type(VertexFormat f) { return vertex_format_packed(f) ? VertexType::Unorm8 : static_cast<VertexType>(static_cast<uint32_t>(f) / 4); }
+constexpr uint32_t vertex_format_components(VertexFormat f) { return vertex_format_packed(f) ? 4 : static_cast<uint32_t>(f) % 4 + 1; }
+constexpr uint32_t vertex_type_bytes(VertexType t) {
+  switch (t) {
+    case VertexType::Unorm8: case VertexType::Snorm8: case VertexType::Uint8: case VertexType::Sint8: return 1;
+    case VertexType::Unorm16: case VertexType::Snorm16: case VertexType::Uint16: case VertexType::Sint16: case VertexType::Half: return 2;
+    default: return 4;
+  }
+}
+// The bytes of one attribute in the vertex buffer.
+constexpr uint32_t vertex_format_bytes(VertexFormat f) { return vertex_format_packed(f) ? 4 : vertex_type_bytes(vertex_format_type(f)) * vertex_format_components(f); }
+constexpr bool vertex_format_is_integer(VertexFormat f) {
+  const VertexType t = vertex_format_type(f);
+  return !vertex_format_packed(f) && (t == VertexType::Uint8 || t == VertexType::Sint8 || t == VertexType::Uint16 || t == VertexType::Sint16 || t == VertexType::Uint32 || t == VertexType::Sint32);
+}
 
 struct VertexAttribute {
   uint32_t location;  // which input of the vertex shader
@@ -688,6 +722,8 @@ enum DeviceFeature : uint32_t {
   kFeatureOcclusionQueries = 1u << 7,  // ICommandBuffer::begin_occlusion_query / end_occlusion_query / occlusion_result
   kFeatureMultipleTargets = 1u << 5,   // RenderPassBegin::extra_colors and GraphicsPipelineDesc::color_target_count
   kFeatureClipDistances = 1u << 28,    // GraphicsPipelineDesc::clip_distances (TGSI shaders' CLIPDIST outputs)
+  kFeatureVertexFormats = 1u << 29,    // VertexFormat values other than Float1 .. Float4
+  kFeatureAddressModes = 1u << 31,     // AddressMode::MirrorRepeat, ClampToBorder and MirrorOnce, SamplerDesc::border
 };
 
 

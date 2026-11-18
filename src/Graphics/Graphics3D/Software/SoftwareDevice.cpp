@@ -481,7 +481,7 @@ class TextureSet final : public ITextureSet {
     const Surface surface = image.surface(level, layer);
     const int64_t w = surface.width, h = surface.height;
     if (sampler.filter == Filter::Nearest) {
-      return texel(surface, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
+      return texel_or_border(surface, sampler, index(floor_to(unit_coordinate(u) * static_cast<float>(w)), w, sampler.address_u), index(floor_to(unit_coordinate(v) * static_cast<float>(h)), h, sampler.address_v));
     }
     // Linear: the four texels around the point, whose centres are half a texel in.
     const float fx = unit_coordinate(u) * static_cast<float>(w) - 0.5f, fy = unit_coordinate(v) * static_cast<float>(h) - 0.5f;
@@ -489,9 +489,15 @@ class TextureSet final : public ITextureSet {
     const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
     const int64_t xs[2] = {index(x0, w, sampler.address_u), index(x0 + 1, w, sampler.address_u)};
     const int64_t ys[2] = {index(y0, h, sampler.address_v), index(y0 + 1, h, sampler.address_v)};
-    const Vec4 a = texel(surface, xs[0], ys[0]), b = texel(surface, xs[1], ys[0]), c = texel(surface, xs[0], ys[1]), d = texel(surface, xs[1], ys[1]);
+    const Vec4 a = texel_or_border(surface, sampler, xs[0], ys[0]), b = texel_or_border(surface, sampler, xs[1], ys[0]), c = texel_or_border(surface, sampler, xs[0], ys[1]),
+               d = texel_or_border(surface, sampler, xs[1], ys[1]);
     const Vec4 top = a * (1 - tx) + b * tx, bottom = c * (1 - tx) + d * tx;
     return top * (1 - ty) + bottom * ty;
+  }
+  // (index() gives -1 for a texel outside an image whose sampler has a border there)
+  static Vec4 texel_or_border(const Surface& surface, const SamplerDesc& sampler, int64_t x, int64_t y) {
+    if (x < 0 || y < 0) return border_color_value(sampler.border);
+    return texel(surface, x, y);
   }
   const SoftwareImage* image_for(uint32_t unit) const { return unit < kMaxTextureUnits ? images_[unit] : nullptr; }
   // A coordinate a NaN or a very large value cannot turn into an index outside the image: both are brought into a range the integer conversion can take.
@@ -511,6 +517,13 @@ class TextureSet final : public ITextureSet {
       i %= size;
       return i < 0 ? i + size : i;
     }
+    if (mode == AddressMode::MirrorRepeat) {   // (every second copy of the image is turned around)
+      i %= 2 * size;
+      if (i < 0) i += 2 * size;
+      return i < size ? i : 2 * size - 1 - i;
+    }
+    if (mode == AddressMode::ClampToBorder && (i < 0 || i >= size)) return -1;
+    if (mode == AddressMode::MirrorOnce && i < 0) i = -1 - i;   // (mirrored about zero, then the edge texel)
     return i < 0 ? 0 : (i >= size ? size - 1 : i);
   }
   static Vec4 texel(const Surface& surface, int64_t x, int64_t y) {
@@ -590,6 +603,46 @@ float read_float(ConstByteView bytes, uint64_t offset) {
   const uint8_t* src = bytes.try_at(offset);
   if (src && offset + 4 <= bytes.size()) __builtin_memcpy(&v, src, 4);
   return v;
+}
+
+// An unsigned little-endian number of `bytes` bytes (1, 2 or 4) at `offset`; 0 when it is not all inside the buffer.
+uint32_t read_unsigned(ConstByteView bytes, uint64_t offset, uint32_t count) {
+  ConstByteView field;
+  if (!bytes.try_subview(offset, count, &field)) return 0;
+  uint32_t v = 0;
+  for (uint32_t i = 0; i < count; ++i) v |= uint32_t{field[i]} << (8 * i);
+  return v;
+}
+
+// One vertex attribute as the shader's input register (VertexFormat says how each kind arrives).
+Vec4 read_attribute(ConstByteView bytes, uint64_t offset, VertexFormat format) {
+  if (format == VertexFormat::Bgra8Unorm) {
+    const uint32_t v = read_unsigned(bytes, offset, 4);
+    return {static_cast<float>((v >> 16) & 0xFF) / 255.0f, static_cast<float>((v >> 8) & 0xFF) / 255.0f, static_cast<float>(v & 0xFF) / 255.0f, static_cast<float>(v >> 24) / 255.0f};
+  }
+  if (format == VertexFormat::Rgb10A2Unorm) {
+    const uint32_t v = read_unsigned(bytes, offset, 4);
+    return {static_cast<float>(v & 0x3FF) / 1023.0f, static_cast<float>((v >> 10) & 0x3FF) / 1023.0f, static_cast<float>((v >> 20) & 0x3FF) / 1023.0f, static_cast<float>(v >> 30) / 3.0f};
+  }
+  const VertexType type = vertex_format_type(format);
+  const uint32_t size = vertex_type_bytes(type), components = vertex_format_components(format);
+  const bool integer = vertex_format_is_integer(format);
+  float v[4] = {0, 0, 0, integer ? __builtin_bit_cast(float, uint32_t{1}) : 1.0f};
+  for (uint32_t k = 0; k < components; ++k) {
+    const uint32_t raw = read_unsigned(bytes, offset + uint64_t{size} * k, size);
+    const int32_t wide = size == 1 ? static_cast<int8_t>(raw) : size == 2 ? static_cast<int16_t>(raw) : static_cast<int32_t>(raw);   // (the value sign extended)
+    switch (type) {
+      case VertexType::Float: v[k] = __builtin_bit_cast(float, raw); break;
+      case VertexType::Half: v[k] = half_to_float(static_cast<uint16_t>(raw)); break;
+      case VertexType::Unorm8: v[k] = static_cast<float>(raw) / 255.0f; break;
+      case VertexType::Unorm16: v[k] = static_cast<float>(raw) / 65535.0f; break;
+      case VertexType::Snorm8: v[k] = wide < -127 ? -1.0f : static_cast<float>(wide) / 127.0f; break;
+      case VertexType::Snorm16: v[k] = wide < -32767 ? -1.0f : static_cast<float>(wide) / 32767.0f; break;
+      case VertexType::Uint8: case VertexType::Uint16: case VertexType::Uint32: v[k] = __builtin_bit_cast(float, raw); break;
+      case VertexType::Sint8: case VertexType::Sint16: case VertexType::Sint32: v[k] = __builtin_bit_cast(float, static_cast<uint32_t>(wide)); break;
+    }
+  }
+  return {v[0], v[1], v[2], v[3]};
 }
 
 bool stencil_compare(CompareOp op, uint32_t reference, uint32_t stored) {
@@ -1095,13 +1148,10 @@ ClipVertex run_vertex_shader(const SoftwarePipeline& pipeline, const VertexStrea
   for (uint32_t i = 0; i < pd.attribute_count; ++i) {
     const VertexAttribute& at = pd.attributes[i];
     if (at.location >= kMaxVertexAttributes) continue;
-    const uint32_t components = static_cast<uint32_t>(at.format) + 1;
-    float v[4] = {0, 0, 0, 1};
     const uint32_t slot = at.slot < kMaxVertexBuffers ? at.slot : 0;
     const uint32_t stride = slot == 0 ? pd.vertex_stride : pd.slot_strides[slot];
     const uint64_t base = streams.offset[slot] + (at.per_instance ? instance : vertex) * stride;
-    for (uint32_t k = 0; k < components; ++k) v[k] = read_float(streams.data[slot], base + at.offset + 4 * k);
-    attributes[at.location] = {v[0], v[1], v[2], v[3]};
+    attributes[at.location] = read_attribute(streams.data[slot], base + at.offset, at.format);
   }
   ShaderIo io;
   if (pipeline.vertex_ex()) pipeline.vertex_ex()(attributes, constants, context, &io);

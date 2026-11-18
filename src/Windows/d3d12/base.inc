@@ -180,12 +180,17 @@ struct Dev {
   int software;
   LONG removed;
   UINT null_target;        /* a 1 x 1 render target: the pass of a draw that has no target (stream output only) */
+  /* The colour targets of passes that have a depth buffer and no render target (cmdlist.inc depth_companion): one for each depth buffer drawn into that way, until it is destroyed. */
+  struct Companion { UINT depth, color; } *companions;
+  UINT companion_count, companion_capacity;
+  SRWLOCK companion_lock;
   struct SharedShader *shared;      /* the kernel's shaders the pipelines have, each once (pso.inc) */
   UINT shared_count, shared_capacity;
   UINT next_pixel_base;    /* TcosD3D12PipelineOptions: for the next graphics pipeline, where the pixel shader's constant buffers begin (16-byte registers) */
   UINT next_shader_kind;   /* ... and the kernel's kind of its shaders (0: DXBC / DXIL) */
 };
 #define DEV_FEATURE_STREAM_OUTPUT (1u << 21)      /* graphics::kFeatureStreamOutput in KmtCaps.features */
+#define DEV_FEATURE_VERTEX_FORMATS (1u << 29)     /* graphics::kFeatureVertexFormats: vertex elements other than 32-bit floats */
 
 static const GUID *const g_device_iids[] = {&IID_ID3D12Object, &IID_ID3D12Device, NULL};
 

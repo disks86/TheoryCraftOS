@@ -165,8 +165,10 @@ static UINT region_tiles(const TileLayout *t, D3D12_TILED_RESOURCE_COORDINATE c,
   return n;
 }
 
+static void depth_companion_drop(Dev *dev, UINT depth);      /* (cmdlist.inc) */
 static void resource_destroy(DxObj *o) {
   Resource *r = (Resource *)o;
+  if (r->alloc && (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) depth_companion_drop(r->d.dev, r->alloc);
   EnterCriticalSection(&g_lock);
   for (Resource **pp = &g_cpu_resources; *pp; pp = &(*pp)->next_cpu)
     if (*pp == r) { *pp = r->next_cpu; break; }

@@ -34,7 +34,7 @@ class VirglDevice final : public IGraphicsDevice {
 
   DeviceInfo info() const override {
     // (compute only when the host says it has it: a compute shader on a host without loses the whole context)
-    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureClipDistances | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | (gpu_.virgl_has_tessellation() ? kFeatureTessellationStores : 0u) : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
+    return {"virgl (virtio-gpu)", DeviceKind::VirtualGpu, true, kMaxPushConstantBytes, kFeatureBlendState | kFeatureVertexFormats | kFeatureAddressModes | kFeatureClipDistances | kFeatureTexelAccess | kFeatureSystemInputs | kFeatureInstancing | kFeatureLines | kFeatureMultipleTargets | kFeatureFloatFormats | kFeatureOcclusionQueries | kFeatureStatisticsQueries | kFeatureTimestampQueries | kFeatureDepthResolve | kFeatureStreamOutput | kFeatureTextureKinds | kFeatureIndependentBlend | (gpu_.virgl_has_compute() ? kFeatureCompute | kFeatureStorageInDraws | kFeatureFragmentStores | kFeatureVertexStores | kFeatureGeometryStores | (gpu_.virgl_has_tessellation() ? kFeatureTessellationStores : 0u) : 0u) | (gpu_.virgl_has_geometry() ? kFeatureGeometryShaders : 0u) | (gpu_.virgl_has_tessellation() ? kFeatureTessellation : 0u) | kFeatureSrgbFormats | kFeatureUnorm16Formats | kFeatureIntegerFormats | kFeatureSnormFormats | (gpu_.virgl_max_samples() >= 2 ? kFeatureMultisample : 0u),
             (gpu_.virgl_max_samples() >= 2 ? 1u << 2 : 0u) | (gpu_.virgl_max_samples() >= 4 ? 1u << 4 : 0u), limits()};
   }
   // What the host's GL has (GL 3.3, which the TGSI it is given needs, at least): 16 texture units in each stage (GL_MAX_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS), 16
@@ -47,6 +47,8 @@ class VirglDevice final : public IGraphicsDevice {
     l.varyings = gpu_.virgl_has_tessellation() ? 15 : 14;   // (GLSL 4.00 and later: a GL 4 host)
     // (a GL 4 host's control stage puts out 32 vectors per control point, GL_MAX_TESS_CONTROL_OUTPUT_COMPONENTS 128: one is the position, one kept spare)
     l.control_varyings = gpu_.virgl_has_tessellation() ? 30 : 0;
+    l.color_targets = kMaxColorTargets;     // (GL_MAX_DRAW_BUFFERS is at least 8)
+    l.vertex_buffers = kMaxVertexBuffers;   // (a per-vertex and a per-instance binding for each: GL_MAX_VERTEX_ATTRIB_BINDINGS is at least 16)
     return l;
   }
 
@@ -89,7 +91,7 @@ class VirglDevice final : public IGraphicsDevice {
   hardware::VirtioGpu& gpu_;
   uint32_t next_handle_ = 1;  // object handles share one namespace per context
   uint64_t all_used_until_ = 0;   // the last work of a submit that used too many buffers to note each one (see in_flight)
-  uint32_t sampler_states_[8] = {};   // by filter and address modes (3 bits), 0 until made
+  uint32_t sampler_states_[512] = {};   // by filter (1 bit), the two address modes (3 bits each) and the border colour (2 bits); 0 until made
 };
 
 }  // namespace graphics
