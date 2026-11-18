@@ -39,6 +39,26 @@ constexpr TbNhiDevice kDevices[] = {
 };
 }  // namespace
 
+namespace {
+// USB4 host interfaces of other makers that have a name here (they are found by their class whether or not they are listed). The AMD ids
+// are those of Linux's nhi.c as remembered (unverified); none of them needs anything but the standard USB4 host interface.
+constexpr struct { uint16_t vendor_id, device_id; TbNhiDevice device; } kOtherHosts[] = {
+    {0x1022, 0x162E, {0x162E, "AMD Rembrandt USB4 host 0", TbGeneration::Usb4}},
+    {0x1022, 0x162F, {0x162F, "AMD Rembrandt USB4 host 1", TbGeneration::Usb4}},
+    {0x1022, 0x1668, {0x1668, "AMD Phoenix USB4 host 0", TbGeneration::Usb4}},
+    {0x1022, 0x1669, {0x1669, "AMD Phoenix USB4 host 1", TbGeneration::Usb4}},
+};
+constexpr TbNhiDevice kGenericUsb4 = {0, "USB4 host interface", TbGeneration::Usb4};
+}  // namespace
+
+const TbNhiDevice* tb_find_host(uint16_t vendor_id, uint16_t device_id, uint8_t class_code, uint8_t subclass, uint8_t prog_if) {
+  if (const TbNhiDevice* intel = tb_find_nhi(vendor_id, device_id)) return intel;
+  if (class_code != 0x0C || subclass != 0x03 || prog_if != kUsb4ProgIf) return nullptr;
+  for (const auto& h : kOtherHosts)
+    if (h.vendor_id == vendor_id && h.device_id == device_id) return &h.device;
+  return &kGenericUsb4;
+}
+
 const TbNhiDevice* tb_find_nhi(uint16_t vendor_id, uint16_t device_id) {
   if (vendor_id != 0x8086) return nullptr;
   for (const TbNhiDevice& d : kDevices)

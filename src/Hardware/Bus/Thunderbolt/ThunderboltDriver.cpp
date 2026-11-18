@@ -26,8 +26,9 @@ constexpr uint16_t kPciCommand = 0x04;
 
 ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDeviceInfo& device, IRegisterMapper& mapper) {
   stop();
-  model_ = tb_find_nhi(device.vendor_id, device.device_id);
+  model_ = tb_find_host(device.vendor_id, device.device_id, device.class_code, device.subclass, device.prog_if);
   if (!model_) return outcome_ = Outcome::UnknownDevice;
+  const bool intel = device.vendor_id == 0x8086;     // (the force power and LTR registers, and the PCIe-to-CIO capability, are Intel's)
   // memory space and bus mastering; the status bits above the command register clear when written, so only the low half is kept
   const uint32_t command = pci.read32(device.address, kPciCommand) & 0xFFFF;
   pci.write32(device.address, kPciCommand, command | (1u << 1) | (1u << 2));
@@ -39,13 +40,13 @@ ThunderboltDriver::Outcome ThunderboltDriver::start(IPciBus& pci, const PciDevic
   attach_power(pci, device.address);
   // the controller's own registers through the switch's upstream port, if it has them
   PciAddress upstream;
-  if (tb_find_upstream_port(pci, device, &upstream)) {
+  if (intel && tb_find_upstream_port(pci, device, &upstream)) {
     upstream_config_ = UniquePointer<PciFunctionConfig>::make(allocator_, pci, upstream);
     const uint16_t capability = upstream_config_ ? tb_find_vendor_capability(*upstream_config_) : 0;
     if (capability != 0) cio_ = UniquePointer<TbPcie2Cio>::make(allocator_, *upstream_config_, capability);
   }
   nhi_config_ = UniquePointer<PciFunctionConfig>::make(allocator_, pci, device.address);
-  return start_device(*mmio_, cio_.get(), model_->generation, nhi_config_.get());
+  return start_device(*mmio_, cio_.get(), model_->generation, intel ? nhi_config_.get() : nullptr);   // (no Intel power registers on others)
 }
 
 ThunderboltDriver::Outcome ThunderboltDriver::start_device(ITbRegisters& registers, TbPcie2Cio* cio, TbGeneration generation, ITbConfigSpace* nhi_config) {

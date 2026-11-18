@@ -32,6 +32,7 @@
 #include "Kernel/Clipboard.hpp"
 #include "Gui/Controls/DataGrid.hpp"
 #include "Desktop/FileExplorer.hpp"
+#include "Desktop/ThunderboltPrompts.hpp"
 #include "Desktop/FileTransfer.hpp"
 #include "Desktop/CopyProgressDialog.hpp"
 #include "Desktop/ColorDialog.hpp"
@@ -2635,6 +2636,74 @@ static void test_bluetooth_properties() {
 }
 
 // A Bluetooth adapter has its own group in the computer manager's hardware tree, and a menu with Bluetooth Settings, which opens the window for that adapter.
+// The question when a USB4 device asks for PCIe: one device at a time, "Don't Allow" the default, each button's answer passed on.
+struct FakeApprovals final : desktop::IThunderboltApprovals {
+  std::vector<Request> waiting;
+  std::vector<std::pair<uint64_t, int>> answers;   // (id, 2 always / 1 once / 0 no)
+  bool next_request(Request* out) override {
+    for (const Request& r : waiting) {
+      bool answered = false;
+      for (const auto& a : answers) answered = answered || a.first == r.id;
+      if (!answered) { *out = r; return true; }
+    }
+    return false;
+  }
+  void approve(uint64_t id, bool always) override { answers.push_back({id, always ? 2 : 1}); }
+  void deny(uint64_t id) override { answers.push_back({id, 0}); }
+  void add(uint64_t id, const char* vendor, const char* name) {
+    Request r;
+    r.id = id;
+    snprintf(r.vendor, sizeof r.vendor, "%s", vendor);
+    snprintf(r.name, sizeof r.name, "%s", name);
+    waiting.push_back(r);
+  }
+};
+
+static void test_thunderbolt_prompts() {
+  TestAllocator a;
+  {
+    Screen screen(a, 640, 480);
+    Theme theme;
+    Window w(a, screen.renderer, theme, {640, 480});
+    WindowManager mgr(a);
+    mgr.set_dock(DockStyle::Fill);
+    w.add(&mgr);
+    FakeApprovals approvals;
+    desktop::ThunderboltPrompts prompts(a, mgr, approvals);
+    prompts.pump();
+    CHECK(!prompts.asking() && !prompts.dialog().showing());          // nothing waiting: nothing asked
+    approvals.add(11, "CalDigit", "TS4 Dock");
+    approvals.add(22, "OWC", "Envoy Express");
+    prompts.pump();
+    CHECK(prompts.asking() && prompts.dialog().showing() && prompts.dialog().default_choice() == MessageDialog::Choice::Decline);
+    CHECK(prompts.dialog().title().equals("Thunderbolt") && prompts.dialog().accept_button().text().equals("Always Allow") &&
+          prompts.dialog().alternate_button().text().equals("Allow Once") && prompts.dialog().decline_button().text().equals("Don't Allow"));
+    prompts.pump();
+    CHECK(approvals.answers.empty());                                 // (no answer while the dialog is open)
+    prompts.dialog().decline_button().click();                        // the default: nothing allowed
+    prompts.pump();
+    CHECK(approvals.answers.size() == 1 && approvals.answers[0] == std::make_pair(uint64_t{11}, 0));
+    CHECK(prompts.asking() && prompts.dialog().showing());            // the next device at once
+    prompts.dialog().alternate_button().click();
+    prompts.pump();
+    CHECK(approvals.answers.size() == 2 && approvals.answers[1] == std::make_pair(uint64_t{22}, 1) && !prompts.asking());
+    approvals.add(33, "Sonnet", "eGPU Breakaway Box");
+    prompts.pump();
+    prompts.dialog().accept_button().click();
+    prompts.pump();
+    CHECK(approvals.answers.size() == 3 && approvals.answers[2] == std::make_pair(uint64_t{33}, 2));
+    // Escape is "Don't Allow".
+    approvals.add(44, "Apple", "Pro Display XDR");
+    prompts.pump();
+    KeyArgs esc;
+    esc.usage = hardware::key::kEscape;
+    w.key(esc);
+    prompts.pump();
+    CHECK(approvals.answers.size() == 4 && approvals.answers[3] == std::make_pair(uint64_t{44}, 0));
+  }
+  CHECK(a.live == 0);
+}
+
 static void test_bluetooth_menu() {
   TestAllocator a;
   {
@@ -9129,6 +9198,7 @@ int main() {
   test_wireless_menu();
   test_bluetooth_properties();
   test_bluetooth_menu();
+  test_thunderbolt_prompts();
   test_start_menu_search();
   test_caret_blink();
   test_display_settings_entry();

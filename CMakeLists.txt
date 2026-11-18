@@ -693,6 +693,7 @@ add_executable(BOOTX64
   src/Desktop/DatabaseQuery.cpp
   src/Desktop/WebBrowser.cpp
   src/Desktop/WebNotifications.cpp
+  src/Desktop/ThunderboltPrompts.cpp
   src/Desktop/WebAudio.cpp
   src/Desktop/PictureInPicture.cpp
   src/Desktop/Win32Windows.cpp
@@ -1094,6 +1095,7 @@ add_executable(BOOTX64
   src/Hardware/Bus/Thunderbolt/ThunderboltPower.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltNvm.cpp
   src/Hardware/Bus/Thunderbolt/Usb4Domain.cpp
+  src/Hardware/Bus/Thunderbolt/Usb4Policy.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomainHost.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltRing.cpp
   src/Hardware/Bus/Thunderbolt/ThunderboltXdomain.cpp
