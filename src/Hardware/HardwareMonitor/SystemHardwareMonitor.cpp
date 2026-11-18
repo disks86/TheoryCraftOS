@@ -29,6 +29,32 @@ uint32_t SystemHardwareMonitor::probe() {
   return with([&](HardwareMonitorSet& set) { return set.probe(*io); });
 }
 
+Optional<int32_t> SystemHardwareMonitor::cpu_temperature_millicelsius() {
+  const Optional<int32_t> board = with([](HardwareMonitorSet& set) { return set.cpu_temperature_millicelsius(); });
+  if (board) return board;
+  IHardwareMonitor* ec = embedded_controller();
+  if (!ec) return {};
+  for (uint32_t i = 0; i < ec->channel_count(MonitorChannel::Temperature); ++i) {
+    if (ec->role(MonitorChannel::Temperature, i) != SensorRole::Cpu) continue;
+    const Optional<int32_t> t = ec->temperature_millicelsius(i);
+    if (t) return t;
+  }
+  return {};
+}
+
+Optional<uint32_t> SystemHardwareMonitor::fan_rpm() {
+  const Optional<uint32_t> board = with([](HardwareMonitorSet& set) { return set.fan_rpm(); });
+  if (board) return board;
+  IHardwareMonitor* ec = embedded_controller();
+  if (!ec) return {};
+  Optional<uint32_t> fastest;
+  for (uint32_t i = 0; i < ec->channel_count(MonitorChannel::Fan); ++i) {
+    const Optional<uint32_t> rpm = ec->fan_rpm(i);
+    if (rpm && (!fastest || *rpm > *fastest)) fastest = rpm;
+  }
+  return fastest;
+}
+
 SystemHardwareMonitor* system_hardware_monitor() { return __atomic_load_n(&g_monitor, __ATOMIC_ACQUIRE); }
 
 void set_system_hardware_monitor(SystemHardwareMonitor* monitor) { __atomic_store_n(&g_monitor, monitor, __ATOMIC_RELEASE); }

@@ -59,6 +59,20 @@ SharedPointer<ISerialPort> SystemSerialPorts::share(uint32_t index) const {
   return index < ports_.count() ? ports_[index] : SharedPointer<ISerialPort>();
 }
 
+uint32_t SystemSerialPorts::remove_gone() {
+  List<SharedPointer<ISerialPort>> gone(allocator_);
+  {
+    kernel::ScopedMutex guard(mutex_);
+    for (uint64_t i = ports_.count(); i > 0; --i) {
+      if (ports_[i - 1]->present()) continue;
+      (void)gone.push_back(ports_[i - 1]);
+      ports_.remove_at(i - 1);
+    }
+  }
+  for (const SharedPointer<ISerialPort>& p : gone.view()) p->shutdown();   // (outside the lock)
+  return static_cast<uint32_t>(gone.count());
+}
+
 void SystemSerialPorts::poll() {
   List<SharedPointer<ISerialPort>> snapshot(allocator_);
   {

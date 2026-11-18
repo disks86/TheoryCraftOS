@@ -37,10 +37,12 @@
 #include "Hardware/Printer/SystemPrinters.hpp"
 #include "Hardware/StorageDevice/SystemStorageDevices.hpp"
 #include "Hardware/SystemInput.hpp"
+#include "Hardware/UsbTypeC/IUsbTypeC.hpp"
 
 // The numbers (HardwareEntry::id) of the devices of the kinds whose number is not just their place in their subsystem.
 constexpr uint32_t kMouseIdBase = 0x10000;      // Input: keyboards are 0.., mice kMouseIdBase..
 constexpr uint32_t kUsbControllerPort = 0xFFFF; // Usb: (controller << 16) | port, or (controller << 16) | kUsbControllerPort for the controller itself
+constexpr uint32_t kUsbTypeCIdBase = 0xFFFE0000u; // Usb: kUsbTypeCIdBase | index for the USB-C connectors (UCSI)
 
 // Lists the machine's devices for the Hardware tab and, being asked by group and number, tells the facts of any of them for its Properties window
 // (IDeviceDetails). The facts come from the class interfaces, so every device of a kind is described the same way, plus what the driver adds with
@@ -63,6 +65,8 @@ class SystemInventory final : public desktop::IHardwareInventory, public desktop
   void set_cameras(hardware::SystemCameras* cameras) { cameras_ = cameras; }
   void set_pci(hardware::IPciBus* pci) { pci_ = pci; }
   void set_bluetooth(hardware::IBluetoothManager* bluetooth) { bluetooth_ = bluetooth; }
+  // (set later than the others, when the ACPI devices are known, while the desktop may already be listing: stored atomically)
+  void set_usb_type_c(hardware::IUsbTypeC* type_c) { __atomic_store_n(&usb_type_c_, type_c, __ATOMIC_RELEASE); }
 
   bool refresh() override;
   uint32_t count() const override { return current_.count(); }
@@ -90,4 +94,6 @@ class SystemInventory final : public desktop::IHardwareInventory, public desktop
   hardware::SystemCameras* cameras_ = nullptr;
   hardware::IPciBus* pci_ = nullptr;
   hardware::IBluetoothManager* bluetooth_ = nullptr;
+  hardware::IUsbTypeC* usb_type_c_ = nullptr;
+  hardware::IUsbTypeC* usb_type_c() const { return __atomic_load_n(&usb_type_c_, __ATOMIC_ACQUIRE); }
 };

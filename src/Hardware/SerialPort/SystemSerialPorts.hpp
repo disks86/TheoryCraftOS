@@ -43,6 +43,9 @@ class SystemSerialPorts {
   void initialize();
   // Adds a port found some other way (a USB adapter, a PCI card); it is initialized here. False if it is not there.
   bool add(SharedPointer<ISerialPort> port);
+  // Takes the ports that are gone (present() false: a USB adapter that was pulled out) out of the list; returns how many. A program that
+  // still holds one keeps a port that answers nothing.
+  uint32_t remove_gone();
   void shutdown();
 
   uint32_t count() const;

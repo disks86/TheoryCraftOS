@@ -44,16 +44,20 @@ class SystemHardwareMonitor {
     return set_.with([&](HardwareMonitorSet& set) -> decltype(auto) { return operation(set); });
   }
 
-  [[nodiscard]] Optional<int32_t> cpu_temperature_millicelsius() {
-    return with([](HardwareMonitorSet& set) { return set.cpu_temperature_millicelsius(); });
-  }
-  [[nodiscard]] Optional<uint32_t> fan_rpm() {
-    return with([](HardwareMonitorSet& set) { return set.fan_rpm(); });
-  }
+  // The Super I/O's reading, else the embedded controller's.
+  [[nodiscard]] Optional<int32_t> cpu_temperature_millicelsius();
+  [[nodiscard]] Optional<uint32_t> fan_rpm();
+
+  // A laptop's sensors and fans behind its embedded controller (ChromeEcHardwareMonitor on a Chrome EC): a second source beside the Super I/O
+  // set, outside its lock, because the controller's commands may wait for it (the monitor serializes itself). nullptr removes it; the monitor
+  // must outlive its registration.
+  void set_embedded_controller(IHardwareMonitor* monitor) { __atomic_store_n(&embedded_controller_, monitor, __ATOMIC_RELEASE); }
+  IHardwareMonitor* embedded_controller() const { return __atomic_load_n(&embedded_controller_, __ATOMIC_ACQUIRE); }
 
  private:
   X86PortIo io_;
   Synchronized<HardwareMonitorSet> set_;
+  IHardwareMonitor* embedded_controller_ = nullptr;
 };
 
 // The monitor SystemChipset probed, or nullptr (before that, or after it is gone). Set once at boot; readers may run on any core.
