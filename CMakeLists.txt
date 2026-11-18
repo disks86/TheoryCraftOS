@@ -1659,7 +1659,7 @@ option(TCOS_BLUETOOTH "Start the Bluetooth controllers on the USB ports (Intel f
 if(TCOS_BLUETOOTH)
   target_compile_definitions(BOOTX64 PRIVATE TCOS_BLUETOOTH)
 endif()
-option(TCOS_THUNDERBOLT "Start the Thunderbolt 3 host interface (Alpine Ridge: control channel, the controller's firmware, devices reported as they are connected; PCIe tunnels only on request; not yet run on a real controller)" OFF)
+option(TCOS_THUNDERBOLT "Start the Thunderbolt / USB4 host interface: Thunderbolt 3 controllers through their firmware connection manager, USB4 ones (Intel Tiger Lake and later, AMD, any USB4 host) with the software connection manager - USB 3 and display tunnels at once, PCIe only for devices the user allows; also turns on TCOS_ACPI_EVENTS; not yet run on a real controller" ON)
 option(TCOS_THUNDERBOLT_START_FIRMWARE "With TCOS_THUNDERBOLT: start the controller's connection manager firmware if the BIOS did not (resets the controller's CPU through the upstream port's vendor registers)" OFF)
 option(TCOS_ACPI_EVENTS "Handle ACPI events: the power button, the sleep button and the lid, the embedded controller's events, the SCI through the I/O APIC (implied by TCOS_THUNDERBOLT; not yet run on a real machine)" OFF)
 if(TCOS_ACPI_EVENTS OR TCOS_THUNDERBOLT)

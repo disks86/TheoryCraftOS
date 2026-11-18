@@ -191,7 +191,7 @@ GET_CURRENT_CAM, and it does not use MESSAGE OUT. A UCSI 2.x PPM whose mailbox i
 
 ## USB4 / Thunderbolt
 
-The Intel boards' Thunderbolt 4 and the AMD boards' USB4 controllers both run on the system's software connection manager (`Usb4Domain`; AMD's are matched by the USB4 host interface class). Docks get USB 3 and display tunnels at once, and PCIe after the user allows the device. See the Thunderbolt part of [DellXps9575.md](DellXps9575.md). It is opt-in (`-DTCOS_THUNDERBOLT=ON`) and not validated on hardware.
+The Intel boards' Thunderbolt 4 and the AMD boards' USB4 controllers both run on the system's software connection manager (`Usb4Domain`; AMD's are matched by the USB4 host interface class). Docks get USB 3 and display tunnels at once, and PCIe after the user allows the device. See the Thunderbolt part of [DellXps9575.md](DellXps9575.md). It is on by default (`-DTCOS_THUNDERBOLT=OFF` leaves it out) and not validated on hardware.
 
 ## Not done
 
