@@ -165,7 +165,7 @@ understands):
 | VMware SVGA3D | Direct3D 9 tokens (D3D9 rewritten, DXBC written out first) | textures, mipmaps, stencil written from memory of the protocol; not run on a host. |
 | Intel Gen9 | a vertex function on the CPU + its two fixed pixel kernels | pixel shaders must be exactly a colour or one texture sample (`classify_fragment`); simulated engine in the host tests, picture matches the software device. |
 | Raspberry Pi V3D | its fixed vertex and pixel programs | a vertex shader that is exactly the matrix transform (`classify_vertex`, tested by running it on vectors against the built-in shader; rows or columns, Y flipped for Direct3D) and a `mov oC0, v0` pixel shader; no textures or stencil. The device is not yet in the render nodes (only the Pi session's tests make one), so a Pi has no accelerated Direct3D until it is. |
-| AMD (in progress) | - | no `IGraphicsDevice` exists yet; the Vega / Raven work is hardware drivers only. |
+| Radeon RX Vega M | TGSI text, compiled to GCN machine code (`src/Hardware/GraphicsProcessingUnit/AMD/Gcn`) | both stages run on the card. `TCOS_AMD_VEGAM` (off by default; never run on a card: the host tests run the compiled code on a GCN emulator, `AmdVegaMTest`, `GcnCompilerTest`). One colour target; 16 vertex inputs and textures; any vertex format in 8 vertex buffer slots (the vertices are repacked for the card); float and integer shader instructions, `IF` / `UIF`; no loops, texel fetches, system values, instancing, lines or mipmaps yet. Every draw uploads its targets and reads them back, so it proves the card draws rather than being fast. |
 
 `AdapterCaps` says what the adapter found by trying (`stencil`, `mipmaps`, `textures`, `programmable_vertex`, `programmable_pixel`), so a user-mode driver can pick shaders and formats the
 device takes. **A new device, the AMD one included, is done when**: `create_image` takes a colour target (B8G8R8A8) and a D32Float depth image and `read_pixels` works; it takes the
@@ -400,3 +400,22 @@ four-channel colour formats and one depth format); a depth buffer read as a text
 kernel refuses the combination); rendering into a mip level or an array layer; unordered access to textures; the blend factor, depth bias and back-face stencil state;
 several viewports; more than four unordered access buffers; pipeline statistics queries from the DLL; shared handles; the later device and command list interfaces
 (`ID3D12Device1` ..., ray tracing, mesh shaders, variable rate shading); and all of it on the GPU backends other than virgl.
+
+### The other GPU backends and feature level 11_0
+
+Where each stands, and what it would take:
+
+- **Radeon RX Vega M** (`Graphics3D/Vega`, the GCN compiler): the one with a real shader compiler and an emulator that runs what it compiles, so its work is checked on the host.
+  It takes 16 vertex inputs, 16 textures (a shader with more than four shares one set of descriptor registers, loaded before each lookup; more than eight vertex inputs
+  likewise), 8 vertex buffer slots and every `VertexFormat` (repacked on the CPU: each input the shader reads becomes four 32-bit values), the address modes, and shaders
+  with integers and masks (`FSLT` / `USEQ` ..., `UADD` / `UMUL` / `UMAD`, the bitwise operations and shifts, `F2I` / `I2F` ..., `UCMP`, `UIF`, integer immediates).
+  23 of the 99 conformance scenes match the CPU renderer (21 before); the rest are refused. Still between it and 11_0: more than one colour target (the compiler's
+  exports, `CB_COLOR1` .. 7, the draw area, the models), loops and `UDIV`, texel fetches and sizes (`TXF`, `TXQ`), the fragment position and face, vertex and instance
+  numbers, instancing, lines and points, mipmapped and non-8-bit images. The limit of 12 interpolants it reports is what the tables hold and has no scene of its own yet.
+- **VMware SVGA3D**: its commands are the Direct3D 9 generation (`SVGA_3D_CMD_SHADER_DEFINE` with vs / ps 2.0 and 3.0 tokens), which ends at Shader Model 3: about ten
+  interpolants, no integer instructions, no texel fetches. More render targets, samplers and vertex streams are possible there, feature level 11_0 is not: that needs the
+  DX10 command set (`SVGA_3D_CMD_DX_*`, which takes DXBC as it is, with guest-backed objects). There is no simulator of the device here, so nothing about it can be checked
+  on the host.
+- **Intel Gen9**: the vertex stage runs on the CPU and the pixel stage is one of three fixed EU kernels. Programmable shaders need an EU compiler and a simulator that runs
+  EU code; raising the limits without them would promise what cannot be drawn.
+- **Raspberry Pi V3D**: fixed programs and a small straight-line compiler; the device is not in the render nodes, so nothing reaches it.
