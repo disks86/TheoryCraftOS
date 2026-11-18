@@ -606,6 +606,10 @@ typedef struct ClassEntry {
   BOOL suspended;
 } ClassEntry;
 static ClassEntry *g_classes;
+static void remote_announce_all(void);      /* (remote.inc) */
+static void remote_announce(REFCLSID clsid, DWORD pid);
+static DWORD remote_running(REFCLSID clsid);
+static HRESULT remote_get_class(REFCLSID clsid, REFIID iid, void **out);
 static DWORD g_next_class_cookie = 1;
 static LONG g_server_refs;
 
@@ -630,6 +634,7 @@ EXPORT HRESULT WINAPI CoRegisterClassObject(REFCLSID clsid, LPUNKNOWN object, DW
   g_classes = e;
   unlock();
   *cookie = e->cookie;
+  if ((context & CLSCTX_LOCAL_SERVER) && !e->suspended) remote_announce_all();      /* (other processes can ask for it now) */
   return S_OK;
 }
 EXPORT HRESULT WINAPI CoRevokeClassObject(DWORD cookie) {
@@ -638,6 +643,7 @@ EXPORT HRESULT WINAPI CoRevokeClassObject(DWORD cookie) {
     if (e->cookie != cookie) continue;
     *link = e->next;
     unlock();
+    if ((e->context & CLSCTX_LOCAL_SERVER) && remote_running(&e->clsid) == GetCurrentProcessId()) remote_announce(&e->clsid, 0);
     IUnknown_Release(e->object);
     mem_free(e);
     return S_OK;
@@ -647,8 +653,9 @@ EXPORT HRESULT WINAPI CoRevokeClassObject(DWORD cookie) {
 }
 EXPORT HRESULT WINAPI CoResumeClassObjects(void) {
   lock();
-  for (ClassEntry *e = g_classes; e; e = e->next) if (e->thread == GetCurrentThreadId()) e->suspended = FALSE;
+  for (ClassEntry *e = g_classes; e; e = e->next) e->suspended = FALSE;      /* (every class of the process, as on Windows: a server registers on one thread and resumes on another) */
   unlock();
+  remote_announce_all();
   return S_OK;
 }
 EXPORT HRESULT WINAPI CoSuspendClassObjects(void) {
@@ -769,9 +776,7 @@ EXPORT HRESULT WINAPI CoGetClassObject(REFCLSID rclsid, DWORD context, LPVOID se
     }
   }
   if (context & CLSCTX_LOCAL_SERVER) {
-    clsid_key_path(&clsid, W('L', 'o', 'c', 'a', 'l', 'S', 'e', 'r', 'v', 'e', 'r', '3', '2'), path);
-    /* a server in another process cannot be reached: this library has no RPC */
-    if (reg_class_string(path, NULL, dll, MAX_PATH * 2) == ERROR_SUCCESS && dll[0]) return CO_E_SERVER_EXEC_FAILURE;
+    return remote_get_class(&clsid, riid, out);      /* (a server in another process: one that runs, or the one the registry says to start; remote.inc) */
   }
   return REGDB_E_CLASSNOTREG;
 }

@@ -1,0 +1,36 @@
+/* The interfaces of tests/windows/com32.c: "oleautomation" interfaces, which travel between processes by their type library (docs/WindowsCom.md).
+ *   widl -m32 -I /usr/include/wine/windows -t -T com32.tlb -h -H com32_h.h -u -U com32_i.c tests/windows/com32.idl */
+import "oaidl.idl";
+
+[object, oleautomation, uuid(7C051A01-5C0D-4E57-9A52-544353434F01)]
+interface ITcosCallback : IUnknown {
+  HRESULT Notify([in] LONG value, [in] BSTR text);
+}
+
+[object, oleautomation, uuid(7C051A02-5C0D-4E57-9A52-544353434F01)]
+interface ITcosTest : IUnknown {
+  HRESULT Add([in] LONG a, [in] LONG b, [out, retval] LONG *sum);
+  HRESULT Echo([in] BSTR text, [out, retval] BSTR *back);
+  HRESULT Big([in] LONGLONG value, [in] LONG shift, [out] LONGLONG *shifted);
+  HRESULT CallBack([in] ITcosCallback *callback, [in] LONG times);
+  HRESULT Make([out, retval] ITcosTest **another);
+  HRESULT Turn([in] VARIANT value, [out, retval] VARIANT *back);
+  HRESULT Where([out] LONG *process, [out] BSTR *arguments);
+  HRESULT Fail([in] LONG code);
+  HRESULT Quit();
+}
+
+/* (derived from the first: its methods come after ITcosTest's in the virtual table) */
+[object, oleautomation, uuid(7C051A03-5C0D-4E57-9A52-544353434F01)]
+interface ITcosTest2 : ITcosTest {
+  HRESULT Count([out, retval] LONG *calls);
+  HRESULT Length([in] LPWSTR text, [in] LPWSTR none, [out] LONG *length, [out] LPWSTR *upper);
+}
+
+[uuid(7C051A0F-5C0D-4E57-9A52-544353434F01), version(1.0)]
+library TcosComTest {
+  importlib("stdole2.tlb");
+  [uuid(7C051A10-5C0D-4E57-9A52-544353434F01)] coclass TcosTest { [default] interface ITcosTest2; };
+  [uuid(7C051A11-5C0D-4E57-9A52-544353434F01)] coclass TcosServiceTest { [default] interface ITcosTest2; };
+  interface ITcosCallback;
+}

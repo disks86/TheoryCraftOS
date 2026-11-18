@@ -31,15 +31,16 @@ static StdEntry *g_std_entries;
 static ULONGLONG g_oxid;
 static ULONGLONG g_next_oid = 0x1000;
 
+/* The OXID says which process an OBJREF is of: a number of its own in the upper half, its process id in the lower (remote.inc reaches the owner by that). */
 static ULONGLONG process_oxid(void) {
   if (!g_oxid) {
     GUID g;
     CoCreateGuid(&g);
-    mem_copy(&g_oxid, &g, 8);
-    if (!g_oxid) g_oxid = 1;
+    g_oxid = ((ULONGLONG)(g.Data1 | 1) << 32) | GetCurrentProcessId();
   }
   return g_oxid;
 }
+static HRESULT remote_unmarshal(DWORD pid, REFGUID ipid, REFIID iid, void **out);      /* (remote.inc) */
 
 /* ---- the standard marshaler ----------------------------------------------------------------------------------------------------------------------------------------- */
 
@@ -146,6 +147,12 @@ static HRESULT std_take(IStream *stream, REFIID riid, void **out, BOOL consume) 
     skip.QuadPart = (LONGLONG)dsa_entries * 2;
     IStream_Seek(stream, skip, STREAM_SEEK_CUR, NULL);
   }
+  {
+    /* An object of another process: that process hands the reference over, and a proxy stands for the object here. */
+    ULONGLONG oxid;
+    mem_copy(&oxid, body + 8, 8);
+    if ((DWORD)oxid != GetCurrentProcessId() && (DWORD)oxid != 0) return remote_unmarshal((DWORD)oxid, &ipid, riid, consume ? out : NULL);
+  }
   lock();
   for (e = g_std_entries; e; e = e->next) if (IsEqualGUID(&e->ipid, &ipid)) break;
   if (!e) { unlock(); return CO_E_OBJNOTCONNECTED; }
@@ -171,6 +178,31 @@ static HRESULT std_take(IStream *stream, REFIID riid, void **out, BOOL consume) 
   }
   if (release_hold && unk) IUnknown_Release(unk);
   return hr;
+}
+
+/* The marshaled reference `ipid` is taken by another process (remote.inc): the entry is used as an unmarshal uses it, and the caller gets the object with the
+ * reference that was the entry's (or a new one, if the entry stays) and its OID. */
+static HRESULT std_claim(REFGUID ipid, IUnknown **identity, ULONGLONG *oid) {
+  StdEntry *e;
+  lock();
+  for (e = g_std_entries; e; e = e->next) if (IsEqualGUID(&e->ipid, ipid)) break;
+  if (!e || !e->unk) { unlock(); return CO_E_OBJNOTCONNECTED; }
+  *identity = e->unk;
+  *oid = e->oid;
+  BOOL free_entry = FALSE;
+  if (e->table) {
+    IUnknown_AddRef(e->unk);      /* (a table marshal can be unmarshaled again and again) */
+  } else {
+    if (e->normal_refs > 0) e->normal_refs--;
+    if (e->normal_refs == 0) free_entry = TRUE;      /* (its reference goes to the caller) */
+    else IUnknown_AddRef(e->unk);
+  }
+  if (free_entry) {
+    for (StdEntry **link = &g_std_entries, *x; (x = *link) != NULL; link = &x->next) if (x == e) { *link = x->next; break; }
+  }
+  unlock();
+  if (free_entry) mem_free(e);
+  return S_OK;
 }
 
 static HRESULT WINAPI stdm_unmarshal(IMarshal *me, IStream *stream, REFIID riid, void **out) {

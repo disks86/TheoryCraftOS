@@ -913,6 +913,9 @@ static BOOL start_dependencies(LPCWSTR name, DWORD depth)
         SERVICE_STATUS_PROCESS status;
         if (depth > 8) { ok = FALSE; break; }
         if (*d == '+') continue;      /* (a group) */
+        /* The services of Windows that this system has no process for, because what they do is in its libraries: COM and RPC between processes (ole32). A
+           service that depends on one - nearly every service that serves COM objects says "RPCSS" - finds it running. */
+        if (wcsicmp(d, L"RpcSs") == 0 || wcsicmp(d, L"RpcEptMapper") == 0 || wcsicmp(d, L"DcomLaunch") == 0) continue;
         reap_deleted(d);
         read_status(d, &status);
         if (status.dwCurrentState == SERVICE_RUNNING) continue;
@@ -1654,7 +1657,14 @@ static SERVICE_STATUS_HANDLE register_handler(LPCWSTR name, LPHANDLER_FUNCTION h
     ServiceSlot *s;
     WCHAR en[MAX_NAME + 20], an[MAX_NAME + 20], mn[MAX_NAME + 20];
     if (!name || (!handler && !handler_ex)) { SetLastError(ERROR_INVALID_PARAMETER); return NULL; }
-    if (!(s = slot_named(name))) { SetLastError(ERROR_SERVICE_NOT_IN_EXE); return NULL; }
+    if (!(s = slot_named(name))) {
+        /* (a service with a process of its own may give any name, or none - Chromium's give "": Windows does not look at it, and it is the one service of the process) */
+        ServiceSlot *only = NULL;
+        DWORD i, slots = 0;
+        for (i = 0; i < MAX_SLOTS; ++i) if (g_slots[i].magic == SLOT_MAGIC) { only = &g_slots[i]; ++slots; }
+        if (slots != 1 || !(service_type_of(only->name) & SERVICE_WIN32_OWN_PROCESS)) { SetLastError(ERROR_SERVICE_NOT_IN_EXE); return NULL; }
+        s = only;
+    }
     s->handler = handler;
     s->handler_ex = handler_ex;
     s->context = context;

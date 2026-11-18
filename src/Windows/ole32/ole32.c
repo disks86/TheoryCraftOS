@@ -20,8 +20,8 @@
  * (compound files), property sets, the OLE helpers (clipboard, drag and drop, data cache, advise holders) and the user-marshaling routines.
  *
  * Design. All of it runs inside one process: an object that a thread of the process creates is used by every other thread of the process through the same pointer, so the
- * "standard marshaler" turns an interface into an OBJREF (the Windows format) that names an entry of a table in this process, and unmarshaling finds the entry again. A
- * server in another process is not reachable: RPC is not part of this library. Behaviour checked with Wine's tests (tests/windows/wine/ole32). The Windows headers
+ * "standard marshaler" turns an interface into an OBJREF (the Windows format) that names an entry of a table in this process, and unmarshaling finds the entry again. An
+ * object of another process is reached through a proxy and this library's own way of sending calls (remote.inc; not the wire protocol of DCOM). Behaviour checked with Wine's tests (tests/windows/wine/ole32). The Windows headers
  * of mingw supply the interface definitions; this file is the only one that defines the functions they declare, so they are not imports. */
 #define INITGUID
 #define _OLE32_
@@ -45,6 +45,7 @@
 #include <docobj.h>
 #include <ctxtcall.h>
 #include <callobj.h>
+#include <winsvc.h>
 
 #pragma GCC diagnostic ignored "-Wmisleading-indentation"
 typedef int PROPVAR_CHANGE_FLAGS;
@@ -57,6 +58,7 @@ __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n ret\n");
 #include "stream.inc"
 #include "compobj.inc"
 #include "marshal.inc"
+#include "remote.inc"
 #include "errorinfo.inc"
 #include "propvariant.inc"
 #include "storage.inc"
@@ -71,7 +73,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
   (void)module;
   (void)reserved;
   switch (reason) {
-    case DLL_PROCESS_ATTACH: core_init(); break;
+    case DLL_PROCESS_ATTACH: core_init(); remote_init(); break;
     case DLL_THREAD_DETACH: thread_detach(); break;
     default: break;
   }

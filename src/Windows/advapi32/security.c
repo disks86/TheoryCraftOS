@@ -2942,8 +2942,25 @@ __declspec(dllexport) DWORD WINAPI SetSecurityInfo(HANDLE handle, SE_OBJECT_TYPE
     case SE_FILE_OBJECT:
     case SE_KERNEL_OBJECT:
     case SE_WMIGUID_OBJECT:
+        status = NtSetSecurityObject(handle, SecurityInfo, &sd);
+        break;
     case SE_REGISTRY_KEY:
         status = NtSetSecurityObject(handle, SecurityInfo, &sd);
+        if (status == STATUS_ACCESS_DENIED)
+        {
+            /* The handle was not opened with the right to change the descriptor (KEY_WRITE has none): as Windows does for a key, the key is opened again with
+               that right - which the caller gets or not by the key's own descriptor - and the change is made through that handle. (Chromium's updater changes
+               the permissions of a key it made with KEY_WRITE, and gives up if it cannot.) */
+            HKEY again = NULL;
+            const REGSAM wanted = ((SecurityInfo & DACL_SECURITY_INFORMATION) ? WRITE_DAC : 0) |
+                                  ((SecurityInfo & (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION)) ? WRITE_OWNER : 0) |
+                                  ((SecurityInfo & SACL_SECURITY_INFORMATION) ? ACCESS_SYSTEM_SECURITY : 0);
+            if (RegOpenKeyExW((HKEY)handle, L"", 0, wanted, &again) == ERROR_SUCCESS)
+            {
+                status = NtSetSecurityObject(again, SecurityInfo, &sd);
+                RegCloseKey(again);
+            }
+        }
         break;
 
     default:
