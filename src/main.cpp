@@ -1961,9 +1961,9 @@ static efi::Status kernel_main(efi::Handle image, efi::SystemTable* st) {
     }
 #endif
 #ifdef TCOS_THUNDERBOLT
-    // The Thunderbolt 3 host interface (Alpine Ridge): the control channel to the controller's own connection manager firmware, which the BIOS has to have started. Devices that are
-    // connected are listed (and announced on the desktop); none gets a PCIe tunnel, which would give it access to memory, until something approves it. Opt-in (-DTCOS_THUNDERBOLT=ON): none
-    // of it has run on a real controller.
+    // The Thunderbolt / USB4 host interface: Thunderbolt 3 controllers through their own connection manager firmware (which the BIOS has to have started), USB4 ones through the
+    // software connection manager and its policy (USB 3 and display tunnels at once). Devices that are connected are listed and announced on the desktop; none gets a PCIe tunnel,
+    // which would give it access to memory, until the user allows it. On by default (-DTCOS_THUNDERBOLT=OFF leaves it out); none of it has run on a real controller.
     UniquePointer<hardware::ThunderboltDriver> thunderbolt;
     UniquePointer<hardware::FileTbKeyStore> thunderbolt_keys;       // the keys of devices approved at the secure level
     UniquePointer<hardware::ThunderboltNet> thunderbolt_net;        // networking to another host on the cable (after the driver: it goes first)
